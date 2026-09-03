@@ -77,18 +77,18 @@
         role_node_firecracker: "{{ lookup('ansible.builtin.template', billet_role_templates + '/billet-node.service.j2',
           template_vars={'billet_systemd_notify_ready': true, 'billet_firecracker_enabled': true}) }}"
         # THE SCHEDULED UPDATERS, which the package enables and the role
-        # renders. Four files, two copies each, compared directive by directive
-        # below like the services.
+        # renders (services.yml and images-refresh.yml). Four files, two copies
+        # each, compared directive by directive below like the services.
         packaged_scheduled:
           billet-upgrade.service: "{{ lookup('ansible.builtin.file', billet_repo_root + '/deploy/billet-upgrade.service') }}"
           billet-upgrade.timer: "{{ lookup('ansible.builtin.file', billet_repo_root + '/deploy/billet-upgrade.timer') }}"
-          billet-images.service: "{{ lookup('ansible.builtin.file', billet_repo_root + '/deploy/billet-images.service') }}"
-          billet-images.timer: "{{ lookup('ansible.builtin.file', billet_repo_root + '/deploy/billet-images.timer') }}"
+          billet-images-refresh.service: "{{ lookup('ansible.builtin.file', billet_repo_root + '/deploy/billet-images-refresh.service') }}"
+          billet-images-refresh.timer: "{{ lookup('ansible.builtin.file', billet_repo_root + '/deploy/billet-images-refresh.timer') }}"
         role_scheduled:
           billet-upgrade.service: "{{ lookup('ansible.builtin.template', billet_role_templates + '/billet-upgrade.service.j2') }}"
           billet-upgrade.timer: "{{ lookup('ansible.builtin.template', billet_role_templates + '/billet-upgrade.timer.j2') }}"
-          billet-images.service: "{{ lookup('ansible.builtin.template', billet_role_templates + '/billet-images.service.j2') }}"
-          billet-images.timer: "{{ lookup('ansible.builtin.template', billet_role_templates + '/billet-images.timer.j2') }}"
+          billet-images-refresh.service: "{{ lookup('ansible.builtin.template', billet_role_templates + '/billet-images-refresh.service.j2') }}"
+          billet-images-refresh.timer: "{{ lookup('ansible.builtin.template', billet_role_templates + '/billet-images-refresh.timer.j2') }}"
 
     # The comparison is per directive and LIST-valued, because several of these
     # legitimately appear more than once (a Firecracker node has two After=
@@ -216,18 +216,19 @@
         - { unit: billet-upgrade.timer, directive: RandomizedDelaySec }
         - { unit: billet-upgrade.timer, directive: Unit }
         - { unit: billet-upgrade.timer, directive: WantedBy }
-        - { unit: billet-images.service, directive: Description }
-        - { unit: billet-images.service, directive: Type }
-        - { unit: billet-images.service, directive: User }
-        - { unit: billet-images.service, directive: Group }
-        - { unit: billet-images.service, directive: UMask }
-        - { unit: billet-images.service, directive: ExecStart }
-        - { unit: billet-images.service, directive: TimeoutStartSec }
-        - { unit: billet-images.timer, directive: OnCalendar }
-        - { unit: billet-images.timer, directive: RandomizedDelaySec }
-        - { unit: billet-images.timer, directive: Persistent }
-        - { unit: billet-images.timer, directive: Unit }
-        - { unit: billet-images.timer, directive: WantedBy }
+        - { unit: billet-images-refresh.service, directive: Description }
+        - { unit: billet-images-refresh.service, directive: After }
+        - { unit: billet-images-refresh.service, directive: Type }
+        - { unit: billet-images-refresh.service, directive: User }
+        - { unit: billet-images-refresh.service, directive: Group }
+        - { unit: billet-images-refresh.service, directive: ExecStart }
+        - { unit: billet-images-refresh.service, directive: TimeoutStartSec }
+        - { unit: billet-images-refresh.service, directive: ReadWritePaths }
+        - { unit: billet-images-refresh.timer, directive: OnCalendar }
+        - { unit: billet-images-refresh.timer, directive: RandomizedDelaySec }
+        - { unit: billet-images-refresh.timer, directive: Persistent }
+        - { unit: billet-images-refresh.timer, directive: Unit }
+        - { unit: billet-images-refresh.timer, directive: WantedBy }
       loop_control:
         label: "{{ item.unit }} {{ item.directive }}"
 

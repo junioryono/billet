@@ -52,7 +52,7 @@ const (
 	//
 	// It exists because BuildKit cannot be told apart by user agent without
 	// admitting every client that types "buildkit/", and because a plaintext
-	// blob URL is only usable by a caller that reached billet over loopback.
+	// blob URL is only usable by a caller inside the guest the adapter serves.
 	actionsClientHeader = "X-Billet-Cache-Client"
 	actionsOriginHeader = "X-Billet-Cache-Origin"
 	actionsClientLocal  = "billet-loopback"
@@ -258,8 +258,13 @@ func actionsTwirpRequest(req *http.Request) bool {
 // x509 failure this path exists to remove, one leg later.
 //
 // The value comes from the client, so it is checked rather than believed: only
-// a bare http origin on a loopback address is accepted. billet will not mint a
-// URL pointing anywhere else.
+// a bare http origin on a loopback or private address is accepted. THE PRIVATE
+// RANGE IS THERE FOR THE GUEST'S DOCKER GATEWAY: the adapter binds it so that a
+// builder running in a container reaches the adapter with no `network=host`,
+// and a signed URL naming that address is usable only inside the guest's own
+// network, exactly as a loopback one is. A public address, a link-local one or
+// a name is refused, because a URL naming any of those is a token carried
+// somewhere billet does not serve.
 func actionsLoopbackOrigin(req *http.Request) string {
 	if req.Header.Get(actionsClientHeader) != actionsClientLocal {
 		return ""
@@ -281,7 +286,7 @@ func actionsLoopbackOrigin(req *http.Request) string {
 	}
 
 	ip := net.ParseIP(host)
-	if ip == nil || !ip.IsLoopback() {
+	if ip == nil || (!ip.IsLoopback() && !ip.IsPrivate()) {
 		return ""
 	}
 

@@ -267,11 +267,13 @@ jobs:
   # container-driver builder runs BuildKit in its own image, whose trust store
   # billet cannot populate, so its calls to the remapped origin meet a node leaf it
   # does not trust. (The embedded docker driver cannot export type=gha at all, so
-  # it is not the case to measure.) That is now ANSWERED rather than open: measured
-  # live, the export fails with x509, and the fix is the opt-in loopback adapter
-  # the lanes below gate. This lane stays continue-on-error because it measures
-  # what a builder that has NOT opted in still does -- the limitation an operator
-  # meets if they leave their workflow unchanged -- and that case is unchanged.
+  # it is not the case to measure.) THIS LANE IS THE WORKFLOW AN OPERATOR LEAVES
+  # UNCHANGED: a stock setup-buildx-action, a stock build-push-action, a plain
+  # `type=gha`, nothing billet-specific named. It is served because the guest's
+  # docker shim points the buildx client at the plaintext adapter, which listens
+  # on the docker gateway where a container builder can reach it. A GATE, not a
+  # measurement: an image without the shim fails here with the x509 error the
+  # shim exists to remove, which is the right verdict on that image.
   buildkit-gha:
     needs: candidate-identity
     runs-on: ${{ inputs.runner_label }}
@@ -279,6 +281,12 @@ jobs:
     steps:
       - name: Refuse a non-billet runner
         run: test "${RUNNER_NAME#billet-}" != "$RUNNER_NAME"
+      - name: Expose the Actions runtime to the proof
+        uses: actions/github-script@v8
+        with:
+          script: |
+            core.setSecret(process.env.ACTIONS_RUNTIME_TOKEN);
+            core.exportVariable('BILLET_PROBE_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN);
       - name: Establish a build context whose layer is unique to this run
         run: |
           mkdir -p conformance/gha
@@ -290,21 +298,34 @@ jobs:
         uses: docker/setup-buildx-action@v3
         with:
           driver: docker-container
-      - name: type=gha through a container-driver builder
-        id: container-gha
-        continue-on-error: true
+      - name: type=gha through a container-driver builder, nothing billet-specific named
         uses: docker/build-push-action@v6
         with:
           context: conformance/gha
           cache-to: type=gha,mode=max,scope=billet-container-${{ github.run_id }}-${{ github.run_attempt }}
           cache-from: type=gha,scope=billet-container-${{ github.run_id }}-${{ github.run_attempt }}
           outputs: type=cacheonly
-      - name: Report the container-driver gha outcome
+      - name: Prove the export was served by billet rather than GitHub
         run: |
-          echo "container-driver type=gha outcome: ${{ steps.container-gha.outcome }}"
-          if [ '${{ steps.container-gha.outcome }}' != 'success' ]; then
-            echo "::warning title=container gha::a container-driver type=gha export did not complete against the node CA; the run shows whether this was fatal or a non-fatal warning"
-          fi
+          set -euo pipefail
+          # The shim rewrote the buildx client's results URL to the adapter, so the
+          # adapter's origin is what a lookup for the scope above answers from.
+          test -n "${BILLET_ACTIONS_CACHE_URL:-}"
+          headers=$(mktemp)
+          trap 'rm -f "$headers"' EXIT
+          curl --silent --show-error --connect-timeout 15 --max-time 30 \
+            --dump-header "$headers" --output /dev/null \
+            --header 'Content-Type: application/json' \
+            --header "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
+            --data '{"key":"buildkit-blob-probe","restore_keys":[],"version":"billet-container-${{ github.run_id }}-${{ github.run_attempt }}"}' \
+            "${BILLET_ACTIONS_CACHE_URL%/}/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL" || true
+          tr -d '\r' < "$headers" | grep -Fxiq 'X-Billet-Actions-Cache: local' || {
+            echo 'the adapter did not answer locally for the builder scope' >&2
+            cat "$headers" >&2
+            exit 1
+          }
+        env:
+          ACTIONS_RUNTIME_TOKEN: ${{ env.BILLET_PROBE_RUNTIME_TOKEN }}
 
   # THE V2 PROTOCOL THROUGH THE LOOPBACK ADAPTER, DRIVEN DIRECTLY. A build proves
   # the product path but not the two things that make this path work at all: that
@@ -1070,3 +1091,307 @@ jobs:
       - run: |
           printf '%s\n' 'billet-${{ github.run_id }}-${{ github.run_attempt }}-poison' > expected
           cmp expected conformance/download/payload
+
+  # A SERVICE CONTAINER IS THE ORDINARY SHAPE OF A TEST JOB, and nothing in billet
+  # is written for it: the runner creates it through the guest's Docker. What is
+  # proved here is that it works the way GitHub's runners do -- reached from host
+  # steps through the mapped port, health-checked before the first step -- and
+  # that a real query ran, not that a container existed.
+  services-host:
+    needs: candidate-identity
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: billet
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Refuse a non-billet runner
+        run: test "${RUNNER_NAME#billet-}" != "$RUNNER_NAME"
+      - name: Query the service through the mapped port from a host step
+        run: |
+          set -euo pipefail
+          docker run --rm --network host -e PGPASSWORD=billet postgres:16-alpine \
+            psql -h 127.0.0.1 -p 5432 -U postgres -v ON_ERROR_STOP=1 \
+            -c 'create table conformance (run text)' \
+            -c "insert into conformance values ('billet-${{ github.run_id }}-${{ github.run_attempt }}')" \
+            -tA -c 'select run from conformance' | tee answer
+          test "$(cat answer)" = 'billet-${{ github.run_id }}-${{ github.run_attempt }}'
+
+  # THE SAME SERVICE, A SECOND TIME, so the run can measure what the site's Docker
+  # image store did for the second job's `Initialize containers`: the first job
+  # pulled postgres into the deployment-scoped store, and the second boots a fresh
+  # guest that finds it there. Runs after the first, on the same tier.
+  services-host-again:
+    needs: services-host
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: billet
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Refuse a non-billet runner
+        run: test "${RUNNER_NAME#billet-}" != "$RUNNER_NAME"
+      - name: Query the service again
+        run: |
+          set -euo pipefail
+          docker run --rm --network host -e PGPASSWORD=billet postgres:16-alpine \
+            psql -h 127.0.0.1 -p 5432 -U postgres -tA -c 'select 1' | tee answer
+          test "$(cat answer)" = 1
+
+  # A JOB CONTAINER REACHES A SERVICE BY ITS LABEL, on the network the runner
+  # creates for the job, with no port mapping. The job image has psql; the steps
+  # need nothing from the host.
+  services-container:
+    needs: candidate-identity
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 30
+    container: postgres:16
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: billet
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Refuse a non-billet runner
+        run: test "${RUNNER_NAME#billet-}" != "$RUNNER_NAME"
+      - name: Query the service by hostname from inside the job container
+        env:
+          PGPASSWORD: billet
+        run: |
+          set -euo pipefail
+          psql -h postgres -U postgres -v ON_ERROR_STOP=1 \
+            -c 'create table conformance (run text)' \
+            -c "insert into conformance values ('billet-${{ github.run_id }}-${{ github.run_attempt }}-container')" \
+            -tA -c 'select run from conformance' | tee answer
+          test "$(cat answer)" = 'billet-${{ github.run_id }}-${{ github.run_attempt }}-container'
+
+  # DOCKER COMPOSE FROM A HOST STEP, the other ordinary way a job gets a database.
+  compose-database:
+    needs: candidate-identity
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 30
+    steps:
+      - name: Refuse a non-billet runner
+        run: test "${RUNNER_NAME#billet-}" != "$RUNNER_NAME"
+      - name: Bring up a database with compose and query it
+        run: |
+          set -euo pipefail
+          mkdir -p conformance/compose
+          cat >conformance/compose/compose.yml <<'EOF'
+          services:
+            db:
+              image: postgres:16-alpine
+              environment:
+                POSTGRES_PASSWORD: billet
+              healthcheck:
+                test: ["CMD", "pg_isready", "-U", "postgres"]
+                interval: 5s
+                timeout: 5s
+                retries: 10
+          EOF
+          cd conformance/compose
+          docker compose up -d --wait
+          docker compose exec -T -e PGPASSWORD=billet db psql -U postgres -tA -c 'select 1' | tee answer
+          test "$(cat answer)" = 1
+          docker compose down -v
+
+  # WHAT THE IMAGE STORE DID, MEASURED RATHER THAN INFERRED. The runner's own
+  # `Initialize containers` step is where a service image is pulled and started;
+  # the first services job pulled postgres into the site's store and the second
+  # ran on a fresh guest. Both durations go in the summary. A cold store makes the
+  # two similar, which the summary shows; a warm one makes the second seconds.
+  container-init-timings:
+    needs: [services-host, services-host-again]
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 15
+    steps:
+      - name: Refuse a non-billet runner
+        run: test "${RUNNER_NAME#billet-}" != "$RUNNER_NAME"
+      - name: Report the Initialize containers durations
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+              owner: context.repo.owner, repo: context.repo.repo, run_id: context.runId, per_page: 100,
+            });
+            const rows = [["Job", "Initialize containers"]];
+            for (const name of ["services-host", "services-host-again"]) {
+              const job = jobs.find((j) => j.name === name || j.name.endsWith(" / " + name));
+              if (!job || job.conclusion !== "success") {
+                core.setFailed(`no successful ${name} job to measure`);
+                return;
+              }
+              const step = (job.steps || []).find((s) => s.name === "Initialize containers");
+              if (!step || !step.started_at || !step.completed_at) {
+                core.setFailed(`${name} has no timed Initialize containers step`);
+                return;
+              }
+              const seconds = (Date.parse(step.completed_at) - Date.parse(step.started_at)) / 1000;
+              rows.push([name, `${seconds.toFixed(1)} s`]);
+            }
+            await core.summary.addHeading("Service container initialisation").addRaw(
+              "The first job pulled postgres:16-alpine into the site's Docker image store; the second booted a fresh guest. The difference is what the store saved.", true
+            ).addTable(rows).write();
+
+  # EVERY CLIENT THAT REACHES THE RESULTS ORIGIN MUST TRUST THE NODE'S CA, not
+  # only the toolkit's Node client. billet marks every response it writes with
+  # X-Billet-Actions-Cache, so a client that reached the node through the remap
+  # sees that header, and one that could not verify the leaf fails before any
+  # header exists. Each step is one client written in a different language.
+  client-trust:
+    needs: candidate-identity
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 30
+    steps:
+      - name: Refuse a non-billet runner
+        run: test "${RUNNER_NAME#billet-}" != "$RUNNER_NAME"
+      - name: curl, through the guest trust store and SSL_CERT_FILE
+        run: |
+          set -euo pipefail
+          headers=$(mktemp)
+          curl --silent --show-error --connect-timeout 15 --max-time 30 --head \
+            --dump-header "$headers" --output /dev/null \
+            https://results-receiver.actions.githubusercontent.com/ || true
+          tr -d '\r' < "$headers" | grep -Eiq '^X-Billet-Actions-Cache:' || { cat "$headers" >&2; exit 1; }
+      - name: Python, the standard library through SSL_CERT_FILE
+        run: |
+          set -euo pipefail
+          python3 - <<'EOF'
+          import urllib.request
+          req = urllib.request.Request("https://results-receiver.actions.githubusercontent.com/", method="HEAD")
+          try:
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  headers = r.headers
+          except urllib.error.HTTPError as e:
+              headers = e.headers
+          assert "X-Billet-Actions-Cache" in headers, dict(headers)
+          EOF
+      - name: Python, requests through REQUESTS_CA_BUNDLE
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet --user requests
+          python3 - <<'EOF'
+          import requests
+          r = requests.head("https://results-receiver.actions.githubusercontent.com/", timeout=30)
+          assert "X-Billet-Actions-Cache" in r.headers, dict(r.headers)
+          EOF
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+      - name: Go, net/http through SSL_CERT_FILE
+        run: |
+          set -euo pipefail
+          mkdir -p conformance/goclient && cd conformance/goclient
+          cat >main.go <<'EOF'
+          package main
+
+          import (
+          	"fmt"
+          	"net/http"
+          	"os"
+          )
+
+          func main() {
+          	resp, err := http.Head("https://results-receiver.actions.githubusercontent.com/")
+          	if err != nil {
+          		fmt.Fprintln(os.Stderr, err)
+          		os.Exit(1)
+          	}
+          	if resp.Header.Get("X-Billet-Actions-Cache") == "" {
+          		fmt.Fprintln(os.Stderr, "no X-Billet-Actions-Cache header:", resp.Header)
+          		os.Exit(1)
+          	}
+          }
+          EOF
+          printf 'module goclient\n\ngo 1.22\n' > go.mod
+          go run .
+      # sccache is Rust and rustls; it reads the runtime token and results URL the
+      # runner sets and speaks the cache protocol itself. What is proved: it
+      # reaches the origin without a certificate error and caches. Whether billet
+      # served it or spliced it to GitHub is reported, not asserted -- a client
+      # billet does not admit by user agent is passed upstream by design.
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - name: sccache with the GitHub Actions cache backend
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+        run: |
+          set -euo pipefail
+          mkdir -p conformance/sccache && cd conformance/sccache
+          printf 'int main(void) { return 0; }\n' > hello.c
+          sccache gcc -c hello.c -o hello.o
+          rm -f hello.o
+          sccache gcc -c hello.c -o hello.o
+          sccache --show-stats | tee stats
+          grep -Eq 'Cache location\s+ghac' stats
+          if grep -Eq 'Cache errors\s+[1-9]' stats; then
+            echo 'sccache reported cache errors against the results origin' >&2
+            exit 1
+          fi
+
+  # A DOCKER CLIENT INSIDE A JOB CONTAINER, exporting type=gha with nothing
+  # billet-specific named. The container hook bind-mounts the guest's docker shim
+  # into the job container and the job hook puts its directory first on PATH, so
+  # the image's own client is fronted exactly as the host's is. The proof is the
+  # build succeeding: without the shim the builder meets the remapped origin's
+  # certificate and the export fails with x509.
+  container-docker-buildkit:
+    needs: candidate-identity
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 30
+    container: docker:27-cli
+    steps:
+      - name: Refuse a non-billet runner
+        shell: sh
+        run: test "${RUNNER_NAME#billet-}" != "$RUNNER_NAME"
+      - name: Prove the shim fronts the image's own client
+        shell: sh
+        run: |
+          set -eu
+          case "$(command -v docker)" in
+            /opt/billet/bin/docker) ;;
+            *) echo "docker resolves to $(command -v docker), not the shim" >&2; exit 1 ;;
+          esac
+          docker version --format '{{.Client.Version}}'
+      - name: Establish a build context whose layer is unique to this run
+        shell: sh
+        run: |
+          set -eu
+          mkdir -p conformance/gha-in-container
+          cat >conformance/gha-in-container/Dockerfile <<EOF
+          FROM alpine:3.20
+          RUN echo billet-${{ github.run_id }}-${{ github.run_attempt }}-in-container >/probe
+          EOF
+      - name: Set up a container-driver builder from inside the job container
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker-container
+      - name: type=gha from inside the job container, nothing billet-specific named
+        uses: docker/build-push-action@v6
+        with:
+          context: conformance/gha-in-container
+          cache-to: type=gha,mode=max,scope=billet-in-container-${{ github.run_id }}-${{ github.run_attempt }}
+          cache-from: type=gha,scope=billet-in-container-${{ github.run_id }}-${{ github.run_attempt }}
+          outputs: type=cacheonly

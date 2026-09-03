@@ -1,0 +1,33 @@
+# When billet-images-refresh.service runs. Enabled by the package; the service
+# says why.
+#
+#   systemctl disable --now billet-images-refresh.timer     # to opt a host out
+#
+# DAILY, WITH THE DECISION IN THE COMMAND RATHER THAN THE CALENDAR. The guest
+# image is built centrally once a week, and GitHub stops handing jobs to a runner
+# about thirty days after a newer release ships, so what matters is not when this
+# fires but that a new generation is on the cluster within a day of being
+# published. `billet images refresh` compares the channel's build time with the
+# newest generation imported and does nothing while nothing newer is published,
+# so a daily tick costs one signed statement and one question of the cluster,
+# and pulls only when there is something to pull.
+[Unit]
+Description=billet guest image refresh, daily
+Documentation=https://github.com/junioryono/billet/blob/main/docs/operating/guest-images.md
+
+[Timer]
+OnCalendar=daily
+
+# SPREAD, because a site's nodes all pulling the same fifteen-gigabyte image at
+# 00:00:00 is one release asset fetched N times at once and N boot-verifications
+# competing for the same cluster.
+RandomizedDelaySec=2h
+
+# A MISSED RUN IS RUN: a node that was off for the day would otherwise wait
+# another, and the runner window does not.
+Persistent=true
+
+Unit=billet-images-refresh.service
+
+[Install]
+WantedBy=timers.target

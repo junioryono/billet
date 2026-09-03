@@ -98,3 +98,52 @@ func jobStartedHook(t *testing.T) string {
 
 	return hook
 }
+
+// THE SHIM'S DIRECTORY GOES FIRST ON EVERY STEP'S PATH, and every variable a
+// client honours names the one trust bundle: the container hook can only mount
+// the shim, and a Python client reading certifi's bundle only trusts the node's
+// leaf if REQUESTS_CA_BUNDLE says so. Both travel through the same hook.
+func TestTheJobStartedHookPutsTheShimFirstOnPathAndPublishesEveryTrustVariable(t *testing.T) {
+	t.Parallel()
+
+	hook := jobStartedHook(t)
+	dir := t.TempDir()
+	source := filepath.Join(dir, "ca.pem")
+	environment := filepath.Join(dir, "github.env")
+	pathFile := filepath.Join(dir, "github.path")
+	for _, file := range []string{source, environment, pathFile} {
+		if err := os.WriteFile(file, nil, 0o600); err != nil {
+			t.Fatalf("write %s: %v", file, err)
+		}
+	}
+
+	run := exec.CommandContext(t.Context(), "sh", "-c", hook)
+	run.Env = append(os.Environ(),
+		"RUNNER_TEMP="+dir,
+		"GITHUB_ENV="+environment,
+		"GITHUB_PATH="+pathFile,
+		"BILLET_ACTIONS_CA_SOURCE="+source,
+	)
+	if output, err := run.CombinedOutput(); err != nil {
+		t.Fatalf("the job-started hook failed: %v\n%s", err, output)
+	}
+
+	published, err := os.ReadFile(environment)
+	if err != nil {
+		t.Fatalf("read the published environment: %v", err)
+	}
+	bundle := filepath.Join(dir, "billet-actions-cache-ca.pem")
+	for _, variable := range []string{"NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"} {
+		if !strings.Contains(string(published), variable+"="+bundle+"\n") {
+			t.Errorf("the hook does not publish %s naming the bundle:\n%s", variable, published)
+		}
+	}
+
+	prepended, err := os.ReadFile(pathFile)
+	if err != nil {
+		t.Fatalf("read the published PATH additions: %v", err)
+	}
+	if string(prepended) != "/opt/billet/bin\n" {
+		t.Errorf("GITHUB_PATH received %q, want the shim's directory alone", prepended)
+	}
+}

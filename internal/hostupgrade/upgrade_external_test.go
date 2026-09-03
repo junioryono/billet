@@ -36,9 +36,9 @@ func TestAnExternalLedgerUpgradeSkipsExactlyTheLedgerSteps(t *testing.T) {
 	want := []string{
 		"preserve",
 		"stop-node",
-		"refresh-guest-images",
 		"stop-server",
 		"hide-binary",
+		"prepare-images",
 		"install-candidate",
 		"probe",
 		"record-installed",

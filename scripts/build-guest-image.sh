@@ -185,6 +185,38 @@ fi
 # mountpoint, so it must run before the unmount; inlined at the end of the build
 # it silently became a read of an empty host directory when the filesystem moved
 # to the start. As a function it can be driven by a test against a fixture.
+# install_container_hook vendors GitHub's reference docker container hook into the
+# image, verified against internal/guestassets/container-hook.pin, and installs
+# billet's wrapper in front of it.
+#
+# THE PIN IS ONE LINE, VERSION AND SHA256, for the reason the runner's is: a
+# checksum is only true of its version. The zip carries one file, index.js, which
+# lands as upstream.js beside the wrapper the runner is pointed at.
+install_container_hook() {
+	local rootfs=$1
+	local pin="$SCRIPT_DIR/../internal/guestassets/container-hook.pin"
+	local version sha256 zip
+	version=$(awk 'NR==1{print $1}' "$pin")
+	sha256=$(awk 'NR==1{print $2}' "$pin")
+	if [ -z "$version" ] || [ -z "$sha256" ]; then
+		echo "cannot read the container hook version and checksum from $pin" >&2
+		exit 1
+	fi
+	zip="actions-runner-hooks-docker-$version.zip"
+	curl -fsSL --http1.1 \
+		--connect-timeout 20 --max-time 300 \
+		--retry 5 --retry-delay 5 --retry-all-errors \
+		-o "$WORK/$zip" \
+		"https://github.com/actions/runner-container-hooks/releases/download/v$version/$zip"
+	echo "$sha256  $WORK/$zip" | sha256sum -c -
+	install -d -m 0755 "$rootfs/usr/local/lib/billet/container-hook"
+	unzip -p "$WORK/$zip" index.js >"$rootfs/usr/local/lib/billet/container-hook/upstream.js"
+	chmod 0644 "$rootfs/usr/local/lib/billet/container-hook/upstream.js"
+	install -m 0644 "$SCRIPT_DIR/../internal/guestassets/container-hook.js" \
+		"$rootfs/usr/local/lib/billet/container-hook/index.js"
+	printf '%s\n' "$version" >"$rootfs/usr/local/lib/billet/container-hook/VERSION"
+}
+
 read_guest_contract() {
 	local rootfs="$1"
 	local agent="$rootfs/usr/local/bin/billet-agent"
@@ -836,6 +868,22 @@ IMAGEINFO
 		"$rootfs/usr/local/bin/billet-actions-proxy"
 	install -m 0755 "$SCRIPT_DIR/../internal/guestassets/dns-upstreams.py" \
 		"$rootfs/usr/local/bin/billet-dns-upstreams"
+	# THE DOCKER SHIM SITS AHEAD OF THE REAL CLIENT on the job's PATH and points a
+	# build's BuildKit cache client at the adapter, which is what lets a workflow
+	# that changed only `runs-on` export `type=gha` from a container-driver
+	# builder. Installed twice: /usr/local/bin/docker is first on the runner's own
+	# PATH, and /opt/billet/bin/docker is what the container hook bind-mounts into
+	# a job container and the job hook prepends to GITHUB_PATH, so the shim is
+	# first wherever a step runs and finds the image's client behind itself.
+	install -m 0755 "$SCRIPT_DIR/../internal/guestassets/docker-shim.sh" \
+		"$rootfs/usr/local/bin/docker"
+	install -D -m 0755 "$SCRIPT_DIR/../internal/guestassets/docker-shim.sh" \
+		"$rootfs/opt/billet/bin/docker"
+
+	# THE CONTAINER HOOK: GitHub's reference docker hook, pinned by version and
+	# sha256 the way the runner is, behind a wrapper that adds one mount. The
+	# runner runs it with its own node, so the guest needs no node of its own.
+	install_container_hook "$rootfs"
 	install -m 0755 /dev/stdin "$rootfs/usr/local/bin/billet-agent" <<'AGENT'
 #!/bin/bash
 # Read this microVM's runner registration out of the metadata service and start the
@@ -1035,19 +1083,37 @@ set -eu
 # runner mounts it into those containers.
 target="$RUNNER_TEMP/billet-actions-cache-ca.pem"
 install -m 0444 "$BILLET_ACTIONS_CA_SOURCE" "$target"
+# ONE BUNDLE, EVERY VARIABLE A CLIENT HONOURS. Node reads NODE_EXTRA_CA_CERTS;
+# OpenSSL, Go, rustls-native-certs and curl read SSL_CERT_FILE; Python's
+# requests reads certifi's bundle and IGNORES the system store unless
+# REQUESTS_CA_BUNDLE says otherwise, and curl prefers CURL_CA_BUNDLE where it is
+# set. The bundle carries the distribution roots too, so none of these replaces
+# the trust a client had with the trust it needs.
 {
 	printf 'NODE_EXTRA_CA_CERTS=%s\n' "$target"
 	printf 'SSL_CERT_FILE=%s\n' "$target"
+	printf 'REQUESTS_CA_BUNDLE=%s\n' "$target"
+	printf 'CURL_CA_BUNDLE=%s\n' "$target"
 } >>"$GITHUB_ENV"
 
-# THE ADAPTER'S URL GOES THROUGH GITHUB_ENV BECAUSE THAT IS THE ONLY PLACE A
-# `with:` INPUT CAN READ IT. A workflow needs it inside
-# `cache-to: type=gha,url_v2=...`, which is an expression evaluated against the
-# env context; the runner's own process environment does not reach that context.
+# THE ADAPTER'S URL GOES THROUGH GITHUB_ENV BECAUSE THAT IS WHERE A STEP'S
+# ENVIRONMENT COMES FROM. The docker shim reads it from the environment of the
+# build it fronts, and a workflow that names the adapter itself needs it inside
+# `cache-to: type=gha,url_v2=...`, an expression evaluated against the env
+# context; the runner's own process environment reaches neither.
 # GUARDED, because this hook runs under `set -u` and the adapter is allowed to
 # have failed to start: interception is not conditional on it.
 if [ -n "${BILLET_ACTIONS_CACHE_URL:-}" ]; then
 	printf 'BILLET_ACTIONS_CACHE_URL=%s\n' "$BILLET_ACTIONS_CACHE_URL" >>"$GITHUB_ENV"
+fi
+
+# THE SHIM'S DIRECTORY GOES FIRST ON EVERY STEP'S PATH, on the host and inside a
+# job container (where the container hook has bind-mounted it), so a build run
+# by whatever docker client an image carries is fronted by the shim.
+# GUARDED like the URL above: the runner sets GITHUB_PATH for a job hook, and a
+# harness that runs this script without one must not turn that into a failure.
+if [ -n "${GITHUB_PATH:-}" ]; then
+	printf '%s\n' /opt/billet/bin >>"$GITHUB_PATH"
 fi
 ACTIONS_HOOK
 	chown runner:runner "$actions_hook_path"
@@ -1210,21 +1276,30 @@ if [ -n "$actions_proxy" ] && [ -n "$actions_ca_path" ] && [ -n "$actions_hook_p
 		systemctl stop billet-actions-proxy.socket billet-actions-proxy.service 2>/dev/null || true
 	fi
 
-	# THE PLAINTEXT LOOPBACK ADAPTER, for the one client the DNS remap cannot
-	# reach. Same script, same tunnel, same fail-open addresses; the difference is
-	# that this one terminates nothing and TERMINATES the TLS itself, so BuildKit
-	# never meets a certificate it has to trust. It is a SEPARATE unit rather than
-	# a second listener in the passthrough, so a crash of one is not a crash of
-	# both and the passthrough's socket-activation contract is untouched.
+	# THE PLAINTEXT ADAPTER, for the one client the DNS remap cannot reach. Same
+	# script, same tunnel, same fail-open addresses; the difference is that this
+	# one terminates nothing and TERMINATES the TLS itself, so BuildKit never
+	# meets a certificate it has to trust. It is a SEPARATE unit rather than a
+	# second listener in the passthrough, so a crash of one is not a crash of both
+	# and the passthrough's socket-activation contract is untouched.
+	#
+	# BOUND ON THE DOCKER GATEWAY, NOT LOOPBACK. A builder made with buildx's
+	# docker-container driver lives in its own network namespace, where loopback
+	# is its own and the guest's is out of reach without `network=host`; the
+	# gateway is the one address both the guest and every container on the
+	# bridge can dial. It is still inside the guest: nothing outside the microVM
+	# routes to it, the node mints blob URLs naming it only for the adapter, and
+	# the job's containers are the job's own. The `docker` shim on the job's PATH
+	# points a build here, so no workflow has to.
 	#
 	# NOT A GATE ON INTERCEPTION, and what that costs is worth stating exactly. If
-	# it does not start, a build that opted in fails its `type=gha` step with the
-	# same x509 it would have hit without billet -- buildx fills an empty url_v2
-	# from the real results URL, which is DNS-remapped to a certificate the builder
-	# cannot verify. Everything else is untouched: the runner's own cache, the
-	# artifacts and the logs all keep going through the passthrough. Taking the
-	# remap down with it would trade a working cache for a path that fails either
-	# way.
+	# it does not start, the shim has nothing to point at and a container-driver
+	# build fails its `type=gha` step with the same x509 it would have hit without
+	# billet -- buildx fills an empty url_v2 from the real results URL, which is
+	# DNS-remapped to a certificate the builder cannot verify. Everything else is
+	# untouched: the runner's own cache, the artifacts and the logs all keep going
+	# through the passthrough. Taking the remap down with it would trade a working
+	# cache for a path that fails either way.
 	#
 	# BILLET_ADAPTER_START_BEGIN — the block between these markers is extracted and
 	# EXECUTED against fake service-manager commands by
@@ -1238,16 +1313,16 @@ if [ -n "$actions_proxy" ] && [ -n "$actions_ca_path" ] && [ -n "$actions_hook_p
 				--property=Type=notify --property=NotifyAccess=main \
 				--property=TimeoutStartSec=5s \
 				--property=Restart=always --property=RestartSec=100ms \
-				--socket-property=ListenStream="127.0.0.1:$actions_cache_port" \
+				--socket-property=ListenStream="$docker_gateway:$actions_cache_port" \
 				--socket-property=Accept=no --socket-property=FlushPending=no \
 				"$python_runtime" /usr/local/bin/billet-actions-proxy \
 				--mode cache-adapter --systemd-socket --upstream "$actions_proxy" \
 				--fallback-addr "$results_fallback" --ca-file "$actions_ca_path" &&
 			systemctl start billet-actions-cache-adapter.service 2>/dev/null; then
-			actions_cache_url="http://127.0.0.1:$actions_cache_port/"
+			actions_cache_url="http://$docker_gateway:$actions_cache_port/"
 		else
-			log "the BuildKit cache adapter did not start; a build that opts in with url_v2 will"
-			log "fail its type=gha step exactly as it does without billet, and nothing else is affected"
+			log "the BuildKit cache adapter did not start; a container-driver build will fail"
+			log "its type=gha step exactly as it does without billet, and nothing else is affected"
 			systemctl stop billet-actions-cache-adapter.socket \
 				billet-actions-cache-adapter.service 2>/dev/null || true
 		fi
@@ -1486,10 +1561,16 @@ if [ -n "$actions_cache_active" ] && [ -n "$actions_ca_path" ] && [ -n "$actions
 	runner_env+=("NODE_EXTRA_CA_CERTS=$actions_ca_path" "SSL_CERT_FILE=$actions_ca_path"
 		"BILLET_ACTIONS_CA_SOURCE=$actions_ca_path"
 		"ACTIONS_RUNNER_HOOK_JOB_STARTED=$actions_hook_path")
-	# ONLY WHEN THE ADAPTER IS ACTUALLY SERVING. A workflow writes
-	# `url_v2=${{ env.BILLET_ACTIONS_CACHE_URL }}`, so publishing this for a
-	# listener that never started would point BuildKit at a refused connection
-	# instead of leaving it on GitHub's cache.
+	# THE CONTAINER HOOK, ONLY WHERE INTERCEPTION IS: it exists to put the docker
+	# shim inside a job container, and a tier without interception has nothing
+	# for the shim to point at, so those tiers keep the runner's built-in docker
+	# path and this one runs GitHub's reference of it plus one mount.
+	runner_env+=("ACTIONS_RUNNER_CONTAINER_HOOKS=/usr/local/lib/billet/container-hook/index.js")
+	# ONLY WHEN THE ADAPTER IS ACTUALLY SERVING. The docker shim, and a workflow
+	# that writes `url_v2=${{ env.BILLET_ACTIONS_CACHE_URL }}`, point BuildKit
+	# wherever this says, so publishing it for a listener that never started
+	# would point a build at a refused connection instead of leaving it on
+	# GitHub's cache.
 	#
 	# BILLET_ADAPTER_ENV_BEGIN — extracted and executed with the startup block
 	# above by TestTheAgentPublishesTheAdapterURLOnlyWhenItIsServing, because a

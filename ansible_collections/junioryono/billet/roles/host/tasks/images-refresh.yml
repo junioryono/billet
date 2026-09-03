@@ -1,0 +1,63 @@
+---
+# THE GUEST IMAGE REFRESH TIMER, the same units the package ships and enables,
+# rendered here because this fleet installs no package: a node whose images age
+# past GitHub's runner window launches nothing. Enabled when the deployment
+# updates itself (billet_automatic_updates, the same switch as the upgrade timer
+# in services.yml) and installed disabled otherwise, so an operator who turns
+# updates on later has nothing left to render. Removed when the host boots no
+# guests.
+
+- name: Install the guest image refresh units
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: "/etc/systemd/system/{{ item }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - billet-images-refresh.service
+    - billet-images-refresh.timer
+  become: true
+  notify: Reload systemd
+  when: billet_firecracker_enabled and billet_ceph_enabled
+
+- name: Apply guest image refresh unit changes
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable the guest image refresh timer when the deployment updates itself
+  ansible.builtin.systemd_service:
+    name: billet-images-refresh.timer
+    enabled: "{{ billet_automatic_updates | bool }}"
+    state: "{{ 'started' if billet_automatic_updates | bool else 'stopped' }}"
+  become: true
+  when:
+    - billet_firecracker_enabled and billet_ceph_enabled
+    - not ansible_check_mode
+
+- name: Inspect the guest image refresh timer on a host that boots no guests
+  ansible.builtin.stat:
+    path: /etc/systemd/system/billet-images-refresh.timer
+  register: billet_images_refresh_timer_unit
+  when: not (billet_firecracker_enabled and billet_ceph_enabled)
+
+- name: Stop and disable the guest image refresh timer on a host that boots no guests
+  ansible.builtin.systemd_service:
+    name: billet-images-refresh.timer
+    enabled: false
+    state: stopped
+  become: true
+  when:
+    - not (billet_firecracker_enabled and billet_ceph_enabled)
+    - billet_images_refresh_timer_unit.stat.exists
+    - not ansible_check_mode
+
+- name: Remove the guest image refresh units from a host that boots no guests
+  ansible.builtin.file:
+    path: "/etc/systemd/system/{{ item }}"
+    state: absent
+  loop:
+    - billet-images-refresh.timer
+    - billet-images-refresh.service
+  become: true
+  notify: Reload systemd
+  when: not (billet_firecracker_enabled and billet_ceph_enabled)

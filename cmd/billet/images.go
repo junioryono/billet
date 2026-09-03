@@ -333,34 +333,60 @@ func cmdImagesDue(ctx context.Context, args []string) error {
 		return errors.New("billet images due: no image given and no firecracker tier names one")
 	}
 
-	store, err := ceph.New(*cfg.Node.Ceph)
+	store, err := openGenerationDater(cfg)
 	if err != nil {
 		return err
 	}
 
-	newest, found, err := store.NewestGeneration(ctx, image)
+	due, why, err := generationDue(ctx, store, image, *maxAge)
 	if err != nil {
 		return err
 	}
 
-	if !found {
-		fmt.Printf("no generation of %s has been published; a build is due\n", image)
+	fmt.Println(why)
 
-		return nil
-	}
-
-	age := time.Since(newest.Built)
-	if age < *maxAge {
-		fmt.Printf("%s was published %s ago, which is inside %s; nothing to do\n",
-			newest.Name, age.Round(time.Minute), *maxAge)
-
+	if !due {
 		return errNothingToBuild
 	}
 
-	fmt.Printf("the newest generation %s is %s old; a build is due\n",
-		newest.Name, age.Round(time.Minute))
-
 	return nil
+}
+
+// generationDater is the one question `images due` and `billet check` ask of the
+// cluster.
+type generationDater interface {
+	NewestGeneration(ctx context.Context, image string) (ceph.Generation, bool, error)
+}
+
+// openGenerationDater is a variable so a test can answer for the cluster.
+var openGenerationDater = func(cfg *config.Config) (generationDater, error) {
+	return ceph.New(*cfg.Node.Ceph)
+}
+
+// generationDue is the ONE calculation of whether an image is older than the
+// build cadence, over the newest generation's age read from its name. It is
+// maintenance information for `images due` and `billet check`; what decides a
+// pull is `images refresh`, which compares against the channel.
+func generationDue(
+	ctx context.Context, store generationDater, image string, maxAge time.Duration,
+) (bool, string, error) {
+	newest, found, err := store.NewestGeneration(ctx, image)
+	if err != nil {
+		return false, "", err
+	}
+
+	if !found {
+		return true, fmt.Sprintf("no generation of %s has been published; a build is due", image), nil
+	}
+
+	age := time.Since(newest.Built)
+	if age < maxAge {
+		return false, fmt.Sprintf("%s was published %s ago, which is inside %s; nothing to do",
+			newest.Name, age.Round(time.Minute), maxAge), nil
+	}
+
+	return true, fmt.Sprintf("the newest generation %s is %s old; a build is due",
+		newest.Name, age.Round(time.Minute)), nil
 }
 
 // errNothingToBuild says a rebuild is not due. It is an ANSWER rather than a

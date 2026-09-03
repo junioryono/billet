@@ -18,6 +18,10 @@ type scheduledFake struct {
 	scheduleErr map[string]error
 }
 
+// ManagerName is launchd's, because a manager with scheduled agents is launchd,
+// and the systemd timers must not be enabled beside them.
+func (f *scheduledFake) ManagerName() string { return "launchd" }
+
 func (f *scheduledFake) Scheduled() (string, string) {
 	return deploy.UpgradeAgentLabel, deploy.ImagesAgentLabel
 }

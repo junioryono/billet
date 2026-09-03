@@ -45,17 +45,17 @@ func TestTheImagesUnitRefreshesDailyAsRoot(t *testing.T) {
 		"Type=oneshot",
 		"ExecStart=/usr/bin/billet images refresh --config /etc/billet/billet.yaml",
 	} {
-		if !strings.Contains(deploy.ImagesUnit, want) {
-			t.Errorf("%s does not carry %q", deploy.ImagesUnitName, want)
+		if !strings.Contains(deploy.ImagesRefreshUnit, want) {
+			t.Errorf("%s does not carry %q", deploy.ImagesRefreshUnitName, want)
 		}
 	}
 
-	requireScheduledPair(t, deploy.ImagesUnitName, deploy.ImagesUnit,
-		deploy.ImagesTimerName, deploy.ImagesTimer)
+	requireScheduledPair(t, deploy.ImagesRefreshUnitName, deploy.ImagesRefreshUnit,
+		deploy.ImagesRefreshTimerName, deploy.ImagesRefreshTimer)
 
 	for _, want := range []string{"OnCalendar=daily", "Persistent=true"} {
-		if !strings.Contains(deploy.ImagesTimer, want) {
-			t.Errorf("%s does not carry %q", deploy.ImagesTimerName, want)
+		if !strings.Contains(deploy.ImagesRefreshTimer, want) {
+			t.Errorf("%s does not carry %q", deploy.ImagesRefreshTimerName, want)
 		}
 	}
 }

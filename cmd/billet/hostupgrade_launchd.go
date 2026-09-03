@@ -42,7 +42,7 @@ type launchdHost struct {
 
 	staged string
 	agents agentManager
-	// tartImages is what RefreshGuestImages runs on a tart node: a pull of
+	// tartImages is what PrepareImages runs on a tart node: a pull of
 	// every configured image that is absent. A seam so the test does not reach
 	// for tart.
 	tartImages func(ctx context.Context) error
@@ -96,14 +96,14 @@ func (h *launchdHost) stop(ctx context.Context, label string) error {
 	return nil
 }
 
-// RefreshGuestImages pulls every configured tart image that is absent.
+// PrepareImages pulls every configured tart image that is absent.
 //
 // PULL IF ABSENT, NOTHING MORE, for the reason `images refresh` gives on a Mac:
 // a tart tier names an OCI image by tag, and re-pulling one on every upgrade is
 // a decision a person makes. A candidate whose tiers name an image the store
 // does not hold is a node that refuses every job on that tier; this is what
 // stops that being discovered after the swap.
-func (h *launchdHost) RefreshGuestImages(ctx context.Context) error {
+func (h *launchdHost) PrepareImages(ctx context.Context) error {
 	if h.cfg.Node == nil || h.cfg.Node.Provider != config.ProviderTart {
 		return nil
 	}

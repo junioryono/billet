@@ -138,7 +138,7 @@ if [ -d /run/systemd/system ]; then
     # either one to opt this host out. NOT `|| exit`: a host whose systemd
     # refuses the enable (a container image being built, say) must still finish
     # installing.
-    for timer in billet-upgrade.timer billet-images.timer; do
+    for timer in billet-upgrade.timer billet-images-refresh.timer; do
         if ! systemctl enable --now "${timer}" >/dev/null 2>&1; then
             echo "billet: ${timer} could not be enabled; automatic updates on this host" >&2
             echo "        need \`systemctl enable --now ${timer}\` once systemd is running." >&2

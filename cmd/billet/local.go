@@ -148,7 +148,7 @@ func cmdLocalStatus(ctx context.Context, args []string) error {
 // package enables both, and a disabled one looks exactly like a working one
 // from every other angle.
 func printTimers(ctx context.Context) {
-	for _, timer := range []string{deploy.UpgradeTimerName, deploy.ImagesTimerName} {
+	for _, timer := range []string{deploy.UpgradeTimerName, deploy.ImagesRefreshTimerName} {
 		out, err := exec.CommandContext(ctx, "systemctl", "is-enabled", "--", timer).Output()
 
 		state := strings.TrimSpace(string(out))

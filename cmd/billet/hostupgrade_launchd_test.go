@@ -168,7 +168,7 @@ func TestTheLaunchdHostRefreshesImagesOnlyForTart(t *testing.T) {
 	tart := &config.Config{Node: &config.NodeConfig{Provider: config.ProviderTart}}
 
 	h, _ := macHost(t, tart)
-	if err := h.RefreshGuestImages(t.Context()); err == nil ||
+	if err := h.PrepareImages(t.Context()); err == nil ||
 		!strings.Contains(err.Error(), "tart was reached") {
 		t.Errorf("a tart node did not reach the pull: %v", err)
 	}
@@ -176,7 +176,7 @@ func TestTheLaunchdHostRefreshesImagesOnlyForTart(t *testing.T) {
 	docker := &config.Config{Node: &config.NodeConfig{Provider: config.ProviderDocker}}
 
 	h, _ = macHost(t, docker)
-	if err := h.RefreshGuestImages(t.Context()); err != nil {
+	if err := h.PrepareImages(t.Context()); err != nil {
 		t.Errorf("a docker node reached the tart pull: %v", err)
 	}
 }

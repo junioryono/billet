@@ -112,10 +112,10 @@ nfpms:
         dst: /usr/lib/systemd/system/billet-upgrade.service
       - src: deploy/billet-upgrade.timer
         dst: /usr/lib/systemd/system/billet-upgrade.timer
-      - src: deploy/billet-images.service
-        dst: /usr/lib/systemd/system/billet-images.service
-      - src: deploy/billet-images.timer
-        dst: /usr/lib/systemd/system/billet-images.timer
+      - src: deploy/billet-images-refresh.service
+        dst: /usr/lib/systemd/system/billet-images-refresh.service
+      - src: deploy/billet-images-refresh.timer
+        dst: /usr/lib/systemd/system/billet-images-refresh.timer
       - src: deploy/billet-rbd.conf
         dst: /usr/lib/modules-load.d/billet-rbd.conf
 

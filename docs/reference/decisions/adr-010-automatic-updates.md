@@ -26,7 +26,7 @@ The deployment this was built for is a firecracker node in one place and a contr
 
 ### Guest images follow the same rule
 
-`billet images refresh`, run daily by `billet-images.timer` or the `sh.billet.images` agent, pulls, boot-verifies and promotes only when the signed image channel names an image built after the newest generation imported. A generation is named for the moment it was imported, which is always after the build it came from, so the comparison needs no new cluster metadata and the same image is never imported twice; a pull is followed by a reap to three verified generations per guest contract. The Go host transaction gains the step the Ansible role always had: with the node stopped and the server still up, the candidate asks which configured images speak its guest contract and pulls a generation for each that does not.
+`billet images refresh`, run daily by `billet-images-refresh.timer` or the `sh.billet.images` agent, pulls, boot-verifies and promotes only when the signed image channel names an image built after the newest generation imported. A generation is named for the moment it was imported, which is always after the build it came from, so the comparison needs no new cluster metadata and the same image is never imported twice; a pull is followed by a reap to three verified generations per guest contract. The Go host transaction has the step the Ansible role always had, `imaged`: with the services stopped and before the ledger is fenced, the candidate asks which configured images speak its guest contract and pulls a generation for each that does not.
 
 ### The ledger refuses to be served backwards
 

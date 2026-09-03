@@ -249,7 +249,7 @@ Nodes record the highest release they have ever registered with, and `billet sta
 
 ## Guest images
 
-A release is a binary; the runner a job runs in is a guest image billet publishes weekly, and GitHub stops queueing work to a runner about thirty days after a newer one ships. Two things keep the image current without anybody pulling. The transaction itself, on a firecracker host, asks the candidate which configured images speak its guest contract and pulls, verifies and promotes a generation for each that does not, with the node stopped and the server still up, exactly where the Ansible role has always done it. And the package enables `billet-images.timer`, which daily runs `billet images refresh`: it pulls, verifies and promotes only when the signed image channel names an image built after the newest generation imported, then reaps to three verified generations per guest contract. A tart node's refresh pulls every configured image that is absent and nothing more. `automatic: false` stops the refresh too. [Guest images](guest-images.md) has the rest.
+A release is a binary; the runner a job runs in is a guest image billet publishes weekly, and GitHub stops queueing work to a runner about thirty days after a newer one ships. Two things keep the image current without anybody pulling, and they answer different questions. Inside every host upgrade, after the services are stopped and before anything is fenced, the transaction asks the candidate binary whether the images this host's tiers boot are compatible with it (`billet images compatible`) and pulls, boot-verifies and promotes a generation for each that is not (`billet images pull --verify`), so a host is `committed` only with an image it can actually launch, and a host that cannot get one rolls back naming that as the reason. Between upgrades, the package enables `billet-images-refresh.timer`, which daily runs `billet images refresh`: it pulls, verifies and promotes only when the signed image channel names an image built after the newest generation imported, then reaps to three verified generations per guest contract, which is what keeps the baked Actions runner inside GitHub's thirty-day window on a host nobody upgrades for a month. A tart node's refresh pulls every configured image that is absent and nothing more. `automatic: false` stops the refresh too. `billet check` on a firecracker node names each image's newest generation and says when the timer is not enabled. [Guest images](guest-images.md) has the rest.
 
 ## Configuration
 
@@ -283,7 +283,7 @@ A maintenance window bounds when a rollout may **begin**. It never stops one —
 | The control plane, on a Mac | the `sh.billet.upgrade` agent `billet local up` installs |
 | A PostgreSQL controller, single or active-passive | the same timer on every controller host; see [PostgreSQL and active-passive controllers](../deploying/postgres-and-active-passive.md) for what its transaction skips |
 | Every node, Linux or Mac | the coordinator's dispatch, through the node's own updater |
-| Guest images on a firecracker node | the transaction, and `billet-images.timer` daily |
+| Guest images on a firecracker node | the transaction, and `billet-images-refresh.timer` daily |
 | Guest images on a tart node | the transaction and the `sh.billet.images` agent, pulling only what is absent |
 | A host installed by `install.sh` with no units | nothing; the units are what an updater stops and starts, and the script installs none |
 | An EC2 AMI or a CodeBuild image | nothing; `billet ami build` remains an operator's step |

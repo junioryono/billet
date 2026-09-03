@@ -621,6 +621,13 @@ func (c *Converger) DisableCmd(label string) string {
 // ManagerName is what billet calls this service manager in a sentence.
 func (c *Converger) ManagerName() string { return "launchd" }
 
+// StartTimer refuses: launchd has no timer units. The scheduled maintenance a
+// Mac runs is the two oneshot agents EnableScheduled installs, and `up` asks the
+// manager's name before it reaches for this.
+func (c *Converger) StartTimer(_ context.Context, unit string) error {
+	return fmt.Errorf("launchd has no timer to start for %s", unit)
+}
+
 // CollateralNote explains how enabling one service could commit another.
 //
 // launchd HAS NO SUCH MECHANISM, which is worth saying rather than leaving the

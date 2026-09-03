@@ -24,14 +24,15 @@ const (
 	BackupUnitName  = "billet-backup.service"
 	BackupTimerName = "billet-backup.timer"
 	// UpgradeUnitName and UpgradeTimerName are the root executor of a recorded
-	// rollout on a control-plane host, and ImagesUnitName and ImagesTimerName
-	// the daily guest-image refresh on a node. Both timers are enabled by the
-	// package — the one exception to the package enabling nothing, stated in
-	// the units themselves — and neither is managed by `billet local up`.
-	UpgradeUnitName  = "billet-upgrade.service"
-	UpgradeTimerName = "billet-upgrade.timer"
-	ImagesUnitName   = "billet-images.service"
-	ImagesTimerName  = "billet-images.timer"
+	// rollout on a control-plane host, and ImagesRefreshUnitName and
+	// ImagesRefreshTimerName the daily guest-image refresh on a node. Both
+	// timers are enabled by the package — the one exception to the package
+	// enabling nothing, stated in the units themselves — and `billet local up`
+	// enables them too, as a reported last step outside the unit plan.
+	UpgradeUnitName        = "billet-upgrade.service"
+	UpgradeTimerName       = "billet-upgrade.timer"
+	ImagesRefreshUnitName  = "billet-images-refresh.service"
+	ImagesRefreshTimerName = "billet-images-refresh.timer"
 )
 
 // ServerUnit is the control-plane unit this build ships.
@@ -60,14 +61,14 @@ var UpgradeUnit string
 //go:embed billet-upgrade.timer
 var UpgradeTimer string
 
-// ImagesUnit and ImagesTimer are the scheduled guest-image refresh this build
-// ships.
+// ImagesRefreshUnit and ImagesRefreshTimer are the scheduled guest-image
+// refresh this build ships.
 //
-//go:embed billet-images.service
-var ImagesUnit string
+//go:embed billet-images-refresh.service
+var ImagesRefreshUnit string
 
-//go:embed billet-images.timer
-var ImagesTimer string
+//go:embed billet-images-refresh.timer
+var ImagesRefreshTimer string
 
 // Launch agent labels, as launchd knows them. A macOS service is addressed by
 // its LABEL rather than its filename, so these are the strings `launchctl`
@@ -79,7 +80,7 @@ const (
 	ServerAgentName  = ServerAgentLabel + ".plist"
 	NodeAgentName    = NodeAgentLabel + ".plist"
 	// UpgradeAgentLabel and ImagesAgentLabel are the Mac's scheduled oneshots:
-	// the analogues of billet-upgrade.timer and billet-images.timer, installed
+	// the analogues of billet-upgrade.timer and billet-images-refresh.timer, installed
 	// by `billet local up` because on a Mac that command is the converge.
 	UpgradeAgentLabel = "sh.billet.upgrade"
 	ImagesAgentLabel  = "sh.billet.images"

@@ -47,6 +47,15 @@ const (
 
 	// StepStopped is both services stopped and the old binary hidden.
 	StepStopped Step = "stopped"
+	// StepImaged is a guest generation the candidate's contract accepts in the
+	// cluster, for every image this host's microVM tiers boot.
+	//
+	// BEFORE THE FENCE, because a pull records nothing in the ledger and
+	// everything in the cluster and on this host's disk, and AFTER THE STOP,
+	// because nothing may launch against a generation while it is being imported
+	// and verified. It has no unwinding: a generation the old binary does not
+	// accept is inert to it, and the next upgrade finds it already there.
+	StepImaged Step = "imaged"
 
 	// StepFenced is the maintenance fence written and flushed.
 	StepFenced Step = "fenced"
@@ -88,6 +97,7 @@ var ordered = []Step{
 	StepClaimed,
 	StepStaged,
 	StepStopped,
+	StepImaged,
 	StepFenced,
 	StepSnapshotted,
 	StepInstalled,

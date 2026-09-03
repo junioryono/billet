@@ -5,8 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
+	"runtime"
 	"strings"
+	"time"
 
+	"github.com/junioryono/billet/deploy"
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/github"
@@ -247,7 +251,11 @@ func runCheck(ctx context.Context, opts checkOptions) (checkReport, error) {
 		// like one that is working, and the day an operator finds out is the day
 		// the archive was needed. ADVISORY throughout: this reports, and nothing
 		// here decides whether the deployment may run.
+		reportLocalBackupAge(ctx)
 		reportBackupAge(ctx, cfg, skipNetworkProbes)
+		reportTimer(ctx, "updates", deploy.UpgradeTimerName,
+			"a recorded rollout waits on this host until somebody runs "+
+				"billet host-upgrade --from-rollout")
 
 		a, err := alloc.New(db, alloc.Limits{
 			MaxVCPU:   cfg.Server.MaxVCPU,
@@ -342,6 +350,10 @@ func runCheck(ctx context.Context, opts checkOptions) (checkReport, error) {
 			if err := checkFirecrackerHost(ctx, cfg); err != nil {
 				return report, err
 			}
+			// REPORTED, NEVER FATAL: a stale image is maintenance information, and
+			// the failure this line exists to catch is a refresh timer that stopped
+			// firing, which looks exactly like one that is working.
+			reportGuestImageFreshness(ctx, cfg)
 		}
 
 		if cfg.Node.Provider == config.ProviderTart {
@@ -532,4 +544,135 @@ func checkTrustedGroup(ctx context.Context, cfg *config.Config, t *config.Tier) 
 	}
 
 	return policy.ValidateTrustedRunnerGroup(ctx, id, t.Workflows)
+}
+
+// reportGuestImageFreshness names the newest generation of each image this
+// host's microVM tiers boot, how old it is, and whether the packaged refresh
+// timer is what will replace it.
+func reportGuestImageFreshness(ctx context.Context, cfg *config.Config) {
+	if cfg.Node == nil || cfg.Node.Ceph == nil {
+		return
+	}
+
+	images, err := firecrackerTierImages(cfg)
+	if err != nil || len(images) == 0 {
+		return
+	}
+
+	store, err := openGenerationDater(cfg)
+	if err != nil {
+		fmt.Printf("images   could not read the cluster's generations: %v\n", err)
+
+		return
+	}
+
+	for _, image := range images {
+		name, _, _ := strings.Cut(image, "@")
+
+		_, why, err := generationDue(ctx, store, name, imagesRefreshAge)
+		if err != nil {
+			fmt.Printf("images   %s: could not tell: %v\n", name, err)
+
+			continue
+		}
+
+		fmt.Printf("images   %s: %s\n", name, why)
+	}
+
+	reportTimer(ctx, "refresh", deploy.ImagesRefreshTimerName,
+		"nothing will replace an image that ages out of GitHub's runner window")
+}
+
+// reportTimer says whether a packaged timer is enabled, or that it could not ask.
+func reportTimer(ctx context.Context, label, timer, consequence string) {
+	switch enabled, err := timerEnabled(ctx, timer); {
+	case err != nil:
+		fmt.Printf("%-8s could not tell whether %s is enabled: %v\n", label, timer, err)
+	case enabled:
+		fmt.Printf("%-8s %s is enabled\n", label, timer)
+	default:
+		fmt.Printf("%-8s %s is NOT enabled; %s (billet local up enables it, or: "+
+			"systemctl enable --now %s)\n", label, timer, consequence, timer)
+	}
+}
+
+// localBackupDir is where the packaged backup unit writes, one directory per
+// run; the unit's ExecStart is the one spelling of it.
+const localBackupDir = "/var/lib/billet/backups"
+
+// localBackupStale is two missed daily runs.
+const localBackupStale = 48 * time.Hour
+
+// reportLocalBackupAge names the newest local archive and how old it is, and
+// whether the timer that writes them is enabled. A timer that stopped firing
+// looks exactly like one that is working, and the day an operator finds out is
+// the day the archive was needed. ADVISORY: reports, decides nothing.
+func reportLocalBackupAge(ctx context.Context) {
+	entries, err := os.ReadDir(localBackupDir)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		fmt.Printf("backup   no local archive yet under %s\n", localBackupDir)
+	case err != nil:
+		fmt.Printf("backup   UNCHECKED: %s: %v\n", localBackupDir, err)
+	default:
+		var newest string
+		var newestAt time.Time
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			info, err := e.Info()
+			if err != nil {
+				continue
+			}
+			if newest == "" || info.ModTime().After(newestAt) {
+				newest, newestAt = e.Name(), info.ModTime()
+			}
+		}
+		switch {
+		case newest == "":
+			fmt.Printf("backup   no local archive yet under %s\n", localBackupDir)
+		case time.Since(newestAt) > localBackupStale:
+			fmt.Printf("backup   newest local archive %s is %s old, past two daily runs; the timer "+
+				"may have stopped firing\n", newest, time.Since(newestAt).Round(time.Hour))
+		default:
+			fmt.Printf("backup   newest local archive %s, %s old\n", newest,
+				time.Since(newestAt).Round(time.Minute))
+		}
+	}
+
+	reportTimer(ctx, "backup", deploy.BackupTimerName,
+		"nothing writes an archive of this deployment")
+}
+
+// imagesRefreshAge is the age past which `billet check` calls an image stale,
+// the same as `images refresh`'s default: the weekly build plus a day of slack.
+const imagesRefreshAge = 6 * 24 * time.Hour
+
+// timerEnabled asks systemd whether a packaged timer is enabled. Off Linux, or
+// where systemctl is absent, the answer is an error rather than false, because
+// "not enabled" is a verdict and "could not ask" is not.
+var timerEnabled = func(ctx context.Context, timer string) (bool, error) {
+	if runtime.GOOS != "linux" {
+		return false, errors.New("no systemd on " + runtime.GOOS)
+	}
+
+	systemctl, err := exec.LookPath("systemctl")
+	if err != nil {
+		return false, err
+	}
+
+	out, err := exec.CommandContext(ctx, systemctl, "is-enabled", timer).Output()
+	state := strings.TrimSpace(string(out))
+
+	switch {
+	case state == "enabled" || state == "enabled-runtime" || state == "static":
+		return true, nil
+	case state != "":
+		// `is-enabled` exits non-zero for disabled and not-found alike, and the
+		// word on stdout is the verdict.
+		return false, nil
+	default:
+		return false, err
+	}
 }

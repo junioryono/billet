@@ -221,7 +221,7 @@ jobs:
 
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            debootstrap e2fsprogs jq zstd \
+            debootstrap e2fsprogs jq zstd unzip \
             build-essential flex bison libelf-dev libssl-dev bc \
             dnsmasq
 

@@ -25,17 +25,6 @@ type Host interface {
 	// may end a job.
 	StopNode(ctx context.Context) error
 
-	// RefreshGuestImages puts a guest image the candidate can boot in place, on
-	// a host that boots any, before the candidate is installed.
-	//
-	// BETWEEN THE NODE STOPPING AND THE SERVER STOPPING, which is where the
-	// Ansible role has always done it: the node is stopped so no launch races
-	// the contract change, and the control plane is still up so the drain it
-	// just recorded stays recorded. A candidate whose guest contract moved would
-	// otherwise come up with `@verified` resolving to nothing it can boot, and
-	// every job on that host refused until somebody pulled by hand.
-	RefreshGuestImages(ctx context.Context) error
-
 	// StopServer stops the control plane, after custody has settled.
 	StopServer(ctx context.Context) error
 
@@ -47,6 +36,12 @@ type Host interface {
 	// HideBinary removes the installed executable so a concurrent operator
 	// cannot enter through either version while the swap is underway.
 	HideBinary(ctx context.Context) error
+
+	// PrepareImages puts a guest generation the candidate's contract accepts in
+	// the cluster for every image this host's microVM tiers boot, or does nothing
+	// on a host that boots none. A host whose new binary refuses every image it
+	// holds launches nothing until somebody pulls, which is not an upgraded host.
+	PrepareImages(ctx context.Context) error
 
 	// Fence makes already-open operator handles refuse transactions, and waits
 	// for any transaction that began before it to finish.
@@ -269,18 +264,16 @@ func advance(ctx context.Context, req Request, log *slog.Logger) error {
 				return err
 			}
 
-			// THE GUEST IMAGE, WITH THE NODE STOPPED AND THE SERVER STILL UP. See
-			// Host.RefreshGuestImages for why exactly here.
-			if err := host.RefreshGuestImages(ctx); err != nil {
-				return err
-			}
-
 			if err := host.StopServer(ctx); err != nil {
 				return err
 			}
 
 			return host.HideBinary(ctx)
 		},
+	}, {
+		step: StepImaged,
+		what: "pulling a guest generation the candidate accepts",
+		do:   host.PrepareImages,
 	}, {
 		step: StepFenced,
 		what: "fencing the ledger",

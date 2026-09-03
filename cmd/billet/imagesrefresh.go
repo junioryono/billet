@@ -48,7 +48,7 @@ var (
 // THE OTHER HALF OF AN AUTOMATIC UPDATE. A release is a binary; the runner a job
 // runs in is a guest image billet publishes weekly, and GitHub stops queueing
 // work to a runner about thirty days after a newer one ships. This is what
-// billet-images.timer runs daily so a node that updates its binary also updates
+// billet-images-refresh.timer runs daily so a node that updates its binary also updates
 // what it boots.
 //
 // NEWER THAN WHAT IS IMPORTED, NOT MERELY OLD. A generation is named for the

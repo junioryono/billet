@@ -19,6 +19,8 @@ var gateSubjects = map[string]string{
 	"ACTIONS_PROXY":  "../internal/guestassets/actions-proxy.py",
 	"DNS_UPSTREAMS":  "../internal/guestassets/dns-upstreams.py",
 	"DOCKER_CACHE":   "../internal/guestassets/docker-cache.sh",
+	"DOCKER_SHIM":    "../internal/guestassets/docker-shim.sh",
+	"CONTAINER_HOOK": "../internal/guestassets/container-hook.js",
 	"RUNNER_DIR":     "../internal/guestassets/runner-service.sh",
 	"AGENT":          "", // the agent is a heredoc inside build-guest-image.sh
 	"IMAGE_ENV_FILE": "",

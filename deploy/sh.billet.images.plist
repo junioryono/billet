@@ -4,7 +4,7 @@
   billet guest image refresh, for a Mac.
 
   INSTALLED BY `billet local up`, beside sh.billet.upgrade, and the analogue of
-  billet-images.timer. Once a day it runs `billet images refresh`, which on a
+  billet-images-refresh.timer. Once a day it runs `billet images refresh`, which on a
   tart node pulls every image the tiers name that is not yet in tart's store —
   and only those: a tart tier names an OCI image by tag, and re-pulling tens of
   gigabytes on a schedule for a tag that may not have moved is a decision a

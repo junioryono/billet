@@ -347,6 +347,14 @@ func TestTheBackupUnitRunsAsTheServiceAccountAndIsNotEnabledDirectly(t *testing.
 			deploy.BackupTimerName)
 	}
 
+	// DAILY AND SPREAD, and a test names both so a retuned schedule is a decision
+	// somebody wrote down rather than an edit nobody noticed.
+	for _, want := range []string{"OnCalendar=daily", "RandomizedDelaySec="} {
+		if !strings.Contains(deploy.BackupTimer, want) {
+			t.Errorf("%s does not carry %q", deploy.BackupTimerName, want)
+		}
+	}
+
 	// A MISSED RUN IS RUN. Without this a host that was off overnight silently
 	// skips a day, and a backup's failures are the ones nobody sees.
 	if !strings.Contains(deploy.BackupTimer, "Persistent=true") {
@@ -369,6 +377,40 @@ func TestTheBackupUnitRunsAsTheServiceAccountAndIsNotEnabledDirectly(t *testing.
 			if strings.Contains(line, "rm ") || strings.Contains(line, "find ") {
 				t.Errorf("%s removes files: %q", name, line)
 			}
+		}
+	}
+}
+
+// THE IMAGE REFRESH FOLLOWS THE BACKUP'S SHAPE: a oneshot nothing enables at
+// boot, a timer that is the thing enabled, run daily with the decision in the
+// command, persistent so a host that was off does not wait another day, and as
+// root because a pull maps RBD and boots a probe under the jailer.
+func TestTheImageRefreshUnitIsAPersistentDailyTimerRunAsRoot(t *testing.T) {
+	for _, want := range []string{
+		"User=root",
+		"Type=oneshot",
+		"ExecStart=/usr/bin/billet images refresh --config /etc/billet/billet.yaml",
+		"ReadWritePaths=/var/lib/billet",
+	} {
+		if !strings.Contains(deploy.ImagesRefreshUnit, want) {
+			t.Errorf("%s does not carry %q", deploy.ImagesRefreshUnitName, want)
+		}
+	}
+
+	if strings.Contains(deploy.ImagesRefreshUnit, "[Install]") {
+		t.Errorf("%s has an [Install] section: a oneshot enabled at boot runs once per boot and "+
+			"then never again, which reads exactly like a working schedule", deploy.ImagesRefreshUnitName)
+	}
+
+	for _, want := range []string{
+		"[Install]",
+		"OnCalendar=daily",
+		"Persistent=true",
+		"RandomizedDelaySec=",
+		"Unit=" + deploy.ImagesRefreshUnitName,
+	} {
+		if !strings.Contains(deploy.ImagesRefreshTimer, want) {
+			t.Errorf("%s does not carry %q", deploy.ImagesRefreshTimerName, want)
 		}
 	}
 }

@@ -1252,58 +1252,12 @@ func (h *systemdHost) StopServer(ctx context.Context) error {
 	return h.stop(ctx, serverUnit)
 }
 
-// RefreshGuestImages pulls a generation the candidate can boot, on a firecracker
-// host, using the candidate's own judgement of what that is.
-//
-// THE CANDIDATE DECIDES, BECAUSE THE CONTRACT IS THE CANDIDATE'S. `images
-// compatible` reads the guest contract out of the binary that runs it, so it is
-// the staged candidate that has to ask whether each configured image speaks its
-// contract — this binary would answer for the release being replaced. Exit 2
-// names the images that need a generation in the result file; each is then
-// pulled, boot-verified and promoted by the candidate too, so the generation it
-// records as verified is one it proved itself. The same three commands, in the
-// same order, as the Ansible role's transaction.
-func (h *systemdHost) RefreshGuestImages(ctx context.Context) error {
-	if h.cfg.Node == nil || h.cfg.Node.Provider != config.ProviderFirecracker {
-		return nil
-	}
-
-	results := filepath.Join(filepath.Dir(h.staged), "guest-images-to-refresh")
-
-	err := h.runStaged(ctx, "images", "compatible", "--result-file", results,
-		"--config", h.configPath())
-	if err == nil {
-		fmt.Printf("  every configured guest image speaks the candidate's contract\n")
-
-		return nil
-	}
-
-	if subprocessExit(err) != 2 {
-		return fmt.Errorf("asking the candidate which guest images it can boot: %w", err)
-	}
-
-	needed, err := readImageResults(results)
-	if err != nil {
-		return err
-	}
-
-	for _, image := range needed {
-		fmt.Printf("  pulling and verifying a generation of %s the candidate can boot\n", image)
-
-		if err := h.runStaged(ctx, "images", "pull", "--verify", "--config", h.configPath(),
-			image); err != nil {
-			return fmt.Errorf("pulling a guest image for the candidate: %w", err)
-		}
-	}
-
-	return nil
-}
-
-// readImageResults reads the bare image names `images compatible` wrote.
+// readImageResults reads the bare image names `images compatible --result-file`
+// wrote, one per line.
 func readImageResults(path string) ([]string, error) {
 	body, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("read which guest images the candidate needs: %w", err)
+		return nil, fmt.Errorf("the candidate said images need a generation but left no list: %w", err)
 	}
 
 	var names []string
@@ -1312,6 +1266,10 @@ func readImageResults(path string) ([]string, error) {
 		if name := strings.TrimSpace(line); name != "" {
 			names = append(names, name)
 		}
+	}
+
+	if len(names) == 0 {
+		return nil, errors.New("the candidate said images need a generation and named none")
 	}
 
 	return names, nil
@@ -1553,6 +1511,57 @@ func (h *ledgerHost) lowerWatermark(ctx context.Context) error {
 	}
 
 	fmt.Printf("  lowered the ledger's release watermark to %s, as asked\n", h.downgradeTo)
+
+	return nil
+}
+
+// PrepareImages pulls a guest generation the candidate accepts, for every image
+// this host's firecracker tiers boot.
+//
+// THE CANDIDATE DECIDES, FROM THE STAGED BINARY. `images compatible` reads the
+// guest contract out of the binary that runs it, so it is the staged candidate
+// that has to ask whether each configured image speaks its contract; this
+// binary would answer for the release being replaced. Its exit status is the
+// answer: 0 is nothing to do, 2 names the images that need a generation in the
+// result file, and anything else could not tell, which refuses the upgrade
+// rather than reading as "nothing to do". The pull is the same `images pull
+// --verify` an operator runs, so the generation is imported, booted and
+// promoted under the same rules, by the candidate that will boot it. This is
+// the Go half of what the Ansible host role's transaction already did.
+func (h *systemdHost) PrepareImages(ctx context.Context) error {
+	if h.cfg.Node == nil || h.cfg.Node.Provider != config.ProviderFirecracker ||
+		h.cfg.Node.Ceph == nil {
+		return nil
+	}
+
+	result := filepath.Join(filepath.Dir(h.staged), "guest-images-to-refresh")
+
+	err := h.runStaged(ctx, "images", "compatible", "--config", h.configPath(),
+		"--result-file", result)
+	if err == nil {
+		fmt.Printf("  every configured guest image speaks the candidate's contract\n")
+
+		return nil
+	}
+
+	if subprocessExit(err) != 2 {
+		return fmt.Errorf("the candidate could not say whether this host's guest images are "+
+			"compatible with it: %w", err)
+	}
+
+	names, err := readImageResults(result)
+	if err != nil {
+		return err
+	}
+
+	for _, name := range names {
+		fmt.Printf("  pulling and verifying a generation of %s the candidate can boot\n", name)
+
+		if err := h.runStaged(ctx, "images", "pull", "--verify", "--config", h.configPath(),
+			name); err != nil {
+			return fmt.Errorf("pulling a generation of %s the candidate accepts: %w", name, err)
+		}
+	}
 
 	return nil
 }

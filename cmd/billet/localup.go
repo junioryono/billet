@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/junioryono/billet/deploy"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/initconfig"
 	"github.com/junioryono/billet/internal/lifeops"
@@ -59,6 +60,7 @@ type converger interface {
 	EnabledNow(ctx context.Context, unit string) (lifeops.Enablement, error)
 	Enable(ctx context.Context, unit string) error
 	Disable(ctx context.Context, unit string) error
+	StartTimer(ctx context.Context, unit string) error
 	StopAndProve(ctx context.Context, unit string) (lifeops.StopResult, error)
 }
 
@@ -264,10 +266,15 @@ func runLocalUp(ctx context.Context, o upOptions) error {
 		return err
 	}
 
-	// THE SCHEDULED AGENTS, AFTER THE SERVICES ARE UP AND PROVED. On a Mac this
-	// command is the converge — there is no package to enable a timer — so the
-	// two oneshots that act on rollouts and refresh images are installed here.
-	// On Linux the package and the role own the timers, and this does nothing.
+	// THE SCHEDULES, AFTER THE SERVICES ARE UP AND PROVED. On systemd the timers
+	// the package enables are enabled and armed again here, reported rather than
+	// fatal, because a host set up from a tarball ran no postinstall. On a Mac
+	// this command is the converge — there is no package to enable a timer — so
+	// the two oneshot agents that act on rollouts and refresh images are
+	// installed here, and a schedule that could not be installed is an exit
+	// status, because a Mac that never updates is what it would otherwise be.
+	enableTimers(ctx, c, cfg, req)
+
 	if err := enableScheduledAgents(ctx, c); err != nil {
 		return err
 	}
@@ -317,6 +324,66 @@ func enableScheduledAgents(ctx context.Context, c converger) error {
 	}
 
 	return nil
+}
+
+// enableTimers enables and starts the scheduled maintenance this host needs,
+// after its services are up and proved: the backup and the updater on a
+// control-plane host, the guest image refresh on a firecracker node.
+//
+// WHY `up` DOES THIS AT ALL. The package enables no service, and a deployment is
+// four things that are useless apart, so a host installed from the package had
+// no backup until an operator enabled a unit the docs mentioned; the first
+// hardware failure on such a host lost the fleet's identity. The package does
+// enable the two update timers, but a host converged from a tarball ran no
+// postinstall. All three are idempotent and refuse to overwrite, so enabling
+// them blind is safe. REPORTED, NEVER FATAL: the services are running by now,
+// and a timer that could not be enabled is one line naming the command, not a
+// reason to unwind a control plane that is taking work.
+//
+// SYSTEMD ONLY, by the manager's name: launchd has no timers, and the Mac's
+// scheduled agents are enableScheduledAgents' job.
+func enableTimers(ctx context.Context, c converger, cfg *config.Config, req lifeops.UpRequest) {
+	if c.ManagerName() != "systemd" {
+		return
+	}
+
+	var timers []string
+
+	if req.WantServer {
+		timers = append(timers, deploy.BackupTimerName, deploy.UpgradeTimerName)
+	}
+
+	if cfg.Node != nil && cfg.Node.Provider == config.ProviderFirecracker && cfg.Node.Ceph != nil {
+		timers = append(timers, deploy.ImagesRefreshTimerName)
+	}
+
+	for _, timer := range timers {
+		enablement, err := c.EnabledNow(ctx, timer)
+		if err != nil {
+			fmt.Printf("timer    %s: could not read its enablement (%v); run: systemctl enable --now %s\n",
+				timer, err, timer)
+
+			continue
+		}
+
+		if enablement.Enabled != lifeops.Yes {
+			if err := c.Enable(ctx, timer); err != nil {
+				fmt.Printf("timer    %s: could not be enabled (%v); run: systemctl enable --now %s\n",
+					timer, err, timer)
+
+				continue
+			}
+		}
+
+		if err := c.StartTimer(ctx, timer); err != nil {
+			fmt.Printf("timer    %s: enabled but could not be started (%v); run: systemctl start %s\n",
+				timer, err, timer)
+
+			continue
+		}
+
+		fmt.Printf("timer    %s enabled and armed\n", timer)
+	}
 }
 
 // clearShutdownSeal reopens admission if — and only if — a shutdown is what

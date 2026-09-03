@@ -138,10 +138,10 @@ billet_release_channel: ""
 # starts a rollout when the stable channel advances (release.automatic, on
 # unless written false), and two timers on each host act on it: billet-upgrade
 # runs `billet host-upgrade --from-rollout` on a host with a control plane, and
-# billet-images runs `billet images refresh` on a firecracker host. The role
-# installs both units wherever they apply and enables them when this is true;
-# false installs them disabled, so an operator who turns updates on later has
-# nothing to render.
+# billet-images-refresh runs `billet images refresh` on a firecracker host. The
+# role installs both units wherever they apply and enables them when this is
+# true; false installs them disabled, so an operator who turns updates on later
+# has nothing to render.
 #
 # HOW THIS COEXISTS WITH billet_version, which is the question every operator
 # asks next. A pin is the release the role installs on a converge; a rollout is

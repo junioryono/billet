@@ -72,12 +72,13 @@ type Dispatcher interface {
 // blocked the next one. This is what makes that sentence true.
 //
 // IT DOES NOT REPLACE THE CONTROL PLANE. A process cannot install its own
-// successor — that is `billet host-upgrade`, run on the controller's host by an
-// operator or by external automation. What the coordinator does about the
-// controller is OBSERVE: when the running binary is the target, it records that,
-// and only then does it begin on the nodes. That is what makes the rollout
-// server-first, and it is an observation rather than an action precisely because
-// the acting half cannot live in the process being replaced.
+// successor, and this one runs unprivileged — that is `billet host-upgrade
+// --from-rollout`, run on the controller's host as root by the packaged timer
+// or an operator. What the coordinator does about the controller is OBSERVE:
+// when the running binary is the target, it records that, and only then does it
+// begin on the nodes. That is what makes the rollout server-first, and it is an
+// observation rather than an action precisely because the acting half cannot
+// live in the process being replaced.
 type Coordinator struct {
 	store      *Store
 	fleet      Fleet
