@@ -45,6 +45,7 @@ import (
 	"github.com/junioryono/billet/internal/provider/ec2"
 	"github.com/junioryono/billet/internal/provider/firecracker"
 	"github.com/junioryono/billet/internal/provider/tart"
+	"github.com/junioryono/billet/internal/releasesource"
 	"github.com/junioryono/billet/internal/rollout"
 	"github.com/junioryono/billet/internal/scaleset"
 	"github.com/junioryono/billet/internal/server"
@@ -329,7 +330,7 @@ func cmdServer(ctx context.Context, lc *lifecycle, args []string) error {
 	//
 	// --dry-run remains for proving the GitHub path while advertising zero.
 
-	return runServer(ctx, lc, cfg, *dryRun, *upgradeProbe)
+	return runServer(ctx, lc, cfg, *cfgPath, *dryRun, *upgradeProbe)
 }
 
 // claimNodeDeployment reads this host's identity and takes the host-wide lock on
@@ -489,6 +490,7 @@ func runServer(
 	ctx context.Context,
 	lc *lifecycle,
 	cfg *config.Config,
+	cfgPath string,
 	dryRun, upgradeProbe bool,
 ) error {
 	// Built by the SHARED constructor, so the server and teardown authenticate
@@ -726,13 +728,34 @@ func runServer(
 	// a host. It is wired here rather than inside server.New for the same reason
 	// the runner is: what a control plane can talk to is a property of how this
 	// process was assembled, not of the scheduler.
+	// AND THE CONTROLLER'S OWN HALF, UNDER release.automatic. A process cannot
+	// install its own successor, so the coordinator is given the node's updater
+	// to start on this host — the same detached `billet host-upgrade`, journal,
+	// claim and decision fence — and nothing else changes: it still only
+	// OBSERVES the result, from the successor. Refused on a PostgreSQL ledger for
+	// the reason the transactional upgrade is refused there, and said at startup
+	// rather than discovered at the first rollout.
+	coordinatorOpts := []rollout.CoordinatorOption{rollout.WithCoordinatorLogger(slog.Default())}
+	automatic := cfg.Release != nil && cfg.Release.Automatic
+	postgres := cfg.Server.State != nil && cfg.Server.State.Backend == config.StatePostgres
+
+	switch {
+	case automatic && postgres:
+		slog.Warn("release.automatic is set, but this control plane's own host is not upgraded " +
+			"automatically on a PostgreSQL ledger; run `billet host-upgrade` there when a rollout " +
+			"is waiting on the controller")
+	case automatic:
+		coordinatorOpts = append(coordinatorOpts,
+			rollout.WithSelfUpgrader(node.ExecUpgrader{ConfigPath: cfgPath}))
+	}
+
 	coordinator := rollout.NewCoordinator(
 		rollout.New(db),
 		ledgerFleet{alloc: allocator},
 		planeDispatcher{runner: planeRunner},
 		version.Version(),
 		nodeapi.VersionNodeUpgrade,
-		rollout.WithCoordinatorLogger(slog.Default()),
+		coordinatorOpts...,
 	)
 
 	opts = append(opts,
@@ -749,6 +772,37 @@ func runServer(
 	)
 
 	plane := server.New(allocator, wiring.Provisioner{Client: client}, cfg.Tiers, owner, slog.Default(), opts...)
+
+	// THE AUTOMATIC ROLLOUT STARTER, beside the coordinator rather than inside
+	// it: one records a decision, the other converges whatever is recorded. Below
+	// becomeController, because recording one is a write only the controller may
+	// make. Its resolve is the one `billet rollout start` uses.
+	if automatic {
+		client := &releasesource.Client{}
+
+		policy, err := releasesource.PolicyForRelease(false)
+		if err != nil {
+			return err
+		}
+
+		release := cfg.Release
+		starter := &rolloutAutostart{
+			release: release,
+			store:   rollout.New(db),
+			fleet:   ledgerFleet{alloc: allocator},
+			running: version.Version(),
+			current: releasesource.Host(version.Version(),
+				releasesource.Range{Min: nodeapi.MinVersion, Max: nodeapi.Version},
+				state.LatestSchemaVersion(), firecracker.GuestContract),
+			resolve: func(ctx context.Context) (*releasesource.Manifest, string, error) {
+				return resolveTarget(ctx, client, policy, release.Channel, release.Version)
+			},
+			now: time.Now,
+			log: slog.Default(),
+		}
+
+		go starter.Run(ctx)
+	}
 
 	// READINESS IS REPORTED BEFORE THE LISTENERS OPEN THEIR SESSIONS, AND MOVING IT
 	// AFTER THEM WOULD BE A RESTART LOOP.

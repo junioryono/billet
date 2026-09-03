@@ -5,7 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"time"
+
+	"github.com/junioryono/billet/internal/nodeapi"
 )
 
 // Host is what the coordinator knows about one machine in the fleet.
@@ -71,13 +74,16 @@ type Dispatcher interface {
 // pointed out that nothing did, so every started rollout stayed open forever and
 // blocked the next one. This is what makes that sentence true.
 //
-// IT DOES NOT REPLACE THE CONTROL PLANE. A process cannot install its own
-// successor — that is `billet host-upgrade`, run on the controller's host by an
-// operator or by external automation. What the coordinator does about the
-// controller is OBSERVE: when the running binary is the target, it records that,
-// and only then does it begin on the nodes. That is what makes the rollout
-// server-first, and it is an observation rather than an action precisely because
-// the acting half cannot live in the process being replaced.
+// IT DOES NOT REPLACE THE CONTROL PLANE ITSELF. A process cannot install its own
+// successor — that is `billet host-upgrade`, a detached program that outlives the
+// process that started it. What the coordinator does about the controller is
+// OBSERVE: when the running binary is the target, it records that, and only then
+// does it begin on the nodes. That is what makes the rollout server-first, and it
+// is an observation rather than an action precisely because the acting half
+// cannot live in the process being replaced. What it MAY do is START that
+// program, exactly as a node does when told to upgrade, when it has been given a
+// SelfUpgrader: `release.automatic` wires one, so a deployment following a
+// channel needs nobody at the controller's keyboard either.
 type Coordinator struct {
 	store      *Store
 	fleet      Fleet
@@ -86,6 +92,12 @@ type Coordinator struct {
 	now        func() time.Time
 	minWire    int
 	ourVersion string
+	// self starts the transactional upgrade of this control plane's own host,
+	// or is nil where an operator does that by hand. selfAsked is when it was
+	// last asked per fleet decision, so a refused updater is retried on a
+	// backoff rather than on every tick.
+	self      SelfUpgrader
+	selfAsked map[string]time.Time
 	// warnedAt is when each host was last reported as out of contact, so a 30
 	// second tick does not turn one stalled machine into a log nobody reads.
 	//
@@ -108,6 +120,26 @@ func WithCoordinatorLogger(log *slog.Logger) CoordinatorOption {
 	return func(c *Coordinator) { c.log = log }
 }
 
+// SelfUpgrader starts the transactional upgrade of the host this control plane
+// runs on. It is the node's Upgrader, given to the controller: the same detached
+// `billet host-upgrade`, the same recovery journal, claim and decision fence,
+// answering on the same inherited descriptor.
+type SelfUpgrader interface {
+	StartUpgrade(ctx context.Context, spec nodeapi.UpgradeSpec) error
+}
+
+// WithSelfUpgrader lets the coordinator start its own host's upgrade when a
+// rollout's target is not the binary it is running.
+func WithSelfUpgrader(u SelfUpgrader) CoordinatorOption {
+	return func(c *Coordinator) { c.self = u }
+}
+
+// selfRetryAfter is how long a refused or failed self-upgrade waits before it is
+// asked for again. An accepted one replaces this process, so nothing here ever
+// sees it succeed; what this bounds is a refusal — a lock somebody else holds,
+// a channel that would not resolve — repeating on every thirty-second tick.
+const selfRetryAfter = 10 * time.Minute
+
 // NewCoordinator builds the driver for a rollout.
 //
 // ourVersion is what this binary reports itself as, and minWire is the node-wire
@@ -126,6 +158,7 @@ func NewCoordinator(store *Store, fleet Fleet, dispatch Dispatcher,
 		minWire:    minWire,
 		ourVersion: ourVersion,
 		warnedAt:   make(map[string]time.Time),
+		selfAsked:  make(map[string]time.Time),
 	}
 
 	for _, opt := range opts {
@@ -222,6 +255,8 @@ func (c *Coordinator) observeController(ctx context.Context, current *Rollout) e
 			"running", c.ourVersion, "target", current.TargetVersion,
 			"rollout", current.ID)
 
+		c.upgradeSelf(ctx, current)
+
 		return nil
 	}
 
@@ -247,6 +282,45 @@ func (c *Coordinator) observeController(ctx context.Context, current *Rollout) e
 		"version", current.TargetVersion, "rollout", current.ID)
 
 	return nil
+}
+
+// upgradeSelf starts this host's own transactional upgrade toward the rollout's
+// target, once per fleet decision within the backoff, when a SelfUpgrader was
+// given.
+//
+// THE SAME INSTRUCTION A NODE GETS: version, manifest digest, rollout and
+// generation, so `host-upgrade` fences it against a superseded decision exactly
+// as it would on a node, and an updater that refuses says why on the answer
+// channel. Nothing is recorded in the rollout: the controller's phases are an
+// OBSERVATION made by the successor, and this process cannot be its own witness.
+func (c *Coordinator) upgradeSelf(ctx context.Context, current *Rollout) {
+	if c.self == nil {
+		return
+	}
+
+	key := current.ID + "@" + strconv.FormatInt(current.Generation, 10)
+	if last, ok := c.selfAsked[key]; ok && c.now().Sub(last) < selfRetryAfter {
+		return
+	}
+
+	c.selfAsked[key] = c.now()
+
+	spec := nodeapi.UpgradeSpec{
+		Version:        current.TargetVersion,
+		ManifestSHA256: current.TargetDigest,
+		RolloutID:      current.ID,
+		Generation:     current.Generation,
+	}
+
+	if err := c.self.StartUpgrade(ctx, spec); err != nil {
+		c.log.Warn("the control plane's own host did not take the upgrade; retrying later",
+			"target", current.TargetVersion, "rollout", current.ID, "error", err)
+
+		return
+	}
+
+	c.log.Info("the control plane's own host is upgrading; this process will be replaced",
+		"target", current.TargetVersion, "rollout", current.ID)
 }
 
 // convergenceWalk is the sequence a component takes from pending to committed.

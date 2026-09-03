@@ -1287,3 +1287,76 @@ func TestABlockedHostConvergesOnceSomethingReturnsItToTheRollout(t *testing.T) {
 			nodes[0].ConvergedDigest, targetDigest)
 	}
 }
+
+type fakeSelfUpgrader struct {
+	specs []nodeapi.UpgradeSpec
+	fail  error
+}
+
+func (u *fakeSelfUpgrader) StartUpgrade(_ context.Context, spec nodeapi.UpgradeSpec) error {
+	u.specs = append(u.specs, spec)
+
+	return u.fail
+}
+
+// A CONTROL PLANE THAT IS NOT THE TARGET STARTS ITS OWN HOST'S UPGRADE, once per
+// decision, with the whole instruction a node would get, and tells no node
+// anything until its successor observes the result. Without a self-upgrader it
+// only waits, which is what an operator-driven deployment asked for.
+func TestTheControllerUpgradesItsOwnHostWhenGivenASelfUpgrader(t *testing.T) {
+	t.Parallel()
+
+	_, s := open(t)
+	fleet := &fakeFleet{}
+	fleet.set("n1", "v0.3.26", 14, true)
+	dispatch := &fakeDispatcher{}
+	r, err := s.Start(t.Context(), StartRequest{
+		TargetVersion: targetVersion, TargetDigest: targetDigest,
+		PriorVersion: "v0.3.26", Policy: DefaultPolicy(), CreatedBy: "ops", Nodes: []string{"n1"},
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	self := &fakeSelfUpgrader{}
+	now := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
+	c := NewCoordinator(s, fleet, dispatch, "v0.3.26", 14,
+		WithCoordinatorLogger(slog.New(slog.DiscardHandler)),
+		WithSelfUpgrader(self),
+		WithCoordinatorClock(func() time.Time { return now }))
+
+	tick(t, c)
+	tick(t, c)
+
+	if len(self.specs) != 1 {
+		t.Fatalf("the self-upgrader was asked %d times across two ticks, want once", len(self.specs))
+	}
+	want := nodeapi.UpgradeSpec{Version: targetVersion, ManifestSHA256: targetDigest, RolloutID: r.ID, Generation: r.Generation}
+	if self.specs[0] != want {
+		t.Errorf("asked with %+v, want %+v", self.specs[0], want)
+	}
+	if len(dispatch.told) != 0 {
+		t.Errorf("a node was told to upgrade before the control plane was on the target: %v", dispatch.told)
+	}
+
+	// A refusal is retried after the backoff, not before.
+	self.fail = errors.New("the updater refused: another upgrade holds this host")
+	now = now.Add(selfRetryAfter)
+	tick(t, c)
+	if len(self.specs) != 2 {
+		t.Fatalf("after the backoff the self-upgrader was asked %d times in total, want 2", len(self.specs))
+	}
+	now = now.Add(time.Minute)
+	tick(t, c)
+	if len(self.specs) != 2 {
+		t.Fatalf("a refused updater was asked again a minute later, %d times in total", len(self.specs))
+	}
+
+	// AND WITHOUT ONE, ONLY WAITING.
+	waiting := NewCoordinator(s, fleet, dispatch, "v0.3.26", 14,
+		WithCoordinatorLogger(slog.New(slog.DiscardHandler)))
+	tick(t, waiting)
+	if len(dispatch.told) != 0 {
+		t.Errorf("a coordinator with no self-upgrader told a node: %v", dispatch.told)
+	}
+}
