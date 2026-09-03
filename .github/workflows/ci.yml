@@ -533,6 +533,25 @@ jobs:
           CGO_ENABLED: "0"
         run: go build -o /dev/null ./cmd/billet
 
+  # The Sphinx build that Read the Docs runs, with warnings as errors, so a
+  # broken cross-reference or a page missing from the toctree fails here rather
+  # than publishing.
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: docs/requirements.txt
+      - run: python -m pip install --requirement docs/requirements.txt
+      - env:
+          SPHINXBUILD: sphinx-build
+        run: make docs
+
   # THE ONE CONTEXT BRANCH PROTECTION REQUIRES. Protection names a status check
   # by its job name, and naming every job above would have to be re-done each
   # time one is added or renamed, with a forgotten one leaving a gate that no
@@ -556,6 +575,7 @@ jobs:
         terraform-lint,
         vuln,
         cross-build,
+        docs,
       ]
     if: always()
     steps:

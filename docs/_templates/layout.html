@@ -1,0 +1,43 @@
+{% extends "!layout.html" %}
+
+{% block extrahead %}
+<!-- Add any analytics or additional scripts here -->
+{{ super() }}
+{% endblock %}
+
+{% block menu %}
+{{ super() }}
+
+<p class="caption" role="heading"><span class="caption-text">Quick Links</span></p>
+<ul>
+    <li class="toctree-l1">
+        <a class="reference external" href="https://github.com/junioryono/billet">
+            GitHub
+        </a>
+    </li>
+    <li class="toctree-l1">
+        <a class="reference external" href="https://pkg.go.dev/github.com/junioryono/billet">
+            pkg.go.dev
+        </a>
+    </li>
+    <li class="toctree-l1">
+        <a class="reference external" href="https://goreportcard.com/report/github.com/junioryono/billet">Go
+            Report Card
+        </a>
+    </li>
+</ul>
+
+<p class="caption" role="heading">
+    <span class="caption-text">
+        Community
+    </span>
+</p>
+
+<ul>
+    <li class="toctree-l1">
+        <a class="reference external" href="https://github.com/junioryono/billet/issues">
+            Issues
+        </a>
+    </li>
+</ul>
+{% endblock %}
