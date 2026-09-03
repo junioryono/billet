@@ -385,6 +385,21 @@
           - { task: "Stop and disable the billet server unless it may run here", guard: "not billet_server_should_run" }
           - { task: "Stop and disable the billet node unless it may run here", guard: "not billet_node_should_run" }
 
+    # THE NODE RESTARTS WHEN THE ENVIRONMENT IT IMPORTS CHANGES. On a host that is
+    # both a controller and a node the node unit imports the server's environment
+    # file, and a dispatched updater inherits it; a rotated connection string the
+    # node never re-read would be one the updater could not open the ledger with.
+    - name: The node restart condition names the server environment file
+      ansible.builtin.assert:
+        that:
+          - >-
+            (billet_gated | selectattr('name', 'equalto', 'Restart the billet node after non-binary inputs change')
+             | first).when | string is search('billet_server_environment_install.changed')
+        fail_msg: >-
+          The node restart no longer fires when the server environment file changes,
+          so a dispatched updater on a host that is both can inherit a stale
+          connection string.
+
     # THE TASK MUST STILL EXIST, asserted separately. A rename already fails this
     # -- `first` over an empty list errors, so it cannot silently go unasserted --
     # but it fails talking about `first`, which reads as a broken test rather than

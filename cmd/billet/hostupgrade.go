@@ -237,12 +237,60 @@ func rolloutInstruction(ctx context.Context, cfg *config.Config) (hostUpgradeTar
 		return hostUpgradeTarget{}, false, nil
 	}
 
+	target := hostUpgradeTarget{
+		pin:            current.TargetVersion,
+		digest:         current.TargetDigest,
+		rolloutID:      current.ID,
+		generation:     current.Generation,
+		allowDowngrade: current.Policy.AllowDowngrade,
+		fromRollout:    true,
+	}
+
+	// A COMPLETED ROLLOUT IS TAKEN ONCE. The decision mark records which fleet
+	// decision this host has acted on, and acting includes having been found on
+	// the target; a completed rollout at or below that mark is one this host
+	// already took, or one it was deliberately moved past — an operator's
+	// `host-upgrade --version ... --allow-downgrade` on one host, a manual
+	// upgrade after a completed downgrade — and a timer that followed it again
+	// would undo a person's decision every five minutes. Only a host that has
+	// not acted on it, a standby whose timer fired after the rollout closed,
+	// takes it. An open rollout is fenced one step later by checkDecision, which
+	// admits an equal generation so a rolled-back host can be told again.
+	if current.State == rollout.StateCompleted {
+		acted, err := readDecision()
+		if err != nil {
+			return hostUpgradeTarget{}, false, err
+		}
+
+		if current.Generation <= acted {
+			fmt.Printf("Rollout %s (decision %d) completed and this host has acted on decision "+
+				"%d; nothing to do.\n", current.ID, current.Generation, acted)
+
+			return hostUpgradeTarget{}, false, nil
+		}
+	}
+
 	// THE VERSION IS NOT ENOUGH TO DO NOTHING, for the reason actOnResolved gives:
 	// a host running the target version from another manifest is one a rollout
 	// blocks and tells an operator to reinstall, and the timer is that operator.
 	// Only a POSITIVE disagreement reinstalls; a host with no record is on it.
 	if current.TargetVersion == version.Version() {
 		if !installedDisagrees(current.TargetDigest) {
+			// AND DOING NOTHING IS STILL ACTING ON THE DECISION, for the reason
+			// actOnResolved's own no-op gives: a host found on decision 10's target
+			// that never raised its mark would let a delayed decision 9 pass the
+			// fence and downgrade it.
+			if err := checkAndRecordDecision(target); err != nil {
+				if errors.Is(err, ErrSuperseded) {
+					fmt.Printf("This host already runs %s and has acted on a later decision than "+
+						"rollout %s's; nothing to do.\n", current.TargetVersion, current.ID)
+
+					return hostUpgradeTarget{}, false, nil
+				}
+
+				return hostUpgradeTarget{}, false, err
+			}
+
 			fmt.Printf("This host already runs %s, rollout %s's target; nothing to do.\n",
 				current.TargetVersion, current.ID)
 
@@ -282,14 +330,7 @@ func rolloutInstruction(ctx context.Context, cfg *config.Config) (hostUpgradeTar
 			current.Generation)
 	}
 
-	return hostUpgradeTarget{
-		pin:            current.TargetVersion,
-		digest:         current.TargetDigest,
-		rolloutID:      current.ID,
-		generation:     current.Generation,
-		allowDowngrade: current.Policy.AllowDowngrade,
-		fromRollout:    true,
-	}, true, nil
+	return target, true, nil
 }
 
 // readFleetDecision is the open rollout, or the newest finished one, and
@@ -1311,8 +1352,16 @@ type ledgerHost struct {
 func newLedgerHost(cfg *config.Config, cfgPath string, journal *hostupgrade.Journal) ledgerHost {
 	h := ledgerHost{cfg: cfg, cfgPath: cfgPath, external: ledgerKindFor(cfg) != ""}
 
+	// THE PERMISSION ALONE MOVES NOTHING; ONLY A PROVED DOWNGRADE LOWERS THE MARK.
+	// `--allow-downgrade` on an upgrade is harmless to every other check, and
+	// were it to write the newer release here, before the candidate is probed, a
+	// probe that failed on an external ledger — which has no snapshot to put the
+	// mark back — would leave the restored older binary refused by a mark it
+	// raised itself.
 	if journal != nil && journal.AllowDowngrade {
-		h.downgradeTo = journal.ToVersion
+		if order, ok := version.Compare(journal.ToVersion, journal.FromVersion); ok && order < 0 {
+			h.downgradeTo = journal.ToVersion
+		}
 	}
 
 	return h
@@ -1628,6 +1677,13 @@ func (h *ledgerHost) lowerWatermark(ctx context.Context) error {
 	return nil
 }
 
+// The two handles a lowering may go through, as variables so a test can prove
+// which one an external ledger gets without a database of either kind.
+var (
+	lowerThroughMaintenance = openStateMaintenance
+	lowerThroughAdmin       = openStateAdmin
+)
+
 // lowerReleaseWatermark moves the ledger's mark down to the release being
 // installed, through the handle that may.
 //
@@ -1642,9 +1698,9 @@ func (h *ledgerHost) lowerWatermark(ctx context.Context) error {
 var lowerReleaseWatermark = func(ctx context.Context, cfg *config.Config, external bool,
 	release string,
 ) error {
-	open := openStateMaintenance
+	open := lowerThroughMaintenance
 	if external {
-		open = openStateAdmin
+		open = lowerThroughAdmin
 	}
 
 	db, err := open(ctx, cfg)

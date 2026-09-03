@@ -109,6 +109,71 @@ func (db *DB) enforceReleaseWatermark(ctx context.Context, running string, recor
 	return nil
 }
 
+// raiseReleaseWatermarkIn records the running release inside the controller
+// claim's transaction: a proved newer release is written, an equal or
+// uncomparable one leaves the row alone, and a proved older one refuses the
+// claim, since a newer control plane recorded itself between this handle's open
+// and its claim.
+//
+// THE TABLE MAY NOT BE THERE: a standby promoting onto a ledger the leader never
+// migrated past 47 has just applied 48 itself, but a control plane on an older
+// binary claiming a ledger nobody migrated has no table to read, and that is an
+// ordinary state rather than a fault.
+func (db *DB) raiseReleaseWatermarkIn(ctx context.Context, tx *sql.Tx) error {
+	running := db.runningRelease
+	if running == "" {
+		return nil
+	}
+
+	seen, err := readAppliedMigrations(ctx, ReadQueries(tx))
+	if err != nil {
+		return fmt.Errorf("state: read whether the ledger records a release watermark: %w", err)
+	}
+
+	if _, applied := seen[releaseWatermarkMigration]; !applied {
+		return nil
+	}
+
+	row, err := ReadQueries(tx).ReadReleaseWatermark(ctx)
+
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		if !version.IsRelease(running) {
+			return nil
+		}
+	case err != nil:
+		return fmt.Errorf("state: read the ledger's release watermark: %w", err)
+	default:
+		order, ok := version.Compare(running, row.Release)
+		if !ok {
+			slog.Debug("the running release and the ledger's release watermark cannot be "+
+				"ordered, so neither is refused nor recorded", "running", running,
+				"recorded", row.Release)
+
+			return nil
+		}
+
+		if order < 0 {
+			return fmt.Errorf("%w: %s recorded itself as serving this ledger (%s) after this %s "+
+				"handle opened, so the claim is refused", ErrReleaseBehind, row.Release,
+				row.RecordedAt, running)
+		}
+
+		if order == 0 {
+			return nil
+		}
+	}
+
+	if err := WriteQueries(tx).SetReleaseWatermark(ctx, ledgerdb.SetReleaseWatermarkParams{
+		Release:    running,
+		RecordedAt: time.Now().UTC().Format(time.RFC3339Nano),
+	}); err != nil {
+		return fmt.Errorf("state: record %s as the release serving this ledger: %w", running, err)
+	}
+
+	return nil
+}
+
 // checkReleaseWatermarkIn refuses, inside a revalidated write transaction, a
 // running release that the mark has moved past since this handle opened.
 //

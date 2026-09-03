@@ -491,3 +491,65 @@ func TestAnAutomaticStartRefusesAnAbortedTargetInsideItsTransaction(t *testing.T
 		t.Fatalf("an operator's start after an abort was refused: %v", err)
 	}
 }
+
+// abortingWindow is a maintenance window that, on its second asking — the one
+// immediately before the start — starts and aborts a rollout to the target, which
+// is the interleaving the pre-read cannot see.
+type abortingWindow struct {
+	t     *testing.T
+	s     *Store
+	asked int
+}
+
+func (w *abortingWindow) open(time.Time) bool {
+	w.asked++
+
+	if w.asked == 2 {
+		aborted, err := w.s.Start(w.t.Context(), StartRequest{
+			Channel: "stable", TargetVersion: newerVersion, TargetDigest: otherDigest,
+			PriorVersion: targetVersion, Policy: DefaultPolicy(), CreatedBy: "ops",
+			Nodes: []string{"epyc-1"},
+		})
+		if err != nil {
+			w.t.Errorf("Start inside the window: %v", err)
+
+			return true
+		}
+
+		if err := w.s.Finish(w.t.Context(), aborted.ID, StateAborted, "no"); err != nil {
+			w.t.Errorf("Finish inside the window: %v", err)
+		}
+	}
+
+	return true
+}
+
+// THE TICK ASKS FOR THE TRANSACTIONAL REFUSAL. An abort landing between the
+// starter's pre-read and its write is seen only by the store's own check inside
+// the start transaction, and only if the tick asked for it.
+func TestATickRefusesAnAbortLandingBetweenItsReadAndItsWrite(t *testing.T) {
+	t.Parallel()
+
+	_, s := open(t)
+
+	fleet := &fakeFleet{}
+	fleet.set("epyc-1", targetVersion, 19, true)
+
+	window := &abortingWindow{t: t, s: s}
+	starter := NewStarter(s, fleet,
+		&fakeResolver{target: Target{Version: newerVersion, Digest: otherDigest}},
+		StartPolicy{Enabled: true, Channel: "stable", OpenAt: window.open},
+		targetVersion, WithStarterLogger(slog.New(slog.DiscardHandler)))
+
+	if err := starter.Tick(t.Context()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+
+	if window.asked != 2 {
+		t.Fatalf("the window was asked %d times, want twice", window.asked)
+	}
+
+	if openRollout(t, s) != nil {
+		t.Fatal("the tick overruled an abort that landed between its read and its write")
+	}
+}

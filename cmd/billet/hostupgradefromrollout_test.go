@@ -18,6 +18,12 @@ import (
 func ledgerWithRollout(t *testing.T, target string) (*config.Config, *rollout.Rollout) {
 	t.Helper()
 
+	// THE DECISION MARK LIVES UNDER THE UPGRADE ROOT, and the timer's no-op raises
+	// it, so each test gets a root of its own.
+	original := upgradeRoot
+	upgradeRoot = t.TempDir()
+	t.Cleanup(func() { upgradeRoot = original })
+
 	cfg := &config.Config{Server: &config.ServerConfig{IdentityDir: t.TempDir()}}
 
 	db, err := openStateAdmin(t.Context(), cfg)

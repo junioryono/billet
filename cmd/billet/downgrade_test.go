@@ -11,6 +11,7 @@ import (
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/hostupgrade"
+	"github.com/junioryono/billet/internal/state"
 )
 
 // A DOWNGRADE IS REFUSED UNLESS ASKED FOR BY NAME, AND ONLY A PROVED ONE.
@@ -66,9 +67,22 @@ func TestTheSystemdHostLowersTheWatermarkOnlyWhenTheJournalSaysSo(t *testing.T) 
 	}
 
 	asked := newSystemdHost(cfg, "", "/staged/billet",
-		&hostupgrade.Journal{ToVersion: "v0.4.0", AllowDowngrade: true})
+		&hostupgrade.Journal{FromVersion: "v0.5.0", ToVersion: "v0.4.0", AllowDowngrade: true})
 	if asked.downgradeTo != "v0.4.0" {
 		t.Errorf("a journal with the flag set downgradeTo = %q, want v0.4.0", asked.downgradeTo)
+	}
+
+	// THE FLAG ON AN UPGRADE, OR ON A PAIR THAT CANNOT BE ORDERED, MOVES NOTHING:
+	// writing the newer release before the probe would, on an external ledger
+	// with no snapshot, leave a rolled-back host refused by its own mark.
+	for name, j := range map[string]*hostupgrade.Journal{
+		"an upgrade":     {FromVersion: "v0.5.0", ToVersion: "v0.6.0", AllowDowngrade: true},
+		"the same":       {FromVersion: "v0.5.0", ToVersion: "v0.5.0", AllowDowngrade: true},
+		"could not tell": {FromVersion: "(devel)", ToVersion: "v0.4.0", AllowDowngrade: true},
+	} {
+		if h := newSystemdHost(cfg, "", "/staged/billet", j); h.downgradeTo != "" {
+			t.Errorf("%s with the flag set downgradeTo = %q", name, h.downgradeTo)
+		}
 	}
 }
 
@@ -162,7 +176,7 @@ func TestTheMarkIsLoweredBeforeTheCandidateIsProbed(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	journal := &hostupgrade.Journal{ToVersion: "v0.4.0", AllowDowngrade: true}
+	journal := &hostupgrade.Journal{FromVersion: "v0.5.0", ToVersion: "v0.4.0", AllowDowngrade: true}
 
 	external := newSystemdHost(&config.Config{Server: &config.ServerConfig{
 		State: &config.StateConfig{Backend: config.StatePostgres},
@@ -186,5 +200,43 @@ func TestTheMarkIsLoweredBeforeTheCandidateIsProbed(t *testing.T) {
 		"lower external=false to v0.4.0\ncandidate check\n"
 	if string(body) != want {
 		t.Errorf("the steps ran as:\n%s\nwant:\n%s", body, want)
+	}
+}
+
+// AN EXTERNAL LEDGER IS LOWERED THROUGH THE OPERATOR HANDLE AND A LOCAL ONE
+// THROUGH THE MAINTENANCE HANDLE, proved against the real chooser with both
+// openers replaced: the PostgreSQL maintenance open is a read-only probe, and a
+// chooser that picked it would fail every external downgrade at the write.
+func TestTheLoweringPicksTheHandleTheLedgerAllows(t *testing.T) {
+	var opened []string
+
+	prevMaintenance, prevAdmin := lowerThroughMaintenance, lowerThroughAdmin
+	t.Cleanup(func() { lowerThroughMaintenance, lowerThroughAdmin = prevMaintenance, prevAdmin })
+
+	refuse := errors.New("recorded")
+	lowerThroughMaintenance = func(context.Context, *config.Config) (*state.DB, error) {
+		opened = append(opened, "maintenance")
+
+		return nil, refuse
+	}
+	lowerThroughAdmin = func(context.Context, *config.Config) (*state.DB, error) {
+		opened = append(opened, "admin")
+
+		return nil, refuse
+	}
+
+	cfg := &config.Config{Server: &config.ServerConfig{}}
+
+	if err := lowerReleaseWatermark(t.Context(), cfg, true, "v0.4.0"); !errors.Is(err, refuse) {
+		t.Fatalf("the external lowering did not reach an opener: %v", err)
+	}
+
+	if err := lowerReleaseWatermark(t.Context(), cfg, false, "v0.4.0"); !errors.Is(err, refuse) {
+		t.Fatalf("the local lowering did not reach an opener: %v", err)
+	}
+
+	if got := fmt.Sprint(opened); got != "[admin maintenance]" {
+		t.Errorf("the lowering opened %s, want the operator handle for an external ledger and "+
+			"the maintenance handle for a local one", got)
 	}
 }

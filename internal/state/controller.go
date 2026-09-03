@@ -179,8 +179,23 @@ func (db *DB) ClaimController(
 			Holder:    holder,
 			ClaimedAt: time.Now().UTC().Format(time.RFC3339Nano),
 		})
+		if err != nil {
+			return err
+		}
 
-		return err
+		// AND THE RELEASE WATERMARK MOVES IN THIS SAME TRANSACTION, for every
+		// control plane and never at open. This is the first moment the process
+		// is the control plane proper: a standby beside an older leader is taking
+		// over, and a process pointed at another deployment's ledger has just
+		// been refused by the binding above with the mark untouched. One
+		// transaction, so a failure to record leaves no claim behind either, and
+		// a handle that could not record never holds an epoch it could write
+		// under after the exclusion was given back.
+		if db.recordsRelease || wasStandby {
+			return db.raiseReleaseWatermarkIn(ctx, tx)
+		}
+
+		return nil
 	}); err != nil {
 		// THE EXCLUSION IS GIVEN BACK. A claim that held the lock and failed to
 		// record itself would leave the deployment excluded by a process that
@@ -194,19 +209,6 @@ func (db *DB) ClaimController(
 	// that stored its epoch first would read a row that does not yet carry the
 	// value it is about to write, and refuse its own claim.
 	db.claimedEpoch.Store(epoch)
-
-	// AND THE RELEASE WATERMARK MOVES HERE, AFTER THE BINDING AND THE CLAIM, for
-	// every control plane and never at open. This is the first moment the process
-	// is the control plane proper: a standby beside an older leader has just
-	// taken over, and a process pointed at another deployment's ledger has just
-	// been refused by the binding with the mark untouched. A promoted standby
-	// records too, which is what makes a follower-first upgrade of an
-	// active-passive pair leave the mark at the newer release.
-	if db.recordsRelease || wasStandby {
-		if err := db.enforceReleaseWatermark(ctx, db.runningRelease, true); err != nil {
-			return restore(err)
-		}
-	}
 
 	return ControllerClaim{Holder: holder, Epoch: epoch}, nil
 }
