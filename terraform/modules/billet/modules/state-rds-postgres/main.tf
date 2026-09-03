@@ -13,7 +13,7 @@
 # what it does not buy. Exactly ONE controller may make scheduling decisions
 # either way — a database's ability to serialize writes is not proof that only
 # one process is polling GitHub, which is why billet takes a claim row as well.
-# See docs/state-backends.md.
+# See docs/deploying/postgres-and-active-passive.md.
 #
 # IT EXPOSES A NARROW CONNECTION OBJECT AND NOTHING ELSE: the endpoint, the port,
 # the database, the username, and the ARNs of the secrets a controller may read.

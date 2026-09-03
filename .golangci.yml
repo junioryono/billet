@@ -1,7 +1,7 @@
 # billet — strict golangci-lint v2 config
 #
 # Why each non-stdlib rule exists is documented inline next to that rule. The
-# conventions themselves live in CLAUDE.md.
+# conventions themselves live in CLAUDE.md and the billet-checks-and-lint skill.
 #
 # Do NOT silence a rule with a bare //nolint — nolintlint rejects that. Use
 # `//nolint:linter-name // reason` when an exception is genuinely justified.

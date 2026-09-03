@@ -29,7 +29,7 @@
   So a Mac node is a logged-in user's agent. On a dedicated host that means
   enabling automatic login, which is a real security decision — the disk is
   unlocked and the session is live at every boot — and it is the price of
-  running macOS guests without a person present. See docs/reference-hardware.md.
+  running macOS guests without a person present. See docs/reference/reference-hardware.md.
 -->
 <plist version="1.0">
 <dict>

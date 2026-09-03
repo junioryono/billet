@@ -14,7 +14,8 @@ import (
 // decides whether `terraform destroy` may remove the roles and log group a running
 // CodeBuild build depends on, and AWS does nothing to stop that removal: DeleteProject
 // succeeds while a build is in progress and the build runs on (measured 2026-09-02,
-// docs/aws-acceptance.md). So the script is run here against a fake `aws` that replays
+// docs/reference/records/aws-acceptance.md). So the script is run here against a
+// fake `aws` that replays
 // scripted pages and records every invocation — in both directions, because a gate
 // that refuses a drained fleet is the failure ADR-005 names, and the next thing anybody
 // does with one is delete it.

@@ -9,12 +9,12 @@ One bare-metal machine running billet with real kernel isolation: every job gets
 | | |
 |---|---|
 | **`/dev/kvm`** | Bare metal, or a machine with nested virtualisation. Firecracker is a VMM; there is no software fallback. |
-| **A guest kernel** | An uncompressed kernel *you* build and place at `node.firecracker.kernel_image`. Neither this role nor `billet images pull` creates it. `docs/reference-hardware.md` records how the measured host builds one. |
+| **A guest kernel** | An uncompressed kernel *you* build and place at `node.firecracker.kernel_image`. Neither this role nor `billet images pull` creates it. `docs/reference/reference-hardware.md` records how the measured host builds one. |
 | **A Ceph cluster** | Two pools, and a non-`admin` identity for billet. The role can bootstrap a single-host cluster, but only when you name every disk it may consume — that path is destructive by definition and is never inferred. |
 | **Two bridges** | `billet0` for trusted guests, `billet1` for untrusted. The role creates both from `billet_networks`, whose defaults already match what `billet init` generates. |
 | **Guest images** | A published generation from `billet images pull`, not a container image. |
 
-If that list is longer than you want, [the Docker example](../single-host-docker/README.md) is the same deployment with none of it, and [`docs/first-deployment.md`](../../../../../docs/first-deployment.md) walks it by hand. Start there and come back.
+If that list is longer than you want, [the Docker example](../single-host-docker/README.md) is the same deployment with none of it, and [`docs/getting-started/index.md`](../../../../../docs/getting-started/index.md) walks it by hand. Start there and come back.
 
 ## What has been proven, and what has not
 
@@ -57,4 +57,4 @@ A dry run (`--check`) is worth doing first. It does not download Firecracker or 
 
 **A guest never boots.** The kernel at `node.firecracker.kernel_image` is the usual cause — a pulled generation boots its own recorded kernel, so that path is the fallback for a hand-built one.
 
-**A job queues forever.** The runner-group and workflow-allowlist checks in [docs/first-deployment.md](../../../../../docs/first-deployment.md) apply here unchanged.
+**A job queues forever.** The runner-group and workflow-allowlist checks in [docs/getting-started/index.md](../../../../../docs/getting-started/index.md) apply here unchanged.

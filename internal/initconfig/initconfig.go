@@ -583,9 +583,10 @@ func checkTargetPlatform(goos string) error {
 // reaches it directly, so a caller passing Provider: docker with a Tart block —
 // or an EC2 one — used to get a docker config with every one of those values
 // thrown away and no error, while the CLI refuses the same combination by flag
-// name. Two entry points enforcing different contracts is the shape CLAUDE.md
-// names, and config validation already refuses the mirror image of this on a
-// loaded file ("node.tart is set but this node's provider is %s").
+// name. Two entry points enforcing different contracts is the shape the
+// billet-config skill names, and config validation already refuses the mirror
+// image of this on a loaded file ("node.tart is set but this node's provider is
+// %s").
 func refuseForeignBackendInputs(p Params) error {
 	if p.Tart != nil && p.Provider != config.ProviderTart {
 		return fmt.Errorf("tart inputs are set but this generation is for %s, and only a tart "+
@@ -969,7 +970,7 @@ func firecrackerNodeBlocks(trusted bool, h HostInputs) string {
     # An uncompressed guest kernel YOU place at this path — neither the Ansible
     # role nor `+"`billet images pull`"+` creates it, and `+"`billet check`"+` requires it to
     # exist. A pulled generation boots its OWN recorded kernel, so this file is the
-    # fallback for a hand-built generation; build one per docs/reference-hardware.md
+    # fallback for a hand-built generation; build one per docs/reference/reference-hardware.md
     # or copy a pulled kernel out of kernel_dir.
     kernel_image: %s
     # The host bridge trusted guests attach to.

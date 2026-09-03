@@ -1,6 +1,6 @@
 # control-plane-ec2-sqlite
 
-billet's control plane and nothing else, per [ADR-001](../../../../docs/adr-001-control-plane-hosting.md): a single small EC2 with SQLite on a **dedicated, retained** encrypted gp3 EBS volume, recovered by EC2 auto-recovery — not an ASG, which would launch a fresh instance that does not reattach the data volume. Consume it directly when you have your own compute IAM story; the opinionated root composes it with `fleet-ec2`, passing that child's instance profile so the co-located controller runs billet with the node role.
+billet's control plane and nothing else, per [ADR-001](../../../../../docs/reference/decisions/adr-001-control-plane-hosting.md): a single small EC2 with SQLite on a **dedicated, retained** encrypted gp3 EBS volume, recovered by EC2 auto-recovery — not an ASG, which would launch a fresh instance that does not reattach the data volume. Consume it directly when you have your own compute IAM story; the opinionated root composes it with `fleet-ec2`, passing that child's instance profile so the co-located controller runs billet with the node role.
 
 The fail-closed **mount** of the ledger volume is the configuration layer's job: set the `junioryono.billet.host` role's `billet_ledger_volume_id` to this child's `ledger_volume_id` output.
 

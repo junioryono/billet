@@ -147,7 +147,7 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*provider.In
 	// where every user on the host can read it out of ps. The JIT config is a
 	// live runner registration until it is consumed, so that is a credential
 	// disclosure with a working-looking implementation — the same class of
-	// mistake as the App key argv residual already documented in CLAUDE.md.
+	// mistake as the App key argv residual the billet-security skill records.
 	//
 	// --env-file keeps it off the command line entirely. The file is 0600 and
 	// removed as soon as docker has read it.

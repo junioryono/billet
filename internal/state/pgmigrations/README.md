@@ -6,7 +6,7 @@ The PostgreSQL twin of `../migrations`. Same file format, same parser (`internal
 
 DDL is the one part of the ledger that is not portable. `STRICT`, an `INTEGER` column with `CHECK (x IN (0,1))` standing in for a boolean, and the table rebuilds that exist only to work around SQLite's `ALTER TABLE` limits are all SQLite's own spelling.
 
-The **queries** are not duplicated. There is one directory (`../queries`), compiled once, and its statements execute on both engines — see `docs/adr-008-state-backends.md` for the measurement that made that possible. So this directory is the only place billet carries the same idea twice, and everything below exists to stop the two copies drifting.
+The **queries** are not duplicated. There is one directory (`../queries`), compiled once, and its statements execute on both engines — see `docs/reference/decisions/adr-008-state-backends.md` for the measurement that made that possible. So this directory is the only place billet carries the same idea twice, and everything below exists to stop the two copies drifting.
 
 ## Every file here is its SQLite twin, translated
 

@@ -1,0 +1,52 @@
+---
+name: billet-github-protocol
+description: "How billet talks to GitHub: the Runner Scale Set API through the vendored `actions/scaleset` client (internal/scaleset is its only importer), message sessions and the listener's message lifecycle, JIT runner registrations, runner groups and workflow allowlists as the trust boundary, scale-set provisioning and teardown, App Manifest onboarding and the two permissions, and what billet deliberately does not take from actions-runner-controller. Load when touching internal/scaleset, internal/server's session or message handling, internal/github, `billet teardown`, `billet github-app create`, runner-group validation, or when GitHub's behaviour has to be measured rather than read."
+---
+
+# The GitHub protocol
+
+## What this area is
+
+billet long-polls GitHub's Runner Scale Set API; GitHub never connects to billet. `github.com/actions/scaleset` (v0.4.0, a public preview whose README says interfaces may change) is consumed only through `internal/scaleset`, which adapts vendor types to `server.Session` and carries no policy (depguard enforces the boundary). `internal/server`'s listener runs one session per tier: `Available → acquire, Assigned → consume escrow, Completed → release`. `internal/github` owns the App: the manifest flow, JWTs, installation resolution, `VerifyAppAt`, and the runner-group policy client. `docs/reference/upstream-references.md` records what billet takes from other people's code and what it does not, checked against source at named versions; read it before reimplementing anything near this protocol.
+
+## Rules
+
+**The scale-set client is the answer to most protocol questions, and usually the only one.** The API is not documented elsewhere. Everything in `internal/scaleset` is translation (vendor types in, billet types out); `provision.go` reconciles one scale set per tier before any listener starts, `quiet.go` and `runner_lookup.go` find and remove runners. `internal/fakeactions` stands in for the service in tests and is deliberately not a simulator: it answers the handshake and serves what a test tells it to.
+
+**A message session is single-holder and GitHub will not hand it over.** Opening a second session for a scale set whose first was abandoned answers `409 Conflict … RunnerScaleSetSessionConflictException … already has an active session for owner`, measured against a real organization. `openSession` waits on `ErrSessionHeld` (`sessionRetryFor`) and returns every other reason at once; a control plane killed and restarted used to not start at all. Nothing is lost while it waits: GitHub queues a job for 24 hours with no runner available. How long GitHub takes to expire an abandoned session is not known; `TestLiveSessionReplacement` records the refusal rather than asserting a timeout.
+
+**The message lifecycle is idempotent on billet's durable scheduler id.** GitHub's positive `runnerRequestId` when present, or a collision-free negative id assigned transactionally to the stable `jobId` when the direct-assignment path sends zero; zero is never an identity. `DeleteMessage` acknowledges a notification and does not decline a job; `AcquireJobs` is one-way with no decline or release, which is why a promise to GitHub cannot be revoked by a local timer (`billet-capacity`). A scale-set response that is not a subset of its request stops the listener, because no race produces it and a fresh session makes GitHub redeliver; an assignment with no escrow behind it declines and carries on, because ordinary races reach it.
+
+**A scale-set runner is a pool member, not the job that caused scale-up.** GitHub registers a JIT runner into a scale set and may give it any job waiting there, so trust and cache scope are properties of the pool (wire version 12 is the floor for that reason), and `JobStarted` is the authoritative binding between a registration and the job it consumed. billet journals that binding separately from the launch, resolves completion through the physical runner's lease, and reconciles idle surplus to `TotalAssignedJobs`. Scale-down removes the GitHub registration before destroying compute and keeps both when removal fails. GitHub does not requeue a job whose runner vanished after starting: its own README documents reassignment only for a job not acquired in time.
+
+**JIT registrations are single-use and cannot update themselves.** Every JIT config GitHub mints carries `Ephemeral = True` and `DisableUpdate = True` (measured against the live API), which is why the runner-release deadline is billet's to watch (`billet-guest-images`). The registration is delivered off argv on every backend (`billet-security`), and a node may mint exactly the registration for a launch it holds.
+
+**A trusted tier is a runner group GitHub restricts, and billet re-checks it before every mint.** `trusted` requires a non-default `runner_group` with `restricted_to_workflows` and `selected_workflows` equal to the tier's `workflows` list; the control plane reads the policy at startup and immediately before each registration and refuses drift. A group with selected visibility and an empty repository list routes nothing and reports nothing (the scale set registers, capacity is advertised, the job queues forever), so `billet check` refuses it; it is easy to reach through a REST `PATCH` that sets visibility without re-sending repository ids. The runner-group name is validated by the property that it survives the client's own path-then-parse-then-encode round trip (`&`, `#`, `;`, `%`, `+` do not), and `github.org` by both boundaries it crosses (`runnerGroupUnsafe` measured `#%/?`). `billet-config` has the whole rule.
+
+**Scale sets are billet's to remove.** GitHub's UI has no delete control for them, so `billet teardown --tier|--all` removes what billet created, recorded through `state.ScaleSetRecord` (`scaleset_provenance.go`) so a recreated scale set does not wedge a tier and a tier in a non-default group is found under it. `AdvertiseNothing` and `WithHurry` are the server options a dry run and a hurried stop use.
+
+**Onboarding is the App Manifest flow, so every deployment ends up with provably identical minimal permissions.** `metadata: read` and `organization_self_hosted_runners: read and write`, no Contents (billet cannot read your code), the webhook inactive (`hook_attributes`; a test asserts the field is present and false, not merely absent). The App is created against the organization (a personal account cannot onboard) and then installed, because creating does not install and an uninstalled App is why `installation_id` stays zero; `WaitForOrgInstallation` waits for the install. The callback binds loopback only, so a remote machine forwards the port (`--port` with `ssh -L`). Refusals happen before GitHub is touched, the key is written before anything else, and the one-time code is redacted from every error (`billet-identity-and-ca`).
+
+**Two issuers.** The runner-group policy client signs with `app_id`; the scale-set client signs with `client_id` when one is set. A check that signs with one does not vouch for the other, so `billet check`'s healthy report says which it tested. A bare `404 Not Found` on `/access_tokens` is an uninstalled App or a stale installation, and `explainGitHubAccess` says so after a failure without replacing the error.
+
+**billet is not actions-runner-controller without Kubernetes.** ARC tracks no individual job; its whole scaling decision is `min(MinRunners + TotalAssignedJobs, MaxRunners)` and Kubernetes absorbs scheduling and placement. billet has fixed hardware, a per-machine budget under a deployment ceiling, and placement constraints that need a lease bound to a host, so it takes ARC's protocol handling and none of its scaling.
+
+**Two compatibility caveats are permanent until GitHub moves.** There is no supported way to point `actions/cache` at your own server (`actions/toolkit#1051`, open since April 2022), which is why the cache is interception. The Cache v2 protocol's `.proto` files have never been published (`actions/toolkit#1931`), so billet's three-method implementation is derived from the generated TypeScript client and gated by a live conformance suite.
+
+## Measured facts
+
+- Session conflict: `409 Conflict`, `RunnerScaleSetSessionConflictException`.
+- The first real long poll ran about 88 seconds against a 90-second lease TTL.
+- JIT config: `Ephemeral = True`, `DisableUpdate = True`.
+- The worst defect in the project called `AcquireJobs` with ids from `JobAssigned` instead of `JobAvailable`, self-consistent on billet's side and wrong on the wire.
+- Runner-group characters that do not survive the client: `&#;%+`; organization: `#%/?`.
+
+## Where the tests are
+
+- `internal/scaleset/*_test.go` (`endtoend_test.go`, `sessionconflict_test.go`, `teardown_test.go`, `wire_test.go`, `version_test.go`), `internal/server/sessionconflict_test.go`, `jobresult_test.go`, `scaleset_provenance_test.go`.
+- `internal/github/*_test.go` (manifest, permissions, redaction), `cmd/billet/githubapp_test.go`, `teardown_test.go`, `githubaccess_test.go`.
+- `internal/integration/sessionreplacement_test.go`, `configboundary_test.go`; `internal/e2e/lifecycle_test.go` (a message is acked only after its work is done; a redelivered message does not start the job twice).
+
+## Related skills
+
+`billet-capacity` (escrow and the message lifecycle), `billet-identity-and-ca` (the App key and onboarding), `billet-security` (trust classes), `billet-config` (runner-group validation).

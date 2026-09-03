@@ -49,7 +49,8 @@ import (
 //
 // UNTIL IT RUNS, NOTHING MAY LEAN ON CROSS-SESSION REPLAY. That is a constraint on
 // the code rather than on this file: every recovery path in billet is written to
-// be safe whether or not a message comes back, and docs/upgrades.md says which
+// be safe whether or not a message comes back, and docs/operating/upgrades.md says
+// which
 // behaviours are proved and which are assumed.
 func TestLiveSessionReplacement(t *testing.T) {
 	client, set := liveScaleSet(t)

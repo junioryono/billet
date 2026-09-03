@@ -18,7 +18,7 @@
 # difference anywhere in the output is the placeholder, ?N against $N — and
 # modernc.org/sqlite executes $N correctly, binding positionally, honouring a
 # repeated $1 the way PostgreSQL does, and resolving $2 that appears textually
-# before $1. Both halves are measured in docs/adr-008-state-backends.md.
+# before $1. Both halves are measured in docs/reference/decisions/adr-008-state-backends.md.
 #
 # SO GENERATION RUNS ONCE, WITH THE POSTGRESQL ENGINE. Not because PostgreSQL is
 # privileged, but because a $N constant runs on both and a ?N constant does not.

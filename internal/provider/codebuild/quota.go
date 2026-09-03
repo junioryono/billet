@@ -16,7 +16,7 @@ const codeBuildServiceCode = "codebuild"
 // AccountQueueCeiling is how many builds the WHOLE ACCOUNT may have queued.
 //
 // MEASURED RATHER THAN LOOKED UP, on 2026-09-02 and recorded in
-// docs/codebuild.md: past thirty queued builds StartBuild is refused with
+// docs/deploying/aws-codebuild.md: past thirty queued builds StartBuild is refused with
 // `AccountLimitExceededException: Cannot have more than 30 builds in queue for
 // the account`. Service Quotas does not list it, so it cannot be read — which is
 // exactly why it is a constant here with the measurement attached rather than a
@@ -27,7 +27,8 @@ const AccountQueueCeiling = 30
 
 // Quotas reports the account ceilings this node's configuration runs against.
 //
-// THIS IS THE SENTENCE docs/codebuild.md ALREADY PROMISED AND NOTHING SUPPLIED.
+// THIS IS THE SENTENCE docs/deploying/aws-codebuild.md ALREADY PROMISED AND NOTHING
+// SUPPLIED.
 // checks.go's own doc comment said an operator "has to see the 36-hour cap, the
 // 8-hour queued cap, and the concurrency quota before work is admitted", and
 // Ceilings carried the first two and no quota at all — a claim in a comment the

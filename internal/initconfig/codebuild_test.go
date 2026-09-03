@@ -352,8 +352,8 @@ func TestFleetCapacityIsRefusedOnANonMacGeneration(t *testing.T) {
 // Generate is exported and internal/e2e reaches it directly, so a caller passing
 // the wrong backend's block used to get a config with every one of those values
 // thrown away and no error, while the CLI refused the same combination by flag
-// name. Two entry points enforcing different contracts is the shape CLAUDE.md
-// names.
+// name. Two entry points enforcing different contracts is the shape the
+// billet-config skill names.
 func TestCodeBuildInputsOnAnotherBackendAreRefused(t *testing.T) {
 	t.Parallel()
 

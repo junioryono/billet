@@ -2,7 +2,7 @@
 
 Reach Billet hosts from CI through AWS Systems Manager, so a converge needs no inbound port and no SSH key.
 
-**This is optional.** Billet needs no inbound connectivity to run jobs — nodes always dial outbound to the control plane. This module is about *configuration management*: how the machine running `ansible-playbook` reaches the hosts it converges. See [Reaching your hosts to converge them](../../../docs/deployment-guide.md#reaching-your-hosts-to-converge-them) for the alternatives, including the one that needs no infrastructure at all.
+**This is optional.** Billet needs no inbound connectivity to run jobs — nodes always dial outbound to the control plane. This module is about *configuration management*: how the machine running `ansible-playbook` reaches the hosts it converges. See [Reaching your hosts to converge them](../../../docs/deploying/reaching-hosts.md) for the alternatives, including the one that needs no infrastructure at all.
 
 ## Read this before choosing this route
 

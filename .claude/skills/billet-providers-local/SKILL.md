@@ -1,0 +1,74 @@
+---
+name: billet-providers-local
+description: "The provider contract (internal/provider) and the three backends that run work on the host: docker (trials), firecracker (one microVM per job under the jailer, on bare metal with Ceph) and tart (macOS and Linux arm64 guests on an owned Apple Silicon Mac). Every rule here was learned by running a real guest. Load when touching internal/provider, internal/provider/docker, internal/provider/firecracker, internal/provider/tart, the guest launcher scripts, or when a launch, list, destroy or adoption behaves differently on a real host than in the fake."
+---
+
+# Local providers: docker, firecracker, tart
+
+## What this area is
+
+`internal/provider` is the narrow contract: `Accepts(trust)`, `Kind`, `Launch`, `Find`, `List`, `Destroy`, with `Spec`, `Instance`, `Teardown` (`TeardownRequested` is the zero value and the safe one; only `TeardownStopped` permits a release), `TrustClass` (zero value `TrustUnknown`, refused), `InstanceName`/`LeaseOf` (an instance is named `billet-<lease>` so reconciliation after a crash needs no side table), and the optional capabilities (`VolumeAttacher`, `GuestVolumeLocator`, `InterruptionSource`, `StagedCredentialReaper`, `QuotaReporter`). An optional capability may not carry a safety invariant. A provider imports nothing above itself (depguard). `docker` exists so `billet init` works on a laptop. `firecracker` runs every guest under the jailer with a Ceph-backed root disk. `tart` drives the `tart` CLI and Apple's Virtualization.framework; `realtart_test.go`, `realguest_test.go`, `realfirecracker_test.go` and `realdocker_test.go` pin what the real tools do.
+
+## Rules for every backend
+
+**`Accepts` is asked before anything expensive.** Minting a registration and then being refused leaves it on GitHub with nothing to consume it, one orphan per pull request. `docker` refuses untrusted work outright; `firecracker` refuses it until `node.firecracker.untrusted_bridge` names a separate network; `tart` refuses it until `node.tart.untrusted_isolation: softnet`; and in tart `Accepts` and the flag builder are one function, because written as two a mechanism admitted and not applied boots untrusted work on the trusted bridge.
+
+**`List` errors rather than answering short.** Reconciliation frees the capacity of every lease absent from an inventory, so the dangerous failure is a short, empty, successful answer. `created` is not `running` (a container that exists and was never started never will be), and an unrecognised state still counts as running, because the caller destroys what is not running.
+
+**One process writes the launch verdict from a closed vocabulary.** What billet may say about a failed launch comes from a status file its own launcher wrote (`launching` before the identity check, `started` before the pid, `command-missing`), never the guest's stdout or stderr, because the registration travels on that delivery's stdin and a guest whose shell is `cat >&2` reflects a credential into a node log. billet reads the status and the pid in one query: `launching` with no pid is conclusive, `started` with no pid is transient once and conclusive on a second observation. `command-missing` is conclusive, because retrying a command the guest lacks burns the node's single slot for the full ten-minute timeout on every job.
+
+**A cancelled command is not a returned one.** `exec.CommandContext` kills the process and then `Wait` blocks until the output pipes close, which anything the process spawned holds open: a `tart list` whose child slept sixty seconds took all sixty despite a 300ms deadline. `cmd.WaitDelay` is what makes a bound real.
+
+**Never quote the guest.** A launch failure destroys the VM, so naming `billet-runner.log` points at a machine that no longer exists, and quoting its head lets a job (dispatched the moment the runner registers) choose the bytes billet prints.
+
+## Firecracker
+
+**Every guest runs under the jailer**, chrooted, dropped to its own uid, in a cgroup, under seccomp, and the jailer names its chroot after the resolved `--exec-file`: the reference host installs `firecracker-v1.16.1` behind a stable symlink, so the jail is at `/srv/jailer/firecracker-v1.16.1/<id>/root`, and `List` enumerates every directory a jailer has built in rather than the path the config names, or every guest started before a version bump sits where the new process does not look.
+
+**`jailer --daemonize` exits 0 for a VM that died on startup** (a pid file and a socket beside a VMM that exited 1), so `Launch` believes the VMM's own API and nothing else. The registration travels in MMDS v2, placed before `InstanceStart`, which is why the backend drives the API rather than a `--config-file` (a config file starts the machine as it is read). A unix socket address is a fixed-size field, so the API socket six components below the chroot base is refused at construction.
+
+**The jailer creates a per-VM cgroup only when given a `--cgroup`, and the two cgroup forms cannot coexist on a host** (`CgroupMove … Resource busy`).
+
+**There is no API action that kills a microVM.** The API has `FlushMetrics`, `InstanceStart` and `SendCtrlAltDel`, and a real guest ignored the last for twenty seconds. billet signals the VMM after proving the pid is still that microVM's (the `--id <jail id>` pair in `/proc/<pid>/cmdline`), re-checks before SIGKILL, and treats an unreadable `/proc` entry as could-not-tell. billet passes `--new-pid-ns` because the jailer's documentation says the pid file is written only then, and a future version honouring its docs must not make "no pid file" read as "nothing running". Teardown never continues past a VMM it could not stop, because removing the jail removes the pid file that is the only handle for ever stopping it.
+
+**The kernel is linked into each jail and stays root-owned.** Chowning the jail tree chowned the host's one kernel to an account every VMM shares; chown the chroot alone. The owner marker stays root-owned too, because `List` and `Find` trust it.
+
+**Two defects survived every unit test and died on the first real launch**: `os.Stat().Sys()` holds a `*syscall.Stat_t`, not the structurally identical `*unix.Stat_t`, and the shutdown action above. That is the argument for `realfirecracker_test.go` existing at all. The generation's recorded kernel wins over the node's configuration (`kernelForGeneration`), a recorded name that is not a plain base name is refused because cluster metadata is writable by any client with pool access, and an unpaired generation falls back to `node.firecracker.kernel_image`.
+
+## Tart
+
+**`tart run` is the VM, and nothing believes its exit status.** It starts detached in its own session so a billet restart does not kill guests; state is read back through `tart list`. A VM that refuses to start used to surface as a delivery timeout, so `Launch` waits for the VM to be running and quotes the host's own reason from the run log.
+
+**Tart has no labels, so ownership is a marker file and the order is the invariant.** Clone under a `.staging` name, write and fsync the marker, then `tart rename` to the lease name; a lease-named VM always has provable ownership, `List` refuses to guess about one that does not, and two deployments on one Mac cannot destroy each other's guests. `checkSpec` reserves the `.staging` suffix so nothing can be launched under it.
+
+**`List` cross-checks tart's JSON against the vms directory and asks `tart get` about each absence.** Both inferences are wrong in opposite directions: refusing every operation over any missing row let one directory left by a killed node wedge a host, and tolerating a missing row frees a live guest's capacity. `tart get` has three measured answers: a real VM returns its configuration; a name with no directory exits 2 with `does not exist`; a directory tart cannot read exits 1 with `missing files for a supported layout`. What each proves is narrower than it looks: `does not exist` about a directory billet just enumerated is tart reading a different store, not a corpse; `missing files` means tart cannot reconstruct the VM, not that a running guest stopped. So it is a corpse only under a `.staging` name, and a lease-named directory tart cannot read wedges the host until a person looks.
+
+**`tart stop` requests a stop.** Reading the state once afterwards catches a VM mid-transition, so `Destroy` polls until the state settles, bounded by `stopWindow`, and accepts only a `tart list` row that says stopped, never an omitted row. The ownership marker is re-read immediately before the delete. An `os.SameFile` against the starting directory was removed: inode reuse defeats it, demonstrated on Linux in CI.
+
+**The store lock closes the delete race.** `tart delete` resolves a name, so a VM appearing under it microseconds after the check would be destroyed. A quarantine rename was written and reverted (one review found three defects in it). `$TART_HOME/.billet/store.lock` is flocked around the rename that publishes a lease name and the delete that removes one, and deliberately not around the clone or a staging cleanup. Keyed on the store, because two deployments share it; a fresh descriptor per acquisition, because a second flock on the same fd succeeds; it waits on contention. Measured: a dot-directory at the top of `TART_HOME` is invisible to `tart create`/`list`/`get`, `tart prune` targets only `caches` or `vms`, and `tart rename` already refuses an occupied target. What stays open is an operator running `tart delete` by hand.
+
+**The registration travels on stdin, and the guest agent kills its exec session's process group.** `tart exec -i` delivers it to the guest agent's unix socket, never argv, never SSH, never the clone. Measured in a real guest: `nohup`, a double fork and `systemd-run --user` all leave the runner dead three seconds later while `tart exec` exits 0. Only `setsid` survives; macOS guests have no `setsid`, so the fallback is perl's `POSIX::setsid`. Even that fails if the delivering shell returns before the child calls `setsid()`, so the script waits for the launcher to announce its pid before writing the sentinel; removing that wait fails `realguest_test.go`. `proveRunning` asks the guest whether the recorded pid is alive, because every one of those failures reported success. Guest assertions use billet's own `billet_birth`, because `pgrep -fc` is a Linux spelling and macOS pgrep has no `-c`.
+
+**softnet blocks the guest's resolver, so billet configures one and proves resolution.** softnet blocks the private address space, which includes the vmnet gateway the DHCP resolver points at; egress keeps working and every job fails to clone. billet sets a public resolver before delivering the registration (three spellings: systemd-resolved, plain `resolv.conf`, macOS `networksetup`, since `resolv.conf` there is generated and read by nothing) and verifies resolution, turning a silently stopped mechanism into a launch error. `untrusted_isolation` is not free to name speculatively: `billet check` is fatal when it is named and softnet carries no setuid-root grant.
+
+**A moving image tag resolves to its pulled digest** (`tart fqn`; the error is `doesn't point to a digest`), and an unpulled image refuses the launch naming `tart pull`, because a macOS image is tens of gigabytes and the node's serial queue must not carry it. `ghcr.io/cirruslabs/ubuntu` carries neither the runner nor Docker; `ubuntu-runner-arm64` carries both (11.3GB compressed on a 40GB disk; a macOS Xcode image is 81GB). A native arm64 guest ran a service container and a `docker build`, which a macOS guest cannot (no nested virtualization, no container runtime).
+
+**SIGKILL re-adopts; SIGTERM drains.** Kill a tart node mid-job and the next node reports `found=1 adopted=1`, leaves the runner alone and the job finishes green on the same VM. SIGTERM is a drain (the node reports it is not taking new work and is waiting for the compute already running, with no bound), so the node outlives the job and destroys the VM itself; a restart test that sends TERM proves the drain while looking like it proved adoption.
+
+## Measured facts
+
+- Virtualization.framework refuses a third macOS guest and one under 4GiB; `config.DefaultMacOSVMLimit = 2` is pinned to that refusal.
+- `tart get`: exit 2 `does not exist`; exit 1 `missing files for a supported layout`.
+- `SendCtrlAltDel`: ignored by a real guest for twenty seconds.
+- Delivery mechanisms in a real `ghcr.io/cirruslabs/ubuntu` guest: `nohup`, double fork, `systemd-run --user` all dead in three seconds; `setsid` survives.
+- A node's serial queue: 300ms deadline, 60-second wait without `WaitDelay`.
+- Docker `--filter name=` is a substring match.
+
+## Where the tests are
+
+- `internal/provider/*_test.go` (the contract), `docker/realdocker_test.go`, `firecracker/realfirecracker_test.go` (`TestTheRealHostIdentityIsOneNewWillAccept`, launch and destroy leave nothing), `tart/realtart_test.go` (lifecycle, error phrasings, list shape, two deployments kept apart, the store lock ignored by tart), `tart/realguest_test.go` (Linux `setsid` and macOS perl, softnet resolver, Xcode).
+- `internal/provider/firecracker/*_test.go`: `TestAPidFileThatIsNotAPidStopsTeardown` asserts the jail, the disk and the tap are still there, not merely that an error came back.
+
+## Related skills
+
+`billet-capacity` (what `List` and `Destroy` prove), `billet-security` (trust gates and the pid rule), `billet-guest-images` (the kernel pair and images pull for tart), `billet-lifecycle` (the Mac agent), `billet-storage-and-cache` (the Ceph root disk).
