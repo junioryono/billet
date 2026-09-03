@@ -935,7 +935,7 @@ func (p *Plane) checkRegistration(req nodeapi.RegisterRequest) (int, nodeapi.Ran
 	// check: the same catalogue refuses the same node forever.
 	if req.Provider == config.ProviderCodeBuild && len(p.tiers) > 0 {
 		if err := config.CodeBuildTrustConflict(p.tierList(), req.Node); err != nil {
-			return 0, nodeWire, fmt.Errorf("%w: %v", ErrRefused, err)
+			return 0, nodeWire, fmt.Errorf("%w: %w", ErrRefused, err)
 		}
 	}
 
