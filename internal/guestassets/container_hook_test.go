@@ -127,6 +127,7 @@ func TestTheContainerHookLeavesOtherRequestsAlone(t *testing.T) {
 		{"shim absent", map[string]any{"command": "prepare_job", "args": map[string]any{"container": map[string]any{"image": "x"}}}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			index, record := hookHarness(t, "0")
 			shim := filepath.Join(t.TempDir(), "docker")
 			if tc.shim {
