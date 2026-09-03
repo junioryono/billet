@@ -304,7 +304,7 @@ Because these defaults are easy to get wrong by hand, they are provisioned as a 
 
 ```hcl
 module "converge" {
-  source = "github.com/junioryono/billet//terraform/modules/converge-aws-ssm?ref=main"
+  source = "github.com/junioryono/billet//terraform/modules/converge-aws-ssm?ref=v0.5.0"
 
   name               = "billet-converge"
   github_repository  = "your-org/your-infra-repo"
@@ -325,7 +325,7 @@ The prerequisite is real: **you must own a domain on Cloudflare**, because the t
 
 ```hcl
 module "converge" {
-  source = "github.com/junioryono/billet//terraform/modules/converge-cloudflare?ref=main"
+  source = "github.com/junioryono/billet//terraform/modules/converge-cloudflare?ref=v0.5.0"
 
   account_id = var.cloudflare_account_id
   zone_id    = var.cloudflare_zone_id

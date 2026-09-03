@@ -59,7 +59,7 @@ runs:
   using: composite
   steps:
     - id: setup
-      uses: junioryono/billet/actions/setup-docker-builder@main
+      uses: junioryono/billet/actions/setup-docker-builder@v0.5.0
       with:
         cache-key: ${{ inputs.cache-key }}
         cache-size-gb: ${{ inputs.cache-size-gb }}
