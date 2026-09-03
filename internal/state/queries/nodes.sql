@@ -15,10 +15,22 @@ SELECT name, provider, site, live,
 
 -- name: ListNodeWireVersions :many
 -- What each host's registration said about its build, and what was negotiated.
+--
+-- highest_release is the newest release this host has EVER registered with, kept
+-- beside node_release so a report can say a host is running something older than
+-- it once did. It decides nothing: a rolled-back host is exactly that shape.
 SELECT name, live, node_release, wire_min, wire_max, wire_version, epoch,
-       node_digest
+       node_digest, highest_release
   FROM nodes
  ORDER BY name;
+
+-- name: ReadNodeHighestRelease :one
+-- The newest release one host has registered with, for the registration that is
+-- about to decide whether this one is newer still.
+--
+-- sql.ErrNoRows means the host was never registered, which the caller reads as
+-- "nothing recorded" rather than as an error.
+SELECT highest_release FROM nodes WHERE name = @name;
 
 -- name: ReadNodeLiveness :one
 -- Whether the deployment can currently reach one host.
@@ -234,10 +246,11 @@ SELECT name FROM nodes
 INSERT INTO nodes
    (name, provider, site, total_vcpu, total_memory, ec2_shapes, last_seen_at, live,
     node_release, wire_min, wire_max, wire_version, node_digest, codebuild_fleet,
-    codebuild_jit_path, codebuild_region, incarnation, epoch)
+    codebuild_jit_path, codebuild_region, incarnation, highest_release, epoch)
 VALUES (@name, @provider, @site, @total_vcpu, @total_memory, @ec2_shapes, @last_seen_at, 1,
         @node_release, @wire_min, @wire_max, @wire_version, @node_digest,
-        @codebuild_fleet, @codebuild_jit_path, @codebuild_region, @incarnation, 1)
+        @codebuild_fleet, @codebuild_jit_path, @codebuild_region, @incarnation,
+        @highest_release, 1)
 ON CONFLICT (name) DO UPDATE SET
    provider     = excluded.provider,
    site         = excluded.site,
@@ -255,6 +268,7 @@ ON CONFLICT (name) DO UPDATE SET
    codebuild_jit_path = excluded.codebuild_jit_path,
    codebuild_region   = excluded.codebuild_region,
    incarnation  = excluded.incarnation,
+   highest_release = excluded.highest_release,
    epoch        = nodes.epoch + 1,
    decommissioned_at   = '',
    decommission_proven = 0,

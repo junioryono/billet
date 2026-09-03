@@ -61,6 +61,16 @@ type Policy struct {
 	// wrong as a default. A fleet of fifty should not stop for one bad host; a
 	// fleet of two should not lose both.
 	FailureBudget int `json:"failure_budget"`
+
+	// AllowDowngrade records that an operator asked for a target older than the
+	// release the fleet is running, by name.
+	//
+	// IN THE POLICY BECAUSE IT TRAVELS WITH THE DECISION. The controller host's
+	// updater reads it out of the ledger to lower the release watermark before
+	// the older candidate is probed; without it a downgrade is refused at that
+	// probe and rolls back, which is the safe answer for a decision nobody made.
+	// The automatic starter never sets it.
+	AllowDowngrade bool `json:"allow_downgrade,omitempty"`
 }
 
 // DefaultPolicy is one host at a time, stopping after one failure.

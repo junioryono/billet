@@ -38,12 +38,14 @@ import (
 // it is to give it something to say and a place to say it.
 func cmdImages(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: billet images <pull|compatible|verify|due|list|reap|promote|unpromote>")
+		return errors.New("usage: billet images <pull|refresh|compatible|verify|due|list|reap|promote|unpromote>")
 	}
 
 	switch args[0] {
 	case "pull":
 		return cmdImagesPull(ctx, args[1:])
+	case "refresh":
+		return cmdImagesRefresh(ctx, args[1:])
 	case "compatible":
 		return cmdImagesCompatible(ctx, args[1:])
 	case "verify":
@@ -555,7 +557,7 @@ func cmdImagesVerify(ctx context.Context, args []string) error {
 	}
 
 	if rest == "" {
-		return errors.New("usage: billet images <pull|compatible|verify|due|list|reap|promote|unpromote>")
+		return errors.New("usage: billet images <pull|refresh|compatible|verify|due|list|reap|promote|unpromote>")
 	}
 
 	// THE GENERATION IS REQUIRED, not defaulted, for the same reason the provider

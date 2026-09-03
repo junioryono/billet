@@ -8,6 +8,7 @@ import (
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/state"
+	"github.com/junioryono/billet/internal/version"
 )
 
 // THE ONE PLACE THAT TURNS A CONFIG INTO AN OPEN LEDGER.
@@ -28,10 +29,11 @@ func openState(ctx context.Context, cfg *config.Config) (*state.DB, error) {
 	}
 
 	if cfg.Server.LedgerBackend() == config.StatePostgres {
-		return state.OpenPostgres(ctx, cfg.Server.IdentityDir, dsn)
+		return state.OpenPostgres(ctx, cfg.Server.IdentityDir, dsn,
+			state.WithRunningRelease(version.Version()))
 	}
 
-	return state.Open(ctx, cfg.Server.IdentityDir)
+	return state.Open(ctx, cfg.Server.IdentityDir, state.WithRunningRelease(version.Version()))
 }
 
 // openStateStandby opens the ledger for a control plane that is WAITING to
@@ -54,7 +56,8 @@ func openStateStandby(ctx context.Context, cfg *config.Config) (*state.DB, error
 			config.ControllersActivePassive, cfg.Server.LedgerBackend())
 	}
 
-	return state.OpenPostgresStandby(ctx, cfg.Server.IdentityDir, dsn)
+	return state.OpenPostgresStandby(ctx, cfg.Server.IdentityDir, dsn,
+		state.WithRunningRelease(version.Version()))
 }
 
 // openStateAdmin opens the ledger for a ONE-SHOT OPERATOR COMMAND: it proceeds
@@ -69,9 +72,11 @@ func openStateAdmin(ctx context.Context, cfg *config.Config) (*state.DB, error) 
 	var db *state.DB
 
 	if cfg.Server.LedgerBackend() == config.StatePostgres {
-		db, err = state.OpenPostgresAdmin(ctx, cfg.Server.IdentityDir, dsn)
+		db, err = state.OpenPostgresAdmin(ctx, cfg.Server.IdentityDir, dsn,
+			state.WithRunningRelease(version.Version()))
 	} else {
-		db, err = state.OpenAdmin(ctx, cfg.Server.IdentityDir)
+		db, err = state.OpenAdmin(ctx, cfg.Server.IdentityDir,
+			state.WithRunningRelease(version.Version()))
 	}
 
 	if err != nil {
@@ -128,7 +133,8 @@ func openStateMaintenance(ctx context.Context, cfg *config.Config) (*state.DB, e
 			config.StatePostgres)
 	}
 
-	return state.OpenMaintenance(ctx, cfg.Server.IdentityDir)
+	return state.OpenMaintenance(ctx, cfg.Server.IdentityDir,
+		state.WithRunningRelease(version.Version()))
 }
 
 // ledgerDSN reads the connection string out of the environment.

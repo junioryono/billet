@@ -1,0 +1,30 @@
+# When billet-upgrade.service looks.
+#
+# EVERY FIVE MINUTES, because what it looks at is a durable decision that is
+# either there or not, and the cost of looking is one read of the ledger through
+# the operator handle. A rollout the control plane started at 02:00 is acted on
+# by 02:05; between rollouts the unit exits saying there is nothing to do.
+#
+#   systemctl disable --now billet-upgrade.timer
+#
+# is how a host opts out of acting on rollouts; `release: {automatic: false}` in
+# billet.yaml is how a deployment stops starting them.
+[Unit]
+Description=billet host upgrade, every five minutes
+Documentation=https://billet.readthedocs.io/en/latest/operating/upgrades.html
+
+[Timer]
+# SOON AFTER BOOT, so a host that was off while a rollout was recorded takes it
+# up once it is back and its services have settled.
+OnBootSec=2min
+OnUnitActiveSec=5min
+
+# SPREAD, so a fleet's controller hosts do not all read the ledger on the same
+# second — and so two controller hosts sharing one PostgreSQL ledger are not both
+# stopping at once, which the claim would refuse anyway.
+RandomizedDelaySec=1min
+
+Unit=billet-upgrade.service
+
+[Install]
+WantedBy=timers.target

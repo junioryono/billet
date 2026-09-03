@@ -18,6 +18,7 @@ import (
 	"github.com/junioryono/billet/internal/provenance"
 	"github.com/junioryono/billet/internal/provider/firecracker"
 	"github.com/junioryono/billet/internal/releasesource"
+	"github.com/junioryono/billet/internal/rollout"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/version"
 )
@@ -72,12 +73,19 @@ func cmdHostUpgrade(ctx context.Context, args []string) error {
 		"install even if this machine already reports the release being installed; "+
 			"this is what repairs a host a rollout blocked for running the right version "+
 			"from bytes it did not decide on")
+	allowDowngrade := fs.Bool("allow-downgrade", false,
+		"install a release OLDER than the one running here; on a control plane the "+
+			"ledger's release watermark is lowered to admit it, after the snapshot that "+
+			"keeps the higher mark for a rollback")
 	status := fs.Bool("status", false,
 		"report what this machine holds — a transaction in progress, its journal, the "+
 			"fleet decision it last acted on, and which release manifest produced it")
 	ackFD := fs.Int("ack-fd", 0,
 		"a descriptor to report acceptance or refusal on; a node passes this so a "+
 			"preflight refusal reaches the control plane instead of being invisible")
+	fromRollout := fs.Bool("from-rollout", false,
+		"act on the rollout this deployment's ledger records, the way the scheduled "+
+			"updater on a control-plane host does; nothing to act on exits 0")
 
 	if err := parse(fs, args); err != nil {
 		return err
@@ -98,6 +106,21 @@ func cmdHostUpgrade(ctx context.Context, args []string) error {
 		return nil
 	}
 
+	if *fromRollout {
+		// THE LEDGER IS THE ONLY INPUT. A target, a digest, a generation or an
+		// ack passed beside it would be a second opinion about a decision the
+		// ledger already holds, and the point of this mode is that nothing on the
+		// command line can retarget it.
+		if *pin != "" || *digest != "" || *rolloutID != "" || *generation != 0 || *resume ||
+			*reinstall || *ackFD != 0 {
+			return errors.New("--from-rollout takes its whole instruction from the ledger and " +
+				"accepts no --version, --manifest-sha256, --rollout, --generation, " +
+				"--reinstall, --resume or --ack-fd beside it")
+		}
+
+		return hostUpgradeFromRollout(ctx, cfg, *cfgPath, *skipVerify)
+	}
+
 	ack := newUpgradeAck(*ackFD)
 	defer ack.close()
 
@@ -113,13 +136,14 @@ func cmdHostUpgrade(ctx context.Context, args []string) error {
 	}
 
 	err = startHostUpgrade(ctx, cfg, *cfgPath, hostUpgradeTarget{
-		channel:    *channel,
-		pin:        *pin,
-		digest:     *digest,
-		rolloutID:  *rolloutID,
-		generation: *generation,
-		skipVerify: *skipVerify,
-		reinstall:  *reinstall,
+		channel:        *channel,
+		pin:            *pin,
+		digest:         *digest,
+		rolloutID:      *rolloutID,
+		generation:     *generation,
+		skipVerify:     *skipVerify,
+		reinstall:      *reinstall,
+		allowDowngrade: *allowDowngrade,
 	}, ack)
 
 	// REFUSING AFTER THE FACT IS A NO-OP ONCE ACCEPTANCE WAS SENT. What the caller
@@ -129,6 +153,106 @@ func cmdHostUpgrade(ctx context.Context, args []string) error {
 	ack.refuse(err)
 
 	return err
+}
+
+// hostUpgradeFromRollout acts on the rollout the ledger records, if any.
+//
+// THE ROOT EXECUTOR OF A DECISION THE CONTROL PLANE CANNOT CARRY OUT ON ITSELF.
+// A rollout is server-first and a process cannot install its own successor, so
+// billet-upgrade.timer runs this on every control-plane host: it reads the open
+// rollout through the operator handle, and if the target is a release this
+// machine is not running it runs exactly the transaction a node's dispatch would
+// — same pin, same digest, same generation, same fences. Nothing here consults
+// the channel; a channel that advanced after the decision changes nothing, which
+// is the rule every other reader of a rollout already keeps.
+func hostUpgradeFromRollout(ctx context.Context, cfg *config.Config, cfgPath string,
+	skipVerify bool,
+) error {
+	target, ok, err := rolloutInstruction(ctx, cfg)
+	if err != nil || !ok {
+		return err
+	}
+
+	target.skipVerify = skipVerify
+
+	// NO ACK FD. There is no node waiting on the far end of a pipe; the timer
+	// reads the exit status and the journal, and `billet host-upgrade --status`
+	// reads the rest.
+	return startHostUpgrade(ctx, cfg, cfgPath, target, newUpgradeAck(0))
+}
+
+// rolloutInstruction reads what the open rollout asks of this host, and says
+// whether there is anything to do.
+//
+// FOUR WAYS TO ANSWER "NOTHING", EACH SAID OUT LOUD, because this runs unattended
+// every few minutes and a silent exit 0 is indistinguishable from a timer that
+// stopped firing. No control plane here; automatic updates turned off; no
+// rollout open; the controller already converged or this binary already the
+// target — the last of which the control plane records on its next pass, so the
+// timer has nothing to add.
+//
+// THE HANDLE IS CLOSED BEFORE ANYTHING IS RETURNED TO ACT ON. The transaction
+// that follows fences the ledger and waits for every handle opened before the
+// fence to finish; one this same process left open would be one it waited on
+// forever.
+func rolloutInstruction(ctx context.Context, cfg *config.Config) (hostUpgradeTarget, bool, error) {
+	if cfg.Server == nil {
+		fmt.Printf("This host runs no control plane, so no rollout is recorded here; " +
+			"nothing to do.\n")
+
+		return hostUpgradeTarget{}, false, nil
+	}
+
+	if !cfg.Release.AutomaticUpdates() {
+		fmt.Printf("release.automatic is false on this host, so the recorded rollout is left " +
+			"to an operator; nothing to do.\n")
+
+		return hostUpgradeTarget{}, false, nil
+	}
+
+	db, err := openStateAdmin(ctx, cfg)
+	if err != nil {
+		return hostUpgradeTarget{}, false, fmt.Errorf("server state: %w", err)
+	}
+
+	defer func() { _ = db.Close() }()
+
+	current, err := rollout.New(db).Open(ctx)
+	if err != nil {
+		if errors.Is(err, rollout.ErrNoRollout) {
+			fmt.Printf("No rollout is running; nothing to do.\n")
+
+			return hostUpgradeTarget{}, false, nil
+		}
+
+		return hostUpgradeTarget{}, false, err
+	}
+
+	if current.ControllerPhase.Converged() {
+		fmt.Printf("Rollout %s has already converged the control plane; nothing to do.\n",
+			current.ID)
+
+		return hostUpgradeTarget{}, false, nil
+	}
+
+	if current.TargetVersion == version.Version() {
+		fmt.Printf("This host already runs %s, rollout %s's target; the control plane "+
+			"records that on its next pass. Nothing to do.\n", current.TargetVersion, current.ID)
+
+		return hostUpgradeTarget{}, false, nil
+	}
+
+	fmt.Printf("Rollout %s asks this host to move from %s to %s (manifest %s, decision %d).\n",
+		current.ID, version.Version(), current.TargetVersion, current.TargetDigest,
+		current.Generation)
+
+	return hostUpgradeTarget{
+		pin:            current.TargetVersion,
+		digest:         current.TargetDigest,
+		rolloutID:      current.ID,
+		generation:     current.Generation,
+		allowDowngrade: current.Policy.AllowDowngrade,
+	}, true, nil
 }
 
 type hostUpgradeTarget struct {
@@ -161,6 +285,15 @@ type hostUpgradeTarget struct {
 	// decides there is nothing to do. This is the way through, and it is a person
 	// asserting rather than billet inferring.
 	reinstall bool
+	// allowDowngrade is a person, or a rollout an operator started with
+	// --allow-downgrade, asking for a release older than the one running here.
+	//
+	// WITHOUT IT A DOWNGRADE IS REFUSED BEFORE ANYTHING DRAINS. The ledger's
+	// release watermark would refuse the older candidate at the probe anyway and
+	// the transaction would roll back — correctly, and after a drain nobody
+	// needed. With it, the transaction lowers the mark inside its migrate step,
+	// after the snapshot that keeps the higher one for a rollback.
+	allowDowngrade bool
 }
 
 // startHostUpgrade stages a verified candidate and then runs the transaction.
@@ -173,7 +306,7 @@ type hostUpgradeTarget struct {
 func startHostUpgrade(ctx context.Context, cfg *config.Config, cfgPath string,
 	target hostUpgradeTarget, ack *upgradeAck,
 ) error {
-	policy, err := releasesource.PolicyForRelease(target.skipVerify)
+	policy, err := releasePolicyFor(cfg, target.skipVerify)
 	if err != nil {
 		return err
 	}
@@ -251,6 +384,14 @@ func actOnResolved(ctx context.Context, cfg *config.Config, cfgPath string,
 		return err
 	}
 
+	// A DOWNGRADE NOBODY NAMED IS REFUSED HERE, before a drain. On a host with a
+	// ledger the release watermark would refuse it at the probe and roll the
+	// transaction back; on a node-only host nothing else would, and the fleet's
+	// newest release would quietly be replaced by whatever an old pin said.
+	if err := checkDowngrade(manifest.Version, version.Version(), target.allowDowngrade); err != nil {
+		return err
+	}
+
 	// THE FENCE IS ASKED BEFORE ANYTHING ELSE IS DECIDED, INCLUDING WHETHER THERE
 	// IS ANYTHING TO DO. Putting the already-running fast path first was a defect a
 	// review caught: a machine could satisfy decision 10 without ever raising its
@@ -307,15 +448,16 @@ func actOnResolved(ctx context.Context, cfg *config.Config, cfgPath string,
 	}
 
 	journal := &hostupgrade.Journal{
-		Dir:          dir,
-		FromVersion:  version.Version(),
-		ToVersion:    manifest.Version,
-		TargetDigest: digest,
-		RolloutID:    target.rolloutID,
-		Generation:   target.generation,
-		PID:          os.Getpid(),
-		Step:         hostupgrade.StepClaimed,
-		StartedAt:    time.Now().UTC().Format(time.RFC3339Nano),
+		Dir:            dir,
+		FromVersion:    version.Version(),
+		ToVersion:      manifest.Version,
+		TargetDigest:   digest,
+		RolloutID:      target.rolloutID,
+		Generation:     target.generation,
+		AllowDowngrade: target.allowDowngrade,
+		PID:            os.Getpid(),
+		Step:           hostupgrade.StepClaimed,
+		StartedAt:      time.Now().UTC().Format(time.RFC3339Nano),
 	}
 
 	// THE JOURNAL IS ON THE DISK BEFORE THE POINTER EXISTS, so no reader can ever
@@ -382,7 +524,7 @@ func actOnResolved(ctx context.Context, cfg *config.Config, cfgPath string,
 	fmt.Printf("The node stops first so its compute drains, and that wait is unbounded:\n")
 	fmt.Printf("a job may run for days and nothing here ends one.\n\n")
 
-	return finishHostUpgrade(ctx, journal, newSystemdHost(cfg, cfgPath, staged))
+	return finishHostUpgrade(ctx, journal, newSystemdHost(cfg, cfgPath, staged, journal))
 }
 
 // resumeHostUpgrade continues or unwinds the transaction already on this machine.
@@ -460,7 +602,7 @@ func resumeHostUpgrade(ctx context.Context, cfg *config.Config) error {
 	}
 
 	return finishHostUpgrade(ctx, journal,
-		newSystemdHost(cfg, "", filepath.Join(dir, "billet")))
+		newSystemdHost(cfg, "", filepath.Join(dir, "billet"), journal))
 }
 
 // finishHostUpgrade runs the transaction and releases the claim only once the
@@ -986,18 +1128,30 @@ type systemdHost struct {
 	staged   string
 	inspect  *lifeops.Inspector
 	converge *lifeops.Converger
+	// downgradeTo is the release the ledger's watermark is lowered to before the
+	// candidate is probed, or empty for an upgrade. Read from the journal so a
+	// resumed transaction keeps the permission the interrupted one was given.
+	downgradeTo string
 }
 
-func newSystemdHost(cfg *config.Config, cfgPath, staged string) *systemdHost {
+func newSystemdHost(cfg *config.Config, cfgPath, staged string,
+	journal *hostupgrade.Journal,
+) *systemdHost {
 	inspector := lifeops.NewInspector()
 
-	return &systemdHost{
+	h := &systemdHost{
 		cfg:      cfg,
 		cfgPath:  cfgPath,
 		staged:   staged,
 		inspect:  inspector,
 		converge: lifeops.NewConverger(inspector),
 	}
+
+	if journal != nil && journal.AllowDowngrade {
+		h.downgradeTo = journal.ToVersion
+	}
+
+	return h
 }
 
 const (
@@ -1019,6 +1173,102 @@ func (h *systemdHost) StopNode(ctx context.Context) error {
 // StopServer stops the control plane, after the node's custody has settled.
 func (h *systemdHost) StopServer(ctx context.Context) error {
 	return h.stop(ctx, serverUnit)
+}
+
+// RefreshGuestImages pulls a generation the candidate can boot, on a firecracker
+// host, using the candidate's own judgement of what that is.
+//
+// THE CANDIDATE DECIDES, BECAUSE THE CONTRACT IS THE CANDIDATE'S. `images
+// compatible` reads the guest contract out of the binary that runs it, so it is
+// the staged candidate that has to ask whether each configured image speaks its
+// contract — this binary would answer for the release being replaced. Exit 2
+// names the images that need a generation in the result file; each is then
+// pulled, boot-verified and promoted by the candidate too, so the generation it
+// records as verified is one it proved itself. The same three commands, in the
+// same order, as the Ansible role's transaction.
+func (h *systemdHost) RefreshGuestImages(ctx context.Context) error {
+	if h.cfg.Node == nil || h.cfg.Node.Provider != config.ProviderFirecracker {
+		return nil
+	}
+
+	results := filepath.Join(filepath.Dir(h.staged), "guest-images-to-refresh")
+
+	err := h.runStaged(ctx, "images", "compatible", "--result-file", results,
+		"--config", h.configPath())
+	if err == nil {
+		fmt.Printf("  every configured guest image speaks the candidate's contract\n")
+
+		return nil
+	}
+
+	if subprocessExit(err) != 2 {
+		return fmt.Errorf("asking the candidate which guest images it can boot: %w", err)
+	}
+
+	needed, err := readImageResults(results)
+	if err != nil {
+		return err
+	}
+
+	for _, image := range needed {
+		fmt.Printf("  pulling and verifying a generation of %s the candidate can boot\n", image)
+
+		if err := h.runStaged(ctx, "images", "pull", "--verify", "--config", h.configPath(),
+			image); err != nil {
+			return fmt.Errorf("pulling a guest image for the candidate: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// readImageResults reads the bare image names `images compatible` wrote.
+func readImageResults(path string) ([]string, error) {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read which guest images the candidate needs: %w", err)
+	}
+
+	var names []string
+
+	for line := range strings.SplitSeq(string(body), "\n") {
+		if name := strings.TrimSpace(line); name != "" {
+			names = append(names, name)
+		}
+	}
+
+	return names, nil
+}
+
+// runStaged runs the staged candidate, before it is installed.
+//
+// THE EXIT STATUS SURVIVES THE WRAP, because `images compatible` answers with
+// it: 2 is "these images need a generation", which is an answer and not a
+// failure, and a caller has to be able to tell the two apart.
+func (h *systemdHost) runStaged(ctx context.Context, args ...string) error {
+	// THE BINARY IS THE CANDIDATE THIS TRANSACTION STAGED, proved against the
+	// signed manifest before anything stopped, and the arguments are this file's
+	// own literals plus the config path the caller was started with. Nothing
+	// here arrives from a manifest, a node or a guest.
+	//nolint:gosec // the candidate was verified against the signed manifest and the arguments are this file's literals; see above
+	cmd := exec.CommandContext(ctx, h.staged, args...)
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s: %w: %s", strings.Join(args[:2], " "), err, out)
+	}
+
+	return nil
+}
+
+// subprocessExit reads the status a child billet exited with, or 1 for anything
+// that was not a child exiting.
+func subprocessExit(err error) int {
+	if exit, ok := errors.AsType[*exec.ExitError](err); ok {
+		return exit.ExitCode()
+	}
+
+	return 1
 }
 
 func (h *systemdHost) stop(ctx context.Context, unit string) error {
@@ -1192,11 +1442,42 @@ func (h *systemdHost) RecordInstalled(_ context.Context, digest, release string)
 // the ledger here would apply the old build's migrations, which is the opposite
 // of what an upgrade needs. The candidate's own `--upgrade-probe` is what runs.
 func (h *systemdHost) Migrate(ctx context.Context) error {
+	// THE WATERMARK IS LOWERED BEFORE THE CANDIDATE TOUCHES THE LEDGER, and only
+	// for a downgrade somebody asked for. The snapshot one step back keeps the
+	// higher mark, so a rollback of the downgrade restores the refusal with the
+	// rest of the ledger. Done through this binary's maintenance handle because
+	// the candidate, being the older one, is exactly what the mark refuses.
+	if err := h.lowerWatermark(ctx); err != nil {
+		return err
+	}
+
 	// --maintenance-probe FOR THE SAME REASON THE SNAPSHOT USES OpenMaintenance.
 	// The ledger is fenced at this point, and an ordinary `billet check` is an
 	// operator command: it opens through OpenAdmin and is refused. The flag is what
 	// says "I am the transaction", and `billet check` is its one caller.
 	return h.runCandidate(ctx, "check", "--config", h.configPath(), "--maintenance-probe")
+}
+
+// lowerWatermark admits the older candidate to the ledger, when asked to.
+func (h *systemdHost) lowerWatermark(ctx context.Context) error {
+	if h.downgradeTo == "" || h.cfg.Server == nil {
+		return nil
+	}
+
+	db, err := openStateMaintenance(ctx, h.cfg)
+	if err != nil {
+		return fmt.Errorf("open the ledger to lower its release watermark: %w", err)
+	}
+
+	defer func() { _ = db.Close() }()
+
+	if err := db.SetReleaseWatermark(ctx, h.downgradeTo); err != nil {
+		return err
+	}
+
+	fmt.Printf("  lowered the ledger's release watermark to %s, as asked\n", h.downgradeTo)
+
+	return nil
 }
 
 // ProbeReady starts the candidate under units that poll nothing.

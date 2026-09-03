@@ -100,6 +100,22 @@ nfpms:
         dst: /usr/lib/systemd/system/billet-backup.service
       - src: deploy/billet-backup.timer
         dst: /usr/lib/systemd/system/billet-backup.timer
+
+      # BOTH OF THESE ARE ENABLED BY postinstall, AND THAT IS THE ONE EXCEPTION.
+      # The upgrade timer acts only on a rollout the ledger already records, the
+      # images timer only on a node whose config names guest images, and each
+      # exits doing nothing under `release: {automatic: false}` — so neither
+      # connects a machine to GitHub, which is what the enable-nothing rule
+      # protects. They are what makes an unattended deployment able to take the
+      # update it decided on. The units say how to turn them off.
+      - src: deploy/billet-upgrade.service
+        dst: /usr/lib/systemd/system/billet-upgrade.service
+      - src: deploy/billet-upgrade.timer
+        dst: /usr/lib/systemd/system/billet-upgrade.timer
+      - src: deploy/billet-images.service
+        dst: /usr/lib/systemd/system/billet-images.service
+      - src: deploy/billet-images.timer
+        dst: /usr/lib/systemd/system/billet-images.timer
       - src: deploy/billet-rbd.conf
         dst: /usr/lib/modules-load.d/billet-rbd.conf
 

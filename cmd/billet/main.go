@@ -45,6 +45,7 @@ import (
 	"github.com/junioryono/billet/internal/provider/ec2"
 	"github.com/junioryono/billet/internal/provider/firecracker"
 	"github.com/junioryono/billet/internal/provider/tart"
+	"github.com/junioryono/billet/internal/releasesource"
 	"github.com/junioryono/billet/internal/rollout"
 	"github.com/junioryono/billet/internal/scaleset"
 	"github.com/junioryono/billet/internal/server"
@@ -735,9 +736,23 @@ func runServer(
 		rollout.WithCoordinatorLogger(slog.Default()),
 	)
 
+	// AND THE STARTER, which is what makes `release.automatic` true: the
+	// coordinator converges a rollout that exists, and this is what makes one
+	// exist when the channel advances. It resolves the channel through the same
+	// functions `billet rollout start` does, so the two cannot disagree about
+	// what a target is.
+	starter, err := newRolloutStarter(cfg, rollout.New(db), ledgerFleet{alloc: allocator},
+		releasesource.Host(version.Version(),
+			releasesource.Range{Min: nodeapi.MinVersion, Max: nodeapi.Version},
+			state.LatestSchemaVersion(), firecracker.GuestContract))
+	if err != nil {
+		return err
+	}
+
 	opts = append(opts,
 		server.WithNodeRunner(planeRunner),
 		server.WithRolloutCoordinator(coordinator, 0),
+		server.WithRolloutStarter(starter, 0),
 		// AND THE SWEEP OF STAGED CODEBUILD REGISTRATIONS a dead node never reaped.
 		// Wired here because it needs what only this process has: the ledger, which
 		// is the sole authority for deleting one, and the host's AWS credentials —
@@ -4040,6 +4055,10 @@ func printWireWindow(ctx context.Context, a *alloc.Allocator) {
 			fmt.Printf(" (this deployment cannot reach it)")
 		}
 
+		if note := describeDowngrade(n); note != "" {
+			fmt.Printf("  <- %s", note)
+		}
+
 		fmt.Println()
 	}
 
@@ -4084,6 +4103,28 @@ func printWireWindow(ctx context.Context, a *alloc.Allocator) {
 	fmt.Printf("          A host that is gone for good still counts. Once it is stopped and " +
 		"holds no lease,\n          `billet nodes decommission <node>` forgets it and closes " +
 		"this window.\n")
+}
+
+// describeDowngrade says when a host is running something older than it once
+// registered with, and stays silent otherwise.
+//
+// A NOTE, NOT A VERDICT. A rollout that failed on this host and rolled it back
+// produces exactly this shape, and `billet rollout status` says whether one did;
+// what this line adds is that somebody's hand producing the same shape is no
+// longer invisible. Only a proved order is reported: a host whose current release
+// cannot be ordered against its highest says nothing here.
+func describeDowngrade(n alloc.NodeWire) string {
+	if n.HighestRelease == "" || n.Release == "" {
+		return ""
+	}
+
+	order, ok := version.Compare(n.Release, n.HighestRelease)
+	if !ok || order >= 0 {
+		return ""
+	}
+
+	return fmt.Sprintf("DOWNGRADED: it once registered on %s (a rollout's rollback does this; "+
+		"`billet rollout status` says whether one did)", n.HighestRelease)
 }
 
 // describeRelease names a host's build, or says why it has no name.

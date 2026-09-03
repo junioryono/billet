@@ -105,6 +105,9 @@ func cmdRolloutStart(ctx context.Context, args []string) error {
 		"how many hosts may end blocked or rolled back before this stops starting new ones")
 	skipVerify := fs.Bool("skip-signature-verification", false,
 		"trust this source by other means; only for an air-gapped mirror")
+	allowDowngrade := fs.Bool("allow-downgrade", false,
+		"move the fleet to a release OLDER than the one this control plane is running; "+
+			"the ledger's release watermark is lowered to admit it")
 
 	if err := parse(fs, args); err != nil {
 		return err
@@ -123,13 +126,25 @@ func cmdRolloutStart(ctx context.Context, args []string) error {
 	// running while a rollout is midway through draining a host.
 	client := &releasesource.Client{}
 
-	policy, err := releasesource.PolicyForRelease(*skipVerify)
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		return err
+	}
+
+	policy, err := releasePolicyFor(cfg, *skipVerify)
 	if err != nil {
 		return err
 	}
 
 	target, digest, err := resolveTarget(ctx, client, policy, *channel, *pin)
 	if err != nil {
+		return err
+	}
+
+	// A DOWNGRADE IS A DECISION SOMEBODY MAKES BY NAME. Every host's updater
+	// would otherwise be refused by the ledger's release watermark at the probe
+	// and roll back, one drain at a time, for a target nobody meant.
+	if err := checkDowngrade(target.Version, version.Version(), *allowDowngrade); err != nil {
 		return err
 	}
 
@@ -169,8 +184,9 @@ func cmdRolloutStart(ctx context.Context, args []string) error {
 		TargetDigest:  digest,
 		PriorVersion:  version.Version(),
 		Policy: rollout.Policy{
-			Cohort:        *cohort,
-			FailureBudget: *failureBudget,
+			Cohort:         *cohort,
+			FailureBudget:  *failureBudget,
+			AllowDowngrade: *allowDowngrade,
 		},
 		CreatedBy: actor(),
 		Nodes:     names,
@@ -193,6 +209,56 @@ func cmdRolloutStart(ctx context.Context, args []string) error {
 	fmt.Printf("\nWatch it with `billet rollout status`.\n")
 
 	return nil
+}
+
+// releasePolicyFor decides what a release manifest must be signed by for this
+// deployment.
+//
+// ONE ANSWER FOR THE COMMAND, THE UPDATER AND THE AUTOMATIC STARTER. A
+// deployment mirroring billet's releases internally names its own signing
+// identity and issuer in `release:`, and a path that consulted only the built-in
+// default would refuse that mirror's every manifest — or, with the waiver, trust
+// it unsigned. The waiver still wins, because skipping verification is an act
+// somebody performs on the command line rather than something a config implies.
+func releasePolicyFor(cfg *config.Config, skipVerify bool) (releasesource.Policy, error) {
+	policy, err := releasesource.PolicyForRelease(skipVerify)
+	if err != nil || skipVerify || cfg == nil || cfg.Release == nil {
+		return policy, err
+	}
+
+	if cfg.Release.SigningIdentity != "" {
+		policy.Identity = cfg.Release.SigningIdentity
+		policy.Issuer = cfg.Release.SigningIssuer
+	}
+
+	return policy, nil
+}
+
+// ErrDowngrade means a target older than the running release was asked for
+// without saying so.
+var ErrDowngrade = errors.New("this target is older than the release running here")
+
+// checkDowngrade refuses a proved downgrade nobody asked for by name.
+//
+// PROVED, NOT SUSPECTED. A development build cannot be ordered against a release
+// and is neither refused nor waved through on that basis: the ledger's own
+// watermark is the backstop for whatever this could not tell. What this adds is
+// an answer BEFORE anything is recorded or drained, in the one sentence that
+// names the flag.
+func checkDowngrade(target, running string, allowed bool) error {
+	if allowed {
+		return nil
+	}
+
+	order, ok := version.Compare(target, running)
+	if !ok || order >= 0 {
+		return nil
+	}
+
+	return fmt.Errorf("%w: %s is older than %s. A downgrade is refused unless asked for by "+
+		"name with --allow-downgrade, because the ledger has been served by the newer release "+
+		"and an older binary would otherwise be refused by its release watermark, one drain "+
+		"at a time", ErrDowngrade, target, running)
 }
 
 // resolveTarget turns a channel or an exact pin into one immutable manifest.

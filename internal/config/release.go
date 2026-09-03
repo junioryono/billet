@@ -35,10 +35,10 @@ var (
 
 // ReleaseConfig says how this deployment learns about new billet releases.
 //
-// EVERY FIELD IS OPTIONAL AND THE ZERO VALUE IS SAFE. A deployment that says
-// nothing follows the signed stable channel and updates only when an operator
-// asks — which is the behaviour every existing install already has, so adding
-// this block changes nothing about a fleet that ignores it.
+// EVERY FIELD IS OPTIONAL. A deployment that says nothing follows the signed
+// stable channel and updates itself: the control plane starts a rollout when
+// the channel advances, and every host converges on it. Saying `automatic:
+// false` is the one sentence that turns that off.
 type ReleaseConfig struct {
 	// Channel is the signed pointer this deployment follows. Empty means stable.
 	Channel string `yaml:"channel,omitempty"`
@@ -52,13 +52,22 @@ type ReleaseConfig struct {
 	Version string `yaml:"version,omitempty"`
 
 	// Automatic lets the control plane start a rollout by itself when the channel
-	// advances.
+	// advances, and lets the scheduled updaters on each host act on it.
 	//
-	// OFF BY DEFAULT, AND THAT IS NOT TIMIDITY. An automatic rollout drains hosts
-	// and replaces binaries; a deployment that had not decided to allow that must
-	// not start doing it because it upgraded to a billet that could. Turning it on
-	// is a sentence somebody writes.
-	Automatic bool `yaml:"automatic,omitempty"`
+	// ON BY DEFAULT, AND THIS IS THE ONE ZERO VALUE IN THIS FILE THAT DOES NOT
+	// REFUSE. Every other absent field here answers "hold"; this one answers "go",
+	// because the failure an unattended deployment actually meets is the update
+	// that never happens: a runner image GitHub stops queueing to, a fix that
+	// shipped and never arrived. What makes that safe to default is everything
+	// around it — a rollout drains every host for as long as its work takes, a
+	// candidate is verified and rolled back on failure, and the ledger's release
+	// watermark refuses to let an unattended update go backwards. A deployment
+	// that must not move says so with `automatic: false`.
+	//
+	// A POINTER SO ABSENCE AND FALSE ARE DIFFERENT. A plain bool cannot tell "the
+	// operator wrote false" from "the operator wrote nothing", and only the first
+	// is an opt-out. Read it through AutomaticUpdates, never directly.
+	Automatic *bool `yaml:"automatic,omitempty"`
 
 	// MaintenanceWindow bounds when an automatic rollout may START.
 	//
@@ -107,6 +116,30 @@ func (r *ReleaseConfig) EffectiveChannel() string {
 
 // Pinned reports whether this deployment follows nothing.
 func (r *ReleaseConfig) Pinned() bool { return r != nil && r.Version != "" }
+
+// PinnedVersion is the exact release this deployment is pinned to, or empty for
+// one that follows a channel.
+func (r *ReleaseConfig) PinnedVersion() string {
+	if r == nil {
+		return ""
+	}
+
+	return r.Version
+}
+
+// AutomaticUpdates reports whether this deployment updates itself.
+//
+// TRUE FOR AN ABSENT BLOCK AND AN ABSENT FIELD. The only thing that turns it off
+// is an operator writing `automatic: false`, which is what the pointer exists to
+// tell apart from writing nothing. Every reader — the rollout starter, the
+// host's updater, the image refresh — asks this and never the field.
+func (r *ReleaseConfig) AutomaticUpdates() bool {
+	if r == nil || r.Automatic == nil {
+		return true
+	}
+
+	return *r.Automatic
+}
 
 // ValidateRelease reports everything wrong with a release block.
 //
@@ -197,13 +230,13 @@ func validateMaintenanceWindow(r *ReleaseConfig) []error {
 
 	var errs []error
 
-	if !r.Automatic {
+	if !r.AutomaticUpdates() {
 		// NOT AN ERROR ABOUT THE WINDOW, an error about what it would do. A window
 		// with no automatic rollout to gate decides nothing, and an operator who
 		// wrote one believes their fleet updates inside it.
 		errs = append(errs, errors.New("release.maintenance_window bounds when an "+
 			"AUTOMATIC rollout may start, and release.automatic is false, so nothing "+
-			"here starts one. Set release.automatic, or remove the window"))
+			"here starts one. Remove `automatic: false`, or remove the window"))
 	}
 
 	start, startErr := parseWindowTime(w.Start)

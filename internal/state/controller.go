@@ -164,6 +164,16 @@ func (db *DB) ClaimController(
 
 			return restore(fmt.Errorf("state: migrate on promotion: %w", err))
 		}
+
+		// AND THE RELEASE WATERMARK MOVES HERE, for the same reason: this is the
+		// first moment the standby is the control plane proper. Recorded at open it
+		// was only checked; a newer standby beside an older leader must not fence
+		// that leader out of its own restart before it has actually taken over.
+		if err := db.enforceReleaseWatermark(ctx, db.runningRelease, true); err != nil {
+			db.revalidate.Store(true)
+
+			return restore(err)
+		}
 	}
 
 	var epoch int64

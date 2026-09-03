@@ -49,6 +49,9 @@ func (h *fakeHost) record(what string) error {
 
 func (h *fakeHost) StopNode(context.Context) error   { return h.record("stop-node") }
 func (h *fakeHost) StopServer(context.Context) error { return h.record("stop-server") }
+func (h *fakeHost) RefreshGuestImages(context.Context) error {
+	return h.record("refresh-guest-images")
+}
 func (h *fakeHost) HideBinary(context.Context) error { return h.record("hide-binary") }
 func (h *fakeHost) InstallCandidate(context.Context) error {
 	return h.record("install-candidate")
@@ -156,6 +159,10 @@ func TestAHealthyUpgradeRunsInOrder(t *testing.T) {
 		// The node first, so compute drains while the control plane can still
 		// record what happened to it.
 		"stop-node",
+		// The guest image the candidate boots is put in place while the node is
+		// stopped and the server still up, where the Ansible role has always done
+		// it; a contract change would otherwise leave the new node nothing to boot.
+		"refresh-guest-images",
 		"stop-server",
 		// Then the binary goes, so no operator command can enter through either
 		// version while the swap is underway.

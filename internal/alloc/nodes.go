@@ -108,6 +108,16 @@ type NodeWire struct {
 	// something that provably postdates the instruction. A registration bumps
 	// this; nothing else does.
 	Epoch int64
+	// HighestRelease is the newest release tag this host has ever registered
+	// with, or empty for a host that has only ever named something that is not
+	// one.
+	//
+	// A REPORT, NOT A RULE. A host whose Release is provably older than this
+	// is running something older than it once did, which `billet status` says so
+	// a person can decide whether that was a rollout's rollback or somebody's
+	// hand. Refusing the registration would break the rollback the coordinator
+	// infers from exactly that re-registration.
+	HighestRelease string
 }
 
 // NodeWireVersions reports which wire version every known host is on.
@@ -125,14 +135,15 @@ func (a *Allocator) NodeWireVersions(ctx context.Context) ([]NodeWire, error) {
 
 		for _, row := range rows {
 			out = append(out, NodeWire{
-				Name:       row.Name,
-				Live:       row.Live == 1,
-				Release:    row.NodeRelease,
-				Min:        int(row.WireMin),
-				Max:        int(row.WireMax),
-				Negotiated: int(row.WireVersion),
-				Digest:     row.NodeDigest,
-				Epoch:      row.Epoch,
+				Name:           row.Name,
+				Live:           row.Live == 1,
+				Release:        row.NodeRelease,
+				Min:            int(row.WireMin),
+				Max:            int(row.WireMax),
+				Negotiated:     int(row.WireVersion),
+				Digest:         row.NodeDigest,
+				Epoch:          row.Epoch,
+				HighestRelease: row.HighestRelease,
 			})
 		}
 

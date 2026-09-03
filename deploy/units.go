@@ -23,6 +23,15 @@ const (
 	// in. Embedded so a test can pin what the package installs.
 	BackupUnitName  = "billet-backup.service"
 	BackupTimerName = "billet-backup.timer"
+	// UpgradeUnitName and UpgradeTimerName are the root executor of a recorded
+	// rollout on a control-plane host, and ImagesUnitName and ImagesTimerName
+	// the daily guest-image refresh on a node. Both timers are enabled by the
+	// package — the one exception to the package enabling nothing, stated in
+	// the units themselves — and neither is managed by `billet local up`.
+	UpgradeUnitName  = "billet-upgrade.service"
+	UpgradeTimerName = "billet-upgrade.timer"
+	ImagesUnitName   = "billet-images.service"
+	ImagesTimerName  = "billet-images.timer"
 )
 
 // ServerUnit is the control-plane unit this build ships.
@@ -42,6 +51,23 @@ var BackupUnit string
 
 //go:embed billet-backup.timer
 var BackupTimer string
+
+// UpgradeUnit and UpgradeTimer are the scheduled host upgrade this build ships.
+//
+//go:embed billet-upgrade.service
+var UpgradeUnit string
+
+//go:embed billet-upgrade.timer
+var UpgradeTimer string
+
+// ImagesUnit and ImagesTimer are the scheduled guest-image refresh this build
+// ships.
+//
+//go:embed billet-images.service
+var ImagesUnit string
+
+//go:embed billet-images.timer
+var ImagesTimer string
 
 // Launch agent labels, as launchd knows them. A macOS service is addressed by
 // its LABEL rather than its filename, so these are the strings `launchctl`

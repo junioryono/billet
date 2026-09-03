@@ -91,7 +91,7 @@ func TestARegistrationRecordsWhatTheNodeSaidAboutItsBuild(t *testing.T) {
 
 	want = NodeWire{
 		Name: "epyc-1", Live: true, Release: "v9.9.9", Min: 12, Max: 13, Negotiated: 13,
-		Epoch: got["epyc-1"].Epoch,
+		Epoch: got["epyc-1"].Epoch, HighestRelease: "v9.9.9",
 	}
 	if got["epyc-1"] != want {
 		t.Errorf("after an upgrade the host recorded %+v, want %+v", got["epyc-1"], want)
@@ -175,6 +175,64 @@ func TestAnImpossibleWireRecordIsRefused(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// THE HIGHEST RELEASE A HOST HAS REGISTERED WITH NEVER GOES DOWN, AND REFUSES
+// NOTHING.
+//
+// A host that comes back on an older release is exactly what the rollout
+// coordinator reads as a rollback, so the registration has to succeed; what this
+// column adds is that a report can say the host is running something older than
+// it once did. A development build names nothing that can be ordered and must
+// not become the mark, or every later registration would compare against a
+// string that orders against nothing.
+func TestTheHighestReleaseAHostRegisteredWithNeverDecreases(t *testing.T) {
+	t.Parallel()
+
+	a, err := New(openState(t), Limits{MaxVCPU: 32, MaxMemory: 128 * config.GiB}, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	reg := NodeRegistration{
+		Name: "epyc-2", Provider: config.ProviderDocker, VCPU: 8, Memory: 32 * config.GiB,
+		WireMin: 12, WireMax: 19, WireVersion: 19,
+	}
+
+	register := func(release string) NodeWire {
+		t.Helper()
+
+		reg.Release = release
+
+		if _, err := a.RegisterNode(t.Context(), reg); err != nil {
+			t.Fatalf("RegisterNode on %q: %v", release, err)
+		}
+
+		return wireOf(t, a)["epyc-2"]
+	}
+
+	if got := register("(devel)"); got.HighestRelease != "" {
+		t.Fatalf("a development build was recorded as the highest release: %q",
+			got.HighestRelease)
+	}
+
+	if got := register("v0.5.0"); got.HighestRelease != "v0.5.0" {
+		t.Fatalf("the first release tag was not recorded as the highest: %+v", got)
+	}
+
+	rolledBack := register("v0.4.0")
+	if rolledBack.Release != "v0.4.0" || rolledBack.HighestRelease != "v0.5.0" {
+		t.Fatalf("a host coming back on v0.4.0 recorded %+v; want release v0.4.0 and the "+
+			"highest still v0.5.0", rolledBack)
+	}
+
+	if got := register("(devel)"); got.HighestRelease != "v0.5.0" {
+		t.Fatalf("a development build moved the highest release to %q", got.HighestRelease)
+	}
+
+	if got := register("v0.6.0"); got.HighestRelease != "v0.6.0" {
+		t.Fatalf("a newer release did not raise the highest: %+v", got)
 	}
 }
 

@@ -125,6 +125,16 @@ type Journal struct {
 	RolloutID  string `json:"rollout_id,omitempty"`
 	Generation int64  `json:"generation,omitempty"`
 
+	// AllowDowngrade records that a person asked for a release older than the
+	// one this ledger has been served by, and that the transaction may lower the
+	// ledger's release watermark to admit it.
+	//
+	// ON THE JOURNAL BECAUSE A RESUME HAS TO KNOW. The mark is lowered inside the
+	// migrate step, and a resumed run that had forgotten the permission would
+	// have the candidate refused by a ledger this same transaction had already
+	// snapshotted and was about to hand it.
+	AllowDowngrade bool `json:"allow_downgrade,omitempty"`
+
 	// PID is the process that claimed this transaction.
 	//
 	// A NAME FOR THE HOLDER, NOT A HANDLE ON IT. The transaction lock already says
