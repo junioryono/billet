@@ -532,3 +532,43 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "0"
         run: go build -o /dev/null ./cmd/billet
+
+  # THE ONE CONTEXT BRANCH PROTECTION REQUIRES. Protection names a status check
+  # by its job name, and naming every job above would have to be re-done each
+  # time one is added or renamed, with a forgotten one leaving a gate that no
+  # longer gates. So main requires this job alone, and it fails unless EVERY job
+  # it needs reported success. `if: always()` is what makes it run when one of
+  # them failed or was cancelled; without it the job is skipped, and a skipped
+  # required check blocks the merge with nothing saying why.
+  verify-all-checks:
+    name: Verify All Checks Passed
+    runs-on: ubuntu-latest
+    needs:
+      [
+        test,
+        lint,
+        sqlc,
+        release-config,
+        host-lifecycle,
+        package-lifecycle,
+        terraform,
+        terraform-consumer-floor,
+        terraform-lint,
+        vuln,
+        cross-build,
+      ]
+    if: always()
+    steps:
+      - name: Verify all checks passed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          # Every needed job must have SUCCEEDED: a skipped or cancelled job is
+          # not a passed one, and reading it as one is a green check over an
+          # unverified tree.
+          if ! jq -e 'all(.[]; .result == "success")' <<<"$NEEDS" >/dev/null; then
+            echo "not every check passed:"
+            jq -r 'to_entries[] | "  \(.key): \(.value.result)"' <<<"$NEEDS"
+            exit 1
+          fi
+          echo "every check passed"
