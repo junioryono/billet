@@ -135,6 +135,12 @@ type Journal struct {
 	RolloutID  string `json:"rollout_id,omitempty"`
 	Generation int64  `json:"generation,omitempty"`
 
+	// SettlesThrough is the newest fleet decision that had completed when an
+	// operator's own run began, so the host settles on it at the commit and a
+	// timer does not move the host back to a rollout the person knew about.
+	// Zero for a run that serves a rollout, whose own Generation is settled on.
+	SettlesThrough int64 `json:"settles_through,omitempty"`
+
 	// AllowDowngrade records that a person asked for a release older than the
 	// one this ledger has been served by, and that the transaction may lower the
 	// ledger's release watermark to admit it.

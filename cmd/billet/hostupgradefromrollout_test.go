@@ -12,8 +12,10 @@ import (
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/hostupgrade"
+	"github.com/junioryono/billet/internal/node"
 	"github.com/junioryono/billet/internal/provenance"
 	"github.com/junioryono/billet/internal/rollout"
+	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/version"
 )
 
@@ -108,6 +110,23 @@ func TestFromRolloutHasNothingToDoWithoutADecisionToAct(t *testing.T) {
 			cfg, _ := ledgerWithRollout(t, "")
 
 			return cfg
+		}},
+		{"no ledger yet", func(t *testing.T) *config.Config {
+			t.Helper()
+
+			// THE PACKAGE ENABLES THE TIMER BEFORE THE SERVER HAS EVER RUN, and a
+			// read that created a ledger here would leave a root-owned one the
+			// service account cannot open.
+			dir := t.TempDir()
+
+			t.Cleanup(func() {
+				if _, err := os.Lstat(state.LedgerPath(dir)); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("reading the decision created a ledger in an empty state directory "+
+						"(err %v)", err)
+				}
+			})
+
+			return &config.Config{Server: &config.ServerConfig{IdentityDir: dir}}
 		}},
 		{"already on the target", func(t *testing.T) *config.Config {
 			t.Helper()
@@ -438,6 +457,16 @@ func TestACommittedTransactionSettlesOnItsDecision(t *testing.T) {
 	if settled, err := readSettled(); err != nil || settled != 7 {
 		t.Fatalf("an operator's own run moved the settled mark to %d (err %v)", settled, err)
 	}
+
+	// AN OPERATOR'S RUN THAT KNEW THE FLEET'S DECISION SETTLES THROUGH IT.
+	knowing := newLedgerHost(&config.Config{}, "", &hostupgrade.Journal{SettlesThrough: 9})
+	if err := knowing.RecordInstalled(t.Context(), strings.Repeat("6", 64), "v0.4.0"); err != nil {
+		t.Fatalf("RecordInstalled: %v", err)
+	}
+
+	if settled, err := readSettled(); err != nil || settled != 9 {
+		t.Fatalf("a run that settles through decision 9 left the mark at %d (err %v)", settled, err)
+	}
 }
 
 // THE INSTRUCTION IS READ THROUGH A HANDLE THAT NAMES NO RELEASE, because the
@@ -480,5 +509,161 @@ func TestTheInstructionIsReadWithoutTheWatermark(t *testing.T) {
 	if reads != 1 || others != 0 {
 		t.Fatalf("readFleetDecision opens through openStateForDecision %d time(s) and through "+
 			"another opener %d time(s); want exactly one and none", reads, others)
+	}
+}
+
+// AN OPERATOR'S OWN RUN SETTLES THROUGH THE FLEET'S LAST COMPLETED DECISION, and
+// only through a completed one: an aborted rollout decided nothing, an open one
+// has its instruction still to come, and a run that serves a rollout settles on
+// that rollout's own generation.
+func TestAManualRunSettlesThroughTheLastCompletedRollout(t *testing.T) {
+	manual := hostUpgradeTarget{pin: "v0.4.0"}
+
+	cfg, r := ledgerWithRollout(t, "v9.9.9")
+	if got := settlesThrough(t.Context(), cfg, manual); got != 0 {
+		t.Errorf("an open rollout was settled through as %d", got)
+	}
+
+	finish(t, cfg, r.ID, rollout.StateCompleted)
+
+	if got := settlesThrough(t.Context(), cfg, manual); got != r.Generation {
+		t.Errorf("a completed rollout settled through as %d, want %d", got, r.Generation)
+	}
+
+	if got := settlesThrough(t.Context(), cfg, hostUpgradeTarget{
+		generation: r.Generation, fromRollout: true,
+	}); got != 0 {
+		t.Errorf("a run serving a rollout settled through %d as well", got)
+	}
+
+	aborted, a := ledgerWithRollout(t, "v9.9.9")
+
+	finish(t, aborted, a.ID, rollout.StateAborted)
+
+	if got := settlesThrough(t.Context(), aborted, manual); got != 0 {
+		t.Errorf("an aborted rollout was settled through as %d", got)
+	}
+
+	if got := settlesThrough(t.Context(), &config.Config{Node: &config.NodeConfig{}}, manual); got != 0 {
+		t.Errorf("a node-only host settled through %d", got)
+	}
+}
+
+// A TIMER'S PROCESS THAT WAS OVERTAKEN SETTLES AND DOES NOTHING. It read the
+// decision as the old release; a dispatched updater on the same host installed
+// the target and released the lock before it got there. The provenance record
+// says the installed binary is the target's, so stopping the services that just
+// started would only be refused by the mark the successor recorded.
+func TestAnOvertakenTimerSettlesRatherThanReinstalling(t *testing.T) {
+	withUpgradeRoot(t)
+
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sum, err := provenance.HashFile(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	prev := provenance.Path
+	provenance.Path = filepath.Join(t.TempDir(), "installed.json")
+	t.Cleanup(func() { provenance.Path = prev })
+
+	digest := strings.Repeat("5", 64)
+	if err := provenance.Write(provenance.Record{
+		Version: "v9.9.9", ManifestDigest: digest, BinarySHA256: sum,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ack, answer := ackReader(t)
+
+	err = actOnResolved(t.Context(), &config.Config{}, "",
+		hostUpgradeTarget{pin: "v9.9.9", digest: digest, generation: 12, fromRollout: true},
+		ack, nil, installedManifest(t), digest, heldTxLock(t))
+	if err != nil {
+		t.Fatalf("an overtaken timer refused: %v", err)
+	}
+
+	if got := answer(); got != node.AckAccepted {
+		t.Errorf("the overtaken timer answered %q, want an acceptance", got)
+	}
+
+	for name, read := range map[string]func() (int64, error){
+		"last-decision": readDecision, "settled-decision": readSettled,
+	} {
+		if got, err := read(); err != nil || got != 12 {
+			t.Errorf("%s is %d after the overtaken run (err %v), want 12", name, got, err)
+		}
+	}
+
+	claims, err := filepath.Glob(filepath.Join(upgradeRoot, "upgrade-*"))
+	if err != nil || len(claims) != 0 {
+		t.Errorf("the overtaken timer staged a transaction: %v (err %v)", claims, err)
+	}
+}
+
+// THE RE-READ IS WHERE IT SAYS IT IS: after the claim is published, before the
+// transaction is accepted. A test that calls confirmFleetDecision directly would
+// pass with the call deleted from actOnResolved.
+func TestTheDecisionIsConfirmedBetweenTheClaimAndTheAcceptance(t *testing.T) {
+	t.Parallel()
+
+	fset := token.NewFileSet()
+
+	file, err := parser.ParseFile(fset, "hostupgrade.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse hostupgrade.go: %v", err)
+	}
+
+	var act *ast.FuncDecl
+
+	for _, decl := range file.Decls {
+		if fn, ok := decl.(*ast.FuncDecl); ok && fn.Name.Name == "actOnResolved" {
+			act = fn
+		}
+	}
+
+	if act == nil {
+		t.Fatal("hostupgrade.go has no actOnResolved")
+	}
+
+	var published, confirmed, accepted []token.Pos
+
+	ast.Inspect(act, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+
+		switch fn := call.Fun.(type) {
+		case *ast.Ident:
+			switch fn.Name {
+			case "publishClaim":
+				published = append(published, call.Pos())
+			case "confirmFleetDecision":
+				confirmed = append(confirmed, call.Pos())
+			}
+		case *ast.SelectorExpr:
+			if fn.Sel.Name == "accept" {
+				accepted = append(accepted, call.Pos())
+			}
+		}
+
+		return true
+	})
+
+	if len(published) != 1 || len(confirmed) != 1 || len(accepted) == 0 {
+		t.Fatalf("actOnResolved publishes %d claim(s), confirms %d decision(s) and accepts %d "+
+			"time(s); want one, one and at least one", len(published), len(confirmed), len(accepted))
+	}
+
+	last := accepted[len(accepted)-1]
+	if published[0] >= confirmed[0] || confirmed[0] >= last {
+		t.Fatalf("the decision is confirmed at %s, want after the claim (%s) and before the "+
+			"acceptance (%s)", fset.Position(confirmed[0]), fset.Position(published[0]),
+			fset.Position(last))
 	}
 }

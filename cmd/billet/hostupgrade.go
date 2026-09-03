@@ -370,6 +370,39 @@ func settleOnTarget(current *rollout.Rollout, target hostUpgradeTarget) error {
 	return nil
 }
 
+// settlesThrough is the fleet decision an operator's own run on a control-plane
+// host settles on when it commits: the newest completed rollout at the moment the
+// run began, or zero.
+//
+// A PERSON'S DECISION ABOUT THIS HOST IS TAKEN RELATIVE TO THE FLEET'S. Without
+// this, a host that had never settled on the completed rollout — a standby that
+// missed it, a host set up after it — and was then deliberately put on another
+// release by hand would be moved back to the rollout's target by the next timer
+// tick, because nothing said the person knew. A run that serves a rollout
+// settles on that rollout's own generation instead, and an open rollout is not
+// settled through: its instruction is still to come, fenced by the other mark.
+// A ledger that cannot be read here is said and settles nothing; the timer will
+// not be able to read it either.
+func settlesThrough(ctx context.Context, cfg *config.Config, target hostUpgradeTarget) int64 {
+	if target.fromRollout || target.generation != 0 || cfg.Server == nil {
+		return 0
+	}
+
+	current, found, err := readFleetDecision(ctx, cfg)
+	if err != nil {
+		fmt.Printf("NOTE: the fleet's last decision could not be read (%v), so this run settles "+
+			"on none; a rollout completed before it may move this host again.\n", err)
+
+		return 0
+	}
+
+	if !found || current.State != rollout.StateCompleted {
+		return 0
+	}
+
+	return current.Generation
+}
+
 // readFleetDecision is the open rollout, or the newest finished one, and
 // whether there is either.
 //
@@ -384,6 +417,13 @@ func settleOnTarget(current *rollout.Rollout, target hostUpgradeTarget) error {
 func readFleetDecision(ctx context.Context, cfg *config.Config) (*rollout.Rollout, bool, error) {
 	db, err := openStateForDecision(ctx, cfg)
 	if err != nil {
+		if errors.Is(err, errNoLedgerYet) {
+			fmt.Printf("This host's control plane has not run yet, so there is no ledger to read " +
+				"a rollout from; nothing to do.\n")
+
+			return nil, false, nil
+		}
+
 		return nil, false, fmt.Errorf("server state: %w", err)
 	}
 
@@ -640,6 +680,33 @@ func actOnResolved(ctx context.Context, cfg *config.Config, cfgPath string,
 	// every host in the field before one billet-driven upgrade has run, and turning
 	// each of their no-op upgrades into a real transaction would stop services and
 	// drain compute to fix a diagnostic.
+	// ANOTHER TRANSACTION INSTALLED EXACTLY THIS TARGET while this process, still
+	// the release it replaced, was reading the decision. A timer's process and a
+	// dispatched updater share a host that is both controller and node; the
+	// updater can commit and release the lock between the timer's read and its
+	// own lock. The provenance record names the manifest the installed binary
+	// came from, and when that is the target's, the decision is carried out:
+	// settle on it and do nothing, rather than stop the services that just
+	// started and be refused by the mark the successor recorded.
+	if target.fromRollout {
+		if installed, err := provenance.Installed(); err == nil && strings.EqualFold(installed, digest) {
+			if err := checkAndRecordDecision(target); err != nil {
+				return err
+			}
+
+			if err := recordSettled(target.generation); err != nil {
+				return err
+			}
+
+			fmt.Printf("Another transaction has already installed %s from manifest %s on this "+
+				"host; nothing to do.\n", manifest.Version, digest)
+
+			ack.accept()
+
+			return nil
+		}
+	}
+
 	if manifest.Version == version.Version() && !target.reinstall && !installedDisagrees(digest) {
 		fmt.Printf("This machine is already running %s.\n", manifest.Version)
 
@@ -676,6 +743,7 @@ func actOnResolved(ctx context.Context, cfg *config.Config, cfgPath string,
 		TargetDigest:   digest,
 		RolloutID:      target.rolloutID,
 		Generation:     target.generation,
+		SettlesThrough: settlesThrough(ctx, cfg, target),
 		AllowDowngrade: target.allowDowngrade,
 		Ledger:         ledgerKindFor(cfg),
 		PID:            os.Getpid(),
@@ -1393,8 +1461,9 @@ type ledgerHost struct {
 	// external marks a ledger this host does not hold — PostgreSQL — where the
 	// migrate step is skipped and the lowering has to happen at the probe.
 	external bool
-	// generation is the fleet decision this transaction serves, settled on when
-	// the commit is recorded, or zero for an operator's own run.
+	// generation is the fleet decision this host settles on when the commit is
+	// recorded: the one this transaction serves, or, for an operator's own run,
+	// the newest the fleet had completed when the run began.
 	generation int64
 }
 
@@ -1402,7 +1471,7 @@ func newLedgerHost(cfg *config.Config, cfgPath string, journal *hostupgrade.Jour
 	h := ledgerHost{cfg: cfg, cfgPath: cfgPath, external: ledgerKindFor(cfg) != ""}
 
 	if journal != nil {
-		h.generation = journal.Generation
+		h.generation = max(journal.Generation, journal.SettlesThrough)
 	}
 
 	// THE PERMISSION ALONE MOVES NOTHING; ONLY A PROVED DOWNGRADE LOWERS THE MARK.

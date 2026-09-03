@@ -147,3 +147,62 @@ func TestAnAdminHandleLowersTheWatermarkOnAnExternalLedger(t *testing.T) {
 
 	_ = probe.Close()
 }
+
+// A CLAIM THE WATERMARK REFUSES LEAVES NOTHING BEHIND. The mark is written inside
+// the claim's transaction, so a standby that opened before a newer leader
+// recorded and then tries to claim is refused as a whole: no epoch advances, the
+// handle stays a standby, and the exclusion is free for the next claimant.
+func TestAClaimRefusedByTheWatermarkAdvancesNoEpoch(t *testing.T) {
+	dsn := requirePostgres(t)
+	ctx := t.Context()
+
+	standby, err := OpenPostgresStandby(ctx, t.TempDir(), dsn, WithRunningRelease("v0.5.0"))
+	if err != nil {
+		t.Fatalf("OpenPostgresStandby: %v", err)
+	}
+
+	t.Cleanup(func() { _ = standby.Close() })
+
+	leader, err := OpenPostgres(ctx, t.TempDir(), dsn, WithRunningRelease("v0.6.0"))
+	if err != nil {
+		t.Fatalf("OpenPostgres: %v", err)
+	}
+
+	claimed, err := leader.ClaimController(ctx, "leader", "deployment-a")
+	if err != nil {
+		t.Fatalf("the leader could not claim: %v", err)
+	}
+
+	if err := leader.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if _, err := standby.ClaimController(ctx, "standby", "deployment-a"); !errors.Is(err,
+		ErrReleaseBehind) {
+		t.Fatalf("an older standby claimed after a newer leader recorded: %v", err)
+	}
+
+	held, err := standby.ControllerHolder(ctx)
+	if err != nil {
+		t.Fatalf("ControllerHolder: %v", err)
+	}
+
+	if held.Epoch != claimed.Epoch {
+		t.Errorf("the refused claim advanced the epoch from %d to %d", claimed.Epoch, held.Epoch)
+	}
+
+	if err := standby.Tx(ctx, func(*sql.Tx) error { return nil }); !errors.Is(err, ErrStandby) {
+		t.Errorf("the refused standby was allowed a write: %v", err)
+	}
+
+	next, err := OpenPostgres(ctx, t.TempDir(), dsn, WithRunningRelease("v0.6.0"))
+	if err != nil {
+		t.Fatalf("OpenPostgres after the refusal: %v", err)
+	}
+
+	t.Cleanup(func() { _ = next.Close() })
+
+	if _, err := next.ClaimController(ctx, "next", "deployment-a"); err != nil {
+		t.Fatalf("the exclusion was not free after the refused claim: %v", err)
+	}
+}

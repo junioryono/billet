@@ -60,6 +60,10 @@ func openStateStandby(ctx context.Context, cfg *config.Config) (*state.DB, error
 		state.WithRunningRelease(version.Version()))
 }
 
+// errNoLedgerYet means the state directory holds no ledger to read a decision
+// from, which on a host the package just installed is the ordinary state.
+var errNoLedgerYet = errors.New("no ledger here yet")
+
 // openStateForDecision opens the ledger for the one read that must not be
 // refused by the release watermark: the host's own instruction.
 //
@@ -71,10 +75,28 @@ func openStateStandby(ctx context.Context, cfg *config.Config) (*state.DB, error
 // verifies the schema is one this binary knows, verifies the deployment
 // identity, and the caller reads and closes. The structural test on this file
 // exempts it by name.
+//
+// AND IT CREATES NOTHING. The package enables the timer that runs this on every
+// host, including one whose server has never run, and an operator open of an
+// empty state directory would mint a root-owned ledger there five minutes after
+// the install, which the service account then cannot open. A directory with no
+// ledger is nothing to decide about. What it still does, like every operator
+// open, is migrate an unheld ledger that is behind this binary; that is the
+// same act `billet rollout status` performs on such a host.
 func openStateForDecision(ctx context.Context, cfg *config.Config) (*state.DB, error) {
 	dsn, err := ledgerDSN(cfg)
 	if err != nil {
 		return nil, err
+	}
+
+	if cfg.Server.LedgerBackend() != config.StatePostgres {
+		if _, err := os.Lstat(state.LedgerPath(cfg.Server.IdentityDir)); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil, fmt.Errorf("%w: %s", errNoLedgerYet, cfg.Server.IdentityDir)
+			}
+
+			return nil, fmt.Errorf("look for the ledger: %w", err)
+		}
 	}
 
 	var db *state.DB
