@@ -1,8 +1,12 @@
 package main
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"go/ast"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/junioryono/billet/internal/config"
@@ -124,5 +128,63 @@ func TestTheHostKnowsWhetherItsLedgerIsExternal(t *testing.T) {
 	}}, "", "/staged/billet", nil)
 	if !postgres.external {
 		t.Error("a PostgreSQL control plane read as a local ledger")
+	}
+}
+
+// THE MARK IS LOWERED BEFORE THE CANDIDATE IS ASKED ANYTHING, at the migrate step
+// on a local ledger and at the probe step on an external one, through the handle
+// each ledger allows. Asserted by order against a candidate that records when it
+// was run, because the failure is the lowering happening after the probe that
+// the higher mark refuses, or not at all.
+func TestTheMarkIsLoweredBeforeTheCandidateIsProbed(t *testing.T) {
+	record := filepath.Join(t.TempDir(), "record")
+
+	prevLower, prevBinary := lowerReleaseWatermark, installedBinary
+	lowerReleaseWatermark = func(_ context.Context, _ *config.Config, external bool,
+		release string,
+	) error {
+		f, err := os.OpenFile(record, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+		if err != nil {
+			return err
+		}
+
+		defer func() { _ = f.Close() }()
+
+		_, err = fmt.Fprintf(f, "lower external=%v to %s\n", external, release)
+
+		return err
+	}
+	installedBinary = filepath.Join(t.TempDir(), "billet")
+	t.Cleanup(func() { lowerReleaseWatermark, installedBinary = prevLower, prevBinary })
+
+	if err := os.WriteFile(installedBinary, []byte("#!/bin/sh\nprintf 'candidate %s\\n' \"$1\" >> "+
+		record+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	journal := &hostupgrade.Journal{ToVersion: "v0.4.0", AllowDowngrade: true}
+
+	external := newSystemdHost(&config.Config{Server: &config.ServerConfig{
+		State: &config.StateConfig{Backend: config.StatePostgres},
+	}}, "", "/staged/billet", journal)
+	if err := external.ProbeReady(t.Context()); err != nil {
+		t.Fatalf("ProbeReady on an external ledger: %v", err)
+	}
+
+	local := newSystemdHost(&config.Config{Server: &config.ServerConfig{}}, "", "/staged/billet",
+		journal)
+	if err := local.Migrate(t.Context()); err != nil {
+		t.Fatalf("Migrate on a local ledger: %v", err)
+	}
+
+	body, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := "lower external=true to v0.4.0\ncandidate server\n" +
+		"lower external=false to v0.4.0\ncandidate check\n"
+	if string(body) != want {
+		t.Errorf("the steps ran as:\n%s\nwant:\n%s", body, want)
 	}
 }

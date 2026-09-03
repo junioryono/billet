@@ -25,6 +25,10 @@ func TestThePostgresProbeVerifiesAndChangesNothing(t *testing.T) {
 		t.Fatalf("OpenPostgres: %v", err)
 	}
 
+	if _, err := plane.ClaimController(ctx, "controller", "deployment-a"); err != nil {
+		t.Fatalf("ClaimController: %v", err)
+	}
+
 	if err := plane.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -94,4 +98,52 @@ func TestThePostgresProbeMigratesNothing(t *testing.T) {
 	if exists {
 		t.Fatal("the probe created the schema on a ledger no controller had migrated")
 	}
+}
+
+// AN OPERATOR HANDLE LOWERS THE MARK ON AN EXTERNAL LEDGER, because the
+// maintenance open there is a read-only probe and the host transaction has no
+// snapshot to lower it after; and it does so beside a controller that still
+// holds the exclusion, which is the active-passive shape.
+func TestAnAdminHandleLowersTheWatermarkOnAnExternalLedger(t *testing.T) {
+	dsn := requirePostgres(t)
+	ctx := t.Context()
+
+	plane, err := OpenPostgres(ctx, t.TempDir(), dsn, WithRunningRelease("v0.5.0"))
+	if err != nil {
+		t.Fatalf("OpenPostgres: %v", err)
+	}
+
+	t.Cleanup(func() { _ = plane.Close() })
+
+	if _, err := plane.ClaimController(ctx, "controller", "deployment-a"); err != nil {
+		t.Fatalf("ClaimController: %v", err)
+	}
+
+	admin, err := OpenPostgresAdmin(ctx, t.TempDir(), dsn, WithRunningRelease("v0.5.0"))
+	if err != nil {
+		t.Fatalf("OpenPostgresAdmin beside the controller: %v", err)
+	}
+
+	t.Cleanup(func() { _ = admin.Close() })
+
+	if err := admin.SetReleaseWatermark(ctx, "v0.4.0"); err != nil {
+		t.Fatalf("an operator handle could not lower the mark on an external ledger: %v", err)
+	}
+
+	release, _, err := admin.ReleaseWatermark(ctx)
+	if err != nil {
+		t.Fatalf("ReleaseWatermark: %v", err)
+	}
+
+	if release != "v0.4.0" {
+		t.Fatalf("the mark is %q after lowering, want v0.4.0", release)
+	}
+
+	// AND THE OLDER CANDIDATE'S PROBE NOW PASSES.
+	probe, err := OpenPostgresProbe(ctx, t.TempDir(), dsn, WithRunningRelease("v0.4.0"))
+	if err != nil {
+		t.Fatalf("the older candidate was still refused after the mark was lowered: %v", err)
+	}
+
+	_ = probe.Close()
 }

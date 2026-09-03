@@ -2,9 +2,13 @@ package main
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/provenance"
 	"github.com/junioryono/billet/internal/rollout"
 	"github.com/junioryono/billet/internal/version"
 )
@@ -267,5 +271,46 @@ func finish(t *testing.T, cfg *config.Config, id, outcome string) {
 
 	if err := store.Finish(t.Context(), id, outcome, "the test said so"); err != nil {
 		t.Fatalf("Finish %s: %v", outcome, err)
+	}
+}
+
+// A HOST ON THE TARGET VERSION FROM ANOTHER MANIFEST IS REINSTALLED. The digest
+// is the decision's identity, and a rollout blocks such a host and names this
+// command as the repair; a timer that read the version alone would leave it
+// blocked forever. Only a positive disagreement counts: no record is on target.
+func TestFromRolloutReinstallsATargetVersionFromAnotherManifest(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sum, err := provenance.HashFile(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	prev := provenance.Path
+	provenance.Path = filepath.Join(t.TempDir(), "installed.json")
+	t.Cleanup(func() { provenance.Path = prev })
+
+	cfg, r := ledgerWithRollout(t, version.Version())
+
+	if _, ok, err := rolloutInstruction(t.Context(), cfg); err != nil || ok {
+		t.Fatalf("a host with no record was reinstalled (ok=%v, err=%v)", ok, err)
+	}
+
+	if err := provenance.Write(provenance.Record{
+		Version: version.Version(), ManifestDigest: strings.Repeat("2", 64), BinarySHA256: sum,
+	}); err != nil {
+		t.Fatalf("Write the provenance record: %v", err)
+	}
+
+	got, ok, err := rolloutInstruction(t.Context(), cfg)
+	if err != nil || !ok {
+		t.Fatalf("a host from another manifest was left alone (ok=%v, err=%v)", ok, err)
+	}
+
+	if got.digest != r.TargetDigest || got.rolloutID != r.ID {
+		t.Errorf("the reinstall names %+v, want rollout %s at %s", got, r.ID, r.TargetDigest)
 	}
 }

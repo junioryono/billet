@@ -451,3 +451,43 @@ func TestAWindowThatClosesDuringResolutionStartsNothing(t *testing.T) {
 		t.Fatal("a rollout began in a window that closed while the channel was resolving")
 	}
 }
+
+// THE ABORT CHECK THAT HOLDS IS INSIDE START'S OWN TRANSACTION. A read before the
+// write leaves a window in which an operator starts and aborts a rollout to the
+// same bytes; with the request's flag the store refuses in the transaction that
+// would have inserted, and without it an operator's own start still overrules.
+func TestAnAutomaticStartRefusesAnAbortedTargetInsideItsTransaction(t *testing.T) {
+	t.Parallel()
+
+	_, s := open(t)
+
+	req := StartRequest{
+		Channel: "stable", TargetVersion: newerVersion, TargetDigest: otherDigest,
+		PriorVersion: targetVersion, Policy: DefaultPolicy(), CreatedBy: "ops",
+		Nodes: []string{"epyc-1"},
+	}
+
+	aborted, err := s.Start(t.Context(), req)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	if err := s.Finish(t.Context(), aborted.ID, StateAborted, "a cache regression"); err != nil {
+		t.Fatalf("Finish: %v", err)
+	}
+
+	automatic := req
+	automatic.RefuseAbortedTarget = true
+
+	if _, err := s.Start(t.Context(), automatic); !errors.Is(err, ErrAbortedTarget) {
+		t.Fatalf("an automatic start over an aborted target was not refused: %v", err)
+	}
+
+	if openRollout(t, s) != nil {
+		t.Fatal("the refused start recorded a rollout anyway")
+	}
+
+	if _, err := s.Start(t.Context(), req); err != nil {
+		t.Fatalf("an operator's start after an abort was refused: %v", err)
+	}
+}

@@ -256,7 +256,8 @@ func (s *Starter) Tick(ctx context.Context) error {
 	// THE NEWEST ROLLOUT TO THESE BYTES, WHEREVER IT SITS IN THE HISTORY: an abort
 	// found by walking the last N rollouts of any target is one that N unrelated
 	// rollouts later would be forgotten, and an operator's decision does not age
-	// out because the fleet was busy.
+	// out because the fleet was busy. This read is for the sentence; the refusal
+	// that holds is Start's own, inside the transaction that would insert.
 	last, found, err := s.store.NewestForTarget(ctx, target.Digest)
 	if err != nil {
 		return err
@@ -289,15 +290,25 @@ func (s *Starter) Tick(ctx context.Context) error {
 	policy.AllowDowngrade = false
 
 	recorded, err := s.store.Start(ctx, StartRequest{
-		Channel:       s.policy.Channel,
-		TargetVersion: target.Version,
-		TargetDigest:  target.Digest,
-		PriorVersion:  s.ourVersion,
-		Policy:        policy,
-		CreatedBy:     "automatic (" + s.policy.source() + ")",
-		Nodes:         names,
+		Channel:             s.policy.Channel,
+		TargetVersion:       target.Version,
+		TargetDigest:        target.Digest,
+		PriorVersion:        s.ourVersion,
+		Policy:              policy,
+		CreatedBy:           "automatic (" + s.policy.source() + ")",
+		Nodes:               names,
+		RefuseAbortedTarget: true,
 	})
 	if err != nil {
+		if errors.Is(err, ErrAbortedTarget) {
+			// ABORTED BETWEEN THE READ ABOVE AND THIS WRITE, which the store decides
+			// rather than this.
+			s.say("aborted", "the "+s.policy.source()+" names "+target.Version+", and a rollout "+
+				"to that exact release was aborted; nothing automatic restarts it")
+
+			return nil
+		}
+
 		if errors.Is(err, ErrOpen) {
 			// SOMEBODY STARTED ONE BETWEEN THE READ AND THE WRITE, which the store
 			// decides rather than this; the next tick sees it as open.

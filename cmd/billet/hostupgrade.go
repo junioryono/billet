@@ -160,10 +160,11 @@ func cmdHostUpgrade(ctx context.Context, args []string) error {
 //
 // THE ROOT EXECUTOR OF A DECISION THE CONTROL PLANE CANNOT CARRY OUT ON ITSELF.
 // A rollout is server-first and a process cannot install its own successor, so
-// billet-upgrade.timer runs this on every control-plane host: it reads the open
-// rollout through the operator handle, and if the target is a release this
-// machine is not running it runs exactly the transaction a node's dispatch would
-// — same pin, same digest, same generation, same fences. Nothing here consults
+// billet-upgrade.timer runs this on every control-plane host: it reads the
+// fleet's decision — the open rollout, or the last completed one — through the
+// operator handle, and if this machine is not on its target it runs exactly the
+// transaction a node's dispatch would — same pin, same digest, same generation,
+// same fences. Nothing here consults
 // the channel; a channel that advanced after the decision changes nothing, which
 // is the rule every other reader of a rollout already keeps.
 func hostUpgradeFromRollout(ctx context.Context, cfg *config.Config, cfgPath string,
@@ -229,17 +230,27 @@ func rolloutInstruction(ctx context.Context, cfg *config.Config) (hostUpgradeTar
 
 		return hostUpgradeTarget{}, false, nil
 
-	case current.TargetVersion == version.Version():
-		fmt.Printf("This host already runs %s, rollout %s's target; nothing to do.\n",
-			current.TargetVersion, current.ID)
-
-		return hostUpgradeTarget{}, false, nil
-
 	case current.State == rollout.StateAborted:
 		fmt.Printf("Rollout %s to %s was aborted (%s), and nothing automatic restarts it; "+
 			"nothing to do.\n", current.ID, current.TargetVersion, current.TerminalReason)
 
 		return hostUpgradeTarget{}, false, nil
+	}
+
+	// THE VERSION IS NOT ENOUGH TO DO NOTHING, for the reason actOnResolved gives:
+	// a host running the target version from another manifest is one a rollout
+	// blocks and tells an operator to reinstall, and the timer is that operator.
+	// Only a POSITIVE disagreement reinstalls; a host with no record is on it.
+	if current.TargetVersion == version.Version() {
+		if !installedDisagrees(current.TargetDigest) {
+			fmt.Printf("This host already runs %s, rollout %s's target; nothing to do.\n",
+				current.TargetVersion, current.ID)
+
+			return hostUpgradeTarget{}, false, nil
+		}
+
+		fmt.Printf("This host runs %s from a manifest other than rollout %s's (%s); "+
+			"reinstalling it.\n", current.TargetVersion, current.ID, current.TargetDigest)
 	}
 
 	// A COMPLETED ROLLOUT IS FOLLOWED ONLY FORWARDS, unless it was itself a
@@ -255,6 +266,8 @@ func rolloutInstruction(ctx context.Context, cfg *config.Config) (hostUpgradeTar
 	}
 
 	switch {
+	case current.TargetVersion == version.Version():
+		// Said above.
 	case current.State == rollout.StateCompleted:
 		fmt.Printf("Rollout %s completed at %s while this host stayed on %s; moving it "+
 			"(manifest %s, decision %d).\n", current.ID, current.TargetVersion,
@@ -444,6 +457,22 @@ func startHostUpgrade(ctx context.Context, cfg *config.Config, cfgPath string,
 	return actOnResolved(ctx, cfg, cfgPath, target, ack, client, manifest, digest, tx)
 }
 
+// refuseClaimed gives back a claim whose transaction was refused before it was
+// accepted.
+//
+// THE DIRECTORY GOES TOO. The transaction touched nothing outside it, so the
+// journal records a decision that was refused rather than an upgrade somebody
+// needs to read about — and a rollout retries every few minutes, which would
+// otherwise leave one behind each time.
+func refuseClaimed(dir string, err error) error {
+	claimErr := releaseClaim(dir)
+	if claimErr == nil {
+		_ = os.RemoveAll(dir)
+	}
+
+	return errors.Join(err, claimErr)
+}
+
 // actOnResolved decides and does everything that follows knowing which release is
 // being asked for.
 //
@@ -463,22 +492,6 @@ func startHostUpgrade(ctx context.Context, cfg *config.Config, cfgPath string,
 // exactly as another process would, and the probe that tried it refused every
 // ordinary upgrade against its own caller's lock. Naming it in the signature is
 // how a caller is told, since nothing else can enforce it.
-// refuseClaimed gives back a claim whose transaction was refused before it was
-// accepted.
-//
-// THE DIRECTORY GOES TOO. The transaction touched nothing outside it, so the
-// journal records a decision that was refused rather than an upgrade somebody
-// needs to read about — and a rollout retries every few minutes, which would
-// otherwise leave one behind each time.
-func refuseClaimed(dir string, err error) error {
-	claimErr := releaseClaim(dir)
-	if claimErr == nil {
-		_ = os.RemoveAll(dir)
-	}
-
-	return errors.Join(err, claimErr)
-}
-
 func actOnResolved(ctx context.Context, cfg *config.Config, cfgPath string,
 	target hostUpgradeTarget, ack *upgradeAck, client *releasesource.Client,
 	manifest *releasesource.Manifest, digest string, _ *txLock,
@@ -1601,38 +1614,47 @@ func (h *ledgerHost) Migrate(ctx context.Context) error {
 }
 
 // lowerWatermark admits the older candidate to the ledger, when asked to.
-//
-// THROUGH THE MAINTENANCE HANDLE ON A LOCAL LEDGER, which is fenced and
-// snapshotted by now, and THROUGH THE OPERATOR HANDLE ON AN EXTERNAL ONE, which
-// is neither: the probe handle a PostgreSQL maintenance open returns refuses
-// every write, and the server on this host is stopped, so the operator handle
-// is the one that can. On an active-passive pair the other controller may still
-// be serving the newer release; lowering under it admits this host and nothing
-// else, and that controller re-records the mark the next time it claims.
 func (h *ledgerHost) lowerWatermark(ctx context.Context) error {
 	if h.downgradeTo == "" || h.cfg.Server == nil {
 		return nil
 	}
 
-	open := openStateMaintenance
-	if h.external {
-		open = openStateAdmin
-	}
-
-	db, err := open(ctx, h.cfg)
-	if err != nil {
-		return fmt.Errorf("open the ledger to lower its release watermark: %w", err)
-	}
-
-	defer func() { _ = db.Close() }()
-
-	if err := db.SetReleaseWatermark(ctx, h.downgradeTo); err != nil {
+	if err := lowerReleaseWatermark(ctx, h.cfg, h.external, h.downgradeTo); err != nil {
 		return err
 	}
 
 	fmt.Printf("  lowered the ledger's release watermark to %s, as asked\n", h.downgradeTo)
 
 	return nil
+}
+
+// lowerReleaseWatermark moves the ledger's mark down to the release being
+// installed, through the handle that may.
+//
+// THE MAINTENANCE HANDLE ON A LOCAL LEDGER, which is fenced and snapshotted by
+// now, and THE OPERATOR HANDLE ON AN EXTERNAL ONE, which is neither: the probe
+// handle a PostgreSQL maintenance open returns refuses every write, and the
+// server on this host is stopped, so the operator handle is the one that can. On
+// an active-passive pair the other controller may still be serving the newer
+// release; lowering under it admits this host and nothing else, and that
+// controller re-records the mark the next time it claims. A variable so a test
+// can see which host step asks, and with what.
+var lowerReleaseWatermark = func(ctx context.Context, cfg *config.Config, external bool,
+	release string,
+) error {
+	open := openStateMaintenance
+	if external {
+		open = openStateAdmin
+	}
+
+	db, err := open(ctx, cfg)
+	if err != nil {
+		return fmt.Errorf("open the ledger to lower its release watermark: %w", err)
+	}
+
+	defer func() { _ = db.Close() }()
+
+	return db.SetReleaseWatermark(ctx, release)
 }
 
 // PrepareImages pulls a guest generation the candidate accepts, for every image

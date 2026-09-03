@@ -707,6 +707,8 @@
       billet_config_install.changed | default(false) or
       billet_firecracker_install.changed | default(false) or
       billet_firecracker_links.changed | default(false) or
+      (billet_server_environment | default({}) | length > 0 and
+       billet_server_environment_install.changed | default(false)) or
       billet_systemd_units.changed | default(false)
   become: true
 

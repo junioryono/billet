@@ -36,6 +36,10 @@ var ErrOutstanding = errors.New("rollout: this rollout has not converged")
 // ErrNoRollout means nothing is running.
 var ErrNoRollout = errors.New("rollout: no rollout is running")
 
+// ErrAbortedTarget means the newest rollout to the requested bytes was aborted by
+// an operator, and the request said not to overrule that.
+var ErrAbortedTarget = errors.New("rollout: the newest rollout to this target was aborted")
+
 // State is whether a rollout is still being worked on.
 const (
 	StateOpen      = "open"
@@ -172,6 +176,12 @@ type StartRequest struct {
 	// because its compute may be running. Both are wrong if the set is recomputed
 	// on every pass.
 	Nodes []string
+	// RefuseAbortedTarget refuses to start when the newest rollout to this digest
+	// was aborted, INSIDE THE SAME TRANSACTION THAT WOULD INSERT, so a start and
+	// an abort that land between an automatic starter's read and its write cannot
+	// be overruled by it. An operator's start leaves it false: `billet rollout
+	// start` after an abort is the decision to try again.
+	RefuseAbortedTarget bool
 }
 
 // Start records one fleet decision, or reports the one already running.
@@ -224,6 +234,19 @@ func (s *Store) Start(ctx context.Context, req StartRequest) (*Rollout, error) {
 			return fmt.Errorf("%w: %s is converging on %s. Abort it or let it finish before "+
 				"starting one for %s", ErrOpen, existing.ID, existing.TargetVersion,
 				req.TargetVersion)
+		}
+
+		if req.RefuseAbortedTarget {
+			last, err := state.ReadQueries(tx).ReadNewestRolloutForTarget(ctx, req.TargetDigest)
+
+			switch {
+			case errors.Is(err, sql.ErrNoRows):
+			case err != nil:
+				return fmt.Errorf("rollout: read the newest rollout to %s: %w", req.TargetDigest, err)
+			case last.State == StateAborted:
+				return fmt.Errorf("%w: rollout %s to %s was aborted (%s)", ErrAbortedTarget,
+					last.ID, req.TargetVersion, last.TerminalReason)
+			}
 		}
 
 		policy, err := json.Marshal(req.Policy)
