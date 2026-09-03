@@ -1034,9 +1034,10 @@ client_b.close()
 
 // The origin billet mints into a signed blob URL is read back from the BOUND
 // socket, so the port in that URL cannot disagree with the port this process
-// accepts on. A non-loopback bind is refused outright: the node will not mint a
-// URL naming one, so serving there would be admitted, served, and handed a URL it
-// was told not to use -- on a cleartext port exposed to the guest's network.
+// accepts on. A bind anywhere but loopback or a private address (the guest's
+// docker gateway, where a container builder reaches it) is refused outright:
+// the node will not mint a URL naming one, so serving there would be admitted,
+// served, and handed a URL it was told not to use -- on a cleartext port.
 func TestGuestCacheAdapterTakesItsOriginFromTheBoundSocket(t *testing.T) {
 	t.Parallel()
 
@@ -1093,7 +1094,24 @@ if server is not None:
     assert proxy.listener_origin(server) == expected, proxy.listener_origin(server)
     server.close()
 
-# Anywhere but loopback is refused rather than served.
+# The guest's docker gateway is a private address and is accepted; it is where a
+# container-driver builder reaches this listener. A public or link-local bind is
+# refused, and so is the unspecified address, which Python counts as private.
+class Bound:
+    def __init__(self, address):
+        self.address = address
+    def getsockname(self):
+        return self.address
+
+assert proxy.listener_origin(Bound(("172.17.0.1", 41321))) == "http://172.17.0.1:41321"
+for refused in (("8.8.8.8", 41321), ("169.254.169.254", 41321), ("0.0.0.0", 41321)):
+    try:
+        proxy.listener_origin(Bound(refused))
+        raise AssertionError("a listener on %s was accepted" % (refused,))
+    except SystemExit:
+        pass
+
+# Anywhere but loopback or a private address is refused rather than served.
 server = socket.create_server(("0.0.0.0", 0))
 try:
     proxy.listener_origin(server)

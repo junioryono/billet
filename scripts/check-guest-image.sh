@@ -393,6 +393,19 @@ else
 	fail "no docker client"
 fi
 
+# THE SHIM IS WHAT MAKES `type=gha` FROM A CONTAINER-DRIVER BUILDER WORK WITH
+# NO WORKFLOW CHANGE: it points the buildx client's cache URL at the adapter,
+# because the runner sets that URL per step and nothing else billet controls can.
+DOCKER_SHIM="$MNT/usr/local/bin/docker"
+if [ -x "$DOCKER_SHIM" ] && grep -Fq 'ACTIONS_RESULTS_URL=$BILLET_ACTIONS_CACHE_URL' "$DOCKER_SHIM" &&
+	grep -Fq 'exec "$real" "$@"' "$DOCKER_SHIM"; then
+	pass "the docker shim points a build's BuildKit cache client at billet's adapter"
+else
+	fail "no docker shim at /usr/local/bin/docker; on an interception tier a type=gha
+        export from a container-driver builder fails with an x509 error unless the
+        workflow names the adapter itself"
+fi
+
 buildx_plugin=""
 for candidate in \
 	usr/local/lib/docker/cli-plugins/docker-buildx \
@@ -1255,7 +1268,7 @@ fi
 
 # THE ADAPTER IS PART OF THE INTERCEPTION CONTRACT, so an image that speaks the
 # current contract without it is refused here rather than discovered by a build.
-# Both halves are checked: the script can serve the plaintext loopback endpoint,
+# Both halves are checked: the script can serve the plaintext endpoint on the docker gateway,
 # and the agent actually starts it -- a script nothing launches is dead code, and
 # a unit whose script does not know the mode fails after the guest has booted.
 #
@@ -1269,11 +1282,11 @@ if [ -x "$ACTIONS_PROXY" ] &&
 	grep -Fq 'X-Billet-Cache-Origin' "$ACTIONS_PROXY" &&
 	[ -x "$AGENT" ] &&
 	grep -Fq -- '--mode cache-adapter' "$AGENT" &&
-	grep -Fq -- '--socket-property=ListenStream="127.0.0.1:$actions_cache_port"' "$AGENT" &&
+	grep -Fq -- '--socket-property=ListenStream="$docker_gateway:$actions_cache_port"' "$AGENT" &&
 	grep -Fq 'BILLET_ACTIONS_CACHE_URL' "$AGENT"; then
-	pass "the guest can serve BuildKit's type=gha cache over plaintext loopback"
+	pass "the guest can serve BuildKit's type=gha cache over plaintext on the docker gateway"
 else
-	fail "the guest has no loopback cache adapter, or the agent does not start it; a
+	fail "the guest has no plaintext cache adapter, or the agent does not start it; a
         container-driver BuildKit cannot verify the node's leaf, so type=gha would fail
         with x509 on an image this contract says supports it"
 fi

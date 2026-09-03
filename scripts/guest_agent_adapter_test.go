@@ -48,7 +48,7 @@ func TestTheAgentPublishesTheAdapterURLOnlyWhenItIsServing(t *testing.T) {
 		{
 			name:         "the adapter starts and its URL is published",
 			active:       "1",
-			wantURL:      "http://127.0.0.1:41321/",
+			wantURL:      "http://172.17.0.1:41321/",
 			wantLaunched: true,
 		},
 		{
@@ -93,6 +93,7 @@ func TestTheAgentPublishesTheAdapterURLOnlyWhenItIsServing(t *testing.T) {
 				"actions_proxy=http://billet:sesh@10.9.8.7:9000",
 				"results_fallback=140.82.114.21,140.82.114.22",
 				"actions_ca_path=/home/runner/runner/_work/_billet/actions-cache-ca.pem",
+				"docker_gateway=172.17.0.1",
 				"actions_cache_port=41321",
 				`actions_cache_url=""`,
 				"runner_env=()",
@@ -131,10 +132,11 @@ func TestTheAgentPublishesTheAdapterURLOnlyWhenItIsServing(t *testing.T) {
 			if !tc.wantLaunched {
 				return
 			}
-			// The unit itself: the mode that serves the loopback endpoint, the
-			// loopback-only bind on the port the published URL names, the trust
-			// bundle and the fail-open addresses the adapter refuses to run
-			// without, and the readiness protocol that makes `start` mean serving.
+			// The unit itself: the mode that serves the plaintext endpoint, the
+			// bind on the docker gateway (where a container builder can reach it)
+			// on the port the published URL names, the trust bundle and the
+			// fail-open addresses the adapter refuses to run without, and the
+			// readiness protocol that makes `start` mean serving.
 			for _, required := range [][]string{
 				// The unit and the program, because a fake service manager succeeds
 				// for whatever it is handed: without these the block could start a
@@ -145,7 +147,7 @@ func TestTheAgentPublishesTheAdapterURLOnlyWhenItIsServing(t *testing.T) {
 					"/usr/local/bin/billet-actions-proxy"},
 				{"--mode", "cache-adapter"},
 				{"--systemd-socket"},
-				{"--socket-property=ListenStream=127.0.0.1:41321"},
+				{"--socket-property=ListenStream=172.17.0.1:41321"},
 				{"--property=Type=notify"},
 				{"--ca-file", "/home/runner/runner/_work/_billet/actions-cache-ca.pem"},
 				{"--fallback-addr", "140.82.114.21,140.82.114.22"},

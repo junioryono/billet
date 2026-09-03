@@ -22,12 +22,13 @@ a BuildKit created with buildx's `docker-container` driver runs in its own image
 with its own trust store, so the remapped origin presents it a node leaf it
 cannot verify and `type=gha` dies with `x509: certificate signed by unknown
 authority`. billet cannot edit that image. So this mode serves PLAINTEXT HTTP on
-loopback, which the builder is pointed at explicitly with `url_v2=`, and does
-the TLS itself: it rewrites the request head -- the results Host the node
-requires, plus the two headers that admit billet's own adapter and say which
-origin a signed blob URL must name -- opens the same authenticated tunnel, writes
-the request, and relays the answer. Only the BuildKit leg is cleartext, and only
-on loopback.
+the guest's docker gateway address, where a container can reach it, and does the
+TLS itself: it rewrites the request head -- the results Host the node requires,
+plus the two headers that admit billet's own adapter and say which origin a
+signed blob URL must name -- opens the same authenticated tunnel, writes the
+request, and relays the answer. The guest's `docker` shim points a build at it,
+and a workflow may name it with `url_v2=` as well. Only the BuildKit leg is
+cleartext, and only inside the guest.
 
 THE TWO MODES RELAY DIFFERENTLY AND HAVE TO. The passthrough copies both
 directions at once because it carries whatever the results origin carries,
@@ -697,12 +698,18 @@ def listener_origin(server):
     address = server.getsockname()
     host = address[0]
     ip = ipaddress.ip_address(host)
-    # The node refuses to mint a URL naming anything but a loopback address, so a
-    # listener bound anywhere else would be admitted, served, and handed a URL it
-    # was told not to use. Refuse here too: this port is cleartext, and putting it
-    # on the guest's network is not a thing to discover from a cache miss.
-    if not ip.is_loopback:
-        raise SystemExit("the cache adapter must listen on a loopback address")
+    # The node mints a URL naming a loopback or private address and nothing else,
+    # so a listener bound anywhere else would be admitted, served, and handed a
+    # URL it was told not to use. Refuse here too: this port is cleartext, and
+    # the guest's docker gateway is as far as it may go -- a container builder
+    # reaches it there with no network=host, and nothing outside the guest can.
+    # THE NODE IS THE AUTHORITY on which addresses it will mint, and Go's
+    # IsPrivate is narrower than Python's: Python counts 0.0.0.0/8 and the
+    # link-local range as private, Go counts neither, and the node refuses
+    # both -- so they are refused here by name, or a listener on one would be
+    # served and handed a URL the node would not have minted.
+    if ip.is_unspecified or ip.is_link_local or not (ip.is_loopback or ip.is_private):
+        raise SystemExit("the cache adapter must listen on a loopback or private address")
 
     return "http://%s:%d" % (("[%s]" % host) if ip.version == 6 else host, address[1])
 
