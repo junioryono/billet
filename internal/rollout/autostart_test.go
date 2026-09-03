@@ -3,6 +3,7 @@ package rollout
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"testing"
@@ -351,5 +352,102 @@ func TestAnEmptyFleetStartsNothingQuietly(t *testing.T) {
 
 	if openRollout(t, s) != nil {
 		t.Fatal("a rollout was started over no hosts")
+	}
+}
+
+// AN ABORT DOES NOT AGE OUT. The refusal is about the newest rollout to these
+// bytes, wherever it sits in the history; walking the last N rollouts of any
+// target forgot an operator's decision once the fleet had been busy enough.
+func TestAnAbortIsRememberedHoweverManyRolloutsFollow(t *testing.T) {
+	t.Parallel()
+
+	s, _, starter := starting(t, StartPolicy{Enabled: true}, "epyc-1")
+
+	aborted, err := s.Start(t.Context(), StartRequest{
+		Channel: "stable", TargetVersion: newerVersion, TargetDigest: otherDigest,
+		PriorVersion: targetVersion, Policy: DefaultPolicy(), CreatedBy: "ops",
+		Nodes: []string{"epyc-1"},
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	if err := s.Finish(t.Context(), aborted.ID, StateAborted, "a cache regression"); err != nil {
+		t.Fatalf("Finish: %v", err)
+	}
+
+	for i := range 25 {
+		later, err := s.Start(t.Context(), StartRequest{
+			Channel: "stable", TargetVersion: fmt.Sprintf("v0.6.%d", i),
+			TargetDigest: fmt.Sprintf("%064x", i+1), PriorVersion: targetVersion,
+			Policy: DefaultPolicy(), CreatedBy: "ops", Nodes: []string{"epyc-1"},
+		})
+		if err != nil {
+			t.Fatalf("Start %d: %v", i, err)
+		}
+
+		convergeController(t, s, later)
+
+		for _, phase := range []Phase{
+			PhaseDraining, PhaseReadyToInstall, PhaseInstalling, PhaseVerifying, PhaseCommitted,
+		} {
+			if err := s.Advance(t.Context(), AdvanceRequest{
+				RolloutID: later.ID, Node: "epyc-1", To: phase,
+			}); err != nil {
+				t.Fatalf("advance epyc-1 to %s: %v", phase, err)
+			}
+		}
+
+		if err := s.Finish(t.Context(), later.ID, StateCompleted, ""); err != nil {
+			t.Fatalf("Finish %d: %v", i, err)
+		}
+	}
+
+	if err := starter.Tick(t.Context()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+
+	if openRollout(t, s) != nil {
+		t.Fatal("an abort twenty-five rollouts back was forgotten and its target restarted")
+	}
+}
+
+// closingResolver resolves, and the window closes while it does.
+type closingResolver struct {
+	target Target
+	open   *bool
+}
+
+func (r *closingResolver) Resolve(context.Context) (Target, error) {
+	*r.open = false
+
+	return r.target, nil
+}
+
+// THE WINDOW BOUNDS THE MOMENT OF BEGINNING, not the tick that led to it. A
+// channel that took long enough to resolve must not start a rollout in a window
+// that closed while it was being asked.
+func TestAWindowThatClosesDuringResolutionStartsNothing(t *testing.T) {
+	t.Parallel()
+
+	_, s := open(t)
+
+	fleet := &fakeFleet{}
+	fleet.set("epyc-1", targetVersion, 19, true)
+
+	windowOpen := true
+	starter := NewStarter(s, fleet,
+		&closingResolver{target: Target{Version: newerVersion, Digest: otherDigest},
+			open: &windowOpen},
+		StartPolicy{Enabled: true, Channel: "stable",
+			OpenAt: func(time.Time) bool { return windowOpen }},
+		targetVersion, WithStarterLogger(slog.New(slog.DiscardHandler)))
+
+	if err := starter.Tick(t.Context()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+
+	if openRollout(t, s) != nil {
+		t.Fatal("a rollout began in a window that closed while the channel was resolving")
 	}
 }

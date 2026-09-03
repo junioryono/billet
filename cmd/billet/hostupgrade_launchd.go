@@ -164,30 +164,6 @@ func (h *launchdHost) InstallCandidate(_ context.Context) error {
 	return copyFile(h.staged, installedBinary)
 }
 
-// ProbeReady runs the candidate's probes, under the agents' own PATH.
-//
-// THE CANDIDATE'S NODE PROBE RESOLVES tart OUT OF PATH, and this process was
-// started by the node agent, whose plist sets one with the Homebrew prefix; the
-// probe inherits it. Started from a terminal by an operator, it inherits the
-// shell's, which is where they installed tart from.
-func (h *launchdHost) ProbeReady(ctx context.Context) error {
-	if h.cfg.Server != nil {
-		if err := h.runCandidate(ctx, "server", "--config", h.configPath(),
-			"--upgrade-probe"); err != nil {
-			return fmt.Errorf("the candidate could not open what it inherited: %w", err)
-		}
-	}
-
-	if h.cfg.Node != nil {
-		if err := h.runCandidate(ctx, "node", "--config", h.configPath(),
-			"--upgrade-probe"); err != nil {
-			return fmt.Errorf("the candidate's node could not initialise its provider: %w", err)
-		}
-	}
-
-	return nil
-}
-
 // StartServices bootstraps the agents again, server first, and proves each.
 //
 // BOOTSTRAPPED, NOT ENABLED. The agents were booted out, which removes them

@@ -109,6 +109,35 @@ func (db *DB) enforceReleaseWatermark(ctx context.Context, running string, recor
 	return nil
 }
 
+// checkReleaseWatermarkIn refuses, inside a revalidated write transaction, a
+// running release that the mark has moved past since this handle opened.
+//
+// THE TABLE IS THERE TO READ: a revalidated handle has just verified the schema
+// is the one this binary carries, and this binary carries migration 48. What can
+// have changed is the row, by a newer control plane claiming in the meantime.
+func (db *DB) checkReleaseWatermarkIn(ctx context.Context, q Querier) error {
+	if db.runningRelease == "" {
+		return nil
+	}
+
+	row, err := ReadQueries(q).ReadReleaseWatermark(ctx)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+
+	if err != nil {
+		return fmt.Errorf("state: re-read the ledger's release watermark: %w", err)
+	}
+
+	if order, ok := version.Compare(db.runningRelease, row.Release); ok && order < 0 {
+		return fmt.Errorf("%w: %s recorded itself as serving this ledger (%s) after this %s "+
+			"handle opened, so the write is refused", ErrReleaseBehind, row.Release,
+			row.RecordedAt, db.runningRelease)
+	}
+
+	return nil
+}
+
 // releaseWatermarkApplied reports whether the ledger's schema carries the table.
 func (db *DB) releaseWatermarkApplied(ctx context.Context) (bool, error) {
 	var applied bool
@@ -167,12 +196,16 @@ func (db *DB) ReleaseWatermark(ctx context.Context) (string, string, error) {
 // SetReleaseWatermark moves the mark to a release an operator chose, in either
 // direction.
 //
-// THE ONE WRITE THAT MAY LOWER IT, and it is allowed only through the maintenance
+// THE ONE WRITE THAT MAY LOWER IT, and it is allowed through the maintenance
 // handle — the typed entry the host-upgrade transaction opens after it has
 // snapshotted the ledger, so the higher mark survives in the snapshot a rollback
-// restores. Every other writer moves the mark forwards or not at all.
+// restores — and, on an external ledger, through the operator handle, because
+// there the maintenance open is a probe that refuses every write and there is no
+// snapshot for the mark to survive in. Every other writer moves the mark
+// forwards or not at all.
 func (db *DB) SetReleaseWatermark(ctx context.Context, release string) error {
-	if !db.maintenanceBypass {
+	external := db.admin && db.backend.engine() != "sqlite"
+	if !db.maintenanceBypass && !external {
 		return errors.New("state: the release watermark is lowered only through the host " +
 			"upgrade's maintenance handle; nothing else may move it backwards")
 	}

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/junioryono/billet/internal/config"
@@ -58,7 +59,7 @@ func TestFromRolloutTakesTheWholeInstructionFromTheLedger(t *testing.T) {
 
 	want := hostUpgradeTarget{
 		pin: "v9.9.9", digest: r.TargetDigest, rolloutID: r.ID, generation: r.Generation,
-		allowDowngrade: true,
+		allowDowngrade: true, fromRollout: true,
 	}
 
 	if got != want {
@@ -117,15 +118,109 @@ func TestFromRolloutHasNothingToDoWithoutADecisionToAct(t *testing.T) {
 	}
 }
 
-// A CONVERGED CONTROLLER IS LEFT ALONE, however far the nodes are from the
-// target: the host half of the rollout is done, and the coordinator does the rest.
-func TestFromRolloutStopsOnceTheControllerConverged(t *testing.T) {
+// A CONVERGED CONTROLLER PHASE IS NOT THIS HOST'S PHASE. The rollout records one
+// control plane's progress; a PostgreSQL standby is a second controller host
+// that phase says nothing about, and its timer is the only thing that moves it.
+// So a host not on the target acts however far the recorded controller got.
+func TestFromRolloutMovesAHostBehindAConvergedController(t *testing.T) {
 	cfg, r := ledgerWithRollout(t, "v9.9.9")
+
+	advanceController(t, cfg, r)
+
+	got, ok, err := rolloutInstruction(t.Context(), cfg)
+	if err != nil {
+		t.Fatalf("rolloutInstruction: %v", err)
+	}
+
+	if !ok || got.rolloutID != r.ID || got.digest != r.TargetDigest {
+		t.Fatalf("a host behind a converged controller was told nothing (ok=%v, %+v)", ok, got)
+	}
+}
+
+// THE LAST COMPLETED ROLLOUT IS THE DECISION ONCE NOTHING IS OPEN. A standby is
+// not a node, so the rollout completes without it; its timer then finds no open
+// rollout and must still take the fleet to where the fleet went. An aborted
+// rollout is an operator's decision and moves nobody.
+func TestFromRolloutMovesAStandbyToTheLastCompletedRollout(t *testing.T) {
+	cfg, r := ledgerWithRollout(t, "v9.9.9")
+
+	finish(t, cfg, r.ID, rollout.StateCompleted)
+
+	got, ok, err := rolloutInstruction(t.Context(), cfg)
+	if err != nil {
+		t.Fatalf("rolloutInstruction: %v", err)
+	}
+
+	want := hostUpgradeTarget{
+		pin: "v9.9.9", digest: r.TargetDigest, rolloutID: r.ID, generation: r.Generation,
+		allowDowngrade: true, fromRollout: true,
+	}
+
+	if !ok || got != want {
+		t.Fatalf("a completed rollout gave (ok=%v) %+v, want %+v", ok, got, want)
+	}
+
+	aborted, a := ledgerWithRollout(t, "v9.9.9")
+
+	finish(t, aborted, a.ID, rollout.StateAborted)
+
+	if _, ok, err := rolloutInstruction(t.Context(), aborted); err != nil || ok {
+		t.Fatalf("an aborted rollout was acted on (ok=%v, err=%v)", ok, err)
+	}
+}
+
+// THE INSTRUCTION IS READ AGAIN BEFORE IT IS ACCEPTED. Between the read and the
+// claim an operator can abort the rollout or the coordinator replace it; the
+// same tuple, open or completed, is confirmed and anything else is superseded.
+func TestFromRolloutRefusesADecisionThatChangedSinceItWasRead(t *testing.T) {
+	cfg, r := ledgerWithRollout(t, "v9.9.9")
+
+	target, ok, err := rolloutInstruction(t.Context(), cfg)
+	if err != nil || !ok {
+		t.Fatalf("rolloutInstruction: ok=%v err=%v", ok, err)
+	}
+
+	if err := confirmFleetDecision(t.Context(), cfg, target); err != nil {
+		t.Fatalf("an unchanged decision was not confirmed: %v", err)
+	}
+
+	finish(t, cfg, r.ID, rollout.StateCompleted)
+
+	if err := confirmFleetDecision(t.Context(), cfg, target); err != nil {
+		t.Fatalf("a decision that completed meanwhile was not confirmed: %v", err)
+	}
+
+	aborted, a := ledgerWithRollout(t, "v9.9.9")
+
+	target, _, err = rolloutInstruction(t.Context(), aborted)
+	if err != nil {
+		t.Fatalf("rolloutInstruction: %v", err)
+	}
+
+	finish(t, aborted, a.ID, rollout.StateAborted)
+
+	if err := confirmFleetDecision(t.Context(), aborted, target); !errors.Is(err, ErrSuperseded) {
+		t.Fatalf("a decision aborted since it was read was confirmed: %v", err)
+	}
+
+	other := target
+	other.generation++
+
+	if err := confirmFleetDecision(t.Context(), cfg, other); !errors.Is(err, ErrSuperseded) {
+		t.Fatalf("a decision with another generation was confirmed: %v", err)
+	}
+}
+
+// advanceController walks the recorded control plane to committed.
+func advanceController(t *testing.T, cfg *config.Config, r *rollout.Rollout) {
+	t.Helper()
 
 	db, err := openStateAdmin(t.Context(), cfg)
 	if err != nil {
 		t.Fatalf("openStateAdmin: %v", err)
 	}
+
+	defer func() { _ = db.Close() }()
 
 	store := rollout.New(db)
 
@@ -139,15 +234,38 @@ func TestFromRolloutStopsOnceTheControllerConverged(t *testing.T) {
 			t.Fatalf("Advance the controller to %s: %v", phase, err)
 		}
 	}
+}
 
-	_ = db.Close()
+// finish ends the rollout in the given state. A completed rollout is one whose
+// controller and every node converged, so those are walked first.
+func finish(t *testing.T, cfg *config.Config, id, outcome string) {
+	t.Helper()
 
-	_, ok, err := rolloutInstruction(t.Context(), cfg)
+	db, err := openStateAdmin(t.Context(), cfg)
 	if err != nil {
-		t.Fatalf("rolloutInstruction: %v", err)
+		t.Fatalf("openStateAdmin: %v", err)
 	}
 
-	if ok {
-		t.Fatal("a converged controller was told to upgrade again")
+	defer func() { _ = db.Close() }()
+
+	store := rollout.New(db)
+
+	if outcome == rollout.StateCompleted {
+		for _, node := range []string{"", "epyc-1"} {
+			for _, phase := range []rollout.Phase{
+				rollout.PhaseDraining, rollout.PhaseReadyToInstall, rollout.PhaseInstalling,
+				rollout.PhaseVerifying, rollout.PhaseCommitted,
+			} {
+				if err := store.Advance(t.Context(), rollout.AdvanceRequest{
+					RolloutID: id, Node: node, To: phase,
+				}); err != nil {
+					t.Fatalf("Advance %q to %s: %v", node, phase, err)
+				}
+			}
+		}
+	}
+
+	if err := store.Finish(t.Context(), id, outcome, "the test said so"); err != nil {
+		t.Fatalf("Finish %s: %v", outcome, err)
 	}
 }

@@ -106,3 +106,23 @@ func TestTheDowngradeCheckPrecedesTheClaim(t *testing.T) {
 		t.Fatal("actOnResolved claims the machine before it checks for a downgrade")
 	}
 }
+
+// AN EXTERNAL LEDGER IS KNOWN TO THE HOST FROM THE CONFIG, because the migrate
+// step that lowers the mark on a local ledger is skipped there and the probe step
+// has to do it instead, through the operator handle rather than the read-only
+// probe the maintenance open returns on PostgreSQL.
+func TestTheHostKnowsWhetherItsLedgerIsExternal(t *testing.T) {
+	t.Parallel()
+
+	local := newSystemdHost(&config.Config{Server: &config.ServerConfig{}}, "", "/staged/billet", nil)
+	if local.external {
+		t.Error("a SQLite control plane read as an external ledger")
+	}
+
+	postgres := newSystemdHost(&config.Config{Server: &config.ServerConfig{
+		State: &config.StateConfig{Backend: config.StatePostgres},
+	}}, "", "/staged/billet", nil)
+	if !postgres.external {
+		t.Error("a PostgreSQL control plane read as a local ledger")
+	}
+}

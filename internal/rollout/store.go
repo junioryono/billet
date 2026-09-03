@@ -547,6 +547,31 @@ func unresolved(ctx context.Context, q state.ReadOps, rolloutID string) ([]strin
 	return out, nil
 }
 
+// NewestForTarget is the newest rollout, in any state, to one manifest digest,
+// and whether there is one.
+func (s *Store) NewestForTarget(ctx context.Context, digest string) (*Rollout, bool, error) {
+	var out *Rollout
+
+	err := s.db.View(ctx, func(q state.Querier) error {
+		out = nil
+
+		row, err := state.ReadQueries(q).ReadNewestRolloutForTarget(ctx, digest)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+
+		if err != nil {
+			return fmt.Errorf("rollout: read the newest rollout to %s: %w", digest, err)
+		}
+
+		out, err = rolloutFrom(&row)
+
+		return err
+	})
+
+	return out, out != nil, err
+}
+
 // History lists finished rollouts, newest first.
 func (s *Store) History(ctx context.Context, limit int) ([]Rollout, error) {
 	if limit <= 0 {

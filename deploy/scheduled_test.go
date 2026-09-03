@@ -22,6 +22,9 @@ func TestTheUpgradeUnitActsOnTheRecordedRolloutAsRoot(t *testing.T) {
 		"Type=oneshot",
 		"ExecStart=/usr/bin/billet host-upgrade --from-rollout --config /etc/billet/billet.yaml",
 		"TimeoutStartSec=88200",
+		// THE LEDGER'S ENVIRONMENT, or a PostgreSQL controller's updater cannot
+		// read the rollout it is meant to act on.
+		"EnvironmentFile=-/etc/billet/server.env",
 	} {
 		if !strings.Contains(deploy.UpgradeUnit, want) {
 			t.Errorf("%s does not carry %q", deploy.UpgradeUnitName, want)

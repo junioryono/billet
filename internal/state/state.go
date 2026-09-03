@@ -137,9 +137,11 @@ type DB struct {
 	stateDir          string
 	maintenanceBypass bool
 
-	// runningRelease is the billet this handle was opened by, kept so a standby
-	// that is promoted can record it the way a control plane does at open.
+	// runningRelease is the billet this handle was opened by, and recordsRelease
+	// whether this handle is one that records it: the control plane proper, at
+	// the moment it claims. See ClaimController.
 	runningRelease string
+	recordsRelease bool
 
 	// claimedEpoch is the controller generation this process claimed, or 0 for a
 	// handle that is not a controller — a migration, an operator command, the
@@ -221,7 +223,7 @@ type openMode struct {
 }
 
 // records reports whether a handle opened in this mode is the one that moves the
-// release watermark forward.
+// release watermark forward, which it does in ClaimController and never at open.
 //
 // THE CONTROL PLANE PROPER AND NOTHING ELSE. An operator command may be a newer
 // binary run from a laptop; a standby has not earned a write; the upgrade probe
@@ -324,6 +326,7 @@ func openDir(
 		stateDir:          stateDir,
 		maintenanceBypass: maintenanceBypass,
 		runningRelease:    mode.release,
+		recordsRelease:    mode.records(),
 		fencedCh:          make(chan struct{}),
 	}
 
@@ -443,9 +446,13 @@ func openDir(
 	}
 
 	// AFTER THE MIGRATION, BECAUSE THE TABLE IT READS ARRIVED IN ONE. A proved
-	// downgrade is refused here whichever handle this is; a proved upgrade is
-	// recorded only by the control plane proper. See openMode.records.
-	if err := db.enforceReleaseWatermark(startupCtx, mode.release, mode.records()); err != nil {
+	// downgrade is refused here whichever handle this is. A proved upgrade is
+	// recorded by nobody at open: the control plane proper records it in
+	// ClaimController, after the deployment binding has agreed these rows are
+	// its own. Recorded here, a newer binary pointed at another deployment's
+	// ledger would raise that ledger's mark on the way to being refused, and
+	// fence its real controller out of its own restart. See openMode.records.
+	if err := db.enforceReleaseWatermark(startupCtx, mode.release, false); err != nil {
 		return nil, errors.Join(err, db.Close())
 	}
 
@@ -569,13 +576,19 @@ func (db *DB) Tx(ctx context.Context, fn func(*sql.Tx) error) error {
 	// controller exclusion. The check at open time is only true of the control
 	// plane that was running then; this one is true of the schema this
 	// transaction is actually writing against, because BEGIN IMMEDIATE already
-	// holds the write lock a migration would need.
+	// holds the write lock a migration would need. The release watermark is
+	// re-read for the same reason: a newer control plane can have claimed and
+	// recorded since this handle opened, and two releases that share a schema
+	// would pass the schema check alone.
 	if db.revalidate.Load() {
 		if err := db.checkMaintenance(); err != nil {
 			return err
 		}
 		if err := verifySchemaIn(ctx, db.backend, tx); err != nil {
 			return db.asCancellation(ctx, err)
+		}
+		if err := db.checkReleaseWatermarkIn(ctx, tx); err != nil {
+			return err
 		}
 	}
 

@@ -85,7 +85,8 @@
           billet-images-refresh.service: "{{ lookup('ansible.builtin.file', billet_repo_root + '/deploy/billet-images-refresh.service') }}"
           billet-images-refresh.timer: "{{ lookup('ansible.builtin.file', billet_repo_root + '/deploy/billet-images-refresh.timer') }}"
         role_scheduled:
-          billet-upgrade.service: "{{ lookup('ansible.builtin.template', billet_role_templates + '/billet-upgrade.service.j2') }}"
+          billet-upgrade.service: "{{ lookup('ansible.builtin.template', billet_role_templates + '/billet-upgrade.service.j2',
+            template_vars={'billet_server_environment_path': '/etc/billet/server.env'}) }}"
           billet-upgrade.timer: "{{ lookup('ansible.builtin.template', billet_role_templates + '/billet-upgrade.timer.j2') }}"
           billet-images-refresh.service: "{{ lookup('ansible.builtin.template', billet_role_templates + '/billet-images-refresh.service.j2') }}"
           billet-images-refresh.timer: "{{ lookup('ansible.builtin.template', billet_role_templates + '/billet-images-refresh.timer.j2') }}"
@@ -209,6 +210,7 @@
         - { unit: billet-upgrade.service, directive: User }
         - { unit: billet-upgrade.service, directive: Group }
         - { unit: billet-upgrade.service, directive: UMask }
+        - { unit: billet-upgrade.service, directive: EnvironmentFile }
         - { unit: billet-upgrade.service, directive: ExecStart }
         - { unit: billet-upgrade.service, directive: TimeoutStartSec }
         - { unit: billet-upgrade.timer, directive: OnBootSec }

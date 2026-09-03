@@ -78,9 +78,15 @@ func cmdImagesRefresh(ctx context.Context, args []string) error {
 		return err
 	}
 
+	// A CONTROL-PLANE-ONLY HOST IS NOTHING TO DO, NOT A FAULT. The package enables
+	// the timer on every host and the Mac installs the agent beside every server,
+	// so this runs daily where nothing boots a guest; a red unit there would be a
+	// standing false alarm.
 	if cfg.Node == nil {
-		return errors.New("billet images refresh: this config has no node section, so " +
-			"there is nothing here that boots a guest image")
+		fmt.Printf("this host has no node section, so nothing here boots a guest image; " +
+			"nothing to do.\n")
+
+		return nil
 	}
 
 	if !cfg.Release.AutomaticUpdates() {

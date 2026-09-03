@@ -145,10 +145,6 @@ const startInitialDelay = time.Minute
 // list of the same sentence.
 const sayAgainAfter = 6 * time.Hour
 
-// historyDepth bounds how far back an aborted decision about the same target is
-// looked for.
-const historyDepth = 20
-
 // Run looks on a cadence until the context ends.
 func (s *Starter) Run(ctx context.Context, every time.Duration) {
 	if every <= 0 {
@@ -256,30 +252,37 @@ func (s *Starter) Tick(ctx context.Context) error {
 	// exactly these bytes, with a reason; starting it again an hour later would
 	// overrule them with nothing new to go on. The channel moving on to a
 	// different release is what ends the refusal.
-	history, err := s.store.History(ctx, historyDepth)
+	//
+	// THE NEWEST ROLLOUT TO THESE BYTES, WHEREVER IT SITS IN THE HISTORY: an abort
+	// found by walking the last N rollouts of any target is one that N unrelated
+	// rollouts later would be forgotten, and an operator's decision does not age
+	// out because the fleet was busy.
+	last, found, err := s.store.NewestForTarget(ctx, target.Digest)
 	if err != nil {
 		return err
 	}
 
-	for i := range history {
-		if history[i].TargetDigest != target.Digest {
-			continue
-		}
+	if found && last.State == StateAborted {
+		s.say("aborted", "the "+s.policy.source()+" names "+target.Version+", and rollout "+
+			last.ID+" to that exact release was aborted ("+last.TerminalReason+
+			"); nothing automatic restarts it. `billet rollout start` does, on purpose")
 
-		if history[i].State == StateAborted {
-			s.say("aborted", "the "+s.policy.source()+" names "+target.Version+", and rollout "+
-				history[i].ID+" to that exact release was aborted ("+history[i].TerminalReason+
-				"); nothing automatic restarts it. `billet rollout start` does, on purpose")
-
-			return nil
-		}
-
-		break
+		return nil
 	}
 
 	names := make([]string, 0, len(hosts))
 	for i := range hosts {
 		names = append(names, hosts[i].Name)
+	}
+
+	// THE WINDOW IS ASKED AGAIN, AT THE MOMENT OF BEGINNING. Resolving a channel
+	// and reading a fleet take as long as they take, and the window bounds when a
+	// rollout may BEGIN, which is the write below and not the tick that led to it.
+	if s.policy.OpenAt != nil && !s.policy.OpenAt(s.now()) {
+		s.log.Debug("the maintenance window closed while the target was being resolved; " +
+			"starting no rollout")
+
+		return nil
 	}
 
 	policy := s.policy.Rollout

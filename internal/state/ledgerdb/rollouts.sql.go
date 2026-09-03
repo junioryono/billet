@@ -356,6 +356,36 @@ func (q *Queries) ListRolloutNodes(ctx context.Context, rolloutID string) ([]Lis
 	return items, nil
 }
 
+const readNewestRolloutForTarget = `-- name: ReadNewestRolloutForTarget :one
+SELECT id, generation, channel, target_version, target_digest, policy,
+       controller_phase, prior_version, state, created_by, created_at,
+       finished_at, terminal_reason
+  FROM rollouts WHERE target_digest = $1 ORDER BY generation DESC LIMIT 1
+`
+
+// The newest rollout, in any state, to one manifest digest: what an automatic
+// start consults before it would restart bytes an operator abandoned.
+func (q *Queries) ReadNewestRolloutForTarget(ctx context.Context, targetDigest string) (Rollout, error) {
+	row := q.db.QueryRowContext(ctx, readNewestRolloutForTarget, targetDigest)
+	var i Rollout
+	err := row.Scan(
+		&i.ID,
+		&i.Generation,
+		&i.Channel,
+		&i.TargetVersion,
+		&i.TargetDigest,
+		&i.Policy,
+		&i.ControllerPhase,
+		&i.PriorVersion,
+		&i.State,
+		&i.CreatedBy,
+		&i.CreatedAt,
+		&i.FinishedAt,
+		&i.TerminalReason,
+	)
+	return i, err
+}
+
 const readRolloutControllerPhase = `-- name: ReadRolloutControllerPhase :one
 SELECT controller_phase FROM rollouts WHERE id = $1
 `

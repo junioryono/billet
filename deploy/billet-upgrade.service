@@ -44,6 +44,12 @@ User=root
 Group=root
 UMask=0077
 
+# THE LEDGER'S ENVIRONMENT, for a PostgreSQL controller: `dsn_env` names a
+# variable, the role writes it to this file, and the updater has to read the
+# rollout through the same connection the server uses. With the leading `-`, so
+# a SQLite host, where the file does not exist, starts rather than failing.
+EnvironmentFile=-/etc/billet/server.env
+
 ExecStart=/usr/bin/billet host-upgrade --from-rollout --config /etc/billet/billet.yaml
 
 # THE DRAIN IS THE BOUND, AND IT IS UNBOUNDED. A job may run for days; the

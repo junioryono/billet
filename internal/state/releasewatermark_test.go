@@ -1,6 +1,7 @@
 package state
 
 import (
+	"database/sql"
 	"errors"
 	"strings"
 	"testing"
@@ -26,14 +27,19 @@ func watermarkOf(t *testing.T, dir string) string {
 	return release
 }
 
-// serveAs opens the ledger as a control plane running one release and closes it
-// again, which is what records the mark.
+// serveAs opens the ledger as a control plane running one release, claims the
+// deployment as the control plane does, and closes it again. The claim is what
+// records the mark; an open alone records nothing.
 func serveAs(t *testing.T, dir, release string) {
 	t.Helper()
 
 	db, err := Open(t.Context(), dir, WithRunningRelease(release))
 	if err != nil {
 		t.Fatalf("Open as %s: %v", release, err)
+	}
+
+	if _, err := db.ClaimController(t.Context(), "controller", "deployment-a"); err != nil {
+		t.Fatalf("ClaimController as %s: %v", release, err)
 	}
 
 	if err := db.Close(); err != nil {
@@ -200,4 +206,79 @@ func TestALoweredWatermarkAdmitsTheOlderBinary(t *testing.T) {
 	}
 
 	serveAs(t, dir, "v0.4.0")
+}
+
+// THE MARK MOVES AT THE CLAIM, NOT AT THE OPEN. A newer binary pointed at another
+// deployment's ledger is refused by the deployment binding inside the claim; had
+// the open recorded, it would have raised that ledger's mark on the way to being
+// refused and fenced the ledger's own controller out of its next restart.
+func TestAForeignClaimantMovesNoWatermark(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	serveAs(t, dir, "v0.5.0")
+
+	foreign, err := Open(t.Context(), dir, WithRunningRelease("v0.6.0"))
+	if err != nil {
+		t.Fatalf("Open as a newer binary: %v", err)
+	}
+
+	if got := watermarkOf(t, dir); got != "v0.5.0" {
+		t.Fatalf("an open alone recorded %q; only a claim may", got)
+	}
+
+	if _, err := foreign.ClaimController(t.Context(), "elsewhere", "deployment-b"); !errors.Is(err,
+		ErrForeignLedger) {
+		t.Fatalf("a claim for another deployment was not refused as foreign: %v", err)
+	}
+
+	_ = foreign.Close()
+
+	if got := watermarkOf(t, dir); got != "v0.5.0" {
+		t.Fatalf("a refused foreign claimant recorded %q", got)
+	}
+
+	// AND THE LEDGER'S OWN CONTROLLER STILL RESTARTS.
+	serveAs(t, dir, "v0.5.0")
+}
+
+// AN OPERATOR HANDLE OPENED BEFORE A NEWER CONTROL PLANE CLAIMED CANNOT WRITE
+// AFTER IT. The open-time check was true of the ledger then; two releases that
+// share a schema pass the schema re-check, so the mark is re-read inside every
+// write of a revalidating handle.
+func TestAnOlderHandleOpenAcrossANewerClaimCannotWrite(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	plane, err := Open(t.Context(), dir, WithRunningRelease("v0.5.0"))
+	if err != nil {
+		t.Fatalf("Open the control plane: %v", err)
+	}
+
+	if _, err := plane.ClaimController(t.Context(), "controller", "deployment-a"); err != nil {
+		t.Fatalf("ClaimController: %v", err)
+	}
+
+	// An operator command beside a running control plane: no lock, revalidating.
+	older, err := OpenAdmin(t.Context(), dir, WithRunningRelease("v0.5.0"))
+	if err != nil {
+		t.Fatalf("OpenAdmin beside the control plane: %v", err)
+	}
+
+	defer func() { _ = older.Close() }()
+
+	if err := older.Tx(t.Context(), func(*sql.Tx) error { return nil }); err != nil {
+		t.Fatalf("a write beside a control plane on the same release was refused: %v", err)
+	}
+
+	_ = plane.Close()
+
+	serveAs(t, dir, "v0.6.0")
+
+	err = older.Tx(t.Context(), func(*sql.Tx) error { return nil })
+	if !errors.Is(err, ErrReleaseBehind) {
+		t.Fatalf("an older handle wrote after a newer control plane recorded itself: %v", err)
+	}
 }

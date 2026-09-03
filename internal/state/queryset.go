@@ -112,6 +112,7 @@ type ReadOps interface {
 	ListRemoteCostNodes(ctx context.Context) ([]ledgerdb.ListRemoteCostNodesRow, error)
 	ListRevokedCerts(ctx context.Context) ([]ledgerdb.RevokedCert, error)
 	ListRolloutHistory(ctx context.Context, maxRows int64) ([]ledgerdb.Rollout, error)
+	ReadNewestRolloutForTarget(ctx context.Context, targetDigest string) (ledgerdb.Rollout, error)
 	ListRolloutNodePhases(ctx context.Context, rolloutID string) ([]ledgerdb.ListRolloutNodePhasesRow, error)
 	ListRolloutNodes(ctx context.Context, rolloutID string) ([]ledgerdb.ListRolloutNodesRow, error)
 	ListRunningLeasesWithReplacedHolder(ctx context.Context, arg ledgerdb.ListRunningLeasesWithReplacedHolderParams) ([]ledgerdb.ListRunningLeasesWithReplacedHolderRow, error)

@@ -182,15 +182,22 @@ func hostUpgradeFromRollout(ctx context.Context, cfg *config.Config, cfgPath str
 	return startHostUpgrade(ctx, cfg, cfgPath, target, newUpgradeAck(0))
 }
 
-// rolloutInstruction reads what the open rollout asks of this host, and says
+// rolloutInstruction reads what the fleet's decision asks of this host, and says
 // whether there is anything to do.
 //
-// FOUR WAYS TO ANSWER "NOTHING", EACH SAID OUT LOUD, because this runs unattended
+// EVERY WAY TO ANSWER "NOTHING" IS SAID OUT LOUD, because this runs unattended
 // every few minutes and a silent exit 0 is indistinguishable from a timer that
 // stopped firing. No control plane here; automatic updates turned off; no
-// rollout open; the controller already converged or this binary already the
-// target — the last of which the control plane records on its next pass, so the
-// timer has nothing to add.
+// decision at all; this binary already the target.
+//
+// THE DECISION IS THE OPEN ROLLOUT, OR THE LAST COMPLETED ONE. A rollout's
+// controller phase is one fact about one control plane, and a PostgreSQL
+// standby is a second controller host that phase says nothing about: the leader
+// converges, the nodes follow, the rollout completes, and the standby's own
+// timer fires into a ledger with nothing open. So a host that is not on the
+// last completed rollout's target takes that rollout, under its digest and its
+// downgrade permission; an aborted one is an operator's decision and is left
+// alone. A host already on the target is nothing to do whatever the phase says.
 //
 // THE HANDLE IS CLOSED BEFORE ANYTHING IS RETURNED TO ACT ON. The transaction
 // that follows fences the ledger and waits for every handle opened before the
@@ -211,41 +218,56 @@ func rolloutInstruction(ctx context.Context, cfg *config.Config) (hostUpgradeTar
 		return hostUpgradeTarget{}, false, nil
 	}
 
-	db, err := openStateAdmin(ctx, cfg)
+	current, found, err := readFleetDecision(ctx, cfg)
 	if err != nil {
-		return hostUpgradeTarget{}, false, fmt.Errorf("server state: %w", err)
-	}
-
-	defer func() { _ = db.Close() }()
-
-	current, err := rollout.New(db).Open(ctx)
-	if err != nil {
-		if errors.Is(err, rollout.ErrNoRollout) {
-			fmt.Printf("No rollout is running; nothing to do.\n")
-
-			return hostUpgradeTarget{}, false, nil
-		}
-
 		return hostUpgradeTarget{}, false, err
 	}
 
-	if current.ControllerPhase.Converged() {
-		fmt.Printf("Rollout %s has already converged the control plane; nothing to do.\n",
-			current.ID)
+	switch {
+	case !found:
+		fmt.Printf("No rollout is running and none has completed; nothing to do.\n")
+
+		return hostUpgradeTarget{}, false, nil
+
+	case current.TargetVersion == version.Version():
+		fmt.Printf("This host already runs %s, rollout %s's target; nothing to do.\n",
+			current.TargetVersion, current.ID)
+
+		return hostUpgradeTarget{}, false, nil
+
+	case current.State == rollout.StateAborted:
+		fmt.Printf("Rollout %s to %s was aborted (%s), and nothing automatic restarts it; "+
+			"nothing to do.\n", current.ID, current.TargetVersion, current.TerminalReason)
 
 		return hostUpgradeTarget{}, false, nil
 	}
 
-	if current.TargetVersion == version.Version() {
-		fmt.Printf("This host already runs %s, rollout %s's target; the control plane "+
-			"records that on its next pass. Nothing to do.\n", current.TargetVersion, current.ID)
+	// A COMPLETED ROLLOUT IS FOLLOWED ONLY FORWARDS, unless it was itself a
+	// downgrade somebody named. The open case is fenced the same way one step
+	// later, by checkDowngrade, with the same permission.
+	if order, ok := version.Compare(current.TargetVersion, version.Version()); ok && order < 0 &&
+		!current.Policy.AllowDowngrade {
+		fmt.Printf("Rollout %s's target %s is older than the %s running here and the rollout "+
+			"did not allow a downgrade; nothing to do.\n", current.ID, current.TargetVersion,
+			version.Version())
 
 		return hostUpgradeTarget{}, false, nil
 	}
 
-	fmt.Printf("Rollout %s asks this host to move from %s to %s (manifest %s, decision %d).\n",
-		current.ID, version.Version(), current.TargetVersion, current.TargetDigest,
-		current.Generation)
+	switch {
+	case current.State == rollout.StateCompleted:
+		fmt.Printf("Rollout %s completed at %s while this host stayed on %s; moving it "+
+			"(manifest %s, decision %d).\n", current.ID, current.TargetVersion,
+			version.Version(), current.TargetDigest, current.Generation)
+	case current.ControllerPhase.Converged():
+		fmt.Printf("Rollout %s has converged a control plane on %s, and this host runs %s; "+
+			"moving it (manifest %s, decision %d).\n", current.ID, current.TargetVersion,
+			version.Version(), current.TargetDigest, current.Generation)
+	default:
+		fmt.Printf("Rollout %s asks this host to move from %s to %s (manifest %s, decision %d).\n",
+			current.ID, version.Version(), current.TargetVersion, current.TargetDigest,
+			current.Generation)
+	}
 
 	return hostUpgradeTarget{
 		pin:            current.TargetVersion,
@@ -253,7 +275,68 @@ func rolloutInstruction(ctx context.Context, cfg *config.Config) (hostUpgradeTar
 		rolloutID:      current.ID,
 		generation:     current.Generation,
 		allowDowngrade: current.Policy.AllowDowngrade,
+		fromRollout:    true,
 	}, true, nil
+}
+
+// readFleetDecision is the open rollout, or the newest finished one, and
+// whether there is either.
+func readFleetDecision(ctx context.Context, cfg *config.Config) (*rollout.Rollout, bool, error) {
+	db, err := openStateAdmin(ctx, cfg)
+	if err != nil {
+		return nil, false, fmt.Errorf("server state: %w", err)
+	}
+
+	defer func() { _ = db.Close() }()
+
+	store := rollout.New(db)
+
+	current, err := store.Open(ctx)
+	if err == nil {
+		return current, true, nil
+	}
+
+	if !errors.Is(err, rollout.ErrNoRollout) {
+		return nil, false, err
+	}
+
+	history, err := store.History(ctx, 1)
+	if err != nil {
+		return nil, false, err
+	}
+
+	if len(history) == 0 {
+		return nil, false, nil
+	}
+
+	return &history[0], true, nil
+}
+
+// confirmFleetDecision re-reads the decision a `--from-rollout` run was built
+// from, immediately before the run is accepted.
+//
+// THE INSTRUCTION WAS READ BEFORE THE LOCK, THE CLAIM AND THE RESOLUTION, and an
+// operator can abort a rollout in that window, or the coordinator can replace it
+// with a decision this host has not yet seen. A dispatched node is fenced against
+// that by the generation the coordinator hands it; the timer hands itself its
+// instruction, so it asks again. The same tuple in the same or a completed state
+// is confirmed; anything else is superseded and nothing is installed. A read
+// cannot close the window to zero, and what lies past it is what the decision
+// fence and the digest fence already refuse.
+func confirmFleetDecision(ctx context.Context, cfg *config.Config, target hostUpgradeTarget) error {
+	current, found, err := readFleetDecision(ctx, cfg)
+	if err != nil {
+		return err
+	}
+
+	if !found || current.ID != target.rolloutID || current.Generation != target.generation ||
+		current.TargetDigest != target.digest || current.State == rollout.StateAborted {
+		return fmt.Errorf("%w: rollout %s (decision %d) is no longer the deployment's decision "+
+			"since this host read it; nothing was installed", ErrSuperseded, target.rolloutID,
+			target.generation)
+	}
+
+	return nil
 }
 
 type hostUpgradeTarget struct {
@@ -272,9 +355,13 @@ type hostUpgradeTarget struct {
 	// rolloutID and generation are the fleet decision this serves, recorded in the
 	// journal so an operator who finds a machine mid-upgrade knows what asked for
 	// it and a resuming run can see which decision it belongs to.
-	rolloutID  string
-	generation int64
-	skipVerify bool
+	rolloutID string
+	// fromRollout marks an instruction this host read from the ledger itself
+	// rather than one a coordinator handed it, which is re-read before the
+	// transaction is accepted. See confirmFleetDecision.
+	fromRollout bool
+	generation  int64
+	skipVerify  bool
 	// reinstall installs even when this machine already reports the release.
 	//
 	// THE REPAIR THAT DOES NOT DEPEND ON THE RECORD BEING READABLE. The ordinary
@@ -376,6 +463,22 @@ func startHostUpgrade(ctx context.Context, cfg *config.Config, cfgPath string,
 // exactly as another process would, and the probe that tried it refused every
 // ordinary upgrade against its own caller's lock. Naming it in the signature is
 // how a caller is told, since nothing else can enforce it.
+// refuseClaimed gives back a claim whose transaction was refused before it was
+// accepted.
+//
+// THE DIRECTORY GOES TOO. The transaction touched nothing outside it, so the
+// journal records a decision that was refused rather than an upgrade somebody
+// needs to read about — and a rollout retries every few minutes, which would
+// otherwise leave one behind each time.
+func refuseClaimed(dir string, err error) error {
+	claimErr := releaseClaim(dir)
+	if claimErr == nil {
+		_ = os.RemoveAll(dir)
+	}
+
+	return errors.Join(err, claimErr)
+}
+
 func actOnResolved(ctx context.Context, cfg *config.Config, cfgPath string,
 	target hostUpgradeTarget, ack *upgradeAck, client *releasesource.Client,
 	manifest *releasesource.Manifest, digest string, _ *txLock,
@@ -505,16 +608,17 @@ func actOnResolved(ctx context.Context, cfg *config.Config, cfgPath string,
 	// SECOND instruction, and the window that matters is the whole length of this
 	// one — which is unbounded, because it contains a drain.
 	if err := checkAndRecordDecision(target); err != nil {
-		// THE DIRECTORY GOES TOO. This transaction was never accepted and has touched
-		// nothing outside it, so the journal records a decision that was refused
-		// rather than an upgrade somebody needs to read about — and a rollout retries
-		// every few minutes, which would otherwise leave one behind each time.
-		claimErr := releaseClaim(dir)
-		if claimErr == nil {
-			_ = os.RemoveAll(dir)
-		}
+		return refuseClaimed(dir, err)
+	}
 
-		return errors.Join(err, claimErr)
+	// A SELF-READ INSTRUCTION IS READ AGAIN, NOW THAT THE CLAIM HOLDS THE HOST
+	// STILL. Between the read and this point a rollout can have been aborted or
+	// replaced; a node is told about that by its coordinator, and a timer has to
+	// ask.
+	if target.fromRollout {
+		if err := confirmFleetDecision(ctx, cfg, target); err != nil {
+			return refuseClaimed(dir, err)
+		}
 	}
 
 	// THE JOB IS TAKEN, AND THIS IS THE MOMENT IT BECAME TRUE.
@@ -1186,10 +1290,13 @@ type ledgerHost struct {
 	// candidate is probed, or empty for an upgrade. Read from the journal so a
 	// resumed transaction keeps the permission the interrupted one was given.
 	downgradeTo string
+	// external marks a ledger this host does not hold — PostgreSQL — where the
+	// migrate step is skipped and the lowering has to happen at the probe.
+	external bool
 }
 
 func newLedgerHost(cfg *config.Config, cfgPath string, journal *hostupgrade.Journal) ledgerHost {
-	h := ledgerHost{cfg: cfg, cfgPath: cfgPath}
+	h := ledgerHost{cfg: cfg, cfgPath: cfgPath, external: ledgerKindFor(cfg) != ""}
 
 	if journal != nil && journal.AllowDowngrade {
 		h.downgradeTo = journal.ToVersion
@@ -1494,12 +1601,25 @@ func (h *ledgerHost) Migrate(ctx context.Context) error {
 }
 
 // lowerWatermark admits the older candidate to the ledger, when asked to.
+//
+// THROUGH THE MAINTENANCE HANDLE ON A LOCAL LEDGER, which is fenced and
+// snapshotted by now, and THROUGH THE OPERATOR HANDLE ON AN EXTERNAL ONE, which
+// is neither: the probe handle a PostgreSQL maintenance open returns refuses
+// every write, and the server on this host is stopped, so the operator handle
+// is the one that can. On an active-passive pair the other controller may still
+// be serving the newer release; lowering under it admits this host and nothing
+// else, and that controller re-records the mark the next time it claims.
 func (h *ledgerHost) lowerWatermark(ctx context.Context) error {
 	if h.downgradeTo == "" || h.cfg.Server == nil {
 		return nil
 	}
 
-	db, err := openStateMaintenance(ctx, h.cfg)
+	open := openStateMaintenance
+	if h.external {
+		open = openStateAdmin
+	}
+
+	db, err := open(ctx, h.cfg)
 	if err != nil {
 		return fmt.Errorf("open the ledger to lower its release watermark: %w", err)
 	}
@@ -1567,7 +1687,17 @@ func (h *systemdHost) PrepareImages(ctx context.Context) error {
 }
 
 // ProbeReady starts the candidate under units that poll nothing.
-func (h *systemdHost) ProbeReady(ctx context.Context) error {
+//
+// ON AN EXTERNAL LEDGER THE DOWNGRADE'S LOWERING HAPPENS HERE, because the
+// migrate step that does it on a local ledger is skipped there, and the
+// candidate's probe is exactly what the higher mark would refuse.
+func (h *ledgerHost) ProbeReady(ctx context.Context) error {
+	if h.external {
+		if err := h.lowerWatermark(ctx); err != nil {
+			return err
+		}
+	}
+
 	if h.cfg.Server != nil {
 		if err := h.runCandidate(ctx, "server", "--config", h.configPath(),
 			"--upgrade-probe"); err != nil {

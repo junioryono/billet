@@ -164,16 +164,6 @@ func (db *DB) ClaimController(
 
 			return restore(fmt.Errorf("state: migrate on promotion: %w", err))
 		}
-
-		// AND THE RELEASE WATERMARK MOVES HERE, for the same reason: this is the
-		// first moment the standby is the control plane proper. Recorded at open it
-		// was only checked; a newer standby beside an older leader must not fence
-		// that leader out of its own restart before it has actually taken over.
-		if err := db.enforceReleaseWatermark(ctx, db.runningRelease, true); err != nil {
-			db.revalidate.Store(true)
-
-			return restore(err)
-		}
 	}
 
 	var epoch int64
@@ -204,6 +194,19 @@ func (db *DB) ClaimController(
 	// that stored its epoch first would read a row that does not yet carry the
 	// value it is about to write, and refuse its own claim.
 	db.claimedEpoch.Store(epoch)
+
+	// AND THE RELEASE WATERMARK MOVES HERE, AFTER THE BINDING AND THE CLAIM, for
+	// every control plane and never at open. This is the first moment the process
+	// is the control plane proper: a standby beside an older leader has just
+	// taken over, and a process pointed at another deployment's ledger has just
+	// been refused by the binding with the mark untouched. A promoted standby
+	// records too, which is what makes a follower-first upgrade of an
+	// active-passive pair leave the mark at the newer release.
+	if db.recordsRelease || wasStandby {
+		if err := db.enforceReleaseWatermark(ctx, db.runningRelease, true); err != nil {
+			return restore(err)
+		}
+	}
 
 	return ControllerClaim{Holder: holder, Epoch: epoch}, nil
 }

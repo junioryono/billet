@@ -217,3 +217,22 @@ func TestARefreshDryRunPullsNothing(t *testing.T) {
 		t.Errorf("a dry run pulled %v and reaped %v", run.pulled, run.reaped)
 	}
 }
+
+// A HOST WITH NO NODE HAS NOTHING TO REFRESH, AND SAYS SO WITH EXIT 0. The package
+// enables the timer on every host and the Mac installs the agent beside every
+// server, so this runs daily on control-plane-only hosts; an error there is a red
+// unit on every healthy one.
+func TestARefreshOnAHostWithNoNodeHasNothingToDo(t *testing.T) {
+	head, _, _ := strings.Cut(firecrackerNodeConfig, "node:")
+	_, tiers, _ := strings.Cut(firecrackerNodeConfig, "tiers:")
+	body := head + "tiers:" + tiers
+
+	path := filepath.Join(t.TempDir(), "billet.yaml")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	if err := cmdImagesRefresh(t.Context(), []string{"--config", path}); err != nil {
+		t.Fatalf("a control-plane-only host was refused: %v", err)
+	}
+}

@@ -360,9 +360,11 @@ func (c *Converger) diagnoseBootstrap(ctx context.Context, label, out string, co
 // A LOADED JOB WITH A PROCESS IS LEFT ALONE. That process may be the upgrade
 // transaction itself, midway through draining the node; booting it out to load
 // a fresh copy of its own plist would kill the updater. A loaded job with no
-// process is booted out and loaded again, so a plist this build changed takes
-// effect — launchd reads a plist once, at bootstrap, and nothing else refreshes
-// what it holds.
+// process is booted out and loaded again, so what launchd holds is what the
+// plist on disk says — launchd reads a plist once, at bootstrap. A plist that
+// differs from the one this build ships is refused by Enable before any of
+// that, as the service agents' are: a changed schedule wants a person to move
+// the old file aside, and `up` says so.
 func (c *Converger) EnableScheduled(ctx context.Context, label string) error {
 	if err := c.Enable(ctx, label); err != nil {
 		return err
