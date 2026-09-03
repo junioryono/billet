@@ -3281,6 +3281,7 @@ func (c *Config) Validate() error {
 	errs = append(errs, c.validateNode()...)
 	errs = append(errs, c.validateNodes()...)
 	errs = append(errs, c.validateSites()...)
+	errs = append(errs, c.validateCodeBuildTrust()...)
 	errs = append(errs, c.validateTiers()...)
 	errs = append(errs, c.validateCapacity()...)
 	errs = append(errs, c.validateMacOSHostLimits()...)
