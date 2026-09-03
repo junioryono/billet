@@ -109,7 +109,7 @@ func TestRefreshPullsOnlyWhatIsDue(t *testing.T) {
 		"ubuntu-2404-x64": time.Now().Add(-8 * 24 * time.Hour),
 	}})
 
-	if err := cmdImagesRefresh(context.Background(), []string{"--config", cfg}); err != nil {
+	if err := cmdImagesRefresh(t.Context(), []string{"--config", cfg}); err != nil {
 		t.Fatalf("refresh: %v", err)
 	}
 	if len(*pulled) != 1 || (*pulled)[0] != "ubuntu-2404-x64" {
@@ -119,7 +119,7 @@ func TestRefreshPullsOnlyWhatIsDue(t *testing.T) {
 	cfg, pulled = refreshHarness(t, fakeDater{newest: map[string]time.Time{
 		"ubuntu-2404-x64": time.Now().Add(-1 * time.Hour),
 	}})
-	if err := cmdImagesRefresh(context.Background(), []string{"--config", cfg}); err != nil {
+	if err := cmdImagesRefresh(t.Context(), []string{"--config", cfg}); err != nil {
 		t.Fatalf("refresh: %v", err)
 	}
 	if len(*pulled) != 0 {
@@ -132,7 +132,7 @@ func TestRefreshPullsOnlyWhatIsDue(t *testing.T) {
 func TestRefreshPullsAnImageTheClusterHasNeverSeen(t *testing.T) {
 	cfg, pulled := refreshHarness(t, fakeDater{newest: map[string]time.Time{}})
 
-	if err := cmdImagesRefresh(context.Background(), []string{"--config", cfg}); err != nil {
+	if err := cmdImagesRefresh(t.Context(), []string{"--config", cfg}); err != nil {
 		t.Fatalf("refresh: %v", err)
 	}
 	if len(*pulled) != 1 {
@@ -145,7 +145,7 @@ func TestRefreshPullsAnImageTheClusterHasNeverSeen(t *testing.T) {
 func TestRefreshReportsAClusterItCouldNotAsk(t *testing.T) {
 	cfg, pulled := refreshHarness(t, fakeDater{err: errors.New("rbd: connection refused")})
 
-	err := cmdImagesRefresh(context.Background(), []string{"--config", cfg})
+	err := cmdImagesRefresh(t.Context(), []string{"--config", cfg})
 	if err == nil || len(*pulled) != 0 {
 		t.Fatalf("refresh = %v with pulls %v, want the cluster's error and no pull", err, *pulled)
 	}

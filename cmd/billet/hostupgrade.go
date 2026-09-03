@@ -1246,6 +1246,9 @@ func (h *systemdHost) PrepareImages(ctx context.Context) error {
 // runStaged runs the staged candidate, which is the binary this transaction is
 // about to install; the installed one is hidden by the time this is called.
 func (h *systemdHost) runStaged(ctx context.Context, args ...string) error {
+	// #nosec G204 -- h.staged is the path stageCandidate wrote after verifying the
+	// archive's digest against the signed manifest, and every argument is built
+	// here; nothing from a config file or the network reaches argv.
 	cmd := exec.CommandContext(ctx, h.staged, args...)
 
 	out, err := cmd.CombinedOutput()

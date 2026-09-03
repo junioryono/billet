@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -32,7 +31,10 @@ func stagedImagesFake(t *testing.T, compatibleStatus int, names []string) (strin
 	}
 
 	return staged, func() []string {
-		body, _ := os.ReadFile(record)
+		body, err := os.ReadFile(record)
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatalf("read the fake's record: %v", err)
+		}
 		var lines []string
 		for line := range strings.SplitSeq(strings.TrimSpace(string(body)), "\n") {
 			if line != "" {
@@ -71,7 +73,7 @@ func firecrackerHost(staged string) *systemdHost {
 func TestAnUpgradePullsEveryImageTheCandidateSaysNeedsAGeneration(t *testing.T) {
 	staged, recorded := stagedImagesFake(t, 2, []string{"ubuntu-2404-x64", "ubuntu-2404-arm64"})
 
-	if err := firecrackerHost(staged).PrepareImages(context.Background()); err != nil {
+	if err := firecrackerHost(staged).PrepareImages(t.Context()); err != nil {
 		t.Fatalf("PrepareImages: %v", err)
 	}
 
@@ -92,7 +94,7 @@ func TestAnUpgradePullsEveryImageTheCandidateSaysNeedsAGeneration(t *testing.T) 
 func TestAnUpgradePullsNothingWhenEveryImageIsCompatible(t *testing.T) {
 	staged, recorded := stagedImagesFake(t, 0, nil)
 
-	if err := firecrackerHost(staged).PrepareImages(context.Background()); err != nil {
+	if err := firecrackerHost(staged).PrepareImages(t.Context()); err != nil {
 		t.Fatalf("PrepareImages: %v", err)
 	}
 
@@ -109,7 +111,7 @@ func TestAnUpgradePullsNothingWhenEveryImageIsCompatible(t *testing.T) {
 func TestAnUpgradeRefusesWhenTheCandidateCannotJudgeItsImages(t *testing.T) {
 	staged, recorded := stagedImagesFake(t, 1, nil)
 
-	err := firecrackerHost(staged).PrepareImages(context.Background())
+	err := firecrackerHost(staged).PrepareImages(t.Context())
 	if err == nil || !strings.Contains(err.Error(), "could not say whether") {
 		t.Fatalf("PrepareImages = %v, want a refusal naming the unanswered question", err)
 	}
@@ -128,7 +130,7 @@ func TestAnUpgradeOnANonFirecrackerHostTouchesNoImages(t *testing.T) {
 	h.cfg.Node.Provider = config.ProviderDocker
 	h.cfg.Node.Ceph = nil
 
-	if err := h.PrepareImages(context.Background()); err != nil {
+	if err := h.PrepareImages(t.Context()); err != nil {
 		t.Fatalf("PrepareImages: %v", err)
 	}
 	if len(recorded()) != 0 {
