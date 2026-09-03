@@ -16,8 +16,8 @@ import (
 // It is a live runner registration until consumed, and `docker run -e VAR=value`
 // puts the value in this process's command line where every user on the host can
 // read it out of ps. That is a credential disclosure whose implementation looks
-// entirely correct — the same class as the App-key argv residual already
-// documented in CLAUDE.md.
+// entirely correct — the same class as the App-key argv residual the
+// billet-security skill records.
 //
 // So this records the exact argv handed to the container CLI and asserts the
 // secret is absent from it. A stub binary is used rather than real docker

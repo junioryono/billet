@@ -2,7 +2,7 @@
 
 The AWS side of a billet CodeBuild fleet: the project billet starts builds in, an optional reserved-capacity fleet, the two IAM roles, the log group, the Parameter Store path the single-use runner registration is staged under, and an optional KMS key.
 
-Consume it when you already have a billet control plane and want AWS-managed compute — Linux on demand, or Apple silicon on a reserved macOS fleet — behind an existing `runs-on` label. The design record is [ADR-007](../../../../../docs/adr-007-codebuild-provider.md); the operator's guide is [docs/codebuild.md](../../../../../docs/codebuild.md).
+Consume it when you already have a billet control plane and want AWS-managed compute — Linux on demand, or Apple silicon on a reserved macOS fleet — behind an existing `runs-on` label. The design record is [ADR-007](../../../../../docs/reference/decisions/adr-007-codebuild-provider.md); the operator's guide is [docs/deploying/aws-codebuild.md](../../../../../docs/deploying/aws-codebuild.md).
 
 ## Read this before enabling a tier
 

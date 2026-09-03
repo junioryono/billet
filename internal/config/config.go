@@ -763,7 +763,7 @@ const (
 	// webhook-only and would take over job detection, runner registration and
 	// scheduling. billet starts an ordinary NO_SOURCE project and runs GitHub's
 	// runner from its own JIT configuration, exactly as the ec2 backend does inside
-	// an instance — see docs/adr-007-codebuild-provider.md.
+	// an instance — see docs/reference/decisions/adr-007-codebuild-provider.md.
 	//
 	// It is how billet reaches AWS-MANAGED APPLE SILICON, through a reserved-capacity
 	// MAC_ARM fleet, without an operator allocating an EC2 Mac Dedicated Host. It is
@@ -2275,7 +2275,7 @@ const DefaultMacOSVMLimit = 2
 // Virtualization.framework refuses anything below it outright —
 // "LessThanMinimalResourcesError: VM should have 4294967296 bytes of memory at
 // minimum" — so a smaller tier is a config error, not a small guest. Recorded
-// against the reference Mac in docs/reference-hardware.md, the same way
+// against the reference Mac in docs/reference/reference-hardware.md, the same way
 // DefaultMacOSVMLimit is pinned to the refusal a third concurrent guest gets.
 //
 // ENFORCED HERE AND NOWHERE ELSE, and that is forced rather than chosen:
@@ -2963,7 +2963,8 @@ var keyHints = []struct{ needle, advice string }{
 			"firecracker block, because storage belongs to the site rather than to the compute " +
 			"backend. A ZFS clone exists only on the machine that took it, so a cache written to " +
 			"one belonged to that host and to no other, which is the storage half of billet " +
-			"being a one-machine product. docs/adr-003-ceph-rbd.md is how to build the cluster; " +
+			"being a one-machine product. " +
+			"docs/reference/decisions/adr-003-ceph-rbd.md is how to build the cluster; " +
 			"billet.example.yaml has the block to copy",
 	},
 }
@@ -5097,7 +5098,8 @@ func checkCodeBuildEnvironment(b CodeBuildConfig) []error {
 		return []error{fmt.Errorf("node.codebuild.environment_type %s cannot run a GitHub Actions "+
 			"job: Lambda compute offers no container privilege, so `docker build`, service "+
 			"containers and `docker compose` all fail — which is the same reason "+
-			"docs/adr-002-cloud-compute-backend.md disqualified Lambda outright",
+			"docs/reference/decisions/adr-002-cloud-compute-backend.md "+
+			"disqualified Lambda outright",
 			b.EnvironmentType)}
 
 	case strings.Contains(upper, "WINDOWS"):
@@ -5307,7 +5309,7 @@ func (c *Config) validateCodeBuildNode() []error {
 				"after %d minutes (8 hours). billet adds no deadline of its own and no drain or "+
 				"upgrade ever stops a build for taking too long, but it will not advertise a tier "+
 				"whose ceiling nobody has acknowledged. Work that can exceed either limit belongs "+
-				"on owned EC2 or Mac capacity; see docs/codebuild.md",
+				"on owned EC2 or Mac capacity; see docs/deploying/aws-codebuild.md",
 			CodeBuildBuildCeilingMinutes, CodeBuildQueuedCeilingMinutes))
 	}
 
@@ -5623,7 +5625,7 @@ func (c *Config) validateGuestOSRules(where string, t *Tier) []error {
 // validateUnpinnedMacOSTier is the one shape a macOS tier may take without a
 // node: SEVERAL backends behind one label, so that a Mac somebody owns fills
 // first and a managed fleet takes the overflow — the topology a single pin
-// cannot express, and the one docs/aws-acceptance.md measures.
+// cannot express, and the one docs/reference/records/aws-acceptance.md measures.
 //
 // The pin was never the enforcement point. Placement counts macOS guests per
 // host and refuses a host past its limit whether or not the tier named it; what
@@ -5786,7 +5788,8 @@ func (c *Config) macOSHostProvider(node string, declared bool, p NodePolicy) Pro
 // policy written as `{name: cb}` under a tier `provider: codebuild, node: cb`
 // therefore resolved to no provider, was read as a Mac somebody owns, and
 // inherited Apple's two — advertising two jobs against a one-Mac fleet, which is
-// the exact queue-and-requeue failure docs/aws-acceptance.md measures. A macOS
+// the exact queue-and-requeue failure docs/reference/records/aws-acceptance.md
+// measures. A macOS
 // tier's providers are all in macOSProviders, and a tier pinned to a node can
 // only ever be placed on a node running one of them, so a tier that accepts only
 // remote backends has said what the node is.

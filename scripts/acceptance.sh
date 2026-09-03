@@ -1,7 +1,7 @@
 #!/bin/sh
 # An isolated acceptance run, end to end.
 #
-# WHAT IT IS FOR is the procedure docs/aws-acceptance.md used to describe by hand:
+# WHAT IT IS FOR is the procedure docs/reference/records/aws-acceptance.md used to describe by hand:
 # stand a deployment up beside whatever else is on the machine, let a real GitHub
 # Actions job run on it, record what happened, and destroy exactly what it made.
 #

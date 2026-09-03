@@ -4,7 +4,7 @@
 # `terraform destroy` on this module removes the node role, the build role and the log
 # group that a RUNNING build depends on, and AWS will not stop it: DeleteProject
 # succeeds while a build is in progress and the build carries on to completion
-# (measured 2026-09-02, docs/aws-acceptance.md). GitHub does not requeue a job whose
+# (measured 2026-09-02, docs/reference/records/aws-acceptance.md). GitHub does not requeue a job whose
 # runner vanished mid-execution, so a destroy under a live build is somebody's failed
 # build. This script runs from a destroy-time provisioner BEFORE any of that is removed
 # and exits non-zero while anything in the project could still be running.

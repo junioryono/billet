@@ -13,7 +13,8 @@ import (
 //
 // A CODEBUILD CURATED IMAGE SHIPS NO ACTIONS RUNNER. CodeBuild's own runner feature
 // installs one during DOWNLOAD_SOURCE, and billet does not use that feature — see
-// docs/adr-007-codebuild-provider.md — so either the image brought one or this
+// docs/reference/decisions/adr-007-codebuild-provider.md — so either the image
+// brought one or this
 // buildspec fetches it.
 // runnerImageDir is where a CUSTOM IMAGE is expected to ship a runner, and it is
 // only ever read.
@@ -210,14 +211,15 @@ const refuseRootHome = `case "$BILLET_HOME" in *[!/]*) ;; *) ` +
 // runner. `set -e` is not relied on for it — every step is chained explicitly,
 // because a buildspec command list is run by CodeBuild rather than by a script
 // billet controls, and `!` in front of a pipeline makes `set -e` a no-op anyway
-// (the rule CLAUDE.md states for billet's own shell gates).
+// (the rule the billet-shell-gates skill states for billet's own shell gates).
 func fetchRunnerScript() []string {
 	// THE CHECKSUM CHECK HAS TWO SPELLINGS BECAUSE THE PLATFORMS DISAGREE, and the
 	// gate must not be the thing that gets skipped: a Linux image has sha256sum, a
 	// macOS build has `shasum -a 256` and no sha256sum at all. A gate that silently
-	// does nothing on one platform is the failure CLAUDE.md records for `command -v`
-	// under a privilege drop — it passed every local run and would have failed every
-	// real one. No tool at all is a refusal rather than an unverified install.
+	// does nothing on one platform is the failure the billet-shell-gates skill records
+	// for `command -v` under a privilege drop — it passed every local run and would
+	// have failed every real one. No tool at all is a refusal rather than an
+	// unverified install.
 	// PRINTF RATHER THAN ECHO, because POSIX leaves `echo`'s handling of backslashes
 	// IMPLEMENTATION-DEFINED and the two platforms this backend runs on need not agree.
 	// The line being built contains a PATHNAME, so a backslash anywhere in it could be

@@ -123,7 +123,8 @@ var errCodeBuildNeedsCeiling = fmt.Errorf(
 		"still waiting for capacity is FAILED after %d minutes (8 hours). billet adds no "+
 		"deadline of its own and no drain or upgrade ever stops a build for taking too long, "+
 		"but it will not write a tier whose ceiling nobody has acknowledged. Work that can "+
-		"exceed either limit belongs on owned EC2 or Mac capacity; see docs/codebuild.md",
+		"exceed either limit belongs on owned EC2 or Mac capacity; "+
+		"see docs/deploying/aws-codebuild.md",
 	config.CodeBuildBuildCeilingMinutes, config.CodeBuildQueuedCeilingMinutes)
 
 // normalizeCodeBuild fills in what a generation may default and refuses what it
@@ -570,7 +571,8 @@ func minutesText(minutes int) string {
 // every pinned tier's max_concurrent against that — so a fleet of four would be
 // refused at load, with a diagnostic about a licence that has nothing to do with
 // a managed fleet. Setting the limit to the fleet's own capacity is what
-// docs/codebuild.md tells an operator to do; the generation does it for them,
+// docs/deploying/aws-codebuild.md tells an operator to do; the generation does it
+// for them,
 // because it is the same number they just supplied.
 func codeBuildNodeBlocks(c *CodeBuildParams) (string, string) {
 	if c.Environment != config.CodeBuildMacARM {

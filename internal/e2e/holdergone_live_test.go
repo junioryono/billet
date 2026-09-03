@@ -20,7 +20,8 @@ import (
 // the API — a stop that never confirms, a build that ends on its own, a
 // registration that stays in Parameter Store — and three of the nine things
 // measured while writing the backend contradicted that understanding (see
-// docs/aws-acceptance.md). So the same scenario runs here over the real
+// docs/reference/records/aws-acceptance.md). So the same scenario runs here over
+// the real
 // service: the real listener, plane, wire, node loop and provider, with only
 // GitHub faked. The build ends on its own because the runner inside refuses
 // the fake GitHub's registration and the buildspec's guard fails the build.

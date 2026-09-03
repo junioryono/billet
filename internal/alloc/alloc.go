@@ -2268,7 +2268,8 @@ func (a *Allocator) RegisterNode(ctx context.Context, reg NodeRegistration) (int
 			// OVERWRITTEN ON EVERY REGISTRATION, like the release: the answer to
 			// "where does this host stage registrations" is whatever it just said.
 			// A host that moves paths leaves the old one unswept, which is said in
-			// docs/codebuild.md rather than guarded here — refusing the move would
+			// docs/deploying/aws-codebuild.md rather than guarded here — refusing the
+			// move would
 			// keep a correctly reconfigured host out of the fleet over a path nothing
 			// on it writes to any more.
 			CodebuildJitPath: jitPath,

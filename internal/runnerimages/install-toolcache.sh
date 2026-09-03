@@ -181,8 +181,9 @@ install_toolcache() {
 	#
 	# THE REAL BUILD COULD NOT HAVE CAUGHT THIS. Ubuntu 26.04 ships uutils
 	# coreutils, so the three end-to-end builds all ran against a chmod that
-	# accepts the flag. That is the same trap CLAUDE.md records for `sh` and
-	# `sleep` in the firecracker tests: green on the machine it was written on,
+	# accepts the flag. That is the same trap the billet-shell-gates skill records
+	# for `sh` and `sleep` in the firecracker tests: green on the machine it was
+	# written on,
 	# and possibly wrong on the machine it runs on.
 	# `! -type l` IS LOAD-BEARING, not tidiness. Linux has no per-symlink mode, so
 	# chmod on a link fails with EPERM even as root -- and with `-exec ... +` that

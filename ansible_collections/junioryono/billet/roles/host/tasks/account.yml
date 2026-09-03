@@ -314,7 +314,7 @@
 # binary already removed and the fence already raised.
 #
 # REFUSED AT INPUT VALIDATION INSTEAD, before anything is claimed or stopped.
-# What an operator does instead is exactly what docs/state-backends.md already
+# What an operator does instead is exactly what docs/deploying/postgres-and-active-passive.md already
 # says: upgrade a PostgreSQL controller with the service stopped. Once the binary
 # on disk matches the candidate, `billet_binary_upgrade` is false and an ordinary
 # converge does everything else this role does.
@@ -334,7 +334,7 @@
       with billet-server and billet-node STOPPED, then converge this role again —
       with the binary already in place the role does everything else, including
       the config, the units and {{ billet_server_environment_path }}. See
-      docs/state-backends.md.
+      docs/deploying/postgres-and-active-passive.md.
   when:
     - billet_configured_state_backend != 'sqlite'
     - not billet_interrupted_upgrade | bool

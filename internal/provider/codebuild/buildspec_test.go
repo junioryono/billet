@@ -341,7 +341,7 @@ func buildSharedRunner() (string, error) {
 // harness substitutes a STAND-IN runner, and a stand-in has no root guard. What is
 // asserted here is that billet EMITS the variable, in the phase that runs the command,
 // which is the half billet owns. The other half belongs to a binary billet does not own
-// and is pinned by the acceptance run in docs/aws-acceptance.md.
+// and is pinned by the acceptance run in docs/reference/records/aws-acceptance.md.
 func TestTheBuildspecAllowsTheRunnerToRunAsRoot(t *testing.T) {
 	for name, env := range map[string]config.CodeBuildEnvironment{
 		"linux container": config.CodeBuildLinuxContainer,
@@ -1163,8 +1163,8 @@ func TestAVerifiedTarballWithNoRunnerFailsTheBuild(t *testing.T) {
 // fetch test runs on a machine that has one, so deleting its `exit 1` changed no test.
 // The branch exists because the two platforms disagree — a Linux image has `sha256sum`,
 // a macOS build has `shasum -a 256` and no `sha256sum` at all — and a gate that silently
-// does nothing on one platform is the failure CLAUDE.md records for `command -v` under a
-// privilege drop.
+// does nothing on one platform is the failure the billet-shell-gates skill records for
+// `command -v` under a privilege drop.
 //
 // THE PATH IS CLOSED for this one, which is the only way to ask the question: the
 // stand-in directory is the WHOLE PATH, so neither tool can be found.

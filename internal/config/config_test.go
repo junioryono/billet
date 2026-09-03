@@ -379,7 +379,7 @@ func TestMalformedTrailingYAMLIsNotEndOfInput(t *testing.T) {
 		// Comments are not content: a file ending in an explanation the operator
 		// left themselves still ends.
 		"a comment-only tail": {
-			body: validConfig + "\n# why max_vcpu is 120: see docs/reference-hardware.md\n",
+			body: validConfig + "\n# why max_vcpu is 120: see docs/reference/reference-hardware.md\n",
 		},
 		// An EMPTY second document is still a second document, and it is the one
 		// a truncated edit most plausibly leaves behind.

@@ -2,7 +2,7 @@
 
 One Linux machine running both billet roles, provisioned by the `junioryono.billet.host` role instead of by hand. Docker is the backend because its only prerequisite is Docker; Firecracker needs `/dev/kvm`, a guest kernel you build, a Ceph cluster and two bridges before a job can run.
 
-If you would rather do it by hand once to see the moving parts, [docs/first-deployment.md](../../../../../docs/first-deployment.md) is the same deployment without Ansible. Read it first if anything below is surprising — it explains the GitHub-side steps in more detail, and they are the ones people get wrong.
+If you would rather do it by hand once to see the moving parts, [docs/getting-started/index.md](../../../../../docs/getting-started/index.md) is the same deployment without Ansible. Read it first if anything below is surprising — it explains the GitHub-side steps in more detail, and they are the ones people get wrong.
 
 ## What was actually walked
 
@@ -67,4 +67,4 @@ Point a workflow at the tier's label (`billet status` lists them) and dispatch i
 
 **The converge fails at "Prove committed services are stably active".** The services were installed and started but did not stay up. `journalctl -u billet-server` on the host says why; a 401 from GitHub means the App key and the installation do not match.
 
-**The job queues forever.** That is billet's characteristic failure — the runner-group and workflow-allowlist checks in [docs/first-deployment.md](../../../../../docs/first-deployment.md) are the list to work through.
+**The job queues forever.** That is billet's characteristic failure — the runner-group and workflow-allowlist checks in [docs/getting-started/index.md](../../../../../docs/getting-started/index.md) are the list to work through.

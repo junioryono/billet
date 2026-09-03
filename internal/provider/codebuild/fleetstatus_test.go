@@ -187,7 +187,8 @@ func TestAContextThatRepeatsTheStatusCodeIsNotACapacityWarning(t *testing.T) {
 
 // A DECLARED macOS LIMIT ABOVE THE FLEET'S CAPACITY IS REFUSED.
 //
-// MEASURED 2026-09-02, docs/aws-acceptance.md: base capacity 1, macos_vm_limit 2,
+// MEASURED 2026-09-02, docs/reference/records/aws-acceptance.md: base capacity 1,
+// macos_vm_limit 2,
 // two concurrent jobs through one runs-on. billet did what the config asked —
 // escrowed both, started two builds — and the second sat QUEUED behind the busy
 // Mac while GitHub withdrew and requeued its assignment. MAC_ARM offers no

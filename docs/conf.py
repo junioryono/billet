@@ -51,11 +51,12 @@ templates_path = ['_templates']
 # List of patterns, relative to source directory, that match files and
 # directories to ignore when looking for source files.
 #
-# The Markdown files at the top of docs/ are the operator guides and ADRs that
-# the code and CLAUDE.md link to by path; they are not Sphinx sources. Sphinx
-# content lives in subdirectories, and `*.md` does not cross a directory
-# boundary, so only the top-level files are excluded.
-exclude_patterns = ['_build', '_venv', 'Thumbs.db', '.DS_Store', '*.md']
+# Every Markdown file under docs/ is a Sphinx source and must be reachable from a
+# toctree in index.rst; the build runs with -W, so a page left out of the toctree
+# fails it rather than publishing silently. The decisions and records under
+# docs/reference/ are also cited by path from Go comments, billet.example.yaml,
+# and the terraform and ansible trees, so moving one means updating those.
+exclude_patterns = ['_build', '_venv', 'Thumbs.db', '.DS_Store']
 
 # -- Options for HTML output -------------------------------------------------
 
@@ -96,6 +97,10 @@ myst_enable_extensions = [
     "deflist",
     "tasklist",
 ]
+
+# Generate an anchor for every heading down to level 3, so a page can link to a
+# section on itself or another page with an ordinary `#slug` fragment.
+myst_heading_anchors = 3
 
 # Copy button configuration
 copybutton_prompt_text = r"$ |>>> |\.\.\. "

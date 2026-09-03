@@ -309,7 +309,7 @@ var errTartAnsible = errors.New(
 		"and installs systemd units under /etc/billet — and a tart node is an Apple-silicon " +
 		"Mac. A Mac is converged by `billet init --profile local-service` and `billet local " +
 		"up`, which manage the launch agents billet ships; see the reference Mac in " +
-		"docs/reference-hardware.md")
+		"docs/reference/reference-hardware.md")
 
 // printTartNext is the host preparation a generated tart config names and billet
 // cannot do, printed in the shape the firecracker and ec2 preambles use.

@@ -8,7 +8,8 @@ import (
 )
 
 // referenceHostMemory is what DetectHostCapacity actually reported on the
-// reference host — the nominally-512GiB machine in docs/reference-hardware.md.
+// reference host — the nominally-512GiB machine in
+// docs/reference/reference-hardware.md.
 // The awkward figure is the point: real memory is never a round number, and the
 // rounding exists because of what this value renders as without it.
 const referenceHostMemory = 523505880 * config.KiB

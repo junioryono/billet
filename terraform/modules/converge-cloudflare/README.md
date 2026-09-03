@@ -2,7 +2,7 @@
 
 Reach Billet hosts from CI through a Cloudflare Tunnel, so a converge needs no inbound port.
 
-**This is optional.** Billet needs no inbound connectivity to run jobs — nodes always dial outbound to the control plane. This module is about *configuration management*. See [Reaching your hosts to converge them](../../../docs/deployment-guide.md#reaching-your-hosts-to-converge-them) for the alternatives.
+**This is optional.** Billet needs no inbound connectivity to run jobs — nodes always dial outbound to the control plane. This module is about *configuration management*. See [Reaching your hosts to converge them](../../../docs/deploying/choose-a-shape.md#reaching-your-hosts-to-converge-them) for the alternatives.
 
 ## Why this over Systems Manager
 
