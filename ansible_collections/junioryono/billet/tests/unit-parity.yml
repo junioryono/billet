@@ -73,6 +73,12 @@
         role_server_ledger: "{{ lookup('ansible.builtin.template', billet_role_templates + '/billet-server.service.j2',
           template_vars={'billet_systemd_notify_ready': true, 'billet_ledger_volume_id': 'vol-0123456789abcdef0',
           'billet_ledger_mount_unit_name': 'var-lib-billet-server.mount'}) }}"
+        # A NODE BESIDE A POSTGRESQL CONTROLLER, which imports the server's
+        # environment so a dispatched updater inherits the connection string.
+        role_node_with_environment: "{{ lookup('ansible.builtin.template', billet_role_templates + '/billet-node.service.j2',
+          template_vars={'billet_systemd_notify_ready': true, 'billet_firecracker_enabled': false,
+          'billet_server_environment': {'BILLET_STATE_DSN': 'postgres://x'},
+          'billet_server_environment_path': '/etc/billet/server.env'}) }}"
         # A FIRECRACKER NODE, whose guest bridges are a real dependency.
         role_node_firecracker: "{{ lookup('ansible.builtin.template', billet_role_templates + '/billet-node.service.j2',
           template_vars={'billet_systemd_notify_ready': true, 'billet_firecracker_enabled': true}) }}"
@@ -90,6 +96,20 @@
           billet-upgrade.timer: "{{ lookup('ansible.builtin.template', billet_role_templates + '/billet-upgrade.timer.j2') }}"
           billet-images-refresh.service: "{{ lookup('ansible.builtin.template', billet_role_templates + '/billet-images-refresh.service.j2') }}"
           billet-images-refresh.timer: "{{ lookup('ansible.builtin.template', billet_role_templates + '/billet-images-refresh.timer.j2') }}"
+
+    # THE NODE IMPORTS THE SERVER'S ENVIRONMENT EXACTLY WHEN ONE IS SET. A
+    # dispatched updater inherits the node's environment, and on a PostgreSQL
+    # controller that is the only way it can open the ledger; a node beside a
+    # SQLite controller imports nothing, because there is nothing to import.
+    - name: The node unit imports the server environment when one is configured
+      ansible.builtin.assert:
+        that:
+          - role_node_with_environment is search('(?m)^EnvironmentFile=-/etc/billet/server.env$')
+          - not (role_node_steady is search('(?m)^EnvironmentFile='))
+        fail_msg: >-
+          billet-node.service.j2 must import {{ '{{' }} billet_server_environment_path {{ '}}' }}
+          exactly when billet_server_environment is set, or a dispatched updater
+          on a PostgreSQL controller has no connection string.
 
     # The comparison is per directive and LIST-valued, because several of these
     # legitimately appear more than once (a Firecracker node has two After=

@@ -60,6 +60,42 @@ func openStateStandby(ctx context.Context, cfg *config.Config) (*state.DB, error
 		state.WithRunningRelease(version.Version()))
 }
 
+// openStateForDecision opens the ledger for the one read that must not be
+// refused by the release watermark: the host's own instruction.
+//
+// NAMES NO RELEASE, ON PURPOSE, AND THIS IS THE ONLY OPEN THAT MAY. Every other
+// open in this file names the running binary so a proved older one is refused;
+// this one exists because `host-upgrade --from-rollout` on a standby is that
+// older binary, reading what it should become from a ledger whose leader has
+// already recorded the newer release. It is an operator handle otherwise: it
+// verifies the schema is one this binary knows, verifies the deployment
+// identity, and the caller reads and closes. The structural test on this file
+// exempts it by name.
+func openStateForDecision(ctx context.Context, cfg *config.Config) (*state.DB, error) {
+	dsn, err := ledgerDSN(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	var db *state.DB
+
+	if cfg.Server.LedgerBackend() == config.StatePostgres {
+		db, err = state.OpenPostgresAdmin(ctx, cfg.Server.IdentityDir, dsn)
+	} else {
+		db, err = state.OpenAdmin(ctx, cfg.Server.IdentityDir)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	if err := verifyLedgerIdentity(ctx, cfg, db); err != nil {
+		return nil, errors.Join(err, db.Close())
+	}
+
+	return db, nil
+}
+
 // openStateAdmin opens the ledger for a ONE-SHOT OPERATOR COMMAND: it proceeds
 // without the directory lock when a control plane holds it, and then verifies
 // the schema rather than migrating it. See state.OpenAdmin.

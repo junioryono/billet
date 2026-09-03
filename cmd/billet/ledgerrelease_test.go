@@ -32,9 +32,43 @@ func TestEveryLedgerOpenNamesTheRunningRelease(t *testing.T) {
 
 	var opens int
 
+	// THE ONE EXEMPTION, BY NAME: the instruction reader. A standby's timer is an
+	// older binary reading what it should become, and the watermark the newer
+	// leader recorded would refuse it. Its opens are asserted the other way
+	// round below: they must NOT name a release.
+	var exempt *ast.FuncDecl
+
+	for _, decl := range file.Decls {
+		if fn, ok := decl.(*ast.FuncDecl); ok && fn.Name.Name == "openStateForDecision" {
+			exempt = fn
+		}
+	}
+
+	if exempt == nil {
+		t.Fatal("ledger.go has no openStateForDecision; the timer's instruction read moved")
+	}
+
 	ast.Inspect(file, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
 		if !ok {
+			return true
+		}
+
+		if call.Pos() >= exempt.Pos() && call.End() <= exempt.End() {
+			if pkg, name, ok := selector(call.Fun); ok && pkg == "state" && len(name) >= 4 &&
+				name[:4] == "Open" {
+				for _, arg := range call.Args {
+					if inner, ok := arg.(*ast.CallExpr); ok {
+						if p, fn, ok := selector(inner.Fun); ok && p == "state" &&
+							fn == "WithRunningRelease" {
+							t.Errorf("%s: openStateForDecision names the running release, so a "+
+								"standby behind its leader cannot read its own instruction",
+								fset.Position(call.Pos()))
+						}
+					}
+				}
+			}
+
 			return true
 		}
 

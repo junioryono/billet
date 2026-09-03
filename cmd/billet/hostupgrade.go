@@ -246,25 +246,25 @@ func rolloutInstruction(ctx context.Context, cfg *config.Config) (hostUpgradeTar
 		fromRollout:    true,
 	}
 
-	// A COMPLETED ROLLOUT IS TAKEN ONCE. The decision mark records which fleet
-	// decision this host has acted on, and acting includes having been found on
-	// the target; a completed rollout at or below that mark is one this host
-	// already took, or one it was deliberately moved past — an operator's
+	// A COMPLETED ROLLOUT IS TAKEN ONCE. The settled mark records which fleet
+	// decision this host carried out — a transaction that committed, or a host
+	// found already on the target — and a completed rollout at or below it is one
+	// this host took, or one it was deliberately moved past: an operator's
 	// `host-upgrade --version ... --allow-downgrade` on one host, a manual
-	// upgrade after a completed downgrade — and a timer that followed it again
-	// would undo a person's decision every five minutes. Only a host that has
-	// not acted on it, a standby whose timer fired after the rollout closed,
-	// takes it. An open rollout is fenced one step later by checkDecision, which
-	// admits an equal generation so a rolled-back host can be told again.
+	// upgrade after a completed downgrade. A timer that followed it again would
+	// undo a person's decision every five minutes. A host that attempted it and
+	// rolled back never settled on it and is asked again, which is what
+	// rolled_back means everywhere else in a rollout. An open rollout is fenced
+	// one step later by checkDecision on the other mark.
 	if current.State == rollout.StateCompleted {
-		acted, err := readDecision()
+		settled, err := readSettled()
 		if err != nil {
 			return hostUpgradeTarget{}, false, err
 		}
 
-		if current.Generation <= acted {
-			fmt.Printf("Rollout %s (decision %d) completed and this host has acted on decision "+
-				"%d; nothing to do.\n", current.ID, current.Generation, acted)
+		if current.Generation <= settled {
+			fmt.Printf("Rollout %s (decision %d) completed and this host settled on decision "+
+				"%d; nothing to do.\n", current.ID, current.Generation, settled)
 
 			return hostUpgradeTarget{}, false, nil
 		}
@@ -276,23 +276,9 @@ func rolloutInstruction(ctx context.Context, cfg *config.Config) (hostUpgradeTar
 	// Only a POSITIVE disagreement reinstalls; a host with no record is on it.
 	if current.TargetVersion == version.Version() {
 		if !installedDisagrees(current.TargetDigest) {
-			// AND DOING NOTHING IS STILL ACTING ON THE DECISION, for the reason
-			// actOnResolved's own no-op gives: a host found on decision 10's target
-			// that never raised its mark would let a delayed decision 9 pass the
-			// fence and downgrade it.
-			if err := checkAndRecordDecision(target); err != nil {
-				if errors.Is(err, ErrSuperseded) {
-					fmt.Printf("This host already runs %s and has acted on a later decision than "+
-						"rollout %s's; nothing to do.\n", current.TargetVersion, current.ID)
-
-					return hostUpgradeTarget{}, false, nil
-				}
-
+			if err := settleOnTarget(current, target); err != nil {
 				return hostUpgradeTarget{}, false, err
 			}
-
-			fmt.Printf("This host already runs %s, rollout %s's target; nothing to do.\n",
-				current.TargetVersion, current.ID)
 
 			return hostUpgradeTarget{}, false, nil
 		}
@@ -333,10 +319,70 @@ func rolloutInstruction(ctx context.Context, cfg *config.Config) (hostUpgradeTar
 	return target, true, nil
 }
 
+// settleOnTarget records that a host found on the decision's target has acted
+// on it, under the host transaction lock.
+//
+// DOING NOTHING IS STILL ACTING ON THE DECISION, for the reason actOnResolved's
+// own no-op gives: a host found on decision 10's target that never raised its
+// mark would let a delayed decision 9 pass the fence and downgrade it. And it
+// settles on the decision, so a completed rollout is not followed again after an
+// operator moves this host by hand.
+//
+// UNDER THE TRANSACTION LOCK, because the binary this process is running may be
+// a candidate another updater installed a moment ago and has yet to prove: a
+// host that is a node in the rollout as well has a dispatched updater of its
+// own, and blessing its candidate from outside its transaction would settle on a
+// decision that transaction may still roll back. A held lock is nothing to do
+// now, said out loud, and the timer asks again.
+func settleOnTarget(current *rollout.Rollout, target hostUpgradeTarget) error {
+	tx, err := takeTxLock()
+	if err != nil {
+		if errors.Is(err, ErrUpgradeInProgress) {
+			fmt.Printf("This host runs %s, rollout %s's target, but an upgrade transaction holds "+
+				"it; nothing to decide until that finishes.\n", current.TargetVersion, current.ID)
+
+			return nil
+		}
+
+		return err
+	}
+
+	defer tx.release()
+
+	if err := checkAndRecordDecision(target); err != nil {
+		if errors.Is(err, ErrSuperseded) {
+			fmt.Printf("This host already runs %s and has acted on a later decision than "+
+				"rollout %s's; nothing to do.\n", current.TargetVersion, current.ID)
+
+			return nil
+		}
+
+		return err
+	}
+
+	if err := recordSettled(target.generation); err != nil {
+		return err
+	}
+
+	fmt.Printf("This host already runs %s, rollout %s's target; nothing to do.\n",
+		current.TargetVersion, current.ID)
+
+	return nil
+}
+
 // readFleetDecision is the open rollout, or the newest finished one, and
 // whether there is either.
+//
+// THROUGH A HANDLE THAT NAMES NO RELEASE, DELIBERATELY. The host this runs on
+// may be the standby the decision exists to move: the leader claimed on the
+// newer release and recorded the watermark, and an open that named this older
+// binary would be refused by it — exactly the refusal that is right everywhere
+// else and wrong for the one read whose point is to learn what to become. The
+// handle still verifies the schema is one this binary knows (an older binary
+// never reads a newer schema, so a standby whose leader migrated first is
+// upgraded by hand) and the deployment identity, and it writes nothing.
 func readFleetDecision(ctx context.Context, cfg *config.Config) (*rollout.Rollout, bool, error) {
-	db, err := openStateAdmin(ctx, cfg)
+	db, err := openStateForDecision(ctx, cfg)
 	if err != nil {
 		return nil, false, fmt.Errorf("server state: %w", err)
 	}
@@ -1347,10 +1393,17 @@ type ledgerHost struct {
 	// external marks a ledger this host does not hold — PostgreSQL — where the
 	// migrate step is skipped and the lowering has to happen at the probe.
 	external bool
+	// generation is the fleet decision this transaction serves, settled on when
+	// the commit is recorded, or zero for an operator's own run.
+	generation int64
 }
 
 func newLedgerHost(cfg *config.Config, cfgPath string, journal *hostupgrade.Journal) ledgerHost {
 	h := ledgerHost{cfg: cfg, cfgPath: cfgPath, external: ledgerKindFor(cfg) != ""}
+
+	if journal != nil {
+		h.generation = journal.Generation
+	}
 
 	// THE PERMISSION ALONE MOVES NOTHING; ONLY A PROVED DOWNGRADE LOWERS THE MARK.
 	// `--allow-downgrade` on an upgrade is harmless to every other check, and
@@ -1635,9 +1688,16 @@ func (h *ledgerHost) RecordInstalled(_ context.Context, digest, release string) 
 		return err
 	}
 
-	return provenance.Write(provenance.Record{
+	if err := provenance.Write(provenance.Record{
 		Version: release, ManifestDigest: digest, BinarySHA256: sum,
-	})
+	}); err != nil {
+		return err
+	}
+
+	// THE DECISION IS SETTLED HERE, after the commit and beside the record of
+	// what was installed: this is the one point a transaction is known to have
+	// carried its decision out, and a rollback never reaches it.
+	return recordSettled(h.generation)
 }
 
 // Migrate opens the ledger with the candidate as its only writer.

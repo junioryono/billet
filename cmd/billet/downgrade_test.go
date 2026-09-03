@@ -7,6 +7,7 @@ import (
 	"go/ast"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/junioryono/billet/internal/config"
@@ -211,6 +212,13 @@ func TestTheLoweringPicksTheHandleTheLedgerAllows(t *testing.T) {
 	var opened []string
 
 	prevMaintenance, prevAdmin := lowerThroughMaintenance, lowerThroughAdmin
+
+	// THE BINDINGS THEMSELVES, before they are replaced: a test that only
+	// replaced them would pass with the two swapped in production.
+	if reflect.ValueOf(prevAdmin).Pointer() != reflect.ValueOf(openStateAdmin).Pointer() ||
+		reflect.ValueOf(prevMaintenance).Pointer() != reflect.ValueOf(openStateMaintenance).Pointer() {
+		t.Fatal("the lowering's openers are not openStateAdmin and openStateMaintenance")
+	}
 	t.Cleanup(func() { lowerThroughMaintenance, lowerThroughAdmin = prevMaintenance, prevAdmin })
 
 	refuse := errors.New("recorded")
