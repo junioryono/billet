@@ -1,0 +1,11 @@
+[Unit]
+Description=Check billet's Ceph storage health hourly
+
+[Timer]
+OnBootSec=5m
+OnUnitActiveSec=1h
+RandomizedDelaySec=5m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

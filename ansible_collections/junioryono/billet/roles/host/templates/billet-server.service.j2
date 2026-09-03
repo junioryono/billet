@@ -1,0 +1,110 @@
+[Unit]
+Description=billet control plane
+Documentation=https://github.com/junioryono/billet
+After=network-online.target
+Wants=network-online.target
+{% if billet_ledger_volume_id | default('') | length > 0 %}
+# The ledger lives on a dedicated volume. Without these dependencies, a failed
+# mount would let StateDirectory= (and billet itself) create a fresh ledger,
+# deployment identity and CA on the root disk — a silent fork of the
+# deployment. In the role-managed unit rather than a drop-in, because the
+# upgrade transaction refuses drop-ins it cannot replace and recover.
+#
+# BOTH directives, because they fail differently: Requires= on the EXACT mount
+# unit fails the start even when that unit is absent (RequiresMountsFor alone
+# is satisfied by the root filesystem when no mount unit exists for the path),
+# and RequiresMountsFor= orders the start after every mount the path needs.
+# billet_ledger_mount_unit_name is set by the role before any unit render; a
+# missing value fails the render rather than emitting a unit with no fence.
+Requires={{ billet_ledger_mount_unit_name }}
+After={{ billet_ledger_mount_unit_name }}
+RequiresMountsFor={{ billet_candidate_server_state_dir }}
+{% endif %}
+{% if billet_server_prepare_only | default(false) %}
+
+# HELD: this host is prepared to be the control plane but is NOT commissioned.
+# The ledger volume is mounted and proved and carries no DEPLOYMENT IDENTITY or
+# CA, so starting the server here would mint them — which is indistinguishable
+# from a genuinely new deployment and cannot be detected afterwards. (The
+# directory is not empty: the role's own `billet check` preflight opens the
+# ledger and leaves billet.db and its schema. It does not mint an identity, and
+# the identity is the thing that must be absent.)
+#
+# ASSERT rather than CONDITION deliberately: a failed condition SKIPS the unit
+# and reports the start job as successful, which is the wrong signal for a
+# deliberate hold. A failed assertion fails the job and logs why.
+#
+# Disabling the unit is what stops the boot path; this is what stops a manual
+# `systemctl start` and anything that pulls the server in as a dependency.
+# IN THE UNIT rather than a drop-in for the same reason the mount fence above
+# is: the upgrade transaction refuses drop-ins it cannot replace and recover,
+# and only this file is staged, backed up, committed and rolled back with the
+# transaction.
+#
+# Release it by converging with billet_server_prepare_only: false.
+# ASSERT THAT `/` DOES NOT EXIST. `!` negates, and the root directory exists on
+# every running system, so this is false by an immutable property rather than by
+# a path nobody happens to have created. The first version asserted a
+# /nonexistent/... path, which is conventional, not uncreatable: anything that
+# created it would silently commission the host.
+AssertPathExists=!/
+{% endif %}
+
+{% set billet_notify_ready = billet_systemd_notify_ready | default(false) %}
+[Service]
+Type={{ 'notify' if billet_notify_ready else 'exec' }}
+{% if billet_notify_ready %}
+NotifyAccess=main
+{% endif %}
+User={{ billet_service_user }}
+Group={{ billet_service_group }}
+UMask=0077
+{% if billet_server_environment | default({}) | length > 0 %}
+# THE CONTROL PLANE'S ENVIRONMENT, and what it is for is the PostgreSQL ledger:
+# `server.state.postgres.dsn_env` names an environment VARIABLE rather than
+# carrying a connection string, because a DSN holds a password and a secret in
+# billet.yaml ends up in a backup. The file is 0640 root:{{ billet_service_group }},
+# which this unit can read and nothing else on the host can.
+#
+# THE DIRECTIVE IS IN THE UNIT RATHER THAN A DROP-IN, for the same reason the
+# mount fence above is: the transactional host upgrade REFUSES effective drop-ins
+# it cannot replace and recover, so a DSN delivered that way would break every
+# later upgrade of this host.
+#
+# THE FILE ITSELF IS NOT PART OF THAT TRANSACTION, deliberately. It is operator
+# content — a credential, not something a new billet binary changes — so it
+# follows the App private key rather than billet.yaml and this unit: nothing
+# about a binary upgrade replaces it, so there is nothing for a rollback to put
+# back.
+#
+# WITH THE LEADING `-`, so a host whose file has not been written yet starts
+# rather than failing with nothing saying why. billet's own refusal — an empty
+# data source — is the better diagnostic, and it names the variable.
+EnvironmentFile=-{{ billet_server_environment_path }}
+{% endif %}
+ExecStart=/usr/bin/billet server --config /etc/billet/billet.yaml{{ ' --upgrade-probe' if billet_systemd_upgrade_probe | default(false) else '' }}
+TimeoutStartSec=120
+TimeoutStopSec=88200
+KillSignal=SIGTERM
+KillMode=mixed
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+ReadOnlyPaths=/etc/billet
+ReadWritePaths="{{ billet_candidate_server_state_dir }}"
+
+[Install]
+WantedBy=multi-user.target

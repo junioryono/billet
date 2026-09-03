@@ -1,0 +1,107 @@
+---
+- name: Validate the host role syntax
+  hosts: all
+  gather_facts: true
+  roles:
+    - role: junioryono.billet.host
+      billet_binary_src: /tmp/billet
+      billet_github_private_key_src: /tmp/app-private-key.pem
+      billet_config:
+        server:
+          listen: 127.0.0.1:7717
+          state_dir: /var/lib/billet/server
+          max_vcpu: 2
+          max_memory: 2GiB
+        github:
+          org: example
+          app_id: 1
+          installation_id: 2
+          private_key_path: /etc/billet/app-private-key.pem
+        node:
+          name: example
+          server_addr: 127.0.0.1:7717
+          provider: firecracker
+          state_dir: /var/lib/billet/node
+          lock_dir: /run/billet/locks
+          firecracker:
+            kernel_image: /var/lib/billet/kernels/vmlinux
+            bridge: billet0
+            untrusted_bridge: billet1
+          ceph:
+            image_pool: billet-images
+            cache_pool: billet-cache
+        tiers:
+          - label: billet-2vcpu-ubuntu-2404
+            provider: firecracker
+            vcpu: 2
+            memory: 2GiB
+            disk: 20GiB
+            image: ubuntu-2404-x64@verified
+    - role: junioryono.billet.development_host
+      billet_development_proxy_config_src: ""
+      billet_development_tls_sans:
+        - localhost
+        - 127.0.0.1
+        - "::1"
+
+- name: Validate the host role syntax for an ec2 node
+  hosts: all
+  gather_facts: true
+  roles:
+    - role: junioryono.billet.host
+      billet_binary_src: /tmp/billet
+      billet_github_private_key_src: /tmp/app-private-key.pem
+      billet_firecracker_enabled: false
+      billet_ceph_enabled: false
+      billet_cache_tls_cert_src: /tmp/cache-cert.pem
+      billet_cache_tls_key_src: /tmp/cache-key.pem
+      billet_config:
+        server:
+          listen: 127.0.0.1:7717
+          state_dir: /var/lib/billet/server
+          max_vcpu: 16
+          max_memory: 32GiB
+        github:
+          org: example
+          app_id: 1
+          installation_id: 2
+          private_key_path: /etc/billet/app-private-key.pem
+        node:
+          name: cloud
+          server_addr: 127.0.0.1:7717
+          provider: ec2
+          state_dir: /var/lib/billet/node
+          site: aws
+          max_vcpu: 16
+          max_memory: 32GiB
+          ec2:
+            region: us-west-2
+            subnet_id: subnet-0abc
+            security_group_ids:
+              - sg-0abc
+            untrusted_security_group_ids:
+              - sg-fork
+            instance_types:
+              - type: c7i.2xlarge
+                vcpu: 8
+                memory: 16GiB
+                price_usd_per_hour: 0.357
+          ebs_s3:
+            region: us-west-2
+            availability_zone: us-west-2a
+            bucket: billet-cache-example
+          cache:
+            listen: 10.0.0.10:9443
+            guest_endpoint: https://10.0.0.10:9443
+            tls_cert: /etc/billet/cache-tls/cert.pem
+            tls_key: /etc/billet/cache-tls/key.pem
+        sites:
+          - name: aws
+            store: ebs-s3
+        tiers:
+          - label: billet-ec2-8vcpu
+            provider: ec2
+            vcpu: 8
+            memory: 16GiB
+            image: ami-REPLACE-run-billet-ami-build
+            trust: untrusted

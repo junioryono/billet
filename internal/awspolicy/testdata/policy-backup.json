@@ -1,0 +1,50 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "BilletBackupObjects",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject"
+      ],
+      "Resource": [
+        "arn:aws:s3:::billet-backups-example/billet-backups/*"
+      ]
+    },
+    {
+      "Sid": "BilletBackupList",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::billet-backups-example"
+      ],
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "billet-backups/*"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "BilletBackupKMSUse",
+      "Effect": "Allow",
+      "Action": [
+        "kms:DescribeKey",
+        "kms:GenerateDataKey",
+        "kms:Decrypt"
+      ],
+      "Resource": [
+        "arn:aws:kms:us-west-2:123456789012:key/1234abcd-12ab-34cd-56ef-1234567890ab"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": "s3.us-west-2.amazonaws.com"
+        }
+      }
+    }
+  ]
+}

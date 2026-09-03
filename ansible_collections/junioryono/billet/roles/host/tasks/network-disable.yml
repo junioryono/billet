@@ -1,0 +1,52 @@
+---
+# A non-firecracker node must not have the guest network. For a FRESH ec2 or docker
+# host there is nothing to do — it never had one — and this file is a clean no-op.
+#
+# CONVERTING A LIVE FIRECRACKER HOST to ec2 is a different, dangerous thing, and
+# this role REFUSES to do it implicitly. The teardown would be destructive
+# (draining compute, deleting bridges and the guest firewall) and would run BEFORE
+# the transactional upgrade in services.yml records service state — so a converge
+# that then failed could roll back to a host whose network was gone and whose
+# firecracker node was left stopped, with the ledger believing it was never
+# running. Rather than thread a destructive teardown through that transaction, the
+# conversion is made a deliberate operator decommission: drain the firecracker
+# compute, remove the guest network, then converge as an ec2 node on a clean host.
+#
+# Billet's OWN /etc/billet/network/*.conf files are the ownership token — that
+# directory is billet's, unlike the shared /etc/systemd/network where an operator's
+# own 80-billet0.netdev could collide with a default bridge name.
+
+- name: Inspect billet guest-network state that must not exist on this provider
+  ansible.builtin.find:
+    paths: /etc/billet/network
+    patterns: "*.conf"
+    file_type: file
+  register: billet_disable_conf_files
+  become: true
+
+- name: Record the billet guest networks present on this host
+  ansible.builtin.set_fact:
+    billet_disable_network_names: >-
+      {{
+        billet_disable_conf_files.files | map(attribute='path') | map('basename') |
+        map('regex_replace', '[.]conf$', '') | list
+      }}
+  when: billet_disable_conf_files.files | length > 0
+
+- name: Refuse an implicit firecracker-to-non-firecracker conversion
+  ansible.builtin.fail:
+    msg: >-
+      This host still carries a billet guest network ({{ billet_disable_network_names | join(', ') }})
+      but is now configured as {{ ('a ' + billet_config.node.provider + ' node')
+      if billet_config.node is defined else 'a control plane with no node' }}, which
+      has no guest network. Billet will not tear that down implicitly: it is a
+      destructive change that must not race the transactional upgrade. Convert
+      deliberately instead — drain and decommission the firecracker compute on this
+      host, then for EACH network above (call it NAME) stop and disable
+      billet-dnsmasq@NAME.service, delete the NAME bridge (ip link delete NAME) and
+      /etc/systemd/network/80-NAME.netdev and 81-NAME.network; stop and disable
+      billet-network.service and delete the billet_guard and billet_nat nftables
+      tables; then remove /etc/billet/network and /etc/sysctl.d/99-billet-node.conf,
+      and converge this role as a {{ billet_config.node.provider }} node on the
+      clean host.
+  when: billet_disable_conf_files.files | length > 0

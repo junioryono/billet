@@ -1,0 +1,64 @@
+# Build output. These are root-anchored on purpose: an unanchored `billet`
+# pattern also matches the cmd/billet package directory and silently drops the
+# whole program from the repository.
+/bin/
+/dist/
+/billet
+/billet-agent
+
+# Local state and secrets — never commit these.
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.lock
+/.billet/
+billet.yaml
+# ...except the one the package ships. This rule is for an operator's own
+# config, and it silently swallowed deploy/billet.yaml — so the package built
+# locally and could not have built from a clean checkout at all.
+!deploy/billet.yaml
+*.pem
+*.key
+*.crt
+!testdata/**/*.pem
+!testdata/**/*.key
+!testdata/**/*.crt
+
+# `billet ca issue <node>` writes here when --out is not given, which is the
+# right default for an operator standing in their home directory and the wrong
+# one for anything run inside the repo. *.key already kept the private half out;
+# the certificates were not covered, and two of them were committed by a test
+# run before this line existed.
+*-billet-tls/
+
+# Guest images and rootfs artifacts (large, rebuildable)
+/images/**/out/
+*.ext4
+*.img
+*.qcow2
+vmlinux*
+
+# Go
+*.test
+*.out
+/vendor/
+
+# Python helpers used by contributor and acceptance tooling.
+__pycache__/
+*.py[cod]
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+.playwright-mcp/
+
+# Terraform local state (never committed)
+*.tfstate
+*.tfstate.*
+.terraform/
+
+# Terraform-generated Lambda archive (rebuilt from source by archive_file)
+terraform/modules/billet/modules/fleet-ec2/lambda/*.zip
+.claude/worktrees/

@@ -1,0 +1,76 @@
+---
+# THE BLOCK `billet init --emit ansible` PRINTS MUST BE ONE THIS ROLE ACCEPTS.
+#
+# It shipped once as one that did not. The role provisions a Firecracker host by
+# default and ASSERTS its provisioning flags match node.provider before it
+# touches anything; `billet init` defaults to docker. So the default emission was
+# a valid billet_config that the role it names refused, before rendering
+# anything — paste it, converge, and stop at an input assertion with an empty
+# host. Nothing caught it, because the Go tests proved the block was a correct
+# CONFIG and the Ansible tests fed the role a config written by hand.
+#
+# This is the seam between them: a block this repository's own binary generated,
+# put through this repository's own role. Check mode, and the binary is a no-op,
+# so what actually runs is the role's input validation — which is the thing that
+# refused.
+- name: Converge a generated block
+  hosts: all
+  become: true
+  pre_tasks:
+    # A vars file that failed to load leaves billet_config undefined, and the
+    # role would then skip every node-shaped assertion and pass for the one
+    # reason this test must never pass for.
+    - name: Prove the generated block actually reached this play
+      ansible.builtin.assert:
+        that:
+          - billet_config is defined
+          - billet_config.server is defined
+          - billet_config.node is defined
+          - billet_config.tiers | default([]) | length > 0
+        fail_msg: >-
+          The emitted block did not reach the role. This test proves the role
+          ACCEPTS a generated config; an absent config would satisfy it silently.
+
+    # And that it is the shape whose refusal this exists to catch: a docker node
+    # with the role's Firecracker defaults left alone is exactly what failed.
+    - name: Prove the block is the provider whose refusal this catches
+      ansible.builtin.assert:
+        that:
+          - billet_config.node.provider == 'docker'
+          - not billet_firecracker_enabled
+          - not billet_ceph_enabled
+        fail_msg: >-
+          Expected a docker emission carrying billet_firecracker_enabled and
+          billet_ceph_enabled false. Without those the role refuses the block,
+          which is the defect this test exists for.
+  roles:
+    # Services stay disabled because the question here is whether the role
+    # accepts the CONFIG, not whether a control plane can reach GitHub. The key
+    # is still supplied: the emitted block names a private_key_path, and the
+    # role requires the key wherever the config names one — `billet check` reads
+    # it on every host, whichever services are enabled.
+    - role: junioryono.billet.host
+      billet_binary_src: "{{ billet_emitted_block_binary_src }}"
+      billet_github_private_key_src: "{{ billet_emitted_block_key_src }}"
+      billet_enable_server: false
+      billet_enable_node: false
+  post_tasks:
+    # THE GUARD ON WHY THE KEY IS GATED ON THE CONFIG. This play disables both
+    # services, so a role that decides the key install from billet_enable_server
+    # SKIPS it here — and every other assertion in this file still passes, which
+    # is how that shipped. `billet check` reads github.private_key_path on every
+    # host whichever services run, so the install must happen anyway, and a
+    # skipped registration is the observable difference between the two rules.
+    - name: Prove the App key install is decided by the config, not the services
+      ansible.builtin.assert:
+        that:
+          - billet_github_key_required | bool
+          - billet_github_key_managed | bool
+          - billet_private_key_install is defined
+          - billet_private_key_install.skipped | default(false) | bool == false
+          - billet_private_key_install.changed | bool
+        fail_msg: >-
+          The GitHub App key install did not run with both services disabled.
+          The emitted block names github.private_key_path, so the key belongs on
+          this host regardless of billet_enable_server — gate the install on the
+          config, not on which units are started.

@@ -1,0 +1,79 @@
+# One backup of this deployment.
+#
+# NOT ENABLED BY THE PACKAGE, and neither is its timer. Installing billet does
+# not start copying a deployment's credentials anywhere; that is the
+# administrator's decision, made after billet.yaml names somewhere to put them.
+#
+#   systemctl enable --now billet-backup.timer
+#
+# NOT MANAGED BY `billet local up`/`down`/`status` either, and that is deliberate
+# rather than an omission. Those commands own the two services that hold a
+# deployment's compute and its ledger, and their whole safety content is the
+# ORDER they act in — a third unit in that plan would have to be modelled in
+# every refusal, fake and test for no benefit, because a backup is a oneshot with
+# nothing to drain. What replaces the reporting is `billet check`, which names
+# the newest archive in the bucket and how old it is: a timer that stopped firing
+# looks exactly like one that is working, and that is the failure worth catching.
+[Unit]
+Description=billet deployment backup
+Documentation=https://github.com/junioryono/billet/blob/main/docs/restore-rehearsal.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+
+# THE SAME ACCOUNT THE CONTROL PLANE RUNS AS, because that is who can read the
+# ledger, the deployment identity and the node-wire authority. The App key is
+# owned by this account too (0600), which is what `billet local up` and a restore
+# both make true.
+User=billet
+Group=billet
+UMask=0077
+
+# The archive is a directory of 0600 files inside a 0700 directory, and it holds
+# TWO private keys. StateDirectory= creates this owned by the service account
+# with the mode below and nothing else on the machine can read it.
+StateDirectory=billet/backups
+StateDirectoryMode=0700
+
+# EACH RUN WRITES A NEW DIRECTORY, because `billet local backup` refuses a
+# destination that is not empty — a backup is one whole unit and billet will not
+# mix one into a directory that already holds something. %H is the hostname and
+# the date makes the name unique; an operator wanting a different scheme edits
+# this line.
+ExecStart=/usr/bin/sh -c '/usr/bin/billet local backup --config /etc/billet/billet.yaml --out /var/lib/billet/backups/$(date -u +%%Y-%%m-%%dT%%H-%%M-%%SZ)'
+
+# LOCAL COPIES ARE NOT PRUNED BY BILLET. Nothing here deletes an archive: every
+# one holds a copy of the GitHub App private key GitHub issues exactly once, and
+# a service unit that removes credentials on a timer is not something to add
+# quietly. Prune /var/lib/billet/backups deliberately, or point backup.s3 at a
+# bucket with a lifecycle rule and keep few locally.
+
+# A backup reads the ledger through the operator handle, which does not need the
+# state directory's exclusive lock, so this runs against a LIVE control plane. It
+# does hold SQLite's single writer slot for the length of the snapshot, and it
+# takes the same authority lock `billet ca rotate` does — so a rotation running
+# at the same moment makes this exit non-zero rather than capture half of one.
+TimeoutStartSec=1800
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+
+# The ledger and the authority, which the archive is made of.
+ReadWritePaths=/var/lib/billet/server
+
+# The config and the App key, read-only.
+ReadOnlyPaths=/etc/billet

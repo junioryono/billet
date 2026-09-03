@@ -1,0 +1,161 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+
+	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/state"
+)
+
+// THE ONE PLACE THAT TURNS A CONFIG INTO AN OPEN LEDGER.
+//
+// Every command that reaches the control-plane store comes through here, so the
+// question "which backend is this deployment on" is answered once. Written as
+// eighteen call sites each choosing for themselves, the failure is a command
+// that opens SQLite against a deployment whose ledger is in PostgreSQL — which
+// on a fresh directory does not fail: it CREATES one, migrates it, and reports
+// an empty fleet.
+
+// openState opens the ledger as the CONTROL PLANE, taking the exclusive
+// directory lock and migrating.
+func openState(ctx context.Context, cfg *config.Config) (*state.DB, error) {
+	dsn, err := ledgerDSN(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	if cfg.Server.LedgerBackend() == config.StatePostgres {
+		return state.OpenPostgres(ctx, cfg.Server.IdentityDir, dsn)
+	}
+
+	return state.Open(ctx, cfg.Server.IdentityDir)
+}
+
+// openStateStandby opens the ledger for a control plane that is WAITING to
+// become this deployment's controller.
+//
+// POSTGRESQL ONLY, and the refusal lives in config rather than here: a SQLite
+// ledger is a file a second machine cannot open, so there is nothing to elect
+// over. This is the shape of that refusal one layer down — there is no SQLite
+// branch to fall through to.
+func openStateStandby(ctx context.Context, cfg *config.Config) (*state.DB, error) {
+	dsn, err := ledgerDSN(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	if cfg.Server.LedgerBackend() != config.StatePostgres {
+		return nil, fmt.Errorf(
+			"server.controllers is %s but this deployment's ledger is %s; config validation "+
+				"should have refused that pairing",
+			config.ControllersActivePassive, cfg.Server.LedgerBackend())
+	}
+
+	return state.OpenPostgresStandby(ctx, cfg.Server.IdentityDir, dsn)
+}
+
+// openStateAdmin opens the ledger for a ONE-SHOT OPERATOR COMMAND: it proceeds
+// without the directory lock when a control plane holds it, and then verifies
+// the schema rather than migrating it. See state.OpenAdmin.
+func openStateAdmin(ctx context.Context, cfg *config.Config) (*state.DB, error) {
+	dsn, err := ledgerDSN(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	var db *state.DB
+
+	if cfg.Server.LedgerBackend() == config.StatePostgres {
+		db, err = state.OpenPostgresAdmin(ctx, cfg.Server.IdentityDir, dsn)
+	} else {
+		db, err = state.OpenAdmin(ctx, cfg.Server.IdentityDir)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	// AND IT IS THIS DEPLOYMENT'S LEDGER, ASKED ONCE FOR EVERY OPERATOR COMMAND.
+	//
+	// A command binds nothing — it is not the authority for what these rows are —
+	// but pointing one at another deployment's ledger is exactly as wrong as
+	// pointing a control plane at them, and one wrong DSN reaches it. `billet ca
+	// issue` would record an admission in a fleet it has never met.
+	//
+	// PEEKED RATHER THAN READ, because state.DeploymentID MINTS one when the
+	// directory has none: a status command that created an identity as a side
+	// effect of looking would be the thing that makes the next start read a
+	// deployment as day one.
+	if err := verifyLedgerIdentity(ctx, cfg, db); err != nil {
+		return nil, errors.Join(err, db.Close())
+	}
+
+	return db, nil
+}
+
+// verifyLedgerIdentity refuses a ledger that says it belongs to somebody else.
+//
+// AN ABSENT IDENTITY IS NOT A MISMATCH. A host being prepared has no identity
+// file yet — `billet check` is documented as the way to create one — and a
+// ledger migrated before the binding existed carries no binding either. Both are
+// ordinary and both answer yes; what is refused is two answers that disagree.
+func verifyLedgerIdentity(ctx context.Context, cfg *config.Config, db *state.DB) error {
+	deployment, ok, err := state.PeekDeploymentID(cfg.Server.IdentityDir)
+	if err != nil || !ok {
+		return err
+	}
+
+	return db.VerifyDeploymentBinding(ctx, deployment)
+}
+
+// openStateMaintenance opens the ledger for the quiescent upgrade probe, which
+// crosses a host-upgrade fence without admitting operator or workload writes.
+func openStateMaintenance(ctx context.Context, cfg *config.Config) (*state.DB, error) {
+	if cfg.Server.LedgerBackend() == config.StatePostgres {
+		// THE FENCE IS A FILE IN THE IDENTITY DIRECTORY, so it applies here too —
+		// what does not yet apply is the rest of the transactional host upgrade,
+		// which stops a service, snapshots a ledger and puts it back. None of
+		// that is written for an external ledger, and a probe that crossed the
+		// fence as though it were would be the one thing standing between a
+		// half-finished upgrade and a live deployment.
+		return nil, fmt.Errorf(
+			"the transactional host upgrade is not implemented for a %s ledger; it snapshots "+
+				"and restores the state directory, and an external ledger is your database's "+
+				"own backup. Upgrade this controller with the service stopped",
+			config.StatePostgres)
+	}
+
+	return state.OpenMaintenance(ctx, cfg.Server.IdentityDir)
+}
+
+// ledgerDSN reads the connection string out of the environment.
+//
+// FROM THE ENVIRONMENT, NEVER FROM THE FILE, and the config only names the
+// variable — a DSN carries a password, and a secret written into YAML ends up in
+// a backup, a paste buffer and eventually a support thread. The same rule the
+// GitHub App private key follows.
+//
+// AN EMPTY VALUE IS REFUSED HERE rather than passed on, so the diagnostic names
+// the variable an operator has to set instead of arriving several layers down as
+// a connection failure.
+func ledgerDSN(cfg *config.Config) (string, error) {
+	if cfg.Server == nil || cfg.Server.LedgerBackend() != config.StatePostgres {
+		return "", nil
+	}
+
+	name := cfg.Server.LedgerDSNEnv()
+
+	dsn := os.Getenv(name)
+	if dsn == "" {
+		return "", fmt.Errorf(
+			"server.state.postgres.dsn_env names %s and that variable is empty, so billet has "+
+				"no connection string. Export it in the service's environment — it is read "+
+				"from there rather than from the config file because it carries a password",
+			name)
+	}
+
+	return dsn, nil
+}

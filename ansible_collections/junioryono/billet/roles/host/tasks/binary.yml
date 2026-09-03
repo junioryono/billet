@@ -1,0 +1,233 @@
+---
+# Fetch a PINNED billet release onto the target, for an operator who would
+# rather name a version than stage a binary and hand it over.
+#
+# THE TRUST MODEL IS WEAKER THAN FIRECRACKER'S, one file over, and the
+# difference is the whole reason this comment exists. Those hashes are pinned in
+# THIS COLLECTION, so a tampered release fails here. billet's own checksums.txt
+# comes from the same origin as the archive it describes, so verifying against
+# it proves the download is complete and uncorrupted and says NOTHING about
+# whether the release host is honest. A collection that ships independently of
+# billet's releases cannot pin their hashes; billet_binary_src remains the way
+# to install an artefact you verified yourself.
+#
+# It also changes the DEPLOYMENT SHAPE. A host given billet_binary_src needs no
+# outbound access at all — the binary arrives over the SSH connection Ansible
+# already has, which is what makes an air-gapped or egress-filtered node
+# possible. Fetching here makes the release origin a requirement of
+# provisioning. billet_release_url_base points that at an internal mirror.
+
+# A CHANNEL IS RESOLVED ONCE, HERE, AND EVERYTHING BELOW SEES A PINNED VERSION.
+#
+# The refusal that follows is unchanged and still applies — to the RESOLVED value.
+# An operator who set a channel has opted into a non-deterministic converge
+# knowingly; what they have not opted into is the rest of this file guessing, so
+# the channel stops existing at this line.
+#
+# THE STATEMENT'S SIGNATURE IS NOT CHECKED HERE, and saying so is the point. This
+# is Ansible reading a pointer to work out which archive to fetch; the integrity
+# check for what it then installs is checksums.txt, exactly as it is for a pinned
+# version, with exactly the same limits the comment at the top of this file
+# describes. `billet host-upgrade` is the path that verifies a signature, because
+# by then there is a billet on the host to do it with.
+- name: Resolve the release channel
+  when:
+    - billet_release_channel | length > 0
+    - billet_version | length == 0
+  block:
+    - name: Read the signed channel statement
+      ansible.builtin.uri:
+        url: "{{ billet_release_channel_base }}/{{ billet_release_channel }}.json"
+        return_content: true
+      register: billet_channel_statement
+      delegate_to: localhost
+      become: false
+
+    - name: Take the release the channel names
+      ansible.builtin.set_fact:
+        billet_version: "{{ billet_channel_statement.json.tag }}"
+
+    - name: Report which release the channel resolved to
+      ansible.builtin.debug:
+        msg: >-
+          The {{ billet_release_channel }} channel names {{ billet_version }};
+          this converge installs that. Pin billet_version to make the same
+          playbook install the same binary on a later day.
+
+- name: Refuse an unpinned billet version
+  ansible.builtin.assert:
+    that:
+      - billet_version | lower not in ['latest', 'main', 'head']
+    fail_msg: >-
+      billet_version must name one release, not {{ billet_version }}. A moving
+      target makes a converge non-deterministic: the same playbook installs
+      different binaries on different days, and does it through the drain and
+      restart of a real upgrade transaction. Server and node cannot negotiate
+      across versions either, so a fleet has to pin one and move it
+      deliberately.
+
+- name: Resolve the release architecture
+  ansible.builtin.set_fact:
+    # .get rather than an index: an architecture billet does not publish must
+    # reach the refusal below, not raise an undefined-key error in its place.
+    billet_release_arch: >-
+      {{ {'x86_64': 'amd64', 'aarch64': 'arm64'}.get(ansible_facts['architecture'], '') }}
+
+- name: Refuse an architecture billet does not publish
+  ansible.builtin.assert:
+    that:
+      - billet_release_arch | length > 0
+    fail_msg: >-
+      billet publishes linux amd64 and arm64; this host reports
+      {{ ansible_facts['architecture'] }}. Build the binary yourself and pass it
+      as billet_binary_src.
+
+- name: Name the release artefacts
+  ansible.builtin.set_fact:
+    # goreleaser's archive name drops the tag's leading v, while the release
+    # itself keeps it. Both spellings appear in one URL.
+    billet_release_archive: >-
+      billet_{{ billet_version | regex_replace('^v', '') }}_linux_{{ billet_release_arch }}.tar.gz
+    billet_release_base: "{{ billet_release_url_base }}/{{ billet_version }}"
+    billet_release_candidate: "{{ billet_release_stage }}/billet-{{ billet_version }}"
+
+- name: Inspect the release candidate already staged for this version
+  ansible.builtin.stat:
+    path: "{{ billet_release_candidate }}"
+  register: billet_release_candidate_stat
+  check_mode: false
+  become: true
+
+- name: Refuse a staged candidate that root did not put there
+  ansible.builtin.assert:
+    that:
+      - billet_release_candidate_stat.stat.pw_name == 'root'
+      - not billet_release_candidate_stat.stat.wgrp
+      - not billet_release_candidate_stat.stat.woth
+      - billet_release_candidate_stat.stat.isreg
+      - not billet_release_candidate_stat.stat.islnk
+    fail_msg: >-
+      {{ billet_release_candidate }} is reused as {{ billet_version }} without
+      re-verifying it, so it must be a regular file owned by root and writable by
+      nobody else. It is owned by
+      {{ billet_release_candidate_stat.stat.pw_name | default('?') }}. Remove it
+      and converge again to refetch from {{ billet_release_base }}.
+  when: billet_release_candidate_stat.stat.exists
+
+- name: Inspect the release staging directory before creating it
+  ansible.builtin.stat:
+    path: "{{ billet_release_stage }}"
+    follow: false
+  register: billet_release_stage_stat
+  check_mode: false
+  become: true
+
+# account.yml creates this directory too, and runs AFTER this file — so on a
+# fresh host it does not exist yet and cannot be relied on here.
+- name: Refuse a release staging path that is not a directory
+  ansible.builtin.assert:
+    that:
+      - not billet_release_stage_stat.stat.exists or
+        (billet_release_stage_stat.stat.isdir and not billet_release_stage_stat.stat.islnk)
+    fail_msg: >-
+      {{ billet_release_stage }} exists and is not a real directory. billet
+      stages a downloaded release there as root; following a symlink out of it
+      would write wherever the link points.
+
+- name: Create the release staging directory
+  ansible.builtin.file:
+    path: "{{ billet_release_stage }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+  become: true
+
+# VERIFIED BEFORE IT IS UNPACKED. get_url is given the checksums file rather
+# than a literal, and matches this archive's line in it by name; a mismatch
+# leaves nothing behind to unpack.
+- name: Create a private working directory for this run
+  ansible.builtin.tempfile:
+    state: directory
+    prefix: billet-release-
+    suffix: .d
+  register: billet_release_workdir
+  become: true
+  when:
+    - not billet_release_candidate_stat.stat.exists
+    - not ansible_check_mode
+
+- name: Name this run's private working directory
+  ansible.builtin.set_fact:
+    billet_release_unpack: "{{ billet_release_workdir.path | default('') }}"
+  when:
+    - not billet_release_candidate_stat.stat.exists
+    - not ansible_check_mode
+
+- name: Download the pinned billet release
+  ansible.builtin.get_url:
+    url: "{{ billet_release_base }}/{{ billet_release_archive }}"
+    dest: "{{ billet_release_unpack }}/{{ billet_release_archive }}"
+    checksum: "sha256:{{ billet_release_base }}/checksums.txt"
+    owner: root
+    group: root
+    mode: "0600"
+  become: true
+  when:
+    - not billet_release_candidate_stat.stat.exists
+    - not ansible_check_mode
+
+- name: Unpack only the billet binary from the release
+  ansible.builtin.unarchive:
+    src: "{{ billet_release_unpack }}/{{ billet_release_archive }}"
+    dest: "{{ billet_release_unpack }}"
+    remote_src: true
+    include: [billet]
+    owner: root
+    group: root
+  become: true
+  when:
+    - not billet_release_candidate_stat.stat.exists
+    - not ansible_check_mode
+
+- name: Publish the unpacked binary under the version it came from
+  ansible.builtin.copy:
+    src: "{{ billet_release_unpack }}/billet"
+    dest: "{{ billet_release_candidate }}"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0755"
+  become: true
+  when:
+    - not billet_release_candidate_stat.stat.exists
+    - not ansible_check_mode
+
+# What account.yml inspects, journals and installs. The transaction is unchanged
+# by where the candidate came from; only the side it lives on moves.
+- name: Remove this run's working directory once the candidate is published
+  ansible.builtin.file:
+    path: "{{ billet_release_unpack }}"
+    state: absent
+  become: true
+  when:
+    - not billet_release_candidate_stat.stat.exists
+    - not ansible_check_mode
+    - billet_release_unpack | default('') | length > 0
+
+- name: Report that a dry run does not fetch
+  ansible.builtin.debug:
+    msg: >-
+      This is a check run, so nothing was fetched and the binary decision
+      cannot be made. A real converge would download
+      would-fetch={{ billet_release_base }}/{{ billet_release_archive }}
+      and verify it against that release's checksums.txt.
+  when:
+    - ansible_check_mode
+    - not billet_release_candidate_stat.stat.exists
+
+- name: Point the upgrade transaction at the fetched candidate
+  ansible.builtin.set_fact:
+    billet_candidate_path: "{{ billet_release_candidate }}"
+    billet_candidate_on_target: >-
+      {{ billet_release_candidate_stat.stat.exists or not ansible_check_mode }}

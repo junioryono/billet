@@ -1,0 +1,288 @@
+---
+# THE FAIL-CLOSED LEDGER MOUNT. The terraform module attaches a dedicated EBS
+# volume for the SQLite ledger; this mounts it at server.state_dir so a failed
+# mount STOPS billet-server rather than letting it start on the root disk. The
+# packaged unit's StateDirectory= and billet itself both create a missing state
+# directory, so without the mount dependency a missing volume silently forks the
+# deployment: a fresh ledger, deployment identity and CA on the root disk.
+#
+# The rules, in order: the expected volume must be attached; adopting an
+# unmounted state dir requires billet-server STOPPED (a live server could write
+# a ledger between the emptiness check and the mount) and the directory EMPTY
+# (an existing root-disk ledger is never shadowed — that needs a deliberate
+# migration); the volume is formatted only when it carries NO signature at all
+# (wipefs, not just a filesystem probe — a partition table reports no TYPE);
+# the mount names the volume's own stable by-id device — never a filesystem
+# UUID a snapshot-clone would duplicate — and after mounting, the state
+# directory's backing device is proved to be the expected volume.
+#
+# billet_ledger_mount_unit_name is computed in main.yml, before the server unit
+# (which names it in Requires=) is ever rendered.
+
+- name: Validate the ledger volume request
+  ansible.builtin.assert:
+    that:
+      - billet_ledger_volume_id is match('^vol-[0-9a-f]{8,17}$')
+      - billet_enable_server
+    fail_msg: >-
+      billet_ledger_volume_id must be an EBS volume id (vol-...), and the ledger
+      volume belongs on the control-plane host: it backs server.state_dir, so
+      billet_enable_server must be true here.
+
+- name: Resolve the ledger volume's stable device path
+  ansible.builtin.set_fact:
+    billet_ledger_device_path: >-
+      {{
+        billet_ledger_device
+        if billet_ledger_device | length > 0
+        else '/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_'
+          ~ (billet_ledger_volume_id | replace('-', ''))
+      }}
+
+- name: Require the ledger volume on this host
+  ansible.builtin.stat:
+    path: "{{ billet_ledger_device_path }}"
+  register: billet_ledger_device_stat
+  check_mode: false
+  become: true
+
+- name: Refuse a host without the ledger volume
+  ansible.builtin.assert:
+    that:
+      - billet_ledger_device_stat.stat.exists
+    fail_msg: >-
+      The ledger volume {{ billet_ledger_volume_id }} is not attached at
+      {{ billet_ledger_device_path }}. Attach it (terraform-aws-billet does this
+      at /dev/sdf), or on a non-Nitro instance name the device explicitly with
+      billet_ledger_device. Refusing to continue: without the volume the server
+      would start on the root disk with a fresh ledger.
+
+- name: Resolve the ledger device's real path
+  ansible.builtin.command:
+    argv: [readlink, -f, "{{ billet_ledger_device_path }}"]
+  register: billet_ledger_device_real
+  changed_when: false
+  check_mode: false
+  become: true
+
+- name: Inspect what currently serves the server state directory
+  ansible.builtin.command:
+    argv: [findmnt, -no, SOURCE, --mountpoint, "{{ billet_candidate_server_state_dir }}"]
+  register: billet_ledger_current_source
+  # rc 1 is the documented "not a mountpoint"; anything else is a real failure
+  # that must not be read as "not mounted" and fall into the adoption path.
+  failed_when: billet_ledger_current_source.rc not in [0, 1]
+  changed_when: false
+  check_mode: false
+  become: true
+
+- name: Resolve the current mount's real device
+  ansible.builtin.command:
+    argv: [readlink, -f, "{{ billet_ledger_current_source.stdout | trim }}"]
+  register: billet_ledger_current_real
+  changed_when: false
+  check_mode: false
+  become: true
+  when: billet_ledger_current_source.rc == 0
+
+- name: Refuse a state directory mounted from an unexpected device
+  ansible.builtin.assert:
+    that:
+      - billet_ledger_current_real.stdout | trim == billet_ledger_device_real.stdout | trim
+    fail_msg: >-
+      {{ billet_candidate_server_state_dir }} is mounted from
+      {{ billet_ledger_current_source.stdout | trim }}, which is not the
+      configured ledger volume {{ billet_ledger_volume_id }}
+      ({{ billet_ledger_device_path }}). Refusing to touch it: two candidate
+      ledgers means a human must decide which one is authoritative.
+  when: billet_ledger_current_source.rc == 0
+
+# ADOPTION DURING A BINARY UPGRADE IS REFUSED: the upgrade transaction stages
+# candidate units but leaves the OLD, unfenced server unit installed until it
+# commits, so a crash mid-transaction would reboot into a server with no mount
+# dependency. Adopt with an ordinary converge first; the fence is then in the
+# installed unit before any upgrade runs. A FRESH INSTALL is exempt — with no
+# billet-server unit installed there is no unfenced unit a crash could reboot
+# into, and a fresh host has no "ordinary converge without a new binary" to
+# run first, so refusing would deadlock the module-output-to-role flow the
+# deployment guide documents. The exemption is exactly a PROVEN not-found
+# unit: a masked, linked or errored LoadState still represents installed unit
+# policy (a runtime mask vanishes on reboot, revealing the unfenced unit), so
+# anything else fails closed.
+- name: Refuse to adopt the ledger volume inside a binary upgrade
+  ansible.builtin.assert:
+    that:
+      - >-
+        not (billet_binary_upgrade | default(false)) or
+        (
+          (billet_installed_server_unit_load_state.rc | default(1)) == 0 and
+          (billet_installed_server_unit_load_state.stdout | default('') | trim) == 'not-found'
+        )
+    fail_msg: >-
+      {{ billet_candidate_server_state_dir }} is not yet the ledger mount, and
+      this run is a binary upgrade with a billet-server unit already
+      installed. Adopting the volume mid-transaction leaves that pre-upgrade
+      unit without its mount fence if the transaction is interrupted. Run an
+      ordinary converge (no new binary) to adopt the ledger volume first, then
+      upgrade.
+  when: billet_ledger_current_source.rc != 0
+
+# ADOPTION (the state dir is not yet the ledger mount) demands a stopped server:
+# a live pre-ledger server could mint a ledger between the emptiness check below
+# and the mount, and the mount would then shadow it.
+- name: Inspect billet-server before adopting an unmounted state directory
+  ansible.builtin.command:
+    argv: [systemctl, is-active, billet-server.service]
+  register: billet_ledger_server_active
+  failed_when: false
+  changed_when: false
+  check_mode: false
+  become: true
+  when: billet_ledger_current_source.rc != 0
+
+- name: Inspect billet-server's main process before adoption
+  ansible.builtin.command:
+    argv: [systemctl, show, --property=MainPID, --value, billet-server.service]
+  register: billet_ledger_server_mainpid
+  changed_when: false
+  check_mode: false
+  become: true
+  when: billet_ledger_current_source.rc != 0
+
+- name: Refuse to adopt the ledger volume under a running server
+  ansible.builtin.assert:
+    that:
+      # The STATE STRING, not the exit code (is-active rc semantics vary), AND a
+      # zero MainPID: a deactivating server still holds the SQLite files and can
+      # write between the emptiness check and the mount.
+      - billet_ledger_server_active.stdout | trim in ['inactive', 'failed', 'unknown']
+      - billet_ledger_server_mainpid.stdout | trim in ['', '0']
+    fail_msg: >-
+      billet-server.service is {{ billet_ledger_server_active.stdout | trim }}
+      (main pid {{ billet_ledger_server_mainpid.stdout | trim }}) but
+      {{ billet_candidate_server_state_dir }} is not yet the ledger mount.
+      Mounting under a live or still-terminating server would shadow whatever
+      it writes. Stop billet-server and wait for it to exit, then re-run.
+  when: billet_ledger_current_source.rc != 0
+
+- name: List root-disk content under the state directory
+  ansible.builtin.find:
+    paths: "{{ billet_candidate_server_state_dir }}"
+    hidden: true
+    file_type: any
+  register: billet_ledger_rootdisk_content
+  check_mode: false
+  become: true
+  when: billet_ledger_current_source.rc != 0
+
+- name: Refuse to shadow an existing ledger on the root disk
+  ansible.builtin.assert:
+    that:
+      - billet_ledger_rootdisk_content.matched == 0
+    fail_msg: >-
+      {{ billet_candidate_server_state_dir }} already holds
+      {{ billet_ledger_rootdisk_content.matched }} file(s) on the ROOT DISK and
+      is not mounted from the ledger volume. Mounting over it would hide the
+      existing ledger, deployment identity and CA while they keep existing
+      underneath — a fork waiting for the next reboot. Stop billet-server, copy
+      the state directory's contents onto the ledger volume yourself, move the
+      originals aside, and re-run.
+  when: billet_ledger_current_source.rc != 0
+
+# MEASURED: a partitioned device answers `blkid -s TYPE` empty with rc=0 —
+# indistinguishable from blank by the filesystem probe alone — so BLANK is
+# decided by wipefs, which reports EVERY signature (filesystems, partition
+# tables, raid members, LUKS). Only a device wipefs finds nothing on is blank.
+- name: Inspect the ledger volume for any signature
+  ansible.builtin.command:
+    argv: [wipefs, --no-act, --noheadings, --output, TYPE, "{{ billet_ledger_device_real.stdout | trim }}"]
+  register: billet_ledger_signatures
+  changed_when: false
+  check_mode: false
+  become: true
+
+- name: Refuse a ledger volume carrying a foreign signature
+  ansible.builtin.assert:
+    that:
+      # Blank, or EXACTLY one ext4 signature — a device carrying ext4 PLUS a
+      # stale raid/partition signature is refused too, not mounted around.
+      - billet_ledger_signatures.stdout | trim | length == 0 or
+        billet_ledger_signatures.stdout_lines | map('trim') | reject('equalto', '') | list == ['ext4']
+    fail_msg: >-
+      The device for {{ billet_ledger_volume_id }} carries signatures other than
+      a single ext4 filesystem ({{ billet_ledger_signatures.stdout_lines | join(' | ') }}).
+      The ledger volume is used whole, as one ext4 filesystem; anything else
+      here is almost certainly the wrong volume, and formatting it would
+      destroy whatever it holds. Wipe it deliberately if it is genuinely
+      disposable, then re-run.
+
+- name: Create the ledger filesystem on a blank volume
+  ansible.builtin.command:
+    argv: [mkfs.ext4, -L, billet-ledger, "{{ billet_ledger_device_real.stdout | trim }}"]
+  when:
+    - billet_ledger_signatures.stdout | trim | length == 0
+    - not ansible_check_mode
+  become: true
+
+# THE MOUNT NAMES THE VOLUME, NOT ITS FILESYSTEM UUID. The by-id link encodes
+# the EBS volume id and is recreated by udev at every boot, so it always means
+# THIS volume — where a filesystem UUID is copied by a snapshot-clone, and a
+# clone attached later could win the by-uuid link at some future boot and put
+# the ledger on the wrong disk with every unit dependency satisfied.
+- name: Install the ledger mount unit
+  ansible.builtin.template:
+    src: billet-ledger.mount.j2
+    dest: "/etc/systemd/system/{{ billet_ledger_mount_unit_name }}"
+    owner: root
+    group: root
+    mode: "0644"
+  register: billet_ledger_mount_installed
+  become: true
+
+- name: Enable and start the ledger mount
+  ansible.builtin.systemd_service:
+    name: "{{ billet_ledger_mount_unit_name }}"
+    enabled: true
+    state: started
+    daemon_reload: "{{ billet_ledger_mount_installed is changed }}"
+  become: true
+
+- name: Prove the state directory is served by the expected volume
+  ansible.builtin.command:
+    argv: [findmnt, -no, SOURCE, --mountpoint, "{{ billet_candidate_server_state_dir }}"]
+  register: billet_ledger_mounted_source
+  changed_when: false
+  check_mode: false
+  become: true
+  when: not ansible_check_mode
+
+- name: Resolve the mounted device's real path
+  ansible.builtin.command:
+    argv: [readlink, -f, "{{ billet_ledger_mounted_source.stdout | trim }}"]
+  register: billet_ledger_mounted_real
+  changed_when: false
+  check_mode: false
+  become: true
+  when: not ansible_check_mode
+
+- name: Refuse a mount that is not the expected volume
+  ansible.builtin.assert:
+    that:
+      - billet_ledger_mounted_real.stdout | trim == billet_ledger_device_real.stdout | trim
+    fail_msg: >-
+      After mounting, {{ billet_candidate_server_state_dir }} is served by
+      {{ billet_ledger_mounted_source.stdout | trim }}, not the configured
+      ledger volume {{ billet_ledger_volume_id }}. The host's device naming
+      does not match; refusing to continue rather than run against the wrong
+      disk.
+  when: not ansible_check_mode
+
+- name: Re-apply state directory ownership on the mounted filesystem
+  ansible.builtin.file:
+    path: "{{ billet_candidate_server_state_dir }}"
+    state: directory
+    owner: "{{ billet_service_user }}"
+    group: "{{ billet_service_group }}"
+    mode: "0700"
+  become: true
+  when: not ansible_check_mode

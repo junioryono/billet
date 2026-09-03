@@ -1,0 +1,27 @@
+-- migration 36: pending_completion_lease_index
+--
+-- disruptionGuard correlates on pending_completions.lease_id, and the table is
+-- keyed on (tier, request_id) — so without this every disruption write scans it
+-- once per candidate lease, inside the single writer, on the node-expiry path
+-- that can consider every lease on a host at once. Failed acknowledgements leave
+-- rows behind, so the table is not tightly bounded either.
+--
+-- APPENDED RATHER THAN FOLDED INTO 35, which is new on the same branch and not
+-- released. "Nobody has run it yet" is the argument that erodes the checksum
+-- guard, and it is not even true here: anyone who ran this branch mid-way has 35
+-- applied, and editing it would refuse to open their database.
+--
+-- NOT PARTIAL, and that was measured rather than reasoned about. A
+-- `WHERE lease_id != ''` index reads like the tighter choice and SQLite
+-- will not use it here: it only takes a partial index when the query's
+-- own WHERE syntactically implies the index's, and `p.lease_id =
+-- leases.id` does not imply `lease_id != ''`. EXPLAIN QUERY PLAN said
+-- `SCAN p` — the index would have been decoration answering a cost
+-- finding that was still open.
+--
+-- Everything between the markers below is PUBLISHED BYTES; the prose is not.
+-- Reformat one tab and every ledger that applied this migration refuses to open.
+
+-- +billet:statement
+CREATE INDEX pending_completions_lease_idx ON pending_completions(lease_id)
+-- +billet:end

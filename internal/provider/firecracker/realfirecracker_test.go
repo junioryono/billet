@@ -1,0 +1,562 @@
+package firecracker
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/deploymentid"
+	"github.com/junioryono/billet/internal/provider"
+)
+
+// selftestDeployment is the identity the real-host tests own their jails under.
+//
+// A MINTED SHAPE, because New validates it: the owner is written into every jail's
+// marker and read back through the same grammar, so an owner this package cannot
+// parse is one List would fail on. It was "billet-selftest" — fifteen characters,
+// refused by New — from the moment that grammar was shared until now, and nothing
+// noticed, because every machine that would have said so skips before reaching the
+// call. TestTheRealHostIdentityIsOneNewWillAccept is what does not skip.
+const selftestDeployment = "5e1f7e575e1f7e575e1f7e575e1f7e57"
+
+// AND THAT CONSTANT IS CHECKED WHERE THE REAL TESTS CANNOT BE.
+//
+// Everything below this needs root, /dev/kvm, a bridge and a ceph pool, so on every
+// machine CI and `make check` run on it skips — which makes a fixture constant that
+// the production constructor refuses invisible for as long as nobody runs the
+// reference host.
+//
+// SO IT CALLS New, rather than re-stating the grammar New applies. Nothing about the
+// identity check needs hardware: a stub binary and a short chroot base are enough to
+// reach it, and asking the constructor itself is what makes the answer about the
+// constructor rather than about a rule this test believes it uses.
+func TestTheRealHostIdentityIsOneNewWillAccept(t *testing.T) {
+	t.Parallel()
+
+	// Sanity first, so a failure below names the identity rather than the fixture.
+	if err := deploymentid.Validate(selftestDeployment); err != nil {
+		t.Fatalf("every real-host test would fail at New: %v", err)
+	}
+
+	dir := shortDir(t)
+
+	// NAMED `firecracker` RATHER THAN A VERSIONED FILENAME, for the socket budget
+	// shortDir exists for. The jailer names its chroot after the resolved binary, so
+	// the name is part of the address: `firecracker-v1.16.1` lands at 102 bytes of
+	// darwin's 103, and a test that passes by one byte fails the next time anything
+	// about the fixture's path gets longer, for a reason that has nothing to do with
+	// the identity it is checking. This one has no stake in the versioned form.
+	bin := filepath.Join(dir, "firecracker")
+	if err := os.WriteFile(bin, []byte("#!/bin/true\n"), 0o600); err != nil {
+		t.Fatalf("write the stub binary: %v", err)
+	}
+
+	if _, err := New(selftestDeployment, config.FirecrackerConfig{
+		BinaryPath: bin, JailerPath: bin, KernelImage: bin,
+		ChrootBase: dir, JailUIDMin: 900000, JailUIDCount: 8, Bridge: "br0",
+	}, &fakeDisk{}); err != nil {
+		t.Fatalf("New refuses the identity the real-host tests own their jails under, "+
+			"so every one of them fails at construction wherever they do run: %v", err)
+	}
+}
+
+// A REAL MICROVM, LAUNCHED AND DESTROYED THROUGH THE REAL JAILER.
+//
+// The fake-VMM tests assert what billet SAYS; this asserts that what it says works.
+// It is the same shape as the docker backend's realdocker_test.go and it exists for
+// the same reason: every defect this backend's design turned on — the chroot name,
+// the exit code that means nothing, the cgroup that must always be asked for — was
+// found by running the thing, and none of them is reachable from a fake.
+//
+// It skips unless the machine can actually do it, which is the reference host and
+// nowhere else. Everything it needs beyond firecracker itself is stated in the skip
+// messages, so a host that is nearly ready says which part is missing.
+func TestRealFirecrackerLaunchAndDestroy(t *testing.T) {
+	env := requireRealHost(t)
+
+	p, err := New(selftestDeployment, env.cfg, env.disk,
+		WithBootWait(20*time.Second))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// A UNIQUE LEASE PER RUN, because the jailer refuses an id whose chroot
+	// survives — which is exactly what a previous failed run leaves behind.
+	name := provider.InstanceName(env.lease)
+	rootCapacity := env.disk.growthCapacity(t, env.image)
+
+	t.Cleanup(func() {
+		// WithoutCancel: the test context is done by the time cleanup runs, and a
+		// cleanup that cannot run leaves a microVM, a jail, a tap and a mapped disk.
+		if _, err := p.Destroy(context.WithoutCancel(t.Context()), name); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+	})
+
+	inst, err := p.Launch(t.Context(), provider.Spec{
+		Name:      name,
+		Image:     env.image,
+		VCPU:      2,
+		Memory:    1 * config.GiB,
+		Disk:      rootCapacity,
+		Command:   []string{"./run.sh"},
+		Trust:     provider.TrustTrusted,
+		JITConfig: "not-a-real-registration",
+	})
+	if err != nil {
+		t.Fatalf("Launch against real firecracker: %v", err)
+	}
+
+	// THE JAIL IS WHERE THE JAILER PUT IT, not where the configured path suggests.
+	// This is the assertion the whole design turned on, and it can only be made
+	// against the real jailer: a fake would agree with whatever billet computed.
+	j := p.jailFor(name)
+	if got := ext4Size(t, j.rootDiskPath()); got < int64(rootCapacity) {
+		t.Errorf("the root filesystem visible to the guest is %d bytes, want at least %d", got,
+			rootCapacity)
+	}
+
+	if _, err := os.Stat(j.socket()); err != nil {
+		t.Errorf("no api socket at the path billet derives, so the jailer used another: %v", err)
+	}
+
+	// AND THE VMM IS ACTUALLY RUNNING, which is the claim Launch makes.
+	if !inst.Running {
+		t.Error("Launch reported an instance that is not running")
+	}
+
+	found, ok, err := p.Find(t.Context(), name)
+	if err != nil || !ok {
+		t.Fatalf("Find: found=%v err=%v", ok, err)
+	}
+
+	if !found.Running {
+		t.Error("Find reported a live microVM as not running")
+	}
+
+	listed, err := p.List(t.Context())
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+
+	var seen bool
+
+	for _, i := range listed {
+		if i.Name == name {
+			seen = true
+		}
+	}
+
+	if !seen {
+		t.Errorf("List did not report the microVM it just launched: %+v", listed)
+	}
+
+	// THE CREDENTIAL IS NOT IN ARGV. Asserted against the real process table
+	// rather than against what billet recorded, because /proc is where a local
+	// process would actually read it.
+	if out, err := exec.CommandContext(t.Context(), "ps", "-eo", "args").Output(); err == nil {
+		if strings.Contains(string(out), "not-a-real-registration") {
+			t.Error("the runner registration is visible in the process table")
+		}
+	}
+}
+
+// AND A DESTROY LEAVES NOTHING, which is the half the fake cannot check: a jail
+// that survives blocks every relaunch of that lease, and a mapped device holds pool
+// space no sweep will find.
+func TestRealFirecrackerDestroyLeavesNothing(t *testing.T) {
+	env := requireRealHost(t)
+
+	p, err := New(selftestDeployment, env.cfg, env.disk, WithBootWait(20*time.Second))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	name := provider.InstanceName(env.lease)
+	rootCapacity := env.disk.growthCapacity(t, env.image)
+
+	if _, err := p.Launch(t.Context(), provider.Spec{
+		Name: name, Image: env.image, VCPU: 1, Memory: 512 * config.MiB, Disk: rootCapacity,
+		Command: []string{"./run.sh"}, Trust: provider.TrustTrusted,
+		JITConfig: "not-a-real-registration",
+	}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	if _, err := p.Destroy(t.Context(), name); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+	env.disk.assertGone(t, name)
+
+	j := p.jailFor(name)
+
+	if _, err := os.Stat(j.dir()); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the jail survived: %v", err)
+	}
+
+	// THE TAP TOO. Nothing enumerates network devices looking for orphans, so one
+	// left attached is invisible — and its NAME is allocated rather than derived, so
+	// the claim directory is what says whether it came back.
+	if left, err := p.claimedBy(name); err != nil {
+		t.Errorf("read what %s still holds: %v", name, err)
+	} else if left != (resources{}) {
+		t.Errorf("%s still holds %+v after its destroy", name, left)
+	}
+
+	// AND DESTROYING AGAIN IS STILL SUCCESS.
+	if _, err := p.Destroy(t.Context(), name); err != nil {
+		t.Errorf("the second Destroy: %v", err)
+	}
+}
+
+// realHost is what a live launch needs, and where it came from.
+type realHost struct {
+	cfg   config.FirecrackerConfig
+	disk  rbdDisk
+	image string
+	lease string
+}
+
+// requireRealHost skips unless this machine can launch a microVM for real, saying
+// which part is missing when it cannot.
+func requireRealHost(t *testing.T) realHost {
+	t.Helper()
+
+	// NOT PARALLEL, and deliberately: these share the host's jailer, its cgroup
+	// tree, its bridge and its ceph pools, which is precisely the process-global
+	// state the package's testing rules say must run alone.
+	if os.Geteuid() != 0 {
+		t.Skip("not root: the jailer chroots, mknods a device node and attaches a tap")
+	}
+
+	if err := checkKVM(); err != nil {
+		t.Skipf("no usable /dev/kvm: %v", err)
+	}
+
+	image := os.Getenv("BILLET_TEST_GOLDEN_IMAGE")
+	if image == "" {
+		t.Skip("set BILLET_TEST_GOLDEN_IMAGE to a golden image in the ceph image pool, " +
+			"written image@snapshot, to run this")
+	}
+
+	bridge := os.Getenv("BILLET_TEST_BRIDGE")
+	if bridge == "" {
+		t.Skip("set BILLET_TEST_BRIDGE to a bridge on this host to run this")
+	}
+
+	cfg := config.FirecrackerConfig{
+		KernelImage: os.Getenv("BILLET_TEST_KERNEL"),
+		Bridge:      bridge,
+	}
+	cfg.Normalize()
+
+	if cfg.KernelImage == "" {
+		t.Skip("set BILLET_TEST_KERNEL to an uncompressed guest kernel to run this")
+	}
+
+	for _, bin := range []string{cfg.BinaryPath, cfg.JailerPath} {
+		if _, err := os.Stat(bin); err != nil {
+			t.Skipf("%s is not installed: %v", bin, err)
+		}
+	}
+
+	if errs := config.CheckFirecracker(cfg); len(errs) > 0 {
+		t.Skipf("the environment does not describe a usable host: %v", errs)
+	}
+
+	return realHost{
+		cfg:   cfg,
+		disk:  realDisk(t),
+		image: image,
+		lease: freshLease(t),
+	}
+}
+
+// realDisk drives the actual rbd command, through the same shape the wiring uses.
+//
+// A LOCAL TYPE RATHER THAN internal/store/ceph, because a provider may not import
+// the store — the layering depguard enforces. It runs the same two commands the
+// ceph client does, which is what makes this a test of the launch path rather than
+// of the storage.
+func realDisk(t *testing.T) rbdDisk {
+	t.Helper()
+
+	pool := os.Getenv("BILLET_TEST_CACHE_POOL")
+	if pool == "" {
+		t.Skip("set BILLET_TEST_CACHE_POOL to the ceph pool per-job clones live in")
+	}
+
+	images := os.Getenv("BILLET_TEST_IMAGE_POOL")
+	if images == "" {
+		t.Skip("set BILLET_TEST_IMAGE_POOL to the ceph pool golden images live in")
+	}
+
+	return rbdDisk{images: images, cache: pool, id: os.Getenv("BILLET_TEST_CEPH_USER")}
+}
+
+// rbdDisk is the smallest thing that satisfies RootDisk against a live cluster.
+type rbdDisk struct {
+	images, cache, id string
+}
+
+// growthCapacity chooses a test capacity one GiB beyond the source device. Since
+// an ext4 filesystem cannot be larger than its block device, reaching this value
+// proves both RBD and filesystem growth rather than merely accepting a large image.
+func (d rbdDisk) growthCapacity(t *testing.T, image string) config.ByteSize {
+	t.Helper()
+
+	out, err := exec.CommandContext(t.Context(), "rbd", d.args("--format", "json", "info",
+		d.images+"/"+image)...).Output()
+	if err != nil {
+		t.Fatalf("inspect the source image before the growth test: %v", err)
+	}
+	var info struct {
+		Size int64 `json:"size"`
+	}
+	if err := json.Unmarshal(out, &info); err != nil || info.Size <= 0 {
+		t.Fatalf("source image did not report a positive size: %v, %s", err, out)
+	}
+	if info.Size > int64(config.ByteSize(1<<63-1)-config.GiB) {
+		t.Fatalf("source image is too large to request a growth probe: %d", info.Size)
+	}
+
+	return config.ByteSize(info.Size) + config.GiB
+}
+
+func (d rbdDisk) args(rest ...string) []string {
+	if d.id == "" {
+		return rest
+	}
+
+	return append([]string{"--id", d.id}, rest...)
+}
+
+// The real host test always names an explicit generation, which is what a resolver
+// returns unchanged — so this stands in for the store without needing one.
+func (d rbdDisk) ResolveGeneration(_ context.Context, image, _ string) (string, error) {
+	return image, nil
+}
+
+func (d rbdDisk) CloneRoot(
+	ctx context.Context, image, name string, capacity config.ByteSize,
+) (string, error) {
+	if err := exec.CommandContext(ctx, "rbd", d.args("clone",
+		d.images+"/"+image, d.cache+"/"+name)...).Run(); err != nil {
+		return "", err
+	}
+
+	if capacity > 0 {
+		out, err := exec.CommandContext(ctx, "rbd", d.args("--format", "json", "info",
+			d.cache+"/"+name)...).Output()
+		if err != nil {
+			return "", err
+		}
+		var info struct {
+			Size int64 `json:"size"`
+		}
+		if err := json.Unmarshal(out, &info); err != nil {
+			return "", err
+		}
+
+		sizeMiB := (int64(capacity)-1)/int64(config.MiB) + 1
+		if info.Size < int64(capacity) {
+			if err := exec.CommandContext(ctx, "rbd", d.args("resize", "--size",
+				fmt.Sprintf("%dM", sizeMiB), d.cache+"/"+name)...).Run(); err != nil {
+				return "", err
+			}
+		}
+	}
+
+	out, err := exec.CommandContext(ctx, "rbd", d.args("device", "map",
+		d.cache+"/"+name)...).Output()
+	if err != nil {
+		return "", err
+	}
+
+	return strings.TrimSpace(string(out)), nil
+}
+
+// ext4Size reads the superblock through the exact device node Firecracker opens
+// inside the jail. That is the filesystem the guest sees, not merely RBD's outer
+// block-device capacity.
+func ext4Size(t *testing.T, device string) int64 {
+	t.Helper()
+
+	out, err := exec.CommandContext(t.Context(), "dumpe2fs", "-h", device).CombinedOutput()
+	if err != nil {
+		t.Fatalf("inspect the guest root filesystem: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+
+	values := make(map[string]int64)
+	for _, line := range strings.Split(string(out), "\n") {
+		key, value, found := strings.Cut(line, ":")
+		if !found || (key != "Block count" && key != "Block size") {
+			continue
+		}
+		n, parseErr := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+		if parseErr != nil {
+			t.Fatalf("parse %s from dumpe2fs: %v", key, parseErr)
+		}
+		values[key] = n
+	}
+
+	if values["Block count"] <= 0 || values["Block size"] <= 0 {
+		t.Fatalf("dumpe2fs did not report a positive block count and size: %s", out)
+	}
+
+	return values["Block count"] * values["Block size"]
+}
+
+// DiscardRoot unmaps the per-job clone and removes it.
+//
+// IT WAITS OUT A BUSY DEVICE, AND THAT IS NOT POLISH — IT IS WHAT MAKES THIS A
+// STAND-IN. The kernel client still holds the device for a moment after the VMM
+// exits, so the first unmap after a teardown answers `(16) Device or resource busy`;
+// the `rbd rm` behind it then fails because a mapped image cannot be removed. The
+// production client (internal/store/ceph) retries for five seconds for exactly this
+// reason, so a fixture that tries once destroys nothing on the path this test
+// exists to check.
+//
+// AND IT RETURNS ITS ERRORS. They were discarded, under a comment saying the caller
+// could not act on either — the caller is Destroy, which RETAINS the jail when a
+// discard fails precisely so a later Destroy can find the clone and retry. Swallowing
+// them made the fixture report success while leaving both behind, so the code under
+// test took a branch the real client would never have given it.
+//
+// Measured on the reference host: the first run of this test after it was revived
+// left a mapped image in the cache pool, and unmapping it by hand a moment later
+// succeeded on the first attempt.
+func (d rbdDisk) DiscardRoot(ctx context.Context, name string) error {
+	const (
+		attempts = 20
+		pause    = 250 * time.Millisecond
+	)
+
+	spec := d.cache + "/" + name
+
+	var unmapErr error
+
+	for attempt := range attempts {
+		out, err := exec.CommandContext(ctx, "rbd", d.args("device", "unmap", spec)...).CombinedOutput()
+		if err == nil {
+			unmapErr = nil
+
+			break
+		}
+
+		unmapErr = fmt.Errorf("unmap %s: %w: %s", spec, err, strings.TrimSpace(string(out)))
+
+		// NOT MAPPED IS DONE, not a failure: Destroy is idempotent and reaches here
+		// for a lease whose clone was already discarded.
+		if !strings.Contains(string(out), "Device or resource busy") {
+			unmapErr = nil
+
+			break
+		}
+
+		if attempt == attempts-1 {
+			break
+		}
+
+		timer := time.NewTimer(pause)
+
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+
+			return errors.Join(unmapErr, ctx.Err())
+		case <-timer.C:
+		}
+	}
+
+	if unmapErr != nil {
+		return unmapErr
+	}
+
+	if out, err := exec.CommandContext(ctx, "rbd", d.args("rm", spec)...).CombinedOutput(); err != nil {
+		// An image that is already gone is success, for the same reason.
+		if !strings.Contains(string(out), "No such file or directory") {
+			return fmt.Errorf("remove %s: %w: %s", spec, err, strings.TrimSpace(string(out)))
+		}
+	}
+
+	return nil
+}
+
+// assertGone proves teardown removed both forms of RBD state: the kernel mapping
+// and the cache-pool image it pins.
+func (d rbdDisk) assertGone(t *testing.T, name string) {
+	t.Helper()
+
+	out, err := exec.CommandContext(t.Context(), "rbd", d.args("--format", "json", "device",
+		"list")...).Output()
+	if err != nil {
+		t.Fatalf("list RBD mappings after Destroy: %v", err)
+	}
+	var mappings []struct {
+		Pool string `json:"pool"`
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(out, &mappings); err != nil {
+		t.Fatalf("decode RBD mappings after Destroy: %v", err)
+	}
+	for _, mapping := range mappings {
+		if mapping.Pool == d.cache && mapping.Name == name {
+			t.Errorf("Destroy left %s/%s mapped", d.cache, name)
+		}
+	}
+
+	out, err = exec.CommandContext(t.Context(), "rbd", d.args("--format", "json", "ls",
+		d.cache)...).Output()
+	if err != nil {
+		t.Fatalf("list cache-pool images after Destroy: %v", err)
+	}
+	var images []string
+	if err := json.Unmarshal(out, &images); err != nil {
+		t.Fatalf("decode cache-pool images after Destroy: %v", err)
+	}
+	for _, image := range images {
+		if image == name {
+			t.Errorf("Destroy left %s/%s in the cache pool", d.cache, name)
+		}
+	}
+}
+
+// KernelFor answers "nothing recorded". This harness boots against a real cluster
+// with the kernel the test configures, which is exactly the unpaired case -- and
+// pretending otherwise would have the launch look for a kernel this test never
+// installed.
+func (d rbdDisk) KernelFor(_ context.Context, _, _ string) (string, bool, error) {
+	return "", false, nil
+}
+
+// GenerationGone is false: this harness boots against a real cluster and does not
+// exercise the alias re-resolve.
+func (d rbdDisk) GenerationGone(error) bool { return false }
+
+// freshLease is a lease id of the shape alloc mints, unique per run so a previous
+// failed run's leftovers cannot be mistaken for this one's.
+func freshLease(t *testing.T) string {
+	t.Helper()
+
+	raw, err := os.ReadFile("/proc/sys/kernel/random/uuid")
+	if err != nil {
+		t.Skipf("cannot mint a lease id on this machine: %v", err)
+	}
+
+	id := strings.ReplaceAll(strings.TrimSpace(string(raw)), "-", "")
+	if len(id) != leaseIDLength {
+		t.Skipf("the uuid source produced %d characters, not %d", len(id), leaseIDLength)
+	}
+
+	return id
+}

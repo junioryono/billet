@@ -1,0 +1,260 @@
+# GoReleaser builds and publishes what a tag says.
+#
+# It creates no tags of its own — it runs on the one that is already there, and
+# it REFUSES a tag that is not semantic versioning. That is the constraint Go
+# imposes on this project and the one place billet cannot copy a date-stamped
+# release scheme: a module version must be vX.Y.Z, so a tag like
+# "2026.08.11-03.58.56" is not a version Go will ever resolve.
+version: 2
+
+project_name: billet
+
+snapshot:
+  # A repository cloned after the pre-module guest-image tags can have one of
+  # those as its nearest tag. Debian requires a version to begin with a digit,
+  # so a snapshot must not inherit that tag even though a real release is always
+  # cut from a validated vX.Y.Z version.
+  version_template: "0.0.0-SNAPSHOT-{{ .ShortCommit }}"
+
+# NO before.hooks. A release must build what the tag says and nothing else: a
+# `go mod tidy` here would edit go.mod and go.sum during the build, so what is
+# published could differ from what was reviewed and tested. CI already fails a
+# PR whose modules are untidy, which is the right place for it.
+
+builds:
+  - id: billet
+    main: ./cmd/billet
+    binary: billet
+    env:
+      # NO CGO, ANYWHERE. A node is deployed by copying one static file, which is
+      # the whole reason billet uses a pure-Go SQLite driver.
+      - CGO_ENABLED=0
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    ignore:
+      # macOS on Intel is not a platform billet targets. `make cross` builds the
+      # same three, and the two lists must agree or CI proves something the
+      # release does not ship.
+      - goos: darwin
+        goarch: amd64
+    flags:
+      - -trimpath
+    ldflags:
+      # -s -w strip the symbol and DWARF tables. The version is INJECTED rather
+      # than left to Go's VCS stamping because -trimpath and -buildvcs interact
+      # in ways that would silently produce "(devel)" in a published artifact;
+      # internal/version keeps the stamping as a fallback for ordinary builds.
+      - -s -w
+      - -X github.com/junioryono/billet/internal/version.version={{.Version}}
+      - -X github.com/junioryono/billet/internal/version.commit={{.FullCommit}}
+      - -X github.com/junioryono/billet/internal/version.date={{.Date}}
+
+archives:
+  - id: billet
+    # The install script derives this name from uname, so it is a contract rather
+    # than a preference. Changing it breaks every existing installer.
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+      - LICENSE
+      - billet.example.yaml
+      # The macOS service definitions travel in the ARCHIVE because there is no
+      # package for them: nfpms builds .deb and .rpm, and a Mac operator
+      # installs the darwin archive by hand. They ride in the linux archives
+      # too — one archive list covers both — which costs two small files and
+      # keeps the release from having a shape per platform.
+      - deploy/sh.billet.node.plist
+      - deploy/sh.billet.server.plist
+
+nfpms:
+  - id: billet
+    package_name: billet
+    vendor: junioryono
+    homepage: https://github.com/junioryono/billet
+    maintainer: junioryono <junioryono@users.noreply.github.com>
+    description: |-
+      Self-hosted GitHub Actions runners on your own hardware.
+      billet runs a control plane that talks to GitHub's scale-set API and
+      launches ephemeral runners on machines you own.
+    license: Apache-2.0
+    dependencies:
+      - e2fsprogs
+      - kmod
+    # NO apk. Alpine uses BusyBox adduser/addgroup rather than GNU
+    # useradd/groupadd, and OpenRC rather than systemd — so an apk built from
+    # these scripts and these units could not install, and shipping a package
+    # that cannot work is worse than not shipping one.
+    formats: [deb, rpm]
+    bindir: /usr/bin
+    contents:
+      - src: deploy/billet-server.service
+        dst: /usr/lib/systemd/system/billet-server.service
+      - src: deploy/billet-node.service
+        dst: /usr/lib/systemd/system/billet-node.service
+
+      # NEITHER IS ENABLED BY THE PACKAGE, for the reason the server unit is not:
+      # installing billet must not start copying a deployment's credentials
+      # anywhere. `systemctl enable --now billet-backup.timer` is the operator's
+      # decision, after billet.yaml names somewhere to put them.
+      - src: deploy/billet-backup.service
+        dst: /usr/lib/systemd/system/billet-backup.service
+      - src: deploy/billet-backup.timer
+        dst: /usr/lib/systemd/system/billet-backup.timer
+      - src: deploy/billet-rbd.conf
+        dst: /usr/lib/modules-load.d/billet-rbd.conf
+
+      # THE LIVE CONFIG IS NOT PACKAGED — postinstall copies this template to
+      # /etc/billet/billet.yaml when nothing is there yet.
+      #
+      # config|noreplace protects an UPGRADE and nothing else. `apt purge` still
+      # removes a conffile, and `rpm -e` can rename a modified one to .rpmsave —
+      # either takes the App ids, the tier catalog and the capacity ceilings with
+      # it while the deployment identity and the App key survive separately,
+      # which is the half-recoverable machine all of this exists to avoid. The
+      # same reasoning as /var/lib/billet: what must outlive the package must not
+      # be owned by the package manager.
+      #
+      # NOT UNDER /usr/share/doc, and that was found by installing on a slim
+      # image. Debian's minimal images ship
+      # /etc/dpkg/dpkg.cfg.d/docker with `path-exclude=/usr/share/doc/*`, so a
+      # template kept there is silently dropped at unpack time — postinstall then
+      # finds nothing to copy and the machine ends up with no config at all, with
+      # no error anywhere. Anything postinstall depends on has to live outside
+      # the paths a minimal install is entitled to throw away.
+      - src: deploy/billet.yaml
+        dst: /usr/share/billet/billet.yaml
+
+      - src: billet.example.yaml
+        dst: /usr/share/doc/billet/billet.example.yaml
+      - src: README.md
+        dst: /usr/share/doc/billet/README.md
+      - src: LICENSE
+        dst: /usr/share/doc/billet/LICENSE
+
+      # /etc/billet is created here so its mode is right before the config file
+      # lands in it — it holds the GitHub App private key.
+      - dst: /etc/billet
+        type: dir
+        file_info:
+          mode: 0750
+
+      # /var/lib/billet is DELIBERATELY NOT LISTED, and this was found by
+      # installing the package and then removing it. A directory shipped in
+      # `contents` is owned by the package manager, so `dpkg -r billet` deleted
+      # it — taking the deployment identity and the mTLS CA's private key with it,
+      # which invalidates every node certificate in the fleet. An upgrade done as
+      # remove-then-install would have silently destroyed the deployment.
+      #
+      # postinstall creates it instead, so nothing owns it and nothing removes it.
+      # An operator who genuinely wants it gone deletes it themselves, which is
+      # what postremove says.
+
+    scripts:
+      # postinstall RUNS daemon-reload AND NOTHING ELSE. Installing billet must
+      # not connect a machine to GitHub and start accepting other people's jobs;
+      # that is the administrator's decision, and it cannot be made before
+      # /etc/billet/billet.yaml says something true.
+      postinstall: deploy/scripts/postinstall.sh
+      preremove: deploy/scripts/preremove.sh
+      postremove: deploy/scripts/postremove.sh
+
+    deb:
+      lintian_overrides:
+        # The units are shipped but deliberately not enabled, which lintian reads
+        # as an omission.
+        - systemd-service-file-missing-install-key
+
+checksum:
+  name_template: "checksums.txt"
+
+# THE RELEASE MANIFEST IS BUILT AND SIGNED HERE RATHER THAN IN THE WORKFLOW, and
+# the reason is release immutability rather than preference. A published release
+# is frozen — its assets cannot be added to — so anything a deployment needs in
+# order to verify and install that release has to exist BEFORE GoReleaser
+# publishes. `signs` is the stage that runs after the archives and checksums and
+# before the release, which is exactly that window.
+#
+# `artifacts: checksum` MAKES IT RUN ONCE, over one artifact, rather than once per
+# published file. The manifest describes the whole release, so running it per
+# artifact would rebuild the same document N times and race on the output.
+#
+# NOTHING HERE COMPUTES A COMPATIBILITY FACT. mkreleasemanifest reads the wire
+# range, the ledger schema and the guest contract out of the packages that define
+# them, so this file cannot describe a binary nobody built — which is the failure
+# a hand-maintained list in YAML produces on exactly the release where it matters.
+signs:
+  # WRITING THE MANIFEST AND SIGNING IT ARE ONE STEP because of ORDER, not
+  # tidiness: the manifest describes the artifacts, so it cannot be written before
+  # they exist, and it has to exist before it can be signed. Signing runs after
+  # checksums, which is the first moment both are true. A goreleaser `after` hook
+  # would run later than the signature it is meant to produce input for.
+  #
+  # A SNAPSHOT'S VERSION IS PINNED RATHER THAN DERIVED. `.Tag` in a snapshot is
+  # whatever tag is nearest in the checkout, which on a full clone of this
+  # repository is a guest-image tag — not a billet release tag, which the
+  # generator correctly refuses. CI happened to produce v0.0.0 only because its
+  # clone had fetched no tags, so the local build and the CI build were checking
+  # different things. Naming it makes both deterministic.
+  #
+  # A SNAPSHOT WRITES THE MANIFEST AND DOES NOT SIGN IT, and that split is forced
+  # rather than chosen. Keyless signing needs an OIDC identity, which exists only
+  # in the tagged release workflow — so a snapshot cannot produce a signature no
+  # matter what is installed, and `make dist` on a laptop or in the
+  # package-lifecycle job would fail on `cosign: not found` for a signature that
+  # could never have been valid. Generating the manifest still runs, because that
+  # is the half a local build can check.
+  - id: release-manifest
+    artifacts: checksum
+    cmd: sh
+    args:
+      - "-c"
+      - >-
+        go run ./scripts/mkreleasemanifest
+        --dist dist
+        --version {{ if .IsSnapshot }}v0.0.0{{ else }}{{ .Tag }}{{ end }}
+        --commit {{ .FullCommit }}
+        --rollback-to "${BILLET_ROLLBACK_TO:-}"
+        --out dist/release-manifest.json
+        {{ if not .IsSnapshot }}&& cosign sign-blob --yes --new-bundle-format
+        --bundle dist/release-manifest.sigstore.json
+        dist/release-manifest.json{{ end }}
+    # GORELEASER LOOKS FOR A SIGNATURE FILE AFTER RUNNING THIS, and the default
+    # name is `${artifact}.sig` -- so with `artifacts: checksum` and no override it
+    # expected `dist/checksums.txt.sig`, which this command has never produced.
+    # That surfaced only at PUBLISH time, as
+    # `failed to upload checksums.txt.sig: no such file or directory`, which is why
+    # `make dist` could never catch it: it runs `--skip=publish`, so the phantom
+    # artifact is registered and never uploaded. The local gate and the real path
+    # diverged exactly where the bug was.
+    signature: release-manifest.sigstore.json
+    output: false
+
+changelog:
+  # FROM COMMIT SUBJECTS, not from a label taxonomy, and that is a deliberate
+  # departure from how the author's other repositories do this. billet's commit
+  # subjects are already declarative sentences written to be read — "A launched
+  # container is told what to run, or it is not launched" — so a PR-label scheme
+  # would be process bought with nothing to show for it.
+  use: git
+  sort: asc
+  filters:
+    exclude:
+      - "^Merge "
+      - "^chore\\(deps\\)"
+
+release:
+  draft: false
+  prerelease: auto
+  # THE MANIFEST AND ITS SIGNATURE TRAVEL WITH THE RELEASE. `signs` above produced
+  # them into dist/; these globs are what actually uploads them, and without both
+  # entries a deployment following a channel finds a pointer to a release with
+  # nothing in it to verify.
+  # The MANIFEST is an extra file; its BUNDLE is not, because `signs.signature`
+  # above already registers that as the release's signature artifact and a second
+  # glob would upload the same asset name twice.
+  extra_files:
+    - glob: dist/release-manifest.json
+  # Pre-alpha. Anyone arriving from a tag should be told before they deploy it.
+  header: |
+    billet is pre-alpha. Interfaces, config keys and on-disk formats change
+    without notice. Do not point release or deploy pipelines at it yet.

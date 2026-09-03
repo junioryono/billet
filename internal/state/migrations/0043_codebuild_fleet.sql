@@ -1,0 +1,27 @@
+-- migration 43: codebuild_fleet
+--
+-- A RESERVED CODEBUILD FLEET IS ONE SHARED POOL OF INSTANCES, so two nodes drawing
+-- on it each advertise the whole of it and the deployment promises GitHub twice what
+-- AWS will run. Neither node's config is wrong on its own — the duplication is only
+-- visible from here — so the fleet a node names is recorded and a second node naming
+-- it is refused at registration.
+--
+-- Empty is the ordinary on-demand case and carries no such claim, which is why the
+-- default is empty rather than the column being nullable: an absent value and a
+-- declared absence are the same fact for this question.
+--
+-- WHAT RELEASES A CLAIM IS A PROOF, and two narrower rules shipped first. Scoping the
+-- refusal to `live = 1` was wrong because liveness says nothing about remote compute
+-- — ForgetEveryNode marks every host not-live whenever a control plane starts, and a
+-- node that merely disconnected is not-live while its builds keep running. Scoping it
+-- to `decommissioned_at = ''` was wrong because `--force` records
+-- `decommission_proven = 0` precisely so every later drain keeps saying the exclusion
+-- is unproven. The reader is in alloc.RegisterNode; this column only has to be
+-- durable.
+--
+-- Everything between the markers below is PUBLISHED BYTES; the prose is not.
+-- Reformat one tab and every ledger that applied this migration refuses to open.
+
+-- +billet:statement
+ALTER TABLE nodes ADD COLUMN codebuild_fleet TEXT NOT NULL DEFAULT ''
+-- +billet:end

@@ -1,0 +1,560 @@
+package state
+
+import (
+	"database/sql"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+// latestVersion is the highest migration this binary carries.
+func latestVersion(t *testing.T) int {
+	t.Helper()
+
+	highest := 0
+
+	for _, m := range sqliteTimeline.migrations {
+		if m.Version > highest {
+			highest = m.Version
+		}
+	}
+
+	if highest == 0 {
+		t.Fatal("no migrations are defined, so every version assertion below is vacuous")
+	}
+
+	return highest
+}
+
+// schemaVersion is the highest migration recorded in a database.
+func schemaVersion(t *testing.T, db *DB) int {
+	t.Helper()
+
+	var version int
+
+	err := db.Reader().QueryRowContext(t.Context(),
+		`SELECT COALESCE(MAX(version), 0) FROM schema_migrations`).Scan(&version)
+	if err != nil {
+		t.Fatalf("read the recorded schema version: %v", err)
+	}
+
+	return version
+}
+
+// THE DEFECT. Every operator command that reaches the ledger — nodes
+// pending/approve/revoke, ca token/issue/revoke/revocations, leases
+// quarantined/release, and check — opened it through Open, which takes the
+// exclusive directory lock a running control plane already holds. So all of them
+// failed with ErrLocked against a live deployment.
+//
+// It is worst for `leases release --force`, whose whole purpose is reclaiming
+// capacity a quarantine has stranded on a RUNNING deployment: the documented
+// remedy required stopping the thing holding the capacity.
+//
+// The lock exists to stop TWO CONTROL PLANES writing conflicting scheduling
+// decisions. A one-shot command is not one, and SQLite serialises the writes
+// themselves, so it may proceed without the lock.
+func TestAnOperatorCommandOpensWhileTheServerHoldsTheLock(t *testing.T) {
+	dir := t.TempDir()
+	ctx := t.Context()
+
+	server, err := Open(ctx, dir)
+	if err != nil {
+		t.Fatalf("Open (the server): %v", err)
+	}
+
+	t.Cleanup(func() { _ = server.Close() })
+
+	// The existing guard still holds: a second CONTROL PLANE is refused.
+	if _, err := Open(ctx, dir); !errors.Is(err, ErrLocked) {
+		t.Fatalf("a second Open must still be refused with ErrLocked, got: %v", err)
+	}
+
+	admin, err := OpenAdmin(ctx, dir)
+	if err != nil {
+		t.Fatalf("OpenAdmin while the server holds the lock: %v", err)
+	}
+
+	defer func() { _ = admin.Close() }()
+
+	// AND IT MUST BE USABLE FOR A WRITE, not merely openable. Every command in
+	// the list above mutates: approving an enrollment, revoking a certificate,
+	// forcing a quarantined lease back. An admin handle that opens and then
+	// cannot write would move the failure one line later rather than fix it.
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+
+	if err := admin.Tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx,
+			`INSERT INTO nodes (name, provider, last_seen_at) VALUES (?, ?, ?)`,
+			"epyc-1", "docker", now)
+
+		return err
+	}); err != nil {
+		t.Fatalf("write through the admin handle: %v", err)
+	}
+
+	// READ BACK THROUGH THE SERVER'S OWN HANDLE, because the point is that the
+	// running control plane sees it. Reading it back through the admin handle
+	// would prove only that SQLite remembers its own transaction.
+	var provider string
+
+	if err := server.Reader().QueryRowContext(ctx,
+		`SELECT provider FROM nodes WHERE name = ?`, "epyc-1").Scan(&provider); err != nil {
+		t.Fatalf("the server should see what the operator command wrote: %v", err)
+	}
+
+	if provider != "docker" {
+		t.Errorf("provider = %q, want docker", provider)
+	}
+}
+
+// With nothing else holding the directory there is no reason to behave
+// differently from Open, and one good reason not to: on a fresh control plane an
+// operator runs `billet ca issue` before the server has ever started, so the
+// schema has to be created by whoever gets there first.
+func TestAnOperatorCommandMigratesWhenNothingElseHoldsTheDirectory(t *testing.T) {
+	ctx := t.Context()
+
+	admin, err := OpenAdmin(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenAdmin on a fresh directory: %v", err)
+	}
+
+	defer func() { _ = admin.Close() }()
+
+	if got, want := schemaVersion(t, admin), latestVersion(t); got != want {
+		t.Errorf("schema version = %d, want %d; a fresh directory must be migrated", got, want)
+	}
+}
+
+func TestMaintenanceFenceRefusesNewAndAlreadyOpenAdminTransactions(t *testing.T) {
+	dir := t.TempDir()
+	ctx := t.Context()
+
+	server, err := Open(ctx, dir)
+	if err != nil {
+		t.Fatalf("open server: %v", err)
+	}
+	t.Cleanup(func() { _ = server.Close() })
+
+	admin, err := OpenAdmin(ctx, dir)
+	if err != nil {
+		t.Fatalf("open admin before maintenance: %v", err)
+	}
+	t.Cleanup(func() { _ = admin.Close() })
+
+	if err := os.WriteFile(filepath.Join(dir, maintenanceFile), []byte("host upgrade\n"), 0o600); err != nil {
+		t.Fatalf("create maintenance fence: %v", err)
+	}
+
+	if _, err := OpenAdmin(ctx, dir); !errors.Is(err, ErrMaintenance) {
+		t.Fatalf("new admin open error = %v, want ErrMaintenance", err)
+	}
+	if err := admin.Tx(ctx, func(*sql.Tx) error { return nil }); !errors.Is(err, ErrMaintenance) {
+		t.Fatalf("already-open admin transaction error = %v, want ErrMaintenance", err)
+	}
+}
+
+// THE ENVIRONMENT ALONE AUTHORIZES NOTHING. BILLET_MAINTENANCE=1 used to let
+// any Open or OpenAdmin cross the fence, which made fence-crossing an ambient
+// property a forgotten export could confer on every future command. Only the
+// typed OpenMaintenance entry may cross it — the gate this test holds.
+func TestTheEnvironmentAloneCannotCrossTheMaintenanceFence(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, maintenanceFile), []byte("host upgrade\n"), 0o600); err != nil {
+		t.Fatalf("create maintenance fence: %v", err)
+	}
+	t.Setenv("BILLET_MAINTENANCE", "1")
+
+	if _, err := OpenAdmin(t.Context(), dir); !errors.Is(err, ErrMaintenance) {
+		t.Fatalf("OpenAdmin with only the env var = %v, want ErrMaintenance", err)
+	}
+	if _, err := Open(t.Context(), dir); !errors.Is(err, ErrMaintenance) {
+		t.Fatalf("Open with only the env var = %v, want ErrMaintenance", err)
+	}
+
+	// The typed entry still crosses, env var or not.
+	db, err := OpenMaintenance(t.Context(), dir)
+	if err != nil {
+		t.Fatalf("the typed quiescent-probe open failed: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	if got, want := schemaVersion(t, db), latestVersion(t); got != want {
+		t.Fatalf("schema version = %d, want %d", got, want)
+	}
+}
+
+func TestQuiescentUpgradeProbeCanOpenTheFencedLedgerExplicitly(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, maintenanceFile), []byte("host upgrade\n"), 0o600); err != nil {
+		t.Fatalf("create maintenance fence: %v", err)
+	}
+
+	db, err := OpenMaintenance(t.Context(), dir)
+	if err != nil {
+		t.Fatalf("open quiescent maintenance probe: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	if got, want := schemaVersion(t, db), latestVersion(t); got != want {
+		t.Fatalf("schema version = %d, want %d", got, want)
+	}
+}
+
+// A NEWER CLI MUST NOT MIGRATE THE RUNNING SERVER'S DATABASE UNDERNEATH IT.
+//
+// Open runs migrations, so an operator running a newer binary's `billet nodes
+// approve` against a live older control plane would silently upgrade the schema
+// that plane is mid-transaction against. Refusing is the only safe answer: the
+// running process cannot be asked to re-read it.
+func TestAnOperatorCommandRefusesToMigrateUnderARunningServer(t *testing.T) {
+	dir := t.TempDir()
+	ctx := t.Context()
+
+	behind := latestVersion(t) - 1
+
+	// A control plane running an older binary, still holding the directory.
+	server := openAt(t, dir, behind)
+
+	t.Cleanup(func() { _ = server.Close() })
+
+	if got := schemaVersion(t, server); got != behind {
+		t.Fatalf("staged schema version = %d, want %d", got, behind)
+	}
+
+	_, err := OpenAdmin(ctx, dir)
+	if err == nil {
+		t.Fatal("OpenAdmin must refuse a database whose schema this binary would have to migrate")
+	}
+
+	// THE DIAGNOSTIC IS THE POINT. An operator holding two binaries needs to be
+	// told which one is ahead, not merely that something is wrong.
+	if !errors.Is(err, ErrSchemaBehind) {
+		t.Errorf("error should be ErrSchemaBehind, got: %v", err)
+	}
+
+	// AND NOTHING WAS MIGRATED. This is the assertion the whole test exists for:
+	// refusing after upgrading the schema would be the same defect with a
+	// message attached.
+	if got := schemaVersion(t, server); got != behind {
+		t.Errorf("schema version = %d after a refused admin open, want %d untouched", got, behind)
+	}
+
+	// THIS IS THE UPGRADE BOUNDARY THE HOST ROLE OWNS. Once the old control plane
+	// has drained and released the directory, the candidate becomes the sole
+	// writer and may apply the append-only migration before anything restarts.
+	if err := server.Close(); err != nil {
+		t.Fatalf("stop the older control plane: %v", err)
+	}
+
+	candidate, err := OpenAdmin(ctx, dir)
+	if err != nil {
+		t.Fatalf("open the stopped older ledger with the candidate: %v", err)
+	}
+	t.Cleanup(func() { _ = candidate.Close() })
+
+	if got, want := schemaVersion(t, candidate), latestVersion(t); got != want {
+		t.Fatalf("schema version after the stopped-ledger migration = %d, want %d", got, want)
+	}
+}
+
+// THE OPEN-TIME CHECK IS A TIME-OF-CHECK-TO-TIME-OF-USE ON ITS OWN.
+//
+// An admin handle verifies the schema against the control plane it found. That
+// plane can then exit and a NEWER one acquire the lock and migrate, leaving the
+// still-running command writing against a schema it never checked — which is
+// precisely the restart boundary refuseUnknownVersions exists to guard. So every
+// transaction on an unlocked handle re-checks.
+//
+// The migration is staged by writing the bookkeeping row a newer billet would
+// have written, which is what an older binary actually sees afterwards.
+func TestAnOperatorTransactionRechecksTheSchemaItIsWritingAgainst(t *testing.T) {
+	dir := t.TempDir()
+	ctx := t.Context()
+
+	server, err := Open(ctx, dir)
+	if err != nil {
+		t.Fatalf("Open (the server): %v", err)
+	}
+
+	t.Cleanup(func() { _ = server.Close() })
+
+	admin, err := OpenAdmin(ctx, dir)
+	if err != nil {
+		t.Fatalf("OpenAdmin: %v", err)
+	}
+
+	t.Cleanup(func() { _ = admin.Close() })
+
+	// It verified cleanly at open, which is what makes this a TOCTOU rather than
+	// an ordinary refusal.
+	if err := admin.Tx(ctx, func(*sql.Tx) error { return nil }); err != nil {
+		t.Fatalf("the admin handle should be usable before anything changes: %v", err)
+	}
+
+	// A NEWER BILLET MIGRATES. From this binary's side that is a recorded
+	// migration it has never heard of.
+	if err := server.Tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx,
+			`INSERT INTO schema_migrations (version, name, checksum, applied_at) VALUES (?, ?, ?, ?)`,
+			9999, "from_a_newer_billet", "whatever", time.Now().UTC().Format(time.RFC3339Nano))
+
+		return err
+	}); err != nil {
+		t.Fatalf("stage a newer billet's migration: %v", err)
+	}
+
+	err = admin.Tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx,
+			`INSERT INTO nodes (name, provider, last_seen_at) VALUES (?, ?, ?)`,
+			"epyc-1", "docker", time.Now().UTC().Format(time.RFC3339Nano))
+
+		return err
+	})
+	if err == nil {
+		t.Fatal("a transaction on an unlocked handle must re-check the schema; the database was " +
+			"migrated by a newer billet after this handle verified it")
+	}
+
+	// AND THE WRITE DID NOT LAND. Refusing after committing would be the defect
+	// with a message attached.
+	var nodes int
+
+	if err := server.Reader().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM nodes WHERE name = ?`, "epyc-1").Scan(&nodes); err != nil {
+		t.Fatalf("count nodes: %v", err)
+	}
+
+	if nodes != 0 {
+		t.Errorf("the refused transaction still wrote %d node row(s)", nodes)
+	}
+}
+
+// AN OPERATOR COMMAND DOES NOT RE-SCAN THE WHOLE LEDGER.
+//
+// quick_check reads the entire file and job_history is unbounded, so its cost
+// grows with the deployment. Running it at every open put that growing scan in
+// front of `nodes approve`, `leases release --force` and `check`, under the same
+// thirty-second startup budget — so a large or loaded deployment could lose every
+// live administration command, the emergency one included.
+//
+// ASSERTED BY CORRUPTING THE LEDGER rather than by a flag. An earlier version
+// recorded "did we scan" on the handle, which proved only that the bookkeeping
+// ran: deleting the PRAGMA and keeping the assignment satisfied it. This asks the
+// question the operator cares about — does this handle REFUSE a broken database —
+// and the answer differs for the two kinds of caller.
+func TestOnlyTheControlPlaneRefusesACorruptedLedger(t *testing.T) {
+	dir := t.TempDir()
+	ctx := t.Context()
+
+	db, err := Open(ctx, dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	// ENOUGH DATA THAT THE CORRUPTION CAN LAND WELL PAST THE SCHEMA. Both open
+	// paths read sqlite_master and schema_migrations — the admin one still
+	// MIGRATES here, because it takes the free lock — so corrupting a page either
+	// of them reads would fail this test for the wrong reason, with a message
+	// about re-scanning when what actually happened is a malformed page in a table
+	// the open legitimately touched.
+	if err := db.Tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx,
+			`INSERT INTO job_history (lease_id, tier, queued_at)
+			 WITH RECURSIVE rows(x) AS (
+			     SELECT 1 UNION ALL SELECT x + 1 FROM rows WHERE x < 4000
+			 )
+			 SELECT 'lease-' || x, 'padding', '2026-01-01T00:00:00.000000000Z' FROM rows`)
+
+		return err
+	}); err != nil {
+		t.Fatalf("pad the ledger: %v", err)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	corruptPages(t, filepath.Join(dir, "billet.db"))
+
+	// THE CONTROL PLANE REFUSES. It is about to make scheduling decisions
+	// against this file and cannot do that against a ledger it cannot trust.
+	if _, err := Open(ctx, dir); err == nil {
+		t.Error("a control plane opened a corrupted ledger; it schedules against this file")
+	} else if !strings.Contains(err.Error(), "integrity") {
+		t.Errorf("the refusal should name the integrity check, got: %v", err)
+	}
+
+	// AN OPERATOR COMMAND DOES NOT, because it does not scan. Reading the
+	// quarantine list or approving a node does not require re-proving the whole
+	// file, and making it do so put a growing scan in front of the command an
+	// operator reaches for in an emergency.
+	admin, err := OpenAdmin(ctx, dir)
+	if err != nil {
+		t.Fatalf("an operator command must not re-scan the ledger to open it: %v", err)
+	}
+
+	t.Cleanup(func() { _ = admin.Close() })
+
+	// AND THE SCAN IS STILL AVAILABLE ON DEMAND, which is what `billet check`
+	// uses and how an operator finds out.
+	if err := admin.IntegrityCheck(ctx); err == nil {
+		t.Error("IntegrityCheck passed a corrupted ledger, so `billet check` would report it healthy")
+	}
+}
+
+// corruptPages overwrites whole pages in the LAST THIRD of a SQLite file.
+//
+// Whole pages, and several of them: measured, a couple of hundred bytes near the
+// header lands in unused space and quick_check reports nothing, which would make
+// this test pass for the wrong reason.
+//
+// POSITIONED RELATIVE TO THE FILE rather than at fixed page numbers, because a
+// fixed list is coupled to today's schema layout in both directions. The next
+// migration shifts allocation: pages that currently hold padding could come to
+// hold schema_migrations, and this test would then fail on an open that
+// legitimately reads it — with a message about re-scanning, which is not what
+// went wrong. The padding above is what makes "the last third" reliably data.
+func corruptPages(t *testing.T, path string) {
+	t.Helper()
+
+	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatalf("open the ledger file: %v", err)
+	}
+
+	defer func() {
+		if err := f.Close(); err != nil {
+			t.Errorf("close the ledger file: %v", err)
+		}
+	}()
+
+	info, err := f.Stat()
+	if err != nil {
+		t.Fatalf("size the ledger file: %v", err)
+	}
+
+	const pageSize = 4096
+
+	pages := info.Size() / pageSize
+	if pages < 30 {
+		t.Fatalf("the ledger is only %d pages; the padding above should have grown it far "+
+			"beyond the schema, and without that this test corrupts pages the open path reads",
+			pages)
+	}
+
+	junk := make([]byte, pageSize)
+	for i := range junk {
+		junk[i] = 0xAB
+	}
+
+	// Spread through the final third, so a single relocated table cannot move all
+	// of them out of the way.
+	for page := pages * 2 / 3; page < pages-1; page += (pages / 12) + 1 {
+		if _, err := f.WriteAt(junk, page*pageSize); err != nil {
+			t.Fatalf("corrupt page %d: %v", page, err)
+		}
+	}
+}
+
+// AND A READ RE-CHECKS TOO, for the same reason a write does.
+//
+// Separate from the transaction test above because View has its own code path:
+// deleting its verification left every other test green, so the guard was
+// decorative. A read against a schema a newer billet has rebuilt would report
+// rows that no longer mean what this binary thinks they mean.
+func TestAnOperatorReadRechecksTheSchemaItIsReadingFrom(t *testing.T) {
+	dir := t.TempDir()
+	ctx := t.Context()
+
+	server, err := Open(ctx, dir)
+	if err != nil {
+		t.Fatalf("Open (the server): %v", err)
+	}
+
+	t.Cleanup(func() { _ = server.Close() })
+
+	admin, err := OpenAdmin(ctx, dir)
+	if err != nil {
+		t.Fatalf("OpenAdmin: %v", err)
+	}
+
+	t.Cleanup(func() { _ = admin.Close() })
+
+	if err := admin.View(ctx, func(Querier) error { return nil }); err != nil {
+		t.Fatalf("the admin handle should read cleanly before anything changes: %v", err)
+	}
+
+	if err := server.Tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx,
+			`INSERT INTO schema_migrations (version, name, checksum, applied_at) VALUES (?, ?, ?, ?)`,
+			9999, "from_a_newer_billet", "whatever", time.Now().UTC().Format(time.RFC3339Nano))
+
+		return err
+	}); err != nil {
+		t.Fatalf("stage a newer billet's migration: %v", err)
+	}
+
+	called := false
+
+	err = admin.View(ctx, func(Querier) error {
+		called = true
+
+		return nil
+	})
+	if err == nil {
+		t.Fatal("a read on an unlocked handle must re-check the schema")
+	}
+
+	// REFUSED BEFORE THE CALLBACK RAN, not after. Reporting an error having
+	// already handed the caller rows from a schema it does not understand would
+	// be the defect with a message attached.
+	if called {
+		t.Error("the callback ran despite the schema check failing")
+	}
+}
+
+// TWO OPERATOR COMMANDS ON A FRESH INSTALL RACE HERE, and the answer has to be
+// honest about which situation it is.
+//
+// The first takes the free lock and creates the schema; the second finds the
+// lock held, which is indistinguishable from a running control plane, and finds
+// no schema at all. Reporting that as "the plane holding this directory is older
+// than you" would send an operator looking for a control plane that does not
+// exist.
+func TestAnOperatorCommandSaysTheDirectoryIsStillBeingInitialised(t *testing.T) {
+	dir := t.TempDir()
+	ctx := t.Context()
+
+	// Somebody else holds the directory and has not created the schema yet,
+	// which is what the middle of a first-run migration looks like from here.
+	held, err := lockDir(dir)
+	if err != nil {
+		t.Fatalf("take the directory lock: %v", err)
+	}
+
+	t.Cleanup(func() {
+		if err := held.release(); err != nil {
+			t.Errorf("release the directory lock: %v", err)
+		}
+	})
+
+	_, err = OpenAdmin(ctx, dir)
+	if err == nil {
+		t.Fatal("OpenAdmin must refuse a directory whose schema does not exist yet")
+	}
+
+	if !errors.Is(err, ErrSchemaBehind) {
+		t.Fatalf("error should be ErrSchemaBehind, got: %v", err)
+	}
+
+	// THE REMEDY IS THE POINT, not the sentinel. "Restart the older control
+	// plane" is the wrong advice here and is what this asserts against.
+	if got := err.Error(); !strings.Contains(got, "initialising") {
+		t.Errorf("the diagnostic should say the directory is being initialised, got: %v", got)
+	}
+}

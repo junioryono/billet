@@ -1,0 +1,17 @@
+---
+# One machine, both roles. The group is named `linux` so the generated block in
+# group_vars/linux.yml reaches it.
+#
+# NOTHING billet-specific belongs here. `billet init --emit ansible` prints a
+# top-level `billet_config:` mapping, and pasting that into a host or group
+# entry inside this file would need it re-indented by hand — a block that has
+# been reflowed is no longer the one the emission printed, and the mistake
+# surfaces as a role assertion about a config that looks correct. Put it in
+# group_vars/linux.yml, where it is taken byte for byte.
+all:
+  children:
+    linux:
+      hosts:
+        billet-1:
+          ansible_host: 10.0.0.10
+          ansible_user: ubuntu

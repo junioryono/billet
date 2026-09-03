@@ -1,0 +1,132 @@
+# billet configuration.
+#
+# Installed by the package and NEVER overwritten by an upgrade — it is marked as
+# a config file, so your edits survive. Nothing starts until this says something
+# true; see billet.example.yaml for every key and why it exists.
+
+# The control plane. It runs no compute — a machine that should also run jobs
+# enables billet-node.service beside billet-server.service, reading this same
+# file. That pair IS the single-machine deployment; there is no combined mode.
+server:
+  # Loopback only. Any other address requires client certificates, which billet
+  # mints itself — run `billet ca issue <node>` and copy the bundle to that host.
+  # A node on THIS machine needs none: a loopback listener serves plain HTTP,
+  # because there is nothing between two local processes to authenticate.
+  listen: 127.0.0.1:7717
+
+  # ENROLLMENT LIVES ON ITS OWN ADDRESS OR NOWHERE, and nowhere is the default.
+  # The two routes a machine with no certificate needs cannot ask for one, so
+  # putting them on the wire above would let anyone who can reach the port hold
+  # connections the fleet needs. Unset means admission stays out of band:
+  # `billet ca issue <node>` here, and copy the bundle to the host. Not valid
+  # beside a loopback `listen`, which issues no certificates at all.
+  #
+  # bootstrap_listen: 0.0.0.0:7718
+
+  state_dir: /var/lib/billet/server
+
+  # ZERO ON PURPOSE, so billet refuses to start until you size it.
+  #
+  # THIS IS THE ONE NUMBER A PACKAGE MUST NOT GUESS. It is the hard ceiling the
+  # allocator escrows against, and it is what stops concurrent tiers from
+  # collectively overcommitting the machine. A plausible default — 4 vCPU, say —
+  # is silently wrong on a smaller host: billet would admit more work than the
+  # machine has, which is the exact failure the global ledger exists to prevent,
+  # and nothing would report it.
+  #
+  # Leave headroom for the host. `billet check` prints how much of the machine is
+  # spoken for once these are set.
+  max_vcpu: 0
+  max_memory: 0
+
+  # When a stopping billet starts REPORTING that its drain is running long.
+  #
+  # IT IS NOT A DEADLINE. A drain waits for the jobs already running for as long
+  # as they run; nothing here ends one, and nothing destroys a running job on the
+  # way out. Raising or lowering this only moves when the log line appears.
+  #
+  # The units' TimeoutStopSec is no longer sized from this. It bounds how long
+  # systemd waits before SIGKILLing a drain that is still going — which loses
+  # billet's own bookkeeping but not the jobs: the guests keep running and the
+  # next process re-adopts them.
+  #
+  # drain_timeout: 6h
+
+github:
+  org: your-org
+
+  # Populated by `billet github-app create --org your-org`.
+  app_id: 0
+  installation_id: 0
+  private_key_path: /etc/billet/app-private-key.pem
+
+# Where a backup goes when it leaves this disk. Optional, and left out here on
+# purpose: `billet local backup --out <dir>` writes a directory with a manifest
+# of digests, which is what your own tooling picks up. Set this and billet
+# uploads what it writes and can restore straight back from it — see
+# billet.example.yaml for every key, and note that billet never deletes from the
+# bucket, so retention is the bucket's job.
+#
+# backup:
+#   s3:
+#     bucket: billet-backups
+#     region: us-west-2
+
+# Uncomment on a machine that should run jobs, then
+# `systemctl enable --now billet-node`. On the machine running the control plane
+# this is the single-machine deployment: two units, one file, loopback between
+# them.
+#
+# NO tls BLOCK while server_addr is loopback — billet refuses that pairing,
+# because a control plane listening only on loopback serves plain HTTP and a node
+# configured for https would never connect. A node on ANOTHER machine needs one:
+# run `billet ca issue <node>` on the control plane, copy the bundle here, add
+# the tls block, and point server_addr at an address this host can reach.
+#
+# node:
+#   name: this-host
+#   server_addr: 127.0.0.1:7717
+#   provider: docker
+#   state_dir: /var/lib/billet/node
+#
+#   # THE HOST-WIDE DEPLOYMENT LOCK, and the packaged units depend on this exact
+#   # path. It stops two processes carrying one deployment identity from managing
+#   # the same containers, so every process that can reach the same container
+#   # runtime has to meet at the same directory. billet's own default is derived
+#   # from HOME, which a systemd service does not have — so leaving this out
+#   # means billet refuses to start rather than quietly running without the
+#   # protection.
+#   #
+#   # It belongs to the node because the node is the role that runs containers;
+#   # the control plane takes no lock. (It was `server.lock_dir` before that was
+#   # true, and billet will tell you so if it finds it there.)
+#   #
+#   # /run/billet is created by the units' RuntimeDirectory=. It is tmpfs, which
+#   # is correct: the lock is meaningful per boot.
+#   lock_dir: /run/billet/locks
+
+# Tiers are yours to define. The label is what users put in `runs-on`.
+tiers:
+  - label: billet-2vcpu-ubuntu-2404
+    provider: docker
+    # The safe default is untrusted, which Docker refuses because it shares the
+    # host kernel. To use Docker, choose a non-default runner group restricted
+    # to exact workflows and set trust: trusted; see billet.example.yaml.
+    trust: untrusted
+    vcpu: 2
+    memory: 8GiB
+    disk: 40GiB
+    image: ghcr.io/actions/actions-runner:latest
+    command: ["./run.sh"]
+
+# How this host learns about new billet releases.
+#
+# THE PACKAGED DEFAULT FOLLOWS THE SIGNED STABLE CHANNEL AND UPDATES NOTHING BY
+# ITSELF. `billet rollout start` is what turns the channel into a decision, and
+# `billet host-upgrade` is what carries one out on this machine; neither runs
+# without somebody asking. Set `automatic: true` to let the control plane start a
+# rollout when the channel advances, and give it a maintenance_window if it should
+# only begin at a quiet hour — see billet.example.yaml for both.
+release:
+  channel: stable
+  automatic: false

@@ -1,0 +1,32 @@
+# When billet-backup.service runs.
+#
+#   systemctl enable --now billet-backup.timer
+#
+# DAILY RATHER THAN HOURLY, and the number follows from what a restored ledger
+# costs rather than from taste: a restore installs a ledger with no lease for
+# compute created since the backup, so every job that started in the gap is one
+# node recovery destroys as an orphan — and GitHub does not requeue a job that
+# already started. A shorter interval narrows that window; a longer one widens
+# it. A day is the point where the archive is worth having and the copies are
+# still countable; change it here if your deployment's answer differs.
+[Unit]
+Description=billet deployment backup, daily
+Documentation=https://github.com/junioryono/billet/blob/main/docs/restore-rehearsal.md
+
+[Timer]
+OnCalendar=daily
+
+# SPREAD, because a fleet of control planes all backing up at 00:00:00 is a fleet
+# of simultaneous PUTs into one bucket and one simultaneous hold of every
+# ledger's single writer slot.
+RandomizedDelaySec=1h
+
+# A MISSED RUN IS RUN, which matters on the machines this exists for: a host that
+# was off overnight would otherwise silently skip a day, and the failure a backup
+# has is always the one nobody saw.
+Persistent=true
+
+Unit=billet-backup.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,42 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "BilletBuildReadRegistration",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:GetParameters"
+      ],
+      "Resource": [
+        "arn:TFPARTITION:ssm:TFREGION:TFACCOUNT:parameter/TFPARAMPATH/*"
+      ]
+    },
+    {
+      "Sid": "BilletBuildLogs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": [
+        "arn:TFPARTITION:logs:TFREGION:TFACCOUNT:log-group:TFLOGGROUP:*"
+      ]
+    },
+    {
+      "Sid": "BilletBuildRegistrationKMS",
+      "Effect": "Allow",
+      "Action": [
+        "kms:Decrypt"
+      ],
+      "Resource": [
+        "arn:TFPARTITION:kms:TFREGION:TFACCOUNT:key/TFKMSKEY"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": "ssm.TFREGION.TFDNSSUFFIX"
+        }
+      }
+    }
+  ]
+}

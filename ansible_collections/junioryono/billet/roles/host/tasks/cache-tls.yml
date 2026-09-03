@@ -1,0 +1,85 @@
+---
+# An EC2 node.cache terminates HTTPS for guests reaching it across the VPC, so it
+# needs a certificate and key at the absolute paths the config names. They are
+# installed only when both source paths are given; otherwise the operator manages
+# the material themselves and this file does nothing.
+
+- name: Assert the EC2 cache TLS sources are given together
+  ansible.builtin.assert:
+    that:
+      - (billet_cache_tls_cert_src | length > 0) == (billet_cache_tls_key_src | length > 0)
+    fail_msg: >-
+      node.cache terminates HTTPS for EC2 guests, so its certificate and key are
+      installed together or not at all. Set both BILLET_CACHE_TLS_CERT_PATH and
+      BILLET_CACHE_TLS_KEY_PATH, or neither to manage the material yourself.
+
+- name: Inspect the EC2 cache TLS directories
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ billet_config.node.cache.tls_cert | dirname }}"
+    - "{{ billet_config.node.cache.tls_key | dirname }}"
+  register: billet_cache_tls_dirs
+  become: true
+  when: billet_cache_tls_cert_src | length > 0
+
+# CREATED ONLY WHEN ABSENT, so pointing tls_cert at an existing shared directory
+# (say /etc/ssl/private) never re-owns or re-modes it out from under another
+# service. An operator who names an existing directory owns its permissions.
+- name: Create the EC2 cache TLS directories when absent
+  ansible.builtin.file:
+    path: "{{ item.item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+  loop: "{{ billet_cache_tls_dirs.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item }}"
+  become: true
+  when:
+    - billet_cache_tls_cert_src | length > 0
+    - not item.stat.exists
+
+- name: Install the EC2 cache TLS certificate
+  ansible.builtin.copy:
+    src: "{{ billet_cache_tls_cert_src }}"
+    dest: "{{ billet_config.node.cache.tls_cert }}"
+    owner: root
+    group: root
+    mode: "0644"
+  become: true
+  register: billet_cache_tls_cert_install
+  when: billet_cache_tls_cert_src | length > 0
+
+# root:root 0600 — only the node (which runs as root) reads it, so the unprivileged
+# billet account has no business holding a private key.
+- name: Install the EC2 cache TLS private key
+  ansible.builtin.copy:
+    src: "{{ billet_cache_tls_key_src }}"
+    dest: "{{ billet_config.node.cache.tls_key }}"
+    owner: root
+    group: root
+    mode: "0600"
+  become: true
+  no_log: true
+  register: billet_cache_tls_key_install
+  when: billet_cache_tls_key_src | length > 0
+
+# ROTATION IS REPORTED, NOT AUTO-RESTARTED. The node reads this material at
+# startup, so a certificate replaced under a live node is not served until it
+# restarts — but the node restart belongs to the transactional upgrade in
+# services.yml, and a handler flushed before that transaction would restart at the
+# wrong point (and fail on a fresh install where the unit does not yet exist). A
+# fresh install starts the node with the new material regardless; a standalone
+# rotation is a drain-and-restart the operator times deliberately, so it is
+# surfaced rather than forced.
+- name: Note that a cache TLS rotation needs a node restart to take effect
+  ansible.builtin.debug:
+    msg: >-
+      The EC2 cache TLS material changed on an already-installed host. Restart
+      billet-node.service to serve the new certificate — a drain-and-restart, so
+      time it when the jobs it is running can be interrupted.
+  when:
+    - billet_persisted_inputs.results[0].stat.exists
+    - (billet_cache_tls_cert_install is changed) or (billet_cache_tls_key_install is changed)

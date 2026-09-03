@@ -1,0 +1,5 @@
+[
+  "sqs:ReceiveMessage",
+  "sqs:DeleteMessage",
+  "sqs:GetQueueAttributes"
+]

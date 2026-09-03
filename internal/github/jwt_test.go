@@ -1,0 +1,217 @@
+package github
+
+import (
+	"crypto"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/json"
+	"encoding/pem"
+	"strings"
+	"testing"
+	"time"
+)
+
+func testKeyPKCS1(t *testing.T) ([]byte, *rsa.PrivateKey) {
+	t.Helper()
+
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+
+	encoded := pem.EncodeToMemory(&pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(key),
+	})
+
+	return encoded, key
+}
+
+// The signature must actually verify. A JWT that merely has three
+// dot-separated segments is indistinguishable from a correct one until GitHub
+// rejects it, at which point the error says nothing about the cause.
+func TestSignAppJWTProducesAVerifiableSignature(t *testing.T) {
+	pemBytes, key := testKeyPKCS1(t)
+
+	now := time.Date(2026, time.August, 6, 12, 0, 0, 0, time.UTC)
+
+	token, err := SignAppJWT(1234, pemBytes, now)
+	if err != nil {
+		t.Fatalf("SignAppJWT: %v", err)
+	}
+
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		t.Fatalf("token has %d segments, want 3", len(parts))
+	}
+
+	signingInput := parts[0] + "." + parts[1]
+	digest := sha256.Sum256([]byte(signingInput))
+
+	sig, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil {
+		t.Fatalf("decode signature: %v", err)
+	}
+
+	if err := rsa.VerifyPKCS1v15(&key.PublicKey, crypto.SHA256, digest[:], sig); err != nil {
+		t.Fatalf("signature does not verify: %v", err)
+	}
+
+	var header map[string]string
+	decodeSegment(t, parts[0], &header)
+
+	if header["alg"] != "RS256" {
+		t.Errorf("alg = %q, want RS256", header["alg"])
+	}
+
+	var claims map[string]any
+	decodeSegment(t, parts[1], &claims)
+
+	if claims["iss"] != "1234" {
+		t.Errorf("iss = %v, want \"1234\"", claims["iss"])
+	}
+}
+
+// numericClaim reads a JSON number claim, naming the claim when it is missing
+// or the wrong type. A bare `claims["iat"].(float64)` panics instead, reporting
+// a stack trace rather than which claim the signer failed to emit.
+func numericClaim(t *testing.T, claims map[string]any, name string) int64 {
+	t.Helper()
+
+	v, ok := claims[name].(float64)
+	if !ok {
+		t.Fatalf("claim %q is missing or not a number: %v", name, claims[name])
+	}
+
+	return int64(v)
+}
+
+// GitHub rejects a token whose iat is in the future, and a minute of fast clock
+// is common on a host whose NTP has not settled. The resulting error reads like
+// a credential problem, which sends people down entirely the wrong path.
+func TestSignAppJWTBackdatesIssuedAt(t *testing.T) {
+	pemBytes, _ := testKeyPKCS1(t)
+
+	now := time.Date(2026, time.August, 6, 12, 0, 0, 0, time.UTC)
+
+	token, err := SignAppJWT(99, pemBytes, now)
+	if err != nil {
+		t.Fatalf("SignAppJWT: %v", err)
+	}
+
+	var claims map[string]any
+	decodeSegment(t, strings.Split(token, ".")[1], &claims)
+
+	iat := numericClaim(t, claims, "iat")
+	exp := numericClaim(t, claims, "exp")
+
+	// EXACT values, not inequalities. "iat is in the past" stays true if the
+	// backdate shrinks to one second, which would no longer absorb the clock skew
+	// this exists for; "exp is under ten minutes" stays true at ten seconds.
+	if want := now.Add(-appJWTBackdate).Unix(); iat != want {
+		t.Errorf("iat = %d, want exactly %d (now - %s)", iat, want, appJWTBackdate)
+	}
+
+	if want := now.Add(appJWTLifetime).Unix(); exp != want {
+		t.Errorf("exp = %d, want exactly %d (now + %s)", exp, want, appJWTLifetime)
+	}
+
+	// The values themselves must stay inside GitHub's rules.
+	if appJWTBackdate < 30*time.Second {
+		t.Errorf("backdate %s is too small to absorb ordinary clock skew", appJWTBackdate)
+	}
+
+	if appJWTLifetime+appJWTBackdate > 10*time.Minute {
+		t.Errorf("iat..exp spans %s; GitHub rejects anything over 10m",
+			appJWTLifetime+appJWTBackdate)
+	}
+
+	// The claim set is exactly what GitHub expects — an extra claim is a
+	// compatibility risk nobody would notice.
+	for _, want := range []string{"iat", "exp", "iss"} {
+		if _, ok := claims[want]; !ok {
+			t.Errorf("claims missing %q", want)
+		}
+	}
+
+	if len(claims) != 3 {
+		t.Errorf("claims = %v, want exactly iat/exp/iss", claims)
+	}
+}
+
+// A key downloaded from the web UI can be PKCS#8 while the manifest conversion
+// returns PKCS#1. Accepting only one produces a baffling parse error on a key
+// that is perfectly valid.
+func TestSignAppJWTAcceptsPKCS8(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+
+	der, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatalf("marshal pkcs8: %v", err)
+	}
+
+	encoded := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})
+
+	if _, err := SignAppJWT(7, encoded, time.Now()); err != nil {
+		t.Fatalf("SignAppJWT with a PKCS#8 key: %v", err)
+	}
+}
+
+func TestSignAppJWTRejectsBadInput(t *testing.T) {
+	valid, _ := testKeyPKCS1(t)
+
+	if _, err := SignAppJWT(0, valid, time.Now()); err == nil {
+		t.Error("app id 0 should be rejected")
+	}
+
+	if _, err := SignAppJWT(-1, valid, time.Now()); err == nil {
+		t.Error("a negative app id should be rejected")
+	}
+
+	if _, err := SignAppJWT(1, []byte("not a pem file"), time.Now()); err == nil {
+		t.Error("non-PEM input should be rejected")
+	}
+
+	notRSA := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: []byte("garbage")})
+	if _, err := SignAppJWT(1, notRSA, time.Now()); err == nil {
+		t.Error("undecodable key material should be rejected")
+	}
+}
+
+// Diagnostics must never disclose the key itself.
+func TestRedactPEMDisclosesNothing(t *testing.T) {
+	pemBytes, _ := testKeyPKCS1(t)
+
+	got := redactPEM(pemBytes)
+
+	if strings.Contains(got, "MII") || strings.Contains(got, "BEGIN") {
+		t.Errorf("redactPEM leaked key material: %q", got)
+	}
+
+	if !strings.Contains(got, "rsa private key") {
+		t.Errorf("redactPEM should name the block type, got %q", got)
+	}
+
+	if got := redactPEM([]byte("nonsense")); got != "<not PEM>" {
+		t.Errorf("redactPEM(non-PEM) = %q", got)
+	}
+}
+
+func decodeSegment(t *testing.T, segment string, into any) {
+	t.Helper()
+
+	raw, err := base64.RawURLEncoding.DecodeString(segment)
+	if err != nil {
+		t.Fatalf("decode segment: %v", err)
+	}
+
+	if err := json.Unmarshal(raw, into); err != nil {
+		t.Fatalf("unmarshal segment: %v", err)
+	}
+}

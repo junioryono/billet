@@ -1,0 +1,239 @@
+---
+# Renders the units the fail-closed ledger mount shapes, without a host: the
+# server unit must carry the mount dependencies exactly when a ledger volume is
+# configured, the mount unit must mount the volume's own by-id device with no
+# nofail, and the prepare-only hold must appear exactly when it is asked for. The mount
+# LOGIC (refusing to shadow a root-disk ledger, the expected-volume proofs)
+# needs a real host with a real block device and is exercised there, not here.
+- name: Render the ledger mount units
+  hosts: localhost
+  gather_facts: false
+  vars:
+    template_dir: "{{ playbook_dir }}/../roles/host/templates"
+    billet_service_user: billet
+    billet_service_group: billet
+    billet_config:
+      server:
+        state_dir: /var/lib/billet/server
+    # The role resolves this once, in upgrade-inspect.yml, from `identity_dir`
+    # when the config names its ledger backend and from `state_dir` otherwise —
+    # and the template reads the FACT rather than re-deriving. See the PostgreSQL
+    # renders at the bottom of this file, which are the case the two spellings
+    # exist for.
+    billet_candidate_server_state_dir: /var/lib/billet/server
+    billet_ledger_mount_unit_name: var-lib-billet-server.mount
+  tasks:
+    # THE TEMPLATE GATES DIRECTLY ON THE VOLUME ID — deliberately not a separate
+    # derived variable an inventory could override to false while the volume
+    # stays configured, which would render a unit without its fence.
+    - name: Render the server unit WITHOUT a ledger volume
+      ansible.builtin.set_fact:
+        billet_server_unit_plain: >-
+          {{ lookup('ansible.builtin.template', template_dir + '/billet-server.service.j2') }}
+      vars:
+        billet_ledger_volume_id: ""
+
+    - name: Render the server unit WITH a ledger volume
+      ansible.builtin.set_fact:
+        billet_server_unit_ledger: >-
+          {{ lookup('ansible.builtin.template', template_dir + '/billet-server.service.j2') }}
+      vars:
+        billet_ledger_volume_id: vol-0123456789abcdef0
+
+    - name: The mount dependencies appear exactly when a ledger volume is configured
+      ansible.builtin.assert:
+        that:
+          # BOTH directives: Requires= on the exact .mount unit fails the start
+          # even when that unit is absent (RequiresMountsFor alone is satisfied
+          # by the root filesystem when no mount unit exists for the path).
+          # LINE-ANCHORED — a commented-out directive must not satisfy these.
+          - billet_server_unit_ledger | regex_findall('(?m)^Requires=(.*)$') | map('trim') | list == ['var-lib-billet-server.mount']
+          - billet_server_unit_ledger | regex_findall('(?m)^After=(.*)$') | map('trim') | list | last == 'var-lib-billet-server.mount'
+          - billet_server_unit_ledger | regex_findall('(?m)^RequiresMountsFor=(.*)$') | map('trim') | list == ['/var/lib/billet/server']
+          - billet_server_unit_plain | regex_findall('(?m)^(Requires|RequiresMountsFor)=') | length == 0
+          - "'var-lib-billet-server.mount' not in billet_server_unit_plain"
+        fail_msg: >-
+          billet-server.service must require the exact ledger mount unit AND the
+          state-dir mounts exactly when billet_ledger_volume_id is set — always
+          would break hosts with no dedicated volume, never would let a failed
+          mount fork the ledger onto the root disk.
+
+    # A configured volume with NO computed unit name must FAIL the render, not
+    # silently emit a unit with no fence.
+    - name: Render the server unit with a volume but no unit name
+      ansible.builtin.set_fact:
+        billet_server_unit_broken: >-
+          {{ lookup('ansible.builtin.template', template_dir + '/billet-server.service.j2') }}
+      vars:
+        billet_ledger_volume_id: vol-0123456789abcdef0
+        billet_ledger_mount_unit_name: "{{ undef() }}"
+      register: billet_ledger_render_without_name
+      ignore_errors: true
+
+    - name: A missing mount unit name fails the render
+      ansible.builtin.assert:
+        that:
+          - billet_ledger_render_without_name is failed
+        fail_msg: >-
+          Rendering the server unit with a ledger volume but no computed mount
+          unit name must fail — emitting a unit without Requires= on the exact
+          mount is the silent-fork hole the dependency exists to close.
+
+    - name: Render the ledger mount unit
+      ansible.builtin.set_fact:
+        billet_ledger_mount_unit_text: >-
+          {{ lookup('ansible.builtin.template', template_dir + '/billet-ledger.mount.j2') }}
+      vars:
+        ansible_managed: rendered-for-test
+        billet_ledger_volume_id: vol-0123456789abcdef0
+        billet_ledger_device_path: /dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_vol0123456789abcdef0
+        billet_candidate_server_state_dir: /var/lib/billet/server
+
+    - name: The mount unit mounts by the volume identity and fails closed
+      ansible.builtin.assert:
+        that:
+          # By the VOLUME's stable by-id device — never a filesystem UUID, which
+          # a snapshot-clone duplicates and could win at a later boot.
+          - billet_ledger_mount_unit_text | regex_findall('(?m)^What=(.*)$') | map('trim') | list == ['/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_vol0123456789abcdef0']
+          - billet_ledger_mount_unit_text | regex_findall('(?m)^Where=(.*)$') | map('trim') | list == ['/var/lib/billet/server']
+          - "'by-uuid' not in (billet_ledger_mount_unit_text | regex_findall('(?m)^What=.*$') | join)"
+          # FAIL CLOSED: a nofail option would let boot proceed and the server
+          # start on the root disk, the exact failure this exists to prevent.
+          # The full Options value is pinned so ANY appended option is caught.
+          - billet_ledger_mount_unit_text | regex_findall('(?m)^Options=(.*)$') | map('trim') | list == ['defaults,noatime']
+        fail_msg: >-
+          The ledger mount unit must mount the volume's own by-id device at the
+          server state dir with exactly Options=defaults,noatime.
+
+    # THE PREPARE-ONLY HOLD. A prepared control-plane host has a mounted, proved,
+    # still-unclaimed ledger volume and no deployment identity; starting the
+    # server would mint one, which is indistinguishable from a genuinely new
+    # deployment afterwards. The hold is in THIS unit rather than a drop-in for
+    # the same reason the mount fence is: the upgrade transaction refuses
+    # drop-ins it cannot replace and recover, and only this file is staged,
+    # backed up, committed and rolled back with the transaction.
+    #
+    # MEASURED on systemd 255 rather than reasoned about, because the obvious
+    # mechanism does not work: `systemctl mask` REFUSES a unit whose real file
+    # is at /etc/systemd/system/<unit>, which is where the role renders this one
+    # ("Failed to mask unit, file ... already exists"). With the assertion, a
+    # start exits 1 with AssertResult=no and the unit stays inactive EVEN WHEN
+    # ENABLED; without it the same unit starts, AssertResult=yes.
+    - name: Render the server unit held, and not held
+      ansible.builtin.set_fact:
+        billet_server_unit_held: >-
+          {{ lookup('ansible.builtin.template', template_dir + '/billet-server.service.j2') }}
+      vars:
+        billet_ledger_volume_id: vol-0123456789abcdef0
+        billet_server_prepare_only: true
+
+    - name: The hold appears exactly when prepare-only is requested
+      ansible.builtin.assert:
+        that:
+          # LINE-ANCHORED, so a commented-out directive cannot satisfy it.
+          - billet_server_unit_held | regex_findall('(?m)^AssertPathExists=(.*)$') | length == 1
+          # ASSERT, never Condition: a failed condition SKIPS the unit and reports
+          # the start job as SUCCESSFUL, which is the wrong signal for a
+          # deliberate hold and would let a caller believe the server was running.
+          - billet_server_unit_held | regex_findall('(?m)^Condition[A-Za-z]*=') | length == 0
+          # FALSE BY AN IMMUTABLE PROPERTY, not by a path nobody happens to have
+          # created. `!` negates, and `/` exists on every running system, so this
+          # can never be satisfied. The first version asserted a /nonexistent/...
+          # path, which is conventional rather than uncreatable: anything that
+          # created it would silently commission the host. A sentinel whose
+          # PRESENCE meant held would be worse still -- deleting it would.
+          - billet_server_unit_held | regex_findall('(?m)^AssertPathExists=(.*)$') | map('trim') | list == ['!/']
+          # It belongs to [Unit]: an assertion under [Service] is not a directive
+          # systemd applies to the job.
+          - billet_server_unit_held.index('AssertPathExists') < billet_server_unit_held.index('[Service]')
+          # And it must NOT appear on an ordinary control plane, or every normal
+          # host would refuse to start its server.
+          - billet_server_unit_ledger | regex_findall('(?m)^Assert[A-Za-z]*=') | length == 0
+          - billet_server_unit_plain | regex_findall('(?m)^Assert[A-Za-z]*=') | length == 0
+          # The hold must not cost the host its mount fence.
+          - billet_server_unit_held | regex_findall('(?m)^Requires=(.*)$') | map('trim') | list == ['var-lib-billet-server.mount']
+        fail_msg: >-
+          billet-server.service must carry exactly one AssertPathExists=!/
+          inside [Unit], exactly when billet_server_prepare_only is true — and
+          must keep its ledger mount dependencies while held.
+
+    # THE NODE IS HELD TOO, and this is the assertion that would have caught the
+    # defect in the first version of this change. On a host running both roles
+    # a CERTLESS node mints the deployment identity when the server has not: `billet
+    # node` claims the deployment before it reaches --upgrade-probe, and
+    # nodeDeploymentID falls through to state.DeploymentID(server.state_dir),
+    # whose comment says "whichever role runs first mints the identity". Holding
+    # only the server left the invariant broken by the other unit on the machine.
+    - name: Render the node unit held, and not held
+      ansible.builtin.set_fact:
+        billet_node_unit_held: >-
+          {{ lookup('ansible.builtin.template', template_dir + '/billet-node.service.j2') }}
+      vars:
+        billet_server_prepare_only: true
+        # The node unit's own switches; the hold must not depend on them.
+        billet_firecracker_enabled: true
+
+    - name: Render the node unit on an ordinary host
+      ansible.builtin.set_fact:
+        billet_node_unit_plain: >-
+          {{ lookup('ansible.builtin.template', template_dir + '/billet-node.service.j2') }}
+      vars:
+        billet_server_prepare_only: false
+        # The node unit's own switches; the hold must not depend on them.
+        billet_firecracker_enabled: true
+
+    - name: The node carries the same hold, on the same terms
+      ansible.builtin.assert:
+        that:
+          - billet_node_unit_held | regex_findall('(?m)^AssertPathExists=(.*)$') | map('trim') | list == ['!/']
+          - billet_node_unit_held | regex_findall('(?m)^Condition[A-Za-z]*=') | length == 0
+          - billet_node_unit_held.index('AssertPathExists') < billet_node_unit_held.index('[Service]')
+          # And an ordinary node is untouched, or every host with a node would
+          # refuse to start one.
+          - billet_node_unit_plain | regex_findall('(?m)^Assert[A-Za-z]*=') | length == 0
+        fail_msg: >-
+          billet-node.service must carry the same AssertPathExists=!/ hold as the
+          server exactly when billet_server_prepare_only is true. A prepare-only
+          host that held only the server would have its deployment identity
+          minted by the node instead.
+
+    # Mirrors main.yml's escape expression; keep the two in sync. The probe is
+    # computed in a {{ }} TEMPLATE (the same Jinja context main.yml's set_fact
+    # uses — measured: it PRESERVES the \x2d escape, where assert's `that:`
+    # context interprets it), and the assertions avoid backslash literals: the
+    # length pins exactly one real backslash (30 chars) and the x2d marker must
+    # survive, so a Jinja that started interpreting the escape fails both.
+    # Verified byte-identical against `systemd-escape --path --suffix=mount`.
+    - name: Probe the unit-name escape for a plain and a dashed path
+      ansible.builtin.set_fact:
+        billet_escape_plain: >-
+          {{ ('/var/lib/billet/server' | trim('/') | replace('-', '\x2d') | replace('/', '-')) ~ '.mount' }}
+        billet_escape_dashed: >-
+          {{ ('/var/lib/my-app/server' | trim('/') | replace('-', '\x2d') | replace('/', '-')) ~ '.mount' }}
+
+    - name: The unit-name escape handles plain and dashed paths like systemd-escape
+      ansible.builtin.assert:
+        that:
+          - billet_escape_plain == 'var-lib-billet-server.mount'
+          - billet_escape_dashed | length == 30
+          - "'x2d' in billet_escape_dashed"
+          - billet_escape_dashed is match('var-lib-my.x2dapp-server\.mount')
+        fail_msg: >-
+          The Jinja path escape no longer matches systemd-escape --path; a
+          mismatched name makes systemd refuse the mount unit (Where does not
+          match the unit name), which fails closed but blocks every converge.
+
+    - name: The mount's Where and the unit's RequiresMountsFor name the same path
+      ansible.builtin.assert:
+        that:
+          - >-
+            billet_ledger_mount_unit_text | regex_findall('(?m)^Where=(.*)$') | first | trim ==
+            billet_server_unit_ledger | regex_findall('(?m)^RequiresMountsFor=(.*)$') | first | trim
+        fail_msg: >-
+          The mount unit's Where and the server unit's RequiresMountsFor no
+          longer name the same path. Both read billet_candidate_server_state_dir
+          — they did NOT once, and the server unit re-derived its own answer from
+          billet_config.server.state_dir, which is the default for every
+          PostgreSQL deployment whatever it named. If they diverge the server
+          requires a mount that never appears, or worse, does not require the one
+          that does.

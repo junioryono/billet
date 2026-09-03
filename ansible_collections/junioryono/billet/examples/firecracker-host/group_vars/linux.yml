@@ -1,0 +1,27 @@
+---
+# REPLACE THIS FILE WITH WHAT `billet init --emit ansible` PRINTS.
+#
+#   billet init --emit ansible \
+#     --provider firecracker \
+#     --config ~/billet-app.yaml \
+#     --org your-org \
+#     --runner-group billet-trusted \
+#     --workflow 'your-org/your-repo/.github/workflows/ci.yml@refs/heads/main' \
+#     > group_vars/linux.yml
+#
+# --config names the file `billet github-app create` wrote the App identity
+# into; without it the block carries app_id 0 and the role refuses it. Only the
+# block goes to stdout, so the redirect is safe.
+#
+# Drop --runner-group and --workflow to get `trust: untrusted` tiers instead —
+# a microVM isolates the guest kernel, so unlike Docker this backend can run code
+# billet cannot vouch for. Read the comment the generated file puts above
+# untrusted_bridge; it tells you which kind you got.
+#
+# A firecracker emission carries NO provisioning flags, because the role's
+# defaults are already a Firecracker host — including the two bridges billet0 and
+# billet1 that the generated config names.
+#
+# The empty mapping below is deliberate: a plausible placeholder would pass the
+# role's input assertions and fail later, inside the upgrade transaction.
+billet_config: {}

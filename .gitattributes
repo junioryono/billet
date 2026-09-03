@@ -1,0 +1,22 @@
+# A MIGRATION'S BYTES ARE PUBLISHED, so nothing may rewrite them on the way to a
+# working tree.
+#
+# internal/state/migrations/*.sql carry the exact statement bytes every existing
+# deployment recorded a sha256 of. A line-ending conversion on checkout — which is
+# what core.autocrlf does on a Windows or a misconfigured machine — would change
+# every checksum in the file, and the control plane would refuse to start with
+# "migrations are append-only and must never be edited" against a ledger that is
+# perfectly fine.
+#
+# `text eol=lf` rather than `-text`: it pins the working tree to LF in both
+# directions AND keeps the files textual, so a new migration still reviews as a
+# readable diff. internal/state/migrationfiles.go refuses a carriage return
+# outright, which is what makes the failure loud if anything gets past this.
+internal/state/migrations/*.sql text eol=lf
+
+# THE SAME REASON, ONE FILE OVER. scripts/kernel/check-config.sh is moby's script
+# vendored verbatim and pinned by sha256; the release gate refuses to run a copy
+# that does not hash to the pin. A line-ending conversion on checkout changes every
+# byte of it, so the gate would report an unreviewed edit against a file nobody
+# touched -- and the remedy it names, restoring the file with git, would not help.
+scripts/kernel/check-config.sh text eol=lf

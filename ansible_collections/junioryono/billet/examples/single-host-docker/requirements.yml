@@ -1,0 +1,10 @@
+---
+# Pin `version` to a release tag before you rely on this. `main` is what the
+# walkthrough used and it moves; billet is pre-alpha and the role's inputs are
+# still allowed to change between commits.
+collections:
+  - name: git+https://github.com/junioryono/billet.git#/ansible_collections/junioryono/billet/
+    type: git
+    version: main
+  - name: ansible.posix
+    version: ">=1.5.4"

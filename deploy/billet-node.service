@@ -1,0 +1,78 @@
+# billet compute host.
+#
+# NOT ENABLED OR STARTED BY THE PACKAGE.
+#
+#   systemctl enable --now billet-node
+#
+# A node needs three things before it will start: a node section in
+# /etc/billet/billet.yaml naming the control plane, the certificate bundle
+# `billet ca issue <name>` produced on that control plane, and access to a
+# container runtime.
+[Unit]
+Description=billet compute host
+Documentation=https://github.com/junioryono/billet
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+# READINESS IS BILLET'S TO REPORT; see the same block in billet-server.service.
+# The node sends READY=1 once its provider is initialized and its contribution
+# resolved, before it registers with the control plane — so a start that
+# succeeds means this host is able to take work, not merely that a process
+# exists.
+Type=notify
+NotifyAccess=main
+# THE NODE IS A PRIVILEGED HOST AGENT. Docker needs a rootful socket, and the
+# Firecracker backend additionally creates TAP devices and block-device nodes,
+# enters cgroups and chroots, and signals a VMM only after tying its pid to the
+# lease. Running this unit as the server's unprivileged account makes the
+# Firecracker configuration pass schema validation and fail on its first job.
+#
+# The VMM does NOT remain root: the jailer drops each guest to its own uid before
+# Firecracker reads guest-controlled state. This root process is the custodian
+# that creates and later destroys those boundaries.
+User=root
+Group=root
+
+ExecStart=/usr/bin/billet node --config /etc/billet/billet.yaml
+
+StateDirectory=billet/node
+StateDirectoryMode=0700
+
+# /run/billet/locks is the host-wide collision domain for node invocations that
+# carry one deployment identity. The server no longer takes this lock; its
+# authoritative state store serializes the control plane instead.
+RuntimeDirectory=billet/locks
+RuntimeDirectoryMode=0750
+
+# Sized for billet's maximum configurable drain (24h) + teardown (~25m) + margin.
+# A node's drain waits for the containers it is holding, and a SIGKILL through
+# the middle of it leaves them running with their leases renewed by nobody.
+TimeoutStopSec=88200
+
+# The bound on reaching READY=1: provider initialization and capacity
+# detection, before any registration attempt.
+TimeoutStartSec=120
+KillSignal=SIGTERM
+KillMode=mixed
+
+Restart=on-failure
+RestartSec=5s
+
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# The node maps RBD devices and the jailer creates per-guest cgroups through
+# sysfs. ProtectKernelTunables would remount those required interfaces read-only.
+ProtectKernelModules=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+
+ReadOnlyPaths=/etc/billet
+# Certificate renewal installs a new key, leaf and CA bundle atomically while
+# the process is running. Keep the rest of /etc immutable to the node.
+ReadWritePaths=-/etc/billet/tls -/srv/jailer
+
+[Install]
+WantedBy=multi-user.target

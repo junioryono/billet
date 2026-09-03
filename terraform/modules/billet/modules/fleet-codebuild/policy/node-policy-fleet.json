@@ -1,0 +1,49 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "BilletCodeBuildRun",
+      "Effect": "Allow",
+      "Action": [
+        "codebuild:StartBuild",
+        "codebuild:StopBuild"
+      ],
+      "Resource": [
+        "arn:TFPARTITION:codebuild:TFREGION:TFACCOUNT:project/TFPROJECT"
+      ]
+    },
+    {
+      "Sid": "BilletCodeBuildRead",
+      "Effect": "Allow",
+      "Action": [
+        "codebuild:BatchGetBuilds",
+        "codebuild:ListBuildsForProject",
+        "codebuild:BatchGetProjects"
+      ],
+      "Resource": [
+        "arn:TFPARTITION:codebuild:TFREGION:TFACCOUNT:project/TFPROJECT"
+      ]
+    },
+    {
+      "Sid": "BilletCodeBuildStageRegistration",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:PutParameter",
+        "ssm:DeleteParameter"
+      ],
+      "Resource": [
+        "arn:TFPARTITION:ssm:TFREGION:TFACCOUNT:parameter/TFPARAMPATH/*"
+      ]
+    },
+    {
+      "Sid": "BilletCodeBuildFleetRead",
+      "Effect": "Allow",
+      "Action": [
+        "codebuild:BatchGetFleets"
+      ],
+      "Resource": [
+        "arn:TFPARTITION:codebuild:TFREGION:TFACCOUNT:fleet/TFFLEET"
+      ]
+    }
+  ]
+}

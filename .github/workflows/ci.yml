@@ -1,0 +1,534 @@
+name: CI
+
+# billet's own CI runs on GitHub-hosted runners for now. Dogfooding it on billet
+# is a goal, but a runner platform that can only be built by an already-working
+# copy of itself is a bootstrap trap — the hosted path stays supported forever.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # THIS JOB RUNS THE SUITE TWICE AND TALKS TO TWO REAL SERVICES, so it is the
+    # one job whose runtime is not mostly Go. `-race -covermode=atomic` over the
+    # whole tree, against a real Docker daemon for internal/e2e and a real
+    # PostgreSQL for the backend tests, then the capacity suite again against
+    # PostgreSQL.
+    #
+    # SIZED FROM WHAT THE SUITE MEASURABLY COSTS, NOT FROM A ROUND NUMBER. The
+    # race suite takes about eleven minutes and the PostgreSQL capacity suite two
+    # more, so a 15-minute job was cancelling itself AFTER every step had passed,
+    # in the coverage upload -- a gate failing a correct change on wall clock it
+    # never controlled. Two branches raised it to 25 for that reason the same
+    # day. Raise it again when the suite grows; do not trim tests to fit it.
+    timeout-minutes: 25
+
+    # THE POSTGRESQL BACKEND IS TESTED AGAINST A REAL SERVER OR NOT AT ALL.
+    # Every fact internal/state pins about it is a fact about the server rather
+    # than about billet's code -- what an advisory lock excludes, what a
+    # read-only transaction refuses, what the catalogue reports -- so a fake
+    # would assert billet's own assumptions back at itself. The tests SKIP
+    # without BILLET_TEST_POSTGRES_DSN and REFUSE to skip when CI is set, so a
+    # run that lost this service fails loudly instead of reporting success for a
+    # backend nothing exercised.
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: billet
+          POSTGRES_PASSWORD: billet
+          POSTGRES_DB: billet
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U billet"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      BILLET_TEST_POSTGRES_DSN: postgres://billet:billet@127.0.0.1:5432/billet?sslmode=disable
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify modules are tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      # -race matters more than usual here: the control plane is a capacity
+      # allocator with concurrent scale-set listeners, and a data race in that
+      # code double-admits jobs onto a machine that cannot hold them.
+      - name: Test
+        run: go test -race -count=1 -coverprofile=coverage.out -covermode=atomic ./...
+
+      # THE CAPACITY SUITE AGAIN, AGAINST THE OTHER ENGINE.
+      #
+      # internal/alloc holds the rules a second backend could break without
+      # failing to compile: escrow before advertising, the fencing epoch,
+      # capacity charged on COALESCE(node, target_node), custody staying charged
+      # until evidence, and the quiescence answer `billet local down` stops
+      # services on. Every one is a property of a TRANSACTION, and the
+      # transaction is exactly what differs between a file with a write lock and
+      # a server with an advisory one.
+      #
+      # THE SAME TESTS, NOT A SECOND SUITE, so a rule added there is covered on
+      # both engines without anybody remembering to add it twice. The run above
+      # is SQLite; this one sets BILLET_TEST_LEDGER and fails rather than
+      # skipping if the server is missing.
+      #
+      # NOT -race HERE. The race detector's value is in the SQLite run above,
+      # which exercises the same Go with the same concurrency; this run is about
+      # what the SERVER does, and doubling a 50-second suite to re-answer a
+      # question already answered buys nothing.
+      #
+      # internal/state is NOT re-run: its PostgreSQL coverage is the dedicated
+      # backend tests, which the run above already executed against this service.
+      # Adding it here would re-run its SQLite suite and call it conformance.
+      - name: Test the capacity suite against PostgreSQL
+        run: go test -count=1 ./internal/alloc/
+        env:
+          BILLET_TEST_LEDGER: postgres
+
+      - name: Coverage summary
+        run: go tool cover -func=coverage.out | tail -1
+
+      - uses: codecov/codecov-action@v7
+        with:
+          files: coverage.out
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: make fmt-check
+
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          # Pinned, not `latest`: a linter that changes under you turns an
+          # unrelated PR red and trains people to ignore the signal.
+          version: v2.12.2
+
+      # billet's own analyzers, plus the tests that prove they still detect
+      # anything. The second half is not optional: tools/lint is a nested module,
+      # so `go test ./...` in the Test job does NOT reach the analyzers' own
+      # suites — and an analyzer that silently stopped detecting would still
+      # report zero violations, which reads exactly like a clean tree.
+      - name: Run billet's own analyzers
+        run: make lint-custom
+
+  # The committed query code must be what sqlc produces from the query files AND
+  # the migrations, because sqlc reads the migration history rather than a
+  # flattened schema — so adding a migration can change generated code.
+  #
+  # ITS OWN JOB, AND HERE RATHER THAN IN `make check`: the generated code is
+  # committed precisely so an ordinary build never downloads sqlc, and CI runs
+  # build/vet/test/lint individually rather than the composite target, so a gate
+  # added to `check` alone runs on nobody's machine but the author's.
+  sqlc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Version pinned exactly and read from the Makefile, the way golangci-lint
+      # and goreleaser are: this step compares committed output against what one
+      # specific sqlc generates, so `@latest` means a new sqlc release fails an
+      # unrelated PR that touched no SQL.
+      - name: Prove the committed queries are what sqlc generates
+        run: |
+          version=$(make --no-print-directory print-sqlc-version)
+          go install "github.com/sqlc-dev/sqlc/cmd/sqlc@$version"
+          sqlc diff
+
+  # A broken release config should fail on the PR that broke it, not at the
+  # moment somebody presses the release button. `check` is cheap — it parses and
+  # validates, it does not build.
+  #
+  # ITS OWN JOB, AND INSTALLED FROM THE MODULE PROXY. Both halves of that are a
+  # reaction to the same outage: goreleaser-action downloads a tarball from
+  # GitHub's release CDN, that CDN served 503 to all three of the action's
+  # attempts twice in one day, and because the step lived in `lint` it took
+  # golangci-lint down with it — a red "lint" on runs where nothing had been
+  # linted at all. Separating the job means a CDN blip can only fail the thing
+  # it is actually about, and `go install` fetches through proxy.golang.org,
+  # which is a cache rather than a redirect to the same CDN.
+  release-config:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Version pinned exactly, the way golangci-lint is, and read from the
+      # Makefile so the gate and `make tools` cannot drift to two goreleasers.
+      - name: Validate the release config
+        run: |
+          version=$(make --no-print-directory print-goreleaser-version)
+          go install "github.com/goreleaser/goreleaser/v2@$version"
+          goreleaser check
+
+      # `terraform/` was in no release for months and nothing said so: it simply
+      # postdated every tag, so a consumer pinning the module got "subdir not
+      # found" and only `main` or a bare SHA resolved. This proves every
+      # documented source names a version and that git carries the path it
+      # names; `cut-release.yml` runs the same script with the tag.
+      #
+      # HERE RATHER THAN ONLY IN `make check`: CI runs build/vet/test/lint
+      # individually rather than the composite target, so a gate added to
+      # `check` alone runs on nobody's machine but the author's.
+      - name: Prove every documented Terraform module source is pinnable
+        run: make module-sources
+
+  host-lifecycle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install the pinned Ansible runtime
+        run: |
+          python -m pip install ansible-core==2.19.4
+          # The host role's guest-network tasks use ansible.posix.sysctl, and
+          # the fresh-check parses the WHOLE role (static imports resolve
+          # modules even for tasks a controller-only run skips), so bare
+          # ansible-core is not enough.
+          ansible-galaxy collection install ansible.posix:2.2.2
+
+      - name: Exercise alert ownership migration and teardown
+        run: make alert-lifecycle
+
+      - name: Exercise development-host check mode
+        run: make development-check-mode
+
+      - name: Guard transactional host-upgrade ordering
+        run: make host-upgrade-order
+
+      - name: Pin the fail-closed ledger mount units
+        run: make ledger-mount-render
+
+      # billet ships its units twice — the package installs deploy/*.service,
+      # the role renders its own templates — and nothing compared them until
+      # this. Hardening one and forgetting the other is the failure it catches.
+      - name: Prove the packaged units and the role's templates agree
+        run: make unit-parity
+
+      # The PostgreSQL ledger shipped and the role read
+      # server.state_dir, which such a config does not have — so every one of
+      # them converged green against the DEFAULT directory, sandboxed and
+      # mounted somewhere the control plane does not use.
+      - name: Prove the host role converges a PostgreSQL deployment
+        run: make postgres-profile
+
+      # The runner itself is the fresh host: no billet account, binary or
+      # units. The packaged postinstall pre-creates the account everywhere
+      # else, so this is the one place CI sees an operator's first dry run.
+      - name: Dry-run the host role against a fresh machine
+        run: make host-fresh-check
+
+      # The seam between the two suites: the Go tests prove the emission is a
+      # correct CONFIG and the Ansible tests feed the role a config written by
+      # hand, so neither noticed that the default emission was one the role
+      # REFUSES. This puts a generated block through the real role.
+      - name: Converge the host role with a generated block
+        run: make emitted-block-check
+
+      # And the EXAMPLE a stranger copies, with a block generated the way its
+      # README instructs. emitted-block-check converges the role with both
+      # services disabled; this one enables them, so it covers the input path
+      # that requires the App key.
+      - name: Converge the shipped example with a generated block
+        run: make example-check
+
+      # The other example, as far as a runner without /dev/kvm or a Ceph cluster
+      # can take it: that the role ACCEPTS a firecracker emission. That is the
+      # seam the docker emission broke — a block the role refused before
+      # rendering anything, which neither test suite could see.
+      - name: Accept a firecracker emission through the role
+        run: make firecracker-example-check
+
+      # Both gates above carry the key path the role owns, so neither reaches
+      # the half of the policy that governs a key the role does NOT manage —
+      # delete that branch and they stay green. This runs the policy's five
+      # cases directly.
+      - name: Prove the GitHub App key policy on both paths
+        run: make key-policy-check
+
+      # No other suite names a version, so none of them reaches binary.yml —
+      # delete it and they all stay green. This also asks the release origin
+      # whether the URL the role builds is one it publishes, which check mode
+      # cannot see: get_url does not fetch there, so every dry run passes
+      # against a 404.
+      # No other suite sets RUNNER_NAME, so none of them reaches the guard --
+      # delete it and they all stay green. The refusal it makes is the difference
+      # between a converge that fails and one that destroys the job running it.
+      - name: Prove a converge cannot be driven from a billet runner
+        run: make converge-guard-check
+
+      - name: Prove the pinned-release fetch path
+        run: make release-fetch-check
+
+  # Both legs here need the real Debian package, so they share a job: `dist` is
+  # phony and runs again for the second target, but the Go build cache is warm
+  # by then and it costs about a minute.
+  package-lifecycle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install the pinned release builder
+        run: |
+          version=$(make --no-print-directory print-goreleaser-version)
+          go install "github.com/goreleaser/goreleaser/v2@$version"
+
+      - name: Exercise package installation and removal
+        run: make package-lifecycle
+
+      # AN UNTESTED BACKUP IS NOT A BACKUP, which ADR-001 has said since before
+      # backup existed. This is the packaged-Linux half of the rehearsal: a real
+      # .deb, the real service account, a real `billet local backup` and a
+      # restore onto a state directory that has never seen the deployment, run
+      # as root exactly as an operator would. It found a defect on its first run
+      # — every file a root restore published stayed root-owned inside a
+      # service-owned directory, so the restored control plane could not open
+      # one of them — which nothing in the Go suite could see.
+      - name: Rehearse a restore on a packaged Linux host
+        run: make restore-rehearsal
+
+      # AND THE PROFILE WHERE THE ARCHIVE IS THE ONLY COPY THERE IS. A
+      # PostgreSQL deployment archives HALF of itself on purpose — the ledger is
+      # pg_dump's to copy — so this exercises a different archive schema, an
+      # entry set one short, and two refusals that exist nowhere else. The step
+      # above cannot reach any of it, and control-plane-postgres has no ledger
+      # volume by design, which makes that archive the only copy of the
+      # deployment identity a replacement controller can be built from.
+      - name: Rehearse a restore of a PostgreSQL deployment
+        run: make postgres-restore-rehearsal
+
+  # The Terraform module has no compiler, so fmt/validate/test in CI is the only
+  # thing standing between a typo and an operator's plan. The tests run against
+  # a mocked provider: no credentials, nothing created, real provider schemas.
+  terraform:
+    # Named by the leg's ROLE, not its version: a required-status-check
+    # configured against a name that embeds the pin would silently stop being
+    # satisfied on the next version bump.
+    name: terraform (${{ matrix.label }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The REPO floor, measured twice: the suite's override_during needs
+          # 1.11 (1.10.5 fails init), and its apply-mode upgrade test needs
+          # 1.14 — earlier versions run every assertion green and then fail the
+          # file, because tearing that state down means destroying the ledger
+          # volume and prevent_destroy refuses it (1.13.3 fails, 1.14.0 passes).
+          # The module's consumer floor stays 1.9 in versions.tf — a consumer's
+          # init never parses a child's tests/, which the leg below proves.
+          - { label: "floor", terraform: "1.14.0", probe: false }
+          - { label: "stable", terraform: "1.15.9", probe: false }
+          # Early warning for the next terraform release, never a blocker: a
+          # red probe is information, not a broken PR. Today latest resolves
+          # to the same stable as the pinned leg above — the probe's value
+          # arrives the day the next minor releases, with no pin bump.
+          - { label: "latest-probe", terraform: "latest", probe: true }
+    continue-on-error: ${{ matrix.probe }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ matrix.terraform }}
+          # The wrapper shims terraform for plan-output capture, which breaks
+          # plain `make` invocations; these jobs only need the real binary.
+          terraform_wrapper: false
+
+      - name: Format, validate, and plan-test the module
+        run: |
+          make tf-fmt-check
+          make tf-validate
+          make tf-test
+
+      # WHAT A CHANGE COSTS A RUNNING DEPLOYMENT is committed beside the module,
+      # because a plan cannot say it: ADR-004 keeps live billet nodes outside
+      # Terraform, so "1 to change, 1 to destroy" reads the same for a tag and for
+      # the instance holding the ledger. This refuses a module resource with no
+      # entry — and an entry for a resource no module declares, which is how a
+      # stale table goes on looking like coverage.
+      #
+      # It needs no terraform at all, so it also runs in the Go job through
+      # `make test`; it is here because this is the job somebody adding a
+      # resource to the module will be watching.
+      - name: Prove every module resource is classified
+        run: make tf-classify
+
+      - name: Unit-test the spot-router Lambda
+        # Lives here, not in `check`'s Go jobs: this is the terraform module's
+        # code, and its drop-vs-re-raise classification decides whether a real
+        # two-minute Spot warning is lost. Before this job existed it ran in no
+        # CI job at all.
+        run: make lambda-test
+
+  # The module declares required_version >= 1.9 for CONSUMERS, whose init
+  # never parses the child's tests/ — but this repo's module directory cannot
+  # init on 1.9 (the test suite needs 1.14), so without this leg the declared
+  # consumer floor would be an untested claim that rots. It validates exactly
+  # what a consumer resolves: the module sources without tests.
+  terraform-consumer-floor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.9.8"
+          terraform_wrapper: false
+
+      - name: Validate the module as a 1.9 consumer resolves it
+        # As a CHILD module under a minimal root, not as a root itself: root
+        # validation misses child-module-only behavior and points path.root at
+        # the module. The root passes only the one required variable, so it
+        # also proves every other input genuinely defaults.
+        run: |
+          workdir=$(mktemp -d)
+          mkdir "$workdir/module" "$workdir/consumer"
+          cp -R terraform/modules/billet/. "$workdir/module/"
+          rm -rf "$workdir/module/tests" "$workdir/module/.terraform" "$workdir/module/.terraform.lock.hcl"
+          cat > "$workdir/consumer/main.tf" <<'HCL'
+          module "billet" {
+            source = "../module"
+            name   = "billet-floor"
+          }
+          HCL
+          terraform -chdir="$workdir/consumer" init -backend=false -input=false > /dev/null
+          terraform -chdir="$workdir/consumer" validate
+
+  # Lint and config-scan are terraform-version-independent, so they run once.
+  # Versions are read from the Makefile, the way goreleaser's is, so the
+  # workflow and `make tf-lint`/`make tf-scan` cannot drift apart.
+  terraform-lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Read the pinned scanner versions
+        id: pins
+        run: |
+          echo "tflint=$(make --no-print-directory print-tflint-version)" >> "$GITHUB_OUTPUT"
+          echo "trivy=$(make --no-print-directory print-trivy-version)" >> "$GITHUB_OUTPUT"
+
+      - uses: terraform-linters/setup-tflint@v6
+        with:
+          tflint_version: ${{ steps.pins.outputs.tflint }}
+
+      - name: tflint (aws ruleset pinned in .tflint.hcl)
+        # The token keeps the ruleset download from tripping GitHub's
+        # unauthenticated rate limit on busy days.
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: make tf-lint
+
+      # Aqua's own setup action rather than curl-piping contrib/install.sh:
+      # the pin above selects which trivy BINARY to fetch, but a piped script
+      # from the main branch is unpinned code executing first.
+      - uses: aquasecurity/setup-trivy@v0.3.1
+        with:
+          version: ${{ steps.pins.outputs.trivy }}
+
+      - name: trivy config scan (ignores are justified in .trivyignore)
+        run: make tf-scan
+
+  # A control plane that holds a GitHub App key and terminates TLS should not
+  # ship with known-vulnerable dependencies.
+  vuln:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+  # The binary must build for every platform a node can run on, since nodes are
+  # deployed by copying one static file. Cross-compilation is the cheapest way to
+  # catch a build-tag mistake before someone hits it on a Mac mini.
+  cross-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: darwin, goarch: arm64 }
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: go build -o /dev/null ./cmd/billet

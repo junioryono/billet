@@ -1,0 +1,406 @@
+---
+# FIRST, BEFORE EVERY OTHER TASK, and in its own file so the gate can exercise it
+# with tasks_from -- without that, a fixture has to satisfy the whole role's
+# validation before it reaches the guard, and every "this case is allowed" check
+# ends up failing for an unrelated reason instead of passing.
+- name: Refuse a converge that would destroy the job running it
+  ansible.builtin.import_tasks: converge-guard.yml
+
+- name: Inspect persisted billet installation inputs
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  register: billet_persisted_inputs
+  loop:
+    - /usr/bin/billet
+    - /etc/billet/app-private-key.pem
+    - /var/lib/billet/upgrades/active
+  check_mode: false
+  become: true
+
+- name: Validate the billet host platform before journal inspection
+  ansible.builtin.assert:
+    that:
+      - ansible_facts["system"] == "Linux"
+      - ansible_facts["service_mgr"] == "systemd"
+    fail_msg: >-
+      The billet host role requires a Linux systemd host. It cannot inspect or
+      recover a durable Linux service transaction on another platform.
+
+# ONE PREDICATE FOR EVERY START, derived once. billet_enable_server answers "is
+# this host the control plane" and is what ledger-mount's assert tests;
+# billet_server_should_run answers "may it run right now", which is what every
+# start-capable task is really asking. Written as one fact because the role
+# starts the server from SIX places — the readiness probe, the ordinary restart,
+# the steady-state start, the upgrade finalizer, the recovery finalizer, and
+# durable enablement that starts it at the next boot — and a hold applied to some
+# of them is not a hold.
+- name: Derive whether the billet server may run on this host
+  ansible.builtin.set_fact:
+    billet_server_should_run: >-
+      {{ billet_enable_server and not (billet_server_prepare_only | default(false)) }}
+    # THE NODE IS HELD TOO, AND THAT IS NOT SYMMETRY FOR ITS OWN SAKE. A CERTLESS
+    # node co-resident with a server mints the deployment identity when the server
+    # has not: `billet node` claims the deployment before it reaches
+    # --upgrade-probe, and with no certificate bundle nodeDeploymentID falls
+    # through to state.DeploymentID(server.state_dir), whose comment says so
+    # outright -- "whichever role runs first mints the identity". A node WITH a
+    # bundle reads its deployment from the certificate instead, so it is only the
+    # certless case that breaks the invariant. A prepared host is USUALLY in it --
+    # nothing has issued a certificate yet -- but the role neither issues nor
+    # forbids a pre-provisioned node.tls bundle, so that is not guaranteed.
+    # Holding the node is therefore conservative rather than exact, and costs
+    # nothing: its control plane is not running, so it has nothing to dial.
+    billet_node_should_run: >-
+      {{ billet_enable_node and not (billet_server_prepare_only | default(false)) }}
+
+- name: Validate the prepare-only request
+  ansible.builtin.assert:
+    that:
+      # A host prepared to become a control plane must BE one; and preparing
+      # without the ledger volume is a contradiction, since the role skips the
+      # whole mount-and-prove path when no volume is named, leaving nothing
+      # prepared for the state to land on.
+      - not (billet_server_prepare_only | default(false)) or billet_enable_server
+      - >-
+        not (billet_server_prepare_only | default(false)) or
+        billet_ledger_volume_id | default('') | length > 0
+    fail_msg: >-
+      billet_server_prepare_only prepares a control-plane host without starting
+      it, so it requires billet_enable_server (this host is the control plane; it
+      is simply not commissioned yet) and billet_ledger_volume_id (without a
+      ledger volume there is no mounted, proved, still-unclaimed filesystem for
+      the preserved state to be copied onto, which is the entire purpose).
+
+- name: Inspect a durable host-upgrade journal before normal convergence
+  ansible.builtin.import_tasks: upgrade-inspect.yml
+
+# The escaped mount unit name is computed HERE — before account.yml renders the
+# server unit, which must name the exact .mount unit in Requires= — and before
+# the recovery guard below, which needs it to prove the ledger is mounted. The
+# escape mirrors `systemd-escape --path` for ordinary paths (dashes become
+# \x2d, slashes become dashes); a path exotic enough to diverge fails CLOSED —
+# systemd refuses a mount unit whose name does not match its Where=, so the
+# mount never starts and the converge stops, rather than the server starting
+# unfenced.
+- name: Compute the ledger mount unit name
+  ansible.builtin.set_fact:
+    billet_ledger_mount_unit_name: >-
+      {{ (billet_candidate_server_state_dir | trim('/')
+          | replace('-', '\x2d') | replace('/', '-')) ~ '.mount' }}
+
+# A HOST CONVERGED WITH A LEDGER VOLUME MUST NOT SILENTLY DROP IT. The mount
+# unit on disk is durable evidence of the earlier choice; an inventory that
+# omits billet_ledger_volume_id against such a host would render the server
+# unit WITHOUT the mount dependency, and the next failed mount would fork the
+# ledger onto the root disk — the exact failure the volume exists to prevent.
+- name: Inspect the installed ledger mount unit
+  ansible.builtin.stat:
+    path: "/etc/systemd/system/{{ billet_ledger_mount_unit_name }}"
+  register: billet_ledger_mount_unit_installed_stat
+  check_mode: false
+  become: true
+
+- name: Refuse to drop a previously configured ledger volume
+  ansible.builtin.assert:
+    that:
+      - billet_ledger_volume_id | length > 0 or not billet_ledger_mount_unit_installed_stat.stat.exists
+    fail_msg: >-
+      {{ billet_ledger_mount_unit_name }} is installed, so this host was
+      converged with billet_ledger_volume_id, but the current inventory does
+      not set it. Refusing to render billet-server.service without its mount
+      dependency: a later failed mount would start the server on the root disk
+      with a fresh ledger. Set billet_ledger_volume_id, or deliberately remove
+      the mount unit and migrate the ledger off the volume first.
+
+- name: Refuse a dry run that cannot recover an interrupted upgrade
+  ansible.builtin.assert:
+    that:
+      - not billet_interrupted_upgrade | bool
+    fail_msg: >-
+      An interrupted billet upgrade is recorded at
+      /var/lib/billet/upgrades/active. Run the playbook without --check so the
+      role can prove both services stopped and restore the durable recovery
+      copy before applying any other host changes.
+  when: ansible_check_mode
+
+- name: Recover an interrupted billet upgrade before converging anything else
+  ansible.builtin.import_tasks: upgrade-recover.yml
+  when:
+    - billet_interrupted_upgrade | bool
+    - not ansible_check_mode
+
+- name: Require a fresh converge after interrupted-upgrade recovery
+  ansible.builtin.fail:
+    msg: >-
+      The interrupted billet upgrade was {{
+        'finished from its durable commit'
+        if billet_upgrade_commit_state.stat.exists
+        else 'rolled back from ' ~ billet_upgrade_recovery_dir
+      }}. Rerun the playbook to start a fresh transaction for the requested
+      binary.
+  when:
+    - billet_interrupted_upgrade | bool
+    - not ansible_check_mode
+
+# THE APP KEY IS DEMANDED BY THE CONFIG, NOT BY THE SERVICE. `billet check`
+# reads github.private_key_path whenever the config carries a github block, and
+# --maintenance-probe does not skip that read, so the key is needed on every
+# host this role checks — including one converged with billet_enable_server
+# false. Keyed on the service instead, a single-host block converged with the
+# server disabled reaches that check INSIDE the upgrade transaction and rolls
+# back a hundred tasks in, naming a missing file rather than a missing input.
+#
+# PRESENCE of the block decides it, not the length of a path: a github block
+# whose private_key_path is missing, empty or not a string is a config billet
+# refuses on load, and catching that here is the point of deciding it here.
+# The trailing default('', true) is load-bearing, and not for the reason it
+# looks: `github: null` and `github: <string>` THROW on attribute access
+# without it, so the fact becomes a Jinja error in place of the refusal
+# below. It also has to enclose the type test, because set_fact stringifies
+# whatever the expression returns — a test outside it always says string.
+- name: Decide what this host's config asks of the GitHub App key
+  ansible.builtin.set_fact:
+    billet_github_key_required: >-
+      {{ billet_config is mapping and 'github' in billet_config }}
+    billet_github_key_path: >-
+      {{ ((billet_config | default({})).github | default({})).private_key_path | default('', true) }}
+    billet_github_key_path_is_string: >-
+      {{ (((billet_config | default({})).github | default({})).private_key_path | default('', true)) is string }}
+
+# The role manages the key at ONE path. It does not refuse the others: a
+# config may name a key some other mechanism provisions, and billet only ever
+# READS the path — the copy below has a fixed destination, so nothing the
+# config says can direct a write. What it refuses is being handed a key it
+# would install somewhere the config does not name, which installs a secret
+# and fixes nothing.
+- name: Decide whether this role manages the GitHub App key
+  ansible.builtin.set_fact:
+    billet_github_key_managed: >-
+      {{ billet_github_key_required | bool
+         and billet_github_key_path == '/etc/billet/app-private-key.pem' }}
+
+- name: Validate billet host inputs
+  ansible.builtin.assert:
+    that:
+      - billet_binary_src | length > 0 or billet_version | length > 0 or billet_persisted_inputs.results[0].stat.exists
+      - billet_config is mapping
+      - billet_config | length > 0
+      - not billet_ceph_bootstrap or billet_ceph_mon_ip | length > 0
+      - not billet_ceph_bootstrap or billet_ceph_devices | length > 0
+      - billet_networks | map(attribute='name') | unique | list | length == billet_networks | length
+      - billet_networks | map(attribute='name') | select('match', '^[A-Za-z0-9][A-Za-z0-9_.-]{0,14}$') | list | length == billet_networks | length
+      - "'.' not in (billet_networks | map(attribute='name') | list)"
+      - "'..' not in (billet_networks | map(attribute='name') | list)"
+    fail_msg: >-
+      A billet host needs a Linux billet binary and a complete billet_config.
+      Name the binary with billet_binary_src, or a release to fetch with
+      billet_version; an already-installed binary is enough on an ordinary
+      converging run, which therefore needs no secret input. Ceph bootstrap additionally
+      requires an explicit monitor address and device list; disks are never
+      inferred. Guest bridge names must be unique Linux interface names of at
+      most 15 characters and cannot contain path or control characters.
+
+- name: Refuse a managed GitHub App key with nothing to install and none installed
+  ansible.builtin.assert:
+    that:
+      - billet_github_private_key_src | length > 0 or billet_persisted_inputs.results[1].stat.exists
+    fail_msg: >-
+      billet_config.github.private_key_path is /etc/billet/app-private-key.pem,
+      which this role manages, but no key is there and none was supplied. Pass
+      the key `billet github-app create` wrote as billet_github_private_key_src
+      on the first converge; after that the installed file is enough. `billet
+      check` reads it on every host, whichever services are enabled.
+  when: billet_github_key_managed | bool
+
+- name: Refuse a github block billet will not load
+  ansible.builtin.assert:
+    that:
+      - billet_config.github is mapping
+      - billet_github_key_path_is_string | bool
+      - billet_github_key_path | length > 0
+    fail_msg: >-
+      billet_config.github is present but names no usable private_key_path.
+      billet requires github.private_key_path whenever a github block exists and
+      refuses the config when it LOADS — which, left to billet, happens inside
+      this role's upgrade transaction, after the host has already been changed.
+  when: billet_github_key_required | bool
+
+- name: Refuse a GitHub App key this role cannot install where the config reads it
+  ansible.builtin.assert:
+    that:
+      - billet_github_private_key_src | length == 0
+    fail_msg: >-
+      billet_config.github.private_key_path is {{ billet_github_key_path }}, but
+      this role installs a key only to /etc/billet/app-private-key.pem. Installing
+      the one you passed would leave a secret on the host that billet never reads.
+      Either provision {{ billet_github_key_path }} by whatever manages it and drop
+      billet_github_private_key_src, or set private_key_path to
+      /etc/billet/app-private-key.pem — the block `billet init --emit ansible`
+      prints already does.
+  when:
+    - billet_github_key_required | bool
+    - not billet_github_key_managed | bool
+
+# AND THE KEY IT DOES NOT MANAGE STILL HAS TO BE THERE. Refusing the source was
+# only half of it: with no source and nothing at the configured path, preflight
+# had nothing left to check, and `billet check` found the missing file inside
+# the upgrade transaction — the late rollback this whole rule exists to prevent,
+# surviving in the one case the rule does not manage. check_mode false because
+# the answer is an observation, and a dry run that cannot see the key cannot
+# tell an operator their config points at nothing.
+#
+# This runs before NORMAL convergence mutates anything, which is not the same as
+# before anything at all: an interrupted transaction is recovered above, and
+# deliberately stays there. Recovery finishes work already authorised by an
+# earlier converge and must not be blocked by new inventory it was never about.
+- name: Inspect a GitHub App key this role does not manage
+  ansible.builtin.stat:
+    path: "{{ billet_github_key_path }}"
+    follow: true
+  register: billet_unmanaged_key
+  become: true
+  check_mode: false
+  when:
+    - billet_github_key_required | bool
+    - not billet_github_key_managed | bool
+
+- name: Refuse a config naming a GitHub App key that is not on the host
+  ansible.builtin.assert:
+    that:
+      # follow: true above, so these describe the link's TARGET — billet opens
+      # the path, and a key managed as a symlink is an ordinary arrangement.
+      - billet_unmanaged_key.stat.exists
+      - billet_unmanaged_key.stat.isreg
+    fail_msg: >-
+      billet_config.github.private_key_path is {{ billet_github_key_path }}, and
+      no readable file is there. This role installs a key only to
+      /etc/billet/app-private-key.pem, so it will not put one at that path —
+      provision it with whatever manages it before converging, or set
+      private_key_path to /etc/billet/app-private-key.pem and pass the key as
+      billet_github_private_key_src. Left to billet, this surfaces as a missing
+      file inside the upgrade transaction, after convergence has changed the
+      host.
+  when:
+    - billet_github_key_required | bool
+    - not billet_github_key_managed | bool
+
+# NO TASK-LEVEL GUARD ON THIS ASSERT. It carried `when: billet_config.node is
+# defined`, which made its first two clauses — the ones written for a host with
+# NO node — unreachable in exactly the case they protect: a control-plane-only
+# host with the role's defaults installed firecracker, the guest network and Ceph
+# on a machine that runs no jobs. Every clause below already handles both shapes.
+- name: Assert the provisioning flags match the configured provider
+  ansible.builtin.assert:
+    that:
+      # A host with NO node runs no compute backend, so it must provision none —
+      # otherwise a control-plane-only config with the default flags would install
+      # firecracker, the guest network and Ceph on a machine that runs no jobs.
+      - billet_config.node is defined or not billet_firecracker_enabled
+      - billet_config.node is defined or not billet_ceph_enabled
+      # With a node, its provider must be KNOWN and match the flags. A missing,
+      # empty or misspelled provider is refused HERE, before any task mutates the
+      # host, rather than left to `billet check` after the fact.
+      - billet_config.node is not defined or (billet_config.node.provider | default('')) in ['firecracker', 'ec2', 'docker', 'tart']
+      - billet_config.node is not defined or (billet_config.node.provider | default('')) != 'firecracker' or billet_firecracker_enabled
+      - billet_config.node is not defined or (billet_config.node.provider | default('')) == 'firecracker' or not billet_firecracker_enabled
+      - not billet_ceph_enabled or billet_firecracker_enabled
+    fail_msg: >-
+      node.provider must be one of firecracker, ec2, docker or tart, and
+      billet_firecracker_enabled and billet_ceph_enabled must match it. A
+      firecracker node needs the guest bridges this role installs; an ec2 or docker
+      node must have none, because the guest network serves only the firecracker
+      backend, so set billet_firecracker_enabled to false for an ec2 node.
+      billet_ceph_enabled provisions a Ceph cluster ON THIS host and so applies only
+      to a firecracker host — a firecracker node may instead use a Ceph cluster
+      another host bootstraps, so billet_ceph_enabled: false is valid there. A
+      missing or unknown provider is refused here rather than risking a destructive
+      guest-network teardown.
+
+      A host with NO node runs no compute backend and must provision none, so
+      both flags must be false there.
+
+# THE REFUSAL IN THAT FILE ONLY EXISTS IF SOMETHING RUNS IT. network-disable.yml
+# was written to stop a live firecracker host being converted to ec2 or docker
+# implicitly — a destructive teardown that must not race the transactional
+# upgrade. Its header says the role REFUSES this; nothing imported it, so it
+# never did, and emitting billet_firecracker_enabled: false is what reaches that
+# path.
+#
+# BEFORE account.yml, because account.yml renders the requested configuration
+# straight over /etc/billet/billet.yaml. Refusing after that point fails the
+# converge with the durable config already saying ec2 while a firecracker node
+# keeps running on its old in-memory copy — and a reboot before anyone cleans up
+# starts from the half-converted state. The probe is read-only, so running it
+# first costs nothing on a host that has nothing to refuse, which is every fresh
+# ec2 or docker node and every host that never had a guest network.
+- name: Refuse a guest network on a provider that has none
+  ansible.builtin.import_tasks: network-disable.yml
+  when: not billet_firecracker_enabled
+
+- name: Clear any candidate carried over from an earlier play
+  ansible.builtin.set_fact:
+    billet_candidate_on_target: false
+    billet_candidate_path: ""
+
+# billet_binary_src WINS, and says so rather than ignoring the other input
+# quietly. Overriding a pinned inventory for one run is the supported way to try
+# a build, so this is a report and not a refusal.
+- name: Report that a supplied binary overrides the pinned version
+  ansible.builtin.debug:
+    msg: >-
+      billet_binary_src is set, so billet_version {{ billet_version }} is NOT
+      being fetched; the supplied binary is what will be installed.
+  when:
+    - billet_version | length > 0
+    - billet_binary_src | length > 0
+
+# BEFORE account.yml, which is what inspects and journals the candidate, and
+# which creates the staging directory this needs — so binary.yml makes its own.
+# Skipped unless a version is named AND no binary was supplied, so an ordinary
+# billet_binary_src host never reaches the network.
+- name: Fetch the pinned billet release onto the target
+  ansible.builtin.import_tasks: binary.yml
+  when:
+    - billet_version | length > 0
+    - billet_binary_src | length == 0
+
+- name: Configure billet account and files
+  ansible.builtin.import_tasks: account.yml
+
+# AFTER account.yml (the state directory and service user exist) and BEFORE
+# services.yml (nothing may start against the root disk while the volume is
+# expected). Gated on the volume id: without one, mounting stays the operator's.
+- name: Mount the control-plane ledger volume fail closed
+  ansible.builtin.import_tasks: ledger-mount.yml
+  when: billet_ledger_volume_id | length > 0
+
+- name: Install the EC2 cache TLS material
+  ansible.builtin.import_tasks: cache-tls.yml
+  when:
+    - billet_config.node is defined
+    - (billet_config.node.cache | default({})).tls_cert is defined
+
+- name: Configure Firecracker
+  ansible.builtin.import_tasks: firecracker.yml
+  when: billet_firecracker_enabled
+
+- name: Configure guest networking
+  ansible.builtin.import_tasks: network.yml
+  when: billet_firecracker_enabled
+
+- name: Configure Ceph
+  ansible.builtin.import_tasks: ceph.yml
+  when: billet_ceph_enabled
+
+- name: Remove disabled Ceph kernel module policy
+  ansible.builtin.file:
+    path: /etc/modules-load.d/billet-rbd.conf
+    state: absent
+  when: not billet_ceph_enabled
+  become: true
+
+- name: Configure or remove Ceph health alerts
+  ansible.builtin.import_tasks: alerts.yml
+
+- name: Configure billet services
+  ansible.builtin.import_tasks: services.yml

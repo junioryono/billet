@@ -1,0 +1,80 @@
+name: billet Docker build and push
+description: Run docker/build-push-action against a per-job BuildKit daemon backed by a sticky disk.
+inputs:
+  cache-key:
+    description: Cache identity for the builder's sticky disk, normally the Dockerfile path prefixed by github.repository.
+    required: false
+    default: Dockerfile
+  cache-size-gb:
+    description: Sticky-disk size on first creation. Existing generations keep their original size.
+    required: false
+    default: "100"
+  context:
+    description: Build context, forwarded to docker/build-push-action. The default builds the checked-out repository.
+    required: false
+    default: "{{defaultContext}}"
+  file:
+    description: Dockerfile path within the context, forwarded to docker/build-push-action.
+    required: false
+  tags:
+    description: Newline- or comma-separated image tags, forwarded to docker/build-push-action.
+    required: false
+  push:
+    description: Push the built image to its registry, forwarded to docker/build-push-action.
+    required: false
+    default: "false"
+  load:
+    description: Load the built image into the local Docker daemon, forwarded to docker/build-push-action.
+    required: false
+    default: "false"
+  platforms:
+    description: Comma-separated target platforms, forwarded to docker/build-push-action.
+    required: false
+  target:
+    description: Build stage to stop at, forwarded to docker/build-push-action.
+    required: false
+  build-args:
+    description: Newline-separated build arguments, forwarded to docker/build-push-action.
+    required: false
+  secrets:
+    description: Newline-separated build secrets, forwarded to docker/build-push-action. Never written to the sticky disk.
+    required: false
+  labels:
+    description: Newline-separated image labels, forwarded to docker/build-push-action.
+    required: false
+  outputs:
+    description: Export destinations (type=...), forwarded to docker/build-push-action.
+    required: false
+outputs:
+  imageid:
+    description: Image ID from docker/build-push-action.
+    value: ${{ steps.build.outputs.imageid }}
+  digest:
+    description: Image digest from docker/build-push-action.
+    value: ${{ steps.build.outputs.digest }}
+  metadata:
+    description: Build result metadata JSON from docker/build-push-action.
+    value: ${{ steps.build.outputs.metadata }}
+runs:
+  using: composite
+  steps:
+    - id: setup
+      uses: junioryono/billet/actions/setup-docker-builder@main
+      with:
+        cache-key: ${{ inputs.cache-key }}
+        cache-size-gb: ${{ inputs.cache-size-gb }}
+    - id: build
+      uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+      with:
+        builder: ${{ steps.setup.outputs.name }}
+        context: ${{ inputs.context }}
+        file: ${{ inputs.file }}
+        tags: ${{ inputs.tags }}
+        push: ${{ inputs.push }}
+        load: ${{ inputs.load }}
+        platforms: ${{ inputs.platforms }}
+        target: ${{ inputs.target }}
+        build-args: ${{ inputs.build-args }}
+        secrets: ${{ inputs.secrets }}
+        labels: ${{ inputs.labels }}
+        outputs: ${{ inputs.outputs }}

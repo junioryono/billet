@@ -1,0 +1,24 @@
+name: billet stop Docker builder
+description: Internal post hook that quiesces BuildKit before its sticky disk commits.
+inputs:
+  container:
+    description: Name of the BuildKit container the setup action started; stopped before its state publishes.
+    required: true
+  builder:
+    description: Name of the buildx builder to remove, so a later job cannot select a builder whose daemon is gone.
+    required: true
+  state-path:
+    description: Sticky-disk mount holding the BuildKit state; quiesced here so the publication captures a consistent store.
+    required: true
+  mount-limit-bytes:
+    description: Ceiling on the cache-mount portion of the BuildKit store, enforced before publication (default 20 GiB).
+    required: false
+    default: "21474836480"
+  discard-marker:
+    description: Runner-local publication guard removed only after the cache-mount policy is enforced.
+    required: true
+runs:
+  using: node24
+  main: index.js
+  post: cleanup.js
+  post-if: always()

@@ -1,0 +1,50 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "BilletBackupObjects",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject"
+      ],
+      "Resource": [
+        "arn:TFPARTITION:s3:::TFBUCKET/TFPREFIX/*"
+      ]
+    },
+    {
+      "Sid": "BilletBackupList",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:TFPARTITION:s3:::TFBUCKET"
+      ],
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "TFPREFIX/*"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "BilletBackupKMSUse",
+      "Effect": "Allow",
+      "Action": [
+        "kms:DescribeKey",
+        "kms:GenerateDataKey",
+        "kms:Decrypt"
+      ],
+      "Resource": [
+        "arn:TFPARTITION:kms:TFREGION:000000000000:key/TFKMSKEY"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": "s3.TFREGION.TFDNSSUFFIX"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,40 @@
+---
+# THE COLLECTION README'S DOCUMENTED FIRST STEP, as a gate: "Run the playbook
+# with --check --diff before converging a new or existing machine ... so a
+# first dry run can describe the installation without failing on tools it has
+# not installed yet." A FRESH host is the case nothing else in CI exercises —
+# the packaged postinstall pre-creates the service account, so a preflight that
+# only works once the account exists looks green everywhere except an
+# operator's first machine. This play is run in CHECK MODE against a host with
+# no billet account, no billet binary and no billet units, and it must
+# complete: a crash here is a crash in every new deployment's first dry run.
+#
+# The failure it was born from: getent with fail_key: false answers a missing
+# account as {name: None} — the KEY is present — so a key-presence guard
+# admitted the fresh-host case into an assert that dereferenced None.
+- name: Check-mode converge of a fresh host
+  hosts: all
+  become: true
+  pre_tasks:
+    # The claim under test is "fresh": if the account already exists, a
+    # regressed preflight guard would pass anyway and this gate would prove
+    # nothing — so its absence is asserted rather than assumed.
+    - name: Prove the target has no billet account
+      ansible.builtin.command: id billet
+      register: billet_fresh_check_account
+      failed_when: billet_fresh_check_account.rc == 0
+      changed_when: false
+      check_mode: false
+  roles:
+    - role: junioryono.billet.host
+      billet_binary_src: "{{ billet_fresh_check_binary_src }}"
+      billet_enable_server: false
+      billet_enable_node: false
+      billet_firecracker_enabled: false
+      billet_ceph_enabled: false
+      billet_config:
+        server:
+          listen: 127.0.0.1:7717
+          state_dir: /var/lib/billet/server
+          max_vcpu: 2
+          max_memory: 4GiB

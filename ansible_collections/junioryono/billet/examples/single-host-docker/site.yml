@@ -1,0 +1,12 @@
+---
+- name: billet single-host Docker deployment
+  hosts: linux
+  become: true
+  gather_facts: true
+  roles:
+    - role: junioryono.billet.host
+      # Both roles on one machine. This is the shape `billet init` generates:
+      # the config carries a `server:` and a `node:` section, and the two
+      # processes talk over the loopback address it wrote.
+      billet_enable_server: true
+      billet_enable_node: true

@@ -1,0 +1,606 @@
+package alloc
+
+import (
+	"database/sql"
+	"errors"
+	"strings"
+	"testing"
+
+	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/state"
+)
+
+// ONE LABEL, TWO KINDS OF MACHINE.
+//
+// The point of the whole change: a tier that lists several backends may be
+// placed on a host running any of them, so losing the machine at home does not
+// take the `runs-on` label down with it. Before this, a tier named exactly one
+// provider and placement compared it for equality — which made a tier's backend
+// a property of its reservation and pinned every lease before anything knew
+// where it would run.
+func TestATierWithSeveralProvidersBindsToEither(t *testing.T) {
+	t.Parallel()
+
+	tier := config.Tier{
+		Label:     "billet-8vcpu-ubuntu-2404",
+		Providers: []config.ProviderKind{config.ProviderFirecracker, config.ProviderEC2},
+		VCPU:      8,
+		Memory:    32 * config.GiB,
+		GuestOS:   config.GuestLinux,
+	}
+
+	for name, host := range map[string]struct {
+		node     string
+		provider config.ProviderKind
+	}{
+		"the preferred backend": {"epyc-1", config.ProviderFirecracker},
+		"the fallback":          {"ec2-spot-1", config.ProviderEC2},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			a := newBareAllocator(t, Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB},
+				[]config.Tier{tier})
+
+			if _, err := a.RegisterNode(t.Context(), testRegistration(host.node, host.provider)); err != nil {
+				t.Fatalf("RegisterNode: %v", err)
+			}
+
+			lease, err := a.Reserve(t.Context(), tier.Label)
+			if err != nil {
+				t.Fatalf("Reserve: %v", err)
+			}
+
+			if err := a.Bind(t.Context(), lease.ID, lease.Epoch, host.node); err != nil {
+				t.Fatalf("a tier that accepts %v would not bind to a %s host: %v",
+					tier.Providers, host.provider, err)
+			}
+
+			// AND THE LEDGER RECORDS WHICH ONE IT ACTUALLY LANDED ON. "May run on"
+			// and "is running on" are different facts, and collapsing them is what
+			// made a fallback impossible to express.
+			bound, err := a.Lease(t.Context(), lease.ID)
+			if err != nil {
+				t.Fatalf("read the bound lease: %v", err)
+			}
+
+			if bound.Provider != host.provider {
+				t.Errorf("the lease records provider %q, want the backend it is on (%q)",
+					bound.Provider, host.provider)
+			}
+		})
+	}
+}
+
+// A lease chooses nothing until it is placed.
+//
+// The distinction the single column could not make: a reserved lease has not
+// been anywhere, so claiming a backend for it is a guess that later reads as a
+// fact.
+func TestAReservedLeaseHasNotChosenABackend(t *testing.T) {
+	t.Parallel()
+
+	tier := config.Tier{
+		Label:     "billet-8vcpu-ubuntu-2404",
+		Providers: []config.ProviderKind{config.ProviderFirecracker, config.ProviderEC2},
+		VCPU:      8,
+		Memory:    32 * config.GiB,
+		GuestOS:   config.GuestLinux,
+	}
+
+	a := newBareAllocator(t, Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB}, []config.Tier{tier})
+
+	// Somewhere to put it: escrow chooses a machine now, so a reservation against
+	// an empty fleet is refused rather than left unplaced.
+	if _, err := a.RegisterNode(t.Context(),
+		testRegistration("epyc-1", config.ProviderFirecracker)); err != nil {
+		t.Fatalf("RegisterNode: %v", err)
+	}
+
+	lease, err := a.Reserve(t.Context(), tier.Label)
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	if lease.Provider != "" {
+		t.Errorf("a reserved lease already claims to be on %q", lease.Provider)
+	}
+
+	if len(lease.Providers) != 2 {
+		t.Errorf("the lease records %v as acceptable, want both of the tier's", lease.Providers)
+	}
+}
+
+// A host running something the tier does not accept is still refused.
+//
+// Failover widens what is allowed; it does not remove the check. A firecracker
+// tier must not land on a docker host just because the tier now holds a list.
+func TestAProviderOutsideTheListIsStillRefused(t *testing.T) {
+	t.Parallel()
+
+	tier := config.Tier{
+		Label:     "billet-8vcpu-ubuntu-2404",
+		Providers: []config.ProviderKind{config.ProviderFirecracker, config.ProviderEC2},
+		VCPU:      8,
+		Memory:    32 * config.GiB,
+		GuestOS:   config.GuestLinux,
+	}
+
+	a := newBareAllocator(t, Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB}, []config.Tier{tier})
+
+	// A HOST THE TIER ACCEPTS, because a reservation has to be placeable before
+	// there is anything to bind. A fleet of only unacceptable machines advertises
+	// nothing now, which is the placement side of this rule and is covered by
+	// TestOnlyHostsThatCouldServeATierAreEligible.
+	if _, err := a.RegisterNode(t.Context(),
+		testRegistration("epyc-1", config.ProviderFirecracker)); err != nil {
+		t.Fatalf("RegisterNode: %v", err)
+	}
+
+	lease, err := a.Reserve(t.Context(), tier.Label)
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	// SEEDED, BECAUSE REGISTRATION NO LONGER ALLOWS IT. The backend changing under
+	// a reservation was the window this check guarded, and the registration guard
+	// now closes it: escrow names its machine, so a host with capacity outstanding
+	// cannot change backend even before anything binds. Bind's check stays as
+	// depth — it compares against the provider the node registered, not one a
+	// catalogue claims — so it is reached here the only way left.
+	if err := a.db.Tx(t.Context(), func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(t.Context(),
+			`UPDATE nodes SET provider = $1 WHERE name = $2`, config.ProviderDocker, "epyc-1")
+
+		return err
+	}); err != nil {
+		t.Fatalf("seed the backend change: %v", err)
+	}
+
+	err = a.Bind(t.Context(), lease.ID, lease.Epoch, "epyc-1")
+	if !errors.Is(err, ErrWrongProvider) {
+		t.Fatalf("bind to a backend the tier does not accept = %v, want ErrWrongProvider", err)
+	}
+}
+
+// THE ENCODING PRESERVES THE ORDER, because the order is a preference and not a
+// set: encodeProviders and decodeProviders are the durable representation, and a
+// representation that sorted or deduplicated would change what the list MEANS.
+//
+// THIS COMMENT HAS BEEN WRONG TWICE, both times by claiming a consequence
+// instead of stating the property, so here is what is actually traceable today.
+// No decoded lease reaches the chooser. insertLease returns a freshly built
+// Lease carrying Providers straight from the tier config; that is the value the
+// listener holds and hands to Launch, and nodeplane.pick walks THAT. The reload
+// paths that decode Providers — Assign, Bind, Heartbeat, Release, transition,
+// Lease(id) — do not feed it. So reordering in decodeProviders would fail this
+// test and would not, today, move a job.
+//
+// Which is the reason to keep the test rather than to weaken it. The order has
+// to already be intact in the ledger on the day something reads it back and
+// chooses: escrow-time placement is exactly that change, and it is easier to
+// hold an invariant than to discover it was lost.
+func TestThePreferenceOrderIsPreserved(t *testing.T) {
+	t.Parallel()
+
+	tier := config.Tier{
+		Label:     "billet-8vcpu-ubuntu-2404",
+		Providers: []config.ProviderKind{config.ProviderEC2, config.ProviderFirecracker},
+		VCPU:      8,
+		Memory:    32 * config.GiB,
+		GuestOS:   config.GuestLinux,
+	}
+
+	a := newBareAllocator(t, Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB}, []config.Tier{tier})
+
+	// Somewhere to put it: escrow chooses a machine now, so a reservation against
+	// an empty fleet is refused rather than left unplaced.
+	if _, err := a.RegisterNode(t.Context(),
+		testRegistration("epyc-1", config.ProviderFirecracker)); err != nil {
+		t.Fatalf("RegisterNode: %v", err)
+	}
+
+	lease, err := a.Reserve(t.Context(), tier.Label)
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	reloaded, err := a.Lease(t.Context(), lease.ID)
+	if err != nil {
+		t.Fatalf("read the lease back: %v", err)
+	}
+
+	want := []config.ProviderKind{config.ProviderEC2, config.ProviderFirecracker}
+
+	for i := range want {
+		if i >= len(reloaded.Providers) || reloaded.Providers[i] != want[i] {
+			t.Fatalf("preference read back as %v, want %v — the order is the whole meaning "+
+				"of the list", reloaded.Providers, want)
+		}
+	}
+}
+
+// A single `provider:` still works, unchanged.
+//
+// It is what almost every deployment wants and what every existing config says.
+func TestASingleProviderStillPlaces(t *testing.T) {
+	t.Parallel()
+
+	tier := config.Tier{
+		Label:    "billet-2vcpu",
+		Provider: config.ProviderDocker,
+		VCPU:     2,
+		Memory:   4 * config.GiB,
+		GuestOS:  config.GuestLinux,
+	}
+
+	a := newBareAllocator(t, Limits{MaxVCPU: 8, MaxMemory: 16 * config.GiB}, []config.Tier{tier})
+
+	if _, err := a.RegisterNode(t.Context(), testRegistration("laptop", config.ProviderDocker)); err != nil {
+		t.Fatalf("RegisterNode: %v", err)
+	}
+
+	lease, err := a.Reserve(t.Context(), tier.Label)
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	if err := a.Bind(t.Context(), lease.ID, lease.Epoch, "laptop"); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	bound, err := a.Lease(t.Context(), lease.ID)
+	if err != nil {
+		t.Fatalf("read the bound lease: %v", err)
+	}
+
+	if bound.Provider != config.ProviderDocker {
+		t.Errorf("chose %q, want docker", bound.Provider)
+	}
+}
+
+// alloc.New applies the same provider rules config.Load does.
+//
+// Its own doc says it cannot assume its catalogue came through Load — a caller
+// can build tiers in code — and it was accepting tiers that package refuses. The
+// macOS case is not tidiness: placement only tests list MEMBERSHIP, so a
+// [tart, ec2] macOS tier would bind a macOS lease to an EC2 node quite happily,
+// which is the Apple-hardware invariant gone.
+func TestNewRefusesTiersConfigWouldRefuse(t *testing.T) {
+	t.Parallel()
+
+	for name, tier := range map[string]config.Tier{
+		"both spellings": {
+			Label: "billet-8vcpu", VCPU: 8, Memory: 32 * config.GiB, GuestOS: config.GuestLinux,
+			Provider:  config.ProviderFirecracker,
+			Providers: []config.ProviderKind{config.ProviderFirecracker},
+		},
+		"a duplicate": {
+			Label: "billet-8vcpu", VCPU: 8, Memory: 32 * config.GiB, GuestOS: config.GuestLinux,
+			Providers: []config.ProviderKind{config.ProviderEC2, config.ProviderEC2},
+		},
+		"no provider at all": {
+			Label: "billet-8vcpu", VCPU: 8, Memory: 32 * config.GiB, GuestOS: config.GuestLinux,
+		},
+		"an unknown backend": {
+			Label: "billet-8vcpu", VCPU: 8, Memory: 32 * config.GiB, GuestOS: config.GuestLinux,
+			Providers: []config.ProviderKind{"quantum"},
+		},
+		"a macos tier that can leave apple hardware": {
+			Label: "billet-6vcpu-macos", VCPU: 6, Memory: 16 * config.GiB, GuestOS: config.GuestMacOS,
+			// PINNED, because alloc.New refuses an unpinned macOS tier for a
+			// different reason — the licence cap needs a host to count against.
+			// Without the pin this case never reached the check it is named for,
+			// and passed on the strength of the other rule.
+			Node:      "mac-mini-1",
+			Providers: []config.ProviderKind{config.ProviderTart, config.ProviderEC2},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			db := openState(t)
+
+			if _, err := New(db, Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB},
+				[]config.Tier{tier}); err == nil {
+				t.Fatalf("accepted a tier with %s", name)
+			}
+		})
+	}
+}
+
+// A stored provider list billet cannot fully read authorizes NOTHING.
+//
+// Dropping the entries it does not recognise and keeping the rest was fail-open:
+// "bogus,docker" still authorized a docker node, so a corrupted or truncated
+// placement fact silently became a narrower but still-valid one.
+func TestAMalformedProviderListFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	for name, stored := range map[string]string{
+		"an unknown entry": "bogus,docker",
+		"an empty element": ",docker",
+		"a trailing comma": "docker,",
+		"only junk":        "bogus",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := decodeProviders(stored); got != nil {
+				t.Errorf("decoded %q as %v; a placement fact billet cannot fully read must "+
+					"authorize nothing", stored, got)
+			}
+		})
+	}
+
+	// And a well-formed one still round-trips, in order.
+	want := []config.ProviderKind{config.ProviderFirecracker, config.ProviderEC2}
+
+	got := decodeProviders(encodeProviders(want))
+	if len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("a valid list round-tripped as %v, want %v", got, want)
+	}
+}
+
+// A host may not change its backend while it is running work, in ANY phase.
+//
+// Re-registration overwrote the provider freely, which falsified every lease
+// already bound there: each recorded the backend it chose at bind, and after the
+// change the ledger said a job ran on firecracker while the host called itself
+// docker. Later checks read the NODE's row, so they went on authorizing the
+// lease — the fact that had become wrong was the one nothing re-read.
+//
+// EVERY non-terminal phase is exercised. The first version bound a lease still
+// in `capacity` and stopped there, so a regression that guarded only that phase
+// would have passed — and `capacity` is the phase where the change matters least,
+// because nothing is running yet.
+func TestANodeCannotChangeBackendWhileRunningWork(t *testing.T) {
+	t.Parallel()
+
+	for _, phase := range []Phase{PhaseCapacity, PhaseAssigned, PhaseLaunching, PhaseOnline, PhaseBusy} {
+		t.Run(string(phase), func(t *testing.T) {
+			t.Parallel()
+
+			tier := config.Tier{
+				Label:     "billet-8vcpu-ubuntu-2404",
+				Providers: []config.ProviderKind{config.ProviderFirecracker, config.ProviderDocker},
+				VCPU:      8,
+				Memory:    32 * config.GiB,
+				GuestOS:   config.GuestLinux,
+			}
+
+			a := newBareAllocator(t, Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB},
+				[]config.Tier{tier})
+
+			if _, err := a.RegisterNode(t.Context(), testRegistration("shapeshifter", config.ProviderFirecracker)); err != nil {
+				t.Fatalf("RegisterNode: %v", err)
+			}
+
+			lease, err := a.Reserve(t.Context(), tier.Label)
+			if err != nil {
+				t.Fatalf("Reserve: %v", err)
+			}
+
+			if err := a.Bind(t.Context(), lease.ID, lease.Epoch, "shapeshifter"); err != nil {
+				t.Fatalf("Bind: %v", err)
+			}
+
+			advanceTo(t, a, lease, phase)
+
+			// Both backends are acceptable to the tier, so nothing downstream would
+			// object — which is exactly why the refusal has to happen here.
+			_, err = a.RegisterNode(t.Context(), testRegistration("shapeshifter", config.ProviderDocker))
+			if !errors.Is(err, ErrWrongProvider) {
+				t.Fatalf("a host running %s work changed its backend: %v", phase, err)
+			}
+
+			// AND THE MESSAGE SAYS HOW TO GET OUT. This fires during startup — cmd
+			// registers the node before it recovers anything — so an operator meets
+			// it with billet refusing to boot. Naming the value to put back is the
+			// difference between an instruction and a dead end.
+			if !strings.Contains(err.Error(), string(config.ProviderFirecracker)) {
+				t.Errorf("the refusal does not name the provider to restore: %v", err)
+			}
+
+			// The lease still says what it actually chose.
+			bound, err := a.Lease(t.Context(), lease.ID)
+			if err != nil {
+				t.Fatalf("read the lease: %v", err)
+			}
+
+			if bound.Provider != config.ProviderFirecracker {
+				t.Errorf("the lease now claims %q; its compute is still on firecracker",
+					bound.Provider)
+			}
+		})
+	}
+}
+
+// A host may re-register with the SAME backend while busy — that is an ordinary
+// restart, and refusing it would make a crash unrecoverable.
+func TestABusyNodeMayReRegisterUnchanged(t *testing.T) {
+	t.Parallel()
+
+	tier := config.Tier{
+		Label:     "billet-8vcpu-ubuntu-2404",
+		Providers: []config.ProviderKind{config.ProviderFirecracker},
+		VCPU:      8,
+		Memory:    32 * config.GiB,
+		GuestOS:   config.GuestLinux,
+	}
+
+	a := newBareAllocator(t, Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB}, []config.Tier{tier})
+
+	if _, err := a.RegisterNode(t.Context(), testRegistration("epyc-1", config.ProviderFirecracker)); err != nil {
+		t.Fatalf("RegisterNode: %v", err)
+	}
+
+	lease, err := a.Reserve(t.Context(), tier.Label)
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	if err := a.Bind(t.Context(), lease.ID, lease.Epoch, "epyc-1"); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	advanceTo(t, a, lease, PhaseBusy)
+
+	if _, err := a.RegisterNode(t.Context(), testRegistration("epyc-1", config.ProviderFirecracker)); err != nil {
+		t.Fatalf("a busy host could not restart under the same backend, which makes a crash "+
+			"unrecoverable: %v", err)
+	}
+}
+
+// A host whose leases are all TERMINAL changes freely: nothing is running to
+// falsify.
+func TestANodeWithOnlyFinishedWorkMayChangeBackend(t *testing.T) {
+	t.Parallel()
+
+	tier := config.Tier{
+		Label:     "billet-8vcpu-ubuntu-2404",
+		Providers: []config.ProviderKind{config.ProviderFirecracker, config.ProviderDocker},
+		VCPU:      8,
+		Memory:    32 * config.GiB,
+		GuestOS:   config.GuestLinux,
+	}
+
+	a := newBareAllocator(t, Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB}, []config.Tier{tier})
+
+	if _, err := a.RegisterNode(t.Context(), testRegistration("epyc-1", config.ProviderFirecracker)); err != nil {
+		t.Fatalf("RegisterNode: %v", err)
+	}
+
+	lease, err := a.Reserve(t.Context(), tier.Label)
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	if err := a.Bind(t.Context(), lease.ID, lease.Epoch, "epyc-1"); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	if err := a.Release(t.Context(), lease.ID, lease.Epoch, PhaseDone); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+
+	if _, err := a.RegisterNode(t.Context(), testRegistration("epyc-1", config.ProviderDocker)); err != nil {
+		t.Fatalf("a host with only finished work could not change its backend: %v", err)
+	}
+}
+
+// advanceTo walks a bound lease to a phase.
+func advanceTo(t *testing.T, a *Allocator, lease *Lease, phase Phase) {
+	t.Helper()
+
+	order := []Phase{PhaseAssigned, PhaseLaunching, PhaseOnline, PhaseBusy}
+
+	for _, step := range order {
+		if step == PhaseAssigned {
+			if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 1, 1); err != nil {
+				t.Fatalf("Assign: %v", err)
+			}
+		} else if err := a.Advance(t.Context(), lease.ID, lease.Epoch, step); err != nil {
+			t.Fatalf("Advance to %s: %v", step, err)
+		}
+
+		if step == phase {
+			return
+		}
+	}
+}
+
+// An IDLE host changes freely — the refusal is about running work, not about
+// pinning a machine forever.
+func TestAnIdleNodeMayChangeBackend(t *testing.T) {
+	t.Parallel()
+
+	a := newBareAllocator(t, Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB},
+		[]config.Tier{{
+			Label: "billet-8vcpu", Providers: []config.ProviderKind{config.ProviderDocker},
+			VCPU: 8, Memory: 32 * config.GiB, GuestOS: config.GuestLinux,
+		}})
+
+	if _, err := a.RegisterNode(t.Context(), testRegistration("spare", config.ProviderFirecracker)); err != nil {
+		t.Fatalf("RegisterNode: %v", err)
+	}
+
+	if _, err := a.RegisterNode(t.Context(), testRegistration("spare", config.ProviderDocker)); err != nil {
+		t.Fatalf("an idle host could not change its backend: %v", err)
+	}
+}
+
+// AN UPGRADED LEASE STILL PLACES.
+//
+// The claim the state package's migration test could not make: it can only read
+// columns back, because alloc imports state and not the other way round. This is
+// the behaviour anyone actually cares about — a job that was in flight when the
+// operator upgraded still gets a host — and the migration is only useful insofar
+// as it produces a lease that binds.
+//
+// The pre-upgrade row is written directly, which is the point: it never went
+// through Reserve, so nothing in this test can accidentally supply the value the
+// migration is supposed to have backfilled.
+func TestAnUpgradedLeaseStillBinds(t *testing.T) {
+	t.Parallel()
+
+	tier := config.Tier{
+		Label:     "billet-8vcpu-ubuntu-2404",
+		Providers: []config.ProviderKind{config.ProviderFirecracker},
+		VCPU:      8,
+		Memory:    32 * config.GiB,
+		GuestOS:   config.GuestLinux,
+	}
+
+	db := openState(t)
+
+	a, err := New(db, Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB}, []config.Tier{tier})
+	if err != nil {
+		t.Fatalf("alloc.New: %v", err)
+	}
+
+	if _, err := a.RegisterNode(t.Context(), testRegistration("epyc-1", config.ProviderFirecracker)); err != nil {
+		t.Fatalf("RegisterNode: %v", err)
+	}
+
+	// A row exactly as migration 9 leaves one: providers backfilled from the old
+	// single column, nothing chosen because it was never bound.
+	const leaseID = "upgraded-lease"
+
+	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(t.Context(),
+			`INSERT INTO leases
+			   (id, tier, node, macos_slot, guest_os, provider, providers, chosen_provider,
+			    phase, vcpu, memory, epoch, created_at, heartbeat_at, expires_at)
+			 VALUES ($1, $2, NULL, 0, 'linux', 'firecracker', 'firecracker', '',
+			         'capacity', 8, 34359738368, 0, '2026-01-01T00:00:00Z',
+			         '2026-01-01T00:00:00Z', '2999-01-01T00:00:00Z')`,
+			leaseID, tier.Label)
+
+		return err
+	}); err != nil {
+		t.Fatalf("write a migrated lease: %v", err)
+	}
+
+	if err := a.Bind(t.Context(), leaseID, 0, "epyc-1"); err != nil {
+		t.Fatalf("a lease carried across the upgrade could not be placed: %v", err)
+	}
+
+	bound, err := a.Lease(t.Context(), leaseID)
+	if err != nil {
+		t.Fatalf("read the bound lease: %v", err)
+	}
+
+	if bound.Provider != config.ProviderFirecracker {
+		t.Errorf("the upgraded lease recorded %q as its backend", bound.Provider)
+	}
+}
+
+// openState opens a throwaway ledger.
+func openState(t *testing.T) *state.DB {
+	t.Helper()
+
+	db := openTestLedger(t)
+
+	return db
+}

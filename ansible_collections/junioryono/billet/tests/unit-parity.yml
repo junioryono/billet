@@ -1,0 +1,281 @@
+---
+# BILLET SHIPS ITS SYSTEMD UNITS TWICE, and nothing compared them until this.
+#
+# deploy/*.service is what the .deb and .rpm install; the role's Jinja templates
+# are what an Ansible-managed host gets. They are deliberately NOT byte-equal —
+# the role templates identity, conditionally fences the ledger mount, and
+# renders a different readiness protocol for a legacy binary — so a diff would
+# be noise. What must not drift is the SEMANTICS an operator depends on: which
+# account the service runs as, what it executes, how long it is given to drain,
+# and the sandbox it is confined by. Harden one copy and forget the other and
+# the two provisioning paths quietly stop being the same product.
+#
+# Renders every variant the role can produce, because a single render cannot
+# speak for the others: the node's dependencies differ by backend, the server's
+# differ by whether a dedicated ledger volume fences the state directory, and
+# the readiness protocol differs between a preserved legacy install and the
+# steady state the upgrade transaction installs. The render compared against
+# the package is that steady state — the shape a role-managed host ends up
+# running — not the ordinary converge's decision, which is asserted separately
+# below as a rule rather than a render.
+- name: The packaged units and the role's templates agree on what matters
+  hosts: localhost
+  gather_facts: false
+  connection: local
+
+  vars:
+    billet_repo_root: "{{ playbook_dir }}/../../../.."
+    billet_role_templates: "{{ playbook_dir }}/../roles/host/templates"
+
+    # The inputs the templates need. billet_firecracker_enabled deliberately has
+    # no template-level default — a provider-aware unit rendered without knowing
+    # the provider would be a guess — so every render below states it.
+    billet_service_user: billet
+    billet_service_group: billet
+    billet_config:
+      server:
+        state_dir: /var/lib/billet/server
+      node:
+        state_dir: /var/lib/billet/node
+    # THE RESOLVED SERVER STATE DIRECTORY, which the role derives once in
+    # upgrade-inspect.yml before any unit is rendered — from `identity_dir` when
+    # the config names its ledger backend and from `state_dir` otherwise. The
+    # template reads the FACT rather than re-deriving, so there is one answer:
+    # a second derivation in the template would keep reading `state_dir` and
+    # sandbox the wrong directory on every PostgreSQL deployment. Stated here for
+    # the same reason billet_ledger_mount_unit_name is — a missing value must
+    # fail the render rather than emit a unit with a guess in it.
+    billet_candidate_server_state_dir: /var/lib/billet/server
+
+  tasks:
+    - name: Read the packaged units and render every variant of the role's
+      ansible.builtin.set_fact:
+        packaged_server: "{{ lookup('ansible.builtin.file', billet_repo_root + '/deploy/billet-server.service') }}"
+        packaged_node: "{{ lookup('ansible.builtin.file', billet_repo_root + '/deploy/billet-node.service') }}"
+        # THE STEADY-STATE SHAPE the upgrade transaction installs, which is
+        # what a host converged by the role ends up running and therefore the
+        # render that must match the package.
+        role_server_steady: "{{ lookup('ansible.builtin.template', billet_role_templates + '/billet-server.service.j2',
+          template_vars={'billet_systemd_notify_ready': true}) }}"
+        role_node_steady: "{{ lookup('ansible.builtin.template', billet_role_templates + '/billet-node.service.j2',
+          template_vars={'billet_systemd_notify_ready': true, 'billet_firecracker_enabled': false}) }}"
+        # A PRESERVED LEGACY INSTALL: a binary that predates notifyReady keeps
+        # the protocol it already had.
+        role_server_legacy: "{{ lookup('ansible.builtin.template', billet_role_templates + '/billet-server.service.j2',
+          template_vars={'billet_systemd_notify_ready': false}) }}"
+        # THE UPGRADE TRANSACTION'S QUIESCENT PROBE.
+        role_server_probe: "{{ lookup('ansible.builtin.template', billet_role_templates + '/billet-server.service.j2',
+          template_vars={'billet_systemd_notify_ready': true, 'billet_systemd_upgrade_probe': true}) }}"
+        # A SERVER WHOSE LEDGER IS ON ITS OWN VOLUME, which legitimately adds a
+        # second After= and the mount fence. The package cannot know about a
+        # volume, so this variant is compared against itself rather than
+        # against deploy/, and its extra directives are pinned below.
+        role_server_ledger: "{{ lookup('ansible.builtin.template', billet_role_templates + '/billet-server.service.j2',
+          template_vars={'billet_systemd_notify_ready': true, 'billet_ledger_volume_id': 'vol-0123456789abcdef0',
+          'billet_ledger_mount_unit_name': 'var-lib-billet-server.mount'}) }}"
+        # A FIRECRACKER NODE, whose guest bridges are a real dependency.
+        role_node_firecracker: "{{ lookup('ansible.builtin.template', billet_role_templates + '/billet-node.service.j2',
+          template_vars={'billet_systemd_notify_ready': true, 'billet_firecracker_enabled': true}) }}"
+
+    # The comparison is per directive and LIST-valued, because several of these
+    # legitimately appear more than once (a Firecracker node has two After=
+    # lines) and a single-value regex would silently compare only the first.
+    # Line-anchored, so a commented-out directive cannot satisfy a match.
+    - name: The server's invariant directives agree
+      ansible.builtin.assert:
+        that:
+          # PRESENT, then equal. Equality alone is satisfied by [] == [], so a
+          # directive deleted from BOTH copies — the sandbox quietly dropped
+          # from the package and the template together — would pass the gate
+          # that exists to notice it.
+          - (packaged_server | regex_findall('(?m)^' ~ item ~ '=(.*)$') | length) > 0
+          - (packaged_server | regex_findall('(?m)^' ~ item ~ '=(.*)$') | map('trim') | list)
+            == (role_server_steady | regex_findall('(?m)^' ~ item ~ '=(.*)$') | map('trim') | list)
+        fail_msg: >-
+          The packaged server unit and the role's steady-state render disagree on {{ item }}:
+          packaged {{ packaged_server | regex_findall('(?m)^' ~ item ~ '=(.*)$') | map('trim') | list }},
+          role {{ role_server_steady | regex_findall('(?m)^' ~ item ~ '=(.*)$') | map('trim') | list }}.
+          These two are the same product provisioned two ways; change both or neither.
+      loop:
+        # What the unit says it is, and when it runs.
+        - Description
+        - Documentation
+        - After
+        - Wants
+        # Identity and what it runs.
+        - ExecStart
+        - User
+        - Group
+        - UMask
+        # Readiness and lifecycle.
+        - Type
+        - NotifyAccess
+        - TimeoutStartSec
+        - TimeoutStopSec
+        - KillSignal
+        - KillMode
+        - Restart
+        - RestartSec
+        # The sandbox.
+        - NoNewPrivileges
+        - PrivateTmp
+        - ProtectSystem
+        - ProtectHome
+        - ProtectKernelTunables
+        - ProtectKernelModules
+        - ProtectControlGroups
+        - RestrictSUIDSGID
+        - RestrictNamespaces
+        - LockPersonality
+        - MemoryDenyWriteExecute
+        - SystemCallArchitectures
+        - SystemCallFilter
+        - CapabilityBoundingSet
+        - ReadOnlyPaths
+        # Where it is wanted.
+        - WantedBy
+
+    - name: The node's invariant directives agree
+      ansible.builtin.assert:
+        that:
+          # PRESENT, then equal. Equality alone is satisfied by [] == [], so a
+          # directive deleted from BOTH copies — the sandbox quietly dropped
+          # from the package and the template together — would pass the gate
+          # that exists to notice it.
+          - (packaged_node | regex_findall('(?m)^' ~ item ~ '=(.*)$') | length) > 0
+          - (packaged_node | regex_findall('(?m)^' ~ item ~ '=(.*)$') | map('trim') | list)
+            == (role_node_steady | regex_findall('(?m)^' ~ item ~ '=(.*)$') | map('trim') | list)
+        fail_msg: >-
+          The packaged node unit and the role's steady-state render disagree on {{ item }}:
+          packaged {{ packaged_node | regex_findall('(?m)^' ~ item ~ '=(.*)$') | map('trim') | list }},
+          role {{ role_node_steady | regex_findall('(?m)^' ~ item ~ '=(.*)$') | map('trim') | list }}.
+      loop:
+        - Description
+        - Documentation
+        - Wants
+        - ExecStart
+        - User
+        - Group
+        - Type
+        - NotifyAccess
+        - TimeoutStartSec
+        - TimeoutStopSec
+        - KillSignal
+        - KillMode
+        - Restart
+        - RestartSec
+        - RuntimeDirectory
+        - RuntimeDirectoryMode
+        - PrivateTmp
+        - ProtectSystem
+        - ProtectHome
+        - ProtectKernelModules
+        - RestrictSUIDSGID
+        - LockPersonality
+        - SystemCallArchitectures
+        - ReadOnlyPaths
+        - WantedBy
+
+    # THE READINESS RULE ITSELF, which no render can show: the templates take
+    # the protocol as an input, so what decides it on an ordinary converge is
+    # the expression in the role.
+    #
+    # Measured on systemd 255, a unit that is not installed answers `systemctl
+    # show --property=Type --value` with exit 0 and an EMPTY string, so the
+    # exit status distinguishes nothing here. An absent unit therefore proves
+    # only that no unit exists — NOT that the binary already on the host can
+    # send READY=1 — and this branch runs precisely when no binary is being
+    # installed. Handing a Type=notify unit to a binary that predates
+    # notifyReady is a host that fails its start at TimeoutStartSec, outside
+    # the transaction that would roll it back.
+    - name: The readiness rule is loaded from the role
+      ansible.builtin.set_fact:
+        billet_account_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/account.yml') | from_yaml }}"
+
+    - name: An ordinary converge grants notification only to a unit that already has it
+      vars:
+        install_task: "{{ billet_account_tasks | selectattr('name', 'equalto', 'Install the billet systemd units') | first }}"
+        rule: "{{ install_task.vars.billet_systemd_notify_ready | string }}"
+      ansible.builtin.assert:
+        that:
+          - "\"== 'notify'\" in rule"
+          - "\"in ['', 'notify']\" not in rule"
+        fail_msg: >-
+          The ordinary-converge readiness rule no longer requires an installed unit to already
+          report notify. An absent unit does not prove the installed binary can send READY=1,
+          and this path runs with a binary of unknown vintage.
+
+    # THE DIFFERENCES ARE ASSERTED TOO, not merely tolerated. Each is deliberate
+    # and each is the kind of thing that would otherwise drift into an accident;
+    # pinning them means the gate notices when one stops being true, instead of
+    # a reviewer having to remember why the lists above omit them.
+    - name: The deliberate differences are exactly the deliberate ones
+      ansible.builtin.assert:
+        that:
+          # systemd creates the state directories for the packaged units. The
+          # role pre-creates them itself (it owns the ledger-volume mount) and
+          # grants write access by path instead.
+          - packaged_server | regex_findall('(?m)^StateDirectory=(.*)$') | map('trim') | list == ['billet/server']
+          - role_server_steady | regex_findall('(?m)^StateDirectory=') | length == 0
+          - packaged_server | regex_findall('(?m)^ReadWritePaths=') | length == 0
+          - role_server_steady | regex_findall('(?m)^ReadWritePaths=(.*)$') | map('trim') | list
+            == ['"/var/lib/billet/server"']
+          - packaged_node | regex_findall('(?m)^StateDirectory=(.*)$') | map('trim') | list == ['billet/node']
+          - role_node_steady | regex_findall('(?m)^StateDirectory=') | length == 0
+          - packaged_server | regex_findall('(?m)^StateDirectoryMode=(.*)$') | map('trim') | list == ['0700']
+          - packaged_node | regex_findall('(?m)^StateDirectoryMode=(.*)$') | map('trim') | list == ['0700']
+          - role_server_steady | regex_findall('(?m)^StateDirectoryMode=') | length == 0
+          - role_node_steady | regex_findall('(?m)^StateDirectoryMode=') | length == 0
+          # The node's writable paths differ by the same one directory: the
+          # role grants its state dir by path where the package gets it from
+          # StateDirectory.
+          - packaged_node | regex_findall('(?m)^ReadWritePaths=(.*)$') | map('trim') | list
+            == ['-/etc/billet/tls -/srv/jailer']
+          - role_node_steady | regex_findall('(?m)^ReadWritePaths=(.*)$') | map('trim') | list
+            == ['-/etc/billet/tls -/srv/jailer "/var/lib/billet/node"']
+
+          # The node's dependencies are backend-shaped. The package cannot know
+          # the backend, so it orders after docker.service and requires nothing;
+          # the role knows, and a Firecracker node genuinely requires the guest
+          # bridges billet-network.service installs.
+          - packaged_node | regex_findall('(?m)^After=(.*)$') | map('trim') | list
+            == ['network-online.target docker.service']
+          - role_node_steady | regex_findall('(?m)^After=(.*)$') | map('trim') | list
+            == ['network-online.target']
+          - role_node_firecracker | regex_findall('(?m)^After=(.*)$') | map('trim') | list
+            == ['network-online.target billet-network.service']
+          - role_node_firecracker | regex_findall('(?m)^Requires=(.*)$') | map('trim') | list
+            == ['billet-network.service']
+
+          # The ledger-volume server is the same unit plus a mount fence: a
+          # second After=, a Requires= on the exact mount unit, and
+          # RequiresMountsFor= on the state directory. Nothing the package can
+          # express, and the reason the comparison above uses the no-volume
+          # render.
+          - role_server_ledger | regex_findall('(?m)^After=(.*)$') | map('trim') | list
+            == ['network-online.target', 'var-lib-billet-server.mount']
+          - role_server_ledger | regex_findall('(?m)^Requires=(.*)$') | map('trim') | list
+            == ['var-lib-billet-server.mount']
+          - role_server_ledger | regex_findall('(?m)^RequiresMountsFor=(.*)$') | map('trim') | list
+            == ['/var/lib/billet/server']
+          - packaged_server | regex_findall('(?m)^(Requires|RequiresMountsFor)=') | length == 0
+
+          # A preserved legacy install keeps Type=exec and gains no
+          # NotifyAccess, which is the whole point of preserving it: a binary
+          # that never sends READY=1 under Type=notify fails its start at
+          # TimeoutStartSec (measured: systemd holds the job the full window and
+          # reports Result=timeout).
+          - role_server_legacy | regex_findall('(?m)^Type=(.*)$') | map('trim') | list == ['exec']
+          - role_server_legacy | regex_findall('(?m)^NotifyAccess=') | length == 0
+
+          # The upgrade probe is the only render that carries the flag, and it
+          # must never reach a steady-state unit.
+          - "'--upgrade-probe' in role_server_probe"
+          - "'--upgrade-probe' not in role_server_steady"
+          - "'--upgrade-probe' not in packaged_server"
+          - "'--upgrade-probe' not in packaged_node"
+        fail_msg: >-
+          A difference between the packaged units and the role's templates is no longer the
+          deliberate one this gate documents. Read the assertion that failed: either the change
+          is intended and this list needs updating with it, or one of the two provisioning paths
+          has drifted from the other.

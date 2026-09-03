@@ -1,0 +1,24 @@
+---
+- name: Reload systemd
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  when: not (_billet_alert_skip_service_control | default(false))
+  become: "{{ _billet_alert_become | default(true) }}"
+
+- name: Reload billet guest networking
+  ansible.builtin.command: networkctl reload
+  changed_when: true
+  become: true
+
+- name: Restart billet dnsmasq
+  ansible.builtin.systemd_service:
+    name: "billet-dnsmasq@{{ item.name }}.service"
+    state: restarted
+  loop: "{{ billet_networks }}"
+  when: not ansible_check_mode
+  become: true
+
+- name: Reload billet firewall
+  ansible.builtin.command: /usr/sbin/nft -f /etc/billet/network.nft
+  changed_when: true
+  become: true

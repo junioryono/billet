@@ -1,0 +1,194 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "BilletRuntimeRead",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeInstances",
+        "ec2:DescribeImages",
+        "ec2:DescribeSubnets",
+        "ec2:DescribeSecurityGroups"
+      ],
+      "Resource": [
+        "*"
+      ]
+    },
+    {
+      "Sid": "BilletRuntimeLaunch",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:RunInstances"
+      ],
+      "Resource": [
+        "*"
+      ]
+    },
+    {
+      "Sid": "BilletRuntimeTag",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateTags"
+      ],
+      "Resource": [
+        "*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "ec2:CreateAction": [
+            "RunInstances",
+            "CreateVolume",
+            "CreateSnapshot"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "BilletRuntimeTerminate",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:TerminateInstances"
+      ],
+      "Resource": [
+        "*"
+      ],
+      "Condition": {
+        "Null": {
+          "aws:ResourceTag/sh.billet.owner": "false"
+        }
+      }
+    },
+    {
+      "Sid": "BilletCacheCreateVolume",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateVolume"
+      ],
+      "Resource": [
+        "*"
+      ],
+      "Condition": {
+        "Null": {
+          "aws:RequestTag/sh.billet.owner": "false"
+        }
+      }
+    },
+    {
+      "Sid": "BilletCacheCloneSource",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateVolume"
+      ],
+      "Resource": [
+        "arn:TFPARTITION:ec2:*::snapshot/*"
+      ],
+      "Condition": {
+        "Null": {
+          "aws:ResourceTag/sh.billet.owner": "false"
+        }
+      }
+    },
+    {
+      "Sid": "BilletCacheSnapshotSource",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateSnapshot"
+      ],
+      "Resource": [
+        "arn:TFPARTITION:ec2:*:*:volume/*"
+      ],
+      "Condition": {
+        "Null": {
+          "aws:ResourceTag/sh.billet.owner": "false"
+        }
+      }
+    },
+    {
+      "Sid": "BilletCacheSnapshotCreate",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateSnapshot"
+      ],
+      "Resource": [
+        "arn:TFPARTITION:ec2:*:*:snapshot/*"
+      ],
+      "Condition": {
+        "Null": {
+          "aws:RequestTag/sh.billet.owner": "false"
+        }
+      }
+    },
+    {
+      "Sid": "BilletCacheDescribe",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeVolumes",
+        "ec2:DescribeSnapshots"
+      ],
+      "Resource": [
+        "*"
+      ]
+    },
+    {
+      "Sid": "BilletCacheAttach",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:AttachVolume",
+        "ec2:DetachVolume"
+      ],
+      "Resource": [
+        "*"
+      ],
+      "Condition": {
+        "Null": {
+          "aws:ResourceTag/sh.billet.owner": "false"
+        }
+      }
+    },
+    {
+      "Sid": "BilletCacheDelete",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DeleteVolume",
+        "ec2:DeleteSnapshot"
+      ],
+      "Resource": [
+        "*"
+      ],
+      "Condition": {
+        "Null": {
+          "aws:ResourceTag/sh.billet.cache-owner": "false",
+          "aws:ResourceTag/sh.billet.owner": "false"
+        }
+      }
+    },
+    {
+      "Sid": "BilletCacheObjects",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject"
+      ],
+      "Resource": [
+        "arn:TFPARTITION:s3:::TFBUCKET/TFPREFIX/*"
+      ]
+    },
+    {
+      "Sid": "BilletCacheList",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:TFPARTITION:s3:::TFBUCKET"
+      ],
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "TFPREFIX/*"
+          ]
+        }
+      }
+    }
+  ]
+}

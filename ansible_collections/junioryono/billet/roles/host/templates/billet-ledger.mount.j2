@@ -1,0 +1,22 @@
+{{ ansible_managed | comment }}
+[Unit]
+Description=billet control-plane ledger ({{ billet_ledger_volume_id }})
+Documentation=https://github.com/junioryono/billet
+# FAIL CLOSED: no nofail. A missing or wrong volume leaves this mount failed,
+# and billet-server.service (Requires= on this unit) then refuses to start —
+# instead of creating a fresh ledger, deployment identity and CA on the root
+# disk.
+
+[Mount]
+# The VOLUME's own stable identity, not a filesystem UUID: the by-id link
+# encodes the EBS volume id and is recreated by udev every boot, while a
+# filesystem UUID is copied by a snapshot-clone — a clone attached later could
+# win a by-uuid link at boot and put the ledger on the wrong disk. A
+# billet_ledger_device override names the operator's own stable device path.
+What={{ billet_ledger_device_path }}
+Where={{ billet_candidate_server_state_dir }}
+Type=ext4
+Options=defaults,noatime
+
+[Install]
+WantedBy=multi-user.target

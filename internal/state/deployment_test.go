@@ -1,0 +1,207 @@
+package state
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// The identity is stable across calls, because everything billet has already
+// started is labelled with the previous answer.
+func TestDeploymentIDIsStable(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	first, err := DeploymentID(dir)
+	if err != nil {
+		t.Fatalf("DeploymentID: %v", err)
+	}
+
+	second, err := DeploymentID(dir)
+	if err != nil {
+		t.Fatalf("DeploymentID again: %v", err)
+	}
+
+	if first != second {
+		t.Errorf("identity changed between calls: %q then %q — every container "+
+			"labelled with the first would become invisible", first, second)
+	}
+}
+
+// TWO STATE DIRECTORIES ARE TWO INSTALLATIONS, and this is the whole reason the
+// identity exists.
+//
+// The process lock guards a directory, so two billets with different state
+// directories both start happily. Labelling their compute by node name would
+// then give them the same label — hostnames match, since it is one machine — and
+// the first to reconcile would find the other's lease ids absent from its own
+// database and destroy live jobs it has no relationship with.
+func TestTwoStateDirectoriesGetDifferentIdentities(t *testing.T) {
+	t.Parallel()
+
+	a, err := DeploymentID(t.TempDir())
+	if err != nil {
+		t.Fatalf("DeploymentID: %v", err)
+	}
+
+	b, err := DeploymentID(t.TempDir())
+	if err != nil {
+		t.Fatalf("DeploymentID: %v", err)
+	}
+
+	if a == b {
+		t.Fatal("two installations share an identity, so each can destroy the other's containers")
+	}
+}
+
+func TestDeploymentIDIsCreatedPrivate(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	if _, err := DeploymentID(dir); err != nil {
+		t.Fatalf("DeploymentID: %v", err)
+	}
+
+	info, err := os.Stat(filepath.Join(dir, deploymentIDFile))
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("deployment id is mode %o, want 600", perm)
+	}
+}
+
+// An empty file is refused rather than treated as "no identity yet".
+//
+// Minting a fresh one would be the friendlier-looking choice and the wrong one:
+// the empty file means a previous write was interrupted, and anything that run
+// started is labelled with an id nothing can now reproduce. Failing says so.
+func TestAnEmptyDeploymentIDIsRefused(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	if err := os.WriteFile(filepath.Join(dir, deploymentIDFile), []byte("  \n"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	err := func() error { _, err := DeploymentID(dir); return err }()
+	if err == nil {
+		t.Fatal("an empty identity file was accepted, so compute would be labelled with nothing")
+	}
+
+	// THE ADVICE IS PART OF THE BEHAVIOUR, and this message used to say only
+	// "delete it to have billet mint a new identity" — which contradicts the
+	// invariant the identity exists to hold. An operator who follows that while
+	// containers are running strands every one of them: billet filters by the new
+	// identity, finds nothing, lets the leases expire, resells the capacity, and
+	// the old containers run forever. Asserted here because nothing else would
+	// notice the sentence coming back.
+	// The label name is spelled out rather than imported: internal/state must not
+	// depend on a compute backend. That makes drift possible, so the docker
+	// package pins the same string against its own constant — see
+	// TestTheOwnerLabelMatchesWhatOperatorsAreTold. This assertion caught the
+	// first drift already: the message said "billet.deployment", which is not a
+	// label billet has ever written.
+	for _, want := range []string{"RESTORE", "backup", "sh.billet.owner", "DISAGREE"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the error does not mention %q, so it does not point at recovering the "+
+				"original identity before resetting it: %v", want, err)
+		}
+	}
+
+	if strings.Contains(err.Error(), "delete it to have billet mint") {
+		t.Error("the error tells the operator to delete the identity as a standalone repair, " +
+			"which strands every container already labelled with it")
+	}
+}
+
+// A copied state directory carries the original's identity.
+//
+// Deliberate: the copy IS the same installation as far as its containers are
+// concerned, and minting a new id for it would strand every one of them.
+//
+// THE EARLIER VERSION OF THIS COMMENT CLAIMED THE DIRECTORY LOCK MAKES THAT SAFE.
+// It does not. That lock is taken on a file INSIDE the state directory, and a COPY
+// has its own inode, so both directories can be locked at once — two live processes
+// claiming one identity against one docker daemon, each able to act on the other's
+// containers.
+//
+// What closes it is a second lock keyed by the identity rather than by a path:
+// LockDeployment, exercised end to end by
+// TestACopiedStateDirectoryCannotRunAlongsideTheOriginal. This test is the half
+// that lock DEPENDS on — that the copy keeps the identity in the first place.
+// A copy that minted a fresh one would strand every container the original
+// started, and would never collide either.
+func TestACopiedStateDirectoryKeepsItsIdentity(t *testing.T) {
+	t.Parallel()
+
+	original := t.TempDir()
+
+	want, err := DeploymentID(original)
+	if err != nil {
+		t.Fatalf("DeploymentID: %v", err)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(original, deploymentIDFile))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+
+	copied := t.TempDir()
+
+	if err := os.WriteFile(filepath.Join(copied, deploymentIDFile), raw, 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	got, err := DeploymentID(copied)
+	if err != nil {
+		t.Fatalf("DeploymentID of the copy: %v", err)
+	}
+
+	if got != want {
+		t.Errorf("the copy minted a new identity (%q, was %q), stranding every container "+
+			"the original started", got, want)
+	}
+}
+
+// PeekDeploymentID READS WITHOUT MINTING: a missing file is a miss, not a new
+// identity, so a read-only caller like `billet init iam` cannot create one by
+// asking.
+func TestPeekDeploymentIDDoesNotMint(t *testing.T) {
+	dir := t.TempDir()
+
+	id, found, err := PeekDeploymentID(dir)
+	if err != nil {
+		t.Fatalf("peek an empty dir: %v", err)
+	}
+	if found || id != "" {
+		t.Fatalf("peek reported found=%v id=%q for an empty dir", found, id)
+	}
+	// It must NOT have created the file.
+	if _, statErr := os.Stat(filepath.Join(dir, deploymentIDFile)); !os.IsNotExist(statErr) {
+		t.Fatal("peek minted a deployment id file")
+	}
+
+	// After a real mint, peek returns it.
+	minted, err := DeploymentID(dir)
+	if err != nil {
+		t.Fatalf("DeploymentID: %v", err)
+	}
+	id, found, err = PeekDeploymentID(dir)
+	if err != nil || !found || id != minted {
+		t.Fatalf("peek after mint = (%q, %v, %v), want (%q, true, nil)", id, found, err, minted)
+	}
+
+	// A corrupt file is an error, not a miss.
+	if err := os.WriteFile(filepath.Join(dir, deploymentIDFile), []byte("not-hex\n"), 0o600); err != nil {
+		t.Fatalf("corrupt: %v", err)
+	}
+	if _, _, err := PeekDeploymentID(dir); err == nil {
+		t.Fatal("peek accepted a corrupt deployment id")
+	}
+}

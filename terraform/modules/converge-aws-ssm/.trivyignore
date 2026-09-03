@@ -1,0 +1,27 @@
+# Every ignore here carries its justification, and both of these are about the
+# same fact: this bucket exists to move files that can contain a GitHub App
+# private key, and it is emptied by the tool that fills it.
+
+# AWS-0090: "Bucket does not have versioning enabled."
+#
+# SUSPENDED ON PURPOSE, AND ENABLING IT WOULD CREATE THE EXPOSURE THIS MODULE
+# EXISTS TO PREVENT. The Ansible SSM connection plugin transits every file
+# through this bucket -- even for modules that send no files, because it ships
+# the module's own .py -- and its documentation warns that secrets in a task's
+# arguments land in those objects in plaintext. Ansible deletes them at the end
+# of a run. With versioning ENABLED that delete leaves a non-current version, so
+# a private key would persist in version history, invisible in an object listing
+# that looks empty. The plugin's own docs recommend versioning disabled or
+# suspended for exactly this reason.
+AWS-0090
+
+# AWS-0089: "Bucket has logging disabled."
+#
+# Not silenced because access logging is worthless here -- it is not -- but
+# because a log target is a SECOND bucket adjacent to the same credential, with
+# its own policy, retention and scanner findings to get right, and this module's
+# job is to be a small correct thing an operator can adopt. CloudTrail S3 data
+# events cover the same ground account-wide, are configured once rather than per
+# module, and are where an operator investigating a key exposure would look
+# first. Revisit if this module ever grows a fleet of buckets.
+AWS-0089

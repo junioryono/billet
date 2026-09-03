@@ -1,0 +1,9 @@
+# Provider binaries and local state — a reusable module commits neither; the
+# consuming root module's lock and state govern. The module's OWN lock file is
+# the one exception: a consumer's init ignores a child module's lock entirely,
+# while committing it pins the provider CI resolves — without it, an AWS
+# provider release can redden the blocking terraform jobs on an unrelated PR.
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+crash.log

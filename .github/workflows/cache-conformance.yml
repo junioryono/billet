@@ -1,0 +1,1072 @@
+name: Cache and artifact conformance
+
+on:
+  workflow_call:
+    inputs:
+      runner_label:
+        description: A billet runner label whose image and cache path are under test
+        required: true
+        type: string
+      expected_runner_version:
+        description: Exact Actions runner version expected in the candidate image
+        required: false
+        type: string
+      expected_guest_contract:
+        description: Exact Billet guest contract expected in the candidate image
+        required: false
+        type: string
+      billet_repository:
+        description: Billet repository containing the conformance fixture action
+        required: false
+        default: junioryono/billet
+        type: string
+      billet_ref:
+        description: Exact Billet tag or commit containing this reusable workflow
+        required: true
+        type: string
+      mode:
+        description: Require local interception or prove kill-switch passthrough
+        required: false
+        default: intercept
+        type: string
+  workflow_dispatch:
+    inputs:
+      runner_label:
+        description: A billet runner label whose image and cache path are under test
+        required: true
+        type: string
+      expected_runner_version:
+        description: Exact Actions runner version expected in the candidate image
+        required: false
+        type: string
+      expected_guest_contract:
+        description: Exact Billet guest contract expected in the candidate image
+        required: false
+        type: string
+      billet_repository:
+        description: Billet repository containing the conformance fixture action
+        required: false
+        default: junioryono/billet
+        type: string
+      billet_ref:
+        description: Exact Billet tag or commit containing this workflow
+        required: true
+        type: string
+      mode:
+        description: Require local interception or prove kill-switch passthrough
+        required: false
+        default: intercept
+        type: choice
+        options:
+          - intercept
+          - passthrough
+
+permissions:
+  contents: read
+
+jobs:
+  candidate-identity:
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 30
+    steps:
+      - name: Validate the conformance mode
+        env:
+          BILLET_CONFORMANCE_MODE: ${{ inputs.mode }}
+        run: |
+          case "$BILLET_CONFORMANCE_MODE" in
+            intercept|passthrough) ;;
+            *) echo "unsupported conformance mode: $BILLET_CONFORMANCE_MODE" >&2; exit 1 ;;
+          esac
+      - name: Refuse a non-billet runner or the wrong candidate image
+        env:
+          EXPECTED_RUNNER_VERSION: ${{ inputs.expected_runner_version }}
+          EXPECTED_GUEST_CONTRACT: ${{ inputs.expected_guest_contract }}
+        run: |
+          set -euo pipefail
+          test "${RUNNER_NAME#billet-}" != "$RUNNER_NAME"
+          if [ -n "$EXPECTED_RUNNER_VERSION" ]; then
+            test "$(sed -n 's/^RUNNER_VERSION=//p' /etc/billet-image)" = "$EXPECTED_RUNNER_VERSION"
+          fi
+          if [ -n "$EXPECTED_GUEST_CONTRACT" ]; then
+            test "$(sed -n 's/^WANT_CONTRACT=//p' /usr/local/bin/billet-agent | head -1)" = "$EXPECTED_GUEST_CONTRACT"
+          fi
+      # A PLAIN RUN STEP DOES NOT SEE THE ACTIONS RUNTIME. ACTIONS_RESULTS_URL and
+      # ACTIONS_RUNTIME_TOKEN are handed only to action steps, so the probe below
+      # borrows them through a node action — measured live: the first run to reach
+      # this job died on `test -n` with both variables empty, on a runner whose
+      # interception was healthy.
+      - name: Expose the Actions runtime to the probe
+        uses: actions/github-script@v8
+        with:
+          script: |
+            core.setSecret(process.env.ACTIONS_RUNTIME_TOKEN);
+            core.exportVariable('BILLET_PROBE_RESULTS_URL', process.env.ACTIONS_RESULTS_URL);
+            core.exportVariable('BILLET_PROBE_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN);
+      - name: Prove this job is traversing Billet rather than GitHub's cache
+        if: inputs.mode == 'intercept'
+        env:
+          ACTIONS_RESULTS_URL: ${{ env.BILLET_PROBE_RESULTS_URL }}
+          ACTIONS_RUNTIME_TOKEN: ${{ env.BILLET_PROBE_RUNTIME_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "${ACTIONS_RESULTS_URL:-}"
+          test -n "${ACTIONS_RUNTIME_TOKEN:-}"
+          response_headers=$(mktemp)
+          trap 'rm -f "$response_headers"' EXIT
+          curl --silent --show-error --fail \
+            --dump-header "$response_headers" \
+            --output /dev/null \
+            --header "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
+            --header "Content-Type: application/json" \
+            --header "User-Agent: @actions/cache-conformance" \
+            --data '{"key":"billet-conformance-probe-${{ github.run_id }}-${{ github.run_attempt }}","restore_keys":[],"version":"billet-conformance-probe"}' \
+            "${ACTIONS_RESULTS_URL%/}/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL"
+          tr -d '\r' < "$response_headers" | grep -Fxi 'X-Billet-Actions-Cache: local'
+      - name: Prove the kill switch bypasses Billet local cache
+        if: inputs.mode == 'passthrough'
+        env:
+          ACTIONS_RESULTS_URL: ${{ env.BILLET_PROBE_RESULTS_URL }}
+          ACTIONS_RUNTIME_TOKEN: ${{ env.BILLET_PROBE_RUNTIME_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "${ACTIONS_RESULTS_URL:-}"
+          test -n "${ACTIONS_RUNTIME_TOKEN:-}"
+          response_headers=$(mktemp)
+          trap 'rm -f "$response_headers"' EXIT
+          passthrough_status=$(curl --silent --show-error \
+            --connect-timeout 15 \
+            --max-time 30 \
+            --dump-header "$response_headers" \
+            --output /dev/null \
+            --write-out '%{http_code}' \
+            --header "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
+            --header "Content-Type: application/json" \
+            --header "User-Agent: @actions/cache-conformance" \
+            --data '{"key":"billet-conformance-passthrough-${{ github.run_id }}-${{ github.run_attempt }}","restore_keys":[],"version":"billet-conformance-passthrough"}' \
+            "${ACTIONS_RESULTS_URL%/}/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL")
+          test "$passthrough_status" != 000
+          if tr -d '\r' < "$response_headers" | grep -Fxiq 'X-Billet-Actions-Cache: local'; then
+            echo 'the selected kill switch still allowed local cache interception' >&2
+            exit 1
+          fi
+          printf 'GitHub passthrough returned HTTP %s\n' "$passthrough_status"
+
+  save-host:
+    needs: candidate-identity
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 30
+    steps:
+      - name: Refuse a non-billet runner
+        run: test "${RUNNER_NAME#billet-}" != "$RUNNER_NAME"
+      - name: Establish a unique cache miss
+        id: cache
+        uses: actions/cache@v5
+        with:
+          path: conformance/cache
+          key: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-host
+      - name: Refuse a stale cache
+        if: steps.cache.outputs.cache-hit == 'true'
+        run: exit 1
+      - name: Create cache and artifact payloads
+        run: |
+          mkdir -p conformance/cache conformance/artifact
+          printf '%s\n' 'billet-${{ github.run_id }}-${{ github.run_attempt }}-host' > conformance/cache/payload
+          cp conformance/cache/payload conformance/artifact/payload
+      - name: Upload artifact metadata and content
+        uses: actions/upload-artifact@v7
+        with:
+          name: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-host
+          path: conformance/artifact/payload
+          if-no-files-found: error
+
+  restore-host:
+    needs: save-host
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 30
+    steps:
+      - name: Refuse a non-billet runner
+        run: test "${RUNNER_NAME#billet-}" != "$RUNNER_NAME"
+      - name: Restore the cache written by the previous runner
+        id: cache
+        uses: actions/cache@v5
+        with:
+          path: conformance/cache
+          key: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-host
+          fail-on-cache-miss: true
+      - name: Verify the restored cache payload
+        run: |
+          test '${{ steps.cache.outputs.cache-hit }}' = true
+          printf '%s\n' 'billet-${{ github.run_id }}-${{ github.run_attempt }}-host' > expected
+          cmp expected conformance/cache/payload
+      - name: Download the artifact through the shared results origin
+        uses: actions/download-artifact@v8
+        with:
+          name: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-host
+          path: conformance/download
+      - name: Verify the downloaded artifact payload
+        run: cmp expected conformance/download/payload
+
+  save-container:
+    needs: candidate-identity
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 30
+    container: node:24-bookworm
+    steps:
+      - name: Refuse a non-billet runner
+        run: test "${RUNNER_NAME#billet-}" != "$RUNNER_NAME"
+      - name: Establish a unique cache miss inside a job container
+        id: cache
+        uses: actions/cache@v5
+        with:
+          path: conformance/cache
+          key: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-container
+      - name: Refuse a stale cache
+        if: steps.cache.outputs.cache-hit == 'true'
+        run: exit 1
+      - name: Create cache and artifact payloads
+        run: |
+          mkdir -p conformance/cache conformance/artifact
+          printf '%s\n' 'billet-${{ github.run_id }}-${{ github.run_attempt }}-container' > conformance/cache/payload
+          cp conformance/cache/payload conformance/artifact/payload
+      - name: Upload artifact metadata and content
+        uses: actions/upload-artifact@v7
+        with:
+          name: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-container
+          path: conformance/artifact/payload
+          if-no-files-found: error
+
+  restore-container:
+    needs: save-container
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 30
+    container: node:24-bookworm
+    steps:
+      - name: Refuse a non-billet runner
+        run: test "${RUNNER_NAME#billet-}" != "$RUNNER_NAME"
+      - name: Restore the cache written by the previous containerized runner
+        id: cache
+        uses: actions/cache@v5
+        with:
+          path: conformance/cache
+          key: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-container
+          fail-on-cache-miss: true
+      - name: Verify the restored cache payload
+        run: |
+          test '${{ steps.cache.outputs.cache-hit }}' = true
+          printf '%s\n' 'billet-${{ github.run_id }}-${{ github.run_attempt }}-container' > expected
+          cmp expected conformance/cache/payload
+      - name: Download the artifact through the shared results origin
+        uses: actions/download-artifact@v8
+        with:
+          name: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-container
+          path: conformance/download
+      - name: Verify the downloaded artifact payload
+        run: cmp expected conformance/download/payload
+
+  # BuildKit type=gha is the one interception surface the DNS remap cannot own. A
+  # container-driver builder runs BuildKit in its own image, whose trust store
+  # billet cannot populate, so its calls to the remapped origin meet a node leaf it
+  # does not trust. (The embedded docker driver cannot export type=gha at all, so
+  # it is not the case to measure.) That is now ANSWERED rather than open: measured
+  # live, the export fails with x509, and the fix is the opt-in loopback adapter
+  # the lanes below gate. This lane stays continue-on-error because it measures
+  # what a builder that has NOT opted in still does -- the limitation an operator
+  # meets if they leave their workflow unchanged -- and that case is unchanged.
+  buildkit-gha:
+    needs: candidate-identity
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 30
+    steps:
+      - name: Refuse a non-billet runner
+        run: test "${RUNNER_NAME#billet-}" != "$RUNNER_NAME"
+      - name: Establish a build context whose layer is unique to this run
+        run: |
+          mkdir -p conformance/gha
+          cat >conformance/gha/Dockerfile <<EOF
+          FROM alpine:3.20
+          RUN echo billet-${{ github.run_id }}-${{ github.run_attempt }} >/probe
+          EOF
+      - name: Set up a container-driver builder
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker-container
+      - name: type=gha through a container-driver builder
+        id: container-gha
+        continue-on-error: true
+        uses: docker/build-push-action@v6
+        with:
+          context: conformance/gha
+          cache-to: type=gha,mode=max,scope=billet-container-${{ github.run_id }}-${{ github.run_attempt }}
+          cache-from: type=gha,scope=billet-container-${{ github.run_id }}-${{ github.run_attempt }}
+          outputs: type=cacheonly
+      - name: Report the container-driver gha outcome
+        run: |
+          echo "container-driver type=gha outcome: ${{ steps.container-gha.outcome }}"
+          if [ '${{ steps.container-gha.outcome }}' != 'success' ]; then
+            echo "::warning title=container gha::a container-driver type=gha export did not complete against the node CA; the run shows whether this was fatal or a non-fatal warning"
+          fi
+
+  # THE V2 PROTOCOL THROUGH THE LOOPBACK ADAPTER, DRIVEN DIRECTLY. A build proves
+  # the product path but not the two things that make this path work at all: that
+  # the signed URLs name the adapter's own origin rather than the results host --
+  # an https URL there is the x509 failure arriving one request later, after
+  # storage has been allocated -- and that what one VM published another restores.
+  # curl shows both, and cannot pass by accident.
+  loopback-v2-save:
+    needs: candidate-identity
+    if: inputs.mode == 'intercept'
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 30
+    steps:
+      - name: Refuse a non-billet runner
+        run: test "${RUNNER_NAME#billet-}" != "$RUNNER_NAME"
+      - name: Publish a v2 cache entry through the loopback adapter
+        run: |
+          set -euo pipefail
+          test -n "${BILLET_ACTIONS_CACHE_URL:-}"
+          base=${BILLET_ACTIONS_CACHE_URL%/}
+          service=$base/twirp/github.actions.results.api.v1.CacheService
+          key=billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-loopback
+          version=billet-loopback-v2
+          headers=$(mktemp)
+          body=$(mktemp)
+          trap 'rm -f "$headers" "$body"' EXIT
+          # NO AUTHORIZATION HEADER, DELIBERATELY. In this mode billet must serve
+          # the call itself; one that fell through to GitHub would be refused
+          # there, which is an outcome this lane must not be able to pass with.
+          curl --silent --show-error --fail --dump-header "$headers" --output "$body" \
+            --header 'Content-Type: application/json' \
+            --data "{\"key\":\"$key\",\"version\":\"$version\"}" \
+            "$service/CreateCacheEntry"
+          tr -d '\r' < "$headers" | grep -Fxi 'X-Billet-Actions-Cache: local'
+          test "$(jq -r .ok "$body")" = true
+          upload=$(jq -r .signed_upload_url "$body")
+          case "$upload" in
+            "$base"/_billet/actions-cache/*) ;;
+            *) echo "the signed upload URL does not name the adapter: $upload" >&2; exit 1 ;;
+          esac
+          printf '%s\n' 'billet-${{ github.run_id }}-${{ github.run_attempt }}-loopback' > archive
+          curl --silent --show-error --fail --request PUT --dump-header "$headers" \
+            --output /dev/null --header 'x-ms-blob-type: BlockBlob' \
+            --data-binary @archive "$upload"
+          tr -d '\r' < "$headers" | grep -Fxi 'X-Billet-Actions-Cache: local'
+          size=$(wc -c < archive | tr -d ' ')
+          curl --silent --show-error --fail --dump-header "$headers" --output "$body" \
+            --header 'Content-Type: application/json' \
+            --data "{\"key\":\"$key\",\"version\":\"$version\",\"size_bytes\":\"$size\"}" \
+            "$service/FinalizeCacheEntryUpload"
+          tr -d '\r' < "$headers" | grep -Fxi 'X-Billet-Actions-Cache: local'
+          test "$(jq -r .ok "$body")" = true
+          # `jq -r` PRINTS "null" FOR AN ABSENT FIELD, which `test -n` accepts.
+          jq -e '(.entry_id | type) == "string" and (.entry_id | length) > 0' "$body" >/dev/null
+
+  loopback-v2-restore:
+    needs: loopback-v2-save
+    if: inputs.mode == 'intercept'
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 30
+    steps:
+      - name: Refuse a non-billet runner
+        run: test "${RUNNER_NAME#billet-}" != "$RUNNER_NAME"
+      - name: Restore in a second VM what the first published
+        run: |
+          set -euo pipefail
+          test -n "${BILLET_ACTIONS_CACHE_URL:-}"
+          base=${BILLET_ACTIONS_CACHE_URL%/}
+          service=$base/twirp/github.actions.results.api.v1.CacheService
+          key=billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-loopback
+          version=billet-loopback-v2
+          headers=$(mktemp)
+          body=$(mktemp)
+          trap 'rm -f "$headers" "$body"' EXIT
+          curl --silent --show-error --fail --dump-header "$headers" --output "$body" \
+            --header 'Content-Type: application/json' \
+            --data "{\"key\":\"$key\",\"restore_keys\":[],\"version\":\"$version\"}" \
+            "$service/GetCacheEntryDownloadURL"
+          tr -d '\r' < "$headers" | grep -Fxi 'X-Billet-Actions-Cache: local'
+          test "$(jq -r .ok "$body")" = true
+          test "$(jq -r .matched_key "$body")" = "$key"
+          download=$(jq -r .signed_download_url "$body")
+          case "$download" in
+            "$base"/_billet/actions-cache/*) ;;
+            *) echo "the signed download URL does not name the adapter: $download" >&2; exit 1 ;;
+          esac
+          curl --silent --show-error --fail --dump-header "$headers" --output restored "$download"
+          tr -d '\r' < "$headers" | grep -Fxi 'X-Billet-Actions-Cache: local'
+          printf '%s\n' 'billet-${{ github.run_id }}-${{ github.run_attempt }}-loopback' > expected
+          cmp expected restored
+
+  # ...AND THE PRODUCT PATH ITSELF, IN TWO VMs. Export in one, import in another,
+  # and require an observable CACHED step -- an export that merely did not error
+  # proves nothing, which is what removing continue-on-error alone would have
+  # bought. Each lane also proves billet, not GitHub, is answering this VM's cache
+  # calls, so a hit cannot be GitHub's own cache serving the same unique scope.
+  buildkit-loopback-export:
+    needs: candidate-identity
+    if: inputs.mode == 'intercept'
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 30
+    steps:
+      - name: Refuse a non-billet runner
+        run: test "${RUNNER_NAME#billet-}" != "$RUNNER_NAME"
+      - name: Prove billet is answering this VM's cache calls
+        run: |
+          set -euo pipefail
+          test -n "${BILLET_ACTIONS_CACHE_URL:-}"
+          headers=$(mktemp)
+          trap 'rm -f "$headers"' EXIT
+          curl --silent --show-error --fail --dump-header "$headers" --output /dev/null \
+            --header 'Content-Type: application/json' \
+            --data '{"key":"billet-loopback-probe-${{ github.run_id }}-${{ github.run_attempt }}","restore_keys":[],"version":"billet-loopback-probe"}' \
+            "${BILLET_ACTIONS_CACHE_URL%/}/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL"
+          tr -d '\r' < "$headers" | grep -Fxi 'X-Billet-Actions-Cache: local'
+      - name: Establish a build context whose layer is unique to this run
+        run: |
+          mkdir -p conformance/loopback
+          cat >conformance/loopback/Dockerfile <<EOF
+          FROM alpine:3.20
+          RUN echo billet-loopback-${{ github.run_id }}-${{ github.run_attempt }} >/probe
+          EOF
+      # network=host GIVES THE BUILDER THE GUEST'S NETWORK NAMESPACE, which is what
+      # puts the adapter's loopback port in reach. Acceptable here because this is
+      # a one-job microVM on a trusted tier; it is not a setting to carry to an
+      # untrusted runner.
+      - name: Set up a container-driver builder in the guest namespace
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker-container
+          driver-opts: network=host
+      - name: Export type=gha through the loopback adapter
+        uses: docker/build-push-action@v6
+        env:
+          # THE FALLBACK MUST NOT SILENTLY WORK, and this is what stops this lane
+          # passing with the adapter untouched. buildx fills url_v2 from
+          # ACTIONS_RESULTS_URL when the attribute is empty or ignored, and with
+          # host networking the builder can reach GitHub directly -- so an export
+          # that never went near billet would still be green. Pointed at a dead
+          # port, that path fails loudly instead. The build summary is off for the
+          # same reason: it would use the variable this poisons.
+          ACTIONS_RESULTS_URL: http://127.0.0.1:1/
+          ACTIONS_CACHE_URL: http://127.0.0.1:1/
+          DOCKER_BUILD_SUMMARY: "false"
+        with:
+          context: conformance/loopback
+          cache-to: type=gha,mode=max,version=2,url_v2=${{ env.BILLET_ACTIONS_CACHE_URL }},scope=billet-loopback-${{ github.run_id }}-${{ github.run_attempt }}
+          outputs: type=cacheonly
+
+  buildkit-loopback-import:
+    needs: buildkit-loopback-export
+    if: inputs.mode == 'intercept'
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 30
+    steps:
+      - name: Refuse a non-billet runner
+        run: test "${RUNNER_NAME#billet-}" != "$RUNNER_NAME"
+      - name: Prove billet is answering this VM's cache calls
+        run: |
+          set -euo pipefail
+          test -n "${BILLET_ACTIONS_CACHE_URL:-}"
+          headers=$(mktemp)
+          trap 'rm -f "$headers"' EXIT
+          curl --silent --show-error --fail --dump-header "$headers" --output /dev/null \
+            --header 'Content-Type: application/json' \
+            --data '{"key":"billet-loopback-probe-${{ github.run_id }}-${{ github.run_attempt }}","restore_keys":[],"version":"billet-loopback-probe"}' \
+            "${BILLET_ACTIONS_CACHE_URL%/}/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL"
+          tr -d '\r' < "$headers" | grep -Fxi 'X-Billet-Actions-Cache: local'
+      - name: Establish the same build context as the exporting VM
+        run: |
+          mkdir -p conformance/loopback
+          cat >conformance/loopback/Dockerfile <<EOF
+          FROM alpine:3.20
+          RUN echo billet-loopback-${{ github.run_id }}-${{ github.run_attempt }} >/probe
+          EOF
+      - name: Set up a container-driver builder in the guest namespace
+        id: builder
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker-container
+          driver-opts: network=host
+      # THE RUNTIME TOKEN IS NOT IN A PLAIN RUN STEP'S ENVIRONMENT, and buildx
+      # refuses the gha backend without one (the node never decodes it). Borrowing
+      # it through a node action is the same thing candidate-identity does.
+      - name: Expose the Actions runtime to buildx
+        uses: actions/github-script@v8
+        with:
+          script: |
+            core.setSecret(process.env.ACTIONS_RUNTIME_TOKEN);
+            core.exportVariable('BILLET_PROBE_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN);
+      - name: Import the cache the previous VM exported and require a hit
+        env:
+          ACTIONS_RUNTIME_TOKEN: ${{ env.BILLET_PROBE_RUNTIME_TOKEN }}
+          # As in the exporting lane: the only route to a cache this build can use
+          # must be the adapter, so the variable buildx would fall back to names a
+          # dead port.
+          ACTIONS_RESULTS_URL: http://127.0.0.1:1/
+          ACTIONS_CACHE_URL: http://127.0.0.1:1/
+        run: |
+          set -euo pipefail
+          docker buildx build --builder '${{ steps.builder.outputs.name }}' --progress=plain \
+            --cache-from "type=gha,version=2,url_v2=${BILLET_ACTIONS_CACHE_URL},scope=billet-loopback-${{ github.run_id }}-${{ github.run_attempt }}" \
+            --output type=cacheonly conformance/loopback >build.log 2>&1 || {
+              cat build.log
+              echo "the import build failed" >&2
+              exit 1
+            }
+          cat build.log
+          # THE RUN-UNIQUE LAYER, NOT ANY CACHED STEP. A build that succeeded
+          # proves only that the import did not error, and a bare `CACHED` is
+          # satisfied by the base image's own vertex -- which says nothing about
+          # what came back from billet. Find the vertex whose name carries THIS
+          # run's marker and require that vertex to be the cached one.
+          #
+          # BILLET_CACHED_ASSERT_BEGIN — the block between these markers is
+          # extracted verbatim and run against passing and failing fixture logs by
+          # TestTheImportLaneRequiresTheRunUniqueLayerToBeCached. A gate nobody has
+          # executed is one that can only refuse correct artifacts.
+          marker=billet-loopback-${{ github.run_id }}-${{ github.run_attempt }}
+          vertex=$(awk -v want="RUN echo $marker" \
+            '$1 ~ /^#[0-9]+$/ && index($0, want) { print $1; exit }' build.log)
+          if [ -z "$vertex" ]; then
+            echo "no build step named $marker appears in the log" >&2
+            exit 1
+          fi
+          grep -Eq "^$vertex CACHED[[:space:]]*$" build.log
+          # BILLET_CACHED_ASSERT_END
+
+  # With local handling switched off, a call through the adapter must still reach
+  # GitHub and billet must not answer it. What this exercises is the NODE's splice
+  # -- the tunnel still opens in this mode -- rather than the adapter's own direct
+  # dial, which has no live trigger and is covered by the guest probe in
+  # internal/guestassets instead.
+  loopback-passthrough:
+    needs: candidate-identity
+    if: inputs.mode == 'passthrough'
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 30
+    steps:
+      - name: Refuse a non-billet runner
+        run: test "${RUNNER_NAME#billet-}" != "$RUNNER_NAME"
+      # WITH THE RUNTIME TOKEN, so GitHub answers the lookup rather than refusing
+      # it: an unauthenticated call is rejected upstream, and "some HTTP status
+      # came back" would then be satisfied by an answer nobody authored.
+      - name: Expose the Actions runtime to the probe
+        uses: actions/github-script@v8
+        with:
+          script: |
+            core.setSecret(process.env.ACTIONS_RUNTIME_TOKEN);
+            core.exportVariable('BILLET_PROBE_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN);
+      - name: Prove the adapter reaches GitHub and billet does not answer
+        env:
+          ACTIONS_RUNTIME_TOKEN: ${{ env.BILLET_PROBE_RUNTIME_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "${BILLET_ACTIONS_CACHE_URL:-}"
+          test -n "${ACTIONS_RUNTIME_TOKEN:-}"
+          headers=$(mktemp)
+          trap 'rm -f "$headers"' EXIT
+          status=$(curl --silent --show-error --connect-timeout 15 --max-time 30 \
+            --dump-header "$headers" --output /dev/null --write-out '%{http_code}' \
+            --header 'Content-Type: application/json' \
+            --header "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
+            --data '{"key":"billet-loopback-passthrough-${{ github.run_id }}-${{ github.run_attempt }}","restore_keys":[],"version":"billet-loopback-passthrough"}' \
+            "${BILLET_ACTIONS_CACHE_URL%/}/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL")
+          test "$status" != 000
+          # WHAT PROVES GITHUB ANSWERED IS WHO DID NOT, and billet marks every
+          # response it writes: the NODE puts X-Billet-Actions-Cache on all of them
+          # (its local answers, its 421 for a mis-rewritten Host, its 502 for an
+          # unreachable upstream), and the ADAPTER puts X-Billet-Cache-Adapter on
+          # every response it composes itself rather than relays. Keyed on the
+          # header NAMES rather than on statuses or on one value: GitHub is free to
+          # answer 403 or 502 itself, and a lane that read those as billet's would
+          # fail a deployment that was working.
+          if tr -d '\r' < "$headers" | grep -Eiq '^X-Billet-(Actions-Cache|Cache-Adapter):'; then
+            echo 'billet answered this itself; the kill switch did not put it on GitHub' >&2
+            exit 1
+          fi
+          printf 'the loopback adapter reached GitHub and got HTTP %s\n' "$status"
+
+  save-pinned-host:
+    needs: candidate-identity
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25
+        id: cache
+        with:
+          path: conformance/cache
+          key: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-pinned
+      - name: Establish the pinned lane's unique miss and payload
+        run: |
+          test '${{ steps.cache.outputs.cache-hit }}' != true
+          mkdir -p conformance/cache conformance/artifact
+          printf '%s\n' 'billet-${{ github.run_id }}-${{ github.run_attempt }}-pinned' > conformance/cache/payload
+          cp conformance/cache/payload conformance/artifact/payload
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-pinned
+          path: conformance/artifact/payload
+          if-no-files-found: error
+
+  restore-pinned-host:
+    needs: save-pinned-host
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25
+        id: cache
+        with:
+          path: conformance/cache
+          key: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-pinned
+          fail-on-cache-miss: true
+      - name: Verify the pinned cache client and payload
+        run: |
+          test '${{ steps.cache.outputs.cache-hit }}' = true
+          printf '%s\n' 'billet-${{ github.run_id }}-${{ github.run_attempt }}-pinned' > expected
+          cmp expected conformance/cache/payload
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-pinned
+          path: conformance/download
+      - run: cmp expected conformance/download/payload
+
+  save-embedded-current:
+    needs: candidate-identity
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.billet_repository }}
+          ref: ${{ inputs.billet_ref }}
+          path: .billet-conformance
+          sparse-checkout: .github/actions/cache-conformance-fixtures
+          persist-credentials: false
+      - uses: ./.billet-conformance/.github/actions/cache-conformance-fixtures
+        with:
+          operation: prepare
+          lane: current
+          salt: ${{ github.run_id }}-${{ github.run_attempt }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: conformance/embedded/node/package-lock.json
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+          cache-dependency-path: conformance/embedded/java/pom.xml
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: conformance/embedded/python/requirements.txt
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.25"
+          cache: true
+          cache-dependency-path: conformance/embedded/go.sum
+      - uses: actions/setup-dotnet@v5
+        env:
+          DOTNET_INSTALL_DIR: ${{ runner.temp }}/dotnet
+        with:
+          dotnet-version: 10.0.x
+          cache: true
+          cache-dependency-path: conformance/embedded/dotnet/packages.lock.json
+      - uses: ./.billet-conformance/.github/actions/cache-conformance-fixtures
+        with:
+          operation: write
+          lane: current
+          salt: ${{ github.run_id }}-${{ github.run_attempt }}
+
+  restore-embedded-current:
+    needs: save-embedded-current
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.billet_repository }}
+          ref: ${{ inputs.billet_ref }}
+          path: .billet-conformance
+          sparse-checkout: .github/actions/cache-conformance-fixtures
+          persist-credentials: false
+      - uses: ./.billet-conformance/.github/actions/cache-conformance-fixtures
+        with:
+          operation: prepare
+          lane: current
+          salt: ${{ github.run_id }}-${{ github.run_attempt }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: conformance/embedded/node/package-lock.json
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+          cache-dependency-path: conformance/embedded/java/pom.xml
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: conformance/embedded/python/requirements.txt
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.25"
+          cache: true
+          cache-dependency-path: conformance/embedded/go.sum
+      - uses: actions/setup-dotnet@v5
+        env:
+          DOTNET_INSTALL_DIR: ${{ runner.temp }}/dotnet
+        with:
+          dotnet-version: 10.0.x
+          cache: true
+          cache-dependency-path: conformance/embedded/dotnet/packages.lock.json
+      - uses: ./.billet-conformance/.github/actions/cache-conformance-fixtures
+        with:
+          operation: verify
+          lane: current
+          salt: ${{ github.run_id }}-${{ github.run_attempt }}
+
+  save-embedded-pinned:
+    needs: candidate-identity
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.billet_repository }}
+          ref: ${{ inputs.billet_ref }}
+          path: .billet-conformance
+          sparse-checkout: .github/actions/cache-conformance-fixtures
+          persist-credentials: false
+      - uses: ./.billet-conformance/.github/actions/cache-conformance-fixtures
+        with:
+          operation: prepare
+          lane: pinned
+          salt: ${{ github.run_id }}-${{ github.run_attempt }}
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: conformance/embedded/node/package-lock.json
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+          cache-jdk: false
+          cache-dependency-path: conformance/embedded/java/pom.xml
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: conformance/embedded/python/requirements.txt
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+        with:
+          go-version: "1.25"
+          cache: true
+          cache-dependency-path: conformance/embedded/go.sum
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1
+        env:
+          DOTNET_INSTALL_DIR: ${{ runner.temp }}/dotnet
+        with:
+          dotnet-version: 10.0.x
+          cache: true
+          cache-dependency-path: conformance/embedded/dotnet/packages.lock.json
+      - uses: ./.billet-conformance/.github/actions/cache-conformance-fixtures
+        with:
+          operation: write
+          lane: pinned
+          salt: ${{ github.run_id }}-${{ github.run_attempt }}
+
+  restore-embedded-pinned:
+    needs: save-embedded-pinned
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.billet_repository }}
+          ref: ${{ inputs.billet_ref }}
+          path: .billet-conformance
+          sparse-checkout: .github/actions/cache-conformance-fixtures
+          persist-credentials: false
+      - uses: ./.billet-conformance/.github/actions/cache-conformance-fixtures
+        with:
+          operation: prepare
+          lane: pinned
+          salt: ${{ github.run_id }}-${{ github.run_attempt }}
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: conformance/embedded/node/package-lock.json
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+          cache-jdk: false
+          cache-dependency-path: conformance/embedded/java/pom.xml
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: conformance/embedded/python/requirements.txt
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+        with:
+          go-version: "1.25"
+          cache: true
+          cache-dependency-path: conformance/embedded/go.sum
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1
+        env:
+          DOTNET_INSTALL_DIR: ${{ runner.temp }}/dotnet
+        with:
+          dotnet-version: 10.0.x
+          cache: true
+          cache-dependency-path: conformance/embedded/dotnet/packages.lock.json
+      - uses: ./.billet-conformance/.github/actions/cache-conformance-fixtures
+        with:
+          operation: verify
+          lane: pinned
+          salt: ${{ github.run_id }}-${{ github.run_attempt }}
+
+  poisoned-clients:
+    needs: candidate-identity
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 30
+    steps:
+      - name: Recover the supervised forwarder from a process crash
+        run: |
+          set -euo pipefail
+          origin=results-receiver.actions.githubusercontent.com
+          before=$(systemctl show --property=MainPID --value billet-actions-proxy.service)
+          test "$before" -gt 0
+          sudo systemctl kill --kill-whom=main --signal=KILL billet-actions-proxy.service
+          # Active plus a NEW MainPID is systemd's fork, not the bind: the restarted
+          # python takes ~200ms to adopt the socket and reach its accept loop, and the
+          # next step's connect once lost that race. Readiness is the PORT answering --
+          # the same successful-connect wait the guest agent runs at first start.
+          ready=0
+          for _ in $(seq 1 100); do
+            after=$(systemctl show --property=MainPID --value billet-actions-proxy.service)
+            if systemctl is-active --quiet billet-actions-proxy.service &&
+               [ "$after" -gt 0 ] && [ "$after" != "$before" ] &&
+               (: </dev/tcp/"$origin"/443) 2>/dev/null; then
+              ready=1
+              break
+            fi
+            sleep 0.1
+          done
+          if [ "$ready" != 1 ]; then
+            systemctl status --no-pager billet-actions-proxy.socket billet-actions-proxy.service || true
+            sudo journalctl --no-pager -u billet-actions-proxy.service -n 50 || true
+            echo "the passthrough did not become ready after a crash" >&2
+            exit 1
+          fi
+      - name: Isolate a malformed TLS client and a silent client from the passthrough
+        run: |
+          set -euo pipefail
+          # The results origin is DNS-remapped to the guest passthrough (see the
+          # guest agent), reached by name through /etc/hosts. A client that sends
+          # garbage or nothing must not wedge the passthrough for the legitimate
+          # cache traffic that follows, and a silent one must be dropped rather than
+          # leaked. The cache step below proves recovery.
+          origin=results-receiver.actions.githubusercontent.com
+          # The origin must resolve to the guest passthrough, not GitHub: a bare TCP
+          # connect would succeed either way, so assert the remap is active locally.
+          addr=$(getent ahostsv4 "$origin" | awk 'NR == 1 { print $1 }')
+          case "$addr" in
+            172.1[6-9].*|172.2[0-9].*|172.3[01].*) ;;
+            *) echo "results origin is not remapped to the local passthrough: $addr" >&2; exit 1 ;;
+          esac
+          # Wait for the passthrough to answer before probing. With socket activation
+          # the listener is always up (systemd owns it), but this keeps the probe
+          # honest against any residual restart race rather than assuming a single
+          # open cannot lose it, the way the previous version did.
+          for _ in $(seq 1 50); do (: </dev/tcp/"$origin"/443) 2>/dev/null && break; sleep 0.1; done
+          # A malformed TLS client: the node rejects it and the passthrough tears the
+          # connection down; it must not wedge the listener for what follows.
+          exec 3<>"/dev/tcp/$origin/443"
+          printf 'not-a-tls-client' >&3
+          exec 3>&-
+          # A silent client: it sends nothing, so the passthrough must drop it after
+          # its connect timeout without ever spending a node tunnel. Wait past that
+          # timeout, then prove it was CLOSED cleanly: the read reaches EOF and exits
+          # 0 (a leaked-open connection blocks and the timeout exits 124 instead), it
+          # received no bytes, and the passthrough is the SAME process throughout (a
+          # crash-and-restart would also close the socket, and must not read as pass).
+          before=$(systemctl show --property=MainPID --value billet-actions-proxy.service)
+          exec 4<>"/dev/tcp/$origin/443"
+          sleep 15
+          silent_out=$(mktemp)
+          if timeout 5 head -c 64 <&4 >"$silent_out" 2>/dev/null; then
+            silent_closed=1
+          else
+            silent_closed=0
+          fi
+          exec 4>&-
+          after=$(systemctl show --property=MainPID --value billet-actions-proxy.service)
+          test "$silent_closed" = 1 || { echo "the silent client was left open past the connect timeout" >&2; exit 1; }
+          test ! -s "$silent_out" || { echo "the silent client received unexpected bytes" >&2; exit 1; }
+          # A running MainPID that did not change proves the drop was not a crash-restart.
+          # Both-zero would pass a bare equality, so require the process to be present.
+          systemctl is-active --quiet billet-actions-proxy.service || { echo "the passthrough is not running after the silent-client probe" >&2; exit 1; }
+          test "$before" -gt 0 && test "$after" -gt 0 && test "$before" = "$after" || { echo "the passthrough restarted during the silent-client probe" >&2; exit 1; }
+          rm -f "$silent_out"
+      - name: Prove cache traffic remains usable after the transport faults
+        id: recovered-cache
+        uses: actions/cache@v5
+        with:
+          path: conformance/recovered-cache
+          key: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-fault-recovery
+      - name: Establish the post-fault cache payload
+        run: |
+          test '${{ steps.recovered-cache.outputs.cache-hit }}' != true
+          mkdir -p conformance/recovered-cache
+          printf '%s\n' 'recovered' > conformance/recovered-cache/payload
+      - name: Create a clean artifact payload
+        run: |
+          mkdir -p conformance/artifact conformance/poison-actions conformance/poison-tls conformance/poison-proxy conformance/poison-process
+          printf '%s\n' 'billet-${{ github.run_id }}-${{ github.run_attempt }}-poison' > conformance/artifact/payload
+          for path in conformance/poison-actions conformance/poison-tls conformance/poison-proxy conformance/poison-process; do
+            printf '%s\n' "$path" > "$path/payload"
+          done
+      - name: Poison Actions service variables
+        id: poison-actions
+        continue-on-error: true
+        uses: actions/cache@v5
+        env:
+          ACTIONS_CACHE_URL: https://127.0.0.1:1/
+          ACTIONS_RESULTS_URL: https://127.0.0.1:1/
+          ACTIONS_RUNTIME_TOKEN: poisoned
+        with:
+          path: conformance/poison-actions
+          key: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-poison-actions
+      # There is deliberately no NODE_OPTIONS poison here. A step that set
+      # NODE_OPTIONS=--require=/nonexistent to crash the cache client's runtime was
+      # removed once the runner (2.336.0) proved to strip step-env NODE_OPTIONS from
+      # JS actions: the runner's own bundled node exits non-zero with that value, yet
+      # actions/cache ran to a clean SUCCESS, so the poison never reached the action
+      # and the client cached normally. That stripping is a runner security control,
+      # not something billet can restore or should want to -- so the scenario is not
+      # expressible here, and the reachability, trust, proxy and tooling poisons above
+      # and below cover a compromised client's every fail-open path that billet owns.
+      - name: Poison CA and TLS overrides
+        id: poison-tls
+        continue-on-error: true
+        uses: actions/cache@v5
+        env:
+          NODE_EXTRA_CA_CERTS: /billet-conformance-does-not-exist
+          SSL_CERT_FILE: /billet-conformance-does-not-exist
+          GIT_SSL_NO_VERIFY: "true"
+        with:
+          path: conformance/poison-tls
+          key: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-poison-tls
+      - name: Poison proxy variables
+        id: poison-proxy
+        continue-on-error: true
+        uses: actions/cache@v5
+        env:
+          http_proxy: http://127.0.0.1:1
+          https_proxy: http://127.0.0.1:1
+          no_proxy: ""
+        with:
+          path: conformance/poison-proxy
+          key: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-poison-proxy
+      - name: Poison loader, tar and path variables
+        id: poison-process
+        continue-on-error: true
+        uses: actions/cache@v5
+        env:
+          LD_PRELOAD: /billet-conformance-does-not-exist
+          TAR_OPTIONS: --help
+          PATH: /usr/bin:/bin
+        with:
+          path: conformance/poison-process
+          key: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-poison-process
+      - name: Prove clean artifact metadata still passes through
+        uses: actions/upload-artifact@v7
+        with:
+          name: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-poison
+          path: conformance/artifact/payload
+          if-no-files-found: error
+
+  restore-poison-artifact:
+    needs: poisoned-clients
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 30
+    steps:
+      - name: Observe the runner lifecycle after poisoned Actions variables
+        id: poison-actions
+        uses: actions/cache@v5
+        with:
+          path: conformance/poison-actions
+          key: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-poison-actions
+          lookup-only: true
+      - name: Prove poisoned CA and TLS variables published no cache
+        id: poison-tls
+        uses: actions/cache@v5
+        with:
+          path: conformance/poison-tls
+          key: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-poison-tls
+          lookup-only: true
+      - name: Prove poisoned proxy variables published no cache
+        id: poison-proxy
+        uses: actions/cache@v5
+        with:
+          path: conformance/poison-proxy
+          key: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-poison-proxy
+          lookup-only: true
+      - name: Observe the runner lifecycle after poisoned process variables
+        id: poison-process
+        uses: actions/cache@v5
+        with:
+          path: conformance/poison-process
+          key: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-poison-process
+          lookup-only: true
+      - name: Require interceptor-owned poison operations to remain a miss
+        run: |
+          test '${{ steps.poison-tls.outputs.cache-hit }}' != true
+          test '${{ steps.poison-proxy.outputs.cache-hit }}' != true
+      - name: Record runner-owned poison outcomes
+        run: |
+          actions_hit='${{ steps.poison-actions.outputs.cache-hit }}'
+          process_hit='${{ steps.poison-process.outputs.cache-hit }}'
+          {
+            echo '### Runner-owned poison observations'
+            echo
+            echo '| Probe | Cache hit on a fresh runner |'
+            echo '|---|---|'
+            echo "| Actions service variables | ${actions_hit:-false} |"
+            echo "| Loader, tar and path variables | ${process_hit:-false} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$actions_hit" = true ]; then
+            echo '::notice title=Actions-variable probe::the runner restored a usable Actions service environment for the post action; this lifecycle is outside the interceptor boundary'
+          fi
+          if [ "$process_hit" = true ]; then
+            echo '::notice title=Process-variable probe::the runner and cache client completed publication despite the hostile process environment; this lifecycle is outside the interceptor boundary'
+          fi
+      - name: Restore the cache saved after the proxy faults
+        id: recovered-cache
+        uses: actions/cache@v5
+        with:
+          path: conformance/recovered-cache
+          key: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-fault-recovery
+          fail-on-cache-miss: true
+      - name: Verify the post-fault cache payload
+        run: |
+          test '${{ steps.recovered-cache.outputs.cache-hit }}' = true
+          printf '%s\n' 'recovered' > expected-cache
+          cmp expected-cache conformance/recovered-cache/payload
+      - uses: actions/download-artifact@v8
+        with:
+          name: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-poison
+          path: conformance/download
+      - run: |
+          printf '%s\n' 'billet-${{ github.run_id }}-${{ github.run_attempt }}-poison' > expected
+          cmp expected conformance/download/payload

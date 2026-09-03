@@ -1,0 +1,271 @@
+---
+# THE POSTGRESQL BLOCK `billet init` PRINTS MUST BE ONE THIS ROLE ACCEPTS, AND
+# THE DSN MUST REACH THE SERVICE.
+#
+# emitted-block-check.yml's sibling, and it exists for the same seam and a sharper
+# reason. The PostgreSQL ledger shipped `server.identity_dir` plus an explicit `state:`
+# block, and the role read `server.state_dir` — which such a config does not
+# have. Every one of them converged GREEN against the default directory, fencing,
+# chowning and sandboxing somewhere the control plane does not use. Nothing
+# caught it because the Go tests proved the generation was a correct CONFIG and
+# the Ansible tests fed the role a config written by hand, always in the
+# shorthand.
+#
+# The other half is the connection string. `dsn_env` names an environment
+# VARIABLE rather than carrying a DSN, so a config alone can never be enough:
+# something has to put the value in the service's environment, and until this
+# nothing did.
+#
+# Check mode, and the binary is a no-op, so what runs is the role's input
+# validation and its renders. ONE TASK IS EXEMPT and has to be: the no-op is
+# installed at /usr/bin/billet for real, because a check-mode copy writes nothing
+# and the role would then read a first install as the binary change it refuses on
+# this profile. That mutation is refused on a host that already has billet, and
+# undone in the block's `always` — see both, below.
+- name: Converge a generated PostgreSQL block
+  hosts: all
+  become: true
+  pre_tasks:
+    - name: Prove the generated block actually reached this play
+      ansible.builtin.assert:
+        that:
+          - billet_config is defined
+          - billet_config.server is defined
+          - billet_config.node is defined
+          - billet_config.tiers | default([]) | length > 0
+        fail_msg: >-
+          The emitted block did not reach the role. This test proves the role
+          ACCEPTS a generated config; an absent config would satisfy it silently.
+
+    # AND THAT IT IS THE SHAPE THIS EXISTS FOR. The two spellings are mutually
+    # exclusive at load, so a generation that wrote `state_dir` here would be the
+    # ordinary case wearing a postgres flag — and every assertion below would
+    # pass against a config that exercises none of this.
+    - name: Prove the block is the PostgreSQL shape whose converger this catches
+      ansible.builtin.assert:
+        that:
+          - billet_config.server.identity_dir is defined
+          - billet_config.server.state_dir is not defined
+          - billet_config.server.state.backend == 'postgres'
+          - billet_config.server.state.postgres.dsn_env == 'BILLET_STATE_DSN'
+        fail_msg: >-
+          Expected a generation naming identity_dir and an explicit postgres
+          state block, with no state_dir. Without that this play exercises the
+          shorthand and proves nothing about the profile it is named for.
+    # THE BINARY IS ALREADY INSTALLED, WHICH IS THE STATE THE REFUSAL POINTS AT.
+    #
+    # A PostgreSQL host cannot take the transactional upgrade path: it snapshots
+    # and restores the state directory, which an external ledger does not have —
+    # and a FIRST INSTALL is a binary change, so a fresh host meets that refusal.
+    # What the refusal tells an operator to do is install /usr/bin/billet
+    # themselves with the services stopped and then converge, and this is that
+    # host: the same bytes the role is handed as its candidate, so
+    # `billet_binary_upgrade` is false and the ordinary converge runs.
+    #
+    # OMITTING THE BINARY ENTIRELY DOES NOT WORK, and CI is where that was
+    # measured: the role refuses a converge with no binary source and no
+    # persisted install, which is right — it would have nothing to validate the
+    # config with.
+    #
+    # AND THE INSTALL IS THE ONE TASK HERE THAT RUNS FOR REAL. This playbook is
+    # driven with --check, and a check-mode copy reports `changed` while writing
+    # nothing — so the file was never there, the role correctly read a first
+    # install as a binary change, and this play met the refusal it was arranged
+    # to avoid. That is what CI measured: the install was in place and had no
+    # effect at all.
+    #
+    # WHICH MAKES IT THE ONLY HOST MUTATION IN A CHECK-MODE SUITE, so it is
+    # gated on the host having no billet to lose. The gates around this one
+    # assume a bare machine — that is what a CI runner is — and a developer's
+    # Linux box with a real /usr/bin/billet is not a bare machine. Refusing
+    # names the reason; replacing a real billet with /usr/bin/true and then
+    # deleting it does not.
+    # THE FIXTURE'S OWN DIGEST, from the controller, because that is where the
+    # copy reads its source. Comparing digests is what lets the refusal below
+    # tell a REAL billet from this gate's own leftover.
+    - name: Read the fixture's digest
+      ansible.builtin.stat:
+        path: "{{ billet_postgres_block_binary_src }}"
+      register: billet_postgres_block_fixture
+      delegate_to: localhost
+      become: false
+      check_mode: false
+
+    - name: Look at what is installed before installing anything
+      ansible.builtin.stat:
+        path: /usr/bin/billet
+      register: billet_postgres_block_installed
+      check_mode: false
+      become: true
+
+    # A BYTE-IDENTICAL LEFTOVER IS THIS GATE'S OWN AND IS ADOPTED.
+    #
+    # Refusing every existing /usr/bin/billet protects a real installation and
+    # ALSO refuses the no-op a previous run left behind when it was killed before
+    # its `always` — which wedges the host for a person over a file this gate
+    # wrote. That is a check refusing a state it created, which is the failure
+    # ADR-005 names.
+    #
+    # So the question is not "is something there" but "is it something to lose",
+    # and the digest answers it. Anything else still gets the refusal.
+    - name: Refuse to run this gate on a host that has a billet to lose
+      ansible.builtin.assert:
+        that:
+          # DIFFERENT DEFAULTS ON THE TWO SIDES, so a pair of undefined checksums
+          # — an unreadable file, a directory under that name — can never compare
+          # equal and adopt something nobody has read.
+          - not billet_postgres_block_installed.stat.exists or
+            (billet_postgres_block_fixture.stat.exists and
+             billet_postgres_block_installed.stat.checksum | default('installed-unreadable')
+             == billet_postgres_block_fixture.stat.checksum | default('fixture-unreadable'))
+        fail_msg: >-
+          /usr/bin/billet exists on this host and is not this gate's fixture.
+          This play models the operator a PostgreSQL host needs — one who
+          installed the binary themselves with the services stopped — by
+          installing a no-op there and removing it again, and it will not replace
+          a billet that is already installed. Run this gate on a machine with no
+          billet on it, which is what CI is. A file left by an interrupted run of
+          this gate is recognised by its digest and reused, so that case needs
+          nothing from you.
+
+  # THE INSTALL AND EVERYTHING AFTER IT ARE ONE BLOCK, so the removal is reached
+  # on every path. A role failure or a failed assertion aborts the play, and
+  # post_tasks do not run then — which would leave a no-op billet installed on
+  # the host for every gate that runs after this one in the same job. `always` is
+  # what makes that impossible rather than unlikely.
+  #
+  # NOT `roles:` FOR THE SAME REASON: a role listed there runs before post_tasks
+  # and outside any block this play can put an `always` on.
+  tasks:
+    - name: Converge the generated block against an installed binary
+      block:
+        # WHAT THIS DOES NOT CLOSE, said rather than implied: `copy` has no
+        # no-clobber form, so a real billet installed between the stat above and
+        # this task would be overwritten. Nothing billet owns can fix that —
+        # and by then the bytes are already gone, so a conditional removal in
+        # `always` would not restore them either. The gate runs on a machine
+        # nothing else is installing onto.
+        - name: Install the binary the way this profile's operator has to
+          ansible.builtin.copy:
+            src: "{{ billet_postgres_block_binary_src }}"
+            dest: /usr/bin/billet
+            mode: "0755"
+            owner: root
+            group: root
+          become: true
+          check_mode: false
+
+        - name: Converge the host role
+          ansible.builtin.include_role:
+            name: junioryono.billet.host
+          vars:
+            billet_binary_src: "{{ billet_postgres_block_binary_src }}"
+            billet_github_private_key_src: "{{ billet_postgres_block_key_src }}"
+            billet_enable_server: false
+            billet_enable_node: false
+            # THE DSN, the way an operator supplies one: from a vault, into the
+            # service's environment, never into billet.yaml.
+            billet_server_environment:
+              BILLET_STATE_DSN: postgres://billet:s3cret@ledger.internal:5432/billet?sslmode=verify-full
+
+        # THE DIRECTORY THE ROLE ACTED ON is the one the config names. This is the
+        # defect itself: the fact below drives the state-path refusals, the
+        # ownership it applies, the mount fence and the server unit's
+        # ReadWritePaths, so one wrong answer here is wrong in all four places at
+        # once.
+        - name: Prove the role resolved the directory the config actually names
+          ansible.builtin.assert:
+            that:
+              - billet_candidate_server_state_dir == billet_config.server.identity_dir
+            fail_msg: >-
+              The role resolved server state to {{ billet_candidate_server_state_dir }}
+              while the config names {{ billet_config.server.identity_dir }}. A
+              PostgreSQL deployment writes identity_dir and no state_dir; reading
+              state_dir alone answers the default for every one of them.
+
+        # AND THE ENVIRONMENT FILE WAS WRITTEN. Without it the converge is green
+        # and the control plane then fails to start against an empty data source
+        # — which is exactly the class of silent success this seam exists to
+        # catch.
+        - name: Prove the DSN reached the service's environment
+          ansible.builtin.assert:
+            that:
+              - billet_server_environment_install is defined
+              - billet_server_environment_install.skipped | default(false) | bool == false
+              - billet_server_environment_install.changed | bool
+            fail_msg: >-
+              The server environment file was not rendered. billet reads
+              BILLET_STATE_DSN from the environment because a DSN carries a
+              password, so a config alone is never enough — something has to
+              deliver the value, and on this host that is the role.
+
+      always:
+        # PUT BACK WHAT THE INSTALL PUT THERE, whatever happened above. The
+        # refusal in pre_tasks has already established there was nothing here to
+        # lose, so this restores the host rather than merely tidying — and it is
+        # what leaves /usr/bin/billet absent for the play below, where a FIRST
+        # INSTALL is the binary change the refusal exists for.
+        - name: Remove the binary this play installed
+          ansible.builtin.file:
+            path: /usr/bin/billet
+            state: absent
+          become: true
+          check_mode: false
+
+# AND A BINARY CHANGE IS REFUSED, which is the other half of this profile's
+# answer and the reason the play above installs the binary first.
+#
+# A FIRST INSTALL IS A BINARY CHANGE — there is no installed binary to compare
+# against — so without this refusal a fresh PostgreSQL host failed several
+# irreversible steps into a transaction it cannot finish, with the old binary
+# already removed and the fence already raised. CI is where that was measured:
+# this gate supplied a binary, and the refusal fired exactly as it should.
+#
+# ITS OWN PLAY, because the assertion is that the ROLE FAILS — which cannot be
+# observed from inside a play whose `roles:` section is the thing failing. A
+# block/rescue around include_role is what turns a role failure into a fact this
+# play can assert on, and reaching the task AFTER it is what says the role did
+# not refuse.
+- name: Prove a binary change against an external ledger is refused
+  hosts: all
+  become: true
+  tasks:
+    - name: Converge with a candidate binary
+      block:
+        - name: Run the role with a binary this host does not have installed
+          ansible.builtin.include_role:
+            name: junioryono.billet.host
+          vars:
+            billet_binary_src: "{{ billet_postgres_block_binary_src }}"
+            billet_github_private_key_src: "{{ billet_postgres_block_key_src }}"
+            billet_enable_server: false
+            billet_enable_node: false
+            billet_server_environment:
+              BILLET_STATE_DSN: postgres://billet:s3cret@ledger.internal:5432/billet?sslmode=verify-full
+
+        # REACHED ONLY IF THE ROLE DID NOT REFUSE, which is the failure this play
+        # exists to catch.
+        - name: Record that the role accepted the binary change
+          ansible.builtin.set_fact:
+            billet_postgres_upgrade_accepted: true
+
+      rescue:
+        - name: Record the refusal
+          ansible.builtin.set_fact:
+            billet_postgres_upgrade_accepted: false
+            billet_postgres_refusal: "{{ ansible_failed_result.msg | default('') }}"
+
+    - name: The refusal happened, and it says what to do instead
+      ansible.builtin.assert:
+        that:
+          - not billet_postgres_upgrade_accepted
+          # THE MESSAGE, NOT MERELY A FAILURE. Any broken task fails a play; what
+          # this is about is the operator meeting a sentence that names the
+          # limitation and the way through it. A test asserting only `is failed`
+          # would pass against a role that fell over for an unrelated reason.
+          - "'transactional binary upgrade is not implemented' in billet_postgres_refusal"
+          - "'STOPPED' in billet_postgres_refusal"
+        fail_msg: >-
+          Expected the role to refuse a binary change on a host whose ledger is
+          external, naming what to do instead. It reported:
+          {{ billet_postgres_refusal | default('(the role did not fail at all)') }}

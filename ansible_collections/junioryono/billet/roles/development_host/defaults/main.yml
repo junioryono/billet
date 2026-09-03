@@ -1,0 +1,38 @@
+---
+billet_development_user: "{{ ansible_facts['user_id'] }}"
+billet_development_home: "{{ ansible_facts['user_dir'] }}"
+
+billet_development_install_terraform: true
+billet_development_terraform_min_version: "1.12.0"
+billet_development_caddy_min_version: "2.7.0"
+
+# Repository signing keys are verified before either apt source is trusted.
+billet_development_hashicorp_signing_fingerprint: 798AEC654E5C15428C8E42EEAA16FCBCA621E701
+billet_development_caddy_signing_fingerprint: 65760C51EDEA2017CEA2CA15155B6D79CA56EA34
+billet_development_apt_stage: /var/cache/billet-development-host
+
+billet_development_tls_enabled: true
+billet_development_tls_caroot: "{{ billet_development_home ~ '/Library/Application Support/mkcert' if ansible_facts['system'] == 'Darwin' else billet_development_home ~ '/.local/share/mkcert' }}"
+billet_development_tls_dir: "{{ billet_development_home }}/.config/billet/development/tls"
+billet_development_tls_cert_path: "{{ billet_development_tls_dir }}/development.pem"
+billet_development_tls_key_path: "{{ billet_development_tls_dir }}/development-key.pem"
+billet_development_tls_sans:
+  - localhost
+  - 127.0.0.1
+  - "::1"
+
+billet_development_proxy_enabled: true
+billet_development_proxy_admin: 127.0.0.1:2019
+billet_development_proxy_config_dir: "{{ billet_development_home }}/.config/billet/development/proxy"
+billet_development_proxy_config_src: ""
+billet_development_proxy_config_path: "{{ billet_development_proxy_config_dir }}/Caddyfile"
+billet_development_proxy_routes_path: "{{ billet_development_proxy_config_dir }}/routes.caddy"
+billet_development_proxy_env_path: "{{ billet_development_proxy_config_dir }}/proxy.env"
+billet_development_proxy_log_path: "{{ billet_development_home }}/.local/state/billet/development-proxy.log"
+billet_development_proxy_environment:
+  BILLET_DEVELOPMENT_CERT_FILE: "{{ billet_development_tls_cert_path }}"
+  BILLET_DEVELOPMENT_KEY_FILE: "{{ billet_development_tls_key_path }}"
+billet_development_proxy_systemd_unit: billet-development-proxy.service
+billet_development_proxy_launchd_label: io.billet.development-proxy
+
+billet_development_brew_bin: "{{ '/opt/homebrew/bin/brew' if ansible_facts['architecture'] in ['arm64', 'aarch64'] else '/usr/local/bin/brew' }}"

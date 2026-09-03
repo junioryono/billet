@@ -1,0 +1,583 @@
+# billet — strict golangci-lint v2 config
+#
+# Why each non-stdlib rule exists is documented inline next to that rule. The
+# conventions themselves live in CLAUDE.md.
+#
+# Do NOT silence a rule with a bare //nolint — nolintlint rejects that. Use
+# `//nolint:linter-name // reason` when an exception is genuinely justified.
+#
+# Run: golangci-lint run --timeout=5m
+#
+# PINNED VERSION: v2.12.2, matching .github/workflows/ci.yml. Install the same
+# version locally so your runs agree with CI:
+#   go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+# Bump both together, deliberately.
+
+version: "2"
+
+run:
+  go: "1.26"
+  timeout: 5m
+  modules-download-mode: readonly
+
+linters:
+  default: none
+  enable:
+    # ----- correctness / error handling -----
+    - errcheck
+    - errorlint # %w wrapping, errors.Is/As, no err == sentinel
+    - nilerr # if err != nil { return nil }
+    - nilnil # never return (nil, nil) from (*T, error)
+    - nonamedreturns
+    - staticcheck
+    - govet
+    - gocheckcompilerdirectives # typo'd //go:build tags — billet has real build tags
+    - predeclared
+    - ineffassign
+    - wastedassign
+    - unconvert
+    - unparam
+    - unused
+    - copyloopvar
+    - intrange
+
+    # ----- database / process correctness -----
+    # billet's control plane is a capacity ledger over SQLite; a leaked rows
+    # handle or an unchecked rows.Err() silently truncates a scheduling decision.
+    - rowserrcheck
+    - sqlclosecheck
+    - bodyclose
+    - noctx
+    - contextcheck
+    - containedctx
+
+    # ----- security -----
+    # This process holds a GitHub App private key and a TLS CA key.
+    - gosec
+    - bidichk
+
+    # ----- style / dead code -----
+    - revive
+    - gocritic
+    - nakedret
+    - prealloc
+    - misspell
+    - whitespace
+    - usestdlibvars
+    - usetesting
+    - tparallel
+    - thelper
+    - dogsled
+
+    # ----- type safety -----
+    - errchkjson
+    - recvcheck # one receiver style per type
+    - canonicalheader
+    - sloglint # structured-logging consistency
+    - fatcontext # no context derivation inside loops
+    - makezero # make([]T, n) followed by append
+    - reassign
+    - mirror
+    # An interface is a CONTRACT SOMEBODY ELSE IMPLEMENTS, and an unnamed
+    # parameter list is the one place Go lets a contract say nothing about what
+    # it wants. `DestroyCompletedBound(context.Context, int64, string, string,
+    # string, int64, alloc.Phase)` was real, and three of those strings are a
+    # result, a lease id and a node name in an order nothing at the declaration
+    # tells you. Measured at 31 violations, all of them named rather than
+    # suppressed.
+    - inamedparam
+
+    # ----- custom rule infrastructure -----
+    - depguard
+    - forbidigo
+    - nolintlint
+
+  # Explicitly NOT enabled, so nobody proposes them again:
+  #   wrapcheck       — billet's packages are its own; the error text at a
+  #                     boundary is already contextual and double-wrapping reads
+  #                     "open state db: open state db: ...". Revisit if a public
+  #                     API package appears.
+  #   exhaustive      — the string enums (ProviderKind, GuestOS, lease phase)
+  #                     are validated at parse time, not switched exhaustively.
+  #   gochecknoglobals — `var ErrXxx = errors.New(...)` is the project pattern.
+  #   gocyclo/cyclop/funlen/nestif — validation functions naturally branch.
+  #   varnamelen/nlreturn/lll — style noise.
+  #   gofumpt         — opinions beyond gofmt that fight AI training data.
+  #   paralleltest    — billet's tests open real SQLite files; t.Parallel() on
+  #                     every one buys nothing and invites flakes.
+
+  settings:
+    # errcheck by default ignores `_ = f()`. check-blank flags that too, which is
+    # the form reached for when silencing the linter rather than handling the error.
+    errcheck:
+      check-blank: true
+      check-type-assertions: true
+      exclude-functions:
+        # Deferred cleanup on an error path we are already returning from; the
+        # close error would replace the real one.
+        - (*database/sql.Rows).Close
+
+    staticcheck:
+      checks:
+        - all
+        - -ST1003 # initialisms — noisy against SQL/JSON identifiers
+
+    errorlint:
+      errorf: true
+      errorf-multi: true
+      asserts: true
+      comparison: true # catches err == sql.ErrNoRows
+
+    gosec:
+      excludes:
+        - G104 # errcheck handles dropped errors better
+        - G115 # int conversion noise
+      severity: medium
+      confidence: medium
+
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - experimental
+        - opinionated
+        - performance
+        - style
+      disabled-checks:
+        - unnamedResult # conflicts with nonamedreturns
+        - hugeParam
+        - paramTypeCombine
+        - unnecessaryBlock
+        - commentedOutCode
+
+    # ===== depguard — package bans + layering =====
+    depguard:
+      rules:
+        global:
+          list-mode: lax
+          deny:
+            - pkg: "github.com/pkg/errors"
+              desc: 'Use fmt.Errorf("...: %w", err) or errors.Join.'
+            - pkg: "io/ioutil"
+              desc: "Deprecated. Use io and os."
+            - pkg: "github.com/sirupsen/logrus"
+              desc: "billet standardizes on log/slog."
+            - pkg: "go.uber.org/zap"
+              desc: "billet standardizes on log/slog."
+            - pkg: "github.com/rs/zerolog"
+              desc: "billet standardizes on log/slog."
+            - pkg: "math/rand$"
+              desc: "Use math/rand/v2, or crypto/rand for anything security-relevant."
+            - pkg: "github.com/mattn/go-sqlite3"
+              desc: "cgo breaks the single-static-binary guarantee and the cross-build matrix. Use modernc.org/sqlite."
+
+        # One SQLite driver, imported in one place. A second import site is how a
+        # connection gets opened without the durability pragmas the state package
+        # verifies at startup.
+        sqlitedriver:
+          list-mode: lax
+          files:
+            - "$all"
+            - "!**/internal/state/**"
+          deny:
+            - pkg: "modernc.org/sqlite"
+              desc: "Open the control-plane database through internal/state, which verifies WAL + synchronous=FULL and takes the process lock."
+            - pkg: "github.com/jackc/pgx"
+              desc: "Open the control-plane database through internal/state, which verifies durability, takes the process lock and serializes writers. A second import site is how a connection gets opened without them."
+
+        # One scale-set client, imported in one place. The upstream module is a
+        # PUBLIC PREVIEW whose README says its interfaces may change, and a
+        # preview type reaching into the scheduler is how someone else's release
+        # note becomes a rewrite here. internal/scaleset translates; everything
+        # above it consumes billet's own server.Session.
+        scalesetclient:
+          list-mode: lax
+          files:
+            - "$all"
+            - "!**/internal/scaleset/**"
+          deny:
+            - pkg: "github.com/actions/scaleset"
+              desc: "Consume GitHub's scale-set API through internal/scaleset, which adapts it to server.Session. The upstream module is a public preview."
+
+        # Layering: a compute backend is a leaf. It must not reach up into the
+        # scheduler, or the provider abstraction stops being substitutable.
+        provider:
+          list-mode: lax
+          files:
+            - "**/internal/provider/**"
+          deny:
+            - pkg: "github.com/junioryono/billet/internal/server"
+              desc: "A provider is a lower layer than the scheduler; invert the dependency."
+            - pkg: "github.com/junioryono/billet/internal/node"
+              desc: "A provider must not import the node runtime that drives it."
+            - pkg: "github.com/junioryono/billet/cmd"
+              desc: "Providers must not import cmd/."
+
+        # The storage layer is a leaf too.
+        store:
+          list-mode: lax
+          files:
+            - "**/internal/store/**"
+          deny:
+            - pkg: "github.com/junioryono/billet/internal/server"
+              desc: "The store is a lower layer than the scheduler."
+            - pkg: "github.com/junioryono/billet/internal/provider"
+              desc: "Storage and compute are siblings; neither imports the other."
+            - pkg: "github.com/junioryono/billet/cmd"
+              desc: "The store must not import cmd/."
+
+        # lifeops drives a SERVICE MANAGER, not billet's internals. It is
+        # allowed the config it reads paths out of and the units it compares
+        # against, and nothing else: a lifecycle package that reached into the
+        # scheduler, a provider or the ledger would make "what is this machine
+        # running" depend on the thing it is meant to be reporting on. Written
+        # as an ALLOWLIST rather than a list of denials, because the other
+        # rules here are lax denylists and denying five packages would still
+        # admit every other internal one.
+        lifeops:
+          list-mode: strict
+          files:
+            - "**/internal/lifeops/**"
+          # ANCHORED WITH $, because depguard matches a PREFIX otherwise —
+          # without it "internal/config" would also admit a future
+          # internal/config/secrets, which is not what the sentence above says.
+          #
+          # internal/lifeops itself is allowed because the tree now holds more
+          # than one service manager: internal/lifeops/launchd is a SIBLING
+          # backend that imports the shared vocabulary — Refusal, Tristate, and
+          # the plan and result types the lifecycle commands speak — rather than
+          # copying it. That is the rule's intent rather than an exception to it;
+          # what it forbids is a lifecycle package reaching into the scheduler,
+          # a provider or the ledger, and a sibling backend does none of that.
+          allow:
+            - $gostd
+            - github.com/junioryono/billet/deploy$
+            - github.com/junioryono/billet/internal/config$
+            - github.com/junioryono/billet/internal/lifeops$
+            # A service manager is asked about the host through syscalls the
+            # standard library does not wrap: the launchd backend needs
+            # unix.Access to answer "can this account write here" WITHOUT
+            # writing, which matters because that question is asked while
+            # rendering a --dry-run.
+            - golang.org/x/sys/unix$
+
+        # GENERATED QUERIES ARE REACHED BY THE THREE PACKAGES THAT OPEN A
+        # TRANSACTION, AND BY NOBODY ELSE. sqlc emits a *Queries carrying every
+        # statement and a DBTX that accepts any *sql.DB, so a caller holding it
+        # directly would have the whole ledger with none of what internal/state
+        # exists for: the process lock, the single writer, BEGIN IMMEDIATE, the
+        # busy retry and the maintenance fence.
+        #
+        # ALL LEDGER SQL LIVES IN ONE QUERY DIRECTORY, internal/alloc's and
+        # internal/rollout's included, so that the guards on it -- the
+        # prepare-against-the-migrated-schema check, the read/write
+        # classification, the ASCII rule and the wildcard ban -- are written once
+        # and cover every domain. Those two therefore import this package for its
+        # PARAMETER AND ROW TYPES; the handle itself comes from
+        # state.ReadQueries / state.WriteQueries, which is what keeps one
+        # implementation of the read-only refusal and one place listing every
+        # query in exactly one of the two halves.
+        #
+        # "TYPES ONLY" IS ENFORCED BY forbidigo, NOT BY THIS RULE, and that
+        # distinction was a comment claiming more than it delivered until it was
+        # written down: depguard governs whether a package may be IMPORTED, so
+        # nothing here stops internal/alloc calling the exported ledgerdb.New and
+        # helping itself to the whole method set. The forbidigo entry below bans
+        # that constructor everywhere but internal/state.
+        generatedqueries:
+          list-mode: lax
+          files:
+            - "$all"
+            - "!**/internal/state/**"
+            - "!**/internal/alloc/**"
+            - "!**/internal/rollout/**"
+          deny:
+            - pkg: "github.com/junioryono/billet/internal/state/ledgerdb"
+              desc: "Generated queries are bound by internal/state's adapters; reach the ledger through internal/state, which takes the lock and owns the transaction."
+
+        # And the generated package is a leaf: it must not reach back up.
+        sqlcgenerated:
+          list-mode: lax
+          files:
+            - "**/internal/state/ledgerdb/**"
+          deny:
+            - pkg: "github.com/junioryono/billet/internal"
+              desc: "Generated code imports nothing of billet's; it is the bottom of the stack."
+
+        # config is the leaf everything reads; it must import nothing of ours.
+        config:
+          list-mode: lax
+          files:
+            - "**/internal/config/**"
+          deny:
+            - pkg: "github.com/junioryono/billet/internal"
+              desc: "config is a leaf package — it must not import other billet packages."
+
+        # A LEDGER WRITER MAY NOT REACH THE NETWORK, AND THE BLAST RADIUS IS WHY.
+        #
+        # The writer pool is ONE connection and DB.Tx begins IMMEDIATE, so a
+        # transaction holds SQLite's single writer slot from BEGIN. A network or
+        # exec call inside one therefore stalls every scheduling write in this
+        # process for as long as the remote takes — and every operator command in
+        # the OTHER process too, which is what beginWrite's stall warning exists to
+        # make visible after the fact. An EC2 API call or a node dispatch inside a
+        # transaction would couple commit latency to somebody else's service.
+        #
+        # These three packages are the only ones that open a write transaction, and
+        # today they already satisfy this: none of them imports net/http, os/exec,
+        # or anything above them. Measured at 0 violations, which is the bar for
+        # putting a rule in CI at all — this pins a property billet HAS rather than
+        # asking anyone to go and get it.
+        #
+        # It is a lax denylist rather than an allowlist because the stdlib surface
+        # these three legitimately use is wide (crypto/rand, encoding/json,
+        # database/sql, os, path/filepath, syscall) and enumerating it would turn
+        # every ordinary edit into a config change.
+        #
+        # TESTS ARE EXEMPT, and one of them is the reason rather than an
+        # afterthought: deploymentlock_process_test.go proves the directory lock
+        # excludes another PROCESS, which it can only do by spawning one. The rule
+        # is about what a transaction does at runtime in a deployment, and a test
+        # binary is not that.
+        #
+        # `$`-ANCHORED WHERE A SIBLING SHARES THE PREFIX. depguard matches a
+        # prefix, so a bare internal/node also denies internal/nodeapi — which is
+        # the protocol-version leaf internal/rollout legitimately reads to decide
+        # which hosts can be asked for an inventory. Denying it would refuse
+        # correct code, which is the failure that gets a check deleted.
+        ledgerwriters:
+          list-mode: lax
+          files:
+            - "**/internal/state/**"
+            - "**/internal/alloc/**"
+            - "**/internal/rollout/**"
+            - "!$test"
+          deny:
+            - pkg: "net/http"
+              desc: "A package that opens a write transaction must not make HTTP calls: DB.Tx holds SQLite's single writer slot, so a request inside one stalls every scheduling write."
+            - pkg: "os/exec"
+              desc: "A package that opens a write transaction must not run subprocesses: DB.Tx holds SQLite's single writer slot for as long as the command takes."
+            - pkg: "github.com/junioryono/billet/internal/provider"
+              desc: "The ledger is a lower layer than compute; a provider call inside a transaction holds the single writer slot across a remote API."
+            - pkg: "github.com/junioryono/billet/internal/store"
+              desc: "The ledger is a lower layer than site storage; an rbd call inside a transaction holds the single writer slot."
+            - pkg: "github.com/junioryono/billet/internal/github"
+              desc: "The ledger is a lower layer than the GitHub client; a token mint inside a transaction holds the single writer slot across a network round trip."
+            - pkg: "github.com/junioryono/billet/internal/scaleset"
+              desc: "The ledger is a lower layer than the scale-set client."
+            - pkg: "github.com/junioryono/billet/internal/nodeplane"
+              desc: "The ledger is a lower layer than the node wire; a dispatch inside a transaction holds the single writer slot across a node's response."
+            - pkg: "github.com/junioryono/billet/internal/nodeclient"
+              desc: "The ledger is a lower layer than the node wire client."
+            - pkg: "github.com/junioryono/billet/internal/node$"
+              desc: "The ledger is a lower layer than the node runtime."
+            - pkg: "github.com/junioryono/billet/internal/server"
+              desc: "The ledger is a lower layer than the scheduler; invert the dependency."
+            - pkg: "github.com/junioryono/billet/cmd"
+              desc: "The ledger must not import cmd/."
+
+    # ===== forbidigo — identifier bans =====
+    forbidigo:
+      analyze-types: true
+      exclude-godoc-examples: true
+      forbid:
+        - pattern: '^fmt\.Print(ln|f)?$'
+          msg: "Use log/slog in library code. cmd/billet is allow-listed for operator output."
+        - pattern: "^panic$"
+          msg: "Return errors instead of panicking. A control plane that panics drops every in-flight lease."
+        - pattern: '^os\.Exit$'
+          msg: "Return errors and let main decide; don't os.Exit from library code."
+        - pattern: '^http\.(Get|Post|PostForm|Head)$'
+          msg: "Use http.NewRequestWithContext so the context propagates and the call is cancellable."
+        - pattern: '^context\.(Background|TODO)$'
+          msg: "Thread the context through. Long-lived roots belong in cmd/billet, which is allow-listed."
+        - pattern: '^time\.After$'
+          msg: "time.After leaks its timer until it fires. Use a context deadline or an explicit time.NewTimer with Stop."
+        # errors.As takes a pointer to a variable declared on the line above and
+        # reports through a bool, so the target is in scope after the branch that
+        # decided it was never populated -- which is how a nil *ExitError gets
+        # dereferenced. errors.AsType returns the value and the bool together, so
+        # the value cannot outlive the check. The one exception is a BEHAVIOURAL
+        # interface target (something with ExitCode and no Error): AsType's type
+        # parameter is constrained to error and cannot express it, so that site
+        # carries a //nolint with the reason.
+        - pattern: '^errors\.As$'
+          msg: "Use errors.AsType[T](err) (Go 1.26+): it returns the value with the bool, so a target cannot be used outside the branch that proved it was found."
+        # sqlc's constructor hands back the FULL generated method set, which is
+        # exactly the compile-time read/write split state.ReadQueries and
+        # state.WriteQueries exist to preserve. depguard can only say whether a
+        # package may be imported, and internal/alloc and internal/rollout must
+        # import ledgerdb for its parameter and row TYPES -- so without this,
+        # "types only" is documentation. internal/state is excluded below, because
+        # it is where the two binders live.
+        #
+        # AN IMPORT ALIAS DOES NOT EVADE IT, and that is measured rather than read
+        # because it is a fact about forbidigo: with analyze-types on, importing
+        # the package as `gen` and calling `gen.New` is still reported as
+        # `gen.New` against this pattern. A pattern that matched only the spelling
+        # would be one rename away from silence.
+        - pattern: '^ledgerdb\.New$'
+          msg: "Bind the generated queries through state.ReadQueries or state.WriteQueries. ledgerdb.New returns every method, which gives away the compile-time read/write split those two exist to keep."
+
+    revive:
+      severity: warning
+      confidence: 0.8
+      enable-all-rules: false
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: dot-imports
+        - name: error-return
+        - name: error-strings
+        - name: error-naming
+        - name: errorf
+        - name: if-return
+        - name: increment-decrement
+        - name: indent-error-flow
+        - name: range
+        - name: receiver-naming
+        - name: redefines-builtin-id
+        - name: superfluous-else
+        - name: time-naming
+        - name: unconditional-recursion
+        - name: unexported-return
+        - name: unreachable-code
+        - name: var-declaration
+        - name: var-naming
+        - name: waitgroup-by-value
+        - name: atomic
+        - name: modifies-value-receiver
+        - name: constant-logical-expr
+        - name: identical-branches
+        - name: duplicated-imports
+        - name: defer
+        - name: empty-block
+        - name: exported
+        - name: package-comments
+        - name: unused-parameter
+          arguments:
+            - allow-regex: "^_"
+
+    usetesting:
+      os-setenv: true
+      context-background: true
+      context-todo: true
+
+    usestdlibvars:
+      http-method: true
+      http-status-code: true
+      time-weekday: true
+      time-month: true
+      time-layout: true
+      crypto-hash: true
+
+    nolintlint:
+      allow-unused: false
+      require-explanation: true
+      require-specific: true
+
+  exclusions:
+    generated: lax
+    # A LINKED WORKTREE IS NOT THIS CHECKOUT'S SOURCE. Sessions park git
+    # worktrees under .claude/, so `make check` linted another branch's
+    # in-progress code and failed on it — a gate failing for something the
+    # committer cannot fix, and one CI never reproduces, because CI checks out
+    # a clean tree. .gitignore excludes the same path for the same reason.
+    paths:
+      - \.claude/
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      # internal/state IS where the two binders live, so it is the one package
+      # that may call the generated constructor.
+      #
+      # ANCHORED TO FILES DIRECTLY IN THAT PACKAGE. `internal/state/` alone is a
+      # SUBSTRING match, so it would exempt every subpackage under it -- present
+      # and future -- and a hand-written one could then help itself to the whole
+      # generated method set while this comment said only one package could.
+      - path: (^|/)internal/state/[^/]+\.go$
+        linters:
+          - forbidigo
+        text: ledgerdb\.New
+
+      # ----- tests: relax noise-heavy rules -----
+      #
+      # errcheck is deliberately NOT in this list. It was, on the assumption that
+      # tests are full of `defer db.Close()` and enabling it would bury everyone
+      # in noise. Measured, it was 19 sites — and two of them were real bugs that
+      # had been passing for the wrong reason. `n, _ := f()` followed by an
+      # assertion that n is zero passes precisely when the call FAILS, and this
+      # catches it mechanically rather than relying on anyone remembering to
+      # look. Genuinely irrelevant errors get `//nolint:errcheck // reason`.
+      - path: _test\.go
+        linters:
+          - gosec
+          - contextcheck
+          - containedctx
+          - nilnil
+          - nonamedreturns
+          - forbidigo # tests legitimately use context.Background and fmt.Print
+          - revive
+          - dogsled
+          - prealloc
+
+      # ----- cmd/billet is the operator-facing boundary -----
+      # It prints to stdout by design, creates the root context, and decides the
+      # process exit code. Those are exactly the things forbidigo bans elsewhere.
+      #
+      # MATCHED ON A PATH COMPONENT, NOT ON THE START OF THE STRING, and that is
+      # measured rather than stylistic. golangci-lint's cache is shared by every
+      # checkout on a machine and is keyed on file CONTENT, so a second checkout of
+      # this repo -- a git worktree, a release clone -- hits entries whose stored
+      # path belongs to the run that produced them. The path is then rendered
+      # relative to whichever directory is being linted, and `^` stops matching:
+      # `../<other-checkout>/cmd/billet/ami.go` is the same file under the same
+      # rule, and 612 excluded findings came back as failures against a tree with
+      # nothing wrong in it. Both spellings are green in a single checkout, so
+      # nothing here says which one is right.
+      #
+      # The neighbouring `_test\.go` was never anchored and never had the problem.
+      # `(^|/)` keeps the component boundary that `^` was there for.
+      - path: (^|/)cmd/billet/
+        linters:
+          - forbidigo
+
+      # THE STANDALONE TOOLS UNDER scripts/ ARE OPERATOR OUTPUT TOO, and are not
+      # part of the billet binary. Each is its own `package main` that runs once —
+      # in the release workflow, or from a terminal — and everything it prints is
+      # meant for the job log a person reads when something goes wrong; routing
+      # that through slog would put a timestamp and a level in front of a sentence
+      # whose whole audience is one human reading CI output. Each also DECIDES A
+      # PROCESS EXIT CODE, which is what `main` is for and what the os.Exit rule
+      # says elsewhere it should be left to.
+      #
+      # WIDENED FROM `mk[a-z]+` DELIBERATELY. That pattern described the two
+      # release-time generators that existed when it was written rather than the
+      # class the reason above names, so the next tool added here failed a rule
+      # whose own message said it was allowed. The `[a-z]+/` still requires a
+      # program DIRECTORY, so a stray .go file directly under scripts/ — which
+      # would be part of the package the shell-script tests live in — is not
+      # covered.
+      - path: (^|/)scripts/[a-z]+/
+        linters:
+          - forbidigo
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  # Keep the baseline clean — fix everything rather than grandfathering it.
+  new: false
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/junioryono/billet
+  exclusions:
+    generated: lax

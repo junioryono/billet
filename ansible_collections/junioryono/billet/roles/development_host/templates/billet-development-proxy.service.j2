@@ -1,0 +1,27 @@
+[Unit]
+Description=Billet development reverse proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+User={{ billet_development_user }}
+Group={{ billet_development_group_result.stdout }}
+WorkingDirectory={{ billet_development_proxy_config_dir }}
+Environment=HOME={{ billet_development_home }}
+Environment=XDG_CONFIG_HOME={{ billet_development_proxy_config_dir }}/state
+Environment=XDG_DATA_HOME={{ billet_development_proxy_config_dir }}/data
+ExecStart={{ billet_development_caddy_bin }} run --config {{ billet_development_proxy_config_path }} --adapter caddyfile --envfile {{ billet_development_proxy_env_path }}
+ExecReload={{ billet_development_caddy_bin }} reload --config {{ billet_development_proxy_config_path }} --adapter caddyfile --envfile {{ billet_development_proxy_env_path }} --force
+TimeoutStopSec=5s
+LimitNOFILE=1048576
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths={{ billet_development_proxy_config_dir }} {{ billet_development_proxy_log_path | dirname }}
+
+[Install]
+WantedBy=multi-user.target

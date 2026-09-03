@@ -1,0 +1,29 @@
+---
+# The emitted block, parsed rather than grepped, AND from the file under test.
+# A textual check ties the gate to an indentation the emitter never promised and
+# can be satisfied by a duplicate key whose value billet would not use. Reading
+# it as a global would be satisfied by any other source that happened to define
+# billet_config — an inventory, a playbook-adjacent vars file, a variable
+# plugin — so it is loaded here into a namespace of its own.
+- name: Prove the emitted block carries the App identity it was generated from
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Load the generated block on its own
+      ansible.builtin.include_vars:
+        file: "{{ emitted_block_path }}"
+        name: emitted_block
+
+    - name: Prove the identity in --config reached the emitted block
+      ansible.builtin.assert:
+        that:
+          - emitted_block.billet_config is defined
+          - emitted_block.billet_config.github is defined
+          - emitted_block.billet_config.github.app_id == expected_app_id | int
+          - emitted_block.billet_config.github.installation_id == expected_installation_id | int
+        fail_msg: >-
+          {{ emitted_block_path }} does not carry the App identity it was
+          generated from. `billet init --emit ansible --config <file>` must read
+          the ids `billet github-app create` wrote there; without that it emits
+          zeros, and a zero app_id is refused when the config is LOADED — so the
+          block the example tells a reader to generate would never converge.

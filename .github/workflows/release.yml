@@ -1,0 +1,150 @@
+name: Release
+
+# Two ways in, and the second exists to avoid a secret.
+#
+#   • a v* tag pushed by a human — a hotfix tagged on a release branch
+#   • called by cut-release.yml, which creates the tag itself
+#
+# A ref pushed with the default GITHUB_TOKEN does NOT trigger another workflow;
+# that is GitHub's recursion guard, and it is why a "cut a release" button
+# usually needs a PAT or a GitHub App to push with. Calling this workflow
+# directly sidesteps it: a workflow_call is not an event, so the guard never
+# applies and billet needs no repository secrets at all.
+on:
+  push:
+    tags: ["v*"]
+  workflow_call:
+    inputs:
+      tag:
+        description: The tag to build.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      # Creating the GitHub Release and uploading its archives.
+      attestations: read
+      contents: write
+      # SIGNING THE MANIFEST, KEYLESSLY. cosign exchanges this OIDC token for a
+      # short-lived Fulcio certificate, so billet holds no signing key: there is
+      # nothing to rotate, nothing to leak, and the certificate's SAN names the
+      # workflow that requested it — which is what internal/releasesource pins
+      # against rather than pinning a public key it would then have to distribute.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # The TAG, whichever way we got here. When called, the caller has just
+          # created it on a release branch and the workflow files come from the
+          # calling commit — so the ref has to be named explicitly or this builds
+          # the caller's branch instead.
+          ref: ${{ inputs.tag || github.ref }}
+          # GoReleaser reads the tag history to work out the version and the
+          # changelog. A shallow clone gives it neither.
+          fetch-depth: 0
+
+      - name: Verify release metadata matches the tag
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: scripts/check-release-metadata.sh
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # BEFORE GORELEASER, because GoReleaser is what runs it. The manifest has
+      # to be signed and published as part of the release rather than added
+      # afterwards: release immutability freezes the assets the moment the
+      # release is published, so `gh release upload` after the fact would be
+      # refused — correctly, and by the property this pipeline exists to have.
+      # @v3 BECAUSE THERE IS NO @v4 REF TO RESOLVE. cosign-installer publishes
+      # v4.x RELEASES but its moving major tags stop at v3 -- `git ls-remote` shows
+      # refs/tags/v2 and refs/tags/v3 and nothing else -- so `@v4` is not an older
+      # version, it is a ref that does not exist. Actions fails the whole dispatch
+      # resolving it, before any step runs, which is what broke the release button.
+      # guest-image.yml has always used @v3 and works. Pin an exact `v4.1.2` if a
+      # v4 installer is actually wanted; do not write `@v4`.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      # THE ROLLBACK TARGET IS THE NEWEST EXISTING RELEASE, and an absent one is a
+      # value rather than a failure: the first release billet publishes has
+      # nothing behind it, and refusing that would mean no release could ever be
+      # the first.
+      #
+      # COMPUTED HERE rather than inside the manifest builder, because it is a
+      # fact about the repository's tags rather than about the build.
+      - name: Work out the rollback target
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          # `|| true` ON THE PIPELINE, not on grep alone: grep exits 1 when the
+          # only tag is this one, and under pipefail that aborts the step with no
+          # message rather than yielding the empty answer that case means.
+          rollback_to=$(git tag --list 'v*' --sort=-v:refname \
+            | grep -vFx "${RELEASE_TAG}" \
+            | head -n 1 || true)
+
+          printf 'BILLET_ROLLBACK_TO=%s\n' "${rollback_to}" >> "$GITHUB_ENV"
+          printf 'rollback target: %s\n' "${rollback_to:-<none: this is the first release>}"
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          # Pinned exactly, the way golangci-lint is. "~> v2" downloads whichever
+          # v2 exists at the time, so a release built today and one rebuilt next
+          # month are not the same build.
+          version: "v2.17.1"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Read by the manifest step inside .goreleaser.yaml.
+          BILLET_ROLLBACK_TO: ${{ env.BILLET_ROLLBACK_TO }}
+          COSIGN_YES: "true"
+
+      # A workflow_call can build a maintained release branch whose tree predates
+      # this helper. Read it from the immutable commit that defined this job,
+      # never from moving main or from the release being verified.
+      - name: Check out release verification code
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .billet-release-tools
+          sparse-checkout: scripts/verify-release-attestation.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      # Release immutability is a repository setting rather than workflow YAML.
+      # Failing here makes that external precondition part of every release gate:
+      # GitHub must have locked the tag and assets and issued their attestation.
+      - name: Verify immutable release attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: .billet-release-tools/scripts/verify-release-attestation.sh
+
+      # THE CHANNEL IS ADVANCED LAST, and only for a release this job has just
+      # proved immutable — which is the fact the statement asserts. Advancing it
+      # before the gate would point every deployment following `stable` at a
+      # release whose immutability nobody had checked, and the assertion in the
+      # signed statement would be a claim rather than a finding.
+      #
+      # A HOTFIX ON AN OLDER MINOR MUST NOT MOVE `stable` BACKWARDS. The channel
+      # names the newest release, so a v0.3.27 cut after v0.4.0 exists publishes
+      # its artifacts and leaves the pointer alone; deployments pinned to that
+      # series install it by exact version.
+      - name: Advance the stable channel
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: scripts/advance-release-channel.sh

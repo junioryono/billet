@@ -1,0 +1,204 @@
+---
+billet_binary_src: "{{ lookup('env', 'BILLET_BINARY_PATH') }}"
+billet_config: {}
+billet_github_private_key_src: "{{ lookup('env', 'BILLET_GITHUB_PRIVATE_KEY_PATH') }}"
+
+# The control plane's ENVIRONMENT, rendered to /etc/billet/server.env (0640
+# root:billet) and named by the server unit as an EnvironmentFile.
+#
+# WHAT IT IS FOR is the PostgreSQL ledger: `server.state.postgres.dsn_env` names
+# an environment VARIABLE rather than carrying a connection string, because a DSN
+# holds a password and a secret written into billet.yaml ends up in a backup, a
+# paste buffer and eventually a support thread. So the DSN goes here, from a
+# vault:
+#
+#   billet_server_environment:
+#     BILLET_STATE_DSN: "{{ vault_billet_state_dsn }}"
+#
+# EMPTY RENDERS NOTHING AND NAMES NOTHING, deliberately: the server unit is
+# byte-identical to what it has always been on a deployment that does not use
+# this, so an ordinary converge does not restart a control plane — which on this
+# service is a drain — over a directive nothing reads.
+#
+# NEVER A SYSTEMD DROP-IN. The transactional host upgrade REFUSES effective
+# drop-ins it cannot replace and recover, so a drop-in here would make every
+# later upgrade of this host fail. The role renders the unit, and the unit names
+# the file.
+#
+# AND NOT PART OF THAT TRANSACTION EITHER: it is written on every converge,
+# alongside the GitHub App private key, because a credential the operator
+# supplies is not something a new billet binary replaces. Gating it on "not a
+# binary upgrade" looks right and is not — a FIRST INSTALL is a binary upgrade,
+# so that gate would leave every fresh host without its DSN.
+billet_server_environment: {}
+
+# The certificate bundle the control plane verifies its LEDGER's TLS against,
+# staged on the controller and installed at billet_state_ca_bundle_path.
+#
+# WITHOUT IT `sslmode=verify-full` CANNOT SUCCEED AGAINST RDS. Amazon RDS server
+# certificates are issued by self-signed per-region "Amazon RDS ... Root CA"
+# authorities, which are in NO operating system trust store — measured against
+# the published bundle — so a verify-full DSN with nothing to verify against
+# fails on a stock Ubuntu host. Point the DSN's `sslrootcert` at the installed
+# path; terraform-aws-billet's state-rds-postgres emits both in `dsn_template`.
+#
+# Fetch it from https://truststore.pki.rds.amazonaws.com/<region>/<region>-bundle.pem
+# (state-rds-postgres reports the exact URL as `ssl_bundle_url`) and hand the
+# file over the SSH connection Ansible already has, so the target needs no egress
+# of its own — the same shape billet_binary_src follows.
+#
+# EMPTY INSTALLS NOTHING, which is right for a SQLite deployment, for an adopted
+# endpoint whose TLS is already trusted by the system store, and for an operator
+# who manages the file themselves.
+billet_state_ca_bundle_src: ""
+
+# The TLS material an EC2 node.cache uses to terminate HTTPS for guests across the
+# VPC. Optional: leave unset to install the certificate and key yourself. Only an
+# ec2 node with a node.cache reads them.
+billet_cache_tls_cert_src: "{{ lookup('env', 'BILLET_CACHE_TLS_CERT_PATH') }}"
+billet_cache_tls_key_src: "{{ lookup('env', 'BILLET_CACHE_TLS_KEY_PATH') }}"
+
+# The dedicated EBS ledger volume the terraform-aws-billet module creates
+# (its `ledger_volume_id` output). When set, the role mounts it FAIL CLOSED at
+# server.state_dir: the volume is formatted only when blank, mounted by the
+# volume's own stable by-id device through a systemd mount unit — never a
+# filesystem UUID, which a snapshot-clone duplicates — verified to be the expected
+# volume, and billet-server.service gains RequiresMountsFor on the state dir —
+# so a failed mount stops the server rather than letting it start on the root
+# disk with a fresh ledger, deployment identity and CA. Empty leaves mounting
+# to the operator.
+billet_ledger_volume_id: ""
+# The ledger volume's device path, for a host where the Nitro by-id link
+# (/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_vol...) does not exist.
+# Normally derived from billet_ledger_volume_id.
+billet_ledger_device: ""
+billet_service_user: billet
+billet_service_group: billet
+billet_service_home: /var/lib/billet
+billet_adopt_existing_service_account: false
+billet_enable_server: true
+# Prepare a control-plane host WITHOUT commissioning it: the ledger volume is
+# formatted, mounted and proved, the units are installed with their mount fence,
+# and BOTH billet-server and billet-node are left installed, disabled and HELD by
+# an assertion in their own units — so neither can mint a deployment identity and
+# CA, including across a reboot, until an operator has put one there.
+#
+# The node is held for the SERVER's reason: on a host running both roles a
+# CERTLESS node mints the identity when the server has not — `billet node` claims the
+# deployment before it reaches --upgrade-probe, and nodeDeploymentID falls through
+# to state.DeploymentID(server.state_dir). Holding only the server leaves the
+# invariant broken by the other unit on the same machine.
+#
+# For a cutover that must PRESERVE an existing deployment: the state arrives from
+# another host AFTER the volume is mounted, and without this there is no point
+# between "blank volume mounted at server.state_dir" and "server running" at
+# which to place it. billet_enable_server stays TRUE — this host IS the control
+# plane, it is simply not commissioned yet.
+#
+# The host is commissioned by converging again with this false.
+billet_server_prepare_only: false
+billet_enable_node: true
+
+billet_firecracker_enabled: true
+billet_firecracker_version: v1.16.1
+billet_firecracker_checksums:
+  x86_64: 382a02a869e4d6d5cb14c40577f9545e8458021ea8b0b2d3fc10ec14d9c242e6
+  aarch64: 8d0e69f6d6f9a1724551f607f18504052c16c1828ee3d4d7b6e6c73380871e0e
+billet_firecracker_stage: /var/cache/billet-provision
+
+# A billet release to fetch onto the target, when the operator would rather name
+# a version than stage a binary. Empty means the role installs only what
+# billet_binary_src supplies, which is also what an egress-filtered host needs:
+# with billet_binary_src the binary arrives over the SSH connection Ansible
+# already has, and nothing on the host reaches the network.
+#
+# It must name ONE release. `latest` is refused — see tasks/binary.yml.
+billet_version: ""
+
+# A signed release channel to resolve into billet_version, for an operator who
+# would rather track billet's releases than edit a pin.
+#
+# EMPTY BY DEFAULT, AND THAT IS NOT AN OVERSIGHT. This role's own rule is that a
+# converge must be deterministic: with a channel set, the same playbook installs
+# different binaries on different days, and does it through the drain and restart
+# of a real upgrade transaction. Setting this is opting into that tradeoff
+# knowingly, and the resolved version is printed so a run says which release it
+# actually chose.
+#
+# THE CHANNEL-FOLLOWING PATH THAT IS NOT THIS ONE is `billet host-upgrade`, driven
+# by a rollout: it resolves the channel once, records the digest, and converges the
+# fleet against that one target — so every host installs the same release even
+# though the pointer keeps moving. Prefer it. This exists for a deployment whose
+# only orchestration is Ansible.
+billet_release_channel: ""
+
+# Where the signed channel statements are served from. Point this at an internal
+# mirror alongside billet_release_url_base for a fleet that cannot reach
+# raw.githubusercontent.com.
+billet_release_channel_base: https://raw.githubusercontent.com/junioryono/billet/release-channel
+
+# Where a fetched release comes from. Point this at an internal mirror that
+# carries the same archives and checksums.txt for a fleet that cannot reach
+# github.com.
+billet_release_url_base: https://github.com/junioryono/billet/releases/download
+
+# The same staging directory Firecracker uses, under a name that says what it is
+# for. One value, so an operator who moves the staging area moves both.
+billet_release_stage: "{{ billet_firecracker_stage }}"
+
+billet_networks:
+  - name: billet0
+    address: 172.31.0.1
+    prefix: 24
+    netmask: 255.255.255.0
+    dhcp_start: 172.31.0.10
+    dhcp_end: 172.31.0.250
+  - name: billet1
+    address: 172.31.1.1
+    prefix: 24
+    netmask: 255.255.255.0
+    dhcp_start: 172.31.1.10
+    dhcp_end: 172.31.1.250
+billet_guest_dns_servers:
+  - 1.1.1.1
+  - 1.0.0.1
+billet_guest_denied_ipv4:
+  - 10.0.0.0/8
+  - 100.64.0.0/10
+  - 169.254.0.0/16
+  - 172.16.0.0/12
+  - 192.168.0.0/16
+billet_guest_denied_ipv6:
+  - fc00::/7
+  - fe80::/10
+billet_guest_host_tcp_ports:
+  - 53
+  - 7718
+billet_guest_host_udp_ports:
+  - 53
+  - 67
+billet_image_verify_port: "{{ billet_config.node.firecracker.image_verify_port | default(7719, true) }}"
+
+billet_ceph_enabled: true
+billet_ceph_bootstrap: false
+billet_ceph_mon_ip: ""
+billet_ceph_ssh_user: "{{ ansible_user }}"
+billet_ceph_devices: []
+billet_ceph_image_pool: billet-images
+billet_ceph_cache_pool: billet-cache
+billet_ceph_pool_size: 2
+billet_ceph_pool_min_size: 1
+billet_ceph_user: billet
+billet_ceph_keyring_path: /etc/ceph/ceph.client.billet.keyring
+
+billet_alert_email: ""
+billet_alert_from: ""
+billet_smtp_host: email-smtp.us-west-2.amazonaws.com
+billet_smtp_port: 587
+billet_smtp_username: "{{ lookup('env', 'SES_SMTP_USERNAME') }}"
+billet_smtp_password: "{{ lookup('env', 'SES_SMTP_PASSWORD') }}"
+
+# Permit a converge driven from a billet-managed runner. Off, because the default
+# outcome is a deploy job that destroys itself when the node it runs on drains.
+# Set it only when the runner is provably not backed by the host being converged.
+billet_allow_converge_from_billet_runner: false

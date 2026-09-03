@@ -1,0 +1,17 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "BilletControllerSweepRegistrations",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:GetParametersByPath",
+        "ssm:DeleteParameter"
+      ],
+      "Resource": [
+        "arn:TFPARTITION:ssm:TFREGION:TFACCOUNT:parameter/TFPARAMPATH",
+        "arn:TFPARTITION:ssm:TFREGION:TFACCOUNT:parameter/TFPARAMPATH/*"
+      ]
+    }
+  ]
+}

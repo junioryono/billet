@@ -1,0 +1,296 @@
+package state
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/junioryono/billet/internal/deploymentid"
+)
+
+// deploymentIDFile holds the identity of one billet installation.
+//
+// A file rather than a row in the database, because the identity has to be
+// readable by things that have not opened the database and must survive the
+// database being rebuilt. Its lifetime is the state directory's.
+const deploymentIDFile = "deployment-id"
+
+// recoverIdentityAdvice is what an operator is told when the identity is gone or
+// unusable. One string, used by every branch that can say it.
+//
+// ONE COPY BECAUSE TWO DRIFTED. This started as duplicated prose on the empty
+// and invalid branches; a test pinned one of them, the other was free to lose
+// its guidance entirely, and an earlier version of both named a container label
+// that billet has never written.
+//
+// "COMPARE THE CANDIDATES" is not padding either. An operator who once followed
+// the older advice and reset the identity has containers under TWO ids, and
+// restoring an arbitrary one makes the other installation's live work invisible
+// — the same failure this text exists to prevent, reached by following it. The
+// only safe instruction is to reconcile the candidates and stop if they
+// disagree.
+const recoverIdentityAdvice = "RESTORE THE ORIGINAL IDENTITY if you can — from a backup, or from " +
+	"the sh.billet.owner label on containers this installation started. If the candidates " +
+	"DISAGREE, stop and work out which is current rather than picking one: an installation whose " +
+	"identity was reset in the past leaves containers under both, and restoring the wrong one " +
+	"hides live work. Deleting the file mints a NEW identity, and every container labelled with " +
+	"the old one becomes invisible to billet: its leases expire, its capacity is resold, and it " +
+	"runs forever. Only reset it once you have confirmed no compute is left under the old identity"
+
+// writeDeploymentID puts an identity on disk durably, or not at all.
+func writeDeploymentID(path, stateDir, id string) error {
+	// O_EXCL, so two processes racing to initialise the same directory cannot
+	// each write an id and have the loser's compute labelled with a value nothing
+	// will look for afterwards.
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		if os.IsExist(err) {
+			return err
+		}
+
+		return fmt.Errorf("state: write deployment id: %w", err)
+	}
+
+	defer func() { _ = f.Close() }()
+
+	if _, err := f.WriteString(id + "\n"); err != nil {
+		return fmt.Errorf("state: write deployment id: %w", err)
+	}
+
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("state: sync deployment id: %w", err)
+	}
+
+	// THE DIRECTORY IS SYNCED TOO, and that is not belt-and-braces. Syncing a new
+	// file persists its CONTENTS; the directory entry that makes it findable is a
+	// separate write, and losing power between the two leaves a state directory
+	// with no identity in it. Billet would mint a fresh one on restart, and every
+	// container labelled with the old id becomes invisible — leases reaped,
+	// capacity resold, containers running forever.
+	dir, err := os.Open(stateDir)
+	if err != nil {
+		return fmt.Errorf("state: open state dir to sync it: %w", err)
+	}
+
+	defer func() { _ = dir.Close() }()
+
+	if err := dir.Sync(); err != nil {
+		// THE FILE GOES WITH THE FAILURE. Leaving it behind means the next call
+		// takes the read path, finds an id whose directory entry was never made
+		// durable, and returns it as though the guarantee held — turning a
+		// one-time startup error into a silent loss of the property this sync
+		// exists to provide.
+		if rmErr := os.Remove(path); rmErr != nil {
+			return fmt.Errorf("state: sync state dir (%w), and the half-written identity "+
+				"could not be removed (%v); delete %s by hand", err, rmErr, path)
+		}
+
+		return fmt.Errorf("state: sync state dir: %w", err)
+	}
+
+	return nil
+}
+
+// AdoptDeploymentID records an identity this installation was handed.
+//
+// A NODE DOES NOT GET TO INVENT ITS DEPLOYMENT, and letting it was a defect that
+// made standalone enrollment impossible. DeploymentID mints a random identity
+// when a state directory has none — right for a control plane, which is where an
+// installation begins, and wrong for a node, which JOINS one. A fresh node minted
+// its own, the control plane compared it with its own and refused the
+// registration, and nothing in the enrollment instructions could have prevented
+// it: the bundle carried a certificate and no identity.
+//
+// So the certificate carries it, and this writes it down. Refuses rather than
+// overwrites when the directory already holds a DIFFERENT one — that state
+// directory's containers are labelled with the old identity, and quietly
+// relabelling the node would orphan every one of them.
+func AdoptDeploymentID(stateDir, id string) (string, error) {
+	if err := validDeploymentID(id); err != nil {
+		return "", fmt.Errorf("state: adopt deployment id %q: %w", id, err)
+	}
+
+	path := filepath.Join(stateDir, deploymentIDFile)
+
+	existing, err := os.ReadFile(path)
+	if err == nil {
+		have := strings.TrimSpace(string(existing))
+		if have == id {
+			return id, nil
+		}
+
+		return "", fmt.Errorf(
+			"state: %s says this host belongs to deployment %s, but it was given a certificate "+
+				"for %s. Billet will not relabel it: the compute it is already managing carries "+
+				"the old identity and would become invisible to both installations. Point "+
+				"node.state_dir somewhere new to join a different deployment",
+			path, have, id)
+	}
+
+	if !os.IsNotExist(err) {
+		return "", fmt.Errorf("state: read deployment id: %w", err)
+	}
+
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		return "", fmt.Errorf("state: create state dir %s: %w", stateDir, err)
+	}
+
+	if err := writeDeploymentID(path, stateDir, id); err != nil {
+		if os.IsExist(err) {
+			// Another process won the race and wrote one. Re-read rather than
+			// assume it wrote the same thing.
+			return AdoptDeploymentID(stateDir, id)
+		}
+
+		return "", err
+	}
+
+	return id, nil
+}
+
+// PeekDeploymentID reads the deployment identity WITHOUT minting one, for a
+// read-only caller such as `billet init iam` that must not create an identity as a
+// side effect of asking. found is false when the state directory has none yet
+// (the caller decides whether that is an error); an existing-but-invalid file is
+// returned as an error rather than a miss.
+func PeekDeploymentID(stateDir string) (string, bool, error) {
+	path := filepath.Join(stateDir, deploymentIDFile)
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", false, nil
+		}
+
+		return "", false, fmt.Errorf("state: read deployment id: %w", err)
+	}
+
+	id := strings.TrimSpace(string(raw))
+	if err := validDeploymentID(id); err != nil {
+		return "", false, fmt.Errorf("state: %s: %w", path, err)
+	}
+
+	return id, true, nil
+}
+
+// DeploymentID returns the stable identity of the billet installation rooted at
+// this state directory, creating it on first use.
+//
+// THIS IS WHAT MAKES DESTRUCTIVE RECONCILIATION SAFE, and the reason the node
+// name cannot be used for it: the node name defaults to the hostname, so two
+// installations on one machine carry the same name while keeping separate state
+// directories, and the process lock guards a directory rather than a name.
+// Labelling compute by node name would let one installation enumerate the
+// other's containers, find their lease ids absent from its own database, and
+// destroy live jobs. It cannot be derived from configuration either — a derived
+// label would change under the operator's feet and orphan every running
+// container.
+//
+// RANDOM rather than derived from the path, so copying a state directory does
+// not silently produce two installations claiming one identity: the copy carries
+// the original's id, which is what makes it DETECTABLE — LockDeployment keys a
+// host-wide lock on the id, so running the copy alongside the original fails as
+// a lock conflict.
+func DeploymentID(stateDir string) (string, error) {
+	path := filepath.Join(stateDir, deploymentIDFile)
+
+	existing, err := os.ReadFile(path)
+	if err == nil {
+		id := strings.TrimSpace(string(existing))
+		if id == "" {
+			return "", fmt.Errorf("state: %s is empty. %s", path, recoverIdentityAdvice)
+		}
+
+		if err := validDeploymentID(id); err != nil {
+			return "", fmt.Errorf("state: %s: %w. %s", path, err, recoverIdentityAdvice)
+		}
+
+		return id, nil
+	}
+
+	if !os.IsNotExist(err) {
+		return "", fmt.Errorf("state: read deployment id: %w", err)
+	}
+
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		return "", fmt.Errorf("state: create state dir %s: %w", stateDir, err)
+	}
+
+	var raw [16]byte
+
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", fmt.Errorf("state: mint a deployment id: %w", err)
+	}
+
+	id := hex.EncodeToString(raw[:])
+
+	if err := writeDeploymentID(path, stateDir, id); err != nil {
+		if os.IsExist(err) {
+			// Another process won the race. The loser re-reads the winner's, so the
+			// two never label compute with different values.
+			return DeploymentID(stateDir)
+		}
+
+		return "", err
+	}
+
+	return id, nil
+}
+
+// deploymentIDLen is the length of the hex encoding of the 16 random bytes an
+// identity is minted from.
+const deploymentIDLen = deploymentid.Length
+
+// validDeploymentID refuses anything billet would not have minted.
+//
+// THE IDENTITY IS INTERPOLATED INTO PLACES THAT PARSE, which is what makes this
+// worth checking rather than trusting. It becomes a filename in the host-wide
+// lock directory, where a `/` or a `..` leaves that directory entirely — and
+// silently, since the resulting lock failure is indistinguishable from a host
+// that has nowhere to put one, so the protection degrades off while reporting a
+// cache-directory problem. It is also written as a docker label and sent back as
+// `--filter label=…`, where a comma or an `=` changes what is being asked.
+//
+// Billet mints this value itself, so anything failing this check is a hand-edit
+// or a corrupted file. Refusing beats sanitising: a sanitised id is a DIFFERENT
+// identity from the one already written onto running containers, so billet would
+// come up unable to see its own compute while believing it could.
+func validDeploymentID(id string) error {
+	return deploymentid.Validate(id)
+}
+
+// IdentityProbe is a three-valued answer about a state directory's deployment
+// identity. Three-valued because the caller is a safety gate: an unreadable
+// directory is NOT an absent identity, and collapsing them would let a
+// permissions problem silently disarm the refusal built on this probe.
+type IdentityProbe int
+
+const (
+	IdentityAbsent IdentityProbe = iota
+	IdentityPresent
+	IdentityUnknown
+)
+
+// ProbeDeploymentID reports whether a state directory already holds a minted
+// deployment identity, WITHOUT minting one — DeploymentID creates the file
+// when absent, which makes it unusable as a probe. `billet init` asks before
+// pointing a config away from (or over) a directory whose identity is live.
+func ProbeDeploymentID(stateDir string) IdentityProbe {
+	info, err := os.Stat(filepath.Join(stateDir, deploymentIDFile))
+
+	switch {
+	case err == nil && info.Mode().IsRegular():
+		return IdentityPresent
+	case err == nil:
+		// Something IS there and it is not a regular identity file — a state
+		// directory in an unexpected shape is not one to point away from.
+		return IdentityUnknown
+	case os.IsNotExist(err):
+		return IdentityAbsent
+	default:
+		return IdentityUnknown
+	}
+}

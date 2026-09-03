@@ -1,0 +1,30 @@
+---
+# REPLACE THIS FILE WITH WHAT `billet init --emit ansible` PRINTS.
+#
+#   billet init --emit ansible \
+#     --config ~/billet-app.yaml \
+#     --org your-org \
+#     --runner-group billet-trusted \
+#     --workflow 'your-org/your-repo/.github/workflows/ci.yml@refs/heads/main' \
+#     > group_vars/linux.yml
+#
+# --config names the file `billet github-app create` wrote the App identity
+# into; without it the block carries app_id 0 and the role refuses it. Only the
+# block goes to stdout; everything else the command says goes to
+# stderr, so that redirect is safe. Take the output byte for byte — it is
+# already at the indentation a group_vars file wants, and it carries the
+# provisioning flags the role asserts against `node.provider` (a docker
+# emission sets billet_ceph_enabled and billet_firecracker_enabled false; a
+# firecracker one leaves the role's defaults alone).
+#
+# The emission measures the machine it runs on. To generate from somewhere
+# else — a laptop, a CI job — state the target's capacity instead:
+#
+#   billet init --emit ansible --max-vcpu 8 --max-memory 32GiB ...
+#
+# The empty mapping below is deliberate. A plausible-looking placeholder — a
+# github block with app_id 0 — would pass the role's input assertions and fail
+# later, inside the upgrade transaction, which is the late failure this example
+# exists to keep you out of. An empty config stops at the first assertion,
+# before the host is touched.
+billet_config: {}

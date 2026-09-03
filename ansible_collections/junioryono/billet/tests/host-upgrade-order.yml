@@ -1,0 +1,425 @@
+---
+- name: Guard the transactional host-upgrade ordering
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    billet_host_main_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/main.yml') | from_yaml }}"
+    billet_host_service_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/services.yml') | from_yaml }}"
+    billet_host_account_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/account.yml') | from_yaml }}"
+    billet_host_inspection_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/upgrade-inspect.yml') | from_yaml }}"
+    billet_host_recovery_dispatch_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/upgrade-recover.yml') | from_yaml }}"
+    billet_host_recovery_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/upgrade-rollback.yml') | from_yaml }}"
+    billet_host_finalization_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/upgrade-finalize.yml') | from_yaml }}"
+    billet_server_unit: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/templates/billet-server.service.j2') }}"
+    billet_node_unit: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/templates/billet-node.service.j2') }}"
+  tasks:
+    - name: Locate the upgrade transaction and recovery path
+      ansible.builtin.set_fact:
+        billet_upgrade_task: "{{ billet_host_service_tasks | selectattr('name', 'equalto', 'Upgrade billet as one recoverable host transaction') | first }}"
+        billet_top_level_names: "{{ billet_host_service_tasks | map(attribute='name') | list }}"
+        billet_account_names: "{{ billet_host_account_tasks | map(attribute='name') | list }}"
+        billet_inspection_names: "{{ billet_host_inspection_tasks | map(attribute='name') | list }}"
+        billet_main_names: "{{ billet_host_main_tasks | map(attribute='name') | list }}"
+        billet_recovery_dispatch_names: "{{ billet_host_recovery_dispatch_tasks | map(attribute='name') | list }}"
+        billet_recovery_names: "{{ billet_host_recovery_tasks | map(attribute='name') | list }}"
+        billet_finalization_names: "{{ billet_host_finalization_tasks | map(attribute='name') | list }}"
+
+    - name: Record transaction and recovery task details
+      ansible.builtin.set_fact:
+        billet_upgrade_names: "{{ billet_upgrade_task.block | map(attribute='name') | list }}"
+        billet_rollback_names: "{{ billet_upgrade_task.rescue | map(attribute='name') | list }}"
+        billet_upgrade_stop_node: "{{ billet_upgrade_task.block | selectattr('name', 'equalto', 'Gracefully stop the billet node before changing its guest contract') | first }}"
+        billet_upgrade_stop_server: "{{ billet_upgrade_task.block | selectattr('name', 'equalto', 'Gracefully stop the billet server after compute has drained') | first }}"
+        billet_upgrade_backup_ledger: "{{ billet_upgrade_task.block | selectattr('name', 'equalto', 'Preserve the stopped control-plane ledger') | first }}"
+        billet_candidate_stage: "{{ billet_host_account_tasks | selectattr('name', 'equalto', 'Stage the immutable candidate binary inside its recovery journal') | first }}"
+        billet_candidate_unit_stage: "{{ billet_host_account_tasks | selectattr('name', 'equalto', 'Stage candidate systemd units for the upgrade transaction') | first }}"
+        billet_ordinary_unit_install: "{{ billet_host_account_tasks | selectattr('name', 'equalto', 'Install the billet systemd units') | first }}"
+        billet_service_policy_reload: "{{ billet_host_account_tasks | selectattr('name', 'equalto', 'Reload systemd before inspecting installed service policy') | first }}"
+        billet_service_policy_pending_probe: "{{ billet_host_account_tasks | selectattr('name', 'equalto', 'Inspect pending Billet service policy during a dry run') | first }}"
+        billet_service_policy_pending_guard: "{{ billet_host_account_tasks | selectattr('name', 'equalto', 'Refuse a dry run against stale Billet service policy') | first }}"
+        billet_steady_unit_install: "{{ billet_upgrade_task.block | selectattr('name', 'equalto', 'Install steady-state units without the quiescent probe') | first }}"
+        billet_recovery_stop_proof: "{{ billet_host_recovery_tasks | selectattr('name', 'equalto', 'Refuse recovery without conclusive process and cgroup evidence') | first }}"
+        billet_recovery_cgroup_probe: "{{ billet_host_recovery_tasks | selectattr('name', 'equalto', 'Inspect service cgroups before recovering upgrade inputs') | first }}"
+        billet_recovery_restore_inputs: "{{ billet_host_recovery_tasks | selectattr('name', 'equalto', 'Restore configuration and units that existed before the upgrade') | first }}"
+        billet_recovery_candidate_links: "{{ billet_host_recovery_tasks | selectattr('name', 'equalto', 'Remove candidate persistent and runtime enablement links') | first }}"
+        billet_service_dropin_reload: "{{ billet_host_account_tasks | selectattr('name', 'equalto', 'Reload systemd before inspecting host-upgrade service overlays') | first }}"
+        billet_service_dropin_probe: "{{ billet_host_account_tasks | selectattr('name', 'equalto', 'Inspect billet service drop-ins before the upgrade transaction') | first }}"
+        billet_service_dropin_guard: "{{ billet_host_account_tasks | selectattr('name', 'equalto', 'Refuse service drop-ins the transaction cannot replace or recover') | first }}"
+        billet_candidate_dropin_probe: "{{ billet_upgrade_task.block | selectattr('name', 'equalto', 'Inspect candidate service drop-ins before readiness probes') | first }}"
+        billet_candidate_dropin_guard: "{{ billet_upgrade_task.block | selectattr('name', 'equalto', 'Refuse candidate service drop-ins before readiness probes') | first }}"
+        billet_service_link_guard: "{{ billet_host_service_tasks | selectattr('name', 'equalto', 'Refuse service link states rollback cannot reproduce exactly') | first }}"
+        billet_legacy_transient_guard: "{{ billet_host_recovery_dispatch_tasks | selectattr('name', 'equalto', 'Refuse rollback of a legacy transient service definition') | first }}"
+
+    - name: Render legacy-compatible and transactional units
+      ansible.builtin.set_fact:
+        billet_legacy_server_unit: "{{ lookup('ansible.builtin.template', playbook_dir + '/../roles/host/templates/billet-server.service.j2') }}"
+        billet_legacy_node_unit: "{{ lookup('ansible.builtin.template', playbook_dir + '/../roles/host/templates/billet-node.service.j2') }}"
+        billet_transaction_server_unit: "{{ lookup('ansible.builtin.template', playbook_dir + '/../roles/host/templates/billet-server.service.j2', template_vars={'billet_systemd_notify_ready': true, 'billet_systemd_upgrade_probe': true}) }}"
+        billet_transaction_node_unit: "{{ lookup('ansible.builtin.template', playbook_dir + '/../roles/host/templates/billet-node.service.j2', template_vars={'billet_systemd_notify_ready': true, 'billet_systemd_upgrade_probe': true}) }}"
+        billet_unsafe_override_dropin: |
+          [Service]
+          Type=exec
+          ExecStart=
+          ExecStart=/usr/bin/billet node --config /etc/billet/billet.yaml
+        billet_stale_manager_identity:
+          user: billet
+          group: billet
+        billet_reloaded_disk_identity:
+          user: unapproved
+          group: unapproved
+        billet_changed_identity_unit: |
+          [Service]
+          User=unapproved
+          Group=unapproved
+      vars:
+        billet_service_user: billet
+        billet_service_group: billet
+        billet_config: {}
+        # The role default (defaults/main.yml) does not apply to a bare template
+        # lookup, and the template deliberately has no fallback: a provider-aware
+        # unit rendered without knowing the provider would be a guess.
+        billet_firecracker_enabled: true
+        # The server's state directory is RESOLVED ONCE by the role, in
+        # upgrade-inspect.yml, from `identity_dir` when the config names its
+        # ledger backend and from `state_dir` otherwise — and the template reads
+        # that fact rather than re-deriving, so a PostgreSQL deployment does not
+        # get the default sandboxed and mounted underneath it. Stated here for
+        # the same reason billet_firecracker_enabled is: no fallback, so a
+        # missing value fails the render rather than emitting a guess.
+        billet_candidate_server_state_dir: /var/lib/billet/server
+
+    - name: Exercise an effective ExecStart and Type drop-in override
+      block:
+        - name: Apply the transaction's drop-in acceptance condition
+          ansible.builtin.assert:
+            that:
+              - billet_unsafe_override_dropin | trim | length == 0
+
+        - name: Record an unsafe acceptance
+          ansible.builtin.set_fact:
+            billet_unsafe_override_accepted: true
+      rescue:
+        - name: Record the expected refusal
+          ansible.builtin.set_fact:
+            billet_unsafe_override_refused: true
+
+    - name: Prove the effective override was refused
+      ansible.builtin.assert:
+        that:
+          - billet_unsafe_override_refused | default(false) | bool
+          - not billet_unsafe_override_accepted | default(false) | bool
+
+    - name: Exercise a changed main-unit identity hidden by stale manager state
+      block:
+        - name: Apply the installed identity acceptance condition after reload
+          ansible.builtin.assert:
+            that:
+              - billet_reloaded_disk_identity.user == billet_stale_manager_identity.user
+              - billet_reloaded_disk_identity.group == billet_stale_manager_identity.group
+
+        - name: Record an unsafe stale-identity acceptance
+          ansible.builtin.set_fact:
+            billet_stale_identity_accepted: true
+      rescue:
+        - name: Record the expected fresh-identity refusal
+          ansible.builtin.set_fact:
+            billet_stale_identity_refused: true
+
+    - name: Prove the reloaded on-disk identity was refused
+      ansible.builtin.assert:
+        that:
+          - billet_stale_identity_refused | default(false) | bool
+          - not billet_stale_identity_accepted | default(false) | bool
+          - "'User=unapproved' in billet_changed_identity_unit"
+          - "'Group=unapproved' in billet_changed_identity_unit"
+
+    - name: Require durable recovery before any live host mutation
+      ansible.builtin.assert:
+        that:
+          - "'Refuse unsafe billet state directories' in billet_inspection_names"
+          - "'Refuse billet state paths with symlinked or noncanonical ancestors' in billet_inspection_names"
+          - "'Refuse billet state paths that are symlinks or non-directories' in billet_inspection_names"
+          - billet_account_names.index('Reload systemd before inspecting installed service policy') < billet_account_names.index('Inspect the installed billet server unit before account mutation')
+          - billet_account_names.index('Reload systemd before inspecting installed service policy') < billet_account_names.index('Inspect the installed billet server identity before account mutation')
+          - billet_account_names.index('Inspect the installed billet server identity before account mutation') < billet_account_names.index('Refuse an implicit installed service identity migration')
+          - billet_service_policy_reload['ansible.builtin.systemd_service'].daemon_reload | bool
+          - billet_service_policy_reload.changed_when == false
+          - "'not ansible_check_mode' in (billet_service_policy_reload.when | string)"
+          - "'--property=NeedDaemonReload' in billet_service_policy_pending_probe['ansible.builtin.command'].argv"
+          - billet_service_policy_pending_probe.changed_when == false
+          - billet_service_policy_pending_probe.check_mode == false
+          - "'ansible_check_mode' in (billet_service_policy_pending_probe.when | string)"
+          - "\"item.stdout | trim == 'no'\" in billet_service_policy_pending_guard['ansible.builtin.assert'].that"
+          - "'ansible_check_mode' in (billet_service_policy_pending_guard.when | string)"
+          - billet_account_names.index('Refuse an implicit installed service identity migration') < billet_account_names.index('Create the billet service group')
+          - billet_account_names.index('Refuse an implicit installed service identity migration') < billet_account_names.index('Create billet directories')
+          - billet_account_names.index('Refuse to move installed billet state implicitly') < billet_account_names.index('Render billet configuration')
+          - billet_account_names.index('Create the upgrade recovery directory') < billet_account_names.index('Stage the immutable candidate binary inside its recovery journal')
+          - billet_account_names.index('Stage the immutable candidate binary inside its recovery journal') < billet_account_names.index('Bind the host transaction to the inspected candidate digest')
+          - billet_account_names.index('Refuse redirected or non-file upgrade inputs') < billet_account_names.index('Preserve configuration and units before replacing them')
+          - billet_account_names.index('Preserve configuration and units before replacing them') < billet_account_names.index('Stage candidate systemd units for the upgrade transaction')
+          - "'Preserve the previous billet binary before live mutation' in billet_account_names"
+          - "'billet_upgrade_recovery_dir' in billet_candidate_stage['ansible.builtin.copy'].dest"
+          - billet_main_names.index('Inspect a durable host-upgrade journal before normal convergence') < billet_main_names.index('Recover an interrupted billet upgrade before converging anything else')
+          - billet_main_names.index('Recover an interrupted billet upgrade before converging anything else') < billet_main_names.index('Configure billet account and files')
+          - billet_main_names.index('Configure billet account and files') < billet_main_names.index('Configure billet services')
+          - billet_account_names.index('Decide whether the billet binary needs a transactional upgrade') < billet_account_names.index('Reload systemd before inspecting host-upgrade service overlays')
+          - billet_account_names.index('Reload systemd before inspecting host-upgrade service overlays') < billet_account_names.index('Inspect billet service drop-ins before the upgrade transaction')
+          - billet_account_names.index('Inspect billet service drop-ins before the upgrade transaction') < billet_account_names.index('Refuse service drop-ins the transaction cannot replace or recover')
+          - billet_account_names.index('Refuse service drop-ins the transaction cannot replace or recover') < billet_account_names.index('Allocate a unique recovery directory before replacing upgrade inputs')
+          - billet_top_level_names.index('Persist the host-upgrade recovery manifest before live mutation') < billet_top_level_names.index("Stage this transaction's atomic host-upgrade claim")
+          - billet_top_level_names.index('Durably commit host-upgrade recovery inputs before publishing the pointer') < billet_top_level_names.index("Stage this transaction's atomic host-upgrade claim")
+          - billet_top_level_names.index("Stage this transaction's atomic host-upgrade claim") < billet_top_level_names.index('Durably stage the atomic host-upgrade claim')
+          - billet_top_level_names.index('Durably stage the atomic host-upgrade claim') < billet_top_level_names.index('Claim the host upgrade without replacing another transaction')
+          - billet_top_level_names.index('Claim the host upgrade without replacing another transaction') < billet_top_level_names.index('Durably publish the active host-upgrade pointer before live mutation')
+          - billet_top_level_names.index('Durably publish the active host-upgrade pointer before live mutation') < billet_top_level_names.index('Upgrade billet as one recoverable host transaction')
+          - billet_top_level_names.index('Prove this transaction owns the host before live mutation') < billet_top_level_names.index('Upgrade billet as one recoverable host transaction')
+          - billet_top_level_names.index('Prove every configured guest image is compatible with the candidate binary') < billet_top_level_names.index('Upgrade billet as one recoverable host transaction')
+          - billet_service_dropin_reload['ansible.builtin.systemd_service'].daemon_reload | bool
+          - "'--property=DropInPaths' in billet_service_dropin_probe['ansible.builtin.command'].argv"
+          - "'item.stdout | trim | length == 0' in billet_service_dropin_guard['ansible.builtin.assert'].that"
+          - "'--property=DropInPaths' in billet_candidate_dropin_probe['ansible.builtin.command'].argv"
+          - "'item.stdout | trim | length == 0' in billet_candidate_dropin_guard['ansible.builtin.assert'].that"
+          - "'Type=exec' in billet_unsafe_override_dropin"
+          - "'ExecStart=/usr/bin/billet node --config /etc/billet/billet.yaml' in billet_unsafe_override_dropin"
+          - billet_unsafe_override_dropin | trim | length > 0
+          - "'BILLET_MAINTENANCE' not in billet_server_unit"
+          - "'BILLET_MAINTENANCE' not in billet_node_unit"
+          - "'--upgrade-probe' in billet_server_unit"
+          - "'--upgrade-probe' in billet_node_unit"
+          - "'billet_systemd_notify_ready' in billet_server_unit"
+          - "'billet_systemd_notify_ready' in billet_node_unit"
+          - "\"'notify' if billet_notify_ready else 'exec'\" in billet_server_unit"
+          - "\"'notify' if billet_notify_ready else 'exec'\" in billet_node_unit"
+          - "'NotifyAccess=main' in billet_server_unit"
+          - "'NotifyAccess=main' in billet_node_unit"
+          - "'Type=exec' in billet_legacy_server_unit"
+          - "'Type=exec' in billet_legacy_node_unit"
+          - "'ExecStart=/usr/bin/billet server --config /etc/billet/billet.yaml\nTimeoutStartSec=120' in billet_legacy_server_unit"
+          - "'ExecStart=/usr/bin/billet node --config /etc/billet/billet.yaml\nTimeoutStartSec=120' in billet_legacy_node_unit"
+          - "'NotifyAccess=main' not in billet_legacy_server_unit"
+          - "'NotifyAccess=main' not in billet_legacy_node_unit"
+          - "'Type=notify' in billet_transaction_server_unit"
+          - "'Type=notify' in billet_transaction_node_unit"
+          - "'ExecStart=/usr/bin/billet server --config /etc/billet/billet.yaml --upgrade-probe\nTimeoutStartSec=120' in billet_transaction_server_unit"
+          - "'ExecStart=/usr/bin/billet node --config /etc/billet/billet.yaml --upgrade-probe\nTimeoutStartSec=120' in billet_transaction_node_unit"
+          - "'NotifyAccess=main' in billet_transaction_server_unit"
+          - "'NotifyAccess=main' in billet_transaction_node_unit"
+          - billet_candidate_unit_stage.vars.billet_systemd_notify_ready | bool
+          - billet_steady_unit_install.vars.billet_systemd_notify_ready | bool
+          - "'billet_installed_service_types' in (billet_ordinary_unit_install.vars.billet_systemd_notify_ready | string)"
+          - billet_main_names.index('Recover an interrupted billet upgrade before converging anything else') < billet_main_names.index('Configure Firecracker')
+          - billet_main_names.index('Configure billet account and files') < billet_main_names.index('Configure Firecracker')
+          - billet_main_names.index('Recover an interrupted billet upgrade before converging anything else') < billet_main_names.index('Configure guest networking')
+          - billet_main_names.index('Recover an interrupted billet upgrade before converging anything else') < billet_main_names.index('Configure Ceph')
+
+    - name: Require drain, fencing, snapshot, migration, and commit ordering
+      ansible.builtin.assert:
+        that:
+          - billet_upgrade_names.index('Gracefully stop the billet node before changing its guest contract') < billet_upgrade_names.index('Pull, boot-verify, and promote every compatible guest needed')
+          - billet_top_level_names.index('Refuse service link states rollback cannot reproduce exactly') < billet_top_level_names.index('Prove every configured guest image is compatible with the candidate binary')
+          - "'transient' not in (billet_service_link_guard['ansible.builtin.assert'].that | join(' '))"
+          - billet_upgrade_names.index('Pull, boot-verify, and promote every compatible guest needed') < billet_upgrade_names.index('Gracefully stop the billet server after compute has drained')
+          - billet_upgrade_names.index('Gracefully stop the billet server after compute has drained') < billet_upgrade_names.index('Hide the old executable before establishing the maintenance fence')
+          - billet_upgrade_names.index('Hide the old executable before establishing the maintenance fence') < billet_upgrade_names.index('Fence the ledger against operator commands during migration and rollback')
+          - billet_upgrade_names.index('Fence the ledger against operator commands during migration and rollback') < billet_upgrade_names.index('Durably fence every ledger mount before exposing the candidate')
+          - billet_upgrade_names.index('Durably fence every ledger mount before exposing the candidate') < billet_upgrade_names.index('Wait for operator commands started before the fence to finish')
+          - billet_upgrade_names.index('Wait for operator commands started before the fence to finish') < billet_upgrade_names.index('Preserve the stopped control-plane ledger')
+          - billet_upgrade_names.index('Preserve the stopped control-plane ledger') < billet_upgrade_names.index('Durably flush the stopped ledger snapshot before marking it complete')
+          - billet_upgrade_names.index('Durably flush the stopped ledger snapshot before marking it complete') < billet_upgrade_names.index('Commit the durable ledger snapshot before exposing the candidate')
+          - billet_upgrade_names.index('Commit the durable ledger snapshot before exposing the candidate') < billet_upgrade_names.index('Durably publish ledger snapshot completion before exposing the candidate')
+          - billet_upgrade_names.index('Durably publish ledger snapshot completion before exposing the candidate') < billet_upgrade_names.index('Install the candidate billet binary after fencing and ledger preservation')
+          - billet_upgrade_names.index('Install candidate configuration after preserving the stopped ledger') < billet_upgrade_names.index('Validate and migrate with the new billet binary as the only ledger writer')
+          - billet_upgrade_names.index('Load candidate systemd units before starting either upgraded service') < billet_upgrade_names.index('Inspect candidate service drop-ins before readiness probes')
+          - billet_upgrade_names.index('Inspect candidate service drop-ins before readiness probes') < billet_upgrade_names.index('Refuse candidate service drop-ins before readiness probes')
+          - billet_upgrade_names.index('Refuse candidate service drop-ins before readiness probes') < billet_upgrade_names.index('Validate and migrate with the new billet binary as the only ledger writer')
+          - billet_upgrade_names.index('Validate and migrate with the new billet binary as the only ledger writer') < billet_upgrade_names.index('Start the quiescent upgraded server readiness probe')
+          - billet_upgrade_names.index('Start the quiescent upgraded node readiness probe') < billet_upgrade_names.index('Inspect upgraded readiness-probe stability baseline')
+          - billet_upgrade_names.index('Inspect upgraded readiness-probe stability baseline') < billet_upgrade_names.index('Observe upgraded readiness probes across the restart interval')
+          - billet_upgrade_names.index('Observe upgraded readiness probes across the restart interval') < billet_upgrade_names.index('Inspect upgraded readiness-probe stability before committing the transaction')
+          - billet_upgrade_names.index('Prove upgraded readiness probes are stably active before commit') < billet_upgrade_names.index('Install steady-state units without the quiescent probe')
+          - billet_upgrade_names.index('Persist desired billet service enablement while the ledger remains fenced') < billet_upgrade_names.index('Durably flush every mutated host filesystem before commit')
+          - billet_upgrade_names.index('Durably flush every mutated host filesystem before commit') < billet_upgrade_names.index('Record the durable host-upgrade commit before opening administration')
+          - billet_upgrade_names.index('Record the durable host-upgrade commit before opening administration') < billet_upgrade_names.index('Durably publish the host-upgrade commit before opening administration')
+          - billet_upgrade_names.index('Durably publish the host-upgrade commit before opening administration') < billet_upgrade_names.index('Finalize the committed host transaction')
+          - billet_finalization_names.index('Open the committed ledger to operator commands') < billet_finalization_names.index('Durably open the committed ledger to operator commands')
+          - billet_finalization_names.index('Durably open the committed ledger to operator commands') < billet_finalization_names.index('Start the committed billet server before admitting compute')
+          - billet_finalization_names.index('Start the committed billet server before admitting compute') < billet_finalization_names.index('Start the committed billet node after the control plane')
+          - billet_finalization_names.index('Start the committed billet node after the control plane') < billet_finalization_names.index('Inspect committed service stability baseline')
+          - billet_finalization_names.index('Inspect committed service stability baseline') < billet_finalization_names.index('Observe committed services across the restart interval')
+          - billet_finalization_names.index('Observe committed services across the restart interval') < billet_finalization_names.index('Inspect committed service stability after the restart interval')
+          - billet_finalization_names.index('Prove committed services are stably active') < billet_finalization_names.index('Close the durable host-upgrade transaction after stable service startup')
+          - billet_finalization_names.index('Close the durable host-upgrade transaction after stable service startup') < billet_finalization_names.index('Durably close the host-upgrade transaction')
+
+    - name: Require recovery to exclude processes before restoring state
+      ansible.builtin.assert:
+        that:
+          - billet_recovery_names.index('Stop compute before recovering the authoritative ledger') < billet_recovery_names.index('Hide the installed executable while recovery owns the ledger')
+          - billet_recovery_names.index('Stop the control plane before recovering its authoritative ledger') < billet_recovery_names.index('Hide the installed executable while recovery owns the ledger')
+          - billet_recovery_names.index('Hide the installed executable while recovery owns the ledger') < billet_recovery_names.index('Wait for every billet process started before executable removal to finish')
+          - billet_recovery_names.index('Wait for every billet process started before executable removal to finish') < billet_recovery_names.index('Refuse recovery without conclusive process and cgroup evidence')
+          - billet_recovery_names.index('Refuse recovery without conclusive process and cgroup evidence') < billet_recovery_names.index('Remove current ledger entries before restoring a completed snapshot')
+          # The snapshot copy must be unfenced BEFORE the previous binary
+          # validates it: a fenced copy would need a fence bypass, and the
+          # previous binary's vintage — and therefore its bypass semantics —
+          # is unknown to this role.
+          - billet_recovery_names.index('Unfence the isolated ledger snapshot for validation') < billet_recovery_names.index('Prove the durable ledger snapshot is valid before replacing current state')
+          - billet_recovery_names.index('Prove the durable ledger snapshot is valid before replacing current state') < billet_recovery_names.index('Remove current ledger entries before restoring a completed snapshot')
+          - billet_recovery_names.index('Restore the previous control-plane ledger') < billet_recovery_names.index('Durably flush every restored host filesystem before rollback commit')
+          - billet_recovery_names.index('Restore configuration and units that existed before the upgrade') < billet_recovery_names.index('Durably flush every restored host filesystem before rollback commit')
+          - billet_recovery_names.index('Disable candidate services before restoring previous units') < billet_recovery_names.index('Restore configuration and units that existed before the upgrade')
+          - billet_recovery_names.index('Remove candidate persistent and runtime enablement links') < billet_recovery_names.index('Restore configuration and units that existed before the upgrade')
+          - billet_recovery_names.index('Remove candidate persistent and runtime enablement links') < billet_recovery_names.index('Restore runtime-only service enablement')
+          - billet_recovery_candidate_links.loop | length == 4
+          - "'/etc/systemd/system/multi-user.target.wants/billet-server.service' in billet_recovery_candidate_links.loop"
+          - "'/etc/systemd/system/multi-user.target.wants/billet-node.service' in billet_recovery_candidate_links.loop"
+          - "'/run/systemd/system/multi-user.target.wants/billet-server.service' in billet_recovery_candidate_links.loop"
+          - "'/run/systemd/system/multi-user.target.wants/billet-node.service' in billet_recovery_candidate_links.loop"
+          - billet_recovery_names.index('Prove prior service enablement was restored exactly') < billet_recovery_names.index('Durably flush every restored host filesystem before rollback commit')
+          - billet_recovery_names.index('Durably flush every restored host filesystem before rollback commit') < billet_recovery_names.index('Record the durable rollback commit before opening administration')
+          - billet_recovery_names.index('Record the durable rollback commit before opening administration') < billet_recovery_names.index('Durably publish the rollback commit before opening administration')
+          - billet_recovery_names.index('Durably publish the rollback commit before opening administration') < billet_recovery_names.index('Finalize the committed host rollback')
+          - billet_recovery_dispatch_names.index('Inspect whether the durable host transaction already committed') < billet_recovery_dispatch_names.index('Finish a committed host transaction without rolling it back')
+          - billet_recovery_dispatch_names.index('Finish a committed host transaction without rolling it back') < billet_recovery_dispatch_names.index('Roll back an uncommitted host transaction')
+          - billet_recovery_dispatch_names.index('Finish a committed host transaction without rolling it back') < billet_recovery_dispatch_names.index('Refuse rollback of a legacy transient service definition')
+          - billet_recovery_dispatch_names.index('Refuse rollback of a legacy transient service definition') < billet_recovery_dispatch_names.index('Roll back an uncommitted host transaction')
+          - "'not billet_upgrade_commit_state.stat.exists' in (billet_legacy_transient_guard.when | string)"
+          - "'transient' in (billet_legacy_transient_guard['ansible.builtin.assert'].that | join(' '))"
+          - "'item.1.rc == 0' in (billet_recovery_stop_proof['ansible.builtin.assert'].that | join(' '))"
+          - "'item.1.rc == 1' in (billet_recovery_stop_proof['ansible.builtin.assert'].that | join(' '))"
+          - "'not found.' in (billet_recovery_stop_proof['ansible.builtin.assert'].that | join(' '))"
+          - "'not in [0, 1]' in (billet_recovery_cgroup_probe.failed_when | string)"
+          - "'billet_upgrade_manifest.inputs' in billet_recovery_restore_inputs.loop"
+
+    - name: Require the transaction to stop installed services and snapshot the configured ledger
+      ansible.builtin.assert:
+        that:
+          - "'billet_service_state_before_upgrade.results[1].rc != 4' in (billet_upgrade_stop_node.when | string)"
+          - "'billet_service_state_before_upgrade.results[0].rc != 4' in (billet_upgrade_stop_server.when | string)"
+          - "'billet_ledger_before_upgrade.stat.exists' in (billet_upgrade_backup_ledger.when | string)"
+          - "'billet_candidate_server_state_dir' in billet_upgrade_backup_ledger['ansible.builtin.command'].argv[2]"
+          - billet_rollback_names == ['Restore the durable pre-upgrade host state', 'Report the failed upgrade and its recovery copy']
+
+    # THE PREPARE-ONLY HOLD'S WIRING, WHICH NO OTHER TEST CAN SEE. The render
+    # test proves the units carry the assertion; it would pass unchanged if every
+    # predicate substitution in services.yml were reverted, because rendering a
+    # template says nothing about which tasks start a service.
+    #
+    # THE NODE MATTERS AS MUCH AS THE SERVER, and that is the whole reason this
+    # exists. On a host running both roles the NODE mints the deployment identity
+    # when the server has not: `billet node` claims the deployment before it
+    # reaches --upgrade-probe, and nodeDeploymentID falls through to
+    # state.DeploymentID(server.state_dir) — whose comment says "whichever role
+    # runs first mints the identity". A first version of this change held only the
+    # server, and the invariant was broken by the other unit on the same machine.
+    #
+    # Stated as a TEXT invariant on purpose: billet_enable_node must not appear in
+    # services.yml at all, because every consumer became billet_node_should_run.
+    # Reverting any one of them reintroduces the string, which is exactly the
+    # regression to catch. The counts alone are only a floor -- the per-task
+    # assertions below are what establish the wiring.
+    - name: Record how services.yml gates the two services
+      ansible.builtin.set_fact:
+        billet_services_text: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/services.yml') }}"
+        billet_manifest_task: "{{ billet_upgrade_task.block | selectattr('name', 'search', 'manifest') | list }}"
+
+    - name: Every start of either service is gated on its should_run predicate
+      ansible.builtin.assert:
+        that:
+          # NOT ONE occurrence. Every consumer became billet_node_should_run, so
+          # any revert puts this string back.
+          - billet_services_text | regex_findall('billet_enable_node') | length == 0
+          # The server keeps the bare flag ONLY where it means "this host owns the
+          # control-plane role" rather than "start it": the three state-file
+          # ownership tasks, which a prepared host still needs applied.
+          - billet_services_text | regex_findall('billet_enable_server') | length == 3
+          # THE COUNTS ARE A FLOOR, NOT THE WIRING. There are nine sites; a
+          # `>= 8` assertion let one guard be deleted -- removing it from the
+          # node's steady-state start leaves eight, introduces no
+          # billet_enable_node, and passed. The per-task assertions below are
+          # what actually establish the wiring; these two only catch a wholesale
+          # deletion of the predicates.
+          - billet_services_text | regex_findall('billet_server_should_run') | length >= 8
+          - billet_services_text | regex_findall('billet_node_should_run') | length >= 8
+          # THE MANIFEST IS WHAT BOTH FINALIZERS RESOLVE FROM, so a held host that
+          # crashed mid-transaction must not be started by its own recovery.
+          # THE BRACES ARE WRITTEN \{\{ ON PURPOSE. Ansible templates this string
+          # before Jinja evaluates it, so a literal {{ here would be INTERPOLATED
+          # and the assertion would compare against the variable's value rather
+          # than against the text of the file. Escaped, the two braces are not
+          # adjacent, the templater leaves them alone, and the regex reads them as
+          # literal braces.
+          - billet_services_text | regex_findall('candidate_server_active:\s*"\{\{\s*billet_server_should_run') | length == 1
+          - billet_services_text | regex_findall('candidate_node_active:\s*"\{\{\s*billet_node_should_run') | length == 1
+          # ...while server_was_active must keep meaning the ACTUAL pre-transaction
+          # state, or an uncommitted rollback restores something that never ran.
+          - billet_services_text | regex_findall('server_was_active:\s*"\{\{\s*billet_service_state_before_upgrade') | length == 1
+        fail_msg: >-
+          services.yml must gate every start, restart, durable enablement and
+          manifest target of BOTH billet-server and billet-node on the
+          should_run predicates. Holding only the server is not a hold: on a
+          two-role host a CERTLESS node mints the deployment identity when the
+          server has not.
+
+    # NAMED TASK BY NAMED TASK, because a count is not a wiring. Deleting the
+    # guard from ONE start left the occurrence count at eight, introduced no
+    # billet_enable_node, satisfied both manifest regexes, and passed -- while
+    # the role would try to start a held node and fail the converge.
+    - name: Record every task that starts or enables a billet service
+      ansible.builtin.set_fact:
+        billet_gated: >-
+          {{
+            (billet_host_service_tasks | selectattr('name', 'defined') | list)
+            + (billet_upgrade_task.block | selectattr('name', 'defined') | list)
+          }}
+        # ONE LIST, used by both assertions below, so a task can never be present
+        # in the existence check and absent from the guard check.
+        billet_gated_expectations:
+          - { task: "Start the quiescent upgraded server readiness probe", guard: "billet_server_should_run" }
+          - { task: "Start the quiescent upgraded node readiness probe", guard: "billet_node_should_run" }
+          - { task: "Restart the billet server after non-binary inputs change", guard: "billet_server_should_run" }
+          - { task: "Restart the billet node after non-binary inputs change", guard: "billet_node_should_run" }
+          - { task: "Enable and start the billet server", guard: "billet_server_should_run" }
+          - { task: "Enable and start the billet node", guard: "billet_node_should_run" }
+          - { task: "Stop and disable the billet server unless it may run here", guard: "not billet_server_should_run" }
+          - { task: "Stop and disable the billet node unless it may run here", guard: "not billet_node_should_run" }
+
+    # THE TASK MUST STILL EXIST, asserted separately. A rename already fails this
+    # -- `first` over an empty list errors, so it cannot silently go unasserted --
+    # but it fails talking about `first`, which reads as a broken test rather than
+    # a missing guard. This says which task went away.
+    - name: Every gated task is still present under the name this test knows
+      ansible.builtin.assert:
+        that:
+          - billet_gated | selectattr('name', 'equalto', item.task) | list | length == 1
+        fail_msg: >-
+          services.yml has no task named "{{ item.task }}". If it was renamed,
+          rename it here too; if it was deleted, the service it started is no
+          longer gated by anything and a prepare-only host would start it.
+      loop: "{{ billet_gated_expectations }}"
+      loop_control:
+        label: "{{ item.task }}"
+
+    # POLARITY, NOT SUBSTRING. `is search('billet_server_should_run')` also matches
+    # `not billet_server_should_run`, so inverting a guard -- starting the service
+    # exactly when it must not -- passed every assertion, left the counts
+    # unchanged and introduced no billet_enable_server. A positive expectation must
+    # therefore ALSO assert the negated form is absent.
+    - name: Each start, restart and stop names its own should_run predicate
+      ansible.builtin.assert:
+        that:
+          - >-
+            (billet_gated | selectattr('name', 'equalto', item.task) | first).when | string
+            is search(item.guard)
+          - >-
+            item.guard.startswith('not ') or
+            not ((billet_gated | selectattr('name', 'equalto', item.task) | first).when | string
+                 is search('not ' ~ item.guard))
+        fail_msg: >-
+          services.yml task "{{ item.task }}" must be gated on {{ item.guard }}.
+          A count of predicate occurrences cannot establish that: deleting one
+          guard leaves the others in place and the count barely moves.
+      loop: "{{ billet_gated_expectations }}"
+      loop_control:
+        label: "{{ item.task }}"

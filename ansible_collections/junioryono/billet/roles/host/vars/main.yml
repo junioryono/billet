@@ -1,0 +1,63 @@
+---
+# ROLE VARS RATHER THAN DEFAULTS, because this is not an operator's to choose:
+# the unit template names this path and the task below writes it, and a playbook
+# that moved one without the other would leave a control plane reading a file
+# nothing writes.
+
+# The control plane's EnvironmentFile. Written only when
+# billet_server_environment has something in it, and named by the server unit
+# only then — see defaults/main.yml for what it is for.
+billet_server_environment_path: /etc/billet/server.env
+
+# And the marker recording that the role wrote it, so the removal that follows an
+# emptied billet_server_environment can never take a file an operator wrote
+# themselves. The msmtprc sidecar's shape, for the msmtprc sidecar's reason.
+billet_server_environment_marker_path: /etc/billet/server.env-managed
+
+# Where billet_state_ca_bundle_src lands. It matches state-rds-postgres's
+# `ssl_root_cert_path` default, which is what the DSN that module emits names as
+# `sslrootcert` — one path, written down in the two places that have to agree.
+billet_state_ca_bundle_path: /etc/billet/rds-ca-bundle.pem
+
+# billet_configured_server_state_dir is the directory THIS RUN'S billet_config
+# points the control plane's identity at.
+#
+# TWO SPELLINGS OF ONE DIRECTORY, AND A POSTGRESQL DEPLOYMENT HAS ONLY THE
+# SECOND. `state_dir` is the shorthand — the ledger and the identity in one place
+# — while `identity_dir` is what a config naming its ledger backend writes
+# instead, because only the LEDGER moves into the database: the deployment
+# identity, the node-wire CA and its rotation state, the process lock and the
+# maintenance fence are still files. The two are mutually exclusive at load, and
+# upgrade-inspect.yml refuses a config carrying both before it acts on either.
+#
+# READING `state_dir` ALONE ANSWERED THE DEFAULT FOR EVERY POSTGRESQL
+# DEPLOYMENT, whatever it actually named — after which the role fences, chowns,
+# sandboxes and mounts a directory the control plane does not use, and billet
+# finds its own identity directory outside ReadWritePaths under
+# ProtectSystem=strict.
+#
+# HERE RATHER THAN INLINE so there is ONE definition: upgrade-inspect.yml sets
+# the candidate fact from it and the server unit template reads that fact, and a
+# test can exercise this expression against a config directly. account.yml has a
+# near-twin that reads the INSTALLED file rather than this run's request; the two
+# cannot share, and both must read both spellings.
+billet_configured_server_state_dir: >-
+  {{
+    billet_config.get('server', {}).get('identity_dir')
+    or billet_config.get('server', {}).get('state_dir')
+    or '/var/lib/billet/server'
+  }}
+
+# billet_configured_state_backend is where THIS RUN'S config keeps the ledger.
+#
+# `sqlite` FOR EVERY CONFIG THAT SAYS NOTHING, which is the same answer the
+# config layer fills in — a `state_dir` shorthand IS `backend: sqlite`, and a
+# node-only host has no server section and no ledger to have an opinion about.
+# Naming the default rather than leaving it empty matters because the refusals
+# that read this are written as "not sqlite": an empty answer would refuse every
+# ordinary host.
+billet_configured_state_backend: >-
+  {{
+    billet_config.get('server', {}).get('state', {}).get('backend')
+    or 'sqlite'
+  }}

@@ -1,0 +1,92 @@
+---
+# WITH A LEDGER VOLUME CONFIGURED, RECOVERY MUST NOT TOUCH AN UNMOUNTED (or
+# wrong-device) STATE DIRECTORY: both finalize and rollback restore or replace
+# ledger content, and doing that against the root disk — or a bind mount, or an
+# unrelated volume — is the fork the mount exists to prevent. At the head of
+# THIS file so every caller is covered: the main.yml interrupted-upgrade path
+# AND the in-run transaction rescue in services.yml.
+- name: Resolve the ledger volume's stable device path for recovery
+  ansible.builtin.set_fact:
+    billet_ledger_recovery_device: >-
+      {{
+        billet_ledger_device
+        if billet_ledger_device | length > 0
+        else '/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_'
+          ~ (billet_ledger_volume_id | replace('-', ''))
+      }}
+  when: billet_ledger_volume_id | length > 0
+
+- name: Inspect what serves the state directory before recovery
+  ansible.builtin.command:
+    argv: [findmnt, -no, SOURCE, --mountpoint, "{{ billet_candidate_server_state_dir }}"]
+  register: billet_ledger_recovery_mount
+  failed_when: billet_ledger_recovery_mount.rc not in [0, 1]
+  changed_when: false
+  check_mode: false
+  become: true
+  when: billet_ledger_volume_id | length > 0
+
+- name: Resolve the recovery mount and expected device real paths
+  ansible.builtin.command:
+    argv: [readlink, -f, "{{ item }}"]
+  register: billet_ledger_recovery_real
+  changed_when: false
+  check_mode: false
+  become: true
+  loop:
+    - "{{ billet_ledger_recovery_mount.stdout | trim }}"
+    - "{{ billet_ledger_recovery_device }}"
+  when:
+    - billet_ledger_volume_id | length > 0
+    - billet_ledger_recovery_mount.rc == 0
+
+- name: Refuse recovery while the ledger volume is not serving the state directory
+  ansible.builtin.assert:
+    that:
+      - billet_ledger_recovery_mount.rc == 0
+      - billet_ledger_recovery_real.results[0].stdout | trim == billet_ledger_recovery_real.results[1].stdout | trim
+    fail_msg: >-
+      Recovery would touch {{ billet_candidate_server_state_dir }}, but it is
+      {{ 'not a mountpoint' if billet_ledger_recovery_mount.rc != 0
+         else 'served by ' ~ (billet_ledger_recovery_mount.stdout | trim) }} —
+      not the configured ledger volume {{ billet_ledger_volume_id }}. Restoring
+      the ledger there would fork it off the volume. Mount the volume
+      (systemctl start {{ billet_ledger_mount_unit_name }}) and re-run.
+  when: billet_ledger_volume_id | length > 0
+
+- name: Inspect whether the durable host transaction already committed
+  ansible.builtin.stat:
+    path: "{{ billet_upgrade_recovery_dir }}/commit.complete"
+    follow: false
+  register: billet_upgrade_commit_state
+  become: true
+
+- name: Refuse a redirected or non-file upgrade commit record
+  ansible.builtin.assert:
+    that:
+      - billet_upgrade_commit_state.stat.isreg
+      - not billet_upgrade_commit_state.stat.islnk | default(false)
+    fail_msg: >-
+      The active billet transaction has a redirected or malformed commit
+      record. Leave its fence and pointer intact for manual inspection.
+  when: billet_upgrade_commit_state.stat.exists
+
+- name: Finish a committed host transaction without rolling it back
+  ansible.builtin.include_tasks: upgrade-finalize.yml
+  when: billet_upgrade_commit_state.stat.exists
+
+- name: Refuse rollback of a legacy transient service definition
+  ansible.builtin.assert:
+    that:
+      - billet_upgrade_manifest.server_enablement != 'transient'
+      - billet_upgrade_manifest.node_enablement != 'transient'
+    fail_msg: >-
+      This uncommitted legacy journal records a transient service whose
+      in-memory unit definition cannot be reconstructed. Leave its fence and
+      pointer intact for manual recovery. Committed journals can still finish
+      because finalization does not restore the previous unit definition.
+  when: not billet_upgrade_commit_state.stat.exists
+
+- name: Roll back an uncommitted host transaction
+  ansible.builtin.include_tasks: upgrade-rollback.yml
+  when: not billet_upgrade_commit_state.stat.exists

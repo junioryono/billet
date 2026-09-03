@@ -1,0 +1,57 @@
+{
+  "_comment": [
+    "Package names GitHub's declaration uses that Ubuntu 24.04 cannot install by that name.",
+    "",
+    "BILLET'S OWN FILE, NOT VENDORED. toolset-2404.json is upstream's and is pinned by",
+    "digest so it cannot be edited; this is the narrow, reviewed mapping that makes a name",
+    "in it installable here. Keeping them apart is the point: the declaration stays exactly",
+    "what GitHub published, and every deviation is one line in a file whose whole purpose is",
+    "to list deviations.",
+    "",
+    "AN ENTRY IS A LAST RESORT AND NEEDS EVIDENCE. The first question is always whether the",
+    "name resolves once the right apt component is enabled -- p7zip-rar needed multiverse,",
+    "not an alias. Only a name that cannot be installed at all belongs here, and 'why' must",
+    "record what was checked rather than what was assumed.",
+    "",
+    "A VIRTUAL PACKAGE FAILS IN TWO OPPOSITE WAYS AND BOTH ARE HERE. With TWO providers apt",
+    "refuses to choose and the build dies loudly (netcat). With ONE it silently installs the",
+    "provider, the build succeeds, and only a gate that iterates the DECLARED names notices",
+    "that dpkg knows the package under a different one (upx). The second is the dangerous",
+    "shape: without the gate it would never have surfaced at all.",
+    "",
+    "THE GATE READS THIS TOO, so a mapped package is still verified as present. Without that",
+    "the mapping would satisfy the build and quietly defeat the check that the declared",
+    "software is installed."
+  ],
+
+  "netcat": {
+    "install": "netcat-openbsd",
+    "why": [
+      "On noble `netcat` is a pure virtual package with TWO providers -- netcat-openbsd and",
+      "netcat-traditional -- so apt refuses to choose and fails the whole transaction with",
+      "'Package netcat has no installation candidate'. Measured on a real debootstrapped",
+      "noble rootfs, not inferred: it took down the first end-to-end build at stage 2.",
+      "",
+      "netcat-openbsd is the provider Ubuntu itself prefers -- Priority: important, in main,",
+      "against netcat-traditional at Priority: optional in universe -- and it Provides:",
+      "netcat, so the `netcat` command upstream's own Apt.Tests.ps1 expects still resolves."
+    ]
+  },
+
+  "upx": {
+    "install": "upx-ucl",
+    "why": [
+      "`upx` is a virtual package with exactly ONE provider, upx-ucl, so apt installs it",
+      "without complaint and the build succeeds -- but dpkg then knows the package as",
+      "upx-ucl and nothing named `upx` is registered. Measured on the first image that",
+      "built end to end: the publication gate reported it missing while /usr/bin/upx",
+      "existed as an alternatives symlink and worked.",
+      "",
+      "That is the opposite failure to netcat's and the more dangerous one. Nothing in the",
+      "build says anything is wrong; only iterating the DECLARED names against dpkg finds",
+      "it. Mapping the name makes the gate check what is actually installed instead of",
+      "reporting a false absence on every correct image -- and a false absence is how a",
+      "check gets deleted."
+    ]
+  }
+}

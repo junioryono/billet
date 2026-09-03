@@ -1,0 +1,199 @@
+# Watch actions/runner for a release, and open a pull request bumping the pin.
+#
+# WHY A PULL REQUEST AND NOT A BUILD. GitHub stops sending jobs to a self-hosted
+# runner more than 30 days behind a release, and billet's runners cannot update
+# themselves out of that — a JIT config carries DisableUpdate=True, so the runner in
+# an image is the runner forever. Something has to notice a release.
+#
+# But a runner release should not reach a fleet unattended. Merging is the gate, and
+# it is deliberate: actions-runner-controller reached the same design and wrote down
+# the reason — "since images won't be built until the generated PR is merged we still
+# have room to wait before triggering a build should there be any problems with the
+# runner release."
+#
+# WHY POLLING RATHER THAN BEING TOLD. A `repository_dispatch` from actions/runner
+# would need a token with write access to this repository held by somebody else, and
+# a dependency pointing the wrong way. Polling costs one unauthenticated request a
+# day.
+name: Runner release
+
+on:
+  schedule:
+    # Daily. The window is thirty days, so this is not about speed — it is about not
+    # depending on somebody remembering to look.
+    - cron: "17 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Read the newest release and the current pin
+        id: read
+        run: |
+          set -euo pipefail
+
+          body=$(curl -sSf --connect-timeout 10 --max-time 60 --retry 2 \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/actions/runner/releases/latest)
+
+          version=$(printf '%s' "$body" | jq -r '.tag_name' | sed 's/^v//')
+
+          # THE MARKERS, NOT A REGEX OVER THE BODY. The notes carry one checksum per
+          # platform between `<!-- BEGIN SHA linux-x64 -->` and its END, and they also
+          # contain OTHER 64-character hex strings — a greedy pattern takes the wrong
+          # one, which was measured, and would pin a checksum belonging to another
+          # architecture.
+          #
+          # EXTRACTED IN JQ RATHER THAN THROUGH `sed | head -1`. `grep -q`-shaped
+          # pipelines under pipefail return the WRITER's SIGPIPE when the reader
+          # leaves early, which reads as "not found" for a value that is present —
+          # intermittently, depending on how much the writer had left to do. One
+          # process cannot signal itself.
+          # BETWEEN MARKERS, LIKE THE RENDERING BELOW, and for the reason that one
+          # learned: a test that reads this text is satisfied by a workflow which
+          # extracts every checksum and then wires the wrong one into a variable.
+          # TestTheReleaseBumpWorkflowExtractsEachPlatformsOwnChecksum runs exactly
+          # this block against a fixture release body with a DISTINCT digest per
+          # platform, so a copy-paste that reads linux-arm64 into SHA_OSX_ARM64 --
+          # which would pin Linux's digest as the macOS one and take that platform
+          # out of service -- fails rather than reviews as fine.
+          # BILLET_SHA_EXTRACT_BEGIN
+          sha_for() {
+            printf '%s' "$body" | jq -r --arg p "$1" \
+              'try (.body | capture("<!-- BEGIN SHA " + $p + " -->(?<sha>[0-9a-f]{64})<!-- END SHA " + $p + " -->").sha) catch ""'
+          }
+
+          # EVERY PLATFORM BILLET PINS, NOT ONLY THE ONE LINE 1 CARRIES.
+          #
+          # pinned.txt is a version line plus a platform table, and the table's
+          # checksums are only true of the version on line 1 — internal/runnerrelease
+          # says exactly that about the pair on line 1 and it is no less true of the
+          # rows below. This step used to write line 1 alone, `>` truncating the table
+          # away, so the next bump would have left `PinnedSHA256For` with no checksum
+          # for linux-arm64 or osx-arm64 at all: a codebuild macOS or arm64 launch is
+          # refused outright rather than run unverified, which is the safe direction
+          # and still a fleet that stops working. Refreshing one row and not the
+          # others would verify a new tarball against an old release's digest.
+          sha=$(sha_for linux-x64)
+          sha_linux_arm64=$(sha_for linux-arm64)
+          sha_osx_arm64=$(sha_for osx-arm64)
+          # BILLET_SHA_EXTRACT_END
+
+          case "$version" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "github named the release '$version', which is not a version" >&2; exit 1 ;;
+          esac
+
+          for pair in "linux-x64:$sha" "linux-arm64:$sha_linux_arm64" "osx-arm64:$sha_osx_arm64"; do
+            platform=${pair%%:*}
+            value=${pair#*:}
+
+            case "$value" in
+              [0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;;
+              *)
+                echo "no $platform checksum in the release notes for $version" >&2
+                echo "billet pins a checksum per platform and refuses a launch it has none" >&2
+                echo "for, so a partial bump takes that platform out of the fleet." >&2
+                exit 1
+                ;;
+            esac
+          done
+
+          current=$(awk 'NR==1{print $1}' internal/runnerrelease/pinned.txt)
+
+          {
+            echo "version=$version"
+            echo "sha=$sha"
+            echo "sha_linux_arm64=$sha_linux_arm64"
+            echo "sha_osx_arm64=$sha_osx_arm64"
+            echo "current=$current"
+            echo "published=$(printf '%s' "$body" | jq -r '.published_at')"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Open a pull request
+        if: steps.read.outputs.version != steps.read.outputs.current
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.read.outputs.version }}
+          SHA: ${{ steps.read.outputs.sha }}
+          SHA_LINUX_ARM64: ${{ steps.read.outputs.sha_linux_arm64 }}
+          SHA_OSX_ARM64: ${{ steps.read.outputs.sha_osx_arm64 }}
+          CURRENT: ${{ steps.read.outputs.current }}
+          PUBLISHED: ${{ steps.read.outputs.published }}
+        run: |
+          set -euo pipefail
+
+          branch="runner-release/$VERSION"
+
+          # ALREADY OPEN IS NOT A FAILURE. This runs daily and a release stands for
+          # weeks, so most days there is a pull request sitting there already —
+          # opening a second one every morning would train everybody to ignore them.
+          if gh pr list --head "$branch" --state open --json number --jq 'length' | grep -qv '^0$'; then
+            echo "a pull request for $VERSION is already open"
+            exit 0
+          fi
+
+          # THE WHOLE FILE, BECAUSE THE WHOLE FILE IS ABOUT ONE VERSION. Line 1 is
+          # the version and its linux-x64 checksum, and the rows below are the same
+          # release's other platforms; internal/runnerrelease reads line 1 by
+          # position, so the order is load-bearing rather than tidy.
+          #
+          # BETWEEN MARKERS, AND THAT IS NOT DECORATION: this statement is what
+          # TestTheReleaseBumpWorkflowWritesEveryPinnedPlatform extracts and RUNS
+          # against fixture values, comparing the file it produces. Two earlier
+          # versions of that test read the workflow's text instead and both were
+          # satisfied by a workflow that had stopped emitting the platform rows.
+          # Keep the markers, and keep everything between them executable on its
+          # own given VERSION, SHA, SHA_LINUX_ARM64 and SHA_OSX_ARM64.
+          # BILLET_PIN_RENDER_BEGIN
+          {
+            printf '%s %s\n' "$VERSION" "$SHA"
+            printf 'linux-arm64 %s\n' "$SHA_LINUX_ARM64"
+            printf 'osx-arm64 %s\n' "$SHA_OSX_ARM64"
+          } > internal/runnerrelease/pinned.txt
+          # BILLET_PIN_RENDER_END
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add internal/runnerrelease/pinned.txt
+          git commit --file - <<COMMIT
+          Runner: take up actions/runner $VERSION
+
+          Published $PUBLISHED; the pin was $CURRENT.
+
+          GitHub stops sending jobs to a self-hosted runner more than 30 days after a
+          release, and billet's runners cannot update themselves out of it -- a JIT
+          config carries DisableUpdate=True, so the runner baked into an image is the
+          runner forever.
+
+          Opened by the daily poll rather than applied automatically, so a bad runner
+          release does not reach a fleet without somebody agreeing to it.
+          COMMIT
+
+          git push origin "$branch"
+
+          gh pr create --head "$branch" --title "Runner: take up actions/runner $VERSION" --body "\
+          \`actions/runner\` **$VERSION** was published on $PUBLISHED. The pin was \`$CURRENT\`.
+
+          **The clock starts at the release, not at merge.** GitHub stops sending jobs to a
+          self-hosted runner more than 30 days behind a release, and billet's runners cannot
+          update themselves out of it: a JIT configuration carries \`DisableUpdate = True\`, so
+          the runner baked into an image is the runner forever.
+
+          Merging this moves the pin, which is what the guest-image workflow bakes in and
+          what \`billet ami\` installs. Merging is deliberately the gate: a bad runner release
+          should not reach a fleet without somebody agreeing to it.
+
+          Nothing is verified by opening this. The guest-image workflow builds the image and
+          proves it boots — under Firecracker, on a hosted runner, which does have
+          \`/dev/kvm\`. \`billet images verify\` then proves it against a real cluster, which is
+          the half a hosted runner genuinely cannot do."

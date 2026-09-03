@@ -1,0 +1,507 @@
+package ec2
+
+import (
+	"context"
+	"encoding/json"
+	"encoding/xml"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/url"
+	"reflect"
+	"strings"
+	"time"
+
+	"github.com/junioryono/billet/internal/awscreds"
+)
+
+// apiVersion is the EC2 query API this client speaks. Pinned, because the
+// parameter and response shapes below are that version's.
+const apiVersion = "2016-11-15"
+
+// maxAttempts bounds how many times one call is issued.
+//
+// THREE, NOT MORE, and the reason is that the caller is a launch path a job is
+// waiting on. Retrying is right for a throttle or a 500 — those are the API
+// saying "not now" rather than "no" — but a long retry ladder in front of
+// RunInstances turns a busy region into a launch that outlives the plane's
+// command timeout, and the node then has custody of compute nobody asked for.
+const maxAttempts = 3
+
+// client talks the EC2 query API over signed HTTPS.
+//
+//nolint:recvcheck // The redaction methods MUST take a value receiver: a pointer-receiver String is not consulted when a VALUE is formatted, so %+v on a dereferenced client would print the secret out of its unexported creds field. Every other method needs the pointer. The mix is deliberate and the safety property is the reason — github.App carries the identical exception for the identical reason.
+type client struct {
+	http     *http.Client
+	endpoint string
+	// quotas is the Service Quotas endpoint, DERIVED rather than configured: it
+	// is a different service from EC2, so it cannot share node.ec2.endpoint, and
+	// an operator has no reason to aim a read-only diagnostic at a host of their
+	// choosing. A test sets it directly.
+	quotas string
+	region string
+	creds  awscreds.Source
+
+	// now is time.Now, replaceable so a test can pin a signature.
+	now func() time.Time
+	// sleep waits between attempts, replaceable so a test does not.
+	sleep func(ctx context.Context, d time.Duration) error
+}
+
+// REDACTED, BECAUSE IT HOLDS A CREDENTIAL SOURCE IN AN UNEXPORTED FIELD.
+//
+// fmt cannot invoke methods through an unexported field — reflect refuses — so a
+// source's own redaction is never consulted when the struct AROUND it is printed
+// structurally. `%+v` on a client holding a value-typed source printed the secret
+// access key in full, past three layers of redaction that all worked in
+// isolation.
+//
+// This is the fourth type in this package to need its own methods for that
+// reason, which is the tell that method-based redaction cannot be made absolute:
+// see the note in the billet-security skill, where the same residual is recorded
+// for the GitHub App key.
+// ON A VALUE RECEIVER, which is the rule this package's own skill states and
+// which the first version of these methods broke: a pointer receiver is not
+// consulted when a VALUE is formatted, so `%+v` on a dereferenced client
+// structurally rendered the unexported creds field and printed the secret. A
+// value receiver serves both forms.
+//
+// `Credentials` and `awscreds.Static` take value receivers for the same reason.
+// `awscreds.IMDS` cannot — it holds a sync.Mutex, so a value copy is a vet
+// error and the pointer receiver is the only correct choice there.
+func (c client) String() string { return "ec2.client{endpoint=" + c.endpoint + "}" }
+
+// GoString covers %#v.
+func (c client) GoString() string { return c.String() }
+
+// Format catches every verb.
+func (c client) Format(f fmt.State, _ rune) {
+	_, _ = io.WriteString(f, c.String()) //nolint:errcheck // fmt.State swallows write errors by design
+}
+
+// MarshalJSON keeps a client out of anything that serializes it structurally.
+func (c client) MarshalJSON() ([]byte, error) { return json.Marshal(c.String()) }
+
+// LogValue is what slog consults.
+func (c client) LogValue() slog.Value { return slog.StringValue(c.String()) }
+
+// apiError is a refusal the EC2 API described.
+//
+// THE CODE IS THE PART THAT MATTERS, and it is kept separate from the message
+// because callers branch on it: an already-terminated instance is success for an
+// idempotent destroy, and telling that from a real failure by matching prose is
+// how a teardown failure gets swallowed.
+type apiError struct {
+	Code    string
+	Message string
+	Status  int
+}
+
+func (e *apiError) Error() string {
+	if e.Code == "" {
+		return fmt.Sprintf("ec2: the api returned http %d", e.Status)
+	}
+
+	return fmt.Sprintf("ec2: %s: %s", e.Code, e.Message)
+}
+
+// codeOf reports the API error code in a chain, and whether there was one.
+func codeOf(err error) (string, bool) {
+	if apiErr, ok := errors.AsType[*apiError](err); ok {
+		return apiErr.Code, true
+	}
+
+	return "", false
+}
+
+// retryable reports whether an attempt is worth repeating.
+//
+// A THROTTLE AND A 500 ARE "NOT NOW"; EVERYTHING ELSE IS "NO". Retrying a
+// rejected parameter just spends the caller's deadline arriving at the same
+// answer, and retrying RunInstances after an ambiguous failure is how one job
+// becomes two instances — which is why the launch also carries a client token,
+// so that even a retry AWS itself performs cannot double-launch.
+func retryable(err error) bool {
+	// A REFUSED REDIRECT IS A VERDICT, NOT A BLIP. An endpoint that answers with a
+	// redirect will answer with one again, so the retries cannot change the
+	// outcome — and each one is another signed request handed to whatever is
+	// answering. It has to be named here because it is not an apiError, and the
+	// default for those is the opposite.
+	if errors.Is(err, errRedirected) {
+		return false
+	}
+
+	apiErr, ok := errors.AsType[*apiError](err)
+	if !ok {
+		// Anything else that is not the API answering: a connection that dropped, a
+		// body that would not parse. The request may never have arrived, so it is
+		// worth making again — unlike the refusal above, which is billet's own
+		// verdict and will not change.
+		return true
+	}
+
+	switch apiErr.Code {
+	case "RequestLimitExceeded", "Throttling", "ThrottlingException",
+		"Unavailable", "ServiceUnavailable", "InternalError", "InternalFailure":
+		return true
+	}
+
+	// A CAPACITY VERDICT IS A 500 THAT IS NOT A BLIP, and it has to be named here
+	// because the line below reads the status alone.
+	//
+	// AWS returns InsufficientInstanceCapacity with HTTP 500 — it is classified as
+	// a server error — so it landed in "not now" and was retried against the same
+	// shape in the same availability zone, milliseconds apart. That cannot change
+	// the answer. The recovery is a DIFFERENT SHAPE, which Launch now walks to,
+	// and every retry here is time spent before that begins.
+	if capacityRefusal(apiErr.Code) {
+		return false
+	}
+
+	return apiErr.Status >= http.StatusInternalServerError
+}
+
+// capacityRefusal reports whether a code means "not this shape, here, now" —
+// AWS refusing synchronously, having started nothing.
+//
+// WHAT MAKES A FALLBACK SAFE, and the whole reason it is a named list rather
+// than a status range. Trying a second shape after an AMBIGUOUS failure — a
+// dropped connection, an unparseable body — could leave two instances carrying
+// one lease's name, both registered with GitHub, one of them free to pick up
+// unrelated work. These codes are AWS's own verdict that the request was
+// rejected, so nothing was started and another shape is a fresh question.
+//
+//	InsufficientInstanceCapacity  AWS has none of that shape in that AZ right now.
+//	UnfulfillableCapacity         the SPOT form of the same, and this backend
+//	                              launches spot through RunInstances — so leaving
+//	                              it out defeated the fallback for the mode a
+//	                              cost-conscious deployment actually runs in.
+//	InsufficientHostCapacity      the dedicated-host variant. Not requested by this
+//	                              backend today; listed so it does not have to be
+//	                              rediscovered when it is.
+//	Unsupported                   that shape is not offered in that AZ at all.
+//	                              BROADER THAN THE OTHERS: AWS also uses it for an
+//	                              unsupported request or configuration, so a config
+//	                              that is simply wrong will be refused once per
+//	                              declared shape rather than once. Wasteful, never
+//	                              unsafe — it is still a synchronous rejection —
+//	                              and the error names every shape it tried.
+//
+// THE NON-RETRY APPLIES EVERYWHERE, INCLUDING THE AMI BUILDER, which has no
+// fallback loop of its own: retryable takes no action parameter. That is
+// deliberate rather than overlooked. The retries here are 200ms and 400ms apart,
+// and AWS's own guidance for a capacity refusal is to wait — so what the builder
+// loses is three attempts inside half a second that were never going to differ,
+// and what it gains is failing immediately with the actual reason instead.
+func capacityRefusal(code string) bool {
+	switch code {
+	case "InsufficientInstanceCapacity", "UnfulfillableCapacity",
+		"InsufficientHostCapacity", "Unsupported":
+		return true
+	}
+
+	return false
+}
+
+// call issues one action and unmarshals the response into out.
+func (c *client) call(ctx context.Context, params url.Values, out any) error {
+	params.Set("Version", apiVersion)
+
+	body := params.Encode()
+
+	var lastErr error
+
+	for attempt := range maxAttempts {
+		if attempt > 0 {
+			// EXPONENTIAL, AND CANCELLABLE. A fixed pause is either useless
+			// against a throttle or wasteful against a blip, and a sleep that
+			// ignores the context outlives the job it is launching for.
+			delay := time.Duration(1<<uint(attempt-1)) * 200 * time.Millisecond
+
+			if err := c.wait(ctx, delay); err != nil {
+				return err
+			}
+		}
+
+		// REBUILT EVERY ATTEMPT. A signature covers a timestamp and the
+		// credentials, both of which can change between attempts, and the body
+		// reader is consumed by the one before.
+		payload, err := c.attempt(ctx, body)
+		if err == nil {
+			if out == nil {
+				return nil
+			}
+
+			// ZEROED BEFORE EVERY DECODE, because encoding/xml APPENDS to slices
+			// and this target is shared across attempts.
+			//
+			// A truncated body is worth retrying — it is a transfer that failed
+			// rather than an answer billet disagrees with — but the decoder fills
+			// in what it managed to read before it fails. Without this the retry
+			// appended a full set of rows to the partial ones, and
+			// DescribeInstances reported an instance twice into a list that feeds a
+			// loop that destroys. Measured: two instances came back as four.
+			if v := reflect.ValueOf(out); v.Kind() == reflect.Pointer && !v.IsNil() {
+				v.Elem().SetZero()
+			}
+
+			if err = xml.Unmarshal(payload, out); err == nil {
+				return nil
+			}
+
+			err = fmt.Errorf("ec2: parse the api response: %w", err)
+		}
+
+		lastErr = err
+
+		if !retryable(err) {
+			return err
+		}
+	}
+
+	return fmt.Errorf("ec2: %s failed after %d attempts: %w",
+		params.Get("Action"), maxAttempts, lastErr)
+}
+
+func (c *client) wait(ctx context.Context, d time.Duration) error {
+	if c.sleep != nil {
+		return c.sleep(ctx, d)
+	}
+
+	// A TIMER RATHER THAN time.After, which billet bans outright: After leaks its
+	// timer until it fires, and this one is abandoned on every cancellation.
+	t := time.NewTimer(d)
+	defer t.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
+// attempt issues one request and returns its body, leaving the decode to the
+// caller so that a failed attempt cannot contaminate the next one's target.
+func (c *client) attempt(ctx context.Context, body string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, strings.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("ec2: build request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=utf-8")
+	// SET EXPLICITLY because it is SIGNED. NewRequestWithContext derives it from a
+	// strings.Reader already, and stating it here keeps the signed value and the
+	// sent value from being two separate derivations.
+	req.ContentLength = int64(len(body))
+
+	creds, err := c.creds.Credentials(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("ec2: resolve aws credentials: %w", err)
+	}
+
+	now := time.Now
+	if c.now != nil {
+		now = c.now
+	}
+
+	if err := sign(req, []byte(body), creds, c.region, now()); err != nil {
+		return nil, err
+	}
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		// THE WRAPPER IS DISCARDED, NOT WRAPPED AGAIN. net/http returns a
+		// *url.Error whose message contains the whole URL it was working on — for
+		// a refused redirect that is the TARGET, chosen by whatever answered, with
+		// its query string intact. The sentinel already says everything billet is
+		// willing to say about it.
+		// THE SENTINEL'S OWN MESSAGE, not the bare sentinel. The CheckRedirect
+		// closure names the host it refused — safe by the same rule that governs
+		// everything else here — and returning errRedirected alone threw that away,
+		// so an operator whose VPC endpoint sits behind a redirecting proxy was told
+		// only that a redirect happened. What must not survive is net/http's
+		// *url.Error wrapper, which renders the whole target including its query.
+		if uerr, ok := errors.AsType[*url.Error](err); ok && errors.Is(err, errRedirected) {
+			return nil, uerr.Err
+		}
+
+		if errors.Is(err, errRedirected) {
+			return nil, err
+		}
+
+		return nil, fmt.Errorf("ec2: call the api: %w", err)
+	}
+
+	defer func() { _ = resp.Body.Close() }()
+
+	// BOUNDED. A DescribeInstances page is large but not unbounded, and an
+	// unbounded read is an allocation sized by whatever answered.
+	payload, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil {
+		return nil, fmt.Errorf("ec2: read the api response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, parseAPIError(payload, resp.StatusCode)
+	}
+
+	return payload, nil
+}
+
+// errorResponse is the shape the query API uses for a refusal.
+type errorResponse struct {
+	Errors []struct {
+		Code    string `xml:"Code"`
+		Message string `xml:"Message"`
+	} `xml:"Errors>Error"`
+	RequestID string `xml:"RequestID"`
+}
+
+// parseAPIError turns a non-200 into an apiError, keeping the status when the
+// body is not the shape it should be.
+func parseAPIError(payload []byte, status int) error {
+	var parsed errorResponse
+
+	if err := xml.Unmarshal(payload, &parsed); err != nil || len(parsed.Errors) == 0 {
+		// A GATEWAY, A PROXY, OR A LOAD BALANCER answered instead of EC2, and its
+		// body is not this shape. The status is all there is, and it is enough to
+		// decide whether to retry.
+		return &apiError{Status: status}
+	}
+
+	return &apiError{
+		Code:    parsed.Errors[0].Code,
+		Message: parsed.Errors[0].Message,
+		Status:  status,
+	}
+}
+
+// instanceItem is one instance as the API describes it.
+type instanceItem struct {
+	InstanceID string `xml:"instanceId"`
+	State      struct {
+		Name string `xml:"name"`
+	} `xml:"instanceState"`
+	// StateReason says WHO stopped it, which "stopped" alone does not.
+	// Client.InstanceInitiatedShutdown is the guest powering itself off;
+	// Client.UserInitiatedShutdown is somebody calling StopInstances; Server.* is
+	// the host. An image build treats only the first as a success signal.
+	StateReason struct {
+		Code string `xml:"code"`
+	} `xml:"stateReason"`
+	Tags []struct {
+		Key   string `xml:"key"`
+		Value string `xml:"value"`
+	} `xml:"tagSet>item"`
+}
+
+// tag reports a tag's value, and whether it was set.
+func (i instanceItem) tag(key string) (string, bool) {
+	for _, t := range i.Tags {
+		if t.Key == key {
+			return t.Value, true
+		}
+	}
+
+	return "", false
+}
+
+// getConsoleOutputResponse is what the serial console held when AWS was asked.
+//
+// THE OUTPUT IS BASE64 AND MAY BE EMPTY, and those are different answers. An
+// instance that has not posted anything yet returns no <output> element at all,
+// which is "not yet" rather than "nothing was printed" -- the caller polls
+// through it and its own deadline is what bounds an instance that never speaks.
+type getConsoleOutputResponse struct {
+	InstanceID string `xml:"instanceId"`
+	Timestamp  string `xml:"timestamp"`
+	Output     string `xml:"output"`
+}
+
+// runInstancesResponse is what a launch answers with.
+// createImageResponse carries the id of the AMI a build produced.
+type createImageResponse struct {
+	ImageID string `xml:"imageId"`
+}
+
+type runInstancesResponse struct {
+	Instances []instanceItem `xml:"instancesSet>item"`
+}
+
+// describeInstancesResponse is one page of instances.
+//
+// NextToken is why this is a page rather than the answer. A fleet larger than one
+// page that ignored it would report a subset — and the callers are reconciliation
+// and teardown, so a missing instance reads as "that lease is not running here",
+// which frees capacity for a machine that is still executing a job.
+type describeInstancesResponse struct {
+	Reservations []struct {
+		Instances []instanceItem `xml:"instancesSet>item"`
+	} `xml:"reservationSet>item"`
+	NextToken string `xml:"nextToken"`
+}
+
+// describeImagesResponse carries what billet needs from an AMI: which device is
+// root, and EVERY mapping the image declares — the root included, because whether
+// billet says anything about overriding it depends on what that entry said.
+type describeImagesResponse struct {
+	Images []struct {
+		ImageID        string `xml:"imageId"`
+		RootDeviceName string `xml:"rootDeviceName"`
+		// RootDeviceType is "ebs" or "instance-store". billet requires the first
+		// and refuses the second up front, because every root parameter it sends
+		// is EBS-shaped.
+		RootDeviceType string `xml:"rootDeviceType"`
+		// State is "pending" until an image can be launched from, then "available".
+		// A build that hands back an id before that produces a tier whose first
+		// launch fails with an error about the image rather than about the config.
+		State string `xml:"imageState"`
+		// Architecture is AWS's spelling of the processor the image is for
+		// ("x86_64" or "arm64"), which is NOT billet's ("x64" or "arm64"). It is
+		// read so a verification asks the ARTIFACT what it is rather than taking
+		// an operator's word: a check run against the wrong architecture's
+		// toolcache spellings fails every assertion on a correct image.
+		Architecture string `xml:"architecture"`
+		// BlockDevices are the image's own mappings. billet states
+		// DeleteOnTermination at launch for the EBS ones, so these are read to BUILD
+		// that request — and to warn about the ones the image asks to keep.
+		// Mappings with no <ebs> child, and any with no device name, are not
+		// restated; the root is stated by setBlockDevices rather than from here.
+		BlockDevices []imageMapping `xml:"blockDeviceMapping>item"`
+		// Tags carry provenance: which billet built the image, and which AMIContract
+		// it satisfies. An image built before billet stamped its output has neither,
+		// which is the pre-contract case rather than a passing one.
+		Tags []imageTag `xml:"tagSet>item"`
+	} `xml:"imagesSet>item"`
+}
+
+// imageTag is one entry of an image's tag set.
+type imageTag struct {
+	Key   string `xml:"key"`
+	Value string `xml:"value"`
+}
+
+// imageMapping is one entry of an image's block device mapping.
+type imageMapping struct {
+	DeviceName string `xml:"deviceName"`
+	// A POINTER BECAUSE ABSENCE IS MEANINGFUL. A mapping with no <ebs> child is an
+	// instance-store or suppressed device, and handing EC2 an
+	// Ebs.DeleteOnTermination for one is a request about a volume that does not
+	// exist. A value type cannot express that: an absent <ebs> and a
+	// present-but-empty one would both decode to the zero struct.
+	//
+	// It is also how billet establishes that a root is EBS-backed when the image
+	// does not report its root device type: see requireEBSRoot.
+	EBS *struct {
+		DeleteOnTermination string `xml:"deleteOnTermination"`
+		// VolumeSize is the mapping's size in GiB, as a string because that is
+		// what the query API returns and because an absent value has to be
+		// distinguishable from a zero. EBS refuses to create a volume SMALLER
+		// than the snapshot behind it, so this is the floor a build has to
+		// respect rather than a number it may pick freely.
+		VolumeSize string `xml:"volumeSize"`
+	} `xml:"ebs"`
+}

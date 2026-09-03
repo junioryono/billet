@@ -1,0 +1,161 @@
+---
+- name: Bootstrap a new single-host Ceph cluster
+  when: billet_ceph_bootstrap
+  block:
+    - name: Install Ceph bootstrap dependencies
+      ansible.builtin.apt:
+        name:
+          - cephadm
+          - docker.io
+        state: present
+      become: true
+
+    - name: Work around Ubuntu uutils numeric owner handling
+      ansible.builtin.group:
+        name: ceph-daemon
+        gid: 167
+        system: true
+        state: present
+      become: true
+
+    - name: Create the matching Ceph daemon account
+      ansible.builtin.user:
+        name: ceph-daemon
+        uid: 167
+        group: ceph-daemon
+        home: /var/lib/ceph
+        create_home: false
+        shell: /usr/sbin/nologin
+        system: true
+        state: present
+      become: true
+
+    - name: Check whether Ceph is already configured
+      ansible.builtin.stat:
+        path: /etc/ceph/ceph.conf
+      register: billet_ceph_conf
+
+    - name: Bootstrap Ceph without opening root SSH
+      ansible.builtin.command:
+        argv:
+          - cephadm
+          - bootstrap
+          - --mon-ip
+          - "{{ billet_ceph_mon_ip }}"
+          - --single-host-defaults
+          - --ssh-user
+          - "{{ billet_ceph_ssh_user }}"
+          - --skip-monitoring-stack
+          - --skip-dashboard
+      become: true
+      when: not billet_ceph_conf.stat.exists
+
+
+    - name: Inspect Ceph's current device inventory
+      ansible.builtin.command:
+        argv: [ceph, orch, device, ls, --hostname, "{{ inventory_hostname }}", --format, json, --refresh]
+      register: billet_ceph_device_inventory
+      changed_when: false
+      become: true
+
+    - name: Add each explicitly named available OSD device
+      ansible.builtin.command:
+        argv: [ceph, orch, daemon, add, osd, "{{ inventory_hostname }}:{{ item }}"]
+      loop: "{{ billet_ceph_devices }}"
+      when: >-
+        item in (
+          billet_ceph_device_inventory.stdout | from_json |
+          selectattr('available', 'equalto', true) |
+          map(attribute='path') | list
+        )
+      changed_when: true
+      become: true
+
+- name: Inspect Ceph pools
+  ansible.builtin.command: ceph osd pool ls
+  register: billet_ceph_pools
+  changed_when: false
+  check_mode: false
+  become: true
+
+- name: Create billet Ceph pools
+  ansible.builtin.command:
+    argv: [ceph, osd, pool, create, "{{ item }}"]
+  loop:
+    - "{{ billet_ceph_image_pool }}"
+    - "{{ billet_ceph_cache_pool }}"
+  when: item not in billet_ceph_pools.stdout_lines
+  become: true
+
+- name: Initialize billet Ceph pools for RBD
+  ansible.builtin.command:
+    argv: [rbd, pool, init, "{{ item }}"]
+  loop:
+    - "{{ billet_ceph_image_pool }}"
+    - "{{ billet_ceph_cache_pool }}"
+  changed_when: false
+  become: true
+
+- name: Configure billet Ceph pool replication
+  ansible.builtin.command:
+    argv: [ceph, osd, pool, set, "{{ item.0 }}", "{{ item.1 }}", "{{ item.2 }}"]
+  loop:
+    - ["{{ billet_ceph_image_pool }}", size, "{{ billet_ceph_pool_size }}"]
+    - ["{{ billet_ceph_image_pool }}", min_size, "{{ billet_ceph_pool_min_size }}"]
+    - ["{{ billet_ceph_cache_pool }}", size, "{{ billet_ceph_pool_size }}"]
+    - ["{{ billet_ceph_cache_pool }}", min_size, "{{ billet_ceph_pool_min_size }}"]
+  changed_when: false
+  become: true
+
+- name: Require clone-v2-compatible Ceph clients
+  ansible.builtin.command: ceph osd set-require-min-compat-client mimic
+  changed_when: false
+  become: true
+
+- name: Create the scoped billet Ceph identity
+  ansible.builtin.command:
+    argv:
+      - ceph
+      - auth
+      - get-or-create
+      - "client.{{ billet_ceph_user }}"
+      - mon
+      - profile rbd
+      - osd
+      - "profile rbd pool={{ billet_ceph_image_pool }}, profile rbd pool={{ billet_ceph_cache_pool }}"
+      - -o
+      - "{{ billet_ceph_keyring_path }}"
+  changed_when: false
+  become: true
+
+- name: Protect the billet Ceph keyring
+  ansible.builtin.file:
+    path: "{{ billet_ceph_keyring_path }}"
+    owner: root
+    group: root
+    mode: "0600"
+  become: true
+
+- name: Verify the scoped Ceph identity can read both pools
+  ansible.builtin.command:
+    argv: [rbd, ls, "{{ item }}", --id, "{{ billet_ceph_user }}", --keyring, "{{ billet_ceph_keyring_path }}"]
+  loop:
+    - "{{ billet_ceph_image_pool }}"
+    - "{{ billet_ceph_cache_pool }}"
+  changed_when: false
+  become: true
+
+- name: Load the RBD kernel client after every boot
+  ansible.builtin.copy:
+    content: "rbd\n"
+    dest: /etc/modules-load.d/billet-rbd.conf
+    owner: root
+    group: root
+    mode: "0644"
+  become: true
+
+- name: Load the RBD kernel client now
+  ansible.builtin.command: modprobe rbd
+  changed_when: false
+  when: not ansible_check_mode
+  become: true

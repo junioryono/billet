@@ -1,0 +1,5 @@
+# billet Docker build and push
+
+The combined wrapper around `setup-docker-builder` and an exact reviewed commit of `docker/build-push-action` v7: it starts the per-job BuildKit daemon on a sticky disk, then forwards the common build inputs to upstream. Every input and output is documented in [`action.yml`](action.yml); the cache model, ceilings, mirror routing and publication semantics are documented in [`../setup-docker-builder/README.md`](../setup-docker-builder/README.md).
+
+Reference it as `junioryono/billet/actions/build-push-action@v0` to follow Billet's releases without editing this workflow again, or as an exact tag or commit SHA to pin. Whichever you choose, the sibling `setup-docker-builder` reference resolves to the same Billet: the release workflow rewrites every internal reference to the tag being cut before it creates that tag. See [Action versioning](../../docs/action-versioning.md) for what `@v0` moving actually costs. Use `setup-docker-builder` directly when an upstream input this wrapper does not expose is needed.

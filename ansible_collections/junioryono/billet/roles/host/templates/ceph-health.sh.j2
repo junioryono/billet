@@ -1,0 +1,18 @@
+#!/bin/sh
+set -eu
+
+state_dir=/var/lib/billet/health
+state_file=${state_dir}/ceph.last
+mkdir -p "${state_dir}"
+
+detail=$(ceph health detail 2>&1) || status=ERROR
+status=${status:-$(printf '%s\n' "${detail}" | sed -n '1s/ .*//p')}
+previous=$(test -f "${state_file}" && cat "${state_file}" || true)
+
+if [ "${status}" != "HEALTH_OK" ] && [ "${detail}" != "${previous}" ]; then
+    printf '%s\n' "${detail}" | mail -r {{ billet_alert_from | quote }} -s "billet Ceph health on $(hostname): ${status}" {{ billet_alert_email | quote }}
+elif [ "${status}" = "HEALTH_OK" ] && [ -n "${previous}" ] && ! printf '%s' "${previous}" | grep -q '^HEALTH_OK'; then
+    printf '%s\n' "Ceph recovered on $(hostname): ${detail}" | mail -r {{ billet_alert_from | quote }} -s "billet Ceph recovered on $(hostname)" {{ billet_alert_email | quote }}
+fi
+
+printf '%s\n' "${detail}" >"${state_file}"

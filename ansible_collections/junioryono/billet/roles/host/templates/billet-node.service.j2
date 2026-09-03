@@ -1,0 +1,63 @@
+[Unit]
+Description=billet compute host
+Documentation=https://github.com/junioryono/billet
+{% if billet_firecracker_enabled %}
+# The guest bridges billet-network.service installs only exist for the
+# firecracker backend. An ec2 (or docker) node has no such service, and requiring
+# one that was never installed would leave the node unit unable to start.
+After=network-online.target billet-network.service
+Requires=billet-network.service
+{% else %}
+After=network-online.target
+{% endif %}
+Wants=network-online.target
+
+{% set billet_notify_ready = billet_systemd_notify_ready | default(false) %}
+{% if billet_server_prepare_only | default(false) %}
+
+# HELD, FOR THE SERVER'S REASON RATHER THAN ITS OWN. On a host running both
+# roles a CERTLESS node mints the deployment identity when the server has not:
+# `billet node` claims the deployment before it reaches --upgrade-probe, and
+# nodeDeploymentID falls through to state.DeploymentID(server.state_dir) —
+# whose own comment says "whichever role runs first mints the identity". So a
+# prepare-only host that held only the server would have the invariant broken
+# by the other unit on the same machine.
+#
+# See billet-server.service for why this is an assertion in the unit rather
+# than a mask or a drop-in, and why it asserts that `/` does not exist.
+AssertPathExists=!/
+{% endif %}
+
+[Service]
+Type={{ 'notify' if billet_notify_ready else 'exec' }}
+{% if billet_notify_ready %}
+NotifyAccess=main
+{% endif %}
+User=root
+Group=root
+ExecStart=/usr/bin/billet node --config /etc/billet/billet.yaml{{ ' --upgrade-probe' if billet_systemd_upgrade_probe | default(false) else '' }}
+TimeoutStartSec=120
+RuntimeDirectory=billet/locks
+RuntimeDirectoryMode=0750
+TimeoutStopSec=88200
+KillSignal=SIGTERM
+KillMode=mixed
+Restart=on-failure
+RestartSec=5s
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# The node maps RBD devices and the jailer creates per-guest cgroups through
+# sysfs. ProtectKernelTunables would remount those required interfaces read-only.
+ProtectKernelModules=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+ReadOnlyPaths=/etc/billet
+# The node atomically replaces its own TLS bundle during renewal. ProtectSystem
+# keeps the rest of /etc read-only; only this rotating credential directory is
+# writable.
+ReadWritePaths=-/etc/billet/tls -/srv/jailer "{{ billet_config.get('node', {}).get('state_dir', '/var/lib/billet/node') }}"
+
+[Install]
+WantedBy=multi-user.target

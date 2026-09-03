@@ -1,0 +1,8 @@
+[Unit]
+Description=Check billet's Ceph storage health
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/billet-ceph-health

@@ -1,0 +1,221 @@
+name: AWS acceptance
+
+# A REAL DEPLOYMENT, A REAL JOB, AND A TEARDOWN THAT RUNS WHATEVER HAPPENS.
+#
+# This is the only workflow in the repository that launches billable compute in a
+# real AWS account, and the only one that needs a GitHub App private key. Both
+# facts shape everything below.
+#
+# NEVER ON pull_request, AND THAT IS THE FIRST RULE. A pull-request workflow from
+# a fork runs code the author controls, and this job holds an OIDC role that can
+# create EC2 instances and a private key that can mint tokens for the whole
+# organization. `workflow_dispatch` and `schedule` both run from a ref a
+# maintainer chose.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: The billet ref to run the acceptance against
+        required: false
+        type: string
+      jobs:
+        description: How many jobs must finish before the run stops waiting
+        required: false
+        default: "1"
+        type: string
+      wait:
+        description: Give up waiting after this long; the teardown still runs
+        required: false
+        default: 30m
+        type: string
+  schedule:
+    # Weekly, out of hours. An acceptance run costs money every time it runs, and
+    # the thing it is watching for — an AWS API that changed under billet, a
+    # runner release that no longer starts — moves on the scale of weeks.
+    - cron: "0 4 * * 1"
+
+permissions: {}
+
+concurrency:
+  # ONE AT A TIME, ACROSS EVERY TRIGGER, and never cancelled. Two acceptance runs
+  # in one account are two deployments competing for the same quota — but far
+  # worse, `cancel-in-progress` would kill a run BETWEEN its launch and its
+  # teardown, which is precisely the state that leaves compute billing. A queued
+  # run waits; a running one is never interrupted.
+  group: aws-acceptance
+  cancel-in-progress: false
+
+env:
+  # THE DEDICATED CI ACCOUNT, named in docs/aws-acceptance.md. It holds nothing
+  # else, because the control plane stores a GitHub App private key and the fleet
+  # executes arbitrary pull-request code — neither belongs beside anything that
+  # matters. It is an identifier rather than a credential, and it is recorded
+  # deliberately: `billet acceptance` REFUSES to run against any other account,
+  # which is what makes "this never touches another deployment" a property of the
+  # job rather than a convention.
+  BILLET_ACCEPTANCE_ACCOUNT: "810711872940"
+  BILLET_ACCEPTANCE_REGION: us-west-2
+
+jobs:
+  acceptance:
+    # ONLY FROM THE CANONICAL REPOSITORY. A fork that enabled Actions on its own
+    # copy would otherwise run this on a schedule against an account it cannot
+    # reach, failing weekly for a reason nobody there can fix.
+    if: github.repository == 'junioryono/billet'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    permissions:
+      contents: read
+      # OIDC IS WHY THIS CANNOT RUN ON pull_request. It mints a credential that
+      # can create and destroy compute; nothing that a fork can trigger may hold
+      # one.
+      id-token: write
+
+    steps:
+      - name: Check out the ref this run is about
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build the billet under test
+        run: go build -o "$RUNNER_TEMP/billet" ./cmd/billet
+
+      - name: Assume the acceptance role
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::${{ env.BILLET_ACCEPTANCE_ACCOUNT }}:role/billet-acceptance
+          aws-region: ${{ env.BILLET_ACCEPTANCE_REGION }}
+          # A SHORT SESSION, because the run is bounded by the job timeout above
+          # and a credential that outlives it is one nothing is watching.
+          role-duration-seconds: 5400
+
+      # THE APP PRIVATE KEY, AND THE ONE THING THIS RUN CANNOT ISOLATE.
+      #
+      # `billet acceptance` gives the derived deployment its own identity, its own
+      # ports, its own state and its own scale sets — but there is one App per
+      # organization in practice, and minting a second per run is not something a
+      # harness should do: the private key is issued exactly once. So the run
+      # shares it, and the key is written 0600 into a directory the job owns.
+      - name: Stage the acceptance deployment's config and App key
+        env:
+          BILLET_ACCEPTANCE_CONFIG_BODY: ${{ secrets.BILLET_ACCEPTANCE_CONFIG }}
+          BILLET_ACCEPTANCE_APP_KEY: ${{ secrets.BILLET_ACCEPTANCE_APP_KEY }}
+        run: |
+          set -eu
+
+          if [ -z "$BILLET_ACCEPTANCE_CONFIG_BODY" ] || [ -z "$BILLET_ACCEPTANCE_APP_KEY" ]; then
+            echo "::error::BILLET_ACCEPTANCE_CONFIG and BILLET_ACCEPTANCE_APP_KEY must both be set." >&2
+            echo "This workflow derives an isolated deployment from that config; it does not invent one." >&2
+            exit 1
+          fi
+
+          install -d -m 0700 "$RUNNER_TEMP/acceptance"
+          umask 077
+          printf '%s\n' "$BILLET_ACCEPTANCE_CONFIG_BODY" > "$RUNNER_TEMP/acceptance/base.yaml"
+          printf '%s\n' "$BILLET_ACCEPTANCE_APP_KEY" > "$RUNNER_TEMP/acceptance/app-private-key.pem"
+
+      # `up` IS ITS OWN STEP so the workspace exists before anything that could
+      # fail — the teardown below is scoped to it, and a teardown against a
+      # workspace `up` never wrote refuses rather than guessing.
+      - name: Derive the isolated deployment
+        id: up
+        run: |
+          "$RUNNER_TEMP/billet" acceptance up \
+            --config "$RUNNER_TEMP/acceptance/base.yaml" \
+            --workspace "$RUNNER_TEMP/acceptance/ws" \
+            --account "$BILLET_ACCEPTANCE_ACCOUNT" \
+            --region "$BILLET_ACCEPTANCE_REGION"
+
+      # THE JOB THE RUN IS WAITING FOR. `billet acceptance` deliberately does not
+      # dispatch one — deciding which workflow to run is the operator's, and a
+      # command that dispatched one would need write access to a repository for no
+      # reason. Here that operator is this step.
+      - name: Dispatch the acceptance workflow
+        env:
+          GH_TOKEN: ${{ secrets.BILLET_ACCEPTANCE_DISPATCH_TOKEN }}
+          BILLET_ACCEPTANCE_WORKFLOW: ${{ vars.BILLET_ACCEPTANCE_WORKFLOW }}
+          BILLET_ACCEPTANCE_REPO: ${{ vars.BILLET_ACCEPTANCE_REPO }}
+        run: |
+          set -eu
+
+          if [ -z "${BILLET_ACCEPTANCE_WORKFLOW:-}" ] || [ -z "${BILLET_ACCEPTANCE_REPO:-}" ]; then
+            echo "::error::BILLET_ACCEPTANCE_REPO and BILLET_ACCEPTANCE_WORKFLOW must name the" >&2
+            echo "workflow whose job this run is proving. It runs in a repository the" >&2
+            echo "acceptance deployment's runner group permits, not in this one." >&2
+            exit 1
+          fi
+
+          gh workflow run "$BILLET_ACCEPTANCE_WORKFLOW" --repo "$BILLET_ACCEPTANCE_REPO"
+
+      # THE RUN ITSELF, and `--no-teardown` because the teardown is the step
+      # below: it must run when this one FAILS, and a teardown inside a step that
+      # failed is one an `if: always()` cannot be written around.
+      - name: Run the acceptance deployment
+        id: run
+        run: |
+          "$RUNNER_TEMP/billet" acceptance run \
+            --workspace "$RUNNER_TEMP/acceptance/ws" \
+            --jobs "${{ inputs.jobs || '1' }}" \
+            --wait "${{ inputs.wait || '30m' }}" \
+            --no-teardown
+
+      # THE EVIDENCE IS UPLOADED BEFORE THE TEARDOWN RUNS, and on `always()`,
+      # because the run that FAILED is the one whose evidence is worth reading —
+      # and the teardown is about to destroy what it describes.
+      - name: Upload the evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: acceptance-evidence
+          path: |
+            ${{ runner.temp }}/acceptance/ws/evidence.json
+            ${{ runner.temp }}/acceptance/ws/server.log
+            ${{ runner.temp }}/acceptance/ws/node.log
+          if-no-files-found: warn
+
+      # THE TEARDOWN, ON always(), AND IT IS THE POINT OF THIS WORKFLOW BEING A
+      # WORKFLOW. Every step above can fail; compute left billing afterwards is
+      # the outcome this exists to make impossible. `down` seals, waits for what
+      # is running, deletes this run's scale sets, decommissions its cloud
+      # resources and then SWEEPS — asking the provider rather than assuming.
+      #
+      # --keep-workspace, so the sweep below has an identity to scope to. The
+      # workspace is the runner's temp directory and goes with the runner.
+      - name: Tear down
+        if: always()
+        run: |
+          "$RUNNER_TEMP/billet" acceptance down \
+            --workspace "$RUNNER_TEMP/acceptance/ws" \
+            --keep-workspace
+
+      # AND THE SWEEP AS ITS OWN STEP, which is not redundant with the one inside
+      # `down`. This one FAILS THE JOB. `down` runs under `always()` beside other
+      # steps that may also have failed, so a step whose only job is to be red
+      # when anything remains is what makes "nothing was left behind" a property
+      # of the workflow's own status rather than something a person has to read a
+      # log for.
+      #
+      # `billet acceptance sweep` RATHER THAN A grep. The first version of this
+      # step matched `billet decommission`'s prose for a phrase meaning "there is
+      # nothing here" — which makes a reworded diagnostic silently turn a red job
+      # green, and puts the one decision that has to be right in a place no test
+      # can reach. The command decides, in Go, and this reads an exit status.
+      - name: Prove nothing billable remains
+        if: always()
+        run: |
+          "$RUNNER_TEMP/billet" acceptance sweep \
+            --workspace "$RUNNER_TEMP/acceptance/ws"
+
+      # THE APP KEY IS REMOVED WHATEVER HAPPENED. The runner is ephemeral, so this
+      # is belt and braces — and belt and braces is the right amount for a
+      # credential GitHub issues exactly once.
+      - name: Remove the staged credentials
+        if: always()
+        run: rm -f "$RUNNER_TEMP/acceptance/app-private-key.pem"

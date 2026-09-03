@@ -1,0 +1,104 @@
+# billet control plane.
+#
+# NOT ENABLED OR STARTED BY THE PACKAGE. Installing billet does not connect
+# anything to GitHub; that is the administrator's decision, made after
+# /etc/billet/billet.yaml says something true.
+#
+#   systemctl enable --now billet-server
+#
+[Unit]
+Description=billet control plane
+Documentation=https://github.com/junioryono/billet
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# READINESS IS BILLET'S TO REPORT, and Type=exec cannot carry it: systemd calls
+# the start successful the moment execve does, which is before the ledger is
+# open and before the node wire is listening. Anything sequencing on this unit —
+# `systemctl start`, an ordering dependency, `billet local up` starting the
+# server before the node — would be sequencing on a pid rather than on a
+# service. billet already sends READY=1 once the state store is open, the
+# allocator is built and the wire is served, so this says so.
+#
+# The binary and this file are installed together by the package, which is what
+# makes the opt-in safe: a unit that waits for a notification a binary never
+# sends fails its start at TimeoutStartSec. The Ansible role reads the INSTALLED
+# type and preserves it for exactly that reason.
+Type=notify
+NotifyAccess=main
+User=billet
+Group=billet
+UMask=0077
+
+# EXPLICIT, AND NOT OPTIONAL. billet's default config path is per-user — it
+# resolves through os.UserConfigDir() and only falls back to /etc — and it
+# deliberately never reads the working directory, because a service that adopted
+# a billet.yaml from wherever it happened to start would be taking the state
+# directory, the App key path and every tier's resources from an attacker.
+ExecStart=/usr/bin/billet server --config /etc/billet/billet.yaml
+
+# /var/lib/billet/server holds the SQLite capacity ledger, the deployment
+# identity, and the mTLS CA's private key. The sibling node runs as root, so the
+# two roles must not race to change ownership of their common parent.
+StateDirectory=billet/server
+StateDirectoryMode=0700
+
+# TWENTY-FOUR AND A HALF HOURS, AND THE ARITHMETIC IS THE POINT.
+#
+#   drain_timeout  24h     — the largest value billet accepts
+#   teardown       ~25m    — destroy (12m) + destroy (12m) + close (30s) + release (30s)
+#   margin           5m
+#
+# systemd sends SIGTERM and then SIGKILL when this expires. A SIGKILL lands in
+# the middle of the teardown: containers survive with nobody tracking them, and
+# their leases are renewed by nobody. So this must exceed what billet is allowed
+# to spend, or the service manager's impatience undoes the shutdown ordering
+# billet exists to get right.
+#
+# LOWER drain_timeout FIRST if this is too long for you, then lower this to
+# match. Do not lower this alone.
+TimeoutStopSec=88200
+
+# The bound on reaching READY=1, which billet sends before it has spoken to
+# GitHub at all — the token refresh and scale-set reconcile happen after. So
+# this bounds opening the ledger and binding the wire, and is generous for it.
+TimeoutStartSec=120
+KillSignal=SIGTERM
+
+# A second SIGTERM stops billet waiting for its running jobs and tears down
+# immediately; a third gives up where it stands. To send one:
+#
+#   systemctl kill --kill-whom=main --signal=SIGTERM billet-server
+#
+# --kill-whom=main MATTERS. Without it systemctl signals every process in the
+# service, including a container CLI billet has in flight — which kills the child
+# out from under the teardown that was trying to use it. Re-running
+# `systemctl stop` does not send a second application-level SIGTERM either.
+KillMode=mixed
+
+# A clean exit after a drain is a clean exit. `always` would restart a control
+# plane an operator had just asked to stop.
+Restart=on-failure
+RestartSec=5s
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+
+# The GitHub App private key and the config live here, read-only.
+ReadOnlyPaths=/etc/billet
+
+[Install]
+WantedBy=multi-user.target

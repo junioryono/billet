@@ -1,0 +1,34 @@
+---
+# A CONVERGE CAN DESTROY THE JOB RUNNING IT, and nothing else in this role can
+# notice. Restarting the node drains it; a second SIGTERM stops the waiting and
+# destroys the jobs still running, and GitHub does not requeue a job whose runner
+# vanished mid-execution. So a converge driven from a billet-managed runner can
+# kill itself part-way through a durable, rollback-capable upgrade transaction --
+# and the operator sees a cancelled job rather than a diagnosis.
+#
+# billet names the compute behind a lease "billet-<lease id>" (provider.InstanceName,
+# reversed by provider.LeaseOf), and the runner registers under that name, which is
+# what makes this detectable at all.
+#
+# FIRST, BEFORE EVERY OTHER TASK. A refusal is only useful before the transaction
+# it protects has started.
+- name: Refuse a converge driven from a billet-managed runner
+  vars:
+    billet_driving_runner: "{{ lookup('env', 'RUNNER_NAME') | default('', true) }}"
+  ansible.builtin.assert:
+    that:
+      - billet_allow_converge_from_billet_runner | bool
+        or not (billet_driving_runner is match('^billet-.'))
+    fail_msg: >-
+      This play is running on {{ billet_driving_runner }}, which is a runner billet
+      itself manages. Converging from one is how a deployment destroys its own
+      deploy job: this role restarts the billet services, the node drains, and a
+      second SIGTERM destroys the jobs still running on it -- including this one.
+      GitHub does not requeue a job whose runner disappeared, so the converge stops
+      part-way through an upgrade transaction and reports nothing useful.
+      Run it from a workstation that can reach the host, or from a plain runner
+      billet does not manage. If this runner is genuinely not backed by the host
+      being converged, set billet_allow_converge_from_billet_runner=true.
+    success_msg: >-
+      Not running on a billet-managed runner, so this converge cannot drain the
+      node out from under itself.

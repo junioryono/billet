@@ -1,0 +1,23 @@
+-- migration 41: node_digest
+--
+-- nodeDigestMigration records which signed manifest produced a host's binary.
+--
+-- A NAME IS NOT BYTES, and that is the whole reason for a second column beside
+-- node_release. A rollout resolves a channel once, to one immutable manifest, and
+-- persists that manifest's digest precisely so every host installs the same bytes
+-- — but convergence was read from the version string a node was BUILT with, which
+-- two builds can share and which a moved tag makes identical. This is what a host
+-- says about its own provenance, proved against the binary that is running before
+-- it is sent.
+--
+-- EMPTY MEANS NOTHING ON THAT MACHINE CAN SAY, never "unverified". On the day this
+-- ships that is every host in the field, so a rollout converges such a host on its
+-- version and records that no manifest proved it; a host that names a manifest
+-- which DISAGREES is the case that could not previously exist and is now blocked.
+--
+-- Everything between the markers below is PUBLISHED BYTES; the prose is not.
+-- Reformat one tab and every ledger that applied this migration refuses to open.
+
+-- +billet:statement
+ALTER TABLE nodes ADD COLUMN node_digest TEXT NOT NULL DEFAULT ''
+-- +billet:end

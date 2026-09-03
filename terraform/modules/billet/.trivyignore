@@ -1,0 +1,54 @@
+# Every entry here is a deliberate design decision, not an accepted risk backlog.
+# Remove the entry in the same PR that changes the decision.
+
+# The ledger volume is encrypted (enforced by the plan tests); it uses the
+# account's EBS default key because the module does not yet surface a CMK input
+# for the control plane. The cache path has enable_kms; adding a control-plane
+# key input is additive work, not a default this module should impose.
+AVD-AWS-0027
+
+# Runner and control-plane security groups allow unrestricted egress by design:
+# jobs fetch from GitHub, registries, and package mirrors, and the control plane
+# long-polls GitHub. Ingress is what the module restricts.
+AVD-AWS-0104
+
+# The created subnet is public on purpose: the opinionated default is a small
+# deployment whose control plane reaches GitHub without a NAT gateway's monthly
+# cost. Operators with private-subnet requirements adopt their own network via
+# vpc_id/subnet_id.
+AVD-AWS-0164
+
+# VPC flow logs are a monitoring decision with per-GB cost, left to the
+# operator. The module's monitoring surface is deliberately left to the operator.
+AVD-AWS-0178
+
+# The cache bucket holds rebuildable build artifacts: access logging (AVD-AWS-0089)
+# and versioning (AVD-AWS-0090) would multiply storage cost to protect data whose
+# loss costs one cache rebuild.
+#
+# THE BACKUP BUCKET IS THE OPPOSITE CASE AND ANSWERS BOTH SEPARATELY, said here
+# because these ids are module-wide and a reader would otherwise take the
+# sentence above as covering it. It holds two private keys and a ledger, so it
+# IS versioned (backup.tf enables it deliberately: versioning is what makes
+# billet's never-delete credential mean something). What it does not have is
+# ACCESS LOGGING, which needs a second bucket this child does not own and would
+# have to create, name and lifecycle — an operator who needs to know who read
+# their archives adds aws_s3_bucket_logging against a target of their choosing,
+# and CloudTrail data events are the other answer. That is a decision left with
+# them rather than a cost imposed by default.
+AVD-AWS-0089
+AVD-AWS-0090
+
+# The cache bucket is SSE-S3 by default; enable_kms switches it to a
+# customer-managed key with per-deployment read isolation. The default is
+# deliberate: SSE-S3 has no key-management burden and the data is a build cache.
+AVD-AWS-0132
+
+# The spot-router Lambda is a thirty-line forwarder whose only work is moving
+# an interruption warning onto the queue. X-Ray tracing (AVD-AWS-0066) would
+# add a per-invocation cost to observe a function whose failure alarm is the
+# monitoring surface, and a CMK on its log group (AVD-AWS-0017) is the same
+# key-management burden the ledger entry above declines — the logs carry
+# instance ids, not secrets.
+AVD-AWS-0066
+AVD-AWS-0017

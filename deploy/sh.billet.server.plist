@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  billet control plane, for the all-local Mac: one machine running both roles.
+
+  NOT LOADED BY ANY PACKAGE.
+
+    cp sh.billet.server.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/sh.billet.server.plist
+
+  OPTIONAL, and most Macs should not have it. A Mac is compute; the control
+  plane belongs wherever the deployment's ledger lives, and adr-001 puts that on
+  a small always-on host rather than on a machine whose whole job is running
+  guests. This file is for the single-machine shape — one Mac, both roles, the
+  node dialling 127.0.0.1 — which is what a first deployment looks like.
+
+  AN AGENT BESIDE THE NODE, rather than a daemon, and the reason is different
+  from the node's. The control plane needs no keychain and no per-user VM store,
+  so a daemon would work — but the two processes share one config file and one
+  deployment identity, and splitting them across a system daemon and a user
+  agent means two accounts, two state directory owners, and a `billet check`
+  whose answer depends on which one you ran it as. On the machine this is for,
+  they are one operator's pair of processes.
+
+  ON A LINUX CONTROL PLANE THE SERVER RUNS AS ITS OWN UNPRIVILEGED ACCOUNT
+  (billet-server.service, User=billet). Here it runs as the logged-in user
+  because that is who owns the state directory the node also needs. That is a
+  weaker separation, and it is the honest cost of the single-machine shape.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>sh.billet.server</string>
+
+    <!-- An explicit config flag, and the same path the node uses: one file, two
+         processes, which is billet's single-machine shape rather than a
+         convenience. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/billet</string>
+        <string>server</string>
+        <string>--config</string>
+        <string>/usr/local/etc/billet/billet.yaml</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- Sized like the node's, and for a related reason: stopping the SERVER is
+         the destructive half of a shutdown. Its teardown releases every lease
+         the listener still holds, and a SIGKILL partway through leaves the
+         ledger disagreeing with the compute a node is still holding. Stop the
+         node first and let it drain; the server after custody has settled. -->
+    <key>ExitTimeOut</key>
+    <integer>88200</integer>
+
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+
+    <key>StandardOutPath</key>
+    <string>/usr/local/var/log/billet/server.log</string>
+    <key>StandardErrorPath</key>
+    <string>/usr/local/var/log/billet/server.log</string>
+</dict>
+</plist>

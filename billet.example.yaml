@@ -1,0 +1,1117 @@
+# billet configuration — copy to billet.yaml and edit.
+#
+# THIS FILE DESCRIBES A MACHINE, NOT A LAPTOP. It is the intended deployment —
+# Firecracker microVMs on bare metal, backed by a Ceph cluster — and that provider
+# is built and runs. What it needs is a HOST that can serve it, which is four
+# things a laptop does not have:
+#
+#   * /dev/kvm, with firecracker and jailer installed (see
+#     docs/reference-hardware.md for the versions billet is developed against).
+#   * A Ceph cluster with the two pools below, holding a golden image. Building
+#     one is docs/adr-003-ceph-rbd.md.
+#   * An unprivileged account for the jailer to drop the VMM to — `useradd
+#     --system --no-create-home --shell /usr/sbin/nologin billet`.
+#   * A bridge for guests to attach to.
+#
+# `billet check` proves all four before a job ever arrives, and names whichever
+# one is missing.
+#
+# TO RUN IT ON A LAPTOP INSTEAD, FIVE edits HERE, and all five are needed — the
+# README's quickstart lists what else the file needs (the github: block, a
+# writable server.state_dir) and the Docker daemon it assumes:
+#
+#   1. `provider: firecracker` -> `provider: docker`, in the node section and in
+#      every tier.
+#   2. Delete the `ceph:` block below. It is REFUSED rather than ignored on any
+#      backend that cannot attach a block device, so leaving it in place means
+#      the config does not load at all — see the block's own comment for why a
+#      storage section nothing will read is an error.
+#   3. Delete the `firecracker:` block below, for the same reason as the `ceph:`
+#      one: only the firecracker backend reads it, so on any other provider it is
+#      a jail directory, a uid range and a bridge that nothing consults, and it is
+#      REFUSED rather than ignored.
+#   4. Delete the `cache:` block. Docker guests cannot attach its block volumes,
+#      so it is refused on that provider rather than ignored.
+#   5. `image:` -> a Docker image that contains the GitHub runner, for example
+#      `ghcr.io/actions/actions-runner:latest`. The image name is passed
+#      straight to `docker run`, so `ubuntu-2404-x64@g1` below is a golden-image
+#      reference for Firecracker and is not pullable.
+#
+# Edits 1 through 3 together get you a config that validates and a server that
+# starts, and every job then fails to launch — which is why the third is here.
+#
+# The Docker provider reads vcpu, memory and shm; it ignores disk and warm_pool.
+# The `ceph:`, `firecracker:` and `cache:` blocks are REFUSED on it rather than
+# ignored: a block only firecracker reads is, on any other provider,
+# configuration nothing consults.
+#
+# This example is the single-machine deployment, which is TWO PROCESSES reading
+# this one file:
+#
+#   billet server --config ./billet.yaml     # the control plane
+#   billet node   --config ./billet.yaml     # the compute host
+#
+# They talk over the loopback address below. Nothing is exposed to the network
+# and no certificates are involved — a control plane listening only on loopback
+# serves plain HTTP, because there is nothing between two processes on one box to
+# authenticate. (Setting node.tls against a loopback server is refused for that
+# reason.) Add machines by running `billet node` on each with its own copy of
+# this file, its server_addr pointing at this one, and a bundle from
+# `billet ca issue` — at which point the server has to listen on an address those
+# machines can reach, and the wire becomes mTLS.
+
+server:
+  # Nodes dial the server; the server never dials out except to GitHub. On a
+  # single box this stays on loopback, so billet exposes nothing to the network.
+  #
+  # ANY OTHER ADDRESS REQUIRES CLIENT CERTIFICATES, and billet mints them itself
+  # — there is no CA to run. The wire identifies a node by the name in its
+  # certificate, so without one the only identity available is the name a caller
+  # types into the URL, which anything on the network can type. Run
+  # `billet ca issue <node>` here and copy the bundle to that host.
+  listen: 127.0.0.1:7717
+
+  # A SECOND ADDRESS, serving only the two things a machine with no certificate
+  # needs: reading this deployment's authority, and asking to join.
+  #
+  # ITS ABSENCE IS A REFUSAL, not a default. Without it this control plane does
+  # not enroll over the network at all, and admission stays out of band — run
+  # `billet ca issue <node>` here and copy the bundle to the host.
+  #
+  # It exists because those two routes cannot require a certificate, and a
+  # listener that admits callers who need not prove anything must not share a
+  # connection budget with the fleet: a caller that handshakes and then idles
+  # holds a slot, and once the budget is full a healthy node's connection is
+  # never accepted at all. So `listen` above demands a certificate in the
+  # handshake and serves nothing else, and this address carries the rest — which
+  # means it can be closed between enrollments without affecting a running fleet.
+  #
+  # Not valid beside a loopback `listen`: there are no certificates there, so
+  # there is nothing to enroll into.
+  #
+  # bootstrap_listen: 0.0.0.0:7718
+
+  # The names and addresses nodes will DIAL this control plane by. They become
+  # the subject names of the certificate it serves.
+  #
+  # Needed only when `listen` is a wildcard like 0.0.0.0:7717, which says which
+  # interfaces to accept on and says nothing about what a node types. A concrete
+  # listen address supplies itself.
+  #
+  # BOTH LISTENERS PRESENT THIS ONE CERTIFICATE, so if you set this list, the
+  # name an enrolling machine dials `bootstrap_listen` by has to be in it too.
+  #
+  # node_tls_hosts:
+  #   - billet.example
+  #   - 10.0.0.4
+
+  # MUST be local storage. SQLite's WAL is not safe on NFS, and this directory
+  # holds the capacity ledger.
+  #
+  # THIS IS THE SHORTHAND, and it is what almost every deployment wants: one
+  # directory holding the SQLite ledger, the deployment identity, the node-wire
+  # CA, the process lock and the maintenance fence. It means exactly
+  # `identity_dir: <dir>` plus `state: {backend: sqlite}`.
+  state_dir: /var/lib/billet/server
+
+  # TO PUT THE LEDGER IN POSTGRESQL, replace state_dir with the two keys below.
+  # Writing both is refused rather than merged, because two spellings of one
+  # value is a mistake nobody can see.
+  #
+  # What it buys is a REPLACEABLE CONTROLLER: the scheduling state outlives the
+  # machine, so recovery is your database's own backup rather than a directory
+  # restored onto local storage. What it does not buy on its own is high
+  # availability — exactly one controller may make scheduling decisions either
+  # way. See docs/adr-008-state-backends.md.
+  #
+  # identity_dir holds what is NOT rows and cannot follow the ledger into a
+  # database: the deployment identity, the node-wire CA and its rotation state,
+  # the process lock, and the maintenance fence.
+  #
+  #   identity_dir: /var/lib/billet/server
+  #   state:
+  #     backend: postgres
+  #     postgres:
+  #       # The NAME of an environment variable holding the connection string,
+  #       # never the string itself: a DSN carries a password, and a secret
+  #       # written into this file ends up in a backup and a paste buffer. Export
+  #       # it in the service's environment, the way the App private key is kept
+  #       # out of here.
+  #       dsn_env: BILLET_STATE_DSN
+
+  # How long a stopping billet waits for the jobs it is ALREADY running before it
+  # destroys them. This is what makes `systemctl restart` free rather than a way
+  # to fail somebody's CI.
+  #
+  # Defaults to 6h, which is how long GitHub lets a job run by default — not how
+  # long a shutdown ought to take. Raise it if your jobs run longer, as
+  # self-hosted runners often are: a drain shorter than your longest job kills
+  # exactly the work it exists to protect. Overrunning it is safe — billet stops
+  # waiting and destroys what is left, which is what it did before there was a
+  # drain at all.
+  #
+  # A service manager's stop timeout must exceed this PLUS the teardown, or its
+  # own expiry arrives first as a SIGKILL, which skips the teardown and strands
+  # the containers. The shipped units size TimeoutStopSec from this.
+  #
+  # drain_timeout: 6h
+
+  # Hard ceiling on what the allocator will hand out across every tier combined.
+  # Capacity is escrowed before each scale-set listener advertises to GitHub, so
+  # this is what stops concurrent tiers from collectively overcommitting the box.
+  #
+  # Sizing: leave headroom for the host. On a 64-core/128-thread, 512 GB machine,
+  # 120 vCPU and 480GiB reserves 8 threads and 32 GB for the OS, the Ceph OSDs,
+  # and billet itself. Note that 128 SMT threads are not 128 core-equivalents —
+  # measure real per-job-class throughput before raising this.
+  # See docs/reference-hardware.md for how tier shapes map onto a real topology.
+  max_vcpu: 120
+  max_memory: 480GiB
+
+  # WHICH MACHINE A JOB GOES TO, once more than one could take it. Only
+  # meaningful with a fleet; a single-host deployment can ignore it.
+  #
+  #   pack   (default) fill a machine before starting on the next
+  #   spread             keep machines as even as possible
+  #
+  # PACK BECAUSE FRAGMENTS CANNOT HOLD A BIG JOB. Spreading leaves every host
+  # partly used, and six 4 vCPU jobs spread across two 16 vCPU machines leave
+  # four free on each — so an 8 vCPU job fits nowhere while eight vCPU sit idle
+  # in the fleet. A job that cannot be placed is worse than a job that shares a
+  # disk.
+  #
+  # The usual reason to spread is contention, and it is weaker here than it
+  # looks: billet escrows vCPU and memory and the provider enforces both per
+  # container, so two jobs on one host do not take each other's cores or RAM.
+  # What they share is disk, page cache and network — so reach for `spread` if
+  # your builds are IO-heavy and you would rather fit less work than have them
+  # contend.
+  #
+  # Provider preference always wins over this: `providers: [firecracker, ec2]`
+  # means the machine at home before the cloud, whichever policy is set.
+  #
+  # placement: pack
+
+github:
+  org: your-org
+
+  # Populated by `billet github-app create --org your-org`.
+  #
+  # billet requests exactly two permissions: metadata read, and organization
+  # self-hosted runners read+write. It does not request actions:read, which
+  # would expose workflow runs, logs, and artifacts.
+  #
+  # Creating the App does not install it — the CLI walks you through both steps,
+  # and installation is where installation_id comes from.
+  app_id: 0
+  installation_id: 0
+  private_key_path: /etc/billet/app-private-key.pem
+
+# Where `billet local backup` puts a copy that is NOT on the disk it protects.
+#
+# OPTIONAL, AND THE DIRECTORY IS STILL THE CONTRACT. `billet local backup --out
+# <dir>` writes a manifest of digests and sizes precisely so that restic, rclone,
+# a NAS or whatever you already run can carry it — leave this section out and
+# that is the plan, which is a supported answer rather than an omission.
+#
+# WHAT SETTING IT ADDS is the half that matters on the day you use it: with a
+# bucket configured, a backup uploads what it just wrote, and `billet local
+# restore --from-backup latest` fetches, verifies and restores in one command on
+# a machine that holds nothing but the billet binary. An upload-only answer would
+# have you installing a second tool during an outage.
+#
+# BILLET NEVER DELETES FROM IT. There is no retention here and no eviction: the
+# bucket does that with versioning and a lifecycle rule, and the credential this
+# host holds cannot destroy the archives it wrote — which matters because this is
+# the one machine that also holds the App key and the node-wire CA.
+#
+# backup:
+#   s3:
+#     bucket: billet-backups
+#
+#     # The SIGNING region. With no endpoint it also selects the host billet
+#     # dials, so a typo here signs a request for somewhere that does not exist.
+#     region: us-west-2
+#
+#     # Archives land under <prefix>/<deployment-id>/<taken-at>/, so two
+#     # deployments can share a bucket and an IAM policy can be scoped to one.
+#     # No wildcard: a `*` here would widen that grant to every sibling prefix.
+#     prefix: billet-backups
+#
+#     # For an S3-COMPATIBLE store rather than AWS: Ceph RGW — which the
+#     # reference hardware already runs — MinIO, or R2. Addressing is path style
+#     # against it, because virtual-host style is what MinIO does not do by
+#     # default. https only, except loopback.
+#     # endpoint: https://rgw.example
+#
+#     # A customer-managed key for server-side encryption. Empty asks for SSE-S3
+#     # (AES256), which every S3-compatible store supports. An archive is two
+#     # private keys and a ledger, so what encrypts it at rest is a real
+#     # decision.
+#     # kms_key_id: arn:aws:kms:us-west-2:123456789012:key/...
+
+# Read by `billet node`. On a single machine this sits beside the server section
+# above and the two processes share the file.
+node:
+  # OPTIONAL WITH A CERTIFICATE. The control plane authorises a node by the name
+  # in its certificate, so an enrolled host takes its name from there and this
+  # key is a second place to write the same fact. Set it on a loopback node,
+  # which has no certificate to take one from — and if it is set alongside a
+  # certificate, the two must agree.
+  name: epyc-1
+  server_addr: 127.0.0.1:7717
+
+  # WHERE `billet node --enroll` ASKS TO JOIN, when the control plane serves
+  # enrollment on an address of its own (server.bootstrap_listen above).
+  #
+  # Used once and never again: a running node does not touch those routes, so
+  # this decides nothing after the certificate is written. Unset falls back to
+  # server_addr, which is right for a control plane that has no separate
+  # enrollment address — against one that does, the node wire refuses a
+  # connection with no certificate and the fallback cannot work.
+  #
+  # `--bootstrap-addr` overrides it, and `billet ca token` prints the whole
+  # command with the right value in it.
+  #
+  # bootstrap_addr: billet.example:7718
+
+  provider: firecracker
+
+  # NODE-LOCAL DATA: the generation pointer store, the image cache, and this
+  # host's mTLS identity. It is not the server's state_dir and does not need to
+  # be — a node with no certificate takes its deployment identity from the
+  # `server:` section in this same file, which is what lets the two directories
+  # differ on one machine.
+  #
+  # A node whose file has NO server section (the ordinary multi-machine case)
+  # gets its identity from its certificate instead.
+  state_dir: /var/lib/billet/node
+
+  # Where this host takes the deployment lock, which stops two processes managing
+  # the same containers. It belongs to the node because the node is what runs
+  # them; the control plane takes no lock. Leave it unset for the per-user
+  # default. (This key used to be `server.lock_dir` too — it is node-only now.)
+  #
+  # lock_dir: /run/billet/locks
+
+  # WHAT THIS MACHINE CONTRIBUTES, which is not the same as what it has. Unset
+  # means "everything I can detect", which is what a dedicated box wants.
+  #
+  # Declared HERE, on the machine, rather than in the control plane's config,
+  # because the person running this host is the one who knows what else it does.
+  # Setting them above what the machine has is allowed — overcommitting is a
+  # decision you are entitled to make — and warned about at startup.
+  #
+  # A number here is what the allocator escrows against, so it is also the
+  # answer to "why is this host not being given work".
+  #
+  # max_vcpu: 120
+  # max_memory: 480GiB
+
+  # WHERE THIS MACHINE IS, naming one of the control plane's declared sites
+  # below. Optional, and only meaningful once a deployment has more than one
+  # place. A node claiming a site the control plane does not declare is refused
+  # at registration — a typo would otherwise become a place of its own, with a
+  # cache of its own that is always empty.
+  #
+  # site: home
+
+  # The bundle `billet ca issue epyc-1` wrote on the control plane, copied here.
+  #
+  # REQUIRED TO DIAL ANYTHING BUT LOOPBACK. The name in this certificate is what
+  # the control plane authorises, so this host can act as the node it names and
+  # as nothing else. The certificate also carries which DEPLOYMENT it belongs to,
+  # so a fresh host needs nothing beyond these three files — it does not invent
+  # an identity the control plane would refuse.
+  #
+  # node.key is a private key: 0600, and it never leaves this machine.
+  #
+  # tls:
+  #   cert: /etc/billet/tls/node.crt
+  #   key: /etc/billet/tls/node.key
+  #   ca: /etc/billet/tls/ca.crt
+
+  # How long billet may hold capacity for compute it cannot account for — a
+  # container adopted from a crashed run, or one an ambiguous launch may have
+  # left behind — before destroying it and reclaiming the capacity.
+  #
+  # UNSET MEANS NO BOUND, which is the default. Billet does not limit job
+  # duration, and self-hosted runners are routinely configured past GitHub's
+  # six-hour default, so a limit billet chose for itself would kill legitimate
+  # long jobs. Set this only if you know your longest job; billet warns hourly
+  # about held capacity either way, which is the signal that actually helps.
+  #
+  # max_custody: 24h
+
+  # How long a stopping node waits for the compute it is still holding before it
+  # gives up and lets the teardown destroy it. Defaults to 6h.
+  #
+  # Separate from the control plane's key on purpose: a node and a control plane
+  # are restarted for different reasons and need not wait the same amount of time.
+  #
+  # drain_timeout: 6h
+
+  firecracker:
+    # The guest kernel must include everything Docker needs, or service
+    # containers fail in ways that are hard to read. Validate with moby's
+    # contrib/check-config.sh rather than a hand-written list.
+    kernel_image: /var/lib/billet/images/vmlinux
+
+    # THE BRIDGE EVERY GUEST ATTACHES TO. Required: a runner with no network
+    # registers and then does nothing, which looks like a healthy tier running no
+    # jobs. billet creates one tap per microVM and attaches it here.
+    bridge: br0
+
+    # AND A SEPARATE ONE FOR FORK PULL REQUESTS, whose ABSENCE is what refuses
+    # them. A microVM isolates the KERNEL, not the bridge it is attached to — a
+    # guest on the line above reaches whatever that bridge reaches, which on a
+    # machine that also holds the Ceph cluster and the control-plane database is
+    # everything that matters. Naming a network for untrusted work is how you say
+    # what a stranger's code may reach; until then billet will not run it at all.
+    # This is the same rule as node.ec2.untrusted_security_group_ids.
+    #
+    # untrusted_bridge: br-untrusted
+
+    # WHERE `billet images verify` briefly listens for the probe guest's signed
+    # report. A fixed port lets host policy admit exactly this callback instead of
+    # opening arbitrary high ports. The verification lock permits only one probe
+    # per host. Defaults to 7719.
+    #
+    # image_verify_port: 7719
+
+    # WHERE THE BINARIES ARE, defaulted to where their own instructions put them
+    # and where the reference host has them. The reference host installs them as
+    # versioned filenames behind stable symlinks, so `firecracker --version`
+    # always matches what is on disk — and note that the JAILER NAMES ITS CHROOT
+    # AFTER THE RESOLVED PATH, so with the layout below every microVM lives under
+    # /srv/jailer/firecracker-v1.16.1/ rather than /srv/jailer/firecracker/.
+    # `billet check` prints the directory it derives, because it is not the one
+    # written here.
+    #
+    # binary_path: /usr/local/bin/firecracker
+    # jailer_path: /usr/local/bin/jailer
+    # kernel_dir: /var/lib/billet/kernels
+    # chroot_base: /srv/jailer
+
+    # THE ACCOUNT THE JAILER DROPS THE VMM TO, before it reads anything an
+    # operator or a job wrote. Defaults to `billet`, and root is REFUSED: dropping
+    # privileges is the whole reason to use the jailer, so running the VMM as root
+    # removes the point of it. Create one with
+    #
+    #   useradd --system --no-create-home --shell /usr/sbin/nologin billet
+    #
+    # jail_user: billet
+
+  # THE APPLE SILICON BACKEND. Only read when provider is tart, and REFUSED on
+  # any other, for the reason node.firecracker and node.ceph are refused: nothing
+  # else consults it, so it would describe an isolation policy no launch applies.
+  #
+  # Omit the whole block on a node that runs only trusted tiers. It exists to
+  # answer one question: what happens to a fork's pull request.
+  #
+  # tart:
+  #   # WHAT CONFINES AN UNTRUSTED GUEST, and its ABSENCE is what refuses one —
+  #   # the same rule, and the same reasoning, as untrusted_bridge above. A tart
+  #   # VM is a real kernel boundary; the NETWORK is not. Tart's default is
+  #   # shared NAT, where a guest reaches the host and can ARP-spoof the vmnet
+  #   # bridge to read another guest's traffic, so untrusted work runs only once
+  #   # you have said what confines it.
+  #   #
+  #   # `softnet` is tart's own userspace packet filter: it restricts a guest to
+  #   # public destinations and isolates guests from each other on the bridge. It
+  #   # ships with tart and needs a one-time setuid-root grant on the host, which
+  #   # `billet check` reports — and which billet REFUSES to run without once
+  #   # this is set, rather than quietly falling back to the default network.
+  #   untrusted_isolation: softnet
+  #
+  #   # WHAT AN ISOLATED GUEST RESOLVES THROUGH, and billet supplies it because
+  #   # billet is what took the working one away. Measured: under softnet the
+  #   # DHCP-assigned resolver is the vmnet gateway, which sits in the private
+  #   # address space softnet blocks — egress and TCP/443 keep working, so
+  #   # nothing looks wrong and every job simply fails to resolve github.com.
+  #   # Defaults to 1.1.1.1 and 8.8.8.8. Addresses only: a guest with no working
+  #   # resolver cannot look up a name.
+  #   #
+  #   # untrusted_dns: [1.1.1.1, 8.8.8.8]
+
+  # THE SITE'S STORAGE. Golden images, the per-job root clone taken from one, and
+  # every cache in the plane are RBD images in a Ceph cluster on the nodes' own
+  # NVMe.
+  #
+  # A SIBLING OF firecracker RATHER THAN A FIELD IN IT, because storage belongs to
+  # the SITE: two hosts in one place map the same pool, which is the whole point of
+  # replacing ZFS. A ZFS clone exists only on the machine that took it, so a cache
+  # written to one pinned every repository to the host that first built it.
+  #
+  # Required for `provider: firecracker` and refused for every other backend — a
+  # container has nowhere to attach a block device, and an ec2 node's compute runs
+  # in a region that cannot reach this cluster. docs/adr-003-ceph-rbd.md is how the
+  # cluster is built and why it is not in the cloud.
+  ceph:
+    # Where the monitors are. Omit for Ceph's own search path, which finds
+    # /etc/ceph/ceph.conf — what `cephadm bootstrap` writes.
+    #
+    # conf_path: /etc/ceph/ceph.conf
+
+    # WHO THIS MACHINE IS, without the `client.` prefix. Defaults to `billet`, and
+    # `admin` is REFUSED: an admin key can delete a pool, so a node holding one
+    # turns a compromised host into a deleted site. Create a scoped identity:
+    #
+    #   ceph auth get-or-create client.billet \
+    #     mon 'profile rbd' \
+    #     osd 'profile rbd pool=billet-images, profile rbd pool=billet-cache'
+    #
+    # user: billet
+    # keyring_path: /etc/ceph/ceph.client.billet.keyring
+
+    # THE CLUSTER MUST CLONE THE NEW WAY, and `billet check` refuses one that
+    # would not. On clone v1 a snapshot must be PROTECTED before it can be cloned,
+    # and a protected snapshot with a live clone can be neither unprotected nor
+    # removed — so a cache generation that any running job holds a clone of would
+    # be undeletable, and eviction would be blocked by ordinary traffic rather than
+    # by anything wrong. Nothing in billet clones yet, which is why it is checked
+    # now: the fix is one command on an empty cluster, and the same fix after a
+    # fleet is built on it is a full pool.
+    #
+    # TWO settings decide it, and either one can be the problem:
+    #
+    #   ceph osd set-require-min-compat-client mimic   # cephadm leaves this at luminous
+    #   ceph config rm client rbd_default_clone_format # if it has been forced to 1
+    #   rbd config pool rm <pool> rbd_default_clone_format   # ...or forced per pool
+    #
+    # The second overrides the first, so satisfying only the floor is not enough.
+    # billet reads both, for both pools, and names whichever one is the cause.
+
+    # TWO POOLS, and one name for both is refused. Not for tuning — RBD's object
+    # size is a per-IMAGE property, so the reason ZFS wanted two datasets with
+    # different recordsizes does not survive the move. It is blast radius: a cache
+    # is thrown away and a golden image is not, so eviction has to be able to walk
+    # one pool without being able to reach the other.
+    image_pool: billet-images
+    cache_pool: billet-cache
+
+  # THE PER-JOB CACHE API, bound to one literal address on the Firecracker guest
+  # bridge. It is optional; without it guests still boot from Ceph but workflows
+  # receive no sticky disks and Docker pulls cold. A wildcard, loopback address,
+  # hostname, or endpoint different from listen is refused so a bearer-token API
+  # cannot quietly appear on another host interface.
+  #
+  # The guest requests its architecture-scoped Docker image store through this
+  # API before starting the runner. The guest prepares changed state only after
+  # the pinned runner reports a clean success. GitHub's completed-job message
+  # must independently report `succeeded` before the node opens the readiness
+  # route and later publishes it;
+  # every other result is discarded. Published generations expire after eight
+  # inactive days.
+  cache:
+    listen: 172.20.0.1:7718
+    guest_endpoint: http://172.20.0.1:7718
+
+  # THREE SITE-LOCAL PULL-THROUGH CACHES, one Distribution instance per
+  # upstream because proxy mode accepts one remote URL. Every endpoint is an
+  # HTTPS origin reachable from both trusted and untrusted guest bridges, so it
+  # must serve PUBLIC content only: configuring an upstream credential would
+  # expose everything that credential can read to every guest at the site.
+  # Repeat this exact block on every Firecracker node in the site.
+  #
+  # BuildKit uses all three mappings. Docker Engine's registry-mirrors setting
+  # supports Docker Hub only, so service-container and ordinary daemon pulls
+  # use the docker.io instance; ghcr.io and quay.io remain warm through the
+  # architecture-scoped /var/lib/docker disk above and still check upstream
+  # when a tag is pulled.
+  #
+  # THREE SEPARATE INSTANCES, and billet checks that they really are three: one
+  # Distribution process proxies ONE upstream. Two endpoints differing only by
+  # host case or an explicit `:443` address the same listener, so they are
+  # refused as a duplicate rather than accepted as two. A different port is a
+  # different instance and is fine.
+  #
+  # registry_mirrors:
+  #   docker.io: https://docker-cache.home.example
+  #   ghcr.io: https://ghcr-cache.home.example
+  #   quay.io: https://quay-cache.home.example
+
+  # THE CLOUD BACKEND, for `provider: ec2`. One instance per job, in one subnet.
+  #
+  # This is the AVAILABILITY story: a tier that lists `providers: [firecracker,
+  # ec2]` may be placed on either, so losing the bare-metal host does not take the
+  # `runs-on` label down with it. The first job that fails over runs with a COLD
+  # cache because sites never copy bytes over a WAN; an AWS-local EBS/S3 store can
+  # warm later jobs at that site.
+  #
+  # An ec2 node is an ORCHESTRATOR: it holds credentials and calls an API, and the
+  # compute appears in a region. Nothing runs on the machine billet runs on, so
+  # max_vcpu and max_memory above are REQUIRED here rather than detected — billet
+  # will not choose how much to buy on your account. They are hard resource
+  # budgets: placement charges the declared EC2 shape it will actually buy, not
+  # the usually smaller tier request. A fallback shape is charged before its AWS
+  # request is sent. The ORDER of a tier's `providers:` list makes home fill first.
+  #
+  # Credentials come from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / (optionally)
+  # AWS_SESSION_TOKEN, and failing that from this instance's own IAM role over
+  # IMDSv2. The role is preferred: the alternative is a credential that never
+  # expires, in a unit file, on a host that launches machines. Shared-config
+  # profiles and SSO are NOT read — project them into the environment.
+  #
+  # THE IAM POLICY THAT ROLE NEEDS IS GENERATED FROM THIS CONFIG. Run
+  # `billet init iam --config <this file>` and it prints exactly the policy this
+  # node will exercise — the runtime set (ec2:RunInstances, DescribeInstances,
+  # DescribeImages, TerminateInstances, CreateTags, DescribeSubnets,
+  # DescribeSecurityGroups), plus the EBS/S3 (and KMS) statements if this node has
+  # an ebs_s3 cache, the sqs statements if it is spot, and iam:PassRole if it names
+  # an instance_profile. Add `--builder` for the ec2:CreateImage that
+  # `billet ami build` needs. Two identifiers here are not scoping ARNs, so
+  # `init iam` asks for them: `--role-arn <role ARN>` when instance_profile is set
+  # (the profile name is not the role's ARN), and `--kms-key-arn <key ARN>` when
+  # ebs_s3.kms_key_id is a bare id or alias. Generating it from the config is how
+  # the grant and what billet actually calls cannot drift apart; every mutating
+  # action it grants is scoped to billet's own tagged resources.
+  #
+  # ec2:
+  #   region: us-west-2
+  #
+  #   # Where instances land. Their route to GitHub is yours to arrange: a private
+  #   # subnet needs a NAT gateway, a public one needs assign_public_ip. A runner
+  #   # that cannot reach GitHub registers and then does nothing.
+  #   subnet_id: subnet-0abc123
+  #   security_group_ids: [sg-0trusted]
+  #   # assign_public_ip: true
+  #
+  #   # FORK PULL-REQUEST WORK RUNS ONLY IF THIS IS SET, and it should name a group
+  #   # that reaches only what a stranger's code should reach. An instance isolates
+  #   # the KERNEL, which is why this backend may run untrusted work at all — it
+  #   # does not isolate the VPC. Without this key untrusted work is refused rather
+  #   # than quietly placed on the trusted group.
+  #   # untrusted_security_group_ids: [sg-0fork]
+  #
+  #   # An IAM role handed to whatever a TRUSTED job runs. Empty is the right
+  #   # answer unless a job genuinely needs AWS credentials.
+  #   #
+  #   # UNTRUSTED WORK NEVER RECEIVES IT. A fork's pull request runs its steps
+  #   # directly on the instance, so it could read the role's temporary
+  #   # credentials out of the metadata service — straight past the isolation
+  #   # that lets this backend run untrusted work at all.
+  #   # instance_profile: billet-runner
+  #
+  #   # THE SHAPES BILLET MAY BUY, each declaring what it holds, because billet
+  #   # ships no table of EC2 instance types — a table would be out of date within a
+  #   # quarter, and being out of date means launching a machine smaller than the
+  #   # lease already escrowed against it. The ORDER is a preference: placement
+  #   # charges the first shape that fits, and a capacity refusal from AWS may move
+  #   # to a later shape only after billet confirms that shape still fits the node
+  #   # and deployment budgets.
+  #   instance_types:
+  #     - type: c7i.2xlarge
+  #       vcpu: 8
+  #       memory: 16GiB
+  #       price_usd_per_hour: 0.357
+  #     - type: c7i.8xlarge
+  #       vcpu: 32
+  #       memory: 64GiB
+  #       price_usd_per_hour: 1.428
+  #
+  #   # SPOT DEFAULTS OFF. GitHub does not requeue a job whose runner vanished
+  #   # mid-execution, so a reclaimed spot instance is a failed build rather than a
+  #   # retry — and defaulting to it would make the failover path the unreliable
+  #   # one, which is the opposite of what a failover is for. Turn it on if you
+  #   # would rather have a cheap build that sometimes dies.
+  #   # Enabling it also requires one SQS queue PER NODE. An EventBridge router
+  #   # must look up the warned instance's sh.billet.node tag and deliver the
+  #   # warning only to that node's queue; several nodes consuming one queue can
+  #   # hide a two-minute warning from its owner for the entire visibility timeout.
+  #   # billet records the failure reason before teardown and deletes a message
+  #   # only after that record is durable. The node role needs sqs:ReceiveMessage
+  #   # and sqs:DeleteMessage on its queue.
+  #   # spot: true
+  #   # interruption_queue_url: https://sqs.us-west-2.amazonaws.com/123456789012/aws-1
+
+  # THE SECOND AWS BACKEND: one CodeBuild build per job, and how billet reaches
+  # AWS-MANAGED APPLE SILICON without anybody allocating an EC2 Mac Dedicated Host,
+  # operating a macOS host, installing Tart or building an 81 GB guest image.
+  #
+  # IT DOES NOT USE CODEBUILD'S OWN GITHUB ACTIONS RUNNER INTEGRATION. That feature
+  # is webhook-only and would take over job detection, runner registration and
+  # scheduling — bypassing the scale-set listener, the capacity ledger, ordered
+  # provider fallback, custody and the stable-label contract. billet starts an
+  # ordinary NO_SOURCE project through the API and runs GitHub's own runner from its
+  # own JIT configuration, exactly as the ec2 backend does inside an instance. So
+  # your workflows keep their existing `runs-on` labels and nothing in a repository
+  # names an AWS project. Do NOT add a WORKFLOW_JOB_QUEUED webhook to a
+  # billet-owned project: two schedulers acquiring one job produce duplicate
+  # runners. See docs/adr-007-codebuild-provider.md and docs/codebuild.md.
+  #
+  # TWO CEILINGS COME WITH IT AND BILLET CANNOT LIFT EITHER. A build is capped at
+  # 2160 minutes (36 hours), and a build still WAITING for capacity is FAILED after
+  # at most 480 (8 hours). Work that can exceed either belongs on owned EC2 or Mac
+  # capacity, where billet imposes no job limit at all.
+  #
+  # UNTRUSTED WORK IS REFUSED ON THIS BACKEND, and there is no key here that changes
+  # that. AWS documents a reserved-capacity instance as staying alive between builds
+  # and sharing cached data with other projects in the account, by design — so a
+  # fork's pull request is arbitrary code a later build inherits, and no security
+  # group fixes that. macOS is reserved-capacity only. Run untrusted tiers on
+  # firecracker or ec2.
+  #
+  # `billet init iam --config <this file>` prints the NODE's policy, and
+  # `--build-role` prints the BUILD's own service role — a different principal, and
+  # one whose every permission is a permission the workflow holds.
+  #
+  # codebuild:
+  #   region: us-west-2
+  #
+  #   # THE PROJECT MUST BE BILLET'S ALONE. A CodeBuild build cannot be tagged —
+  #   # tags exist on projects and report groups, and StartBuild has no field that
+  #   # becomes one — so the project ARN is the entire IAM boundary between billet's
+  #   # builds and anybody else's, and billet's inventory feeds a loop that STOPS
+  #   # builds. Sharing a project with another workload is how billet comes to stop
+  #   # somebody else's work.
+  #   project: billet-linux
+  #
+  #   # WHAT DECIDES THIS NODE'S GUEST OS. MAC_ARM boots macOS; everything else
+  #   # boots Linux. It is derived rather than configured twice, so a node cannot
+  #   # advertise Linux and start macOS builds.
+  #   environment_type: LINUX_CONTAINER
+  #
+  #   # DOCKER NEEDS IT, and only a CONTAINER environment has it to give: an EC2 or
+  #   # macOS environment IS the machine, so setting it there is refused rather than
+  #   # ignored. A real Actions workflow reaches `docker build` almost immediately,
+  #   # so a container tier without this fails on its first Docker step.
+  #   privileged_mode: true
+  #
+  #   # NO DEFAULT, AND ITS ABSENCE IS A REFUSAL. Nothing about billet changes when
+  #   # you set it; what it buys is that somebody read the two ceilings above before
+  #   # a tier advertised capacity, rather than meeting the first one as a build
+  #   # that died at hour 36.
+  #   accept_external_build_ceiling: true
+  #
+  #   # FORK PULL-REQUEST WORK RUNS ONLY IF THESE ARE SET, and only on an on-demand
+  #   # container tier. An on-demand Linux build is a freshly-booted machine
+  #   # destroyed with the build (measured: 31 builds, 31 distinct hosts, nothing
+  #   # surviving between them), so it is a per-job boundary the way an ec2 instance
+  #   # is — but a build container isolates the kernel, not the network, so untrusted
+  #   # work needs a vpc that reaches only what a stranger's code should. THEIR
+  #   # ABSENCE IS THE REFUSAL, the same rule as node.ec2.untrusted_security_group_ids.
+  #   #
+  #   # Unlike ec2, the network lives on the PROJECT (StartBuild has no vpc override),
+  #   # so these must be exactly what the project was created with — the fleet-codebuild
+  #   # terraform module wires that — and billet verifies the project carries them
+  #   # before it starts a fork's build. Refused beside fleet_arn or a reserved
+  #   # environment_type: a reserved instance is shared between builds, and macOS is
+  #   # reserved-only, so no network isolates a fork there.
+  #   # untrusted_vpc_id: vpc-0fork
+  #   # untrusted_subnets: [subnet-0fork1, subnet-0fork2]
+  #   # untrusted_security_group_ids: [sg-0fork]
+  #
+  #   # THE OPERATOR'S NUMBERS, not billet's. billet adds no deadline of its own and
+  #   # no drain or upgrade ever stops a build for taking too long. build_timeout
+  #   # also SIZES THE INVENTORY WALK: CodeBuild cannot list only active builds, so
+  #   # reconciliation walks recent history and stops once every build it sees is
+  #   # older than the service could still be running. A tighter ceiling is a
+  #   # cheaper sweep. Both default to CodeBuild's own maxima.
+  #   # build_timeout_minutes: 2160
+  #   # queued_timeout_minutes: 480
+  #
+  #   # WHERE THE SINGLE-USE RUNNER REGISTRATION IS STAGED. It goes into an SSM
+  #   # Parameter Store SecureString and reaches the build as a PARAMETER_STORE
+  #   # environment variable, so the registration never appears in a command line, a
+  #   # buildspec, a log, the CodeBuild console, build metadata or CloudTrail's
+  #   # request rendering — only the parameter's NAME does.
+  #   #
+  #   # A LITERAL, NEVER A WILDCARD: it lands in an IAM Resource ARN, so a `*`
+  #   # widens both roles' grants to sibling paths — which on a shared account are
+  #   # other deployments' runner registrations.
+  #   jit_parameter_path: /billet/linux/jit
+  #
+  #   # A PER-DEPLOYMENT KEY, worth setting on a shared account. Without one a
+  #   # SecureString is encrypted under the account's aws/ssm key, which authorizes
+  #   # any principal in the account that can reach Parameter Store — so a
+  #   # neighbouring deployment's role could read this one's staged registrations.
+  #   # jit_kms_key_id: arn:aws:kms:us-west-2:123456789012:key/...
+  #
+  #   # WHERE THE BUILDS' LOGS GO, and billet pins it on EVERY launch rather than
+  #   # leaving the project's own configuration to decide. Left unset, billet pins
+  #   # CodeBuild's own default for the project (/aws/codebuild/<project>), so the
+  #   # ordinary case needs nothing here.
+  #   #
+  #   # IT IS PINNED BECAUSE THE BUILD ROLE'S GRANT IS SCOPED TO THIS GROUP'S ARN.
+  #   # An adopted or hand-edited project carrying a different group would otherwise
+  #   # get a policy for one group while its builds wrote to another, and the role
+  #   # could not write its own logs. Set this to route logs somewhere else; that
+  #   # keeps the setting and the grant in one file rather than two.
+  #   # log_group: /aws/codebuild/billet-linux
+  #
+  #   # THE COMPUTE TYPES BILLET MAY BUY, each declaring what it holds — the same
+  #   # rule ec2.instance_types follows, and for the same reason: billet ships no
+  #   # table of them, and being out of date means starting a build smaller than the
+  #   # lease already escrowed against it. The ORDER is a preference, and a fallback
+  #   # matters MORE here than on ec2: CodeBuild's concurrent-build quota is per
+  #   # environment AND compute type, and the account default is ONE.
+  #   compute_types:
+  #     - type: BUILD_GENERAL1_MEDIUM
+  #       vcpu: 4
+  #       memory: 7GiB
+  #       price_usd_per_hour: 0.01
+  #     - type: BUILD_GENERAL1_LARGE
+  #       vcpu: 8
+  #       memory: 15GiB
+  #       price_usd_per_hour: 0.02
+  #
+  #   # RESERVED CAPACITY, which macOS requires and which is a STANDING COST rather
+  #   # than a per-job one: a fleet carries an initial per-instance charge and bills
+  #   # for as long as it is provisioned, whether or not anything is building. A
+  #   # fleetOverride also makes CodeBuild ignore the project's VPC configuration, so
+  #   # the fleet's own network is the one that governs.
+  #   #
+  #   # A macOS node also needs nodes[].macos_vm_limit set to the fleet's capacity:
+  #   # billet will not assume Apple's per-host allowance of 2 applies to a fleet AWS
+  #   # operates under its own agreement, so it asks for the number instead.
+  #   # fleet_arn: arn:aws:codebuild:us-west-2:123456789012:fleet/billet-macos
+
+  # THE AWS-LOCAL CACHE STORE, for an EC2 node in an `ebs-s3` site. EBS carries
+  # encrypted block generations and S3 carries the small fenced pointer. The
+  # bucket is not a data path: cache bytes never leave the availability zone.
+  # Every resource is tagged with this deployment identity, and orphan cleanup
+  # refuses anything it does not own.
+  #
+  # The node role needs ec2:CreateVolume, ec2:DeleteVolume, ec2:CreateSnapshot,
+  # ec2:DeleteSnapshot, ec2:DescribeVolumes, ec2:DescribeSnapshots, ec2:CreateTags,
+  # ec2:AttachVolume and ec2:DetachVolume. It also needs s3:GetObject and
+  # s3:PutObject for the prefix, plus s3:ListBucket constrained to that prefix.
+  # Constrain EBS deletion by sh.billet.owner and sh.billet.cache-owner tag
+  # conditions too; billet rechecks them in code, while IAM is the account-level
+  # boundary if state is corrupted or a future caller supplies the wrong id.
+  #
+  # ebs_s3:
+  #   region: us-west-2
+  #   # Must be the availability zone of node.ec2.subnet_id; EBS cannot attach
+  #   # a volume across zones.
+  #   availability_zone: us-west-2a
+  #   bucket: billet-cache-example
+  #   prefix: production
+  #   # Encrypt EBS volumes and snapshots with this customer-managed key. Empty
+  #   # uses the account's default EBS key. S3 pointer objects use SSE-S3.
+  #   # kms_key_id: arn:aws:kms:us-west-2:123456789012:key/...
+  #
+  # The EC2 guest reaches the same per-job API over HTTPS. The certificate must
+  # name cache.aws.example and its issuer must already be trusted by the AMI —
+  # bake that issuer into the image's host trust store with
+  # `billet ami build --ca-cert <issuer.pem>`. Restrict the listener to the runner
+  # security groups: the bearer is scoped to one instance and five slots, but it
+  # is still a credential.
+  #
+  # cache:
+  #   listen: 10.0.1.10:7718
+  #   guest_endpoint: https://cache.aws.example:7718
+  #   tls_cert: /etc/billet/cache/tls.crt
+  #   tls_key: /etc/billet/cache/tls.key
+
+# Tiers are yours to define — this is not a fixed catalog. The label is what
+# users put in `runs-on`.
+tiers:
+  # SEVERAL SIZES OF ONE TIER, WITHOUT WRITING EACH ONE OUT.
+  #
+  # A real deployment wants a small, a medium and a large of the same thing, and
+  # each of those is about fifteen lines that differ in two numbers and a label.
+  # `sizes` writes the other thirteen:
+  #
+  #   - label: web
+  #     provider: docker
+  #     trust: trusted
+  #     runner_group: billet
+  #     workflows: ["acme/repo/.github/workflows/ci.yml@refs/heads/main"]
+  #     image: ghcr.io/actions/actions-runner:latest
+  #     sizes: [2, 4, 8]           # -> web-2vcpu, web-4vcpu, web-8vcpu
+  #     memory_per_vcpu: 4GiB      # optional; 4GiB is the default
+  #
+  # IT IS A TEMPLATE, NOT A RANGE. Each size becomes a real, separate tier with
+  # its own label, its own scale set and its own escrow — because that is exactly
+  # what it was when it was written out by hand. Everything else the entry says
+  # reaches every expansion, including the whole trust policy.
+  #
+  # `vcpu` and `memory` are REFUSED beside it: two spellings of one value is a
+  # mistake this file has already made three times, and it is silent every time.
+  # A macOS tier cannot be expanded at all — each expansion would inherit its
+  # host's whole guest allowance and together they would exceed it, so the shares
+  # are yours to divide with an explicit max_concurrent each.
+  #
+  # REMEMBER THE SHARED BUDGET BELOW. Every tier escrows one discovery slot
+  # before it advertises, so a ladder of three is three slots held before any job
+  # arrives, and `billet check` prints how much of the machine that is.
+
+  # RESERVING A FLOOR. Every tier shares one budget, and headroom is whatever is
+  # left — so a tier with steady demand can hold all of it. The others then
+  # advertise zero capacity, their jobs queue at GitHub indefinitely, and nothing
+  # in billet is behaving incorrectly. A tier with small instances wins that race
+  # simply by fitting more often.
+  #
+  #   reserved: 2     # always keep room for 2 of these, however busy the rest is
+  #
+  # It is a FLOOR, where max_concurrent is a ceiling — the difference between
+  # limiting a tier and guaranteeing one. A reservation is deducted from what
+  # other tiers may take only while it is UNMET; once the tier holds its floor it
+  # competes for the rest on equal terms.
+  #
+  # THE COST IS REAL. An idle listener keeps one discovery slot rather than
+  # claiming its whole floor, but the allocator still keeps every unmet reserved
+  # slot away from competing tiers. Reserve
+  # 2 slots of an 8 vCPU tier that gets no work and the machine is permanently
+  # 16 vCPU smaller, with no error and no log line.
+  #
+  # So reserve for a tier that HAS demand and is being crowded out, never for one
+  # that might someday want capacity. `billet check` prints how much of the
+  # machine is spoken for; read it before and after.
+  #
+  # Unset means no guarantee, which is the default: a floor is a promise about a
+  # machine that only its operator can make.
+
+  # ONE LABEL, TWO KINDS OF MACHINE. A tier may name several backends in
+  # preference order, so losing the box at home does not take the runs-on label
+  # down with it — jobs land on EC2 instead.
+  #
+  # THE ORDER DECIDES. The control plane picks the machine when the job is
+  # ADMITTED, walking this list most-preferred-first over the hosts that can
+  # serve the tier and have room — so a job goes to the cloud only when home is
+  # full, rather than to whichever machine happened to ask first.
+  #
+  # EACH BACKEND GETS ITS OWN LAUNCH DETAILS. A Firecracker generation and an
+  # EC2 AMI are both images, but neither backend can interpret the other's name;
+  # their runner entrypoints may differ too. Single-provider tiers keep the
+  # simpler top-level image and command fields. A multi-provider tier uses one
+  # launch entry for every provider instead.
+  #
+  # - label: billet-8vcpu-ubuntu-2404
+  #   providers: [firecracker, ec2]   # instead of `provider: firecracker`
+  #   vcpu: 8
+  #   memory: 32GiB
+  #   # Real root capacity on Firecracker and EC2. Firecracker grows only the
+  #   # per-job clone; Docker uses the host filesystem and ignores this field.
+  #   disk: 160GiB
+  #   launch:
+  #     firecracker:
+  #       image: ubuntu-2404-x64@verified
+  #     ec2:
+  #       image: ami-0123456789abcdef0
+  #       command: [/usr/local/bin/billet-runner]
+
+  - label: billet-2vcpu-ubuntu-2404
+    provider: firecracker
+    vcpu: 2
+    memory: 8GiB
+    disk: 80GiB
+    image: ubuntu-2404-x64@g1
+    # Each persistent BuildKit RUN --mount=type=cache record is reset when it
+    # grows past this size. Defaults to 20GiB; at most 100GiB.
+    buildkit_cache_mount_limit: 20GiB
+
+  - label: billet-4vcpu-ubuntu-2404
+    provider: firecracker
+    # Omitted trust safely defaults to untrusted. Interception needs a trusted
+    # pool in a non-default GitHub runner group restricted to these exact
+    # workflows; billet verifies the live group policy before every JIT mint.
+    # trust: trusted
+    # runner_group: billet-cache-trusted
+    # workflows:
+    #   - acme/api/.github/workflows/ci.yml@refs/heads/main
+    vcpu: 4
+    memory: 16GiB
+    disk: 80GiB
+    image: ubuntu-2404-x64@g1
+    # Transparent actions/cache interception is off unless explicitly enabled.
+    # Use it only on a Linux Firecracker tier backed by node.cache and a site
+    # store, after this image and runner passed cache-conformance.yml. The official
+    # toolkit CacheService client is local; BuildKit type=gha, ArtifactService,
+    # unknown clients and unknown methods remain on GitHub.
+    # intercept: true
+    # cache_scope:
+    #   owner: acme
+    #   repository: api
+    #   workflow_ref: acme/api/.github/workflows/ci.yml@refs/heads/main
+
+  - label: billet-8vcpu-ubuntu-2404
+    provider: firecracker
+    vcpu: 8
+    memory: 32GiB
+    disk: 160GiB
+    image: ubuntu-2404-x64@g1
+    # Chromium and Postgres both misbehave on the default /dev/shm.
+    shm: 1GiB
+    # Pre-booted idle VMs are likewise refused until a provider owns and accounts
+    # for them. No accepted key is allowed to be an inert cost setting.
+    # warm_pool: 2
+
+  # A tier that produces release artifacts. Interception is deliberately absent.
+  - label: billet-4vcpu-ubuntu-2404-release
+    provider: firecracker
+    vcpu: 4
+    memory: 16GiB
+    disk: 80GiB
+    image: ubuntu-2404-x64@g1
+
+# Apple Silicon, once a Mac mini joins the fleet. Such a host CAN serve both
+# macOS guests and native Linux arm64 guests, but whether it does is your
+# decision — see the nodes section below.
+#
+# YOU DO NOT HAVE TO WRITE THIS BY HAND. `billet init --provider tart
+# --node-name <this Mac>` generates the whole shape below — a pinned macOS tier,
+# an arm64 Linux one with --guest-os linux, the softnet isolation an untrusted
+# tier needs, and an image for each guest kind that billet has run a real job in.
+# What follows is what that generation looks like, and what to edit afterwards.
+#
+# Apple's licence allows at most 2 concurrent macOS guests per physical Mac, and
+# that is WHY a macOS tier has to name its host: without the name billet cannot
+# tell which Mac to count a guest against, and two macOS tiers on one machine
+# would each believe they had 2.
+#
+# THE ONE SHAPE THAT MAY LEAVE THE HOST UNNAMED is a macOS tier listing SEVERAL
+# providers — `providers: [tart, codebuild]` — so that this Mac fills to its two
+# guests and a managed fleet takes the overflow under one label. Placement counts
+# guests per host either way; what the guard needs instead of the pin is a
+# nodes[] entry for each backend's host (with macos_vm_limit for the fleet's
+# node, since Apple's number is not the fleet's), and max_concurrent then
+# defaults to what those hosts permit between them. A reservation stays pinned.
+#
+# guest_os is what the licence check keys off — not the label — so a macOS tier
+# named anything at all is still capped, and a Linux tier with "macos" in its
+# name is not.
+#
+#  - label: billet-6vcpu-macos-26
+#    provider: tart
+#    guest_os: macos
+#    node: mac-mini-1      # required: 2 macOS guests per Mac, counted per host
+#    vcpu: 6
+#    memory: 24GiB
+#    image: macos-26
+#    # Defaults to the host's macOS limit, and may not exceed it. Two macOS
+#    # tiers on one node must still sum to that limit or less.
+#
+#  - label: billet-4vcpu-ubuntu-2404-arm
+#    provider: tart
+#    guest_os: linux
+#    node: mac-mini-1
+#    vcpu: 4
+#    memory: 12GiB
+#    image: ubuntu-2404-arm64
+
+# Per-host policy, read by the control plane. Optional: omit a host entirely and
+# it is unconstrained, with Apple's standard limit of 2 macOS guests.
+#
+# Note this is the FLEET description, distinct from the `node:` section above,
+# which is how a single host describes ITSELF. Host policy has to live here
+# because it is enforced across tiers that an individual host never sees.
+#
+# Declaring `provider` lets billet tell whether an UNPINNED tier could ever land
+# on a host. Without it a macOS-only Mac cannot be distinguished from a host that
+# might receive your x64 Linux tiers, so that check stays silent — the allocator
+# still enforces the allowlist when a node is actually chosen.
+#
+# nodes:
+#   # The default arrangement: one Mac serving both guest types.
+#   - name: mac-mini-1
+#     provider: tart
+#     guest_os: [macos, linux]
+#
+#   # Dedicate a Mac to macOS. Linux Tart tiers are now a config error rather
+#   # than something that quietly queues forever.
+#   - name: mac-mini-2
+#     provider: tart
+#     guest_os: [macos]
+#
+#   # Or run one purely as an arm64 Linux builder and never boot macOS on it.
+#   # Either form works; they are equivalent.
+#   - name: mac-mini-3
+#     provider: tart
+#     guest_os: [linux]
+#   - name: mac-mini-4
+#     provider: tart
+#     macos_vm_limit: 0
+#
+#   # Keep one licensed slot free for interactive use. Lowering the limit also
+#   # lowers the default max_concurrent of every macOS tier pinned here.
+#   - name: mac-mini-5
+#     provider: tart
+#     macos_vm_limit: 1
+#
+# macos_vm_limit defaults to 2 because that is what Apple's standard licence
+# permits per Apple-branded host. billet does not know what agreement you have,
+# so raising it is allowed — but doing so is an assertion about YOUR licence,
+# not a tuning knob.
+
+# The places this deployment has compute in. Optional: a single-machine
+# deployment never writes one.
+#
+# A SITE IS WHERE COMPUTE AND ITS STORAGE SHARE A FAST NETWORK, which is the
+# answer to "which storage" — a question every cache has to have one of, because
+# a cache is fast precisely because it sits next to the machine using it.
+#
+# Declared here rather than inferred from what nodes claim, because a free
+# string cannot tell a typo from a new location: a node that means "home" and
+# types "hom" would get a site of its own, an empty cache, and every job placed
+# there running cold while the fleet looked healthy.
+#
+# A NAME IS MATCHED EXACTLY, here and in every `site:` that refers to one. That
+# includes surrounding whitespace, which billet refuses rather than trims: a name
+# quietly trimmed here and compared raw at registration is a site a node can
+# never join, and a diagnostic that shows you what you wrote is worth more than
+# one that silently corrects it.
+#
+# sites:
+#   - name: home
+#     store: ceph
+#
+# `store: ebs-s3` selects the AWS-local EBS snapshot and S3 pointer backend. A
+# cache key never crosses sites: the first AWS failover runs cold, and later jobs
+# at the same AWS site can reuse the generation it publishes.
+#
+# A tier may then insist on one, the way it can already pin a node — except a
+# site holds several machines, so it constrains WITHOUT giving up the fallback
+# that having several of them buys:
+#
+#   - label: billet-4vcpu-ubuntu-2404-home
+#     provider: firecracker
+#     site: home
+#     vcpu: 4
+#     memory: 16GiB
+#     image: ubuntu-2404-x64@g1
+
+# ── release ──────────────────────────────────────────────────────────────────
+#
+# How this deployment learns about new billet releases. Every field is optional
+# and saying nothing is the behaviour every existing install already has: follow
+# the signed stable channel, and update only when an operator asks.
+#
+# release:
+#   # The signed pointer to follow. `stable` or `candidate`. Its statement is
+#   # signed, carries an expiry and asserts that the release it names was proved
+#   # immutable — so an unsigned edit, or an old statement replayed onto the
+#   # branch that serves it, is refused rather than followed.
+#   channel: stable
+#
+#   # Or pin an exact release, which NEVER moves. A tag or a 40-character commit
+#   # SHA; "latest" and "main" are refused, because both read as versions and
+#   # neither is one. Setting this together with `channel` is an error rather
+#   # than a precedence puzzle: a deployment that did both would be following a
+#   # pointer while reporting itself pinned.
+#   # version: v0.4.0
+#
+#   # Let the control plane START a rollout by itself when the channel advances.
+#   # OFF BY DEFAULT, and not out of timidity: an automatic rollout drains hosts
+#   # and replaces binaries, and a deployment that had not decided to allow that
+#   # must not begin doing it because it upgraded to a billet that could.
+#   automatic: false
+#
+#   # When an automatic rollout may BEGIN, in UTC. It never stops one: a rollout
+#   # in progress waits for the work already running on a host for as long as it
+#   # takes, and a window that could interrupt that would be a clock authorising
+#   # a teardown. UTC rather than local, because a fleet spans machines whose
+#   # local time is not one thing — and because a local window is unstable across
+#   # a DST transition, in exactly the quiet hour somebody chose.
+#   maintenance_window:
+#     start: "02:00"
+#     end: "04:00"
+#
+#   # For a deployment mirroring billet's releases internally: what a release
+#   # manifest must be signed by. Both or neither — a SAN says who a certificate
+#   # is FOR, and the issuer says who vouched for that, so an identity with no
+#   # issuer would accept any authority able to mint that name.
+#   # signing_identity: '^https://github\.com/your-org/billet/\.github/workflows/release\.yml@refs/tags/v.*$'
+#   # signing_issuer: https://token.actions.githubusercontent.com

@@ -1,0 +1,56 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "BilletCodeBuildRun",
+      "Effect": "Allow",
+      "Action": [
+        "codebuild:StartBuild",
+        "codebuild:StopBuild"
+      ],
+      "Resource": [
+        "arn:TFPARTITION:codebuild:TFREGION:TFACCOUNT:project/TFPROJECT"
+      ]
+    },
+    {
+      "Sid": "BilletCodeBuildRead",
+      "Effect": "Allow",
+      "Action": [
+        "codebuild:BatchGetBuilds",
+        "codebuild:ListBuildsForProject",
+        "codebuild:BatchGetProjects"
+      ],
+      "Resource": [
+        "arn:TFPARTITION:codebuild:TFREGION:TFACCOUNT:project/TFPROJECT"
+      ]
+    },
+    {
+      "Sid": "BilletCodeBuildStageRegistration",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:PutParameter",
+        "ssm:DeleteParameter"
+      ],
+      "Resource": [
+        "arn:TFPARTITION:ssm:TFREGION:TFACCOUNT:parameter/TFPARAMPATH/*"
+      ]
+    },
+    {
+      "Sid": "BilletCodeBuildRegistrationKMS",
+      "Effect": "Allow",
+      "Action": [
+        "kms:Encrypt",
+        "kms:GenerateDataKey",
+        "kms:Decrypt"
+      ],
+      "Resource": [
+        "arn:TFPARTITION:kms:TFREGION:TFACCOUNT:key/TFKMSKEY"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": "ssm.TFREGION.TFDNSSUFFIX"
+        }
+      }
+    }
+  ]
+}

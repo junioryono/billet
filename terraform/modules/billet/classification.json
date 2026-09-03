@@ -1,0 +1,311 @@
+{
+  "_comment": [
+    "WHAT A CHANGE TO EACH RESOURCE COSTS A RUNNING DEPLOYMENT.",
+    "",
+    "Terraform's own plan says create / update / replace / destroy. It cannot say",
+    "which of those stops a machine that is running somebody's build, because it",
+    "does not know that billet is on these hosts — ADR-004 keeps live nodes outside",
+    "Terraform deliberately. This table is that missing half, and scripts/tfclassify",
+    "joins it to `terraform show -json` so a plan can be read before it is applied.",
+    "",
+    "THE CLASS DESCRIBES THE WORST ORDINARY CHANGE to the resource, not the change",
+    "in front of you: tfclassify takes the worse of this class and what the plan's",
+    "own actions imply, so a destroy is treated as destructive whatever is written",
+    "here. Erring high costs an operator a drain they did not need; erring low costs",
+    "somebody's build, and only one of those is recoverable.",
+    "",
+    "  in_place    nothing running is disturbed.",
+    "  replacement the resource is recreated. No running job is on it, but there is",
+    "              a window where it does not exist.",
+    "  draining    a host that may be running jobs stops, or loses something a",
+    "              running job depends on. billet's durable drain comes first, and",
+    "              a Terraform timeout is not permission to terminate a job.",
+    "  destructive data does not come back.",
+    "",
+    "EVERY MANAGED RESOURCE IN EVERY MODULE MUST HAVE AN ENTRY, and tfclass's own",
+    "test refuses a missing one — a plan reader silent about a resource it has",
+    "never heard of is a gate that passes without examining it.",
+    "",
+    "Keyed by type.name rather than by full address, because the same resource",
+    "means the same thing in whichever module declares it: the node role exists in",
+    "both fleet-ec2 and fleet-codebuild and is the identity a running instance or",
+    "build carries either way."
+  ],
+
+  "aws_instance.control_plane": {
+    "class": "draining",
+    "reason": "the controller itself. Replacing it stops the process that is polling GitHub, holding the capacity ledger and dispatching to every node.",
+    "remedy": "billet drain --wait"
+  },
+  "aws_volume_attachment.ledger": {
+    "class": "draining",
+    "reason": "detaching stops the instance first (stop_instance_before_detaching), so this is a controller outage wearing a storage change's clothes.",
+    "remedy": "billet drain --wait"
+  },
+  "aws_ebs_volume.ledger": {
+    "class": "destructive",
+    "reason": "the SQLite ledger, the deployment identity and the node-wire CA. prevent_destroy already fails the plan closed; a resize or a cross-AZ move is what gets here.",
+    "remedy": "billet local backup, then restore onto the replacement"
+  },
+  "aws_cloudwatch_metric_alarm.control_plane_recover": {
+    "class": "in_place",
+    "reason": "the EC2 auto-recovery alarm. Changing it alters what happens to a FUTURE hardware failure and disturbs nothing now."
+  },
+  "aws_security_group.control_plane": {
+    "class": "draining",
+    "reason": "replacing it detaches the group the running controller's node wire and cache endpoint are reachable on, so every node loses its control plane.",
+    "remedy": "billet drain --wait"
+  },
+  "aws_security_group.runner": {
+    "class": "draining",
+    "reason": "replacing it severs the network of every instance already running a job in it.",
+    "remedy": "billet drain --wait"
+  },
+  "aws_vpc_security_group_ingress_rule.node_wire": {
+    "class": "replacement",
+    "reason": "a port or CIDR change recreates the rule, so the node wire is briefly unreachable. Nodes redial; nothing running is destroyed."
+  },
+  "aws_vpc_security_group_ingress_rule.node_bootstrap": {
+    "class": "replacement",
+    "reason": "the enrollment port, which is shut in the steady state and used only while a machine is being added."
+  },
+  "aws_vpc_security_group_ingress_rule.ssh": {
+    "class": "replacement",
+    "reason": "SSH for configuration management. billet does not use it."
+  },
+  "aws_vpc_security_group_ingress_rule.cache": {
+    "class": "replacement",
+    "reason": "the runners' path to the cache endpoint. The cache fails open to a miss, so a gap costs cache hits rather than jobs."
+  },
+  "aws_vpc_security_group_egress_rule.control_plane_all": {
+    "class": "draining",
+    "reason": "the controller's only route to GitHub. Without it the control plane cannot poll, acquire, or report a job's completion.",
+    "remedy": "billet drain --wait"
+  },
+  "aws_vpc_security_group_egress_rule.runner_all": {
+    "class": "draining",
+    "reason": "a running job's only route out. Recreating it mid-job fails checkouts and package installs in whatever is running.",
+    "remedy": "billet drain --wait"
+  },
+  "aws_iam_role.this": {
+    "class": "draining",
+    "reason": "the standalone controller's own instance identity. Replacing it takes away the credentials the running controller is using.",
+    "remedy": "billet drain --wait"
+  },
+  "aws_iam_instance_profile.this": {
+    "class": "draining",
+    "reason": "as above: the profile the running controller obtains its credentials through.",
+    "remedy": "billet drain --wait"
+  },
+  "aws_iam_role.node": {
+    "class": "draining",
+    "reason": "the identity a running node uses to launch, reap and reach its cache. Replacing it strands compute the node can no longer account for.",
+    "remedy": "billet drain --wait"
+  },
+  "aws_iam_instance_profile.node": {
+    "class": "draining",
+    "reason": "the profile that role reaches the node through.",
+    "remedy": "billet drain --wait"
+  },
+  "aws_iam_role_policy.node": {
+    "class": "draining",
+    "reason": "an identity policy is evaluated PER REQUEST, not frozen when a session begins — so a narrowed grant lands on the launches, teardowns and registration writes billet is making for leases that are already open, and those failures are somebody's job.",
+    "remedy": "billet drain --wait"
+  },
+  "aws_iam_role.build": {
+    "class": "draining",
+    "reason": "the service role a CodeBuild build runs under. Replacing it breaks builds already executing.",
+    "remedy": "billet drain --wait"
+  },
+  "aws_iam_role_policy.build": {
+    "class": "draining",
+    "reason": "the identity a RUNNING BUILD is executing as, and an identity policy is evaluated per request rather than frozen at assume-time. An update landing after CodeBuild starts and before the build reads its staged registration leaves that job unable to register at all; one landing later revokes the log writes it is still making.",
+    "remedy": "billet drain --wait"
+  },
+  "aws_iam_role.fleet": {
+    "class": "draining",
+    "reason": "the role a reserved CodeBuild fleet's instances run under.",
+    "remedy": "billet drain --wait"
+  },
+  "aws_iam_role_policy.fleet": {
+    "class": "draining",
+    "reason": "the identity a reserved fleet's instances execute under, evaluated per request while a build is running on one.",
+    "remedy": "billet drain --wait"
+  },
+  "aws_iam_role_policy.pass_role": {
+    "class": "draining",
+    "reason": "the node's PassRole grant. Without it RunInstances is refused — so an update landing between a lease being escrowed and its instance being launched fails that job rather than a later one.",
+    "remedy": "billet drain --wait"
+  },
+  "aws_iam_role_policy.controller_sweep": {
+    "class": "in_place",
+    "reason": "the controller's list-and-delete grant on the staged-registration path. It never touches a lease that is open: the sweep acts only on one the ledger has already closed and aged past ServiceInventoryWindow, so losing it during a window fails no job — it leaves the leaked registrations a dead node stranded in place until the grant is back, and the sweep is a retry loop that finds them on its next pass."
+  },
+  "aws_iam_role_policy.backups": {
+    "class": "in_place",
+    "reason": "the controller's get/put/list grant on its own archive prefix. Updated in place."
+  },
+  "aws_iam_role_policy.spot": {
+    "class": "in_place",
+    "reason": "the node's grant on the interruption queue. Losing it during a window costs the two-minute warning and therefore the ATTRIBUTION of a spot reclaim — but AWS takes that instance either way, so the job is lost by the reclaim rather than by this change."
+  },
+  "aws_codebuild_project.this": {
+    "class": "draining",
+    "reason": "the project billet starts builds in, and half of what tells its own builds from somebody else's. Replacing it orphans every build already running in the old one.",
+    "remedy": "billet drain --wait"
+  },
+  "aws_codebuild_fleet.this": {
+    "class": "draining",
+    "reason": "reserved capacity. AWS keeps a reserved instance alive between builds, so replacing the fleet takes the machines running jobs with it.",
+    "remedy": "billet drain --wait"
+  },
+  "aws_cloudwatch_log_group.this": {
+    "class": "destructive",
+    "reason": "destroying a log group deletes the build logs in it, which are the only record of why a job failed."
+  },
+  "aws_cloudwatch_log_group.spot_router": {
+    "class": "destructive",
+    "reason": "as above, for the spot router's own logs."
+  },
+  "aws_kms_key.registrations": {
+    "class": "destructive",
+    "reason": "the key CodeBuild runner registrations are encrypted with. A destroyed key makes its ciphertext permanently unreadable."
+  },
+  "aws_kms_alias.registrations": {
+    "class": "replacement",
+    "reason": "a name for the key. The key and its ciphertext are unaffected."
+  },
+  "aws_kms_key.cache": {
+    "class": "destructive",
+    "reason": "the key the cache's EBS volumes and snapshots are encrypted with; destroying it makes every existing snapshot unreadable."
+  },
+  "aws_kms_alias.cache": {
+    "class": "replacement",
+    "reason": "a name for the key."
+  },
+  "aws_s3_bucket.cache": {
+    "class": "destructive",
+    "reason": "the cache's atomic pointer, lease and fencing state. Losing it loses which snapshot each cache generation refers to."
+  },
+  "aws_s3_bucket_public_access_block.cache": {
+    "class": "in_place",
+    "reason": "weakening it exposes the bucket, which is worth a person's attention and disturbs nothing running."
+  },
+  "aws_s3_bucket_server_side_encryption_configuration.cache": {
+    "class": "in_place",
+    "reason": "applies to objects written AFTER the change; existing objects keep the encryption they were written with."
+  },
+  "aws_s3_bucket.backups": {
+    "class": "destructive",
+    "reason": "the off-site copies of the ledger, the deployment identity, the GitHub App key and the node-wire CA. This bucket is the thing that survives losing the controller."
+  },
+  "aws_s3_bucket_versioning.backups": {
+    "class": "destructive",
+    "reason": "versioning is what makes a no-delete grant mean anything. Suspending it does not delete an archive today and removes the property that protects every archive tomorrow."
+  },
+  "aws_s3_bucket_lifecycle_configuration.backups": {
+    "class": "destructive",
+    "reason": "the retention rule. It expires NONCURRENT versions only; a rule that reached current objects would remove backups on a timer."
+  },
+  "aws_s3_bucket_public_access_block.backups": {
+    "class": "in_place",
+    "reason": "weakening it exposes two private keys and a ledger to the internet. Worth a person's attention; nothing running is disturbed."
+  },
+  "aws_s3_bucket_server_side_encryption_configuration.backups": {
+    "class": "in_place",
+    "reason": "applies to archives written after the change."
+  },
+  "aws_sqs_queue.interruptions": {
+    "class": "replacement",
+    "reason": "billet requires a spot node's node.name to equal this queue's basename, so replacing it under a different name needs the node's config changed to match before it can read its own interruptions.",
+    "remedy": "update node.name to the new spot_node_name output"
+  },
+  "aws_cloudwatch_event_rule.spot_interruption": {
+    "class": "replacement",
+    "reason": "the rule routing EC2 spot warnings to the queue. While it is absent a two-minute warning is missed and the job dies without billet recording why."
+  },
+  "aws_cloudwatch_event_target.spot_router": {
+    "class": "replacement",
+    "reason": "as above: the target the rule delivers to."
+  },
+  "aws_lambda_function.spot_router": {
+    "class": "replacement",
+    "reason": "the tag-scoped router between the event rule and the queue."
+  },
+  "aws_lambda_permission.spot_router": {
+    "class": "in_place",
+    "reason": "EventBridge's permission to invoke the router."
+  },
+  "aws_iam_role.spot_router": {
+    "class": "replacement",
+    "reason": "the router's own execution role. No job runs under it."
+  },
+  "aws_iam_role_policy.spot_router": {
+    "class": "in_place",
+    "reason": "updated in place."
+  },
+  "aws_vpc.this": {
+    "class": "draining",
+    "reason": "the network every host and every job instance is in. Replacing it replaces everything under it.",
+    "remedy": "billet drain --wait"
+  },
+  "aws_subnet.this": {
+    "class": "draining",
+    "reason": "where the controller and every runner launch. Replacing it forces the controller to be replaced with it.",
+    "remedy": "billet drain --wait"
+  },
+  "aws_internet_gateway.this": {
+    "class": "draining",
+    "reason": "the created network's only route out, which is a running job's path to GitHub.",
+    "remedy": "billet drain --wait"
+  },
+  "aws_route_table.this": {
+    "class": "draining",
+    "reason": "as above: replacing it removes the default route while it is recreated.",
+    "remedy": "billet drain --wait"
+  },
+  "aws_route.internet": {
+    "class": "draining",
+    "reason": "the default route itself.",
+    "remedy": "billet drain --wait"
+  },
+  "aws_route_table_association.this": {
+    "class": "draining",
+    "reason": "what binds the subnet to that route table.",
+    "remedy": "billet drain --wait"
+  },
+  "terraform_data.active_build_guard": {
+    "class": "in_place",
+    "reason": "a plan-time guard rather than infrastructure. It refuses the apply it is part of; it changes nothing on a host."
+  },
+  "aws_db_instance.ledger": {
+    "class": "destructive",
+    "reason": "the capacity ledger itself on the PostgreSQL profile. Replacing it does not move the rows: every lease, node registration, custody record and rollout is in this database, and a controller that comes up against an empty one re-admits capacity that is already running somebody's build. deletion_protection and a mandatory final snapshot are what make the plan fail closed rather than this entry.",
+    "remedy": "billet drain --wait, then restore from a snapshot deliberately — this is not a change to apply and watch"
+  },
+  "aws_db_parameter_group.ledger": {
+    "class": "draining",
+    "reason": "holds synchronous_commit = on, which billet checks at startup and refuses without. Its VALUE is dynamic and applies without a restart (measured: describe-engine-default-parameters reports ApplyType dynamic) — but attaching a DIFFERENT group to the instance is pending-reboot, and that reboot takes the controller's connection with it mid-transaction.",
+    "remedy": "billet drain --wait"
+  },
+  "aws_db_subnet_group.ledger": {
+    "class": "draining",
+    "reason": "which subnets the ledger is reachable in. Changing it moves the endpoint the controller is connected to.",
+    "remedy": "billet drain --wait"
+  },
+  "aws_security_group.ledger": {
+    "class": "draining",
+    "reason": "the only thing that admits the controller to its own ledger. Replacing it detaches the database from every rule referencing it, and a controller whose next write cannot reach PostgreSQL stops.",
+    "remedy": "billet drain --wait"
+  },
+  "aws_vpc_security_group_ingress_rule.ledger": {
+    "class": "draining",
+    "reason": "the controller's permission to reach the ledger, by group identity. A window with no rule is a window with no ledger.",
+    "remedy": "billet drain --wait"
+  },
+  "aws_iam_role_policy.state_secrets": {
+    "class": "draining",
+    "reason": "what lets the host read the ledger credential and assemble BILLET_STATE_DSN. IAM is evaluated per request rather than frozen when the role was assumed, so removing it takes effect on a running controller's next fetch — the same reason every other role policy here is draining rather than in_place.",
+    "remedy": "billet drain --wait"
+  }
+}

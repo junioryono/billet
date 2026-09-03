@@ -1,0 +1,2523 @@
+// Package nodeplane is the control plane's half of the node wire.
+//
+// It holds what the server knows about each registered node, hands out commands
+// to nodes that are long-polling for them, and collects the results. The
+// Runner it exposes is the same server.Runner the in-process path implements, so
+// the listener cannot tell whether the compute it is driving is a goroutine away
+// or a continent away.
+package nodeplane
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/nodeapi"
+)
+
+// ErrNoNode means no registered node can run a lease.
+//
+// Distinct from a launch failure: nothing was attempted, nothing is running, and
+// the caller may release the lease without ambiguity. That certainty is the
+// whole reason it is its own error.
+var ErrNoNode = errors.New("nodeplane: no registered node can run this lease")
+
+// ErrUnregistered means the node making a request is not known.
+var ErrUnregistered = errors.New("nodeplane: node is not registered")
+
+// ErrRefused means a registration was understood and rejected on its merits.
+//
+// PERMANENT, which is the distinction that matters: a node told this stops rather
+// than retrying, so it must never carry a failure that could heal. A version
+// mismatch and a foreign deployment qualify; a ledger that could not write the node
+// row does not — that is an outage.
+var ErrRefused = errors.New("nodeplane: registration refused")
+
+// ErrTakeCustody answers a result for a launch the plane stopped waiting for.
+//
+// THE REPORT IS NOT REJECTED, IT IS REDIRECTED. The node did the work and told the
+// truth, just later than the command timeout — by which point the plane had told the
+// listener the lease was the node's. Answering 204 would leave the container running
+// under a lease NOBODY renews, and the reaper resells that capacity a TTL later.
+var ErrTakeCustody = errors.New("nodeplane: this launch's lease is now the node's to hold")
+
+// defaultCommandTimeout bounds how long a launch waits for a node to answer.
+//
+// It is NOT a statement that nothing started. A command already handed to a node
+// may be executing while this expires, so the caller is told the outcome is
+// unknown and the lease is kept — see Runner.Launch.
+const defaultCommandTimeout = 10 * time.Minute
+
+// defaultPollTimeout bounds a command long-poll.
+//
+// Short enough that a node notices a dead connection promptly, long enough that
+// an idle fleet is not generating constant traffic. The node is told this value
+// at registration rather than choosing it, so both sides agree on when silence
+// means "nothing to do".
+const defaultPollTimeout = 50 * time.Second
+
+// Plane tracks nodes and routes commands to them.
+type Plane struct {
+	// owners records which incarnation was given the launch for each lease.
+	//
+	// A SUPERSEDED PROCESS MAY MAINTAIN WHAT IT HOLDS AND NOTHING ELSE. Routing by node
+	// name alone lets a superseded host release the current one's leases — same name,
+	// same certificate — returning capacity while a container runs.
+	//
+	// HELD ON THE PLANE, NOT THE NODE RECORD, which expires: a draining process outlives
+	// its replacement by design, so ownership tied to liveness would vanish exactly when
+	// the drain still needed to renew.
+	owners map[string]leaseOwner
+
+	log  *slog.Logger
+	now  func() time.Time
+	ttl  time.Duration
+	poll time.Duration
+	// commandTimeout bounds a caller's wait, NOT the node's work. Expiring it
+	// says the outcome is unknown, never that nothing happened.
+	commandTimeout time.Duration
+
+	mu    sync.Mutex
+	nodes map[string]*node
+	// registering counts registrations that have begun for each node but have
+	// not installed their ledger epoch and inventory yet. Beginning one clears
+	// prior absence evidence before it waits for an earlier registration, reads
+	// the store or writes an epoch.
+	registering        map[string]int
+	activeRegistration map[string]uint64
+	registrationGuards map[string]*sync.Mutex
+	nextRegistration   uint64
+	// afterRegisterNodeForTest stages the otherwise unobservable gap between a
+	// durable registration and its in-memory install. Production leaves it nil.
+	afterRegisterNodeForTest func(context.Context, string, int64)
+	// afterAuthorizeForTest runs after the wire has authorized a lease request
+	// and before it consults the ledger, so a test can stand in that window.
+	afterAuthorizeForTest func(node, leaseID string)
+
+	registrar Registrar
+	// barriers is the durable half of a compute barrier, or nil for a plane that
+	// is not asked to prove anything.
+	barriers BarrierStore
+
+	// deployment is the identity this control plane belongs to. A node carrying a
+	// different one is refused: it would label its compute with an identity this
+	// installation does not recognise, and the orphan sweeper would then find
+	// containers it cannot attribute.
+	deployment string
+
+	// sites are the places this deployment declares and the storage authority
+	// each one uses, or empty for a deployment that has not needed the distinction.
+	// See WithSites.
+	sites map[string]config.SiteStoreKind
+
+	// tiers is the deployment's catalogue and the ONE authority on what a tier
+	// is. The wire checks a JIT request against it, and a launch carries the
+	// shape a node needs so that no node keeps a copy of its own.
+	tiers map[string]config.Tier
+
+	// lateResults holds the tombstones of nodes whose record is gone — withdrawn
+	// or expired — so a result that was already on the wire when the node left
+	// is still recognised. Guarded by mu.
+	//
+	// FORGETTING A NODE DELETES ITS RECORD AND THE TOMBSTONES LIVE ON IT. A node
+	// reports before it withdraws, but a report cut on the client side by the
+	// stop signal can still be inside the handler when the withdrawal lands; and
+	// a destroy that timed out leaves nothing in flight, so the node can be
+	// expired by silence before its late answer arrives. A late SUCCESSFUL
+	// destroy is the only proof that compute is gone, and discarding it leaves
+	// the ownership record alive after the process exits — the failure
+	// re-registration keeps tombstones for. ONE BOUND FOR THE WHOLE STORE,
+	// maxAbandoned entries with the oldest evicted, because a bound per node is
+	// no bound at all across a long-lived control plane replacing hosts. The next
+	// registration under a name adopts its entries.
+	lateResults map[lateResult]abandonedCmd
+
+	// pendingGone holds hosts the plane has forgotten but the ledger has not been told
+	// about. Guarded by mu.
+	//
+	// A QUEUE RATHER THAN A RETURN VALUE, because expiry happens in places that cannot
+	// write to a database: callers reach it incidentally while holding the mutex, so
+	// handing them the fact means they drop it — and a node deleted from the map can
+	// never be rediscovered, so the ledger would believe in it forever. A failed write
+	// goes back on the queue.
+	pendingGone []goneNode
+}
+
+type registrationIntent struct {
+	generation uint64
+	guard      *sync.Mutex
+}
+
+func (p *Plane) beginRegistration(node string) registrationIntent {
+	p.mu.Lock()
+	if p.registrationGuards == nil {
+		p.registrationGuards = make(map[string]*sync.Mutex)
+	}
+	guard := p.registrationGuards[node]
+	if guard == nil {
+		guard = &sync.Mutex{}
+		p.registrationGuards[node] = guard
+	}
+	if p.registering == nil {
+		p.registering = make(map[string]int)
+	}
+	p.registering[node]++
+	if n := p.nodes[node]; n != nil {
+		n.inventoryKnown = false
+		n.inventory = nil
+	}
+	p.mu.Unlock()
+
+	// ONE NODE'S REGISTRATIONS COMMIT IN ONE ORDER. The guard is held across the
+	// ownership read, allocator epoch and plane install, so its database row and
+	// in-memory process cannot describe different registrations.
+	// Guards are per node: a slow host never stalls command traffic or another
+	// host's registration.
+	guard.Lock()
+
+	p.mu.Lock()
+	p.nextRegistration++
+	generation := p.nextRegistration
+	if p.activeRegistration == nil {
+		p.activeRegistration = make(map[string]uint64)
+	}
+	p.activeRegistration[node] = generation
+	p.mu.Unlock()
+
+	return registrationIntent{generation: generation, guard: guard}
+}
+
+func (p *Plane) finishRegistration(node string, intent registrationIntent) {
+	p.mu.Lock()
+	if p.activeRegistration[node] == intent.generation {
+		delete(p.activeRegistration, node)
+	}
+	if p.registering[node] <= 1 {
+		delete(p.registering, node)
+	} else {
+		p.registering[node]--
+	}
+	p.mu.Unlock()
+	intent.guard.Unlock()
+}
+
+// node is one registered compute host.
+type node struct {
+	name string
+	// incarnation is the node PROCESS currently registered under this name.
+	//
+	// The name is configuration and a certificate can be copied, so the name
+	// alone cannot say whether a second registration is the same host restarting
+	// or a different host arriving. This can: a restart brings a new value and
+	// the old process is gone, while a duplicate brings a new value and the old
+	// process keeps talking. Only the second produces requests carrying an
+	// incarnation that is no longer current, and those are refused.
+	incarnation string
+	provider    config.ProviderKind
+	guestOS     []config.GuestOS
+	// wireVersion is the version registration settled on with this incarnation.
+	//
+	// KEPT HERE NOW THAT DISPATCH DECIDES FROM IT. It used to be deliberately
+	// absent — the ledger is what `billet status` reads, and this map is not
+	// visible from another process — but the compute barrier must not send an
+	// inventory command to a host whose wire has none, and that choice is made
+	// here, while the queue is held.
+	wireVersion int
+	lastSeen    time.Time
+	// inventoryKnown says this incarnation supplied the complete provider inventory
+	// in inventory. The set is evidence about one lease only by membership, never
+	// merely because some inventory exists.
+	inventoryKnown bool
+	inventory      map[string]bool
+
+	// ledgerEpoch is the fencing token the ledger gave this registration.
+	//
+	// Carried so expiry can say WHICH incarnation it is giving up on. Without it
+	// a "this node is gone" written after the host has already come back would
+	// mark the live one dead — registration commits to the ledger before taking
+	// this mutex, so that ordering is reachable rather than theoretical.
+	ledgerEpoch int64
+
+	// queue holds commands not yet handed to the node.
+	queue []*pending
+	// inflight holds commands handed over but not yet answered, by command id.
+	//
+	// Kept SEPARATE from the queue so a redelivery is a deliberate act rather
+	// than an accident of leaving things on a list. A command moves back only if
+	// the node reconnects and asks for it again.
+	inflight map[string]*pending
+
+	// abandoned holds launches the plane stopped waiting for, by command id, with
+	// the moment it gave up.
+	//
+	// A TOMBSTONE, and what it records is the lease changing hands. Abandoning a
+	// delivered launch tells the listener the node has custody; if that launch
+	// then succeeds and reports, this is the only thing left that can tell the
+	// node it owns what it started.
+	abandoned map[string]abandonedCmd
+
+	// waiting is signalled when a command arrives for a node that is polling.
+	waiting chan struct{}
+
+	// waiters counts pollers parked on this node, so a test can synchronise on a
+	// poll that is genuinely blocked rather than on a sleep.
+	waiters int
+}
+
+// lateResult keys a tombstone that has outlived its node record.
+type lateResult struct {
+	node string
+	id   string
+}
+
+// abandonedCmd is a command the plane stopped waiting for.
+//
+// The KIND and the REQUEST matter, not just the fact. A late launch result hands
+// the node custody; a late DESTROY result is the opposite — it is the only proof
+// that compute is gone, and discarding it left the plane reporting custody
+// forever for a container that no longer existed.
+type abandonedCmd struct {
+	kind nodeapi.CommandKind
+	// incarnation is the process that TOOK the command, without which a late result
+	// cannot be attributed.
+	//
+	// A destroy answered by a process that is not the owner proves nothing about the
+	// owner's container: A owns a running container, B supersedes A and takes a
+	// destroy, truthfully finds nothing, and C supersedes B before B reports. B's late
+	// success would end A's ownership, and the next completion would accept a no-op
+	// destroy and release capacity while A's container still runs.
+	incarnation string
+	requestID   int64
+	at          time.Time
+}
+
+// rememberAbandoned records a command the plane gave up waiting for.
+func (n *node) rememberAbandoned(cmd nodeapi.Command, takenBy string, at time.Time) {
+	// ONLY THE KINDS WHOSE LATE ANSWER MEANS SOMETHING. A sweep or a tend result
+	// arriving late tells the plane nothing it acts on, and letting them share a
+	// bounded budget with launches and destroys let a burst of them EVICT a
+	// safety-critical entry: the launch that then reported success was answered
+	// with an ordinary 204, so the node never adopted the lease the listener had
+	// already stopped renewing, and it expired under a running container.
+	if cmd.Kind != nodeapi.CommandLaunch && cmd.Kind != nodeapi.CommandDestroy {
+		return
+	}
+
+	if n.abandoned == nil {
+		n.abandoned = make(map[string]abandonedCmd)
+	}
+
+	if len(n.abandoned) >= maxAbandoned {
+		// Drop the oldest. The newer entries are the launches still likely to
+		// report, and an unbounded map on a node whose every launch outlasts the
+		// command timeout is a slow leak in the one process that must not fall over.
+		var (
+			oldest string
+			when   time.Time
+		)
+
+		for id, entry := range n.abandoned {
+			if oldest == "" || entry.at.Before(when) {
+				oldest, when = id, entry.at
+			}
+		}
+
+		delete(n.abandoned, oldest)
+	}
+
+	n.abandoned[cmd.ID] = abandonedCmd{
+		kind:        cmd.Kind,
+		incarnation: takenBy,
+		requestID:   cmd.RequestIDOf(),
+		at:          at,
+	}
+}
+
+// pending is a command and the caller waiting for its result.
+type pending struct {
+	cmd  nodeapi.Command
+	done chan nodeapi.CommandResult
+	// expectedProvider is the immutable backend placement selected. Registration
+	// may update the node object before this command is queued; dispatch refuses
+	// that stale choice rather than sending one backend's launch shape to another.
+	expectedProvider config.ProviderKind
+	// expectedIncarnation fences a bound destroy to the process that adopted its
+	// lease. A replacement sharing the node name must never take that command.
+	expectedIncarnation string
+	// expectedLedgerEpoch fences a compute-barrier inventory to the registration
+	// whose epoch the caller captured. Zero means the command does not care.
+	//
+	// REGISTRATION COMMITS THE LEDGER EPOCH BEFORE IT INSTALLS THE NEW
+	// INCARNATION, and those are deliberately not one act — the ledger write must
+	// not happen under this mutex. So there is a window in which the ledger reads
+	// the NEW epoch while the plane still routes to the OLD process, and a
+	// barrier that captured the fence in it would credit that process's answer to
+	// a registration it never belonged to. Two hosts sharing one name is the case
+	// that makes it matter: the run's two ends would come from two machines.
+	expectedLedgerEpoch int64
+	// incarnation is the node PROCESS that took this command.
+	//
+	// The node NAME is not enough. A superseded process and its replacement share
+	// a name and a certificate, so an entitlement looked up by name hands one
+	// process the other's work — and the JIT route, which must stay open so a
+	// launch already under way can finish, is exactly where that matters.
+	incarnation string
+	// delivered records that a node took this command. After that point a
+	// timeout is AMBIGUOUS rather than a failure, because the node may be acting
+	// on it right now.
+	delivered bool
+}
+
+// leaseOwner is the node process responsible for a lease.
+type leaseOwner struct {
+	node        string
+	incarnation string
+	// requestID is the job this lease was launched for, so the destroy that ends
+	// an ordinary job can end its ownership too. That destroy is the only signal
+	// the wire gets: the lease itself is released in-process by the listener.
+	requestID int64
+}
+
+// Option configures a Plane.
+type Option func(*Plane)
+
+// WithClock replaces the clock, for tests.
+func WithClock(now func() time.Time) Option { return func(p *Plane) { p.now = now } }
+
+// CurrentIncarnationForTest reports the process a node's name currently
+// resolves to on this plane, or "" for a node it does not know.
+func (p *Plane) CurrentIncarnationForTest(name string) string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if n := p.nodes[name]; n != nil {
+		return n.incarnation
+	}
+
+	return ""
+}
+
+// ForgetForTest drops a node, as a control-plane restart would.
+//
+// Exported for tests only. It stages the one state a node cannot produce for
+// itself: being unknown to a server that is still answering, which is what makes
+// its next write fail with "register again" rather than with a transport error.
+func (p *Plane) ForgetForTest(name string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	delete(p.nodes, name)
+}
+
+// ReconciledForTest reports whether the live incarnation has vouched for a
+// complete inventory.
+//
+// Exported for tests because the state it exposes is otherwise invisible from
+// outside the package and is what a refusal must not disturb: only a SUCCESSFUL
+// registration restores it, and a completion may settle a lease from absence
+// only while it holds.
+func (p *Plane) ReconciledForTest(name string) bool { return p.reconciledNode(name) }
+
+// OwnsForTest reports whether a process is recorded as a lease's owner.
+func (p *Plane) OwnsForTest(leaseID, node, incarnation string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	owner, ok := p.owners[leaseID]
+
+	return ok && owner.node == node && owner.incarnation == incarnation
+}
+
+// WaitersForTest reports how many pollers are parked on this node.
+//
+// Exported for tests so they can synchronise on a poll that is genuinely WAITING
+// rather than sleeping and hoping — the difference between testing what happens
+// to a woken poll and testing what happens to a poll that never blocked.
+func (p *Plane) WaitersForTest(name string) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	n, ok := p.nodes[name]
+	if !ok {
+		return 0
+	}
+
+	return n.waiters
+}
+
+// QueuedForTest reports how many commands are waiting to be taken.
+//
+// Exported for tests only. Expiry and dispatch race unless a test can see that
+// the command it queued has actually arrived, and polling for that is the only
+// way to make the ordering deterministic without inventing a hook production
+// would never use.
+func (p *Plane) QueuedForTest(name string) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	n, ok := p.nodes[name]
+	if !ok {
+		return 0
+	}
+
+	return len(n.queue)
+}
+
+// SetPollWindowForTest shortens the long-poll window.
+//
+// Exported for tests only, and named so nobody mistakes it for configuration:
+// the window is part of the contract a node is told at registration, so a
+// deployment that wants a different one changes it in one place rather than
+// having each side pick.
+func (p *Plane) SetPollWindowForTest(d time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.poll = d
+}
+
+// WithCommandTimeout bounds how long a launch waits for its result.
+func WithCommandTimeout(d time.Duration) Option {
+	return func(p *Plane) {
+		if d > 0 {
+			p.commandTimeout = d
+		}
+	}
+}
+
+// New builds a Plane.
+func New(log *slog.Logger, deployment string, leaseTTL time.Duration, opts ...Option) *Plane {
+	p := &Plane{
+		log:            log,
+		now:            time.Now,
+		ttl:            leaseTTL,
+		poll:           defaultPollTimeout,
+		nodes:          map[string]*node{},
+		deployment:     deployment,
+		commandTimeout: defaultCommandTimeout,
+	}
+
+	for _, o := range opts {
+		o(p)
+	}
+
+	return p
+}
+
+// Watch expires silent nodes until the context ends.
+//
+// A TIMER, BECAUSE NOTHING ELSE ASKS. A node's liveness decides what its tier
+// ADVERTISES, and an idle deployment never picks a node, lists the fleet or
+// destroys anything — so expiry driven only by those would leave a host that
+// crashed on a quiet afternoon advertising its capacity until somebody happened
+// to launch something.
+//
+// Half the silence window, so a node is noticed within about one and a half of
+// them rather than up to two.
+func (p *Plane) Watch(ctx context.Context) {
+	every := p.staleAfter() / 2
+	if every <= 0 {
+		return
+	}
+
+	t := time.NewTicker(every)
+	defer t.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			p.mu.Lock()
+			p.expireStaleLocked()
+
+			pending := p.pendingGone
+			p.pendingGone = nil
+			p.mu.Unlock()
+
+			if failed := p.recordGone(ctx, pending); len(failed) > 0 {
+				// BACK ON THE QUEUE. A database that was briefly unavailable must not
+				// cost the ledger a permanent belief in a machine that is gone.
+				p.mu.Lock()
+				p.pendingGone = append(failed, p.pendingGone...)
+				p.mu.Unlock()
+			}
+		}
+	}
+}
+
+// liveNode returns one host if it is currently live, or nil.
+//
+// Expiry runs first, so a name that belongs to a machine the plane has given up
+// on answers nil rather than a corpse — which is the whole reason a destroy
+// cannot simply trust a name it was handed.
+func (p *Plane) liveNode(name string) *node {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.expireStaleLocked()
+
+	return p.nodes[name]
+}
+
+// reconciledNode reports whether the current live incarnation vouched for a
+// complete inventory during registration.
+func (p *Plane) reconciledNode(name string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.expireStaleLocked()
+	n := p.nodes[name]
+
+	return n != nil && n.inventoryKnown
+}
+
+// goneNode is a host the plane has given up on, with the epoch it had.
+//
+// The epoch travels with the name because by the time this is written the node
+// may have registered again — a fast restart — and the write must then match
+// nothing rather than kill the incarnation that replaced it.
+type goneNode struct {
+	name  string
+	epoch int64
+}
+
+// recordGone tells the ledger about hosts the plane has forgotten.
+//
+// OUTSIDE p.mu, which is the whole reason expiry reports rather than writes: a
+// database write while holding that mutex stalls every launch and every poll for
+// as long as the database takes.
+//
+// Best effort. A failure leaves the ledger believing in a node for longer than
+// it should — corrected by the next registration, the next tick, or a restart —
+// and there is nobody here to return an error to.
+func (p *Plane) recordGone(ctx context.Context, gone []goneNode) []goneNode {
+	if p.registrar == nil {
+		return nil
+	}
+
+	var failed []goneNode
+
+	for _, g := range gone {
+		if err := p.registrar.NodeGone(ctx, g.name, g.epoch); err != nil {
+			p.log.Warn("could not record that a node is gone; retrying, and its capacity "+
+				"stays advertised until that succeeds",
+				"node", g.name, "error", err)
+
+			failed = append(failed, g)
+		}
+	}
+
+	return failed
+}
+
+// Registrar is the ledger's node table.
+//
+// A NODE IS NOT REGISTERED UNTIL THE LEDGER SAYS SO. The plane's own map decides
+// where commands go; the allocator's node row is what Bind checks before it will
+// place a lease. Registering in one and not the other produced a node that took
+// commands and then had every Bind refused — which looked like a broken node
+// rather than a missing row.
+type Registrar interface {
+	// RegisterNode records the host and returns the row's new fencing epoch, which
+	// NodeGone must present to prove which incarnation it is talking about.
+	RegisterNode(ctx context.Context, reg alloc.NodeRegistration) (int64, error)
+
+	// NodeGone records that this control plane has given up on a host. Fenced on
+	// the epoch, so an expiry that lands after the node has already come back
+	// matches nothing.
+	NodeGone(ctx context.Context, name string, epoch int64) error
+
+	// NodeWithdrawn records that a host said it is leaving, fenced on the epoch
+	// AND the incarnation, and answers alloc.ErrWithdrawalStale when the fence
+	// has moved. It releases nothing and marks no disruption; see Plane.Withdraw.
+	NodeWithdrawn(ctx context.Context, name string, epoch int64, incarnation string) error
+
+	// ForgetEveryNode marks the whole fleet unreachable, for a plane that has just
+	// started and has no judgement about anything yet.
+	ForgetEveryNode(ctx context.Context) error
+
+	// BumpDispatch advances a host's durable launch-dispatch fence.
+	//
+	// ON THIS INTERFACE RATHER THAN A SEPARATE ONE, because it is not optional:
+	// the plane must be unable to hand a host a launch without advancing it. A
+	// compute barrier's acknowledgement is accepted only while that number is
+	// where it was when the barrier was issued, so a launch that skipped this
+	// would be running behind an answer somebody is about to call proof.
+	BumpDispatch(ctx context.Context, node string) (int64, error)
+
+	// ResolveQuarantineFor frees capacity held for compute a returning host says
+	// it is not running, and reports how many leases it released.
+	// The epoch fences it: an overtaken registration must not terminalize a lease
+	// a newer one has just vouched for, using a listing taken before that
+	// container was visible.
+	ResolveQuarantineFor(ctx context.Context, node string, running []string, epoch int64) (int, error)
+
+	// SettleCompletionOnTerminalLease records GitHub's outcome against a lease
+	// something else has already settled, and reports whether it was. It never
+	// terminalizes an open lease: every completion path that cannot reach the
+	// holder waits for the host's inventory, or an operator, to settle the
+	// lease and only corrects the verdict.
+	SettleCompletionOnTerminalLease(
+		ctx context.Context, leaseID string, leaseEpoch int64, outcome alloc.Phase,
+	) (bool, error)
+}
+
+// sortedSites lists the declared places in a stable order, so a refusal naming
+// what IS valid reads the same on every run.
+func sortedSites(set map[string]config.SiteStoreKind) []string {
+	out := make([]string, 0, len(set))
+	for k := range set {
+		out = append(out, k)
+	}
+
+	slices.Sort(out)
+
+	return out
+}
+
+// WithTierCatalog gives the plane the deployment's tiers.
+//
+// HELD HERE RATHER THAN ON THE NODE, because a node with its own copy needs that
+// copy to agree with the server's and nothing checks: a missing tier refuses the
+// launch loudly, but a drifted `image:` runs the wrong image silently. The plane
+// puts the shape on the launch command instead.
+func WithTierCatalog(tiers []config.Tier) Option {
+	return func(p *Plane) {
+		p.tiers = make(map[string]config.Tier, len(tiers))
+		for i := range tiers {
+			p.tiers[tiers[i].Label] = tiers[i]
+		}
+	}
+}
+
+// tierFor reports a tier from the catalogue.
+func (p *Plane) tierFor(label string) (config.Tier, bool) {
+	t, ok := p.tiers[label]
+
+	return t, ok
+}
+
+// WithSites declares the places this deployment has compute in and each site's
+// authoritative storage backend.
+//
+// THE CONTROL PLANE IS THE AUTHORITY, and this is the only place the rule can be
+// enforced: a node names a site in ITS OWN config, on another machine, in a file
+// with no reason to list the deployment's places, so it cannot check itself.
+// Every remote claim arrives at Register.
+//
+// Empty means the deployment has declared no sites, in which case a node claiming
+// one is refused: there is nothing it could correctly mean.
+//
+// A NAME IS KEYED EXACTLY AS DECLARED, and nothing here normalizes one. That is
+// the whole rule rather than an omission: config validation refuses a site name
+// with surrounding whitespace (see checkIdentityPadding), so the bytes in this
+// map are the bytes an operator wrote and the bytes Register compares req.Site
+// against. Trimming on one side of that comparison and not the other is what
+// made a site declared as " home " authorise `tiers[].site: home` at load and
+// then refuse every node reporting `home`, forever.
+func WithSites(sites []config.SiteConfig) Option {
+	return func(p *Plane) {
+		p.sites = make(map[string]config.SiteStoreKind, len(sites))
+		for _, site := range sites {
+			p.sites[site.Name] = site.Store
+		}
+	}
+}
+
+func siteAcceptsProvider(store config.SiteStoreKind, provider config.ProviderKind) bool {
+	switch store {
+	case config.SiteStoreCeph:
+		return provider == config.ProviderFirecracker
+	case config.SiteStoreEBSS3:
+		return provider == config.ProviderEC2
+	default:
+		return false
+	}
+}
+
+// WithRegistrar makes registration durable in the ledger as well as in memory.
+func WithRegistrar(r Registrar) Option { return func(p *Plane) { p.registrar = r } }
+
+// WithPollTimeout sets the long-poll window a node is told to wait out.
+//
+// It also sets how long silence has to last before a node is forgotten, and
+// therefore how often Watch looks — see staleAfter. Shortening it in a test is
+// what makes expiry observable without waiting out the real window.
+func WithPollTimeout(d time.Duration) Option {
+	return func(p *Plane) {
+		if d > 0 {
+			p.poll = d
+		}
+	}
+}
+
+// Register records a node's claim about itself.
+//
+// EVERY FIELD IS A CLAIM. What a node says about its provider and guest-OS
+// support decides only what the server will ASK it to do; it can never widen the
+// capacity ledger, whose limits come from the server's own configuration. A node
+// that lies gets commands it cannot execute and fails them, which is a bad node
+// rather than an over-committed host.
+func (p *Plane) Register(
+	ctx context.Context, req nodeapi.RegisterRequest,
+) (nodeapi.RegisterResponse, error) {
+	// BEFORE beginRegistration, WHICH IS ALREADY A MUTATION. That call clears the
+	// incumbent process's inventory, and nothing restores it until a registration
+	// SUCCEEDS — so a permanently refused request used to leave the live host's
+	// inventory unknown indefinitely, which is the one fact a completion needs
+	// before it may settle a lease from absence. Every check in checkRegistration
+	// is pure, so running it first costs nothing and makes "a refusal changes
+	// nothing" true rather than nearly true.
+	if err := p.ArrivingForRegistration(ctx, req.Node); err != nil {
+		return nodeapi.RegisterResponse{}, err
+	}
+
+	negotiated, nodeWire, err := p.checkRegistration(req)
+	if err != nil {
+		return nodeapi.RegisterResponse{}, err
+	}
+
+	intent := p.beginRegistration(req.Node)
+	defer p.finishRegistration(req.Node, intent)
+
+	return p.register(ctx, req, intent, negotiated, nodeWire)
+}
+
+// ArrivingForRegistration discards what a host had PROVED to a compute barrier,
+// and is what every registration path must call FIRST.
+//
+// BEFORE THE SEMANTIC CHECKS, AND THAT ORDERING IS THE WHOLE POINT. A
+// registration carries the host's own live inventory, and a PERMANENTLY refused
+// one — zero capacity, a protocol range this build no longer overlaps, a site
+// nobody declared — is still an authenticated host saying what it is running.
+// Refusing the request does not make that claim untrue, and the node stops
+// retrying, so a proof left standing there can stay standing forever. Rolling a
+// control plane past an old node's protocol range is exactly that shape, and it
+// is the operation during which somebody is most likely to run `local down`.
+//
+// IT IS DELIBERATELY NOT SUBJECT TO "A REFUSAL CHANGES NOTHING", which governs
+// the IN-MEMORY inventory beginRegistration clears. The two are restored
+// differently: that one comes back only from a SUCCESSFUL registration, so
+// clearing it on a doomed request leaves a live host's inventory unknown
+// indefinitely, and a completion needs it. A barrier run comes back from the
+// barrier loop asking again on its own cadence, with nobody involved — so
+// discarding one that did not need discarding costs a single round.
+//
+// SHARED BECAUSE THERE ARE TWO REGISTRATION PATHS AND ONLY ONE IS THE REAL ONE.
+// `Plane.Register` is the in-process and test entry point; every node on the
+// wire arrives through `handler.register`, which assembles the sequence itself
+// so it can read the launched leases in between. An earlier version of this ran
+// on `Plane.Register` alone and therefore never ran in production, and its test
+// passed because the test called the wrong one.
+func (p *Plane) ArrivingForRegistration(ctx context.Context, node string) error {
+	if p.barriers == nil {
+		return nil
+	}
+
+	// A FAILURE FAILS THE REGISTRATION, because the alternative is a proof
+	// surviving the arrival that contradicts it. The node retries, exactly as it
+	// does when the ledger cannot record the registration itself.
+	if err := p.barriers.InvalidateBarrierRun(ctx, node); err != nil {
+		return fmt.Errorf(
+			"nodeplane: could not discard node %q's idle proof as it re-registered: %w",
+			node, err)
+	}
+
+	return nil
+}
+
+// ArrivalWasUnreadable discards what EVERY host had proved, for an arrival whose
+// identity could not be established.
+//
+// THE LOOPBACK CASE, AND ONLY IT. That wire requires no certificate, so a
+// registration whose body will not decode — an unknown field from a node rolled
+// ahead of this control plane, an oversized body — names nobody. Those are
+// permanent refusals a node does not retry, so leaving every proof standing on
+// one is the same defect as leaving one standing, minus the ability to say whose.
+//
+// Over-invalidation is the point, and it costs one barrier round on what is by
+// definition a single-machine deployment.
+func (p *Plane) ArrivalWasUnreadable(ctx context.Context) error {
+	if p.barriers == nil {
+		return nil
+	}
+
+	if err := p.barriers.InvalidateEveryBarrierRun(ctx); err != nil {
+		return fmt.Errorf(
+			"nodeplane: could not discard the fleet's idle proofs after an unreadable "+
+				"registration: %w", err)
+	}
+
+	return nil
+}
+
+// checkRegistration decides everything about a registration that can be decided
+// from the request alone.
+//
+// PURE, AND THAT IS THE POINT. It reads the request, the deployment identity and
+// the declared sites — the last two fixed when the Plane was built — so it
+// touches no node, no lock and no ledger. That is what lets every permanent
+// refusal happen before the first mutation, and it is why the returned values
+// are handed to register rather than recomputed there: a caller cannot reach the
+// mutating half without having passed this.
+func (p *Plane) checkRegistration(req nodeapi.RegisterRequest) (int, nodeapi.Range, error) {
+	negotiated, nodeWire, err := negotiateWire(req)
+	if err != nil {
+		return 0, nodeWire, err
+	}
+
+	if req.Node == "" {
+		return 0, nodeWire, fmt.Errorf("%w: a node must have a name", ErrRefused)
+	}
+
+	if req.Deployment != p.deployment {
+		return 0, nodeWire, fmt.Errorf(
+			"%w: node %q belongs to deployment %s, this control plane is %s; a node labels its "+
+				"compute with its own identity, so accepting it would produce containers this "+
+				"installation cannot attribute",
+			ErrRefused, req.Node, req.Deployment, p.deployment)
+	}
+
+	// REFUSED HERE, PERMANENTLY, rather than by the ledger. The allocator rejects
+	// a contribution of nothing as well, but an error from the registrar is
+	// treated as an OUTAGE and answered 503, so the node retries — a node whose
+	// config offers no capacity would retry forever, every backoff, with nothing
+	// in the loop ever saying why.
+	if req.VCPU <= 0 || req.Memory <= 0 {
+		return 0, nodeWire, fmt.Errorf(
+			"%w: node %q contributes %d vcpu and %s of memory; a host that offers nothing "+
+				"can never be given work, so set node.max_vcpu and node.max_memory or leave "+
+				"them unset to contribute what the machine has",
+			ErrRefused, req.Node, req.VCPU, req.Memory)
+	}
+
+	// REFUSED RATHER THAN RECORDED, because a site nobody declared is
+	// indistinguishable afterwards from a real one. A typo becomes a place of a
+	// single machine, with a cache of its own that is always empty, and every job
+	// sent there runs cold while the fleet looks perfectly healthy.
+	//
+	// PERMANENT, like the version and deployment checks above it. The same node
+	// with the same config will be refused forever, so a node that treated this as
+	// an outage would retry until someone read a log.
+	if req.Site != "" {
+		store, declared := p.sites[req.Site]
+		if !declared {
+			if len(p.sites) == 0 {
+				return 0, nodeWire, fmt.Errorf(
+					"%w: node %q is at site %q, but this control plane declares no sites; add a "+
+						"sites block naming it, or remove node.site",
+					ErrRefused, req.Node, req.Site)
+			}
+
+			return 0, nodeWire, fmt.Errorf(
+				"%w: node %q is at site %q, which this control plane does not declare (have %s)",
+				ErrRefused, req.Node, req.Site, strings.Join(sortedSites(p.sites), ", "))
+		}
+		if !siteAcceptsProvider(store, req.Provider) {
+			return 0, nodeWire, fmt.Errorf(
+				"%w: node %q reports provider %s at site %q, whose authoritative store is %s; "+
+					"that pairing would split one site across independent cache authorities",
+				ErrRefused, req.Node, req.Provider, req.Site, store)
+		}
+	}
+
+	return negotiated, nodeWire, nil
+}
+
+// negotiateWire picks the version this registration will be served at.
+//
+// THE REFUSAL NAMES WHICH SIDE TO UPGRADE. "Upgrade whichever is older" is not
+// actionable from a log line — an operator reading it on the node still has to
+// go and find out what the control plane speaks — and the two ranges already
+// decide it, because once they do not overlap there is no third possibility.
+func negotiateWire(req nodeapi.RegisterRequest) (int, nodeapi.Range, error) {
+	self := nodeapi.Self()
+
+	// A DECLARATION THAT IS NOT A RANGE IS REFUSED BEFORE ANYTHING ELSE RUNS.
+	// Normalising it would settle on a version the peer has just said it does not
+	// implement, and registration's side effects — the ledger epoch, supersession,
+	// the inventory snapshot — all lie past this point.
+	node, declared := nodeapi.DeclaredRange(req.MinVersion, req.Version)
+	if !declared {
+		return 0, node, fmt.Errorf(
+			"%w: node %q declared protocol minimum %d and newest %d, which is not a range; "+
+				"this control plane speaks %s and cannot tell what that host implements",
+			ErrRefused, req.Node, req.MinVersion, req.Version, self)
+	}
+
+	negotiated, ok := nodeapi.Negotiate(node, self)
+	if !ok {
+		if node.Max < self.Min {
+			return 0, node, fmt.Errorf(
+				"%w: node %q speaks wire protocol %s and this control plane speaks %s; "+
+					"UPGRADE THAT NODE — its build is older than the oldest protocol this "+
+					"control plane still supports",
+				ErrRefused, req.Node, node, self)
+		}
+
+		return 0, node, fmt.Errorf(
+			"%w: node %q speaks wire protocol %s and this control plane speaks %s; "+
+				"UPGRADE THIS CONTROL PLANE FIRST — a node is never rolled ahead of it, "+
+				"because an older control plane refuses a newer node's registration before "+
+				"any version check can run",
+			ErrRefused, req.Node, node, self)
+	}
+
+	// AN ABSENT RELEASE IS DELIBERATELY NOT CHECKED HERE. Refusal is for a claim
+	// that makes a host unusable or unaccountable — no capacity, a foreign
+	// deployment, a protocol nobody shares. The release decides nothing about
+	// capacity, fencing, identity, custody or destruction, so taking a working
+	// machine out of the fleet over it would cost more than the field is worth.
+	// The version it arrived at is recorded beside it, and that is what lets the
+	// REPORT tell an old build with none to give from a current one that owes it.
+	return negotiated, node, nil
+}
+
+// maxRelease bounds a node's release claim.
+//
+// Long enough for any semver a build could carry (`v1.2.3-rc.1+build.5`) and
+// short enough that it cannot push anything else out of a status line.
+const maxRelease = 64
+
+// safeRelease reduces a node's release claim to something safe to print.
+//
+// THE RELEASE IS THE ONE FREE-FORM STRING A NODE PUTS IN AN OPERATOR'S REPORT,
+// and a node is authenticated without being trusted to be well behaved. Stored
+// verbatim it is a newline away from forging a whole row of `billet status`:
+// a laggard could render itself, or another host, as converged — in the exact
+// report an operator reads to decide whether a protocol is safe to retire.
+//
+// REDUCED RATHER THAN REFUSED, because the field authorises nothing and taking a
+// working host out of the fleet over it would cost more than it is worth. What
+// survives is a version token; everything else becomes a visible '?' rather than
+// disappearing, so a mangled claim reads as mangled instead of as a shorter
+// version somebody might believe.
+func safeRelease(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if len(trimmed) > maxRelease {
+		trimmed = trimmed[:maxRelease]
+	}
+
+	var b strings.Builder
+
+	for _, r := range trimmed {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case strings.ContainsRune(".-+_()", r):
+			b.WriteRune(r)
+		default:
+			b.WriteByte('?')
+		}
+	}
+
+	return b.String()
+}
+
+// safeDigest reduces a node's claimed manifest digest to one or to nothing.
+//
+// IT REFUSES RATHER THAN REPAIRS, WHICH IS THE OPPOSITE OF safeRelease, and the
+// difference is what the two fields DO. A release is a diagnostic: mangling an
+// odd one into a safe token keeps it printable and costs nothing. A digest is
+// COMPARED — a host whose digest disagrees with the rollout's target is blocked
+// — so a mangled one would not be a harmless string, it would be a disagreement
+// this node never claimed, and the host would be cordoned over a character.
+//
+// A sha256 has exactly one shape: 64 lowercase hex characters. Anything else is
+// not a digest, and the safe reading of "not a digest" is the one billet already
+// has for a host that cannot say — empty, which converges on the version and
+// records that nothing proved it. Uppercase is accepted and folded, because a hex
+// digest is the same digest however it was rendered and refusing over that would
+// block a host for a formatting difference.
+func safeDigest(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if len(trimmed) != sha256HexLen {
+		return ""
+	}
+
+	var b strings.Builder
+
+	for _, r := range trimmed {
+		switch {
+		case r >= '0' && r <= '9', r >= 'a' && r <= 'f':
+			b.WriteRune(r)
+		case r >= 'A' && r <= 'F':
+			b.WriteRune(r + ('a' - 'A'))
+		default:
+			return ""
+		}
+	}
+
+	return b.String()
+}
+
+// sha256HexLen is how long a sha256 is when written as hex.
+const sha256HexLen = 64
+
+// negotiatedDigest takes a manifest digest only from a pairing that has one.
+//
+// CHECKED WHERE IT IS READ, which is the rule the wire's own documentation states
+// for every field introduced above MinVersion. Below VersionNodeDigest the field
+// does not exist in the protocol this registration settled on, so a value in it
+// is not something that pairing can mean — and taking it anyway would let a
+// caller speaking wire 12 supply evidence a rollout treats as proof, or as
+// grounds to BLOCK a host. Neither is an outcome that protocol can ask for.
+//
+// DROPPED RATHER THAN REFUSED, because the absence is already a state everything
+// downstream reads correctly: a host that cannot say. Refusing the registration
+// would take a working node out of the fleet over a field that authorises
+// nothing about capacity, and the bridge runs one way — an older node is exactly
+// what a control plane is expected to keep serving.
+func negotiatedDigest(raw string, negotiated int) string {
+	if negotiated < nodeapi.VersionNodeDigest {
+		return ""
+	}
+
+	return safeDigest(raw)
+}
+
+// register performs the half of registration that MUTATES: the ledger epoch, the
+// supersession of whatever process held this name, and the inventory adoption.
+//
+// negotiated and nodeWire come from checkRegistration rather than being derived
+// here, so this cannot be reached by a request that has not already been judged.
+func (p *Plane) register(
+	ctx context.Context, req nodeapi.RegisterRequest, intent registrationIntent,
+	negotiated int, nodeWire nodeapi.Range,
+) (nodeapi.RegisterResponse, error) {
+	p.mu.Lock()
+	currentIntent := p.activeRegistration[req.Node]
+	p.mu.Unlock()
+	if currentIntent != intent.generation {
+		return nodeapi.RegisterResponse{}, fmt.Errorf(
+			"%w: a newer registration for node %q overtook this one",
+			ErrSuperseded, req.Node)
+	}
+
+	// THE LEDGER FIRST, outside the mutex but after the intent is visible. A node
+	// that appears in the plane's map but not in the allocator's node table takes
+	// commands and then has every Bind refused — the failure looks like a broken
+	// node instead of a missing row. The intent has already invalidated prior
+	// absence evidence, so a blocked epoch write cannot race an old inventory into
+	// releasing this process's live compute. A ledger refusal leaves membership
+	// unchanged and inventory unknown, so the node retries without an unsafe old
+	// snapshot becoming authoritative.
+	// Scoped outside the registrar block: a plane without one (tests, and the
+	// in-process path) has no ledger to fence against, and zero is the epoch a
+	// node that was never recorded would carry anyway.
+	var epoch int64
+
+	if p.registrar != nil {
+		reg := alloc.NodeRegistration{
+			Name:      req.Node,
+			Provider:  req.Provider,
+			Site:      req.Site,
+			VCPU:      req.VCPU,
+			Memory:    req.Memory,
+			EC2Shapes: req.EC2Shapes,
+			// A CLAIM ON SHARED CAPACITY, so the ledger adjudicates it rather than
+			// this plane: two nodes naming one reserved fleet are only visible from
+			// the node TABLE, and only inside the transaction that writes a row.
+			CodeBuildFleet: req.CodeBuildFleet,
+			Incarnation:    req.Incarnation,
+			// WHERE THE CONTROL PLANE SWEEPS for registrations a dead node left
+			// behind. The ledger validates and records it; a duplicate path is not
+			// a conflict the way a duplicate fleet is, because sweeping a path twice
+			// deletes nothing the first pass would not.
+			CodeBuildJITPath: req.CodeBuildJITParameterPath,
+			CodeBuildRegion:  req.CodeBuildRegion,
+			Release:          safeRelease(req.Release),
+			Digest:           negotiatedDigest(req.InstalledDigest, negotiated),
+			WireMin:          nodeWire.Min,
+			WireMax:          nodeWire.Max,
+			WireVersion:      negotiated,
+		}
+
+		var err error
+
+		epoch, err = p.registrar.RegisterNode(ctx, reg)
+
+		// ONE LEDGER ERROR IS A VERDICT AND THE REST ARE OUTAGES, and collapsing the
+		// two is the mistake this branch exists to avoid in both directions.
+		//
+		// A fleet another live node already draws on cannot be resolved by anything
+		// on the refused machine: the same node with the same config will be refused
+		// forever, and reporting it as an outage sends that node into a retry loop
+		// whose log says the database is unwell. So it is wrapped in ErrRefused,
+		// which stops the node with the operator's actual next step.
+		//
+		// Everything else stays UNWRAPPED, deliberately. A ledger that cannot write
+		// is an outage rather than a judgement — the same registration succeeds once
+		// the database answers — and a node that treated it as permanent would stay
+		// down after the control plane recovered.
+		switch {
+		case errors.Is(err, alloc.ErrFleetHeld):
+			return nodeapi.RegisterResponse{}, fmt.Errorf("%w: %w", ErrRefused, err)
+
+		case err != nil:
+			return nodeapi.RegisterResponse{}, fmt.Errorf(
+				"nodeplane: the ledger could not record node %q: %w", req.Node, err)
+		}
+		if p.afterRegisterNodeForTest != nil {
+			p.afterRegisterNodeForTest(ctx, req.Node, epoch)
+		}
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.activeRegistration[req.Node] != intent.generation {
+		return nodeapi.RegisterResponse{}, fmt.Errorf(
+			"%w: a newer registration for node %q overtook this one after its ledger write",
+			ErrSuperseded, req.Node)
+	}
+
+	n, ok := p.nodes[req.Node]
+	if !ok {
+		n = &node{name: req.Node, inflight: map[string]*pending{}, waiting: make(chan struct{}, 1)}
+		p.nodes[req.Node] = n
+
+		// A NAME THAT WAS FORGOTTEN TAKES ITS TOMBSTONES BACK, so a late result
+		// for a command the departed process took is settled the same way whether
+		// it arrives before or after this registration.
+		for key, entry := range p.lateResults {
+			if key.node != req.Node {
+				continue
+			}
+
+			if n.abandoned == nil {
+				n.abandoned = make(map[string]abandonedCmd)
+			}
+
+			n.abandoned[key.id] = entry
+
+			delete(p.lateResults, key)
+		}
+	}
+
+	// A REGISTRAR TOKEN NEVER MOVES BACKWARDS, and this has to be decided BEFORE
+	// anything below it runs.
+	//
+	// The per-node guard makes this defensive for the allocator used in production,
+	// but Registrar is an interface and the epoch still decides whether everything
+	// below may treat this request as current.
+	if epoch > 0 && epoch < n.ledgerEpoch {
+		p.log.Warn("ignoring a registration that was overtaken by a newer one from the same "+
+			"node; the newer process keeps its commands",
+			"node", req.Node, "arrived_at_epoch", epoch, "current", n.ledgerEpoch)
+
+		return p.wireResponse(negotiated), nil
+	}
+	if n.incarnation != "" && n.incarnation != req.Incarnation {
+		// SAID OUT LOUD, because the two causes need different fixes and look
+		// identical from here. A restart is ordinary. A SECOND HOST arriving under
+		// a name that is already taken is a configuration mistake — one bundle
+		// copied to two machines, or one name in two config files — and the first
+		// symptom otherwise is compute nobody can attribute.
+		p.log.Warn("a different process has registered under this node's name; if the previous "+
+			"one is still running, two hosts are sharing one identity and their compute "+
+			"cannot be told apart",
+			"node", req.Node, "was", n.incarnation, "now", req.Incarnation)
+	}
+
+	// A RE-REGISTRATION IS A RESTART, and its in-flight commands are lost.
+	//
+	// The node that took them is gone, so nothing will ever report their results.
+	// They are failed with custody rather than silently dropped or retried: a
+	// launch that was handed over may have started something, and the node's own
+	// recovery is what finds it. Retrying here would risk a second container for
+	// one job.
+	for id, pend := range n.inflight {
+		// TOMBSTONED, EXACTLY AS A TIMEOUT IS, AND FOR EVERY KIND.
+		//
+		// A LAUNCH in flight across a re-registration would otherwise report success
+		// afterwards, find no inflight entry and no tombstone, and be answered 204 — while
+		// the listener had already stopped heartbeating the custody it was told about.
+		//
+		// A DESTROY is the easy case to miss: the process that took it can succeed and be
+		// superseded before it reports, and discarding that late result leaves the
+		// ownership record alive after that process exits, so the plane reports custody
+		// forever for a container that has already been removed.
+		n.rememberAbandoned(pend.cmd, pend.incarnation, p.now())
+
+		p.answerLocked(pend, nodeapi.CommandResult{
+			ID:      id,
+			Custody: pend.cmd.Kind == nodeapi.CommandLaunch,
+			Error: fmt.Sprintf("node %q re-registered while this command was in flight, so its "+
+				"outcome is unknown", req.Node),
+		})
+	}
+
+	n.inflight = map[string]*pending{}
+
+	// AN EMPTY CLAIM DOES NOT TAKE THE NAME. An older node registering beside a
+	// current one would otherwise blank the stored incarnation, after which every
+	// process passes the check and the fence is gone — the same bypass as an
+	// absent header, arriving through registration instead.
+	if req.Incarnation != "" {
+		n.incarnation = req.Incarnation
+	}
+	// THE NEGOTIATED VERSION IS KEPT IN BOTH PLACES, and they answer different
+	// questions. The ledger's copy is what `billet status` reads, since that runs
+	// in a separate process with no view of this map; this copy is what dispatch
+	// consults before sending a command a host's wire may not have.
+	n.wireVersion = negotiated
+	n.provider = req.Provider
+	n.guestOS = req.GuestOS
+	n.lastSeen = p.now()
+
+	// NEVER BACKWARDS. Expiry presents this token to its fenced ledger write, so
+	// installing a stale value would leave the node live in the ledger after the
+	// plane had forgotten it.
+	if epoch > n.ledgerEpoch {
+		n.ledgerEpoch = epoch
+	}
+
+	// INVENTORY AND ITS LEDGER CONSEQUENCE LINEARIZE WITH THIS INCARNATION.
+	// A completion is allowed to treat an absent instance as gone only after the
+	// quarantine resolver has made that fact durable. Keeping the resolver under
+	// the plane lock prevents an old known-empty snapshot from being consumed
+	// while a replacement is registering or a newer inventory is being adopted.
+	n.inventoryKnown = false
+	n.inventory = nil
+	if req.InventoryKnown {
+		if p.registrar != nil {
+			if freed, err := p.registrar.ResolveQuarantineFor(
+				ctx, req.Node, req.Instances, n.ledgerEpoch); err != nil {
+				// Best effort: failing registration over accounting cleanup would keep
+				// a healthy host out of the fleet. The exact inventory is still kept,
+				// and a completion retries the same fenced reconciliation before it can
+				// accept absence.
+				p.log.Warn("could not reconcile quarantined capacity with what this host "+
+					"reports running", "node", req.Node, "error", err)
+			} else if freed > 0 {
+				p.log.Info("freed capacity held for compute this host is no longer running",
+					"node", req.Node, "leases", freed)
+			}
+		}
+		p.adoptOwnershipLocked(req.Node, req.Incarnation, req.Instances, true)
+	}
+
+	return p.wireResponse(negotiated), nil
+}
+
+// wireResponse answers a registration with the version it settled on.
+//
+// NEGOTIATED, NOT nodeapi.Version, AND FROM EVERY RETURN PATH. The overtaken
+// registration above returns early, and answering this control plane's own
+// preference there would tell a node it had agreed to a version it does not
+// implement — for the one registration that is least able to complain, since
+// nothing further in that path runs.
+func (p *Plane) wireResponse(negotiated int) nodeapi.RegisterResponse {
+	return nodeapi.RegisterResponse{
+		Version:         negotiated,
+		MinVersion:      nodeapi.MinVersion,
+		MaxVersion:      nodeapi.Version,
+		LeaseTTLSeconds: int(p.ttl.Seconds()),
+		PollSeconds:     int(p.poll.Seconds()),
+	}
+}
+
+// answerLocked delivers a result to whoever is waiting, without blocking.
+//
+// The channel is buffered and written once; a caller that has already given up
+// leaves nobody reading, and this must not stall the plane's mutex on that.
+func (p *Plane) answerLocked(pend *pending, res nodeapi.CommandResult) {
+	select {
+	case pend.done <- res:
+	default:
+	}
+}
+
+// ErrSuperseded means the request came from a node process that is no longer the
+// registered one.
+//
+// TWO HOSTS UNDER ONE NAME is what this catches, and it is the shape a copied
+// certificate bundle produces. Both authenticate — the certificate is genuine —
+// and both claim the same node. Without this the control plane's answer to
+// "whose compute is this" is whichever host polled last, and each host's
+// reconciliation reasons about leases the other one owns.
+var ErrSuperseded = errors.New("nodeplane: another process is registered as this node")
+
+// ReconcileInventory frees capacity held for compute this host says it is not
+// running.
+//
+// THE SAME PROOF AS REGISTRATION, ON A CADENCE THAT ACTUALLY MEETS IT. A lease
+// is quarantined by the reaper, whose clock is the lease TTL — and a node that
+// reconnects after a control-plane restart does so within seconds, long before
+// the leases it was holding expire. So the inventory that arrives with a
+// registration is almost always taken BEFORE the quarantine it would resolve,
+// and nothing looked again.
+//
+// Fenced by the wire rather than by an epoch: this route refuses a superseded
+// incarnation, which is a stronger statement than the registration epoch — it is
+// about the process, not the registration.
+func (p *Plane) ReconcileInventory(
+	ctx context.Context, node, incarnation string, running []string,
+) (int, error) {
+	if p.registrar == nil {
+		return 0, nil
+	}
+
+	// THE INVENTORY, ITS FENCED LEDGER DECISION AND ITS OWNERSHIP ADOPTION ARE
+	// ONE ORDERED FACT. A completion cannot consume the previous snapshot in the
+	// gap, and a replacement cannot install a new incarnation while the old one
+	// is terminalizing capacity under its epoch.
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, pending := p.registering[node]; pending {
+		return 0, fmt.Errorf(
+			"nodeplane: node %q has a registration in progress; retry this inventory after it settles",
+			node)
+	}
+
+	n, ok := p.nodes[node]
+	if !ok {
+		return 0, fmt.Errorf("%w: %s", ErrUnregistered, node)
+	}
+	if n.incarnation != "" && incarnation != "" && n.incarnation != incarnation {
+		return 0, fmt.Errorf(
+			"%w: node %q is registered by process %s and this report came from %s",
+			ErrSuperseded, node, n.incarnation, incarnation)
+	}
+
+	freed, err := p.registrar.ResolveQuarantineFor(ctx, node, running, n.ledgerEpoch)
+	if err != nil {
+		return 0, err
+	}
+	p.adoptOwnershipLocked(node, incarnation, running, true)
+
+	return freed, nil
+}
+
+// CheckIncarnation reports whether a request came from the current node process.
+//
+// COMPATIBILITY IS SCOPED TO NODES THAT HAVE NOT CLAIMED ONE, not to the REQUEST:
+// scoping it to the request would let an absent header bypass the check entirely,
+// so an older node beside a current one would never send the header and both would
+// take work as the same node forever.
+//
+// So absence is accepted only while the registered node is also absent — a fleet
+// mid-upgrade. Once a process has claimed an incarnation, every later request must
+// carry it.
+func (p *Plane) CheckIncarnation(name, claimed string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	n, ok := p.nodes[name]
+	if !ok || n.incarnation == "" || n.incarnation == claimed {
+		return nil
+	}
+
+	if claimed == "" {
+		return fmt.Errorf(
+			"%w: node %q is registered by process %s and this request carried no incarnation. "+
+				"An older billet is running under the same node name — upgrade it, or check "+
+				"for a certificate bundle copied to two machines",
+			ErrSuperseded, name, n.incarnation)
+	}
+
+	return fmt.Errorf(
+		"%w: node %q is registered by process %s, and this request came from %s. Two hosts "+
+			"are configured as the same node — check for a certificate bundle copied to both, "+
+			"or the same node.name in two config files",
+		ErrSuperseded, name, n.incarnation, claimed)
+}
+
+// ErrNotEntitled means a node asked for something no command it holds allows.
+var ErrNotEntitled = errors.New("nodeplane: this node holds no command that entitles it to that")
+
+// ownedByLocked reports whether this process is the one recorded as holding a
+// request's compute.
+//
+// A DESTROY ONLY PROVES SOMETHING ABOUT THE PROCESS THAT RAN IT. Any other
+// process answering "nothing to remove" is telling the truth about itself and
+// saying nothing about the container, which is on a machine it cannot see.
+func (p *Plane) ownedByLocked(requestID int64, node, incarnation string) bool {
+	if incarnation == "" {
+		return false
+	}
+
+	for _, owner := range p.owners {
+		if owner.requestID == requestID {
+			return owner.node == node && owner.incarnation == incarnation
+		}
+	}
+
+	// Nothing recorded, so there is nothing to contradict and nothing to end.
+	return false
+}
+
+// forgetForRequest drops the ownership of whatever lease a request was launched
+// under.
+//
+// The listener destroys a job's compute when it completes, which is the ONLY
+// signal for an ordinary successful job: its lease is then released through the
+// allocator, in-process, without ever touching this wire. Without this, every
+// completed job left an entry for the life of the installation.
+func (p *Plane) forgetForRequest(requestID int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.forgetForRequestLocked(requestID)
+}
+
+func (p *Plane) forgetForRequestLocked(requestID int64) {
+	for id, owner := range p.owners {
+		if owner.requestID == requestID {
+			delete(p.owners, id)
+		}
+	}
+}
+
+// tookCommand reports which process was handed this command.
+func (p *Plane) tookCommand(pend *pending) string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return pend.incarnation
+}
+
+// OwnerOfRequest reports which process holds the compute a request was launched
+// under, and whether that process is still the node's current one.
+//
+// A DESTROY IS ONLY CONFIRMED BY THE PROCESS THAT HAS THE CONTAINER. The wire
+// broadcasts to whoever is polling, which is the CURRENT incarnation — so a
+// superseded process draining its custody is never asked, answers nothing, and
+// its replacement reports the destroy as done because it genuinely has nothing
+// to remove. Believing that answer releases the lease under a live job.
+func (p *Plane) OwnerOfRequest(requestID int64) (RequestOwner, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	for _, owner := range p.owners {
+		if owner.requestID != requestID {
+			continue
+		}
+
+		n, live := p.nodes[owner.node]
+
+		return RequestOwner{
+			Node:        owner.node,
+			Incarnation: owner.incarnation,
+			Current:     live && n.incarnation == owner.incarnation,
+		}, true
+	}
+
+	return RequestOwner{}, false
+}
+
+// OwnerOfLease reports the process that adopted or launched one fenced lease.
+func (p *Plane) OwnerOfLease(leaseID string) (RequestOwner, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	owner, ok := p.owners[leaseID]
+	if !ok {
+		return RequestOwner{}, false
+	}
+	n, live := p.nodes[owner.node]
+
+	return RequestOwner{
+		Node: owner.node, Incarnation: owner.incarnation,
+		Current: live && n.incarnation == owner.incarnation,
+	}, true
+}
+
+// RequestOwner is the process holding a request's compute, and whether it is
+// still the one its node's commands reach.
+type RequestOwner struct {
+	Node string
+	// Incarnation is the process itself, which is what a destroy's confirmation
+	// must be compared against.
+	//
+	// CURRENCY IS A SNAPSHOT AND CANNOT BE TRUSTED LATER. It is read before the
+	// command is dispatched and can change while the command is in flight: a
+	// replacement registers, TAKES the destroy, truthfully reports it has nothing
+	// to remove, and a decision made on the earlier reading treats that as the
+	// owner confirming. The lease is released under a live container.
+	Incarnation string
+	// Current is false for a superseded process that is draining: it does not
+	// poll, so it never sees a destroy and cannot confirm one. Useful for
+	// deciding whether to bother asking, never for deciding who answered.
+	Current bool
+}
+
+// ForgetLease drops the ownership record for a lease that has ended.
+//
+// BOUNDED, because the alternative is one map entry per job for the life of the
+// installation. A node that never goes quiet is never expired, so nothing else
+// would ever remove them.
+func (p *Plane) ForgetLease(node, leaseID string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if owner, ok := p.owners[leaseID]; ok && owner.node == node {
+		delete(p.owners, leaseID)
+	}
+}
+
+// AdoptOwnership records that this process is responsible for leases the ledger
+// already places on its node.
+//
+// A CONTROL PLANE RESTART FORGETS EVERYTHING, and a superseded process then
+// cannot finish. The sequence: a node is holding compute, the plane restarts, the
+// node re-registers and adopts what it finds, a second host supersedes it — and
+// the new plane never saw the launch, so it has no owner for that lease. The
+// draining process is refused its own release, custody is never given up, and
+// the drain runs forever.
+//
+// The ledger knows what it forgot: a lease bound to this node and still open is
+// this node's, and the process registering now is the one holding it.
+func (p *Plane) AdoptOwnership(node, incarnation string, leaseIDs []string) {
+	p.AdoptOwnershipWithInventory(node, incarnation, leaseIDs, false)
+}
+
+// AdoptOwnershipWithInventory atomically restores owners and records whether
+// the registering process supplied a complete provider inventory.
+func (p *Plane) AdoptOwnershipWithInventory(
+	node, incarnation string,
+	leaseIDs []string,
+	inventoryKnown bool,
+) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.adoptOwnershipLocked(node, incarnation, leaseIDs, inventoryKnown)
+}
+
+func (p *Plane) adoptOwnershipLocked(
+	node, incarnation string,
+	leaseIDs []string,
+	inventoryKnown bool,
+) {
+	n := p.nodes[node]
+	if n == nil || n.incarnation != incarnation {
+		return
+	}
+	if inventoryKnown {
+		n.inventoryKnown = true
+		n.inventory = make(map[string]bool, len(leaseIDs))
+		for _, id := range leaseIDs {
+			n.inventory[id] = true
+		}
+	}
+
+	if p.owners == nil {
+		p.owners = make(map[string]leaseOwner, len(leaseIDs))
+	}
+
+	open := make(map[string]bool, len(leaseIDs))
+
+	for _, id := range leaseIDs {
+		open[id] = true
+
+		if incarnation == "" {
+			continue
+		}
+
+		// GAPS ONLY, never a claim. Every registration runs this, so overwriting
+		// would let a REPLACEMENT take ownership of the leases the process it
+		// superseded is still draining — which is the exact situation this exists
+		// to survive. A lease already attributed to a process stays with it; the
+		// current incarnation is permitted anyway, by name.
+		if _, taken := p.owners[id]; !taken {
+			p.owners[id] = leaseOwner{node: node, incarnation: incarnation}
+		}
+	}
+
+	// AND STALE ADOPTIONS ARE DROPPED — but ONLY adoptions.
+	//
+	// An entry adopted from a snapshot carries no request id, so nothing can ever
+	// name it again: no destroy matches it, and this map outlives node expiry. A
+	// lease that ends between the read and the adopt leaves exactly that, and
+	// repeated races accumulate them forever.
+	//
+	// A record created by DELIVERY is a different thing and must not be touched
+	// here. Absence from the snapshot does not prove terminality: LaunchedLeaseIDs
+	// reports only phases that may have compute, so a lease that was delivered and is
+	// still `assigned` is legitimately missing — and deleting its owner would let
+	// somebody else answer a destroy for a container that is about to exist.
+	//
+	// Runs even for an empty snapshot: one-to-zero is exactly the shape that
+	// strands an entry for the life of the process.
+	for id, owner := range p.owners {
+		if owner.node == node && owner.requestID == 0 && !open[id] {
+			delete(p.owners, id)
+		}
+	}
+}
+
+// MayMutateLease reports whether this process may change a lease's fate.
+//
+// THE CURRENT PROCESS, OR THE ONE THAT WAS GIVEN THE LAUNCH. Anything else is a
+// host acting on work it was never handed — which, between a superseded
+// incarnation and its replacement, means releasing capacity that another host's
+// container is still using.
+func (p *Plane) MayMutateLease(node, incarnation, leaseID string) error {
+	_, err := p.AuthorizeLease(node, incarnation, leaseID)
+
+	return err
+}
+
+// AuthorizeLease is MayMutateLease that also says WHY it admitted: true when
+// the process is the recorded owner of the lease, false when it is merely the
+// node's current process with nothing recorded against the lease.
+//
+// ONE SNAPSHOT, BECAUSE THE TWO ANSWERS DECIDE DIFFERENT THINGS. An admission
+// by ownership needs no further check; an admission by membership alone must
+// be followed by the ledger's word on where the lease is placed (or, for an
+// ended lease, whose job it was). Answering the second question from a second
+// acquisition of the lock let an owner recorded in between — a replacement
+// adopting the lease — turn "current but ownerless" into "recorded", and the
+// ledger check was skipped for a lease another host's compute was still on.
+func (p *Plane) AuthorizeLease(node, incarnation, leaseID string) (bool, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	// OWNERSHIP IS CHECKED BEFORE MEMBERSHIP, and that order is the fix. A
+	// draining process outlives its replacement by design; when the replacement
+	// goes silent the node record is forgotten, and requiring membership first
+	// refused the drain the right to renew its own lease at exactly the moment
+	// nothing else could. The lease then expired under compute that was still
+	// running.
+	owner, owned := p.owners[leaseID]
+	if owned && owner.node == node && owner.incarnation == incarnation {
+		return true, nil
+	}
+
+	// AND AN OWNER THAT NAMES ANOTHER HOST ENDS IT HERE, rather than falling
+	// through to the membership check below — which admitted any current node for
+	// any lease id, because being registered proves which host you are and says
+	// nothing about what work you were given. EntitledToLaunch draws that line for
+	// JIT credentials; this is the same line for a lease's fate.
+	//
+	// Lease ids are not secret — provider.InstanceName puts them in the runner
+	// name, which the organisation's runner list shows — so this was reachable by
+	// reading a web page: release somebody else's lease, and the ledger frees vCPU
+	// that a container on another machine is still using.
+	if owned && owner.node != node {
+		return false, fmt.Errorf(
+			"%w: lease %s was given to node %q and this request came from %q. A node may "+
+				"change the fate only of work it was handed",
+			ErrSuperseded, leaseID, owner.node, node)
+	}
+
+	n, ok := p.nodes[node]
+	if !ok {
+		return false, fmt.Errorf("%w: %s", ErrUnregistered, node)
+	}
+
+	// COMPATIBILITY IS SCOPED TO THE NODE, NOT THE REQUEST — the same correction
+	// CheckIncarnation needed last round, and I did not apply it here or to
+	// EntitledToLaunch. Accepting an empty claim unconditionally makes the header
+	// optional, and an optional fence is no fence: a superseded process simply
+	// stops sending it, reads a lease id and epoch through the open routes, and
+	// releases the replacement's lease.
+	if n.incarnation == "" || n.incarnation == incarnation {
+		return false, nil
+	}
+
+	return false, fmt.Errorf(
+		"%w: node %q is registered by process %s, this request came from %s, and that process "+
+			"was not given lease %s. A superseded process may maintain what it already holds "+
+			"and nothing else",
+		ErrSuperseded, node, n.incarnation, incarnation, leaseID)
+}
+
+// EntitledToLaunch reports whether a node is currently executing a launch for
+// this lease.
+//
+// A REGISTERED NODE IS NOT AN ENTITLED ONE, and conflating the two left the JIT
+// endpoint open to anything holding a node certificate. A registration proves
+// which host you are; it says nothing about what work you were given. Without
+// this, a compromised host could ask for runner registrations in a loop — for
+// any scale set, under any name — and start runners that billet never escrowed
+// capacity for, never tracked, and never tears down. That contradicts the one
+// containment property the design claims: that compromising a compute host does
+// not let it mint runners.
+//
+// The lease id carries the entitlement because it is already in the runner name
+// billet chooses (see provider.InstanceName), so a node can only ask for the
+// registration belonging to the launch it was actually told to perform.
+func (p *Plane) EntitledToLaunch(node, incarnation, leaseID string) (string, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	n, ok := p.nodes[node]
+	if !ok {
+		return "", fmt.Errorf("%w: %s", ErrUnregistered, node)
+	}
+
+	for _, pend := range n.inflight {
+		if pend.cmd.Kind != nodeapi.CommandLaunch || pend.cmd.Lease == nil {
+			continue
+		}
+
+		// THE PROCESS THAT WAS GIVEN THE COMMAND, not merely the node that was.
+		// The JIT route stays open to a superseded process on purpose — a launch it
+		// began must be able to finish — and looking the entitlement up by name
+		// alone would hand it the CURRENT process's work instead. A long poll
+		// admitted before supersession can still wake afterwards holding a command,
+		// so this is reachable without anything hostile happening.
+		//
+		// An EMPTY claim does not match a command that has an owner. Treating it as
+		// a wildcard made the header optional, which let a process mint the
+		// registration for somebody else's in-flight launch by simply omitting it.
+		if pend.incarnation != "" && pend.incarnation != incarnation {
+			continue
+		}
+
+		if pend.cmd.Lease.ID == leaseID {
+			// THE TIER COMES BACK, because the lease id alone is not the whole
+			// entitlement. A node holding an ordinary launch could otherwise ask for
+			// a registration in ANOTHER scale set — the lease check passes, and the
+			// runner it starts joins a tier with different labels, different jobs and
+			// possibly different secrets. The caller resolves this tier's own set and
+			// refuses anything else.
+			return pend.cmd.Lease.Tier, nil
+		}
+	}
+
+	return "", fmt.Errorf(
+		"%w: node %q was not given a launch for lease %s, so it may not mint a runner "+
+			"registration for it", ErrNotEntitled, node, leaseID)
+}
+
+// maxAbandoned bounds what one node's tombstones can cost.
+//
+// A node whose launches all outlast the command timeout would otherwise grow
+// this without limit. Losing the OLDEST entry is the right sacrifice: the newer
+// ones are the launches still likely to report.
+const maxAbandoned = 1024
+
+// Seen records that a node just spoke, whatever it said.
+//
+// EVERY REQUEST IS EVIDENCE OF LIFE. The node's command loop is synchronous, so
+// if Recover, Sweep or Tend wedges it never reaches Poll again — while its
+// custody janitor keeps heartbeating perfectly well. Taking liveness only from
+// Poll and Result would let each heartbeat run expiry, so the same call that
+// proved the node alive would declare it dead, and every later heartbeat would
+// be refused as unregistered while its leases expired.
+//
+// Command eligibility is bounded by the command timeout, which is the right
+// instrument for a node that takes work and never answers. Membership is bounded
+// by silence, which is the right instrument for a node that has gone.
+func (p *Plane) Seen(name, incarnation string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	n, ok := p.nodes[name]
+	if !ok {
+		return
+	}
+
+	// ONLY THE CURRENT PROCESS VOUCHES FOR THE NODE. A superseded one draining its
+	// custody keeps talking for as long as its job runs, and counting that as
+	// liveness kept a DEAD replacement in the fleet: the plane went on choosing
+	// that node, every launch it sent waited out the command timeout, and the
+	// tier was effectively down for the length of somebody else's job.
+	//
+	// The draining process is not being disbelieved — its heartbeats and results
+	// are still accepted. It simply is not evidence that the node is available
+	// for work, because it is the one process that has been told it is not.
+	if !currentLocked(n, incarnation) {
+		return
+	}
+
+	n.lastSeen = p.now()
+}
+
+// Nodes reports the registered node names, for diagnostics.
+func (p *Plane) Nodes() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.expireStaleLocked()
+
+	out := make([]string, 0, len(p.nodes))
+	for name := range p.nodes {
+		out = append(out, name)
+	}
+
+	return out
+}
+
+// Poll blocks until a command is available for this node, the context ends, or
+// the poll window closes.
+//
+// THE "NOTHING TO DO" CASE IS A BOOL, NOT A NIL. Returning a nil command with a
+// nil error would make the ordinary outcome of an idle fleet indistinguishable
+// from a bug at every call site, and this codebase has already rejected that
+// shape twice — in the provider's Find and in the deployment lock — for the same
+// reason: it is the return value that gets logged as a shrug.
+//
+// An empty command with ok=false is how a quiet poll ends. The node re-polls
+// immediately; that is not an error and must not be treated as one.
+func (p *Plane) Poll(ctx context.Context, nodeName, incarnation string) (nodeapi.Command, bool, error) {
+	p.mu.Lock()
+
+	n, ok := p.nodes[nodeName]
+	if !ok {
+		p.mu.Unlock()
+
+		return nodeapi.Command{}, false, ErrUnregistered
+	}
+
+	// CHECKED BEFORE EVERY HANDOVER, not only after a wait. The HTTP guard runs
+	// before this function takes the mutex, so a supersession can land in between
+	// and the fast path would hand a queued command to a process that no longer
+	// owns the name — which then becomes that lease's recorded owner and holds a
+	// genuine entitlement to mint its runner.
+	if err := supersededLocked(n, nodeName, incarnation); err != nil {
+		p.mu.Unlock()
+
+		return nodeapi.Command{}, false, err
+	}
+
+	n.lastSeen = p.now()
+
+	if cmd, took := p.takeLocked(n, incarnation); took {
+		p.mu.Unlock()
+
+		return cmd, true, nil
+	}
+
+	wait := n.waiting
+	n.waiters++
+	p.mu.Unlock()
+
+	defer func() {
+		p.mu.Lock()
+
+		if n, ok := p.nodes[nodeName]; ok {
+			n.waiters--
+		}
+
+		p.mu.Unlock()
+	}()
+
+	timer := time.NewTimer(p.poll)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return nodeapi.Command{}, false, ctx.Err()
+	case <-timer.C:
+		return nodeapi.Command{}, false, nil
+	case <-wait:
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	n, ok = p.nodes[nodeName]
+	if !ok {
+		return nodeapi.Command{}, false, ErrUnregistered
+	}
+
+	// AND AGAIN AFTER WAITING, because a long poll is admitted at the start and
+	// answered at the end, and a supersession can land between the two.
+	if err := supersededLocked(n, nodeName, incarnation); err != nil {
+		return nodeapi.Command{}, false, err
+	}
+
+	cmd, took := p.takeLocked(n, incarnation)
+
+	return cmd, took, nil
+}
+
+// currentLocked reports whether this request speaks for the node's live process.
+//
+// AN EMPTY CLAIM IS NOT CURRENT once a process has claimed the name — the third
+// place this needed saying. Treating it as eligible let a superseded process
+// drop the header and keep a dead replacement schedulable indefinitely, simply
+// by submitting results nobody asked for.
+func currentLocked(n *node, incarnation string) bool {
+	return n.incarnation == "" || n.incarnation == incarnation
+}
+
+// supersededLocked reports whether this process has lost the node's name.
+//
+// One place, so the fast path and the woken path cannot drift — they already had,
+// which is how a queued command reached a process that no longer owned the name.
+func supersededLocked(n *node, name, incarnation string) error {
+	if n.incarnation == "" || n.incarnation == incarnation {
+		return nil
+	}
+
+	return fmt.Errorf(
+		"%w: node %q is registered by process %s and this request came from %s",
+		ErrSuperseded, name, n.incarnation, incarnation)
+}
+
+// takeLocked moves the first eligible command into flight, recording who took
+// it. A launch is rendered for one provider before it enters this queue, so a
+// replacement process using another provider gets a clean failure rather than
+// a command it cannot interpret.
+func (p *Plane) takeLocked(n *node, incarnation string) (nodeapi.Command, bool) {
+	for len(n.queue) > 0 {
+		pend := n.queue[0]
+		n.queue = n.queue[1:]
+
+		if pend.expectedIncarnation != "" && pend.expectedIncarnation != incarnation {
+			p.answerLocked(pend, nodeapi.CommandResult{
+				ID: pend.cmd.ID,
+				Error: fmt.Sprintf("node %q process %s replaced the bound holder %s before taking this command",
+					n.name, incarnation, pend.expectedIncarnation),
+			})
+
+			continue
+		}
+
+		if pend.expectedProvider != "" && pend.expectedProvider != n.provider {
+			p.answerLocked(pend, nodeapi.CommandResult{
+				ID: pend.cmd.ID,
+				Error: fmt.Sprintf("node %q changed provider from %s to %s after dispatch and "+
+					"before taking this command", n.name, pend.expectedProvider, n.provider),
+			})
+
+			continue
+		}
+
+		pend.delivered = true
+		pend.incarnation = incarnation
+		n.inflight[pend.cmd.ID] = pend
+
+		// THE LEASE FOLLOWS THE PROCESS THAT WAS GIVEN IT. This is what lets a
+		// superseded incarnation keep maintaining the launch it began — and stops it
+		// touching one it was not given, which shares its node name and its
+		// certificate and is otherwise indistinguishable.
+		if pend.cmd.Kind == nodeapi.CommandLaunch && pend.cmd.Lease != nil && incarnation != "" {
+			if p.owners == nil {
+				p.owners = make(map[string]leaseOwner)
+			}
+
+			p.owners[pend.cmd.Lease.ID] = leaseOwner{
+				node:        n.name,
+				incarnation: incarnation,
+				requestID:   pend.cmd.RequestIDOf(),
+			}
+		}
+
+		return pend.cmd, true
+	}
+
+	return nodeapi.Command{}, false
+}
+
+// Result records what a node made of a command.
+func (p *Plane) Result(nodeName, incarnation string, res nodeapi.CommandResult) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	n, ok := p.nodes[nodeName]
+	if !ok {
+		// A NODE THAT IS GONE CAN STILL BE HEARD FROM ONCE: a report on the wire
+		// before a withdrawal, or the late answer to a command that had already
+		// timed out when silence forgot the node. The tombstones that outlived
+		// its record say whether this is that report, and a match is settled
+		// exactly as it would have been a moment earlier.
+		key := lateResult{node: nodeName, id: res.ID}
+
+		if entry, abandoned := p.lateResults[key]; abandoned {
+			delete(p.lateResults, key)
+
+			return p.settleAbandonedLocked(nodeName, entry, res)
+		}
+
+		return ErrUnregistered
+	}
+
+	// THE RESULT IS ACCEPTED FROM ANY PROCESS — it is the handover itself — but
+	// only the CURRENT one is evidence that this node can be given work. A
+	// superseded process draining its custody reports for as long as its job runs,
+	// and counting that as liveness kept a dead replacement in the fleet.
+	if currentLocked(n, incarnation) {
+		n.lastSeen = p.now()
+	}
+
+	pend, ok := n.inflight[res.ID]
+	if !ok {
+		// A LAUNCH THE PLANE GAVE UP ON IS DIFFERENT FROM ONE NOBODY IS WAITING
+		// FOR. Abandoning a delivered launch tells the listener "the node has
+		// custody", and the listener stops heartbeating on the strength of it. If
+		// that launch then succeeds and reports, answering with a shrug leaves the
+		// container running under a lease nothing renews.
+		if entry, abandoned := n.abandoned[res.ID]; abandoned {
+			delete(n.abandoned, res.ID)
+
+			return p.settleAbandonedLocked(nodeName, entry, res)
+		}
+
+		// Otherwise ordinary: the caller may have timed out on a command that is
+		// not a launch, or the node may be reporting again after a reconnect.
+		// Refusing would make a node retry something already accounted for.
+		return nil
+	}
+
+	delete(n.inflight, res.ID)
+
+	// OWNERSHIP OUTLIVES THE COMMAND, and tying it to the command was a way to
+	// lose a container. A launch that SUCCEEDS leaves a container running; deleting
+	// the owner then let a second host register, take the lease through
+	// AdoptOwnership, and refuse the process that is actually running it when it
+	// later takes custody. A completion routed to the new owner finds nothing,
+	// reports success, and the lease is released under a live job.
+	//
+	// So a successful launch KEEPS its owner, and the record ends where the
+	// compute does: when the listener destroys it (destroyLocked below) or the
+	// node releases it over the wire.
+	//
+	// A launch that FAILED without custody started nothing, so there is nothing
+	// left to own.
+	if pend.cmd.Kind == nodeapi.CommandLaunch && pend.cmd.Lease != nil &&
+		!res.OK && !res.Custody {
+		delete(p.owners, pend.cmd.Lease.ID)
+	}
+
+	p.answerLocked(pend, res)
+
+	return nil
+}
+
+// Withdraw takes a node out of placement because its current process said it
+// will not poll again.
+//
+// SILENCE STILL MEANS NOTHING, AND THIS IS THE ONE OTHER WAY OUT. A node that
+// drains and exits used to say nothing, and nothing here could tell a clean exit
+// from a partition — so the plane kept choosing the stopped host until
+// expireStaleLocked forgot it, and every job aimed there in that window waited
+// the window out before being placed elsewhere. A partition has to stay
+// conservative, because the compute barrier and custody both rest on it; what
+// this adds is a deliberate message from the authority on the node's own intent,
+// which is the node, and only from the process currently registered under the
+// name — a superseded process withdrawing would take its replacement out of the
+// fleet.
+//
+// LEDGER FIRST, MEMORY SECOND. Placement escrows against the ledger's live set
+// long before this map is consulted, so the durable half is the one that stops
+// the next job being aimed here; and a ledger that cannot record the withdrawal
+// leaves the node exactly where it was — placeable until the ledger answers or
+// the host goes silent — which is today's behaviour rather than a new one. The
+// write happens outside the mutex, for recordGone's reason, and the in-memory
+// removal re-checks the fence afterwards because a registration can land in
+// between. The ledger's own fence would already have refused that one; this is
+// the belt to that brace.
+//
+// ONE RACE IS LEFT OPEN, AND ITS OUTCOME IS TODAY'S. Between the two lock
+// sections the node is still in the map, so a Watch tick can expire it if it
+// has been silent for the whole window — four poll windows — during a ledger
+// write the request deadline bounds to a fraction of that. When it happens the
+// node is forgotten by silence, NodeGone records it and this returns
+// ErrSuperseded, which is exactly what a stop used to produce. A marker that
+// made expiry skip a withdrawing node would carve an exception into the silence
+// rule to close a window a healthy ledger cannot open; it is documented here
+// rather than written.
+//
+// WHAT IT DOES NOT DO. It releases no lease and appends nothing to pendingGone
+// — the ledger already knows — and it touches neither the owners map nor the
+// barrier run, exactly as expiry does not: a lease this process adopted stays
+// attributed to it, and the next registration's ArrivingForRegistration discards
+// the run. Commands the node never took are answered "nothing started", as after
+// silence; a command still in flight is tombstoned and answered as a
+// re-registration does it — unknown, custody for a launch — and the tombstones
+// outlive the node record (lateResults), because a result cut on the client
+// side by the stop signal can still be inside the handler when this runs.
+func (p *Plane) Withdraw(ctx context.Context, name, incarnation string) error {
+	p.mu.Lock()
+
+	p.expireStaleLocked()
+
+	n, ok := p.nodes[name]
+	if !ok {
+		p.mu.Unlock()
+
+		return fmt.Errorf("%w: %s", ErrUnregistered, name)
+	}
+
+	if err := supersededLocked(n, name, incarnation); err != nil {
+		p.mu.Unlock()
+
+		return err
+	}
+
+	epoch := n.ledgerEpoch
+
+	p.mu.Unlock()
+
+	if p.registrar != nil {
+		err := p.registrar.NodeWithdrawn(ctx, name, epoch, incarnation)
+
+		switch {
+		case errors.Is(err, alloc.ErrWithdrawalStale):
+			// THE LEDGER'S FENCE MOVED: the host registered again, or under another
+			// process, since this plane last recorded it. The process asking is not
+			// the one the fleet is placing on, so it has nothing to withdraw.
+			return fmt.Errorf("%w: node %q is not registered by the process that asked to "+
+				"withdraw it: %w", ErrSuperseded, name, err)
+
+		case err != nil:
+			return fmt.Errorf("nodeplane: could not record node %q's withdrawal, so it stays "+
+				"placeable until the ledger answers: %w", name, err)
+		}
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	n, ok = p.nodes[name]
+	if !ok || !currentLocked(n, incarnation) || n.ledgerEpoch != epoch {
+		return fmt.Errorf("%w: node %q registered again while its withdrawal was being "+
+			"recorded, so the registration that withdrew is not the one placement sees",
+			ErrSuperseded, name)
+	}
+
+	for id, pend := range n.inflight {
+		// TOMBSTONED AND ANSWERED AS A RE-REGISTRATION DOES IT: unknown, and custody
+		// for a launch, because a command the node took may have started something
+		// and the node's next Recover is what finds it. Reachable when the node's
+		// own report was lost — or is still inside the handler, cut on the client
+		// side by the stop signal, which is why the tombstone has to survive the
+		// record it lives on (see lateResults).
+		n.rememberAbandoned(pend.cmd, pend.incarnation, p.now())
+
+		p.answerLocked(pend, nodeapi.CommandResult{
+			ID:      id,
+			Custody: pend.cmd.Kind == nodeapi.CommandLaunch,
+			Error: fmt.Sprintf("node %q withdrew while this command was in flight, so its "+
+				"outcome is unknown", name),
+		})
+	}
+
+	// NOTHING STARTED, and the caller may act on that certainty: the node never
+	// took these, and it is not going to. The listener hands the capacity back
+	// and the job is reassigned — which is what used to happen after the silence
+	// window, now happening at once.
+	for _, pend := range n.queue {
+		p.answerLocked(pend, nodeapi.CommandResult{
+			ID: pend.cmd.ID,
+			Error: fmt.Sprintf("node %q withdrew before taking this command, so nothing "+
+				"started", name),
+		})
+	}
+
+	p.forgetNodeLocked(n)
+
+	p.log.Info("a node withdrew from the fleet; nothing is placed on it until it registers again",
+		"node", name)
+
+	return nil
+}
+
+// forgetNodeLocked removes a node's record, keeping the tombstones that must
+// outlive it. Caller holds p.mu.
+//
+// ONE PLACE FOR BOTH WAYS OUT OF THE FLEET. Withdrawal and expiry each delete
+// the record, and a late result for a command the departed process took is
+// the same proof whichever way it left; a version that preserved the
+// tombstones on one path and dropped them on the other was found in review.
+func (p *Plane) forgetNodeLocked(n *node) {
+	for id, entry := range n.abandoned {
+		p.rememberLateLocked(lateResult{node: n.name, id: id}, entry)
+	}
+
+	delete(p.nodes, n.name)
+}
+
+// rememberLateLocked keeps one tombstone past its node record, within the
+// store's bound. Caller holds p.mu.
+//
+// INSERTED FIRST, THEN THE OLDEST GOES — THE INCOMING ONE INCLUDED. A node that
+// ran for months is forgotten carrying tombstones older than anything the store
+// holds, and evicting before inserting would drop a recent destroy's proof to
+// make room for an entry that is itself the oldest. The newer entries are the
+// ones whose answer is still likely to arrive, whichever node they came from.
+func (p *Plane) rememberLateLocked(key lateResult, entry abandonedCmd) {
+	if p.lateResults == nil {
+		p.lateResults = make(map[lateResult]abandonedCmd)
+	}
+
+	p.lateResults[key] = entry
+
+	if len(p.lateResults) <= maxAbandoned {
+		return
+	}
+
+	var (
+		oldest lateResult
+		when   time.Time
+		found  bool
+	)
+
+	for k, e := range p.lateResults {
+		if !found || e.at.Before(when) {
+			oldest, when, found = k, e.at, true
+		}
+	}
+
+	delete(p.lateResults, oldest)
+}
+
+// settleAbandonedLocked answers a late result for a command the plane had
+// stopped waiting for. Caller holds p.mu.
+//
+// ONE PLACE, because it is reached from a node that is still registered and from
+// one that has withdrawn, and the two must not drift: a late successful destroy
+// is the only proof its compute is gone from either.
+func (p *Plane) settleAbandonedLocked(
+	nodeName string, entry abandonedCmd, res nodeapi.CommandResult,
+) error {
+	switch {
+	case entry.kind == nodeapi.CommandDestroy && res.OK &&
+		p.ownedByLocked(entry.requestID, nodeName, entry.incarnation):
+		// THE ONLY PROOF THE COMPUTE IS GONE, arriving late. Discarding the
+		// answer of a destroy whose process was superseded before it could
+		// report leaves the ownership record alive after that process exits,
+		// so every later destroy is answered by its replacement — which
+		// cannot confirm somebody else's ownership — and the plane reports
+		// custody forever while the listener heartbeats its capacity.
+		p.forgetForRequestLocked(entry.requestID)
+
+		return nil
+
+	case entry.kind == nodeapi.CommandLaunch && res.OK:
+		return ErrTakeCustody
+
+	case entry.kind == nodeapi.CommandLaunch:
+		// A FAILED LATE LAUNCH NEEDS NO HANDOFF: nothing is running, so there
+		// is nothing to hold — and nothing left to own either.
+		p.forgetForRequestLocked(entry.requestID)
+
+		return nil
+	}
+
+	// A destroy that FAILED leaves the compute where it was, so its owner
+	// keeps it.
+	return nil
+}
+
+// staleWindows is how many poll windows of silence mean a node is gone.
+//
+// A healthy node re-polls the moment its window closes, so several missed
+// windows is real absence rather than idleness. Generous by that measure on
+// purpose: forgetting a live node makes its next request fail with "register
+// again", which recovers in one round trip, while forgetting too slowly leaves a
+// corpse in every broadcast — and it was the corpse that caused the damage.
+const staleWindows = 4
+
+// staleAfter is how long a node may be silent before the plane forgets it.
+//
+// DERIVED FROM THE WINDOW THE NODE WAS ACTUALLY TOLD, not from the default. A
+// deployment that lengthens the poll window would otherwise have healthy nodes
+// expired during the very window the server instructed them to wait out.
+func (p *Plane) staleAfter() time.Duration {
+	window := p.poll
+	if window <= 0 {
+		window = defaultPollTimeout
+	}
+
+	return staleWindows * window
+}
+
+// expireStaleLocked drops nodes that have gone silent.
+//
+// A NODE THAT NEVER EXPIRES POISONS THE FLEET. One host unplugged a week ago
+// would stay in it, so every command aimed there waits out the full command
+// timeout and returns an error — and the listener answers a destroy error by
+// holding its lease and heartbeating it indefinitely, so a single dead machine
+// makes every later completed job leak its capacity.
+//
+// A node with commands IN FLIGHT is not expired at all — see the guard below —
+// so nothing here answers one, and custody is never transferred by expiry. What
+// is answered is the QUEUE: those commands never reached the node, so a caller
+// waiting on a machine that is gone is told plainly that nothing started.
+func (p *Plane) expireStaleLocked() {
+	cutoff := p.now().Add(-p.staleAfter())
+
+	for name, n := range p.nodes {
+		if !n.lastSeen.Before(cutoff) {
+			continue
+		}
+
+		// A NODE WITH WORK IN FLIGHT IS NOT SILENT, IT IS BUSY.
+		//
+		// The loop executes commands synchronously, so a node pulling a five-minute
+		// image does not poll while it works — and expiring it there was actively
+		// harmful rather than merely wrong. Expiring it WOULD answer an in-flight
+		// launch with custody, the listener would stop heartbeating on that, and the
+		// lease would be reaped before the provider had even returned — after which
+		// the launch starts a runner on capacity already sold to somebody else.
+		// This guard is what makes that conditional rather than what happens.
+		//
+		// The command timeout is what bounds this instead, and it is the right
+		// instrument: it is already the thing that decides how long an unanswered
+		// command may run before its outcome is called unknown. A node that is
+		// genuinely dead has its commands timed out first and becomes expirable
+		// immediately afterwards.
+		if len(n.inflight) > 0 {
+			continue
+		}
+
+		// NOTHING IN FLIGHT IS ANSWERED HERE, because the guard above means there
+		// is nothing in flight to answer. Expiry must never hand custody of a
+		// running launch to the node.
+		//
+		// Queued commands never reached it, so they are unambiguous: nothing
+		// started, and the caller may act on that certainty.
+		for _, pend := range n.queue {
+			p.answerLocked(pend, nodeapi.CommandResult{
+				ID: pend.cmd.ID,
+				Error: fmt.Sprintf("node %q went silent before taking this command, so nothing "+
+					"started", name),
+			})
+		}
+
+		p.log.Warn("forgetting a node that stopped polling; it will have to register again",
+			"node", name, "silent_for", p.now().Sub(n.lastSeen))
+
+		// REPORTED, NOT WRITTEN. The ledger has to learn this too — capacity is
+		// counted there, and a node the plane has forgotten while the ledger still
+		// believes in it goes on backing advertisements for a machine nothing can
+		// reach. But this runs holding p.mu, and a database write under that mutex
+		// stalls every launch and every poll for as long as the database takes.
+		//
+		// So the fact is handed back and Watch records it with the lock released.
+		// Callers that expire as a side effect of doing something else discard it;
+		// the timer reconciles within a tick, and until it does the ledger is
+		// merely behind rather than wrong.
+		p.pendingGone = append(p.pendingGone, goneNode{name: name, epoch: n.ledgerEpoch})
+
+		// THE TOMBSTONES OUTLIVE THE RECORD, here as on a withdrawal: a destroy
+		// that timed out is no longer in flight, so this guard does not hold the
+		// node, and its late success may still be the only proof its compute is
+		// gone. See lateResults.
+		p.forgetNodeLocked(n)
+	}
+}
+
+// pick chooses a node for a lease.
+//
+// The lease's own recorded constraints decide, not the live catalogue: TargetNode
+// pins it, Providers says what it may run on. That is the same rule Bind
+// enforces, and it is here for the same reason — a tier edited while a lease is
+// open must not move the lease.
+func (p *Plane) pick(lease *alloc.Lease) (*node, config.ProviderKind, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	// EXPIRED LAZILY, at the two places staleness can do harm: choosing where to
+	// launch, and broadcasting a destroy. A background sweeper would need its own
+	// lifecycle and would only ever run between these; doing it here means a
+	// stale node cannot be picked even once.
+	p.expireStaleLocked()
+
+	// COALESCE(node, target_node), the same attribution the ledger uses. The two
+	// answer different questions — target_node is where placement decided the work
+	// goes, node is where it actually went — and the BOUND one wins, because that
+	// is where the container already is. Resolving only the target let a bound
+	// lease be launched on a different host.
+	if pinned := lease.Node; pinned != "" {
+		n, err := p.pinnedLocked(lease, pinned, "bound to")
+		if err != nil {
+			return nil, "", err
+		}
+
+		return n, n.provider, nil
+	}
+
+	if lease.TargetNode != "" {
+		n, err := p.pinnedLocked(lease, lease.TargetNode, "pinned to")
+		if err != nil {
+			return nil, "", err
+		}
+
+		return n, n.provider, nil
+	}
+
+	// IN THE LEASE'S OWN ORDER OF PREFERENCE. Providers is most-preferred-first,
+	// so walking it rather than the node map is what makes the preference mean
+	// anything.
+	//
+	// BY NAME WITHIN A PROVIDER, because the node map iterates in hash order: two
+	// identical fleets would otherwise place the same lease differently, which
+	// cannot be reproduced from a log. Escrow already names a machine for every
+	// reservation, so this runs only for a lease that carries neither.
+	names := make([]string, 0, len(p.nodes))
+	for name := range p.nodes {
+		names = append(names, name)
+	}
+
+	slices.Sort(names)
+
+	for _, want := range lease.Providers {
+		for _, name := range names {
+			if n := p.nodes[name]; n.provider == want && acceptsGuestOS(n, lease) {
+				return n, n.provider, nil
+			}
+		}
+	}
+
+	return nil, "", fmt.Errorf("%w: lease %s needs one of %v and no registered node offers it",
+		ErrNoNode, lease.ID, lease.Providers)
+}
+
+// pinnedLocked resolves a lease that names its machine. Caller holds p.mu.
+func (p *Plane) pinnedLocked(lease *alloc.Lease, name, how string) (*node, error) {
+	n, ok := p.nodes[name]
+	if !ok {
+		return nil, fmt.Errorf("%w: lease %s is %s node %q, which is not registered",
+			ErrNoNode, lease.ID, how, name)
+	}
+
+	if !acceptsProvider(n, lease) {
+		return nil, fmt.Errorf(
+			"%w: lease %s is %s node %q, which runs %s and the lease may not use it",
+			ErrNoNode, lease.ID, how, n.name, n.provider)
+	}
+
+	return n, nil
+}
+
+// PickForTest reports which node a lease would be aimed at.
+func (p *Plane) PickForTest(lease *alloc.Lease) (string, error) {
+	n, _, err := p.pick(lease)
+	if err != nil {
+		return "", err
+	}
+
+	return n.name, nil
+}
+
+func acceptsProvider(n *node, lease *alloc.Lease) bool {
+	for _, want := range lease.Providers {
+		if n.provider == want {
+			return acceptsGuestOS(n, lease)
+		}
+	}
+
+	return false
+}
+
+// acceptsGuestOS reports whether a node claims to boot this lease's guest.
+//
+// An EMPTY allowlist means the node did not say, which is treated as "anything".
+// The authoritative check is Bind, against the server's own node policy; this
+// only avoids sending a command that is certain to fail.
+func acceptsGuestOS(n *node, lease *alloc.Lease) bool {
+	if len(n.guestOS) == 0 {
+		return true
+	}
+
+	for _, os := range n.guestOS {
+		if os == lease.GuestOS {
+			return true
+		}
+	}
+
+	return false
+}

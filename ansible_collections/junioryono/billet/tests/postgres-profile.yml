@@ -1,0 +1,283 @@
+---
+# What the host role has to get right for a deployment whose LEDGER is in
+# PostgreSQL, without a host.
+#
+# THE SHIPPED BACKEND HAD NO CONVERGER, and this is the gate for the half that
+# fixes it. The PostgreSQL ledger published the contract — `server.identity_dir` plus
+# `state: {backend: postgres, postgres: {dsn_env: …}}` — and the role read
+# `server.state_dir` in three places, none of which a postgres config has. Every
+# one of them answered the DEFAULT directory, so the role would fence, chown,
+# sandbox and mount /var/lib/billet/server on a host whose control plane keeps
+# its identity somewhere else. The failure is not a crash: the converge is green
+# and the server then cannot write its own CA under ProtectSystem=strict.
+#
+# The DSN is the other half. `dsn_env` names an environment VARIABLE rather than
+# carrying a connection string, so something has to put it in the service's
+# environment — and it must not be a systemd drop-in, because the transactional
+# host upgrade REFUSES effective drop-ins it cannot replace and recover.
+- name: Prove the host role converges a PostgreSQL deployment
+  hosts: localhost
+  gather_facts: false
+  vars:
+    role_vars: "{{ playbook_dir }}/../roles/host/vars/main.yml"
+    template_dir: "{{ playbook_dir }}/../roles/host/templates"
+    billet_service_user: billet
+    billet_service_group: billet
+    billet_ledger_volume_id: ""
+    billet_systemd_notify_ready: true
+
+  tasks:
+    # THE ROLE'S OWN EXPRESSION, not a copy of it. Loading the file is what makes
+    # this a test of the derivation rather than of a second implementation that
+    # agrees with it today.
+    - name: Load the role's vars
+      ansible.builtin.include_vars:
+        file: "{{ role_vars }}"
+
+    - name: Resolve the state directory for each way a config can name it
+      ansible.builtin.set_fact:
+        resolved_postgres: >-
+          {{ billet_configured_server_state_dir }}
+      vars:
+        billet_config:
+          server:
+            identity_dir: /var/lib/billet/identity
+            state:
+              backend: postgres
+              postgres:
+                dsn_env: BILLET_STATE_DSN
+
+    - name: Resolve the state directory for the sqlite shorthand
+      ansible.builtin.set_fact:
+        resolved_sqlite: >-
+          {{ billet_configured_server_state_dir }}
+      vars:
+        billet_config:
+          server:
+            state_dir: /srv/billet/server
+
+    - name: Resolve the state directory for a config that names neither
+      ansible.builtin.set_fact:
+        resolved_default: >-
+          {{ billet_configured_server_state_dir }}
+      vars:
+        billet_config:
+          server:
+            listen: 127.0.0.1:7717
+
+    - name: Resolve the state directory for a config with no server at all
+      ansible.builtin.set_fact:
+        resolved_nodeonly: >-
+          {{ billet_configured_server_state_dir }}
+      vars:
+        billet_config:
+          node:
+            state_dir: /var/lib/billet/node
+
+    # THE THIRD AND FOURTH CASES ARE THE ONES A NAIVE FIX BREAKS. A node-only
+    # host has no server section at all, and a control plane that omitted the key
+    # keeps its state exactly where the config layer's default puts it — so
+    # neither may become empty, or every path the role builds from this answer
+    # becomes a relative one.
+    - name: Every way of naming the server's directory resolves to the right one
+      ansible.builtin.assert:
+        that:
+          - resolved_postgres | trim == '/var/lib/billet/identity'
+          - resolved_sqlite | trim == '/srv/billet/server'
+          - resolved_default | trim == '/var/lib/billet/server'
+          - resolved_nodeonly | trim == '/var/lib/billet/server'
+        fail_msg: >-
+          billet_configured_server_state_dir resolved
+          postgres={{ resolved_postgres | trim }},
+          sqlite={{ resolved_sqlite | trim }},
+          default={{ resolved_default | trim }},
+          node-only={{ resolved_nodeonly | trim }}.
+          identity_dir is what a PostgreSQL deployment names and state_dir is the
+          shorthand; reading one alone sandboxes and chowns a directory the
+          control plane does not use.
+
+    # WHICH BACKEND THE CONFIG NAMES, and `sqlite` for every config that says
+    # nothing. The refusals that read this are written as "not sqlite", so an
+    # empty answer for an ordinary host would refuse every one of them — which is
+    # the direction that takes a working fleet out rather than the one that lets
+    # a broken host in.
+    - name: Resolve the ledger backend for each shape of config
+      ansible.builtin.set_fact:
+        backend_postgres: "{{ billet_configured_state_backend }}"
+      vars:
+        billet_config:
+          server:
+            identity_dir: /var/lib/billet/identity
+            state:
+              backend: postgres
+              postgres:
+                dsn_env: BILLET_STATE_DSN
+
+    - name: Resolve the ledger backend for the shorthand
+      ansible.builtin.set_fact:
+        backend_shorthand: "{{ billet_configured_state_backend }}"
+      vars:
+        billet_config:
+          server:
+            state_dir: /var/lib/billet/server
+
+    - name: Resolve the ledger backend for a node-only host
+      ansible.builtin.set_fact:
+        backend_nodeonly: "{{ billet_configured_state_backend }}"
+      vars:
+        billet_config:
+          node:
+            state_dir: /var/lib/billet/node
+
+    - name: The ledger backend answers sqlite for everything that says nothing
+      ansible.builtin.assert:
+        that:
+          - backend_postgres | trim == 'postgres'
+          - backend_shorthand | trim == 'sqlite'
+          - backend_nodeonly | trim == 'sqlite'
+        fail_msg: >-
+          billet_configured_state_backend resolved
+          postgres={{ backend_postgres | trim }},
+          shorthand={{ backend_shorthand | trim }},
+          node-only={{ backend_nodeonly | trim }}.
+          The transactional-upgrade refusal is written as "not sqlite", so an
+          empty answer for an ordinary config would refuse every host that has
+          done nothing wrong.
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # THE UNIT
+    # ─────────────────────────────────────────────────────────────────────────
+
+    - name: Render the server unit for a PostgreSQL deployment with no environment
+      ansible.builtin.set_fact:
+        unit_pg_bare: >-
+          {{ lookup('ansible.builtin.template', template_dir + '/billet-server.service.j2') }}
+      vars:
+        billet_candidate_server_state_dir: /var/lib/billet/identity
+        # THE CONFIG IS IN SCOPE ON PURPOSE, so a template that RE-DERIVES the
+        # directory instead of reading the resolved fact renders successfully and
+        # gets the assertion wrong — rather than failing to render, which would
+        # be a mutation nobody could tell from a typo. In the role this variable
+        # is always defined.
+        billet_config:
+          server:
+            identity_dir: /var/lib/billet/identity
+            state:
+              backend: postgres
+              postgres:
+                dsn_env: BILLET_STATE_DSN
+        billet_server_environment: {}
+
+    - name: Render the server unit for a PostgreSQL deployment with a DSN
+      ansible.builtin.set_fact:
+        unit_pg_env: >-
+          {{ lookup('ansible.builtin.template', template_dir + '/billet-server.service.j2') }}
+      vars:
+        billet_candidate_server_state_dir: /var/lib/billet/identity
+        # THE CONFIG IS IN SCOPE ON PURPOSE, so a template that RE-DERIVES the
+        # directory instead of reading the resolved fact renders successfully and
+        # gets the assertion wrong — rather than failing to render, which would
+        # be a mutation nobody could tell from a typo. In the role this variable
+        # is always defined.
+        billet_config:
+          server:
+            identity_dir: /var/lib/billet/identity
+            state:
+              backend: postgres
+              postgres:
+                dsn_env: BILLET_STATE_DSN
+        billet_server_environment:
+          BILLET_STATE_DSN: postgres://billet:s3cret@ledger.internal:5432/billet?sslmode=verify-full
+
+    # THE SANDBOX FOLLOWS THE IDENTITY DIRECTORY. Under ProtectSystem=strict a
+    # path outside ReadWritePaths is READ-ONLY to the service, so this is not a
+    # tidiness assertion: with the wrong directory here the control plane starts
+    # and cannot write its own CA, ledger lock or maintenance fence.
+    - name: The sandbox names the directory the config actually points at
+      ansible.builtin.assert:
+        that:
+          - unit_pg_bare | regex_findall('(?m)^ReadWritePaths=(.*)$') | map('trim') | list == ['"/var/lib/billet/identity"']
+          - '"/var/lib/billet/server" not in unit_pg_bare'
+        fail_msg: >-
+          The rendered server unit's ReadWritePaths is
+          {{ unit_pg_bare | regex_findall('(?m)^ReadWritePaths=(.*)$') | map('trim') | list }}.
+          It must be the directory billet_config names, or ProtectSystem=strict
+          makes the control plane's own identity directory read-only.
+
+    # A UNIT THAT DOES NOT CHANGE IS A CONTROL PLANE THAT DOES NOT RESTART, and
+    # on this service a restart is a DRAIN. So a deployment that uses none of
+    # this must render exactly the unit it always did: the EnvironmentFile
+    # appears only when there is something to read from it.
+    - name: The EnvironmentFile appears exactly when there is an environment to read
+      ansible.builtin.assert:
+        that:
+          - unit_pg_bare | regex_findall('(?m)^EnvironmentFile=') | length == 0
+          - unit_pg_env | regex_findall('(?m)^EnvironmentFile=(.*)$') | map('trim') | list == ['-/etc/billet/server.env']
+        fail_msg: >-
+          EnvironmentFile lines: without an environment
+          {{ unit_pg_bare | regex_findall('(?m)^EnvironmentFile=(.*)$') | map('trim') | list }},
+          with one
+          {{ unit_pg_env | regex_findall('(?m)^EnvironmentFile=(.*)$') | map('trim') | list }}.
+          It must be absent when nothing would read it — a changed unit restarts
+          the control plane, and on this service that is a drain — and present
+          with the leading `-` when there is, so a host whose file has not been
+          written yet still starts and billet gives the real diagnostic.
+
+    # NOT A DROP-IN, and this is worth asserting structurally rather than
+    # trusting: `account.yml` refuses an upgrade on a host whose billet units
+    # have effective drop-ins, because the transaction cannot replace and recover
+    # an overlay. Delivering the DSN that way would make every later upgrade of
+    # that host fail.
+    - name: The environment is delivered in the unit the transaction owns
+      ansible.builtin.assert:
+        that:
+          - "'billet-server.service.d' not in unit_pg_env"
+        fail_msg: >-
+          The rendered unit refers to a drop-in directory. The transactional host
+          upgrade refuses effective drop-ins it cannot replace and recover, so a
+          DSN delivered that way breaks every later upgrade of the host.
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # THE ENVIRONMENT FILE
+    # ─────────────────────────────────────────────────────────────────────────
+
+    - name: Render the server environment
+      ansible.builtin.set_fact:
+        env_file: >-
+          {{ lookup('ansible.builtin.template', template_dir + '/server.env.j2') }}
+      vars:
+        billet_server_environment:
+          BILLET_STATE_DSN: postgres://billet:s3%cret@ledger.internal:5432/billet?sslmode=verify-full
+          BILLET_EXTRA: plain
+
+    # SYSTEMD PARSES NAME=value AND PERFORMS NO SHELL EXPANSION, so the value is
+    # written verbatim — which matters, because a real DSN's password routinely
+    # contains characters a shell would treat as syntax. The assertion is on the
+    # WHOLE line rather than a substring: a template that dropped everything
+    # after the `?` would still contain the prefix.
+    - name: Every variable is written verbatim, one per line
+      ansible.builtin.assert:
+        that:
+          - >-
+            'BILLET_STATE_DSN=postgres://billet:s3%cret@ledger.internal:5432/billet?sslmode=verify-full'
+            in (env_file.splitlines() | map('trim') | list)
+          - "'BILLET_EXTRA=plain' in (env_file.splitlines() | map('trim') | list)"
+          - env_file | regex_findall('(?m)^BILLET_STATE_DSN=') | length == 1
+        fail_msg: >-
+          The rendered environment file does not carry each variable verbatim on
+          its own line. systemd performs no shell expansion here, and a DSN's
+          password routinely contains characters a shell would treat as syntax.
+
+    # ORDERED, so a converge is idempotent. Ansible's dict ordering is not a
+    # promise, and an environment file that reshuffled would report `changed`
+    # on every run — which restarts the control plane, which is a drain.
+    - name: The file is ordered, so an unchanged environment does not restart anything
+      ansible.builtin.assert:
+        that:
+          - >-
+            (env_file.splitlines() | select('match', '^BILLET_') | list)
+            == (env_file.splitlines() | select('match', '^BILLET_') | list | sort)
+        fail_msg: >-
+          The rendered environment file is not in a stable order. A file that
+          reshuffles reports `changed` on every converge, and a changed
+          EnvironmentFile restarts the control plane — which is a drain.

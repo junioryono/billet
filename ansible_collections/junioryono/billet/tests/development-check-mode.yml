@@ -1,0 +1,123 @@
+---
+- name: Verify an interrupted first Linux development-host dry run
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    billet_development_install_terraform: false
+    billet_development_apt_stage: "{{ lookup('env', 'TMPDIR') | default('/tmp', true) }}/billet-development-host-check-mode"
+    billet_development_tls_caroot: "{{ lookup('env', 'TMPDIR') | default('/tmp', true) }}/billet-development-host-check-mode/caroot"
+    billet_development_tls_dir: "{{ lookup('env', 'TMPDIR') | default('/tmp', true) }}/billet-development-host-check-mode/tls"
+    billet_development_proxy_config_dir: "{{ lookup('env', 'TMPDIR') | default('/tmp', true) }}/billet-development-host-check-mode/proxy"
+    billet_development_proxy_log_path: "{{ lookup('env', 'TMPDIR') | default('/tmp', true) }}/billet-development-host-check-mode/logs/caddy.log"
+  pre_tasks:
+    - name: Model an interrupted package setup directory
+      ansible.builtin.file:
+        path: "{{ billet_development_apt_stage }}"
+        state: directory
+        mode: "0700"
+      check_mode: false
+      when: ansible_facts["system"] == "Linux"
+  roles:
+    - role: junioryono.billet.development_host
+      when: ansible_facts["system"] == "Linux"
+  tasks:
+    - name: Require first-run changes to be predicted
+      ansible.builtin.assert:
+        that:
+          - billet_development_linux_package_prediction is changed
+          - billet_development_linux_package_prediction.msg == 'Would verify the publisher repositories and install Caddy, mkcert.'
+          - billet_development_certificate_prediction is changed
+          - billet_development_proxy_files_prediction is changed
+      when: ansible_facts["system"] == "Linux"
+  post_tasks:
+    - name: Remove the interrupted package setup fixtures
+      ansible.builtin.file:
+        path: "{{ billet_development_apt_stage }}"
+        state: absent
+      check_mode: false
+      when: ansible_facts["system"] == "Linux"
+
+- name: Verify stale repositories defer Linux package probing
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    billet_development_install_terraform: false
+  tasks:
+    - name: Model present artifacts with a stale repository
+      ansible.builtin.set_fact:
+        billet_development_deb822_support:
+          rc: 0
+        billet_development_apt_artifacts:
+          results:
+            - { stat: { exists: true } }
+            - { stat: { exists: true } }
+            - { stat: { exists: true } }
+            - { stat: { exists: true } }
+            - { stat: { exists: true } }
+            - { stat: { exists: true } }
+        billet_development_caddy_repository:
+          changed: true
+        billet_development_hashicorp_repository:
+          changed: false
+
+    - name: Exercise Linux package readiness
+      ansible.builtin.include_role:
+        name: junioryono.billet.development_host
+        tasks_from: package-readiness
+
+    - name: Require stale repository repair before package probing
+      ansible.builtin.assert:
+        that: not billet_development_linux_packages_ready
+
+- name: Verify development tool probes run in check mode
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    billet_development_install_terraform: true
+    billet_development_caddy_min_version: "2.7.0"
+    billet_development_terraform_min_version: "1.12.0"
+  tasks:
+    - name: Point development tool probes at the fixture
+      ansible.builtin.set_fact:
+        billet_development_caddy_bin: "{{ playbook_dir }}/fixtures/fake-development-tool.sh"
+        billet_development_mkcert_bin: "{{ playbook_dir }}/fixtures/fake-development-tool.sh"
+        billet_development_terraform_bin: "{{ playbook_dir }}/fixtures/fake-development-tool.sh"
+
+    - name: Exercise development tool verification
+      ansible.builtin.include_role:
+        name: junioryono.billet.development_host
+        tasks_from: verify-tools
+
+    - name: Require every read-only version probe to execute
+      ansible.builtin.assert:
+        that:
+          - billet_development_caddy_version_command.stdout == 'v2.7.0'
+          - billet_development_mkcert_version_command.stdout == 'v1.4.4'
+          - (billet_development_terraform_version_command.stdout | from_json).terraform_version == '1.12.0'
+
+- name: Verify configured guest networks are not retired
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    billet_managed_network_files:
+      files:
+        - path: /etc/billet/network/billet0.conf
+        - path: /etc/billet/network/billet1.conf
+        - path: /etc/billet/network/retired.conf
+    billet_networks:
+      - name: billet0
+      - name: billet1
+  tasks:
+    - name: Exercise managed guest network normalization
+      ansible.builtin.include_role:
+        name: junioryono.billet.host
+        tasks_from: network-stale
+
+    - name: Require only the absent network to be retired
+      ansible.builtin.assert:
+        that: billet_stale_network_names == ['retired']

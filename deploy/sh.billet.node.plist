@@ -1,0 +1,126 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  billet compute host, for an Apple Silicon Mac running the tart backend.
+
+  NOT LOADED BY ANY PACKAGE.
+
+    cp sh.billet.node.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/sh.billet.node.plist
+
+  A LAUNCH AGENT, NOT A LAUNCH DAEMON, and that is the whole difference between
+  this file and billet-node.service. Three facts force it:
+
+    1. Since macOS 15, Virtualization.framework requires an UNLOCKED
+       login.keychain to run a VM — undocumented, and tart's own FAQ is where it
+       is written down. A headless SSH session leaves that keychain locked, and
+       the guest then fails with "SecKeyCreateRandomKey_ios failed", "Failed to
+       generate keypair", or "Interaction is not allowed with the Security
+       Server" — none of which mention a keychain. A daemon has no login session
+       and so has no unlocked keychain.
+    2. tart's VM store is per-user (TART_HOME, defaulting to ~/.tart). A daemon
+       running as root would look at root's store and find none of the images
+       the operator pulled.
+    3. The Linux node unit runs as ROOT because Docker's socket and the
+       Firecracker jailer need it. Neither applies here: tart is a CLI the
+       operator's own account drives, and running this as root would buy nothing
+       while breaking (1) and (2).
+
+  So a Mac node is a logged-in user's agent. On a dedicated host that means
+  enabling automatic login, which is a real security decision — the disk is
+  unlocked and the session is live at every boot — and it is the price of
+  running macOS guests without a person present. See docs/reference-hardware.md.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>sh.billet.node</string>
+
+    <!-- The config flag is EXPLICIT, for the reason the systemd units are explicit:
+         billet's default config path is per-user and never reads the working
+         directory. A system path also keeps this file free of a username, which
+         launchd would not expand anyway — it performs no variable substitution
+         in ProgramArguments or in the log paths below. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/billet</string>
+        <string>node</string>
+        <string>--config</string>
+        <string>/usr/local/etc/billet/billet.yaml</string>
+    </array>
+
+    <!-- A LAUNCH AGENT DOES NOT INHERIT YOUR SHELL'S PATH, and without this the
+         node starts, registers, and can do nothing: measured on a real Mac, the
+         first thing it says is
+
+           tart: list VMs: exec: "tart": executable file not found in $PATH
+
+         and it then refuses to take work, correctly, because it cannot tell
+         what is already running here. launchd's own default is
+         /usr/bin:/bin:/usr/sbin:/sbin, which contains neither Homebrew prefix.
+
+         SOFTNET IS RESOLVED THE SAME WAY, by billet's preflight and by tart
+         itself when it supervises an isolated guest — so a PATH missing the
+         Homebrew prefix breaks untrusted isolation as well as inventory.
+
+         Both prefixes: /opt/homebrew is Apple Silicon Homebrew, /usr/local is
+         where a manually installed billet and an Intel Homebrew put things. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart on failure only, which is Restart=on-failure. A node that exits
+         0 has finished draining and must stay stopped; restarting it would take
+         new work the operator asked it to stop taking. -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- THE MOST IMPORTANT LINE IN THIS FILE. launchd sends SIGTERM, waits
+         ExitTimeOut, then SIGKILLs — and the default is FIVE SECONDS, measured
+         on macOS 26 by asking `launchctl print` about an agent that sets none.
+         (Apple's launchd.plist(5) says twenty; the machine says five, and the
+         machine is what runs the node.) billet's node answers SIGTERM by
+         DRAINING: it stops taking work and waits for the jobs already running
+         here, which is bounded by drain_timeout and can be hours. A SIGKILL
+         through the middle of that leaves guests running with their leases
+         renewed by nobody, which is exactly what TimeoutStopSec=88200 prevents
+         on Linux.
+
+         Sized the same way: the maximum configurable drain (24h) plus teardown
+         plus margin. Lower drain_timeout first if this is too long to wait at
+         shutdown; never this alone.
+
+         NOT ZERO. launchd reads zero as infinity, and the man page's own
+         warning is that it can stall system shutdown forever. -->
+    <key>ExitTimeOut</key>
+    <integer>88200</integer>
+
+    <!-- Interactive, so launchd does not apply the background I/O and CPU
+         throttling it gives Standard and Background jobs. This process
+         supervises virtual machines running somebody's CI. -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <!-- RestartSec=5s. -->
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+
+    <!-- launchd does not expand ~ or $HOME here either, so these are absolute
+         and the directory has to exist and be writable by this user:
+
+           sudo mkdir -p /usr/local/var/log/billet
+           sudo chown "$(id -u):$(id -g)" /usr/local/var/log/billet -->
+    <key>StandardOutPath</key>
+    <string>/usr/local/var/log/billet/node.log</string>
+    <key>StandardErrorPath</key>
+    <string>/usr/local/var/log/billet/node.log</string>
+</dict>
+</plist>

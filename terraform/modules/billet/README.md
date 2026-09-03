@@ -1,0 +1,90 @@
+# terraform-aws-billet
+
+Provisions the AWS infrastructure a [billet](https://github.com/junioryono/billet) deployment needs: the network, the control-plane instance, the cache storage, and the IAM role its compute assumes. It is an **infrastructure module, not a Terraform provider** — per [ADR-004](../../../docs/adr-004-terraform-provider.md), `billet.yaml`, the mTLS certificates and the systemd units belong to the configuration-management layer (the `junioryono.billet.host` Ansible role), and enrollment stays a human fingerprint comparison outside `terraform apply`.
+
+## Layout: an opinionated root over flat composable children
+
+The root is a thin composition of **two** independently consumable children plus the network they share. Consume the root for the co-located deployment (one controller that also runs billet with the node role); consume a child directly when you already own the other half.
+
+| Module | Owns | Use it alone when |
+|---|---|---|
+| root (`terraform/modules/billet`) | The adopt-or-create network, the cross-child cache-endpoint rule, and the composition — it attaches `fleet-ec2`'s instance profile to the controller | You want the whole co-located deployment |
+| [`modules/control-plane-ec2-sqlite`](modules/control-plane-ec2-sqlite/README.md) | The controller instance, its security group, its auto-recovery alarm, the retained ledger volume, and (standalone) a minimal own instance profile | You have your own compute IAM story or fleet |
+| [`modules/fleet-ec2`](modules/fleet-ec2/README.md) | The node IAM role/profile with billet's generated policy, the trusted-runner security group, the cache storage, and the spot queue + router | You have your own control plane |
+
+**Three more children exist and the root composes none of them**, because each is a choice the opinionated default does not make for you. They are called directly, or from an example:
+
+| Module | Owns | Reach for it when |
+|---|---|---|
+| [`modules/fleet-codebuild`](modules/fleet-codebuild/README.md) | An AWS-managed CodeBuild project, an optional reserved fleet (the only way to get macOS), both IAM roles, the log group and the JIT parameter path | You want compute AWS operates, including managed macOS — see [docs/codebuild.md](../../../docs/codebuild.md) |
+| [`modules/state-rds-postgres`](modules/state-rds-postgres/README.md) | The PostgreSQL ledger, or the grant for one you already run. It exposes a narrow connection object and never learns the password | You want the controller to be rebuildable rather than restorable — see [docs/state-backends.md](../../../docs/state-backends.md) |
+| [`modules/control-plane-postgres`](modules/control-plane-postgres/README.md) | The controller for that profile: the same instance, security group and auto-recovery alarm, and **no ledger volume** | You are pairing a controller with the module above |
+
+`examples/postgres` composes the last two with an adopted network and a CodeBuild fleet, which is the four-way adoption boundary worth reading before you write your own.
+
+The root's input and output contract is **preserved across the split** — every pre-split variable and output keeps its name and meaning — and `moved.tf` maps every relocated resource permanently, so an existing deployment plans **zero changes** on upgrade. For the ledger volume that mapping is not a nicety: without it, `prevent_destroy` would (correctly) refuse the plan.
+
+Each child's README carries its complete create/adopt/always-created table; the root's own resources are:
+
+| Resource | Created when | Adopted when |
+|---|---|---|
+| `aws_vpc.this`, `aws_internet_gateway.this`, `aws_route_table.this`, `aws_route.internet` | `vpc_id` unset | `vpc_id` set (nothing created) |
+| `aws_subnet.this`, `aws_route_table_association.this` | `subnet_id` unset (association also needs a created VPC) | `subnet_id` set |
+| `aws_vpc_security_group_ingress_rule.cache` | always with `enable_cache` (joins the two children's groups) | — |
+
+## What it creates
+
+- **Networking** — adopt-or-create: with `vpc_id`/`subnet_id` unset it builds a minimal public VPC and subnet; with them set it places billet in your existing network. A control-plane security group (the node-wire port, the enrollment port when `bootstrap_ingress_cidrs` names one, plus optional SSH) and a trusted-runner security group. (An *untrusted* runner group is deliberately left to you — the module will not guess a safe boundary for a fork's code.)
+- **IAM** — the node role and instance profile the control plane assumes to launch and reap EC2 compute and reach the cache. Its policy is billet's **own** generator's output: the module commits a rendering of `internal/awspolicy` (kept equal by the `internal/tfpolicy` drift test) and substitutes your account, region, cache bucket, prefix, KMS key and queue for the sentinels. To scope it to an exact config instead, pass `billet init iam` output as `var.iam_policy_json`.
+- **Control plane** — a single small EC2 with **EC2 auto-recovery** (a `StatusCheckFailed_System` alarm with the `ec2:recover` action), per [ADR-001](../../../docs/adr-001-control-plane-hosting.md). Not an ASG: an ASG would launch a fresh instance that does not reattach the ledger volume. The SQLite ledger lives on a **dedicated, retained** encrypted gp3 EBS volume (the root is OS-only), so it survives instance termination or replacement; that volume carries `prevent_destroy`, so a plan that *would* destroy it — a cross-AZ move (EBS volumes are AZ-bound) or a casual `terraform destroy` — **fails loudly** instead. The instance ignores AMI drift (`ignore_changes = [ami]`), so a newer image never forces a replacement.
+
+  > **The fail-closed mount is a required config-layer step.** Per ADR-004 this module owns the *volume* but not the *mount*. Set the `junioryono.billet.host` role's `billet_ledger_volume_id` to this module's `ledger_volume_id` output and the role mounts it fail closed: resolved and mounted by the volume's own NVMe identity (never a filesystem UUID a snapshot-clone would duplicate), formatted only when blank, no `nofail`, `Requires=` on the exact mount unit plus `RequiresMountsFor` on `billet-server.service`, an expected-volume proof after mounting, and a refusal to shadow an existing root-disk ledger — otherwise a failed mount would let the controller start on the root disk with a *fresh* ledger, deployment identity and CA. See [docs/deployment-guide.md](../../../docs/deployment-guide.md).
+- **Cache** (`enable_cache`) — an S3 bucket for the fenced pointer and lease state (encrypted with SSE-S3/AES256). An optional customer-managed KMS key (`enable_kms`) encrypts the cache's EBS **volumes and snapshots** — which billet creates at runtime — not the bucket. The key is minted **per module instance**, and that is the cross-deployment READ boundary: tag conditions give destructive integrity (per-deployment only once value-scoped — see the *Presence-mode ownership* caveat below) but cannot stop another deployment *cloning a snapshot* and reading the cache (`ec2:CreateVolume` does not authorize the parent snapshot); with each deployment's snapshots under its own key and each role's KMS grants scoped to exactly that key, the foreign clone fails at the KMS grant instead — measured with `iam:SimulateCustomPolicy` (own key via EBS: allowed; another deployment's key: implicit deny; direct KMS calls and non-AWS-service grants: denied). Sharing one key between deployments silently reopens that boundary, and the protection is strictly opt-in per deployment: a deployment without `enable_kms` encrypts under the account's default EBS key (the AWS-managed `aws/ebs` unless the account configured another), and `aws/ebs` authorizes any account principal through EC2 — its snapshots remain readable no matter what keys its neighbours set, and a shared customer default is no better, and a key protects only snapshots created after it was set — evict or re-snapshot older generations to bring them under it.
+- **Spot** (`enable_spot`) — the SQS interruption queue a spot node consumes, plus a router that fills it. billet requires the queue's basename to equal the node's `node.name` (one queue per node), so a spot node's `node.name` must be the module's `spot_node_name` output (`<name>-spot-interruptions`). The router is an EventBridge rule → Lambda that, on each EC2 Spot interruption warning, reads the warned instance's `sh.billet.node` tag and forwards the warning to exactly that node's queue (an untagged, non-billet instance is dropped). This is necessary because EventBridge cannot match on an instance tag and a bare rule→queue would feed a node foreign warnings it re-queues. The Lambda's IAM is least-privilege: `ec2:DescribeInstances` (unscopable), `sqs:GetQueueUrl`/`SendMessage` scoped to the created queue, and logs to its own group. For **several** spot nodes (several queues), extend the router's SQS grant to the other queues.
+
+## Configuration handoff
+
+The module writes no billet configuration. It **outputs** the non-secret facts the Ansible role needs — `subnet_id`, `availability_zone`, `runner_security_group_id`, `node_wire_address`, `bootstrap_wire_address`, `cache_bucket`, `cache_prefix`, `cache_kms_key_arn`, `interruption_queue_url` — which you feed into `junioryono.billet.host`'s `billet_config` to render `billet.yaml`. The control-plane EC2 already carries `control_plane_instance_profile` (its own identity — how billet reads AWS credentials from IMDS), so that is not a `billet_config` value. `node.ec2.instance_profile` is a *separate*, optional role for trusted job instances; leave it unset unless a job genuinely needs AWS credentials, and pair it with `job_instance_profile_role_arn` so the node role may pass exactly it. Certificates and the App key are installed by the Ansible role, never by Terraform.
+
+## Scope and caveats
+
+- **Any partition.** The committed IAM rendering carries `TFPARTITION` and `TFDNSSUFFIX` sentinels that the module rewrites from `data.aws_partition.this` (`.partition` and `.dns_suffix`), so one rendering serves the commercial partition, GovCloud and China — whose ARNs (`arn:aws-cn:…`) and service suffix (`amazonaws.com.cn`) differ. `billet init iam` derives the partition from the region the same way; pass its output via `var.iam_policy_json` to override.
+- **The IAM policy is feature-gated.** The node role gets only what the enabled features need: a compute-only node gets the ec2 runtime, a cache node adds the EBS/S3 cache statements (and KMS with `enable_kms`), and `enable_spot` adds a grant scoped to exactly the created interruption queue. The committed renderings are kept equal to `billet init iam`'s output by a drift test; pass `var.iam_policy_json` (`billet init iam` output) to override entirely.
+- **Presence-mode ownership.** The deployment identity is minted on the server's first run and is unknown at `terraform apply`, so the policy's ownership conditions are tag-*presence*, not a deployment *value*. That is a sound boundary for **one** billet deployment per account; if you run several in one account, they can act on each other's tagged compute. Scope per deployment after the id exists with `billet init iam --deployment <id>` and `var.iam_policy_json`.
+- **Enrollment is a second port, and it is closed.** billet's node wire requires a client certificate in the handshake and serves no route without one, which is what makes a publicly reachable `node_ingress_cidrs` a supported posture rather than a denial of service. The two routes a machine with no certificate needs — reading the deployment's authority, and asking to join — are on `server.bootstrap_listen`, reported as `bootstrap_wire_address` and reachable only from `bootstrap_ingress_cidrs`, which is **empty by default**. Nothing a running fleet does goes through it: open it while you add a machine, approve the machine with `billet nodes approve`, and close it again. Setting the CIDRs alone is not enough — `server.bootstrap_listen` must also be set in `billet.yaml`, because in billet its absence is a refusal rather than a default.
+- **Architecture.** `control_plane_ami` empty resolves an Ubuntu 24.04 image for `var.control_plane_architecture` (`x86_64` by default); set it to `arm64` for a Graviton `control_plane_instance_type`.
+- **Availability zone.** A created subnet is placed in a zone that actually **offers** `control_plane_instance_type`, not in whatever zone AWS would pick: a zone reporting *available* need not sell every shape (measured in us-east-1, all six zones report available while us-east-1e offers no t3 at all, so a default deployment landing there fails at `RunInstances`). Only ordinary zones are considered — a Local Zone can offer the shape and its name sorts *ahead* of a plain one, so an account opted into one would otherwise have its control plane and ledger land there. Name a zone yourself with `subnet_availability_zone` — a zone that does not offer the shape is refused at **plan** time, with the zones that do. The choice is fixed at creation either way: an applied subnet keeps its zone (`ignore_changes`), because the ledger volume is zone-bound and carries `prevent_destroy` — replacing the subnet to move zones is a plan terraform refuses, so moving is a deliberate migration rather than an edit, and an upgrade of an existing deployment plans nothing. An adopted subnet (`subnet_id`) is used as-is; its zone is yours.
+
+## Usage
+
+```hcl
+provider "aws" {
+  region = "us-west-2" # the module takes its region from the provider
+}
+
+module "billet" {
+  source            = "github.com/junioryono/billet//terraform/modules/billet?ref=main"
+  name              = "billet"
+  enable_cache      = true
+  ssh_ingress_cidrs = ["203.0.113.0/24"] # your admin range, for the Ansible role
+}
+```
+
+Then converge the control plane with the Ansible role and hand it the outputs; run `billet check` before starting the services.
+
+**Pin it to a release.** `?ref=` names the version, and it is the same version as the binary and the collection beside it — a consumer's `versions.tf`, `requirements.yml` and `billet_version` should all say `vX.Y.Z`. What you are reading on `main` says `?ref=main`, because documentation on `main` describes `main`; every release rewrites it to that release's tag, so the copy of this README inside a release names the version you are installing. A moving target makes a converge non-deterministic, and this module creates the instance the binary runs on.
+
+## Teardown: decommission before destroy
+
+`terraform destroy` removes only the infrastructure **this module** manages. billet creates runner instances and cache EBS volumes/snapshots **outside** Terraform state, and deliberately leaves compute running on a shutdown timeout so in-flight jobs finish. So a `terraform destroy` alone can strand billable instances and volumes.
+
+The teardown order is therefore:
+
+1. **Drain and decommission billet** — stop the node so its jobs finish, then run `billet decommission --config <billet.yaml>`. It reports the deployment's leftover instances and, with `--yes`, purges the owned cache (snapshots, available volumes and the S3 state index); a live instance is fatal without `--terminate-instances`, and the cache purge refuses while any clone lease is still live, so compute is never pulled out from under a running job. It scopes everything to this deployment's `sh.billet.owner` tag, so it never touches another deployment's resources.
+2. **`terraform destroy`** — once nothing billable remains outside state. The **ledger volume** (`aws_ebs_volume.ledger`) carries `prevent_destroy`, so destroy will refuse it until you have snapshotted that volume and removed the guard (or `terraform state rm` it): that friction is deliberate — the control plane's SQLite ledger is the last thing you throw away.
+
+The module's guarantee is narrowed accordingly: it removes module-managed infrastructure *after* billet has been decommissioned.
+
+## Tests
+
+`terraform test` runs three plan-only suites against a **mocked AWS provider**: `tests/plan.tftest.hcl` covers the root's composition (network create-vs-adopt, the cross-child rule, plan-known outputs), while `tests/fleet.tftest.hcl` and `tests/control_plane.tftest.hcl` make each child the configuration under test — a root-level test reaches a child only through outputs, so the IAM, spot, cache and ledger assertions live where the resources do. All — no credentials, no AWS calls, nothing created (`make tf-test`, or `terraform init && terraform test` from this directory). CI runs them on the pinned floor and current terraform versions, plus `terraform fmt`, `validate`, a pinned tflint with the aws ruleset, and a pinned trivy config scan whose ignores are each justified in `.trivyignore`. What a mock cannot prove: that the plan applies against real AWS, and that plan-time AWS *queries* resolve — the Ubuntu AMI lookup is the risky one, so the tests pin its owner and name pattern textually while its resolution stays live-acceptance work. `internal/tfpolicy`'s Go test keeps the committed IAM rendering equal to `internal/awspolicy`; regenerate it with `UPDATE_TF_POLICY=1 go test ./internal/tfpolicy/`.

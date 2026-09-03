@@ -1,0 +1,214 @@
+name: Cut Release
+
+# The manual "ship main" button. Press it and billet cuts a release branch, tags
+# it, and builds it.
+#
+# THE BRANCH OUTLIVES THE RELEASE, which is the point of the shape. One branch
+# per MINOR version carries every patch on it: cut release/v0.4 and tag v0.4.0,
+# then a hotfix later is a commit on that same branch tagged v0.4.1 — without
+# dragging in whatever main has done since. A branch per release would need a new
+# one for every hotfix and could not do that.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to cut, e.g. v0.4.0. Leave blank for the next minor.'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+# ONE CUT AT A TIME. Two dispatches could otherwise both read the same newest tag,
+# compute different next versions, check out the same branch tip, and publish two
+# releases containing identical code — or race on the same tag and fail one push
+# after its branch had already been created.
+concurrency:
+  group: cut-release
+  cancel-in-progress: false
+
+jobs:
+  cut:
+    name: Cut the release branch and tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Work out what to cut
+        id: plan
+        env:
+          # Through the environment, not interpolated into the script. A
+          # workflow_dispatch input is attacker-influenced in the sense that
+          # matters here: an expression substituted into a shell script is an
+          # injection, and this job holds contents: write.
+          REQUESTED: ${{ inputs.version }}
+        run: scripts/plan-release.sh
+
+      - name: Cut it
+        env:
+          TAG: ${{ steps.plan.outputs.tag }}
+          BRANCH: ${{ steps.plan.outputs.branch }}
+          COLLECTION_VERSION: ${{ steps.plan.outputs.collection_version }}
+        run: |
+          set -euo pipefail
+
+          # The branch may already exist: that is what a second patch on the same
+          # minor series looks like, and it is the case this shape exists for.
+          if git ls-remote --exit-code --heads origin "${BRANCH}" >/dev/null 2>&1; then
+            echo "${BRANCH} already exists; tagging its tip rather than main"
+            git fetch origin "${BRANCH}:${BRANCH}"
+            git checkout "${BRANCH}"
+          else
+            git checkout -b "${BRANCH}"
+          fi
+
+          # Main composes current sibling actions at @main. A RELEASE MUST NOT:
+          # pinning the outer action would otherwise still execute mutable code.
+          # Rewrite only Billet's three internal references, commit that generated
+          # release surface on the minor branch, and tag the resulting commit.
+          sed -E -i "s#junioryono/billet/actions/setup-docker-builder@(main|v[0-9]+\\.[0-9]+\\.[0-9]+)#junioryono/billet/actions/setup-docker-builder@${TAG}#" actions/build-push-action/action.yml
+          sed -E -i "s#junioryono/billet/actions/(stickydisk|stop-docker-builder)@(main|v[0-9]+\\.[0-9]+\\.[0-9]+)#junioryono/billet/actions/\\1@${TAG}#" actions/setup-docker-builder/action.yml
+
+          # AND THE TERRAFORM MODULE SOURCES, for the same reason and in the
+          # same place. A consumer pins the module the way they pin the binary
+          # and the collection, so the README inside a release has to name that
+          # release rather than main. Both spellings are rewritten so re-cutting
+          # a branch that already carries a tag is idempotent.
+          #
+          # NOT `grep -rl … | xargs sed`: grep exits 1 on no matches, which under
+          # pipefail aborts with no message, and xargs with no arguments runs sed
+          # against stdin and hangs the job. The list is captured, an empty one is
+          # named, and each file is rewritten and staged in turn.
+          set +e
+          module_sources=$(grep -rlE '"github\.com/junioryono/billet//terraform/[^"]*\?ref=(main|v[0-9]+\.[0-9]+\.[0-9]+)"' --include='*.md' docs terraform)
+          grep_status=$?
+          set -e
+          if [ "${grep_status}" -gt 1 ] || [ -z "${module_sources}" ]; then
+            echo "::error::found no documented terraform module source to pin to ${TAG} (grep exited ${grep_status})"
+            exit 1
+          fi
+          while IFS= read -r module_source_file; do
+            sed -E -i "s#(\"github\.com/junioryono/billet//terraform/[^\"]*)\?ref=(main|v[0-9]+\.[0-9]+\.[0-9]+)\"#\\1?ref=${TAG}\"#g" "${module_source_file}"
+            git add "${module_source_file}"
+          done <<< "${module_sources}"
+
+          # A COLLECTION INSTALLED FROM A GIT TAG STILL READS galaxy.yml. The
+          # tag and that metadata must describe the same artifact, or Ansible
+          # reports a different version from the one the operator pinned.
+          sed -E -i "s#^version: [0-9]+\.[0-9]+\.[0-9]+\$#version: ${COLLECTION_VERSION}#" ansible_collections/junioryono/billet/galaxy.yml
+          RELEASE_TAG="${TAG}" scripts/check-release-metadata.sh
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add actions/build-push-action/action.yml actions/setup-docker-builder/action.yml ansible_collections/junioryono/billet/galaxy.yml
+          if ! git diff --cached --quiet; then
+            git commit -m "Release ${TAG}"
+          fi
+          git push origin "HEAD:${BRANCH}"
+
+          git tag -a "${TAG}" -m "${TAG}"
+          git push origin "${TAG}"
+
+          {
+            echo "## Cut \`${TAG}\`"
+            echo ""
+            echo "From \`${BRANCH}\` at \`$(git rev-parse --short HEAD)\`. The release build is running."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Called rather than triggered: a tag pushed with GITHUB_TOKEN above does not
+  # start a workflow of its own.
+  release:
+    needs: cut
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.cut.outputs.tag }}
+    # A CALLED WORKFLOW CANNOT HOLD MORE THAN ITS CALLER GRANTS, so this block has
+    # to mirror release.yml's job permissions exactly rather than approximate them.
+    # `id-token: write` is the one that bites: release.yml signs the manifest
+    # keylessly, exchanging that OIDC token for a short-lived Fulcio certificate,
+    # and a caller that omits it does not produce a signing failure inside the run —
+    # GitHub refuses the whole dispatch as `startup_failure`, with no jobs, no
+    # annotation and no log to read. The button simply stops working, and the last
+    # person to press it is whoever finds out.
+    permissions:
+      attestations: read
+      contents: write
+      id-token: write
+
+  # THE MOVING MAJOR, AND IT MOVES LAST.
+  #
+  # A consumer who writes `@v0` is asking to follow billet's releases without
+  # editing their workflow for every one — which is what is required of the
+  # end-user update experience, and the same promise the stable channel makes for
+  # the binary. It is the ONLY billet ref that ever moves: an exact semver tag and
+  # a commit SHA never do, and GitHub release immutability freezes the assets
+  # behind them.
+  #
+  # `needs: release` IS THE ACCEPTANCE, not a formality. release.yml proves the
+  # release immutable and verifies its GitHub attestation before it finishes, so
+  # gating on it means v0 can only ever point at a release that passed those. A
+  # step inside the cut job would move v0 to a tag whose build had not run yet,
+  # and every `@v0` consumer would be executing an unpublished release for as
+  # long as the build took to fail.
+  #
+  # FORCE-PUSHED BECAUSE THAT IS WHAT A MOVING TAG IS. The supply-chain tradeoff
+  # is real and documented rather than hidden: `@v0` gets fixes without an edit
+  # and can change under a consumer; a commit SHA cannot change and gets nothing.
+  # Both are supported; neither is called the safe one.
+  advance-major:
+    name: Advance the moving v0 tag
+    needs: [cut, release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Point v0 at the accepted release
+        env:
+          TAG: ${{ needs.cut.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          # DERIVED FROM THE TAG, never from the input: plan-release.sh has
+          # already validated the tag's shape, and re-parsing the dispatch input
+          # here would be a second reading of an attacker-influenced value.
+          case "${TAG}" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *)
+              echo "::error::${TAG} is not a semantic version tag"
+              exit 1
+              ;;
+          esac
+          major="${TAG%%.*}"
+
+          # THE COMMIT THE RELEASE WAS BUILT FROM, resolved through the tag rather
+          # than from a branch tip. The minor branch can have moved since the cut —
+          # a second hotfix, a merge — and pointing the major at its tip would make
+          # @v0 name code no release ever built.
+          git fetch origin "refs/tags/${TAG}:refs/tags/${TAG}"
+          target=$(git rev-list -n 1 "${TAG}")
+
+          # ANNOTATED AND FORCED. -f on both the tag and the push: this ref exists
+          # to move, and a fast-forward-only push would refuse the ordinary case of
+          # a hotfix on an older minor being superseded.
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git tag -f -a "${major}" -m "${major} -> ${TAG}" "${target}"
+          git push -f origin "refs/tags/${major}"
+
+          {
+            echo "## \`${major}\` now points at \`${TAG}\`"
+            echo ""
+            echo "Consumers using \`@${major}\` pick this up on their next run."
+          } >> "$GITHUB_STEP_SUMMARY"

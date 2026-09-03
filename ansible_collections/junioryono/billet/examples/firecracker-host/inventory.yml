@@ -1,0 +1,14 @@
+---
+# One bare-metal machine. The group is `linux` so the generated block in
+# group_vars/linux.yml reaches it.
+#
+# NOTHING billet-specific belongs here — see the note in the Docker example's
+# inventory. `billet init --emit ansible` prints a top-level mapping; it goes in
+# group_vars, byte for byte.
+all:
+  children:
+    linux:
+      hosts:
+        billet-fc-1:
+          ansible_host: 10.0.0.20
+          ansible_user: ubuntu
