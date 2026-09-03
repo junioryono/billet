@@ -50,6 +50,9 @@ func (h *fakeHost) record(what string) error {
 func (h *fakeHost) StopNode(context.Context) error   { return h.record("stop-node") }
 func (h *fakeHost) StopServer(context.Context) error { return h.record("stop-server") }
 func (h *fakeHost) HideBinary(context.Context) error { return h.record("hide-binary") }
+func (h *fakeHost) PrepareImages(context.Context) error {
+	return h.record("prepare-images")
+}
 func (h *fakeHost) InstallCandidate(context.Context) error {
 	return h.record("install-candidate")
 }
@@ -160,6 +163,10 @@ func TestAHealthyUpgradeRunsInOrder(t *testing.T) {
 		// Then the binary goes, so no operator command can enter through either
 		// version while the swap is underway.
 		"hide-binary",
+		// A GENERATION THE CANDIDATE ACCEPTS IS PULLED WHILE NOTHING RUNS AND
+		// BEFORE THE FENCE: a pull records in the cluster, not the ledger, and a
+		// host whose new binary refuses every image it holds is not upgraded.
+		"prepare-images",
 		"fence",
 		// The snapshot precedes the migration, because a migration is the one step
 		// putting the old binary back cannot undo.
@@ -707,5 +714,29 @@ func TestACommittedUpgradeResumedAfterACrashStillRecordsItsManifest(t *testing.T
 
 	if record > start {
 		t.Errorf("the manifest was recorded after the services started: %v", h.did)
+	}
+}
+
+// A HOST THAT CANNOT GET AN IMAGE ITS CANDIDATE ACCEPTS ROLLS BACK, with the
+// services restored and no ledger restored, because nothing had been fenced or
+// snapshotted yet. Without this a candidate that refuses every generation on the
+// cluster would be committed onto a host that launches nothing.
+func TestAFailedImagePullRollsBackBeforeTheFence(t *testing.T) {
+	j := newJournal(t)
+	h := &fakeHost{failAt: "prepare-images"}
+
+	err := runUnwinding(t, j, h)
+	if !errors.Is(err, ErrRolledBack) {
+		t.Fatalf("a failed image pull returned %v, want ErrRolledBack", err)
+	}
+
+	if slices.Contains(h.did, "fence") || slices.Contains(h.did, "restore-ledger") {
+		t.Errorf("the pull failed before the fence, so nothing should be fenced or restored:\n  %v", h.did)
+	}
+
+	for _, want := range []string{"restore-preserved", "start-services-rollback", "prove-stable"} {
+		if !slices.Contains(h.did, want) {
+			t.Errorf("the rollback did not %s:\n  %v", want, h.did)
+		}
 	}
 }

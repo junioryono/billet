@@ -5,8 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
+	"runtime"
 	"strings"
+	"time"
 
+	"github.com/junioryono/billet/deploy"
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/github"
@@ -342,6 +346,10 @@ func runCheck(ctx context.Context, opts checkOptions) (checkReport, error) {
 			if err := checkFirecrackerHost(ctx, cfg); err != nil {
 				return report, err
 			}
+			// REPORTED, NEVER FATAL: a stale image is maintenance information, and
+			// the failure this line exists to catch is a refresh timer that stopped
+			// firing, which looks exactly like one that is working.
+			reportGuestImageFreshness(ctx, cfg)
 		}
 
 		if cfg.Node.Provider == config.ProviderTart {
@@ -532,4 +540,83 @@ func checkTrustedGroup(ctx context.Context, cfg *config.Config, t *config.Tier) 
 	}
 
 	return policy.ValidateTrustedRunnerGroup(ctx, id, t.Workflows)
+}
+
+// reportGuestImageFreshness names the newest generation of each image this
+// host's microVM tiers boot, how old it is, and whether the packaged refresh
+// timer is what will replace it.
+func reportGuestImageFreshness(ctx context.Context, cfg *config.Config) {
+	if cfg.Node == nil || cfg.Node.Ceph == nil {
+		return
+	}
+
+	images, err := firecrackerTierImages(cfg)
+	if err != nil || len(images) == 0 {
+		return
+	}
+
+	store, err := openGenerationDater(cfg)
+	if err != nil {
+		fmt.Printf("images   could not read the cluster's generations: %v\n", err)
+
+		return
+	}
+
+	for _, image := range images {
+		name, _, _ := strings.Cut(image, "@")
+
+		_, why, err := generationDue(ctx, store, name, imagesRefreshAge)
+		if err != nil {
+			fmt.Printf("images   %s: could not tell: %v\n", name, err)
+
+			continue
+		}
+
+		fmt.Printf("images   %s: %s\n", name, why)
+	}
+
+	switch enabled, err := imagesRefreshTimerEnabled(ctx); {
+	case err != nil:
+		fmt.Printf("refresh  could not tell whether %s is enabled: %v\n",
+			deploy.ImagesRefreshTimerName, err)
+	case enabled:
+		fmt.Printf("refresh  %s is enabled\n", deploy.ImagesRefreshTimerName)
+	default:
+		fmt.Printf("refresh  %s is NOT enabled; nothing will replace an image that ages out "+
+			"of GitHub's runner window (systemctl enable --now %s)\n",
+			deploy.ImagesRefreshTimerName, deploy.ImagesRefreshTimerName)
+	}
+}
+
+// imagesRefreshAge is the age past which `billet check` calls an image stale,
+// the same as `images refresh`'s default: the weekly build plus a day of slack.
+const imagesRefreshAge = 6 * 24 * time.Hour
+
+// imagesRefreshTimerEnabled asks systemd whether the packaged refresh timer is
+// enabled. Off Linux, or where systemctl is absent, the answer is an error rather
+// than false, because "not enabled" is a verdict and "could not ask" is not.
+var imagesRefreshTimerEnabled = func(ctx context.Context) (bool, error) {
+	if runtime.GOOS != "linux" {
+		return false, errors.New("no systemd on " + runtime.GOOS)
+	}
+
+	systemctl, err := exec.LookPath("systemctl")
+	if err != nil {
+		return false, err
+	}
+
+	out, err := exec.CommandContext(ctx, systemctl, "is-enabled",
+		deploy.ImagesRefreshTimerName).Output()
+	state := strings.TrimSpace(string(out))
+
+	switch {
+	case state == "enabled" || state == "enabled-runtime" || state == "static":
+		return true, nil
+	case state != "":
+		// `is-enabled` exits non-zero for disabled and not-found alike, and the
+		// word on stdout is the verdict.
+		return false, nil
+	default:
+		return false, err
+	}
 }

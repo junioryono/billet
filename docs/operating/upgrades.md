@@ -2,6 +2,8 @@
 
 Updating billet is one durable decision that converges the whole deployment: the controller, every node, and the guest images they boot. This is what that looks like from an operator's chair — including the parts that go wrong.
 
+Two things keep the guest images converged, and they answer different questions. Inside every host upgrade, after the services are stopped and before anything is fenced, the transaction asks the candidate binary whether the images this host's tiers boot are compatible with it (`billet images compatible`) and pulls, boot-verifies and promotes a generation for each that is not (`billet images pull --verify`), so a host is `committed` only with an image it can actually launch, and a host that cannot get one rolls back naming that as the reason. Between upgrades, the packaged `billet-images-refresh.timer` runs `billet images refresh` daily on a firecracker node and pulls when the newest generation is older than the weekly build cadence, which is what keeps the baked Actions runner inside GitHub's thirty-day window on a host nobody upgrades for a month. The timer is shipped, not enabled, for the reason the backup timer is not; `billet check` reports a firecracker node whose timer is not enabled, and the Ansible host role enables it on every node that boots guests.
+
 The rule underneath all of it: **no ordinary update terminates a running job.** Jobs may run for days. A timeout may stop *you* waiting, and it never stops the work. The only thing in billet that ends a running job is `billet force-destroy`, which is a separate command, requires an explicit confirmation, and tells you exactly whose builds it is about to fail.
 
 ## The normal case

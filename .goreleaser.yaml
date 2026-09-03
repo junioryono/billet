@@ -100,6 +100,14 @@ nfpms:
         dst: /usr/lib/systemd/system/billet-backup.service
       - src: deploy/billet-backup.timer
         dst: /usr/lib/systemd/system/billet-backup.timer
+
+      # THE GUEST IMAGE REFRESH, same rule: shipped, not enabled. A node that boots
+      # firecracker guests enables it (`billet check` says when it is not), and a
+      # host that boots none has nothing for it to do.
+      - src: deploy/billet-images-refresh.service
+        dst: /usr/lib/systemd/system/billet-images-refresh.service
+      - src: deploy/billet-images-refresh.timer
+        dst: /usr/lib/systemd/system/billet-images-refresh.timer
       - src: deploy/billet-rbd.conf
         dst: /usr/lib/modules-load.d/billet-rbd.conf
 

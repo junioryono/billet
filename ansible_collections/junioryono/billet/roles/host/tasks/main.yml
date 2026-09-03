@@ -402,5 +402,8 @@
 - name: Configure or remove Ceph health alerts
   ansible.builtin.import_tasks: alerts.yml
 
+- name: Configure or remove the guest image refresh timer
+  ansible.builtin.import_tasks: images-refresh.yml
+
 - name: Configure billet services
   ansible.builtin.import_tasks: services.yml
