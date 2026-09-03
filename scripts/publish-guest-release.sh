@@ -2,7 +2,7 @@
 set -eu
 
 : "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
-: "${GITHUB_SHA:?GITHUB_SHA is required}"
+: "${SOURCE_SHA:?SOURCE_SHA is required: the commit of the release the image was built from}"
 : "${TAG:?TAG is required}"
 
 out=${1:-out}
@@ -10,19 +10,23 @@ if ! printf '%s\n' "$TAG" | grep -Eq '^guest-[0-9]{8}-[0-9]{6}$'; then
     printf 'invalid guest release tag: %s\n' "$TAG" >&2
     exit 2
 fi
-case "$GITHUB_SHA" in
-    ''|*[!0-9a-f]*) printf 'invalid publication commit: %s\n' "$GITHUB_SHA" >&2; exit 2 ;;
+case "$SOURCE_SHA" in
+    ''|*[!0-9a-f]*) printf 'invalid source commit: %s\n' "$SOURCE_SHA" >&2; exit 2 ;;
 esac
-case "${#GITHUB_SHA}" in
+case "${#SOURCE_SHA}" in
     40|64) ;;
-    *) printf 'invalid publication commit length: %s\n' "$GITHUB_SHA" >&2; exit 2 ;;
+    *) printf 'invalid source commit length: %s\n' "$SOURCE_SHA" >&2; exit 2 ;;
 esac
 
+# THE TAG POINTS AT THE RELEASE COMMIT THE IMAGE WAS BUILT FROM, never at the
+# main commit that published it: the manifest's schema is closed, so the tag's
+# target is the provenance record.
+#
 # THE TAG IS CREATED BEFORE THE RELEASE. --target affects only a missing tag, so
 # handing an existing attacker-chosen tag to gh release create would publish the
 # checked assets under a different commit. Both local and remote conflicts fail;
 # neither command is allowed to rewrite a ref.
-git tag "$TAG" "$GITHUB_SHA"
+git tag "$TAG" "$SOURCE_SHA"
 git push origin "refs/tags/$TAG"
 
 # THE ASSETS COME FROM THE MANIFEST, NOT FROM A LIST HERE.

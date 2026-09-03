@@ -11,6 +11,19 @@
 # accounts. `github.repository` is whatever repository this file is in, so the
 # workflow publishes to its own home wherever that turns out to be, and the move
 # is a `git push` rather than an edit here that somebody has to remember.
+#
+# WHY IT BUILDS FROM THE STABLE RELEASE AND NOT FROM MAIN. main is gated and is
+# still not something a fleet should inherit unreviewed at 04:17 on a Monday: an
+# image that reaches the channel fans out to every deployment on its next refresh,
+# so the tree it is built from is one a person promoted by cutting a release -- the
+# rule the AMI already follows, where the tag is the promotion. The workflow itself
+# stays on main, because every deployed binary verifies the channel's signature
+# against THIS FILE running on refs/heads/main (imagesource.PublishRef); only the
+# tree the build job checks out moves to the release. So the YAML here drives
+# scripts from an older tree, and the seam between them -- the script names and
+# the environment passed across -- is frozen by a test rather than left to drift.
+# A build from main is still possible for testing a change to those scripts, and
+# it cannot publish.
 name: Guest image
 
 on:
@@ -33,6 +46,11 @@ on:
         default: true
         type: boolean
 
+      source:
+        description: "Tree to build from: blank for the release the stable channel names, a vX.Y.Z release tag, or main (which cannot publish)"
+        required: false
+        type: string
+
 # LEAST PRIVILEGE, NAMED PER JOB BELOW rather than here, so a step added to a
 # future job does not silently inherit the ability to write releases.
 permissions: {}
@@ -51,6 +69,9 @@ jobs:
 
     outputs:
       tag: ${{ steps.pack.outputs.tag }}
+      source_tag: ${{ steps.source.outputs.tag }}
+      source_sha: ${{ steps.source.outputs.sha }}
+      source_is_release: ${{ steps.source.outputs.is_release }}
 
     permissions:
       # A MANUALLY SELECTED BRANCH RUNS ITS OWN BUILD SCRIPTS. It gets enough to
@@ -66,9 +87,77 @@ jobs:
       PUBLISH: "no"
 
     steps:
-      - name: Check out
+      # THE TREE IS RESOLVED BEFORE ANYTHING IS CHECKED OUT, from the stable channel
+      # -- the same pointer deployments follow, so the image is built from the
+      # release the fleet actually runs, hotfix-on-an-older-series rules included.
+      # A tag named by hand has to be an immutable, published, non-prerelease
+      # release; anything else is refused here, before an hour of building.
+      #
+      # THE ANNOTATED TAG IS PEELED. cut-release makes annotated tags, and the ref
+      # of one names the tag object rather than the commit; a checkout of that sha
+      # works, but the publish job records the commit, and the two must agree.
+      - name: Resolve the source release
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE: ${{ inputs.source }}
+        run: |
+          set -euo pipefail
+
+          semver='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          is_release=false
+
+          case "${SOURCE:-}" in
+            main)
+              tag=main
+              sha=$GITHUB_SHA
+              ;;
+            '')
+              if ! channel=$(gh api "repos/$GITHUB_REPOSITORY/contents/stable.json?ref=release-channel" \
+                  --jq .content 2>/dev/null | base64 -d); then
+                echo "the stable channel has not been published yet, so there is no release to" >&2
+                echo "build from; cut one first, or dispatch with source=main to build without publishing" >&2
+                exit 1
+              fi
+              tag=$(printf '%s' "$channel" | jq -r .tag)
+              ;;
+            *)
+              tag=$SOURCE
+              ;;
+          esac
+
+          if [ "$tag" != main ]; then
+            if ! [[ $tag =~ $semver ]]; then
+              echo "source must be a release tag like v0.5.0, or main: $tag" >&2
+              exit 1
+            fi
+
+            release=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
+              --json isImmutable,isPrerelease,isDraft)
+            if [ "$(jq -r '.isImmutable and (.isPrerelease | not) and (.isDraft | not)' <<<"$release")" != true ]; then
+              echo "$tag is not an immutable, published, non-prerelease release: $release" >&2
+              exit 1
+            fi
+
+            ref=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag")
+            sha=$(jq -r .object.sha <<<"$ref")
+            if [ "$(jq -r .object.type <<<"$ref")" = tag ]; then
+              sha=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$sha" --jq .object.sha)
+            fi
+            is_release=true
+          fi
+
+          echo "building the guest image from $tag ($sha)"
+          {
+            echo "tag=$tag"
+            echo "sha=$sha"
+            echo "is_release=$is_release"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check out the source release
         uses: actions/checkout@v5
         with:
+          ref: ${{ steps.source.outputs.sha }}
           persist-credentials: false
 
       # A HOSTED RUNNER HAS ABOUT 14 GB FREE and this build wants most of it: a
@@ -258,6 +347,7 @@ jobs:
             echo "| Guest contract | \`$(jq -r .guest_contract out/manifest.json)\` |"
             echo "| Architecture | \`$(jq -r .arch out/manifest.json)\` |"
             echo "| Built | $(jq -r .built_at out/manifest.json) |"
+            echo "| Built from | \`$SOURCE_TAG\` (\`$SOURCE_SHA\`) |"
             echo
             echo "Pulled by \`billet images pull\`, which verifies the manifest"
             echo "signature and each asset's digest before anything reaches the cluster."
@@ -269,6 +359,8 @@ jobs:
         env:
           KERNEL: ${{ github.workspace }}/out/vmlinux-billet
           ROOTFS: ${{ github.workspace }}/out/rootfs.img.zst
+          SOURCE_TAG: ${{ steps.source.outputs.tag }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
 
       # THE RELEASE GATE. Nothing below this runs against an image that fails it.
       #
@@ -382,7 +474,11 @@ jobs:
     # `inputs.publish` is the empty string -- and github casts both '' and false to
     # 0 when comparing across types, making that condition FALSE. MAIN ONLY also
     # makes this job's write token and OIDC identity unreachable to branch scripts.
-    if: github.ref == 'refs/heads/main' && (github.event_name != 'workflow_dispatch' || inputs.publish)
+    #
+    # AND ONLY AN IMAGE BUILT FROM A RELEASE. A build from main is for testing the
+    # build scripts; what the channel points every deployment at is a tree a
+    # person promoted.
+    if: github.ref == 'refs/heads/main' && (github.event_name != 'workflow_dispatch' || inputs.publish) && needs.build.outputs.source_is_release == 'true'
     runs-on: ubuntu-24.04
 
     permissions:
@@ -426,10 +522,16 @@ jobs:
       # locks a published tag and its assets, so a guest-latest release freezes on
       # its first generation rather than moving. Pullers read a tiny pointer from
       # guest-channel and then fetch assets from the immutable dated URL.
+      #
+      # THE GUEST TAG POINTS AT THE RELEASE COMMIT THE IMAGE WAS BUILT FROM, not at
+      # the main commit that happened to publish it. That is the provenance record:
+      # the manifest's schema is closed and every deployed reader refuses an
+      # unknown field, so it cannot carry one, and a tag's target can.
       - name: Publish the dated release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.build.outputs.tag }}
+          SOURCE_SHA: ${{ needs.build.outputs.source_sha }}
         run: scripts/publish-guest-release.sh out
 
       # A BRANCH, NOT A RELEASE. The release is immutable; this two-file branch is
@@ -440,6 +542,7 @@ jobs:
       - name: Advance the guest channel
         env:
           TAG: ${{ needs.build.outputs.tag }}
+          SOURCE_TAG: ${{ needs.build.outputs.source_tag }}
         run: |
           set -euo pipefail
 
@@ -482,5 +585,5 @@ jobs:
           git -C "$channel_dir" config user.name github-actions[bot]
           git -C "$channel_dir" config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git -C "$channel_dir" add current.json current.sigstore.json
-          git -C "$channel_dir" commit -m "Guest channel: $TAG"
+          git -C "$channel_dir" commit -m "Guest channel: $TAG (built from $SOURCE_TAG)"
           git -C "$channel_dir" push origin HEAD:refs/heads/guest-channel
