@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -928,7 +929,35 @@ func (p *Plane) checkRegistration(req nodeapi.RegisterRequest) (int, nodeapi.Ran
 		}
 	}
 
+	// A CODEBUILD NODE SERVES ONE TRUST CLASS. Config load refuses the pairing
+	// where the file is written; this is the same rule where the catalogue lives,
+	// because the node's file may be the node's alone. PERMANENT, like the site
+	// check: the same catalogue refuses the same node forever.
+	if req.Provider == config.ProviderCodeBuild && len(p.tiers) > 0 {
+		if err := config.CodeBuildTrustConflict(p.tierList(), req.Node); err != nil {
+			return 0, nodeWire, fmt.Errorf("%w: %w", ErrRefused, err)
+		}
+	}
+
 	return negotiated, nodeWire, nil
+}
+
+// tierList is the catalogue as a slice, in label order, for the rules that take
+// one.
+func (p *Plane) tierList() []config.Tier {
+	labels := make([]string, 0, len(p.tiers))
+	for label := range p.tiers {
+		labels = append(labels, label)
+	}
+
+	sort.Strings(labels)
+
+	tiers := make([]config.Tier, 0, len(labels))
+	for _, label := range labels {
+		tiers = append(tiers, p.tiers[label])
+	}
+
+	return tiers
 }
 
 // negotiateWire picks the version this registration will be served at.
