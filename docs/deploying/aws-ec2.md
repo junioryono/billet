@@ -11,14 +11,16 @@ The root module `terraform/modules/billet` composes an adopt-or-create network w
 | `modules/control-plane-ec2-sqlite` | the controller instance, its security group, the EC2 auto-recovery alarm, and a retained encrypted gp3 ledger volume with `prevent_destroy` |
 | `modules/fleet-ec2` | the node IAM role and instance profile rendered from billet's own policy generator, the trusted-runner security group, the cache bucket with an optional per-deployment KMS key, and the spot queue with the EventBridge-to-Lambda router |
 
-Outputs are the non-secret facts your `billet.yaml` needs: `subnet_id`, `availability_zone`, `runner_security_group_id`, `node_wire_address`, `bootstrap_wire_address`, `cache_bucket`, `cache_prefix`, `cache_kms_key_arn`, `interruption_queue_url`, `ledger_volume_id`, `spot_node_name`. Examples live under `terraform/modules/billet/examples`. Pin the module to a release: `?ref=vX.Y.Z`, the same version as the binary and the collection.
+Outputs are the non-secret facts your `billet.yaml` needs: `subnet_id`, `availability_zone`, `runner_security_group_id`, `node_wire_address`, `bootstrap_wire_address`, `cache_bucket`, `cache_prefix`, `cache_kms_key_arn`, `interruption_queue_url`, `ledger_volume_id`, `spot_node_name`. Examples live under `terraform/modules/billet/examples`.
 
 ```hcl
 module "billet" {
-  source = "github.com/junioryono/billet//terraform/modules/billet?ref=v0.5.0"
+  source = "github.com/junioryono/billet//terraform/modules/billet?ref=main"
   # see the module README for inputs
 }
 ```
+
+Pin the module to a release in your own configuration: the `?ref=` names the version, and it is the same version as the binary and the collection beside it. Documentation on `main` says `?ref=main` because it describes `main`; cutting a release rewrites every documented source to that release's tag, so the copy of this page inside a release names the version you are installing.
 
 The module's IAM is exactly what `billet init iam` prints for the same config, kept equal by a drift test, so the module can never grant a permission billet would not ask for. `billet init iam --builder` adds what `billet ami build` needs; `--controller-sweep` adds the CodeBuild registration sweep.
 
