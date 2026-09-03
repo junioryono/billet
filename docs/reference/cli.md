@@ -1,6 +1,6 @@
 # CLI
 
-`billet <command> [flags]`. Every command takes `--config <path>`; the default is the per-user config path (`billet check -h` prints it), never the working directory, and the `local` commands default to the packaged service config (`/etc/billet/billet.yaml` on Linux, `/usr/local/etc/billet/billet.yaml` on macOS). Most failures exit 1. A few commands use 2 or 3 as answers rather than errors, noted below, so a monitor can tell a task from an outage.
+`billet <command> [flags]`. Every command that reads a deployment's configuration takes `--config <path>` (the exceptions are `version`, `release record`, and the `acceptance` subcommands other than `up`, which work from their workspace); the default is the per-user config path (`billet check -h` prints it), never the working directory, and the `local` commands default to the packaged service config (`/etc/billet/billet.yaml` on Linux, `/usr/local/etc/billet/billet.yaml` on macOS). Most failures exit 1. Where a command uses 2 or 3 as an answer rather than an error, so a monitor can tell a task from an outage, the entry below says so.
 
 ## Roles
 
@@ -90,7 +90,7 @@ Validate the config and the state directory, prove the App key signs a JWT GitHu
 
 ### `billet local status|up|down|uninstall`
 
-Manage the systemd units (Linux) or launch agents (macOS). `status` reports what the service manager actually has loaded. `up` runs `billet check`, starts the server, then the node, proves each held its process, then enables them; it writes no units on systemd and writes the agents on macOS. `down` seals admission, waits for running work, stops the node, stops the server and disables both. `uninstall` is `down` plus forgetting the services, leaving the data.
+Manage the systemd units (Linux) or launch agents (macOS). `status` reports what the service manager actually has loaded. `up` runs `billet check`, starts the server, then the node, proves each held its process, then enables them; it writes no units on systemd and writes the agents on macOS. `up` exits 2 when the services are up but admission could not be reopened (an operator's seal, or a seal it could not read), so the host is running and takes no work until `billet resume`. `down` seals admission, waits for running work, stops the node, stops the server and disables both. `uninstall` is `down` plus forgetting the services, leaving the data.
 
 | Flag | Applies to | Meaning |
 |---|---|---|
@@ -154,7 +154,7 @@ Capture a deployment as one unit, put it back as one unit or not at all, or put 
 
 | Command | Meaning |
 |---|---|
-| `billet images pull [<ref>] [--from <dir>] [--source] [--verify] [--result-file] [--allow-stale] [--kernel-dir] [--staging-dir] [--keep-staging] [--signing-identity] [--signing-issuer] [--skip-signature-verification]` | fetch a published guest image, verify its signature and every asset, install the paired kernel durably, import it as a generation; on a tart node, pull the tiers' images into tart's store |
+| `billet images pull [<ref>] [--from <dir>] [--source <url>] [--verify] [--result-file <path>] [--allow-stale] [--kernel-dir <dir>] [--staging-dir <dir>] [--keep-staging] [--signing-identity <pattern>] [--signing-issuer <issuer>] [--skip-signature-verification]` | fetch a published guest image, verify its signature and every asset, install the paired kernel durably, import it as a generation; on a tart node, pull the tiers' images into tart's store |
 | `billet images verify <image>@<gen> [--wait 3m] [--record] [--allow-unpaired]` | boot one microVM and make the guest prove it works; `--record` (default) marks it so `@verified` resolves to it |
 | `billet images compatible [--wait 3m] [--result-file]` | prove every configured image speaks this binary's guest contract. Exit 2: images need a compatible generation |
 | `billet images due [--max-age 144h]` | is the newest generation old enough to rebuild. Exit 2: nothing to do |

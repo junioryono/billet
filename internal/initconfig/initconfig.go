@@ -970,8 +970,7 @@ func firecrackerNodeBlocks(trusted bool, h HostInputs) string {
     # An uncompressed guest kernel YOU place at this path — neither the Ansible
     # role nor `+"`billet images pull`"+` creates it, and `+"`billet check`"+` requires it to
     # exist. A pulled generation boots its OWN recorded kernel, so this file is the
-    # fallback for a hand-built generation; build one per
-    # docs/reference/reference-hardware.md
+    # fallback for a hand-built generation; build one per docs/reference/reference-hardware.md
     # or copy a pulled kernel out of kernel_dir.
     kernel_image: %s
     # The host bridge trusted guests attach to.
