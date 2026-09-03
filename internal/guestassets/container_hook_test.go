@@ -1,7 +1,9 @@
 package guestassets_test
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -44,19 +46,26 @@ func hookHarness(t *testing.T, upstreamStatus string) (index, record string) {
 }
 
 func jsString(s string) string {
-	b, _ := json.Marshal(s)
+	b, err := json.Marshal(s)
+	if err != nil {
+		panic(err)
+	}
 	return string(b)
 }
 
 func runHook(t *testing.T, node, index string, request map[string]any, shim string) (int, []byte) {
 	t.Helper()
-	body, _ := json.Marshal(request)
+	body, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
 	cmd := exec.CommandContext(t.Context(), node, index)
 	cmd.Stdin = strings.NewReader(string(body))
 	cmd.Env = append(os.Environ(), "BILLET_TEST_SHIM="+shim)
 	out, err := cmd.CombinedOutput()
 	code := 0
-	if exit, ok := err.(*exec.ExitError); ok {
+	var exit *exec.ExitError
+	if errors.As(err, &exit) {
 		code = exit.ExitCode()
 	} else if err != nil {
 		t.Fatalf("run the hook: %v\n%s", err, out)
@@ -95,17 +104,36 @@ func TestTheContainerHookMountsTheShimIntoTheJobContainer(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("hook exited %d\n%s", code, out)
 	}
-	forwarded := readForwarded(t, record)
-	mounts := forwarded["args"].(map[string]any)["container"].(map[string]any)["systemMountVolumes"].([]any)
+	var forwarded struct {
+		Command      string `json:"command"`
+		ResponseFile string `json:"responseFile"`
+		Args         struct {
+			Container struct {
+				SystemMountVolumes []struct {
+					Source   string `json:"sourceVolumePath"`
+					Target   string `json:"targetVolumePath"`
+					ReadOnly bool   `json:"readOnly"`
+				} `json:"systemMountVolumes"`
+			} `json:"container"`
+		} `json:"args"`
+	}
+	body, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatalf("the reference hook was never handed a request: %v", err)
+	}
+	if err := json.Unmarshal(body, &forwarded); err != nil {
+		t.Fatalf("the reference hook was handed something that is not JSON: %v\n%s", err, body)
+	}
+	mounts := forwarded.Args.Container.SystemMountVolumes
 	if len(mounts) != 2 {
 		t.Fatalf("forwarded %d system mounts, want the socket and the shim: %v", len(mounts), mounts)
 	}
-	last := mounts[1].(map[string]any)
-	if last["sourceVolumePath"] != shim || last["targetVolumePath"] != shim || last["readOnly"] != true {
-		t.Errorf("the shim mount is %v, want %s read-only at its own path", last, shim)
+	last := mounts[1]
+	if last.Source != shim || last.Target != shim || !last.ReadOnly {
+		t.Errorf("the shim mount is %+v, want %s read-only at its own path", last, shim)
 	}
-	if forwarded["responseFile"] != "/tmp/x.json" || forwarded["command"] != "prepare_job" {
-		t.Errorf("the rest of the request did not arrive untouched: %v", forwarded)
+	if forwarded.ResponseFile != "/tmp/x.json" || forwarded.Command != "prepare_job" {
+		t.Errorf("the rest of the request did not arrive untouched: %+v", forwarded)
 	}
 }
 
@@ -140,9 +168,15 @@ func TestTheContainerHookLeavesOtherRequestsAlone(t *testing.T) {
 				t.Fatalf("hook exited %d\n%s", code, out)
 			}
 			forwarded := readForwarded(t, record)
-			want, _ := json.Marshal(tc.request)
-			got, _ := json.Marshal(forwarded)
-			if string(got) != string(want) {
+			want, err := json.Marshal(tc.request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := json.Marshal(forwarded)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, want) {
 				t.Errorf("forwarded %s\nwant   %s", got, want)
 			}
 		})
