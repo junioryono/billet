@@ -347,7 +347,7 @@ made in GitHub first — a container shares the host kernel, so billet only
 runs workflows an organization runner group explicitly allows.
 
 The whole path, including the GitHub side:
-  https://github.com/junioryono/billet/blob/main/docs/first-deployment.md
+  https://github.com/junioryono/billet/blob/main/docs/getting-started/index.md
 
 For a machine that should run jobs across reboots, install the package"
         echo "instead — it ships systemd units and a config skeleton:"

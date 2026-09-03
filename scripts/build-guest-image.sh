@@ -145,7 +145,7 @@ SIZE_MB="${SIZE_MB:-22528}"
 # than about a configuration. So the build measures what it used, reports it, and
 # refuses if the margin is gone, naming the number to raise SIZE_MB to. That is
 # what keeps this file's constant a recorded measurement instead of a guess that
-# happened to work, which is the rule CLAUDE.md states about byte sizes.
+# happened to work, which is the rule the billet-config skill states about byte sizes.
 MIN_FREE_MB="${MIN_FREE_MB:-512}"
 IMAGE_POOL="${IMAGE_POOL:-billet-images}"
 IMAGE_NAME="${IMAGE_NAME:-ubuntu-2404-x64}"
@@ -1065,7 +1065,7 @@ ACTIONS_HOOK
 	# `docker-container` builder runs BuildKit in its own image with its own store
 	# and is not reached by this at all -- that builder is served by the plaintext
 	# loopback adapter below, which it must be pointed at explicitly; see
-	# docs/actions-cache.md.)
+	# docs/operating/actions-cache.md.)
 	# Best effort, and deliberately NOT a gate on interception. The runner and the
 	# job/action containers trust the node leaf through their own NODE_EXTRA_CA_CERTS
 	# bundle, so their cache and artifact traffic is unaffected if this fails. The
@@ -1901,7 +1901,7 @@ publish() {
 
 	# gnudd, NOT dd: Ubuntu 26.04's uutils coreutils does not implement
 	# `iflag=direct`, which is the same class of difference that broke `cephadm
-	# bootstrap` on this host. See docs/adr-003-ceph-rbd.md.
+	# bootstrap` on this host. See docs/reference/decisions/adr-003-ceph-rbd.md.
 	local ddbin=dd
 	command -v gnudd >/dev/null 2>&1 && ddbin=gnudd
 

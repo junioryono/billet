@@ -352,7 +352,7 @@ acceptance: ## Run an ISOLATED acceptance deployment against a real account, and
 	@# NOT IN `check`, and not in CI's ordinary jobs: it launches billable compute
 	@# in a real AWS account and needs a real GitHub App. .github/workflows/
 	@# acceptance.yml is what runs it on a schedule, against the dedicated account
-	@# docs/aws-acceptance.md names.
+	@# docs/reference/records/aws-acceptance.md names.
 	@#
 	@# BILLET_ACCEPTANCE_CONFIG is the config to DERIVE FROM; the run never writes
 	@# to it, and every path, port, tier label and deployment identity it uses is

@@ -16,7 +16,7 @@
 # looks exactly like one that is working, and that is the failure worth catching.
 [Unit]
 Description=billet deployment backup
-Documentation=https://github.com/junioryono/billet/blob/main/docs/restore-rehearsal.md
+Documentation=https://github.com/junioryono/billet/blob/main/docs/reference/records/restore-rehearsal.md
 After=network-online.target
 Wants=network-online.target
 

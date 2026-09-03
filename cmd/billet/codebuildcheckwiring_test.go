@@ -73,7 +73,8 @@ func TestTheFleetConcurrencyJudgementAppliesOnlyToADeclaredMacOSLimit(t *testing
 // AND THE LIVE CHECK ASKS THAT JUDGEMENT, WITH THE FLEET IT DESCRIBED.
 //
 // PROVING THE MECHANISM IS NOT PROVING IT IS USED. The judgement above is a plain
-// function; what turns the measurement in docs/aws-acceptance.md into a refusal an
+// function; what turns the measurement in docs/reference/records/aws-acceptance.md
+// into a refusal an
 // operator meets is one call in checkCodeBuildLive. Delete it and every suite
 // stays green while a tier advertises two Macs to GitHub against a fleet that has
 // one. A structural test because the hazard is an absence: exercising it at run

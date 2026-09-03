@@ -83,9 +83,9 @@ Then: **fix, mutation-test each fix, run `make check`, commit, and immediately l
 make check
 ```
 
-Build, vet, gofmt, lint, and `go test -race`. All clean, every time. CI runs all of it, so a red `make check` is a red CI run — that is the point of the gate. CI does more besides (`go mod tidy` diff, coverage upload, `govulncheck`, cross-builds, the Ansible role tests, and the terraform gates), so green locally is necessary rather than sufficient. A change touching `.tf` files also needs `make tf-fmt-check tf-validate tf-test tf-lint tf-scan` before pushing — those are deliberately outside `check` because they need terraform/tflint/trivy installed.
+Build, vet, gofmt, lint (for the host and for linux), billet's own analyzers, and `go test -race -covermode=atomic`. All clean, every time. CI runs all of it, so a red `make check` is a red CI run — that is the point of the gate. CI does more besides (`go mod tidy` diff, the suite against a real PostgreSQL, coverage upload, `govulncheck`, cross-builds, `sqlc diff`, the Sphinx docs build, the package and restore rehearsals, the Ansible role tests, and the terraform gates), so green locally is necessary rather than sufficient. A change touching `.tf` files also needs `make tf-fmt-check tf-validate tf-test tf-lint tf-scan` before pushing — those are deliberately outside `check` because they need terraform/tflint/trivy installed. A change under `docs/` needs `make docs`. `billet-checks-and-lint` has the anatomy of the gate.
 
-If the linter objects, fix the code. An exception is `//nolint:linter-name // reason` with a real reason; `nolintlint` rejects a bare directive, so "0 issues" means "0 unexplained issues".
+If the linter objects, fix the code. An exception is `//nolint:linter-name // reason` with a real reason for golangci-lint, or `//billet:ignore <analyzer> // reason` for billet's own analyzers; both reject a bare directive and report an unused one, so "0 issues" means "0 unexplained issues".
 
 ## Commit messages
 
@@ -123,8 +123,6 @@ Body covers:
 
 Link the issue with `Closes #N`.
 
-## Pre-1.0 has no upgrade path, and the docs must say so
+## Pre-1.0 may break a format, and never confusingly
 
-There is no released version, so a change to the on-disk state format is allowed to break an existing database. It is **not** allowed to break it confusingly: detect the incompatible shape and say what to do about it, the way `checkBookkeepingSchema` does. A raw `no such column` gives an operator nothing to act on.
-
-Once there is a tagged release, this stops being true and schema changes become append-only migrations with real upgrade tests.
+Tagged releases exist (`release/vX.Y` branches, a moving `v0` tag, signed manifests), so the ledger's schema is no longer free to change: migrations are append-only, their statement bytes are published and checksummed, and every deployment records them — see `billet-state`. What pre-1.0 still permits is breaking a non-ledger on-disk format (the recover journal, an archive schema, a channel statement), provided the refusal detects the old shape and says what to do about it. A raw `no such column`, or a silently accepted older schema whose meaning changed, gives an operator nothing to act on; a schema number that changes is better than one whose meaning changes.

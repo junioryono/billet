@@ -20,7 +20,8 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// `billet acceptance` runs the procedure docs/aws-acceptance.md used to describe
+// `billet acceptance` runs the procedure docs/reference/records/aws-acceptance.md
+// used to describe
 // by hand: stand a deployment up beside whatever else is on the machine, let a
 // real GitHub Actions job run on it, record what happened, and tear it down
 // leaving nothing billable.

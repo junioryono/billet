@@ -827,7 +827,7 @@ func checkSpec(spec provider.Spec) error {
 
 	// A cache the backend cannot attach must fail the launch, not vanish. A
 	// deployment that believes it has a cache and does not is the exact failure
-	// the storage rules in CLAUDE.md exist to prevent.
+	// the storage rules in the billet-storage-and-cache skill exist to prevent.
 	if len(spec.Volumes) > 0 || spec.CacheEndpoint != "" || spec.CacheToken != "" {
 		return fmt.Errorf("tart: %s asks for cache volumes, which this backend does not "+
 			"attach yet; launching without them would be a guest that silently has "+

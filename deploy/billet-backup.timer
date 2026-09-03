@@ -11,7 +11,7 @@
 # still countable; change it here if your deployment's answer differs.
 [Unit]
 Description=billet deployment backup, daily
-Documentation=https://github.com/junioryono/billet/blob/main/docs/restore-rehearsal.md
+Documentation=https://github.com/junioryono/billet/blob/main/docs/reference/records/restore-rehearsal.md
 
 [Timer]
 OnCalendar=daily

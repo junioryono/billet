@@ -2,7 +2,7 @@
 
 The PostgreSQL ledger for a billet control plane — or the grant for one you already run.
 
-With `server.state.backend: postgres`, billet's capacity ledger, node registrations, custody and job history live in a database billet does not operate. What stays on the controller is `server.identity_dir`: the deployment identity, the node-wire CA and its rotation state, the process lock and the maintenance fence. Those cannot follow the ledger here — a private key is not rows, and local process coordination has nothing to do with SQL. See [docs/state-backends.md](../../../../../docs/state-backends.md) for what the profile buys and what it does not.
+With `server.state.backend: postgres`, billet's capacity ledger, node registrations, custody and job history live in a database billet does not operate. What stays on the controller is `server.identity_dir`: the deployment identity, the node-wire CA and its rotation state, the process lock and the maintenance fence. Those cannot follow the ledger here — a private key is not rows, and local process coordination has nothing to do with SQL. See [docs/deploying/postgres-and-active-passive.md](../../../../../docs/deploying/postgres-and-active-passive.md) for what the profile buys and what it does not.
 
 **It is one controller either way.** A database's ability to serialize writes is not proof that only one process is polling GitHub, which is why billet takes a claim row in the ledger and fences a replaced controller by its epoch. This module provisions storage; it does not make billet highly available.
 
@@ -68,7 +68,7 @@ The `junioryono.billet.host` role does both halves: `billet_state_ca_bundle_src`
 
 The **ledger** is `pg_dump` or a provider snapshot. billet refuses to copy it deliberately: a half-measure copying rows out through billet's own connection would produce an archive that *looks* like a backup and is not. Automated backups are on here by default, and so is `deletion_protection`.
 
-The **identity directory** is billet's. `billet local backup` writes an identity-only archive on a PostgreSQL deployment — the deployment identity, the node-wire CA and its rotation state, and the GitHub App private key — and records the ledger as external rather than pretending to have copied it. Restoring is the two halves paired: your dump first, then `billet local restore --external-ledger-attached`, which billet refuses without because it cannot see the database on the other end of the DSN. See [docs/state-backends.md](../../../../../docs/state-backends.md).
+The **identity directory** is billet's. `billet local backup` writes an identity-only archive on a PostgreSQL deployment — the deployment identity, the node-wire CA and its rotation state, and the GitHub App private key — and records the ledger as external rather than pretending to have copied it. Restoring is the two halves paired: your dump first, then `billet local restore --external-ledger-attached`, which billet refuses without because it cannot see the database on the other end of the DSN. See [docs/deploying/postgres-and-active-passive.md](../../../../../docs/deploying/postgres-and-active-passive.md).
 
 **Pair the two halves.** A ledger without its deployment identity is a fresh authority that cannot see the compute the old one launched; an identity without the CA cannot issue a node certificate. If you restore one, restore the other from the same moment.
 

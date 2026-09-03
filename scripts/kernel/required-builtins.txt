@@ -1,26 +1,14 @@
 # Every kernel option billet's guest MUST carry, and must carry as =y.
 #
-# ONE FILE, TWO READERS, for the reason internal/runnerrelease gives about the
-# runner version: scripts/build-guest-kernel.sh enables each of these, and
-# scripts/check-guest-kernel-config.sh refuses a built config that does not have
-# them. Held apart, the list that is enabled and the list that is checked drift,
-# and the check then passes for an option the build stopped setting.
+# ONE FILE, TWO READERS, for the reason internal/runnerrelease gives about the runner version: scripts/build-guest-kernel.sh enables each of these, and scripts/check-guest-kernel-config.sh refuses a built config that does not have them. Held apart, the list that is enabled and the list that is checked drift, and the check then passes for an option the build stopped setting.
 #
-# BUILT IN RATHER THAN AS MODULES. A microVM boots one kernel and has no
-# initramfs to load modules from, so =m is the same as absent here -- which is
-# why the gate demands =y and refuses a config carrying any =m line at all.
-# moby's check-config.sh accepts either; this is where billet is stricter.
+# BUILT IN RATHER THAN AS MODULES. A microVM boots one kernel and has no initramfs to load modules from, so =m is the same as absent here -- which is why the gate demands =y and refuses a config carrying any =m line at all. moby's check-config.sh accepts either; this is where billet is stricter.
 #
-# WHERE THEY COME FROM. Firecracker's CI config is the base, and this list is
-# what moby's check-config.sh reported missing on it plus what a CI job needs:
-# measured, that base was missing IP_NF_RAW, IP6_NF_RAW, NETFILTER_XT_MARK,
-# NET_CLS_CGROUP and the nftables set, which surfaces as service containers
-# failing strangely rather than as a boot failure.
+# WHERE THEY COME FROM. Firecracker's CI config is the base, and this list is what moby's check-config.sh reported missing on it plus what a CI job needs: measured, that base was missing IP_NF_RAW, IP6_NF_RAW, NETFILTER_XT_MARK, NET_CLS_CGROUP and the nftables set, which surfaces as service containers failing strangely rather than as a boot failure.
 #
 # Blank lines and # comments are ignored; one option per line, without CONFIG_.
 
-# netfilter: what moby found missing on the base config, plus nftables, which
-# ubuntu's userspace reaches through the compat layer.
+# netfilter: what moby found missing on the base config, plus nftables, which ubuntu's userspace reaches through the compat layer.
 IP_NF_RAW
 IP6_NF_RAW
 NETFILTER_XT_MARK
@@ -52,8 +40,7 @@ IP_VS_PROTO_TCP
 IP_VS_PROTO_UDP
 IP_VS_RR
 
-# filesystems: overlayfs is docker's storage driver, and the rest are what a job
-# may format a volume with.
+# filesystems: overlayfs is docker's storage driver, and the rest are what a job may format a volume with.
 OVERLAY_FS
 EXT4_FS
 XFS_FS
@@ -89,8 +76,7 @@ BLK_DEV_THROTTLING
 FAIR_GROUP_SCHED
 CFS_BANDWIDTH
 
-# what the runtime needs beside that boundary: keys for credential storage,
-# POSIX_MQUEUE for bind-mounting /dev/mqueue, seccomp for the default profile.
+# what the runtime needs beside that boundary: keys for credential storage, POSIX_MQUEUE for bind-mounting /dev/mqueue, seccomp for the default profile.
 KEYS
 POSIX_MQUEUE
 SECCOMP

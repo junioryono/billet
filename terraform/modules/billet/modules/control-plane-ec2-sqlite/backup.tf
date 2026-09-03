@@ -4,7 +4,7 @@
 # writes the ledger, the deployment identity, the GitHub App private key and the
 # node-wire authority as one verified unit — and leaves it on the same volume as
 # the deployment. ADR-001 has always said the copy belongs in S3 with a REHEARSED
-# restore; this is the bucket, and docs/restore-rehearsal.md is the rehearsal.
+# restore; this is the bucket, and docs/reference/records/restore-rehearsal.md is the rehearsal.
 #
 # CREATED ONLY WHEN ASKED, and adoptable: an operator who already has a backup
 # bucket sets create_backup_bucket = false and passes backup_bucket, and this

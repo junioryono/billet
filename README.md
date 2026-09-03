@@ -1,736 +1,126 @@
 # billet
 
-Self-hosted GitHub Actions runners on your own hardware, with a colocated cache.
+[![CI](https://github.com/junioryono/billet/actions/workflows/ci.yml/badge.svg)](https://github.com/junioryono/billet/actions/workflows/ci.yml) [![Coverage](https://codecov.io/gh/junioryono/billet/branch/main/graph/badge.svg)](https://codecov.io/gh/junioryono/billet) [![Go Reference](https://pkg.go.dev/badge/github.com/junioryono/billet.svg)](https://pkg.go.dev/github.com/junioryono/billet) [![Docs](https://img.shields.io/badge/docs-billet.readthedocs.io-2980B9)](https://billet.readthedocs.io/en/latest/) [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 
-A *billet* is a bar of metal prepared for forging — raw material shaped into something useful, which
-is roughly what CI does to source code.
+**Self-hosted GitHub Actions runners on your own hardware, with the cloud as fallback and a cache beside the compute.**
 
-> **Status: pre-alpha.** Nothing here is production-ready yet. Do not point release or deploy
-> pipelines at it. See [Status](#status) for what actually works today.
+A box under your desk is the cheapest fast CI you will ever have, and the reason people do not rely on it is that houses lose power. billet is built so that one `runs-on` label can mean "the machine at home if it is up, EC2 if it is not". The control plane talks to GitHub over an outbound long-poll, so GitHub never connects to you; a single-box deployment opens nothing at all. One static binary, no hosted component, Apache-2.0.
 
-## The idea
+> **Pre-alpha.** Jobs run end to end through every backend against real GitHub and AWS, but do not point release or deploy pipelines at it yet. [What is proven](https://billet.readthedocs.io/en/latest/reference/status.html) says exactly what has run for real, by backend, with dates.
 
-**Your own hardware for the builds, the cloud for when it is not there.**
+## Contents
 
-A box under your desk is the cheapest fast CI you will ever have, and the reason people do not rely
-on it is that houses lose power and ISPs go down. billet is built so that one `runs-on` label can
-mean "the machine at home if it is up, EC2 if it is not" — the control plane lives somewhere always
-on, and the compute is wherever you have it.
+- [Why billet](#why-billet)
+- [Quick start](#quick-start)
+- [Deployment shapes](#deployment-shapes)
+- [Backends](#backends)
+- [How it works](#how-it-works)
+- [Security](#security)
+- [Documentation](#documentation)
+- [Contributing](#contributing)
 
-That combination is the thing billet is FOR. Kubernetes-based autoscalers do not span bare metal and
-cloud; the AWS-based projects are AWS-only; the microVM products are commercial. See
-[Alternatives](#alternatives) for an honest comparison, including cases where you should use
-something else.
+## Why billet
 
-> The cloud path has run real GitHub Actions jobs on EC2, including Docker builds, service containers and runtime toolchain installation, and destroyed every instance afterward. The same unchanged `runs-on` label has also completed first on preferred bare-metal capacity and then on EC2 after that local contribution was withdrawn. A tier can name several backends, capacity is measured per machine, and the control plane picks the host when the job is admitted — in the tier's own order of preference, so `[firecracker, ec2]` means the box at home before the cloud. See [Status](#status) and [AWS acceptance](docs/aws-acceptance.md).
+- **One label, several machines, in your order of preference.** A tier can name `[firecracker, ec2]`, and the control plane picks the host when the job is admitted: the box at home first, the cloud when it is not there. Failover under one unchanged label has completed against real GitHub and AWS.
+- **A kernel per job on your own hardware.** Firecracker microVMs under the jailer on Linux, tart VMs on an Apple Silicon Mac, one EC2 instance or CodeBuild build per job in AWS. Docker is there for trials.
+- **A cache beside the compute.** Guest images, sticky disks, BuildKit state, the Docker image store and, on Linux, `actions/cache` itself, served from a Ceph pool or EBS at the same site instead of crossing the internet.
+- **Nothing hosted.** No SaaS, no webhook endpoint, no public IP, no tunnel. Nodes dial the control plane; the control plane dials GitHub; that is all.
 
-## What it is
+## Quick start
 
-`billet` is **being built** to run your GitHub Actions jobs on machines you control — a server under
-your desk, a Mac mini, or EC2 — with the accelerations that make self-hosting worth the trouble.
-Most of the following does not work yet; see [Status](#status) for what does.
-
-- **Ephemeral microVM per job.** Firecracker on bare metal, one job per VM, destroyed after. Stronger
-  isolation than container-based runners.
-- **Colocated Actions cache.** Cache traffic served from the same box as the runner instead of
-  crossing the internet.
-- **Persistent build caches** — Docker layers, package managers, git mirrors — kept on copy-on-write
-  volumes instead of being re-downloaded every run.
-- **Observability** — job history, machine metrics, logs, and test analytics, without shipping your
-  CI data to a third party.
-
-There is **no hosted control plane and no SaaS component.** You run the whole thing. `billet` talks
-to GitHub over outbound long-poll, so **GitHub never connects to you** — no public IP, no webhook
-endpoint, no tunnel. A single-box deployment opens nothing at all. A fleet is the one exception, and
-it is a local one: nodes dial the control plane, so it has to listen somewhere they can reach —
-normally a private network or a VPN rather than the internet.
-
-## What it is not
-
-- **Not a way to run untrusted code cheaply.** See [Security](#security) — this matters.
-- **Not a managed service.** If you want someone else to run it, use
-  [Blacksmith](https://blacksmith.sh), [Actuated](https://actuated.com), [Namespace](https://namespace.so),
-  or [WarpBuild](https://warpbuild.com). They are good products; this is for people who want to own it.
-- **Not free of operational burden.** One machine is one failure domain. Budget for that.
-
-## Choose a deployment
-
-| Goal | Control plane and database | Compute | Start here |
-|---|---|---|---|
-| Try Billet on one computer | `billet server` and SQLite on that computer | Docker on the same computer, for trusted workflows only | `billet init` writes a runnable config when given a non-default runner group and exact workflow allowlist; see [Quickstart](#quickstart) |
-| Use an existing Linux server | Server and SQLite may share the host | Firecracker and Ceph, installed through Ansible | [Install](#install) and the [Ansible collection](ansible_collections/junioryono/billet/README.md) |
-| Keep local speed with cloud fallback | Small EC2 controller with SQLite on encrypted EBS | Local Firecracker first, EC2 On-Demand second | [Deployment guide](docs/deployment-guide.md#a-hybrid-owned-hardware-deployment) |
-| Run entirely in AWS | Small EC2 controller with SQLite on encrypted EBS | EC2 instance per job | [Deployment guide](docs/deployment-guide.md#choose-a-deployment-shape) |
-| Run macOS or arm64 Linux jobs on a Mac | Controller may run locally, on the Mac itself, or in AWS | Tart on an owned Apple Silicon Mac | Real Xcode and Docker jobs run end to end; you supply the Mac, a pulled guest image and, for fork pull requests, `node.tart.untrusted_isolation`. See [the reference Mac](docs/reference-hardware.md#the-reference-mac-for-the-tart-provider) |
-| Run macOS jobs in AWS instead | Small EC2 controller with SQLite on encrypted EBS | CodeBuild on a reserved `MAC_ARM` fleet | Real Xcode jobs run end to end on Apple silicon AWS operates; every job inherits CodeBuild's 36-hour ceiling and a reserved fleet is a 24-hour minimum commitment. See [the CodeBuild backend](docs/codebuild.md) |
-
-For a hybrid owned-hardware installation, including the control plane, SQLite/EBS recovery, local server, EC2 fallback, Terraform/Ansible responsibilities, and maintenance model, read the [deployment guide](docs/deployment-guide.md). The short version is: Terraform creates cloud infrastructure, Ansible configures existing machines over SSH, and Billet owns live jobs, leases, enrollment, and drains. A compute node is not a backup controller, and a database backup is not fallback compute.
-
-Billet currently supports one authoritative controller. The recommended AWS state shape is SQLite on local EBS with EC2 auto-recovery, not an Auto Scaling group and never EFS/NFS. PostgreSQL and fenced active/passive controllers are phased together. Composable AWS Terraform infrastructure modules and the local setup lifecycle are tracked together; this is separate from the deferred Billet Terraform provider in [ADR-004](docs/adr-004-terraform-provider.md).
-
-## Install
+One Linux machine with Docker, a GitHub organization you own, and about fifteen minutes.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/junioryono/billet/main/scripts/install.sh | sh
+
+billet init --org your-org --runner-group billet-trusted \
+  --workflow 'your-org/your-repo/.github/workflows/ci.yml@refs/heads/main' --config ~/billet.yaml
+billet github-app create --org your-org --config ~/billet.yaml   # creates and installs the App
+billet check --config ~/billet.yaml                              # proves the credential and the config
+
+billet server --config ~/billet.yaml   # the control plane; and in a second terminal:
+billet node   --config ~/billet.yaml   # the machine that runs jobs
 ```
 
-Downloads the latest release for your platform, verifies its checksum, and puts the binary in `/usr/local/bin`. It does not create users, write config, or start anything.
-
-When one machine prepares another, set the target explicitly. This is useful for an Ansible control machine on macOS provisioning a Linux server, or for preparing a second Mac without running the installer there:
-
-```bash
-billet_stage=$(mktemp -d)
-curl -fsSL https://raw.githubusercontent.com/junioryono/billet/main/scripts/install.sh | \
-  BILLET_OS=linux BILLET_ARCH=amd64 BILLET_INSTALL_DIR="$billet_stage" sh
-```
-
-`BILLET_OS` and `BILLET_ARCH` must be set together. Supported targets are `linux/amd64`, `linux/arm64`, and `darwin/arm64`. A cross-target install verifies and places the binary but does not execute it on the control machine.
-
-**A binary for a platform is not a backend on it.** `darwin/arm64` builds the same binary everywhere, and what a Mac can actually RUN is the tart backend with its own requirements — an installed `tart`, a pulled guest image, and a login session for Virtualization.framework. What is proven on each is in [Status](#status), by backend rather than by platform.
-
-**For a Linux machine that should run jobs across reboots, install the package instead** — it ships the systemd units. Pick the file for your platform from the [latest release](https://github.com/junioryono/billet/releases/latest):
-
-```bash
-sudo dpkg -i billet_*_linux_amd64.deb    # Debian / Ubuntu
-sudo rpm -i  billet_*_linux_amd64.rpm    # Fedora / RHEL
-```
-
-The package installs the units and **does not enable or start them**. Installing
-billet should not connect a machine to GitHub and begin accepting jobs; that is
-your decision, and it cannot be made before `/etc/billet/billet.yaml` says
-something true.
-
-**On a Mac there is no package, and the binary above is the whole install.** billet ships launch AGENTS rather than daemons — Virtualization.framework needs an unlocked login keychain and tart's image store is per-user, so a root daemon finds neither — and `billet local up` is what installs, starts, proves and enables them; `billet local status`, `down` and `uninstall` are the rest of that lifecycle. The flow is `billet init --profile local-service` → `billet github-app create` → `billet check` → `billet local up`. Run them as the account that will run the node, never under `sudo`.
-
-`billet init` writes a **docker** config by default; add `--provider tart --node-name <this Mac>` for macOS or native arm64 Linux guests, **on the Mac itself** — it is refused anywhere else, because the ceiling is measured from the machine running the command, the node name comes from its hostname, and the paths are its platform's. That generation names a guest image billet has actually run a job in — the Xcode macOS image and the arm64 `ubuntu-runner` image, both measured — pins the macOS tier to this host because Apple counts its two-guest limit per machine, and writes the softnet isolation an untrusted tier needs. billet still does not *build* those images: you pull them once with `billet images pull` (the macOS one is about 87GB), and a launch refuses an image that is not present rather than fetching one inside a job. A tart host also needs Homebrew `tart`, a one-time setuid-root grant on `softnet` if it will run untrusted work, and automatic login for the keychain. See [the reference Mac](docs/reference-hardware.md#the-reference-mac-for-the-tart-provider), which walks all of it.
-
-The package prepares the RBD kernel client before the hardened node unit can run and records it for subsequent boots. Removing the package removes that boot policy and the binaries and units, but deliberately preserves `/etc/billet`, `/var/lib/billet`, and `/srv/jailer`; configuration, deployment identity, credentials, and any recoverable guest state are operator data rather than package-manager data.
-
-**For a reproducible Firecracker host**, use the `junioryono.billet.host` Ansible role under `ansible_collections/`. It connects to an already installed Linux machine over SSH and converges the supplied Billet binary, users, systemd units, verified Firecracker binaries, Ceph client or explicitly authorized single-host bootstrap, guest networks, configuration, validation, and transactional host upgrades. You supply the deployment-specific facts it cannot safely guess: capacity, GitHub App credentials, network ranges, and the exact disks a new Ceph cluster may consume. It can enable the server and node independently, refuses to start either before `billet check` passes, and never replaces an existing App key implicitly. See the [collection documentation](ansible_collections/junioryono/billet/README.md) for variables, upgrade recovery, and examples.
-
-**For a development machine beside the runners**, the same collection provides `junioryono.billet.development_host`. It installs cross-platform Terraform and local TLS/proxy tooling on Debian-family Linux or macOS. It is not a Billet compute-host installer: Firecracker remains Linux-only, and a Mac compute host's SERVICES are converged by `billet local up` rather than by the collection. Its tart backend is still configured by hand, for the reason in the install section above.
-
-**A control plane** — talks to GitHub, owns the capacity ledger:
-
-```bash
-# Creates the App and prints the github: block to paste in. The key goes
-# somewhere the service user can write; /etc/billet is root-owned.
-sudo -H -u billet billet github-app create \
-    --org YOUR-ORG --key-path /var/lib/billet/app-private-key.pem
-
-sudoedit /etc/billet/billet.yaml     # paste that block; set max_vcpu/max_memory
-sudo -H -u billet billet check --config /etc/billet/billet.yaml
-sudo systemctl enable --now billet-server
-```
-
-**A compute host** — runs the containers. It needs a `node:` section naming the control plane, and a certificate: either enroll it and approve its fingerprint, or issue one directly (see [Adding a second machine](#adding-a-second-machine)):
-
-```bash
-sudoedit /etc/billet/billet.yaml     # uncomment and fill in the node: section
-sudo -H -u billet billet check --config /etc/billet/billet.yaml
-sudo systemctl enable --now billet-node
-```
-
-> **`billet-node` is root on that host.** It joins the `docker` group, and
-> anything that can reach a rootful Docker socket can start a privileged
-> container or mount the filesystem. Prefer rootless Docker where the workload
-> allows it.
-
-## Updating
-
-**The supported path is one command:**
-
-```bash
-billet rollout start          # resolve the signed stable channel and converge the fleet
-billet rollout status         # where each host has got to
-```
-
-That records one immutable target and converges the controller and every node onto it, one host at a time, without terminating a running job — a host with a six-hour job on it drains for six hours and then installs. To move a single machine instead, `billet host-upgrade` runs the same transaction directly, with a recovery journal and automatic rollback. [docs/upgrades.md](docs/upgrades.md) covers the failure cases: a host that will not come back, one that is unreachable, and the explicit force operation.
-
-The manual routes below still work and are what a deployment that pins its own artifacts uses. None of them drains first, so run `billet drain --wait` before them if the machine is running work.
-
-**If you built from source:**
-
-```bash
-git pull && go build ./cmd/billet
-sudo mkdir -p /usr/local/bin && sudo install -m 0755 billet /usr/local/bin/billet
-sudo systemctl restart billet-server                # if you wrote your own unit
-```
-
-**If you installed the package:**
-
-```bash
-sudo dpkg -i billet_*_linux_amd64.deb        # or rpm -U
-sudo systemctl restart billet-server         # and/or billet-node
-```
-
-**If you used the install script**, re-run it. Note that it writes
-`/usr/local/bin/billet` while the packaged units run `/usr/bin/billet` — so if
-this machine has the package installed, update the package rather than the
-script, or the units keep running the old binary.
-
-Publishing a GitHub release does not change a running installation and does not affect its jobs. Installing the release and restarting a service is the point at which draining begins.
-
-**The node wire is a range, and an upgrade is server-first.** A control plane declares the span of wire versions it speaks and a node declares its own; registration picks the highest both speak and records it. So the control plane is upgraded first and nodes converge onto it one at a time, at whatever pace suits the work they are running — there is no maintenance window in which both halves have to be replaced together. `billet status` reports which hosts are still on an older protocol, which is what says when a later release may stop carrying it. The reverse order is refused rather than supported: a node newer than its control plane is rejected by that control plane's strict request decoder before any version check can run, and the node stops with a message saying to upgrade the control plane first.
-
-**A drain never destroys a running job, and it does not time out.** SIGTERM stops new admission and then waits for the work already running, for as long as that work takes. `drain_timeout` no longer bounds it: a job may run for days, elapsed time is not evidence that one stopped making progress, and GitHub does not requeue a job whose runner vanished after starting — so a timer deciding to fail somebody's build was never a timeout, it was a policy nobody chose. The key now decides only when Billet begins reporting that a drain is running long, and it has no maximum.
-
-**A node that finishes draining says so.** When `billet node` stops with nothing left running it tells the control plane it is leaving, and placement moves to the other hosts at once instead of after the node's silence window — which is how long a stopped host used to keep receiving assignments, each of them waiting that window out before being placed elsewhere. Silence still means nothing: a node that dies is forgotten only by silence, because from the control plane a crash and a partition look the same and the compute barrier depends on that caution. A withdrawal releases no capacity and marks no job; it only stops new work being aimed at a host that is gone.
-
-A second SIGTERM stops the *waiting*, not the work:
-
-```bash
-sudo systemctl kill --kill-whom=main --signal=SIGTERM billet-server
-```
-
-**The jobs still running are left running.** Their guests keep going, their nodes keep holding them, their capacity stays charged until a host proves the compute is gone, and the next control plane re-adopts their leases. What the shutdown still does is finish the teardown it owes — the destroys a completion asked for, the session close, the idle escrow — so nothing is stranded that was already finished.
-
-`--kill-whom=main` matters because without it systemd signals every process in the service, including a container CLI Billet has in flight.
-
-`billet force-destroy` is the explicit emergency operation for the case where an operator genuinely does want running compute destroyed: it requires the deployment to be sealed first, names every affected job, lease and host before it acts, and warns that GitHub does not requeue a job whose runner vanished after starting. Capacity for a job left running by an ordinary stop stays charged until a node reports it gone. **Current pre-alpha limitation:** `billet drain --wait` proves what the LEDGER holds and cannot see compute whose lease has already gone.
-
-### Capacity that does not come back
-
-A lease whose holder stops heartbeating is reclaimed by the reaper — but only if nothing was running behind it. If there was, the capacity stays charged to its host and the lease is **quarantined**, because expiry proves the control plane stopped hearing from something, never that the container stopped. Freeing it immediately would let another tier take that slot while the container is still there, and two jobs would land on a machine sized for one.
-
-It resolves itself in the ordinary case: the host destroys the container and says so, or reports what it is actually running — every sweep, not only when it reconnects, because quarantine happens on the reaper's clock and a node that reconnects after an outage usually does so before the leases it was holding have expired. A quarantined lease missing from that report has no container by definition. After an upgrade from a release that predates durable runner identity, billet checks the exact organization runner before touching surviving compute: a busy ephemeral runner stays quarantined and is rechecked, while an absent or idle ephemeral registration is safely retired before its guest is removed; ambiguous, static, or unavailable GitHub state leaves capacity charged. `billet leases` shows every custody, teardown, and quarantine hold with its node and age. `billet leases release <lease> --force` records your assertion that the compute is gone: quarantine is resolved immediately because it has no holder, while a healthy custody holder receives the request through its next heartbeat, drops its local obligation, and releases the lease itself. Force, because nothing has confirmed anything: if you are wrong that slot is sold twice.
-
-## Guest images
-
-Firecracker root disks are grown per job to the tier's requested `disk` capacity, then the host expands ext4 on the unmounted clone before the guest boots. This also works with already-published images. The immutable golden generation remains small and shared, and teardown discards the enlarged clone with the microVM. A zero `disk` keeps the generation's size as the backend default.
-
-A Firecracker job boots a **golden image**: an Ubuntu 24.04 rootfs carrying Docker, the
-GitHub Actions runner, and a small agent that reads the runner registration out of the
-metadata service and starts the runner with it. It lives in Ceph as an RBD image with
-immutable named snapshots called **generations**, and every job gets a copy-on-write
-clone of one, discarded when the guest is.
-
-**What is in it comes from GitHub's own declaration rather than from a list billet
-maintains.** GitHub does not publish the image its hosted runners boot — `actions/runner-images`
-is Packer source whose only builder targets Azure, and every release there carries one
-~50KB JSON file. It does publish `toolset-2404.json`, which names every apt package and
-toolcache line, so billet vendors that file pinned by digest and builds from it. The
-practical consequence: a workflow that assumes something a hosted runner has — `openssh-client`,
-`gnupg2`, `tzdata`, `pkg-config`, a particular Python minor — finds it here too, and
-`billet images` refuses to publish an image missing anything the declaration names.
-`docs/adr-005-runner-image-parity.md` records what that costs and what is still missing
-(the heavyweight software: JDKs, .NET, Android, Swift, Rust, browsers).
-
-The guest agent drops from root to the dedicated `runner` account and establishes `HOME=/home/runner`, `USER=runner`, and `LOGNAME=runner` explicitly. A systemd service is not a login session, and `setpriv` changes ids without constructing that account environment; leaving these implicit lets setup actions install a toolchain and then fail when the tool first asks for its per-user cache. The image contents gate checks this contract before publication.
-
-```bash
-sudo scripts/build-guest-image.sh          # build and publish a new generation
-billet images verify <image>@<generation>  # boot one, make the guest prove it, record it
-billet images list                         # what exists, what is verified, what tiers boot
-billet images reap                         # remove generations nothing needs
-billet runner check                        # how close the runner is to being refused
-```
-
-### Promotion, and why a tier should say `@verified`
-
-A tier names one of two things:
-
-```yaml
-image: ubuntu-2404-x64@g20260814145813   # exactly this, forever
-image: ubuntu-2404-x64@verified          # the newest one proved to boot
-```
-
-`@verified` is what lets a fleet take up a new image with **no config edit and no
-restart**: verification records itself, and the next launch resolves to it. Rollback is
-`billet images unpromote <image>@<generation>`, one command against the cluster rather
-than an edit on every node — which matters because it is what you reach for while a bad
-image is in front of every job.
-
-A bare image name stays refused. Choosing a generation for somebody who did not choose one
-is how a job boots something nobody decided on; naming `@verified` *is* the decision. And
-a launch resolves the alias before it does anything, so the log line names the generation
-rather than the word — "which image did this job actually run" has to be answerable
-afterwards.
-
-If nothing has passed verification, `@verified` **refuses** rather than booting something unproven. It also refuses a generation whose snapshot is gone: the alias is resolved from verification records *intersected with the generations that still exist*, so a record that outlived its snapshot names nothing rather than pointing every launch at a corpse.
-
-Verification records **which kernel proved it**, and does so under the same cluster lock that reaping takes. The two have to exclude each other: a reap landing between "this booted" and "this is verified" would leave a generation the whole fleet takes up with no kernel recorded, and each node would boot it against whatever it happens to be configured with. Note that a probe boots either way — a clone outlives the snapshot it came from — so a verification can genuinely succeed against a generation somebody deleted while it ran.
-
-### Where images come from
-
-Every deployment needs the same guest: Ubuntu, Docker, the Actions runner, billet's agent.
-Nothing in it is specific to an organisation, so billet builds it **once, centrally**, and
-a deployment pulls it:
-
-```
-billet images pull ubuntu-2404-x64
-billet images verify ubuntu-2404-x64@<generation>
-billet images compatible                 # prove every configured Firecracker image speaks this binary's contract
-```
-
-The built-in source reads `current.json` and its Sigstore bundle from billet's `guest-channel` branch, verifies that the main publication workflow signed a still-current pointer attesting to an immutable dated `guest-YYYYMMDD-HHMMSS` prerelease, then downloads that release. The pointer expires after ten days, so rewriting the mutable branch with an older genuine channel cannot silently pin a fleet there. There is deliberately no rolling `guest-latest` release: repository release immutability locks a published tag and its assets, while GitHub's repository-wide `latest` alias belongs to billet's binary installer. The raw pointer avoids spending GitHub's anonymous REST budget when many nodes share one egress address. A configured mirror remains a direct asset base URL and bypasses first-party discovery.
-
-`billet images pull --verify` combines import, a real guest boot and promotion, and `--result-file` records the exact imported generation only after every requested verification succeeds. A verified generation is fleet-wide shared state and is deliberately left published if a later host upgrade fails: another upgraded host may already depend on it, while immutable unused generations remain safe for ordinary retention to collect. Reaping replans under the same publication lock and refuses to remove a generation whose verification or guest contract changed after the operator's preview. With no explicit image, `billet images compatible` checks every distinct Firecracker image in the catalogue and `--result-file` writes the bare names of floating images that need replacement; automatic image selection resolves an omitted `node.name` from the node TLS certificate before applying node-pinned tier constraints. A matching already imported generation is boot-verified before another multi-gigabyte copy is downloaded, and a generation published before contract metadata existed is boot-verified once and backfilled instead of being replaced speculatively. Exact incompatible pins are refused rather than silently redirected. `@verified` and generation retention are contract-relative: during a rolling upgrade, an older binary keeps resolving and retaining its newest compatible verified generation while the new binary may select the newer contract it just proved.
-
-The pull fetches a signed manifest, refuses anything this build cannot use, checks each
-asset against the digest the manifest names, unpacks, and publishes the result as a
-generation. It stages to disk and verifies **before** importing — streaming straight into
-the cluster would put unverified bytes into shared storage, where undoing it is a cluster
-operation rather than deleting a file.
-
-### Who published this, and why the signature is the load-bearing check
-
-Every asset is verified against a digest **the manifest names**. That is worth nothing on
-its own: a manifest somebody else serves names digests of bytes they chose, and every one
-of those checks passes. The signature is the only thing binding the manifest to the
-workflow that produced it, so without it the rest is a checksum against itself.
-
-So a pull verifies the signature over the bytes that arrived, before parsing anything out
-of them, against a pinned identity:
-
-```
-https://github.com/junioryono/billet/.github/workflows/guest-image.yml@refs/heads/main
-```
-
-Pinned to the **workflow and the ref**, not the repository. A certificate's identity is
-whatever workflow requested it on whatever ref it ran on, so pinning the repository alone
-would accept a signature from any workflow in it — including one added by a pull request,
-which is a far lower bar to clear than compromising the release process.
-
-Sigstore's trust root is embedded in the binary rather than fetched. A node that may be
-air-gapped cannot reach sigstore's CDN, and the verification library refreshes its TUF
-cache whenever it expires — so relying on TUF at verification time means depending on the
-one thing an air-gapped node does not have.
-
-**A source that is not billet's own must say what would make it trustworthy.** Pointing at
-your own mirror and configuring nothing is refused rather than silently unverified:
-
-```yaml
-images:
-  source: https://mirror.internal/billet
-  signing_identity: ^https://github\.com/acme/images/.*$
-  signing_issuer: https://token.actions.githubusercontent.com
-```
-
-or `--skip-signature-verification`, which is deliberate rather than what happens by
-default.
-
-**Sideloading is verified the same way.** `--from <dir>` exists for a deployment with no route to the internet, and it applies the same policy to the same signature — a directory is not more trustworthy than a download, it is less, because nothing about how it arrived is even in principle observable. Its assets are copied into billet's own staging *while being hashed*, rather than checked where they sit: a file verified in place can be replaced before it is read, and then the bytes reaching the cluster are bytes nothing checked.
-
-**This used to be a per-node timer that rebuilt the image on every machine.** That is
-gone. It required root, debootstrap and an hour on every node, it had every operator
-independently discover GitHub's thirty-day rule, and it made N machines do N builds of a
-byte-identical artifact. Building centrally makes the expiry one project's problem instead
-of everybody's.
-
-`scripts/build-guest-image.sh` remains, for a custom image or an air-gapped build. It is
-no longer the normal path.
-
-### What is checked before an image is published
-
-Nothing reaches a release without passing both halves of a gate, because an image that
-reaches a release is one every deployment pulls — a bad one fans out to everybody on the
-next refresh, and the thing that would rebuild it is itself a guest booting the image.
-
-**Its contents**, by loop-mounting the filesystem read-only: the runner is installed and is the version the manifest claims, Docker and its Buildx and Compose plugins are there, the agent's contract matches what the manifest advertises, the units that must start are *enabled* rather than merely present, and root is locked rather than passwordless.
-
-**That it boots**, under Firecracker, on the runner that built it. The guest is served a
-metadata contract it is required to refuse, and its refusal on the console proves the
-whole chain: the kernel booted this filesystem, systemd reached its target, the network
-came up, the metadata service answered, and the agent ran and parsed what it got. A pass
-is that sentence — not a clean exit, because Firecracker exits 0 on some guest-side
-failures.
-
-The two catch different things and neither replaces the other. Contents cannot see an
-integration failure; a boot cannot see that a unit was installed but never enabled.
-
-### The kernel and the filesystem are a matched pair
-
-A guest booted with a different kernel fails in the middle of somebody's job, so they are
-published together and the generation records which kernel it was paired with. A pull
-keeps the kernel it fetched in `/var/lib/billet/kernels`, named by version *and* digest —
-version alone does not identify a file, since two builds can produce the same version from
-different sources.
-
-**The local half is committed before the remote half exists.** A generation is Ceph
-metadata naming an exact kernel filename, and it outlives the machine that published it —
-so the pull installs the kernel durably first: mode, then file sync, then the atomic
-rename, then an fsync of the directory that holds the name. That last step is the one
-`fsync(2)` says is required and the one that was missing; without it a power loss could
-leave a complete published generation whose kernel disappeared in recovery, and every node
-would resolve a verified generation it could not boot. If any of those steps fails,
-nothing remote is attempted, and re-running the pull re-verifies the kernel and commits
-the name.
-
-`billet images reap` collects kernels no surviving generation names. It refuses while any
-generation's kernel is unknown: such a generation still boots something on disk, unnamed
-and indistinguishable from an orphan, and deleting it breaks the generation that boots it.
-
-### Taking up a new runner release
-
-`billet runner check` exits **0** while there is nothing to do, **2** once a rebuild is
-due, and **3** once GitHub is already refusing — distinct because the second is a task and
-the third is an outage. Failing to *reach* GitHub is none of the three: it is an error,
-because a machine with no egress cannot find out, and reporting that as an expiring fleet
-is the false alarm that teaches people to ignore the true one.
-
-**The clock starts at the first release newer than yours, not at the newest one.** Every
-major, minor and patch release is an available update, so a runner that missed two
-releases has been on the clock since the first of them — and counting from the newest
-moves a deadline that has already passed every time something else ships. Concretely:
-2.334.0 went out of date when 2.335.0 was published on 2026-06-08, so its window closed on
-2026-07-08; counting from 2.336.0 on 2026-07-20 gives 2026-08-19 and describes a fleet
-GitHub had been refusing for six weeks as having a month in hand. One calculation over
-`(installed version, stable release history)` answers it, and both `billet runner check`
-and `billet images pull` ask that one. Prereleases are not updates and do not start it.
-
-Two things it will not do. It never states a deadline it cannot place: a version older
-than the history it reads is its own answer — expiry is still *provable* there, because
-the real window opened no later than the earliest release it can see, but "how long is
-left" is not, so it says so rather than printing a number. And 30 days is the **ordinary**
-window rather than a promise: GitHub may enforce a critical security release at once, and
-it publishes no endpoint saying what it will refuse.
-
-`billet images pull` asks the same question about the runner baked into the image it is
-importing, refuses only when the window is *proved* closed (`--allow-stale` overrides, and
-skips the lookup), and says **cannot determine** when it could not ask. It used to refuse
-at `built_at + 30 days`, which is evidence about neither direction: an image built the day
-a release shipped is still current a year later if nothing else shipped, and one built
-yesterday around a runner three releases behind is already refused. Image age is still
-reported — it says a weekly build has been missed — and it decides nothing.
-
-The version and its checksum live on one line in `internal/runnerrelease/pinned.txt`,
-because a checksum is only true of its version — and a daily workflow watches
-`actions/runner` and opens a pull request when a release lands, so keeping source current
-is a review rather than a reminder. Merging is deliberately the gate: a bad runner release
-should not reach a fleet without somebody agreeing to it.
-
-The scheduled refresh does not wait for that. It builds at **whatever GitHub has
-published**, and records the version it installed on the image itself — which is what
-`billet runner check` reads, because the image is the only thing that knows what the fleet
-is actually running. The compiled-in pin says what a build *would* install, and the two
-part company the moment a scheduled rebuild takes up a newer release.
-
-## Status
-
-billet is pre-alpha. **Jobs run end to end through the Docker, Firecracker, EC2 and Tart providers**, and the same-label local-to-cloud failover path has completed against real GitHub and AWS infrastructure. What works **today**:
-
-| | |
-|---|---|
-| `billet github-app create` | Creates and installs the GitHub App via the manifest flow |
-| `billet check` | Validates the config, the App private key, and the state database; reports every registered node's site and liveness. For an EC2 node it also reports that node's conservative compute-only peak implied by its declared shape prices and resource ceilings |
-| `billet server --dry-run` | Connects to a real org, reconciles scale sets, polls — accepts nothing |
-| `billet server` | The control plane, serving the node wire. It runs no compute of its own — a machine that should also run jobs runs `billet node` beside it. A fleet with no live node advertises zero, so an empty fleet is told to GitHub rather than discovered when a job fails to launch |
-| `billet node` | A compute host: dials the control plane, never listens. One per machine, including the machine the server is on |
-| `billet node --enroll` | Asks a control plane to admit this machine, printing the fingerprint an operator compares |
-| `billet nodes pending` | Shows what is waiting to be let in, with the fingerprint to check |
-| `billet nodes approve <node> --fingerprint <fp>` | Admits the machine whose fingerprint you compared |
-| `billet ca token` | Mints the short-lived credential a machine needs to ask |
-| `billet ca show` | The authority's fingerprint and expiry, and a warning once it is close enough to expiry to be shortening every certificate it issues. It does **not** report whether a rotation is running |
-| `billet ca issue <node>` | Mints a certificate directly, for a machine you are provisioning anyway |
-| `billet nodes revoke <node>` | Withdraws every credential that machine holds, renewals included |
-| `billet ca revoke <node> --cert <path>` | Withdraws one specific certificate |
-| `billet ca rotate` / `retire` | Replaces the authority as an overlap, so no node is cut off |
-| `billet leases` | Every custody, teardown, and quarantine hold, with its node and age |
-| `billet leases quarantined` | The compatibility view limited to holders that vanished |
-| `billet leases release <lease> --force` | Hands capacity back on your assertion that its compute is gone; a live holder is told to drop custody first |
-| `billet leases failures` | Jobs GitHub did not report as succeeded, on leases billet's own infrastructure had disrupted — its host stopped answering, its guest went missing from an inventory, or the machine was reclaimed. Two facts side by side and no verdict between them: billet cannot tell a broken host from a broken build, and it **does not re-run anything**, because a re-run is a side effect on your repository and a deploy must not happen twice because a machine went away. `--since` (default 24h) and `--limit` bound it |
-| `billet cache conformance install` | Installs a deterministic consumer-owned cache conformance workflow whose jobs can be authorized by an exact-workflow restricted runner group; the resolved Billet commit SHA, runner, guest contract, and one trusted label are baked into the generated gate |
-| `billet ami build` | Builds the AWS machine image the `ec2` backend launches. It reads the same pinned declaration as the Firecracker guest image and runs the same installers — one file, sourced by the guest build and carried to the builder — so a workflow finds the declared apt set, the node/go/Python/PyPy/Ruby/CodeQL toolcache and the five JDKs on either backend, on **x64 and arm64 alike**: every vendor's architecture spelling comes from one variable, and the one line arm64 has no publisher for (CodeQL) is recorded rather than skipped silently. The heavyweight software ADR-005 lists (.NET, Android, browsers) is on neither backend yet. It then **boots the image it made** and asserts the contract on the artifact rather than on the builder (`--verify=false` opts out, and leaves the image unstamped). **An AMI id is region-scoped**, so a tier's `image:` or `launch.ec2.image` only works in the region it was built for |
-| `billet ami verify <ami-id>` | Boots an AMI, makes it prove the free space cloud-init gave it, that its Docker daemon starts with the classic image store, and that the runner and every declared toolcache line execute **as the runner account under the job's own `env -i`** — then stamps `AMIContract` on it with `CreateTags`. The tag is the promotion: an image billet has not booted carries none, and `billet check` reports it as needing a rebuild. This is what a build calls, and what makes a failed verification recoverable without buying a second builder |
-| `billet teardown` | Removes the scale sets billet created |
-| Capacity ledger | Lease state machine, fencing epochs, placement enforcement, escrow before advertising |
-| Docker provider | One container per job, JIT registration delivered off argv. **Trials only** — shares the host kernel, so it refuses anything not established as trusted |
-| EC2 provider | One instance per job, in one subnet. The instance IS the isolation boundary, so unlike Docker it may run fork pull-request code — but only once `untrusted_security_group_ids` describes a network for it, because an instance isolates the kernel and not the VPC. A launch is idempotent by lease id, so an ambiguous retry cannot start two machines for one job. Real private-repository jobs have exercised JIT registration, Docker builds, service containers, runtime toolchain installation, same-label local-to-cloud failover and a live FIS Spot interruption, with every instance destroyed afterward. Three cold launches reached the first job step in 47.6–58.7 seconds ([AWS acceptance](docs/aws-acceptance.md)) |
-| Crash recovery | A job running when the controller dies is adopted and left to finish, not killed; its capacity stays held |
-| Per-machine capacity | Each node reports what it contributes; a tier advertises the smaller of the deployment ceiling and what its machines can hold. An EC2 node also reports its ordered purchasable shapes, so placement charges the selected shape rather than the usually smaller tier request. Each shape carries an operator-audited hourly price: `billet check` reports one node's conservative peak before credentials are tested, and `billet status` reports the deployment-wide peak across registered EC2 nodes under the shared ceiling. A host nothing can reach stops backing advertisements |
-| Placement | The control plane chooses the machine when the work is admitted, by provider preference, then packing (`placement: spread` to even the load instead), then name. Reserved floors are held against the machines that could keep them |
-| Sites | A node says where it is; a tier may insist on a place. Cache implementations namespace data by site, and the control plane rejects a split-config node whose provider cannot use that site's declared store. The cross-node/cross-site behavior still needs a real integration proof |
-| Graceful drain | SIGTERM stops new admission and waits for the jobs already running, for as long as they run — no deadline, and nothing destroys them. `drain_timeout` only decides when Billet starts reporting a long drain. A second signal ends the wait and leaves the work running. A node that stops cleanly withdraws itself from placement at once; one that dies is forgotten only by silence. `billet force-destroy` is the one operation that ends running work, and it can be reached no other way. See [Updating](#updating) and [docs/upgrades.md](docs/upgrades.md) |
-| Release pipeline | GitHub-immutable tagged releases with attestations, checksums, `.deb`/`.rpm` packages with systemd units, an install script that verifies the published checksum, and immutable internal action references on every release tag |
-| Multi-backend tiers | One label can name several providers, and the preference ORDER decides: the control plane picks the host when the job is admitted, walking the tier's list most-preferred-first. Each backend gets its own `launch` entry because a Firecracker generation, an EC2 AMI and their runner commands are backend-specific. `[firecracker, ec2]` means the bare-metal box before the cloud, and live same-label acceptance has completed the same unchanged workflow locally and on EC2 after local capacity was removed |
-| Tart macOS guests | One job, one ephemeral macOS VM on an owned Apple Silicon Mac, through the `tart` CLI and Apple's Virtualization.framework. A real private-repository Xcode job has run to `** BUILD SUCCEEDED **` and the VM was destroyed afterwards. The registration travels on stdin to the guest agent, never argv and never the clone, and a launch is not called complete until the guest confirms the runner is alive — the delivery's own exit code is not believed. Apple's two-guests-per-Mac limit is enforced from the host's own refusal rather than from a reading of the licence. **You supply the image**: billet pulls what a tier names with `billet images pull` and refuses to pull inside a launch, because a macOS image is tens of gigabytes |
-| Tart Linux arm64 guests | The same backend, running native arm64 Linux on that Mac — and it does what a macOS guest cannot: a real job has built a Docker image and used a Postgres **service container**, neither of which is possible under Apple's hypervisor (no nested virtualization, no container runtime). The published `ghcr.io/cirruslabs/ubuntu` base image carries neither the Actions runner nor Docker; `ubuntu-runner-arm64` carries both |
-| Tart untrusted work | Refused until `node.tart.untrusted_isolation` names a mechanism, exactly as Firecracker refuses it without a separate bridge: a VM isolates the kernel, not the network, and tart's default NAT reaches the host and lets a guest spoof the vmnet bridge. `softnet` is the mechanism billet drives, and because it blocks the private address space it also blocks the guest's DHCP-assigned resolver — so billet configures a public resolver and PROVES resolution before delivering the registration. Measured in real Linux and macOS guests; a fork pull request has not yet been run end to end |
-| Mac host lifecycle | `billet local up`/`status`/`down`/`uninstall` manage the launch agents on an owned Mac, alongside the systemd units they already manage on Linux — one command layer imposing one order on two service managers. A launch AGENT rather than a daemon, because Virtualization.framework needs an unlocked login keychain a headless SSH session does not have, so these commands refuse to run as root. What billet checks is the job launchd **loaded**, not the plist on disk: launchd reads a plist once at bootstrap, so a node can run a stale five-second drain grace while its file is byte-identical to the shipped one. Killing the node mid-job re-adopts the exact guest and leaves the job running; SIGTERM drains instead. Still open: billet-built guest images with `@verified` promotion, a cache for Apple Silicon (`node.cache` is refused there today), and `update` |
-| Backup and restore | `billet local backup --out <dir>` captures a deployment as ONE unit — the SQLite ledger, the deployment identity, the GitHub App private key and the node-wire authority — because each is useless without the others: a ledger without its identity is a fresh authority that cannot see the compute the old one launched, an identity without the CA cannot issue a node certificate, and a CA without the App key cannot get a token. It runs against a LIVE control plane (SQLite's `VACUUM INTO` is a consistent snapshot, so no `-wal` travels beside it) and takes the same lock `ca rotate` and `ca retire` take, so it can never capture a key from one authority generation beside a certificate from another. `billet local restore --from <dir>` puts it back as one unit **or not at all**: every piece is absent (installed), byte-identical (already done), or different (preserved and REFUSED). There is no flag that overwrites one — a different App key is never replaced, because GitHub issues it once. `--dry-run` reports every refusal through the same code path the real restore takes. Locally it proves three things before publishing anything (the directory lock: no control plane holds it; the maintenance fence: no handle can transact, including one an operator command already has open; a writer barrier: any transaction that began before the fence has finished) — and NONE of them reaches another machine, so `--old-controller-fenced` is the operator asserting the old controller is stopped and disabled everywhere, and without it the restore refuses. An interrupted restore leaves the directory fenced with a journal beside it, so nothing can start on a half-restored deployment; re-run to resume, or `--abandon` to remove only what that run created and can still prove it wrote. A restore that runs as root hands what it wrote to the service account and says so path by path — on a packaged host it *must* run as root, because the App key lands in root-owned `/etc/billet`, and systemd's `StateDirectory=` will not repair anything underneath a directory whose own owner is already right. **The restore is rehearsed on every pull request**, in two legs: a control plane started on a restored directory that has never seen the deployment, serving the node that trusted the old one, and the real Debian package doing the same on a Linux host with the real service account. What that does NOT cover is written down in [docs/restore-rehearsal.md](docs/restore-rehearsal.md). **An archive on the disk it protects is not a backup**, so `backup.s3` in the config makes `billet local backup` upload what it just wrote (never instead of writing it) and `billet local restore --from-backup latest` fetch, verify and restore on a machine holding nothing but the binary — an `s3://` URL could not replace that config, because it carries no region and SigV4 signs one into every request. billet **never deletes** from the bucket: `internal/archivestore` has no delete operation and the generated IAM grant carries none, so the credential on the host that also holds the App key cannot destroy the copies that exist to survive losing that host — retention is the bucket's, through versioning and a lifecycle rule on noncurrent versions. Every write refuses to replace (`If-None-Match: *`), the manifest is uploaded LAST so a half-finished upload is not an archive anything will offer you, credentials are env-or-IMDSv2 only, and an `endpoint` addresses Ceph RGW, MinIO or R2 path-style. `billet check` reports the newest archive and its age, because a timer that stopped firing looks exactly like one that is working. **`billet local recover`** is the operation restore deliberately refuses — putting a deployment back over ITSELF, with a ledger that has rows in it. It is a separate command rather than a flag: it refuses unless the archive is this host's own deployment (so it can never relabel one), seals the deployment, waits for `alloc.Quiescence` to report it holding nothing, and REFUSES while work is outstanding unless `--accept-failing-jobs`, which names every job it strands by tier, node, phase and run id. The ledger it replaces is renamed to `billet.db.superseded-<taken-at>` and never deleted — it is the only record of the work that operation failed — and the deployment is sealed AGAIN afterwards, because the restored ledger carries the admission it had when the backup was taken (open), and a recovered control plane must not take new work while its nodes hold compute it has never heard of. `--abandon` puts the superseded ledger back |
-| Firecracker microVMs | One job, one guest kernel, on bare metal. Under the jailer always: chrooted, dropped to its own unprivileged uid, in a cgroup, with a seccomp filter. The root disk is a copy-on-write RBD clone of a golden image, discarded with the guest, and the runner registration is delivered through the metadata service so it is never in argv and never on a disk. The guest image exists too: `scripts/build-guest-image.sh` builds and publishes it, and a guest boots, takes its registration and runs a container in about ten seconds. See [Guest images](#guest-images) |
-
-**Not built:** observability and the dashboard. Both cache stores have site-local immutable generations, active-clone leases, ext4 verification, fenced CAS publication and inactivity eviction: Ceph uses RBD clones, while AWS uses encrypted EBS volumes and snapshots with the authoritative pointer in S3. AWS state objects are namespaced by deployment and site, and every targeted EBS deletion rechecks both ownership tags before acting; IAM conditions on those same tags and the owner-specific S3 prefix remain the account-level backstop. Firecracker reserves five hot-attach slots per guest; EC2 resolves its one-job instance and attaches owned volumes to it at workflow runtime. The sticky-disk and BuildKit actions are implemented against those paths, but still need their issues' real warm-workflow, failed-job, and power-cut proofs. Firecracker and EC2 guests now request a deployment-, site-, and architecture-scoped `/var/lib/docker` volume before the runner starts. Fresh Docker 29 installations are explicitly kept on the supported `overlay2` backend because its default containerd image store keeps image content in `/var/lib/containerd`, outside that independently fenced volume. A changed store becomes eligible only after the pinned runner reports a clean one-job result and the guest unmounts and checks it; GitHub's independent `succeeded` completion opens the bounded settlement window. The readiness call is cooperative coordination rather than an intra-guest security boundary—workflow code has passwordless sudo and Docker-root equivalence—so the tier's static pool trust policy and GitHub's result remain the publication authority. The control plane records that authoritative result, fenced lease identity and bound holder in SQLite before acknowledging GitHub. Settlement retires the record without replaying teardown, and physical removal waits until both settlement and the source acknowledgement are durable, so either ordering survives restart without exposing a reused request ID to stale teardown. Published generations remain for eight inactive days, while failures, cancellations, no change, untrusted workloads and unknown results discard the job's clone. Untrusted work may read the deployment's trusted baseline but never changes it, so a deployment that pulls private images treats those image layers as visible to every job admitted to that deployment. A tier bounds each persistent BuildKit mount independently, and three optional site-local registry mirrors cover BuildKit's Docker Hub, GHCR, and Quay pulls while Docker Engine uses the Docker Hub mirror it supports. Cache availability and commit errors degrade to warnings, and untrusted jobs discard their writes. Transparent `actions/cache` interception is opt-in on Linux Firecracker tiers: the node handles only the three CacheService v2 methods, leaves ArtifactService on GitHub, authenticates the VM's cache session without decoding GitHub's token, propagates its CA through host and container action paths, and consults a central organisation/repository kill switch before every local operation. The live pinned/current action matrix remains the promotion gate for interception-enabled images and runner releases; see [Transparent Actions cache](docs/actions-cache.md). An EC2 node's `max_vcpu` and `max_memory` are hard resource budgets: the allocator charges the selected purchasable shape, and a fallback is authorised against both the node and deployment ceilings before its AWS request is sent. The enforceable price policy is the shape allowlist—do not declare one you are unwilling to buy—while each required `price_usd_per_hour` lets `billet check` report one node's conservative compute-only peak and `billet status` report the deployment-wide peak across registered EC2 nodes under the shared ceiling. The report is not an admission gate: copied prices can go stale, so AWS Budgets is the account-wide backstop. Spot remains off by default; when enabled it requires an EventBridge-to-SQS warning queue in the same region, records the reclaim reason durably, and starts teardown without waiting for lease expiry. A live FIS interruption has exercised that full path ([AWS acceptance](docs/aws-acceptance.md)).
-
-**billet runs a fleet, with one thing still missing before it is worth having one.** Capacity is a
-figure per machine, so hosts of different sizes can be described and a tier advertises only what its
-machines can actually hold. The control plane chooses the host when the work is ADMITTED — which is
-what finally makes `providers: [firecracker, ec2]` mean "the machine at home first, the cloud if you
-must" — and a destroy goes to the machine holding the container rather than to everyone.
-
-Within a correctly configured site, **cache bytes live in shared storage rather than on the machine that built them**: a Ceph node can clone an RBD generation, and an EC2 node can create an EBS volume from a snapshot. The server's declared store is authoritative for every registering node; what remains is the real same-site sharing and cross-site cold integration proof.
-
-**A terminate request is not a stopped guest**, and billet no longer pretends otherwise. `TerminateInstances` returns when the request is *accepted* while the machine keeps running for a minute or two, so this backend reports its teardown as requested rather than confirmed and the node keeps that lease charged. A targeted lookup retains EC2's explicit `terminated` record as causal proof even though fleet inventory excludes historical instances; if that record is unavailable, absence must remain uninterrupted through the full remote-consistency window. Waiting inside the teardown was never the fix — a node runs one command at a time, so it would stall every launch queued behind it. A wedged teardown stays charged rather than being released on elapsed time, appears in `billet status` and `billet leases`, and can be explicitly forced without stopping a healthy node.
-
-**A shape AWS has none of falls through to the next one you declared.** `InsufficientInstanceCapacity` is the likeliest way a cloud launch fails for a reason retrying cannot fix, so billet walks `instance_types` in your order until one starts. It only does that after a refusal AWS returns synchronously, having launched nothing; after an *ambiguous* failure it stops, because a second attempt could leave two machines carrying one job's name.
-
-**One ec2 node is a serial launch queue**, because a node executes one command at a time. That is invisible for a backend where a node is one machine's worth of jobs and visible for one where a single node can stand for sixty — so a large cloud fleet wants several ec2 nodes, each registered separately with its own budget, rather than one with a large one.
-
-Spot warnings are routed one queue per node. The router resolves the warned instance's `sh.billet.node` tag and targets only that node's queue; the queue name must equal the node's effective identity, taken from `node.name` or its certificate. A shared SQS queue is refused as a deployment shape because one consumer hides a message for the visibility timeout, which can consume the whole two-minute warning before the owner sees it.
-
-**The cloud runner path and same-label multi-provider failover are proven end to end.** Real private-repository jobs have launched on EC2, registered through JIT configuration, used Docker and a service container, installed Go at runtime, completed green, and left no live instance behind. The same unchanged workflow also completed first on preferred local capacity and then on EC2 after that local contribution was withdrawn. EBS/S3 cache behavior still uses fake AWS boundaries. See [AWS acceptance](docs/aws-acceptance.md); the remaining real multi-node and cross-site cache acceptance is still open.
-
-The owner namespace is the EC2 cache isolation boundary. Pre-release S3 state objects written without a deployment-and-site owner are deliberately ignored and are never migrated automatically: their key cannot prove which deployment owns the referenced snapshots. An operator upgrading an experimental deployment from that layout must drain its EC2 nodes, remove its old unnamespaced state, and let the cache repopulate under the owner-specific prefix.
-
-### Adding a second machine
-
-A control plane bound to a network address requires client certificates, and mints its own authority to issue them. There is no CA to run and nothing to install.
-
-**The machine asks, and you approve a fingerprint.** Two ends display the same number and you check they match — that comparison is the trust decision, and everything else is transport.
-
-```bash
-# on the control plane
-billet ca show                      # prints the authority's fingerprint
-billet ca token                     # prints a short-lived join token
-
-# on the new machine
-billet node --enroll \
-  --ca-fingerprint SHA256:...  \
-  --join-token h7q2...              # prints THIS machine's fingerprint, then waits
-
-# back on the control plane
-billet nodes pending                # shows the same fingerprint, if nothing is in the way
-billet nodes approve mac-mini-1 --fingerprint SHA256:...
-```
-
-Neither side accepts on faith. The node refuses to enroll without the authority's fingerprint, because its first connection has nothing to verify against — accepting whatever answered would let anyone who replies first own every job that node runs. And approval refuses without the node's fingerprint, because approving by name alone approves whatever currently holds the name.
-
-The join token is what stops a stranger who can reach the port filling that pending list, or taking a name before the machine that should have it. It is short-lived, counted, and stored as a hash.
-
-**Enrollment is served on its own port, and its absence is a refusal.** Those two routes — reading the authority, and asking to join — cannot require a certificate, because a machine that has not enrolled has none. So they are not on the node wire: that listener demands a certificate in the TLS handshake and serves nothing else, which is what keeps a caller who can prove nothing from occupying connections the fleet needs. They are on `server.bootstrap_listen` instead, which is unset by default — a control plane without one does not enroll over the network at all, and `billet ca issue` below is the way in. Set it when you want a machine to be able to ask, and close the port again afterwards: nothing a running fleet does goes through it. `billet ca token` prints the whole command including `--bootstrap-addr`, so the address travels with the fingerprint and the token.
-
-**Or issue a certificate directly**, which is right for a machine you are provisioning anyway — cloud-init can drop a bundle on it, and no human is standing there to compare a fingerprint:
-
-```bash
-# on the control plane
-billet ca issue mac-mini-1          # writes ./mac-mini-1-billet-tls/
-scp -r mac-mini-1-billet-tls mac-mini-1:/etc/billet/tls
-
-# in that host's billet.yaml — node.name comes from the certificate
-node:
-  server_addr: billet.example:7717
-  tls:
-    cert: /etc/billet/tls/node.crt
-    key:  /etc/billet/tls/node.key
-    ca:   /etc/billet/tls/ca.crt
-```
-
-Both paths are recorded, so `billet nodes pending --all` is the single answer to what has been admitted and when.
-
-**A node registers itself, and the fleet is not something you edit.** Registration is dynamic and never asks whether a host was declared anywhere: it negotiates a mutually supported protocol version, then checks a non-empty name, the deployment identity, that the contribution is non-zero, and that the site is one this deployment declares. The allocator then requires a provider, and refuses to move a host to a different provider or site while leases are still outstanding against it. So `nodes:` is policy *about* hosts rather than a roster *of* them. The one config fact registration does enforce is `sites:` — a node claiming a site the control plane has never heard of is refused rather than recorded, because a typo would otherwise become a place of its own with a cache that is always empty.
-
-**And the operator commands run against a live control plane**, which is when you actually need them. `billet nodes pending|approve|deny|revoke`, `ca token|issue|revoke|revocations`, `cache enable|disable`, `status`, `leases|release` and `check` reach the ledger without taking the exclusive lock the server holds: that lock exists to stop two control planes writing conflicting scheduling decisions, and a one-shot command is not one — it makes no scheduling decisions, and the writes it does make are ordinary transactions SQLite serialises against the server's own.
-
-What they deliberately will **not** do is migrate a ledger another process is HOLDING. Run a newer billet's CLI against an older running control plane and it refuses rather than upgrading a schema that plane is mid-transaction against, and tells you which side to restart. A **stopped** deployment is the other case and it does migrate: whoever opens the ledger first creates or upgrades it, which is what lets `billet ca issue` work on a fresh install before any server exists — so running a newer binary's command against a stopped older deployment upgrades its schema, and that older server will then refuse to start. Upgrade the server binary at the same time. The reusable host role owns that transaction: before replacing desired-state files it preserves the installed configuration, units and binary, records the old identity, exact systemd enablement and active-service state in a durable manifest, and claims `/var/lib/billet/upgrades/active` with a no-replace hard link so concurrent controllers cannot own the same host. It proves only the configured Firecracker images eligible for this node, drains node then server, removes the installed executable, establishes the maintenance fence, commits a stopped-ledger snapshot, and only then installs and validates the candidate. The role accepts only distinct dedicated state directories below `/var/lib/billet`, refuses symlinks, and will not recursively change ownership through an arbitrary configured path. New and already-open operator handles remain excluded throughout backup, migration, probe startup, and possible restoration. Candidate units use an explicit quiescent upgrade mode that opens and validates the fenced ledger or initializes the provider but never polls GitHub, registers a node, dispatches, or accepts workload; steady-state units contain no maintenance bypass. After the probes remain stable, the role installs the steady units, persists desired enablement, flushes every mutated filesystem, records the durable decision, opens the fence, starts full services in server-then-node order, proves their stability, and only then removes the active pointer. If Ansible or the host stops while the pointer exists, the next converge inspects it before account, package, Firecracker, network, Ceph, or other desired-state work and then requires a fresh run. An uncommitted transaction proves both services terminal with zero main/control PIDs and conclusively empty or absent cgroups before touching the ledger, validates the completed snapshot before removing current state, restores the configuration, units, binary, exact enablement and ledger, durably records the rollback, and only then reopens administration and restarts the previously active services. A transaction already bearing either commit record retries only committed finalization, leaving the pointer in place until full services are stable, so an interruption after the fence opens can never cause later operator writes to be replaced by the old snapshot. If any prerequisite or inactivity evidence is inconclusive, the active pointer and recovery copy are left untouched for the operator. A command that needs to *write* while the plane happens to be mid-decision waits for it, and if it waits too long it stops and says so rather than hanging silently. Some commands commit more than one transaction — `nodes revoke` records each older certificate before withdrawing them — so it tells you that whatever it had already done stands, rather than pretending it was a no-op. A command that only reads never waits for the write lock at all, and no command re-verifies the whole ledger on the way in — that scan belongs to the control plane, which is about to schedule against it, and `billet check` asks for it explicitly. So `status`, `leases` and `nodes pending` answer immediately however busy or however old the deployment is.
-
-| Action | Control-plane restart? |
-|---|---|
-| A registered machine reconnecting | **No** — it re-registers itself |
-| Admitting a **new** machine | **No** — enroll it, approve the fingerprint, and it joins |
-| Reclaiming stranded capacity | **No** — `leases release --force` works on a running deployment, which is the only place quarantine happens |
-| Add or change a **tier** | **Yes** — tiers are read at startup, and each becomes one scale set |
-| Change the `nodes:` policy block | **Yes** — it is snapshotted into the allocator at construction and enforced during placement |
-
-The name in the certificate is the only thing that decides which node a request is from — a host holding a bundle can act as that node and as nothing else. The certificate also carries which **deployment** it belongs to, so a fresh host does not invent an identity the control plane would refuse.
-
-**Certificates renew themselves** when less than a third of their life remains, over the wire, with the private key never leaving the node. A certificate that has already expired cannot renew — renewal is authenticated by the certificate being renewed — so that machine has to be re-enrolled. For a full-life certificate the window is months, and the usual way to miss it is a host that was powered off throughout. It is not the only way: the window is a third of the certificate's *own* life, so it shrinks as the authority approaches its expiry and starts capping what it issues, and a long control-plane outage or a renewal that keeps failing to install can carry a running node through expiry too.
-
-**Taking one back:** `billet nodes revoke <node>` withdraws every credential that machine currently holds, and each is refused on the very next request it makes rather than at its expiry. Revoke the **node**, not a file — because a node renews itself, the bundle you issued names a serial it stopped presenting months ago, and taking that one back would report success and change nothing. A certificate issued in a later second is unaffected, so a rebuilt machine can keep its name — the cutoff is whole-second and resolves its own second toward refusing, so mint the replacement a second later rather than instantly. `billet ca revoke <node> --cert <path>` still withdraws one specific credential when that is what you mean.
-
-One residual, because it is the kind of thing that should not be found out during an incident: everything issued since the credential ledger existed is revoked by **serial**, where no clock is involved, but a legacy certificate whose serial was never recorded is caught by the cutoff instead — and a cutoff is a comparison between two clocks. A certificate minted by an authority running ahead of the control plane can carry a date after the cutoff and survive it. If you cannot enumerate what a compromised host holds, or you do not trust the clocks, rotate the authority rather than relying on the cutoff.
-
-**Replacing the authority** is an overlap rather than a switch, because a node trusts what it was given: `billet ca rotate` has the new authority issue node certificates while the old one still signs what the server presents and both stay trusted, nodes adopt the new one as they renew, and `billet ca retire` ends it once they have.
-
-Loopback stays plain HTTP, because there is nothing between the two processes to authenticate
-against. Anything else refuses to start without a certificate rather than serving unauthenticated on
-a network, which is the failure that looks like it works.
-
-Two things to know before relying on it. The **authority** is the cliff, not any single certificate: a leaf may not outlive the CA that signed it, so once the CA has less than a leaf's lifetime left, every certificate it issues is quietly shorter than the last. Renewals keep working and come round faster and faster, nothing errors, and then every node in the fleet expires on the day the authority does. `billet ca show` warns once that starts, because it is invisible otherwise, and `billet ca rotate` is the answer rather than waiting for it.
-
-And a node's identity is its **name**, so two hosts configured with the same one are one host as far as the control plane is concerned. A per-process incarnation value is what routes new commands to the newest registration and stops a superseded process acting on work it was never given — but it does not tell a restart from a duplicate, and it deliberately lets a superseded process go on maintaining and reporting the work it already holds, because a draining process has to outlive its replacement. After a restart the plane still cannot say which of two machines sharing a name physically holds a given container. Give each host its own name.
-
-**The runner path has run against a real organization.** Docker remains exercised by the end-to-end suite against a scripted Actions service, while Firecracker has completed a real private-repository workflow and the EC2 path has completed the same unchanged workflow after local capacity was withdrawn, as well as handling a live FIS Spot interruption. The remaining live proofs are cache reuse, failure recovery, power-cut safety and cross-node site behavior.
-
-Everything below describes the intended design. Where a thing is not built, it says so.
-
-## Quickstart
-
-> **Setting up for the first time?** [Your first deployment](docs/first-deployment.md) walks the whole path on one Linux machine — including the GitHub-side steps this section assumes you have already done, and what to look at when a job sits in the queue. The commands below are the short form for someone who has an organization, a workflow-restricted runner group, and Docker already.
-
-
-> **Use `billet init` as the base for a Docker trial rather than copying `billet.example.yaml`.** The example describes the measured Firecracker deployment: it needs KVM, jailer, a guest bridge, scoped Ceph credentials, published guest images, and root. `billet init` instead writes a Docker-shaped config for an ordinary development machine with no block-device cache.
->
-> Docker shares the host kernel and is for trials rather than for untrusted code.
->
-> A Docker trial requires a non-default runner group and at least one exact workflow identity in its allowlist. `billet init` refuses to write a Docker config without both rather than generating a pool that cannot run or silently trusting arbitrary work. The runner group must restrict which repositories may use it, and every allowlisted workflow must run only revisions you control.
-
-```bash
-billet init --org myorg --runner-group 'Billet trusted' --workflow myorg/myrepo/.github/workflows/ci.yml@refs/heads/main --config ./billet.yaml
-billet github-app create --org myorg --config ./billet.yaml   # creates the App, fills the block in
-billet check --config ./billet.yaml                # validates config, key, state
-
-billet server --config ./billet.yaml               # then, in two terminals:
-billet node   --config ./billet.yaml               # the machine that runs the jobs
-```
-
-`billet init` measures this host and writes a ceiling below what it found, leaving room for the kernel, the container runtime and your shell. It picks a runner image that is actually pullable, points the state directories somewhere writable, and describes both roles in one file. Nothing in it has to be hand-edited: `github-app create --config` writes the App ids into the same file rather than printing a block to paste. Re-running `init` against an existing config converges the fields it owns and keeps everything else; if the file carries content it will not merge for you — edited values, sites, extra tiers — it writes `billet.yaml.new` beside it for a deliberate comparison instead of touching the original (`--force` overwrites outright). **Those are two different rules on one file, and each command says which one it is following.** `init` generates a whole config, so it replaces one only where it can prove nothing is lost; `github-app create --config` edits a single block into a config you already have — the one thing no generator can merge for you — and states that before it opens a browser. It also refuses a config that cannot take the block, or is not there at all, before anything reaches GitHub: the App private key is issued exactly once, so a config that cannot record it is not something to find out afterwards.
-
-**A single machine runs both roles**, as two processes reading that one file. They talk over the loopback address in `server.listen`, so nothing is exposed to the network and no certificates are involved: a control plane listening only on loopback serves plain HTTP, because there is nothing between two processes on one box to authenticate. Certificates start mattering when you add a second machine — `billet ca issue <node>` mints one, the new host's `node.name` comes from it, and the server then has to listen where that machine can reach it.
-
-**And Docker has to be there.** `billet check` never touches it, but `billet node` calls `docker ps` before it takes any work, to re-adopt containers from a previous run. No CLI, no running daemon, or no permission on the socket, and it stops there.
-
-`--config` is not optional here. billet deliberately does **not** read a
-`billet.yaml` from the working directory — a server started from a directory
-someone else can write to would otherwise adopt their config, which chooses the
-state directory, the App key path and every tier's resources. Without the flag
-it reads your user config directory (`billet check -h` prints the path).
-
-Then, once the runner plane exists, in a workflow:
+Then, in a workflow:
 
 ```yaml
 jobs:
   build:
-    runs-on: billet-4vcpu-ubuntu-2404
+    runs-on: billet-2vcpu
 ```
 
-## Architecture
+The runner group must be workflow-restricted before `init`, and the App is created in a browser. [Get started](https://billet.readthedocs.io/en/latest/getting-started/index.html) walks every step, including the one that costs an hour.
 
-One binary, two roles (the Nomad/Consul model):
+## Deployment shapes
 
-```
-billet server   control plane — scale-set listeners, capacity allocator, scheduler, state
-billet node     compute host  — runs a provider, launches instances, reports capacity
-```
+| Goal | Control plane | Compute | Guide |
+|---|---|---|---|
+| Try it on one computer | `billet server` and SQLite on it | Docker on the same machine, trusted workflows only | [Single host with Docker](https://billet.readthedocs.io/en/latest/deploying/single-host-docker.html) |
+| One Linux server, real isolation, a persistent cache | on the server | Firecracker guests and a Ceph pool on its disks, converged by Ansible | [A Linux Firecracker host](https://billet.readthedocs.io/en/latest/deploying/linux-firecracker-host.html) |
+| macOS or arm64 Linux jobs on a Mac you own | local, on the Mac, or in AWS | tart VMs on Apple Silicon | [Run jobs on a Mac](https://billet.readthedocs.io/en/latest/deploying/mac-tart.html) |
+| Everything in AWS | a small EC2 instance, SQLite on EBS | one EC2 instance per job | [AWS with EC2](https://billet.readthedocs.io/en/latest/deploying/aws-ec2.html) |
+| Managed macOS in AWS | in AWS | CodeBuild on a reserved Apple Silicon fleet | [AWS with CodeBuild](https://billet.readthedocs.io/en/latest/deploying/aws-codebuild.html) |
+| Owned hardware first, the cloud when it is not there | a small EC2 instance | local Firecracker, then EC2, under one label | [Hybrid](https://billet.readthedocs.io/en/latest/deploying/hybrid-owned-hardware.html) |
+| Controller failover | active and passive controllers on PostgreSQL | any fleet | [PostgreSQL and active-passive](https://billet.readthedocs.io/en/latest/deploying/postgres-and-active-passive.html) |
 
-One machine runs both as two processes over loopback; there is no combined mode.
+[Choose a shape](https://billet.readthedocs.io/en/latest/deploying/choose-a-shape.html) compares them by failure domain.
 
-```
-                 GitHub  ◄── outbound long-poll only, no inbound
+## Backends
+
+| Backend | Runs on | Boundary | Fork pull requests |
+|---|---|---|---|
+| `firecracker` | Linux with KVM and Ceph | a microVM under the jailer: its own kernel, chroot, uid, cgroup, seccomp | with a separate untrusted bridge |
+| `tart` | Apple Silicon | a VM under Apple's hypervisor; macOS or arm64 Linux guests | with softnet isolation |
+| `ec2` | AWS | one instance per job, destroyed with it | with a separate security group |
+| `codebuild` | AWS | one build per job on managed hosts, Linux or Apple Silicon | refused |
+| `docker` | anywhere with Docker | a container sharing the host kernel | refused |
+
+Storage is a property of the site: a Ceph pool for Firecracker hosts, EBS snapshots with an S3 pointer for EC2. The ledger is SQLite on local disk by default, or PostgreSQL when the controller should be rebuildable rather than restored.
+
+## How it works
+
+```text
+                 GitHub  ◄── outbound long-poll only; nothing inbound
                     ▲
               ┌─────┴──────┐
-              │   server   │   SQLite state · global capacity allocator
+              │   server   │   scale-set listeners · capacity ledger · scheduler
               └─────┬──────┘
-                    │  nodes dial OUT over mTLS
-        ┌───────────┼───────────┐
-        ▼           ▼           ▼
-   ┌─────────┐ ┌─────────┐ ┌─────────┐
-   │bare metal│ │Apple Si │ │   EC2   │
-   │firecracker│ │ planned│ │ per-job │
-   └─────────┘ └─────────┘ └─────────┘
+                    │  nodes dial OUT over mTLS (plain HTTP on loopback)
+        ┌───────────┼──────────────┬───────────────┐
+        ▼           ▼              ▼               ▼
+   ┌──────────┐ ┌──────────┐ ┌───────────┐ ┌────────────┐
+   │bare metal│ │ Apple Si │ │    EC2    │ │  CodeBuild │
+   │firecracker│ │   tart   │ │ per job   │ │  per job   │
+   └──────────┘ └──────────┘ └───────────┘ └────────────┘
 ```
 
-Runner tiers are **defined by you**, not chosen from a fixed catalog:
-
-```yaml
-tiers:
-  - label: billet-8vcpu-ubuntu-2404
-    provider: firecracker
-    vcpu: 8
-    memory: 32GiB
-    disk: 160GiB
-```
-
-For Firecracker and EC2, `disk` is usable root-volume capacity rather than a scheduling annotation. Firecracker grows only the job's copy-on-write clone and expands ext4 on the host before boot; the immutable golden image stays small and shared, including images published before this behavior existed. A zero value keeps that image size as the backend default. Docker runs on the host filesystem and ignores this field.
+One binary, two roles. `billet server` creates one GitHub runner scale set per tier, reserves capacity in its ledger before it advertises a slot, accepts a job, chooses the machine, and tells that machine's node to launch. `billet node` runs one provider, polls for commands, and hands each guest a single-use runner registration off argv. When GitHub reports completion the node destroys the compute and the capacity comes back, and only then. A control plane that restarts re-adopts the jobs already running; nothing billet does on its own destroys a running job. [How billet works](https://billet.readthedocs.io/en/latest/concepts/how-it-works.html) and [Tiers and capacity](https://billet.readthedocs.io/en/latest/concepts/tiers-and-capacity.html) go deeper.
 
 ## Security
 
-Read this before pointing `billet` at anything.
+billet is not a sandbox for untrusted code, and says so. Trust belongs to a runner pool, not to the event that scaled it up: every tier is untrusted unless promoted, and a trusted tier requires a workflow-restricted runner group that billet re-checks against GitHub before every registration it mints. Fork pull requests get arbitrary code execution on your hardware and are admitted only on a backend that is a real boundary with a network of its own; [GitHub's own guidance](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/manage-access) against self-hosted runners on public repositories applies. The App billet creates holds two permissions (metadata read, organization self-hosted runners read and write) and cannot read your code. The control plane runs unprivileged; the Linux node runs as root because Firecracker and the Docker socket require it, and the jailer drops every VM to its own uid. Caches are a deliberate cross-job channel, so do not cache secrets. Read [Trust and isolation](https://billet.readthedocs.io/en/latest/concepts/trust-and-isolation.html) before pointing billet at anything. To report a vulnerability, email the maintainer rather than opening an issue.
 
-**Trust belongs to a runner pool, not to the assignment that happened to scale it up.** GitHub registers a JIT runner into a scale set and may give it any job waiting in that set, so Billet never derives launch authority from `push` versus `pull_request`. Every tier is `trust: untrusted` unless explicitly promoted. A `trusted` tier requires a non-default runner group plus an exact `workflows` allowlist; Billet reads GitHub's runner-group policy at startup and again before minting each registration, and refuses policy drift. The operator is still responsible for ensuring those workflows do not execute untrusted revisions or triggers. Untrusted pools require a real isolation boundary and their separate network; Docker refuses them.
+## Documentation
 
-**Do not use self-hosted runners with public repositories.** This is
-[GitHub's own guidance](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/manage-access),
-not ours. Fork pull requests do not receive your secrets, but they *do* get arbitrary code execution
-on your hardware. `billet` isolates jobs in microVMs on bare metal, which helps — each job gets its own kernel — but **it does not make running untrusted code on your own machine safe, and billet will not pretend otherwise**. A microVM's boundary is the KERNEL, not the network it is attached to: a guest on your ordinary bridge reaches whatever that bridge reaches. Billet therefore refuses an untrusted pool until `node.firecracker.untrusted_bridge` names a separate network. The runtime never rewrites host networking; the optional Ansible role creates separate bridges and blocks their access to the host, private networks, link-local/cloud metadata and CGNAT by default, with deployment-specific additions supplied as variables. If you do not use that role, the equivalent policy is yours to write before enabling untrusted work. The same rule governs the `ec2` provider, which rents you the boundary instead of owning it. The `docker` provider shares the host kernel and refuses untrusted pools outright. Private repos with controlled workflows are the intended trusted shape.
+Everything is at [billet.readthedocs.io](https://billet.readthedocs.io/en/latest/).
 
-**Caches are a deliberate cross-job channel.** A job that writes a secret into a cached directory persists it for later jobs to read. Publication is an explicit fenced operation and the node discards every untrusted sticky-disk or image-store clone without failing its job, while transparent Actions-cache traffic from untrusted jobs remains on GitHub's service. Docker image stores are scoped by deployment, site and architecture; private images pulled by a trusted job are therefore readable by every later job admitted to that deployment boundary. User sticky-disk keys are exact and may deliberately cross repositories, so prefix ordinary keys with `${{ github.repository }}`. Nothing prevents a trusted job from leaking into its own cache: **don't cache secrets.**
+- **[Get started](https://billet.readthedocs.io/en/latest/getting-started/index.html)**: from nothing to a job in fifteen minutes.
+- **[Concepts](https://billet.readthedocs.io/en/latest/concepts/how-it-works.html)**: how it works, tiers and capacity, trust and isolation, sites and storage, identity and security, state and controllers.
+- **[Deploying](https://billet.readthedocs.io/en/latest/deploying/choose-a-shape.html)**: choose a shape; a single host; a Firecracker host; a Mac; AWS with EC2 or CodeBuild; hybrid; PostgreSQL and active-passive controllers; reaching your hosts.
+- **[Operating](https://billet.readthedocs.io/en/latest/operating/status-and-leases.html)**: status and leases, nodes, guest images, the Actions cache, upgrades, backup and recovery, draining and stopping, CA rotation, troubleshooting.
+- **[Reference](https://billet.readthedocs.io/en/latest/reference/cli.html)**: every command and every configuration key, what is proven, the reference hardware, the [architecture decisions](https://billet.readthedocs.io/en/latest/reference/decisions/index.html) and the [acceptance records](https://billet.readthedocs.io/en/latest/reference/records/index.html).
 
-**GitHub App permissions.** `billet` requests exactly two:
-
-| Permission | Level |
-|---|---|
-| Metadata | read |
-| Organization self-hosted runners | read & write |
-
-No repository *Contents* permission — `billet` cannot read your code. (It is not literally "no
-access to anything", and any project claiming that is overselling; the App can manage runners on your
-org, which is a real capability.)
-
-**Transparent `actions/cache` interception is opt-in and stays off on unqualified tiers.** GitHub exposes no supported custom cache URL, and `ACTIONS_RESULTS_URL` carries artifact metadata as well as cache traffic, so Billet terminates TLS only for that exact host and handles only the three CacheService v2 methods from the official toolkit client. ArtifactService, unknown clients and unknown methods remain upstream, and so does BuildKit `type=gha` unless a workflow opts in: a `docker-container` builder carries its own trust store, so it cannot verify the node's certificate at all, and it is served instead by a plaintext listener on the guest's loopback that the builder is pointed at explicitly with `url_v2` — Billet does the TLS to the node itself. A supervised guest forwarder falls back to GitHub when it cannot establish the node tunnel, and so does that adapter; the runner's supported job hook propagates proxy and CA state into job and action containers; and `billet cache disable` is the central organisation/repository kill switch. A workflow-restricted runner group cannot authorize jobs defined by Billet's cross-organization reusable workflow, so `billet cache conformance install` writes the full gate into the private consumer repository and pins the resolved Billet commit SHA and candidate contract there. See [Transparent Actions cache](docs/actions-cache.md) for configuration, failure semantics, and the live conformance gate.
-
-**EC2 cold-start measurement is built into images made by `billet ami build`.** Immediately before each `RunInstances` attempt billet puts its epoch in that attempt's user data. The image records when its runner entry point is ready, then GitHub's supported `ACTIONS_RUNNER_HOOK_JOB_STARTED` hook prints `billet timing: launch_to_job_start_ms=… launch_to_runner_ms=… runner_to_job_start_ms=…` before the first job step. Invalid or missing timing state exits successfully and prints nothing, so the probe cannot fail a workflow. Three cold runs reached the first job step in 47.609, 52.188 and 58.662 seconds; they spent 37.936–43.220 seconds reaching the runner and 9.673–15.442 seconds from runner readiness to the job. That is acceptable for fallback capacity and does not justify live, billable, unleased instances, so `warm_pool` remains refused. See [AWS acceptance](docs/aws-acceptance.md).
-
-## Compatibility caveats
-
-**There is no supported way to point `actions/cache` at your own server**, which is why transparent caching requires interception rather than a custom URL. [actions/toolkit#1051](https://github.com/actions/toolkit/issues/1051) — "add support for non-GitHub-hosted caching for self-hosted runners" — has been open since **April 2022**, and the PR to allow a custom cache URL is still unmerged. Billet therefore keeps interception off by default and leaves untrusted or centrally disabled scopes on GitHub's service.
-
-**The Actions Cache v2 protocol is reverse-engineered.** GitHub has never published the `.proto` files ([actions/toolkit#1931](https://github.com/actions/toolkit/issues/1931) has been open since January 2025), so Billet's exact three-method implementation is derived from the official generated TypeScript client and verified by a live conformance suite. **GitHub can change it without notice.** The checked-in gate runs moving-major and exact-commit cache clients, every setup action with an embedded cache client, host and job-container save/restore, artifact passthrough, and hostile environment probes. A cache failure is treated as a miss or warning; an interception-enabled image or runner release is not promoted until that candidate passes.
-
-**Apple Silicon support requires [Tart](https://tart.run), which is not open source.** Tart is
-licensed FSL-1.1-ALv2; each release converts to Apache-2.0 after two years, and competing commercial
-use is restricted. `billet` treats it as an optional external dependency you install yourself, the
-same as Docker or Ceph. `billet` itself is Apache-2.0 throughout.
-
-**A compute host needs Ceph, on the nodes' own NVMe.** A snapshot on one machine cannot be mounted on
-another, so a cache kept in local storage is a cache that pins every repository to the host that
-first built it. Ceph RBD gives the same snapshot-and-clone primitive from a pool any node at the site
-can map, which is what makes a cache a property of a *place* rather than of a machine — and it is
-what the commercial products run. The billet binary installs nothing; either run `cephadm bootstrap`, create two pools, run `ceph osd set-require-min-compat-client mimic`, and point `node.ceph` at them, or let the optional Ansible role perform those exact steps after you explicitly name the monitor address and every disk it may consume. That last command is not optional and `billet check` refuses a
-cluster without it: `cephadm` leaves a cluster cloning the old way, where a snapshot must be protected
-before it can be cloned and a protected snapshot with a live clone can be neither unprotected nor
-removed — so a cache generation any running job holds would be undeletable. On a single
-box it is honestly more moving parts than the ZFS pool it replaced,
-and the reason to adopt it anyway is that retrofitting shared storage later means rewriting placement
-at the same time. [`docs/adr-003-ceph-rbd.md`](docs/adr-003-ceph-rbd.md) is how the reference cluster
-was built and what it measured — including the two things about Ubuntu 26.04 that break `cephadm
-bootstrap`, and why clone v2 is a requirement rather than a preference.
-
-## Roadmap
-
-| Phase | Status |
-|---|---|
-| P0 — scaffolding, GitHub App onboarding, host prep | ✅ mostly |
-| P1 — runner plane: scale sets, allocator, providers | ✅ listeners, allocator, the drain, and the Docker, EC2 and Firecracker providers |
-| P2 — guest images, node split, user-defined tiers | 🚧 node split + mTLS done; the microVM and the guest image it boots are both done, and the image keeps itself current ([Guest images](#guest-images)). What is left is breadth: ours carries Docker and the runner against a hosted runner's ~50GB |
-| P3 — Ceph, the storage layer, sticky disks, trust classes | 🚧 The generation/lease/CAS layer, five Firecracker hot-attach slots and `actions/stickydisk` are implemented and locally tested; real-host warm-run and power-cut verification remain to be done |
-| P4 — colocated Actions cache | 🚧 The generic interceptor, fenced archive store, kill switch and pinned/current conformance matrix are implemented; immutable release, transactional host upgrade and live cold/save/warm/restore/fault proof remain to be done |
-| P5 — Docker layer cache, registry mirrors, container baseline | 🚧 Persistent in-guest BuildKit state, per-mount ceilings, the architecture-scoped Docker image store and three-registry mirror plumbing are implemented and locally tested; real pilot timing remains to be done |
-| P6 — observability, SSH-into-a-job | ⬜ |
-| P7 — Apple Silicon provider (macOS + Linux arm64) | 🚧 The provider, real Xcode and Docker-plus-service-container jobs, softnet isolation for untrusted work, node-restart adoption, a launchd-managed node and the owned-Mac lifecycle (`billet local up`/`down`/`uninstall`) are proven on a real Mac; billet-built guest images and an Apple Silicon cache remain |
-| P8 — EC2 provider, cloud-hosted control plane, provider failover | ✅ The provider, AMI builder, real GitHub job path, live Spot-warning handling, exact purchased-shape accounting and same-label local-to-cloud failover are proven |
-| P9 — per-node capacity, admission-time placement, addressed teardown. **A prerequisite of P8**, not a sequel: failover needs the decision made before the work is accepted | ✅ Per-node budgets, admission-time placement and teardown addressed to the host that launched the compute are all in |
-| P10 — dashboard, signed releases, public launch | 🚧 releases and packages done; signing and the dashboard are not |
-| P11 — setup and AWS Terraform | ⬜ The in-repo `terraform-aws-billet` module already provisions the AWS control plane and fleet infrastructure; guided local deployment and the composable module split are planned together. A Billet Terraform provider remains deferred until there is a versioned atomic configuration API ([ADR-004](docs/adr-004-terraform-provider.md)) |
+Terraform modules live under [`terraform/modules`](terraform/modules/billet/README.md), the Ansible collection under [`ansible_collections/junioryono/billet`](ansible_collections/junioryono/billet/README.md), and the published Actions under [`actions/`](actions).
 
 ## Alternatives
 
-Use one of these instead if it fits — most people should.
+Use one of these if it fits. [actions-runner-controller](https://github.com/actions/actions-runner-controller) is GitHub's own and needs Kubernetes. [terraform-aws-github-runner](https://github.com/github-aws-runners/terraform-aws-github-runner) is AWS-only. [GARM](https://github.com/cloudbase/garm) is the closest open-source multi-provider control plane, without a cache. [Ubicloud](https://github.com/ubicloud/ubicloud) is the best open reference for how a commercial runner cloud is built, under AGPL. [Actuated](https://actuated.com), [Blacksmith](https://blacksmith.sh), [Namespace](https://namespace.so), [WarpBuild](https://warpbuild.com) and [Depot](https://depot.dev) are managed products. billet is one `runs-on` label spanning bare metal, Apple Silicon and the cloud with failover between them, plus a colocated cache, in one Apache-2.0 binary with no Kubernetes; every piece of that exists somewhere in that list and the combination does not. billet borrows several of Blacksmith's published designs and says so.
 
-| | License | Runs on | Isolation | Notes |
-|---|---|---|---|---|
-| [actions-runner-controller](https://github.com/actions/actions-runner-controller) | Apache-2.0 | Kubernetes | container | GitHub's own. Mature and widely deployed. Needs a cluster; tracks no individual job and delegates scheduling to k8s; no cache or persistent build state. |
-| [terraform-aws-github-runner](https://github.com/github-aws-runners/terraform-aws-github-runner) | MIT | AWS only | EC2 per job | Terraform + Lambda, webhook-driven. Well maintained. No cache service, no bare metal. |
-| [GARM](https://github.com/cloudbase/garm) | Apache-2.0 | many clouds + LXD | varies | The closest existing OSS control plane, and a genuine multi-provider design. No colocated cache or build-state caching. |
-| [Ubicloud](https://github.com/ubicloud/ubicloud) | **AGPL** | their cloud | microVM | The best open reference for how a commercial runner cloud is built. The licence makes adopting a piece of it hard. |
-| [Actuated](https://actuated.com) | commercial | your hardware | Firecracker | Closest on isolation. Paid. |
-| [Blacksmith](https://blacksmith.sh), [Namespace](https://namespace.so), [WarpBuild](https://warpbuild.com), [Depot](https://depot.dev), [BuildJet](https://buildjet.com) | commercial | their hardware | varies | Managed. If you do not want to run infrastructure, use one of these. |
+## Contributing
 
-**Where billet is different:** one `runs-on` label spanning bare metal, Apple Silicon and cloud with
-failover between them, plus a colocated cache and persistent build state, in one Apache-2.0 binary
-with no Kubernetes. Every piece of that exists somewhere in the table; the combination does not.
-
-**Where it is worse, today:** all of them work and billet mostly does not.
-
-## Prior art
-
-`billet` is an open-source take on what [Blacksmith](https://blacksmith.sh) built, and it borrows
-several of their published designs — persistent BuildKit state, snapshot-clone caches, transparent
-cache interception. Their [engineering blog](https://www.blacksmith.sh/blog) is worth reading.
-[Ubicloud](https://github.com/ubicloud/ubicloud) (AGPL) is the highest-quality open reference for how
-a commercial runner cloud is actually built, and [GARM](https://github.com/cloudbase/garm) is the
-closest existing OSS control plane.
+See [CONTRIBUTING.md](CONTRIBUTING.md). `make check` is the gate; the skills under `.claude/skills` are the project's written-down rules.
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE).
+Apache-2.0. See [LICENSE](LICENSE). Apple Silicon support requires [Tart](https://tart.run), which is licensed FSL-1.1-ALv2 and is an external dependency you install yourself, like Docker or Ceph.

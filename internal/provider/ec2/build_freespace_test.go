@@ -15,7 +15,7 @@ import (
 // an `if` CONDITION — so a df that printed something unexpected made the guard
 // pass and the build proceed onto a disk it never measured. Measured, not read:
 // with `billet_free_kib=not-a-number` the script exits 0. Same family as the
-// `!`-pipeline rule already in CLAUDE.md, and the reason a `case` comes first.
+// `!`-pipeline rule in billet-shell-gates, and the reason a `case` comes first.
 func TestTheFreeSpaceGuardRefusesWhatItCannotRead(t *testing.T) {
 	t.Parallel()
 

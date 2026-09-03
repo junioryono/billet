@@ -87,7 +87,7 @@ func printCodeBuildCeilings(cfg *config.Config) {
 // And that policy must set the limit EXPLICITLY: the fallback MacOSLimit answers
 // Apple's per-host allowance, which describes a Mac somebody owns and not a fleet
 // AWS operates. What is judged is the same number every macOS tier pinned to the
-// node was validated against — measured, docs/aws-acceptance.md.
+// node was validated against — measured, docs/reference/records/aws-acceptance.md.
 func judgeCodeBuildFleetConcurrency(cfg *config.Config, fleet codebuild.FleetReport) ([]string, []string) {
 	if cfg.Node == nil || cfg.Node.CodeBuild == nil ||
 		cfg.Node.CodeBuild.EnvironmentType != config.CodeBuildMacARM {

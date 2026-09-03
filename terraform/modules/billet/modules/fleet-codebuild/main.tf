@@ -193,7 +193,7 @@ resource "aws_codebuild_fleet" "this" {
 # THE DESTROY GUARD. `terraform destroy` removes the node role, the build role and the
 # log group a RUNNING build depends on, and AWS will not stop it for you: DeleteProject
 # succeeds while a build is in progress and the build carries on to completion — measured
-# 2026-09-02 (docs/aws-acceptance.md), against an earlier claim here that AWS refused.
+# 2026-09-02 (docs/reference/records/aws-acceptance.md), against an earlier claim here that AWS refused.
 # GitHub does not requeue a job whose runner vanished mid-execution, so a destroy under
 # a live build is somebody's failed build, reported as a green apply.
 #

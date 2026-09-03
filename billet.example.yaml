@@ -6,9 +6,9 @@
 # things a laptop does not have:
 #
 #   * /dev/kvm, with firecracker and jailer installed (see
-#     docs/reference-hardware.md for the versions billet is developed against).
+#     docs/reference/reference-hardware.md for the versions billet is developed against).
 #   * A Ceph cluster with the two pools below, holding a golden image. Building
-#     one is docs/adr-003-ceph-rbd.md.
+#     one is docs/reference/decisions/adr-003-ceph-rbd.md.
 #   * An unprivileged account for the jailer to drop the VMM to — `useradd
 #     --system --no-create-home --shell /usr/sbin/nologin billet`.
 #   * A bridge for guests to attach to.
@@ -122,7 +122,7 @@ server:
   # machine, so recovery is your database's own backup rather than a directory
   # restored onto local storage. What it does not buy on its own is high
   # availability — exactly one controller may make scheduling decisions either
-  # way. See docs/adr-008-state-backends.md.
+  # way. See docs/reference/decisions/adr-008-state-backends.md.
   #
   # identity_dir holds what is NOT rows and cannot follow the ledger into a
   # database: the deployment identity, the node-wire CA and its rotation state,
@@ -164,7 +164,7 @@ server:
   # 120 vCPU and 480GiB reserves 8 threads and 32 GB for the OS, the Ceph OSDs,
   # and billet itself. Note that 128 SMT threads are not 128 core-equivalents —
   # measure real per-job-class throughput before raising this.
-  # See docs/reference-hardware.md for how tier shapes map onto a real topology.
+  # See docs/reference/reference-hardware.md for how tier shapes map onto a real topology.
   max_vcpu: 120
   max_memory: 480GiB
 
@@ -445,7 +445,7 @@ node:
   #
   # Required for `provider: firecracker` and refused for every other backend — a
   # container has nowhere to attach a block device, and an ec2 node's compute runs
-  # in a region that cannot reach this cluster. docs/adr-003-ceph-rbd.md is how the
+  # in a region that cannot reach this cluster. docs/reference/decisions/adr-003-ceph-rbd.md is how the
   # cluster is built and why it is not in the cloud.
   ceph:
     # Where the monitors are. Omit for Ceph's own search path, which finds
@@ -638,7 +638,7 @@ node:
   # your workflows keep their existing `runs-on` labels and nothing in a repository
   # names an AWS project. Do NOT add a WORKFLOW_JOB_QUEUED webhook to a
   # billet-owned project: two schedulers acquiring one job produce duplicate
-  # runners. See docs/adr-007-codebuild-provider.md and docs/codebuild.md.
+  # runners. See docs/reference/decisions/adr-007-codebuild-provider.md and docs/deploying/aws-codebuild.md.
   #
   # TWO CEILINGS COME WITH IT AND BILLET CANNOT LIFT EITHER. A build is capped at
   # 2160 minutes (36 hours), and a build still WAITING for capacity is FAILED after

@@ -46,7 +46,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # THE DEDICATED CI ACCOUNT, named in docs/aws-acceptance.md. It holds nothing
+  # THE DEDICATED CI ACCOUNT, named in docs/reference/records/aws-acceptance.md. It holds nothing
   # else, because the control plane stores a GitHub App private key and the fleet
   # executes arbitrary pull-request code — neither belongs beside anything that
   # matters. It is an identifier rather than a credential, and it is recorded

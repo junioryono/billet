@@ -432,7 +432,8 @@ func TestARealAgentsDefaultExitTimeoutIsFiveSeconds(t *testing.T) {
 
 	if job.ExitTimeout != 5 {
 		t.Errorf("the default ExitTimeOut is %d, and billet's plists, their test and "+
-			"docs/reference-hardware.md are all written around it being 5; re-measure and "+
+			"docs/reference/reference-hardware.md are all written around it being 5; "+
+			"re-measure and "+
 			"update them together", job.ExitTimeout)
 	}
 }

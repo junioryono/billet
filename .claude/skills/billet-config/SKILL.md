@@ -1,0 +1,69 @@
+---
+name: billet-config
+description: "billet.yaml: every top-level block, which role and which provider requires or refuses it, and the validation rules that are not obvious from the schema. internal/config is a leaf package; ByteSize; RunsOnHost and remote budgets; the macOS constants and unpinned macOS tiers; sites and store pairing; normalising versus refusing a value; the two commands that write /etc/billet/billet.yaml under different rules; internal/initconfig. Load when touching internal/config, internal/initconfig, billet.example.yaml, deploy/billet.yaml, `billet init`, `billet github-app create --config`, or any validation of tiers, nodes or sites."
+---
+
+# Configuration
+
+## What this area is
+
+`internal/config` parses and validates `billet.yaml` (`Config`, `Load`, `Parse`, the `Check*` validators). It imports nothing else of billet's, enforced by depguard, so a rule that `alloc` also needs is exported from `config` and called from both. `billet.example.yaml` is the annotated reference and `deploy/billet.yaml` the packaged template; both are parsed by the config test suite, so a renamed key breaks the build rather than an install. `internal/initconfig` renders a runnable file for `billet init` and is importable so tests can exercise what it writes.
+
+## The blocks
+
+| Key | Read by | What it is |
+|---|---|---|
+| `server` | `billet server`; a certless node sharing the file reads it to learn which deployment it joins | `listen` (loopback means plain HTTP; anything else requires mTLS), `bootstrap_listen` (the enrollment listener; absent means no network enrollment), `node_tls_hosts` (required when `listen` is a wildcard; both listeners present one certificate), `state_dir` (shorthand for `identity_dir` plus `state: {backend: sqlite}`; writing both is refused), `identity_dir`, `state` (`backend: sqlite` or `postgres`; `postgres.dsn_env` names the variable holding the DSN, never the DSN), `controllers` (`single` or `active-passive`, refused on SQLite), `identity` (`backend: file` or `aws-ssm` with `aws_ssm.region/prefix/kms_key_id`), `max_vcpu` and `max_memory` (required, positive, the deployment ceiling), `placement` (`pack` or `spread`), `drain_timeout` |
+| `github` | `billet server` | `org`, `app_id`, `client_id` (optional), `installation_id` (required; creating an App does not install it), `private_key_path` |
+| `node` | `billet node` | `name` (from the certificate when there is one; required on loopback), `server_addr`, `bootstrap_addr`, `provider`, `site`, `max_vcpu`/`max_memory` (what this host contributes; required for `ec2` and `codebuild`), `tls` (all three of `cert`, `key`, `ca`), `lock_dir` and `allow_unlocked_deployment`, `state_dir` (required), `max_custody`, `drain_timeout`, and one provider block: `firecracker` plus `ceph` (both required for firecracker, refused otherwise), `tart` (optional), `ec2`, `codebuild`, plus `ebs_s3`, `cache`, `registry_mirrors` |
+| `tiers` | both roles | one tier is one scale set; `label` is the `runs-on` value. `trust`, `workflows`, `cache_scope`, `provider` or ordered `providers` (never both), `guest_os`, `node` and `site` pins, `runner_group`, `command`, per-provider `launch`, `vcpu`/`memory` or `sizes` with `memory_per_vcpu`, `disk`, `shm`, `buildkit_cache_mount_limit`, `image`, `intercept`, `max_concurrent` (ceiling), `reserved` (floor); `warm_pool` is refused when non-zero because no provider implements it |
+| `nodes` | control plane | per-host policy, not a roster: `name`, `provider`, `guest_os` allowlist, `macos_vm_limit` |
+| `sites` | control plane | `name` (matched exactly), `store` (`ceph` or `ebs-s3`) |
+| `backup` | `local backup`, `local restore --from-backup` | `s3.bucket`, `s3.region` (required even with an `endpoint`), `s3.prefix`, `s3.endpoint` (path-style; RGW, MinIO, R2), `s3.kms_key_id` |
+| `images` | `images pull` | `source` (empty means billet's own), `signing_identity` and `signing_issuer` (required for a non-default source) |
+| `release` | rollouts | `channel` (`stable` or `candidate`), `version` (an exact tag or a 40-hex SHA; `latest` and `main` refused; exclusive with `channel`), `automatic`, `maintenance_window` (bounds when a rollout may begin), `signing_identity` and `signing_issuer` (both or neither) |
+
+Provider kinds are `firecracker`, `tart`, `ec2`, `codebuild`, `docker`. The whole catalog is duplicated on every machine with nothing checking the copies agree; tiers and `nodes` are read at startup, so changing either needs a restart, while nodes register dynamically.
+
+## Rules
+
+**`config` is a leaf, and `alloc.New` re-applies the safety rules anyway.** `alloc.New` is exported, so it cannot assume its catalog came through `config.Load`; a rule enforced in only one of the two has a second entry point that does not enforce it. The same argument makes `config.CheckEC2Endpoint` (https required, loopback the one exception) callable from the provider constructor as well as from `Load`.
+
+**Never guess a byte size.** `config.ByteSize` parses with exact integer arithmetic on a restricted grammar. It used `strconv.ParseFloat`, which accepts `NaN`, `Inf`, hex and exponents and loses precision above 2^53; converting those to `int64` can come out negative, which silently disables the ceiling. A bare int of bytes is how a memory limit ends up 1024x wrong.
+
+**A contribution is detected only for a backend that runs work on the host.** `ProviderKind.RunsOnHost` is the one reader of that distinction and is keyed on the host backends, so a second remote backend nobody remembers to add is treated as remote. An `ec2` or `codebuild` node is an orchestrator: `node.max_vcpu`/`max_memory` are required, the overcommit warning is skipped, and those numbers are hard resource budgets rather than price budgets. Placement charges the first fitting declared shape rather than the smaller tier request, and every fallback is authorised atomically against the node and deployment ceilings before the request reaches AWS.
+
+**The macOS limit is a default about a host somebody owns.** `DefaultMacOSVMLimit` is 2, pinned to Virtualization.framework's own refusal of a third guest rather than to a licence reading; `NodePolicy.MacOSLimit()` answers it for a host nothing was declared about, and the default is keyed on `RunsOnHost` because a CodeBuild `MAC_ARM` fleet runs under AWS's agreement (left alone it capped a five-instance fleet at two and blamed Apple). The limit is enforced against `Tier.GuestOS`, never a label. `MinMacOSGuestMemory` is 4GiB because the framework answers `LessThanMinimalResourcesError` below it and `provider.Spec` carries no guest OS, so config is the only layer that can hold the rule. `macos_vm_limit > 0` beside a `guest_os` allowlist excluding macOS is refused.
+
+**A macOS tier pins a node unless it spans several backends.** Placement counts macOS guests per host whether or not the tier named one; the pin gave the load-time guard one host to check. `providers: [tart, codebuild]` is the shape a pin cannot express, so `validateUnpinnedMacOSTier` holds each backend's declared `nodes[]` policy to the pinned rules instead, `max_concurrent` defaults to and is bounded by what those hosts permit between them, and a reservation stays pinned. `validateMacOSHostLimits` sums per-host totals at load; two generated macOS tiers with unset `max_concurrent` sum to 4 against a limit of 2, which is why `billet init --provider tart` writes one tier at the host's limit.
+
+**Storage is a property of the site.** `node.ceph` is a sibling of `node.firecracker`, required for firecracker and refused for every other backend. `siteAcceptsProvider` maps each store to the one backend that uses it; `validateCodeBuildNode` refuses a `codebuild` node that names a `site`, and `validateSites` refuses a sited tier that lists codebuild, because placement confines a sited tier to hosts at that site and a codebuild node declares none, so the tier advertises 0 while `billet check` reports healthy (measured on a live acceptance).
+
+**Normalise a value something else will use; refuse an identity.** A path, pool, region, endpoint or node name is trimmed once and written back (`CephConfig.normalize`, `EC2Config.normalize`, `EBSS3Config.normalize`, `RegistryMirrors.normalize`, `trimNodeName`), because `image_pool: "  tank  "` reached `rbd` with its padding. `sites[].name`, `tiers[].site`, `node.site`, `github.org` and `tiers[].runner_group` are refused with padding (`checkIdentityPadding`), because a trimmed identity names a different deployment or organization on another machine; one shipped version authorised `" home "` at load and refused every node reporting `home` forever.
+
+**A rule about a string that leaves the process is pinned to the boundary it crosses.** The runner-group validator began as a URL-safe allowlist and was wrong both ways; sweeping every character through the vendored client's exact path-then-`url.Parse`-then-`Encode` round trip settled it in a minute: `&`, `#`, `;`, `%`, `+` do not survive (`;` because Go's `ParseQuery` rejects it since 1.17). `github.org` goes into the client's URL unescaped and into the REST path escaped; `runnerGroupUnsafe` measured exactly `#%/?` as damaging. The tests assert the property, not the list. Config cannot test any of this itself, so the cross-layer proofs live in `internal/integration`.
+
+**Two commands write `/etc/billet/billet.yaml` under different rules, and each says which.** `billet init` generates a whole file, so it replaces one only where `initconfig.PlanReRun` proves the bytes are its own output (or under `--force`) and otherwise writes `<path>.new`. `billet github-app create --config` edits five scalars under `github:` in place, preserving comments, mode and owner, because the App identity is the one thing no generator can merge. `configEditRule` states the rule before a browser opens; `planConfigEdit` decides every failure (missing file, `github:` holding a list, an unwritable directory) before `github.Onboard`, using the real renderer against a probe identity, because the key is issued once and a failure after registration used to exit 0 with the key spent. Do not add a third writer without choosing a rule.
+
+**`billet init` refuses what it cannot measure.** `--provider tart` is refused anywhere but Apple Silicon (the ceiling, the node name and the paths all come from the machine running it) and requires `--node-name`, because a stock Mac hostname is not a legal node name and sanitising one would name a host the operator never chose. It writes `untrusted_isolation` only for an untrusted generation, because `billet check` is fatal when it is named and softnet carries no setuid grant. A docker generation needs a non-default runner group and at least one exact workflow. `--emit ansible` prints the `billet_config` block instead of writing a file.
+
+**Cache TLS interception defaults off, per tier.** `intercept` is opt-in and allowed only on Linux firecracker tiers with a `node.cache` listener and a static `cache_scope`; `ACTIONS_RESULTS_URL` carries artifact metadata as well as cache traffic, so a mistake here breaks a deploy rather than slowing CI. `node.cache.listen` is one literal non-loopback address; TLS on it is required for EC2 and refused on the firecracker bridge.
+
+**Small refusals that each cost a debugging session.** `node.tls` against a loopback `server.listen` is a config error, not an upgrade. `interruption_queue_url`'s basename must equal `node.name`, because a shared spot queue hides a two-minute warning behind another consumer's visibility timeout. `sizes` beside explicit `vcpu`/`memory` is refused. `codebuild.accept_external_build_ceiling` has no default; its absence refuses. `codebuild.untrusted_*` need all three keys and are refused beside `fleet_arn` or a reserved environment. A trailing DNS root dot on a registry mirror is refused.
+
+## Measured facts
+
+- Virtualization.framework refuses a third concurrent macOS guest ("The number of VMs exceeds the system limit") and a guest under 4GiB (`LessThanMinimalResourcesError`).
+- Runner-group round trip: `&#;%+` are damaged; `github.org`: `#%/?`.
+- `image_pool` padding reached `rbd` unchanged before `normalize` existed; site-name padding was found three times in `internal/config`.
+- A codebuild-only sited tier advertised 0 with `billet check` healthy (first live acceptance re-run).
+
+## Where the tests are
+
+- `internal/config/*_test.go`: build cases by `strings.Replace` on a known-good config; both directions of every guard (the macOS cap has one test proving a tier whose label omits `macos` is capped and one proving `builds-macos-artifacts` is not).
+- `internal/integration/configboundary_test.go`, `generatedtier_test.go`, `releaseboundary_test.go`.
+- `cmd/billet/configedit_test.go`, `init_test.go`, `init_rerun_test.go`, `initansible_test.go`, `inittart.go`'s tests, `internal/initconfig/*_test.go`.
+
+## Related skills
+
+`billet-capacity` (what the numbers become at runtime), `billet-providers-local` and `billet-providers-aws` (per-backend blocks), `billet-storage-and-cache` (sites), `billet-identity-and-ca` (the App block and `github-app create`).

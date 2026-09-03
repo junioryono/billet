@@ -147,7 +147,7 @@ variable "state_secret_policy_json" {
 }
 
 variable "create_backup_bucket" {
-  description = "Create the S3 bucket this deployment's identity copy belongs in: the deployment identity, the node-wire CA and its rotation state, and the GitHub App private key. There is no retained volume beside the instance on this profile, so an off-site copy is the ONLY recovery path for any of it. NOTE that `billet local backup` does not work on a PostgreSQL deployment yet — it refuses the ledger deliberately and has no identity-only archive — so today that copy is one you make (docs/state-backends.md has the command) and this is where it goes. Set false and supply backup_bucket to adopt an existing one."
+  description = "Create the S3 bucket this deployment's identity copy belongs in: the deployment identity, the node-wire CA and its rotation state, and the GitHub App private key. There is no retained volume beside the instance on this profile, so an off-site copy is the ONLY recovery path for any of it. NOTE that `billet local backup` does not work on a PostgreSQL deployment yet — it refuses the ledger deliberately and has no identity-only archive — so today that copy is one you make (docs/deploying/postgres-and-active-passive.md has the command) and this is where it goes. Set false and supply backup_bucket to adopt an existing one."
   type        = bool
   default     = false
 }

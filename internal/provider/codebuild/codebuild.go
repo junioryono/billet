@@ -11,7 +11,7 @@
 // rather than inferred: there is no API-invoked form of it. So this backend starts
 // an ordinary NO_SOURCE project with StartBuild and runs GitHub's own runner from
 // billet's own JIT configuration, exactly as internal/provider/ec2 does inside an
-// instance. See docs/adr-007-codebuild-provider.md.
+// instance. See docs/reference/decisions/adr-007-codebuild-provider.md.
 //
 // FOUR THINGS ARE UNLIKE EVERY OTHER BACKEND, and each of them shapes the code:
 //
