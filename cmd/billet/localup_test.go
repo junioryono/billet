@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/junioryono/billet/deploy"
+	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/initconfig"
 	"github.com/junioryono/billet/internal/lifeops"
 )
@@ -352,6 +353,12 @@ func enablementOf(word string) lifeops.Enablement {
 	}
 }
 
+func (f *fakeConverger) StartTimer(_ context.Context, unit string) error {
+	f.record("start-timer " + unit)
+
+	return nil
+}
+
 func (f *fakeConverger) Enable(_ context.Context, unit string) error {
 	f.record("enable " + unit)
 
@@ -593,6 +600,12 @@ func TestUpFollowsTheOrderItsSafetyDependsOn(t *testing.T) {
 		"revalidate " + deploy.NodeUnitName,
 		"start " + deploy.NodeUnitName,
 		"enable " + deploy.NodeUnitName,
+		// THE TIMERS COME LAST, after every service is up and proved: the backup
+		// on a control-plane host, enabled and then armed, because a package that
+		// enables nothing left a deployment with no backup until somebody read
+		// the docs, and its first hardware failure lost the fleet's identity.
+		"enable " + deploy.BackupTimerName,
+		"start-timer " + deploy.BackupTimerName,
 	}
 	if strings.Join(f.trace, " → ") != strings.Join(want, " → ") {
 		t.Errorf("up did:\n  %s\nwant:\n  %s",
@@ -1651,5 +1664,43 @@ func TestUpPrintsTheBackendsOwnProof(t *testing.T) {
 	// AND THE OTHER MANAGER'S SENTENCE IS NOT.
 	if strings.Contains(out, "ready, and still running") {
 		t.Errorf("a readiness this backend never established was reported:\n%s", out)
+	}
+}
+
+// A FIRECRACKER NODE GETS THE IMAGE REFRESH TIMER, a control-plane host the
+// backup timer, and a host that is both gets both, each enabled and then armed
+// after every service is proved. A manager that is not systemd gets neither:
+// launchd has no timers, and pretending would report maintenance nothing runs.
+func TestUpArmsTheTimersEachHostNeeds(t *testing.T) {
+	asLinux(t)
+
+	cfg := refreshConfig(t)
+	f := stageUp(t, &fakeConverger{plan: bothUnits()}, githubVerified)
+
+	if err := runLocalUp(t.Context(), upOptions{configPath: cfg, servicePath: cfg}); err != nil {
+		t.Fatalf("a firecracker control-plane host was refused: %v", err)
+	}
+
+	trace := strings.Join(f.trace, " → ")
+	for _, want := range []string{
+		"enable " + deploy.BackupTimerName + " → start-timer " + deploy.BackupTimerName,
+		"enable " + deploy.ImagesRefreshTimerName + " → start-timer " + deploy.ImagesRefreshTimerName,
+	} {
+		if !strings.Contains(trace, want) {
+			t.Errorf("up did not %q:\n  %s", want, trace)
+		}
+	}
+	if last := f.trace[len(f.trace)-1]; !strings.HasPrefix(last, "start-timer ") {
+		t.Errorf("the timers are not the last thing up did: %s", trace)
+	}
+
+	other := &fakeConverger{serverName: "sh.billet.server", nodeName: "sh.billet.node"}
+	loaded, err := config.Load(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enableTimers(t.Context(), other, loaded, lifeops.UpRequest{WantServer: true})
+	if len(other.trace) != 0 {
+		t.Errorf("a manager with no timers was asked to %v", other.trace)
 	}
 }

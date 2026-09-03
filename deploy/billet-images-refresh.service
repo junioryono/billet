@@ -9,9 +9,10 @@
 #
 #   systemctl enable --now billet-images-refresh.timer
 #
-# NOT MANAGED BY `billet local up`/`down`/`status` either, exactly as the backup
-# is not: those own the two services that hold compute and a ledger, and their
-# safety content is the order they act in.
+# `billet local up` ENABLES AND ARMS THE TIMER on a firecracker node as its last
+# step, exactly as it does the backup timer on a control-plane host, and reports
+# rather than fails when it cannot; the timer is deliberately not part of the
+# unit plan `up`/`down` prove and unwind.
 [Unit]
 Description=billet guest image refresh
 Documentation=https://github.com/junioryono/billet/blob/main/docs/operating/guest-images.md

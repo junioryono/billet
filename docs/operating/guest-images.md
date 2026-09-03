@@ -35,11 +35,7 @@ Verification records itself, the next launch resolves to it, and rollback is `bi
 
 ## Keeping images current
 
-Nothing has to be pulled by hand on a host that follows the packaged units. `billet images refresh` reads the newest generation's age off its name for every image this host's firecracker tiers boot and, when it is older than the weekly build cadence (`--max-age`, six days by default), runs the same `billet images pull --verify` an operator would: import, boot, promote, under the kernel lock and the runner-deadline proof. Inside that cadence it prints why and exits 0, so a daily tick costs one question of the cluster. `billet-images-refresh.timer` runs it daily with a randomised delay and `Persistent=true`, and is shipped by the package without being enabled, exactly as the backup timer is: a host that boots no guests has nothing for it to do, and the decision belongs to the operator of one that does.
-
-```
-systemctl enable --now billet-images-refresh.timer
-```
+Nothing has to be pulled by hand on a host that follows the packaged units. `billet images refresh` reads the newest generation's age off its name for every image this host's firecracker tiers boot and, when it is older than the weekly build cadence (`--max-age`, six days by default), runs the same `billet images pull --verify` an operator would: import, boot, promote, under the kernel lock and the runner-deadline proof. Inside that cadence it prints why and exits 0, so a daily tick costs one question of the cluster. `billet-images-refresh.timer` runs it daily with a randomised delay and `Persistent=true`. The package ships it without enabling it, exactly as it ships the backup timer, and `billet local up` enables and arms it on a firecracker node after the services are up and proved, so a host set up with `up` refreshes its images with nothing further from its operator; on a host set up some other way, `systemctl enable --now billet-images-refresh.timer` is the one command.
 
 `billet check` on a firecracker node reports each image's newest generation and its age, and says plainly when the timer is not enabled, because a timer that was never enabled looks exactly like one that is working right up until GitHub refuses the runner baked into a stale image. The Ansible host role installs and enables the timer on every node that boots guests.
 

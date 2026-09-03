@@ -6,14 +6,14 @@
 #
 #   systemctl enable --now billet-backup.timer
 #
-# NOT MANAGED BY `billet local up`/`down`/`status` either, and that is deliberate
-# rather than an omission. Those commands own the two services that hold a
-# deployment's compute and its ledger, and their whole safety content is the
-# ORDER they act in — a third unit in that plan would have to be modelled in
-# every refusal, fake and test for no benefit, because a backup is a oneshot with
-# nothing to drain. What replaces the reporting is `billet check`, which names
-# the newest archive in the bucket and how old it is: a timer that stopped firing
-# looks exactly like one that is working, and that is the failure worth catching.
+# `billet local up` ENABLES AND ARMS THE TIMER on a control-plane host, as its
+# last step after the services are up and proved, and reports rather than fails
+# when it cannot. It is deliberately NOT part of the unit plan `up`/`down` prove
+# and unwind: those own the two services that hold a deployment's compute and its
+# ledger, and a backup is a oneshot with nothing to drain. `billet check` names
+# the newest local archive and how old it is, and the bucket's when one is
+# configured: a timer that stopped firing looks exactly like one that is working,
+# and that is the failure worth catching.
 [Unit]
 Description=billet deployment backup
 Documentation=https://github.com/junioryono/billet/blob/main/docs/reference/records/restore-rehearsal.md
