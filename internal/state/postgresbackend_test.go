@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -484,4 +485,185 @@ func postgresLockKey(t *testing.T, db *DB) int64 {
 	}
 
 	return be.lockKey
+}
+
+// A MIGRATION WAITS FOR ITS LOCKS, WHICH THE WRITER'S OWN TIMEOUT WOULD REFUSE.
+//
+// The writer pool's lock_timeout is fifty milliseconds so contention comes back
+// to beginWrite's loop, and that loop covers the BEGIN and the advisory lock
+// only. A migration's statements take locks the advisory lock says nothing about
+// — DDL on the tables, reads of the bookkeeping table — so under that timeout
+// the open failed fifty milliseconds behind any other session, measured in CI
+// under the alloc suite's parallel schema builds. beginMigration is what lets
+// this one transaction wait instead; without it this test fails at the assertion
+// with SQLSTATE 55P03.
+//
+// THE HOLDER IS A SESSION OF ITS OWN, and the open is observed WAITING before
+// the lock is released: a release that came first would be a wait nothing
+// satisfied, and a test that passes whether or not the migration waited.
+func TestAMigrationWaitsOutAnotherSessionsLock(t *testing.T) {
+	dsn := requirePostgres(t)
+	dir := t.TempDir()
+
+	// Migrated once so the table the holder locks exists. The second open's
+	// migration transaction then reads schema_migrations first, and that read
+	// queues behind ACCESS EXCLUSIVE exactly as a CREATE TABLE queues behind a
+	// catalogue lock.
+	first, err := OpenPostgres(t.Context(), dir, dsn)
+	if err != nil {
+		t.Fatalf("OpenPostgres: %v", err)
+	}
+
+	if err := first.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	release := holdSchemaMigrations(t, dsn)
+
+	opened := make(chan error, 1)
+
+	go func() {
+		db, err := OpenPostgres(t.Context(), dir, dsn)
+		if err == nil {
+			err = db.Close()
+		}
+
+		opened <- err
+	}()
+
+	awaitAWaiterOnSchemaMigrations(t, dsn)
+
+	// LONGER THAN THE WRITER'S lock_timeout, MEASURED FROM THE MOMENT THE OPEN
+	// WAS SEEN WAITING. Released any sooner, the fifty-millisecond timeout might
+	// not have fired yet and the old code would pass this test some of the time.
+	time.Sleep(250 * time.Millisecond)
+
+	release()
+
+	if err := <-opened; err != nil {
+		t.Fatalf("the open should have waited out the held lock and succeeded; got: %v", err)
+	}
+}
+
+// A MIGRATION CUT OFF AT ITS DEADLINE SAYS WHAT THE BUDGET WAS AND WHERE TO LOOK.
+//
+// Waiting is bounded by the context, and the bound arrives as the server
+// cancelling the statement (57014), which Tx translates into the deadline. That
+// left "canceling statement due to user request: context deadline exceeded" —
+// true, and naming no lock, no holder and no advice. The refusal has to carry
+// the migration's account, the budget and, for this engine, the catalogue view
+// that names the session in the way.
+func TestAMigrationCutOffAtItsDeadlineSaysWhatToLookAt(t *testing.T) {
+	dsn := requirePostgres(t)
+	dir := t.TempDir()
+
+	first, err := OpenPostgres(t.Context(), dir, dsn)
+	if err != nil {
+		t.Fatalf("OpenPostgres: %v", err)
+	}
+
+	if err := first.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	holdSchemaMigrations(t, dsn)
+
+	// SHORT, so the open's own thirty-second budget is not what this waits for:
+	// openDir derives its deadline from the caller's and keeps the earlier one.
+	ctx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
+	defer cancel()
+
+	db, err := OpenPostgres(ctx, dir, dsn)
+	if err == nil {
+		_ = db.Close()
+
+		t.Fatal("the open succeeded while another session held the ledger's bookkeeping " +
+			"table; either the holder was not holding or the migration did not wait")
+	}
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("a migration stopped by its deadline must carry the deadline's identity, "+
+			"so a caller can tell a stall from a fault; got: %v", err)
+	}
+
+	for _, want := range []string{"startup budget", "pg_stat_activity", "schema_migrations"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal should mention %q so an operator knows what happened and "+
+				"where to look; got: %v", want, err)
+		}
+	}
+}
+
+// holdSchemaMigrations takes ACCESS EXCLUSIVE on the bookkeeping table from a
+// session of its own and returns the release. The release is also registered as
+// a cleanup, after the schema's own, so the schema can still be dropped.
+func holdSchemaMigrations(t *testing.T, dsn string) (release func()) {
+	t.Helper()
+
+	conn, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open a holder session: %v", err)
+	}
+
+	tx, err := conn.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatalf("begin the holder's transaction: %v", err)
+	}
+
+	if _, err := tx.ExecContext(t.Context(),
+		`LOCK TABLE schema_migrations IN ACCESS EXCLUSIVE MODE`); err != nil {
+		t.Fatalf("lock schema_migrations: %v", err)
+	}
+
+	var once sync.Once
+
+	release = func() {
+		once.Do(func() {
+			_ = tx.Rollback()
+			_ = conn.Close()
+		})
+	}
+
+	t.Cleanup(release)
+
+	return release
+}
+
+// awaitAWaiterOnSchemaMigrations blocks until some session is waiting for a lock
+// on this schema's bookkeeping table, which is the proof that the open under
+// test is blocked by the holder rather than by nothing.
+func awaitAWaiterOnSchemaMigrations(t *testing.T, dsn string) {
+	t.Helper()
+
+	conn, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open an observer session: %v", err)
+	}
+
+	defer func() { _ = conn.Close() }()
+
+	deadline := time.Now().Add(10 * time.Second)
+
+	for {
+		var waiting int
+
+		// to_regclass resolves through this DSN's search_path, so the count is
+		// scoped to this test's schema and not to every ledger in the database.
+		if err := conn.QueryRowContext(t.Context(),
+			`SELECT count(*) FROM pg_locks WHERE relation = to_regclass('schema_migrations') AND NOT granted`,
+		).Scan(&waiting); err != nil {
+			t.Fatalf("inspect pg_locks: %v", err)
+		}
+
+		if waiting > 0 {
+			return
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatal("no session ever waited on schema_migrations, so the open was not " +
+				"blocked by the held lock and releasing it would prove nothing")
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
 }

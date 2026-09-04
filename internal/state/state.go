@@ -484,9 +484,11 @@ func openDir(
 	return db, nil
 }
 
-// startupTimeout bounds the pragma verification, integrity check and migrations.
-// Generous, because a first run creates the database and an integrity check
-// scans it; anything slower than this is a sick disk, not a slow one.
+// startupTimeout bounds the pragma verification, integrity check and migrations,
+// and a migration run at promotion takes the same bound for itself (see
+// migrate). Generous, because a first run creates the database and an integrity
+// check scans it; anything slower than this is a sick disk, not a slow one — or,
+// on PostgreSQL, another session holding a lock the migration is waiting for.
 const startupTimeout = 30 * time.Second
 
 // PingContext proves the database is reachable AND configured as promised.
@@ -959,8 +961,35 @@ func readAppliedMigrations(ctx context.Context, q ReadOps) (map[int]appliedMigra
 	return seen, nil
 }
 
+// migrate applies every migration this binary carries that the ledger has not
+// recorded, in one transaction.
+//
+// BOUNDED BY THE STARTUP BUDGET WHEREVER IT RUNS. The open path already carries
+// that deadline and keeps it, because WithTimeout never extends a parent. The
+// promotion path does not: ClaimController is handed the server's own context,
+// which ends at shutdown and never before, and a migration's statements are
+// allowed to WAIT for their locks (see backend.beginMigration) — so a standby
+// promoting onto a table another session holds would sit inside PostgreSQL for
+// as long as the process lived, with no line anywhere saying so. Bounded, it
+// fails with a diagnostic, the claim is given back, and the service manager
+// starts it again. Deriving a context is safe here because the transaction
+// never leaves this function; the caution in beginWrite is about one that does.
 func (db *DB) migrate(ctx context.Context) error {
-	return db.Tx(ctx, func(tx *sql.Tx) error {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+
+		ctx, cancel = context.WithTimeout(ctx, startupTimeout)
+		defer cancel()
+	}
+
+	err := db.Tx(ctx, func(tx *sql.Tx) error {
+		// FIRST, before the bootstrap DDL: that CREATE TABLE IF NOT EXISTS takes
+		// locks too, and it is where a contended open failed just as readily as
+		// at a numbered migration.
+		if err := db.backend.beginMigration(ctx, tx); err != nil {
+			return fmt.Errorf("prepare the migration transaction: %w", err)
+		}
+
 		// Bootstrapping is idempotent and lives outside the versioned set, so the
 		// bookkeeping table's existence is never itself a migration whose absence
 		// has to be inferred from a failed query.
@@ -1018,4 +1047,16 @@ func (db *DB) migrate(ctx context.Context) error {
 		}
 		return nil
 	})
+
+	// A DEADLINE, NOT A CANCELLATION. Tx has already translated the engine's
+	// spelling of "interrupted" into the context's error, so what arrives here
+	// names the migration and carries the deadline's identity; this adds what the
+	// number was and where to look. A plain cancellation is a shutdown during
+	// startup and not a stall, so it is left alone.
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("%w; the migration did not finish inside the %s startup budget. %s",
+			err, startupTimeout, db.backend.migrationTimeoutAdvice())
+	}
+
+	return err
 }

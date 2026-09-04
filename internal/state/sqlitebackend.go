@@ -348,6 +348,17 @@ var isInterrupt = func(err error) bool {
 // this call in which another writer could be admitted.
 func (*sqliteBackend) beginWrite(context.Context, *sql.Tx) error { return nil }
 
+// beginMigration has nothing to widen: BEGIN IMMEDIATE already holds the only
+// lock DDL needs on this engine, so nothing can make a migration wait once its
+// transaction has begun.
+func (*sqliteBackend) beginMigration(context.Context, *sql.Tx) error { return nil }
+
+func (*sqliteBackend) migrationTimeoutAdvice() string {
+	return "Nothing else can hold a SQLite ledger once its write transaction has begun, " +
+		"so a migration that did not finish is a disk that did not answer; check the " +
+		"storage under the state directory."
+}
+
 // snapshotInto is VACUUM INTO, waiting out a writer in another process on the
 // same terms beginWrite does.
 //
