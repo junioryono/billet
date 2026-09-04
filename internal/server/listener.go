@@ -274,6 +274,16 @@ type Listener struct {
 	// wrong ordering fail causally rather than usually.
 	heartbeatLock func()
 
+	// heartbeatTicks replaces the heartbeat loop's ticker when non-nil, and
+	// heartbeatPassed runs after each pass the LOOP made. TEST-ONLY and nil in
+	// every deployment. Together they let a test deliver a tick to the real loop
+	// while the poll is blocked and know when that pass has finished, which is
+	// the only way to prove heartbeats run independently of the poll: a test
+	// that called heartbeatPass itself would prove a pass renews leases and
+	// nothing about who runs it, or when.
+	heartbeatTicks  <-chan time.Time
+	heartbeatPassed func()
+
 	// Guards the escrow below: renewal and the poll loop touch held and running
 	// concurrently.
 	mu sync.Mutex
@@ -2039,15 +2049,24 @@ func stopping(ctx context.Context, err error) error {
 // The interval is a fraction of the TTL so a single missed beat — a busy
 // database, a slow write — does not expire anything.
 func (l *Listener) heartbeatLoop(ctx context.Context) {
-	ticker := time.NewTicker(l.heartbeatInterval())
-	defer ticker.Stop()
+	ticks := l.heartbeatTicks
+	if ticks == nil {
+		ticker := time.NewTicker(l.heartbeatInterval())
+		defer ticker.Stop()
+
+		ticks = ticker.C
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-ticks:
 			l.heartbeatPass(ctx)
+
+			if l.heartbeatPassed != nil {
+				l.heartbeatPassed()
+			}
 		}
 	}
 }
