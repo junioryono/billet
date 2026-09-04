@@ -309,7 +309,8 @@ func mappingValue(m *yaml.Node, key string) *yaml.Node {
 // and a scalar there would make the derived config unparseable rather than
 // merely different; the comments the operator hung on the old value move to the
 // replacement, because this file's contract is that the derivation eats none. A
-// value that defines an anchor is refused for the reason forceScalar gives.
+// non-mapping value that defines an anchor is refused for the reason forceScalar
+// gives; a mapping is kept as it is, anchor and all, because nothing is replaced.
 func ensureMapping(m *yaml.Node, key string) (*yaml.Node, error) {
 	for i := 0; i+1 < len(m.Content); i += 2 {
 		if isKey(m.Content[i], key) {
