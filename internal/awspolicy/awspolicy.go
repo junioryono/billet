@@ -140,9 +140,11 @@
 // ask), and closed by the same thing: a per-deployment KMS key.
 //
 // THE BUILDER IS SCOPED SEPARATELY. `billet ami build` tags its builder instance
-// with a per-build owner (BuilderOwnerPrefix + name), NOT a deployment id, so the
-// --builder statements match that prefix by StringLike and carry their own
-// Terminate — the deployment-scoped runtime Terminate would not reach a builder.
+// with a per-build owner (ec2.BuilderOwner), which carries the deployment id in
+// value mode and not in account-wide mode, so the --builder statements match
+// ec2.BuilderOwnerPattern by StringLike and carry their own Terminate — the
+// runtime Terminate is scoped to the deployment's exact owner value and would
+// not reach a builder.
 // The snapshot deny above gets NO builder exemption, which is deliberate in both
 // directions: a build launches from a base image and from the image it just made,
 // and neither names a snapshot, so an exemption would authorize nothing it needs —
@@ -589,11 +591,12 @@ func (in Inputs) Build() (Policy, error) {
 	}
 
 	if in.Builder {
-		// The builder is scoped to its OWN per-build owner prefix, not the
-		// deployment id — `billet ami build` tags the builder with billet-ami-build-*,
-		// a distinct identity. It gets its own Terminate for cleanup, because the
-		// runtime Terminate above is scoped to the deployment and would not match the
-		// builder once the policy is per-deployment.
+		// The builder is scoped to its OWN owner value, which carries the
+		// deployment id in value mode and not in account-wide mode
+		// (ec2.BuilderOwnerPattern, the same function `billet ami build` stamps
+		// with). It gets its own Terminate for cleanup, because the runtime
+		// Terminate above is conditioned on the deployment's EXACT owner value and
+		// would not match a builder, whose value is a different string.
 		//
 		// CreateImage authorizes MULTIPLE resource types — the source instance, the
 		// new image, and (for an EBS-backed builder) the snapshots it creates — so it
@@ -606,7 +609,7 @@ func (in Inputs) Build() (Policy, error) {
 				Sid: "BilletAMIBuilderSource", Effect: "Allow",
 				Action:    ec2.BuilderIAMActions(),
 				Resource:  []string{"arn:" + partition + ":ec2:*:*:instance/*"},
-				Condition: builderOwnerCondition(),
+				Condition: builderOwnerCondition(in.Owner),
 			},
 			Statement{
 				Sid: "BilletAMIBuilderImage", Effect: "Allow",
@@ -621,7 +624,7 @@ func (in Inputs) Build() (Policy, error) {
 				Sid: "BilletAMIBuilderTerminate", Effect: "Allow",
 				Action:    ec2.RuntimeTerminateIAMActions(),
 				Resource:  []string{"arn:" + partition + ":ec2:*:*:instance/*"},
-				Condition: builderOwnerCondition(),
+				Condition: builderOwnerCondition(in.Owner),
 			},
 			// A build boots the image it produced and reads the verifier's report off
 			// the serial console. Scoped to instances carrying the builder tag: console
@@ -648,7 +651,7 @@ func (in Inputs) Build() (Policy, error) {
 				Sid: "BilletAMIBuilderConsole", Effect: "Allow",
 				Action:    ec2.BuilderVerifyIAMActions(),
 				Resource:  []string{"arn:" + partition + ":ec2:*:*:instance/*"},
-				Condition: builderOwnerCondition(),
+				Condition: builderOwnerCondition(in.Owner),
 			},
 			// And the contract promotion, which is the one standalone CreateTags billet
 			// makes. It is conditioned on the RESOURCE tag rather than the request tag —
@@ -659,7 +662,7 @@ func (in Inputs) Build() (Policy, error) {
 				Action: ec2.BuilderPromoteIAMActions(),
 				// An AMI ARN has an empty account field, as above.
 				Resource:  []string{"arn:" + partition + ":ec2:*::image/*"},
-				Condition: builderOwnerCondition(),
+				Condition: builderOwnerCondition(in.Owner),
 			},
 		)
 
@@ -689,13 +692,16 @@ func (in Inputs) Build() (Policy, error) {
 				},
 			}
 
-			// In per-deployment mode the tag it may stamp is the BUILDER's own
-			// prefix and nothing else: this statement exists for `ami build`,
-			// which always tags with it, so a wider allowance would let this role
-			// stamp another deployment's owner onto an image it created.
+			// In per-deployment mode the tag it may stamp is THIS DEPLOYMENT's own
+			// builder value and nothing else: this statement exists for `ami
+			// build`, which always tags with it, so a wider allowance would let
+			// this role stamp another deployment's builder onto an image it
+			// created and then reach it through the statements above.
 			if in.Owner != "" {
 				tag.Condition["StringLike"] = map[string]any{
-					"aws:RequestTag/" + ec2.OwnerTagKey: []string{ec2.BuilderOwnerPrefix + "*"},
+					"aws:RequestTag/" + ec2.OwnerTagKey: []string{
+						ec2.BuilderOwnerPattern(in.Owner),
+					},
 				}
 			}
 
@@ -1494,8 +1500,13 @@ func createTagCondition(owner string, builder bool) map[string]any {
 
 	key := "aws:RequestTag/" + ec2.OwnerTagKey
 	if builder {
-		// StringLike, so the exact owner AND the builder prefix both match.
-		cond["StringLike"] = map[string]any{key: []string{owner, ec2.BuilderOwnerPrefix + "*"}}
+		// StringLike, so the exact owner AND this deployment's builders both
+		// match. The builder half is the same pattern the builder statements use
+		// and the same one `ami build` stamps, so a role in value mode cannot tag
+		// a launch with another deployment's builder value.
+		cond["StringLike"] = map[string]any{
+			key: []string{owner, ec2.BuilderOwnerPattern(owner)},
+		}
 	} else {
 		stringEquals[key] = owner
 	}
@@ -1513,23 +1524,23 @@ func createTagCondition(owner string, builder bool) map[string]any {
 	return cond
 }
 
-// builderOwnerCondition matches the builder's per-build owner value by prefix, so
-// the builder's permissions reach only builder instances — never a deployment's
-// job instances, whatever mode the rest of the policy is in.
+// builderOwnerCondition matches the builder's own owner value, so the builder's
+// permissions reach only builder instances — never a deployment's job instances,
+// whatever mode the rest of the policy is in — and in VALUE mode only this
+// deployment's builders.
 //
-// AND ONLY BY PREFIX, WHICH IS A BOUNDARY THIS DOES NOT DRAW. `billet ami build`
-// stamps `billet-ami-build-<image name>`, which carries no deployment id, so in
-// a shared account two deployments that both hold a builder grant can act on
-// each other's BUILDER instances — imaging, terminating, reading a console,
-// stamping a contract tag. Their job instances, cache volumes and snapshots stay
-// isolated, because those are conditioned on the owner tag's VALUE. Closing this
-// needs a deployment-scoped tag on the builder itself and a matching condition
-// here, which changes what `ami build` sends and wants measuring against a real
-// account: issue #56.
-func builderOwnerCondition() map[string]any {
+// THE PATTERN COMES FROM THE PACKAGE THAT STAMPS IT. A policy and a tagger
+// deciding this separately is what let two deployments in one account image,
+// terminate, read the console of and stamp each other's builds while every job
+// instance stayed isolated (issue #56).
+//
+// An empty owner is the account-wide mode and yields the bare prefix, reaching
+// every builder in the account. That is correct there: the mode has no
+// deployment to distinguish and its own documentation says so.
+func builderOwnerCondition(owner string) map[string]any {
 	return map[string]any{
 		"StringLike": map[string]any{
-			"aws:ResourceTag/" + ec2.OwnerTagKey: []string{ec2.BuilderOwnerPrefix + "*"},
+			"aws:ResourceTag/" + ec2.OwnerTagKey: []string{ec2.BuilderOwnerPattern(owner)},
 		},
 	}
 }
