@@ -52,7 +52,7 @@ import (
 // THE PROCESS TIMEOUT IS NOT DECORATION: the expiry window alone defaults to
 // thirty minutes, and Go's default is ten.
 //
-// IT RAN FOUR TIMES ON 2026-09-04 and the answers are in ADR-006,
+// IT RAN FIVE TIMES ON 2026-09-04 and the answers are in ADR-006,
 // upstream-references.md and the protocol skill: a successor is refused under
 // either name, the session was still refused at 60 seconds every time and open at
 // 91 or 92, and the unacknowledged message came back to the successor. NOTHING
@@ -144,8 +144,16 @@ func TestLiveSessionReplacement(t *testing.T) {
 
 	switch {
 	case refusal == nil:
+		report.SameOwnerOpened = boolPtr(true)
+
+		// ARMED THE MOMENT IT EXISTS. A close registered after the next probe is
+		// one a fatal probe skips, and what it would have closed is the next run's
+		// abandoned session.
+		closeSession(t, second, "the successor session", report)
+
 		t.Log("RECORDED: a successor under the SAME owner opened at once")
 	case sameHeld:
+		report.SameOwnerOpened = boolPtr(false)
 		report.SameOwnerRefused = refusal.Error()
 		recordRefusal(report, abandonedAt)
 
@@ -165,32 +173,40 @@ func TestLiveSessionReplacement(t *testing.T) {
 	// scale set or as a fresh holder decides whether a promotion waits out the old
 	// leader's session or takes over at once.
 	//
-	// IT IS ASKED WHATEVER THE FIRST PROBE ANSWERED. Owner-sensitivity is the thing
-	// this probe exists to find, so skipping it when the same owner got in would
-	// leave the failover question unanswered in precisely the case that would have
-	// made it interesting.
-	other, otherHeld, otherErr := probeSession(t.Context(), client, set.ID, successorOwner)
+	// AND IT IS ONLY THE ABANDONED SESSION'S QUESTION WHILE THAT IS WHAT IS
+	// OUTSTANDING. If the same owner already opened, the session anything would now
+	// be refused by is the one THIS RUN opened seconds ago, and recording that
+	// refusal as the failover answer would manufacture the owner-sensitivity the
+	// measurement exists to find. One trial can measure one abandoned session, so
+	// the other case is recorded as unmeasured, in the report and out loud, and
+	// needs a trial of its own.
+	if second != nil {
+		report.FailoverUnmeasured = "a successor under the same owner opened, so any answer " +
+			"to another name would be about the session this run opened rather than the " +
+			"abandoned one; the failover needs its own abandoned session"
 
-	switch {
-	case otherErr == nil:
-		report.OtherOwnerOpened = boolPtr(true)
+		t.Logf("NOT MEASURED: %s", report.FailoverUnmeasured)
+	} else {
+		other, otherHeld, otherErr := probeSession(t.Context(), client, set.ID, successorOwner)
 
-		t.Log("RECORDED: a successor under a DIFFERENT owner opened while a session was " +
-			"outstanding, so a failover to another host does not wait")
-
-		if second == nil {
+		switch {
+		case otherErr == nil:
+			report.OtherOwnerOpened = boolPtr(true)
 			second = other
-		} else {
-			closeSession(t, other, "the failover probe's session")
-		}
-	case otherHeld:
-		report.OtherOwnerOpened = boolPtr(false)
-		report.OtherOwnerRefused = otherErr.Error()
 
-		t.Logf("RECORDED: a successor under a DIFFERENT owner is refused too: %v", otherErr)
-	default:
-		t.Fatalf("the failover probe answered something other than the session-held "+
-			"refusal: %v", otherErr)
+			closeSession(t, second, "the successor session", report)
+
+			t.Log("RECORDED: a successor under a DIFFERENT owner opened while the abandoned " +
+				"session was outstanding, so a failover to another host does not wait")
+		case otherHeld:
+			report.OtherOwnerOpened = boolPtr(false)
+			report.OtherOwnerRefused = otherErr.Error()
+
+			t.Logf("RECORDED: a successor under a DIFFERENT owner is refused too: %v", otherErr)
+		default:
+			t.Fatalf("the failover probe answered something other than the session-held "+
+				"refusal: %v", otherErr)
+		}
 	}
 
 	// WAITING IT OUT IS WHAT billet DOES, so how long that takes is the number an
@@ -202,25 +218,12 @@ func TestLiveSessionReplacement(t *testing.T) {
 	// held; carrying it through the wait as well would measure one case twice.
 	if second == nil {
 		second = awaitSession(t, client, set.ID, owner, report, abandonedAt)
-	}
-
-	if second == nil {
-		return
-	}
-
-	t.Cleanup(func() {
-		closeCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()),
-			30*time.Second)
-		defer cancel()
-
-		// A LEFT-OPEN SUCCESSOR IS THE NEXT RUN'S ABANDONED SESSION, so a close
-		// that failed is reported rather than logged past.
-		if err := second.Close(closeCtx); err != nil {
-			report.SuccessorCloseFailed = err.Error()
-
-			t.Errorf("closing the successor session: %v", err)
+		if second == nil {
+			return
 		}
-	})
+
+		closeSession(t, second, "the successor session", report)
+	}
 
 	report.NewSessionStatistics = second.Statistics()
 
@@ -291,8 +294,10 @@ func awaitRedelivery(
 				return
 			}
 		case ctx.Err() != nil:
+			// SameMessage IS LEFT ABSENT. Nothing came back, so the comparison it
+			// reports did not happen, and false would read as a different message
+			// having arrived.
 			report.Redelivered = boolPtr(false)
-			report.SameMessage = boolPtr(false)
 			report.Note = "no message carrying id " + strconv.FormatInt(held.MessageID, 10) +
 				" reached the successor within " + pollWindow.String()
 
@@ -309,9 +314,15 @@ func awaitRedelivery(
 	}
 }
 
-// closeSession closes a session this measurement opened and did not otherwise
-// need, because what it leaves behind is the next run's abandoned session.
-func closeSession(t *testing.T, session server.Session, what string) {
+// closeSession arms the close of a session this measurement opened, because a
+// session left open is the next run's abandoned one.
+//
+// A FAILED CLOSE IS REPORTED AND RECORDED, not logged past, for the same reason.
+// Cleanups run last-registered-first, so a close armed here runs before the
+// report is written and what it records reaches the file.
+func closeSession(
+	t *testing.T, session server.Session, what string, report *replacementReport,
+) {
 	t.Helper()
 
 	t.Cleanup(func() {
@@ -319,6 +330,8 @@ func closeSession(t *testing.T, session server.Session, what string) {
 		defer cancel()
 
 		if err := session.Close(ctx); err != nil {
+			report.SuccessorCloseFailed = what + ": " + err.Error()
+
 			t.Errorf("closing %s: %v", what, err)
 		}
 	})
@@ -603,7 +616,11 @@ type replacementReport struct {
 	// opening under the abandoned holder's own name and under another host's.
 	SameOwnerRefused  string `json:"same_owner_refused,omitempty"`
 	OtherOwnerRefused string `json:"other_owner_refused,omitempty"`
+	SameOwnerOpened   *bool  `json:"same_owner_opened,omitempty"`
 	OtherOwnerOpened  *bool  `json:"other_owner_opened,omitempty"`
+	// FailoverUnmeasured says why this run could not answer the different-owner
+	// question, which is not the same as answering it no.
+	FailoverUnmeasured string `json:"failover_unmeasured,omitempty"`
 
 	// LastRefusedAfter and OpenedAfter BRACKET the expiry rather than naming it:
 	// the session was still held at the first and open at the second, and nothing
