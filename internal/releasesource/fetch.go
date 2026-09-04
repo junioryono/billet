@@ -36,22 +36,30 @@ type Policy = imagesource.Policy
 // the release process.
 const PublishWorkflow = ".github/workflows/release.yml"
 
-// PublishRef is the git ref releases may be signed from.
+// PublishRefPattern is the git ref releases may be signed from.
 //
-// A RELEASE IS BUILT FROM A MAINTAINED BRANCH, not from main. cut-release.yml
-// commits the generated release surface onto `release/vX.Y` and tags that, and
-// release.yml runs against the tag — so pinning `refs/heads/main` would refuse
-// every release billet actually publishes. What must stay excluded is
-// `refs/pull/N/head`, which is the low bar the imagesource comment names.
-var PublishRefPattern = `refs/(heads/release/v[0-9]+\.[0-9]+|tags/v[0-9]+\.[0-9]+\.[0-9]+)`
+// THE REF IS THE RUN'S, NOT THE TAG'S, AND THAT WAS MEASURED. cut-release.yml
+// runs on main and CALLS release.yml (a workflow_call, so the tag it pushed with
+// GITHUB_TOKEN starts nothing), and the Fulcio certificate names the workflow
+// that requested it under the ref of the run that requested it: v0.6.0's
+// manifest carries `release.yml@refs/heads/main`. An earlier reading of this
+// pattern assumed release.yml "runs against the tag" and accepted only
+// `refs/heads/release/vX.Y` or `refs/tags/vX.Y.Z`, so every binary shipped with
+// it, v0.5.0 and v0.6.0 included, refused every manifest billet had ever
+// published; the first rollout rehearsal (2026-09-04) is where that surfaced.
+// The two refs the workflow can actually run under are the cut button on main
+// and a hotfix tag pushed by hand (`on: push: tags: v*`); a release branch is
+// not one of them, because release.yml has no branch trigger. What must stay
+// excluded is `refs/pull/N/head`, which is the low bar the imagesource comment
+// names, and every other branch.
+var PublishRefPattern = `refs/(heads/main|tags/v[0-9]+\.[0-9]+\.[0-9]+)`
 
 // DefaultSigningIdentity is the certificate SAN a billet release manifest must
 // carry.
 //
 // ANCHORED AT BOTH ENDS AND ESCAPED EXCEPT WHERE THE PATTERN IS THE POINT. The
 // repository and the workflow are literals and go through QuoteMeta; the ref is a
-// deliberate alternation, because a release is cut from whichever minor branch
-// carries it.
+// deliberate alternation between the button's run on main and a hand-pushed tag.
 var DefaultSigningIdentity = `^https://github\.com/` +
 	regexp.QuoteMeta(DefaultRepo) + `/` + regexp.QuoteMeta(PublishWorkflow) + `@` +
 	PublishRefPattern + `$`
