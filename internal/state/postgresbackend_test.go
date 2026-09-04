@@ -605,12 +605,21 @@ func holdSchemaMigrations(t *testing.T, dsn string) (release func()) {
 		t.Fatalf("open a holder session: %v", err)
 	}
 
-	tx, err := conn.BeginTx(t.Context(), nil)
+	// THE HOLDER OUTLIVES THE TEST'S OWN CONTEXT, and it has to. t.Context() is
+	// cancelled JUST BEFORE the cleanups run, and database/sql binds the context
+	// a transaction was begun on to that transaction — so a holder begun on
+	// t.Context() can never be rolled back from a cleanup, which is the only
+	// place a caller that does not release by hand ever releases. That is not a
+	// flake: TestAMigrationCutOffAtItsDeadlineSaysWhatToLookAt takes this path
+	// every run and answered "context already done: context canceled" every run.
+	holderCtx := context.WithoutCancel(t.Context())
+
+	tx, err := conn.BeginTx(holderCtx, nil)
 	if err != nil {
 		t.Fatalf("begin the holder's transaction: %v", err)
 	}
 
-	if _, err := tx.ExecContext(t.Context(),
+	if _, err := tx.ExecContext(holderCtx,
 		`LOCK TABLE schema_migrations IN ACCESS EXCLUSIVE MODE`); err != nil {
 		t.Fatalf("lock schema_migrations: %v", err)
 	}
@@ -621,7 +630,12 @@ func holdSchemaMigrations(t *testing.T, dsn string) (release func()) {
 		once.Do(func() {
 			// A ROLLBACK THAT FAILED IS A LOCK STILL HELD, and the test would then
 			// hang or fail somewhere that names neither; say so here.
-			if err := tx.Rollback(); err != nil {
+			//
+			// ErrTxDone IS NOT THAT. It says the transaction is already over —
+			// the server ended the session, or database/sql rolled it back — and
+			// a transaction that is over is holding nothing. Reporting it would
+			// be reporting the lock released as a lock stuck.
+			if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
 				t.Errorf("release the holder's lock on schema_migrations: %v", err)
 			}
 
