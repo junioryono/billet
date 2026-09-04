@@ -217,7 +217,7 @@ func TestARedeliveredAssignmentDoesNotStartASecondRunner(t *testing.T) {
 	defer stop()
 
 	// THE FAKE REPLAYS THE WHOLE EXCHANGE DELIBERATELY, which is more than anyone
-	// has measured: what five real runs on 2026-09-04 established is narrower,
+	// has measured: what six real runs on 2026-09-04 established is narrower,
 	// that a session abandoned while holding an unacknowledged JobAssigned handed
 	// that same message id to its successor (internal/integration's
 	// TestLiveSessionReplacement). Nothing has measured a JobAvailable replayed for

@@ -52,7 +52,7 @@ import (
 // THE PROCESS TIMEOUT IS NOT DECORATION: the expiry window alone defaults to
 // thirty minutes, and Go's default is ten.
 //
-// IT RAN FIVE TIMES ON 2026-09-04 and the answers are in ADR-006,
+// IT RAN SIX TIMES ON 2026-09-04 and the answers are in ADR-006,
 // upstream-references.md and the protocol skill: a successor is refused under
 // either name, the session was still refused at 60 seconds every time and open at
 // 91 or 92, and the unacknowledged message came back to the successor. NOTHING
@@ -140,7 +140,8 @@ func TestLiveSessionReplacement(t *testing.T) {
 	// billet's own session open now waits rather than failing to start: see
 	// server.openSession, which existed as a bare error return until this test ran
 	// and took a restarted control plane down with it.
-	second, sameHeld, refusal := probeSession(t.Context(), client, set.ID, owner)
+	sameAsked := time.Now()
+	second, sameHeld, refusal := probeSession(probeCtx(t), client, set.ID, owner)
 
 	switch {
 	case refusal == nil:
@@ -155,7 +156,7 @@ func TestLiveSessionReplacement(t *testing.T) {
 	case sameHeld:
 		report.SameOwnerOpened = boolPtr(false)
 		report.SameOwnerRefused = refusal.Error()
-		recordRefusal(report, abandonedAt)
+		recordRefusal(report, abandonedAt, sameAsked)
 
 		t.Logf("RECORDED: a successor under the SAME owner is refused while the abandoned "+
 			"session is outstanding: %v", refusal)
@@ -187,17 +188,26 @@ func TestLiveSessionReplacement(t *testing.T) {
 
 		t.Logf("NOT MEASURED: %s", report.FailoverUnmeasured)
 	} else {
-		other, otherHeld, otherErr := probeSession(t.Context(), client, set.ID, successorOwner)
+		other, otherHeld, otherErr := probeSession(probeCtx(t), client, set.ID, successorOwner)
 
 		switch {
 		case otherErr == nil:
-			report.OtherOwnerOpened = boolPtr(true)
+			// AND AN OPENING HERE HAS TWO EXPLANATIONS. The same owner was refused
+			// a moment ago, so this either means a different name may displace an
+			// outstanding session or means the abandoned session expired in the
+			// gap; nothing in the answer separates them. Recording the first would
+			// be picking the more interesting one. The refusal below has no such
+			// ambiguity: something was outstanding, and nothing else was open.
+			report.FailoverUnmeasured = "a successor under a different owner opened " +
+				since(abandonedAt) + " after the abandoned session, " +
+				since(sameAsked) + " after the same owner was refused; whether a " +
+				"different name displaced it or it had expired by then is not " +
+				"separable from one trial"
 			second = other
 
 			closeSession(t, second, "the successor session", report)
 
-			t.Log("RECORDED: a successor under a DIFFERENT owner opened while the abandoned " +
-				"session was outstanding, so a failover to another host does not wait")
+			t.Logf("NOT MEASURED: %s", report.FailoverUnmeasured)
 		case otherHeld:
 			report.OtherOwnerOpened = boolPtr(false)
 			report.OtherOwnerRefused = otherErr.Error()
@@ -317,7 +327,9 @@ func awaitRedelivery(
 // closeSession arms the close of a session this measurement opened, because a
 // session left open is the next run's abandoned one.
 //
-// A FAILED CLOSE IS REPORTED AND RECORDED, not logged past, for the same reason.
+// A CLOSE THAT DID NOT COME BACK CLEANLY IS REPORTED AND RECORDED, not logged
+// past: it does not prove the session is still open, it proves nothing either
+// way, and the next run is the one that finds out.
 // Cleanups run last-registered-first, so a close armed here runs before the
 // report is written and what it records reaches the file.
 func closeSession(
@@ -337,12 +349,38 @@ func closeSession(
 	})
 }
 
-// recordRefusal writes the lower end of the bracket: a refusal actually observed
-// at this moment, measured from the one origin every "after" in the record uses.
-func recordRefusal(report *replacementReport, since time.Time) {
-	held := time.Since(since).Truncate(time.Second)
+// recordRefusal writes the lower end of the bracket, measured from the one origin
+// every "after" in the record uses.
+//
+// FROM WHEN THE REQUEST LEFT, NOT WHEN THE ANSWER CAME BACK. A refusal was issued
+// somewhere inside the request, so the moment it proves the session was still
+// held is the earlier end of that interval; timing the answer instead counts
+// however slow the round trip was as time the session was proved outstanding.
+func recordRefusal(report *replacementReport, origin, asked time.Time) {
+	held := asked.Sub(origin).Truncate(time.Second)
 	report.LastRefusedAfter = held.String()
 	report.LastRefusedAfterSeconds = int(held.Seconds())
+}
+
+// since renders how long ago a moment was, for a sentence in the record.
+func since(t time.Time) string {
+	return time.Since(t).Truncate(time.Second).String()
+}
+
+// probeCtx bounds one session probe.
+//
+// AN UNBOUNDED PROBE MAKES ITS OWN ANSWER WRONG: a request that takes a minute to
+// come back is one whose answer describes a moment the record cannot name, and
+// the gap between two probes is the window in which the thing being measured
+// expires. A probe that outlasts this is a could-not-tell, which the callers
+// treat as fatal rather than as a refusal.
+func probeCtx(t *testing.T) context.Context {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(t.Context(), probeTimeout)
+	t.Cleanup(cancel)
+
+	return ctx
 }
 
 // awaitMessage polls until GitHub hands this session a message CARRYING WORK, or
@@ -462,7 +500,15 @@ func awaitSession(
 	// pace still leaves a bracket with both ends: the refusal recorded here is
 	// what "still refused at" names, and sleeping first would leave it empty.
 	for attempt := 1; ; attempt++ {
-		session, refusedHeld, err := probeSession(ctx, client, id, owner)
+		asked := time.Now()
+
+		// EACH ATTEMPT IS BOUNDED INSIDE THE WHOLE WAIT. A probe that hangs would
+		// otherwise sit inside the window until it closed, and the one answer this
+		// loop is here to catch would arrive as a bound reached.
+		attemptCtx, endAttempt := context.WithTimeout(ctx, probeTimeout)
+		session, refusedHeld, err := probeSession(attemptCtx, client, id, owner)
+
+		endAttempt()
 
 		switch {
 		case err == nil:
@@ -481,7 +527,7 @@ func awaitSession(
 
 			return session
 		case refusedHeld:
-			recordRefusal(report, abandonedAt)
+			recordRefusal(report, abandonedAt, asked)
 
 			t.Logf("still refused at %s (attempt %d); waiting", report.LastRefusedAfter, attempt)
 		case ctx.Err() != nil:
@@ -566,6 +612,11 @@ const (
 	messagePace   = 5 * time.Second
 )
 
+// probeTimeout bounds one session open, so a slow request cannot be the reason a
+// bracket end names a moment nothing was observed at. Well above the ~1s these
+// take against a real organization, and well below the pace between them.
+const probeTimeout = 20 * time.Second
+
 // expiryWindow bounds the wait for GitHub to expire an abandoned session, and
 // sessionPace is how often it is asked — the same pace server.openSession uses,
 // because what is being waited for is not made sooner by asking more often.
@@ -639,7 +690,8 @@ type replacementReport struct {
 	// SameMessage says whether what came back carried the id that was held. The
 	// payload is not compared; the shape beside it is what the record shows.
 	SameMessage *bool `json:"same_message,omitempty"`
-	// SuccessorCloseFailed is set when this run left a session behind.
+	// SuccessorCloseFailed is set when a close did not come back cleanly, which
+	// leaves the session's state unknown rather than proven open.
 	SuccessorCloseFailed string `json:"successor_close_failed,omitempty"`
 	// OtherMessageIDs are messages the successor was handed that were not the one
 	// the abandoned session held.
