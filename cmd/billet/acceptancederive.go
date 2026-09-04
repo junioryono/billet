@@ -102,6 +102,16 @@ func rewriteForAcceptance(root *yaml.Node, dir, prefix, listen string) ([]string
 	// as corruption, which is still a failure nobody asked for.
 	removeScalar(root, "backup")
 
+	// NEVER ON AUTOMATIC UPDATES. The binary under acceptance is whatever the
+	// workflow built, which reports no release, and a fleet whose hosts report no
+	// release is not on the channel's target, so the starter would open a rollout
+	// to the channel on its first tick and drain the one node the acceptance job
+	// needs (measured 2026-09-04 on the recover rehearsal, whose snapshot
+	// deployment began moving itself to v0.6.0 a minute after boot). An
+	// acceptance run proves the tree it was built from, never the channel; the
+	// rest of a `release:` block the base carries is left alone.
+	setScalar(ensureMapping(root, "release"), "automatic", "false")
+
 	labels, err := prefixTierLabels(root, prefix)
 	if err != nil {
 		return nil, err
@@ -284,6 +294,27 @@ func mappingValue(m *yaml.Node, key string) *yaml.Node {
 	}
 
 	return nil
+}
+
+// ensureMapping returns the mapping under key, creating an empty one when the
+// key is absent. A key holding something other than a mapping is replaced,
+// because the caller is about to write a key into it and a scalar there would
+// make the derived config unparseable rather than merely different.
+func ensureMapping(m *yaml.Node, key string) *yaml.Node {
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		if isKey(m.Content[i], key) {
+			if m.Content[i+1].Kind != yaml.MappingNode {
+				m.Content[i+1] = &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+			}
+
+			return m.Content[i+1]
+		}
+	}
+
+	value := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+	m.Content = append(m.Content, &yaml.Node{Kind: yaml.ScalarNode, Value: key}, value)
+
+	return value
 }
 
 // prefixScalar prefixes an existing scalar, and does nothing when the key is

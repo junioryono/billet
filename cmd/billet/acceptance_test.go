@@ -139,6 +139,47 @@ func TestAnAcceptanceRunSharesNoStateWithTheDeploymentItCameFrom(t *testing.T) {
 	}
 }
 
+// AN ACCEPTANCE RUN NEVER MOVES ITSELF. The binary under test reports no release,
+// and the automatic starter reads a fleet reporting no release as not on the
+// channel's target: measured 2026-09-04, a snapshot-built rehearsal deployment
+// with no release block opened a rollout to v0.6.0 a minute after boot. A base
+// that says nothing about releases is on automatic updates by default, so the
+// derivation has to say no explicitly, and a base that follows a channel keeps
+// everything about it except that switch.
+func TestAnAcceptanceRunIsNeverOnAutomaticUpdates(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name  string
+		extra string
+	}{
+		{"a base that says nothing about releases", ""},
+		{"a base that follows the candidate channel", "\nrelease:\n  channel: candidate\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			base := writeAcceptanceBase(t, acceptanceBaseConfig+tc.extra)
+			ws := deriveForTest(t, base, t.TempDir())
+
+			cfg, err := config.Load(ws.ConfigPath)
+			if err != nil {
+				t.Fatalf("the derived config does not load: %v", err)
+			}
+
+			if cfg.Release.AutomaticUpdates() {
+				t.Fatal("the derived deployment is on automatic updates, so its control plane " +
+					"would open a rollout to the channel and drain the node the acceptance job needs")
+			}
+
+			if tc.extra != "" && cfg.Release.Channel != config.ChannelCandidate {
+				t.Errorf("the base's channel %q was not kept: got %q",
+					config.ChannelCandidate, cfg.Release.Channel)
+			}
+		})
+	}
+}
+
 // THE TIER LABELS ARE THE SCALE SETS, so this is the assertion the teardown's
 // safety rests on: `billet acceptance down` runs `teardown --all` against the
 // derived config, which deletes the scale set of every tier in it.
