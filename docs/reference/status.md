@@ -18,7 +18,7 @@ billet is pre-alpha. This page says what has actually run, by backend, against r
 | Area | Proven | Not yet |
 |---|---|---|
 | Ceph RBD | the reference cluster built and measured (ADR-003); real Ceph growth becomes Firecracker guest capacity; same-site sharing and cross-site isolation on real hosts | |
-| EBS + S3 | first real publication on 2026-09-03 found and fixed two refusals every fake accepted; warm hits clone from snapshots | the live warm-workflow, failed-job and power-cut proofs for sticky disks |
+| EBS + S3 | first real publication on 2026-09-03 found and fixed two refusals every fake accepted; warm hits clone from snapshots | the live warm-workflow, failed-job and power-cut proofs for sticky disks, which the acceptance lane cannot run: an EC2 guest asks for its cache over the node's listener, and a node on a hosted runner has no address to serve one from (measured 2026-09-04, [#27](https://github.com/junioryono/billet/issues/27)) |
 | Actions cache interception | the live conformance matrix (host and container save/restore, BuildKit through two drivers, kill switch, pinned and embedded clients, poisoned clients) | |
 | SQLite ledger | every invariant tested; migrations frozen since the first release | |
 | PostgreSQL ledger | the suite runs against PostgreSQL 18 in CI; the allocator re-run on it; the identity-only backup and restore rehearsed with the real package | |
