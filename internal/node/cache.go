@@ -240,11 +240,16 @@ func (s *CacheService) observe(ctx context.Context, session *cacheSession, obs a
 	}
 
 	// DURABLE BEFORE IT IS SENT, so a report the plane never answered is resent
-	// by whichever process ends the compute.
+	// by whichever process ends the compute. A record that could not be written
+	// is not reported either: an observation that exists only in memory would be
+	// told to the plane once and, after a restart, never again, and the plane
+	// would hold a fact this host cannot account for.
 	session.observed.Reported = false
 	if err := s.persistSession(session); err != nil {
-		s.log.Warn("could not make a cache observation durable; a restart before the compute "+
-			"ends would lose it", "instance", session.instance, "error", err)
+		s.log.Warn("could not make a cache observation durable; it is kept in memory and "+
+			"reported when the session next persists", "instance", session.instance, "error", err)
+
+		return
 	}
 
 	s.report(ctx, session)
@@ -334,12 +339,24 @@ func (s *CacheService) SettleObservation(ctx context.Context, instance string) {
 	session := s.byToken[token]
 	s.mu.Unlock()
 
-	if err := lockCacheSession(ctx, session); err != nil {
+	// DETACHED FROM THE TEARDOWN'S CONTEXT, and bounded. A destroy arrives on a
+	// context that may already be cancelled, and a settlement that gave up on
+	// the lock wait would let the runner forget the lease before the last
+	// report was attempted. The bound keeps a wedged session from holding the
+	// teardown.
+	settleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cacheReportLimit)
+	defer cancel()
+
+	if err := lockCacheSession(settleCtx, session); err != nil {
+		s.log.Warn("could not settle what the cache did for a job before its compute was "+
+			"forgotten; the session's cleanup will try once more",
+			"instance", instance, "error", err)
+
 		return
 	}
 	defer session.mu.Unlock()
 
-	s.settleObservation(ctx, session)
+	s.settleObservation(settleCtx, session)
 }
 
 // Prepare creates one unguessable session credential before compute starts.
@@ -732,15 +749,17 @@ func (s *CacheService) attachDockerStore(
 		return
 	}
 
-	// WHAT THE STORE ANSWERED, observed here where it was answered: a clone of a
-	// generation is warm and names it, a miss that became a fresh volume is cold.
+	// WHAT THE STORE ANSWERED: a clone of a generation is warm and names it, a
+	// miss that became a fresh volume is cold. OBSERVED ONLY ONCE THE VOLUME IS
+	// IN DURABLE CUSTODY, below: an observation persists the session and then
+	// talks to the plane, and doing either before the slot is recorded is a
+	// window in which a crash leaves a volume restart cleanup cannot find.
 	observed := alloc.CacheObservation{ImageCache: alloc.ImageCacheCold}
 	if !cold {
 		observed = alloc.CacheObservation{
 			ImageCache: alloc.ImageCacheWarm, CacheGeneration: volume.Generation,
 		}
 	}
-	s.observe(ctx, session, observed)
 
 	session.slots[0] = &cacheAttachment{
 		Volume: volume, Publication: publicationLWW, Docker: true,
@@ -755,6 +774,7 @@ func (s *CacheService) attachDockerStore(
 		}
 		s.log.Warn("Docker image-store custody could not be made durable; the job can continue cold",
 			"instance", session.instance, "error", errors.Join(err, discardErr, retryErr))
+		s.observe(ctx, session, alloc.CacheObservation{ImageCache: alloc.ImageCacheUnavailable})
 		http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
 
 		return
@@ -778,10 +798,14 @@ func (s *CacheService) attachDockerStore(
 		s.log.Warn("Docker image store could not be attached; the job can continue cold",
 			"instance", session.instance,
 			"error", errors.Join(err, detachErr, discardErr, clearErr))
+		s.observe(ctx, session, alloc.CacheObservation{ImageCache: alloc.ImageCacheUnavailable})
 		http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
 
 		return
 	}
+
+	// THE GUEST HAS ITS STORE, so what the store answered is what it saw.
+	s.observe(ctx, session, observed)
 
 	guestDevice := guestVolumeDevice(0)
 	if locator, ok := s.attacher.(provider.GuestVolumeLocator); ok {

@@ -176,10 +176,53 @@ func TestAHostBackedLeaseArchivesItsSiteAndNoPrice(t *testing.T) {
 	}
 }
 
-// A REAPED LEASE KEEPS ITS PROVIDER. The reaper archives from its own
-// projection, which did not select chosen_provider, so every lease that expired
-// into quarantine and was then resolved was archived as having run on nothing.
-func TestAReapedLeaseKeepsItsProviderInTheHistory(t *testing.T) {
+// A LEASE THE REAPER FAILS OUTRIGHT KEEPS ITS PROVIDER. A lease is bound while
+// still `assigned`, and a node that dies between the bind and the launch leaves
+// exactly that: bound, never launched, so the reaper terminalizes it from its
+// own projection rather than quarantining it. That projection did not select
+// chosen_provider, so every such lease was archived as having run on nothing.
+//
+// THIS IS THE ONE PATH THAT ARCHIVES A BOUND LEASE FROM THE PROJECTION. A
+// launched lease is quarantined instead and resolved from a full load, which
+// would carry the provider whatever the projection said.
+func TestABoundLeaseTheReaperFailsKeepsItsProviderInTheHistory(t *testing.T) {
+	a := pricedCloudAllocator(t, 340_000)
+
+	lease, err := a.Reserve(t.Context(), "cloud")
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+	if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 1, 1); err != nil {
+		t.Fatalf("Assign: %v", err)
+	}
+	if err := a.Bind(t.Context(), lease.ID, lease.Epoch, "cloud-1"); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	if err := a.ExpireForTest(t.Context(), lease.ID); err != nil {
+		t.Fatalf("ExpireForTest: %v", err)
+	}
+	if n, err := a.Reap(t.Context()); err != nil || n != 1 {
+		t.Fatalf("Reap = %d, %v; want 1 failed outright", n, err)
+	}
+
+	got, err := a.HistoryPlacement(t.Context(), lease.ID)
+	if err != nil {
+		t.Fatalf("HistoryPlacement: %v", err)
+	}
+
+	want := JobPlacement{
+		Provider: config.ProviderEC2, InstanceType: "eight", VCPU: 8, Memory: 16 * config.GiB,
+		Site: "us-east", PriceUSDPerHour: 340_000,
+	}
+	if got != want {
+		t.Fatalf("HistoryPlacement after the reaper failed a bound lease = %+v, want %+v", got, want)
+	}
+}
+
+// A QUARANTINED LEASE RESOLVED LATER KEEPS EVERYTHING TOO, from the full load
+// the resolution makes.
+func TestAQuarantinedLeaseKeepsItsPlacementInTheHistory(t *testing.T) {
 	a := pricedCloudAllocator(t, 340_000)
 
 	lease, err := a.Reserve(t.Context(), "cloud")
@@ -203,10 +246,13 @@ func TestAReapedLeaseKeepsItsProviderInTheHistory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("HistoryPlacement: %v", err)
 	}
-	if got.Provider != config.ProviderEC2 || got.InstanceType != "eight" ||
-		got.PriceUSDPerHour != 340_000 || got.Site != "us-east" {
-		t.Fatalf("HistoryPlacement after a reap = %+v, want the ec2 host's eight shape at "+
-			"340000 in us-east", got)
+
+	want := JobPlacement{
+		Provider: config.ProviderEC2, InstanceType: "eight", VCPU: 8, Memory: 16 * config.GiB,
+		Site: "us-east", PriceUSDPerHour: 340_000,
+	}
+	if got != want {
+		t.Fatalf("HistoryPlacement after a quarantine = %+v, want %+v", got, want)
 	}
 }
 
@@ -233,9 +279,15 @@ func TestAnExpiredEscrowArchivesItsChargedShape(t *testing.T) {
 	if err != nil {
 		t.Fatalf("HistoryPlacement: %v", err)
 	}
-	if got.InstanceType != "eight" || got.PriceUSDPerHour != 340_000 || got.Site != "us-east" ||
-		got.VCPU != 8 {
-		t.Fatalf("HistoryPlacement after the reaper failed an escrow = %+v", got)
+
+	// NO PROVIDER, because an escrow that never bound ran on nothing; every
+	// other fact was decided at escrow and is kept.
+	want := JobPlacement{
+		InstanceType: "eight", VCPU: 8, Memory: 16 * config.GiB, Site: "us-east",
+		PriceUSDPerHour: 340_000,
+	}
+	if got != want {
+		t.Fatalf("HistoryPlacement after the reaper failed an escrow = %+v, want %+v", got, want)
 	}
 }
 

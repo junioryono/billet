@@ -22,6 +22,9 @@ type recordingObserver struct {
 	mu     sync.Mutex
 	refuse int
 	calls  []observedCall
+	// inspect runs inside every call, before the answer, so a test can look at
+	// what is on disk at the moment the plane is told.
+	inspect func(obs alloc.CacheObservation)
 }
 
 type observedCall struct {
@@ -34,6 +37,10 @@ func (o *recordingObserver) ObserveCache(_ context.Context, instance string, obs
 	defer o.mu.Unlock()
 
 	o.calls = append(o.calls, observedCall{instance: instance, obs: obs})
+
+	if o.inspect != nil {
+		o.inspect(obs)
+	}
 
 	if o.refuse > 0 {
 		o.refuse--
@@ -201,46 +208,82 @@ func closeActionsResponse(t *testing.T, response *http.Response) {
 	}
 }
 
-// A REPORT THE PLANE REFUSED IS KEPT ON THE SESSION AND RESENT WHEN THE
-// COMPUTE ENDS, with what the session never observed filled in.
-func TestAnUnreportedObservationIsResentWhenTheSessionEnds(t *testing.T) {
+// sessionRecord reads one session's durable record as it is on disk right now.
+func sessionRecord(t *testing.T, service *CacheService, token string) durableCacheSession {
+	t.Helper()
+
+	raw, err := os.ReadFile(filepath.Join(service.stateDir, token+".json"))
+	if err != nil {
+		t.Fatalf("read the session record: %v", err)
+	}
+
+	var record durableCacheSession
+	if err := json.Unmarshal(raw, &record); err != nil {
+		t.Fatalf("decode the session record: %v", err)
+	}
+
+	return record
+}
+
+// A REPORT THE PLANE REFUSED IS KEPT ON THE SESSION AND RESENT BY THE PROCESS
+// THAT ENDS THE COMPUTE, which need not be the one that observed it: the
+// service is rebuilt over the same state directory, the way a restarted node
+// rebuilds it, and its cleanup is what resends.
+//
+// THE RECORD IS ON DISK BEFORE THE PLANE IS TOLD, and the observer checks that
+// at the moment it is called: an observation reported first and written second
+// is one a crash in between would report once and never again.
+func TestAnUnreportedObservationIsResentAfterARestart(t *testing.T) {
 	t.Parallel()
 
 	storage := &fakeCacheStore{current: "gen-3"}
 	service, observer, token := observedService(t, storage)
 	observer.refuse = 1
+	observer.inspect = func(alloc.CacheObservation) {
+		record := sessionRecord(t, service, token)
+		if record.Observed.ImageCache != string(alloc.ImageCacheWarm) ||
+			record.Observed.CacheGeneration != "gen-3" || record.Observed.Reported {
+			t.Errorf("the plane was told before the record was durable: on disk %+v", record.Observed)
+		}
+		if record.Slots[0] == nil || !record.Slots[0].Docker {
+			t.Error("the plane was told before the volume was in durable custody")
+		}
+	}
 
 	docker := cacheRequest(t, service, token, "/v1/docker-store",
 		map[string]any{"architecture": "amd64"})
 	if docker.Code != http.StatusCreated {
 		t.Fatalf("Docker store status = %d: %s", docker.Code, docker.Body.String())
 	}
+	if calls := observer.recorded(); len(calls) != 1 {
+		t.Fatalf("observer was told %d times before the restart, want the one refused report", len(calls))
+	}
 
-	// DURABLE AS UNREPORTED, in between: a restart here must resend it too.
-	raw, err := os.ReadFile(filepath.Join(service.stateDir, token+".json"))
+	// DURABLE AS UNREPORTED, in between.
+	if record := sessionRecord(t, service, token); record.Observed.Reported {
+		t.Fatalf("session record after a refused report = %+v, want it unreported", record.Observed)
+	}
+
+	// THE RESTART. A second service over the same directory loads the session,
+	// and its observer is what the resend reaches.
+	restarted, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", service.rootState,
+		storage, &fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
 	if err != nil {
-		t.Fatalf("read the session record: %v", err)
+		t.Fatalf("NewCacheService after the restart: %v", err)
 	}
-	var record durableCacheSession
-	if err := json.Unmarshal(raw, &record); err != nil {
-		t.Fatalf("decode the session record: %v", err)
-	}
-	if record.Observed.ImageCache != string(alloc.ImageCacheWarm) ||
-		record.Observed.CacheGeneration != "gen-3" || record.Observed.Reported {
-		t.Fatalf("session record after a refused report = %+v, want the warm observation unreported",
-			record.Observed)
+	after := &recordingObserver{}
+	restarted.SetCacheObserver(after)
+
+	if err := restarted.Cleanup(t.Context(), "billet-one"); err != nil {
+		t.Fatalf("Cleanup after the restart: %v", err)
 	}
 
-	if err := service.Cleanup(t.Context(), "billet-one"); err != nil {
-		t.Fatalf("Cleanup: %v", err)
-	}
-
-	calls := observer.recorded()
+	calls := after.recorded()
 	want := alloc.CacheObservation{
 		ImageCache: alloc.ImageCacheWarm, CacheGeneration: "gen-3", ActionsCache: alloc.ActionsCacheOff,
 	}
-	if len(calls) != 2 || calls[1].obs != want {
-		t.Fatalf("observer was told %+v, want the refused warm report and then %+v at the end", calls, want)
+	if len(calls) != 1 || calls[0].instance != "billet-one" || calls[0].obs != want {
+		t.Fatalf("the restarted service told its observer %+v, want %+v for billet-one", calls, want)
 	}
 }
 
