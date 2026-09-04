@@ -52,12 +52,13 @@ import (
 // THE PROCESS TIMEOUT IS NOT DECORATION: the expiry window alone defaults to
 // thirty minutes, and Go's default is ten.
 //
-// IT RAN ON 2026-09-04 and the answers are in ADR-006, upstream-references.md and
-// the protocol skill: a successor is refused under either name, the session was
-// still refused at 60 seconds and open at 91, and the unacknowledged message came
-// back to the successor. NOTHING LEANS ON THAT REDELIVERY ANYWAY: every recovery
-// path in billet is written to be safe whether or not a message comes back, which
-// is what makes the answer a fact about GitHub rather than a dependency.
+// IT RAN FOUR TIMES ON 2026-09-04 and the answers are in ADR-006,
+// upstream-references.md and the protocol skill: a successor is refused under
+// either name, the session was still refused at 60 seconds every time and open at
+// 91 or 92, and the unacknowledged message came back to the successor. NOTHING
+// LEANS ON THAT REDELIVERY ANYWAY: every recovery path in billet is written to be
+// safe whether or not a message comes back, which is what makes the answer a fact
+// about GitHub rather than a dependency.
 func TestLiveSessionReplacement(t *testing.T) {
 	client, set := liveScaleSet(t)
 
@@ -120,6 +121,11 @@ func TestLiveSessionReplacement(t *testing.T) {
 	t.Logf("first session holds message %d (%s), deliberately NOT acknowledged",
 		held.MessageID, report.HeldMessage)
 
+	// ONE ORIGIN FOR EVERY "AFTER" IN THIS RECORD: the moment the session became
+	// an abandoned one. Two clocks produced a lower bound measured from before
+	// the wait it is quoted against.
+	abandonedAt := time.Now()
+
 	// A SESSION IS SINGLE-HOLDER, AND GITHUB DOES NOT LET A SUCCESSOR DISPLACE ONE.
 	//
 	// MEASURED, 2026-08-30, against a real organization: opening a second session
@@ -141,8 +147,7 @@ func TestLiveSessionReplacement(t *testing.T) {
 		t.Log("RECORDED: a successor under the SAME owner opened at once")
 	case sameHeld:
 		report.SameOwnerRefused = refusal.Error()
-		report.LastRefusedAfter = "0s"
-		report.LastRefusedAfterSeconds = 0
+		recordRefusal(report, abandonedAt)
 
 		t.Logf("RECORDED: a successor under the SAME owner is refused while the abandoned "+
 			"session is outstanding: %v", refusal)
@@ -159,25 +164,33 @@ func TestLiveSessionReplacement(t *testing.T) {
 	// different name; whether GitHub treats that as a second session for the same
 	// scale set or as a fresh holder decides whether a promotion waits out the old
 	// leader's session or takes over at once.
-	if refusal != nil {
-		other, otherHeld, otherErr := probeSession(t.Context(), client, set.ID, successorOwner)
+	//
+	// IT IS ASKED WHATEVER THE FIRST PROBE ANSWERED. Owner-sensitivity is the thing
+	// this probe exists to find, so skipping it when the same owner got in would
+	// leave the failover question unanswered in precisely the case that would have
+	// made it interesting.
+	other, otherHeld, otherErr := probeSession(t.Context(), client, set.ID, successorOwner)
 
-		switch {
-		case otherErr == nil:
-			report.OtherOwnerOpened = boolPtr(true)
+	switch {
+	case otherErr == nil:
+		report.OtherOwnerOpened = boolPtr(true)
+
+		t.Log("RECORDED: a successor under a DIFFERENT owner opened while a session was " +
+			"outstanding, so a failover to another host does not wait")
+
+		if second == nil {
 			second = other
-
-			t.Log("RECORDED: a successor under a DIFFERENT owner opened while the abandoned " +
-				"session was outstanding, so a failover to another host does not wait")
-		case otherHeld:
-			report.OtherOwnerOpened = boolPtr(false)
-			report.OtherOwnerRefused = otherErr.Error()
-
-			t.Logf("RECORDED: a successor under a DIFFERENT owner is refused too: %v", otherErr)
-		default:
-			t.Fatalf("the failover probe answered something other than the session-held "+
-				"refusal: %v", otherErr)
+		} else {
+			closeSession(t, other, "the failover probe's session")
 		}
+	case otherHeld:
+		report.OtherOwnerOpened = boolPtr(false)
+		report.OtherOwnerRefused = otherErr.Error()
+
+		t.Logf("RECORDED: a successor under a DIFFERENT owner is refused too: %v", otherErr)
+	default:
+		t.Fatalf("the failover probe answered something other than the session-held "+
+			"refusal: %v", otherErr)
 	}
 
 	// WAITING IT OUT IS WHAT billet DOES, so how long that takes is the number an
@@ -188,7 +201,7 @@ func TestLiveSessionReplacement(t *testing.T) {
 	// already established what a different name is told while the session is
 	// held; carrying it through the wait as well would measure one case twice.
 	if second == nil {
-		second = awaitSession(t, client, set.ID, owner, report)
+		second = awaitSession(t, client, set.ID, owner, report, abandonedAt)
 	}
 
 	if second == nil {
@@ -213,35 +226,14 @@ func TestLiveSessionReplacement(t *testing.T) {
 
 	t.Logf("successor session opened; statistics=%+v", report.NewSessionStatistics)
 
-	// WHETHER THE ABANDONED SESSION'S MESSAGE COMES BACK is the question. A poll
-	// that times out with nothing is a finding, not a failure: it means a
-	// successor must not expect a redelivery, which is precisely what every
+	// WHETHER THE ABANDONED SESSION'S MESSAGE COMES BACK is the question, and it
+	// is asked for the whole window rather than once: ErrNoMessage ends ONE
+	// server-side long poll, measured at about 88 seconds, and treating the first
+	// one as the answer would record a redelivery that arrived a second later as
+	// "no". A window that closes with nothing is a finding, not a failure: it
+	// means a successor must not expect a redelivery, which is what every
 	// recovery path in billet is written to survive.
-	pollCtx, cancel := context.WithTimeout(t.Context(), pollWindow)
-	defer cancel()
-
-	msg, err := second.GetMessage(pollCtx, 0, 1)
-
-	switch {
-	case errors.Is(err, server.ErrNoMessage):
-		report.Redelivered = boolPtr(false)
-		report.Note = "the successor's first poll returned no message within " +
-			pollWindow.String() + ", with message " +
-			strconv.FormatInt(held.MessageID, 10) + " left unacknowledged by the abandoned session"
-	case err != nil:
-		report.Note = "the successor's first poll failed: " + err.Error()
-
-		t.Errorf("polling the successor session: %v", err)
-	default:
-		report.Redelivered = boolPtr(true)
-		report.RedeliveredMessageID = msg.MessageID
-		report.RedeliveredMessage = describeMessage(msg)
-		report.SameMessage = boolPtr(msg.MessageID == held.MessageID)
-		report.Note = "the successor was handed a message"
-
-		t.Logf("RECORDED: the successor was handed message %d (%s); the abandoned session "+
-			"held %d", msg.MessageID, report.RedeliveredMessage, held.MessageID)
-	}
+	awaitRedelivery(t, second, held, report)
 
 	// STATISTICS ARE RECORDED AND NOT ACTED ON, and that distinction is the whole
 	// point of writing them down. The vendored README calls them the authoritative
@@ -254,6 +246,90 @@ func TestLiveSessionReplacement(t *testing.T) {
 		t.Error("the successor session carried no statistics, so nothing here can say " +
 			"what GitHub told it about the scale set")
 	}
+}
+
+// awaitRedelivery polls the successor for the whole window, looking for the id
+// the abandoned session was holding.
+//
+// REDELIVERY MEANS THAT ID, not any message: a notification about something else
+// recorded as a redelivery would answer a question nobody asked. Anything else
+// that arrives is recorded by id, acknowledged so the queue can move on, and the
+// window keeps running.
+func awaitRedelivery(
+	t *testing.T, session server.Session, held *server.Message, report *replacementReport,
+) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(t.Context(), pollWindow)
+	defer cancel()
+
+	for {
+		msg, err := session.GetMessage(ctx, 0, 1)
+
+		switch {
+		case err == nil && msg.MessageID == held.MessageID:
+			report.Redelivered = boolPtr(true)
+			report.SameMessage = boolPtr(true)
+			report.RedeliveredMessageID = msg.MessageID
+			report.RedeliveredMessage = describeMessage(msg)
+			report.Note = "the successor was handed the message the abandoned session held"
+
+			t.Logf("RECORDED: the successor was handed message %d (%s), which is the one the "+
+				"abandoned session held", msg.MessageID, report.RedeliveredMessage)
+
+			return
+		case err == nil:
+			report.OtherMessageIDs = append(report.OtherMessageIDs, msg.MessageID)
+
+			t.Logf("the successor was handed message %d (%s), which is NOT the held %d; "+
+				"acknowledging it and asking again", msg.MessageID, describeMessage(msg),
+				held.MessageID)
+
+			if ackErr := session.DeleteMessage(ctx, msg.MessageID); ackErr != nil {
+				t.Errorf("acknowledging an unrelated message: %v", ackErr)
+
+				return
+			}
+		case ctx.Err() != nil:
+			report.Redelivered = boolPtr(false)
+			report.SameMessage = boolPtr(false)
+			report.Note = "no message carrying id " + strconv.FormatInt(held.MessageID, 10) +
+				" reached the successor within " + pollWindow.String()
+
+			t.Logf("RECORDED: %s", report.Note)
+
+			return
+		case !errors.Is(err, server.ErrNoMessage):
+			report.Note = "the successor's poll failed: " + err.Error()
+
+			t.Errorf("polling the successor session: %v", err)
+
+			return
+		}
+	}
+}
+
+// closeSession closes a session this measurement opened and did not otherwise
+// need, because what it leaves behind is the next run's abandoned session.
+func closeSession(t *testing.T, session server.Session, what string) {
+	t.Helper()
+
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
+		defer cancel()
+
+		if err := session.Close(ctx); err != nil {
+			t.Errorf("closing %s: %v", what, err)
+		}
+	})
+}
+
+// recordRefusal writes the lower end of the bracket: a refusal actually observed
+// at this moment, measured from the one origin every "after" in the record uses.
+func recordRefusal(report *replacementReport, since time.Time) {
+	held := time.Since(since).Truncate(time.Second)
+	report.LastRefusedAfter = held.String()
+	report.LastRefusedAfterSeconds = int(held.Seconds())
 }
 
 // awaitMessage polls until GitHub hands this session a message CARRYING WORK, or
@@ -348,6 +424,7 @@ func boolPtr(v bool) *bool { return &v }
 // timeout nobody has documented.
 func awaitSession(
 	t *testing.T, client *scaleset.Client, id int, owner string, report *replacementReport,
+	abandonedAt time.Time,
 ) server.Session {
 	t.Helper()
 
@@ -358,13 +435,14 @@ func awaitSession(
 	ctx, cancel := context.WithTimeout(t.Context(), expiryWindow)
 	defer cancel()
 
-	outOfTime := func() server.Session {
-		report.Note = "the abandoned session was still outstanding after " +
-			expiryWindow.String()
+	// WHAT A REACHED BOUND ESTABLISHES IS THAT NOTHING OPENED, not that the
+	// session was still held at it. The last refusal is the last moment anything
+	// was observed, and the window may have closed long after it.
+	outOfTime := func() {
+		report.Note = "no successful opening was observed within " + expiryWindow.String() +
+			"; the last confirmed refusal was at " + refusalOrNone(report)
 
-		t.Logf("RECORDED: still refused after %s", expiryWindow)
-
-		return nil
+		t.Logf("RECORDED: %s", report.Note)
 	}
 
 	// THE FIRST PROBE IS IMMEDIATE, so a session that expires inside the first
@@ -381,7 +459,7 @@ func awaitSession(
 			// single number would read as one. The lower end rounds DOWN and the
 			// upper end UP, because a bracket that rounds inwards claims a second at
 			// which nothing was observed.
-			took := ceilSeconds(time.Since(started))
+			took := ceilSeconds(time.Since(abandonedAt))
 			report.OpenedAfter = took.String()
 			report.OpenedAfterSeconds = int(took.Seconds())
 
@@ -390,13 +468,13 @@ func awaitSession(
 
 			return session
 		case refusedHeld:
-			since := time.Since(started).Truncate(time.Second)
-			report.LastRefusedAfter = since.String()
-			report.LastRefusedAfterSeconds = int(since.Seconds())
+			recordRefusal(report, abandonedAt)
 
-			t.Logf("still refused at %s (attempt %d); waiting", since, attempt)
+			t.Logf("still refused at %s (attempt %d); waiting", report.LastRefusedAfter, attempt)
 		case ctx.Err() != nil:
-			return outOfTime()
+			outOfTime()
+
+			return nil
 		default:
 			t.Errorf("waiting out the abandoned session answered something other than the "+
 				"session-held refusal: %v", err)
@@ -406,7 +484,9 @@ func awaitSession(
 
 		remaining := time.Until(started.Add(expiryWindow))
 		if remaining <= 0 {
-			return outOfTime()
+			outOfTime()
+
+			return nil
 		}
 
 		timer := time.NewTimer(min(sessionPace, remaining))
@@ -414,11 +494,22 @@ func awaitSession(
 		select {
 		case <-ctx.Done():
 			timer.Stop()
+			outOfTime()
 
-			return outOfTime()
+			return nil
 		case <-timer.C:
 		}
 	}
+}
+
+// refusalOrNone names the last observed refusal, or says there was none, which a
+// bare empty string in a sentence would not.
+func refusalOrNone(report *replacementReport) string {
+	if report.LastRefusedAfter == "" {
+		return "no point at all"
+	}
+
+	return report.LastRefusedAfter
 }
 
 // ceilSeconds rounds a duration UP to the second, so an upper observation names
@@ -533,6 +624,9 @@ type replacementReport struct {
 	SameMessage *bool `json:"same_message,omitempty"`
 	// SuccessorCloseFailed is set when this run left a session behind.
 	SuccessorCloseFailed string `json:"successor_close_failed,omitempty"`
+	// OtherMessageIDs are messages the successor was handed that were not the one
+	// the abandoned session held.
+	OtherMessageIDs []int64 `json:"other_message_ids,omitempty"`
 
 	Note string `json:"note,omitempty"`
 }
