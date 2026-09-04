@@ -63,6 +63,7 @@ A release is a semantic-version tag (`vX.Y.Z`, because Go resolves nothing else;
 - `internal/rollout/*_test.go` (`dispatchguard_test.go`: no host is disturbed by a pass that could not settle), `internal/hostupgrade/upgrade_test.go` (fourteen ordering tests), `internal/releasesource/*_test.go`, `internal/provenance/*_test.go`.
 - `cmd/billet/upgradedecision_test.go`, `upgradefence_test.go`, `upgradetxlock_test.go`, `upgradeprobe_test.go`, `hostupgradegate_test.go`, `releaserecord_test.go`, `releaserecordbounds_test.go`, `rollout*_test.go`, `promotionorder_test.go`.
 - `scripts/releasemanifest_test.go`, `scripts/movingmajor_test.go`, `scripts/scripts_test.go` (install.sh), the Ansible scenario targets.
+- `scripts/rollout-rehearsal.sh` (`make rollout-rehearsal`): two packaged hosts moved from one published release to the next by a rollout under real systemd, the controller through `billet-upgrade.timer` (or, on a FROM before v0.6.0, the operator's `host-upgrade`), then a downgrade candidate that cannot open the migrated ledger proved to roll back; the first real run of `hostupgrade.go`'s doing rather than its ordering, recorded in `docs/reference/records/host-rehearsals.md`.
 
 ## Related skills
 

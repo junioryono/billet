@@ -49,6 +49,8 @@ description: "The control-plane ledger in internal/state: SQLite and PostgreSQL 
 
 **The ledger is not authoritative for cache generation pointers.** Those live in the site store (`billet-storage-and-cache`).
 
+**A promotion is as fast as the database's keepalives, and that is the operator's to set.** The election is a session advisory lock, so a partitioned leader holds the claim until PostgreSQL notices its TCP session is dead: with the server defaults (`tcp_keepalives_idle` two hours) a standby waits hours. `scripts/promotion-rehearsal.sh` runs the pair against `postgres:18-alpine` with `tcp_keepalives_idle=10 tcp_keepalives_interval=5 tcp_keepalives_count=3`, partitions the leader with `docker network disconnect`, and records partition-to-promotion and the old leader's exit and restart as a standby when the partition heals; the numbers are in `docs/reference/records/host-rehearsals.md`.
+
 ## Measured facts
 
 - `SQLITE_BUSY_SNAPSHOT` (517) appeared the moment operator commands were admitted alongside the plane, with deferred transactions.
