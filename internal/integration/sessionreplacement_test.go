@@ -31,12 +31,13 @@ import (
 // asserting a redelivery GitHub would never make. A fake cannot be evidence about
 // somebody else's service.
 //
-// SO THIS RECORDS RATHER THAN ASSERTS, at every boundary where billet has no
-// documented answer. Its output is the finding; a green run against a fixed
-// expectation would be asserting the very thing that is unknown. What it DOES
-// assert is that the sessions open, that a replacement succeeds, and that
-// statistics come back — the mechanics the measurement depends on, which failing
-// silently would make every recorded finding meaningless.
+// SO THIS RECORDS RATHER THAN ASSERTS, at every boundary where GitHub's answer
+// is not documented. Its output is the finding; a green run against a fixed
+// expectation would be asserting the very thing that is being measured. What it
+// DOES assert is the mechanics every finding rests on: that the first session
+// opens and is handed a message carrying work, that each probe's refusal is the
+// session-held one rather than some other failure, and that statistics come
+// back. A bounded wait that never opens is a finding too, not a failure.
 //
 // It needs a real organization and is skipped without one:
 //
@@ -51,11 +52,12 @@ import (
 // THE PROCESS TIMEOUT IS NOT DECORATION: the expiry window alone defaults to
 // thirty minutes, and Go's default is ten.
 //
-// UNTIL IT RUNS, NOTHING MAY LEAN ON CROSS-SESSION REPLAY. That is a constraint on
-// the code rather than on this file: every recovery path in billet is written to
-// be safe whether or not a message comes back, and docs/operating/upgrades.md says
-// which
-// behaviours are proved and which are assumed.
+// IT RAN ON 2026-09-04 and the answers are in ADR-006, upstream-references.md and
+// the protocol skill: a successor is refused under either name, the session was
+// still refused at 60 seconds and open at 91, and the unacknowledged message came
+// back to the successor. NOTHING LEANS ON THAT REDELIVERY ANYWAY: every recovery
+// path in billet is written to be safe whether or not a message comes back, which
+// is what makes the answer a fact about GitHub rather than a dependency.
 func TestLiveSessionReplacement(t *testing.T) {
 	client, set := liveScaleSet(t)
 
@@ -139,6 +141,8 @@ func TestLiveSessionReplacement(t *testing.T) {
 		t.Log("RECORDED: a successor under the SAME owner opened at once")
 	case sameHeld:
 		report.SameOwnerRefused = refusal.Error()
+		report.LastRefusedAfter = "0s"
+		report.LastRefusedAfterSeconds = 0
 
 		t.Logf("RECORDED: a successor under the SAME owner is refused while the abandoned "+
 			"session is outstanding: %v", refusal)
@@ -269,8 +273,11 @@ func awaitMessage(
 ) (*server.Message, error) {
 	t.Helper()
 
-	ctx := t.Context()
-	deadline := time.Now().Add(window)
+	// THE WINDOW BOUNDS THE CALLS, NOT ONLY THE LOOP. A long poll that hangs is
+	// exactly what a bound is for, and a deadline checked between requests lets
+	// one request outlast every window this test advertises.
+	ctx, cancel := context.WithTimeout(t.Context(), window)
+	defer cancel()
 
 	for {
 		started := time.Now()
@@ -287,12 +294,10 @@ func awaitMessage(
 			if ackErr := session.DeleteMessage(ctx, msg.MessageID); ackErr != nil {
 				return nil, ackErr
 			}
+		case ctx.Err() != nil:
+			return nil, fmt.Errorf("no message carrying work within %s", window)
 		case !errors.Is(err, server.ErrNoMessage):
 			return nil, err
-		}
-
-		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("no message carrying work within %s", window)
 		}
 
 		if elapsed := time.Since(started); elapsed < messagePace {
@@ -302,7 +307,7 @@ func awaitMessage(
 			case <-ctx.Done():
 				timer.Stop()
 
-				return nil, ctx.Err()
+				return nil, fmt.Errorf("no message carrying work within %s", window)
 			case <-timer.C:
 			}
 		}
@@ -347,60 +352,83 @@ func awaitSession(
 	t.Helper()
 
 	started := time.Now()
-	deadline := started.Add(expiryWindow)
 
+	// ONE DEADLINE FOR THE WHOLE WAIT, carried into every request. A window
+	// enforced only between attempts is one a single slow request can outlast.
+	ctx, cancel := context.WithTimeout(t.Context(), expiryWindow)
+	defer cancel()
+
+	outOfTime := func() server.Session {
+		report.Note = "the abandoned session was still outstanding after " +
+			expiryWindow.String()
+
+		t.Logf("RECORDED: still refused after %s", expiryWindow)
+
+		return nil
+	}
+
+	// THE FIRST PROBE IS IMMEDIATE, so a session that expires inside the first
+	// pace still leaves a bracket with both ends: the refusal recorded here is
+	// what "still refused at" names, and sleeping first would leave it empty.
 	for attempt := 1; ; attempt++ {
-		// NEVER PAST THE WINDOW THE CALLER ASKED FOR, and never a full pace beyond
-		// it: a bound overshot by its own polling interval is not the bound.
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			report.Note = "the abandoned session was still outstanding after " +
-				expiryWindow.String()
-
-			t.Logf("RECORDED: still refused after %s", expiryWindow)
-
-			return nil
-		}
-
-		timer := time.NewTimer(min(sessionPace, remaining))
-
-		select {
-		case <-t.Context().Done():
-			timer.Stop()
-
-			return nil
-		case <-timer.C:
-		}
-
-		session, refusedHeld, err := probeSession(t.Context(), client, id, owner)
+		session, refusedHeld, err := probeSession(ctx, client, id, owner)
 
 		switch {
 		case err == nil:
 			// AN UPPER OBSERVATION AND A LOWER ONE, NEVER AN EXPIRY. What this run
-			// establishes is that the session was still held at the last refusal and
-			// open at this attempt; the moment in between is not observed, and a
-			// single number would read as one.
-			took := time.Since(started).Round(time.Second)
+			// establishes is that the session was still refused at the last refusal
+			// and open at this attempt; the moment between is not observed, and a
+			// single number would read as one. The lower end rounds DOWN and the
+			// upper end UP, because a bracket that rounds inwards claims a second at
+			// which nothing was observed.
+			took := ceilSeconds(time.Since(started))
 			report.OpenedAfter = took.String()
 			report.OpenedAfterSeconds = int(took.Seconds())
 
-			t.Logf("RECORDED: the abandoned session was still held at %s and open at %s "+
+			t.Logf("RECORDED: the abandoned session was still refused at %s and open at %s "+
 				"(attempt %d)", report.LastRefusedAfter, report.OpenedAfter, attempt)
 
 			return session
 		case refusedHeld:
-			since := time.Since(started).Round(time.Second)
+			since := time.Since(started).Truncate(time.Second)
 			report.LastRefusedAfter = since.String()
 			report.LastRefusedAfterSeconds = int(since.Seconds())
 
-			t.Logf("still held at %s (attempt %d); waiting", since, attempt)
+			t.Logf("still refused at %s (attempt %d); waiting", since, attempt)
+		case ctx.Err() != nil:
+			return outOfTime()
 		default:
 			t.Errorf("waiting out the abandoned session answered something other than the "+
 				"session-held refusal: %v", err)
 
 			return nil
 		}
+
+		remaining := time.Until(started.Add(expiryWindow))
+		if remaining <= 0 {
+			return outOfTime()
+		}
+
+		timer := time.NewTimer(min(sessionPace, remaining))
+
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+
+			return outOfTime()
+		case <-timer.C:
+		}
 	}
+}
+
+// ceilSeconds rounds a duration UP to the second, so an upper observation names
+// a moment the thing had already happened by.
+func ceilSeconds(d time.Duration) time.Duration {
+	if truncated := d.Truncate(time.Second); truncated != d {
+		return truncated + time.Second
+	}
+
+	return d
 }
 
 // describeMessage says what a message carried, for a record a person reads.
@@ -461,9 +489,10 @@ func durationOr(name string, fallback time.Duration) time.Duration {
 
 // replacementReport is what one run measured.
 //
-// A RECORD, NOT AN ASSERTION. Every field is something billet currently has no
-// documented answer for, and the value of running this is the answer rather than
-// a pass.
+// A RECORD, NOT AN ASSERTION. Each field is something GitHub's own documentation
+// does not answer, and the value of a run is the answer rather than the pass.
+// The 2026-09-04 run's answers are in ADR-006 and upstream-references.md; a later
+// run that disagrees with them is the reason this stays a record.
 type replacementReport struct {
 	Organization   string    `json:"organization"`
 	ScaleSet       string    `json:"scale_set"`
