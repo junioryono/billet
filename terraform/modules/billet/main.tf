@@ -83,6 +83,8 @@ module "fleet" {
   enable_spot                   = var.enable_spot
   iam_policy_json               = var.iam_policy_json
   job_instance_profile_role_arn = var.job_instance_profile_role_arn
+  builder                       = var.builder
+  builder_payload_bucket        = var.builder_payload_bucket
   tags                          = var.tags
 }
 

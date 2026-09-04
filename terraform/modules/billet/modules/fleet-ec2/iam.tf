@@ -88,6 +88,37 @@ resource "aws_iam_instance_profile" "node" {
   tags = local.tags
 }
 
+# THE AMI BUILDER'S GRANT, as its own document so the node's rendering does not
+# change when a deployment turns it on.
+#
+# BILLET'S OWN GENERATOR'S OUTPUT, exactly as the node policy is: the module
+# commits a rendering of internal/awspolicy with NoCompute and Builder set —
+# the builder statements and nothing else — kept equal by internal/tfpolicy's
+# drift test, and substitutes this deployment's partition and payload bucket for
+# the sentinels. The two renderings differ only in whether the installers are
+# staged in S3, which is needed once the toolcache declaration outgrows EC2's
+# user-data limit.
+locals {
+  _builder_policy_file = (
+    var.builder_payload_bucket == ""
+    ? "${path.module}/policy/builder-policy.json"
+    : "${path.module}/policy/builder-policy-payload.json"
+  )
+
+  builder_policy = replace(replace(
+    file(local._builder_policy_file),
+    "TFPARTITION", data.aws_partition.this.partition),
+  "TFPAYLOADBUCKET", var.builder_payload_bucket)
+}
+
+resource "aws_iam_role_policy" "builder" {
+  count = var.builder ? 1 : 0
+
+  name   = "${var.name}-builder"
+  role   = aws_iam_role.node.id
+  policy = local.builder_policy
+}
+
 # THE SPOT INTERRUPTION GRANT, scoped to exactly the queue this module creates and
 # added only when spot is enabled — kept out of the committed rendering so a
 # non-spot node's role does not carry it. The ACTIONS come from the committed

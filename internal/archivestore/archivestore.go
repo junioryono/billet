@@ -39,6 +39,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/awscreds"
+	"github.com/junioryono/billet/internal/awsjson"
 	"github.com/junioryono/billet/internal/awss3"
 	"github.com/junioryono/billet/internal/awssig"
 	"github.com/junioryono/billet/internal/config"
@@ -132,7 +133,13 @@ func NewS3(cfg config.BackupS3Config, creds CredentialSource) (*S3, error) {
 		return nil, errors.New("archivestore: an archive store needs an AWS credential source")
 	}
 
-	base := "https://" + cfg.Bucket + ".s3." + cfg.Region + ".amazonaws.com/"
+	// THE SUFFIX IS THE PARTITION'S. `backup.s3` is what `billet local backup`
+	// writes to and what a restore reads back, and `billet init hybrid` now names
+	// a bucket there for every generation — so a deployment in cn-north-1 would
+	// have taken every backup against a host that does not exist and discovered
+	// it at the restore.
+	base := "https://" + cfg.Bucket + ".s3." + cfg.Region + "." +
+		awsjson.DNSSuffixFor(cfg.Region) + "/"
 	if cfg.Endpoint != "" {
 		base = strings.TrimSuffix(cfg.Endpoint, "/") + "/" + cfg.Bucket + "/"
 	}

@@ -42,6 +42,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/awscreds"
+	"github.com/junioryono/billet/internal/awsjson"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/provider"
 )
@@ -1642,12 +1643,7 @@ func runningState(state string) bool {
 // A config can always override this outright, and one in a partition billet has
 // not been taught about should.
 func defaultEndpointFor(region string) string {
-	suffix := "amazonaws.com"
-	if strings.HasPrefix(region, "cn-") {
-		suffix = "amazonaws.com.cn"
-	}
-
-	return "https://ec2." + region + "." + suffix + "/"
+	return awsjson.EndpointFor("ec2", region)
 }
 
 // maxUserData is what EC2 accepts, measured before base64 encoding.

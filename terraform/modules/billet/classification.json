@@ -145,6 +145,10 @@
     "class": "in_place",
     "reason": "the controller's get/put/list grant on its own archive prefix. Updated in place."
   },
+  "aws_iam_role_policy.builder": {
+    "class": "in_place",
+    "reason": "the AMI builder's grant on the node role. `billet ami build` is an operator command run deliberately, not something a running job depends on, so removing it mid-flight fails the next build rather than a lease that is already open — and an identity policy is evaluated per request, so a build in progress would lose it too. Nothing on a host stops."
+  },
   "aws_iam_role_policy.spot": {
     "class": "in_place",
     "reason": "the node's grant on the interruption queue. Losing it during a window costs the two-minute warning and therefore the ATTRIBUTION of a spot reclaim — but AWS takes that instance either way, so the job is lost by the reclaim rather than by this change."
