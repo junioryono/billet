@@ -506,7 +506,7 @@ func (s *Server) runTier(ctx context.Context, t *config.Tier, set *ScaleSet) err
 // runner is available, and compute already running is held by its node and
 // re-adopted; what the wait costs is scheduling latency, which is the tradeoff
 // ADR-001 already accepts by choosing recovery in minutes over HA. Measured
-// 2026-09-04: the abandoned session was still held at 61 seconds and gone by 91,
+// 2026-09-04: the abandoned session was still refused at 60 seconds and open at 91,
 // and the message it was holding unacknowledged came back to the successor. A
 // measurement rather than a promise, which is why this is a loop and not a
 // sleep, and why nothing here assumes the redelivery.
