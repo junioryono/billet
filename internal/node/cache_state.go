@@ -22,6 +22,8 @@ type durableCacheSession struct {
 	Repository  string                                `json:"repository,omitempty"`
 	WorkflowRef string                                `json:"workflow_ref,omitempty"`
 	Intercept   bool                                  `json:"intercept,omitempty"`
+	LeaseID     string                                `json:"lease_id,omitempty"`
+	Epoch       int64                                 `json:"epoch,omitempty"`
 	Observed    cacheObserved                         `json:"observed"`
 	Closed      bool                                  `json:"closed"`
 	Slots       [provider.MaxVolumes]*cacheAttachment `json:"slots"`
@@ -65,8 +67,9 @@ func (s *CacheService) loadSessions() error {
 			token: record.Token, instance: record.Instance, trust: record.Trust,
 			owner: record.Owner, repository: record.Repository, workflowRef: record.WorkflowRef,
 			intercept: record.Intercept,
-			observed:  record.Observed,
-			closed:    record.Closed, slots: record.Slots, admit: make(chan struct{}, 1),
+			leaseID:   record.LeaseID, epoch: record.Epoch,
+			observed: record.Observed,
+			closed:   record.Closed, slots: record.Slots, admit: make(chan struct{}, 1),
 			actions:  record.Actions,
 			receipts: record.Receipts,
 		}
@@ -124,8 +127,9 @@ func (s *CacheService) persistSession(session *cacheSession) error {
 		Token: session.token, Instance: session.instance, Trust: session.trust,
 		Owner: session.owner, Repository: session.repository, WorkflowRef: session.workflowRef,
 		Intercept: session.intercept,
-		Observed:  session.observed,
-		Closed:    session.closed, Slots: session.slots, Actions: session.actions,
+		LeaseID:   session.leaseID, Epoch: session.epoch,
+		Observed: session.observed,
+		Closed:   session.closed, Slots: session.slots, Actions: session.actions,
 		Receipts: session.receipts,
 	}
 	encoded, err := json.Marshal(record)

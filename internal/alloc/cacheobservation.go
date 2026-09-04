@@ -58,16 +58,19 @@ type ActionsCache string
 const (
 	// ActionsCacheServed means the request was answered from the site store.
 	ActionsCacheServed ActionsCache = "served"
-	// ActionsCacheSpliced means interception was on and the request went
-	// upstream to GitHub for a reason other than the kill switch: the policy
-	// could not be read, or the client was not one billet serves locally.
+	// ActionsCacheSpliced means interception was on and billet handed the
+	// request to GitHub for a reason other than the kill switch: the policy
+	// could not be read, the client was not one billet serves locally, or the
+	// local handler failed. It says what billet did with the call, not what
+	// GitHub answered; an upstream that could not be reached is GitHub's
+	// unavailability, and the path fails open on it by design.
 	ActionsCacheSpliced ActionsCache = "spliced"
 	// ActionsCacheDisabled means the central kill switch refused the request.
 	ActionsCacheDisabled ActionsCache = "disabled"
-	// ActionsCacheUnavailable means the request was bound to a reservation
-	// billet holds, failed locally, and could not go upstream because GitHub
-	// has nothing to answer it with; the guest was told the cache was
-	// unavailable.
+	// ActionsCacheUnavailable means billet answered the request with a failure
+	// of its own and handed nothing to GitHub: a call bound to a reservation
+	// only billet holds that failed locally, or a request billet refused before
+	// reading it.
 	ActionsCacheUnavailable ActionsCache = "unavailable"
 	// ActionsCacheOff means the session had no interception at all: the tier does
 	// not intercept, or the work was untrusted.

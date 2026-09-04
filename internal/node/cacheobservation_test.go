@@ -29,14 +29,18 @@ type recordingObserver struct {
 
 type observedCall struct {
 	instance string
+	leaseID  string
+	epoch    int64
 	obs      alloc.CacheObservation
 }
 
-func (o *recordingObserver) ObserveCache(_ context.Context, instance string, obs alloc.CacheObservation) error {
+func (o *recordingObserver) ObserveCache(
+	_ context.Context, instance, leaseID string, epoch int64, obs alloc.CacheObservation,
+) error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
-	o.calls = append(o.calls, observedCall{instance: instance, obs: obs})
+	o.calls = append(o.calls, observedCall{instance: instance, leaseID: leaseID, epoch: epoch, obs: obs})
 
 	if o.inspect != nil {
 		o.inspect(obs)
@@ -72,9 +76,13 @@ func observedService(t *testing.T, storage *fakeCacheStore) (*CacheService, *rec
 	observer := &recordingObserver{}
 	service.SetCacheObserver(observer)
 
-	credentials, err := service.Prepare("billet-one", provider.TrustTrusted)
+	// THE SESSION NAMES ITS LEASE, the way the runner's launch scopes it, so an
+	// observation is attributable after the runner has forgotten the instance.
+	credentials, err := service.PrepareScoped("billet-one", CacheSessionScope{
+		Trust: provider.TrustTrusted, LeaseID: "lease-one", Epoch: 3,
+	})
 	if err != nil {
-		t.Fatalf("Prepare: %v", err)
+		t.Fatalf("PrepareScoped: %v", err)
 	}
 
 	return service, observer, credentials.Token
@@ -117,8 +125,10 @@ func TestTheImageStoreObservationNamesWhatTheStoreAnswered(t *testing.T) {
 			}
 
 			calls := observer.recorded()
-			if len(calls) != 1 || calls[0].instance != "billet-one" || calls[0].obs != tc.want {
-				t.Fatalf("observer was told %+v, want one observation %+v for billet-one", calls, tc.want)
+			if len(calls) != 1 || calls[0].instance != "billet-one" || calls[0].obs != tc.want ||
+				calls[0].leaseID != "lease-one" || calls[0].epoch != 3 {
+				t.Fatalf("observer was told %+v, want one observation %+v for billet-one under "+
+					"lease-one at epoch 3", calls, tc.want)
 			}
 		})
 	}
@@ -312,8 +322,45 @@ func TestAnUnreportedObservationIsResentAfterARestart(t *testing.T) {
 	want := alloc.CacheObservation{
 		ImageCache: alloc.ImageCacheWarm, CacheGeneration: "gen-3", ActionsCache: alloc.ActionsCacheOff,
 	}
-	if len(calls) != 1 || calls[0].instance != "billet-one" || calls[0].obs != want {
-		t.Fatalf("the restarted service told its observer %+v, want %+v for billet-one", calls, want)
+	if len(calls) != 1 || calls[0].instance != "billet-one" || calls[0].obs != want ||
+		calls[0].leaseID != "lease-one" || calls[0].epoch != 3 {
+		t.Fatalf("the restarted service told its observer %+v, want %+v for billet-one under "+
+			"lease-one at epoch 3, which only the session record can name after a restart",
+			calls, want)
+	}
+}
+
+// A CALL STILL BEING ANSWERED IS NOT SETTLED AS UNUSED. The proxy marks a
+// CacheService call in flight before it is dispatched and clears the mark once
+// its outcome is recorded; a settlement in between leaves the Actions half
+// alone, and the outcome recorded afterwards is reported with the lease the
+// session carries.
+func TestSettlementLeavesAnInFlightActionsCallAlone(t *testing.T) {
+	t.Parallel()
+
+	service, _, session, _ := testActionsService(t)
+	observer := &recordingObserver{}
+	service.SetCacheObserver(observer)
+
+	service.beginActionsCall(session)
+
+	if err := service.Cleanup(t.Context(), session.instance); err != nil {
+		t.Fatalf("Cleanup: %v", err)
+	}
+
+	calls := observer.recorded()
+	if len(calls) != 1 || calls[0].obs != (alloc.CacheObservation{ImageCache: alloc.ImageCacheUnused}) {
+		t.Fatalf("settlement with a call in flight told the observer %+v, want the image half "+
+			"only", calls)
+	}
+
+	service.observeActions(t.Context(), session, alloc.ActionsCacheServed)
+	service.endActionsCall(session)
+
+	calls = observer.recorded()
+	want := alloc.CacheObservation{ImageCache: alloc.ImageCacheUnused, ActionsCache: alloc.ActionsCacheServed}
+	if len(calls) != 2 || calls[1].obs != want {
+		t.Fatalf("the late outcome was reported as %+v, want %+v", calls, want)
 	}
 }
 

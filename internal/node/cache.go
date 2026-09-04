@@ -79,11 +79,17 @@ type cacheSession struct {
 	repository  string
 	workflowRef string
 	intercept   bool
+	leaseID     string
+	epoch       int64
 	observed    cacheObserved
-	closed      bool
-	slots       [provider.MaxVolumes]*cacheAttachment
-	actions     map[string]*actionsArchive
-	receipts    map[string]*actionsReceipt
+	// inflight counts CacheService calls between dispatch and their recorded
+	// outcome, so settlement does not write `unused` over a call still being
+	// answered.
+	inflight int
+	closed   bool
+	slots    [provider.MaxVolumes]*cacheAttachment
+	actions  map[string]*actionsArchive
+	receipts map[string]*actionsReceipt
 }
 
 // CacheCredentials identifies one managed guest's cache session.
@@ -100,6 +106,13 @@ type CacheSessionScope struct {
 	Owner       string
 	Repository  string
 	WorkflowRef string
+	// LeaseID and Epoch name the lease the guest runs under, so an observation
+	// can be attributed after the runner has forgotten the instance. Recorded
+	// on the durable session; they authorise nothing, and the runner's own
+	// mapping is preferred while it exists because a re-adoption moves the
+	// epoch.
+	LeaseID string
+	Epoch   int64
 }
 
 // ActionsPolicy reads the control plane's current interception kill switch.
@@ -108,10 +121,15 @@ type ActionsPolicy interface {
 }
 
 // CacheObserver is told what the cache did for one guest, so the lease's
-// history can carry it. The runner implements it, because only the runner
-// knows which lease an instance name belongs to.
+// history can carry it. The runner implements it.
+//
+// THE LEASE TRAVELS WITH THE CALL, from the session's durable record, so a
+// process that never launched the guest can still attribute what it saw. The
+// runner prefers its own mapping while it holds one, because that carries the
+// epoch in force now.
 type CacheObserver interface {
-	ObserveCache(ctx context.Context, instance string, obs alloc.CacheObservation) error
+	ObserveCache(ctx context.Context, instance, leaseID string, epoch int64,
+		obs alloc.CacheObservation) error
 }
 
 // cacheObserved is what one session has seen the cache do, and whether the
@@ -276,7 +294,8 @@ func (s *CacheService) report(ctx context.Context, session *cacheSession) {
 	reportCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cacheReportLimit)
 	defer cancel()
 
-	if err := s.observer.ObserveCache(reportCtx, session.instance, obs); err != nil {
+	if err := s.observer.ObserveCache(reportCtx, session.instance, session.leaseID,
+		session.epoch, obs); err != nil {
 		s.log.Warn("could not record what the cache did for a job; it is kept here and resent "+
 			"when the compute ends", "instance", session.instance, "error", err)
 
@@ -305,7 +324,10 @@ func (s *CacheService) settleObservation(ctx context.Context, session *cacheSess
 		obs.ImageCache = alloc.ImageCacheUnused
 	}
 
-	if session.observed.ActionsCache == "" {
+	// A CALL STILL BEING ANSWERED IS NOT "UNUSED". Its outcome is recorded
+	// when the handler returns, under this same lock, and reported then with
+	// the lease the session carries.
+	if session.observed.ActionsCache == "" && session.inflight == 0 {
 		obs.ActionsCache = alloc.ActionsCacheOff
 		if session.intercept {
 			obs.ActionsCache = alloc.ActionsCacheUnused
@@ -319,6 +341,21 @@ func (s *CacheService) settleObservation(ctx context.Context, session *cacheSess
 	}
 
 	s.report(ctx, session)
+}
+
+// beginActionsCall marks a CacheService call as in flight, and endActionsCall
+// clears it once its outcome has been recorded. Between the two, settlement
+// leaves the Actions half alone.
+func (s *CacheService) beginActionsCall(session *cacheSession) {
+	session.mu.Lock()
+	session.inflight++
+	session.mu.Unlock()
+}
+
+func (s *CacheService) endActionsCall(session *cacheSession) {
+	session.mu.Lock()
+	session.inflight--
+	session.mu.Unlock()
 }
 
 // SettleObservation settles what the cache did for one instance while the
@@ -402,9 +439,10 @@ func (s *CacheService) PrepareScoped(
 			token: token, instance: instance, trust: scope.Trust,
 			owner: scope.Owner, repository: scope.Repository, workflowRef: scope.WorkflowRef,
 			intercept: scope.Intercept,
-			admit:     make(chan struct{}, 1),
-			actions:   make(map[string]*actionsArchive),
-			receipts:  make(map[string]*actionsReceipt),
+			leaseID:   scope.LeaseID, epoch: scope.Epoch,
+			admit:    make(chan struct{}, 1),
+			actions:  make(map[string]*actionsArchive),
+			receipts: make(map[string]*actionsReceipt),
 		}
 		credentials := CacheCredentials{Token: token}
 		if scope.Intercept {

@@ -498,33 +498,44 @@ func (r *actionsHeaderReader) Read(buffer []byte) (int, error) {
 // reservation-bound request never falls through at all — the reservation is
 // billet's own, and GitHub has nothing to answer it with.
 func (p *actionsProxy) respond(req *http.Request, session *cacheSession) (*http.Response, bool) {
-	var replay []byte
-	if actionsLocalRequest(req) && (req.URL.Path == actionsCreatePath ||
-		req.URL.Path == actionsFinalizePath || req.URL.Path == actionsDownloadPath) {
-		var err error
-		replay, err = io.ReadAll(io.LimitReader(req.Body, actionsRequestLimit+1))
-		if err != nil {
-			return actionsBlobError(http.StatusBadRequest,
-				"Actions cache metadata request could not be read"), true
-		}
-		if len(replay) > actionsRequestLimit {
-			return actionsBlobError(http.StatusRequestEntityTooLarge,
-				"Actions cache metadata request is too large"), true
-		}
-		req.Body = io.NopCloser(bytes.NewReader(replay))
-	}
 	// THE OBSERVATION IS RECORDED WHERE THE DISPOSITION IS FINAL. A CacheService
 	// call the handler answered was served; one the handler failed is either
 	// retried through GitHub (a splice, whatever billet intended) or, when it is
 	// bound to a reservation only billet holds, refused to the guest as
-	// unavailable. The calls actionsResponse decides on its own -- refused by
-	// the kill switch, or from a client billet does not serve -- are recorded
-	// there.
+	// unavailable; one refused before it was read is unavailable too. The calls
+	// actionsResponse decides on its own -- refused by the kill switch, or from
+	// a client billet does not serve -- are recorded there.
+	//
+	// IN FLIGHT FROM HERE UNTIL THE OUTCOME IS RECORDED, so a settlement that
+	// runs in between does not write `unused` over a call still being answered.
 	cacheCall := actionsCacheCall(req)
+	if cacheCall {
+		p.service.beginActionsCall(session)
+		defer p.service.endActionsCall(session)
+	}
 	observe := func(ctx context.Context, outcome alloc.ActionsCache) {
 		if cacheCall {
 			p.service.observeActions(ctx, session, outcome)
 		}
+	}
+
+	var replay []byte
+	if actionsLocalRequest(req) && cacheCall {
+		var err error
+		replay, err = io.ReadAll(io.LimitReader(req.Body, actionsRequestLimit+1))
+		if err != nil {
+			observe(req.Context(), alloc.ActionsCacheUnavailable)
+
+			return actionsBlobError(http.StatusBadRequest,
+				"Actions cache metadata request could not be read"), true
+		}
+		if len(replay) > actionsRequestLimit {
+			observe(req.Context(), alloc.ActionsCacheUnavailable)
+
+			return actionsBlobError(http.StatusRequestEntityTooLarge,
+				"Actions cache metadata request is too large"), true
+		}
+		req.Body = io.NopCloser(bytes.NewReader(replay))
 	}
 
 	reservationBound := strings.HasPrefix(req.URL.Path, actionsBlobPrefix)

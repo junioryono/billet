@@ -210,17 +210,24 @@ func WithCacheService(cache *CacheService) Option {
 	}
 }
 
-// ObserveCache records what the cache did for one instance against the lease
-// this process holds for it.
+// ObserveCache records what the cache did for one instance against its lease.
 //
-// THE LEASE IS FOUND BY THE INSTANCE NAME, wherever this process holds it: a
-// request that is running, a launch still in progress, or compute in custody.
-// An instance nothing here holds is an error the cache keeps the observation
-// against, and resends when the compute ends.
-func (r *Runner) ObserveCache(ctx context.Context, instance string, obs alloc.CacheObservation) error {
-	leaseID, epoch, ok := r.leaseForInstance(instance)
-	if !ok {
-		return fmt.Errorf("node: no lease is held here for %s", instance)
+// THIS PROCESS'S OWN MAPPING FIRST, wherever it holds the instance: a request
+// that is running, a launch still in progress, or compute in custody. That
+// carries the epoch in force now, which the session's record does not once a
+// quarantine has moved it. The session's lease is what a process that never
+// launched the guest, or has already forgotten it, attributes with; a session
+// from before the record carried one names nothing, and the observation is
+// kept against the next attempt.
+func (r *Runner) ObserveCache(
+	ctx context.Context, instance, leaseID string, epoch int64, obs alloc.CacheObservation,
+) error {
+	if held, heldEpoch, ok := r.leaseForInstance(instance); ok {
+		leaseID, epoch = held, heldEpoch
+	}
+
+	if leaseID == "" {
+		return fmt.Errorf("node: no lease is known here for %s", instance)
 	}
 
 	return r.alloc.RecordCacheObservation(ctx, leaseID, epoch, obs)
@@ -436,7 +443,10 @@ func (r *Runner) Launch(
 	var buildKitCacheMountLimit config.ByteSize
 	if r.cache != nil {
 		var credentials CacheCredentials
-		scope := CacheSessionScope{Trust: trust, Intercept: tier.Intercept && trust == provider.TrustTrusted}
+		scope := CacheSessionScope{
+			Trust: trust, Intercept: tier.Intercept && trust == provider.TrustTrusted,
+			LeaseID: lease.ID, Epoch: lease.Epoch,
+		}
 		if tier.CacheScope != nil {
 			scope.Owner = tier.CacheScope.Owner
 			scope.Repository = tier.CacheScope.Repository
