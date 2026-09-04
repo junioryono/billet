@@ -36,7 +36,7 @@ Because those defaults are easy to get wrong, they are provisioned as a module:
 
 ```hcl
 module "converge" {
-  source = "github.com/junioryono/billet//terraform/modules/converge-aws-ssm?ref=main"
+  source = "github.com/junioryono/billet//terraform/modules/converge-aws-ssm?ref=v0.6.0"
 
   name              = "billet-converge"
   github_repository = "your-org/your-infra-repo"
@@ -53,7 +53,7 @@ You must own a domain on Cloudflare, because the tunnel is addressed by hostname
 
 ```hcl
 module "converge" {
-  source = "github.com/junioryono/billet//terraform/modules/converge-cloudflare?ref=main"
+  source = "github.com/junioryono/billet//terraform/modules/converge-cloudflare?ref=v0.6.0"
 
   account_id = var.cloudflare_account_id
   zone_id    = var.cloudflare_zone_id

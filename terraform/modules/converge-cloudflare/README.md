@@ -18,7 +18,7 @@ No S3 bucket, so **a converge's secrets never transit object storage** — inclu
 
 ```hcl
 module "converge" {
-  source = "github.com/junioryono/billet//terraform/modules/converge-cloudflare?ref=main"
+  source = "github.com/junioryono/billet//terraform/modules/converge-cloudflare?ref=v0.6.0"
 
   account_id = var.cloudflare_account_id
   zone_id    = var.cloudflare_zone_id
