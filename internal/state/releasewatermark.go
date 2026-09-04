@@ -204,10 +204,26 @@ func (db *DB) checkReleaseWatermarkIn(ctx context.Context, q Querier) error {
 }
 
 // releaseWatermarkApplied reports whether the ledger's schema carries the table.
+//
+// A LEDGER NOBODY HAS CREATED CARRIES NOTHING. The probe opens what it inherits,
+// and on a fresh PostgreSQL deployment that is a database with no schema at all;
+// reading the migration table there is not "could not tell", it is "no".
 func (db *DB) releaseWatermarkApplied(ctx context.Context) (bool, error) {
+	// THROUGH THE BARE READER, because View re-verifies the schema on a handle
+	// that holds no exclusion, and there is no schema to verify yet.
+	exists, err := db.backend.bookkeepingTableExists(ctx, db.Reader())
+	if err != nil {
+		return false, fmt.Errorf("state: read whether the ledger has been created: %w",
+			db.asCancellation(ctx, err))
+	}
+
+	if !exists {
+		return false, nil
+	}
+
 	var applied bool
 
-	err := db.View(ctx, func(q Querier) error {
+	err = db.View(ctx, func(q Querier) error {
 		seen, err := readAppliedMigrations(ctx, ReadQueries(q))
 		if err != nil {
 			return err

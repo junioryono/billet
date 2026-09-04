@@ -68,7 +68,13 @@ func TestThePostgresProbeVerifiesAndChangesNothing(t *testing.T) {
 		t.Errorf("the probe moved the watermark to %q; only a serving control plane may", release)
 	}
 
-	// AN OLDER CANDIDATE IS REFUSED AS A DOWNGRADE, fence or no fence.
+	// AN OLDER CANDIDATE IS REFUSED AS A DOWNGRADE, fence or no fence. The first
+	// probe is closed first, because it holds the directory lock and a second
+	// open there would be refused for that rather than for the watermark.
+	if err := probe.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
 	if _, err := OpenPostgresProbe(ctx, dir, dsn, WithRunningRelease("v0.4.9")); !errors.Is(err,
 		ErrReleaseBehind) {
 		t.Errorf("an older candidate probed a ledger a newer release served: err = %v", err)
@@ -155,6 +161,18 @@ func TestAnAdminHandleLowersTheWatermarkOnAnExternalLedger(t *testing.T) {
 func TestAClaimRefusedByTheWatermarkAdvancesNoEpoch(t *testing.T) {
 	dsn := requirePostgres(t)
 	ctx := t.Context()
+
+	// THE SCHEMA EXISTS AND CARRIES NO MARK: an operator handle migrates it and
+	// records nothing, which is the ledger a standby finds beside a leader that
+	// has not yet claimed on the newer release.
+	admin, err := OpenPostgresAdmin(ctx, t.TempDir(), dsn)
+	if err != nil {
+		t.Fatalf("OpenPostgresAdmin: %v", err)
+	}
+
+	if err := admin.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
 
 	standby, err := OpenPostgresStandby(ctx, t.TempDir(), dsn, WithRunningRelease("v0.5.0"))
 	if err != nil {

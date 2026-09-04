@@ -446,6 +446,9 @@ func TestEveryUntransactedReadIsAccountedFor(t *testing.T) {
 	// "<file>:<function>" -> why this one does not translate, or how it does.
 	known := map[string]string{
 		"scaleset.go:ScaleSets": "translates: it passes its error through db.asCancellation",
+		"releasewatermark.go:releaseWatermarkApplied": "translates: it passes its error through " +
+			"db.asCancellation; through the bare reader because the probe opens a ledger nobody " +
+			"has created yet, which View's schema re-check would refuse",
 		// BOTH OF THESE ARE THE OPEN PATH, AND THAT IS THE WHOLE REASON. Neither
 		// runs on a handle that has been returned to anybody, so there is no
 		// deliberate stop to report: a failure is a handle that never opened, and
