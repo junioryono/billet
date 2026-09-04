@@ -262,3 +262,49 @@ node:
         price_usd_per_hour: 0.34
 `
 }
+
+// A CONFIG THAT EXISTS AND DOES NOT PARSE IS AN ERROR, NOT AN ABSENT IDENTITY.
+//
+// Folding the two together is the could-not-tell collapse this repository keeps
+// removing, and here it has a specific cost: an operator who pointed --config at
+// a real deployment and mistyped it would get a silently ACCOUNT-WIDE build,
+// whose only symptom is a denial at RunInstances that names nothing. A missing
+// config is genuinely fine — a build needs none, since --region, --subnet and
+// --security-group are enough.
+//
+// Mutation: treating every config.Load error as "no identity" makes this pass an
+// account-wide owner and print the note, which is what this asserts against.
+func TestTheBuilderOwnerRefusesAConfigItCannotRead(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "billet.yaml")
+	if err := os.WriteFile(cfgPath, []byte("node:\n  provider: [this is not a scalar\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var (
+		owner string
+		err   error
+	)
+
+	printed := captureStderr(t, func() {
+		owner, err = builderOwner(cfgPath, "", "billet-runner-1")
+	})
+
+	if err == nil {
+		t.Fatalf("a config that does not parse was read as an absent identity, owner %q", owner)
+	}
+
+	if !strings.Contains(err.Error(), "--config") {
+		t.Errorf("the refusal must name the flag that pointed at it: %v", err)
+	}
+
+	if owner != "" {
+		t.Errorf("a refusal must return no owner, got %q", owner)
+	}
+
+	// AND IT MUST NOT HAVE FALLEN BACK FIRST. The note is what an account-wide
+	// build prints, so seeing it here means the error was reached after the
+	// fallback rather than instead of it.
+	if strings.Contains(printed, "no deployment identity") {
+		t.Errorf("the account-wide fallback ran before the refusal:\n%s", printed)
+	}
+}

@@ -591,11 +591,12 @@ func (in Inputs) Build() (Policy, error) {
 	}
 
 	if in.Builder {
-		// The builder is scoped to its OWN per-build owner prefix, not the
-		// deployment id — `billet ami build` tags the builder with billet-ami-build-*,
-		// a distinct identity. It gets its own Terminate for cleanup, because the
-		// runtime Terminate above is scoped to the deployment and would not match the
-		// builder once the policy is per-deployment.
+		// The builder is scoped to its OWN owner value, which carries the
+		// deployment id in value mode and not in account-wide mode
+		// (ec2.BuilderOwnerPattern, the same function `billet ami build` stamps
+		// with). It gets its own Terminate for cleanup, because the runtime
+		// Terminate above is conditioned on the deployment's EXACT owner value and
+		// would not match a builder, whose value is a different string.
 		//
 		// CreateImage authorizes MULTIPLE resource types — the source instance, the
 		// new image, and (for an EBS-backed builder) the snapshots it creates — so it

@@ -103,15 +103,22 @@ variable "iam_policy_json" {
 # node's grant is byte-identical whether or not a deployment builds images, and
 # so an operator can read in one document exactly what turning this on added. It
 # is ADDITIVE: the builder's launches ride the node policy's own RunInstances,
-# admitted because the module's rendering is presence-mode and the builder tags
-# its instances with the same owner key. Passing a VALUE-scoped iam_policy_json
-# instead (`billet init iam --deployment <id>`) needs `--builder` on that command
-# too, or the runtime statements will not admit the builder's own tag.
+# admitted because this module's rendering is presence-mode and the builder tags
+# its instances with the same owner key. That is also why it cannot be combined
+# with iam_policy_json, which is refused on the variable below.
 variable "builder" {
-  description = "Grant the node role what `billet ami build` needs: ec2:CreateImage on a builder-tagged instance and on the image and snapshots it makes, its own TerminateInstances for cleanup, GetConsoleOutput to read the verifier's report, and the CreateTags that stamps a verified image. Off by default — it widens the identity every job's instance is launched by, and a deployment that builds its AMI elsewhere should not carry it."
+  description = "Grant the node role what `billet ami build` needs: ec2:CreateImage on a builder-tagged instance and on the image and snapshots it makes, its own TerminateInstances for cleanup, GetConsoleOutput to read the verifier's report, and the CreateTags that stamps a verified image. Off by default — it widens the identity every job's instance is launched by, and a deployment that builds its AMI elsewhere should not carry it. Refused beside iam_policy_json: see that variable."
   type        = bool
   default     = false
 
+  validation {
+    # A BOOLEAN AND AN EMPTINESS, never a reading of the document. An earlier
+    # attempt at this rule searched the override for a literal and was wrong in
+    # both directions; whether an arbitrary IAM document admits the builder is
+    # not a question terraform can answer, and this one does not ask it.
+    condition     = !var.builder || var.iam_policy_json == ""
+    error_message = "builder = true cannot be combined with iam_policy_json. This module's builder rendering is account-wide, because the module has no deployment id at apply time, and IAM unions allows — so beside a value-scoped override it hands the role account-wide reach over every deployment's builders in the account. Generate the override with `billet init iam --deployment <id> --builder` instead, so one document carries the node grant and the builder grant together, and leave builder = false."
+  }
 }
 
 variable "builder_payload_bucket" {
