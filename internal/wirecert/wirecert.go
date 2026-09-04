@@ -61,6 +61,16 @@ const CALifetime = 10 * 365 * 24 * time.Hour
 // a node that cannot connect.
 const LeafLifetime = 365 * 24 * time.Hour
 
+// MinIssuedLifetime is the shortest leaf IssueNodeFor will mint.
+//
+// A NODE RENEWS ON A FIVE-MINUTE SWEEP ONCE LESS THAN A THIRD OF THE LIFE
+// REMAINS, so the final third has to be longer than a sweep or the renewal can
+// fall between two sweeps and the node expires in place, which is a host that
+// has to be re-enrolled by hand. Twenty minutes puts the window at six minutes
+// forty seconds against a five-minute cadence; ten, the first value chosen,
+// put it at three minutes twenty and would have been missed.
+const MinIssuedLifetime = 20 * time.Minute
+
 // ExpiryWarning is how long before expiry the control plane starts complaining.
 const ExpiryWarning = 30 * 24 * time.Hour
 
@@ -519,16 +529,21 @@ func (c *CA) IssueNode(name string) (Bundle, error) {
 //
 // A SHORT LEAF IS HOW A ROTATION IS REHEARSED. A node renews once less than a
 // third of its certificate's life remains, so with year-long leaves nothing
-// renews inside any rehearsal; a twelve-minute leaf renews inside the run. The
-// same cap as every leaf applies: nothing outlives the authority.
+// renews inside any rehearsal; a twenty-minute leaf renews inside the run. The
+// bounds are enforced HERE, not only by the command that asks, because an
+// exported entry point that trusts its caller is a second place the rule can be
+// missing (the alloc.New argument). The same cap as every leaf applies: nothing
+// outlives the authority.
 func (c *CA) IssueNodeFor(name string, lifetime time.Duration) (Bundle, error) {
 	if name == "" {
 		return Bundle{}, errors.New("wirecert: a node certificate needs a node name")
 	}
 
-	if lifetime <= 0 {
-		return Bundle{}, fmt.Errorf("wirecert: a node certificate's lifetime must be positive, not %s",
-			lifetime)
+	if lifetime < MinIssuedLifetime || lifetime > LeafLifetime {
+		return Bundle{}, fmt.Errorf("wirecert: a node certificate's lifetime of %s is outside "+
+			"[%s, %s]: a node renews on a five-minute sweep once a third of the life remains, "+
+			"so a shorter leaf can expire between two sweeps, and a longer one is not something "+
+			"this authority issues", lifetime, MinIssuedLifetime, LeafLifetime)
 	}
 
 	tmpl, err := c.leafTemplate(name, lifetime)
@@ -1004,9 +1019,22 @@ func syncDir(dir string) error {
 // Computed from the certificate's OWN lifetime rather than from LeafLifetime, so
 // a leaf shortened by the CA's own expiry still renews proportionally rather
 // than being judged against a year it never had.
+//
+// THE BACKDATED HOUR IS NOT LIFE. leafTemplate sets NotBefore an hour before
+// issue (ClockSkew) so a host whose clock runs behind can use the certificate
+// at once; that hour was never time the certificate had left. Counting it made
+// a twenty-minute leaf look eighty minutes long and due the moment it was
+// issued, which a rehearsal with short leaves found. A certificate that was not
+// backdated (nothing billet issues) is measured from its NotBefore as before.
 func RenewalDue(cert *x509.Certificate) (time.Duration, bool) {
 	left := time.Until(cert.NotAfter)
-	lifetime := cert.NotAfter.Sub(cert.NotBefore)
+
+	issued := cert.NotBefore.Add(ClockSkew)
+	if !issued.Before(cert.NotAfter) {
+		issued = cert.NotBefore
+	}
+
+	lifetime := cert.NotAfter.Sub(issued)
 
 	return left, left < lifetime/3
 }

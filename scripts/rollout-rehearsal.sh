@@ -51,7 +51,7 @@ fi
 # and the record says which half was manual.
 timer_release=v0.6.0
 controller_has_timer=no
-if [ "$(printf '%s\n%s\n' "${timer_release}" "${FROM}" | sort -V | head -1)" = "${timer_release}" ]; then
+if rehearsal_version_ge "${FROM}" "${timer_release}"; then
     controller_has_timer=yes
 fi
 
@@ -66,8 +66,9 @@ started_at=$(date -u +%s)
 
 # THE SCALE SET OUTLIVES THE CONTAINERS unless something removes it, and a scale
 # set nothing serves makes a job aimed at its label queue for 24 hours. So the
-# teardown asks the control plane to remove it before the hosts go, and runs on
-# every exit.
+# teardown asks the control plane to remove it before the hosts go, runs on
+# every exit, and A TEARDOWN THAT FAILS FAILS THE RUN: a green rehearsal that
+# left a scale set behind would hide the one thing an operator has to act on.
 cleanup() {
     status=$?
     set +e
@@ -75,8 +76,11 @@ cleanup() {
     echo
     echo "=== teardown"
     if docker exec "${controller}" test -f /etc/billet/billet.yaml >/dev/null 2>&1; then
-        rehearsal_as_billet "${controller}" /usr/bin/billet teardown --all --yes \
-            --config /etc/billet/billet.yaml 2>&1 | tail -3 || true
+        if ! rehearsal_teardown_scale_sets "${controller}"; then
+            echo "TEARDOWN FAILED: the scale set for ${label} may still exist. Remove it from any host" >&2
+            echo "holding this App: billet teardown --tier ${label} --yes --config <that config>" >&2
+            if [ "${status}" -eq 0 ]; then status=1; fi
+        fi
     fi
 
     if [ "${status}" -ne 0 ]; then
@@ -107,6 +111,7 @@ rehearsal_start_host "${controller}" "${network}" no "${storage}"
 rehearsal_start_host "${node}" "${network}" yes "${storage}"
 rehearsal_install_package "${controller}" "${from_deb}"
 rehearsal_install_package "${node}" "${from_deb}"
+rehearsal_install_app_key "${controller}"
 
 # The controller's file: a server, the borrowed App, one docker tier under a
 # label no other deployment uses. No release: block, so the deployment is on
@@ -155,6 +160,7 @@ rehearsal_issue_bundle "${controller}" "${node}" "${work}/bundle"
 rehearsal_install_bundle "${node}" "${work}/bundle"
 
 rehearsal_step "billet local up on both, controller first"
+since=$(rehearsal_clock "${controller}")
 docker exec "${controller}" /usr/bin/billet local up --config /etc/billet/billet.yaml 2>&1 | tail -6
 docker exec "${node}" /usr/bin/billet local up --config /etc/billet/billet.yaml 2>&1 | tail -6
 
@@ -163,9 +169,8 @@ test "$(rehearsal_active "${controller}" billet-server.service)" = active ||
 test "$(rehearsal_active "${node}" billet-node.service)" = active ||
     rehearsal_fail "billet-node.service is not active on ${node} after local up"
 
-rehearsal_wait_for 120 "the node to register" "${controller}" \
-    runuser -u billet -- sh -c "/usr/bin/billet status --config /etc/billet/billet.yaml | grep -q '${node}'" ||
-    rehearsal_fail "${node} never appeared in billet status on the controller"
+rehearsal_wait_registered 120 "${controller}" "${node}" "${since}" ||
+    rehearsal_fail "${node} never registered with the controller"
 
 test "$(rehearsal_version "${controller}")" = "${FROM_VERSION}" ||
     rehearsal_fail "the controller reports $(rehearsal_version "${controller}"), not ${FROM_VERSION}, before the rollout"
@@ -251,11 +256,22 @@ test "$(rehearsal_version "${controller}")" = "${TO_VERSION}" ||
     rehearsal_fail "after the rollback the controller reports $(rehearsal_version "${controller}"), not ${TO_VERSION}"
 rehearsal_wait_for 120 "the server to be back" "${controller}" systemctl is-active --quiet billet-server.service ||
     rehearsal_fail "billet-server.service did not come back after the rollback"
-test "$(rehearsal_version "${node}")" = "${TO_VERSION}" ||
-    rehearsal_fail "the node moved to $(rehearsal_version "${node}") although the controller never converged"
-journals_after=$(docker exec "${node}" sh -c 'ls -1d /var/lib/billet/upgrades/*/ 2>/dev/null | wc -l')
-test "${journals_before}" = "${journals_after}" ||
-    rehearsal_fail "the node was dispatched an upgrade (${journals_before} -> ${journals_after} journals) before the controller converged"
+
+# THE GUARD IS GIVEN TIME TO BE VIOLATED. The coordinator looks every thirty
+# seconds; a check made the instant the controller rolled back proves nothing
+# about a coordinator that would dispatch the node on its next pass. The
+# rollout stays open across three passes while the node is watched.
+held=0
+while [ "${held}" -lt 90 ]; do
+    sleep 15
+    held=$((held + 15))
+    test "$(rehearsal_version "${node}")" = "${TO_VERSION}" ||
+        rehearsal_fail "the node moved to $(rehearsal_version "${node}") although the controller never converged"
+    journals_now=$(docker exec "${node}" sh -c 'ls -1d /var/lib/billet/upgrades/*/ 2>/dev/null | wc -l')
+    test "${journals_before}" = "${journals_now}" ||
+        rehearsal_fail "the node was dispatched an upgrade (${journals_before} -> ${journals_now} journals) before the controller converged"
+done
+echo "the node stayed on ${TO_VERSION} with ${journals_before} journal(s) through ${held}s of the failed rollout"
 
 rehearsal_as_billet "${controller}" /usr/bin/billet rollout status --config /etc/billet/billet.yaml 2>&1 | tail -6
 rehearsal_as_billet "${controller}" /usr/bin/billet rollout abort \

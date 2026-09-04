@@ -957,8 +957,8 @@ func TestCAIssueHonoursALifetime(t *testing.T) {
 	before := time.Now()
 
 	if err := cmdCAIssue(t.Context(), []string{"epyc-1", "--config", cfg, "--out", out,
-		"--lifetime", "15m"}); err != nil {
-		t.Fatalf("ca issue --lifetime 15m: %v", err)
+		"--lifetime", "20m"}); err != nil {
+		t.Fatalf("ca issue --lifetime 20m: %v", err)
 	}
 
 	bundle, err := wirecert.LoadBundle(
@@ -980,20 +980,21 @@ func TestCAIssueHonoursALifetime(t *testing.T) {
 	}
 
 	// Issued at `now` with ClockSkew of backdating, good for the lifetime asked.
-	wantNotAfter := before.Add(15 * time.Minute)
+	wantNotAfter := before.Add(20 * time.Minute)
 	if cert.NotAfter.Before(wantNotAfter.Add(-30*time.Second)) ||
 		cert.NotAfter.After(wantNotAfter.Add(30*time.Second)) {
-		t.Errorf("the certificate expires at %s, want about %s (15m after issue)",
+		t.Errorf("the certificate expires at %s, want about %s (20m after issue)",
 			cert.NotAfter, wantNotAfter)
 	}
 
-	if life := cert.NotAfter.Sub(cert.NotBefore); life > 15*time.Minute+wirecert.ClockSkew+time.Minute {
-		t.Errorf("the certificate's life is %s; --lifetime 15m was not honoured", life)
+	if life := cert.NotAfter.Sub(cert.NotBefore); life > 20*time.Minute+wirecert.ClockSkew+time.Minute {
+		t.Errorf("the certificate's life is %s; --lifetime 20m was not honoured", life)
 	}
 
 	for _, tc := range []struct{ lifetime, want string }{
+		{"19m59s", "outside"},
 		{"5m", "outside"},
-		{"9000h", "outside"},
+		{"8761h", "outside"},
 		{"0s", "outside"},
 	} {
 		err := cmdCAIssue(t.Context(), []string{"epyc-2", "--config", cfg,
@@ -1002,7 +1003,7 @@ func TestCAIssueHonoursALifetime(t *testing.T) {
 			t.Fatalf("--lifetime %s was accepted", tc.lifetime)
 		}
 
-		if !strings.Contains(err.Error(), tc.want) || !strings.Contains(err.Error(), "10m") {
+		if !strings.Contains(err.Error(), tc.want) || !strings.Contains(err.Error(), "20m0s") {
 			t.Errorf("--lifetime %s: refusal %q does not name the bound", tc.lifetime, err)
 		}
 	}

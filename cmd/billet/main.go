@@ -2471,11 +2471,6 @@ func serialFromCert(path string) (string, error) {
 	return wirecert.Serial(cert), nil
 }
 
-// minIssuedLifetime is the shortest certificate `billet ca issue` will write. A
-// node renews on a five-minute sweep once less than a third of the life remains,
-// so a leaf shorter than this can expire between two sweeps.
-const minIssuedLifetime = 10 * time.Minute
-
 func cmdCAIssue(ctx context.Context, args []string) error {
 	fs := newFlagSet("billet ca issue")
 	cfgPath := addConfigFlag(fs)
@@ -2486,7 +2481,7 @@ func cmdCAIssue(ctx context.Context, args []string) error {
 	lifetime := fs.Duration("lifetime", wirecert.LeafLifetime,
 		"how long the certificate is good for (default a year; the node renews it on its "+
 			"own once less than a third remains). Shorter for a short-lived host or a "+
-			"rotation rehearsal; never below "+minIssuedLifetime.String())
+			"rotation rehearsal; never below "+wirecert.MinIssuedLifetime.String())
 
 	name, err := parseWithName(fs, args)
 	if err != nil {
@@ -2497,15 +2492,14 @@ func cmdCAIssue(ctx context.Context, args []string) error {
 		return errors.New("usage: billet ca issue <node> [--out <dir>] [--lifetime <duration>]")
 	}
 
-	// BOUNDED ON BOTH SIDES. Below the floor a node's five-minute sweep can miss
-	// the renewal window and expire in place, which is a host that has to be
-	// re-enrolled; above LeafLifetime nothing here is exercised that the default
-	// does not, and a leaf may never outlive its authority anyway.
-	if *lifetime < minIssuedLifetime || *lifetime > wirecert.LeafLifetime {
+	// The bounds are wirecert's (IssueNodeFor refuses outside them); checked here
+	// too so the refusal arrives before the config is loaded and the authority
+	// touched, naming the flag.
+	if *lifetime < wirecert.MinIssuedLifetime || *lifetime > wirecert.LeafLifetime {
 		return fmt.Errorf("--lifetime %s is outside [%s, %s]: a node renews on a five-minute "+
 			"sweep once a third of the life remains, so a shorter leaf expires in place, and a "+
-			"longer one is not something an authority issues", *lifetime, minIssuedLifetime,
-			wirecert.LeafLifetime)
+			"longer one is not something an authority issues", *lifetime,
+			wirecert.MinIssuedLifetime, wirecert.LeafLifetime)
 	}
 
 	// VALIDATED HERE, not on first connection. The common name IS the node's

@@ -114,11 +114,11 @@ rehearsal_fetch_release() {
         cd "${dir}" &&
             grep -F " ${deb}" checksums.txt >"${deb}.sha256" &&
             test -s "${deb}.sha256" &&
-            sha256sum -c "${deb}.sha256" >/dev/null
+            rehearsal_sha256_check "${deb}.sha256"
     ) || rehearsal_fail "${deb} does not match ${tag}'s checksums.txt"
 
     REHEARSAL_DEB="${dir}/${deb}"
-    REHEARSAL_MANIFEST_SHA256=$(sha256sum "${dir}/release-manifest.json" | cut -c1-64)
+    REHEARSAL_MANIFEST_SHA256=$(rehearsal_sha256_of "${dir}/release-manifest.json")
 
     echo "fetched ${tag}: ${deb} verified; manifest ${REHEARSAL_MANIFEST_SHA256}"
 }
@@ -178,6 +178,82 @@ rehearsal_cert_issuer() {
     docker exec "$1" openssl x509 -in "$2" -noout -issuer 2>/dev/null | cut -d= -f2-
 }
 
+# rehearsal_sha256_check verifies the "<digest>  <file>" lines in a sum file,
+# and rehearsal_sha256_of prints a file's digest, with whichever of coreutils'
+# sha256sum or perl's shasum the host has: a Mac running Docker Desktop has the
+# second and not the first, and a helper that quietly fell through would make
+# "verified" mean "no tool was found".
+rehearsal_sha256_check() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum -c "$1" >/dev/null
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 -c "$1" >/dev/null
+    else
+        rehearsal_fail "neither sha256sum nor shasum is installed, so nothing can verify a download"
+    fi
+}
+
+rehearsal_sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | cut -c1-64
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | cut -c1-64
+    else
+        rehearsal_fail "neither sha256sum nor shasum is installed, so nothing can digest a manifest"
+    fi
+}
+
+# rehearsal_version_ge succeeds when release tag $1 is at or above tag $2, by
+# strict vX.Y.Z arithmetic. Not `sort -V`: BSD sort has no -V, and a comparison
+# that fails inside an `if` would silently pick the wrong branch on a Mac.
+rehearsal_version_ge() {
+    local IFS=.
+    local -a a b
+    read -r -a a <<<"${1#v}"
+    read -r -a b <<<"${2#v}"
+
+    local i
+    for i in 0 1 2; do
+        if [ "${a[i]:-0}" -gt "${b[i]:-0}" ]; then return 0; fi
+        if [ "${a[i]:-0}" -lt "${b[i]:-0}" ]; then return 1; fi
+    done
+
+    return 0
+}
+
+# rehearsal_clock prints a host's clock in the form journalctl --since takes,
+# for marking a boundary before which a log line does not count.
+rehearsal_clock() {
+    docker exec "$1" date -u '+%Y-%m-%d %H:%M:%S'
+}
+
+# rehearsal_wait_registered waits until the controller's journal records a
+# REGISTRATION of the node after the given clock mark.
+#
+# NOT `billet status`, deliberately: status prints every node the ledger knows,
+# reachable or not, so a row that survived a restore, a restart or a shared
+# ledger satisfies a grep for the name without any host having connected. The
+# server's "node registered" line is written by the registration handler when
+# a host actually arrives, and a mark taken before the boundary makes it causal.
+rehearsal_wait_registered() {
+    local deadline=$1 controller=$2 node=$3 since=$4
+
+    rehearsal_wait_for "${deadline}" "${node} to register with ${controller}" "${controller}" \
+        sh -c "journalctl -u billet-server --since '${since}' --no-pager -o cat | grep -q 'node registered node=${node}'"
+}
+
+# rehearsal_teardown_scale_sets removes every scale set a rehearsal's control
+# plane created, and returns the command's own status so a cleanup can refuse
+# to call a run green when the scale set is still there.
+rehearsal_teardown_scale_sets() {
+    local controller=$1
+    shift
+
+    docker exec "$@" "${controller}" runuser -u billet -- env "$@" /usr/bin/billet teardown --all --yes \
+        --config /etc/billet/billet.yaml 2>&1 | tail -3
+    return "${PIPESTATUS[0]}"
+}
+
 # rehearsal_start_host starts a container whose PID 1 is systemd, on the given
 # network, optionally with its own docker daemon (a node that runs the docker
 # provider). Waits for systemd to reach running or degraded.
@@ -235,19 +311,26 @@ rehearsal_start_host() {
     esac
 }
 
-# rehearsal_install_package installs a billet .deb into a host and stages the
-# App key where the packaged config template expects it, owned by the service
-# account the postinstall created.
+# rehearsal_install_package installs a billet .deb into a host.
 rehearsal_install_package() {
     local name=$1 deb=$2
 
     docker cp "${deb}" "${name}":/tmp/billet.deb
     docker exec "${name}" sh -c 'apt-get install -y -qq /tmp/billet.deb >/dev/null 2>&1' ||
         rehearsal_fail "the package would not install in ${name}"
+    docker exec "${name}" rm -f /tmp/billet.deb
+}
+
+# rehearsal_install_app_key stages the App key where the packaged config
+# template expects it, owned by the service account the postinstall created.
+# CONTROLLERS ONLY: a node has no use for the App, and a rehearsal that put the
+# real credential on every compute host would be rehearsing a leak.
+rehearsal_install_app_key() {
+    local name=$1
 
     docker cp "${BILLET_REHEARSAL_APP_KEY}" "${name}":/tmp/app-key.pem
     docker exec "${name}" install -m 0600 -o billet -g billet /tmp/app-key.pem /etc/billet/app-private-key.pem
-    docker exec "${name}" rm -f /tmp/app-key.pem /tmp/billet.deb
+    docker exec "${name}" rm -f /tmp/app-key.pem
 }
 
 # rehearsal_install_config writes a host's /etc/billet/billet.yaml from stdin

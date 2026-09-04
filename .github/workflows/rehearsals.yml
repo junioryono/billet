@@ -23,10 +23,11 @@ on:
         required: false
         type: string
       only:
-        description: Run one rehearsal (rollout, recover, ca-rotation, promotion) or all
+        description: Run one rehearsal or all of them
         required: false
         default: all
-        type: string
+        type: choice
+        options: [all, rollout, recover, ca-rotation, promotion]
   schedule:
     - cron: "0 5 * * 2"
 
@@ -85,9 +86,12 @@ jobs:
           echo "BILLET_REHEARSAL_APP_KEY=$RUNNER_TEMP/app/app-private-key.pem" >> "$GITHUB_ENV"
 
       # THE TWO RELEASES COME FROM THE INPUTS OR FROM THE CHANNEL. A scheduled run
-      # has no inputs, so it moves from the release before the one the stable
-      # channel names to that one, which is the move a deployment following the
-      # channel just made or is about to make.
+      # has no inputs, so it moves to the release the stable channel names from
+      # the greatest published release BELOW it, which is the move a deployment
+      # following the channel just made or is about to make. TO must be a
+      # published, non-prerelease release; FROM is chosen relative to TO and not
+      # as "the second newest", which is a different release the moment a tag
+      # exists that the channel has not taken up.
       - name: Choose the releases the rollout rehearsal moves between
         if: inputs.only == 'all' || inputs.only == 'rollout' || inputs.only == ''
         env:
@@ -99,11 +103,22 @@ jobs:
           if [ -z "$TO" ]; then
             TO=$(gh api "repos/$GITHUB_REPOSITORY/contents/stable.json?ref=release-channel" --jq .content | base64 -d | sed -nE 's/.*"tag": *"([^"]+)".*/\1/p')
           fi
-          if [ -z "$FROM" ]; then
-            FROM=$(gh release list -R "$GITHUB_REPOSITORY" --exclude-pre-releases --exclude-drafts --limit 20 --json tagName --jq '[.[].tagName | select(startswith("v"))] | sort_by(split(".") | map(ltrimstr("v") | tonumber)) | reverse | .[1] // empty')
+          if [ -z "$TO" ]; then
+            echo "::error::the stable channel names no release and no --to was given" >&2
+            exit 1
           fi
-          if [ -z "$FROM" ] || [ -z "$TO" ] || [ "$FROM" = "$TO" ]; then
-            echo "::notice::no pair of releases to move between (from=$FROM to=$TO); skipping the rollout rehearsal"
+          if ! gh release view "$TO" -R "$GITHUB_REPOSITORY" --json isPrerelease,isDraft --jq 'if .isPrerelease or .isDraft then error("prerelease or draft") else . end' >/dev/null; then
+            echo "::error::$TO is not a published, non-prerelease release" >&2
+            exit 1
+          fi
+          if [ -z "$FROM" ]; then
+            FROM=$(gh release list -R "$GITHUB_REPOSITORY" --exclude-pre-releases --exclude-drafts --limit 50 --json tagName --jq --arg to "$TO" '
+              def key: ltrimstr("v") | split(".") | map(tonumber);
+              [.[].tagName | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$")) | select((key) < ($to | key))]
+              | sort_by(key) | last // empty')
+          fi
+          if [ -z "$FROM" ]; then
+            echo "::notice::no published release below $TO to move from; skipping the rollout rehearsal"
             echo "BILLET_REHEARSAL_SKIP_ROLLOUT=1" >> "$GITHUB_ENV"
             exit 0
           fi

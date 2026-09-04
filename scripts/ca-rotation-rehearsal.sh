@@ -13,8 +13,9 @@
 # NODES RENEW WHEN LESS THAN A THIRD OF A LEAF'S LIFE REMAINS, on the sweep that
 # runs every five minutes, so with year-long leaves nothing renews inside a
 # rehearsal. `billet ca issue --lifetime` exists for exactly this: the nodes
-# below get twelve-minute certificates and the rehearsal watches the window in
-# which each must renew.
+# below get twenty-minute certificates (the floor: a shorter leaf's final third
+# is shorter than a sweep) and the rehearsal watches the window in which each
+# must renew.
 #
 #   BILLET_REHEARSAL_APP_CONFIG=... BILLET_REHEARSAL_APP_KEY=... scripts/ca-rotation-rehearsal.sh
 set -euo pipefail
@@ -33,11 +34,12 @@ controller="rehearsal-controller"
 node_a="rehearsal-node-a"
 node_b="rehearsal-node-b"
 label="rehearse-${id}-2vcpu"
-leaf_lifetime=12m
-# The window in which a twelve-minute leaf must be renewed: renewal is due once
-# less than four minutes remain (eight minutes in), the sweep runs every five,
-# so the latest a healthy node renews is about thirteen minutes after issue.
-renew_deadline=$((16 * 60))
+leaf_lifetime=20m
+# The window in which a twenty-minute leaf must be renewed: renewal is due once
+# less than six minutes forty seconds remain (thirteen minutes twenty in), the
+# sweep runs every five minutes from the node's start, so the latest a healthy
+# node renews is about nineteen minutes after issue.
+renew_deadline=$((25 * 60))
 storage=$(mktemp -d)
 work=$(mktemp -d)
 started_at=$(date -u +%s)
@@ -49,8 +51,11 @@ cleanup() {
     echo
     echo "=== teardown"
     if docker exec "${controller}" test -f /etc/billet/billet.yaml >/dev/null 2>&1; then
-        rehearsal_as_billet "${controller}" /usr/bin/billet teardown --all --yes \
-            --config /etc/billet/billet.yaml 2>&1 | tail -3 || true
+        if ! rehearsal_teardown_scale_sets "${controller}"; then
+            echo "TEARDOWN FAILED: the scale set for ${label} may still exist. Remove it from any host" >&2
+            echo "holding this App: billet teardown --tier ${label} --yes --config <that config>" >&2
+            if [ "${status}" -eq 0 ]; then status=1; fi
+        fi
     fi
 
     if [ "${status}" -ne 0 ]; then
@@ -74,6 +79,7 @@ rehearsal_start_host "${node_b}" "${network}" yes "${storage}"
 for h in "${controller}" "${node_a}" "${node_b}"; do
     rehearsal_install_package "${h}" "${REHEARSAL_DIST_DEB}"
 done
+rehearsal_install_app_key "${controller}"
 
 {
     cat <<EOF
@@ -124,19 +130,19 @@ serial_a=$(rehearsal_cert_serial "${node_a}" /etc/billet/tls/node.crt)
 serial_b=$(rehearsal_cert_serial "${node_b}" /etc/billet/tls/node.crt)
 echo "issued by ${old_authority}: ${node_a} serial ${serial_a}, ${node_b} serial ${serial_b}"
 
+since=$(rehearsal_clock "${controller}")
 docker exec "${controller}" /usr/bin/billet local up --config /etc/billet/billet.yaml 2>&1 | tail -4
 docker exec "${node_a}" /usr/bin/billet local up --config /etc/billet/billet.yaml 2>&1 | tail -4
 docker exec "${node_b}" /usr/bin/billet local up --config /etc/billet/billet.yaml 2>&1 | tail -4
 for n in "${node_a}" "${node_b}"; do
-    rehearsal_wait_for 120 "${n} to register" "${controller}" \
-        runuser -u billet -- sh -c "/usr/bin/billet status --config /etc/billet/billet.yaml | grep -q '${n}'" ||
-        rehearsal_fail "${n} never appeared in billet status"
+    rehearsal_wait_registered 120 "${controller}" "${n}" "${since}" ||
+        rehearsal_fail "${n} never registered with the controller"
 done
 
 rehearsal_step "billet ca rotate, then restart the control plane to present the overlap"
-rehearsal_as_billet "${controller}" /usr/bin/billet ca show --config /etc/billet/billet.yaml 2>&1 | head -4
+rehearsal_as_billet "${controller}" /usr/bin/billet ca show --config /etc/billet/billet.yaml 2>&1 | sed -n '1,4p'
 rotated_at=$(date -u +%s)
-rehearsal_as_billet "${controller}" /usr/bin/billet ca rotate --config /etc/billet/billet.yaml 2>&1 | head -3
+rehearsal_as_billet "${controller}" /usr/bin/billet ca rotate --config /etc/billet/billet.yaml 2>&1 | sed -n '1,3p'
 docker exec "${controller}" test -f /var/lib/billet/server/ca/ca-previous.key ||
     rehearsal_fail "ca rotate left no committed previous authority (ca-previous.key)"
 docker exec "${controller}" systemctl restart billet-server.service
@@ -163,20 +169,20 @@ for n in "${node_a}" "${node_b}"; do
 done
 
 rehearsal_step "billet ca retire drops the old authority; the fleet keeps polling"
-rehearsal_as_billet "${controller}" /usr/bin/billet ca retire --config /etc/billet/billet.yaml 2>&1 | head -4
+rehearsal_as_billet "${controller}" /usr/bin/billet ca retire --config /etc/billet/billet.yaml 2>&1 | sed -n '1,4p'
 if docker exec "${controller}" test -f /var/lib/billet/server/ca/ca-previous.crt; then
     rehearsal_fail "ca retire left ca-previous.crt in place"
 fi
+since=$(rehearsal_clock "${controller}")
 docker exec "${controller}" systemctl restart billet-server.service
 rehearsal_wait_for 60 "the server to be back" "${controller}" systemctl is-active --quiet billet-server.service ||
     rehearsal_fail "billet-server.service did not come back after the retire"
 
-# THE PROOF IS A FRESH REGISTRATION, not a row that survived from before: the
-# plane restarted and forgot every host, so a node listed now has connected to a
-# plane that trusts only the new authority, with the certificate it renewed.
+# THE PROOF IS A FRESH REGISTRATION after the restart, recorded in the server's
+# own journal: a node that registers now has connected to a plane that trusts
+# only the new authority, with the certificate it renewed.
 for n in "${node_a}" "${node_b}"; do
-    rehearsal_wait_for 180 "${n} to register with the retired authority gone" "${controller}" \
-        runuser -u billet -- sh -c "/usr/bin/billet status --config /etc/billet/billet.yaml | grep -q '${n}'" ||
+    rehearsal_wait_registered 180 "${controller}" "${n}" "${since}" ||
         rehearsal_fail "${n} did not re-register after the old authority was retired"
 done
 
@@ -185,9 +191,16 @@ rehearsal_issue_bundle "${controller}" "rehearsal-node-c" "${work}/bundle-c"
 docker cp "${work}/bundle-c/ca.crt" "${node_a}:/tmp/ca-now.crt"
 docker exec "${node_a}" sh -c 'openssl s_client -connect '"${controller}"':7717 -CAfile /tmp/ca-now.crt -cert /etc/billet/tls/node.crt -key /etc/billet/tls/node.key </dev/null 2>/dev/null | grep -q "Verify return code: 0"' ||
     rehearsal_fail "a bundle issued after the retire does not verify the server ${node_a}'s renewed certificate dials"
-if openssl verify -CAfile "${work}/bundle-c/ca.crt" "${work}/bundle-a/node.crt" >/dev/null 2>&1; then
-    rehearsal_fail "the ORIGINAL certificate still verifies against the trust bundle after the retire"
-fi
+# BOTH INPUTS ARE PROVED READABLE FIRST: the original certificate verifies
+# against the bundle it came with (exit 0), and then fails against today's
+# bundle with openssl's verification-failure status (2) rather than its
+# cannot-read status (1), so an unreadable file cannot pass as a retired one.
+openssl verify -CAfile "${work}/bundle-a/ca.crt" "${work}/bundle-a/node.crt" >/dev/null 2>&1 ||
+    rehearsal_fail "the original certificate does not verify against its own bundle, so the retire check below would prove nothing"
+verify_status=0
+openssl verify -CAfile "${work}/bundle-c/ca.crt" "${work}/bundle-a/node.crt" >/dev/null 2>&1 || verify_status=$?
+test "${verify_status}" -eq 2 ||
+    rehearsal_fail "verifying the ORIGINAL certificate against today's bundle exited ${verify_status}; 2 is the retired authority refusing it, anything else is not"
 
 echo
 echo "ca rotation rehearsal: PASSED"

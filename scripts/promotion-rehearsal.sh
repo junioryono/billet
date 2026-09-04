@@ -62,13 +62,20 @@ cleanup() {
 
     echo
     echo "=== teardown"
+    torn_down=no
     for c in "${controller_b}" "${controller_a}"; do
         if docker exec "${c}" test -f /etc/billet/billet.yaml >/dev/null 2>&1; then
-            docker exec -e "BILLET_STATE_DSN=${dsn}" "${c}" runuser -u billet -- \
-                env "BILLET_STATE_DSN=${dsn}" /usr/bin/billet teardown --all --yes \
-                --config /etc/billet/billet.yaml 2>&1 | tail -2 && break
+            if rehearsal_teardown_scale_sets "${c}" -e "BILLET_STATE_DSN=${dsn}"; then
+                torn_down=yes
+                break
+            fi
         fi
     done
+    if [ "${torn_down}" = no ]; then
+        echo "TEARDOWN FAILED: the scale set for ${label} may still exist. Remove it from any host" >&2
+        echo "holding this App: billet teardown --tier ${label} --yes --config <that config>" >&2
+        if [ "${status}" -eq 0 ]; then status=1; fi
+    fi
 
     if [ "${status}" -ne 0 ]; then
         for h in "${controller_a}" "${controller_b}" "${node}"; do
@@ -100,6 +107,8 @@ rehearsal_start_host "${node}" "${network}" yes "${storage}"
 for h in "${controller_a}" "${controller_b}" "${node}"; do
     rehearsal_install_package "${h}" "${REHEARSAL_DIST_DEB}"
 done
+rehearsal_install_app_key "${controller_a}"
+rehearsal_install_app_key "${controller_b}"
 
 # THE DSN REACHES THE UNIT THE WAY THE HOST ROLE DELIVERS IT: an environment
 # file the unit imports, never a value in billet.yaml, which names only the
@@ -169,17 +178,24 @@ docker exec -e "BILLET_STATE_DSN=${dsn}" "${controller_a}" runuser -u billet -- 
 docker cp "${controller_a}:/tmp/${node}-tls" "${work}/bundle"
 rehearsal_install_bundle "${node}" "${work}/bundle"
 
-docker exec "${controller_a}" tar -C /var/lib/billet/server -cf /tmp/identity.tar deployment-id authority-created ca
+# THE ARCHIVE HOLDS THE CA KEY, so it is created under a private umask, its
+# mode is checked, and every copy is removed the moment it has been read.
+docker exec "${controller_a}" sh -c 'umask 077 && tar -C /var/lib/billet/server -cf /tmp/identity.tar deployment-id authority-created ca'
+test "$(docker exec "${controller_a}" stat -c '%a' /tmp/identity.tar)" = 600 ||
+    rehearsal_fail "the identity archive is not mode 0600; it holds the authority's key"
 docker cp "${controller_a}:/tmp/identity.tar" "${work}/identity.tar"
+docker exec "${controller_a}" rm -f /tmp/identity.tar
 docker cp "${work}/identity.tar" "${controller_b}:/tmp/identity.tar"
+rm -f "${work}/identity.tar"
 docker exec "${controller_b}" tar -C /var/lib/billet/server -xf /tmp/identity.tar
-docker exec "${controller_b}" chown -R billet:billet /var/lib/billet/server
 docker exec "${controller_b}" rm -f /tmp/identity.tar
+docker exec "${controller_b}" chown -R billet:billet /var/lib/billet/server
 test "$(docker exec "${controller_a}" cat /var/lib/billet/server/deployment-id)" = \
     "$(docker exec "${controller_b}" cat /var/lib/billet/server/deployment-id)" ||
     rehearsal_fail "the two controllers do not share one deployment identity"
 
 rehearsal_step "start A, then B; one claims and one stands by"
+since_a=$(rehearsal_clock "${controller_a}")
 docker exec -e "BILLET_STATE_DSN=${dsn}" "${controller_a}" /usr/bin/billet local up --config /etc/billet/billet.yaml 2>&1 | tail -4
 docker exec -e "BILLET_STATE_DSN=${dsn}" "${controller_b}" /usr/bin/billet local up --config /etc/billet/billet.yaml 2>&1 | tail -4
 docker exec "${node}" /usr/bin/billet local up --config /etc/billet/billet.yaml 2>&1 | tail -4
@@ -190,12 +206,12 @@ rehearsal_wait_for 120 "A to claim the controller" "${controller_a}" \
 rehearsal_wait_for 120 "B to stand by" "${controller_b}" \
     sh -c 'journalctl -u billet-server --no-pager -o cat | grep -q "standing by for this deployment.s controller"' ||
     rehearsal_fail "controller B never stood by"
-rehearsal_wait_for 120 "the node to register with A" "${controller_a}" \
-    sh -c "BILLET_STATE_DSN='${dsn}' runuser -u billet -- env BILLET_STATE_DSN='${dsn}' /usr/bin/billet status --config /etc/billet/billet.yaml | grep -q '${node}'" ||
-    rehearsal_fail "${node} never registered"
+rehearsal_wait_registered 120 "${controller_a}" "${node}" "${since_a}" ||
+    rehearsal_fail "${node} never registered with A"
 echo "claim held by: $(active_controller "${controller_b}")"
 
 rehearsal_step "partition A; measure the promotion"
+since_b=$(rehearsal_clock "${controller_b}")
 partitioned_at=$(date -u +%s)
 docker network disconnect "${network}" "${controller_a}"
 rehearsal_wait_for 300 "B to be promoted" "${controller_b}" \
@@ -207,8 +223,9 @@ echo "promotion took ${promotion_took}s (keepalives idle=${keepalive_idle}s inte
 test "$(active_controller "${controller_b}")" = "${controller_b}" ||
     rehearsal_fail "billet status on B does not name B as the claim holder after the promotion"
 
-rehearsal_wait_for 300 "the node to re-register with B" "${controller_b}" \
-    sh -c "BILLET_STATE_DSN='${dsn}' runuser -u billet -- env BILLET_STATE_DSN='${dsn}' /usr/bin/billet status --config /etc/billet/billet.yaml | grep -q '${node}'" ||
+# A REGISTRATION B'S JOURNAL RECORDS after the partition: the shared ledger's
+# row for the node says nothing about which controller it is talking to.
+rehearsal_wait_registered 300 "${controller_b}" "${node}" "${since_b}" ||
     rehearsal_fail "${node} did not re-register with the promoted controller"
 node_moved_at=$(date -u +%s)
 
