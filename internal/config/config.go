@@ -4579,36 +4579,40 @@ func AWSDNSSuffix(region string) string {
 	return "amazonaws.com"
 }
 
-// vpcEndpointLabelRe is ONE DNS label of a lowercased host: alphanumeric at both
-// ends, hyphens allowed between, 63 characters at most.
+// hostLabelRe is ONE DNS label: alphanumeric at both ends, hyphens allowed between,
+// 63 characters at most.
 //
-// PER LABEL RATHER THAN OVER THE WHOLE PREFIX. The first version of this check was
+// PER LABEL RATHER THAN OVER THE WHOLE NAME. An earlier version of this check was
 // registryMirrorOriginRe's whole-host shape, which pins only the first and last
 // character — so `a..b` (an empty label), `a.-b`, `a.---.b` and a 72-character label
-// all passed it. None of those is a name DNS can answer, which makes them the same
-// silent unreachable queue as the other partition's suffix. Lowercase only, because
-// the host has already been folded by the time this is asked.
-var vpcEndpointLabelRe = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
+// all passed it. None of those is a name DNS can answer.
+//
+// ASCII BY CONSTRUCTION, which is load-bearing rather than incidental: isHostname is
+// asked BEFORE the host is folded to lower case, so admitting no non-ASCII here is
+// what makes the fold below safe. Both cases are allowed for that reason.
+var hostLabelRe = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$`)
 
 // maxHostname is a DNS name's length in its textual form, the bound DNS itself
 // enforces. Checked because the label rule alone does not imply it: sixty valid
-// labels are sixty valid labels and still not a host anything can look up.
+// labels are sixty valid labels and still not a name anything can look up.
 const maxHostname = 253
 
-// vpcEndpointLabels reports whether prefix is a non-empty dotted run of DNS labels,
-// which is what has to sit in front of `.sqs.<region>.vpce.<suffix>`.
+// isHostname reports whether host is a name DNS could answer: every dot-separated
+// label is one, and the whole thing is within the length DNS allows.
 //
-// The label itself is the operator's endpoint id and billet cannot know it, so this
-// asks only whether it could be a hostname. It deliberately does NOT require AWS's
-// `vpce-` spelling: that is a fact about somebody else's product, and unlike the DNS
-// suffixes there is no way to measure it without owning an endpoint.
-func vpcEndpointLabels(prefix string) bool {
-	if prefix == "" {
+// ASKED OF THE WHOLE HOST BEFORE IT IS CLASSIFIED, not of the VPC endpoint's own
+// labels afterwards. Checking only that prefix left two ways to name something
+// unaddressable: node.ec2.region is deliberately a SHAPE with no length cap, so a
+// 64-character region makes an over-long label in `sqs.<region>.<suffix>` — a
+// standard host, never near the private branch — and the 253-character bound sat in
+// that branch too. One question asked once about the name as a whole closes both.
+func isHostname(host string) bool {
+	if host == "" || len(host) > maxHostname {
 		return false
 	}
 
-	for label := range strings.SplitSeq(prefix, ".") {
-		if !vpcEndpointLabelRe.MatchString(label) {
+	for label := range strings.SplitSeq(host, ".") {
+		if !hostLabelRe.MatchString(label) {
 			return false
 		}
 	}
@@ -4652,25 +4656,48 @@ func CheckSQSQueueURL(raw, region string) error {
 	if isLoopbackHost(u.Hostname()) {
 		return nil
 	}
+
+	// A PORT IS PART OF WHAT GETS DIALLED, and Hostname() drops it. The SQS client
+	// addresses the queue URL's Host, port included, so `sqs.<region>.<suffix>:1`
+	// matched the standard host exactly and then connected to port 1. AWS serves this
+	// on 443 and the loopback exception above is what lets a test point somewhere
+	// else, so an explicit 443 is the only port worth accepting.
+	if port := u.Port(); port != "" && port != "443" {
+		return errors.New("node.ec2.interruption_queue_url must not name a port other than " +
+			"443: the host is what billet dials, and SQS answers nowhere else")
+	}
+
+	// ASCII FIRST, THEN FOLDED. strings.ToLower is Unicode-aware and U+0130 folds to
+	// an ASCII `i`, so 63 of them are 126 bytes of host that become 63 characters
+	// passing every rule below — while the name actually dialled is neither what was
+	// measured nor what was checked. An internationalised name reaches DNS as its
+	// xn-- form, so that is the form to write here.
+	if !isHostname(u.Hostname()) {
+		return errors.New("node.ec2.interruption_queue_url's host is not a hostname: every " +
+			"hostname label has to begin and end alphanumeric, hold only ASCII letters, " +
+			"digits and hyphens, and be 63 characters at most, with 253 for the whole " +
+			"name. A name outside that resolves nowhere, so the queue would be " +
+			"unreachable rather than wrong — write an internationalised name in its " +
+			"xn-- form, which is what goes on the wire in any case")
+	}
+
 	host := strings.ToLower(u.Hostname())
 	suffix := AWSDNSSuffix(region)
 	standard := host == "sqs."+region+"."+suffix || host == region+".queue."+suffix
 
-	// THE VPC-ENDPOINT FORM STILL HAS TO BE A HOSTNAME. A bare suffix match accepts
-	// `.sqs.<region>.vpce.<suffix>` with no endpoint label at all, and `..sqs.` and
-	// `a_b!.sqs.` with labels that are not ones — each an address DNS cannot resolve,
-	// reaching a node as the same silence a wrong partition does.
-	var private bool
-	if prefix, ok := strings.CutSuffix(host, ".sqs."+region+".vpce."+suffix); ok {
-		private = len(host) <= maxHostname && vpcEndpointLabels(prefix)
-	}
+	// THE VPC-ENDPOINT FORM IS MATCHED BY SUFFIX, because the labels in front are the
+	// operator's endpoint id and billet cannot know them. What sits there needs no
+	// separate check: isHostname has already held the whole name to valid labels, and
+	// this cuts on a dot boundary, so a match leaves one or more of them. It does not
+	// require AWS's `vpce-` spelling — the DNS suffixes were measured, and an
+	// endpoint's own label cannot be without owning an endpoint.
+	_, private := strings.CutSuffix(host, ".sqs."+region+".vpce."+suffix)
 
 	if !standard && !private {
 		return fmt.Errorf("node.ec2.interruption_queue_url must name an SQS endpoint in "+
 			"node.ec2.region %q: sqs.%s.%s, the legacy %s.queue.%s, or "+
-			"<endpoint>.sqs.%s.vpce.%s with the VPC endpoint's own hostname label in "+
-			"front; the other partition's suffix names no host in this region, and "+
-			"billet signs every queue request for this region",
+			"<endpoint>.sqs.%s.vpce.%s; the other partition's suffix names no host in "+
+			"this region, and billet signs every queue request for this region",
 			region, region, suffix, region, suffix, region, suffix)
 	}
 

@@ -877,11 +877,15 @@ func vpceQueue(prefix string) string {
 	return "https://" + prefix + vpceTail + "/123456789012/aws-1"
 }
 
-// vpcePrefixFilling builds endpoint labels that make the whole HOST exactly n
-// characters, in valid 63-character labels, so the length boundary is exercised by a
-// name that is otherwise correct. It fails rather than returns a wrong length,
-// because a fixture that quietly built a 251-character host would leave the test
-// green while asserting nothing about the bound.
+// vpcePrefixFilling builds endpoint labels making the whole HOST exactly n
+// characters, so the length bound is exercised by a name that is otherwise correct.
+//
+// IT PROVES ITS OWN OUTPUT, twice. A generator that quietly built a 251-character
+// host would leave the test green while asserting nothing about the boundary; and an
+// earlier version wrote a separator with nothing after it whenever the target was a
+// multiple of 64, producing the right LENGTH ending in an EMPTY LABEL — so a refusal
+// case would have exercised the label rule while claiming to exercise the bound. It
+// asserts the length and then asks isHostname, which is the rule under test.
 func vpcePrefixFilling(t *testing.T, n int) string {
 	t.Helper()
 
@@ -896,31 +900,42 @@ func vpcePrefixFilling(t *testing.T, n int) string {
 			b.WriteByte('.')
 		}
 
-		b.WriteString(strings.Repeat("a", min(want-b.Len(), 63)))
+		// At least one character after every separator, so no label is ever empty.
+		run := min(want-b.Len(), 63)
+		if run < 1 {
+			t.Fatalf("cannot fill %d characters in whole labels", want)
+		}
+
+		b.WriteString(strings.Repeat("a", run))
 	}
 
-	if got := b.Len() + len(vpceTail); got != n {
+	prefix := b.String()
+	if got := len(prefix) + len(vpceTail); got != n {
 		t.Fatalf("the fixture built a %d-character host, not %d", got, n)
 	}
 
-	return b.String()
+	if n <= maxHostname && !isHostname(prefix+vpceTail) {
+		t.Fatalf("the fixture built a host that is not one: %q", prefix)
+	}
+
+	return prefix
 }
 
-// A VPC ENDPOINT'S HOST HAS TO BE A HOSTNAME, LABEL BY LABEL.
+// A QUEUE HOST HAS TO BE A HOSTNAME, LABEL BY LABEL.
 //
-// The private form is matched by SUFFIX, because the labels in front are the
+// The VPC-endpoint form is matched by SUFFIX, because the labels in front are the
 // operator's endpoint id and billet cannot know them. A bare suffix match asks for
-// nothing at all in front of it, and a whole-prefix shape — the first version of this
+// nothing at all in front of it, and a whole-name shape — an earlier version of this
 // check — pins only the first and last character. So `.sqs...` with no label,
-// `a_b!.sqs...`, `a..b` with an empty inner label, `a.-b`, and a 64-character label
-// all loaded, and not one of them is a name DNS can answer.
+// `a_b.sqs...`, `a..b` with an empty inner label, `a.-b`, and a 64-character label all
+// loaded, and not one of them is a name DNS can answer.
 //
 // THAT IS THE SAME FAILURE AS THE WRONG PARTITION, which is why it is here rather
 // than filed as tidiness: a queue URL billet accepts but a node cannot address costs
-// the two-minute interruption warning, and it costs it silently — no error anywhere,
-// the lease charged until it expires.
+// the two-minute interruption warning, and costs it silently — no error anywhere, the
+// lease charged until it expires.
 //
-// WHAT IS NOT ASSERTED IS AWS'S `vpce-` SPELLING. The DNS suffixes were measured; the
+// WHAT IS NOT ASSERTED IS AWS'S `vpce-` SPELLING. The DNS suffixes were measured; an
 // endpoint's own label cannot be, without owning an endpoint. So a rule about it would
 // be a reading of the documentation, and several labels stay accepted: they are a
 // well-formed name inside AWS's own zone.
@@ -931,7 +946,8 @@ func TestASpotQueueVPCEndpointNeedsItsOwnLabel(t *testing.T) {
 		"no label at all":           "",
 		"an empty leading label":    ".",
 		"an empty inner label":      "a..b",
-		"an illegal character":      "a_b!",
+		"an underscore":             "a_b",
+		"a bang":                    "a!b",
 		"a trailing dot":            "vpce-0a1b.",
 		"a leading hyphen":          "-vpce",
 		"a trailing hyphen":         "vpce-",
@@ -948,7 +964,7 @@ func TestASpotQueueVPCEndpointNeedsItsOwnLabel(t *testing.T) {
 			got := loadErr(t, spotConfig(t, "us-west-2", vpceQueue(prefix)))
 
 			if !strings.Contains(got, "hostname label") {
-				t.Errorf("the error does not say the endpoint's own label is the problem: %s", got)
+				t.Errorf("the error does not say the host is not a hostname: %s", got)
 			}
 		})
 	}
@@ -977,7 +993,7 @@ func TestASpotQueueVPCEndpointNeedsItsOwnLabel(t *testing.T) {
 // valid labels are sixty valid labels and still not a name anything can look up. Both
 // sides of the boundary, because a bound asserted only from the refusing side is
 // satisfied by a check that refuses everything.
-func TestASpotQueueVPCEndpointHostIsBoundedInLength(t *testing.T) {
+func TestASpotQueueHostIsBoundedInLength(t *testing.T) {
 	t.Parallel()
 
 	t.Run("exactly 253", func(t *testing.T) {
@@ -985,7 +1001,7 @@ func TestASpotQueueVPCEndpointHostIsBoundedInLength(t *testing.T) {
 
 		body := spotConfig(t, "us-west-2", vpceQueue(vpcePrefixFilling(t, 253)))
 		if _, err := Load(writeConfig(t, body)); err != nil {
-			t.Fatalf("a 253-character host is the longest DNS name there is, and it was refused: %v", err)
+			t.Fatalf("253 characters is the longest DNS name there is, and it was refused: %v", err)
 		}
 	})
 
@@ -995,7 +1011,109 @@ func TestASpotQueueVPCEndpointHostIsBoundedInLength(t *testing.T) {
 		got := loadErr(t, spotConfig(t, "us-west-2", vpceQueue(vpcePrefixFilling(t, 254))))
 
 		if !strings.Contains(got, "hostname label") {
-			t.Errorf("the error does not name the endpoint host as the problem: %s", got)
+			t.Errorf("the error does not name the host as the problem: %s", got)
 		}
 	})
+}
+
+// THE HOST IS ASKED BEFORE IT IS CLASSIFIED, and the standard form is why.
+//
+// The hostname rule lived in the VPC-endpoint branch, where an over-long label could
+// only arrive as somebody's endpoint id. But node.ec2.region is deliberately a SHAPE
+// with no length cap — an allowlist of regions goes stale — so a 64-character region
+// builds an over-long label in `sqs.<region>.amazonaws.com`, which is a STANDARD host
+// that never goes near that branch. It matched its own interpolation exactly and
+// loaded, naming a label longer than DNS permits.
+func TestASpotQueueStandardHostIsAHostnameToo(t *testing.T) {
+	t.Parallel()
+
+	region := strings.Repeat("a", 64) + "-b-1"
+	if !awsRegionRe.MatchString(region) {
+		t.Fatalf("the region shape has changed, so this case no longer reaches the host rule: %q", region)
+	}
+
+	err := CheckSQSQueueURL(
+		"https://sqs."+region+".amazonaws.com/123456789012/aws-1", region)
+	if err == nil {
+		t.Fatal("a standard host with a 64-character label was accepted")
+	}
+
+	if !strings.Contains(err.Error(), "hostname label") {
+		t.Errorf("the error does not say the host is not a hostname: %v", err)
+	}
+}
+
+// A PORT IS PART OF WHAT GETS DIALLED, and url.Hostname() drops it.
+//
+// The SQS client addresses the queue URL's Host — port included — so
+// `sqs.<region>.<suffix>:1` matched the standard host exactly, loaded, and then
+// connected to port 1. The queue is unreachable and nothing said so, which is this
+// validator's whole failure mode. Loopback returns before this, which is what lets a
+// test point at an httptest server on its own port.
+func TestASpotQueueMayNotNameAnotherPort(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		queue  string
+		accept bool
+	}{
+		"port 1":            {"https://sqs.us-west-2.amazonaws.com:1/123456789012/aws-1", false},
+		"port 8080":         {"https://sqs.us-west-2.amazonaws.com:8080/123456789012/aws-1", false},
+		"a vpc endpoint":    {"https://vpce-0a1b" + vpceTail + ":9000/123456789012/aws-1", false},
+		"an explicit 443":   {"https://sqs.us-west-2.amazonaws.com:443/123456789012/aws-1", true},
+		"no port at all":    {"https://sqs.us-west-2.amazonaws.com/123456789012/aws-1", true},
+		"loopback on 44301": {"http://127.0.0.1:44301/123456789012/aws-1", true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			err := CheckSQSQueueURL(tc.queue, "us-west-2")
+			if tc.accept {
+				if err != nil {
+					t.Fatalf("a queue billet can reach was refused: %v", err)
+				}
+
+				return
+			}
+
+			if err == nil {
+				t.Fatal("a queue on a port SQS does not answer on was accepted")
+			}
+			if !strings.Contains(err.Error(), "443") {
+				t.Errorf("the error does not name the port SQS answers on: %v", err)
+			}
+		})
+	}
+}
+
+// A UNICODE HOST IS NOT THE HOST THAT WAS CHECKED.
+//
+// strings.ToLower is Unicode-aware, and U+0130 folds to an ASCII `i`. So 63 of them
+// are 126 bytes of hostname that become 63 ASCII characters — passing the label rule
+// and the length bound — while the name the node actually dials is neither the one
+// measured nor the one checked. Measured with Go's own folding rather than assumed.
+// The rule is therefore asked of the RAW hostname, before the fold.
+func TestASpotQueueHostIsCheckedBeforeItIsFolded(t *testing.T) {
+	t.Parallel()
+
+	// THE PREMISE, MEASURED WITH THIS GO rather than assumed: U+0130 folds to an
+	// ASCII byte, so 63 of them shrink from 126 bytes to 63 — a label that is only
+	// legal after the fold. If a future Go stops folding it, the case is moot rather
+	// than failing, and says so.
+	label := strings.Repeat("İ", 63)
+
+	folded := strings.ToLower(label)
+	if len(label) != 126 || len(folded) != 63 {
+		t.Skipf("this Go does not fold U+0130 into ASCII (%d bytes -> %d), so the case is moot",
+			len(label), len(folded))
+	}
+
+	err := CheckSQSQueueURL("https://"+label+vpceTail+"/123456789012/aws-1", "us-west-2")
+	if err == nil {
+		t.Fatal("a host that is only a hostname after folding was accepted")
+	}
+
+	if !strings.Contains(err.Error(), "hostname label") {
+		t.Errorf("the error does not say the host is not a hostname: %v", err)
+	}
 }
