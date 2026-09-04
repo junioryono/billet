@@ -619,7 +619,12 @@ func holdSchemaMigrations(t *testing.T, dsn string) (release func()) {
 
 	release = func() {
 		once.Do(func() {
-			_ = tx.Rollback()
+			// A ROLLBACK THAT FAILED IS A LOCK STILL HELD, and the test would then
+			// hang or fail somewhere that names neither; say so here.
+			if err := tx.Rollback(); err != nil {
+				t.Errorf("release the holder's lock on schema_migrations: %v", err)
+			}
+
 			_ = conn.Close()
 		})
 	}
