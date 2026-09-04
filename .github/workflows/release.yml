@@ -26,6 +26,15 @@ permissions:
 jobs:
   release:
     name: Build and publish
+    # ONLY WHEN THIS REPOSITORY IS THE ONE RUNNING IT. A reusable workflow can be
+    # called from any repository, and the certificate cosign obtains names the
+    # CALLED workflow under its own ref: a foreign caller would be issued
+    # `release.yml@refs/heads/main`, the exact identity every deployment trusts,
+    # over whatever source that caller checked out. The job never runs there,
+    # so no token is minted and no certificate exists to present. The other half
+    # of the guard, pinning the source repository extension in the verifier, is
+    # deliberately not enforced yet (internal/imagesource/verify.go).
+    if: github.repository == 'junioryono/billet'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
