@@ -46,6 +46,24 @@ Generate a `billet.yaml` that runs. It measures the host, writes a ceiling below
 | `--region`, `--subnet`, `--security-group` (repeatable), `--untrusted-security-group` (repeatable), `--instance-type` (repeatable), `--price type=usd` (repeatable), `--max-vcpu`, `--max-memory` | ec2: the region signed into every request, network, shapes (prices are fetched; `--price` overrides), and the required cloud budget |
 | `--codebuild-project`, `--codebuild-environment`, `--codebuild-fleet-arn`, `--codebuild-fleet-capacity`, `--compute-type NAME=vcpu,memory,price` (repeatable), `--jit-parameter-path`, `--jit-kms-key-id`, `--codebuild-log-group`, `--privileged`, `--build-timeout-minutes`, `--queued-timeout-minutes`, `--accept-external-build-ceiling` | codebuild: the dedicated project, environment type, reserved fleet and its capacity, ordered purchasable shapes, the parameter path the IAM policy is scoped to, and the acknowledgement of CodeBuild's 36-hour and 8-hour ceilings, which is required and changes nothing about how billet behaves |
 
+### `billet init hybrid`
+
+Generate the hybrid shape as one unit into `--out DIR`: a Terraform root over the billet module, an inventory with both hosts and one tier catalogue with ordered providers, the playbook, the collection pin and a numbered `RUNBOOK.md`. Three renders of one generation, selected by flags: with nothing extra the **plan** render carries a `<terraform output NAME>` placeholder for every fact the apply produces; with `--terraform-output` the **prepare** render fills them from `terraform output -json` and keeps the controller server-only and prepare-only, because the co-located node's certificate bundle does not exist until `billet ca issue` has run and the host role's `billet check` refuses a missing one; with `--commission` the controller gains the EC2 orchestrator and every tier's `launch.ec2.image` becomes `--ami`. A file is replaced only when its first line carries billet's marker; an operator's own file gets the fresh generation beside it at `<file>.new`.
+
+| Flag | Meaning |
+|---|---|
+| `--out` | the directory to write into (required) |
+| `--name`, `--region` | the Terraform name prefix and the region (region required) |
+| `--org`, `--runner-group`, `--workflow` (repeatable), `--config` | the organization, the trusted pool (omit both policy flags for untrusted tiers), and the file `github-app create` wrote the App identity into |
+| `--control-plane-private-ip` | the controller's address, declared into the root, `server.listen`, every `server_addr` and `ansible_host` before the apply |
+| `--controller-name`, `--local-name` | the two hosts' inventory and certificate names (defaults `<name>-control-plane`, `<name>-fc-1`) |
+| `--local-vcpu`, `--local-memory` | what the Firecracker host has (required); its contribution leaves headroom |
+| `--max-vcpu`, `--max-memory` | the cloud budget, which is the orchestrator's ceiling (required) |
+| `--instance-type` (repeatable), `--price` | `TYPE` (fetched from AWS) or `TYPE=vcpu,memory,usd` (declared, no credentials); `--price` overrides a fetched price |
+| `--ssh-ingress-cidr` (repeatable) | CIDRs that may SSH to the controller; empty for every route that dials out |
+| `--kernel-image`, `--ceph-user`, `--ceph-keyring`, `--cache-listen`, `--cache-guest-endpoint` | the Firecracker host's inputs, as for `--provider firecracker` |
+| `--terraform-output`, `--commission`, `--ami`, `--force` | the prepare render's facts, the commission render, its AMI, and replacing a file that is not billet's own |
+
 ### `billet init iam`
 
 Print the IAM policy this config's node role needs, derived from the config: cache adds EBS and S3, spot adds the queue, an instance profile adds `PassRole`.

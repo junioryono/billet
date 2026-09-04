@@ -319,6 +319,13 @@ jobs:
       - name: Prove every fetch is bounded and retried
         run: make fetch-retry-check
 
+      # The hybrid generator writes an inventory and a playbook that the Go
+      # tests parse with a YAML library. Ansible is what has to read them, and
+      # the anchor carrying one tier catalogue to both hosts is the seam a
+      # library and Ansible could disagree on.
+      - name: Prove the generated hybrid shape is one Ansible reads
+        run: make hybrid-emission-check
+
   # Both legs here need the real Debian package, so they share a job: `dist` is
   # phony and runs again for the second target, but the Go build cache is warm
   # by then and it costs about a minute.
@@ -426,6 +433,17 @@ jobs:
         # two-minute Spot warning is lost. Before this job existed it ran in no
         # CI job at all.
         run: make lambda-test
+
+      # The root `billet init hybrid` writes is HCL rendered as text, and only
+      # terraform can read it: a module input renamed on one side and not the
+      # other passes every Go test and fails an operator's first init.
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Prove the generated hybrid root validates against the module
+        run: make hybrid-root-check
 
   # The module declares required_version >= 1.9 for CONSUMERS, whose init
   # never parses the child's tests/ — but this repo's module directory cannot
