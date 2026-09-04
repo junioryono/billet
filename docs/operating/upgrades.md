@@ -51,6 +51,14 @@ release:
 
 Every release manifest and channel statement billet publishes is signed by `release.yml` running on `main`, because the cut button calls that workflow from `main`. Binaries before v0.6.1 carry a policy that accepted only a release-branch or tag identity, so on them `billet rollout start`, the automatic starter and `billet host-upgrade --version` refuse every manifest with `the manifest's signature does not satisfy this source's policy`. A fleet on v0.5.0 or v0.6.0 is moved once by the package or the Ansible host role, which install from the release's checksums rather than its manifest; from v0.6.1 it moves itself. The first rollout rehearsal found this on 2026-09-04 (UTC), in its first step.
 
+## A value-scoped builder grant strands a build in flight
+
+`billet ami build` tags its builder instance with an owner value that now carries the deployment id, and a per-deployment IAM policy (`billet init iam --deployment <id> --builder --payload-bucket <bucket>`, passed to `fleet-ec2` as `iam_policy_json`) admits only that form. A builder tagged the old way carries no id, so the narrowed policy denies every action on it: measured with `iam:SimulateCustomPolicy`, `CreateImage`, `TerminateInstances` and `GetConsoleOutput` all come back `implicitDeny`.
+
+That matters only across the upgrade, and only for a build that is running while you replace the policy. Its instance cannot be imaged, terminated or read by the role that started it, so it runs to its own timeout and you clean it up by hand.
+
+**Let any build finish before you replace a value-scoped policy**, then upgrade the binary, then the policy. Account-wide deployments (`--account-wide`, and every `fleet-ec2` rendering with no deployment id, which is what the module produces at apply time) are unaffected: their pattern matches both forms.
+
 ## What a host actually does
 
 Each host walks the same phases, and `billet rollout status` names them:

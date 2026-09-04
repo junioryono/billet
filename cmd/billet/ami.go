@@ -10,8 +10,10 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/deploymentid"
 	"github.com/junioryono/billet/internal/provider/ec2"
 	"github.com/junioryono/billet/internal/runnerrelease"
+	"github.com/junioryono/billet/internal/state"
 )
 
 // defaultRunnerVersion is the actions/runner release a build installs unless told
@@ -67,6 +69,11 @@ func cmdAMIBuild(ctx context.Context, args []string) error {
 		"REQUIRED. S3 bucket to stage the shared installers in, fetched by the builder "+
 			"through a presigned URL. They no longer fit EC2's 16 KiB user data and "+
 			"cannot be embedded")
+	deployment := fs.String("deployment", "",
+		"this deployment's identity, which scopes the builder's owner tag so a "+
+			"value-scoped IAM policy admits this build and no other deployment's "+
+			"(defaults to the id in the config's state directory; empty stamps the "+
+			"account-wide form, which only an --account-wide policy admits)")
 	region := fs.String("region", "", "override the region from the config")
 	subnet := fs.String("subnet", "", "override the subnet from the config")
 	group := fs.String("security-group", "", "override the security group from the config")
@@ -152,13 +159,20 @@ func cmdAMIBuild(ctx context.Context, args []string) error {
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 
-	// AN OWNER PER BUILD, not a constant. The owner tag is what separates one
+	// AN OWNER PER BUILD, AND PER DEPLOYMENT. The owner tag is what separates one
 	// deployment's compute from another's in a shared account, and a fixed string
-	// would put every build anyone ever runs under the same identity — so the
-	// recovery story this tag exists for ("find the builder that leaked") would
-	// return other people's machines. The image name is already unique per account
-	// and region, which is exactly the property needed.
-	p, err := ec2.New(ec2.BuilderOwnerPrefix+*name, cfg, ec2.WithLogger(log))
+	// would put every build anyone ever runs under one identity — so the recovery
+	// story this tag exists for ("find the builder that leaked") would return
+	// other people's machines. The image name is unique per account and region;
+	// the deployment id in front of it is what makes a value-scoped policy admit
+	// this build and refuse another deployment's, which it could not do while the
+	// builder's value carried no id at all (issue #56).
+	owner, err := builderOwner(*cfgPath, *deployment, *name)
+	if err != nil {
+		return err
+	}
+
+	p, err := ec2.New(owner, cfg, ec2.WithLogger(log))
 	if err != nil {
 		return fmt.Errorf("configure the ec2 client: %w", err)
 	}
@@ -193,7 +207,8 @@ func cmdAMIBuild(ctx context.Context, args []string) error {
 		// rebuild" as a broken build.
 		fmt.Printf("It was NOT verified, so it carries no AMI contract tag and `billet check`\n")
 		fmt.Printf("will report it as needing a rebuild. To boot it and stamp it:\n\n")
-		fmt.Printf("  billet ami verify %s\n\n", image)
+
+		fmt.Printf("  %s\n\n", verifyCommandFor(image, *deployment))
 	}
 	fmt.Printf("Put it in a tier:\n\n")
 	fmt.Printf("  - label: your-label\n")
@@ -217,6 +232,11 @@ func cmdAMIVerify(ctx context.Context, args []string) error {
 	cfgPath := addConfigFlag(fs)
 	shape := fs.String("instance-type", "",
 		"shape the verifier runs on (default: a small Nitro shape for the image's arch)")
+	deployment := fs.String("deployment", "",
+		"this deployment's identity, which scopes the builder's owner tag so a "+
+			"value-scoped IAM policy admits this build and no other deployment's "+
+			"(defaults to the id in the config's state directory; empty stamps the "+
+			"account-wide form, which only an --account-wide policy admits)")
 	region := fs.String("region", "", "override the region from the config")
 	subnet := fs.String("subnet", "", "override the subnet from the config")
 	group := fs.String("security-group", "", "override the security group from the config")
@@ -252,11 +272,17 @@ func cmdAMIVerify(ctx context.Context, args []string) error {
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 
-	// AN OWNER PER IMAGE, for the same reason a build takes one per name: the owner
-	// tag is what separates this verification's compute from any deployment's, and
-	// a fixed string would put every verification anyone ever runs under one
-	// identity. The image id is already unique per account and region.
-	p, err := ec2.New(ec2.BuilderOwnerPrefix+image, cfg, ec2.WithLogger(log))
+	// AN OWNER PER IMAGE, AND PER DEPLOYMENT, for the same reason a build takes
+	// one per name: the owner tag separates this verification's compute from any
+	// deployment's, a fixed string would put every verification anyone ever runs
+	// under one identity, and the deployment id is what lets a value-scoped
+	// policy tell this one from another deployment's.
+	owner, err := builderOwner(*cfgPath, *deployment, image)
+	if err != nil {
+		return err
+	}
+
+	p, err := ec2.New(owner, cfg, ec2.WithLogger(log))
 	if err != nil {
 		return fmt.Errorf("configure the ec2 client: %w", err)
 	}
@@ -317,4 +343,78 @@ func ec2ConfigFor(path, region, subnet, group string) (config.EC2Config, error) 
 	}
 
 	return cfg, nil
+}
+
+// builderOwner is the owner tag a build stamps, which decides whether a
+// value-scoped IAM policy admits it.
+//
+// THE ID COMES FROM THE SAME PLACE `billet init iam` READS IT, so the policy an
+// operator generated and the tag this stamps agree without them being told to
+// keep two flags in step: the deployment's state directory, where a control
+// plane mints the identity on first run and a node adopts it at enrolment. An
+// explicit --deployment wins, for a build run somewhere neither has been.
+//
+// NO ID IS THE ACCOUNT-WIDE FORM, and it says so, because that is the case an
+// operator cannot otherwise diagnose: `billet init iam --deployment <id>
+// --builder` renders a policy that admits only that deployment's builders, and a
+// build run from a laptop with no config stamps the account-wide value and is
+// denied at RunInstances with nothing naming the reason.
+func builderOwner(cfgPath, deployment, name string) (string, error) {
+	if deployment != "" {
+		if err := deploymentid.Validate(deployment); err != nil {
+			return "", fmt.Errorf("--deployment: %w", err)
+		}
+
+		return ec2.BuilderOwner(deployment, name), nil
+	}
+
+	// A BUILD NEEDS NO CONFIG AT ALL — --region, --subnet and --security-group
+	// are enough — so a config that is ABSENT is not an error here. A config that
+	// exists and does not parse is a different answer and is not folded into
+	// this one: an operator who pointed --config at a real deployment and
+	// mistyped it would otherwise get a silently account-wide build whose only
+	// symptom is a denial at RunInstances.
+	cfg, err := config.Load(cfgPath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("--config %s: %w", cfgPath, err)
+	}
+
+	if err == nil {
+		for _, dir := range deploymentStateDirs(cfg) {
+			id, found, err := state.PeekDeploymentID(dir)
+			if err != nil {
+				return "", err
+			}
+
+			if found {
+				return ec2.BuilderOwner(id, name), nil
+			}
+		}
+	}
+
+	fmt.Fprintf(os.Stderr, "NOTE: no deployment identity found, so this build is tagged %s. "+
+		"A policy from `billet init iam --deployment <id> --builder` will NOT admit it; "+
+		"pass --deployment, or point --config at a deployment that has one.\n\n",
+		ec2.BuilderOwner("", name))
+
+	return ec2.BuilderOwner("", name), nil
+}
+
+// verifyCommandFor renders the `billet ami verify` an unverified build prints.
+//
+// THE DEPLOYMENT TRAVELS WITH IT. Verification launches its own builder-tagged
+// instance, so it needs the owner value the build stamped or a value-scoped
+// policy denies it — and an explicit --deployment is exactly the case where the
+// machine running this has no state directory to resolve one from. A bare
+// command there is one that cannot run, and whose failure names an authorization
+// rather than the missing flag.
+//
+// An empty deployment adds nothing: the command resolves the id the same way the
+// build did, from the config it is pointed at.
+func verifyCommandFor(image, deployment string) string {
+	if deployment == "" {
+		return "billet ami verify " + image
+	}
+
+	return "billet ami verify " + image + " --deployment " + shellArg(deployment)
 }

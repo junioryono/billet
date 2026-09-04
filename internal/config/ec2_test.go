@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -734,5 +735,413 @@ func TestACloudEndpointMustNameAHostWithNoPath(t *testing.T) {
 				t.Errorf("endpoint %q was rejected: %v", endpoint, err)
 			}
 		})
+	}
+}
+
+// spotConfig is the cloud fixture with a chosen region and interruption queue.
+//
+// The node in ec2Node is named aws-1, so every queue basename here has to be aws-1
+// or CheckSQSQueueNode refuses it for a different reason than the one under test.
+func spotConfig(t *testing.T, region, queueURL string) string {
+	t.Helper()
+
+	return cloudConfig(t, "    region: us-west-2\n", "    region: "+region+"\n"+
+		"    spot: true\n"+
+		"    interruption_queue_url: "+queueURL+"\n")
+}
+
+// A QUEUE HOST BELONGS TO ITS REGION'S PARTITION, AND THE REGION PICKS IT.
+//
+// The validator used to admit EITHER DNS suffix for EVERY region, so a cn-north-1
+// node could name sqs.cn-north-1.amazonaws.com — which is not a host — while
+// `billet init iam` derived arn:aws-cn:sqs:... from the same region. The policy is
+// then right, the config loads, and the node signs a ReceiveMessage for a name that
+// does not resolve: the two-minute spot warning simply never arrives.
+//
+// MEASURED WITH dig ON 2026-09-04, because the endpoint tables read the other way
+// for the legacy and VPC-endpoint forms. Every standard and legacy host below was
+// resolved: the accepted ones answer and the refused ones are NXDOMAIN. GovCloud is
+// a separate partition that takes the COMMERCIAL suffix, which is why it is here — a
+// rule keyed on "is this the commercial partition" rather than on the region's own
+// prefix gets exactly that case wrong.
+func TestASpotQueueHostBelongsToItsRegionsPartition(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct{ region, queue string }{
+		// sqs.cn-north-1.amazonaws.com.cn -> 140.179.15.58
+		"china standard": {"cn-north-1",
+			"https://sqs.cn-north-1.amazonaws.com.cn/123456789012/aws-1"},
+		// cn-north-1.queue.amazonaws.com.cn is a CNAME onto the host above. This one
+		// was REFUSED before the fix: the legacy form was admitted only with the
+		// commercial suffix, so China's real legacy host was not a legal value.
+		"china legacy": {"cn-north-1",
+			"https://cn-north-1.queue.amazonaws.com.cn/123456789012/aws-1"},
+		"china vpc endpoint": {"cn-north-1",
+			"https://vpce-0a1b.sqs.cn-north-1.vpce.amazonaws.com.cn/123456789012/aws-1"},
+		// sqs.us-gov-west-1.amazonaws.com -> 56.136.121.58, and the .cn form is
+		// NXDOMAIN: GovCloud is its own partition on the commercial suffix.
+		"govcloud standard": {"us-gov-west-1",
+			"https://sqs.us-gov-west-1.amazonaws.com/123456789012/aws-1"},
+		"commercial standard": {"us-west-2",
+			"https://sqs.us-west-2.amazonaws.com/123456789012/aws-1"},
+		// us-west-2.queue.amazonaws.com -> 44.242.184.144.
+		"commercial legacy": {"us-west-2",
+			"https://us-west-2.queue.amazonaws.com/123456789012/aws-1"},
+		"commercial vpc endpoint": {"us-west-2",
+			"https://vpce-0a1b.sqs.us-west-2.vpce.amazonaws.com/123456789012/aws-1"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			if _, err := Load(writeConfig(t, spotConfig(t, tc.region, tc.queue))); err != nil {
+				t.Fatalf("a queue host in %s's own partition was refused: %v", tc.region, err)
+			}
+		})
+	}
+}
+
+// THE OTHER PARTITION'S SUFFIX NAMES NO HOST, so accepting it can only produce a
+// node that never hears a reclaim. Every case here loaded before the fix.
+//
+// The DIAGNOSTIC is asserted rather than the fact of an error: an operator who
+// copied the wrong suffix has to be told which hosts their region's partition
+// actually serves, and "an error came back" is also satisfied by any of the four
+// unrelated refusals earlier in the same validator.
+func TestASpotQueueHostFromTheOtherPartitionIsRefused(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct{ region, queue, wantHost string }{
+		"commercial suffix in china": {"cn-north-1",
+			"https://sqs.cn-north-1.amazonaws.com/123456789012/aws-1",
+			"sqs.cn-north-1.amazonaws.com.cn,"},
+		"commercial legacy in china": {"cn-north-1",
+			"https://cn-north-1.queue.amazonaws.com/123456789012/aws-1",
+			"sqs.cn-north-1.amazonaws.com.cn,"},
+		"commercial vpc endpoint in china": {"cn-north-1",
+			"https://vpce-0a1b.sqs.cn-north-1.vpce.amazonaws.com/123456789012/aws-1",
+			"sqs.cn-north-1.amazonaws.com.cn,"},
+		"china suffix in a commercial region": {"us-west-2",
+			"https://sqs.us-west-2.amazonaws.com.cn/123456789012/aws-1",
+			"sqs.us-west-2.amazonaws.com,"},
+		"china legacy in a commercial region": {"us-west-2",
+			"https://us-west-2.queue.amazonaws.com.cn/123456789012/aws-1",
+			"sqs.us-west-2.amazonaws.com,"},
+		"china vpc endpoint in a commercial region": {"us-west-2",
+			"https://vpce-0a1b.sqs.us-west-2.vpce.amazonaws.com.cn/123456789012/aws-1",
+			"sqs.us-west-2.amazonaws.com,"},
+		"china suffix in govcloud": {"us-gov-west-1",
+			"https://sqs.us-gov-west-1.amazonaws.com.cn/123456789012/aws-1",
+			"sqs.us-gov-west-1.amazonaws.com,"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			got := loadErr(t, spotConfig(t, tc.region, tc.queue))
+
+			if !strings.Contains(got, strconv.Quote(tc.region)) {
+				t.Errorf("the error does not name the region it signs for: %s", got)
+			}
+			if !strings.Contains(got, tc.wantHost) {
+				t.Errorf("the error does not name %s, the host %s's partition serves: %s",
+					tc.wantHost, tc.region, got)
+			}
+		})
+	}
+}
+
+// GOVCLOUD IS THE CASE A PARTITION-SHAPED RULE GETS WRONG. It is a partition of its
+// own, so a suffix chosen by asking "is this the commercial partition" would send it
+// to amazonaws.com.cn, where nothing answers.
+func TestTheDNSSuffixIsThePartitionsOwn(t *testing.T) {
+	t.Parallel()
+
+	for region, want := range map[string]string{
+		"cn-north-1":     "amazonaws.com.cn",
+		"cn-northwest-1": "amazonaws.com.cn",
+		"us-west-2":      "amazonaws.com",
+		"us-east-1":      "amazonaws.com",
+		"us-gov-west-1":  "amazonaws.com",
+		"us-gov-east-1":  "amazonaws.com",
+	} {
+		if got := AWSDNSSuffix(region); got != want {
+			t.Errorf("AWSDNSSuffix(%q) = %q, want %q", region, got, want)
+		}
+	}
+}
+
+// vpceTail is the suffix a us-west-2 VPC endpoint's own labels sit in front of.
+const vpceTail = ".sqs.us-west-2.vpce.amazonaws.com"
+
+// vpceQueue is a queue URL whose endpoint labels are prefix.
+func vpceQueue(prefix string) string {
+	return "https://" + prefix + vpceTail + "/123456789012/aws-1"
+}
+
+// vpcePrefixFilling builds endpoint labels making the whole HOST exactly n
+// characters, so the length bound is exercised by a name that is otherwise correct.
+//
+// IT PROVES ITS OWN OUTPUT, twice. A generator that quietly built a 251-character
+// host would leave the test green while asserting nothing about the boundary; and an
+// earlier version wrote a separator with nothing after it whenever the target was a
+// multiple of 64, producing the right LENGTH ending in an EMPTY LABEL — so a refusal
+// case would have exercised the label rule while claiming to exercise the bound. It
+// asserts the length and then asks isHostname, which is the rule under test.
+func vpcePrefixFilling(t *testing.T, n int) string {
+	t.Helper()
+
+	want := n - len(vpceTail)
+	if want < 1 {
+		t.Fatalf("a %d-character host leaves no room for an endpoint label", n)
+	}
+
+	var b strings.Builder
+	for b.Len() < want {
+		if b.Len() > 0 {
+			b.WriteByte('.')
+		}
+
+		// At least one character after every separator, so no label is ever empty.
+		run := min(want-b.Len(), 63)
+		if run < 1 {
+			t.Fatalf("cannot fill %d characters in whole labels", want)
+		}
+
+		b.WriteString(strings.Repeat("a", run))
+	}
+
+	prefix := b.String()
+	if got := len(prefix) + len(vpceTail); got != n {
+		t.Fatalf("the fixture built a %d-character host, not %d", got, n)
+	}
+
+	if n <= maxHostname && !isHostname(prefix+vpceTail) {
+		t.Fatalf("the fixture built a host that is not one: %q", prefix)
+	}
+
+	return prefix
+}
+
+// A QUEUE HOST HAS TO BE A HOSTNAME, LABEL BY LABEL.
+//
+// The VPC-endpoint form is matched by SUFFIX, because the labels in front are the
+// operator's endpoint id and billet cannot know them. A bare suffix match asks for
+// nothing at all in front of it, and a whole-name shape — an earlier version of this
+// check — pins only the first and last character. So `.sqs...` with no label,
+// `a_b.sqs...`, `a..b` with an empty inner label, `a.-b`, and a 64-character label all
+// loaded, and not one of them is a name DNS can answer.
+//
+// THAT IS THE SAME FAILURE AS THE WRONG PARTITION, which is why it is here rather
+// than filed as tidiness: a queue URL billet accepts but a node cannot address costs
+// the two-minute interruption warning, and costs it silently — no error anywhere, the
+// lease charged until it expires.
+//
+// WHAT IS NOT ASSERTED IS AWS'S `vpce-` SPELLING. The DNS suffixes were measured; an
+// endpoint's own label cannot be, without owning an endpoint. So a rule about it would
+// be a reading of the documentation, and several labels stay accepted: they are a
+// well-formed name inside AWS's own zone.
+func TestASpotQueueVPCEndpointNeedsItsOwnLabel(t *testing.T) {
+	t.Parallel()
+
+	refused := map[string]string{
+		"no label at all":           "",
+		"an empty leading label":    ".",
+		"an empty inner label":      "a..b",
+		"an underscore":             "a_b",
+		"a bang":                    "a!b",
+		"a trailing dot":            "vpce-0a1b.",
+		"a leading hyphen":          "-vpce",
+		"a trailing hyphen":         "vpce-",
+		"an inner leading hyphen":   "a.-b",
+		"an inner trailing hyphen":  "a-.b",
+		"an all-hyphen inner label": "a.---.b",
+		"a label of sixty-four":     strings.Repeat("a", 64),
+	}
+
+	for name, prefix := range refused {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			got := loadErr(t, spotConfig(t, "us-west-2", vpceQueue(prefix)))
+
+			if !strings.Contains(got, "hostname label") {
+				t.Errorf("the error does not say the host is not a hostname: %s", got)
+			}
+		})
+	}
+
+	accepted := map[string]string{
+		"one character":          "a",
+		"all digits":             "123",
+		"what aws hands out":     "vpce-0a1b2c3d4e5f6g7h8-abcdefgh",
+		"a zonal name":           "vpce-0a1b2c3d4e5f6g7h8-abcdefgh-us-west-2a",
+		"a punycode label":       "xn--k3h",
+		"a label of sixty-three": strings.Repeat("a", 63),
+	}
+
+	for name, prefix := range accepted {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			if _, err := Load(writeConfig(t, spotConfig(t, "us-west-2", vpceQueue(prefix)))); err != nil {
+				t.Fatalf("a well-formed VPC endpoint host was refused: %v", err)
+			}
+		})
+	}
+}
+
+// AND THE WHOLE HOST HAS A LENGTH, which the per-label rule does not imply: sixty
+// valid labels are sixty valid labels and still not a name anything can look up. Both
+// sides of the boundary, because a bound asserted only from the refusing side is
+// satisfied by a check that refuses everything.
+func TestASpotQueueHostIsBoundedInLength(t *testing.T) {
+	t.Parallel()
+
+	t.Run("exactly 253", func(t *testing.T) {
+		t.Parallel()
+
+		body := spotConfig(t, "us-west-2", vpceQueue(vpcePrefixFilling(t, 253)))
+		if _, err := Load(writeConfig(t, body)); err != nil {
+			t.Fatalf("253 characters is the longest DNS name there is, and it was refused: %v", err)
+		}
+	})
+
+	t.Run("one over", func(t *testing.T) {
+		t.Parallel()
+
+		got := loadErr(t, spotConfig(t, "us-west-2", vpceQueue(vpcePrefixFilling(t, 254))))
+
+		if !strings.Contains(got, "hostname label") {
+			t.Errorf("the error does not name the host as the problem: %s", got)
+		}
+	})
+}
+
+// THE HOST IS ASKED BEFORE IT IS CLASSIFIED, and the standard form is why.
+//
+// The hostname rule lived in the VPC-endpoint branch, where an over-long label could
+// only arrive as somebody's endpoint id. But node.ec2.region is deliberately a SHAPE
+// with no length cap — an allowlist of regions goes stale — so a 64-character region
+// builds an over-long label in `sqs.<region>.amazonaws.com`, which is a STANDARD host
+// that never goes near that branch. It matched its own interpolation exactly and
+// loaded, naming a label longer than DNS permits.
+func TestASpotQueueStandardHostIsAHostnameToo(t *testing.T) {
+	t.Parallel()
+
+	region := strings.Repeat("a", 64) + "-b-1"
+	if !awsRegionRe.MatchString(region) {
+		t.Fatalf("the region shape has changed, so this case no longer reaches the host rule: %q", region)
+	}
+
+	err := CheckSQSQueueURL(
+		"https://sqs."+region+".amazonaws.com/123456789012/aws-1", region)
+	if err == nil {
+		t.Fatal("a standard host with a 64-character label was accepted")
+	}
+
+	if !strings.Contains(err.Error(), "hostname label") {
+		t.Errorf("the error does not say the host is not a hostname: %v", err)
+	}
+}
+
+// A PORT IS PART OF WHAT GETS DIALLED, and url.Hostname() drops it.
+//
+// The SQS client addresses the queue URL's Host — port included — so
+// `sqs.<region>.<suffix>:1` matched the standard host exactly, loaded, and then
+// connected to port 1. The queue is unreachable and nothing said so, which is this
+// validator's whole failure mode. Loopback returns before this, which is what lets a
+// test point at an httptest server on its own port.
+func TestASpotQueueMayNotNameAnotherPort(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		queue  string
+		accept bool
+	}{
+		"port 1":            {"https://sqs.us-west-2.amazonaws.com:1/123456789012/aws-1", false},
+		"port 8080":         {"https://sqs.us-west-2.amazonaws.com:8080/123456789012/aws-1", false},
+		"a vpc endpoint":    {"https://vpce-0a1b" + vpceTail + ":9000/123456789012/aws-1", false},
+		"an explicit 443":   {"https://sqs.us-west-2.amazonaws.com:443/123456789012/aws-1", true},
+		"no port at all":    {"https://sqs.us-west-2.amazonaws.com/123456789012/aws-1", true},
+		"loopback on 44301": {"http://127.0.0.1:44301/123456789012/aws-1", true},
+
+		// ZERO-PADDED IS STILL 443. `:0443` is a decimal port that net.LookupPort
+		// resolves to 443 and every client dials as 443 (measured), so this is a
+		// REACHABLE queue — and a validator that refused it on the spelling would take
+		// a working config away at load, which is worse than the bug the port rule is
+		// for. The first version of that rule compared the text.
+		"a zero-padded 443": {"https://sqs.us-west-2.amazonaws.com:0443/123456789012/aws-1", true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			err := CheckSQSQueueURL(tc.queue, "us-west-2")
+			if tc.accept {
+				if err != nil {
+					t.Fatalf("a queue billet can reach was refused: %v", err)
+				}
+
+				return
+			}
+
+			if err == nil {
+				t.Fatal("a queue on a port SQS does not answer on was accepted")
+			}
+			if !strings.Contains(err.Error(), "443") {
+				t.Errorf("the error does not name the port SQS answers on: %v", err)
+			}
+		})
+	}
+}
+
+// A UNICODE HOST IS NOT THE HOST THAT WAS CHECKED.
+//
+// strings.ToLower is Unicode-aware, and U+0130 folds to an ASCII `i`. So 63 of them
+// are 126 bytes of hostname that become 63 ASCII characters — passing the label rule
+// and the length bound — while the name the node actually dials is neither the one
+// measured nor the one checked. Measured with Go's own folding rather than assumed.
+// The rule is therefore asked of the RAW hostname, before the fold.
+func TestASpotQueueHostIsCheckedBeforeItIsFolded(t *testing.T) {
+	t.Parallel()
+
+	// THE PREMISE, MEASURED WITH THIS GO rather than assumed: a non-ASCII rune whose
+	// ToLower is a single ASCII byte. Two exist — U+0130, the dotted capital I, folding
+	// to `i`, and U+212A, the Kelvin sign, folding to `k` — and this takes whichever
+	// still holds.
+	//
+	// IT FAILS RATHER THAN SKIPS when neither does. A skip would let a toolchain
+	// upgrade quietly delete the only case that tells checking the raw host from
+	// checking the folded one, and leave CI green while doing it. If Go's folding
+	// changes, somebody has to come and re-measure the premise, and a red test is what
+	// sends them.
+	var wide string
+
+	for _, candidate := range []string{"İ", "K"} {
+		if folded := strings.ToLower(candidate); len(candidate) > 1 && len(folded) == 1 {
+			wide = candidate
+
+			break
+		}
+	}
+
+	if wide == "" {
+		t.Fatal("no non-ASCII rune folds to a single ASCII byte in this Go, so the premise " +
+			"this guard rests on has changed and needs re-measuring")
+	}
+
+	label := strings.Repeat(wide, 63)
+
+	folded := strings.ToLower(label)
+	if len(label) <= 63 || len(folded) != 63 {
+		t.Fatalf("the fixture is not a label that only becomes legal by folding: %d bytes -> %d",
+			len(label), len(folded))
+	}
+
+	err := CheckSQSQueueURL("https://"+label+vpceTail+"/123456789012/aws-1", "us-west-2")
+	if err == nil {
+		t.Fatal("a host that is only a hostname after folding was accepted")
+	}
+
+	if !strings.Contains(err.Error(), "hostname label") {
+		t.Errorf("the error does not say the host is not a hostname: %v", err)
 	}
 }
