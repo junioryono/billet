@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/wirecert"
 )
 
@@ -512,11 +513,27 @@ func (p *actionsProxy) respond(req *http.Request, session *cacheSession) (*http.
 		}
 		req.Body = io.NopCloser(bytes.NewReader(replay))
 	}
+	// THE OBSERVATION IS RECORDED WHERE THE DISPOSITION IS FINAL. A CacheService
+	// call the handler answered was served; one the handler failed is either
+	// retried through GitHub (a splice, whatever billet intended) or, when it is
+	// bound to a reservation only billet holds, refused to the guest as
+	// unavailable. The calls actionsResponse decides on its own -- refused by
+	// the kill switch, or from a client billet does not serve -- are recorded
+	// there.
+	cacheCall := actionsCacheCall(req)
+	observe := func(ctx context.Context, outcome alloc.ActionsCache) {
+		if cacheCall {
+			p.service.observeActions(ctx, session, outcome)
+		}
+	}
+
 	reservationBound := strings.HasPrefix(req.URL.Path, actionsBlobPrefix)
 	if req.URL.Path == actionsFinalizePath && replay != nil {
 		var err error
 		reservationBound, err = p.service.actionsFinalizeReserved(req.Context(), replay, session)
 		if err != nil {
+			observe(req.Context(), alloc.ActionsCacheUnavailable)
+
 			return actionsBlobError(http.StatusBadGateway,
 				"Actions cache storage is unavailable"), true
 		}
@@ -524,28 +541,33 @@ func (p *actionsProxy) respond(req *http.Request, session *cacheSession) (*http.
 			if err != nil {
 				p.service.log.Warn("a reserved Actions cache finalization failed locally",
 					"instance", session.instance, "path", req.URL.Path, "error", err)
+				observe(req.Context(), alloc.ActionsCacheUnavailable)
 
 				return actionsBlobError(http.StatusBadGateway,
 					"Actions cache storage is unavailable"), true
 			}
 			response.Request = req
+			observe(req.Context(), alloc.ActionsCacheServed)
 
 			return response, true
 		}
 	}
 	if response, handled, err := p.service.actionsResponse(req, session); handled && err == nil {
 		response.Request = req
+		observe(req.Context(), alloc.ActionsCacheServed)
 
 		return response, true
 	} else if handled && err != nil {
 		if reservationBound {
 			p.service.log.Warn("a reserved Actions cache request failed locally",
 				"instance", session.instance, "path", req.URL.Path, "error", err)
+			observe(req.Context(), alloc.ActionsCacheUnavailable)
 
 			return actionsBlobError(http.StatusBadGateway, "Actions cache storage is unavailable"), true
 		}
 		p.service.log.Warn("Actions cache interception failed; retrying through GitHub",
 			"instance", session.instance, "path", req.URL.Path, "error", err)
+		observe(req.Context(), alloc.ActionsCacheSpliced)
 	} else if reservationBound {
 		p.service.log.Warn("a reserved Actions cache request cannot be passed to GitHub",
 			"instance", session.instance, "path", req.URL.Path)

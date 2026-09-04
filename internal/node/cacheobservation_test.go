@@ -124,42 +124,78 @@ func TestTheImageStoreObservationNamesWhatTheStoreAnswered(t *testing.T) {
 	}
 }
 
-// THE ACTIONS OBSERVATION IS WHAT INTERCEPTION DID FOR THE FIRST CacheService
-// CALL: served from the site store, refused by the kill switch, or spliced
-// upstream for a client billet does not serve locally.
+// THE ACTIONS OBSERVATION IS WHAT INTERCEPTION FINALLY DID FOR THE FIRST
+// CacheService CALL, driven through the proxy, where that is decided: served
+// from the site store, refused by the kill switch, spliced upstream for a client
+// billet does not serve locally OR for a local handler that failed and was
+// retried through GitHub, and unavailable for a reserved call that failed
+// locally and had nowhere to go.
 func TestTheActionsObservationNamesWhatInterceptionDid(t *testing.T) {
 	t.Parallel()
 
 	for name, tc := range map[string]struct {
 		allowed   bool
 		anonymous bool
-		want      alloc.ActionsCache
+		// storeErr makes the local handler fail on a call GitHub can still answer.
+		storeErr error
+		// reserved stages an upload archive on the session first, so the finalize
+		// is bound to a reservation only billet holds; the finalize then fails
+		// locally because nothing was uploaded to it.
+		reserved bool
+		want     alloc.ActionsCache
+		status   int
 	}{
-		"served":   {allowed: true, want: alloc.ActionsCacheServed},
+		"served":   {allowed: true, want: alloc.ActionsCacheServed, status: http.StatusOK},
 		"disabled": {allowed: false, want: alloc.ActionsCacheDisabled},
 		"spliced":  {allowed: true, anonymous: true, want: alloc.ActionsCacheSpliced},
+		"spliced after a local failure": {
+			allowed: true, storeErr: errors.New("rbd: pool is read-only"),
+			want: alloc.ActionsCacheSpliced,
+		},
+		"unavailable on a reserved failure": {
+			allowed: true, reserved: true,
+			want: alloc.ActionsCacheUnavailable, status: http.StatusBadGateway,
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			service, _, session, _ := testActionsService(t)
+			service, storage, session, _ := testActionsService(t)
+			storage.createErr = tc.storeErr
 			observer := &recordingObserver{}
 			service.SetCacheObserver(observer)
 			service.SetActionsPolicy(actionsPolicyFunc(func(context.Context, string, string) (bool, error) {
 				return tc.allowed, nil
 			}))
+			proxy := service.actionsProxy()
+			if proxy == nil {
+				t.Fatal("the intercepting session has no proxy")
+			}
 
-			create := actionsRequestForTest(t, http.MethodPost,
-				"https://"+actionsResultsHost+actionsCreatePath, `{"key":"linux-npm-abc","version":"v1"}`)
+			path, body := actionsCreatePath, `{"key":"linux-npm-abc","version":"v1"}`
+			if tc.reserved {
+				session.mu.Lock()
+				session.actions["reserved"] = &actionsArchive{
+					ID: "reserved", Mode: actionsModeUpload, CacheKey: "linux-npm-abc",
+					Version: "v1", StoreKey: "k",
+				}
+				session.mu.Unlock()
+				path, body = actionsFinalizePath, `{"key":"linux-npm-abc","version":"v1","size_bytes":"4"}`
+			}
+
+			first := actionsRequestForTest(t, http.MethodPost, "https://"+actionsResultsHost+path, body)
 			if tc.anonymous {
 				// A client billet does not recognise: not the toolkit, not the
 				// loopback adapter. It goes upstream, and that is what is observed.
-				create.Header.Del("User-Agent")
+				first.Header.Del("User-Agent")
 			}
 
-			response, _, err := service.actionsResponse(create, session)
-			if err != nil {
-				t.Fatalf("actionsResponse: %v", err)
+			response, handled := proxy.respond(first, session)
+			if handled != (tc.status != 0) {
+				t.Fatalf("respond handled=%t, want %t", handled, tc.status != 0)
+			}
+			if handled && response.StatusCode != tc.status {
+				t.Fatalf("respond status = %d, want %d", response.StatusCode, tc.status)
 			}
 			closeActionsResponse(t, response)
 
@@ -173,20 +209,14 @@ func TestTheActionsObservationNamesWhatInterceptionDid(t *testing.T) {
 			// does a second call, because the first observation is kept.
 			blob := actionsRequestForTest(t, http.MethodHead,
 				"https://"+actionsResultsHost+actionsBlobPrefix+"nothing", "")
-			blobResponse, _, err := service.actionsResponse(blob, session)
-			if err != nil {
-				t.Fatalf("blob actionsResponse: %v", err)
-			}
+			blobResponse, _ := proxy.respond(blob, session)
 			closeActionsResponse(t, blobResponse)
 			again := actionsRequestForTest(t, http.MethodPost,
 				"https://"+actionsResultsHost+actionsCreatePath, `{"key":"linux-npm-def","version":"v1"}`)
 			if tc.anonymous {
 				again.Header.Del("User-Agent")
 			}
-			secondResponse, _, err := service.actionsResponse(again, session)
-			if err != nil {
-				t.Fatalf("second actionsResponse: %v", err)
-			}
+			secondResponse, _ := proxy.respond(again, session)
 			closeActionsResponse(t, secondResponse)
 			if told := observer.recorded(); len(told) != 1 {
 				t.Fatalf("observer was told %d times, want the first observation only", len(told))

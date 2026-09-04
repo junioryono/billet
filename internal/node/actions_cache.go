@@ -163,7 +163,9 @@ func (s *CacheService) actionsResponse(
 	session *cacheSession,
 ) (*http.Response, bool, error) {
 	// A CacheService call is what the observation is about. The blob legs that
-	// follow a served call, and everything on the artifact side, are not.
+	// follow a served call, and everything on the artifact side, are not. Only
+	// the dispositions decided HERE are recorded here; a call that goes to a
+	// handler is recorded by the proxy, once the handler has answered.
 	cacheCall := actionsCacheCall(req)
 
 	if !actionsLocalRequest(req) {
@@ -205,9 +207,10 @@ func (s *CacheService) actionsResponse(
 
 		return nil, false, nil
 	}
-	if cacheCall {
-		s.observeActions(req.Context(), session, alloc.ActionsCacheServed)
-	}
+	// A CALL THAT IS ANSWERED HERE IS NOT OBSERVED HERE. Whether the guest was
+	// served is known only once the handler has answered, and a handler that
+	// fails is retried through GitHub by the proxy, which is where the final
+	// disposition is recorded.
 	// Resolved once, from the request, and checked there: a signed URL must name
 	// an origin this client can reach without TLS, and only the request says
 	// which that is.

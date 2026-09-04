@@ -49,6 +49,10 @@ func (c ImageCache) Valid() bool {
 
 // ActionsCache is what the Actions cache interception did for the FIRST
 // CacheService request a job made, as the node saw it.
+//
+// RECORDED WHEN THE DISPOSITION IS FINAL, not when it is intended: a call the
+// site store failed to answer is retried through GitHub, and what the guest
+// got was a splice, whatever billet set out to do.
 type ActionsCache string
 
 const (
@@ -60,6 +64,11 @@ const (
 	ActionsCacheSpliced ActionsCache = "spliced"
 	// ActionsCacheDisabled means the central kill switch refused the request.
 	ActionsCacheDisabled ActionsCache = "disabled"
+	// ActionsCacheUnavailable means the request was bound to a reservation
+	// billet holds, failed locally, and could not go upstream because GitHub
+	// has nothing to answer it with; the guest was told the cache was
+	// unavailable.
+	ActionsCacheUnavailable ActionsCache = "unavailable"
 	// ActionsCacheOff means the session had no interception at all: the tier does
 	// not intercept, or the work was untrusted.
 	ActionsCacheOff ActionsCache = "off"
@@ -72,7 +81,7 @@ const (
 func (c ActionsCache) Valid() bool {
 	switch c {
 	case ActionsCacheServed, ActionsCacheSpliced, ActionsCacheDisabled,
-		ActionsCacheOff, ActionsCacheUnused:
+		ActionsCacheUnavailable, ActionsCacheOff, ActionsCacheUnused:
 		return true
 	}
 

@@ -33,7 +33,8 @@
 -- guest's Docker image store clone did (warm, cold, unavailable, unused) and
 -- cache_generation the generation a warm clone resolved; actions_cache is what
 -- the Actions cache interception did for the first CacheService request (served,
--- spliced, disabled by the kill switch, off, unused). The FIRST observation is
+-- spliced, disabled by the kill switch, unavailable, off, unused), recorded
+-- once the disposition is final rather than when it is intended. The FIRST observation is
 -- kept, on the lease and on the history row alike, and it is written onto the
 -- history row the moment it is observed rather than left to the archive, for the
 -- reason migration 35 gives for a disruption. The empty string is the zero value
