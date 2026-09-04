@@ -369,12 +369,10 @@ rehearsal_install_app_key() {
 
 # rehearsal_install_config writes a host's /etc/billet/billet.yaml from stdin
 # with the mode and owner the package would have given it.
-# NO `local` IN HERE. This is the one function the scripts use as the sink of a
-# pipeline whose left side is a brace group holding here-documents, and on the
-# Mac's bash 3.2 every such call printed `local: can only be used in a function`
-# against the here-document's line (2026-09-04, three rehearsals; a smaller probe
-# of the same shape does not reproduce it). The positional parameter needs no
-# declaration, so there is nothing for that shell to get wrong.
+# The positional parameter needs no declaration. (A `local` here was once
+# suspected of the "local: can only be used in a function" message the first
+# rehearsals printed; the cause was a backtick pair inside an unquoted
+# here-document in the callers, and a function stays a function in a pipeline.)
 rehearsal_install_config() {
     docker exec -i "$1" sh -c 'cat >/tmp/billet.yaml' &&
         docker exec "$1" install -m 0640 -o root -g billet /tmp/billet.yaml /etc/billet/billet.yaml &&
