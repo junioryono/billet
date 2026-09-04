@@ -14,6 +14,40 @@ import (
 
 const cacheSessionDirectory = "cache-sessions"
 
+// errSessionFinished is what a write to a session's record gets once cleanup
+// has removed it: the compute is gone, and a record written now would load on
+// the next start as a session for compute that does not exist.
+var errSessionFinished = errors.New("node: the cache session has finished and writes no record")
+
+// validateSessionLease checks the lease a session claims to run under.
+//
+// THE LEASE MUST NAME THIS INSTANCE. Instances are named after their lease
+// (provider.InstanceName), so a record whose lease does not produce its own
+// instance name attributes what this guest saw to some other job; a record
+// from before the session carried a lease names none and carries epoch zero.
+// A fresh lease's epoch IS zero, so the epoch is checked for sign, not for
+// being positive.
+func validateSessionLease(instance, leaseID string, epoch int64) error {
+	if leaseID == "" {
+		if epoch != 0 {
+			return fmt.Errorf("node: cache session for %s carries epoch %d with no lease", instance, epoch)
+		}
+
+		return nil
+	}
+
+	if provider.InstanceName(leaseID) != instance {
+		return fmt.Errorf("node: cache session for %s claims lease %q, which names a different instance",
+			instance, leaseID)
+	}
+
+	if epoch < 0 {
+		return fmt.Errorf("node: cache session for %s carries a negative epoch %d", instance, epoch)
+	}
+
+	return nil
+}
+
 type durableCacheSession struct {
 	Token       string                                `json:"token"`
 	Instance    string                                `json:"instance"`
@@ -97,6 +131,9 @@ func (r durableCacheSession) valid(filename string) error {
 	if r.Trust != provider.TrustTrusted && r.Trust != provider.TrustUntrusted {
 		return fmt.Errorf("node: cache custody file %s has unknown trust %q", filename, r.Trust)
 	}
+	if err := validateSessionLease(r.Instance, r.LeaseID, r.Epoch); err != nil {
+		return fmt.Errorf("node: cache custody file %s: %w", filename, err)
+	}
 	if r.Intercept {
 		if err := validateActionsScope(CacheSessionScope{
 			Trust: r.Trust, Intercept: true, Owner: r.Owner, Repository: r.Repository,
@@ -122,7 +159,17 @@ func (r durableCacheSession) valid(filename string) error {
 }
 
 // persistSession is called while session.mu is held.
+//
+// A FINISHED SESSION WRITES NOTHING, whoever asks. Cleanup removes the record
+// and the indexes together, and a handler that was still running -- a late
+// finalize against a receipt cleanup does not clear -- would otherwise put the
+// record back as an orphan. Refusing here, at the one place every write goes
+// through, is what makes that impossible rather than merely guarded.
 func (s *CacheService) persistSession(session *cacheSession) error {
+	if session.finished {
+		return errSessionFinished
+	}
+
 	record := durableCacheSession{
 		Token: session.token, Instance: session.instance, Trust: session.trust,
 		Owner: session.owner, Repository: session.repository, WorkflowRef: session.workflowRef,

@@ -79,7 +79,7 @@ func observedService(t *testing.T, storage *fakeCacheStore) (*CacheService, *rec
 	// THE SESSION NAMES ITS LEASE, the way the runner's launch scopes it, so an
 	// observation is attributable after the runner has forgotten the instance.
 	credentials, err := service.PrepareScoped("billet-one", CacheSessionScope{
-		Trust: provider.TrustTrusted, LeaseID: "lease-one", Epoch: 3,
+		Trust: provider.TrustTrusted, LeaseID: "one", Epoch: 3,
 	})
 	if err != nil {
 		t.Fatalf("PrepareScoped: %v", err)
@@ -126,9 +126,9 @@ func TestTheImageStoreObservationNamesWhatTheStoreAnswered(t *testing.T) {
 
 			calls := observer.recorded()
 			if len(calls) != 1 || calls[0].instance != "billet-one" || calls[0].obs != tc.want ||
-				calls[0].leaseID != "lease-one" || calls[0].epoch != 3 {
+				calls[0].leaseID != "one" || calls[0].epoch != 3 {
 				t.Fatalf("observer was told %+v, want one observation %+v for billet-one under "+
-					"lease-one at epoch 3", calls, tc.want)
+					"lease one at epoch 3", calls, tc.want)
 			}
 		})
 	}
@@ -323,9 +323,9 @@ func TestAnUnreportedObservationIsResentAfterARestart(t *testing.T) {
 		ImageCache: alloc.ImageCacheWarm, CacheGeneration: "gen-3", ActionsCache: alloc.ActionsCacheOff,
 	}
 	if len(calls) != 1 || calls[0].instance != "billet-one" || calls[0].obs != want ||
-		calls[0].leaseID != "lease-one" || calls[0].epoch != 3 {
+		calls[0].leaseID != "one" || calls[0].epoch != 3 {
 		t.Fatalf("the restarted service told its observer %+v, want %+v for billet-one under "+
-			"lease-one at epoch 3, which only the session record can name after a restart",
+			"lease one at epoch 3, which only the session record can name after a restart",
 			calls, want)
 	}
 }
@@ -416,6 +416,72 @@ func TestAnInterruptedFirstActionsCallStaysUnknownAfterARestart(t *testing.T) {
 	if len(calls) != 1 || calls[0].obs != want {
 		t.Fatalf("the restarted service told its observer %+v, want %+v with the Actions half "+
 			"left unknown", calls, want)
+	}
+}
+
+// A SESSION'S LEASE MUST NAME ITS OWN INSTANCE, at creation and on load, or a
+// record could attribute what one guest saw to another job's lease.
+func TestASessionRefusesALeaseThatNamesAnotherInstance(t *testing.T) {
+	t.Parallel()
+
+	service, _, _ := observedService(t, &fakeCacheStore{})
+
+	for name, scope := range map[string]CacheSessionScope{
+		"another instance's lease": {Trust: provider.TrustTrusted, LeaseID: "two", Epoch: 1},
+		"an epoch with no lease":   {Trust: provider.TrustTrusted, Epoch: 1},
+		"a negative epoch":         {Trust: provider.TrustTrusted, LeaseID: "other", Epoch: -1},
+	} {
+		if _, err := service.PrepareScoped("billet-other", scope); err == nil {
+			t.Errorf("PrepareScoped accepted %s: %+v", name, scope)
+		}
+	}
+
+	// A FRESH LEASE'S EPOCH IS ZERO, and a record from before the session
+	// carried a lease names none; both are ordinary.
+	if _, err := service.PrepareScoped("billet-fresh", CacheSessionScope{
+		Trust: provider.TrustTrusted, LeaseID: "fresh",
+	}); err != nil {
+		t.Errorf("PrepareScoped refused a fresh lease at epoch zero: %v", err)
+	}
+	if _, err := service.PrepareScoped("billet-legacy", CacheSessionScope{
+		Trust: provider.TrustTrusted,
+	}); err != nil {
+		t.Errorf("PrepareScoped refused a session naming no lease: %v", err)
+	}
+
+	// AND ON LOAD, where the record is whatever is on disk.
+	record := durableCacheSession{
+		Token: "aa", Instance: "billet-other", Trust: provider.TrustTrusted, LeaseID: "two",
+	}
+	if err := record.valid("aa.json"); err == nil {
+		t.Error("a record whose lease names another instance loaded")
+	}
+}
+
+// A FINISHED SESSION WRITES NO RECORD, whoever asks: the one write path refuses,
+// so a late handler cannot put an orphan back for the next start to load.
+func TestAFinishedSessionWritesNoRecord(t *testing.T) {
+	t.Parallel()
+
+	service, _, token := observedService(t, &fakeCacheStore{})
+
+	service.mu.Lock()
+	session := service.byToken[token]
+	service.mu.Unlock()
+
+	if err := service.Cleanup(t.Context(), "billet-one"); err != nil {
+		t.Fatalf("Cleanup: %v", err)
+	}
+
+	session.mu.Lock()
+	err := service.persistSession(session)
+	session.mu.Unlock()
+
+	if !errors.Is(err, errSessionFinished) {
+		t.Fatalf("a write to a finished session was answered %v, want errSessionFinished", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(service.stateDir, token+".json")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("the finished session's record is back: %v", statErr)
 	}
 }
 

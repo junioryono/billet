@@ -462,6 +462,9 @@ func (s *CacheService) PrepareScoped(
 			return CacheCredentials{}, err
 		}
 	}
+	if err := validateSessionLease(instance, scope.LeaseID, scope.Epoch); err != nil {
+		return CacheCredentials{}, err
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
