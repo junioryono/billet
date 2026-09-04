@@ -103,10 +103,10 @@
 // `arn:aws:ec2:*:*:snapshot/*` denies both. So this statement takes the wildcard,
 // the same shape BilletCacheSnapshotCreate and BilletAMIBuilderImage already use.
 //
-// NOTHING BILLET DOES IS DENIED BY IT, and that rests on two live measurements
-// rather than a simulator: billet's own RunInstances names no snapshot
-// (setBlockDevices writes DeleteOnTermination and VolumeSize, never a SnapshotId)
-// and a cache clone goes through CreateVolume, which is a different action.
+// NOTHING BILLET SENDS IS DENIED BY IT: billet's own RunInstances names no
+// snapshot (setBlockDevices writes DeleteOnTermination and VolumeSize, never a
+// SnapshotId) and a cache clone goes through CreateVolume, which is a different
+// action.
 //
 // ASKED OF EC2 ITSELF, 2026-09-04, three RunInstances --dry-run calls under a
 // throwaway role holding exactly the rendering below, against the account's real
@@ -116,16 +116,21 @@
 //	this policy, that snapshot in a mapping       UnauthorizedOperation, explicit deny
 //	the PREVIOUS policy, the same mapping         DryRunOperation
 //
-// The third line is what the guard is for: before this statement the launch was
-// authorized, and it attaches a volume holding the deployment identity and the CA
-// key to a machine that runs somebody's workflow. The first says billet's own
-// launch is untouched, and it also settles the AMI question a simulation cannot
-// reach: a launch from an EBS-backed AMI whose backing snapshot is UNTAGGED is
-// allowed, so that snapshot is not in the authorization context, while a snapshot
-// the mapping NAMES is. And EC2's own refusal names the resource it evaluated,
-// `arn:aws:ec2:us-west-2::snapshot/snap-…` — account-less, as the section above
-// says, which the wildcard account matches and would keep matching if that ever
-// changed.
+// The third line is what the guard is for: before this statement EC2 AUTHORIZED
+// that request, and what it attaches is a volume holding the deployment identity
+// and the CA key, to a machine that runs somebody's workflow. (A dry run answers
+// the authorization question and no other, which is the question here; it says
+// nothing about capacity.) The first line says billet's own launch is untouched,
+// and it answers the AMI question a simulation cannot reach: that launch was
+// allowed although the AMI's own backing snapshot is untagged, so the AMI's
+// backing snapshot was not evaluated while a snapshot the mapping NAMES was. That
+// is measured for the image the acceptance lane boots and the request billet
+// sends, which is the case that matters — and if AWS ever changed it, the failure
+// is a refused launch rather than a widened grant, which is the direction this
+// package chooses everywhere. EC2's own refusal also names the resource it
+// evaluated, `arn:aws:ec2:us-west-2::snapshot/snap-…` — account-less, as the
+// section above says, which the wildcard account matches and would keep matching
+// if that spelling ever changed.
 //
 // WHAT IT DOES NOT CLOSE, in account-wide mode, is another billet deployment's
 // TAGGED snapshot — the same limitation BilletCacheCloneSource states one section
@@ -139,8 +144,9 @@
 // The snapshot deny above gets NO builder exemption, which is deliberate in both
 // directions: a build launches from a base image and from the image it just made,
 // and neither names a snapshot, so an exemption would authorize nothing it needs —
-// and it could not help even in principle, because CreateImage tags only the
-// image, so a builder's own backing snapshots carry no owner tag to match.
+// and with the CreateImage request billet sends today it could not help anyway,
+// because that request tags only the image, so a builder's own backing snapshots
+// carry no owner tag for an exemption to match.
 //
 // VALIDATED AGAINST A LIVE AWS ACCOUNT with iam:SimulateCustomPolicy in both
 // modes: every action billet performs is allowed for its own tagged resources with
