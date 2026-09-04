@@ -70,7 +70,8 @@ func (*postgresBackend) sharedLedger() bool { return true }
 // error this package can classify and retry, on the caller's own terms, instead
 // of blocking inside the server past a deadline the caller thought it had. It is
 // the same argument as SQLite's deliberately short busy_timeout: the waiting
-// belongs in Go, where the context is real.
+// belongs in Go, where the context is real. The one transaction it does not
+// bound is the migration's, which widens it for itself — see beginMigration.
 //
 // default_transaction_read_only IS THE READER'S REFUSAL. It is the counterpart
 // of SQLite's query_only, and it matters for the same reason: the narrow Querier
@@ -372,6 +373,42 @@ func (b *postgresBackend) beginWrite(ctx context.Context, tx *sql.Tx) error {
 	}
 
 	return nil
+}
+
+// beginMigration lets the migration's statements wait for their locks.
+//
+// THE WRITER'S lock_timeout IS FOR SCHEDULING WRITES, AND A MIGRATION IS NOT
+// ONE. Fifty milliseconds is right for a write whose caller has a real deadline
+// and a loop that classifies contention and retries on its own terms — and that
+// loop covers beginning the transaction and nothing after it, correctly, because
+// a caller's closure may not run twice. A migration's statements are DDL: they
+// take locks on tables and catalogue rows that the advisory lock says nothing
+// about, and a CREATE TABLE that waited fifty milliseconds behind any other
+// session — a second control plane starting, a restore, a client transaction
+// left open, or the parallel schema builds of billet's own test suite — was
+// cancelled, and the cancellation was the result of opening the ledger.
+//
+// SET LOCAL, so it reverts at COMMIT or ROLLBACK and the pool's single
+// connection is back on fifty milliseconds for the next scheduling write. The
+// advisory lock has already been taken under that timeout by the time this
+// runs, so what is widened is only the statements after it.
+//
+// WHAT BOUNDS IT IS THE CONTEXT. pgx cancels a running statement when the
+// context ends, the server answers 57014, and asCancellation translates that
+// into the caller's own deadline; migrate makes sure there is one.
+func (*postgresBackend) beginMigration(ctx context.Context, tx *sql.Tx) error {
+	//billet:ignore rawsql // a transaction-local server setting, not a query over billet's tables
+	if _, err := tx.ExecContext(ctx, `SET LOCAL lock_timeout = 0`); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (*postgresBackend) migrationTimeoutAdvice() string {
+	return "Another session is most likely holding a lock on the ledger's tables: a second " +
+		"control plane starting, a restore, or a transaction a client left open. " +
+		"pg_stat_activity and pg_locks name it; end it and start billet again."
 }
 
 // snapshotInto refuses, and the refusal is the design rather than a gap.
