@@ -208,6 +208,43 @@ func TestAnAcceptanceRunIsNeverOnAutomaticUpdates(t *testing.T) {
 	}
 }
 
+// THE NODE THAT DEFINES AN ANCHOR IS REFUSED, NOT REPLACED. Dropping it would leave
+// every alias dangling and the derived file unparseable; carrying the anchor onto
+// the new `false` would silently flip every other use. The base itself loads,
+// which is what makes this the derivation's refusal and not the loader's.
+func TestAnAnchoredAutomaticIsRefusedRatherThanRewritten(t *testing.T) {
+	t.Parallel()
+
+	body := strings.Replace(acceptanceBaseConfig,
+		"  lock_dir: /run/billet/locks\n",
+		"  lock_dir: /run/billet/locks\n  allow_unlocked_deployment: *enabled\n", 1)
+	body = "release:\n  automatic: &enabled true\n" + body
+
+	if !strings.Contains(body, "*enabled") || !strings.HasPrefix(body, "release:") {
+		t.Fatal("the fixture did not take, so this test proves nothing about anchors")
+	}
+
+	if _, err := config.Parse("the fixture", []byte(body)); err != nil {
+		t.Fatalf("the fixture must load before the derivation can be the one refusing: %v", err)
+	}
+
+	base := writeAcceptanceBase(t, body)
+
+	_, err := deriveAcceptance(t.Context(), acceptanceInputs{
+		base:      base,
+		workspace: t.TempDir(),
+		prefix:    defaultLabelPrefix,
+	})
+	if err == nil {
+		t.Fatal("a base whose release.automatic defines an anchor was derived; the aliases of that " +
+			"anchor are dangling in the derived file, or were silently flipped")
+	}
+
+	if !strings.Contains(err.Error(), "&enabled") {
+		t.Errorf("the refusal does not name the anchor: %v", err)
+	}
+}
+
 // THE TIER LABELS ARE THE SCALE SETS, so this is the assertion the teardown's
 // safety rests on: `billet acceptance down` runs `teardown --all` against the
 // derived config, which deletes the scale set of every tier in it.

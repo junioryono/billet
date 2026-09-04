@@ -110,7 +110,9 @@ func rewriteForAcceptance(root *yaml.Node, dir, prefix, listen string) ([]string
 	// deployment began moving itself to v0.6.0 a minute after boot). An
 	// acceptance run proves the tree it was built from, never the channel; the
 	// rest of a `release:` block the base carries is left alone.
-	forceScalar(ensureMapping(root, "release"), "automatic", "false")
+	if err := forceScalar(ensureMapping(root, "release"), "automatic", "false"); err != nil {
+		return nil, err
+	}
 
 	labels, err := prefixTierLabels(root, prefix)
 	if err != nil {
@@ -342,12 +344,24 @@ func joinComments(a, b string) string {
 // for an alias: an AliasNode keeps its Kind and its Alias pointer, renders as a
 // reference to whatever the anchor still says, and a boolean written through
 // `automatic: *shared` would have come out unchanged or unparseable. Replacing
-// the node breaks only this reference; the anchor and every other use of it
-// stay as the operator wrote them, and so do the key's comments.
-func forceScalar(m *yaml.Node, key, value string) {
+// the node breaks only this reference; an anchor defined ELSEWHERE and every
+// other use of it stay as the operator wrote them, and so do the key's comments.
+//
+// A node that itself DEFINES an anchor is refused rather than replaced. Dropping
+// the anchor leaves every alias of it dangling, so the derived file would not
+// parse; carrying the anchor onto the new value would silently change every
+// other place the operator used it. Neither is a derivation, so the operator is
+// asked to write the value out where it is aliased.
+func forceScalar(m *yaml.Node, key, value string) error {
 	for i := 0; i+1 < len(m.Content); i += 2 {
 		if isKey(m.Content[i], key) {
 			old := m.Content[i+1]
+			if old.Anchor != "" {
+				return fmt.Errorf("%s defines the anchor &%s, which other values alias; an acceptance run "+
+					"sets it to %s and cannot rewrite the anchor's other uses, so spell those out "+
+					"in the base config and remove the anchor", key, old.Anchor, value)
+			}
+
 			m.Content[i+1] = &yaml.Node{
 				Kind:        yaml.ScalarNode,
 				Value:       value,
@@ -356,13 +370,15 @@ func forceScalar(m *yaml.Node, key, value string) {
 				FootComment: old.FootComment,
 			}
 
-			return
+			return nil
 		}
 	}
 
 	m.Content = append(m.Content,
 		&yaml.Node{Kind: yaml.ScalarNode, Value: key},
 		&yaml.Node{Kind: yaml.ScalarNode, Value: value})
+
+	return nil
 }
 
 // prefixScalar prefixes an existing scalar, and does nothing when the key is
