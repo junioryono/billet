@@ -1,31 +1,87 @@
 package main
 
 import (
+	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"net/http"
 	"testing"
+
+	"github.com/junioryono/billet/internal/awss3"
 )
 
-// THE CACHE PROBE'S INCONCLUSIVE VERDICT IS TAKEN FROM THE ANSWER, NOT THE WORDS.
+// THE VERDICT COMES FROM THE ANSWER S3 SENT, NOT FROM THE WORDS OF A MESSAGE.
 //
 // `billet check` reads a 403 from the ebs-s3 bucket probe as INCONCLUSIVE rather
-// than as a broken bucket, because billet's own minimal grant conditions
+// than as a broken bucket, because billet's minimal grant conditions
 // s3:ListBucket on s3:prefix — a context key a GetObject request does not carry —
 // so a healthy miss can answer 403 under exactly the policy billet generates.
-// That branch used to be selected by looking for the substring "HTTP 403" in the
-// probe error's rendered message, which made every message on the path
-// load-bearing: reword one and a refused identity becomes a hard failure, or a
-// real fault becomes an advisory line an operator scrolls past.
 //
-// A STRUCTURAL TEST BECAUSE THE CALL SITE CANNOT BE REACHED. `ebss3.New` builds
-// its endpoint from the region and the bucket with no override, so nothing in a
-// unit test can put a fake S3 behind ec2Preflight; and the branch is one
-// fmt.Printf, so a run-time test would be asserting on stdout after standing up a
-// config, an identity and a credential chain. What is being defended here is an
-// ABSENCE — delete the awss3.StatusOf call and every other test in this change
-// stays green while the operator-facing regression comes back.
-func TestTheCacheProbeClassifiesARefusalByItsStatus(t *testing.T) {
+// THE DECEPTIVE CASE IS THE ONE THAT MATTERS. This branch was selected by looking
+// for the substring "HTTP 403" in the probe error's rendered message, so an error
+// that merely CONTAINS those characters was read as a refused identity, and any
+// reword of a diagnostic on the path changed the verdict. That error is in the
+// table below and must be a failure.
+func TestTheCacheProbeVerdictReadsTheRefusalRatherThanTheMessage(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want cacheProbeVerdict
+	}{
+		{
+			name: "a bucket that answered", err: nil, want: cacheProbeAnswered,
+		},
+		{
+			name: "a refusal S3 sent",
+			err: fmt.Errorf("ebs-s3: the cache bucket did not answer a probe read: %w",
+				fmt.Errorf("ebs-s3: S3 GET returned %w",
+					&awss3.Refusal{Status: http.StatusForbidden, Code: "AccessDenied"})),
+			want: cacheProbeInconclusive,
+		},
+		{
+			// PROSE THAT LOOKS LIKE A REFUSAL IS NOT ONE. Nothing here carries an
+			// S3 answer, so it must not reach the advisory branch.
+			name: "a message that merely says HTTP 403",
+			err:  errors.New("ebs-s3: something else entirely went wrong: HTTP 403"),
+			want: cacheProbeFailed,
+		},
+		{
+			name: "a bucket that does not exist",
+			err: fmt.Errorf("ebs-s3: S3 GET returned %w",
+				&awss3.Refusal{Status: http.StatusNotFound, Code: awss3.CodeNoSuchBucket}),
+			want: cacheProbeFailed,
+		},
+		{
+			// A transport failure carries no S3 answer either, and reporting it
+			// as inconclusive would hide an unreachable bucket behind an
+			// advisory line.
+			name: "a host that could not be dialled",
+			err:  errors.New("ebs-s3: call S3: dial tcp: connection refused"),
+			want: cacheProbeFailed,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := judgeCacheProbe(tc.err); got != tc.want {
+				t.Errorf("judgeCacheProbe = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// AND `billet check` ASKS THAT JUDGEMENT, WITH THE PROBE'S OWN ERROR.
+//
+// PROVING THE MECHANISM IS NOT PROVING IT IS USED. The verdict above is a plain
+// function; what turns it into something an operator meets is one call in
+// ec2Preflight. Delete it and the table stays green while the probe prints that a
+// bucket S3 has never heard of answered.
+//
+// A STRUCTURAL TEST BECAUSE THE CALL SITE CANNOT BE REACHED. ebss3.New builds its
+// endpoint from the region and the bucket with no override, so nothing in a unit
+// test can put a fake S3 behind ec2Preflight. The ARGUMENT is asserted as well as
+// the call, because judging an error other than the probe's judges nothing.
+func TestTheCheckCommandJudgesTheCacheProbesOwnAnswer(t *testing.T) {
 	fset := token.NewFileSet()
 
 	file, err := parser.ParseFile(fset, "main.go", nil, 0)
@@ -33,12 +89,22 @@ func TestTheCacheProbeClassifiesARefusalByItsStatus(t *testing.T) {
 		t.Fatalf("parse main.go: %v", err)
 	}
 
-	preflight := functionNamed(file, "ec2Preflight")
+	var preflight *ast.FuncDecl
+
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if ok && fn.Recv == nil && fn.Name.Name == "ec2Preflight" {
+			preflight = fn
+		}
+	}
+
+	// A WALK THAT FOUND NOTHING PASSES FOR THE WRONG REASON, which is the failure
+	// every structural test in this repository is arranged against.
 	if preflight == nil {
 		t.Fatal("ec2Preflight is gone from main.go; this guard is checking nothing")
 	}
 
-	var asksTheStatus bool
+	var judged bool
 
 	ast.Inspect(preflight, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
@@ -46,26 +112,27 @@ func TestTheCacheProbeClassifiesARefusalByItsStatus(t *testing.T) {
 			return true
 		}
 
-		selector, ok := call.Fun.(*ast.SelectorExpr)
-		if !ok || selector.Sel.Name != "StatusOf" {
+		fn, ok := call.Fun.(*ast.Ident)
+		if !ok || fn.Name != "judgeCacheProbe" || len(call.Args) != 1 {
 			return true
 		}
 
-		if pkg, ok := selector.X.(*ast.Ident); ok && pkg.Name == "awss3" {
-			asksTheStatus = true
+		if arg, ok := call.Args[0].(*ast.Ident); ok && arg.Name == "probeErr" {
+			judged = true
 		}
 
 		return true
 	})
 
-	if !asksTheStatus {
-		t.Error("ec2Preflight no longer asks awss3.StatusOf what S3 answered, so the cache " +
-			"probe cannot tell a refused identity from a broken bucket")
+	if !judged {
+		t.Error("ec2Preflight does not judge the cache probe's own error through " +
+			"judgeCacheProbe, so a refused identity and a bucket that does not exist " +
+			"are reported the same way")
 	}
 
 	// AND IT MUST NOT GO BACK TO THE MESSAGE. A strings.Contains over anything's
-	// .Error() in this function is the shape that was removed, and it would pass
-	// the assertion above while sitting beside it.
+	// .Error() in this function is the shape that was removed, and it would sit
+	// beside the call above while deciding the verdict instead of it.
 	ast.Inspect(preflight, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
 		if !ok {
@@ -97,16 +164,4 @@ func TestTheCacheProbeClassifiesARefusalByItsStatus(t *testing.T) {
 
 		return true
 	})
-}
-
-// functionNamed finds one top-level function declaration.
-func functionNamed(file *ast.File, name string) *ast.FuncDecl {
-	for _, decl := range file.Decls {
-		fn, ok := decl.(*ast.FuncDecl)
-		if ok && fn.Recv == nil && fn.Name.Name == name {
-			return fn
-		}
-	}
-
-	return nil
 }

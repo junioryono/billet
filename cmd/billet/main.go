@@ -33,7 +33,6 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/awscreds"
-	"github.com/junioryono/billet/internal/awss3"
 	"github.com/junioryono/billet/internal/awssig"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/node"
@@ -3232,27 +3231,19 @@ func ec2Preflight(
 			if err != nil {
 				return fmt.Errorf("node.ebs_s3: %w", err)
 			}
-			switch probeErr := store.CheckAccess(ctx); {
-			case probeErr == nil:
+			// THE VERDICT IS judgeCacheProbe's, not this switch's. What each
+			// answer means is in cacheprobe.go, where a test can reach it.
+			probeErr := store.CheckAccess(ctx)
+			switch judgeCacheProbe(probeErr) {
+			case cacheProbeAnswered:
 				fmt.Printf("cache    bucket %s answers under this deployment's prefix\n",
 					cfg.Node.EBSS3.Bucket)
-			case awss3.StatusOf(probeErr) == http.StatusForbidden:
-				// NOT PROOF OF A BROKEN BUCKET: S3 answers 404 for a miss only
-				// with s3:ListBucket, and billet's minimal grant conditions
-				// that on s3:prefix — a context key GetObject does not carry —
-				// so under exactly the generated policy a healthy miss can
-				// answer 403. Advisory, until live acceptance pins the shape.
-				//
-				// ASKED OF THE ANSWER, NOT OF THE WORDS. This matched the
-				// substring "HTTP 403" in a rendered message until the store
-				// started wrapping S3's own refusal, which made every message
-				// on that path load-bearing: reword one and a refused identity
-				// becomes a hard failure, or a real fault becomes advisory.
+			case cacheProbeInconclusive:
 				fmt.Printf("cache    bucket probe INCONCLUSIVE: %v\n", probeErr)
 				fmt.Printf("         (a 403 here is EITHER a refused identity OR a healthy miss " +
 					"under billet's minimal grant, whose prefix-conditioned ListBucket cannot " +
 					"match a GetObject; a real job read will settle it)\n")
-			default:
+			case cacheProbeFailed:
 				return fmt.Errorf("node.ebs_s3: %w", probeErr)
 			}
 		}

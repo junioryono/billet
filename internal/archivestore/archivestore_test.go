@@ -238,12 +238,14 @@ func TestAnAbsentKeyIsDistinguishable(t *testing.T) {
 	}
 }
 
-// The two documents S3 sends for the two facts a 404 can carry.
+// The two documents S3 sends for the two facts a 404 can carry, declaration and
+// newline included.
 const (
-	noSuchKeyDocument = `<?xml version="1.0" encoding="UTF-8"?><Error><Code>NoSuchKey</Code>` +
+	noSuchKeyDocument = `<?xml version="1.0" encoding="UTF-8"?>` + "\n" +
+		`<Error><Code>NoSuchKey</Code>` +
 		`<Message>The specified key does not exist.</Message>` +
 		`<Key>billet/dep/2026/manifest.json</Key></Error>`
-	noSuchBucketDocument = `<?xml version="1.0" encoding="UTF-8"?>` +
+	noSuchBucketDocument = `<?xml version="1.0" encoding="UTF-8"?>` + "\n" +
 		`<Error><Code>NoSuchBucket</Code>` +
 		`<Message>The specified bucket does not exist</Message>` +
 		`<BucketName>billet-backups</BucketName></Error>`

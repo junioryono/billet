@@ -113,13 +113,17 @@ func TestIndeterminateS3WritesAreAmbiguous(t *testing.T) {
 func TestOnlyNoSuchKeyReadsAsAnAbsentStateObject(t *testing.T) {
 	t.Parallel()
 
+	// The shape S3 answers in, declaration and newline included.
 	const (
-		noSuchKey = `<?xml version="1.0" encoding="UTF-8"?><Error><Code>NoSuchKey</Code>` +
+		noSuchKey = `<?xml version="1.0" encoding="UTF-8"?>` + "\n" +
+			`<Error><Code>NoSuchKey</Code>` +
 			`<Message>The specified key does not exist.</Message></Error>`
-		noSuchBucket = `<?xml version="1.0" encoding="UTF-8"?><Error><Code>NoSuchBucket</Code>` +
+		noSuchBucket = `<?xml version="1.0" encoding="UTF-8"?>` + "\n" +
+			`<Error><Code>NoSuchBucket</Code>` +
 			`<Message>The specified bucket does not exist</Message>` +
 			`<BucketName>billet-cache-example</BucketName></Error>`
-		accessDenied = `<?xml version="1.0" encoding="UTF-8"?><Error><Code>AccessDenied</Code>` +
+		accessDenied = `<?xml version="1.0" encoding="UTF-8"?>` + "\n" +
+			`<Error><Code>AccessDenied</Code>` +
 			`<Message>Access Denied</Message></Error>`
 	)
 

@@ -52,7 +52,19 @@ func TestRealS3TellsAMissingBucketFromAMissingKey(t *testing.T) {
 	key := "billet-probe-does-not-exist/" + hex.EncodeToString(nonce[:])
 
 	t.Run("a missing key in a bucket that exists", func(t *testing.T) {
-		refusal := probe(t, bucket, region, key, creds)
+		refusal := probe(t, s3Get{bucket: bucket, region: region, key: key, creds: creds})
+
+		// A TEST ROLE THAT CANNOT LIST IS A SETUP PROBLEM, NOT A MODEL PROBLEM.
+		// S3 answers 403 rather than NoSuchKey for a miss when the caller holds
+		// no s3:ListBucket for the prefix — that is the very behaviour
+		// internal/store/ebss3's CheckAccess is written around — so failing here
+		// would report billet's model of S3 as wrong when what is wrong is the
+		// credential this run was given.
+		if refusal.Status == http.StatusForbidden {
+			t.Skipf("this identity was refused (%s) rather than told the key is missing; "+
+				"S3 answers NoSuchKey only to a caller holding s3:ListBucket on %q for "+
+				"this prefix", refusal, bucket)
+		}
 
 		if refusal.Status != http.StatusNotFound || refusal.Code != CodeNoSuchKey {
 			t.Fatalf("a missing object answered %s; billet reads only %s as absence",
@@ -65,7 +77,7 @@ func TestRealS3TellsAMissingBucketFromAMissingKey(t *testing.T) {
 	})
 
 	t.Run("a bucket that does not exist", func(t *testing.T) {
-		refusal := probe(t, absent, region, key, creds)
+		refusal := probe(t, s3Get{bucket: absent, region: region, key: key, creds: creds})
 
 		if refusal.Status != http.StatusNotFound || refusal.Code != CodeNoSuchBucket {
 			t.Fatalf("a bucket that does not exist answered %s, not %s at HTTP 404 — the "+
@@ -81,15 +93,22 @@ func TestRealS3TellsAMissingBucketFromAMissingKey(t *testing.T) {
 	})
 }
 
+// s3Get is one request the probe makes. A struct rather than four parameters
+// because only the bucket differs between the two, and the pair is the whole
+// measurement.
+type s3Get struct {
+	bucket string
+	region string
+	key    string
+	creds  awssig.Credentials
+}
+
 // probe makes one signed GET, the way billet's own S3 clients do, and reports
 // what came back.
-func probe(
-	t *testing.T,
-	bucket, region, key string,
-	creds awssig.Credentials,
-) *Refusal {
+func probe(t *testing.T, get s3Get) *Refusal {
 	t.Helper()
 
+	bucket, region, key := get.bucket, get.region, get.key
 	url := "https://" + bucket + ".s3." + region + ".amazonaws.com/" + key
 
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, url, http.NoBody)
@@ -99,7 +118,7 @@ func probe(
 
 	req.Header.Set("X-Amz-Content-Sha256", awssig.SHA256Hex(nil))
 
-	if err := awssig.Sign(req, nil, creds, region, "s3", time.Now()); err != nil {
+	if err := awssig.Sign(req, nil, get.creds, region, "s3", time.Now()); err != nil {
 		t.Fatalf("sign the probe request: %v", err)
 	}
 

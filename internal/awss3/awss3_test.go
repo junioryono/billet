@@ -11,17 +11,17 @@ import (
 
 // The documents S3 actually sends, in the shape it sends them.
 const (
-	noSuchKeyDocument = `<?xml version="1.0" encoding="UTF-8"?>` +
+	noSuchKeyDocument = `<?xml version="1.0" encoding="UTF-8"?>` + "\n" +
 		`<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message>` +
 		`<Key>billet-cache/owners/abc/state/def.json</Key>` +
 		`<RequestId>QWERTY123</RequestId><HostId>aGVsbG8=</HostId></Error>`
 
-	noSuchBucketDocument = `<?xml version="1.0" encoding="UTF-8"?>` +
+	noSuchBucketDocument = `<?xml version="1.0" encoding="UTF-8"?>` + "\n" +
 		`<Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist</Message>` +
 		`<BucketName>billet-cache-example</BucketName>` +
 		`<RequestId>QWERTY123</RequestId><HostId>aGVsbG8=</HostId></Error>`
 
-	accessDeniedDocument = `<?xml version="1.0" encoding="UTF-8"?>` +
+	accessDeniedDocument = `<?xml version="1.0" encoding="UTF-8"?>` + "\n" +
 		`<Error><Code>AccessDenied</Code><Message>Access Denied</Message>` +
 		`<RequestId>QWERTY123</RequestId><HostId>aGVsbG8=</HostId></Error>`
 )
@@ -104,6 +104,21 @@ func TestOnlyNoSuchKeyAtFourOhFourIsAbsence(t *testing.T) {
 			// would be allowed to say an object is absent.
 			name: "an error document with something after it", status: http.StatusNotFound,
 			body: "<Error><Code>NoSuchKey</Code></Error><Unexpected/>",
+		},
+		{
+			// AND IT SKIPS WHATEVER PRECEDES THE FIRST ELEMENT, character data
+			// included — the same hole at the other end of the document.
+			name: "an error document with something before it", status: http.StatusNotFound,
+			body: "garbage<Error><Code>NoSuchKey</Code></Error>",
+		},
+		{
+			// THE PROLOG IS NOT CONTENT. A declaration, a comment and whitespace
+			// carry no verdict, and refusing a body over one would turn a healthy
+			// miss into a failure — the more expensive mistake of the two.
+			name: "an error document behind a comment", status: http.StatusNotFound,
+			body: "<!-- served by a cache -->\n" +
+				"<Error><Code>NoSuchKey</Code><Message>gone</Message></Error>\n",
+			code: CodeNoSuchKey, absent: true,
 		},
 		{
 			// Into a string field encoding/xml keeps the LAST match, so this
@@ -233,7 +248,8 @@ func TestARefusalRendersTheCodeAndTheStatus(t *testing.T) {
 		t.Errorf("Error() = %q", got)
 	}
 
-	if got := (&Refusal{Status: 301}).Error(); got != "HTTP 301" {
+	unnamed := &Refusal{Status: http.StatusMovedPermanently}
+	if got := unnamed.Error(); got != "HTTP 301" {
 		t.Errorf("Error() = %q", got)
 	}
 
@@ -248,6 +264,45 @@ func TestARefusalRendersTheCodeAndTheStatus(t *testing.T) {
 
 	if missing.Absent() {
 		t.Error("a nil refusal read as an absent object")
+	}
+}
+
+// THE REGION HINT IS REMOTE BYTES, and it is repeated to an operator.
+//
+// The code is shape-checked before it is rendered; a header is no more
+// trustworthy than a body, and archivestore takes a configured endpoint, so the
+// far side is not always AWS.
+func TestARegionHintIsOnlyRepeatedWhenItLooksLikeOne(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{name: "a region", value: "eu-west-1", want: "eu-west-1"},
+		{name: "surrounding space", value: "  eu-west-1  ", want: "eu-west-1"},
+		{name: "absent", value: ""},
+		{name: "an escape sequence", value: "eu-west-1\x1b[2J"},
+		{name: "a sentence", value: "the bucket is somewhere else"},
+		{name: "longer than any region", value: strings.Repeat("a", 33)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			response := &http.Response{Header: http.Header{}}
+			if tc.value != "" {
+				response.Header.Set("X-Amz-Bucket-Region", tc.value)
+			}
+
+			if got := RegionHint(response); got != tc.want {
+				t.Errorf("RegionHint = %q, want %q", got, tc.want)
+			}
+		})
+	}
+
+	if got := RegionHint(nil); got != "" {
+		t.Errorf("RegionHint(nil) = %q", got)
 	}
 }
 

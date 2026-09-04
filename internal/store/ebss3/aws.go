@@ -223,7 +223,7 @@ func (s s3API) refusalError(op string, refusal *awss3.Refusal, response *http.Re
 	// advice. Reported only when it DIFFERS — the header comes back on ordinary
 	// answers too, and "the bucket's region is us-west-2" beside a config that
 	// says us-west-2 is a diagnostic that sends an operator hunting.
-	if hint := response.Header.Get("X-Amz-Bucket-Region"); hint != "" && hint != s.cfg.Region {
+	if hint := awss3.RegionHint(response); hint != "" && hint != s.cfg.Region {
 		return fmt.Errorf("ebs-s3: S3 %s returned %w; the bucket's region is %s and "+
 			"node.ebs_s3.region says %s", op, refusal, hint, s.cfg.Region)
 	}

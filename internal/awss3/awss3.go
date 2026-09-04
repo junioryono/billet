@@ -21,23 +21,27 @@
 //
 // MEASURED AGAINST REAL S3 IN us-east-1 ON 2026-09-04, because a rule about
 // somebody else's API written from its documentation agrees with whatever billet
-// already believes. Two GETs, both answering HTTP 404:
+// already believes. WHAT WAS OBSERVED, exactly, is two unauthenticated GETs,
+// both answering HTTP 404 with a body ending at </Error> and no trailing byte:
 //
-//	a key that is not there, in a bucket that is:
+//	one key that was not there, in a public bucket that was:
 //	  <Error><Code>NoSuchKey</Code><Message>The specified key does not
-//	  exist.</Message><Key>…</Key><RequestId>…</RequestId>…</Error>
+//	  exist.</Message><Key>…</Key><RequestId>…</RequestId><HostId>…</HostId></Error>
 //
-//	any key, in a bucket that does not exist:
+//	one key in a randomly named bucket that could not exist:
 //	  <Error><Code>NoSuchBucket</Code><Message>The specified bucket does not
 //	  exist</Message><BucketName>…</BucketName><RequestId>…</RequestId>…</Error>
 //
-// The first went to a public open-data bucket, whose policy grants anonymous
-// s3:ListBucket — the same grant internal/store/ebss3's CheckAccess names as the
-// condition for getting a 404 rather than a 403 on a miss. The second needed no
-// identity at all: a bucket is resolved before a request is authorized, so the
-// name being wrong is answered before anything looks at who is asking. Both were
-// unauthenticated; reals3_test.go is the same pair signed, against a bucket an
-// operator points it at.
+// TWO INFERENCES, LABELLED AS THAT. That the first answered 404 rather than 403
+// is consistent with that bucket granting anonymous s3:ListBucket, which is the
+// condition internal/store/ebss3's CheckAccess already names — no policy was
+// read. And that the second answered without a credential suggests the name is
+// resolved before the request is authorized, which is a reading of one response
+// rather than a measurement of S3's ordering. Neither inference is what the code
+// rests on: it rests on the two codes.
+//
+// reals3_test.go is the same pair SIGNED, against a bucket an operator points it
+// at, which is the run that would contradict any of this.
 package awss3
 
 import (
@@ -159,7 +163,13 @@ func ParseRefusal(status int, body []byte) *Refusal {
 	}
 
 	decoder := xml.NewDecoder(bytes.NewReader(body))
-	if err := decoder.Decode(&document); err != nil {
+
+	start, ok := rootOf(decoder)
+	if !ok {
+		return refusal
+	}
+
+	if err := decoder.DecodeElement(&document, &start); err != nil {
 		return refusal
 	}
 
@@ -177,13 +187,35 @@ func ParseRefusal(status int, body []byte) *Refusal {
 	return refusal
 }
 
-// endsAfter reports whether the document was the whole body.
+// rootOf returns the body's one element, provided nothing but a prolog came
+// before it.
 //
-// Decode STOPS AT THE END OF THE FIRST ELEMENT and never looks further, so
-// `<Error><Code>NoSuchKey</Code></Error><anything/>` decodes cleanly — and a body
+// Decode SKIPS WHATEVER PRECEDES THE FIRST ELEMENT, character data included, so
+// `garbage<Error><Code>NoSuchKey</Code></Error>` decodes cleanly — and a body
 // billet did not understand whole would then be allowed to say that an object is
-// absent. Trailing WHITESPACE is tolerated because it carries no verdict and
-// something between billet and S3 is free to add a newline.
+// absent.
+func rootOf(decoder *xml.Decoder) (xml.StartElement, bool) {
+	for {
+		token, err := decoder.Token()
+		if err != nil {
+			return xml.StartElement{}, false
+		}
+
+		if start, ok := token.(xml.StartElement); ok {
+			return start, true
+		}
+
+		if !carriesNoVerdict(token) {
+			return xml.StartElement{}, false
+		}
+	}
+}
+
+// endsAfter reports whether the element was the last of the body.
+//
+// DecodeElement STOPS AT THE END OF THAT ELEMENT and never looks further, so
+// `<Error><Code>NoSuchKey</Code></Error><anything/>` decodes cleanly, and the
+// same sentence applies at this end as at the other one.
 func endsAfter(decoder *xml.Decoder) bool {
 	for {
 		token, err := decoder.Token()
@@ -191,15 +223,56 @@ func endsAfter(decoder *xml.Decoder) bool {
 			return true
 		}
 
-		if err != nil {
-			return false
-		}
-
-		text, ok := token.(xml.CharData)
-		if !ok || strings.TrimSpace(string(text)) != "" {
+		if err != nil || !carriesNoVerdict(token) {
 			return false
 		}
 	}
+}
+
+// carriesNoVerdict reports whether a token is the matter XML allows AROUND a
+// document's one element: a declaration, a comment, a directive, or whitespace.
+//
+// TOLERATED RATHER THAN REQUIRED, and tolerated in both directions because a
+// document is one element with that matter either side of it. None of it says
+// anything about an object, and refusing a body over a newline something added
+// in front of S3 would turn a healthy miss into a failure — which is the
+// opposite mistake and the more expensive one.
+func carriesNoVerdict(token xml.Token) bool {
+	switch t := token.(type) {
+	case xml.ProcInst, xml.Comment, xml.Directive:
+		return true
+	case xml.CharData:
+		return strings.TrimSpace(string(t)) == ""
+	default:
+		return false
+	}
+}
+
+// regionShape is what an AWS region name looks like.
+//
+// THE HINT IS REMOTE BYTES TOO. X-Amz-Bucket-Region lands in an operator's
+// terminal beside the code, and the code is shape-checked for exactly that
+// reason; a header is no more trustworthy than a body, and archivestore takes a
+// configured endpoint, so the far side is not always AWS.
+var regionShape = regexp.MustCompile(`^[a-z0-9-]{1,32}$`)
+
+// RegionHint reports the bucket's real region when S3 named one.
+//
+// S3 answers a wrong-region request with a redirect carrying this header, and an
+// operator staring at a bare 301 has no other way to see that their region is
+// wrong. It is empty when the header is absent or is not a name billet will
+// repeat.
+func RegionHint(response *http.Response) string {
+	if response == nil {
+		return ""
+	}
+
+	hint := strings.TrimSpace(response.Header.Get("X-Amz-Bucket-Region"))
+	if !regionShape.MatchString(hint) {
+		return ""
+	}
+
+	return hint
 }
 
 // StatusOf reports the status of the S3 refusal in err's chain, or zero.

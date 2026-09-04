@@ -428,7 +428,7 @@ func (s S3) statusError(op, key string, response *http.Response) error {
 func (s S3) refusalError(
 	op, key string, refusal *awss3.Refusal, response *http.Response,
 ) error {
-	if hint := response.Header.Get("X-Amz-Bucket-Region"); hint != "" && hint != s.cfg.Region {
+	if hint := awss3.RegionHint(response); hint != "" && hint != s.cfg.Region {
 		return fmt.Errorf("archivestore: %s %s returned %w; the bucket's region is %s and "+
 			"backup.s3.region says %s", op, key, refusal, hint, s.cfg.Region)
 	}
