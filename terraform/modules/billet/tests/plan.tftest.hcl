@@ -460,8 +460,9 @@ run "a_seventeenth_spot_node_name_is_refused_at_the_root" {
 
 # ...AND THE ROOT ADMITS EVERYTHING THE CHILD ADMITS: a root rule tightened past
 # the child's would refuse at the entry point operators actually use, with every
-# child test still green. Sixteen names, one at billet's 64-character ceiling and
-# one with an underscore, all reach the output.
+# child test still green. Sixteen names covering every edge of the rule — the
+# 64-character ceiling, an underscore, an uppercase letter, a leading digit and
+# the one-character floor — all reach the output.
 run "the_root_admits_the_edges_of_the_name_rule" {
   command = plan
 
@@ -469,14 +470,17 @@ run "the_root_admits_the_edges_of_the_name_rule" {
     name        = "billet-test"
     enable_spot = true
     spot_node_names = concat(
-      ["abcdefghij-abcdefghij-abcdefghij-abcdefghij-abcdefghij-abcdefghi", "build_1"],
-      [for i in range(14) : "build-${i}"],
+      ["abcdefghij-abcdefghij-abcdefghij-abcdefghij-abcdefghij-abcdefghi", "build_1", "A", "0"],
+      [for i in range(12) : "build-${i}"],
     )
   }
 
   assert {
-    condition     = length(output.interruption_queue_urls) == 17 && contains(keys(output.interruption_queue_urls), "abcdefghij-abcdefghij-abcdefghij-abcdefghij-abcdefghij-abcdefghi") && contains(keys(output.interruption_queue_urls), "build_1")
-    error_message = "sixteen further names, the longest and an underscored one among them, must all cross the root into interruption_queue_urls"
+    condition = length(output.interruption_queue_urls) == 17 && alltrue([
+      for n in ["abcdefghij-abcdefghij-abcdefghij-abcdefghij-abcdefghij-abcdefghi", "build_1", "A", "0"] :
+      contains(keys(output.interruption_queue_urls), n)
+    ])
+    error_message = "sixteen further names, the longest, an underscored, an uppercase, a digit-first and a one-character one among them, must all cross the root into interruption_queue_urls"
   }
 }
 

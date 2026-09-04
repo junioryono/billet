@@ -867,10 +867,12 @@ run "refuses_more_spot_node_names_than_the_grants_can_carry" {
   expect_failures = [var.spot_node_names]
 }
 
-# ...AND SIXTEEN ARE ACCEPTED AND ALL REACH THE GRANT, so the cap cannot drift
-# below what the README promises. The ARNs are unknown at plan under the mock
-# (no override for sixteen queues), so the count of resources in the grant is
-# what proves every queue arrived; the several-node run proves WHICH.
+# ...AND SIXTEEN ARE ACCEPTED AND ALL REACH THE ROUTER, so the cap cannot drift
+# below what the README promises. The queue ARNs are unknown at plan under the
+# mock (no override for sixteen queues), so neither policy document can be
+# decoded here; the environment is built from the configured names and IS known,
+# so it is the half this run counts. The several-node run proves the grants
+# carry the same set as the environment, for a set it can override.
 run "accepts_sixteen_spot_node_names" {
   command = plan
 
@@ -893,13 +895,18 @@ run "accepts_sixteen_spot_node_names" {
     condition     = length(local.spot_queue_arns) == 17 && length(local.spot_queue_names) == 17
     error_message = "every one of the seventeen queues must be in the list the grants and the environment derive from"
   }
+  assert {
+    condition     = toset(split(",", aws_lambda_function.spot_router[0].environment[0].variables["BILLET_INTERRUPTION_QUEUE_NAMES"])) == toset(concat(["billet-test-spot-interruptions"], [for i in range(16) : "build-${i}"]))
+    error_message = "the router must be told all seventeen names at the ceiling"
+  }
 }
 
-# BOTH ENDS OF WHAT THE RULE ADMITS REACH THE QUEUE INTACT: 64 characters is
-# billet's own ceiling, and an underscore is legal on both sides. Asserted on the
+# EVERY EDGE OF WHAT THE RULE ADMITS REACHES THE QUEUE INTACT: 64 characters is
+# billet's own ceiling, an underscore is legal on both sides, and so are an
+# uppercase letter, a leading digit and a single character. Asserted on the
 # queue's name rather than on the plan surviving, so a regex tightened past what
 # billet accepts fails here rather than at an operator's apply.
-run "accepts_the_longest_spot_node_name_and_an_underscore" {
+run "accepts_the_edges_of_the_name_rule" {
   command = plan
 
   module {
@@ -910,16 +917,15 @@ run "accepts_the_longest_spot_node_name_and_an_underscore" {
     vpc_id          = "vpc-0f0f0f0f0f0f0f0f0"
     name            = "billet-test"
     enable_spot     = true
-    spot_node_names = ["abcdefghij-abcdefghij-abcdefghij-abcdefghij-abcdefghij-abcdefghi", "build_1"]
+    spot_node_names = ["abcdefghij-abcdefghij-abcdefghij-abcdefghij-abcdefghij-abcdefghi", "build_1", "A", "0"]
   }
 
   assert {
-    condition     = aws_sqs_queue.spot_nodes["abcdefghij-abcdefghij-abcdefghij-abcdefghij-abcdefghij-abcdefghi"].name == "abcdefghij-abcdefghij-abcdefghij-abcdefghij-abcdefghij-abcdefghi"
-    error_message = "64 characters is billet's own node-name ceiling and must reach the queue intact"
-  }
-  assert {
-    condition     = aws_sqs_queue.spot_nodes["build_1"].name == "build_1"
-    error_message = "an underscore is legal for billet and SQS alike and must reach the queue intact"
+    condition = alltrue([
+      for n in ["abcdefghij-abcdefghij-abcdefghij-abcdefghij-abcdefghij-abcdefghi", "build_1", "A", "0"] :
+      aws_sqs_queue.spot_nodes[n].name == n
+    ])
+    error_message = "the 64-character ceiling, an underscore, an uppercase letter, a leading digit and a one-character name are all legal for billet and SQS alike and must reach the queue intact"
   }
 }
 

@@ -255,7 +255,7 @@ variable "spot_node_names" {
 
   validation {
     condition     = length(var.spot_node_names) <= 16
-    error_message = "spot_node_names admits at most 16 further spot nodes: every queue's ARN is repeated in the node role's and the router's inline policies, and IAM caps a role's inline policies at 10,240 characters combined. More spot nodes than that are several fleet-ec2 instances."
+    error_message = "spot_node_names admits at most 16 further spot nodes: every queue's ARN is repeated in the node role's and the router's inline policies, and IAM caps a role's inline policies at 10,240 characters combined, which the node role's other grants share. More spot nodes than that are several fleet-ec2 instances."
   }
 }
 

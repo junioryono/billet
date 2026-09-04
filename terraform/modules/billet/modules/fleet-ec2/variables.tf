@@ -118,13 +118,18 @@ variable "spot_node_names" {
     # queues that exist with neither a grant nor a served name. The binding
     # quota is IAM's 10,240 characters for ALL of a role's inline policies
     # combined, which the node role shares between its generated rendering
-    # (about 3 KB with sentinels, more with real values, up to 5 KB for an
-    # override), the builder grant (1.4 KB), PassRole and the root's backup
-    # grant; a worst-case queue ARN with a 64-character name is 113 characters,
-    # so 17 queues cost about 2.1 KB and fit with room to spare. Lambda's 4 KB
-    # environment would admit about 60 names and is not the limit.
+    # (about 3 KB with sentinels, more with real values), the builder grant
+    # (1.4 KB), PassRole and the root's backup grant; a worst-case queue ARN
+    # with a 64-character name is 113 characters, so 17 queues cost about 2.1 KB
+    # and fit beside the module's own renderings with room to spare. Lambda's
+    # 4 KB environment would admit about 60 names and is not the limit.
+    #
+    # WHAT THIS BOUNDS IS THIS INPUT'S SHARE. An iam_policy_json override is
+    # installed verbatim and unbounded, and one already near the quota fails the
+    # primary spot grant with no further names at all; that was true before this
+    # input existed and is the override's author's to size.
     condition     = length(var.spot_node_names) <= 16
-    error_message = "spot_node_names admits at most 16 further spot nodes: every queue's ARN is repeated in the node role's and the router's inline policies, and IAM caps a role's inline policies at 10,240 characters combined. More spot nodes than that are several fleet-ec2 instances."
+    error_message = "spot_node_names admits at most 16 further spot nodes: every queue's ARN is repeated in the node role's and the router's inline policies, and IAM caps a role's inline policies at 10,240 characters combined, which the node role's other grants share. More spot nodes than that are several fleet-ec2 instances."
   }
 }
 

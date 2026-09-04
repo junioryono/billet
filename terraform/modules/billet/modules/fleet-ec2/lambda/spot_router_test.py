@@ -10,6 +10,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import sys
 import types
 import unittest
@@ -449,7 +450,10 @@ class SpotRouterModuleWiringTest(unittest.TestCase):
     # dependency graph. The check is positional over fmt-formatted HCL — every
     # resource header starts a line at column 0, so the policy's block is the text
     # between its header and the next — rather than a parser, for the reason the
-    # test above gives.
+    # test above gives. Within the block, all three HCL comment forms are removed,
+    # then all whitespace, then the trailing comma terraform fmt keeps in a
+    # multi-line list — so a commented-out edge in any form is absent and a list
+    # spread over several lines is still present.
     def test_the_router_grant_waits_for_the_function_that_serves_the_set(self):
         with open(os.path.join(_HERE, "..", "spot.tf"), encoding="utf-8") as f:
             spot_tf = f.read()
@@ -458,13 +462,13 @@ class SpotRouterModuleWiringTest(unittest.TestCase):
         start = spot_tf.index(header)
         end = spot_tf.find('\nresource "', start + 1)
         block = spot_tf[start:end if end != -1 else len(spot_tf)]
-        # Comment lines are dropped first: a `# depends_on = ...` left behind by
-        # somebody removing the edge would otherwise satisfy a substring search.
-        code = "\n".join(line for line in block.splitlines()
-                         if not line.strip().startswith("#"))
+        code = re.sub(r"/\*.*?\*/", "", block, flags=re.DOTALL)
+        code = re.sub(r"(?m)(#|//).*$", "", code)
+        code = re.sub(r"\s+", "", code)
+        code = code.replace(",]", "]")
 
         self.assertIn(
-            "depends_on = [aws_lambda_function.spot_router]",
+            "depends_on=[aws_lambda_function.spot_router]",
             code,
             "the router's policy no longer waits for the function: an apply may widen "
             "the grant to a new queue before the function serves its name, and the old "
