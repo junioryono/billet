@@ -209,10 +209,11 @@ rehearsal_as_billet "${controller}" /usr/bin/billet ca retire --force --config /
 # gated on the certificate and ignores an orphaned key, so a retire that
 # removed only the certificate would pass every later assertion here and
 # refuse the next rotation.
+# POSITIVE PROOF OF ABSENCE: `test ! -e` must succeed. The inverted form, "if
+# test -e then fail", reads a failed docker exec as the file being gone.
 for f in ca-previous.key ca-previous.crt; do
-    if docker exec "${controller}" test -e "/var/lib/billet/server/ca/${f}"; then
-        rehearsal_fail "ca retire left ${f} in place"
-    fi
+    docker exec "${controller}" test ! -e "/var/lib/billet/server/ca/${f}" ||
+        rehearsal_fail "could not prove ${f} absent after ca retire"
 done
 since=$(rehearsal_clock "${controller}")
 docker exec "${controller}" systemctl restart billet-server.service
