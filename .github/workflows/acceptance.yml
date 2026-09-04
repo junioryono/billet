@@ -66,11 +66,15 @@ jobs:
     timeout-minutes: 90
 
     # THE ENVIRONMENT IS THE PRINCIPAL. The role in the acceptance account trusts
-    # exactly one OIDC subject, `repo:junioryono/billet:environment:acceptance`,
-    # and declaring the environment is what puts that subject in the token
-    # whatever ref the run was dispatched for. A scheduled run from main and a
-    # dispatched run from a branch are then the same principal; a pull_request
-    # workflow cannot request an environment, so a fork's run is not.
+    # exactly one OIDC subject, this repository's `environment:acceptance`, and
+    # declaring the environment is what puts that subject in the token whatever
+    # ref the run was dispatched for. A scheduled run from main and a dispatched
+    # run from a branch are then the same principal; a pull_request workflow
+    # cannot request an environment, so a fork's run is not. The subject GitHub
+    # issues here is the id-qualified spelling,
+    # `repo:<owner>@<id>/<repo>@<id>:environment:acceptance` (measured
+    # 2026-09-04 in the account's CloudTrail, when a role trusting only the plain
+    # spelling refused the first run), so the role names both spellings.
     environment: acceptance
 
     permissions:
@@ -235,12 +239,30 @@ jobs:
           # post-job revocation only warns when it fails, so it is not relied on.
           skip-token-revoke: true
 
+      # REST, NOT `gh workflow run`. Without `--ref`, gh asks GraphQL for the
+      # repository's default branch, and that query needs `contents: read`, which
+      # this token deliberately lacks: the second run of this lane failed there
+      # with `Resource not accessible by integration (repository.defaultBranchRef)`
+      # (2026-09-04). The REST repository object answers the default branch
+      # under `metadata: read`, and the dispatch endpoint needs `actions: write`,
+      # so the token stays at those two.
       - name: Dispatch the acceptance workflow
         env:
           GH_TOKEN: ${{ steps.dispatch-token.outputs.token }}
           BILLET_ACCEPTANCE_WORKFLOW: ${{ vars.BILLET_ACCEPTANCE_WORKFLOW }}
           BILLET_ACCEPTANCE_REPO: ${{ vars.BILLET_ACCEPTANCE_REPO }}
-        run: gh workflow run "$BILLET_ACCEPTANCE_WORKFLOW" --repo "$BILLET_ACCEPTANCE_REPO"
+        run: |
+          set -eu
+
+          default_branch=$(gh api "repos/$BILLET_ACCEPTANCE_REPO" --jq .default_branch)
+          if [ -z "$default_branch" ]; then
+            echo "::error::could not read the default branch of $BILLET_ACCEPTANCE_REPO." >&2
+            exit 1
+          fi
+
+          gh api -X POST "repos/$BILLET_ACCEPTANCE_REPO/actions/workflows/$BILLET_ACCEPTANCE_WORKFLOW/dispatches" \
+            -f "ref=$default_branch"
+          echo "dispatched $BILLET_ACCEPTANCE_WORKFLOW on $BILLET_ACCEPTANCE_REPO@$default_branch"
 
       # REVOKED THE MOMENT IT HAS DONE ITS ONE JOB, whether or not the dispatch
       # succeeded, and the revocation is PROVED: GitHub answers 204 for a revoked
