@@ -4,7 +4,9 @@
 # spot warning in the account at one queue, and a node re-queues (poison-acks) a
 # warning tagged for a different node. This Lambda looks up the tag and forwards the
 # warning to exactly that node's queue; an untagged (non-billet) instance is
-# dropped. Created only when spot is enabled.
+# dropped. Created only when spot is enabled. It is granted, and told about, every
+# queue this module creates — the primary and one per spot_node_names entry — from
+# the one list local.spot_queues, so the two can never disagree.
 
 data "archive_file" "spot_router" {
   count = var.enable_spot ? 1 : 0
@@ -40,7 +42,7 @@ resource "aws_iam_role" "spot_router" {
 
 # LEAST PRIVILEGE: DescribeInstances cannot be resource-scoped (it takes no
 # resource ARN), but the queue actions are scoped to exactly the interruption
-# queue this module created, and the logs to this function's own log group.
+# queues this module created, and the logs to this function's own log group.
 # jsonencode rather than the provider's policy-document data source so the
 # whole document is assertable in the mocked plan tests with the queue and
 # log-group ARNs overridden to known values.
@@ -62,7 +64,7 @@ resource "aws_iam_role_policy" "spot_router" {
         Sid      = "ForwardToNodeQueue"
         Effect   = "Allow"
         Action   = ["sqs:GetQueueUrl", "sqs:SendMessage"]
-        Resource = aws_sqs_queue.interruptions[0].arn
+        Resource = local.spot_queue_arns
       },
       {
         Sid      = "Logs"
@@ -99,12 +101,14 @@ resource "aws_lambda_function" "spot_router" {
 
   environment {
     variables = {
-      # THE QUEUE THIS ROUTER SERVES, read from the resource rather than rebuilt
-      # from var.name. Without it the handler cannot tell a tag naming another
-      # deployment's queue from its own grant being absent, stale or not yet
-      # propagated — AccessDenied is what AWS answers for both — and reading the
-      # second as the first drops a real two-minute warning silently.
-      BILLET_INTERRUPTION_QUEUE_NAME = aws_sqs_queue.interruptions[0].name
+      # THE QUEUES THIS ROUTER SERVES, read from the resources rather than rebuilt
+      # from the inputs, and from the SAME list the grant above is scoped to.
+      # Without them the handler cannot tell a tag naming another deployment's
+      # queue from its own grant being absent, stale or not yet propagated —
+      # AccessDenied is what AWS answers for both — and reading the second as the
+      # first drops a real two-minute warning silently. Comma-separated: a queue
+      # name is [A-Za-z0-9_-], so the separator can never occur inside one.
+      BILLET_INTERRUPTION_QUEUE_NAMES = join(",", local.spot_queue_names)
     }
   }
 }

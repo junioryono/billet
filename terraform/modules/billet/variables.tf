@@ -222,6 +222,38 @@ variable "enable_spot" {
   default     = false
 }
 
+# SEVERAL SPOT NODES ARE SEVERAL QUEUES. Each name creates a queue named exactly
+# it, and fleet-ec2 widens the node grant, the router grant and the router's served
+# set from the same list, so no queue can be granted without being named to the
+# router or the other way round. THE CHILD'S EXACT RULES, duplicated on purpose:
+# this root and fleet-ec2 are two entry points, and a rule enforced at only one of
+# them is one that is not enforced.
+variable "spot_node_names" {
+  description = "Further spot nodes beside the one enable_spot creates. One interruption queue is created per entry, named exactly it (billet requires the queue basename to equal the node's node.name); the node grant, the router grant and the router's served set widen to every queue from this one input, and interruption_queue_urls reports each node's queue. Queue names are account-wide per region in SQS. Requires enable_spot."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = length(var.spot_node_names) == 0 || var.enable_spot
+    error_message = "spot_node_names requires enable_spot: the router and the primary queue it serves only exist with spot enabled, and a queue nothing forwards to receives no warning."
+  }
+
+  validation {
+    condition     = alltrue([for n in var.spot_node_names : can(regex("^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$", n))])
+    error_message = "every spot_node_names entry must be a name both billet and SQS accept: 1 to 64 letters, digits, hyphens or underscores, starting with a letter or digit, and no dot (billet allows one in a node name; SQS refuses it in a queue name)."
+  }
+
+  validation {
+    condition     = length(distinct(var.spot_node_names)) == length(var.spot_node_names)
+    error_message = "spot_node_names must not repeat a name: two spot nodes cannot share one interruption queue."
+  }
+
+  validation {
+    condition     = !contains(var.spot_node_names, "${var.name}-spot-interruptions")
+    error_message = "spot_node_names must not name the primary queue enable_spot already creates (<name>-spot-interruptions); that node is served by spot_node_name."
+  }
+}
+
 # THE ROOT'S EXACT RULE, duplicated on purpose: this root and fleet-ec2 are two
 # entry points, and a rule enforced at only one of them is one that is not enforced.
 variable "spot_router_alarm_actions" {

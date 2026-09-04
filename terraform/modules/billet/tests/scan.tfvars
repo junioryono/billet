@@ -4,3 +4,4 @@
 enable_spot          = true
 enable_kms           = true
 create_backup_bucket = true
+spot_node_names      = ["build-1"]

@@ -81,6 +81,7 @@ module "fleet" {
   cache_prefix                  = var.cache_prefix
   enable_kms                    = var.enable_kms
   enable_spot                   = var.enable_spot
+  spot_node_names               = var.spot_node_names
   spot_router_alarm_actions     = var.spot_router_alarm_actions
   iam_policy_json               = var.iam_policy_json
   job_instance_profile_role_arn = var.job_instance_profile_role_arn

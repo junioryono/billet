@@ -12,19 +12,21 @@ warning it would refuse and re-queue (the poison-ack churn the README warns abou
 ERROR CLASSIFICATION MATTERS because the warning has a ~2-minute life, so the only
 thing that may consume one SILENTLY is a positive proof it is not this router's to
 place: an instance that is present and carries no tag, an instance EC2 says is
-already gone, a tag that cannot name a queue, or a tag naming a queue other than
-the one this router serves (BILLET_INTERRUPTION_QUEUE_NAME, set by the module to
-the queue it created) THAT SQS then answers AccessDenied or NonExistentQueue for.
-That last one takes both halves: a queue this router is granted but was not told
-about still forwards. Everything else is a could-not-tell and is re-raised, so
-Lambda retries and the failure appears on the function's Errors metric — where the
-module's alarm reports it — rather than a real warning disappearing.
+already gone, a tag that cannot name a queue, or a tag naming a queue outside the
+set this router serves (BILLET_INTERRUPTION_QUEUE_NAMES, set by the module to
+every queue it created, comma-separated) THAT SQS then answers AccessDenied or
+NonExistentQueue for. That last one takes both halves: a queue this router is
+granted but was not told about still forwards. Everything else is a could-not-tell
+and is re-raised, so Lambda retries and the failure appears on the function's
+Errors metric — where the module's alarm reports it — rather than a real warning
+disappearing.
 
 AccessDenied in particular is what AWS answers BOTH for a queue outside this
 router's grant AND for a grant that is absent, stale, or has not propagated yet,
-which is exactly the state a fresh apply, a renamed queue or a policy edit leaves
-it in. Reading it as the first alone dropped a real warning at the moment the node
-most needed it; the queue name is what tells the two apart.
+which is exactly the state a fresh apply, a new spot_node_names entry or a policy
+edit leaves it in. Reading it as the first alone dropped a real warning at the
+moment the node most needed it; the served set is what tells the two apart, and
+the module derives it from the same list it scopes the grant to.
 """
 
 import json
@@ -36,9 +38,10 @@ from botocore.exceptions import ClientError
 
 NODE_TAG = "sh.billet.node"
 
-# THE QUEUE THIS ROUTER SERVES, set by the module to the queue it created. Unset
-# is "cannot tell whose queue this is", which is the safe value: it drops nothing.
-QUEUE_NAME_ENV = "BILLET_INTERRUPTION_QUEUE_NAME"
+# THE QUEUES THIS ROUTER SERVES, set by the module to every queue it created,
+# comma-separated (a queue name cannot contain a comma). Unset or empty is "cannot
+# tell whose queue this is", which is the safe value: it drops nothing.
+QUEUE_NAMES_ENV = "BILLET_INTERRUPTION_QUEUE_NAMES"
 
 # SQS queue names are up to 80 characters of alphanumerics, hyphens and
 # underscores. A tag that is not one cannot name a queue, so drop it without an
@@ -47,9 +50,9 @@ _QUEUE_NAME = re.compile(r"\A[A-Za-z0-9_-]{1,80}\Z")
 
 # The two codes that end a warning for a queue this router does NOT serve: there
 # is nowhere to place it and nothing saying the queue is reachable. Not "permanent"
-# — an extended grant's AccessDenied clears when it propagates, the window the
-# module README names — which is exactly why they may never be read this way about
-# the router's OWN queue, where both are a could-not-tell.
+# — a fresh grant's AccessDenied clears when it propagates — which is exactly why
+# they may never be read this way about a queue in the served set, where both are
+# a could-not-tell.
 _FOREIGN_QUEUE_ERRORS = {"AWS.SimpleQueueService.NonExistentQueue", "AccessDenied"}
 
 _ec2 = boto3.client("ec2")
@@ -78,10 +81,9 @@ def handler(event, _context):
         print(f"{instance_id} {NODE_TAG}={node!r} is not a legal queue name; dropping")
         return
 
-    # A TAG THAT IS NOT THIS ROUTER'S QUEUE IS STILL LOOKED UP, never short-circuited
-    # on the name: a deployment with several spot queues extends the router's grant to
-    # them (see the module README) and those forward successfully. The name only
-    # decides what a FAILURE means.
+    # A TAG OUTSIDE THE SERVED SET IS STILL LOOKED UP, never short-circuited on the
+    # name: a queue this router is granted but was not told about forwards
+    # successfully. The set only decides what a FAILURE means.
     try:
         url = _sqs.get_queue_url(QueueName=node)["QueueUrl"]
     except ClientError as err:
@@ -104,20 +106,29 @@ def handler(event, _context):
 def _drop(what, err, node):
     """Whether an SQS ClientError may be dropped (True) rather than re-raised, which
     takes a POSITIVE proof the warning is not this router's to place: the tag names a
-    queue other than the one it serves, AND SQS answered one of the two codes that
-    end it for such a queue. Its own queue's refusals and an unconfigured queue name
+    queue outside the set it serves, AND SQS answered one of the two codes that end
+    it for such a queue. A served queue's refusals and an unconfigured served set
     are could-not-tells, and re-raising one costs a retry where dropping it costs a
     real two-minute warning."""
     code = err.response.get("Error", {}).get("Code", "")
-    served = os.environ.get(QUEUE_NAME_ENV, "")
-    if served and node != served and code in _FOREIGN_QUEUE_ERRORS:
-        print(f"{what} failed ({code}) for {node!r}, which is not {served!r}, the queue "
-              f"this router serves; dropping")
+    served = _served()
+    if served and node not in served and code in _FOREIGN_QUEUE_ERRORS:
+        print(f"{what} failed ({code}) for {node!r}, which is not one of the queues this "
+              f"router serves ({', '.join(sorted(served))}); dropping")
         return True
 
     print(f"{what} failed ({code}); this router cannot place the warning and cannot "
           f"prove the queue is not its own, so Lambda will retry it")
     return False
+
+
+def _served():
+    """The set of queue names this router serves, from the module-set environment.
+    MEMBERSHIP, not a substring match: "build-1" served must not make "build" look
+    served. Whitespace and empty entries are ignored, so an empty variable is the
+    empty set — the value that drops nothing."""
+    raw = os.environ.get(QUEUE_NAMES_ENV, "")
+    return frozenset(name.strip() for name in raw.split(",") if name.strip())
 
 
 def _node_of(instance_id):

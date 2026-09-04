@@ -39,10 +39,15 @@ output "interruption_queue_url" {
 }
 
 output "spot_node_name" {
-  description = "The name a SPOT node must use as its node.name (the queue basename); empty when spot is disabled."
+  description = "The name a SPOT node must use as its node.name (the queue basename); empty when spot is disabled. With spot_node_names, this is the primary queue's node and interruption_queue_urls carries every node."
   # Read from the queue, not rebuilt from var.name: this name is also what the
   # router is told it serves, and three copies of one literal is two that can drift.
   value = var.enable_spot ? aws_sqs_queue.interruptions[0].name : ""
+}
+
+output "interruption_queue_urls" {
+  description = "Every spot node's interruption queue URL, keyed by the node.name that must consume it (node.ec2.interruption_queue_url): the primary queue under spot_node_name and one per spot_node_names entry. Empty when spot is disabled."
+  value       = { for q in local.spot_queues : q.name => q.url }
 }
 
 # WHAT THIS MODULE DID, NOT WHAT THE ROLE CAN DO.

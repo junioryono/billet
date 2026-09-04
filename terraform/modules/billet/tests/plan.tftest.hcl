@@ -147,7 +147,7 @@ run "creates_a_network_and_composes_by_default" {
     error_message = "the cache bucket name should derive from name and account"
   }
   assert {
-    condition     = output.interruption_queue_url == "" && output.spot_node_name == ""
+    condition     = output.interruption_queue_url == "" && output.spot_node_name == "" && length(output.interruption_queue_urls) == 0
     error_message = "spot outputs must be empty when spot is off"
   }
   assert {
@@ -363,12 +363,35 @@ run "spot_surfaces_the_node_name" {
     # what the child does with it is asserted in fleet.tftest.hcl, because a test
     # run against the root cannot address a child module's resources.
     spot_router_alarm_actions = ["arn:aws:sns:us-east-1:123456789012:billet-ops"]
+    # A SECOND SPOT NODE, named from the root. The map output is the witness that
+    # the list crossed the module call and the child's queues came back through
+    # it; the queue, the grants and the router's environment are asserted in
+    # fleet.tftest.hcl for the same reason as the alarm action.
+    spot_node_names = ["build-1"]
   }
 
   assert {
     condition     = output.spot_node_name == "billet-test-spot-interruptions"
     error_message = "the spot node name must be the queue basename"
   }
+  assert {
+    condition     = toset(keys(output.interruption_queue_urls)) == toset(["billet-test-spot-interruptions", "build-1"])
+    error_message = "interruption_queue_urls must carry the primary and every spot_node_names entry, keyed by node name, through the root"
+  }
+}
+
+# THE ROOT ENFORCES THE CHILD'S RULE ITSELF, so the refusal names the input the
+# operator typed rather than surfacing from a module they did not write.
+run "spot_node_names_without_spot_is_refused_at_the_root" {
+  command = plan
+
+  variables {
+    name            = "billet-test"
+    enable_spot     = false
+    spot_node_names = ["build-1"]
+  }
+
+  expect_failures = [var.spot_node_names]
 }
 
 # ...and a value that is not an ARN is refused at PLAN, not silently ignored by

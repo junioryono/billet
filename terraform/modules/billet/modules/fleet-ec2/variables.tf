@@ -69,6 +69,49 @@ variable "enable_spot" {
   default     = false
 }
 
+# SEVERAL SPOT NODES ARE SEVERAL QUEUES, AND ONE INPUT MAKES THEM. billet needs one
+# interruption queue per spot node, its basename equal to that node's node.name;
+# the queue enable_spot creates serves one node. Each name here creates a queue
+# named exactly it, and the node role's consumer grant, the router's forwarding
+# grant and the set of names the router is told it serves all widen from this one
+# list — so telling the router about a queue, granting it, and granting the node
+# are one operation rather than three an operator can half-do. The half-done shape
+# is what issue #66 was: a queue granted by hand but never named to the router
+# had its warnings DROPPED while the grant propagated, because the router could
+# not prove the queue was its own.
+variable "spot_node_names" {
+  description = "Further spot nodes beside the one enable_spot creates. One interruption queue is created per entry, named exactly it (billet requires the queue basename to equal the node's node.name), and the node grant, the router grant and the router's served set widen to every queue from this one input. Queue names are account-wide per region in SQS. Requires enable_spot."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = length(var.spot_node_names) == 0 || var.enable_spot
+    error_message = "spot_node_names requires enable_spot: the router and the primary queue it serves only exist with spot enabled, and a queue nothing forwards to receives no warning."
+  }
+
+  validation {
+    # THE INTERSECTION OF TWO RULES, both of which the name has to satisfy:
+    # billet's node name (^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$, config.ValidateNodeName)
+    # and SQS's queue name ([A-Za-z0-9_-]{1,80}). A dot is the case worth spelling
+    # out: legal for billet, refused by SQS, and refusing it here is a plan
+    # failure rather than an apply that dies after the first queue was created.
+    condition     = alltrue([for n in var.spot_node_names : can(regex("^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$", n))])
+    error_message = "every spot_node_names entry must be a name both billet and SQS accept: 1 to 64 letters, digits, hyphens or underscores, starting with a letter or digit, and no dot (billet allows one in a node name; SQS refuses it in a queue name)."
+  }
+
+  validation {
+    # toset() would collapse a duplicate silently, and two nodes named alike would
+    # then share one queue — the shared-consumer shape billet refuses.
+    condition     = length(distinct(var.spot_node_names)) == length(var.spot_node_names)
+    error_message = "spot_node_names must not repeat a name: two spot nodes cannot share one interruption queue."
+  }
+
+  validation {
+    condition     = !contains(var.spot_node_names, local.spot_queue_name)
+    error_message = "spot_node_names must not name the primary queue enable_spot already creates (<name>-spot-interruptions); that node is served by spot_node_name."
+  }
+}
+
 variable "spot_router_alarm_actions" {
   description = "ARNs notified when the spot interruption router fails an invocation — a warning it could not place and re-raised for Lambda to retry. Usually an SNS topic; this module creates none, so an operator supplies their own. Empty leaves the alarm with no action: its state is still visible in the console and to DescribeAlarms, but nothing is sent."
   type        = list(string)
