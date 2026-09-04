@@ -144,12 +144,23 @@ jobs:
       # THE JOB THE RUN IS WAITING FOR. `billet acceptance` deliberately does not
       # dispatch one — deciding which workflow to run is the operator's, and a
       # command that dispatched one would need write access to a repository for no
-      # reason. Here that operator is this step.
-      - name: Dispatch the acceptance workflow
+      # reason. Here that operator is the three steps below.
+      #
+      # THE CREDENTIAL THAT DISPATCHES IT IS MINTED HERE, FROM THE APP KEY THE RUN
+      # ALREADY HOLDS, and it is nobody's personal token. The acceptance App is
+      # installed on the guide repository alone and holds `actions: write` there;
+      # the installation token is narrowed further at minting to that one
+      # repository and that one permission, lives an hour, and the action revokes
+      # it when the job ends. A fine-grained personal access token would do the
+      # same job as a credential tied to a person, expiring on a date nobody
+      # watches, passing through a clipboard on its way into the secret; this
+      # passes through nothing.
+      - name: Name the repository the acceptance workflow runs in
+        id: target
         env:
-          GH_TOKEN: ${{ secrets.BILLET_ACCEPTANCE_DISPATCH_TOKEN }}
           BILLET_ACCEPTANCE_WORKFLOW: ${{ vars.BILLET_ACCEPTANCE_WORKFLOW }}
           BILLET_ACCEPTANCE_REPO: ${{ vars.BILLET_ACCEPTANCE_REPO }}
+          BILLET_ACCEPTANCE_APP_CLIENT_ID: ${{ vars.BILLET_ACCEPTANCE_APP_CLIENT_ID }}
         run: |
           set -eu
 
@@ -160,7 +171,46 @@ jobs:
             exit 1
           fi
 
-          gh workflow run "$BILLET_ACCEPTANCE_WORKFLOW" --repo "$BILLET_ACCEPTANCE_REPO"
+          if [ -z "${BILLET_ACCEPTANCE_APP_CLIENT_ID:-}" ]; then
+            echo "::error::BILLET_ACCEPTANCE_APP_CLIENT_ID must be the acceptance App's client id;" >&2
+            echo "it is what the App key below signs for when the dispatch token is minted." >&2
+            exit 1
+          fi
+
+          # owner/name and nothing else: the two halves become the token's scope,
+          # and a value that split wrongly would ask for a token on the wrong
+          # repository rather than fail.
+          case "$BILLET_ACCEPTANCE_REPO" in
+            */*/* | */ | /*)
+              echo "::error::BILLET_ACCEPTANCE_REPO must be owner/name, got '$BILLET_ACCEPTANCE_REPO'." >&2
+              exit 1
+              ;;
+            */*) ;;
+            *)
+              echo "::error::BILLET_ACCEPTANCE_REPO must be owner/name, got '$BILLET_ACCEPTANCE_REPO'." >&2
+              exit 1
+              ;;
+          esac
+
+          echo "owner=${BILLET_ACCEPTANCE_REPO%%/*}" >> "$GITHUB_OUTPUT"
+          echo "name=${BILLET_ACCEPTANCE_REPO#*/}" >> "$GITHUB_OUTPUT"
+
+      - name: Mint the token that dispatches it
+        id: dispatch-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.BILLET_ACCEPTANCE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.BILLET_ACCEPTANCE_APP_KEY }}
+          owner: ${{ steps.target.outputs.owner }}
+          repositories: ${{ steps.target.outputs.name }}
+          permission-actions: write
+
+      - name: Dispatch the acceptance workflow
+        env:
+          GH_TOKEN: ${{ steps.dispatch-token.outputs.token }}
+          BILLET_ACCEPTANCE_WORKFLOW: ${{ vars.BILLET_ACCEPTANCE_WORKFLOW }}
+          BILLET_ACCEPTANCE_REPO: ${{ vars.BILLET_ACCEPTANCE_REPO }}
+        run: gh workflow run "$BILLET_ACCEPTANCE_WORKFLOW" --repo "$BILLET_ACCEPTANCE_REPO"
 
       # THE RUN ITSELF, and `--no-teardown` because the teardown is the step
       # below: it must run when this one FAILS, and a teardown inside a step that
