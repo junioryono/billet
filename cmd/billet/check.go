@@ -150,7 +150,8 @@ func runCheck(ctx context.Context, opts checkOptions) (checkReport, error) {
 	// A fatal GitHub verdict is returned at the END, after every local section
 	// has reported: check is the command an operator reaches for when something
 	// is wrong, and a stale installation_id must not hide the local diagnostics.
-	var githubFailure error
+	// The node's cache verdict is deferred the same way and for the same reason.
+	var githubFailure, cacheFailure error
 
 	if cfg.GitHub != nil {
 		fmt.Printf("org      %s (app %d, installation %d)\n",
@@ -287,35 +288,64 @@ func runCheck(ctx context.Context, opts checkOptions) (checkReport, error) {
 	}
 
 	if cfg.Node != nil {
+		// WHAT THE GUESTS WILL ACTUALLY GET, DECIDED BEFORE ANYTHING THAT CAN
+		// ABORT. The verdict is a fact about the configuration and needs nothing
+		// else to be true: no certificate, no credentials, no network. Every other
+		// step of this section can end the run — and a host still being
+		// commissioned commonly has an unreadable bundle, no AWS credentials AND no
+		// cache listener at once, which is exactly the operator who must not have
+		// to fix the first two before being told about the third.
+		//
+		// PRINTED AFTER THE HEADER, because an absent node.name is filled in from
+		// the certificate below, so there is no name to print before it.
+		//
+		// Its refusal is DEFERRED like the GitHub verdict, and for the same reason:
+		// a store nothing can reach is a failed check, and it must not hide the
+		// local diagnostics that come after it.
+		var cacheLines []string
+
+		cacheLines, cacheFailure = judgeNodeCache(cfg)
+
 		var bundle *wirecert.Bundle
 		if cfg.Node.TLS != nil {
 			b, err := nodeBundle(cfg)
 			if err != nil {
-				return report, fmt.Errorf("node identity: %w", err)
+				// NO HEADER HERE: this is the one path where the node's name was
+				// never established. The verdict is printed anyway, because it
+				// never depended on the name.
+				printNodeCache(cacheLines)
+
+				return report, errors.Join(cacheFailure, fmt.Errorf("node identity: %w", err))
 			}
 			bundle = b
 		}
+
 		site := cfg.Node.Site
 		if site == "" {
 			site = "local (implicit)"
 		}
 		fmt.Printf("node     %s at %s via %s -> %s\n", cfg.Node.Name, site,
 			cfg.Node.Provider, cfg.Node.ServerAddr)
+		printNodeCache(cacheLines)
 
 		// Config validation proves the ec2 block is COHERENT. It cannot prove this
 		// machine can act on it, and the difference is a deployment that validates
 		// and then fails on the first job of the day.
 		// THE COST BOUND IS PRINTED FOR EVERY REMOTE BACKEND, because every one of
 		// them declares priced shapes; only the ec2 credential probe is ec2's.
+		// NEITHER FINDING HIDES THE OTHER, which is why every return from here to
+		// the end of this block carries the cache verdict with it. A host still
+		// being configured commonly cannot reach AWS at all, and that is exactly
+		// the host whose operator has to be told the cache is unreachable too.
 		if !cfg.Node.Provider.RunsOnHost() {
 			if err := printRemoteCost(cfg); err != nil {
-				return report, err
+				return report, errors.Join(cacheFailure, err)
 			}
 		}
 
 		if cfg.Node.Provider == config.ProviderEC2 && cfg.Node.EC2 != nil {
 			if err := checkEC2Credentials(ctx, cfg, bundle, opts.authorize, skipNetworkProbes); err != nil {
-				return report, err
+				return report, errors.Join(cacheFailure, err)
 			}
 		}
 
@@ -330,14 +360,14 @@ func runCheck(ctx context.Context, opts checkOptions) (checkReport, error) {
 
 			if !skipNetworkProbes {
 				if err := checkCodeBuildLive(ctx, cfg, bundle); err != nil {
-					return report, err
+					return report, errors.Join(cacheFailure, err)
 				}
 			}
 		}
 
 		if cfg.Node.Ceph != nil {
 			if err := checkCephCluster(ctx, cfg.Node.Ceph); err != nil {
-				return report, err
+				return report, errors.Join(cacheFailure, err)
 			}
 		}
 
@@ -348,7 +378,7 @@ func runCheck(ctx context.Context, opts checkOptions) (checkReport, error) {
 		// useful one to name first.
 		if cfg.Node.Provider == config.ProviderFirecracker && cfg.Node.Firecracker != nil {
 			if err := checkFirecrackerHost(ctx, cfg); err != nil {
-				return report, err
+				return report, errors.Join(cacheFailure, err)
 			}
 			// REPORTED, NEVER FATAL: a stale image is maintenance information, and
 			// the failure this line exists to catch is a refresh timer that stopped
@@ -358,7 +388,7 @@ func runCheck(ctx context.Context, opts checkOptions) (checkReport, error) {
 
 		if cfg.Node.Provider == config.ProviderTart {
 			if err := checkTartHost(ctx, cfg); err != nil {
-				return report, err
+				return report, errors.Join(cacheFailure, err)
 			}
 		}
 	}
@@ -507,9 +537,11 @@ func runCheck(ctx context.Context, opts checkOptions) (checkReport, error) {
 			reservedVCPU, cfg.Server.MaxVCPU, share, reservedMemory, cfg.Server.MaxMemory)
 	}
 
-	// The deferred GitHub verdict: everything local has reported, and a check
-	// with a broken App is still a failed check.
-	return report, githubFailure
+	// The deferred verdicts: everything local has reported, and a check with a
+	// broken App — or with a cache store nothing can reach — is still a failed
+	// check. JOINED rather than ordered, because neither of them is the other's
+	// consequence and an operator with both has both to fix.
+	return report, errors.Join(githubFailure, cacheFailure)
 }
 
 // checkTrustedGroup reaches the verdict the server reaches at startup, using

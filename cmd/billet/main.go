@@ -3236,8 +3236,19 @@ func ec2Preflight(
 			probeErr := store.CheckAccess(ctx)
 			switch judgeCacheProbe(probeErr) {
 			case cacheProbeAnswered:
-				fmt.Printf("cache    bucket %s answers under this deployment's prefix\n",
-					cfg.Node.EBSS3.Bucket)
+				// A BUCKET THAT ANSWERS IS NOT A CACHE. Without a node.cache
+				// listener nothing on this host ever reads or writes that prefix,
+				// and this line read as though the cache were working — which is
+				// most of why the whole shape was silent. The refusal is above;
+				// this stops the report contradicting it three lines later.
+				reachable := ""
+				if cfg.Node.Cache == nil {
+					reachable = " (but nothing on this node serves it — see the cache " +
+						"line above)"
+				}
+
+				fmt.Printf("cache    bucket %s answers under this deployment's prefix%s\n",
+					cfg.Node.EBSS3.Bucket, reachable)
 			case cacheProbeInconclusive:
 				fmt.Printf("cache    bucket probe INCONCLUSIVE: %v\n", probeErr)
 				fmt.Printf("         (a 403 here is EITHER a refused identity OR a healthy miss " +
