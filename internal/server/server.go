@@ -505,7 +505,12 @@ func (s *Server) runTier(ctx context.Context, t *config.Tier, set *ScaleSet) err
 // A JOB IS NOT LOST WHILE THIS WAITS. GitHub queues a job for 24 hours when no
 // runner is available, and compute already running is held by its node and
 // re-adopted; what the wait costs is scheduling latency, which is the tradeoff
-// ADR-001 already accepts by choosing recovery in minutes over HA.
+// ADR-001 already accepts by choosing recovery in minutes over HA. Measured on
+// eight runs, 2026-09-04: the abandoned session was still refused at 60 seconds
+// every time and open at 91 or 92, and the message it was holding
+// unacknowledged came back to the successor each time. A
+// measurement rather than a promise, which is why this is a loop and not a
+// sleep, and why nothing here assumes the redelivery.
 func (s *Server) openSession(ctx context.Context, t *config.Tier, set *ScaleSet) (Session, error) {
 	for attempt := 1; ; attempt++ {
 		session, err := s.prov.Session(ctx, set.ID, s.owner)

@@ -25,6 +25,21 @@
       ]
     },
     {
+      "Sid": "BilletRuntimeDenyForeignSnapshot",
+      "Effect": "Deny",
+      "Action": [
+        "ec2:RunInstances"
+      ],
+      "Resource": [
+        "arn:TFPARTITION:ec2:*:*:snapshot/*"
+      ],
+      "Condition": {
+        "Null": {
+          "aws:ResourceTag/sh.billet.owner": "true"
+        }
+      }
+    },
+    {
       "Sid": "BilletRuntimeTag",
       "Effect": "Allow",
       "Action": [

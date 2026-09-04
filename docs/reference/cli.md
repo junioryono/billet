@@ -69,7 +69,7 @@ Generate the hybrid shape as one unit into `--out DIR`: a Terraform root over th
 
 ### `billet init iam`
 
-Print the IAM policy this config's node role needs, derived from the config: cache adds EBS and S3, spot adds the queue, an instance profile adds `PassRole`.
+Print the IAM policy this config's node role needs, derived from the config: cache adds EBS and S3, spot adds the queue, an instance profile adds `PassRole`. Every ec2 policy also denies `ec2:RunInstances` for a snapshot the deployment does not own, because that grant otherwise reads any snapshot in the account through a block-device mapping.
 
 | Flag | Meaning |
 |---|---|

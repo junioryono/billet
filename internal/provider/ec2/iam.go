@@ -85,6 +85,12 @@ func RuntimeDescribeIAMActions() []string {
 // tightly enough to be safe is exactly the kind of multi-resource condition that
 // denies a legitimate launch. The instances it creates are tagged, which is what
 // the tag-conditioned teardown below relies on.
+//
+// THE ONE BOUND ON IT IS A DENY, not a narrower Allow: RunInstances also
+// authorizes every snapshot a block-device mapping names, so the bundled policy
+// denies this action outright for any snapshot resource the deployment does not
+// own. billet's own launches name no snapshot, so nothing this package sends is
+// affected.
 func RuntimeLaunchIAMActions() []string {
 	return []string{IAMRunInstances}
 }
