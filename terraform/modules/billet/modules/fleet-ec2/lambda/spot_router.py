@@ -14,7 +14,9 @@ thing that may consume one SILENTLY is a positive proof it is not this router's 
 place: an instance that is present and carries no tag, an instance EC2 says is
 already gone, a tag that cannot name a queue, or a tag naming a queue other than
 the one this router serves (BILLET_INTERRUPTION_QUEUE_NAME, set by the module to
-the queue it created). Everything else is a could-not-tell and is re-raised, so
+the queue it created) WHOSE lookup or send then fails in a way no retry can fix.
+That last one takes both halves: a queue this router is granted but was not told
+about still forwards. Everything else is a could-not-tell and is re-raised, so
 Lambda retries and the failure appears on the function's Errors metric — where the
 module's alarm reports it — rather than a real warning disappearing.
 

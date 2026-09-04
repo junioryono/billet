@@ -164,7 +164,13 @@ class SpotRouterTest(unittest.TestCase):
                 with contextlib.redirect_stdout(spoken):
                     spot_router.handler(_warning(), None)
 
-                self.assertIn("is not a legal queue name", spoken.getvalue())
+                # The line NAMES THE TAG, and is not the untagged one: both paths
+                # drop without touching SQS, so this is the only thing that can
+                # tell them apart.
+                said = spoken.getvalue()
+                self.assertIn(f"{spot_router.NODE_TAG}=''", said)
+                self.assertIn("is not a legal queue name", said)
+                self.assertNotIn("names no billet node", said)
                 _sqs.get_queue_url.assert_not_called()
                 _sqs.send_message.assert_not_called()
 
@@ -306,20 +312,27 @@ class SpotRouterModuleWiringTest(unittest.TestCase):
         with open(os.path.join(_HERE, "..", "spot.tf"), encoding="utf-8") as f:
             spot_tf = f.read()
 
-        # Scoped to the ROUTER FUNCTION'S environment block. An assignment anywhere
-        # else in spot.tf — a local, another resource — would satisfy a whole-file
-        # search while the deployed function carried nothing.
-        block = re.search(
-            r'resource\s+"aws_lambda_function"\s+"spot_router"\s*\{.*?\n'
-            r"\s*environment\s*\{\s*\n\s*variables\s*=\s*\{(.*?)\n\s*\}",
+        # Scoped to the ROUTER FUNCTION'S OWN declaration: cut at the next top-level
+        # resource or data block first, so the environment searched inside it cannot
+        # be some other resource's further down the file, and an assignment anywhere
+        # else in spot.tf cannot satisfy a search that was meant to be about this one.
+        declaration = re.search(
+            r'^resource\s+"aws_lambda_function"\s+"spot_router"\s*\{\n(.*?)^\}$',
             spot_tf,
-            re.DOTALL,
+            re.DOTALL | re.MULTILINE,
+        )
+        self.assertIsNotNone(
+            declaration, "spot.tf must declare aws_lambda_function.spot_router")
+
+        block = re.search(
+            r"^\s*environment\s*\{\s*\n\s*variables\s*=\s*\{(.*?)\n\s*\}",
+            declaration.group(1),
+            re.DOTALL | re.MULTILINE,
         )
         self.assertIsNotNone(
             block,
-            "spot.tf must give aws_lambda_function.spot_router an environment block; "
-            "without one the handler cannot tell a foreign queue from its own "
-            "missing grant",
+            "the router function must carry an environment block; without one the "
+            "handler cannot tell a foreign queue from its own missing grant",
         )
 
         assignment = re.search(

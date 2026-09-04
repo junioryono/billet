@@ -34,7 +34,7 @@ Every resource this child can own, mechanically complete — a resource absent h
 | `aws_sqs_queue.interruptions` | `enable_spot` | Basename must equal the spot node's `node.name` |
 | `aws_iam_role_policy.spot` | `enable_spot` | Queue-scoped, actions from `policy/spot-actions.json` |
 | `aws_iam_role.spot_router` + policy, `aws_lambda_function.spot_router`, `aws_cloudwatch_log_group.spot_router`, `aws_cloudwatch_event_rule.spot_interruption` + target, `aws_lambda_permission.spot_router` | `enable_spot` | The tag-scoped router; least-privilege IAM. Told the created queue's name, which is what lets it drop a foreign warning without dropping one its own grant merely failed to reach |
-| `aws_cloudwatch_metric_alarm.spot_router_errors` | `enable_spot` | One `Errors` datapoint in five minutes; no action until `spot_router_alarm_actions` names one |
+| `aws_cloudwatch_metric_alarm.spot_router_errors` | `enable_spot` | One `Errors` datapoint in one minute; no action until `spot_router_alarm_actions` names one |
 | `data.archive_file.spot_router` | `enable_spot` | Zips the committed Lambda source under the root's `.terraform` |
 
 Adopted (never created): the VPC (`vpc_id` is a required input).
