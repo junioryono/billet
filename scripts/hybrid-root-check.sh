@@ -78,4 +78,9 @@ check_shape untrusted
 check_shape trusted --runner-group billet-trusted \
     --workflow 'acme/repo/.github/workflows/ci.yml@refs/heads/main'
 
-echo "hybrid-root-check: both roots validate"
+# THE BUILDER SHAPE, because it renders module inputs the other two do not and
+# references a resource this root creates: a renamed input or bucket attribute
+# passes every Go test and fails an operator's first plan.
+check_shape builder --builder
+
+echo "hybrid-root-check: every root validates"

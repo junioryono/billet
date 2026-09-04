@@ -810,3 +810,98 @@ func TestPerDeploymentKMSKeyScopesEveryKMSGrant(t *testing.T) {
 		t.Errorf("expected the Use and Grant KMS statements, found %d", kmsStatements)
 	}
 }
+
+// THE PAYLOAD GRANT REACHES BILLET'S OWN OBJECTS AND NOTHING ELSE IN THE BUCKET.
+//
+// `billet ami build --payload-bucket` stages one archive per build at the bucket
+// ROOT, named billet-payload-<digest>-<nonce>.tar.gz, and payloadStager refuses a
+// key containing a slash — so the resource can be scoped by that object name
+// rather than by a prefix an operator would have to keep clear. Asserted as the
+// whole resource, because widening it to `<bucket>/*` is the obvious edit and it
+// hands this role every object an operator keeps beside the payloads.
+func TestThePayloadGrantIsScopedToBilletsOwnObjects(t *testing.T) {
+	p, err := Inputs{
+		Owner: "0f1e2d3c4b5a69788796a5b4c3d2e1f0", Builder: true,
+		Payload: &Payload{Bucket: "billet-ami-payloads"},
+	}.Build()
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	s := stmt(t, p, "BilletAMIBuilderPayload")
+
+	want := []string{"arn:aws:s3:::billet-ami-payloads/billet-payload-*"}
+	if !slices.Equal(s.Resource, want) {
+		t.Errorf("the payload grant acts on %v, want %v", s.Resource, want)
+	}
+
+	// THREE ACTIONS, AND THE READ IS NOT OPTIONAL: the builder hands the guest a
+	// PRESIGNED url, which grants no more than its signer holds, so without
+	// s3:GetObject the build downloads its own payload and gets a 403.
+	wantActions := []string{"s3:PutObject", "s3:GetObject", "s3:DeleteObject"}
+	if !slices.Equal(s.Action, wantActions) {
+		t.Errorf("the payload grant permits %v, want %v", s.Action, wantActions)
+	}
+
+	// AND IT CARRIES NO CONDITION, deliberately: the objects are created by this
+	// same role moments earlier and carry no tags, so a tag condition would deny
+	// the read-back and the cleanup of billet's own archive.
+	if len(s.Condition) != 0 {
+		t.Errorf("the payload grant is conditioned on %v; a tag condition here denies "+
+			"the builder its own object", s.Condition)
+	}
+}
+
+// A PAYLOAD BUCKET WITHOUT A BUILDER IS REFUSED RATHER THAN IGNORED.
+//
+// Nothing but `billet ami build` touches that bucket, so granting it to a plain
+// node role widens the identity every job's instance is launched by for a
+// command it never runs. Silently dropping it is worse than refusing: the
+// operator believes they granted something, and the build fails on a permission
+// they think they gave.
+func TestAPayloadBucketNeedsABuilder(t *testing.T) {
+	_, err := Inputs{
+		Owner:   "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+		Payload: &Payload{Bucket: "billet-ami-payloads"},
+	}.Build()
+	if err == nil {
+		t.Fatal("a payload bucket without Builder must be refused")
+	}
+	if !strings.Contains(err.Error(), "only meaningful for a builder") {
+		t.Errorf("the refusal must say why, got %v", err)
+	}
+}
+
+// A WIDENING BUCKET NAME IS REFUSED, the same rule the backup bucket follows: a
+// `*` in an ARN component reaches every bucket sharing the prefix.
+func TestAPayloadBucketRefusesAWideningName(t *testing.T) {
+	for _, bucket := range []string{"", "billet-*", "billet-payloads/extra"} {
+		t.Run(bucket, func(t *testing.T) {
+			_, err := Inputs{
+				Owner: "0f1e2d3c4b5a69788796a5b4c3d2e1f0", Builder: true,
+				Payload: &Payload{Bucket: bucket},
+			}.Build()
+			if err == nil {
+				t.Fatalf("bucket %q must be refused", bucket)
+			}
+		})
+	}
+}
+
+// A BUILDER WITHOUT A PAYLOAD BUCKET GRANTS NOTHING ON S3, so the ec2-only
+// builder grant stays what it was for every deployment whose installers still
+// fit in user data.
+func TestABuilderWithoutAPayloadBucketTouchesNoS3(t *testing.T) {
+	p, err := Inputs{Owner: "0f1e2d3c4b5a69788796a5b4c3d2e1f0", Builder: true}.Build()
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	for _, s := range p.Statement {
+		for _, a := range s.Action {
+			if strings.HasPrefix(a, "s3:") {
+				t.Errorf("%s grants %s without a payload bucket", s.Sid, a)
+			}
+		}
+	}
+}

@@ -75,6 +75,50 @@ variable "iam_policy_json" {
   default     = ""
 }
 
+# THE AMI BUILDER'S GRANT, OFF BY DEFAULT AND ADDITIVE.
+#
+# `billet ami build` provisions an instance, images it, boots the image it made
+# and reads the verifier's report off the console before stamping the contract
+# tag. None of that is in the node's own policy, so without this the command is
+# run from a workstation with an operator's own credentials — a second machine
+# to keep trustworthy for one step, on a deployment whose controller may be
+# reachable only through a tunnel.
+#
+# A SEPARATE INLINE POLICY rather than a variant of the node rendering, so the
+# node's grant is byte-identical whether or not a deployment builds images, and
+# so an operator can read in one document exactly what turning this on added. It
+# is ADDITIVE: the builder's launches ride the node policy's own RunInstances,
+# admitted because the module's rendering is presence-mode and the builder tags
+# its instances with the same owner key. Passing a VALUE-scoped iam_policy_json
+# instead (`billet init iam --deployment <id>`) needs `--builder` on that command
+# too, or the runtime statements will not admit the builder's own tag.
+variable "builder" {
+  description = "Grant the node role what `billet ami build` needs: ec2:CreateImage on a builder-tagged instance and on the image and snapshots it makes, its own TerminateInstances for cleanup, GetConsoleOutput to read the verifier's report, and the CreateTags that stamps a verified image. Off by default — it widens the identity every job's instance is launched by, and a deployment that builds its AMI elsewhere should not carry it."
+  type        = bool
+  default     = false
+}
+
+variable "builder_payload_bucket" {
+  description = "The S3 bucket `billet ami build --payload-bucket` stages its shared installers in, when they no longer fit EC2's 16384-byte user-data limit. Empty grants nothing on S3. The grant is scoped to the object names billet writes (billet-payload-*) at the bucket root, so anything else kept in that bucket is out of reach. Requires builder."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.builder_payload_bucket == "" || var.builder
+    error_message = "builder_payload_bucket is only read when builder = true; nothing but `billet ami build` stages objects there, so granting it to a role that does not build would widen it for a command it never runs."
+  }
+
+  validation {
+    # THE SAME RULES THE GENERATOR APPLIES, restated because this value is
+    # spliced into an IAM Resource ARN here: a wildcard widens the grant to every
+    # bucket sharing the prefix, and a slash names a key rather than a bucket, so
+    # the grant would match nothing and the build would fail fetching its own
+    # payload on a permission the operator believes they gave.
+    condition     = var.builder_payload_bucket == "" || can(regex("^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$", var.builder_payload_bucket))
+    error_message = "builder_payload_bucket must be a literal S3 bucket name (lowercase letters, digits, dots, hyphens) — no wildcard and no slash: it is spliced into an IAM Resource ARN."
+  }
+}
+
 variable "job_instance_profile_role_arn" {
   description = "The exact IAM role ARN trusted JOB instances receive (node.ec2.instance_profile's role); grants the node role iam:PassRole on it alone. Empty grants no PassRole."
   type        = string

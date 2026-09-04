@@ -50,6 +50,23 @@ func tfPolicyCases() map[string]awspolicy.Inputs {
 		"node-policy-cache-kms.json": {
 			Partition: "TFPARTITION", DNSSuffix: "TFDNSSUFFIX", Region: "TFREGION", Cache: cacheKMS,
 		},
+
+		// THE BUILDER IS A SEPARATE INLINE POLICY, not a variant of the node
+		// rendering, and NoCompute is what makes that possible: it carries the
+		// AMI-builder statements and nothing else, so the node's own grant is
+		// byte-identical whether or not a deployment builds images. Attaching it
+		// as its own aws_iam_role_policy also means an operator can read, in one
+		// document, exactly what turning `builder` on added.
+		//
+		// TWO RENDERINGS, gated on whether the installers are staged in S3.
+		// `--payload-bucket` is needed only once the toolcache declaration
+		// outgrows EC2's 16384-byte user-data limit, so a deployment that does
+		// not stage gets no S3 grant at all.
+		"builder-policy.json": {Partition: "TFPARTITION", NoCompute: true, Builder: true},
+		"builder-policy-payload.json": {
+			Partition: "TFPARTITION", NoCompute: true, Builder: true,
+			Payload: &awspolicy.Payload{Bucket: "TFPAYLOADBUCKET"},
+		},
 	}
 }
 

@@ -38,6 +38,10 @@ func cmdInitIAM(_ context.Context, args []string) error {
 		"also grant what `billet ami build` needs: ec2:CreateImage, tagging the image it "+
 			"creates, ec2:GetConsoleOutput to read the verification's report, and the "+
 			"ec2:CreateTags that stamps a verified image's contract")
+	payloadBucket := fs.String("payload-bucket", "",
+		"the S3 bucket `billet ami build --payload-bucket` stages the shared installers in, "+
+			"needed once they outgrow EC2's user-data limit; grants put, get and delete on the "+
+			"object names billet writes there and nothing else (requires --builder)")
 	roleARN := fs.String("role-arn", "",
 		"the IAM role ARN the instance_profile contains, for iam:PassRole scoping")
 	kmsKeyARN := fs.String("kms-key-arn", "",
@@ -114,7 +118,7 @@ func cmdInitIAM(_ context.Context, args []string) error {
 		return err
 	}
 
-	in, err := iamInputsFromConfig(cfg, *builder, *roleARN, *kmsKeyARN)
+	in, err := iamInputsFromConfig(cfg, *builder, *roleARN, *kmsKeyARN, *payloadBucket)
 	if err != nil {
 		return err
 	}
@@ -201,13 +205,29 @@ func deploymentStateDirs(cfg *config.Config) []string {
 
 // iamInputsFromConfig reads the deployment's shape out of the loaded config,
 // resolving the two identifiers that must be ARNs from their flags.
-func iamInputsFromConfig(cfg *config.Config, builder bool, roleARN, kmsKeyARN string) (awspolicy.Inputs, error) {
+func iamInputsFromConfig(
+	cfg *config.Config, builder bool, roleARN, kmsKeyARN, payloadBucket string,
+) (awspolicy.Inputs, error) {
 	ec2cfg := cfg.Node.EC2
 
 	in := awspolicy.Inputs{
 		Partition: awspolicy.PartitionForRegion(ec2cfg.Region),
 		Region:    ec2cfg.Region,
 		Builder:   builder,
+	}
+
+	// THE PAYLOAD BUCKET IS A FLAG BECAUSE IT IS NOT IN THE CONFIG. It is an
+	// argument to `billet ami build`, not something billet.yaml names, so this
+	// command cannot derive it — and a build that stages installers without the
+	// grant fails fetching its own payload.
+	if payloadBucket != "" {
+		if !builder {
+			return awspolicy.Inputs{}, errors.New("--payload-bucket is only meaningful with " +
+				"--builder: it is where `billet ami build` stages the shared installers, and " +
+				"nothing else billet does touches that bucket")
+		}
+
+		in.Payload = &awspolicy.Payload{Bucket: payloadBucket}
 	}
 
 	// PassRole is needed only when the config names an instance profile, and it

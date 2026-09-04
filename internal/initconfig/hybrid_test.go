@@ -552,3 +552,33 @@ func TestGenerateHybridHostSideInputs(t *testing.T) {
 		}
 	}
 }
+
+// THE BUILDER GRANT MOVES THE IMAGE BUILD ONTO THE CONTROLLER, which is the
+// whole point of asking for it: without it `billet ami build` runs from a
+// machine holding AWS credentials of its own, which on a deployment reached
+// only through a tunnel is a second machine to keep trustworthy for one step.
+func TestGenerateHybridBuilderGrant(t *testing.T) {
+	t.Parallel()
+
+	off, _ := mustGenerateHybrid(t, hybridParams())
+	if strings.Contains(off[HybridTerraformFile], "\n  builder                = true") {
+		t.Error("the builder grant must be off unless asked")
+	}
+	if !strings.Contains(off[HybridTerraformFile], "--builder") {
+		t.Error("the root must say how to turn the builder grant on")
+	}
+
+	p := hybridParams()
+	p.Builder = true
+	on, _ := mustGenerateHybrid(t, p)
+
+	if !strings.Contains(on[HybridTerraformFile], "builder                = true") {
+		t.Error("the root must ask the module for the builder grant")
+	}
+
+	// THE PAYLOAD BUCKET IS THE ONE THIS ROOT CREATES, by reference rather than
+	// by a second spelling of its name: the grant and the bucket cannot drift.
+	if !strings.Contains(on[HybridTerraformFile], "builder_payload_bucket = aws_s3_bucket.ami_payloads.bucket") {
+		t.Error("the builder's payload grant must name the bucket this root creates")
+	}
+}

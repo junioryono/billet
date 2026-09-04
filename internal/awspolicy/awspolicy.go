@@ -161,6 +161,21 @@ type Backup struct {
 	KMSKeyARN string
 }
 
+// Payload describes the bucket `billet ami build` stages its shared installers
+// in, when they are too large for EC2's user-data limit to carry.
+//
+// THE GRANT IS SCOPED BY OBJECT NAME, NOT BY PREFIX, and that is stricter than a
+// prefix would be. billet writes `billet-payload-<digest>-<nonce>.tar.gz` at the
+// bucket root and refuses a key containing a slash, so the resource can name
+// exactly the objects billet creates — an operator may keep anything else in the
+// same bucket and this role cannot read, replace or delete it.
+type Payload struct {
+	// Bucket is where the archive is staged. It lands in an IAM Resource ARN, so
+	// it must be literal: a `*` here would reach every bucket whose name shares
+	// the prefix.
+	Bucket string
+}
+
 // Identity describes what a CONTROL PLANE needs to reach this deployment's
 // identity material in Parameter Store.
 //
@@ -313,6 +328,12 @@ type Inputs struct {
 	InstanceProfileRoleARN string
 	// Builder adds the ec2:CreateImage the AMI builder needs.
 	Builder bool
+	// Payload, when non-nil, adds the S3 statements `billet ami build
+	// --payload-bucket` needs to stage the shared installers. It is meaningful
+	// only for a BUILDER and is refused without one: nothing else billet does
+	// touches that bucket, so granting it to a plain node role would widen the
+	// role every job's instance is launched by for a command it never runs.
+	Payload *Payload
 	// NoCompute omits the runtime statements entirely, for a principal that
 	// launches nothing.
 	//
@@ -553,6 +574,44 @@ func (in Inputs) Build() (Policy, error) {
 				Condition: builderOwnerCondition(),
 			},
 		)
+	}
+
+	// THE PAYLOAD BUCKET IS THE BUILDER'S, AND ONLY THE BUILDER'S. Refused
+	// without Builder rather than ignored, because a caller who passed it meant
+	// to grant something and silently dropping it is how a build fails on a
+	// permission the operator believes they gave.
+	if in.Payload != nil {
+		if !in.Builder {
+			return Policy{}, errors.New("awspolicy: a payload bucket is only meaningful for a " +
+				"builder; `billet ami build` is the one command that stages installers in it")
+		}
+
+		if in.Payload.Bucket == "" {
+			return Policy{}, errors.New("awspolicy: a payload policy needs the S3 bucket name")
+		}
+
+		if err := literalARNComponent("payload bucket", in.Payload.Bucket); err != nil {
+			return Policy{}, err
+		}
+
+		// A SLASH MAKES IT A KEY RATHER THAN A BUCKET, and the resulting ARN is
+		// structurally valid and matches nothing: the grant would be accepted,
+		// reach no object, and the build would fail downloading its own payload
+		// on a permission the operator believes they gave. No S3 bucket name
+		// contains one, so this can only ever be a mistake.
+		if strings.Contains(in.Payload.Bucket, "/") {
+			return Policy{}, fmt.Errorf("awspolicy: the payload bucket %q contains a slash, so it "+
+				"names a key rather than a bucket; the grant would match no object at all",
+				in.Payload.Bucket)
+		}
+
+		p.Statement = append(p.Statement, Statement{
+			Sid: "BilletAMIBuilderPayload", Effect: "Allow",
+			Action: ec2.BuilderPayloadIAMActions(),
+			Resource: []string{
+				"arn:" + partition + ":s3:::" + in.Payload.Bucket + "/" + ec2.BuilderPayloadKeyPrefix + "*",
+			},
+		})
 	}
 
 	if in.InstanceProfileRoleARN != "" {

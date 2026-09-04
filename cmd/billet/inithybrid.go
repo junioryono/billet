@@ -33,6 +33,7 @@ type hybridInputs struct {
 	instanceTypes, priceOverrides  []string
 	sshIngress                     []string
 	keyName, localUser, localImage string
+	builder                        bool
 	kernelImage, cephUser, cephKey string
 	cacheListen, cacheGuest        string
 	cfgPath                        string
@@ -96,6 +97,10 @@ func cmdInitHybrid(ctx context.Context, args []string) error {
 	localImage := fs.String("local-image", "",
 		"the guest generation every tier boots on the Firecracker host (default "+
 			initconfig.DefaultFirecrackerImage+", the x64 generation billet publishes)")
+	builder := fs.Bool("builder", false,
+		"grant the controller's role what `billet ami build` performs, so the image is built on "+
+			"the controller rather than from a workstation holding your AWS credentials; it widens "+
+			"the node role by exactly billet's builder document")
 
 	kernelImage := fs.String("kernel-image", "", "the Firecracker host's pinned guest kernel")
 	cephUser := fs.String("ceph-user", "", "the RADOS identity billet authenticates as, WITHOUT the `client.` prefix")
@@ -202,6 +207,7 @@ func cmdInitHybrid(ctx context.Context, args []string) error {
 		SSHKeyName:       *keyName,
 		LocalAnsibleUser: *localUser,
 		LocalImage:       *localImage,
+		Builder:          *builder,
 		Host: initconfig.HostInputs{
 			KernelImage:        *kernelImage,
 			CephUser:           *cephUser,
@@ -250,7 +256,7 @@ func cmdInitHybrid(ctx context.Context, args []string) error {
 		controlPlaneIP: *controlPlaneIP, controllerName: *controllerName, localName: *localName,
 		localVCPU: *localVCPU, cloudVCPU: *maxVCPU, localMemory: *localMemory, cloudMemory: *maxMemory,
 		instanceTypes: instanceTypes, priceOverrides: priceOverrides, sshIngress: sshIngress,
-		keyName: *keyName, localUser: *localUser, localImage: *localImage,
+		keyName: *keyName, localUser: *localUser, localImage: *localImage, builder: *builder,
 		kernelImage: *kernelImage, cephUser: *cephUser, cephKey: *cephKeyring,
 		cacheListen: *cacheListen, cacheGuest: *cacheGuest, out: *out,
 	}
@@ -500,6 +506,9 @@ func hybridFlags(in hybridInputs) []string {
 	add("key-name", in.keyName)
 	add("local-ansible-user", in.localUser)
 	add("local-image", in.localImage)
+	if in.builder {
+		out = append(out, "--builder")
+	}
 	add("kernel-image", in.kernelImage)
 	add("ceph-user", in.cephUser)
 	add("ceph-keyring", in.cephKey)
@@ -614,7 +623,11 @@ func renderHybridRunbook(in hybridInputs, p initconfig.HybridParams, trusted, ca
 	fmt.Fprintf(&b, "Install the controller's own bundle root-owned at `/etc/billet/tls` (`node.crt`, `ca.crt` 0644, `node.key` 0600): `billet-node.service` runs as root and rewrites the bundle at renewal. Stream the local host's bundle host-to-host to its `/etc/billet/tls`, so the key never lands on a laptop. Both configs name exactly these paths, and dial %s.\n\n", wire)
 
 	b.WriteString("## 6. Build the AMI\n\n")
-	b.WriteString("From a workstation with your own AWS credentials: the node role carries no builder grant, on purpose.\n\n")
+	if p.Builder {
+		b.WriteString("**On the controller**, which carries the builder grant this generation asked for, so no machine outside the deployment needs AWS credentials. Take the three values from the outputs on your workstation and run the build over your converge route:\n\n")
+	} else {
+		b.WriteString("From a workstation with your own AWS credentials: the node role carries no builder grant. Generate with `--builder` to move this onto the controller instead.\n\n")
+	}
 	fmt.Fprintf(&b, "```bash\nbillet ami build --region %s \\\n  --subnet \"$(terraform -chdir=%s output -raw subnet_id)\" \\\n  --security-group \"$(terraform -chdir=%s output -raw runner_security_group_id)\" \\\n  --payload-bucket \"$(terraform -chdir=%s output -raw ami_payload_bucket)\" \\\n  --public-ip --base-image ami-<an EBS-backed Ubuntu 24.04 image in %s>\n```\n\n",
 		shellArg(p.Region), tf, tf, tf, p.Region)
 	b.WriteString("Pass `--public-ip`: the created subnet's only route is an internet gateway, which is unusable without an address. The command boots the image it made and stamps it only after it proved itself.\n\n")

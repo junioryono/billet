@@ -27,6 +27,7 @@ Every resource this child can own, mechanically complete — a resource absent h
 | `aws_iam_role.node` | always | Trust policy rendered with `jsonencode`, partition-following |
 | `aws_iam_role_policy.node` | always | The generated rendering, or `iam_policy_json` verbatim |
 | `aws_iam_role_policy.pass_role` | `job_instance_profile_role_arn` set | `iam:PassRole` on exactly that ARN, to EC2 only |
+| `aws_iam_role_policy.builder` | `builder` | What `billet ami build` needs, as its OWN document so the node's rendering is unchanged. Adds one S3 statement with `builder_payload_bucket` |
 | `aws_iam_instance_profile.node` | always | Attach to whatever instance runs billet |
 | `aws_security_group.runner` + egress rule | always | Trusted work; an untrusted group is deliberately yours |
 | `aws_s3_bucket.cache` + public-access block + SSE config | `enable_cache` | Bucket name from `cache_bucket` or `<name>-cache-<account>` |
@@ -43,3 +44,7 @@ Adopted (never created): the VPC (`vpc_id` is a required input).
 - `vpc_id` (required) — this child never creates a network.
 - `iam_policy_json` — `billet init iam` output replaces the rendering entirely.
 - `job_instance_profile_role_arn` — the exact role trusted JOB instances receive; grants `iam:PassRole` on it alone.
+- `builder` — grant the node role what `billet ami build` performs: `ec2:CreateImage` on a builder-tagged instance and on the image and snapshots it makes, its own `TerminateInstances` for cleanup, `GetConsoleOutput` to read the verifier's report off the console, and the `CreateTags` that stamps a verified image's contract. **Off by default**, because it widens the identity every job's instance is launched by, and a deployment that builds its image elsewhere should not carry it. On, the build runs on the controller with its instance role instead of from a workstation holding an operator's own credentials.
+
+  It is **additive**: the builder's launches ride the node policy's own `RunInstances`, which admits them because this module's rendering is presence-mode and `billet ami build` tags its instances with the same owner key. If you replace the rendering with a **value**-scoped `var.iam_policy_json` (`billet init iam --deployment <id>`), pass `--builder` to that command too, or the runtime statements will not admit the builder's own `billet-ami-build-*` tag.
+- `builder_payload_bucket` — the bucket `billet ami build --payload-bucket` stages the shared installers in, needed once the pinned toolcache declaration outgrows EC2's 16384-byte user-data limit. Empty grants nothing on S3. The grant is scoped to the object names billet writes (`billet-payload-*`, at the bucket root, because the stager refuses a key containing a slash), so anything else in that bucket is out of reach. Requires `builder`.

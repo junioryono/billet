@@ -155,6 +155,14 @@ type HybridParams struct {
 	// generation names it, because the generator cannot see that machine.
 	LocalImage string
 
+	// Builder grants the controller's own role what `billet ami build`
+	// performs, so the image can be built ON the controller instead of from a
+	// workstation holding an operator's AWS credentials — a second machine to
+	// keep trustworthy for one step, on a deployment whose controller may be
+	// reachable only through a tunnel. Off by default: it widens the identity
+	// every job's instance is launched by.
+	Builder bool
+
 	// Host carries the Firecracker host's inputs billet cannot detect.
 	Host HostInputs
 
@@ -864,6 +872,24 @@ module "billet" {
   # on EC2, and node.ebs_s3; add it deliberately per docs/deploying/aws-ec2.md.
   enable_cache = false
 `)
+
+	if p.Builder {
+		b.WriteString(`
+  # THE BUILDER'S GRANT, so ` + "`billet ami build`" + ` runs on the controller with its
+  # own instance role rather than from a workstation holding your AWS
+  # credentials. It is additive: the builder's launches ride the node policy's
+  # RunInstances, and the payload grant reaches only the objects billet stages.
+  builder                = true
+  builder_payload_bucket = aws_s3_bucket.ami_payloads.bucket
+`)
+	} else {
+		b.WriteString(`
+  # NO BUILDER GRANT. ` + "`billet ami build`" + ` therefore runs from a machine with AWS
+  # credentials of its own; generate with --builder to move it onto the
+  # controller, which widens the node role by exactly billet's builder document.
+  # builder = true
+`)
+	}
 
 	if len(p.SSHIngressCIDRs) > 0 {
 		b.WriteString("\n  # The machine that runs Ansible, when it reaches the controller by SSH.\n")

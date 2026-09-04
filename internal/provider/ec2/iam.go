@@ -26,7 +26,21 @@ const (
 	IAMSQSReceiveMessage     = "sqs:ReceiveMessage"
 	IAMSQSDeleteMessage      = "sqs:DeleteMessage"
 	IAMSQSGetQueueAttributes = "sqs:GetQueueAttributes"
+
+	IAMS3PutObject    = "s3:PutObject"
+	IAMS3GetObject    = "s3:GetObject"
+	IAMS3DeleteObject = "s3:DeleteObject"
 )
+
+// BuilderPayloadKeyPrefix is the one object-name prefix `billet ami build`
+// stages under, and it is what scopes the payload grant.
+//
+// THE KEYS SIT AT THE BUCKET ROOT. stagePayload builds
+// `billet-payload-<digest>-<nonce>.tar.gz` and payloadStager refuses a key
+// containing a slash, so there is no configurable prefix to grant on — which is
+// better than one: the grant reaches exactly the objects billet writes and
+// nothing else an operator keeps in the same bucket.
+const BuilderPayloadKeyPrefix = "billet-payload-"
 
 // BuilderOwnerPrefix begins the owner-tag value `billet ami build` stamps on the
 // builder instance it launches — a per-build identity distinct from a deployment
@@ -121,6 +135,19 @@ func BuilderVerifyIAMActions() []string {
 // image resources carrying the per-build owner tag, which CreateImage stamped.
 func BuilderPromoteIAMActions() []string {
 	return []string{IAMCreateTags}
+}
+
+// BuilderPayloadIAMActions is what staging the shared installers costs, and all
+// three are performed on the same object by one build.
+//
+// PUT uploads the archive, GET is what the PRESIGNED url the builder hands the
+// guest resolves to — a presigned URL grants no more than its signer holds, so
+// without GetObject the builder signs a URL that answers 403 and the build fails
+// downloading its own payload — and DELETE is the cleanup that runs as each
+// build ends. Declared here, beside the code that performs them, so the
+// generator cannot grant something billet does not do.
+func BuilderPayloadIAMActions() []string {
+	return []string{IAMS3PutObject, IAMS3GetObject, IAMS3DeleteObject}
 }
 
 // SpotIAMActions are what a spot node needs to consume its interruption queue,

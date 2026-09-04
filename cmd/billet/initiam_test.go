@@ -563,3 +563,94 @@ node:
 		t.Errorf("--deployment did not override the state-dir id: got %v", se)
 	}
 }
+
+// plainEC2NodeConfig is a minimal ec2 node config on disk: no instance profile
+// and no cache, so the payload cases below turn on exactly one thing.
+func plainEC2NodeConfig(t *testing.T) string {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), "billet.yaml")
+	body := `
+node:
+  server_addr: 127.0.0.1:7717
+  name: aws-1
+  provider: ec2
+  state_dir: ` + t.TempDir() + `
+  max_vcpu: 64
+  max_memory: 256GiB
+  ec2:
+    region: us-west-2
+    subnet_id: subnet-0abc
+    security_group_ids: [sg-0abc]
+    instance_types:
+      - type: c7i.2xlarge
+        vcpu: 8
+        memory: 16GiB
+        price_usd_per_hour: 0.34
+`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	return path
+}
+
+// THE PAYLOAD BUCKET IS A FLAG BECAUSE billet.yaml DOES NOT NAME IT: it is an
+// argument to `billet ami build`, so this command cannot derive it. With
+// --builder it adds one statement scoped to the object names billet writes;
+// widening it to the whole bucket would hand the role every object an operator
+// keeps beside the payloads.
+func TestInitIAMBuilderPayloadBucketIsScoped(t *testing.T) {
+	path := plainEC2NodeConfig(t)
+
+	out := capture(t, func() {
+		if err := cmdInit(t.Context(), []string{
+			"iam", "--config", path, "--account-wide", "--builder",
+			"--payload-bucket", "billet-ami-payloads",
+		}); err != nil {
+			t.Fatalf("init iam: %v", err)
+		}
+	})
+
+	if !strings.Contains(out, `"arn:aws:s3:::billet-ami-payloads/billet-payload-*"`) {
+		t.Errorf("the payload grant is not scoped to billet's own objects:\n%s", out)
+	}
+	if !strings.Contains(out, "BilletAMIBuilderPayload") {
+		t.Errorf("the payload statement is absent:\n%s", out)
+	}
+}
+
+// WITHOUT --builder IT IS REFUSED, rather than granting S3 to a role that
+// stages nothing: the operator believes they granted something, and the build
+// fails on a permission they think they gave.
+func TestInitIAMRefusesAPayloadBucketWithoutTheBuilder(t *testing.T) {
+	path := plainEC2NodeConfig(t)
+
+	err := cmdInit(t.Context(), []string{
+		"iam", "--config", path, "--account-wide", "--payload-bucket", "billet-ami-payloads",
+	})
+	if err == nil {
+		t.Fatal("init iam accepted --payload-bucket without --builder")
+	}
+	if !strings.Contains(err.Error(), "--payload-bucket") || !strings.Contains(err.Error(), "--builder") {
+		t.Errorf("the refusal must name both flags: %v", err)
+	}
+}
+
+// AND A BUILDER WITHOUT ONE GRANTS NO S3 AT ALL, so a deployment whose
+// installers still fit in user data is unchanged.
+func TestInitIAMBuilderWithoutAPayloadBucketGrantsNoS3(t *testing.T) {
+	path := plainEC2NodeConfig(t)
+
+	out := capture(t, func() {
+		if err := cmdInit(t.Context(), []string{
+			"iam", "--config", path, "--account-wide", "--builder",
+		}); err != nil {
+			t.Fatalf("init iam: %v", err)
+		}
+	})
+
+	if strings.Contains(out, "s3:") {
+		t.Errorf("a builder with no payload bucket granted S3:\n%s", out)
+	}
+}
