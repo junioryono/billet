@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/awscreds"
+	"github.com/junioryono/billet/internal/awsjson"
 	"github.com/junioryono/billet/internal/awssig"
 )
 
@@ -105,7 +106,10 @@ func New(region, endpoint string, creds awscreds.Source) *Client {
 	}
 
 	if endpoint == "" {
-		endpoint = "https://servicequotas." + region + ".amazonaws.com/"
+		// THE SUFFIX IS THE PARTITION'S, asked of the one place that holds the
+		// rule rather than restated as the commercial one, which names no host in
+		// cn-north-1.
+		endpoint = awsjson.EndpointFor("servicequotas", region)
 	}
 
 	httpClient := &http.Client{Timeout: apiTimeout}

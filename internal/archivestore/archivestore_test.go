@@ -547,3 +547,45 @@ func TestTheStoreNeverRendersItsCredentialSource(t *testing.T) {
 		}
 	}
 }
+
+// THE ARCHIVE BUCKET IS ADDRESSED IN THE CALLER'S PARTITION.
+//
+// This host was built by hand with the commercial suffix, which names no host in
+// cn-north-1 — and `backup.s3` is where `billet local backup` writes and where a
+// restore reads, so a deployment there would have taken every backup against
+// nothing and found out at the restore, which is the worst moment available.
+//
+// An explicit endpoint (RGW, MinIO, R2) still wins and is path-style, because
+// that is what MinIO does not do by default.
+//
+// Mutation: restoring ".amazonaws.com" fails the China case.
+func TestTheArchiveBucketFollowsThePartition(t *testing.T) {
+	t.Parallel()
+
+	for _, c := range []struct {
+		name, region, endpoint, want string
+	}{
+		{"commercial", "us-west-2", "", "https://billet-backups.s3.us-west-2.amazonaws.com/"},
+		{"govcloud", "us-gov-west-1", "", "https://billet-backups.s3.us-gov-west-1.amazonaws.com/"},
+		{"china", "cn-north-1", "", "https://billet-backups.s3.cn-north-1.amazonaws.com.cn/"},
+		{
+			"an explicit endpoint wins, path style",
+			"us-west-2", "https://minio.example.internal:9000",
+			"https://minio.example.internal:9000/billet-backups/",
+		},
+	} {
+		store, err := NewS3(config.BackupS3Config{
+			Bucket:   "billet-backups",
+			Region:   c.region,
+			Prefix:   "billet-backups",
+			Endpoint: c.endpoint,
+		}, &staticCredentials{})
+		if err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+
+		if store.base != c.want {
+			t.Errorf("%s addresses the bucket at %q, want %q", c.name, store.base, c.want)
+		}
+	}
+}

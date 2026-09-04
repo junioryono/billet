@@ -277,6 +277,27 @@ variable "backup_retention_days" {
   }
 }
 
+# THE AMI BUILDER'S GRANT. Off by default: it widens the identity every job's
+# instance is launched by, and a deployment that builds its image elsewhere
+# should not carry it. On, `billet ami build` runs on the controller with its own
+# instance role rather than from a workstation holding an operator's credentials.
+variable "builder" {
+  description = "Grant the node role what `billet ami build` needs (image creation, its own cleanup, the verifier's console and the contract tag), so the build can run on the controller rather than from a workstation's credentials. Off by default."
+  type        = bool
+  default     = false
+}
+
+variable "builder_payload_bucket" {
+  description = "The S3 bucket `billet ami build --payload-bucket` stages its shared installers in, once they no longer fit EC2's user-data limit. Empty grants nothing on S3; the grant is scoped to the object names billet writes. Requires builder."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.builder_payload_bucket == "" || var.builder
+    error_message = "builder_payload_bucket is only read when builder = true."
+  }
+}
+
 variable "iam_policy_json" {
   description = "Override the node role's IAM policy. Empty uses the module's committed rendering of billet's own generator (billet init iam), substituted for this deployment's resources. Paste `billet init iam` output to scope it to an exact config."
   type        = string

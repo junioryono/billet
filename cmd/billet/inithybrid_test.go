@@ -33,7 +33,25 @@ const hybridOutputsJSON = `{
   "subnet_id": {"sensitive": false, "type": "string", "value": "subnet-0abc"},
   "runner_security_group_id": {"sensitive": false, "type": "string", "value": "sg-trusted"},
   "untrusted_runner_security_group_id": {"sensitive": false, "type": "string", "value": "sg-untrusted"},
-  "ami_payload_bucket": {"sensitive": false, "type": "string", "value": "acme-ci-ami-payloads-1"}
+  "ami_payload_bucket": {"sensitive": false, "type": "string", "value": "acme-ci-ami-payloads-1"},
+  "name": {"sensitive": false, "type": "string", "value": "acme-ci"},
+  "region": {"sensitive": false, "type": "string", "value": "us-west-2"}
+}`
+
+// hybridCacheOutputsJSON adds the three facts a --cache root declares and a
+// generation without one does not, so the prepare render can fill them.
+const hybridCacheOutputsJSON = `{
+  "control_plane_private_ip": {"sensitive": false, "type": "string", "value": "10.60.0.10"},
+  "ledger_volume_id": {"sensitive": false, "type": "string", "value": "vol-0abc"},
+  "subnet_id": {"sensitive": false, "type": "string", "value": "subnet-0abc"},
+  "runner_security_group_id": {"sensitive": false, "type": "string", "value": "sg-trusted"},
+  "untrusted_runner_security_group_id": {"sensitive": false, "type": "string", "value": "sg-untrusted"},
+  "ami_payload_bucket": {"sensitive": false, "type": "string", "value": "acme-ci-ami-payloads-1"},
+  "cache_bucket": {"sensitive": false, "type": "string", "value": "acme-ci-cache-1"},
+  "cache_prefix": {"sensitive": false, "type": "string", "value": "billet-cache"},
+  "availability_zone": {"sensitive": false, "type": "string", "value": "us-west-2a"},
+  "name": {"sensitive": false, "type": "string", "value": "acme-ci"},
+  "region": {"sensitive": false, "type": "string", "value": "us-west-2"}
 }`
 
 var hybridFileNames = []string{
@@ -413,5 +431,340 @@ func TestInitHybridRefusals(t *testing.T) {
 				t.Errorf("a refused run must write nothing, but %s exists", out)
 			}
 		})
+	}
+}
+
+// THE BUILD COMMAND HAS TO RUN WHERE ITS CREDENTIALS ARE.
+//
+// With --builder the grant is on the controller's role, and the controller has
+// no copy of the Terraform state — so a command reading `terraform -chdir=...
+// output` there resolves nothing, while running it on the workstation is
+// exactly the credentials --builder exists to remove. The prepare render is the
+// first that CAN write the values literally, because that is when the apply has
+// produced them.
+func TestInitHybridBuilderRunbookRunsWhereTheCredentialsAre(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "acme-ci")
+	cfg := filepath.Join(dir, "none.yaml")
+	outputs := filepath.Join(dir, "outputs.json")
+	if err := os.WriteFile(outputs, []byte(hybridOutputsJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// The PLAN render has no facts, so it keeps the workstation form and says
+	// the prepare render will replace it.
+	if _, err := runInitHybrid(t, append(hybridArgs(out, cfg), "--builder")...); err != nil {
+		t.Fatalf("plan render: %v", err)
+	}
+	plan := readHybrid(t, out, HybridRunbookFile)
+	if !strings.Contains(plan, "terraform -chdir=terraform output -raw subnet_id") {
+		t.Error("before the apply the build command must still read the outputs it can reach")
+	}
+	if !strings.Contains(plan, "prints a command to run **on the controller**") {
+		t.Error("the plan render must say the controller-side command is coming")
+	}
+
+	// The PREPARE render carries the values literally and says where to run it.
+	if _, err := runInitHybrid(t, append(hybridArgs(out, cfg),
+		"--builder", "--terraform-output", outputs)...); err != nil {
+		t.Fatalf("prepare render: %v", err)
+	}
+	prepared := readHybrid(t, out, HybridRunbookFile)
+	if !strings.Contains(prepared, "**On the controller**") {
+		t.Error("with the grant and the facts, the build runs on the controller")
+	}
+	if strings.Contains(prepared, "terraform -chdir=terraform output -raw subnet_id") {
+		t.Error("the controller has no Terraform state, so the command must not read it")
+	}
+	// THE WHOLE COMMAND IS MATCHED, fences included, not its arguments one at a
+	// time against the page.
+	//
+	// The prose under this step names `--public-ip` to explain why it is there,
+	// so a `strings.Contains(runbook, "--public-ip")` is satisfied by the
+	// sentence and stays green with the flag deleted from the command itself —
+	// measured, by deleting it and watching the test pass. Locating the fenced
+	// block instead needs a Markdown scanner, and a hand-written one cannot tell
+	// a fence from a fence quoted inside a wider one. An exact match of the whole
+	// block needs neither: prose cannot satisfy it, and no argument can go
+	// missing, change or be added without breaking it.
+	//
+	// --public-ip is the argument worth the care: the generated subnet's only
+	// route is an internet gateway, which an instance cannot use without an
+	// address, so a command missing it fails in the subnet this same generation
+	// created.
+	want := "```bash\n" +
+		"billet ami build --region us-west-2 \\\n" +
+		"  --subnet subnet-0abc \\\n" +
+		"  --security-group sg-trusted \\\n" +
+		"  --payload-bucket acme-ci-ami-payloads-1 \\\n" +
+		"  --public-ip --base-image ami-<an EBS-backed Ubuntu 24.04 image in us-west-2>\n" +
+		"```"
+	assertOneBuildCommand(t, prepared, want)
+}
+
+// assertOneBuildCommand proves the AMI build step carries exactly this command,
+// and that it is the step's own live command.
+//
+// A match alone proves the text is somewhere on the page. Three cheap facts make
+// it the right somewhere, without the Markdown parser that a hand-written
+// scanner cannot correctly be: the step's heading appears exactly once, so a
+// stale duplicate step cannot answer for the real one; the command appears
+// exactly once, so a later section cannot; and this generator opens every fence
+// with exactly three backticks, so a quoted example inside a wider fence — the
+// one case a scanner would also miss — cannot exist to be matched.
+func assertOneBuildCommand(t *testing.T, runbook, want string) {
+	t.Helper()
+
+	heading, n := "## 6. Build the AMI", 0
+
+	for line := range strings.SplitSeq(runbook, "\n") {
+		// EXACTLY THIS LINE, not a document containing the text: `## 6. Build the
+		// AMI` is a substring of `### 6. Build the AMI`, and a count keyed on the
+		// PRECEDING newline misses a duplicate at byte zero.
+		if line == heading {
+			n++
+		}
+	}
+
+	if n != 1 {
+		t.Fatalf("the runbook carries the build step %d times, want exactly one", n)
+	}
+
+	// THE CONTAINERS THE PROOF ASSUMES ABSENT, proved absent. The command below
+	// is only the step's live command if nothing quotes it, and Markdown has
+	// three ways to quote a triple-backtick block: a wider backtick fence, a
+	// tilde fence, and an HTML comment. This generator emits neither fence.
+	for _, quoted := range []string{"````", "~~~"} {
+		if strings.Contains(runbook, quoted) {
+			t.Errorf("this generator emits no %q, and the assertion below rests on that: "+
+				"a command quoted inside one would satisfy it", quoted)
+		}
+	}
+
+	// IT DOES EMIT ONE HTML COMMENT — the ownership marker `billet init hybrid`
+	// reads back before it will replace this file — so the rule for that one is
+	// that it closes on its own line and therefore contains no command. An
+	// unclosed one, or a second, could swallow the rest of the page.
+	comments := 0
+
+	for _, line := range strings.Split(runbook, "\n") {
+		opens := strings.Count(line, "<!--")
+		comments += opens
+
+		if opens > 0 && strings.Count(line, "-->") != opens {
+			t.Errorf("an HTML comment that does not close on its own line can quote the "+
+				"command below: %q", line)
+		}
+	}
+
+	if comments != 1 {
+		t.Errorf("the runbook carries %d HTML comments, want only the ownership marker", comments)
+	}
+
+	if n := strings.Count(runbook, want); n != 1 {
+		t.Errorf("the build step must carry exactly this command, once, and carries it %d "+
+			"times:\n%s\n\ngot:\n%s", n, want, runbook)
+	}
+}
+
+// WITHOUT --builder IT STAYS A WORKSTATION COMMAND, and says so, however many
+// facts are known.
+func TestInitHybridWithoutTheBuilderTheBuildStaysOnAWorkstation(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "acme-ci")
+	cfg := filepath.Join(dir, "none.yaml")
+	outputs := filepath.Join(dir, "outputs.json")
+	if err := os.WriteFile(outputs, []byte(hybridOutputsJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := runInitHybrid(t, append(hybridArgs(out, cfg), "--terraform-output", outputs)...); err != nil {
+		t.Fatalf("prepare render: %v", err)
+	}
+	runbook := readHybrid(t, out, HybridRunbookFile)
+	if !strings.Contains(runbook, "From a workstation with your own AWS credentials") {
+		t.Error("without the grant the runbook must say whose credentials the build uses")
+	}
+	// The workstation command reads the state it has, and carries the same
+	// public address the subnet's only route requires. Matched whole, for the
+	// reason the controller-side one is.
+	want := "```bash\n" +
+		"billet ami build --region us-west-2 \\\n" +
+		"  --subnet \"$(terraform -chdir=terraform output -raw subnet_id)\" \\\n" +
+		"  --security-group \"$(terraform -chdir=terraform output -raw runner_security_group_id)\" \\\n" +
+		"  --payload-bucket \"$(terraform -chdir=terraform output -raw ami_payload_bucket)\" \\\n" +
+		"  --public-ip --base-image ami-<an EBS-backed Ubuntu 24.04 image in us-west-2>\n" +
+		"```"
+	assertOneBuildCommand(t, runbook, want)
+}
+
+// AN IMAGE THAT CANNOT TRUST THE CACHE IS A CACHE NOBODY USES.
+//
+// A guest's cache client speaks HTTPS to an endpoint on the controller's
+// private address, so the listener's certificate comes from a private issuer
+// and no public root chains to it. `ami build --ca-cert` is the only thing that
+// puts that issuer in the image's host trust store, and the image is built in
+// step 6 while the listener's own pair is not asked for until step 7 — so a
+// runbook that mentions the pair and never the issuer produces a deployment
+// where the bucket, the listener, the site and the security-group rule are all
+// correct and every job still fetches cold, with nothing reporting an error.
+//
+// Mutation: dropping --ca-cert from either command fails this.
+func TestInitHybridCacheRunbookTrustsTheListenersIssuer(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "acme-ci")
+	cfg := filepath.Join(dir, "none.yaml")
+	outputs := filepath.Join(dir, "outputs.json")
+	if err := os.WriteFile(outputs, []byte(hybridCacheOutputsJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// THE WORKSTATION FORM, which is the default: no builder grant.
+	if _, err := runInitHybrid(t, append(hybridArgs(out, cfg),
+		"--cache", "--terraform-output", outputs)...); err != nil {
+		t.Fatalf("prepare render: %v", err)
+	}
+
+	runbook := readHybrid(t, out, HybridRunbookFile)
+
+	// The argument, in its place in the command, so a mention in prose cannot
+	// satisfy it.
+	want := "--payload-bucket \"$(terraform -chdir=terraform output -raw ami_payload_bucket)\"" +
+		" \\\n  --ca-cert cache-ca.pem \\\n"
+	if !strings.Contains(runbook, want) {
+		t.Errorf("a cache generation must bake the listener's issuer into the image:\n%s", runbook)
+	}
+
+	// The step that builds the image has to say what the issuer is for, since
+	// skipping it reports nothing; and the step that installs the listener has
+	// to tie its leaf to that anchor, because an anchor signing nothing on the
+	// listener is the same cold fetch.
+	if !strings.Contains(runbook, "--ca-cert` below takes the PEM of that issuer") {
+		t.Error("step 6 must say what the issuer is for")
+	}
+
+	if !strings.Contains(runbook, "signed by that same `cache-ca.pem`") {
+		t.Error("step 7 must tie the leaf it asks for to the anchor step 6 baked in")
+	}
+
+	// AND THE CONTROLLER-SIDE FORM, where the file has to be on the controller,
+	// because that is where the command runs.
+	if _, err := runInitHybrid(t, append(hybridArgs(out, cfg),
+		"--cache", "--builder", "--terraform-output", outputs, "--force")...); err != nil {
+		t.Fatalf("builder prepare render: %v", err)
+	}
+
+	builder := readHybrid(t, out, HybridRunbookFile)
+	if !strings.Contains(builder,
+		"--payload-bucket acme-ci-ami-payloads-1 \\\n  --ca-cert cache-ca.pem \\\n") {
+		t.Errorf("the controller-side build needs the issuer too:\n%s", builder)
+	}
+
+	if !strings.Contains(builder, "`cache-ca.pem` has to be on the controller too") {
+		t.Error("the controller-side build must say where the issuer file has to be")
+	}
+}
+
+// WITHOUT A CACHE THERE IS NO ISSUER TO TRUST, and asking for one would send an
+// operator looking for a file no part of this generation produces.
+func TestInitHybridWithoutACacheTheBuildAsksForNoIssuer(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "acme-ci")
+	cfg := filepath.Join(dir, "none.yaml")
+
+	if _, err := runInitHybrid(t, hybridArgs(out, cfg)...); err != nil {
+		t.Fatalf("plan render: %v", err)
+	}
+
+	if runbook := readHybrid(t, out, HybridRunbookFile); strings.Contains(runbook, "--ca-cert") {
+		t.Error("a generation with no cache has no private issuer to bake in")
+	}
+}
+
+// OUTPUTS FROM ANOTHER ROOT ARE REFUSED, BY THE ONE FACT THAT CAN SEE IT.
+//
+// Every rendering takes the region from --region; every id in the outputs comes
+// from an apply. So a re-render against a root applied elsewhere — or with
+// --region retyped — produces a config that signs against one region and names
+// another's subnet, security group, buckets and controller. Nothing downstream
+// catches it: a generation without a cache has no availability zone to trip
+// over, and simply prints an AMI command that cannot work.
+//
+// Mutation: dropping the comparison lets the mismatched render succeed.
+func TestInitHybridRefusesOutputsFromAnotherRegionsRoot(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "acme-ci")
+	cfg := filepath.Join(dir, "none.yaml")
+	outputs := filepath.Join(dir, "outputs.json")
+
+	elsewhere := strings.Replace(hybridOutputsJSON,
+		`"region": {"sensitive": false, "type": "string", "value": "us-west-2"}`,
+		`"region": {"sensitive": false, "type": "string", "value": "eu-central-1"}`, 1)
+	if elsewhere == hybridOutputsJSON {
+		t.Fatal("the fixture no longer carries the region output this case rewrites")
+	}
+
+	// THE NAME IS THE HALF THAT CATCHES THE LIKELIER MISTAKE: another
+	// deployment's outputs.json, from the same region, reads as this one on
+	// region alone, and every id in it names that deployment's resources.
+	otherDeployment := strings.Replace(hybridOutputsJSON,
+		`"name": {"sensitive": false, "type": "string", "value": "acme-ci"}`,
+		`"name": {"sensitive": false, "type": "string", "value": "acme-staging"}`, 1)
+	if otherDeployment == hybridOutputsJSON {
+		t.Fatal("the fixture no longer carries the name output this case rewrites")
+	}
+
+	other := filepath.Join(dir, "other.json")
+	if err := os.WriteFile(other, []byte(otherDeployment), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := runInitHybrid(t, append(hybridArgs(out, cfg),
+		"--terraform-output", other)...); err == nil ||
+		!strings.Contains(err.Error(), "acme-staging") {
+		t.Fatalf("another deployment's outputs from the same region must be refused "+
+			"and named, got %v", err)
+	}
+
+	if err := os.WriteFile(outputs, []byte(elsewhere), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := runInitHybrid(t, append(hybridArgs(out, cfg), "--terraform-output", outputs)...)
+	if err == nil {
+		t.Fatal("a root applied in another region was accepted")
+	}
+
+	// The refusal has to name BOTH regions and the two ways out, because the
+	// operator cannot tell from the file which root wrote it.
+	for _, want := range []string{"eu-central-1", "us-west-2", "--region", "--terraform-output"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal must name %q: %v", want, err)
+		}
+	}
+}
+
+// AND A MISSING REGION OUTPUT IS REFUSED LIKE ANY OTHER, rather than comparing
+// against an empty string and passing whenever --region is also empty.
+func TestInitHybridRefusesTerraformOutputWithNoRegion(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "acme-ci")
+	cfg := filepath.Join(dir, "none.yaml")
+	outputs := filepath.Join(dir, "outputs.json")
+
+	without := strings.Replace(hybridOutputsJSON,
+		",\n  \"region\": {\"sensitive\": false, \"type\": \"string\", \"value\": \"us-west-2\"}", "", 1)
+	if without == hybridOutputsJSON {
+		t.Fatal("the fixture no longer carries the region output this case removes, so the " +
+			"refusal below would be asserted against a file that still has one")
+	}
+
+	if err := os.WriteFile(outputs, []byte(without), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := runInitHybrid(t, append(hybridArgs(out, cfg), "--terraform-output", outputs)...)
+	if err == nil || !strings.Contains(err.Error(), "region") {
+		t.Fatalf("a missing region output must be refused by name, got %v", err)
 	}
 }

@@ -42,3 +42,8 @@ output "spot_node_name" {
   description = "The name a SPOT node must use as its node.name (the queue basename); empty when spot is disabled."
   value       = var.enable_spot ? "${var.name}-spot-interruptions" : ""
 }
+
+output "builder_granted" {
+  description = "Whether the node role carries the AMI builder's grant. When false, `billet ami build` needs credentials of its own from somewhere else."
+  value       = var.builder
+}

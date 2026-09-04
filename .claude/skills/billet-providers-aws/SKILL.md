@@ -33,6 +33,8 @@ description: "The two AWS compute backends and the AWS plumbing they share: ec2 
 
 **`ec2:CreateVolume` from a snapshot authorises the snapshot as well** (the `ebs-s3` store found it: `aws:RequestTag` is not in the snapshot's context, so the one statement conditioned on the new volume's tag denied every clone). `BilletCacheCloneSource` grants it on `arn:<partition>:ec2:*::snapshot/*` conditioned on the owner tag.
 
+**`ec2:RunInstances` on `*` authorises every snapshot a block-device mapping names**, so the runtime grant is also a read of every snapshot in the account — the control plane's ledger snapshots, identity and CA key included. It cannot be narrowed (one call makes several resource types), so `awspolicy` bounds it with the one DENY it renders: `ec2:RunInstances` on `arn:<partition>:ec2:*:*:snapshot/*`, `Null` true on the owner tag account-wide and `StringNotEquals` on the owner value per deployment. Two things measured 2026-09-04 rather than read: a NEGATED operator evaluates true when the key is absent, so one `StringNotEquals` catches the untagged snapshot too; and `arn:aws:ec2:*::snapshot/*` — the documented account-less shape, and what the acceptance role's hand-written guard uses — answers ALLOWED for an ARN written with an account, while the wildcard-account form denies both. EC2 was asked directly under a throwaway role holding the generated document, three `run-instances --dry-run` calls: billet's own launch shape is `DryRunOperation`, the same request with the ledger snapshot in a mapping is an explicit deny naming `arn:aws:ec2:us-west-2::snapshot/snap-…`, and the PREVIOUS rendering allowed that same request — which is the exposure, measured rather than argued. So a snapshot the mapping NAMES is evaluated and the AMI's own backing snapshot is not — measured for the image the lane boots and the request billet sends, and if AWS ever changed it the failure is a refused launch rather than a widened grant. EC2 renders the resource account-less, which the wildcard account matches.
+
 ## codebuild
 
 **A build cannot be tagged, so ownership is a dedicated project plus markers.** `StartBuild` has no field that becomes a tag; the boundary is a per-deployment-and-node tagged project plus `BILLET_OWNER` and `BILLET_INSTANCE_NAME` environment overrides read back through `BatchGetBuilds`. `List` and `Find` verify both, and an owner-marked build whose lease marker names no lease fails the whole inventory, because this list frees capacity.
@@ -53,8 +55,6 @@ description: "The two AWS compute backends and the AWS plumbing they share: ec2 
 
 **`terraform destroy` refuses under a running build, and it is the module that refuses.** `DeleteProject` succeeds while a build is in its `BUILD` phase (measured 2026-09-02); `refuse-active-builds.sh` walks the project's builds through the operator's `aws` CLI as a destroy-time provisioner, pins `TZ=UTC`, and never calls `StopBuild`. `BILLET_SKIP_ACTIVE_BUILD_GUARD=1` is the operator asserting the fleet was drained.
 
-**`ec2:RunInstances` on `*` authorises every snapshot a block-device mapping names.** The account-wide node policy grants it unconditioned, so a node role can launch an instance with any snapshot in the account attached and read it: in a shared account that is the control plane's ledger snapshots, identity and CA key included. Every other route to a foreign snapshot is closed by the generator's tag conditions (`BilletCacheCloneSource`, `BilletCacheAttach`); this one is open until #39 adds the deny to what `awspolicy` renders. The acceptance role carries it by hand: deny `ec2:RunInstances` on `arn:aws:ec2:*::snapshot/*` when `ec2:ResourceTag/sh.billet.owner` is null, measured with `simulate-principal-policy` (explicit deny on an untagged snapshot, allowed with the tag, allowed for a plain launch; 2026-09-04).
-
 ## Measured facts
 
 - SDK cost: 13.2MB and 15 modules for one `RunInstances`, versus 21.8MB for all of billet.
@@ -65,6 +65,8 @@ description: "The two AWS compute backends and the AWS plumbing they share: ec2 
 - Default `aws/ssm` key: `WithDecryption=true` returns plaintext with no `kms:*` grant; a customer-managed key refuses `kms:Decrypt` and a mixed page fails whole.
 - `DeleteProject` succeeds under a live build; the build runs on.
 - EC2 cold start: 47.6, 52.2, 58.7 seconds to the first job step (2026-08-18).
+- `RunInstances` evaluates a snapshot a block-device mapping NAMES, and names it account-less in the refusal; the launch was still allowed with the AMI's own untagged backing snapshot, for the one image and request measured (EC2 itself, `--dry-run`, 2026-09-04).
+- `arn:<p>:ec2:*::snapshot/*` does not match an account-qualified snapshot ARN and `arn:<p>:ec2:*:*:snapshot/*` matches both spellings (`iam:SimulateCustomPolicy`, not an EC2 observation).
 - SQS endpoint suffixes, resolved 2026-09-04: China is `amazonaws.com.cn` for all three forms (standard, legacy `<region>.queue.`, and `vpce`), the commercial names are NXDOMAIN there and vice versa, and **GovCloud takes the commercial suffix** — so the partition is derived from the region's `cn-` prefix (`config.AWSDNSSuffix`, which `awsjson.DNSSuffixFor` calls) rather than from the partition name.
 
 ## Where the tests are

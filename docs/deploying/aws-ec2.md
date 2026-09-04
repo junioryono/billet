@@ -22,7 +22,9 @@ module "billet" {
 
 Pin the module to a release in your own configuration: the `?ref=` names the version, and it is the same version as the binary and the collection beside it. Documentation on `main` says `?ref=main` because it describes `main`; cutting a release rewrites every documented source to that release's tag, so the copy of this page inside a release names the version you are installing.
 
-The module's IAM is exactly what `billet init iam` prints for the same config, kept equal by a drift test, so the module can never grant a permission billet would not ask for. `billet init iam --builder` adds what `billet ami build` needs; `--controller-sweep` adds the CodeBuild registration sweep.
+The module's IAM is exactly what `billet init iam` prints for the same config, kept equal by a drift test, so the module can never grant a permission billet would not ask for. `billet init iam --builder` adds what `billet ami build` needs (with `--payload-bucket` for the staged installers); `--controller-sweep` adds the CodeBuild registration sweep. The module's `builder` input attaches that same generated document as its own inline policy, so the build can run on the controller rather than from a workstation's credentials.
+
+The node role may launch instances but may not launch one from a snapshot this deployment does not own, which is an explicit deny rather than a narrower grant: `ec2:RunInstances` authorises every snapshot a block-device mapping names, and the account a fleet runs in is usually also where the control plane's ledger snapshots live. billet's own launches name no snapshot, so nothing it does is refused by it. In account-wide mode the deny asks only that the snapshot carry billet's owner tag, so another billet deployment's snapshot in the same account is still reachable; a per-deployment KMS key is what closes that, the same as for the cache.
 
 ## The node
 

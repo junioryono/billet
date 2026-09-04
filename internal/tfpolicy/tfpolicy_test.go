@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 
@@ -40,15 +41,34 @@ func tfPolicyCases() map[string]awspolicy.Inputs {
 	// committed rendering carries `arn:TFPARTITION:` and `ec2.TFREGION.TFDNSSUFFIX`
 	// rather than the commercial partition and amazonaws.com — the module rewrites
 	// them to `data.aws_partition.this.partition`/`.dns_suffix`, so one rendering
-	// serves GovCloud and China too. Compute-only carries no partition ARN, so it
-	// needs neither sentinel.
+	// serves GovCloud and China too. Compute-only needs the PARTITION sentinel and
+	// not the suffix one: it carries no kms:ViaService or PassRole service name, but
+	// it does carry the snapshot ARN the launch boundary denies, and a rendering that
+	// hard-coded `arn:aws:` there would deny nothing in GovCloud or China.
 	return map[string]awspolicy.Inputs{
-		"node-policy-compute.json": {},
+		"node-policy-compute.json": {Partition: "TFPARTITION"},
 		"node-policy-cache.json": {
 			Partition: "TFPARTITION", DNSSuffix: "TFDNSSUFFIX", Region: "TFREGION", Cache: cache,
 		},
 		"node-policy-cache-kms.json": {
 			Partition: "TFPARTITION", DNSSuffix: "TFDNSSUFFIX", Region: "TFREGION", Cache: cacheKMS,
+		},
+
+		// THE BUILDER IS A SEPARATE INLINE POLICY, not a variant of the node
+		// rendering, and NoCompute is what makes that possible: it carries the
+		// AMI-builder statements and nothing else, so the node's own grant is
+		// byte-identical whether or not a deployment builds images. Attaching it
+		// as its own aws_iam_role_policy also means an operator can read, in one
+		// document, exactly what turning `builder` on added.
+		//
+		// TWO RENDERINGS, gated on whether the installers are staged in S3.
+		// `--payload-bucket` is needed only once the toolcache declaration
+		// outgrows EC2's 16384-byte user-data limit, so a deployment that does
+		// not stage gets no S3 grant at all.
+		"builder-policy.json": {Partition: "TFPARTITION", NoCompute: true, Builder: true},
+		"builder-policy-payload.json": {
+			Partition: "TFPARTITION", NoCompute: true, Builder: true,
+			Payload: &awspolicy.Payload{Bucket: "TFPAYLOADBUCKET"},
 		},
 	}
 }
@@ -550,6 +570,126 @@ func TestTheCodeBuildNodeRoleLaunchesNoInstancesAndOwnsNoFleet(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// AND EVERY NODE RENDERING REFUSES A LAUNCH FROM A SNAPSHOT NOBODY OWNS.
+//
+// The drift test below pins the bytes, which catches a change; this says what the
+// bytes must never lose, which catches a change somebody regenerated without
+// reading. ec2:RunInstances authorizes every snapshot a block-device mapping
+// names, and the module grants it on "*" — so without this statement the fleet
+// role can launch an instance with the control plane's ledger snapshot attached
+// and read the deployment identity and the node-wire CA key off it. The renderings
+// are in PRESENCE mode (the deployment id is minted on the server's first run,
+// unknown at apply), so the condition here is the tag being absent.
+//
+// THE PARTITION SENTINEL IS PART OF THE ASSERTION: the module rewrites it, and a
+// rendering that hard-coded `arn:aws:` would deny nothing at all in GovCloud or
+// China while every byte comparison stayed green.
+//
+// A RENDERING THAT GRANTS NO LAUNCH IS ASKED THE OPPOSITE QUESTION. The builder
+// documents are ADDITIVE and carry no ec2:RunInstances at all — they image a
+// builder, read its console, terminate it and stamp the contract — so there is
+// no launch of theirs to bound, and requiring the deny of them would assert a
+// boundary around a permission they do not grant. They are held to the other
+// half of the same rule instead: gaining a launch must fail this test rather
+// than pass it silently, so a document carrying RunInstances and no deny is a
+// failure whichever file it is.
+func TestTheCommittedNodePolicyDeniesAnUnownedSnapshotLaunch(t *testing.T) {
+	var bounded, unbounded int
+
+	for name := range tfPolicyCases() {
+		t.Run(name, func(t *testing.T) {
+			body, err := os.ReadFile(policyDir + name)
+			if err != nil {
+				t.Fatalf("read: %v (regenerate with UPDATE_TF_POLICY=1)", err)
+			}
+
+			var doc struct {
+				Statement []struct {
+					Sid       string
+					Effect    string
+					Action    []string
+					Resource  []string
+					Condition map[string]map[string]any
+				}
+			}
+
+			if err := json.Unmarshal(body, &doc); err != nil {
+				t.Fatalf("parse %s: %v", name, err)
+			}
+
+			// WHETHER THIS DOCUMENT LAUNCHES ANYTHING is what decides which half of
+			// the rule applies, read out of the document rather than from its name.
+			launches := false
+
+			for _, st := range doc.Statement {
+				if st.Effect == "Allow" && slices.Contains(st.Action, "ec2:RunInstances") {
+					launches = true
+				}
+			}
+
+			var found bool
+
+			for _, st := range doc.Statement {
+				if st.Sid != "BilletRuntimeDenyForeignSnapshot" {
+					continue
+				}
+
+				found = true
+
+				if st.Effect != "Deny" {
+					t.Errorf("%s has Effect %q; an Allow bounds nothing", st.Sid, st.Effect)
+				}
+
+				if !slices.Equal(st.Action, []string{"ec2:RunInstances"}) {
+					t.Errorf("%s denies %v, want exactly the launch action", st.Sid, st.Action)
+				}
+
+				if !slices.Equal(st.Resource, []string{"arn:TFPARTITION:ec2:*:*:snapshot/*"}) {
+					t.Errorf("%s acts on %v, want the partition-sentinel snapshot ARN with a "+
+						"wildcard account", st.Sid, st.Resource)
+				}
+
+				if st.Condition["Null"]["aws:ResourceTag/sh.billet.owner"] != "true" {
+					t.Errorf("%s does not require the owner tag to be ABSENT: %v",
+						st.Sid, st.Condition)
+				}
+			}
+
+			if launches && !found {
+				t.Errorf("%s grants ec2:RunInstances and carries no launch boundary, so the "+
+					"role it renders may launch an instance with any snapshot in the account "+
+					"attached", name)
+			}
+
+			if !launches && found {
+				t.Errorf("%s bounds a launch it does not grant; either it gained "+
+					"ec2:RunInstances without the rest of the runtime statements, or this "+
+					"deny is dead weight in a document that cannot launch", name)
+			}
+
+			if launches {
+				bounded++
+			} else {
+				unbounded++
+			}
+		})
+	}
+
+	// AND BOTH HALVES RAN. An empty case set makes every assertion above vacuous,
+	// and so does a split that puts every rendering on one side of it: if no
+	// document launched, nothing was bounded and the whole test passed by
+	// examining nothing.
+	if bounded == 0 {
+		t.Fatal("no rendering that launches anything was examined, so the boundary this " +
+			"test exists for was never asserted")
+	}
+
+	if unbounded == 0 {
+		t.Fatal("no launch-free rendering was examined, so the builder documents this test " +
+			"deliberately exempts were not seen at all")
 	}
 }
 

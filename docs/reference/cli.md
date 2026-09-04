@@ -63,15 +63,18 @@ Generate the hybrid shape as one unit into `--out DIR`: a Terraform root over th
 | `--ssh-ingress-cidr` (repeatable), `--key-name` | IPv4 CIDRs that may SSH to the controller (empty for a route that ends on the controller itself), and the key pair it launches with (empty attaches none; the runbook reaches the fresh image with EC2 Instance Connect) |
 | `--local-ansible-user`, `--local-image` | the account Ansible connects to the Firecracker host as (empty leaves it to your SSH configuration), and the guest generation every tier boots there (default the x64 generation billet publishes) |
 | `--kernel-image`, `--ceph-user`, `--ceph-keyring`, `--cache-listen`, `--cache-guest-endpoint` | the Firecracker host's inputs, as for `--provider firecracker` |
+| `--cache`, `--local-site`, `--cloud-site` | give the cloud half an EBS+S3 site cache: the module creates the bucket and the rule admitting runners to it, the orchestrator gains `node.ebs_s3` and a `node.cache` HTTPS listener, and both hosts declare the place their storage is in (defaults `home` and the region). You supply the listener's TLS pair |
+| `--builder` | grant the controller's role what `billet ami build` performs, so the image is built there rather than from a workstation holding your AWS credentials |
 | `--terraform-output`, `--commission`, `--ami`, `--force` | the prepare render's facts, the commission render, its AMI (required with `--commission`), and replacing a file that is not billet's own |
 
 ### `billet init iam`
 
-Print the IAM policy this config's node role needs, derived from the config: cache adds EBS and S3, spot adds the queue, an instance profile adds `PassRole`.
+Print the IAM policy this config's node role needs, derived from the config: cache adds EBS and S3, spot adds the queue, an instance profile adds `PassRole`. Every ec2 policy also denies `ec2:RunInstances` for a snapshot the deployment does not own, because that grant otherwise reads any snapshot in the account through a block-device mapping.
 
 | Flag | Meaning |
 |---|---|
 | `--builder` | also grant what `billet ami build` needs |
+| `--payload-bucket <bucket>` | with `--builder`, also grant put, get and delete on the objects `billet ami build --payload-bucket` stages there (`billet-payload-*`) and nothing else |
 | `--build-role` | print the CodeBuild build service role's policy instead of the node's |
 | `--controller-sweep` | print the control plane's grant for sweeping staged registrations under this node's parameter path |
 | `--account <id>` | the 12-digit account (codebuild) |
