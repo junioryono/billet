@@ -830,16 +830,12 @@ func TestGenerateHybridUntrustedRunnersReachTheCache(t *testing.T) {
 		t.Fatal("this case is about the untrusted shape")
 	}
 
-	root := files[HybridTerraformFile]
-	if !strings.Contains(root, `resource "aws_vpc_security_group_ingress_rule" "untrusted_runner_cache"`) {
-		t.Fatal("an untrusted generation with a cache must admit its own runner group to the cache port")
-	}
-	if !strings.Contains(root, "referenced_security_group_id = aws_security_group.untrusted_runner.id") {
-		t.Error("the rule must name the untrusted group this root creates")
-	}
-	if !strings.Contains(root, "security_group_id            = module.billet.control_plane_security_group_id") {
-		t.Error("the rule must open the controller's group, which is where the listener binds")
-	}
+	// THE WHOLE BLOCK IS READ, not the file. Asserting that the file somewhere
+	// contains each line lets a widened rule pass: a to_port of 65535 beside a
+	// correct from_port opens 9443 through 65535 from untrusted runners, and
+	// every "does the file contain this line" check stays green.
+	rule := terraformBlock(t, files[HybridTerraformFile],
+		`resource "aws_vpc_security_group_ingress_rule" "untrusted_runner_cache"`)
 
 	// THE PORT IS THE LISTENER'S. Read it back out of the rendered config rather
 	// than restating the constant, so a change to one and not the other fails.
@@ -848,9 +844,61 @@ func TestGenerateHybridUntrustedRunnersReachTheCache(t *testing.T) {
 	if !ok {
 		t.Fatalf("the cache listener has no port: %q", controller.Node.Cache.Listen)
 	}
-	if !strings.Contains(root, "from_port                    = "+port) {
-		t.Errorf("the rule opens a different port than the listener binds (%s)", port)
+
+	for field, want := range map[string]string{
+		// The controller's group is where the listener binds, and the untrusted
+		// group is the one this root creates and the module knows nothing about.
+		"security_group_id":            "module.billet.control_plane_security_group_id",
+		"referenced_security_group_id": "aws_security_group.untrusted_runner.id",
+		// BOTH ports, or the range is open above the one the listener serves.
+		"from_port":   port,
+		"to_port":     port,
+		"ip_protocol": `"tcp"`,
+	} {
+		if got := hclAttr(t, rule, field); got != want {
+			t.Errorf("the cache rule's %s is %q, want %q", field, got, want)
+		}
 	}
+}
+
+// terraformBlock returns the one rendered block whose header line is the given
+// text, from that line to the line holding its closing brace. Every assertion
+// about a rendered resource needs it: `strings.Contains` over the whole file
+// answers "does this text appear anywhere", which a neighbouring resource can
+// satisfy, and cannot see a field that was widened rather than removed.
+func terraformBlock(t *testing.T, root, header string) string {
+	t.Helper()
+
+	_, rest, ok := strings.Cut(root, header)
+	if !ok {
+		t.Fatalf("the generated root has no %s", header)
+	}
+
+	end := strings.Index(rest, "\n}")
+	if end < 0 {
+		t.Fatalf("%s is never closed", header)
+	}
+
+	return rest[:end]
+}
+
+// hclAttr reads one `name = value` from a block, returning "" when the block
+// does not set it, so an assertion against a removed field fails rather than
+// passing vacuously.
+func hclAttr(t *testing.T, block, name string) string {
+	t.Helper()
+
+	for line := range strings.SplitSeq(block, "\n") {
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		if strings.TrimSpace(key) == name {
+			return strings.TrimSpace(value)
+		}
+	}
+
+	return ""
 }
 
 // A TRUSTED GENERATION NEEDS NO SUCH RULE: its jobs launch in the module's own

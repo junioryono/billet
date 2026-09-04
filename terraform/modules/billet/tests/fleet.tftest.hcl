@@ -703,3 +703,90 @@ run "refuses_a_payload_bucket_naming_a_key" {
 
   expect_failures = [var.builder_payload_bucket]
 }
+
+# A DOT IS THE ONE THAT LOOKS FINE, and it is the case this variable's regex
+# exists for. Dots are legal in S3 and unusable for billet: the virtual-hosted
+# host a dotted name produces is not covered by S3's wildcard certificate, so
+# the build's fetch fails TLS verification. Without this case, widening the
+# regex back to [a-z0-9.-] would apply cleanly, render a policy that reads
+# correctly, and be refused by `billet ami build` against the bucket it was
+# pointed at, with every Go test still green.
+run "refuses_a_dotted_payload_bucket" {
+  command = plan
+
+  module {
+    source = "./modules/fleet-ec2"
+  }
+
+  variables {
+    name                   = "billet-test"
+    vpc_id                 = "vpc-0f0f0f0f0f0f0f0f0"
+    builder                = true
+    builder_payload_bucket = "billet.ami.payloads"
+  }
+
+  expect_failures = [var.builder_payload_bucket]
+}
+
+# AND AN UPPERCASE ONE. TFPAYLOADBUCKET is what this module substitutes into the
+# committed rendering, and it is a placeholder inside that file only; a real
+# input carrying uppercase is a bucket S3 will not even create.
+run "refuses_an_uppercase_payload_bucket" {
+  command = plan
+
+  module {
+    source = "./modules/fleet-ec2"
+  }
+
+  variables {
+    name                   = "billet-test"
+    vpc_id                 = "vpc-0f0f0f0f0f0f0f0f0"
+    builder                = true
+    builder_payload_bucket = "TFPAYLOADBUCKET"
+  }
+
+  expect_failures = [var.builder_payload_bucket]
+}
+
+# BOTH ENDS OF S3'S OWN LENGTH RANGE ARE ACCEPTED, so a regex tightened past
+# what S3 permits fails here rather than at an operator's apply. Three is S3's
+# floor and 63 its ceiling.
+run "accepts_the_shortest_payload_bucket" {
+  command = plan
+
+  module {
+    source = "./modules/fleet-ec2"
+  }
+
+  variables {
+    name                   = "billet-test"
+    vpc_id                 = "vpc-0f0f0f0f0f0f0f0f0"
+    builder                = true
+    builder_payload_bucket = "abc"
+  }
+
+  assert {
+    condition     = length(aws_iam_role_policy.builder) == 1
+    error_message = "three characters is S3's own floor and must be accepted"
+  }
+}
+
+run "accepts_the_longest_payload_bucket" {
+  command = plan
+
+  module {
+    source = "./modules/fleet-ec2"
+  }
+
+  variables {
+    name                   = "billet-test"
+    vpc_id                 = "vpc-0f0f0f0f0f0f0f0f0"
+    builder                = true
+    builder_payload_bucket = "abcdefghij-abcdefghij-abcdefghij-abcdefghij-abcdefghij-abcdefgh"
+  }
+
+  assert {
+    condition     = length(aws_iam_role_policy.builder) == 1
+    error_message = "63 characters is S3's own ceiling and must be accepted"
+  }
+}

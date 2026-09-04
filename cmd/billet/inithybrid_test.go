@@ -458,11 +458,53 @@ func TestInitHybridBuilderRunbookRunsWhereTheCredentialsAre(t *testing.T) {
 	if strings.Contains(prepared, "terraform -chdir=terraform output -raw subnet_id") {
 		t.Error("the controller has no Terraform state, so the command must not read it")
 	}
-	for _, want := range []string{"--subnet subnet-0abc", "--security-group sg-trusted", "--payload-bucket acme-ci-ami-payloads-1"} {
-		if !strings.Contains(prepared, want) {
-			t.Errorf("the controller-side command must carry %q literally", want)
+	// EVERY ARGUMENT THE BUILD NEEDS, read out of the COMMAND rather than the
+	// page. The prose under this step names `--public-ip` to explain why it is
+	// there, so a `strings.Contains` over the whole runbook is satisfied by the
+	// sentence and stays green with the flag deleted from the command itself —
+	// measured, by removing it. --public-ip is the one worth the care: the
+	// generated subnet's only route is an internet gateway, which an instance
+	// cannot use without an address, so a command missing it fails in the
+	// subnet this same generation created.
+	build := runbookCommand(t, prepared, "## 6. Build the AMI")
+	for _, want := range []string{
+		"billet ami build",
+		"--region us-west-2",
+		"--subnet subnet-0abc",
+		"--security-group sg-trusted",
+		"--payload-bucket acme-ci-ami-payloads-1",
+		"--public-ip",
+		"--base-image ami-",
+	} {
+		if !strings.Contains(build, want) {
+			t.Errorf("the controller-side command must carry %q literally, and it is:\n%s", want, build)
 		}
 	}
+}
+
+// runbookCommand returns the first fenced block after the given heading, which
+// is the command an operator copies. Asserting against the whole runbook cannot
+// tell a command from the paragraph explaining it, and this file's paragraphs
+// quote the very flags the commands carry.
+func runbookCommand(t *testing.T, runbook, heading string) string {
+	t.Helper()
+
+	_, rest, ok := strings.Cut(runbook, heading)
+	if !ok {
+		t.Fatalf("the runbook has no %q step", heading)
+	}
+
+	_, rest, ok = strings.Cut(rest, "```bash\n")
+	if !ok {
+		t.Fatalf("%q carries no command", heading)
+	}
+
+	block, _, ok := strings.Cut(rest, "```")
+	if !ok {
+		t.Fatalf("%q's command block is never closed", heading)
+	}
+
+	return block
 }
 
 // WITHOUT --builder IT STAYS A WORKSTATION COMMAND, and says so, however many
@@ -483,7 +525,11 @@ func TestInitHybridWithoutTheBuilderTheBuildStaysOnAWorkstation(t *testing.T) {
 	if !strings.Contains(runbook, "From a workstation with your own AWS credentials") {
 		t.Error("without the grant the runbook must say whose credentials the build uses")
 	}
-	if !strings.Contains(runbook, "terraform -chdir=terraform output -raw subnet_id") {
-		t.Error("the workstation command reads the state it has")
+	build := runbookCommand(t, runbook, "## 6. Build the AMI")
+	if !strings.Contains(build, "terraform -chdir=terraform output -raw subnet_id") {
+		t.Errorf("the workstation command reads the state it has, and it is:\n%s", build)
+	}
+	if !strings.Contains(build, "--public-ip") {
+		t.Error("the workstation command needs the public address the subnet's only route requires")
 	}
 }

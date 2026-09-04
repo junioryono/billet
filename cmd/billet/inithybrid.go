@@ -580,10 +580,10 @@ func hybridNext(in hybridInputs, p initconfig.HybridParams, carried bool) string
 // THE ORDER IS THE ROLE'S, NOT A PREFERENCE. The controller is prepared before
 // anything mints an identity, because the ledger volume has to be mounted and
 // proved first; certificates are issued on the prepared host, because the node
-// configs name bundles the role's billet check refuses to find missing; the
-// AMI is built from a workstation, because the node role carries no builder
-// grant; and the local host is converged last, alone, because its certificate
-// has to be installed by hand first.
+// configs name bundles the role's billet check refuses to find missing; the AMI
+// is built wherever the credentials for it are, which is a workstation unless
+// --builder put the grant on the controller; and the local host is converged
+// last, alone, because its certificate has to be installed by hand first.
 func renderHybridRunbook(in hybridInputs, p initconfig.HybridParams, trusted, carried bool) string {
 	// EVERY COMMAND HERE RUNS FROM THE DIRECTORY THIS FILE IS IN, so paths are
 	// relative to it and the same runbook is right wherever the operator put
