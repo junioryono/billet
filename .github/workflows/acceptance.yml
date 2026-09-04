@@ -151,8 +151,9 @@ jobs:
       # installed on the guide repository alone and holds `actions: write` there;
       # the installation token is narrowed further at minting to that one
       # repository and that one permission, and is revoked by the step after the
-      # dispatch, the only step that needs it. If that revocation cannot be
-      # proved the job is red and the token's own hour is the bound. A
+      # dispatch, the only step that needs it. A revocation GitHub refuses makes
+      # the job red; a job cancelled or a runner lost before that step runs
+      # leaves the token's own hour as the bound. A
       # fine-grained personal access token would do the same job as a credential
       # tied to a person, expiring on a date nobody watches, passing through a
       # clipboard on its way into the secret; this passes through nothing.
@@ -211,7 +212,9 @@ jobs:
               exit 1
               ;;
           esac
-          if [ "$BILLET_ACCEPTANCE_REPO" = "$GITHUB_REPOSITORY" ]; then
+          # GitHub compares owners and repositories case-insensitively, so so
+          # does this refusal.
+          if [ "${BILLET_ACCEPTANCE_REPO,,}" = "${GITHUB_REPOSITORY,,}" ]; then
             echo "::error::BILLET_ACCEPTANCE_REPO names this repository; the acceptance job runs in the guide repository." >&2
             exit 1
           fi
