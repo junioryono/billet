@@ -110,7 +110,7 @@ func rewriteForAcceptance(root *yaml.Node, dir, prefix, listen string) ([]string
 	// deployment began moving itself to v0.6.0 a minute after boot). An
 	// acceptance run proves the tree it was built from, never the channel; the
 	// rest of a `release:` block the base carries is left alone.
-	setScalar(ensureMapping(root, "release"), "automatic", "false")
+	forceScalar(ensureMapping(root, "release"), "automatic", "false")
 
 	labels, err := prefixTierLabels(root, prefix)
 	if err != nil {
@@ -297,13 +297,21 @@ func mappingValue(m *yaml.Node, key string) *yaml.Node {
 }
 
 // ensureMapping returns the mapping under key, creating an empty one when the
-// key is absent. A key holding something other than a mapping is replaced,
-// because the caller is about to write a key into it and a scalar there would
-// make the derived config unparseable rather than merely different.
+// key is absent. A key holding something other than a mapping (a `null`, or an
+// alias of one) is replaced, because the caller is about to write a key into it
+// and a scalar there would make the derived config unparseable rather than
+// merely different; the comments the operator hung on the old value move to the
+// replacement, because this file's contract is that the derivation eats none.
 func ensureMapping(m *yaml.Node, key string) *yaml.Node {
 	for i := 0; i+1 < len(m.Content); i += 2 {
 		if isKey(m.Content[i], key) {
-			if m.Content[i+1].Kind != yaml.MappingNode {
+			if old := m.Content[i+1]; old.Kind != yaml.MappingNode {
+				// The comments move to the KEY, because a block mapping has no line
+				// of its own for a line comment to render on; the key does.
+				key := m.Content[i]
+				key.HeadComment = joinComments(key.HeadComment, old.HeadComment)
+				key.LineComment = joinComments(key.LineComment, old.LineComment)
+				key.FootComment = joinComments(key.FootComment, old.FootComment)
 				m.Content[i+1] = &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
 			}
 
@@ -315,6 +323,46 @@ func ensureMapping(m *yaml.Node, key string) *yaml.Node {
 	m.Content = append(m.Content, &yaml.Node{Kind: yaml.ScalarNode, Value: key}, value)
 
 	return value
+}
+
+// joinComments keeps both comments when both exist.
+func joinComments(a, b string) string {
+	switch {
+	case a == "":
+		return b
+	case b == "":
+		return a
+	default:
+		return a + "\n" + b
+	}
+}
+
+// forceScalar sets key to a plain scalar whatever the value node was. setScalar
+// rewrites Value, Tag and Style in place, which is right for a scalar and wrong
+// for an alias: an AliasNode keeps its Kind and its Alias pointer, renders as a
+// reference to whatever the anchor still says, and a boolean written through
+// `automatic: *shared` would have come out unchanged or unparseable. Replacing
+// the node breaks only this reference; the anchor and every other use of it
+// stay as the operator wrote them, and so do the key's comments.
+func forceScalar(m *yaml.Node, key, value string) {
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		if isKey(m.Content[i], key) {
+			old := m.Content[i+1]
+			m.Content[i+1] = &yaml.Node{
+				Kind:        yaml.ScalarNode,
+				Value:       value,
+				HeadComment: old.HeadComment,
+				LineComment: old.LineComment,
+				FootComment: old.FootComment,
+			}
+
+			return
+		}
+	}
+
+	m.Content = append(m.Content,
+		&yaml.Node{Kind: yaml.ScalarNode, Value: key},
+		&yaml.Node{Kind: yaml.ScalarNode, Value: value})
 }
 
 // prefixScalar prefixes an existing scalar, and does nothing when the key is

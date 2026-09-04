@@ -59,7 +59,10 @@ active_controller() {
 cleanup() {
     status=$?
     set +e
-    trap - INT TERM
+    # IGNORED, NOT RESET: a second Ctrl-C or a TERM during the teardown must not
+    # end the shell before the scale set and the hosts are gone. The status the
+    # first signal chose (130 or 143) is already in ${status}.
+    trap '' INT TERM
     status=$(rehearsal_verdict "${status}")
 
     echo
@@ -73,7 +76,7 @@ cleanup() {
             fi
         fi
     done
-    if [ "${torn_down}" = no ]; then
+    if [ "${plane_started}" = yes ] && [ "${torn_down}" = no ]; then
         echo "TEARDOWN FAILED: the scale set for ${label} may still exist. Remove it from any host" >&2
         echo "holding this App: billet teardown --tier ${label} --yes --config <that config>" >&2
         if [ "${status}" -eq 0 ]; then status=1; fi
@@ -95,6 +98,7 @@ cleanup() {
 # own status so that cleanup, which only the EXIT trap runs, reads a failure and
 # not the $? of whatever the signal interrupted.
 REHEARSAL_PASSED=0
+plane_started=no
 trap 'exit 130' INT
 trap 'exit 143' TERM
 trap cleanup EXIT
@@ -213,6 +217,7 @@ test "$(docker exec "${controller_a}" cat /var/lib/billet/server/deployment-id)"
 
 rehearsal_step "start A, then B; one claims and one stands by"
 since_a=$(rehearsal_clock "${controller_a}")
+plane_started=yes
 docker exec -e "BILLET_STATE_DSN=${dsn}" "${controller_a}" /usr/bin/billet local up --config /etc/billet/billet.yaml 2>&1 | tail -4
 docker exec -e "BILLET_STATE_DSN=${dsn}" "${controller_b}" /usr/bin/billet local up --config /etc/billet/billet.yaml 2>&1 | tail -4
 docker exec "${node}" /usr/bin/billet local up --config /etc/billet/billet.yaml 2>&1 | tail -4

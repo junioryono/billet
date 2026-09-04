@@ -69,8 +69,10 @@ jobs:
     # exactly one OIDC subject, this repository's `environment:acceptance`, and
     # declaring the environment is what puts that subject in the token whatever
     # ref the run was dispatched for. A scheduled run from main and a dispatched
-    # run from a branch are then the same principal; a pull_request workflow
-    # cannot request an environment, so a fork's run is not. The subject GitHub
+    # run from a branch are then the same principal. What keeps a fork out is not
+    # the environment (a pull_request job can name one): this workflow has no
+    # pull_request trigger, the job runs only in the canonical repository, and a
+    # fork's run is never issued an OIDC token for this one. The subject GitHub
     # issues here is the id-qualified spelling,
     # `repo:<owner>@<id>/<repo>@<id>:environment:acceptance` (measured
     # 2026-09-04 in the account's CloudTrail, when a role trusting only the plain

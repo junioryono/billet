@@ -149,17 +149,33 @@ func TestAnAcceptanceRunSharesNoStateWithTheDeploymentItCameFrom(t *testing.T) {
 func TestAnAcceptanceRunIsNeverOnAutomaticUpdates(t *testing.T) {
 	t.Parallel()
 
+	// AN ALIAS IS NOT A SCALAR. Rewriting the value in place leaves an AliasNode
+	// pointing at the anchor, which renders as the anchor's value or not at all;
+	// the derivation has to replace the node. The anchor sits on a boolean the
+	// base legitimately carries, because the base must load before it is derived.
+	aliased := strings.Replace(acceptanceBaseConfig,
+		"  lock_dir: /run/billet/locks\n",
+		"  lock_dir: /run/billet/locks\n  allow_unlocked_deployment: &on true\n", 1) +
+		"\nrelease:\n  automatic: *on\n  channel: candidate\n"
+
+	if !strings.Contains(aliased, "&on true") {
+		t.Fatal("the alias fixture did not take, so this test proves nothing about aliases")
+	}
+
 	for _, tc := range []struct {
-		name  string
-		extra string
+		name string
+		body string
 	}{
-		{"a base that says nothing about releases", ""},
-		{"a base that follows the candidate channel", "\nrelease:\n  channel: candidate\n"},
+		{"a base that says nothing about releases", acceptanceBaseConfig},
+		{"a base that follows the candidate channel", acceptanceBaseConfig + "\nrelease:\n  channel: candidate\n"},
+		{"a base that says yes explicitly", acceptanceBaseConfig + "\nrelease:\n  automatic: true\n"},
+		{"a base that says yes through an alias", aliased},
+		{"a base with an empty release block", acceptanceBaseConfig + "\nrelease: null # left for the operator\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			base := writeAcceptanceBase(t, acceptanceBaseConfig+tc.extra)
+			base := writeAcceptanceBase(t, tc.body)
 			ws := deriveForTest(t, base, t.TempDir())
 
 			cfg, err := config.Load(ws.ConfigPath)
@@ -172,9 +188,21 @@ func TestAnAcceptanceRunIsNeverOnAutomaticUpdates(t *testing.T) {
 					"would open a rollout to the channel and drain the node the acceptance job needs")
 			}
 
-			if tc.extra != "" && cfg.Release.Channel != config.ChannelCandidate {
+			if strings.Contains(tc.body, "candidate") && cfg.Release.Channel != config.ChannelCandidate {
 				t.Errorf("the base's channel %q was not kept: got %q",
 					config.ChannelCandidate, cfg.Release.Channel)
+			}
+
+			// THE OPERATOR'S COMMENT SURVIVES the value it hung on being replaced.
+			if strings.Contains(tc.body, "left for the operator") {
+				derived, err := os.ReadFile(ws.ConfigPath)
+				if err != nil {
+					t.Fatalf("read the derived config: %v", err)
+				}
+
+				if !strings.Contains(string(derived), "left for the operator") {
+					t.Error("the comment on `release: null` was eaten by the derivation")
+				}
 			}
 		})
 	}
