@@ -181,6 +181,25 @@ billet_release_url_base: https://github.com/junioryono/billet/releases/download
 # for. One value, so an operator who moves the staging area moves both.
 billet_release_stage: "{{ billet_firecracker_stage }}"
 
+# EVERY FETCH THIS ROLE MAKES IS BOUNDED AND RETRIED: the release channel
+# statement, the release archive and its checksums, and the Firecracker
+# tarball. A single stalled connection -- a CDN blip, a transient 5xx, a TCP
+# connect that hangs for the kernel's own timeout -- used to fail the whole
+# converge at a verification step, and on a fleet converged from CI behind an
+# approval gate that is a red run and a spent approval for an outage nobody
+# caused. Measured: a release host that reached the same URL in a tenth of a
+# second a minute later.
+#
+# The timeout is the seconds ONE socket operation may stall (get_url and uri
+# apply it to the connect and to every read, so a transfer is bounded per read
+# rather than in total); the retries wait this delay between attempts. A real
+# outage still fails, in a few minutes rather than after the defaults, and a
+# blip does not. tests/fetch-retry-check.sh refuses a fetch task that carries
+# none of this.
+billet_fetch_timeout: 30
+billet_fetch_retries: 5
+billet_fetch_retry_delay: 5
+
 billet_networks:
   - name: billet0
     address: 172.31.0.1

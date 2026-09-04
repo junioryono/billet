@@ -16,9 +16,10 @@ const tablePath = "../../terraform/modules/billet/classification.json"
 // moduleRoot is the tree every managed resource has to be accounted for in.
 //
 // THE DEPLOYMENT MODULE AND ITS CHILDREN, AND DELIBERATELY NOT ITS SIBLINGS.
-// terraform/modules also holds converge-aws-ssm and converge-cloudflare, which
-// say in their own first comment that they are optional and NOT part of the
-// billet root module: they carry an operator's remote-access path to a host, run
+// terraform/modules also holds converge-aws-ssm, converge-cloudflare and
+// converge-cloudflare-warp, which say in their own first comment that they are
+// optional and NOT part of the billet root module: they carry an operator's
+// remote-access path to a host, run
 // no jobs, hold no ledger, and are applied on their own. Classifying them would
 // be claiming this table describes what a change to somebody's SSM activation
 // costs a running deployment, which it does not.

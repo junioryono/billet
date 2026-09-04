@@ -57,12 +57,17 @@
   ansible.builtin.get_url:
     url: "{{ item.url }}"
     dest: "{{ billet_development_apt_stage }}/{{ item.name }}.asc"
+    timeout: "{{ billet_development_fetch_timeout }}"
     owner: root
     group: root
     mode: "0600"
   loop:
     - { name: caddy, url: "https://dl.cloudsmith.io/public/caddy/stable/gpg.key" }
     - { name: hashicorp, url: "https://apt.releases.hashicorp.com/gpg" }
+  register: billet_development_key_download
+  until: billet_development_key_download is succeeded
+  retries: "{{ billet_development_fetch_retries }}"
+  delay: "{{ billet_development_fetch_retry_delay }}"
   when: not ansible_check_mode or billet_development_apt_stage_stat.stat.exists
   become: true
 

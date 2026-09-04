@@ -42,12 +42,12 @@ output "control_plane_instance_id" {
 }
 
 output "control_plane_private_ip" {
-  description = "The control plane's private IP."
+  description = "The control plane's private IP: the one control_plane_private_ip declared, otherwise the one AWS observed at launch."
   value       = module.control_plane.private_ip
 }
 
 output "node_wire_address" {
-  description = "The host:port other hosts dial for the node wire — bind it as server.listen, and use it as node.server_addr on a remote node. billet requires host:port, not a bare IP. This is the PRIVATE address and the right default; a node outside the VPC reaches it over a private network, a VPN or overlay, a reverse tunnel, or the public address below (ADR-001)."
+  description = "The host:port other hosts dial for the node wire — bind it as server.listen, and use it as node.server_addr on a remote node. billet requires host:port, not a bare IP. This is the PRIVATE address and the right default; a node outside the VPC reaches it over a private network, a VPN or overlay, a reverse tunnel, or the public address below (ADR-001). Plan-known once control_plane_private_ip is declared."
   value       = module.control_plane.node_wire_address
 }
 
@@ -111,6 +111,21 @@ output "ledger_device_name" {
   value       = module.control_plane.ledger_device_name
 }
 
+output "backup_bucket" {
+  description = "The bucket billet copies its deployment archives to (backup.s3.bucket) — created, adopted, or empty when there is no off-site copy."
+  value       = module.control_plane.backup_bucket
+}
+
+output "backup_prefix" {
+  description = "The object prefix archives land under (backup.s3.prefix). The grant is scoped to it literally."
+  value       = module.control_plane.backup_prefix
+}
+
+output "backup_role_name" {
+  description = "The IAM role the backup grant is attached to, or empty. In this root it is fleet-ec2's node role, because that is the identity the co-located controller runs with; a grant anywhere else would leave the bucket unwritable."
+  value       = module.control_plane.backup_role_name
+}
+
 output "vpc_cidr" {
   description = "The VPC's resolved CIDR (created or adopted) — what the node-wire ingress defaults to. Additive post-split, and load-bearing for the tests: it reads THROUGH the child, so asserting it proves the resolved adopted CIDR actually crossed the module call rather than only that the root resolved it."
   value       = module.control_plane.vpc_cidr
@@ -143,7 +158,7 @@ output "cost_inputs" {
       cache_bucket         = var.enable_cache
       cache_kms_key        = var.enable_kms
       spot_interruption    = var.enable_spot
-      backup_bucket        = false
+      backup_bucket        = var.create_backup_bucket
       nat_gateway          = false
       internet_gateway     = local.create_vpc
       cloudwatch_log_group = false
@@ -163,4 +178,9 @@ output "cost_inputs" {
     # which is free.
     notes = local.create_vpc ? "This deployment's created VPC routes through an internet gateway, not a NAT gateway; instances need a public IP to reach GitHub." : "This deployment adopted your network, so its egress path — and any NAT gateway charge — is yours."
   }
+}
+
+output "subnet_cidr" {
+  description = "The subnet's resolved CIDR (created or adopted), read THROUGH the child so asserting it proves the range a declared control_plane_private_ip is checked against actually crossed the module call."
+  value       = module.control_plane.subnet_cidr
 }

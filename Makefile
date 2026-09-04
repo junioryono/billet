@@ -347,6 +347,18 @@ release-fetch-check: ## Prove the billet_version fetch path and the URL it build
 firecracker-example-check: ## Prove the role accepts a firecracker emission, up to the hardware
 	ansible_collections/junioryono/billet/tests/firecracker-example-check.sh
 
+.PHONY: fetch-retry-check
+fetch-retry-check: ## Prove every network fetch in both roles is bounded and retried
+	ansible_collections/junioryono/billet/tests/fetch-retry-check.sh
+
+.PHONY: hybrid-emission-check
+hybrid-emission-check: ## Prove the inventory and playbook `billet init hybrid` writes are ones Ansible reads
+	ansible_collections/junioryono/billet/tests/hybrid-emission-check.sh
+
+.PHONY: hybrid-root-check
+hybrid-root-check: ## Prove the Terraform root `billet init hybrid` writes validates against this checkout's module
+	scripts/hybrid-root-check.sh
+
 .PHONY: acceptance
 acceptance: ## Run an ISOLATED acceptance deployment against a real account, and destroy exactly what it makes
 	@# NOT IN `check`, and not in CI's ordinary jobs: it launches billable compute

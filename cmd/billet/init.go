@@ -94,6 +94,13 @@ func cmdInit(ctx context.Context, args []string) error {
 		return cmdInitIAM(ctx, args[1:])
 	}
 
+	// `billet init hybrid` writes a DIRECTORY -- a Terraform root, an inventory
+	// with both hosts, a playbook, the collection pin and a runbook -- rather
+	// than one config, so it is its own command with its own flags.
+	if len(args) > 0 && args[0] == "hybrid" {
+		return cmdInitHybrid(ctx, args[1:])
+	}
+
 	fs := newFlagSet("billet init")
 
 	// A PARSE DIAGNOSTIC MUST NOT REACH AN APPENDED INVENTORY. newFlagSet sends
