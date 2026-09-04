@@ -216,7 +216,11 @@ func TestARedeliveredAssignmentDoesNotStartASecondRunner(t *testing.T) {
 	stop := restarted.run(t)
 	defer stop()
 
-	// GitHub redelivers the whole exchange for the SAME request.
+	// GitHub redelivers the whole exchange for the SAME request. MEASURED, not
+	// assumed: on 2026-09-04 a real session abandoned while holding an
+	// unacknowledged message handed that exact message id to its successor
+	// (internal/integration's TestLiveSessionReplacement). This test is what makes
+	// the redelivery harmless rather than what makes it happen.
 	restarted.plane.queue(fakeactions.StatisticsJSON(1, 0),
 		fakeactions.JobJSON("JobAvailable", lease.RequestID, "push", testTier))
 
