@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -52,7 +53,7 @@ import (
 // THE PROCESS TIMEOUT IS NOT DECORATION: the expiry window alone defaults to
 // thirty minutes, and Go's default is ten.
 //
-// IT RAN SEVEN TIMES ON 2026-09-04 and the answers are in ADR-006,
+// IT RAN EIGHT TIMES ON 2026-09-04 and the answers are in ADR-006,
 // upstream-references.md and the protocol skill: a successor is refused under
 // either name, the session was still refused at 60 seconds every time and open at
 // 91 or 92, and the unacknowledged message came back to the successor. NOTHING
@@ -136,6 +137,7 @@ func TestLiveSessionReplacement(t *testing.T) {
 
 	report.HeldMessageID = held.MessageID
 	report.HeldMessage = describeMessage(held)
+	report.HeldJobs = describeJobs(held)
 
 	abandonFirst = true
 
@@ -311,10 +313,27 @@ func awaitRedelivery(
 			report.SameMessage = boolPtr(true)
 			report.RedeliveredMessageID = msg.MessageID
 			report.RedeliveredMessage = describeMessage(msg)
-			report.Note = "the successor was handed the message the abandoned session held"
+
+			// THE IDENTITIES, NOT ONLY THE ID AND THE COUNT. "The same message came
+			// back" and "the same work came back" are different findings, and every
+			// record that quotes this one makes the second claim: a redelivery a
+			// recovery path could lean on is one carrying the same jobs, so the jobs
+			// are compared and the comparison is what the record reports.
+			report.RedeliveredJobs = describeJobs(msg)
+			report.SameJobs = boolPtr(report.RedeliveredJobs == report.HeldJobs)
+
+			if *report.SameJobs {
+				report.Note = "the successor was handed the message the abandoned session " +
+					"held, carrying the same jobs"
+			} else {
+				report.Note = "the successor was handed the message id the abandoned " +
+					"session held, but carrying DIFFERENT jobs"
+			}
 
 			t.Logf("RECORDED: the successor was handed message %d (%s), which is the one the "+
-				"abandoned session held", msg.MessageID, report.RedeliveredMessage)
+				"abandoned session held; jobs held %s, jobs back %s, same=%t",
+				msg.MessageID, report.RedeliveredMessage, report.HeldJobs,
+				report.RedeliveredJobs, *report.SameJobs)
 
 			return
 		case err == nil:
@@ -614,6 +633,37 @@ func describeMessage(m *server.Message) string {
 		len(m.Available), len(m.Assigned), len(m.Started), len(m.Completed))
 }
 
+// describeJobs renders the identities a message carries, in delivery order, so
+// two deliveries can be compared as strings.
+//
+// THE IDENTITIES ARE THE THREE GITHUB SENDS: the request id billet schedules on,
+// the run, and the stable workflow-job id that carries a direct assignment when
+// the request id is zero. Not the runner fields, which are only authoritative on
+// started and completed messages, and not the whole payload, which carries a
+// token that differs per delivery by design.
+func describeJobs(m *server.Message) string {
+	var b strings.Builder
+
+	for _, group := range []struct {
+		kind string
+		jobs []server.Job
+	}{
+		{"available", m.Available},
+		{"assigned", m.Assigned},
+		{"started", m.Started},
+		{"completed", m.Completed},
+	} {
+		for i := range group.jobs {
+			job := &group.jobs[i]
+
+			fmt.Fprintf(&b, "%s[request=%d run=%d job=%s] ",
+				group.kind, job.RequestID, job.RunID, job.JobID)
+		}
+	}
+
+	return strings.TrimSpace(b.String())
+}
+
 // envOr is a default this measurement can be pointed away from.
 func envOr(name, fallback string) string {
 	if v := os.Getenv(name); v != "" {
@@ -714,9 +764,16 @@ type replacementReport struct {
 	Redelivered          *bool  `json:"redelivered,omitempty"`
 	RedeliveredMessageID int64  `json:"redelivered_message_id,omitempty"`
 	RedeliveredMessage   string `json:"redelivered_message,omitempty"`
-	// SameMessage says whether what came back carried the id that was held. The
-	// payload is not compared; the shape beside it is what the record shows.
-	SameMessage *bool `json:"same_message,omitempty"`
+	// SameMessage says whether what came back carried the id that was held, and
+	// SameJobs whether it carried the same job identities. Two questions, because
+	// a message id that returns carrying different work would answer the first yes
+	// and be a finding rather than a redelivery anything may lean on.
+	SameMessage *bool  `json:"same_message,omitempty"`
+	SameJobs    *bool  `json:"same_jobs,omitempty"`
+	HeldJobs    string `json:"held_jobs,omitempty"`
+	// RedeliveredJobs is what the successor's copy carried, absent unless the held
+	// id came back.
+	RedeliveredJobs string `json:"redelivered_jobs,omitempty"`
 	// SuccessorCloseFailed is set when a close did not come back cleanly, which
 	// leaves the session's state unknown rather than proven open.
 	SuccessorCloseFailed string `json:"successor_close_failed,omitempty"`
