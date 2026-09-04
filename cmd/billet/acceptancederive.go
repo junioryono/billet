@@ -110,7 +110,12 @@ func rewriteForAcceptance(root *yaml.Node, dir, prefix, listen string) ([]string
 	// deployment began moving itself to v0.6.0 a minute after boot). An
 	// acceptance run proves the tree it was built from, never the channel; the
 	// rest of a `release:` block the base carries is left alone.
-	if err := forceScalar(ensureMapping(root, "release"), "automatic", "false"); err != nil {
+	release, err := ensureMapping(root, "release")
+	if err != nil {
+		return nil, err
+	}
+
+	if err := forceScalar(release, "automatic", "false"); err != nil {
 		return nil, err
 	}
 
@@ -303,11 +308,16 @@ func mappingValue(m *yaml.Node, key string) *yaml.Node {
 // alias of one) is replaced, because the caller is about to write a key into it
 // and a scalar there would make the derived config unparseable rather than
 // merely different; the comments the operator hung on the old value move to the
-// replacement, because this file's contract is that the derivation eats none.
-func ensureMapping(m *yaml.Node, key string) *yaml.Node {
+// replacement, because this file's contract is that the derivation eats none. A
+// value that defines an anchor is refused for the reason forceScalar gives.
+func ensureMapping(m *yaml.Node, key string) (*yaml.Node, error) {
 	for i := 0; i+1 < len(m.Content); i += 2 {
 		if isKey(m.Content[i], key) {
 			if old := m.Content[i+1]; old.Kind != yaml.MappingNode {
+				if old.Anchor != "" {
+					return nil, anchoredValue(key, old.Anchor)
+				}
+
 				// The comments move to the KEY, because a block mapping has no line
 				// of its own for a line comment to render on; the key does.
 				key := m.Content[i]
@@ -317,14 +327,24 @@ func ensureMapping(m *yaml.Node, key string) *yaml.Node {
 				m.Content[i+1] = &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
 			}
 
-			return m.Content[i+1]
+			return m.Content[i+1], nil
 		}
 	}
 
 	value := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
 	m.Content = append(m.Content, &yaml.Node{Kind: yaml.ScalarNode, Value: key}, value)
 
-	return value
+	return value, nil
+}
+
+// anchoredValue is the refusal for a value the derivation would have to replace
+// and that defines an anchor. It says "may be", because an anchor nothing
+// aliases is legal YAML; the derivation refuses either way rather than decide
+// what the operator meant by it.
+func anchoredValue(key, anchor string) error {
+	return fmt.Errorf("%s defines the anchor &%s, which may be aliased elsewhere in the base config; "+
+		"an acceptance run rewrites this value and will not change what the anchor means, so "+
+		"spell out any aliased uses and remove the anchor", key, anchor)
 }
 
 // joinComments keeps both comments when both exist.
@@ -357,9 +377,7 @@ func forceScalar(m *yaml.Node, key, value string) error {
 		if isKey(m.Content[i], key) {
 			old := m.Content[i+1]
 			if old.Anchor != "" {
-				return fmt.Errorf("%s defines the anchor &%s, which other values alias; an acceptance run "+
-					"sets it to %s and cannot rewrite the anchor's other uses, so spell those out "+
-					"in the base config and remove the anchor", key, old.Anchor, value)
+				return anchoredValue(key, old.Anchor)
 			}
 
 			m.Content[i+1] = &yaml.Node{

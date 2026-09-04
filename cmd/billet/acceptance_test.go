@@ -215,33 +215,50 @@ func TestAnAcceptanceRunIsNeverOnAutomaticUpdates(t *testing.T) {
 func TestAnAnchoredAutomaticIsRefusedRatherThanRewritten(t *testing.T) {
 	t.Parallel()
 
-	body := strings.Replace(acceptanceBaseConfig,
-		"  lock_dir: /run/billet/locks\n",
-		"  lock_dir: /run/billet/locks\n  allow_unlocked_deployment: *enabled\n", 1)
-	body = "release:\n  automatic: &enabled true\n" + body
+	for _, tc := range []struct {
+		name    string
+		release string
+	}{
+		// The anchor on the boolean the derivation rewrites.
+		{"on release.automatic", "release:\n  automatic: &enabled true\n"},
+		// The anchor on the release value the derivation replaces with a mapping,
+		// which is the earlier of the two replacements and must refuse the same way.
+		{"on a null release", "release: &enabled null\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-	if !strings.Contains(body, "*enabled") || !strings.HasPrefix(body, "release:") {
-		t.Fatal("the fixture did not take, so this test proves nothing about anchors")
-	}
+			body := strings.Replace(acceptanceBaseConfig,
+				"  lock_dir: /run/billet/locks\n",
+				"  lock_dir: /run/billet/locks\n  allow_unlocked_deployment: *enabled\n", 1)
+			body = tc.release + body
 
-	if _, err := config.Parse("the fixture", []byte(body)); err != nil {
-		t.Fatalf("the fixture must load before the derivation can be the one refusing: %v", err)
-	}
+			if !strings.Contains(body, "*enabled") || !strings.Contains(body, "&enabled") {
+				t.Fatal("the fixture did not take, so this test proves nothing about anchors")
+			}
 
-	base := writeAcceptanceBase(t, body)
+			if _, err := config.Parse("the fixture", []byte(body)); err != nil {
+				t.Fatalf("the fixture must load before the derivation can be the one refusing: %v", err)
+			}
 
-	_, err := deriveAcceptance(t.Context(), acceptanceInputs{
-		base:      base,
-		workspace: t.TempDir(),
-		prefix:    defaultLabelPrefix,
-	})
-	if err == nil {
-		t.Fatal("a base whose release.automatic defines an anchor was derived; the aliases of that " +
-			"anchor are dangling in the derived file, or were silently flipped")
-	}
+			base := writeAcceptanceBase(t, body)
 
-	if !strings.Contains(err.Error(), "&enabled") {
-		t.Errorf("the refusal does not name the anchor: %v", err)
+			_, err := deriveAcceptance(t.Context(), acceptanceInputs{
+				base:      base,
+				workspace: t.TempDir(),
+				prefix:    defaultLabelPrefix,
+			})
+			if err == nil {
+				t.Fatal("a base whose release value defines an anchor was derived; the aliases of that " +
+					"anchor are dangling in the derived file, or were silently flipped")
+			}
+
+			// THE DERIVATION'S REFUSAL, not the loader's: a dangling alias fails
+			// later as "unknown anchor", which names nothing the operator can act on.
+			if !strings.Contains(err.Error(), "&enabled") || strings.Contains(err.Error(), "unknown anchor") {
+				t.Errorf("the refusal is not the derivation's own, naming the anchor: %v", err)
+			}
+		})
 	}
 }
 
