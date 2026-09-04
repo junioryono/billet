@@ -482,7 +482,7 @@ func TestParseTerraformOutput(t *testing.T) {
 	want := HybridFacts{
 		ControlPlanePrivateIP: "10.60.0.10", LedgerVolumeID: "vol-0abc", SubnetID: "subnet-0abc",
 		RunnerSecurityGroupID: "sg-trusted", UntrustedRunnerSecurityGroupID: "sg-untrusted",
-		AMIPayloadBucket: "acme-ci-ami-payloads-1",
+		AMIPayloadBucket: "acme-ci-ami-payloads-1", Region: "us-west-2",
 	}
 	if got != want {
 		t.Errorf("facts %+v, want %+v", got, want)
@@ -739,6 +739,7 @@ func TestParseTerraformOutputCacheFacts(t *testing.T) {
   "subnet_id": {"value": "subnet-0abc"},
   "runner_security_group_id": {"value": "sg-trusted"},
   "ami_payload_bucket": {"value": "acme-ci-ami-payloads-1"},
+  "region": {"value": "us-west-2"},
   "cache_bucket": {"value": "acme-ci-cache-1"},
   "cache_prefix": {"value": "billet-cache"},
   "availability_zone": {"value": "us-west-2a"}
