@@ -47,6 +47,10 @@ release:
     end: "04:00"
 ```
 
+## Releases before v0.6.1 cannot verify a release
+
+Every release manifest and channel statement billet publishes is signed by `release.yml` running on `main`, because the cut button calls that workflow from `main`. Binaries before v0.6.1 carry a policy that accepted only a release-branch or tag identity, so on them `billet rollout start`, the automatic starter and `billet host-upgrade --version` refuse every manifest with `the manifest's signature does not satisfy this source's policy`. A fleet on v0.5.0 or v0.6.0 is moved once by the package or the Ansible host role, which install from the release's checksums rather than its manifest; from v0.6.1 it moves itself. The first rollout rehearsal found this on 2026-09-04 (UTC), in its first step.
+
 ## What a host actually does
 
 Each host walks the same phases, and `billet rollout status` names them:

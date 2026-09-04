@@ -46,7 +46,8 @@ const PublishWorkflow = ".github/workflows/release.yml"
 // pattern assumed release.yml "runs against the tag" and accepted only
 // `refs/heads/release/vX.Y` or `refs/tags/vX.Y.Z`, so every binary shipped with
 // it, v0.5.0 and v0.6.0 included, refused every manifest billet had ever
-// published; the first rollout rehearsal (2026-09-04) is where that surfaced.
+// published; the first rollout rehearsal (2026-09-04 UTC) is where that
+// surfaced.
 // The two refs the workflow can actually run under are the cut button on main
 // and a hotfix tag pushed by hand (`on: push: tags: v*`); a release branch is
 // not one of them, because release.yml has no branch trigger. What must stay

@@ -17,7 +17,22 @@ import (
 func TestTheSigningIdentityAcceptsWhatTheReleaseWorkflowSignsWith(t *testing.T) {
 	t.Parallel()
 
-	identity := regexp.MustCompile(DefaultSigningIdentity)
+	// THE POLICY THE COMMANDS USE, not the constant behind it: a test on the
+	// constant stays green if PolicyForRelease stops handing it out.
+	policy, err := PolicyForRelease(false)
+	if err != nil {
+		t.Fatalf("PolicyForRelease: %v", err)
+	}
+
+	if !policy.Required {
+		t.Fatal("the default release policy does not require a signature")
+	}
+
+	if policy.Issuer != "https://token.actions.githubusercontent.com" {
+		t.Fatalf("the default release policy trusts issuer %q, want GitHub Actions", policy.Issuer)
+	}
+
+	identity := regexp.MustCompile(policy.Identity)
 
 	for _, san := range []string{
 		// The cut button: what v0.6.0's release-manifest.sigstore.json carries.
@@ -38,8 +53,9 @@ func TestTheSigningIdentityAcceptsWhatTheReleaseWorkflowSignsWith(t *testing.T) 
 		"https://github.com/junioryono/billet/.github/workflows/ci.yml@refs/heads/main",
 		// Another repository.
 		"https://github.com/someone/billet/.github/workflows/release.yml@refs/heads/main",
-		// A prefix or suffix around the exact SAN.
+		// A prefix or suffix around the exact SAN, and a path below main.
 		"https://github.com/junioryono/billet/.github/workflows/release.yml@refs/heads/main2",
+		"https://github.com/junioryono/billet/.github/workflows/release.yml@refs/heads/main/x",
 		"xhttps://github.com/junioryono/billet/.github/workflows/release.yml@refs/heads/main",
 		// A release branch: release.yml has no branch trigger, so nothing signs there.
 		"https://github.com/junioryono/billet/.github/workflows/release.yml@refs/heads/release/v0.6",
