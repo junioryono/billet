@@ -73,10 +73,82 @@
 // key whose policy or grants admit foreign roles reopens the boundary on the
 // key side, which no identity policy can see.
 //
+// A LAUNCH MAY NOT ATTACH A SNAPSHOT BILLET DOES NOT OWN — this deployment's, in
+// per-deployment mode; any billet-owned one in account-wide mode, which is the
+// same weaker boundary every other condition here falls back to without an id.
+// That is the one boundary RunInstances-on-"*" cannot draw by being scoped:
+// RunInstances authorizes every snapshot a block-device mapping names, so an
+// unconditioned grant lets a node role launch an instance with ANY snapshot in the
+// account attached and read it — in a shared account that is the control plane's
+// own ledger snapshots, a volume holding the deployment identity and the node-wire
+// CA key. The other two routes to a foreign snapshot are already closed by tag
+// conditions (BilletCacheCloneSource on CreateVolume, BilletCacheAttach); this one
+// is closed by an explicit DENY, because the Allow it bounds cannot be narrowed
+// without denying the launch itself.
+//
+// MEASURED WITH iam:SimulateCustomPolicy, 2026-09-04, both modes and both
+// directions each. Per-deployment (StringNotEquals on the owner value): a snapshot
+// with no owner tag is an explicitDeny, one carrying ANOTHER deployment's owner is
+// an explicitDeny, one carrying this deployment's own is allowed, and a plain
+// launch (instance + image) is allowed. Account-wide (Null true, the tag absent):
+// an untagged snapshot is an explicitDeny and a tagged one is allowed. The
+// per-deployment case needs no second statement for the untagged snapshot, which
+// is a property of IAM rather than of this document: a NEGATED operator evaluates
+// true when the key is absent from the request context, so one StringNotEquals
+// catches both the foreign owner and the missing tag.
+//
+// THE ACCOUNT FIELD IS A WILDCARD, NOT EMPTY, AND THE DIFFERENCE IS THE WHOLE
+// GUARD. An EBS snapshot ARN is documented account-less and BilletCacheCloneSource
+// matches exactly that shape — but a Deny must match every spelling the resource
+// could take, and measured on the same day, `arn:aws:ec2:*::snapshot/*` answers
+// ALLOWED for `arn:aws:ec2:us-west-2:<account>:snapshot/snap-…` while
+// `arn:aws:ec2:*:*:snapshot/*` denies both. So this statement takes the wildcard,
+// the same shape BilletCacheSnapshotCreate and BilletAMIBuilderImage already use.
+//
+// NOTHING BILLET SENDS IS DENIED BY IT: billet's own RunInstances names no
+// snapshot (setBlockDevices writes DeleteOnTermination and VolumeSize, never a
+// SnapshotId) and a cache clone goes through CreateVolume, which is a different
+// action.
+//
+// ASKED OF EC2 ITSELF, 2026-09-04, three RunInstances --dry-run calls under a
+// throwaway role holding exactly the rendering below, against the account's real
+// control-plane ledger snapshot (untagged) and the AMI billet boots:
+//
+//	this policy, billet's own launch shape        DryRunOperation
+//	this policy, that snapshot in a mapping       UnauthorizedOperation, explicit deny
+//	the PREVIOUS policy, the same mapping         DryRunOperation
+//
+// The third line is what the guard is for: before this statement EC2 AUTHORIZED
+// that request, and what it attaches is a volume holding the deployment identity
+// and the CA key, to a machine that runs somebody's workflow. (A dry run answers
+// the authorization question and no other, which is the question here; it says
+// nothing about capacity.) The first line says billet's own launch is untouched,
+// and it answers the AMI question a simulation cannot reach: that launch was
+// allowed although the AMI's own backing snapshot is untagged, so the AMI's
+// backing snapshot was not evaluated while a snapshot the mapping NAMES was. That
+// is measured for the image the acceptance lane boots and the request billet
+// sends, which is the case that matters — and if AWS ever changed it, the failure
+// is a refused launch rather than a widened grant, which is the direction this
+// package chooses everywhere. EC2's own refusal also names the resource it
+// evaluated, `arn:aws:ec2:us-west-2::snapshot/snap-…` — account-less, as the
+// section above says, which the wildcard account matches and would keep matching
+// if that spelling ever changed.
+//
+// WHAT IT DOES NOT CLOSE, in account-wide mode, is another billet deployment's
+// TAGGED snapshot — the same limitation BilletCacheCloneSource states one section
+// up, for the same reason (presence is all a policy with no deployment id can
+// ask), and closed by the same thing: a per-deployment KMS key.
+//
 // THE BUILDER IS SCOPED SEPARATELY. `billet ami build` tags its builder instance
 // with a per-build owner (BuilderOwnerPrefix + name), NOT a deployment id, so the
 // --builder statements match that prefix by StringLike and carry their own
 // Terminate — the deployment-scoped runtime Terminate would not reach a builder.
+// The snapshot deny above gets NO builder exemption, which is deliberate in both
+// directions: a build launches from a base image and from the image it just made,
+// and neither names a snapshot, so an exemption would authorize nothing it needs —
+// and with the CreateImage request billet sends today it could not help anyway,
+// because that request tags only the image, so a builder's own backing snapshots
+// carry no owner tag for an exemption to match.
 //
 // VALIDATED AGAINST A LIVE AWS ACCOUNT with iam:SimulateCustomPolicy in both
 // modes: every action billet performs is allowed for its own tagged resources with
@@ -116,8 +188,11 @@ type Policy struct {
 	Statement []Statement `json:"Statement"`
 }
 
-// Statement is one Allow rule. Condition is omitted when empty so an
-// unconditioned statement does not render an empty object.
+// Statement is one rule. Every statement here is an Allow but one — the snapshot
+// boundary the package comment describes, which has to be a Deny because the
+// Allow it bounds cannot be narrowed without denying billet's own launches.
+// Condition is omitted when empty so an unconditioned statement does not render an
+// empty object.
 type Statement struct {
 	Sid       string         `json:"Sid"`
 	Effect    string         `json:"Effect"`
@@ -394,6 +469,19 @@ func (in Inputs) Build() (Policy, error) {
 			Statement{
 				Sid: "BilletRuntimeLaunch", Effect: "Allow",
 				Action: ec2.RuntimeLaunchIAMActions(), Resource: []string{"*"},
+			},
+			// AND THE ONE THING THAT LAUNCH MAY NOT ATTACH: a snapshot this deployment
+			// does not own. RunInstances authorizes every snapshot a block-device
+			// mapping names, so the Allow above is also a read of any snapshot in the
+			// account — the ledger's among them. It cannot be narrowed (it creates
+			// several resource types at once), so the boundary is a Deny beside it. See
+			// the package comment for the simulation and for why billet's own launches,
+			// which name no snapshot, are unaffected.
+			Statement{
+				Sid: "BilletRuntimeDenyForeignSnapshot", Effect: "Deny",
+				Action:    ec2.RuntimeLaunchIAMActions(),
+				Resource:  []string{"arn:" + partition + ":ec2:*:*:snapshot/*"},
+				Condition: foreignOwnerCondition("aws:ResourceTag/"+ec2.OwnerTagKey, in.Owner),
 			},
 			// Tagging only as part of a create, AND — in per-deployment mode — only with
 			// this deployment's own owner value. Without the value condition a role could
@@ -1204,6 +1292,26 @@ func ownerTagCondition(key, owner string) map[string]any {
 	}
 
 	return map[string]any{"StringEquals": map[string]any{key: owner}}
+}
+
+// foreignOwnerCondition is ownerTagCondition's negation: it matches a resource
+// this deployment does not own, which is what a DENY has to ask. With a deployment
+// id that is StringNotEquals on the exact value; without one it is the tag being
+// absent.
+//
+// ONE STATEMENT COVERS BOTH FOREIGN CASES IN VALUE MODE, and that is IAM's rule
+// rather than this document's: a negated matching operator evaluates TRUE when the
+// key is absent from the request context, so StringNotEquals denies an untagged
+// resource as well as one carrying somebody else's owner. Measured with
+// iam:SimulateCustomPolicy on 2026-09-04 rather than read — a policy that needed a
+// second Null statement and did not have one would fail open on exactly the
+// resource this guard is about.
+func foreignOwnerCondition(key, owner string) map[string]any {
+	if owner == "" {
+		return map[string]any{"Null": map[string]any{key: "true"}}
+	}
+
+	return map[string]any{"StringNotEquals": map[string]any{key: owner}}
 }
 
 // withCacheOwnerPresent adds "the cache-owner tag is present" to an owner

@@ -68,6 +68,27 @@ run "sentinels_fully_substituted" {
     error_message = "the BilletCacheList statement must scope s3:prefix to exactly the real cache_prefix on the bare bucket ARN"
   }
 
+  # THE LAUNCH BOUNDARY, structurally. ec2:RunInstances is granted on "*" and it
+  # authorises every snapshot a block-device mapping names, so without this Deny
+  # the node role can launch an instance with the control plane's ledger snapshot
+  # attached and read the deployment identity and the CA key off it. Asserted as a
+  # whole statement, and with the Effect, because the same statement rendered Allow
+  # would bound nothing while every substring search still passed.
+  assert {
+    condition = anytrue([
+      for s in jsondecode(aws_iam_role_policy.node.policy).Statement :
+      try(
+        s.Sid == "BilletRuntimeDenyForeignSnapshot" &&
+        s.Effect == "Deny" &&
+        tolist(s.Action) == tolist(["ec2:RunInstances"]) &&
+        tolist(s.Resource) == tolist(["arn:aws:ec2:*:*:snapshot/*"]) &&
+        s.Condition.Null["aws:ResourceTag/sh.billet.owner"] == "true",
+        false
+      )
+    ])
+    error_message = "the node policy must DENY ec2:RunInstances for a snapshot carrying no billet owner tag, in the real partition"
+  }
+
   # A bucket containing a region string survives intact (the case F4 caught: a
   # global region replace after the bucket replace would corrupt it).
   assert {
@@ -241,6 +262,29 @@ run "compute_only_role_has_no_cache_or_spot_grants" {
   assert {
     condition     = !strcontains(aws_iam_role_policy.node.policy, "s3:") && !strcontains(aws_iam_role_policy.node.policy, "sqs:") && !strcontains(aws_iam_role_policy.node.policy, "BilletCache")
     error_message = "a compute-only role must not carry cache or spot grants"
+  }
+
+  # THE COMPUTE-ONLY RENDERING CARRIES A PARTITION SENTINEL TOO, since the launch
+  # boundary names a snapshot ARN — and this run is the only one that would see it
+  # unsubstituted, because every other assertion here is about the cache rendering.
+  assert {
+    condition     = !can(regex("TF(REGION|BUCKET|PREFIX|KMSKEY|PARTITION|DNSSUFFIX)", aws_iam_role_policy.node.policy))
+    error_message = "a committed policy sentinel survived the compute-only render"
+  }
+
+  # And a role with no cache still refuses a foreign snapshot: the exposure is the
+  # bare ec2:RunInstances grant, which every ec2 node holds.
+  assert {
+    condition = anytrue([
+      for s in jsondecode(aws_iam_role_policy.node.policy).Statement :
+      try(
+        s.Sid == "BilletRuntimeDenyForeignSnapshot" &&
+        s.Effect == "Deny" &&
+        tolist(s.Resource) == tolist(["arn:aws:ec2:*:*:snapshot/*"]),
+        false
+      )
+    ])
+    error_message = "a compute-only role must still deny a launch from a snapshot it does not own"
   }
   assert {
     condition     = length(aws_iam_role_policy.spot) == 0

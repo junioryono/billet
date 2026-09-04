@@ -24,6 +24,8 @@ Pin the module to a release in your own configuration: the `?ref=` names the ver
 
 The module's IAM is exactly what `billet init iam` prints for the same config, kept equal by a drift test, so the module can never grant a permission billet would not ask for. `billet init iam --builder` adds what `billet ami build` needs; `--controller-sweep` adds the CodeBuild registration sweep.
 
+The node role may launch instances but may not launch one from a snapshot this deployment does not own, which is an explicit deny rather than a narrower grant: `ec2:RunInstances` authorises every snapshot a block-device mapping names, and the account a fleet runs in is usually also where the control plane's ledger snapshots live. billet's own launches name no snapshot, so nothing it does is refused by it. In account-wide mode the deny asks only that the snapshot carry billet's owner tag, so another billet deployment's snapshot in the same account is still reachable; a per-deployment KMS key is what closes that, the same as for the cache.
+
 ## The node
 
 An `ec2` node is an orchestrator: it calls an API and the compute appears in a region. So `node.max_vcpu` and `node.max_memory` are required rather than detected, and they are hard resource budgets rather than price budgets. The node registers its ordered `instance_types`, each with `vcpu`, `memory` and an operator-audited `price_usd_per_hour`; placement charges the first shape that fits, and a shape AWS has none of (`InsufficientInstanceCapacity`) falls through to the next one you declared, after a synchronous refusal that launched nothing.
