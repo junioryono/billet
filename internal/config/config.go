@@ -600,6 +600,13 @@ type NodeConfig struct {
 	// Cache exposes the per-job sticky-volume API on a Firecracker guest bridge or
 	// over TLS to EC2 guests. Optional: a node without it offers no dynamic cache
 	// volumes to workflows.
+	//
+	// OPTIONAL IS NOT FREE, and `billet check` says so. A node that names a store
+	// and no endpoint has a cache nothing can reach: an EBSS3 node is REFUSED
+	// there, because that block backs nothing else, and a Ceph node is reported,
+	// because image_pool still boots every guest. The refusal is not here because
+	// `billet decommission` and `billet init iam` both read a store block on a
+	// config that has already lost its listener.
 	Cache *NodeCacheConfig `yaml:"cache,omitempty"`
 	// RegistryMirrors are three site-local Distribution pull-through caches. One
 	// instance per upstream is required because proxy mode has one remote URL.
@@ -1339,6 +1346,13 @@ type CephConfig struct {
 }
 
 // EBSS3Config points a cloud node at its site's EBS and S3 cache storage.
+//
+// IT EXISTS ONLY TO BACK node.cache. Nothing on a running node reads it by any
+// other route, so without that listener every field here is inert and every job
+// runs on the instance's root volume — which `billet check` refuses rather than
+// config load, because `billet decommission` purges what the cache left behind
+// and `billet init iam` renders its grants, and both read this block on a config
+// whose listener is already gone.
 type EBSS3Config struct {
 	// Region is the signing region for both services and must match node.ec2.
 	Region string `yaml:"region"`
