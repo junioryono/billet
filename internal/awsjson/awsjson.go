@@ -13,9 +13,13 @@
 // all belong to the caller; this is the transport, the signature, and the
 // classification of outcomes that are the same for every service.
 //
-// IT IS A LEAF. It imports billet's signer and credential chain and nothing else,
-// so a provider and the control plane can both use it without either importing
-// the other.
+// IT IS A LEAF. It imports billet's signer, its credential chain and the config
+// package below both, and nothing else, so a provider and the control plane can
+// both use it without either importing the other. config is there for one rule:
+// which DNS suffix a region's partition uses. That question is asked on both sides
+// of the wire — here to build a host, and in config to refuse a spot queue URL that
+// names the other partition's — and config may import nothing of billet's, so the
+// rule is declared there and called from here rather than written twice.
 package awsjson
 
 import (
@@ -33,6 +37,7 @@ import (
 
 	"github.com/junioryono/billet/internal/awscreds"
 	"github.com/junioryono/billet/internal/awssig"
+	"github.com/junioryono/billet/internal/config"
 )
 
 // ContentType is what AWS JSON 1.1 requires. It is SIGNED, so a mismatch between
@@ -458,10 +463,13 @@ func EndpointFor(service, region string) string {
 }
 
 // DNSSuffixFor is the partition's DNS suffix for a region.
+//
+// THE RULE ITSELF LIVES IN internal/config, and this is one call rather than a
+// second copy. config is the leaf everything reads and may import nothing of
+// billet's, so its SQS host validator cannot ask this package the question — and it
+// has to select exactly this suffix or it admits a queue host in the other
+// partition. Keeping the name here means nothing above changes. config.TapPrefix is
+// the same arrangement for the firecracker provider, for the same reason.
 func DNSSuffixFor(region string) string {
-	if strings.HasPrefix(region, "cn-") {
-		return "amazonaws.com.cn"
-	}
-
-	return "amazonaws.com"
+	return config.AWSDNSSuffix(region)
 }

@@ -4563,7 +4563,90 @@ func (e *EC2Config) normalize() {
 	}
 }
 
+// AWSDNSSuffix is the DNS suffix of the partition a region belongs to.
+//
+// DECLARED HERE AND USED THERE, exactly like TapPrefix and for the same reason:
+// config may not import awsjson, and a second copy of this rule in this file would
+// be a constant that can drift from the thing it is validating against.
+// awsjson.DNSSuffixFor is this function.
+//
+// MEASURED 2026-09-04 rather than read, because the documentation lists endpoints
+// per service page and gets the legacy forms wrong. `sqs.cn-north-1.amazonaws.com`
+// and `cn-north-1.queue.amazonaws.com` do not resolve; `sqs.cn-north-1.amazonaws.com.cn`
+// does, and `cn-north-1.queue.amazonaws.com.cn` is a CNAME onto it. In the other
+// direction `sqs.us-west-2.amazonaws.com.cn` does not resolve. GOVCLOUD IS NOT A
+// SEPARATE CASE despite being a separate partition: `sqs.us-gov-west-1.amazonaws.com`
+// resolves and the .cn form does not. The VPC-endpoint zone is delegated per
+// partition too — `vpce.amazonaws.com` is served by ns-1714.awsdns-22.co.uk and
+// `vpce.amazonaws.com.cn` by ns-960.awsdns-cn-60.com — which is corroboration
+// rather than a probe, since the names below it are created with an endpoint.
+//
+// A PARTITION BILLET HAS NOT BEEN TAUGHT ABOUT answers "amazonaws.com" here, and
+// the SQS host check therefore REFUSES its queue URL rather than admitting a host
+// that is not one: the ISO partitions are not under amazonaws.com at all. That is
+// the safe direction and it is unchanged.
+func AWSDNSSuffix(region string) string {
+	if strings.HasPrefix(region, "cn-") {
+		return "amazonaws.com.cn"
+	}
+
+	return "amazonaws.com"
+}
+
+// hostLabelRe is ONE DNS label: alphanumeric at both ends, hyphens allowed between,
+// 63 characters at most.
+//
+// PER LABEL RATHER THAN OVER THE WHOLE NAME. An earlier version of this check was
+// registryMirrorOriginRe's whole-host shape, which pins only the first and last
+// character — so `a..b` (an empty label), `a.-b`, `a.---.b` and a 72-character label
+// all passed it. None of those is a name DNS can answer.
+//
+// ASCII BY CONSTRUCTION, which is load-bearing rather than incidental: isHostname is
+// asked BEFORE the host is folded to lower case, so admitting no non-ASCII here is
+// what makes the fold below safe. Both cases are allowed for that reason.
+var hostLabelRe = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$`)
+
+// maxHostname is a DNS name's length in its textual form, the bound DNS itself
+// enforces. Checked because the label rule alone does not imply it: sixty valid
+// labels are sixty valid labels and still not a name anything can look up.
+const maxHostname = 253
+
+// isHostname reports whether host is a name DNS could answer: every dot-separated
+// label is one, and the whole thing is within the length DNS allows.
+//
+// ASKED OF THE WHOLE HOST BEFORE IT IS CLASSIFIED, not of the VPC endpoint's own
+// labels afterwards. Checking only that prefix left two ways to name something
+// unaddressable: node.ec2.region is deliberately a SHAPE with no length cap, so a
+// 64-character region makes an over-long label in `sqs.<region>.<suffix>` — a
+// standard host, never near the private branch — and the 253-character bound sat in
+// that branch too. One question asked once about the name as a whole closes both.
+func isHostname(host string) bool {
+	if host == "" || len(host) > maxHostname {
+		return false
+	}
+
+	for label := range strings.SplitSeq(host, ".") {
+		if !hostLabelRe.MatchString(label) {
+			return false
+		}
+	}
+
+	return true
+}
+
 // CheckSQSQueueURL refuses a warning queue that cannot be signed safely.
+//
+// THE SUFFIX IS SELECTED BY THE REGION, NEVER OFFERED AS A CHOICE. This admitted
+// either partition's suffix for every region, so `cn-north-1` accepted
+// `sqs.cn-north-1.amazonaws.com` — which is not a host — while `billet init iam`
+// derived the queue ARN's partition from the same region and rendered a correct
+// `arn:aws-cn:sqs:...`. Everything an operator can see is then right: the policy
+// applies, the queue exists, the node starts. Behind it the node signs a
+// ReceiveMessage for cn-north-1 and sends it to a name that does not resolve, so
+// the two-minute spot warning never arrives, every reclaim becomes an unexplained
+// failed job, and the lease stays charged until it expires. The queue host, the
+// region billet signs for and the partition billet is authorised in have to be one
+// partition, and only the region can decide which.
 func CheckSQSQueueURL(raw, region string) error {
 	if raw == "" {
 		return nil
@@ -4587,14 +4670,57 @@ func CheckSQSQueueURL(raw, region string) error {
 	if isLoopbackHost(u.Hostname()) {
 		return nil
 	}
+
+	// A PORT IS PART OF WHAT GETS DIALLED, and Hostname() drops it. The SQS client
+	// addresses the queue URL's Host, port included, so `sqs.<region>.<suffix>:1`
+	// matched the standard host exactly and then connected to port 1. AWS serves this
+	// on 443 and the loopback exception above is what lets a test point somewhere
+	// else, so an explicit 443 is the only port worth accepting.
+	//
+	// COMPARED AS A NUMBER, NOT AS TEXT. `:0443` is a decimal 443 that net.LookupPort
+	// resolves to 443 and every client dials as 443 (measured), so refusing it on the
+	// spelling would take a reachable config away at load — which is a worse failure
+	// than the one this check exists for. url.Parse has already refused a port that is
+	// not digits, so the only way Atoi fails here is a number too big to be one.
+	if port := u.Port(); port != "" {
+		if n, err := strconv.Atoi(port); err != nil || n != 443 {
+			return errors.New("node.ec2.interruption_queue_url must not name a port other " +
+				"than 443: the host is what billet dials, and SQS answers nowhere else")
+		}
+	}
+
+	// ASCII FIRST, THEN FOLDED. strings.ToLower is Unicode-aware and U+0130 folds to
+	// an ASCII `i`, so 63 of them are 126 bytes of host that become 63 characters
+	// passing every rule below — while the name actually dialled is neither what was
+	// measured nor what was checked. An internationalised name reaches DNS as its
+	// xn-- form, so that is the form to write here.
+	if !isHostname(u.Hostname()) {
+		return errors.New("node.ec2.interruption_queue_url's host is not a hostname: every " +
+			"hostname label has to begin and end alphanumeric, hold only ASCII letters, " +
+			"digits and hyphens, and be 63 characters at most, with 253 for the whole " +
+			"name. A name outside that resolves nowhere, so the queue would be " +
+			"unreachable rather than wrong — write an internationalised name in its " +
+			"xn-- form, which is what goes on the wire in any case")
+	}
+
 	host := strings.ToLower(u.Hostname())
-	standard := host == "sqs."+region+".amazonaws.com" ||
-		host == "sqs."+region+".amazonaws.com.cn" ||
-		host == region+".queue.amazonaws.com"
-	private := strings.HasSuffix(host, ".sqs."+region+".vpce.amazonaws.com") ||
-		strings.HasSuffix(host, ".sqs."+region+".vpce.amazonaws.com.cn")
+	suffix := AWSDNSSuffix(region)
+	standard := host == "sqs."+region+"."+suffix || host == region+".queue."+suffix
+
+	// THE VPC-ENDPOINT FORM IS MATCHED BY SUFFIX, because the labels in front are the
+	// operator's endpoint id and billet cannot know them. What sits there needs no
+	// separate check: isHostname has already held the whole name to valid labels, and
+	// this cuts on a dot boundary, so a match leaves one or more of them. It does not
+	// require AWS's `vpce-` spelling — the DNS suffixes were measured, and an
+	// endpoint's own label cannot be without owning an endpoint.
+	_, private := strings.CutSuffix(host, ".sqs."+region+".vpce."+suffix)
+
 	if !standard && !private {
-		return fmt.Errorf("node.ec2.interruption_queue_url must name an SQS endpoint in node.ec2.region %q", region)
+		return fmt.Errorf("node.ec2.interruption_queue_url must name an SQS endpoint in "+
+			"node.ec2.region %q: sqs.%s.%s, the legacy %s.queue.%s, or "+
+			"<endpoint>.sqs.%s.vpce.%s; the other partition's suffix names no host in "+
+			"this region, and billet signs every queue request for this region",
+			region, region, suffix, region, suffix, region, suffix)
 	}
 
 	return nil
