@@ -34,6 +34,35 @@ variable "subnet_in_vpc_ok" {
   type        = bool
 }
 
+# THE CONTROLLER'S ADDRESS IS DECLARED HERE OR NOWHERE. It is repeated in at
+# least four places outside this module -- server.listen (also the certificate
+# SAN of a concrete listener), every node's node.server_addr, the Ansible
+# ansible_host, and whatever routes a node's path to it -- and none of them
+# decides it. Left empty, AWS hands the ENI an address at creation, an instance
+# replacement changes it silently, and the first symptom is a node timeout that
+# names nothing.
+variable "private_ip" {
+  description = "The private IPv4 address the control-plane instance takes in subnet_id. Empty leaves the choice to AWS, which is what every deployment before this input did. Declaring the address an APPLIED instance already holds plans no change (the state carries private_ip); any other value REPLACES the instance, because the address is fixed at launch -- a drain first, as the classification says. Checked against subnet_cidr when the caller supplies it."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.private_ip == "" || can(cidrnetmask("${var.private_ip}/32"))
+    error_message = "private_ip must be an IPv4 address (no prefix length), or empty to let AWS choose."
+  }
+}
+
+variable "subnet_cidr" {
+  description = "The CIDR of subnet_id, when the caller knows it, so private_ip can be proved to lie inside the subnet and outside the five addresses AWS reserves in every subnet (the first four and the last). Empty skips that check. A separate input for the reason subnet_in_vpc_ok is: this child cannot look the subnet up itself without deferring the read and cascading unknowns through the instance, so the fact is supplied -- the opinionated root resolves it from whichever side is real."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.subnet_cidr == "" || can(cidrnetmask(var.subnet_cidr))
+    error_message = "subnet_cidr must be an IPv4 CIDR (address/prefix), or empty to skip the containment check."
+  }
+}
+
 variable "instance_type" {
   description = "The control-plane instance type."
   type        = string

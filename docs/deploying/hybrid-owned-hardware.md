@@ -49,7 +49,7 @@ server:
   node_tls_hosts: [billet.example]
 ```
 
-`bootstrap_listen` unset is a refusal, not a default: without it you issue certificates with `billet ca issue` and copy them out of band. `node_tls_hosts` must name every address and hostname a node will dial, including the one it dials the bootstrap port by, because both listeners present one certificate. The Terraform module outputs the controller's private address as `node_wire_address`; a public posture supplies its own name. See [Adding and removing nodes](../operating/nodes.md).
+`bootstrap_listen` unset is a refusal, not a default: without it you issue certificates with `billet ca issue` and copy them out of band. `node_tls_hosts` must name every address and hostname a node will dial, including the one it dials the bootstrap port by, because both listeners present one certificate. The Terraform module outputs the controller's private address as `node_wire_address`, and `control_plane_private_ip` declares it rather than leaving it to AWS: the same address is `server.listen`, every node's `node.server_addr`, the inventory's `ansible_host` and whatever routes a node's path to it, and declaring it is what keeps an instance replacement from changing all of them silently. A public posture supplies its own name. See [Adding and removing nodes](../operating/nodes.md).
 
 ## The two nodes
 

@@ -50,6 +50,17 @@ variable "subnet_availability_zone" {
   default     = ""
 }
 
+variable "control_plane_private_ip" {
+  description = "The controller's private IPv4 address, DECLARED rather than left to AWS. It is repeated in server.listen (the certificate SAN of a concrete listener), every node's node.server_addr, the inventory's ansible_host and whatever routes a node's path here, and none of those decides it — so left empty an instance replacement changes it silently. Declaring the address an applied instance already holds plans no change; any other value replaces the instance (a draining change). Checked at plan against the subnet's CIDR, created or adopted."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.control_plane_private_ip == "" || can(cidrnetmask("${var.control_plane_private_ip}/32"))
+    error_message = "control_plane_private_ip must be an IPv4 address (no prefix length), or empty to let AWS choose."
+  }
+}
+
 variable "control_plane_instance_type" {
   description = "The control-plane instance shape. ADR-001 sizes this small: it long-polls GitHub and owns a SQLite ledger, not a fleet's worth of compute."
   type        = string

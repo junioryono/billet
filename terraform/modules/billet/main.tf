@@ -42,8 +42,11 @@ locals {
   vpc_id    = local.create_vpc ? aws_vpc.this[0].id : var.vpc_id
   subnet_id = local.create_subnet ? aws_subnet.this[0].id : var.subnet_id
 
-  # The VPC CIDR and the subnet's availability zone, from whichever side is real.
+  # The VPC CIDR, the subnet's CIDR and its availability zone, from whichever
+  # side is real. The subnet CIDR is what proves a declared controller address
+  # at plan time.
   vpc_cidr          = local.create_vpc ? var.vpc_cidr : data.aws_vpc.adopted[0].cidr_block
+  subnet_cidr       = local.create_subnet ? var.subnet_cidr : data.aws_subnet.adopted[0].cidr_block
   availability_zone = local.create_subnet ? aws_subnet.this[0].availability_zone : data.aws_subnet.adopted[0].availability_zone
 
   region = data.aws_region.this.region
@@ -94,6 +97,12 @@ module "control_plane" {
   # An adopted subnet must be IN the adopted VPC; when both are created this is
   # trivially true. Resolved here because the adopted lookup lives here.
   subnet_in_vpc_ok = local.create_subnet ? true : data.aws_subnet.adopted[0].vpc_id == var.vpc_id
+
+  # THE ADDRESS, DECLARED, and the CIDR that proves it at plan. Resolved here
+  # for the same reason subnet_in_vpc_ok is: the child cannot look the subnet
+  # up without deferring the read through the instance.
+  private_ip  = var.control_plane_private_ip
+  subnet_cidr = local.subnet_cidr
 
   instance_type           = var.control_plane_instance_type
   ami                     = var.control_plane_ami

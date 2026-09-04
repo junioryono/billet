@@ -605,3 +605,158 @@ run "auto_recovery_follows_the_partition" {
     error_message = "the recover action must follow BOTH the partition and the region; a commercial ARN in GovCloud creates an alarm that silently does nothing"
   }
 }
+
+# THE CONTROLLER'S ADDRESS, DECLARED. Four places outside this module repeat it
+# -- server.listen, every node's server_addr, the inventory's ansible_host and
+# whatever routes a node here -- and until this input existed none of them
+# decided it: the address was whatever AWS handed the ENI, and an instance
+# replacement changed it silently.
+run "a_declared_address_is_the_instances_and_the_wires" {
+  command = plan
+
+  module {
+    source = "./modules/control-plane-ec2-sqlite"
+  }
+
+  variables {
+    name              = "billet-test"
+    vpc_id            = "vpc-0f0f0f0f0f0f0f0f0"
+    subnet_id         = "subnet-0e0e0e0e0e0e0e0e0"
+    availability_zone = "us-east-1a"
+    vpc_cidr          = "10.0.0.0/16"
+    subnet_in_vpc_ok  = true
+    private_ip        = "10.0.0.10"
+    subnet_cidr       = "10.0.0.0/24"
+  }
+
+  assert {
+    condition     = aws_instance.control_plane.private_ip == "10.0.0.10"
+    error_message = "the declared address must be the one the instance launches with"
+  }
+
+  # AND IT IS PLAN-KNOWN, which is the property a consumer needs: the wire
+  # address can be written into billet.yaml and an inventory before the apply.
+  assert {
+    condition     = output.node_wire_address == "10.0.0.10:7717"
+    error_message = "the node-wire address must be the declared address and the listen port, known at plan"
+  }
+}
+
+# AN ADDRESS OUTSIDE THE SUBNET FAILS THE PLAN rather than RunInstances after
+# the network is already built. Delete the containment precondition and this
+# run passes its plan, which is the mutation it exists to catch.
+run "refuses_an_address_outside_the_subnet" {
+  command = plan
+
+  module {
+    source = "./modules/control-plane-ec2-sqlite"
+  }
+
+  variables {
+    name              = "billet-test"
+    vpc_id            = "vpc-0f0f0f0f0f0f0f0f0"
+    subnet_id         = "subnet-0e0e0e0e0e0e0e0e0"
+    availability_zone = "us-east-1a"
+    vpc_cidr          = "10.0.0.0/16"
+    subnet_in_vpc_ok  = true
+    private_ip        = "10.0.1.10"
+    subnet_cidr       = "10.0.0.0/24"
+  }
+
+  expect_failures = [aws_instance.control_plane]
+}
+
+# AWS RESERVES THE FIRST FOUR AND THE LAST ADDRESS OF EVERY SUBNET. .1 is the
+# VPC router: inside the CIDR, so the containment check alone admits it, and
+# RunInstances refuses it.
+run "refuses_a_reserved_address" {
+  command = plan
+
+  module {
+    source = "./modules/control-plane-ec2-sqlite"
+  }
+
+  variables {
+    name              = "billet-test"
+    vpc_id            = "vpc-0f0f0f0f0f0f0f0f0"
+    subnet_id         = "subnet-0e0e0e0e0e0e0e0e0"
+    availability_zone = "us-east-1a"
+    vpc_cidr          = "10.0.0.0/16"
+    subnet_in_vpc_ok  = true
+    private_ip        = "10.0.0.1"
+    subnet_cidr       = "10.0.0.0/24"
+  }
+
+  expect_failures = [aws_instance.control_plane]
+}
+
+# ...AND THE LAST ADDRESS, which cidrhost(-1) names; a check that listed only
+# the first four would let the broadcast address through.
+run "refuses_the_broadcast_address" {
+  command = plan
+
+  module {
+    source = "./modules/control-plane-ec2-sqlite"
+  }
+
+  variables {
+    name              = "billet-test"
+    vpc_id            = "vpc-0f0f0f0f0f0f0f0f0"
+    subnet_id         = "subnet-0e0e0e0e0e0e0e0e0"
+    availability_zone = "us-east-1a"
+    vpc_cidr          = "10.0.0.0/16"
+    subnet_in_vpc_ok  = true
+    private_ip        = "10.0.0.255"
+    subnet_cidr       = "10.0.0.0/24"
+  }
+
+  expect_failures = [aws_instance.control_plane]
+}
+
+# A MALFORMED ADDRESS IS REFUSED BY ITS VARIABLE, before any precondition
+# would try to parse it.
+run "refuses_a_malformed_address" {
+  command = plan
+
+  module {
+    source = "./modules/control-plane-ec2-sqlite"
+  }
+
+  variables {
+    name              = "billet-test"
+    vpc_id            = "vpc-0f0f0f0f0f0f0f0f0"
+    subnet_id         = "subnet-0e0e0e0e0e0e0e0e0"
+    availability_zone = "us-east-1a"
+    vpc_cidr          = "10.0.0.0/16"
+    subnet_in_vpc_ok  = true
+    private_ip        = "10.0.0.10/32"
+  }
+
+  expect_failures = [var.private_ip]
+}
+
+# WITHOUT A SUBNET CIDR THE CHECK IS SKIPPED, not failed: a direct consumer who
+# does not supply the fact keeps the declaration, the way subnet_in_vpc_ok is a
+# claim the caller makes rather than one this child can verify.
+run "skips_the_containment_check_without_a_subnet_cidr" {
+  command = plan
+
+  module {
+    source = "./modules/control-plane-ec2-sqlite"
+  }
+
+  variables {
+    name              = "billet-test"
+    vpc_id            = "vpc-0f0f0f0f0f0f0f0f0"
+    subnet_id         = "subnet-0e0e0e0e0e0e0e0e0"
+    availability_zone = "us-east-1a"
+    vpc_cidr          = "10.0.0.0/16"
+    subnet_in_vpc_ok  = true
+    private_ip        = "192.0.2.10"
+  }
+
+  assert {
+    condition     = aws_instance.control_plane.private_ip == "192.0.2.10"
+    error_message = "with no subnet_cidr the declared address must be taken on the caller's word"
+  }
+}

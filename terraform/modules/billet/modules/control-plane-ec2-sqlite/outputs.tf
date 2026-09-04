@@ -4,12 +4,12 @@ output "instance_id" {
 }
 
 output "private_ip" {
-  description = "The control plane's private IP."
+  description = "The control plane's private IP: the one private_ip declared, otherwise the one AWS observed at launch."
   value       = aws_instance.control_plane.private_ip
 }
 
 output "node_wire_address" {
-  description = "The host:port other hosts dial for the node wire — bind it as server.listen, and use it as node.server_addr on a remote node. billet requires host:port, not a bare IP."
+  description = "The host:port other hosts dial for the node wire — bind it as server.listen, and use it as node.server_addr on a remote node. billet requires host:port, not a bare IP. Plan-known once private_ip is declared, so a root can assert it and a consumer can write it into configuration before the apply."
   value       = "${aws_instance.control_plane.private_ip}:${var.listen_port}"
 }
 
@@ -96,4 +96,9 @@ output "backup_prefix" {
 output "availability_zone" {
   description = "The availability_zone this child received — re-exported so a composing root's tests can prove the resolved zone crossed the module call; the ledger volume is created in it."
   value       = var.availability_zone
+}
+
+output "subnet_cidr" {
+  description = "The subnet_cidr this child received, or empty — re-exported so a composing root's tests can prove the resolved CIDR crossed the module call; it is what a declared private_ip is checked against."
+  value       = var.subnet_cidr
 }

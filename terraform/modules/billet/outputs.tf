@@ -42,12 +42,12 @@ output "control_plane_instance_id" {
 }
 
 output "control_plane_private_ip" {
-  description = "The control plane's private IP."
+  description = "The control plane's private IP: the one control_plane_private_ip declared, otherwise the one AWS observed at launch."
   value       = module.control_plane.private_ip
 }
 
 output "node_wire_address" {
-  description = "The host:port other hosts dial for the node wire — bind it as server.listen, and use it as node.server_addr on a remote node. billet requires host:port, not a bare IP. This is the PRIVATE address and the right default; a node outside the VPC reaches it over a private network, a VPN or overlay, a reverse tunnel, or the public address below (ADR-001)."
+  description = "The host:port other hosts dial for the node wire — bind it as server.listen, and use it as node.server_addr on a remote node. billet requires host:port, not a bare IP. This is the PRIVATE address and the right default; a node outside the VPC reaches it over a private network, a VPN or overlay, a reverse tunnel, or the public address below (ADR-001). Plan-known once control_plane_private_ip is declared."
   value       = module.control_plane.node_wire_address
 }
 
@@ -163,4 +163,9 @@ output "cost_inputs" {
     # which is free.
     notes = local.create_vpc ? "This deployment's created VPC routes through an internet gateway, not a NAT gateway; instances need a public IP to reach GitHub." : "This deployment adopted your network, so its egress path — and any NAT gateway charge — is yours."
   }
+}
+
+output "subnet_cidr" {
+  description = "The subnet's resolved CIDR (created or adopted), read THROUGH the child so asserting it proves the range a declared control_plane_private_ip is checked against actually crossed the module call."
+  value       = module.control_plane.subnet_cidr
 }

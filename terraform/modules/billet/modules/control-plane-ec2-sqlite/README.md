@@ -20,6 +20,13 @@ module "control_plane" {
   # purpose: this child cannot look the subnet up itself without deferring the
   # read and cascading unknowns through the instance.
   subnet_in_vpc_ok = true
+
+  # DECLARE the controller's address rather than observe it. Every node's
+  # server_addr, the Ansible inventory and whatever routes a node here all
+  # repeat it; declared, an instance replacement keeps it. subnet_cidr is what
+  # lets the plan refuse an address outside the subnet or one AWS reserves.
+  private_ip  = "10.0.0.10"
+  subnet_cidr = aws_subnet.mine.cidr_block
 }
 ```
 
@@ -60,3 +67,4 @@ Three properties are worth knowing before you rely on it. **billet never deletes
 
 - `create_instance_profile` — exactly one identity source: true creates the bare own identity (and refuses a supplied name, which would otherwise be silently ignored); set it false and supply `instance_profile_name` to attach an existing profile (the root passes `fleet-ec2`'s).
 - `subnet_in_vpc_ok` — the caller's explicit, required assertion that the subnet belongs to `vpc_id`; false fails the plan, because a launch cannot mix a subnet and security groups from different VPCs. The root resolves it from its adopted-subnet lookup.
+- `private_ip` — the controller's private address, **declared rather than observed**. Left empty, AWS assigns one at launch and nothing pins it: the address is repeated in `server.listen` (which is also the certificate SAN of a concrete listener), in every node's `node.server_addr`, in the inventory's `ansible_host` and in whatever routes a node's path to it, and an instance replacement changes it silently, surfacing as a node timeout that names nothing. Declaring the address an **applied** instance already holds plans no change, because the state carries `private_ip`; any other value replaces the instance (the address is fixed at launch), which is a `draining` change — drain first. With `subnet_cidr` supplied the plan refuses an address outside the subnet or one of the five AWS reserves (the first four and the last); without it the check is skipped, for the same reason `subnet_in_vpc_ok` is an input rather than a lookup.
