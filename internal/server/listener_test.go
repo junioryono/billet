@@ -2331,6 +2331,15 @@ func TestEscrowSurvivesAPollLongerThanTheLeaseTTL(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer cancel()
 
+	// THE REAL LOOP, FED BY HAND. The ticks go to the goroutine Run starts, not
+	// to a pass this test calls itself: a test that renewed the leases from
+	// inside the poll would pass against a listener whose heartbeats stopped
+	// for the length of a poll, which is the regression this test exists for.
+	// Each send is followed by a wait for the pass it caused, bounded so that a
+	// loop that is not running fails the test instead of hanging it.
+	ticks := make(chan time.Time)
+	passed := make(chan struct{})
+
 	var (
 		polls    atomic.Int32
 		resultMu sync.Mutex
@@ -2339,6 +2348,8 @@ func TestEscrowSurvivesAPollLongerThanTheLeaseTTL(t *testing.T) {
 	)
 
 	l := NewListener(a, "billet-4vcpu-a", nil)
+	l.heartbeatTicks = ticks
+	l.heartbeatPassed = func() { passed <- struct{}{} }
 
 	l.session = &fakeSession{onPoll: func(int) {
 		switch polls.Add(1) {
@@ -2350,15 +2361,32 @@ func TestEscrowSurvivesAPollLongerThanTheLeaseTTL(t *testing.T) {
 			held := l.Held()
 
 			// The stall, step by step: the clock moves a heartbeat interval,
-			// the heartbeat pass the loop would have made at that tick runs (it
-			// takes the listener's mutex itself; the poll holds nothing), and
-			// the reaper looks. Fifteen steps of ttl/3 are five TTLs. WITH THE
-			// RENEWAL REMOVED from heartbeatHeld, the third Reap reclaims every
-			// lease and the assertion below goes red, which is the mutation
-			// this test was checked against.
+			// the loop is handed the tick it would have seen and the pass it
+			// makes is waited for, then the reaper looks. Fifteen steps of
+			// ttl/3 are five TTLs. Two mutations were checked against this:
+			// WITH THE RENEWAL REMOVED from heartbeatHeld the third Reap
+			// reclaims every lease and the assertion below goes red; WITH THE
+			// LOOP NOT STARTED by Run, or its pass moved to after the poll,
+			// nothing takes the tick and the wait below fails the test.
 			for range 15 {
 				clock.advance(ttl / 3)
-				l.heartbeatPass(ctx)
+
+				select {
+				case ticks <- clock.Now():
+				case <-time.After(5 * time.Second):
+					t.Error("the heartbeat loop took no tick while the poll was blocked; " +
+						"heartbeats are bounded by the poll again")
+
+					return
+				}
+
+				select {
+				case <-passed:
+				case <-time.After(5 * time.Second):
+					t.Error("the heartbeat loop took a tick and made no pass")
+
+					return
+				}
 
 				if _, err := a.Reap(ctx); err != nil {
 					t.Errorf("Reap: %v", err)
