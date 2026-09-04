@@ -52,6 +52,9 @@ type blockAPI interface {
 }
 
 type objectAPI interface {
+	// Get reads one state object. found=false means S3 SAID THE OBJECT IS NOT
+	// THERE — the NoSuchKey code, not merely a 404 — because a bucket that does
+	// not exist answers the same status and must not read as an empty cache.
 	Get(ctx context.Context, key string) (body []byte, etag string, found bool, err error)
 	Put(ctx context.Context, key string, body []byte, expectedETag string) (string, error)
 	List(ctx context.Context, prefix string) ([]string, error)
@@ -1060,6 +1063,12 @@ func retentionDuration(generation generationState, fallback time.Duration) time.
 // key a GetObject request does not carry — so under exactly the generated
 // policy a healthy miss can answer 403. The caller classifies 403 as
 // inconclusive; everything else here is a real answer about the bucket.
+//
+// AND A 404 IS A HEALTHY MISS ONLY WHEN S3 SAYS NoSuchKey. A bucket that does
+// not exist answers 404 as well, and this probe used to print that a bucket
+// billet had never reached "answers under this deployment's prefix". It is a
+// refusal now, and it is the one place a misaddressed bucket is caught before a
+// job runs.
 func (s Store) CheckAccess(ctx context.Context) error {
 	// Under this owner's own state prefix, because that is what the node's
 	// policy is scoped to — a probe outside it would 403 under a correctly

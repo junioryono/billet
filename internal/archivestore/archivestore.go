@@ -39,6 +39,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/awscreds"
+	"github.com/junioryono/billet/internal/awss3"
 	"github.com/junioryono/billet/internal/awssig"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/deployarchive"
@@ -230,6 +231,12 @@ var ErrObjectExists = fmt.Errorf("archivestore: %w", deployarchive.ErrObjectExis
 // ErrNoSuchObject is an absent key, which is a fact rather than a failure — a
 // caller listing archives and then fetching one races an operator's lifecycle
 // rule.
+//
+// IT IS S3's NoSuchKey AND NOTHING ELSE. Every 404 used to come back under this
+// name, so a bucket that does not exist reached restore reconciliation as "no
+// archive here" — on the one day the machine is new, the operator has nothing
+// but the binary, and the difference between "that backup is gone" and
+// "backup.s3.bucket is not the bucket you think" is the whole recovery.
 var ErrNoSuchObject = errors.New("archivestore: no such object")
 
 // Get fetches one object.
@@ -241,11 +248,16 @@ func (s S3) Get(ctx context.Context, key string) ([]byte, error) {
 
 	defer func() { _ = response.Body.Close() }()
 
-	switch {
-	case response.StatusCode == http.StatusNotFound:
-		return nil, fmt.Errorf("%w: %s", ErrNoSuchObject, key)
-	case response.StatusCode != http.StatusOK:
-		return nil, s.statusError("GET", key, response)
+	if response.StatusCode != http.StatusOK {
+		// ONLY NoSuchKey IS ABSENCE. S3 answers 404 for an object that is not
+		// there and for a BUCKET that is not there, and the second is not a fact
+		// about this archive.
+		refusal := awss3.ReadRefusal(response)
+		if refusal.Absent() {
+			return nil, fmt.Errorf("%w: %s", ErrNoSuchObject, key)
+		}
+
+		return nil, s.refusalError("GET", key, refusal, response)
 	}
 
 	body, err := io.ReadAll(io.LimitReader(response.Body, maxObject+1))
@@ -354,7 +366,10 @@ func (s S3) list(ctx context.Context, prefix string) ([]listedObject, error) {
 		}
 
 		if response.StatusCode != http.StatusOK {
-			return nil, s.statusError("LIST", prefix, response)
+			// The payload is already in hand, so the refusal is parsed out of it
+			// rather than read from a body this loop has closed.
+			return nil, s.refusalError("LIST", prefix,
+				awss3.ParseRefusal(response.StatusCode, payload), response)
 		}
 
 		if len(payload) > maxListing {
@@ -394,16 +409,60 @@ func (s S3) list(ctx context.Context, prefix string) ([]listedObject, error) {
 	}
 }
 
-// statusError reports an unexpected status, naming the bucket's real region when
-// the store tells us — an operator staring at a bare 301 has no other way to see
-// that their region is wrong.
+// statusError reports an unexpected status, reading what S3 said about it out of
+// the body it has not looked at yet.
 func (s S3) statusError(op, key string, response *http.Response) error {
+	return s.refusalError(op, key, awss3.ReadRefusal(response), response)
+}
+
+// refusalError names the cause when the answer carries one.
+//
+// THE BUCKET'S REAL REGION FIRST, because an operator staring at a bare 301 has
+// no other way to see that their region is wrong, and a hint at all means the
+// bucket exists somewhere — so the region is the thing to change and the missing
+// bucket below would be the wrong advice.
+//
+// A BUCKET THAT DOES NOT EXIST IS NAMED AS THAT. It reached this package as a
+// 404 and left it as "no such object", which on the day a restore runs points an
+// operator at their backups rather than at their config.
+func (s S3) refusalError(
+	op, key string, refusal *awss3.Refusal, response *http.Response,
+) error {
 	if hint := response.Header.Get("X-Amz-Bucket-Region"); hint != "" && hint != s.cfg.Region {
-		return fmt.Errorf("archivestore: %s %s returned HTTP %d; the bucket's region is %s and "+
-			"backup.s3.region says %s", op, key, response.StatusCode, hint, s.cfg.Region)
+		return fmt.Errorf("archivestore: %s %s returned %w; the bucket's region is %s and "+
+			"backup.s3.region says %s", op, key, refusal, hint, s.cfg.Region)
 	}
 
-	return fmt.Errorf("archivestore: %s %s returned HTTP %d", op, key, response.StatusCode)
+	switch {
+	case refusal.Code == awss3.CodeNoSuchBucket:
+		return fmt.Errorf("archivestore: %s %s returned %w: %s does not exist — this is the "+
+			"config naming a bucket that is not there, NOT an archive that is missing",
+			op, key, refusal, s.destination())
+	case refusal.Status == http.StatusNotFound && refusal.Code == "":
+		return fmt.Errorf("archivestore: %s %s returned %w and named no error code billet "+
+			"recognises; an absent object is reported only when S3 says %s, so this is a "+
+			"failure rather than a missing archive", op, key, refusal, awss3.CodeNoSuchKey)
+	default:
+		return fmt.Errorf("archivestore: %s %s returned %w", op, key, refusal)
+	}
+}
+
+// destination names the bucket the way the config does, so the sentence an
+// operator reads matches the lines they would edit. An endpoint is the other way
+// to be pointed at a bucket that is not there, and it is only ever set for a
+// Ceph RGW or MinIO store.
+//
+// RENDERING THE ENDPOINT IS SAFE HERE for the reason request states below:
+// CheckBackupEndpoint has already refused a userinfo section, a query string and
+// a fragment, so it provably carries no credential — and *url.Error already puts
+// the whole request URL in front of an operator on the transport's own failures.
+func (s S3) destination() string {
+	if s.cfg.Endpoint != "" {
+		return fmt.Sprintf("backup.s3.bucket %q at backup.s3.endpoint %s", s.cfg.Bucket,
+			s.cfg.Endpoint)
+	}
+
+	return fmt.Sprintf("backup.s3.bucket %q in backup.s3.region %s", s.cfg.Bucket, s.cfg.Region)
 }
 
 // request signs and sends one call.
