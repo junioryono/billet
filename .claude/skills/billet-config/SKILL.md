@@ -23,7 +23,7 @@ description: "billet.yaml: every top-level block, which role and which provider 
 | `images` | `images pull` | `source` (empty means billet's own), `signing_identity` and `signing_issuer` (required for a non-default source) |
 | `release` | the rollout starter, `host-upgrade --from-rollout`, `images refresh` | `channel` (`stable` or `candidate`), `version` (an exact tag or a 40-hex SHA; `latest` and `main` refused; exclusive with `channel`), `automatic` (a `*bool` whose nil is TRUE, read only through `AutomaticUpdates()`; the one switch for starting rollouts, acting on them and refreshing images), `maintenance_window` (bounds when a rollout may begin; refused beside an explicit `automatic: false`), `signing_identity` and `signing_issuer` (both or neither) |
 
-Provider kinds are `firecracker`, `tart`, `ec2`, `codebuild`, `docker`. The whole catalog is duplicated on every machine with nothing checking the copies agree; tiers and `nodes` are read at startup, so changing either needs a restart, while nodes register dynamically.
+Provider kinds are `firecracker`, `tart`, `ec2`, `codebuild`, `docker`, and `simulated`, which is in the closed set only so a test can register a simulated host: `ProviderKind.TestOnly` names it and `Config.Validate` refuses it at every site a file could name it (`node.provider`, `tiers[].provider(s)`, `tiers[].launch`, `nodes[].provider`), deliberately outside the per-tier and per-node rules `alloc.New` re-applies, so a catalogue built in code can still name it. The whole catalog is duplicated on every machine with nothing checking the copies agree; tiers and `nodes` are read at startup, so changing either needs a restart, while nodes register dynamically.
 
 ## Rules
 

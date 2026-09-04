@@ -39,7 +39,7 @@ Byte sizes are written as `32GiB`, `512MiB` and parsed exactly; durations as Go 
 | `name` | on loopback | otherwise the certificate's name; defaults to the hostname |
 | `server_addr` | yes | the control plane's node wire |
 | `bootstrap_addr` | no | used once at `--enroll`; falls back to `server_addr` |
-| `provider` | yes | `docker`, `firecracker`, `tart`, `ec2`, `codebuild` |
+| `provider` | yes | `docker`, `firecracker`, `tart`, `ec2`, `codebuild`; `simulated` is billet's own test-only backend and is refused anywhere in a configuration |
 | `site` | no | one of the control plane's `sites`; required with `ebs_s3`; refused on `codebuild` |
 | `max_vcpu`, `max_memory` | for `ec2` and `codebuild` | what this host contributes; detected on a host backend when unset |
 | `tls.cert`, `tls.key`, `tls.ca` | for a non-loopback `server_addr` | from `billet ca issue` or enrollment; refused against a loopback server |
