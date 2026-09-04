@@ -139,8 +139,11 @@ func (s *stack) ask(t *testing.T, barrierID string) {
 	}
 }
 
-// THE WHOLE OF THE COMPUTE BARRIER, ON REAL COMPUTE: the ledger reports quiet
-// while compute billet started is still running, and the barrier is what sees it.
+// THE WHOLE OF THE COMPUTE BARRIER, ON COMPUTE THE LEDGER CANNOT SEE: the ledger
+// reports quiet while compute billet started is still running, and the barrier
+// is what sees it. On the docker leg that compute is a real container; on the
+// simulated leg it is the backend's own record, and the wire, the command and
+// the proof are the same.
 //
 // The scenario is built in two halves, because A LIVE BILLET DESTROYS A STRAY
 // ALMOST AT ONCE and that is correct behaviour rather than something to work
@@ -161,143 +164,143 @@ func (s *stack) ask(t *testing.T, barrierID string) {
 // name shape, the inventory travels the real node wire as a real command, and
 // the list comes back out of a real container runtime.
 func TestTheBarrierSeesRealComputeWhoseLeaseIsGone(t *testing.T) {
-	forEachBackend(t, theBarrierSeesRealComputeWhoseLeaseIsGone)
-}
+	for _, b := range backends() {
+		t.Run(b.name, func(t *testing.T) {
+			s, clock := barrierStack(t, b.opts...)
 
-func theBarrierSeesRealComputeWhoseLeaseIsGone(t *testing.T, opts ...stackOpt) {
-	s, clock := barrierStack(t, opts...)
+			// A REAL JOB, THROUGH THE REAL DISPATCH PATH, run to completion so the
+			// control plane can be stopped with nothing outstanding.
+			s.plane.queue(fakeactions.StatisticsJSON(1, 0),
+				fakeactions.JobJSON("JobAvailable", 4101, "push", testTier))
 
-	// A REAL JOB, THROUGH THE REAL DISPATCH PATH, run to completion so the
-	// control plane can be stopped with nothing outstanding.
-	s.plane.queue(fakeactions.StatisticsJSON(1, 0),
-		fakeactions.JobJSON("JobAvailable", 4101, "push", testTier))
+			stop := s.runBarrierStack(t)
 
-	stop := s.runBarrierStack(t)
+			deadline := time.Now().Add(30 * time.Second)
+			for len(s.plane.acquiredIDs()) == 0 {
+				if time.Now().After(deadline) {
+					t.Fatal("billet never bid for the available job")
+				}
 
-	deadline := time.Now().Add(30 * time.Second)
-	for len(s.plane.acquiredIDs()) == 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("billet never bid for the available job")
-		}
+				time.Sleep(50 * time.Millisecond)
+			}
 
-		time.Sleep(50 * time.Millisecond)
-	}
+			s.plane.queue(fakeactions.StatisticsJSON(0, 1),
+				fakeactions.JobJSON("JobAssigned", 4101, "push", testTier))
 
-	s.plane.queue(fakeactions.StatisticsJSON(0, 1),
-		fakeactions.JobJSON("JobAssigned", 4101, "push", testTier))
+			names := s.awaitOneRunning(t)
 
-	names := s.awaitOneRunning(t)
+			if _, ours := provider.LeaseOf(names[0]); !ours {
+				t.Fatalf("container %q does not carry a billet lease name", names[0])
+			}
 
-	if _, ours := provider.LeaseOf(names[0]); !ours {
-		t.Fatalf("container %q does not carry a billet lease name", names[0])
-	}
+			s.plane.queue(fakeactions.StatisticsJSON(0, 0),
+				fakeactions.JobJSON("JobCompleted", 4101, "push", testTier))
 
-	s.plane.queue(fakeactions.StatisticsJSON(0, 0),
-		fakeactions.JobJSON("JobCompleted", 4101, "push", testTier))
+			s.awaitGone(t)
 
-	s.awaitGone(t)
+			// THE CONTROL PLANE STOPS. Nothing sweeps after this: the reaper rode the
+			// server's own tick, and this node's sweep is not on a timer.
+			stop()
 
-	// THE CONTROL PLANE STOPS. Nothing sweeps after this: the reaper rode the
-	// server's own tick, and this node's sweep is not on a timer.
-	stop()
+			// A CONTAINER WITH NO LEASE, put there the way a lost launch leaves one —
+			// billet's own name shape, on the host's real container runtime, with nothing
+			// in the ledger to attribute it to.
+			const strayLease = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaff"
 
-	// A CONTAINER WITH NO LEASE, put there the way a lost launch leaves one —
-	// billet's own name shape, on the host's real container runtime, with nothing
-	// in the ledger to attribute it to.
-	const strayLease = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaff"
+			// THE TIER'S OWN IMAGE AND COMMAND, so the stray is what this backend runs:
+			// a sleeping container on docker, a modelled runner on the simulated backend.
+			if _, err := s.provider.Launch(t.Context(), provider.Spec{
+				Name:      provider.InstanceName(strayLease),
+				Image:     s.tiers[0].Image,
+				VCPU:      1,
+				Memory:    config.GiB,
+				Command:   s.tiers[0].Command,
+				Trust:     provider.TrustTrusted,
+				JITConfig: "acceptance-stray",
+			}); err != nil {
+				t.Fatalf("put a stray on the host: %v", err)
+			}
 
-	// THE TIER'S OWN IMAGE AND COMMAND, so the stray is what this backend runs:
-	// a sleeping container on docker, a modelled runner on the simulated backend.
-	if _, err := s.provider.Launch(t.Context(), provider.Spec{
-		Name:      provider.InstanceName(strayLease),
-		Image:     s.tiers[0].Image,
-		VCPU:      1,
-		Memory:    config.GiB,
-		Command:   s.tiers[0].Command,
-		Trust:     provider.TrustTrusted,
-		JITConfig: "acceptance-stray",
-	}); err != nil {
-		t.Fatalf("put a stray on the host: %v", err)
-	}
+			sealed := s.seal(t)
 
-	sealed := s.seal(t)
+			// THE LEDGER BARRIER IS SATISFIED. This assertion is the defect stated
+			// positively: if it ever fails, the ledger has grown the ability to see this
+			// class and the compute barrier's premise is gone.
+			q, err := s.alloc.Quiescence(t.Context())
+			if err != nil {
+				t.Fatalf("Quiescence: %v", err)
+			}
 
-	// THE LEDGER BARRIER IS SATISFIED. This assertion is the defect stated
-	// positively: if it ever fails, the ledger has grown the ability to see this
-	// class and the compute barrier's premise is gone.
-	q, err := s.alloc.Quiescence(t.Context())
-	if err != nil {
-		t.Fatalf("Quiescence: %v", err)
-	}
+			if !q.Quiet() {
+				t.Fatalf("the ledger did not report quiet while only a stray remained: %+v", q)
+			}
 
-	if !q.Quiet() {
-		t.Fatalf("the ledger did not report quiet while only a stray remained: %+v", q)
-	}
+			// ...and the compute is there, on the host, right now.
+			instances, err := s.provider.List(t.Context())
+			if err != nil {
+				t.Fatalf("List: %v", err)
+			}
 
-	// ...and the compute is there, on the host, right now.
-	instances, err := s.provider.List(t.Context())
-	if err != nil {
-		t.Fatalf("List: %v", err)
-	}
+			// RUNNING, NOT MERELY PRESENT. `List` reports exited containers too, and the
+			// node's inventory reports their lease ids just the same — so without this a
+			// stray whose command returned immediately would satisfy every assertion
+			// below while proving nothing about compute that is still executing.
+			if len(instances) != 1 || !instances[0].Running {
+				t.Fatalf("expected exactly one RUNNING stray, found %s", describe(instances))
+			}
 
-	// RUNNING, NOT MERELY PRESENT. `List` reports exited containers too, and the
-	// node's inventory reports their lease ids just the same — so without this a
-	// stray whose command returned immediately would satisfy every assertion
-	// below while proving nothing about compute that is still executing.
-	if len(instances) != 1 || !instances[0].Running {
-		t.Fatalf("expected exactly one RUNNING stray, found %s", describe(instances))
-	}
+			barrier, err := s.alloc.RequestComputeBarrier(t.Context(), sealed.Generation, "e2e")
+			if err != nil {
+				t.Fatalf("RequestComputeBarrier: %v", err)
+			}
 
-	barrier, err := s.alloc.RequestComputeBarrier(t.Context(), sealed.Generation, "e2e")
-	if err != nil {
-		t.Fatalf("RequestComputeBarrier: %v", err)
-	}
+			s.ask(t, barrier.ID)
 
-	s.ask(t, barrier.ID)
+			c, host := s.clearanceFor(t, s.node)
 
-	c, host := s.clearanceFor(t, s.node)
+			if c.Clear() {
+				t.Fatal("the fleet was reported CLEAR while a container billet named was running")
+			}
 
-	if c.Clear() {
-		t.Fatal("the fleet was reported CLEAR while a container billet named was running")
-	}
+			if host.State != alloc.ClearanceRunning {
+				t.Fatalf("host state is %v, want %v — the host answered the inventory, so its own "+
+					"answer must be what the report shows", host.State, alloc.ClearanceRunning)
+			}
 
-	if host.State != alloc.ClearanceRunning {
-		t.Fatalf("host state is %v, want %v — the host answered the inventory, so its own "+
-			"answer must be what the report shows", host.State, alloc.ClearanceRunning)
-	}
+			// The stray goes, for real.
+			if _, err := s.provider.Destroy(t.Context(), instances[0].ID); err != nil {
+				t.Fatalf("Destroy: %v", err)
+			}
 
-	// The stray goes, for real.
-	if _, err := s.provider.Destroy(t.Context(), instances[0].ID); err != nil {
-		t.Fatalf("Destroy: %v", err)
-	}
+			s.ask(t, barrier.ID)
 
-	s.ask(t, barrier.ID)
+			c, host = s.clearanceFor(t, s.node)
 
-	c, host = s.clearanceFor(t, s.node)
+			if c.Clear() {
+				t.Fatal("one empty answer cleared the fleet; the grace is what makes a run evidence")
+			}
 
-	if c.Clear() {
-		t.Fatal("one empty answer cleared the fleet; the grace is what makes a run evidence")
-	}
+			if host.State != alloc.ClearanceSettling {
+				t.Fatalf("host state is %v, want %v", host.State, alloc.ClearanceSettling)
+			}
 
-	if host.State != alloc.ClearanceSettling {
-		t.Fatalf("host state is %v, want %v", host.State, alloc.ClearanceSettling)
-	}
+			// A SECOND EMPTY ANSWER, TAKEN AFTER THE GRACE HAS ELAPSED. Both ends of the
+			// run come from the allocator's clock, so moving it forward between the two
+			// samples is exactly the span the predicate measures.
+			clock.advance(6 * time.Minute)
+			s.ask(t, barrier.ID)
 
-	// A SECOND EMPTY ANSWER, TAKEN AFTER THE GRACE HAS ELAPSED. Both ends of the
-	// run come from the allocator's clock, so moving it forward between the two
-	// samples is exactly the span the predicate measures.
-	clock.advance(6 * time.Minute)
-	s.ask(t, barrier.ID)
+			c, host = s.clearanceFor(t, s.node)
 
-	c, host = s.clearanceFor(t, s.node)
+			if host.State != alloc.ClearanceProved {
+				t.Fatalf("host state is %v, want %v (empty since %s, clears at %s)",
+					host.State, alloc.ClearanceProved, host.EmptySince, host.ClearAt)
+			}
 
-	if host.State != alloc.ClearanceProved {
-		t.Fatalf("host state is %v, want %v (empty since %s, clears at %s)",
-			host.State, alloc.ClearanceProved, host.EmptySince, host.ClearAt)
-	}
-
-	if !c.Clear() {
-		t.Fatalf("the fleet is not clear though its only host is proved: %+v", c)
+			if !c.Clear() {
+				t.Fatalf("the fleet is not clear though its only host is proved: %+v", c)
+			}
+		})
 	}
 }
 
@@ -315,76 +318,76 @@ func theBarrierSeesRealComputeWhoseLeaseIsGone(t *testing.T, opts ...stackOpt) {
 // already tests. So this proves what a drain and a decommission do ABOUT such a
 // host, and claims nothing about what put it in that state.
 func TestAnUnreachableHostBlocksUntilSomebodyDecommissionsIt(t *testing.T) {
-	forEachBackend(t, anUnreachableHostBlocksUntilSomebodyDecommissionsIt)
-}
+	for _, b := range backends() {
+		t.Run(b.name, func(t *testing.T) {
+			s, _ := barrierStack(t, b.opts...)
 
-func anUnreachableHostBlocksUntilSomebodyDecommissionsIt(t *testing.T, opts ...stackOpt) {
-	s, _ := barrierStack(t, opts...)
+			sealed := s.seal(t)
 
-	sealed := s.seal(t)
+			if _, err := s.alloc.RequestComputeBarrier(t.Context(), sealed.Generation, "e2e"); err != nil {
+				t.Fatalf("RequestComputeBarrier: %v", err)
+			}
 
-	if _, err := s.alloc.RequestComputeBarrier(t.Context(), sealed.Generation, "e2e"); err != nil {
-		t.Fatalf("RequestComputeBarrier: %v", err)
-	}
+			// THE MACHINE GOES AWAY FOR REAL: the node loop stops, so nothing is
+			// heartbeating under this name any more, and the control plane records what
+			// it records when a host stops answering.
+			s.stopNode()
 
-	// THE MACHINE GOES AWAY FOR REAL: the node loop stops, so nothing is
-	// heartbeating under this name any more, and the control plane records what
-	// it records when a host stops answering.
-	s.stopNode()
+			fence, found, err := s.alloc.NodeFenceOf(t.Context(), s.node)
+			if err != nil || !found {
+				t.Fatalf("NodeFenceOf(%s): %v (found=%v)", s.node, err, found)
+			}
 
-	fence, found, err := s.alloc.NodeFenceOf(t.Context(), s.node)
-	if err != nil || !found {
-		t.Fatalf("NodeFenceOf(%s): %v (found=%v)", s.node, err, found)
-	}
+			if err := s.alloc.NodeGone(t.Context(), s.node, fence.Epoch); err != nil {
+				t.Fatalf("NodeGone: %v", err)
+			}
 
-	if err := s.alloc.NodeGone(t.Context(), s.node, fence.Epoch); err != nil {
-		t.Fatalf("NodeGone: %v", err)
-	}
+			before, host := s.clearanceFor(t, s.node)
 
-	before, host := s.clearanceFor(t, s.node)
+			if before.Clear() {
+				t.Fatal("a fleet with an unreachable host was reported clear")
+			}
 
-	if before.Clear() {
-		t.Fatal("a fleet with an unreachable host was reported clear")
-	}
+			if host.State != alloc.ClearanceUnreachable {
+				t.Fatalf("host state is %v, want %v", host.State, alloc.ClearanceUnreachable)
+			}
 
-	if host.State != alloc.ClearanceUnreachable {
-		t.Fatalf("host state is %v, want %v", host.State, alloc.ClearanceUnreachable)
-	}
+			// An unforced decommission must refuse: nothing has been proved about it.
+			proven, err := s.alloc.Decommission(t.Context(), alloc.DecommissionRequest{
+				Node: s.node, Actor: "e2e",
+			})
+			if err == nil {
+				t.Fatalf("decommission succeeded (proven=%v) with no proof and no --force", proven)
+			}
 
-	// An unforced decommission must refuse: nothing has been proved about it.
-	proven, err := s.alloc.Decommission(t.Context(), alloc.DecommissionRequest{
-		Node: s.node, Actor: "e2e",
-	})
-	if err == nil {
-		t.Fatalf("decommission succeeded (proven=%v) with no proof and no --force", proven)
-	}
+			// Forced, it goes through — and stays marked as something billet never
+			// established.
+			proven, err = s.alloc.Decommission(t.Context(), alloc.DecommissionRequest{
+				Node: s.node, Actor: "e2e", Force: true,
+			})
+			if err != nil {
+				t.Fatalf("forced Decommission: %v", err)
+			}
 
-	// Forced, it goes through — and stays marked as something billet never
-	// established.
-	proven, err = s.alloc.Decommission(t.Context(), alloc.DecommissionRequest{
-		Node: s.node, Actor: "e2e", Force: true,
-	})
-	if err != nil {
-		t.Fatalf("forced Decommission: %v", err)
-	}
+			if proven {
+				t.Fatal("a forced decommission of an unreachable host reported itself PROVEN")
+			}
 
-	if proven {
-		t.Fatal("a forced decommission of an unreachable host reported itself PROVEN")
-	}
+			after, err := s.alloc.ComputeClear(t.Context())
+			if err != nil {
+				t.Fatalf("ComputeClear: %v", err)
+			}
 
-	after, err := s.alloc.ComputeClear(t.Context())
-	if err != nil {
-		t.Fatalf("ComputeClear: %v", err)
-	}
+			if !after.Clear() {
+				t.Fatalf("the fleet is not clear after its only host was decommissioned: %+v", after)
+			}
 
-	if !after.Clear() {
-		t.Fatalf("the fleet is not clear after its only host was decommissioned: %+v", after)
-	}
-
-	unproven := after.Unproven()
-	if len(unproven) != 1 || unproven[0] != s.node {
-		t.Fatalf("Unproven() is %v, want [%s] — a forced exclusion that stops being "+
-			"reported is the laundering this exists to prevent", unproven, s.node)
+			unproven := after.Unproven()
+			if len(unproven) != 1 || unproven[0] != s.node {
+				t.Fatalf("Unproven() is %v, want [%s] — a forced exclusion that stops being "+
+					"reported is the laundering this exists to prevent", unproven, s.node)
+			}
+		})
 	}
 }
 
@@ -400,65 +403,65 @@ func anUnreachableHostBlocksUntilSomebodyDecommissionsIt(t *testing.T, opts ...s
 // only place they are exercised together, against a registration that really did
 // negotiate 13 on the real wire rather than a row written to say it had.
 func TestAHostOnTheOldWireIsNeverAskedAndNeverProved(t *testing.T) {
-	forEachBackend(t, aHostOnTheOldWireIsNeverAskedAndNeverProved)
-}
+	for _, b := range backends() {
+		t.Run(b.name, func(t *testing.T) {
+			s, clock := barrierStack(t, b.opts...)
 
-func aHostOnTheOldWireIsNeverAskedAndNeverProved(t *testing.T, opts ...stackOpt) {
-	s, clock := barrierStack(t, opts...)
+			deployment, err := state.DeploymentID(s.dir)
+			if err != nil {
+				t.Fatalf("DeploymentID: %v", err)
+			}
 
-	deployment, err := state.DeploymentID(s.dir)
-	if err != nil {
-		t.Fatalf("DeploymentID: %v", err)
-	}
+			registerAtWire(t, s.wireAddr, deployment, "legacy-1", nodeapi.VersionComputeBarrier-1)
 
-	registerAtWire(t, s.wireAddr, deployment, "legacy-1", nodeapi.VersionComputeBarrier-1)
+			sealed := s.seal(t)
 
-	sealed := s.seal(t)
+			barrier, err := s.alloc.RequestComputeBarrier(t.Context(), sealed.Generation, "e2e")
+			if err != nil {
+				t.Fatalf("RequestComputeBarrier: %v", err)
+			}
 
-	barrier, err := s.alloc.RequestComputeBarrier(t.Context(), sealed.Generation, "e2e")
-	if err != nil {
-		t.Fatalf("RequestComputeBarrier: %v", err)
-	}
+			// THE HALF THAT LIVES IN THE PLANE: a barrier round would not put the command
+			// on that host at all. Asserted here rather than only in internal/nodeplane
+			// because the two halves are one rule — a host that cannot answer must be
+			// skipped AND reported — and a test that saw only the ledger's half would
+			// survive deleting the skip, which costs that host's single command slot for
+			// the full command timeout on every round.
+			if targets := s.wire.BarrierTargetsForTest(); len(targets) != 1 || targets[0] != s.node {
+				t.Fatalf("a barrier round would ask %v; it must ask only %s, because a refusal "+
+					"is not an inventory", targets, s.node)
+			}
 
-	// THE HALF THAT LIVES IN THE PLANE: a barrier round would not put the command
-	// on that host at all. Asserted here rather than only in internal/nodeplane
-	// because the two halves are one rule — a host that cannot answer must be
-	// skipped AND reported — and a test that saw only the ledger's half would
-	// survive deleting the skip, which costs that host's single command slot for
-	// the full command timeout on every round.
-	if targets := s.wire.BarrierTargetsForTest(); len(targets) != 1 || targets[0] != s.node {
-		t.Fatalf("a barrier round would ask %v; it must ask only %s, because a refusal "+
-			"is not an inventory", targets, s.node)
-	}
+			// THE CURRENT HOST IS PROVED, so nothing but the old one can be what blocks.
+			s.ask(t, barrier.ID)
+			clock.advance(6 * time.Minute)
+			s.ask(t, barrier.ID)
 
-	// THE CURRENT HOST IS PROVED, so nothing but the old one can be what blocks.
-	s.ask(t, barrier.ID)
-	clock.advance(6 * time.Minute)
-	s.ask(t, barrier.ID)
+			if _, host := s.clearanceFor(t, s.node); host.State != alloc.ClearanceProved {
+				t.Fatalf("the current host is %v, want %v", host.State, alloc.ClearanceProved)
+			}
 
-	if _, host := s.clearanceFor(t, s.node); host.State != alloc.ClearanceProved {
-		t.Fatalf("the current host is %v, want %v", host.State, alloc.ClearanceProved)
-	}
+			c, legacy := s.clearanceFor(t, "legacy-1")
 
-	c, legacy := s.clearanceFor(t, "legacy-1")
+			if legacy.State != alloc.ClearanceBelowProtocol {
+				t.Fatalf("the old host is %v, want %v", legacy.State, alloc.ClearanceBelowProtocol)
+			}
 
-	if legacy.State != alloc.ClearanceBelowProtocol {
-		t.Fatalf("the old host is %v, want %v", legacy.State, alloc.ClearanceBelowProtocol)
-	}
+			if legacy.WireVersion != nodeapi.VersionComputeBarrier-1 {
+				t.Fatalf("the ledger recorded wire %d for a host that negotiated %d",
+					legacy.WireVersion, nodeapi.VersionComputeBarrier-1)
+			}
 
-	if legacy.WireVersion != nodeapi.VersionComputeBarrier-1 {
-		t.Fatalf("the ledger recorded wire %d for a host that negotiated %d",
-			legacy.WireVersion, nodeapi.VersionComputeBarrier-1)
-	}
+			if c.Clear() {
+				t.Fatal("a fleet holding a host that cannot answer an inventory was reported CLEAR")
+			}
 
-	if c.Clear() {
-		t.Fatal("a fleet holding a host that cannot answer an inventory was reported CLEAR")
-	}
-
-	blocking := c.Blocking()
-	if len(blocking) != 1 || blocking[0].Node != "legacy-1" {
-		t.Fatalf("Blocking() is %v, want just legacy-1 — the report has to name the host "+
-			"an operator would have to upgrade or decommission", blocking)
+			blocking := c.Blocking()
+			if len(blocking) != 1 || blocking[0].Node != "legacy-1" {
+				t.Fatalf("Blocking() is %v, want just legacy-1 — the report has to name the host "+
+					"an operator would have to upgrade or decommission", blocking)
+			}
+		})
 	}
 }
 

@@ -8,10 +8,14 @@
 // is destroyed and the capacity comes back. Each of those steps is covered
 // elsewhere; that they compose is only covered here.
 //
-// The GitHub side is fake and the docker side is REAL. That split is deliberate:
-// billet's relationship with GitHub is a protocol it can be lied to about
-// safely, while its relationship with a container runtime is one where the
-// interesting failures come from the runtime actually behaving like itself.
+// The GitHub side is fake and the compute side is SELECTABLE. billet's
+// relationship with GitHub is a protocol it can be lied to about safely. Its
+// relationship with a container runtime is one where the interesting failures
+// come from the runtime actually behaving like itself, so the scenarios about
+// the plane and the wire run over the real docker backend AND over the simulated
+// one (backends): only the docker leg is evidence about a runtime, and the
+// simulated leg is evidence that the scenario measures the plane rather than
+// the runtime, on machines with no daemon to skip for.
 package e2e
 
 import (
@@ -408,24 +412,37 @@ func (s *stack) sameBackend() []stackOpt {
 // zero, and nothing here steers the backend's clock.
 const simulatedRunsFor = 365 * 24 * time.Hour
 
-// forEachBackend runs a scenario over every backend the shared stack can carry.
+// backend is one compute backend the shared stack can carry, and the options
+// that build a stack over it.
+type backend struct {
+	name string
+	opts []stackOpt
+}
+
+// backends are the backends every plane-and-wire scenario runs over, as
+// subtests: `for _, b := range backends() { t.Run(b.name, ...) }`.
 //
-// THE SCENARIOS THAT TAKE THIS ARE ABOUT THE PLANE AND THE WIRE, and touch the
-// backend only through List, Find and Destroy. Running each over docker AND over
+// THE SCENARIOS THAT DO THIS ARE ABOUT THE PLANE AND THE WIRE, and reach the
+// backend only through the provider contract. Running each over docker AND over
 // the simulated backend proves that, and gives the suite a run on a machine with
-// no daemon: the docker leg skips there and the simulated leg never does.
+// no daemon: the docker leg skips there and the simulated leg never does. Only
+// the docker leg says anything about a real runtime; a claim in a scenario's
+// comment about a REAL container is a claim about that leg.
 //
-// One Host per simulated leg, shared by every stack the scenario builds, so a
-// restart re-adopts what the previous process launched and a second deployment
-// on the same machine is really on the same machine.
-func forEachBackend(t *testing.T, scenario func(t *testing.T, opts ...stackOpt)) {
-	t.Helper()
-
-	t.Run("docker", func(t *testing.T) { scenario(t) })
-
-	t.Run("simulated", func(t *testing.T) {
-		scenario(t, withBackend(config.ProviderSimulated, simulatedBackend(simulated.NewHost())))
-	})
+// A Host per call, so each scenario's simulated leg has one of its own that
+// every stack the scenario builds shares: a restart re-adopts what the previous
+// process launched, and a second deployment on the same machine is really on
+// the same machine. A table and subtests rather than a helper taking the
+// scenario as a function, because a function with a *testing.T that does not
+// begin with t.Helper is a lint finding, and one that does would report every
+// failure at the helper's call site instead of the assertion.
+func backends() []backend {
+	return []backend{
+		{name: "docker"},
+		{name: "simulated", opts: []stackOpt{
+			withBackend(config.ProviderSimulated, simulatedBackend(simulated.NewHost())),
+		}},
+	}
 }
 
 // simulatedBackend builds simulated providers over one shared host.

@@ -18,8 +18,8 @@ import (
 //
 // It is a promise the code already CLAIMS to keep, so these tests can fail
 // informatively. Everything under them is real — a real dispatch, the real node
-// wire, a real container runtime, the real drain — and the single thing steered
-// is the allocator's clock.
+// wire, the real drain, and on the docker leg a real container runtime — and the
+// single thing steered is the allocator's clock.
 //
 // WHAT THE CLOCK IS FOR HERE, AND WHAT IT IS NOT. It carries the scenario across
 // two simulated days, so "billet imposes no job limit" is asserted rather than
@@ -88,193 +88,193 @@ func multiDayStack(t *testing.T, opts ...stackOpt) (*stack, *offsetClock) {
 //     thing here rather than a fake: the goroutine below makes the same call the
 //     upgrade transaction makes.
 func TestAMultiDayJobBlocksUpdateAndTeardown(t *testing.T) {
-	forEachBackend(t, aMultiDayJobBlocksUpdateAndTeardown)
-}
+	for _, b := range backends() {
+		t.Run(b.name, func(t *testing.T) {
+			s, clock := multiDayStack(t, b.opts...)
 
-func aMultiDayJobBlocksUpdateAndTeardown(t *testing.T, opts ...stackOpt) {
-	s, clock := multiDayStack(t, opts...)
+			leaseID, _ := s.startAMultiDayJob(t, 5101, clock)
 
-	leaseID, _ := s.startAMultiDayJob(t, 5101, clock)
+			// TEARDOWN, AND IT IS REFUSED FOR THE RIGHT REASON. Asserted on the sentinel
+			// AND in both directions of --force: `Decommission` has several refusals, and
+			// a test happy with "an error" would pass against the liveness one, which
+			// --force overrides. This one deliberately has nothing behind it, because a
+			// decommissioned host is excluded from every tier's floor while its capacity
+			// stays charged either way.
+			for _, force := range []bool{false, true} {
+				_, err := s.alloc.Decommission(t.Context(), alloc.DecommissionRequest{
+					Node: s.node, Actor: "e2e", Force: force,
+				})
+				if !errors.Is(err, alloc.ErrNotDecommissionable) {
+					t.Fatalf("decommission(force=%v) of a host running a two-day job returned %v, want "+
+						"%v — its capacity is still charged, so excluding it silently changes what "+
+						"every tier's floor believes is already met",
+						force, err, alloc.ErrNotDecommissionable)
+				}
+			}
 
-	// TEARDOWN, AND IT IS REFUSED FOR THE RIGHT REASON. Asserted on the sentinel
-	// AND in both directions of --force: `Decommission` has several refusals, and
-	// a test happy with "an error" would pass against the liveness one, which
-	// --force overrides. This one deliberately has nothing behind it, because a
-	// decommissioned host is excluded from every tier's floor while its capacity
-	// stays charged either way.
-	for _, force := range []bool{false, true} {
-		_, err := s.alloc.Decommission(t.Context(), alloc.DecommissionRequest{
-			Node: s.node, Actor: "e2e", Force: force,
+			// THE BARRIER BOTH OTHER OPERATIONS WAIT ON, and it holds at both stages.
+			sealed := s.seal(t)
+
+			q, err := s.alloc.Quiescence(t.Context())
+			if err != nil {
+				t.Fatalf("Quiescence: %v", err)
+			}
+
+			if q.Quiet() {
+				t.Fatalf("the ledger reported quiet while a job had been running for %s: %+v",
+					simulatedJobDuration, q)
+			}
+
+			// NAMED, NOT COUNTED. The report exists so an operator can recognise their
+			// own work in it; "1 lease" tells them nothing about whether to keep waiting.
+			if !outstandingHolds(q, leaseID) {
+				t.Fatalf("the barrier does not name the lease it is waiting on (%s): %+v",
+					leaseID, q.Outstanding)
+			}
+
+			barrier, err := s.alloc.RequestComputeBarrier(t.Context(), sealed.Generation, "e2e")
+			if err != nil {
+				t.Fatalf("RequestComputeBarrier: %v", err)
+			}
+
+			s.ask(t, barrier.ID)
+
+			c, host := s.clearanceFor(t, s.node)
+			if c.Clear() || host.State != alloc.ClearanceRunning {
+				t.Fatalf("the fleet is clear=%v with %s in state %v, want not-clear and %v",
+					c.Clear(), s.node, host.State, alloc.ClearanceRunning)
+			}
+
+			// AND ELAPSED TIME ALONE NEVER CLEARS A HOST THAT IS RUNNING SOMETHING.
+			// computeAbsenceGrace is a span between two EMPTY answers, so moving past it
+			// while the host keeps answering "I am running something" must change nothing
+			// whatever.
+			clock.advance(6 * time.Minute)
+			s.ask(t, barrier.ID)
+
+			c, host = s.clearanceFor(t, s.node)
+			if c.Clear() || host.State != alloc.ClearanceRunning {
+				t.Fatalf("advancing past the absence grace cleared a host that is still running "+
+					"compute: clear=%v state=%v", c.Clear(), host.State)
+			}
+
+			// UPDATE. The real node drain, on its own goroutine because it is not
+			// expected to return.
+			drained := make(chan struct{})
+
+			go func() {
+				defer close(drained)
+
+				s.stopNode()
+			}()
+
+			// DAYS PASS WHILE THE DRAIN IS WAITING, which is a different claim from the
+			// days that passed before it started and is the one this test is named for. A
+			// review of the first version caught that: it advanced the clock and only
+			// afterwards began the drain, so it proved that an old lease blocks a new
+			// operation briefly rather than that a waiting operation survives elapsed
+			// time.
+			//
+			// Everything the allocator decides — the barrier's grace, lease expiry,
+			// quarantine — moves with this. What it cannot reach is a real-time deadline
+			// inside the drain itself, and the assertion below is what covers that: this
+			// node's drain_timeout is 200ms, so by the time the window closes the drain
+			// has been waiting more than an order of magnitude past its own configured
+			// threshold and has still not ended. That number USED to bound the wait and
+			// then destroy whatever was left; a regression restoring it lands here.
+			for elapsed := time.Duration(0); elapsed < simulatedJobDuration; elapsed += simulatedStep {
+				clock.advance(simulatedStep)
+			}
+
+			// IT MUST NOT RETURN, and the window is generous because the claim is a
+			// negative one. A node holding nothing returns from this immediately
+			// (stopGracefully's Holding() fast path), so a drain that stopped waiting for
+			// running compute lands here in milliseconds rather than timing out.
+			select {
+			case <-drained:
+				t.Fatal("the node's drain returned while it was still holding a running job; a stop " +
+					"is not evidence that the work on a host should end, and GitHub does not requeue " +
+					"a job whose runner vanished after starting")
+			case <-time.After(3 * time.Second):
+			}
+
+			// ...and the container is untouched, which is the substantive half. An error
+			// value is the cheapest thing a function produces; what matters is that
+			// nothing else happened.
+			s.assertStillRunning(t, leaseID)
+
+			// THE JOB FINISHES, AND THE DEFERRED OPERATION RESUMES BY ITSELF.
+			s.plane.queue(fakeactions.StatisticsJSON(0, 0),
+				fakeactions.JobJSON("JobCompleted", 5101, "push", testTier))
+
+			select {
+			case <-drained:
+			case <-time.After(90 * time.Second):
+				t.Fatal("the node's drain never returned after its job completed; a drain that does " +
+					"not end on its own is one an operator has to kill")
+			}
+
+			s.awaitGone(t)
+
+			// The ledger barrier settles first...
+			deadline := time.Now().Add(30 * time.Second)
+
+			for {
+				q, err := s.alloc.Quiescence(t.Context())
+				if err != nil {
+					t.Fatalf("Quiescence: %v", err)
+				}
+
+				if q.Quiet() {
+					break
+				}
+
+				if time.Now().After(deadline) {
+					t.Fatalf("the ledger never went quiet after the job finished: %+v", q)
+				}
+
+				time.Sleep(100 * time.Millisecond)
+			}
+
+			// ...AND THE COMPUTE BARRIER DOES NOT, WHICH IS THE ORDERING LESSON THIS
+			// SCENARIO ENDS ON RATHER THAN A GAP IN IT.
+			//
+			// The second stage asks each HOST what its provider is running, and the host
+			// that would answer is the one this leg just stopped. Whatever it is reported
+			// as afterwards — still running, from telemetry that was already stale when it
+			// arrived; settling, waiting on an empty answer that can never come; or
+			// unreachable — every one of those is not-clear, and none of them can become
+			// clear on its own, because the proof is two observations and nothing is left
+			// to give the second.
+			//
+			// THAT IS WHY `billet local down` PROVES THE FLEET CLEAR BEFORE IT STOPS
+			// ANYTHING, rather than stopping and then asking. Running the drain in this
+			// order — which is what an update does, since the node stops first so its
+			// compute drains while the control plane is still there to record what
+			// happened to it — leaves the deployment unprovable until the host comes back.
+			//
+			// Asserted as `!Clear()` rather than on a particular state, because all three
+			// are the safe direction and pinning one would make this test about which of
+			// them the host happened to land in. That a barrier DOES clear once a host
+			// answers empty twice across the grace is
+			// TestTheBarrierSeesRealComputeWhoseLeaseIsGone's subject, on a stack whose
+			// node is still there to answer.
+			//
+			// AND NOTHING IS ASKED HERE, deliberately. The first version put two more
+			// `ask` rounds in — which a review caught: the node loop has exited, so
+			// `AskNodeForTest` dispatches to nobody, returns nil whatever happened, and
+			// can spend its whole 60-second deadline doing it. The assertion then passed
+			// on the record from BEFORE the stop while looking like it rested on two
+			// fresh rounds, and the test took two minutes to say so. Time is advanced
+			// instead, which is the only thing that could still change the answer.
+			clock.advance(6 * time.Minute)
+
+			if c, _ = s.clearanceFor(t, s.node); c.Clear() {
+				t.Fatal("the fleet was reported CLEAR with no host left to answer for it; a proof is " +
+					"two observations from a machine billet can reach, and stopping that machine is " +
+					"not one of them")
+			}
 		})
-		if !errors.Is(err, alloc.ErrNotDecommissionable) {
-			t.Fatalf("decommission(force=%v) of a host running a two-day job returned %v, want "+
-				"%v — its capacity is still charged, so excluding it silently changes what "+
-				"every tier's floor believes is already met",
-				force, err, alloc.ErrNotDecommissionable)
-		}
-	}
-
-	// THE BARRIER BOTH OTHER OPERATIONS WAIT ON, and it holds at both stages.
-	sealed := s.seal(t)
-
-	q, err := s.alloc.Quiescence(t.Context())
-	if err != nil {
-		t.Fatalf("Quiescence: %v", err)
-	}
-
-	if q.Quiet() {
-		t.Fatalf("the ledger reported quiet while a job had been running for %s: %+v",
-			simulatedJobDuration, q)
-	}
-
-	// NAMED, NOT COUNTED. The report exists so an operator can recognise their
-	// own work in it; "1 lease" tells them nothing about whether to keep waiting.
-	if !outstandingHolds(q, leaseID) {
-		t.Fatalf("the barrier does not name the lease it is waiting on (%s): %+v",
-			leaseID, q.Outstanding)
-	}
-
-	barrier, err := s.alloc.RequestComputeBarrier(t.Context(), sealed.Generation, "e2e")
-	if err != nil {
-		t.Fatalf("RequestComputeBarrier: %v", err)
-	}
-
-	s.ask(t, barrier.ID)
-
-	c, host := s.clearanceFor(t, s.node)
-	if c.Clear() || host.State != alloc.ClearanceRunning {
-		t.Fatalf("the fleet is clear=%v with %s in state %v, want not-clear and %v",
-			c.Clear(), s.node, host.State, alloc.ClearanceRunning)
-	}
-
-	// AND ELAPSED TIME ALONE NEVER CLEARS A HOST THAT IS RUNNING SOMETHING.
-	// computeAbsenceGrace is a span between two EMPTY answers, so moving past it
-	// while the host keeps answering "I am running something" must change nothing
-	// whatever.
-	clock.advance(6 * time.Minute)
-	s.ask(t, barrier.ID)
-
-	c, host = s.clearanceFor(t, s.node)
-	if c.Clear() || host.State != alloc.ClearanceRunning {
-		t.Fatalf("advancing past the absence grace cleared a host that is still running "+
-			"compute: clear=%v state=%v", c.Clear(), host.State)
-	}
-
-	// UPDATE. The real node drain, on its own goroutine because it is not
-	// expected to return.
-	drained := make(chan struct{})
-
-	go func() {
-		defer close(drained)
-
-		s.stopNode()
-	}()
-
-	// DAYS PASS WHILE THE DRAIN IS WAITING, which is a different claim from the
-	// days that passed before it started and is the one this test is named for. A
-	// review of the first version caught that: it advanced the clock and only
-	// afterwards began the drain, so it proved that an old lease blocks a new
-	// operation briefly rather than that a waiting operation survives elapsed
-	// time.
-	//
-	// Everything the allocator decides — the barrier's grace, lease expiry,
-	// quarantine — moves with this. What it cannot reach is a real-time deadline
-	// inside the drain itself, and the assertion below is what covers that: this
-	// node's drain_timeout is 200ms, so by the time the window closes the drain
-	// has been waiting more than an order of magnitude past its own configured
-	// threshold and has still not ended. That number USED to bound the wait and
-	// then destroy whatever was left; a regression restoring it lands here.
-	for elapsed := time.Duration(0); elapsed < simulatedJobDuration; elapsed += simulatedStep {
-		clock.advance(simulatedStep)
-	}
-
-	// IT MUST NOT RETURN, and the window is generous because the claim is a
-	// negative one. A node holding nothing returns from this immediately
-	// (stopGracefully's Holding() fast path), so a drain that stopped waiting for
-	// running compute lands here in milliseconds rather than timing out.
-	select {
-	case <-drained:
-		t.Fatal("the node's drain returned while it was still holding a running job; a stop " +
-			"is not evidence that the work on a host should end, and GitHub does not requeue " +
-			"a job whose runner vanished after starting")
-	case <-time.After(3 * time.Second):
-	}
-
-	// ...and the container is untouched, which is the substantive half. An error
-	// value is the cheapest thing a function produces; what matters is that
-	// nothing else happened.
-	s.assertStillRunning(t, leaseID)
-
-	// THE JOB FINISHES, AND THE DEFERRED OPERATION RESUMES BY ITSELF.
-	s.plane.queue(fakeactions.StatisticsJSON(0, 0),
-		fakeactions.JobJSON("JobCompleted", 5101, "push", testTier))
-
-	select {
-	case <-drained:
-	case <-time.After(90 * time.Second):
-		t.Fatal("the node's drain never returned after its job completed; a drain that does " +
-			"not end on its own is one an operator has to kill")
-	}
-
-	s.awaitGone(t)
-
-	// The ledger barrier settles first...
-	deadline := time.Now().Add(30 * time.Second)
-
-	for {
-		q, err := s.alloc.Quiescence(t.Context())
-		if err != nil {
-			t.Fatalf("Quiescence: %v", err)
-		}
-
-		if q.Quiet() {
-			break
-		}
-
-		if time.Now().After(deadline) {
-			t.Fatalf("the ledger never went quiet after the job finished: %+v", q)
-		}
-
-		time.Sleep(100 * time.Millisecond)
-	}
-
-	// ...AND THE COMPUTE BARRIER DOES NOT, WHICH IS THE ORDERING LESSON THIS
-	// SCENARIO ENDS ON RATHER THAN A GAP IN IT.
-	//
-	// The second stage asks each HOST what its provider is running, and the host
-	// that would answer is the one this leg just stopped. Whatever it is reported
-	// as afterwards — still running, from telemetry that was already stale when it
-	// arrived; settling, waiting on an empty answer that can never come; or
-	// unreachable — every one of those is not-clear, and none of them can become
-	// clear on its own, because the proof is two observations and nothing is left
-	// to give the second.
-	//
-	// THAT IS WHY `billet local down` PROVES THE FLEET CLEAR BEFORE IT STOPS
-	// ANYTHING, rather than stopping and then asking. Running the drain in this
-	// order — which is what an update does, since the node stops first so its
-	// compute drains while the control plane is still there to record what
-	// happened to it — leaves the deployment unprovable until the host comes back.
-	//
-	// Asserted as `!Clear()` rather than on a particular state, because all three
-	// are the safe direction and pinning one would make this test about which of
-	// them the host happened to land in. That a barrier DOES clear once a host
-	// answers empty twice across the grace is
-	// TestTheBarrierSeesRealComputeWhoseLeaseIsGone's subject, on a stack whose
-	// node is still there to answer.
-	//
-	// AND NOTHING IS ASKED HERE, deliberately. The first version put two more
-	// `ask` rounds in — which a review caught: the node loop has exited, so
-	// `AskNodeForTest` dispatches to nobody, returns nil whatever happened, and
-	// can spend its whole 60-second deadline doing it. The assertion then passed
-	// on the record from BEFORE the stop while looking like it rested on two
-	// fresh rounds, and the test took two minutes to say so. Time is advanced
-	// instead, which is the only thing that could still change the answer.
-	clock.advance(6 * time.Minute)
-
-	if c, _ = s.clearanceFor(t, s.node); c.Clear() {
-		t.Fatal("the fleet was reported CLEAR with no host left to answer for it; a proof is " +
-			"two observations from a machine billet can reach, and stopping that machine is " +
-			"not one of them")
 	}
 }
 
@@ -294,46 +294,46 @@ func aMultiDayJobBlocksUpdateAndTeardown(t *testing.T, opts ...stackOpt) {
 // re-adopts them. Freeing a slot whose container is live is the overcommit the
 // whole ordering exists to prevent.
 func TestAMultiDayJobSurvivesAControlPlaneShutdown(t *testing.T) {
-	forEachBackend(t, aMultiDayJobSurvivesAControlPlaneShutdown)
-}
+	for _, b := range backends() {
+		t.Run(b.name, func(t *testing.T) {
+			s, clock := multiDayStack(t, b.opts...)
 
-func aMultiDayJobSurvivesAControlPlaneShutdown(t *testing.T, opts ...stackOpt) {
-	s, clock := multiDayStack(t, opts...)
+			leaseID, stop := s.startAMultiDayJob(t, 5102, clock)
 
-	leaseID, stop := s.startAMultiDayJob(t, 5102, clock)
+			before, err := s.alloc.Usage(t.Context())
+			if err != nil {
+				t.Fatalf("Usage: %v", err)
+			}
 
-	before, err := s.alloc.Usage(t.Context())
-	if err != nil {
-		t.Fatalf("Usage: %v", err)
-	}
+			if before.VCPU == 0 {
+				t.Fatalf("nothing was charged for a running job: %+v", before)
+			}
 
-	if before.VCPU == 0 {
-		t.Fatalf("nothing was charged for a running job: %+v", before)
-	}
+			// THE CONTROL PLANE STOPS, hurried.
+			stop()
 
-	// THE CONTROL PLANE STOPS, hurried.
-	stop()
+			// The container is still there, still RUNNING, and still this job's own.
+			s.assertStillRunning(t, leaseID)
 
-	// The container is still there, still RUNNING, and still this job's own.
-	s.assertStillRunning(t, leaseID)
+			// AND ITS CAPACITY IS STILL CHARGED. Asserted against the LEASE rather than
+			// against total usage, which never falls to zero while a listener runs: free
+			// escrow a listener holds to offer GitHub is indistinguishable from a leak in
+			// an aggregate.
+			held, err := s.alloc.Lease(t.Context(), leaseID)
+			if err != nil {
+				t.Fatalf("the job's lease is gone after a shutdown, so its container is now compute "+
+					"nothing accounts for: %v", err)
+			}
 
-	// AND ITS CAPACITY IS STILL CHARGED. Asserted against the LEASE rather than
-	// against total usage, which never falls to zero while a listener runs: free
-	// escrow a listener holds to offer GitHub is indistinguishable from a leak in
-	// an aggregate.
-	held, err := s.alloc.Lease(t.Context(), leaseID)
-	if err != nil {
-		t.Fatalf("the job's lease is gone after a shutdown, so its container is now compute "+
-			"nothing accounts for: %v", err)
-	}
+			if held.Phase.Terminal() {
+				t.Fatalf("the job's lease is %s after a shutdown; a stop is not a completion", held.Phase)
+			}
 
-	if held.Phase.Terminal() {
-		t.Fatalf("the job's lease is %s after a shutdown; a stop is not a completion", held.Phase)
-	}
-
-	if held.VCPU == 0 || held.Memory == 0 {
-		t.Fatalf("the surviving lease is charged nothing (%d vCPU, %s), so its host's capacity "+
-			"can be sold twice", held.VCPU, held.Memory)
+			if held.VCPU == 0 || held.Memory == 0 {
+				t.Fatalf("the surviving lease is charged nothing (%d vCPU, %s), so its host's capacity "+
+					"can be sold twice", held.VCPU, held.Memory)
+			}
+		})
 	}
 }
 
