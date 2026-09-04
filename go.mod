@@ -7,6 +7,7 @@ require (
 	github.com/golang-jwt/jwt/v4 v4.5.2
 	github.com/hashicorp/go-retryablehttp v0.7.8
 	github.com/jackc/pgx/v5 v5.10.0
+	github.com/junioryono/godi/v5 v5.1.0
 	github.com/sigstore/sigstore-go v1.3.0
 	golang.org/x/sys v0.47.0
 	gopkg.in/yaml.v3 v3.0.1
