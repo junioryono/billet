@@ -46,9 +46,50 @@ cat >"$outputs" <<'EOF'
   "ami_payload_bucket": {"sensitive": false, "type": "string", "value": "hybrid-check-ami-payloads-1"},
   "cache_bucket": {"sensitive": false, "type": "string", "value": "hybrid-check-cache-1"},
   "cache_prefix": {"sensitive": false, "type": "string", "value": "billet-cache"},
-  "availability_zone": {"sensitive": false, "type": "string", "value": "us-west-2a"}
+  "availability_zone": {"sensitive": false, "type": "string", "value": "us-west-2a"},
+  "name": {"sensitive": false, "type": "string", "value": "hybrid-check"},
+  "region": {"sensitive": false, "type": "string", "value": "us-west-2"},
+  "node_wire_address": {"sensitive": false, "type": "string", "value": "10.60.0.10:7717"},
+  "backup_bucket": {"sensitive": false, "type": "string", "value": "hybrid-check-backups-1"},
+  "backup_prefix": {"sensitive": false, "type": "string", "value": "billet-backups"},
+  "control_plane_instance_id": {"sensitive": false, "type": "string", "value": "i-0abc"}
 }
 EOF
+
+# THIS FIXTURE IS A HAND-WRITTEN COPY OF WHAT AN APPLY PRODUCES, and the fifth
+# such copy in the repository. A render that begins DEMANDING a new output
+# therefore breaks here and nowhere a person would look first: the failure is a
+# generation refusing a file this script wrote, ten minutes into a CI job.
+#
+# So the fixture is checked against the root the plan render actually writes,
+# before the render that consumes it. A key the root declares and this file
+# omits is named here, at the top of the gate, instead of surfacing as a refusal
+# further down.
+#
+# The fixture therefore carries EVERY output the root declares, not only the ones
+# a render reads: that is what `terraform output -json` would hand over, and it
+# is what makes this check exact rather than one more list to keep in step.
+plan=$work/plan
+"$billet" init hybrid --out "$plan" \
+    --name hybrid-check --region us-west-2 --org acme \
+    --control-plane-private-ip 10.60.0.10 \
+    --local-vcpu 32 --local-memory 128GiB \
+    --max-vcpu 16 --max-memory 32GiB \
+    --instance-type 'c7i.xlarge=4,8GiB,0.17' \
+    --instance-type 'c7i.2xlarge=8,16GiB,0.34' \
+    --cache >"$work/plan.log" 2>&1 || {
+    echo "hybrid-emission-check: the plan render failed" >&2; cat "$work/plan.log" >&2; exit 1; }
+
+missing=$(sed -n 's/^output "\([a-z0-9_]*\)" {$/\1/p' "$plan/terraform/main.tf" |
+    while read -r name; do
+        grep -q "\"$name\":" "$outputs" || printf '%s ' "$name"
+    done)
+if [ -n "$missing" ]; then
+    echo "hybrid-emission-check: the generated root declares outputs this gate's" >&2
+    echo "  fixture does not carry, so a render demanding one would fail here" >&2
+    echo "  rather than where it was introduced: $missing" >&2
+    exit 1
+fi
 
 # THE COMMISSION RENDER, because it is the most complete one: both hosts carry
 # a node, the controller carries the server, the App and the backup block.
