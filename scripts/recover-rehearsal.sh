@@ -39,6 +39,7 @@ started_at=$(date -u +%s)
 cleanup() {
     status=$?
     set +e
+    status=$(rehearsal_verdict "${status}")
 
     echo
     echo "=== teardown"
@@ -192,5 +193,6 @@ if grep -q 'not taking new work' <<<"${status}"; then
 fi
 
 echo
+REHEARSAL_PASSED=1
 echo "recover rehearsal: PASSED"
 echo "  package $(rehearsal_version "${controller}") on ${REHEARSAL_ARCH}; superseded ledger kept at ${superseded}; total $(($(date -u +%s) - started_at))s"

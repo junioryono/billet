@@ -59,6 +59,7 @@ active_controller() {
 cleanup() {
     status=$?
     set +e
+    status=$(rehearsal_verdict "${status}")
 
     echo
     echo "=== teardown"
@@ -249,5 +250,6 @@ test "$(rehearsal_active "${controller_b}" billet-server.service)" = active ||
     rehearsal_fail "controller B is not active after A rejoined"
 
 echo
+REHEARSAL_PASSED=1
 echo "promotion rehearsal: PASSED"
 echo "  package $(rehearsal_version "${controller_a}") on ${REHEARSAL_ARCH}; PostgreSQL keepalives idle=${keepalive_idle}s interval=${keepalive_interval}s count=${keepalive_count}; partition -> promotion ${promotion_took}s; node re-registered $((node_moved_at - partitioned_at))s after the partition; heal -> old leader standing by $((stood_by_at - healed_at))s; total $(($(date -u +%s) - started_at))s"

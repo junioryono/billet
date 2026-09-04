@@ -72,6 +72,7 @@ started_at=$(date -u +%s)
 cleanup() {
     status=$?
     set +e
+    status=$(rehearsal_verdict "${status}")
 
     echo
     echo "=== teardown"
@@ -279,5 +280,6 @@ rehearsal_as_billet "${controller}" /usr/bin/billet rollout abort \
     --config /etc/billet/billet.yaml 2>&1 | tail -3
 
 echo
+REHEARSAL_PASSED=1
 echo "rollout rehearsal: PASSED"
 echo "  ${FROM} -> ${TO} on ${REHEARSAL_ARCH}; controller upgrade ${controller_upgrade_took}s (timer: ${controller_has_timer}); node converged ${node_upgrade_took}s after the controller; rollback ${rollback_took}s; total $(($(date -u +%s) - started_at))s"

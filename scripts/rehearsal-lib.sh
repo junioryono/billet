@@ -28,6 +28,22 @@ rehearsal_fail() {
     exit 1
 }
 
+# rehearsal_verdict corrects the status an EXIT trap read. Measured: on the
+# Mac's /bin/bash 3.2.57 a `set -u` abort reaches the EXIT trap with $? = 0
+# (bash 5.2.21 and 5.3.8 report 1), so the first real recover run died at an
+# unbound variable and exited 0 with no PASSED line. Each script sets
+# REHEARSAL_PASSED=1 on the line before its PASSED echo; a zero status without
+# it is a failure whatever the shell. Prints the corrected status (no nameref:
+# bash 3.2 has none).
+rehearsal_verdict() {
+    if [ "$1" -eq 0 ] && [ "${REHEARSAL_PASSED:-0}" -ne 1 ]; then
+        echo "rehearsal FAILED: the script ended before its last step with status 0 (an aborted shell reports 0 to its EXIT trap)" >&2
+        echo 1
+    else
+        echo "$1"
+    fi
+}
+
 rehearsal_step() {
     echo
     echo "=== $*"
@@ -296,10 +312,10 @@ rehearsal_start_host() {
     fi
 
     docker run -d --name "${name}" --hostname "${name}" --network "${network}" \
-        "${aliases[@]}" \
+        ${aliases[@]+"${aliases[@]}"} \
         --privileged --cgroupns=host \
         -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
-        "${volumes[@]}" \
+        ${volumes[@]+"${volumes[@]}"} \
         -e DEBIAN_FRONTEND=noninteractive \
         --platform "linux/${REHEARSAL_ARCH}" \
         ubuntu:24.04 sh -c \

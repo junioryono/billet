@@ -47,6 +47,7 @@ started_at=$(date -u +%s)
 cleanup() {
     status=$?
     set +e
+    status=$(rehearsal_verdict "${status}")
 
     echo
     echo "=== teardown"
@@ -203,5 +204,6 @@ test "${verify_status}" -eq 2 ||
     rehearsal_fail "verifying the ORIGINAL certificate against today's bundle exited ${verify_status}; 2 is the retired authority refusing it, anything else is not"
 
 echo
+REHEARSAL_PASSED=1
 echo "ca rotation rehearsal: PASSED"
 echo "  package $(rehearsal_version "${controller}") on ${REHEARSAL_ARCH}; leaf ${leaf_lifetime}; both nodes renewed $((renewed_at - issued_at))s after issue ($((renewed_at - rotated_at))s after the rotation); total $(($(date -u +%s) - started_at))s"
