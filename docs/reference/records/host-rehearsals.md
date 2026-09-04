@@ -31,12 +31,16 @@ Every release manifest billet has published is signed as `release.yml@refs/heads
 
 The finding cost one release cut and had never been visible to a test, because every fixture signs its manifests with whatever identity the test names. It is the kind of defect the rehearsal exists for.
 
+## What the first recover runs found
+
+**2026-09-04 (UTC), `make recover-rehearsal` three times on this Mac, each stopped by something it exposed, none yet reaching the recovery itself.** The first run died in the harness before a host was up: `aliases[@]: unbound variable`, an empty array expanded under `set -u` on the Mac's `/bin/bash` 3.2, and it exited 0, because on that shell a `set -u` abort reaches the EXIT trap with `$?` of 0 (bash 5.2 and 5.3 report 1; measured with a probe). The harness now initialises a sentinel to 0 before its traps, sets it to 1 as the script's last statement, and fails any run that reaches the trap with status 0 without it. The second run got both hosts up and was refused by `billet local up`: the acceptance App had been given `actions: write` so the acceptance lane could dispatch a workflow, and `billet check` refuses an App whose installation holds a permission billet never requested; the dispatch is a second App's job now and the acceptance App is back to the two permissions the manifest flow asked for. The third run commissioned the deployment, registered the node, took the backup and moved the ledger on, then `local down` was refused: `the ledger is fenced for host maintenance`. The journal explains it: a minute after boot the control plane logged `started a rollout, because the stable channel advanced` from `0.0.0-SNAPSHOT-…` to `v0.6.0`, because a snapshot build reports a release the channel is not on and the deployment said nothing about `release:`, so it was on automatic updates; the packaged root `billet-upgrade.timer` then began the host transaction, fenced the ledger and started replacing `/usr/bin/billet`, which is also why the teardown's `billet teardown` found the binary unrunnable and left the scale set behind (removed by hand with `billet teardown --tier … --runner-group default`). The recover, CA rotation and promotion rehearsals now write `release: {automatic: false}`, since the thing they rehearse is not a rollout, and `billet acceptance up` writes it into every derived config for the same reason: an acceptance deployment proves the tree it was built from, never the channel. The rollout rehearsal keeps the default, because the default is what it rehearses.
+
 ## What has run and what has not
 
 | Rehearsal | Status |
 |---|---|
 | Rollout | ran to its first step and found the signing-identity defect above; the full run (both hosts moved, the downgrade rolled back) follows on v0.6.1 |
-| Recover | not yet run against a real App |
+| Recover | ran three times on 2026-09-04 against the acceptance App and stopped each time at something it exposed (above); the recovery itself has not yet run |
 | CA rotation | not yet run against a real App |
 | Promotion | not yet run against a real App |
 

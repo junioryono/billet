@@ -72,6 +72,7 @@ started_at=$(date -u +%s)
 cleanup() {
     status=$?
     set +e
+    trap - INT TERM
     status=$(rehearsal_verdict "${status}")
 
     echo
@@ -96,7 +97,14 @@ cleanup() {
     rm -rf "${work}" || true
     exit "${status}"
 }
-trap cleanup EXIT INT TERM
+# THE SENTINEL STARTS AT 0 HERE, whatever the environment says, or an exported
+# REHEARSAL_PASSED=1 would turn an aborted run green. A signal exits through its
+# own status so that cleanup, which only the EXIT trap runs, reads a failure and
+# not the $? of whatever the signal interrupted.
+REHEARSAL_PASSED=0
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap cleanup EXIT
 
 rehearsal_step "fetch and verify both releases"
 rehearsal_fetch_release "${FROM}" "${work}/from"
@@ -280,6 +288,8 @@ rehearsal_as_billet "${controller}" /usr/bin/billet rollout abort \
     --config /etc/billet/billet.yaml 2>&1 | tail -3
 
 echo
-REHEARSAL_PASSED=1
 echo "rollout rehearsal: PASSED"
 echo "  ${FROM} -> ${TO} on ${REHEARSAL_ARCH}; controller upgrade ${controller_upgrade_took}s (timer: ${controller_has_timer}); node converged ${node_upgrade_took}s after the controller; rollback ${rollback_took}s; total $(($(date -u +%s) - started_at))s"
+# THE LAST STATEMENT, after every line of output: a signal landing before this
+# still fails the run.
+REHEARSAL_PASSED=1

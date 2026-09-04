@@ -32,11 +32,14 @@ rehearsal_fail() {
 # Mac's /bin/bash 3.2.57 a `set -u` abort reaches the EXIT trap with $? = 0
 # (bash 5.2.21 and 5.3.8 report 1), so the first real recover run died at an
 # unbound variable and exited 0 with no PASSED line. Each script sets
-# REHEARSAL_PASSED=1 on the line before its PASSED echo; a zero status without
-# it is a failure whatever the shell. Prints the corrected status (no nameref:
-# bash 3.2 has none).
+# REHEARSAL_PASSED=0 before it installs its traps, so nothing inherited from
+# the environment can vouch for it, and REHEARSAL_PASSED=1 as its very last
+# statement; a zero status without that is a failure whatever the shell. The
+# comparison is on the string, because an inherited word that is not a number
+# would make an arithmetic test error out and read as "not set". Prints the
+# corrected status (no nameref: bash 3.2 has none).
 rehearsal_verdict() {
-    if [ "$1" -eq 0 ] && [ "${REHEARSAL_PASSED:-0}" -ne 1 ]; then
+    if [ "$1" -eq 0 ] && [ "${REHEARSAL_PASSED:-0}" != 1 ]; then
         echo "rehearsal FAILED: the script ended before its last step with status 0 (an aborted shell reports 0 to its EXIT trap)" >&2
         echo 1
     else

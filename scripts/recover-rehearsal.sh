@@ -39,6 +39,7 @@ started_at=$(date -u +%s)
 cleanup() {
     status=$?
     set +e
+    trap - INT TERM
     status=$(rehearsal_verdict "${status}")
 
     echo
@@ -62,7 +63,14 @@ cleanup() {
     rm -rf "${work}" || true
     exit "${status}"
 }
-trap cleanup EXIT INT TERM
+# THE SENTINEL STARTS AT 0 HERE, whatever the environment says, or an exported
+# REHEARSAL_PASSED=1 would turn an aborted run green. A signal exits through its
+# own status so that cleanup, which only the EXIT trap runs, reads a failure and
+# not the $? of whatever the signal interrupted.
+REHEARSAL_PASSED=0
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap cleanup EXIT
 
 rehearsal_step "two packaged hosts on the tree's own package"
 docker network create "${network}" >/dev/null
@@ -80,6 +88,14 @@ server:
   state_dir: /var/lib/billet/server
   max_vcpu: 8
   max_memory: 16GiB
+# NOT ON AUTOMATIC UPDATES. This is the tree's own snapshot build, which reports
+# a release the stable channel is not on, so the starter opened a rollout to the
+# channel within a minute of boot (measured 2026-09-04) and the packaged root
+# timer then fenced the ledger for its host transaction, refusing the very
+# `local down` this rehearsal is about. The rollout rehearsal is the one that
+# wants the default.
+release:
+  automatic: false
 EOF
     rehearsal_github_block
     cat <<EOF
@@ -193,6 +209,8 @@ if grep -q 'not taking new work' <<<"${status}"; then
 fi
 
 echo
-REHEARSAL_PASSED=1
 echo "recover rehearsal: PASSED"
 echo "  package $(rehearsal_version "${controller}") on ${REHEARSAL_ARCH}; superseded ledger kept at ${superseded}; total $(($(date -u +%s) - started_at))s"
+# THE LAST STATEMENT, after every line of output: a signal landing before this
+# still fails the run.
+REHEARSAL_PASSED=1
