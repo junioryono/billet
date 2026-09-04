@@ -6,7 +6,8 @@
 # warning to exactly that node's queue; an untagged (non-billet) instance is
 # dropped. Created only when spot is enabled. It is granted, and told about, every
 # queue this module creates — the primary and one per spot_node_names entry — from
-# the one list local.spot_queues, so the two can never disagree.
+# the one list local.spot_queues, so the two converge on the same set; the served
+# set lands first, and the policy's depends_on below says why.
 
 data "archive_file" "spot_router" {
   count = var.enable_spot ? 1 : 0

@@ -73,12 +73,13 @@ variable "enable_spot" {
 # interruption queue per spot node, its basename equal to that node's node.name;
 # the queue enable_spot creates serves one node. Each name here creates a queue
 # named exactly it, and the node role's consumer grant, the router's forwarding
-# grant and the set of names the router is told it serves all widen from this one
-# list — so telling the router about a queue, granting it, and granting the node
-# are one operation rather than three an operator can half-do. The half-done shape
-# is what issue #66 was: a queue granted by hand but never named to the router
-# had its warnings DROPPED while the grant propagated, because the router could
-# not prove the queue was its own.
+# grant and the set of names the router is told it serves all derive from this
+# one list — so telling the router about a queue, granting it, and granting the
+# node converge from one input rather than being three edits an operator makes
+# by hand, with the served set landing before the grants (spot.tf says why that
+# order is the safe one). The hand-made shape is what issue #66 was: a queue
+# granted but never named to the router had its warnings DROPPED while the grant
+# propagated, because the router could not prove the queue was its own.
 variable "spot_node_names" {
   description = "Further spot nodes beside the one enable_spot creates. One interruption queue is created per entry, named exactly it (billet requires the queue basename to equal the node's node.name), and the node grant, the router grant and the router's served set widen to every queue from this one input. Queue names are account-wide per region in SQS. Requires enable_spot."
   type        = list(string)

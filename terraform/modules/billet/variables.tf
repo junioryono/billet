@@ -223,9 +223,10 @@ variable "enable_spot" {
 }
 
 # SEVERAL SPOT NODES ARE SEVERAL QUEUES. Each name creates a queue named exactly
-# it, and fleet-ec2 widens the node grant, the router grant and the router's served
-# set from the same list, so no queue can be granted without being named to the
-# router or the other way round. THE CHILD'S EXACT RULES, duplicated on purpose:
+# it, and fleet-ec2 derives the node grant, the router grant and the router's
+# served set from the same list, so the three converge on every queue from one
+# input — the served set landing first, which is the safe order while a grant
+# propagates. THE CHILD'S EXACT RULES, duplicated on purpose:
 # this root and fleet-ec2 are two entry points, and a rule enforced at only one of
 # them is one that is not enforced.
 variable "spot_node_names" {

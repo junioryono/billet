@@ -450,10 +450,14 @@ class SpotRouterModuleWiringTest(unittest.TestCase):
     # dependency graph. The check is positional over fmt-formatted HCL — every
     # resource header starts a line at column 0, so the policy's block is the text
     # between its header and the next — rather than a parser, for the reason the
-    # test above gives. Within the block, all three HCL comment forms are removed,
-    # then all whitespace, then the trailing comma terraform fmt keeps in a
-    # multi-line list — so a commented-out edge in any form is absent and a list
-    # spread over several lines is still present.
+    # test above gives. Within the block, all three HCL comment forms are removed
+    # and then all whitespace, and the edge is a depends_on list that names the
+    # function anywhere in it — so a commented-out edge in any form is absent,
+    # and a list spread over several lines, carrying a second element or indexing
+    # the function is still present. What this cannot catch is an author who
+    # removes the edge and plants the same text in a string; it guards a removal,
+    # not a decoy, which is the limit of a text check and the reason a review
+    # reads the block too.
     def test_the_router_grant_waits_for_the_function_that_serves_the_set(self):
         with open(os.path.join(_HERE, "..", "spot.tf"), encoding="utf-8") as f:
             spot_tf = f.read()
@@ -465,11 +469,10 @@ class SpotRouterModuleWiringTest(unittest.TestCase):
         code = re.sub(r"/\*.*?\*/", "", block, flags=re.DOTALL)
         code = re.sub(r"(?m)(#|//).*$", "", code)
         code = re.sub(r"\s+", "", code)
-        code = code.replace(",]", "]")
 
-        self.assertIn(
-            "depends_on=[aws_lambda_function.spot_router]",
+        self.assertRegex(
             code,
+            r"depends_on=\[[^\]]*aws_lambda_function\.spot_router\b",
             "the router's policy no longer waits for the function: an apply may widen "
             "the grant to a new queue before the function serves its name, and the old "
             "function drops that queue's AccessDenied as foreign while the grant "
