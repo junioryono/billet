@@ -216,7 +216,14 @@ func TestARedeliveredAssignmentDoesNotStartASecondRunner(t *testing.T) {
 	stop := restarted.run(t)
 	defer stop()
 
-	// GitHub redelivers the whole exchange for the SAME request.
+	// THE FAKE REPLAYS THE WHOLE EXCHANGE DELIBERATELY, which is more than anyone
+	// has measured: what eight real runs on 2026-09-04 established is narrower,
+	// that a session abandoned while holding an unacknowledged JobAssigned handed
+	// that same message id to its successor, carrying the same assigned job on the
+	// run that compared identities (internal/integration's
+	// TestLiveSessionReplacement). Nothing has measured a JobAvailable replayed for
+	// a request already acquired, so this is the stronger case on purpose: it makes
+	// the redelivery harmless rather than making it happen.
 	restarted.plane.queue(fakeactions.StatisticsJSON(1, 0),
 		fakeactions.JobJSON("JobAvailable", lease.RequestID, "push", testTier))
 
