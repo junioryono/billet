@@ -55,9 +55,11 @@ variable "control_plane_private_ip" {
   type        = string
   default     = ""
 
+  # THE CHILD'S EXACT RULE, canonical rather than parseable: a leading-zero
+  # octet parses, passes containment, and misses the reserved-address check.
   validation {
-    condition     = var.control_plane_private_ip == "" || can(cidrnetmask("${var.control_plane_private_ip}/32"))
-    error_message = "control_plane_private_ip must be an IPv4 address (no prefix length), or empty to let AWS choose."
+    condition     = var.control_plane_private_ip == "" || try(cidrhost("${var.control_plane_private_ip}/32", 0), "") == var.control_plane_private_ip
+    error_message = "control_plane_private_ip must be a canonical IPv4 address (no prefix length, no leading zeros), or empty to let AWS choose."
   }
 }
 

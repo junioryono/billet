@@ -46,9 +46,16 @@ variable "private_ip" {
   type        = string
   default     = ""
 
+  # CANONICAL, NOT MERELY PARSEABLE. Terraform's CIDR functions accept a
+  # leading-zero octet (measured on 1.14: cidrnetmask("10.0.0.001/32") is
+  # fine) and normalise their own results, so "10.0.0.001" would pass the
+  # containment check and compare UNEQUAL to the canonical "10.0.0.1" the
+  # reserved-address check produces -- a reserved address admitted at plan.
+  # The same string is what an operator writes into server.listen and every
+  # server_addr, so the spelling is refused rather than rewritten.
   validation {
-    condition     = var.private_ip == "" || can(cidrnetmask("${var.private_ip}/32"))
-    error_message = "private_ip must be an IPv4 address (no prefix length), or empty to let AWS choose."
+    condition     = var.private_ip == "" || try(cidrhost("${var.private_ip}/32", 0), "") == var.private_ip
+    error_message = "private_ip must be a canonical IPv4 address (no prefix length, no leading zeros), or empty to let AWS choose."
   }
 }
 

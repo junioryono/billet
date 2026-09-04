@@ -911,3 +911,99 @@ run "composed_without_backups_needs_no_role_name" {
     error_message = "no backup bucket means no grant and no role to report"
   }
 }
+
+# A LEADING-ZERO OCTET IS REFUSED BY THE VARIABLE. Terraform's CIDR functions
+# accept "10.0.0.001" and normalise their own results, so without this rule
+# the value passes containment and compares unequal to the canonical
+# "10.0.0.1" the reserved-address check produces: a reserved address admitted
+# at plan (measured on 1.14).
+run "refuses_a_noncanonical_address" {
+  command = plan
+
+  module {
+    source = "./modules/control-plane-ec2-sqlite"
+  }
+
+  variables {
+    name              = "billet-test"
+    vpc_id            = "vpc-0f0f0f0f0f0f0f0f0"
+    subnet_id         = "subnet-0e0e0e0e0e0e0e0e0"
+    availability_zone = "us-east-1a"
+    vpc_cidr          = "10.0.0.0/16"
+    subnet_in_vpc_ok  = true
+    private_ip        = "10.0.0.001"
+    subnet_cidr       = "10.0.0.0/24"
+  }
+
+  expect_failures = [var.private_ip]
+}
+
+# THE NETWORK ADDRESS AND THE LAST OF THE FIRST FOUR, so the reserved list is
+# covered at both ends of its range and not only at the router.
+run "refuses_the_network_address" {
+  command = plan
+
+  module {
+    source = "./modules/control-plane-ec2-sqlite"
+  }
+
+  variables {
+    name              = "billet-test"
+    vpc_id            = "vpc-0f0f0f0f0f0f0f0f0"
+    subnet_id         = "subnet-0e0e0e0e0e0e0e0e0"
+    availability_zone = "us-east-1a"
+    vpc_cidr          = "10.0.0.0/16"
+    subnet_in_vpc_ok  = true
+    private_ip        = "10.0.0.0"
+    subnet_cidr       = "10.0.0.0/24"
+  }
+
+  expect_failures = [aws_instance.control_plane]
+}
+
+run "refuses_the_fourth_reserved_address" {
+  command = plan
+
+  module {
+    source = "./modules/control-plane-ec2-sqlite"
+  }
+
+  variables {
+    name              = "billet-test"
+    vpc_id            = "vpc-0f0f0f0f0f0f0f0f0"
+    subnet_id         = "subnet-0e0e0e0e0e0e0e0e0"
+    availability_zone = "us-east-1a"
+    vpc_cidr          = "10.0.0.0/16"
+    subnet_in_vpc_ok  = true
+    private_ip        = "10.0.0.3"
+    subnet_cidr       = "10.0.0.0/24"
+  }
+
+  expect_failures = [aws_instance.control_plane]
+}
+
+# ...and the first usable address is accepted, so the reserved list is not
+# wider than AWS's.
+run "accepts_the_first_usable_address" {
+  command = plan
+
+  module {
+    source = "./modules/control-plane-ec2-sqlite"
+  }
+
+  variables {
+    name              = "billet-test"
+    vpc_id            = "vpc-0f0f0f0f0f0f0f0f0"
+    subnet_id         = "subnet-0e0e0e0e0e0e0e0e0"
+    availability_zone = "us-east-1a"
+    vpc_cidr          = "10.0.0.0/16"
+    subnet_in_vpc_ok  = true
+    private_ip        = "10.0.0.4"
+    subnet_cidr       = "10.0.0.0/24"
+  }
+
+  assert {
+    condition     = aws_instance.control_plane.private_ip == "10.0.0.4"
+    error_message = "the first address AWS does not reserve must be accepted"
+  }
+}

@@ -17,4 +17,8 @@ if [ -z "$python" ] || [ ! -x "$python" ]; then
     python=$(command -v python3) || { echo "fetch-retry-check: no python3" >&2; exit 1; }
 fi
 
+# THE GATE IS EXECUTED AGAINST FIXTURES IT MUST REFUSE before it is trusted
+# with the real roles: a walk that stopped seeing a task shape would otherwise
+# pass in silence, which is the one failure this gate exists to prevent.
+"$python" "$here/fetch_retry_check.py" --self-test
 exec "$python" "$here/fetch_retry_check.py" "$collection"
