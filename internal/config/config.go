@@ -4579,12 +4579,42 @@ func AWSDNSSuffix(region string) string {
 	return "amazonaws.com"
 }
 
-// vpcEndpointLabelRe is the hostname shape a VPC endpoint's own labels must have in
-// front of `.sqs.<region>.vpce.<suffix>`: begins and ends alphanumeric, with letters,
-// digits, dots and hyphens between. It is registryMirrorOriginRe's host group, for
-// the same reason that one refuses a terminal root dot — a host that does not end
-// alphanumeric is not a second spelling of one that does.
-var vpcEndpointLabelRe = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$`)
+// vpcEndpointLabelRe is ONE DNS label of a lowercased host: alphanumeric at both
+// ends, hyphens allowed between, 63 characters at most.
+//
+// PER LABEL RATHER THAN OVER THE WHOLE PREFIX. The first version of this check was
+// registryMirrorOriginRe's whole-host shape, which pins only the first and last
+// character — so `a..b` (an empty label), `a.-b`, `a.---.b` and a 72-character label
+// all passed it. None of those is a name DNS can answer, which makes them the same
+// silent unreachable queue as the other partition's suffix. Lowercase only, because
+// the host has already been folded by the time this is asked.
+var vpcEndpointLabelRe = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
+
+// maxHostname is a DNS name's length in its textual form, the bound DNS itself
+// enforces. Checked because the label rule alone does not imply it: sixty valid
+// labels are sixty valid labels and still not a host anything can look up.
+const maxHostname = 253
+
+// vpcEndpointLabels reports whether prefix is a non-empty dotted run of DNS labels,
+// which is what has to sit in front of `.sqs.<region>.vpce.<suffix>`.
+//
+// The label itself is the operator's endpoint id and billet cannot know it, so this
+// asks only whether it could be a hostname. It deliberately does NOT require AWS's
+// `vpce-` spelling: that is a fact about somebody else's product, and unlike the DNS
+// suffixes there is no way to measure it without owning an endpoint.
+func vpcEndpointLabels(prefix string) bool {
+	if prefix == "" {
+		return false
+	}
+
+	for label := range strings.SplitSeq(prefix, ".") {
+		if !vpcEndpointLabelRe.MatchString(label) {
+			return false
+		}
+	}
+
+	return true
+}
 
 // CheckSQSQueueURL refuses a warning queue that cannot be signed safely.
 //
@@ -4629,13 +4659,10 @@ func CheckSQSQueueURL(raw, region string) error {
 	// THE VPC-ENDPOINT FORM STILL HAS TO BE A HOSTNAME. A bare suffix match accepts
 	// `.sqs.<region>.vpce.<suffix>` with no endpoint label at all, and `..sqs.` and
 	// `a_b!.sqs.` with labels that are not ones — each an address DNS cannot resolve,
-	// reaching a node as the same silence a wrong partition does. What is checked is
-	// the SHAPE of a hostname, the one registryMirrorOriginRe already settled on for
-	// the same question, and not AWS's `vpce-` naming: the endpoint's own label is a
-	// fact about somebody else's product that billet has no way to measure here.
+	// reaching a node as the same silence a wrong partition does.
 	var private bool
 	if prefix, ok := strings.CutSuffix(host, ".sqs."+region+".vpce."+suffix); ok {
-		private = vpcEndpointLabelRe.MatchString(prefix)
+		private = len(host) <= maxHostname && vpcEndpointLabels(prefix)
 	}
 
 	if !standard && !private {

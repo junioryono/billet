@@ -869,54 +869,133 @@ func TestTheDNSSuffixIsThePartitionsOwn(t *testing.T) {
 	}
 }
 
-// A VPC ENDPOINT'S HOST NEEDS THE ENDPOINT'S OWN LABEL, and a suffix match alone
-// does not ask for one.
+// vpceTail is the suffix a us-west-2 VPC endpoint's own labels sit in front of.
+const vpceTail = ".sqs.us-west-2.vpce.amazonaws.com"
+
+// vpceQueue is a queue URL whose endpoint labels are prefix.
+func vpceQueue(prefix string) string {
+	return "https://" + prefix + vpceTail + "/123456789012/aws-1"
+}
+
+// vpcePrefixFilling builds endpoint labels that make the whole HOST exactly n
+// characters, in valid 63-character labels, so the length boundary is exercised by a
+// name that is otherwise correct. It fails rather than returns a wrong length,
+// because a fixture that quietly built a 251-character host would leave the test
+// green while asserting nothing about the bound.
+func vpcePrefixFilling(t *testing.T, n int) string {
+	t.Helper()
+
+	want := n - len(vpceTail)
+	if want < 1 {
+		t.Fatalf("a %d-character host leaves no room for an endpoint label", n)
+	}
+
+	var b strings.Builder
+	for b.Len() < want {
+		if b.Len() > 0 {
+			b.WriteByte('.')
+		}
+
+		b.WriteString(strings.Repeat("a", min(want-b.Len(), 63)))
+	}
+
+	if got := b.Len() + len(vpceTail); got != n {
+		t.Fatalf("the fixture built a %d-character host, not %d", got, n)
+	}
+
+	return b.String()
+}
+
+// A VPC ENDPOINT'S HOST HAS TO BE A HOSTNAME, LABEL BY LABEL.
 //
-// The private form is matched by suffix because the label is the operator's endpoint
-// id, which billet cannot know. That accepted `.sqs.<region>.vpce.<suffix>` with no
-// label at all, and `..sqs.` and `a_b!.sqs.` with labels that are not hostnames —
-// none of which DNS can resolve, so each reaches a node as exactly the silence a
-// wrong partition produces: no interruption warning, no error, a lease charged until
-// it expires.
+// The private form is matched by SUFFIX, because the labels in front are the
+// operator's endpoint id and billet cannot know them. A bare suffix match asks for
+// nothing at all in front of it, and a whole-prefix shape — the first version of this
+// check — pins only the first and last character. So `.sqs...` with no label,
+// `a_b!.sqs...`, `a..b` with an empty inner label, `a.-b`, and a 64-character label
+// all loaded, and not one of them is a name DNS can answer.
 //
-// WHAT IS ASSERTED IS THE SHAPE OF A HOSTNAME, not AWS's `vpce-` naming. A label
-// billet cannot measure is not one it should legislate, so `two.labels.sqs...` stays
-// accepted: it is a well-formed name inside AWS's own zone, and refusing it would be
-// this validator inventing a rule about somebody else's product.
+// THAT IS THE SAME FAILURE AS THE WRONG PARTITION, which is why it is here rather
+// than filed as tidiness: a queue URL billet accepts but a node cannot address costs
+// the two-minute interruption warning, and it costs it silently — no error anywhere,
+// the lease charged until it expires.
+//
+// WHAT IS NOT ASSERTED IS AWS'S `vpce-` SPELLING. The DNS suffixes were measured; the
+// endpoint's own label cannot be, without owning an endpoint. So a rule about it would
+// be a reading of the documentation, and several labels stay accepted: they are a
+// well-formed name inside AWS's own zone.
 func TestASpotQueueVPCEndpointNeedsItsOwnLabel(t *testing.T) {
 	t.Parallel()
 
-	const tail = ".sqs.us-west-2.vpce.amazonaws.com/123456789012/aws-1"
+	refused := map[string]string{
+		"no label at all":           "",
+		"an empty leading label":    ".",
+		"an empty inner label":      "a..b",
+		"an illegal character":      "a_b!",
+		"a trailing dot":            "vpce-0a1b.",
+		"a leading hyphen":          "-vpce",
+		"a trailing hyphen":         "vpce-",
+		"an inner leading hyphen":   "a.-b",
+		"an inner trailing hyphen":  "a-.b",
+		"an all-hyphen inner label": "a.---.b",
+		"a label of sixty-four":     strings.Repeat("a", 64),
+	}
 
-	for name, host := range map[string]string{
-		"no label at all":  "https://" + tail,
-		"an empty label":   "https://." + tail,
-		"an illegal label": "https://a_b!" + tail,
-		"a trailing dot":   "https://vpce-0a1b." + tail,
-	} {
+	for name, prefix := range refused {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			got := loadErr(t, spotConfig(t, "us-west-2", host))
+			got := loadErr(t, spotConfig(t, "us-west-2", vpceQueue(prefix)))
 
 			if !strings.Contains(got, "hostname label") {
-				t.Errorf("the error does not say the endpoint's own label is missing: %s", got)
+				t.Errorf("the error does not say the endpoint's own label is the problem: %s", got)
 			}
 		})
 	}
 
-	// ACCEPTED, and both are the reason the rule is a shape: one label is what AWS
-	// hands out, and several are still a hostname under the same zone.
-	for name, host := range map[string]string{
-		"one label":    "https://vpce-0a1b-2c3d" + tail,
-		"more of them": "https://vpce-0a1b.zonal.us-west-2a" + tail,
-	} {
+	accepted := map[string]string{
+		"one character":          "a",
+		"all digits":             "123",
+		"what aws hands out":     "vpce-0a1b2c3d4e5f6g7h8-abcdefgh",
+		"a zonal name":           "vpce-0a1b2c3d4e5f6g7h8-abcdefgh-us-west-2a",
+		"a punycode label":       "xn--k3h",
+		"a label of sixty-three": strings.Repeat("a", 63),
+	}
+
+	for name, prefix := range accepted {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			if _, err := Load(writeConfig(t, spotConfig(t, "us-west-2", host))); err != nil {
+			if _, err := Load(writeConfig(t, spotConfig(t, "us-west-2", vpceQueue(prefix)))); err != nil {
 				t.Fatalf("a well-formed VPC endpoint host was refused: %v", err)
 			}
 		})
 	}
+}
+
+// AND THE WHOLE HOST HAS A LENGTH, which the per-label rule does not imply: sixty
+// valid labels are sixty valid labels and still not a name anything can look up. Both
+// sides of the boundary, because a bound asserted only from the refusing side is
+// satisfied by a check that refuses everything.
+func TestASpotQueueVPCEndpointHostIsBoundedInLength(t *testing.T) {
+	t.Parallel()
+
+	t.Run("exactly 253", func(t *testing.T) {
+		t.Parallel()
+
+		body := spotConfig(t, "us-west-2", vpceQueue(vpcePrefixFilling(t, 253)))
+		if _, err := Load(writeConfig(t, body)); err != nil {
+			t.Fatalf("a 253-character host is the longest DNS name there is, and it was refused: %v", err)
+		}
+	})
+
+	t.Run("one over", func(t *testing.T) {
+		t.Parallel()
+
+		got := loadErr(t, spotConfig(t, "us-west-2", vpceQueue(vpcePrefixFilling(t, 254))))
+
+		if !strings.Contains(got, "hostname label") {
+			t.Errorf("the error does not name the endpoint host as the problem: %s", got)
+		}
+	})
 }
