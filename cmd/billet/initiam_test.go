@@ -656,6 +656,15 @@ node:
 	if err == nil {
 		t.Fatalf("init iam rendered a policy for a queue host that does not exist:\n%s", out)
 	}
+
+	// AND NOTHING WAS PRINTED, which is the half a returned error does not cover.
+	// This command's output is a policy an operator pastes into IAM, so a refusal
+	// that had already written one hands them a grant for a queue billet has just
+	// said it will not use — and the error alone would still be there to read.
+	if strings.TrimSpace(out) != "" {
+		t.Errorf("the refusal still printed a policy an operator would apply:\n%s", out)
+	}
+
 	if !strings.Contains(err.Error(), "sqs.cn-north-1.amazonaws.com.cn,") {
 		t.Errorf("the refusal does not name the host cn-north-1's partition serves: %v", err)
 	}
