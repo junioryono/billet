@@ -43,6 +43,7 @@ A deployment is named by a 32-hex identity (`internal/deploymentid`, `deployment
 - A second flock on a separate descriptor in one process: refused (EWOULDBLOCK, darwin).
 - Retire guard: three narrower rules each let a wrong key through before the positive rule was written.
 - `pem.Decode` skips to the first BEGIN and returns a remainder; a second private key appended after a legitimate one parsed clean and was unlinked with the file.
+- A real rotation across two packaged nodes on twenty-minute leaves (2026-09-04): both renewed on the same sweep 808s after issue, 787s after the rotation, at the one-third boundary; `ca retire` without `--force` prints its confirmation and exits 0 having retired nothing, and rounds the rotation's age to the hour.
 - Onboarding status handling: `{404, 422}` left the kill switch open for a 414; "every 4xx" swallowed a valid code on 429; only 404 establishes a code is unusable.
 
 ## Where the tests are
