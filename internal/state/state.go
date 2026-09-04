@@ -137,6 +137,12 @@ type DB struct {
 	stateDir          string
 	maintenanceBypass bool
 
+	// runningRelease is the billet this handle was opened by, and recordsRelease
+	// whether this handle is one that records it: the control plane proper, at
+	// the moment it claims. See ClaimController.
+	runningRelease string
+	recordsRelease bool
+
 	// claimedEpoch is the controller generation this process claimed, or 0 for a
 	// handle that is not a controller — a migration, an operator command, the
 	// upgrade probe. It is what every write transaction is fenced against.
@@ -173,14 +179,15 @@ type DB struct {
 // database, and verifies that the durability pragmas actually took effect.
 //
 // The caller's context bounds startup only; it does not own the returned DB.
-func Open(ctx context.Context, stateDir string) (*DB, error) {
-	return openDir(ctx, stateDir, newSQLiteBackend(stateDir), openMode{})
+func Open(ctx context.Context, stateDir string, opts ...OpenOption) (*DB, error) {
+	return openDir(ctx, stateDir, newSQLiteBackend(stateDir), openMode{}.with(opts))
 }
 
 // OpenMaintenance opens the control-plane store for a quiescent upgrade probe.
 // It bypasses a host-upgrade fence without admitting operator or workload writes.
-func OpenMaintenance(ctx context.Context, stateDir string) (*DB, error) {
-	return openDir(ctx, stateDir, newSQLiteBackend(stateDir), openMode{maintenanceProbe: true})
+func OpenMaintenance(ctx context.Context, stateDir string, opts ...OpenOption) (*DB, error) {
+	return openDir(ctx, stateDir, newSQLiteBackend(stateDir),
+		openMode{maintenanceProbe: true}.with(opts))
 }
 
 // openMode is what kind of process is opening the ledger.
@@ -208,6 +215,32 @@ type openMode struct {
 	// operator commands work — which means the fence protects a FORMER leader and
 	// not a NEVER-leader. A standby's only protection is that Tx refuses it.
 	standby bool
+
+	// release is the billet opening the ledger, for the release watermark, or
+	// empty for a caller that named none and gets neither the check nor the
+	// record. See WithRunningRelease.
+	release string
+}
+
+// records reports whether a handle opened in this mode is the one that moves the
+// release watermark forward, which it does in ClaimController and never at open.
+//
+// THE CONTROL PLANE PROPER AND NOTHING ELSE. An operator command may be a newer
+// binary run from a laptop; a standby has not earned a write; the upgrade probe
+// proves a candidate can open what it inherited and leaves the recording to the
+// service that then serves it, so a rollback that never reaches that service has
+// nothing to undo.
+func (m openMode) records() bool {
+	return !m.admin && !m.maintenanceProbe && !m.standby
+}
+
+// with applies the caller's options to a mode.
+func (m openMode) with(opts []OpenOption) openMode {
+	for _, opt := range opts {
+		opt(&m)
+	}
+
+	return m
 }
 
 // openDir is the shared body of every entry point.
@@ -292,6 +325,8 @@ func openDir(
 		unlocked:          lock == nil,
 		stateDir:          stateDir,
 		maintenanceBypass: maintenanceBypass,
+		runningRelease:    mode.release,
+		recordsRelease:    mode.records(),
 		fencedCh:          make(chan struct{}),
 	}
 
@@ -370,6 +405,13 @@ func openDir(
 
 		db.revalidate.Store(true)
 
+		// A STANDBY IS REFUSED AS A DOWNGRADE TOO, and records nothing. What it
+		// would be promoted into is a ledger a newer release has served; that it
+		// waits rather than serves changes nothing about which binary is older.
+		if err := db.enforceReleaseWatermark(startupCtx, mode.release, false); err != nil {
+			return nil, errors.Join(err, db.Close())
+		}
+
 		return db, nil
 	}
 
@@ -392,11 +434,26 @@ func openDir(
 			return nil, errors.Join(err, db.Close())
 		}
 
+		if err := db.enforceReleaseWatermark(startupCtx, mode.release, false); err != nil {
+			return nil, errors.Join(err, db.Close())
+		}
+
 		return db, nil
 	}
 
 	if err := db.migrate(startupCtx); err != nil {
 		return nil, errors.Join(fmt.Errorf("migrate state db: %w", err), db.Close())
+	}
+
+	// AFTER THE MIGRATION, BECAUSE THE TABLE IT READS ARRIVED IN ONE. A proved
+	// downgrade is refused here whichever handle this is. A proved upgrade is
+	// recorded by nobody at open: the control plane proper records it in
+	// ClaimController, after the deployment binding has agreed these rows are
+	// its own. Recorded here, a newer binary pointed at another deployment's
+	// ledger would raise that ledger's mark on the way to being refused, and
+	// fence its real controller out of its own restart. See openMode.records.
+	if err := db.enforceReleaseWatermark(startupCtx, mode.release, false); err != nil {
+		return nil, errors.Join(err, db.Close())
 	}
 
 	// AND AN OPERATOR COMMAND GIVES THE EXCLUSION BACK THE MOMENT IT HAS FINISHED
@@ -519,13 +576,19 @@ func (db *DB) Tx(ctx context.Context, fn func(*sql.Tx) error) error {
 	// controller exclusion. The check at open time is only true of the control
 	// plane that was running then; this one is true of the schema this
 	// transaction is actually writing against, because BEGIN IMMEDIATE already
-	// holds the write lock a migration would need.
+	// holds the write lock a migration would need. The release watermark is
+	// re-read for the same reason: a newer control plane can have claimed and
+	// recorded since this handle opened, and two releases that share a schema
+	// would pass the schema check alone.
 	if db.revalidate.Load() {
 		if err := db.checkMaintenance(); err != nil {
 			return err
 		}
 		if err := verifySchemaIn(ctx, db.backend, tx); err != nil {
 			return db.asCancellation(ctx, err)
+		}
+		if err := db.checkReleaseWatermarkIn(ctx, tx); err != nil {
+			return err
 		}
 	}
 

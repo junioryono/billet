@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  billet host upgrade, from the recorded rollout, for a Mac.
+
+  INSTALLED BY `billet local up`, because on a Mac that command is the converge:
+  there is no package to enable a timer and no Ansible role to render one.
+
+  THE ANALOGUE OF billet-upgrade.timer. Every five minutes it runs the host
+  upgrade in its from-rollout mode, which reads the rollout this deployment's
+  ledger records and, if it names a release this machine is not running, runs
+  the host transaction: the node agent is booted out and drains for as long as
+  its jobs take, the server agent stops, the ledger is snapshotted and the
+  candidate installed, migrated and probed, and both agents are bootstrapped
+  again, or everything is put back. With no ledger on this Mac, no rollout, or
+  `release: {automatic: false}` in billet.yaml it exits saying so.
+
+  A LAUNCH AGENT, LIKE THE SERVICES IT UPGRADES, and running as the same
+  account: the binary it replaces is /usr/local/bin/billet, which that account
+  must own the directory of (see docs/deploying/mac-tart.md), and the agents it
+  boots out and back in live in that account's GUI domain.
+
+  NOT KEPT ALIVE, because this is a oneshot; StartInterval is the schedule.
+  RunAtLoad runs it once at login, so a Mac that was off while a rollout was
+  recorded takes it up once it is back.
+
+    launchctl bootout gui/$(id -u)/sh.billet.upgrade
+
+  is how a Mac opts out of acting on rollouts until the next `billet local up`;
+  `release: {automatic: false}` is how a deployment stops starting them.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>sh.billet.upgrade</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/billet</string>
+        <string>host-upgrade</string>
+        <string>--from-rollout</string>
+        <string>--config</string>
+        <string>/usr/local/etc/billet/billet.yaml</string>
+    </array>
+
+    <!-- The same PATH the node agent carries, for the same reason: the candidate's
+         probe resolves tart and softnet out of it, and launchd's default has
+         neither Homebrew prefix. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StartInterval</key>
+    <integer>300</integer>
+
+    <!-- THE DRAIN IS THE BOUND, AND IT IS UNBOUNDED. launchd's default
+         ExitTimeOut is five seconds (measured); a transaction that has booted
+         out the node and is waiting for its jobs must not be killed under it.
+         Sized like the service agents: the largest drain billet accepts, plus
+         teardown, plus margin. Never zero, which launchd reads as infinity. -->
+    <key>ExitTimeOut</key>
+    <integer>88200</integer>
+
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <key>StandardOutPath</key>
+    <string>/usr/local/var/log/billet/upgrade.log</string>
+    <key>StandardErrorPath</key>
+    <string>/usr/local/var/log/billet/upgrade.log</string>
+</dict>
+</plist>

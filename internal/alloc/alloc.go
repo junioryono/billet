@@ -28,6 +28,7 @@ import (
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/state/ledgerdb"
+	"github.com/junioryono/billet/internal/version"
 )
 
 // querier is state.Querier under a local name.
@@ -2250,8 +2251,20 @@ func (a *Allocator) RegisterNode(ctx context.Context, reg NodeRegistration) (int
 		// A HOST THAT COMES BACK IS A MEMBER AGAIN, and the statement is what says
 		// so: it clears the decommission and the drained flag as part of the same
 		// upsert that bumps the epoch. See internal/state/queries/nodes.sql.
+		// THE HIGHEST RELEASE NEVER GOES DOWN, and it is read here, inside the
+		// same transaction, so the comparison and the write are one decision. A
+		// host coming back on an older release keeps the newer mark; a report can
+		// then say so. Only a release tag is ever kept: a development build names
+		// nothing that can be ordered, and storing it would make every later
+		// comparison "could not tell" for as long as the row lives.
+		highest, err := highestRelease(ctx, q, name, reg.Release)
+		if err != nil {
+			return err
+		}
+
 		registered, err := q.UpsertNodeRegistration(ctx, ledgerdb.UpsertNodeRegistrationParams{
 			Name:           name,
+			HighestRelease: highest,
 			Provider:       string(kind),
 			Site:           reg.Site,
 			TotalVcpu:      int64(reg.VCPU),
@@ -2288,6 +2301,43 @@ func (a *Allocator) RegisterNode(ctx context.Context, reg NodeRegistration) (int
 	}
 
 	return epoch, nil
+}
+
+// highestRelease decides what a host's highest-release column holds after a
+// registration reporting `release`.
+//
+// THREE ANSWERS, NONE OF THEM A REFUSAL. The reported release is a tag newer than
+// the recorded one, or there is no recorded one: the reported release. It is a
+// tag that is older or equal: the recorded one stays. It is not a release tag at
+// all: the recorded one stays, because "(devel)" cannot be ordered against
+// anything and must not become the mark every later registration is measured
+// against.
+func highestRelease(ctx context.Context, q state.ReadOps, name, release string) (string, error) {
+	release = strings.TrimSpace(release)
+
+	recorded, err := q.ReadNodeHighestRelease(ctx, name)
+
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		recorded = ""
+	case err != nil:
+		return "", fmt.Errorf("alloc: read the highest release %s has registered with: %w",
+			name, err)
+	}
+
+	if !version.IsRelease(release) {
+		return recorded, nil
+	}
+
+	if recorded == "" {
+		return release, nil
+	}
+
+	if order, ok := version.Compare(release, recorded); ok && order > 0 {
+		return release, nil
+	}
+
+	return recorded, nil
 }
 
 // NodeGone records that the control plane has given up on a host.

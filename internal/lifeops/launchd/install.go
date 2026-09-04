@@ -349,6 +349,62 @@ func (c *Converger) diagnoseBootstrap(ctx context.Context, label, out string, co
 		"one that is still stopping, and one that is disabled", c.domain(), c.agentPath(label), said)
 }
 
+// EnableScheduled installs a oneshot agent, clears any disabled override, and
+// loads it so its schedule is live now rather than at the next login.
+//
+// NO PROOF, BECAUSE THERE IS NO PROCESS TO PROVE. StartAndProve's whole test is
+// that one pid survived a settle window, and a oneshot that ran at load and
+// exited is a success that test would call a crash. What is established instead
+// is that launchd holds the job: `print` answers for it afterwards.
+//
+// A LOADED JOB WITH A PROCESS IS LEFT ALONE. That process may be the upgrade
+// transaction itself, midway through draining the node; booting it out to load
+// a fresh copy of its own plist would kill the updater. A loaded job with no
+// process is booted out and loaded again, so what launchd holds is what the
+// plist on disk says — launchd reads a plist once, at bootstrap. A plist that
+// differs from the one this build ships is refused by Enable before any of
+// that, as the service agents' are: a changed schedule wants a person to move
+// the old file aside, and `up` says so.
+func (c *Converger) EnableScheduled(ctx context.Context, label string) error {
+	if err := c.Enable(ctx, label); err != nil {
+		return err
+	}
+
+	job, loaded, err := c.job(ctx, label)
+	if err != nil {
+		return err
+	}
+
+	if loaded {
+		if job.Running() {
+			return nil
+		}
+
+		if _, code, err := c.run(ctx, []string{"bootout", c.target(label)}); err != nil {
+			return err
+		} else if code != 0 && code != nothingToBoot {
+			return fmt.Errorf("launchd: `launchctl bootout %s` exited %d", c.target(label), code)
+		}
+	}
+
+	out, code, err := c.run(ctx, []string{"bootstrap", c.domain(), c.agentPath(label)})
+	if err != nil {
+		return err
+	}
+
+	if code != 0 {
+		return c.diagnoseBootstrap(ctx, label, out, code)
+	}
+
+	if _, loaded, err := c.job(ctx, label); err != nil {
+		return err
+	} else if !loaded {
+		return fmt.Errorf("launchd: %s was bootstrapped and launchd does not hold it", label)
+	}
+
+	return nil
+}
+
 // Uninstall removes a label's agent and leaves nothing behind that would stop a
 // later install.
 //

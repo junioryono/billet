@@ -1,0 +1,64 @@
+# One look at the rollout this deployment's ledger records, and the host
+# transaction if it names a release this machine is not running.
+#
+# THE ROOT EXECUTOR THE CONTROL PLANE CANNOT BE. A rollout is server-first: no
+# node is told to move until the control plane runs the target, and a process
+# cannot install its own successor. billet-server runs as `billet` with an empty
+# capability set, so it cannot stop itself, replace /usr/bin/billet or start the
+# result either. This unit is what can. It acts ONLY on a decision the ledger
+# already holds — `billet rollout start`, or the control plane's own automatic
+# start when the channel advances — and never on the channel itself, so a
+# machine whose operator started nothing and whose config says
+# `release: {automatic: false}` is left exactly as it is.
+#
+# ENABLED BY THE PACKAGE, AND THAT IS THE ONE EXCEPTION TO "THE PACKAGE ENABLES
+# NOTHING". That rule exists so installing billet cannot connect a machine to
+# GitHub before /etc/billet/billet.yaml says something true. This timer connects
+# nothing: with no ledger, no rollout, or `automatic: false` it exits saying so.
+# What it does is make an unattended deployment able to take the upgrade it
+# decided on, which is the whole promise of automatic updates. Turn it off with
+#
+#   systemctl disable --now billet-upgrade.timer
+#
+# WHAT HAPPENS WHEN IT ACTS is `billet host-upgrade`: the node drains for as long
+# as its jobs take, the server stops, the ledger is fenced and snapshotted, the
+# candidate is installed, migrated and probed, and the services come back — or
+# everything is put back and the host reports a rollback. None of that is bounded
+# by this unit; a oneshot that outlives its timer is the ordinary case here.
+[Unit]
+Description=billet host upgrade, from the recorded rollout
+Documentation=https://billet.readthedocs.io/en/latest/operating/upgrades.html
+After=network-online.target billet-server.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+
+# ROOT, BECAUSE THE TRANSACTION IS. It stops and starts billet-server and
+# billet-node through systemd, replaces /usr/bin/billet, writes the maintenance
+# fence in the server's state directory and its journal under
+# /var/lib/billet/upgrades. No sandbox directive here can be reconciled with
+# talking to systemd and replacing a binary, and one that could would be a
+# transaction that half-runs.
+User=root
+Group=root
+UMask=0077
+
+# THE LEDGER'S ENVIRONMENT, for a PostgreSQL controller: `dsn_env` names a
+# variable, the role writes it to this file, and the updater has to read the
+# rollout through the same connection the server uses. With the leading `-`, so
+# a SQLite host, where the file does not exist, starts rather than failing.
+EnvironmentFile=-/etc/billet/server.env
+
+ExecStart=/usr/bin/billet host-upgrade --from-rollout --config /etc/billet/billet.yaml
+
+# THE DRAIN IS THE BOUND, AND IT IS UNBOUNDED. A job may run for days; the
+# updater waits for it, and this unit must not kill the updater underneath it.
+# Sized the way the service units' TimeoutStopSec is: the largest drain billet
+# accepts, plus teardown, plus margin. Zero would be infinity and is refused for
+# the same reason it is on the launch agents.
+TimeoutStartSec=88200
+
+# A REFUSED OR FAILED RUN IS A FAILED UNIT, visible in `systemctl status` and
+# `journalctl -u billet-upgrade`, and the timer fires again. "Nothing to do" is
+# a clean exit, so a healthy host shows a clean unit.

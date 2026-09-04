@@ -8,6 +8,7 @@ import (
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/state"
+	"github.com/junioryono/billet/internal/version"
 )
 
 // THE ONE PLACE THAT TURNS A CONFIG INTO AN OPEN LEDGER.
@@ -28,10 +29,11 @@ func openState(ctx context.Context, cfg *config.Config) (*state.DB, error) {
 	}
 
 	if cfg.Server.LedgerBackend() == config.StatePostgres {
-		return state.OpenPostgres(ctx, cfg.Server.IdentityDir, dsn)
+		return state.OpenPostgres(ctx, cfg.Server.IdentityDir, dsn,
+			state.WithRunningRelease(version.Version()))
 	}
 
-	return state.Open(ctx, cfg.Server.IdentityDir)
+	return state.Open(ctx, cfg.Server.IdentityDir, state.WithRunningRelease(version.Version()))
 }
 
 // openStateStandby opens the ledger for a control plane that is WAITING to
@@ -54,7 +56,66 @@ func openStateStandby(ctx context.Context, cfg *config.Config) (*state.DB, error
 			config.ControllersActivePassive, cfg.Server.LedgerBackend())
 	}
 
-	return state.OpenPostgresStandby(ctx, cfg.Server.IdentityDir, dsn)
+	return state.OpenPostgresStandby(ctx, cfg.Server.IdentityDir, dsn,
+		state.WithRunningRelease(version.Version()))
+}
+
+// errNoLedgerYet means the state directory holds no ledger to read a decision
+// from, which on a host the package just installed is the ordinary state.
+var errNoLedgerYet = errors.New("no ledger here yet")
+
+// openStateForDecision opens the ledger for the one read that must not be
+// refused by the release watermark: the host's own instruction.
+//
+// NAMES NO RELEASE, ON PURPOSE, AND THIS IS THE ONLY OPEN THAT MAY. Every other
+// open in this file names the running binary so a proved older one is refused;
+// this one exists because `host-upgrade --from-rollout` on a standby is that
+// older binary, reading what it should become from a ledger whose leader has
+// already recorded the newer release. It is an operator handle otherwise: it
+// verifies the schema is one this binary knows, verifies the deployment
+// identity, and the caller reads and closes. The structural test on this file
+// exempts it by name.
+//
+// AND IT CREATES NOTHING. The package enables the timer that runs this on every
+// host, including one whose server has never run, and an operator open of an
+// empty state directory would mint a root-owned ledger there five minutes after
+// the install, which the service account then cannot open. A directory with no
+// ledger is nothing to decide about. What it still does, like every operator
+// open, is migrate an unheld ledger that is behind this binary; that is the
+// same act `billet rollout status` performs on such a host.
+func openStateForDecision(ctx context.Context, cfg *config.Config) (*state.DB, error) {
+	dsn, err := ledgerDSN(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	if cfg.Server.LedgerBackend() != config.StatePostgres {
+		if _, err := os.Lstat(state.LedgerPath(cfg.Server.IdentityDir)); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil, fmt.Errorf("%w: %s", errNoLedgerYet, cfg.Server.IdentityDir)
+			}
+
+			return nil, fmt.Errorf("look for the ledger: %w", err)
+		}
+	}
+
+	var db *state.DB
+
+	if cfg.Server.LedgerBackend() == config.StatePostgres {
+		db, err = state.OpenPostgresAdmin(ctx, cfg.Server.IdentityDir, dsn)
+	} else {
+		db, err = state.OpenAdmin(ctx, cfg.Server.IdentityDir)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	if err := verifyLedgerIdentity(ctx, cfg, db); err != nil {
+		return nil, errors.Join(err, db.Close())
+	}
+
+	return db, nil
 }
 
 // openStateAdmin opens the ledger for a ONE-SHOT OPERATOR COMMAND: it proceeds
@@ -69,9 +130,11 @@ func openStateAdmin(ctx context.Context, cfg *config.Config) (*state.DB, error) 
 	var db *state.DB
 
 	if cfg.Server.LedgerBackend() == config.StatePostgres {
-		db, err = state.OpenPostgresAdmin(ctx, cfg.Server.IdentityDir, dsn)
+		db, err = state.OpenPostgresAdmin(ctx, cfg.Server.IdentityDir, dsn,
+			state.WithRunningRelease(version.Version()))
 	} else {
-		db, err = state.OpenAdmin(ctx, cfg.Server.IdentityDir)
+		db, err = state.OpenAdmin(ctx, cfg.Server.IdentityDir,
+			state.WithRunningRelease(version.Version()))
 	}
 
 	if err != nil {
@@ -115,20 +178,22 @@ func verifyLedgerIdentity(ctx context.Context, cfg *config.Config, db *state.DB)
 // crosses a host-upgrade fence without admitting operator or workload writes.
 func openStateMaintenance(ctx context.Context, cfg *config.Config) (*state.DB, error) {
 	if cfg.Server.LedgerBackend() == config.StatePostgres {
-		// THE FENCE IS A FILE IN THE IDENTITY DIRECTORY, so it applies here too —
-		// what does not yet apply is the rest of the transactional host upgrade,
-		// which stops a service, snapshots a ledger and puts it back. None of
-		// that is written for an external ledger, and a probe that crossed the
-		// fence as though it were would be the one thing standing between a
-		// half-finished upgrade and a live deployment.
-		return nil, fmt.Errorf(
-			"the transactional host upgrade is not implemented for a %s ledger; it snapshots "+
-				"and restores the state directory, and an external ledger is your database's "+
-				"own backup. Upgrade this controller with the service stopped",
-			config.StatePostgres)
+		// A PROBE, NOT A MAINTENANCE HANDLE. billet copies no PostgreSQL ledger,
+		// so the transaction there fences, snapshots and migrates nothing; what
+		// the candidate proves is that it could serve what it inherits, which is
+		// the standby's question. The handle it gets can write nothing and claim
+		// nothing, and the migration waits for the candidate's own claim.
+		dsn, err := ledgerDSN(cfg)
+		if err != nil {
+			return nil, err
+		}
+
+		return state.OpenPostgresProbe(ctx, cfg.Server.IdentityDir, dsn,
+			state.WithRunningRelease(version.Version()))
 	}
 
-	return state.OpenMaintenance(ctx, cfg.Server.IdentityDir)
+	return state.OpenMaintenance(ctx, cfg.Server.IdentityDir,
+		state.WithRunningRelease(version.Version()))
 }
 
 // ledgerDSN reads the connection string out of the environment.

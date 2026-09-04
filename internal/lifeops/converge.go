@@ -118,6 +118,11 @@ type UpRequest struct {
 	// the roles its configuration defines, not a fixed pair.
 	WantServer bool
 	WantNode   bool
+	// BinaryDir is the directory the services' executable lives in, which the
+	// updater the services start has to be able to rename into. Only a manager
+	// whose services run as an unprivileged account checks it; empty means no
+	// such check.
+	BinaryDir string
 }
 
 // unitSpec is what a unit MUST be before `up` will act on it. Every field is a

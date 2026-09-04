@@ -149,6 +149,11 @@ func runLocalUp(ctx context.Context, o upOptions) error {
 		NodeLockDir:    nodeLockDir(cfg),
 		WantServer:     cfg.Server != nil,
 		WantNode:       cfg.Node != nil,
+		// WHERE THE UPDATER WILL RENAME INTO. On a Mac the updater runs as this
+		// account and /usr/local/bin is root-owned until the setup's chown; the
+		// launchd planner refuses with that command rather than letting the first
+		// rollout drain the node and then fail to land.
+		BinaryDir: hostPathsFor(hostOS).binaryDir(),
 	}
 	if cfg.GitHub != nil {
 		req.KeyPath = cfg.GitHub.PrivateKeyPath
@@ -261,26 +266,82 @@ func runLocalUp(ctx context.Context, o upOptions) error {
 		return err
 	}
 
+	// THE SCHEDULES, AFTER THE SERVICES ARE UP AND PROVED. On systemd the timers
+	// the package enables are enabled and armed again here, reported rather than
+	// fatal, because a host set up from a tarball ran no postinstall. On a Mac
+	// this command is the converge — there is no package to enable a timer — so
+	// the two oneshot agents that act on rollouts and refresh images are
+	// installed here, and a schedule that could not be installed is an exit
+	// status, because a Mac that never updates is what it would otherwise be.
 	enableTimers(ctx, c, cfg, req)
+
+	if err := enableScheduledAgents(ctx, c); err != nil {
+		return err
+	}
 
 	return clearShutdownSeal(ctx, cfg, req)
 }
 
-// enableTimers enables and starts the scheduled maintenance this host needs,
-// after its services are up and proved: the backup on a control-plane host,
-// the guest image refresh on a firecracker node.
+// scheduledInstaller is the manager that can install a oneshot agent and load
+// its schedule: launchd. systemd's timers are the package's.
+type scheduledInstaller interface {
+	Scheduled() (string, string)
+	EnableScheduled(ctx context.Context, label string) error
+}
+
+// enableScheduledAgents installs and loads the two oneshot agents, on a manager
+// that has them.
 //
-// WHY `up` DOES THIS AT ALL. The package enables nothing, and a deployment is
+// INSTALL AND ENABLE ONLY, NO START-AND-PROVE: a oneshot has no process to
+// prove, and launchd's proof of a service is a pid that survived a window. What
+// is established is that launchd holds the job on its schedule. A failure here
+// is reported as what it is — the services are up, the schedule is not — with
+// the same exit status a sealed deployment gets, because a script that brings a
+// host up and moves on would otherwise move on from a Mac that never updates.
+func enableScheduledAgents(ctx context.Context, c converger) error {
+	s, ok := c.(scheduledInstaller)
+	if !ok {
+		return nil
+	}
+
+	upgrade, images := s.Scheduled()
+
+	fmt.Println()
+
+	for _, label := range []string{upgrade, images} {
+		if err := s.EnableScheduled(ctx, label); err != nil {
+			fmt.Printf("schedule %s could not be installed: %v\n", label, err)
+
+			return &exitError{
+				code: 2,
+				msg: "the services are running but " + label + " could not be installed, so " +
+					"this Mac will not act on rollouts or refresh images until it is: " +
+					err.Error(),
+			}
+		}
+
+		fmt.Printf("schedule %s is installed and loaded\n", label)
+	}
+
+	return nil
+}
+
+// enableTimers enables and starts the scheduled maintenance this host needs,
+// after its services are up and proved: the backup and the updater on a
+// control-plane host, the guest image refresh on a firecracker node.
+//
+// WHY `up` DOES THIS AT ALL. The package enables no service, and a deployment is
 // four things that are useless apart, so a host installed from the package had
 // no backup until an operator enabled a unit the docs mentioned; the first
-// hardware failure on such a host lost the fleet's identity. The backup and the
-// refresh are both idempotent and both refuse to overwrite, so enabling them
-// blind is safe. REPORTED, NEVER FATAL: the services are running by now, and a
-// timer that could not be enabled is one line naming the command, not a reason
-// to unwind a control plane that is taking work.
+// hardware failure on such a host lost the fleet's identity. The package does
+// enable the two update timers, but a host converged from a tarball ran no
+// postinstall. All three are idempotent and refuse to overwrite, so enabling
+// them blind is safe. REPORTED, NEVER FATAL: the services are running by now,
+// and a timer that could not be enabled is one line naming the command, not a
+// reason to unwind a control plane that is taking work.
 //
-// SYSTEMD ONLY, by the manager's name: launchd has no timers, and a Mac node's
-// images are pulled by hand.
+// SYSTEMD ONLY, by the manager's name: launchd has no timers, and the Mac's
+// scheduled agents are enableScheduledAgents' job.
 func enableTimers(ctx context.Context, c converger, cfg *config.Config, req lifeops.UpRequest) {
 	if c.ManagerName() != "systemd" {
 		return
@@ -289,7 +350,7 @@ func enableTimers(ctx context.Context, c converger, cfg *config.Config, req life
 	var timers []string
 
 	if req.WantServer {
-		timers = append(timers, deploy.BackupTimerName)
+		timers = append(timers, deploy.BackupTimerName, deploy.UpgradeTimerName)
 	}
 
 	if cfg.Node != nil && cfg.Node.Provider == config.ProviderFirecracker && cfg.Node.Ceph != nil {

@@ -28,6 +28,14 @@ esac
 # while an unmanaged billet process kept running — holding leases, managing
 # containers, and answering to nothing.
 if [ -d /run/systemd/system ]; then
+    # THE TIMERS GO FIRST, so nothing schedules an upgrade or an image refresh
+    # into the middle of the removal. Disabled as well as stopped: postinstall
+    # enabled them, and a removal that left the enablement behind would have the
+    # next install's daemon-reload find a timer pointing at a unit that is gone.
+    for timer in billet-upgrade.timer billet-images-refresh.timer; do
+        systemctl disable --now "${timer}" >/dev/null 2>&1 || true
+    done
+
     for unit in billet-node billet-server; do
         if systemctl is-active --quiet "${unit}" 2>/dev/null; then
             if ! systemctl stop "${unit}"; then

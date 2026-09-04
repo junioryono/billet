@@ -135,6 +135,32 @@ type Journal struct {
 	RolloutID  string `json:"rollout_id,omitempty"`
 	Generation int64  `json:"generation,omitempty"`
 
+	// SettlesThrough is the newest fleet decision that had completed when an
+	// operator's own run began, so the host settles on it at the commit and a
+	// timer does not move the host back to a rollout the person knew about.
+	// Zero for a run that serves a rollout, whose own Generation is settled on.
+	SettlesThrough int64 `json:"settles_through,omitempty"`
+
+	// AllowDowngrade records that a person asked for a release older than the
+	// one this ledger has been served by, and that the transaction may lower the
+	// ledger's release watermark to admit it.
+	//
+	// ON THE JOURNAL BECAUSE A RESUME HAS TO KNOW. The mark is lowered inside the
+	// migrate step, and a resumed run that had forgotten the permission would
+	// have the candidate refused by a ledger this same transaction had already
+	// snapshotted and was about to hand it.
+	AllowDowngrade bool `json:"allow_downgrade,omitempty"`
+
+	// Ledger says where this host's ledger lives: empty for the SQLite file in
+	// the state directory, LedgerExternal for a database billet does not hold.
+	//
+	// ON THE JOURNAL BECAUSE IT DECIDES WHICH STEPS EXIST. An external ledger is
+	// neither fenced, snapshotted nor migrated by the updater — billet copies no
+	// PostgreSQL database, and the candidate migrates when it takes the
+	// controller claim — and a resumed run has to skip the same steps the
+	// interrupted one did, or it would try to restore a snapshot nothing took.
+	Ledger string `json:"ledger,omitempty"`
+
 	// PID is the process that claimed this transaction.
 	//
 	// A NAME FOR THE HOLDER, NOT A HANDLE ON IT. The transaction lock already says
@@ -152,6 +178,14 @@ type Journal struct {
 	// Failure is why this upgrade stopped, when it did.
 	Failure string `json:"failure,omitempty"`
 }
+
+// LedgerExternal marks a journal for a host whose ledger is a database billet
+// does not hold.
+const LedgerExternal = "external"
+
+// ExternalLedger reports whether this transaction has no ledger file to fence,
+// snapshot or migrate.
+func (j *Journal) ExternalLedger() bool { return j.Ledger == LedgerExternal }
 
 // JournalName is the file inside the recovery directory.
 const JournalName = "journal.json"

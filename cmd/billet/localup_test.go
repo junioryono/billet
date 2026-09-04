@@ -606,6 +606,8 @@ func TestUpFollowsTheOrderItsSafetyDependsOn(t *testing.T) {
 		// the docs, and its first hardware failure lost the fleet's identity.
 		"enable " + deploy.BackupTimerName,
 		"start-timer " + deploy.BackupTimerName,
+		"enable " + deploy.UpgradeTimerName,
+		"start-timer " + deploy.UpgradeTimerName,
 	}
 	if strings.Join(f.trace, " → ") != strings.Join(want, " → ") {
 		t.Errorf("up did:\n  %s\nwant:\n  %s",
@@ -1668,8 +1670,8 @@ func TestUpPrintsTheBackendsOwnProof(t *testing.T) {
 }
 
 // A FIRECRACKER NODE GETS THE IMAGE REFRESH TIMER, a control-plane host the
-// backup timer, and a host that is both gets both, each enabled and then armed
-// after every service is proved. A manager that is not systemd gets neither:
+// backup and upgrade timers, and a host that is both gets all three, each
+// enabled and then armed after every service is proved. A manager that is not systemd gets neither:
 // launchd has no timers, and pretending would report maintenance nothing runs.
 func TestUpArmsTheTimersEachHostNeeds(t *testing.T) {
 	asLinux(t)
@@ -1684,6 +1686,7 @@ func TestUpArmsTheTimersEachHostNeeds(t *testing.T) {
 	trace := strings.Join(f.trace, " → ")
 	for _, want := range []string{
 		"enable " + deploy.BackupTimerName + " → start-timer " + deploy.BackupTimerName,
+		"enable " + deploy.UpgradeTimerName + " → start-timer " + deploy.UpgradeTimerName,
 		"enable " + deploy.ImagesRefreshTimerName + " → start-timer " + deploy.ImagesRefreshTimerName,
 	} {
 		if !strings.Contains(trace, want) {

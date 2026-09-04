@@ -2,151 +2,237 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/x509"
-	"encoding/pem"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/imagesource"
 	"github.com/junioryono/billet/internal/store/ceph"
 )
 
-type fakeDater struct {
-	newest map[string]time.Time
-	err    error
+// fakeRefreshStore answers with one newest generation, or none.
+type fakeRefreshStore struct {
+	newest ceph.Generation
+	found  bool
 }
 
-func (f fakeDater) NewestGeneration(_ context.Context, image string) (ceph.Generation, bool, error) {
-	if f.err != nil {
-		return ceph.Generation{}, false, f.err
-	}
-	built, ok := f.newest[image]
-	if !ok {
-		return ceph.Generation{}, false, nil
-	}
-	return ceph.Generation{Name: image + "-gen", Built: built}, true, nil
+func (s fakeRefreshStore) NewestGeneration(context.Context, string) (ceph.Generation, bool, error) {
+	return s.newest, s.found, nil
 }
 
-// refreshHarness points `images refresh` at a fake cluster and counts the pulls.
-func refreshHarness(t *testing.T, dater fakeDater) (string, *[]string) {
+// refreshRun stages the seams a refresh runs through and records what it did.
+type refreshRun struct {
+	pulled  []string
+	reaped  []string
+	pullErr error
+}
+
+// firecrackerRefreshConfig writes a config for a firecracker node with one tier
+// naming one image, and returns its path.
+func firecrackerRefreshConfig(t *testing.T, automatic string) string {
 	t.Helper()
 
-	var pulled []string
-	prevOpen, prevPull := openGenerationDater, pullImage
-	openGenerationDater = func(*config.Config) (generationDater, error) { return dater, nil }
-	pullImage = func(_ context.Context, _, image string) error {
-		pulled = append(pulled, image)
-		return nil
-	}
-	t.Cleanup(func() { openGenerationDater, pullImage = prevOpen, prevPull })
+	body := strings.Replace(firecrackerNodeConfig, "node:", automatic+"node:", 1)
 
-	return refreshConfig(t), &pulled
-}
-
-func refreshConfig(t *testing.T) string {
-	t.Helper()
-
-	dir := t.TempDir()
-
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		t.Fatal(err)
-	}
-	keyPath := filepath.Join(dir, "app.pem")
-	if err := os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{
-		Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key),
-	}), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	path := filepath.Join(dir, "billet.yaml")
-	body := fmt.Sprintf(`server:
-  listen: 127.0.0.1:7717
-  state_dir: %s
-  max_vcpu: 8
-  max_memory: 32GiB
-github:
-  org: acme
-  app_id: 1
-  installation_id: 1
-  private_key_path: %s
-node:
-  name: epyc-1
-  server_addr: 127.0.0.1:7717
-  provider: firecracker
-  state_dir: %s
-  firecracker:
-    kernel_image: /var/lib/billet/vmlinux
-    bridge: br0
-  ceph:
-    image_pool: billet-images
-    cache_pool: billet-cache
-tiers:
-  - label: billet-4vcpu
-    provider: firecracker
-    vcpu: 4
-    memory: 16GiB
-    image: ubuntu-2404-x64@verified
-`, filepath.Join(dir, "server"), keyPath, filepath.Join(dir, "node"))
-
+	path := filepath.Join(t.TempDir(), "billet.yaml")
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
-		t.Fatal(err)
+		t.Fatalf("write config: %v", err)
 	}
 
 	return path
 }
 
-// A generation inside the cadence is left alone; one older than it is pulled
-// through the same `images pull --verify` an operator runs.
-func TestRefreshPullsOnlyWhatIsDue(t *testing.T) {
-	cfg, pulled := refreshHarness(t, fakeDater{newest: map[string]time.Time{
-		"ubuntu-2404-x64": time.Now().Add(-8 * 24 * time.Hour),
-	}})
+// firecrackerNodeConfig is the smallest firecracker node config the refresh
+// accepts: a loopback control plane beside it, one tier naming @verified.
+const firecrackerNodeConfig = `
+server:
+  listen: 127.0.0.1:7717
+  state_dir: /var/lib/billet/server
+  max_vcpu: 8
+  max_memory: 32GiB
+github:
+  org: acme
+  app_id: 1
+  installation_id: 2
+  private_key_path: /etc/billet/app-private-key.pem
+node:
+  name: epyc-1
+  server_addr: 127.0.0.1:7717
+  provider: firecracker
+  state_dir: /var/lib/billet/node
+  firecracker:
+    kernel_image: /var/lib/billet/kernels/vmlinux
+    bridge: billet0
+  ceph:
+    image_pool: billet-images
+    cache_pool: billet-cache
+tiers:
+  - label: small
+    provider: firecracker
+    vcpu: 2
+    memory: 4GiB
+    image: ubuntu-2404-x64@verified
+`
 
-	if err := cmdImagesRefresh(t.Context(), []string{"--config", cfg}); err != nil {
+func stageRefresh(t *testing.T, store fakeRefreshStore, builtAt time.Time) *refreshRun {
+	t.Helper()
+
+	run := &refreshRun{}
+
+	restoreStore, restoreFetch, restorePull, restoreReap :=
+		openRefreshStore, fetchImageManifest, refreshPull, refreshReap
+
+	t.Cleanup(func() {
+		openRefreshStore, fetchImageManifest, refreshPull, refreshReap =
+			restoreStore, restoreFetch, restorePull, restoreReap
+	})
+
+	openRefreshStore = func(*config.Config) (refreshStore, error) { return store, nil }
+	fetchImageManifest = func(context.Context, *config.Config) (*imagesource.Manifest, error) {
+		return &imagesource.Manifest{BuiltAt: builtAt}, nil
+	}
+	refreshPull = func(_ context.Context, _, image string) error {
+		run.pulled = append(run.pulled, image)
+
+		return run.pullErr
+	}
+	refreshReap = func(_ context.Context, _, image string, keep int) error {
+		run.reaped = append(run.reaped, image)
+
+		if keep != 3 {
+			t.Errorf("reap asked to keep %d, want 3", keep)
+		}
+
+		return nil
+	}
+
+	return run
+}
+
+var (
+	channelBuilt = time.Date(2026, 9, 1, 4, 17, 0, 0, time.UTC)
+	older        = ceph.Generation{Name: "g20260825120000", Built: channelBuilt.Add(-7 * 24 * time.Hour)}
+	newer        = ceph.Generation{Name: "g20260902120000", Built: channelBuilt.Add(32 * time.Hour)}
+)
+
+// A GENERATION OLDER THAN THE CHANNEL'S BUILD IS REFRESHED, THEN REAPED. A
+// generation is named for the moment it was imported, which is after the build
+// it came from, so the comparison is the whole decision.
+func TestARefreshPullsWhenTheChannelIsNewerThanWhatIsImported(t *testing.T) {
+	run := stageRefresh(t, fakeRefreshStore{newest: older, found: true}, channelBuilt)
+
+	err := cmdImagesRefresh(t.Context(), []string{"--config", firecrackerRefreshConfig(t, "")})
+	if err != nil {
 		t.Fatalf("refresh: %v", err)
 	}
-	if len(*pulled) != 1 || (*pulled)[0] != "ubuntu-2404-x64" {
-		t.Fatalf("pulled %v, want the one stale image", *pulled)
+
+	if len(run.pulled) != 1 || run.pulled[0] != "ubuntu-2404-x64" {
+		t.Errorf("pulled %v, want the bare image name once", run.pulled)
 	}
 
-	cfg, pulled = refreshHarness(t, fakeDater{newest: map[string]time.Time{
-		"ubuntu-2404-x64": time.Now().Add(-1 * time.Hour),
-	}})
-	if err := cmdImagesRefresh(t.Context(), []string{"--config", cfg}); err != nil {
-		t.Fatalf("refresh: %v", err)
-	}
-	if len(*pulled) != 0 {
-		t.Fatalf("pulled %v for a generation an hour old", *pulled)
+	if len(run.reaped) != 1 || run.reaped[0] != "ubuntu-2404-x64" {
+		t.Errorf("reaped %v, want the image once after its pull", run.reaped)
 	}
 }
 
-// NOTHING PUBLISHED IS DUE, not "nothing to do": a node whose cluster holds no
-// generation of its tier's image launches nothing.
-func TestRefreshPullsAnImageTheClusterHasNeverSeen(t *testing.T) {
-	cfg, pulled := refreshHarness(t, fakeDater{newest: map[string]time.Time{}})
+// A GENERATION IMPORTED AFTER THE CHANNEL'S BUILD IS UP TO DATE, and nothing is
+// pulled or reaped — the same image must never be imported twice.
+func TestARefreshDoesNothingWhenTheImportedGenerationIsNewer(t *testing.T) {
+	run := stageRefresh(t, fakeRefreshStore{newest: newer, found: true}, channelBuilt)
 
-	if err := cmdImagesRefresh(t.Context(), []string{"--config", cfg}); err != nil {
+	err := cmdImagesRefresh(t.Context(), []string{"--config", firecrackerRefreshConfig(t, "")})
+	if err != nil {
 		t.Fatalf("refresh: %v", err)
 	}
-	if len(*pulled) != 1 {
-		t.Fatalf("pulled %v, want the unpublished image", *pulled)
+
+	if len(run.pulled) != 0 || len(run.reaped) != 0 {
+		t.Errorf("pulled %v and reaped %v for an image already newer than the channel",
+			run.pulled, run.reaped)
 	}
 }
 
-// A cluster that could not answer is an error, never a pull and never a quiet
-// exit: a timer that swallowed it would look like a working schedule.
-func TestRefreshReportsAClusterItCouldNotAsk(t *testing.T) {
-	cfg, pulled := refreshHarness(t, fakeDater{err: errors.New("rbd: connection refused")})
+// NO GENERATION AT ALL IS A PULL. A fresh node has nothing to boot until one is
+// imported, and the channel is where it comes from.
+func TestARefreshPullsWhenNothingIsImported(t *testing.T) {
+	run := stageRefresh(t, fakeRefreshStore{}, channelBuilt)
 
-	err := cmdImagesRefresh(t.Context(), []string{"--config", cfg})
-	if err == nil || len(*pulled) != 0 {
-		t.Fatalf("refresh = %v with pulls %v, want the cluster's error and no pull", err, *pulled)
+	err := cmdImagesRefresh(t.Context(), []string{"--config", firecrackerRefreshConfig(t, "")})
+	if err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+
+	if len(run.pulled) != 1 {
+		t.Errorf("pulled %v, want one pull for a node with no generation", run.pulled)
+	}
+}
+
+// A FAILED PULL REAPS NOTHING, and is reported. Reaping after a pull that left
+// nothing new would be a cleanup nobody asked for on a day something went wrong.
+func TestAFailedPullIsReportedAndReapsNothing(t *testing.T) {
+	run := stageRefresh(t, fakeRefreshStore{newest: older, found: true}, channelBuilt)
+	run.pullErr = errors.New("the channel expired")
+
+	err := cmdImagesRefresh(t.Context(), []string{"--config", firecrackerRefreshConfig(t, "")})
+	if err == nil || !strings.Contains(err.Error(), "the channel expired") {
+		t.Fatalf("a failed pull was not reported: %v", err)
+	}
+
+	if len(run.reaped) != 0 {
+		t.Errorf("reaped %v after a failed pull", run.reaped)
+	}
+}
+
+// `automatic: false` LEAVES IMAGES TO AN OPERATOR: nothing is fetched, nothing
+// is pulled, and the exit is clean because a timer exiting red on every healthy
+// opted-out host is noise.
+func TestARefreshDoesNothingWhenAutomaticUpdatesAreOff(t *testing.T) {
+	run := stageRefresh(t, fakeRefreshStore{newest: older, found: true}, channelBuilt)
+
+	err := cmdImagesRefresh(t.Context(), []string{"--config",
+		firecrackerRefreshConfig(t, "release:\n  automatic: false\n")})
+	if err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+
+	if len(run.pulled) != 0 {
+		t.Errorf("pulled %v with automatic updates off", run.pulled)
+	}
+}
+
+// A DRY RUN DECIDES AND DOES NOTHING.
+func TestARefreshDryRunPullsNothing(t *testing.T) {
+	run := stageRefresh(t, fakeRefreshStore{newest: older, found: true}, channelBuilt)
+
+	err := cmdImagesRefresh(t.Context(), []string{"--config", firecrackerRefreshConfig(t, ""),
+		"--dry-run"})
+	if err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+
+	if len(run.pulled) != 0 || len(run.reaped) != 0 {
+		t.Errorf("a dry run pulled %v and reaped %v", run.pulled, run.reaped)
+	}
+}
+
+// A HOST WITH NO NODE HAS NOTHING TO REFRESH, AND SAYS SO WITH EXIT 0. The package
+// enables the timer on every host and the Mac installs the agent beside every
+// server, so this runs daily on control-plane-only hosts; an error there is a red
+// unit on every healthy one.
+func TestARefreshOnAHostWithNoNodeHasNothingToDo(t *testing.T) {
+	head, _, _ := strings.Cut(firecrackerNodeConfig, "node:")
+	_, tiers, _ := strings.Cut(firecrackerNodeConfig, "tiers:")
+	body := head + "tiers:" + tiers
+
+	path := filepath.Join(t.TempDir(), "billet.yaml")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	if err := cmdImagesRefresh(t.Context(), []string{"--config", path}); err != nil {
+		t.Fatalf("a control-plane-only host was refused: %v", err)
 	}
 }

@@ -562,15 +562,15 @@ func (b *postgresBackend) releaseController() error {
 // carries: the session advisory lock in claimController, which stops a second
 // controller starting, and the epoch in ControllerClaim, which stops the first
 // one writing once a second has legitimately taken over.
-func OpenPostgres(ctx context.Context, stateDir, dsn string) (*DB, error) {
-	return openDir(ctx, stateDir, newPostgresBackend(dsn), openMode{})
+func OpenPostgres(ctx context.Context, stateDir, dsn string, opts ...OpenOption) (*DB, error) {
+	return openDir(ctx, stateDir, newPostgresBackend(dsn), openMode{}.with(opts))
 }
 
 // OpenPostgresAdmin is the operator-command form, with the same asymmetry
 // OpenAdmin describes: it proceeds without the directory lock when a control
 // plane holds it, and then VERIFIES the schema rather than migrating it.
-func OpenPostgresAdmin(ctx context.Context, stateDir, dsn string) (*DB, error) {
-	return openDir(ctx, stateDir, newPostgresBackend(dsn), openMode{admin: true})
+func OpenPostgresAdmin(ctx context.Context, stateDir, dsn string, opts ...OpenOption) (*DB, error) {
+	return openDir(ctx, stateDir, newPostgresBackend(dsn), openMode{admin: true}.with(opts))
 }
 
 // OpenPostgresStandby opens the ledger for a control plane that is WAITING to
@@ -591,6 +591,24 @@ func OpenPostgresAdmin(ctx context.Context, stateDir, dsn string) (*DB, error) {
 // would be a second process on one host waiting for a lock its own service
 // manager already restarts it to take. Config refuses the pairing, and the
 // absence of an entry point here is the same refusal one layer down.
-func OpenPostgresStandby(ctx context.Context, stateDir, dsn string) (*DB, error) {
-	return openDir(ctx, stateDir, newPostgresBackend(dsn), openMode{standby: true})
+func OpenPostgresStandby(ctx context.Context, stateDir, dsn string, opts ...OpenOption) (*DB, error) {
+	return openDir(ctx, stateDir, newPostgresBackend(dsn), openMode{standby: true}.with(opts))
+}
+
+// OpenPostgresProbe opens the ledger for the host upgrade's quiescent probe on a
+// deployment whose ledger is a database billet does not hold.
+//
+// THE STANDBY'S OPEN, ALLOWED ACROSS THE FENCE. A candidate probing an external
+// ledger may prove exactly what a standby proves — the DSN resolves, the schema
+// is one it knows and not ahead of it, the deployment binding agrees, the
+// release watermark admits it — and may claim nothing and migrate nothing,
+// because the migration is the controller claim's right and happens when the
+// candidate serves. Every write is refused, structurally, the way a standby's
+// is. What it adds over a standby is crossing a host-upgrade fence, which the
+// transaction may have raised in this host's identity directory; the fence
+// reaches only local handles, so on this backend it is a courtesy rather than
+// the exclusion it is on SQLite.
+func OpenPostgresProbe(ctx context.Context, stateDir, dsn string, opts ...OpenOption) (*DB, error) {
+	return openDir(ctx, stateDir, newPostgresBackend(dsn),
+		openMode{standby: true, maintenanceProbe: true}.with(opts))
 }

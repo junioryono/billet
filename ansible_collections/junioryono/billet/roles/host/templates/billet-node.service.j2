@@ -35,6 +35,12 @@ NotifyAccess=main
 {% endif %}
 User=root
 Group=root
+{% if billet_server_environment | default({}) | length > 0 %}
+# THE CONTROL PLANE'S ENVIRONMENT, ON A HOST THAT IS BOTH. The updater a rollout
+# dispatches to this node inherits this unit's environment, and on a PostgreSQL
+# controller it has to open the ledger the server's way; see billet-server.service.
+EnvironmentFile=-{{ billet_server_environment_path }}
+{% endif %}
 ExecStart=/usr/bin/billet node --config /etc/billet/billet.yaml{{ ' --upgrade-probe' if billet_systemd_upgrade_probe | default(false) else '' }}
 TimeoutStartSec=120
 RuntimeDirectory=billet/locks

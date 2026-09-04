@@ -263,7 +263,8 @@
           # this is about is the operator meeting a sentence that names the
           # limitation and the way through it. A test asserting only `is failed`
           # would pass against a role that fell over for an unrelated reason.
-          - "'transactional binary upgrade is not implemented' in billet_postgres_refusal"
+          - "'billet upgrades such a host itself' in billet_postgres_refusal"
+          - "'billet-upgrade.timer' in billet_postgres_refusal"
           - "'STOPPED' in billet_postgres_refusal"
         fail_msg: >-
           Expected the role to refuse a binary change on a host whose ledger is

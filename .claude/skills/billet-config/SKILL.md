@@ -21,13 +21,15 @@ description: "billet.yaml: every top-level block, which role and which provider 
 | `sites` | control plane | `name` (matched exactly), `store` (`ceph` or `ebs-s3`) |
 | `backup` | `local backup`, `local restore --from-backup` | `s3.bucket`, `s3.region` (required even with an `endpoint`), `s3.prefix`, `s3.endpoint` (path-style; RGW, MinIO, R2), `s3.kms_key_id` |
 | `images` | `images pull` | `source` (empty means billet's own), `signing_identity` and `signing_issuer` (required for a non-default source) |
-| `release` | rollouts | `channel` (`stable` or `candidate`), `version` (an exact tag or a 40-hex SHA; `latest` and `main` refused; exclusive with `channel`), `automatic`, `maintenance_window` (bounds when a rollout may begin), `signing_identity` and `signing_issuer` (both or neither) |
+| `release` | the rollout starter, `host-upgrade --from-rollout`, `images refresh` | `channel` (`stable` or `candidate`), `version` (an exact tag or a 40-hex SHA; `latest` and `main` refused; exclusive with `channel`), `automatic` (a `*bool` whose nil is TRUE, read only through `AutomaticUpdates()`; the one switch for starting rollouts, acting on them and refreshing images), `maintenance_window` (bounds when a rollout may begin; refused beside an explicit `automatic: false`), `signing_identity` and `signing_issuer` (both or neither) |
 
 Provider kinds are `firecracker`, `tart`, `ec2`, `codebuild`, `docker`. The whole catalog is duplicated on every machine with nothing checking the copies agree; tiers and `nodes` are read at startup, so changing either needs a restart, while nodes register dynamically.
 
 ## Rules
 
 **`config` is a leaf, and `alloc.New` re-applies the safety rules anyway.** `alloc.New` is exported, so it cannot assume its catalog came through `config.Load`; a rule enforced in only one of the two has a second entry point that does not enforce it. The same argument makes `config.CheckEC2Endpoint` (https required, loopback the one exception) callable from the provider constructor as well as from `Load`.
+
+**`release.automatic` is the one zero value that does not refuse, and it is a pointer so absence and `false` differ.** A deployment that says nothing updates itself; `automatic: false` is the opt-out. Every reader goes through `AutomaticUpdates()`, because a reader of the field reads an absent block as off, which is the old default coming back one call site at a time. `billet init` appends a commented `release:` block stating the default and the two lines that change it (`initconfig.releaseBlock`).
 
 **Never guess a byte size.** `config.ByteSize` parses with exact integer arithmetic on a restricted grammar. It used `strconv.ParseFloat`, which accepts `NaN`, `Inf`, hex and exponents and loses precision above 2^53; converting those to `int64` can come out negative, which silently disables the ceiling. A bare int of bytes is how a memory limit ends up 1024x wrong.
 

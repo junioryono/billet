@@ -127,8 +127,10 @@ func plistValue(t *testing.T, name, body, key string) (kind, value string) {
 // decoder does not. That would have shipped a plist launchd refuses to load.
 func TestTheLaunchAgentsAreWellFormedXML(t *testing.T) {
 	for name, body := range map[string]string{
-		deploy.NodeAgentName:   deploy.NodeAgent,
-		deploy.ServerAgentName: deploy.ServerAgent,
+		deploy.NodeAgentName:    deploy.NodeAgent,
+		deploy.ServerAgentName:  deploy.ServerAgent,
+		deploy.UpgradeAgentName: deploy.UpgradeAgent,
+		deploy.ImagesAgentName:  deploy.ImagesAgent,
 	} {
 		decoder := xml.NewDecoder(strings.NewReader(body))
 
@@ -152,8 +154,10 @@ func TestTheLaunchAgentsAreWellFormedXML(t *testing.T) {
 // success against a job that does not exist.
 func TestEachAgentCarriesTheLabelBilletNamesIt(t *testing.T) {
 	for label, agent := range map[string]struct{ name, body string }{
-		deploy.NodeAgentLabel:   {deploy.NodeAgentName, deploy.NodeAgent},
-		deploy.ServerAgentLabel: {deploy.ServerAgentName, deploy.ServerAgent},
+		deploy.NodeAgentLabel:    {deploy.NodeAgentName, deploy.NodeAgent},
+		deploy.ServerAgentLabel:  {deploy.ServerAgentName, deploy.ServerAgent},
+		deploy.UpgradeAgentLabel: {deploy.UpgradeAgentName, deploy.UpgradeAgent},
+		deploy.ImagesAgentLabel:  {deploy.ImagesAgentName, deploy.ImagesAgent},
 	} {
 		kind, got := plistValue(t, agent.name, agent.body, "Label")
 		if kind != "string" {

@@ -129,7 +129,12 @@ func (c *Converger) requiredDirs(req lifeops.UpRequest) []string {
 		}
 	}
 
-	for _, dir := range []string{req.ServerStateDir, req.NodeStateDir, req.NodeLockDir} {
+	// AND WHERE THE BINARY LIVES. The upgrade agent runs as this account and
+	// replaces /usr/local/bin/billet by renaming into its directory, which is
+	// root-owned on a stock Mac; a refusal here, with the chown that fixes it,
+	// beats a transaction that drains the node and then cannot land.
+	for _, dir := range []string{req.ServerStateDir, req.NodeStateDir, req.NodeLockDir,
+		req.BinaryDir} {
 		if dir != "" {
 			dirs = append(dirs, dir)
 		}

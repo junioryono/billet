@@ -330,7 +330,7 @@ func cmdServer(ctx context.Context, lc *lifecycle, args []string) error {
 	//
 	// --dry-run remains for proving the GitHub path while advertising zero.
 
-	return runServer(ctx, lc, cfg, *cfgPath, *dryRun, *upgradeProbe)
+	return runServer(ctx, lc, cfg, *dryRun, *upgradeProbe)
 }
 
 // claimNodeDeployment reads this host's identity and takes the host-wide lock on
@@ -490,7 +490,6 @@ func runServer(
 	ctx context.Context,
 	lc *lifecycle,
 	cfg *config.Config,
-	cfgPath string,
 	dryRun, upgradeProbe bool,
 ) error {
 	// Built by the SHARED constructor, so the server and teardown authenticate
@@ -728,39 +727,32 @@ func runServer(
 	// a host. It is wired here rather than inside server.New for the same reason
 	// the runner is: what a control plane can talk to is a property of how this
 	// process was assembled, not of the scheduler.
-	// AND THE CONTROLLER'S OWN HALF, UNDER release.automatic. A process cannot
-	// install its own successor, so the coordinator is given the node's updater
-	// to start on this host — the same detached `billet host-upgrade`, journal,
-	// claim and decision fence — and nothing else changes: it still only
-	// OBSERVES the result, from the successor. Refused on a PostgreSQL ledger for
-	// the reason the transactional upgrade is refused there, and said at startup
-	// rather than discovered at the first rollout.
-	coordinatorOpts := []rollout.CoordinatorOption{rollout.WithCoordinatorLogger(slog.Default())}
-	automatic := cfg.Release != nil && cfg.Release.Automatic
-	postgres := cfg.Server.State != nil && cfg.Server.State.Backend == config.StatePostgres
-
-	switch {
-	case automatic && postgres:
-		slog.Warn("release.automatic is set, but this control plane's own host is not upgraded " +
-			"automatically on a PostgreSQL ledger; run `billet host-upgrade` there when a rollout " +
-			"is waiting on the controller")
-	case automatic:
-		coordinatorOpts = append(coordinatorOpts,
-			rollout.WithSelfUpgrader(node.ExecUpgrader{ConfigPath: cfgPath}))
-	}
-
 	coordinator := rollout.NewCoordinator(
 		rollout.New(db),
 		ledgerFleet{alloc: allocator},
 		planeDispatcher{runner: planeRunner},
 		version.Version(),
 		nodeapi.VersionNodeUpgrade,
-		coordinatorOpts...,
+		rollout.WithCoordinatorLogger(slog.Default()),
 	)
+
+	// AND THE STARTER, which is what makes `release.automatic` true: the
+	// coordinator converges a rollout that exists, and this is what makes one
+	// exist when the channel advances. It resolves the channel through the same
+	// functions `billet rollout start` does, so the two cannot disagree about
+	// what a target is.
+	starter, err := newRolloutStarter(cfg, rollout.New(db), ledgerFleet{alloc: allocator},
+		releasesource.Host(version.Version(),
+			releasesource.Range{Min: nodeapi.MinVersion, Max: nodeapi.Version},
+			state.LatestSchemaVersion(), firecracker.GuestContract))
+	if err != nil {
+		return err
+	}
 
 	opts = append(opts,
 		server.WithNodeRunner(planeRunner),
 		server.WithRolloutCoordinator(coordinator, 0),
+		server.WithRolloutStarter(starter, 0),
 		// AND THE SWEEP OF STAGED CODEBUILD REGISTRATIONS a dead node never reaped.
 		// Wired here because it needs what only this process has: the ledger, which
 		// is the sole authority for deleting one, and the host's AWS credentials —
@@ -772,37 +764,6 @@ func runServer(
 	)
 
 	plane := server.New(allocator, wiring.Provisioner{Client: client}, cfg.Tiers, owner, slog.Default(), opts...)
-
-	// THE AUTOMATIC ROLLOUT STARTER, beside the coordinator rather than inside
-	// it: one records a decision, the other converges whatever is recorded. Below
-	// becomeController, because recording one is a write only the controller may
-	// make. Its resolve is the one `billet rollout start` uses.
-	if automatic {
-		client := &releasesource.Client{}
-
-		policy, err := releasesource.PolicyForRelease(false)
-		if err != nil {
-			return err
-		}
-
-		release := cfg.Release
-		starter := &rolloutAutostart{
-			release: release,
-			store:   rollout.New(db),
-			fleet:   ledgerFleet{alloc: allocator},
-			running: version.Version(),
-			current: releasesource.Host(version.Version(),
-				releasesource.Range{Min: nodeapi.MinVersion, Max: nodeapi.Version},
-				state.LatestSchemaVersion(), firecracker.GuestContract),
-			resolve: func(ctx context.Context) (*releasesource.Manifest, string, error) {
-				return resolveTarget(ctx, client, policy, release.Channel, release.Version)
-			},
-			now: time.Now,
-			log: slog.Default(),
-		}
-
-		go starter.Run(ctx)
-	}
 
 	// READINESS IS REPORTED BEFORE THE LISTENERS OPEN THEIR SESSIONS, AND MOVING IT
 	// AFTER THEM WOULD BE A RESTART LOOP.
@@ -4094,6 +4055,10 @@ func printWireWindow(ctx context.Context, a *alloc.Allocator) {
 			fmt.Printf(" (this deployment cannot reach it)")
 		}
 
+		if note := describeDowngrade(n); note != "" {
+			fmt.Printf("  <- %s", note)
+		}
+
 		fmt.Println()
 	}
 
@@ -4138,6 +4103,28 @@ func printWireWindow(ctx context.Context, a *alloc.Allocator) {
 	fmt.Printf("          A host that is gone for good still counts. Once it is stopped and " +
 		"holds no lease,\n          `billet nodes decommission <node>` forgets it and closes " +
 		"this window.\n")
+}
+
+// describeDowngrade says when a host is running something older than it once
+// registered with, and stays silent otherwise.
+//
+// A NOTE, NOT A VERDICT. A rollout that failed on this host and rolled it back
+// produces exactly this shape, and `billet rollout status` says whether one did;
+// what this line adds is that somebody's hand producing the same shape is no
+// longer invisible. Only a proved order is reported: a host whose current release
+// cannot be ordered against its highest says nothing here.
+func describeDowngrade(n alloc.NodeWire) string {
+	if n.HighestRelease == "" || n.Release == "" {
+		return ""
+	}
+
+	order, ok := version.Compare(n.Release, n.HighestRelease)
+	if !ok || order >= 0 {
+		return ""
+	}
+
+	return fmt.Sprintf("DOWNGRADED: it once registered on %s (a rollout's rollback does this; "+
+		"`billet rollout status` says whether one did)", n.HighestRelease)
 }
 
 // describeRelease names a host's build, or says why it has no name.

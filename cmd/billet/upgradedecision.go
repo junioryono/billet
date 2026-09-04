@@ -35,26 +35,74 @@ var ErrSuperseded = errors.New("this instruction has been superseded")
 // answering zero for it hands a stale instruction permission to overwrite the
 // evidence and install a release the fleet has left behind. That one is an error,
 // and a fenced instruction refuses on it.
-func readDecision() (int64, error) {
-	body, err := os.ReadFile(decisionPath())
+func readDecision() (int64, error) { return readMark(decisionPath()) }
+
+// settledName is the newest fleet decision this machine has SETTLED on: one whose
+// transaction committed here, or one this machine was found already on.
+//
+// A SECOND MARK, BECAUSE THE FIRST IS RAISED BEFORE THE WORK. last-decision is
+// written before a transaction stages anything, so a superseded instruction is
+// refused whatever happens next, and it survives that transaction's rollback —
+// which is right for a fence and wrong for a question of whether the decision
+// was carried out. A completed rollout is taken by a host that has not settled
+// on it, so a standby that attempted it and rolled back is asked again, and one
+// that committed it or was found on it is not moved back to it after an operator
+// moved it by hand.
+const settledName = "settled-decision"
+
+func settledPath() string { return filepath.Join(upgradeRoot, settledName) }
+
+// readSettled returns the newest fleet decision this machine has settled on.
+func readSettled() (int64, error) { return readMark(settledPath()) }
+
+// recordSettled raises the settled mark to a decision, never lowering it.
+func recordSettled(generation int64) error {
+	if generation <= 0 {
+		return nil
+	}
+
+	return withDecisionLock(func() error { return raiseMark(settledPath(), generation) })
+}
+
+// readMark reads one decision mark.
+func readMark(path string) (int64, error) {
+	body, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return 0, nil
 		}
 
-		return 0, fmt.Errorf("%w: %s could not be read: %w", ErrUnreadableDecision,
-			decisionPath(), err)
+		return 0, fmt.Errorf("%w: %s could not be read: %w", ErrUnreadableDecision, path, err)
 	}
 
 	generation, err := strconv.ParseInt(strings.TrimSpace(string(body)), 10, 64)
 	if err != nil || generation < 0 {
 		return 0, fmt.Errorf("%w: %s does not hold a fleet decision number. Remove it once "+
 			"you know which release this machine should be on; until then billet cannot "+
-			"tell whether an instruction has been superseded", ErrUnreadableDecision,
-			decisionPath())
+			"tell whether an instruction has been superseded", ErrUnreadableDecision, path)
 	}
 
 	return generation, nil
+}
+
+// raiseMark writes a mark if the generation is above what it holds.
+func raiseMark(path string, generation int64) error {
+	held, err := readMark(path)
+	if err != nil {
+		return err
+	}
+
+	if generation <= held {
+		return nil
+	}
+
+	if err := wirecert.WriteFileAtomic(path,
+		[]byte(strconv.FormatInt(generation, 10)+"\n"), 0o600); err != nil {
+		return fmt.Errorf("record which fleet decision this machine is acting on: %w", err)
+	}
+
+	// FLUSHED, because this is the record that outlives the crash it exists for.
+	return syncUpgradeDir(upgradeRoot)
 }
 
 // ErrUnreadableDecision means the fence exists and billet cannot read it.
@@ -169,24 +217,7 @@ func recordDecision(generation int64) error {
 	return withDecisionLock(func() error { return recordLocked(generation) })
 }
 
-func recordLocked(generation int64) error {
-	acted, err := readDecision()
-	if err != nil {
-		return err
-	}
-
-	if generation <= acted {
-		return nil
-	}
-
-	if err := wirecert.WriteFileAtomic(decisionPath(),
-		[]byte(strconv.FormatInt(generation, 10)+"\n"), 0o600); err != nil {
-		return fmt.Errorf("record which fleet decision this machine is acting on: %w", err)
-	}
-
-	// FLUSHED, because this is the record that outlives the crash it exists for.
-	return syncUpgradeDir(upgradeRoot)
-}
+func recordLocked(generation int64) error { return raiseMark(decisionPath(), generation) }
 
 // checkDecision refuses an instruction older than one this machine has acted on.
 //

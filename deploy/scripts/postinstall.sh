@@ -127,6 +127,24 @@ fi
 if [ -d /run/systemd/system ]; then
     systemctl daemon-reload || true
 
+    # THE ONE EXCEPTION TO "THE PACKAGE ENABLES NOTHING". That rule keeps an
+    # install from connecting a machine to GitHub before billet.yaml says
+    # something true, and these two timers connect nothing: the upgrade timer
+    # acts only on a rollout the ledger already records, the images timer only
+    # on a node whose config names guest images, and both exit doing nothing
+    # under `release: {automatic: false}`. What they buy is a deployment that
+    # takes the update it decided on with nobody at a keyboard, which is the
+    # promise `release.automatic` makes by default. `systemctl disable --now`
+    # either one to opt this host out. NOT `|| exit`: a host whose systemd
+    # refuses the enable (a container image being built, say) must still finish
+    # installing.
+    for timer in billet-upgrade.timer billet-images-refresh.timer; do
+        if ! systemctl enable --now "${timer}" >/dev/null 2>&1; then
+            echo "billet: ${timer} could not be enabled; automatic updates on this host" >&2
+            echo "        need \`systemctl enable --now ${timer}\` once systemd is running." >&2
+        fi
+    done
+
     # A DROP-IN CAN OUTLIVE THE ASSUMPTION IT WAS WRITTEN UNDER. These units
     # are Type=notify: the service is ready when billet's MAIN process sends
     # READY=1, so an override whose ExecStart wraps billet in something that

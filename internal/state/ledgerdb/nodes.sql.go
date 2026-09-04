@@ -199,23 +199,28 @@ func (q *Queries) ListCodeBuildRegistrationPaths(ctx context.Context, provider s
 
 const listNodeWireVersions = `-- name: ListNodeWireVersions :many
 SELECT name, live, node_release, wire_min, wire_max, wire_version, epoch,
-       node_digest
+       node_digest, highest_release
   FROM nodes
  ORDER BY name
 `
 
 type ListNodeWireVersionsRow struct {
-	Name        string
-	Live        int64
-	NodeRelease string
-	WireMin     int64
-	WireMax     int64
-	WireVersion int64
-	Epoch       int64
-	NodeDigest  string
+	Name           string
+	Live           int64
+	NodeRelease    string
+	WireMin        int64
+	WireMax        int64
+	WireVersion    int64
+	Epoch          int64
+	NodeDigest     string
+	HighestRelease string
 }
 
 // What each host's registration said about its build, and what was negotiated.
+//
+// highest_release is the newest release this host has EVER registered with, kept
+// beside node_release so a report can say a host is running something older than
+// it once did. It decides nothing: a rolled-back host is exactly that shape.
 func (q *Queries) ListNodeWireVersions(ctx context.Context) ([]ListNodeWireVersionsRow, error) {
 	rows, err := q.db.QueryContext(ctx, listNodeWireVersions)
 	if err != nil {
@@ -234,6 +239,7 @@ func (q *Queries) ListNodeWireVersions(ctx context.Context) ([]ListNodeWireVersi
 			&i.WireVersion,
 			&i.Epoch,
 			&i.NodeDigest,
+			&i.HighestRelease,
 		); err != nil {
 			return nil, err
 		}
@@ -552,6 +558,22 @@ func (q *Queries) ReadNodeEpoch(ctx context.Context, name string) (int64, error)
 	return epoch, err
 }
 
+const readNodeHighestRelease = `-- name: ReadNodeHighestRelease :one
+SELECT highest_release FROM nodes WHERE name = $1
+`
+
+// The newest release one host has registered with, for the registration that is
+// about to decide whether this one is newer still.
+//
+// sql.ErrNoRows means the host was never registered, which the caller reads as
+// "nothing recorded" rather than as an error.
+func (q *Queries) ReadNodeHighestRelease(ctx context.Context, name string) (string, error) {
+	row := q.db.QueryRowContext(ctx, readNodeHighestRelease, name)
+	var highest_release string
+	err := row.Scan(&highest_release)
+	return highest_release, err
+}
+
 const readNodeIncarnation = `-- name: ReadNodeIncarnation :one
 SELECT incarnation FROM nodes WHERE name = $1
 `
@@ -647,10 +669,11 @@ const upsertNodeRegistration = `-- name: UpsertNodeRegistration :one
 INSERT INTO nodes
    (name, provider, site, total_vcpu, total_memory, ec2_shapes, last_seen_at, live,
     node_release, wire_min, wire_max, wire_version, node_digest, codebuild_fleet,
-    codebuild_jit_path, codebuild_region, incarnation, epoch)
+    codebuild_jit_path, codebuild_region, incarnation, highest_release, epoch)
 VALUES ($1, $2, $3, $4, $5, $6, $7, 1,
         $8, $9, $10, $11, $12,
-        $13, $14, $15, $16, 1)
+        $13, $14, $15, $16,
+        $17, 1)
 ON CONFLICT (name) DO UPDATE SET
    provider     = excluded.provider,
    site         = excluded.site,
@@ -668,6 +691,7 @@ ON CONFLICT (name) DO UPDATE SET
    codebuild_jit_path = excluded.codebuild_jit_path,
    codebuild_region   = excluded.codebuild_region,
    incarnation  = excluded.incarnation,
+   highest_release = excluded.highest_release,
    epoch        = nodes.epoch + 1,
    decommissioned_at   = '',
    decommission_proven = 0,
@@ -693,6 +717,7 @@ type UpsertNodeRegistrationParams struct {
 	CodebuildJitPath string
 	CodebuildRegion  string
 	Incarnation      string
+	HighestRelease   string
 }
 
 // Register a host, or re-register one, and return its new fence.
@@ -724,6 +749,7 @@ func (q *Queries) UpsertNodeRegistration(ctx context.Context, arg UpsertNodeRegi
 		arg.CodebuildJitPath,
 		arg.CodebuildRegion,
 		arg.Incarnation,
+		arg.HighestRelease,
 	)
 	var epoch int64
 	err := row.Scan(&epoch)

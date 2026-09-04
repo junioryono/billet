@@ -253,6 +253,9 @@ func runCheck(ctx context.Context, opts checkOptions) (checkReport, error) {
 		// here decides whether the deployment may run.
 		reportLocalBackupAge(ctx)
 		reportBackupAge(ctx, cfg, skipNetworkProbes)
+		reportTimer(ctx, "updates", deploy.UpgradeTimerName,
+			"a recorded rollout waits on this host until somebody runs "+
+				"billet host-upgrade --from-rollout")
 
 		a, err := alloc.New(db, alloc.Limits{
 			MaxVCPU:   cfg.Server.MaxVCPU,

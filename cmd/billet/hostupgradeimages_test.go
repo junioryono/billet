@@ -59,12 +59,14 @@ func itoa(n int) string {
 
 func firecrackerHost(staged string) *systemdHost {
 	return &systemdHost{
-		cfg: &config.Config{Node: &config.NodeConfig{
-			Provider: config.ProviderFirecracker,
-			Ceph:     &config.CephConfig{},
-		}},
-		cfgPath: "/etc/billet/billet.yaml",
-		staged:  staged,
+		ledgerHost: ledgerHost{
+			cfg: &config.Config{Node: &config.NodeConfig{
+				Provider: config.ProviderFirecracker,
+				Ceph:     &config.CephConfig{},
+			}},
+			cfgPath: "/etc/billet/billet.yaml",
+		},
+		staged: staged,
 	}
 }
 

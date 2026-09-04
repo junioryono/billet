@@ -11,6 +11,78 @@ func releaseErrors(r *ReleaseConfig) string {
 	return errors.Join(ValidateRelease(r)...).Error()
 }
 
+// SAYING NOTHING UPDATES ITSELF, AND ONLY `automatic: false` TURNS THAT OFF.
+//
+// The field is a pointer precisely so absence and false are different facts, and
+// every reader goes through the accessor: a reader that consulted the field would
+// read an absent block as off, which is the old default coming back one call
+// site at a time.
+func TestAutomaticUpdatesAreOnUnlessTheOperatorSaysFalse(t *testing.T) {
+	t.Parallel()
+
+	var absent *ReleaseConfig
+
+	if !absent.AutomaticUpdates() {
+		t.Error("an absent release block reports automatic updates off")
+	}
+
+	if !(&ReleaseConfig{}).AutomaticUpdates() {
+		t.Error("a release block that says nothing reports automatic updates off")
+	}
+
+	if !(&ReleaseConfig{Automatic: new(true)}).AutomaticUpdates() {
+		t.Error("automatic: true reports automatic updates off")
+	}
+
+	if (&ReleaseConfig{Automatic: new(false)}).AutomaticUpdates() {
+		t.Error("automatic: false reports automatic updates on")
+	}
+}
+
+// THE OPT-OUT SURVIVES A ROUND TRIP THROUGH YAML. `automatic: false` has to
+// arrive as a false pointer rather than as the nil an omitempty bool would
+// collapse it to, or the one sentence that turns updates off would be read as
+// nothing having been said.
+func TestAutomaticFalseIsReadFromYAML(t *testing.T) {
+	t.Parallel()
+
+	off := strings.Replace(validConfig, "server:", "release:\n  automatic: false\nserver:", 1)
+
+	cfg, err := Parse("billet.yaml", []byte(off))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	if cfg.Release == nil || cfg.Release.AutomaticUpdates() {
+		t.Fatalf("automatic: false was read as automatic updates on (release = %+v)", cfg.Release)
+	}
+
+	on, err := Parse("billet.yaml", []byte(validConfig))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	if !on.Release.AutomaticUpdates() {
+		t.Error("a config with no release block reports automatic updates off")
+	}
+}
+
+// A WINDOW BESIDE AN EXPLICIT OPT-OUT IS STILL REFUSED. The window gates an
+// automatic start; with the operator having turned those off, it decides nothing,
+// and the refusal names the sentence to remove.
+func TestAMaintenanceWindowBesideAutomaticFalseIsRefused(t *testing.T) {
+	t.Parallel()
+
+	got := releaseErrors(&ReleaseConfig{
+		Automatic:         new(false),
+		MaintenanceWindow: &MaintenanceWindow{Start: "02:00", End: "04:00"},
+	})
+
+	if !strings.Contains(got, "nothing here starts one") {
+		t.Errorf("a window beside automatic: false was accepted: %v", got)
+	}
+}
+
 // SAYING NOTHING FOLLOWS THE SIGNED STABLE CHANNEL, which is the behaviour every
 // existing install already has. Adding this block must change nothing about a
 // fleet that ignores it.
@@ -125,17 +197,20 @@ func TestHalfASigningPolicyIsRefused(t *testing.T) {
 	}
 }
 
-// A WINDOW WITH NOTHING TO GATE IS REFUSED, because an operator who wrote one
-// believes their fleet updates inside it.
-func TestAMaintenanceWindowWithoutAutomaticIsRefused(t *testing.T) {
+// A WINDOW WITH NOTHING SAID ABOUT `automatic` IS A WINDOW ON AN AUTOMATIC
+// DEPLOYMENT, because absence means on. Refusing it would make the one setting
+// most operators write — when the fleet may move — need a second line to mean
+// anything.
+func TestAMaintenanceWindowAloneIsAccepted(t *testing.T) {
 	t.Parallel()
 
-	got := releaseErrors(&ReleaseConfig{
+	errs := ValidateRelease(&ReleaseConfig{
 		MaintenanceWindow: &MaintenanceWindow{Start: "02:00", End: "04:00"},
 	})
 
-	if !strings.Contains(got, "nothing here starts one") {
-		t.Errorf("a window with no automatic rollout was accepted: %v", got)
+	if len(errs) != 0 {
+		t.Errorf("a window on a deployment that says nothing about automatic was refused: %v",
+			errs)
 	}
 }
 
@@ -146,7 +221,7 @@ func TestAZeroWidthWindowIsRefused(t *testing.T) {
 	t.Parallel()
 
 	got := releaseErrors(&ReleaseConfig{
-		Automatic:         true,
+		Automatic:         new(true),
 		MaintenanceWindow: &MaintenanceWindow{Start: "02:00", End: "02:00"},
 	})
 
@@ -159,7 +234,7 @@ func TestMalformedWindowTimesAreRefused(t *testing.T) {
 	t.Parallel()
 
 	got := releaseErrors(&ReleaseConfig{
-		Automatic:         true,
+		Automatic:         new(true),
 		MaintenanceWindow: &MaintenanceWindow{Start: "2am", End: "25:00"},
 	})
 
@@ -177,7 +252,7 @@ func TestAWindowThatWrapsMidnightOpens(t *testing.T) {
 	t.Parallel()
 
 	r := &ReleaseConfig{
-		Automatic:         true,
+		Automatic:         new(true),
 		MaintenanceWindow: &MaintenanceWindow{Start: "22:00", End: "04:00"},
 	}
 
@@ -221,7 +296,7 @@ func TestAnAbsentWindowIsAlwaysOpen(t *testing.T) {
 		t.Error("an absent release block reports its window closed")
 	}
 
-	if !(&ReleaseConfig{Automatic: true}).OpenAt(time.Now()) {
+	if !(&ReleaseConfig{Automatic: new(true)}).OpenAt(time.Now()) {
 		t.Error("a release block with no window reports it closed")
 	}
 }
@@ -234,7 +309,7 @@ func TestAnUnreadableWindowIsClosed(t *testing.T) {
 	t.Parallel()
 
 	r := &ReleaseConfig{
-		Automatic:         true,
+		Automatic:         new(true),
 		MaintenanceWindow: &MaintenanceWindow{Start: "not a time", End: "04:00"},
 	}
 

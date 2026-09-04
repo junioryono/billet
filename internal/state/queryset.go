@@ -112,6 +112,7 @@ type ReadOps interface {
 	ListRemoteCostNodes(ctx context.Context) ([]ledgerdb.ListRemoteCostNodesRow, error)
 	ListRevokedCerts(ctx context.Context) ([]ledgerdb.RevokedCert, error)
 	ListRolloutHistory(ctx context.Context, maxRows int64) ([]ledgerdb.Rollout, error)
+	ReadNewestRolloutForTarget(ctx context.Context, targetDigest string) (ledgerdb.Rollout, error)
 	ListRolloutNodePhases(ctx context.Context, rolloutID string) ([]ledgerdb.ListRolloutNodePhasesRow, error)
 	ListRolloutNodes(ctx context.Context, rolloutID string) ([]ledgerdb.ListRolloutNodesRow, error)
 	ListRunningLeasesWithReplacedHolder(ctx context.Context, arg ledgerdb.ListRunningLeasesWithReplacedHolderParams) ([]ledgerdb.ListRunningLeasesWithReplacedHolderRow, error)
@@ -127,6 +128,8 @@ type ReadOps interface {
 	ReadComputeBarrier(ctx context.Context) (ledgerdb.ReadComputeBarrierRow, error)
 	ReadControllerClaim(ctx context.Context) (ledgerdb.ReadControllerClaimRow, error)
 	ReadDeploymentBinding(ctx context.Context) (ledgerdb.ReadDeploymentBindingRow, error)
+	ReadNodeHighestRelease(ctx context.Context, name string) (string, error)
+	ReadReleaseWatermark(ctx context.Context) (ledgerdb.ReadReleaseWatermarkRow, error)
 	ReadEnrollment(ctx context.Context, name string) (ledgerdb.NodeEnrollment, error)
 	ReadEnrollmentFingerprint(ctx context.Context, name string) (string, error)
 	ReadJobConclusion(ctx context.Context, leaseID string) (sql.NullString, error)
@@ -242,6 +245,7 @@ type WriteOps interface {
 	SetAdmission(ctx context.Context, arg ledgerdb.SetAdmissionParams) error
 	SetLeasePhase(ctx context.Context, arg ledgerdb.SetLeasePhaseParams) error
 	SettleForceTarget(ctx context.Context, arg ledgerdb.SettleForceTargetParams) (sql.Result, error)
+	SetReleaseWatermark(ctx context.Context, arg ledgerdb.SetReleaseWatermarkParams) error
 	SpendJoinToken(ctx context.Context, arg ledgerdb.SpendJoinTokenParams) (sql.Result, error)
 	StartPoolRunner(ctx context.Context, arg ledgerdb.StartPoolRunnerParams) error
 	TerminalizeQuarantinedLease(ctx context.Context, arg ledgerdb.TerminalizeQuarantinedLeaseParams) error

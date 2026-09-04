@@ -18,9 +18,9 @@ The [reference Mac](../reference/reference-hardware.md) is a Mac mini with 64 GB
 ```bash
 CFG=/usr/local/etc/billet/billet.yaml
 
-sudo mkdir -p /usr/local/etc/billet /usr/local/var/log/billet \
+sudo mkdir -p /usr/local/bin /usr/local/etc/billet /usr/local/var/log/billet \
               /usr/local/var/lib/billet /usr/local/var/run/billet/locks
-sudo chown "$(id -un)" /usr/local/etc/billet /usr/local/var/log/billet \
+sudo chown "$(id -un)" /usr/local/bin /usr/local/etc/billet /usr/local/var/log/billet \
               /usr/local/var/lib/billet /usr/local/var/run/billet/locks
 
 billet init --profile local-service --provider tart --node-name mac-mini-1
@@ -32,6 +32,8 @@ billet local status
 ```
 
 Run these as the account that will run the node, **never under `sudo`**: a launch agent lives in your GUI domain, and root's domain has neither an unlocked keychain nor the images you pulled. The directories are the one thing that needs `sudo`, because `/usr/local` is root-owned and launchd creates nothing itself; `billet local up` refuses with the exact command rather than asking for a password.
+
+`/usr/local/bin` is in that list because the updater runs as this account too. A rollout upgrades a Mac by replacing `/usr/local/bin/billet`, which is a rename into that directory, and on a stock Mac the directory is root's; `billet local up` and the updater both refuse with the `chown` above rather than draining the node and then finding the replacement cannot land. On a dedicated runner Mac the account already controls every guest and every image, so the binary being writable by it adds exposure only through that account.
 
 `billet init --provider tart` is refused anywhere but on the Mac itself: the ceiling is measured there, the paths are that platform's, and the images named are the two billet has run real jobs in. `--node-name` is the one input the machine cannot supply, because a macOS tier pins the host Apple counts its limit against and a stock Mac's hostname (spaces, an apostrophe, `.local`) is not a legal node name; billet refuses rather than inventing one. The generation writes macOS guests by default; `--guest-os linux` gives an arm64 Linux tier and passing both gives one of each. There is no Ansible path to a Mac; `billet local up` is the converge.
 
@@ -62,6 +64,12 @@ Enable SSH first (`sudo systemsetup -setremotelogin on`); on macOS 26, Screen Sh
 ## What a restart does
 
 Kill the node mid-job and the guest keeps running; the next node reports it adopted the guest, leaves the runner alone, and the job finishes green on the same VM. SIGTERM is a drain: the node stops taking work, waits for the jobs already running, destroys their VMs itself and exits. A billet upgrade never kills a running job, because `tart run` is the VM and billet starts it detached.
+
+## What an update does
+
+A Mac updates itself the way a Linux host does, with launchd's vocabulary. `billet local up` installs two oneshot agents beside the services: `sh.billet.upgrade`, which every five minutes runs `billet host-upgrade --from-rollout` and acts on the rollout a ledger on this Mac records, and `sh.billet.images`, which daily pulls any configured tart image that is absent from the store. A node-only Mac in a larger deployment is upgraded by the coordinator's dispatch instead: its node agent starts the updater detached, in its own session, and a detached child provably outlives its agent's bootout, which was measured here rather than assumed from the guest case.
+
+The transaction is the one [Upgrading billet](../operating/upgrades.md) describes, with a bootout where Linux has a stop (the node drains for as long as its jobs take, and every pid launchd named is proved gone), a bootstrap where Linux has a start (the same pid proved to survive a settle window, which is all launchd can prove), the two plists preserved and restored beside the config, and the binary at `/usr/local/bin/billet`. The ledger steps run only when this Mac holds a control plane. `billet local status` reports both scheduled agents; `billet local uninstall` boots them out and removes them with the rest.
 
 ## The config
 

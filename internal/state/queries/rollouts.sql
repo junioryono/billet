@@ -62,6 +62,14 @@ SELECT id, generation, channel, target_version, target_digest, policy,
        finished_at, terminal_reason
   FROM rollouts ORDER BY generation DESC LIMIT CAST(@max_rows AS BIGINT);
 
+-- name: ReadNewestRolloutForTarget :one
+-- The newest rollout, in any state, to one manifest digest: what an automatic
+-- start consults before it would restart bytes an operator abandoned.
+SELECT id, generation, channel, target_version, target_digest, policy,
+       controller_phase, prior_version, state, created_by, created_at,
+       finished_at, terminal_reason
+  FROM rollouts WHERE target_digest = @target_digest ORDER BY generation DESC LIMIT 1;
+
 -- name: ReadRolloutControllerPhase :one
 -- Where the control plane itself has got to in one rollout.
 SELECT controller_phase FROM rollouts WHERE id = @id;

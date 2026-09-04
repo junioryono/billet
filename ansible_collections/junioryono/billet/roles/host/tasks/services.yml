@@ -707,6 +707,8 @@
       billet_config_install.changed | default(false) or
       billet_firecracker_install.changed | default(false) or
       billet_firecracker_links.changed | default(false) or
+      (billet_server_environment | default({}) | length > 0 and
+       billet_server_environment_install.changed | default(false)) or
       billet_systemd_units.changed | default(false)
   become: true
 
@@ -751,5 +753,56 @@
     state: stopped
   when:
     - not billet_node_should_run
+    - not ansible_check_mode
+  become: true
+
+# THE SCHEDULED UPDATER, INSTALLED ON EVERY HOST WITH A CONTROL PLANE AND
+# ENABLED WHEN THE DEPLOYMENT UPDATES ITSELF. The upgrade timer acts on the
+# rollout a ledger records, so it belongs on a host with a control plane; the
+# guest image refresh timer is its sibling on a firecracker host, in
+# images-refresh.yml. Both are the packaged units the .deb ships, rendered here
+# because this fleet installs no package; tests/unit-parity.yml holds the two
+# copies together.
+#
+# INSTALLED EVEN WHEN DISABLED, so an operator who turns billet_automatic_updates
+# on later has nothing left to render. Outside the upgrade transaction, because
+# a oneshot on a timer holds no compute and no ledger between runs.
+- name: Install the scheduled updater units
+  ansible.builtin.template:
+    src: "{{ item.src }}"
+    dest: "/etc/systemd/system/{{ item.dest }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - { src: billet-upgrade.service.j2, dest: billet-upgrade.service, wanted: "{{ billet_server_should_run }}" }
+    - { src: billet-upgrade.timer.j2, dest: billet-upgrade.timer, wanted: "{{ billet_server_should_run }}" }
+  loop_control:
+    label: "{{ item.dest }}"
+  when: item.wanted | bool
+  register: billet_scheduled_units
+  become: true
+
+- name: Load the scheduled updater units
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  when:
+    - billet_scheduled_units is changed
+    - not ansible_check_mode
+  become: true
+
+# THE TIMER, NOT THE SERVICE: the service is a oneshot the timer triggers, and
+# enabling a oneshot directly runs it at every boot and then never again.
+- name: Enable the scheduled updaters
+  ansible.builtin.systemd_service:
+    name: "{{ item.timer }}"
+    enabled: "{{ billet_automatic_updates | bool }}"
+    state: "{{ 'started' if billet_automatic_updates | bool else 'stopped' }}"
+  loop:
+    - { timer: billet-upgrade.timer, wanted: "{{ billet_server_should_run }}" }
+  loop_control:
+    label: "{{ item.timer }}"
+  when:
+    - item.wanted | bool
     - not ansible_check_mode
   become: true

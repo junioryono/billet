@@ -1,8 +1,11 @@
 ---
-# THE GUEST IMAGE REFRESH TIMER, the same units the package ships, enabled here
-# because a role-managed firecracker node is one the operator has decided about:
-# a node whose images age past GitHub's runner window launches nothing, and the
-# package deliberately enables no timer. Removed when the host boots no guests.
+# THE GUEST IMAGE REFRESH TIMER, the same units the package ships and enables,
+# rendered here because this fleet installs no package: a node whose images age
+# past GitHub's runner window launches nothing. Enabled when the deployment
+# updates itself (billet_automatic_updates, the same switch as the upgrade timer
+# in services.yml) and installed disabled otherwise, so an operator who turns
+# updates on later has nothing left to render. Removed when the host boots no
+# guests.
 
 - name: Install the guest image refresh units
   ansible.builtin.template:
@@ -21,11 +24,11 @@
 - name: Apply guest image refresh unit changes
   ansible.builtin.meta: flush_handlers
 
-- name: Start the guest image refresh timer
+- name: Enable the guest image refresh timer when the deployment updates itself
   ansible.builtin.systemd_service:
     name: billet-images-refresh.timer
-    enabled: true
-    state: started
+    enabled: "{{ billet_automatic_updates | bool }}"
+    state: "{{ 'started' if billet_automatic_updates | bool else 'stopped' }}"
   become: true
   when:
     - billet_firecracker_enabled and billet_ceph_enabled

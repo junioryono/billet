@@ -112,6 +112,12 @@ type Server struct {
 	converge *rollout.Coordinator
 	// convergeEvery paces the coordinator. Zero selects the default.
 	convergeEvery time.Duration
+
+	// starter begins a rollout when the channel advances, or is nil for a
+	// deployment assembled without one — the same nil case converge has.
+	starter *rollout.Starter
+	// startEvery paces the starter. Zero selects the starter's default.
+	startEvery time.Duration
 }
 
 // ControlPlaneOption configures a Server.
@@ -315,6 +321,17 @@ func (s *Server) Run(ctx context.Context) error {
 		defer stopConverging()
 
 		go s.converge.Run(converging, s.convergeInterval())
+	}
+
+	// AND THE STARTER BESIDE IT, under the same rule: a tick that fails is
+	// logged and retried, and nothing it does can stop a listener. It is what
+	// makes `release.automatic` mean anything — without it the channel could
+	// advance forever and no rollout would ever exist to converge.
+	if s.starter != nil {
+		starting, stopStarting := context.WithCancel(ctx)
+		defer stopStarting()
+
+		go s.starter.Run(starting, s.startEvery)
 	}
 
 	sets := make(map[string]*ScaleSet, len(s.tiers))
@@ -725,6 +742,18 @@ func WithRolloutCoordinator(c *rollout.Coordinator, every time.Duration) Control
 	return func(s *Server) {
 		s.converge = c
 		s.convergeEvery = every
+	}
+}
+
+// WithRolloutStarter gives the control plane the driver that begins a rollout
+// when the deployment's channel advances.
+//
+// OPTIONAL FOR THE REASON THE COORDINATOR IS: a deployment whose runner is not
+// the node plane has nobody to converge, so it has nothing to start either.
+func WithRolloutStarter(s *rollout.Starter, every time.Duration) ControlPlaneOption {
+	return func(srv *Server) {
+		srv.starter = s
+		srv.startEvery = every
 	}
 }
 

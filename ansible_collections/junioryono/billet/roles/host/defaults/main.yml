@@ -132,6 +132,41 @@ billet_version: ""
 # only orchestration is Ansible.
 billet_release_channel: ""
 
+# Whether this host takes the update billet decides on by itself.
+#
+# TRUE BY DEFAULT, MATCHING billet.yaml's OWN DEFAULT. billet's control plane
+# starts a rollout when the stable channel advances (release.automatic, on
+# unless written false), and two timers on each host act on it: billet-upgrade
+# runs `billet host-upgrade --from-rollout` on a host with a control plane, and
+# billet-images-refresh runs `billet images refresh` on a firecracker host. The
+# role installs both units wherever they apply and enables them when this is
+# true; false installs them disabled, so an operator who turns updates on later
+# has nothing to render.
+#
+# HOW THIS COEXISTS WITH billet_version, which is the question every operator
+# asks next. A pin is the release the role installs on a converge; a rollout is
+# the release billet installs between converges. They do not fight, because the
+# role refuses a converge that would move a host to an OLDER release than the
+# one it runs (see billet_allow_downgrade), and because an ordinary converge
+# with neither billet_version nor billet_binary_src set keeps whatever is
+# installed. So the shape for a fleet on automatic updates is: pin
+# billet_version for the FIRST install of a host, then leave both empty and let
+# rollouts own the binary. A pin left behind reads as intent the rollout has
+# already overtaken, and the role says so rather than draining a host to honour
+# it.
+billet_automatic_updates: true
+
+# Whether a converge may move a host to a release OLDER than the one it runs.
+#
+# FALSE BY DEFAULT, AND THE REFUSAL IS BEFORE THE DRAIN. A stale billet_version
+# beside a fleet that rollouts have moved on would otherwise stop the node,
+# stop the server and hide the binary before the ledger's release watermark
+# refused the older candidate and the transaction rolled back — a drain nobody
+# needed, every converge. Comparing the two binaries' own `version` output
+# first costs nothing. Set this true for a downgrade you mean, in the same run
+# as the pin that names it.
+billet_allow_downgrade: false
+
 # Where the signed channel statements are served from. Point this at an internal
 # mirror alongside billet_release_url_base for a fleet that cannot reach
 # raw.githubusercontent.com.

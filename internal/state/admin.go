@@ -38,8 +38,8 @@ var ErrSchemaBehind = errors.New("state: the ledger needs migrating and another 
 // plane: an operator runs `billet ca issue` before the server has ever started,
 // so whoever gets there first has to create the schema, and two commands racing
 // to create it must not both try.
-func OpenAdmin(ctx context.Context, stateDir string) (*DB, error) {
-	return openDir(ctx, stateDir, newSQLiteBackend(stateDir), openMode{admin: true})
+func OpenAdmin(ctx context.Context, stateDir string, opts ...OpenOption) (*DB, error) {
+	return openDir(ctx, stateDir, newSQLiteBackend(stateDir), openMode{admin: true}.with(opts))
 }
 
 // verifySchema proves the ledger is already at the schema this binary expects,

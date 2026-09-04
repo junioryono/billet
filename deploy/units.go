@@ -23,10 +23,14 @@ const (
 	// in. Embedded so a test can pin what the package installs.
 	BackupUnitName  = "billet-backup.service"
 	BackupTimerName = "billet-backup.timer"
-	// ImagesRefreshUnitName and ImagesRefreshTimerName are the oneshot that keeps
-	// a firecracker node's guest images inside GitHub's runner window and the
-	// timer that runs it. Like the backup, not part of what `billet local up`
-	// manages; `billet check` reports whether the timer is enabled.
+	// UpgradeUnitName and UpgradeTimerName are the root executor of a recorded
+	// rollout on a control-plane host, and ImagesRefreshUnitName and
+	// ImagesRefreshTimerName the daily guest-image refresh on a node. Both
+	// timers are enabled by the package — the one exception to the package
+	// enabling nothing, stated in the units themselves — and `billet local up`
+	// enables them too, as a reported last step outside the unit plan.
+	UpgradeUnitName        = "billet-upgrade.service"
+	UpgradeTimerName       = "billet-upgrade.timer"
 	ImagesRefreshUnitName  = "billet-images-refresh.service"
 	ImagesRefreshTimerName = "billet-images-refresh.timer"
 )
@@ -49,7 +53,15 @@ var BackupUnit string
 //go:embed billet-backup.timer
 var BackupTimer string
 
-// ImagesRefreshUnit and ImagesRefreshTimer are the scheduled guest image
+// UpgradeUnit and UpgradeTimer are the scheduled host upgrade this build ships.
+//
+//go:embed billet-upgrade.service
+var UpgradeUnit string
+
+//go:embed billet-upgrade.timer
+var UpgradeTimer string
+
+// ImagesRefreshUnit and ImagesRefreshTimer are the scheduled guest-image
 // refresh this build ships.
 //
 //go:embed billet-images-refresh.service
@@ -67,6 +79,13 @@ const (
 	NodeAgentLabel   = "sh.billet.node"
 	ServerAgentName  = ServerAgentLabel + ".plist"
 	NodeAgentName    = NodeAgentLabel + ".plist"
+	// UpgradeAgentLabel and ImagesAgentLabel are the Mac's scheduled oneshots:
+	// the analogues of billet-upgrade.timer and billet-images-refresh.timer, installed
+	// by `billet local up` because on a Mac that command is the converge.
+	UpgradeAgentLabel = "sh.billet.upgrade"
+	ImagesAgentLabel  = "sh.billet.images"
+	UpgradeAgentName  = UpgradeAgentLabel + ".plist"
+	ImagesAgentName   = ImagesAgentLabel + ".plist"
 )
 
 // ServerAgent and NodeAgent are the macOS launch agents this build ships.
@@ -81,3 +100,12 @@ var ServerAgent string
 
 //go:embed sh.billet.node.plist
 var NodeAgent string
+
+// UpgradeAgent and ImagesAgent are the Mac's scheduled oneshots this build
+// ships.
+//
+//go:embed sh.billet.upgrade.plist
+var UpgradeAgent string
+
+//go:embed sh.billet.images.plist
+var ImagesAgent string

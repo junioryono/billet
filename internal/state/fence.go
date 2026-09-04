@@ -230,7 +230,7 @@ var writerBarrierLimit = 30 * time.Second
 // billet.db must not be handed one — sql.Open would create the file, and the
 // next thing a restore does is decide whether a ledger is already there.
 func WriterBarrier(ctx context.Context, stateDir string) error {
-	path := filepath.Join(stateDir, "billet.db")
+	path := LedgerPath(stateDir)
 
 	if _, err := os.Lstat(path); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -367,6 +367,10 @@ func PeekAdmission(ctx context.Context, stateDir string) (Admission, error) {
 
 	return ReadAdmission(ctx, db)
 }
+
+// LedgerPath is where the SQLite ledger lives in a state directory, for a caller
+// that must know whether one exists without being handed one.
+func LedgerPath(stateDir string) string { return filepath.Join(stateDir, "billet.db") }
 
 func PeekLedger(ctx context.Context, dbPath string) (LedgerContents, error) {
 	if err := requireRegularFile(dbPath); err != nil {

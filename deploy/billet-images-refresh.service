@@ -1,18 +1,22 @@
 # One check that this node's guest images are current, and a pull if not.
 #
-# NOT ENABLED BY THE PACKAGE, and neither is its timer, for the reason the backup
-# is not: a host that boots no firecracker guests has nothing for this to do, and
-# the decision belongs to the operator of the one that does. `billet check`
-# reports a firecracker node whose timer is not enabled, because a timer that was
-# never enabled looks exactly like one that is working right up until GitHub
-# refuses the runner baked into a stale image.
+# ENABLED BY THE PACKAGE, with billet-upgrade.timer, and that is the one exception
+# to the package enabling nothing. The rule exists so that installing billet
+# cannot connect a machine to GitHub before its config says something true, and
+# this connects nothing: it reads the signed image channel, and it exits doing
+# nothing on a host that boots no firecracker guests and under
+# `release: {automatic: false}`. What it is for is the deployment nobody visits: a
+# node whose images age past GitHub's runner window launches nothing, and a timer
+# that was never enabled looks exactly like one that is working right up until
+# that day. `billet check` reports a firecracker node whose timer is not enabled.
 #
-#   systemctl enable --now billet-images-refresh.timer
+#   systemctl disable --now billet-images-refresh.timer     # to opt a host out
 #
-# `billet local up` ENABLES AND ARMS THE TIMER on a firecracker node as its last
-# step, exactly as it does the backup timer on a control-plane host, and reports
-# rather than fails when it cannot; the timer is deliberately not part of the
-# unit plan `up`/`down` prove and unwind.
+# `billet local up` ENABLES AND ARMS THE TIMER TOO, on a firecracker node, as its
+# last step, exactly as it does the backup timer on a control-plane host, and
+# reports rather than fails when it cannot, because a host converged from a
+# tarball ran no postinstall; the timer is deliberately not part of the unit
+# plan `up`/`down` prove and unwind.
 [Unit]
 Description=billet guest image refresh
 Documentation=https://github.com/junioryono/billet/blob/main/docs/operating/guest-images.md

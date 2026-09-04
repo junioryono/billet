@@ -556,42 +556,7 @@ func stageImage(
 		return manifest, staged, cleanup, nil
 	}
 
-	src, err := resolveSource(cfg, opts.source)
-	if err != nil {
-		return nil, "", nil, err
-	}
-	client := &imagesource.Client{Source: src}
-	if err := client.Resolve(ctx); err != nil {
-		return nil, "", nil, err
-	}
-	src = client.Source
-
-	identity, issuer := opts.identity, opts.issuer
-
-	if cfg.Images != nil {
-		if identity == "" {
-			identity = cfg.Images.SigningIdentity
-		}
-
-		if issuer == "" {
-			issuer = cfg.Images.SigningIssuer
-		}
-	}
-
-	policy, err := imagesource.PolicyFor(src, identity, issuer, opts.skipSig)
-	if err != nil {
-		return nil, "", nil, err
-	}
-
-	fmt.Printf("fetching %s\n", src.ManifestURL())
-
-	if policy.Required {
-		fmt.Printf("requiring a signature from %s\n", policy.Identity)
-	} else {
-		fmt.Println("WARNING: importing without verifying who published this manifest")
-	}
-
-	manifest, err := client.Manifest(ctx, policy)
+	manifest, client, err := resolveImageManifest(ctx, cfg, opts)
 	if err != nil {
 		return nil, "", nil, err
 	}
@@ -618,6 +583,63 @@ func stageImage(
 	}
 
 	return manifest, dir, cleanup, nil
+}
+
+// resolveImageManifest fetches and verifies the manifest the configured source
+// currently publishes, and hands back the client positioned to download from it.
+//
+// THE NETWORK HALF OF A PULL ON ITS OWN, because `images refresh` needs the
+// answer to "is there a newer image" without paying for the download, and a
+// second copy of the source, policy and signature steps is a second place for
+// them to disagree. Everything a pull verifies about a manifest is verified here.
+func resolveImageManifest(
+	ctx context.Context,
+	cfg *config.Config,
+	opts stageOptions,
+) (*imagesource.Manifest, *imagesource.Client, error) {
+	src, err := resolveSource(cfg, opts.source)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	client := &imagesource.Client{Source: src}
+	if err := client.Resolve(ctx); err != nil {
+		return nil, nil, err
+	}
+
+	src = client.Source
+
+	identity, issuer := opts.identity, opts.issuer
+
+	if cfg.Images != nil {
+		if identity == "" {
+			identity = cfg.Images.SigningIdentity
+		}
+
+		if issuer == "" {
+			issuer = cfg.Images.SigningIssuer
+		}
+	}
+
+	policy, err := imagesource.PolicyFor(src, identity, issuer, opts.skipSig)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	fmt.Printf("fetching %s\n", src.ManifestURL())
+
+	if policy.Required {
+		fmt.Printf("requiring a signature from %s\n", policy.Identity)
+	} else {
+		fmt.Println("WARNING: importing without verifying who published this manifest")
+	}
+
+	manifest, err := client.Manifest(ctx, policy)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return manifest, client, nil
 }
 
 // sideloadPolicy decides what a directory on disk must prove.
