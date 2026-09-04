@@ -74,15 +74,19 @@ rehearsal_require_app() {
         rehearsal_fail "BILLET_REHEARSAL_APP_KEY ${BILLET_REHEARSAL_APP_KEY} is not a file"
 }
 
-# rehearsal_github_block prints the github: block of the App config, verbatim,
-# for splicing into a rehearsal's own config. The rehearsal owns everything
-# else about its deployment; the App is the one thing it borrows.
+# rehearsal_github_block prints the github: block of the App config for
+# splicing into a rehearsal's own config, with the key path rewritten to where
+# rehearsal_install_package put the key inside the host. The rehearsal owns
+# everything else about its deployment; the App is the one thing it borrows.
+# Both the block form and the one-line flow form `github: {...}` (which
+# `billet github-app create --config` writes) are handled.
 rehearsal_github_block() {
     awk '
         /^github:/ { on = 1; print; next }
         on && /^[^ #]/ { on = 0 }
         on { print }
-    ' "${BILLET_REHEARSAL_APP_CONFIG}"
+    ' "${BILLET_REHEARSAL_APP_CONFIG}" |
+        sed -E 's#private_key_path: *[^,}]+#private_key_path: /etc/billet/app-private-key.pem#'
 }
 
 # rehearsal_fetch_release downloads one release's Debian package for the
