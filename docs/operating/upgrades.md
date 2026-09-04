@@ -53,7 +53,7 @@ Every release manifest and channel statement billet publishes is signed by `rele
 
 ## A value-scoped builder grant strands a build in flight
 
-`billet ami build` tags its builder instance with an owner value that now carries the deployment id, and a per-deployment IAM policy (`billet init iam --deployment <id> --builder`, or the `fleet-ec2` module's own rendering with a deployment) admits only that form. A builder tagged the old way carries no id, so the narrowed policy denies every action on it: measured with `iam:SimulateCustomPolicy`, `CreateImage`, `TerminateInstances` and `GetConsoleOutput` all come back `implicitDeny`.
+`billet ami build` tags its builder instance with an owner value that now carries the deployment id, and a per-deployment IAM policy (`billet init iam --deployment <id> --builder --payload-bucket <bucket>`, passed to `fleet-ec2` as `iam_policy_json`) admits only that form. A builder tagged the old way carries no id, so the narrowed policy denies every action on it: measured with `iam:SimulateCustomPolicy`, `CreateImage`, `TerminateInstances` and `GetConsoleOutput` all come back `implicitDeny`.
 
 That matters only across the upgrade, and only for a build that is running while you replace the policy. Its instance cannot be imaged, terminated or read by the role that started it, so it runs to its own timeout and you clean it up by hand.
 

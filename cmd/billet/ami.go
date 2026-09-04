@@ -207,7 +207,8 @@ func cmdAMIBuild(ctx context.Context, args []string) error {
 		// rebuild" as a broken build.
 		fmt.Printf("It was NOT verified, so it carries no AMI contract tag and `billet check`\n")
 		fmt.Printf("will report it as needing a rebuild. To boot it and stamp it:\n\n")
-		fmt.Printf("  billet ami verify %s\n\n", image)
+
+		fmt.Printf("  %s\n\n", verifyCommandFor(image, *deployment))
 	}
 	fmt.Printf("Put it in a tier:\n\n")
 	fmt.Printf("  - label: your-label\n")
@@ -397,4 +398,23 @@ func builderOwner(cfgPath, deployment, name string) (string, error) {
 		ec2.BuilderOwner("", name))
 
 	return ec2.BuilderOwner("", name), nil
+}
+
+// verifyCommandFor renders the `billet ami verify` an unverified build prints.
+//
+// THE DEPLOYMENT TRAVELS WITH IT. Verification launches its own builder-tagged
+// instance, so it needs the owner value the build stamped or a value-scoped
+// policy denies it — and an explicit --deployment is exactly the case where the
+// machine running this has no state directory to resolve one from. A bare
+// command there is one that cannot run, and whose failure names an authorization
+// rather than the missing flag.
+//
+// An empty deployment adds nothing: the command resolves the id the same way the
+// build did, from the config it is pointed at.
+func verifyCommandFor(image, deployment string) string {
+	if deployment == "" {
+		return "billet ami verify " + image
+	}
+
+	return "billet ami verify " + image + " --deployment " + shellArg(deployment)
 }

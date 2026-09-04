@@ -308,3 +308,26 @@ func TestTheBuilderOwnerRefusesAConfigItCannotRead(t *testing.T) {
 		t.Errorf("the account-wide fallback ran before the refusal:\n%s", printed)
 	}
 }
+
+// THE VERIFY COMMAND A BUILD PRINTS HAS TO BE ONE THAT RUNS.
+//
+// Verification launches its own builder-tagged instance, so it needs the owner
+// value the build stamped or a value-scoped policy denies it. An explicit
+// --deployment is exactly the case where the machine running this has no state
+// directory to resolve one from, so a bare `billet ami verify <image>` hands the
+// operator a command that cannot work and whose failure names an authorization
+// rather than the missing flag.
+func TestThePrintedVerifyCommandCarriesTheDeployment(t *testing.T) {
+	const id = "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+
+	if got, want := verifyCommandFor("ami-0abc", id),
+		"billet ami verify ami-0abc --deployment "+id; got != want {
+		t.Errorf("the printed command is %q, want %q", got, want)
+	}
+
+	// WITHOUT ONE IT ADDS NOTHING, because the command resolves the id the same
+	// way the build did, and a bare --deployment would be refused.
+	if got, want := verifyCommandFor("ami-0abc", ""), "billet ami verify ami-0abc"; got != want {
+		t.Errorf("with no deployment the printed command is %q, want %q", got, want)
+	}
+}

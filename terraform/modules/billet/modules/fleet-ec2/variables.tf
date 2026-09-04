@@ -69,23 +69,24 @@ variable "enable_spot" {
   default     = false
 }
 
-# OVERRIDING REPLACES THE NODE POLICY, AND THE BUILDER RIDES IT.
+# AN OVERRIDE SUPPLIES THE WHOLE GRANT, BUILDER AND PAYLOAD INCLUDED.
 #
-# `builder = true` attaches an ADDITIVE document granting CreateImage, the
-# console read, the promotion tag and the create-time tag for CreateImage — and
-# nothing that launches an instance. The builder's launch rides whatever the node
-# policy allows, which the committed presence-mode rendering does whatever the
-# owner tag says, and a VALUE-scoped policy does not: `billet ami build` tags its
-# builder billet-ami-build-<image>, never the deployment id.
+# There are exactly two supported shapes, and mixing them is refused on `builder`
+# below:
 #
-# The module cannot check this for you. Whether an arbitrary IAM document admits
-# that launch is not a question a string comparison answers — a presence-mode
-# policy admits it while containing no such literal, and a document naming the
-# prefix in a Sid or a Deny admits nothing — and a gate that is wrong in either
-# direction is worse than the operator knowing the rule. Issue #61 removes the
-# coupling instead, by making the builder document self-sufficient.
+#   1. No override. The module renders billet's own generator output and, with
+#      `builder = true`, attaches its builder document beside it. Both are
+#      ACCOUNT-WIDE, because the module has no deployment id at apply time — the
+#      control plane mints one on its first run — and they agree with each other.
+#
+#   2. An override, with `builder = false`. You generate one document carrying
+#      everything, and it can be VALUE-scoped because you know the id by then.
+#
+# Mixing them puts a narrow node policy beside a wide builder policy, and IAM
+# unions allows: the role gets the wide one, and the isolation the override was
+# chosen for is gone (issue #56).
 variable "iam_policy_json" {
-  description = "Override the node role's policy document entirely (the output of `billet init iam`). Empty renders the committed generator output for the enabled features. WITH builder = true, generate the override with `--builder` too: the builder policy is additive and grants nothing that launches an instance, so a value-scoped override generated without it denies the build's first call."
+  description = "Override the node role's policy document entirely. Empty renders the committed generator output for the enabled features. Cannot be combined with builder = true — generate one document carrying every grant instead, with `billet init iam --deployment <id> --builder --payload-bucket <bucket>`, and leave the two builder inputs at their defaults."
   type        = string
   default     = ""
 }
@@ -117,7 +118,7 @@ variable "builder" {
     # both directions; whether an arbitrary IAM document admits the builder is
     # not a question terraform can answer, and this one does not ask it.
     condition     = !var.builder || var.iam_policy_json == ""
-    error_message = "builder = true cannot be combined with iam_policy_json. This module's builder rendering is account-wide, because the module has no deployment id at apply time, and IAM unions allows — so beside a value-scoped override it hands the role account-wide reach over every deployment's builders in the account. Generate the override with `billet init iam --deployment <id> --builder` instead, so one document carries the node grant and the builder grant together, and leave builder = false."
+    error_message = "builder = true cannot be combined with iam_policy_json. This module's builder rendering is account-wide, because the module has no deployment id at apply time, and IAM unions allows — so beside a value-scoped override it hands the role account-wide reach over every deployment's builders in the account. Generate the override with `billet init iam --deployment <id> --builder --payload-bucket <bucket>` instead, so one document carries the node grant, the builder grant and the payload statement together, and leave builder = false. The payload bucket is not optional: `billet ami build` requires --payload-bucket, so an override without that statement fails at the staging step."
   }
 }
 

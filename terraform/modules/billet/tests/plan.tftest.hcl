@@ -475,3 +475,24 @@ run "root_creates_no_backups_by_default" {
     error_message = "the cost inputs must say the bucket is off by default"
   }
 }
+
+# THE ROOT REFUSES A BUILDER BESIDE AN OVERRIDE, at the layer an operator typed
+# both into.
+#
+# The child refuses it too, and must, being an exported entry point of its own —
+# but a refusal that surfaces from a module the operator did not write names
+# inputs they cannot see. The reason is the child's: the builder grant this
+# module attaches is account-wide, because there is no deployment id at apply
+# time, and IAM unions allows, so beside a value-scoped override it would hand
+# the node role account-wide reach over every deployment's builders.
+run "root_refuses_a_builder_beside_an_override" {
+  command = plan
+
+  variables {
+    name            = "billet-test"
+    builder         = true
+    iam_policy_json = "{\"Version\":\"2012-10-17\",\"Statement\":[]}"
+  }
+
+  expect_failures = [var.builder]
+}

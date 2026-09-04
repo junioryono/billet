@@ -583,8 +583,8 @@ run "no_builder_grant_unless_asked" {
     error_message = "a deployment that did not ask to build images must carry no builder grant"
   }
   assert {
-    condition     = output.builder_granted == false
-    error_message = "the builder grant must be reported as absent"
+    condition     = output.builder_policy_attached == false
+    error_message = "this module attached no builder policy and must report so"
   }
 }
 
