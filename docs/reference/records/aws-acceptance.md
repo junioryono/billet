@@ -59,7 +59,7 @@ Until 2026-09-04 the workflow above had never run: the role it assumes did not e
 
 **One guard the account states that the generator does not.** The account-wide policy grants `ec2:RunInstances` on `*`, and RunInstances authorises any snapshot a block-device mapping names; the same account keeps the production ledger volume's daily snapshots, a volume holding the deployment identity and the node-wire CA key. The role therefore carries an explicit deny on `ec2:RunInstances` for `arn:aws:ec2:*::snapshot/*` when `ec2:ResourceTag/sh.billet.owner` is null. Measured with `aws iam simulate-principal-policy` on 2026-09-04: `RunInstances` against a production ledger snapshot ARN is an explicit deny from that policy; the same with an owner tag in context is allowed; a plain instance launch is allowed. The generator is asked to carry the guard itself in issue #39, because the exposure is the same wherever a node role shares an account with anything that has snapshots.
 
-The first run of the workflow itself waits on one secret only a person can mint, the token that dispatches the guide repository's workflow.
+The workflow first expected a secret only a person can mint, a fine-grained personal access token that dispatches the guide repository's workflow, and nobody had minted one. It now mints that credential itself from the App key it already stages, as the paragraph on dispatch above says; the acceptance App was given `actions: write` on the guide repository for exactly that step, and nothing else about its permissions moved.
 
 ## Environment
 
