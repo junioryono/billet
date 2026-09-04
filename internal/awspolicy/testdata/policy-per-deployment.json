@@ -60,7 +60,7 @@
         "StringLike": {
           "aws:RequestTag/sh.billet.owner": [
             "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
-            "billet-ami-build-*"
+            "billet-ami-build-0f1e2d3c4b5a69788796a5b4c3d2e1f0-*"
           ]
         },
         "StringLikeIfExists": {
@@ -276,7 +276,7 @@
       "Condition": {
         "StringLike": {
           "aws:ResourceTag/sh.billet.owner": [
-            "billet-ami-build-*"
+            "billet-ami-build-0f1e2d3c4b5a69788796a5b4c3d2e1f0-*"
           ]
         }
       }
@@ -304,7 +304,7 @@
       "Condition": {
         "StringLike": {
           "aws:ResourceTag/sh.billet.owner": [
-            "billet-ami-build-*"
+            "billet-ami-build-0f1e2d3c4b5a69788796a5b4c3d2e1f0-*"
           ]
         }
       }
@@ -321,7 +321,7 @@
       "Condition": {
         "StringLike": {
           "aws:ResourceTag/sh.billet.owner": [
-            "billet-ami-build-*"
+            "billet-ami-build-0f1e2d3c4b5a69788796a5b4c3d2e1f0-*"
           ]
         }
       }
@@ -338,7 +338,7 @@
       "Condition": {
         "StringLike": {
           "aws:ResourceTag/sh.billet.owner": [
-            "billet-ami-build-*"
+            "billet-ami-build-0f1e2d3c4b5a69788796a5b4c3d2e1f0-*"
           ]
         }
       }

@@ -6,6 +6,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/junioryono/billet/internal/provider/ec2"
 )
 
 func sids(p Policy) []string {
@@ -612,9 +614,13 @@ func TestCreateTagsAllowsBuilderPrefix(t *testing.T) {
 	if !ok {
 		t.Fatalf("builder CreateTags has no StringLike owner condition: %v", stmt(t, p, "BilletRuntimeTag").Condition)
 	}
+	// THE BUILDER HALF IS THIS DEPLOYMENT'S BUILDERS, not every builder in the
+	// account. The bare prefix here would let a value-scoped role tag a launch
+	// with another deployment's builder value and then act on it through the
+	// builder statements, which is the hole issue #56 named.
 	vals, ok := like["aws:RequestTag/sh.billet.owner"].([]string)
-	if !ok || len(vals) != 2 || vals[0] != "0f1e2d3c4b5a69788796a5b4c3d2e1f0" || vals[1] != "billet-ami-build-*" {
-		t.Errorf("builder CreateTags owner values are %v, want [<owner>, billet-ami-build-*]", vals)
+	if !ok || len(vals) != 2 || vals[0] != "0f1e2d3c4b5a69788796a5b4c3d2e1f0" || vals[1] != "billet-ami-build-0f1e2d3c4b5a69788796a5b4c3d2e1f0-*" {
+		t.Errorf("builder CreateTags owner values are %v, want [<owner>, billet-ami-build-0f1e2d3c4b5a69788796a5b4c3d2e1f0-*]", vals)
 	}
 }
 
@@ -688,7 +694,9 @@ func TestOnlyABuilderMayTagAnImageOnCreate(t *testing.T) {
 // the promotion's condition is on the RESOURCE tag, which the image carries
 // because CreateImage stamped it.
 func TestTheVerificationGrantsAreScopedToTheBuilder(t *testing.T) {
-	p, err := Inputs{Owner: "0f1e2d3c4b5a69788796a5b4c3d2e1f0", Builder: true}.Build()
+	const owner = "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+
+	p, err := Inputs{Owner: owner, Builder: true}.Build()
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -722,9 +730,14 @@ func TestTheVerificationGrantsAreScopedToTheBuilder(t *testing.T) {
 					tc.sid, s.Condition)
 			}
 
+			// THIS DEPLOYMENT'S BUILDERS, not every builder in the account: the
+			// console carries whatever the build printed and the promote stamps
+			// the contract a verified image proved, so reaching another
+			// deployment's build through either is issue #56's hole.
 			vals, ok := like["aws:ResourceTag/sh.billet.owner"].([]string)
-			if !ok || len(vals) != 1 || vals[0] != "billet-ami-build-*" {
-				t.Errorf("%s is conditioned on %v, want [billet-ami-build-*]", tc.sid, vals)
+			if !ok || len(vals) != 1 || vals[0] != ec2.BuilderOwnerPattern(owner) {
+				t.Errorf("%s is conditioned on %v, want [%s]", tc.sid, vals,
+					ec2.BuilderOwnerPattern(owner))
 			}
 		})
 	}
@@ -1121,9 +1134,11 @@ func TestABuilderWithRuntimeStatementsTagsThroughTheRuntimeGrant(t *testing.T) {
 	}
 }
 
-// IN PER-DEPLOYMENT MODE THE BUILDER MAY STAMP ONLY ITS OWN OWNER PREFIX, so
-// the grant cannot put another deployment's identity on an image it created.
-func TestABuilderOnlyTagGrantIsScopedToTheBuilderPrefix(t *testing.T) {
+// IN PER-DEPLOYMENT MODE THE BUILDER MAY STAMP ONLY THIS DEPLOYMENT'S OWN
+// BUILDER VALUE, so the grant cannot put another deployment's builder identity
+// on an image it created and then reach it through the statements that act on
+// that value.
+func TestABuilderOnlyTagGrantIsScopedToThisDeploymentsBuilders(t *testing.T) {
 	p, err := Inputs{
 		Owner: "0f1e2d3c4b5a69788796a5b4c3d2e1f0", NoCompute: true, Builder: true,
 	}.Build()
@@ -1136,8 +1151,102 @@ func TestABuilderOnlyTagGrantIsScopedToTheBuilderPrefix(t *testing.T) {
 		t.Fatalf("a per-deployment builder tag grant carries no request-tag condition")
 	}
 
+	// THE BARE PREFIX IS THE FAILURE THIS NAMES. It reaches every builder in the
+	// account, which is what account-wide mode wants and what a value-scoped
+	// policy must not have.
 	vals, ok := like["aws:RequestTag/sh.billet.owner"].([]string)
+	if !ok || !slices.Equal(vals, []string{"billet-ami-build-0f1e2d3c4b5a69788796a5b4c3d2e1f0-*"}) {
+		t.Errorf("the tag grant admits %v, want only this deployment's own builders", vals)
+	}
+}
+
+// AND EVERY BUILDER STATEMENT IS SCOPED THE SAME WAY, which is the whole of
+// issue #56: the value `billet ami build` stamps carried no deployment id while
+// the runtime's did, so a value-scoped policy isolated a deployment's job
+// instances and left its BUILDERS reachable by every other deployment in the
+// account — imaging, terminating, reading a console, stamping a contract.
+//
+// Asserted over every statement rather than one, because the hole was that four
+// of them agreed with each other and not with the tagger.
+func TestEveryBuilderStatementIsScopedToThisDeployment(t *testing.T) {
+	p, err := Inputs{Owner: "0f1e2d3c4b5a69788796a5b4c3d2e1f0", NoCompute: true, Builder: true}.Build()
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	want := ec2.BuilderOwnerPattern("0f1e2d3c4b5a69788796a5b4c3d2e1f0")
+	if want == ec2.BuilderOwnerPrefix+"*" {
+		t.Fatal("the pattern for a named deployment is the account-wide one, so the " +
+			"assertions below cannot tell the two modes apart")
+	}
+
+	scoped := 0
+
+	for _, st := range p.Statement {
+		if !strings.HasPrefix(st.Sid, "BilletAMIBuilder") {
+			continue
+		}
+
+		// The payload statement is an S3 grant on a bucket, with no owner tag to
+		// condition on; the image statement is deliberately unconditioned,
+		// because the image does not exist yet and the source instance is what
+		// bounds the call.
+		if st.Sid == "BilletAMIBuilderPayload" || st.Sid == "BilletAMIBuilderImage" {
+			continue
+		}
+
+		like, ok := st.Condition["StringLike"].(map[string]any)
+		if !ok {
+			t.Errorf("%s carries no StringLike condition, so it is not scoped at all", st.Sid)
+
+			continue
+		}
+
+		var found bool
+
+		for key, v := range like {
+			if !strings.HasSuffix(key, ec2.OwnerTagKey) {
+				continue
+			}
+
+			found = true
+
+			if vals, ok := v.([]string); !ok || !slices.Equal(vals, []string{want}) {
+				t.Errorf("%s admits %v, want exactly %q", st.Sid, v, want)
+			}
+		}
+
+		if !found {
+			t.Errorf("%s conditions on no owner tag at all", st.Sid)
+		}
+
+		scoped++
+	}
+
+	// A LOOP OVER A SET THAT COULD BE EMPTY PROVES NOTHING, and the builder
+	// statements are exactly what a refactor could rename out from under this.
+	if scoped < 3 {
+		t.Fatalf("only %d builder statements were scoped; the source, terminate, console "+
+			"and promote statements should all have been", scoped)
+	}
+}
+
+// ACCOUNT-WIDE MODE KEEPS THE BARE PREFIX, because it has no deployment to
+// distinguish: folding an empty id in would produce `billet-ami-build--*` and
+// match nothing billet ever stamps.
+func TestAccountWideBuilderStatementsKeepTheBarePrefix(t *testing.T) {
+	p, err := Inputs{NoCompute: true, Builder: true}.Build()
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	like, ok := stmt(t, p, "BilletAMIBuilderSource").Condition["StringLike"].(map[string]any)
+	if !ok {
+		t.Fatal("the builder source statement carries no owner condition")
+	}
+
+	vals, ok := like["aws:ResourceTag/sh.billet.owner"].([]string)
 	if !ok || !slices.Equal(vals, []string{"billet-ami-build-*"}) {
-		t.Errorf("the tag grant admits %v, want only the builder's own prefix", vals)
+		t.Errorf("account-wide mode admits %v, want every builder in the account", vals)
 	}
 }

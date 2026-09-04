@@ -49,6 +49,40 @@ const BuilderPayloadKeyPrefix = "billet-payload-"
 // with a deployment's job instances.
 const BuilderOwnerPrefix = "billet-ami-build-"
 
+// BuilderOwner is the owner-tag value a build stamps, and BuilderOwnerPattern is
+// what an IAM policy must match to reach it. THEY ARE ONE FUNCTION APART ON
+// PURPOSE: a tagger and a policy deciding this separately is the defect the pair
+// was written to close (issue #56). The value carried no deployment id while the
+// runtime's did, so a value-scoped policy isolated a deployment's job instances
+// and not its builders, and two deployments in one account could image,
+// terminate, read the console of and stamp each other's builds.
+//
+// MEASURED 2026-09-04 with iam:SimulateCustomPolicy against a live account: a
+// role scoped to `billet-ami-build-<deployment>-*` is allowed on its own
+// builder, implicitly denied on another deployment's, and implicitly denied on
+// an ordinary job instance of its own deployment. The same held at create time
+// against aws:RequestTag, which AWS authorizes separately, so both moved
+// together.
+//
+// AN EMPTY DEPLOYMENT IS THE ACCOUNT-WIDE MODE, not an oversight: that mode
+// scopes by tag presence because there is no id to scope to, and a build run
+// before a deployment has minted one has nothing to fold in. The value and the
+// pattern then keep the shape they had, which is what leaves that mode working
+// unchanged.
+func BuilderOwner(deployment, name string) string {
+	if deployment == "" {
+		return BuilderOwnerPrefix + name
+	}
+
+	return BuilderOwnerPrefix + deployment + "-" + name
+}
+
+// BuilderOwnerPattern is the IAM match for every builder of one deployment, or
+// for every builder in the account when no deployment is named.
+func BuilderOwnerPattern(deployment string) string {
+	return BuilderOwner(deployment, "*")
+}
+
 // OwnerTagKey is the tag billet stamps on every instance and cache volume/snapshot
 // it creates, carrying the deployment identity. A bundled IAM policy conditions the
 // destructive actions on this tag: on its exact VALUE (the deployment id) when
