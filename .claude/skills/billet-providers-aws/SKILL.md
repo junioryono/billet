@@ -53,6 +53,8 @@ description: "The two AWS compute backends and the AWS plumbing they share: ec2 
 
 **`terraform destroy` refuses under a running build, and it is the module that refuses.** `DeleteProject` succeeds while a build is in its `BUILD` phase (measured 2026-09-02); `refuse-active-builds.sh` walks the project's builds through the operator's `aws` CLI as a destroy-time provisioner, pins `TZ=UTC`, and never calls `StopBuild`. `BILLET_SKIP_ACTIVE_BUILD_GUARD=1` is the operator asserting the fleet was drained.
 
+**`ec2:RunInstances` on `*` authorises every snapshot a block-device mapping names.** The account-wide node policy grants it unconditioned, so a node role can launch an instance with any snapshot in the account attached and read it: in a shared account that is the control plane's ledger snapshots, identity and CA key included. Every other route to a foreign snapshot is closed by the generator's tag conditions (`BilletCacheCloneSource`, `BilletCacheAttach`); this one is open until #39 adds the deny to what `awspolicy` renders. The acceptance role carries it by hand: deny `ec2:RunInstances` on `arn:aws:ec2:*::snapshot/*` when `ec2:ResourceTag/sh.billet.owner` is null, measured with `simulate-principal-policy` (explicit deny on an untagged snapshot, allowed with the tag, allowed for a plain launch; 2026-09-04).
+
 ## Measured facts
 
 - SDK cost: 13.2MB and 15 modules for one `RunInstances`, versus 21.8MB for all of billet.

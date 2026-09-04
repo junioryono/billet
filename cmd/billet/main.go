@@ -2478,6 +2478,10 @@ func cmdCAIssue(ctx context.Context, args []string) error {
 	reissue := fs.Bool("reissue", false,
 		"deliberately replace an existing bundle directory (the old one is moved to "+
 			"<dir>.replaced; the old certificate stays valid until revoked)")
+	lifetime := fs.Duration("lifetime", wirecert.LeafLifetime,
+		"how long the certificate is good for (default a year; the node renews it on its "+
+			"own once less than a third remains). Shorter for a short-lived host or a "+
+			"rotation rehearsal; never below "+wirecert.MinIssuedLifetime.String())
 
 	name, err := parseWithName(fs, args)
 	if err != nil {
@@ -2485,7 +2489,17 @@ func cmdCAIssue(ctx context.Context, args []string) error {
 	}
 
 	if name == "" {
-		return errors.New("usage: billet ca issue <node> [--out <dir>]")
+		return errors.New("usage: billet ca issue <node> [--out <dir>] [--lifetime <duration>]")
+	}
+
+	// The bounds are wirecert's (IssueNodeFor refuses outside them); checked here
+	// too so the refusal arrives before the config is loaded and the authority
+	// touched, naming the flag.
+	if *lifetime < wirecert.MinIssuedLifetime || *lifetime > wirecert.LeafLifetime {
+		return fmt.Errorf("--lifetime %s is outside [%s, %s]: a node renews on a five-minute "+
+			"sweep once a third of the life remains, so a shorter leaf expires in place, and a "+
+			"longer one is not something an authority issues", *lifetime,
+			wirecert.MinIssuedLifetime, wirecert.LeafLifetime)
 	}
 
 	// VALIDATED HERE, not on first connection. The common name IS the node's
@@ -2516,7 +2530,7 @@ func cmdCAIssue(ctx context.Context, args []string) error {
 		return err
 	}
 
-	bundle, err := authority.Issuing.IssueNode(name)
+	bundle, err := authority.Issuing.IssueNodeFor(name, *lifetime)
 	if err != nil {
 		return err
 	}
