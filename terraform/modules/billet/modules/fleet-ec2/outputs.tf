@@ -44,3 +44,8 @@ output "spot_node_name" {
   # router is told it serves, and three copies of one literal is two that can drift.
   value = var.enable_spot ? aws_sqs_queue.interruptions[0].name : ""
 }
+
+output "builder_granted" {
+  description = "Whether the node role carries the AMI builder's grant. When false, `billet ami build` needs credentials of its own from somewhere else."
+  value       = var.builder
+}

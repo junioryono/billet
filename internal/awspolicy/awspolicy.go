@@ -73,10 +73,82 @@
 // key whose policy or grants admit foreign roles reopens the boundary on the
 // key side, which no identity policy can see.
 //
+// A LAUNCH MAY NOT ATTACH A SNAPSHOT BILLET DOES NOT OWN — this deployment's, in
+// per-deployment mode; any billet-owned one in account-wide mode, which is the
+// same weaker boundary every other condition here falls back to without an id.
+// That is the one boundary RunInstances-on-"*" cannot draw by being scoped:
+// RunInstances authorizes every snapshot a block-device mapping names, so an
+// unconditioned grant lets a node role launch an instance with ANY snapshot in the
+// account attached and read it — in a shared account that is the control plane's
+// own ledger snapshots, a volume holding the deployment identity and the node-wire
+// CA key. The other two routes to a foreign snapshot are already closed by tag
+// conditions (BilletCacheCloneSource on CreateVolume, BilletCacheAttach); this one
+// is closed by an explicit DENY, because the Allow it bounds cannot be narrowed
+// without denying the launch itself.
+//
+// MEASURED WITH iam:SimulateCustomPolicy, 2026-09-04, both modes and both
+// directions each. Per-deployment (StringNotEquals on the owner value): a snapshot
+// with no owner tag is an explicitDeny, one carrying ANOTHER deployment's owner is
+// an explicitDeny, one carrying this deployment's own is allowed, and a plain
+// launch (instance + image) is allowed. Account-wide (Null true, the tag absent):
+// an untagged snapshot is an explicitDeny and a tagged one is allowed. The
+// per-deployment case needs no second statement for the untagged snapshot, which
+// is a property of IAM rather than of this document: a NEGATED operator evaluates
+// true when the key is absent from the request context, so one StringNotEquals
+// catches both the foreign owner and the missing tag.
+//
+// THE ACCOUNT FIELD IS A WILDCARD, NOT EMPTY, AND THE DIFFERENCE IS THE WHOLE
+// GUARD. An EBS snapshot ARN is documented account-less and BilletCacheCloneSource
+// matches exactly that shape — but a Deny must match every spelling the resource
+// could take, and measured on the same day, `arn:aws:ec2:*::snapshot/*` answers
+// ALLOWED for `arn:aws:ec2:us-west-2:<account>:snapshot/snap-…` while
+// `arn:aws:ec2:*:*:snapshot/*` denies both. So this statement takes the wildcard,
+// the same shape BilletCacheSnapshotCreate and BilletAMIBuilderImage already use.
+//
+// NOTHING BILLET SENDS IS DENIED BY IT: billet's own RunInstances names no
+// snapshot (setBlockDevices writes DeleteOnTermination and VolumeSize, never a
+// SnapshotId) and a cache clone goes through CreateVolume, which is a different
+// action.
+//
+// ASKED OF EC2 ITSELF, 2026-09-04, three RunInstances --dry-run calls under a
+// throwaway role holding exactly the rendering below, against the account's real
+// control-plane ledger snapshot (untagged) and the AMI billet boots:
+//
+//	this policy, billet's own launch shape        DryRunOperation
+//	this policy, that snapshot in a mapping       UnauthorizedOperation, explicit deny
+//	the PREVIOUS policy, the same mapping         DryRunOperation
+//
+// The third line is what the guard is for: before this statement EC2 AUTHORIZED
+// that request, and what it attaches is a volume holding the deployment identity
+// and the CA key, to a machine that runs somebody's workflow. (A dry run answers
+// the authorization question and no other, which is the question here; it says
+// nothing about capacity.) The first line says billet's own launch is untouched,
+// and it answers the AMI question a simulation cannot reach: that launch was
+// allowed although the AMI's own backing snapshot is untagged, so the AMI's
+// backing snapshot was not evaluated while a snapshot the mapping NAMES was. That
+// is measured for the image the acceptance lane boots and the request billet
+// sends, which is the case that matters — and if AWS ever changed it, the failure
+// is a refused launch rather than a widened grant, which is the direction this
+// package chooses everywhere. EC2's own refusal also names the resource it
+// evaluated, `arn:aws:ec2:us-west-2::snapshot/snap-…` — account-less, as the
+// section above says, which the wildcard account matches and would keep matching
+// if that spelling ever changed.
+//
+// WHAT IT DOES NOT CLOSE, in account-wide mode, is another billet deployment's
+// TAGGED snapshot — the same limitation BilletCacheCloneSource states one section
+// up, for the same reason (presence is all a policy with no deployment id can
+// ask), and closed by the same thing: a per-deployment KMS key.
+//
 // THE BUILDER IS SCOPED SEPARATELY. `billet ami build` tags its builder instance
 // with a per-build owner (BuilderOwnerPrefix + name), NOT a deployment id, so the
 // --builder statements match that prefix by StringLike and carry their own
 // Terminate — the deployment-scoped runtime Terminate would not reach a builder.
+// The snapshot deny above gets NO builder exemption, which is deliberate in both
+// directions: a build launches from a base image and from the image it just made,
+// and neither names a snapshot, so an exemption would authorize nothing it needs —
+// and with the CreateImage request billet sends today it could not help anyway,
+// because that request tags only the image, so a builder's own backing snapshots
+// carry no owner tag for an exemption to match.
 //
 // VALIDATED AGAINST A LIVE AWS ACCOUNT with iam:SimulateCustomPolicy in both
 // modes: every action billet performs is allowed for its own tagged resources with
@@ -116,8 +188,11 @@ type Policy struct {
 	Statement []Statement `json:"Statement"`
 }
 
-// Statement is one Allow rule. Condition is omitted when empty so an
-// unconditioned statement does not render an empty object.
+// Statement is one rule. Every statement here is an Allow but one — the snapshot
+// boundary the package comment describes, which has to be a Deny because the
+// Allow it bounds cannot be narrowed without denying billet's own launches.
+// Condition is omitted when empty so an unconditioned statement does not render an
+// empty object.
 type Statement struct {
 	Sid       string         `json:"Sid"`
 	Effect    string         `json:"Effect"`
@@ -159,6 +234,21 @@ type Backup struct {
 	// A full key ARN, not an alias or a bare id: IAM resource scoping needs one,
 	// and a bare `*` would grant every key in the account.
 	KMSKeyARN string
+}
+
+// Payload describes the bucket `billet ami build` stages its shared installers
+// in, when they are too large for EC2's user-data limit to carry.
+//
+// THE GRANT IS SCOPED BY OBJECT NAME, NOT BY PREFIX, and that is stricter than a
+// prefix would be. billet writes `billet-payload-<digest>-<nonce>.tar.gz` at the
+// bucket root and refuses a key containing a slash, so the resource can name
+// exactly the objects billet creates — an operator may keep anything else in the
+// same bucket and this role cannot read, replace or delete it.
+type Payload struct {
+	// Bucket is where the archive is staged. It lands in an IAM Resource ARN, so
+	// it must be literal: a `*` here would reach every bucket whose name shares
+	// the prefix.
+	Bucket string
 }
 
 // Identity describes what a CONTROL PLANE needs to reach this deployment's
@@ -313,6 +403,12 @@ type Inputs struct {
 	InstanceProfileRoleARN string
 	// Builder adds the ec2:CreateImage the AMI builder needs.
 	Builder bool
+	// Payload, when non-nil, adds the S3 statements `billet ami build
+	// --payload-bucket` needs to stage the shared installers. It is meaningful
+	// only for a BUILDER and is refused without one: nothing else billet does
+	// touches that bucket, so granting it to a plain node role would widen the
+	// role every job's instance is launched by for a command it never runs.
+	Payload *Payload
 	// NoCompute omits the runtime statements entirely, for a principal that
 	// launches nothing.
 	//
@@ -394,6 +490,19 @@ func (in Inputs) Build() (Policy, error) {
 			Statement{
 				Sid: "BilletRuntimeLaunch", Effect: "Allow",
 				Action: ec2.RuntimeLaunchIAMActions(), Resource: []string{"*"},
+			},
+			// AND THE ONE THING THAT LAUNCH MAY NOT ATTACH: a snapshot this deployment
+			// does not own. RunInstances authorizes every snapshot a block-device
+			// mapping names, so the Allow above is also a read of any snapshot in the
+			// account — the ledger's among them. It cannot be narrowed (it creates
+			// several resource types at once), so the boundary is a Deny beside it. See
+			// the package comment for the simulation and for why billet's own launches,
+			// which name no snapshot, are unaffected.
+			Statement{
+				Sid: "BilletRuntimeDenyForeignSnapshot", Effect: "Deny",
+				Action:    ec2.RuntimeLaunchIAMActions(),
+				Resource:  []string{"arn:" + partition + ":ec2:*:*:snapshot/*"},
+				Condition: foreignOwnerCondition("aws:ResourceTag/"+ec2.OwnerTagKey, in.Owner),
 			},
 			// Tagging only as part of a create, AND — in per-deployment mode — only with
 			// this deployment's own owner value. Without the value condition a role could
@@ -553,6 +662,91 @@ func (in Inputs) Build() (Policy, error) {
 				Condition: builderOwnerCondition(),
 			},
 		)
+
+		// THE CREATE-TIME TAG CHECK, FOR A BUILDER-ONLY POLICY.
+		//
+		// `billet ami build` sends a TagSpecification on CreateImage, and AWS
+		// authorizes that as a SEPARATE ec2:CreateTags check keyed on
+		// ec2:CreateAction — measured with --dry-run: the identical call is
+		// refused `UnauthorizedOperation ... ec2:CreateTags` when nothing grants
+		// it, and succeeds when something does. A policy that grants
+		// ec2:CreateImage without it therefore cannot build at all.
+		//
+		// The RUNTIME statement is what normally satisfies it: createTagCondition
+		// appends CreateImage to its CreateAction list when Builder is set. But a
+		// NoCompute policy has no runtime statement, and that is exactly the shape
+		// the terraform module attaches beside an unchanged node rendering — so
+		// without this the module's `builder = true` would grant CreateImage and
+		// still be denied, which is worse than not granting it, because the module
+		// says the build now works. Emitted only for NoCompute, so a policy
+		// carrying both blocks does not say the same thing twice.
+		if in.NoCompute {
+			tag := Statement{
+				Sid: "BilletAMIBuilderTag", Effect: "Allow",
+				Action: ec2.RuntimeTagIAMActions(), Resource: []string{"*"},
+				Condition: map[string]any{
+					"StringEquals": map[string]any{"ec2:CreateAction": []string{"CreateImage"}},
+				},
+			}
+
+			// In per-deployment mode the tag it may stamp is the BUILDER's own
+			// prefix and nothing else: this statement exists for `ami build`,
+			// which always tags with it, so a wider allowance would let this role
+			// stamp another deployment's owner onto an image it created.
+			if in.Owner != "" {
+				tag.Condition["StringLike"] = map[string]any{
+					"aws:RequestTag/" + ec2.OwnerTagKey: []string{ec2.BuilderOwnerPrefix + "*"},
+				}
+			}
+
+			p.Statement = append(p.Statement, tag)
+		}
+	}
+
+	// THE PAYLOAD BUCKET IS THE BUILDER'S, AND ONLY THE BUILDER'S. Refused
+	// without Builder rather than ignored, because a caller who passed it meant
+	// to grant something and silently dropping it is how a build fails on a
+	// permission the operator believes they gave.
+	if in.Payload != nil {
+		if !in.Builder {
+			return Policy{}, errors.New("awspolicy: a payload bucket is only meaningful for a " +
+				"builder; `billet ami build` is the one command that stages installers in it")
+		}
+
+		if in.Payload.Bucket == "" {
+			return Policy{}, errors.New("awspolicy: a payload policy needs the S3 bucket name")
+		}
+
+		if err := literalARNComponent("payload bucket", in.Payload.Bucket); err != nil {
+			return Policy{}, err
+		}
+
+		// A SLASH MAKES IT A KEY RATHER THAN A BUCKET, and the resulting ARN is
+		// structurally valid and matches nothing: the grant would be accepted,
+		// reach no object, and the build would fail downloading its own payload
+		// on a permission the operator believes they gave. No S3 bucket name
+		// contains one, so this can only ever be a mistake.
+		//
+		// WHETHER BILLET CAN SIGN FOR THE NAME IS ASKED WHERE ONE IS TYPED, not
+		// here. ec2.CheckPayloadBucket is the stager's own rule and demands
+		// lowercase; this generator also renders for the terraform module, whose
+		// committed policy carries an UPPERCASE sentinel precisely so no real
+		// value can collide with it. So the two entry points an operator names a
+		// bucket through — `billet init iam --payload-bucket` and the module's
+		// own variable — apply that rule, and this keeps the ARN safe.
+		if strings.Contains(in.Payload.Bucket, "/") {
+			return Policy{}, fmt.Errorf("awspolicy: the payload bucket %q contains a slash, so it "+
+				"names a key rather than a bucket; the grant would match no object at all",
+				in.Payload.Bucket)
+		}
+
+		p.Statement = append(p.Statement, Statement{
+			Sid: "BilletAMIBuilderPayload", Effect: "Allow",
+			Action: ec2.BuilderPayloadIAMActions(),
+			Resource: []string{
+				"arn:" + partition + ":s3:::" + in.Payload.Bucket + "/" + ec2.BuilderPayloadKeyPrefix + "*",
+			},
+		})
 	}
 
 	if in.InstanceProfileRoleARN != "" {
@@ -1206,6 +1400,26 @@ func ownerTagCondition(key, owner string) map[string]any {
 	return map[string]any{"StringEquals": map[string]any{key: owner}}
 }
 
+// foreignOwnerCondition is ownerTagCondition's negation: it matches a resource
+// this deployment does not own, which is what a DENY has to ask. With a deployment
+// id that is StringNotEquals on the exact value; without one it is the tag being
+// absent.
+//
+// ONE STATEMENT COVERS BOTH FOREIGN CASES IN VALUE MODE, and that is IAM's rule
+// rather than this document's: a negated matching operator evaluates TRUE when the
+// key is absent from the request context, so StringNotEquals denies an untagged
+// resource as well as one carrying somebody else's owner. Measured with
+// iam:SimulateCustomPolicy on 2026-09-04 rather than read — a policy that needed a
+// second Null statement and did not have one would fail open on exactly the
+// resource this guard is about.
+func foreignOwnerCondition(key, owner string) map[string]any {
+	if owner == "" {
+		return map[string]any{"Null": map[string]any{key: "true"}}
+	}
+
+	return map[string]any{"StringNotEquals": map[string]any{key: owner}}
+}
+
 // withCacheOwnerPresent adds "the cache-owner tag is present" to an owner
 // condition, so a delete requires BOTH the owner match and the cache-owner tag —
 // the owner scopes to the deployment, the cache-owner marks it a cache resource.
@@ -1302,6 +1516,16 @@ func createTagCondition(owner string, builder bool) map[string]any {
 // builderOwnerCondition matches the builder's per-build owner value by prefix, so
 // the builder's permissions reach only builder instances — never a deployment's
 // job instances, whatever mode the rest of the policy is in.
+//
+// AND ONLY BY PREFIX, WHICH IS A BOUNDARY THIS DOES NOT DRAW. `billet ami build`
+// stamps `billet-ami-build-<image name>`, which carries no deployment id, so in
+// a shared account two deployments that both hold a builder grant can act on
+// each other's BUILDER instances — imaging, terminating, reading a console,
+// stamping a contract tag. Their job instances, cache volumes and snapshots stay
+// isolated, because those are conditioned on the owner tag's VALUE. Closing this
+// needs a deployment-scoped tag on the builder itself and a matching condition
+// here, which changes what `ami build` sends and wants measuring against a real
+// account: issue #56.
 func builderOwnerCondition() map[string]any {
 	return map[string]any{
 		"StringLike": map[string]any{

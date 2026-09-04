@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -153,7 +154,10 @@ node:
 	}
 
 	got := parsePolicy(t, out)
-	want := []string{"BilletRuntimeRead", "BilletRuntimeLaunch", "BilletRuntimeTag", "BilletRuntimeTerminate"}
+	want := []string{
+		"BilletRuntimeRead", "BilletRuntimeLaunch", "BilletRuntimeDenyForeignSnapshot",
+		"BilletRuntimeTag", "BilletRuntimeTerminate",
+	}
 	if len(got) != len(want) {
 		t.Errorf("a compute-only config produced %v, want the runtime statements %v", got, want)
 	}
@@ -345,6 +349,101 @@ node:
 	}
 	if !strings.Contains(err.Error(), "--kms-key-arn") {
 		t.Errorf("the refusal does not name --kms-key-arn: %v", err)
+	}
+}
+
+// THE POLICY AN OPERATOR APPLIES REFUSES A LAUNCH FROM A SNAPSHOT THIS DEPLOYMENT
+// DOES NOT OWN, in whichever mode they asked for.
+//
+// ec2:RunInstances authorizes every snapshot a block-device mapping names and this
+// command grants it on "*", so without the deny the role an operator pastes into
+// their account can launch an instance with the control plane's ledger snapshot
+// attached. The generator's own tests prove the statement is built; this proves it
+// reaches the bytes `billet init iam` prints, which is what anybody actually
+// applies.
+func TestInitIAMDeniesALaunchFromAnUnownedSnapshot(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want func(t *testing.T, cond map[string]any)
+	}{
+		{
+			name: "account-wide", args: []string{"--account-wide"},
+			want: func(t *testing.T, cond map[string]any) {
+				t.Helper()
+
+				null, ok := cond["Null"].(map[string]any)
+				if !ok || null["aws:ResourceTag/sh.billet.owner"] != "true" {
+					t.Errorf("--account-wide does not deny an UNTAGGED snapshot: %v", cond)
+				}
+			},
+		},
+		{
+			name: "per-deployment", args: []string{"--deployment", testDeployID},
+			want: func(t *testing.T, cond map[string]any) {
+				t.Helper()
+
+				se, ok := cond["StringNotEquals"].(map[string]any)
+				if !ok || se["aws:ResourceTag/sh.billet.owner"] != testDeployID {
+					t.Errorf("--deployment does not deny every snapshot but this deployment's: %v", cond)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := ec2NodeConfig(t)
+
+			var err error
+
+			args := append([]string{"iam", "--config", path,
+				"--role-arn", "arn:aws:iam::123456789012:role/billet-node"}, tc.args...)
+			out := capture(t, func() { err = cmdInit(t.Context(), args) })
+			if err != nil {
+				t.Fatalf("init iam: %v", err)
+			}
+
+			// EFFECT AND RESOURCE ARE READ HERE rather than through stmtCondition:
+			// the same statement rendered Allow, or scoped to something other than a
+			// snapshot, would carry an identical Condition and bound nothing.
+			var doc struct {
+				Statement []struct {
+					Sid       string         `json:"Sid"`
+					Effect    string         `json:"Effect"`
+					Action    []string       `json:"Action"`
+					Resource  []string       `json:"Resource"`
+					Condition map[string]any `json:"Condition"`
+				} `json:"Statement"`
+			}
+			if err := json.Unmarshal([]byte(out), &doc); err != nil {
+				t.Fatalf("policy JSON: %v\n%s", err, out)
+			}
+
+			var found bool
+
+			for _, s := range doc.Statement {
+				if s.Sid != "BilletRuntimeDenyForeignSnapshot" {
+					continue
+				}
+
+				found = true
+
+				if s.Effect != "Deny" {
+					t.Errorf("the snapshot boundary is %q, not a Deny", s.Effect)
+				}
+				if !slices.Equal(s.Action, []string{"ec2:RunInstances"}) {
+					t.Errorf("the deny names %v, want exactly the launch action", s.Action)
+				}
+				if !slices.Equal(s.Resource, []string{"arn:aws:ec2:*:*:snapshot/*"}) {
+					t.Errorf("the deny acts on %v, want every snapshot ARN spelling", s.Resource)
+				}
+
+				tc.want(t, s.Condition)
+			}
+
+			if !found {
+				t.Errorf("the printed policy carries no launch boundary: %s", out)
+			}
+		})
 	}
 }
 
@@ -561,5 +660,118 @@ node:
 	}
 	if se, ok := stmtCondition(t, out, "BilletRuntimeTerminate")["StringEquals"].(map[string]any); !ok || se["aws:ResourceTag/sh.billet.owner"] != testDeployID {
 		t.Errorf("--deployment did not override the state-dir id: got %v", se)
+	}
+}
+
+// plainEC2NodeConfig is a minimal ec2 node config on disk: no instance profile
+// and no cache, so the payload cases below turn on exactly one thing.
+func plainEC2NodeConfig(t *testing.T) string {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), "billet.yaml")
+	body := `
+node:
+  server_addr: 127.0.0.1:7717
+  name: aws-1
+  provider: ec2
+  state_dir: ` + t.TempDir() + `
+  max_vcpu: 64
+  max_memory: 256GiB
+  ec2:
+    region: us-west-2
+    subnet_id: subnet-0abc
+    security_group_ids: [sg-0abc]
+    instance_types:
+      - type: c7i.2xlarge
+        vcpu: 8
+        memory: 16GiB
+        price_usd_per_hour: 0.34
+`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	return path
+}
+
+// THE PAYLOAD BUCKET IS A FLAG BECAUSE billet.yaml DOES NOT NAME IT: it is an
+// argument to `billet ami build`, so this command cannot derive it. With
+// --builder it adds one statement scoped to the object names billet writes;
+// widening it to the whole bucket would hand the role every object an operator
+// keeps beside the payloads.
+func TestInitIAMBuilderPayloadBucketIsScoped(t *testing.T) {
+	path := plainEC2NodeConfig(t)
+
+	out := capture(t, func() {
+		if err := cmdInit(t.Context(), []string{
+			"iam", "--config", path, "--account-wide", "--builder",
+			"--payload-bucket", "billet-ami-payloads",
+		}); err != nil {
+			t.Fatalf("init iam: %v", err)
+		}
+	})
+
+	if !strings.Contains(out, `"arn:aws:s3:::billet-ami-payloads/billet-payload-*"`) {
+		t.Errorf("the payload grant is not scoped to billet's own objects:\n%s", out)
+	}
+	if !strings.Contains(out, "BilletAMIBuilderPayload") {
+		t.Errorf("the payload statement is absent:\n%s", out)
+	}
+}
+
+// WITHOUT --builder IT IS REFUSED, rather than granting S3 to a role that
+// stages nothing: the operator believes they granted something, and the build
+// fails on a permission they think they gave.
+func TestInitIAMRefusesAPayloadBucketWithoutTheBuilder(t *testing.T) {
+	path := plainEC2NodeConfig(t)
+
+	err := cmdInit(t.Context(), []string{
+		"iam", "--config", path, "--account-wide", "--payload-bucket", "billet-ami-payloads",
+	})
+	if err == nil {
+		t.Fatal("init iam accepted --payload-bucket without --builder")
+	}
+	if !strings.Contains(err.Error(), "--payload-bucket") || !strings.Contains(err.Error(), "--builder") {
+		t.Errorf("the refusal must name both flags: %v", err)
+	}
+}
+
+// AND A BUILDER WITHOUT ONE GRANTS NO S3 AT ALL, so a deployment whose
+// installers still fit in user data is unchanged.
+func TestInitIAMBuilderWithoutAPayloadBucketGrantsNoS3(t *testing.T) {
+	path := plainEC2NodeConfig(t)
+
+	out := capture(t, func() {
+		if err := cmdInit(t.Context(), []string{
+			"iam", "--config", path, "--account-wide", "--builder",
+		}); err != nil {
+			t.Fatalf("init iam: %v", err)
+		}
+	})
+
+	if strings.Contains(out, "s3:") {
+		t.Errorf("a builder with no payload bucket granted S3:\n%s", out)
+	}
+}
+
+// A DOTTED BUCKET IS REFUSED WHERE IT IS TYPED.
+//
+// Dots are legal in S3 and unusable for billet: the virtual-hosted host a
+// dotted name produces is not covered by S3's wildcard certificate, so the
+// build's fetch fails TLS verification. Printing a policy for such a bucket
+// produces a grant that reads correctly and a build that refuses the bucket it
+// was pointed at, which is a worse failure than refusing here.
+func TestInitIAMRefusesADottedPayloadBucket(t *testing.T) {
+	path := plainEC2NodeConfig(t)
+
+	err := cmdInit(t.Context(), []string{
+		"iam", "--config", path, "--account-wide", "--builder",
+		"--payload-bucket", "billet.ami.payloads",
+	})
+	if err == nil {
+		t.Fatal("init iam accepted a bucket the stager refuses")
+	}
+	if !strings.Contains(err.Error(), "--payload-bucket") {
+		t.Errorf("the refusal must name the flag: %v", err)
 	}
 }

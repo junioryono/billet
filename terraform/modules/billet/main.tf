@@ -84,6 +84,8 @@ module "fleet" {
   spot_router_alarm_actions     = var.spot_router_alarm_actions
   iam_policy_json               = var.iam_policy_json
   job_instance_profile_role_arn = var.job_instance_profile_role_arn
+  builder                       = var.builder
+  builder_payload_bucket        = var.builder_payload_bucket
   tags                          = var.tags
 }
 
