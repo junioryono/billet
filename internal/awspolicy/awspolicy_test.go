@@ -60,7 +60,10 @@ func TestRuntimeOnlyPolicy(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	want := []string{"BilletRuntimeRead", "BilletRuntimeLaunch", "BilletRuntimeTag", "BilletRuntimeTerminate"}
+	want := []string{
+		"BilletRuntimeRead", "BilletRuntimeLaunch", "BilletRuntimeDenyForeignSnapshot",
+		"BilletRuntimeTag", "BilletRuntimeTerminate",
+	}
 	if got := sids(p); !slices.Equal(got, want) {
 		t.Fatalf("a compute-only policy has statements %v, want %v", got, want)
 	}
@@ -110,6 +113,162 @@ func TestRuntimeMutationsAreBounded(t *testing.T) {
 	}
 	if stmt(t, p, "BilletRuntimeRead").Condition != nil {
 		t.Error("the describes carry a condition; they are not resource-scopable")
+	}
+}
+
+// A LAUNCH MAY NOT ATTACH A SNAPSHOT THIS DEPLOYMENT DOES NOT OWN.
+//
+// ec2:RunInstances authorizes every snapshot a block-device mapping names, and the
+// Allow above it is on "*" because the call creates several resource types at once
+// — so an unbounded runtime policy is also a read of every snapshot in the
+// account, the control plane's ledger snapshots among them. The bound is a DENY,
+// and this asserts the Effect explicitly: the same statement rendered Allow would
+// be a silent no-op that a test looking the statement up by Sid would pass.
+//
+// BOTH MODES, BOTH DIRECTIONS. Under a deployment id the condition is
+// StringNotEquals on the exact value, which IAM also evaluates true for a snapshot
+// carrying NO owner tag (measured, see the package comment); under none it is the
+// tag being absent, which is all a policy with no id can ask.
+func TestALaunchMayNotAttachASnapshotBilletDoesNotOwn(t *testing.T) {
+	const owner = "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+
+	for _, tc := range []struct {
+		name      string
+		in        Inputs
+		resource  string
+		assertion func(t *testing.T, cond map[string]any)
+	}{
+		{
+			name: "account-wide", in: Inputs{}, resource: "arn:aws:ec2:*:*:snapshot/*",
+			assertion: func(t *testing.T, cond map[string]any) {
+				t.Helper()
+
+				null, ok := cond["Null"].(map[string]any)
+				if !ok || null["aws:ResourceTag/sh.billet.owner"] != "true" {
+					t.Errorf("the deny does not require the owner tag to be ABSENT: %v", cond)
+				}
+			},
+		},
+		{
+			name: "per-deployment", in: Inputs{Owner: owner},
+			resource: "arn:aws:ec2:*:*:snapshot/*",
+			assertion: func(t *testing.T, cond map[string]any) {
+				t.Helper()
+
+				se, ok := cond["StringNotEquals"].(map[string]any)
+				if !ok || se["aws:ResourceTag/sh.billet.owner"] != owner {
+					t.Errorf("the deny does not negate this deployment's own owner value: %v", cond)
+				}
+				// A Null-present beside it would AND the two and narrow the deny
+				// to untagged snapshots alone, letting a sibling deployment's
+				// tagged snapshot through the one mode that can refuse it.
+				if _, present := cond["Null"]; present {
+					t.Errorf("the value deny also carries a presence check, which narrows it: %v", cond)
+				}
+			},
+		},
+		{
+			// THE PARTITION FOLLOWS, or a China node's policy denies an ARN that
+			// cannot exist while the snapshots it is about stay reachable.
+			name: "another partition", in: Inputs{Partition: "aws-cn"},
+			resource: "arn:aws-cn:ec2:*:*:snapshot/*",
+			assertion: func(t *testing.T, cond map[string]any) {
+				t.Helper()
+
+				if _, ok := cond["Null"].(map[string]any); !ok {
+					t.Errorf("the deny lost its condition in another partition: %v", cond)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, err := tc.in.Build()
+			if err != nil {
+				t.Fatalf("Build: %v", err)
+			}
+
+			s := stmt(t, p, "BilletRuntimeDenyForeignSnapshot")
+
+			if s.Effect != "Deny" {
+				t.Errorf("the snapshot boundary has Effect %q; an Allow here grants nothing "+
+					"and bounds nothing", s.Effect)
+			}
+
+			if !slices.Equal(s.Action, []string{"ec2:RunInstances"}) {
+				t.Errorf("the deny names %v, want exactly the launch action — a wider deny "+
+					"would refuse a call billet makes", s.Action)
+			}
+
+			// THE ACCOUNT FIELD IS A WILDCARD, NOT EMPTY. Measured 2026-09-04:
+			// `arn:aws:ec2:*::snapshot/*` answers ALLOWED for a snapshot ARN written
+			// with an account, so the account-less form the sibling CreateVolume
+			// statement uses would leave half the spellings undenied.
+			if !slices.Equal(s.Resource, []string{tc.resource}) {
+				t.Errorf("the deny acts on %v, want [%s]", s.Resource, tc.resource)
+			}
+
+			tc.assertion(t, s.Condition)
+		})
+	}
+
+	// AND A PRINCIPAL THAT LAUNCHES NOTHING GETS NEITHER HALF: no RunInstances, so
+	// no boundary on one. A deny rendered for a control plane would be dead text
+	// suggesting it holds a permission it does not.
+	p, err := Inputs{
+		NoCompute: true,
+		Backup:    &Backup{Bucket: "billet-backups-example", Prefix: "billet-backups"},
+	}.Build()
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	for _, s := range p.Statement {
+		if s.Sid == "BilletRuntimeDenyForeignSnapshot" {
+			t.Error("a NoCompute policy carries the launch boundary, but grants no launch")
+		}
+	}
+}
+
+// AND IT IS THE ONLY DENY IN THE DOCUMENT.
+//
+// A Deny beats every Allow anywhere, so one that widened — to another action, or
+// by losing its resource scope — would refuse calls billet makes and the failure
+// would arrive as an UnauthorizedOperation on a real node rather than here. The
+// snapshot boundary is the one place billet needs one; everything else is scoped
+// by being granted narrowly.
+func TestOnlyTheSnapshotBoundaryIsADeny(t *testing.T) {
+	p, err := Inputs{
+		Owner:  "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+		Region: "us-west-2",
+		Cache: &Cache{
+			Bucket: "b", Prefix: "p", KMSKeyARN: "arn:aws:kms:us-west-2:1:key/k",
+		},
+		SpotQueueARN:           "arn:aws:sqs:us-west-2:1:q",
+		InstanceProfileRoleARN: "arn:aws:iam::1:role/r",
+		Builder:                true,
+	}.Build()
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	if len(p.Statement) == 0 {
+		t.Fatal("the policy is empty, so the check below proves nothing")
+	}
+
+	var denies []string
+
+	for _, s := range p.Statement {
+		switch s.Effect {
+		case "Deny":
+			denies = append(denies, s.Sid)
+		case "Allow":
+		default:
+			t.Errorf("statement %q has Effect %q, which IAM reads as neither", s.Sid, s.Effect)
+		}
+	}
+
+	if !slices.Equal(denies, []string{"BilletRuntimeDenyForeignSnapshot"}) {
+		t.Errorf("the policy denies %v, want only the snapshot boundary", denies)
 	}
 }
 

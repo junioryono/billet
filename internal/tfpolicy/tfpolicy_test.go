@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 
@@ -40,10 +41,12 @@ func tfPolicyCases() map[string]awspolicy.Inputs {
 	// committed rendering carries `arn:TFPARTITION:` and `ec2.TFREGION.TFDNSSUFFIX`
 	// rather than the commercial partition and amazonaws.com — the module rewrites
 	// them to `data.aws_partition.this.partition`/`.dns_suffix`, so one rendering
-	// serves GovCloud and China too. Compute-only carries no partition ARN, so it
-	// needs neither sentinel.
+	// serves GovCloud and China too. Compute-only needs the PARTITION sentinel and
+	// not the suffix one: it carries no kms:ViaService or PassRole service name, but
+	// it does carry the snapshot ARN the launch boundary denies, and a rendering that
+	// hard-coded `arn:aws:` there would deny nothing in GovCloud or China.
 	return map[string]awspolicy.Inputs{
-		"node-policy-compute.json": {},
+		"node-policy-compute.json": {Partition: "TFPARTITION"},
 		"node-policy-cache.json": {
 			Partition: "TFPARTITION", DNSSuffix: "TFDNSSUFFIX", Region: "TFREGION", Cache: cache,
 		},
@@ -550,6 +553,87 @@ func TestTheCodeBuildNodeRoleLaunchesNoInstancesAndOwnsNoFleet(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// AND EVERY NODE RENDERING REFUSES A LAUNCH FROM A SNAPSHOT NOBODY OWNS.
+//
+// The drift test below pins the bytes, which catches a change; this says what the
+// bytes must never lose, which catches a change somebody regenerated without
+// reading. ec2:RunInstances authorizes every snapshot a block-device mapping
+// names, and the module grants it on "*" — so without this statement the fleet
+// role can launch an instance with the control plane's ledger snapshot attached
+// and read the deployment identity and the node-wire CA key off it. The renderings
+// are in PRESENCE mode (the deployment id is minted on the server's first run,
+// unknown at apply), so the condition here is the tag being absent.
+//
+// THE PARTITION SENTINEL IS PART OF THE ASSERTION: the module rewrites it, and a
+// rendering that hard-coded `arn:aws:` would deny nothing at all in GovCloud or
+// China while every byte comparison stayed green.
+func TestTheCommittedNodePolicyDeniesAnUnownedSnapshotLaunch(t *testing.T) {
+	cases := 0
+
+	for name := range tfPolicyCases() {
+		cases++
+
+		t.Run(name, func(t *testing.T) {
+			body, err := os.ReadFile(policyDir + name)
+			if err != nil {
+				t.Fatalf("read: %v (regenerate with UPDATE_TF_POLICY=1)", err)
+			}
+
+			var doc struct {
+				Statement []struct {
+					Sid       string
+					Effect    string
+					Action    []string
+					Resource  []string
+					Condition map[string]map[string]any
+				}
+			}
+
+			if err := json.Unmarshal(body, &doc); err != nil {
+				t.Fatalf("parse %s: %v", name, err)
+			}
+
+			var found bool
+
+			for _, st := range doc.Statement {
+				if st.Sid != "BilletRuntimeDenyForeignSnapshot" {
+					continue
+				}
+
+				found = true
+
+				if st.Effect != "Deny" {
+					t.Errorf("%s has Effect %q; an Allow bounds nothing", st.Sid, st.Effect)
+				}
+
+				if !slices.Equal(st.Action, []string{"ec2:RunInstances"}) {
+					t.Errorf("%s denies %v, want exactly the launch action", st.Sid, st.Action)
+				}
+
+				if !slices.Equal(st.Resource, []string{"arn:TFPARTITION:ec2:*:*:snapshot/*"}) {
+					t.Errorf("%s acts on %v, want the partition-sentinel snapshot ARN with a "+
+						"wildcard account", st.Sid, st.Resource)
+				}
+
+				if st.Condition["Null"]["aws:ResourceTag/sh.billet.owner"] != "true" {
+					t.Errorf("%s does not require the owner tag to be ABSENT: %v",
+						st.Sid, st.Condition)
+				}
+			}
+
+			if !found {
+				t.Errorf("%s carries no launch boundary, so the role it renders may launch an "+
+					"instance with any snapshot in the account attached", name)
+			}
+		})
+	}
+
+	// AND THE LOOP RAN, or an empty case set makes every assertion above vacuous.
+	if cases == 0 {
+		t.Fatal("no node rendering was examined, so this test proves nothing")
 	}
 }
 

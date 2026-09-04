@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -153,7 +154,10 @@ node:
 	}
 
 	got := parsePolicy(t, out)
-	want := []string{"BilletRuntimeRead", "BilletRuntimeLaunch", "BilletRuntimeTag", "BilletRuntimeTerminate"}
+	want := []string{
+		"BilletRuntimeRead", "BilletRuntimeLaunch", "BilletRuntimeDenyForeignSnapshot",
+		"BilletRuntimeTag", "BilletRuntimeTerminate",
+	}
 	if len(got) != len(want) {
 		t.Errorf("a compute-only config produced %v, want the runtime statements %v", got, want)
 	}
@@ -345,6 +349,101 @@ node:
 	}
 	if !strings.Contains(err.Error(), "--kms-key-arn") {
 		t.Errorf("the refusal does not name --kms-key-arn: %v", err)
+	}
+}
+
+// THE POLICY AN OPERATOR APPLIES REFUSES A LAUNCH FROM A SNAPSHOT THIS DEPLOYMENT
+// DOES NOT OWN, in whichever mode they asked for.
+//
+// ec2:RunInstances authorizes every snapshot a block-device mapping names and this
+// command grants it on "*", so without the deny the role an operator pastes into
+// their account can launch an instance with the control plane's ledger snapshot
+// attached. The generator's own tests prove the statement is built; this proves it
+// reaches the bytes `billet init iam` prints, which is what anybody actually
+// applies.
+func TestInitIAMDeniesALaunchFromAnUnownedSnapshot(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want func(t *testing.T, cond map[string]any)
+	}{
+		{
+			name: "account-wide", args: []string{"--account-wide"},
+			want: func(t *testing.T, cond map[string]any) {
+				t.Helper()
+
+				null, ok := cond["Null"].(map[string]any)
+				if !ok || null["aws:ResourceTag/sh.billet.owner"] != "true" {
+					t.Errorf("--account-wide does not deny an UNTAGGED snapshot: %v", cond)
+				}
+			},
+		},
+		{
+			name: "per-deployment", args: []string{"--deployment", testDeployID},
+			want: func(t *testing.T, cond map[string]any) {
+				t.Helper()
+
+				se, ok := cond["StringNotEquals"].(map[string]any)
+				if !ok || se["aws:ResourceTag/sh.billet.owner"] != testDeployID {
+					t.Errorf("--deployment does not deny every snapshot but this deployment's: %v", cond)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := ec2NodeConfig(t)
+
+			var err error
+
+			args := append([]string{"iam", "--config", path,
+				"--role-arn", "arn:aws:iam::123456789012:role/billet-node"}, tc.args...)
+			out := capture(t, func() { err = cmdInit(t.Context(), args) })
+			if err != nil {
+				t.Fatalf("init iam: %v", err)
+			}
+
+			// EFFECT AND RESOURCE ARE READ HERE rather than through stmtCondition:
+			// the same statement rendered Allow, or scoped to something other than a
+			// snapshot, would carry an identical Condition and bound nothing.
+			var doc struct {
+				Statement []struct {
+					Sid       string         `json:"Sid"`
+					Effect    string         `json:"Effect"`
+					Action    []string       `json:"Action"`
+					Resource  []string       `json:"Resource"`
+					Condition map[string]any `json:"Condition"`
+				} `json:"Statement"`
+			}
+			if err := json.Unmarshal([]byte(out), &doc); err != nil {
+				t.Fatalf("policy JSON: %v\n%s", err, out)
+			}
+
+			var found bool
+
+			for _, s := range doc.Statement {
+				if s.Sid != "BilletRuntimeDenyForeignSnapshot" {
+					continue
+				}
+
+				found = true
+
+				if s.Effect != "Deny" {
+					t.Errorf("the snapshot boundary is %q, not a Deny", s.Effect)
+				}
+				if !slices.Equal(s.Action, []string{"ec2:RunInstances"}) {
+					t.Errorf("the deny names %v, want exactly the launch action", s.Action)
+				}
+				if !slices.Equal(s.Resource, []string{"arn:aws:ec2:*:*:snapshot/*"}) {
+					t.Errorf("the deny acts on %v, want every snapshot ARN spelling", s.Resource)
+				}
+
+				tc.want(t, s.Condition)
+			}
+
+			if !found {
+				t.Errorf("the printed policy carries no launch boundary: %s", out)
+			}
+		})
 	}
 }
 
