@@ -184,6 +184,42 @@ linters:
             - pkg: "github.com/jackc/pgx"
               desc: "Open the control-plane database through internal/state, which verifies durability, takes the process lock and serializes writers. A second import site is how a connection gets opened without them."
 
+        # THE CONTAINER KNOWS ABOUT THE PACKAGES; THE PACKAGES DO NOT KNOW ABOUT
+        # THE CONTAINER. internal/wiring declares every godi module, cmd/billet
+        # builds and resolves, and a test may override a registration -- and
+        # nothing else names godi, so a domain constructor stays a plain Go
+        # function with plain parameters that any caller can assemble by hand.
+        # The list is the whole of item 2 of the dependency-injection ADR.
+        dependencyinjection:
+          list-mode: lax
+          files:
+            - "$all"
+            - "!**/internal/wiring/**"
+            - "!**/internal/wiringtest/**"
+            - "!**/cmd/billet/**"
+            - "!$test"
+          deny:
+            - pkg: "github.com/junioryono/godi"
+              desc: "godi is imported by internal/wiring (the modules), cmd/billet (build and resolve) and tests (overrides). A domain package takes its collaborators as plain parameters; register it in a wiring module instead."
+
+        # AND THE TOP OF THE GRAPH IS REACHED BY NOBODY BELOW IT. internal/wiring
+        # imports every domain package, so a domain package importing it would be
+        # a cycle waiting for the next registration. Only the two roles' entry
+        # point, the test container and the suites that assemble a deployment
+        # may name it.
+        wiringconsumers:
+          list-mode: lax
+          files:
+            - "$all"
+            - "!**/cmd/billet/**"
+            - "!**/internal/wiring/**"
+            - "!**/internal/wiringtest/**"
+            - "!**/internal/e2e/**"
+            - "!**/internal/integration/**"
+          deny:
+            - pkg: "github.com/junioryono/billet/internal/wiring"
+              desc: "internal/wiring is the top of the graph; it imports everything and is imported only by cmd/billet, internal/wiringtest and the suites that assemble a deployment."
+
         # One scale-set client, imported in one place. The upstream module is a
         # PUBLIC PREVIEW whose README says its interfaces may change, and a
         # preview type reaching into the scheduler is how someone else's release
@@ -417,6 +453,17 @@ linters:
         # would be one rename away from silence.
         - pattern: '^ledgerdb\.New$'
           msg: "Bind the generated queries through state.ReadQueries or state.WriteQueries. ledgerdb.New returns every method, which gives away the compile-time read/write split those two exist to keep."
+        # A RESOLVE THAT PANICS IS THE panic BAN ABOVE UNDER ANOTHER NAME. A
+        # control plane that panics drops every in-flight lease; a missing
+        # registration is an error a caller returns, and Build reports it first
+        # anyway.
+        - pattern: '^godi\.MustResolve(Keyed|Group)?$'
+          msg: "Use godi.Resolve and return the error. MustResolve panics, and a control plane that panics drops every in-flight lease."
+        # ONE ASSEMBLY. Every container is built by wiring.Build, which is what
+        # makes 'the same modules assemble production and tests' a fact rather
+        # than a rule somebody remembers. internal/wiring is excluded below.
+        - pattern: '^godi\.NewCollection$'
+          msg: "Build a container through wiring.Build, which is the one place a collection is created."
 
     revive:
       severity: warning
@@ -502,6 +549,12 @@ linters:
         linters:
           - forbidigo
         text: ledgerdb\.New
+
+      # internal/wiring IS where the one collection is created.
+      - path: (^|/)internal/wiring/
+        linters:
+          - forbidigo
+        text: godi\.NewCollection
 
       # ----- tests: relax noise-heavy rules -----
       #
