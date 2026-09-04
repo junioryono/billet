@@ -565,17 +565,24 @@ run "the_builder_grant_is_its_own_document" {
     error_message = "asking for the builder must attach its grant"
   }
 
-  # THE FIVE EC2 STATEMENTS THE BUILD PERFORMS, by Sid, as an exact set: a
-  # missing one is a build that dies partway (no console read, no contract tag),
-  # and an extra one is a permission billet never exercises.
+  # THE STATEMENTS THE BUILD PERFORMS, by Sid, as an exact set: a missing one is
+  # a build that dies partway (no console read, no contract tag), and an extra
+  # one is a permission billet never exercises.
+  #
+  # BilletAMIBuilderTag IS NOT OPTIONAL and is the one a reading would drop. AWS
+  # authorizes the TagSpecification on CreateImage as a SEPARATE ec2:CreateTags
+  # check; the node's own rendering does not list CreateImage there, so without
+  # this statement `builder = true` grants CreateImage and every build is still
+  # refused — which is worse than granting nothing, because the module says the
+  # build now works.
   assert {
     condition = toset([
       for s in jsondecode(aws_iam_role_policy.builder[0].policy).Statement : s.Sid
       ]) == toset([
       "BilletAMIBuilderSource", "BilletAMIBuilderImage", "BilletAMIBuilderTerminate",
-      "BilletAMIBuilderConsole", "BilletAMIBuilderPromote",
+      "BilletAMIBuilderConsole", "BilletAMIBuilderPromote", "BilletAMIBuilderTag",
     ])
-    error_message = "the builder grant must be exactly the five statements billet's generator emits for a build"
+    error_message = "the builder grant must be exactly the statements billet's generator emits for a build, including the create-time tag check CreateImage needs"
   }
 
   # AND NOTHING OF THE RUNTIME. The builder rides the node policy's own

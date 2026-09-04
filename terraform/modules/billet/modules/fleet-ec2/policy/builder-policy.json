@@ -79,6 +79,23 @@
           ]
         }
       }
+    },
+    {
+      "Sid": "BilletAMIBuilderTag",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateTags"
+      ],
+      "Resource": [
+        "*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "ec2:CreateAction": [
+            "CreateImage"
+          ]
+        }
+      }
     }
   ]
 }

@@ -905,3 +905,75 @@ func TestABuilderWithoutAPayloadBucketTouchesNoS3(t *testing.T) {
 		}
 	}
 }
+
+// A BUILDER-ONLY POLICY CAN ACTUALLY BUILD, which is not implied by granting
+// ec2:CreateImage.
+//
+// `billet ami build` sends a TagSpecification on CreateImage, and AWS
+// authorizes create-time tags as a SEPARATE ec2:CreateTags check keyed on
+// ec2:CreateAction — measured with --dry-run, the identical call is refused
+// `UnauthorizedOperation ... ec2:CreateTags` when nothing grants it. The RUNTIME
+// statement normally satisfies that, and NoCompute omits the runtime statement,
+// so a builder-only policy has to carry the check itself or it grants an action
+// it will always be denied. That shape is exactly what the terraform module
+// attaches beside an unchanged node rendering.
+func TestABuilderOnlyPolicyCanTagTheImageItCreates(t *testing.T) {
+	p, err := Inputs{NoCompute: true, Builder: true}.Build()
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	s := stmt(t, p, "BilletAMIBuilderTag")
+
+	if !slices.Equal(s.Action, []string{"ec2:CreateTags"}) {
+		t.Errorf("the create-time tag grant permits %v, want [ec2:CreateTags]", s.Action)
+	}
+
+	equals, ok := s.Condition["StringEquals"].(map[string]any)
+	if !ok {
+		t.Fatalf("the create-time tag grant carries no StringEquals: %v", s.Condition)
+	}
+
+	actions, ok := equals["ec2:CreateAction"].([]string)
+	if !ok || !slices.Equal(actions, []string{"CreateImage"}) {
+		t.Errorf("the create-time tag grant is keyed on %v, want exactly [CreateImage]: it exists "+
+			"for the image the build makes and must not widen to every create", actions)
+	}
+}
+
+// AND A POLICY THAT CARRIES BOTH BLOCKS SAYS IT ONCE. With the runtime
+// statement present, createTagCondition already appends CreateImage to it, so a
+// second statement would be two answers to one question.
+func TestABuilderWithRuntimeStatementsTagsThroughTheRuntimeGrant(t *testing.T) {
+	p, err := Inputs{Owner: "0f1e2d3c4b5a69788796a5b4c3d2e1f0", Builder: true}.Build()
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	for _, s := range p.Statement {
+		if s.Sid == "BilletAMIBuilderTag" {
+			t.Fatal("a policy with runtime statements must tag through BilletRuntimeTag, not a second grant")
+		}
+	}
+}
+
+// IN PER-DEPLOYMENT MODE THE BUILDER MAY STAMP ONLY ITS OWN OWNER PREFIX, so
+// the grant cannot put another deployment's identity on an image it created.
+func TestABuilderOnlyTagGrantIsScopedToTheBuilderPrefix(t *testing.T) {
+	p, err := Inputs{
+		Owner: "0f1e2d3c4b5a69788796a5b4c3d2e1f0", NoCompute: true, Builder: true,
+	}.Build()
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	like, ok := stmt(t, p, "BilletAMIBuilderTag").Condition["StringLike"].(map[string]any)
+	if !ok {
+		t.Fatalf("a per-deployment builder tag grant carries no request-tag condition")
+	}
+
+	vals, ok := like["aws:RequestTag/sh.billet.owner"].([]string)
+	if !ok || !slices.Equal(vals, []string{"billet-ami-build-*"}) {
+		t.Errorf("the tag grant admits %v, want only the builder's own prefix", vals)
+	}
+}

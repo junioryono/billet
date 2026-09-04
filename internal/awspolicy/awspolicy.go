@@ -574,6 +574,45 @@ func (in Inputs) Build() (Policy, error) {
 				Condition: builderOwnerCondition(),
 			},
 		)
+
+		// THE CREATE-TIME TAG CHECK, FOR A BUILDER-ONLY POLICY.
+		//
+		// `billet ami build` sends a TagSpecification on CreateImage, and AWS
+		// authorizes that as a SEPARATE ec2:CreateTags check keyed on
+		// ec2:CreateAction — measured with --dry-run: the identical call is
+		// refused `UnauthorizedOperation ... ec2:CreateTags` when nothing grants
+		// it, and succeeds when something does. A policy that grants
+		// ec2:CreateImage without it therefore cannot build at all.
+		//
+		// The RUNTIME statement is what normally satisfies it: createTagCondition
+		// appends CreateImage to its CreateAction list when Builder is set. But a
+		// NoCompute policy has no runtime statement, and that is exactly the shape
+		// the terraform module attaches beside an unchanged node rendering — so
+		// without this the module's `builder = true` would grant CreateImage and
+		// still be denied, which is worse than not granting it, because the module
+		// says the build now works. Emitted only for NoCompute, so a policy
+		// carrying both blocks does not say the same thing twice.
+		if in.NoCompute {
+			tag := Statement{
+				Sid: "BilletAMIBuilderTag", Effect: "Allow",
+				Action: ec2.RuntimeTagIAMActions(), Resource: []string{"*"},
+				Condition: map[string]any{
+					"StringEquals": map[string]any{"ec2:CreateAction": []string{"CreateImage"}},
+				},
+			}
+
+			// In per-deployment mode the tag it may stamp is the BUILDER's own
+			// prefix and nothing else: this statement exists for `ami build`,
+			// which always tags with it, so a wider allowance would let this role
+			// stamp another deployment's owner onto an image it created.
+			if in.Owner != "" {
+				tag.Condition["StringLike"] = map[string]any{
+					"aws:RequestTag/" + ec2.OwnerTagKey: []string{ec2.BuilderOwnerPrefix + "*"},
+				}
+			}
+
+			p.Statement = append(p.Statement, tag)
+		}
 	}
 
 	// THE PAYLOAD BUCKET IS THE BUILDER'S, AND ONLY THE BUILDER'S. Refused
