@@ -260,7 +260,11 @@ rehearsal_teardown_scale_sets() {
         inside+=("${pair}")
     done
 
-    docker exec "${outside[@]}" "${controller}" runuser -u billet -- env "${inside[@]}" \
+    # `${a[@]+"${a[@]}"}` rather than "${a[@]}": on the Bash 3.2 a Mac ships, an
+    # empty array expanded under `set -u` is fatal, and this runs in the EXIT trap
+    # where that would end the cleanup before the hosts are removed.
+    docker exec ${outside[@]+"${outside[@]}"} "${controller}" runuser -u billet -- \
+        env ${inside[@]+"${inside[@]}"} \
         /usr/bin/billet teardown --all --yes --config /etc/billet/billet.yaml 2>&1 | tail -3
     return "${PIPESTATUS[0]}"
 }
@@ -371,9 +375,25 @@ rehearsal_version() {
     docker exec "$1" /usr/bin/billet version 2>/dev/null | awk 'NR == 1 { print $2 }'
 }
 
-# rehearsal_active prints a unit's ActiveState in a host.
+# rehearsal_active prints a unit's ActiveState in a host, or `unknown` when the
+# host could not be asked. THREE-VALUED: a caller asserting a unit is NOT active
+# must accept only `inactive` or `failed`, because an unreachable host answers
+# nothing and nothing is not proof of a stop (`rehearsal_stopped`).
 rehearsal_active() {
-    docker exec "$1" systemctl is-active "$2" 2>/dev/null || true
+    local state
+    if ! state=$(docker exec "$1" systemctl show -p ActiveState --value "$2" 2>/dev/null) || [ -z "${state}" ]; then
+        echo unknown
+        return 0
+    fi
+    echo "${state}"
+}
+
+# rehearsal_stopped succeeds only when a unit's state proves no process remains.
+rehearsal_stopped() {
+    case "$(rehearsal_active "$1" "$2")" in
+        inactive | failed) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 # rehearsal_wait_for polls a command in a host until it succeeds or the

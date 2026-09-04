@@ -417,7 +417,7 @@ recover-rehearsal: dist ## Recover a deployment a real control plane served, res
 	scripts/recover-rehearsal.sh
 
 .PHONY: ca-rotation-rehearsal
-ca-rotation-rehearsal: dist ## Rotate and retire the node-wire authority across two nodes that renew twelve-minute leaves
+ca-rotation-rehearsal: dist ## Rotate and retire the node-wire authority across two nodes that renew twenty-minute leaves
 	scripts/ca-rotation-rehearsal.sh
 
 .PHONY: promotion-rehearsal

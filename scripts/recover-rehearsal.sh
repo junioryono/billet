@@ -138,8 +138,8 @@ grep -qF "${node}-later" <<<"${admissions}" ||
 rehearsal_step "stop the control plane the way an operator does"
 docker exec "${controller}" /usr/bin/billet local down --timeout 10m \
     --reason "recover rehearsal" --config /etc/billet/billet.yaml 2>&1 | tail -8
-test "$(rehearsal_active "${controller}" billet-server.service)" != active ||
-    rehearsal_fail "billet-server.service is still active after local down"
+rehearsal_stopped "${controller}" billet-server.service ||
+    rehearsal_fail "billet-server.service is $(rehearsal_active "${controller}" billet-server.service) after local down; only inactive or failed proves a stop"
 
 rehearsal_step "billet local recover, as root, from the archive"
 docker exec "${controller}" /usr/bin/billet local recover --config /etc/billet/billet.yaml \
