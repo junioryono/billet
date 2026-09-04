@@ -41,9 +41,21 @@ func TestNothingOutsideATestImportsThisPackage(t *testing.T) {
 		name := d.Name()
 
 		if d.IsDir() {
-			// Worktrees are parked under .claude and vendored trees are not
-			// billet's; neither is a production path.
-			if path != root && (strings.HasPrefix(name, ".") || name == "vendor") {
+			if path == root {
+				return nil
+			}
+
+			// NAMED EXCLUSIONS, NOT EVERY HIDDEN DIRECTORY. A hidden directory can
+			// hold Go source that ships, so only what is provably not this module
+			// is skipped: the object store, a vendored tree, and any directory
+			// carrying its own go.mod, which is another checkout (sessions park
+			// worktrees under .claude) or a nested module that cannot import this
+			// one's internals without a replace directive of its own.
+			if name == ".git" || name == "vendor" {
+				return filepath.SkipDir
+			}
+
+			if _, err := os.Stat(filepath.Join(path, "go.mod")); err == nil {
 				return filepath.SkipDir
 			}
 

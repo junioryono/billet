@@ -74,6 +74,14 @@ func durationOf(cmd []string) (time.Duration, error) {
 			"positive duration, got %s", d)
 	}
 
+	// THE CANONICAL SPELLING, not merely a parseable one. A closed vocabulary that
+	// admits `60s` beside `1m0s` is two spellings of one command, and the second
+	// spelling is the one nothing documents.
+	if cmd[2] != d.String() {
+		return 0, fmt.Errorf("simulated: the duration must be spelled as RunFor renders it "+
+			"(%s), got %q", d, cmd[2])
+	}
+
 	return d, nil
 }
 

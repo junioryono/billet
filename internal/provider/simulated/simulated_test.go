@@ -132,6 +132,9 @@ func TestALaunchWithoutWhatItNeedsIsRefused(t *testing.T) {
 		"a duration that is not one": {func(s *provider.Spec) {
 			s.Command = []string{runnerWord, runForFlag, "soon"}
 		}, "not one"},
+		"a duration spelled another way": {func(s *provider.Spec) {
+			s.Command = []string{runnerWord, runForFlag, "60s"}
+		}, "spelled"},
 		"zero duration":     {func(s *provider.Spec) { s.Command = RunFor(0) }, "positive"},
 		"negative duration": {func(s *provider.Spec) { s.Command = RunFor(-time.Second) }, "positive"},
 		"an extra word": {func(s *provider.Spec) {

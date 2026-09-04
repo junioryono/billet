@@ -1,7 +1,10 @@
 package e2e
 
 import (
+	"context"
 	"errors"
+	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,6 +22,56 @@ const (
 	simulatedDuration = 10 * time.Minute
 )
 
+// gatedProvider is the simulated backend with a Destroy the test can hold open.
+//
+// IT EXISTS TO MAKE AN ORDERING OBSERVABLE. The invariant under test is that the
+// lease is released only after the compute is confirmed gone, and a scenario
+// that reads the end state alone cannot see it: a regression that released first
+// and destroyed a moment later leaves exactly the same final picture. Holding
+// the destroy open is the only way to ask the ledger what it says in between.
+type gatedProvider struct {
+	*simulated.Provider
+
+	mu sync.Mutex
+	// hold, when set, is what a Destroy waits on before delegating; entered is
+	// signalled once when a Destroy reaches the gate.
+	hold    chan struct{}
+	entered chan struct{}
+}
+
+// holdDestroys arms the gate. The first Destroy to arrive signals entered and
+// waits until release is closed.
+func (g *gatedProvider) holdDestroys() (entered <-chan struct{}, release func()) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	g.hold = make(chan struct{})
+	g.entered = make(chan struct{}, 1)
+
+	return g.entered, sync.OnceFunc(func() { close(g.hold) })
+}
+
+func (g *gatedProvider) Destroy(ctx context.Context, id string) (provider.Teardown, error) {
+	g.mu.Lock()
+	hold, entered := g.hold, g.entered
+	g.mu.Unlock()
+
+	if hold != nil {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+
+		select {
+		case <-hold:
+		case <-ctx.Done():
+			return provider.TeardownRequested, ctx.Err()
+		}
+	}
+
+	return g.Provider.Destroy(ctx, id)
+}
+
 // simulatedStack is the real control plane, ledger and node runtime over the
 // backend that starts no compute, on a clock the test moves.
 //
@@ -26,10 +79,11 @@ const (
 // past the lease TTL while heartbeats arrive on the real clock would quarantine
 // the lease and the test would be measuring the reaper. How a replay moves both
 // together is the harness's design (#74), not this scenario's.
-func simulatedStack(t *testing.T, opts ...stackOpt) (*stack, *offsetClock) {
+func simulatedStack(t *testing.T, opts ...stackOpt) (*stack, *offsetClock, *gatedProvider) {
 	t.Helper()
 
 	clock := &offsetClock{}
+	gate := &gatedProvider{}
 
 	build := func(t *testing.T, deployment string) provider.Provider {
 		t.Helper()
@@ -40,7 +94,9 @@ func simulatedStack(t *testing.T, opts ...stackOpt) (*stack, *offsetClock) {
 			t.Fatalf("simulated.New: %v", err)
 		}
 
-		return p
+		gate.Provider = p
+
+		return gate
 	}
 
 	tiers := []config.Tier{{
@@ -58,7 +114,7 @@ func simulatedStack(t *testing.T, opts ...stackOpt) (*stack, *offsetClock) {
 
 	return newStack(t, append([]stackOpt{
 		withBackend(config.ProviderSimulated, build), withTiers(tiers),
-	}, opts...)...), clock
+	}, opts...)...), clock, gate
 }
 
 // A LEASE PLACED ON THE SIMULATED BACKEND IS CHARGED, HELD FOR THE MODELLED
@@ -78,7 +134,7 @@ func TestASimulatedJobIsChargedHeldAndSettledThroughTheOrdinaryPath(t *testing.T
 		"over the wire": {overTheWire},
 	} {
 		t.Run(name, func(t *testing.T) {
-			s, clock := simulatedStack(t, opts...)
+			s, clock, gate := simulatedStack(t, opts...)
 
 			s.plane.queue(fakeactions.StatisticsJSON(1, 0),
 				fakeactions.JobJSON("JobAvailable", 5001, "push", simulatedTier))
@@ -161,9 +217,27 @@ func TestASimulatedJobIsChargedHeldAndSettledThroughTheOrdinaryPath(t *testing.T
 					"reported the job complete: %v", err)
 			}
 
-			// THE JOB COMPLETES, and the ordinary path runs: destroy, then release.
+			// THE JOB COMPLETES, and the ordinary path runs: destroy, THEN release.
+			// The destroy is held open so the ledger can be asked mid-teardown; a
+			// lease released before the compute is confirmed gone is the overcommit
+			// the ordering exists to prevent, and only visible from in here.
+			entered, release := gate.holdDestroys()
+			defer release()
+
 			s.plane.queue(fakeactions.StatisticsJSON(0, 0),
 				fakeactions.JobJSON("JobCompleted", 5001, "push", simulatedTier))
+
+			select {
+			case <-entered:
+			case <-time.After(30 * time.Second):
+				t.Fatal("the completion never reached the backend's Destroy")
+			}
+
+			if _, err := s.alloc.Lease(t.Context(), leaseID); err != nil {
+				t.Fatalf("the lease was released while its teardown was still in flight: %v", err)
+			}
+
+			release()
 
 			s.awaitGone(t)
 
@@ -219,7 +293,7 @@ func (s *stack) assertRunningAndCharged(t *testing.T, name, leaseID string) {
 // to consume it is an orphan on GitHub, one per pull request. This backend has
 // no boundary at all, so the refusal is the same one docker makes.
 func TestUntrustedWorkNeverReachesTheSimulatedBackend(t *testing.T) {
-	s, _ := simulatedStack(t, untrustedPool)
+	s, _, _ := simulatedStack(t, untrustedPool)
 
 	s.plane.queue(fakeactions.StatisticsJSON(1, 0),
 		fakeactions.JobJSON("JobAvailable", 5002, "pull_request", simulatedTier))
@@ -240,8 +314,21 @@ func TestUntrustedWorkNeverReachesTheSimulatedBackend(t *testing.T) {
 	s.plane.queue(fakeactions.StatisticsJSON(0, 1),
 		fakeactions.JobJSON("JobAssigned", 5002, "pull_request", simulatedTier))
 
-	// There is no positive signal for "nothing happened", so this is a wait.
-	time.Sleep(3 * time.Second)
+	// THE ASSIGNMENT WAS HANDLED, proved by its acknowledgement: the listener acks
+	// a message only after acting on it, and the fake keeps an unacknowledged
+	// head in place. Asserting "nothing happened" after a sleep would pass while
+	// the assignment sat undelivered behind an unacknowledged offer.
+	const assignedMessage = 2
+
+	deadline = time.Now().Add(30 * time.Second)
+
+	for !slices.Contains(s.plane.ackedIDs(), assignedMessage) {
+		if time.Now().After(deadline) {
+			t.Fatalf("the assignment was never acknowledged; acked %v", s.plane.ackedIDs())
+		}
+
+		time.Sleep(50 * time.Millisecond)
+	}
 
 	instances, err := s.provider.List(t.Context())
 	if err != nil {
