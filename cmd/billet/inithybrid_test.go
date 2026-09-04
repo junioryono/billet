@@ -481,9 +481,34 @@ func TestInitHybridBuilderRunbookRunsWhereTheCredentialsAre(t *testing.T) {
 		"  --payload-bucket acme-ci-ami-payloads-1 \\\n" +
 		"  --public-ip --base-image ami-<an EBS-backed Ubuntu 24.04 image in us-west-2>\n" +
 		"```"
-	if !strings.Contains(prepared, want) {
-		t.Errorf("the controller-side build must be exactly this command:\n%s\n\ngot:\n%s",
-			want, prepared)
+	assertOneBuildCommand(t, prepared, want)
+}
+
+// assertOneBuildCommand proves the AMI build step carries exactly this command,
+// and that it is the step's own live command.
+//
+// A match alone proves the text is somewhere on the page. Three cheap facts make
+// it the right somewhere, without the Markdown parser that a hand-written
+// scanner cannot correctly be: the step's heading appears exactly once, so a
+// stale duplicate step cannot answer for the real one; the command appears
+// exactly once, so a later section cannot; and this generator opens every fence
+// with exactly three backticks, so a quoted example inside a wider fence — the
+// one case a scanner would also miss — cannot exist to be matched.
+func assertOneBuildCommand(t *testing.T, runbook, want string) {
+	t.Helper()
+
+	if n := strings.Count(runbook, "\n## 6. Build the AMI\n"); n != 1 {
+		t.Fatalf("the runbook carries the build step %d times, want exactly one", n)
+	}
+
+	if strings.Contains(runbook, "````") {
+		t.Error("this generator opens every fence with three backticks, and the assertion " +
+			"below rests on that: a command quoted inside a wider fence would satisfy it")
+	}
+
+	if n := strings.Count(runbook, want); n != 1 {
+		t.Errorf("the build step must carry exactly this command, once, and carries it %d "+
+			"times:\n%s\n\ngot:\n%s", n, want, runbook)
 	}
 }
 
@@ -515,8 +540,5 @@ func TestInitHybridWithoutTheBuilderTheBuildStaysOnAWorkstation(t *testing.T) {
 		"  --payload-bucket \"$(terraform -chdir=terraform output -raw ami_payload_bucket)\" \\\n" +
 		"  --public-ip --base-image ami-<an EBS-backed Ubuntu 24.04 image in us-west-2>\n" +
 		"```"
-	if !strings.Contains(runbook, want) {
-		t.Errorf("without the grant the build must be exactly this command:\n%s\n\ngot:\n%s",
-			want, runbook)
-	}
+	assertOneBuildCommand(t, runbook, want)
 }

@@ -865,9 +865,28 @@ func TestGenerateHybridUntrustedRunnersReachTheCache(t *testing.T) {
   ip_protocol                  = "tcp"
 }`, port, port)
 
-	if !strings.Contains(files[HybridTerraformFile], want) {
+	root := files[HybridTerraformFile]
+
+	// EXACTLY ONE, AND LIVE. A match proves the text is present, not that it is
+	// the rule terraform will apply: the safe block could sit in a comment above
+	// a second, widened copy of the same resource, and terraform would apply the
+	// widened one. Two cheap facts close that without a parser. The resource may
+	// be declared exactly once, so there is no second copy to be the live one;
+	// and this generator emits no block comments at all, so the one declaration
+	// cannot be commented out.
+	header := `resource "aws_vpc_security_group_ingress_rule" "untrusted_runner_cache" {`
+	if n := strings.Count(root, header); n != 1 {
+		t.Fatalf("the generated root declares the cache rule %d times, want exactly one", n)
+	}
+
+	if strings.Contains(root, "/*") {
+		t.Error("this generator emits no block comments, and the rule assertions below " +
+			"rest on that: a commented-out declaration would satisfy them with no rule applied")
+	}
+
+	if !strings.Contains(root, want) {
 		t.Errorf("an untrusted generation with a cache must render exactly this rule, "+
-			"and the port must be the listener's:\n%s\n\ngot:\n%s", want, files[HybridTerraformFile])
+			"and the port must be the listener's:\n%s\n\ngot:\n%s", want, root)
 	}
 }
 
