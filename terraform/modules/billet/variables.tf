@@ -213,13 +213,26 @@ variable "enable_kms" {
   }
 }
 
-# SPOT INTERRUPTIONS. The queue is created when enable_spot is true; the
-# EventBridge-to-queue router that a tag-scoped delivery needs is a documented
-# follow-up (see README).
+# SPOT INTERRUPTIONS. enable_spot creates the queue a spot node consumes and the
+# EventBridge-to-Lambda router that a tag-scoped delivery needs, since EventBridge
+# cannot match on the instance tag that says which node owns the warning.
 variable "enable_spot" {
-  description = "Create the SQS interruption queue a spot deployment consumes."
+  description = "Create the SQS interruption queue a spot deployment consumes, and the tag-scoped router that fills it."
   type        = bool
   default     = false
+}
+
+# THE ROOT'S EXACT RULE, duplicated on purpose: this root and fleet-ec2 are two
+# entry points, and a rule enforced at only one of them is one that is not enforced.
+variable "spot_router_alarm_actions" {
+  description = "ARNs notified when the spot interruption router fails an invocation — a warning it could not place and re-raised for Lambda to retry. Usually an SNS topic; this module creates none, so an operator supplies their own. Empty leaves the alarm with no action: its state is still visible in the console and to DescribeAlarms, but nothing is sent."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for action in var.spot_router_alarm_actions : can(regex("^arn:", action))])
+    error_message = "every spot_router_alarm_actions entry must be an ARN (an SNS topic's, usually)."
+  }
 }
 
 # THE OFF-SITE COPY. Passed through to the control-plane child, which owns the

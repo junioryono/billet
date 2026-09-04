@@ -244,6 +244,10 @@
     "class": "in_place",
     "reason": "updated in place."
   },
+  "aws_cloudwatch_metric_alarm.spot_router_errors": {
+    "class": "in_place",
+    "reason": "the router's error alarm. Changing it alters what an operator is told about a FUTURE failure and disturbs nothing running."
+  },
   "aws_vpc.this": {
     "class": "draining",
     "reason": "the network every host and every job instance is in. Replacing it replaces everything under it.",

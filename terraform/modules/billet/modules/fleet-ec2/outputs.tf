@@ -40,5 +40,7 @@ output "interruption_queue_url" {
 
 output "spot_node_name" {
   description = "The name a SPOT node must use as its node.name (the queue basename); empty when spot is disabled."
-  value       = var.enable_spot ? "${var.name}-spot-interruptions" : ""
+  # Read from the queue, not rebuilt from var.name: this name is also what the
+  # router is told it serves, and three copies of one literal is two that can drift.
+  value = var.enable_spot ? aws_sqs_queue.interruptions[0].name : ""
 }
