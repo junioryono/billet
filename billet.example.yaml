@@ -773,6 +773,14 @@ node:
   # Every resource is tagged with this deployment identity, and orphan cleanup
   # refuses anything it does not own.
   #
+  # THIS BLOCK AND THE `cache:` BLOCK BELOW ARE GIVEN TOGETHER OR NOT AT ALL, and
+  # `billet check` refuses a store with no listener to serve it: a guest is handed
+  # no cache endpoint, so every job's /var/lib/docker is the instance's root
+  # volume, every image is pulled cold, and no volume, snapshot or state object is
+  # ever created. It is refused there rather than at load because `billet
+  # decommission` and `billet init iam` both read this block on a config whose
+  # listener has already been removed.
+  #
   # The node role needs ec2:CreateVolume, ec2:DeleteVolume, ec2:CreateSnapshot,
   # ec2:DeleteSnapshot, ec2:DescribeVolumes, ec2:DescribeSnapshots, ec2:CreateTags,
   # ec2:AttachVolume and ec2:DetachVolume. It also needs s3:GetObject and
