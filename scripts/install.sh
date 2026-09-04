@@ -32,7 +32,12 @@ CHANNEL="${BILLET_CHANNEL:-stable}"
 # release asset redirect that downgraded to http would put the bytes this script
 # is about to run on the wire in the clear. The checksum is fetched the same way,
 # so an attacker who could rewrite one could rewrite both.
-CURL="curl -fsSL --proto =https --proto-redir =https"
+#
+# BOUNDED AND RETRIED. A connect that hangs for the kernel's own timeout, or one
+# transient 5xx from the release host, used to fail the install outright;
+# --retry-all-errors is what makes a 5xx retryable, since curl retries only
+# transient network errors without it. A real outage still fails, in minutes.
+CURL="curl -fsSL --proto =https --proto-redir =https --connect-timeout 20 --max-time 300 --retry 4 --retry-all-errors --retry-delay 3"
 
 die() {
     printf 'install: %s\n' "$*" >&2

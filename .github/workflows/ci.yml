@@ -313,6 +313,12 @@ jobs:
       - name: Prove the pinned-release fetch path
         run: make release-fetch-check
 
+      # Every fetch site was bounded and retried once, after one stalled
+      # connection failed a converge behind an approval gate. This is what
+      # keeps the next get_url or uri from shipping with the module defaults.
+      - name: Prove every fetch is bounded and retried
+        run: make fetch-retry-check
+
   # Both legs here need the real Debian package, so they share a job: `dist` is
   # phony and runs again for the second target, but the Go build cache is warm
   # by then and it costs about a minute.

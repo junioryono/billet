@@ -347,6 +347,10 @@ release-fetch-check: ## Prove the billet_version fetch path and the URL it build
 firecracker-example-check: ## Prove the role accepts a firecracker emission, up to the hardware
 	ansible_collections/junioryono/billet/tests/firecracker-example-check.sh
 
+.PHONY: fetch-retry-check
+fetch-retry-check: ## Prove every network fetch in both roles is bounded and retried
+	ansible_collections/junioryono/billet/tests/fetch-retry-check.sh
+
 .PHONY: acceptance
 acceptance: ## Run an ISOLATED acceptance deployment against a real account, and destroy exactly what it makes
 	@# NOT IN `check`, and not in CI's ordinary jobs: it launches billable compute

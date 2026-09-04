@@ -47,9 +47,14 @@
     url: "https://github.com/firecracker-microvm/firecracker/releases/download/{{ billet_firecracker_version }}/firecracker-{{ billet_firecracker_version }}-{{ billet_firecracker_arch }}.tgz"
     dest: "{{ billet_firecracker_stage }}/firecracker-{{ billet_firecracker_version }}-{{ billet_firecracker_arch }}.tgz"
     checksum: "sha256:{{ billet_firecracker_checksums[billet_firecracker_arch] }}"
+    timeout: "{{ billet_fetch_timeout }}"
     owner: root
     group: root
     mode: "0600"
+  register: billet_firecracker_download
+  until: billet_firecracker_download is succeeded
+  retries: "{{ billet_fetch_retries }}"
+  delay: "{{ billet_fetch_retry_delay }}"
   become: true
   when:
     - not billet_firecracker_present
