@@ -380,8 +380,12 @@ run "spot_surfaces_the_node_name" {
   }
 }
 
-# THE ROOT ENFORCES THE CHILD'S RULE ITSELF, so the refusal names the input the
-# operator typed rather than surfacing from a module they did not write.
+# THE ROOT ENFORCES THE CHILD'S RULES ITSELF, so the refusal names the input the
+# operator typed rather than surfacing from a module they did not write. Each
+# run expects the failure on the ROOT's variable: the child's refusal is
+# module.fleet.var.spot_node_names, a different address, so a root that lost a
+# rule fails these rather than being covered by the child. One run per rule,
+# because a single refusal run would be satisfied by whichever rule survived.
 run "spot_node_names_without_spot_is_refused_at_the_root" {
   command = plan
 
@@ -392,6 +396,88 @@ run "spot_node_names_without_spot_is_refused_at_the_root" {
   }
 
   expect_failures = [var.spot_node_names]
+}
+
+run "a_dotted_spot_node_name_is_refused_at_the_root" {
+  command = plan
+
+  variables {
+    name            = "billet-test"
+    enable_spot     = true
+    spot_node_names = ["build.1"]
+  }
+
+  expect_failures = [var.spot_node_names]
+}
+
+run "a_repeated_spot_node_name_is_refused_at_the_root" {
+  command = plan
+
+  variables {
+    name            = "billet-test"
+    enable_spot     = true
+    spot_node_names = ["build-1", "build-1"]
+  }
+
+  expect_failures = [var.spot_node_names]
+}
+
+run "the_primary_queue_as_a_spot_node_name_is_refused_at_the_root" {
+  command = plan
+
+  variables {
+    name            = "billet-test"
+    enable_spot     = true
+    spot_node_names = ["billet-test-spot-interruptions"]
+  }
+
+  expect_failures = [var.spot_node_names]
+}
+
+run "an_overlong_spot_node_name_is_refused_at_the_root" {
+  command = plan
+
+  variables {
+    name            = "billet-test"
+    enable_spot     = true
+    spot_node_names = ["abcdefghij-abcdefghij-abcdefghij-abcdefghij-abcdefghij-abcdefghij"]
+  }
+
+  expect_failures = [var.spot_node_names]
+}
+
+run "a_seventeenth_spot_node_name_is_refused_at_the_root" {
+  command = plan
+
+  variables {
+    name            = "billet-test"
+    enable_spot     = true
+    spot_node_names = [for i in range(17) : "build-${i}"]
+  }
+
+  expect_failures = [var.spot_node_names]
+}
+
+# ...AND THE ROOT ADMITS EVERYTHING THE CHILD ADMITS: a root rule tightened past
+# the child's would refuse at the entry point operators actually use, with every
+# child test still green. Sixteen names, one at billet's 64-character ceiling and
+# one with an underscore, all reach the output.
+run "the_root_admits_the_edges_of_the_name_rule" {
+  command = plan
+
+  variables {
+    name        = "billet-test"
+    enable_spot = true
+    spot_node_names = concat(
+      ["abcdefghij-abcdefghij-abcdefghij-abcdefghij-abcdefghij-abcdefghi", "build_1"],
+      [for i in range(14) : "build-${i}"],
+    )
+  }
+
+  assert {
+    condition     = length(output.interruption_queue_urls) == 17 && contains(keys(output.interruption_queue_urls), "abcdefghij-abcdefghij-abcdefghij-abcdefghij-abcdefghij-abcdefghi") && contains(keys(output.interruption_queue_urls), "build_1")
+    error_message = "sixteen further names, the longest and an underscored one among them, must all cross the root into interruption_queue_urls"
+  }
 }
 
 # ...and a value that is not an ARN is refused at PLAN, not silently ignored by

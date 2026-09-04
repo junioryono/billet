@@ -51,6 +51,16 @@ resource "aws_iam_role_policy" "spot_router" {
 
   name = "${var.name}-spot-router"
   role = aws_iam_role.spot_router[0].id
+  # THE SERVED SET LANDS BEFORE THE GRANT WIDENS. Both derive from one list, but
+  # equality at the end of an apply says nothing about the order the two updates
+  # run in, and the wrong order reopens the window this input exists to close: a
+  # grant widened to a new queue while the old function still serves one name
+  # answers AccessDenied during propagation, which that function reads as a
+  # foreign queue and DROPS. A function that already serves the name re-raises
+  # the same AccessDenied until the grant lands, so it goes first. The interval
+  # with a function and no policy at all is safe for the same reason: nothing it
+  # cannot do is a drop.
+  depends_on = [aws_lambda_function.spot_router]
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [

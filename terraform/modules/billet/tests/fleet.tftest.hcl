@@ -846,6 +846,55 @@ run "refuses_a_spot_node_name_longer_than_billet_allows" {
   expect_failures = [var.spot_node_names]
 }
 
+# A SEVENTEENTH NAME IS REFUSED AT PLAN. Every queue's ARN lands in two inline
+# policies and its name in the Lambda's environment, and AWS refuses each past a
+# quota a plan cannot see; the apply that finds out has already created queues
+# that nothing grants or serves, which is the #66 shape again.
+run "refuses_more_spot_node_names_than_the_grants_can_carry" {
+  command = plan
+
+  module {
+    source = "./modules/fleet-ec2"
+  }
+
+  variables {
+    vpc_id          = "vpc-0f0f0f0f0f0f0f0f0"
+    name            = "billet-test"
+    enable_spot     = true
+    spot_node_names = [for i in range(17) : "build-${i}"]
+  }
+
+  expect_failures = [var.spot_node_names]
+}
+
+# ...AND SIXTEEN ARE ACCEPTED AND ALL REACH THE GRANT, so the cap cannot drift
+# below what the README promises. The ARNs are unknown at plan under the mock
+# (no override for sixteen queues), so the count of resources in the grant is
+# what proves every queue arrived; the several-node run proves WHICH.
+run "accepts_sixteen_spot_node_names" {
+  command = plan
+
+  module {
+    source = "./modules/fleet-ec2"
+  }
+
+  variables {
+    vpc_id          = "vpc-0f0f0f0f0f0f0f0f0"
+    name            = "billet-test"
+    enable_spot     = true
+    spot_node_names = [for i in range(16) : "build-${i}"]
+  }
+
+  assert {
+    condition     = length(aws_sqs_queue.spot_nodes) == 16
+    error_message = "sixteen further spot nodes is the documented ceiling and must create sixteen queues"
+  }
+  assert {
+    condition     = length(local.spot_queue_arns) == 17 && length(local.spot_queue_names) == 17
+    error_message = "every one of the seventeen queues must be in the list the grants and the environment derive from"
+  }
+}
+
 # BOTH ENDS OF WHAT THE RULE ADMITS REACH THE QUEUE INTACT: 64 characters is
 # billet's own ceiling, and an underscore is legal on both sides. Asserted on the
 # queue's name rather than on the plan surviving, so a regex tightened past what

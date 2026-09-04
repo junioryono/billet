@@ -439,6 +439,39 @@ class SpotRouterModuleWiringTest(unittest.TestCase):
             f"queue it cannot reach would alarm instead",
         )
 
+    # THE SERVED SET LANDS BEFORE THE GRANT WIDENS. The two derive from one list,
+    # and a plan test can prove they are EQUAL at the end of an apply and nothing
+    # about the order the two updates run in — which is the whole hazard: a grant
+    # widened to a new queue while the old function still serves one name answers
+    # AccessDenied during propagation, and that function reads it as foreign and
+    # drops the warning. The edge lives in spot.tf as a depends_on on the router
+    # policy, and nothing but this file can see it: `terraform test` exposes no
+    # dependency graph. The check is positional over fmt-formatted HCL — every
+    # resource header starts a line at column 0, so the policy's block is the text
+    # between its header and the next — rather than a parser, for the reason the
+    # test above gives.
+    def test_the_router_grant_waits_for_the_function_that_serves_the_set(self):
+        with open(os.path.join(_HERE, "..", "spot.tf"), encoding="utf-8") as f:
+            spot_tf = f.read()
+
+        header = '\nresource "aws_iam_role_policy" "spot_router" {'
+        start = spot_tf.index(header)
+        end = spot_tf.find('\nresource "', start + 1)
+        block = spot_tf[start:end if end != -1 else len(spot_tf)]
+        # Comment lines are dropped first: a `# depends_on = ...` left behind by
+        # somebody removing the edge would otherwise satisfy a substring search.
+        code = "\n".join(line for line in block.splitlines()
+                         if not line.strip().startswith("#"))
+
+        self.assertIn(
+            "depends_on = [aws_lambda_function.spot_router]",
+            code,
+            "the router's policy no longer waits for the function: an apply may widen "
+            "the grant to a new queue before the function serves its name, and the old "
+            "function drops that queue's AccessDenied as foreign while the grant "
+            "propagates",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

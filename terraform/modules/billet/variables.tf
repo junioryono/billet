@@ -252,6 +252,11 @@ variable "spot_node_names" {
     condition     = !contains(var.spot_node_names, "${var.name}-spot-interruptions")
     error_message = "spot_node_names must not name the primary queue enable_spot already creates (<name>-spot-interruptions); that node is served by spot_node_name."
   }
+
+  validation {
+    condition     = length(var.spot_node_names) <= 16
+    error_message = "spot_node_names admits at most 16 further spot nodes: every queue's ARN is repeated in the node role's and the router's inline policies, and IAM caps a role's inline policies at 10,240 characters combined. More spot nodes than that are several fleet-ec2 instances."
+  }
 }
 
 # THE ROOT'S EXACT RULE, duplicated on purpose: this root and fleet-ec2 are two
