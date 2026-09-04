@@ -21,7 +21,11 @@ import (
 // runs `billet server` and `billet node` side by side, and every deployment
 // shape billet has goes through exactly what this test exercises.
 func TestAJobRunsOnANodeAcrossTheWire(t *testing.T) {
-	s := newWireStack(t)
+	forEachBackend(t, aJobRunsOnANodeAcrossTheWire)
+}
+
+func aJobRunsOnANodeAcrossTheWire(t *testing.T, opts ...stackOpt) {
+	s := newWireStack(t, opts...)
 
 	s.plane.queue(fakeactions.StatisticsJSON(1, 0),
 		fakeactions.JobJSON("JobAvailable", 4001, "push", testTier))

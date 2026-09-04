@@ -56,13 +56,13 @@ func (c *offsetClock) advance(d time.Duration) {
 // server and then puts a stray on the host would race a destroy already on its
 // way. An hour is "never" for a test and stays a real duration rather than a
 // disabling flag, so nothing here depends on how the server reads a zero.
-func barrierStack(t *testing.T) (*stack, *offsetClock) {
+func barrierStack(t *testing.T, opts ...stackOpt) (*stack, *offsetClock) {
 	t.Helper()
 
 	clock := &offsetClock{}
 
-	return newStackIn(t, t.TempDir(), newPlane(t), overTheWire,
-		withClock(clock.now), withReapInterval(time.Hour)), clock
+	return newStackIn(t, t.TempDir(), newPlane(t), append([]stackOpt{overTheWire,
+		withClock(clock.now), withReapInterval(time.Hour)}, opts...)...), clock
 }
 
 // runBarrierStack starts the control plane and returns a stop that is safe to
@@ -161,7 +161,11 @@ func (s *stack) ask(t *testing.T, barrierID string) {
 // name shape, the inventory travels the real node wire as a real command, and
 // the list comes back out of a real container runtime.
 func TestTheBarrierSeesRealComputeWhoseLeaseIsGone(t *testing.T) {
-	s, clock := barrierStack(t)
+	forEachBackend(t, theBarrierSeesRealComputeWhoseLeaseIsGone)
+}
+
+func theBarrierSeesRealComputeWhoseLeaseIsGone(t *testing.T, opts ...stackOpt) {
+	s, clock := barrierStack(t, opts...)
 
 	// A REAL JOB, THROUGH THE REAL DISPATCH PATH, run to completion so the
 	// control plane can be stopped with nothing outstanding.
@@ -202,12 +206,14 @@ func TestTheBarrierSeesRealComputeWhoseLeaseIsGone(t *testing.T) {
 	// in the ledger to attribute it to.
 	const strayLease = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaff"
 
+	// THE TIER'S OWN IMAGE AND COMMAND, so the stray is what this backend runs:
+	// a sleeping container on docker, a modelled runner on the simulated backend.
 	if _, err := s.provider.Launch(t.Context(), provider.Spec{
 		Name:      provider.InstanceName(strayLease),
-		Image:     testImage,
+		Image:     s.tiers[0].Image,
 		VCPU:      1,
 		Memory:    config.GiB,
-		Command:   []string{"sleep", "300"},
+		Command:   s.tiers[0].Command,
 		Trust:     provider.TrustTrusted,
 		JITConfig: "acceptance-stray",
 	}); err != nil {
@@ -309,7 +315,11 @@ func TestTheBarrierSeesRealComputeWhoseLeaseIsGone(t *testing.T) {
 // already tests. So this proves what a drain and a decommission do ABOUT such a
 // host, and claims nothing about what put it in that state.
 func TestAnUnreachableHostBlocksUntilSomebodyDecommissionsIt(t *testing.T) {
-	s, _ := barrierStack(t)
+	forEachBackend(t, anUnreachableHostBlocksUntilSomebodyDecommissionsIt)
+}
+
+func anUnreachableHostBlocksUntilSomebodyDecommissionsIt(t *testing.T, opts ...stackOpt) {
+	s, _ := barrierStack(t, opts...)
 
 	sealed := s.seal(t)
 
@@ -390,7 +400,11 @@ func TestAnUnreachableHostBlocksUntilSomebodyDecommissionsIt(t *testing.T) {
 // only place they are exercised together, against a registration that really did
 // negotiate 13 on the real wire rather than a row written to say it had.
 func TestAHostOnTheOldWireIsNeverAskedAndNeverProved(t *testing.T) {
-	s, clock := barrierStack(t)
+	forEachBackend(t, aHostOnTheOldWireIsNeverAskedAndNeverProved)
+}
+
+func aHostOnTheOldWireIsNeverAskedAndNeverProved(t *testing.T, opts ...stackOpt) {
+	s, clock := barrierStack(t, opts...)
 
 	deployment, err := state.DeploymentID(s.dir)
 	if err != nil {

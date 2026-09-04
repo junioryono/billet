@@ -24,7 +24,11 @@ import (
 // acquiring jobs by the wrong id was invisible to every unit test because
 // billet's types agreed with billet's mistake.
 func TestAJobRunsAndIsCleanedUp(t *testing.T) {
-	s := newStack(t)
+	forEachBackend(t, aJobRunsAndIsCleanedUp)
+}
+
+func aJobRunsAndIsCleanedUp(t *testing.T, opts ...stackOpt) {
+	s := newStack(t, opts...)
 
 	// Available first, then assigned, exactly as the real service sequences them:
 	// billet bids on what is AVAILABLE, and GitHub answers by ASSIGNING. Reversing
@@ -110,7 +114,11 @@ func TestAJobRunsAndIsCleanedUp(t *testing.T) {
 // to consume it is an orphan on GitHub that billet will never clean up — one per
 // pull request, accumulating quietly.
 func TestAPullRequestIsRefusedBeforeAnythingIsMinted(t *testing.T) {
-	s := newStack(t, untrustedPool)
+	forEachBackend(t, aPullRequestIsRefusedBeforeAnythingIsMinted)
+}
+
+func aPullRequestIsRefusedBeforeAnythingIsMinted(t *testing.T, opts ...stackOpt) {
+	s := newStack(t, append(opts, untrustedPool)...)
 
 	s.plane.queue(fakeactions.StatisticsJSON(1, 0),
 		fakeactions.JobJSON("JobAvailable", 4002, "pull_request", testTier))
@@ -165,7 +173,11 @@ func TestAPullRequestIsRefusedBeforeAnythingIsMinted(t *testing.T) {
 // escrow it is holding to offer GitHub is indistinguishable from a leak in an
 // aggregate. Draining the budget is what tells the two apart.
 func TestRefusedWorkReturnsItsCapacity(t *testing.T) {
-	s := newStack(t, untrustedPool)
+	forEachBackend(t, refusedWorkReturnsItsCapacity)
+}
+
+func refusedWorkReturnsItsCapacity(t *testing.T, opts ...stackOpt) {
+	s := newStack(t, append(opts, untrustedPool)...)
 
 	stop := s.run(t)
 	defer stop()
@@ -220,7 +232,11 @@ func TestRefusedWorkReturnsItsCapacity(t *testing.T) {
 // acquisition. A JobAvailable message cannot be acked before billet has bid for
 // the job it describes.
 func TestAMessageIsAcknowledgedOnlyAfterItsWorkIsDone(t *testing.T) {
-	s := newStack(t)
+	forEachBackend(t, aMessageIsAcknowledgedOnlyAfterItsWorkIsDone)
+}
+
+func aMessageIsAcknowledgedOnlyAfterItsWorkIsDone(t *testing.T, opts ...stackOpt) {
+	s := newStack(t, opts...)
 
 	s.plane.queue(fakeactions.StatisticsJSON(1, 0),
 		fakeactions.JobJSON("JobAvailable", 4004, "push", testTier))
@@ -262,7 +278,11 @@ func TestAMessageIsAcknowledgedOnlyAfterItsWorkIsDone(t *testing.T) {
 // keeps the head of the queue until its exact id is deleted, so a billet that
 // forgot to acknowledge would loop here forever rather than passing.
 func TestTheSameJobIsNotStartedTwiceWhenAMessageIsRedelivered(t *testing.T) {
-	s := newStack(t)
+	forEachBackend(t, theSameJobIsNotStartedTwiceWhenAMessageIsRedelivered)
+}
+
+func theSameJobIsNotStartedTwiceWhenAMessageIsRedelivered(t *testing.T, opts ...stackOpt) {
+	s := newStack(t, opts...)
 
 	s.plane.queue(fakeactions.StatisticsJSON(1, 0),
 		fakeactions.JobJSON("JobAvailable", 4005, "push", testTier))
@@ -317,7 +337,11 @@ func TestTheSameJobIsNotStartedTwiceWhenAMessageIsRedelivered(t *testing.T) {
 // Asserted against the request BODY rather than the returned struct, because the
 // struct is billet's own type and would agree with billet's own mistake.
 func TestTheScaleSetCarriesTheTierLabel(t *testing.T) {
-	s := newStack(t)
+	forEachBackend(t, theScaleSetCarriesTheTierLabel)
+}
+
+func theScaleSetCarriesTheTierLabel(t *testing.T, opts ...stackOpt) {
+	s := newStack(t, opts...)
 
 	stop := s.run(t)
 	defer stop()

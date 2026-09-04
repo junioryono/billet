@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
-	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/fakeactions"
 	"github.com/junioryono/billet/internal/node"
 	"github.com/junioryono/billet/internal/nodeapi"
@@ -29,7 +28,11 @@ import (
 // situation being tested. A crash is a process that stops without doing any of
 // that, so the test drives the runner directly and then abandons it.
 func TestARealContainerIsAdoptedAfterACrash(t *testing.T) {
-	s := newStack(t)
+	forEachBackend(t, aRealContainerIsAdoptedAfterACrash)
+}
+
+func aRealContainerIsAdoptedAfterACrash(t *testing.T, opts ...stackOpt) {
+	s := newStack(t, opts...)
 
 	lease := s.launchDirectly(t)
 
@@ -37,7 +40,7 @@ func TestARealContainerIsAdoptedAfterACrash(t *testing.T) {
 	// away. The container knows nothing about it and keeps running.
 	s.closeDB()
 
-	restarted := newStackIn(t, s.dir, s.plane)
+	restarted := newStackIn(t, s.dir, s.plane, s.sameBackend()...)
 
 	if err := restarted.runner.Recover(t.Context()); err != nil {
 		t.Fatalf("Recover: %v", err)
@@ -90,7 +93,11 @@ func TestARealContainerIsAdoptedAfterACrash(t *testing.T) {
 // gone back to the budget, so every second it keeps running is a second the
 // ledger is wrong about the machine.
 func TestARealOrphanIsDestroyedAfterACrash(t *testing.T) {
-	s := newStack(t)
+	forEachBackend(t, aRealOrphanIsDestroyedAfterACrash)
+}
+
+func aRealOrphanIsDestroyedAfterACrash(t *testing.T, opts ...stackOpt) {
+	s := newStack(t, opts...)
 
 	lease := s.launchDirectly(t)
 
@@ -102,7 +109,7 @@ func TestARealOrphanIsDestroyedAfterACrash(t *testing.T) {
 
 	s.closeDB()
 
-	restarted := newStackIn(t, s.dir, s.plane)
+	restarted := newStackIn(t, s.dir, s.plane, s.sameBackend()...)
 
 	if err := restarted.runner.Recover(t.Context()); err != nil {
 		t.Fatalf("Recover: %v", err)
@@ -126,11 +133,17 @@ func TestARealOrphanIsDestroyedAfterACrash(t *testing.T) {
 // other's containers, the first to recover would find the other's lease ids
 // absent from its own database and act on live jobs it has no relationship with.
 func TestADifferentDeploymentIsInvisible(t *testing.T) {
-	first := newStack(t)
+	forEachBackend(t, aDifferentDeploymentIsInvisible)
+}
+
+func aDifferentDeploymentIsInvisible(t *testing.T, opts ...stackOpt) {
+	first := newStack(t, opts...)
 	first.launchDirectly(t)
 
-	// A second installation: its own state directory, therefore its own identity.
-	second := newStack(t)
+	// A second installation: its own state directory, therefore its own identity,
+	// on the SAME machine, which on the simulated backend is the host both stacks
+	// were built over.
+	second := newStack(t, opts...)
 
 	live, err := second.provider.List(t.Context())
 	if err != nil {
@@ -159,7 +172,11 @@ func TestADifferentDeploymentIsInvisible(t *testing.T) {
 // A launch whose cleanup cannot be confirmed keeps its capacity, against a real
 // daemon.
 func TestARealUnconfirmedCleanupHoldsCapacity(t *testing.T) {
-	s := newStack(t)
+	forEachBackend(t, aRealUnconfirmedCleanupHoldsCapacity)
+}
+
+func aRealUnconfirmedCleanupHoldsCapacity(t *testing.T, opts ...stackOpt) {
+	s := newStack(t, opts...)
 
 	lease := s.launchDirectly(t)
 
@@ -168,7 +185,7 @@ func TestARealUnconfirmedCleanupHoldsCapacity(t *testing.T) {
 	// has gone. Recovery takes custody either way.
 	s.closeDB()
 
-	restarted := newStackIn(t, s.dir, s.plane)
+	restarted := newStackIn(t, s.dir, s.plane, s.sameBackend()...)
 
 	if err := restarted.runner.Recover(t.Context()); err != nil {
 		t.Fatalf("Recover: %v", err)
@@ -200,14 +217,18 @@ func TestARealUnconfirmedCleanupHoldsCapacity(t *testing.T) {
 // empty. Without the guard it escrows a second lease and starts a second
 // container — a live runner registration that can pick up unrelated work.
 func TestARedeliveredAssignmentDoesNotStartASecondRunner(t *testing.T) {
-	s := newStack(t)
+	forEachBackend(t, aRedeliveredAssignmentDoesNotStartASecondRunner)
+}
+
+func aRedeliveredAssignmentDoesNotStartASecondRunner(t *testing.T, opts ...stackOpt) {
+	s := newStack(t, opts...)
 
 	lease := s.launchDirectly(t)
 
 	// The controller dies without shutting down, and a new one adopts.
 	s.closeDB()
 
-	restarted := newStackIn(t, s.dir, s.plane)
+	restarted := newStackIn(t, s.dir, s.plane, s.sameBackend()...)
 
 	if err := restarted.runner.Recover(t.Context()); err != nil {
 		t.Fatalf("Recover: %v", err)
@@ -342,7 +363,7 @@ func (s *stack) launchDirectly(t *testing.T) *alloc.Lease {
 	// A push, so the container backend accepts it: these tests are about
 	// recovery, not about the trust boundary.
 	if err := s.runner.Launch(t.Context(), lease,
-		nodeapi.TierSpecOf(s.tiers[0], config.ProviderDocker),
+		nodeapi.TierSpecOf(s.tiers[0], s.kind),
 		node.Job{RequestID: requestID, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}

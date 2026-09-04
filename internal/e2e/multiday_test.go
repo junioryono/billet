@@ -59,14 +59,14 @@ const (
 )
 
 // multiDayStack is barrierStack with a drain_timeout a test can outlive.
-func multiDayStack(t *testing.T) (*stack, *offsetClock) {
+func multiDayStack(t *testing.T, opts ...stackOpt) (*stack, *offsetClock) {
 	t.Helper()
 
 	clock := &offsetClock{}
 
-	return newStackIn(t, t.TempDir(), newPlane(t), overTheWire,
+	return newStackIn(t, t.TempDir(), newPlane(t), append([]stackOpt{overTheWire,
 		withClock(clock.now), withReapInterval(time.Hour),
-		withNodeDrainTimeout(nodeDrainReportAfter)), clock
+		withNodeDrainTimeout(nodeDrainReportAfter)}, opts...)...), clock
 }
 
 // TestAMultiDayJobBlocksUpdateAndTeardown proves the deferred operations
@@ -88,7 +88,11 @@ func multiDayStack(t *testing.T) (*stack, *offsetClock) {
 //     thing here rather than a fake: the goroutine below makes the same call the
 //     upgrade transaction makes.
 func TestAMultiDayJobBlocksUpdateAndTeardown(t *testing.T) {
-	s, clock := multiDayStack(t)
+	forEachBackend(t, aMultiDayJobBlocksUpdateAndTeardown)
+}
+
+func aMultiDayJobBlocksUpdateAndTeardown(t *testing.T, opts ...stackOpt) {
+	s, clock := multiDayStack(t, opts...)
 
 	leaseID, _ := s.startAMultiDayJob(t, 5101, clock)
 
@@ -290,7 +294,11 @@ func TestAMultiDayJobBlocksUpdateAndTeardown(t *testing.T) {
 // re-adopts them. Freeing a slot whose container is live is the overcommit the
 // whole ordering exists to prevent.
 func TestAMultiDayJobSurvivesAControlPlaneShutdown(t *testing.T) {
-	s, clock := multiDayStack(t)
+	forEachBackend(t, aMultiDayJobSurvivesAControlPlaneShutdown)
+}
+
+func aMultiDayJobSurvivesAControlPlaneShutdown(t *testing.T, opts ...stackOpt) {
+	s, clock := multiDayStack(t, opts...)
 
 	leaseID, stop := s.startAMultiDayJob(t, 5102, clock)
 
