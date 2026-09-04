@@ -16,12 +16,16 @@ package main
 import (
 	"golang.org/x/tools/go/analysis/multichecker"
 
+	"github.com/junioryono/billet/tools/lint/analyzer/godiconstructor"
+	"github.com/junioryono/billet/tools/lint/analyzer/godioptional"
 	"github.com/junioryono/billet/tools/lint/analyzer/parallelshared"
 	"github.com/junioryono/billet/tools/lint/analyzer/rawsql"
 )
 
 func main() {
 	multichecker.Main(
+		godiconstructor.Analyzer,
+		godioptional.Analyzer,
 		parallelshared.Analyzer,
 		rawsql.Analyzer,
 	)

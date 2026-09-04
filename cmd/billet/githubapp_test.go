@@ -12,6 +12,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/junioryono/billet/internal/github"
 )
 
 // testKey returns a valid PEM-encoded App private key.
@@ -636,11 +638,11 @@ func TestLookupPathDoesNotTreatAnErrorAsAbsence(t *testing.T) {
 	}
 }
 
-// maxKeySize is a documented bound. Asserting it against itself would let a
-// production edit move the limit and the test with it.
+// github.MaxKeySize is a documented bound. Asserting it against itself would
+// let a production edit move the limit and the test with it.
 func TestMaxKeySizeIsPinned(t *testing.T) {
-	if maxKeySize != 65536 {
-		t.Errorf("maxKeySize = %d, want 65536 (64 KiB, as documented)", maxKeySize)
+	if github.MaxKeySize != 65536 {
+		t.Errorf("github.MaxKeySize = %d, want 65536 (64 KiB, as documented)", github.MaxKeySize)
 	}
 }
 
@@ -687,7 +689,7 @@ func TestCheckPrivateKeyRejectsUnusableKeys(t *testing.T) {
 			t.Helper()
 
 			p := filepath.Join(dir, "huge.pem")
-			if err := os.WriteFile(p, make([]byte, maxKeySize+1), 0o600); err != nil {
+			if err := os.WriteFile(p, make([]byte, github.MaxKeySize+1), 0o600); err != nil {
 				t.Fatalf("write: %v", err)
 			}
 

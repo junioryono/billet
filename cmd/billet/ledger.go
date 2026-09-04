@@ -206,7 +206,7 @@ func openStateMaintenance(ctx context.Context, cfg *config.Config) (*state.DB, e
 // AN EMPTY VALUE IS REFUSED HERE rather than passed on, so the diagnostic names
 // the variable an operator has to set instead of arriving several layers down as
 // a connection failure.
-func ledgerDSN(cfg *config.Config) (string, error) {
+func ledgerDSN(cfg *config.Config) (state.DSN, error) {
 	if cfg.Server == nil || cfg.Server.LedgerBackend() != config.StatePostgres {
 		return "", nil
 	}
@@ -222,5 +222,5 @@ func ledgerDSN(cfg *config.Config) (string, error) {
 			name)
 	}
 
-	return dsn, nil
+	return state.DSN(dsn), nil
 }

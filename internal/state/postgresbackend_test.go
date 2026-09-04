@@ -37,7 +37,7 @@ const postgresDSNEnv = "BILLET_TEST_POSTGRES_DSN"
 // catalogue question it asks is scoped to current_schema(), because a deployment
 // may share a database with something else entirely. A test that used the public
 // schema would pass while that scoping was broken.
-func requirePostgres(t *testing.T) string {
+func requirePostgres(t *testing.T) DSN {
 	t.Helper()
 
 	return requirePostgresSchema(t, "")
@@ -45,7 +45,7 @@ func requirePostgres(t *testing.T) string {
 
 // requirePostgresSchema is the same, with a suffix so one test can hold two
 // LEDGERS rather than two names for one.
-func requirePostgresSchema(t *testing.T, suffix string) string {
+func requirePostgresSchema(t *testing.T, suffix string) DSN {
 	t.Helper()
 
 	dsn := os.Getenv(postgresDSNEnv)
@@ -101,7 +101,7 @@ func requirePostgresSchema(t *testing.T, suffix string) string {
 		_, _ = cleanup.Exec(`DROP SCHEMA IF EXISTS ` + quoted + ` CASCADE`)
 	})
 
-	return withSearchPath(t, dsn, schema)
+	return DSN(withSearchPath(t, dsn, schema))
 }
 
 // withSearchPath points a DSN at one schema.
@@ -597,10 +597,10 @@ func TestAMigrationCutOffAtItsDeadlineSaysWhatToLookAt(t *testing.T) {
 // holdSchemaMigrations takes ACCESS EXCLUSIVE on the bookkeeping table from a
 // session of its own and returns the release. The release is also registered as
 // a cleanup, after the schema's own, so the schema can still be dropped.
-func holdSchemaMigrations(t *testing.T, dsn string) (release func()) {
+func holdSchemaMigrations(t *testing.T, dsn DSN) (release func()) {
 	t.Helper()
 
-	conn, err := sql.Open("pgx", dsn)
+	conn, err := sql.Open("pgx", string(dsn))
 	if err != nil {
 		t.Fatalf("open a holder session: %v", err)
 	}
@@ -651,10 +651,10 @@ func holdSchemaMigrations(t *testing.T, dsn string) (release func()) {
 // awaitAWaiterOnSchemaMigrations blocks until some session is waiting for a lock
 // on this schema's bookkeeping table, which is the proof that the open under
 // test is blocked by the holder rather than by nothing.
-func awaitAWaiterOnSchemaMigrations(t *testing.T, dsn string) {
+func awaitAWaiterOnSchemaMigrations(t *testing.T, dsn DSN) {
 	t.Helper()
 
-	conn, err := sql.Open("pgx", dsn)
+	conn, err := sql.Open("pgx", string(dsn))
 	if err != nil {
 		t.Fatalf("open an observer session: %v", err)
 	}

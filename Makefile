@@ -128,7 +128,7 @@ lint-custom: ## billet's own analyzers, and the tests that prove they still dete
 	@set -e; for target in darwin/arm64 linux/amd64; do \
 		os=$${target%/*}; arch=$${target#*/}; \
 		echo "  billetlint $$os/$$arch"; \
-		GOOS=$$os GOARCH=$$arch /tmp/billetlint -parallelshared -rawsql ./...; \
+		GOOS=$$os GOARCH=$$arch /tmp/billetlint -godiconstructor -godioptional -parallelshared -rawsql ./...; \
 	done
 
 .PHONY: lint-fix

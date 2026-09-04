@@ -14,10 +14,10 @@ import (
 // observe. It is the same reasoning the partition test uses for the claim pool:
 // an advisory lock lives in a SESSION, so the connection that takes it is the
 // one that has to stay open, which is what MaxOpenConns(1) guarantees.
-func heldByAnotherHost(t *testing.T, dsn string) *sql.DB {
+func heldByAnotherHost(t *testing.T, dsn DSN) *sql.DB {
 	t.Helper()
 
-	conn, err := sql.Open("pgx", dsn)
+	conn, err := sql.Open("pgx", string(dsn))
 	if err != nil {
 		t.Fatalf("open a connection for the standing-in controller: %v", err)
 	}

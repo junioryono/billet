@@ -11,7 +11,7 @@ import (
 )
 
 // openStandby opens a standby handle over a schema of the caller's own.
-func openStandby(t *testing.T, dsn string) *DB {
+func openStandby(t *testing.T, dsn DSN) *DB {
 	t.Helper()
 
 	db, err := OpenPostgresStandby(t.Context(), t.TempDir(), dsn)

@@ -127,7 +127,7 @@ func TestAStandbyPromotesWhenTheControllersSessionIsTerminated(t *testing.T) {
 // MaxOpenConns(1) precisely so the lock lives in one session — reading the pid
 // out of pg_locks instead would need the lock key, and two tests sharing a server
 // could then terminate each other's controller.
-func terminateClaimSession(t *testing.T, db *DB, dsn string) {
+func terminateClaimSession(t *testing.T, db *DB, dsn DSN) {
 	t.Helper()
 
 	be, ok := db.backend.(*postgresBackend)
@@ -140,7 +140,7 @@ func terminateClaimSession(t *testing.T, db *DB, dsn string) {
 		t.Fatalf("read the claim session's backend pid: %v", err)
 	}
 
-	admin, err := sql.Open("pgx", dsn)
+	admin, err := sql.Open("pgx", string(dsn))
 	if err != nil {
 		t.Fatalf("open an administrative connection: %v", err)
 	}

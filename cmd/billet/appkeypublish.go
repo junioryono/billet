@@ -9,6 +9,8 @@ import (
 	"github.com/junioryono/billet/internal/awscreds"
 	"github.com/junioryono/billet/internal/awsssm"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/github"
+	"github.com/junioryono/billet/internal/wiring"
 )
 
 // publishAppKey puts a GitHub App private key into this deployment's identity
@@ -27,7 +29,7 @@ func publishAppKey(ctx context.Context, cfg *config.Config, pem []byte) error {
 			"this deployment does not keep its App key in an identity store")
 	}
 
-	name := appKeyPath(ssm)
+	name := wiring.AppKeyPath(ssm)
 
 	_, err := awsssm.New(ssm.Region, awscreds.Default()).Put(ctx, name, string(pem), awsssm.PutOptions{
 		Overwrite: false,
@@ -87,7 +89,7 @@ func githubAppStoreKey(ctx context.Context, args []string) error {
 			cfg.Server.IdentityBackendKind())
 	}
 
-	pem, err := readPrivateKey(*from)
+	pem, err := github.ReadPrivateKeyFile(*from)
 	if err != nil {
 		return err
 	}
