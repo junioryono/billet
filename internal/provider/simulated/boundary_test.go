@@ -29,6 +29,7 @@ func TestNothingOutsideATestImportsThisPackage(t *testing.T) {
 	t.Parallel()
 
 	root := moduleRoot(t)
+	module := modulePath(t, filepath.Join(root, "go.mod"))
 	fset := token.NewFileSet()
 
 	var importers []string
@@ -46,16 +47,19 @@ func TestNothingOutsideATestImportsThisPackage(t *testing.T) {
 			}
 
 			// NAMED EXCLUSIONS, NOT EVERY HIDDEN DIRECTORY. A hidden directory can
-			// hold Go source that ships, so only what is provably not this module
-			// is skipped: the object store, a vendored tree, and any directory
-			// carrying its own go.mod, which is another checkout (sessions park
-			// worktrees under .claude) or a nested module that cannot import this
-			// one's internals without a replace directive of its own.
+			// hold Go source that ships, so only what is provably not this tree is
+			// skipped: the object store, a vendored tree, and another CHECKOUT of
+			// this module (sessions park worktrees under .claude), recognised by a
+			// go.mod declaring the same module path. A NESTED module with a path of
+			// its own is walked: tools/lint is one, and a nested module can reach
+			// this module's internals through a replace directive, so a shipping
+			// tool under one is exactly a production importer.
 			if name == ".git" || name == "vendor" {
 				return filepath.SkipDir
 			}
 
-			if _, err := os.Stat(filepath.Join(path, "go.mod")); err == nil {
+			nested := filepath.Join(path, "go.mod")
+			if _, err := os.Stat(nested); err == nil && modulePath(t, nested) == module {
 				return filepath.SkipDir
 			}
 
@@ -97,6 +101,26 @@ func TestNothingOutsideATestImportsThisPackage(t *testing.T) {
 		t.Fatalf("the simulated backend is imported by production code, which could reach a "+
 			"backend that fabricates completions: %v", importers)
 	}
+}
+
+// modulePath reads the module directive out of a go.mod.
+func modulePath(t *testing.T, gomod string) string {
+	t.Helper()
+
+	body, err := os.ReadFile(gomod)
+	if err != nil {
+		t.Fatalf("read %s: %v", gomod, err)
+	}
+
+	for line := range strings.SplitSeq(string(body), "\n") {
+		if rest, ok := strings.CutPrefix(strings.TrimSpace(line), "module "); ok {
+			return strings.Trim(strings.TrimSpace(rest), `"`)
+		}
+	}
+
+	t.Fatalf("%s declares no module", gomod)
+
+	return ""
 }
 
 // moduleRoot finds the directory holding go.mod above this package.

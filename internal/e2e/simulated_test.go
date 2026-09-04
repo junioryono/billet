@@ -5,6 +5,7 @@ import (
 	"errors"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -32,6 +33,11 @@ const (
 type gatedProvider struct {
 	*simulated.Provider
 
+	// inventoryReads counts every List, so a test can wait for the node to have
+	// looked at the host AFTER a state it cares about was reached, rather than
+	// sleeping and hoping a sweep ran.
+	inventoryReads atomic.Int64
+
 	mu sync.Mutex
 	// hold, when set, is what a Destroy waits on before delegating; entered is
 	// signalled once when a Destroy reaches the gate.
@@ -49,6 +55,36 @@ func (g *gatedProvider) holdDestroys() (entered <-chan struct{}, release func())
 	g.entered = make(chan struct{}, 1)
 
 	return g.entered, sync.OnceFunc(func() { close(g.hold) })
+}
+
+func (g *gatedProvider) List(ctx context.Context) ([]*provider.Instance, error) {
+	instances, err := g.Provider.List(ctx)
+	if err == nil {
+		g.inventoryReads.Add(1)
+	}
+
+	return instances, err
+}
+
+// awaitInventoryRead waits until the node has listed the host at least once
+// more than it had at baseline.
+//
+// A WAIT THAT SOMETHING ELSE ALREADY SATISFIED IS NOT A WAIT, so the caller
+// takes the baseline before the state it wants observed exists. Sweep reaches
+// List on every reaper tick in-process and on every CommandSweep over the wire,
+// so a read after the baseline is a sweep that saw the current inventory.
+func (g *gatedProvider) awaitInventoryRead(t *testing.T, baseline int64) {
+	t.Helper()
+
+	deadline := time.Now().Add(30 * time.Second)
+
+	for g.inventoryReads.Load() <= baseline {
+		if time.Now().After(deadline) {
+			t.Fatalf("the node never listed the host again (still %d reads)", baseline)
+		}
+
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 func (g *gatedProvider) Destroy(ctx context.Context, id string) (provider.Teardown, error) {
@@ -180,15 +216,17 @@ func TestASimulatedJobIsChargedHeldAndSettledThroughTheOrdinaryPath(t *testing.T
 					lease.VCPU, lease.Memory)
 			}
 
-			// HELD. Several reaper ticks pass with the modelled runner still going,
-			// and nothing settles the lease early.
-			time.Sleep(time.Second)
+			// HELD. The node sweeps the host with the modelled runner still going,
+			// observed rather than assumed, and nothing settles the lease.
+			gate.awaitInventoryRead(t, gate.inventoryReads.Load())
 
 			s.assertRunningAndCharged(t, names[0], leaseID)
 
 			// THE MODELLED DURATION ELAPSES. The instance stops and is terminal, and
 			// the lease is STILL charged: the backend's word that a runner finished
 			// is not GitHub's word that the job did.
+			readsBeforeStop := gate.inventoryReads.Load()
+
 			clock.advance(simulatedDuration + time.Second)
 
 			deadline = time.Now().Add(10 * time.Second)
@@ -210,7 +248,8 @@ func TestASimulatedJobIsChargedHeldAndSettledThroughTheOrdinaryPath(t *testing.T
 				time.Sleep(50 * time.Millisecond)
 			}
 
-			time.Sleep(time.Second)
+			// A sweep that SAW the stopped instance, not merely time passing.
+			gate.awaitInventoryRead(t, readsBeforeStop)
 
 			if _, err := s.alloc.Lease(t.Context(), leaseID); err != nil {
 				t.Fatalf("the lease was settled on the backend's word alone, before GitHub "+
