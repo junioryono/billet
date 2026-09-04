@@ -775,3 +775,115 @@ func TestInitIAMRefusesADottedPayloadBucket(t *testing.T) {
 		t.Errorf("the refusal must name the flag: %v", err)
 	}
 }
+
+// THE HOST BILLET DIALS AND THE ARN BILLET IS AUTHORISED FOR ARE ONE PARTITION, and
+// neither package can prove that alone.
+//
+// `billet init iam` derives the queue ARN's partition from node.ec2.region, while
+// internal/config decides which host that region may name. Those two agreed by luck
+// rather than by construction: the validator admitted EITHER DNS suffix for EVERY
+// region, so a cn-north-1 node could name sqs.cn-north-1.amazonaws.com — a host that
+// does not exist — and still get a correct arn:aws-cn policy. An operator applies the
+// grant, `billet check` is happy, and the two-minute spot warning never arrives,
+// because the node is signing for a name nothing resolves.
+//
+// So this asserts both halves of the agreement at once: the China config LOADS with
+// the China host, and the statement it produces is scoped in the China partition.
+//
+// IT IS THE POSITIVE HALF OF A PAIR, and on its own it proves less than it looks.
+// What turns it red is a suffix that stops being the region's — forcing the commercial
+// one refuses this config at load. Deleting the partition guard outright does NOT:
+// this host is accepted either way, and the ARN comes from awspolicy, which the guard
+// does not touch. TestInitIAMRefusesAChinaQueueOnTheCommercialHost below is the half
+// that catches that, which is why the two are written together.
+func TestInitIAMScopesAChinaQueueToTheChinaPartition(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "billet.yaml")
+	body := `
+node:
+  server_addr: 127.0.0.1:7717
+  name: aws-1
+  provider: ec2
+  state_dir: ` + t.TempDir() + `
+  max_vcpu: 64
+  max_memory: 256GiB
+  ec2:
+    region: cn-north-1
+    subnet_id: subnet-0abc
+    security_group_ids: [sg-0abc]
+    spot: true
+    interruption_queue_url: https://sqs.cn-north-1.amazonaws.com.cn/123456789012/aws-1
+    instance_types:
+      - type: c7i.2xlarge
+        vcpu: 8
+        memory: 16GiB
+        price_usd_per_hour: 0.34
+`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var err error
+	out := capture(t, func() {
+		err = cmdInit(t.Context(), []string{"iam", "--config", path, "--deployment", testDeployID})
+	})
+	if err != nil {
+		t.Fatalf("init iam refused a cn-north-1 config naming its own partition's queue host: %v", err)
+	}
+
+	if !strings.Contains(out, "arn:aws-cn:sqs:cn-north-1:123456789012:aws-1") {
+		t.Errorf("the interruption statement is not scoped in the China partition:\n%s", out)
+	}
+}
+
+// AND THE COMMERCIAL HOST IN THE SAME REGION IS REFUSED BEFORE A POLICY EXISTS.
+//
+// The other direction of the pair above, and the case that used to succeed: a
+// cn-north-1 node naming sqs.cn-north-1.amazonaws.com printed an aws-cn policy an
+// operator would then apply. The refusal has to come from LOADING the config, so
+// that `billet node` and `billet check` refuse it too rather than only this command.
+func TestInitIAMRefusesAChinaQueueOnTheCommercialHost(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "billet.yaml")
+	body := `
+node:
+  server_addr: 127.0.0.1:7717
+  name: aws-1
+  provider: ec2
+  state_dir: ` + t.TempDir() + `
+  max_vcpu: 64
+  max_memory: 256GiB
+  ec2:
+    region: cn-north-1
+    subnet_id: subnet-0abc
+    security_group_ids: [sg-0abc]
+    spot: true
+    interruption_queue_url: https://sqs.cn-north-1.amazonaws.com/123456789012/aws-1
+    instance_types:
+      - type: c7i.2xlarge
+        vcpu: 8
+        memory: 16GiB
+        price_usd_per_hour: 0.34
+`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var err error
+	out := capture(t, func() {
+		err = cmdInit(t.Context(), []string{"iam", "--config", path, "--deployment", testDeployID})
+	})
+	if err == nil {
+		t.Fatalf("init iam rendered a policy for a queue host that does not exist:\n%s", out)
+	}
+
+	// AND NOTHING WAS PRINTED, which is the half a returned error does not cover.
+	// This command's output is a policy an operator pastes into IAM, so a refusal
+	// that had already written one hands them a grant for a queue billet has just
+	// said it will not use — and the error alone would still be there to read.
+	if strings.TrimSpace(out) != "" {
+		t.Errorf("the refusal still printed a policy an operator would apply:\n%s", out)
+	}
+
+	if !strings.Contains(err.Error(), "sqs.cn-north-1.amazonaws.com.cn,") {
+		t.Errorf("the refusal does not name the host cn-north-1's partition serves: %v", err)
+	}
+}
