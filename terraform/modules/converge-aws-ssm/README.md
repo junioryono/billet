@@ -18,7 +18,7 @@ If that trade is not one you want to make, [Cloudflare Tunnel](../converge-cloud
 
 ```hcl
 module "converge" {
-  source = "github.com/junioryono/billet//terraform/modules/converge-aws-ssm?ref=v0.6.0"
+  source = "github.com/junioryono/billet//terraform/modules/converge-aws-ssm?ref=v0.6.1"
 
   name              = "billet-converge"
   github_repository = "your-org/your-infra-repo"

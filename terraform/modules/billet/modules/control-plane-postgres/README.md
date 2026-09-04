@@ -48,7 +48,7 @@ The bytes are duplicated under `policy/` rather than read out of the sibling chi
 
 ```hcl
 module "controller" {
-  source = "github.com/junioryono/billet//terraform/modules/billet/modules/control-plane-postgres?ref=v0.6.0"
+  source = "github.com/junioryono/billet//terraform/modules/billet/modules/control-plane-postgres?ref=v0.6.1"
 
   name             = "billet"
   vpc_id           = var.vpc_id
@@ -63,7 +63,7 @@ module "controller" {
 }
 
 module "ledger" {
-  source = "github.com/junioryono/billet//terraform/modules/billet/modules/state-rds-postgres?ref=v0.6.0"
+  source = "github.com/junioryono/billet//terraform/modules/billet/modules/state-rds-postgres?ref=v0.6.1"
 
   name       = "billet"
   vpc_id     = var.vpc_id
