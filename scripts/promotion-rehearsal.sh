@@ -146,8 +146,11 @@ server:
 # a release the stable channel is not on, so the starter opened a rollout to the
 # channel within a minute of boot (measured 2026-09-04) and the packaged root
 # timer then fenced the ledger for its host transaction, refusing the very
-# `local down` this rehearsal is about. The rollout rehearsal is the one that
-# wants the default.
+# local down this rehearsal is about. The rollout rehearsal is the one that
+# wants the default. (Plain words, no backticks: this heredoc is unquoted, and
+# a backtick pair inside it is a command substitution; the first runs of every
+# rehearsal ran the words local down as a command at the top level of the script,
+# "local: can only be used in a function" against the heredoc's line.)
 release:
   automatic: false
 EOF
@@ -167,11 +170,18 @@ EOF
 
     docker exec -i "${c}" sh -c 'cat >/tmp/server.env' <<<"BILLET_STATE_DSN=${dsn}"
     docker exec "${c}" install -m 0640 -o root -g billet /tmp/server.env /etc/billet/server.env
-    docker exec "${c}" install -d -m 0755 /etc/systemd/system/billet-server.service.d
-    docker exec -i "${c}" sh -c 'cat >/etc/systemd/system/billet-server.service.d/10-environment.conf' <<'EOF'
-[Service]
-EnvironmentFile=-/etc/billet/server.env
-EOF
+    # A WHOLE UNIT, NOT A DROP-IN. `billet local up` and the host transaction
+    # refuse a billet unit with an effective drop-in, because a drop-in can
+    # replace ExecStart, the account or the readiness protocol and neither can
+    # start what it has not accounted for; the third promotion run measured the
+    # refusal ("billet-server.service has drop-in overrides", 2026-09-04). The
+    # host role renders its own unit carrying EnvironmentFile= for exactly this
+    # reason (docs/deploying/postgres-and-active-passive.md), and the rehearsal
+    # does the same from the packaged unit, in /etc where it shadows /usr/lib.
+    docker exec "${c}" sh -c 'sed "/^\[Service\]/a EnvironmentFile=-/etc/billet/server.env" /usr/lib/systemd/system/billet-server.service >/etc/systemd/system/billet-server.service'
+    docker exec "${c}" grep -q '^EnvironmentFile=-/etc/billet/server.env$' /etc/systemd/system/billet-server.service ||
+        rehearsal_fail "the rendered unit on ${c} does not carry the EnvironmentFile line"
+    docker exec "${c}" rm -rf /etc/systemd/system/billet-server.service.d
     docker exec "${c}" systemctl daemon-reload
 done
 
@@ -208,6 +218,12 @@ docker cp "${controller_a}:/tmp/identity.tar" "${work}/identity.tar"
 docker exec "${controller_a}" rm -f /tmp/identity.tar
 docker cp "${work}/identity.tar" "${controller_b}:/tmp/identity.tar"
 rm -f "${work}/identity.tar"
+# B HAS NO IDENTITY DIRECTORY YET: only A ran `ca issue`, and the service
+# account's directory is what systemd's StateDirectory= would create on first
+# start. It is created here as that account, 0700, so root's extraction lands in
+# a directory the server can open (the first two promotion runs failed on this
+# line with "Cannot open: No such file or directory", 2026-09-04).
+docker exec "${controller_b}" install -d -m 0700 -o billet -g billet /var/lib/billet/server
 docker exec "${controller_b}" tar -C /var/lib/billet/server -xf /tmp/identity.tar
 docker exec "${controller_b}" rm -f /tmp/identity.tar
 docker exec "${controller_b}" chown -R billet:billet /var/lib/billet/server
@@ -223,7 +239,7 @@ docker exec -e "BILLET_STATE_DSN=${dsn}" "${controller_b}" /usr/bin/billet local
 docker exec "${node}" /usr/bin/billet local up --config /etc/billet/billet.yaml 2>&1 | tail -4
 
 rehearsal_wait_for 120 "A to claim the controller" "${controller_a}" \
-    sh -c 'journalctl -u billet-server --no-pager -o cat | grep -q "claimed this deployment.s controller"' ||
+    sh -c 'journalctl -u billet-server --no-pager -o cat | grep -Eq "(claimed|promoted to) this deployment.s controller"' ||
     rehearsal_fail "controller A never claimed"
 rehearsal_wait_for 120 "B to stand by" "${controller_b}" \
     sh -c 'journalctl -u billet-server --no-pager -o cat | grep -q "standing by for this deployment.s controller"' ||

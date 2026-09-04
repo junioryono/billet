@@ -111,8 +111,11 @@ server:
 # a release the stable channel is not on, so the starter opened a rollout to the
 # channel within a minute of boot (measured 2026-09-04) and the packaged root
 # timer then fenced the ledger for its host transaction, refusing the very
-# `local down` this rehearsal is about. The rollout rehearsal is the one that
-# wants the default.
+# local down this rehearsal is about. The rollout rehearsal is the one that
+# wants the default. (Plain words, no backticks: this heredoc is unquoted, and
+# a backtick pair inside it is a command substitution; the first runs of every
+# rehearsal ran the words local down as a command at the top level of the script,
+# "local: can only be used in a function" against the heredoc's line.)
 release:
   automatic: false
 EOF
@@ -196,7 +199,12 @@ for n in "${node_a}" "${node_b}"; do
 done
 
 rehearsal_step "billet ca retire drops the old authority; the fleet keeps polling"
-rehearsal_as_billet "${controller}" /usr/bin/billet ca retire --config /etc/billet/billet.yaml 2>&1 | sed -n '1,4p'
+# --force IS THE OPERATOR'S CHECK, MADE. Without it `ca retire` prints what the
+# operator has to have verified (every node renewed since the rotation) and
+# exits 0 having retired nothing, which the first real run read as a retire;
+# the harness has just proved both renewals from the nodes' own journals, so
+# it says so.
+rehearsal_as_billet "${controller}" /usr/bin/billet ca retire --force --config /etc/billet/billet.yaml 2>&1 | sed -n '1,4p'
 if docker exec "${controller}" test -f /var/lib/billet/server/ca/ca-previous.crt; then
     rehearsal_fail "ca retire left ca-previous.crt in place"
 fi
