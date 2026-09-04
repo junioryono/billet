@@ -305,10 +305,16 @@ var (
 // queue rather than every queue in the account.
 //
 // THE REGION COMES FROM THE CONFIG, NOT THE HOST. config already proved the queue
-// is in node.ec2.region, and the URL host varies — sqs.<region>.amazonaws.com, a
-// China .amazonaws.com.cn host, a legacy <region>.queue.amazonaws.com, or a VPC
-// endpoint — so only the ACCOUNT and NAME are read from the URL path, which is the
-// same across all of them, and both are checked against their grammars.
+// is in node.ec2.region AND in that region's partition, and within that the host
+// still varies — sqs.<region>.<suffix>, a legacy <region>.queue.<suffix>, or a VPC
+// endpoint under .sqs.<region>.vpce.<suffix> — so only the ACCOUNT and NAME are read
+// from the URL path, which is the same across all of them, and both are checked
+// against their grammars.
+//
+// THE PARTITION HERE AND THE SUFFIX THERE COME FROM THE SAME REGION, which is the
+// point rather than a coincidence: this renders arn:aws-cn:sqs:... for a cn- region,
+// and a validator that admitted the commercial host for one would authorise a queue
+// the node then failed to resolve.
 func sqsQueueARN(queueURL, partition, region string) (string, error) {
 	u, err := url.Parse(queueURL)
 	if err != nil {

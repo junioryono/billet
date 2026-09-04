@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -734,5 +735,136 @@ func TestACloudEndpointMustNameAHostWithNoPath(t *testing.T) {
 				t.Errorf("endpoint %q was rejected: %v", endpoint, err)
 			}
 		})
+	}
+}
+
+// spotConfig is the cloud fixture with a chosen region and interruption queue.
+//
+// The node in ec2Node is named aws-1, so every queue basename here has to be aws-1
+// or CheckSQSQueueNode refuses it for a different reason than the one under test.
+func spotConfig(t *testing.T, region, queueURL string) string {
+	t.Helper()
+
+	return cloudConfig(t, "    region: us-west-2\n", "    region: "+region+"\n"+
+		"    spot: true\n"+
+		"    interruption_queue_url: "+queueURL+"\n")
+}
+
+// A QUEUE HOST BELONGS TO ITS REGION'S PARTITION, AND THE REGION PICKS IT.
+//
+// The validator used to admit EITHER DNS suffix for EVERY region, so a cn-north-1
+// node could name sqs.cn-north-1.amazonaws.com — which is not a host — while
+// `billet init iam` derived arn:aws-cn:sqs:... from the same region. The policy is
+// then right, the config loads, and the node signs a ReceiveMessage for a name that
+// does not resolve: the two-minute spot warning simply never arrives.
+//
+// MEASURED WITH dig ON 2026-09-04, because the endpoint tables read the other way
+// for the legacy and VPC-endpoint forms. Every standard and legacy host below was
+// resolved: the accepted ones answer and the refused ones are NXDOMAIN. GovCloud is
+// a separate partition that takes the COMMERCIAL suffix, which is why it is here — a
+// rule keyed on "is this the commercial partition" rather than on the region's own
+// prefix gets exactly that case wrong.
+func TestASpotQueueHostBelongsToItsRegionsPartition(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct{ region, queue string }{
+		// sqs.cn-north-1.amazonaws.com.cn -> 140.179.15.58
+		"china standard": {"cn-north-1",
+			"https://sqs.cn-north-1.amazonaws.com.cn/123456789012/aws-1"},
+		// cn-north-1.queue.amazonaws.com.cn is a CNAME onto the host above. This one
+		// was REFUSED before the fix: the legacy form was admitted only with the
+		// commercial suffix, so China's real legacy host was not a legal value.
+		"china legacy": {"cn-north-1",
+			"https://cn-north-1.queue.amazonaws.com.cn/123456789012/aws-1"},
+		"china vpc endpoint": {"cn-north-1",
+			"https://vpce-0a1b.sqs.cn-north-1.vpce.amazonaws.com.cn/123456789012/aws-1"},
+		// sqs.us-gov-west-1.amazonaws.com -> 56.136.121.58, and the .cn form is
+		// NXDOMAIN: GovCloud is its own partition on the commercial suffix.
+		"govcloud standard": {"us-gov-west-1",
+			"https://sqs.us-gov-west-1.amazonaws.com/123456789012/aws-1"},
+		"commercial standard": {"us-west-2",
+			"https://sqs.us-west-2.amazonaws.com/123456789012/aws-1"},
+		// us-west-2.queue.amazonaws.com -> 44.242.184.144.
+		"commercial legacy": {"us-west-2",
+			"https://us-west-2.queue.amazonaws.com/123456789012/aws-1"},
+		"commercial vpc endpoint": {"us-west-2",
+			"https://vpce-0a1b.sqs.us-west-2.vpce.amazonaws.com/123456789012/aws-1"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			if _, err := Load(writeConfig(t, spotConfig(t, tc.region, tc.queue))); err != nil {
+				t.Fatalf("a queue host in %s's own partition was refused: %v", tc.region, err)
+			}
+		})
+	}
+}
+
+// THE OTHER PARTITION'S SUFFIX NAMES NO HOST, so accepting it can only produce a
+// node that never hears a reclaim. Every case here loaded before the fix.
+//
+// The DIAGNOSTIC is asserted rather than the fact of an error: an operator who
+// copied the wrong suffix has to be told which hosts their region's partition
+// actually serves, and "an error came back" is also satisfied by any of the four
+// unrelated refusals earlier in the same validator.
+func TestASpotQueueHostFromTheOtherPartitionIsRefused(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct{ region, queue, wantHost string }{
+		"commercial suffix in china": {"cn-north-1",
+			"https://sqs.cn-north-1.amazonaws.com/123456789012/aws-1",
+			"sqs.cn-north-1.amazonaws.com.cn,"},
+		"commercial legacy in china": {"cn-north-1",
+			"https://cn-north-1.queue.amazonaws.com/123456789012/aws-1",
+			"sqs.cn-north-1.amazonaws.com.cn,"},
+		"commercial vpc endpoint in china": {"cn-north-1",
+			"https://vpce-0a1b.sqs.cn-north-1.vpce.amazonaws.com/123456789012/aws-1",
+			"sqs.cn-north-1.amazonaws.com.cn,"},
+		"china suffix in a commercial region": {"us-west-2",
+			"https://sqs.us-west-2.amazonaws.com.cn/123456789012/aws-1",
+			"sqs.us-west-2.amazonaws.com,"},
+		"china legacy in a commercial region": {"us-west-2",
+			"https://us-west-2.queue.amazonaws.com.cn/123456789012/aws-1",
+			"sqs.us-west-2.amazonaws.com,"},
+		"china vpc endpoint in a commercial region": {"us-west-2",
+			"https://vpce-0a1b.sqs.us-west-2.vpce.amazonaws.com.cn/123456789012/aws-1",
+			"sqs.us-west-2.amazonaws.com,"},
+		"china suffix in govcloud": {"us-gov-west-1",
+			"https://sqs.us-gov-west-1.amazonaws.com.cn/123456789012/aws-1",
+			"sqs.us-gov-west-1.amazonaws.com,"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			got := loadErr(t, spotConfig(t, tc.region, tc.queue))
+
+			if !strings.Contains(got, strconv.Quote(tc.region)) {
+				t.Errorf("the error does not name the region it signs for: %s", got)
+			}
+			if !strings.Contains(got, tc.wantHost) {
+				t.Errorf("the error does not name %s, the host %s's partition serves: %s",
+					tc.wantHost, tc.region, got)
+			}
+		})
+	}
+}
+
+// GOVCLOUD IS THE CASE A PARTITION-SHAPED RULE GETS WRONG. It is a partition of its
+// own, so a suffix chosen by asking "is this the commercial partition" would send it
+// to amazonaws.com.cn, where nothing answers.
+func TestTheDNSSuffixIsThePartitionsOwn(t *testing.T) {
+	t.Parallel()
+
+	for region, want := range map[string]string{
+		"cn-north-1":     "amazonaws.com.cn",
+		"cn-northwest-1": "amazonaws.com.cn",
+		"us-west-2":      "amazonaws.com",
+		"us-east-1":      "amazonaws.com",
+		"us-gov-west-1":  "amazonaws.com",
+		"us-gov-east-1":  "amazonaws.com",
+	} {
+		if got := AWSDNSSuffix(region); got != want {
+			t.Errorf("AWSDNSSuffix(%q) = %q, want %q", region, got, want)
+		}
 	}
 }

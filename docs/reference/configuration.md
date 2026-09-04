@@ -64,7 +64,7 @@ Byte sizes are written as `32GiB`, `512MiB` and parsed exactly; durations as Go 
 
 ### `node.ec2` (required for ec2)
 
-`region` (required), `endpoint` (https, loopback excepted), `subnet_id` (required), `security_group_ids`, `untrusted_security_group_ids` (absent means untrusted work is refused), `assign_public_ip`, `instance_profile` (optional, and empty is the right answer unless a job needs one), `instance_types` (ordered; each `type`, `vcpu`, `memory`, `price_usd_per_hour`), `spot`, `interruption_queue_url` (required with `spot`; its basename must equal the node's name).
+`region` (required), `endpoint` (https, loopback excepted), `subnet_id` (required), `security_group_ids`, `untrusted_security_group_ids` (absent means untrusted work is refused), `assign_public_ip`, `instance_profile` (optional, and empty is the right answer unless a job needs one), `instance_types` (ordered; each `type`, `vcpu`, `memory`, `price_usd_per_hour`), `spot`, `interruption_queue_url` (required with `spot`; its basename must equal the node's name, and its host must be one `region`'s own partition serves — `sqs.<region>.amazonaws.com` and its legacy and VPC-endpoint forms in the commercial and GovCloud partitions, the `.amazonaws.com.cn` versions of all three in China, and never a mixture, because billet signs the request for `region` and sends it to that host).
 
 ### `node.codebuild` (required for codebuild, refused otherwise)
 

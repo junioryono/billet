@@ -622,6 +622,12 @@ node:
   #   # billet records the failure reason before teardown and deletes a message
   #   # only after that record is durable. The node role needs sqs:ReceiveMessage
   #   # and sqs:DeleteMessage on its queue.
+  #   #
+  #   # THE HOST BELONGS TO THE REGION'S PARTITION and billet refuses the other
+  #   # one's, because it signs the request for `region` and sends it to this
+  #   # host. A China deployment names sqs.<region>.amazonaws.com.cn, not the
+  #   # commercial host below; GovCloud is a separate partition that uses the
+  #   # commercial suffix.
   #   # spot: true
   #   # interruption_queue_url: https://sqs.us-west-2.amazonaws.com/123456789012/aws-1
 

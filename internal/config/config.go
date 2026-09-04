@@ -4549,7 +4549,49 @@ func (e *EC2Config) normalize() {
 	}
 }
 
+// AWSDNSSuffix is the DNS suffix of the partition a region belongs to.
+//
+// DECLARED HERE AND USED THERE, exactly like TapPrefix and for the same reason:
+// config may not import awsjson, and a second copy of this rule in this file would
+// be a constant that can drift from the thing it is validating against.
+// awsjson.DNSSuffixFor is this function.
+//
+// MEASURED 2026-09-04 rather than read, because the documentation lists endpoints
+// per service page and gets the legacy forms wrong. `sqs.cn-north-1.amazonaws.com`
+// and `cn-north-1.queue.amazonaws.com` do not resolve; `sqs.cn-north-1.amazonaws.com.cn`
+// does, and `cn-north-1.queue.amazonaws.com.cn` is a CNAME onto it. In the other
+// direction `sqs.us-west-2.amazonaws.com.cn` does not resolve. GOVCLOUD IS NOT A
+// SEPARATE CASE despite being a separate partition: `sqs.us-gov-west-1.amazonaws.com`
+// resolves and the .cn form does not. The VPC-endpoint zone is delegated per
+// partition too — `vpce.amazonaws.com` is served by ns-1714.awsdns-22.co.uk and
+// `vpce.amazonaws.com.cn` by ns-960.awsdns-cn-60.com — which is corroboration
+// rather than a probe, since the names below it are created with an endpoint.
+//
+// A PARTITION BILLET HAS NOT BEEN TAUGHT ABOUT answers "amazonaws.com" here, and
+// the SQS host check therefore REFUSES its queue URL rather than admitting a host
+// that is not one: the ISO partitions are not under amazonaws.com at all. That is
+// the safe direction and it is unchanged.
+func AWSDNSSuffix(region string) string {
+	if strings.HasPrefix(region, "cn-") {
+		return "amazonaws.com.cn"
+	}
+
+	return "amazonaws.com"
+}
+
 // CheckSQSQueueURL refuses a warning queue that cannot be signed safely.
+//
+// THE SUFFIX IS SELECTED BY THE REGION, NEVER OFFERED AS A CHOICE. This admitted
+// either partition's suffix for every region, so `cn-north-1` accepted
+// `sqs.cn-north-1.amazonaws.com` — which is not a host — while `billet init iam`
+// derived the queue ARN's partition from the same region and rendered a correct
+// `arn:aws-cn:sqs:...`. Everything an operator can see is then right: the policy
+// applies, the queue exists, the node starts. Behind it the node signs a
+// ReceiveMessage for cn-north-1 and sends it to a name that does not resolve, so
+// the two-minute spot warning never arrives, every reclaim becomes an unexplained
+// failed job, and the lease stays charged until it expires. The queue host, the
+// region billet signs for and the partition billet is authorised in have to be one
+// partition, and only the region can decide which.
 func CheckSQSQueueURL(raw, region string) error {
 	if raw == "" {
 		return nil
@@ -4574,13 +4616,15 @@ func CheckSQSQueueURL(raw, region string) error {
 		return nil
 	}
 	host := strings.ToLower(u.Hostname())
-	standard := host == "sqs."+region+".amazonaws.com" ||
-		host == "sqs."+region+".amazonaws.com.cn" ||
-		host == region+".queue.amazonaws.com"
-	private := strings.HasSuffix(host, ".sqs."+region+".vpce.amazonaws.com") ||
-		strings.HasSuffix(host, ".sqs."+region+".vpce.amazonaws.com.cn")
+	suffix := AWSDNSSuffix(region)
+	standard := host == "sqs."+region+"."+suffix || host == region+".queue."+suffix
+	private := strings.HasSuffix(host, ".sqs."+region+".vpce."+suffix)
 	if !standard && !private {
-		return fmt.Errorf("node.ec2.interruption_queue_url must name an SQS endpoint in node.ec2.region %q", region)
+		return fmt.Errorf("node.ec2.interruption_queue_url must name an SQS endpoint in "+
+			"node.ec2.region %q, whose partition serves sqs.%s.%s, %s.queue.%s and "+
+			"<endpoint>.sqs.%s.vpce.%s; the other partition's suffix names no host in "+
+			"this region, and billet signs every queue request for this region",
+			region, region, suffix, region, suffix, region, suffix)
 	}
 
 	return nil
