@@ -21,6 +21,11 @@ import (
 // out and rendered without the redaction methods below.
 type RunnerGroupPolicyClient interface {
 	ValidateTrustedRunnerGroup(ctx context.Context, groupID int, wantWorkflows []string) error
+	// ValidateRunnerGroupReach asks only whether a group can be assigned a job
+	// at all. It is the half of the trusted validation that applies to EVERY
+	// tier, including an untrusted one, which lives in the default group and was
+	// asked nothing.
+	ValidateRunnerGroupReach(ctx context.Context, groupID int) error
 	InspectScaleSetRunner(ctx context.Context, runnerName string, runnerID int64) (RunnerRecovery, error)
 	// FindRunnerGroupID resolves a name so a caller holding only the App
 	// credentials can validate a group, which is what lets `billet check` reach
@@ -131,32 +136,14 @@ func (c *runnerGroupPolicyClient) ValidateTrustedRunnerGroup(ctx context.Context
 		return fmt.Errorf("github: runner group %d is not restricted to selected workflows", groupID)
 	}
 
-	// A GROUP THAT GRANTS NO REPOSITORY ROUTES NOTHING, AND SAYS SO NOWHERE.
-	//
-	// With visibility "selected" and an empty repository list, GitHub silently
-	// never assigns a job: the scale set registers, the listener advertises, and
-	// every surface reports healthy while the job queues forever with no runner
-	// group attached. Measured on a real organization — it cost an hour, and the
-	// only thing that distinguished it from a working deployment was this list.
-	//
-	// The assertion is deliberately just "not empty" rather than matching each
-	// workflow's repository against the grant. Empty is unambiguous and cannot
-	// produce a false refusal; per-workflow matching would have to parse the
-	// owner/repo out of every selected_workflows entry and would refuse a
-	// working deployment the day that format admits a shape this does not expect.
-	//
-	// It is easy to reach by accident: a REST PATCH that sets visibility to
-	// "selected" without re-sending selected_repository_ids clears the list.
-	if strings.EqualFold(policy.Visibility, "selected") {
-		granted, err := c.runnerGroupRepositories(ctx, token, groupID)
-		if err != nil {
-			return err
-		}
-		if granted == 0 {
-			return fmt.Errorf("github: runner group %d is visible to selected repositories and "+
-				"grants none, so GitHub can never assign it a job", groupID)
-		}
+	// THE REACH RULE IS THE SAME ONE EVERY TIER NEEDS, so it is asked here
+	// through the function an untrusted tier's check calls too, with the token
+	// and the visibility this request already fetched rather than fetching them
+	// twice.
+	if err := c.checkRunnerGroupReach(ctx, token, groupID, policy.Visibility); err != nil {
+		return err
 	}
+
 	want := slices.Clone(wantWorkflows)
 	got := slices.Clone(policy.SelectedWorkflows)
 	slices.Sort(want)
@@ -166,6 +153,113 @@ func (c *runnerGroupPolicyClient) ValidateTrustedRunnerGroup(ctx context.Context
 			got, want)
 	}
 	return nil
+}
+
+// ValidateRunnerGroupReach asks whether a group can be assigned a job at all,
+// and nothing else about its policy.
+//
+// THIS IS THE HALF EVERY TIER NEEDS. An untrusted tier lives in the default
+// group, which the trusted validation refuses outright and therefore never
+// examines, so `billet check` asked nothing about it: the acceptance lane's
+// third run sat queued for its whole window against a default group that
+// granted no repository, with every surface reporting healthy.
+func (c *runnerGroupPolicyClient) ValidateRunnerGroupReach(ctx context.Context, groupID int) error {
+	if c == nil || c.org == "" || c.appID <= 0 || c.installationID <= 0 || len(c.privateKey) == 0 {
+		return fmt.Errorf("github: runner-group validation is not configured")
+	}
+
+	token, err := c.installationToken(ctx)
+	if err != nil {
+		return err
+	}
+
+	visibility, err := c.runnerGroupVisibility(ctx, token, groupID)
+	if err != nil {
+		return err
+	}
+
+	return c.checkRunnerGroupReach(ctx, token, groupID, visibility)
+}
+
+// checkRunnerGroupReach is the rule itself, taking a visibility its caller has
+// already read so the trusted path does not fetch the group twice.
+//
+// A GROUP THAT GRANTS NO REPOSITORY ROUTES NOTHING, AND SAYS SO NOWHERE.
+//
+// With visibility "selected" and an empty repository list, GitHub silently never
+// assigns a job: the scale set registers, the listener advertises, and every
+// surface reports healthy while the job queues forever with no runner group
+// attached. Measured twice on a real organization — once at the cost of an hour,
+// and again by the acceptance lane, which waited out its whole window against
+// the DEFAULT group in exactly this state.
+//
+// The assertion is deliberately just "not empty" rather than matching a
+// workflow's repository against the grant. Empty is unambiguous and cannot
+// produce a false refusal; per-workflow matching would have to parse the
+// owner/repo out of every selected_workflows entry and would refuse a working
+// deployment the day that format admits a shape this does not expect.
+//
+// It is easy to reach by accident: a REST PATCH that sets visibility to
+// "selected" without re-sending selected_repository_ids clears the list.
+func (c *runnerGroupPolicyClient) checkRunnerGroupReach(
+	ctx context.Context, token string, groupID int, visibility string,
+) error {
+	if !strings.EqualFold(visibility, "selected") {
+		return nil
+	}
+
+	granted, err := c.runnerGroupRepositories(ctx, token, groupID)
+	if err != nil {
+		return err
+	}
+
+	if granted == 0 {
+		return fmt.Errorf("github: runner group %d is visible to selected repositories and "+
+			"grants none, so GitHub can never assign it a job", groupID)
+	}
+
+	return nil
+}
+
+// runnerGroupVisibility reads one group's visibility, for the callers that need
+// the reach rule without the trusted policy around it.
+func (c *runnerGroupPolicyClient) runnerGroupVisibility(
+	ctx context.Context, token string, groupID int,
+) (string, error) {
+	endpoint := fmt.Sprintf("%s/orgs/%s/actions/runner-groups/%d", c.base,
+		url.PathEscape(c.org), groupID)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, http.NoBody)
+	if err != nil {
+		return "", fmt.Errorf("github: build runner-group request: %w", err)
+	}
+
+	setAPIHeaders(req)
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := doWithTimeout(c.client, req)
+	if err != nil {
+		return "", fmt.Errorf("github: get runner group: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return "", fmt.Errorf("github: read runner group: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("github: get runner group: %w", apiError(resp.StatusCode, body))
+	}
+
+	var group struct {
+		Visibility string `json:"visibility"`
+	}
+	if err := json.Unmarshal(body, &group); err != nil {
+		return "", fmt.Errorf("github: decode runner group: %w", err)
+	}
+
+	return group.Visibility, nil
 }
 
 // InspectScaleSetRunner reads the state of a registration whose name, id and
@@ -452,10 +546,23 @@ func (c *runnerGroupPolicyClient) FindRunnerGroupID(ctx context.Context, name st
 		return 0, false, fmt.Errorf("github: decode runner groups: %w", err)
 	}
 
+	// AN EMPTY NAME IS THE DEFAULT GROUP, which is where a tier that names none
+	// lands — GitHub assigns its scale set there. Resolving it by name would
+	// depend on the group being called "Default", which is only its name until
+	// somebody renames it; the listing marks it, so the mark is what this reads.
 	for _, g := range listed.RunnerGroups {
-		if g.Name == name {
+		if name == "" && g.Default {
+			return g.ID, true, nil
+		}
+
+		if name != "" && g.Name == name {
 			return g.ID, g.Default, nil
 		}
+	}
+
+	if name == "" {
+		return 0, false, fmt.Errorf("%w: this organization lists no default runner group, "+
+			"which is where a tier naming none would land", ErrRunnerGroupNotFound)
 	}
 
 	return 0, false, fmt.Errorf("%w: %q", ErrRunnerGroupNotFound, name)
