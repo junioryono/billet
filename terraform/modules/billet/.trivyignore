@@ -44,14 +44,16 @@ AVD-AWS-0090
 # deliberate: SSE-S3 has no key-management burden and the data is a build cache.
 AVD-AWS-0132
 
-# The spot-router Lambda is a hundred-line forwarder whose only work is moving
-# an interruption warning onto the queue. X-Ray tracing (AVD-AWS-0066) would add
-# a per-invocation cost to observe a function whose monitoring surface is the
-# error alarm this module creates beside it (aws_cloudwatch_metric_alarm
-# .spot_router_errors, on the function's own Errors metric — the router re-raises
-# rather than dropping anything it cannot prove foreign, so a lost warning is a
-# datapoint there). A CMK on its log group (AVD-AWS-0017) is the same
-# key-management burden the ledger entry above declines — the logs carry
-# instance ids, not secrets.
+# The spot-router Lambda is a hundred-line forwarder whose only work is moving an
+# interruption warning onto the queue. X-Ray tracing (AVD-AWS-0066) would add a
+# per-invocation cost to observe a function whose failures already land on one
+# metric: the router re-raises rather than dropping anything it cannot prove is
+# another deployment's, so a lost warning is an Errors datapoint, and
+# aws_cloudwatch_metric_alarm.spot_router_errors watches exactly that. What is
+# declined here is the TRACING, not the signal — and the alarm SENDS nothing
+# until spot_router_alarm_actions names somewhere to send it, because this module
+# creates no SNS topic and will not invent an alerting path an operator already
+# has. A CMK on its log group (AVD-AWS-0017) is the same key-management burden
+# the ledger entry above declines — the logs carry instance ids, not secrets.
 AVD-AWS-0066
 AVD-AWS-0017
