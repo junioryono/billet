@@ -69,8 +69,23 @@ variable "enable_spot" {
   default     = false
 }
 
+# OVERRIDING REPLACES THE NODE POLICY, AND THE BUILDER RIDES IT.
+#
+# `builder = true` attaches an ADDITIVE document granting CreateImage, the
+# console read, the promotion tag and the create-time tag for CreateImage — and
+# nothing that launches an instance. The builder's launch rides whatever the node
+# policy allows, which the committed presence-mode rendering does whatever the
+# owner tag says, and a VALUE-scoped policy does not: `billet ami build` tags its
+# builder billet-ami-build-<image>, never the deployment id.
+#
+# The module cannot check this for you. Whether an arbitrary IAM document admits
+# that launch is not a question a string comparison answers — a presence-mode
+# policy admits it while containing no such literal, and a document naming the
+# prefix in a Sid or a Deny admits nothing — and a gate that is wrong in either
+# direction is worse than the operator knowing the rule. Issue #61 removes the
+# coupling instead, by making the builder document self-sufficient.
 variable "iam_policy_json" {
-  description = "Override the node role's policy document entirely (the output of `billet init iam`). Empty renders the committed generator output for the enabled features."
+  description = "Override the node role's policy document entirely (the output of `billet init iam`). Empty renders the committed generator output for the enabled features. WITH builder = true, generate the override with `--builder` too: the builder policy is additive and grants nothing that launches an instance, so a value-scoped override generated without it denies the build's first call."
   type        = string
   default     = ""
 }
@@ -97,26 +112,6 @@ variable "builder" {
   type        = bool
   default     = false
 
-  validation {
-    # AN OVERRIDE HAS TO ADMIT THE BUILDER'S OWN TAG, and only whoever generated
-    # it can make it do so.
-    #
-    # iam_policy_json REPLACES the node policy outright, and this builder
-    # document is ADDITIVE: it grants CreateImage, the console read, the
-    # promotion tag and the create-time tag for CreateImage, and nothing that
-    # launches an instance. The launch rides the node policy's own RunInstances,
-    # which a PRESENCE-mode rendering admits whatever the owner tag says and a
-    # VALUE-mode one does not — `billet ami build` tags its builder
-    # billet-ami-build-<image>, never the deployment id. So a value-scoped
-    # override generated without --builder denies the very first call while the
-    # apply reports the builder grant enabled, which is worse than not having it.
-    #
-    # A substring is the only test available here and it is the right one:
-    # `billet init iam --builder` is what puts that prefix into the conditions
-    # that admit the builder's launch and its create-time tag.
-    condition     = var.iam_policy_json == "" || !var.builder || can(regex("billet-ami-build-", var.iam_policy_json))
-    error_message = "builder = true beside an iam_policy_json override needs that override to admit the builder's own owner tag. iam_policy_json REPLACES the node policy; the builder document is additive and grants nothing that launches an instance; and a value-scoped policy admits only the deployment's exact owner value, while `billet ami build` tags its builder billet-ami-build-<image>. Regenerate the override with `billet init iam --deployment <id> --builder`, which adds the billet-ami-build-* conditions this looks for."
-  }
 }
 
 variable "builder_payload_bucket" {

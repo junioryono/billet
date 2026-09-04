@@ -801,72 +801,11 @@ run "accepts_the_longest_payload_bucket" {
   }
 }
 
-# A VALUE-SCOPED OVERRIDE THAT DOES NOT ADMIT THE BUILDER IS REFUSED AT APPLY.
-#
-# iam_policy_json REPLACES the node policy, and the builder document is additive:
-# it grants nothing that launches an instance. So a policy generated with
-# `--deployment <id>` and no `--builder` admits only that deployment's exact
-# owner value, while `billet ami build` tags its builder billet-ami-build-<image>
-# — the first RunInstances is denied while the apply reports the builder grant
-# enabled, which is worse than never having asked for it.
-run "refuses_a_builder_beside_an_override_that_cannot_launch_it" {
-  command = plan
-
-  module {
-    source = "./modules/fleet-ec2"
-  }
-
-  variables {
-    name    = "billet-test"
-    vpc_id  = "vpc-0f0f0f0f0f0f0f0f0"
-    builder = true
-    iam_policy_json = jsonencode({
-      Version = "2012-10-17"
-      Statement = [{
-        Sid = "BilletRunInstances", Effect = "Allow", Action = "ec2:RunInstances", Resource = "*"
-        Condition = {
-          StringEquals = { "aws:RequestTag/sh.billet.owner" = "deployment-abc" }
-        }
-      }]
-    })
-  }
-
-  expect_failures = [var.builder]
-}
-
-# ...AND ONE THAT DOES ADMIT IT APPLIES, so the refusal is about the missing
-# condition and not about overriding at all.
-run "accepts_a_builder_beside_an_override_that_admits_it" {
-  command = plan
-
-  module {
-    source = "./modules/fleet-ec2"
-  }
-
-  variables {
-    name    = "billet-test"
-    vpc_id  = "vpc-0f0f0f0f0f0f0f0f0"
-    builder = true
-    iam_policy_json = jsonencode({
-      Version = "2012-10-17"
-      Statement = [{
-        Sid = "BilletRunInstances", Effect = "Allow", Action = "ec2:RunInstances", Resource = "*"
-        Condition = {
-          StringLike = { "aws:RequestTag/sh.billet.owner" = ["deployment-abc", "billet-ami-build-*"] }
-        }
-      }]
-    })
-  }
-
-  assert {
-    condition     = aws_iam_role_policy.node.policy == var.iam_policy_json
-    error_message = "an override that admits the builder must still replace the node policy outright"
-  }
-}
-
-# AN OVERRIDE WITHOUT THE BUILDER IS UNTOUCHED BY THIS RULE, which is the shape
-# every existing consumer has.
-run "an_override_without_the_builder_needs_no_such_condition" {
+# AN OVERRIDE REPLACES THE NODE POLICY AND NOTHING ELSE. It attaches no builder,
+# and the module asks no question about its contents: whether a given IAM
+# document admits the builder's own launch is not something a string can answer,
+# so the variable's own text carries the rule instead. See #61.
+run "an_override_attaches_no_builder_and_is_passed_through" {
   command = plan
 
   module {

@@ -34,6 +34,7 @@ const hybridOutputsJSON = `{
   "runner_security_group_id": {"sensitive": false, "type": "string", "value": "sg-trusted"},
   "untrusted_runner_security_group_id": {"sensitive": false, "type": "string", "value": "sg-untrusted"},
   "ami_payload_bucket": {"sensitive": false, "type": "string", "value": "acme-ci-ami-payloads-1"},
+  "name": {"sensitive": false, "type": "string", "value": "acme-ci"},
   "region": {"sensitive": false, "type": "string", "value": "us-west-2"}
 }`
 
@@ -49,6 +50,7 @@ const hybridCacheOutputsJSON = `{
   "cache_bucket": {"sensitive": false, "type": "string", "value": "acme-ci-cache-1"},
   "cache_prefix": {"sensitive": false, "type": "string", "value": "billet-cache"},
   "availability_zone": {"sensitive": false, "type": "string", "value": "us-west-2a"},
+  "name": {"sensitive": false, "type": "string", "value": "acme-ci"},
   "region": {"sensitive": false, "type": "string", "value": "us-west-2"}
 }`
 
@@ -700,6 +702,28 @@ func TestInitHybridRefusesOutputsFromAnotherRegionsRoot(t *testing.T) {
 		`"region": {"sensitive": false, "type": "string", "value": "eu-central-1"}`, 1)
 	if elsewhere == hybridOutputsJSON {
 		t.Fatal("the fixture no longer carries the region output this case rewrites")
+	}
+
+	// THE NAME IS THE HALF THAT CATCHES THE LIKELIER MISTAKE: another
+	// deployment's outputs.json, from the same region, reads as this one on
+	// region alone, and every id in it names that deployment's resources.
+	otherDeployment := strings.Replace(hybridOutputsJSON,
+		`"name": {"sensitive": false, "type": "string", "value": "acme-ci"}`,
+		`"name": {"sensitive": false, "type": "string", "value": "acme-staging"}`, 1)
+	if otherDeployment == hybridOutputsJSON {
+		t.Fatal("the fixture no longer carries the name output this case rewrites")
+	}
+
+	other := filepath.Join(dir, "other.json")
+	if err := os.WriteFile(other, []byte(otherDeployment), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := runInitHybrid(t, append(hybridArgs(out, cfg),
+		"--terraform-output", other)...); err == nil ||
+		!strings.Contains(err.Error(), "acme-staging") {
+		t.Fatalf("another deployment's outputs from the same region must be refused "+
+			"and named, got %v", err)
 	}
 
 	if err := os.WriteFile(outputs, []byte(elsewhere), 0o644); err != nil {

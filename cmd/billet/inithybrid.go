@@ -132,6 +132,12 @@ func cmdInitHybrid(ctx context.Context, args []string) error {
 		return err
 	}
 
+	// TRIMMED ONCE, BEFORE ANYTHING READS THEM. config's own region check trims
+	// a local copy, so `--region " us-west-2 "` validated and then compared
+	// unequal against the trimmed value the outputs carry — a refusal naming two
+	// regions that print identically.
+	*name, *region = strings.TrimSpace(*name), strings.TrimSpace(*region)
+
 	// WHICH FLAGS WERE ACTUALLY PASSED, so the re-run command the runbook prints
 	// repeats a --config the operator named and not the per-user default.
 	setFlags := make(map[string]bool)
@@ -204,20 +210,24 @@ func cmdInitHybrid(ctx context.Context, args []string) error {
 			return err
 		}
 
-		// THE OUTPUTS HAVE TO BE THIS ROOT'S, and the region is the one fact that
-		// says so cheaply. Every rendering takes the region from --region while
-		// every id here comes from an apply, so outputs from a root applied in
-		// another region — or a re-render with --region retyped — produce a
-		// config that signs against one region and names another's subnet,
-		// security group, buckets and controller. Nothing downstream refuses it:
-		// a cache generation eventually trips over the availability zone, and a
-		// generation without one prints an AMI command that simply cannot work.
-		if f.Region != *region {
-			return fmt.Errorf("--terraform-output was written by a root in %s and this "+
-				"generation is for %s: every id in it names resources in the other "+
-				"region, so either re-render with --region %s or point "+
-				"--terraform-output at this region's own outputs",
-				f.Region, *region, f.Region)
+		// THE OUTPUTS HAVE TO BE THIS GENERATION'S. Every rendering takes the name
+		// and region from the flags while every id here comes from an apply, so
+		// another root's outputs render a config that signs against one
+		// deployment and names another's subnet, security group, buckets and
+		// controller. Nothing downstream refuses it: a cache generation
+		// eventually trips over the availability zone, and a generation without
+		// one prints an AMI command that simply cannot work.
+		//
+		// THIS IS NOT A BINDING, and the message says which mistake it caught
+		// rather than claiming the file is now proved to be this root's. Two
+		// generations sharing a name and a region in different accounts are
+		// identical from here; #62 is what would actually bind them.
+		if f.Name != *name || f.Region != *region {
+			return fmt.Errorf("--terraform-output was written by the %q root in %s and this "+
+				"generation is %q in %s: every id in that file names another deployment's "+
+				"resources, so either re-render with --name %s --region %s or point "+
+				"--terraform-output at this generation's own outputs",
+				f.Name, f.Region, *name, *region, shellArg(f.Name), shellArg(f.Region))
 		}
 
 		facts = &f

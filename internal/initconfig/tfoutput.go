@@ -67,6 +67,7 @@ func ParseTerraformOutput(raw []byte, need HybridNeeds) (HybridFacts, error) {
 		HybridOutputSubnetID:              &f.SubnetID,
 		HybridOutputRunnerSecurityGroup:   &f.RunnerSecurityGroupID,
 		HybridOutputAMIPayloadBucket:      &f.AMIPayloadBucket,
+		HybridOutputName:                  &f.Name,
 		HybridOutputRegion:                &f.Region,
 	} {
 		if *dst, err = read(name); err != nil {

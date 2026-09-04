@@ -56,6 +56,7 @@ const (
 	HybridOutputRunnerSecurityGroup   = "runner_security_group_id"
 	HybridOutputUntrustedRunnerSG     = "untrusted_runner_security_group_id"
 	HybridOutputAMIPayloadBucket      = "ami_payload_bucket"
+	HybridOutputName                  = "name"
 	HybridOutputRegion                = "region"
 	HybridOutputCacheBucket           = "cache_bucket"
 	HybridOutputCachePrefix           = "cache_prefix"
@@ -95,11 +96,17 @@ type HybridFacts struct {
 	RunnerSecurityGroupID          string
 	UntrustedRunnerSecurityGroupID string
 	AMIPayloadBucket               string
-	// Region is consumed by no rendering — every one of them takes the region
-	// from HybridParams. It is read so the two can be COMPARED: an operator
-	// pointing at another root's outputs, or retyping --region, otherwise gets a
-	// config that signs for one region and names another's subnet, security
-	// group and buckets, with nothing in the generation saying so.
+	// Name and Region are consumed by no rendering — every one takes both from
+	// HybridParams. They are read so the two can be COMPARED, because outputs
+	// from another root otherwise render a config that signs against one
+	// deployment and names another's subnet, security group, buckets and
+	// controller, with nothing in the generation saying so.
+	//
+	// THEY DO NOT BIND TO A ROOT, and nothing available here can. Two generations
+	// sharing a name and a region, in different accounts, are indistinguishable
+	// from these outputs. What this catches is the ordinary mistake — the wrong
+	// outputs.json, or a flag retyped — not a determined one.
+	Name   string
 	Region string
 	// The cache facts, demanded only of a generation that asked for one.
 	CacheBucket      string
@@ -1266,8 +1273,13 @@ output "backup_prefix" {
   value       = module.billet.backup_prefix
 }
 
-output "region" {
-  description = "The region everything above is in."
+output %[2]q {
+  description = "The generation these outputs belong to. billet init hybrid compares it and the region with its own flags before it fills a single placeholder, so another root's outputs are refused rather than quietly rendered. It does not identify the ACCOUNT, so two deployments sharing a name and a region are still indistinguishable from here."
+  value       = %[3]q
+}
+
+output %[4]q {
+  description = "The region everything above is in, compared the same way."
   value       = module.billet.region
 }
 
@@ -1276,11 +1288,11 @@ output "control_plane_instance_id" {
   value       = module.billet.control_plane_instance_id
 }
 
-output %q {
+output %[1]q {
   description = "Pass to billet ami build --payload-bucket."
   value       = aws_s3_bucket.ami_payloads.id
 }
-`, HybridOutputAMIPayloadBucket)
+`, HybridOutputAMIPayloadBucket, HybridOutputName, p.Name, HybridOutputRegion)
 
 	return b.String()
 }

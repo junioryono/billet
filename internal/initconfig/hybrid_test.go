@@ -219,6 +219,11 @@ func TestGenerateHybridPlaceholdersNameDeclaredOutputs(t *testing.T) {
 	for _, name := range []string{
 		HybridOutputControlPlanePrivateIP, HybridOutputLedgerVolumeID, HybridOutputSubnetID,
 		HybridOutputRunnerSecurityGroup, HybridOutputUntrustedRunnerSG, HybridOutputAMIPayloadBucket,
+		// The two the prepare render COMPARES rather than consumes. Without them
+		// here, deleting either output from the rendered root would leave every
+		// command test green — they hand the parser a document they wrote
+		// themselves — while a real prepare render refused every root.
+		HybridOutputName, HybridOutputRegion,
 	} {
 		if !declared[name] {
 			t.Errorf("terraform/main.tf does not declare %q, which the prepare render demands", name)
@@ -472,6 +477,7 @@ func TestParseTerraformOutput(t *testing.T) {
   "runner_security_group_id": {"sensitive": false, "type": "string", "value": "sg-trusted"},
   "untrusted_runner_security_group_id": {"sensitive": false, "type": "string", "value": "sg-untrusted"},
   "ami_payload_bucket": {"sensitive": false, "type": "string", "value": "acme-ci-ami-payloads-1"},
+  "name": {"sensitive": false, "type": "string", "value": "acme-ci"},
   "region": {"sensitive": false, "type": "string", "value": "us-west-2"}
 }`
 
@@ -482,7 +488,7 @@ func TestParseTerraformOutput(t *testing.T) {
 	want := HybridFacts{
 		ControlPlanePrivateIP: "10.60.0.10", LedgerVolumeID: "vol-0abc", SubnetID: "subnet-0abc",
 		RunnerSecurityGroupID: "sg-trusted", UntrustedRunnerSecurityGroupID: "sg-untrusted",
-		AMIPayloadBucket: "acme-ci-ami-payloads-1", Region: "us-west-2",
+		AMIPayloadBucket: "acme-ci-ami-payloads-1", Name: "acme-ci", Region: "us-west-2",
 	}
 	if got != want {
 		t.Errorf("facts %+v, want %+v", got, want)
@@ -739,6 +745,7 @@ func TestParseTerraformOutputCacheFacts(t *testing.T) {
   "subnet_id": {"value": "subnet-0abc"},
   "runner_security_group_id": {"value": "sg-trusted"},
   "ami_payload_bucket": {"value": "acme-ci-ami-payloads-1"},
+  "name": {"value": "acme-ci"},
   "region": {"value": "us-west-2"},
   "cache_bucket": {"value": "acme-ci-cache-1"},
   "cache_prefix": {"value": "billet-cache"},
