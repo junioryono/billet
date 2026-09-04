@@ -312,3 +312,92 @@ func TestAGivenBaseIsNotOverridden(t *testing.T) {
 			"this off api.github.com", client.base, fake)
 	}
 }
+
+// THE SAME RULE, ASKED OF A GROUP NOBODY VALIDATES OTHERWISE.
+//
+// An untrusted tier lives in the DEFAULT group, which the trusted validation
+// refuses outright and therefore never examines — so a default group with
+// visibility "selected" and no repositories left every surface reporting
+// healthy while every job queued forever. The acceptance lane's third run found
+// it by waiting out its whole window (2026-09-04), which is the second time this
+// exact state has cost a measured hour.
+//
+// This asks ONLY reach: no workflow restriction, because the default group has
+// none and refusing it for that would refuse every untrusted deployment.
+func TestRunnerGroupReachRequiresARepositoryGrant(t *testing.T) {
+	newServer := func(t *testing.T, visibility string, repoCount int) (*httptest.Server, *atomic.Int32) {
+		t.Helper()
+
+		var repoCalls atomic.Int32
+
+		mux := http.NewServeMux()
+		mux.HandleFunc("POST /app/installations/22/access_tokens",
+			func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusCreated)
+				fmt.Fprintf(w, `{"token":"installation-secret","expires_at":%q}`,
+					time.Now().Add(time.Hour).UTC().Format(time.RFC3339))
+			})
+
+		// THE DEFAULT GROUP'S OWN SHAPE: no workflow restriction at all, which is
+		// what it is and what this must accept.
+		mux.HandleFunc("GET /orgs/acme/actions/runner-groups/1",
+			func(w http.ResponseWriter, _ *http.Request) {
+				fmt.Fprintf(w, `{"name":"Default","default":true,"visibility":%q,`+
+					`"restricted_to_workflows":false,"selected_workflows":[]}`, visibility)
+			})
+		mux.HandleFunc("GET /orgs/acme/actions/runner-groups/1/repositories",
+			func(w http.ResponseWriter, _ *http.Request) {
+				repoCalls.Add(1)
+				fmt.Fprintf(w, `{"total_count":%d,"repositories":[]}`, repoCount)
+			})
+
+		srv := httptest.NewServer(mux)
+		t.Cleanup(srv.Close)
+
+		return srv, &repoCalls
+	}
+
+	t.Run("selected with no repositories is refused", func(t *testing.T) {
+		key, _ := testKeyPKCS1(t)
+		srv, _ := newServer(t, "selected", 0)
+		c := newRunnerGroupPolicyClient(srv.Client(), srv.URL, "acme", 11, 22, key)
+
+		err := c.ValidateRunnerGroupReach(t.Context(), 1)
+		if err == nil {
+			t.Fatal("a default group granting no repository was accepted")
+		}
+
+		if !strings.Contains(err.Error(), "grants none") {
+			t.Errorf("the refusal does not name the cause: %v", err)
+		}
+	})
+
+	t.Run("selected with a grant is accepted", func(t *testing.T) {
+		key, _ := testKeyPKCS1(t)
+		srv, _ := newServer(t, "selected", 1)
+		c := newRunnerGroupPolicyClient(srv.Client(), srv.URL, "acme", 11, 22, key)
+
+		if err := c.ValidateRunnerGroupReach(t.Context(), 1); err != nil {
+			t.Errorf("a group granting a repository was refused: %v", err)
+		}
+	})
+
+	// AND IT ASKS NOTHING ELSE. A default group is not restricted to workflows
+	// and never will be, so a reach check that also demanded that restriction
+	// would refuse every untrusted deployment there is.
+	t.Run("an unrestricted group is accepted", func(t *testing.T) {
+		key, _ := testKeyPKCS1(t)
+		srv, calls := newServer(t, "all", 0)
+		c := newRunnerGroupPolicyClient(srv.Client(), srv.URL, "acme", 11, 22, key)
+
+		if err := c.ValidateRunnerGroupReach(t.Context(), 1); err != nil {
+			t.Errorf("a group visible to every repository was refused: %v", err)
+		}
+
+		// visibility "all" cannot be changed by the list, so asking for it would
+		// be a request per validation for an answer that decides nothing.
+		if got := calls.Load(); got != 0 {
+			t.Errorf("the repositories endpoint was consulted %d times for visibility all", got)
+		}
+	})
+}

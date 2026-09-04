@@ -147,6 +147,20 @@ jobs:
             --account "$BILLET_ACCEPTANCE_ACCOUNT" \
             --region "$BILLET_ACCEPTANCE_REGION"
 
+      # CHECK BEFORE WAITING, because the failure this catches is invisible from
+      # inside a run that has already started.
+      #
+      # The lane's third run (2026-09-04) dispatched its job and then sat queued
+      # for its whole window: the organization's Default group had visibility
+      # "selected" and granted no repository, so GitHub assigned the job to
+      # nothing, and every surface reported healthy. Every derived tier is
+      # untrusted and lands in that group, so `billet check` on the derived
+      # config now reaches the same verdict in seconds. It runs BEFORE the
+      # dispatch so a failing lane costs a dispatch it never made.
+      - name: Prove the derived deployment can be assigned a job
+        run: |
+          "$RUNNER_TEMP/billet" check --config "$RUNNER_TEMP/acceptance/ws/billet.yaml"
+
       # THE JOB THE RUN IS WAITING FOR. `billet acceptance` deliberately does not
       # dispatch one — deciding which workflow to run is the operator's, and a
       # command that dispatched one would need write access to a repository for no

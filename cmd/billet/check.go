@@ -421,6 +421,12 @@ func runCheck(ctx context.Context, opts checkOptions) (checkReport, error) {
 
 	fmt.Printf("tiers    %d\n", len(cfg.Tiers))
 
+	// ONE VERDICT PER RUNNER GROUP, shared across the tiers that name it. Every
+	// untrusted tier lands in the default group, so without this a deployment
+	// with four of them asks GitHub the same question four times and prints the
+	// same failure four times.
+	reach := map[int]error{}
+
 	for i := range cfg.Tiers {
 		t := &cfg.Tiers[i]
 
@@ -463,8 +469,8 @@ func runCheck(ctx context.Context, opts checkOptions) (checkReport, error) {
 		// tell" into "failed", which is the distinction this command is careful
 		// about everywhere else. Maintenance skips it for free: the verdict is
 		// githubSkipped, not verified.
-		if t.Trust == config.WorkloadTrusted && report.github == githubVerified {
-			if err := checkTrustedGroup(ctx, cfg, t); err != nil {
+		if report.github == githubVerified {
+			if err := checkTierRunnerGroup(ctx, cfg, t, reach); err != nil {
 				report.github = githubFailed
 				fmt.Printf("           runner group FAILED: %v\n", err)
 
@@ -512,15 +518,24 @@ func runCheck(ctx context.Context, opts checkOptions) (checkReport, error) {
 	return report, githubFailure
 }
 
-// checkTrustedGroup reaches the verdict the server reaches at startup, using
-// only the App credentials `billet check` already holds.
+// checkTierRunnerGroup reaches the verdict the server reaches at startup for a
+// TRUSTED tier, and for every other tier asks the one question that applies to
+// it too: can this group be assigned a job at all.
 //
 // The server validates through the Actions-tenant client it builds anyway; this
 // path exists because check builds no such client and should not have to. Both
 // end in the same github.ValidateTrustedRunnerGroup, so the policy itself has
 // one implementation — only the name-to-id lookup differs, and that difference
 // is why this is a function rather than a copy of the server's block.
-func checkTrustedGroup(ctx context.Context, cfg *config.Config, t *config.Tier) error {
+//
+// AN UNTRUSTED TIER WAS ASKED NOTHING, and that is what this adds. It lives in
+// the default group, which the trusted rules refuse outright and therefore never
+// examine, so a default group with visibility "selected" and no repositories
+// left every surface reporting healthy while every job queued forever. The
+// acceptance lane's third run found it by waiting out its whole window.
+func checkTierRunnerGroup(
+	ctx context.Context, cfg *config.Config, t *config.Tier, reach map[int]error,
+) error {
 	gh := cfg.GitHub
 
 	key, err := resolveAppKey(ctx, cfg)
@@ -536,14 +551,35 @@ func checkTrustedGroup(ctx context.Context, cfg *config.Config, t *config.Tier) 
 		return err
 	}
 
-	// The server refuses this too: the default group cannot back a trusted pool,
-	// because it admits every repository in the organization.
-	if isDefault {
-		return fmt.Errorf("runner group %q is the default group, which cannot back a trusted "+
-			"pool", t.RunnerGroup)
+	if t.Trust == config.WorkloadTrusted {
+		// The server refuses this too: the default group cannot back a trusted
+		// pool, because it admits every repository in the organization.
+		if isDefault {
+			return fmt.Errorf("runner group %q is the default group, which cannot back a "+
+				"trusted pool", t.RunnerGroup)
+		}
+
+		// The trusted validation contains the reach rule, so record its verdict
+		// under this group rather than asking GitHub the same question again for
+		// a later tier that shares it.
+		err := policy.ValidateTrustedRunnerGroup(ctx, id, t.Workflows)
+		reach[id] = err
+
+		return err
 	}
 
-	return policy.ValidateTrustedRunnerGroup(ctx, id, t.Workflows)
+	// ONE ANSWER PER GROUP, not per tier. Every untrusted tier in a deployment
+	// shares the default group, and a check that asked GitHub once per tier
+	// would spend a request per tier to learn the same fact — and report the
+	// same failure several times over.
+	if err, asked := reach[id]; asked {
+		return err
+	}
+
+	err = policy.ValidateRunnerGroupReach(ctx, id)
+	reach[id] = err
+
+	return err
 }
 
 // reportGuestImageFreshness names the newest generation of each image this

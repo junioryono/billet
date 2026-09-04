@@ -58,6 +58,8 @@ func (*recoveryPolicy) ValidateTrustedRunnerGroup(context.Context, int, []string
 	return nil
 }
 
+func (*recoveryPolicy) ValidateRunnerGroupReach(context.Context, int) error { return nil }
+
 func (p *recoveryPolicy) InspectScaleSetRunner(
 	_ context.Context, name string, id int64,
 ) (billetgithub.RunnerRecovery, error) {

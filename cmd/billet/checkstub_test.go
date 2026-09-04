@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -330,4 +331,198 @@ tiers:
 	}
 
 	return cfgPath
+}
+
+// writeUntrustedCheckConfig is writeCheckConfig's tier with no runner group at
+// all, which is what an untrusted tier is: it lands in the organization's
+// DEFAULT group, and that group is the one nothing validated.
+func writeUntrustedCheckConfig(t *testing.T, labels ...string) string {
+	t.Helper()
+
+	if len(labels) == 0 {
+		labels = []string{"billet-untrusted"}
+	}
+
+	dir := t.TempDir()
+
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate a key: %v", err)
+	}
+
+	keyPath := filepath.Join(dir, "app.pem")
+	if err := os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(key),
+	}), 0o600); err != nil {
+		t.Fatalf("write the key: %v", err)
+	}
+
+	cfgPath := filepath.Join(dir, "billet.yaml")
+	body := fmt.Sprintf(`server:
+  listen: 127.0.0.1:7717
+  state_dir: %s
+  max_vcpu: 8
+  max_memory: 32GiB
+github:
+  org: acme
+  app_id: 7
+  installation_id: 42
+  private_key_path: %s
+tiers:
+`, filepath.Join(dir, "server"), keyPath)
+
+	for _, label := range labels {
+		body += fmt.Sprintf(`  - label: %s
+    provider: docker
+    vcpu: 4
+    memory: 16GiB
+    image: ghcr.io/actions/actions-runner:latest
+    trust: untrusted
+`, label)
+	}
+
+	if err := os.WriteFile(cfgPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write the config: %v", err)
+	}
+
+	return cfgPath
+}
+
+// defaultGroupServer answers as an organization whose DEFAULT group has the
+// given visibility and repository count, and counts what was asked.
+func defaultGroupServer(t *testing.T, visibility string, repos int) (*httptest.Server, *atomic.Int32) {
+	t.Helper()
+
+	var repoCalls atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/access_tokens"):
+			w.WriteHeader(http.StatusCreated)
+			_, _ = fmt.Fprintf(w, `{"token":"stub","expires_at":%q}`,
+				time.Now().Add(time.Hour).UTC().Format(time.RFC3339))
+
+		case strings.HasSuffix(r.URL.Path, "/actions/runner-groups"):
+			_, _ = fmt.Fprint(w, `{"runner_groups":[{"id":3,"name":"Default","default":true}]}`)
+
+		case strings.HasSuffix(r.URL.Path, "/repositories"):
+			repoCalls.Add(1)
+			_, _ = fmt.Fprintf(w, `{"total_count":%d,"repositories":[]}`, repos)
+
+		case strings.Contains(r.URL.Path, "/actions/runner-groups/"):
+			_, _ = fmt.Fprintf(w, `{"name":"Default","default":true,"visibility":%q,`+
+				`"restricted_to_workflows":false,"selected_workflows":[]}`, visibility)
+
+		default:
+			_, _ = fmt.Fprint(w, `{"id": 42, "permissions": {
+				"metadata": "read", "organization_self_hosted_runners": "write"}}`)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	return srv, &repoCalls
+}
+
+// AN UNTRUSTED TIER'S GROUP IS CHECKED TOO, AND WAS NOT.
+//
+// The trusted validation refuses the default group outright, so it never
+// examines one — and an untrusted tier lives there. A default group with
+// visibility "selected" and no repositories therefore passed every surface while
+// GitHub assigned it nothing: the acceptance lane's third run sat queued for its
+// whole window against exactly that, on 2026-09-04, and the cause was invisible
+// from inside billet.
+func TestCheckValidatesAnUntrustedTiersDefaultGroup(t *testing.T) {
+	t.Setenv("BILLET_MAINTENANCE", "")
+
+	t.Run("a default group granting no repository fails the check", func(t *testing.T) {
+		cfgPath := writeUntrustedCheckConfig(t)
+
+		srv, _ := defaultGroupServer(t, "selected", 0)
+
+		prev := githubAPIBase
+		githubAPIBase = srv.URL
+		t.Cleanup(func() { githubAPIBase = prev })
+
+		var err error
+		out := capture(t, func() { err = cmdCheck(t.Context(), []string{"--config", cfgPath}) })
+
+		if err == nil {
+			t.Fatalf("a default group that routes nothing passed the check:\n%s", out)
+		}
+
+		if !strings.Contains(out, "billet-untrusted") {
+			t.Errorf("the failure must name the tier whose group it is:\n%s", out)
+		}
+
+		if !strings.Contains(out, "grants none") {
+			t.Errorf("the failure must name the cause, not just fail:\n%s", out)
+		}
+	})
+
+	t.Run("a default group granting a repository passes", func(t *testing.T) {
+		cfgPath := writeUntrustedCheckConfig(t)
+
+		srv, _ := defaultGroupServer(t, "selected", 1)
+
+		prev := githubAPIBase
+		githubAPIBase = srv.URL
+		t.Cleanup(func() { githubAPIBase = prev })
+
+		var err error
+		out := capture(t, func() { err = cmdCheck(t.Context(), []string{"--config", cfgPath}) })
+
+		if err != nil {
+			t.Fatalf("a default group that routes jobs failed the check: %v\n%s", err, out)
+		}
+	})
+
+	// AND AN UNREACHABLE GITHUB STAYS ADVISORY. The App probe classifies a 502 as
+	// unverifiable, and a group lookup against the same API cannot reach a
+	// verdict either — turning could-not-tell into failed is the collapse this
+	// command is careful about everywhere else.
+	t.Run("an unverifiable github does not fail the check", func(t *testing.T) {
+		cfgPath := writeUntrustedCheckConfig(t)
+		stubGitHubUnverifiable(t)
+
+		var err error
+		out := capture(t, func() { err = cmdCheck(t.Context(), []string{"--config", cfgPath}) })
+
+		if err != nil {
+			t.Fatalf("an unreachable GitHub failed the check: %v\n%s", err, out)
+		}
+	})
+}
+
+// EVERY UNTRUSTED TIER SHARES THE DEFAULT GROUP, SO IT IS ASKED ABOUT ONCE.
+//
+// A deployment with several untrusted tiers would otherwise spend a GitHub
+// request per tier to learn one fact, and print the same failure once per tier —
+// which reads as several problems rather than the one there is.
+//
+// The count is what proves the memo: asserting the output alone would pass with
+// the request repeated, because the answer is the same each time.
+func TestCheckAsksAboutTheDefaultGroupOncePerCheck(t *testing.T) {
+	t.Setenv("BILLET_MAINTENANCE", "")
+
+	cfgPath := writeUntrustedCheckConfig(t, "billet-untrusted-a", "billet-untrusted-b",
+		"billet-untrusted-c")
+
+	srv, repoCalls := defaultGroupServer(t, "selected", 1)
+
+	prev := githubAPIBase
+	githubAPIBase = srv.URL
+	t.Cleanup(func() { githubAPIBase = prev })
+
+	var err error
+	out := capture(t, func() { err = cmdCheck(t.Context(), []string{"--config", cfgPath}) })
+
+	if err != nil {
+		t.Fatalf("three untrusted tiers in a routable default group failed: %v\n%s", err, out)
+	}
+
+	if got := repoCalls.Load(); got != 1 {
+		t.Errorf("the default group's repository list was fetched %d times for three tiers, "+
+			"want exactly one", got)
+	}
 }
