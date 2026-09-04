@@ -101,8 +101,11 @@ server:
 # a release the stable channel is not on, so the starter opened a rollout to the
 # channel within a minute of boot (measured 2026-09-04) and the packaged root
 # timer then fenced the ledger for its host transaction, refusing the very
-# `local down` this rehearsal is about. The rollout rehearsal is the one that
-# wants the default.
+# local down this rehearsal is about. The rollout rehearsal is the one that
+# wants the default. (Plain words, no backticks: this heredoc is unquoted, and
+# a backtick pair inside it is a command substitution; the first runs of every
+# rehearsal ran the words local down as a command at the top level of the script,
+# "local: can only be used in a function" against the heredoc's line.)
 release:
   automatic: false
 EOF

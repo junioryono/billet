@@ -369,14 +369,16 @@ rehearsal_install_app_key() {
 
 # rehearsal_install_config writes a host's /etc/billet/billet.yaml from stdin
 # with the mode and owner the package would have given it.
+# The positional parameter needs no declaration. (A `local` here was once
+# suspected of the "local: can only be used in a function" message the first
+# rehearsals printed; the cause was a backtick pair inside an unquoted
+# here-document in the callers, and a function stays a function in a pipeline.)
 rehearsal_install_config() {
-    local name=$1
-
-    docker exec -i "${name}" sh -c 'cat >/tmp/billet.yaml' &&
-        docker exec "${name}" install -m 0640 -o root -g billet /tmp/billet.yaml /etc/billet/billet.yaml &&
-        docker exec "${name}" rm -f /tmp/billet.yaml &&
-        docker exec "${name}" systemctl daemon-reload ||
-        rehearsal_fail "could not install the config into ${name}"
+    docker exec -i "$1" sh -c 'cat >/tmp/billet.yaml' &&
+        docker exec "$1" install -m 0640 -o root -g billet /tmp/billet.yaml /etc/billet/billet.yaml &&
+        docker exec "$1" rm -f /tmp/billet.yaml &&
+        docker exec "$1" systemctl daemon-reload ||
+        rehearsal_fail "could not install the config into $1"
 }
 
 # rehearsal_as_billet runs a billet command in a host as the service account,
