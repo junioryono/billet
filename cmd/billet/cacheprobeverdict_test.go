@@ -177,12 +177,21 @@ func TestTheCheckCommandJudgesTheCacheProbesOwnAnswer(t *testing.T) {
 		}
 	}
 
+	// AND NONE OF THEM MAY FALL INTO ANOTHER. Three distinct clauses that all
+	// end up running the failure's body are three clauses telling nothing apart.
+	for _, name := range handled {
+		if clause := clauses[name]; clause != nil && fallsThrough(clause) {
+			t.Errorf("the %s branch falls through, so it does not do its own thing", name)
+		}
+	}
+
 	// AND THE FAILURE MUST REFUSE WITH THE PROBE'S OWN ERROR. `return nil` there
 	// satisfies "it returns something" while reporting a bucket that does not
-	// exist as a healthy one.
+	// exist as a healthy one — so the RETURNED FORM is checked, not merely that
+	// probeErr appears somewhere inside it.
 	if failed := clauses["cacheProbeFailed"]; failed != nil && !refusesWith(failed, "probeErr") {
-		t.Error("the cacheProbeFailed branch does not return something built from probeErr, " +
-			"so a bucket that does not exist leaves `billet check` reporting success")
+		t.Error("the cacheProbeFailed branch does not return probeErr or an fmt.Errorf built " +
+			"from it, so a bucket that does not exist can leave `billet check` reporting success")
 	}
 
 	// AND IT MUST NOT GO BACK TO THE MESSAGE. A strings.Contains over anything's
@@ -221,30 +230,66 @@ func TestTheCheckCommandJudgesTheCacheProbesOwnAnswer(t *testing.T) {
 	})
 }
 
-// refusesWith reports whether a case clause returns something that names an
-// identifier — the probe's own error rather than nil or a fresh message that
-// throws the answer away.
+// refusesWith reports whether a case clause returns the named error, or an
+// fmt.Errorf built from it.
+//
+// THE FORM IS CHECKED, NOT THE MENTION. Searching the whole returned expression
+// for the identifier accepts `return func(error) error { return nil }(probeErr)`
+// — which names it, compiles, and reports success. Two shapes are what this file
+// is defending, so two shapes are what it recognises; a third one arriving is a
+// test to update rather than a defect to hide.
 func refusesWith(clause *ast.CaseClause, name string) bool {
 	for _, stmt := range clause.Body {
 		ret, ok := stmt.(*ast.ReturnStmt)
-		if !ok || len(ret.Results) == 0 {
+		if !ok {
 			continue
 		}
 
 		for _, result := range ret.Results {
-			named := false
-
-			ast.Inspect(result, func(n ast.Node) bool {
-				if ident, ok := n.(*ast.Ident); ok && ident.Name == name {
-					named = true
-				}
-
-				return true
-			})
-
-			if named {
+			if ident, ok := result.(*ast.Ident); ok && ident.Name == name {
 				return true
 			}
+
+			if wrapsIdent(result, name) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// wrapsIdent reports an `fmt.Errorf(…, name, …)` call.
+func wrapsIdent(expr ast.Expr, name string) bool {
+	call, ok := expr.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+
+	selector, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok || selector.Sel.Name != "Errorf" {
+		return false
+	}
+
+	if pkg, ok := selector.X.(*ast.Ident); !ok || pkg.Name != "fmt" {
+		return false
+	}
+
+	for _, arg := range call.Args {
+		if ident, ok := arg.(*ast.Ident); ok && ident.Name == name {
+			return true
+		}
+	}
+
+	return false
+}
+
+// fallsThrough reports a clause that runs the next one's body.
+func fallsThrough(clause *ast.CaseClause) bool {
+	for _, stmt := range clause.Body {
+		branch, ok := stmt.(*ast.BranchStmt)
+		if ok && branch.Tok == token.FALLTHROUGH {
+			return true
 		}
 	}
 

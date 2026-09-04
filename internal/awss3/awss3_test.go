@@ -206,6 +206,25 @@ func TestOnlyNoSuchKeyAtFourOhFourIsAbsence(t *testing.T) {
 			code: CodeNoSuchKey, absent: true,
 		},
 		{
+			// AND THE END IS STRICTER THAN THE START. The document has finished,
+			// so a doctype after it is not late prolog — it is a second
+			// document's worth of matter arriving after billet has its answer.
+			name: "a doctype after the document", status: http.StatusNotFound,
+			body: "<Error><Code>NoSuchKey</Code></Error><!DOCTYPE Error>",
+		},
+		{
+			name: "a declaration after the document", status: http.StatusNotFound,
+			body: `<Error><Code>NoSuchKey</Code></Error><?xml version="1.0"?>`,
+		},
+		{
+			// A DECLARATION IS ONLY ONE WHEN IT COMES FIRST. encoding/xml
+			// tokenizes a processing instruction wherever it appears and says
+			// nothing about whether it belongs there.
+			name: "a declaration behind a comment", status: http.StatusNotFound,
+			body: `<!-- x --><?xml version="1.0"?>` + "\n" +
+				"<Error><Code>NoSuchKey</Code></Error>",
+		},
+		{
 			// A BYTE-ORDER MARK IS NOT CHARACTER DATA ANYBODY MEANT. Go hands it
 			// back as CharData, which is not whitespace, so without stripping it
 			// an otherwise perfect document from an S3-compatible endpoint would

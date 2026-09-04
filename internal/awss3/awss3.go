@@ -222,7 +222,7 @@ var utf8BOM = []byte{0xEF, 0xBB, 0xBF}
 // billet did not understand whole would then be allowed to say that an object is
 // absent.
 func rootOf(decoder *xml.Decoder) (xml.StartElement, bool) {
-	for {
+	for first := true; ; first = false {
 		token, err := decoder.Token()
 		if err != nil {
 			return xml.StartElement{}, false
@@ -232,10 +232,48 @@ func rootOf(decoder *xml.Decoder) (xml.StartElement, bool) {
 			return start, true
 		}
 
-		if !carriesNoVerdict(token) {
+		if !allowedBeforeRoot(token, first) {
 			return xml.StartElement{}, false
 		}
 	}
+}
+
+// allowedBeforeRoot reports whether a token is prolog: a declaration, a doctype,
+// a comment, or XML whitespace.
+//
+// THE DECLARATION ONLY FIRST, because `<Error/><?xml version="1.0"?>` and
+// `<!-- x --><?xml version="1.0"?>` are not documents with a declaration in
+// them — encoding/xml tokenizes a processing instruction wherever it appears and
+// says nothing about whether it belongs there. What is NOT policed is how many
+// doctypes appear or where: that costs a grammar and closes nothing, since none
+// of it can carry a verdict.
+func allowedBeforeRoot(token xml.Token, first bool) bool {
+	if instruction, ok := token.(xml.ProcInst); ok {
+		return first || !strings.EqualFold(instruction.Target, "xml")
+	}
+
+	return carriesNoVerdict(token) || isDirective(token)
+}
+
+// allowedAfterRoot reports whether a token is what may follow a document: a
+// comment or XML whitespace, and nothing else.
+//
+// STRICTER THAN THE PROLOG, and deliberately: the document has ENDED, so a
+// doctype or a declaration there is not late prolog, it is a second document's
+// worth of matter arriving after billet has its answer.
+func allowedAfterRoot(token xml.Token) bool {
+	if _, ok := token.(xml.ProcInst); ok {
+		return false
+	}
+
+	return carriesNoVerdict(token)
+}
+
+// isDirective reports a `<!…>` that is not a comment — a doctype, in practice.
+func isDirective(token xml.Token) bool {
+	_, ok := token.(xml.Directive)
+
+	return ok
 }
 
 // endsAfter reports whether the element was the last of the body.
@@ -250,23 +288,22 @@ func endsAfter(decoder *xml.Decoder) bool {
 			return true
 		}
 
-		if err != nil || !carriesNoVerdict(token) {
+		if err != nil || !allowedAfterRoot(token) {
 			return false
 		}
 	}
 }
 
-// carriesNoVerdict reports whether a token is the matter XML allows AROUND a
-// document's one element: a declaration, a comment, a directive, or whitespace.
+// carriesNoVerdict reports whether a token is a comment or XML whitespace, which
+// is what both ends of a document allow unconditionally.
 //
-// TOLERATED RATHER THAN REQUIRED, and tolerated in both directions because a
-// document is one element with that matter either side of it. None of it says
-// anything about an object, and refusing a body over a newline something added
-// in front of S3 would turn a healthy miss into a failure — which is the
-// opposite mistake and the more expensive one.
+// TOLERATED RATHER THAN REQUIRED, because refusing a body over a newline
+// something between billet and S3 added would turn a healthy miss into a
+// failure — the opposite mistake and the more expensive one. Neither says
+// anything about an object, which is the test each token has to pass.
 func carriesNoVerdict(token xml.Token) bool {
 	switch t := token.(type) {
-	case xml.ProcInst, xml.Comment, xml.Directive:
+	case xml.Comment:
 		return true
 	case xml.CharData:
 		return strings.Trim(string(t), xmlSpace) == ""
