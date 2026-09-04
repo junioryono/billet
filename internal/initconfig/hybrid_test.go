@@ -831,146 +831,44 @@ func TestGenerateHybridUntrustedRunnersReachTheCache(t *testing.T) {
 		t.Fatal("this case is about the untrusted shape")
 	}
 
-	// THE WHOLE BLOCK IS READ, not the file. Asserting that the file somewhere
-	// contains each line lets a widened rule pass: a to_port of 65535 beside a
-	// correct from_port opens 9443 through 65535 from untrusted runners, and
-	// every "does the file contain this line" check stays green.
-	rule := terraformBlock(t, files[HybridTerraformFile],
-		"aws_vpc_security_group_ingress_rule", "untrusted_runner_cache")
-
-	// THE PORT IS THE LISTENER'S. Read it back out of the rendered config rather
-	// than restating the constant, so a change to one and not the other fails.
+	// THE WHOLE BLOCK IS COMPARED, not the file, and not attribute by attribute.
+	//
+	// `strings.Contains` over the rendered root for one line at a time cannot see
+	// a field that was WIDENED rather than removed: a to_port of 65535 beside a
+	// correct from_port opens 9443 through 65535 from untrusted runners and
+	// leaves every such check green. Three attempts at slicing the block out with
+	// a hand-written scanner each turned out to be an incomplete HCL lexer — a
+	// heredoc, a `//` comment or a `#` inside a string each made it answer for
+	// the wrong text, and a helper that guesses makes every assertion built on it
+	// one that cannot fail.
+	//
+	// So the expected block is written out and matched exactly. It admits no
+	// widened field, no changed protocol, no swapped group and no added line,
+	// needs no lexer, and the one value that must agree with something else —
+	// the port — is still read back out of the listener this same generation
+	// rendered rather than restated.
 	controller := hostConfig(t, inventoryHosts(t, files[HybridInventoryFile])["acme-ci-control-plane"])
+
 	_, port, ok := strings.Cut(controller.Node.Cache.Listen, ":")
 	if !ok {
 		t.Fatalf("the cache listener has no port: %q", controller.Node.Cache.Listen)
 	}
 
-	for field, want := range map[string]string{
-		// The controller's group is where the listener binds, and the untrusted
-		// group is the one this root creates and the module knows nothing about.
-		"security_group_id":            "module.billet.control_plane_security_group_id",
-		"referenced_security_group_id": "aws_security_group.untrusted_runner.id",
-		// BOTH ports, or the range is open above the one the listener serves.
-		"from_port":   port,
-		"to_port":     port,
-		"ip_protocol": `"tcp"`,
-	} {
-		if got := hclAttr(t, rule, field); got != want {
-			t.Errorf("the cache rule's %s is %q, want %q", field, got, want)
-		}
+	// The controller's group is where the listener binds; the untrusted group is
+	// the one this root creates and the billet module knows nothing about.
+	want := fmt.Sprintf(`resource "aws_vpc_security_group_ingress_rule" "untrusted_runner_cache" {
+  security_group_id            = module.billet.control_plane_security_group_id
+  description                  = "billet EC2 cache endpoint (from untrusted runners)"
+  referenced_security_group_id = aws_security_group.untrusted_runner.id
+  from_port                    = %s
+  to_port                      = %s
+  ip_protocol                  = "tcp"
+}`, port, port)
+
+	if !strings.Contains(files[HybridTerraformFile], want) {
+		t.Errorf("an untrusted generation with a cache must render exactly this rule, "+
+			"and the port must be the listener's:\n%s\n\ngot:\n%s", want, files[HybridTerraformFile])
 	}
-}
-
-// terraformBlock returns the body of the one `resource "kind" "name"` block in
-// a rendered root, without its opening or closing line. Every assertion about a
-// rendered resource needs it: strings.Contains over the whole file answers "does
-// this text appear anywhere", which a neighbouring resource can satisfy, and
-// cannot see a field that was widened rather than removed.
-//
-// IT REFUSES EVERYTHING IT CANNOT READ, because a helper that guesses turns
-// every assertion built on it into one that cannot fail. The opener must be one
-// exact line and there must be exactly one of it, so a commented-out copy or a
-// second rendering is a failure rather than a silent choice of the first; the
-// body ends at the brace that PAIRS with that opener, counted, so an indented
-// closer cannot run the extraction into the next resource.
-func terraformBlock(t *testing.T, root, kind, name string) string {
-	t.Helper()
-
-	opener := fmt.Sprintf("resource %q %q {", kind, name)
-
-	lines := strings.Split(root, "\n")
-
-	start := -1
-	for i, line := range lines {
-		if strings.TrimSpace(line) != opener {
-			continue
-		}
-		if start >= 0 {
-			t.Fatalf("the generated root declares %s %q twice, at lines %d and %d",
-				kind, name, start+1, i+1)
-		}
-
-		start = i
-	}
-
-	if start < 0 {
-		t.Fatalf("the generated root has no %s %q", kind, name)
-	}
-
-	depth := 0
-	for i := start; i < len(lines); i++ {
-		depth += hclDepthChange(lines[i])
-		if depth == 0 {
-			return strings.Join(lines[start+1:i], "\n")
-		}
-	}
-
-	t.Fatalf("%s %q is never closed", kind, name)
-
-	return ""
-}
-
-// hclAttr reads one top-level `name = value` out of a block body and fails when
-// the block does not set it exactly once. An absent attribute is a
-// could-not-tell, not a value: returning "" for one lets an assertion against a
-// deleted field pass the day somebody expects an empty string. A nested block's
-// attribute is not this block's either, so depth is tracked rather than every
-// line scanned — a to_port inside a nested block would otherwise answer for the
-// rule itself.
-func hclAttr(t *testing.T, block, name string) string {
-	t.Helper()
-
-	found, depth := "", 0
-
-	for _, line := range strings.Split(block, "\n") {
-		change := hclDepthChange(line)
-
-		if depth == 0 {
-			if key, value, ok := strings.Cut(line, "="); ok && strings.TrimSpace(key) == name {
-				if found != "" {
-					t.Fatalf("the block sets %s twice", name)
-				}
-
-				found = strings.TrimSpace(value)
-			}
-		}
-
-		depth += change
-	}
-
-	if found == "" {
-		t.Fatalf("the block does not set %s:\n%s", name, block)
-	}
-
-	return found
-}
-
-// hclDepthChange counts the braces one line opens minus the braces it closes,
-// ignoring any inside a string or a comment, so a value like "{ Name = \"x\" }"
-// nets to zero and a `#` that mentions a brace changes nothing.
-func hclDepthChange(line string) int {
-	if i := strings.Index(line, "#"); i >= 0 {
-		line = line[:i]
-	}
-
-	change, inString := 0, false
-
-	for i := 0; i < len(line); i++ {
-		switch {
-		case line[i] == '\\' && inString:
-			i++
-		case line[i] == '"':
-			inString = !inString
-		case inString:
-		case line[i] == '{':
-			change++
-		case line[i] == '}':
-			change--
-		}
-	}
-
-	return change
 }
 
 // A TRUSTED GENERATION NEEDS NO SUCH RULE: its jobs launch in the module's own

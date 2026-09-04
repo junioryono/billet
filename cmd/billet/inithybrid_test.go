@@ -458,100 +458,33 @@ func TestInitHybridBuilderRunbookRunsWhereTheCredentialsAre(t *testing.T) {
 	if strings.Contains(prepared, "terraform -chdir=terraform output -raw subnet_id") {
 		t.Error("the controller has no Terraform state, so the command must not read it")
 	}
-	// EVERY ARGUMENT THE BUILD NEEDS, read out of the COMMAND rather than the
-	// page. The prose under this step names `--public-ip` to explain why it is
-	// there, so a `strings.Contains` over the whole runbook is satisfied by the
+	// THE WHOLE COMMAND IS MATCHED, fences included, not its arguments one at a
+	// time against the page.
+	//
+	// The prose under this step names `--public-ip` to explain why it is there,
+	// so a `strings.Contains(runbook, "--public-ip")` is satisfied by the
 	// sentence and stays green with the flag deleted from the command itself —
-	// measured, by removing it. --public-ip is the one worth the care: the
-	// generated subnet's only route is an internet gateway, which an instance
-	// cannot use without an address, so a command missing it fails in the
-	// subnet this same generation created.
-	build := runbookCommand(t, prepared, "## 6. Build the AMI")
-	for _, want := range []string{
-		"billet ami build",
-		"--region us-west-2",
-		"--subnet subnet-0abc",
-		"--security-group sg-trusted",
-		"--payload-bucket acme-ci-ami-payloads-1",
-		"--public-ip",
-		"--base-image ami-",
-	} {
-		if !strings.Contains(build, want) {
-			t.Errorf("the controller-side command must carry %q literally, and it is:\n%s", want, build)
-		}
+	// measured, by deleting it and watching the test pass. Locating the fenced
+	// block instead needs a Markdown scanner, and a hand-written one cannot tell
+	// a fence from a fence quoted inside a wider one. An exact match of the whole
+	// block needs neither: prose cannot satisfy it, and no argument can go
+	// missing, change or be added without breaking it.
+	//
+	// --public-ip is the argument worth the care: the generated subnet's only
+	// route is an internet gateway, which an instance cannot use without an
+	// address, so a command missing it fails in the subnet this same generation
+	// created.
+	want := "```bash\n" +
+		"billet ami build --region us-west-2 \\\n" +
+		"  --subnet subnet-0abc \\\n" +
+		"  --security-group sg-trusted \\\n" +
+		"  --payload-bucket acme-ci-ami-payloads-1 \\\n" +
+		"  --public-ip --base-image ami-<an EBS-backed Ubuntu 24.04 image in us-west-2>\n" +
+		"```"
+	if !strings.Contains(prepared, want) {
+		t.Errorf("the controller-side build must be exactly this command:\n%s\n\ngot:\n%s",
+			want, prepared)
 	}
-}
-
-// runbookCommand returns the one fenced command inside the named step, which is
-// what an operator copies. Asserting against the whole runbook cannot tell a
-// command from the paragraph explaining it, and this file's paragraphs quote the
-// very flags the commands carry — `--public-ip` is named in prose one line below
-// the command that passes it.
-//
-// IT REFUSES EVERYTHING IT CANNOT READ. The heading must be one exact line and
-// appear exactly once, so a stale duplicate step carrying a correct command
-// cannot answer for the real one; the search stops at the next heading, so a
-// step with no command fails rather than borrowing a later step's; and the fence
-// lines must be exactly ```bash and ```, with exactly one such block in the step.
-func runbookCommand(t *testing.T, runbook, heading string) string {
-	t.Helper()
-
-	lines := strings.Split(runbook, "\n")
-
-	start := -1
-	for i, line := range lines {
-		if strings.TrimRight(line, " ") != heading {
-			continue
-		}
-		if start >= 0 {
-			t.Fatalf("the runbook carries %q twice, at lines %d and %d", heading, start+1, i+1)
-		}
-
-		start = i
-	}
-
-	if start < 0 {
-		t.Fatalf("the runbook has no %q step", heading)
-	}
-
-	end := len(lines)
-	for i := start + 1; i < len(lines); i++ {
-		if strings.HasPrefix(lines[i], "## ") {
-			end = i
-
-			break
-		}
-	}
-
-	var blocks []string
-
-	for i := start + 1; i < end; i++ {
-		if lines[i] != "```bash" {
-			continue
-		}
-
-		closed := false
-		for j := i + 1; j < end; j++ {
-			if lines[j] != "```" {
-				continue
-			}
-
-			blocks = append(blocks, strings.Join(lines[i+1:j], "\n"))
-			i, closed = j, true
-
-			break
-		}
-
-		if !closed {
-			t.Fatalf("%q's command block is never closed", heading)
-		}
-	}
-
-	if len(blocks) != 1 {
-		t.Fatalf("%q carries %d commands, want exactly one", heading, len(blocks))
-	}
-
-	return blocks[0]
 }
 
 // WITHOUT --builder IT STAYS A WORKSTATION COMMAND, and says so, however many
@@ -572,11 +505,18 @@ func TestInitHybridWithoutTheBuilderTheBuildStaysOnAWorkstation(t *testing.T) {
 	if !strings.Contains(runbook, "From a workstation with your own AWS credentials") {
 		t.Error("without the grant the runbook must say whose credentials the build uses")
 	}
-	build := runbookCommand(t, runbook, "## 6. Build the AMI")
-	if !strings.Contains(build, "terraform -chdir=terraform output -raw subnet_id") {
-		t.Errorf("the workstation command reads the state it has, and it is:\n%s", build)
-	}
-	if !strings.Contains(build, "--public-ip") {
-		t.Error("the workstation command needs the public address the subnet's only route requires")
+	// The workstation command reads the state it has, and carries the same
+	// public address the subnet's only route requires. Matched whole, for the
+	// reason the controller-side one is.
+	want := "```bash\n" +
+		"billet ami build --region us-west-2 \\\n" +
+		"  --subnet \"$(terraform -chdir=terraform output -raw subnet_id)\" \\\n" +
+		"  --security-group \"$(terraform -chdir=terraform output -raw runner_security_group_id)\" \\\n" +
+		"  --payload-bucket \"$(terraform -chdir=terraform output -raw ami_payload_bucket)\" \\\n" +
+		"  --public-ip --base-image ami-<an EBS-backed Ubuntu 24.04 image in us-west-2>\n" +
+		"```"
+	if !strings.Contains(runbook, want) {
+		t.Errorf("without the grant the build must be exactly this command:\n%s\n\ngot:\n%s",
+			want, runbook)
 	}
 }
