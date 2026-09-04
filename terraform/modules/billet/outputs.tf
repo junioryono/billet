@@ -97,8 +97,13 @@ output "interruption_queue_url" {
 }
 
 output "spot_node_name" {
-  description = "The name a SPOT node must use as its node.name: billet requires the interruption queue's basename to equal the effective node name, so a spot node's node.name must be this. Empty when spot is disabled."
+  description = "The name a SPOT node must use as its node.name: billet requires the interruption queue's basename to equal the effective node name, so a spot node's node.name must be this. Empty when spot is disabled. With spot_node_names, this is the primary queue's node and interruption_queue_urls carries every node."
   value       = module.fleet.spot_node_name
+}
+
+output "interruption_queue_urls" {
+  description = "Every spot node's interruption queue URL, keyed by the node.name that must consume it (node.ec2.interruption_queue_url): the primary under spot_node_name and one per spot_node_names entry. Empty when spot is disabled."
+  value       = module.fleet.interruption_queue_urls
 }
 
 output "ledger_volume_id" {

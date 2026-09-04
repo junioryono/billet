@@ -325,7 +325,8 @@ run "spot_grants_are_scoped_to_the_created_queue" {
   # The node's grant: the actions come FROM the committed file here too, which
   # closes the chain generator → committed file → rendered module policy. A
   # literal list would let the module regress to hard-coded actions and stay
-  # green after the file moves on.
+  # green after the file moves on. The Resource is a one-element LIST, because
+  # it is the same list every queue lands in when spot_node_names widens it.
   assert {
     condition = jsondecode(aws_iam_role_policy.spot[0].policy) == {
       Version = "2012-10-17"
@@ -333,7 +334,7 @@ run "spot_grants_are_scoped_to_the_created_queue" {
         Sid      = "BilletSpotInterruptions"
         Effect   = "Allow"
         Action   = jsondecode(file("${path.root}/policy/spot-actions.json"))
-        Resource = "arn:aws:sqs:us-east-1:123456789012:billet-test-interruptions"
+        Resource = ["arn:aws:sqs:us-east-1:123456789012:billet-test-interruptions"]
       }]
     }
     error_message = "the node's spot grant must be exactly the committed spot-actions.json on exactly the created queue"
@@ -358,7 +359,7 @@ run "spot_grants_are_scoped_to_the_created_queue" {
           Sid      = "ForwardToNodeQueue"
           Effect   = "Allow"
           Action   = ["sqs:GetQueueUrl", "sqs:SendMessage"]
-          Resource = "arn:aws:sqs:us-east-1:123456789012:billet-test-interruptions"
+          Resource = ["arn:aws:sqs:us-east-1:123456789012:billet-test-interruptions"]
         },
         {
           Sid      = "Logs"
@@ -476,21 +477,22 @@ run "spot_creates_the_interruption_router" {
     error_message = "the declared log group must be the /aws/lambda/<function> group Lambda writes to"
   }
 
-  # THE ROUTER IS TOLD WHICH QUEUE IS ITS OWN, read from the queue resource. This
-  # is what lets the handler drop a tag naming another deployment's queue while
-  # RE-RAISING AccessDenied for its own — the two are the same answer from AWS,
-  # and without the name the second reads as the first and a real two-minute
-  # warning is consumed silently. (spot_router_test.py asserts the handler reads
-  # this exact variable, and what it does with each classification.)
+  # THE ROUTER IS TOLD WHICH QUEUES ARE ITS OWN, read from the queue resource.
+  # This is what lets the handler drop a tag naming another deployment's queue
+  # while RE-RAISING AccessDenied for its own — the two are the same answer from
+  # AWS, and without the name the second reads as the first and a real
+  # two-minute warning is consumed silently. With one spot node the set is one
+  # name and no separator. (spot_router_test.py asserts the handler reads this
+  # exact variable, and what it does with each classification.)
   assert {
-    condition     = aws_lambda_function.spot_router[0].environment[0].variables["BILLET_INTERRUPTION_QUEUE_NAME"] == aws_sqs_queue.interruptions[0].name
-    error_message = "the router must be told the created queue's name as BILLET_INTERRUPTION_QUEUE_NAME"
+    condition     = aws_lambda_function.spot_router[0].environment[0].variables["BILLET_INTERRUPTION_QUEUE_NAMES"] == aws_sqs_queue.interruptions[0].name
+    error_message = "the router must be told the created queue's name as BILLET_INTERRUPTION_QUEUE_NAMES"
   }
   # ...and nothing else: a Lambda's environment is rendered in the console and in
   # every GetFunctionConfiguration answer, so what it carries is deliberate.
   assert {
     condition     = length(keys(aws_lambda_function.spot_router[0].environment[0].variables)) == 1
-    error_message = "the router's environment must carry only the queue name"
+    error_message = "the router's environment must carry only the served queue names"
   }
 
   # THE ERROR ALARM IS THE ONLY THING WATCHING a re-raised warning, so it is
@@ -583,8 +585,347 @@ run "no_spot_router_without_spot" {
   }
 
   assert {
-    condition     = length(aws_sqs_queue.interruptions) == 0
+    condition     = length(aws_sqs_queue.interruptions) == 0 && length(aws_sqs_queue.spot_nodes) == 0
     error_message = "no interruption queue without enable_spot"
+  }
+}
+
+# SEVERAL SPOT NODES ARE SEVERAL QUEUES, AND ONE INPUT MOVES EVERY HALF. Each
+# name creates a queue named exactly it; the node grant, the router grant and the
+# router's served set then have to name the same queues. The exact documents are
+# asserted first, and then the property itself, DERIVED from the plan rather than
+# written down: the served set is the set of names of every queue the module
+# declares, and each grant's resources are the set of their ARNs. A change that
+# widens one half and not another — the shape issue #66 described, where a queue
+# granted by hand but never named had its warnings dropped — fails the derived
+# assertions whatever literal it happens to produce.
+run "several_spot_nodes_widen_every_half_from_one_input" {
+  command = plan
+
+  module {
+    source = "./modules/fleet-ec2"
+  }
+
+  variables {
+    vpc_id          = "vpc-0f0f0f0f0f0f0f0f0"
+    name            = "billet-test"
+    enable_spot     = true
+    spot_node_names = ["build-2", "build-1"]
+  }
+
+  override_resource {
+    target          = aws_sqs_queue.interruptions[0]
+    override_during = plan
+    values          = { arn = "arn:aws:sqs:us-east-1:123456789012:billet-test-spot-interruptions" }
+  }
+  override_resource {
+    target          = aws_sqs_queue.spot_nodes["build-1"]
+    override_during = plan
+    values          = { arn = "arn:aws:sqs:us-east-1:123456789012:build-1" }
+  }
+  override_resource {
+    target          = aws_sqs_queue.spot_nodes["build-2"]
+    override_during = plan
+    values          = { arn = "arn:aws:sqs:us-east-1:123456789012:build-2" }
+  }
+  override_resource {
+    target          = aws_cloudwatch_log_group.spot_router[0]
+    override_during = plan
+    values          = { arn = "arn:aws:logs:us-east-1:123456789012:log-group:/aws/lambda/billet-test-spot-router" }
+  }
+
+  # One queue per name, named EXACTLY the name: billet requires the basename to
+  # equal node.name, so a prefix or suffix here is a queue no node can consume.
+  assert {
+    condition     = toset(keys(aws_sqs_queue.spot_nodes)) == toset(["build-1", "build-2"])
+    error_message = "spot_node_names must create exactly one queue per name"
+  }
+  assert {
+    condition     = aws_sqs_queue.spot_nodes["build-1"].name == "build-1" && aws_sqs_queue.spot_nodes["build-2"].name == "build-2"
+    error_message = "each further queue must be named exactly its node, with nothing added"
+  }
+  # ...with the primary's attributes. The visibility timeout is the one that
+  # matters: a message hidden for longer than the warning is a warning lost.
+  assert {
+    condition = alltrue([
+      for q in values(aws_sqs_queue.spot_nodes) :
+      q.visibility_timeout_seconds == aws_sqs_queue.interruptions[0].visibility_timeout_seconds &&
+      q.message_retention_seconds == aws_sqs_queue.interruptions[0].message_retention_seconds &&
+      q.sqs_managed_sse_enabled == aws_sqs_queue.interruptions[0].sqs_managed_sse_enabled
+    ])
+    error_message = "a further queue must carry the primary's visibility timeout, retention and encryption"
+  }
+  # The primary queue is untouched by the input: an existing deployment keeps it.
+  assert {
+    condition     = aws_sqs_queue.interruptions[0].name == "billet-test-spot-interruptions"
+    error_message = "spot_node_names must not rename or replace the primary queue"
+  }
+
+  # THE EXACT DOCUMENTS, primary first and then the names in the order given.
+  assert {
+    condition = jsondecode(aws_iam_role_policy.spot[0].policy) == {
+      Version = "2012-10-17"
+      Statement = [{
+        Sid    = "BilletSpotInterruptions"
+        Effect = "Allow"
+        Action = jsondecode(file("${path.root}/policy/spot-actions.json"))
+        Resource = [
+          "arn:aws:sqs:us-east-1:123456789012:billet-test-spot-interruptions",
+          "arn:aws:sqs:us-east-1:123456789012:build-2",
+          "arn:aws:sqs:us-east-1:123456789012:build-1",
+        ]
+      }]
+    }
+    error_message = "the node's spot grant must cover every created queue: every spot node in the co-located root runs under this one role"
+  }
+  assert {
+    condition = jsondecode(aws_iam_role_policy.spot_router[0].policy) == {
+      Version = "2012-10-17"
+      Statement = [
+        {
+          Sid      = "ReadInstanceNodeTag"
+          Effect   = "Allow"
+          Action   = "ec2:DescribeInstances"
+          Resource = "*"
+        },
+        {
+          Sid    = "ForwardToNodeQueue"
+          Effect = "Allow"
+          Action = ["sqs:GetQueueUrl", "sqs:SendMessage"]
+          Resource = [
+            "arn:aws:sqs:us-east-1:123456789012:billet-test-spot-interruptions",
+            "arn:aws:sqs:us-east-1:123456789012:build-2",
+            "arn:aws:sqs:us-east-1:123456789012:build-1",
+          ]
+        },
+        {
+          Sid      = "Logs"
+          Effect   = "Allow"
+          Action   = ["logs:CreateLogStream", "logs:PutLogEvents"]
+          Resource = "arn:aws:logs:us-east-1:123456789012:log-group:/aws/lambda/billet-test-spot-router:*"
+        },
+      ]
+    }
+    error_message = "the router's forwarding grant must cover every created queue and nothing else"
+  }
+  assert {
+    condition     = aws_lambda_function.spot_router[0].environment[0].variables["BILLET_INTERRUPTION_QUEUE_NAMES"] == "billet-test-spot-interruptions,build-2,build-1"
+    error_message = "the router must be told every created queue's name, comma-separated"
+  }
+  assert {
+    condition     = length(keys(aws_lambda_function.spot_router[0].environment[0].variables)) == 1
+    error_message = "the router's environment must still carry only the served queue names"
+  }
+
+  # THE PROPERTY, DERIVED. Three sets computed from the plan — the served names,
+  # the node grant's resources, the router grant's resources — each equal to the
+  # set of every declared queue. A half widened alone breaks its own line here.
+  assert {
+    condition = toset(split(",", aws_lambda_function.spot_router[0].environment[0].variables["BILLET_INTERRUPTION_QUEUE_NAMES"])) == toset([
+      for q in concat(aws_sqs_queue.interruptions, values(aws_sqs_queue.spot_nodes)) : q.name
+    ])
+    error_message = "the router's served set must be exactly the names of every queue the module declares"
+  }
+  assert {
+    condition = toset(one([
+      for s in jsondecode(aws_iam_role_policy.spot_router[0].policy).Statement :
+      s if s.Sid == "ForwardToNodeQueue"
+      ]).Resource) == toset([
+      for q in concat(aws_sqs_queue.interruptions, values(aws_sqs_queue.spot_nodes)) : q.arn
+    ])
+    error_message = "the router's forwarding grant must name exactly the ARNs of every queue the module declares"
+  }
+  assert {
+    condition = toset(jsondecode(aws_iam_role_policy.spot[0].policy).Statement[0].Resource) == toset([
+      for q in concat(aws_sqs_queue.interruptions, values(aws_sqs_queue.spot_nodes)) : q.arn
+    ])
+    error_message = "the node's consumer grant must name exactly the ARNs of every queue the module declares"
+  }
+
+  # THE HANDOFF: every node's queue, keyed by the node.name that consumes it. The
+  # URLs are post-apply and unknown under the mock; the keys are what the
+  # operator reads a node's config from, and they are known.
+  assert {
+    condition     = toset(keys(output.interruption_queue_urls)) == toset(["billet-test-spot-interruptions", "build-1", "build-2"])
+    error_message = "interruption_queue_urls must carry every spot node's queue, the primary included, keyed by node name"
+  }
+  assert {
+    condition     = output.spot_node_name == "billet-test-spot-interruptions"
+    error_message = "spot_node_name keeps naming the primary queue's node"
+  }
+}
+
+# THE NAME RULE IS THE INTERSECTION OF BILLET'S AND SQS'S, and each refusal below
+# is one the apply would otherwise have reached: a dotted name is legal for billet
+# and refused by SQS after the earlier queues were created; a duplicate would be
+# collapsed by toset into one shared queue, the consumer shape billet refuses; the
+# primary's own name is a second queue with the first's name; and a name without
+# spot is a queue nothing forwards to.
+run "refuses_spot_node_names_without_spot" {
+  command = plan
+
+  module {
+    source = "./modules/fleet-ec2"
+  }
+
+  variables {
+    vpc_id          = "vpc-0f0f0f0f0f0f0f0f0"
+    name            = "billet-test"
+    enable_spot     = false
+    spot_node_names = ["build-1"]
+  }
+
+  expect_failures = [var.spot_node_names]
+}
+
+run "refuses_a_dotted_spot_node_name" {
+  command = plan
+
+  module {
+    source = "./modules/fleet-ec2"
+  }
+
+  variables {
+    vpc_id          = "vpc-0f0f0f0f0f0f0f0f0"
+    name            = "billet-test"
+    enable_spot     = true
+    spot_node_names = ["build.1"]
+  }
+
+  expect_failures = [var.spot_node_names]
+}
+
+run "refuses_a_repeated_spot_node_name" {
+  command = plan
+
+  module {
+    source = "./modules/fleet-ec2"
+  }
+
+  variables {
+    vpc_id          = "vpc-0f0f0f0f0f0f0f0f0"
+    name            = "billet-test"
+    enable_spot     = true
+    spot_node_names = ["build-1", "build-1"]
+  }
+
+  expect_failures = [var.spot_node_names]
+}
+
+run "refuses_the_primary_queue_as_a_spot_node_name" {
+  command = plan
+
+  module {
+    source = "./modules/fleet-ec2"
+  }
+
+  variables {
+    vpc_id          = "vpc-0f0f0f0f0f0f0f0f0"
+    name            = "billet-test"
+    enable_spot     = true
+    spot_node_names = ["billet-test-spot-interruptions"]
+  }
+
+  expect_failures = [var.spot_node_names]
+}
+
+run "refuses_a_spot_node_name_longer_than_billet_allows" {
+  command = plan
+
+  module {
+    source = "./modules/fleet-ec2"
+  }
+
+  variables {
+    vpc_id          = "vpc-0f0f0f0f0f0f0f0f0"
+    name            = "billet-test"
+    enable_spot     = true
+    spot_node_names = ["abcdefghij-abcdefghij-abcdefghij-abcdefghij-abcdefghij-abcdefghij"]
+  }
+
+  expect_failures = [var.spot_node_names]
+}
+
+# A SEVENTEENTH NAME IS REFUSED AT PLAN. Every queue's ARN lands in two inline
+# policies and its name in the Lambda's environment, and AWS refuses each past a
+# quota a plan cannot see; the apply that finds out has already created queues
+# that nothing grants or serves, which is the #66 shape again.
+run "refuses_more_spot_node_names_than_the_grants_can_carry" {
+  command = plan
+
+  module {
+    source = "./modules/fleet-ec2"
+  }
+
+  variables {
+    vpc_id          = "vpc-0f0f0f0f0f0f0f0f0"
+    name            = "billet-test"
+    enable_spot     = true
+    spot_node_names = [for i in range(17) : "build-${i}"]
+  }
+
+  expect_failures = [var.spot_node_names]
+}
+
+# ...AND SIXTEEN ARE ACCEPTED AND ALL REACH THE ROUTER, so the cap cannot drift
+# below what the README promises. The queue ARNs are unknown at plan under the
+# mock (no override for sixteen queues), so neither policy document can be
+# decoded here; the environment is built from the configured names and IS known,
+# so it is the half this run counts. The several-node run proves the grants
+# carry the same set as the environment, for a set it can override.
+run "accepts_sixteen_spot_node_names" {
+  command = plan
+
+  module {
+    source = "./modules/fleet-ec2"
+  }
+
+  variables {
+    vpc_id          = "vpc-0f0f0f0f0f0f0f0f0"
+    name            = "billet-test"
+    enable_spot     = true
+    spot_node_names = [for i in range(16) : "build-${i}"]
+  }
+
+  assert {
+    condition     = length(aws_sqs_queue.spot_nodes) == 16
+    error_message = "sixteen further spot nodes is the documented ceiling and must create sixteen queues"
+  }
+  assert {
+    condition     = length(local.spot_queue_arns) == 17 && length(local.spot_queue_names) == 17
+    error_message = "every one of the seventeen queues must be in the list the grants and the environment derive from"
+  }
+  assert {
+    condition     = toset(split(",", aws_lambda_function.spot_router[0].environment[0].variables["BILLET_INTERRUPTION_QUEUE_NAMES"])) == toset(concat(["billet-test-spot-interruptions"], [for i in range(16) : "build-${i}"]))
+    error_message = "the router must be told all seventeen names at the ceiling"
+  }
+}
+
+# EVERY EDGE OF WHAT THE RULE ADMITS REACHES THE QUEUE INTACT: 64 characters is
+# billet's own ceiling, an underscore is legal on both sides, and so are an
+# uppercase letter, a leading digit and a single character. Asserted on the
+# queue's name rather than on the plan surviving, so a regex tightened past what
+# billet accepts fails here rather than at an operator's apply.
+run "accepts_the_edges_of_the_name_rule" {
+  command = plan
+
+  module {
+    source = "./modules/fleet-ec2"
+  }
+
+  variables {
+    vpc_id          = "vpc-0f0f0f0f0f0f0f0f0"
+    name            = "billet-test"
+    enable_spot     = true
+    spot_node_names = ["abcdefghij-abcdefghij-abcdefghij-abcdefghij-abcdefghij-abcdefghi", "build_1", "A", "0"]
+  }
+
+  assert {
+    condition = alltrue([
+      for n in ["abcdefghij-abcdefghij-abcdefghij-abcdefghij-abcdefghij-abcdefghi", "build_1", "A", "0"] :
+      aws_sqs_queue.spot_nodes[n].name == n
+    ])
+    error_message = "the 64-character ceiling, an underscore, an uppercase letter, a leading digit and a one-character name are all legal for billet and SQS alike and must reach the queue intact"
   }
 }
 

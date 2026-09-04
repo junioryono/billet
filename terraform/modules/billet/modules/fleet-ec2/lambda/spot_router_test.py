@@ -10,6 +10,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import sys
 import types
 import unittest
@@ -42,6 +43,9 @@ import spot_router  # noqa: E402
 
 # The queue the module creates and grants this router, as the tests deploy it.
 OWN_QUEUE = "billet-spot-interruptions"
+# A second spot node's queue, which the module creates from spot_node_names and
+# grants and names to the router from the same list.
+SECOND_QUEUE = "build-1"
 
 
 def _warning(instance_id="i-abc"):
@@ -67,12 +71,14 @@ class SpotRouterTest(unittest.TestCase):
     def setUp(self):
         _ec2.reset_mock(side_effect=True, return_value=True)
         _sqs.reset_mock(side_effect=True, return_value=True)
-        # Every case runs with the environment the module actually deploys, so a
-        # test that wants the unconfigured case has to say so.
-        self._serve(OWN_QUEUE)
+        # Every case runs with the environment the module actually deploys for a
+        # deployment with one spot node, so a test that wants the unconfigured
+        # case, or several queues, has to say so.
+        self._serve([OWN_QUEUE])
 
-    def _serve(self, name):
-        """Deploy this test's router as serving `name`, or nothing when it is None.
+    def _serve(self, names):
+        """Deploy this test's router as serving `names`, joined the way the module
+        joins them, or nothing when it is None.
 
         patch.dict restores the whole environment at cleanup, so removing the key
         inside it is undone too — and cleanups run last-in-first-out, so a test
@@ -80,10 +86,10 @@ class SpotRouterTest(unittest.TestCase):
         patch = mock.patch.dict(os.environ, {})
         patch.start()
         self.addCleanup(patch.stop)
-        if name is None:
-            os.environ.pop(spot_router.QUEUE_NAME_ENV, None)
+        if names is None:
+            os.environ.pop(spot_router.QUEUE_NAMES_ENV, None)
         else:
-            os.environ[spot_router.QUEUE_NAME_ENV] = name
+            os.environ[spot_router.QUEUE_NAMES_ENV] = ",".join(names)
 
     def test_forwards_to_the_owning_node_queue(self):
         _ec2.describe_instances.return_value = _tagged(OWN_QUEUE, "i-xyz")
@@ -215,10 +221,10 @@ class SpotRouterTest(unittest.TestCase):
         self.assertEqual(_sqs.send_message.call_args.kwargs["QueueUrl"],
                          "https://sqs/theirs")
 
-    # A QUEUE THIS ROUTER DOES NOT SERVE IS STILL LOOKED UP. A deployment with
-    # several spot queues extends the router's grant to them, and those forward.
-    # Turning the name comparison into a short-circuit would break that silently,
-    # so the name may decide what a FAILURE means and nothing else.
+    # A QUEUE THIS ROUTER DOES NOT SERVE IS STILL LOOKED UP. A queue the router is
+    # granted but was not told about forwards. Turning the membership test into a
+    # short-circuit would break that silently, so the served set may decide what a
+    # FAILURE means and nothing else.
     def test_forwards_to_a_queue_it_does_not_serve_when_the_grant_allows_it(self):
         _ec2.describe_instances.return_value = _tagged("another-billet-node")
         _sqs.get_queue_url.return_value = {"QueueUrl": "https://sqs/other"}
@@ -228,6 +234,103 @@ class SpotRouterTest(unittest.TestCase):
         _sqs.get_queue_url.assert_called_once_with(QueueName="another-billet-node")
         self.assertEqual(_sqs.send_message.call_args.kwargs["QueueUrl"],
                          "https://sqs/other")
+
+    # SEVERAL SERVED QUEUES. The module creates one queue per spot node and tells
+    # the router every name, from the same list it scopes the grant to. A refusal
+    # about ANY of them is the could-not-tell the single-queue cases below assert
+    # for the primary — this is the window issue #66 named: a second queue that was
+    # granted but not named had its AccessDenied read as foreign and its warning
+    # dropped while the grant propagated.
+
+    def test_forwards_to_a_second_served_queue(self):
+        self._serve([OWN_QUEUE, SECOND_QUEUE])
+        _ec2.describe_instances.return_value = _tagged(SECOND_QUEUE)
+        _sqs.get_queue_url.return_value = {"QueueUrl": "https://sqs/second"}
+
+        spot_router.handler(_warning(), None)
+
+        _sqs.get_queue_url.assert_called_once_with(QueueName=SECOND_QUEUE)
+        self.assertEqual(_sqs.send_message.call_args.kwargs["QueueUrl"],
+                         "https://sqs/second")
+
+    def test_reraises_access_denied_to_a_second_served_queue(self):
+        self._serve([OWN_QUEUE, SECOND_QUEUE])
+        _ec2.describe_instances.return_value = _tagged(SECOND_QUEUE)
+        _sqs.get_queue_url.side_effect = _ClientError("AccessDenied")
+        with self.assertRaises(_ClientError):
+            spot_router.handler(_warning(), None)
+        _sqs.send_message.assert_not_called()
+
+    def test_reraises_when_a_second_served_queue_does_not_exist(self):
+        self._serve([OWN_QUEUE, SECOND_QUEUE])
+        _ec2.describe_instances.return_value = _tagged(SECOND_QUEUE)
+        _sqs.get_queue_url.side_effect = _ClientError(
+            "AWS.SimpleQueueService.NonExistentQueue")
+        with self.assertRaises(_ClientError):
+            spot_router.handler(_warning(), None)
+        _sqs.send_message.assert_not_called()
+
+    def test_reraises_access_denied_sending_to_a_second_served_queue(self):
+        self._serve([OWN_QUEUE, SECOND_QUEUE])
+        _ec2.describe_instances.return_value = _tagged(SECOND_QUEUE)
+        _sqs.get_queue_url.return_value = {"QueueUrl": "https://sqs/second"}
+        _sqs.send_message.side_effect = _ClientError("AccessDenied")
+        with self.assertRaises(_ClientError):
+            spot_router.handler(_warning(), None)
+        _sqs.send_message.assert_called_once()
+
+    # ...while a queue outside a set of several is still foreign, so widening the
+    # set has not turned the classification off.
+    def test_drops_access_denied_for_a_queue_outside_a_served_set_of_several(self):
+        self._serve([OWN_QUEUE, SECOND_QUEUE])
+        _ec2.describe_instances.return_value = _tagged("someone-elses-queue")
+        _sqs.get_queue_url.side_effect = _ClientError("AccessDenied")
+        spot_router.handler(_warning(), None)
+        _sqs.send_message.assert_not_called()
+
+    # MEMBERSHIP, NOT A SUBSTRING. "build-1" served must not make "build" read as
+    # served: a rewrite that searches the raw environment string finds the shorter
+    # name inside the longer one and re-raises for a queue that is foreign — safe,
+    # and wrong, and invisible to every other case in this file, whose foreign
+    # names share no text with a served one. (The other direction, a foreign
+    # "build-10", is not a substring of the raw string and would pass such a
+    # rewrite, so it proves nothing.)
+    def test_a_served_names_substring_is_foreign(self):
+        self._serve([OWN_QUEUE, SECOND_QUEUE])
+        _ec2.describe_instances.return_value = _tagged(SECOND_QUEUE[:-2])
+        _sqs.get_queue_url.side_effect = _ClientError("AccessDenied")
+        spot_router.handler(_warning(), None)
+        _sqs.get_queue_url.assert_called_once_with(QueueName="build")
+        _sqs.send_message.assert_not_called()
+
+    # THE SET IS PARSED, NOT TAKEN LITERALLY: whitespace and empty entries are
+    # ignored, so a hand-edited or reformatted value serves the same names.
+    def test_the_served_set_ignores_whitespace_and_empty_entries(self):
+        with mock.patch.dict(os.environ,
+                             {spot_router.QUEUE_NAMES_ENV: f" {OWN_QUEUE} , ,{SECOND_QUEUE},"}):
+            self.assertEqual(spot_router._served(), frozenset([OWN_QUEUE, SECOND_QUEUE]))
+
+        # ...and a served name reached through the ragged form is still a
+        # could-not-tell, proving the parsed set is what _drop consults.
+        with mock.patch.dict(os.environ,
+                             {spot_router.QUEUE_NAMES_ENV: f" {OWN_QUEUE} , ,{SECOND_QUEUE},"}):
+            _ec2.describe_instances.return_value = _tagged(SECOND_QUEUE)
+            _sqs.get_queue_url.side_effect = _ClientError("AccessDenied")
+            with self.assertRaises(_ClientError):
+                spot_router.handler(_warning(), None)
+
+    # AN EMPTY SET DROPS NOTHING, in every spelling of empty: an unset variable is
+    # asserted further down, and these are the set forms.
+    def test_an_empty_served_set_drops_nothing(self):
+        for raw in ("", ",", " , , "):
+            with self.subTest(raw=raw):
+                _sqs.reset_mock(side_effect=True, return_value=True)
+                with mock.patch.dict(os.environ, {spot_router.QUEUE_NAMES_ENV: raw}):
+                    self.assertEqual(spot_router._served(), frozenset())
+                    _ec2.describe_instances.return_value = _tagged("someone-elses-queue")
+                    _sqs.get_queue_url.side_effect = _ClientError("AccessDenied")
+                    with self.assertRaises(_ClientError):
+                        spot_router.handler(_warning(), None)
 
     # ITS OWN QUEUE. Every refusal about the queue this router is supposed to be
     # able to reach is a could-not-tell — AccessDenied is equally the answer for an
@@ -269,7 +372,7 @@ class SpotRouterTest(unittest.TestCase):
         with self.assertRaises(_ClientError):
             spot_router.handler(_warning(), None)
 
-    # AND WITH NO QUEUE NAME AT ALL the router cannot tell whose queue a tag names,
+    # AND WITH NO SERVED SET AT ALL the router cannot tell whose queue a tag names,
     # so it drops nothing: the unset environment is the safe value, not a licence to
     # fall back on the error code alone.
     def test_reraises_access_denied_when_no_queue_is_configured(self):
@@ -304,9 +407,9 @@ class SpotRouterTest(unittest.TestCase):
 
 # THE HANDLER AND THE MODULE HAVE TO NAME THE SAME VARIABLE, and neither gate can
 # see both: this file has no terraform and the plan tests have no Python. A rename
-# on one side leaves the router with no queue name, which is safe (it drops nothing)
-# and wrong (a foreign queue it cannot reach becomes a failed invocation and an
-# alarm instead of a drop).
+# on one side leaves the router with no served set, which is safe (it drops
+# nothing) and wrong (a foreign queue it cannot reach becomes a failed invocation
+# and an alarm instead of a drop).
 class SpotRouterModuleWiringTest(unittest.TestCase):
     def test_the_module_names_the_variable_the_handler_reads(self):
         with open(os.path.join(_HERE, "..", "spot.tf"), encoding="utf-8") as f:
@@ -315,11 +418,14 @@ class SpotRouterModuleWiringTest(unittest.TestCase):
         # THE LITERAL IS PINNED ON BOTH SIDES, and each side's gate pins its own.
         # tests/fleet.tftest.hcl:spot_creates_the_interruption_router asserts against a
         # real plan — terraform having done the parsing — that the router function's
-        # environment carries exactly this key, set to the created queue, and nothing
+        # environment carries exactly this key, set to the created queues, and nothing
         # else. So the whole of the Python side's job is that the handler reads that
         # same name, which an equality says completely; a containment check over
-        # spot.tf would pass a rename to any text the file already holds.
-        self.assertEqual(spot_router.QUEUE_NAME_ENV, "BILLET_INTERRUPTION_QUEUE_NAME")
+        # spot.tf would pass a rename to any text the file already holds. The
+        # PLURAL is part of the pin: the singular this replaced is a prefix of it,
+        # so a handler that kept the old name would find it in spot.tf and read an
+        # unset variable in production.
+        self.assertEqual(spot_router.QUEUE_NAMES_ENV, "BILLET_INTERRUPTION_QUEUE_NAMES")
 
         # ...and this one catches spot.tf losing the variable on a machine with no
         # terraform, which is where `make lambda-test` runs. It cannot say WHERE the
@@ -327,11 +433,50 @@ class SpotRouterModuleWiringTest(unittest.TestCase):
         # valid HCL (a comment above `variables`, a one-line map, a brace inside a
         # heredoc), and the plan test already knows.
         self.assertIn(
-            spot_router.QUEUE_NAME_ENV,
+            spot_router.QUEUE_NAMES_ENV,
             spot_tf,
-            f"spot.tf names no {spot_router.QUEUE_NAME_ENV}, so the deployed router "
+            f"spot.tf names no {spot_router.QUEUE_NAMES_ENV}, so the deployed router "
             f"would read an unset variable: it would drop nothing, and a foreign "
             f"queue it cannot reach would alarm instead",
+        )
+
+    # THE SERVED SET LANDS BEFORE THE GRANT WIDENS. The two derive from one list,
+    # and a plan test can prove they are EQUAL at the end of an apply and nothing
+    # about the order the two updates run in — which is the whole hazard: a grant
+    # widened to a new queue while the old function still serves one name answers
+    # AccessDenied during propagation, and that function reads it as foreign and
+    # drops the warning. The edge lives in spot.tf as a depends_on on the router
+    # policy, and nothing but this file can see it: `terraform test` exposes no
+    # dependency graph. The check is positional over fmt-formatted HCL — every
+    # resource header starts a line at column 0, so the policy's block is the text
+    # between its header and the next — rather than a parser, for the reason the
+    # test above gives. Within the block, all three HCL comment forms are removed
+    # and then all whitespace, and the edge is a depends_on list that names the
+    # function anywhere in it — so a commented-out edge in any form is absent,
+    # and a list spread over several lines, carrying a second element or indexing
+    # the function is still present. What this cannot catch is an author who
+    # removes the edge and plants the same text in a string; it guards a removal,
+    # not a decoy, which is the limit of a text check and the reason a review
+    # reads the block too.
+    def test_the_router_grant_waits_for_the_function_that_serves_the_set(self):
+        with open(os.path.join(_HERE, "..", "spot.tf"), encoding="utf-8") as f:
+            spot_tf = f.read()
+
+        header = '\nresource "aws_iam_role_policy" "spot_router" {'
+        start = spot_tf.index(header)
+        end = spot_tf.find('\nresource "', start + 1)
+        block = spot_tf[start:end if end != -1 else len(spot_tf)]
+        code = re.sub(r"/\*.*?\*/", "", block, flags=re.DOTALL)
+        code = re.sub(r"(?m)(#|//).*$", "", code)
+        code = re.sub(r"\s+", "", code)
+
+        self.assertRegex(
+            code,
+            r"depends_on=\[[^\]]*aws_lambda_function\.spot_router\b",
+            "the router's policy no longer waits for the function: an apply may widen "
+            "the grant to a new queue before the function serves its name, and the old "
+            "function drops that queue's AccessDenied as foreign while the grant "
+            "propagates",
         )
 
 

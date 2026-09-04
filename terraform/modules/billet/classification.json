@@ -224,6 +224,11 @@
     "reason": "billet requires a spot node's node.name to equal this queue's basename, so replacing it under a different name needs the node's config changed to match before it can read its own interruptions.",
     "remedy": "update node.name to the new spot_node_name output"
   },
+  "aws_sqs_queue.spot_nodes": {
+    "class": "replacement",
+    "reason": "one further spot node's interruption queue, named exactly that node. A changed spot_node_names entry replaces the queue under a new name — one that node cannot read until its node.name matches — and a removed entry destroys it, which the plan reports as destructive whatever is written here.",
+    "remedy": "set that node's node.name to its key in the interruption_queue_urls output"
+  },
   "aws_cloudwatch_event_rule.spot_interruption": {
     "class": "replacement",
     "reason": "the rule routing EC2 spot warnings to the queue. While it is absent a two-minute warning is missed and the job dies without billet recording why."
