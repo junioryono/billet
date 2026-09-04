@@ -65,7 +65,7 @@ cleanup() {
     torn_down=no
     for c in "${controller_b}" "${controller_a}"; do
         if docker exec "${c}" test -f /etc/billet/billet.yaml >/dev/null 2>&1; then
-            if rehearsal_teardown_scale_sets "${c}" -e "BILLET_STATE_DSN=${dsn}"; then
+            if rehearsal_teardown_scale_sets "${c}" "BILLET_STATE_DSN=${dsn}"; then
                 torn_down=yes
                 break
             fi

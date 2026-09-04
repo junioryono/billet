@@ -24,7 +24,7 @@ func leafOf(t *testing.T, b Bundle) *x509.Certificate {
 	return cert
 }
 
-// IssueNodeFor is what a rotation rehearsal issues twelve-minute leaves with. It
+// IssueNodeFor is what a rotation rehearsal issues twenty-minute leaves with. It
 // must honour the lifetime it is given, refuse a lifetime that could not be one,
 // and stay under the authority's own expiry like every other leaf.
 func TestIssueNodeForHonoursTheLifetime(t *testing.T) {

@@ -244,13 +244,24 @@ rehearsal_wait_registered() {
 
 # rehearsal_teardown_scale_sets removes every scale set a rehearsal's control
 # plane created, and returns the command's own status so a cleanup can refuse
-# to call a run green when the scale set is still there.
+# to call a run green when the scale set is still there. Extra arguments are
+# NAME=VALUE pairs the command needs in its environment (a PostgreSQL DSN);
+# they are rendered as docker's -e on the outside and env's assignments on the
+# inside, because the two vocabularies differ and a flag that leaks across is
+# a teardown that never ran.
 rehearsal_teardown_scale_sets() {
     local controller=$1
     shift
+    local -a outside=() inside=()
+    local pair
 
-    docker exec "$@" "${controller}" runuser -u billet -- env "$@" /usr/bin/billet teardown --all --yes \
-        --config /etc/billet/billet.yaml 2>&1 | tail -3
+    for pair in "$@"; do
+        outside+=(-e "${pair}")
+        inside+=("${pair}")
+    done
+
+    docker exec "${outside[@]}" "${controller}" runuser -u billet -- env "${inside[@]}" \
+        /usr/bin/billet teardown --all --yes --config /etc/billet/billet.yaml 2>&1 | tail -3
     return "${PIPESTATUS[0]}"
 }
 
