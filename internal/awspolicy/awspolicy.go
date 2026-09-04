@@ -236,6 +236,21 @@ type Backup struct {
 	KMSKeyARN string
 }
 
+// Payload describes the bucket `billet ami build` stages its shared installers
+// in, when they are too large for EC2's user-data limit to carry.
+//
+// THE GRANT IS SCOPED BY OBJECT NAME, NOT BY PREFIX, and that is stricter than a
+// prefix would be. billet writes `billet-payload-<digest>-<nonce>.tar.gz` at the
+// bucket root and refuses a key containing a slash, so the resource can name
+// exactly the objects billet creates — an operator may keep anything else in the
+// same bucket and this role cannot read, replace or delete it.
+type Payload struct {
+	// Bucket is where the archive is staged. It lands in an IAM Resource ARN, so
+	// it must be literal: a `*` here would reach every bucket whose name shares
+	// the prefix.
+	Bucket string
+}
+
 // Identity describes what a CONTROL PLANE needs to reach this deployment's
 // identity material in Parameter Store.
 //
@@ -388,6 +403,12 @@ type Inputs struct {
 	InstanceProfileRoleARN string
 	// Builder adds the ec2:CreateImage the AMI builder needs.
 	Builder bool
+	// Payload, when non-nil, adds the S3 statements `billet ami build
+	// --payload-bucket` needs to stage the shared installers. It is meaningful
+	// only for a BUILDER and is refused without one: nothing else billet does
+	// touches that bucket, so granting it to a plain node role would widen the
+	// role every job's instance is launched by for a command it never runs.
+	Payload *Payload
 	// NoCompute omits the runtime statements entirely, for a principal that
 	// launches nothing.
 	//
@@ -641,6 +662,91 @@ func (in Inputs) Build() (Policy, error) {
 				Condition: builderOwnerCondition(),
 			},
 		)
+
+		// THE CREATE-TIME TAG CHECK, FOR A BUILDER-ONLY POLICY.
+		//
+		// `billet ami build` sends a TagSpecification on CreateImage, and AWS
+		// authorizes that as a SEPARATE ec2:CreateTags check keyed on
+		// ec2:CreateAction — measured with --dry-run: the identical call is
+		// refused `UnauthorizedOperation ... ec2:CreateTags` when nothing grants
+		// it, and succeeds when something does. A policy that grants
+		// ec2:CreateImage without it therefore cannot build at all.
+		//
+		// The RUNTIME statement is what normally satisfies it: createTagCondition
+		// appends CreateImage to its CreateAction list when Builder is set. But a
+		// NoCompute policy has no runtime statement, and that is exactly the shape
+		// the terraform module attaches beside an unchanged node rendering — so
+		// without this the module's `builder = true` would grant CreateImage and
+		// still be denied, which is worse than not granting it, because the module
+		// says the build now works. Emitted only for NoCompute, so a policy
+		// carrying both blocks does not say the same thing twice.
+		if in.NoCompute {
+			tag := Statement{
+				Sid: "BilletAMIBuilderTag", Effect: "Allow",
+				Action: ec2.RuntimeTagIAMActions(), Resource: []string{"*"},
+				Condition: map[string]any{
+					"StringEquals": map[string]any{"ec2:CreateAction": []string{"CreateImage"}},
+				},
+			}
+
+			// In per-deployment mode the tag it may stamp is the BUILDER's own
+			// prefix and nothing else: this statement exists for `ami build`,
+			// which always tags with it, so a wider allowance would let this role
+			// stamp another deployment's owner onto an image it created.
+			if in.Owner != "" {
+				tag.Condition["StringLike"] = map[string]any{
+					"aws:RequestTag/" + ec2.OwnerTagKey: []string{ec2.BuilderOwnerPrefix + "*"},
+				}
+			}
+
+			p.Statement = append(p.Statement, tag)
+		}
+	}
+
+	// THE PAYLOAD BUCKET IS THE BUILDER'S, AND ONLY THE BUILDER'S. Refused
+	// without Builder rather than ignored, because a caller who passed it meant
+	// to grant something and silently dropping it is how a build fails on a
+	// permission the operator believes they gave.
+	if in.Payload != nil {
+		if !in.Builder {
+			return Policy{}, errors.New("awspolicy: a payload bucket is only meaningful for a " +
+				"builder; `billet ami build` is the one command that stages installers in it")
+		}
+
+		if in.Payload.Bucket == "" {
+			return Policy{}, errors.New("awspolicy: a payload policy needs the S3 bucket name")
+		}
+
+		if err := literalARNComponent("payload bucket", in.Payload.Bucket); err != nil {
+			return Policy{}, err
+		}
+
+		// A SLASH MAKES IT A KEY RATHER THAN A BUCKET, and the resulting ARN is
+		// structurally valid and matches nothing: the grant would be accepted,
+		// reach no object, and the build would fail downloading its own payload
+		// on a permission the operator believes they gave. No S3 bucket name
+		// contains one, so this can only ever be a mistake.
+		//
+		// WHETHER BILLET CAN SIGN FOR THE NAME IS ASKED WHERE ONE IS TYPED, not
+		// here. ec2.CheckPayloadBucket is the stager's own rule and demands
+		// lowercase; this generator also renders for the terraform module, whose
+		// committed policy carries an UPPERCASE sentinel precisely so no real
+		// value can collide with it. So the two entry points an operator names a
+		// bucket through — `billet init iam --payload-bucket` and the module's
+		// own variable — apply that rule, and this keeps the ARN safe.
+		if strings.Contains(in.Payload.Bucket, "/") {
+			return Policy{}, fmt.Errorf("awspolicy: the payload bucket %q contains a slash, so it "+
+				"names a key rather than a bucket; the grant would match no object at all",
+				in.Payload.Bucket)
+		}
+
+		p.Statement = append(p.Statement, Statement{
+			Sid: "BilletAMIBuilderPayload", Effect: "Allow",
+			Action: ec2.BuilderPayloadIAMActions(),
+			Resource: []string{
+				"arn:" + partition + ":s3:::" + in.Payload.Bucket + "/" + ec2.BuilderPayloadKeyPrefix + "*",
+			},
+		})
 	}
 
 	if in.InstanceProfileRoleARN != "" {
@@ -1410,6 +1516,16 @@ func createTagCondition(owner string, builder bool) map[string]any {
 // builderOwnerCondition matches the builder's per-build owner value by prefix, so
 // the builder's permissions reach only builder instances — never a deployment's
 // job instances, whatever mode the rest of the policy is in.
+//
+// AND ONLY BY PREFIX, WHICH IS A BOUNDARY THIS DOES NOT DRAW. `billet ami build`
+// stamps `billet-ami-build-<image name>`, which carries no deployment id, so in
+// a shared account two deployments that both hold a builder grant can act on
+// each other's BUILDER instances — imaging, terminating, reading a console,
+// stamping a contract tag. Their job instances, cache volumes and snapshots stay
+// isolated, because those are conditioned on the owner tag's VALUE. Closing this
+// needs a deployment-scoped tag on the builder itself and a matching condition
+// here, which changes what `ami build` sends and wants measuring against a real
+// account: issue #56.
 func builderOwnerCondition() map[string]any {
 	return map[string]any{
 		"StringLike": map[string]any{

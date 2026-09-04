@@ -969,3 +969,175 @@ func TestPerDeploymentKMSKeyScopesEveryKMSGrant(t *testing.T) {
 		t.Errorf("expected the Use and Grant KMS statements, found %d", kmsStatements)
 	}
 }
+
+// THE PAYLOAD GRANT REACHES BILLET'S OWN OBJECTS AND NOTHING ELSE IN THE BUCKET.
+//
+// `billet ami build --payload-bucket` stages one archive per build at the bucket
+// ROOT, named billet-payload-<digest>-<nonce>.tar.gz, and payloadStager refuses a
+// key containing a slash — so the resource can be scoped by that object name
+// rather than by a prefix an operator would have to keep clear. Asserted as the
+// whole resource, because widening it to `<bucket>/*` is the obvious edit and it
+// hands this role every object an operator keeps beside the payloads.
+func TestThePayloadGrantIsScopedToBilletsOwnObjects(t *testing.T) {
+	p, err := Inputs{
+		Owner: "0f1e2d3c4b5a69788796a5b4c3d2e1f0", Builder: true,
+		Payload: &Payload{Bucket: "billet-ami-payloads"},
+	}.Build()
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	s := stmt(t, p, "BilletAMIBuilderPayload")
+
+	want := []string{"arn:aws:s3:::billet-ami-payloads/billet-payload-*"}
+	if !slices.Equal(s.Resource, want) {
+		t.Errorf("the payload grant acts on %v, want %v", s.Resource, want)
+	}
+
+	// THREE ACTIONS, AND THE READ IS NOT OPTIONAL: the builder hands the guest a
+	// PRESIGNED url, which grants no more than its signer holds, so without
+	// s3:GetObject the build downloads its own payload and gets a 403.
+	wantActions := []string{"s3:PutObject", "s3:GetObject", "s3:DeleteObject"}
+	if !slices.Equal(s.Action, wantActions) {
+		t.Errorf("the payload grant permits %v, want %v", s.Action, wantActions)
+	}
+
+	// AND IT CARRIES NO CONDITION, deliberately: the objects are created by this
+	// same role moments earlier and carry no tags, so a tag condition would deny
+	// the read-back and the cleanup of billet's own archive.
+	if len(s.Condition) != 0 {
+		t.Errorf("the payload grant is conditioned on %v; a tag condition here denies "+
+			"the builder its own object", s.Condition)
+	}
+}
+
+// A PAYLOAD BUCKET WITHOUT A BUILDER IS REFUSED RATHER THAN IGNORED.
+//
+// Nothing but `billet ami build` touches that bucket, so granting it to a plain
+// node role widens the identity every job's instance is launched by for a
+// command it never runs. Silently dropping it is worse than refusing: the
+// operator believes they granted something, and the build fails on a permission
+// they think they gave.
+func TestAPayloadBucketNeedsABuilder(t *testing.T) {
+	_, err := Inputs{
+		Owner:   "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+		Payload: &Payload{Bucket: "billet-ami-payloads"},
+	}.Build()
+	if err == nil {
+		t.Fatal("a payload bucket without Builder must be refused")
+	}
+	if !strings.Contains(err.Error(), "only meaningful for a builder") {
+		t.Errorf("the refusal must say why, got %v", err)
+	}
+}
+
+// A WIDENING BUCKET NAME IS REFUSED, the same rule the backup bucket follows: a
+// `*` in an ARN component reaches every bucket sharing the prefix.
+func TestAPayloadBucketRefusesAWideningName(t *testing.T) {
+	// A DOT IS NOT REFUSED HERE, deliberately: this generator also renders the
+	// module's committed policy, whose bucket is an uppercase sentinel, so the
+	// "can billet sign for this name" rule belongs at the two entry points where
+	// a real bucket is typed. TestInitIAMRefusesADottedPayloadBucket is that
+	// rule's test.
+	for _, bucket := range []string{"", "billet-*", "billet-payloads/extra"} {
+		t.Run(bucket, func(t *testing.T) {
+			_, err := Inputs{
+				Owner: "0f1e2d3c4b5a69788796a5b4c3d2e1f0", Builder: true,
+				Payload: &Payload{Bucket: bucket},
+			}.Build()
+			if err == nil {
+				t.Fatalf("bucket %q must be refused", bucket)
+			}
+		})
+	}
+}
+
+// A BUILDER WITHOUT A PAYLOAD BUCKET GRANTS NOTHING ON S3, so the ec2-only
+// builder grant stays what it was for every deployment whose installers still
+// fit in user data.
+func TestABuilderWithoutAPayloadBucketTouchesNoS3(t *testing.T) {
+	p, err := Inputs{Owner: "0f1e2d3c4b5a69788796a5b4c3d2e1f0", Builder: true}.Build()
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	for _, s := range p.Statement {
+		for _, a := range s.Action {
+			if strings.HasPrefix(a, "s3:") {
+				t.Errorf("%s grants %s without a payload bucket", s.Sid, a)
+			}
+		}
+	}
+}
+
+// A BUILDER-ONLY POLICY CAN ACTUALLY BUILD, which is not implied by granting
+// ec2:CreateImage.
+//
+// `billet ami build` sends a TagSpecification on CreateImage, and AWS
+// authorizes create-time tags as a SEPARATE ec2:CreateTags check keyed on
+// ec2:CreateAction — measured with --dry-run, the identical call is refused
+// `UnauthorizedOperation ... ec2:CreateTags` when nothing grants it. The RUNTIME
+// statement normally satisfies that, and NoCompute omits the runtime statement,
+// so a builder-only policy has to carry the check itself or it grants an action
+// it will always be denied. That shape is exactly what the terraform module
+// attaches beside an unchanged node rendering.
+func TestABuilderOnlyPolicyCanTagTheImageItCreates(t *testing.T) {
+	p, err := Inputs{NoCompute: true, Builder: true}.Build()
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	s := stmt(t, p, "BilletAMIBuilderTag")
+
+	if !slices.Equal(s.Action, []string{"ec2:CreateTags"}) {
+		t.Errorf("the create-time tag grant permits %v, want [ec2:CreateTags]", s.Action)
+	}
+
+	equals, ok := s.Condition["StringEquals"].(map[string]any)
+	if !ok {
+		t.Fatalf("the create-time tag grant carries no StringEquals: %v", s.Condition)
+	}
+
+	actions, ok := equals["ec2:CreateAction"].([]string)
+	if !ok || !slices.Equal(actions, []string{"CreateImage"}) {
+		t.Errorf("the create-time tag grant is keyed on %v, want exactly [CreateImage]: it exists "+
+			"for the image the build makes and must not widen to every create", actions)
+	}
+}
+
+// AND A POLICY THAT CARRIES BOTH BLOCKS SAYS IT ONCE. With the runtime
+// statement present, createTagCondition already appends CreateImage to it, so a
+// second statement would be two answers to one question.
+func TestABuilderWithRuntimeStatementsTagsThroughTheRuntimeGrant(t *testing.T) {
+	p, err := Inputs{Owner: "0f1e2d3c4b5a69788796a5b4c3d2e1f0", Builder: true}.Build()
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	for _, s := range p.Statement {
+		if s.Sid == "BilletAMIBuilderTag" {
+			t.Fatal("a policy with runtime statements must tag through BilletRuntimeTag, not a second grant")
+		}
+	}
+}
+
+// IN PER-DEPLOYMENT MODE THE BUILDER MAY STAMP ONLY ITS OWN OWNER PREFIX, so
+// the grant cannot put another deployment's identity on an image it created.
+func TestABuilderOnlyTagGrantIsScopedToTheBuilderPrefix(t *testing.T) {
+	p, err := Inputs{
+		Owner: "0f1e2d3c4b5a69788796a5b4c3d2e1f0", NoCompute: true, Builder: true,
+	}.Build()
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	like, ok := stmt(t, p, "BilletAMIBuilderTag").Condition["StringLike"].(map[string]any)
+	if !ok {
+		t.Fatalf("a per-deployment builder tag grant carries no request-tag condition")
+	}
+
+	vals, ok := like["aws:RequestTag/sh.billet.owner"].([]string)
+	if !ok || !slices.Equal(vals, []string{"billet-ami-build-*"}) {
+		t.Errorf("the tag grant admits %v, want only the builder's own prefix", vals)
+	}
+}

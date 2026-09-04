@@ -33,6 +33,8 @@ type hybridInputs struct {
 	instanceTypes, priceOverrides  []string
 	sshIngress                     []string
 	keyName, localUser, localImage string
+	builder, cache                 bool
+	localSite, cloudSite           string
 	kernelImage, cephUser, cephKey string
 	cacheListen, cacheGuest        string
 	cfgPath                        string
@@ -96,6 +98,21 @@ func cmdInitHybrid(ctx context.Context, args []string) error {
 	localImage := fs.String("local-image", "",
 		"the guest generation every tier boots on the Firecracker host (default "+
 			initconfig.DefaultFirecrackerImage+", the x64 generation billet publishes)")
+	cache := fs.Bool("cache", false,
+		"give the cloud half an EBS+S3 site cache: the module creates the bucket and the rule "+
+			"admitting runners to it, the orchestrator gains node.ebs_s3 and a node.cache listener, "+
+			"and both hosts declare the site their storage belongs to (you supply the listener's "+
+			"TLS pair)")
+	localSite := fs.String("local-site", "",
+		"the name of the place the Firecracker host is in, whose store is its Ceph cluster "+
+			"(default "+initconfig.HybridDefaultLocalSite+"; with --cache)")
+	cloudSite := fs.String("cloud-site", "",
+		"the name of the place the cloud half is in, whose store is EBS and S3 (default the "+
+			"region; with --cache)")
+	builder := fs.Bool("builder", false,
+		"grant the controller's role what `billet ami build` performs, so the image is built on "+
+			"the controller rather than from a workstation holding your AWS credentials; it widens "+
+			"the node role by exactly billet's builder document")
 
 	kernelImage := fs.String("kernel-image", "", "the Firecracker host's pinned guest kernel")
 	cephUser := fs.String("ceph-user", "", "the RADOS identity billet authenticates as, WITHOUT the `client.` prefix")
@@ -114,6 +131,12 @@ func cmdInitHybrid(ctx context.Context, args []string) error {
 	if err := parse(fs, args); err != nil {
 		return err
 	}
+
+	// TRIMMED ONCE, BEFORE ANYTHING READS THEM. config's own region check trims
+	// a local copy, so `--region " us-west-2 "` validated and then compared
+	// unequal against the trimmed value the outputs carry — a refusal naming two
+	// regions that print identically.
+	*name, *region = strings.TrimSpace(*name), strings.TrimSpace(*region)
 
 	// WHICH FLAGS WERE ACTUALLY PASSED, so the re-run command the runbook prints
 	// repeats a --config the operator named and not the per-user default.
@@ -137,6 +160,11 @@ func cmdInitHybrid(ctx context.Context, args []string) error {
 	if *ami != "" && !*commission {
 		return errors.New("--ami is read with --commission only; before it every tier carries the " +
 			"placeholder, because nothing launches until the node exists")
+	}
+	if !*cache && (*localSite != "" || *cloudSite != "") {
+		return errors.New("--local-site and --cloud-site name the two places a cache lives in, " +
+			"so they are only read with --cache; without one this deployment declares no sites " +
+			"at all and the names would be written nowhere")
 	}
 	if *commission && *ami == "" {
 		return errors.New("--commission needs --ami: the render it produces advertises the ec2 " +
@@ -175,10 +203,33 @@ func cmdInitHybrid(ctx context.Context, args []string) error {
 		if err != nil {
 			return fmt.Errorf("--terraform-output: %w", err)
 		}
-		f, err := initconfig.ParseTerraformOutput(raw, untrusted)
+		f, err := initconfig.ParseTerraformOutput(raw, initconfig.HybridNeeds{
+			Untrusted: untrusted, Cache: *cache,
+		})
 		if err != nil {
 			return err
 		}
+
+		// THE OUTPUTS HAVE TO BE THIS GENERATION'S. Every rendering takes the name
+		// and region from the flags while every id here comes from an apply, so
+		// another root's outputs render a config that signs against one
+		// deployment and names another's subnet, security group, buckets and
+		// controller. Nothing downstream refuses it: a cache generation
+		// eventually trips over the availability zone, and a generation without
+		// one prints an AMI command that simply cannot work.
+		//
+		// THIS IS NOT A BINDING, and the message says which mistake it caught
+		// rather than claiming the file is now proved to be this root's. Two
+		// generations sharing a name and a region in different accounts are
+		// identical from here; #62 is what would actually bind them.
+		if f.Name != *name || f.Region != *region {
+			return fmt.Errorf("--terraform-output was written by the %q root in %s and this "+
+				"generation is %q in %s: every id in that file names another deployment's "+
+				"resources, so either re-render with --name %s --region %s or point "+
+				"--terraform-output at this generation's own outputs",
+				f.Name, f.Region, *name, *region, shellArg(f.Name), shellArg(f.Region))
+		}
+
 		facts = &f
 	}
 
@@ -202,6 +253,10 @@ func cmdInitHybrid(ctx context.Context, args []string) error {
 		SSHKeyName:       *keyName,
 		LocalAnsibleUser: *localUser,
 		LocalImage:       *localImage,
+		Builder:          *builder,
+		Cache:            *cache,
+		LocalSite:        *localSite,
+		CloudSite:        *cloudSite,
 		Host: initconfig.HostInputs{
 			KernelImage:        *kernelImage,
 			CephUser:           *cephUser,
@@ -250,7 +305,8 @@ func cmdInitHybrid(ctx context.Context, args []string) error {
 		controlPlaneIP: *controlPlaneIP, controllerName: *controllerName, localName: *localName,
 		localVCPU: *localVCPU, cloudVCPU: *maxVCPU, localMemory: *localMemory, cloudMemory: *maxMemory,
 		instanceTypes: instanceTypes, priceOverrides: priceOverrides, sshIngress: sshIngress,
-		keyName: *keyName, localUser: *localUser, localImage: *localImage,
+		keyName: *keyName, localUser: *localUser, localImage: *localImage, builder: *builder,
+		cache: *cache, localSite: *localSite, cloudSite: *cloudSite,
 		kernelImage: *kernelImage, cephUser: *cephUser, cephKey: *cephKeyring,
 		cacheListen: *cacheListen, cacheGuest: *cacheGuest, out: *out,
 	}
@@ -500,6 +556,14 @@ func hybridFlags(in hybridInputs) []string {
 	add("key-name", in.keyName)
 	add("local-ansible-user", in.localUser)
 	add("local-image", in.localImage)
+	if in.builder {
+		out = append(out, "--builder")
+	}
+	if in.cache {
+		out = append(out, "--cache")
+	}
+	add("local-site", in.localSite)
+	add("cloud-site", in.cloudSite)
 	add("kernel-image", in.kernelImage)
 	add("ceph-user", in.cephUser)
 	add("ceph-keyring", in.cephKey)
@@ -543,10 +607,10 @@ func hybridNext(in hybridInputs, p initconfig.HybridParams, carried bool) string
 // THE ORDER IS THE ROLE'S, NOT A PREFERENCE. The controller is prepared before
 // anything mints an identity, because the ledger volume has to be mounted and
 // proved first; certificates are issued on the prepared host, because the node
-// configs name bundles the role's billet check refuses to find missing; the
-// AMI is built from a workstation, because the node role carries no builder
-// grant; and the local host is converged last, alone, because its certificate
-// has to be installed by hand first.
+// configs name bundles the role's billet check refuses to find missing; the AMI
+// is built wherever the credentials for it are, which is a workstation unless
+// --builder put the grant on the controller; and the local host is converged
+// last, alone, because its certificate has to be installed by hand first.
 func renderHybridRunbook(in hybridInputs, p initconfig.HybridParams, trusted, carried bool) string {
 	// EVERY COMMAND HERE RUNS FROM THE DIRECTORY THIS FILE IS IN, so paths are
 	// relative to it and the same runbook is right wherever the operator put
@@ -554,6 +618,14 @@ func renderHybridRunbook(in hybridInputs, p initconfig.HybridParams, trusted, ca
 	dir := "."
 	tf := "terraform"
 	flags := shellArgs(hybridFlags(in))
+	// THE ADDRESS A GUEST DIALS, named here because the cache's certificate has
+	// to be valid for it and an operator reading the runbook needs the string
+	// rather than a description of it.
+	cacheAddress := p.ControlPlaneIP
+	if cacheAddress == "" {
+		cacheAddress = "the control_plane_private_ip output"
+	}
+
 	wire := fmt.Sprintf("%s:%d", p.ControlPlaneIP, 7717)
 	if p.ControlPlaneIP == "" {
 		wire = "the control_plane_private_ip output, port 7717"
@@ -614,12 +686,69 @@ func renderHybridRunbook(in hybridInputs, p initconfig.HybridParams, trusted, ca
 	fmt.Fprintf(&b, "Install the controller's own bundle root-owned at `/etc/billet/tls` (`node.crt`, `ca.crt` 0644, `node.key` 0600): `billet-node.service` runs as root and rewrites the bundle at renewal. Stream the local host's bundle host-to-host to its `/etc/billet/tls`, so the key never lands on a laptop. Both configs name exactly these paths, and dial %s.\n\n", wire)
 
 	b.WriteString("## 6. Build the AMI\n\n")
-	b.WriteString("From a workstation with your own AWS credentials: the node role carries no builder grant, on purpose.\n\n")
-	fmt.Fprintf(&b, "```bash\nbillet ami build --region %s \\\n  --subnet \"$(terraform -chdir=%s output -raw subnet_id)\" \\\n  --security-group \"$(terraform -chdir=%s output -raw runner_security_group_id)\" \\\n  --payload-bucket \"$(terraform -chdir=%s output -raw ami_payload_bucket)\" \\\n  --public-ip --base-image ami-<an EBS-backed Ubuntu 24.04 image in %s>\n```\n\n",
-		shellArg(p.Region), tf, tf, tf, p.Region)
+
+	// THE IMAGE HAS TO TRUST THE CACHE BEFORE IT IS BUILT, which is why the
+	// issuer is asked for here rather than beside the listener's own pair in
+	// step 7.
+	//
+	// A guest's cache client speaks HTTPS to an endpoint on the controller's
+	// PRIVATE address, so its certificate comes from a private issuer and no
+	// public root signs it. `ami build --ca-cert` is what puts that issuer in the
+	// image's host trust store. Without it the cache is not broken in any way an
+	// operator sees: every request fails its TLS handshake, every job falls back
+	// to a cold fetch, and the bucket, the listener, the site and the security
+	// group rule this generation created are all correct and all unused.
+	//
+	// The AMI is what carries the anchor, so a re-issued CA means a rebuilt
+	// image; a long-lived issuer is worth the trouble here.
+	caCert := ""
+
+	if p.Cache {
+		caCert = " \\\n  --ca-cert cache-ca.pem"
+
+		fmt.Fprintf(&b, "This generation has a cloud cache, so the image must trust the listener's issuer. The endpoint is on a private address (%s) and its certificate is signed by an issuer of yours, which no public root chains to — so `--ca-cert` below takes the PEM of that issuer and bakes it into the image's host trust store. Skip it and nothing reports an error: every guest's cache request fails its TLS handshake, every job fetches cold, and the bucket, listener and security-group rule this generation created go unused. Have the same issuer that will sign the pair in step 7, and put its PEM beside the command as `cache-ca.pem`.\n\n",
+			cacheAddress)
+	}
+
+	// THE COMMAND HAS TO RUN WHERE THE CREDENTIALS ARE, and the two cases put
+	// that in different places. A workstation build reads the three values out
+	// of the Terraform state it has; a controller build has neither that
+	// directory nor that state, so its command carries the values literally —
+	// which is only possible once the apply has produced them.
+	if p.Builder && p.Facts != nil {
+		b.WriteString("**On the controller**, which carries the builder grant this generation asked for, so no machine outside the deployment needs AWS credentials. Run it over whichever route you converge with; the values are written out here because the controller has no copy of the Terraform state")
+
+		if p.Cache {
+			b.WriteString(", and `cache-ca.pem` has to be on the controller too, since that is where the command runs")
+		}
+
+		b.WriteString(":\n\n")
+		fmt.Fprintf(&b, "```bash\nbillet ami build --region %s \\\n  --subnet %s \\\n  --security-group %s \\\n  --payload-bucket %s%s \\\n  --public-ip --base-image ami-<an EBS-backed Ubuntu 24.04 image in %s>\n```\n\n",
+			shellArg(p.Region),
+			shellArg(p.Facts.SubnetID),
+			shellArg(p.Facts.RunnerSecurityGroupID),
+			shellArg(p.Facts.AMIPayloadBucket),
+			caCert,
+			p.Region)
+	} else {
+		if p.Builder {
+			b.WriteString("This generation asked for the builder grant, so once the apply has run the prepare render prints a command to run **on the controller** instead of this one. Until then, from a workstation with your own AWS credentials:\n\n")
+		} else {
+			b.WriteString("From a workstation with your own AWS credentials: the node role carries no builder grant. Generate with `--builder` to move this onto the controller instead.\n\n")
+		}
+		fmt.Fprintf(&b, "```bash\nbillet ami build --region %s \\\n  --subnet \"$(terraform -chdir=%s output -raw subnet_id)\" \\\n  --security-group \"$(terraform -chdir=%s output -raw runner_security_group_id)\" \\\n  --payload-bucket \"$(terraform -chdir=%s output -raw ami_payload_bucket)\"%s \\\n  --public-ip --base-image ami-<an EBS-backed Ubuntu 24.04 image in %s>\n```\n\n",
+			shellArg(p.Region), tf, tf, tf, caCert, p.Region)
+	}
 	b.WriteString("Pass `--public-ip`: the created subnet's only route is an internet gateway, which is unusable without an address. The command boots the image it made and stamps it only after it proved itself.\n\n")
 
 	b.WriteString("## 7. Render the commission phase, and converge both hosts\n\n")
+	if p.Cache {
+		// THE LISTENER APPEARS IN THIS RENDER, so its pair has to exist before the
+		// converge that installs it: the role copies whatever the two variables
+		// name to the paths the config carries, and refuses half a pair.
+		fmt.Fprintf(&b, "This render adds the cloud cache, so the converge below needs the LEAF of the pair whose issuer step 6 baked into the image: the orchestrator terminates HTTPS for job instances that fetch across the VPC, and the certificate has to be valid for the address a guest dials (%s) and be signed by that same `cache-ca.pem`, or the anchor in the image matches nothing. Hand it over the way the App key was handed over, and the role installs it to the paths the config names:\n\n```bash\nexport BILLET_CACHE_TLS_CERT_PATH=<your cert.pem>\nexport BILLET_CACHE_TLS_KEY_PATH=<your key.pem>\n```\n\n",
+			cacheAddress)
+	}
 	fmt.Fprintf(&b, "```bash\nbillet init hybrid --out %s %s --terraform-output outputs.json --commission --ami ami-<from step 6>\nansible-playbook -i inventory.yml site.yml -l %s\nansible-playbook -i inventory.yml site.yml -l %s\n```\n\n",
 		shellArg(dir), flags, shellArg(p.ControllerName), shellArg(p.LocalName))
 	b.WriteString("No key this time: the protected copy on the controller is enough. The commission render lifts the hold, adds the ec2 orchestrator beside the server, and writes the AMI into every tier's `launch.ec2.image`. The local host converges last, alone, once its bundle from step 5 is in place. Then `billet check --config /etc/billet/billet.yaml` on each.\n\n")

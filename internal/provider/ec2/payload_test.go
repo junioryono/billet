@@ -320,3 +320,41 @@ func (r redirectRoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 
 	return r.next.RoundTrip(clone)
 }
+
+// THE PAYLOAD IS SIGNED FOR THE PARTITION'S OWN HOST.
+//
+// A build's first act is staging its own payload, and this endpoint used to be
+// built by hand with the commercial suffix. In cn-north-1 that names a host
+// which does not exist, so the build dies before it launches anything — while
+// `billet init iam` and the terraform module both render a correct aws-cn grant
+// for the same region, which makes it read as a permissions problem.
+//
+// The URL is what the signature covers, so a wrong host is not a redirect: it
+// is a request signed for one name and sent to another.
+//
+// Mutation: restoring ".amazonaws.com" fails the two China cases.
+func TestThePayloadEndpointFollowsThePartition(t *testing.T) {
+	t.Parallel()
+
+	for _, c := range []struct {
+		region, want string
+	}{
+		{"us-west-2", "billet-payloads.s3.us-west-2.amazonaws.com"},
+		{"eu-central-1", "billet-payloads.s3.eu-central-1.amazonaws.com"},
+		// GovCloud keeps the commercial suffix; only China differs.
+		{"us-gov-west-1", "billet-payloads.s3.us-gov-west-1.amazonaws.com"},
+		{"cn-north-1", "billet-payloads.s3.cn-north-1.amazonaws.com.cn"},
+		{"cn-northwest-1", "billet-payloads.s3.cn-northwest-1.amazonaws.com.cn"},
+	} {
+		stager := payloadStager{bucket: "billet-payloads", region: c.region}
+
+		u, err := stager.endpoint("billet-payload-abc")
+		if err != nil {
+			t.Fatalf("%s: %v", c.region, err)
+		}
+
+		if u.Host != c.want {
+			t.Errorf("%s stages at %q, want %q", c.region, u.Host, c.want)
+		}
+	}
+}

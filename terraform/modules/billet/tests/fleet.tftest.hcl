@@ -563,3 +563,307 @@ run "no_pass_role_without_a_job_role" {
   }
 }
 
+
+# THE AMI BUILDER'S GRANT IS OFF UNLESS ASKED, and that is what keeps the
+# identity every job's instance is launched by as narrow as it was.
+run "no_builder_grant_unless_asked" {
+  command = plan
+
+  module {
+    source = "./modules/fleet-ec2"
+  }
+
+  variables {
+    name   = "billet-test"
+    vpc_id = "vpc-0f0f0f0f0f0f0f0f0"
+  }
+
+  assert {
+    condition     = length(aws_iam_role_policy.builder) == 0
+    error_message = "a deployment that did not ask to build images must carry no builder grant"
+  }
+  assert {
+    condition     = output.builder_granted == false
+    error_message = "the builder grant must be reported as absent"
+  }
+}
+
+# ...AND WHEN ASKED, IT IS THE GENERATOR'S OWN DOCUMENT, attached as its OWN
+# policy so the node's rendering is unchanged. Delete the separate resource and
+# fold these statements into the node policy, and this run fails.
+run "the_builder_grant_is_its_own_document" {
+  command = plan
+
+  module {
+    source = "./modules/fleet-ec2"
+  }
+
+  variables {
+    name    = "billet-test"
+    vpc_id  = "vpc-0f0f0f0f0f0f0f0f0"
+    builder = true
+  }
+
+  assert {
+    condition     = length(aws_iam_role_policy.builder) == 1
+    error_message = "asking for the builder must attach its grant"
+  }
+
+  # THE STATEMENTS THE BUILD PERFORMS, by Sid, as an exact set: a missing one is
+  # a build that dies partway (no console read, no contract tag), and an extra
+  # one is a permission billet never exercises.
+  #
+  # BilletAMIBuilderTag IS NOT OPTIONAL and is the one a reading would drop. AWS
+  # authorizes the TagSpecification on CreateImage as a SEPARATE ec2:CreateTags
+  # check; the node's own rendering does not list CreateImage there, so without
+  # this statement `builder = true` grants CreateImage and every build is still
+  # refused — which is worse than granting nothing, because the module says the
+  # build now works.
+  assert {
+    condition = toset([
+      for s in jsondecode(aws_iam_role_policy.builder[0].policy).Statement : s.Sid
+      ]) == toset([
+      "BilletAMIBuilderSource", "BilletAMIBuilderImage", "BilletAMIBuilderTerminate",
+      "BilletAMIBuilderConsole", "BilletAMIBuilderPromote", "BilletAMIBuilderTag",
+    ])
+    error_message = "the builder grant must be exactly the statements billet's generator emits for a build, including the create-time tag check CreateImage needs"
+  }
+
+  # AND NOTHING OF THE RUNTIME. The builder rides the node policy's own
+  # RunInstances; repeating it here would be a second, differently-scoped answer
+  # to what may launch an instance.
+  assert {
+    condition = length([
+      for s in jsondecode(aws_iam_role_policy.builder[0].policy).Statement :
+      s if contains(s.Action, "ec2:RunInstances")
+    ]) == 0
+    error_message = "the builder document must not restate the runtime's launch grant"
+  }
+
+  # NO S3 WITHOUT A PAYLOAD BUCKET: a deployment whose installers still fit in
+  # user data stages nothing and is granted nothing.
+  assert {
+    condition = length([
+      for s in jsondecode(aws_iam_role_policy.builder[0].policy).Statement :
+      s if length([for a in s.Action : a if startswith(a, "s3:")]) > 0
+    ]) == 0
+    error_message = "without a payload bucket the builder grant must touch no S3"
+  }
+
+  # THE PARTITION FOLLOWS data.aws_partition, so one committed rendering serves
+  # GovCloud and China; an unsubstituted sentinel is a policy that matches nothing.
+  assert {
+    condition = length([
+      for s in jsondecode(aws_iam_role_policy.builder[0].policy).Statement :
+      s if length([for r in s.Resource : r if strcontains(r, "TFPARTITION")]) > 0
+    ]) == 0
+    error_message = "the partition sentinel must be substituted"
+  }
+}
+
+# THE PAYLOAD GRANT NAMES BILLET'S OWN OBJECTS IN THAT BUCKET AND NOTHING ELSE.
+run "a_payload_bucket_adds_one_scoped_s3_statement" {
+  command = plan
+
+  module {
+    source = "./modules/fleet-ec2"
+  }
+
+  variables {
+    name                   = "billet-test"
+    vpc_id                 = "vpc-0f0f0f0f0f0f0f0f0"
+    builder                = true
+    builder_payload_bucket = "billet-ami-payloads"
+  }
+
+  assert {
+    condition = one([
+      for s in jsondecode(aws_iam_role_policy.builder[0].policy).Statement :
+      s if s.Sid == "BilletAMIBuilderPayload"
+    ]).Resource == ["arn:aws:s3:::billet-ami-payloads/billet-payload-*"]
+    error_message = "the payload grant must name the objects billet writes, not the whole bucket"
+  }
+
+  assert {
+    condition = one([
+      for s in jsondecode(aws_iam_role_policy.builder[0].policy).Statement :
+      s if s.Sid == "BilletAMIBuilderPayload"
+    ]).Action == ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"]
+    error_message = "the payload grant must be put, get and delete; the presigned read is not optional"
+  }
+}
+
+# A PAYLOAD BUCKET WITHOUT THE BUILDER IS REFUSED, rather than granting S3 to a
+# role that never stages anything.
+run "refuses_a_payload_bucket_without_the_builder" {
+  command = plan
+
+  module {
+    source = "./modules/fleet-ec2"
+  }
+
+  variables {
+    name                   = "billet-test"
+    vpc_id                 = "vpc-0f0f0f0f0f0f0f0f0"
+    builder_payload_bucket = "billet-ami-payloads"
+  }
+
+  expect_failures = [var.builder_payload_bucket]
+}
+
+# ...AND A BUCKET NAME THAT WOULD WIDEN OR MISS. A wildcard reaches every bucket
+# sharing the prefix; a slash names a key rather than a bucket, so the grant
+# matches nothing and the build fails fetching its own payload.
+run "refuses_a_widening_payload_bucket" {
+  command = plan
+
+  module {
+    source = "./modules/fleet-ec2"
+  }
+
+  variables {
+    name                   = "billet-test"
+    vpc_id                 = "vpc-0f0f0f0f0f0f0f0f0"
+    builder                = true
+    builder_payload_bucket = "billet-*"
+  }
+
+  expect_failures = [var.builder_payload_bucket]
+}
+
+run "refuses_a_payload_bucket_naming_a_key" {
+  command = plan
+
+  module {
+    source = "./modules/fleet-ec2"
+  }
+
+  variables {
+    name                   = "billet-test"
+    vpc_id                 = "vpc-0f0f0f0f0f0f0f0f0"
+    builder                = true
+    builder_payload_bucket = "billet-payloads/staging"
+  }
+
+  expect_failures = [var.builder_payload_bucket]
+}
+
+# A DOT IS THE ONE THAT LOOKS FINE, and it is the case this variable's regex
+# exists for. Dots are legal in S3 and unusable for billet: the virtual-hosted
+# host a dotted name produces is not covered by S3's wildcard certificate, so
+# the build's fetch fails TLS verification. Without this case, widening the
+# regex back to [a-z0-9.-] would apply cleanly, render a policy that reads
+# correctly, and be refused by `billet ami build` against the bucket it was
+# pointed at, with every Go test still green.
+run "refuses_a_dotted_payload_bucket" {
+  command = plan
+
+  module {
+    source = "./modules/fleet-ec2"
+  }
+
+  variables {
+    name                   = "billet-test"
+    vpc_id                 = "vpc-0f0f0f0f0f0f0f0f0"
+    builder                = true
+    builder_payload_bucket = "billet.ami.payloads"
+  }
+
+  expect_failures = [var.builder_payload_bucket]
+}
+
+# AND AN UPPERCASE ONE. TFPAYLOADBUCKET is what this module substitutes into the
+# committed rendering, and it is a placeholder inside that file only; a real
+# input carrying uppercase is a bucket S3 will not even create.
+run "refuses_an_uppercase_payload_bucket" {
+  command = plan
+
+  module {
+    source = "./modules/fleet-ec2"
+  }
+
+  variables {
+    name                   = "billet-test"
+    vpc_id                 = "vpc-0f0f0f0f0f0f0f0f0"
+    builder                = true
+    builder_payload_bucket = "TFPAYLOADBUCKET"
+  }
+
+  expect_failures = [var.builder_payload_bucket]
+}
+
+# BOTH ENDS OF S3'S OWN LENGTH RANGE ARE ACCEPTED, so a regex tightened past
+# what S3 permits fails here rather than at an operator's apply. Three is S3's
+# floor and 63 its ceiling.
+run "accepts_the_shortest_payload_bucket" {
+  command = plan
+
+  module {
+    source = "./modules/fleet-ec2"
+  }
+
+  variables {
+    name                   = "billet-test"
+    vpc_id                 = "vpc-0f0f0f0f0f0f0f0f0"
+    builder                = true
+    builder_payload_bucket = "abc"
+  }
+
+  # ASSERT THE NAME REACHED THE ARN, not merely that the plan survived. A run
+  # whose only assertion is that a resource exists passes for any accepted
+  # value, so it proves the validation admitted the name and nothing about what
+  # the grant then says.
+  assert {
+    condition = one([
+      for s in jsondecode(aws_iam_role_policy.builder[0].policy).Statement :
+      s if s.Sid == "BilletAMIBuilderPayload"
+    ]).Resource == ["arn:aws:s3:::abc/billet-payload-*"]
+    error_message = "three characters is S3's own floor and must reach the grant intact"
+  }
+}
+
+run "accepts_the_longest_payload_bucket" {
+  command = plan
+
+  module {
+    source = "./modules/fleet-ec2"
+  }
+
+  variables {
+    name                   = "billet-test"
+    vpc_id                 = "vpc-0f0f0f0f0f0f0f0f0"
+    builder                = true
+    builder_payload_bucket = "abcdefghij-abcdefghij-abcdefghij-abcdefghij-abcdefghij-abcdefgh"
+  }
+
+  assert {
+    condition = one([
+      for s in jsondecode(aws_iam_role_policy.builder[0].policy).Statement :
+      s if s.Sid == "BilletAMIBuilderPayload"
+    ]).Resource == ["arn:aws:s3:::abcdefghij-abcdefghij-abcdefghij-abcdefghij-abcdefghij-abcdefgh/billet-payload-*"]
+    error_message = "63 characters is S3's own ceiling and must reach the grant intact"
+  }
+}
+
+# AN OVERRIDE REPLACES THE NODE POLICY AND NOTHING ELSE. It attaches no builder,
+# and the module asks no question about its contents: whether a given IAM
+# document admits the builder's own launch is not something a string can answer,
+# so the variable's own text carries the rule instead. See #61.
+run "an_override_attaches_no_builder_and_is_passed_through" {
+  command = plan
+
+  module {
+    source = "./modules/fleet-ec2"
+  }
+
+  variables {
+    name            = "billet-test"
+    vpc_id          = "vpc-0f0f0f0f0f0f0f0f0"
+    iam_policy_json = jsonencode({ Version = "2012-10-17", Statement = [] })
+  }
+
+  assert {
+    condition     = length(aws_iam_role_policy.builder) == 0
+    error_message = "no builder was asked for, so none is attached"
+  }
+}

@@ -1,0 +1,113 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "BilletAMIBuilderSource",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateImage"
+      ],
+      "Resource": [
+        "arn:TFPARTITION:ec2:*:*:instance/*"
+      ],
+      "Condition": {
+        "StringLike": {
+          "aws:ResourceTag/sh.billet.owner": [
+            "billet-ami-build-*"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "BilletAMIBuilderImage",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateImage"
+      ],
+      "Resource": [
+        "arn:TFPARTITION:ec2:*::image/*",
+        "arn:TFPARTITION:ec2:*:*:snapshot/*"
+      ]
+    },
+    {
+      "Sid": "BilletAMIBuilderTerminate",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:TerminateInstances"
+      ],
+      "Resource": [
+        "arn:TFPARTITION:ec2:*:*:instance/*"
+      ],
+      "Condition": {
+        "StringLike": {
+          "aws:ResourceTag/sh.billet.owner": [
+            "billet-ami-build-*"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "BilletAMIBuilderConsole",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:GetConsoleOutput"
+      ],
+      "Resource": [
+        "arn:TFPARTITION:ec2:*:*:instance/*"
+      ],
+      "Condition": {
+        "StringLike": {
+          "aws:ResourceTag/sh.billet.owner": [
+            "billet-ami-build-*"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "BilletAMIBuilderPromote",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateTags"
+      ],
+      "Resource": [
+        "arn:TFPARTITION:ec2:*::image/*"
+      ],
+      "Condition": {
+        "StringLike": {
+          "aws:ResourceTag/sh.billet.owner": [
+            "billet-ami-build-*"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "BilletAMIBuilderTag",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateTags"
+      ],
+      "Resource": [
+        "*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "ec2:CreateAction": [
+            "CreateImage"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "BilletAMIBuilderPayload",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:GetObject",
+        "s3:DeleteObject"
+      ],
+      "Resource": [
+        "arn:TFPARTITION:s3:::TFPAYLOADBUCKET/billet-payload-*"
+      ]
+    }
+  ]
+}

@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/junioryono/billet/internal/awsjson"
 	"github.com/junioryono/billet/internal/awssig"
 	"github.com/junioryono/billet/internal/runnerimages"
 )
@@ -62,6 +63,26 @@ const (
 // is holding it. Refusing here says which character was the problem instead.
 var bucketName = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$`)
 
+// CheckPayloadBucket applies the rule the stager enforces, so a policy or a
+// module input cannot accept a bucket the build will refuse.
+//
+// DOTS ARE THE CASE THIS EXISTS FOR. They are legal in S3 and unusable here:
+// the virtual-hosted host a dotted name produces is not covered by S3's
+// wildcard certificate, so the fetch fails TLS verification. Accepting one in
+// an IAM grant or a Terraform variable means an apply that succeeds, a policy
+// that looks right, and a build that refuses the bucket it was pointed at.
+func CheckPayloadBucket(bucket string) error {
+	if !bucketName.MatchString(bucket) {
+		return fmt.Errorf("%q is not a bucket name billet will sign a request for; it must be "+
+			"3 to 63 lowercase letters, digits and hyphens, starting and ending with a letter "+
+			"or digit. Dots are legal in S3 and unusable here: the virtual-hosted host they "+
+			"produce is not covered by S3's wildcard certificate, so the fetch fails TLS "+
+			"verification", bucket)
+	}
+
+	return nil
+}
+
 // payloadStager puts a build's oversized payload where its builder can fetch it.
 type payloadStager struct {
 	bucket string
@@ -92,7 +113,13 @@ func (p payloadStager) endpoint(key string) (*url.URL, error) {
 		return nil, fmt.Errorf("ec2: %q is not a payload key", key)
 	}
 
-	host := p.bucket + ".s3." + p.region + ".amazonaws.com"
+	// THE SUFFIX IS THE PARTITION'S. Built by hand this was the commercial one,
+	// so in `cn-north-1` the very first thing a build does — staging its own
+	// payload — signed for a host that does not exist, and the build died before
+	// it launched anything. `billet init iam` and the terraform module both
+	// render a correct aws-cn grant for that region, which made it look like a
+	// permissions problem.
+	host := p.bucket + ".s3." + p.region + "." + awsjson.DNSSuffixFor(p.region)
 
 	return &url.URL{Scheme: "https", Host: host, Path: "/" + key}, nil
 }
