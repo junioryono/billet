@@ -238,15 +238,26 @@ func rootOf(decoder *xml.Decoder) (xml.StartElement, bool) {
 	}
 }
 
-// allowedBeforeRoot reports whether a token is prolog: a declaration, a doctype,
-// a comment, or XML whitespace.
+// allowedBeforeRoot reports whether a token is prolog: a processing instruction,
+// a doctype, a comment, or XML whitespace.
 //
-// THE DECLARATION ONLY FIRST, because `<Error/><?xml version="1.0"?>` and
-// `<!-- x --><?xml version="1.0"?>` are not documents with a declaration in
-// them — encoding/xml tokenizes a processing instruction wherever it appears and
-// says nothing about whether it belongs there. What is NOT policed is how many
-// doctypes appear or where: that costs a grammar and closes nothing, since none
-// of it can carry a verdict.
+// THE DECLARATION ONLY FIRST, because `<!-- x --><?xml version="1.0"?>` is not a
+// document with a declaration in it — encoding/xml tokenizes a processing
+// instruction wherever it appears and says nothing about whether it belongs
+// there. Any OTHER instruction is allowed anywhere in the prolog, which is what
+// XML says too.
+//
+// WHAT IS NOT POLICED, and the boundary is deliberate: how many doctypes appear
+// or where; whether a declaration-shaped instruction is a VALID declaration
+// (`<?XML version="99"?>` reaches the decoder as an ordinary instruction, since
+// encoding/xml validates only the exact lowercase target); and whether the
+// material behind an accepted whitespace token was lexically whitespace — a
+// CDATA section holding a space, or `&#32;`, arrives as the same xml.CharData.
+// Proving any of that means keeping the raw bytes and doing offset arithmetic
+// around every token, and it closes nothing: THE VERDICT COMES FROM ONE <Code>
+// INSIDE ONE <Error>, and nothing out here can change what that says. What these
+// two functions are for is the material that CAN — a second element, character
+// data, a document that carries on past its answer.
 func allowedBeforeRoot(token xml.Token, first bool) bool {
 	if instruction, ok := token.(xml.ProcInst); ok {
 		return first || !strings.EqualFold(instruction.Target, "xml")

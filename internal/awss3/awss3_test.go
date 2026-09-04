@@ -225,6 +225,23 @@ func TestOnlyNoSuchKeyAtFourOhFourIsAbsence(t *testing.T) {
 				"<Error><Code>NoSuchKey</Code></Error>",
 		},
 		{
+			// AN ORDINARY INSTRUCTION IS PROLOG WHEREVER IT SITS, which XML says
+			// too, and which the declaration rule above must not sweep up.
+			name:   "an instruction that is not a declaration, before the document",
+			status: http.StatusNotFound,
+			body:   "<?cache hit?><Error><Code>NoSuchKey</Code></Error>",
+			code:   CodeNoSuchKey, absent: true,
+		},
+		{
+			// AND NOT AFTER IT. The epilogue takes comments and whitespace only,
+			// so a regression that re-admitted instructions generally — rather
+			// than declarations specifically — is caught here rather than only by
+			// the declaration case below.
+			name:   "an instruction that is not a declaration, after the document",
+			status: http.StatusNotFound,
+			body:   "<Error><Code>NoSuchKey</Code></Error><?cache hit?>",
+		},
+		{
 			// A BYTE-ORDER MARK IS NOT CHARACTER DATA ANYBODY MEANT. Go hands it
 			// back as CharData, which is not whitespace, so without stripping it
 			// an otherwise perfect document from an S3-compatible endpoint would

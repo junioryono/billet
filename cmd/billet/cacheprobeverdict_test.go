@@ -230,33 +230,37 @@ func TestTheCheckCommandJudgesTheCacheProbesOwnAnswer(t *testing.T) {
 	})
 }
 
-// refusesWith reports whether a case clause returns the named error, or an
-// fmt.Errorf built from it.
+// refusesWith reports whether a case clause is exactly one return of the named
+// error, or of an fmt.Errorf built from it.
 //
-// THE FORM IS CHECKED, NOT THE MENTION. Searching the whole returned expression
-// for the identifier accepts `return func(error) error { return nil }(probeErr)`
-// — which names it, compiles, and reports success. Two shapes are what this file
-// is defending, so two shapes are what it recognises; a third one arriving is a
-// test to update rather than a defect to hide.
+// THE FORM IS CHECKED, NOT THE MENTION. Searching the returned expression for
+// the identifier accepts `return func(error) error { return nil }(probeErr)`,
+// which names it, compiles, and reports success. And accepting ANY return that
+// carries it accepts a clause that returns nil on the path it will actually
+// take:
+//
+//	if probeErr != nil { return nil }
+//	return probeErr
+//
+// So the clause's whole SHAPE is pinned rather than analysed: one statement,
+// one result, one of two forms. That is deliberately narrow. A second statement
+// arriving here fails this test, and the person who put it there is then the one
+// deciding whether the branch still refuses — which is the whole job.
 func refusesWith(clause *ast.CaseClause, name string) bool {
-	for _, stmt := range clause.Body {
-		ret, ok := stmt.(*ast.ReturnStmt)
-		if !ok {
-			continue
-		}
-
-		for _, result := range ret.Results {
-			if ident, ok := result.(*ast.Ident); ok && ident.Name == name {
-				return true
-			}
-
-			if wrapsIdent(result, name) {
-				return true
-			}
-		}
+	if len(clause.Body) != 1 {
+		return false
 	}
 
-	return false
+	ret, ok := clause.Body[0].(*ast.ReturnStmt)
+	if !ok || len(ret.Results) != 1 {
+		return false
+	}
+
+	if ident, ok := ret.Results[0].(*ast.Ident); ok {
+		return ident.Name == name
+	}
+
+	return wrapsIdent(ret.Results[0], name)
 }
 
 // wrapsIdent reports an `fmt.Errorf(…, name, …)` call.
@@ -285,8 +289,21 @@ func wrapsIdent(expr ast.Expr, name string) bool {
 }
 
 // fallsThrough reports a clause that runs the next one's body.
+//
+// LABELS ARE UNWRAPPED, because Go allows a labelled final fallthrough and its
+// top-level node is an *ast.LabeledStmt — which a check for the branch statement
+// alone walks straight past.
 func fallsThrough(clause *ast.CaseClause) bool {
 	for _, stmt := range clause.Body {
+		for {
+			labelled, ok := stmt.(*ast.LabeledStmt)
+			if !ok {
+				break
+			}
+
+			stmt = labelled.Stmt
+		}
+
 		branch, ok := stmt.(*ast.BranchStmt)
 		if ok && branch.Tok == token.FALLTHROUGH {
 			return true
