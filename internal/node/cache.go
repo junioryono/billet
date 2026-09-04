@@ -87,6 +87,10 @@ type cacheSession struct {
 	// answered.
 	inflight int
 	closed   bool
+	// finished says the session has left the service's indexes and its record
+	// is gone; an outcome recorded after that is reported but no longer written,
+	// or the record would come back as an orphan.
+	finished bool
 	slots    [provider.MaxVolumes]*cacheAttachment
 	actions  map[string]*actionsArchive
 	receipts map[string]*actionsReceipt
@@ -146,6 +150,11 @@ type cacheObserved struct {
 	ActionsCache    string `json:"actions_cache,omitempty"`
 	// Reported says everything above has reached the control plane.
 	Reported bool `json:"reported,omitempty"`
+	// ActionsPending says the first CacheService call was dispatched and its
+	// outcome not yet recorded. DURABLE, so a crash inside that call leaves the
+	// Actions half unknown after a restart rather than settled as unused: the
+	// guest made a call, and what it got could not be told.
+	ActionsPending bool `json:"actions_pending,omitempty"`
 }
 
 func (o cacheObserved) observation() alloc.CacheObservation {
@@ -250,10 +259,24 @@ func (s *CacheService) observe(ctx context.Context, session *cacheSession, obs a
 
 	if obs.ActionsCache != "" && session.observed.ActionsCache == "" {
 		session.observed.ActionsCache = string(obs.ActionsCache)
+		session.observed.ActionsPending = false
 		changed = true
 	}
 
 	if !changed {
+		return
+	}
+
+	session.observed.Reported = false
+
+	// A SESSION ALREADY FINISHED HAS NO RECORD TO WRITE. Its file is gone and
+	// it has left the indexes, so a write here would leave an orphan that loads
+	// on the next start as a session for compute that does not exist. The
+	// outcome is still reported, with the lease the session carries, and lost
+	// only if that report fails.
+	if session.finished {
+		s.report(ctx, session)
+
 		return
 	}
 
@@ -262,7 +285,6 @@ func (s *CacheService) observe(ctx context.Context, session *cacheSession, obs a
 	// is not reported either: an observation that exists only in memory would be
 	// told to the plane once and, after a restart, never again, and the plane
 	// would hold a fact this host cannot account for.
-	session.observed.Reported = false
 	if err := s.persistSession(session); err != nil {
 		s.log.Warn("could not make a cache observation durable; it is kept in memory and "+
 			"reported when the session next persists", "instance", session.instance, "error", err)
@@ -303,6 +325,9 @@ func (s *CacheService) report(ctx context.Context, session *cacheSession) {
 	}
 
 	session.observed.Reported = true
+	if session.finished {
+		return
+	}
 	if err := s.persistSession(session); err != nil {
 		s.log.Warn("could not record that a cache observation was reported; it may be resent",
 			"instance", session.instance, "error", err)
@@ -326,8 +351,11 @@ func (s *CacheService) settleObservation(ctx context.Context, session *cacheSess
 
 	// A CALL STILL BEING ANSWERED IS NOT "UNUSED". Its outcome is recorded
 	// when the handler returns, under this same lock, and reported then with
-	// the lease the session carries.
-	if session.observed.ActionsCache == "" && session.inflight == 0 {
+	// the lease the session carries. A call a crash interrupted is not "unused"
+	// either: the durable pending mark says the guest asked, and what it got
+	// stays unknown.
+	if session.observed.ActionsCache == "" && session.inflight == 0 &&
+		!session.observed.ActionsPending {
 		obs.ActionsCache = alloc.ActionsCacheOff
 		if session.intercept {
 			obs.ActionsCache = alloc.ActionsCacheUnused
@@ -346,10 +374,26 @@ func (s *CacheService) settleObservation(ctx context.Context, session *cacheSess
 // beginActionsCall marks a CacheService call as in flight, and endActionsCall
 // clears it once its outcome has been recorded. Between the two, settlement
 // leaves the Actions half alone.
+//
+// THE FIRST CALL IS ALSO MARKED DURABLY, before it is dispatched, so a crash
+// inside it does not let the next process settle the half as unused. The mark
+// is cleared by the outcome's own write.
 func (s *CacheService) beginActionsCall(session *cacheSession) {
 	session.mu.Lock()
+	defer session.mu.Unlock()
+
 	session.inflight++
-	session.mu.Unlock()
+
+	if session.observed.ActionsCache != "" || session.observed.ActionsPending || session.finished {
+		return
+	}
+
+	session.observed.ActionsPending = true
+	if err := s.persistSession(session); err != nil {
+		s.log.Warn("could not record that an Actions cache call is in flight; a crash inside it "+
+			"would settle the job's cache outcome as unused", "instance", session.instance,
+			"error", err)
+	}
 }
 
 func (s *CacheService) endActionsCall(session *cacheSession) {
@@ -496,6 +540,7 @@ func (s *CacheService) finishSession(session *cacheSession) error {
 	}
 	delete(s.byInstance, session.instance)
 	delete(s.byToken, token)
+	session.finished = true
 
 	return nil
 }

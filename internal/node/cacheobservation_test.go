@@ -333,16 +333,24 @@ func TestAnUnreportedObservationIsResentAfterARestart(t *testing.T) {
 // A CALL STILL BEING ANSWERED IS NOT SETTLED AS UNUSED. The proxy marks a
 // CacheService call in flight before it is dispatched and clears the mark once
 // its outcome is recorded; a settlement in between leaves the Actions half
-// alone, and the outcome recorded afterwards is reported with the lease the
-// session carries.
+// alone, the outcome recorded afterwards is reported with the lease the
+// session carries, and a session cleanup has already finished is not written
+// back to disk as an orphan.
 func TestSettlementLeavesAnInFlightActionsCallAlone(t *testing.T) {
 	t.Parallel()
 
 	service, _, session, _ := testActionsService(t)
 	observer := &recordingObserver{}
 	service.SetCacheObserver(observer)
+	recordPath := filepath.Join(service.stateDir, session.token+".json")
 
 	service.beginActionsCall(session)
+
+	// THE FIRST CALL IS MARKED DURABLY BEFORE IT IS DISPATCHED.
+	if record := sessionRecord(t, service, session.token); !record.Observed.ActionsPending {
+		t.Fatalf("session record while the first call is in flight = %+v, want it pending",
+			record.Observed)
+	}
 
 	if err := service.Cleanup(t.Context(), session.instance); err != nil {
 		t.Fatalf("Cleanup: %v", err)
@@ -353,6 +361,9 @@ func TestSettlementLeavesAnInFlightActionsCallAlone(t *testing.T) {
 		t.Fatalf("settlement with a call in flight told the observer %+v, want the image half "+
 			"only", calls)
 	}
+	if _, err := os.Stat(recordPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the session record survived its cleanup: %v", err)
+	}
 
 	service.observeActions(t.Context(), session, alloc.ActionsCacheServed)
 	service.endActionsCall(session)
@@ -361,6 +372,76 @@ func TestSettlementLeavesAnInFlightActionsCallAlone(t *testing.T) {
 	want := alloc.CacheObservation{ImageCache: alloc.ImageCacheUnused, ActionsCache: alloc.ActionsCacheServed}
 	if len(calls) != 2 || calls[1].obs != want {
 		t.Fatalf("the late outcome was reported as %+v, want %+v", calls, want)
+	}
+
+	// NOT WRITTEN BACK: the session is finished, and a record here would load
+	// on the next start as a session for compute that does not exist.
+	if _, err := os.Stat(recordPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a late outcome recreated the finished session's record: %v", err)
+	}
+	service.mu.Lock()
+	_, indexed := service.byInstance[session.instance]
+	service.mu.Unlock()
+	if indexed {
+		t.Fatal("a late outcome put the finished session back in the service's indexes")
+	}
+}
+
+// A CALL A CRASH INTERRUPTED IS NOT SETTLED AS UNUSED EITHER. The pending mark
+// is durable, so the process that loads the session after the crash leaves the
+// Actions half unknown: the guest asked, and what it got could not be told.
+func TestAnInterruptedFirstActionsCallStaysUnknownAfterARestart(t *testing.T) {
+	t.Parallel()
+
+	service, storage, session, _ := testActionsService(t)
+	service.SetCacheObserver(&recordingObserver{})
+
+	// The crash: the call is dispatched and never returns; the process is gone.
+	service.beginActionsCall(session)
+
+	restarted, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", service.rootState,
+		storage, &fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewCacheService after the restart: %v", err)
+	}
+	after := &recordingObserver{}
+	restarted.SetCacheObserver(after)
+
+	if err := restarted.Cleanup(t.Context(), session.instance); err != nil {
+		t.Fatalf("Cleanup after the restart: %v", err)
+	}
+
+	calls := after.recorded()
+	want := alloc.CacheObservation{ImageCache: alloc.ImageCacheUnused}
+	if len(calls) != 1 || calls[0].obs != want {
+		t.Fatalf("the restarted service told its observer %+v, want %+v with the Actions half "+
+			"left unknown", calls, want)
+	}
+}
+
+// A GUEST THAT WENT AWAY AS ITS CALL WAS ANSWERED DOES NOT LOSE THE OUTCOME.
+// The outcome is recorded under a detached, bounded context rather than the
+// request's, which is already cancelled by then.
+func TestAnOutcomeIsRecordedAfterTheGuestsRequestIsCancelled(t *testing.T) {
+	t.Parallel()
+
+	service, _, session, _ := testActionsService(t)
+	observer := &recordingObserver{}
+	service.SetCacheObserver(observer)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	service.observeActions(ctx, session, alloc.ActionsCacheServed)
+
+	record := sessionRecord(t, service, session.token)
+	if record.Observed.ActionsCache != string(alloc.ActionsCacheServed) || !record.Observed.Reported {
+		t.Fatalf("session record after a cancelled request = %+v, want the served outcome reported",
+			record.Observed)
+	}
+	if calls := observer.recorded(); len(calls) != 1 ||
+		calls[0].obs != (alloc.CacheObservation{ActionsCache: alloc.ActionsCacheServed}) {
+		t.Fatalf("observer was told %+v, want the served outcome", calls)
 	}
 }
 

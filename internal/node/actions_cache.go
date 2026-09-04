@@ -249,18 +249,30 @@ func actionsCacheCall(req *http.Request) bool {
 
 // observeActions records what interception did for a CacheService call.
 //
-// TAKES THE SESSION LOCK ITSELF, briefly, before the handlers below take it
-// for the work: the observation is decided by then, and holding the lock across
-// the report would hold it across a plane round trip inside every cache call.
+// TAKES THE SESSION LOCK ITSELF, briefly, outside the handlers' own hold of
+// it: the observation is decided by then, and holding the lock across the
+// report would hold it across a plane round trip inside every cache call.
+//
+// DETACHED FROM THE GUEST'S REQUEST, and bounded. The outcome is final at the
+// moment this is called, and a guest that disconnected or ran out of time in
+// that same instant is no reason to lose it; waiting on the request's context
+// would drop the outcome and let settlement write `unused` over a call that
+// was answered.
 func (s *CacheService) observeActions(
 	ctx context.Context, session *cacheSession, outcome alloc.ActionsCache,
 ) {
-	if err := lockCacheSession(ctx, session); err != nil {
+	recordCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cacheReportLimit)
+	defer cancel()
+
+	if err := lockCacheSession(recordCtx, session); err != nil {
+		s.log.Warn("could not record what the Actions cache did for a job; the session was "+
+			"held for longer than the bound", "instance", session.instance, "error", err)
+
 		return
 	}
 	defer session.mu.Unlock()
 
-	s.observe(ctx, session, alloc.CacheObservation{ActionsCache: outcome})
+	s.observe(recordCtx, session, alloc.CacheObservation{ActionsCache: outcome})
 }
 
 func actionsLocalRequest(req *http.Request) bool {
