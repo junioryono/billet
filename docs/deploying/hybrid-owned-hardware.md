@@ -112,6 +112,10 @@ The facts a deployment needs arrive in three waves, so the generation has three 
 8. Run a job locally, withdraw local capacity, run it again on EC2 with the unchanged label, and confirm every instance disappeared. That exact sequence has completed against real GitHub and AWS ([AWS acceptance](../reference/records/aws-acceptance.md)).
 9. Rehearse controller recovery and restore from the backup bucket before calling the deployment recoverable.
 
-What the generator leaves to you, deliberately: the EBS+S3 site cache (`enable_cache = false` in the root, because it needs a site, `node.cache` with a TLS pair on EC2 and `node.ebs_s3`; [AWS with EC2](aws-ec2.md)), the Ceph bootstrap decision on the local host (destructive, never inferred), and the local host's own address as Ansible reaches it.
+`--cache` adds the cloud half's cache in the same generation. The two halves cache in different places and neither can reach the other's storage — the Firecracker host writes RBD images into its own Ceph pools, the cloud writes EBS snapshots with a fenced pointer in S3 — so the generation declares both as **sites**, names each node's own, and gives the orchestrator the `node.ebs_s3` store plus the HTTPS `node.cache` listener its job instances fetch through. The one thing it cannot produce is that listener's certificate: hand the pair to the converge as `BILLET_CACHE_TLS_CERT_PATH` and `BILLET_CACHE_TLS_KEY_PATH`, valid for the controller's address, because that is what a guest dials.
+
+`--builder` grants the controller's own role what `billet ami build` performs, so step 6 runs there instead of from a workstation holding your AWS credentials.
+
+What the generator still leaves to you, deliberately: the Ceph bootstrap decision on the local host (destructive, never inferred), the local host's own address as Ansible reaches it, and the cache listener's TLS pair above.
 
 [Reaching your hosts](reaching-hosts.md) covers how the machine running Ansible reaches the local host.

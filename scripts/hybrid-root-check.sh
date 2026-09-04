@@ -83,4 +83,8 @@ check_shape trusted --runner-group billet-trusted \
 # passes every Go test and fails an operator's first plan.
 check_shape builder --builder
 
+# THE CACHE SHAPE, for the same reason: it turns enable_cache on and reads three
+# more module outputs, any one of which could be renamed on one side only.
+check_shape cache --cache
+
 echo "hybrid-root-check: every root validates"

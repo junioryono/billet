@@ -474,7 +474,7 @@ func TestParseTerraformOutput(t *testing.T) {
   "region": {"sensitive": false, "type": "string", "value": "us-west-2"}
 }`
 
-	got, err := ParseTerraformOutput([]byte(full), true)
+	got, err := ParseTerraformOutput([]byte(full), HybridNeeds{Untrusted: true})
 	if err != nil {
 		t.Fatalf("a complete output: %v", err)
 	}
@@ -488,24 +488,24 @@ func TestParseTerraformOutput(t *testing.T) {
 	}
 
 	missing := strings.Replace(full, `"ledger_volume_id"`, `"ledger_volume"`, 1)
-	if _, err := ParseTerraformOutput([]byte(missing), true); err == nil || !strings.Contains(err.Error(), `"ledger_volume_id"`) {
+	if _, err := ParseTerraformOutput([]byte(missing), HybridNeeds{Untrusted: true}); err == nil || !strings.Contains(err.Error(), `"ledger_volume_id"`) {
 		t.Errorf("a missing output must be refused by name, got %v", err)
 	}
 
 	noUntrusted := strings.Replace(full, `"untrusted_runner_security_group_id"`, `"other"`, 1)
-	if _, err := ParseTerraformOutput([]byte(noUntrusted), false); err != nil {
+	if _, err := ParseTerraformOutput([]byte(noUntrusted), HybridNeeds{}); err != nil {
 		t.Errorf("a trusted generation must not demand the untrusted group: %v", err)
 	}
-	if _, err := ParseTerraformOutput([]byte(noUntrusted), true); err == nil {
+	if _, err := ParseTerraformOutput([]byte(noUntrusted), HybridNeeds{Untrusted: true}); err == nil {
 		t.Error("an untrusted generation must demand the untrusted group")
 	}
 
 	empty := strings.Replace(full, `"value": "subnet-0abc"`, `"value": ""`, 1)
-	if _, err := ParseTerraformOutput([]byte(empty), true); err == nil || !strings.Contains(err.Error(), `"subnet_id"`) {
+	if _, err := ParseTerraformOutput([]byte(empty), HybridNeeds{Untrusted: true}); err == nil || !strings.Contains(err.Error(), `"subnet_id"`) {
 		t.Errorf("an empty output must be refused by name, got %v", err)
 	}
 
-	if _, err := ParseTerraformOutput([]byte("not json"), true); err == nil {
+	if _, err := ParseTerraformOutput([]byte("not json"), HybridNeeds{Untrusted: true}); err == nil {
 		t.Error("garbage must be refused")
 	}
 }
@@ -580,5 +580,227 @@ func TestGenerateHybridBuilderGrant(t *testing.T) {
 	// by a second spelling of its name: the grant and the bucket cannot drift.
 	if !strings.Contains(on[HybridTerraformFile], "builder_payload_bucket = aws_s3_bucket.ami_payloads.bucket") {
 		t.Error("the builder's payload grant must name the bucket this root creates")
+	}
+}
+
+// THE CLOUD CACHE, WHOLE: the two sites, the orchestrator's store and the
+// listener its job instances fetch through. Each of these is a validation rule
+// billet enforces at load, so a generation that got any one wrong would produce
+// a config the host refuses — the point of generating it is that they agree.
+func TestGenerateHybridCloudCache(t *testing.T) {
+	t.Parallel()
+
+	p := hybridParams()
+	p.Cache = true
+	p.Facts = hybridFacts()
+	p.Facts.CacheBucket = "acme-ci-cache-123456789012"
+	p.Facts.CachePrefix = "billet-cache"
+	p.Facts.AvailabilityZone = "us-west-2a"
+	p.Commission = true
+	p.AMI = "ami-0123456789abcdef0"
+
+	files, _ := mustGenerateHybrid(t, p)
+
+	if !strings.Contains(files[HybridTerraformFile], "enable_cache = true") {
+		t.Error("the root must create the cache when one was asked for")
+	}
+
+	hosts := inventoryHosts(t, files[HybridInventoryFile])
+	controller := hostConfig(t, hosts["acme-ci-control-plane"])
+	local := hostConfig(t, hosts["acme-ci-fc-1"])
+
+	// TWO PLACES, TWO STORES. The control plane reads this list and matches a
+	// node's reported site against it exactly.
+	if len(controller.Sites) != 2 {
+		t.Fatalf("the controller must declare both places, got %+v", controller.Sites)
+	}
+	byName := map[string]config.SiteStoreKind{}
+	for _, s := range controller.Sites {
+		byName[s.Name] = s.Store
+	}
+	if byName["home"] != config.SiteStoreCeph {
+		t.Errorf("the local site must be ceph, got %q", byName["home"])
+	}
+	if byName["us-west-2"] != config.SiteStoreEBSS3 {
+		t.Errorf("the cloud site must be ebs-s3, got %q", byName["us-west-2"])
+	}
+
+	// EACH NODE NAMES ITS OWN PLACE, and a cache key is scoped by it — which is
+	// why billet requires node.site with node.ebs_s3 at all.
+	if controller.Node.Site != "us-west-2" {
+		t.Errorf("the orchestrator's site is %q, want the cloud one", controller.Node.Site)
+	}
+	if local.Node.Site != "home" {
+		t.Errorf("the local node's site is %q, want the local one", local.Node.Site)
+	}
+
+	// THE STORE: the region is the node's own, the zone is the subnet's, and the
+	// bucket and prefix are the ones the apply produced.
+	e := controller.Node.EBSS3
+	if e == nil {
+		t.Fatal("the orchestrator must carry node.ebs_s3")
+	}
+	if e.Region != "us-west-2" || e.AvailabilityZone != "us-west-2a" ||
+		e.Bucket != "acme-ci-cache-123456789012" || e.Prefix != "billet-cache" {
+		t.Errorf("the store does not carry the apply's facts: %+v", e)
+	}
+
+	// THE LISTENER: the controller's own address, HTTPS because the guest's
+	// bearer token crosses the VPC, and on the port the module's cache rule opens.
+	c := controller.Node.Cache
+	if c == nil {
+		t.Fatal("the orchestrator must carry node.cache")
+	}
+	if c.Listen != "10.60.0.10:9443" {
+		t.Errorf("the cache listens on %q, want the controller's address on the module's cache port", c.Listen)
+	}
+	if c.GuestEndpoint != "https://10.60.0.10:9443" {
+		t.Errorf("the guest endpoint is %q, want https on the same address and port", c.GuestEndpoint)
+	}
+	if c.TLSCert == "" || c.TLSKey == "" || !strings.HasPrefix(c.TLSCert, "/") {
+		t.Errorf("an EC2 cache listener needs an absolute TLS pair, got %q and %q", c.TLSCert, c.TLSKey)
+	}
+}
+
+// WITHOUT --cache NOTHING OF IT APPEARS, so a deployment that keeps no cache is
+// exactly what it was: no sites, no store, no listener, and a root that creates
+// no bucket.
+func TestGenerateHybridWithoutACacheDeclaresNoSites(t *testing.T) {
+	t.Parallel()
+
+	p := hybridParams()
+	p.Facts = hybridFacts()
+	p.Commission = true
+	p.AMI = "ami-0123456789abcdef0"
+
+	files, _ := mustGenerateHybrid(t, p)
+
+	if !strings.Contains(files[HybridTerraformFile], "enable_cache = false") {
+		t.Error("without --cache the root must create no cache bucket")
+	}
+
+	hosts := inventoryHosts(t, files[HybridInventoryFile])
+	controller := hostConfig(t, hosts["acme-ci-control-plane"])
+	local := hostConfig(t, hosts["acme-ci-fc-1"])
+
+	if len(controller.Sites) != 0 {
+		t.Errorf("a deployment with no cache declares no sites, got %+v", controller.Sites)
+	}
+	if controller.Node.Site != "" || local.Node.Site != "" {
+		t.Errorf("no node names a site without a cache, got %q and %q",
+			controller.Node.Site, local.Node.Site)
+	}
+	if controller.Node.EBSS3 != nil || controller.Node.Cache != nil {
+		t.Error("no store and no listener without a cache")
+	}
+}
+
+// THE CACHE'S OWN FACTS ARE PLACEHOLDERS UNTIL THE APPLY, and the outputs that
+// fill them are declared only by a root that creates a cache — so the two move
+// together or a prepare render waits forever on an output nobody produces.
+func TestGenerateHybridCacheFactsAreDeclaredAndFilled(t *testing.T) {
+	t.Parallel()
+
+	p := hybridParams()
+	p.Cache = true
+	p.Commission = false
+	plan, _ := mustGenerateHybrid(t, p)
+
+	declared := map[string]bool{}
+	for _, m := range regexp.MustCompile(`(?m)^output "([a-z_]+)"`).FindAllStringSubmatch(plan[HybridTerraformFile], -1) {
+		declared[m[1]] = true
+	}
+	for _, name := range []string{HybridOutputCacheBucket, HybridOutputCachePrefix, HybridOutputAvailabilityZone} {
+		if !declared[name] {
+			t.Errorf("a cache root must declare %q, which the prepare render demands", name)
+		}
+	}
+
+	// ...and a root WITHOUT a cache declares none of them, because it creates
+	// nothing they could describe.
+	bare, _ := mustGenerateHybrid(t, hybridParams())
+	for _, name := range []string{HybridOutputCacheBucket, HybridOutputCachePrefix} {
+		if strings.Contains(bare[HybridTerraformFile], `output "`+name+`"`) {
+			t.Errorf("a root with no cache must not declare %q", name)
+		}
+	}
+}
+
+// ParseTerraformOutput demands the cache facts only of a generation that reads
+// them: a root that never declared an output cannot be faulted for not
+// producing it.
+func TestParseTerraformOutputCacheFacts(t *testing.T) {
+	t.Parallel()
+
+	withCache := `{
+  "control_plane_private_ip": {"value": "10.60.0.10"},
+  "ledger_volume_id": {"value": "vol-0abc"},
+  "subnet_id": {"value": "subnet-0abc"},
+  "runner_security_group_id": {"value": "sg-trusted"},
+  "ami_payload_bucket": {"value": "acme-ci-ami-payloads-1"},
+  "cache_bucket": {"value": "acme-ci-cache-1"},
+  "cache_prefix": {"value": "billet-cache"},
+  "availability_zone": {"value": "us-west-2a"}
+}`
+
+	got, err := ParseTerraformOutput([]byte(withCache), HybridNeeds{Cache: true})
+	if err != nil {
+		t.Fatalf("a complete cache output: %v", err)
+	}
+	if got.CacheBucket != "acme-ci-cache-1" || got.CachePrefix != "billet-cache" ||
+		got.AvailabilityZone != "us-west-2a" {
+		t.Errorf("the cache facts were not read: %+v", got)
+	}
+
+	// The same document without them is fine for a generation that keeps no
+	// cache, and refused by name for one that does.
+	bare := strings.Replace(withCache, `"cache_bucket"`, `"other"`, 1)
+	if _, err := ParseTerraformOutput([]byte(bare), HybridNeeds{}); err != nil {
+		t.Errorf("a cacheless generation must not demand the cache outputs: %v", err)
+	}
+	if _, err := ParseTerraformOutput([]byte(bare), HybridNeeds{Cache: true}); err == nil ||
+		!strings.Contains(err.Error(), `"cache_bucket"`) {
+		t.Errorf("a missing cache output must be refused by name, got %v", err)
+	}
+}
+
+// THE TWO PLACES NEED TWO NAMES, and the names are identities the control plane
+// matches exactly.
+func TestGenerateHybridSiteNames(t *testing.T) {
+	t.Parallel()
+
+	p := hybridParams()
+	p.Cache = true
+	p.LocalSite = "basement"
+	p.CloudSite = "oregon"
+	files, _ := mustGenerateHybrid(t, p)
+
+	controller := hostConfig(t, inventoryHosts(t, files[HybridInventoryFile])["acme-ci-control-plane"])
+	names := []string{controller.Sites[0].Name, controller.Sites[1].Name}
+	if !slices.Contains(names, "basement") || !slices.Contains(names, "oregon") {
+		t.Errorf("the named sites must be the ones written, got %v", names)
+	}
+
+	for _, tc := range []struct {
+		name  string
+		edit  func(*HybridParams)
+		wants string
+	}{
+		{"one name twice", func(p *HybridParams) { p.LocalSite, p.CloudSite = "here", "here" }, "two places need two names"},
+		{"a padded name", func(p *HybridParams) { p.LocalSite = " home" }, "--local-site"},
+		{"an upper-case name", func(p *HybridParams) { p.CloudSite = "US-West" }, "--cloud-site"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			q := hybridParams()
+			q.Cache = true
+			tc.edit(&q)
+
+			_, _, err := GenerateHybrid(q)
+			if err == nil || !strings.Contains(err.Error(), tc.wants) {
+				t.Fatalf("want a refusal naming %q, got %v", tc.wants, err)
+			}
+		})
 	}
 }

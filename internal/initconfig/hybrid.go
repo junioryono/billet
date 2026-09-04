@@ -56,6 +56,9 @@ const (
 	HybridOutputRunnerSecurityGroup   = "runner_security_group_id"
 	HybridOutputUntrustedRunnerSG     = "untrusted_runner_security_group_id"
 	HybridOutputAMIPayloadBucket      = "ami_payload_bucket"
+	HybridOutputCacheBucket           = "cache_bucket"
+	HybridOutputCachePrefix           = "cache_prefix"
+	HybridOutputAvailabilityZone      = "availability_zone"
 )
 
 // HybridPlaceholder is the text standing in for an apply-time fact in a plan
@@ -91,6 +94,10 @@ type HybridFacts struct {
 	RunnerSecurityGroupID          string
 	UntrustedRunnerSecurityGroupID string
 	AMIPayloadBucket               string
+	// The cache facts, demanded only of a generation that asked for one.
+	CacheBucket      string
+	CachePrefix      string
+	AvailabilityZone string
 }
 
 // HybridParams is everything `billet init hybrid` decided or was told.
@@ -155,6 +162,21 @@ type HybridParams struct {
 	// generation names it, because the generator cannot see that machine.
 	LocalImage string
 
+	// Cache turns on the EBS+S3 site cache for the cloud half: the module
+	// creates the bucket, the orchestrator gains node.ebs_s3 and the node.cache
+	// listener its job instances fetch through, and both hosts declare the site
+	// their storage belongs to.
+	//
+	// THE TWO HALVES CACHE IN DIFFERENT PLACES, which is what makes the sites
+	// necessary rather than decorative: the Firecracker host's generations live
+	// in its own Ceph pools, and an EC2 job cannot reach them across the WAN, so
+	// the cloud half needs a store of its own and cache keys are scoped by site.
+	Cache bool
+	// LocalSite and CloudSite name those two places. Empty defaults to "home"
+	// and to the region, which is what an operator would write anyway.
+	LocalSite string
+	CloudSite string
+
 	// Builder grants the controller's own role what `billet ami build`
 	// performs, so the image can be built ON the controller instead of from a
 	// workstation holding an operator's AWS credentials — a second machine to
@@ -205,6 +227,21 @@ const (
 	// hybridBackupPrefix is the root module's default, restated so the config
 	// and the grant name the same literal.
 	hybridBackupPrefix = "billet-backups"
+	// hybridCachePort is the port the module's cache rule opens from the runner
+	// group to the control plane, and therefore the one the orchestrator's cache
+	// listener binds. It is the root's cache_listen_port default; the two are one
+	// number in two files, and a mismatch is a listener nothing may reach.
+	hybridCachePort = 9443
+	// Where the role installs the cache's TLS pair. The paths are the config's to
+	// choose — the role copies billet_cache_tls_cert_src to whatever
+	// node.cache.tls_cert names — and they must be absolute, because an EC2
+	// listener's are.
+	hybridCacheTLSCert = "/etc/billet/cache-tls/cert.pem"
+	hybridCacheTLSKey  = "/etc/billet/cache-tls/key.pem"
+	// HybridDefaultLocalSite is what the machine at home is called when the
+	// operator does not say. A site is a PLACE, so the default names one.
+	// Exported because the CLI prints it in the flag's help.
+	HybridDefaultLocalSite = "home"
 )
 
 var (
@@ -366,6 +403,31 @@ func checkHybridParams(p *HybridParams) error {
 	if p.LocalImage == "" {
 		p.LocalImage = DefaultFirecrackerImage
 	}
+
+	// THE TWO PLACES, defaulted rather than demanded: an operator who turns the
+	// cache on should not also have to invent two names. They are IDENTITIES —
+	// a node reports its site and the control plane matches it exactly — so
+	// padding is refused rather than trimmed, the same rule config applies.
+	if p.LocalSite == "" {
+		p.LocalSite = HybridDefaultLocalSite
+	}
+	if p.CloudSite == "" {
+		p.CloudSite = p.Region
+	}
+	for flag, name := range map[string]string{
+		"--local-site": p.LocalSite,
+		"--cloud-site": p.CloudSite,
+	} {
+		if !hybridHostPattern.MatchString(name) {
+			return fmt.Errorf("%s %q must be a lowercase name of letters, digits and hyphens: a "+
+				"node reports its site and the control plane matches it exactly", flag, name)
+		}
+	}
+	if p.LocalSite == p.CloudSite {
+		return fmt.Errorf("--local-site and --cloud-site are both %q; two places need two names, "+
+			"because a cache key is scoped by site and the two stores are not the same storage",
+			p.LocalSite)
+	}
 	if idx := strings.IndexFunc(p.LocalImage, badImageRune); idx >= 0 {
 		return fmt.Errorf("--local-image: %q contains whitespace or a control character", p.LocalImage)
 	}
@@ -439,6 +501,9 @@ func hybridFactValues(p HybridParams) map[string]string {
 	}
 
 	return map[string]string{
+		HybridOutputCacheBucket:           pick(HybridOutputCacheBucket, f.CacheBucket),
+		HybridOutputCachePrefix:           pick(HybridOutputCachePrefix, f.CachePrefix),
+		HybridOutputAvailabilityZone:      pick(HybridOutputAvailabilityZone, f.AvailabilityZone),
 		HybridOutputControlPlanePrivateIP: pick(HybridOutputControlPlanePrivateIP, f.ControlPlanePrivateIP),
 		HybridOutputLedgerVolumeID:        pick(HybridOutputLedgerVolumeID, f.LedgerVolumeID),
 		HybridOutputSubnetID:              pick(HybridOutputSubnetID, f.SubnetID),
@@ -531,6 +596,90 @@ func hybridGitHubYAML(p HybridParams) string {
 	return b.String()
 }
 
+// hybridSitesYAML declares the two places this deployment stores caches in, or
+// nothing when it keeps none.
+//
+// A SITE IS WHERE COMPUTE AND ITS STORAGE SHARE A FAST NETWORK, which is exactly
+// why a hybrid deployment has two: the Firecracker host's generations live in
+// its own Ceph pools and an EC2 job cannot reach them across the WAN. The
+// control plane reads this list; it is what authorises each node's reported
+// site, and cache keys are scoped by it.
+func hybridSitesYAML(p HybridParams) string {
+	if !p.Cache {
+		return ""
+	}
+
+	return fmt.Sprintf(`
+# WHERE THIS DEPLOYMENT KEEPS CACHES. Two places, because the two halves cannot
+# reach each other's storage: the machine at home writes RBD images into its own
+# Ceph pools, and the cloud half writes EBS snapshots with a pointer in S3. A
+# node reports its site at registration and the control plane matches it
+# EXACTLY, so these names and the node.site values below are one string.
+sites:
+  - name: %s
+    store: ceph
+  - name: %s
+    store: ebs-s3
+`, yamlScalar(p.LocalSite), yamlScalar(p.CloudSite))
+}
+
+// hybridCloudCacheYAML is the orchestrator's half of the cloud cache: the store
+// its job instances read and write, and the listener they fetch through.
+func hybridCloudCacheYAML(p HybridParams, facts map[string]string) string {
+	// THE CONTROLLER'S OWN ADDRESS, taken from the same resolved fact server.listen
+	// and every server_addr take it from, so the listener and the wire cannot name
+	// two different machines.
+	ip := facts[HybridOutputControlPlanePrivateIP]
+
+	if !p.Cache {
+		return ""
+	}
+
+	return fmt.Sprintf(`
+  # THE CLOUD SITE'S STORE. Generations are EBS snapshots and the fenced pointer
+  # is one S3 object; the zone is the subnet's, because a cache volume and the
+  # instance consuming it must be in one zone. The region is the node's own —
+  # billet refuses a cache in a different one.
+  ebs_s3:
+    region: %s
+    availability_zone: %s
+    bucket: %s
+    prefix: %s
+
+  # WHAT A JOB INSTANCE FETCHES THROUGH. One literal, non-loopback address —
+  # the controller's, which is where this orchestrator runs — and HTTPS, because
+  # the guest's bearer token crosses the VPC to reach it. The module's cache rule
+  # is what admits the runner group to this port and nothing else.
+  #
+  # THE PAIR IS YOURS TO SUPPLY. The role installs whatever
+  # billet_cache_tls_cert_src and billet_cache_tls_key_src name to these paths;
+  # the certificate has to be valid for the address above, since that is what the
+  # guest dials.
+  cache:
+    listen: %s
+    guest_endpoint: %s
+    tls_cert: %s
+    tls_key: %s
+`,
+		yamlScalar(p.Region),
+		yamlScalar(facts[HybridOutputAvailabilityZone]),
+		yamlScalar(facts[HybridOutputCacheBucket]),
+		yamlScalar(facts[HybridOutputCachePrefix]),
+		yamlScalar(fmt.Sprintf("%s:%d", ip, hybridCachePort)),
+		yamlScalar(fmt.Sprintf("https://%s:%d", ip, hybridCachePort)),
+		hybridCacheTLSCert, hybridCacheTLSKey,
+	)
+}
+
+// hybridSiteLineYAML is a node's own `site:` line, or nothing.
+func hybridSiteLineYAML(p HybridParams, site string) string {
+	if !p.Cache {
+		return ""
+	}
+
+	return fmt.Sprintf("  site: %s\n", yamlScalar(site))
+}
+
 // hybridTLSYAML is the bundle `billet ca issue` writes, at the path the runbook
 // installs it to, at the given indent.
 func hybridTLSYAML(indent string) string {
@@ -570,11 +719,12 @@ backup:
     bucket: %s-backups
     region: %s
     prefix: %s
-`,
+%s`,
 		yamlScalar(wire), serviceStateBase,
 		localVCPU+p.CloudVCPU, localMemory+p.CloudMemory,
 		hybridGitHubYAML(p),
 		p.Name, yamlScalar(p.Region), hybridBackupPrefix,
+		hybridSitesYAML(p),
 	)
 
 	if !p.Commission {
@@ -589,7 +739,7 @@ backup:
 node:
   server_addr: %s
 %s  provider: ec2
-  state_dir: %s/node
+%s  state_dir: %s/node
   lock_dir: %s
   # REQUIRED for ec2 and equal to the cloud budget: there is no host to detect
   # a contribution from.
@@ -602,6 +752,7 @@ node:
       - %s
 `,
 		yamlScalar(wire), hybridTLSYAML("  "),
+		hybridSiteLineYAML(p, p.CloudSite),
 		serviceStateBase, serviceLockDir,
 		p.CloudVCPU, p.CloudMemory,
 		yamlScalar(p.Region), yamlScalar(facts[HybridOutputSubnetID]),
@@ -617,6 +768,7 @@ node:
 	b.WriteString("    # prices, which only report exposure and never gate a job.\n")
 	b.WriteString("    instance_types:\n")
 	b.WriteString(ec2InstanceTypesYAML(p.Shapes))
+	b.WriteString(hybridCloudCacheYAML(p, facts))
 
 	return b.String()
 }
@@ -637,7 +789,7 @@ node:
   # name is omitted: it comes from the certificate `+"`billet ca issue`"+` wrote.
   server_addr: %s
 %s  provider: firecracker
-  state_dir: %s/node
+%s  state_dir: %s/node
   lock_dir: %s
   # What this host CONTRIBUTES: what it has, minus the headroom the kernel,
   # Ceph and your shell need.
@@ -645,6 +797,7 @@ node:
   max_memory: %s
 %s`,
 		yamlScalar(wire), hybridTLSYAML("  "),
+		hybridSiteLineYAML(p, p.LocalSite),
 		serviceStateBase, serviceLockDir,
 		localVCPU, localMemory,
 		firecrackerNodeBlocks(trusted, p.Host),
@@ -867,11 +1020,26 @@ module "billet" {
   # bucket is where billet local backup copies it, and the grant is on the node
   # role the controller runs with.
   create_backup_bucket = true
+`)
 
-  # THE EBS+S3 SITE CACHE IS OFF. It needs a site, node.cache with a TLS pair
-  # on EC2, and node.ebs_s3; add it deliberately per docs/deploying/aws-ec2.md.
+	if p.Cache {
+		b.WriteString(`
+  # THE EBS+S3 SITE CACHE. The bucket holds each generation's fenced pointer and
+  # lease state; the generations themselves are EBS snapshots. Turning it on also
+  # creates the one rule that admits the runner group to the controller's cache
+  # port, and nothing else — the listener, its TLS pair and node.ebs_s3 are in
+  # the inventory beside it.
+  enable_cache = true
+`)
+	} else {
+		b.WriteString(`
+  # THE EBS+S3 SITE CACHE IS OFF. Generate with --cache to turn it on: the
+  # module then creates the bucket and the rule admitting runners to the
+  # controller's cache listener, and the orchestrator gains node.ebs_s3 and
+  # node.cache. You supply the listener's TLS pair; nothing else changes.
   enable_cache = false
 `)
+	}
 
 	if p.Builder {
 		b.WriteString(`
@@ -1036,6 +1204,25 @@ output %q {
   value       = aws_security_group.untrusted_runner.id
 }
 `, HybridOutputUntrustedRunnerSG)
+	}
+
+	if p.Cache {
+		fmt.Fprintf(&b, `
+output %q {
+  description = "The cache bucket holding each generation's fenced pointer and lease state (node.ebs_s3.bucket)."
+  value       = module.billet.cache_bucket
+}
+
+output %q {
+  description = "The object prefix isolating this deployment inside that bucket (node.ebs_s3.prefix)."
+  value       = module.billet.cache_prefix
+}
+
+output %q {
+  description = "The subnet's zone. A cache volume and the instance consuming it must be in one zone (node.ebs_s3.availability_zone)."
+  value       = module.billet.availability_zone
+}
+`, HybridOutputCacheBucket, HybridOutputCachePrefix, HybridOutputAvailabilityZone)
 	}
 
 	fmt.Fprintf(&b, `

@@ -6,15 +6,31 @@ import (
 	"strings"
 )
 
+// HybridNeeds says which optional facts a generation depends on, so
+// ParseTerraformOutput demands exactly what this deployment's shape consumes
+// and nothing it does not.
+//
+// A STRUCT RATHER THAN BOOLEANS IN A ROW, because two bare bools at a call site
+// are two chances to swap them, and swapping these means demanding an output
+// the root does not declare while accepting one it does.
+type HybridNeeds struct {
+	// Untrusted demands the untrusted runner group, which only an untrusted
+	// generation's root declares.
+	Untrusted bool
+	// Cache demands the three cache facts, which only a --cache root declares.
+	Cache bool
+}
+
 // ParseTerraformOutput reads `terraform output -json` into the facts a hybrid
 // render consumes.
 //
 // EVERY CONSUMED OUTPUT IS REQUIRED, BY NAME. A missing one is not a fact
 // billet can leave blank: an empty subnet loads and then launches nothing, and
 // an empty ledger volume id makes the role skip the fail-closed mount and start
-// the controller on the root disk. The untrusted group is demanded only for an
-// untrusted generation, because a trusted root declares no such output.
-func ParseTerraformOutput(raw []byte, untrusted bool) (HybridFacts, error) {
+// the controller on the root disk. The optional ones are demanded only where
+// the generation actually reads them, because a root that never declared an
+// output cannot be faulted for not producing it.
+func ParseTerraformOutput(raw []byte, need HybridNeeds) (HybridFacts, error) {
 	var doc map[string]struct {
 		Value any `json:"value"`
 	}
@@ -57,9 +73,21 @@ func ParseTerraformOutput(raw []byte, untrusted bool) (HybridFacts, error) {
 		}
 	}
 
-	if untrusted {
+	if need.Untrusted {
 		if f.UntrustedRunnerSecurityGroupID, err = read(HybridOutputUntrustedRunnerSG); err != nil {
 			return HybridFacts{}, err
+		}
+	}
+
+	if need.Cache {
+		for name, dst := range map[string]*string{
+			HybridOutputCacheBucket:      &f.CacheBucket,
+			HybridOutputCachePrefix:      &f.CachePrefix,
+			HybridOutputAvailabilityZone: &f.AvailabilityZone,
+		} {
+			if *dst, err = read(name); err != nil {
+				return HybridFacts{}, err
+			}
 		}
 	}
 

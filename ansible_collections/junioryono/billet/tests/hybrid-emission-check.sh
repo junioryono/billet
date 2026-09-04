@@ -43,7 +43,10 @@ cat >"$outputs" <<'EOF'
   "subnet_id": {"sensitive": false, "type": "string", "value": "subnet-0abc"},
   "runner_security_group_id": {"sensitive": false, "type": "string", "value": "sg-trusted"},
   "untrusted_runner_security_group_id": {"sensitive": false, "type": "string", "value": "sg-untrusted"},
-  "ami_payload_bucket": {"sensitive": false, "type": "string", "value": "hybrid-check-ami-payloads-1"}
+  "ami_payload_bucket": {"sensitive": false, "type": "string", "value": "hybrid-check-ami-payloads-1"},
+  "cache_bucket": {"sensitive": false, "type": "string", "value": "hybrid-check-cache-1"},
+  "cache_prefix": {"sensitive": false, "type": "string", "value": "billet-cache"},
+  "availability_zone": {"sensitive": false, "type": "string", "value": "us-west-2a"}
 }
 EOF
 
@@ -56,7 +59,7 @@ EOF
     --max-vcpu 16 --max-memory 32GiB \
     --instance-type 'c7i.xlarge=4,8GiB,0.17' \
     --instance-type 'c7i.2xlarge=8,16GiB,0.34' \
-    --terraform-output "$outputs" --commission --ami ami-0123456789abcdef0 \
+    --terraform-output "$outputs" --commission --ami ami-0123456789abcdef0 --cache \
     >"$work/gen.log" 2>&1 || {
     echo "hybrid-emission-check: the generation failed" >&2; cat "$work/gen.log" >&2; exit 1; }
 
@@ -109,6 +112,21 @@ if controller.get("billet_server_prepare_only") is not False or controller.get("
     sys.exit("hybrid-emission-check: the commission render must lift the hold and enable the node")
 if controller["billet_config"]["node"]["ec2"]["subnet_id"] != "subnet-0abc":
     sys.exit("hybrid-emission-check: the ec2 placement did not come from the terraform outputs")
+
+# THE CACHE, AS ANSIBLE SEES IT. The sites list and the store are what the
+# control plane authorises a node's reported site against, so a generation whose
+# two halves disagreed would converge and then refuse the node at registration.
+sites = {s["name"]: s["store"] for s in controller["billet_config"].get("sites", [])}
+if sites != {"home": "ceph", "us-west-2": "ebs-s3"}:
+    sys.exit(f"hybrid-emission-check: the controller declares {sites}, want the two places and their stores")
+if controller["billet_config"]["node"].get("site") != "us-west-2":
+    sys.exit("hybrid-emission-check: the orchestrator does not name the cloud site")
+if local["billet_config"]["node"].get("site") != "home":
+    sys.exit("hybrid-emission-check: the local node does not name the local site")
+if controller["billet_config"]["node"]["ebs_s3"]["bucket"] != "hybrid-check-cache-1":
+    sys.exit("hybrid-emission-check: the cache store did not come from the terraform outputs")
+if not controller["billet_config"]["node"]["cache"]["guest_endpoint"].startswith("https://"):
+    sys.exit("hybrid-emission-check: an EC2 guest's cache endpoint must be https")
 
 print(f"ok   both hosts carry the same {len(controller['billet_config']['tiers'])}-tier catalogue through the anchor")
 EOF

@@ -33,7 +33,8 @@ type hybridInputs struct {
 	instanceTypes, priceOverrides  []string
 	sshIngress                     []string
 	keyName, localUser, localImage string
-	builder                        bool
+	builder, cache                 bool
+	localSite, cloudSite           string
 	kernelImage, cephUser, cephKey string
 	cacheListen, cacheGuest        string
 	cfgPath                        string
@@ -97,6 +98,17 @@ func cmdInitHybrid(ctx context.Context, args []string) error {
 	localImage := fs.String("local-image", "",
 		"the guest generation every tier boots on the Firecracker host (default "+
 			initconfig.DefaultFirecrackerImage+", the x64 generation billet publishes)")
+	cache := fs.Bool("cache", false,
+		"give the cloud half an EBS+S3 site cache: the module creates the bucket and the rule "+
+			"admitting runners to it, the orchestrator gains node.ebs_s3 and a node.cache listener, "+
+			"and both hosts declare the site their storage belongs to (you supply the listener's "+
+			"TLS pair)")
+	localSite := fs.String("local-site", "",
+		"the name of the place the Firecracker host is in, whose store is its Ceph cluster "+
+			"(default "+initconfig.HybridDefaultLocalSite+"; with --cache)")
+	cloudSite := fs.String("cloud-site", "",
+		"the name of the place the cloud half is in, whose store is EBS and S3 (default the "+
+			"region; with --cache)")
 	builder := fs.Bool("builder", false,
 		"grant the controller's role what `billet ami build` performs, so the image is built on "+
 			"the controller rather than from a workstation holding your AWS credentials; it widens "+
@@ -143,6 +155,11 @@ func cmdInitHybrid(ctx context.Context, args []string) error {
 		return errors.New("--ami is read with --commission only; before it every tier carries the " +
 			"placeholder, because nothing launches until the node exists")
 	}
+	if !*cache && (*localSite != "" || *cloudSite != "") {
+		return errors.New("--local-site and --cloud-site name the two places a cache lives in, " +
+			"so they are only read with --cache; without one this deployment declares no sites " +
+			"at all and the names would be written nowhere")
+	}
 	if *commission && *ami == "" {
 		return errors.New("--commission needs --ami: the render it produces advertises the ec2 " +
 			"fallback, and a placeholder image would fail every job that reaches it; " +
@@ -180,7 +197,9 @@ func cmdInitHybrid(ctx context.Context, args []string) error {
 		if err != nil {
 			return fmt.Errorf("--terraform-output: %w", err)
 		}
-		f, err := initconfig.ParseTerraformOutput(raw, untrusted)
+		f, err := initconfig.ParseTerraformOutput(raw, initconfig.HybridNeeds{
+			Untrusted: untrusted, Cache: *cache,
+		})
 		if err != nil {
 			return err
 		}
@@ -208,6 +227,9 @@ func cmdInitHybrid(ctx context.Context, args []string) error {
 		LocalAnsibleUser: *localUser,
 		LocalImage:       *localImage,
 		Builder:          *builder,
+		Cache:            *cache,
+		LocalSite:        *localSite,
+		CloudSite:        *cloudSite,
 		Host: initconfig.HostInputs{
 			KernelImage:        *kernelImage,
 			CephUser:           *cephUser,
@@ -257,6 +279,7 @@ func cmdInitHybrid(ctx context.Context, args []string) error {
 		localVCPU: *localVCPU, cloudVCPU: *maxVCPU, localMemory: *localMemory, cloudMemory: *maxMemory,
 		instanceTypes: instanceTypes, priceOverrides: priceOverrides, sshIngress: sshIngress,
 		keyName: *keyName, localUser: *localUser, localImage: *localImage, builder: *builder,
+		cache: *cache, localSite: *localSite, cloudSite: *cloudSite,
 		kernelImage: *kernelImage, cephUser: *cephUser, cephKey: *cephKeyring,
 		cacheListen: *cacheListen, cacheGuest: *cacheGuest, out: *out,
 	}
@@ -509,6 +532,11 @@ func hybridFlags(in hybridInputs) []string {
 	if in.builder {
 		out = append(out, "--builder")
 	}
+	if in.cache {
+		out = append(out, "--cache")
+	}
+	add("local-site", in.localSite)
+	add("cloud-site", in.cloudSite)
 	add("kernel-image", in.kernelImage)
 	add("ceph-user", in.cephUser)
 	add("ceph-keyring", in.cephKey)
@@ -563,6 +591,14 @@ func renderHybridRunbook(in hybridInputs, p initconfig.HybridParams, trusted, ca
 	dir := "."
 	tf := "terraform"
 	flags := shellArgs(hybridFlags(in))
+	// THE ADDRESS A GUEST DIALS, named here because the cache's certificate has
+	// to be valid for it and an operator reading the runbook needs the string
+	// rather than a description of it.
+	cacheAddress := p.ControlPlaneIP
+	if cacheAddress == "" {
+		cacheAddress = "the control_plane_private_ip output"
+	}
+
 	wire := fmt.Sprintf("%s:%d", p.ControlPlaneIP, 7717)
 	if p.ControlPlaneIP == "" {
 		wire = "the control_plane_private_ip output, port 7717"
@@ -633,6 +669,13 @@ func renderHybridRunbook(in hybridInputs, p initconfig.HybridParams, trusted, ca
 	b.WriteString("Pass `--public-ip`: the created subnet's only route is an internet gateway, which is unusable without an address. The command boots the image it made and stamps it only after it proved itself.\n\n")
 
 	b.WriteString("## 7. Render the commission phase, and converge both hosts\n\n")
+	if p.Cache {
+		// THE LISTENER APPEARS IN THIS RENDER, so its pair has to exist before the
+		// converge that installs it: the role copies whatever the two variables
+		// name to the paths the config carries, and refuses half a pair.
+		fmt.Fprintf(&b, "This render adds the cloud cache, so the converge below needs its TLS pair: the orchestrator terminates HTTPS for job instances that fetch across the VPC, and the certificate has to be valid for the address a guest dials (%s). Hand it over the way the App key was handed over, and the role installs it to the paths the config names:\n\n```bash\nexport BILLET_CACHE_TLS_CERT_PATH=<your cert.pem>\nexport BILLET_CACHE_TLS_KEY_PATH=<your key.pem>\n```\n\n",
+			cacheAddress)
+	}
 	fmt.Fprintf(&b, "```bash\nbillet init hybrid --out %s %s --terraform-output outputs.json --commission --ami ami-<from step 6>\nansible-playbook -i inventory.yml site.yml -l %s\nansible-playbook -i inventory.yml site.yml -l %s\n```\n\n",
 		shellArg(dir), flags, shellArg(p.ControllerName), shellArg(p.LocalName))
 	b.WriteString("No key this time: the protected copy on the controller is enough. The commission render lifts the hold, adds the ec2 orchestrator beside the server, and writes the AMI into every tier's `launch.ec2.image`. The local host converges last, alone, once its bundle from step 5 is in place. Then `billet check --config /etc/billet/billet.yaml` on each.\n\n")
