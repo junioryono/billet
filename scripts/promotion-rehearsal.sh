@@ -59,6 +59,11 @@ active_controller() {
 cleanup() {
     status=$?
     set +e
+    # IGNORED, NOT RESET: a second Ctrl-C or a TERM during the teardown must not
+    # end the shell before the scale set and the hosts are gone. The status the
+    # first signal chose (130 or 143) is already in ${status}.
+    trap '' INT TERM
+    status=$(rehearsal_verdict "${status}")
 
     echo
     echo "=== teardown"
@@ -71,7 +76,7 @@ cleanup() {
             fi
         fi
     done
-    if [ "${torn_down}" = no ]; then
+    if [ "${plane_started}" = yes ] && [ "${torn_down}" = no ]; then
         echo "TEARDOWN FAILED: the scale set for ${label} may still exist. Remove it from any host" >&2
         echo "holding this App: billet teardown --tier ${label} --yes --config <that config>" >&2
         if [ "${status}" -eq 0 ]; then status=1; fi
@@ -88,7 +93,15 @@ cleanup() {
     rm -rf "${work}" || true
     exit "${status}"
 }
-trap cleanup EXIT INT TERM
+# THE SENTINEL STARTS AT 0 HERE, whatever the environment says, or an exported
+# REHEARSAL_PASSED=1 would turn an aborted run green. A signal exits through its
+# own status so that cleanup, which only the EXIT trap runs, reads a failure and
+# not the $? of whatever the signal interrupted.
+REHEARSAL_PASSED=0
+plane_started=no
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap cleanup EXIT
 
 rehearsal_step "a PostgreSQL with short keepalives, two controllers and a node"
 docker network create "${network}" >/dev/null
@@ -129,6 +142,14 @@ server:
   controllers: active-passive
   max_vcpu: 8
   max_memory: 16GiB
+# NOT ON AUTOMATIC UPDATES. This is the tree's own snapshot build, which reports
+# a release the stable channel is not on, so the starter opened a rollout to the
+# channel within a minute of boot (measured 2026-09-04) and the packaged root
+# timer then fenced the ledger for its host transaction, refusing the very
+# `local down` this rehearsal is about. The rollout rehearsal is the one that
+# wants the default.
+release:
+  automatic: false
 EOF
         rehearsal_github_block
         cat <<EOF
@@ -196,6 +217,7 @@ test "$(docker exec "${controller_a}" cat /var/lib/billet/server/deployment-id)"
 
 rehearsal_step "start A, then B; one claims and one stands by"
 since_a=$(rehearsal_clock "${controller_a}")
+plane_started=yes
 docker exec -e "BILLET_STATE_DSN=${dsn}" "${controller_a}" /usr/bin/billet local up --config /etc/billet/billet.yaml 2>&1 | tail -4
 docker exec -e "BILLET_STATE_DSN=${dsn}" "${controller_b}" /usr/bin/billet local up --config /etc/billet/billet.yaml 2>&1 | tail -4
 docker exec "${node}" /usr/bin/billet local up --config /etc/billet/billet.yaml 2>&1 | tail -4
@@ -251,3 +273,6 @@ test "$(rehearsal_active "${controller_b}" billet-server.service)" = active ||
 echo
 echo "promotion rehearsal: PASSED"
 echo "  package $(rehearsal_version "${controller_a}") on ${REHEARSAL_ARCH}; PostgreSQL keepalives idle=${keepalive_idle}s interval=${keepalive_interval}s count=${keepalive_count}; partition -> promotion ${promotion_took}s; node re-registered $((node_moved_at - partitioned_at))s after the partition; heal -> old leader standing by $((stood_by_at - healed_at))s; total $(($(date -u +%s) - started_at))s"
+# THE LAST STATEMENT, after every line of output: a signal landing before this
+# still fails the run.
+REHEARSAL_PASSED=1

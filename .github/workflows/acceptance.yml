@@ -66,11 +66,17 @@ jobs:
     timeout-minutes: 90
 
     # THE ENVIRONMENT IS THE PRINCIPAL. The role in the acceptance account trusts
-    # exactly one OIDC subject, `repo:junioryono/billet:environment:acceptance`,
-    # and declaring the environment is what puts that subject in the token
-    # whatever ref the run was dispatched for. A scheduled run from main and a
-    # dispatched run from a branch are then the same principal; a pull_request
-    # workflow cannot request an environment, so a fork's run is not.
+    # exactly one OIDC subject, this repository's `environment:acceptance`, and
+    # declaring the environment is what puts that subject in the token whatever
+    # ref the run was dispatched for. A scheduled run from main and a dispatched
+    # run from a branch are then the same principal. What keeps a fork out is not
+    # the environment (a pull_request job can name one): this workflow has no
+    # pull_request trigger, the job runs only in the canonical repository, and a
+    # fork's run is never issued an OIDC token for this one. The subject GitHub
+    # issues here is the id-qualified spelling,
+    # `repo:<owner>@<id>/<repo>@<id>:environment:acceptance` (measured
+    # 2026-09-04 in the account's CloudTrail, when a role trusting only the plain
+    # spelling refused the first run), so the role names both spellings.
     environment: acceptance
 
     permissions:
@@ -144,25 +150,31 @@ jobs:
       # THE JOB THE RUN IS WAITING FOR. `billet acceptance` deliberately does not
       # dispatch one — deciding which workflow to run is the operator's, and a
       # command that dispatched one would need write access to a repository for no
-      # reason. Here that operator is the three steps below.
+      # reason. Here that operator is the four steps below.
       #
-      # THE CREDENTIAL THAT DISPATCHES IT IS MINTED HERE, FROM THE APP KEY THE RUN
-      # ALREADY HOLDS, and it is nobody's personal token. The acceptance App is
-      # installed on the guide repository alone and holds `actions: write` there;
-      # the installation token is narrowed further at minting to that one
-      # repository and that one permission, and is revoked by the step after the
-      # dispatch, the only step that needs it. A revocation GitHub refuses makes
-      # the job red; a job cancelled or a runner lost before that step runs
-      # leaves the token's own hour as the bound. A
-      # fine-grained personal access token would do the same job as a credential
-      # tied to a person, expiring on a date nobody watches, passing through a
-      # clipboard on its way into the secret; this passes through nothing.
+      # THE CREDENTIAL THAT DISPATCHES IT IS MINTED HERE, FROM A SECOND APP'S KEY,
+      # and it is nobody's personal token. It cannot be the acceptance App's key:
+      # `billet check` refuses an App whose installation holds a permission billet
+      # never requested (measured 2026-09-04, when the runner App briefly held
+      # `actions: write` and every rehearsal's `billet local up` refused it), and
+      # that refusal is the credential-isolation claim, not a nuisance. So a
+      # dedicated dispatch App is installed on the guide repository alone with
+      # `actions: write` and the mandatory `metadata: read`, registers no runners,
+      # and its key is BILLET_ACCEPTANCE_DISPATCH_APP_KEY. The installation token
+      # is narrowed further at minting to that one repository and that one
+      # permission, and is revoked by the step after the dispatch, the only step
+      # that needs it. A revocation GitHub refuses makes the job red; a job
+      # cancelled or a runner lost before that step runs leaves the token's own
+      # hour as the bound. A fine-grained personal access token would do the same
+      # job as a credential tied to a person, expiring on a date nobody watches,
+      # passing through a clipboard on its way into the secret; this passes
+      # through nothing.
       - name: Name the repository the acceptance workflow runs in
         id: target
         env:
           BILLET_ACCEPTANCE_WORKFLOW: ${{ vars.BILLET_ACCEPTANCE_WORKFLOW }}
           BILLET_ACCEPTANCE_REPO: ${{ vars.BILLET_ACCEPTANCE_REPO }}
-          BILLET_ACCEPTANCE_APP_CLIENT_ID: ${{ vars.BILLET_ACCEPTANCE_APP_CLIENT_ID }}
+          BILLET_ACCEPTANCE_DISPATCH_APP_CLIENT_ID: ${{ vars.BILLET_ACCEPTANCE_DISPATCH_APP_CLIENT_ID }}
         run: |
           set -eu
 
@@ -173,9 +185,9 @@ jobs:
             exit 1
           fi
 
-          if [ -z "${BILLET_ACCEPTANCE_APP_CLIENT_ID:-}" ]; then
-            echo "::error::BILLET_ACCEPTANCE_APP_CLIENT_ID must be the acceptance App's client id;" >&2
-            echo "it is what the App key below signs for when the dispatch token is minted." >&2
+          if [ -z "${BILLET_ACCEPTANCE_DISPATCH_APP_CLIENT_ID:-}" ]; then
+            echo "::error::BILLET_ACCEPTANCE_DISPATCH_APP_CLIENT_ID must be the dispatch App's client id;" >&2
+            echo "it is what BILLET_ACCEPTANCE_DISPATCH_APP_KEY signs for when the dispatch token is minted." >&2
             exit 1
           fi
 
@@ -226,8 +238,8 @@ jobs:
         id: dispatch-token
         uses: actions/create-github-app-token@v3
         with:
-          client-id: ${{ vars.BILLET_ACCEPTANCE_APP_CLIENT_ID }}
-          private-key: ${{ secrets.BILLET_ACCEPTANCE_APP_KEY }}
+          client-id: ${{ vars.BILLET_ACCEPTANCE_DISPATCH_APP_CLIENT_ID }}
+          private-key: ${{ secrets.BILLET_ACCEPTANCE_DISPATCH_APP_KEY }}
           owner: ${{ steps.target.outputs.owner }}
           repositories: ${{ steps.target.outputs.name }}
           permission-actions: write
@@ -235,12 +247,30 @@ jobs:
           # post-job revocation only warns when it fails, so it is not relied on.
           skip-token-revoke: true
 
+      # REST, NOT `gh workflow run`. Without `--ref`, gh asks GraphQL for the
+      # repository's default branch, and that query needs `contents: read`, which
+      # this token deliberately lacks: the second run of this lane failed there
+      # with `Resource not accessible by integration (repository.defaultBranchRef)`
+      # (2026-09-04). The REST repository object answers the default branch
+      # under `metadata: read`, and the dispatch endpoint needs `actions: write`,
+      # so the token stays at those two.
       - name: Dispatch the acceptance workflow
         env:
           GH_TOKEN: ${{ steps.dispatch-token.outputs.token }}
           BILLET_ACCEPTANCE_WORKFLOW: ${{ vars.BILLET_ACCEPTANCE_WORKFLOW }}
           BILLET_ACCEPTANCE_REPO: ${{ vars.BILLET_ACCEPTANCE_REPO }}
-        run: gh workflow run "$BILLET_ACCEPTANCE_WORKFLOW" --repo "$BILLET_ACCEPTANCE_REPO"
+        run: |
+          set -eu
+
+          default_branch=$(gh api "repos/$BILLET_ACCEPTANCE_REPO" --jq .default_branch)
+          if [ -z "$default_branch" ]; then
+            echo "::error::could not read the default branch of $BILLET_ACCEPTANCE_REPO." >&2
+            exit 1
+          fi
+
+          gh api -X POST "repos/$BILLET_ACCEPTANCE_REPO/actions/workflows/$BILLET_ACCEPTANCE_WORKFLOW/dispatches" \
+            -f "ref=$default_branch"
+          echo "dispatched $BILLET_ACCEPTANCE_WORKFLOW on $BILLET_ACCEPTANCE_REPO@$default_branch"
 
       # REVOKED THE MOMENT IT HAS DONE ITS ONE JOB, whether or not the dispatch
       # succeeded, and the revocation is PROVED: GitHub answers 204 for a revoked

@@ -72,10 +72,20 @@ started_at=$(date -u +%s)
 cleanup() {
     status=$?
     set +e
+    # IGNORED, NOT RESET: a second Ctrl-C or a TERM during the teardown must not
+    # end the shell before the scale set and the hosts are gone. The status the
+    # first signal chose (130 or 143) is already in ${status}.
+    trap '' INT TERM
+    status=$(rehearsal_verdict "${status}")
 
     echo
     echo "=== teardown"
-    if docker exec "${controller}" test -f /etc/billet/billet.yaml >/dev/null 2>&1; then
+    # BY EVIDENCE, NOT BY PROBE. A scale set can exist from the moment the
+    # control plane was asked to start, and that moment is recorded below rather
+    # than inferred here: a probe of the controller that fails because docker or
+    # the container is gone is "could not tell", and reading it as "nothing to
+    # tear down" is how a green run leaves a scale set behind.
+    if [ "${plane_started}" = yes ]; then
         if ! rehearsal_teardown_scale_sets "${controller}"; then
             echo "TEARDOWN FAILED: the scale set for ${label} may still exist. Remove it from any host" >&2
             echo "holding this App: billet teardown --tier ${label} --yes --config <that config>" >&2
@@ -95,7 +105,15 @@ cleanup() {
     rm -rf "${work}" || true
     exit "${status}"
 }
-trap cleanup EXIT INT TERM
+# THE SENTINEL STARTS AT 0 HERE, whatever the environment says, or an exported
+# REHEARSAL_PASSED=1 would turn an aborted run green. A signal exits through its
+# own status so that cleanup, which only the EXIT trap runs, reads a failure and
+# not the $? of whatever the signal interrupted.
+REHEARSAL_PASSED=0
+plane_started=no
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap cleanup EXIT
 
 rehearsal_step "fetch and verify both releases"
 rehearsal_fetch_release "${FROM}" "${work}/from"
@@ -161,6 +179,7 @@ rehearsal_install_bundle "${node}" "${work}/bundle"
 
 rehearsal_step "billet local up on both, controller first"
 since=$(rehearsal_clock "${controller}")
+plane_started=yes
 docker exec "${controller}" /usr/bin/billet local up --config /etc/billet/billet.yaml 2>&1 | tail -6
 docker exec "${node}" /usr/bin/billet local up --config /etc/billet/billet.yaml 2>&1 | tail -6
 
@@ -281,3 +300,6 @@ rehearsal_as_billet "${controller}" /usr/bin/billet rollout abort \
 echo
 echo "rollout rehearsal: PASSED"
 echo "  ${FROM} -> ${TO} on ${REHEARSAL_ARCH}; controller upgrade ${controller_upgrade_took}s (timer: ${controller_has_timer}); node converged ${node_upgrade_took}s after the controller; rollback ${rollback_took}s; total $(($(date -u +%s) - started_at))s"
+# THE LAST STATEMENT, after every line of output: a signal landing before this
+# still fails the run.
+REHEARSAL_PASSED=1

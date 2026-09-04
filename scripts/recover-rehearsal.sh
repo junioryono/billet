@@ -39,10 +39,20 @@ started_at=$(date -u +%s)
 cleanup() {
     status=$?
     set +e
+    # IGNORED, NOT RESET: a second Ctrl-C or a TERM during the teardown must not
+    # end the shell before the scale set and the hosts are gone. The status the
+    # first signal chose (130 or 143) is already in ${status}.
+    trap '' INT TERM
+    status=$(rehearsal_verdict "${status}")
 
     echo
     echo "=== teardown"
-    if docker exec "${controller}" test -f /etc/billet/billet.yaml >/dev/null 2>&1; then
+    # BY EVIDENCE, NOT BY PROBE. A scale set can exist from the moment the
+    # control plane was asked to start, and that moment is recorded below rather
+    # than inferred here: a probe of the controller that fails because docker or
+    # the container is gone is "could not tell", and reading it as "nothing to
+    # tear down" is how a green run leaves a scale set behind.
+    if [ "${plane_started}" = yes ]; then
         if ! rehearsal_teardown_scale_sets "${controller}"; then
             echo "TEARDOWN FAILED: the scale set for ${label} may still exist. Remove it from any host" >&2
             echo "holding this App: billet teardown --tier ${label} --yes --config <that config>" >&2
@@ -61,7 +71,15 @@ cleanup() {
     rm -rf "${work}" || true
     exit "${status}"
 }
-trap cleanup EXIT INT TERM
+# THE SENTINEL STARTS AT 0 HERE, whatever the environment says, or an exported
+# REHEARSAL_PASSED=1 would turn an aborted run green. A signal exits through its
+# own status so that cleanup, which only the EXIT trap runs, reads a failure and
+# not the $? of whatever the signal interrupted.
+REHEARSAL_PASSED=0
+plane_started=no
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap cleanup EXIT
 
 rehearsal_step "two packaged hosts on the tree's own package"
 docker network create "${network}" >/dev/null
@@ -79,6 +97,14 @@ server:
   state_dir: /var/lib/billet/server
   max_vcpu: 8
   max_memory: 16GiB
+# NOT ON AUTOMATIC UPDATES. This is the tree's own snapshot build, which reports
+# a release the stable channel is not on, so the starter opened a rollout to the
+# channel within a minute of boot (measured 2026-09-04) and the packaged root
+# timer then fenced the ledger for its host transaction, refusing the very
+# `local down` this rehearsal is about. The rollout rehearsal is the one that
+# wants the default.
+release:
+  automatic: false
 EOF
     rehearsal_github_block
     cat <<EOF
@@ -111,6 +137,7 @@ rehearsal_issue_bundle "${controller}" "${node}" "${work}/bundle"
 rehearsal_install_bundle "${node}" "${work}/bundle"
 
 since=$(rehearsal_clock "${controller}")
+plane_started=yes
 docker exec "${controller}" /usr/bin/billet local up --config /etc/billet/billet.yaml 2>&1 | tail -6
 docker exec "${node}" /usr/bin/billet local up --config /etc/billet/billet.yaml 2>&1 | tail -6
 rehearsal_wait_registered 120 "${controller}" "${node}" "${since}" ||
@@ -194,3 +221,6 @@ fi
 echo
 echo "recover rehearsal: PASSED"
 echo "  package $(rehearsal_version "${controller}") on ${REHEARSAL_ARCH}; superseded ledger kept at ${superseded}; total $(($(date -u +%s) - started_at))s"
+# THE LAST STATEMENT, after every line of output: a signal landing before this
+# still fails the run.
+REHEARSAL_PASSED=1
