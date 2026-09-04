@@ -11,9 +11,10 @@ warning it would refuse and re-queue (the poison-ack churn the README warns abou
 
 ERROR CLASSIFICATION MATTERS because the warning has a ~2-minute life, so the only
 thing that may consume one SILENTLY is a positive proof it is not this router's to
-place: no tag, an instance already reclaimed, a tag that cannot name a queue, or a
-tag naming a queue other than the one this router serves
-(BILLET_INTERRUPTION_QUEUE_NAME, set by the module to the queue it created). Everything else is a could-not-tell and is re-raised, so
+place: an instance that is present and carries no tag, an instance EC2 says is
+already gone, a tag that cannot name a queue, or a tag naming a queue other than
+the one this router serves (BILLET_INTERRUPTION_QUEUE_NAME, set by the module to
+the queue it created). Everything else is a could-not-tell and is re-raised, so
 Lambda retries and the failure appears on the function's Errors metric — where the
 module's alarm reports it — rather than a real warning disappearing.
 
@@ -56,12 +57,16 @@ _sqs = boto3.client("sqs")
 def handler(event, _context):
     instance_id = event.get("detail", {}).get("instance-id")
     if not instance_id:
-        print("event has no instance-id; dropping")
-        return
+        # NOT a drop. Every interruption warning carries the instance id, and the
+        # rule that invokes this delivers nothing else, so an event without one is a
+        # shape this router cannot read rather than a warning it can prove is not
+        # its own. Raising makes an EventBridge or AWS schema change an alarm
+        # instead of every warning in the account quietly disappearing.
+        raise RuntimeError("event carries no detail.instance-id; cannot route it")
 
-    node = _node_of(instance_id)  # raises on a retryable EC2 error
+    node = _node_of(instance_id)  # raises unless it can say which of the two it is
     if not node:
-        print(f"{instance_id} has no {NODE_TAG} tag; not a billet instance, dropping")
+        print(f"{instance_id} carries no {NODE_TAG} tag; not a billet instance, dropping")
         return
     if not _QUEUE_NAME.match(node):
         print(f"{instance_id} {NODE_TAG}={node!r} is not a legal queue name; dropping")
@@ -109,8 +114,11 @@ def _drop(what, err, node):
 
 
 def _node_of(instance_id):
-    """Return the instance's sh.billet.node tag value, or None if it has none or
-    the instance is already gone. Re-raises a retryable EC2 error."""
+    """Return the instance's sh.billet.node tag value, or None on one of the two
+    proofs that there is nothing of billet's to route: the instance is PRESENT and
+    carries no such tag, or EC2 says it no longer exists. An answer that holds
+    neither — a retryable error, or a success that does not contain the instance
+    this call named — is a could-not-tell and raises."""
     try:
         described = _ec2.describe_instances(InstanceIds=[instance_id])
     except ClientError as err:
@@ -121,9 +129,17 @@ def _node_of(instance_id):
             return None
         raise  # throttling / service error — let Lambda retry
 
+    # The call named exactly this instance, so anything in the answer is it.
     for reservation in described.get("Reservations", []):
         for instance in reservation.get("Instances", []):
             for tag in instance.get("Tags", []):
                 if tag.get("Key") == NODE_TAG:
                     return tag.get("Value")
-    return None
+            return None  # present, and carrying no billet tag: not billet's
+
+    # An empty answer is a THIRD state, and collapsing it into "no tag" would drop a
+    # warning for an instance that may well be billet's. A retry either finds the
+    # instance or is told it is gone, and both of those are answers.
+    raise RuntimeError(
+        f"describe_instances({instance_id}) returned no instance and no error; "
+        f"cannot tell whether it is billet's")

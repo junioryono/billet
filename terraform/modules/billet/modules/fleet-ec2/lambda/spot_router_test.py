@@ -92,14 +92,32 @@ class SpotRouterTest(unittest.TestCase):
         # The forwarded body is the ORIGINAL event the node parses.
         self.assertEqual(json.loads(kwargs["MessageBody"]), event)
 
-    def test_drops_an_untagged_instance(self):
+    def test_drops_an_instance_that_is_present_and_untagged(self):
         _ec2.describe_instances.return_value = _tagged(None)
         spot_router.handler(_warning(), None)
         _sqs.get_queue_url.assert_not_called()
         _sqs.send_message.assert_not_called()
 
-    def test_drops_an_event_without_instance_id(self):
-        spot_router.handler({"detail": {}}, None)
+    # AN ANSWER THAT HOLDS NEITHER PROOF IS NOT "no tag". The call names one
+    # instance, so a success that does not contain it is a third state; collapsing
+    # it into untagged would drop a warning for an instance that may be billet's,
+    # where a retry gets either the instance or InvalidInstanceID.NotFound.
+    def test_reraises_when_the_answer_holds_no_instance(self):
+        for answer in ({}, {"Reservations": []}, {"Reservations": [{"Instances": []}]}):
+            with self.subTest(answer=answer):
+                _sqs.reset_mock(side_effect=True, return_value=True)
+                _ec2.describe_instances.return_value = answer
+                with self.assertRaises(RuntimeError):
+                    spot_router.handler(_warning(), None)
+                _sqs.get_queue_url.assert_not_called()
+
+    # An interruption warning always carries the instance id, and the rule that
+    # invokes this router delivers nothing else — so an event without one is a shape
+    # this router cannot read, not a warning it has proved is not its own. Dropping
+    # it would turn a changed event shape into every warning quietly disappearing.
+    def test_reraises_an_event_without_an_instance_id(self):
+        with self.assertRaises(RuntimeError):
+            spot_router.handler({"detail": {}}, None)
         _ec2.describe_instances.assert_not_called()
         _sqs.send_message.assert_not_called()
 
@@ -204,6 +222,18 @@ class SpotRouterTest(unittest.TestCase):
         _sqs.get_queue_url.side_effect = _ClientError("AccessDenied")
         with self.assertRaises(_ClientError):
             spot_router.handler(_warning(), None)
+
+    # ...and losing the name costs only the ability to CLASSIFY a failure. A router
+    # whose environment went missing still places every warning it can, because
+    # refusing to forward one it could have delivered would lose it for certain.
+    def test_forwards_even_when_no_queue_is_configured(self):
+        self._serve(None)
+        _ec2.describe_instances.return_value = _tagged(OWN_QUEUE)
+        _sqs.get_queue_url.return_value = {"QueueUrl": "https://sqs/q"}
+
+        spot_router.handler(_warning(), None)
+
+        self.assertEqual(_sqs.send_message.call_args.kwargs["QueueUrl"], "https://sqs/q")
 
     def test_queue_name_regex_boundaries(self):
         self.assertTrue(spot_router._QUEUE_NAME.match("a"))
