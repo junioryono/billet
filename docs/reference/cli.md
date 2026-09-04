@@ -101,7 +101,7 @@ Publish an existing App private key into a store-backed deployment (`server.iden
 
 ### `billet check`
 
-Validate the config and the state directory, prove the App key signs a JWT GitHub accepts and the App is installed with exactly the requested permissions, check every trusted tier's runner group, and report registered nodes, images, backups and cloud cost peaks. Works while the control plane is running.
+Validate the config and the state directory, prove the App key signs a JWT GitHub accepts and the App is installed with exactly the requested permissions, check every trusted tier's runner group, say what this node's guests will get from the site's store, and report registered nodes, images, backups and cloud cost peaks. Works while the control plane is running. A node carrying `node.ebs_s3` with no `node.cache` listener fails the check: that store backs nothing else, so every job would run on the instance's root volume and publish nothing.
 
 | Flag | Meaning |
 |---|---|
