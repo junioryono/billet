@@ -76,6 +76,10 @@ type LeaseStore interface {
 		vcpu int, memory config.ByteSize) error
 	Release(ctx context.Context, leaseID string, epoch int64, outcome alloc.Phase) error
 	Lease(ctx context.Context, leaseID string) (*alloc.Lease, error)
+	// RecordCacheObservation writes what the node saw the cache do for a lease's
+	// job, from alloc's closed vocabularies, fenced on the epoch.
+	RecordCacheObservation(ctx context.Context, leaseID string, epoch int64,
+		obs alloc.CacheObservation) error
 	// MarkDeregistered records that a lease's GitHub runner registration has been
 	// removed, so ActiveRunnerLeases stops counting it as a live runner. It is
 	// monotonic and unfenced; deregistration is a fact about GitHub, not about who
@@ -277,6 +281,7 @@ func Handler(log *slog.Logger, p *Plane, store LeaseStore, jit JITSource, opts .
 	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/heartbeat", h.forOwnLease(h.heartbeat))
 	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/failure", h.forOwnLease(h.markFailure))
 	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/resize", h.forOwnLease(h.resize))
+	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/cache", h.forOwnLease(h.cacheObservation))
 	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/release", h.forOwnLease(h.release))
 	mux.HandleFunc("GET /v1/nodes/{node}/leases/{lease}", h.forOwnLease(h.lease))
 	mux.HandleFunc("GET /v1/nodes/{node}/launched", h.forNewWork(h.launched))
@@ -1435,6 +1440,37 @@ func (h *handler) release(w http.ResponseWriter, r *http.Request) {
 	// THE OWNERSHIP RECORD ENDS WITH THE LEASE. Kept only while somebody might
 	// still need to prove they hold it.
 	h.plane.ForgetLease(r.PathValue("node"), r.PathValue("lease"))
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// cacheObservation records what the node saw the cache do for a lease's job.
+//
+// THE VOCABULARY IS CHECKED AT THE BOUNDARY, the way a phase is, so a token this
+// control plane does not record is refused as such rather than surfacing from
+// the ledger as a validation error the node would read as transient.
+func (h *handler) cacheObservation(w http.ResponseWriter, r *http.Request) {
+	var req nodeapi.CacheObservationRequest
+	if !decode(w, r, &req) {
+		return
+	}
+
+	obs := alloc.CacheObservation{
+		ImageCache:      alloc.ImageCache(req.ImageCache),
+		CacheGeneration: req.CacheGeneration,
+		ActionsCache:    alloc.ActionsCache(req.ActionsCache),
+	}
+	if err := obs.Validate(); err != nil {
+		writeErr(w, http.StatusBadRequest, nodeapi.CodeRefused, err.Error())
+
+		return
+	}
+
+	if err := h.store.RecordCacheObservation(r.Context(), r.PathValue("lease"), req.Epoch, obs); err != nil {
+		writeStoreErr(w, err)
+
+		return
+	}
 
 	w.WriteHeader(http.StatusNoContent)
 }

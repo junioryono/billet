@@ -41,13 +41,20 @@ SELECT epoch FROM leases WHERE id = @id;
 -- for the SHAPE placement bought rather than the smaller tier request, and a
 -- fallback resizes the charge; the immutable request is what a later shape is
 -- checked against.
+--
+-- THE PRICE IS THE SHAPE'S PRICE AT THE MOMENT IT IS CHARGED, in millionths of
+-- a dollar, and the site is the placed host's registered site. Both are written
+-- here rather than read back later because a node may re-register with a new
+-- catalogue while this lease is open, and the history a terminalization copies
+-- has to say what the deployment bought, not what it would pay today. Zero is a
+-- host-backed lease, which buys nothing.
 INSERT INTO leases
    (id, tier, node, target_node, macos_slot, guest_os, providers, phase, vcpu, memory,
-    requested_vcpu, requested_memory, instance_type, epoch, created_at, heartbeat_at,
-    expires_at)
+    requested_vcpu, requested_memory, instance_type, site, price_micros_per_hour,
+    epoch, created_at, heartbeat_at, expires_at)
 VALUES (@id, @tier, NULL, @target_node, @macos_slot, @guest_os, @providers, @phase,
-        @vcpu, @memory, @requested_vcpu, @requested_memory, @instance_type, 0,
-        @created_at, @heartbeat_at, @expires_at);
+        @vcpu, @memory, @requested_vcpu, @requested_memory, @instance_type, @site,
+        @price_micros_per_hour, 0, @created_at, @heartbeat_at, @expires_at);
 
 -- name: AssignLease :exec
 -- Bind an escrowed lease to a GitHub job and refresh its TTL.
@@ -76,7 +83,11 @@ UPDATE leases SET node = @node, chosen_provider = @chosen_provider,
 -- A LATER FALLBACK IS A NEW PURCHASE DECISION, so its larger resource vector must
 -- fit before the launch request is allowed onto the wire -- never reconciled
 -- afterwards.
-UPDATE leases SET vcpu = @vcpu, memory = @memory, instance_type = @instance_type
+--
+-- THE PRICE MOVES WITH THE SHAPE: a fallback is a different purchase at a
+-- different rate, and the history records what was bought.
+UPDATE leases SET vcpu = @vcpu, memory = @memory, instance_type = @instance_type,
+       price_micros_per_hour = @price_micros_per_hour
  WHERE id = @id AND epoch = @epoch;
 
 -- name: HeartbeatLease :exec
@@ -160,8 +171,14 @@ UPDATE leases
 -- QUARANTINE IS EXCLUDED because it is already past this line: its compute is
 -- unconfirmed and its capacity stays charged until something proves otherwise, so
 -- reaping it again would be the reaper deciding a question only evidence settles.
-SELECT id, tier, node, target_node, macos_slot, phase, vcpu, memory,
-       requested_vcpu, requested_memory, instance_type, held_at, force_release,
+--
+-- EVERYTHING THE ARCHIVE COPIES IS SELECTED, chosen_provider included. The
+-- reaper terminalizes an expired escrow outright and archives it from this row,
+-- and a projection that left the provider out archived every reaped lease as
+-- having run on nothing.
+SELECT id, tier, node, target_node, macos_slot, chosen_provider, phase, vcpu, memory,
+       requested_vcpu, requested_memory, instance_type, site, price_micros_per_hour,
+       image_cache, cache_generation, actions_cache, held_at, force_release,
        holder_incarnation, failure_reason, disruption, disrupted_at, epoch, run_id,
        request_id
   FROM leases
@@ -172,7 +189,8 @@ SELECT id, tier, node, target_node, macos_slot, phase, vcpu, memory,
 -- name: ReadLease :one
 -- One lease, whatever phase it is in.
 SELECT id, tier, node, target_node, macos_slot, guest_os, providers, chosen_provider,
-       phase, vcpu, memory, requested_vcpu, requested_memory, instance_type,
+       phase, vcpu, memory, requested_vcpu, requested_memory, instance_type, site,
+       price_micros_per_hour, image_cache, cache_generation, actions_cache,
        held_at, force_release, holder_incarnation, failure_reason, disruption,
        disrupted_at, epoch, run_id, request_id
   FROM leases WHERE id = @id;

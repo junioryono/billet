@@ -298,7 +298,10 @@ func (stubStore) Resize(context.Context, string, int64, string, int, config.Byte
 	return nil
 }
 func (stubStore) Release(context.Context, string, int64, alloc.Phase) error { return nil }
-func (stubStore) Lease(context.Context, string) (*alloc.Lease, error)       { return nil, nil }
+func (stubStore) RecordCacheObservation(context.Context, string, int64, alloc.CacheObservation) error {
+	return nil
+}
+func (stubStore) Lease(context.Context, string) (*alloc.Lease, error) { return nil, nil }
 func (stubStore) QuarantinedLeaseIDs(context.Context, string) (map[string]bool, error) {
 	return map[string]bool{}, nil
 }

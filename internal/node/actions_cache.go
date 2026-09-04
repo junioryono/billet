@@ -23,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/provider"
 	storecontract "github.com/junioryono/billet/internal/store"
 )
@@ -161,7 +162,15 @@ func (s *CacheService) actionsResponse(
 	req *http.Request,
 	session *cacheSession,
 ) (*http.Response, bool, error) {
+	// A CacheService call is what the observation is about. The blob legs that
+	// follow a served call, and everything on the artifact side, are not.
+	cacheCall := actionsCacheCall(req)
+
 	if !actionsLocalRequest(req) {
+		if cacheCall {
+			s.observeActions(req.Context(), session, alloc.ActionsCacheSpliced)
+		}
+
 		return nil, false, nil
 	}
 
@@ -169,6 +178,10 @@ func (s *CacheService) actionsResponse(
 	// remains authoritative for untrusted-pool cache traffic; Billet does not
 	// derive storage authority from the assignment that caused scale-up.
 	if session.trust != provider.TrustTrusted || s.actionRule == nil {
+		if cacheCall {
+			s.observeActions(req.Context(), session, alloc.ActionsCacheSpliced)
+		}
+
 		return nil, false, nil
 	}
 	policyCtx, cancel := context.WithTimeout(req.Context(), actionsPolicyLimit)
@@ -179,11 +192,21 @@ func (s *CacheService) actionsResponse(
 		s.log.Warn("Actions cache policy is unavailable",
 			"instance", session.instance, "owner", session.owner,
 			"repository", session.repository, "error", policyErr)
+		if cacheCall {
+			s.observeActions(req.Context(), session, alloc.ActionsCacheSpliced)
+		}
 
 		return nil, false, nil
 	}
 	if !allowed {
+		if cacheCall {
+			s.observeActions(req.Context(), session, alloc.ActionsCacheDisabled)
+		}
+
 		return nil, false, nil
+	}
+	if cacheCall {
+		s.observeActions(req.Context(), session, alloc.ActionsCacheServed)
 	}
 	// Resolved once, from the request, and checked there: a signed URL must name
 	// an origin this client can reach without TLS, and only the request says
@@ -204,6 +227,37 @@ func (s *CacheService) actionsResponse(
 		response, err := s.serveActionsBlob(req, session)
 		return response, true, err
 	}
+}
+
+// actionsCacheCall reports whether a request is one of the three CacheService
+// calls billet serves, whoever sent it.
+func actionsCacheCall(req *http.Request) bool {
+	if req.URL.RawPath != "" {
+		return false
+	}
+
+	switch req.URL.Path {
+	case actionsCreatePath, actionsFinalizePath, actionsDownloadPath:
+		return true
+	default:
+		return false
+	}
+}
+
+// observeActions records what interception did for a CacheService call.
+//
+// TAKES THE SESSION LOCK ITSELF, briefly, before the handlers below take it
+// for the work: the observation is decided by then, and holding the lock across
+// the report would hold it across a plane round trip inside every cache call.
+func (s *CacheService) observeActions(
+	ctx context.Context, session *cacheSession, outcome alloc.ActionsCache,
+) {
+	if err := lockCacheSession(ctx, session); err != nil {
+		return
+	}
+	defer session.mu.Unlock()
+
+	s.observe(ctx, session, alloc.CacheObservation{ActionsCache: outcome})
 }
 
 func actionsLocalRequest(req *http.Request) bool {

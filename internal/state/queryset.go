@@ -135,6 +135,7 @@ type ReadOps interface {
 	ReadJobConclusion(ctx context.Context, leaseID string) (sql.NullString, error)
 	ReadJobFailureReason(ctx context.Context, leaseID string) (string, error)
 	ReadJobNode(ctx context.Context, leaseID string) (sql.NullString, error)
+	ReadJobPlacement(ctx context.Context, leaseID string) (ledgerdb.ReadJobPlacementRow, error)
 	ReadJobIdentity(ctx context.Context, jobID string) (int64, error)
 	ReadJobResult(ctx context.Context, leaseID string) (string, error)
 	ReadJobStarted(ctx context.Context, leaseID string) (bool, error)
@@ -226,6 +227,7 @@ type WriteOps interface {
 	RecordCredentialSweep(ctx context.Context, arg ledgerdb.RecordCredentialSweepParams) error
 	RefreshLeaseHolder(ctx context.Context, arg ledgerdb.RefreshLeaseHolderParams) error
 	RecordBarrierRun(ctx context.Context, arg ledgerdb.RecordBarrierRunParams) error
+	RecordHistoryCacheObservation(ctx context.Context, arg ledgerdb.RecordHistoryCacheObservationParams) error
 	RecordHistoryDisruption(ctx context.Context, arg ledgerdb.RecordHistoryDisruptionParams) error
 	RecordIssuedCert(ctx context.Context, arg ledgerdb.RecordIssuedCertParams) error
 	RecordJobAssignment(ctx context.Context, arg ledgerdb.RecordJobAssignmentParams) error
@@ -234,6 +236,7 @@ type WriteOps interface {
 	RecordJobStart(ctx context.Context, arg ledgerdb.RecordJobStartParams) error
 	BackfillFailureReason(ctx context.Context, arg ledgerdb.BackfillFailureReasonParams) error
 	BackfillLeaseFailureReason(ctx context.Context, arg ledgerdb.BackfillLeaseFailureReasonParams) error
+	RecordLeaseCacheObservation(ctx context.Context, arg ledgerdb.RecordLeaseCacheObservationParams) error
 	RecordLeaseDisruption(ctx context.Context, arg ledgerdb.RecordLeaseDisruptionParams) error
 	RecordMigration(ctx context.Context, arg ledgerdb.RecordMigrationParams) error
 	RecordNodeRevocation(ctx context.Context, arg ledgerdb.RecordNodeRevocationParams) error

@@ -152,6 +152,18 @@ import (
 // node negotiated below this simply stops as before, because an older control
 // plane answers the route with a bare 404 and a node that sent anyway would log
 // a decode failure on every clean stop. MinVersion does not move.
+//
+// VERSION 20 LETS A NODE RECORD WHAT THE CACHE DID FOR A JOB: whether the
+// guest's image store was cloned warm and from which generation, and whether the
+// Actions cache served locally, spliced upstream or was refused by the kill
+// switch. It is an OBSERVATION written onto the lease and its history from a
+// closed vocabulary, and it decides nothing about capacity, fencing, identity,
+// custody or destruction, so it is REPORTED rather than refused: a node
+// negotiated below this sends nothing and the row stays unknown, which is what
+// every job recorded before the column existed already reads as. ADDITIVE, and
+// checked where it is EMITTED, because an older control plane answers the route
+// with a bare 404 and a node that sent anyway would log a decode failure on
+// every cache request. MinVersion does not move.
 const (
 	// MinVersion is the oldest wire this build still speaks.
 	//
@@ -164,7 +176,7 @@ const (
 	MinVersion = 12
 
 	// Version is the newest wire this build speaks, and the one it prefers.
-	Version = 19
+	Version = 20
 
 	// VersionNodeRelease is the version from which a registration names the
 	// node's release.
@@ -261,6 +273,15 @@ const (
 	// silence — which is the behaviour this version exists to shorten, not to
 	// remove.
 	VersionNodeWithdrawal = 19
+
+	// VersionCacheObservation is the version from which a node can record what
+	// the cache did for a job.
+	//
+	// CHECKED WHERE THE MESSAGE IS SENT, like VersionNodeWithdrawal and for the
+	// same reason: below it the route does not exist and an older control plane
+	// answers a bare 404. What is lost on an older pairing is one diagnostic
+	// column, never a decision, so nothing is refused for it.
+	VersionCacheObservation = 20
 )
 
 // Range is the span of wire versions a build speaks, inclusive at both ends.

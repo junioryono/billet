@@ -13,9 +13,13 @@ import (
 const archiveJobHistory = `-- name: ArchiveJobHistory :exec
 INSERT INTO job_history
      (lease_id, tier, node, run_id, request_id, conclusion, failure_reason,
-      disruption, disrupted_at, queued_at, finished_at)
+      disruption, disrupted_at, chosen_provider, instance_type, vcpu, memory, site,
+      price_micros_per_hour, image_cache, cache_generation, actions_cache,
+      queued_at, finished_at)
 VALUES ($1, $2, $3, $4, $5, $6, $7,
-        $8, $9, $10, $11)
+        $8, $9, $10, $11, $12, $13,
+        $14, $15, $16, $17,
+        $18, $19, $20)
 ON CONFLICT (lease_id) DO UPDATE SET
   conclusion     = excluded.conclusion,
   failure_reason = excluded.failure_reason,
@@ -26,21 +30,42 @@ ON CONFLICT (lease_id) DO UPDATE SET
   disruption     = CASE WHEN excluded.disruption != ''
                         THEN excluded.disruption ELSE job_history.disruption END,
   disrupted_at   = CASE WHEN excluded.disruption != ''
-                        THEN excluded.disrupted_at ELSE job_history.disrupted_at END
+                        THEN excluded.disrupted_at ELSE job_history.disrupted_at END,
+  chosen_provider       = excluded.chosen_provider,
+  instance_type         = excluded.instance_type,
+  vcpu                  = excluded.vcpu,
+  memory                = excluded.memory,
+  site                  = excluded.site,
+  price_micros_per_hour = excluded.price_micros_per_hour,
+  image_cache      = CASE WHEN excluded.image_cache != ''
+                          THEN excluded.image_cache ELSE job_history.image_cache END,
+  cache_generation = CASE WHEN excluded.image_cache != ''
+                          THEN excluded.cache_generation ELSE job_history.cache_generation END,
+  actions_cache    = CASE WHEN excluded.actions_cache != ''
+                          THEN excluded.actions_cache ELSE job_history.actions_cache END
 `
 
 type ArchiveJobHistoryParams struct {
-	LeaseID       string
-	Tier          string
-	Node          sql.NullString
-	RunID         sql.NullInt64
-	RequestID     sql.NullInt64
-	Conclusion    sql.NullString
-	FailureReason string
-	Disruption    string
-	DisruptedAt   string
-	QueuedAt      string
-	FinishedAt    sql.NullString
+	LeaseID            string
+	Tier               string
+	Node               sql.NullString
+	RunID              sql.NullInt64
+	RequestID          sql.NullInt64
+	Conclusion         sql.NullString
+	FailureReason      string
+	Disruption         string
+	DisruptedAt        string
+	ChosenProvider     string
+	InstanceType       string
+	Vcpu               int64
+	Memory             int64
+	Site               string
+	PriceMicrosPerHour int64
+	ImageCache         string
+	CacheGeneration    string
+	ActionsCache       string
+	QueuedAt           string
+	FinishedAt         sql.NullString
 }
 
 // Close the history row when the lease terminalizes.
@@ -53,6 +78,18 @@ type ArchiveJobHistoryParams struct {
 // the FIRST observation is the one that can still have been causal, and a
 // disruption recorded during teardown must not replace the spot interruption that
 // caused the teardown.
+//
+// THE PLACEMENT FACTS ARE THE LEASE'S TERMINAL ONES and overwrite: the backend it
+// ran on, the shape placement bought, the charged vCPU and memory, the site and
+// the price that shape was charged at were all decided on the lease row, which
+// is about to be reaped, and the history is where they survive. The price is
+// what the lease recorded when the shape was charged, never today's catalogue.
+//
+// THE CACHE OBSERVATIONS ARE WRITE-ONCE-OR-KEEP like the disruption, and for the
+// same reason: they are written onto this row the moment the node observes them,
+// and an archive arriving from a caller that did not load them must not blank an
+// observation already here. The generation moves with the image-cache token, so
+// a report never shows a generation with nothing to attribute it to.
 func (q *Queries) ArchiveJobHistory(ctx context.Context, arg ArchiveJobHistoryParams) error {
 	_, err := q.db.ExecContext(ctx, archiveJobHistory,
 		arg.LeaseID,
@@ -64,6 +101,15 @@ func (q *Queries) ArchiveJobHistory(ctx context.Context, arg ArchiveJobHistoryPa
 		arg.FailureReason,
 		arg.Disruption,
 		arg.DisruptedAt,
+		arg.ChosenProvider,
+		arg.InstanceType,
+		arg.Vcpu,
+		arg.Memory,
+		arg.Site,
+		arg.PriceMicrosPerHour,
+		arg.ImageCache,
+		arg.CacheGeneration,
+		arg.ActionsCache,
 		arg.QueuedAt,
 		arg.FinishedAt,
 	)
@@ -325,6 +371,50 @@ func (q *Queries) ReadJobNode(ctx context.Context, leaseID string) (sql.NullStri
 	var node sql.NullString
 	err := row.Scan(&node)
 	return node, err
+}
+
+const readJobPlacement = `-- name: ReadJobPlacement :one
+SELECT chosen_provider, instance_type, vcpu, memory, site, price_micros_per_hour,
+       image_cache, cache_generation, actions_cache
+  FROM job_history WHERE lease_id = $1
+`
+
+type ReadJobPlacementRow struct {
+	ChosenProvider     string
+	InstanceType       string
+	Vcpu               int64
+	Memory             int64
+	Site               string
+	PriceMicrosPerHour int64
+	ImageCache         string
+	CacheGeneration    string
+	ActionsCache       string
+}
+
+// What one lease was charged for and what the cache did, from the row that
+// outlives the lease.
+//
+// ZERO IS NOT A PRICE. A host-backed lease buys nothing, so its instance_type is
+// empty and its price is zero; a remote row written before the column existed
+// has a shape and a zero, and a reader renders that as unknown, never as $0.
+// The cache tokens are empty when nothing was observed, and a token this binary
+// does not recognise is a NEWER binary's observation, rendered verbatim rather
+// than dropped.
+func (q *Queries) ReadJobPlacement(ctx context.Context, leaseID string) (ReadJobPlacementRow, error) {
+	row := q.db.QueryRowContext(ctx, readJobPlacement, leaseID)
+	var i ReadJobPlacementRow
+	err := row.Scan(
+		&i.ChosenProvider,
+		&i.InstanceType,
+		&i.Vcpu,
+		&i.Memory,
+		&i.Site,
+		&i.PriceMicrosPerHour,
+		&i.ImageCache,
+		&i.CacheGeneration,
+		&i.ActionsCache,
+	)
+	return i, err
 }
 
 const readJobResult = `-- name: ReadJobResult :one
