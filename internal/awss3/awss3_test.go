@@ -63,14 +63,20 @@ func TestOnlyNoSuchKeyAtFourOhFourIsAbsence(t *testing.T) {
 			name: "a 404 with an empty body", status: http.StatusNotFound, body: "",
 		},
 		{
-			// THE ROOT ELEMENT DECIDES. A <Code> element inside some other
-			// document is not S3's verdict on this request, and reading one as a
-			// verdict is how a listing or a proxy's own XML gets to say that an
-			// object is absent.
-			name:   "NoSuchKey inside a document that is not an error",
+			// THE ROOT ELEMENT DECIDES, and this is the case that proves it: the
+			// <Code> here is a DIRECT child, so without pinning the root to
+			// <Error> it would be read as S3's verdict on this request. A listing
+			// or a proxy's own XML does not get to say that an object is absent.
+			name:   "NoSuchKey directly inside a document that is not an error",
 			status: http.StatusNotFound,
-			body: `<ListBucketResult><Contents><Code>NoSuchKey</Code></Contents>` +
-				`</ListBucketResult>`,
+			body:   `<ListBucketResult><Code>NoSuchKey</Code></ListBucketResult>`,
+		},
+		{
+			// And a code buried deeper in a real error document is not the
+			// document's own code either.
+			name:   "NoSuchKey nested below the error's own fields",
+			status: http.StatusNotFound,
+			body:   `<Error><Detail><Code>NoSuchKey</Code></Detail></Error>`,
 		},
 		{
 			name: "an html error page", status: http.StatusNotFound,
@@ -91,6 +97,26 @@ func TestOnlyNoSuchKeyAtFourOhFourIsAbsence(t *testing.T) {
 		{
 			name: "an empty code element", status: http.StatusNotFound,
 			body: "<Error><Code></Code><Message>something</Message></Error>",
+		},
+		{
+			// DECODE STOPS AT THE END OF THE FIRST ELEMENT, so without a check
+			// that nothing follows it, a body billet did not understand whole
+			// would be allowed to say an object is absent.
+			name: "an error document with something after it", status: http.StatusNotFound,
+			body: "<Error><Code>NoSuchKey</Code></Error><Unexpected/>",
+		},
+		{
+			// Into a string field encoding/xml keeps the LAST match, so this
+			// answered NoSuchKey while naming two codes.
+			name: "a document naming two codes", status: http.StatusNotFound,
+			body: "<Error><Code>NoSuchBucket</Code><Code>NoSuchKey</Code></Error>",
+		},
+		{
+			// A NEWLINE IS NOT A SECOND DOCUMENT. Something between billet and S3
+			// is free to add trailing whitespace, and refusing that would turn a
+			// healthy miss into a failure — the opposite mistake.
+			name: "a document with a trailing newline", status: http.StatusNotFound,
+			body: noSuchKeyDocument + "\n", code: CodeNoSuchKey, absent: true,
 		},
 		{
 			// THE STATUS IS HALF THE ANSWER. The code says what S3 thinks and the
@@ -209,6 +235,19 @@ func TestARefusalRendersTheCodeAndTheStatus(t *testing.T) {
 
 	if got := (&Refusal{Status: 301}).Error(); got != "HTTP 301" {
 		t.Errorf("Error() = %q", got)
+	}
+
+	// A NIL REFUSAL IS NOT AN ANSWER, and neither method dereferences one: both
+	// are reachable through fmt's %w on an error chain nobody built by hand, and
+	// a rendering path that panics turns a diagnostic into an outage.
+	var missing *Refusal
+
+	if got := missing.Error(); got != "s3: no refusal" {
+		t.Errorf("a nil refusal rendered %q", got)
+	}
+
+	if missing.Absent() {
+		t.Error("a nil refusal read as an absent object")
 	}
 }
 

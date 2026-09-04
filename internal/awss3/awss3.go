@@ -41,6 +41,7 @@
 package awss3
 
 import (
+	"bytes"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -147,16 +148,26 @@ func ParseRefusal(status int, body []byte) *Refusal {
 	// THE ROOT ELEMENT MUST BE <Error>. Without pinning it, a <Code> element
 	// nested in some other document — a listing, a proxy's own XML — would be
 	// read as S3's verdict on this request.
+	//
+	// AND THE CODES ARE COLLECTED RATHER THAN ASSIGNED. Into a string field,
+	// encoding/xml overwrites on each match, so `<Error><Code>a</Code>
+	// <Code>b</Code></Error>` would quietly answer `b`. A document naming two
+	// codes is one billet cannot read a single verdict out of.
 	var document struct {
 		XMLName xml.Name `xml:"Error"`
-		Code    string   `xml:"Code"`
+		Codes   []string `xml:"Code"`
 	}
 
-	if err := xml.Unmarshal(body, &document); err != nil {
+	decoder := xml.NewDecoder(bytes.NewReader(body))
+	if err := decoder.Decode(&document); err != nil {
 		return refusal
 	}
 
-	code := strings.TrimSpace(document.Code)
+	if !endsAfter(decoder) || len(document.Codes) != 1 {
+		return refusal
+	}
+
+	code := strings.TrimSpace(document.Codes[0])
 	if !codeShape.MatchString(code) {
 		return refusal
 	}
@@ -164,6 +175,31 @@ func ParseRefusal(status int, body []byte) *Refusal {
 	refusal.Code = code
 
 	return refusal
+}
+
+// endsAfter reports whether the document was the whole body.
+//
+// Decode STOPS AT THE END OF THE FIRST ELEMENT and never looks further, so
+// `<Error><Code>NoSuchKey</Code></Error><anything/>` decodes cleanly — and a body
+// billet did not understand whole would then be allowed to say that an object is
+// absent. Trailing WHITESPACE is tolerated because it carries no verdict and
+// something between billet and S3 is free to add a newline.
+func endsAfter(decoder *xml.Decoder) bool {
+	for {
+		token, err := decoder.Token()
+		if errors.Is(err, io.EOF) {
+			return true
+		}
+
+		if err != nil {
+			return false
+		}
+
+		text, ok := token.(xml.CharData)
+		if !ok || strings.TrimSpace(string(text)) != "" {
+			return false
+		}
+	}
 }
 
 // StatusOf reports the status of the S3 refusal in err's chain, or zero.
