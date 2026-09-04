@@ -52,7 +52,7 @@ module "converge" {
 
 - `non_identity@<team>.cloudflareaccess.com` is a **shared principal**: every service-token device in the account carries it. The Gateway rule is therefore the whole scope — one rule per fleet, not per token. A second fleet gets a second rule (or a second entry in this list), not a second token.
 - The token is valid for `token_duration` (a year by default) and `terraform plan` does not warn on expiry. Put the date in a calendar.
-- Rotate with `previous_client_secret_expires_at` on the token resource, **not** with `-replace`: the former mints a new secret under the same client id and keeps the old one valid until the timestamp, so the enrolment policy stays satisfied while the CI secret is updated. A replace mints a new id, rewires the policy to it in the same apply, and leaves the old token authorised for nothing before the copy can happen.
+- Rotate with the module's two rotation inputs together, **not** with `-replace`: set `client_secret_version` to the current version plus one (a fresh token is `1`; `terraform state show` has the current value) and `previous_client_secret_expires_at` to a timestamp a day or two out, apply, and Cloudflare mints a new secret under the same client id while the old one stays valid until then, so the enrolment policy stays satisfied while the CI secret is updated. Either input alone is refused: the provider itself refuses the expiry without the version (measured on v5), and a version without a window would invalidate the previous secret the moment CI needed it. A replace mints a new id, rewires the policy to it in the same apply, and leaves the old token authorised for nothing before the copy can happen — `create_before_destroy` orders that replacement, it does not give CI the overlap.
 
 ## In CI
 
@@ -86,6 +86,10 @@ for addr in "$UBUNTU_HOST_ADDR" "$CONTROL_PLANE_ADDR"; do nc -z -w 5 "$addr" 22;
 Then Ansible connects over **plain SSH** with the fleet's own CI key and **committed host-key pins** (never an `ssh-keyscan` at job time: this job authenticates the host as much as the host authenticates it). At the end, `warp-cli --accept-tos registration delete`, so a registration is not left listed until inactivity expiry.
 
 When the TCP check fails, Gateway's network log (*Logs → Network*, filter by destination) names the rule that matched. Three causes cover it: the device did not enrol (the policy is not attached to the enrolment application), the rule does not permit this destination for `non_identity@`, or the device profile's split tunnel does not include it.
+
+## Inputs of note
+
+`host_addresses` (bare IPv4 addresses), `precedence` (required, before your block rule), `team_name`, `client_secret_version` and `previous_client_secret_expires_at` (rotation, together, see above), `token_duration`.
 
 ## Outputs
 

@@ -135,9 +135,25 @@ type HybridParams struct {
 	Shapes []config.EC2InstanceType
 
 	// SSHIngressCIDRs open the controller's SSH port to the machine that runs
-	// Ansible; empty opens nothing, which is right for every route that dials
-	// out (Systems Manager, a tunnel, a WARP client).
+	// Ansible; empty opens nothing, which is right for a route that ends on the
+	// controller itself (the Systems Manager agent, a cloudflared tunnel or
+	// route running on the host). IPv4 and canonical, because the root's rule
+	// is cidr_ipv4 and AWS normalises host bits into a permanent diff.
 	SSHIngressCIDRs []string
+	// SSHKeyName is the EC2 key pair the controller launches with. Empty
+	// attaches none, and then the only way onto a fresh Canonical image is EC2
+	// Instance Connect, which the runbook spells out; with a key, Ansible's
+	// ordinary SSH works the moment the instance answers.
+	SSHKeyName string
+	// LocalAnsibleUser is the account Ansible connects to the Firecracker host
+	// as. Empty writes none, leaving the operator's SSH configuration to say:
+	// owned hardware has no reason to carry the cloud image's `ubuntu`.
+	LocalAnsibleUser string
+	// LocalImage is the guest generation every tier boots on the Firecracker
+	// host. Empty is DefaultFirecrackerImage, the x64 generation billet
+	// publishes; an operator with another architecture or their own signed
+	// generation names it, because the generator cannot see that machine.
+	LocalImage string
 
 	// Host carries the Firecracker host's inputs billet cannot detect.
 	Host HostInputs
@@ -289,13 +305,20 @@ func checkHybridParams(p *HybridParams) error {
 		}
 	}
 
+	// THE NAME IS WHAT billet ca issue MINTS, so config's own node-name rule is
+	// applied here, before the runbook's step 5 would meet it, and the DNS-label
+	// shape on top of it because the same string is an inventory hostname.
 	for flag, name := range map[string]string{
 		"--controller-name": p.ControllerName,
 		"--local-name":      p.LocalName,
 	} {
-		if !hybridHostPattern.MatchString(name) {
-			return fmt.Errorf("%s %q must be a lowercase DNS label (letters, digits, hyphens): it "+
-				"is the host's inventory name and the name in its certificate", flag, name)
+		if err := config.ValidateNodeName(flag, name); err != nil {
+			return fmt.Errorf("%s: %w", flag, err)
+		}
+		if !hybridHostPattern.MatchString(name) || len(name) > 63 {
+			return fmt.Errorf("%s %q must be a lowercase DNS label (letters, digits, hyphens, at most "+
+				"63 characters): it is the host's inventory name and the name in its certificate",
+				flag, name)
 		}
 	}
 	if p.ControllerName == p.LocalName {
@@ -311,9 +334,32 @@ func checkHybridParams(p *HybridParams) error {
 	}
 
 	for _, c := range p.SSHIngressCIDRs {
-		if _, _, err := net.ParseCIDR(c); err != nil {
+		ip, network, err := net.ParseCIDR(c)
+		if err != nil {
 			return fmt.Errorf("--ssh-ingress-cidr %q is not a CIDR: %w", c, err)
 		}
+		if ip.To4() == nil {
+			return fmt.Errorf("--ssh-ingress-cidr %q is not IPv4; the controller's SSH rule is an "+
+				"IPv4 rule, and this would fail at plan rather than here", c)
+		}
+		if network.String() != c {
+			return fmt.Errorf("--ssh-ingress-cidr %q has host bits set; write it as %s, because AWS "+
+				"normalises the rule and the plan would then diff forever", c, network)
+		}
+	}
+
+	if p.SSHKeyName != "" && strings.TrimSpace(p.SSHKeyName) != p.SSHKeyName {
+		return fmt.Errorf("--key-name %q carries padding; it names an EC2 key pair exactly", p.SSHKeyName)
+	}
+	if p.LocalAnsibleUser != "" && !hybridHostPattern.MatchString(p.LocalAnsibleUser) {
+		return fmt.Errorf("--local-ansible-user %q must be a plain account name (lowercase letters, "+
+			"digits, hyphens)", p.LocalAnsibleUser)
+	}
+	if p.LocalImage == "" {
+		p.LocalImage = DefaultFirecrackerImage
+	}
+	if idx := strings.IndexFunc(p.LocalImage, badImageRune); idx >= 0 {
+		return fmt.Errorf("--local-image: %q contains whitespace or a control character", p.LocalImage)
 	}
 
 	if p.LocalVCPU <= 0 || p.LocalMemory <= 0 {
@@ -344,6 +390,16 @@ func checkHybridParams(p *HybridParams) error {
 	if p.AMI != "" && !p.Commission {
 		return errors.New("--ami is read on the commission render only; before it every tier " +
 			"carries the placeholder, because nothing launches until the node exists")
+	}
+	// A COMMISSIONED DEPLOYMENT WITH THE PLACEHOLDER IS WORSE THAN A REFUSAL:
+	// it lifts the hold, enables the orchestrator and advertises the fallback
+	// tiers, and the first job that needs the cloud fails at launch on an image
+	// that does not exist. The AMI exists by the time of this render (the
+	// runbook builds it the step before), so it is required rather than
+	// defaulted.
+	if p.Commission && p.AMI == "" {
+		return errors.New("--commission needs --ami: the render it produces advertises the ec2 " +
+			"fallback, and a placeholder image would fail every job that reaches it")
 	}
 	if idx := strings.IndexFunc(p.AMI, badImageRune); idx >= 0 {
 		return fmt.Errorf("--ami: %q contains whitespace or a control character", p.AMI)
@@ -436,7 +492,7 @@ func renderHybridTiers(ts []tier, p HybridParams, trusted bool, ami string) stri
 		b.WriteString("    guest_os: linux\n")
 		fmt.Fprintf(&b, "    vcpu: %d\n    memory: %s\n    disk: %s\n", t.vcpu, t.memory, disk)
 		b.WriteString("    launch:\n")
-		fmt.Fprintf(&b, "      firecracker:\n        image: %s\n", DefaultFirecrackerImage)
+		fmt.Fprintf(&b, "      firecracker:\n        image: %s\n", yamlScalar(p.LocalImage))
 		fmt.Fprintf(&b, "      ec2:\n        image: %s\n        command: [%s]\n",
 			yamlScalar(ami), hybridRunnerCommand)
 		renderTierPolicy(&b, Params{RunnerGroup: p.RunnerGroup, Workflows: p.Workflows}, trusted)
@@ -699,8 +755,7 @@ all:
           # from a workstation on the same network, a Mesh or tunnel address from
           # CI. billet never needs it; only the converge does.
           ansible_host: <the address Ansible reaches this host on>
-          ansible_user: ubuntu
-          ansible_python_interpreter: /usr/bin/python3
+%s          ansible_python_interpreter: /usr/bin/python3
 
           # NODE ONLY. The control plane is %s.
           billet_enable_server: false
@@ -722,6 +777,7 @@ all:
 		yamlScalar(p.Ref),
 		indentYAML(controller, "            "),
 		p.LocalName,
+		hybridLocalUserYAML(p.LocalAnsibleUser),
 		p.ControllerName,
 		yamlScalar(p.Ref),
 		indentYAML(local, "            "),
@@ -730,6 +786,18 @@ all:
 	_ = trusted
 
 	return b.String()
+}
+
+// hybridLocalUserYAML is the local host's ansible_user line, or the comment
+// that explains its absence: owned hardware has no reason to carry the cloud
+// image's account, and the generator cannot see that machine.
+func hybridLocalUserYAML(user string) string {
+	if user == "" {
+		return "          # ansible_user is omitted: your SSH configuration, or --local-ansible-user, says\n" +
+			"          # which account Ansible connects as. Owned hardware has no `ubuntu` by default.\n"
+	}
+
+	return fmt.Sprintf("          ansible_user: %s\n", yamlScalar(user))
 }
 
 // renderHybridTerraform writes the root that creates the controller, the
@@ -809,10 +877,26 @@ module "billet" {
 		b.WriteString("]\n")
 	} else {
 		b.WriteString(`
-  # No SSH ingress: every route in docs/deploying/reaching-hosts.md that dials
-  # out (Systems Manager, a tunnel, a WARP client) needs none. Name your admin
-  # range here for a workstation on the same network.
+  # No SSH ingress. A route that ENDS ON THE CONTROLLER needs none: the Systems
+  # Manager agent, or a cloudflared tunnel or route running on this host, which
+  # a WARP client then reaches (docs/deploying/reaching-hosts.md). A connector
+  # elsewhere in the VPC, or a workstation on the same network, needs its own
+  # source named here.
   ssh_ingress_cidrs = []
+`)
+	}
+
+	if p.SSHKeyName != "" {
+		fmt.Fprintf(&b, `
+  # The key pair Ansible's SSH presents to a fresh Canonical image.
+  key_name = %q
+`, p.SSHKeyName)
+	} else {
+		b.WriteString(`
+  # NO KEY PAIR, so a fresh Canonical image has no operator key at all: the
+  # runbook reaches it with EC2 Instance Connect, which pushes a key for sixty
+  # seconds under IAM. Name a key pair here (or --key-name) for ordinary SSH.
+  # key_name = "my-key"
 `)
 	}
 

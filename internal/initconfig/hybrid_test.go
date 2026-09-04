@@ -340,6 +340,7 @@ func TestGenerateHybridTrustDecidesTheUntrustedSurface(t *testing.T) {
 	p.RunnerGroup, p.Workflows = "billet-trusted", []string{"acme/repo/.github/workflows/ci.yml@refs/heads/main"}
 	p.Facts = hybridFacts()
 	p.Commission = true
+	p.AMI = "ami-0123456789abcdef0"
 	trusted, isTrusted := mustGenerateHybrid(t, p)
 	if !isTrusted {
 		t.Fatal("a policy must render trusted tiers")
@@ -404,6 +405,13 @@ func TestGenerateHybridRefusals(t *testing.T) {
 		{"no shapes", func(p *HybridParams) { p.Shapes = nil }, "--instance-type"},
 		{"no ref", func(p *HybridParams) { p.Ref = "" }, "release"},
 		{"commission without facts", func(p *HybridParams) { p.Commission = true }, "--commission needs --terraform-output"},
+		{"commission without an ami", func(p *HybridParams) { p.Commission = true; p.Facts = hybridFacts() }, "--commission needs --ami"},
+		{"an ipv6 cidr", func(p *HybridParams) { p.SSHIngressCIDRs = []string{"2001:db8::/32"} }, "not IPv4"},
+		{"a cidr with host bits", func(p *HybridParams) { p.SSHIngressCIDRs = []string{"203.0.113.7/24"} }, "host bits"},
+		{"a name longer than a label", func(p *HybridParams) { p.LocalName = strings.Repeat("a", 64) }, "--local-name"},
+		{"a bad local user", func(p *HybridParams) { p.LocalAnsibleUser = "Root User" }, "--local-ansible-user"},
+		{"a bad local image", func(p *HybridParams) { p.LocalImage = "ubuntu 2404" }, "--local-image"},
+		{"a padded key name", func(p *HybridParams) { p.SSHKeyName = " my-key" }, "--key-name"},
 		{"an ami before commission", func(p *HybridParams) { p.AMI = "ami-1" }, "--ami is read on the commission render"},
 		{"a partial policy", func(p *HybridParams) { p.RunnerGroup = "billet-trusted" }, "--workflow"},
 		{"half a cache", func(p *HybridParams) { p.Host.CacheListen = "172.31.0.1:7718" }, "--cache-listen and --cache-guest-endpoint"},
@@ -499,5 +507,48 @@ func TestParseTerraformOutput(t *testing.T) {
 
 	if _, err := ParseTerraformOutput([]byte("not json"), true); err == nil {
 		t.Error("garbage must be refused")
+	}
+}
+
+// THE HOST-SIDE FACTS THE GENERATOR CANNOT SEE ARE INPUTS, NOT ASSUMPTIONS: the
+// key pair the controller launches with, the account Ansible reaches owned
+// hardware as, and the guest generation that hardware can boot. Each is
+// rendered where it is consumed, and each absence says what it means.
+func TestGenerateHybridHostSideInputs(t *testing.T) {
+	t.Parallel()
+
+	bare, _ := mustGenerateHybrid(t, hybridParams())
+	if strings.Contains(bare[HybridTerraformFile], "\n  key_name = ") {
+		t.Error("no key pair must leave key_name unset")
+	}
+	if !strings.Contains(bare[HybridTerraformFile], "Instance Connect") {
+		t.Error("the root must say how a fresh image is reached without a key pair")
+	}
+	hosts := inventoryHosts(t, bare[HybridInventoryFile])
+	if _, set := hosts["acme-ci-fc-1"]["ansible_user"]; set {
+		t.Error("the local host must carry no ansible_user unless one was named; owned hardware has no `ubuntu` by default")
+	}
+	if hosts["acme-ci-control-plane"]["ansible_user"] != "ubuntu" {
+		t.Error("the controller is a Canonical image, whose account is ubuntu")
+	}
+
+	p := hybridParams()
+	p.SSHKeyName = "ops-key"
+	p.LocalAnsibleUser = "operator"
+	p.LocalImage = "ubuntu-2404-arm64@verified"
+	files, _ := mustGenerateHybrid(t, p)
+	if !strings.Contains(files[HybridTerraformFile], `key_name = "ops-key"`) {
+		t.Error("a named key pair must reach the root")
+	}
+	hosts = inventoryHosts(t, files[HybridInventoryFile])
+	if hosts["acme-ci-fc-1"]["ansible_user"] != "operator" {
+		t.Errorf("the local user must be rendered, got %v", hosts["acme-ci-fc-1"]["ansible_user"])
+	}
+	local := hostConfig(t, hosts["acme-ci-fc-1"])
+	for _, tier := range local.Tiers {
+		if tier.Launch[config.ProviderFirecracker].Image != "ubuntu-2404-arm64@verified" {
+			t.Errorf("tier %s: the named local image must be what every tier boots, got %q",
+				tier.Label, tier.Launch[config.ProviderFirecracker].Image)
+		}
 	}
 }

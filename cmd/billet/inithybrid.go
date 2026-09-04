@@ -32,6 +32,7 @@ type hybridInputs struct {
 	localMemory, cloudMemory       string
 	instanceTypes, priceOverrides  []string
 	sshIngress                     []string
+	keyName, localUser, localImage string
 	kernelImage, cephUser, cephKey string
 	cacheListen, cacheGuest        string
 	cfgPath                        string
@@ -86,7 +87,15 @@ func cmdInitHybrid(ctx context.Context, args []string) error {
 	fs.Var(&priceOverrides, "price", "override a fetched shape's price, as type=usd (repeatable)")
 	var sshIngress repeatedString
 	fs.Var(&sshIngress, "ssh-ingress-cidr",
-		"a CIDR that may SSH to the controller, for a workstation on the same network (repeatable)")
+		"an IPv4 CIDR that may SSH to the controller, for a workstation on the same network (repeatable)")
+	keyName := fs.String("key-name", "",
+		"the EC2 key pair the controller launches with; empty attaches none and the runbook reaches "+
+			"the fresh image with EC2 Instance Connect")
+	localUser := fs.String("local-ansible-user", "",
+		"the account Ansible connects to the Firecracker host as; empty leaves it to your SSH configuration")
+	localImage := fs.String("local-image", "",
+		"the guest generation every tier boots on the Firecracker host (default "+
+			initconfig.DefaultFirecrackerImage+", the x64 generation billet publishes)")
 
 	kernelImage := fs.String("kernel-image", "", "the Firecracker host's pinned guest kernel")
 	cephUser := fs.String("ceph-user", "", "the RADOS identity billet authenticates as, WITHOUT the `client.` prefix")
@@ -128,6 +137,11 @@ func cmdInitHybrid(ctx context.Context, args []string) error {
 	if *ami != "" && !*commission {
 		return errors.New("--ami is read with --commission only; before it every tier carries the " +
 			"placeholder, because nothing launches until the node exists")
+	}
+	if *commission && *ami == "" {
+		return errors.New("--commission needs --ami: the render it produces advertises the ec2 " +
+			"fallback, and a placeholder image would fail every job that reaches it; " +
+			"`billet ami build` is the runbook's step before this one")
 	}
 
 	// THE CHEAP REFUSALS BEFORE ANY AWS CALL: a typoed memory must not pay a
@@ -171,20 +185,23 @@ func cmdInitHybrid(ctx context.Context, args []string) error {
 	ref, refNote := hybridRef()
 
 	p := initconfig.HybridParams{
-		Name:            *name,
-		Region:          *region,
-		Org:             *org,
-		RunnerGroup:     *group,
-		Workflows:       workflows,
-		ControlPlaneIP:  *controlPlaneIP,
-		ControllerName:  *controllerName,
-		LocalName:       *localName,
-		LocalVCPU:       *localVCPU,
-		LocalMemory:     localMem,
-		CloudVCPU:       *maxVCPU,
-		CloudMemory:     cloudMem,
-		Shapes:          shapes,
-		SSHIngressCIDRs: sshIngress,
+		Name:             *name,
+		Region:           *region,
+		Org:              *org,
+		RunnerGroup:      *group,
+		Workflows:        workflows,
+		ControlPlaneIP:   *controlPlaneIP,
+		ControllerName:   *controllerName,
+		LocalName:        *localName,
+		LocalVCPU:        *localVCPU,
+		LocalMemory:      localMem,
+		CloudVCPU:        *maxVCPU,
+		CloudMemory:      cloudMem,
+		Shapes:           shapes,
+		SSHIngressCIDRs:  sshIngress,
+		SSHKeyName:       *keyName,
+		LocalAnsibleUser: *localUser,
+		LocalImage:       *localImage,
 		Host: initconfig.HostInputs{
 			KernelImage:        *kernelImage,
 			CephUser:           *cephUser,
@@ -233,6 +250,7 @@ func cmdInitHybrid(ctx context.Context, args []string) error {
 		controlPlaneIP: *controlPlaneIP, controllerName: *controllerName, localName: *localName,
 		localVCPU: *localVCPU, cloudVCPU: *maxVCPU, localMemory: *localMemory, cloudMemory: *maxMemory,
 		instanceTypes: instanceTypes, priceOverrides: priceOverrides, sshIngress: sshIngress,
+		keyName: *keyName, localUser: *localUser, localImage: *localImage,
 		kernelImage: *kernelImage, cephUser: *cephUser, cephKey: *cephKeyring,
 		cacheListen: *cacheListen, cacheGuest: *cacheGuest, out: *out,
 	}
@@ -479,6 +497,9 @@ func hybridFlags(in hybridInputs) []string {
 	addEach("instance-type", in.instanceTypes)
 	addEach("price", in.priceOverrides)
 	addEach("ssh-ingress-cidr", in.sshIngress)
+	add("key-name", in.keyName)
+	add("local-ansible-user", in.localUser)
+	add("local-image", in.localImage)
 	add("kernel-image", in.kernelImage)
 	add("ceph-user", in.cephUser)
 	add("ceph-keyring", in.cephKey)
@@ -578,7 +599,13 @@ func renderHybridRunbook(in hybridInputs, p initconfig.HybridParams, trusted, ca
 	b.WriteString("Every `<terraform output …>` placeholder in `inventory.yml` is filled. The controller entry stays `billet_server_prepare_only: true` and server-only: its ec2 node's certificate does not exist yet.\n\n")
 
 	b.WriteString("## 4. Prepare the controller, with the App key\n\n")
-	fmt.Fprintf(&b, "Reach it however you chose (docs/deploying/reaching-hosts.md), then:\n\n```bash\nansible-galaxy collection install -r requirements.yml\nBILLET_GITHUB_PRIVATE_KEY_PATH=<the key github-app create wrote> \\\n  ansible-playbook -i inventory.yml site.yml -l %s\n```\n\n", shellArg(p.ControllerName))
+	if p.SSHKeyName != "" {
+		fmt.Fprintf(&b, "The controller launched with the %s key pair, so Ansible's ordinary SSH works as `ubuntu` once port 22 is reachable over the route you chose (docs/deploying/reaching-hosts.md).\n\n", shellArg(p.SSHKeyName))
+	} else {
+		b.WriteString("The controller launched with NO key pair, so a fresh image carries no operator key. Push one for sixty seconds with EC2 Instance Connect before each converge, over the route you chose (docs/deploying/reaching-hosts.md); or generate again with `--key-name` for ordinary SSH:\n\n")
+		fmt.Fprintf(&b, "```bash\naws ec2-instance-connect send-ssh-public-key --region %s \\\n  --instance-id \"$(terraform -chdir=%s output -raw control_plane_instance_id)\" \\\n  --instance-os-user ubuntu --ssh-public-key file://~/.ssh/id_ed25519.pub\n```\n\n", shellArg(p.Region), tf)
+	}
+	fmt.Fprintf(&b, "```bash\nansible-galaxy collection install -r requirements.yml\nBILLET_GITHUB_PRIVATE_KEY_PATH=<the key github-app create wrote> \\\n  ansible-playbook -i inventory.yml site.yml -l %s\n```\n\n", shellArg(p.ControllerName))
 	b.WriteString("The role demands the key because the config names it, and `billet_server_prepare_only` does not gate that refusal. Prepare-only mounts and proves the ledger volume, installs the binary and the units, and HOLDS both services, so nothing can mint a deployment identity yet.\n\n")
 
 	b.WriteString("## 5. Issue both certificates on the controller\n\n")

@@ -48,7 +48,7 @@ Generate a `billet.yaml` that runs. It measures the host, writes a ceiling below
 
 ### `billet init hybrid`
 
-Generate the hybrid shape as one unit into `--out DIR`: a Terraform root over the billet module, an inventory with both hosts and one tier catalogue with ordered providers, the playbook, the collection pin and a numbered `RUNBOOK.md`. Three renders of one generation, selected by flags: with nothing extra the **plan** render carries a `<terraform output NAME>` placeholder for every fact the apply produces; with `--terraform-output` the **prepare** render fills them from `terraform output -json` and keeps the controller server-only and prepare-only, because the co-located node's certificate bundle does not exist until `billet ca issue` has run and the host role's `billet check` refuses a missing one; with `--commission` the controller gains the EC2 orchestrator and every tier's `launch.ec2.image` becomes `--ami`. A file is replaced only when its first line carries billet's marker; an operator's own file gets the fresh generation beside it at `<file>.new`.
+Generate the hybrid shape as one unit into `--out DIR`: a Terraform root over the billet module, an inventory with both hosts and one tier catalogue with ordered providers, the playbook, the collection pin and a numbered `RUNBOOK.md`. Three renders of one generation, selected by flags: with nothing extra the **plan** render carries a `<terraform output NAME>` placeholder for every fact the apply produces; with `--terraform-output` the **prepare** render fills them from `terraform output -json` and keeps the controller server-only and prepare-only, because the co-located node's certificate bundle does not exist until `billet ca issue` has run and the host role's `billet check` refuses a missing one; with `--commission` the controller gains the EC2 orchestrator and every tier's `launch.ec2.image` becomes `--ami`, which is required there because a commissioned deployment advertising a placeholder image would fail every job that reached the cloud. A file is replaced only when its first line carries billet's marker; an operator's own file gets the fresh generation beside it at `<file>.new`.
 
 | Flag | Meaning |
 |---|---|
@@ -60,9 +60,10 @@ Generate the hybrid shape as one unit into `--out DIR`: a Terraform root over th
 | `--local-vcpu`, `--local-memory` | what the Firecracker host has (required); its contribution leaves headroom |
 | `--max-vcpu`, `--max-memory` | the cloud budget, which is the orchestrator's ceiling (required) |
 | `--instance-type` (repeatable), `--price` | `TYPE` (fetched from AWS) or `TYPE=vcpu,memory,usd` (declared, no credentials); `--price` overrides a fetched price |
-| `--ssh-ingress-cidr` (repeatable) | CIDRs that may SSH to the controller; empty for every route that dials out |
+| `--ssh-ingress-cidr` (repeatable), `--key-name` | IPv4 CIDRs that may SSH to the controller (empty for a route that ends on the controller itself), and the key pair it launches with (empty attaches none; the runbook reaches the fresh image with EC2 Instance Connect) |
+| `--local-ansible-user`, `--local-image` | the account Ansible connects to the Firecracker host as (empty leaves it to your SSH configuration), and the guest generation every tier boots there (default the x64 generation billet publishes) |
 | `--kernel-image`, `--ceph-user`, `--ceph-keyring`, `--cache-listen`, `--cache-guest-endpoint` | the Firecracker host's inputs, as for `--provider firecracker` |
-| `--terraform-output`, `--commission`, `--ami`, `--force` | the prepare render's facts, the commission render, its AMI, and replacing a file that is not billet's own |
+| `--terraform-output`, `--commission`, `--ami`, `--force` | the prepare render's facts, the commission render, its AMI (required with `--commission`), and replacing a file that is not billet's own |
 
 ### `billet init iam`
 

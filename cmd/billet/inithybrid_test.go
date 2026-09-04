@@ -344,6 +344,22 @@ func TestInitHybridRunbookOrder(t *testing.T) {
 	if !strings.Contains(runbook, "sudo -u billet billet ca issue") {
 		t.Error("the certificates must be issued as the service user, so the minted identity is owned by it")
 	}
+	// No key pair was named, so the runbook has to say how the fresh image is
+	// reached at all; with one, ordinary SSH is the answer and Instance Connect
+	// is not mentioned as the way in.
+	if !strings.Contains(runbook, "aws ec2-instance-connect send-ssh-public-key") {
+		t.Error("without --key-name the runbook must reach the controller with EC2 Instance Connect")
+	}
+	if _, err := runInitHybrid(t, append(hybridArgs(out, filepath.Join(dir, "none.yaml")), "--key-name", "ops-key", "--force")...); err != nil {
+		t.Fatalf("with a key: %v", err)
+	}
+	keyed := readHybrid(t, out, HybridRunbookFile)
+	if !strings.Contains(keyed, "ops-key") || strings.Contains(keyed, "send-ssh-public-key") {
+		t.Error("with --key-name the runbook must name the key and not the Instance Connect push")
+	}
+	if !strings.Contains(keyed, "--key-name ops-key") {
+		t.Error("the re-run commands must repeat --key-name")
+	}
 }
 
 // EVERY REFUSAL NAMES THE FLAG.
@@ -379,6 +395,7 @@ func TestInitHybridRefusals(t *testing.T) {
 		{"no shapes", without("--instance-type"), "--instance-type is required"},
 		{"commission without facts", append(base, "--commission"), "--commission needs --terraform-output"},
 		{"an ami without commission", append(base, "--ami", "ami-1"), "--ami is read with --commission"},
+		{"commission without an ami", append(base, "--terraform-output", filepath.Join(dir, "outputs.json"), "--commission"), "--commission needs --ami"},
 		{"mixed shapes", append(base, "--instance-type", "c7i.4xlarge"), "mixes fetched"},
 		{"a price on a declared shape", append(base, "--price", "c7i.xlarge=0.1"), "--price overrides a FETCHED"},
 		{"a malformed declared shape", append(without("--instance-type"), "--instance-type", "c7i.xlarge=4,8GiB"), "needs vcpu,memory,usd"},

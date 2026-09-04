@@ -34,16 +34,20 @@ locals {
 # in state, the same class as a tunnel token. Both halves are read from
 # `terraform output` once and set as CI secrets.
 #
-# ROTATION IS A SECRET ROTATION, NOT A REPLACEMENT: set
-# previous_client_secret_expires_at a day or two out and apply, and Cloudflare
-# mints a new secret under the same client_id while the old one stays valid
-# until then. A -replace mints a new id, rewires the policy to it in the same
-# apply, and leaves the old token authorised for nothing before the CI secret
-# can be updated.
+# ROTATION IS A SECRET ROTATION, NOT A REPLACEMENT: increment
+# client_secret_version and set previous_client_secret_expires_at a day or two
+# out, apply, and Cloudflare mints a new secret under the same client_id while
+# the old one stays valid until then. A -replace mints a new id, rewires the
+# policy to it in the same apply, and leaves the old token authorised for
+# nothing before the CI secret can be updated; create_before_destroy only
+# orders that replacement, it does not give CI the overlap.
 resource "cloudflare_zero_trust_access_service_token" "ci" {
   account_id = var.account_id
   name       = "${var.name} (CI)"
   duration   = var.token_duration
+
+  client_secret_version             = var.client_secret_version
+  previous_client_secret_expires_at = var.previous_client_secret_expires_at
 
   lifecycle {
     create_before_destroy = true

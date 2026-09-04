@@ -53,6 +53,42 @@ variable "name" {
   default     = "billet-converge"
 }
 
+# THE ROTATION INPUTS, because create_before_destroy is not one: replacing the
+# token mints a new id, rewires the enrolment policy to it in the same apply,
+# and deletes the old one while CI still holds it. A rotation is TWO values
+# set together, measured against provider v5: incrementing
+# client_secret_version mints a NEW secret under the SAME client id, and the
+# provider refuses previous_client_secret_expires_at without it ("Attribute
+# client_secret_version must be specified when previous_client_secret_expires_at
+# is specified"). Both are optional and computed on the resource, so null
+# leaves the provider's own values alone and plans nothing.
+variable "client_secret_version" {
+  description = "Rotate the service token's secret by setting this to the current version plus one (terraform state shows the current one; a fresh token is 1). Null (the default) rotates nothing. Set it together with previous_client_secret_expires_at."
+  type        = number
+  default     = null
+
+  validation {
+    condition     = var.client_secret_version == null || (var.client_secret_version >= 1 && floor(var.client_secret_version) == var.client_secret_version)
+    error_message = "client_secret_version must be a positive whole number."
+  }
+}
+
+variable "previous_client_secret_expires_at" {
+  description = "The RFC 3339 timestamp until which the PREVIOUS client secret stays valid after a rotation, so the enrolment policy stays satisfied while the CI secret is copied. Null (the default) rotates nothing. Set it a day or two out TOGETHER with client_secret_version, apply, copy the new secret from the output into CI, and extend it if you need more time."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.previous_client_secret_expires_at == null || can(formatdate("YYYY-MM-DD", var.previous_client_secret_expires_at))
+    error_message = "previous_client_secret_expires_at must be an RFC 3339 timestamp, e.g. 2026-10-01T00:00:00Z."
+  }
+
+  validation {
+    condition     = (var.previous_client_secret_expires_at == null) == (var.client_secret_version == null)
+    error_message = "a rotation is client_secret_version AND previous_client_secret_expires_at together: the provider refuses the expiry without the version, and a version without an expiry invalidates the previous secret the moment CI needs it."
+  }
+}
+
 variable "token_duration" {
   description = "How long the service token is valid. A year by default; put the expiry in a calendar, because terraform plan does not warn on it. Rotate with previous_client_secret_expires_at on the token resource rather than by replacing it, so the enrolment policy stays satisfied while the new secret is copied."
   type        = string

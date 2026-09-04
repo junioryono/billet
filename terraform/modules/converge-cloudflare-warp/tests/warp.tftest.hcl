@@ -17,8 +17,12 @@ variables {
   precedence     = 3
 }
 
+# APPLY, NOT PLAN, so the token's id is a value rather than an unknown and the
+# policy can be proved to reference THIS token: a plan-time assertion could
+# only count the includes, and a policy naming somebody else's token counts
+# the same.
 run "the_enrolment_policy_is_service_auth_for_this_token" {
-  command = plan
+  command = apply
 
   # `non_identity` is the API spelling of Service Auth. An `allow` decision
   # with a service-token include is a policy that never matches, because a
@@ -31,8 +35,78 @@ run "the_enrolment_policy_is_service_auth_for_this_token" {
 
   assert {
     condition     = length(cloudflare_zero_trust_access_policy.enrol.include) == 1
-    error_message = "the enrolment policy must include exactly this module's token and nothing else"
+    error_message = "the enrolment policy must include exactly one thing"
   }
+
+  # `include` is a SET, so the token id is proved across every element rather
+  # than by index: exactly one element, and it names this token.
+  assert {
+    condition = alltrue([
+      for i in cloudflare_zero_trust_access_policy.enrol.include :
+      try(i.service_token.token_id, "") == cloudflare_zero_trust_access_service_token.ci.id
+    ])
+    error_message = "the enrolment policy must include THIS module's token; another token's id would leave CI unable to enrol while the module looked configured"
+  }
+
+  # NO ROTATION UNLESS ASKED: the attribute is null, so an ordinary apply
+  # mints nothing new.
+  assert {
+    condition     = cloudflare_zero_trust_access_service_token.ci.previous_client_secret_expires_at == null
+    error_message = "a token that was not asked to rotate must not carry a previous-secret expiry"
+  }
+}
+
+# ROTATION IS TWO INPUTS, PASSED THROUGH TOGETHER: the version that mints the
+# new secret and the window the previous one stays valid for, which is the
+# only way CI keeps an enrolment while the secret changes. The provider
+# refuses the expiry without the version (measured on v5), so the module
+# refuses either one alone before the provider can.
+run "rotation_passes_the_version_and_the_expiry_to_the_token" {
+  command = plan
+
+  variables {
+    client_secret_version             = 2
+    previous_client_secret_expires_at = "2026-10-01T00:00:00Z"
+  }
+
+  assert {
+    condition = (
+      cloudflare_zero_trust_access_service_token.ci.client_secret_version == 2 &&
+      cloudflare_zero_trust_access_service_token.ci.previous_client_secret_expires_at == "2026-10-01T00:00:00Z"
+    )
+    error_message = "the rotation's version and window must both reach the token resource"
+  }
+}
+
+run "refuses_a_rotation_that_is_not_a_timestamp" {
+  command = plan
+
+  variables {
+    client_secret_version             = 2
+    previous_client_secret_expires_at = "tomorrow"
+  }
+
+  expect_failures = [var.previous_client_secret_expires_at]
+}
+
+run "refuses_an_expiry_without_a_version" {
+  command = plan
+
+  variables {
+    previous_client_secret_expires_at = "2026-10-01T00:00:00Z"
+  }
+
+  expect_failures = [var.previous_client_secret_expires_at]
+}
+
+run "refuses_a_version_without_an_expiry" {
+  command = plan
+
+  variables {
+    client_secret_version = 2
+  }
+
+  expect_failures = [var.previous_client_secret_expires_at]
 }
 
 run "the_gateway_rule_admits_exactly_the_fleet" {
