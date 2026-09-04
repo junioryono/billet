@@ -202,8 +202,8 @@ rehearsal_step "billet ca retire drops the old authority; the fleet keeps pollin
 # --force IS THE OPERATOR'S CHECK, MADE. Without it `ca retire` prints what the
 # operator has to have verified (every node renewed since the rotation) and
 # exits 0 having retired nothing, which the first real run read as a retire;
-# the harness has just proved both renewals from the nodes' own journals, so
-# it says so.
+# the harness has just proved both renewals from each node's installed
+# certificate (new issuer, new serial), so it says so.
 rehearsal_as_billet "${controller}" /usr/bin/billet ca retire --force --config /etc/billet/billet.yaml 2>&1 | sed -n '1,4p'
 if docker exec "${controller}" test -f /var/lib/billet/server/ca/ca-previous.crt; then
     rehearsal_fail "ca retire left ca-previous.crt in place"
