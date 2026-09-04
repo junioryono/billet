@@ -49,7 +49,7 @@ The finding cost one release cut and had never been visible to a test, because e
 
 | Rehearsal | Status |
 |---|---|
-| Rollout | ran to its first step and found the signing-identity defect above; the full run (both hosts moved, the downgrade rolled back) follows on v0.6.1 |
+| Rollout | ran to its first step and found the signing-identity defect above; the full run (both hosts moved, the downgrade rolled back) needs a release ABOVE v0.6.1, because the FROM host is the one that verifies the target and v0.6.1 is the first binary whose policy accepts the identity every release is signed with |
 | Recover | **passed** on 2026-09-04 (fourth run, 388s, arm64) after three runs that each stopped at something they exposed (above) |
 | CA rotation | **passed** on 2026-09-04 (second, third and fourth runs, 905s, 928s and 907s, arm64, the fourth proving both files of the retired pair absent positively; the first stopped at a harness mistake, above) |
 | Promotion | **passed** on 2026-09-04 (sixth run, 188s, arm64, every post-partition and post-heal journal wait scoped to its boundary; promotion 21s after the partition on keepalives 10/5/3; the runs before it stopped at harness mistakes, above) |
