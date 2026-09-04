@@ -785,3 +785,65 @@ func TestS3DeleteIsSignedIdempotentAndSurfacesErrors(t *testing.T) {
 		t.Fatal("Delete(403) did not surface an error")
 	}
 }
+
+// THE STORE'S TWO ENDPOINTS FOLLOW THE PARTITION.
+//
+// Both were built by hand with the commercial suffix, which names hosts that do
+// not exist in cn-north-1 — and config admits such a region deliberately, and
+// the terraform module renders an aws-cn policy for it. So the grant applied,
+// the listener came up, the bucket existed, and the store behind it could reach
+// neither the EBS API nor its own objects: every job fetched cold with the
+// whole cache correct on paper.
+//
+// READ BACK OUT OF THE STORE `New` BUILT, not recomputed from awsjson here: a
+// test that asks awsjson the same question awsjson answered proves only that
+// awsjson is consistent with itself, and would stay green with this file's two
+// lines unchanged.
+//
+// Mutation: restoring ".amazonaws.com" to either line fails the China case.
+func TestTheStoreEndpointsFollowThePartition(t *testing.T) {
+	t.Parallel()
+
+	for _, c := range []struct {
+		region, ebs, s3 string
+	}{
+		{
+			"us-west-2",
+			"https://ec2.us-west-2.amazonaws.com/",
+			"https://billet-cache.s3.us-west-2.amazonaws.com/",
+		},
+		{
+			"cn-north-1",
+			"https://ec2.cn-north-1.amazonaws.com.cn/",
+			"https://billet-cache.s3.cn-north-1.amazonaws.com.cn/",
+		},
+	} {
+		store, err := New(config.EBSS3Config{
+			Region:           c.region,
+			AvailabilityZone: c.region + "a",
+			Bucket:           "billet-cache",
+			Prefix:           "billet-cache",
+		}, "deployment/site", staticCredentials{})
+		if err != nil {
+			t.Fatalf("%s: %v", c.region, err)
+		}
+
+		blocks, ok := store.blocks.(*ebsAPI)
+		if !ok {
+			t.Fatalf("%s: the store's block API is %T", c.region, store.blocks)
+		}
+
+		if blocks.endpoint != c.ebs {
+			t.Errorf("%s reaches EBS at %q, want %q", c.region, blocks.endpoint, c.ebs)
+		}
+
+		objects, ok := store.objects.(*s3API)
+		if !ok {
+			t.Fatalf("%s: the store's object API is %T", c.region, store.objects)
+		}
+
+		if objects.endpoint != c.s3 {
+			t.Errorf("%s reaches its objects at %q, want %q", c.region, objects.endpoint, c.s3)
+		}
+	}
+}

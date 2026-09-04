@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/awscreds"
+	"github.com/junioryono/billet/internal/awsjson"
 	"github.com/junioryono/billet/internal/awssig"
 	"github.com/junioryono/billet/internal/config"
 )
@@ -67,8 +68,15 @@ func New(cfg config.EBSS3Config, owner string, credentials CredentialSource) (*S
 		Timeout:       30 * time.Second,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
-	ebsEndpoint := "https://ec2." + cfg.Region + ".amazonaws.com/"
-	s3Endpoint := "https://" + cfg.Bucket + ".s3." + cfg.Region + ".amazonaws.com/"
+	// THE SUFFIX IS THE PARTITION'S, ASKED OF THE ONE PLACE THAT KNOWS IT. Both
+	// of these were built by hand with the commercial suffix, which derives a host
+	// that does not exist in `cn-north-1` — and config admits such a region
+	// deliberately, and the terraform module renders an aws-cn policy for it. So
+	// the grant applied, the listener came up, the bucket existed, and the store
+	// behind it could reach neither the EBS API nor its own objects.
+	ebsEndpoint := awsjson.EndpointFor("ec2", cfg.Region)
+	s3Endpoint := "https://" + cfg.Bucket + ".s3." + cfg.Region + "." +
+		awsjson.DNSSuffixFor(cfg.Region) + "/"
 	now := time.Now
 	blocks := newEBSAPI(cfg, owner, credentials, httpClient, ebsEndpoint, now, waitContext)
 	objects := newS3API(cfg, credentials, httpClient, s3Endpoint, now)

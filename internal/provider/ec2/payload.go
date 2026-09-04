@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/junioryono/billet/internal/awsjson"
 	"github.com/junioryono/billet/internal/awssig"
 	"github.com/junioryono/billet/internal/runnerimages"
 )
@@ -112,7 +113,13 @@ func (p payloadStager) endpoint(key string) (*url.URL, error) {
 		return nil, fmt.Errorf("ec2: %q is not a payload key", key)
 	}
 
-	host := p.bucket + ".s3." + p.region + ".amazonaws.com"
+	// THE SUFFIX IS THE PARTITION'S. Built by hand this was the commercial one,
+	// so in `cn-north-1` the very first thing a build does — staging its own
+	// payload — signed for a host that does not exist, and the build died before
+	// it launched anything. `billet init iam` and the terraform module both
+	// render a correct aws-cn grant for that region, which made it look like a
+	// permissions problem.
+	host := p.bucket + ".s3." + p.region + "." + awsjson.DNSSuffixFor(p.region)
 
 	return &url.URL{Scheme: "https", Host: host, Path: "/" + key}, nil
 }
