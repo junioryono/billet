@@ -65,6 +65,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
+    # THE ENVIRONMENT IS THE PRINCIPAL. The role in the acceptance account trusts
+    # exactly one OIDC subject, `repo:junioryono/billet:environment:acceptance`,
+    # and declaring the environment is what puts that subject in the token
+    # whatever ref the run was dispatched for. A scheduled run from main and a
+    # dispatched run from a branch are then the same principal; a pull_request
+    # workflow cannot request an environment, so a fork's run is not.
+    environment: acceptance
+
     permissions:
       contents: read
       # OIDC IS WHY THIS CANNOT RUN ON pull_request. It mints a credential that
