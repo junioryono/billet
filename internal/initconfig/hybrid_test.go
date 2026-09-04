@@ -875,19 +875,43 @@ func TestGenerateHybridUntrustedRunnersReachTheCache(t *testing.T) {
 	// and this generator emits no block comments at all, so the one declaration
 	// cannot be commented out.
 	header := `resource "aws_vpc_security_group_ingress_rule" "untrusted_runner_cache" {`
-	if n := strings.Count(root, header); n != 1 {
-		t.Fatalf("the generated root declares the cache rule %d times, want exactly one", n)
+	if n := countLines(root, header); n != 1 {
+		t.Fatalf("the generated root declares the cache rule on %d lines of its own, "+
+			"want exactly one", n)
 	}
 
-	if strings.Contains(root, "/*") {
-		t.Error("this generator emits no block comments, and the rule assertions below " +
-			"rest on that: a commented-out declaration would satisfy them with no rule applied")
+	// THE CONTAINERS THE PROOF ASSUMES ABSENT, proved absent. A declaration is
+	// only the one terraform applies if nothing quotes it: HCL's block comment
+	// and a heredoc can each carry the whole expected text while the applied
+	// rule is missing or different. This generator emits neither, and saying so
+	// here is what makes the match below mean what it says.
+	for _, quoted := range []string{"/*", "<<"} {
+		if strings.Contains(root, quoted) {
+			t.Errorf("this generator emits no %q, and the rule assertion below rests on "+
+				"that: quoted text would satisfy it with no rule applied", quoted)
+		}
 	}
 
 	if !strings.Contains(root, want) {
 		t.Errorf("an untrusted generation with a cache must render exactly this rule, "+
 			"and the port must be the listener's:\n%s\n\ngot:\n%s", want, root)
 	}
+}
+
+// countLines counts the lines of a document that are exactly the given text,
+// which is what "declared once" means. strings.Count answers a substring
+// question instead: `## 6. Foo` is a substring of `### 6. Foo`, and a resource
+// header is a substring of a longer line that quotes it.
+func countLines(document, line string) int {
+	n := 0
+
+	for candidate := range strings.SplitSeq(document, "\n") {
+		if candidate == line {
+			n++
+		}
+	}
+
+	return n
 }
 
 // A TRUSTED GENERATION NEEDS NO SUCH RULE: its jobs launch in the module's own

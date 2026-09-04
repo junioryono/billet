@@ -36,6 +36,20 @@ const hybridOutputsJSON = `{
   "ami_payload_bucket": {"sensitive": false, "type": "string", "value": "acme-ci-ami-payloads-1"}
 }`
 
+// hybridCacheOutputsJSON adds the three facts a --cache root declares and a
+// generation without one does not, so the prepare render can fill them.
+const hybridCacheOutputsJSON = `{
+  "control_plane_private_ip": {"sensitive": false, "type": "string", "value": "10.60.0.10"},
+  "ledger_volume_id": {"sensitive": false, "type": "string", "value": "vol-0abc"},
+  "subnet_id": {"sensitive": false, "type": "string", "value": "subnet-0abc"},
+  "runner_security_group_id": {"sensitive": false, "type": "string", "value": "sg-trusted"},
+  "untrusted_runner_security_group_id": {"sensitive": false, "type": "string", "value": "sg-untrusted"},
+  "ami_payload_bucket": {"sensitive": false, "type": "string", "value": "acme-ci-ami-payloads-1"},
+  "cache_bucket": {"sensitive": false, "type": "string", "value": "acme-ci-cache-1"},
+  "cache_prefix": {"sensitive": false, "type": "string", "value": "billet-cache"},
+  "availability_zone": {"sensitive": false, "type": "string", "value": "us-west-2a"}
+}`
+
 var hybridFileNames = []string{
 	initconfig.HybridTerraformFile, initconfig.HybridInventoryFile, initconfig.HybridSiteFile,
 	initconfig.HybridRequirementsFile, HybridRunbookFile,
@@ -497,13 +511,50 @@ func TestInitHybridBuilderRunbookRunsWhereTheCredentialsAre(t *testing.T) {
 func assertOneBuildCommand(t *testing.T, runbook, want string) {
 	t.Helper()
 
-	if n := strings.Count(runbook, "\n## 6. Build the AMI\n"); n != 1 {
+	heading, n := "## 6. Build the AMI", 0
+
+	for line := range strings.SplitSeq(runbook, "\n") {
+		// EXACTLY THIS LINE, not a document containing the text: `## 6. Build the
+		// AMI` is a substring of `### 6. Build the AMI`, and a count keyed on the
+		// PRECEDING newline misses a duplicate at byte zero.
+		if line == heading {
+			n++
+		}
+	}
+
+	if n != 1 {
 		t.Fatalf("the runbook carries the build step %d times, want exactly one", n)
 	}
 
-	if strings.Contains(runbook, "````") {
-		t.Error("this generator opens every fence with three backticks, and the assertion " +
-			"below rests on that: a command quoted inside a wider fence would satisfy it")
+	// THE CONTAINERS THE PROOF ASSUMES ABSENT, proved absent. The command below
+	// is only the step's live command if nothing quotes it, and Markdown has
+	// three ways to quote a triple-backtick block: a wider backtick fence, a
+	// tilde fence, and an HTML comment. This generator emits neither fence.
+	for _, quoted := range []string{"````", "~~~"} {
+		if strings.Contains(runbook, quoted) {
+			t.Errorf("this generator emits no %q, and the assertion below rests on that: "+
+				"a command quoted inside one would satisfy it", quoted)
+		}
+	}
+
+	// IT DOES EMIT ONE HTML COMMENT — the ownership marker `billet init hybrid`
+	// reads back before it will replace this file — so the rule for that one is
+	// that it closes on its own line and therefore contains no command. An
+	// unclosed one, or a second, could swallow the rest of the page.
+	comments := 0
+
+	for _, line := range strings.Split(runbook, "\n") {
+		opens := strings.Count(line, "<!--")
+		comments += opens
+
+		if opens > 0 && strings.Count(line, "-->") != opens {
+			t.Errorf("an HTML comment that does not close on its own line can quote the "+
+				"command below: %q", line)
+		}
+	}
+
+	if comments != 1 {
+		t.Errorf("the runbook carries %d HTML comments, want only the ownership marker", comments)
 	}
 
 	if n := strings.Count(runbook, want); n != 1 {
@@ -541,4 +592,87 @@ func TestInitHybridWithoutTheBuilderTheBuildStaysOnAWorkstation(t *testing.T) {
 		"  --public-ip --base-image ami-<an EBS-backed Ubuntu 24.04 image in us-west-2>\n" +
 		"```"
 	assertOneBuildCommand(t, runbook, want)
+}
+
+// AN IMAGE THAT CANNOT TRUST THE CACHE IS A CACHE NOBODY USES.
+//
+// A guest's cache client speaks HTTPS to an endpoint on the controller's
+// private address, so the listener's certificate comes from a private issuer
+// and no public root chains to it. `ami build --ca-cert` is the only thing that
+// puts that issuer in the image's host trust store, and the image is built in
+// step 6 while the listener's own pair is not asked for until step 7 — so a
+// runbook that mentions the pair and never the issuer produces a deployment
+// where the bucket, the listener, the site and the security-group rule are all
+// correct and every job still fetches cold, with nothing reporting an error.
+//
+// Mutation: dropping --ca-cert from either command fails this.
+func TestInitHybridCacheRunbookTrustsTheListenersIssuer(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "acme-ci")
+	cfg := filepath.Join(dir, "none.yaml")
+	outputs := filepath.Join(dir, "outputs.json")
+	if err := os.WriteFile(outputs, []byte(hybridCacheOutputsJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// THE WORKSTATION FORM, which is the default: no builder grant.
+	if _, err := runInitHybrid(t, append(hybridArgs(out, cfg),
+		"--cache", "--terraform-output", outputs)...); err != nil {
+		t.Fatalf("prepare render: %v", err)
+	}
+
+	runbook := readHybrid(t, out, HybridRunbookFile)
+
+	// The argument, in its place in the command, so a mention in prose cannot
+	// satisfy it.
+	want := "--payload-bucket \"$(terraform -chdir=terraform output -raw ami_payload_bucket)\"" +
+		" \\\n  --ca-cert cache-ca.pem \\\n"
+	if !strings.Contains(runbook, want) {
+		t.Errorf("a cache generation must bake the listener's issuer into the image:\n%s", runbook)
+	}
+
+	// The step that builds the image has to say what the issuer is for, since
+	// skipping it reports nothing; and the step that installs the listener has
+	// to tie its leaf to that anchor, because an anchor signing nothing on the
+	// listener is the same cold fetch.
+	if !strings.Contains(runbook, "--ca-cert` below takes the PEM of that issuer") {
+		t.Error("step 6 must say what the issuer is for")
+	}
+
+	if !strings.Contains(runbook, "signed by that same `cache-ca.pem`") {
+		t.Error("step 7 must tie the leaf it asks for to the anchor step 6 baked in")
+	}
+
+	// AND THE CONTROLLER-SIDE FORM, where the file has to be on the controller,
+	// because that is where the command runs.
+	if _, err := runInitHybrid(t, append(hybridArgs(out, cfg),
+		"--cache", "--builder", "--terraform-output", outputs, "--force")...); err != nil {
+		t.Fatalf("builder prepare render: %v", err)
+	}
+
+	builder := readHybrid(t, out, HybridRunbookFile)
+	if !strings.Contains(builder,
+		"--payload-bucket acme-ci-ami-payloads-1 \\\n  --ca-cert cache-ca.pem \\\n") {
+		t.Errorf("the controller-side build needs the issuer too:\n%s", builder)
+	}
+
+	if !strings.Contains(builder, "`cache-ca.pem` has to be on the controller too") {
+		t.Error("the controller-side build must say where the issuer file has to be")
+	}
+}
+
+// WITHOUT A CACHE THERE IS NO ISSUER TO TRUST, and asking for one would send an
+// operator looking for a file no part of this generation produces.
+func TestInitHybridWithoutACacheTheBuildAsksForNoIssuer(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "acme-ci")
+	cfg := filepath.Join(dir, "none.yaml")
+
+	if _, err := runInitHybrid(t, hybridArgs(out, cfg)...); err != nil {
+		t.Fatalf("plan render: %v", err)
+	}
+
+	if runbook := readHybrid(t, out, HybridRunbookFile); strings.Contains(runbook, "--ca-cert") {
+		t.Error("a generation with no cache has no private issuer to bake in")
+	}
 }

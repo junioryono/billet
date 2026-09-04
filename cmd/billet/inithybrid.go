@@ -660,18 +660,48 @@ func renderHybridRunbook(in hybridInputs, p initconfig.HybridParams, trusted, ca
 
 	b.WriteString("## 6. Build the AMI\n\n")
 
+	// THE IMAGE HAS TO TRUST THE CACHE BEFORE IT IS BUILT, which is why the
+	// issuer is asked for here rather than beside the listener's own pair in
+	// step 7.
+	//
+	// A guest's cache client speaks HTTPS to an endpoint on the controller's
+	// PRIVATE address, so its certificate comes from a private issuer and no
+	// public root signs it. `ami build --ca-cert` is what puts that issuer in the
+	// image's host trust store. Without it the cache is not broken in any way an
+	// operator sees: every request fails its TLS handshake, every job falls back
+	// to a cold fetch, and the bucket, the listener, the site and the security
+	// group rule this generation created are all correct and all unused.
+	//
+	// The AMI is what carries the anchor, so a re-issued CA means a rebuilt
+	// image; a long-lived issuer is worth the trouble here.
+	caCert := ""
+
+	if p.Cache {
+		caCert = " \\\n  --ca-cert cache-ca.pem"
+
+		fmt.Fprintf(&b, "This generation has a cloud cache, so the image must trust the listener's issuer. The endpoint is on a private address (%s) and its certificate is signed by an issuer of yours, which no public root chains to — so `--ca-cert` below takes the PEM of that issuer and bakes it into the image's host trust store. Skip it and nothing reports an error: every guest's cache request fails its TLS handshake, every job fetches cold, and the bucket, listener and security-group rule this generation created go unused. Have the same issuer that will sign the pair in step 7, and put its PEM beside the command as `cache-ca.pem`.\n\n",
+			cacheAddress)
+	}
+
 	// THE COMMAND HAS TO RUN WHERE THE CREDENTIALS ARE, and the two cases put
 	// that in different places. A workstation build reads the three values out
 	// of the Terraform state it has; a controller build has neither that
 	// directory nor that state, so its command carries the values literally —
 	// which is only possible once the apply has produced them.
 	if p.Builder && p.Facts != nil {
-		b.WriteString("**On the controller**, which carries the builder grant this generation asked for, so no machine outside the deployment needs AWS credentials. Run it over whichever route you converge with; the values are written out here because the controller has no copy of the Terraform state:\n\n")
-		fmt.Fprintf(&b, "```bash\nbillet ami build --region %s \\\n  --subnet %s \\\n  --security-group %s \\\n  --payload-bucket %s \\\n  --public-ip --base-image ami-<an EBS-backed Ubuntu 24.04 image in %s>\n```\n\n",
+		b.WriteString("**On the controller**, which carries the builder grant this generation asked for, so no machine outside the deployment needs AWS credentials. Run it over whichever route you converge with; the values are written out here because the controller has no copy of the Terraform state")
+
+		if p.Cache {
+			b.WriteString(", and `cache-ca.pem` has to be on the controller too, since that is where the command runs")
+		}
+
+		b.WriteString(":\n\n")
+		fmt.Fprintf(&b, "```bash\nbillet ami build --region %s \\\n  --subnet %s \\\n  --security-group %s \\\n  --payload-bucket %s%s \\\n  --public-ip --base-image ami-<an EBS-backed Ubuntu 24.04 image in %s>\n```\n\n",
 			shellArg(p.Region),
 			shellArg(p.Facts.SubnetID),
 			shellArg(p.Facts.RunnerSecurityGroupID),
 			shellArg(p.Facts.AMIPayloadBucket),
+			caCert,
 			p.Region)
 	} else {
 		if p.Builder {
@@ -679,8 +709,8 @@ func renderHybridRunbook(in hybridInputs, p initconfig.HybridParams, trusted, ca
 		} else {
 			b.WriteString("From a workstation with your own AWS credentials: the node role carries no builder grant. Generate with `--builder` to move this onto the controller instead.\n\n")
 		}
-		fmt.Fprintf(&b, "```bash\nbillet ami build --region %s \\\n  --subnet \"$(terraform -chdir=%s output -raw subnet_id)\" \\\n  --security-group \"$(terraform -chdir=%s output -raw runner_security_group_id)\" \\\n  --payload-bucket \"$(terraform -chdir=%s output -raw ami_payload_bucket)\" \\\n  --public-ip --base-image ami-<an EBS-backed Ubuntu 24.04 image in %s>\n```\n\n",
-			shellArg(p.Region), tf, tf, tf, p.Region)
+		fmt.Fprintf(&b, "```bash\nbillet ami build --region %s \\\n  --subnet \"$(terraform -chdir=%s output -raw subnet_id)\" \\\n  --security-group \"$(terraform -chdir=%s output -raw runner_security_group_id)\" \\\n  --payload-bucket \"$(terraform -chdir=%s output -raw ami_payload_bucket)\"%s \\\n  --public-ip --base-image ami-<an EBS-backed Ubuntu 24.04 image in %s>\n```\n\n",
+			shellArg(p.Region), tf, tf, tf, caCert, p.Region)
 	}
 	b.WriteString("Pass `--public-ip`: the created subnet's only route is an internet gateway, which is unusable without an address. The command boots the image it made and stamps it only after it proved itself.\n\n")
 
@@ -689,7 +719,7 @@ func renderHybridRunbook(in hybridInputs, p initconfig.HybridParams, trusted, ca
 		// THE LISTENER APPEARS IN THIS RENDER, so its pair has to exist before the
 		// converge that installs it: the role copies whatever the two variables
 		// name to the paths the config carries, and refuses half a pair.
-		fmt.Fprintf(&b, "This render adds the cloud cache, so the converge below needs its TLS pair: the orchestrator terminates HTTPS for job instances that fetch across the VPC, and the certificate has to be valid for the address a guest dials (%s). Hand it over the way the App key was handed over, and the role installs it to the paths the config names:\n\n```bash\nexport BILLET_CACHE_TLS_CERT_PATH=<your cert.pem>\nexport BILLET_CACHE_TLS_KEY_PATH=<your key.pem>\n```\n\n",
+		fmt.Fprintf(&b, "This render adds the cloud cache, so the converge below needs the LEAF of the pair whose issuer step 6 baked into the image: the orchestrator terminates HTTPS for job instances that fetch across the VPC, and the certificate has to be valid for the address a guest dials (%s) and be signed by that same `cache-ca.pem`, or the anchor in the image matches nothing. Hand it over the way the App key was handed over, and the role installs it to the paths the config names:\n\n```bash\nexport BILLET_CACHE_TLS_CERT_PATH=<your cert.pem>\nexport BILLET_CACHE_TLS_KEY_PATH=<your key.pem>\n```\n\n",
 			cacheAddress)
 	}
 	fmt.Fprintf(&b, "```bash\nbillet init hybrid --out %s %s --terraform-output outputs.json --commission --ami ami-<from step 6>\nansible-playbook -i inventory.yml site.yml -l %s\nansible-playbook -i inventory.yml site.yml -l %s\n```\n\n",
