@@ -104,10 +104,19 @@ func TestTheCheckCommandJudgesTheCacheProbesOwnAnswer(t *testing.T) {
 		t.Fatal("ec2Preflight is gone from main.go; this guard is checking nothing")
 	}
 
-	var judged bool
+	// THE CALL MUST BE THE SWITCH'S SUBJECT, not merely present. `_ =
+	// judgeCacheProbe(probeErr)` beside a switch that decides some other way
+	// satisfies "the call exists", which is the mechanism-versus-use gap this
+	// whole file is about.
+	var verdict *ast.SwitchStmt
 
 	ast.Inspect(preflight, func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
+		stmt, ok := n.(*ast.SwitchStmt)
+		if !ok {
+			return true
+		}
+
+		call, ok := stmt.Tag.(*ast.CallExpr)
 		if !ok {
 			return true
 		}
@@ -118,16 +127,47 @@ func TestTheCheckCommandJudgesTheCacheProbesOwnAnswer(t *testing.T) {
 		}
 
 		if arg, ok := call.Args[0].(*ast.Ident); ok && arg.Name == "probeErr" {
-			judged = true
+			verdict = stmt
 		}
 
 		return true
 	})
 
-	if !judged {
-		t.Error("ec2Preflight does not judge the cache probe's own error through " +
-			"judgeCacheProbe, so a refused identity and a bucket that does not exist " +
-			"are reported the same way")
+	if verdict == nil {
+		t.Fatal("ec2Preflight does not switch on judgeCacheProbe(probeErr), so a refused " +
+			"identity and a bucket that does not exist are not told apart by the judgement " +
+			"that knows the difference")
+	}
+
+	// AND EACH VERDICT MUST STILL DO ITS THING. A switch naming all three and
+	// acting on none is the same silence as no switch at all; the one that has to
+	// be a REFUSAL is the failure, because that is the branch a misaddressed
+	// bucket now reaches.
+	clauses := map[string]*ast.CaseClause{}
+
+	for _, stmt := range verdict.Body.List {
+		clause, ok := stmt.(*ast.CaseClause)
+		if !ok {
+			continue
+		}
+
+		for _, expr := range clause.List {
+			if name, ok := expr.(*ast.Ident); ok {
+				clauses[name.Name] = clause
+			}
+		}
+	}
+
+	handled := []string{"cacheProbeAnswered", "cacheProbeInconclusive", "cacheProbeFailed"}
+	for _, want := range handled {
+		if clauses[want] == nil {
+			t.Errorf("the cache probe's switch does not handle %s", want)
+		}
+	}
+
+	if failed := clauses["cacheProbeFailed"]; failed != nil && !returnsSomething(failed) {
+		t.Error("the cacheProbeFailed branch does not return, so a bucket that does not exist " +
+			"leaves `billet check` reporting success")
 	}
 
 	// AND IT MUST NOT GO BACK TO THE MESSAGE. A strings.Contains over anything's
@@ -164,4 +204,16 @@ func TestTheCheckCommandJudgesTheCacheProbesOwnAnswer(t *testing.T) {
 
 		return true
 	})
+}
+
+// returnsSomething reports whether a case clause returns a value.
+func returnsSomething(clause *ast.CaseClause) bool {
+	for _, stmt := range clause.Body {
+		ret, ok := stmt.(*ast.ReturnStmt)
+		if ok && len(ret.Results) > 0 {
+			return true
+		}
+	}
+
+	return false
 }

@@ -224,7 +224,10 @@ func (s s3API) refusalError(op string, refusal *awss3.Refusal, response *http.Re
 	// answers too, and "the bucket's region is us-west-2" beside a config that
 	// says us-west-2 is a diagnostic that sends an operator hunting.
 	if hint := awss3.RegionHint(response); hint != "" && hint != s.cfg.Region {
-		return fmt.Errorf("ebs-s3: S3 %s returned %w; the bucket's region is %s and "+
+		// QUOTED, because it is a header the far side chose. awss3.RegionHint has
+		// already refused anything but bounded printable bytes; the quoting is
+		// what keeps it visibly a value rather than part of the sentence.
+		return fmt.Errorf("ebs-s3: S3 %s returned %w; the bucket's region is %q and "+
 			"node.ebs_s3.region says %s", op, refusal, hint, s.cfg.Region)
 	}
 

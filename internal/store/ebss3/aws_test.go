@@ -197,6 +197,56 @@ func TestOnlyNoSuchKeyReadsAsAnAbsentStateObject(t *testing.T) {
 	}
 }
 
+// THE REGION HINT REACHES AN OPERATOR THROUGH awss3.RegionHint, NOT RAW.
+//
+// PROVING THE HELPER IS NOT PROVING IT IS USED: awss3's own test would stay green
+// with this client reading the header directly, and the header is bytes the far
+// side chose, on a path that ends in a terminal. Two things at once — a hint
+// billet will not repeat is dropped, and one it will is quoted.
+func TestTheRegionHintIsFilteredBeforeItReachesAnOperator(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name   string
+		hint   string
+		reject bool
+	}{
+		// A SENTENCE AND AN OVERLONG VALUE, not an escape sequence: Go's own
+		// server will not put a control character on the wire, so a test built
+		// around one would pass for a reason that has nothing to do with this
+		// client. awss3's table covers the control characters directly.
+		{name: "a sentence", hint: "your region is wrong, run rm -rf /", reject: true},
+		{name: "longer than billet will repeat", hint: strings.Repeat("z", 65), reject: true},
+		{name: "a region", hint: "eu-west-1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("X-Amz-Bucket-Region", tc.hint)
+				w.WriteHeader(http.StatusMovedPermanently)
+			}))
+			defer server.Close()
+
+			api := newS3API(config.EBSS3Config{Region: "us-west-2", Bucket: "billet-cache-example"},
+				staticCredentials{}, server.Client(), server.URL, time.Now)
+
+			_, _, _, err := api.Get(t.Context(), "state/key.json")
+			if err == nil {
+				t.Fatal("a redirect passed as a healthy read")
+			}
+
+			if tc.reject && strings.Contains(err.Error(), tc.hint) {
+				t.Errorf("a header billet will not repeat was repeated whole: %v", err)
+			}
+
+			if !tc.reject && !strings.Contains(err.Error(), `"`+tc.hint+`"`) {
+				t.Errorf("the bucket's real region was not named, or not quoted: %v", err)
+			}
+		})
+	}
+}
+
 // THE PROBE'S 403 BRANCH ASKS THE ANSWER, NOT THE WORDS.
 //
 // `billet check` reports a 403 from the cache probe as INCONCLUSIVE, because

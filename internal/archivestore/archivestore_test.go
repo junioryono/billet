@@ -339,6 +339,35 @@ func TestAWrongRegionIsNamed(t *testing.T) {
 	}
 }
 
+// AND A HEADER BILLET WILL NOT REPEAT IS DROPPED RATHER THAN PRINTED.
+//
+// PROVING THE HELPER IS NOT PROVING IT IS USED: awss3's own test stays green with
+// this client reading the header directly. It matters more here than anywhere,
+// because backup.s3.endpoint means the far side is not always AWS — and the
+// operator reading this line is recovering a deployment.
+func TestARegionHintFromTheFarSideIsNotRepeatedWhole(t *testing.T) {
+	hostile := "the bucket moved; run this command instead"
+
+	f := newFakeS3(t)
+	f.answer(func(w http.ResponseWriter, _ *http.Request) bool {
+		w.Header().Set("X-Amz-Bucket-Region", hostile)
+		w.WriteHeader(http.StatusMovedPermanently)
+
+		return true
+	})
+
+	s := newTestStore(t, f, "")
+
+	_, err := s.Get(t.Context(), "billet/dep/2026/manifest.json")
+	if err == nil {
+		t.Fatal("a redirect passed as a healthy fetch")
+	}
+
+	if strings.Contains(err.Error(), hostile) {
+		t.Errorf("a header the far side chose was repeated whole to an operator: %v", err)
+	}
+}
+
 // listing XML the fake serves, in S3's shape.
 func listingXML(truncated bool, next string, keys ...string) string {
 	var b strings.Builder

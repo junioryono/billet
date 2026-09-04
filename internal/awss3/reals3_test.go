@@ -54,16 +54,20 @@ func TestRealS3TellsAMissingBucketFromAMissingKey(t *testing.T) {
 	t.Run("a missing key in a bucket that exists", func(t *testing.T) {
 		refusal := probe(t, s3Get{bucket: bucket, region: region, key: key, creds: creds})
 
-		// A TEST ROLE THAT CANNOT LIST IS A SETUP PROBLEM, NOT A MODEL PROBLEM.
-		// S3 answers 403 rather than NoSuchKey for a miss when the caller holds
-		// no s3:ListBucket for the prefix — that is the very behaviour
-		// internal/store/ebss3's CheckAccess is written around — so failing here
-		// would report billet's model of S3 as wrong when what is wrong is the
-		// credential this run was given.
+		// A REFUSED IDENTITY IS NAMED AS THAT, AND IT STILL FAILS. S3 answers 403
+		// rather than NoSuchKey for a miss when the caller holds no s3:ListBucket
+		// for the prefix — the very behaviour internal/store/ebss3's CheckAccess
+		// is written around — so the diagnostic says which of the two went wrong.
+		// It is not a SKIP: somebody set both variables and supplied a credential
+		// in order to take this measurement, and a green run that measured
+		// nothing is the silence this repository keeps a list of. The half that
+		// needs no permission still runs.
 		if refusal.Status == http.StatusForbidden {
-			t.Skipf("this identity was refused (%s) rather than told the key is missing; "+
-				"S3 answers NoSuchKey only to a caller holding s3:ListBucket on %q for "+
-				"this prefix", refusal, bucket)
+			t.Fatalf("this identity was refused (%s) rather than told the key is missing, so "+
+				"this run measured nothing: S3 answers %s only to a caller holding "+
+				"s3:ListBucket on %q for this prefix. Point the two BILLET_S3_TEST_* "+
+				"variables at a bucket this credential can list", refusal, CodeNoSuchKey,
+				bucket)
 		}
 
 		if refusal.Status != http.StatusNotFound || refusal.Code != CodeNoSuchKey {

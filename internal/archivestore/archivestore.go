@@ -429,7 +429,10 @@ func (s S3) refusalError(
 	op, key string, refusal *awss3.Refusal, response *http.Response,
 ) error {
 	if hint := awss3.RegionHint(response); hint != "" && hint != s.cfg.Region {
-		return fmt.Errorf("archivestore: %s %s returned %w; the bucket's region is %s and "+
+		// QUOTED, because it is a header the far side chose. awss3.RegionHint has
+		// already refused anything but bounded printable bytes; the quoting is
+		// what keeps it visibly a value rather than part of the sentence.
+		return fmt.Errorf("archivestore: %s %s returned %w; the bucket's region is %q and "+
 			"backup.s3.region says %s", op, key, refusal, hint, s.cfg.Region)
 	}
 

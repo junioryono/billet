@@ -149,23 +149,39 @@ func ParseRefusal(status int, body []byte) *Refusal {
 		return refusal
 	}
 
-	// THE ROOT ELEMENT MUST BE <Error>. Without pinning it, a <Code> element
-	// nested in some other document — a listing, a proxy's own XML — would be
-	// read as S3's verdict on this request.
-	//
-	// AND THE CODES ARE COLLECTED RATHER THAN ASSIGNED. Into a string field,
+	// THE CODES ARE COLLECTED RATHER THAN ASSIGNED. Into a string field,
 	// encoding/xml overwrites on each match, so `<Error><Code>a</Code>
 	// <Code>b</Code></Error>` would quietly answer `b`. A document naming two
 	// codes is one billet cannot read a single verdict out of.
+	//
+	// AND EACH ONE IS READ TWICE, AS TEXT AND AS RAW XML. Unmarshalling into a
+	// string SKIPS nested elements and concatenates the character data around
+	// them, so `<Code>NoSuch<x>Bucket</x>Key</Code>` answers `NoSuchKey` — a code
+	// billet assembled out of a document it did not understand. Requiring the two
+	// readings to be equal is what says the element is text and nothing else. It
+	// refuses CDATA and entity references too, which S3 does not send and which
+	// would each be a second spelling of a verdict.
 	var document struct {
-		XMLName xml.Name `xml:"Error"`
-		Codes   []string `xml:"Code"`
+		Codes []struct {
+			XMLName xml.Name
+			Text    string `xml:",chardata"`
+			Inner   string `xml:",innerxml"`
+		} `xml:"Code"`
 	}
 
-	decoder := xml.NewDecoder(bytes.NewReader(body))
+	// STRIPPED BEFORE THE DECODER SEES IT. Go hands a leading byte-order mark
+	// back as character data, which is not whitespace, and rootOf would then
+	// refuse a document that is otherwise exactly right — turning a healthy miss
+	// into a failure on any S3-compatible endpoint that emits one.
+	decoder := xml.NewDecoder(bytes.NewReader(bytes.TrimPrefix(body, utf8BOM)))
 
+	// THE ELEMENT MUST BE S3's OWN <Error>, IN NO NAMESPACE. An encoding/xml tag
+	// without a namespace matches ANY namespace, so `<x:Error xmlns:x="urn:not-s3">`
+	// would otherwise be read as S3's verdict on this request; and without the
+	// name pinned at all, a <Code> inside some other document — a listing, a
+	// proxy's own XML — would be. Both measured bodies carry no namespace.
 	start, ok := rootOf(decoder)
-	if !ok {
+	if !ok || start.Name != (xml.Name{Local: "Error"}) {
 		return refusal
 	}
 
@@ -177,7 +193,12 @@ func ParseRefusal(status int, body []byte) *Refusal {
 		return refusal
 	}
 
-	code := strings.TrimSpace(document.Codes[0])
+	only := document.Codes[0]
+	if only.XMLName != (xml.Name{Local: "Code"}) || only.Inner != only.Text {
+		return refusal
+	}
+
+	code := strings.TrimSpace(only.Text)
 	if !codeShape.MatchString(code) {
 		return refusal
 	}
@@ -186,6 +207,9 @@ func ParseRefusal(status int, body []byte) *Refusal {
 
 	return refusal
 }
+
+// utf8BOM is the byte-order mark some XML writers put in front of a document.
+var utf8BOM = []byte{0xEF, 0xBB, 0xBF}
 
 // rootOf returns the body's one element, provided nothing but a prolog came
 // before it.
@@ -248,19 +272,26 @@ func carriesNoVerdict(token xml.Token) bool {
 	}
 }
 
-// regionShape is what an AWS region name looks like.
+// hintShape is what billet will repeat out of a header.
 //
 // THE HINT IS REMOTE BYTES TOO. X-Amz-Bucket-Region lands in an operator's
 // terminal beside the code, and the code is shape-checked for exactly that
 // reason; a header is no more trustworthy than a body, and archivestore takes a
 // configured endpoint, so the far side is not always AWS.
-var regionShape = regexp.MustCompile(`^[a-z0-9-]{1,32}$`)
+//
+// IT IS NOT AN AWS REGION SHAPE, AND DELIBERATELY NOT. What has to be true is
+// that the bytes are bounded and safe to print — printable ASCII, no spaces, no
+// control characters — not that they name a region billet has heard of. A Ceph
+// RGW or MinIO deployment signs with whatever region name its operator chose,
+// and judging the name would throw away the only wrong-region diagnostic those
+// deployments get. It is quoted where it is rendered.
+var hintShape = regexp.MustCompile(`^[!-~]{1,64}$`)
 
 // RegionHint reports the bucket's real region when S3 named one.
 //
 // S3 answers a wrong-region request with a redirect carrying this header, and an
 // operator staring at a bare 301 has no other way to see that their region is
-// wrong. It is empty when the header is absent or is not a name billet will
+// wrong. It is empty when the header is absent or is not something billet will
 // repeat.
 func RegionHint(response *http.Response) string {
 	if response == nil {
@@ -268,7 +299,7 @@ func RegionHint(response *http.Response) string {
 	}
 
 	hint := strings.TrimSpace(response.Header.Get("X-Amz-Bucket-Region"))
-	if !regionShape.MatchString(hint) {
+	if !hintShape.MatchString(hint) {
 		return ""
 	}
 

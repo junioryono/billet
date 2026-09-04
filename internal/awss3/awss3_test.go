@@ -134,6 +134,56 @@ func TestOnlyNoSuchKeyAtFourOhFourIsAbsence(t *testing.T) {
 			body: noSuchKeyDocument + "\n", code: CodeNoSuchKey, absent: true,
 		},
 		{
+			// A CODE ASSEMBLED OUT OF MARKUP IS NOT A CODE. Unmarshalling into a
+			// string skips the nested element and concatenates the text around
+			// it, so this reads as "NoSuchKey" — out of a document that says
+			// something else entirely.
+			name: "a code with markup inside it", status: http.StatusNotFound,
+			body: "<Error><Code>NoSuch<Unexpected>Bucket</Unexpected>Key</Code></Error>",
+		},
+		{
+			// AN ENCODING/XML TAG WITHOUT A NAMESPACE MATCHES ANY NAMESPACE, so
+			// without pinning the name whole, somebody else's vocabulary gets to
+			// say that an object is absent. Both measured bodies carry none.
+			name:   "a namespaced error document",
+			status: http.StatusNotFound,
+			body: `<x:Error xmlns:x="urn:not-s3"><x:Code>NoSuchKey</x:Code>` +
+				`</x:Error>`,
+		},
+		{
+			name:   "an unqualified error naming a namespaced code",
+			status: http.StatusNotFound,
+			body:   `<Error xmlns:x="urn:not-s3"><x:Code>NoSuchKey</x:Code></Error>`,
+		},
+		{
+			// A BODY WITH NO ELEMENT AT ALL. rootOf runs out of tokens, and a
+			// prolog on its own says nothing about an object.
+			name: "a prolog and nothing else", status: http.StatusNotFound,
+			body: `<?xml version="1.0" encoding="UTF-8"?>` + "\n",
+		},
+		{
+			// A DOCTYPE IS PROLOG, and refusing a document over one would be the
+			// expensive mistake rather than the safe one.
+			name: "an error document behind a doctype", status: http.StatusNotFound,
+			body: "<!DOCTYPE Error>\n<Error><Code>NoSuchKey</Code></Error>",
+			code: CodeNoSuchKey, absent: true,
+		},
+		{
+			// THE SAME TOLERANCE AT THE OTHER END, which is the symmetry the two
+			// guards are written to have.
+			name: "an error document with a comment after it", status: http.StatusNotFound,
+			body: "<Error><Code>NoSuchKey</Code></Error><!-- cached -->\n",
+			code: CodeNoSuchKey, absent: true,
+		},
+		{
+			// A BYTE-ORDER MARK IS NOT CHARACTER DATA ANYBODY MEANT. Go hands it
+			// back as CharData, which is not whitespace, so without stripping it
+			// an otherwise perfect document from an S3-compatible endpoint would
+			// be refused — a healthy miss turned into a failure.
+			name: "a document behind a byte-order mark", status: http.StatusNotFound,
+			body: "\xef\xbb\xbf" + noSuchKeyDocument, code: CodeNoSuchKey, absent: true,
+		},
+		{
 			// THE STATUS IS HALF THE ANSWER. The code says what S3 thinks and the
 			// status says how it answered; a code alone would let a body that
 			// arrived with some other status decide that an object is missing.
