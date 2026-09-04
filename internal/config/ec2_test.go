@@ -868,3 +868,55 @@ func TestTheDNSSuffixIsThePartitionsOwn(t *testing.T) {
 		}
 	}
 }
+
+// A VPC ENDPOINT'S HOST NEEDS THE ENDPOINT'S OWN LABEL, and a suffix match alone
+// does not ask for one.
+//
+// The private form is matched by suffix because the label is the operator's endpoint
+// id, which billet cannot know. That accepted `.sqs.<region>.vpce.<suffix>` with no
+// label at all, and `..sqs.` and `a_b!.sqs.` with labels that are not hostnames —
+// none of which DNS can resolve, so each reaches a node as exactly the silence a
+// wrong partition produces: no interruption warning, no error, a lease charged until
+// it expires.
+//
+// WHAT IS ASSERTED IS THE SHAPE OF A HOSTNAME, not AWS's `vpce-` naming. A label
+// billet cannot measure is not one it should legislate, so `two.labels.sqs...` stays
+// accepted: it is a well-formed name inside AWS's own zone, and refusing it would be
+// this validator inventing a rule about somebody else's product.
+func TestASpotQueueVPCEndpointNeedsItsOwnLabel(t *testing.T) {
+	t.Parallel()
+
+	const tail = ".sqs.us-west-2.vpce.amazonaws.com/123456789012/aws-1"
+
+	for name, host := range map[string]string{
+		"no label at all":  "https://" + tail,
+		"an empty label":   "https://." + tail,
+		"an illegal label": "https://a_b!" + tail,
+		"a trailing dot":   "https://vpce-0a1b." + tail,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			got := loadErr(t, spotConfig(t, "us-west-2", host))
+
+			if !strings.Contains(got, "hostname label") {
+				t.Errorf("the error does not say the endpoint's own label is missing: %s", got)
+			}
+		})
+	}
+
+	// ACCEPTED, and both are the reason the rule is a shape: one label is what AWS
+	// hands out, and several are still a hostname under the same zone.
+	for name, host := range map[string]string{
+		"one label":    "https://vpce-0a1b-2c3d" + tail,
+		"more of them": "https://vpce-0a1b.zonal.us-west-2a" + tail,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			if _, err := Load(writeConfig(t, spotConfig(t, "us-west-2", host))); err != nil {
+				t.Fatalf("a well-formed VPC endpoint host was refused: %v", err)
+			}
+		})
+	}
+}

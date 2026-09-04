@@ -4579,6 +4579,13 @@ func AWSDNSSuffix(region string) string {
 	return "amazonaws.com"
 }
 
+// vpcEndpointLabelRe is the hostname shape a VPC endpoint's own labels must have in
+// front of `.sqs.<region>.vpce.<suffix>`: begins and ends alphanumeric, with letters,
+// digits, dots and hyphens between. It is registryMirrorOriginRe's host group, for
+// the same reason that one refuses a terminal root dot — a host that does not end
+// alphanumeric is not a second spelling of one that does.
+var vpcEndpointLabelRe = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$`)
+
 // CheckSQSQueueURL refuses a warning queue that cannot be signed safely.
 //
 // THE SUFFIX IS SELECTED BY THE REGION, NEVER OFFERED AS A CHOICE. This admitted
@@ -4618,12 +4625,25 @@ func CheckSQSQueueURL(raw, region string) error {
 	host := strings.ToLower(u.Hostname())
 	suffix := AWSDNSSuffix(region)
 	standard := host == "sqs."+region+"."+suffix || host == region+".queue."+suffix
-	private := strings.HasSuffix(host, ".sqs."+region+".vpce."+suffix)
+
+	// THE VPC-ENDPOINT FORM STILL HAS TO BE A HOSTNAME. A bare suffix match accepts
+	// `.sqs.<region>.vpce.<suffix>` with no endpoint label at all, and `..sqs.` and
+	// `a_b!.sqs.` with labels that are not ones — each an address DNS cannot resolve,
+	// reaching a node as the same silence a wrong partition does. What is checked is
+	// the SHAPE of a hostname, the one registryMirrorOriginRe already settled on for
+	// the same question, and not AWS's `vpce-` naming: the endpoint's own label is a
+	// fact about somebody else's product that billet has no way to measure here.
+	var private bool
+	if prefix, ok := strings.CutSuffix(host, ".sqs."+region+".vpce."+suffix); ok {
+		private = vpcEndpointLabelRe.MatchString(prefix)
+	}
+
 	if !standard && !private {
 		return fmt.Errorf("node.ec2.interruption_queue_url must name an SQS endpoint in "+
-			"node.ec2.region %q, whose partition serves sqs.%s.%s, %s.queue.%s and "+
-			"<endpoint>.sqs.%s.vpce.%s; the other partition's suffix names no host in "+
-			"this region, and billet signs every queue request for this region",
+			"node.ec2.region %q: sqs.%s.%s, the legacy %s.queue.%s, or "+
+			"<endpoint>.sqs.%s.vpce.%s with the VPC endpoint's own hostname label in "+
+			"front; the other partition's suffix names no host in this region, and "+
+			"billet signs every queue request for this region",
 			region, region, suffix, region, suffix, region, suffix)
 	}
 
