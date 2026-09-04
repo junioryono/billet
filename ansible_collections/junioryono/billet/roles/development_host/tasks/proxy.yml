@@ -103,6 +103,7 @@
   ansible.builtin.uri:
     url: "http://{{ billet_development_proxy_admin }}/config/"
     status_code: 200
+    timeout: "{{ billet_development_fetch_timeout }}"
   register: billet_development_proxy_ready
   until: billet_development_proxy_ready.status == 200
   retries: 10

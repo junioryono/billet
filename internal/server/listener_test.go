@@ -2312,37 +2312,33 @@ func newBareAllocator(t *testing.T, limits alloc.Limits, tiers []config.Tier,
 // as one lasts, the reaper terminalises the leases, and the poll returns an
 // assignment backed by a lease this listener no longer holds.
 func TestEscrowSurvivesAPollLongerThanTheLeaseTTL(t *testing.T) {
-	// Long enough that renewal at ttl/3 is not competing with goroutine scheduling
-	// jitter under a loaded `make check`: at 150ms it fired every 50ms and failed
-	// twice under full runs while never failing in isolation. Production is
-	// unaffected — 90s TTL with 60s of slack — so the ratio was never at risk.
+	// THE CLOCK IS THE TEST'S, NOT THE MACHINE'S. An earlier version slept for
+	// five TTLs and let the listener's heartbeat ticker race a real-time reaper;
+	// it passed alone and failed under a loaded CI runner (#35), because the
+	// property is arithmetic on a clock and a wall-clock sleep only measures how
+	// busy the machine was. Both sides of the property read the allocator's
+	// clock: the reaper expires against it and a renewal stamps with it, so
+	// moving it is what a long poll IS as far as the ledger is concerned.
 	const ttl = 600 * time.Millisecond
+
+	clock := newTestClock()
 
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
 
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
-		alloc.WithLeaseTTL(ttl))
+		alloc.WithLeaseTTL(ttl), alloc.WithClock(clock.Now))
 
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer cancel()
 
-	// The reaper has to be running, or nothing punishes a missed heartbeat and
-	// this passes against an implementation with no heartbeats at all.
-	go func() {
-		tick := time.NewTicker(ttl / 5)
-		defer tick.Stop()
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-tick.C:
-				if _, err := a.Reap(ctx); err != nil && ctx.Err() == nil {
-					t.Errorf("Reap: %v", err)
-				}
-			}
-		}
-	}()
+	// THE REAL LOOP, FED BY HAND. The ticks go to the goroutine Run starts, not
+	// to a pass this test calls itself: a test that renewed the leases from
+	// inside the poll would pass against a listener whose heartbeats stopped
+	// for the length of a poll, which is the regression this test exists for.
+	// Each send is followed by a wait for the pass it caused, bounded so that a
+	// loop that is not running fails the test instead of hanging it.
+	ticks := make(chan time.Time)
+	passed := make(chan struct{})
 
 	var (
 		polls    atomic.Int32
@@ -2352,6 +2348,8 @@ func TestEscrowSurvivesAPollLongerThanTheLeaseTTL(t *testing.T) {
 	)
 
 	l := NewListener(a, "billet-4vcpu-a", nil)
+	l.heartbeatTicks = ticks
+	l.heartbeatPassed = func() { passed <- struct{}{} }
 
 	l.session = &fakeSession{onPoll: func(int) {
 		switch polls.Add(1) {
@@ -2362,7 +2360,38 @@ func TestEscrowSurvivesAPollLongerThanTheLeaseTTL(t *testing.T) {
 			// unless something renews them on a clock of its own.
 			held := l.Held()
 
-			time.Sleep(5 * ttl)
+			// The stall, step by step: the clock moves a heartbeat interval,
+			// the loop is handed the tick it would have seen and the pass it
+			// makes is waited for, then the reaper looks. Fifteen steps of
+			// ttl/3 are five TTLs. Two mutations were checked against this:
+			// WITH THE RENEWAL REMOVED from heartbeatHeld the third Reap
+			// reclaims every lease and the assertion below goes red; WITH THE
+			// LOOP NOT STARTED by Run, or its pass moved to after the poll,
+			// nothing takes the tick and the wait below fails the test.
+			for range 15 {
+				clock.advance(ttl / 3)
+
+				select {
+				case ticks <- clock.Now():
+				case <-time.After(5 * time.Second):
+					t.Error("the heartbeat loop took no tick while the poll was blocked; " +
+						"heartbeats are bounded by the poll again")
+
+					return
+				}
+
+				select {
+				case <-passed:
+				case <-time.After(5 * time.Second):
+					t.Error("the heartbeat loop took a tick and made no pass")
+
+					return
+				}
+
+				if _, err := a.Reap(ctx); err != nil {
+					t.Errorf("Reap: %v", err)
+				}
+			}
 
 			// Checked HERE, not after Run returns: shutdown releases the escrow, so by then
 			// every lease is legitimately terminal and the assertion would fire against correct
@@ -2403,6 +2432,30 @@ func TestEscrowSurvivesAPollLongerThanTheLeaseTTL(t *testing.T) {
 		t.Errorf("could not renew an escrowed lease after a poll longer than the TTL (%v); "+
 			"it was reaped mid-poll, so heartbeats are still bounded by the poll cadence", err)
 	}
+}
+
+// testClock is a clock a test moves by hand, for the allocator's WithClock.
+type testClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func newTestClock() *testClock {
+	return &testClock{now: time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)}
+}
+
+func (c *testClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.now
+}
+
+func (c *testClock) advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.now = c.now.Add(d)
 }
 
 // A backlog GitHub already assigned has to be SAID, not merely stored.

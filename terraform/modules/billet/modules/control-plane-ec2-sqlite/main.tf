@@ -152,6 +152,11 @@ resource "aws_instance" "control_plane" {
   iam_instance_profile   = local.profile_name
   key_name               = var.key_name != "" ? var.key_name : null
 
+  # DECLARED, NOT OBSERVED, when the caller says so. null leaves the choice to
+  # AWS exactly as before the input existed, so an applied deployment that
+  # never sets private_ip plans nothing.
+  private_ip = var.private_ip != "" ? var.private_ip : null
+
   metadata_options {
     http_tokens   = "required" # IMDSv2 only
     http_endpoint = "enabled"
@@ -169,6 +174,29 @@ resource "aws_instance" "control_plane" {
       # this precondition is where it fails the plan.
       condition     = var.subnet_in_vpc_ok
       error_message = "subnet_id is not in vpc_id — an adopted subnet must belong to the adopted VPC, whose security groups the launch uses."
+    }
+
+    # A DECLARED ADDRESS IS PROVED AT PLAN, not refused by RunInstances after
+    # the network is built. cidrsubnet with no new bits masks the host part, so
+    # the address at the subnet's prefix length equals the subnet's own network
+    # exactly when the address lies inside it (measured on terraform 1.14).
+    precondition {
+      condition = (
+        var.private_ip == "" || var.subnet_cidr == "" ||
+        cidrsubnet("${var.private_ip}/${split("/", var.subnet_cidr)[1]}", 0, 0) == cidrsubnet(var.subnet_cidr, 0, 0)
+      )
+      error_message = "private_ip ${var.private_ip} is not inside subnet_cidr ${var.subnet_cidr}; RunInstances would refuse it."
+    }
+
+    # AWS RESERVES FIVE ADDRESSES IN EVERY SUBNET: the network address, the
+    # VPC router, the DNS resolver, one held for future use, and the broadcast
+    # address. cidrhost(-1) is the last address of the block.
+    precondition {
+      condition = (
+        var.private_ip == "" || var.subnet_cidr == "" ||
+        !contains([for i in [0, 1, 2, 3, -1] : cidrhost(var.subnet_cidr, i)], var.private_ip)
+      )
+      error_message = "private_ip ${var.private_ip} is one of the five addresses AWS reserves in ${var.subnet_cidr} (the first four and the last); RunInstances would refuse it."
     }
   }
 

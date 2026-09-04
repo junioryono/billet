@@ -52,6 +52,15 @@ mock_provider "aws" {
 run "a_deployment_exists_in_a_named_zone" {
   command = apply
 
+  # THE ADDRESS AWS "HANDED" THE INSTANCE, made a real one: the mock would
+  # otherwise invent a string that is not an IPv4 address, and the run below
+  # that declares it back would be refused by the variable's own validation
+  # rather than proving anything about replacement.
+  override_resource {
+    target = module.control_plane.aws_instance.control_plane
+    values = { private_ip = "10.60.0.10" }
+  }
+
   variables {
     name                     = "billet-test"
     subnet_availability_zone = "us-east-1b"
@@ -84,5 +93,44 @@ run "a_changed_zone_does_not_move_an_applied_subnet" {
   assert {
     condition     = module.control_plane.availability_zone == "us-east-1b"
     error_message = "the ledger's zone must not move either: the child creates the volume in the zone it receives"
+  }
+}
+
+# THE ADDRESS INPUT IS SAFE TO ADD TO AN APPLIED DEPLOYMENT, in both of its
+# two shapes. Undeclared, it sends null and the instance is untouched;
+# declared as the address the instance ALREADY HOLDS, the config equals the
+# state and nothing is replaced. The instance id is the witness: a replacement
+# plans an unknown id, and an unknown fails the condition rather than passing
+# it.
+run "an_undeclared_address_does_not_replace_an_applied_instance" {
+  command = plan
+
+  variables {
+    name                     = "billet-test"
+    subnet_availability_zone = "us-east-1b"
+  }
+
+  assert {
+    condition     = output.control_plane_instance_id == run.a_deployment_exists_in_a_named_zone.control_plane_instance_id
+    error_message = "leaving control_plane_private_ip unset must not replace an instance that was applied before the input existed"
+  }
+}
+
+run "declaring_the_address_an_instance_holds_replaces_nothing" {
+  command = plan
+
+  variables {
+    name                     = "billet-test"
+    subnet_availability_zone = "us-east-1b"
+    control_plane_private_ip = run.a_deployment_exists_in_a_named_zone.control_plane_private_ip
+  }
+
+  assert {
+    condition     = output.control_plane_instance_id == run.a_deployment_exists_in_a_named_zone.control_plane_instance_id
+    error_message = "declaring the address the applied instance already holds must plan no replacement; this is how an existing deployment adopts the input"
+  }
+  assert {
+    condition     = output.control_plane_private_ip == run.a_deployment_exists_in_a_named_zone.control_plane_private_ip
+    error_message = "the declared address must be the applied one"
   }
 }

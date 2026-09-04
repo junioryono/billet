@@ -149,10 +149,25 @@ locals {
 # policy's document is normalised by the provider and therefore unknown at plan,
 # so nothing could assert what it grants under the mocked test provider — and
 # what this grants is exactly the thing worth asserting.
+#
+# ON WHICHEVER ROLE THE CONTROLLER RUNS WITH. Gating this on the own identity
+# was the defect: the composed shape attaches a supplied profile, and a grant
+# that exists only beside the own role leaves that controller with a bucket it
+# cannot write to. The variable validation guarantees the name is present
+# whenever this count is non-zero and the own role is not.
+#
+# THE NAME, NOT THE ID: for aws_iam_role they are the same string, but the id is
+# computed and therefore unknown at plan, while the name is what this child
+# chose — so the grant's target, and the output that reports it, stay
+# assertable under the mocked provider.
+locals {
+  backup_role_name = var.create_instance_profile ? aws_iam_role.this[0].name : var.instance_profile_role_name
+}
+
 resource "aws_iam_role_policy" "backups" {
-  count = local.backup_enabled && var.create_instance_profile ? 1 : 0
+  count = local.backup_enabled ? 1 : 0
 
   name   = "${var.name}-control-plane-backups"
-  role   = aws_iam_role.this[0].id
+  role   = local.backup_role_name
   policy = local.backup_policy
 }

@@ -11,6 +11,14 @@ billet_development_hashicorp_signing_fingerprint: 798AEC654E5C15428C8E42EEAA16FC
 billet_development_caddy_signing_fingerprint: 65760C51EDEA2017CEA2CA15155B6D79CA56EA34
 billet_development_apt_stage: /var/cache/billet-development-host
 
+# The signing-key fetches and the proxy readiness probe are bounded and
+# retried, for the reason the host role's billet_fetch_* give: one stalled
+# connection must not fail a converge. Seconds one socket operation may stall,
+# attempts, and the delay between them.
+billet_development_fetch_timeout: 30
+billet_development_fetch_retries: 5
+billet_development_fetch_retry_delay: 5
+
 billet_development_tls_enabled: true
 billet_development_tls_caroot: "{{ billet_development_home ~ '/Library/Application Support/mkcert' if ansible_facts['system'] == 'Darwin' else billet_development_home ~ '/.local/share/mkcert' }}"
 billet_development_tls_dir: "{{ billet_development_home }}/.config/billet/development/tls"

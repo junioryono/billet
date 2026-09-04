@@ -49,9 +49,12 @@ description: "The control-plane ledger in internal/state: SQLite and PostgreSQL 
 
 **The ledger is not authoritative for cache generation pointers.** Those live in the site store (`billet-storage-and-cache`).
 
+**A promotion is as fast as the database's keepalives, and that is the operator's to set.** The election is a session advisory lock, so a partitioned leader holds the claim until PostgreSQL notices its TCP session is dead: with the server defaults (`tcp_keepalives_idle` two hours) a standby waits hours. `scripts/promotion-rehearsal.sh` runs the pair against `postgres:18-alpine` with `tcp_keepalives_idle=10 tcp_keepalives_interval=5 tcp_keepalives_count=3`, partitions the leader with `docker network disconnect`, and records partition-to-promotion and the old leader's exit and restart as a standby when the partition heals; the numbers are in `docs/reference/records/host-rehearsals.md`.
+
 ## Measured facts
 
 - `SQLITE_BUSY_SNAPSHOT` (517) appeared the moment operator commands were admitted alongside the plane, with deferred transactions.
+- A real promotion (2026-09-04, `make promotion-rehearsal`): with `tcp_keepalives_idle=10`, `_interval=5`, `_count=3` on PostgreSQL 18, the standby was promoted 21 seconds after the leader was partitioned, the node re-registered with it 62 seconds after, and the healed old leader stopped on `ErrLeadershipLost`, was restarted by systemd and stood by within 10 seconds. Under `controllers: active-passive` the first controller logs `standing by` and then `promoted to`, never `claimed`.
 - Leadership check cost: 8.3µs→15.8µs SQLite, 419µs→585µs loopback PostgreSQL, per empty write transaction.
 - sqlc's two engines: byte-identical Go with `BIGINT` casts; modernc.org/sqlite binds `$N` positionally, a repeated `$1` once, and a `$2` appearing before `$1` correctly.
 - A single em dash in a query comment shifted every parameter offset after it.

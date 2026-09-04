@@ -22,18 +22,18 @@ billet is pre-alpha. This page says what has actually run, by backend, against r
 | Actions cache interception | the live conformance matrix (host and container save/restore, BuildKit through two drivers, kill switch, pinned and embedded clients, poisoned clients) | |
 | SQLite ledger | every invariant tested; migrations frozen since the first release | |
 | PostgreSQL ledger | the suite runs against PostgreSQL 18 in CI; the allocator re-run on it; the identity-only backup and restore rehearsed with the real package | |
-| Active-passive controllers | the fence and the election under test; promotion order asserted structurally | a promotion measured under a real partition |
+| Active-passive controllers | the fence and the election under test; promotion order asserted structurally; on packaged hosts under real systemd against a real App and a real PostgreSQL: the leader cut off with `docker network disconnect`, the standby promoted 21 seconds later on server keepalives of 10/5/3 seconds, the node re-registered with it 62 seconds after the partition, and the healed old leader stopped, was restarted by systemd and stood by within 10 seconds (2026-09-04, `make promotion-rehearsal`, [Host rehearsals](records/host-rehearsals.md)) | a promotion with jobs running through it, and the identity carried by `ca sync` through a store rather than copied by hand |
 
 ## Operations
 
 | Area | Proven | Not yet |
 |---|---|---|
 | Backup and restore | rehearsed on every pull request with the real Debian package and service account; a restored control plane serves the fleet that trusted the old one | `billet local up` after a restore with a real App, on a real host |
-| Recover | tested end to end in-process, every abandon and resume state | on a real host |
-| Rollouts | the coordinator's ordering, cohorts and failure budget under test; the upgrade transaction's ordering asserted structurally; every corrupt, unsigned, expired or incompatible manifest refused | `cmd/billet`'s real host actions (stop a service, replace a binary, migrate) on a real host; whether GitHub redelivers an unacknowledged message to a new session |
+| Recover | tested end to end in-process, every abandon and resume state; on a packaged host under real systemd against a real App: a served deployment backed up, stopped with `local down`, recovered as root from the archive, restarted sealed, its node re-served, `billet resume` lifting the seal, 388 seconds end to end (2026-09-04, `make recover-rehearsal`, [Host rehearsals](records/host-rehearsals.md)) | `--abandon` of an interrupted recovery on a real host |
+| Rollouts | the coordinator's ordering, cohorts and failure budget under test; the upgrade transaction's ordering asserted structurally; every corrupt, unsigned, expired or incompatible manifest refused; two packaged hosts under real systemd reached `billet rollout start` and its refusal found that no binary through v0.6.0 verifies a published manifest ([Host rehearsals](records/host-rehearsals.md), 2026-09-04) | `cmd/billet`'s real host actions (stop a service, replace a binary, migrate) on a real host, which the rollout rehearsal reaches once a release the deployed policy accepts exists; whether GitHub redelivers an unacknowledged message to a new session |
 | Drain and the compute barrier | a real job, a real stop, a real stray container observed and blocked | |
 | Host lifecycle | `billet local up`/`down` against real systemd and the real package (`make systemd-lifecycle`); launchd facts measured on macOS 26 | |
-| CA rotation | every state of the file machine under test; enrollment across a rotation in the end-to-end suite | a rotation across a real fleet |
+| CA rotation | every state of the file machine under test; enrollment across a rotation in the end-to-end suite; on packaged hosts under real systemd against a real App: `ca rotate`, both nodes' installed certificates carrying the new issuer 788 seconds after the rotation (twenty-minute leaves), `ca retire --force` with both files of the previous pair proved absent, both nodes re-registering with a plane that trusts only the new authority, 907 seconds end to end (2026-09-04, the fourth run of `make ca-rotation-rehearsal`, [Host rehearsals](records/host-rehearsals.md)) | a rotation across a fleet whose leaves are a year long, where renewal is a matter of months |
 | Node enrollment | the whole flow in the end-to-end suite over real mTLS; certless connections refused at the listener | |
 
 ## Not built

@@ -139,6 +139,129 @@ func TestAnAcceptanceRunSharesNoStateWithTheDeploymentItCameFrom(t *testing.T) {
 	}
 }
 
+// AN ACCEPTANCE RUN NEVER MOVES ITSELF. The binary under test reports no release,
+// and the automatic starter reads a fleet reporting no release as not on the
+// channel's target: measured 2026-09-04, a snapshot-built rehearsal deployment
+// with no release block opened a rollout to v0.6.0 a minute after boot. A base
+// that says nothing about releases is on automatic updates by default, so the
+// derivation has to say no explicitly, and a base that follows a channel keeps
+// everything about it except that switch.
+func TestAnAcceptanceRunIsNeverOnAutomaticUpdates(t *testing.T) {
+	t.Parallel()
+
+	// AN ALIAS IS NOT A SCALAR. Rewriting the value in place leaves an AliasNode
+	// pointing at the anchor, which renders as the anchor's value or not at all;
+	// the derivation has to replace the node. The anchor sits on a boolean the
+	// base legitimately carries, because the base must load before it is derived.
+	aliased := strings.Replace(acceptanceBaseConfig,
+		"  lock_dir: /run/billet/locks\n",
+		"  lock_dir: /run/billet/locks\n  allow_unlocked_deployment: &on true\n", 1) +
+		"\nrelease:\n  automatic: *on\n  channel: candidate\n"
+
+	if !strings.Contains(aliased, "&on true") {
+		t.Fatal("the alias fixture did not take, so this test proves nothing about aliases")
+	}
+
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"a base that says nothing about releases", acceptanceBaseConfig},
+		{"a base that follows the candidate channel", acceptanceBaseConfig + "\nrelease:\n  channel: candidate\n"},
+		{"a base that says yes explicitly", acceptanceBaseConfig + "\nrelease:\n  automatic: true\n"},
+		{"a base that says yes through an alias", aliased},
+		{"a base with an empty release block", acceptanceBaseConfig + "\nrelease: null # left for the operator\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			base := writeAcceptanceBase(t, tc.body)
+			ws := deriveForTest(t, base, t.TempDir())
+
+			cfg, err := config.Load(ws.ConfigPath)
+			if err != nil {
+				t.Fatalf("the derived config does not load: %v", err)
+			}
+
+			if cfg.Release.AutomaticUpdates() {
+				t.Fatal("the derived deployment is on automatic updates, so its control plane " +
+					"would open a rollout to the channel and drain the node the acceptance job needs")
+			}
+
+			if strings.Contains(tc.body, "candidate") && cfg.Release.Channel != config.ChannelCandidate {
+				t.Errorf("the base's channel %q was not kept: got %q",
+					config.ChannelCandidate, cfg.Release.Channel)
+			}
+
+			// THE OPERATOR'S COMMENT SURVIVES the value it hung on being replaced.
+			if strings.Contains(tc.body, "left for the operator") {
+				derived, err := os.ReadFile(ws.ConfigPath)
+				if err != nil {
+					t.Fatalf("read the derived config: %v", err)
+				}
+
+				if !strings.Contains(string(derived), "left for the operator") {
+					t.Error("the comment on `release: null` was eaten by the derivation")
+				}
+			}
+		})
+	}
+}
+
+// THE NODE THAT DEFINES AN ANCHOR IS REFUSED, NOT REPLACED. Dropping it would leave
+// every alias dangling and the derived file unparseable; carrying the anchor onto
+// the new `false` would silently flip every other use. The base itself loads,
+// which is what makes this the derivation's refusal and not the loader's.
+func TestAnAnchoredAutomaticIsRefusedRatherThanRewritten(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name    string
+		release string
+	}{
+		// The anchor on the boolean the derivation rewrites.
+		{"on release.automatic", "release:\n  automatic: &enabled true\n"},
+		// The anchor on the release value the derivation replaces with a mapping,
+		// which is the earlier of the two replacements and must refuse the same way.
+		{"on a null release", "release: &enabled null\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			body := strings.Replace(acceptanceBaseConfig,
+				"  lock_dir: /run/billet/locks\n",
+				"  lock_dir: /run/billet/locks\n  allow_unlocked_deployment: *enabled\n", 1)
+			body = tc.release + body
+
+			if !strings.Contains(body, "*enabled") || !strings.Contains(body, "&enabled") {
+				t.Fatal("the fixture did not take, so this test proves nothing about anchors")
+			}
+
+			if _, err := config.Parse("the fixture", []byte(body)); err != nil {
+				t.Fatalf("the fixture must load before the derivation can be the one refusing: %v", err)
+			}
+
+			base := writeAcceptanceBase(t, body)
+
+			_, err := deriveAcceptance(t.Context(), acceptanceInputs{
+				base:      base,
+				workspace: t.TempDir(),
+				prefix:    defaultLabelPrefix,
+			})
+			if err == nil {
+				t.Fatal("a base whose release value defines an anchor was derived; the aliases of that " +
+					"anchor are dangling in the derived file, or were silently flipped")
+			}
+
+			// THE DERIVATION'S REFUSAL, not the loader's: a dangling alias fails
+			// later as "unknown anchor", which names nothing the operator can act on.
+			if !strings.Contains(err.Error(), "&enabled") || strings.Contains(err.Error(), "unknown anchor") {
+				t.Errorf("the refusal is not the derivation's own, naming the anchor: %v", err)
+			}
+		})
+	}
+}
+
 // THE TIER LABELS ARE THE SCALE SETS, so this is the assertion the teardown's
 // safety rests on: `billet acceptance down` runs `teardown --all` against the
 // derived config, which deletes the scale set of every tier in it.

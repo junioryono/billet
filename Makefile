@@ -347,6 +347,18 @@ release-fetch-check: ## Prove the billet_version fetch path and the URL it build
 firecracker-example-check: ## Prove the role accepts a firecracker emission, up to the hardware
 	ansible_collections/junioryono/billet/tests/firecracker-example-check.sh
 
+.PHONY: fetch-retry-check
+fetch-retry-check: ## Prove every network fetch in both roles is bounded and retried
+	ansible_collections/junioryono/billet/tests/fetch-retry-check.sh
+
+.PHONY: hybrid-emission-check
+hybrid-emission-check: ## Prove the inventory and playbook `billet init hybrid` writes are ones Ansible reads
+	ansible_collections/junioryono/billet/tests/hybrid-emission-check.sh
+
+.PHONY: hybrid-root-check
+hybrid-root-check: ## Prove the Terraform root `billet init hybrid` writes validates against this checkout's module
+	scripts/hybrid-root-check.sh
+
 .PHONY: acceptance
 acceptance: ## Run an ISOLATED acceptance deployment against a real account, and destroy exactly what it makes
 	@# NOT IN `check`, and not in CI's ordinary jobs: it launches billable compute
@@ -395,6 +407,34 @@ postgres-restore-rehearsal: dist ## Rehearse a restore of a deployment whose led
 	@# matters most: control-plane-postgres has no ledger volume by design, so that
 	@# archive is the only copy of the deployment's identity there is.
 	scripts/test-postgres-restore-rehearsal.sh
+
+# THE REAL-HOST REHEARSALS. Each drives a path that was proved only against a
+# fake onto packaged hosts under real systemd in throwaway containers, and
+# asserts on what the hosts hold afterwards (scripts/rehearsal-lib.sh). All four
+# need a config with a working GitHub App (BILLET_REHEARSAL_APP_CONFIG) and the
+# key it names (BILLET_REHEARSAL_APP_KEY), because a control plane will not start
+# without one; they SKIP rather than fail without it. Outside `check` for that
+# reason and because each runs for ten to twenty minutes; rehearsals.yml runs
+# them weekly and on dispatch, and records go to docs/reference/records/.
+.PHONY: rollout-rehearsal
+rollout-rehearsal: ## Move two packaged hosts from one PUBLISHED release to the next by rollout, then roll a bad candidate back
+	@# THE ONE REHEARSAL THAT USES PUBLISHED RELEASES rather than dist: what it
+	@# proves is that the release an operator installs today can be moved to the
+	@# next one by `billet rollout start` alone. BILLET_REHEARSAL_FROM and _TO
+	@# name the two tags.
+	scripts/rollout-rehearsal.sh
+
+.PHONY: recover-rehearsal
+recover-rehearsal: dist ## Recover a deployment a real control plane served, restart it sealed, and prove the node comes back
+	scripts/recover-rehearsal.sh
+
+.PHONY: ca-rotation-rehearsal
+ca-rotation-rehearsal: dist ## Rotate and retire the node-wire authority across two nodes that renew twenty-minute leaves
+	scripts/ca-rotation-rehearsal.sh
+
+.PHONY: promotion-rehearsal
+promotion-rehearsal: dist ## Partition the active PostgreSQL controller and measure the standby's promotion
+	scripts/promotion-rehearsal.sh
 
 .PHONY: systemd-lifecycle
 systemd-lifecycle: dist ## Drive `billet local up`/`down` against real systemd and the real package

@@ -605,3 +605,405 @@ run "auto_recovery_follows_the_partition" {
     error_message = "the recover action must follow BOTH the partition and the region; a commercial ARN in GovCloud creates an alarm that silently does nothing"
   }
 }
+
+# THE CONTROLLER'S ADDRESS, DECLARED. Four places outside this module repeat it
+# -- server.listen, every node's server_addr, the inventory's ansible_host and
+# whatever routes a node here -- and until this input existed none of them
+# decided it: the address was whatever AWS handed the ENI, and an instance
+# replacement changed it silently.
+run "a_declared_address_is_the_instances_and_the_wires" {
+  command = plan
+
+  module {
+    source = "./modules/control-plane-ec2-sqlite"
+  }
+
+  variables {
+    name              = "billet-test"
+    vpc_id            = "vpc-0f0f0f0f0f0f0f0f0"
+    subnet_id         = "subnet-0e0e0e0e0e0e0e0e0"
+    availability_zone = "us-east-1a"
+    vpc_cidr          = "10.0.0.0/16"
+    subnet_in_vpc_ok  = true
+    private_ip        = "10.0.0.10"
+    subnet_cidr       = "10.0.0.0/24"
+  }
+
+  assert {
+    condition     = aws_instance.control_plane.private_ip == "10.0.0.10"
+    error_message = "the declared address must be the one the instance launches with"
+  }
+
+  # AND IT IS PLAN-KNOWN, which is the property a consumer needs: the wire
+  # address can be written into billet.yaml and an inventory before the apply.
+  assert {
+    condition     = output.node_wire_address == "10.0.0.10:7717"
+    error_message = "the node-wire address must be the declared address and the listen port, known at plan"
+  }
+}
+
+# AN ADDRESS OUTSIDE THE SUBNET FAILS THE PLAN rather than RunInstances after
+# the network is already built. Delete the containment precondition and this
+# run passes its plan, which is the mutation it exists to catch.
+run "refuses_an_address_outside_the_subnet" {
+  command = plan
+
+  module {
+    source = "./modules/control-plane-ec2-sqlite"
+  }
+
+  variables {
+    name              = "billet-test"
+    vpc_id            = "vpc-0f0f0f0f0f0f0f0f0"
+    subnet_id         = "subnet-0e0e0e0e0e0e0e0e0"
+    availability_zone = "us-east-1a"
+    vpc_cidr          = "10.0.0.0/16"
+    subnet_in_vpc_ok  = true
+    private_ip        = "10.0.1.10"
+    subnet_cidr       = "10.0.0.0/24"
+  }
+
+  expect_failures = [aws_instance.control_plane]
+}
+
+# AWS RESERVES THE FIRST FOUR AND THE LAST ADDRESS OF EVERY SUBNET. .1 is the
+# VPC router: inside the CIDR, so the containment check alone admits it, and
+# RunInstances refuses it.
+run "refuses_a_reserved_address" {
+  command = plan
+
+  module {
+    source = "./modules/control-plane-ec2-sqlite"
+  }
+
+  variables {
+    name              = "billet-test"
+    vpc_id            = "vpc-0f0f0f0f0f0f0f0f0"
+    subnet_id         = "subnet-0e0e0e0e0e0e0e0e0"
+    availability_zone = "us-east-1a"
+    vpc_cidr          = "10.0.0.0/16"
+    subnet_in_vpc_ok  = true
+    private_ip        = "10.0.0.1"
+    subnet_cidr       = "10.0.0.0/24"
+  }
+
+  expect_failures = [aws_instance.control_plane]
+}
+
+# ...AND THE LAST ADDRESS, which cidrhost(-1) names; a check that listed only
+# the first four would let the broadcast address through.
+run "refuses_the_broadcast_address" {
+  command = plan
+
+  module {
+    source = "./modules/control-plane-ec2-sqlite"
+  }
+
+  variables {
+    name              = "billet-test"
+    vpc_id            = "vpc-0f0f0f0f0f0f0f0f0"
+    subnet_id         = "subnet-0e0e0e0e0e0e0e0e0"
+    availability_zone = "us-east-1a"
+    vpc_cidr          = "10.0.0.0/16"
+    subnet_in_vpc_ok  = true
+    private_ip        = "10.0.0.255"
+    subnet_cidr       = "10.0.0.0/24"
+  }
+
+  expect_failures = [aws_instance.control_plane]
+}
+
+# A MALFORMED ADDRESS IS REFUSED BY ITS VARIABLE, before any precondition
+# would try to parse it.
+run "refuses_a_malformed_address" {
+  command = plan
+
+  module {
+    source = "./modules/control-plane-ec2-sqlite"
+  }
+
+  variables {
+    name              = "billet-test"
+    vpc_id            = "vpc-0f0f0f0f0f0f0f0f0"
+    subnet_id         = "subnet-0e0e0e0e0e0e0e0e0"
+    availability_zone = "us-east-1a"
+    vpc_cidr          = "10.0.0.0/16"
+    subnet_in_vpc_ok  = true
+    private_ip        = "10.0.0.10/32"
+  }
+
+  expect_failures = [var.private_ip]
+}
+
+# WITHOUT A SUBNET CIDR THE CHECK IS SKIPPED, not failed: a direct consumer who
+# does not supply the fact keeps the declaration, the way subnet_in_vpc_ok is a
+# claim the caller makes rather than one this child can verify.
+run "skips_the_containment_check_without_a_subnet_cidr" {
+  command = plan
+
+  module {
+    source = "./modules/control-plane-ec2-sqlite"
+  }
+
+  variables {
+    name              = "billet-test"
+    vpc_id            = "vpc-0f0f0f0f0f0f0f0f0"
+    subnet_id         = "subnet-0e0e0e0e0e0e0e0e0"
+    availability_zone = "us-east-1a"
+    vpc_cidr          = "10.0.0.0/16"
+    subnet_in_vpc_ok  = true
+    private_ip        = "192.0.2.10"
+  }
+
+  assert {
+    condition     = aws_instance.control_plane.private_ip == "192.0.2.10"
+    error_message = "with no subnet_cidr the declared address must be taken on the caller's word"
+  }
+}
+
+# THE BACKUP GRANT FOLLOWS THE ROLE THE CONTROLLER RUNS WITH. The first version
+# attached it only to this child's own role, so the composed shape -- a
+# supplied profile, which is what the opinionated root passes -- got a bucket,
+# a lifecycle rule and no principal that may write to it: `billet local backup`
+# failed at the upload and `billet check` reported the archive stale. Point the
+# grant back at the own role and this run fails on the first assertion.
+run "composed_backups_land_on_the_supplied_role" {
+  command = plan
+
+  module {
+    source = "./modules/control-plane-ec2-sqlite"
+  }
+
+  variables {
+    name                       = "billet-test"
+    vpc_id                     = "vpc-0f0f0f0f0f0f0f0f0"
+    subnet_id                  = "subnet-0e0e0e0e0e0e0e0e0"
+    availability_zone          = "us-east-1a"
+    vpc_cidr                   = "10.0.0.0/16"
+    subnet_in_vpc_ok           = true
+    create_instance_profile    = false
+    instance_profile_name      = "billet-test-node"
+    instance_profile_role_name = "billet-test-node"
+    create_backup_bucket       = true
+  }
+
+  assert {
+    condition     = length(aws_iam_role_policy.backups) == 1 && aws_iam_role_policy.backups[0].role == "billet-test-node"
+    error_message = "with a supplied profile the backup grant must attach to the role behind it, not to an own role that does not exist"
+  }
+  assert {
+    condition     = length(aws_iam_role.this) == 0
+    error_message = "a supplied profile must still suppress the own identity; the grant moving is not a reason to mint one"
+  }
+  assert {
+    condition     = output.backup_role_name == "billet-test-node"
+    error_message = "the role the grant landed on must be reported, so a composing root can prove it through an output"
+  }
+
+  # THE DOCUMENT IS UNCHANGED BY WHERE IT LANDS: still billet's own rendering,
+  # still no delete.
+  assert {
+    condition = length([
+      for s in jsondecode(aws_iam_role_policy.backups[0].policy).Statement :
+      s if length([for a in s.Action : a if strcontains(lower(a), "delete")]) > 0
+    ]) == 0
+    error_message = "the grant on a supplied role must carry no delete either"
+  }
+}
+
+# ...AND THE STANDALONE SHAPE IS UNCHANGED: the own role, as before.
+run "standalone_backups_land_on_the_own_role" {
+  command = plan
+
+  module {
+    source = "./modules/control-plane-ec2-sqlite"
+  }
+
+  variables {
+    name                 = "billet-test"
+    vpc_id               = "vpc-0f0f0f0f0f0f0f0f0"
+    subnet_id            = "subnet-0e0e0e0e0e0e0e0e0"
+    availability_zone    = "us-east-1a"
+    vpc_cidr             = "10.0.0.0/16"
+    subnet_in_vpc_ok     = true
+    create_backup_bucket = true
+  }
+
+  assert {
+    condition     = aws_iam_role_policy.backups[0].role == "billet-test-control-plane" && length(aws_iam_role.this) == 1
+    error_message = "a standalone control plane's backup grant must attach to its own role"
+  }
+  assert {
+    condition     = output.backup_role_name == "billet-test-control-plane"
+    error_message = "the own role must be the one reported"
+  }
+}
+
+# BACKUPS BESIDE A SUPPLIED PROFILE WITH NO ROLE NAME IS THE ORIGINAL DEFECT,
+# now refused by the variable rather than applied as a bucket nobody may write
+# to.
+run "refuses_composed_backups_without_the_role_name" {
+  command = plan
+
+  module {
+    source = "./modules/control-plane-ec2-sqlite"
+  }
+
+  variables {
+    name                    = "billet-test"
+    vpc_id                  = "vpc-0f0f0f0f0f0f0f0f0"
+    subnet_id               = "subnet-0e0e0e0e0e0e0e0e0"
+    availability_zone       = "us-east-1a"
+    vpc_cidr                = "10.0.0.0/16"
+    subnet_in_vpc_ok        = true
+    create_instance_profile = false
+    instance_profile_name   = "billet-test-node"
+    create_backup_bucket    = true
+  }
+
+  expect_failures = [var.instance_profile_role_name]
+}
+
+# A ROLE NAME BESIDE THE OWN PROFILE WOULD BE SILENTLY IGNORED, the same rule
+# as a profile name beside create_instance_profile = true.
+run "refuses_a_role_name_beside_an_own_profile" {
+  command = plan
+
+  module {
+    source = "./modules/control-plane-ec2-sqlite"
+  }
+
+  variables {
+    name                       = "billet-test"
+    vpc_id                     = "vpc-0f0f0f0f0f0f0f0f0"
+    subnet_id                  = "subnet-0e0e0e0e0e0e0e0e0"
+    availability_zone          = "us-east-1a"
+    vpc_cidr                   = "10.0.0.0/16"
+    subnet_in_vpc_ok           = true
+    instance_profile_role_name = "operator-role"
+  }
+
+  expect_failures = [var.instance_profile_role_name]
+}
+
+# NO BACKUPS, NO GRANT, whichever identity the controller carries: the composed
+# shape without backups must not demand a role name it has nothing to do with.
+run "composed_without_backups_needs_no_role_name" {
+  command = plan
+
+  module {
+    source = "./modules/control-plane-ec2-sqlite"
+  }
+
+  variables {
+    name                    = "billet-test"
+    vpc_id                  = "vpc-0f0f0f0f0f0f0f0f0"
+    subnet_id               = "subnet-0e0e0e0e0e0e0e0e0"
+    availability_zone       = "us-east-1a"
+    vpc_cidr                = "10.0.0.0/16"
+    subnet_in_vpc_ok        = true
+    create_instance_profile = false
+    instance_profile_name   = "billet-test-node"
+  }
+
+  assert {
+    condition     = length(aws_iam_role_policy.backups) == 0 && output.backup_role_name == ""
+    error_message = "no backup bucket means no grant and no role to report"
+  }
+}
+
+# A LEADING-ZERO OCTET IS REFUSED BY THE VARIABLE. Terraform's CIDR functions
+# accept "10.0.0.001" and normalise their own results, so without this rule
+# the value passes containment and compares unequal to the canonical
+# "10.0.0.1" the reserved-address check produces: a reserved address admitted
+# at plan (measured on 1.14).
+run "refuses_a_noncanonical_address" {
+  command = plan
+
+  module {
+    source = "./modules/control-plane-ec2-sqlite"
+  }
+
+  variables {
+    name              = "billet-test"
+    vpc_id            = "vpc-0f0f0f0f0f0f0f0f0"
+    subnet_id         = "subnet-0e0e0e0e0e0e0e0e0"
+    availability_zone = "us-east-1a"
+    vpc_cidr          = "10.0.0.0/16"
+    subnet_in_vpc_ok  = true
+    private_ip        = "10.0.0.001"
+    subnet_cidr       = "10.0.0.0/24"
+  }
+
+  expect_failures = [var.private_ip]
+}
+
+# THE NETWORK ADDRESS AND THE LAST OF THE FIRST FOUR, so the reserved list is
+# covered at both ends of its range and not only at the router.
+run "refuses_the_network_address" {
+  command = plan
+
+  module {
+    source = "./modules/control-plane-ec2-sqlite"
+  }
+
+  variables {
+    name              = "billet-test"
+    vpc_id            = "vpc-0f0f0f0f0f0f0f0f0"
+    subnet_id         = "subnet-0e0e0e0e0e0e0e0e0"
+    availability_zone = "us-east-1a"
+    vpc_cidr          = "10.0.0.0/16"
+    subnet_in_vpc_ok  = true
+    private_ip        = "10.0.0.0"
+    subnet_cidr       = "10.0.0.0/24"
+  }
+
+  expect_failures = [aws_instance.control_plane]
+}
+
+run "refuses_the_fourth_reserved_address" {
+  command = plan
+
+  module {
+    source = "./modules/control-plane-ec2-sqlite"
+  }
+
+  variables {
+    name              = "billet-test"
+    vpc_id            = "vpc-0f0f0f0f0f0f0f0f0"
+    subnet_id         = "subnet-0e0e0e0e0e0e0e0e0"
+    availability_zone = "us-east-1a"
+    vpc_cidr          = "10.0.0.0/16"
+    subnet_in_vpc_ok  = true
+    private_ip        = "10.0.0.3"
+    subnet_cidr       = "10.0.0.0/24"
+  }
+
+  expect_failures = [aws_instance.control_plane]
+}
+
+# ...and the first usable address is accepted, so the reserved list is not
+# wider than AWS's.
+run "accepts_the_first_usable_address" {
+  command = plan
+
+  module {
+    source = "./modules/control-plane-ec2-sqlite"
+  }
+
+  variables {
+    name              = "billet-test"
+    vpc_id            = "vpc-0f0f0f0f0f0f0f0f0"
+    subnet_id         = "subnet-0e0e0e0e0e0e0e0e0"
+    availability_zone = "us-east-1a"
+    vpc_cidr          = "10.0.0.0/16"
+    subnet_in_vpc_ok  = true
+    private_ip        = "10.0.0.4"
+    subnet_cidr       = "10.0.0.0/24"
+  }
+
+  assert {
+    condition     = aws_instance.control_plane.private_ip == "10.0.0.4"
+    error_message = "the first address AWS does not reserve must be accepted"
+  }
+}
