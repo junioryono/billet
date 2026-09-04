@@ -428,7 +428,7 @@ tiers:
 	// COMMISSIONED THE WAY THE CONTROL PLANE DOES IT: the ledger in PostgreSQL,
 	// the identity and the authority on local disk. A fixture that wrote those by
 	// hand would not prove the command reads what billet actually produces.
-	db, err := state.OpenPostgres(t.Context(), f.stateDir, dsn)
+	db, err := state.OpenPostgres(t.Context(), f.stateDir, state.DSN(dsn))
 	if err != nil {
 		t.Fatalf("OpenPostgres: %v", err)
 	}

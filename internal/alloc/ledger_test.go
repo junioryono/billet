@@ -79,7 +79,7 @@ func openTestLedgerPair(t *testing.T, wantSecond bool) (*state.DB, *state.DB) {
 	dsn := requireTestSchema(t)
 
 	first := mustOpen(t, func() (*state.DB, error) {
-		return state.OpenPostgres(t.Context(), t.TempDir(), dsn)
+		return state.OpenPostgres(t.Context(), t.TempDir(), state.DSN(dsn))
 	})
 
 	if !wantSecond {
@@ -89,7 +89,7 @@ func openTestLedgerPair(t *testing.T, wantSecond bool) (*state.DB, *state.DB) {
 	// A DIFFERENT STATE DIRECTORY, because the two handles stand for two
 	// processes: the directory lock is per host and is not what is under test.
 	second := mustOpen(t, func() (*state.DB, error) {
-		return state.OpenPostgresAdmin(t.Context(), t.TempDir(), dsn)
+		return state.OpenPostgresAdmin(t.Context(), t.TempDir(), state.DSN(dsn))
 	})
 
 	return first, second

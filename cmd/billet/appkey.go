@@ -39,9 +39,9 @@ func appKeyPath(ssm *config.IdentitySSMConfig) string {
 // validating reader: one descriptor opened O_NONBLOCK so a FIFO cannot hang it, a
 // regular file, no group or other permission bits, a bounded read, and actually
 // parsed. None of that has an equivalent in a store, where the equivalent is IAM.
-func resolveAppKey(ctx context.Context, cfg *config.Config) ([]byte, error) {
+func resolveAppKey(ctx context.Context, cfg *config.Config) (github.AppKey, error) {
 	if cfg.Server.IdentityBackendKind() != config.IdentitySSM {
-		return readPrivateKey(cfg.GitHub.PrivateKeyPath)
+		return github.ReadPrivateKeyFile(cfg.GitHub.PrivateKeyPath)
 	}
 
 	ssm := cfg.Server.IdentitySSM()
@@ -66,8 +66,8 @@ func resolveAppKey(ctx context.Context, cfg *config.Config) ([]byte, error) {
 	// PARSED HERE TOO, so the store path refuses exactly what the file path
 	// refuses. A value that is not a key is a value somebody put there, and
 	// finding that out at the first token mint is finding it out on the wire.
-	key := []byte(param.Value)
-	if err := github.ValidatePrivateKey(key); err != nil {
+	key := github.AppKey(param.Value)
+	if err := key.Validate(); err != nil {
 		return nil, fmt.Errorf(
 			"the value at %s is not a usable GitHub App private key: %w", appKeyPath(ssm), err)
 	}
