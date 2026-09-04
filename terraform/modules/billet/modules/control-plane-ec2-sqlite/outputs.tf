@@ -93,6 +93,15 @@ output "backup_prefix" {
   value       = local.backup_prefix
 }
 
+# FROM THE GRANT, NOT FROM THE LOCAL THAT FEEDS IT: reporting the local would
+# name a role whether or not a policy was attached to it, and the composing
+# root's test would then pass with the grant's count regressed to the own
+# role -- the exact defect it exists to catch.
+output "backup_role_name" {
+  description = "The IAM role the backup grant is attached to — this child's own, or the instance_profile_role_name it was given — or empty when there is no off-site copy. Plan-known, so a composing root's tests can prove the grant landed on the identity the controller runs with."
+  value       = length(aws_iam_role_policy.backups) > 0 ? aws_iam_role_policy.backups[0].role : ""
+}
+
 output "availability_zone" {
   description = "The availability_zone this child received — re-exported so a composing root's tests can prove the resolved zone crossed the module call; the ledger volume is created in it."
   value       = var.availability_zone

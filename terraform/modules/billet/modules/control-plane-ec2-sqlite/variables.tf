@@ -168,6 +168,34 @@ variable "instance_profile_name" {
   }
 }
 
+# THE ROLE BEHIND A SUPPLIED PROFILE, so the backup grant can land on the
+# identity the controller actually runs with. The first version of this child
+# attached the grant only to its OWN role, and the co-located root -- which
+# hands the controller fleet-ec2's profile -- got a bucket, a lifecycle rule,
+# and no principal that may write to it: `billet local backup` failed at the
+# upload and `billet check` reported the archive stale. A NAME rather than a
+# lookup of the profile, because a profile created in the same apply is unknown
+# at plan and the grant's count must not depend on it.
+variable "instance_profile_role_name" {
+  description = "The IAM role name behind instance_profile_name, when create_instance_profile is false. Required as soon as a backup bucket is created or adopted, because the controller's backup grant attaches to whichever role it runs with — without it the bucket exists and no principal may write to it. Plan-known by construction (the opinionated root passes fleet-ec2's node_role_name); refused beside create_instance_profile = true, where it would be silently ignored."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = !(var.create_instance_profile && var.instance_profile_role_name != "")
+    error_message = "instance_profile_role_name is only read when create_instance_profile is false; beside the own profile it would be silently ignored while you believe the grant landed there."
+  }
+
+  validation {
+    condition = !(
+      (var.create_backup_bucket || var.backup_bucket != "") &&
+      !var.create_instance_profile &&
+      var.instance_profile_role_name == ""
+    )
+    error_message = "backups are enabled and the controller carries a supplied instance profile, so name the role behind it in instance_profile_role_name: the backup grant attaches to the role the controller actually runs with, and without it the bucket exists with no principal that may write to it (billet local backup fails at the upload; billet check reports the archive stale)."
+  }
+}
+
 variable "create_backup_bucket" {
   description = "Create the S3 bucket billet copies its deployment archives to. A backup on the disk it protects is not one (ADR-001), and the archive holds the ledger, the deployment identity, the GitHub App private key and the node-wire authority as one unit. Set false and supply backup_bucket to adopt an existing bucket, or leave both unset for no off-site copy at all — in which case the archive directory is the seam your own tooling picks up."
   type        = bool

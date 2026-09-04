@@ -760,3 +760,154 @@ run "skips_the_containment_check_without_a_subnet_cidr" {
     error_message = "with no subnet_cidr the declared address must be taken on the caller's word"
   }
 }
+
+# THE BACKUP GRANT FOLLOWS THE ROLE THE CONTROLLER RUNS WITH. The first version
+# attached it only to this child's own role, so the composed shape -- a
+# supplied profile, which is what the opinionated root passes -- got a bucket,
+# a lifecycle rule and no principal that may write to it: `billet local backup`
+# failed at the upload and `billet check` reported the archive stale. Point the
+# grant back at the own role and this run fails on the first assertion.
+run "composed_backups_land_on_the_supplied_role" {
+  command = plan
+
+  module {
+    source = "./modules/control-plane-ec2-sqlite"
+  }
+
+  variables {
+    name                       = "billet-test"
+    vpc_id                     = "vpc-0f0f0f0f0f0f0f0f0"
+    subnet_id                  = "subnet-0e0e0e0e0e0e0e0e0"
+    availability_zone          = "us-east-1a"
+    vpc_cidr                   = "10.0.0.0/16"
+    subnet_in_vpc_ok           = true
+    create_instance_profile    = false
+    instance_profile_name      = "billet-test-node"
+    instance_profile_role_name = "billet-test-node"
+    create_backup_bucket       = true
+  }
+
+  assert {
+    condition     = length(aws_iam_role_policy.backups) == 1 && aws_iam_role_policy.backups[0].role == "billet-test-node"
+    error_message = "with a supplied profile the backup grant must attach to the role behind it, not to an own role that does not exist"
+  }
+  assert {
+    condition     = length(aws_iam_role.this) == 0
+    error_message = "a supplied profile must still suppress the own identity; the grant moving is not a reason to mint one"
+  }
+  assert {
+    condition     = output.backup_role_name == "billet-test-node"
+    error_message = "the role the grant landed on must be reported, so a composing root can prove it through an output"
+  }
+
+  # THE DOCUMENT IS UNCHANGED BY WHERE IT LANDS: still billet's own rendering,
+  # still no delete.
+  assert {
+    condition = length([
+      for s in jsondecode(aws_iam_role_policy.backups[0].policy).Statement :
+      s if length([for a in s.Action : a if strcontains(lower(a), "delete")]) > 0
+    ]) == 0
+    error_message = "the grant on a supplied role must carry no delete either"
+  }
+}
+
+# ...AND THE STANDALONE SHAPE IS UNCHANGED: the own role, as before.
+run "standalone_backups_land_on_the_own_role" {
+  command = plan
+
+  module {
+    source = "./modules/control-plane-ec2-sqlite"
+  }
+
+  variables {
+    name                 = "billet-test"
+    vpc_id               = "vpc-0f0f0f0f0f0f0f0f0"
+    subnet_id            = "subnet-0e0e0e0e0e0e0e0e0"
+    availability_zone    = "us-east-1a"
+    vpc_cidr             = "10.0.0.0/16"
+    subnet_in_vpc_ok     = true
+    create_backup_bucket = true
+  }
+
+  assert {
+    condition     = aws_iam_role_policy.backups[0].role == "billet-test-control-plane" && length(aws_iam_role.this) == 1
+    error_message = "a standalone control plane's backup grant must attach to its own role"
+  }
+  assert {
+    condition     = output.backup_role_name == "billet-test-control-plane"
+    error_message = "the own role must be the one reported"
+  }
+}
+
+# BACKUPS BESIDE A SUPPLIED PROFILE WITH NO ROLE NAME IS THE ORIGINAL DEFECT,
+# now refused by the variable rather than applied as a bucket nobody may write
+# to.
+run "refuses_composed_backups_without_the_role_name" {
+  command = plan
+
+  module {
+    source = "./modules/control-plane-ec2-sqlite"
+  }
+
+  variables {
+    name                    = "billet-test"
+    vpc_id                  = "vpc-0f0f0f0f0f0f0f0f0"
+    subnet_id               = "subnet-0e0e0e0e0e0e0e0e0"
+    availability_zone       = "us-east-1a"
+    vpc_cidr                = "10.0.0.0/16"
+    subnet_in_vpc_ok        = true
+    create_instance_profile = false
+    instance_profile_name   = "billet-test-node"
+    create_backup_bucket    = true
+  }
+
+  expect_failures = [var.instance_profile_role_name]
+}
+
+# A ROLE NAME BESIDE THE OWN PROFILE WOULD BE SILENTLY IGNORED, the same rule
+# as a profile name beside create_instance_profile = true.
+run "refuses_a_role_name_beside_an_own_profile" {
+  command = plan
+
+  module {
+    source = "./modules/control-plane-ec2-sqlite"
+  }
+
+  variables {
+    name                       = "billet-test"
+    vpc_id                     = "vpc-0f0f0f0f0f0f0f0f0"
+    subnet_id                  = "subnet-0e0e0e0e0e0e0e0e0"
+    availability_zone          = "us-east-1a"
+    vpc_cidr                   = "10.0.0.0/16"
+    subnet_in_vpc_ok           = true
+    instance_profile_role_name = "operator-role"
+  }
+
+  expect_failures = [var.instance_profile_role_name]
+}
+
+# NO BACKUPS, NO GRANT, whichever identity the controller carries: the composed
+# shape without backups must not demand a role name it has nothing to do with.
+run "composed_without_backups_needs_no_role_name" {
+  command = plan
+
+  module {
+    source = "./modules/control-plane-ec2-sqlite"
+  }
+
+  variables {
+    name                    = "billet-test"
+    vpc_id                  = "vpc-0f0f0f0f0f0f0f0f0"
+    subnet_id               = "subnet-0e0e0e0e0e0e0e0e0"
+    availability_zone       = "us-east-1a"
+    vpc_cidr                = "10.0.0.0/16"
+    subnet_in_vpc_ok        = true
+    create_instance_profile = false
+    instance_profile_name   = "billet-test-node"
+  }
+
+  assert {
+    condition     = length(aws_iam_role_policy.backups) == 0 && output.backup_role_name == ""
+    error_message = "no backup bucket means no grant and no role to report"
+  }
+}

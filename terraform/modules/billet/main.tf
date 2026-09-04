@@ -116,9 +116,19 @@ module "control_plane" {
   key_name                = var.key_name
 
   # THE CO-LOCATED OPINION: the controller runs billet itself, so it carries
-  # the fleet's node role rather than a bare own identity.
-  create_instance_profile = false
-  instance_profile_name   = module.fleet.instance_profile_name
+  # the fleet's node role rather than a bare own identity — and the backup
+  # grant has to follow it there, or the co-located controller gets a bucket
+  # nobody may write to. The role NAME is plan-known, which is what lets the
+  # grant's count stay decidable.
+  create_instance_profile    = false
+  instance_profile_name      = module.fleet.instance_profile_name
+  instance_profile_role_name = module.fleet.node_role_name
+
+  create_backup_bucket  = var.create_backup_bucket
+  backup_bucket         = var.backup_bucket
+  backup_prefix         = var.backup_prefix
+  backup_kms_key_arn    = var.backup_kms_key_arn
+  backup_retention_days = var.backup_retention_days
 
   tags = var.tags
 }

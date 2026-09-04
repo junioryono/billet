@@ -429,3 +429,49 @@ run "a_created_subnet_is_the_cidr_the_address_is_checked_against" {
     error_message = "a created subnet's cidr must be var.subnet_cidr's default"
   }
 }
+
+# THE CO-LOCATED CONTROLLER'S BACKUP GRANT LANDS ON THE FLEET ROLE. This root
+# hands the controller fleet-ec2's profile, so a grant on the child's own
+# identity would protect nothing here; the wiring is observable only through
+# the child's output, which is why that output exists. The bucket name is
+# composed rather than read back, so it is plan-known too.
+run "root_backups_grant_the_fleet_role" {
+  command = plan
+
+  variables {
+    name                 = "billet-test"
+    create_backup_bucket = true
+  }
+
+  assert {
+    condition     = output.backup_role_name == "billet-test-node"
+    error_message = "the root must attach the backup grant to fleet-ec2's node role, the identity the co-located controller runs with"
+  }
+  assert {
+    condition     = output.backup_bucket == "billet-test-backups" && output.backup_prefix == "billet-backups"
+    error_message = "the bucket and prefix billet.yaml must name should surface from the child"
+  }
+  assert {
+    condition     = output.cost_inputs.created_when_enabled.backup_bucket == true
+    error_message = "the cost inputs must follow the variable that creates the bucket"
+  }
+}
+
+# AND NOTHING WITHOUT ASKING: the default root creates no bucket and grants
+# nothing, so an existing deployment upgrading to this version plans no change.
+run "root_creates_no_backups_by_default" {
+  command = plan
+
+  variables {
+    name = "billet-test"
+  }
+
+  assert {
+    condition     = output.backup_bucket == "" && output.backup_role_name == ""
+    error_message = "a root that asked for no backup bucket must report neither a bucket nor a grant"
+  }
+  assert {
+    condition     = output.cost_inputs.created_when_enabled.backup_bucket == false
+    error_message = "the cost inputs must say the bucket is off by default"
+  }
+}

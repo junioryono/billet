@@ -11,7 +11,7 @@ The root module `terraform/modules/billet` composes an adopt-or-create network w
 | `modules/control-plane-ec2-sqlite` | the controller instance, its security group, the EC2 auto-recovery alarm, and a retained encrypted gp3 ledger volume with `prevent_destroy` |
 | `modules/fleet-ec2` | the node IAM role and instance profile rendered from billet's own policy generator, the trusted-runner security group, the cache bucket with an optional per-deployment KMS key, and the spot queue with the EventBridge-to-Lambda router |
 
-Outputs are the non-secret facts your `billet.yaml` needs: `control_plane_private_ip` (declare it with the input of the same name, so an instance replacement cannot change the address every node dials), `subnet_id`, `availability_zone`, `runner_security_group_id`, `node_wire_address`, `bootstrap_wire_address`, `cache_bucket`, `cache_prefix`, `cache_kms_key_arn`, `interruption_queue_url`, `ledger_volume_id`, `spot_node_name`. Examples live under `terraform/modules/billet/examples`.
+Outputs are the non-secret facts your `billet.yaml` needs: `control_plane_private_ip` (declare it with the input of the same name, so an instance replacement cannot change the address every node dials), `subnet_id`, `availability_zone`, `runner_security_group_id`, `node_wire_address`, `bootstrap_wire_address`, `cache_bucket`, `cache_prefix`, `cache_kms_key_arn`, `interruption_queue_url`, `ledger_volume_id`, `spot_node_name`, and with `create_backup_bucket` the `backup_bucket` and `backup_prefix` that `backup.s3` names (the grant lands on the node role the co-located controller runs with). Examples live under `terraform/modules/billet/examples`.
 
 ```hcl
 module "billet" {

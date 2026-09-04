@@ -220,6 +220,61 @@ variable "enable_spot" {
   default     = false
 }
 
+# THE OFF-SITE COPY. Passed through to the control-plane child, which owns the
+# bucket and the grant; the root's part is to hand the grant fleet-ec2's role,
+# because the co-located controller runs with THAT profile and a grant on the
+# child's own identity would protect nothing here. The validations restate the
+# child's, because this root is an exported entry point of its own.
+variable "create_backup_bucket" {
+  description = "Create the S3 bucket billet copies its deployment archives to (versioned, encrypted, public access blocked, prevent_destroy). A backup on the disk it protects is not one (ADR-001), and the archive holds the ledger, the deployment identity, the GitHub App private key and the node-wire authority as one unit. Set false and pass backup_bucket to adopt an existing bucket, or leave both unset for no off-site copy at all."
+  type        = bool
+  default     = false
+}
+
+variable "backup_bucket" {
+  description = "An existing bucket to grant the controller access to, when create_backup_bucket is false. The module configures nothing on a bucket it does not own."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = !(var.create_backup_bucket && var.backup_bucket != "")
+    error_message = "set create_backup_bucket = true OR pass backup_bucket, not both — a name alongside the bool would be silently ignored."
+  }
+}
+
+variable "backup_prefix" {
+  description = "The object prefix archives land under; billet writes <prefix>/<deployment-id>/<taken-at>/. The IAM grant is scoped to it literally, so set backup.s3.prefix in billet.yaml to the same value."
+  type        = string
+  default     = "billet-backups"
+
+  validation {
+    condition     = !can(regex("[*?]", var.backup_prefix)) && !startswith(var.backup_prefix, "/") && var.backup_prefix != ""
+    error_message = "backup_prefix must be a non-empty literal prefix with no wildcard and no leading slash: it lands in an IAM Resource ARN."
+  }
+}
+
+variable "backup_kms_key_arn" {
+  description = "A customer-managed key to encrypt the backup bucket with; empty uses SSE-S3. A full key ARN, because the grant is resource-scoped to it."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.backup_kms_key_arn == "" || can(regex("^arn:[^:]+:kms:[^:]+:[0-9]{12}:key/", var.backup_kms_key_arn))
+    error_message = "backup_kms_key_arn must be a full KMS key ARN (arn:PARTITION:kms:REGION:ACCOUNT:key/ID)."
+  }
+}
+
+variable "backup_retention_days" {
+  description = "How long a NONCURRENT archive version is kept; the current object of every archive is kept forever, because billet has no delete. Zero creates no lifecycle rule."
+  type        = number
+  default     = 90
+
+  validation {
+    condition     = var.backup_retention_days >= 0
+    error_message = "backup_retention_days cannot be negative."
+  }
+}
+
 variable "iam_policy_json" {
   description = "Override the node role's IAM policy. Empty uses the module's committed rendering of billet's own generator (billet init iam), substituted for this deployment's resources. Paste `billet init iam` output to scope it to an exact config."
   type        = string
