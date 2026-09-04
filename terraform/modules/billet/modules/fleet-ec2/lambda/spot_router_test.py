@@ -10,7 +10,6 @@ import contextlib
 import io
 import json
 import os
-import re
 import sys
 import types
 import unittest
@@ -164,13 +163,14 @@ class SpotRouterTest(unittest.TestCase):
                 with contextlib.redirect_stdout(spoken):
                     spot_router.handler(_warning(), None)
 
-                # The line NAMES THE TAG, and is not the untagged one: both paths
-                # drop without touching SQS, so this is the only thing that can
-                # tell them apart.
-                said = spoken.getvalue()
-                self.assertIn(f"{spot_router.NODE_TAG}=''", said)
-                self.assertIn("is not a legal queue name", said)
-                self.assertNotIn("names no billet node", said)
+                # THE WHOLE OUTPUT, not substrings of it: both paths drop without
+                # touching SQS, so the line is the only thing that tells them apart,
+                # and an equality cannot be loosened later by a second line or by
+                # rewording the untagged message out from under a negative assertion.
+                self.assertEqual(
+                    spoken.getvalue(),
+                    f"i-abc {spot_router.NODE_TAG}='' is not a legal queue name; "
+                    f"dropping\n")
                 _sqs.get_queue_url.assert_not_called()
                 _sqs.send_message.assert_not_called()
 
@@ -301,51 +301,30 @@ class SpotRouterTest(unittest.TestCase):
         self.assertIsNone(spot_router._QUEUE_NAME.match("trailing\n"))
 
 
-# THE HANDLER AND THE MODULE HAVE TO NAME THE SAME VARIABLE, and nothing else in
-# either gate says so: a rename on one side leaves the router with no queue name,
-# which is safe (it drops nothing) and wrong (every foreign warning becomes a failed
-# invocation). The value has to be the created queue's own attribute, not the name
-# rebuilt from var.name, so a queue renamed in one place cannot leave the other
-# behind.
+# THE HANDLER AND THE MODULE HAVE TO NAME THE SAME VARIABLE, and neither gate can
+# see both: this file has no terraform and the plan tests have no Python. A rename
+# on one side leaves the router with no queue name, which is safe (it drops nothing)
+# and wrong (every foreign warning becomes a failed invocation and an alarm).
 class SpotRouterModuleWiringTest(unittest.TestCase):
-    def test_the_module_passes_the_created_queue_as_the_variable_the_handler_reads(self):
+    def test_the_module_names_the_variable_the_handler_reads(self):
         with open(os.path.join(_HERE, "..", "spot.tf"), encoding="utf-8") as f:
             spot_tf = f.read()
 
-        # Scoped to the ROUTER FUNCTION'S OWN declaration: cut at the next top-level
-        # resource or data block first, so the environment searched inside it cannot
-        # be some other resource's further down the file, and an assignment anywhere
-        # else in spot.tf cannot satisfy a search that was meant to be about this one.
-        declaration = re.search(
-            r'^resource\s+"aws_lambda_function"\s+"spot_router"\s*\{\n(.*?)^\}$',
+        # DELIBERATELY A CONTAINMENT CHECK AND NOT A PARSE. Which block the name sits
+        # in, that its value is the created queue and that it is the environment's
+        # only entry are asserted against a real plan in
+        # tests/fleet.tftest.hcl:spot_creates_the_interruption_router, where terraform
+        # has done the parsing. What no terraform test can see is whether the literal
+        # there is the one THIS file reads, and a regex written to re-derive the
+        # structure only invents ways to fail on valid HCL — a comment above
+        # `variables`, a one-line map, a brace inside a heredoc.
+        self.assertIn(
+            spot_router.QUEUE_NAME_ENV,
             spot_tf,
-            re.DOTALL | re.MULTILINE,
+            f"spot.tf names no {spot_router.QUEUE_NAME_ENV}: renaming it on one side "
+            f"leaves the router with no queue name, which drops nothing and makes "
+            f"every foreign warning a failed invocation",
         )
-        self.assertIsNotNone(
-            declaration, "spot.tf must declare aws_lambda_function.spot_router")
-
-        block = re.search(
-            r"^\s*environment\s*\{\s*\n\s*variables\s*=\s*\{(.*?)\n\s*\}",
-            declaration.group(1),
-            re.DOTALL | re.MULTILINE,
-        )
-        self.assertIsNotNone(
-            block,
-            "the router function must carry an environment block; without one the "
-            "handler cannot tell a foreign queue from its own missing grant",
-        )
-
-        assignment = re.search(
-            r"^\s*(\S+)\s*=\s*aws_sqs_queue\.interruptions\[0\]\.name\s*$",
-            block.group(1),
-            re.MULTILINE,
-        )
-        self.assertIsNotNone(
-            assignment,
-            "the router's environment must carry aws_sqs_queue.interruptions[0].name "
-            "— the created queue itself, not its name rebuilt from var.name",
-        )
-        self.assertEqual(assignment.group(1), spot_router.QUEUE_NAME_ENV)
 
 
 if __name__ == "__main__":

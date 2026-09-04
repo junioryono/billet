@@ -14,7 +14,7 @@ thing that may consume one SILENTLY is a positive proof it is not this router's 
 place: an instance that is present and carries no tag, an instance EC2 says is
 already gone, a tag that cannot name a queue, or a tag naming a queue other than
 the one this router serves (BILLET_INTERRUPTION_QUEUE_NAME, set by the module to
-the queue it created) WHOSE lookup or send then fails in a way no retry can fix.
+the queue it created) THAT SQS then answers AccessDenied or NonExistentQueue for.
 That last one takes both halves: a queue this router is granted but was not told
 about still forwards. Everything else is a could-not-tell and is re-raised, so
 Lambda retries and the failure appears on the function's Errors metric — where the
@@ -45,12 +45,12 @@ QUEUE_NAME_ENV = "BILLET_INTERRUPTION_QUEUE_NAME"
 # API call (which would only return an InvalidAddress error anyway).
 _QUEUE_NAME = re.compile(r"\A[A-Za-z0-9_-]{1,80}\Z")
 
-# Failures no retry can fix — but only for a queue this router does not serve,
-# where there is also nothing to place the warning on. For its OWN queue the same
-# two codes are a could-not-tell: an absent or unpropagated grant answers
-# AccessDenied, and a queue that should exist answering NonExistentQueue is a
-# broken deployment rather than evidence the warning belongs to someone else.
-_PERMANENT_QUEUE_ERRORS = {"AWS.SimpleQueueService.NonExistentQueue", "AccessDenied"}
+# The two codes that end a warning for a queue this router does NOT serve: there
+# is nowhere to place it and nothing saying the queue is reachable. Not "permanent"
+# — an extended grant's AccessDenied clears when it propagates, the window the
+# module README names — which is exactly why they may never be read this way about
+# the router's OWN queue, where both are a could-not-tell.
+_FOREIGN_QUEUE_ERRORS = {"AWS.SimpleQueueService.NonExistentQueue", "AccessDenied"}
 
 _ec2 = boto3.client("ec2")
 _sqs = boto3.client("sqs")
@@ -104,12 +104,13 @@ def handler(event, _context):
 def _drop(what, err, node):
     """Whether an SQS ClientError may be dropped (True) rather than re-raised, which
     takes a POSITIVE proof the warning is not this router's to place: the tag names a
-    queue other than the one it serves, and the failure is one no retry can fix. Its
-    own queue's refusals and an unconfigured queue name are could-not-tells, and
-    re-raising one costs a retry where dropping it costs a real two-minute warning."""
+    queue other than the one it serves, AND SQS answered one of the two codes that
+    end it for such a queue. Its own queue's refusals and an unconfigured queue name
+    are could-not-tells, and re-raising one costs a retry where dropping it costs a
+    real two-minute warning."""
     code = err.response.get("Error", {}).get("Code", "")
     served = os.environ.get(QUEUE_NAME_ENV, "")
-    if served and node != served and code in _PERMANENT_QUEUE_ERRORS:
+    if served and node != served and code in _FOREIGN_QUEUE_ERRORS:
         print(f"{what} failed ({code}) for {node!r}, which is not {served!r}, the queue "
               f"this router serves; dropping")
         return True
