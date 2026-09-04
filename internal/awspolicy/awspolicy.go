@@ -106,18 +106,26 @@
 // NOTHING BILLET DOES IS DENIED BY IT, and that rests on two live measurements
 // rather than a simulator: billet's own RunInstances names no snapshot
 // (setBlockDevices writes DeleteOnTermination and VolumeSize, never a SnapshotId)
-// and a cache clone goes through CreateVolume, which is a different action. The
-// AMI's own backing snapshot is not in the launch's authorization context either —
-// the acceptance role has carried this deny in its account-less spelling since
-// 2026-09-04T02:54Z, and acceptance run 33844696218 launched two instances at
-// 06:33Z from an AMI whose backing snapshot carries no tags at all; had that
-// snapshot been authorized, every launch in the run would have failed. The
-// wildcard account here is broader than the deny that run proved, and the reason
-// it is still safe is the OTHER live measurement: EC2 renders a snapshot resource
-// account-less, which is why BilletCacheCloneSource's account-less ARN matched a
-// real clone. So there is no account-qualified spelling for a launch to present
-// instead — which is an inference from two measurements, not a third measurement,
-// and the way to close it is a RunInstances --dry-run under this exact document.
+// and a cache clone goes through CreateVolume, which is a different action.
+//
+// ASKED OF EC2 ITSELF, 2026-09-04, three RunInstances --dry-run calls under a
+// throwaway role holding exactly the rendering below, against the account's real
+// control-plane ledger snapshot (untagged) and the AMI billet boots:
+//
+//	this policy, billet's own launch shape        DryRunOperation
+//	this policy, that snapshot in a mapping       UnauthorizedOperation, explicit deny
+//	the PREVIOUS policy, the same mapping         DryRunOperation
+//
+// The third line is what the guard is for: before this statement the launch was
+// authorized, and it attaches a volume holding the deployment identity and the CA
+// key to a machine that runs somebody's workflow. The first says billet's own
+// launch is untouched, and it also settles the AMI question a simulation cannot
+// reach: a launch from an EBS-backed AMI whose backing snapshot is UNTAGGED is
+// allowed, so that snapshot is not in the authorization context, while a snapshot
+// the mapping NAMES is. And EC2's own refusal names the resource it evaluated,
+// `arn:aws:ec2:us-west-2::snapshot/snap-…` — account-less, as the section above
+// says, which the wildcard account matches and would keep matching if that ever
+// changed.
 //
 // WHAT IT DOES NOT CLOSE, in account-wide mode, is another billet deployment's
 // TAGGED snapshot — the same limitation BilletCacheCloneSource states one section
@@ -128,6 +136,11 @@
 // with a per-build owner (BuilderOwnerPrefix + name), NOT a deployment id, so the
 // --builder statements match that prefix by StringLike and carry their own
 // Terminate — the deployment-scoped runtime Terminate would not reach a builder.
+// The snapshot deny above gets NO builder exemption, which is deliberate in both
+// directions: a build launches from a base image and from the image it just made,
+// and neither names a snapshot, so an exemption would authorize nothing it needs —
+// and it could not help even in principle, because CreateImage tags only the
+// image, so a builder's own backing snapshots carry no owner tag to match.
 //
 // VALIDATED AGAINST A LIVE AWS ACCOUNT with iam:SimulateCustomPolicy in both
 // modes: every action billet performs is allowed for its own tagged resources with
