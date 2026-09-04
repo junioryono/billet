@@ -34,7 +34,8 @@ Every resource this child can own, mechanically complete — a resource absent h
 | `aws_kms_key.cache` + alias | `enable_cache && enable_kms` | Per-deployment EBS snapshot boundary |
 | `aws_sqs_queue.interruptions` | `enable_spot` | Basename must equal the spot node's `node.name` |
 | `aws_iam_role_policy.spot` | `enable_spot` | Queue-scoped, actions from `policy/spot-actions.json` |
-| `aws_iam_role.spot_router` + policy, `aws_lambda_function.spot_router`, `aws_cloudwatch_log_group.spot_router`, `aws_cloudwatch_event_rule.spot_interruption` + target, `aws_lambda_permission.spot_router` | `enable_spot` | The tag-scoped router; least-privilege IAM |
+| `aws_iam_role.spot_router` + policy, `aws_lambda_function.spot_router`, `aws_cloudwatch_log_group.spot_router`, `aws_cloudwatch_event_rule.spot_interruption` + target, `aws_lambda_permission.spot_router` | `enable_spot` | The tag-scoped router; least-privilege IAM. Told the created queue's name, which is what lets it drop a foreign warning without dropping one its own grant merely failed to reach |
+| `aws_cloudwatch_metric_alarm.spot_router_errors` | `enable_spot` | One `Errors` datapoint in one minute; no action until `spot_router_alarm_actions` names one |
 | `data.archive_file.spot_router` | `enable_spot` | Zips the committed Lambda source under the root's `.terraform` |
 
 Adopted (never created): the VPC (`vpc_id` is a required input).
@@ -55,3 +56,4 @@ Adopted (never created): the VPC (`vpc_id` is a required input).
 
   Two details are worth knowing before turning this on in a shared account. `BilletAMIBuilderImage` carries no condition at all, because the image and its snapshots do not exist yet and cannot answer a resource-tag condition; the call is authorized only when the source-instance statement admits it too, so that statement is the gate. And a build run with **no** deployment identity available stamps the account-wide value, which a value-scoped policy will not admit — `billet ami build` says so on stderr rather than letting it fail at `RunInstances` with nothing naming the reason.
 - `builder_payload_bucket` — the bucket `billet ami build --payload-bucket` stages the shared installers in, needed once the pinned toolcache declaration outgrows EC2's 16384-byte user-data limit. Empty grants nothing on S3. The grant is scoped to the object names billet writes (`billet-payload-*`, at the bucket root, because the stager refuses a key containing a slash), so anything else in that bucket is out of reach. Requires `builder`.
+- `spot_router_alarm_actions` — where the router's error alarm sends. This module creates no SNS topic and will not invent one, so the default is an alarm with no action: still visible in the console and to `DescribeAlarms`, but nothing is pushed. A warning the router could not place is a failed invocation and a Lambda retry rather than a silent drop, and this alarm is the only thing that says so.

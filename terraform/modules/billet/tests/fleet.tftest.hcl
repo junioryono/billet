@@ -476,12 +476,89 @@ run "spot_creates_the_interruption_router" {
     error_message = "the declared log group must be the /aws/lambda/<function> group Lambda writes to"
   }
 
+  # THE ROUTER IS TOLD WHICH QUEUE IS ITS OWN, read from the queue resource. This
+  # is what lets the handler drop a tag naming another deployment's queue while
+  # RE-RAISING AccessDenied for its own — the two are the same answer from AWS,
+  # and without the name the second reads as the first and a real two-minute
+  # warning is consumed silently. (spot_router_test.py asserts the handler reads
+  # this exact variable, and what it does with each classification.)
+  assert {
+    condition     = aws_lambda_function.spot_router[0].environment[0].variables["BILLET_INTERRUPTION_QUEUE_NAME"] == aws_sqs_queue.interruptions[0].name
+    error_message = "the router must be told the created queue's name as BILLET_INTERRUPTION_QUEUE_NAME"
+  }
+  # ...and nothing else: a Lambda's environment is rendered in the console and in
+  # every GetFunctionConfiguration answer, so what it carries is deliberate.
+  assert {
+    condition     = length(keys(aws_lambda_function.spot_router[0].environment[0].variables)) == 1
+    error_message = "the router's environment must carry only the queue name"
+  }
+
+  # THE ERROR ALARM IS THE ONLY THING WATCHING a re-raised warning, so it is
+  # asserted field-for-field. notBreaching in particular: a healthy router
+  # publishes no Errors datapoints at all, and the default (missing) would park
+  # the alarm in INSUFFICIENT_DATA forever, which reads exactly like quiet.
+  assert {
+    condition = (
+      length(aws_cloudwatch_metric_alarm.spot_router_errors) == 1 &&
+      aws_cloudwatch_metric_alarm.spot_router_errors[0].namespace == "AWS/Lambda" &&
+      aws_cloudwatch_metric_alarm.spot_router_errors[0].metric_name == "Errors" &&
+      aws_cloudwatch_metric_alarm.spot_router_errors[0].statistic == "Sum" &&
+      aws_cloudwatch_metric_alarm.spot_router_errors[0].period == 60 &&
+      aws_cloudwatch_metric_alarm.spot_router_errors[0].evaluation_periods == 1 &&
+      aws_cloudwatch_metric_alarm.spot_router_errors[0].datapoints_to_alarm == 1 &&
+      aws_cloudwatch_metric_alarm.spot_router_errors[0].threshold == 1 &&
+      aws_cloudwatch_metric_alarm.spot_router_errors[0].comparison_operator == "GreaterThanOrEqualToThreshold" &&
+      aws_cloudwatch_metric_alarm.spot_router_errors[0].treat_missing_data == "notBreaching"
+    )
+    error_message = "the router alarm must fire on one Errors datapoint in one minute and treat missing data as not breaching"
+  }
+  # It watches THIS function, read from the function itself: an alarm on a
+  # dimension nothing publishes stays green forever.
+  assert {
+    condition     = aws_cloudwatch_metric_alarm.spot_router_errors[0].dimensions["FunctionName"] == aws_lambda_function.spot_router[0].function_name
+    error_message = "the router alarm must be dimensioned on the router function's own name"
+  }
+  # No action by default — the module creates no SNS topic and will not invent one.
+  # (length rather than == toset([]): an unset optional set plans as an empty
+  # collection whose type does not compare equal to a set literal.)
+  assert {
+    condition     = length(aws_cloudwatch_metric_alarm.spot_router_errors[0].alarm_actions) == 0 && length(aws_cloudwatch_metric_alarm.spot_router_errors[0].ok_actions) == 0
+    error_message = "the router alarm must have no action until the operator names one"
+  }
+
   # Only EventBridge may invoke the Lambda — exact principal, not a substring,
   # which "events.attacker.example" would satisfy. The mocked partition suffix
   # is amazonaws.com; the China run covers the suffix substitution machinery.
   assert {
     condition     = aws_lambda_permission.spot_router[0].principal == "events.amazonaws.com"
     error_message = "only EventBridge (events.amazonaws.com) may be permitted to invoke the router"
+  }
+}
+
+# The alarm reaches the operator's own topic on BOTH edges. The OK edge says the
+# errors stopped rather than that a warning landed — the Errors metric carries no
+# delivery — but whoever was paged still has to be told the alarm cleared.
+run "spot_router_alarm_actions_reach_the_operators_topic" {
+  command = plan
+
+  module {
+    source = "./modules/fleet-ec2"
+  }
+
+  variables {
+    vpc_id                    = "vpc-0f0f0f0f0f0f0f0f0"
+    name                      = "billet-test"
+    enable_spot               = true
+    spot_router_alarm_actions = ["arn:aws:sns:us-east-1:123456789012:billet-ops"]
+  }
+
+  assert {
+    condition     = aws_cloudwatch_metric_alarm.spot_router_errors[0].alarm_actions == toset(["arn:aws:sns:us-east-1:123456789012:billet-ops"])
+    error_message = "the configured action must be the alarm's action"
+  }
+  assert {
+    condition     = aws_cloudwatch_metric_alarm.spot_router_errors[0].ok_actions == toset(["arn:aws:sns:us-east-1:123456789012:billet-ops"])
+    error_message = "the configured action must also be told when the alarm clears"
   }
 }
 
@@ -501,7 +578,7 @@ run "no_spot_router_without_spot" {
   # EVERY spot-gated resource is absent — not just the Lambda and rule, but the
   # role, log group, target and invoke permission too.
   assert {
-    condition     = length(aws_lambda_function.spot_router) == 0 && length(aws_cloudwatch_event_rule.spot_interruption) == 0 && length(aws_cloudwatch_event_target.spot_router) == 0 && length(aws_lambda_permission.spot_router) == 0 && length(aws_iam_role.spot_router) == 0 && length(aws_iam_role_policy.spot_router) == 0 && length(aws_cloudwatch_log_group.spot_router) == 0
+    condition     = length(aws_lambda_function.spot_router) == 0 && length(aws_cloudwatch_event_rule.spot_interruption) == 0 && length(aws_cloudwatch_event_target.spot_router) == 0 && length(aws_lambda_permission.spot_router) == 0 && length(aws_iam_role.spot_router) == 0 && length(aws_iam_role_policy.spot_router) == 0 && length(aws_cloudwatch_log_group.spot_router) == 0 && length(aws_cloudwatch_metric_alarm.spot_router_errors) == 0
     error_message = "a non-spot deployment must not create any router resource"
   }
 

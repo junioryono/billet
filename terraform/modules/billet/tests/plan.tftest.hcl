@@ -358,12 +358,32 @@ run "spot_surfaces_the_node_name" {
   variables {
     name        = "billet-test"
     enable_spot = true
+    # THE ROUTER'S ALARM ACTION IS SETTABLE FROM THE ROOT. A plan is refused for an
+    # undeclared variable, so this proves the root declares it and accepts an ARN;
+    # what the child does with it is asserted in fleet.tftest.hcl, because a test
+    # run against the root cannot address a child module's resources.
+    spot_router_alarm_actions = ["arn:aws:sns:us-east-1:123456789012:billet-ops"]
   }
 
   assert {
     condition     = output.spot_node_name == "billet-test-spot-interruptions"
     error_message = "the spot node name must be the queue basename"
   }
+}
+
+# ...and a value that is not an ARN is refused at PLAN, not silently ignored by
+# CloudWatch, which would leave an alarm reading as covered while it notifies
+# nobody.
+run "a_router_alarm_action_that_is_not_an_arn_is_refused" {
+  command = plan
+
+  variables {
+    name                      = "billet-test"
+    enable_spot               = true
+    spot_router_alarm_actions = ["billet-ops"]
+  }
+
+  expect_failures = [var.spot_router_alarm_actions]
 }
 
 # THE CONTROLLER'S ADDRESS CROSSES THE MODULE CALL, on both sides of adopt-or-

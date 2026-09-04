@@ -51,10 +51,10 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "cache" {
 }
 
 # THE SPOT INTERRUPTION QUEUE. Created when spot is enabled; a node consumes it to
-# learn one of its instances is about to be reclaimed. NOTE: delivering a warning
-# to the RIGHT node's queue needs a tag-scoped router (EventBridge cannot match on
-# an instance tag), which is a documented follow-up in the README — this creates
-# the queue the node polls, not that router.
+# learn one of its instances is about to be reclaimed. Delivering a warning to the
+# RIGHT node's queue needs a tag-scoped router, because EventBridge cannot match on
+# an instance tag; that router is in spot.tf, and its handler is told this queue's
+# name so it can tell a foreign queue from its own grant failing.
 resource "aws_sqs_queue" "interruptions" {
   count = var.enable_spot ? 1 : 0
 

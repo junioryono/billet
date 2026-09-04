@@ -69,6 +69,19 @@ variable "enable_spot" {
   default     = false
 }
 
+variable "spot_router_alarm_actions" {
+  description = "ARNs notified when the spot interruption router fails an invocation — a warning it could not place and re-raised for Lambda to retry. Usually an SNS topic; this module creates none, so an operator supplies their own. Empty leaves the alarm with no action: its state is still visible in the console and to DescribeAlarms, but nothing is sent."
+  type        = list(string)
+  default     = []
+
+  validation {
+    # An action is an ARN or it is silently ignored by CloudWatch, and an alarm
+    # whose action goes nowhere is worse than no alarm: it reads as covered.
+    condition     = alltrue([for action in var.spot_router_alarm_actions : can(regex("^arn:", action))])
+    error_message = "every spot_router_alarm_actions entry must be an ARN (an SNS topic's, usually)."
+  }
+}
+
 # AN OVERRIDE SUPPLIES THE WHOLE GRANT, BUILDER AND PAYLOAD INCLUDED.
 #
 # There are exactly two supported shapes, and mixing them is refused on `builder`

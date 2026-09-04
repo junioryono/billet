@@ -96,6 +96,55 @@ resource "aws_lambda_function" "spot_router" {
   timeout          = 15
   depends_on       = [aws_cloudwatch_log_group.spot_router]
   tags             = local.tags
+
+  environment {
+    variables = {
+      # THE QUEUE THIS ROUTER SERVES, read from the resource rather than rebuilt
+      # from var.name. Without it the handler cannot tell a tag naming another
+      # deployment's queue from its own grant being absent, stale or not yet
+      # propagated — AccessDenied is what AWS answers for both — and reading the
+      # second as the first drops a real two-minute warning silently.
+      BILLET_INTERRUPTION_QUEUE_NAME = aws_sqs_queue.interruptions[0].name
+    }
+  }
+}
+
+# THE ROUTER'S OWN FAILURES ARE VISIBLE OR THEY ARE NOTHING. The handler drops a
+# warning only on proof it is not its to place; every other outcome it cannot
+# complete is re-raised, which reaches an operator as this metric and nowhere else.
+# treat_missing_data is notBreaching because a healthy router emits no Errors
+# datapoints at all, and an alarm parked in INSUFFICIENT_DATA is one an operator
+# learns to ignore. The period is a minute rather than five: nobody acts inside a
+# two-minute warning, but every reclaim during the window is another warning lost,
+# so the useful measure is how fast the operator learns the router is broken.
+resource "aws_cloudwatch_metric_alarm" "spot_router_errors" {
+  count = var.enable_spot ? 1 : 0
+
+  alarm_name        = "${var.name}-spot-router-errors"
+  alarm_description = "The spot interruption router could not place a two-minute reclaim warning and re-raised it for Lambda to retry. Its own SQS grant being absent, stale or not yet propagated is the usual cause; the function's log group says which call failed and with what. A warning the router can PROVE belongs to another deployment is dropped and never appears here."
+
+  namespace   = "AWS/Lambda"
+  metric_name = "Errors"
+  # Read from the function rather than rebuilt, so a renamed function cannot leave
+  # the alarm watching a dimension nothing publishes — which reads as healthy.
+  dimensions = { FunctionName = aws_lambda_function.spot_router[0].function_name }
+
+  statistic           = "Sum"
+  period              = 60
+  evaluation_periods  = 1
+  datapoints_to_alarm = 1
+  threshold           = 1
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  treat_missing_data  = "notBreaching"
+
+  alarm_actions = var.spot_router_alarm_actions
+  # The OK edge says the errors STOPPED, which is not the same as a warning having
+  # landed: the Errors metric carries no delivery, and with missing data not
+  # breaching a router nothing invoked clears the alarm too. It is worth sending
+  # because whoever was paged needs to know the alarm cleared; it is not evidence.
+  ok_actions = var.spot_router_alarm_actions
+
+  tags = local.tags
 }
 
 resource "aws_cloudwatch_event_rule" "spot_interruption" {
