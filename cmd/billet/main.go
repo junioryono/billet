@@ -1410,6 +1410,14 @@ func newProvider(cfg *config.Config, deployment string) (provider.Provider, erro
 			tart.WithLogger(slog.Default()),
 			tart.WithConfig(tartCfg))
 
+	case config.ProviderSimulated:
+		// UNREACHABLE THROUGH config.Load, WHICH REFUSES THE KIND, and refused again
+		// here because this switch is the one place that turns a kind into compute.
+		// The simulated backend fabricates completions; a host running it would
+		// report every job finished and run none.
+		return nil, errors.New("billet: the simulated backend exists for billet's own test " +
+			"harness and is never constructed by the CLI")
+
 	default:
 		return nil, fmt.Errorf("billet: unknown provider %q", cfg.Node.Provider)
 	}

@@ -17,7 +17,7 @@ Never hard-wrap prose at a column. Every paragraph in a `.md` or `.txt` file, a 
 | `internal/server` | One scale-set listener per tier and the scheduler; the message lifecycle against GitHub. |
 | `internal/scaleset`, `internal/github`, `internal/fakeactions` | The only importer of `actions/scaleset`; App onboarding, JWTs, installation and runner-group policy; the scripted stand-in for GitHub used by tests. |
 | `internal/nodeapi`, `internal/nodeclient`, `internal/nodeplane`, `internal/node` | The node wire: the vocabulary and version range, the node's half, the plane's half, and the node runtime that turns leases into compute and holds custody of what it cannot account for. |
-| `internal/provider` + `docker`, `firecracker`, `tart`, `ec2`, `codebuild` | The compute contract and the five backends. |
+| `internal/provider` + `docker`, `firecracker`, `tart`, `ec2`, `codebuild`, `simulated` | The compute contract and the six backends; `simulated` starts no compute, exists for billet's own test harness, and is refused in a config. |
 | `internal/store` + `ceph`, `ebss3` | The cache-volume contract and the two site stores. |
 | `internal/wirecert`, `internal/wireshare`, `internal/deploymentid` | The node-wire CA and its rotation state machine; carrying an authority between controllers; the deployment identity. |
 | `internal/runnerimages`, `internal/imagesource`, `internal/runnerrelease`, `internal/provenance`, `internal/releasesource`, `internal/guestassets` | The vendored runner-image declaration; fetching and verifying signed guest images; the runner-release deadline; which manifest produced the installed binary; what a billet release contains; scripts installed into every guest. |

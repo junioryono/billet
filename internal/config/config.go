@@ -785,10 +785,19 @@ const (
 	// a VM; this exists so `billet init` works on a laptop and it refuses
 	// untrusted workloads outright.
 	ProviderDocker ProviderKind = "docker"
+	// ProviderSimulated starts no compute: an instance is a record that reports
+	// itself running for a modelled duration and stopped afterwards, so a workload
+	// can be driven through the real allocator and placer at a scale no real backend
+	// can afford. It exists for billet's own test harness. It fabricates completions,
+	// so a configuration that names it anywhere is REFUSED at load, and cmd/billet
+	// never constructs it; it is in the closed set only so the ledger and the node
+	// wire can register a simulated host in a test.
+	ProviderSimulated ProviderKind = "simulated"
 )
 
 var allProviders = []ProviderKind{
 	ProviderFirecracker, ProviderTart, ProviderEC2, ProviderCodeBuild, ProviderDocker,
+	ProviderSimulated,
 }
 
 // Valid reports whether this is a known provider. Exported because alloc.New
@@ -818,9 +827,14 @@ func (p ProviderKind) Valid() bool {
 // hardware. `codebuild` is that second remote backend, and it arrived without
 // this function needing a line: the allowlist already answered correctly for a
 // name it had never heard of, which is what the shape was chosen for.
+//
+// `simulated` is listed as host-backed because every consequence of the answer
+// is right for it: its capacity is what the node declares rather than a shape it
+// buys, placement charges the tier request, and custody reads its inventory as
+// causal, which an authoritative in-memory store is.
 func (p ProviderKind) RunsOnHost() bool {
 	switch p {
-	case ProviderDocker, ProviderFirecracker, ProviderTart:
+	case ProviderDocker, ProviderFirecracker, ProviderTart, ProviderSimulated:
 		return true
 	case ProviderEC2, ProviderCodeBuild:
 		return false
@@ -857,6 +871,18 @@ func RemoteProviders() []ProviderKind {
 
 	return out
 }
+
+// TestOnly reports whether this backend exists for billet's own test harness and
+// may not be named in a configuration.
+//
+// THE ONE READER OF THAT DISTINCTION. Valid says whether billet implements a
+// backend, and the simulated one is implemented: the allocator and the node wire
+// register it in tests. What it may not do is reach a deployment through a file,
+// because a backend that fabricates completions is a fleet that reports every job
+// finished and runs none. That refusal lives in Config.Validate rather than in the
+// per-tier and per-node rules alloc.New re-applies, so a catalogue built in code
+// can still name it.
+func (p ProviderKind) TestOnly() bool { return p == ProviderSimulated }
 
 func (p ProviderKind) ShapeField() string {
 	switch p {
@@ -3293,6 +3319,7 @@ func (c *Config) Validate() error {
 	errs = append(errs, c.validateServer()...)
 	errs = append(errs, c.validateGitHub()...)
 	errs = append(errs, c.validateNode()...)
+	errs = append(errs, c.validateNoTestOnlyBackend()...)
 	errs = append(errs, c.validateNodes()...)
 	errs = append(errs, c.validateSites()...)
 	errs = append(errs, c.validateCodeBuildTrust()...)
@@ -3303,6 +3330,55 @@ func (c *Config) Validate() error {
 	errs = append(errs, c.validateBackup()...)
 
 	return errors.Join(errs...)
+}
+
+// validateNoTestOnlyBackend refuses a file that names a backend that exists only
+// for billet's own test harness, at every place a file could name one.
+//
+// HERE AND NOT IN THE PER-TIER OR PER-NODE RULES, deliberately: alloc.New
+// re-applies Tier.ProviderErrors and NodePolicy.Validate to a catalogue built in
+// code, and the end-to-end suite builds exactly such a catalogue over the
+// simulated backend. What must never happen is a real deployment reaching it
+// through a file, and Validate is the one gate every loaded file passes.
+func (c *Config) validateNoTestOnlyBackend() []error {
+	var errs []error
+
+	refuse := func(where string, p ProviderKind) {
+		errs = append(errs, fmt.Errorf("%s: provider %q starts no compute and fabricates "+
+			"completions; it exists for billet's own test harness and cannot be named in a "+
+			"configuration", where, p))
+	}
+
+	if c.Node != nil && c.Node.Provider.TestOnly() {
+		refuse("node.provider", c.Node.Provider)
+	}
+
+	for i := range c.Tiers {
+		t := &c.Tiers[i]
+		where := fmt.Sprintf("tiers[%d]", i)
+
+		for _, p := range t.AcceptableProviders() {
+			if p.TestOnly() {
+				refuse(where, p)
+			}
+		}
+
+		// A launch block for the kind is refused on its own, because a tier that
+		// does not accept the kind still carries a spelling nothing should read.
+		for p := range t.Launch {
+			if p.TestOnly() {
+				refuse(where+".launch", p)
+			}
+		}
+	}
+
+	for i, n := range c.Nodes {
+		if n.Provider.TestOnly() {
+			refuse(fmt.Sprintf("nodes[%d]", i), n.Provider)
+		}
+	}
+
+	return errs
 }
 
 // validateBackup checks the archive store, and refuses a block that names none.
