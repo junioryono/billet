@@ -205,9 +205,15 @@ rehearsal_step "billet ca retire drops the old authority; the fleet keeps pollin
 # the harness has just proved both renewals from each node's installed
 # certificate (new issuer, new serial), so it says so.
 rehearsal_as_billet "${controller}" /usr/bin/billet ca retire --force --config /etc/billet/billet.yaml 2>&1 | sed -n '1,4p'
-if docker exec "${controller}" test -f /var/lib/billet/server/ca/ca-previous.crt; then
-    rehearsal_fail "ca retire left ca-previous.crt in place"
-fi
+# BOTH FILES OF THE PREVIOUS PAIR, not the certificate alone: LoadServing is
+# gated on the certificate and ignores an orphaned key, so a retire that
+# removed only the certificate would pass every later assertion here and
+# refuse the next rotation.
+for f in ca-previous.key ca-previous.crt; do
+    if docker exec "${controller}" test -e "/var/lib/billet/server/ca/${f}"; then
+        rehearsal_fail "ca retire left ${f} in place"
+    fi
+done
 since=$(rehearsal_clock "${controller}")
 docker exec "${controller}" systemctl restart billet-server.service
 rehearsal_wait_for 60 "the server to be back" "${controller}" systemctl is-active --quiet billet-server.service ||

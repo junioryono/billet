@@ -126,8 +126,8 @@ rehearsal_install_app_key "${controller_b}"
 # THE DSN REACHES THE UNIT THE WAY THE HOST ROLE DELIVERS IT: an environment
 # file the unit imports, never a value in billet.yaml, which names only the
 # variable (docs/deploying/postgres-and-active-passive.md). The packaged
-# billet-server.service carries no EnvironmentFile, so a drop-in adds the one
-# the role would render.
+# billet-server.service carries no EnvironmentFile, so the rehearsal renders a
+# whole unit into /etc carrying the one the role would render (below).
 for c in "${controller_a}" "${controller_b}"; do
     {
         cat <<EOF
@@ -246,14 +246,23 @@ rehearsal_wait_for 120 "B to stand by" "${controller_b}" \
     rehearsal_fail "controller B never stood by"
 rehearsal_wait_registered 120 "${controller_a}" "${node}" "${since_a}" ||
     rehearsal_fail "${node} never registered with A"
-echo "claim held by: $(active_controller "${controller_b}")"
+# ASSERTED, NOT PRINTED: everything measured below is relative to A holding
+# the claim now, and a run where B had it would measure nothing.
+test "$(active_controller "${controller_b}")" = "${controller_a}" ||
+    rehearsal_fail "billet status does not name A as the claim holder before the partition"
+echo "claim held by: ${controller_a}"
 
 rehearsal_step "partition A; measure the promotion"
 since_b=$(rehearsal_clock "${controller_b}")
 partitioned_at=$(date -u +%s)
 docker network disconnect "${network}" "${controller_a}"
+# EVERY CAUSAL WAIT FROM HERE ON READS THE JOURNAL SINCE A CLOCK MARK taken
+# before the boundary it is about. A whole-journal grep is satisfied by a line
+# from before the partition (B's own startup, A's first "standing by"), and
+# the second review round found the post-heal wait below being answered by
+# exactly that line.
 rehearsal_wait_for 300 "B to be promoted" "${controller_b}" \
-    sh -c 'journalctl -u billet-server --no-pager -o cat | grep -q "promoted to this deployment.s controller"' ||
+    sh -c "journalctl -u billet-server --since '${since_b}' --no-pager -o cat | grep -q 'promoted to this deployment.s controller'" ||
     rehearsal_fail "controller B was never promoted after A was partitioned"
 promoted_at=$(date -u +%s)
 promotion_took=$((promoted_at - partitioned_at))
@@ -269,18 +278,21 @@ node_moved_at=$(date -u +%s)
 
 rehearsal_step "heal the partition; the old leader stops and stands by"
 restarts_before=$(docker exec "${controller_a}" systemctl show -p NRestarts --value billet-server.service)
+since_heal=$(rehearsal_clock "${controller_a}")
 docker network connect --alias "${controllers}" "${network}" "${controller_a}"
 healed_at=$(date -u +%s)
 rehearsal_wait_for 300 "A to notice it was replaced" "${controller_a}" \
-    sh -c 'journalctl -u billet-server --no-pager -o cat | grep -q "no longer this deployment.s controller"' ||
+    sh -c "journalctl -u billet-server --since '${since_heal}' --no-pager -o cat | grep -q 'no longer this deployment.s controller'" ||
     rehearsal_fail "controller A never noticed it had been replaced"
 rehearsal_wait_for 120 "A to be restarted by systemd" "${controller_a}" \
     sh -c "test \"\$(systemctl show -p NRestarts --value billet-server.service)\" -gt ${restarts_before}" ||
     rehearsal_fail "systemd did not restart controller A after it stopped"
 rehearsal_wait_for 120 "A to stand by" "${controller_a}" \
-    sh -c 'journalctl -u billet-server --no-pager -o cat | grep -c "standing by for this deployment.s controller" | grep -qvE "^0$"' ||
+    sh -c "journalctl -u billet-server --since '${since_heal}' --no-pager -o cat | grep -q 'standing by for this deployment.s controller'" ||
     rehearsal_fail "controller A did not come back as a standby"
 stood_by_at=$(date -u +%s)
+test "$(rehearsal_active "${controller_a}" billet-server.service)" = active ||
+    rehearsal_fail "controller A is not active after coming back as a standby"
 test "$(active_controller "${controller_a}")" = "${controller_b}" ||
     rehearsal_fail "after healing, billet status on A does not name B as the claim holder"
 test "$(rehearsal_active "${controller_b}" billet-server.service)" = active ||
