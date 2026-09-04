@@ -3231,8 +3231,11 @@ func ec2Preflight(
 			if err != nil {
 				return fmt.Errorf("node.ebs_s3: %w", err)
 			}
-			switch probeErr := store.CheckAccess(ctx); {
-			case probeErr == nil:
+			// THE VERDICT IS judgeCacheProbe's, not this switch's. What each
+			// answer means is in cacheprobe.go, where a test can reach it.
+			probeErr := store.CheckAccess(ctx)
+			switch judgeCacheProbe(probeErr) {
+			case cacheProbeAnswered:
 				// A BUCKET THAT ANSWERS IS NOT A CACHE. Without a node.cache
 				// listener nothing on this host ever reads or writes that prefix,
 				// and this line read as though the cache were working — which is
@@ -3246,17 +3249,12 @@ func ec2Preflight(
 
 				fmt.Printf("cache    bucket %s answers under this deployment's prefix%s\n",
 					cfg.Node.EBSS3.Bucket, reachable)
-			case strings.Contains(probeErr.Error(), "HTTP 403"):
-				// NOT PROOF OF A BROKEN BUCKET: S3 answers 404 for a miss only
-				// with s3:ListBucket, and billet's minimal grant conditions
-				// that on s3:prefix — a context key GetObject does not carry —
-				// so under exactly the generated policy a healthy miss can
-				// answer 403. Advisory, until live acceptance pins the shape.
+			case cacheProbeInconclusive:
 				fmt.Printf("cache    bucket probe INCONCLUSIVE: %v\n", probeErr)
 				fmt.Printf("         (a 403 here is EITHER a refused identity OR a healthy miss " +
 					"under billet's minimal grant, whose prefix-conditioned ListBucket cannot " +
 					"match a GetObject; a real job read will settle it)\n")
-			default:
+			case cacheProbeFailed:
 				return fmt.Errorf("node.ebs_s3: %w", probeErr)
 			}
 		}

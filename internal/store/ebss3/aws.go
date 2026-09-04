@@ -18,6 +18,7 @@ import (
 
 	"github.com/junioryono/billet/internal/awscreds"
 	"github.com/junioryono/billet/internal/awsjson"
+	"github.com/junioryono/billet/internal/awss3"
 	"github.com/junioryono/billet/internal/awssig"
 	"github.com/junioryono/billet/internal/config"
 )
@@ -186,18 +187,19 @@ func (s s3API) Get(ctx context.Context, key string) ([]byte, string, bool, error
 		return nil, "", false, err
 	}
 	defer response.Body.Close()
-	if response.StatusCode == http.StatusNotFound {
-		return nil, "", false, nil
-	}
 	if response.StatusCode != http.StatusOK {
-		// S3 names the bucket's real region on a wrong-region answer; an
-		// operator staring at a bare 301 has no other way to see it.
-		if hint := response.Header.Get("X-Amz-Bucket-Region"); hint != "" {
-			return nil, "", false, fmt.Errorf("ebs-s3: S3 GET returned HTTP %d "+
-				"(the bucket's region is %s)", response.StatusCode, hint)
+		// ONLY NoSuchKey IS ABSENCE. S3 answers 404 for an object that is not
+		// there AND for a BUCKET that is not there, and reading the second as the
+		// first made a misaddressed bucket indistinguishable from a cold cache:
+		// every job fetched cold, the settlement path fails open, and nothing
+		// anywhere reported a fault. An unrecognised 404 stays an error too —
+		// could-not-tell never collapses into no.
+		refusal := awss3.ReadRefusal(response)
+		if refusal.Absent() {
+			return nil, "", false, nil
 		}
 
-		return nil, "", false, fmt.Errorf("ebs-s3: S3 GET returned HTTP %d", response.StatusCode)
+		return nil, "", false, s.refusalError("GET", refusal, response)
 	}
 	if response.Header.Get("ETag") == "" {
 		return nil, "", false, errors.New("ebs-s3: S3 returned a state object with no ETag")
@@ -211,6 +213,45 @@ func (s s3API) Get(ctx context.Context, key string) ([]byte, string, bool, error
 	}
 
 	return body, response.Header.Get("ETag"), true, nil
+}
+
+// refusalError renders one S3 refusal, naming the cause when the answer carries
+// one.
+//
+// A MISADDRESSED BUCKET IS THE CASE IT EXISTS FOR. node.ebs_s3.bucket is written
+// by hand, or generated for an operator who has never written one, and a first
+// run is exactly where a name that is not a bucket shows up — as a 404 that used
+// to read as an empty cache on every path that read one.
+//
+// THE REFUSAL IS WRAPPED WITH %w, so `billet check` can ask what S3 answered
+// rather than looking for a status in the words of a message.
+func (s s3API) refusalError(op string, refusal *awss3.Refusal, response *http.Response) error {
+	// THE REGION HINT FIRST: a hint at all means the bucket exists somewhere, so
+	// the region is the thing to change and the code below would be the wrong
+	// advice. Reported only when it DIFFERS — the header comes back on ordinary
+	// answers too, and "the bucket's region is us-west-2" beside a config that
+	// says us-west-2 is a diagnostic that sends an operator hunting.
+	if hint := awss3.RegionHint(response); hint != "" && hint != s.cfg.Region {
+		// QUOTED, because it is a header the far side chose. awss3.RegionHint has
+		// already refused anything but bounded printable bytes; the quoting is
+		// what keeps it visibly a value rather than part of the sentence.
+		return fmt.Errorf("ebs-s3: S3 %s returned %w; the bucket's region is %q and "+
+			"node.ebs_s3.region says %s", op, refusal, hint, s.cfg.Region)
+	}
+
+	switch {
+	case refusal.Code == awss3.CodeNoSuchBucket:
+		return fmt.Errorf("ebs-s3: S3 %s returned %w: node.ebs_s3.bucket names %q, which does "+
+			"not exist in %s — create it or correct the name; until billet read this code, "+
+			"every read of that bucket answered like an empty cache", op, refusal,
+			s.cfg.Bucket, s.cfg.Region)
+	case refusal.Status == http.StatusNotFound && refusal.Code == "":
+		return fmt.Errorf("ebs-s3: S3 %s returned %w and named no error code billet "+
+			"recognises; a 404 is an absent object only when S3 says %s, so this is reported "+
+			"rather than read as an empty cache", op, refusal, awss3.CodeNoSuchKey)
+	default:
+		return fmt.Errorf("ebs-s3: S3 %s returned %w", op, refusal)
+	}
 }
 
 func (s s3API) Put(
@@ -235,11 +276,11 @@ func (s s3API) Put(
 		return "", errObjectConflict
 	}
 	if response.StatusCode >= http.StatusInternalServerError {
-		return "", fmt.Errorf("%w: S3 conditional PUT returned HTTP %d",
-			errObjectAmbiguous, response.StatusCode)
+		return "", fmt.Errorf("%w: S3 conditional PUT returned %w",
+			errObjectAmbiguous, awss3.ReadRefusal(response))
 	}
 	if response.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("ebs-s3: S3 conditional PUT returned HTTP %d", response.StatusCode)
+		return "", s.refusalError("conditional PUT", awss3.ReadRefusal(response), response)
 	}
 
 	etag := response.Header.Get("ETag")
@@ -260,8 +301,11 @@ func (s s3API) Delete(ctx context.Context, key string) error {
 
 	// S3 DELETE is idempotent: it answers 204 whether or not the object existed, so
 	// a missing object is a success, not an error — decommission must be re-runnable.
+	// A 404 is therefore NOT that: it is the bucket, and a purge that reported
+	// success against a bucket S3 has never heard of would say it removed a
+	// deployment's cache without having looked at one.
 	if response.StatusCode != http.StatusNoContent && response.StatusCode != http.StatusOK {
-		return fmt.Errorf("ebs-s3: S3 DELETE returned HTTP %d", response.StatusCode)
+		return s.refusalError("DELETE", awss3.ReadRefusal(response), response)
 	}
 
 	return nil
@@ -286,7 +330,10 @@ func (s s3API) List(ctx context.Context, prefix string) ([]string, error) {
 			return nil, fmt.Errorf("ebs-s3: read S3 listing: %w", errors.Join(readErr, closeErr))
 		}
 		if response.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("ebs-s3: S3 LIST returned HTTP %d", response.StatusCode)
+			// The payload is already in hand here, so the refusal is parsed out of
+			// it rather than read from a body this loop has closed.
+			return nil, s.refusalError("LIST",
+				awss3.ParseRefusal(response.StatusCode, payload), response)
 		}
 		if len(payload) > awsBodyLimit {
 			return nil, errors.New("ebs-s3: S3 listing exceeds 8 MiB")

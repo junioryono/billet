@@ -1,0 +1,456 @@
+package awss3
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"testing"
+)
+
+// The documents S3 actually sends, in the shape it sends them.
+const (
+	noSuchKeyDocument = `<?xml version="1.0" encoding="UTF-8"?>` + "\n" +
+		`<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message>` +
+		`<Key>billet-cache/owners/abc/state/def.json</Key>` +
+		`<RequestId>QWERTY123</RequestId><HostId>aGVsbG8=</HostId></Error>`
+
+	noSuchBucketDocument = `<?xml version="1.0" encoding="UTF-8"?>` + "\n" +
+		`<Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist</Message>` +
+		`<BucketName>billet-cache-example</BucketName>` +
+		`<RequestId>QWERTY123</RequestId><HostId>aGVsbG8=</HostId></Error>`
+
+	accessDeniedDocument = `<?xml version="1.0" encoding="UTF-8"?>` + "\n" +
+		`<Error><Code>AccessDenied</Code><Message>Access Denied</Message>` +
+		`<RequestId>QWERTY123</RequestId><HostId>aGVsbG8=</HostId></Error>`
+)
+
+// ONLY NoSuchKey AT 404 IS ABSENCE, AND EVERY OTHER 404 IS AN ERROR.
+//
+// This is the whole issue in one table. A bucket that does not exist answers the
+// same status as an object that does not exist, so a reader that looks only at
+// the status cannot tell a misconfigured deployment from a cold cache — and the
+// cache path fails open, so nothing else in billet would ever say a word about
+// it.
+func TestOnlyNoSuchKeyAtFourOhFourIsAbsence(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+		code   string
+		absent bool
+	}{
+		{
+			name: "a missing object", status: http.StatusNotFound, body: noSuchKeyDocument,
+			code: CodeNoSuchKey, absent: true,
+		},
+		{
+			name: "a bucket that does not exist", status: http.StatusNotFound,
+			body: noSuchBucketDocument, code: CodeNoSuchBucket,
+		},
+		{
+			name: "a refused read", status: http.StatusForbidden, body: accessDeniedDocument,
+			code: "AccessDenied",
+		},
+		{
+			// A 404 WITH NOTHING IN IT is not something S3 sends, which is why it
+			// must not be the case that means absence: whatever produced it — a
+			// proxy, a load balancer, a captive network — is not S3 answering
+			// about an object.
+			name: "a 404 with an empty body", status: http.StatusNotFound, body: "",
+		},
+		{
+			// THE ROOT ELEMENT DECIDES, and this is the case that proves it: the
+			// <Code> here is a DIRECT child, so without pinning the root to
+			// <Error> it would be read as S3's verdict on this request. A listing
+			// or a proxy's own XML does not get to say that an object is absent.
+			name:   "NoSuchKey directly inside a document that is not an error",
+			status: http.StatusNotFound,
+			body:   `<ListBucketResult><Code>NoSuchKey</Code></ListBucketResult>`,
+		},
+		{
+			// And a code buried deeper in a real error document is not the
+			// document's own code either.
+			name:   "NoSuchKey nested below the error's own fields",
+			status: http.StatusNotFound,
+			body:   `<Error><Detail><Code>NoSuchKey</Code></Detail></Error>`,
+		},
+		{
+			name: "an html error page", status: http.StatusNotFound,
+			body: "<html><head><title>404 Not Found</title></head></html>",
+		},
+		{
+			name: "a body that is not xml at all", status: http.StatusNotFound,
+			body: "not found\n",
+		},
+		{
+			name: "a code with a newline in it", status: http.StatusNotFound,
+			body: "<Error><Code>NoSuchKey\nand more</Code></Error>",
+		},
+		{
+			name: "a code longer than any AWS sends", status: http.StatusNotFound,
+			body: "<Error><Code>" + strings.Repeat("A", 65) + "</Code></Error>",
+		},
+		{
+			name: "an empty code element", status: http.StatusNotFound,
+			body: "<Error><Code></Code><Message>something</Message></Error>",
+		},
+		{
+			// DECODE STOPS AT THE END OF THE FIRST ELEMENT, so without a check
+			// that nothing follows it, a body billet did not understand whole
+			// would be allowed to say an object is absent.
+			name: "an error document with something after it", status: http.StatusNotFound,
+			body: "<Error><Code>NoSuchKey</Code></Error><Unexpected/>",
+		},
+		{
+			// AND IT SKIPS WHATEVER PRECEDES THE FIRST ELEMENT, character data
+			// included — the same hole at the other end of the document.
+			name: "an error document with something before it", status: http.StatusNotFound,
+			body: "garbage<Error><Code>NoSuchKey</Code></Error>",
+		},
+		{
+			// THE PROLOG IS NOT CONTENT. A declaration, a comment and whitespace
+			// carry no verdict, and refusing a body over one would turn a healthy
+			// miss into a failure — the more expensive mistake of the two.
+			name: "an error document behind a comment", status: http.StatusNotFound,
+			body: "<!-- served by a cache -->\n" +
+				"<Error><Code>NoSuchKey</Code><Message>gone</Message></Error>\n",
+			code: CodeNoSuchKey, absent: true,
+		},
+		{
+			// Into a string field encoding/xml keeps the LAST match, so this
+			// answered NoSuchKey while naming two codes.
+			name: "a document naming two codes", status: http.StatusNotFound,
+			body: "<Error><Code>NoSuchBucket</Code><Code>NoSuchKey</Code></Error>",
+		},
+		{
+			// A NEWLINE IS NOT A SECOND DOCUMENT. Something between billet and S3
+			// is free to add trailing whitespace, and refusing that would turn a
+			// healthy miss into a failure — the opposite mistake.
+			name: "a document with a trailing newline", status: http.StatusNotFound,
+			body: noSuchKeyDocument + "\n", code: CodeNoSuchKey, absent: true,
+		},
+		{
+			// A CODE ASSEMBLED OUT OF MARKUP IS NOT A CODE. Unmarshalling into a
+			// string skips the nested element and concatenates the text around
+			// it, so this reads as "NoSuchKey" — out of a document that says
+			// something else entirely.
+			name: "a code with markup inside it", status: http.StatusNotFound,
+			body: "<Error><Code>NoSuch<Unexpected>Bucket</Unexpected>Key</Code></Error>",
+		},
+		{
+			// AN ENCODING/XML TAG WITHOUT A NAMESPACE MATCHES ANY NAMESPACE, so
+			// without pinning the name whole, somebody else's vocabulary gets to
+			// say that an object is absent. Both measured bodies carry none.
+			name:   "a namespaced error document",
+			status: http.StatusNotFound,
+			body: `<x:Error xmlns:x="urn:not-s3"><x:Code>NoSuchKey</x:Code>` +
+				`</x:Error>`,
+		},
+		{
+			name:   "an unqualified error naming a namespaced code",
+			status: http.StatusNotFound,
+			body:   `<Error xmlns:x="urn:not-s3"><x:Code>NoSuchKey</x:Code></Error>`,
+		},
+		{
+			// THE ROOT'S OWN NAME, ISOLATED. The case above is also refused by
+			// the code's name, so it would stay green with the root check
+			// deleted; here the code is unqualified and only the root is not.
+			name:   "a namespaced error naming an unqualified code",
+			status: http.StatusNotFound,
+			body:   `<x:Error xmlns:x="urn:not-s3"><Code>NoSuchKey</Code></x:Error>`,
+		},
+		{
+			// THE DECODE FAILURE, ISOLATED. The code is populated before the
+			// document runs out, so without the error being acted on, endsAfter
+			// sees a clean EOF and a truncated body answers absence.
+			name: "an error document that stops half way", status: http.StatusNotFound,
+			body: "<Error><Code>NoSuchKey</Code>",
+		},
+		{
+			// XML's WHITESPACE, NOT UNICODE's. strings.TrimSpace would read a
+			// non-breaking space as nothing, and a body with one in front of the
+			// document is malformed rather than empty.
+			name: "a non-breaking space before the document", status: http.StatusNotFound,
+			body: "\u00a0<Error><Code>NoSuchKey</Code></Error>",
+		},
+		{
+			name: "a non-breaking space after the document", status: http.StatusNotFound,
+			body: "<Error><Code>NoSuchKey</Code></Error>\u00a0",
+		},
+		{
+			name: "a non-breaking space around the code", status: http.StatusNotFound,
+			body: "<Error><Code>\u00a0NoSuchKey\u00a0</Code></Error>",
+		},
+		{
+			// A BODY WITH NO ELEMENT AT ALL. rootOf runs out of tokens, and a
+			// prolog on its own says nothing about an object.
+			name: "a prolog and nothing else", status: http.StatusNotFound,
+			body: `<?xml version="1.0" encoding="UTF-8"?>` + "\n",
+		},
+		{
+			// A DOCTYPE IS PROLOG, and refusing a document over one would be the
+			// expensive mistake rather than the safe one.
+			name: "an error document behind a doctype", status: http.StatusNotFound,
+			body: "<!DOCTYPE Error>\n<Error><Code>NoSuchKey</Code></Error>",
+			code: CodeNoSuchKey, absent: true,
+		},
+		{
+			// THE SAME TOLERANCE AT THE OTHER END, which is the symmetry the two
+			// guards are written to have.
+			name: "an error document with a comment after it", status: http.StatusNotFound,
+			body: "<Error><Code>NoSuchKey</Code></Error><!-- cached -->\n",
+			code: CodeNoSuchKey, absent: true,
+		},
+		{
+			// AND THE END IS STRICTER THAN THE START. The document has finished,
+			// so a doctype after it is not late prolog — it is a second
+			// document's worth of matter arriving after billet has its answer.
+			name: "a doctype after the document", status: http.StatusNotFound,
+			body: "<Error><Code>NoSuchKey</Code></Error><!DOCTYPE Error>",
+		},
+		{
+			name: "a declaration after the document", status: http.StatusNotFound,
+			body: `<Error><Code>NoSuchKey</Code></Error><?xml version="1.0"?>`,
+		},
+		{
+			// A DECLARATION IS ONLY ONE WHEN IT COMES FIRST. encoding/xml
+			// tokenizes a processing instruction wherever it appears and says
+			// nothing about whether it belongs there.
+			name: "a declaration behind a comment", status: http.StatusNotFound,
+			body: `<!-- x --><?xml version="1.0"?>` + "\n" +
+				"<Error><Code>NoSuchKey</Code></Error>",
+		},
+		{
+			// AN ORDINARY INSTRUCTION IS PROLOG WHEREVER IT SITS, which XML says
+			// too, and which the declaration rule above must not sweep up.
+			name:   "an instruction that is not a declaration, before the document",
+			status: http.StatusNotFound,
+			body:   "<?cache hit?><Error><Code>NoSuchKey</Code></Error>",
+			code:   CodeNoSuchKey, absent: true,
+		},
+		{
+			// AND NOT AFTER IT. The epilogue takes comments and whitespace only,
+			// so a regression that re-admitted instructions generally — rather
+			// than declarations specifically — is caught here rather than only by
+			// the declaration case below.
+			name:   "an instruction that is not a declaration, after the document",
+			status: http.StatusNotFound,
+			body:   "<Error><Code>NoSuchKey</Code></Error><?cache hit?>",
+		},
+		{
+			// A BYTE-ORDER MARK IS NOT CHARACTER DATA ANYBODY MEANT. Go hands it
+			// back as CharData, which is not whitespace, so without stripping it
+			// an otherwise perfect document from an S3-compatible endpoint would
+			// be refused — a healthy miss turned into a failure.
+			name: "a document behind a byte-order mark", status: http.StatusNotFound,
+			body: "\xef\xbb\xbf" + noSuchKeyDocument, code: CodeNoSuchKey, absent: true,
+		},
+		{
+			// EXACTLY ONE, and the second is character data XML does not allow
+			// there. Stripping every one of them would be reading past bytes
+			// billet cannot account for on its way to a verdict.
+			name: "a document behind two byte-order marks", status: http.StatusNotFound,
+			body: "\xef\xbb\xbf\xef\xbb\xbf" + noSuchKeyDocument,
+		},
+		{
+			// THE STATUS IS HALF THE ANSWER. The code says what S3 thinks and the
+			// status says how it answered; a code alone would let a body that
+			// arrived with some other status decide that an object is missing.
+			name: "NoSuchKey at a status that is not 404", status: http.StatusForbidden,
+			body: noSuchKeyDocument, code: CodeNoSuchKey,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			refusal := ParseRefusal(tc.status, []byte(tc.body))
+
+			if refusal.Status != tc.status {
+				t.Errorf("status = %d, want %d", refusal.Status, tc.status)
+			}
+
+			if refusal.Code != tc.code {
+				t.Errorf("code = %q, want %q", refusal.Code, tc.code)
+			}
+
+			if refusal.Absent() != tc.absent {
+				t.Errorf("Absent() = %v, want %v — %s", refusal.Absent(), tc.absent, refusal)
+			}
+		})
+	}
+}
+
+// A BODY BILLET DID NOT READ WHOLE SAYS NOTHING, and it says it as an error.
+func TestAnOversizedBodyNamesNoCode(t *testing.T) {
+	t.Parallel()
+
+	padded := "<Error><Code>NoSuchKey</Code><Message>" +
+		strings.Repeat("x", bodyLimit) + "</Message></Error>"
+
+	refusal := ParseRefusal(http.StatusNotFound, []byte(padded))
+
+	if refusal.Code != "" || refusal.Absent() {
+		t.Fatalf("a body past the read bound answered %s and Absent()=%v; billet did not see "+
+			"the whole document and must not conclude the object is gone",
+			refusal, refusal.Absent())
+	}
+}
+
+// errorBody fails on the first read, the way a connection dropped mid-answer does.
+type errorBody struct{}
+
+func (errorBody) Read([]byte) (int, error) {
+	return 0, errors.New("connection reset")
+}
+
+func (errorBody) Close() error { return nil }
+
+// A RESPONSE BILLET COULD NOT READ IS COULD-NOT-TELL, never absence.
+func TestReadRefusalTreatsAnUnreadableBodyAsNoCode(t *testing.T) {
+	t.Parallel()
+
+	refusal := ReadRefusal(&http.Response{
+		StatusCode: http.StatusNotFound,
+		Body:       errorBody{},
+	})
+
+	if refusal.Status != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", refusal.Status)
+	}
+
+	if refusal.Code != "" || refusal.Absent() {
+		t.Fatalf("a body that could not be read answered %s and Absent()=%v", refusal,
+			refusal.Absent())
+	}
+}
+
+// ReadRefusal takes the code out of the body it is given.
+func TestReadRefusalReadsTheDocument(t *testing.T) {
+	t.Parallel()
+
+	refusal := ReadRefusal(&http.Response{
+		StatusCode: http.StatusNotFound,
+		Body:       io.NopCloser(strings.NewReader(noSuchBucketDocument)),
+	})
+
+	if refusal.Code != CodeNoSuchBucket {
+		t.Fatalf("code = %q, want %q", refusal.Code, CodeNoSuchBucket)
+	}
+
+	if refusal.Absent() {
+		t.Error("a bucket that does not exist read as an absent object")
+	}
+}
+
+// A RESPONSE WITH NO BODY AT ALL is still a status, and still not absence.
+func TestReadRefusalToleratesAMissingBody(t *testing.T) {
+	t.Parallel()
+
+	refusal := ReadRefusal(&http.Response{StatusCode: http.StatusNotFound})
+
+	if refusal.Status != http.StatusNotFound || refusal.Code != "" || refusal.Absent() {
+		t.Fatalf("a bodyless response answered %s and Absent()=%v", refusal, refusal.Absent())
+	}
+
+	if got := ReadRefusal(nil); got.Status != 0 || got.Absent() {
+		t.Fatalf("a nil response answered %s", got)
+	}
+}
+
+// THE RENDERING IS WHAT AN OPERATOR READS, so it names the code when there is
+// one and never invents one when there is not.
+func TestARefusalRendersTheCodeAndTheStatus(t *testing.T) {
+	t.Parallel()
+
+	named := &Refusal{Status: http.StatusNotFound, Code: CodeNoSuchBucket}
+	if got := named.Error(); got != "NoSuchBucket (HTTP 404)" {
+		t.Errorf("Error() = %q", got)
+	}
+
+	unnamed := &Refusal{Status: http.StatusMovedPermanently}
+	if got := unnamed.Error(); got != "HTTP 301" {
+		t.Errorf("Error() = %q", got)
+	}
+
+	// A NIL REFUSAL IS NOT AN ANSWER, and neither method dereferences one: both
+	// are reachable through fmt's %w on an error chain nobody built by hand, and
+	// a rendering path that panics turns a diagnostic into an outage.
+	var missing *Refusal
+
+	if got := missing.Error(); got != "s3: no refusal" {
+		t.Errorf("a nil refusal rendered %q", got)
+	}
+
+	if missing.Absent() {
+		t.Error("a nil refusal read as an absent object")
+	}
+}
+
+// THE REGION HINT IS REMOTE BYTES, and it is repeated to an operator.
+//
+// The code is shape-checked before it is rendered; a header is no more
+// trustworthy than a body, and archivestore takes a configured endpoint, so the
+// far side is not always AWS.
+func TestARegionHintIsOnlyRepeatedWhenItLooksLikeOne(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{name: "a region", value: "eu-west-1", want: "eu-west-1"},
+		{name: "surrounding space", value: "  eu-west-1  ", want: "eu-west-1"},
+		{name: "absent", value: ""},
+		{name: "an escape sequence", value: "eu-west-1\x1b[2J"},
+		{name: "a sentence", value: "the bucket is somewhere else"},
+		{name: "longer than billet will print", value: strings.Repeat("a", 65)},
+		{name: "at the rendering bound", value: strings.Repeat("a", 64),
+			want: strings.Repeat("a", 64)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			response := &http.Response{Header: http.Header{}}
+			if tc.value != "" {
+				response.Header.Set("X-Amz-Bucket-Region", tc.value)
+			}
+
+			if got := RegionHint(response); got != tc.want {
+				t.Errorf("RegionHint = %q, want %q", got, tc.want)
+			}
+		})
+	}
+
+	if got := RegionHint(nil); got != "" {
+		t.Errorf("RegionHint(nil) = %q", got)
+	}
+}
+
+// THE STATUS TRAVELS THROUGH THE WRAPPING, which is what lets `billet check`
+// classify a 403 without matching on the words of a message.
+func TestStatusOfFindsARefusalThroughItsWrapping(t *testing.T) {
+	t.Parallel()
+
+	wrapped := fmt.Errorf("ebs-s3: the cache bucket did not answer a probe read: %w",
+		fmt.Errorf("ebs-s3: S3 GET returned %w", &Refusal{Status: http.StatusForbidden,
+			Code: "AccessDenied"}))
+
+	if got := StatusOf(wrapped); got != http.StatusForbidden {
+		t.Errorf("StatusOf = %d, want 403", got)
+	}
+
+	// ZERO IS "NOT AN S3 REFUSAL". A transport failure and a credential that
+	// would not resolve reach the same branch, and neither is a 403.
+	if got := StatusOf(errors.New("dial tcp: connection refused")); got != 0 {
+		t.Errorf("StatusOf(a transport failure) = %d, want 0", got)
+	}
+
+	if got := StatusOf(nil); got != 0 {
+		t.Errorf("StatusOf(nil) = %d, want 0", got)
+	}
+}

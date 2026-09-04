@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -215,10 +216,16 @@ func TestAnOccupiedKeyIsDistinguishable(t *testing.T) {
 
 // An absent key is a FACT, not a failure: a caller that listed and then fetched
 // races an operator's lifecycle rule.
+//
+// THE FAKE SERVES THE DOCUMENT S3 SERVES, and that is the point rather than
+// decoration. This test used to answer a BODYLESS 404 — a shape S3 never sends —
+// and it passed for a reader that looked only at the status, which is exactly the
+// reader that could not tell a missing bucket from a missing object.
 func TestAnAbsentKeyIsDistinguishable(t *testing.T) {
 	f := newFakeS3(t)
 	f.answer(func(w http.ResponseWriter, _ *http.Request) bool {
 		w.WriteHeader(http.StatusNotFound)
+		writeXML(t, w, noSuchKeyDocument)
 
 		return true
 	})
@@ -228,6 +235,89 @@ func TestAnAbsentKeyIsDistinguishable(t *testing.T) {
 	_, err := s.Get(t.Context(), "billet/dep/2026/manifest.json")
 	if !errors.Is(err, ErrNoSuchObject) {
 		t.Fatalf("Get returned %v, want ErrNoSuchObject", err)
+	}
+}
+
+// The two documents S3 sends for the two facts a 404 can carry, declaration and
+// newline included.
+const (
+	noSuchKeyDocument = `<?xml version="1.0" encoding="UTF-8"?>` + "\n" +
+		`<Error><Code>NoSuchKey</Code>` +
+		`<Message>The specified key does not exist.</Message>` +
+		`<Key>billet/dep/2026/manifest.json</Key></Error>`
+	noSuchBucketDocument = `<?xml version="1.0" encoding="UTF-8"?>` + "\n" +
+		`<Error><Code>NoSuchBucket</Code>` +
+		`<Message>The specified bucket does not exist</Message>` +
+		`<BucketName>billet-backups</BucketName></Error>`
+)
+
+func writeXML(t *testing.T, w http.ResponseWriter, document string) {
+	t.Helper()
+
+	if _, err := io.WriteString(w, document); err != nil {
+		t.Errorf("write the refusal: %v", err)
+	}
+}
+
+// A MISSING BUCKET IS NOT A MISSING OBJECT, and on the day this matters the
+// difference is the whole recovery.
+//
+// A restore runs on a machine that holds the billet binary and nothing else. Told
+// "no such object", an operator goes looking for backups that were never taken;
+// told the bucket is not there, they fix one line of config. S3 says which it is
+// and billet used to throw the answer away.
+func TestAMissingBucketIsNotAMissingObject(t *testing.T) {
+	f := newFakeS3(t)
+	f.answer(func(w http.ResponseWriter, _ *http.Request) bool {
+		w.WriteHeader(http.StatusNotFound)
+		writeXML(t, w, noSuchBucketDocument)
+
+		return true
+	})
+
+	s := newTestStore(t, f, "")
+
+	_, err := s.Get(t.Context(), "billet/dep/2026/manifest.json")
+	if err == nil {
+		t.Fatal("a bucket that does not exist answered like a healthy fetch")
+	}
+
+	if errors.Is(err, ErrNoSuchObject) {
+		t.Fatalf("a bucket that does not exist reached the caller as an absent archive: %v", err)
+	}
+
+	for _, must := range []string{"NoSuchBucket", "billet-backups", "does not exist"} {
+		if !strings.Contains(err.Error(), must) {
+			t.Errorf("the failure does not say %q: %v", must, err)
+		}
+	}
+}
+
+// A 404 BILLET CANNOT READ IS A FAILURE, NOT AN ABSENCE.
+//
+// S3 always names a code. Something that answers 404 without one — a proxy, a
+// captive network, a gateway in front of the bucket — is not S3 answering about
+// this object, and reading it as "that archive is gone" would be billet asserting
+// something it was never told.
+func TestAnUnreadableFourOhFourIsNotAnAbsentObject(t *testing.T) {
+	f := newFakeS3(t)
+	f.answer(func(w http.ResponseWriter, _ *http.Request) bool {
+		w.WriteHeader(http.StatusNotFound)
+		writeXML(t, w, "<html><head><title>404 Not Found</title></head></html>")
+
+		return true
+	})
+
+	s := newTestStore(t, f, "")
+
+	_, err := s.Get(t.Context(), "billet/dep/2026/manifest.json")
+	if err == nil || errors.Is(err, ErrNoSuchObject) {
+		t.Fatalf("a 404 with no error code answered %v, want a failure that is not "+
+			"ErrNoSuchObject", err)
+	}
+
+	if !strings.Contains(err.Error(), "named no error code billet recognises") {
+		t.Errorf("the failure does not say why it is not an absent object: %v", err)
 	}
 }
 
@@ -243,9 +333,41 @@ func TestAWrongRegionIsNamed(t *testing.T) {
 
 	s := newTestStore(t, f, "")
 
+	// QUOTED, because it is a value the far side chose. Asserting the bare name
+	// stays green with the %q reverted to %s, which is the one thing that keeps
+	// an accepted remote value visibly a value.
 	_, err := s.Get(t.Context(), "billet/dep/2026/manifest.json")
-	if err == nil || !strings.Contains(err.Error(), "eu-west-1") {
-		t.Fatalf("Get returned %v, want the bucket's real region named", err)
+	if err == nil || !strings.Contains(err.Error(), `"eu-west-1"`) {
+		t.Fatalf("Get returned %v, want the bucket's real region named and quoted", err)
+	}
+}
+
+// AND A HEADER BILLET WILL NOT REPEAT IS DROPPED RATHER THAN PRINTED.
+//
+// PROVING THE HELPER IS NOT PROVING IT IS USED: awss3's own test stays green with
+// this client reading the header directly. It matters more here than anywhere,
+// because backup.s3.endpoint means the far side is not always AWS — and the
+// operator reading this line is recovering a deployment.
+func TestARegionHintFromTheFarSideIsNotRepeatedWhole(t *testing.T) {
+	hostile := "the bucket moved; run this command instead"
+
+	f := newFakeS3(t)
+	f.answer(func(w http.ResponseWriter, _ *http.Request) bool {
+		w.Header().Set("X-Amz-Bucket-Region", hostile)
+		w.WriteHeader(http.StatusMovedPermanently)
+
+		return true
+	})
+
+	s := newTestStore(t, f, "")
+
+	_, err := s.Get(t.Context(), "billet/dep/2026/manifest.json")
+	if err == nil {
+		t.Fatal("a redirect passed as a healthy fetch")
+	}
+
+	if strings.Contains(err.Error(), hostile) {
+		t.Errorf("a header the far side chose was repeated whole to an operator: %v", err)
 	}
 }
 

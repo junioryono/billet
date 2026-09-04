@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/awscreds"
+	"github.com/junioryono/billet/internal/awss3"
 	"github.com/junioryono/billet/internal/awssig"
 	"github.com/junioryono/billet/internal/config"
 )
@@ -99,6 +100,182 @@ func TestIndeterminateS3WritesAreAmbiguous(t *testing.T) {
 				t.Fatalf("Put error = %v, want an ambiguous outcome", err)
 			}
 		})
+	}
+}
+
+// ONLY NoSuchKey READS AS AN ABSENT STATE OBJECT.
+//
+// The state read is the cache's whole map of itself, and `found=false` puts an
+// empty one in its place. So a 404 that is really "this bucket does not exist"
+// used to be indistinguishable from a cold cache: every job fetched cold, the
+// node's cache path fails open by design, and the one diagnostic that looks —
+// `billet check`'s bucket probe — printed that the bucket answered.
+func TestOnlyNoSuchKeyReadsAsAnAbsentStateObject(t *testing.T) {
+	t.Parallel()
+
+	// The shape S3 answers in, declaration and newline included.
+	const (
+		noSuchKey = `<?xml version="1.0" encoding="UTF-8"?>` + "\n" +
+			`<Error><Code>NoSuchKey</Code>` +
+			`<Message>The specified key does not exist.</Message></Error>`
+		noSuchBucket = `<?xml version="1.0" encoding="UTF-8"?>` + "\n" +
+			`<Error><Code>NoSuchBucket</Code>` +
+			`<Message>The specified bucket does not exist</Message>` +
+			`<BucketName>billet-cache-example</BucketName></Error>`
+		accessDenied = `<?xml version="1.0" encoding="UTF-8"?>` + "\n" +
+			`<Error><Code>AccessDenied</Code>` +
+			`<Message>Access Denied</Message></Error>`
+	)
+
+	for _, tc := range []struct {
+		name    string
+		status  int
+		body    string
+		wantErr bool
+		// says is a clause the operator has to be able to read in the failure.
+		says string
+	}{
+		{
+			name: "a missing object", status: http.StatusNotFound, body: noSuchKey,
+		},
+		{
+			name: "a bucket that does not exist", status: http.StatusNotFound, body: noSuchBucket,
+			wantErr: true, says: `node.ebs_s3.bucket names "billet-cache-example"`,
+		},
+		{
+			// NOT A SHAPE S3 SENDS, which is exactly why it must not be the case
+			// that means absence: whatever answered is not S3 talking about an
+			// object.
+			name: "a 404 with no error document", status: http.StatusNotFound,
+			wantErr: true, says: "named no error code billet recognises",
+		},
+		{
+			name: "a refused read", status: http.StatusForbidden, body: accessDenied,
+			wantErr: true, says: "AccessDenied (HTTP 403)",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+				if _, err := io.WriteString(w, tc.body); err != nil {
+					t.Errorf("write the refusal: %v", err)
+				}
+			}))
+			defer server.Close()
+
+			api := newS3API(config.EBSS3Config{Region: "us-west-2", Bucket: "billet-cache-example"},
+				staticCredentials{}, server.Client(), server.URL, time.Now)
+
+			body, etag, found, err := api.Get(t.Context(), "state/key.json")
+
+			switch {
+			case tc.wantErr && err == nil:
+				t.Fatalf("Get answered found=%v with no error; a refusal billet cannot read as "+
+					"NoSuchKey must not read as an empty cache", found)
+			case !tc.wantErr && err != nil:
+				t.Fatalf("Get: %v", err)
+			}
+
+			// NOTHING HERE IS A STATE OBJECT. found=true is what makes the caller
+			// parse a body, so a refusal must never claim one — and the absent
+			// case is the pair (found=false, err=nil), which is the only way
+			// loadObject reaches its empty state.
+			if found {
+				t.Errorf("Get claimed to have found a state object in a %d answer", tc.status)
+			}
+
+			if body != nil || etag != "" {
+				t.Errorf("Get returned body %q and etag %q on a refusal", body, etag)
+			}
+
+			if tc.says != "" && !strings.Contains(err.Error(), tc.says) {
+				t.Errorf("the failure does not say %q: %v", tc.says, err)
+			}
+		})
+	}
+}
+
+// THE REGION HINT REACHES AN OPERATOR THROUGH awss3.RegionHint, NOT RAW.
+//
+// PROVING THE HELPER IS NOT PROVING IT IS USED: awss3's own test would stay green
+// with this client reading the header directly, and the header is bytes the far
+// side chose, on a path that ends in a terminal. Two things at once — a hint
+// billet will not repeat is dropped, and one it will is quoted.
+func TestTheRegionHintIsFilteredBeforeItReachesAnOperator(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name   string
+		hint   string
+		reject bool
+	}{
+		// A SENTENCE AND AN OVERLONG VALUE, not an escape sequence: Go's own
+		// server will not put a control character on the wire, so a test built
+		// around one would pass for a reason that has nothing to do with this
+		// client. awss3's table covers the control characters directly.
+		{name: "a sentence", hint: "your region is wrong, run rm -rf /", reject: true},
+		{name: "longer than billet will repeat", hint: strings.Repeat("z", 65), reject: true},
+		{name: "a region", hint: "eu-west-1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("X-Amz-Bucket-Region", tc.hint)
+				w.WriteHeader(http.StatusMovedPermanently)
+			}))
+			defer server.Close()
+
+			api := newS3API(config.EBSS3Config{Region: "us-west-2", Bucket: "billet-cache-example"},
+				staticCredentials{}, server.Client(), server.URL, time.Now)
+
+			_, _, _, err := api.Get(t.Context(), "state/key.json")
+			if err == nil {
+				t.Fatal("a redirect passed as a healthy read")
+			}
+
+			if tc.reject && strings.Contains(err.Error(), tc.hint) {
+				t.Errorf("a header billet will not repeat was repeated whole: %v", err)
+			}
+
+			if !tc.reject && !strings.Contains(err.Error(), `"`+tc.hint+`"`) {
+				t.Errorf("the bucket's real region was not named, or not quoted: %v", err)
+			}
+		})
+	}
+}
+
+// THE PROBE'S 403 BRANCH ASKS THE ANSWER, NOT THE WORDS.
+//
+// `billet check` reports a 403 from the cache probe as INCONCLUSIVE, because
+// billet's own minimal grant can answer one for a healthy miss. It reaches that
+// verdict through the refusal S3 sent, so this asserts the store's error carries
+// it — a message reworded above this line must not be able to change a verdict.
+func TestARefusedReadCarriesItsStatusToTheProbe(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		if _, err := io.WriteString(w, `<Error><Code>AccessDenied</Code></Error>`); err != nil {
+			t.Errorf("write the refusal: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	cfg := config.EBSS3Config{Region: "us-west-2", Bucket: "billet-cache-example"}
+	api := newS3API(cfg, staticCredentials{}, server.Client(), server.URL, time.Now)
+	store := newStore(cfg, "deployment/site", newFakeBlocks(), api)
+
+	err := store.CheckAccess(t.Context())
+	if err == nil {
+		t.Fatal("a refused read passed the access probe")
+	}
+
+	if got := awss3.StatusOf(err); got != http.StatusForbidden {
+		t.Fatalf("the probe's error carries status %d, want 403 — `billet check` classifies "+
+			"this branch as inconclusive and cannot see it", got)
 	}
 }
 
