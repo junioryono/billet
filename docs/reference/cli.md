@@ -185,8 +185,8 @@ Capture a deployment as one unit, put it back as one unit or not at all, or put 
 | `billet images reap [--keep 3] [--dry-run] [--kernel-dir]` | remove generations nothing needs, and orphaned kernels |
 | `billet images promote\|unpromote <image>@<gen>` | the manual half of promotion |
 | `billet runner check [--quiet]` | how close the pinned `actions/runner` is to being refused. Exit 0 nothing to do, 2 rebuild due, 3 GitHub already refusing |
-| `billet ami build [--arch x64\|arm64] [--base-image] [--instance-type] [--builder-disk] [--runner-version] [--name] [--ca-cert] --payload-bucket [--region] [--subnet] [--security-group] [--public-ip] [--timeout 1h] [--verify] [--verify-instance-type]` | build the AMI the ec2 backend launches, boot it, and stamp it only after it proved itself |
-| `billet ami verify <ami-id> [--instance-type] [--region] [--subnet] [--security-group] [--public-ip] [--timeout 20m]` | boot an existing AMI and stamp it if it proves itself |
+| `billet ami build [--arch x64\|arm64] [--base-image] [--instance-type] [--builder-disk] [--runner-version] [--name] [--ca-cert] --payload-bucket [--deployment] [--region] [--subnet] [--security-group] [--public-ip] [--timeout 1h] [--verify] [--verify-instance-type]` | build the AMI the ec2 backend launches, boot it, and stamp it only after it proved itself |
+| `billet ami verify <ami-id> [--instance-type] [--deployment] [--region] [--subnet] [--security-group] [--public-ip] [--timeout 20m]` | boot an existing AMI and stamp it if it proves itself |
 
 ## Cache
 

@@ -295,9 +295,18 @@ variable "backup_retention_days" {
 # should not carry it. On, `billet ami build` runs on the controller with its own
 # instance role rather than from a workstation holding an operator's credentials.
 variable "builder" {
-  description = "Grant the node role what `billet ami build` needs (image creation, its own cleanup, the verifier's console and the contract tag), so the build can run on the controller rather than from a workstation's credentials. Off by default."
+  description = "Grant the node role what `billet ami build` needs (image creation, its own cleanup, the verifier's console and the contract tag), so the build can run on the controller rather than from a workstation's credentials. Off by default. Refused beside iam_policy_json."
   type        = bool
   default     = false
+
+  validation {
+    # THE CHILD'S EXACT RULE, duplicated on purpose: this root is where an
+    # operator sets both, so the refusal should name the two inputs THEY typed
+    # rather than surfacing from a module they did not write. The child enforces
+    # it too, because it is an exported entry point of its own.
+    condition     = !var.builder || var.iam_policy_json == ""
+    error_message = "builder = true cannot be combined with iam_policy_json. The builder grant this module attaches is account-wide — it has no deployment id at apply time — and IAM unions allows, so beside a value-scoped override it would hand the node role account-wide reach over every deployment's builders in the account. Generate the override with `billet init iam --deployment <id> --builder` instead, so one document carries both grants, and leave builder = false."
+  }
 }
 
 variable "builder_payload_bucket" {

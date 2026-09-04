@@ -45,7 +45,18 @@ output "spot_node_name" {
   value = var.enable_spot ? aws_sqs_queue.interruptions[0].name : ""
 }
 
-output "builder_granted" {
-  description = "Whether the node role carries the AMI builder's grant. When false, `billet ami build` needs credentials of its own from somewhere else."
+# WHAT THIS MODULE DID, NOT WHAT THE ROLE CAN DO.
+#
+# It was `builder_granted`, described as whether the role carries the builder's
+# grant — which this module cannot know. The supported deployment-scoped shape is
+# an `iam_policy_json` override generated with `--builder` and `builder = false`,
+# and against that the old output answered "no" while the role held the grant:
+# a could-not-tell reported as a no, about a security-relevant capability.
+#
+# The renamed one states a fact the module owns. Whether an override carries the
+# builder's statements is a question for whoever generated it, and reading the
+# document to guess is the thing this module deliberately does not do.
+output "builder_policy_attached" {
+  description = "Whether THIS MODULE attached its own (account-wide) builder policy, which it does when builder = true. It says nothing about an iam_policy_json override: one generated with `billet init iam --deployment <id> --builder --payload-bucket <bucket>` carries the builder's grant while this reports false."
   value       = var.builder
 }

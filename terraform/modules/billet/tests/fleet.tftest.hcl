@@ -660,8 +660,8 @@ run "no_builder_grant_unless_asked" {
     error_message = "a deployment that did not ask to build images must carry no builder grant"
   }
   assert {
-    condition     = output.builder_granted == false
-    error_message = "the builder grant must be reported as absent"
+    condition     = output.builder_policy_attached == false
+    error_message = "this module attached no builder policy and must report so"
   }
 }
 
@@ -924,8 +924,7 @@ run "accepts_the_longest_payload_bucket" {
 
 # AN OVERRIDE REPLACES THE NODE POLICY AND NOTHING ELSE. It attaches no builder,
 # and the module asks no question about its contents: whether a given IAM
-# document admits the builder's own launch is not something a string can answer,
-# so the variable's own text carries the rule instead. See #61.
+# document admits the builder's own launch is not something a string can answer.
 run "an_override_attaches_no_builder_and_is_passed_through" {
   command = plan
 
@@ -942,5 +941,57 @@ run "an_override_attaches_no_builder_and_is_passed_through" {
   assert {
     condition     = length(aws_iam_role_policy.builder) == 0
     error_message = "no builder was asked for, so none is attached"
+  }
+}
+
+# A BUILDER BESIDE AN OVERRIDE IS REFUSED, BECAUSE IAM WOULD UNION THEM.
+#
+# This module's builder rendering is generated in ACCOUNT-WIDE mode — it has no
+# deployment id at apply time, since the control plane mints one on its first
+# run — so it matches every `billet-ami-build-*` in the account. Attached beside
+# a VALUE-scoped override, IAM's union of allows hands the role that wide reach
+# and the isolation the override was chosen for is gone: this deployment could
+# image, terminate, read the console of and stamp any other deployment's build.
+# That is issue #56 coming back through the module, and it cannot be resolved
+# here, because the id the narrow rendering needs does not exist yet at apply.
+#
+# The refusal turns on which INPUTS are set, never on what the document says: an
+# earlier attempt searched the override for a literal and was wrong in both
+# directions.
+run "refuses_a_builder_beside_an_override" {
+  command = plan
+
+  module {
+    source = "./modules/fleet-ec2"
+  }
+
+  variables {
+    name            = "billet-test"
+    vpc_id          = "vpc-0f0f0f0f0f0f0f0f0"
+    builder         = true
+    iam_policy_json = jsonencode({ Version = "2012-10-17", Statement = [] })
+  }
+
+  expect_failures = [var.builder]
+}
+
+# ...AND A BUILDER WITHOUT ONE STILL APPLIES, so the refusal is about the
+# combination and not about the builder grant itself.
+run "a_builder_without_an_override_still_attaches" {
+  command = plan
+
+  module {
+    source = "./modules/fleet-ec2"
+  }
+
+  variables {
+    name    = "billet-test"
+    vpc_id  = "vpc-0f0f0f0f0f0f0f0f0"
+    builder = true
+  }
+
+  assert {
+    condition     = length(aws_iam_role_policy.builder) == 1
+    error_message = "a builder with no override is the ordinary shape and must apply"
   }
 }
