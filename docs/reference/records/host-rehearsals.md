@@ -54,7 +54,7 @@ The finding cost one release cut and had never been visible to a test, because e
 | CA rotation | **passed** on 2026-09-04 (second, third and fourth runs, 905s, 928s and 907s, arm64, the fourth proving both files of the retired pair absent positively; the first stopped at a harness mistake, above) |
 | Promotion | **passed** on 2026-09-04 (sixth run, 188s, arm64, every post-partition and post-heal journal wait scoped to its boundary; promotion 21s after the partition on keepalives 10/5/3; the runs before it stopped at harness mistakes, above) |
 
-The `status.md` cells these rehearsals exist to move stay at "Not yet" until each has run; a harness is not a proof. The recover, CA rotation and active-passive cells moved on 2026-09-04; the rollout cell waits on a release the deployed policy accepts.
+The `status.md` cells these rehearsals exist to move stay at "Not yet" until each has run; a harness is not a proof. The recover, CA rotation and active-passive cells moved on 2026-09-04; the rollout cell waits on a release above v0.6.1, with v0.6.1 running as the FROM host, because the host running FROM is the one that verifies the target.
 
 ## What the harness does not prove
 

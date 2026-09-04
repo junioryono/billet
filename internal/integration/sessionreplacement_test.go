@@ -52,7 +52,7 @@ import (
 // THE PROCESS TIMEOUT IS NOT DECORATION: the expiry window alone defaults to
 // thirty minutes, and Go's default is ten.
 //
-// IT RAN SIX TIMES ON 2026-09-04 and the answers are in ADR-006,
+// IT RAN SEVEN TIMES ON 2026-09-04 and the answers are in ADR-006,
 // upstream-references.md and the protocol skill: a successor is refused under
 // either name, the session was still refused at 60 seconds every time and open at
 // 91 or 92, and the unacknowledged message came back to the successor. NOTHING
@@ -90,10 +90,29 @@ func TestLiveSessionReplacement(t *testing.T) {
 	// THE FIRST SESSION IS OPENED AND ABANDONED WITHOUT BEING CLOSED, which is
 	// what a killed controller leaves behind. Closing it would be the graceful
 	// path, and the graceful path is not the one whose behaviour is unknown.
-	first, err := client.Session(t.Context(), set.ID, owner)
+	first, err := client.Session(probeCtx(t), set.ID, owner)
 	if err != nil {
 		t.Fatalf("open the first message session: %v", err)
 	}
+
+	// BUT ONLY ONCE THE ABANDONMENT IS THE MEASUREMENT. Until a message carrying
+	// work is held there is nothing to abandon it for, and a precondition that
+	// fails here would leave a session outstanding for no finding at all — which
+	// is the 409 the next attempt would then spend two minutes waiting out.
+	abandonFirst := false
+
+	t.Cleanup(func() {
+		if abandonFirst {
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
+		defer cancel()
+
+		if err := first.Close(ctx); err != nil {
+			t.Errorf("closing the first session after a precondition failed: %v", err)
+		}
+	})
 
 	report.FirstSessionStatistics = first.Statistics()
 
@@ -117,6 +136,8 @@ func TestLiveSessionReplacement(t *testing.T) {
 
 	report.HeldMessageID = held.MessageID
 	report.HeldMessage = describeMessage(held)
+
+	abandonFirst = true
 
 	t.Logf("first session holds message %d (%s), deliberately NOT acknowledged",
 		held.MessageID, report.HeldMessage)
@@ -142,6 +163,7 @@ func TestLiveSessionReplacement(t *testing.T) {
 	// and took a restarted control plane down with it.
 	sameAsked := time.Now()
 	second, sameHeld, refusal := probeSession(probeCtx(t), client, set.ID, owner)
+	sameAnswered := time.Now()
 
 	switch {
 	case refusal == nil:
@@ -198,11 +220,15 @@ func TestLiveSessionReplacement(t *testing.T) {
 			// gap; nothing in the answer separates them. Recording the first would
 			// be picking the more interesting one. The refusal below has no such
 			// ambiguity: something was outstanding, and nothing else was open.
-			report.FailoverUnmeasured = "a successor under a different owner opened " +
-				since(abandonedAt) + " after the abandoned session, " +
-				since(sameAsked) + " after the same owner was refused; whether a " +
-				"different name displaced it or it had expired by then is not " +
-				"separable from one trial"
+			// ROUNDED OUTWARDS, because both numbers are here to say how much room
+			// the ambiguity has: the gap is measured from when the refusal CAME
+			// BACK to when the opening did, and rounding it down would understate
+			// the window the session could have expired in.
+			report.FailoverUnmeasured = "a successor under a different owner was open " +
+				ceilSince(abandonedAt) + " after the abandoned session, and " +
+				ceilSeconds(time.Since(sameAnswered)).String() + " after the same " +
+				"owner's refusal came back; whether a different name displaced it or " +
+				"it had expired in between is not separable from one trial"
 			second = other
 
 			closeSession(t, second, "the successor session", report)
@@ -362,9 +388,10 @@ func recordRefusal(report *replacementReport, origin, asked time.Time) {
 	report.LastRefusedAfterSeconds = int(held.Seconds())
 }
 
-// since renders how long ago a moment was, for a sentence in the record.
-func since(t time.Time) string {
-	return time.Since(t).Truncate(time.Second).String()
+// ceilSince renders how long ago a moment was, rounded UP, for a sentence in the
+// record that names an observation rather than a bound.
+func ceilSince(t time.Time) string {
+	return ceilSeconds(time.Since(t)).String()
 }
 
 // probeCtx bounds one session probe.
@@ -777,7 +804,7 @@ func liveScaleSet(t *testing.T) (*scaleset.Client, *scaleset.ScaleSet) {
 	// ENSURED RATHER THAN LOOKED UP, so a first run against a fresh organization
 	// works. It is the same call the control plane makes, which is what keeps this
 	// measuring billet's own path rather than an arrangement invented here.
-	set, err := client.EnsureScaleSet(t.Context(), name, "", []string{name})
+	set, err := client.EnsureScaleSet(probeCtx(t), name, "", []string{name})
 	if err != nil {
 		t.Fatalf("ensure the conformance scale set: %v", err)
 	}
