@@ -65,7 +65,7 @@ description: "The two AWS compute backends and the AWS plumbing they share: ec2 
 - Default `aws/ssm` key: `WithDecryption=true` returns plaintext with no `kms:*` grant; a customer-managed key refuses `kms:Decrypt` and a mixed page fails whole.
 - `DeleteProject` succeeds under a live build; the build runs on.
 - EC2 cold start: 47.6, 52.2, 58.7 seconds to the first job step (2026-08-18).
-- `RunInstances` evaluates a snapshot a block-device mapping NAMES and not the AMI's own backing snapshot, and names it account-less in the refusal (EC2 itself, `--dry-run`, 2026-09-04).
+- `RunInstances` evaluates a snapshot a block-device mapping NAMES, and names it account-less in the refusal; the launch was still allowed with the AMI's own untagged backing snapshot, for the one image and request measured (EC2 itself, `--dry-run`, 2026-09-04).
 - `arn:<p>:ec2:*::snapshot/*` does not match an account-qualified snapshot ARN and `arn:<p>:ec2:*:*:snapshot/*` matches both spellings (`iam:SimulateCustomPolicy`, not an EC2 observation).
 
 ## Where the tests are

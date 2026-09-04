@@ -73,13 +73,15 @@
 // key whose policy or grants admit foreign roles reopens the boundary on the
 // key side, which no identity policy can see.
 //
-// A LAUNCH MAY NOT ATTACH A SNAPSHOT THIS DEPLOYMENT DOES NOT OWN, and that is
-// the one boundary RunInstances-on-"*" cannot draw by being scoped. RunInstances
-// authorizes every snapshot a block-device mapping names, so an unconditioned
-// grant lets a node role launch an instance with ANY snapshot in the account
-// attached and read it — in a shared account that is the control plane's own
-// ledger snapshots, a volume holding the deployment identity and the node-wire CA
-// key. The other two routes to a foreign snapshot are already closed by tag
+// A LAUNCH MAY NOT ATTACH A SNAPSHOT BILLET DOES NOT OWN — this deployment's, in
+// per-deployment mode; any billet-owned one in account-wide mode, which is the
+// same weaker boundary every other condition here falls back to without an id.
+// That is the one boundary RunInstances-on-"*" cannot draw by being scoped:
+// RunInstances authorizes every snapshot a block-device mapping names, so an
+// unconditioned grant lets a node role launch an instance with ANY snapshot in the
+// account attached and read it — in a shared account that is the control plane's
+// own ledger snapshots, a volume holding the deployment identity and the node-wire
+// CA key. The other two routes to a foreign snapshot are already closed by tag
 // conditions (BilletCacheCloneSource on CreateVolume, BilletCacheAttach); this one
 // is closed by an explicit DENY, because the Allow it bounds cannot be narrowed
 // without denying the launch itself.
