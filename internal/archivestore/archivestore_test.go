@@ -333,9 +333,12 @@ func TestAWrongRegionIsNamed(t *testing.T) {
 
 	s := newTestStore(t, f, "")
 
+	// QUOTED, because it is a value the far side chose. Asserting the bare name
+	// stays green with the %q reverted to %s, which is the one thing that keeps
+	// an accepted remote value visibly a value.
 	_, err := s.Get(t.Context(), "billet/dep/2026/manifest.json")
-	if err == nil || !strings.Contains(err.Error(), "eu-west-1") {
-		t.Fatalf("Get returned %v, want the bucket's real region named", err)
+	if err == nil || !strings.Contains(err.Error(), `"eu-west-1"`) {
+		t.Fatalf("Get returned %v, want the bucket's real region named and quoted", err)
 	}
 }
 

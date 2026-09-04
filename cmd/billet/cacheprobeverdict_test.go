@@ -165,9 +165,24 @@ func TestTheCheckCommandJudgesTheCacheProbesOwnAnswer(t *testing.T) {
 		}
 	}
 
-	if failed := clauses["cacheProbeFailed"]; failed != nil && !returnsSomething(failed) {
-		t.Error("the cacheProbeFailed branch does not return, so a bucket that does not exist " +
-			"leaves `billet check` reporting success")
+	// THREE VERDICTS, THREE CLAUSES. `case cacheProbeAnswered,
+	// cacheProbeInconclusive, cacheProbeFailed:` handles all three names and
+	// tells none of them apart, which is the whole defect wearing the shape of
+	// the fix.
+	for _, a := range handled {
+		for _, b := range handled {
+			if a < b && clauses[a] != nil && clauses[a] == clauses[b] {
+				t.Errorf("%s and %s share one branch, so they are not told apart", a, b)
+			}
+		}
+	}
+
+	// AND THE FAILURE MUST REFUSE WITH THE PROBE'S OWN ERROR. `return nil` there
+	// satisfies "it returns something" while reporting a bucket that does not
+	// exist as a healthy one.
+	if failed := clauses["cacheProbeFailed"]; failed != nil && !refusesWith(failed, "probeErr") {
+		t.Error("the cacheProbeFailed branch does not return something built from probeErr, " +
+			"so a bucket that does not exist leaves `billet check` reporting success")
 	}
 
 	// AND IT MUST NOT GO BACK TO THE MESSAGE. A strings.Contains over anything's
@@ -206,12 +221,30 @@ func TestTheCheckCommandJudgesTheCacheProbesOwnAnswer(t *testing.T) {
 	})
 }
 
-// returnsSomething reports whether a case clause returns a value.
-func returnsSomething(clause *ast.CaseClause) bool {
+// refusesWith reports whether a case clause returns something that names an
+// identifier — the probe's own error rather than nil or a fresh message that
+// throws the answer away.
+func refusesWith(clause *ast.CaseClause, name string) bool {
 	for _, stmt := range clause.Body {
 		ret, ok := stmt.(*ast.ReturnStmt)
-		if ok && len(ret.Results) > 0 {
-			return true
+		if !ok || len(ret.Results) == 0 {
+			continue
+		}
+
+		for _, result := range ret.Results {
+			named := false
+
+			ast.Inspect(result, func(n ast.Node) bool {
+				if ident, ok := n.(*ast.Ident); ok && ident.Name == name {
+					named = true
+				}
+
+				return true
+			})
+
+			if named {
+				return true
+			}
 		}
 	}
 

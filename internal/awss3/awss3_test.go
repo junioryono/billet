@@ -156,6 +156,36 @@ func TestOnlyNoSuchKeyAtFourOhFourIsAbsence(t *testing.T) {
 			body:   `<Error xmlns:x="urn:not-s3"><x:Code>NoSuchKey</x:Code></Error>`,
 		},
 		{
+			// THE ROOT'S OWN NAME, ISOLATED. The case above is also refused by
+			// the code's name, so it would stay green with the root check
+			// deleted; here the code is unqualified and only the root is not.
+			name:   "a namespaced error naming an unqualified code",
+			status: http.StatusNotFound,
+			body:   `<x:Error xmlns:x="urn:not-s3"><Code>NoSuchKey</Code></x:Error>`,
+		},
+		{
+			// THE DECODE FAILURE, ISOLATED. The code is populated before the
+			// document runs out, so without the error being acted on, endsAfter
+			// sees a clean EOF and a truncated body answers absence.
+			name: "an error document that stops half way", status: http.StatusNotFound,
+			body: "<Error><Code>NoSuchKey</Code>",
+		},
+		{
+			// XML's WHITESPACE, NOT UNICODE's. strings.TrimSpace would read a
+			// non-breaking space as nothing, and a body with one in front of the
+			// document is malformed rather than empty.
+			name: "a non-breaking space before the document", status: http.StatusNotFound,
+			body: "\u00a0<Error><Code>NoSuchKey</Code></Error>",
+		},
+		{
+			name: "a non-breaking space after the document", status: http.StatusNotFound,
+			body: "<Error><Code>NoSuchKey</Code></Error>\u00a0",
+		},
+		{
+			name: "a non-breaking space around the code", status: http.StatusNotFound,
+			body: "<Error><Code>\u00a0NoSuchKey\u00a0</Code></Error>",
+		},
+		{
 			// A BODY WITH NO ELEMENT AT ALL. rootOf runs out of tokens, and a
 			// prolog on its own says nothing about an object.
 			name: "a prolog and nothing else", status: http.StatusNotFound,
@@ -182,6 +212,13 @@ func TestOnlyNoSuchKeyAtFourOhFourIsAbsence(t *testing.T) {
 			// be refused — a healthy miss turned into a failure.
 			name: "a document behind a byte-order mark", status: http.StatusNotFound,
 			body: "\xef\xbb\xbf" + noSuchKeyDocument, code: CodeNoSuchKey, absent: true,
+		},
+		{
+			// EXACTLY ONE, and the second is character data XML does not allow
+			// there. Stripping every one of them would be reading past bytes
+			// billet cannot account for on its way to a verdict.
+			name: "a document behind two byte-order marks", status: http.StatusNotFound,
+			body: "\xef\xbb\xbf\xef\xbb\xbf" + noSuchKeyDocument,
 		},
 		{
 			// THE STATUS IS HALF THE ANSWER. The code says what S3 thinks and the
@@ -335,7 +372,9 @@ func TestARegionHintIsOnlyRepeatedWhenItLooksLikeOne(t *testing.T) {
 		{name: "absent", value: ""},
 		{name: "an escape sequence", value: "eu-west-1\x1b[2J"},
 		{name: "a sentence", value: "the bucket is somewhere else"},
-		{name: "longer than any region", value: strings.Repeat("a", 33)},
+		{name: "longer than billet will print", value: strings.Repeat("a", 65)},
+		{name: "at the rendering bound", value: strings.Repeat("a", 64),
+			want: strings.Repeat("a", 64)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()

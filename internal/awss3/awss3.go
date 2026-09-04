@@ -198,7 +198,10 @@ func ParseRefusal(status int, body []byte) *Refusal {
 		return refusal
 	}
 
-	code := strings.TrimSpace(only.Text)
+	// TRIMMED BY XML's WHITESPACE, not Unicode's, for the reason xmlSpace states:
+	// a non-breaking space around a code is part of the code, and a code with one
+	// in it is not one billet has read.
+	code := strings.Trim(only.Text, xmlSpace)
 	if !codeShape.MatchString(code) {
 		return refusal
 	}
@@ -266,11 +269,19 @@ func carriesNoVerdict(token xml.Token) bool {
 	case xml.ProcInst, xml.Comment, xml.Directive:
 		return true
 	case xml.CharData:
-		return strings.TrimSpace(string(t)) == ""
+		return strings.Trim(string(t), xmlSpace) == ""
 	default:
 		return false
 	}
 }
+
+// xmlSpace is the whitespace XML has, and nothing else.
+//
+// strings.TrimSpace TRIMS UNICODE SPACE, a non-breaking space among them, which
+// is not whitespace in XML and is not something billet may read past on its way
+// to a verdict: ` <Error><Code>NoSuchKey</Code></Error>` is a malformed body
+// and must not answer that an object is absent.
+const xmlSpace = " \t\r\n"
 
 // hintShape is what billet will repeat out of a header.
 //
