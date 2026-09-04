@@ -659,13 +659,29 @@ func renderHybridRunbook(in hybridInputs, p initconfig.HybridParams, trusted, ca
 	fmt.Fprintf(&b, "Install the controller's own bundle root-owned at `/etc/billet/tls` (`node.crt`, `ca.crt` 0644, `node.key` 0600): `billet-node.service` runs as root and rewrites the bundle at renewal. Stream the local host's bundle host-to-host to its `/etc/billet/tls`, so the key never lands on a laptop. Both configs name exactly these paths, and dial %s.\n\n", wire)
 
 	b.WriteString("## 6. Build the AMI\n\n")
-	if p.Builder {
-		b.WriteString("**On the controller**, which carries the builder grant this generation asked for, so no machine outside the deployment needs AWS credentials. Take the three values from the outputs on your workstation and run the build over your converge route:\n\n")
+
+	// THE COMMAND HAS TO RUN WHERE THE CREDENTIALS ARE, and the two cases put
+	// that in different places. A workstation build reads the three values out
+	// of the Terraform state it has; a controller build has neither that
+	// directory nor that state, so its command carries the values literally —
+	// which is only possible once the apply has produced them.
+	if p.Builder && p.Facts != nil {
+		b.WriteString("**On the controller**, which carries the builder grant this generation asked for, so no machine outside the deployment needs AWS credentials. Run it over whichever route you converge with; the values are written out here because the controller has no copy of the Terraform state:\n\n")
+		fmt.Fprintf(&b, "```bash\nbillet ami build --region %s \\\n  --subnet %s \\\n  --security-group %s \\\n  --payload-bucket %s \\\n  --public-ip --base-image ami-<an EBS-backed Ubuntu 24.04 image in %s>\n```\n\n",
+			shellArg(p.Region),
+			shellArg(p.Facts.SubnetID),
+			shellArg(p.Facts.RunnerSecurityGroupID),
+			shellArg(p.Facts.AMIPayloadBucket),
+			p.Region)
 	} else {
-		b.WriteString("From a workstation with your own AWS credentials: the node role carries no builder grant. Generate with `--builder` to move this onto the controller instead.\n\n")
+		if p.Builder {
+			b.WriteString("This generation asked for the builder grant, so once the apply has run the prepare render prints a command to run **on the controller** instead of this one. Until then, from a workstation with your own AWS credentials:\n\n")
+		} else {
+			b.WriteString("From a workstation with your own AWS credentials: the node role carries no builder grant. Generate with `--builder` to move this onto the controller instead.\n\n")
+		}
+		fmt.Fprintf(&b, "```bash\nbillet ami build --region %s \\\n  --subnet \"$(terraform -chdir=%s output -raw subnet_id)\" \\\n  --security-group \"$(terraform -chdir=%s output -raw runner_security_group_id)\" \\\n  --payload-bucket \"$(terraform -chdir=%s output -raw ami_payload_bucket)\" \\\n  --public-ip --base-image ami-<an EBS-backed Ubuntu 24.04 image in %s>\n```\n\n",
+			shellArg(p.Region), tf, tf, tf, p.Region)
 	}
-	fmt.Fprintf(&b, "```bash\nbillet ami build --region %s \\\n  --subnet \"$(terraform -chdir=%s output -raw subnet_id)\" \\\n  --security-group \"$(terraform -chdir=%s output -raw runner_security_group_id)\" \\\n  --payload-bucket \"$(terraform -chdir=%s output -raw ami_payload_bucket)\" \\\n  --public-ip --base-image ami-<an EBS-backed Ubuntu 24.04 image in %s>\n```\n\n",
-		shellArg(p.Region), tf, tf, tf, p.Region)
 	b.WriteString("Pass `--public-ip`: the created subnet's only route is an internet gateway, which is unusable without an address. The command boots the image it made and stamps it only after it proved itself.\n\n")
 
 	b.WriteString("## 7. Render the commission phase, and converge both hosts\n\n")

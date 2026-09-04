@@ -1118,6 +1118,29 @@ resource "aws_vpc_security_group_egress_rule" "untrusted_runner_all" {
   ip_protocol       = "-1"
 }
 `, p.Name, p.Name)
+
+		if p.Cache {
+			fmt.Fprintf(&b, `
+# THE UNTRUSTED RUNNERS' PATH TO THE CACHE, which the billet module cannot
+# create because it does not own this group.
+#
+# The module's own cache rule admits its TRUSTED runner group and only that. A
+# fork's pull request launches in the group above instead, so without this rule
+# the guest is handed a cache endpoint it cannot open a socket to: the job runs
+# cold or fails whichever cache step needs it, and nothing in the config says
+# why. An untrusted job hydrates from the trusted baseline and its clone is
+# discarded, so admitting it here grants a read of a cache it can never publish
+# to — which is the boundary billet already enforces above this layer.
+resource "aws_vpc_security_group_ingress_rule" "untrusted_runner_cache" {
+  security_group_id            = module.billet.control_plane_security_group_id
+  description                  = "billet EC2 cache endpoint (from untrusted runners)"
+  referenced_security_group_id = aws_security_group.untrusted_runner.id
+  from_port                    = %d
+  to_port                      = %d
+  ip_protocol                  = "tcp"
+}
+`, hybridCachePort, hybridCachePort)
+		}
 	}
 
 	fmt.Fprintf(&b, `

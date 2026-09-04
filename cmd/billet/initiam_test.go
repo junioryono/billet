@@ -654,3 +654,25 @@ func TestInitIAMBuilderWithoutAPayloadBucketGrantsNoS3(t *testing.T) {
 		t.Errorf("a builder with no payload bucket granted S3:\n%s", out)
 	}
 }
+
+// A DOTTED BUCKET IS REFUSED WHERE IT IS TYPED.
+//
+// Dots are legal in S3 and unusable for billet: the virtual-hosted host a
+// dotted name produces is not covered by S3's wildcard certificate, so the
+// build's fetch fails TLS verification. Printing a policy for such a bucket
+// produces a grant that reads correctly and a build that refuses the bucket it
+// was pointed at, which is a worse failure than refusing here.
+func TestInitIAMRefusesADottedPayloadBucket(t *testing.T) {
+	path := plainEC2NodeConfig(t)
+
+	err := cmdInit(t.Context(), []string{
+		"iam", "--config", path, "--account-wide", "--builder",
+		"--payload-bucket", "billet.ami.payloads",
+	})
+	if err == nil {
+		t.Fatal("init iam accepted a bucket the stager refuses")
+	}
+	if !strings.Contains(err.Error(), "--payload-bucket") {
+		t.Errorf("the refusal must name the flag: %v", err)
+	}
+}

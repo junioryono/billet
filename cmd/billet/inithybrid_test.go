@@ -415,3 +415,75 @@ func TestInitHybridRefusals(t *testing.T) {
 		})
 	}
 }
+
+// THE BUILD COMMAND HAS TO RUN WHERE ITS CREDENTIALS ARE.
+//
+// With --builder the grant is on the controller's role, and the controller has
+// no copy of the Terraform state — so a command reading `terraform -chdir=...
+// output` there resolves nothing, while running it on the workstation is
+// exactly the credentials --builder exists to remove. The prepare render is the
+// first that CAN write the values literally, because that is when the apply has
+// produced them.
+func TestInitHybridBuilderRunbookRunsWhereTheCredentialsAre(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "acme-ci")
+	cfg := filepath.Join(dir, "none.yaml")
+	outputs := filepath.Join(dir, "outputs.json")
+	if err := os.WriteFile(outputs, []byte(hybridOutputsJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// The PLAN render has no facts, so it keeps the workstation form and says
+	// the prepare render will replace it.
+	if _, err := runInitHybrid(t, append(hybridArgs(out, cfg), "--builder")...); err != nil {
+		t.Fatalf("plan render: %v", err)
+	}
+	plan := readHybrid(t, out, HybridRunbookFile)
+	if !strings.Contains(plan, "terraform -chdir=terraform output -raw subnet_id") {
+		t.Error("before the apply the build command must still read the outputs it can reach")
+	}
+	if !strings.Contains(plan, "prints a command to run **on the controller**") {
+		t.Error("the plan render must say the controller-side command is coming")
+	}
+
+	// The PREPARE render carries the values literally and says where to run it.
+	if _, err := runInitHybrid(t, append(hybridArgs(out, cfg),
+		"--builder", "--terraform-output", outputs)...); err != nil {
+		t.Fatalf("prepare render: %v", err)
+	}
+	prepared := readHybrid(t, out, HybridRunbookFile)
+	if !strings.Contains(prepared, "**On the controller**") {
+		t.Error("with the grant and the facts, the build runs on the controller")
+	}
+	if strings.Contains(prepared, "terraform -chdir=terraform output -raw subnet_id") {
+		t.Error("the controller has no Terraform state, so the command must not read it")
+	}
+	for _, want := range []string{"--subnet subnet-0abc", "--security-group sg-trusted", "--payload-bucket acme-ci-ami-payloads-1"} {
+		if !strings.Contains(prepared, want) {
+			t.Errorf("the controller-side command must carry %q literally", want)
+		}
+	}
+}
+
+// WITHOUT --builder IT STAYS A WORKSTATION COMMAND, and says so, however many
+// facts are known.
+func TestInitHybridWithoutTheBuilderTheBuildStaysOnAWorkstation(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "acme-ci")
+	cfg := filepath.Join(dir, "none.yaml")
+	outputs := filepath.Join(dir, "outputs.json")
+	if err := os.WriteFile(outputs, []byte(hybridOutputsJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := runInitHybrid(t, append(hybridArgs(out, cfg), "--terraform-output", outputs)...); err != nil {
+		t.Fatalf("prepare render: %v", err)
+	}
+	runbook := readHybrid(t, out, HybridRunbookFile)
+	if !strings.Contains(runbook, "From a workstation with your own AWS credentials") {
+		t.Error("without the grant the runbook must say whose credentials the build uses")
+	}
+	if !strings.Contains(runbook, "terraform -chdir=terraform output -raw subnet_id") {
+		t.Error("the workstation command reads the state it has")
+	}
+}

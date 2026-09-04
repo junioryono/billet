@@ -11,6 +11,7 @@ import (
 	"github.com/junioryono/billet/internal/awspolicy"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/deploymentid"
+	"github.com/junioryono/billet/internal/provider/ec2"
 	"github.com/junioryono/billet/internal/state"
 )
 
@@ -225,6 +226,15 @@ func iamInputsFromConfig(
 			return awspolicy.Inputs{}, errors.New("--payload-bucket is only meaningful with " +
 				"--builder: it is where `billet ami build` stages the shared installers, and " +
 				"nothing else billet does touches that bucket")
+		}
+
+		// THE RULE THE STAGER ITSELF ENFORCES, asked of the package that performs
+		// the request. A dot is the case worth catching: legal in S3, unusable
+		// here, because the virtual-hosted host it produces is not covered by
+		// S3's wildcard certificate. Printing a policy for a bucket the build
+		// will refuse is a grant that reads correctly and never works.
+		if err := ec2.CheckPayloadBucket(payloadBucket); err != nil {
+			return awspolicy.Inputs{}, fmt.Errorf("--payload-bucket: %w", err)
 		}
 
 		in.Payload = &awspolicy.Payload{Bucket: payloadBucket}

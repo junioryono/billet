@@ -804,3 +804,79 @@ func TestGenerateHybridSiteNames(t *testing.T) {
 		})
 	}
 }
+
+// AN UNTRUSTED JOB CAN ACTUALLY REACH THE CACHE IT IS HANDED.
+//
+// The billet module's own cache rule admits its TRUSTED runner group and only
+// that, and a fork's pull request launches in the untrusted group this root
+// creates — so without a second rule the guest gets an endpoint it cannot open
+// a socket to, the job runs cold or fails a cache step, and nothing in the
+// config says why. The listener and the rule must also agree on the port: two
+// numbers in two files is how a cache ends up unreachable for one of them.
+func TestGenerateHybridUntrustedRunnersReachTheCache(t *testing.T) {
+	t.Parallel()
+
+	p := hybridParams()
+	p.Cache = true
+	p.Facts = hybridFacts()
+	p.Facts.CacheBucket = "acme-ci-cache-1"
+	p.Facts.CachePrefix = "billet-cache"
+	p.Facts.AvailabilityZone = "us-west-2a"
+	p.Commission = true
+	p.AMI = "ami-0123456789abcdef0"
+
+	files, trusted := mustGenerateHybrid(t, p)
+	if trusted {
+		t.Fatal("this case is about the untrusted shape")
+	}
+
+	root := files[HybridTerraformFile]
+	if !strings.Contains(root, `resource "aws_vpc_security_group_ingress_rule" "untrusted_runner_cache"`) {
+		t.Fatal("an untrusted generation with a cache must admit its own runner group to the cache port")
+	}
+	if !strings.Contains(root, "referenced_security_group_id = aws_security_group.untrusted_runner.id") {
+		t.Error("the rule must name the untrusted group this root creates")
+	}
+	if !strings.Contains(root, "security_group_id            = module.billet.control_plane_security_group_id") {
+		t.Error("the rule must open the controller's group, which is where the listener binds")
+	}
+
+	// THE PORT IS THE LISTENER'S. Read it back out of the rendered config rather
+	// than restating the constant, so a change to one and not the other fails.
+	controller := hostConfig(t, inventoryHosts(t, files[HybridInventoryFile])["acme-ci-control-plane"])
+	_, port, ok := strings.Cut(controller.Node.Cache.Listen, ":")
+	if !ok {
+		t.Fatalf("the cache listener has no port: %q", controller.Node.Cache.Listen)
+	}
+	if !strings.Contains(root, "from_port                    = "+port) {
+		t.Errorf("the rule opens a different port than the listener binds (%s)", port)
+	}
+}
+
+// A TRUSTED GENERATION NEEDS NO SUCH RULE: its jobs launch in the module's own
+// runner group, which the module already admits.
+func TestGenerateHybridTrustedNeedsNoExtraCacheRule(t *testing.T) {
+	t.Parallel()
+
+	p := hybridParams()
+	p.Cache = true
+	p.RunnerGroup, p.Workflows = "billet-trusted", []string{"acme/repo/.github/workflows/ci.yml@refs/heads/main"}
+
+	files, trusted := mustGenerateHybrid(t, p)
+	if !trusted {
+		t.Fatal("this case is about the trusted shape")
+	}
+	if strings.Contains(files[HybridTerraformFile], "untrusted_runner_cache") {
+		t.Error("a trusted generation must not create a rule for a group it does not have")
+	}
+}
+
+// ...AND NO CACHE MEANS NO RULE AT ALL, whichever trust the tiers carry.
+func TestGenerateHybridNoCacheNoCacheRule(t *testing.T) {
+	t.Parallel()
+
+	files, _ := mustGenerateHybrid(t, hybridParams())
+	if strings.Contains(files[HybridTerraformFile], "untrusted_runner_cache") {
+		t.Error("no cache means no path to one")
+	}
+}

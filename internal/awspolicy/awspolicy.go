@@ -638,6 +638,14 @@ func (in Inputs) Build() (Policy, error) {
 		// reach no object, and the build would fail downloading its own payload
 		// on a permission the operator believes they gave. No S3 bucket name
 		// contains one, so this can only ever be a mistake.
+		//
+		// WHETHER BILLET CAN SIGN FOR THE NAME IS ASKED WHERE ONE IS TYPED, not
+		// here. ec2.CheckPayloadBucket is the stager's own rule and demands
+		// lowercase; this generator also renders for the terraform module, whose
+		// committed policy carries an UPPERCASE sentinel precisely so no real
+		// value can collide with it. So the two entry points an operator names a
+		// bucket through — `billet init iam --payload-bucket` and the module's
+		// own variable — apply that rule, and this keeps the ARN safe.
 		if strings.Contains(in.Payload.Bucket, "/") {
 			return Policy{}, fmt.Errorf("awspolicy: the payload bucket %q contains a slash, so it "+
 				"names a key rather than a bucket; the grant would match no object at all",
@@ -1400,6 +1408,16 @@ func createTagCondition(owner string, builder bool) map[string]any {
 // builderOwnerCondition matches the builder's per-build owner value by prefix, so
 // the builder's permissions reach only builder instances — never a deployment's
 // job instances, whatever mode the rest of the policy is in.
+//
+// AND ONLY BY PREFIX, WHICH IS A BOUNDARY THIS DOES NOT DRAW. `billet ami build`
+// stamps `billet-ami-build-<image name>`, which carries no deployment id, so in
+// a shared account two deployments that both hold a builder grant can act on
+// each other's BUILDER instances — imaging, terminating, reading a console,
+// stamping a contract tag. Their job instances, cache volumes and snapshots stay
+// isolated, because those are conditioned on the owner tag's VALUE. Closing this
+// needs a deployment-scoped tag on the builder itself and a matching condition
+// here, which changes what `ami build` sends and wants measuring against a real
+// account: issue #56.
 func builderOwnerCondition() map[string]any {
 	return map[string]any{
 		"StringLike": map[string]any{

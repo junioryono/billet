@@ -109,13 +109,16 @@ variable "builder_payload_bucket" {
   }
 
   validation {
-    # THE SAME RULES THE GENERATOR APPLIES, restated because this value is
-    # spliced into an IAM Resource ARN here: a wildcard widens the grant to every
-    # bucket sharing the prefix, and a slash names a key rather than a bucket, so
-    # the grant would match nothing and the build would fail fetching its own
-    # payload on a permission the operator believes they gave.
-    condition     = var.builder_payload_bucket == "" || can(regex("^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$", var.builder_payload_bucket))
-    error_message = "builder_payload_bucket must be a literal S3 bucket name (lowercase letters, digits, dots, hyphens) — no wildcard and no slash: it is spliced into an IAM Resource ARN."
+    # THE SAME RULE THE STAGER ENFORCES, and NO DOTS, which is the case worth
+    # spelling out: a dot is legal in S3 and unusable here, because the
+    # virtual-hosted host it produces is not covered by S3's wildcard
+    # certificate and the fetch fails TLS verification. Accepting one would
+    # apply cleanly, render a policy that looks right, and be refused by
+    # `billet ami build` against the bucket it was pointed at. A wildcard would
+    # widen the grant to every bucket sharing the prefix, and a slash names a
+    # key rather than a bucket, so the grant would match nothing at all.
+    condition     = var.builder_payload_bucket == "" || can(regex("^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$", var.builder_payload_bucket))
+    error_message = "builder_payload_bucket must be a bucket name billet can sign for: 3 to 63 lowercase letters, digits and hyphens, starting and ending with a letter or digit. No dots (their virtual-hosted host is not covered by S3's wildcard certificate, so the build's fetch fails TLS verification), no wildcard, no slash."
   }
 }
 

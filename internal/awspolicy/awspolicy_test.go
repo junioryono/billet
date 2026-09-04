@@ -875,6 +875,11 @@ func TestAPayloadBucketNeedsABuilder(t *testing.T) {
 // A WIDENING BUCKET NAME IS REFUSED, the same rule the backup bucket follows: a
 // `*` in an ARN component reaches every bucket sharing the prefix.
 func TestAPayloadBucketRefusesAWideningName(t *testing.T) {
+	// A DOT IS NOT REFUSED HERE, deliberately: this generator also renders the
+	// module's committed policy, whose bucket is an uppercase sentinel, so the
+	// "can billet sign for this name" rule belongs at the two entry points where
+	// a real bucket is typed. TestInitIAMRefusesADottedPayloadBucket is that
+	// rule's test.
 	for _, bucket := range []string{"", "billet-*", "billet-payloads/extra"} {
 		t.Run(bucket, func(t *testing.T) {
 			_, err := Inputs{
