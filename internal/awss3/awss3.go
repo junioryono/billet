@@ -344,7 +344,11 @@ const xmlSpace = " \t\r\n"
 // RGW or MinIO deployment signs with whatever region name its operator chose,
 // and judging the name would throw away the only wrong-region diagnostic those
 // deployments get. It is quoted where it is rendered.
-var hintShape = regexp.MustCompile(`^[!-~]{1,64}$`)
+//
+// [:graph:] IS THAT SET BY NAME. It is RE2's ASCII printable-except-space class,
+// exactly `!` through `~`, and naming it says what the rule is rather than
+// leaving the next reader to work out what a range across the punctuation means.
+var hintShape = regexp.MustCompile(`^[[:graph:]]{1,64}$`)
 
 // RegionHint reports the bucket's real region when S3 named one.
 //
