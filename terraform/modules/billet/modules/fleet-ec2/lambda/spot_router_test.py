@@ -6,6 +6,8 @@ routing and error-CLASSIFICATION logic, which a Terraform plan test cannot reach
 Run: python3 -m unittest terraform/modules/billet/modules/fleet-ec2/lambda/spot_router_test.py
 """
 
+import contextlib
+import io
 import json
 import os
 import re
@@ -51,9 +53,15 @@ def _warning(instance_id="i-abc"):
     }
 
 
-def _tagged(node):
+def _tagged(node, instance_id="i-abc"):
     tags = [] if node is None else [{"Key": spot_router.NODE_TAG, "Value": node}]
-    return {"Reservations": [{"Instances": [{"Tags": tags}]}]}
+    return _described(instance_id, tags)
+
+
+def _described(instance_id, tags):
+    """A DescribeInstances answer for one instance carrying exactly `tags` — the
+    instance is IDENTIFIED, as EC2's own answer identifies it."""
+    return {"Reservations": [{"Instances": [{"InstanceId": instance_id, "Tags": tags}]}]}
 
 
 class SpotRouterTest(unittest.TestCase):
@@ -79,7 +87,7 @@ class SpotRouterTest(unittest.TestCase):
             os.environ[spot_router.QUEUE_NAME_ENV] = name
 
     def test_forwards_to_the_owning_node_queue(self):
-        _ec2.describe_instances.return_value = _tagged(OWN_QUEUE)
+        _ec2.describe_instances.return_value = _tagged(OWN_QUEUE, "i-xyz")
         _sqs.get_queue_url.return_value = {"QueueUrl": "https://sqs/q"}
 
         event = _warning("i-xyz")
@@ -101,15 +109,28 @@ class SpotRouterTest(unittest.TestCase):
     # AN ANSWER THAT HOLDS NEITHER PROOF IS NOT "no tag". The call names one
     # instance, so a success that does not contain it is a third state; collapsing
     # it into untagged would drop a warning for an instance that may be billet's,
-    # where a retry gets either the instance or InvalidInstanceID.NotFound.
-    def test_reraises_when_the_answer_holds_no_instance(self):
-        for answer in ({}, {"Reservations": []}, {"Reservations": [{"Instances": []}]}):
+    # where a retry gets either the instance or InvalidInstanceID.NotFound. The
+    # message is asserted because any other RuntimeError — a MagicMock misused, a
+    # rewrite raising for its own reason — would satisfy the bare type.
+    def test_reraises_when_the_answer_holds_this_instance_nowhere(self):
+        answers = (
+            {},
+            {"Reservations": []},
+            {"Reservations": [{"Instances": []}]},
+            _described("i-somebody-else", []),
+        )
+        for answer in answers:
             with self.subTest(answer=answer):
+                _ec2.reset_mock(side_effect=True, return_value=True)
                 _sqs.reset_mock(side_effect=True, return_value=True)
                 _ec2.describe_instances.return_value = answer
-                with self.assertRaises(RuntimeError):
+
+                with self.assertRaisesRegex(RuntimeError, "returned no instance"):
                     spot_router.handler(_warning(), None)
+
+                _ec2.describe_instances.assert_called_once_with(InstanceIds=["i-abc"])
                 _sqs.get_queue_url.assert_not_called()
+                _sqs.send_message.assert_not_called()
 
     # An interruption warning always carries the instance id, and the rule that
     # invokes this router delivers nothing else — so an event without one is a shape
@@ -126,6 +147,26 @@ class SpotRouterTest(unittest.TestCase):
         spot_router.handler(_warning(), None)
         _sqs.get_queue_url.assert_not_called()
         _sqs.send_message.assert_not_called()
+
+    # A TAG THAT IS PRESENT AND EMPTY IS NOT AN UNTAGGED INSTANCE. It is still
+    # dropped — nothing names a queue and no retry makes one appear — but it is
+    # billet's instance with unusable tagging, and the line an operator reads has to
+    # say that rather than "names no billet node". Both paths drop without touching
+    # SQS, so the log line is the only thing that can tell them apart.
+    def test_reports_an_unusable_tag_value_as_a_tag_rather_than_as_no_tag(self):
+        for tag in ({"Key": spot_router.NODE_TAG, "Value": ""},
+                    {"Key": spot_router.NODE_TAG}):
+            with self.subTest(tag=tag):
+                _sqs.reset_mock(side_effect=True, return_value=True)
+                _ec2.describe_instances.return_value = _described("i-abc", [tag])
+
+                spoken = io.StringIO()
+                with contextlib.redirect_stdout(spoken):
+                    spot_router.handler(_warning(), None)
+
+                self.assertIn("is not a legal queue name", spoken.getvalue())
+                _sqs.get_queue_url.assert_not_called()
+                _sqs.send_message.assert_not_called()
 
     def test_drops_when_the_instance_is_already_gone(self):
         _ec2.describe_instances.side_effect = _ClientError("InvalidInstanceID.NotFound")
@@ -157,7 +198,15 @@ class SpotRouterTest(unittest.TestCase):
         _ec2.describe_instances.return_value = _tagged("someone-elses-queue")
         _sqs.get_queue_url.return_value = {"QueueUrl": "https://sqs/theirs"}
         _sqs.send_message.side_effect = _ClientError("AccessDenied")
+
         spot_router.handler(_warning(), None)  # must not raise
+
+        # ...having actually reached the send. Returning before either call would
+        # satisfy "did not raise" while classifying nothing.
+        _sqs.get_queue_url.assert_called_once_with(QueueName="someone-elses-queue")
+        _sqs.send_message.assert_called_once()
+        self.assertEqual(_sqs.send_message.call_args.kwargs["QueueUrl"],
+                         "https://sqs/theirs")
 
     # A QUEUE THIS ROUTER DOES NOT SERVE IS STILL LOOKED UP. A deployment with
     # several spot queues extends the router's grant to them, and those forward.
@@ -257,16 +306,31 @@ class SpotRouterModuleWiringTest(unittest.TestCase):
         with open(os.path.join(_HERE, "..", "spot.tf"), encoding="utf-8") as f:
             spot_tf = f.read()
 
+        # Scoped to the ROUTER FUNCTION'S environment block. An assignment anywhere
+        # else in spot.tf — a local, another resource — would satisfy a whole-file
+        # search while the deployed function carried nothing.
+        block = re.search(
+            r'resource\s+"aws_lambda_function"\s+"spot_router"\s*\{.*?\n'
+            r"\s*environment\s*\{\s*\n\s*variables\s*=\s*\{(.*?)\n\s*\}",
+            spot_tf,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(
+            block,
+            "spot.tf must give aws_lambda_function.spot_router an environment block; "
+            "without one the handler cannot tell a foreign queue from its own "
+            "missing grant",
+        )
+
         assignment = re.search(
             r"^\s*(\S+)\s*=\s*aws_sqs_queue\.interruptions\[0\]\.name\s*$",
-            spot_tf,
+            block.group(1),
             re.MULTILINE,
         )
         self.assertIsNotNone(
             assignment,
-            "spot.tf must pass aws_sqs_queue.interruptions[0].name into the router's "
-            "environment; without it the handler cannot tell a foreign queue from its "
-            "own missing grant",
+            "the router's environment must carry aws_sqs_queue.interruptions[0].name "
+            "— the created queue itself, not its name rebuilt from var.name",
         )
         self.assertEqual(assignment.group(1), spot_router.QUEUE_NAME_ENV)
 

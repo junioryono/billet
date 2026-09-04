@@ -65,8 +65,12 @@ def handler(event, _context):
         raise RuntimeError("event carries no detail.instance-id; cannot route it")
 
     node = _node_of(instance_id)  # raises unless it can say which of the two it is
-    if not node:
-        print(f"{instance_id} carries no {NODE_TAG} tag; not a billet instance, dropping")
+    if node is None:
+        # None is the two proofs _node_of can return: untagged, or already gone
+        # (where it has said so itself). A tag that is PRESENT and unusable is not
+        # one of them and falls through to the queue-name check below, which names
+        # the tag rather than reporting a tagged instance as untagged.
+        print(f"{instance_id} names no billet node; nothing to route, dropping")
         return
     if not _QUEUE_NAME.match(node):
         print(f"{instance_id} {NODE_TAG}={node!r} is not a legal queue name; dropping")
@@ -118,7 +122,10 @@ def _node_of(instance_id):
     proofs that there is nothing of billet's to route: the instance is PRESENT and
     carries no such tag, or EC2 says it no longer exists. An answer that holds
     neither — a retryable error, or a success that does not contain the instance
-    this call named — is a could-not-tell and raises."""
+    this call named — is a could-not-tell and raises.
+
+    A tag that is present with an empty or missing value comes back as "", not None:
+    it is unusable, but the instance IS billet's, and the caller says so."""
     try:
         described = _ec2.describe_instances(InstanceIds=[instance_id])
     except ClientError as err:
@@ -129,17 +136,22 @@ def _node_of(instance_id):
             return None
         raise  # throttling / service error — let Lambda retry
 
-    # The call named exactly this instance, so anything in the answer is it.
+    # The instance is IDENTIFIED rather than taken as whatever came first. The call
+    # named one instance and AWS answers with that one, but "the answer's first
+    # entry" and "the instance this warning is about" are two different claims, and
+    # the drop below is a proof about the second.
     for reservation in described.get("Reservations", []):
         for instance in reservation.get("Instances", []):
+            if instance.get("InstanceId") != instance_id:
+                continue
             for tag in instance.get("Tags", []):
                 if tag.get("Key") == NODE_TAG:
-                    return tag.get("Value")
+                    return tag.get("Value") or ""
             return None  # present, and carrying no billet tag: not billet's
 
-    # An empty answer is a THIRD state, and collapsing it into "no tag" would drop a
-    # warning for an instance that may well be billet's. A retry either finds the
-    # instance or is told it is gone, and both of those are answers.
+    # An answer without this instance is a THIRD state, and collapsing it into "no
+    # tag" would drop a warning for an instance that may well be billet's. A retry
+    # either finds the instance or is told it is gone, and both of those are answers.
     raise RuntimeError(
         f"describe_instances({instance_id}) returned no instance and no error; "
         f"cannot tell whether it is billet's")

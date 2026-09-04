@@ -459,14 +459,14 @@ run "spot_creates_the_interruption_router" {
       aws_cloudwatch_metric_alarm.spot_router_errors[0].namespace == "AWS/Lambda" &&
       aws_cloudwatch_metric_alarm.spot_router_errors[0].metric_name == "Errors" &&
       aws_cloudwatch_metric_alarm.spot_router_errors[0].statistic == "Sum" &&
-      aws_cloudwatch_metric_alarm.spot_router_errors[0].period == 300 &&
+      aws_cloudwatch_metric_alarm.spot_router_errors[0].period == 60 &&
       aws_cloudwatch_metric_alarm.spot_router_errors[0].evaluation_periods == 1 &&
       aws_cloudwatch_metric_alarm.spot_router_errors[0].datapoints_to_alarm == 1 &&
       aws_cloudwatch_metric_alarm.spot_router_errors[0].threshold == 1 &&
       aws_cloudwatch_metric_alarm.spot_router_errors[0].comparison_operator == "GreaterThanOrEqualToThreshold" &&
       aws_cloudwatch_metric_alarm.spot_router_errors[0].treat_missing_data == "notBreaching"
     )
-    error_message = "the router alarm must fire on one Errors datapoint in five minutes and treat missing data as not breaching"
+    error_message = "the router alarm must fire on one Errors datapoint in one minute and treat missing data as not breaching"
   }
   # It watches THIS function, read from the function itself: an alarm on a
   # dimension nothing publishes stays green forever.
@@ -491,9 +491,9 @@ run "spot_creates_the_interruption_router" {
   }
 }
 
-# The alarm reaches the operator's own topic, on BOTH edges: the recovery matters
-# as much as the failure, because the failure is a warning Lambda is still
-# retrying and nothing else says it landed.
+# The alarm reaches the operator's own topic on BOTH edges. The OK edge says the
+# errors stopped rather than that a warning landed — the Errors metric carries no
+# delivery — but whoever was paged still has to be told the alarm cleared.
 run "spot_router_alarm_actions_reach_the_operators_topic" {
   command = plan
 
@@ -514,7 +514,7 @@ run "spot_router_alarm_actions_reach_the_operators_topic" {
   }
   assert {
     condition     = aws_cloudwatch_metric_alarm.spot_router_errors[0].ok_actions == toset(["arn:aws:sns:us-east-1:123456789012:billet-ops"])
-    error_message = "the configured action must also be told when the router recovers"
+    error_message = "the configured action must also be told when the alarm clears"
   }
 }
 

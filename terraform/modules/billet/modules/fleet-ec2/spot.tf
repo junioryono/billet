@@ -110,11 +110,13 @@ resource "aws_lambda_function" "spot_router" {
 }
 
 # THE ROUTER'S OWN FAILURES ARE VISIBLE OR THEY ARE NOTHING. The handler drops a
-# warning only on proof it belongs to another deployment; every other outcome it
-# cannot complete is re-raised, which reaches an operator as this metric and
-# nowhere else. treat_missing_data is notBreaching because a healthy router emits
-# no Errors datapoints at all, and an alarm parked in INSUFFICIENT_DATA is one an
-# operator learns to ignore.
+# warning only on proof it is not its to place; every other outcome it cannot
+# complete is re-raised, which reaches an operator as this metric and nowhere else.
+# treat_missing_data is notBreaching because a healthy router emits no Errors
+# datapoints at all, and an alarm parked in INSUFFICIENT_DATA is one an operator
+# learns to ignore. The period is a minute rather than five: nobody acts inside a
+# two-minute warning, but every reclaim during the window is another warning lost,
+# so the useful measure is how fast the operator learns the router is broken.
 resource "aws_cloudwatch_metric_alarm" "spot_router_errors" {
   count = var.enable_spot ? 1 : 0
 
@@ -128,7 +130,7 @@ resource "aws_cloudwatch_metric_alarm" "spot_router_errors" {
   dimensions = { FunctionName = aws_lambda_function.spot_router[0].function_name }
 
   statistic           = "Sum"
-  period              = 300
+  period              = 60
   evaluation_periods  = 1
   datapoints_to_alarm = 1
   threshold           = 1
@@ -136,7 +138,11 @@ resource "aws_cloudwatch_metric_alarm" "spot_router_errors" {
   treat_missing_data  = "notBreaching"
 
   alarm_actions = var.spot_router_alarm_actions
-  ok_actions    = var.spot_router_alarm_actions
+  # The OK edge says the errors STOPPED, which is not the same as a warning having
+  # landed: the Errors metric carries no delivery, and with missing data not
+  # breaching a router nothing invoked clears the alarm too. It is worth sending
+  # because whoever was paged needs to know the alarm cleared; it is not evidence.
+  ok_actions = var.spot_router_alarm_actions
 
   tags = local.tags
 }
