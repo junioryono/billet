@@ -72,7 +72,7 @@ Byte sizes are written as `32GiB`, `512MiB` and parsed exactly; durations as Go 
 
 ### `node.ebs_s3` (for an EC2 site's cache)
 
-`region`, `availability_zone` (must match the subnet's), `bucket`, `prefix`, `kms_key_id`.
+`region`, `availability_zone` (must match the subnet's), `bucket`, `prefix`, `kms_key_id`. It exists only to back `node.cache`: without that listener nothing reads it, so `billet check` refuses the pairing rather than letting every job run cold on the instance's root volume.
 
 ## `tiers`
 
@@ -120,5 +120,6 @@ Per-host policy, not a roster: `name`, `provider` (decides only whether an unpin
 - Tiers and `nodes` are read at startup and snapshotted; changing them restarts the control plane. Nodes register dynamically.
 - A path, pool, region or endpoint is trimmed; an identity (`sites[].name`, `tiers[].site`, `node.site`, `github.org`, `tiers[].runner_group`) is refused with padding, because a trimmed identity names a different deployment on another machine.
 - `node.ceph` is refused on every backend but firecracker; `node.cache` is refused on docker; `node.ceph` and `node.ebs_s3` are refused on codebuild.
+- The mirror of those — a store with no `node.cache` to serve it — is a `billet check` verdict rather than a load refusal, because `billet decommission` and `billet init iam` both read a store block on a config that has lost its listener. `node.ebs_s3` without a listener FAILS the check; `node.ceph` without one is reported, since `image_pool` still boots every guest and `cache_pool` is a required field.
 - `billet init` writes a whole file and refuses to replace one it cannot prove is its own output (it writes `<path>.new` instead; `--force` overrides); `billet github-app create --config` edits five scalars under `github:` in place and preserves everything else.
 - `--config` is never defaulted to the working directory; `billet check -h` prints the per-user default, and the packaged services use `/etc/billet/billet.yaml` (Linux) or `/usr/local/etc/billet/billet.yaml` (macOS).

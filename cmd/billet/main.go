@@ -3233,8 +3233,19 @@ func ec2Preflight(
 			}
 			switch probeErr := store.CheckAccess(ctx); {
 			case probeErr == nil:
-				fmt.Printf("cache    bucket %s answers under this deployment's prefix\n",
-					cfg.Node.EBSS3.Bucket)
+				// A BUCKET THAT ANSWERS IS NOT A CACHE. Without a node.cache
+				// listener nothing on this host ever reads or writes that prefix,
+				// and this line read as though the cache were working — which is
+				// most of why the whole shape was silent. The refusal is above;
+				// this stops the report contradicting it three lines later.
+				reachable := ""
+				if cfg.Node.Cache == nil {
+					reachable = " (but nothing on this node serves it — see the cache " +
+						"line above)"
+				}
+
+				fmt.Printf("cache    bucket %s answers under this deployment's prefix%s\n",
+					cfg.Node.EBSS3.Bucket, reachable)
 			case strings.Contains(probeErr.Error(), "HTTP 403"):
 				// NOT PROOF OF A BROKEN BUCKET: S3 answers 404 for a miss only
 				// with s3:ListBucket, and billet's minimal grant conditions

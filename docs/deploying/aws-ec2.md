@@ -46,9 +46,16 @@ node:
     region: us-west-2
     availability_zone: us-west-2a
     bucket: my-billet-cache
+  cache:                                           # the half ebs_s3 exists for
+    listen: 10.0.1.10:7718
+    guest_endpoint: https://cache.example.internal:7718
+    tls_cert: /etc/billet/cache/tls.crt
+    tls_key: /etc/billet/cache/tls.key
 ```
 
-`billet init --provider ec2` writes this block from flags. One `ec2` node is a serial launch queue (a node executes one command at a time), which is invisible when a node is one machine's worth of jobs and visible when it stands for sixty; run several `ec2` nodes, each registered with its own budget, if that binds.
+`node.ebs_s3` and `node.cache` are two halves of one thing, and the second one is what a guest actually talks to. A store with no listener is a cache nothing can reach: nothing hands the guest a cache endpoint, so every job's `/var/lib/docker` is the instance's root volume, every image is pulled cold, and no volume, snapshot or state object is ever created. That combination loaded, started and ran jobs silently until `billet check` learned to refuse it, and it is a check refusal rather than a config-load one because `billet decommission` (which purges what the cache left behind) and `billet init iam` (which renders its grants) both read the store block on a config whose listener is already gone. The certificate must name the `guest_endpoint` host and its issuer must already be in the AMI's trust store — bake it in with `billet ami build --ca-cert <issuer.pem>` — and the listener should admit the runner security groups only. Leave both blocks out for a node with no cache at all.
+
+`billet init --provider ec2` writes the `ec2` block from flags; the two cache blocks are yours to add together. One `ec2` node is a serial launch queue (a node executes one command at a time), which is invisible when a node is one machine's worth of jobs and visible when it stands for sixty; run several `ec2` nodes, each registered with its own budget, if that binds.
 
 ## The image
 
