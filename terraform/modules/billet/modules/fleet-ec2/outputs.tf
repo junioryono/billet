@@ -3,6 +3,11 @@ output "node_role_arn" {
   value       = aws_iam_role.node.arn
 }
 
+output "node_role_name" {
+  description = "The node role's NAME, plan-known, for a composing root to hand to control-plane-ec2-sqlite's instance_profile_role_name so the controller's backup grant lands on the role it actually runs with."
+  value       = aws_iam_role.node.name
+}
+
 output "instance_profile_name" {
   description = "The instance profile carrying the node role — attach it to whatever EC2 instance runs billet (the opinionated root attaches it to the control plane)."
   value       = aws_iam_instance_profile.node.name

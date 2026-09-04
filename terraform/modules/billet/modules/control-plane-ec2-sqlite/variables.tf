@@ -34,6 +34,42 @@ variable "subnet_in_vpc_ok" {
   type        = bool
 }
 
+# THE CONTROLLER'S ADDRESS IS DECLARED HERE OR NOWHERE. It is repeated in at
+# least four places outside this module -- server.listen (also the certificate
+# SAN of a concrete listener), every node's node.server_addr, the Ansible
+# ansible_host, and whatever routes a node's path to it -- and none of them
+# decides it. Left empty, AWS hands the ENI an address at creation, an instance
+# replacement changes it silently, and the first symptom is a node timeout that
+# names nothing.
+variable "private_ip" {
+  description = "The private IPv4 address the control-plane instance takes in subnet_id. Empty leaves the choice to AWS, which is what every deployment before this input did. Declaring the address an APPLIED instance already holds plans no change (the state carries private_ip); any other value REPLACES the instance, because the address is fixed at launch -- a drain first, as the classification says. Checked against subnet_cidr when the caller supplies it."
+  type        = string
+  default     = ""
+
+  # CANONICAL, NOT MERELY PARSEABLE. Terraform's CIDR functions accept a
+  # leading-zero octet (measured on 1.14: cidrnetmask("10.0.0.001/32") is
+  # fine) and normalise their own results, so "10.0.0.001" would pass the
+  # containment check and compare UNEQUAL to the canonical "10.0.0.1" the
+  # reserved-address check produces -- a reserved address admitted at plan.
+  # The same string is what an operator writes into server.listen and every
+  # server_addr, so the spelling is refused rather than rewritten.
+  validation {
+    condition     = var.private_ip == "" || try(cidrhost("${var.private_ip}/32", 0), "") == var.private_ip
+    error_message = "private_ip must be a canonical IPv4 address (no prefix length, no leading zeros), or empty to let AWS choose."
+  }
+}
+
+variable "subnet_cidr" {
+  description = "The CIDR of subnet_id, when the caller knows it, so private_ip can be proved to lie inside the subnet and outside the five addresses AWS reserves in every subnet (the first four and the last). Empty skips that check. A separate input for the reason subnet_in_vpc_ok is: this child cannot look the subnet up itself without deferring the read and cascading unknowns through the instance, so the fact is supplied -- the opinionated root resolves it from whichever side is real."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.subnet_cidr == "" || can(cidrnetmask(var.subnet_cidr))
+    error_message = "subnet_cidr must be an IPv4 CIDR (address/prefix), or empty to skip the containment check."
+  }
+}
+
 variable "instance_type" {
   description = "The control-plane instance type."
   type        = string
@@ -136,6 +172,34 @@ variable "instance_profile_name" {
     # operate against AWS.
     condition     = var.create_instance_profile == (var.instance_profile_name == "")
     error_message = "set exactly one identity source: create_instance_profile = true with no instance_profile_name, or false with the profile to attach — a name alongside the bool would be silently ignored."
+  }
+}
+
+# THE ROLE BEHIND A SUPPLIED PROFILE, so the backup grant can land on the
+# identity the controller actually runs with. The first version of this child
+# attached the grant only to its OWN role, and the co-located root -- which
+# hands the controller fleet-ec2's profile -- got a bucket, a lifecycle rule,
+# and no principal that may write to it: `billet local backup` failed at the
+# upload and `billet check` reported the archive stale. A NAME rather than a
+# lookup of the profile, because a profile created in the same apply is unknown
+# at plan and the grant's count must not depend on it.
+variable "instance_profile_role_name" {
+  description = "The IAM role name behind instance_profile_name, when create_instance_profile is false. Required as soon as a backup bucket is created or adopted, because the controller's backup grant attaches to whichever role it runs with — without it the bucket exists and no principal may write to it. Plan-known by construction (the opinionated root passes fleet-ec2's node_role_name); refused beside create_instance_profile = true, where it would be silently ignored."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = !(var.create_instance_profile && var.instance_profile_role_name != "")
+    error_message = "instance_profile_role_name is only read when create_instance_profile is false; beside the own profile it would be silently ignored while you believe the grant landed there."
+  }
+
+  validation {
+    condition = !(
+      (var.create_backup_bucket || var.backup_bucket != "") &&
+      !var.create_instance_profile &&
+      var.instance_profile_role_name == ""
+    )
+    error_message = "backups are enabled and the controller carries a supplied instance profile, so name the role behind it in instance_profile_role_name: the backup grant attaches to the role the controller actually runs with, and without it the bucket exists with no principal that may write to it (billet local backup fails at the upload; billet check reports the archive stale)."
   }
 }
 

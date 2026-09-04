@@ -45,6 +45,7 @@ mock_provider "aws" {
   mock_data "aws_subnet" {
     defaults = {
       vpc_id            = "vpc-0f0f0f0f0f0f0f0f0"
+      cidr_block        = "10.0.0.0/24"
       availability_zone = "us-east-1a"
     }
   }
@@ -362,5 +363,115 @@ run "spot_surfaces_the_node_name" {
   assert {
     condition     = output.spot_node_name == "billet-test-spot-interruptions"
     error_message = "the spot node name must be the queue basename"
+  }
+}
+
+# THE CONTROLLER'S ADDRESS CROSSES THE MODULE CALL, on both sides of adopt-or-
+# create. A declared address is the whole point of control_plane_private_ip,
+# and the CIDR it is checked against has to be the subnet that is real.
+run "a_declared_address_reaches_the_created_subnet" {
+  command = plan
+
+  variables {
+    name                     = "billet-test"
+    control_plane_private_ip = "10.60.0.10"
+  }
+
+  assert {
+    condition     = output.control_plane_private_ip == "10.60.0.10"
+    error_message = "the declared address must reach the child and surface plan-known"
+  }
+  assert {
+    condition     = output.node_wire_address == "10.60.0.10:7717"
+    error_message = "the node-wire address must be the declared address, known at plan"
+  }
+}
+
+# AN ADOPTED SUBNET'S CIDR IS THE ONE THE ADDRESS IS CHECKED AGAINST: an address
+# in the created-side default range fails against the adopted 10.0.0.0/24 the
+# mock answers with, which proves the adopted CIDR reached the child rather than
+# var.subnet_cidr's default.
+run "an_adopted_subnet_checks_the_declared_address" {
+  command = plan
+
+  variables {
+    name                     = "billet-test"
+    vpc_id                   = "vpc-0f0f0f0f0f0f0f0f0"
+    subnet_id                = "subnet-0e0e0e0e0e0e0e0e0"
+    control_plane_private_ip = "10.0.0.10"
+  }
+
+  assert {
+    condition     = output.control_plane_private_ip == "10.0.0.10"
+    error_message = "an address inside the adopted subnet must be accepted"
+  }
+
+  # THE CIDR THE CHILD CHECKED AGAINST, read back through it: a regression to
+  # var.subnet_cidr's default here would check every adopted deployment's
+  # address against a range it is not in. A refusal cannot be expected from a
+  # child resource in a root test, so the fact is proved through the output.
+  assert {
+    condition     = output.subnet_cidr == "10.0.0.0/24"
+    error_message = "the adopted subnet's cidr must be the one the child checks the declared address against"
+  }
+}
+
+# ...and the created side resolves to the subnet this module makes.
+run "a_created_subnet_is_the_cidr_the_address_is_checked_against" {
+  command = plan
+
+  variables {
+    name = "billet-test"
+  }
+
+  assert {
+    condition     = output.subnet_cidr == "10.60.0.0/20"
+    error_message = "a created subnet's cidr must be var.subnet_cidr's default"
+  }
+}
+
+# THE CO-LOCATED CONTROLLER'S BACKUP GRANT LANDS ON THE FLEET ROLE. This root
+# hands the controller fleet-ec2's profile, so a grant on the child's own
+# identity would protect nothing here; the wiring is observable only through
+# the child's output, which is why that output exists. The bucket name is
+# composed rather than read back, so it is plan-known too.
+run "root_backups_grant_the_fleet_role" {
+  command = plan
+
+  variables {
+    name                 = "billet-test"
+    create_backup_bucket = true
+  }
+
+  assert {
+    condition     = output.backup_role_name == "billet-test-node"
+    error_message = "the root must attach the backup grant to fleet-ec2's node role, the identity the co-located controller runs with"
+  }
+  assert {
+    condition     = output.backup_bucket == "billet-test-backups" && output.backup_prefix == "billet-backups"
+    error_message = "the bucket and prefix billet.yaml must name should surface from the child"
+  }
+  assert {
+    condition     = output.cost_inputs.created_when_enabled.backup_bucket == true
+    error_message = "the cost inputs must follow the variable that creates the bucket"
+  }
+}
+
+# AND NOTHING WITHOUT ASKING: the default root creates no bucket and grants
+# nothing, so an existing deployment upgrading to this version plans no change.
+run "root_creates_no_backups_by_default" {
+  command = plan
+
+  variables {
+    name = "billet-test"
+  }
+
+  assert {
+    condition     = output.backup_bucket == "" && output.backup_role_name == ""
+    error_message = "a root that asked for no backup bucket must report neither a bucket nor a grant"
+  }
+  assert {
+    condition     = output.cost_inputs.created_when_enabled.backup_bucket == false
+    error_message = "the cost inputs must say the bucket is off by default"
   }
 }

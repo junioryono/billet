@@ -39,7 +39,11 @@
       ansible.builtin.uri:
         url: "{{ billet_release_channel_base }}/{{ billet_release_channel }}.json"
         return_content: true
+        timeout: "{{ billet_fetch_timeout }}"
       register: billet_channel_statement
+      until: billet_channel_statement is succeeded
+      retries: "{{ billet_fetch_retries }}"
+      delay: "{{ billet_fetch_retry_delay }}"
       delegate_to: localhost
       become: false
 
@@ -145,7 +149,10 @@
 
 # VERIFIED BEFORE IT IS UNPACKED. get_url is given the checksums file rather
 # than a literal, and matches this archive's line in it by name; a mismatch
-# leaves nothing behind to unpack.
+# leaves nothing behind to unpack. The checksums fetch happens inside the
+# module, so the retry below covers it too — and a checksum that does not
+# match is retried like any other failure, which costs a tampered release a
+# few more refusals and nothing else.
 - name: Create a private working directory for this run
   ansible.builtin.tempfile:
     state: directory
@@ -169,9 +176,14 @@
     url: "{{ billet_release_base }}/{{ billet_release_archive }}"
     dest: "{{ billet_release_unpack }}/{{ billet_release_archive }}"
     checksum: "sha256:{{ billet_release_base }}/checksums.txt"
+    timeout: "{{ billet_fetch_timeout }}"
     owner: root
     group: root
     mode: "0600"
+  register: billet_release_download
+  until: billet_release_download is succeeded
+  retries: "{{ billet_fetch_retries }}"
+  delay: "{{ billet_fetch_retry_delay }}"
   become: true
   when:
     - not billet_release_candidate_stat.stat.exists
