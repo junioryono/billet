@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"crypto/x509"
+	"encoding/pem"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -938,5 +939,71 @@ func TestCAIssueReissueReplacesDeliberately(t *testing.T) {
 	}
 	if _, statErr := os.Stat(filepath.Join(out+".replaced", "node.key")); statErr != nil {
 		t.Errorf("the refusal did not preserve the archive: %v", statErr)
+	}
+}
+
+// A SHORT LEAF IS THE ONLY WAY TO REHEARSE A ROTATION, because a node renews once
+// less than a third of its certificate's life remains and a year-long leaf
+// renews in eight months. The flag is bounded on both sides, and the bounds are
+// asserted by the messages that name them, because a refusal that says the wrong
+// thing sends an operator to the wrong fix.
+func TestCAIssueHonoursALifetime(t *testing.T) {
+	t.Parallel()
+
+	serverState := t.TempDir()
+	cfg := writeCAConfig(t, serverState)
+	out := filepath.Join(t.TempDir(), "bundle")
+
+	before := time.Now()
+
+	if err := cmdCAIssue(t.Context(), []string{"epyc-1", "--config", cfg, "--out", out,
+		"--lifetime", "15m"}); err != nil {
+		t.Fatalf("ca issue --lifetime 15m: %v", err)
+	}
+
+	bundle, err := wirecert.LoadBundle(
+		filepath.Join(out, "node.crt"),
+		filepath.Join(out, "node.key"),
+		filepath.Join(out, "ca.crt"))
+	if err != nil {
+		t.Fatalf("the bundle it wrote does not load: %v", err)
+	}
+
+	block, _ := pem.Decode(bundle.CertPEM)
+	if block == nil {
+		t.Fatal("the bundle's certificate is not PEM")
+	}
+
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatalf("parse the issued certificate: %v", err)
+	}
+
+	// Issued at `now` with ClockSkew of backdating, good for the lifetime asked.
+	wantNotAfter := before.Add(15 * time.Minute)
+	if cert.NotAfter.Before(wantNotAfter.Add(-30*time.Second)) ||
+		cert.NotAfter.After(wantNotAfter.Add(30*time.Second)) {
+		t.Errorf("the certificate expires at %s, want about %s (15m after issue)",
+			cert.NotAfter, wantNotAfter)
+	}
+
+	if life := cert.NotAfter.Sub(cert.NotBefore); life > 15*time.Minute+wirecert.ClockSkew+time.Minute {
+		t.Errorf("the certificate's life is %s; --lifetime 15m was not honoured", life)
+	}
+
+	for _, tc := range []struct{ lifetime, want string }{
+		{"5m", "outside"},
+		{"9000h", "outside"},
+		{"0s", "outside"},
+	} {
+		err := cmdCAIssue(t.Context(), []string{"epyc-2", "--config", cfg,
+			"--out", filepath.Join(t.TempDir(), "b"), "--lifetime", tc.lifetime})
+		if err == nil {
+			t.Fatalf("--lifetime %s was accepted", tc.lifetime)
+		}
+
+		if !strings.Contains(err.Error(), tc.want) || !strings.Contains(err.Error(), "10m") {
+			t.Errorf("--lifetime %s: refusal %q does not name the bound", tc.lifetime, err)
+		}
 	}
 }

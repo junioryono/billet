@@ -141,7 +141,7 @@ Capture a deployment as one unit, put it back as one unit or not at all, or put 
 | `billet nodes deny <node> --fingerprint <fp>` | refuse one |
 | `billet nodes revoke <node> [--reason]` | take back every credential a machine holds |
 | `billet nodes decommission <node> [--force]` | stop expecting a host to answer for its compute; `--force` records the exclusion as unproven |
-| `billet ca issue <node> [--out <dir>] [--reissue]` | write a node's certificate bundle (default `./<node>-billet-tls`) |
+| `billet ca issue <node> [--out <dir>] [--reissue] [--lifetime <duration>]` | write a node's certificate bundle (default `./<node>-billet-tls`); `--lifetime` shortens the certificate from a year down to no less than ten minutes, for a short-lived host or a rotation rehearsal |
 | `billet ca token [--ttl 1h] [--uses 1] [--note]` | mint a join token; shown once, stored as a hash |
 | `billet ca show` | the authority's fingerprint and expiry, with a warning once it is shortening what it issues |
 | `billet ca rotate` | start a rotation: the new authority issues, both are trusted |

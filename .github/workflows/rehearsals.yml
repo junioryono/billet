@@ -1,0 +1,128 @@
+name: Host rehearsals
+
+# THE FOUR PATHS THAT WERE PROVED ONLY AGAINST FAKES, run on packaged hosts under
+# real systemd: a rollout from one published release to the next with a rollback,
+# `billet local recover` over a deployment a real control plane served, a CA
+# rotation across nodes that renew, and a PostgreSQL promotion under a partition.
+# scripts/*-rehearsal.sh hold the scenarios; docs/reference/records/host-rehearsals.md
+# holds what they measured.
+#
+# WEEKLY AND ON DISPATCH, NEVER ON pull_request. Every rehearsal starts a real
+# control plane against GitHub with the acceptance App's key, which a pull
+# request from a fork must never hold. The rollout rehearsal is dispatched with
+# the two releases it moves between; the others use the tree's own package.
+on:
+  workflow_dispatch:
+    inputs:
+      from:
+        description: The published release the rollout rehearsal starts on (blank skips it)
+        required: false
+        type: string
+      to:
+        description: The published release the rollout rehearsal moves to
+        required: false
+        type: string
+      only:
+        description: Run one rehearsal (rollout, recover, ca-rotation, promotion) or all
+        required: false
+        default: all
+        type: string
+  schedule:
+    - cron: "0 5 * * 2"
+
+permissions: {}
+
+# ONE AT A TIME, AND NEVER CANCELLED: cancelling a rehearsal between its start
+# and its teardown leaves a scale set nobody serves in the organization.
+concurrency:
+  group: host-rehearsals
+  cancel-in-progress: false
+
+jobs:
+  rehearse:
+    if: github.repository == 'junioryono/billet'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    # THE ENVIRONMENT HOLDS THE APP. The same acceptance App the AWS lane uses;
+    # its key reaches nothing but this job, and the environment is what the
+    # secret is scoped to.
+    environment: acceptance
+
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install the pinned release builder
+        run: |
+          version=$(make --no-print-directory print-goreleaser-version)
+          go install "github.com/goreleaser/goreleaser/v2@$version"
+
+      - name: Stage the acceptance App's config and key
+        env:
+          BILLET_ACCEPTANCE_CONFIG_BODY: ${{ secrets.BILLET_ACCEPTANCE_CONFIG }}
+          BILLET_ACCEPTANCE_APP_KEY: ${{ secrets.BILLET_ACCEPTANCE_APP_KEY }}
+        run: |
+          set -eu
+          if [ -z "$BILLET_ACCEPTANCE_CONFIG_BODY" ] || [ -z "$BILLET_ACCEPTANCE_APP_KEY" ]; then
+            echo "::error::BILLET_ACCEPTANCE_CONFIG and BILLET_ACCEPTANCE_APP_KEY must both be set; a rehearsal cannot start a control plane without an App." >&2
+            exit 1
+          fi
+          install -d -m 0700 "$RUNNER_TEMP/app"
+          umask 077
+          printf '%s\n' "$BILLET_ACCEPTANCE_CONFIG_BODY" > "$RUNNER_TEMP/app/billet.yaml"
+          printf '%s\n' "$BILLET_ACCEPTANCE_APP_KEY" > "$RUNNER_TEMP/app/app-private-key.pem"
+          echo "BILLET_REHEARSAL_APP_CONFIG=$RUNNER_TEMP/app/billet.yaml" >> "$GITHUB_ENV"
+          echo "BILLET_REHEARSAL_APP_KEY=$RUNNER_TEMP/app/app-private-key.pem" >> "$GITHUB_ENV"
+
+      # THE TWO RELEASES COME FROM THE INPUTS OR FROM THE CHANNEL. A scheduled run
+      # has no inputs, so it moves from the release before the one the stable
+      # channel names to that one, which is the move a deployment following the
+      # channel just made or is about to make.
+      - name: Choose the releases the rollout rehearsal moves between
+        if: inputs.only == 'all' || inputs.only == 'rollout' || inputs.only == ''
+        env:
+          FROM: ${{ inputs.from }}
+          TO: ${{ inputs.to }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          if [ -z "$TO" ]; then
+            TO=$(gh api "repos/$GITHUB_REPOSITORY/contents/stable.json?ref=release-channel" --jq .content | base64 -d | sed -nE 's/.*"tag": *"([^"]+)".*/\1/p')
+          fi
+          if [ -z "$FROM" ]; then
+            FROM=$(gh release list -R "$GITHUB_REPOSITORY" --exclude-pre-releases --exclude-drafts --limit 20 --json tagName --jq '[.[].tagName | select(startswith("v"))] | sort_by(split(".") | map(ltrimstr("v") | tonumber)) | reverse | .[1] // empty')
+          fi
+          if [ -z "$FROM" ] || [ -z "$TO" ] || [ "$FROM" = "$TO" ]; then
+            echo "::notice::no pair of releases to move between (from=$FROM to=$TO); skipping the rollout rehearsal"
+            echo "BILLET_REHEARSAL_SKIP_ROLLOUT=1" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          echo "BILLET_REHEARSAL_FROM=$FROM" >> "$GITHUB_ENV"
+          echo "BILLET_REHEARSAL_TO=$TO" >> "$GITHUB_ENV"
+          echo "rollout rehearsal: $FROM -> $TO"
+
+      - name: Rollout rehearsal
+        if: (inputs.only == 'all' || inputs.only == 'rollout' || inputs.only == '') && env.BILLET_REHEARSAL_SKIP_ROLLOUT != '1'
+        run: make rollout-rehearsal
+
+      - name: Recover rehearsal
+        if: always() && (inputs.only == 'all' || inputs.only == 'recover' || inputs.only == '')
+        run: make recover-rehearsal
+
+      - name: CA rotation rehearsal
+        if: always() && (inputs.only == 'all' || inputs.only == 'ca-rotation' || inputs.only == '')
+        run: make ca-rotation-rehearsal
+
+      - name: Promotion rehearsal
+        if: always() && (inputs.only == 'all' || inputs.only == 'promotion' || inputs.only == '')
+        run: make promotion-rehearsal

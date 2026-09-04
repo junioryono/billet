@@ -484,7 +484,7 @@ func (c *CA) IssueServer(hosts []string) (Bundle, error) {
 				"the address it dialled against the certificate's names")
 	}
 
-	tmpl, err := c.leafTemplate("billet control plane")
+	tmpl, err := c.leafTemplate("billet control plane", LeafLifetime)
 	if err != nil {
 		return Bundle{}, err
 	}
@@ -511,11 +511,27 @@ func (c *CA) IssueServer(hosts []string) (Bundle, error) {
 // request path, so a host holding this certificate can act as this node and as
 // nothing else.
 func (c *CA) IssueNode(name string) (Bundle, error) {
+	return c.IssueNodeFor(name, LeafLifetime)
+}
+
+// IssueNodeFor mints a node's certificate good for the given lifetime rather
+// than LeafLifetime.
+//
+// A SHORT LEAF IS HOW A ROTATION IS REHEARSED. A node renews once less than a
+// third of its certificate's life remains, so with year-long leaves nothing
+// renews inside any rehearsal; a twelve-minute leaf renews inside the run. The
+// same cap as every leaf applies: nothing outlives the authority.
+func (c *CA) IssueNodeFor(name string, lifetime time.Duration) (Bundle, error) {
 	if name == "" {
 		return Bundle{}, errors.New("wirecert: a node certificate needs a node name")
 	}
 
-	tmpl, err := c.leafTemplate(name)
+	if lifetime <= 0 {
+		return Bundle{}, fmt.Errorf("wirecert: a node certificate's lifetime must be positive, not %s",
+			lifetime)
+	}
+
+	tmpl, err := c.leafTemplate(name, lifetime)
 	if err != nil {
 		return Bundle{}, err
 	}
@@ -525,7 +541,7 @@ func (c *CA) IssueNode(name string) (Bundle, error) {
 	return c.sign(tmpl)
 }
 
-func (c *CA) leafTemplate(cn string) (*x509.Certificate, error) {
+func (c *CA) leafTemplate(cn string, lifetime time.Duration) (*x509.Certificate, error) {
 	serial, err := serialNumber()
 	if err != nil {
 		return nil, err
@@ -533,7 +549,7 @@ func (c *CA) leafTemplate(cn string) (*x509.Certificate, error) {
 
 	now := time.Now()
 
-	notAfter := now.Add(LeafLifetime)
+	notAfter := now.Add(lifetime)
 	if notAfter.After(c.cert.NotAfter) {
 		// A LEAF MAY NOT OUTLIVE ITS AUTHORITY. Verification fails on the CA's
 		// expiry regardless, so issuing past it would hand an operator a
@@ -1033,7 +1049,7 @@ func (c *CA) SignNodeCSR(name string, csrPEM []byte) (Bundle, error) {
 		return Bundle{}, fmt.Errorf("wirecert: the certificate request is not correctly signed: %w", err)
 	}
 
-	tmpl, err := c.leafTemplate(name)
+	tmpl, err := c.leafTemplate(name, LeafLifetime)
 	if err != nil {
 		return Bundle{}, err
 	}
