@@ -185,7 +185,8 @@ class SpotRouterTest(unittest.TestCase):
             spot_router.handler(_warning(), None)
 
     # A QUEUE THIS ROUTER DOES NOT SERVE is another deployment's, and the tag saying
-    # so is the proof that lets a permanent failure be consumed silently.
+    # so is the proof that lets AccessDenied or NonExistentQueue about it be consumed
+    # silently. Neither code is permanent in itself — that is the whole point.
 
     def test_drops_access_denied_for_a_queue_it_does_not_serve(self):
         _ec2.describe_instances.return_value = _tagged("someone-elses-queue")
@@ -200,7 +201,7 @@ class SpotRouterTest(unittest.TestCase):
         spot_router.handler(_warning(), None)
         _sqs.send_message.assert_not_called()
 
-    def test_drops_a_permanent_send_failure_to_a_queue_it_does_not_serve(self):
+    def test_drops_an_access_denied_send_to_a_queue_it_does_not_serve(self):
         _ec2.describe_instances.return_value = _tagged("someone-elses-queue")
         _sqs.get_queue_url.return_value = {"QueueUrl": "https://sqs/theirs"}
         _sqs.send_message.side_effect = _ClientError("AccessDenied")
@@ -304,26 +305,33 @@ class SpotRouterTest(unittest.TestCase):
 # THE HANDLER AND THE MODULE HAVE TO NAME THE SAME VARIABLE, and neither gate can
 # see both: this file has no terraform and the plan tests have no Python. A rename
 # on one side leaves the router with no queue name, which is safe (it drops nothing)
-# and wrong (every foreign warning becomes a failed invocation and an alarm).
+# and wrong (a foreign queue it cannot reach becomes a failed invocation and an
+# alarm instead of a drop).
 class SpotRouterModuleWiringTest(unittest.TestCase):
     def test_the_module_names_the_variable_the_handler_reads(self):
         with open(os.path.join(_HERE, "..", "spot.tf"), encoding="utf-8") as f:
             spot_tf = f.read()
 
-        # DELIBERATELY A CONTAINMENT CHECK AND NOT A PARSE. Which block the name sits
-        # in, that its value is the created queue and that it is the environment's
-        # only entry are asserted against a real plan in
-        # tests/fleet.tftest.hcl:spot_creates_the_interruption_router, where terraform
-        # has done the parsing. What no terraform test can see is whether the literal
-        # there is the one THIS file reads, and a regex written to re-derive the
-        # structure only invents ways to fail on valid HCL — a comment above
-        # `variables`, a one-line map, a brace inside a heredoc.
+        # THE LITERAL IS PINNED ON BOTH SIDES, and each side's gate pins its own.
+        # tests/fleet.tftest.hcl:spot_creates_the_interruption_router asserts against a
+        # real plan — terraform having done the parsing — that the router function's
+        # environment carries exactly this key, set to the created queue, and nothing
+        # else. So the whole of the Python side's job is that the handler reads that
+        # same name, which an equality says completely; a containment check over
+        # spot.tf would pass a rename to any text the file already holds.
+        self.assertEqual(spot_router.QUEUE_NAME_ENV, "BILLET_INTERRUPTION_QUEUE_NAME")
+
+        # ...and this one catches spot.tf losing the variable on a machine with no
+        # terraform, which is where `make lambda-test` runs. It cannot say WHERE the
+        # name sits — a regex written to re-derive that only invents ways to fail on
+        # valid HCL (a comment above `variables`, a one-line map, a brace inside a
+        # heredoc), and the plan test already knows.
         self.assertIn(
             spot_router.QUEUE_NAME_ENV,
             spot_tf,
-            f"spot.tf names no {spot_router.QUEUE_NAME_ENV}: renaming it on one side "
-            f"leaves the router with no queue name, which drops nothing and makes "
-            f"every foreign warning a failed invocation",
+            f"spot.tf names no {spot_router.QUEUE_NAME_ENV}, so the deployed router "
+            f"would read an unset variable: it would drop nothing, and a foreign "
+            f"queue it cannot reach would alarm instead",
         )
 
 
