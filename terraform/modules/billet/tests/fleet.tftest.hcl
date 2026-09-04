@@ -765,9 +765,16 @@ run "accepts_the_shortest_payload_bucket" {
     builder_payload_bucket = "abc"
   }
 
+  # ASSERT THE NAME REACHED THE ARN, not merely that the plan survived. A run
+  # whose only assertion is that a resource exists passes for any accepted
+  # value, so it proves the validation admitted the name and nothing about what
+  # the grant then says.
   assert {
-    condition     = length(aws_iam_role_policy.builder) == 1
-    error_message = "three characters is S3's own floor and must be accepted"
+    condition = one([
+      for s in jsondecode(aws_iam_role_policy.builder[0].policy).Statement :
+      s if s.Sid == "BilletAMIBuilderPayload"
+    ]).Resource == ["arn:aws:s3:::abc/billet-payload-*"]
+    error_message = "three characters is S3's own floor and must reach the grant intact"
   }
 }
 
@@ -786,7 +793,10 @@ run "accepts_the_longest_payload_bucket" {
   }
 
   assert {
-    condition     = length(aws_iam_role_policy.builder) == 1
-    error_message = "63 characters is S3's own ceiling and must be accepted"
+    condition = one([
+      for s in jsondecode(aws_iam_role_policy.builder[0].policy).Statement :
+      s if s.Sid == "BilletAMIBuilderPayload"
+    ]).Resource == ["arn:aws:s3:::abcdefghij-abcdefghij-abcdefghij-abcdefghij-abcdefghij-abcdefgh/billet-payload-*"]
+    error_message = "63 characters is S3's own ceiling and must reach the grant intact"
   }
 }

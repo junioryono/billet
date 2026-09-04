@@ -482,29 +482,76 @@ func TestInitHybridBuilderRunbookRunsWhereTheCredentialsAre(t *testing.T) {
 	}
 }
 
-// runbookCommand returns the first fenced block after the given heading, which
-// is the command an operator copies. Asserting against the whole runbook cannot
-// tell a command from the paragraph explaining it, and this file's paragraphs
-// quote the very flags the commands carry.
+// runbookCommand returns the one fenced command inside the named step, which is
+// what an operator copies. Asserting against the whole runbook cannot tell a
+// command from the paragraph explaining it, and this file's paragraphs quote the
+// very flags the commands carry — `--public-ip` is named in prose one line below
+// the command that passes it.
+//
+// IT REFUSES EVERYTHING IT CANNOT READ. The heading must be one exact line and
+// appear exactly once, so a stale duplicate step carrying a correct command
+// cannot answer for the real one; the search stops at the next heading, so a
+// step with no command fails rather than borrowing a later step's; and the fence
+// lines must be exactly ```bash and ```, with exactly one such block in the step.
 func runbookCommand(t *testing.T, runbook, heading string) string {
 	t.Helper()
 
-	_, rest, ok := strings.Cut(runbook, heading)
-	if !ok {
+	lines := strings.Split(runbook, "\n")
+
+	start := -1
+	for i, line := range lines {
+		if strings.TrimRight(line, " ") != heading {
+			continue
+		}
+		if start >= 0 {
+			t.Fatalf("the runbook carries %q twice, at lines %d and %d", heading, start+1, i+1)
+		}
+
+		start = i
+	}
+
+	if start < 0 {
 		t.Fatalf("the runbook has no %q step", heading)
 	}
 
-	_, rest, ok = strings.Cut(rest, "```bash\n")
-	if !ok {
-		t.Fatalf("%q carries no command", heading)
+	end := len(lines)
+	for i := start + 1; i < len(lines); i++ {
+		if strings.HasPrefix(lines[i], "## ") {
+			end = i
+
+			break
+		}
 	}
 
-	block, _, ok := strings.Cut(rest, "```")
-	if !ok {
-		t.Fatalf("%q's command block is never closed", heading)
+	var blocks []string
+
+	for i := start + 1; i < end; i++ {
+		if lines[i] != "```bash" {
+			continue
+		}
+
+		closed := false
+		for j := i + 1; j < end; j++ {
+			if lines[j] != "```" {
+				continue
+			}
+
+			blocks = append(blocks, strings.Join(lines[i+1:j], "\n"))
+			i, closed = j, true
+
+			break
+		}
+
+		if !closed {
+			t.Fatalf("%q's command block is never closed", heading)
+		}
 	}
 
-	return block
+	if len(blocks) != 1 {
+		t.Fatalf("%q carries %d commands, want exactly one", heading, len(blocks))
+	}
+
+	return blocks[0]
 }
 
 // WITHOUT --builder IT STAYS A WORKSTATION COMMAND, and says so, however many
