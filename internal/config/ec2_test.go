@@ -1063,6 +1063,13 @@ func TestASpotQueueMayNotNameAnotherPort(t *testing.T) {
 		"an explicit 443":   {"https://sqs.us-west-2.amazonaws.com:443/123456789012/aws-1", true},
 		"no port at all":    {"https://sqs.us-west-2.amazonaws.com/123456789012/aws-1", true},
 		"loopback on 44301": {"http://127.0.0.1:44301/123456789012/aws-1", true},
+
+		// ZERO-PADDED IS STILL 443. `:0443` is a decimal port that net.LookupPort
+		// resolves to 443 and every client dials as 443 (measured), so this is a
+		// REACHABLE queue — and a validator that refused it on the spelling would take
+		// a working config away at load, which is worse than the bug the port rule is
+		// for. The first version of that rule compared the text.
+		"a zero-padded 443": {"https://sqs.us-west-2.amazonaws.com:0443/123456789012/aws-1", true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -1096,15 +1103,36 @@ func TestASpotQueueMayNotNameAnotherPort(t *testing.T) {
 func TestASpotQueueHostIsCheckedBeforeItIsFolded(t *testing.T) {
 	t.Parallel()
 
-	// THE PREMISE, MEASURED WITH THIS GO rather than assumed: U+0130 folds to an
-	// ASCII byte, so 63 of them shrink from 126 bytes to 63 — a label that is only
-	// legal after the fold. If a future Go stops folding it, the case is moot rather
-	// than failing, and says so.
-	label := strings.Repeat("İ", 63)
+	// THE PREMISE, MEASURED WITH THIS GO rather than assumed: a non-ASCII rune whose
+	// ToLower is a single ASCII byte. Two exist — U+0130, the dotted capital I, folding
+	// to `i`, and U+212A, the Kelvin sign, folding to `k` — and this takes whichever
+	// still holds.
+	//
+	// IT FAILS RATHER THAN SKIPS when neither does. A skip would let a toolchain
+	// upgrade quietly delete the only case that tells checking the raw host from
+	// checking the folded one, and leave CI green while doing it. If Go's folding
+	// changes, somebody has to come and re-measure the premise, and a red test is what
+	// sends them.
+	var wide string
+
+	for _, candidate := range []string{"İ", "K"} {
+		if folded := strings.ToLower(candidate); len(candidate) > 1 && len(folded) == 1 {
+			wide = candidate
+
+			break
+		}
+	}
+
+	if wide == "" {
+		t.Fatal("no non-ASCII rune folds to a single ASCII byte in this Go, so the premise " +
+			"this guard rests on has changed and needs re-measuring")
+	}
+
+	label := strings.Repeat(wide, 63)
 
 	folded := strings.ToLower(label)
-	if len(label) != 126 || len(folded) != 63 {
-		t.Skipf("this Go does not fold U+0130 into ASCII (%d bytes -> %d), so the case is moot",
+	if len(label) <= 63 || len(folded) != 63 {
+		t.Fatalf("the fixture is not a label that only becomes legal by folding: %d bytes -> %d",
 			len(label), len(folded))
 	}
 

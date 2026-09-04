@@ -4662,9 +4662,17 @@ func CheckSQSQueueURL(raw, region string) error {
 	// matched the standard host exactly and then connected to port 1. AWS serves this
 	// on 443 and the loopback exception above is what lets a test point somewhere
 	// else, so an explicit 443 is the only port worth accepting.
-	if port := u.Port(); port != "" && port != "443" {
-		return errors.New("node.ec2.interruption_queue_url must not name a port other than " +
-			"443: the host is what billet dials, and SQS answers nowhere else")
+	//
+	// COMPARED AS A NUMBER, NOT AS TEXT. `:0443` is a decimal 443 that net.LookupPort
+	// resolves to 443 and every client dials as 443 (measured), so refusing it on the
+	// spelling would take a reachable config away at load — which is a worse failure
+	// than the one this check exists for. url.Parse has already refused a port that is
+	// not digits, so the only way Atoi fails here is a number too big to be one.
+	if port := u.Port(); port != "" {
+		if n, err := strconv.Atoi(port); err != nil || n != 443 {
+			return errors.New("node.ec2.interruption_queue_url must not name a port other " +
+				"than 443: the host is what billet dials, and SQS answers nowhere else")
+		}
 	}
 
 	// ASCII FIRST, THEN FOLDED. strings.ToLower is Unicode-aware and U+0130 folds to

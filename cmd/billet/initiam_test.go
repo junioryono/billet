@@ -575,9 +575,15 @@ node:
 // grant, `billet check` is happy, and the two-minute spot warning never arrives,
 // because the node is signing for a name nothing resolves.
 //
-// So this asserts BOTH halves at once: the China config LOADS with the China host,
-// and the statement it produces is scoped in the China partition. A regression in
-// either package alone turns it red.
+// So this asserts both halves of the agreement at once: the China config LOADS with
+// the China host, and the statement it produces is scoped in the China partition.
+//
+// IT IS THE POSITIVE HALF OF A PAIR, and on its own it proves less than it looks.
+// What turns it red is a suffix that stops being the region's — forcing the commercial
+// one refuses this config at load. Deleting the partition guard outright does NOT:
+// this host is accepted either way, and the ARN comes from awspolicy, which the guard
+// does not touch. TestInitIAMRefusesAChinaQueueOnTheCommercialHost below is the half
+// that catches that, which is why the two are written together.
 func TestInitIAMScopesAChinaQueueToTheChinaPartition(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "billet.yaml")
 	body := `
