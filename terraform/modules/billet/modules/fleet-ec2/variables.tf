@@ -96,6 +96,27 @@ variable "builder" {
   description = "Grant the node role what `billet ami build` needs: ec2:CreateImage on a builder-tagged instance and on the image and snapshots it makes, its own TerminateInstances for cleanup, GetConsoleOutput to read the verifier's report, and the CreateTags that stamps a verified image. Off by default — it widens the identity every job's instance is launched by, and a deployment that builds its AMI elsewhere should not carry it."
   type        = bool
   default     = false
+
+  validation {
+    # AN OVERRIDE HAS TO ADMIT THE BUILDER'S OWN TAG, and only whoever generated
+    # it can make it do so.
+    #
+    # iam_policy_json REPLACES the node policy outright, and this builder
+    # document is ADDITIVE: it grants CreateImage, the console read, the
+    # promotion tag and the create-time tag for CreateImage, and nothing that
+    # launches an instance. The launch rides the node policy's own RunInstances,
+    # which a PRESENCE-mode rendering admits whatever the owner tag says and a
+    # VALUE-mode one does not — `billet ami build` tags its builder
+    # billet-ami-build-<image>, never the deployment id. So a value-scoped
+    # override generated without --builder denies the very first call while the
+    # apply reports the builder grant enabled, which is worse than not having it.
+    #
+    # A substring is the only test available here and it is the right one:
+    # `billet init iam --builder` is what puts that prefix into the conditions
+    # that admit the builder's launch and its create-time tag.
+    condition     = var.iam_policy_json == "" || !var.builder || can(regex("billet-ami-build-", var.iam_policy_json))
+    error_message = "builder = true beside an iam_policy_json override needs that override to admit the builder's own owner tag. iam_policy_json REPLACES the node policy; the builder document is additive and grants nothing that launches an instance; and a value-scoped policy admits only the deployment's exact owner value, while `billet ami build` tags its builder billet-ami-build-<image>. Regenerate the override with `billet init iam --deployment <id> --builder`, which adds the billet-ami-build-* conditions this looks for."
+  }
 }
 
 variable "builder_payload_bucket" {

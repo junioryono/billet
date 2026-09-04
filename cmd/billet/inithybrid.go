@@ -203,6 +203,23 @@ func cmdInitHybrid(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
+
+		// THE OUTPUTS HAVE TO BE THIS ROOT'S, and the region is the one fact that
+		// says so cheaply. Every rendering takes the region from --region while
+		// every id here comes from an apply, so outputs from a root applied in
+		// another region — or a re-render with --region retyped — produce a
+		// config that signs against one region and names another's subnet,
+		// security group, buckets and controller. Nothing downstream refuses it:
+		// a cache generation eventually trips over the availability zone, and a
+		// generation without one prints an AMI command that simply cannot work.
+		if f.Region != *region {
+			return fmt.Errorf("--terraform-output was written by a root in %s and this "+
+				"generation is for %s: every id in it names resources in the other "+
+				"region, so either re-render with --region %s or point "+
+				"--terraform-output at this region's own outputs",
+				f.Region, *region, f.Region)
+		}
+
 		facts = &f
 	}
 

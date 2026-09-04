@@ -33,7 +33,8 @@ const hybridOutputsJSON = `{
   "subnet_id": {"sensitive": false, "type": "string", "value": "subnet-0abc"},
   "runner_security_group_id": {"sensitive": false, "type": "string", "value": "sg-trusted"},
   "untrusted_runner_security_group_id": {"sensitive": false, "type": "string", "value": "sg-untrusted"},
-  "ami_payload_bucket": {"sensitive": false, "type": "string", "value": "acme-ci-ami-payloads-1"}
+  "ami_payload_bucket": {"sensitive": false, "type": "string", "value": "acme-ci-ami-payloads-1"},
+  "region": {"sensitive": false, "type": "string", "value": "us-west-2"}
 }`
 
 // hybridCacheOutputsJSON adds the three facts a --cache root declares and a
@@ -47,7 +48,8 @@ const hybridCacheOutputsJSON = `{
   "ami_payload_bucket": {"sensitive": false, "type": "string", "value": "acme-ci-ami-payloads-1"},
   "cache_bucket": {"sensitive": false, "type": "string", "value": "acme-ci-cache-1"},
   "cache_prefix": {"sensitive": false, "type": "string", "value": "billet-cache"},
-  "availability_zone": {"sensitive": false, "type": "string", "value": "us-west-2a"}
+  "availability_zone": {"sensitive": false, "type": "string", "value": "us-west-2a"},
+  "region": {"sensitive": false, "type": "string", "value": "us-west-2"}
 }`
 
 var hybridFileNames = []string{
@@ -674,5 +676,71 @@ func TestInitHybridWithoutACacheTheBuildAsksForNoIssuer(t *testing.T) {
 
 	if runbook := readHybrid(t, out, HybridRunbookFile); strings.Contains(runbook, "--ca-cert") {
 		t.Error("a generation with no cache has no private issuer to bake in")
+	}
+}
+
+// OUTPUTS FROM ANOTHER ROOT ARE REFUSED, BY THE ONE FACT THAT CAN SEE IT.
+//
+// Every rendering takes the region from --region; every id in the outputs comes
+// from an apply. So a re-render against a root applied elsewhere — or with
+// --region retyped — produces a config that signs against one region and names
+// another's subnet, security group, buckets and controller. Nothing downstream
+// catches it: a generation without a cache has no availability zone to trip
+// over, and simply prints an AMI command that cannot work.
+//
+// Mutation: dropping the comparison lets the mismatched render succeed.
+func TestInitHybridRefusesOutputsFromAnotherRegionsRoot(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "acme-ci")
+	cfg := filepath.Join(dir, "none.yaml")
+	outputs := filepath.Join(dir, "outputs.json")
+
+	elsewhere := strings.Replace(hybridOutputsJSON,
+		`"region": {"sensitive": false, "type": "string", "value": "us-west-2"}`,
+		`"region": {"sensitive": false, "type": "string", "value": "eu-central-1"}`, 1)
+	if elsewhere == hybridOutputsJSON {
+		t.Fatal("the fixture no longer carries the region output this case rewrites")
+	}
+
+	if err := os.WriteFile(outputs, []byte(elsewhere), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := runInitHybrid(t, append(hybridArgs(out, cfg), "--terraform-output", outputs)...)
+	if err == nil {
+		t.Fatal("a root applied in another region was accepted")
+	}
+
+	// The refusal has to name BOTH regions and the two ways out, because the
+	// operator cannot tell from the file which root wrote it.
+	for _, want := range []string{"eu-central-1", "us-west-2", "--region", "--terraform-output"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal must name %q: %v", want, err)
+		}
+	}
+}
+
+// AND A MISSING REGION OUTPUT IS REFUSED LIKE ANY OTHER, rather than comparing
+// against an empty string and passing whenever --region is also empty.
+func TestInitHybridRefusesTerraformOutputWithNoRegion(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "acme-ci")
+	cfg := filepath.Join(dir, "none.yaml")
+	outputs := filepath.Join(dir, "outputs.json")
+
+	without := strings.Replace(hybridOutputsJSON,
+		",\n  \"region\": {\"sensitive\": false, \"type\": \"string\", \"value\": \"us-west-2\"}", "", 1)
+	if without == hybridOutputsJSON {
+		t.Fatal("the fixture no longer carries the region output this case removes, so the " +
+			"refusal below would be asserted against a file that still has one")
+	}
+
+	if err := os.WriteFile(outputs, []byte(without), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := runInitHybrid(t, append(hybridArgs(out, cfg), "--terraform-output", outputs)...)
+	if err == nil || !strings.Contains(err.Error(), "region") {
+		t.Fatalf("a missing region output must be refused by name, got %v", err)
 	}
 }

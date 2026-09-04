@@ -56,6 +56,7 @@ const (
 	HybridOutputRunnerSecurityGroup   = "runner_security_group_id"
 	HybridOutputUntrustedRunnerSG     = "untrusted_runner_security_group_id"
 	HybridOutputAMIPayloadBucket      = "ami_payload_bucket"
+	HybridOutputRegion                = "region"
 	HybridOutputCacheBucket           = "cache_bucket"
 	HybridOutputCachePrefix           = "cache_prefix"
 	HybridOutputAvailabilityZone      = "availability_zone"
@@ -94,6 +95,12 @@ type HybridFacts struct {
 	RunnerSecurityGroupID          string
 	UntrustedRunnerSecurityGroupID string
 	AMIPayloadBucket               string
+	// Region is consumed by no rendering — every one of them takes the region
+	// from HybridParams. It is read so the two can be COMPARED: an operator
+	// pointing at another root's outputs, or retyping --region, otherwise gets a
+	// config that signs for one region and names another's subnet, security
+	// group and buckets, with nothing in the generation saying so.
+	Region string
 	// The cache facts, demanded only of a generation that asked for one.
 	CacheBucket      string
 	CachePrefix      string
