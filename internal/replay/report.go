@@ -196,6 +196,19 @@ func readReport(ctx context.Context, db *state.DB, fleet Fleet, trace Trace) (*R
 
 		seen[row.RequestID] = true
 
+		// THE ROW IS THE TRACE'S JOB, NOT ONLY ITS REQUEST ID. A row recorded under
+		// another tier, or with a result the scripted GitHub never sent, would
+		// describe a different workload than the one replayed.
+		if row.Tier != a.Tier {
+			return nil, fmt.Errorf("request %d was offered on tier %q and the ledger recorded it on %q",
+				row.RequestID, a.Tier, row.Tier)
+		}
+
+		if row.Result != "" && row.Result != a.Result {
+			return nil, fmt.Errorf("request %d completed with result %q and the ledger recorded %q",
+				row.RequestID, a.Result, row.Result)
+		}
+
 		assignedAt, err := parseStamp(row.QueuedAt)
 		if err != nil {
 			return nil, fmt.Errorf("lease %s queued_at: %w", row.LeaseID, err)
@@ -242,14 +255,8 @@ func readReport(ctx context.Context, db *state.DB, fleet Fleet, trace Trace) (*R
 		rec.CacheGeneration = placement.CacheGeneration
 		rec.ActionsCache = placement.ActionsCache
 
-		// ONE CHARGE, TWO RECORDS OF IT. The lease row and the history row both
-		// say what was charged to whom; a report that took the time from one and
-		// the shape from the other would sweep a charge that never existed. They
-		// have to agree, or the report cannot say what the fleet carried.
-		if lease.Host != rec.Node || int(lease.Vcpu) != rec.VCPU || config.ByteSize(lease.Memory) != rec.Memory {
-			return nil, fmt.Errorf("lease %s of job %d is charged to %q for %d vCPU and %s on its lease row and to %q "+
-				"for %d vCPU and %s in its history; the report cannot say which the fleet carried",
-				row.LeaseID, a.Seq, lease.Host, lease.Vcpu, config.ByteSize(lease.Memory), rec.Node, rec.VCPU, rec.Memory)
+		if err := rec.checkAgainstLease(lease.Host, int(lease.Vcpu), config.ByteSize(lease.Memory)); err != nil {
+			return nil, fmt.Errorf("lease %s of job %d: %w", row.LeaseID, a.Seq, err)
 		}
 
 		if err := rec.checkOrder(); err != nil {
@@ -329,6 +336,23 @@ func (f Fleet) checkCharge(c charge) error {
 	return nil
 }
 
+// checkAgainstLease refuses a record whose history row and lease row disagree
+// about what was charged to whom.
+//
+// ONE CHARGE, TWO RECORDS OF IT. The lease row and the history row both say
+// what was charged to whom; a report that took the time from one and the shape
+// from the other would sweep a charge that never existed. They have to agree,
+// or the report cannot say what the fleet carried.
+func (rec *Record) checkAgainstLease(host string, vcpu int, memory config.ByteSize) error {
+	if host != rec.Node || vcpu != rec.VCPU || memory != rec.Memory {
+		return fmt.Errorf("charged to %q for %d vCPU and %s on its lease row and to %q for %d vCPU and %s in "+
+			"its history; the report cannot say which the fleet carried",
+			host, vcpu, memory, rec.Node, rec.VCPU, rec.Memory)
+	}
+
+	return nil
+}
+
 // checkOrder refuses a record whose timestamps contradict the lifecycle: a
 // lease is escrowed, then assigned, then (if a job started) started, then
 // archived, and a job cannot start before it arrived. A row out of that order
@@ -340,6 +364,8 @@ func (rec *Record) checkOrder() error {
 		return errors.New("the job was recorded with no assignment time")
 	case rec.AssignedAt.Before(rec.ChargedFrom):
 		return fmt.Errorf("assigned at %s, before its lease was escrowed at %s", rec.AssignedAt, rec.ChargedFrom)
+	case rec.AssignedAt.Before(rec.Arrival):
+		return fmt.Errorf("assigned at %s, before it arrived at %s", rec.AssignedAt, rec.Arrival)
 	case !rec.StartedAt.IsZero() && rec.StartedAt.Before(rec.AssignedAt):
 		return fmt.Errorf("started at %s, before it was assigned at %s", rec.StartedAt, rec.AssignedAt)
 	case !rec.StartedAt.IsZero() && rec.StartedAt.Before(rec.Arrival):

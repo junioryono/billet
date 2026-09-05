@@ -238,7 +238,7 @@ func (p *plane) route(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 
 	switch {
-	case strings.Contains(path, "/runnergroups"):
+	case r.Method == http.MethodGet && strings.Contains(path, "/runnergroups"):
 		if r.URL.Query().Get("groupName") == RunnerGroup {
 			fakeactions.WriteJSON(p.t, w, fakeactions.ListJSON(
 				map[string]any{"id": 1, "name": RunnerGroup, "isDefaultGroup": false}))
@@ -248,7 +248,7 @@ func (p *plane) route(w http.ResponseWriter, r *http.Request) {
 
 		fakeactions.WriteJSON(p.t, w, fakeactions.ListJSON())
 
-	case strings.Contains(path, "/actions/runner-groups/"):
+	case r.Method == http.MethodGet && strings.Contains(path, "/actions/runner-groups/"):
 		fakeactions.WriteJSON(p.t, w, map[string]any{
 			"restricted_to_workflows": true,
 			"selected_workflows":      []string{Workflow},
@@ -322,7 +322,7 @@ func (p *plane) scaleSets(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch {
-	case m[2] == "":
+	case m[2] == "" && r.Method == http.MethodGet:
 		fakeactions.WriteJSON(p.t, w, p.scaleSetJSON(set))
 	case m[2] == "sessions" && m[3] == "" && r.Method == http.MethodPost:
 		p.openSession(w, set)
@@ -841,6 +841,27 @@ func (p *plane) starved(label string) bool {
 	s := p.byName[label]
 
 	return s != nil && (len(s.available) > 0 || s.lastCap == 0)
+}
+
+// standing is what a tier advertises and holds, so a caller can tell whether
+// a poll it caused changed anything.
+type standing struct {
+	capacity  int
+	available int
+	assigned  int
+}
+
+// standingOf reports a tier's standing.
+func (p *plane) standingOf(label string) standing {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	s := p.byName[label]
+	if s == nil {
+		return standing{}
+	}
+
+	return standing{capacity: s.lastCap, available: len(s.available), assigned: len(s.assigned)}
 }
 
 // wakeLocked returns a parked poll.

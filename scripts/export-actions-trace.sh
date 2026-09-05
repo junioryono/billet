@@ -132,6 +132,18 @@ gh api --paginate \
 	"repos/$repo/actions/runs?status=completed&per_page=100&created=%3E%3D$since" \
 	>"$work/runs.json"
 
+# GITHUB ANSWERS AT MOST 1000 RUNS TO A FILTERED LISTING, whatever the paging
+# says, and a listing that reached the cap is a shorter history that reads as a
+# complete one. total_count is the count before the cap; a window that holds
+# more is refused and the caller narrows --since.
+total=$(jq -s 'map(.total_count) | max // 0' "$work/runs.json")
+
+if [ "$total" -gt 1000 ]; then
+	printf 'the window since %s holds %d completed runs and GitHub lists at most 1000; narrow --since\n' \
+		"$since" "$total" >&2
+	exit 1
+fi
+
 jq -r '.workflow_runs[] | [.id, .path, (.head_branch // "")] | @tsv' "$work/runs.json" >"$work/runs.tsv"
 
 runs=0

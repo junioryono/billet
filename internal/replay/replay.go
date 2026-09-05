@@ -132,10 +132,30 @@ func Run(t *testing.T, fleet Fleet, trace Trace, opts Options) *Report {
 		// whose job finished tops its discovery slot back up before anything is
 		// offered to anyone, exactly as it would in production. What the harness
 		// decides is only who is offered the rest, and that is this order.
-		for _, label := range actions.order {
-			if actions.starved(label) {
+		//
+		// UNTIL A PASS CHANGES NOTHING. A tier nudged while it advertised nothing
+		// uses that poll to escrow the room it can now see and advertise it; the
+		// offer it could take comes on a poll after that, which is the next pass.
+		// One pass would leave such a tier holding escrow and never offered its
+		// backlog, and if this was the trace's last event, those jobs would never
+		// run. A pass that acquires nothing and changes no advertisement is the
+		// end, so a tier that declines its offer every time is not offered it
+		// forever.
+		for changed := true; changed; {
+			changed = false
+
+			for _, label := range actions.order {
+				if !actions.starved(label) {
+					continue
+				}
+
+				before := actions.standingOf(label)
 				actions.nudge(label)
 				settle("a poll for " + label)
+
+				if actions.standingOf(label) != before {
+					changed = true
+				}
 			}
 		}
 	}

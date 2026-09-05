@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -253,13 +254,44 @@ func TestTheExporterWritesATraceTheReplayReads(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// AND EVERY ATTEMPT OF EACH RUN: without filter=all the endpoint answers the
-	// latest attempt only, and a re-run's earlier attempts vanish from the trace.
-	for _, want := range []string{"created=%3E%3D2026-03-01", "runs/101/jobs?per_page=100&filter=all",
-		"runs/102/jobs?per_page=100&filter=all"} {
-		if !strings.Contains(string(log), want) {
-			t.Errorf("gh was never asked %q: %s", want, log)
+	// AND EVERY ATTEMPT OF EACH RUN, spelled exactly: without filter=all the
+	// endpoint answers the latest attempt only, and a re-run's earlier attempts
+	// vanish from the trace. Whole lines, because GitHub accepts only `latest`
+	// or `all` and a substring would pass a misspelling.
+	asked := strings.Split(strings.TrimSpace(string(log)), "\n")
+
+	for _, want := range []string{
+		"repos/acme/web/actions/runs?status=completed&per_page=100&created=%3E%3D2026-03-01",
+		"repos/acme/web/actions/runs/101/jobs?per_page=100&filter=all",
+		"repos/acme/web/actions/runs/102/jobs?per_page=100&filter=all",
+	} {
+		if !slices.Contains(asked, want) {
+			t.Errorf("gh was never asked exactly %q: %v", want, asked)
 		}
+	}
+}
+
+// A WINDOW GITHUB CANNOT LIST WHOLE IS REFUSED. A filtered listing answers at
+// most 1000 runs whatever the paging says, so a window holding more would
+// export a shorter history that reads as complete.
+func TestAWindowBeyondGitHubsListingCapIsRefused(t *testing.T) {
+	h := newExportHarness(t)
+
+	capped := `{"total_count": 1001, "workflow_runs": [
+  {"id": 101, "path": ".github/workflows/ci.yml", "head_branch": "main"}
+]}`
+
+	if err := os.WriteFile(filepath.Join(h.fixtures, "runs.json"), []byte(capped), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout, stderr, err := h.run(t, nil, "acme/web", "--since", "2026-01-01", "--prefix", "billet-")
+	if err == nil {
+		t.Fatal("the exporter exited 0 on a window holding more runs than GitHub lists")
+	}
+
+	if !strings.Contains(stderr, "narrow --since") || stdout != "" {
+		t.Errorf("the refusal did not say what to do, or a trace was written anyway: %q\n%s", stderr, stdout)
 	}
 }
 

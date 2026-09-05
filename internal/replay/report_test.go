@@ -87,6 +87,7 @@ func TestARecordOutOfOrderIsRefused(t *testing.T) {
 
 	for name, rec := range map[string]Record{
 		"no assignment":            {Arrival: minute(1), ChargedFrom: minute(0), FinishedAt: minute(3)},
+		"assigned before arrival":  {Arrival: minute(3), ChargedFrom: minute(0), AssignedAt: minute(2), StartedAt: minute(4), FinishedAt: minute(9)},
 		"assigned before escrow":   {Arrival: minute(1), ChargedFrom: minute(2), AssignedAt: minute(1), FinishedAt: minute(3)},
 		"started before assigned":  {Arrival: minute(1), ChargedFrom: minute(0), AssignedAt: minute(3), StartedAt: minute(2), FinishedAt: minute(9)},
 		"started before arrival":   {Arrival: minute(5), ChargedFrom: minute(0), AssignedAt: minute(2), StartedAt: minute(3), FinishedAt: minute(9)},
@@ -95,6 +96,31 @@ func TestARecordOutOfOrderIsRefused(t *testing.T) {
 	} {
 		if err := rec.checkOrder(); err == nil {
 			t.Errorf("a record %s was accepted", name)
+		}
+	}
+}
+
+// A LEASE ROW AND A HISTORY ROW THAT DISAGREE ABOUT THE CHARGE ARE REFUSED.
+func TestALeaseAndItsHistoryMustAgreeOnTheCharge(t *testing.T) {
+	t.Parallel()
+
+	rec := Record{Node: "only", VCPU: 4, Memory: 8 * config.GiB}
+
+	if err := rec.checkAgainstLease("only", 4, 8*config.GiB); err != nil {
+		t.Fatalf("an agreeing pair was refused: %v", err)
+	}
+
+	for name, lease := range map[string]struct {
+		host   string
+		vcpu   int
+		memory config.ByteSize
+	}{
+		"another host":   {"other", 4, 8 * config.GiB},
+		"another vcpu":   {"only", 2, 8 * config.GiB},
+		"another memory": {"only", 4, 4 * config.GiB},
+	} {
+		if err := rec.checkAgainstLease(lease.host, lease.vcpu, lease.memory); err == nil {
+			t.Errorf("a lease row naming %s was accepted against the history row", name)
 		}
 	}
 }
