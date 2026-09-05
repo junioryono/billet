@@ -616,6 +616,31 @@ func (c *Client) MarkFailure(ctx context.Context, leaseID string, epoch int64, r
 		nodeapi.MarkFailureRequest{Epoch: epoch, Reason: reason}, nil)
 }
 
+// RecordCacheObservation tells the control plane what the cache did for a
+// lease's job.
+//
+// CHECKED WHERE IT IS EMITTED. An older control plane has no route for this and
+// answers a bare 404, which would read here as a decode failure on every cache
+// request of every job on the node. A pairing below the version loses one
+// diagnostic column and nothing else, so the observation is dropped as success
+// rather than reported as an error the caller would resend at teardown; the
+// registration log line already names the negotiated version.
+func (c *Client) RecordCacheObservation(
+	ctx context.Context, leaseID string, epoch int64, obs alloc.CacheObservation,
+) error {
+	if c.WireVersion() < nodeapi.VersionCacheObservation {
+		return nil
+	}
+
+	return c.do(ctx, http.MethodPost, c.leasePath(leaseID, "/cache"),
+		nodeapi.CacheObservationRequest{
+			Epoch:           epoch,
+			ImageCache:      string(obs.ImageCache),
+			CacheGeneration: obs.CacheGeneration,
+			ActionsCache:    string(obs.ActionsCache),
+		}, nil)
+}
+
 // Resize changes an EC2 lease's charged shape before the provider attempts it.
 func (c *Client) Resize(
 	ctx context.Context, leaseID string, epoch int64, instanceType string,

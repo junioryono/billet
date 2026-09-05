@@ -62,6 +62,20 @@ type ResizeRequest struct {
 	Memory       config.ByteSize `json:"memory"`
 }
 
+// CacheObservationRequest records what the node saw the cache do for a lease's
+// job.
+//
+// The tokens are sent as strings from alloc's closed vocabularies, for the
+// reason a phase is: an enum whose numbering is a wire contract is one insertion
+// away from silently remapping every observation in flight. Either half may be
+// empty, meaning that half has not been observed yet.
+type CacheObservationRequest struct {
+	Epoch           int64  `json:"epoch"`
+	ImageCache      string `json:"image_cache,omitempty"`
+	CacheGeneration string `json:"cache_generation,omitempty"`
+	ActionsCache    string `json:"actions_cache,omitempty"`
+}
+
 // ReleaseRequest ends a lease with a terminal outcome.
 type ReleaseRequest struct {
 	Epoch   int64  `json:"epoch"`

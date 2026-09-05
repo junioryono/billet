@@ -119,11 +119,27 @@ ON CONFLICT (lease_id) DO UPDATE SET
 -- the FIRST observation is the one that can still have been causal, and a
 -- disruption recorded during teardown must not replace the spot interruption that
 -- caused the teardown.
+--
+-- THE PLACEMENT FACTS ARE THE LEASE'S TERMINAL ONES and overwrite: the backend it
+-- ran on, the shape placement bought, the charged vCPU and memory, the site and
+-- the price that shape was charged at were all decided on the lease row, which
+-- is about to be reaped, and the history is where they survive. The price is
+-- what the lease recorded when the shape was charged, never today's catalogue.
+--
+-- THE CACHE OBSERVATIONS ARE WRITE-ONCE-OR-KEEP like the disruption, and for the
+-- same reason: they are written onto this row the moment the node observes them,
+-- and an archive arriving from a caller that did not load them must not blank an
+-- observation already here. The generation moves with the image-cache token, so
+-- a report never shows a generation with nothing to attribute it to.
 INSERT INTO job_history
      (lease_id, tier, node, run_id, request_id, conclusion, failure_reason,
-      disruption, disrupted_at, queued_at, finished_at)
+      disruption, disrupted_at, chosen_provider, instance_type, vcpu, memory, site,
+      price_micros_per_hour, image_cache, cache_generation, actions_cache,
+      queued_at, finished_at)
 VALUES (@lease_id, @tier, @node, @run_id, @request_id, @conclusion, @failure_reason,
-        @disruption, @disrupted_at, @queued_at, @finished_at)
+        @disruption, @disrupted_at, @chosen_provider, @instance_type, @vcpu, @memory,
+        @site, @price_micros_per_hour, @image_cache, @cache_generation,
+        @actions_cache, @queued_at, @finished_at)
 ON CONFLICT (lease_id) DO UPDATE SET
   conclusion     = excluded.conclusion,
   failure_reason = excluded.failure_reason,
@@ -134,7 +150,33 @@ ON CONFLICT (lease_id) DO UPDATE SET
   disruption     = CASE WHEN excluded.disruption != ''
                         THEN excluded.disruption ELSE job_history.disruption END,
   disrupted_at   = CASE WHEN excluded.disruption != ''
-                        THEN excluded.disrupted_at ELSE job_history.disrupted_at END;
+                        THEN excluded.disrupted_at ELSE job_history.disrupted_at END,
+  chosen_provider       = excluded.chosen_provider,
+  instance_type         = excluded.instance_type,
+  vcpu                  = excluded.vcpu,
+  memory                = excluded.memory,
+  site                  = excluded.site,
+  price_micros_per_hour = excluded.price_micros_per_hour,
+  image_cache      = CASE WHEN excluded.image_cache != ''
+                          THEN excluded.image_cache ELSE job_history.image_cache END,
+  cache_generation = CASE WHEN excluded.image_cache != ''
+                          THEN excluded.cache_generation ELSE job_history.cache_generation END,
+  actions_cache    = CASE WHEN excluded.actions_cache != ''
+                          THEN excluded.actions_cache ELSE job_history.actions_cache END;
+
+-- name: ReadJobPlacement :one
+-- What one lease was charged for and what the cache did, from the row that
+-- outlives the lease.
+--
+-- ZERO IS NOT A PRICE. A host-backed lease buys nothing, so its instance_type is
+-- empty and its price is zero; a remote row written before the column existed
+-- has a shape and a zero, and a reader renders that as unknown, never as $0.
+-- The cache tokens are empty when nothing was observed, and a token this binary
+-- does not recognise is a NEWER binary's observation, rendered verbatim rather
+-- than dropped.
+SELECT chosen_provider, instance_type, vcpu, memory, site, price_micros_per_hour,
+       image_cache, cache_generation, actions_cache
+  FROM job_history WHERE lease_id = @lease_id;
 
 -- name: ListJobConclusionsForRequest :many
 -- Every recorded outcome for one scheduler request, oldest first.

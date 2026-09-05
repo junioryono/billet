@@ -63,6 +63,11 @@ type placementCost struct {
 	vcpu         int
 	memory       config.ByteSize
 	instanceType string
+	// price is what the shape costs per hour at the moment it is charged, and
+	// zero for a host-backed provider, which buys nothing. Recorded on the
+	// lease so the history says what was bought rather than what today's
+	// catalogue would charge.
+	price config.USDPerHour
 }
 
 // cost is what one lease of this tier really consumes on this host.
@@ -90,6 +95,7 @@ func (n nodeRow) cost(t config.Tier) (placementCost, bool) {
 		if shape.VCPU >= t.VCPU && shape.Memory >= t.Memory {
 			return placementCost{
 				vcpu: shape.VCPU, memory: shape.Memory, instanceType: shape.Type,
+				price: shape.PriceUSDPerHour,
 			}, true
 		}
 	}
@@ -308,6 +314,18 @@ func (p *placer) next(t config.Tier) (string, placementCost, bool) {
 	p.spend(best, t)
 
 	return best, cost, true
+}
+
+// siteOf is the registered site of one candidate host, which escrow records on
+// the lease it aims there. Empty for a host that declared none.
+func (p *placer) siteOf(node string) string {
+	for _, n := range p.order {
+		if n.name == node {
+			return n.site
+		}
+	}
+
+	return ""
 }
 
 // spend takes one instance of a tier off a host.

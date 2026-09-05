@@ -240,29 +240,31 @@ func (q *Queries) HoldLease(ctx context.Context, arg HoldLeaseParams) error {
 const insertLease = `-- name: InsertLease :exec
 INSERT INTO leases
    (id, tier, node, target_node, macos_slot, guest_os, providers, phase, vcpu, memory,
-    requested_vcpu, requested_memory, instance_type, epoch, created_at, heartbeat_at,
-    expires_at)
+    requested_vcpu, requested_memory, instance_type, site, price_micros_per_hour,
+    epoch, created_at, heartbeat_at, expires_at)
 VALUES ($1, $2, NULL, $3, $4, $5, $6, $7,
-        $8, $9, $10, $11, $12, 0,
-        $13, $14, $15)
+        $8, $9, $10, $11, $12, $13,
+        $14, 0, $15, $16, $17)
 `
 
 type InsertLeaseParams struct {
-	ID              string
-	Tier            string
-	TargetNode      sql.NullString
-	MacosSlot       int64
-	GuestOs         string
-	Providers       string
-	Phase           string
-	Vcpu            int64
-	Memory          int64
-	RequestedVcpu   int64
-	RequestedMemory int64
-	InstanceType    string
-	CreatedAt       string
-	HeartbeatAt     string
-	ExpiresAt       string
+	ID                 string
+	Tier               string
+	TargetNode         sql.NullString
+	MacosSlot          int64
+	GuestOs            string
+	Providers          string
+	Phase              string
+	Vcpu               int64
+	Memory             int64
+	RequestedVcpu      int64
+	RequestedMemory    int64
+	InstanceType       string
+	Site               string
+	PriceMicrosPerHour int64
+	CreatedAt          string
+	HeartbeatAt        string
+	ExpiresAt          string
 }
 
 // Escrow one slot.
@@ -279,6 +281,13 @@ type InsertLeaseParams struct {
 // for the SHAPE placement bought rather than the smaller tier request, and a
 // fallback resizes the charge; the immutable request is what a later shape is
 // checked against.
+//
+// THE PRICE IS THE SHAPE'S PRICE AT THE MOMENT IT IS CHARGED, in millionths of
+// a dollar, and the site is the placed host's registered site. Both are written
+// here rather than read back later because a node may re-register with a new
+// catalogue while this lease is open, and the history a terminalization copies
+// has to say what the deployment bought, not what it would pay today. Zero is a
+// host-backed lease, which buys nothing.
 func (q *Queries) InsertLease(ctx context.Context, arg InsertLeaseParams) error {
 	_, err := q.db.ExecContext(ctx, insertLease,
 		arg.ID,
@@ -293,6 +302,8 @@ func (q *Queries) InsertLease(ctx context.Context, arg InsertLeaseParams) error 
 		arg.RequestedVcpu,
 		arg.RequestedMemory,
 		arg.InstanceType,
+		arg.Site,
+		arg.PriceMicrosPerHour,
 		arg.CreatedAt,
 		arg.HeartbeatAt,
 		arg.ExpiresAt,
@@ -301,8 +312,9 @@ func (q *Queries) InsertLease(ctx context.Context, arg InsertLeaseParams) error 
 }
 
 const listExpiredLeases = `-- name: ListExpiredLeases :many
-SELECT id, tier, node, target_node, macos_slot, phase, vcpu, memory,
-       requested_vcpu, requested_memory, instance_type, held_at, force_release,
+SELECT id, tier, node, target_node, macos_slot, chosen_provider, phase, vcpu, memory,
+       requested_vcpu, requested_memory, instance_type, site, price_micros_per_hour,
+       image_cache, cache_generation, actions_cache, held_at, force_release,
        holder_incarnation, failure_reason, disruption, disrupted_at, epoch, run_id,
        request_id
   FROM leases
@@ -317,26 +329,32 @@ type ListExpiredLeasesParams struct {
 }
 
 type ListExpiredLeasesRow struct {
-	ID                string
-	Tier              string
-	Node              sql.NullString
-	TargetNode        sql.NullString
-	MacosSlot         int64
-	Phase             string
-	Vcpu              int64
-	Memory            int64
-	RequestedVcpu     int64
-	RequestedMemory   int64
-	InstanceType      string
-	HeldAt            string
-	ForceRelease      int64
-	HolderIncarnation string
-	FailureReason     string
-	Disruption        string
-	DisruptedAt       string
-	Epoch             int64
-	RunID             sql.NullInt64
-	RequestID         sql.NullInt64
+	ID                 string
+	Tier               string
+	Node               sql.NullString
+	TargetNode         sql.NullString
+	MacosSlot          int64
+	ChosenProvider     string
+	Phase              string
+	Vcpu               int64
+	Memory             int64
+	RequestedVcpu      int64
+	RequestedMemory    int64
+	InstanceType       string
+	Site               string
+	PriceMicrosPerHour int64
+	ImageCache         string
+	CacheGeneration    string
+	ActionsCache       string
+	HeldAt             string
+	ForceRelease       int64
+	HolderIncarnation  string
+	FailureReason      string
+	Disruption         string
+	DisruptedAt        string
+	Epoch              int64
+	RunID              sql.NullInt64
+	RequestID          sql.NullInt64
 }
 
 // The leases whose holders stopped heartbeating.
@@ -344,6 +362,11 @@ type ListExpiredLeasesRow struct {
 // QUARANTINE IS EXCLUDED because it is already past this line: its compute is
 // unconfirmed and its capacity stays charged until something proves otherwise, so
 // reaping it again would be the reaper deciding a question only evidence settles.
+//
+// EVERYTHING THE ARCHIVE COPIES IS SELECTED, chosen_provider included. The
+// reaper terminalizes an expired escrow outright and archives it from this row,
+// and a projection that left the provider out archived every reaped lease as
+// having run on nothing.
 func (q *Queries) ListExpiredLeases(ctx context.Context, arg ListExpiredLeasesParams) ([]ListExpiredLeasesRow, error) {
 	rows, err := q.db.QueryContext(ctx, listExpiredLeases, arg.Cutoff, arg.MaxRows)
 	if err != nil {
@@ -359,12 +382,18 @@ func (q *Queries) ListExpiredLeases(ctx context.Context, arg ListExpiredLeasesPa
 			&i.Node,
 			&i.TargetNode,
 			&i.MacosSlot,
+			&i.ChosenProvider,
 			&i.Phase,
 			&i.Vcpu,
 			&i.Memory,
 			&i.RequestedVcpu,
 			&i.RequestedMemory,
 			&i.InstanceType,
+			&i.Site,
+			&i.PriceMicrosPerHour,
+			&i.ImageCache,
+			&i.CacheGeneration,
+			&i.ActionsCache,
 			&i.HeldAt,
 			&i.ForceRelease,
 			&i.HolderIncarnation,
@@ -511,36 +540,42 @@ func (q *Queries) MarkLeaseFailure(ctx context.Context, arg MarkLeaseFailurePara
 
 const readLease = `-- name: ReadLease :one
 SELECT id, tier, node, target_node, macos_slot, guest_os, providers, chosen_provider,
-       phase, vcpu, memory, requested_vcpu, requested_memory, instance_type,
+       phase, vcpu, memory, requested_vcpu, requested_memory, instance_type, site,
+       price_micros_per_hour, image_cache, cache_generation, actions_cache,
        held_at, force_release, holder_incarnation, failure_reason, disruption,
        disrupted_at, epoch, run_id, request_id
   FROM leases WHERE id = $1
 `
 
 type ReadLeaseRow struct {
-	ID                string
-	Tier              string
-	Node              sql.NullString
-	TargetNode        sql.NullString
-	MacosSlot         int64
-	GuestOs           string
-	Providers         string
-	ChosenProvider    string
-	Phase             string
-	Vcpu              int64
-	Memory            int64
-	RequestedVcpu     int64
-	RequestedMemory   int64
-	InstanceType      string
-	HeldAt            string
-	ForceRelease      int64
-	HolderIncarnation string
-	FailureReason     string
-	Disruption        string
-	DisruptedAt       string
-	Epoch             int64
-	RunID             sql.NullInt64
-	RequestID         sql.NullInt64
+	ID                 string
+	Tier               string
+	Node               sql.NullString
+	TargetNode         sql.NullString
+	MacosSlot          int64
+	GuestOs            string
+	Providers          string
+	ChosenProvider     string
+	Phase              string
+	Vcpu               int64
+	Memory             int64
+	RequestedVcpu      int64
+	RequestedMemory    int64
+	InstanceType       string
+	Site               string
+	PriceMicrosPerHour int64
+	ImageCache         string
+	CacheGeneration    string
+	ActionsCache       string
+	HeldAt             string
+	ForceRelease       int64
+	HolderIncarnation  string
+	FailureReason      string
+	Disruption         string
+	DisruptedAt        string
+	Epoch              int64
+	RunID              sql.NullInt64
+	RequestID          sql.NullInt64
 }
 
 // One lease, whatever phase it is in.
@@ -562,6 +597,11 @@ func (q *Queries) ReadLease(ctx context.Context, id string) (ReadLeaseRow, error
 		&i.RequestedVcpu,
 		&i.RequestedMemory,
 		&i.InstanceType,
+		&i.Site,
+		&i.PriceMicrosPerHour,
+		&i.ImageCache,
+		&i.CacheGeneration,
+		&i.ActionsCache,
 		&i.HeldAt,
 		&i.ForceRelease,
 		&i.HolderIncarnation,
@@ -721,16 +761,18 @@ func (q *Queries) RefreshLeaseHolder(ctx context.Context, arg RefreshLeaseHolder
 }
 
 const resizeLease = `-- name: ResizeLease :exec
-UPDATE leases SET vcpu = $1, memory = $2, instance_type = $3
- WHERE id = $4 AND epoch = $5
+UPDATE leases SET vcpu = $1, memory = $2, instance_type = $3,
+       price_micros_per_hour = $4
+ WHERE id = $5 AND epoch = $6
 `
 
 type ResizeLeaseParams struct {
-	Vcpu         int64
-	Memory       int64
-	InstanceType string
-	ID           string
-	Epoch        int64
+	Vcpu               int64
+	Memory             int64
+	InstanceType       string
+	PriceMicrosPerHour int64
+	ID                 string
+	Epoch              int64
 }
 
 // Authorise a remote fallback shape, atomically with the budget check above it.
@@ -738,11 +780,15 @@ type ResizeLeaseParams struct {
 // A LATER FALLBACK IS A NEW PURCHASE DECISION, so its larger resource vector must
 // fit before the launch request is allowed onto the wire -- never reconciled
 // afterwards.
+//
+// THE PRICE MOVES WITH THE SHAPE: a fallback is a different purchase at a
+// different rate, and the history records what was bought.
 func (q *Queries) ResizeLease(ctx context.Context, arg ResizeLeaseParams) error {
 	_, err := q.db.ExecContext(ctx, resizeLease,
 		arg.Vcpu,
 		arg.Memory,
 		arg.InstanceType,
+		arg.PriceMicrosPerHour,
 		arg.ID,
 		arg.Epoch,
 	)

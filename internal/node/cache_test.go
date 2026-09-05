@@ -58,6 +58,8 @@ type fakeCacheStore struct {
 	released           []string
 	releaseCtxErrs     []error
 	releaseDeadlines   []bool
+	// createErr makes a fresh volume unobtainable, the way a read-only pool would.
+	createErr error
 }
 
 func TestCacheWriterAuthorityOutlivesTheWholeCommitBudget(t *testing.T) {
@@ -116,6 +118,9 @@ func (f *fakeCacheStore) Match(
 }
 
 func (f *fakeCacheStore) Create(_ context.Context, key string, size int64) (storecontract.Volume, error) {
+	if f.createErr != nil {
+		return storecontract.Volume{}, f.createErr
+	}
 	f.created++
 	f.keys = append(f.keys, key)
 	f.createdSizes = append(f.createdSizes, size)

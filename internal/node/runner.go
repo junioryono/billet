@@ -93,6 +93,10 @@ type LeaseStore interface {
 	Resize(ctx context.Context, leaseID string, epoch int64, instanceType string,
 		vcpu int, memory config.ByteSize) error
 	Release(ctx context.Context, leaseID string, epoch int64, outcome alloc.Phase) error
+	// RecordCacheObservation writes what this host saw the cache do for a
+	// lease's job, fenced on the epoch; the ledger keeps the first observation.
+	RecordCacheObservation(ctx context.Context, leaseID string, epoch int64,
+		obs alloc.CacheObservation) error
 	Lease(ctx context.Context, leaseID string) (*alloc.Lease, error)
 	LaunchedLeaseIDs(ctx context.Context, node string) (map[string]bool, error)
 	QuarantinedLeaseIDs(ctx context.Context, node string) (map[string]bool, error)
@@ -195,8 +199,69 @@ func WithMaxCustody(d time.Duration) Option {
 }
 
 // WithCacheService gives Firecracker guests the node-local sticky-disk endpoint.
+//
+// THE RUNNER IS THE CACHE'S OBSERVER, because only the runner knows which lease
+// an instance name belongs to, and that is what a cache observation is recorded
+// against.
 func WithCacheService(cache *CacheService) Option {
-	return func(r *Runner) { r.cache = cache }
+	return func(r *Runner) {
+		r.cache = cache
+		cache.SetCacheObserver(r)
+	}
+}
+
+// ObserveCache records what the cache did for one instance against its lease.
+//
+// THIS PROCESS'S OWN MAPPING FIRST, wherever it holds the instance: a request
+// that is running, a launch still in progress, or compute in custody. That
+// carries the epoch in force now, which the session's record does not once a
+// quarantine has moved it. The session's lease is what a process that never
+// launched the guest, or has already forgotten it, attributes with; a session
+// from before the record carried one names nothing, and the observation is
+// kept against the next attempt.
+func (r *Runner) ObserveCache(
+	ctx context.Context, instance, leaseID string, epoch int64, obs alloc.CacheObservation,
+) error {
+	if held, heldEpoch, ok := r.leaseForInstance(instance); ok {
+		leaseID, epoch = held, heldEpoch
+	}
+
+	if leaseID == "" {
+		return fmt.Errorf("node: no lease is known here for %s", instance)
+	}
+
+	return r.alloc.RecordCacheObservation(ctx, leaseID, epoch, obs)
+}
+
+// leaseForInstance is the lease and epoch this process holds for an instance
+// name, or false when it holds none.
+func (r *Runner) leaseForInstance(name string) (string, int64, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for requestID, inst := range r.running {
+		if inst.Name != name {
+			continue
+		}
+
+		if lease := r.runningLease[requestID]; lease != nil {
+			return lease.ID, lease.Epoch, true
+		}
+	}
+
+	for _, c := range r.launching {
+		if c.name == name {
+			return c.leaseID, c.epoch.Load(), true
+		}
+	}
+
+	for _, c := range r.custody {
+		if c.name == name {
+			return c.leaseID, c.epoch.Load(), true
+		}
+	}
+
+	return "", 0, false
 }
 
 // WithRegistryMirrors gives managed guests their site's public pull-through caches.
@@ -378,7 +443,10 @@ func (r *Runner) Launch(
 	var buildKitCacheMountLimit config.ByteSize
 	if r.cache != nil {
 		var credentials CacheCredentials
-		scope := CacheSessionScope{Trust: trust, Intercept: tier.Intercept && trust == provider.TrustTrusted}
+		scope := CacheSessionScope{
+			Trust: trust, Intercept: tier.Intercept && trust == provider.TrustTrusted,
+			LeaseID: lease.ID, Epoch: lease.Epoch,
+		}
 		if tier.CacheScope != nil {
 			scope.Owner = tier.CacheScope.Owner
 			scope.Repository = tier.CacheScope.Repository
@@ -693,6 +761,14 @@ func (r *Runner) destroy(ctx context.Context, requestID int64) error {
 	r.mu.Lock()
 	lease, holdable := r.runningLease[requestID]
 	r.mu.Unlock()
+
+	// WHAT THE CACHE DID IS SETTLED WHILE THIS REQUEST IS STILL MAPPED TO ITS
+	// LEASE. The cleanup below runs after the mapping is gone, and a report
+	// needs the lease; the job is over either way, so what the guest never
+	// asked for is known now.
+	if r.cache != nil {
+		r.cache.SettleObservation(ctx, inst.Name)
+	}
 
 	if state != provider.TeardownStopped && !holdable {
 		// KEPT IN THE MAPS, so the retry re-enters here rather than through the

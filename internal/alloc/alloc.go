@@ -249,6 +249,21 @@ type Lease struct {
 	// InstanceType is the EC2 shape currently authorised for purchase. Empty for
 	// backends whose charged resources are the requested resources.
 	InstanceType string
+	// Site is the placed host's registered site at escrow, recorded on the row
+	// so the history a terminalization copies names where the job ran.
+	Site string
+	// PriceUSDPerHour is the charged shape's price at the moment it was
+	// charged, written at escrow and again by a fallback resize. Zero for a
+	// host-backed lease, which buys nothing. Never re-read from the node's
+	// catalogue: a node may re-register with new prices while this lease is
+	// open, and the history has to say what was bought.
+	PriceUSDPerHour config.USDPerHour
+	// ImageCache, CacheGeneration and ActionsCache are what the node observed
+	// the cache do for this job, first observation kept. Empty means nothing
+	// was observed; see CacheObservation.
+	ImageCache      ImageCache
+	CacheGeneration string
+	ActionsCache    ActionsCache
 	// PreferenceRank is the chosen target provider's position in the tier's
 	// preference list. It orders unbound listener escrow so a shrink releases
 	// fallback capacity before preferred capacity. Unbound capacity is not adopted
@@ -677,7 +692,8 @@ func (a *Allocator) Escrow(ctx context.Context, tier string, want int) ([]*Lease
 				break
 			}
 
-			lease, err := a.insertLease(ctx, tx, t, target, cost, place.rank[target])
+			lease, err := a.insertLease(ctx, tx, t, target, place.siteOf(target), cost,
+				place.rank[target])
 			if err != nil {
 				return err
 			}
@@ -1032,7 +1048,8 @@ func (a *Allocator) Reserve(ctx context.Context, tier string) (*Lease, error) {
 			return fmt.Errorf("%w for tier %q", ErrNoCapacity, t.Label)
 		}
 
-		lease, err = a.insertLease(ctx, tx, t, target, cost, place.rank[target])
+		lease, err = a.insertLease(ctx, tx, t, target, place.siteOf(target), cost,
+			place.rank[target])
 
 		return err
 	})
@@ -1056,7 +1073,7 @@ func (a *Allocator) Reserve(ctx context.Context, tier string) (*Lease, error) {
 // is: reading admission and then inserting hopefully is not a check, and the
 // thing it fails to exclude is a seal that commits in between.
 func (a *Allocator) insertLease(
-	ctx context.Context, tx *sql.Tx, t config.Tier, target string, cost placementCost,
+	ctx context.Context, tx *sql.Tx, t config.Tier, target, site string, cost placementCost,
 	preferenceRank int,
 ) (*Lease, error) {
 	if err := refuseIfSealed(ctx, tx); err != nil {
@@ -1105,9 +1122,14 @@ func (a *Allocator) insertLease(
 		RequestedVcpu:   int64(t.VCPU),
 		RequestedMemory: int64(t.Memory),
 		InstanceType:    cost.instanceType,
-		CreatedAt:       ts(now),
-		HeartbeatAt:     ts(now),
-		ExpiresAt:       ts(now.Add(a.leaseTTL)),
+		// THE PRICE IS WRITTEN WHEN THE SHAPE IS CHARGED. A node may re-register
+		// with a new catalogue while this lease is open, and the history a
+		// terminalization copies has to say what was bought at the time.
+		Site:               site,
+		PriceMicrosPerHour: int64(cost.price),
+		CreatedAt:          ts(now),
+		HeartbeatAt:        ts(now),
+		ExpiresAt:          ts(now.Add(a.leaseTTL)),
 	}); err != nil {
 		return nil, fmt.Errorf("alloc: insert lease: %w", err)
 	}
@@ -1125,6 +1147,8 @@ func (a *Allocator) insertLease(
 		RequestedVCPU:   t.VCPU,
 		RequestedMemory: t.Memory,
 		InstanceType:    cost.instanceType,
+		Site:            site,
+		PriceUSDPerHour: cost.price,
 		PreferenceRank:  preferenceRank,
 		Epoch:           0,
 	}, nil
@@ -1286,9 +1310,14 @@ func (a *Allocator) Resize(
 		}
 
 		declared := false
+
+		var price config.USDPerHour
+
 		for _, shape := range shapes {
 			if shape.Type == instanceType && shape.VCPU == vcpu && shape.Memory == memory {
 				declared = true
+				price = shape.PriceUSDPerHour
+
 				break
 			}
 		}
@@ -1339,12 +1368,15 @@ func (a *Allocator) Resize(
 				ErrNoCapacity, instanceType, vcpu, memory)
 		}
 
+		// THE PRICE MOVES WITH THE SHAPE: a fallback is a different purchase at a
+		// different rate, and it is recorded here, when it is charged.
 		if err := state.WriteQueries(tx).ResizeLease(ctx, ledgerdb.ResizeLeaseParams{
-			Vcpu:         int64(vcpu),
-			Memory:       int64(memory),
-			InstanceType: instanceType,
-			ID:           leaseID,
-			Epoch:        epoch,
+			Vcpu:               int64(vcpu),
+			Memory:             int64(memory),
+			InstanceType:       instanceType,
+			PriceMicrosPerHour: int64(price),
+			ID:                 leaseID,
+			Epoch:              epoch,
 		}); err != nil {
 			return fmt.Errorf("alloc: resize lease %s for EC2 shape %s: %w", leaseID, instanceType, err)
 		}
@@ -2526,18 +2558,26 @@ func readExpiredLeases(ctx context.Context, tx *sql.Tx, cutoff string, limit int
 	for i := range rows {
 		row := &rows[i]
 
+		// THE PROVIDER IS CARRIED TOO, because archive copies it: a projection
+		// that left it out archived every reaped lease as having run on nothing.
 		expired = append(expired, Lease{
 			ID:                row.ID,
 			Tier:              row.Tier,
 			Node:              row.Node.String,
 			TargetNode:        row.TargetNode.String,
 			MacOSSlot:         row.MacosSlot == 1,
+			Provider:          config.ProviderKind(row.ChosenProvider),
 			Phase:             Phase(row.Phase),
 			VCPU:              int(row.Vcpu),
 			Memory:            config.ByteSize(row.Memory),
 			RequestedVCPU:     int(row.RequestedVcpu),
 			RequestedMemory:   config.ByteSize(row.RequestedMemory),
 			InstanceType:      row.InstanceType,
+			Site:              row.Site,
+			PriceUSDPerHour:   config.USDPerHour(row.PriceMicrosPerHour),
+			ImageCache:        ImageCache(row.ImageCache),
+			CacheGeneration:   row.CacheGeneration,
+			ActionsCache:      ActionsCache(row.ActionsCache),
 			HeldSince:         row.HeldAt,
 			ForceRelease:      row.ForceRelease == 1,
 			HolderIncarnation: row.HolderIncarnation,
@@ -2891,6 +2931,11 @@ func (a *Allocator) loadAny(ctx context.Context, tx querier, leaseID string, epo
 		RequestedVCPU:     int(row.RequestedVcpu),
 		RequestedMemory:   config.ByteSize(row.RequestedMemory),
 		InstanceType:      row.InstanceType,
+		Site:              row.Site,
+		PriceUSDPerHour:   config.USDPerHour(row.PriceMicrosPerHour),
+		ImageCache:        ImageCache(row.ImageCache),
+		CacheGeneration:   row.CacheGeneration,
+		ActionsCache:      ActionsCache(row.ActionsCache),
 		HeldSince:         row.HeldAt,
 		ForceRelease:      row.ForceRelease == 1,
 		HolderIncarnation: row.HolderIncarnation,
@@ -3315,19 +3360,33 @@ func (a *Allocator) archive(ctx context.Context, tx *sql.Tx, l *Lease, outcome P
 	// follow here and for the same reason: not every caller loads the columns, and
 	// an archive that arrives without them must not wipe an observation an earlier
 	// one recorded. The two move together, keyed on the token, so a report can
-	// never show a time with nothing to attribute it to.
+	// never show a time with nothing to attribute it to. The cache observations
+	// follow the same rule.
+	//
+	// THE PLACEMENT FACTS COME FROM THE LEASE, never from a catalogue: the price
+	// is what the row recorded when the shape was charged, and the row is what
+	// is about to be reaped.
 	err := state.WriteQueries(tx).ArchiveJobHistory(ctx, ledgerdb.ArchiveJobHistoryParams{
-		LeaseID:       l.ID,
-		Tier:          l.Tier,
-		Node:          node,
-		RunID:         nullableID(l.RunID),
-		RequestID:     nullableID(l.RequestID),
-		Conclusion:    sql.NullString{String: string(outcome), Valid: true},
-		FailureReason: l.FailureReason,
-		Disruption:    string(l.Disruption),
-		DisruptedAt:   l.DisruptedAt,
-		QueuedAt:      ts(now),
-		FinishedAt:    sql.NullString{String: ts(now), Valid: true},
+		LeaseID:            l.ID,
+		Tier:               l.Tier,
+		Node:               node,
+		RunID:              nullableID(l.RunID),
+		RequestID:          nullableID(l.RequestID),
+		Conclusion:         sql.NullString{String: string(outcome), Valid: true},
+		FailureReason:      l.FailureReason,
+		Disruption:         string(l.Disruption),
+		DisruptedAt:        l.DisruptedAt,
+		ChosenProvider:     string(l.Provider),
+		InstanceType:       l.InstanceType,
+		Vcpu:               int64(l.VCPU),
+		Memory:             int64(l.Memory),
+		Site:               l.Site,
+		PriceMicrosPerHour: int64(l.PriceUSDPerHour),
+		ImageCache:         string(l.ImageCache),
+		CacheGeneration:    l.CacheGeneration,
+		ActionsCache:       string(l.ActionsCache),
+		QueuedAt:           ts(now),
+		FinishedAt:         sql.NullString{String: ts(now), Valid: true},
 	})
 	if err != nil {
 		return fmt.Errorf("alloc: archive lease %s: %w", l.ID, err)

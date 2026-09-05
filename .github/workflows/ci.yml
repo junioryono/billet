@@ -81,7 +81,13 @@ jobs:
       # allocator with concurrent scale-set listeners, and a data race in that
       # code double-admits jobs onto a machine that cannot hold them.
       - name: Test
-        run: go test -race -count=1 -coverprofile=coverage.out -covermode=atomic ./...
+        # -timeout 20m IS PER PACKAGE, and internal/alloc needs it: under -race
+        # and atomic coverage that package alone took 530s on main before
+        # migration 49 added fourteen statements to every test ledger's open,
+        # against go test's default of 600s. The job's own timeout-minutes still
+        # bounds the whole run; this only stops one package that is legitimately
+        # slow from being reported as hung.
+        run: go test -race -count=1 -timeout 20m -coverprofile=coverage.out -covermode=atomic ./...
 
       # THE CAPACITY SUITE AGAIN, AGAINST THE OTHER ENGINE.
       #

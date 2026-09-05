@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/wirecert"
 )
 
@@ -497,26 +498,53 @@ func (r *actionsHeaderReader) Read(buffer []byte) (int, error) {
 // reservation-bound request never falls through at all — the reservation is
 // billet's own, and GitHub has nothing to answer it with.
 func (p *actionsProxy) respond(req *http.Request, session *cacheSession) (*http.Response, bool) {
+	// THE OBSERVATION IS RECORDED WHERE THE DISPOSITION IS FINAL. A CacheService
+	// call the handler answered was served; one the handler failed is either
+	// retried through GitHub (a splice, whatever billet intended) or, when it is
+	// bound to a reservation only billet holds, refused to the guest as
+	// unavailable; one refused before it was read is unavailable too. The calls
+	// actionsResponse decides on its own -- refused by the kill switch, or from
+	// a client billet does not serve -- are recorded there.
+	//
+	// IN FLIGHT FROM HERE UNTIL THE OUTCOME IS RECORDED, so a settlement that
+	// runs in between does not write `unused` over a call still being answered.
+	cacheCall := actionsCacheCall(req)
+	if cacheCall {
+		p.service.beginActionsCall(session)
+		defer p.service.endActionsCall(session)
+	}
+	observe := func(ctx context.Context, outcome alloc.ActionsCache) {
+		if cacheCall {
+			p.service.observeActions(ctx, session, outcome)
+		}
+	}
+
 	var replay []byte
-	if actionsLocalRequest(req) && (req.URL.Path == actionsCreatePath ||
-		req.URL.Path == actionsFinalizePath || req.URL.Path == actionsDownloadPath) {
+	if actionsLocalRequest(req) && cacheCall {
 		var err error
 		replay, err = io.ReadAll(io.LimitReader(req.Body, actionsRequestLimit+1))
 		if err != nil {
+			observe(req.Context(), alloc.ActionsCacheUnavailable)
+
 			return actionsBlobError(http.StatusBadRequest,
 				"Actions cache metadata request could not be read"), true
 		}
 		if len(replay) > actionsRequestLimit {
+			observe(req.Context(), alloc.ActionsCacheUnavailable)
+
 			return actionsBlobError(http.StatusRequestEntityTooLarge,
 				"Actions cache metadata request is too large"), true
 		}
 		req.Body = io.NopCloser(bytes.NewReader(replay))
 	}
+
 	reservationBound := strings.HasPrefix(req.URL.Path, actionsBlobPrefix)
 	if req.URL.Path == actionsFinalizePath && replay != nil {
 		var err error
 		reservationBound, err = p.service.actionsFinalizeReserved(req.Context(), replay, session)
 		if err != nil {
+			observe(req.Context(), alloc.ActionsCacheUnavailable)
+
 			return actionsBlobError(http.StatusBadGateway,
 				"Actions cache storage is unavailable"), true
 		}
@@ -524,28 +552,33 @@ func (p *actionsProxy) respond(req *http.Request, session *cacheSession) (*http.
 			if err != nil {
 				p.service.log.Warn("a reserved Actions cache finalization failed locally",
 					"instance", session.instance, "path", req.URL.Path, "error", err)
+				observe(req.Context(), alloc.ActionsCacheUnavailable)
 
 				return actionsBlobError(http.StatusBadGateway,
 					"Actions cache storage is unavailable"), true
 			}
 			response.Request = req
+			observe(req.Context(), alloc.ActionsCacheServed)
 
 			return response, true
 		}
 	}
 	if response, handled, err := p.service.actionsResponse(req, session); handled && err == nil {
 		response.Request = req
+		observe(req.Context(), alloc.ActionsCacheServed)
 
 		return response, true
 	} else if handled && err != nil {
 		if reservationBound {
 			p.service.log.Warn("a reserved Actions cache request failed locally",
 				"instance", session.instance, "path", req.URL.Path, "error", err)
+			observe(req.Context(), alloc.ActionsCacheUnavailable)
 
 			return actionsBlobError(http.StatusBadGateway, "Actions cache storage is unavailable"), true
 		}
 		p.service.log.Warn("Actions cache interception failed; retrying through GitHub",
 			"instance", session.instance, "path", req.URL.Path, "error", err)
+		observe(req.Context(), alloc.ActionsCacheSpliced)
 	} else if reservationBound {
 		p.service.log.Warn("a reserved Actions cache request cannot be passed to GitHub",
 			"instance", session.instance, "path", req.URL.Path)

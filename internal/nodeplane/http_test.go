@@ -230,6 +230,10 @@ type fakeStore struct {
 	released     []alloc.Phase
 	deregistered []string
 	failures     []string
+	// observations are the cache observations recorded, with the epoch each
+	// arrived under.
+	observations []observed
+	observeErr   error
 	pool         map[string]alloc.PoolRunner
 	retired      []string
 }
@@ -275,6 +279,24 @@ func (f *fakeStore) MarkFailure(_ context.Context, _ string, _ int64, reason str
 	f.failures = append(f.failures, reason)
 
 	return f.failureErr
+}
+
+// observed is one cache observation the fake was asked to record.
+type observed struct {
+	lease string
+	epoch int64
+	obs   alloc.CacheObservation
+}
+
+func (f *fakeStore) RecordCacheObservation(
+	_ context.Context, leaseID string, epoch int64, obs alloc.CacheObservation,
+) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.observations = append(f.observations, observed{lease: leaseID, epoch: epoch, obs: obs})
+
+	return f.observeErr
 }
 
 func (f *fakeStore) Resize(context.Context, string, int64, string, int, config.ByteSize) error {

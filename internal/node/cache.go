@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/provider"
 	storecontract "github.com/junioryono/billet/internal/store"
 )
@@ -39,6 +40,12 @@ const (
 	// against S3 was ~20 requests a second for a six-minute wait.
 	cacheWriterWaitFloor = 500 * time.Millisecond
 	cacheWriterWaitCap   = 30 * time.Second
+
+	// cacheReportLimit bounds telling the control plane what the cache did, the
+	// way actionsPolicyLimit bounds asking it about the kill switch: both run
+	// inside a guest's cache request, and a plane that is slow must cost the job
+	// a diagnostic rather than its cache.
+	cacheReportLimit = 2 * time.Second
 )
 
 // CacheService lets one authenticated microVM replace its reserved drive slots.
@@ -59,6 +66,7 @@ type CacheService struct {
 	actions    *actionsProxy
 	actionIO   actionsVolumeManager
 	actionRule ActionsPolicy
+	observer   CacheObserver
 }
 
 type cacheSession struct {
@@ -71,10 +79,25 @@ type cacheSession struct {
 	repository  string
 	workflowRef string
 	intercept   bool
-	closed      bool
-	slots       [provider.MaxVolumes]*cacheAttachment
-	actions     map[string]*actionsArchive
-	receipts    map[string]*actionsReceipt
+	leaseID     string
+	epoch       int64
+	observed    cacheObserved
+	// inflight counts CacheService calls between dispatch and their recorded
+	// outcome, so settlement does not write `unused` over a call still being
+	// answered.
+	inflight int
+	closed   bool
+	// finished says the session has left the service's indexes and its record
+	// is gone; an outcome recorded after that is reported but no longer written,
+	// or the record would come back as an orphan.
+	finished bool
+	// recovered says this process loaded the session from disk rather than
+	// creating it, so it did not witness the session's whole life and cannot
+	// say what the guest never asked for.
+	recovered bool
+	slots     [provider.MaxVolumes]*cacheAttachment
+	actions   map[string]*actionsArchive
+	receipts  map[string]*actionsReceipt
 }
 
 // CacheCredentials identifies one managed guest's cache session.
@@ -91,11 +114,59 @@ type CacheSessionScope struct {
 	Owner       string
 	Repository  string
 	WorkflowRef string
+	// LeaseID and Epoch name the lease the guest runs under, so an observation
+	// can be attributed after the runner has forgotten the instance. Recorded
+	// on the durable session; they authorise nothing, and the runner's own
+	// mapping is preferred while it exists because a re-adoption moves the
+	// epoch.
+	LeaseID string
+	Epoch   int64
 }
 
 // ActionsPolicy reads the control plane's current interception kill switch.
 type ActionsPolicy interface {
 	ActionsCacheAllowed(ctx context.Context, owner, repository string) (bool, error)
+}
+
+// CacheObserver is told what the cache did for one guest, so the lease's
+// history can carry it. The runner implements it.
+//
+// THE LEASE TRAVELS WITH THE CALL, from the session's durable record, so a
+// process that never launched the guest can still attribute what it saw. The
+// runner prefers its own mapping while it holds one, because that carries the
+// epoch in force now.
+type CacheObserver interface {
+	ObserveCache(ctx context.Context, instance, leaseID string, epoch int64,
+		obs alloc.CacheObservation) error
+}
+
+// cacheObserved is what one session has seen the cache do, and whether the
+// control plane has been told.
+//
+// DURABLE WITH THE SESSION, because the report is best effort at the moment of
+// observation and is resent when the compute ends; a restart in between must
+// not forget what the guest saw. The first observation of each half is kept,
+// which is the same rule the ledger applies, so the two cannot disagree about
+// which observation was first.
+type cacheObserved struct {
+	ImageCache      string `json:"image_cache,omitempty"`
+	CacheGeneration string `json:"cache_generation,omitempty"`
+	ActionsCache    string `json:"actions_cache,omitempty"`
+	// Reported says everything above has reached the control plane.
+	Reported bool `json:"reported,omitempty"`
+	// ActionsPending says the first CacheService call was dispatched and its
+	// outcome not yet recorded. DURABLE, so a crash inside that call leaves the
+	// Actions half unknown after a restart rather than settled as unused: the
+	// guest made a call, and what it got could not be told.
+	ActionsPending bool `json:"actions_pending,omitempty"`
+}
+
+func (o cacheObserved) observation() alloc.CacheObservation {
+	return alloc.CacheObservation{
+		ImageCache:      alloc.ImageCache(o.ImageCache),
+		CacheGeneration: o.CacheGeneration,
+		ActionsCache:    alloc.ActionsCache(o.ActionsCache),
+	}
 }
 
 type cacheAttachment struct {
@@ -169,6 +240,217 @@ func (s *CacheService) Endpoint() string { return s.endpoint }
 // SetActionsPolicy installs the control-plane policy reader before the listener starts.
 func (s *CacheService) SetActionsPolicy(policy ActionsPolicy) { s.actionRule = policy }
 
+// SetCacheObserver installs where observations are reported, before the
+// listener starts. Without one they are kept on the session and reported to
+// nobody.
+func (s *CacheService) SetCacheObserver(observer CacheObserver) { s.observer = observer }
+
+// observe records what the cache did for a session and tells the control
+// plane. Called with session.mu held.
+//
+// THE FIRST OBSERVATION OF EACH HALF IS KEPT, and the generation moves with
+// the image-cache token. A half already observed is left alone, so a repeat
+// costs nothing and a later, different observation cannot replace what the
+// guest first saw.
+func (s *CacheService) observe(ctx context.Context, session *cacheSession, obs alloc.CacheObservation) {
+	changed := false
+
+	if obs.ImageCache != "" && session.observed.ImageCache == "" {
+		session.observed.ImageCache = string(obs.ImageCache)
+		session.observed.CacheGeneration = obs.CacheGeneration
+		changed = true
+	}
+
+	if obs.ActionsCache != "" && session.observed.ActionsCache == "" {
+		session.observed.ActionsCache = string(obs.ActionsCache)
+		session.observed.ActionsPending = false
+		changed = true
+	}
+
+	if !changed {
+		return
+	}
+
+	session.observed.Reported = false
+
+	// A SESSION ALREADY FINISHED HAS NO RECORD TO WRITE. Its file is gone and
+	// it has left the indexes, so a write here would leave an orphan that loads
+	// on the next start as a session for compute that does not exist. The
+	// outcome is still reported, with the lease the session carries, and lost
+	// only if that report fails.
+	if session.finished {
+		s.report(ctx, session)
+
+		return
+	}
+
+	// DURABLE BEFORE IT IS SENT, so a report the plane never answered is resent
+	// by whichever process ends the compute. A record that could not be written
+	// is not reported either: an observation that exists only in memory would be
+	// told to the plane once and, after a restart, never again, and the plane
+	// would hold a fact this host cannot account for.
+	if err := s.persistSession(session); err != nil {
+		s.log.Warn("could not make a cache observation durable; it is kept in memory and "+
+			"reported when the session next persists", "instance", session.instance, "error", err)
+
+		return
+	}
+
+	s.report(ctx, session)
+}
+
+// report tells the control plane what the session has observed, bounded, and
+// records that it landed. Called with session.mu held.
+//
+// BEST EFFORT HERE, AUTHORITATIVE AT THE END. A failure leaves Reported false,
+// and settleObservation resends when the compute ends; what a plane blip costs
+// is nothing, and what a wedged teardown costs is the resend. The caller's
+// context is detached because it is a guest's request, and a guest that went
+// away is no reason to lose what it saw.
+func (s *CacheService) report(ctx context.Context, session *cacheSession) {
+	if s.observer == nil || session.observed.Reported {
+		return
+	}
+
+	obs := session.observed.observation()
+	if obs == (alloc.CacheObservation{}) {
+		return
+	}
+
+	reportCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cacheReportLimit)
+	defer cancel()
+
+	if err := s.observer.ObserveCache(reportCtx, session.instance, session.leaseID,
+		session.epoch, obs); err != nil {
+		s.log.Warn("could not record what the cache did for a job; it is kept here and resent "+
+			"when the compute ends", "instance", session.instance, "error", err)
+
+		return
+	}
+
+	session.observed.Reported = true
+	if session.finished {
+		return
+	}
+	if err := s.persistSession(session); err != nil {
+		s.log.Warn("could not record that a cache observation was reported; it may be resent",
+			"instance", session.instance, "error", err)
+	}
+}
+
+// settleObservation fills in whatever the session ended without observing and
+// makes sure the control plane has been told. Called with session.mu held.
+//
+// WHAT IS WRITTEN IS STILL AN OBSERVATION: the session closed and the guest
+// never asked for an image store, or never made a CacheService request. Only
+// the process that created the session can say that; one that loaded it from
+// disk did not see the guest's whole life, and a request the crashed process
+// was answering, or had not yet recorded, is exactly what it would miss, so a
+// recovered session leaves an unobserved half unknown. A session with no
+// interception says "off" whoever settles it, because that token comes from
+// how the session was scoped rather than from a request: a guest with no proxy
+// can never make one.
+func (s *CacheService) settleObservation(ctx context.Context, session *cacheSession) {
+	var obs alloc.CacheObservation
+
+	if session.observed.ImageCache == "" && !session.recovered {
+		obs.ImageCache = alloc.ImageCacheUnused
+	}
+
+	// A CALL STILL BEING ANSWERED IS NOT "UNUSED". Its outcome is recorded
+	// when the handler returns, under this same lock, and reported then with
+	// the lease the session carries. A call a crash interrupted is not "unused"
+	// either: the durable pending mark says the guest asked, and what it got
+	// stays unknown, and a recovered session is treated so whether or not the
+	// mark's write got to disk before the crash.
+	if session.observed.ActionsCache == "" && session.inflight == 0 &&
+		!session.observed.ActionsPending {
+		switch {
+		case !session.intercept:
+			obs.ActionsCache = alloc.ActionsCacheOff
+		case !session.recovered:
+			obs.ActionsCache = alloc.ActionsCacheUnused
+		}
+	}
+
+	if obs != (alloc.CacheObservation{}) {
+		s.observe(ctx, session, obs)
+
+		return
+	}
+
+	s.report(ctx, session)
+}
+
+// beginActionsCall marks a CacheService call as in flight, and endActionsCall
+// clears it once its outcome has been recorded. Between the two, settlement
+// leaves the Actions half alone.
+//
+// THE FIRST CALL IS ALSO MARKED DURABLY, before it is dispatched, so a crash
+// inside it does not let the next process settle the half as unused. The mark
+// is cleared by the outcome's own write.
+func (s *CacheService) beginActionsCall(session *cacheSession) {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+
+	session.inflight++
+
+	if session.observed.ActionsCache != "" || session.observed.ActionsPending || session.finished {
+		return
+	}
+
+	session.observed.ActionsPending = true
+	if err := s.persistSession(session); err != nil {
+		s.log.Warn("could not record that an Actions cache call is in flight; a crash inside it "+
+			"would settle the job's cache outcome as unused", "instance", session.instance,
+			"error", err)
+	}
+}
+
+func (s *CacheService) endActionsCall(session *cacheSession) {
+	session.mu.Lock()
+	session.inflight--
+	session.mu.Unlock()
+}
+
+// SettleObservation settles what the cache did for one instance while the
+// caller still holds its lease.
+//
+// CALLED BY THE RUNNER BEFORE IT FORGETS A REQUEST, because the report needs
+// the lease the instance belongs to and Cleanup runs after that mapping is
+// gone. Cleanup settles too, for the paths where the mapping survives it.
+func (s *CacheService) SettleObservation(ctx context.Context, instance string) {
+	s.mu.Lock()
+	token, ok := s.byInstance[instance]
+	if !ok {
+		s.mu.Unlock()
+
+		return
+	}
+
+	session := s.byToken[token]
+	s.mu.Unlock()
+
+	// DETACHED FROM THE TEARDOWN'S CONTEXT, and bounded. A destroy arrives on a
+	// context that may already be cancelled, and a settlement that gave up on
+	// the lock wait would let the runner forget the lease before the last
+	// report was attempted. The bound keeps a wedged session from holding the
+	// teardown.
+	settleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cacheReportLimit)
+	defer cancel()
+
+	if err := lockCacheSession(settleCtx, session); err != nil {
+		s.log.Warn("could not settle what the cache did for a job before its compute was "+
+			"forgotten; the session's cleanup will try once more",
+			"instance", instance, "error", err)
+
+		return
+	}
+	defer session.mu.Unlock()
+
+	s.settleObservation(settleCtx, session)
+}
+
 // Prepare creates one unguessable session credential before compute starts.
 func (s *CacheService) Prepare(instance string, trust provider.TrustClass) (CacheCredentials, error) {
 	return s.PrepareScoped(instance, CacheSessionScope{Trust: trust})
@@ -191,6 +473,9 @@ func (s *CacheService) PrepareScoped(
 			return CacheCredentials{}, err
 		}
 	}
+	if err := validateSessionLease(instance, scope.LeaseID, scope.Epoch); err != nil {
+		return CacheCredentials{}, err
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -212,9 +497,10 @@ func (s *CacheService) PrepareScoped(
 			token: token, instance: instance, trust: scope.Trust,
 			owner: scope.Owner, repository: scope.Repository, workflowRef: scope.WorkflowRef,
 			intercept: scope.Intercept,
-			admit:     make(chan struct{}, 1),
-			actions:   make(map[string]*actionsArchive),
-			receipts:  make(map[string]*actionsReceipt),
+			leaseID:   scope.LeaseID, epoch: scope.Epoch,
+			admit:    make(chan struct{}, 1),
+			actions:  make(map[string]*actionsArchive),
+			receipts: make(map[string]*actionsReceipt),
 		}
 		credentials := CacheCredentials{Token: token}
 		if scope.Intercept {
@@ -268,6 +554,7 @@ func (s *CacheService) finishSession(session *cacheSession) error {
 	}
 	delete(s.byInstance, session.instance)
 	delete(s.byToken, token)
+	session.finished = true
 
 	return nil
 }
@@ -399,6 +686,10 @@ func (s *CacheService) cleanupSession(
 	if err := s.persistSession(session); err != nil {
 		return fmt.Errorf("node: record closed cache session for %s: %w", session.instance, err)
 	}
+
+	// THE SESSION IS OVER, so what it never observed is now known, and a report
+	// the plane never answered gets its last chance from this process.
+	s.settleObservation(ctx, session)
 
 	var failures []error
 	for slot, attachment := range session.slots {
@@ -549,9 +840,22 @@ func (s *CacheService) attachDockerStore(
 	if err != nil {
 		s.log.Warn("Docker image store is unavailable; the job can continue cold",
 			"instance", session.instance, "error", err)
+		s.observe(ctx, session, alloc.CacheObservation{ImageCache: alloc.ImageCacheUnavailable})
 		http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
 
 		return
+	}
+
+	// WHAT THE STORE ANSWERED: a clone of a generation is warm and names it, a
+	// miss that became a fresh volume is cold. OBSERVED ONLY ONCE THE VOLUME IS
+	// IN DURABLE CUSTODY, below: an observation persists the session and then
+	// talks to the plane, and doing either before the slot is recorded is a
+	// window in which a crash leaves a volume restart cleanup cannot find.
+	observed := alloc.CacheObservation{ImageCache: alloc.ImageCacheCold}
+	if !cold {
+		observed = alloc.CacheObservation{
+			ImageCache: alloc.ImageCacheWarm, CacheGeneration: volume.Generation,
+		}
 	}
 
 	session.slots[0] = &cacheAttachment{
@@ -567,6 +871,7 @@ func (s *CacheService) attachDockerStore(
 		}
 		s.log.Warn("Docker image-store custody could not be made durable; the job can continue cold",
 			"instance", session.instance, "error", errors.Join(err, discardErr, retryErr))
+		s.observe(ctx, session, alloc.CacheObservation{ImageCache: alloc.ImageCacheUnavailable})
 		http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
 
 		return
@@ -590,10 +895,14 @@ func (s *CacheService) attachDockerStore(
 		s.log.Warn("Docker image store could not be attached; the job can continue cold",
 			"instance", session.instance,
 			"error", errors.Join(err, detachErr, discardErr, clearErr))
+		s.observe(ctx, session, alloc.CacheObservation{ImageCache: alloc.ImageCacheUnavailable})
 		http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
 
 		return
 	}
+
+	// THE GUEST HAS ITS STORE, so what the store answered is what it saw.
+	s.observe(ctx, session, observed)
 
 	guestDevice := guestVolumeDevice(0)
 	if locator, ok := s.attacher.(provider.GuestVolumeLocator); ok {

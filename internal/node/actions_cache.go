@@ -23,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/provider"
 	storecontract "github.com/junioryono/billet/internal/store"
 )
@@ -161,7 +162,17 @@ func (s *CacheService) actionsResponse(
 	req *http.Request,
 	session *cacheSession,
 ) (*http.Response, bool, error) {
+	// A CacheService call is what the observation is about. The blob legs that
+	// follow a served call, and everything on the artifact side, are not. Only
+	// the dispositions decided HERE are recorded here; a call that goes to a
+	// handler is recorded by the proxy, once the handler has answered.
+	cacheCall := actionsCacheCall(req)
+
 	if !actionsLocalRequest(req) {
+		if cacheCall {
+			s.observeActions(req.Context(), session, alloc.ActionsCacheSpliced)
+		}
+
 		return nil, false, nil
 	}
 
@@ -169,6 +180,10 @@ func (s *CacheService) actionsResponse(
 	// remains authoritative for untrusted-pool cache traffic; Billet does not
 	// derive storage authority from the assignment that caused scale-up.
 	if session.trust != provider.TrustTrusted || s.actionRule == nil {
+		if cacheCall {
+			s.observeActions(req.Context(), session, alloc.ActionsCacheSpliced)
+		}
+
 		return nil, false, nil
 	}
 	policyCtx, cancel := context.WithTimeout(req.Context(), actionsPolicyLimit)
@@ -179,12 +194,23 @@ func (s *CacheService) actionsResponse(
 		s.log.Warn("Actions cache policy is unavailable",
 			"instance", session.instance, "owner", session.owner,
 			"repository", session.repository, "error", policyErr)
+		if cacheCall {
+			s.observeActions(req.Context(), session, alloc.ActionsCacheSpliced)
+		}
 
 		return nil, false, nil
 	}
 	if !allowed {
+		if cacheCall {
+			s.observeActions(req.Context(), session, alloc.ActionsCacheDisabled)
+		}
+
 		return nil, false, nil
 	}
+	// A CALL THAT IS ANSWERED HERE IS NOT OBSERVED HERE. Whether the guest was
+	// served is known only once the handler has answered, and a handler that
+	// fails is retried through GitHub by the proxy, which is where the final
+	// disposition is recorded.
 	// Resolved once, from the request, and checked there: a signed URL must name
 	// an origin this client can reach without TLS, and only the request says
 	// which that is.
@@ -204,6 +230,49 @@ func (s *CacheService) actionsResponse(
 		response, err := s.serveActionsBlob(req, session)
 		return response, true, err
 	}
+}
+
+// actionsCacheCall reports whether a request is one of the three CacheService
+// calls billet serves, whoever sent it.
+func actionsCacheCall(req *http.Request) bool {
+	if req.URL.RawPath != "" {
+		return false
+	}
+
+	switch req.URL.Path {
+	case actionsCreatePath, actionsFinalizePath, actionsDownloadPath:
+		return true
+	default:
+		return false
+	}
+}
+
+// observeActions records what interception did for a CacheService call.
+//
+// TAKES THE SESSION LOCK ITSELF, briefly, outside the handlers' own hold of
+// it: the observation is decided by then, and holding the lock across the
+// report would hold it across a plane round trip inside every cache call.
+//
+// DETACHED FROM THE GUEST'S REQUEST, and bounded. The outcome is final at the
+// moment this is called, and a guest that disconnected or ran out of time in
+// that same instant is no reason to lose it; waiting on the request's context
+// would drop the outcome and let settlement write `unused` over a call that
+// was answered.
+func (s *CacheService) observeActions(
+	ctx context.Context, session *cacheSession, outcome alloc.ActionsCache,
+) {
+	recordCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cacheReportLimit)
+	defer cancel()
+
+	if err := lockCacheSession(recordCtx, session); err != nil {
+		s.log.Warn("could not record what the Actions cache did for a job; the session was "+
+			"held for longer than the bound", "instance", session.instance, "error", err)
+
+		return
+	}
+	defer session.mu.Unlock()
+
+	s.observe(recordCtx, session, alloc.CacheObservation{ActionsCache: outcome})
 }
 
 func actionsLocalRequest(req *http.Request) bool {
