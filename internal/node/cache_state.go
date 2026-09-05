@@ -102,8 +102,9 @@ func (s *CacheService) loadSessions() error {
 			owner: record.Owner, repository: record.Repository, workflowRef: record.WorkflowRef,
 			intercept: record.Intercept,
 			leaseID:   record.LeaseID, epoch: record.Epoch,
-			observed: record.Observed,
-			closed:   record.Closed, slots: record.Slots, admit: make(chan struct{}, 1),
+			observed:  record.Observed,
+			recovered: true,
+			closed:    record.Closed, slots: record.Slots, admit: make(chan struct{}, 1),
 			actions:  record.Actions,
 			receipts: record.Receipts,
 		}

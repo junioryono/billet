@@ -91,9 +91,13 @@ type cacheSession struct {
 	// is gone; an outcome recorded after that is reported but no longer written,
 	// or the record would come back as an orphan.
 	finished bool
-	slots    [provider.MaxVolumes]*cacheAttachment
-	actions  map[string]*actionsArchive
-	receipts map[string]*actionsReceipt
+	// recovered says this process loaded the session from disk rather than
+	// creating it, so it did not witness the session's whole life and cannot
+	// say what the guest never asked for.
+	recovered bool
+	slots     [provider.MaxVolumes]*cacheAttachment
+	actions   map[string]*actionsArchive
+	receipts  map[string]*actionsReceipt
 }
 
 // CacheCredentials identifies one managed guest's cache session.
@@ -338,14 +342,18 @@ func (s *CacheService) report(ctx context.Context, session *cacheSession) {
 // makes sure the control plane has been told. Called with session.mu held.
 //
 // WHAT IS WRITTEN IS STILL AN OBSERVATION: the session closed and the guest
-// never asked for an image store, or never made a CacheService request. A
-// session with no interception says so as "off", which is the one token that
-// comes from how the session was scoped rather than from a request, because a
-// guest with no proxy can never make one.
+// never asked for an image store, or never made a CacheService request. Only
+// the process that created the session can say that; one that loaded it from
+// disk did not see the guest's whole life, and a request the crashed process
+// was answering, or had not yet recorded, is exactly what it would miss, so a
+// recovered session leaves an unobserved half unknown. A session with no
+// interception says "off" whoever settles it, because that token comes from
+// how the session was scoped rather than from a request: a guest with no proxy
+// can never make one.
 func (s *CacheService) settleObservation(ctx context.Context, session *cacheSession) {
 	var obs alloc.CacheObservation
 
-	if session.observed.ImageCache == "" {
+	if session.observed.ImageCache == "" && !session.recovered {
 		obs.ImageCache = alloc.ImageCacheUnused
 	}
 
@@ -353,11 +361,14 @@ func (s *CacheService) settleObservation(ctx context.Context, session *cacheSess
 	// when the handler returns, under this same lock, and reported then with
 	// the lease the session carries. A call a crash interrupted is not "unused"
 	// either: the durable pending mark says the guest asked, and what it got
-	// stays unknown.
+	// stays unknown, and a recovered session is treated so whether or not the
+	// mark's write got to disk before the crash.
 	if session.observed.ActionsCache == "" && session.inflight == 0 &&
 		!session.observed.ActionsPending {
-		obs.ActionsCache = alloc.ActionsCacheOff
-		if session.intercept {
+		switch {
+		case !session.intercept:
+			obs.ActionsCache = alloc.ActionsCacheOff
+		case !session.recovered:
 			obs.ActionsCache = alloc.ActionsCacheUnused
 		}
 	}

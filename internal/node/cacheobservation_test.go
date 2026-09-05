@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
@@ -444,19 +445,21 @@ func TestSettlementLeavesAnInFlightActionsCallAlone(t *testing.T) {
 	}
 }
 
-// A CALL A CRASH INTERRUPTED IS NOT SETTLED AS UNUSED EITHER. The pending mark
-// is durable, so the process that loads the session after the crash leaves the
-// Actions half unknown: the guest asked, and what it got could not be told.
-func TestAnInterruptedFirstActionsCallStaysUnknownAfterARestart(t *testing.T) {
+// A SESSION THE NEXT PROCESS LOADS IS NOT SETTLED AS UNUSED. That process did
+// not see the guest's whole life: a call the crashed process was answering, or
+// had not yet written down, is exactly what it would miss. So an intercepting
+// session recovered with nothing observed settles both halves as unknown and
+// tells the plane nothing, while a session with no interception still says
+// "off", which follows from its scope rather than from any request.
+func TestARecoveredSessionLeavesWhatItDidNotWitnessUnknown(t *testing.T) {
 	t.Parallel()
 
 	service, storage, session, _ := testActionsService(t)
 	service.SetCacheObserver(&recordingObserver{})
 
-	// The crash: the call is dispatched through the proxy and never returns
-	// while the "next process" below loads what the record says.
-	entered, release, _ := blockedCall(t, service, session)
-	defer release()
+	// The crash: the call is dispatched through the proxy and is still being
+	// answered while the "next process" below loads what the record says.
+	entered, release, done := blockedCall(t, service, session)
 	<-entered
 
 	restarted, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", service.rootState,
@@ -471,11 +474,36 @@ func TestAnInterruptedFirstActionsCallStaysUnknownAfterARestart(t *testing.T) {
 		t.Fatalf("Cleanup after the restart: %v", err)
 	}
 
-	calls := after.recorded()
-	want := alloc.CacheObservation{ImageCache: alloc.ImageCacheUnused}
+	if calls := after.recorded(); len(calls) != 0 {
+		t.Fatalf("the restarted service told its observer %+v, want nothing: it witnessed neither "+
+			"half", calls)
+	}
+
+	// THE CRASHED PROCESS IS JOINED before the test ends, so nothing of it
+	// outlives the directory it writes to.
+	release()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the blocked call never finished after its release")
+	}
+
+	// AND A RECOVERED SESSION WITH NO INTERCEPTION STILL SAYS OFF.
+	plain, plainObserver, _ := observedService(t, &fakeCacheStore{})
+	reloaded, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", plain.rootState,
+		&fakeCacheStore{}, &fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewCacheService over the plain session: %v", err)
+	}
+	reloaded.SetCacheObserver(plainObserver)
+	if err := reloaded.Cleanup(t.Context(), "billet-one"); err != nil {
+		t.Fatalf("Cleanup of the reloaded plain session: %v", err)
+	}
+	calls := plainObserver.recorded()
+	want := alloc.CacheObservation{ActionsCache: alloc.ActionsCacheOff}
 	if len(calls) != 1 || calls[0].obs != want {
-		t.Fatalf("the restarted service told its observer %+v, want %+v with the Actions half "+
-			"left unknown", calls, want)
+		t.Fatalf("the reloaded plain session told its observer %+v, want %+v: off follows from "+
+			"the scope, unused would need a witness", calls, want)
 	}
 }
 
