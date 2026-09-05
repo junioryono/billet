@@ -33,7 +33,7 @@ Until it is attached the token enrols nothing, which is the failure you can see.
 
 ```hcl
 module "converge" {
-  source = "github.com/junioryono/billet//terraform/modules/converge-cloudflare-warp?ref=main"
+  source = "github.com/junioryono/billet//terraform/modules/converge-cloudflare-warp?ref=v0.9.0"
 
   account_id     = var.cloudflare_account_id
   team_name      = "example"               # the <team> in <team>.cloudflareaccess.com
