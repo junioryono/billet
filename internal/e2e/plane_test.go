@@ -1,5 +1,6 @@
 // Package e2e drives the whole of billet against a fake Actions service and a
-// real container backend.
+// compute backend: the real docker one, or the simulated one that starts no
+// compute.
 //
 // Every other suite tests one seam. This one tests the relationships between
 // them, which is where the defects that survived unit tests have all lived: a
@@ -8,10 +9,14 @@
 // is destroyed and the capacity comes back. Each of those steps is covered
 // elsewhere; that they compose is only covered here.
 //
-// The GitHub side is fake and the docker side is REAL. That split is deliberate:
-// billet's relationship with GitHub is a protocol it can be lied to about
-// safely, while its relationship with a container runtime is one where the
-// interesting failures come from the runtime actually behaving like itself.
+// The GitHub side is fake and the compute side is SELECTABLE. billet's
+// relationship with GitHub is a protocol it can be lied to about safely. Its
+// relationship with a container runtime is one where the interesting failures
+// come from the runtime actually behaving like itself, so the scenarios about
+// the plane and the wire run over the real docker backend AND over the simulated
+// one (backends): only the docker leg is evidence about a runtime, and the
+// simulated leg is evidence that the scenario measures the plane rather than
+// the runtime, on machines with no daemon to skip for.
 package e2e
 
 import (
@@ -39,6 +44,7 @@ import (
 	"github.com/junioryono/billet/internal/nodeplane"
 	"github.com/junioryono/billet/internal/provider"
 	"github.com/junioryono/billet/internal/provider/docker"
+	"github.com/junioryono/billet/internal/provider/simulated"
 	"github.com/junioryono/billet/internal/scaleset"
 	"github.com/junioryono/billet/internal/server"
 	"github.com/junioryono/billet/internal/state"
@@ -332,9 +338,13 @@ type stack struct {
 	// runner directly can send the shape the control plane would have sent.
 	tiers  []config.Tier
 	server *server.Server
-	// provider is the compute backend the node runs, which is Docker for every
-	// stack here except the CodeBuild one built over a fake AWS.
+	// provider is the compute backend the node runs: Docker unless the stack was
+	// built with withBackend. kind and backend are what built it, so a restarted
+	// stack over this one's state directory can run the same backend over the
+	// same host (see sameBackend).
 	provider provider.Provider
+	kind     config.ProviderKind
+	backend  func(t *testing.T, deployment string) provider.Provider
 	node     string
 	// wire is the node plane, present only on a wire stack. A compute barrier is
 	// asked over it, so a test that proves one needs the real thing rather than
@@ -375,10 +385,84 @@ func newStack(t *testing.T, opts ...stackOpt) *stack {
 // It used to be possible to skip this path entirely: `server --dev` ran a node
 // in the control plane's own process. With that gone the wire carries every
 // deployment shape billet has, including the single-machine one.
-func newWireStack(t *testing.T) *stack {
+func newWireStack(t *testing.T, opts ...stackOpt) *stack {
 	t.Helper()
 
-	return newStackIn(t, t.TempDir(), newPlane(t), overTheWire)
+	return newStackIn(t, t.TempDir(), newPlane(t), append([]stackOpt{overTheWire}, opts...)...)
+}
+
+// sameBackend is what a stack restarted over this one's state directory passes
+// to newStackIn, so the restart runs the SAME backend over the SAME host.
+//
+// A restart is a new process with empty memory over surviving state, and on the
+// simulated backend the surviving compute lives in the shared Host the builder
+// closes over; a restarted stack built without this would get an empty host and
+// prove that nothing survives a fresh install, which is not the scenario.
+func (s *stack) sameBackend() []stackOpt {
+	if s.backend == nil {
+		return nil
+	}
+
+	return []stackOpt{withBackend(s.kind, s.backend)}
+}
+
+// simulatedRunsFor is how long a simulated runner occupies its instance on the
+// shared stack: until GitHub says the job is done, which is what `sleep 300`
+// models for the docker tier. A year is "never" for a test and stays a real
+// duration on the wall clock, so nothing depends on how the backend reads a
+// zero, and nothing here steers the backend's clock.
+const simulatedRunsFor = 365 * 24 * time.Hour
+
+// backend is one compute backend the shared stack can carry, and the options
+// that build a stack over it.
+type backend struct {
+	name string
+	opts []stackOpt
+}
+
+// backends are the backends every plane-and-wire scenario runs over, as
+// subtests: `for _, b := range backends() { t.Run(b.name, ...) }`.
+//
+// THE SCENARIOS THAT DO THIS ARE ABOUT THE PLANE AND THE WIRE, and reach the
+// backend, where they reach it at all, only through the provider contract.
+// Running each over docker AND over the simulated backend gives the suite a run
+// on a machine with no daemon (the docker leg skips there and the simulated leg
+// never does), and for a scenario that launches compute it also proves the
+// scenario measures the plane rather than the runtime. A scenario that never
+// launches anything (the acknowledgement order, the scale-set label, the
+// unreachable host) gains only the daemon-free run. Only the docker leg says
+// anything about a real runtime; a claim in a scenario's comment about a REAL
+// container is a claim about that leg.
+//
+// A Host per call, so each scenario's simulated leg has one of its own that
+// every stack the scenario builds shares: a restart re-adopts what the previous
+// process launched, and a second deployment on the same machine is really on
+// the same machine. A table and subtests rather than a helper taking the
+// scenario as a function, because a function with a *testing.T that does not
+// begin with t.Helper is a lint finding, and one that does would report every
+// failure at the helper's call site instead of the assertion.
+func backends() []backend {
+	return []backend{
+		{name: "docker"},
+		{name: "simulated", opts: []stackOpt{
+			withBackend(config.ProviderSimulated, simulatedBackend(simulated.NewHost())),
+		}},
+	}
+}
+
+// simulatedBackend builds simulated providers over one shared host.
+func simulatedBackend(host *simulated.Host) func(t *testing.T, deployment string) provider.Provider {
+	return func(t *testing.T, deployment string) provider.Provider {
+		t.Helper()
+
+		p, err := simulated.New(deployment, simulated.OnHost(host),
+			simulated.WithLogger(testLogger(t)))
+		if err != nil {
+			t.Fatalf("simulated.New: %v", err)
+		}
+
+		return p
+	}
 }
 
 // stackOpt varies how a stack is assembled.
@@ -548,6 +632,14 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 
 	t.Cleanup(closeDB)
 
+	// WHAT THE TIER RUNS FOLLOWS THE BACKEND. The docker tier sleeps inside a
+	// container that keeps running; the simulated tier's command is the backend's
+	// own vocabulary for the same thing.
+	image, command := testImage, []string{"sleep", "300"}
+	if kind == config.ProviderSimulated {
+		image, command = "simulated", simulated.RunFor(simulatedRunsFor)
+	}
+
 	tiers := sc.tiers
 	if tiers == nil {
 		tiers = []config.Tier{{
@@ -556,7 +648,7 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 			VCPU:        2,
 			Memory:      2 * config.GiB,
 			Disk:        10 * config.GiB,
-			Image:       testImage,
+			Image:       image,
 			RunnerGroup: testGroup,
 			GuestOS:     config.GuestLinux,
 			Trust:       config.WorkloadTrusted,
@@ -568,7 +660,7 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 			// default (./run.sh) does not exist in nginx:alpine, and a container that
 			// exits at once fails every "is it still running" assertion here for a
 			// reason that has nothing to do with what is being tested.
-			Command: []string{"sleep", "300"},
+			Command: command,
 		}}
 	}
 	if sc.untrusted {
@@ -704,7 +796,8 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 	return &stack{
 		hurry: hurry,
 		dir:   dir, closeDB: closeDB, plane: p, alloc: a, db: db,
-		runner: runner, server: srv, provider: prov, node: host, tiers: tiers,
+		runner: runner, server: srv, provider: prov, kind: kind, backend: sc.backend,
+		node: host, tiers: tiers,
 		wire: wire, stopNode: stopNode, wireAddr: wireAddr,
 	}
 }

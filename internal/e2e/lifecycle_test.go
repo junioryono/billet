@@ -24,81 +24,85 @@ import (
 // acquiring jobs by the wrong id was invisible to every unit test because
 // billet's types agreed with billet's mistake.
 func TestAJobRunsAndIsCleanedUp(t *testing.T) {
-	s := newStack(t)
+	for _, b := range backends() {
+		t.Run(b.name, func(t *testing.T) {
+			s := newStack(t, b.opts...)
 
-	// Available first, then assigned, exactly as the real service sequences them:
-	// billet bids on what is AVAILABLE, and GitHub answers by ASSIGNING. Reversing
-	// them here would let billet acquire by the wrong id and still pass.
-	s.plane.queue(fakeactions.StatisticsJSON(1, 0),
-		fakeactions.JobJSON("JobAvailable", 4001, "push", testTier))
+			// Available first, then assigned, exactly as the real service sequences them:
+			// billet bids on what is AVAILABLE, and GitHub answers by ASSIGNING. Reversing
+			// them here would let billet acquire by the wrong id and still pass.
+			s.plane.queue(fakeactions.StatisticsJSON(1, 0),
+				fakeactions.JobJSON("JobAvailable", 4001, "push", testTier))
 
-	stop := s.run(t)
-	defer stop()
+			stop := s.run(t)
+			defer stop()
 
-	// Acquired by the id from the AVAILABLE message.
-	deadline := time.Now().Add(30 * time.Second)
+			// Acquired by the id from the AVAILABLE message.
+			deadline := time.Now().Add(30 * time.Second)
 
-	for len(s.plane.acquiredIDs()) == 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("billet never bid for the available job")
-		}
+			for len(s.plane.acquiredIDs()) == 0 {
+				if time.Now().After(deadline) {
+					t.Fatal("billet never bid for the available job")
+				}
 
-		time.Sleep(50 * time.Millisecond)
-	}
+				time.Sleep(50 * time.Millisecond)
+			}
 
-	if got := s.plane.acquiredIDs(); got[0] != 4001 {
-		t.Fatalf("acquired request %d, want the id from the JobAvailable message (4001)", got[0])
-	}
+			if got := s.plane.acquiredIDs(); got[0] != 4001 {
+				t.Fatalf("acquired request %d, want the id from the JobAvailable message (4001)", got[0])
+			}
 
-	// GitHub assigns it, and a container appears.
-	s.plane.queue(fakeactions.StatisticsJSON(0, 1),
-		fakeactions.JobJSON("JobAssigned", 4001, "push", testTier))
+			// GitHub assigns it, and a container appears.
+			s.plane.queue(fakeactions.StatisticsJSON(0, 1),
+				fakeactions.JobJSON("JobAssigned", 4001, "push", testTier))
 
-	names := s.awaitOneRunning(t)
+			names := s.awaitOneRunning(t)
 
-	// Named after the LEASE, which is what makes it reconcilable after a crash.
-	leaseID, ours := provider.LeaseOf(names[0])
-	if !ours {
-		t.Fatalf("container %q does not carry billet's name shape", names[0])
-	}
+			// Named after the LEASE, which is what makes it reconcilable after a crash.
+			leaseID, ours := provider.LeaseOf(names[0])
+			if !ours {
+				t.Fatalf("container %q does not carry billet's name shape", names[0])
+			}
 
-	if leaseID == "" {
-		t.Fatalf("container %q carries no lease id", names[0])
-	}
+			if leaseID == "" {
+				t.Fatalf("container %q carries no lease id", names[0])
+			}
 
-	// The job finishes, and the container goes with it.
-	s.plane.queue(fakeactions.StatisticsJSON(0, 0),
-		fakeactions.JobJSON("JobCompleted", 4001, "push", testTier))
+			// The job finishes, and the container goes with it.
+			s.plane.queue(fakeactions.StatisticsJSON(0, 0),
+				fakeactions.JobJSON("JobCompleted", 4001, "push", testTier))
 
-	// GONE, not merely stopped: a stopped container still holds its name, its
-	// disk and its anonymous volumes.
-	s.awaitGone(t)
+			// GONE, not merely stopped: a stopped container still holds its name, its
+			// disk and its anonymous volumes.
+			s.awaitGone(t)
 
-	// AND THE JOB'S OWN LEASE IS TERMINAL. A container that is gone while its
-	// lease still holds vCPU is the leak this subsystem exists to prevent.
-	//
-	// Asserted against THAT lease rather than against total usage, which never
-	// falls to zero while a listener is running: the listener escrows capacity
-	// BEFORE advertising it, so free escrow it is holding to offer GitHub looks
-	// identical to a leak in an aggregate. My first version asserted the
-	// aggregate and failed against correct behaviour.
-	deadline = time.Now().Add(30 * time.Second)
+			// AND THE JOB'S OWN LEASE IS TERMINAL. A container that is gone while its
+			// lease still holds vCPU is the leak this subsystem exists to prevent.
+			//
+			// Asserted against THAT lease rather than against total usage, which never
+			// falls to zero while a listener is running: the listener escrows capacity
+			// BEFORE advertising it, so free escrow it is holding to offer GitHub looks
+			// identical to a leak in an aggregate. My first version asserted the
+			// aggregate and failed against correct behaviour.
+			deadline = time.Now().Add(30 * time.Second)
 
-	for {
-		_, err := s.alloc.Lease(t.Context(), leaseID)
-		if errors.Is(err, alloc.ErrLeaseNotFound) {
-			break
-		}
+			for {
+				_, err := s.alloc.Lease(t.Context(), leaseID)
+				if errors.Is(err, alloc.ErrLeaseNotFound) {
+					break
+				}
 
-		if err != nil {
-			t.Fatalf("read the job's lease: %v", err)
-		}
+				if err != nil {
+					t.Fatalf("read the job's lease: %v", err)
+				}
 
-		if time.Now().After(deadline) {
-			t.Fatalf("lease %s still holds capacity after its container was destroyed", leaseID)
-		}
+				if time.Now().After(deadline) {
+					t.Fatalf("lease %s still holds capacity after its container was destroyed", leaseID)
+				}
 
-		time.Sleep(100 * time.Millisecond)
+				time.Sleep(100 * time.Millisecond)
+			}
+		})
 	}
 }
 
@@ -110,45 +114,51 @@ func TestAJobRunsAndIsCleanedUp(t *testing.T) {
 // to consume it is an orphan on GitHub that billet will never clean up — one per
 // pull request, accumulating quietly.
 func TestAPullRequestIsRefusedBeforeAnythingIsMinted(t *testing.T) {
-	s := newStack(t, untrustedPool)
+	for _, b := range backends() {
+		t.Run(b.name, func(t *testing.T) {
+			s := newStack(t, append(b.opts, untrustedPool)...)
 
-	s.plane.queue(fakeactions.StatisticsJSON(1, 0),
-		fakeactions.JobJSON("JobAvailable", 4002, "pull_request", testTier))
+			s.plane.queue(fakeactions.StatisticsJSON(1, 0),
+				fakeactions.JobJSON("JobAvailable", 4002, "pull_request", testTier))
 
-	stop := s.run(t)
-	defer stop()
+			stop := s.run(t)
+			defer stop()
 
-	deadline := time.Now().Add(30 * time.Second)
+			deadline := time.Now().Add(30 * time.Second)
 
-	for len(s.plane.acquiredIDs()) == 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("billet never bid for the available job")
-		}
+			for len(s.plane.acquiredIDs()) == 0 {
+				if time.Now().After(deadline) {
+					t.Fatal("billet never bid for the available job")
+				}
 
-		time.Sleep(50 * time.Millisecond)
-	}
+				time.Sleep(50 * time.Millisecond)
+			}
 
-	s.plane.queue(fakeactions.StatisticsJSON(0, 1),
-		fakeactions.JobJSON("JobAssigned", 4002, "pull_request", testTier))
+			s.plane.queue(fakeactions.StatisticsJSON(0, 1),
+				fakeactions.JobJSON("JobAssigned", 4002, "pull_request", testTier))
 
-	// Give it long enough that a container would have appeared if it were going
-	// to. There is no positive signal for "nothing happened", so this is a wait
-	// rather than a poll.
-	time.Sleep(3 * time.Second)
+			// THE ASSIGNMENT WAS HANDLED, proved by its acknowledgement: the listener acks
+			// a message only after acting on it, and the fake keeps an unacknowledged
+			// head in place. Asserting "nothing happened" after a sleep would pass while
+			// the assignment sat undelivered behind an unacknowledged offer. Message 2
+			// is the JobAssigned.
+			awaitAck(t, s, 2)
 
-	instances, err := s.provider.List(t.Context())
-	if err != nil {
-		t.Fatalf("List: %v", err)
-	}
+			instances, err := s.provider.List(t.Context())
+			if err != nil {
+				t.Fatalf("List: %v", err)
+			}
 
-	if len(instances) != 0 {
-		t.Fatalf("ran pull-request code in a container: %v", instances)
-	}
+			if len(instances) != 0 {
+				t.Fatalf("ran pull-request code in a container: %v", instances)
+			}
 
-	// AND NOTHING WAS MINTED. This is the half a provider-level test cannot see.
-	if calls := s.plane.Calls("generatejitconfig"); len(calls) != 0 {
-		t.Errorf("minted %d runner registration(s) for a job that was refused; "+
-			"each one is an orphan on GitHub", len(calls))
+			// AND NOTHING WAS MINTED. This is the half a provider-level test cannot see.
+			if calls := s.plane.Calls("generatejitconfig"); len(calls) != 0 {
+				t.Errorf("minted %d runner registration(s) for a job that was refused; "+
+					"each one is an orphan on GitHub", len(calls))
+			}
+		})
 	}
 }
 
@@ -165,45 +175,55 @@ func TestAPullRequestIsRefusedBeforeAnythingIsMinted(t *testing.T) {
 // escrow it is holding to offer GitHub is indistinguishable from a leak in an
 // aggregate. Draining the budget is what tells the two apart.
 func TestRefusedWorkReturnsItsCapacity(t *testing.T) {
-	s := newStack(t, untrustedPool)
+	for _, b := range backends() {
+		t.Run(b.name, func(t *testing.T) {
+			s := newStack(t, append(b.opts, untrustedPool)...)
 
-	stop := s.run(t)
-	defer stop()
+			stop := s.run(t)
+			defer stop()
 
-	// The budget is 8 vCPU and the tier costs 2, so four leases exhaust it.
-	// Six refusals is comfortably more than that.
-	const refusals = 6
+			// The budget is 8 vCPU and the tier costs 2, so four leases exhaust it.
+			// Six refusals is comfortably more than that.
+			const refusals = 6
 
-	for i := range refusals {
-		id := int64(4100 + i)
+			for i := range refusals {
+				id := int64(4100 + i)
 
-		s.plane.queue(fakeactions.StatisticsJSON(1, 0),
-			fakeactions.JobJSON("JobAvailable", id, "pull_request", testTier))
+				s.plane.queue(fakeactions.StatisticsJSON(1, 0),
+					fakeactions.JobJSON("JobAvailable", id, "pull_request", testTier))
 
-		deadline := time.Now().Add(30 * time.Second)
+				deadline := time.Now().Add(30 * time.Second)
 
-		for !slices.Contains(s.plane.acquiredIDs(), id) {
-			if time.Now().After(deadline) {
-				t.Fatalf("billet stopped bidding after %d refusals; refused work is "+
-					"consuming capacity permanently", i)
+				for !slices.Contains(s.plane.acquiredIDs(), id) {
+					if time.Now().After(deadline) {
+						t.Fatalf("billet stopped bidding after %d refusals; refused work is "+
+							"consuming capacity permanently", i)
+					}
+
+					time.Sleep(50 * time.Millisecond)
+				}
+
+				s.plane.queue(fakeactions.StatisticsJSON(0, 1),
+					fakeactions.JobJSON("JobAssigned", id, "pull_request", testTier))
 			}
 
-			time.Sleep(50 * time.Millisecond)
-		}
+			// THE LAST ASSIGNMENT WAS HANDLED TOO. Acquiring each next job proves the
+			// refusals before it returned their capacity, but nothing follows the sixth,
+			// so its acknowledgement is what proves it was refused rather than left
+			// sitting. Six offer-and-assign pairs make it message 12.
+			awaitAck(t, s, 2*refusals)
 
-		s.plane.queue(fakeactions.StatisticsJSON(0, 1),
-			fakeactions.JobJSON("JobAssigned", id, "pull_request", testTier))
-	}
+			// And nothing ran, which is the other half: bidding freely would be no
+			// comfort if the refusal had stopped working.
+			instances, err := s.provider.List(t.Context())
+			if err != nil {
+				t.Fatalf("List: %v", err)
+			}
 
-	// And nothing ran, which is the other half: bidding freely would be no
-	// comfort if the refusal had stopped working.
-	instances, err := s.provider.List(t.Context())
-	if err != nil {
-		t.Fatalf("List: %v", err)
-	}
-
-	if len(instances) != 0 {
-		t.Fatalf("ran pull-request code in a container: %v", instances)
+			if len(instances) != 0 {
+				t.Fatalf("ran pull-request code in a container: %v", instances)
+			}
+		})
 	}
 }
 
@@ -220,38 +240,42 @@ func TestRefusedWorkReturnsItsCapacity(t *testing.T) {
 // acquisition. A JobAvailable message cannot be acked before billet has bid for
 // the job it describes.
 func TestAMessageIsAcknowledgedOnlyAfterItsWorkIsDone(t *testing.T) {
-	s := newStack(t)
+	for _, b := range backends() {
+		t.Run(b.name, func(t *testing.T) {
+			s := newStack(t, b.opts...)
 
-	s.plane.queue(fakeactions.StatisticsJSON(1, 0),
-		fakeactions.JobJSON("JobAvailable", 4004, "push", testTier))
+			s.plane.queue(fakeactions.StatisticsJSON(1, 0),
+				fakeactions.JobJSON("JobAvailable", 4004, "push", testTier))
 
-	stop := s.run(t)
-	defer stop()
+			stop := s.run(t)
+			defer stop()
 
-	deadline := time.Now().Add(30 * time.Second)
+			deadline := time.Now().Add(30 * time.Second)
 
-	for {
-		acked := s.plane.ackedIDs()
+			for {
+				acked := s.plane.ackedIDs()
 
-		if len(acked) > 0 {
-			// The acknowledgement has happened. The bid must already have.
-			if len(s.plane.acquiredIDs()) == 0 {
-				t.Fatal("message 1 was acknowledged before billet bid for the job in it; " +
-					"the cursor has advanced past work that never happened")
+				if len(acked) > 0 {
+					// The acknowledgement has happened. The bid must already have.
+					if len(s.plane.acquiredIDs()) == 0 {
+						t.Fatal("message 1 was acknowledged before billet bid for the job in it; " +
+							"the cursor has advanced past work that never happened")
+					}
+
+					if acked[0] != 1 {
+						t.Fatalf("acknowledged message %d first, want 1", acked[0])
+					}
+
+					break
+				}
+
+				if time.Now().After(deadline) {
+					t.Fatal("billet never acknowledged the message; it would be redelivered forever")
+				}
+
+				time.Sleep(20 * time.Millisecond)
 			}
-
-			if acked[0] != 1 {
-				t.Fatalf("acknowledged message %d first, want 1", acked[0])
-			}
-
-			break
-		}
-
-		if time.Now().After(deadline) {
-			t.Fatal("billet never acknowledged the message; it would be redelivered forever")
-		}
-
-		time.Sleep(20 * time.Millisecond)
+		})
 	}
 }
 
@@ -262,53 +286,59 @@ func TestAMessageIsAcknowledgedOnlyAfterItsWorkIsDone(t *testing.T) {
 // keeps the head of the queue until its exact id is deleted, so a billet that
 // forgot to acknowledge would loop here forever rather than passing.
 func TestTheSameJobIsNotStartedTwiceWhenAMessageIsRedelivered(t *testing.T) {
-	s := newStack(t)
+	for _, b := range backends() {
+		t.Run(b.name, func(t *testing.T) {
+			s := newStack(t, b.opts...)
 
-	s.plane.queue(fakeactions.StatisticsJSON(1, 0),
-		fakeactions.JobJSON("JobAvailable", 4005, "push", testTier))
+			s.plane.queue(fakeactions.StatisticsJSON(1, 0),
+				fakeactions.JobJSON("JobAvailable", 4005, "push", testTier))
 
-	stop := s.run(t)
-	defer stop()
+			stop := s.run(t)
+			defer stop()
 
-	deadline := time.Now().Add(30 * time.Second)
+			deadline := time.Now().Add(30 * time.Second)
 
-	for len(s.plane.acquiredIDs()) == 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("billet never bid for the available job")
-		}
+			for len(s.plane.acquiredIDs()) == 0 {
+				if time.Now().After(deadline) {
+					t.Fatal("billet never bid for the available job")
+				}
 
-		time.Sleep(20 * time.Millisecond)
-	}
+				time.Sleep(20 * time.Millisecond)
+			}
 
-	s.plane.queue(fakeactions.StatisticsJSON(0, 1),
-		fakeactions.JobJSON("JobAssigned", 4005, "push", testTier))
+			s.plane.queue(fakeactions.StatisticsJSON(0, 1),
+				fakeactions.JobJSON("JobAssigned", 4005, "push", testTier))
 
-	s.awaitOneRunning(t)
+			s.awaitOneRunning(t)
 
-	// Deliver the SAME assignment again, as the service does when an
-	// acknowledgement is lost.
-	s.plane.queue(fakeactions.StatisticsJSON(0, 1),
-		fakeactions.JobJSON("JobAssigned", 4005, "push", testTier))
+			// Deliver the SAME assignment again, as the service does when an
+			// acknowledgement is lost.
+			s.plane.queue(fakeactions.StatisticsJSON(0, 1),
+				fakeactions.JobJSON("JobAssigned", 4005, "push", testTier))
 
-	// Long enough for a second container to have appeared if billet were going to
-	// start one. There is no positive signal for "nothing happened".
-	time.Sleep(3 * time.Second)
+			// THE DUPLICATE WAS CONSUMED, proved by its acknowledgement rather than by a
+			// sleep: a listener that ignored the redelivery, or left it redelivering
+			// forever, would show one running container either way. Message 3 is the
+			// second JobAssigned.
+			awaitAck(t, s, 3)
 
-	instances, err := s.provider.List(t.Context())
-	if err != nil {
-		t.Fatalf("List: %v", err)
-	}
+			instances, err := s.provider.List(t.Context())
+			if err != nil {
+				t.Fatalf("List: %v", err)
+			}
 
-	var running int
+			var running int
 
-	for _, inst := range instances {
-		if inst.Running {
-			running++
-		}
-	}
+			for _, inst := range instances {
+				if inst.Running {
+					running++
+				}
+			}
 
-	if running != 1 {
-		t.Fatalf("a redelivered assignment started %d containers for one job: %v", running, instances)
+			if running != 1 {
+				t.Fatalf("a redelivered assignment started %d containers for one job: %v", running, instances)
+			}
+		})
 	}
 }
 
@@ -317,71 +347,75 @@ func TestTheSameJobIsNotStartedTwiceWhenAMessageIsRedelivered(t *testing.T) {
 // Asserted against the request BODY rather than the returned struct, because the
 // struct is billet's own type and would agree with billet's own mistake.
 func TestTheScaleSetCarriesTheTierLabel(t *testing.T) {
-	s := newStack(t)
+	for _, b := range backends() {
+		t.Run(b.name, func(t *testing.T) {
+			s := newStack(t, b.opts...)
 
-	stop := s.run(t)
-	defer stop()
+			stop := s.run(t)
+			defer stop()
 
-	deadline := time.Now().Add(30 * time.Second)
+			deadline := time.Now().Add(30 * time.Second)
 
-	var created []fakeactions.Request
+			var created []fakeactions.Request
 
-	for {
-		created = createCalls(s.plane)
-		if len(created) > 0 {
-			break
-		}
+			for {
+				created = createCalls(s.plane)
+				if len(created) > 0 {
+					break
+				}
 
-		// Rechecked rather than trusted: the snapshot above can miss a create
-		// that lands while this branch is being taken, and failing then would be
-		// the same false failure in a narrower window.
-		if time.Now().After(deadline) {
-			if created = createCalls(s.plane); len(created) > 0 {
-				break
+				// Rechecked rather than trusted: the snapshot above can miss a create
+				// that lands while this branch is being taken, and failing then would be
+				// the same false failure in a narrower window.
+				if time.Now().After(deadline) {
+					if created = createCalls(s.plane); len(created) > 0 {
+						break
+					}
+
+					t.Fatalf("billet never created a scale set; it made %d other scale-set calls",
+						len(s.plane.Calls("runnerscalesets")))
+				}
+
+				time.Sleep(50 * time.Millisecond)
 			}
 
-			t.Fatalf("billet never created a scale set; it made %d other scale-set calls",
-				len(s.plane.Calls("runnerscalesets")))
-		}
+			// DECODED, not searched. The tier label is also the scale set's NAME, so a
+			// substring match over the body passed whether or not billet sent any labels
+			// at all — which is the one thing this test is named for. `runs-on` routes on
+			// the label, so that is what has to be asserted.
+			//
+			// WHAT THIS STILL CANNOT SEE, because the vendor library hides it: sending
+			// NO labels is indistinguishable from sending the right one. scaleset's
+			// ensureLabels substitutes a single label derived from the NAME when the
+			// caller supplies none, so `Labels: nil` reaches the wire as this exact
+			// label. A WRONG label passes through untouched and is caught here. Verified
+			// by mutating both.
+			for _, c := range created {
+				var sent struct {
+					Labels []struct {
+						Name string `json:"name"`
+					} `json:"labels"`
+				}
 
-		time.Sleep(50 * time.Millisecond)
-	}
+				if err := json.Unmarshal([]byte(c.Body), &sent); err != nil {
+					t.Errorf("the create body is not valid json (%v): %s", err, c.Body)
 
-	// DECODED, not searched. The tier label is also the scale set's NAME, so a
-	// substring match over the body passed whether or not billet sent any labels
-	// at all — which is the one thing this test is named for. `runs-on` routes on
-	// the label, so that is what has to be asserted.
-	//
-	// WHAT THIS STILL CANNOT SEE, because the vendor library hides it: sending
-	// NO labels is indistinguishable from sending the right one. scaleset's
-	// ensureLabels substitutes a single label derived from the NAME when the
-	// caller supplies none, so `Labels: nil` reaches the wire as this exact
-	// label. A WRONG label passes through untouched and is caught here. Verified
-	// by mutating both.
-	for _, c := range created {
-		var sent struct {
-			Labels []struct {
-				Name string `json:"name"`
-			} `json:"labels"`
-		}
+					continue
+				}
 
-		if err := json.Unmarshal([]byte(c.Body), &sent); err != nil {
-			t.Errorf("the create body is not valid json (%v): %s", err, c.Body)
+				labelled := false
 
-			continue
-		}
+				for _, l := range sent.Labels {
+					if l.Name == testTier {
+						labelled = true
+					}
+				}
 
-		labelled := false
-
-		for _, l := range sent.Labels {
-			if l.Name == testTier {
-				labelled = true
+				if !labelled {
+					t.Errorf("created a scale set that does not carry %q as a label: %s", testTier, c.Body)
+				}
 			}
-		}
-
-		if !labelled {
-			t.Errorf("created a scale set that does not carry %q as a label: %s", testTier, c.Body)
-		}
+		})
 	}
 }
 
