@@ -171,9 +171,9 @@ func printPreserved(cfg *config.Config, cfgPath string) {
 	fmt.Println("Left alone, because this is what makes it THIS deployment rather than a new one:")
 	fmt.Printf("         config    %s\n", cfgPath)
 
-	if cfg.GitHub != nil && cfg.GitHub.PrivateKeyPath != "" {
+	for _, keyPath := range appKeyFilePaths(cfg) {
 		fmt.Printf("         app key   %s  (GitHub issues this ONCE and will not reissue it)\n",
-			cfg.GitHub.PrivateKeyPath)
+			keyPath)
 	}
 
 	if cfg.Server != nil && cfg.Server.IdentityDir != "" {

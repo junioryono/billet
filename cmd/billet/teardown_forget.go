@@ -21,7 +21,7 @@ import (
 // directory, which cannot hold a record. Every other failure is returned: a
 // ledger that will not open is a row left behind, and the caller says so rather
 // than printing Done over it.
-func forgetScaleSet(ctx context.Context, cfg *config.Config, org, group, label string) error {
+func forgetScaleSet(ctx context.Context, cfg *config.Config, target, group, label string) error {
 	if cfg == nil || cfg.Server == nil || cfg.Server.IdentityDir == "" {
 		return nil
 	}
@@ -32,5 +32,5 @@ func forgetScaleSet(ctx context.Context, cfg *config.Config, org, group, label s
 	}
 	defer func() { _ = db.Close() }()
 
-	return db.ForgetScaleSet(ctx, org, group, label)
+	return db.ForgetScaleSet(ctx, target, group, label)
 }

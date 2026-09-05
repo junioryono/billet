@@ -60,8 +60,8 @@ func TestABackupOfAnExternalLedgerCarriesEverythingElse(t *testing.T) {
 		t.Fatal("the manifest does not record the ledger as external")
 	}
 
-	if m.Schema != 2 {
-		t.Errorf("an external archive is schema 2, got %d", m.Schema)
+	if m.Schema != Schema {
+		t.Errorf("an external archive is schema %d, got %d", Schema, m.Schema)
 	}
 
 	if m.Ledger.Backend != "postgres" || m.Ledger.DSNEnv != "BILLET_STATE_DSN" {

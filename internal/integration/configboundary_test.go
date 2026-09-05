@@ -257,7 +257,8 @@ func TestTheConfiguredOrgIsTheOneGitHubIsAskedAbout(t *testing.T) {
 	}
 
 	if _, err := github.VerifyAppAt(t.Context(), srv.Client(), srv.URL,
-		cfg.GitHub.AppID, boundaryAppKey(), cfg.GitHub.Org, cfg.GitHub.InstallationID); err != nil {
+		cfg.GitHub.AppID, boundaryAppKey(), github.OrganizationTarget(cfg.GitHub.Org),
+		cfg.GitHub.InstallationID); err != nil {
 		t.Fatalf("VerifyAppAt: %v", err)
 	}
 
@@ -295,5 +296,47 @@ func TestAnOrgThatWouldNameSomethingElseIsRefusedBeforeItIsUsed(t *testing.T) {
 				t.Fatalf("Load accepted github.org %s", org)
 			}
 		})
+	}
+}
+
+// AND A REPOSITORY TARGET IS ASKED ABOUT AT THE REPOSITORY ENDPOINT, escaped
+// segment by segment — the scope config accepted is the scope the REST
+// boundary uses, which is the whole of what a repository-scoped `github:`
+// block has to mean.
+func TestTheConfiguredRepositoryIsTheOneGitHubIsAskedAbout(t *testing.T) {
+	t.Parallel()
+
+	var got string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.URL.EscapedPath()
+		if _, err := w.Write([]byte(`{"id": 67890, "account": {"login": "owner-27", "type": "User"},
+			"permissions": {"metadata": "read", "administration": "write"}}`)); err != nil {
+			t.Errorf("write the fake installation response: %v", err)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	body := strings.Replace(boundaryConfig("home", "home", "office"),
+		"  org: acme-boundary-27\n", "  repository: \"owner-27/wid gets\"\n", 1)
+
+	cfg, err := config.Load(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	target := cfg.GitHubTargets()[0]
+	if !target.IsRepository() || target.Path() != "owner-27/wid gets" {
+		t.Fatalf("the loaded target is %+v, not the repository the file declares", target)
+	}
+
+	if _, err := github.VerifyAppAt(t.Context(), srv.Client(), srv.URL,
+		cfg.GitHub.AppID, boundaryAppKey(), github.RepositoryTarget(target.Owner(), target.RepositoryName()),
+		cfg.GitHub.InstallationID); err != nil {
+		t.Fatalf("VerifyAppAt: %v", err)
+	}
+
+	if got != "/repos/owner-27/wid%20gets/installation" {
+		t.Errorf("GitHub was asked %q, but the config names a repository", got)
 	}
 }

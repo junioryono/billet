@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/junioryono/billet/internal/fakeactions"
+	billetgithub "github.com/junioryono/billet/internal/github"
 )
 
 // fakeActions is the shared fake service, wrapped so these tests can keep
@@ -36,7 +37,8 @@ func (f *fakeActions) config(t *testing.T) Config {
 	t.Helper()
 
 	return Config{
-		ConfigURL:      f.URL + "/acme",
+		Target:         billetgithub.OrganizationTarget("acme"),
+		GitHubURL:      f.URL,
 		ClientID:       "12345",
 		InstallationID: 67890,
 		PrivateKey:     f.PrivateKeyPEM(),

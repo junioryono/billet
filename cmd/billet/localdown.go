@@ -98,9 +98,7 @@ func runLocalDown(ctx context.Context, o downOptions) error {
 		WantServer: cfg.Server != nil,
 		WantNode:   cfg.Node != nil,
 	}
-	if cfg.GitHub != nil {
-		req.KeyPath = cfg.GitHub.PrivateKeyPath
-	}
+	req.KeyPaths = appKeyFilePaths(cfg)
 
 	if !req.WantServer && !req.WantNode {
 		return fmt.Errorf("%s declares neither a server nor a node, so there is nothing on "+

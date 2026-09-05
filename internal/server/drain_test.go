@@ -139,7 +139,7 @@ func TestTheConfiguredDrainTimeoutReachesEveryListener(t *testing.T) {
 
 			s := New(nil, nil, nil, "owner", nil, opts...)
 
-			l := NewListener(nil, "tier", nil, s.listenerOpts()...)
+			l := NewListener(nil, "tier", nil, s.listenerOpts(s.prov)...)
 			if l.drainGrace != tc.want {
 				t.Errorf("listener drain grace = %s, want %s", l.drainGrace, tc.want)
 			}
@@ -165,7 +165,7 @@ func TestAnExplicitlyBadDrainTimeoutIsRefusedRatherThanDefaulted(t *testing.T) {
 	for _, d := range []time.Duration{0, -time.Second} {
 		s := New(nil, nil, nil, "owner", nil, WithDrainTimeout(d))
 
-		l := NewListener(nil, "tier", nil, s.listenerOpts()...)
+		l := NewListener(nil, "tier", nil, s.listenerOpts(s.prov)...)
 		if err := l.configError(); err == nil {
 			t.Errorf("WithDrainTimeout(%s) was silently replaced by the default %s", d, l.drainGrace)
 		}

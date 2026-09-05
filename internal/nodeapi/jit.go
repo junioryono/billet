@@ -35,7 +35,12 @@ type DescribeResponse struct {
 
 // TrustedRunnerGroupRequest asks the control plane to revalidate the policy a
 // trusted pool relies on before the node asks it to mint a registration.
+//
+// Tier names the tier the pool is, from VersionTargetedRunnerGroup: a control
+// plane serving several GitHub targets validates a runner group with the
+// credential of the target that tier belongs to. Omitted by older nodes.
 type TrustedRunnerGroupRequest struct {
+	Tier      string   `json:"tier,omitempty"`
 	Group     string   `json:"group"`
 	Workflows []string `json:"workflows"`
 }

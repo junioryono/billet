@@ -285,9 +285,11 @@ func (j *cloudJIT) JITConfig(
 	return cloudRegistration{name: runnerName}, nil
 }
 
-func (*cloudJIT) ValidateTrustedRunnerGroup(context.Context, string, []string) error { return nil }
-func (*cloudJIT) RemoveRunner(context.Context, string, int64, string) error          { return nil }
-func (*cloudJIT) EnsureRunnerRemoved(context.Context, string) error                  { return nil }
+func (*cloudJIT) ValidateTrustedRunnerGroup(context.Context, string, string, []string) error {
+	return nil
+}
+func (*cloudJIT) RemoveRunner(context.Context, string, int64, string) error { return nil }
+func (*cloudJIT) EnsureRunnerRemoved(context.Context, string) error         { return nil }
 func (*cloudJIT) RecoverRunner(context.Context, string, string, int64, string) (node.RunnerRecovery, error) {
 	return node.RunnerRecoveryTracked, nil
 }

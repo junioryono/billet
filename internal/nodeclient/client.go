@@ -750,10 +750,10 @@ func (c *Client) Describe(ctx context.Context, name, group string) (*node.Set, [
 // registration. The control plane repeats the check against the entitled tier
 // while minting, so a compromised node cannot substitute this request.
 func (c *Client) ValidateTrustedRunnerGroup(
-	ctx context.Context, group string, workflows []string,
+	ctx context.Context, tier, group string, workflows []string,
 ) error {
 	return c.do(ctx, http.MethodPost, c.nodePath("/trusted-runner-group"),
-		nodeapi.TrustedRunnerGroupRequest{Group: group, Workflows: workflows}, nil)
+		nodeapi.TrustedRunnerGroupRequest{Tier: tier, Group: group, Workflows: workflows}, nil)
 }
 
 // JITConfig asks the control plane to mint one runner registration.

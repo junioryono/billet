@@ -71,10 +71,14 @@ type NodeWireRequest struct {
 	Loopback bool
 
 	// The collaborators the routes need.
-	Log         *slog.Logger
-	Plane       *nodeplane.Plane
-	Leases      nodeplane.LeaseStore
+	Log    *slog.Logger
+	Plane  *nodeplane.Plane
+	Leases nodeplane.LeaseStore
+	// JIT serves every tier when TargetJIT is empty; TargetJIT is one source per
+	// GitHub target, keyed by the target's config name, which is what
+	// BuildTargets hands back.
 	JIT         nodeplane.JITSource
+	TargetJIT   map[string]nodeplane.JITSource
 	Revocations nodeplane.Revocations
 	Enrollments nodeplane.Enrollments
 	CachePolicy nodeplane.CachePolicy
@@ -171,6 +175,22 @@ func BuildNodeWire(req NodeWireRequest) (NodeWire, error) {
 		wire.Rotating = authority.Rotating
 		wire.RotationAge = authority.RotationAge
 		wire.IssuingExpiry = authority.Issuing.NotAfter()
+	}
+
+	if len(req.TargetJIT) > 0 {
+		opts = append(opts, nodeplane.WithTargetJIT(req.TargetJIT))
+	}
+
+	if len(req.TargetJIT) > 0 {
+		opts = append(opts, nodeplane.WithTargetJIT(req.TargetJIT))
+	}
+
+	if len(req.TargetJIT) > 0 {
+		opts = append(opts, nodeplane.WithTargetJIT(req.TargetJIT))
+	}
+
+	if len(req.TargetJIT) > 0 {
+		opts = append(opts, nodeplane.WithTargetJIT(req.TargetJIT))
 	}
 
 	wire.Handler = nodeplane.Handler(req.Log, req.Plane, req.Leases, req.JIT, opts...)

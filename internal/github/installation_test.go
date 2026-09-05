@@ -62,7 +62,7 @@ func TestPermissionMismatches(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			inst := &Installation{Permissions: tt.granted}
 
-			got := inst.PermissionMismatches()
+			got := inst.PermissionMismatches(ScopeOrganization)
 			if len(got) != len(tt.want) {
 				t.Fatalf("PermissionMismatches() = %v, want %v", got, tt.want)
 			}
@@ -83,10 +83,10 @@ func TestPermissionMismatchesAreStable(t *testing.T) {
 		"contents": "read", "actions": "read", "issues": "write",
 	}}
 
-	first := inst.PermissionMismatches()
+	first := inst.PermissionMismatches(ScopeOrganization)
 
 	for range 20 {
-		next := inst.PermissionMismatches()
+		next := inst.PermissionMismatches(ScopeOrganization)
 		if len(next) != len(first) {
 			t.Fatalf("unstable length: %v vs %v", next, first)
 		}

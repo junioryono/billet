@@ -24,21 +24,21 @@ const HybridRunbookFile = "RUNBOOK.md"
 // hybridInputs are the parsed flags that DESCRIBE the deployment, kept so the
 // runbook can print the exact command that renders the next phase.
 type hybridInputs struct {
-	name, region, org, runnerGroup string
-	workflows                      []string
-	controlPlaneIP                 string
-	controllerName, localName      string
-	localVCPU, cloudVCPU           int
-	localMemory, cloudMemory       string
-	instanceTypes, priceOverrides  []string
-	sshIngress                     []string
-	keyName, localUser, localImage string
-	builder, cache                 bool
-	localSite, cloudSite           string
-	kernelImage, cephUser, cephKey string
-	cacheListen, cacheGuest        string
-	cfgPath                        string
-	out                            string
+	name, region, org, repository, runnerGroup string
+	workflows                                  []string
+	controlPlaneIP                             string
+	controllerName, localName                  string
+	localVCPU, cloudVCPU                       int
+	localMemory, cloudMemory                   string
+	instanceTypes, priceOverrides              []string
+	sshIngress                                 []string
+	keyName, localUser, localImage             string
+	builder, cache                             bool
+	localSite, cloudSite                       string
+	kernelImage, cephUser, cephKey             string
+	cacheListen, cacheGuest                    string
+	cfgPath                                    string
+	out                                        string
 }
 
 // cmdInitHybrid writes the hybrid shape -- a Terraform root, an inventory with
@@ -62,7 +62,8 @@ func cmdInitHybrid(ctx context.Context, args []string) error {
 	out := fs.String("out", "", "the directory to write the generation into (required)")
 	name := fs.String("name", "billet", "the Terraform module's name prefix for every AWS resource")
 	region := fs.String("region", "", "the AWS region for the controller and the fallback compute (required)")
-	org := fs.String("org", "", "the GitHub organization these runners serve")
+	org := fs.String("org", "", "the GitHub organization these runners serve (exactly one of --org and --repository)")
+	repository := fs.String("repository", "", "the GitHub repository these runners serve, as owner/name")
 	group := fs.String("runner-group", "",
 		"the GitHub runner group a trusted tier belongs to (omit both policy flags for untrusted tiers)")
 	var workflows repeatedString
@@ -239,6 +240,7 @@ func cmdInitHybrid(ctx context.Context, args []string) error {
 		Name:             *name,
 		Region:           *region,
 		Org:              *org,
+		Repository:       *repository,
 		RunnerGroup:      *group,
 		Workflows:        workflows,
 		ControlPlaneIP:   *controlPlaneIP,
@@ -278,16 +280,16 @@ func cmdInitHybrid(ctx context.Context, args []string) error {
 		gb, _, ok := existingGitHubBlock(raw)
 		switch {
 		case ok && !gb.usable():
-			fmt.Fprintf(os.Stdout, "NOTE: the App identity at %s is not complete (org %q, installation %d), "+
+			fmt.Fprintf(os.Stdout, "NOTE: the App identity at %s is not complete (target %q, installation %d), "+
 				"so it was NOT carried; re-run `billet github-app create` to record it together.\n\n",
-				*cfgPath, gb.Org, gb.InstallationID)
-		case ok && *org != "" && gb.Org != *org:
+				*cfgPath, gb.scopePath(), gb.InstallationID)
+		case ok && p.TargetPath() != "" && gb.scopePath() != p.TargetPath():
 			fmt.Fprintf(os.Stdout, "NOTE: the App at %s belongs to %q, but this run is for %q; the identity "+
-				"was NOT carried.\n\n", *cfgPath, gb.Org, *org)
+				"was NOT carried.\n\n", *cfgPath, gb.scopePath(), p.TargetPath())
 		case ok:
 			p.AppID, p.InstallationID, p.ClientID = gb.AppID, gb.InstallationID, gb.ClientID
-			if p.Org == "" {
-				p.Org = gb.Org
+			if p.TargetPath() == "" {
+				p.Org, p.Repository = gb.Org, gb.Repository
 			}
 			carried = true
 		}
@@ -301,7 +303,7 @@ func cmdInitHybrid(ctx context.Context, args []string) error {
 	}
 
 	in := hybridInputs{
-		name: *name, region: *region, org: p.Org, runnerGroup: *group, workflows: workflows,
+		name: *name, region: *region, org: p.Org, repository: p.Repository, runnerGroup: *group, workflows: workflows,
 		controlPlaneIP: *controlPlaneIP, controllerName: *controllerName, localName: *localName,
 		localVCPU: *localVCPU, cloudVCPU: *maxVCPU, localMemory: *localMemory, cloudMemory: *maxMemory,
 		instanceTypes: instanceTypes, priceOverrides: priceOverrides, sshIngress: sshIngress,
@@ -540,6 +542,7 @@ func hybridFlags(in hybridInputs) []string {
 	add("name", in.name)
 	add("region", in.region)
 	add("org", in.org)
+	add("repository", in.repository)
 	add("runner-group", in.runnerGroup)
 	addEach("workflow", in.workflows)
 	add("config", in.cfgPath)
@@ -631,10 +634,7 @@ func renderHybridRunbook(in hybridInputs, p initconfig.HybridParams, trusted, ca
 		wire = "the control_plane_private_ip output, port 7717"
 	}
 
-	orgFlag := shellArg("<your-org>")
-	if p.Org != "" {
-		orgFlag = shellArg(p.Org)
-	}
+	orgFlag := scopeFlag(p.Org, p.Repository)
 
 	trust := "`trust: untrusted`: a fork's pull request runs in a Firecracker guest on the untrusted bridge at home, or on its own EC2 instance in the untrusted security group. Add a trusted tier only with a runner group and workflow allowlist."
 	if trusted {

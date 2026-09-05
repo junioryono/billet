@@ -13,10 +13,10 @@ import (
 	"time"
 )
 
-// ErrNotInstalled means the app exists but is not installed on the organization.
+// ErrNotInstalled means the app exists but is not installed on the target.
 // Distinct from any other failure because the remedy is a browser visit, not a
 // retry or a credential fix.
-var ErrNotInstalled = errors.New("github: app is not installed on the organization")
+var ErrNotInstalled = errors.New("github: app is not installed on the target")
 
 // errInstallationRead marks a response that died mid-read, and
 // errInstallationShape marks a 200 whose body is not a GitHub installation —
@@ -45,26 +45,28 @@ type Installation struct {
 	SuspendedAt *time.Time `json:"suspended_at"`
 }
 
-// GetOrgInstallation resolves the installation id for an organization,
-// authenticating as the app itself.
+// GetInstallation resolves the installation id for a target, authenticating as
+// the app itself: /orgs/{org}/installation for an organization, or
+// /repos/{owner}/{repo}/installation for a repository, whose installation is
+// on the repository's owner whichever kind of account that is.
 //
 // This is the fallback for when the post-install redirect does not arrive — an
 // operator who closes the tab, or an install completed on a different machine.
 // Without it, onboarding would dead-end on a value the operator has no
 // straightforward way to look up.
-func GetOrgInstallation(ctx context.Context, client *http.Client, appID int64, privateKeyPEM []byte, org string) (*Installation, error) {
-	return getOrgInstallationAt(ctx, client, apiBase, appID, privateKeyPEM, org)
+func GetInstallation(ctx context.Context, client *http.Client, appID int64, privateKeyPEM []byte, target Target) (*Installation, error) {
+	return getInstallationAt(ctx, client, apiBase, appID, privateKeyPEM, target)
 }
 
-// getOrgInstallationAt is GetOrgInstallation with an injectable base URL, so the
+// getInstallationAt is GetInstallation with an injectable base URL, so the
 // onboarding flow can be tested end to end without reaching GitHub.
-func getOrgInstallationAt(ctx context.Context, client *http.Client, base string, appID int64, privateKeyPEM []byte, org string) (*Installation, error) {
+func getInstallationAt(ctx context.Context, client *http.Client, base string, appID int64, privateKeyPEM []byte, target Target) (*Installation, error) {
 	jwt, err := SignAppJWT(appID, privateKeyPEM, time.Now())
 	if err != nil {
 		return nil, err
 	}
 
-	endpoint := fmt.Sprintf("%s/orgs/%s/installation", base, url.PathEscape(org))
+	endpoint := target.installationEndpoint(base)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, http.NoBody)
 	if err != nil {
@@ -76,7 +78,7 @@ func getOrgInstallationAt(ctx context.Context, client *http.Client, base string,
 
 	resp, err := doWithTimeout(client, req)
 	if err != nil {
-		return nil, fmt.Errorf("github: get org installation: %w", err)
+		return nil, fmt.Errorf("github: get installation for %s: %w", target, err)
 	}
 	defer resp.Body.Close()
 
@@ -92,7 +94,7 @@ func getOrgInstallationAt(ctx context.Context, client *http.Client, base string,
 		// the caller polls through rather than treating as an error.
 		return nil, ErrNotInstalled
 	default:
-		return nil, fmt.Errorf("github: get org installation: %w", apiError(resp.StatusCode, body))
+		return nil, fmt.Errorf("github: get installation for %s: %w", target, apiError(resp.StatusCode, body))
 	}
 
 	var inst Installation
@@ -107,16 +109,17 @@ func getOrgInstallationAt(ctx context.Context, client *http.Client, base string,
 	return &inst, nil
 }
 
-// WaitForOrgInstallation polls until the app is installed or ctx is done.
+// WaitForInstallation polls until the app is installed on the target or ctx is
+// done.
 //
 // Used when the post-install redirect never arrives. Polling rather than waiting
 // on the callback alone because the operator may finish the install in a
 // different browser, or on a different machine entirely.
-func WaitForOrgInstallation(ctx context.Context, client *http.Client, appID int64, privateKeyPEM []byte, org string, every time.Duration) (*Installation, error) {
-	return waitForOrgInstallationAt(ctx, client, apiBase, appID, privateKeyPEM, org, every)
+func WaitForInstallation(ctx context.Context, client *http.Client, appID int64, privateKeyPEM []byte, target Target, every time.Duration) (*Installation, error) {
+	return waitForInstallationAt(ctx, client, apiBase, appID, privateKeyPEM, target, every)
 }
 
-func waitForOrgInstallationAt(ctx context.Context, client *http.Client, base string, appID int64, privateKeyPEM []byte, org string, every time.Duration) (*Installation, error) {
+func waitForInstallationAt(ctx context.Context, client *http.Client, base string, appID int64, privateKeyPEM []byte, target Target, every time.Duration) (*Installation, error) {
 	// time.NewTicker panics on a non-positive interval, and this is an exported
 	// entry point — a caller's zero value should be a diagnostic, not a crash.
 	if every <= 0 {
@@ -127,7 +130,7 @@ func waitForOrgInstallationAt(ctx context.Context, client *http.Client, base str
 	defer ticker.Stop()
 
 	for {
-		inst, err := getOrgInstallationAt(ctx, client, base, appID, privateKeyPEM, org)
+		inst, err := getInstallationAt(ctx, client, base, appID, privateKeyPEM, target)
 
 		switch {
 		case err == nil:
@@ -151,7 +154,8 @@ func waitForOrgInstallationAt(ctx context.Context, client *http.Client, base str
 }
 
 // PermissionMismatches reports every way the installation's effective
-// permissions differ from what billet requested, in BOTH directions.
+// permissions differ from what billet requested for a target of the given
+// scope, in BOTH directions.
 //
 // An operator can edit an app's permissions between creating it and installing
 // it, and each direction fails differently:
@@ -164,8 +168,10 @@ func waitForOrgInstallationAt(ctx context.Context, client *http.Client, base str
 //
 // Results are sorted so the diagnostic is stable across runs — Go randomizes map
 // iteration, and an error message that reorders itself is one nobody can diff.
-func (i *Installation) PermissionMismatches() []string {
+func (i *Installation) PermissionMismatches(scope Scope) []string {
 	var problems []string
+
+	permissions := permissionsFor(scope)
 
 	for name, want := range permissions {
 		got, ok := i.Permissions[name]
@@ -204,29 +210,29 @@ var ErrAppUnverifiable = errors.New(
 	"github: could not verify the App (network or GitHub unavailable)")
 
 // VerifyAppAt proves the configured App LIVE: the key signs a JWT GitHub
-// accepts, the App is installed on the organization (and not suspended), the
+// accepts, the App is installed on the target's owner (and not suspended), the
 // installation id matches the config, and the granted permissions are exactly
-// what billet requested — every mismatch fatal, in both directions, matching
-// PermissionMismatches' own contract (an extra permission falsifies "billet
-// cannot read your code" just as a missing one breaks registration later).
-// base selects the API host — empty means api.github.com; a test fake or a
-// GitHub Enterprise Server deployment passes its own.
+// what billet requested for the target's scope — every mismatch fatal, in both
+// directions, matching PermissionMismatches' own contract (an extra permission
+// falsifies "billet cannot read your code" just as a missing one breaks
+// registration later). base selects the API host — empty means api.github.com;
+// a test fake or a GitHub Enterprise Server deployment passes its own.
 func VerifyAppAt(
 	ctx context.Context, client *http.Client, base string,
-	appID int64, privateKeyPEM []byte, org string, installationID int64,
+	appID int64, privateKeyPEM []byte, target Target, installationID int64,
 ) (*Installation, error) {
 	if base == "" {
 		base = apiBase
 	}
 
-	return verifyAppAt(ctx, client, base, appID, privateKeyPEM, org, installationID)
+	return verifyAppAt(ctx, client, base, appID, privateKeyPEM, target, installationID)
 }
 
 func verifyAppAt(
 	ctx context.Context, client *http.Client, base string,
-	appID int64, privateKeyPEM []byte, org string, installationID int64,
+	appID int64, privateKeyPEM []byte, target Target, installationID int64,
 ) (*Installation, error) {
-	inst, err := getOrgInstallationAt(ctx, client, base, appID, privateKeyPEM, org)
+	inst, err := getInstallationAt(ctx, client, base, appID, privateKeyPEM, target)
 	if err != nil {
 		// The CALLER cancelled: not a verdict and not "GitHub unreachable" — an
 		// interrupted check must surface as the interruption, or a SIGINT reads
@@ -236,9 +242,16 @@ func verifyAppAt(
 		}
 
 		if errors.Is(err, ErrNotInstalled) {
+			if target.Scope() == ScopeRepository {
+				return nil, fmt.Errorf("github: the App (id %d) is not installed on repository %q — "+
+					"open the App's settings page and install it on the repository's owner with "+
+					"access to that repository (or check that the target names the right "+
+					"repository; GitHub answers 404 for both)", appID, target)
+			}
+
 			return nil, fmt.Errorf("github: the App (id %d) is not installed on %q — open the "+
 				"App's settings page and install it on the organization (or check that "+
-				"github.org names the right organization; GitHub answers 404 for both)", appID, org)
+				"github.org names the right organization; GitHub answers 404 for both)", appID, target)
 		}
 
 		if api, ok := errors.AsType[*APIError](err); ok {
@@ -277,22 +290,25 @@ func verifyAppAt(
 
 	if inst.SuspendedAt != nil {
 		return nil, fmt.Errorf("github: the installation on %q is SUSPENDED (since %s): every "+
-			"token request will fail until it is unsuspended on the organization's "+
-			"installation settings page", org, inst.SuspendedAt.Format(time.RFC3339))
+			"token request will fail until it is unsuspended on the owner's "+
+			"installation settings page", target, inst.SuspendedAt.Format(time.RFC3339))
 	}
 
 	if inst.ID != installationID {
 		return nil, fmt.Errorf("github: the App is installed on %q as installation %d, but the "+
 			"config says installation_id %d — update the config to %d (or re-run "+
-			"`billet github-app create`, which fills it in)", org, inst.ID, installationID, inst.ID)
+			"`billet github-app create`, which fills it in)", target, inst.ID, installationID, inst.ID)
 	}
 
-	if problems := inst.PermissionMismatches(); len(problems) > 0 {
+	if problems := inst.PermissionMismatches(target.Scope()); len(problems) > 0 {
+		// THE OWNER'S KIND COMES FROM THE ANSWER. The installation names the
+		// account it is on, so the review page is the right one for a user's
+		// repository as well as an organization's.
 		return nil, fmt.Errorf("github: the installation's permissions differ from what billet "+
 			"requested; every mismatch matters — a missing one breaks runner registration "+
 			"later, an extra one falsifies billet's credential-isolation claim. Review them "+
-			"at %s/organizations/%s/settings/installations:\n  %s",
-			webBase, url.PathEscape(org), strings.Join(problems, "\n  "))
+			"at %s:\n  %s",
+			SettingsURL(target.Owner, OwnerType(inst.Account.Type)), strings.Join(problems, "\n  "))
 	}
 
 	return inst, nil

@@ -67,7 +67,7 @@ import (
 // REQUIRES ledger/billet.db, so an archive without it is refused as incomplete —
 // correctly, on schema 1, where an absent ledger really is a missing piece
 // rather than a statement about where the ledger lives.
-const Schema = 2
+const Schema = 3
 
 // readableSchemas is every version this build can restore FROM.
 //
@@ -82,7 +82,7 @@ const Schema = 2
 // identity-only archive would meet "an archive is not an archive without
 // ledger/billet.db" and send an operator looking for a file that was never
 // supposed to be there.
-var readableSchemas = map[int]bool{1: true, 2: true}
+var readableSchemas = map[int]bool{1: true, 2: true, 3: true}
 
 // externalBackends is every engine an archive may name as holding its ledger.
 //
@@ -114,7 +114,27 @@ const (
 	EntryConfig   = "config/billet.yaml"
 
 	authorityPrefix = "authority/"
+	appKeyPrefix    = "github/"
+	appKeySuffix    = "/app-private-key.pem"
 )
+
+// EntryAppKeyFor is the archive name of a FURTHER target's App key.
+//
+// The default target's key keeps EntryAppKey, the name every archive before
+// schema 3 wrote, so an archive of a single-target deployment is the archive it
+// always was; a further target's key sits under the target's name. Schema 3
+// adds these entries and nothing else.
+func EntryAppKeyFor(target string) string { return appKeyPrefix + target + appKeySuffix }
+
+// isAppKeyEntry reports whether an entry is any target's App key.
+func isAppKeyEntry(entry string) bool {
+	if entry == EntryAppKey {
+		return true
+	}
+
+	return strings.HasPrefix(entry, appKeyPrefix) && strings.HasSuffix(entry, appKeySuffix) &&
+		len(entry) > len(appKeyPrefix)+len(appKeySuffix)
+}
 
 // AuthorityEntry is the archive name for one allowlisted authority file.
 func AuthorityEntry(name string) string { return authorityPrefix + name }

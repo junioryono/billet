@@ -19,6 +19,7 @@ import (
 	"errors"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/config"
 	billetgithub "github.com/junioryono/billet/internal/github"
 	"github.com/junioryono/billet/internal/node"
 	"github.com/junioryono/billet/internal/nodeplane"
@@ -28,6 +29,33 @@ import (
 
 // Provisioner adapts the client to the control plane's scale-set needs.
 type Provisioner struct{ Client *scaleset.Client }
+
+// Target is one GitHub target with the client that holds its credential.
+type Target struct {
+	Config config.GitHubTarget
+	Client *scaleset.Client
+}
+
+// BuildTargets assembles the two views of a target set the control plane
+// consumes: the server's, which reconciles and polls each tier's scale set
+// through its target's provisioner, and the node plane's, which mints
+// registrations through the same target's client.
+//
+// ONE ASSEMBLY FOR BOTH, keyed by the target's config name on each side, so a
+// tier resolves to the same credential whichever half of the control plane is
+// asking — and so internal/e2e assembles a multi-target deployment the way the
+// CLI does rather than by hand.
+func BuildTargets(targets []Target) ([]server.Target, map[string]nodeplane.JITSource) {
+	servers := make([]server.Target, 0, len(targets))
+	jit := make(map[string]nodeplane.JITSource, len(targets))
+
+	for _, t := range targets {
+		servers = append(servers, server.Target{Config: t.Config, Provisioner: Provisioner{Client: t.Client}})
+		jit[t.Config.Name] = NodeJIT{Client: t.Client}
+	}
+
+	return servers, jit
+}
 
 type poolRunnerStore interface {
 	PoolRunnerByLease(ctx context.Context, leaseID string) (alloc.PoolRunner, error)
@@ -214,7 +242,9 @@ func recoverRunner(ctx context.Context, pool poolRunnerStore, client runnerRecov
 }
 
 // ValidateTrustedRunnerGroup verifies policy immediately before local minting.
-func (j JITSource) ValidateTrustedRunnerGroup(ctx context.Context, group string,
+// The tier is what a router over several targets selects a client by; one
+// client serves every tier it is given.
+func (j JITSource) ValidateTrustedRunnerGroup(ctx context.Context, _ string, group string,
 	workflows []string,
 ) error {
 	return j.Client.ValidateTrustedRunnerGroup(ctx, group, workflows)

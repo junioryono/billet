@@ -33,6 +33,12 @@ type fakeGitHub struct {
 	installationID int64
 	pem            string
 	permissions    map[string]string
+	// target and ownerType are what the fake is standing in for: an
+	// organization by default, or a repository owned by a user or an
+	// organization, which changes the manifest form, the permission set and
+	// the installation endpoint the flow must use.
+	target    Target
+	ownerType OwnerType
 
 	// installed flips once the test "completes" the installation, so the poller
 	// sees the same not-installed-then-installed transition an operator produces.
@@ -106,7 +112,22 @@ func newFakeGitHub(t *testing.T) *fakeGitHub {
 		installationID: 909090,
 		pem:            string(encoded),
 		permissions:    map[string]string{"metadata": "read", "organization_self_hosted_runners": "write"},
+		target:         OrganizationTarget("acme"),
+		ownerType:      OwnerOrganization,
 	}
+}
+
+// newFakeRepository stands in for a repository target whose owner is of the
+// given kind, granted the repository permission set.
+func newFakeRepository(t *testing.T, ownerType OwnerType) *fakeGitHub {
+	t.Helper()
+
+	g := newFakeGitHub(t)
+	g.target = RepositoryTarget("someone", "widgets")
+	g.ownerType = ownerType
+	g.permissions = map[string]string{"metadata": "read", "administration": "write"}
+
+	return g
 }
 
 func (g *fakeGitHub) handler() http.Handler {
@@ -171,7 +192,30 @@ func (g *fakeGitHub) handler() http.Handler {
 			g.appID, g.pem)
 	})
 
-	mux.HandleFunc("/orgs/", func(w http.ResponseWriter, _ *http.Request) {
+	// The owner lookup a repository target makes before the browser opens.
+	mux.HandleFunc("/users/", func(w http.ResponseWriter, r *http.Request) {
+		if strings.TrimPrefix(r.URL.Path, "/users/") != g.target.Owner {
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprint(w, `{"message":"Not Found"}`)
+
+			return
+		}
+
+		fmt.Fprintf(w, `{"login":%q,"type":%q}`, g.target.Owner, g.ownerType)
+	})
+
+	// THE INSTALLATION IS SERVED AT THE TARGET'S OWN ENDPOINT AND NOWHERE ELSE,
+	// so a flow that asks /orgs/ about a repository target gets the 404 GitHub
+	// would give it rather than a fake that answers anything.
+	installation := func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != g.target.installationEndpoint("") {
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprintf(w, `{"message":"Not Found (asked %s, this target answers at %s)"}`,
+				r.URL.Path, g.target.installationEndpoint(""))
+
+			return
+		}
+
 		if !g.installed.Load() {
 			// The ordinary "created but not installed yet" state.
 			w.WriteHeader(http.StatusNotFound)
@@ -181,7 +225,8 @@ func (g *fakeGitHub) handler() http.Handler {
 		}
 
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, `{"id":%d,"account":{"login":"acme","type":"Organization"},"permissions":{`, g.installationID)
+		fmt.Fprintf(w, `{"id":%d,"account":{"login":%q,"type":%q},"permissions":{`,
+			g.installationID, g.target.Owner, g.ownerType)
 
 		first := true
 
@@ -196,7 +241,10 @@ func (g *fakeGitHub) handler() http.Handler {
 		}
 
 		fmt.Fprint(w, "}}")
-	})
+	}
+
+	mux.HandleFunc("/orgs/", installation)
+	mux.HandleFunc("/repos/", installation)
 
 	return mux
 }
@@ -378,6 +426,15 @@ func (b *browser) driveRegistration(ctx context.Context, startURL string) {
 		return
 	}
 
+	// THE FORM FOLLOWS THE OWNER'S KIND. A repository owned by a person must be
+	// registered on the personal page, which names no owner; posting the
+	// manifest to /organizations/<person>/ is a 404 on the far side of the
+	// browser, with the manifest already built.
+	if want := RegistrationURL(b.fake.target.Owner, b.fake.ownerType, state); action != want {
+		b.t.Errorf("the manifest form posts to %q, want %q for a %s-owned %s",
+			action, want, b.fake.ownerType, b.fake.target.Scope())
+	}
+
 	base := strings.TrimSuffix(startURL, "/")
 	_, _ = b.get(ctx, base+"/callback?code=testcode&state="+url.QueryEscape(state))
 }
@@ -497,11 +554,16 @@ func (b *browser) validateManifest(raw, base string) {
 		return
 	}
 
-	if len(perms) != len(permissions) {
-		b.t.Errorf("manifest requests %d permissions, want %d: %v", len(perms), len(permissions), perms)
+	// THE SET FOLLOWS THE TARGET'S SCOPE: a repository has no
+	// organization_self_hosted_runners permission to ask for, and an
+	// organization must not be asked for administration.
+	expected := permissionsFor(b.fake.target.Scope())
+
+	if len(perms) != len(expected) {
+		b.t.Errorf("manifest requests %d permissions, want %d: %v", len(perms), len(expected), perms)
 	}
 
-	for name, want := range permissions {
+	for name, want := range expected {
 		if got, ok := perms[name].(string); !ok || got != want {
 			b.t.Errorf("manifest permission %q = %v, want %q", name, perms[name], want)
 		}
@@ -726,7 +788,7 @@ func TestOnboardEndToEnd(t *testing.T) {
 	)
 
 	result, err := Onboard(ctx, OnboardOptions{
-		Org:         "acme",
+		Target:      OrganizationTarget("acme"),
 		Name:        "billet",
 		OpenBrowser: b.open,
 		Log:         func(string, ...any) {},
@@ -829,7 +891,7 @@ func TestOnboardCompletesWithoutTheSetupCallback(t *testing.T) {
 	defer cancel()
 
 	result, err := Onboard(ctx, OnboardOptions{
-		Org:          "acme",
+		Target:       OrganizationTarget("acme"),
 		OpenBrowser:  b.open,
 		Log:          func(string, ...any) {},
 		Client:       srv.Client(),
@@ -888,7 +950,7 @@ func TestOnboardIgnoresSpoofedInstallationID(t *testing.T) {
 	defer cancel()
 
 	result, err := Onboard(ctx, OnboardOptions{
-		Org:          "acme",
+		Target:       OrganizationTarget("acme"),
 		OpenBrowser:  spoof,
 		Log:          func(string, ...any) {},
 		Client:       srv.Client(),
@@ -927,7 +989,7 @@ func TestOnboardFailsOnUnexpectedPermission(t *testing.T) {
 	saved := false
 
 	_, err := Onboard(ctx, OnboardOptions{
-		Org:          "acme",
+		Target:       OrganizationTarget("acme"),
 		OpenBrowser:  b.open,
 		Log:          func(string, ...any) {},
 		Client:       srv.Client(),
@@ -972,7 +1034,7 @@ func TestOnboardAbortsWhenCredentialsCannotBeSaved(t *testing.T) {
 	defer cancel()
 
 	_, err := Onboard(ctx, OnboardOptions{
-		Org:          "acme",
+		Target:       OrganizationTarget("acme"),
 		OpenBrowser:  b.open,
 		Log:          func(string, ...any) {},
 		Client:       srv.Client(),
@@ -1088,7 +1150,7 @@ func TestOnboardRejectsStateMismatch(t *testing.T) {
 	}
 
 	app, err := Onboard(ctx, OnboardOptions{
-		Org:          "acme",
+		Target:       OrganizationTarget("acme"),
 		OpenBrowser:  attacked,
 		Log:          func(string, ...any) {},
 		Client:       srv.Client(),
@@ -1169,7 +1231,7 @@ func TestOnboardSurvivesAnInjectedCode(t *testing.T) {
 	}
 
 	result, err := Onboard(ctx, OnboardOptions{
-		Org:          "acme",
+		Target:       OrganizationTarget("acme"),
 		OpenBrowser:  attacked,
 		Log:          func(string, ...any) {},
 		Client:       srv.Client(),
@@ -1300,7 +1362,7 @@ func TestAPersistentlyAmbiguousCodeDoesNotBlockTheHonestOne(t *testing.T) {
 	}
 
 	result, err := Onboard(ctx, OnboardOptions{
-		Org:          "acme",
+		Target:       OrganizationTarget("acme"),
 		OpenBrowser:  attacked,
 		Log:          func(string, ...any) {},
 		Client:       srv.Client(),
@@ -1375,7 +1437,7 @@ func TestTheHonestCodeIsTriedEvenBehindAFullRetrySet(t *testing.T) {
 	fake.rejectPrefix = "injected-"
 
 	result, err := Onboard(ctx, OnboardOptions{
-		Org:          "acme",
+		Target:       OrganizationTarget("acme"),
 		OpenBrowser:  attacked,
 		Log:          func(string, ...any) {},
 		Client:       srv.Client(),
@@ -1544,7 +1606,7 @@ func TestEveryAcknowledgedCodeIsAttempted(t *testing.T) {
 			}
 
 			_, err := Onboard(ctx, OnboardOptions{
-				Org:          "acme",
+				Target:       OrganizationTarget("acme"),
 				OpenBrowser:  attacked,
 				Log:          func(string, ...any) {},
 				Client:       client,
@@ -1577,7 +1639,7 @@ func TestOnboardRequiresOrgAndLog(t *testing.T) {
 		t.Error("an empty org should be rejected")
 	}
 
-	if _, err := Onboard(t.Context(), OnboardOptions{Org: "acme"}); err == nil {
+	if _, err := Onboard(t.Context(), OnboardOptions{Target: OrganizationTarget("acme")}); err == nil {
 		t.Error("a missing Log should be rejected")
 	}
 }

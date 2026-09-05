@@ -68,7 +68,10 @@ func cmdGitHubApp(ctx context.Context, args []string) error {
 // anything reach GitHub.
 func githubAppCreate(ctx context.Context, args []string) error {
 	fs := newFlagSet("billet github-app create")
-	org := fs.String("org", "", "GitHub organization to create the App for (required)")
+	org := fs.String("org", "", "GitHub organization to create the App for (exactly one of --org and --repository)")
+	repository := fs.String("repository", "", "GitHub repository, as owner/name, to create the App for")
+	targetName := fs.String("target", config.DefaultTargetName,
+		"the target this App serves: default writes the github block, any other name a targets entry")
 	name := fs.String("name", "", "suggested App name (GitHub App names are globally unique; you can edit it there)")
 	keyPath := fs.String("key-path", "", "where to write the App private key (default: alongside billet.yaml)")
 	cfgPath := fs.String("config", "", "billet.yaml to write the github block into")
@@ -79,9 +82,29 @@ func githubAppCreate(ctx context.Context, args []string) error {
 		return err
 	}
 
-	if *org == "" {
-		return errors.New("--org is required")
+	// EXACTLY ONE SCOPE, held to the rule config validation applies, so a bad
+	// flag is refused by its own name before anything reaches GitHub.
+	switch {
+	case *org == "" && *repository == "":
+		return errors.New("one of --org or --repository is required")
+	case *org != "" && *repository != "":
+		return errors.New("pass either --org or --repository, not both: a target is an " +
+			"organization or one repository")
+	case *org != "":
+		if err := config.CheckOrg(*org); err != nil {
+			return fmt.Errorf("--org: %w", err)
+		}
+	default:
+		if err := config.CheckRepository(*repository); err != nil {
+			return fmt.Errorf("--repository: %w", err)
+		}
 	}
+
+	if *targetName == "" {
+		return errors.New("--target must name a target; the github block is named " + config.DefaultTargetName)
+	}
+
+	identity := githubBlock{Target: *targetName, Org: *org, Repository: *repository}
 
 	// FIRST, so the config's own refusals are the ones an operator sees.
 	//
@@ -89,7 +112,7 @@ func githubAppCreate(ctx context.Context, args []string) error {
 	// --config that does not exist came back as a bare `read --config …: no such
 	// file or directory` on the ordinary invocation, and the refusal that names
 	// the seed was reachable only when --key-path happened to be given.
-	plan, err := planConfigEdit(*cfgPath, *org)
+	plan, err := planConfigEdit(*cfgPath, identity)
 	if err != nil {
 		return err
 	}
@@ -97,7 +120,7 @@ func githubAppCreate(ctx context.Context, args []string) error {
 	// THE RESOLVED PATH, so a symlinked --config defaults its key beside the file
 	// that actually holds the config rather than beside the link.
 	if *keyPath == "" {
-		resolved, err := defaultKeyPath(plan.path)
+		resolved, err := defaultKeyPathFor(plan.path, *targetName)
 		if err != nil {
 			return err
 		}
@@ -150,9 +173,11 @@ func githubAppCreate(ctx context.Context, args []string) error {
 		open = nil
 	}
 
-	fmt.Printf("billet requests exactly these permissions:\n")
+	target := identity.target()
 
-	perms := github.Permissions()
+	fmt.Printf("billet requests exactly these permissions for a %s:\n", target.Scope())
+
+	perms := github.Permissions(target.Scope())
 
 	names := make([]string, 0, len(perms))
 	for name := range perms {
@@ -166,10 +191,21 @@ func githubAppCreate(ctx context.Context, args []string) error {
 	}
 
 	fmt.Printf("\nNo repository Contents permission — billet cannot read your code.\n")
+
+	if target.Scope() == github.ScopeRepository {
+		// THE WIDER GRANT IS SAID OUT LOUD. It is the only permission GitHub
+		// offers for registering a repository's runners, and it also covers the
+		// repository's settings, collaborators and branch protection; billet uses
+		// it for the registration endpoints and nothing else (ADR-011).
+		fmt.Printf("Repository administration is the ONLY permission GitHub offers for registering\n" +
+			"a repository's runners. billet uses it for that and nothing else: never the\n" +
+			"repository's settings, collaborators or branch protection.\n")
+	}
+
 	fmt.Printf("GitHub allows one hour to finish; if it lapses, just run this again.\n\n")
 
 	result, err := onboard(ctx, github.OnboardOptions{
-		Org:         *org,
+		Target:      target,
 		Name:        *name,
 		Port:        *port,
 		OpenBrowser: open,
@@ -200,7 +236,7 @@ func githubAppCreate(ctx context.Context, args []string) error {
 			fmt.Fprintf(os.Stderr,
 				"\nThe App was created and its key saved to %s.\n"+
 					"Fix the problem above, then finish by installing it on %s and running `billet check`.\n",
-				*keyPath, *org)
+				*keyPath, target)
 		}
 
 		return err
@@ -210,7 +246,9 @@ func githubAppCreate(ctx context.Context, args []string) error {
 	fmt.Printf("  private key      %s\n", *keyPath)
 
 	block := githubBlock{
+		Target:         *targetName,
 		Org:            *org,
+		Repository:     *repository,
 		AppID:          result.App.ID,
 		ClientID:       result.App.ClientID,
 		InstallationID: result.Installation.ID,
@@ -279,7 +317,7 @@ func githubAppCreate(ctx context.Context, args []string) error {
 		// `billet github-app store-key` can publish, where a publication straight
 		// from memory would have exactly one failure mode with no way back.
 		if storeBacked {
-			storeAppKeyDuringOnboarding(ctx, plan.path, *keyPath, []byte(result.App.PEM))
+			storeAppKeyDuringOnboarding(ctx, plan.path, *targetName, *keyPath, []byte(result.App.PEM))
 		}
 
 		fmt.Printf("\nThen run: billet check --config %s\n", plan.path)
@@ -301,9 +339,14 @@ func githubAppCreate(ctx context.Context, args []string) error {
 	return nil
 }
 
-// githubBlock is the App identity a config needs.
+// githubBlock is the App identity a config needs, for one target.
 type githubBlock struct {
+	// Target names where the block goes: config.DefaultTargetName (or empty)
+	// is the github block, any other name a targets entry.
+	Target string
+	// Org or Repository, exactly one: the target's scope.
 	Org            string
+	Repository     string
 	AppID          int64
 	ClientID       string
 	InstallationID int64
@@ -343,7 +386,7 @@ func reportIdentity(b githubBlock, streams ...io.Writer) {
 // an App that already exists and a stream that silently dropped it is the whole
 // reason the caller is here.
 func printGitHubBlock(w io.Writer, b githubBlock) error {
-	rendered, err := renderIdentity([]byte("github: {}\n"), b)
+	rendered, err := renderIdentity([]byte(seedFor(b)), b)
 	if err != nil {
 		return fmt.Errorf("render the App identity: %w", err)
 	}
@@ -1285,16 +1328,28 @@ func readPrivateKey(path string) ([]byte, error) {
 	return pemBytes, nil
 }
 
-// defaultKeyPath is where the App key goes when --key-path is not given: what
-// the config already names, then beside the config, then beside the per-user
-// default. The first branch is what makes the local-service flow hold — its
-// generated config names /etc/billet/app-private-key.pem, and defaulting to
-// the per-user directory instead would move the key into a home directory the
-// packaged unit's ProtectHome=true can never read, then rewrite the config to
-// point there.
+// defaultKeyPath is where the default target's App key goes when --key-path is
+// not given: what the config already names, then beside the config, then
+// beside the per-user default. The first branch is what makes the
+// local-service flow hold — its generated config names
+// /etc/billet/app-private-key.pem, and defaulting to the per-user directory
+// instead would move the key into a home directory the packaged unit's
+// ProtectHome=true can never read, then rewrite the config to point there.
 func defaultKeyPath(cfgPath string) (string, error) {
+	return defaultKeyPathFor(cfgPath, config.DefaultTargetName)
+}
+
+// defaultKeyPathFor is defaultKeyPath for a named target: what the config
+// already names for it, else app-private-key-<target>.pem beside the config,
+// so two targets' keys never default to one file.
+func defaultKeyPathFor(cfgPath, target string) (string, error) {
+	file := "app-private-key.pem"
+	if target != "" && target != config.DefaultTargetName {
+		file = "app-private-key-" + target + ".pem"
+	}
+
 	if cfgPath != "" {
-		named, err := configuredKeyPath(cfgPath)
+		named, err := configuredKeyPath(cfgPath, target)
 		if err != nil {
 			return "", err
 		}
@@ -1302,19 +1357,19 @@ func defaultKeyPath(cfgPath string) (string, error) {
 			return named, nil
 		}
 
-		return filepath.Join(filepath.Dir(cfgPath), "app-private-key.pem"), nil
+		return filepath.Join(filepath.Dir(cfgPath), file), nil
 	}
 
-	return filepath.Join(filepath.Dir(defaultConfigPath()), "app-private-key.pem"), nil
+	return filepath.Join(filepath.Dir(defaultConfigPath()), file), nil
 }
 
-// configuredKeyPath reads github.private_key_path out of a config file that
-// may not fully validate yet (an init-generated file has app_id 0), so it is a
-// narrow YAML read rather than config.Load. A read or parse failure is an
+// configuredKeyPath reads a target's private_key_path out of a config file
+// that may not fully validate yet (an init-generated file has app_id 0), so it
+// is a narrow YAML read rather than config.Load. A read or parse failure is an
 // ERROR, not an absent field: collapsing them would silently move the key
 // beside a config nobody can read, and the real problem would surface only
 // after GitHub already holds a registered App — this flow is not repeatable.
-func configuredKeyPath(cfgPath string) (string, error) {
+func configuredKeyPath(cfgPath, target string) (string, error) {
 	raw, err := os.ReadFile(cfgPath)
 	if err != nil {
 		return "", fmt.Errorf("read --config %s: %w", cfgPath, err)
@@ -1324,12 +1379,52 @@ func configuredKeyPath(cfgPath string) (string, error) {
 		GitHub struct {
 			PrivateKeyPath string `yaml:"private_key_path"`
 		} `yaml:"github"`
+		Targets []struct {
+			Name           string `yaml:"name"`
+			PrivateKeyPath string `yaml:"private_key_path"`
+		} `yaml:"targets"`
 	}
 	if err := yaml.Unmarshal(raw, &doc); err != nil {
 		return "", fmt.Errorf("parse --config %s: %w", cfgPath, err)
 	}
 
-	return doc.GitHub.PrivateKeyPath, nil
+	if target == "" || target == config.DefaultTargetName {
+		return doc.GitHub.PrivateKeyPath, nil
+	}
+
+	for _, entry := range doc.Targets {
+		if entry.Name == target {
+			return entry.PrivateKeyPath, nil
+		}
+	}
+
+	return "", nil
+}
+
+// target is the block's identity as the github package sees it.
+func (b githubBlock) target() github.Target {
+	if b.Repository != "" {
+		owner, name, _ := config.SplitRepository(b.Repository)
+
+		return github.RepositoryTarget(owner, name)
+	}
+
+	return github.OrganizationTarget(b.Org)
+}
+
+// isDefault reports whether the block goes under `github:`.
+func (b githubBlock) isDefault() bool {
+	return b.Target == "" || b.Target == config.DefaultTargetName
+}
+
+// seedFor is the smallest document the block can be rendered into, for the
+// printed form.
+func seedFor(b githubBlock) string {
+	if b.isDefault() {
+		return "github: {}\n"
+	}
+
+	return "targets: []\n"
 }
 
 // configEditRule is what BOTH commands say about which of them may edit a
@@ -1390,7 +1485,7 @@ type configEdit struct {
 // second opinion about acceptable YAML. A separate reading of what `github:` may
 // hold is a rule that agrees with renderGitHubBlock today and drifts from it on
 // the next field — the same two-sources-of-truth mistake, one layer up.
-func planConfigEdit(cfgPath, org string) (configEdit, error) {
+func planConfigEdit(cfgPath string, identity githubBlock) (configEdit, error) {
 	if cfgPath == "" {
 		return configEdit{}, nil
 	}
@@ -1437,7 +1532,7 @@ func planConfigEdit(cfgPath, org string) (configEdit, error) {
 	// that omits it — and billet cannot know in advance which shape GitHub will
 	// hand it. Both have to work, or the second is discovered after the App
 	// exists.
-	if err := probeConfig(raw, org); err != nil {
+	if err := probeConfig(raw, identity); err != nil {
 		remedy := ""
 		if errors.Is(err, errNoDocument) {
 			// OFFERED HERE AND NOWHERE ELSE, because this is the one refusal
@@ -1491,7 +1586,7 @@ func planConfigEdit(cfgPath, org string) (configEdit, error) {
 	}
 
 	edit := configEdit{path: cfgPath, given: given, body: raw}
-	if gb, _, ok := existingGitHubBlock(raw); ok {
+	if gb, _, ok := existingIdentity(raw, identity.Target); ok {
 		edit.existing, edit.hasApp = gb, true
 	}
 
@@ -1527,9 +1622,11 @@ func planConfigEdit(cfgPath, org string) (configEdit, error) {
 //
 // The ORG is the run's own in both, because that is the field the verification
 // compares against a caller-supplied value.
-func probeConfig(raw []byte, org string) error {
+func probeConfig(raw []byte, identity githubBlock) error {
 	base := githubBlock{
-		Org:            org,
+		Target:         identity.Target,
+		Org:            identity.Org,
+		Repository:     identity.Repository,
 		AppID:          1,
 		InstallationID: 1,
 		PrivateKeyPath: "probe",
@@ -1720,10 +1817,10 @@ func sayConfigEdit(w io.Writer, edit configEdit) error {
 		// deliberate thing an operator does and init's own guidance describes it —
 		// but replacing the identity a running deployment authenticates with is
 		// not something to discover from a diff afterwards.
-		if _, err := fmt.Fprintf(w, "NOTE: %s already names App %d (org %q). Finishing this "+
+		if _, err := fmt.Fprintf(w, "NOTE: %s already names App %d (%s) for target %s. Finishing this "+
 			"REPLACES that identity with the new App's; the old App stays on GitHub, "+
 			"unreferenced by this config.\n\n",
-			edit.path, edit.existing.AppID, edit.existing.Org); err != nil {
+			edit.path, edit.existing.AppID, edit.existing.describe(), edit.existing.targetName()); err != nil {
 			return sayFailed(err)
 		}
 	}
@@ -1956,9 +2053,10 @@ func renderIdentity(raw []byte, b githubBlock) ([]byte, error) {
 	// in. That is the same reason checkCarried exists, and it is why client_id
 	// and the key path are checked rather than left to the three that happened to
 	// be here.
-	got, gotKeyPath, ok := existingGitHubBlock(rendered)
+	got, gotKeyPath, ok := existingIdentity(rendered, b.Target)
 	if !ok || got.AppID != b.AppID || got.InstallationID != b.InstallationID ||
-		got.Org != b.Org || got.ClientID != b.ClientID || gotKeyPath != b.PrivateKeyPath {
+		got.Org != b.Org || got.Repository != b.Repository || got.ClientID != b.ClientID ||
+		gotKeyPath != b.PrivateKeyPath {
 		return nil, errIdentityLost
 	}
 
@@ -1989,12 +2087,35 @@ func renderGitHubBlock(raw []byte, b githubBlock) ([]byte, error) {
 		return nil, errors.New("the config is not a mapping")
 	}
 
-	gh, err := mappingFor(root, "github")
+	// THE DEFAULT TARGET IS THE github BLOCK; ANY OTHER IS A targets ENTRY, found
+	// by name or appended. One renderer for both, because two would be two
+	// rules about what a target block may hold.
+	var (
+		gh  *yaml.Node
+		err error
+	)
+
+	if b.isDefault() {
+		gh, err = mappingFor(root, "github")
+	} else {
+		gh, err = targetEntryFor(root, b.Target)
+	}
+
 	if err != nil {
 		return nil, err
 	}
 
-	setScalar(gh, "org", b.Org)
+	// EXACTLY ONE SCOPE KEY SURVIVES. A block that carried org and gains a
+	// repository would be a target config refuses at load, so the other
+	// spelling goes.
+	if b.Repository != "" {
+		setScalar(gh, "repository", b.Repository)
+		removeScalar(gh, "org")
+	} else {
+		setScalar(gh, "org", b.Org)
+		removeScalar(gh, "repository")
+	}
+
 	setScalar(gh, "app_id", strconv.FormatInt(b.AppID, 10))
 	setScalar(gh, "installation_id", strconv.FormatInt(b.InstallationID, 10))
 	setScalar(gh, "private_key_path", b.PrivateKeyPath)
@@ -2040,6 +2161,68 @@ func renderGitHubBlock(raw []byte, b githubBlock) ([]byte, error) {
 // wrote. Recognising it with errors.Is is what keeps planConfigEdit from reading
 // the YAML a second time to work out which case it is in.
 var errNoDocument = errors.New("the config has no YAML document in it")
+
+// targetEntryFor returns the mapping of the named targets entry, appending a
+// new entry carrying only its name when there is none.
+//
+// The list is created when absent, and refused when the key holds anything
+// but a sequence: filling something an operator wrote would destroy it, and
+// the caller is about to write a credential identity.
+func targetEntryFor(root *yaml.Node, name string) (*yaml.Node, error) {
+	var list *yaml.Node
+
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		if !isKey(root.Content[i], "targets") {
+			continue
+		}
+
+		found := root.Content[i+1]
+
+		switch {
+		case found.Kind == yaml.SequenceNode:
+			list = found
+		case found.Kind == yaml.ScalarNode && (found.Tag == "!!null" || found.Value == ""):
+			found.Kind = yaml.SequenceNode
+			found.Tag = ""
+			found.Value = ""
+			found.Style = 0
+			list = found
+		default:
+			return nil, fmt.Errorf("the %q key is a %s, not a list; billet will not replace it",
+				"targets", nodeKind(found))
+		}
+
+		break
+	}
+
+	if list == nil {
+		list = &yaml.Node{Kind: yaml.SequenceNode}
+		root.Content = append(root.Content,
+			&yaml.Node{Kind: yaml.ScalarNode, Value: "targets"}, list)
+	}
+
+	for _, entry := range list.Content {
+		if entry.Kind != yaml.MappingNode {
+			return nil, fmt.Errorf("a targets entry is a %s, not a mapping; billet will not "+
+				"replace it", nodeKind(entry))
+		}
+
+		for i := 0; i+1 < len(entry.Content); i += 2 {
+			if isKey(entry.Content[i], "name") {
+				var decoded string
+				if err := entry.Content[i+1].Decode(&decoded); err == nil && decoded == name {
+					return entry, nil
+				}
+			}
+		}
+	}
+
+	entry := &yaml.Node{Kind: yaml.MappingNode}
+	setScalar(entry, "name", name)
+	list.Content = append(list.Content, entry)
+
+	return entry, nil
+}
 
 // mappingFor returns the mapping at a top-level key, creating it if absent.
 func mappingFor(root *yaml.Node, key string) (*yaml.Node, error) {

@@ -10,8 +10,15 @@ import (
 )
 
 // ScaleSetRecord is a scale set billet created, and where.
+//
+// Target is the GitHub PATH of the target the scale set belongs to — `owner`
+// for an organization, `owner/name` for a repository — never the target's
+// config name, which an operator may rename. It is stored in the `org` column,
+// which predates repository targets and keeps its name: every row written
+// before them is an organization's and still reads as one, and a repository's
+// path is simply a value that column had never carried.
 type ScaleSetRecord struct {
-	Org         string
+	Target      string
 	RunnerGroup string
 	Label       string
 	ID          int
@@ -25,7 +32,7 @@ type ScaleSetRecord struct {
 // billet keeps its name and takes a new id, and the stale one would send an
 // operator looking for an object that is gone.
 func (db *DB) RecordScaleSet(ctx context.Context, rec ScaleSetRecord) error {
-	if rec.Org == "" {
+	if rec.Target == "" {
 		return fmt.Errorf("state: record scale set %q: no organization", rec.Label)
 	}
 
@@ -41,7 +48,7 @@ func (db *DB) RecordScaleSet(ctx context.Context, rec ScaleSetRecord) error {
 		q := WriteQueries(tx)
 
 		if err := q.DeleteMovedScaleSet(ctx, ledgerdb.DeleteMovedScaleSetParams{
-			Org:         rec.Org,
+			Org:         rec.Target,
 			ScaleSetID:  int64(rec.ID),
 			RunnerGroup: rec.RunnerGroup,
 			Label:       rec.Label,
@@ -50,7 +57,7 @@ func (db *DB) RecordScaleSet(ctx context.Context, rec ScaleSetRecord) error {
 		}
 
 		return q.UpsertScaleSet(ctx, ledgerdb.UpsertScaleSetParams{
-			Org:         rec.Org,
+			Org:         rec.Target,
 			RunnerGroup: rec.RunnerGroup,
 			Label:       rec.Label,
 			ScaleSetID:  int64(rec.ID),
@@ -64,17 +71,17 @@ func (db *DB) RecordScaleSet(ctx context.Context, rec ScaleSetRecord) error {
 // Called when billet deletes one, so the orphan report stops naming something an
 // operator has already cleaned up. Removing a record billet never had is not an
 // error: teardown may be run against a deployment whose ledger predates this.
-func (db *DB) ForgetScaleSet(ctx context.Context, org, group, label string) error {
+func (db *DB) ForgetScaleSet(ctx context.Context, target, group, label string) error {
 	return db.Tx(ctx, func(tx *sql.Tx) error {
 		return WriteQueries(tx).DeleteScaleSet(ctx, ledgerdb.DeleteScaleSetParams{
-			Org:         org,
+			Org:         target,
 			RunnerGroup: group,
 			Label:       label,
 		})
 	})
 }
 
-// ScaleSets returns every scale set billet recorded creating for one organization.
+// ScaleSets returns every scale set billet recorded creating for one target.
 //
 // On the read-only pool: a read routed through Tx would reserve the single
 // writer slot while it scans. One statement needs no snapshot, so it does not go
@@ -82,8 +89,8 @@ func (db *DB) ForgetScaleSet(ctx context.Context, org, group, label string) erro
 // ITSELF. Server.Run calls this before any listener starts and returns what comes
 // back, so a stop landing in that window used to leave the unit `failed` over a
 // read the shutdown had interrupted. See asCancellation.
-func (db *DB) ScaleSets(ctx context.Context, org string) ([]ScaleSetRecord, error) {
-	rows, err := ReadQueries(db.Reader()).ListScaleSets(ctx, org)
+func (db *DB) ScaleSets(ctx context.Context, target string) ([]ScaleSetRecord, error) {
+	rows, err := ReadQueries(db.Reader()).ListScaleSets(ctx, target)
 	if err != nil {
 		return nil, fmt.Errorf("state: list scale sets: %w", db.asCancellation(ctx, err))
 	}
@@ -92,7 +99,7 @@ func (db *DB) ScaleSets(ctx context.Context, org string) ([]ScaleSetRecord, erro
 
 	for _, r := range rows {
 		out = append(out, ScaleSetRecord{
-			Org:         r.Org,
+			Target:      r.Org,
 			RunnerGroup: r.RunnerGroup,
 			Label:       r.Label,
 			ID:          int(r.ScaleSetID),

@@ -10,6 +10,7 @@ import (
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/fakeactions"
+	billetgithub "github.com/junioryono/billet/internal/github"
 	"github.com/junioryono/billet/internal/node"
 	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/nodeplane"
@@ -574,11 +575,11 @@ func newWiredCodeBuild(t *testing.T, opts ...wiredOpt) *wiredCodeBuild {
 	dir := t.TempDir()
 
 	client, err := scaleset.New(scaleset.Config{
-		ConfigURL:      p.URL + "/acme",
+		Target:         billetgithub.OrganizationTarget("acme"),
+		GitHubURL:      p.URL,
 		ClientID:       "12345",
 		InstallationID: 67890,
 		PrivateKey:     p.PrivateKeyPEM(),
-		Org:            "acme",
 		AppID:          12345,
 		APIURL:         p.URL + "/api/v3",
 	}, nil)

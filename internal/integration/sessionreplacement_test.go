@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/junioryono/billet/internal/github"
 	"github.com/junioryono/billet/internal/scaleset"
 	"github.com/junioryono/billet/internal/server"
 )
@@ -847,11 +848,10 @@ func liveScaleSet(t *testing.T) (*scaleset.Client, *scaleset.ScaleSet) {
 	}
 
 	client, err := scaleset.New(scaleset.Config{
-		ConfigURL:      "https://github.com/" + org,
+		Target:         github.OrganizationTarget(org),
 		ClientID:       strconv.FormatInt(appID, 10),
 		InstallationID: installationID,
 		PrivateKey:     string(key),
-		Org:            org,
 		AppID:          appID,
 	}, slog.New(slog.DiscardHandler))
 	if err != nil {

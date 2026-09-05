@@ -145,15 +145,7 @@ func runLocalRestore(ctx context.Context, o restoreOptions) error {
 		ExternalLedgerAttached: o.ledgerAttached,
 	}
 
-	if cfg.GitHub != nil {
-		target.AppKeyPath = cfg.GitHub.PrivateKeyPath
-		target.GitHub = deployarchive.GitHubIdentity{
-			Org:            cfg.GitHub.Org,
-			AppID:          cfg.GitHub.AppID,
-			ClientID:       cfg.GitHub.ClientID,
-			InstallationID: cfg.GitHub.InstallationID,
-		}
-	}
+	archiveTargets(cfg, &target)
 
 	if o.abandon {
 		return runRestoreAbandon(ctx, archive, target)
@@ -301,15 +293,21 @@ func repairRestoredOwnership(plan deployarchive.Plan) {
 			path, initconfig.ServiceGroup)
 	}
 
-	// THE APP KEY IS REPAIRED BY PATH, because it lives OUTSIDE the state
+	// THE APP KEYS ARE REPAIRED BY PATH, because they live OUTSIDE the state
 	// directory — the planner refuses one inside it — and the walk above is
-	// confined to that directory on purpose.
-	keyErr := c.ApplyOwnership([]lifeops.OwnershipChange{{
-		Path: plan.Target.AppKeyPath, Owner: initconfig.ServiceGroup,
-		Group: initconfig.ServiceGroup, Mode: 0o600,
-		Why: "billet refuses an App key readable beyond its owner, and the service must still " +
-			"be able to read it",
-	}}, uid, gid)
+	// confined to that directory on purpose. Every target's key, the same way.
+	var keyChanges []lifeops.OwnershipChange
+
+	for _, path := range restoredKeyPaths(plan) {
+		keyChanges = append(keyChanges, lifeops.OwnershipChange{
+			Path: path, Owner: initconfig.ServiceGroup,
+			Group: initconfig.ServiceGroup, Mode: 0o600,
+			Why: "billet refuses an App key readable beyond its owner, and the service must still " +
+				"be able to read it",
+		})
+	}
+
+	keyErr := c.ApplyOwnership(keyChanges, uid, gid)
 
 	if err := errors.Join(repairErr, keyErr); err != nil {
 		fmt.Println()
@@ -322,7 +320,54 @@ func repairRestoredOwnership(plan deployarchive.Plan) {
 	}
 
 	if len(repaired) > 0 {
-		fmt.Printf("own      %s given to %s\n", plan.Target.AppKeyPath, initconfig.ServiceGroup)
+		for _, path := range restoredKeyPaths(plan) {
+			fmt.Printf("own      %s given to %s\n", path, initconfig.ServiceGroup)
+		}
+	}
+}
+
+// restoredKeyPaths is every App key path a plan installs: the default target's
+// and each further target's.
+func restoredKeyPaths(plan deployarchive.Plan) []string {
+	paths := []string{plan.Target.AppKeyPath}
+
+	for _, target := range plan.Target.Targets {
+		if target.AppKeyPath != "" {
+			paths = append(paths, target.AppKeyPath)
+		}
+	}
+
+	return paths
+}
+
+// archiveIdentity is a config target's App identity as an archive records it.
+func archiveIdentity(target config.GitHubTarget) deployarchive.GitHubIdentity {
+	return deployarchive.GitHubIdentity{
+		Org:            target.Org,
+		Repository:     target.Repository,
+		AppID:          target.AppID,
+		ClientID:       target.ClientID,
+		InstallationID: target.InstallationID,
+	}
+}
+
+// archiveTargets fills a restore target's key paths and identities from the
+// config: the github block's as the default, every further target beside it.
+func archiveTargets(cfg *config.Config, target *deployarchive.Target) {
+	targets := cfg.GitHubTargets()
+	if len(targets) == 0 {
+		return
+	}
+
+	target.AppKeyPath = targets[0].PrivateKeyPath
+	target.GitHub = archiveIdentity(targets[0])
+
+	for _, further := range targets[1:] {
+		target.Targets = append(target.Targets, deployarchive.TargetPath{
+			Name:       further.Name,
+			AppKeyPath: further.PrivateKeyPath,
+			GitHub:     archiveIdentity(further),
+		})
 	}
 }
 

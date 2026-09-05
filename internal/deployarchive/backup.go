@@ -37,10 +37,17 @@ type BackupRequest struct {
 	// DeploymentID is what state.PeekDeploymentID answered. Required: a state
 	// directory with no identity is not a deployment to back up.
 	DeploymentID string
-	// GitHub is the App identity from the config.
+	// GitHub is the DEFAULT target's App identity from the config.
 	GitHub GitHubIdentity
-	// AppKeyPEM is the App private key, already validated by the caller.
+	// AppKeyPEM is the default target's App private key, already validated by
+	// the caller.
 	AppKeyPEM []byte
+	// Targets are the further targets the deployment serves, each with its key.
+	//
+	// ALL OR NONE, like every other piece: a backup that captured one target's
+	// key and not another's restores a control plane that serves half its
+	// owners, and the half it does not serve fails hours later with a bare 401.
+	Targets []TargetKey
 	// ConfigBody is the billet.yaml as it stands. Copied for REFERENCE; restore
 	// never installs it, because these paths are the source host's.
 	ConfigBody []byte
@@ -54,6 +61,13 @@ type BackupRequest struct {
 	Now func() time.Time
 	// Hostname is recorded in the manifest as provenance.
 	Hostname string
+}
+
+// TargetKey is one further target's identity and its App private key.
+type TargetKey struct {
+	Name      string
+	GitHub    GitHubIdentity
+	AppKeyPEM []byte
 }
 
 // ExternalLedger describes a ledger the archive deliberately does not contain.
@@ -147,8 +161,31 @@ func (req BackupRequest) validate() error {
 		return errors.New("deployarchive: a backup needs a clock")
 	}
 
+	seen := make(map[string]bool, len(req.Targets))
+
+	for _, target := range req.Targets {
+		switch {
+		case target.Name == "" || target.Name == defaultTargetName:
+			return fmt.Errorf("deployarchive: a further target needs a name of its own; %q is the "+
+				"github block's", target.Name)
+		case seen[target.Name]:
+			return fmt.Errorf("deployarchive: target %q is listed twice", target.Name)
+		case target.GitHub.IsZero():
+			return fmt.Errorf("deployarchive: target %q names no App", target.Name)
+		case len(target.AppKeyPEM) == 0:
+			return fmt.Errorf("deployarchive: target %q's App private key is part of the "+
+				"deployment unit and none was supplied; GitHub issues it exactly once", target.Name)
+		}
+
+		seen[target.Name] = true
+	}
+
 	return nil
 }
+
+// defaultTargetName is the name the `github:` block's target carries in
+// config, which a further target may not take.
+const defaultTargetName = "default"
 
 // PrepareDestination creates a directory an archive may be written into, and
 // refuses the places one must not be.
@@ -295,6 +332,13 @@ func writeLocked(ctx context.Context, req BackupRequest) (Manifest, error) {
 		{name: EntryAppKey, body: req.AppKeyPEM},
 	}
 
+	targets := make([]TargetIdentity, 0, len(req.Targets))
+
+	for _, target := range req.Targets {
+		files = append(files, entry{name: EntryAppKeyFor(target.Name), body: target.AppKeyPEM})
+		targets = append(targets, TargetIdentity{Name: target.Name, GitHubIdentity: target.GitHub})
+	}
+
 	for name, body := range authority.Present {
 		files = append(files, entry{name: AuthorityEntry(name), body: body})
 	}
@@ -387,6 +431,7 @@ func writeLocked(ctx context.Context, req BackupRequest) (Manifest, error) {
 			StateDir:   req.StateDir,
 		},
 		GitHub:    req.GitHub,
+		Targets:   targets,
 		Authority: facts,
 		Ledger:    ledger,
 		Files:     records,

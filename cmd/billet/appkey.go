@@ -21,32 +21,37 @@ import (
 // account under a name nothing looks at.
 const appKeyParameter = "github-app-key"
 
-// appKeyPath is where this deployment's App key lives in Parameter Store.
-func appKeyPath(ssm *config.IdentitySSMConfig) string {
-	return awsssm.PathFor(ssm.Prefix, appKeyParameter)
+// appKeyPath is where one target's App key lives in Parameter Store: the bare
+// leaf for the default target, so every deployment onboarded before targets
+// existed keeps its key where it was, and a suffixed leaf for the rest.
+func appKeyPath(ssm *config.IdentitySSMConfig, target config.GitHubTarget) string {
+	return awsssm.PathFor(ssm.Prefix, target.KeyName(appKeyParameter))
 }
 
-// resolveAppKey reads the GitHub App private key, from wherever this deployment
-// keeps it.
+// resolveAppKey reads one target's GitHub App private key, from wherever this
+// deployment keeps it.
 //
-// ONE RESOLVER FOR FIVE CALLERS, and that is the point rather than a tidy-up. The
-// key was read at five sites, each naming cfg.GitHub.PrivateKeyPath; a store that
-// is not a file would otherwise have to be taught to every one of them, and the
-// one that got missed would be the one that decides whether a control plane can
-// mint a token.
+// ONE RESOLVER FOR EVERY CALLER, and that is the point rather than a tidy-up.
+// The key was read at five sites, each naming cfg.GitHub.PrivateKeyPath; a store
+// that is not a file would otherwise have to be taught to every one of them, and
+// the one that got missed would be the one that decides whether a control plane
+// can mint a token. It takes the TARGET rather than the config alone for the
+// same reason: a deployment serving several owners holds one key per owner, and
+// a reader of "the" key is a reader of one of them.
 //
 // THE FILE PATH IS UNCHANGED AND STILL GOES THROUGH readPrivateKey, which is the
 // validating reader: one descriptor opened O_NONBLOCK so a FIFO cannot hang it, a
 // regular file, no group or other permission bits, a bounded read, and actually
 // parsed. None of that has an equivalent in a store, where the equivalent is IAM.
-func resolveAppKey(ctx context.Context, cfg *config.Config) ([]byte, error) {
+func resolveAppKey(ctx context.Context, cfg *config.Config, target config.GitHubTarget) ([]byte, error) {
 	if cfg.Server.IdentityBackendKind() != config.IdentitySSM {
-		return readPrivateKey(cfg.GitHub.PrivateKeyPath)
+		return readPrivateKey(target.PrivateKeyPath)
 	}
 
 	ssm := cfg.Server.IdentitySSM()
+	path := appKeyPath(ssm, target)
 
-	param, err := awsssm.New(ssm.Region, awscreds.Default()).Get(ctx, appKeyPath(ssm))
+	param, err := awsssm.New(ssm.Region, awscreds.Default()).Get(ctx, path)
 	if err != nil {
 		if errors.Is(err, awsssm.ErrNotFound) {
 			// NAMED, BECAUSE THE REMEDY IS A COMMAND. A deployment configured for the
@@ -54,10 +59,11 @@ func resolveAppKey(ctx context.Context, cfg *config.Config) ([]byte, error) {
 			// another deployment's prefix, and both are things an operator fixes
 			// rather than debugs.
 			return nil, fmt.Errorf(
-				"this deployment keeps its GitHub App key in Parameter Store and there is "+
-					"nothing at %s. Run `billet github-app create` to register an App and "+
-					"publish its key there, or check that server.identity.aws_ssm.prefix names "+
-					"this deployment's path", appKeyPath(ssm))
+				"this deployment keeps its GitHub App keys in Parameter Store and there is "+
+					"nothing at %s for target %s. Run `billet github-app create --target %s` to "+
+					"register an App and publish its key there, or check that "+
+					"server.identity.aws_ssm.prefix names this deployment's path",
+				path, target.Name, target.Name)
 		}
 
 		return nil, err
@@ -69,22 +75,22 @@ func resolveAppKey(ctx context.Context, cfg *config.Config) ([]byte, error) {
 	key := []byte(param.Value)
 	if err := github.ValidatePrivateKey(key); err != nil {
 		return nil, fmt.Errorf(
-			"the value at %s is not a usable GitHub App private key: %w", appKeyPath(ssm), err)
+			"the value at %s is not a usable GitHub App private key: %w", path, err)
 	}
 
 	return key, nil
 }
 
-// appKeyLocation is what a diagnostic calls the place the key lives.
+// appKeyLocation is what a diagnostic calls the place one target's key lives.
 //
 // FOR AN OPERATOR'S BENEFIT AND NOTHING ELSE. `billet check` reports which of the
 // two a deployment is using, because "the App key is fine" is a different fact
 // depending on where it was read from and an operator debugging a failover needs
 // to know which one they are looking at.
-func appKeyLocation(cfg *config.Config) string {
+func appKeyLocation(cfg *config.Config, target config.GitHubTarget) string {
 	if cfg.Server.IdentityBackendKind() != config.IdentitySSM {
-		return cfg.GitHub.PrivateKeyPath
+		return target.PrivateKeyPath
 	}
 
-	return "AWS Parameter Store " + appKeyPath(cfg.Server.IdentitySSM())
+	return "AWS Parameter Store " + appKeyPath(cfg.Server.IdentitySSM(), target)
 }

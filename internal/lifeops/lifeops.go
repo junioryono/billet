@@ -269,7 +269,8 @@ func (s ServiceFacts) Running() RunningFacts {
 type Report struct {
 	ConfigPath string
 	Config     FileFacts
-	AppKey     FileFacts
+	// AppKeys is one entry per target's key path, in the order given.
+	AppKeys []FileFacts
 
 	// Binary is the running billet's path, for display. The identity judgments
 	// deliberately do not use it: a pathname cannot survive being replaced.
@@ -400,12 +401,15 @@ func NewInspector(opts ...Option) *Inspector {
 // It reports rather than refuses: a status command must answer on a host that
 // is half-configured, which is exactly when somebody runs it. Callers that need
 // a decision make it from these facts.
-func (i *Inspector) Inspect(ctx context.Context, configPath, keyPath string) (Report, error) {
+func (i *Inspector) Inspect(ctx context.Context, configPath string, keyPaths []string) (Report, error) {
 	report := Report{ConfigPath: configPath}
 
 	report.Config = i.fileFacts(configPath)
-	if keyPath != "" {
-		report.AppKey = i.fileFacts(keyPath)
+
+	for _, keyPath := range keyPaths {
+		if keyPath != "" {
+			report.AppKeys = append(report.AppKeys, i.fileFacts(keyPath))
+		}
 	}
 
 	if path, err := i.selfPath(); err != nil {

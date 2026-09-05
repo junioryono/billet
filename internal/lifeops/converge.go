@@ -105,7 +105,10 @@ type UpPlan struct {
 // UpRequest is what the caller wants converged.
 type UpRequest struct {
 	ConfigPath string
-	KeyPath    string
+	// KeyPaths are every target's App key files. A deployment serving several
+	// GitHub targets holds one key per target, and each is inspected, contained
+	// and owned the same way.
+	KeyPaths []string
 	// ServiceUser and ServiceGroup are the identity the packaged units run as.
 	ServiceUser  string
 	ServiceGroup string
@@ -278,7 +281,7 @@ func (r *osRoot) OpenFile(name string, flag int, perm fs.FileMode) (ownedFile, e
 func (c *Converger) Plan(ctx context.Context, req UpRequest) (UpPlan, error) {
 	var plan UpPlan
 
-	report, err := c.inspector.Inspect(ctx, req.ConfigPath, req.KeyPath)
+	report, err := c.inspector.Inspect(ctx, req.ConfigPath, req.KeyPaths)
 	if err != nil {
 		return plan, err
 	}
@@ -851,14 +854,18 @@ func ownershipChanges(report Report, req UpRequest) []OwnershipChange {
 	// to start while 0600 root:root is unreadable by it. The only arrangement
 	// satisfying both is the ordinary one: the process that needs the secret
 	// owns the secret.
-	if report.AppKey.Path != "" && report.AppKey.Exists == Yes {
-		if report.AppKey.Owner != req.ServiceUser || report.AppKey.Group != req.ServiceGroup ||
-			report.AppKey.Mode.Perm() != 0o600 {
+	for _, key := range report.AppKeys {
+		if key.Path == "" || key.Exists != Yes {
+			continue
+		}
+
+		if key.Owner != req.ServiceUser || key.Group != req.ServiceGroup ||
+			key.Mode.Perm() != 0o600 {
 			changes = append(changes, OwnershipChange{
-				Path: report.AppKey.Path, Owner: req.ServiceUser, Group: req.ServiceGroup, Mode: 0o600,
+				Path: key.Path, Owner: req.ServiceUser, Group: req.ServiceGroup, Mode: 0o600,
 				Why: "billet refuses an App key readable beyond its owner, and the service must " +
 					"still be able to read it",
-				at: report.AppKey.Info,
+				at: key.Info,
 			})
 		}
 	}
@@ -1637,7 +1644,7 @@ func (c *Converger) Services() (string, string) {
 // from a systemd inspector meant the refusal silently reported on systemd units
 // on a host that has none.
 func (c *Converger) Running(ctx context.Context, req UpRequest) ([]RunningFacts, error) {
-	report, err := c.inspector.Inspect(ctx, req.ConfigPath, req.KeyPath)
+	report, err := c.inspector.Inspect(ctx, req.ConfigPath, req.KeyPaths)
 	if err != nil {
 		return nil, err
 	}

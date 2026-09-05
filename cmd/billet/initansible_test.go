@@ -868,7 +868,7 @@ func TestNoIdentityGuidance(t *testing.T) {
 	// so noIdentityGuidance takes no provider at all — which is a stronger
 	// statement than a loop over three identical outputs could make.
 	t.Run("it mints an identity without generating anything", func(t *testing.T) {
-		got := noIdentityGuidance("/etc/billet/billet.yaml", "acme", flags)
+		got := noIdentityGuidance("/etc/billet/billet.yaml", "acme", "", flags)
 
 		for _, want := range []string{
 			"refused when the config is LOADED",
@@ -894,7 +894,7 @@ func TestNoIdentityGuidance(t *testing.T) {
 	})
 
 	t.Run("the org placeholder survives a shell", func(t *testing.T) {
-		got := noIdentityGuidance("/etc/billet/billet.yaml", "", flags)
+		got := noIdentityGuidance("/etc/billet/billet.yaml", "", "", flags)
 
 		// A bare <your-org> is input redirection: the shell removes it from
 		// argv or fails before billet starts, and the App is never created.
@@ -1038,7 +1038,7 @@ func TestTheThirdPrintedCommandActuallyRuns(t *testing.T) {
 	}
 
 	// Step three, lifted from the guidance verbatim.
-	guidance := noIdentityGuidance("/etc/billet/billet.yaml", "acme",
+	guidance := noIdentityGuidance("/etc/billet/billet.yaml", "acme", "",
 		[]string{"--org", "acme", "--provider", "docker",
 			"--runner-group", testTrialGroup, "--workflow", testTrialWorkflow})
 

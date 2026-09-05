@@ -37,8 +37,13 @@ type Config struct {
 	Server *ServerConfig `yaml:"server,omitempty"`
 	// Node is required by `billet node`, ignored by a pure server.
 	Node *NodeConfig `yaml:"node,omitempty"`
-	// GitHub is required by `billet server`.
+	// GitHub is the target named DefaultTargetName: the one organization or
+	// repository a single-target deployment serves. `billet server` needs it or
+	// at least one entry under Targets.
 	GitHub *GitHubConfig `yaml:"github,omitempty"`
+	// Targets are the further organizations and repositories this deployment
+	// serves, each with its own App credential. See GitHubTargets.
+	Targets []GitHubConfig `yaml:"targets,omitempty"`
 	// Tiers is the runner catalog. Each tier becomes one GitHub scale set, and
 	// its Label is what users put in `runs-on`.
 	Tiers []Tier `yaml:"tiers,omitempty"`
@@ -1929,14 +1934,26 @@ func (b *CodeBuildConfig) InventoryWindowMinutes() int {
 // cost of being too tight is a running build read as gone.
 const codeBuildWindowSlackMinutes = 60
 
-// GitHubConfig holds the App identity used to manage runners.
+// GitHubConfig is one GitHub target and the App identity that manages its
+// runners: the `github:` block, or one entry under `targets:`.
 //
-// billet requests exactly two permissions: metadata:read and
-// organization_self_hosted_runners:read+write. It deliberately does not request
-// actions:read, which would expose workflow runs, logs, and artifacts.
+// billet requests exactly two permissions per target: metadata:read and, for an
+// organization, organization_self_hosted_runners:read+write, or for a
+// repository, the repository permission administration:write, which is the only
+// permission GitHub offers for registering a repository's runners. It
+// deliberately does not request actions:read, which would expose workflow runs,
+// logs, and artifacts.
 type GitHubConfig struct {
-	Org   string `yaml:"org"`
-	AppID int64  `yaml:"app_id"`
+	// Name is the target's name under `targets:`, what a tier's `target` names.
+	// Refused under `github:`, whose name is DefaultTargetName.
+	Name string `yaml:"name,omitempty"`
+	// Org is the organization this target is. Exactly one of Org and Repository.
+	Org string `yaml:"org,omitempty"`
+	// Repository is the repository this target is, as owner/name. Its runners
+	// belong to the repository alone: a repository has no runner groups, so a
+	// tier under it is untrusted only.
+	Repository string `yaml:"repository,omitempty"`
+	AppID      int64  `yaml:"app_id"`
 	// ClientID is the App's OAuth client identifier, and it is OPTIONAL.
 	//
 	// GitHub's newer guidance prefers it over the numeric app id as the JWT
@@ -2024,6 +2041,12 @@ func (b *BackupS3Config) normalize() {
 // Tier is one runner shape. Its Label is what appears in `runs-on`.
 type Tier struct {
 	Label string `yaml:"label"`
+
+	// Target names the GitHub target this tier's scale set belongs to. Defaults
+	// to the deployment's only target and is required when there are several,
+	// because a scale set exists on exactly one organization or repository and
+	// the credential that creates it is that target's.
+	Target string `yaml:"target,omitempty"`
 
 	// Trust is the authority every member of this runner pool receives before
 	// GitHub assigns it a job. It is explicit because scale-set JIT runners are
@@ -3029,6 +3052,8 @@ func (c *Config) applyDefaults() {
 		c.Tiers[i].Node = trimNodeName(c.Tiers[i].Node)
 	}
 
+	c.defaultTierTargets()
+
 	if c.Backup != nil {
 		c.Backup.S3.normalize()
 	}
@@ -3317,7 +3342,9 @@ func (c *Config) Validate() error {
 	}
 
 	errs = append(errs, c.validateServer()...)
-	errs = append(errs, c.validateGitHub()...)
+	errs = append(errs, c.validateTargets()...)
+	errs = append(errs, c.validateTargetKeyPaths()...)
+	errs = append(errs, c.validateTierTargets()...)
 	errs = append(errs, c.validateNode()...)
 	errs = append(errs, c.validateNoTestOnlyBackend()...)
 	errs = append(errs, c.validateNodes()...)
@@ -3554,18 +3581,6 @@ func (c *Config) validateSSMIdentity() []error {
 				"than the same one written informally", ssm.Prefix))
 	}
 
-	// TWO SPELLINGS OF ONE VALUE, WHICH THIS FILE HAS ALREADY GOT WRONG THREE
-	// TIMES. With the App key in Parameter Store there is no path to read, and a
-	// config carrying both would leave an operator unable to tell which one the
-	// deployment is actually using — or worse, updating the one nothing reads.
-	if c.GitHub != nil && c.GitHub.PrivateKeyPath != "" {
-		errs = append(errs, fmt.Errorf(
-			"github.private_key_path is written and server.identity.backend is %s, which are "+
-				"two spellings of where the App key lives. With this backend the key is a "+
-				"SecureString under %s, so remove the path; `billet github-app create` writes "+
-				"it there", IdentitySSM, ssm.Prefix))
-	}
-
 	return errs
 }
 
@@ -3784,36 +3799,6 @@ func addressesOverlap(a, b string) bool {
 // isWildcardHost reports whether a listen host accepts on every interface.
 func isWildcardHost(host string) bool {
 	return host == "" || host == "0.0.0.0" || host == "::"
-}
-
-func (c *Config) validateGitHub() []error {
-	if c.GitHub == nil {
-		if c.Server != nil {
-			return []error{errors.New("github section is required for the server role")}
-		}
-		return nil
-	}
-	var errs []error
-	// CheckOrg rather than a non-empty test: this name is concatenated into the
-	// scale-set client's organization URL, so a value that validates here and
-	// names a different organization there is the whole failure.
-	if err := CheckOrg(c.GitHub.Org); err != nil {
-		errs = append(errs, err)
-	}
-	if c.GitHub.AppID <= 0 {
-		errs = append(errs, errors.New("github.app_id is required; run `billet github-app create`"))
-	}
-	if c.GitHub.InstallationID <= 0 {
-		errs = append(errs, errors.New("github.installation_id is required; creating an App does not install it"))
-	}
-	// REQUIRED ONLY WHILE THE KEY IS A FILE. With the identity store selected the
-	// App key is a SecureString and there is no path to name, so requiring one
-	// would make a correct deployment unloadable — and the two-spellings refusal
-	// beside it means a config cannot carry both.
-	if c.GitHub.PrivateKeyPath == "" && c.Server.IdentityBackendKind() == IdentityFile {
-		errs = append(errs, errors.New("github.private_key_path is required"))
-	}
-	return errs
 }
 
 func (c *Config) validateNode() []error {

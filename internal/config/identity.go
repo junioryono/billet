@@ -20,15 +20,16 @@ import (
 //
 // An IDENTITY is different, and gets refused instead. A site name is matched
 // against what a node's registration presents, on another machine; an
-// organization is matched against what GitHub has. Trimming those quietly
-// changes which deployment or which organization the config names, and the
-// operator never sees that it happened — so billet says so and keeps their own
-// bytes in the diagnostic. The set is: sites[].name, tiers[].site, node.site,
-// github.org and tiers[].runner_group.
+// organization or a repository is matched against what GitHub has. Trimming
+// those quietly changes which deployment or which target the config names, and
+// the operator never sees that it happened — so billet says so and keeps their
+// own bytes in the diagnostic. The set is: sites[].name, tiers[].site,
+// node.site, github.org, github.repository, targets[].org,
+// targets[].repository and tiers[].runner_group.
 //
-// Node names and tier labels need nothing here: labelRe admits no whitespace at
-// all, and applyDefaults writes trimNodeName's result back before anything reads
-// it.
+// Node names, tier labels and target names need nothing here: labelRe admits no
+// whitespace at all, and applyDefaults writes trimNodeName's result back before
+// anything reads it.
 
 // checkIdentityPadding refuses surrounding whitespace on a value billet matches
 // exactly.
@@ -47,33 +48,37 @@ func checkIdentityPadding(where, value string) error {
 		"padding", where, value)
 }
 
-// orgUnsafe are the characters that make github.org name a different
-// organization than the one written, or no organization at all.
+// orgUnsafe are the characters that make an owner or a repository name name a
+// different thing than the one written, or nothing at all.
 //
 // MEASURED AGAINST BOTH CONSTRUCTIONS THE VALUE GOES THROUGH, not reasoned about
 // — the same discipline checkRunnerGroup's list came from, and for the same
 // reason: the two boundaries disagree about which characters matter, and only
 // one of them reports anything. billet builds the scale-set client's config URL
-// as "https://github.com/" + org UNESCAPED (cmd/billet), and the REST path as
-// /orgs/ + url.PathEscape(org) + /installation (internal/github). PathEscape
-// carries everything faithfully; the config URL is where the damage happens, and
-// actions/scaleset v0.4.0's parseGitHubConfigFromURL is what reads it back —
-// url.Parse, then the path split on "/".
+// as "https://github.com/" + path UNESCAPED (cmd/billet), and the REST path as
+// /orgs/ + url.PathEscape(owner) or /repos/ + url.PathEscape(owner) + "/" +
+// url.PathEscape(name) (internal/github). PathEscape carries everything
+// faithfully; the config URL is where the damage happens, and actions/scaleset
+// v0.4.0's parseGitHubConfigFromURL is what reads it back — url.Parse, then the
+// path split on "/".
 //
-// Sweeping printable ASCII through both returned exactly these four:
+// Sweeping printable ASCII through both returned exactly these four, for an
+// owner and again for a repository name (2026-09-04, the same four in the same
+// boundary):
 //
 //   - '/' — a second path segment is a REPOSITORY. "acme/x" resolves to
 //     organization "acme", repository "x", and NOTHING reports it. A trailing
 //     one is worse still: parseGitHubConfigFromURL trims it, so "acme/" is
-//     silently "acme".
+//     silently "acme". Inside a repository name a third segment makes the URL
+//     invalid outright.
 //   - '#' and '?' — the rest of the value becomes the fragment or the query, so
-//     the organization is the shorter string in front of it. "acme # prod"
-//     resolves to "acme ".
+//     the name is the shorter string in front of it. "acme # prod" resolves to
+//     "acme ".
 //   - '%' — escapes are DECODED, so "%41" arrives as "A", and an incomplete one
 //     ("acme%corp") makes url.Parse refuse the URL outright.
 //
 // Everything else survives both boundaries byte-for-byte, non-ASCII included, so
-// nothing else is refused. TestCheckOrgAgreesWithTheBoundariesOverAllOfASCII
+// nothing else is refused. TestOwnerRulesAgreeWithTheBoundariesOverAllOfASCII
 // sweeps the whole range rather than sampling it, so a character added to or
 // removed from this set has to agree with what the boundaries do — a handpicked
 // table cannot find one that is MISSING, which is the failure that matters.
@@ -86,15 +91,14 @@ const orgUnsafe = "#%/?"
 // orgUnsafeReason says what each character does, so the diagnostic names the
 // consequence rather than the rule.
 var orgUnsafeReason = map[rune]string{
-	'/': "the scale-set client reads a second path segment as a repository, so this resolves " +
-		"to an organization and a repository rather than to the organization you wrote — and a " +
-		"trailing slash is simply dropped",
-	'#': "everything after it becomes the URL fragment, so the organization billet asks about " +
+	'/': "the scale-set client reads each path segment as a scope, so this resolves " +
+		"to something other than the name you wrote — and a trailing slash is simply dropped",
+	'#': "everything after it becomes the URL fragment, so the name billet asks about " +
 		"is the shorter string in front of it",
-	'?': "everything after it becomes the URL query, so the organization billet asks about is " +
+	'?': "everything after it becomes the URL query, so the name billet asks about is " +
 		"the shorter string in front of it",
 	'%': "a percent escape is decoded before the name is read, so %41 arrives as A, and an " +
-		"incomplete escape makes the organization URL unparseable",
+		"incomplete escape makes the URL unparseable",
 }
 
 // CheckOrg reports why github.org cannot be carried to GitHub as written, or nil.
@@ -104,35 +108,102 @@ var orgUnsafeReason = map[rune]string{
 // so a bad flag is refused by its own name rather than surfacing later as a
 // config-load error blaming a generated file.
 func CheckOrg(org string) error {
+	return checkOrg("github.org", org)
+}
+
+// checkOrg is CheckOrg with the field named by the caller, because the same
+// rule guards github.org and every targets[].org.
+func checkOrg(where, org string) error {
 	// An empty and a whitespace-only value are the SAME fact — nobody named an
 	// organization — and reporting the second as padding would send an operator
 	// to remove spaces from a field they never filled in.
 	if strings.TrimSpace(org) == "" {
-		return errors.New("github.org is required")
+		return fmt.Errorf("%s is required", where)
 	}
 
-	if err := checkIdentityPadding("github.org", org); err != nil {
+	if err := checkIdentityPadding(where, org); err != nil {
 		return err
 	}
 
-	for _, r := range org {
+	return checkOwnerSegment(where, org, "organization")
+}
+
+// CheckRepository reports why a repository target written as owner/name cannot
+// be carried to GitHub as written, or nil.
+//
+// Exported for the reason CheckOrg is: `billet init --repository` and
+// `billet github-app create --repository` validate the flag against the one
+// rule config validation applies.
+func CheckRepository(repository string) error {
+	return checkRepository("github.repository", repository)
+}
+
+// checkRepository is CheckRepository with the field named by the caller.
+//
+// EXACTLY ONE SLASH, and each half is held to the owner rule. The client reads
+// "owner/name" as repository scope and anything with more or fewer segments as
+// a different scope or an invalid URL, so the shape is refused here rather than
+// reported by GitHub as a 404 that never mentions the config.
+func checkRepository(where, repository string) error {
+	if strings.TrimSpace(repository) == "" {
+		return fmt.Errorf("%s is required", where)
+	}
+
+	if err := checkIdentityPadding(where, repository); err != nil {
+		return err
+	}
+
+	owner, name, ok := SplitRepository(repository)
+	if !ok {
+		return fmt.Errorf("%s %q must be written as owner/name — the repository's full name, "+
+			"which is the last two path segments of its GitHub URL", where, repository)
+	}
+
+	if err := checkOwnerSegment(where, owner, "owner"); err != nil {
+		return err
+	}
+
+	return checkOwnerSegment(where, name, "repository name")
+}
+
+// SplitRepository splits owner/name into its halves, reporting false for
+// anything that is not exactly two non-empty segments.
+func SplitRepository(repository string) (string, string, bool) {
+	owner, name, found := strings.Cut(repository, "/")
+	if !found || owner == "" || name == "" || strings.Contains(name, "/") {
+		return "", "", false
+	}
+
+	return owner, name, true
+}
+
+// checkOwnerSegment applies the transport rule to one path segment: an
+// organization, a repository owner or a repository name, each of which travels
+// the same two boundaries.
+func checkOwnerSegment(where, segment, what string) error {
+	for _, r := range segment {
 		switch {
 		// AN ASCII CONTROL, NOT unicode.IsControl. net/url refuses a control
 		// BYTE — below 0x20, or 0x7f — and a multi-byte rune has none of those
 		// bytes, so a C1 control such as U+0080 travels both constructions
 		// completely unchanged. Refusing it under a message that says url.Parse
 		// would reject it is a rule stating a reason that is not true, which is
-		// the thing this file exists to stop doing; an org name nobody can
-		// register is GitHub's 404 to give, not billet's.
+		// the thing this file exists to stop doing; a name nobody can register
+		// is GitHub's 404 to give, not billet's.
 		case r < 0x20 || r == 0x7f:
-			return fmt.Errorf("github.org %q contains an ASCII control character (%U); billet "+
-				"builds the organization URL from this name and url.Parse refuses control bytes, "+
-				"so the client would fail to start rather than reach GitHub", org, r)
+			return fmt.Errorf("%s %q contains an ASCII control character (%U) in the %s; billet "+
+				"builds the GitHub URL from this name and url.Parse refuses control bytes, "+
+				"so the client would fail to start rather than reach GitHub", where, segment, r, what)
 		case strings.ContainsRune(orgUnsafe, r):
-			return fmt.Errorf("github.org %q contains %q: %s. Write the organization's login on "+
-				"its own — the last path segment of its GitHub URL", org, r, orgUnsafeReason[r])
+			return fmt.Errorf("%s %q contains %q in the %s: %s. Write the %s's login on "+
+				"its own — the path segment of its GitHub URL", where, segment, r, what,
+				orgUnsafeReason[r], what)
 		}
 	}
 
 	return nil
 }
+
+// errNoTarget is the refusal for a server-role config naming no GitHub target.
+var errNoTarget = errors.New("github section is required for the server role " +
+	"(or a targets list; a control plane serves at least one organization or repository)")

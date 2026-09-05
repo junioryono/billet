@@ -257,9 +257,11 @@ const PlaceholderAMI = "ami-REPLACE-run-billet-ami-build"
 
 // Params is everything `billet init` decided or was told, for one machine.
 type Params struct {
-	// Org is the GitHub organization these runners serve. May be empty at
-	// generation time; `github-app create` supplies it alongside the App ids.
-	Org string
+	// Org is the GitHub organization these runners serve, or Repository the one
+	// repository as owner/name — exactly one, or neither at generation time,
+	// when `github-app create` supplies it alongside the App ids.
+	Org        string
+	Repository string
 	// Provider is the compute backend. Docker, Firecracker and EC2 are all rendered.
 	Provider config.ProviderKind
 	// Image is the tier's image, handed verbatim to the backend: a container
@@ -387,6 +389,30 @@ func Generate(p Params) (string, bool, error) {
 		if err := config.CheckOrg(p.Org); err != nil {
 			return "", false, fmt.Errorf("--org: %w", err)
 		}
+	}
+
+	if p.Repository != "" {
+		if err := config.CheckRepository(p.Repository); err != nil {
+			return "", false, fmt.Errorf("--repository: %w", err)
+		}
+	}
+
+	if p.Org != "" && p.Repository != "" {
+		return "", false, errors.New("--org and --repository are both set, and a target is " +
+			"exactly one of them: an organization, or one repository")
+	}
+
+	// A REPOSITORY HAS NO RUNNER GROUPS, so no trusted pool can exist under it:
+	// the policy flags are refused by name rather than rendered into a config
+	// that fails to load, and a docker trial, which admits only trusted work, is
+	// refused before the generic "needs a policy" answer can send the operator to
+	// create a runner group that GitHub has nowhere to put.
+	if p.Repository != "" && (p.RunnerGroup != "" || len(p.Workflows) > 0) {
+		return "", false, errRepositoryHasNoPool
+	}
+
+	if p.Repository != "" && p.Provider == config.ProviderDocker {
+		return "", false, errDockerCannotServeRepository
 	}
 	// A BLANK-BUT-PRESENT VALUE IS NOT AN ABSENT ONE. Normalization trims, and a
 	// runner group of only whitespace would trim to empty and read as "no policy"
@@ -665,6 +691,24 @@ var errDockerNeedsPolicy = errors.New(
 		"runner group in your org (Settings → Actions → Runner groups), restrict it to the " +
 		"repositories and workflows you trust, and pass its name as --runner-group with each " +
 		"allowed workflow as --workflow owner/repo/.github/workflows/file.yml@refs/heads/main")
+
+// errRepositoryHasNoPool is what --repository with a trusted-pool policy gets.
+var errRepositoryHasNoPool = errors.New(
+	"--runner-group and --workflow name a trusted pool, and a repository target cannot " +
+		"carry one: GitHub restricts a pool through an organization's runner groups, and a " +
+		"repository has none, so every tier under a repository target is untrusted. Drop " +
+		"both flags, or use --org for an organization whose runner group can be restricted")
+
+// errDockerCannotServeRepository is what --repository with the docker backend
+// gets: the one backend that admits only trusted work, on the one target kind
+// that cannot express any.
+var errDockerCannotServeRepository = errors.New(
+	"a docker trial cannot serve a repository target: docker shares the host kernel, so " +
+		"it refuses any workload that is not trusted, and a trusted pool is a runner group " +
+		"GitHub restricts, which a repository does not have. Use --org for a docker trial, " +
+		"or a backend that admits untrusted work behind a boundary of its own for " +
+		"--repository: firecracker (an untrusted bridge), tart (softnet isolation), ec2 " +
+		"(untrusted security groups)")
 
 // trusted reports whether the tier policy makes a trusted pool, validating it
 // when any part is present. Absent policy is a legal untrusted pool (which
@@ -1022,10 +1066,7 @@ func firecrackerNodeBlocks(trusted bool, h HostInputs) string {
 // value: an operator reading this file should see which numbers billet measured,
 // which it chose, and what changing one costs.
 func renderConfig(p Params, trusted bool, appID, installationID int) string {
-	org := p.Org
-	if org == "" {
-		org = "<your-org>"
-	}
+	scope := scopeLineFor(p.Org, p.Repository)
 
 	paths := p.paths()
 
@@ -1104,7 +1145,7 @@ server:
   max_memory: %s
 
 github:
-  org: %s
+%s
 
   # Filled in by `+"`billet github-app create --config <this file>`"+`.
   app_id: %d
@@ -1141,7 +1182,7 @@ tiers:
 		p.VCPU, p.Memory, ceilVCPU, ceilMemory,
 		p.VCPU-ceilVCPU, p.Memory-ceilMemory,
 		ceilVCPU, ceilMemory,
-		yamlScalar(org),
+		scope,
 		appID, installationID,
 		yamlScalar(paths.keyPath),
 		nameBlock,
@@ -1470,10 +1511,7 @@ func ec2InstanceTypesYAML(shapes []config.EC2InstanceType) string {
 // ceiling is the declared cloud budget rather than a measurement minus headroom,
 // and the node carries an ec2 block instead of firecracker and ceph.
 func renderEC2Config(p Params, trusted bool, appID, installationID int) string {
-	org := p.Org
-	if org == "" {
-		org = "<your-org>"
-	}
+	scope := scopeLineFor(p.Org, p.Repository)
 
 	paths := p.paths()
 	e := p.EC2
@@ -1536,7 +1574,7 @@ server:
   max_memory: %s
 
 github:
-  org: %s
+%s
 
   # Filled in by `+"`billet github-app create --config <this file>`"+`.
   app_id: %d
@@ -1585,7 +1623,7 @@ tiers:
 		yamlScalar(p.Listen),
 		serverStateYAML(p.State, paths.serverState),
 		p.VCPU, p.Memory,
-		yamlScalar(org),
+		scope,
 		appID, installationID,
 		yamlScalar(paths.keyPath),
 		yamlScalar(p.Listen),
@@ -1618,4 +1656,30 @@ func renderEC2Tiers(ts []tier, p Params, trusted bool) string {
 	}
 
 	return b.String()
+}
+
+// scopeLineFor renders the github block's scope line: the organization, the
+// repository as owner/name, or the placeholder an operator fills in.
+//
+// ONE RENDERER FOR EVERY GENERATOR, because a target is exactly one of the two
+// and a generator that wrote both would write a config that refuses to load.
+func scopeLineFor(org, repository string) string {
+	switch {
+	case repository != "":
+		return "  repository: " + yamlScalar(repository)
+	case org != "":
+		return "  org: " + yamlScalar(org)
+	default:
+		return "  org: " + yamlScalar("<your-org>")
+	}
+}
+
+// TargetPath is the GitHub path these runners serve, or empty when neither an
+// organization nor a repository was given.
+func (p Params) TargetPath() string {
+	if p.Repository != "" {
+		return p.Repository
+	}
+
+	return p.Org
 }

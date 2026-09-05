@@ -66,7 +66,7 @@ func TestARestartWaitsForAnAbandonedSessionRatherThanFailing(t *testing.T) {
 	// test green while every restart went back to failing. runTier returns before
 	// building a listener, because the fake's answer after the refusals is an
 	// error, so this reaches the real call site without needing a live listener.
-	err := s.runTier(t.Context(), &config.Tier{Label: "linux"}, &ScaleSet{ID: 1})
+	err := s.runTier(t.Context(), &config.Tier{Label: "linux"}, &ScaleSet{ID: 1}, s.prov)
 
 	// It gets past the refusals: the error it ends on is the one AFTER them, not
 	// the conflict.
@@ -89,7 +89,7 @@ func TestASessionThatFailsForAnotherReasonIsNotRetried(t *testing.T) {
 	held := &heldSessions{refusals: 0}
 	s := &Server{prov: held, log: slog.New(slog.DiscardHandler), owner: "billet"}
 
-	_, err := s.openSession(t.Context(), &config.Tier{Label: "linux"}, &ScaleSet{ID: 1})
+	_, err := s.openSession(t.Context(), &config.Tier{Label: "linux"}, &ScaleSet{ID: 1}, s.prov)
 	if err == nil {
 		t.Fatal("a failure to open a session was reported as success")
 	}
@@ -116,7 +116,7 @@ func TestTheWaitForASessionEndsWhenTheDeploymentStops(t *testing.T) {
 	done := make(chan error, 1)
 
 	go func() {
-		_, err := s.openSession(ctx, &config.Tier{Label: "linux"}, &ScaleSet{ID: 1})
+		_, err := s.openSession(ctx, &config.Tier{Label: "linux"}, &ScaleSet{ID: 1}, s.prov)
 		done <- err
 	}()
 

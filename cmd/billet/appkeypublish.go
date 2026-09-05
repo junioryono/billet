@@ -20,14 +20,14 @@ import (
 // publication that can destroy the only copy of a credential. Parameter Store has
 // conditional create natively, which is why this is three lines rather than the
 // four review rounds the file path took.
-func publishAppKey(ctx context.Context, cfg *config.Config, pem []byte) error {
+func publishAppKey(ctx context.Context, cfg *config.Config, target config.GitHubTarget, pem []byte) error {
 	ssm := cfg.Server.IdentitySSM()
 	if ssm == nil {
 		return errors.New(
 			"this deployment does not keep its App key in an identity store")
 	}
 
-	name := appKeyPath(ssm)
+	name := appKeyPath(ssm, target)
 
 	_, err := awsssm.New(ssm.Region, awscreds.Default()).Put(ctx, name, string(pem), awsssm.PutOptions{
 		Overwrite: false,
@@ -66,6 +66,7 @@ func githubAppStoreKey(ctx context.Context, args []string) error {
 	fs := newFlagSet("github-app store-key")
 	from := fs.String("from", "", "the file holding the App private key")
 	configPath := fs.String("config", "", "path to billet.yaml")
+	targetName := fs.String("target", "", "the target this key belongs to (default: the only one)")
 
 	if err := parse(fs, args); err != nil {
 		return err
@@ -87,16 +88,21 @@ func githubAppStoreKey(ctx context.Context, args []string) error {
 			cfg.Server.IdentityBackendKind())
 	}
 
+	target, err := targetByName(cfg, *targetName)
+	if err != nil {
+		return err
+	}
+
 	pem, err := readPrivateKey(*from)
 	if err != nil {
 		return err
 	}
 
-	if err := publishAppKey(ctx, cfg, pem); err != nil {
+	if err := publishAppKey(ctx, cfg, target, pem); err != nil {
 		return err
 	}
 
-	fmt.Printf("Published the App private key to %s\n", appKeyLocation(cfg))
+	fmt.Printf("Published the App private key to %s\n", appKeyLocation(cfg, target))
 	fmt.Printf("\nThe copy at %s is now a second copy of an unrepeatable credential.\n"+
 		"Remove it once `billet check` reports this deployment healthy.\n", *from)
 
@@ -111,10 +117,16 @@ func githubAppStoreKey(ctx context.Context, args []string) error {
 // failure mode with no way back: the App registered, the key gone. Writing it
 // down first means every failure below leaves a file an operator can publish with
 // `billet github-app store-key`, which is what the message says.
-func storeAppKeyDuringOnboarding(ctx context.Context, cfgPath, keyPath string, pem []byte) {
+func storeAppKeyDuringOnboarding(ctx context.Context, cfgPath, targetName, keyPath string, pem []byte) {
+	var target config.GitHubTarget
+
 	cfg, err := config.Load(cfgPath)
 	if err == nil {
-		err = publishAppKey(ctx, cfg, pem)
+		target, err = targetByName(cfg, targetName)
+	}
+
+	if err == nil {
+		err = publishAppKey(ctx, cfg, target, pem)
 	}
 
 	if err != nil {
@@ -122,13 +134,13 @@ func storeAppKeyDuringOnboarding(ctx context.Context, cfgPath, keyPath string, p
 			"\nThe App was created and its key saved to %s, but publishing it to this "+
 				"deployment's identity store failed:\n  %v\n\n"+
 				"The key is NOT lost. Fix the problem above and run:\n"+
-				"  billet github-app store-key --from %s\n",
-			keyPath, err, keyPath)
+				"  billet github-app store-key --from %s --target %s\n",
+			keyPath, err, keyPath, targetName)
 
 		return
 	}
 
-	fmt.Printf("Published the private key to %s\n", appKeyLocation(cfg))
+	fmt.Printf("Published the private key to %s\n", appKeyLocation(cfg, target))
 	fmt.Printf("The copy at %s is a second copy of an unrepeatable credential; "+
 		"remove it once `billet check` reports this deployment healthy.\n", keyPath)
 }

@@ -24,10 +24,17 @@ type Manifest struct {
 	// between the manifest and the file is itself detectable.
 	DeploymentID string `json:"deployment_id"`
 
-	Source    Source         `json:"source"`
-	GitHub    GitHubIdentity `json:"github"`
-	Authority AuthorityFacts `json:"authority"`
-	Ledger    LedgerFacts    `json:"ledger"`
+	Source Source `json:"source"`
+	// GitHub is the DEFAULT target's App identity, the one the `github:` block
+	// declares, whose key travels as EntryAppKey.
+	GitHub GitHubIdentity `json:"github"`
+	// Targets are the FURTHER targets the deployment serves, each with its own
+	// App and its key under EntryAppKeyFor. Schema 3; empty on every archive of
+	// a single-target deployment, which is what keeps such an archive readable
+	// by the billet that wrote it.
+	Targets   []TargetIdentity `json:"targets,omitempty"`
+	Authority AuthorityFacts   `json:"authority"`
+	Ledger    LedgerFacts      `json:"ledger"`
 
 	Files []FileRecord `json:"files"`
 }
@@ -47,25 +54,43 @@ type Source struct {
 // config naming a different app_id produces a deployment that authenticates as
 // nothing and reports a bare 401 on its first poll.
 type GitHubIdentity struct {
-	Org            string `json:"org"`
+	// Org is the organization, or Repository the owner/name, exactly one of
+	// them: a target is one or the other.
+	Org            string `json:"org,omitempty"`
+	Repository     string `json:"repository,omitempty"`
 	AppID          int64  `json:"app_id"`
 	ClientID       string `json:"client_id,omitempty"`
 	InstallationID int64  `json:"installation_id"`
 }
 
-// Same reports whether two App identities describe the same App.
+// Same reports whether two App identities describe the same App on the same
+// target.
 //
 // ClientID IS NOT COMPARED. It is optional — every config written before the
 // field existed omits it — so requiring it to match would refuse a correct
 // restore on the strength of a field one side simply never recorded.
 func (g GitHubIdentity) Same(other GitHubIdentity) bool {
 	return g.Org == other.Org &&
+		g.Repository == other.Repository &&
 		g.AppID == other.AppID &&
 		g.InstallationID == other.InstallationID
 }
 
+// IsZero reports an identity naming nothing.
+func (g GitHubIdentity) IsZero() bool { return g == GitHubIdentity{} }
+
 func (g GitHubIdentity) String() string {
+	if g.Repository != "" {
+		return fmt.Sprintf("repository %s, app %d, installation %d", g.Repository, g.AppID, g.InstallationID)
+	}
+
 	return fmt.Sprintf("org %s, app %d, installation %d", g.Org, g.AppID, g.InstallationID)
+}
+
+// TargetIdentity is a further target's name and the App that serves it.
+type TargetIdentity struct {
+	Name string `json:"name"`
+	GitHubIdentity
 }
 
 // AuthorityFacts is what the archive holds of the node-wire CA.
@@ -200,6 +225,26 @@ func decodeManifest(body []byte) (Manifest, error) {
 		return Manifest{}, fmt.Errorf(
 			"%w: %s declares schema %d and also says the ledger is external, which schema %d "+
 				"has no way to express", errNotAnArchive, EntryManifest, m.Schema, m.Schema)
+	}
+
+	// THE SAME RULE FOR FURTHER TARGETS, which schema 3 introduced: a schema-1
+	// or -2 manifest listing targets was written by nothing billet ships, and
+	// reading it would plan keys under entry names those schemas never had.
+	if m.Schema < 3 && len(m.Targets) > 0 {
+		return Manifest{}, fmt.Errorf(
+			"%w: %s declares schema %d and also lists further targets, which schema %d "+
+				"has no way to express", errNotAnArchive, EntryManifest, m.Schema, m.Schema)
+	}
+
+	seen := make(map[string]bool, len(m.Targets))
+
+	for _, target := range m.Targets {
+		if target.Name == "" || seen[target.Name] || target.IsZero() {
+			return Manifest{}, fmt.Errorf("%w: %s lists a further target with no name, a "+
+				"duplicate name, or no App identity", errNotAnArchive, EntryManifest)
+		}
+
+		seen[target.Name] = true
 	}
 
 	// AND AN EXTERNAL LEDGER NAMES AN ENGINE THIS BUILD CAN PAIR WITH.

@@ -60,6 +60,12 @@ func requiredEntries(m Manifest) []string {
 		required = append(required, EntryLedger)
 	}
 
+	// EVERY FURTHER TARGET'S KEY, because the manifest says the deployment
+	// serves that target: an archive missing one restores half a deployment.
+	for _, target := range m.Targets {
+		required = append(required, EntryAppKeyFor(target.Name))
+	}
+
 	return required
 }
 
@@ -91,6 +97,13 @@ func knownEntries(m Manifest) map[string]bool {
 
 	for _, f := range wirecert.AuthorityFiles {
 		out[AuthorityEntry(f.Name)] = true
+	}
+
+	// A further target's key is known only when the manifest lists the target,
+	// so a key entry for a target the manifest does not name is refused as
+	// something this archive cannot account for.
+	for _, target := range m.Targets {
+		out[EntryAppKeyFor(target.Name)] = true
 	}
 
 	return out
@@ -397,6 +410,13 @@ func (a *Archive) crossCheck() error {
 	if err := github.ValidatePrivateKey(a.small[EntryAppKey]); err != nil {
 		return fmt.Errorf("deployarchive: the GitHub App private key in this backup does not "+
 			"parse: %w", err)
+	}
+
+	for _, target := range a.Manifest.Targets {
+		if err := github.ValidatePrivateKey(a.small[EntryAppKeyFor(target.Name)]); err != nil {
+			return fmt.Errorf("deployarchive: the GitHub App private key for target %q in this "+
+				"backup does not parse: %w", target.Name, err)
+		}
 	}
 
 	return nil

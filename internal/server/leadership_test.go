@@ -223,7 +223,7 @@ func TestTheControlPlaneForwardsTheLeadershipCheckToItsListeners(t *testing.T) {
 	s := New(a, nil, tiers, "test-owner", nil,
 		WithLeadershipLost(func() bool { return true }))
 
-	if l := NewListener(a, tiers[0].Label, &fakeSession{}, s.listenerOpts()...); !l.fenced() {
+	if l := NewListener(a, tiers[0].Label, &fakeSession{}, s.listenerOpts(s.prov)...); !l.fenced() {
 		t.Error("a listener built by a control plane that was given a leadership check " +
 			"does not carry it")
 	}
@@ -232,7 +232,7 @@ func TestTheControlPlaneForwardsTheLeadershipCheckToItsListeners(t *testing.T) {
 	// would satisfy the assertion above and break every ordinary shutdown.
 	plain := New(a, nil, tiers, "test-owner", nil)
 
-	if l := NewListener(a, tiers[0].Label, &fakeSession{}, plain.listenerOpts()...); l.fenced() {
+	if l := NewListener(a, tiers[0].Label, &fakeSession{}, plain.listenerOpts(plain.prov)...); l.fenced() {
 		t.Error("a control plane that was given no leadership check produced a fenced listener")
 	}
 }

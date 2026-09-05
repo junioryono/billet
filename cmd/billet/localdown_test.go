@@ -95,7 +95,7 @@ func stageDown(t *testing.T, f *fakeConverger, running ...string) *fakeConverger
 		return s
 	}
 
-	inspect = func(context.Context, string, string) (lifeops.Report, error) {
+	inspect = func(context.Context, string, []string) (lifeops.Report, error) {
 		return lifeops.Report{
 			Server: facts(deploy.ServerUnitName),
 			Node:   facts(deploy.NodeUnitName),
@@ -295,7 +295,7 @@ func TestDownForceStopsAUnitRunningADifferentBuild(t *testing.T) {
 	f := &fakeConverger{}
 	stageDown(t, f)
 
-	inspect = func(context.Context, string, string) (lifeops.Report, error) {
+	inspect = func(context.Context, string, []string) (lifeops.Report, error) {
 		return lifeops.Report{
 			Server: lifeops.ServiceFacts{Name: deploy.ServerUnitName, ActiveState: "inactive"},
 			Node: lifeops.ServiceFacts{

@@ -36,24 +36,55 @@ const (
 // rather than letting an operator wander off mid-flow.
 const ManifestTTL = time.Hour
 
-// permissions is the complete set billet requests.
+// organizationPermissions is the complete set billet requests for an
+// organization target, and repositoryPermissions for a repository target.
 //
-// Unexported and copied on the way out: it is a security claim, and an exported map
-// is one an importing package could rewrite at runtime — changing the manifest, the
-// CLI's disclosure and the post-install validation together.
+// Unexported and copied on the way out: each is a security claim, and an
+// exported map is one an importing package could rewrite at runtime — changing
+// the manifest, the CLI's disclosure and the post-install validation together.
+// Read ONLY through permissionsFor, so no code path can request both sets: a
+// test parses this package and holds that to be so.
 //
-// Deliberately absent: `actions: read`. It would expose workflow runs, logs and
-// artifacts, and billet needs none of them. Its absence is what makes "billet
-// cannot read your code" true rather than reassuring.
-var permissions = map[string]string{
-	"metadata":                         "read",
-	"organization_self_hosted_runners": "write",
+// Deliberately absent from both: `actions: read`. It would expose workflow runs,
+// logs and artifacts, and billet needs none of them. Its absence is what makes
+// "billet cannot read your code" true rather than reassuring.
+//
+// THE REPOSITORY SET IS WIDER, AND THAT IS A STATED TRADE. Registering a
+// repository's runners needs the repository permission `administration: write`
+// (measured against docs.github.com's endpoint table for "Create a registration
+// token for a repository", 2026-09-04); there is no repository form of
+// organization_self_hosted_runners. That permission also covers the repository's
+// settings, collaborators and branch protection, none of which billet touches:
+// it is accepted because it is the only permission GitHub offers for the job,
+// and ADR-011 records what billet must never use it for.
+var (
+	organizationPermissions = map[string]string{
+		"metadata":                         "read",
+		"organization_self_hosted_runners": "write",
+	}
+
+	repositoryPermissions = map[string]string{
+		"metadata":       "read",
+		"administration": "write",
+	}
+)
+
+// permissionsFor is the ONE reader of the two sets.
+func permissionsFor(scope Scope) map[string]string {
+	if scope == ScopeRepository {
+		return repositoryPermissions
+	}
+
+	return organizationPermissions
 }
 
-// Permissions returns a copy of the permission set billet requests.
-func Permissions() map[string]string {
-	out := make(map[string]string, len(permissions))
-	for k, v := range permissions {
+// Permissions returns a copy of the permission set billet requests for a
+// target of the given scope.
+func Permissions(scope Scope) map[string]string {
+	set := permissionsFor(scope)
+
+	out := make(map[string]string, len(set))
+	for k, v := range set {
 		out[k] = v
 	}
 
@@ -85,9 +116,10 @@ type HookAttributes struct {
 	Active bool   `json:"active"`
 }
 
-// NewManifest builds billet's manifest. redirectURL and setupURL point at the
-// loopback server the CLI runs for the duration of onboarding.
-func NewManifest(name, redirectURL, setupURL string) Manifest {
+// NewManifest builds billet's manifest for a target of the given scope.
+// redirectURL and setupURL point at the loopback server the CLI runs for the
+// duration of onboarding.
+func NewManifest(name, redirectURL, setupURL string, scope Scope) Manifest {
 	return Manifest{
 		Name:        name,
 		URL:         "https://github.com/junioryono/billet",
@@ -109,7 +141,7 @@ func NewManifest(name, redirectURL, setupURL string) Manifest {
 			URL:    webhookPlaceholderURL,
 			Active: false,
 		},
-		Permissions: Permissions(),
+		Permissions: Permissions(scope),
 		// Deliberately NOT setting SetupOnUpdate. It would redirect a future
 		// repository-access change back to setup_url — a loopback port that
 		// stopped existing the moment onboarding finished, so the operator would
@@ -123,14 +155,24 @@ func NewManifest(name, redirectURL, setupURL string) Manifest {
 // and billet has no webhook receiver by design.
 const webhookPlaceholderURL = "https://github.com/junioryono/billet#billet-uses-no-webhooks"
 
-// RegistrationURL is where the browser POSTs the manifest form.
+// RegistrationURL is where the browser POSTs the manifest form: an
+// organization's App registration page, or a user's own.
 //
 // It must be a form POST, not a redirect: the manifest travels in the request
 // body as a `manifest` field, which is why the CLI serves a self-submitting page
 // rather than simply opening a URL.
-func RegistrationURL(org, state string) string {
+//
+// THE FORM FOLLOWS THE OWNER'S ACCOUNT TYPE, NOT THE TARGET'S SCOPE. A
+// repository owned by an organization registers its App on the organization's
+// page; a repository owned by a person registers it on that person's page,
+// which is the one form with no owner in its path.
+func RegistrationURL(owner string, ownerType OwnerType, state string) string {
+	if ownerType == OwnerUser {
+		return fmt.Sprintf("%s/settings/apps/new?state=%s", webBase, urlQueryEscape(state))
+	}
+
 	return fmt.Sprintf("%s/organizations/%s/settings/apps/new?state=%s",
-		webBase, urlPathEscape(org), urlQueryEscape(state))
+		webBase, urlPathEscape(owner), urlQueryEscape(state))
 }
 
 // App is what GitHub hands back once the manifest is converted. It carries

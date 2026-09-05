@@ -24,8 +24,14 @@ import (
 type Target struct {
 	ConfigPath string
 	StateDir   string
+	// AppKeyPath and GitHub are the DEFAULT target's key path and identity,
+	// from the `github:` block.
 	AppKeyPath string
 	GitHub     GitHubIdentity
+	// Targets are the further targets the config declares, each with the path
+	// its key goes to. Every one the archive carries must be here with the same
+	// identity, and every one here must be in the archive.
+	Targets []TargetPath
 
 	// LedgerBackend is what THIS host's config says its ledger is — "sqlite",
 	// "postgres", or empty for a config that names none (which is sqlite).
@@ -52,6 +58,25 @@ type Target struct {
 	// fleet it has no record of, and reaps as orphans the compute the old one
 	// launched.
 	ExternalLedgerAttached bool
+}
+
+// TargetPath is where one further target's App key lands, and which App the
+// config says it is.
+type TargetPath struct {
+	Name       string
+	AppKeyPath string
+	GitHub     GitHubIdentity
+}
+
+// furtherTarget finds a further target by name.
+func (t Target) furtherTarget(name string) (TargetPath, bool) {
+	for _, target := range t.Targets {
+		if target.Name == name {
+			return target, true
+		}
+	}
+
+	return TargetPath{}, false
 }
 
 // Disposition is what a restore would do with one item.
@@ -246,6 +271,7 @@ func planFor(ctx context.Context, a *Archive, t Target, intent Intent) (Plan, er
 
 	p.checkBinaryUnderstandsArchive()
 	p.checkConfigNamesThisApp()
+	p.checkConfigNamesEveryTarget()
 	p.checkLedgerBackendAgrees()
 
 	p.planIdentity()
@@ -315,6 +341,63 @@ func (p *Plan) checkConfigNamesThisApp() {
 		Remedy: "point --config at the configuration this backup belongs to, or correct the " +
 			"github block; billet will not install an App key beside a config for another App",
 	})
+}
+
+// checkConfigNamesEveryTarget holds the further targets to the same rule, in
+// both directions.
+//
+// A KEY THE CONFIG DOES NOT NAME HAS NOWHERE TO GO, and a target the config
+// names that the archive has no key for is a control plane that serves that
+// owner with nothing: it starts, advertises for the tier, and every mint fails
+// with a bare 401 hours after whoever ran the restore has gone home. Both are
+// refused rather than installed halfway.
+func (p *Plan) checkConfigNamesEveryTarget() {
+	for _, archived := range p.Archive.Manifest.Targets {
+		configured, ok := p.Target.furtherTarget(archived.Name)
+		if !ok {
+			p.refuse(lifeops.Refusal{
+				What: fmt.Sprintf("this backup carries an App key for target %q (%s), and %s "+
+					"declares no such target", archived.Name, archived.GitHubIdentity, p.Target.ConfigPath),
+				Remedy: "add that target to targets: with the App identity this backup names, " +
+					"or point --config at the configuration this backup belongs to",
+			})
+
+			continue
+		}
+
+		if !configured.GitHub.Same(archived.GitHubIdentity) {
+			p.refuse(lifeops.Refusal{
+				What: fmt.Sprintf("this backup's target %q is %s and %s names it as %s",
+					archived.Name, archived.GitHubIdentity, p.Target.ConfigPath, configured.GitHub),
+				Remedy: "correct the targets entry, or point --config at the configuration this " +
+					"backup belongs to; billet will not install an App key beside an entry for " +
+					"another App",
+			})
+		}
+	}
+
+	for _, configured := range p.Target.Targets {
+		if _, ok := p.archivedTarget(configured.Name); !ok {
+			p.refuse(lifeops.Refusal{
+				What: fmt.Sprintf("%s declares target %q (%s), and this backup carries no App key "+
+					"for it", p.Target.ConfigPath, configured.Name, configured.GitHub),
+				Remedy: "the deployment this backup was taken from did not serve that target; " +
+					"restore it from a backup that does, or remove the target from the config and " +
+					"onboard it again afterwards with `billet github-app create --target`",
+			})
+		}
+	}
+}
+
+// archivedTarget finds a further target in the archive by name.
+func (p *Plan) archivedTarget(name string) (TargetIdentity, bool) {
+	for _, target := range p.Archive.Manifest.Targets {
+		if target.Name == name {
+			return target, true
+		}
+	}
+
+	return TargetIdentity{}, false
 }
 
 // planIdentity decides what happens to the deployment identity.
@@ -1025,21 +1108,41 @@ func canonical(path string) (string, error) {
 }
 
 func (p *Plan) planAppKey() {
-	if p.Target.AppKeyPath == "" {
+	p.planOneAppKey(EntryAppKey, "github.private_key_path", p.Target.AppKeyPath,
+		"GitHub App private key")
+
+	// AND ONE PER FURTHER TARGET THE ARCHIVE CARRIES, at the path the config
+	// names for it; a target the config does not name was refused above and
+	// plans nothing.
+	for _, archived := range p.Archive.Manifest.Targets {
+		configured, ok := p.Target.furtherTarget(archived.Name)
+		if !ok {
+			continue
+		}
+
+		p.planOneAppKey(EntryAppKeyFor(archived.Name),
+			fmt.Sprintf("targets[%s].private_key_path", archived.Name), configured.AppKeyPath,
+			fmt.Sprintf("GitHub App private key for target %s", archived.Name))
+	}
+}
+
+// planOneAppKey decides one target's key under the no-clobber rule.
+func (p *Plan) planOneAppKey(entry, field, path, what string) {
+	if path == "" {
 		p.refuse(lifeops.Refusal{
-			What: fmt.Sprintf("%s names no github.private_key_path, so billet has nowhere to put "+
-				"this deployment's App key", p.Target.ConfigPath),
-			Remedy: "set github.private_key_path in that config and run this again",
+			What: fmt.Sprintf("%s names no %s, so billet has nowhere to put "+
+				"this deployment's %s", p.Target.ConfigPath, field, what),
+			Remedy: fmt.Sprintf("set %s in that config and run this again", field),
 		})
 
 		return
 	}
 
-	inside, err := appKeyInsideStateDir(p.Target.AppKeyPath, p.Target.StateDir)
+	inside, err := appKeyInsideStateDir(path, p.Target.StateDir)
 	if err != nil {
 		p.refuse(lifeops.Refusal{
 			What: fmt.Sprintf("billet could not work out whether %s is inside the state "+
-				"directory: %v", p.Target.AppKeyPath, err),
+				"directory: %v", path, err),
 			Remedy: "resolve that path; billet will not install the App key somewhere it cannot " +
 				"place",
 		})
@@ -1049,27 +1152,26 @@ func (p *Plan) planAppKey() {
 
 	if inside {
 		p.refuse(lifeops.Refusal{
-			What: fmt.Sprintf("%s names %s as github.private_key_path, and that is inside the "+
-				"state directory %s", p.Target.ConfigPath, p.Target.AppKeyPath, p.Target.StateDir),
-			Remedy: "point github.private_key_path outside the state directory. That directory is " +
-				"billet's — it creates, renames and DELETES files there by name, including " +
-				"staging names a rotation clears — and GitHub issues the App key exactly once",
+			What: fmt.Sprintf("%s names %s as %s, and that is inside the "+
+				"state directory %s", p.Target.ConfigPath, path, field, p.Target.StateDir),
+			Remedy: fmt.Sprintf("point %s outside the state directory. That directory is "+
+				"billet's — it creates, renames and DELETES files there by name, including "+
+				"staging names a rotation clears — and GitHub issues the App key exactly once", field),
 		})
 
 		return
 	}
 
-	want, _ := p.Archive.Entry(EntryAppKey)
+	want, _ := p.Archive.Entry(entry)
 
-	disposition, refusal := comparePublish(p.Target.AppKeyPath, want, "GitHub App private key")
+	disposition, refusal := comparePublish(path, want, what)
 	if refusal != nil {
 		p.refuse(*refusal)
 
 		return
 	}
 
-	p.add(Action{Entry: EntryAppKey, Path: p.Target.AppKeyPath, What: "GitHub App private key",
-		Disposition: disposition})
+	p.add(Action{Entry: entry, Path: path, What: what, Disposition: disposition})
 }
 
 // comparePublish is the no-clobber decision every credential in this package

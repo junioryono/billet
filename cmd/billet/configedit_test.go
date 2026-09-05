@@ -277,7 +277,7 @@ func TestThePreflightAgreesWithTheWrite(t *testing.T) {
 				t.Fatalf("seed: %v", err)
 			}
 
-			_, planErr := planConfigEdit(path, identity.Org)
+			_, planErr := planConfigEdit(path, identity)
 
 			// BOTH SHAPES THE WRITE CAN PRODUCE, because which one it is
 			// depends on whether GitHub returned a client id — a thing the
