@@ -1,14 +1,19 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/junioryono/billet/internal/config"
@@ -1936,15 +1941,475 @@ func (h *ledgerHost) ProbeReady(ctx context.Context) error {
 	return nil
 }
 
-func (h *ledgerHost) runCandidate(ctx context.Context, args ...string) error {
-	cmd := exec.CommandContext(ctx, installedBinary, args...)
+// candidateProbeDeadline bounds a candidate that neither reports ready nor
+// exits. Both probes open a ledger and build an allocator or a provider, which
+// has never taken more than seconds; what the bound is for is a wedged candidate,
+// which would otherwise hold the transaction with the services already stopped.
+// A variable so a test can shorten it.
+var candidateProbeDeadline = 3 * time.Minute
 
-	out, err := cmd.CombinedOutput()
+// probeStopGrace is how long a legacy candidate is given to leave on SIGTERM
+// before it is killed. A variable for the tests.
+var probeStopGrace = 10 * time.Second
+
+// probeUsageWaitDelay bounds the usage question's reaping and how long it waits
+// for the candidate's output to close after the candidate has exited. A -h that
+// left a process holding its output would otherwise hold the transaction, with
+// the services already stopped, which is the outage this whole step exists to
+// end; and that process is a live descendant, which cordons. A variable for the
+// tests.
+var probeUsageWaitDelay = 10 * time.Second
+
+// probeUsageDeadline bounds the usage question itself: a -h that has neither
+// exited nor closed its output by then is killed and refused. A variable for the
+// tests.
+var probeUsageDeadline = 30 * time.Second
+
+// probeOutputGrace bounds how long the candidate's output may stay open after
+// the candidate itself has exited. A descriptor still open then belongs to a
+// process that kept the candidate's output, which this probe will not hunt by
+// number, and the probe fails rather than leave it behind the transaction. It
+// also bounds how long a killed candidate's exit is waited for. A variable for
+// the tests.
+var probeOutputGrace = 15 * time.Second
+
+// holdFlagName is the flag a candidate lists when its probe exits unless told to
+// hold. Its presence in the candidate's own usage text is what tells the two
+// probe protocols apart.
+const holdFlagName = "upgrade-probe-hold"
+
+// probeReadyLine matches a WHOLE line one of the two probes prints, anchored at
+// both ends, so neither a refusal that quotes the words nor one that begins with
+// the sentence and goes on to say what failed can pass as the answer.
+var probeReadyLine = regexp.MustCompile(`^(?:` + regexp.QuoteMeta(serverProbeReadyLine) + `|` +
+	strings.ReplaceAll(regexp.QuoteMeta(nodeProbeReadyFormat), "%s", "[^:]+") + `)$`)
+
+// probeOutput collects a candidate's output and notices the readiness line in it.
+type probeOutput struct {
+	mu      sync.Mutex
+	buf     bytes.Buffer
+	scanned int
+	ready   chan struct{}
+	seen    bool
+	readErr error
+}
+
+func (p *probeOutput) Write(b []byte) (int, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.buf.Write(b)
+
+	if p.seen {
+		return len(b), nil
+	}
+
+	data := p.buf.Bytes()
+
+	for {
+		nl := bytes.IndexByte(data[p.scanned:], '\n')
+		if nl < 0 {
+			break
+		}
+
+		line := data[p.scanned : p.scanned+nl]
+		p.scanned += nl + 1
+
+		if probeReadyLine.Match(line) {
+			p.seen = true
+			close(p.ready)
+
+			break
+		}
+	}
+
+	return len(b), nil
+}
+
+func (p *probeOutput) String() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.buf.String()
+}
+
+// sawReadyLine reports whether the readiness line was ever printed. Read after
+// the output has closed, it is the whole answer, whichever channel a select
+// happened to pick while the candidate was running.
+func (p *probeOutput) sawReadyLine() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.seen
+}
+
+// drain copies the candidate's output until the last descriptor on it closes,
+// then says so.
+//
+// A READ ERROR IS NOT A CLOSE. The read ending because the pipe broke says nothing
+// about who still holds it or what was left unread, so the error is kept where
+// the verdict can see it, and the verdict treats it as a could-not-tell.
+func (p *probeOutput) drain(r io.Reader, eof chan<- struct{}) {
+	defer close(eof)
+
+	if _, err := io.Copy(p, r); err != nil {
+		p.mu.Lock()
+		p.readErr = err
+		p.mu.Unlock()
+	}
+}
+
+// readError is the error the drain ended on, or nil for a clean end-of-file.
+func (p *probeOutput) readError() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.readErr
+}
+
+// candidateHoldsOnFlag asks the candidate which probe protocol it speaks, by
+// reading its own usage text.
+//
+// A RELEASE THROUGH v0.9.0 PRINTS THE READINESS LINE AND HOLDS; A LATER ONE EXITS
+// UNLESS TOLD TO HOLD, and the flag that tells it is listed in its usage. Every
+// generation prints its flags to stdout and exits zero on -h, measured, so the
+// question has one honest answer per binary, and a candidate that cannot even
+// say what it accepts is refused here rather than probed. THE SAME PIPE DISCIPLINE
+// AS THE PROBE: the parent owns the output, reads it to its end, and a process
+// that still holds it once the usage has exited is a live descendant of the
+// candidate, which cordons rather than being rolled back over, because a pipe can
+// prove it exists and cannot prove it never opened the ledger.
+func candidateHoldsOnFlag(ctx context.Context, what string) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, probeUsageDeadline)
+	defer cancel()
+
+	reader, writer, err := os.Pipe()
 	if err != nil {
-		return fmt.Errorf("%s: %w: %s", args[0], err, out)
+		return false, fmt.Errorf("%s -h: open the usage's output: %w", what, err)
+	}
+
+	defer func() { _ = reader.Close() }()
+
+	usage := &probeOutput{ready: make(chan struct{})}
+	eof := make(chan struct{})
+
+	// NOT exec.CommandContext: its deadline kill runs beside its Wait, and on a
+	// kernel without pidfd that is a signal to a number the Wait may just have
+	// freed (Go's own os package says so). The deadline is kept here and every
+	// signal goes through the handle before the one Wait.
+	//nolint:noctx // the deadline is kept here, its kill precedes the one Wait; see above
+	cmd := exec.Command(installedBinary, what, "-h")
+	cmd.Stdout = writer
+	cmd.Stderr = writer
+
+	if err := cmd.Start(); err != nil {
+		_ = writer.Close()
+
+		return false, fmt.Errorf("%s -h: %w", what, err)
+	}
+
+	_ = writer.Close()
+
+	go usage.drain(reader, eof)
+
+	// THE OUTPUT CLOSING OR THE DEADLINE, then SIGKILL through the handle while
+	// the usage is still unreaped, then the one Wait. A -h that has exited is a
+	// zombie the kill cannot hurt; one still running past its bound is refused.
+	select {
+	case <-eof:
+	case <-ctx.Done():
+	}
+
+	killErr := signalHandle(cmd, syscall.SIGKILL)
+	reaped, err := reap(cmd, probeUsageWaitDelay)
+	closed := awaitClosed(eof, probeUsageWaitDelay)
+
+	switch {
+	case !reaped:
+		return false, fmt.Errorf("%w: %s -h was sent SIGKILL and its exit never arrived within %s "+
+			"(kill: %v): %s", hostupgrade.ErrUnsafeToRestore, what, probeUsageWaitDelay, killErr,
+			usage)
+	case !closed:
+		return false, fmt.Errorf("%w: %s -h exited but something it started still holds its "+
+			"output after %s (exit: %v): %s", hostupgrade.ErrUnsafeToRestore, what,
+			probeUsageWaitDelay, err, usage)
+	case usage.readError() != nil:
+		return false, fmt.Errorf("%w: %s -h: its output could not be read to its end, so what "+
+			"it said and what still holds it are both unknown: %w", hostupgrade.ErrUnsafeToRestore,
+			what, usage.readError())
+	case ctx.Err() != nil:
+		return false, fmt.Errorf("%s -h: the candidate's usage neither finished nor closed its "+
+			"output within %s: %w: %s", what, probeUsageDeadline, ctx.Err(), usage)
+	case err != nil:
+		return false, fmt.Errorf("%s -h: the candidate's usage could not be read: %w: %s",
+			what, err, usage)
+	}
+
+	return strings.Contains(usage.String(), holdFlagName), nil
+}
+
+// runCandidate proves the candidate can come up, by running it as a probe.
+//
+// TWO PROTOCOLS, AND THE CANDIDATE SAYS WHICH IT SPEAKS. A candidate that lists
+// --upgrade-probe-hold exits once it has proved what it can and prints nothing;
+// its exit status is its whole answer, and a readiness line from it is a broken
+// protocol, refused. A candidate that does not list the flag is a release
+// through v0.9.0: it prints the readiness line and holds until stopped, and
+// until v0.9.1 this parent waited only for exit, so every self-upgrade hung at
+// this step with the services already stopped (the rollout rehearsal,
+// 2026-09-05). To such a candidate the line means "stop me", the stop is sent,
+// and the candidate answers it the way every release through v0.9.0 does: its
+// lifecycle context ends and it exits ZERO. So its exit status is its verdict
+// there too, and a signalled death is a refusal whoever sent the signal: a probe
+// that died by SIGTERM did not shut down, and one that had to be killed has not
+// proved it can stop. The line is the ONLY proof a legacy candidate offers, so one
+// that exits without saying it has proved nothing, whatever its status. A
+// candidate that neither exits nor speaks inside the deadline is a could-not-tell,
+// and a could-not-tell fails the probe rather than passing it.
+//
+// THE CANDIDATE IS NOT REAPED UNTIL THE LAST SIGNAL IT MIGHT BE SENT HAS GONE. A
+// pid is anchored for as long as its process is unreaped, zombie included, so a
+// signal sent before Wait cannot reach anything but the candidate, on every
+// platform; a signal sent after Wait is a number that may be somebody else's.
+// So Wait runs only once no further signal will follow, and the deadline is this
+// function's rather than exec.CommandContext's, whose kill runs beside its Wait
+// and, on a kernel without pidfd, is a signal to a number the Wait may just have
+// freed (Go's own os package says so). Nothing is ever signalled by
+// process-group number. Every candidate is sent SIGKILL before it is reaped,
+// because its output closing proves nothing about it being gone: one that exited
+// is a zombie the kill cannot change, one that closed its output and kept running
+// is killed and refused. A candidate whose exit never arrives after that is one
+// the kernel is holding, which cordons the host rather than being rolled back
+// over.
+//
+// Anything that still holds the candidate's output when the candidate has gone
+// is found by that output staying open, and it is a live descendant, so the host
+// is cordoned rather than rolled back over it: the pipe proves the process
+// exists and cannot prove it never opened the ledger. Nothing is hunted by
+// number. A process that closed the output before detaching is not seen, and
+// that is the limit of what a pipe can tell. The parent owns the pipe and reads
+// it to its end before writing any verdict, so a refusal keeps every word.
+func (h *ledgerHost) runCandidate(ctx context.Context, args ...string) error {
+	what := args[0]
+
+	// ONLY THE TWO COMMANDS WITH A PROBE PROTOCOL ARE ASKED WHICH THEY SPEAK. Any
+	// other candidate command answers by its exit status alone, and a readiness
+	// line from one would be as much a broken protocol as from a fixed probe.
+	holdsOnFlag := true
+
+	if what == "server" || what == "node" {
+		var err error
+
+		if holdsOnFlag, err = candidateHoldsOnFlag(ctx, what); err != nil {
+			return err
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, candidateProbeDeadline)
+	defer cancel()
+
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		return fmt.Errorf("%s: open the probe's output: %w", what, err)
+	}
+
+	defer func() { _ = reader.Close() }()
+
+	out := &probeOutput{ready: make(chan struct{})}
+	eof := make(chan struct{})
+
+	// NOT exec.CommandContext, for the reason candidateHoldsOnFlag gives: the
+	// deadline is this function's, and its kill goes through the handle before Wait.
+	//nolint:noctx // the deadline is kept here, its kill precedes the one Wait; see above
+	cmd := exec.Command(installedBinary, args...)
+	cmd.Stdout = writer
+	cmd.Stderr = writer
+	// THE CANDIDATE DECIDES BY ITS FLAG, NOT BY WHAT IT INHERITS, and a socket
+	// that reached it anyway would carry its readiness to a unit that never asked.
+	cmd.Env = withoutNotifySocket(os.Environ())
+
+	if err := cmd.Start(); err != nil {
+		_ = writer.Close()
+
+		return fmt.Errorf("%s: %w", what, err)
+	}
+
+	// THE PARENT'S COPY OF THE WRITE END CLOSES NOW, so end-of-file on the read end
+	// means every process holding the candidate's output has gone.
+	_ = writer.Close()
+
+	go out.drain(reader, eof)
+
+	var stopErr error
+
+	if holdsOnFlag {
+		// A FIXED CANDIDATE IS NEVER SIGNALLED WHILE IT RUNS: it exits by itself,
+		// and its output closing is the first sign of that, or the deadline is.
+		select {
+		case <-eof:
+		case <-ctx.Done():
+		}
+	} else {
+		// THE LINE, OR THE OUTPUT CLOSING, OR THE DEADLINE, whichever comes first;
+		// no reaping yet, so a stop sent below reaches the candidate and only it.
+		select {
+		case <-out.ready:
+			stopErr = signalHandle(cmd, syscall.SIGTERM)
+
+			grace := time.NewTimer(probeStopGrace)
+			defer grace.Stop()
+
+			select {
+			case <-eof:
+			case <-grace.C:
+			case <-ctx.Done():
+			}
+		case <-eof:
+		case <-ctx.Done():
+		}
+	}
+
+	// SIGKILL EVERY TIME, because the output closing proved only that the output
+	// closed: a candidate that exited, on the stop or on its own, is a zombie the
+	// kill cannot hurt, and one still running past its bound is not left behind
+	// the transaction. Then, with every signal behind us, the one Wait.
+	if e := signalHandle(cmd, syscall.SIGKILL); e != nil && stopErr == nil {
+		stopErr = e
+	}
+
+	reaped, err := reap(cmd, probeOutputGrace)
+
+	// THE OUTPUT IS READ TO ITS END BEFORE ANY VERDICT IS WRITTEN, on every path,
+	// because Wait and the drain have no order between them and a quick refusal
+	// would otherwise lose the words it was refused with. Output still open past
+	// the grace is a process that kept the candidate's output and outlived it.
+	closed := awaitClosed(eof, probeOutputGrace)
+	ready := out.sawReadyLine()
+
+	// THE UNSAFE VERDICTS COME FIRST, ahead of any reading of what the candidate
+	// said or how it exited, because they are about whether anything of it is
+	// still alive, and nothing may be restored over a process that is.
+	switch {
+	case !reaped:
+		// A candidate sent SIGKILL whose exit never arrived is one the kernel is
+		// holding, and restoring the ledger under a process that may still have
+		// it open is the one outcome worse than this.
+		return fmt.Errorf("%w: %s was sent SIGKILL and its exit never arrived within %s "+
+			"(stop signal: %v): %s", hostupgrade.ErrUnsafeToRestore, what, probeOutputGrace,
+			stopErr, out)
+	case !closed:
+		// The open output proves a descendant exists; it cannot prove that
+		// descendant never opened the ledger. Whatever else this candidate did,
+		// that is what decides.
+		return fmt.Errorf("%w: %s has gone but something it started still holds its output %s "+
+			"after its exit arrived (exit: %v, said ready: %t): %s", hostupgrade.ErrUnsafeToRestore,
+			what, probeOutputGrace, err, ready, out)
+	case out.readError() != nil:
+		return fmt.Errorf("%w: %s: its output could not be read to its end, so what it said "+
+			"and what still holds it are both unknown: %w", hostupgrade.ErrUnsafeToRestore, what,
+			out.readError())
+	case holdsOnFlag && ready:
+		// READ FROM THE CLOSED OUTPUT, not from which channel a select picked while
+		// the candidate ran, so a fixed candidate that printed the line and exited
+		// in the same instant is refused all the same.
+		return fmt.Errorf("%s: printed the readiness line without being told to hold, which no "+
+			"release that lists --%s does (exit: %v): %s", what, holdFlagName, err, out)
+	case !holdsOnFlag && !ready:
+		// A RELEASE THROUGH v0.9.0 PROVES READINESS ONLY BY SAYING SO. Whatever its
+		// exit status, one that never said it has shown nothing, and a zero here
+		// is a could-not-tell.
+		return fmt.Errorf("%s: a release without --%s proves readiness only by printing the "+
+			"readiness line, and this one never did (exit: %v): %s", what, holdFlagName, err, out)
+	}
+
+	if err := judgeExit(ctx, what, err, out, ready); err != nil {
+		if stopErr != nil {
+			return fmt.Errorf("%w (and the stop signal answered: %w)", err, stopErr)
+		}
+
+		return err
 	}
 
 	return nil
+}
+
+// reap waits, once the last signal the candidate might be sent has gone, for the
+// kernel to hand over its exit. false means the candidate could not be proved
+// gone; the abandoned Wait is then the one thing left running, and it signals
+// nothing.
+func reap(cmd *exec.Cmd, patience time.Duration) (bool, error) {
+	done := make(chan error, 1)
+
+	go func() { done <- cmd.Wait() }()
+
+	last := time.NewTimer(patience)
+	defer last.Stop()
+
+	select {
+	case err := <-done:
+		return true, err
+	case <-last.C:
+		return false, nil
+	}
+}
+
+// awaitClosed reports whether the output closed within the bound.
+func awaitClosed(eof <-chan struct{}, within time.Duration) bool {
+	hold := time.NewTimer(within)
+	defer hold.Stop()
+
+	select {
+	case <-eof:
+		return true
+	case <-hold.C:
+		return false
+	}
+}
+
+// judgeExit reads the candidate's own exit as its verdict. The deadline is read
+// first, because an answer that arrives as the bound closes is a could-not-tell
+// and the bound is a bound; then zero passes; then anything else is the candidate
+// refusing, a death by signal included. A stop this probe sent is answered by a
+// legacy candidate with a zero exit, so there is no signal it is right to forgive.
+func judgeExit(ctx context.Context, what string, err error, out *probeOutput, ready bool) error {
+	switch {
+	case errors.Is(ctx.Err(), context.DeadlineExceeded) && ready:
+		return fmt.Errorf("%s: reported ready but neither exited nor stopped within %s: %s",
+			what, candidateProbeDeadline, out)
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+		return fmt.Errorf("%s: neither ready nor finished within %s: %s",
+			what, candidateProbeDeadline, out)
+	case ctx.Err() != nil:
+		return fmt.Errorf("%s: interrupted: %w", what, ctx.Err())
+	case err == nil:
+		return nil
+	}
+
+	return fmt.Errorf("%s: %w: %s", what, err, out)
+}
+
+// signalHandle signals the candidate through its process handle, before it has
+// been reaped, and treats a candidate that has already gone as nothing to report.
+func signalHandle(cmd *exec.Cmd, sig syscall.Signal) error {
+	err := cmd.Process.Signal(sig)
+	if errors.Is(err, os.ErrProcessDone) {
+		return nil
+	}
+
+	return err
+}
+
+// withoutNotifySocket drops NOTIFY_SOCKET from an environment.
+func withoutNotifySocket(env []string) []string {
+	kept := make([]string, 0, len(env))
+
+	for _, kv := range env {
+		if !strings.HasPrefix(kv, "NOTIFY_SOCKET=") {
+			kept = append(kept, kv)
+		}
+	}
+
+	return kept
 }
 
 func (h *ledgerHost) configPath() string {

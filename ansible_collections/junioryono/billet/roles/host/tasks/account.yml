@@ -578,6 +578,45 @@
     - not ansible_check_mode
     - billet_installed_binary.stat.exists
 
+# A CANDIDATE THAT DOES NOT KNOW THE HOLD FLAG REFUSES IT, in its own flag parser,
+# before it has probed anything. Releases through v0.9.0 hold under --upgrade-probe
+# alone; from v0.9.1 a probe exits once ready unless told to hold, and this unit
+# needs it to hold. A deliberate downgrade (billet_allow_downgrade) renders the
+# older shape, which is why the candidate is asked rather than the version assumed.
+# BOUNDED AND JUDGED. `timeout` ends a usage that hangs, killing one that ignores
+# the TERM it sends first, and a non-zero exit fails
+# the converge here, before a single service is stopped: every release prints its
+# usage and exits zero, so a candidate that cannot is one that would fail its own
+# probe later, with the host already drained.
+- name: Ask the candidate whether its probe can be told to hold
+  ansible.builtin.command:
+    argv:
+      - timeout
+      - -k
+      - "10"
+      - "60"
+      - "{{ billet_upgrade_recovery_dir }}/billet.candidate"
+      - server
+      - -h
+  register: billet_candidate_probe_help
+  changed_when: false
+  check_mode: false
+  become: true
+  when:
+    - billet_binary_upgrade | default(false)
+    - not billet_interrupted_upgrade | bool
+    - not ansible_check_mode
+
+- name: Record whether the candidate's probe holds only when told
+  ansible.builtin.set_fact:
+    billet_candidate_probe_holds_on_flag: >-
+      {{ 'upgrade-probe-hold' in
+         ((billet_candidate_probe_help.stdout | default('')) ~ (billet_candidate_probe_help.stderr | default(''))) }}
+  when:
+    - billet_binary_upgrade | default(false)
+    - not billet_interrupted_upgrade | bool
+    - not ansible_check_mode
+
 - name: Stage candidate systemd units for the upgrade transaction
   ansible.builtin.template:
     src: "{{ item.src }}"
@@ -595,6 +634,7 @@
     - not ansible_check_mode
   vars:
     billet_systemd_upgrade_probe: true
+    billet_systemd_upgrade_probe_hold: "{{ billet_candidate_probe_holds_on_flag | default(false) | bool }}"
     billet_systemd_notify_ready: true
 
 - name: Inspect installed service readiness types before ordinary convergence

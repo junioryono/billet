@@ -41,7 +41,7 @@ Group=root
 # controller it has to open the ledger the server's way; see billet-server.service.
 EnvironmentFile=-{{ billet_server_environment_path }}
 {% endif %}
-ExecStart=/usr/bin/billet node --config /etc/billet/billet.yaml{{ ' --upgrade-probe' if billet_systemd_upgrade_probe | default(false) else '' }}
+ExecStart=/usr/bin/billet node --config /etc/billet/billet.yaml{{ (' --upgrade-probe' ~ (' --upgrade-probe-hold' if billet_systemd_upgrade_probe_hold | default(false) else '')) if billet_systemd_upgrade_probe | default(false) else '' }}
 TimeoutStartSec=120
 RuntimeDirectory=billet/locks
 RuntimeDirectoryMode=0750

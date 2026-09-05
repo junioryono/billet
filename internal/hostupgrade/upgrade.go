@@ -110,6 +110,27 @@ var ErrRolledBack = errors.New("hostupgrade: the upgrade failed and the previous
 // recovery journal intact and tell a person.
 var ErrCordoned = errors.New("hostupgrade: the upgrade failed and the rollback could not be proved")
 
+// ErrUnsafeToRestore is what a step wraps when it failed in a way that leaves the
+// candidate possibly still running, so that restoring the previous release and
+// ledger under it would be worse than the failure.
+//
+// A ROLLBACK OVER A LIVE CANDIDATE IS THE ONE THING WORSE THAN A HUNG PROBE. The
+// probe step found this: a candidate sent SIGKILL whose exit never arrived is one
+// the kernel is holding, and a rollback that restored the ledger while that
+// process still had it open would be corrupting the very thing the snapshot exists
+// to protect. A step that returns this is cordoned with its journal intact; nothing
+// is restored until a person has looked.
+var ErrUnsafeToRestore = errors.New("hostupgrade: the candidate could not be proved gone")
+
+// fenceReason is what the maintenance fence says while a transaction owns the
+// ledger, and it is ONE string because the fence is cleared only under the
+// reason it was written with. The commit and the rollback each used to name
+// their own outcome here, so the ledger refused both as somebody else's fence,
+// and every upgrade with a local ledger ended cordoned with its services stopped
+// and the ledger fenced: found by the rollout rehearsal on 2026-09-05, the first
+// time this code met a real fence rather than a fake that ignored the argument.
+const fenceReason = "host upgrade"
+
 // Run carries out one upgrade, or resumes one.
 //
 // THE ORDER IS NOT NEGOTIABLE and every step is placed by what would go wrong if
@@ -204,6 +225,10 @@ func Run(ctx context.Context, req Request) error {
 	}
 
 	if err := advance(ctx, req, log); err != nil {
+		if errors.Is(err, ErrUnsafeToRestore) {
+			return cordonWithoutRestoring(req, log, err)
+		}
+
 		log.Error("the upgrade failed; restoring the previous release",
 			"from", j.FromVersion, "to", j.ToVersion, "step", j.Step, "error", err)
 
@@ -277,7 +302,7 @@ func advance(ctx context.Context, req Request, log *slog.Logger) error {
 	}, {
 		step: StepFenced,
 		what: "fencing the ledger",
-		do:   func(ctx context.Context) error { return host.Fence(ctx, "host upgrade") },
+		do:   func(ctx context.Context) error { return host.Fence(ctx, fenceReason) },
 	}, {
 		step: StepSnapshotted,
 		what: "snapshotting the ledger",
@@ -355,7 +380,7 @@ func finish(ctx context.Context, req Request, log *slog.Logger) error {
 	// NO FENCE WAS RAISED ON AN EXTERNAL LEDGER, so none is cleared; the
 	// candidate's own claim is what admits it.
 	if !j.ExternalLedger() {
-		if err := host.ClearFence(ctx, "host upgrade committed"); err != nil {
+		if err := host.ClearFence(ctx, fenceReason); err != nil {
 			return fmt.Errorf("hostupgrade: the upgrade committed but the ledger is still "+
 				"fenced, so nothing can write to it: %w", err)
 		}
@@ -390,6 +415,11 @@ func finish(ctx context.Context, req Request, log *slog.Logger) error {
 // A FAILURE THAT CANNOT BE RECORDED IS ALREADY THE CORDONED CASE, because the
 // next run would read a journal describing a state the machine has left — and
 // this is the one situation where doing less is safer than restoring blind.
+// cordonWithoutRestoring records the failure and stops, restoring nothing.
+//
+// THE JOURNAL KEEPS THE CAUSE AND THE STEP, so `--resume` knows where it was and
+// an operator knows why nothing moved. A resume rolls back from here, which is the
+// operator asserting the candidate is gone.
 func beginRollback(ctx context.Context, req Request, log *slog.Logger, cause error) error {
 	if failErr := req.Journal.Fail(cause); failErr != nil {
 		return fmt.Errorf("%w: %w (and the journal could not record it: %w)",
@@ -397,6 +427,25 @@ func beginRollback(ctx context.Context, req Request, log *slog.Logger, cause err
 	}
 
 	return rollBack(ctx, req, log, cause)
+}
+
+// cordonWithoutRestoring records the failure and stops, restoring nothing,
+// because the candidate may still be running; the resume that follows is the
+// operator asserting it is not.
+func cordonWithoutRestoring(req Request, log *slog.Logger, cause error) error {
+	j := req.Journal
+
+	log.Error("the upgrade failed in a way that leaves the candidate possibly running; "+
+		"nothing is restored and this host is cordoned with its recovery journal in place",
+		"from", j.FromVersion, "to", j.ToVersion, "step", j.Step, "dir", j.Dir, "error", cause)
+
+	if failErr := j.Fail(cause); failErr != nil {
+		return fmt.Errorf("%w: %w (and the journal could not record it: %w)",
+			ErrCordoned, cause, failErr)
+	}
+
+	return fmt.Errorf("%w: %w (nothing was restored, because the candidate may still be "+
+		"running; look at it, then `billet host-upgrade --resume` rolls back)", ErrCordoned, cause)
 }
 
 // rollBack restores the previous release, and says which of the two failure
@@ -473,7 +522,7 @@ func finishRollback(ctx context.Context, req Request, log *slog.Logger) error {
 	j, host := req.Journal, req.Host
 
 	if j.Reached(StepFenced) && !j.ExternalLedger() {
-		if err := host.ClearFence(ctx, "host upgrade rolled back"); err != nil {
+		if err := host.ClearFence(ctx, fenceReason); err != nil {
 			return fmt.Errorf("clearing the maintenance fence: %w", err)
 		}
 	}

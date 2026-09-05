@@ -304,11 +304,17 @@ func cmdServer(ctx context.Context, lc *lifecycle, args []string) error {
 		"connect to GitHub and advertise ZERO capacity: proves the whole path without accepting a job")
 	upgradeProbe := fs.Bool("upgrade-probe", false,
 		"open candidate state without polling, dispatching, or accepting workload")
+	holdProbeFlag := fs.Bool("upgrade-probe-hold", false,
+		"with --upgrade-probe, stay up until stopped instead of exiting once ready; the "+
+			"Ansible role's Type=notify probe unit passes this")
 	if err := parse(fs, args); err != nil {
 		return err
 	}
 	if *dryRun && *upgradeProbe {
 		return errors.New("billet server: --dry-run and --upgrade-probe are mutually exclusive")
+	}
+	if *holdProbeFlag && !*upgradeProbe {
+		return errors.New("billet server: --upgrade-probe-hold needs --upgrade-probe")
 	}
 
 	cfg, err := config.Load(*cfgPath)
@@ -330,7 +336,7 @@ func cmdServer(ctx context.Context, lc *lifecycle, args []string) error {
 	//
 	// --dry-run remains for proving the GitHub path while advertising zero.
 
-	return runServer(ctx, lc, cfg, *dryRun, *upgradeProbe)
+	return runServer(ctx, lc, cfg, *dryRun, *upgradeProbe, *holdProbeFlag)
 }
 
 // claimNodeDeployment reads this host's identity and takes the host-wide lock on
@@ -490,7 +496,7 @@ func runServer(
 	ctx context.Context,
 	lc *lifecycle,
 	cfg *config.Config,
-	dryRun, upgradeProbe bool,
+	dryRun, upgradeProbe, holdProbeFlag bool,
 ) error {
 	// Built by the SHARED constructor, one client per target, so the server and
 	// teardown authenticate identically. Two near-identical constructions is how
@@ -562,8 +568,7 @@ func runServer(
 		if err := notifyReady(); err != nil {
 			return fmt.Errorf("server upgrade-probe readiness: %w", err)
 		}
-		fmt.Println("billet server: upgrade probe ready; workload polling and dispatch are disabled")
-		<-ctx.Done()
+		holdProbe(ctx, holdProbeFlag, serverProbeReadyLine)
 
 		return nil
 	}
@@ -1497,12 +1502,18 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 			"node.bootstrap_addr and defaults to node.server_addr (with --enroll)")
 	upgradeProbe := fs.Bool("upgrade-probe", false,
 		"initialize the candidate provider without dialing or accepting workload")
+	holdProbeFlag := fs.Bool("upgrade-probe-hold", false,
+		"with --upgrade-probe, stay up until stopped instead of exiting once ready; the "+
+			"Ansible role's Type=notify probe unit passes this")
 
 	if err := parse(fs, args); err != nil {
 		return err
 	}
 	if *enroll && *upgradeProbe {
 		return errors.New("billet node: --enroll and --upgrade-probe are mutually exclusive")
+	}
+	if *holdProbeFlag && !*upgradeProbe {
+		return errors.New("billet node: --upgrade-probe-hold needs --upgrade-probe")
 	}
 
 	cfg, err := config.Load(*cfgPath)
@@ -1608,9 +1619,7 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 		if err := notifyReady(); err != nil {
 			return fmt.Errorf("node upgrade-probe readiness: %w", err)
 		}
-		fmt.Printf("billet node %s: upgrade probe ready; registration and workload polling are disabled\n",
-			cfg.Node.Name)
-		<-ctx.Done()
+		holdProbe(ctx, *holdProbeFlag, fmt.Sprintf(nodeProbeReadyFormat, cfg.Node.Name))
 
 		return nil
 	}

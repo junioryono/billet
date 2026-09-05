@@ -13,10 +13,10 @@
 # a control plane, because `billet server` cannot start without reaching GitHub
 # (server.Run returns an error when EnsureScaleSet fails). `--upgrade-probe` is
 # the furthest a machine with no App gets — it opens the ledger, migrates it,
-# builds the allocator from the restored rows and reads the App key, then waits —
-# and that is exactly the part a restore is responsible for. The serving half is
-# the Go test's; the systemd units and `billet local up` are still only exercised
-# by hand.
+# builds the allocator from the restored rows and reads the App key, then says so
+# and waits when told to hold — and that is exactly the part a restore is
+# responsible for. The serving half is the Go test's; the systemd units and
+# `billet local up` are still only exercised by hand.
 #
 # It runs as root, because that is what an operator restoring onto a packaged
 # host is: the App key lands in root-owned /etc/billet.
@@ -196,7 +196,9 @@ step "the service account can use what root restored"
 # If this fails, a restored control plane cannot start — which is the whole
 # operation being useless on the platform it is documented for.
 probe=/tmp/upgrade-probe.log
-runuser -u billet -- billet server --upgrade-probe --config "${CONFIG_B}" >"${probe}" 2>&1 &
+# --upgrade-probe-hold, because this script stops the probe itself, the way the
+# role's Type=notify unit does; without it a fixed probe says nothing and exits.
+runuser -u billet -- billet server --upgrade-probe --upgrade-probe-hold --config "${CONFIG_B}" >"${probe}" 2>&1 &
 probe_pid=$!
 
 waited=0

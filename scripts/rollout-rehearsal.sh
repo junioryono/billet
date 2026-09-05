@@ -206,7 +206,10 @@ if [ "${controller_has_timer}" = yes ]; then
     # The packaged timer runs every five minutes; a rehearsal asks its unit to
     # run now rather than waiting for the tick, which is the same command with
     # the same instruction.
-    docker exec "${controller}" systemctl start billet-upgrade.service 2>&1 | tail -3 || true
+    # --no-block, because a oneshot's `start` returns when the unit FINISHES, and
+    # the version wait below is what bounds this; a start that blocked here hid a
+    # probe that never returned behind a script that never printed.
+    docker exec "${controller}" systemctl start --no-block billet-upgrade.service 2>&1 | tail -3 || true
 else
     echo "(${FROM} predates billet-upgrade.timer; running host-upgrade on the controller as its docs said)"
     docker exec "${controller}" /usr/bin/billet host-upgrade --version "${TO}" \
@@ -214,8 +217,13 @@ else
 fi
 
 rehearsal_wait_for 600 "the controller to run ${TO}" "${controller}" \
-    sh -c "/usr/bin/billet version | grep -q ' ${TO_VERSION} '" ||
+    sh -c "/usr/bin/billet version | grep -q ' ${TO_VERSION} '" || {
+    echo "--- billet-upgrade.service on the controller ---" >&2
+    docker exec "${controller}" journalctl -u billet-upgrade.service --no-pager -o short-iso 2>&1 |
+        grep -vE '^[[:space:]]|goroutine|\.go:[0-9]' | tail -30 >&2
+    docker exec "${controller}" cat /var/lib/billet/upgrades/active/journal.json 2>/dev/null >&2 || true
     rehearsal_fail "the controller did not come up on ${TO}"
+}
 controller_upgrade_took=$(($(date -u +%s) - controller_upgrade_started))
 
 step=$(rehearsal_journal_step "${controller}")

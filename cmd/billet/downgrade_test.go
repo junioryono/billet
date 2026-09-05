@@ -172,8 +172,13 @@ func TestTheMarkIsLoweredBeforeTheCandidateIsProbed(t *testing.T) {
 	installedBinary = filepath.Join(t.TempDir(), "billet")
 	t.Cleanup(func() { lowerReleaseWatermark, installedBinary = prevLower, prevBinary })
 
-	if err := os.WriteFile(installedBinary, []byte("#!/bin/sh\nprintf 'candidate %s\\n' \"$1\" >> "+
-		record+"\n"), 0o755); err != nil {
+	// THE STAND-IN ANSWERS THE USAGE QUESTION TOO, and records it as its own step,
+	// because the probe now asks a server or node candidate which protocol it
+	// speaks before running it; the lowering has to precede both.
+	if err := os.WriteFile(installedBinary, []byte("#!/bin/sh\n"+
+		"if [ \"$2\" = -h ]; then printf 'usage %s\\n' \"$1\" >> "+record+
+		"; echo '  -upgrade-probe-hold'; exit 0; fi\n"+
+		"printf 'candidate %s\\n' \"$1\" >> "+record+"\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -197,7 +202,7 @@ func TestTheMarkIsLoweredBeforeTheCandidateIsProbed(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	want := "lower external=true to v0.4.0\ncandidate server\n" +
+	want := "lower external=true to v0.4.0\nusage server\ncandidate server\n" +
 		"lower external=false to v0.4.0\ncandidate check\n"
 	if string(body) != want {
 		t.Errorf("the steps ran as:\n%s\nwant:\n%s", body, want)
