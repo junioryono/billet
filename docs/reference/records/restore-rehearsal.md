@@ -37,6 +37,10 @@ The Linux leg goes one step further than a restore. It proves that `billet local
 
 That last assertion is not decoration. The seal a recovery takes before replacing the ledger lives *in* the ledger being replaced, and the archive's admission row is whatever it was when the backup was taken — open. A recovery that stopped there would hand back a control plane that takes new work immediately, while its nodes still hold compute the restored ledger has never heard of. The rehearsal is what found that.
 
+## Every target's key, or none
+
+A deployment serving several GitHub targets holds one App key per target, and a single-target rehearsal passes with a second key silently dropped. The packaged leg therefore adds a repository-scoped second target with a throwaway key of its own to the template it restores, and asserts that both keys are archived at mode 600, both come back byte-identical at the paths the restored config names, and both are owned by the service account afterwards, because a root-run restore that repaired the first key and forgot the second would start a control plane that serves one target and refuses the other.
+
 ## Off the disk it protects
 
 The rehearsal above proves an archive restores. It says nothing about where the archive is, and `--out <dir>` puts it on the volume it protects.

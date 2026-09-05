@@ -445,3 +445,73 @@ func TestTierTargetPolicyErrorsIsWhatTheServerReapplies(t *testing.T) {
 		t.Errorf("an untrusted tier under a repository target produced %v", errs)
 	}
 }
+
+// THE GITHUB BLOCK IS THE FIRST TARGET, so a targets list with no github block
+// is refused: the archive, the identity store and the host role key the first
+// target by the name `default`, and a first target found by position would move
+// its credential on a reorder or a rename.
+func TestTargetsNeedTheGitHubBlock(t *testing.T) {
+	const block = "github:\n  org: acme\n  app_id: 12345\n  installation_id: 67890\n  private_key_path: /etc/billet/app.pem\n"
+
+	body := validConfig
+	if !strings.Contains(body, block) {
+		t.Fatalf("the fixture's github block has changed, so this case patches nothing:\n%s", body)
+	}
+
+	body = strings.Replace(body, block, "", 1) + `
+targets:
+  - name: personal
+    repository: someone/widgets
+    app_id: 777
+    installation_id: 888
+    private_key_path: /etc/billet/app-personal.pem
+`
+
+	_, err := Load(writeConfig(t, body))
+	if err == nil {
+		t.Fatal("Load accepted a targets list with no github block")
+	}
+
+	if !strings.Contains(err.Error(), "write the first target as github") {
+		t.Errorf("the refusal does not say what to do: %v", err)
+	}
+}
+
+// Two targets naming one key file would load one App's key for both identities
+// and archive the same bytes as two credentials.
+func TestTwoTargetsCannotShareAKeyPath(t *testing.T) {
+	body := strings.Replace(twoTargetConfig(t, "default"),
+		"private_key_path: /etc/billet/app-personal.pem",
+		"private_key_path: /etc/billet/../billet/app.pem", 1)
+
+	_, err := Load(writeConfig(t, body))
+	if err == nil {
+		t.Fatal("Load accepted two targets naming one key file")
+	}
+
+	if !strings.Contains(err.Error(), "every target holds its own App key") {
+		t.Errorf("the refusal does not name the rule: %v", err)
+	}
+}
+
+// CheckTargetName is the one rule a command applies before an App exists for
+// the name; it must agree with what Load refuses.
+func TestCheckTargetNameIsTheLabelGrammar(t *testing.T) {
+	for name, want := range map[string]bool{
+		"personal":    true,
+		"beta-2":      true,
+		"":            false,
+		"has space":   false,
+		"Upper":       true,
+		"trailing-":   true,
+		"with.period": true,
+		"with/slash":  false,
+		" personal":   false,
+		"a#b":         false,
+	} {
+		err := CheckTargetName(name)
+		if (err == nil) != want {
+			t.Errorf("CheckTargetName(%q) = %v, want accepted=%v", name, err, want)
+		}
+	}
+}

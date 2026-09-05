@@ -2,8 +2,11 @@ package deployarchive
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -68,6 +71,81 @@ type TargetKey struct {
 	Name      string
 	GitHub    GitHubIdentity
 	AppKeyPEM []byte
+}
+
+// String renders the target and never its key.
+func (k TargetKey) String() string {
+	return fmt.Sprintf("deployarchive.TargetKey{Name:%q GitHub:%s key:[redacted]}", k.Name, k.GitHub)
+}
+
+// GoString covers %#v, which does not consult String.
+func (k TargetKey) GoString() string { return k.String() }
+
+// Format makes every verb safe: fmt consults Stringer only for some verbs and
+// otherwise formats the fields, key bytes included.
+func (k TargetKey) Format(s fmt.State, _ rune) {
+	//nolint:errcheck // fmt.State has no error channel; a failed write to it is the caller's output problem.
+	io.WriteString(s, k.String())
+}
+
+// MarshalJSON renders the target and never its key.
+func (k TargetKey) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Name   string `json:"name"`
+		GitHub string `json:"github"`
+		Key    string `json:"key"`
+	}{Name: k.Name, GitHub: k.GitHub.String(), Key: "[redacted]"})
+}
+
+// LogValue renders the target and never its key.
+func (k TargetKey) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("name", k.Name),
+		slog.String("github", k.GitHub.String()),
+		slog.String("key", "[redacted]"),
+	)
+}
+
+// String renders the request and never a key.
+func (req BackupRequest) String() string {
+	return fmt.Sprintf("deployarchive.BackupRequest{Dest:%q StateDir:%q DeploymentID:%q GitHub:%s "+
+		"targets:%d key:[redacted]}", req.Dest, req.StateDir, req.DeploymentID, req.GitHub,
+		len(req.Targets))
+}
+
+// GoString covers %#v, which does not consult String.
+func (req BackupRequest) GoString() string { return req.String() }
+
+// Format makes every verb safe.
+func (req BackupRequest) Format(s fmt.State, _ rune) {
+	//nolint:errcheck // fmt.State has no error channel; a failed write to it is the caller's output problem.
+	io.WriteString(s, req.String())
+}
+
+// MarshalJSON renders the request and never a key.
+func (req BackupRequest) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Dest         string `json:"dest"`
+		StateDir     string `json:"state_dir"`
+		DeploymentID string `json:"deployment_id"`
+		GitHub       string `json:"github"`
+		Targets      int    `json:"targets"`
+		Key          string `json:"key"`
+	}{
+		Dest: req.Dest, StateDir: req.StateDir, DeploymentID: req.DeploymentID,
+		GitHub: req.GitHub.String(), Targets: len(req.Targets), Key: "[redacted]",
+	})
+}
+
+// LogValue renders the request and never a key.
+func (req BackupRequest) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("dest", req.Dest),
+		slog.String("deployment_id", req.DeploymentID),
+		slog.String("github", req.GitHub.String()),
+		slog.Int("targets", len(req.Targets)),
+		slog.String("key", "[redacted]"),
+	)
 }
 
 // ExternalLedger describes a ledger the archive deliberately does not contain.

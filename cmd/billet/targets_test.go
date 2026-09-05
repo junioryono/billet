@@ -307,6 +307,7 @@ func TestGitHubAppCreateRefusesTwoScopesAndNone(t *testing.T) {
 		"neither":      {"--no-browser"},
 		"a bad repo":   {"--repository", "acme"},
 		"an empty tgt": {"--org", "acme", "--target", ""},
+		"a bad tgt":    {"--org", "acme", "--target", "has space"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if err := githubAppCreate(t.Context(), append(args, "--no-browser")); err == nil {
@@ -390,5 +391,65 @@ func TestInitWritesARepositoryScopedConfig(t *testing.T) {
 		"--repository", "widgets", "--provider", "firecracker",
 	}); err == nil || !strings.Contains(err.Error(), "--repository") {
 		t.Errorf("init accepted a repository with no owner: %v", err)
+	}
+}
+
+// `billet status` groups the tier lines by target when there are several, and
+// each tier appears under its own target only: an operator reading capacity
+// per label has to know which owner's jobs it serves.
+func TestStatusGroupsTiersByTargetWhenThereAreSeveral(t *testing.T) {
+	cfgPath := writeTargetConfig(t, "  org: acme", `    target: default
+  - label: billet-4vcpu-personal
+    provider: docker
+    vcpu: 4
+    memory: 16GiB
+    image: ghcr.io/actions/actions-runner:latest
+    trust: untrusted
+    target: personal
+targets:
+  - name: personal
+    repository: someone/widgets
+    app_id: 8
+    installation_id: 43
+    private_key_path: EXTRA_KEY
+`)
+
+	if err := os.MkdirAll(filepath.Join(filepath.Dir(cfgPath), "server"), 0o700); err != nil {
+		t.Fatalf("state dir: %v", err)
+	}
+
+	out := capture(t, func() {
+		if err := cmdStatus(t.Context(), []string{"--config", cfgPath}); err != nil {
+			t.Errorf("status: %v", err)
+		}
+	})
+
+	lines := strings.Split(out, "\n")
+
+	position := func(prefix string) int {
+		for i, line := range lines {
+			if strings.HasPrefix(line, prefix) {
+				return i
+			}
+		}
+
+		t.Fatalf("no line starting %q in:\n%s", prefix, out)
+
+		return -1
+	}
+
+	defaultAt := position("target    default (org acme)")
+	personalAt := position("target    personal (repository someone/widgets)")
+	firstTier := position("tier      billet-4vcpu ")
+	secondTier := position("tier      billet-4vcpu-personal ")
+
+	if !(defaultAt < firstTier && firstTier < personalAt && personalAt < secondTier) {
+		t.Errorf("tiers are not grouped under their targets (default@%d, its tier@%d, "+
+			"personal@%d, its tier@%d):\n%s", defaultAt, firstTier, personalAt, secondTier, out)
+	}
+
+	if strings.Count(out, "tier      billet-4vcpu ") != 1 ||
+		strings.Count(out, "tier      billet-4vcpu-personal ") != 1 {
+		t.Errorf("a tier is listed under more than one target:\n%s", out)
 	}
 }

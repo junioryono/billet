@@ -753,7 +753,23 @@ func (c *Client) ValidateTrustedRunnerGroup(
 	ctx context.Context, tier, group string, workflows []string,
 ) error {
 	return c.do(ctx, http.MethodPost, c.nodePath("/trusted-runner-group"),
-		nodeapi.TrustedRunnerGroupRequest{Tier: tier, Group: group, Workflows: workflows}, nil)
+		trustedRunnerGroupRequest(c.WireVersion(), tier, group, workflows), nil)
+}
+
+// trustedRunnerGroupRequest carries the tier only on a wire that knows the
+// field. The plane decodes with DisallowUnknownFields, so a node that
+// negotiated an older version with an older plane (a rollback, or a node
+// upgraded ahead of its controller) would otherwise have every trusted launch
+// refused as a malformed body; on that wire the plane serves one target and
+// resolves the tier itself.
+func trustedRunnerGroupRequest(wire int, tier, group string, workflows []string,
+) nodeapi.TrustedRunnerGroupRequest {
+	req := nodeapi.TrustedRunnerGroupRequest{Group: group, Workflows: workflows}
+	if wire >= nodeapi.VersionTargetedRunnerGroup {
+		req.Tier = tier
+	}
+
+	return req
 }
 
 // JITConfig asks the control plane to mint one runner registration.

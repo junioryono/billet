@@ -1,7 +1,9 @@
 package config
 
 import (
+	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 )
 
@@ -204,13 +206,32 @@ func (c *Config) defaultTierTargets() {
 	}
 }
 
+// CheckTargetName is the rule a target's name is held to: the tier-label
+// grammar, because a tier names its target by it and both end up in the same
+// diagnostics, file names and store parameters. Exported so a command can
+// refuse a name before an App is created for it.
+func CheckTargetName(name string) error {
+	if name == "" {
+		return errors.New("a target name is required")
+	}
+
+	if !labelRe.MatchString(name) {
+		return fmt.Errorf("target name %q must match %s", name, labelRe)
+	}
+
+	return nil
+}
+
 // validateTargets checks the `github:` block and every `targets:` entry.
 //
 // The server role needs at least one; every target names exactly one of an
 // organization or a repository, held to the transport rule for each; names are
-// label-shaped and unique; and `default` is reserved for the `github:` block
-// whenever that block is written, because a `targets:` entry taking the name
-// beside it would be two blocks describing one target.
+// label-shaped and unique. THE GITHUB BLOCK IS THE FIRST TARGET AND ITS NAME IS
+// `default`, unconditionally: a `targets:` list with no `github:` block would
+// make its first entry the default by position, which the archive, the identity
+// store and the host role all key by name, so a reorder or a rename would
+// silently move a credential; and a `targets:` entry named `default` would be
+// two spellings of the block.
 func (c *Config) validateTargets() []error {
 	var errs []error
 
@@ -220,6 +241,12 @@ func (c *Config) validateTargets() []error {
 		}
 
 		return nil
+	}
+
+	if c.GitHub == nil && len(c.Targets) > 0 {
+		errs = append(errs, fmt.Errorf("targets is written without a github block: the github "+
+			"block is the first target, named %q, and targets holds the further ones; write "+
+			"the first target as github", DefaultTargetName))
 	}
 
 	if c.GitHub != nil {
@@ -246,10 +273,10 @@ func (c *Config) validateTargets() []error {
 			errs = append(errs, fmt.Errorf("%s: name is required; a tier names its target by it", where))
 		case !labelRe.MatchString(t.Name):
 			errs = append(errs, fmt.Errorf("%s: name must match %s", where, labelRe))
-		case t.Name == DefaultTargetName && c.GitHub != nil:
-			errs = append(errs, fmt.Errorf("%s: the github block is already the target named %q, "+
-				"so this entry and that block are two spellings of one target; rename it, or "+
-				"move the github block into targets under this name", where, DefaultTargetName))
+		case t.Name == DefaultTargetName:
+			errs = append(errs, fmt.Errorf("%s: %q is the github block's name, so this entry and "+
+				"that block are two spellings of one target; write the first target as github "+
+				"and give this one another name", where, DefaultTargetName))
 		}
 
 		if _, dup := seen[t.Name]; dup && t.Name != "" {
@@ -316,12 +343,28 @@ func (c *Config) validateTargetKeyPaths() []error {
 		return nil
 	}
 
+	// ONE KEY FILE PER TARGET. Two targets naming one path would load one App's
+	// key for both identities, and a backup would archive the same bytes as two
+	// credentials; the restore planner would then publish one and refuse the
+	// other behind a maintenance fence.
+	keyPaths := make(map[string]string, len(c.Targets)+1)
+
 	for _, t := range c.GitHubTargets() {
 		switch c.Server.IdentityBackendKind() {
 		case IdentityFile:
 			if t.PrivateKeyPath == "" {
 				errs = append(errs, fmt.Errorf("%s.private_key_path is required", t.Where()))
+
+				continue
 			}
+
+			cleaned := filepath.Clean(t.PrivateKeyPath)
+			if other, dup := keyPaths[cleaned]; dup {
+				errs = append(errs, fmt.Errorf("%s.private_key_path names %s, which %s already "+
+					"names: every target holds its own App key", t.Where(), t.PrivateKeyPath, other))
+			}
+
+			keyPaths[cleaned] = t.Where()
 		case IdentitySSM:
 			// TWO SPELLINGS OF ONE VALUE, WHICH THIS FILE HAS ALREADY GOT WRONG THREE
 			// TIMES. With the App key in Parameter Store there is no path to read, and

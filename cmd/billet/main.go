@@ -500,7 +500,10 @@ func runServer(
 		return err
 	}
 
-	serverTargets, planeJIT := wiring.BuildTargets(targets)
+	serverTargets, planeJIT, err := wiring.BuildTargets(targets)
+	if err != nil {
+		return err
+	}
 
 	// READ, NOT CLAIMED. The host-wide lock exists to stop two processes managing
 	// one deployment's containers, and a control plane manages none — the node

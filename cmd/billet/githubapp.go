@@ -104,6 +104,12 @@ func githubAppCreate(ctx context.Context, args []string) error {
 		return errors.New("--target must name a target; the github block is named " + config.DefaultTargetName)
 	}
 
+	// BEFORE THE APP EXISTS, because a name the config refuses at load would
+	// otherwise be found out after the key GitHub issues once has been spent.
+	if err := config.CheckTargetName(*targetName); err != nil {
+		return fmt.Errorf("--target: %w", err)
+	}
+
 	identity := githubBlock{Target: *targetName, Org: *org, Repository: *repository}
 
 	// FIRST, so the config's own refusals are the ones an operator sees.

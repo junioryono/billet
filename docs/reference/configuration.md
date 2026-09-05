@@ -39,7 +39,7 @@ A repository target is **untrusted-only**: a repository has no runner groups, so
 
 ## `targets`
 
-Further targets, each an organization or a repository with its own App, served by the same control plane, fleet, CA and identity. `github` and `targets` may coexist; a `targets` entry named `default` beside a `github` block is refused as two spellings of one target.
+Further targets, each an organization or a repository with its own App, served by the same control plane, fleet, CA and identity. `targets` requires the `github` block, which is always the first target and always the one named `default`; a `targets` entry named `default` is refused as a second spelling of it. Two targets may not name one `private_key_path`.
 
 | Key | Required | Meaning |
 |---|---|---|

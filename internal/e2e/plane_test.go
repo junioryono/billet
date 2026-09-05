@@ -749,7 +749,10 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 			{Config: config.GitHubTarget{Name: "beta", Org: "beta"}, Client: second},
 		}
 
-		serverTargets, planeJIT = wiring.BuildTargets(targets)
+		serverTargets, planeJIT, err = wiring.BuildTargets(targets)
+		if err != nil {
+			t.Fatalf("wiring.BuildTargets: %v", err)
+		}
 	}
 
 	var allocOpts []alloc.Option

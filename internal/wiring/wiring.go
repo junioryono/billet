@@ -17,6 +17,7 @@ package wiring
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
@@ -45,16 +46,37 @@ type Target struct {
 // tier resolves to the same credential whichever half of the control plane is
 // asking — and so internal/e2e assembles a multi-target deployment the way the
 // CLI does rather than by hand.
-func BuildTargets(targets []Target) ([]server.Target, map[string]nodeplane.JITSource) {
+//
+// REFUSED RATHER THAN SILENTLY SPLIT. The server keeps a slice and resolves the
+// first entry of a name, the plane keeps a map and would hold the last, so two
+// entries under one name would reconcile a tier through one App and mint its
+// registrations through another. Config refuses duplicate names at load; this
+// refuses them at the seam every caller passes through, and refuses a client
+// whose own target is not the one the config names.
+func BuildTargets(targets []Target) ([]server.Target, map[string]nodeplane.JITSource, error) {
 	servers := make([]server.Target, 0, len(targets))
 	jit := make(map[string]nodeplane.JITSource, len(targets))
 
 	for _, t := range targets {
+		switch {
+		case t.Config.Name == "":
+			return nil, nil, errors.New("wiring: a target with no name")
+		case t.Client == nil:
+			return nil, nil, fmt.Errorf("wiring: target %q has no client", t.Config.Name)
+		case t.Client.Target().Path() != t.Config.Path():
+			return nil, nil, fmt.Errorf("wiring: target %q is %s in the config and %s on its client",
+				t.Config.Name, t.Config.Path(), t.Client.Target().Path())
+		}
+
+		if _, dup := jit[t.Config.Name]; dup {
+			return nil, nil, fmt.Errorf("wiring: two targets named %q", t.Config.Name)
+		}
+
 		servers = append(servers, server.Target{Config: t.Config, Provisioner: Provisioner{Client: t.Client}})
 		jit[t.Config.Name] = NodeJIT{Client: t.Client}
 	}
 
-	return servers, jit
+	return servers, jit, nil
 }
 
 type poolRunnerStore interface {
