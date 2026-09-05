@@ -2097,7 +2097,8 @@ func candidateHoldsOnFlag(ctx context.Context, what string) (bool, error) {
 	// kernel without pidfd that is a signal to a number the Wait may just have
 	// freed (Go's own os package says so). The deadline is kept here and every
 	// signal goes through the handle before the one Wait.
-	cmd := exec.Command(installedBinary, what, "-h") //nolint:noctx // see above: the deadline is kept here, its kill precedes the one Wait
+	//nolint:noctx // the deadline is kept here, its kill precedes the one Wait; see above
+	cmd := exec.Command(installedBinary, what, "-h")
 	cmd.Stdout = writer
 	cmd.Stderr = writer
 
@@ -2219,7 +2220,8 @@ func (h *ledgerHost) runCandidate(ctx context.Context, args ...string) error {
 
 	// NOT exec.CommandContext, for the reason candidateHoldsOnFlag gives: the
 	// deadline is this function's, and its kill goes through the handle before Wait.
-	cmd := exec.Command(installedBinary, args...) //nolint:noctx // see above: the deadline is kept here, its kill precedes the one Wait
+	//nolint:noctx // the deadline is kept here, its kill precedes the one Wait; see above
+	cmd := exec.Command(installedBinary, args...)
 	cmd.Stdout = writer
 	cmd.Stderr = writer
 	// THE CANDIDATE DECIDES BY ITS FLAG, NOT BY WHAT IT INHERITS, and a socket

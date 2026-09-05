@@ -420,6 +420,18 @@ func finish(ctx context.Context, req Request, log *slog.Logger) error {
 // THE JOURNAL KEEPS THE CAUSE AND THE STEP, so `--resume` knows where it was and
 // an operator knows why nothing moved. A resume rolls back from here, which is the
 // operator asserting the candidate is gone.
+func beginRollback(ctx context.Context, req Request, log *slog.Logger, cause error) error {
+	if failErr := req.Journal.Fail(cause); failErr != nil {
+		return fmt.Errorf("%w: %w (and the journal could not record it: %w)",
+			ErrCordoned, cause, failErr)
+	}
+
+	return rollBack(ctx, req, log, cause)
+}
+
+// cordonWithoutRestoring records the failure and stops, restoring nothing,
+// because the candidate may still be running; the resume that follows is the
+// operator asserting it is not.
 func cordonWithoutRestoring(req Request, log *slog.Logger, cause error) error {
 	j := req.Journal
 
@@ -434,15 +446,6 @@ func cordonWithoutRestoring(req Request, log *slog.Logger, cause error) error {
 
 	return fmt.Errorf("%w: %w (nothing was restored, because the candidate may still be "+
 		"running; look at it, then `billet host-upgrade --resume` rolls back)", ErrCordoned, cause)
-}
-
-func beginRollback(ctx context.Context, req Request, log *slog.Logger, cause error) error {
-	if failErr := req.Journal.Fail(cause); failErr != nil {
-		return fmt.Errorf("%w: %w (and the journal could not record it: %w)",
-			ErrCordoned, cause, failErr)
-	}
-
-	return rollBack(ctx, req, log, cause)
 }
 
 // rollBack restores the previous release, and says which of the two failure
