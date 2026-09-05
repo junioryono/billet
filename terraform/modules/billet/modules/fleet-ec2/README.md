@@ -8,7 +8,7 @@ The IAM policy is billet's **own** generator's output (`internal/awspolicy`, kep
 
 ```hcl
 module "fleet" {
-  source = "github.com/junioryono/billet//terraform/modules/billet/modules/fleet-ec2?ref=v0.9.0"
+  source = "github.com/junioryono/billet//terraform/modules/billet/modules/fleet-ec2?ref=v0.9.1"
 
   name         = "billet"
   vpc_id       = aws_vpc.mine.id
