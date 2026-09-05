@@ -37,7 +37,7 @@ Because those defaults are easy to get wrong, they are provisioned as a module:
 
 ```hcl
 module "converge" {
-  source = "github.com/junioryono/billet//terraform/modules/converge-aws-ssm?ref=main"
+  source = "github.com/junioryono/billet//terraform/modules/converge-aws-ssm?ref=v0.8.0"
 
   name              = "billet-converge"
   github_repository = "your-org/your-infra-repo"
@@ -54,7 +54,7 @@ You must own a domain on Cloudflare, because the tunnel is addressed by hostname
 
 ```hcl
 module "converge" {
-  source = "github.com/junioryono/billet//terraform/modules/converge-cloudflare?ref=main"
+  source = "github.com/junioryono/billet//terraform/modules/converge-cloudflare?ref=v0.8.0"
 
   account_id = var.cloudflare_account_id
   zone_id    = var.cloudflare_zone_id
@@ -74,7 +74,7 @@ Cloudflare documents the mechanism for headless Linux: `mdm.xml` with `auth_clie
 
 ```hcl
 module "converge" {
-  source = "github.com/junioryono/billet//terraform/modules/converge-cloudflare-warp?ref=main"
+  source = "github.com/junioryono/billet//terraform/modules/converge-cloudflare-warp?ref=v0.8.0"
 
   account_id     = var.cloudflare_account_id
   team_name      = "example"                      # the <team> in <team>.cloudflareaccess.com
