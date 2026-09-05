@@ -9,6 +9,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/junioryono/billet/internal/hostupgrade"
 )
 
 // usageHandler is what a candidate script prints for `-h`, the way every
@@ -292,10 +294,11 @@ func TestRunCandidateKillsALegacyProbeThatIgnoresTheStop(t *testing.T) {
 	}
 }
 
-// A CHILD THAT KEEPS THE CANDIDATE'S OUTPUT FAILS THE PROBE, and is not hunted:
+// A CHILD THAT KEEPS THE CANDIDATE'S OUTPUT CORDONS THE HOST, and is not hunted:
 // the parent signals nothing by number, so a process it did not start is not one
-// it will kill, and a probe that passed over it would leave it behind the
-// transaction. The test kills the child afterwards.
+// it will kill; and the open output proves that process is alive, so the
+// transaction may not restore the ledger over it. The test kills the child
+// afterwards.
 func TestRunCandidateRefusesAProbeWhoseChildHoldsItsOutput(t *testing.T) {
 	pidFile := filepath.Join(t.TempDir(), "child.pid")
 	t.Setenv("BILLET_TEST_GRANDCHILD_PIDFILE", pidFile)
@@ -322,6 +325,11 @@ func TestRunCandidateRefusesAProbeWhoseChildHoldsItsOutput(t *testing.T) {
 
 	if !strings.Contains(err.Error(), "holding its output") {
 		t.Fatalf("the held output was misread: %v", err)
+	}
+
+	if !errors.Is(err, hostupgrade.ErrUnsafeToRestore) {
+		t.Fatalf("a live descendant was reported as an ordinary refusal, which rolls back over "+
+			"it: %v", err)
 	}
 }
 
@@ -394,11 +402,44 @@ func TestRunCandidateRefusesACandidateWhoseUsageLeavesAProcessOnItsOutput(t *tes
 		t.Fatal("a candidate whose -h left a process on its output was probed and passed")
 	}
 
-	if !strings.Contains(err.Error(), "usage could not be read") {
+	if !strings.Contains(err.Error(), "still holds its output") {
 		t.Fatalf("the held usage output was misread: %v", err)
+	}
+
+	if !errors.Is(err, hostupgrade.ErrUnsafeToRestore) {
+		t.Fatalf("a live descendant of the usage was reported as an ordinary refusal: %v", err)
 	}
 
 	if took := time.Since(started); took > 20*time.Second {
 		t.Fatalf("the usage question held the transaction for %s past a one-second bound", took)
+	}
+}
+
+// AND A FAILED USAGE WITH SOMETHING STILL ALIVE BEHIND IT CORDONS TOO. The
+// non-zero exit is the smaller fact; the live descendant is the one the
+// transaction has to act on.
+func TestRunCandidateCordonsWhenAFailedUsageLeavesAProcessOnItsOutput(t *testing.T) {
+	pidFile := filepath.Join(t.TempDir(), "holder.pid")
+	t.Setenv("BILLET_TEST_GRANDCHILD_PIDFILE", pidFile)
+
+	path := filepath.Join(t.TempDir(), "billet")
+	script := "#!/bin/sh\nif [ \"$2\" = -h ]; then\n  sleep 60 &\n" +
+		"  echo $! > \"$BILLET_TEST_GRANDCHILD_PIDFILE\"\n  echo 'no such command' >&2\n  exit 2\nfi\nexit 0\n"
+
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	previous, previousDelay := installedBinary, probeUsageWaitDelay
+	installedBinary, probeUsageWaitDelay = path, 1*time.Second
+
+	t.Cleanup(func() { installedBinary, probeUsageWaitDelay = previous, previousDelay })
+
+	err := (&ledgerHost{}).runCandidate(t.Context(), "server")
+
+	killLater(t, recordedPID(t, pidFile))
+
+	if !errors.Is(err, hostupgrade.ErrUnsafeToRestore) {
+		t.Fatalf("a failed usage with a live descendant did not cordon: %v", err)
 	}
 }
