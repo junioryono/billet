@@ -25,8 +25,10 @@ import (
 //
 //	-X github.com/junioryono/billet/internal/version.version={{.Version}}
 //
-// Left empty by an ordinary build, which is what makes the fallback below the
-// normal path rather than the exceptional one.
+// GoReleaser's {{.Version}} is the tag WITHOUT its leading v, so what arrives
+// here for release v0.9.1 is "0.9.1"; resolve spells it as the tag. Left empty
+// by an ordinary build, which is what makes the fallback below the normal path
+// rather than the exceptional one.
 var (
 	version string
 	commit  string
@@ -48,25 +50,38 @@ func Version() string {
 	return resolve(version, info, ok)
 }
 
-// resolve picks the version from the two sources, in order.
+// resolve picks the version from the two sources, in order, and spells a
+// release as its tag.
 //
 // A SEPARATE FUNCTION SO THE FALLBACKS CAN BE TESTED. debug.ReadBuildInfo always
 // succeeds inside a test binary and always reports "(devel)", so a test that
 // called Version() directly could never reach the second or third branch — and a
 // mutation that deleted either of them survived, which reads exactly like the
 // code being unnecessary rather than untested.
+//
+// THE TAG IS THE ONE SPELLING EVERYTHING ELSE SPEAKS: channels, manifests,
+// rollouts, pins and the ledger's watermark all say vX.Y.Z. The release build
+// injects the bare X.Y.Z, and for nine releases that is what this returned, so a
+// running release compared as "not a release" against every one of them and no
+// downgrade guard ever held on a release binary (see Compare). Anything that is
+// not a release passes through as it came, because "(devel)" and a snapshot are
+// exactly what they say.
 func resolve(injected string, info *debug.BuildInfo, ok bool) string {
-	if v := strings.TrimSpace(injected); v != "" {
-		return v
+	v := strings.TrimSpace(injected)
+
+	if v == "" && ok && info != nil {
+		v = strings.TrimSpace(info.Main.Version)
 	}
 
-	if ok && info != nil {
-		if v := strings.TrimSpace(info.Main.Version); v != "" {
-			return v
-		}
+	if v == "" {
+		return unknown
 	}
 
-	return unknown
+	if tag, ok := Canonical(v); ok {
+		return tag
+	}
+
+	return v
 }
 
 // Revision is the commit this binary was built from, or "" if nothing recorded

@@ -459,3 +459,24 @@
       loop: "{{ billet_gated_expectations }}"
       loop_control:
         label: "{{ item.task }}"
+
+    # BOTH SPELLINGS OF A RELEASE ARE A RELEASE TO THE DOWNGRADE CHECK. A release
+    # through v0.9.1 prints its version without the tag's v, and a pattern that
+    # required it read every such candidate as not a release, at which point the
+    # assertion passed without comparing and an unnamed downgrade went through.
+    - name: The downgrade check recognises a release with or without its v
+      vars:
+        billet_downgrade_task: "{{ billet_host_account_tasks | selectattr('name', 'equalto', 'Refuse a converge that would downgrade this host') | first }}"
+        billet_release_pattern: "{{ billet_downgrade_task.vars.billet_release_tag }}"
+      ansible.builtin.assert:
+        that:
+          - "'0.9.1' is match(billet_release_pattern)"
+          - "'v0.9.2' is match(billet_release_pattern)"
+          - "'0.10.0' is match(billet_release_pattern)"
+          - "not ('latest' is match(billet_release_pattern))"
+          - "not ('01.2.3' is match(billet_release_pattern))"
+          - "not ('v1.2.3-rc1' is match(billet_release_pattern))"
+          - "not ('(devel)' is match(billet_release_pattern))"
+        fail_msg: >-
+          account.yml's downgrade check must recognise both spellings of a release,
+          v0.9.2 and 0.9.1, and nothing that is not one; pattern {{ billet_release_pattern }}.

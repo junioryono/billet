@@ -188,6 +188,12 @@ func hostUpgradeFromRollout(ctx context.Context, cfg *config.Config, cfgPath str
 	return startHostUpgrade(ctx, cfg, cfgPath, target, newUpgradeAck(0))
 }
 
+// runningRelease is the release this binary is, as the upgrade decisions read
+// it. A variable so a test can stand a RELEASE in for the "(devel)" a test binary
+// reports, because every guard here is could-not-tell against "(devel)" and a
+// test that cannot name a release cannot prove a guard holds.
+var runningRelease = version.Version
+
 // rolloutInstruction reads what the fleet's decision asks of this host, and says
 // whether there is anything to do.
 //
@@ -279,7 +285,7 @@ func rolloutInstruction(ctx context.Context, cfg *config.Config) (hostUpgradeTar
 	// a host running the target version from another manifest is one a rollout
 	// blocks and tells an operator to reinstall, and the timer is that operator.
 	// Only a POSITIVE disagreement reinstalls; a host with no record is on it.
-	if current.TargetVersion == version.Version() {
+	if version.Same(current.TargetVersion, runningRelease()) {
 		if !installedDisagrees(current.TargetDigest) {
 			if err := settleOnTarget(current, target); err != nil {
 				return hostUpgradeTarget{}, false, err
@@ -295,29 +301,29 @@ func rolloutInstruction(ctx context.Context, cfg *config.Config) (hostUpgradeTar
 	// A COMPLETED ROLLOUT IS FOLLOWED ONLY FORWARDS, unless it was itself a
 	// downgrade somebody named. The open case is fenced the same way one step
 	// later, by checkDowngrade, with the same permission.
-	if order, ok := version.Compare(current.TargetVersion, version.Version()); ok && order < 0 &&
+	if order, ok := version.Compare(current.TargetVersion, runningRelease()); ok && order < 0 &&
 		!current.Policy.AllowDowngrade {
 		fmt.Printf("Rollout %s's target %s is older than the %s running here and the rollout "+
 			"did not allow a downgrade; nothing to do.\n", current.ID, current.TargetVersion,
-			version.Version())
+			runningRelease())
 
 		return hostUpgradeTarget{}, false, nil
 	}
 
 	switch {
-	case current.TargetVersion == version.Version():
+	case version.Same(current.TargetVersion, runningRelease()):
 		// Said above.
 	case current.State == rollout.StateCompleted:
 		fmt.Printf("Rollout %s completed at %s while this host stayed on %s; moving it "+
 			"(manifest %s, decision %d).\n", current.ID, current.TargetVersion,
-			version.Version(), current.TargetDigest, current.Generation)
+			runningRelease(), current.TargetDigest, current.Generation)
 	case current.ControllerPhase.Converged():
 		fmt.Printf("Rollout %s has converged a control plane on %s, and this host runs %s; "+
 			"moving it (manifest %s, decision %d).\n", current.ID, current.TargetVersion,
-			version.Version(), current.TargetDigest, current.Generation)
+			runningRelease(), current.TargetDigest, current.Generation)
 	default:
 		fmt.Printf("Rollout %s asks this host to move from %s to %s (manifest %s, decision %d).\n",
-			current.ID, version.Version(), current.TargetVersion, current.TargetDigest,
+			current.ID, runningRelease(), current.TargetVersion, current.TargetDigest,
 			current.Generation)
 	}
 
@@ -655,7 +661,7 @@ func actOnResolved(ctx context.Context, cfg *config.Config, cfgPath string,
 	// ledger the release watermark would refuse it at the probe and roll the
 	// transaction back; on a node-only host nothing else would, and the fleet's
 	// newest release would quietly be replaced by whatever an old pin said.
-	if err := checkDowngrade(manifest.Version, version.Version(), target.allowDowngrade); err != nil {
+	if err := checkDowngrade(manifest.Version, runningRelease(), target.allowDowngrade); err != nil {
 		return err
 	}
 
@@ -712,7 +718,7 @@ func actOnResolved(ctx context.Context, cfg *config.Config, cfgPath string,
 		}
 	}
 
-	if manifest.Version == version.Version() && !target.reinstall && !installedDisagrees(digest) {
+	if version.Same(manifest.Version, runningRelease()) && !target.reinstall && !installedDisagrees(digest) {
 		fmt.Printf("This machine is already running %s.\n", manifest.Version)
 
 		// THE MARK IS RAISED EVEN THOUGH NOTHING IS INSTALLED, because what it
@@ -743,7 +749,7 @@ func actOnResolved(ctx context.Context, cfg *config.Config, cfgPath string,
 
 	journal := &hostupgrade.Journal{
 		Dir:            dir,
-		FromVersion:    version.Version(),
+		FromVersion:    runningRelease(),
 		ToVersion:      manifest.Version,
 		TargetDigest:   digest,
 		RolloutID:      target.rolloutID,
@@ -1751,8 +1757,52 @@ func (h *ledgerHost) RestoreLedger(_ context.Context, from string) error {
 		return nil
 	}
 
-	return copyFile(from, filepath.Join(h.cfg.Server.IdentityDir, "billet.db"))
+	// THE SNAPSHOT IS ROOT'S AND THE LEDGER IS THE SERVICE ACCOUNT'S. The snapshot
+	// was taken by the root updater into its own 0700 recovery directory, and a
+	// copy that kept its owner handed the control plane, which runs as the account
+	// that owns the identity directory, a ledger it could not open. The directory's
+	// owner is the one fact about that account this process has, and it is set on
+	// the staging file BEFORE the copy's sync and rename, so a power cut after the
+	// journal records the rollback cannot leave a ledger that is root's again.
+	dir, err := identityOwner(h.cfg.Server.IdentityDir)
+	if err != nil {
+		return fmt.Errorf("read who owns %s: %w", h.cfg.Server.IdentityDir, err)
+	}
+
+	return copyFileOwnedBy(from, filepath.Join(h.cfg.Server.IdentityDir, "billet.db"), dir)
 }
+
+// chownFd is (*os.File).Chown, a variable so a test can see what would be given
+// away and to whom.
+var chownFd = func(f *os.File, uid, gid int) error { return f.Chown(uid, gid) }
+
+// fchownLike gives the open file the owner and group of what info describes,
+// through its descriptor and never through its name. A stat that carries no
+// owner (not a Unix stat) is left alone rather than guessed at.
+//
+// ONLY THE PRIVILEGED UPDATER GIVES ANYTHING AWAY. The systemd transaction is
+// root, and every file it writes would otherwise be root's; the launchd
+// transaction runs as the operator, whose copies are already the operator's, which
+// is what the launch agents expect, and whose one prerequisite is writable parent
+// directories: a binary a `sudo` once installed is root's, readable, and its copy
+// asked to become root's again would be refused with EPERM and end every upgrade
+// on that Mac.
+func fchownLike(f *os.File, info os.FileInfo) error {
+	if geteuid() != 0 {
+		return nil
+	}
+
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return nil
+	}
+
+	return chownFd(f, int(st.Uid), int(st.Gid))
+}
+
+// identityOwner reads who owns the identity directory, a variable so a test can
+// name an owner the test process is not.
+var identityOwner = os.Stat
 
 // InstallCandidate puts the staged binary in place.
 func (h *systemdHost) InstallCandidate(_ context.Context) error {
@@ -2541,8 +2591,24 @@ func copyIfPresent(from, to string) error {
 }
 
 // copyFile writes through a staging name and flushes, so a reader never finds a
-// half-written binary under the name it is about to execute.
+// half-written binary under the name it is about to execute. The copy keeps its
+// source's mode, and its owner when the updater is privileged; an unprivileged
+// updater's copy is the updater's own (see fchownLike).
 func copyFile(from, to string) error {
+	info, err := os.Stat(from)
+	if err != nil {
+		return fmt.Errorf("stat %s: %w", from, err)
+	}
+
+	return copyFileOwnedBy(from, to, info)
+}
+
+// copyFileOwnedBy is copyFile with the owner taken from `owner` rather than the
+// source, for a copy whose source belongs to the wrong account; the owner is
+// applied when the updater is privileged and left as the updater's own otherwise.
+// Mode, owner and contents are all on the staging file before it is synced and
+// renamed, so what the rename publishes is durable in every respect at once.
+func copyFileOwnedBy(from, to string, owner os.FileInfo) error {
 	body, err := os.ReadFile(from)
 	if err != nil {
 		return fmt.Errorf("read %s: %w", from, err)
@@ -2555,26 +2621,83 @@ func copyFile(from, to string) error {
 
 	staging := to + ".billet-upgrade"
 
+	// A LEFTOVER STAGING NAME IS REMOVED, NEVER REUSED. A crashed earlier attempt
+	// leaves a file there; a compromised service account, in a directory it owns,
+	// could leave a symlink there for root to follow. Remove acts on the name and
+	// follows nothing, and the create below refuses to follow or to reuse.
+	if err := os.Remove(staging); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("clear the staging name %s: %w", staging, err)
+	}
+
+	// ONE DESCRIPTOR FOR EVERYTHING THAT TOUCHES THE STAGING FILE, opened exclusive
+	// and no-follow: the write, the mode, the owner and the flush all act on the
+	// file this call created and on nothing a name could have been pointed at in
+	// between. The updater is root and the identity directory belongs to the
+	// service account, so a by-name write, chmod or chown here was a way for that
+	// account to have root truncate, re-mode or hand it an arbitrary file.
+	//
 	// EVERY DESTINATION IS A CONSTANT IN THIS FILE OR A PATH UNDER THE RECOVERY
 	// DIRECTORY THIS PROCESS CREATED. Nothing here comes from a manifest, a
 	// command line or a node — the archive's contents are extracted elsewhere,
 	// under a directory chosen here — so there is no attacker-influenced component
 	// to traverse with.
-	//nolint:gosec // the destinations are this file's own constants and directories it created; see above
-	if err := os.WriteFile(staging, body, info.Mode().Perm()); err != nil {
+	f, err := os.OpenFile(staging, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW,
+		info.Mode().Perm())
+	if err != nil {
 		return fmt.Errorf("stage %s: %w", to, err)
 	}
 
-	f, err := os.Open(staging)
+	closed := false
+
+	defer func() {
+		if !closed {
+			_ = f.Close()
+		}
+	}()
+
+	st, err := f.Stat()
 	if err != nil {
-		return fmt.Errorf("reopen %s to flush it: %w", staging, err)
+		return fmt.Errorf("stat the staged %s: %w", to, err)
 	}
 
-	syncErr := f.Sync()
-	_ = f.Close()
+	if !st.Mode().IsRegular() {
+		return fmt.Errorf("stage %s: %s is not a regular file", to, staging)
+	}
 
-	if syncErr != nil {
-		return fmt.Errorf("flush %s: %w", staging, syncErr)
+	if _, err := f.Write(body); err != nil {
+		return fmt.Errorf("write %s: %w", staging, err)
+	}
+
+	// THE MODE IS SET AGAIN, EXPLICITLY, because the create above is subject to the
+	// process umask and billet-upgrade.service runs under UMask=0077: a 0755
+	// candidate came out as 0700 root:root, and billet-server, which runs as the
+	// service account, could not execute the binary the transaction had just
+	// installed for it. Every timer-driven upgrade of a control plane ended at
+	// "the services did not start" (2026-09-05), and a rollback restored the
+	// previous binary the same way. fchmod is not subject to the umask.
+	if err := f.Chmod(info.Mode().Perm()); err != nil {
+		return fmt.Errorf("set the mode of %s: %w", to, err)
+	}
+
+	// AND THE OWNER, because the updater is root and every file it writes would
+	// otherwise be root's: the preserved /etc/billet/billet.yaml is root:<service
+	// group> 0640 so the unprivileged server can read it, and a rollback that put
+	// it back as root:root left a control plane that could not read its own
+	// configuration. The source's owner is the owner every copy keeps, unless the
+	// caller named another; either way it is set here, BEFORE the sync, so the
+	// owner is as durable as the bytes when the rename publishes them.
+	if err := fchownLike(f, owner); err != nil {
+		return fmt.Errorf("set the owner of %s: %w", to, err)
+	}
+
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("flush %s: %w", staging, err)
+	}
+
+	closed = true
+
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close %s: %w", staging, err)
 	}
 
 	if err := os.Rename(staging, to); err != nil {

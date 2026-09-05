@@ -331,12 +331,16 @@
 
 - name: Refuse a converge that would downgrade this host
   vars:
-    # `billet version` prints "billet vX.Y.Z ..." on its first line; the second
-    # word is the release. Sliced rather than indexed so a line with one word
-    # reads as no release instead of an error naming neither binary.
+    # `billet version` prints "billet vX.Y.Z ..." on its first line, and a release
+    # through v0.9.1 prints "billet X.Y.Z ..." without the v; the second word is
+    # the release either way. Sliced rather than indexed so a line with one word
+    # reads as no release instead of an error naming neither binary. THE v IS
+    # OPTIONAL IN THE PATTERN, because a pattern that required it read every
+    # older candidate as "not a release" and let an unnamed downgrade to one
+    # through: the comparison below strips the v from both before ordering.
     billet_installed_release: "{{ (billet_release_of.results[0].stdout_lines[0] | default('') | split)[1:2] | join }}"
     billet_candidate_release: "{{ (billet_release_of.results[1].stdout_lines[0] | default('') | split)[1:2] | join }}"
-    billet_release_tag: '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+    billet_release_tag: '^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
   ansible.builtin.assert:
     that:
       - billet_allow_downgrade | bool
