@@ -38,9 +38,21 @@ if [ "${rpm_count}" -ne 1 ]; then
     exit 1
 fi
 
+# APT FAILS FAST OR NOT AT ALL. On 2026-09-05 Ubuntu's archive was mid-sync and a
+# fresh container's apt-get update sat silent for eighteen minutes inside a
+# thirty-minute job, then was killed with nothing to read; the run that did finish
+# reported "File has unexpected size ... Mirror sync in progress?" after ten. A
+# gate that can only fail by being killed is not a gate: every fetch is bounded,
+# the transient half is retried, and the whole call is capped so the failure
+# arrives with its reason while the job still has time to print it (-v names the
+# signal and the command it went to, -k kills a dpkg that shrugs off TERM). And an index
+# apt-get update could not fetch is only a WARNING to it, exit 0, measured against
+# a black-holed proxy; Error-Mode=any makes that the failure it is, here rather
+# than two commands later as "openssl has no installation candidate".
 docker run --rm --platform "linux/${package_arch}" --volume "${deb_path}:/tmp/billet.deb:ro" ubuntu:24.04 sh -euxc '
-    apt-get update
-    apt-get install --yes /tmp/billet.deb
+    APT="timeout -v -k 10 300 apt-get -o APT::Update::Error-Mode=any -o Acquire::Retries=3 -o Acquire::http::Timeout=30"
+    ${APT} update
+    ${APT} install --yes /tmp/billet.deb
     test -x /usr/bin/billet
     test -f /usr/lib/modules-load.d/billet-rbd.conf
     test -f /etc/billet/billet.yaml
@@ -48,7 +60,7 @@ docker run --rm --platform "linux/${package_arch}" --volume "${deb_path}:/tmp/bi
     test -d /srv/jailer
     touch /var/lib/billet/package-lifecycle-state
     touch /srv/jailer/package-lifecycle-guest
-    apt-get remove --yes billet
+    ${APT} remove --yes billet
     test ! -e /usr/bin/billet
     test ! -e /usr/lib/modules-load.d/billet-rbd.conf
     test -f /etc/billet/billet.yaml

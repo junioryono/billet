@@ -43,6 +43,7 @@ billet's shell lives in `scripts/` (guest image, guest kernel, release, install,
 
 ## Measured facts
 
+- A fresh `ubuntu:24.04` container's `apt-get update` against a mid-sync archive mirror (2026-09-05): eighteen minutes of silence inside a thirty-minute job, then killed with nothing to read; the run that did finish said `File has unexpected size ... Mirror sync in progress?` after ten. Every apt call in the rehearsal and lifecycle gates (`restore-rehearsal.sh`, `postgres-restore-rehearsal.sh`, `systemd-lifecycle.sh`, `test-package-lifecycle.sh`, `rehearsal-lib.sh`, `test-systemd-lifecycle.sh`) is now `timeout -v -k 10 300 apt-get -o APT::Update::Error-Mode=any -o Acquire::Retries=3 -o Acquire::http::Timeout=30`, and the two container entrypoint strings keep apt's stderr so `docker logs` carries the reason; the guest image and kernel builds are not gates and keep bare apt. The systemd readiness loops wait 720s, longer than the two bounded calls they follow, and stop at once on a container that has exited. Against a black-holed proxy, `apt-get update` without `Error-Mode=any` exited 0 on "Some index files failed to download"; with it, 100.
 - `! cmd | grep -q .` under `set -e`: the script continued and exited 0 (`/bin/sh`).
 - `;` chain with a failing `sha256sum -c`: exit 0 under dash in `ubuntu:24.04`.
 - `grep -q` early match under `pipefail`: exit 141; late match 0; no match 1.

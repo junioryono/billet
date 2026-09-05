@@ -322,14 +322,23 @@ rehearsal_start_host() {
         -e DEBIAN_FRONTEND=noninteractive \
         --platform "linux/${REHEARSAL_ARCH}" \
         ubuntu:24.04 sh -c \
-        "apt-get update -qq && apt-get install -y -qq ${packages} >/dev/null 2>&1 && exec /lib/systemd/systemd" \
+        "timeout -v -k 10 300 apt-get -o APT::Update::Error-Mode=any -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update -qq && timeout -v -k 10 300 apt-get -o APT::Update::Error-Mode=any -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y -qq ${packages} >/dev/null && exec /lib/systemd/systemd" \
         >/dev/null || rehearsal_fail "could not start the ${name} container"
 
+    # LONGER THAN THE BOOTSTRAP IT WAITS FOR. The entrypoint may spend up to
+    # 300s in each of two bounded apt calls before systemd starts, so a loop that
+    # gave up at 360s would destroy a container still inside its own budget and
+    # call that "systemd never came up". 240 x 3s = 720s. A container that has
+    # exited is a verdict, and the loop stops there instead of polling a corpse.
     printf 'waiting for systemd in %s' "${name}"
     local state= i=0
-    while [ "${i}" -lt 120 ]; do
+    while [ "${i}" -lt 240 ]; do
         state=$(docker exec "${name}" systemctl is-system-running 2>/dev/null || true)
         case "${state}" in running | degraded) break ;; esac
+        if [ "$(docker inspect -f '{{.State.Running}}' "${name}" 2>/dev/null)" = "false" ]; then
+            state=exited
+            break
+        fi
         printf '.'
         sleep 3
         i=$((i + 1))
@@ -350,7 +359,7 @@ rehearsal_install_package() {
     local name=$1 deb=$2
 
     docker cp "${deb}" "${name}":/tmp/billet.deb
-    docker exec "${name}" sh -c 'apt-get install -y -qq /tmp/billet.deb >/dev/null 2>&1' ||
+    docker exec "${name}" sh -c 'timeout -v -k 10 300 apt-get -o APT::Update::Error-Mode=any -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y -qq /tmp/billet.deb >/dev/null' ||
         rehearsal_fail "the package would not install in ${name}"
     docker exec "${name}" rm -f /tmp/billet.deb
 }
