@@ -28,6 +28,9 @@ type fakeHost struct {
 	// failRollbackAt makes an operation fail only while unwinding.
 	failRollbackAt string
 	rollingBack    bool
+	// failWith is the error failAt fails with, when the shape of the error is the
+	// subject; nil means a plain one.
+	failWith error
 
 	recordedDigest  string
 	recordedVersion string
@@ -41,6 +44,10 @@ func (h *fakeHost) record(what string) error {
 	}
 
 	if !h.rollingBack && what == h.failAt {
+		if h.failWith != nil {
+			return h.failWith
+		}
+
 		return errors.New("the " + what + " step failed")
 	}
 

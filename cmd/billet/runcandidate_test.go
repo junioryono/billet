@@ -16,6 +16,12 @@ import (
 // the hold flag is among them is how the parent tells the two protocols apart,
 // so each script declares its generation here and behaves accordingly below.
 func usageHandler(listsHold bool) string {
+	return usageHandlerThatAlso(listsHold, "")
+}
+
+// usageHandlerThatAlso is usageHandler with extra shell run inside the -h branch
+// before it exits, for a candidate whose usage misbehaves.
+func usageHandlerThatAlso(listsHold bool, extra string) string {
 	hold := ""
 	if listsHold {
 		hold = "  echo '  -" + holdFlagName + "'\n"
@@ -23,7 +29,7 @@ func usageHandler(listsHold bool) string {
 
 	return "if [ \"$2\" = -h ]; then\n" +
 		"  echo 'Usage of billet server:'\n" +
-		"  echo '  -upgrade-probe'\n" + hold +
+		"  echo '  -upgrade-probe'\n" + hold + extra +
 		"  exit 0\n" +
 		"fi\n"
 }
@@ -337,7 +343,62 @@ func TestRunCandidateRefusesACandidateWhoseUsageFails(t *testing.T) {
 		t.Fatal("a candidate whose -h exited 2 was probed and passed")
 	}
 
-	if !strings.Contains(err.Error(), "could not print its own usage") {
+	if !strings.Contains(err.Error(), "usage could not be read") {
 		t.Fatalf("the usage failure was misread: %v", err)
+	}
+}
+
+// A RELEASE THROUGH v0.9.0 PROVES READINESS ONLY BY SAYING SO. One that exits zero
+// without the line has proved nothing, and a zero here is a could-not-tell, which
+// never passes.
+func TestRunCandidateRefusesALegacyProbeThatExitsWithoutTheLine(t *testing.T) {
+	legacyCandidate(t, "exit 0")
+
+	err := (&ledgerHost{}).runCandidate(t.Context(), "server")
+	if err == nil {
+		t.Fatal("a legacy candidate that exited zero without the readiness line passed")
+	}
+
+	if !strings.Contains(err.Error(), "proves readiness only by printing") {
+		t.Fatalf("the silent exit was misread: %v", err)
+	}
+}
+
+// THE USAGE QUESTION IS BOUNDED TOO. A candidate whose -h leaves a process on its
+// output would otherwise hold the transaction before the probe even ran, with the
+// services already stopped. The test kills the holder afterwards.
+func TestRunCandidateRefusesACandidateWhoseUsageLeavesAProcessOnItsOutput(t *testing.T) {
+	pidFile := filepath.Join(t.TempDir(), "holder.pid")
+	t.Setenv("BILLET_TEST_GRANDCHILD_PIDFILE", pidFile)
+
+	path := filepath.Join(t.TempDir(), "billet")
+	script := "#!/bin/sh\n" + usageHandlerThatAlso(true,
+		"  sleep 60 &\n  echo $! > \"$BILLET_TEST_GRANDCHILD_PIDFILE\"\n") + "exit 0\n"
+
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	previous, previousDelay := installedBinary, probeUsageWaitDelay
+	installedBinary, probeUsageWaitDelay = path, 1*time.Second
+
+	t.Cleanup(func() { installedBinary, probeUsageWaitDelay = previous, previousDelay })
+
+	started := time.Now()
+
+	err := (&ledgerHost{}).runCandidate(t.Context(), "server")
+
+	killLater(t, recordedPID(t, pidFile))
+
+	if err == nil {
+		t.Fatal("a candidate whose -h left a process on its output was probed and passed")
+	}
+
+	if !strings.Contains(err.Error(), "usage could not be read") {
+		t.Fatalf("the held usage output was misread: %v", err)
+	}
+
+	if took := time.Since(started); took > 20*time.Second {
+		t.Fatalf("the usage question held the transaction for %s past a one-second bound", took)
 	}
 }
