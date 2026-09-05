@@ -693,6 +693,47 @@
     - billet_github_key_managed | bool
     - billet_github_private_key_src | length > 0
 
+# THE FURTHER TARGETS' KEYS, under exactly the rule above: inspected by digest,
+# never replaced, installed with force false, and only where the config names
+# the managed path and a source was passed.
+- name: Inspect the installed further targets' GitHub App private keys
+  ansible.builtin.stat:
+    path: "/etc/billet/app-private-key-{{ item.name }}.pem"
+    checksum_algorithm: sha256
+  register: billet_installed_target_keys
+  become: true
+  no_log: true
+  loop: "{{ billet_github_target_keys | selectattr('owned') | selectattr('supplied') | list }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Refuse to replace an installed further target's App private key implicitly
+  ansible.builtin.assert:
+    that:
+      - not item.stat.exists or item.stat.checksum == (lookup('ansible.builtin.file', billet_github_target_key_srcs[item.item.name], rstrip=false) | hash('sha256'))
+    fail_msg: >-
+      /etc/billet/app-private-key-{{ item.item.name }}.pem already contains a
+      different key. Rotate that credential explicitly before converging the
+      host; the reusable role will not overwrite a live GitHub App identity.
+  no_log: true
+  loop: "{{ billet_installed_target_keys.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+
+- name: Install the further targets' GitHub App private keys without replacing an existing identity
+  ansible.builtin.copy:
+    src: "{{ billet_github_target_key_srcs[item.name] }}"
+    dest: "/etc/billet/app-private-key-{{ item.name }}.pem"
+    owner: "{{ billet_service_user }}"
+    group: "{{ billet_service_group }}"
+    mode: "0600"
+    force: false
+  become: true
+  no_log: true
+  loop: "{{ billet_github_target_keys | selectattr('owned') | selectattr('supplied') | list }}"
+  loop_control:
+    label: "{{ item.name }}"
+
 - name: Stage candidate configuration for the upgrade transaction
   ansible.builtin.template:
     src: billet.yaml.j2

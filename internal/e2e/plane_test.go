@@ -38,6 +38,7 @@ import (
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/fakeactions"
+	billetgithub "github.com/junioryono/billet/internal/github"
 	"github.com/junioryono/billet/internal/node"
 	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/nodeclient"
@@ -83,6 +84,10 @@ type plane struct {
 	// on the create body was asserting on nothing.
 	exists           bool
 	registeredRunner string
+
+	// tier is the label this service's one scale set carries, so a second
+	// fake can stand in for a second target with a tier of its own.
+	tier string
 }
 
 const (
@@ -103,7 +108,15 @@ const (
 func newPlane(t *testing.T) *plane {
 	t.Helper()
 
-	p := &plane{t: t, nextMsgID: 1, setID: 7}
+	return newPlaneFor(t, testTier, 7)
+}
+
+// newPlaneFor is a fake Actions service for one tier, numbering its scale set
+// as given so two services in one test cannot be confused for each other.
+func newPlaneFor(t *testing.T, tier string, setID int) *plane {
+	t.Helper()
+
+	p := &plane{t: t, nextMsgID: 1, setID: setID, tier: tier}
 	p.Server = fakeactions.New(t, p.route)
 
 	return p
@@ -198,7 +211,7 @@ func (p *plane) route(w http.ResponseWriter, r *http.Request) {
 // the very set the fake just handed it — a failure that reads like billet's bug
 // and is entirely the fake's.
 func (p *plane) scaleSet() map[string]any {
-	return fakeactions.ScaleSetJSON(p.setID, testTier, testGroup, testTier)
+	return fakeactions.ScaleSetJSON(p.setID, p.tier, testGroup, p.tier)
 }
 
 // getMessage serves the head of the queue, or 202 for "nothing right now".
@@ -331,7 +344,9 @@ type stack struct {
 	// `billet drain` does rather than reach around the allocator.
 	db *state.DB
 
-	plane  *plane
+	plane *plane
+	// second is the second target's fake service, when the stack has one.
+	second *plane
 	alloc  *alloc.Allocator
 	runner *node.Runner
 	// tiers is the catalogue this stack was built with, so a test driving the
@@ -505,6 +520,24 @@ type stackConfig struct {
 	// tell the two apart, because it never reaches one. Set it small and a drain
 	// that is still waiting long past it is the difference, observed.
 	nodeDrainTimeout time.Duration
+	// second, when set, adds a SECOND GitHub target: a repository served by
+	// its own fake Actions service and its own client, with one untrusted tier
+	// on it. Only the wire stack carries it, because that is the shape in
+	// which the plane's per-target routing exists.
+	second *secondTarget
+}
+
+// secondTarget is a repository target beside the harness's organization.
+type secondTarget struct {
+	plane *plane
+	label string
+}
+
+// withSecondTarget serves a second, repository-scoped target through p, with
+// one untrusted tier labelled as given. p must have been built with that label
+// (newPlaneFor), so its scale set carries it.
+func withSecondTarget(p *plane, label string) stackOpt {
+	return func(c *stackConfig) { c.second = &secondTarget{plane: p, label: label} }
 }
 
 // directRunner drives the node runtime without a socket between it and the
@@ -611,11 +644,11 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 	}
 
 	client, err := scaleset.New(scaleset.Config{
-		ConfigURL:      p.URL + "/acme",
+		Target:         billetgithub.OrganizationTarget("acme"),
+		GitHubURL:      p.URL,
 		ClientID:       "12345",
 		InstallationID: 67890,
 		PrivateKey:     p.PrivateKeyPEM(),
-		Org:            "acme",
 		AppID:          12345,
 		APIURL:         p.URL + "/api/v3",
 	}, nil)
@@ -666,6 +699,60 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 	if sc.untrusted {
 		tiers[0].Trust = config.WorkloadUntrusted
 		tiers[0].Workflows = nil
+	}
+
+	// A SECOND TARGET, ASSEMBLED THE WAY THE CLI ASSEMBLES ONE: a client per
+	// target through wiring.BuildTargets, the server told its targets and the
+	// node plane given one source per target. The second tier is the first
+	// with its own label.
+	//
+	// A SECOND ORGANIZATION, NOT A REPOSITORY, and the reason is the harness:
+	// a repository target's tiers are untrusted by rule, and both backends
+	// here refuse untrusted work (docker shares the kernel; the simulated one
+	// stands in only for work billet already vouches for), so no job on a
+	// repository target can run in this suite. Per-target routing is the same
+	// mechanism whichever scope the second target has; the repository path is
+	// proved by internal/scaleset's wire test and the live measurement.
+	var (
+		targets       []wiring.Target
+		serverTargets []server.Target
+		planeJIT      map[string]nodeplane.JITSource
+	)
+
+	if sc.second != nil {
+		if !sc.wire {
+			t.Fatal("a second target needs the wire stack; the in-process runner has no per-target routing")
+		}
+
+		tiers[0].Target = config.DefaultTargetName
+
+		extra := tiers[0]
+		extra.Label = sc.second.label
+		extra.Target = "beta"
+		tiers = append(tiers, extra)
+
+		second, err := scaleset.New(scaleset.Config{
+			Target:         billetgithub.OrganizationTarget("beta"),
+			GitHubURL:      sc.second.plane.URL,
+			ClientID:       "67890",
+			InstallationID: 98765,
+			PrivateKey:     sc.second.plane.PrivateKeyPEM(),
+			AppID:          67890,
+			APIURL:         sc.second.plane.URL + "/api/v3",
+		}, nil)
+		if err != nil {
+			t.Fatalf("scaleset.New for the second target: %v", err)
+		}
+
+		targets = []wiring.Target{
+			{Config: config.GitHubTarget{Name: config.DefaultTargetName, Org: "acme"}, Client: client},
+			{Config: config.GitHubTarget{Name: "beta", Org: "beta"}, Client: second},
+		}
+
+		serverTargets, planeJIT, err = wiring.BuildTargets(targets)
+		if err != nil {
+			t.Fatalf("wiring.BuildTargets: %v", err)
+		}
 	}
 
 	var allocOpts []alloc.Option
@@ -747,6 +834,10 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 		computeName = host
 	)
 
+	if len(serverTargets) > 0 {
+		serverOpts = append(serverOpts, server.WithTargets(serverTargets...))
+	}
+
 	// CREATED BEFORE THE WIRE, because the node loop takes it too. A drain is a
 	// drain on both sides of the wire: a node whose compute never completes waits
 	// exactly as the control plane does, and without the second signal these
@@ -756,10 +847,13 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 	if sc.wire {
 		var first *nodeLoop
 
-		first, wire, wireAddr, serverOpts = wireUp(
+		var wireOpts []server.ControlPlaneOption
+
+		first, wire, wireAddr, wireOpts = wireUp(
 			t, log, a, client, prov, kind, nil, tiers, deployment,
-			computeName, hurry, wireOptions{drainTimeout: sc.nodeDrainTimeout})
+			computeName, hurry, wireOptions{drainTimeout: sc.nodeDrainTimeout, targetJIT: planeJIT})
 		runner, stopNode = first.runner, first.stop
+		serverOpts = append(serverOpts, wireOpts...)
 	} else {
 		runner = node.New(a, host, wiring.JITSource{Client: client, Pool: a}, prov, log)
 		serverOpts = []server.ControlPlaneOption{
@@ -791,11 +885,23 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 		server.WithDrainTimeout(200*time.Millisecond),
 		server.WithHurry(hurry))
 
-	srv := server.New(a, wiring.Provisioner{Client: client}, tiers, "billet-test", log, serverOpts...)
+	var prov0 server.Provisioner = wiring.Provisioner{Client: client}
+	if targets != nil {
+		// Every tier resolves through WithTargets; a fallback provisioner would
+		// be a second credential nothing should reach.
+		prov0 = nil
+	}
+
+	srv := server.New(a, prov0, tiers, "billet-test", log, serverOpts...)
+
+	var secondPlane *plane
+	if sc.second != nil {
+		secondPlane = sc.second.plane
+	}
 
 	return &stack{
 		hurry: hurry,
-		dir:   dir, closeDB: closeDB, plane: p, alloc: a, db: db,
+		dir:   dir, closeDB: closeDB, plane: p, second: secondPlane, alloc: a, db: db,
 		runner: runner, server: srv, provider: prov, kind: kind, backend: sc.backend,
 		node: host, tiers: tiers,
 		wire: wire, stopNode: stopNode, wireAddr: wireAddr,
@@ -809,6 +915,8 @@ type wireOptions struct {
 	supersedable bool
 	// drainTimeout is the first process's drain_timeout; see nodeProcess.
 	drainTimeout time.Duration
+	// targetJIT gives the plane one credential-holding source per target.
+	targetJIT map[string]nodeplane.JITSource
 }
 
 // wireUp puts a real HTTP node wire between the control plane and the runner.
@@ -843,8 +951,13 @@ func wireUp(
 		t.Fatalf("listen: %v", err)
 	}
 
+	var handlerOpts []nodeplane.HandlerOption
+	if len(wo.targetJIT) > 0 {
+		handlerOpts = append(handlerOpts, nodeplane.WithTargetJIT(wo.targetJIT))
+	}
+
 	wire := &http.Server{
-		Handler:           nodeplane.Handler(log, plane, a, wiring.NodeJIT{Client: client}),
+		Handler:           nodeplane.Handler(log, plane, a, wiring.NodeJIT{Client: client}, handlerOpts...),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 

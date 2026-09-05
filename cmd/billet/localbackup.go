@@ -71,10 +71,11 @@ func runLocalBackup(ctx context.Context, o backupOptions) error {
 			"this on the host that runs `billet server`", o.configPath)
 	}
 
-	if cfg.GitHub == nil {
-		return fmt.Errorf("%s has no github section, so there is no App key to capture — and the "+
-			"key is part of the deployment unit, not an extra. Run `billet github-app create` "+
-			"first", o.configPath)
+	targets := cfg.GitHubTargets()
+	if len(targets) == 0 {
+		return fmt.Errorf("%s has no github section and no targets, so there is no App key to "+
+			"capture — and the key is part of the deployment unit, not an extra. Run `billet "+
+			"github-app create` first", o.configPath)
 	}
 
 	dest, err := filepath.Abs(o.out)
@@ -113,9 +114,25 @@ func runLocalBackup(ctx context.Context, o backupOptions) error {
 	// FIFO cannot hang this, regular-file, bounded, mode-checked and actually
 	// parsed — the same rules `billet check` and `billet server` apply, because a
 	// second implementation of them is a second thing to keep right.
-	appKey, err := resolveAppKey(ctx, cfg)
+	appKey, err := resolveAppKey(ctx, cfg, targets[0])
 	if err != nil {
 		return err
+	}
+
+	// AND EVERY FURTHER TARGET'S, all or none: an archive missing one owner's key
+	// restores a control plane that serves the others and fails that one hours
+	// later with a bare 401.
+	further := make([]deployarchive.TargetKey, 0, len(targets))
+
+	for _, target := range targets[1:] {
+		pem, err := resolveAppKey(ctx, cfg, target)
+		if err != nil {
+			return fmt.Errorf("target %s: %w", target.Name, err)
+		}
+
+		further = append(further, deployarchive.TargetKey{
+			Name: target.Name, GitHub: archiveIdentity(target), AppKeyPEM: pem,
+		})
 	}
 
 	// COPIED FOR REFERENCE AND NEVER INSTALLED BY A RESTORE. It records what the
@@ -168,16 +185,12 @@ func runLocalBackup(ctx context.Context, o backupOptions) error {
 	}
 
 	m, err := deployarchive.Write(ctx, deployarchive.BackupRequest{
-		Dest:         dest,
-		StateDir:     cfg.Server.IdentityDir,
-		ConfigPath:   o.configPath,
-		DeploymentID: deployment,
-		GitHub: deployarchive.GitHubIdentity{
-			Org:            cfg.GitHub.Org,
-			AppID:          cfg.GitHub.AppID,
-			ClientID:       cfg.GitHub.ClientID,
-			InstallationID: cfg.GitHub.InstallationID,
-		},
+		Dest:           dest,
+		StateDir:       cfg.Server.IdentityDir,
+		ConfigPath:     o.configPath,
+		DeploymentID:   deployment,
+		GitHub:         archiveIdentity(targets[0]),
+		Targets:        further,
 		AppKeyPEM:      appKey,
 		ConfigBody:     configBody,
 		Snapshot:       snapshot,

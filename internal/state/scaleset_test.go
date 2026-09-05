@@ -23,7 +23,7 @@ func scaleSets(t *testing.T, db *DB) []ScaleSetRecord {
 func TestARecordedScaleSetOutlivesItsTier(t *testing.T) {
 	db := open(t)
 
-	rec := ScaleSetRecord{Org: testOrg, RunnerGroup: "billet", Label: "billet-2vcpu", ID: 7}
+	rec := ScaleSetRecord{Target: testOrg, RunnerGroup: "billet", Label: "billet-2vcpu", ID: 7}
 	if err := db.RecordScaleSet(t.Context(), rec); err != nil {
 		t.Fatalf("RecordScaleSet: %v", err)
 	}
@@ -42,7 +42,7 @@ func TestOneLabelInTwoRunnerGroupsIsTwoRecords(t *testing.T) {
 	db := open(t)
 
 	for i, group := range []string{"billet", "trusted"} {
-		rec := ScaleSetRecord{Org: testOrg, RunnerGroup: group, Label: "billet-2vcpu", ID: 7 + i}
+		rec := ScaleSetRecord{Target: testOrg, RunnerGroup: group, Label: "billet-2vcpu", ID: 7 + i}
 		if err := db.RecordScaleSet(t.Context(), rec); err != nil {
 			t.Fatalf("RecordScaleSet(%s): %v", group, err)
 		}
@@ -61,7 +61,7 @@ func TestOneLabelInTwoRunnerGroupsIsTwoRecords(t *testing.T) {
 func TestAScaleSetThatMovedRetiresItsOldName(t *testing.T) {
 	db := open(t)
 
-	first := ScaleSetRecord{Org: testOrg, RunnerGroup: "billet", Label: "billet-2vcpu", ID: 7}
+	first := ScaleSetRecord{Target: testOrg, RunnerGroup: "billet", Label: "billet-2vcpu", ID: 7}
 	if err := db.RecordScaleSet(t.Context(), first); err != nil {
 		t.Fatalf("RecordScaleSet: %v", err)
 	}
@@ -88,12 +88,12 @@ func TestAScaleSetThatMovedRetiresItsOldName(t *testing.T) {
 func TestAnIDInAnotherOrganizationIsNotRetired(t *testing.T) {
 	db := open(t)
 
-	other := ScaleSetRecord{Org: "other", RunnerGroup: "billet", Label: "billet-2vcpu", ID: 7}
+	other := ScaleSetRecord{Target: "other", RunnerGroup: "billet", Label: "billet-2vcpu", ID: 7}
 	if err := db.RecordScaleSet(t.Context(), other); err != nil {
 		t.Fatalf("RecordScaleSet: %v", err)
 	}
 
-	mine := ScaleSetRecord{Org: testOrg, RunnerGroup: "elsewhere", Label: "billet-2vcpu", ID: 7}
+	mine := ScaleSetRecord{Target: testOrg, RunnerGroup: "elsewhere", Label: "billet-2vcpu", ID: 7}
 	if err := db.RecordScaleSet(t.Context(), mine); err != nil {
 		t.Fatalf("RecordScaleSet: %v", err)
 	}
@@ -116,7 +116,7 @@ func TestRecordingAgainRefreshesTheID(t *testing.T) {
 	db := open(t)
 
 	for _, id := range []int{7, 9} {
-		rec := ScaleSetRecord{Org: testOrg, RunnerGroup: "billet", Label: "billet-2vcpu", ID: id}
+		rec := ScaleSetRecord{Target: testOrg, RunnerGroup: "billet", Label: "billet-2vcpu", ID: id}
 		if err := db.RecordScaleSet(t.Context(), rec); err != nil {
 			t.Fatalf("RecordScaleSet(%d): %v", id, err)
 		}
@@ -137,7 +137,7 @@ func TestForgettingOneGroupLeavesTheOther(t *testing.T) {
 	db := open(t)
 
 	for _, group := range []string{"billet", "trusted"} {
-		rec := ScaleSetRecord{Org: testOrg, RunnerGroup: group, Label: "billet-2vcpu", ID: 7}
+		rec := ScaleSetRecord{Target: testOrg, RunnerGroup: group, Label: "billet-2vcpu", ID: 7}
 		if err := db.RecordScaleSet(t.Context(), rec); err != nil {
 			t.Fatalf("RecordScaleSet(%s): %v", group, err)
 		}
@@ -175,7 +175,7 @@ func TestAnImpossibleScaleSetIDIsRefused(t *testing.T) {
 
 	for _, id := range []int{0, -1} {
 		err := db.RecordScaleSet(t.Context(), ScaleSetRecord{
-			Org: testOrg, RunnerGroup: "billet", Label: "billet-2vcpu", ID: id,
+			Target: testOrg, RunnerGroup: "billet", Label: "billet-2vcpu", ID: id,
 		})
 		if err == nil {
 			t.Errorf("RecordScaleSet accepted id %d", id)
@@ -200,7 +200,7 @@ func TestAnImpossibleScaleSetIDIsRefused(t *testing.T) {
 func TestRecordingWithNoLabelIsRefused(t *testing.T) {
 	db := open(t)
 
-	err := db.RecordScaleSet(t.Context(), ScaleSetRecord{Org: testOrg, RunnerGroup: "billet", ID: 7})
+	err := db.RecordScaleSet(t.Context(), ScaleSetRecord{Target: testOrg, RunnerGroup: "billet", ID: 7})
 	if err == nil {
 		t.Fatal("RecordScaleSet accepted a record with no label")
 	}

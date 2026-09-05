@@ -249,7 +249,7 @@ func TestInspectReadsWhatSystemdSaysAndJudgesIt(t *testing.T) {
 		deploy.NodeUnitName: absent(),
 	}}
 
-	report, err := h.inspector(a).Inspect(t.Context(), "/etc/billet/billet.yaml", "")
+	report, err := h.inspector(a).Inspect(t.Context(), "/etc/billet/billet.yaml", nil)
 	if err != nil {
 		t.Fatalf("Inspect: %v", err)
 	}
@@ -306,7 +306,7 @@ func TestAReplacedBinaryIsSeenInTheRunningProcess(t *testing.T) {
 		deploy.NodeUnitName: absent(),
 	}}
 
-	report, err := h.inspector(a).Inspect(t.Context(), "/etc/billet/billet.yaml", "")
+	report, err := h.inspector(a).Inspect(t.Context(), "/etc/billet/billet.yaml", nil)
 	if err != nil {
 		t.Fatalf("Inspect: %v", err)
 	}
@@ -367,7 +367,7 @@ func TestTheRunningJudgmentSeparatesCannotTellFromNo(t *testing.T) {
 				deploy.NodeUnitName:   absent(),
 			}}
 
-			report, err := h.inspector(a).Inspect(t.Context(), "/etc/billet/billet.yaml", "")
+			report, err := h.inspector(a).Inspect(t.Context(), "/etc/billet/billet.yaml", nil)
 			if err != nil {
 				t.Fatalf("Inspect: %v", err)
 			}
@@ -391,7 +391,7 @@ func TestInspectAsksSystemdForTheFactsItReports(t *testing.T) {
 		deploy.NodeUnitName:   absent(),
 	}}
 
-	if _, err := h.inspector(a).Inspect(t.Context(), "/etc/billet/billet.yaml", ""); err != nil {
+	if _, err := h.inspector(a).Inspect(t.Context(), "/etc/billet/billet.yaml", nil); err != nil {
 		t.Fatalf("Inspect: %v", err)
 	}
 	if len(a.calls) != 2 {
@@ -428,7 +428,7 @@ func TestExecStartIsTakenFromSystemdsParse(t *testing.T) {
 		deploy.NodeUnitName: absent(),
 	}}
 
-	report, err := h.inspector(a).Inspect(t.Context(), "/etc/billet/billet.yaml", "")
+	report, err := h.inspector(a).Inspect(t.Context(), "/etc/billet/billet.yaml", nil)
 	if err != nil {
 		t.Fatalf("Inspect: %v", err)
 	}
@@ -456,7 +456,7 @@ func TestTwoExecStartsAreCountedRatherThanCollapsed(t *testing.T) {
 		deploy.NodeUnitName:   absent(),
 	}}
 
-	report, err := h.inspector(a).Inspect(t.Context(), "/etc/billet/billet.yaml", "")
+	report, err := h.inspector(a).Inspect(t.Context(), "/etc/billet/billet.yaml", nil)
 	if err != nil {
 		t.Fatalf("Inspect: %v", err)
 	}
@@ -473,14 +473,14 @@ func TestAnUnreadableAnswerIsAnErrorRatherThanAnAbsentUnit(t *testing.T) {
 
 	t.Run("systemd cannot be asked", func(t *testing.T) {
 		a := &answers{fail: os.ErrPermission}
-		if _, err := h.inspector(a).Inspect(t.Context(), "/etc/billet/billet.yaml", ""); err == nil {
+		if _, err := h.inspector(a).Inspect(t.Context(), "/etc/billet/billet.yaml", nil); err == nil {
 			t.Fatal("an unreachable systemd was reported as a host with no units")
 		}
 	})
 
 	t.Run("the reply carries no LoadState", func(t *testing.T) {
 		a := &answers{reply: map[string]string{deploy.ServerUnitName: "ActiveState=active\n"}}
-		_, err := h.inspector(a).Inspect(t.Context(), "/etc/billet/billet.yaml", "")
+		_, err := h.inspector(a).Inspect(t.Context(), "/etc/billet/billet.yaml", nil)
 		if err == nil {
 			t.Fatal("a truncated reply was read as an ordinary unit")
 		}
@@ -500,7 +500,7 @@ func TestASlowSystemdIsBounded(t *testing.T) {
 
 	start := time.Now()
 	_, err := h.inspector(a, WithTimeout(50*time.Millisecond)).
-		Inspect(t.Context(), "/etc/billet/billet.yaml", "")
+		Inspect(t.Context(), "/etc/billet/billet.yaml", nil)
 	if err == nil {
 		t.Fatal("a systemctl that never answered did not time out")
 	}
@@ -530,7 +530,7 @@ func TestAPendingReloadMakesTheUnitComparisonUnknown(t *testing.T) {
 				deploy.NodeUnitName: absent(),
 			}}
 
-			report, err := h.inspector(a).Inspect(t.Context(), "/etc/billet/billet.yaml", "")
+			report, err := h.inspector(a).Inspect(t.Context(), "/etc/billet/billet.yaml", nil)
 			if err != nil {
 				t.Fatalf("Inspect: %v", err)
 			}

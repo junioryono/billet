@@ -598,7 +598,7 @@ func TestRequiredDirsSurvivesItsOwnDeduplication(t *testing.T) {
 		// Every one of these shares a parent, which is what makes the list
 		// collapse and the aliasing bite.
 		ConfigPath:     "/one/root/billet.yaml",
-		KeyPath:        "/one/root/app-private-key.pem",
+		KeyPaths:       []string{"/one/root/app-private-key.pem"},
 		ServerStateDir: "/one/root/server",
 		NodeStateDir:   "/one/root/server",
 		NodeLockDir:    "/one/root/locks",

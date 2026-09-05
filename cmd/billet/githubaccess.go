@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/junioryono/billet/internal/config"
@@ -50,7 +51,7 @@ import (
 // real one would be worse than none. Everything below either wraps or returns
 // the error it was given.
 func explainGitHubAccess(ctx context.Context, cfg *config.Config, err error) error {
-	if err == nil || cfg == nil || cfg.GitHub == nil {
+	if err == nil || cfg == nil || len(cfg.GitHubTargets()) == 0 {
 		return err
 	}
 
@@ -80,19 +81,31 @@ func explainGitHubAccess(ctx context.Context, cfg *config.Config, err error) err
 // held behind an unreachable one while the process is exiting.
 const gitHubProbeTimeout = 15 * time.Second
 
-// gitHubAccessNote is what GitHub says about this App right now, or empty when
-// it says nothing worth adding.
+// gitHubAccessNote is what GitHub says about every App this deployment holds
+// right now, one paragraph per target, or empty when it says nothing worth
+// adding.
 func gitHubAccessNote(ctx context.Context, cfg *config.Config) string {
-	gh := cfg.GitHub
+	var notes []string
 
-	key, err := resolveAppKey(ctx, cfg)
+	for _, target := range cfg.GitHubTargets() {
+		if note := gitHubTargetAccessNote(ctx, cfg, target); note != "" {
+			notes = append(notes, note)
+		}
+	}
+
+	return strings.Join(notes, "\n\n")
+}
+
+// gitHubTargetAccessNote is one target's paragraph.
+func gitHubTargetAccessNote(ctx context.Context, cfg *config.Config, gh config.GitHubTarget) string {
+	key, err := resolveAppKey(ctx, cfg, gh)
 	if err != nil {
-		return fmt.Sprintf("billet could not read the App key at %s to find out why: %v",
-			appKeyLocation(cfg), err)
+		return fmt.Sprintf("billet could not read the App key for target %s at %s to find out why: %v",
+			gh.Name, appKeyLocation(cfg, gh), err)
 	}
 
 	inst, err := github.VerifyAppAt(ctx, nil, githubAPIBase, gh.AppID, key,
-		gh.Org, gh.InstallationID)
+		githubTarget(gh), gh.InstallationID)
 
 	switch {
 	case ctx.Err() != nil:
@@ -103,7 +116,7 @@ func gitHubAccessNote(ctx context.Context, cfg *config.Config) string {
 	// an operator to reinstall something that is fine.
 	case errors.Is(err, github.ErrAppUnverifiable):
 		return fmt.Sprintf("billet asked GitHub about App %d on %s and could not get an "+
-			"answer, so this may be unrelated: %v", gh.AppID, gh.Org, err)
+			"answer, so this may be unrelated: %v", gh.AppID, gh.Path(), err)
 
 	case err != nil:
 		return fmt.Sprintf("billet also asked GitHub about this deployment's App, in case the "+
@@ -123,17 +136,17 @@ func gitHubAccessNote(ctx context.Context, cfg *config.Config) string {
 	// operator would then not look at.
 	default:
 		if gh.ClientID != "" {
-			return fmt.Sprintf("billet also asked GitHub about this deployment's App: %d is "+
-				"installed on %s as installation %d, with exactly the permissions billet "+
-				"requested. THAT WAS CHECKED UNDER app_id. github.client_id is also set, "+
+			return fmt.Sprintf("billet also asked GitHub about this deployment's App for target %s: "+
+				"%d is installed on %s as installation %d, with exactly the permissions billet "+
+				"requested. THAT WAS CHECKED UNDER app_id. client_id is also set, "+
 				"and the scale-set client signs with that instead — so the installation is "+
 				"healthy and a wrong client_id is NOT ruled out.",
-				gh.AppID, gh.Org, inst.ID)
+				gh.Name, gh.AppID, gh.Path(), inst.ID)
 		}
 
-		return fmt.Sprintf("billet also asked GitHub about this deployment's App, and the "+
-			"credential is not the problem: %d is installed on %s as installation %d, "+
+		return fmt.Sprintf("billet also asked GitHub about this deployment's App for target %s, "+
+			"and the credential is not the problem: %d is installed on %s as installation %d, "+
 			"with exactly the permissions billet requested. Whatever failed above is "+
-			"something else.", gh.AppID, gh.Org, inst.ID)
+			"something else.", gh.Name, gh.AppID, gh.Path(), inst.ID)
 	}
 }

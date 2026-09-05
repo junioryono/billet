@@ -318,8 +318,8 @@ func cmdServer(ctx context.Context, lc *lifecycle, args []string) error {
 	if cfg.Server == nil {
 		return fmt.Errorf("%s has no server section", *cfgPath)
 	}
-	if cfg.GitHub == nil {
-		return fmt.Errorf("%s has no github section; run `billet github-app create` first", *cfgPath)
+	if len(cfg.GitHubTargets()) == 0 {
+		return fmt.Errorf("%s has no github section and no targets; run `billet github-app create` first", *cfgPath)
 	}
 
 	// THE CONTROL PLANE RUNS NO COMPUTE. A single machine runs `billet server` and
@@ -492,10 +492,15 @@ func runServer(
 	cfg *config.Config,
 	dryRun, upgradeProbe bool,
 ) error {
-	// Built by the SHARED constructor, so the server and teardown authenticate
-	// identically. Two near-identical constructions is how one of them ends up
-	// pointed at a different organization than the other.
-	client, err := newScaleSetClient(ctx, cfg)
+	// Built by the SHARED constructor, one client per target, so the server and
+	// teardown authenticate identically. Two near-identical constructions is how
+	// one of them ends up pointed at a different owner than the other.
+	targets, err := newScaleSetClients(ctx, cfg)
+	if err != nil {
+		return err
+	}
+
+	serverTargets, planeJIT, err := wiring.BuildTargets(targets)
 	if err != nil {
 		return err
 	}
@@ -623,7 +628,7 @@ func runServer(
 	// them stop without destroying compute, closing a session or handing capacity
 	// back to a deployment that is no longer theirs.
 	opts = append(opts, server.WithHurry(lc.hurry), server.WithLeadershipLost(db.LeadershipLost),
-		server.WithCompletionLedger(db), server.WithOrganization(cfg.GitHub.Org))
+		server.WithCompletionLedger(db), server.WithTargets(serverTargets...))
 
 	if dryRun {
 		opts = append(opts, server.AdvertiseNothing())
@@ -683,7 +688,7 @@ func runServer(
 		nodeplane.WithBarrierStore(allocator))
 
 	wire, err := serveNodeWire(ctx, cfg, nodes, allocator,
-		wiring.NodeJIT{Client: client}, allocator, allocator, db)
+		planeJIT, allocator, allocator, db)
 	if err != nil {
 		return err
 	}
@@ -763,7 +768,7 @@ func runServer(
 			newControllerCredentialSweep(allocator, db, awscreds.Default(), slog.Default())),
 	)
 
-	plane := server.New(allocator, wiring.Provisioner{Client: client}, cfg.Tiers, owner, slog.Default(), opts...)
+	plane := server.New(allocator, nil, cfg.Tiers, owner, slog.Default(), opts...)
 
 	// READINESS IS REPORTED BEFORE THE LISTENERS OPEN THEIR SESSIONS, AND MOVING IT
 	// AFTER THEM WOULD BE A RESTART LOOP.
@@ -987,7 +992,7 @@ type servedWire struct {
 func serveNodeWire(
 	ctx context.Context,
 	cfg *config.Config,
-	nodes *nodeplane.Plane, store nodeplane.LeaseStore, jit nodeplane.JITSource,
+	nodes *nodeplane.Plane, store nodeplane.LeaseStore, jit map[string]nodeplane.JITSource,
 	revocations nodeplane.Revocations, enrollments nodeplane.Enrollments,
 	cachePolicy nodeplane.CachePolicy,
 	opts ...wireOption,
@@ -1040,7 +1045,7 @@ func serveNodeWire(
 		Log:         slog.Default(),
 		Plane:       nodes,
 		Leases:      store,
-		JIT:         jit,
+		TargetJIT:   jit,
 		Revocations: revocations,
 		Enrollments: enrollments,
 		CachePolicy: cachePolicy,
@@ -2065,37 +2070,6 @@ func codeBuildRegion(cfg *config.Config) string {
 	return cfg.Node.CodeBuild.Region
 }
 
-// newScaleSetClient builds the GitHub client from config, reading the key with
-// the same hardened reader `billet check` uses.
-//
-// Shared so teardown and the server authenticate identically. A second,
-// slightly-different construction is how one of them ends up talking to a
-// different organization than the other.
-func newScaleSetClient(ctx context.Context, cfg *config.Config) (*scaleset.Client, error) {
-	if cfg.GitHub == nil {
-		return nil, errors.New("no github section in the config")
-	}
-
-	key, err := resolveAppKey(ctx, cfg)
-	if err != nil {
-		return nil, err
-	}
-
-	appIdentity := cfg.GitHub.ClientID
-	if appIdentity == "" {
-		appIdentity = strconv.FormatInt(cfg.GitHub.AppID, 10)
-	}
-
-	return scaleset.New(scaleset.Config{
-		ConfigURL:      "https://github.com/" + cfg.GitHub.Org,
-		ClientID:       appIdentity,
-		InstallationID: cfg.GitHub.InstallationID,
-		PrivateKey:     string(key),
-		Org:            cfg.GitHub.Org,
-		AppID:          cfg.GitHub.AppID,
-	}, slog.Default())
-}
-
 // cmdTeardown removes the scale sets billet created.
 //
 // It exists because there is no other way to remove them. A scale set created
@@ -2117,6 +2091,8 @@ func cmdTeardown(ctx context.Context, args []string) error {
 		"delete even if the scale set's labels are not this tier's (requires --tier)")
 	group := fs.String("runner-group", "",
 		"the runner group to look in, for a --tier the config no longer declares")
+	targetName := fs.String("target", "",
+		"the target a --tier the config no longer declares belongs to (default: the only one)")
 	yes := fs.Bool("yes", false, "skip the confirmation prompt")
 
 	if err := parse(fs, args); err != nil {
@@ -2129,11 +2105,11 @@ func cmdTeardown(ctx context.Context, args []string) error {
 	}
 
 	// Checked HERE rather than inside the client. config.Load accepts a node-only
-	// config with no github section, and everything below reads cfg.GitHub.Org —
-	// so without this a node config panics instead of explaining itself.
-	if cfg.GitHub == nil {
-		return fmt.Errorf("%s has no github section, so it names no organization to "+
-			"delete anything from", *cfgPath)
+	// config with no github section, and everything below resolves a target — so
+	// without this a node config fails obscurely instead of explaining itself.
+	if len(cfg.GitHubTargets()) == 0 {
+		return fmt.Errorf("%s has no github section and no targets, so it names no "+
+			"organization or repository to delete anything from", *cfgPath)
 	}
 
 	// "Delete everything" is NEVER the default for a destructive command. An omitted
@@ -2161,17 +2137,70 @@ func cmdTeardown(ctx context.Context, args []string) error {
 	if undeclared {
 		fmt.Printf("%q is not a tier in %s. Deleting it by name from runner group %q.\n\n",
 			*tier, *cfgPath, groupOrDefault(*group))
+	} else if *targetName != "" {
+		return errors.New("--target names where to look for a --tier the config no longer " +
+			"declares; a declared tier's target comes from the config")
 	}
 
-	client, err := newScaleSetClient(ctx, cfg)
+	// EVERY TARGET IN CONFIG ORDER, each with its own client and its own
+	// confirmation: a scale set lives on exactly one owner, and the credential
+	// that deletes it is that owner's App.
+	for _, target := range cfg.GitHubTargets() {
+		mine := make([]config.Tier, 0, len(wanted))
+
+		for i := range wanted {
+			t := &wanted[i]
+
+			switch {
+			case undeclared:
+				// An undeclared tier names its target with --target, or has the
+				// only target there is.
+				resolved, err := targetByName(cfg, *targetName)
+				if err != nil {
+					return err
+				}
+
+				if resolved.Name == target.Name {
+					mine = append(mine, *t)
+				}
+			default:
+				resolved, ok := cfg.TierTarget(t)
+				if ok && resolved.Name == target.Name {
+					mine = append(mine, *t)
+				}
+			}
+		}
+
+		if len(mine) == 0 {
+			continue
+		}
+
+		if err := teardownOnTarget(ctx, cfg, target, mine, *force, *yes); err != nil {
+			return err
+		}
+	}
+
+	fmt.Println("Done.")
+
+	return nil
+}
+
+// teardownOnTarget removes the wanted scale sets from one target.
+func teardownOnTarget(
+	ctx context.Context, cfg *config.Config, target config.GitHubTarget,
+	wanted []config.Tier, force, yes bool,
+) error {
+	client, err := newScaleSetClientFor(ctx, cfg, target)
 	if err != nil {
 		return err
 	}
 
+	path := target.Path()
+
 	// The ACTUAL objects, fetched before anything is destroyed. An operator
 	// confirming a destructive act should be shown what is on GitHub, not the
 	// names they typed into their own config.
-	fmt.Printf("This deletes the following from %s:\n\n", cfg.GitHub.Org)
+	fmt.Printf("This deletes the following from %s (target %s):\n\n", describeGitHubTarget(target), target.Name)
 
 	present := make([]config.Tier, 0, len(wanted))
 
@@ -2186,8 +2215,7 @@ func cmdTeardown(ctx context.Context, args []string) error {
 		if set == nil {
 			fmt.Printf("  %-32s not present\n", t.Label)
 
-			if err := forgetScaleSet(ctx, cfg, cfg.GitHub.Org,
-				groupOrDefault(t.RunnerGroup), t.Label); err != nil {
+			if err := forgetScaleSet(ctx, cfg, path, groupOrDefault(t.RunnerGroup), t.Label); err != nil {
 				fmt.Printf("  %-32s billet could not forget it (%v); the control plane "+
 					"will keep reporting it\n", t.Label, err)
 			}
@@ -2201,15 +2229,15 @@ func cmdTeardown(ctx context.Context, args []string) error {
 	}
 
 	if len(present) == 0 {
-		fmt.Println("\nNothing to do.")
+		fmt.Println("\nNothing to do here.")
 
 		return nil
 	}
 
 	fmt.Println("\nRunners already registered to them are removed by GitHub.")
 
-	if !*yes {
-		if err := confirmOrganization(ctx, cfg.GitHub.Org); err != nil {
+	if !yes {
+		if err := confirmTarget(ctx, path); err != nil {
 			return err
 		}
 	}
@@ -2217,7 +2245,7 @@ func cmdTeardown(ctx context.Context, args []string) error {
 	for i := range present {
 		t := &present[i]
 
-		deleted, err := client.DeleteScaleSet(ctx, t.Label, t.RunnerGroup, []string{t.Label}, *force)
+		deleted, err := client.DeleteScaleSet(ctx, t.Label, t.RunnerGroup, []string{t.Label}, force)
 		if err != nil {
 			return err
 		}
@@ -2233,13 +2261,11 @@ func cmdTeardown(ctx context.Context, args []string) error {
 			continue
 		}
 
-		if err := forgetScaleSet(ctx, cfg, cfg.GitHub.Org, groupOrDefault(t.RunnerGroup), t.Label); err != nil {
+		if err := forgetScaleSet(ctx, cfg, path, groupOrDefault(t.RunnerGroup), t.Label); err != nil {
 			fmt.Printf("%s: deleted, but billet could not forget it had created it (%v); "+
 				"the control plane will keep reporting it until this is cleared\n", t.Label, err)
 		}
 	}
-
-	fmt.Println("Done.")
 
 	return nil
 }
@@ -2251,49 +2277,6 @@ func groupOrDefault(group string) string {
 	}
 
 	return group
-}
-
-// confirmOrganization makes the operator type the organization name.
-//
-// Typed confirmation rather than y/N: this is destructive against somebody's
-// organization, and the cost of a stray keystroke is a tier that silently stops
-// accepting work.
-//
-// Read on a goroutine so the context still wins. fmt.Scanln does not observe
-// cancellation, so a Ctrl-C at the prompt would otherwise cancel ctx and leave
-// the process blocked on stdin.
-func confirmOrganization(ctx context.Context, org string) error {
-	fmt.Printf("\nType the organization name to confirm: ")
-
-	typed := make(chan string, 1)
-	failed := make(chan error, 1)
-
-	go func() {
-		var answer string
-
-		if _, err := fmt.Scanln(&answer); err != nil {
-			failed <- err
-
-			return
-		}
-
-		typed <- answer
-	}()
-
-	select {
-	case <-ctx.Done():
-		fmt.Println()
-
-		return ctx.Err()
-	case err := <-failed:
-		return fmt.Errorf("teardown cancelled: %w", err)
-	case answer := <-typed:
-		if answer != org {
-			return errors.New("teardown cancelled")
-		}
-
-		return nil
-	}
 }
 
 // cmdCA issues the certificates the node wire authenticates with.
@@ -2835,13 +2818,28 @@ func cmdStatus(ctx context.Context, args []string) error {
 	fmt.Printf("capacity  %d of %d vCPU, %s of %s, %d open leases\n",
 		usage.VCPU, cfg.Server.MaxVCPU, usage.Memory, cfg.Server.MaxMemory, usage.Leases)
 
-	for i := range cfg.Tiers {
-		t := &cfg.Tiers[i]
-		headroom, err := a.Headroom(ctx, t.Label)
-		if err != nil {
-			return err
+	// GROUPED BY TARGET WHEN THERE ARE SEVERAL, because a tier's scale set lives
+	// on exactly one owner and an operator reading capacity per label needs to
+	// know which owner's jobs it serves.
+	targets := cfg.GitHubTargets()
+
+	for _, target := range targets {
+		if len(targets) > 1 {
+			fmt.Printf("target    %s (%s)\n", target.Name, describeGitHubTarget(target))
 		}
-		fmt.Printf("tier      %-24s %d available\n", t.Label, headroom)
+
+		for i := range cfg.Tiers {
+			t := &cfg.Tiers[i]
+			if len(targets) > 1 && t.Target != target.Name {
+				continue
+			}
+
+			headroom, err := a.Headroom(ctx, t.Label)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("tier      %-24s %d available\n", t.Label, headroom)
+		}
 	}
 
 	if err := printRemoteFleetCost(ctx, a, cfg); err != nil {

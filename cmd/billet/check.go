@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -153,50 +154,71 @@ func runCheck(ctx context.Context, opts checkOptions) (checkReport, error) {
 	// The node's cache verdict is deferred the same way and for the same reason.
 	var githubFailure, cacheFailure error
 
-	if cfg.GitHub != nil {
-		fmt.Printf("org      %s (app %d, installation %d)\n",
-			cfg.GitHub.Org, cfg.GitHub.AppID, cfg.GitHub.InstallationID)
+	// EVERY TARGET, EACH ON ITS OWN LINES. A deployment serving several owners
+	// holds one App per owner, and a check that verified one and reported "the
+	// App is fine" would be vouching for a credential it never tested.
+	targets := cfg.GitHubTargets()
+
+	for _, target := range targets {
+		switch {
+		case len(targets) > 1:
+			fmt.Printf("target   %s: %s (app %d, installation %d)\n",
+				target.Name, describeGitHubTarget(target), target.AppID, target.InstallationID)
+		case target.IsRepository():
+			fmt.Printf("repo     %s (app %d, installation %d)\n",
+				target.Repository, target.AppID, target.InstallationID)
+		default:
+			fmt.Printf("org      %s (app %d, installation %d)\n",
+				target.Org, target.AppID, target.InstallationID)
+		}
 
 		// WHERE THE KEY CAME FROM, BECAUSE "THE APP KEY IS FINE" IS A DIFFERENT
 		// FACT DEPENDING ON WHICH. An operator debugging a failover has to know
 		// whether this host read a file of its own or the deployment's shared
 		// store, and the two look identical in every other line of this report.
-		fmt.Printf("app key  %s\n", appKeyLocation(cfg))
+		fmt.Printf("app key  %s\n", appKeyLocation(cfg, target))
 
-		key, err := resolveAppKey(ctx, cfg)
+		key, err := resolveAppKey(ctx, cfg, target)
 		if err != nil {
 			return report, err
 		}
 
 		// PROVED LIVE, not just parsed: the key signs a JWT GitHub accepts, the
 		// App is installed, the installation id matches, and the permissions are
-		// exactly what billet requested — every mismatch fatal in both
-		// directions. Offline is ADVISORY here (this command still has local
-		// facts worth reporting) and it says so by name, because "check passed"
-		// while unverified is exactly what a later `local up` must not build on.
+		// exactly what billet requested for the target's scope — every mismatch
+		// fatal in both directions. Offline is ADVISORY here (this command still
+		// has local facts worth reporting) and it says so by name, because "check
+		// passed" while unverified is exactly what a later `local up` must not
+		// build on.
+		var verdict githubVerdict
+
 		switch {
 		case skipNetworkProbes:
-			report.github = githubSkipped
+			verdict = githubSkipped
 			fmt.Printf("github   (verification skipped during maintenance)\n")
 		default:
-			inst, err := github.VerifyAppAt(ctx, nil, githubAPIBase, cfg.GitHub.AppID, key,
-				cfg.GitHub.Org, cfg.GitHub.InstallationID)
+			inst, err := github.VerifyAppAt(ctx, nil, githubAPIBase, target.AppID, key,
+				githubTarget(target), target.InstallationID)
 			switch {
 			case errors.Is(err, github.ErrAppUnverifiable):
-				report.github = githubUnverifiable
+				verdict = githubUnverifiable
 				fmt.Printf("github   UNVERIFIED: %v\n", err)
 				fmt.Printf("         (the App may still be fine — this says the check could not " +
 					"reach a verdict, and nothing may treat it as one)\n")
 			case err != nil:
-				report.github = githubFailed
+				verdict = githubFailed
 				fmt.Printf("github   FAILED: %v\n", err)
-				githubFailure = err
+				githubFailure = errors.Join(githubFailure, err)
 			default:
-				report.github = githubVerified
+				verdict = githubVerified
 				fmt.Printf("github   verified: installation %d on %s, permissions exactly as "+
-					"requested\n", inst.ID, cfg.GitHub.Org)
+					"requested for a %s\n", inst.ID, target.Path(), target.Scope())
 			}
 		}
+
+		// THE WORST VERDICT WINS across targets: a deployment is verified only
+		// when every credential it holds is.
+		report.github = worseGitHubVerdict(report.github, verdict)
 	}
 
 	if cfg.Server != nil {
@@ -451,11 +473,11 @@ func runCheck(ctx context.Context, opts checkOptions) (checkReport, error) {
 
 	fmt.Printf("tiers    %d\n", len(cfg.Tiers))
 
-	// ONE VERDICT PER RUNNER GROUP, shared across the tiers that name it. Every
-	// untrusted tier lands in the default group, so without this a deployment
-	// with four of them asks GitHub the same question four times and prints the
-	// same failure four times.
-	reach := map[int]error{}
+	// ONE VERDICT PER RUNNER GROUP PER TARGET, shared across the tiers that name
+	// it. Every untrusted tier lands in the default group, so without this a
+	// deployment with four of them asks GitHub the same question four times and
+	// prints the same failure four times.
+	reach := map[string]error{}
 
 	for i := range cfg.Tiers {
 		t := &cfg.Tiers[i]
@@ -478,9 +500,14 @@ func runCheck(ctx context.Context, opts checkOptions) (checkReport, error) {
 			reserved = fmt.Sprintf("  reserved:%d", t.Reserved)
 		}
 
-		fmt.Printf("  %-34s %2d vCPU  %8s  %s/%s%s%s\n",
+		onTarget := ""
+		if len(targets) > 1 {
+			onTarget = "  target:" + t.Target
+		}
+
+		fmt.Printf("  %-34s %2d vCPU  %8s  %s/%s%s%s%s\n",
 			t.Label, t.VCPU, t.Memory, strings.Join(backends, ","), t.GuestOS,
-			reserved, intercept)
+			reserved, intercept, onTarget)
 
 		// THE SERVER REFUSES ON THIS AND CHECK USED TO PASS OVER IT.
 		//
@@ -500,14 +527,23 @@ func runCheck(ctx context.Context, opts checkOptions) (checkReport, error) {
 		// about everywhere else. Maintenance skips it for free: the verdict is
 		// githubSkipped, not verified.
 		if report.github == githubVerified {
-			if err := checkTierRunnerGroup(ctx, cfg, t, reach); err != nil {
+			skipped, err := checkTierRunnerGroup(ctx, cfg, t, reach)
+
+			switch {
+			case err != nil:
 				report.github = githubFailed
 				fmt.Printf("           runner group FAILED: %v\n", err)
 
 				if githubFailure == nil {
 					githubFailure = err
 				}
-			} else {
+			case skipped:
+				// SAID, NOT SILENT. A repository has no runner groups, so there
+				// is nothing to probe; an operator reading the tier lines must
+				// see that the probe was not run rather than infer it passed.
+				fmt.Printf("           runner group not probed: a repository target has no runner " +
+					"groups, so the tier is untrusted and lands in the repository's own pool\n")
+			default:
 				fmt.Printf("           runner group %q verified\n", t.RunnerGroup)
 			}
 		}
@@ -566,28 +602,44 @@ func runCheck(ctx context.Context, opts checkOptions) (checkReport, error) {
 // left every surface reporting healthy while every job queued forever. The
 // acceptance lane's third run found it by waiting out its whole window.
 func checkTierRunnerGroup(
-	ctx context.Context, cfg *config.Config, t *config.Tier, reach map[int]error,
-) error {
-	gh := cfg.GitHub
-
-	key, err := resolveAppKey(ctx, cfg)
-	if err != nil {
-		return err
+	ctx context.Context, cfg *config.Config, t *config.Tier, reach map[string]error,
+) (bool, error) {
+	target, ok := cfg.TierTarget(t)
+	if !ok {
+		return false, fmt.Errorf("tier %q names target %q, which the config does not declare",
+			t.Label, t.Target)
 	}
 
-	policy := github.NewRunnerGroupPolicyClientAt(githubAPIBase, gh.Org, gh.AppID,
-		gh.InstallationID, key)
+	// A REPOSITORY HAS NO RUNNER GROUPS. Its runners are its own, GitHub offers
+	// no group to restrict a pool with, and config has already refused a trusted
+	// tier or a named group under it — so there is nothing to ask, and the
+	// caller says so rather than printing "verified" over a probe never run.
+	if target.IsRepository() {
+		return true, nil
+	}
+
+	key, err := resolveAppKey(ctx, cfg, target)
+	if err != nil {
+		return false, err
+	}
+
+	policy := github.NewRunnerGroupPolicyClientAt(githubAPIBase, githubTarget(target), target.AppID,
+		target.InstallationID, key)
 
 	id, isDefault, err := policy.FindRunnerGroupID(ctx, t.RunnerGroup)
 	if err != nil {
-		return err
+		return false, err
 	}
+
+	// Keyed by target AND group id: two targets each have a group 1, and a
+	// verdict about one owner's group says nothing about another's.
+	key2 := target.Name + "/" + strconv.Itoa(id)
 
 	if t.Trust == config.WorkloadTrusted {
 		// The server refuses this too: the default group cannot back a trusted
 		// pool, because it admits every repository in the organization.
 		if isDefault {
-			return fmt.Errorf("runner group %q is the default group, which cannot back a "+
+			return false, fmt.Errorf("runner group %q is the default group, which cannot back a "+
 				"trusted pool", t.RunnerGroup)
 		}
 
@@ -595,23 +647,49 @@ func checkTierRunnerGroup(
 		// under this group rather than asking GitHub the same question again for
 		// a later tier that shares it.
 		err := policy.ValidateTrustedRunnerGroup(ctx, id, t.Workflows)
-		reach[id] = err
+		reach[key2] = err
 
-		return err
+		return false, err
 	}
 
 	// ONE ANSWER PER GROUP, not per tier. Every untrusted tier in a deployment
 	// shares the default group, and a check that asked GitHub once per tier
 	// would spend a request per tier to learn the same fact — and report the
 	// same failure several times over.
-	if err, asked := reach[id]; asked {
-		return err
+	if err, asked := reach[key2]; asked {
+		return false, err
 	}
 
 	err = policy.ValidateRunnerGroupReach(ctx, id)
-	reach[id] = err
+	reach[key2] = err
 
-	return err
+	return false, err
+}
+
+// worseGitHubVerdict combines two targets' verdicts into the one the report
+// carries: failed over unverifiable over skipped over verified, so a
+// deployment reads as verified only when every credential it holds is.
+func worseGitHubVerdict(a, b githubVerdict) githubVerdict {
+	rank := func(v githubVerdict) int {
+		switch v {
+		case githubFailed:
+			return 3
+		case githubUnverifiable:
+			return 2
+		case githubSkipped:
+			return 1
+		case githubVerified:
+			return 0
+		default:
+			return -1
+		}
+	}
+
+	if rank(b) > rank(a) {
+		return b
+	}
+
+	return a
 }
 
 // reportGuestImageFreshness names the newest generation of each image this

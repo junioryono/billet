@@ -53,8 +53,12 @@ const (
 	RunnerRecoveryRetired RunnerRecovery = "retired"
 )
 
+// trustedRunnerGroupValidator revalidates a tier's runner-group policy with
+// the credential of that tier's target, which is why the tier travels with the
+// group: a control plane serving several targets cannot tell from a group name
+// alone whose App to ask.
 type trustedRunnerGroupValidator interface {
-	ValidateTrustedRunnerGroup(ctx context.Context, group string, wantWorkflows []string) error
+	ValidateTrustedRunnerGroup(ctx context.Context, tier, group string, wantWorkflows []string) error
 }
 
 // Set is the part of a scale set this package needs.
@@ -420,7 +424,7 @@ func (r *Runner) Launch(
 		if !ok {
 			return fmt.Errorf("node: trusted runner-group policy cannot be verified before registration")
 		}
-		if err := validator.ValidateTrustedRunnerGroup(ctx, tier.RunnerGroup, tier.Workflows); err != nil {
+		if err := validator.ValidateTrustedRunnerGroup(ctx, tier.Label, tier.RunnerGroup, tier.Workflows); err != nil {
 			return fmt.Errorf("node: trusted runner-group policy drifted: %w", err)
 		}
 	}

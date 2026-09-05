@@ -1,6 +1,7 @@
 package initconfig
 
 import (
+	"errors"
 	"slices"
 	"strings"
 	"testing"
@@ -780,4 +781,71 @@ func TestTheUntrustedBridgeCommentMatchesTheTiersItShipsWith(t *testing.T) {
 		t.Error("a trusted generation still claims removing the untrusted bridge refuses " +
 			"every job it schedules; no tier in it uses that bridge")
 	}
+}
+
+// A REPOSITORY TARGET CANNOT CARRY A TRUSTED POOL, so the policy flags are
+// refused by name rather than rendered into a config that fails to load; and
+// docker, which admits only trusted work, cannot serve one at all, refused
+// before the generic "docker needs a policy" answer can send the operator to
+// create a runner group GitHub has nowhere to put.
+func TestGenerateRefusesARepositoryWithAPoolOrOnDocker(t *testing.T) {
+	t.Parallel()
+
+	t.Run("policy flags name a pool a repository cannot have", func(t *testing.T) {
+		t.Parallel()
+
+		p := firecrackerParams()
+		p.Org = ""
+		p.Repository = "acme/widgets"
+		p.RunnerGroup = trialGroup
+		p.Workflows = []string{trialWorkflow}
+
+		_, _, err := Generate(p)
+		if !errors.Is(err, errRepositoryHasNoPool) {
+			t.Fatalf("Generate on --repository with a pool: %v, want %v", err, errRepositoryHasNoPool)
+		}
+	})
+
+	t.Run("docker cannot serve a repository", func(t *testing.T) {
+		t.Parallel()
+
+		p := dockerParams()
+		p.Org = ""
+		p.Repository = "acme/widgets"
+		p.RunnerGroup = ""
+		p.Workflows = nil
+
+		_, _, err := Generate(p)
+		if !errors.Is(err, errDockerCannotServeRepository) {
+			t.Fatalf("Generate on --repository --provider docker: %v, want %v", err,
+				errDockerCannotServeRepository)
+		}
+
+		if strings.Contains(err.Error(), "Create a runner group") {
+			t.Errorf("the refusal sends the operator to create a runner group a repository cannot use: %v", err)
+		}
+	})
+
+	t.Run("firecracker serves a repository untrusted", func(t *testing.T) {
+		t.Parallel()
+
+		p := firecrackerParams()
+		p.Org = ""
+		p.Repository = "acme/widgets"
+		p.RunnerGroup = ""
+		p.Workflows = nil
+
+		body, _, err := Generate(p)
+		if err != nil {
+			t.Fatalf("Generate on --repository --provider firecracker: %v", err)
+		}
+
+		if !strings.Contains(body, "repository: acme/widgets") {
+			t.Errorf("the generated config does not name the repository:\n%s", body)
+		}
+
+		if strings.Contains(body, "trust: trusted") {
+			t.Errorf("a repository target's tier was generated trusted:\n%s", body)
+		}
+	})
 }

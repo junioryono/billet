@@ -879,9 +879,11 @@ func publicationRank(a Action) int {
 		return 5
 	case AuthorityEntry("authority-created"):
 		return 6
-	case EntryAppKey:
-		return 7
 	default:
+		if isAppKeyEntry(a.Entry) {
+			return 7
+		}
+
 		// An entry nothing here ranks goes last rather than first: whatever it
 		// is, it is not one of the ordering constraints above.
 		return 8
@@ -904,11 +906,13 @@ func installOne(req RestoreRequest, a Action) (string, error) {
 		}
 
 		return copyFile(req.Plan.Archive.LedgerPath(), a.Path, rec)
-	case a.Entry == EntryAppKey:
+	case isAppKeyEntry(a.Entry):
 		// THROUGH THE INJECTED INSTALLER, which creates the destination exactly
-		// once and fails rather than replacing. See RestoreRequest.
+		// once and fails rather than replacing. See RestoreRequest. Every
+		// target's key goes the same way; the installer does not know or care
+		// whose it is.
 		if !ok {
-			return "", fmt.Errorf("deployarchive: this backup has no %s", EntryAppKey)
+			return "", fmt.Errorf("deployarchive: this backup has no %s", a.Entry)
 		}
 
 		if err := req.InstallAppKey(a.Path, body); err != nil {
@@ -1971,6 +1975,14 @@ func abandonOne(a *Archive, t Target, path string) (abandonOutcome, error) {
 func entryForTargetPath(a *Archive, t Target, path string) (string, bool) {
 	if path == t.AppKeyPath {
 		return EntryAppKey, true
+	}
+
+	for _, target := range t.Targets {
+		if path == target.AppKeyPath && target.AppKeyPath != "" {
+			if _, archived := a.Entry(EntryAppKeyFor(target.Name)); archived {
+				return EntryAppKeyFor(target.Name), true
+			}
+		}
 	}
 
 	if path == filepath.Join(t.StateDir, "deployment-id") {

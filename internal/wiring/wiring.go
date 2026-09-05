@@ -17,8 +17,10 @@ package wiring
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/config"
 	billetgithub "github.com/junioryono/billet/internal/github"
 	"github.com/junioryono/billet/internal/node"
 	"github.com/junioryono/billet/internal/nodeplane"
@@ -28,6 +30,54 @@ import (
 
 // Provisioner adapts the client to the control plane's scale-set needs.
 type Provisioner struct{ Client *scaleset.Client }
+
+// Target is one GitHub target with the client that holds its credential.
+type Target struct {
+	Config config.GitHubTarget
+	Client *scaleset.Client
+}
+
+// BuildTargets assembles the two views of a target set the control plane
+// consumes: the server's, which reconciles and polls each tier's scale set
+// through its target's provisioner, and the node plane's, which mints
+// registrations through the same target's client.
+//
+// ONE ASSEMBLY FOR BOTH, keyed by the target's config name on each side, so a
+// tier resolves to the same credential whichever half of the control plane is
+// asking — and so internal/e2e assembles a multi-target deployment the way the
+// CLI does rather than by hand.
+//
+// REFUSED RATHER THAN SILENTLY SPLIT. The server keeps a slice and resolves the
+// first entry of a name, the plane keeps a map and would hold the last, so two
+// entries under one name would reconcile a tier through one App and mint its
+// registrations through another. Config refuses duplicate names at load; this
+// refuses them at the seam every caller passes through, and refuses a client
+// whose own target is not the one the config names.
+func BuildTargets(targets []Target) ([]server.Target, map[string]nodeplane.JITSource, error) {
+	servers := make([]server.Target, 0, len(targets))
+	jit := make(map[string]nodeplane.JITSource, len(targets))
+
+	for _, t := range targets {
+		switch {
+		case t.Config.Name == "":
+			return nil, nil, errors.New("wiring: a target with no name")
+		case t.Client == nil:
+			return nil, nil, fmt.Errorf("wiring: target %q has no client", t.Config.Name)
+		case t.Client.Target().Path() != t.Config.Path():
+			return nil, nil, fmt.Errorf("wiring: target %q is %s in the config and %s on its client",
+				t.Config.Name, t.Config.Path(), t.Client.Target().Path())
+		}
+
+		if _, dup := jit[t.Config.Name]; dup {
+			return nil, nil, fmt.Errorf("wiring: two targets named %q", t.Config.Name)
+		}
+
+		servers = append(servers, server.Target{Config: t.Config, Provisioner: Provisioner{Client: t.Client}})
+		jit[t.Config.Name] = NodeJIT{Client: t.Client}
+	}
+
+	return servers, jit, nil
+}
 
 type poolRunnerStore interface {
 	PoolRunnerByLease(ctx context.Context, leaseID string) (alloc.PoolRunner, error)
@@ -214,7 +264,9 @@ func recoverRunner(ctx context.Context, pool poolRunnerStore, client runnerRecov
 }
 
 // ValidateTrustedRunnerGroup verifies policy immediately before local minting.
-func (j JITSource) ValidateTrustedRunnerGroup(ctx context.Context, group string,
+// The tier is what a router over several targets selects a client by; one
+// client serves every tier it is given.
+func (j JITSource) ValidateTrustedRunnerGroup(ctx context.Context, _ string, group string,
 	workflows []string,
 ) error {
 	return j.Client.ValidateTrustedRunnerGroup(ctx, group, workflows)

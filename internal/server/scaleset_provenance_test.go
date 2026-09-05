@@ -15,6 +15,9 @@ import (
 
 const testOrg = "acme"
 
+// testTarget is the one target these control planes serve.
+var testTarget = config.GitHubTarget{Name: config.DefaultTargetName, Org: testOrg}
+
 // capturingHandler keeps the records a run emitted, so a test can assert on what
 // an operator would actually read rather than on a boolean somewhere.
 type capturingHandler struct {
@@ -112,8 +115,8 @@ func TestAScaleSetNoLongerDeclaredIsReported(t *testing.T) {
 	const group = "default"
 
 	for _, rec := range []state.ScaleSetRecord{
-		{Org: testOrg, RunnerGroup: group, Label: declared.Label, ID: 40},
-		{Org: testOrg, RunnerGroup: group, Label: "billet-8vcpu", ID: 41},
+		{Target: testOrg, RunnerGroup: group, Label: declared.Label, ID: 40},
+		{Target: testOrg, RunnerGroup: group, Label: "billet-8vcpu", ID: 41},
 	} {
 		if err := db.RecordScaleSet(t.Context(), rec); err != nil {
 			t.Fatalf("RecordScaleSet(%s): %v", rec.Label, err)
@@ -136,7 +139,7 @@ func TestAScaleSetNoLongerDeclaredIsReported(t *testing.T) {
 	handler := newCapturingHandler()
 
 	if err := New(a, prov, tiers, "test-owner", slog.New(handler),
-		WithCompletionLedger(db), WithOrganization(testOrg)).Run(ctx); err != nil {
+		WithCompletionLedger(db), WithTargets(Target{Config: testTarget, Provisioner: prov})).Run(ctx); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
@@ -178,7 +181,7 @@ func TestReconcilingATierRecordsItsScaleSet(t *testing.T) {
 	}
 
 	if err := New(a, prov, tiers, "test-owner", nil,
-		WithCompletionLedger(db), WithOrganization(testOrg)).Run(ctx); err != nil {
+		WithCompletionLedger(db), WithTargets(Target{Config: testTarget, Provisioner: prov})).Run(ctx); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
@@ -209,7 +212,7 @@ func TestOneGroupsOrphanDoesNotImplicateTheOther(t *testing.T) {
 
 	// Same label, different group: a set an earlier config created elsewhere.
 	gone := state.ScaleSetRecord{
-		Org: testOrg, RunnerGroup: "retired", Label: declared.Label, ID: 41,
+		Target: testOrg, RunnerGroup: "retired", Label: declared.Label, ID: 41,
 	}
 	if err := db.RecordScaleSet(t.Context(), gone); err != nil {
 		t.Fatalf("RecordScaleSet: %v", err)
@@ -229,7 +232,7 @@ func TestOneGroupsOrphanDoesNotImplicateTheOther(t *testing.T) {
 	handler := newCapturingHandler()
 
 	if err := New(a, prov, tiers, "test-owner", slog.New(handler),
-		WithCompletionLedger(db), WithOrganization(testOrg)).Run(ctx); err != nil {
+		WithCompletionLedger(db), WithTargets(Target{Config: testTarget, Provisioner: prov})).Run(ctx); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
@@ -250,7 +253,7 @@ func TestRemovingTheLastTierStillReportsWhatItLeftBehind(t *testing.T) {
 	db := openState(t)
 
 	gone := state.ScaleSetRecord{
-		Org: testOrg, RunnerGroup: "billet", Label: "billet-8vcpu", ID: 41,
+		Target: testOrg, RunnerGroup: "billet", Label: "billet-8vcpu", ID: 41,
 	}
 	if err := db.RecordScaleSet(t.Context(), gone); err != nil {
 		t.Fatalf("RecordScaleSet: %v", err)
@@ -259,7 +262,7 @@ func TestRemovingTheLastTierStillReportsWhatItLeftBehind(t *testing.T) {
 	handler := newCapturingHandler()
 
 	err := New(nil, nil, nil, "test-owner", slog.New(handler),
-		WithCompletionLedger(db), WithOrganization(testOrg)).Run(t.Context())
+		WithCompletionLedger(db), WithTargets(Target{Config: testTarget})).Run(t.Context())
 	if err == nil {
 		t.Fatal("a control plane with no tiers was accepted")
 	}

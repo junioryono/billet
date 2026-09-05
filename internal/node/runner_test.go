@@ -1191,7 +1191,7 @@ func (f *fakeJIT) Describe(context.Context, string, string) (*Set, []string, err
 	return &Set{ID: f.setID, Name: "billet-2vcpu"}, nil, nil
 }
 
-func (f *fakeJIT) ValidateTrustedRunnerGroup(context.Context, string, []string) error {
+func (f *fakeJIT) ValidateTrustedRunnerGroup(context.Context, string, string, []string) error {
 	return nil
 }
 

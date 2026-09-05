@@ -398,10 +398,7 @@ func (c *CodeBuildParams) optionalYAML() string {
 // that is not a setting, and a concurrency quota that defaults to one and will
 // bite before anything else does.
 func renderCodeBuildConfig(p Params, trusted bool, appID, installationID int) string {
-	org := p.Org
-	if org == "" {
-		org = "<your-org>"
-	}
+	scope := scopeLineFor(p.Org, p.Repository)
 
 	paths := p.paths()
 	cb := p.CodeBuild
@@ -459,7 +456,7 @@ server:
   max_memory: %s
 
 github:
-  org: %s
+%s
 
   # Filled in by `+"`billet github-app create --config <this file>`"+`.
   app_id: %d
@@ -527,7 +524,7 @@ tiers:
 		yamlScalar(p.Listen),
 		yamlScalar(paths.serverState),
 		p.VCPU, p.Memory,
-		yamlScalar(org),
+		scope,
 		appID, installationID,
 		yamlScalar(paths.keyPath),
 		nameBlock,

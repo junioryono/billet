@@ -53,7 +53,7 @@ func TestVerifyAppAcceptsAnExactInstallation(t *testing.T) {
 	srv, _ := verifyFake(t, http.StatusOK, `{"id": 42, "permissions": {
 		"metadata": "read", "organization_self_hosted_runners": "write"}}`)
 
-	inst, err := verifyAppAt(t.Context(), srv.Client(), srv.URL, 7, testAppKey(), "acme", 42)
+	inst, err := verifyAppAt(t.Context(), srv.Client(), srv.URL, 7, testAppKey(), OrganizationTarget("acme"), 42)
 	if err != nil {
 		t.Fatalf("an exact installation was refused: %v", err)
 	}
@@ -68,7 +68,7 @@ func TestVerifyAppRefusesAMismatchedInstallationID(t *testing.T) {
 	srv, _ := verifyFake(t, http.StatusOK, `{"id": 42, "permissions": {
 		"metadata": "read", "organization_self_hosted_runners": "write"}}`)
 
-	_, err := verifyAppAt(t.Context(), srv.Client(), srv.URL, 7, testAppKey(), "acme", 99)
+	_, err := verifyAppAt(t.Context(), srv.Client(), srv.URL, 7, testAppKey(), OrganizationTarget("acme"), 99)
 	if err == nil {
 		t.Fatal("a mismatched installation id was accepted")
 	}
@@ -103,7 +103,7 @@ func TestVerifyAppRefusesPermissionDrift(t *testing.T) {
 
 			srv, _ := verifyFake(t, http.StatusOK, body)
 
-			_, err := verifyAppAt(t.Context(), srv.Client(), srv.URL, 7, testAppKey(), "acme", 42)
+			_, err := verifyAppAt(t.Context(), srv.Client(), srv.URL, 7, testAppKey(), OrganizationTarget("acme"), 42)
 			if err == nil {
 				t.Fatal("a permission mismatch was accepted")
 			}
@@ -119,7 +119,7 @@ func TestVerifyAppRefusesAnUninstalledApp(t *testing.T) {
 
 	srv, _ := verifyFake(t, http.StatusNotFound, `{"message": "Not Found"}`)
 
-	_, err := verifyAppAt(t.Context(), srv.Client(), srv.URL, 7, testAppKey(), "acme", 42)
+	_, err := verifyAppAt(t.Context(), srv.Client(), srv.URL, 7, testAppKey(), OrganizationTarget("acme"), 42)
 	if err == nil || !strings.Contains(err.Error(), "not installed") {
 		t.Fatalf("an uninstalled App did not get the install remedy: %v", err)
 	}
@@ -136,7 +136,7 @@ func TestVerifyAppRefusesABadCredentialWithoutLeakingIt(t *testing.T) {
 
 	srv, bearer := verifyFake(t, http.StatusUnauthorized, `{"message": "Bad credentials"}`)
 
-	_, err := verifyAppAt(t.Context(), srv.Client(), srv.URL, 7, testAppKey(), "acme", 42)
+	_, err := verifyAppAt(t.Context(), srv.Client(), srv.URL, 7, testAppKey(), OrganizationTarget("acme"), 42)
 	if err == nil {
 		t.Fatal("a refused credential was accepted")
 	}
@@ -163,7 +163,7 @@ func TestVerifyAppClassifiesGitHubDownAsUnverifiable(t *testing.T) {
 
 	srv, _ := verifyFake(t, http.StatusBadGateway, `{"message": "upstream error"}`)
 
-	_, err := verifyAppAt(t.Context(), srv.Client(), srv.URL, 7, testAppKey(), "acme", 42)
+	_, err := verifyAppAt(t.Context(), srv.Client(), srv.URL, 7, testAppKey(), OrganizationTarget("acme"), 42)
 	if !errors.Is(err, ErrAppUnverifiable) {
 		t.Fatalf("a 502 was not classified as unverifiable: %v", err)
 	}
@@ -176,7 +176,7 @@ func TestVerifyAppClassifiesTransportFailureAsUnverifiable(t *testing.T) {
 	base := srv.URL
 	srv.Close() // the address now refuses connections
 
-	_, err := verifyAppAt(t.Context(), http.DefaultClient, base, 7, testAppKey(), "acme", 42)
+	_, err := verifyAppAt(t.Context(), http.DefaultClient, base, 7, testAppKey(), OrganizationTarget("acme"), 42)
 	if !errors.Is(err, ErrAppUnverifiable) {
 		t.Fatalf("a connection refusal was not classified as unverifiable: %v", err)
 	}
@@ -191,7 +191,7 @@ func TestVerifyAppTreatsABrokenKeyAsFatal(t *testing.T) {
 	srv, _ := verifyFake(t, http.StatusOK, `{}`)
 
 	_, err := verifyAppAt(t.Context(), srv.Client(), srv.URL, 7,
-		[]byte("not a key"), "acme", 42)
+		[]byte("not a key"), OrganizationTarget("acme"), 42)
 	if err == nil {
 		t.Fatal("a broken key was accepted")
 	}
@@ -219,7 +219,7 @@ func TestVerifyAppClassifiesRateLimitsAsUnverifiable(t *testing.T) {
 
 			srv, _ := verifyFake(t, tc.status, tc.body)
 
-			_, err := verifyAppAt(t.Context(), srv.Client(), srv.URL, 7, testAppKey(), "acme", 42)
+			_, err := verifyAppAt(t.Context(), srv.Client(), srv.URL, 7, testAppKey(), OrganizationTarget("acme"), 42)
 			if !errors.Is(err, ErrAppUnverifiable) {
 				t.Fatalf("a throttle was classified as a verdict: %v", err)
 			}
@@ -234,7 +234,7 @@ func TestVerifyAppKeepsAPlainForbiddenFatal(t *testing.T) {
 
 	srv, _ := verifyFake(t, http.StatusForbidden, `{"message": "This installation has been suspended"}`)
 
-	_, err := verifyAppAt(t.Context(), srv.Client(), srv.URL, 7, testAppKey(), "acme", 42)
+	_, err := verifyAppAt(t.Context(), srv.Client(), srv.URL, 7, testAppKey(), OrganizationTarget("acme"), 42)
 	if err == nil || errors.Is(err, ErrAppUnverifiable) {
 		t.Fatalf("a non-throttle 403 was not a fatal verdict: %v", err)
 	}
@@ -249,7 +249,7 @@ func TestVerifyAppRefusesASuspendedInstallation(t *testing.T) {
 	srv, _ := verifyFake(t, http.StatusOK, `{"id": 42, "suspended_at": "2026-08-01T00:00:00Z",
 		"permissions": {"metadata": "read", "organization_self_hosted_runners": "write"}}`)
 
-	_, err := verifyAppAt(t.Context(), srv.Client(), srv.URL, 7, testAppKey(), "acme", 42)
+	_, err := verifyAppAt(t.Context(), srv.Client(), srv.URL, 7, testAppKey(), OrganizationTarget("acme"), 42)
 	if err == nil || !strings.Contains(err.Error(), "SUSPENDED") {
 		t.Fatalf("a suspended installation was not refused by name: %v", err)
 	}
@@ -272,7 +272,7 @@ func TestVerifyAppClassifiesANonGitHubAnswerAsUnverifiable(t *testing.T) {
 
 			srv, _ := verifyFake(t, http.StatusOK, body)
 
-			_, err := verifyAppAt(t.Context(), srv.Client(), srv.URL, 7, testAppKey(), "acme", 42)
+			_, err := verifyAppAt(t.Context(), srv.Client(), srv.URL, 7, testAppKey(), OrganizationTarget("acme"), 42)
 			if !errors.Is(err, ErrAppUnverifiable) {
 				t.Fatalf("a non-GitHub 200 was classified as a verdict: %v", err)
 			}
@@ -294,7 +294,7 @@ func TestVerifyAppClassifiesAMidReadFailureAsUnverifiable(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	_, err := verifyAppAt(t.Context(), srv.Client(), srv.URL, 7, testAppKey(), "acme", 42)
+	_, err := verifyAppAt(t.Context(), srv.Client(), srv.URL, 7, testAppKey(), OrganizationTarget("acme"), 42)
 	if !errors.Is(err, ErrAppUnverifiable) {
 		t.Fatalf("a mid-read failure was classified as a verdict: %v", err)
 	}
@@ -318,7 +318,7 @@ func TestVerifyAppPropagatesCallerCancellation(t *testing.T) {
 		cancel()
 	}()
 
-	_, err := verifyAppAt(ctx, srv.Client(), srv.URL, 7, testAppKey(), "acme", 42)
+	_, err := verifyAppAt(ctx, srv.Client(), srv.URL, 7, testAppKey(), OrganizationTarget("acme"), 42)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancellation surfaced as %v, want context.Canceled", err)
 	}

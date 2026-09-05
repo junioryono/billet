@@ -52,10 +52,15 @@ server:
   #
   # drain_timeout: 6h
 
+# The GitHub target these runners serve: an organization, or one repository as
+# `repository: owner/name` (a repository's tiers are untrusted only, because it
+# has no runner groups). Exactly one of the two. This is the target named
+# `default`; further organizations or repositories go under `targets:`, each
+# with its own App, and each tier then names its target with `target:`.
 github:
   org: your-org
 
-  # Populated by `billet github-app create --org your-org`.
+  # Populated by `billet github-app create --org your-org` (or --repository).
   app_id: 0
   installation_id: 0
   private_key_path: /etc/billet/app-private-key.pem

@@ -27,20 +27,20 @@ import (
 func macStatus(ctx context.Context, cfgPath string) error {
 	fmt.Printf("config   %s\n", cfgPath)
 
-	var keyPath string
+	var keyPaths []string
 
 	cfg, cfgErr := config.Load(cfgPath)
 
 	switch {
 	case cfgErr != nil:
 		fmt.Printf("         UNREADABLE: %v\n", cfgErr)
-	case cfg.GitHub != nil:
-		keyPath = cfg.GitHub.PrivateKeyPath
+	default:
+		keyPaths = appKeyFilePaths(cfg)
 	}
 
 	printMacFile("config", cfgPath)
 
-	if keyPath != "" {
+	for _, keyPath := range keyPaths {
 		printMacFile("key", keyPath)
 	}
 

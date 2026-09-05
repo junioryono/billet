@@ -179,6 +179,57 @@
       {{ billet_github_key_required | bool
          and billet_github_key_path == '/etc/billet/app-private-key.pem' }}
 
+# THE FURTHER TARGETS, EACH UNDER THE SAME RULE. A deployment serving several
+# GitHub targets holds one App key per target (billet_config.targets), and each
+# is managed at its own owned path, /etc/billet/app-private-key-<name>.pem: a
+# key passed for a target whose config names another path is refused for the
+# reason the github block's is, and a managed path with nothing there and no
+# source is refused before anything is changed. One fact per target, in a
+# list, so every later task loops over the same decision.
+# An explicit null is what billet reads an absent list as, so it passes; any
+# other non-list (a string, a mapping, a number) is refused here rather than
+# by billet inside the transaction.
+- name: Refuse a targets list billet will not load
+  ansible.builtin.assert:
+    that:
+      - >-
+        billet_config.targets is none
+        or (billet_config.targets | type_debug) == 'list'
+    fail_msg: >-
+      billet_config.targets is present but is not a list of targets. billet
+      refuses the config when it LOADS — which, left to billet, happens inside
+      this role's upgrade transaction, after the host has already been changed.
+  when:
+    - billet_config is mapping
+    - billet_config.targets is defined
+
+# The policy item carries whether a source was SUPPLIED and never the source
+# itself, so the assertions and stat results below, which have no no_log, can
+# name nothing about the controller; the mapping is read only here, under
+# no_log, and inside the no_log digest and copy tasks in account.yml.
+- name: Decide what this host's config asks of each further target's App key
+  no_log: true
+  ansible.builtin.set_fact:
+    billet_github_target_keys: >-
+      {{ billet_github_target_keys | default([]) + [{
+           'name': item.name | default('', true),
+           'path': item.private_key_path | default('', true),
+           'owned': (item.private_key_path | default('', true))
+                    == ('/etc/billet/app-private-key-' ~ (item.name | default('', true)) ~ '.pem'),
+           'supplied': (billet_github_target_key_srcs[item.name | default('', true)] | default('', true))
+                       | length > 0
+         }] }}
+  loop: >-
+    {{ (billet_config.targets | default([]))
+       if (billet_config is mapping and (billet_config.targets | default([])) is not none)
+       else [] }}
+  loop_control:
+    label: "{{ item.name | default('?') }}"
+
+- name: Settle the further targets' key facts when there are none
+  ansible.builtin.set_fact:
+    billet_github_target_keys: "{{ billet_github_target_keys | default([]) }}"
+
 - name: Validate billet host inputs
   ansible.builtin.assert:
     that:
@@ -240,6 +291,79 @@
   when:
     - billet_github_key_required | bool
     - not billet_github_key_managed | bool
+
+- name: Refuse a further target with no name or no usable private_key_path
+  ansible.builtin.assert:
+    that:
+      - item.name | length > 0
+      - item.path | length > 0
+    fail_msg: >-
+      billet_config.targets carries an entry with no name or no private_key_path.
+      billet requires both for every target and refuses the config when it
+      LOADS — which, left to billet, happens inside this role's upgrade
+      transaction, after the host has already been changed.
+  loop: "{{ billet_github_target_keys }}"
+  loop_control:
+    label: "{{ item.name | default('?') }}"
+
+- name: Refuse a further target's key this role cannot install where the config reads it
+  ansible.builtin.assert:
+    that:
+      - item.owned or not item.supplied
+    fail_msg: >-
+      targets[{{ item.name }}].private_key_path is {{ item.path }}, but this role
+      installs that target's key only to /etc/billet/app-private-key-{{ item.name }}.pem.
+      Installing the one you passed would leave a secret on the host that billet
+      never reads. Either provision {{ item.path }} by whatever manages it and drop
+      billet_github_target_key_srcs.{{ item.name }}, or set that target's
+      private_key_path to /etc/billet/app-private-key-{{ item.name }}.pem.
+  loop: "{{ billet_github_target_keys }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+# The state of every further target's key path, managed or not, so the two
+# refusals below can ask about it the way the github block's are asked about.
+# check_mode false because the answer is an observation.
+- name: Inspect each further target's GitHub App key
+  ansible.builtin.stat:
+    path: "{{ item.path }}"
+    follow: true
+  register: billet_target_key_state
+  become: true
+  check_mode: false
+  loop: "{{ billet_github_target_keys }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Refuse a managed further target's key with nothing to install and none installed
+  ansible.builtin.assert:
+    that:
+      - not item.item.owned or item.item.supplied or item.stat.exists
+    fail_msg: >-
+      targets[{{ item.item.name }}].private_key_path is
+      /etc/billet/app-private-key-{{ item.item.name }}.pem, which this role manages,
+      but no key is there and none was supplied for target {{ item.item.name }}.
+      Pass the key `billet github-app create --target {{ item.item.name }}` wrote as
+      billet_github_target_key_srcs.{{ item.item.name }} on the first converge;
+      after that the installed file is enough.
+  loop: "{{ billet_target_key_state.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+
+- name: Refuse a config naming a further target's GitHub App key that is not on the host
+  ansible.builtin.assert:
+    that:
+      - item.item.owned or (item.stat.exists and item.stat.isreg)
+    fail_msg: >-
+      targets[{{ item.item.name }}].private_key_path is {{ item.item.path }}, and no
+      readable file is there for target {{ item.item.name }}. This role installs that
+      target's key only to /etc/billet/app-private-key-{{ item.item.name }}.pem, so it
+      will not put one at that path — provision it with whatever manages it before
+      converging, or set private_key_path to the managed path and pass the key as
+      billet_github_target_key_srcs.{{ item.item.name }}.
+  loop: "{{ billet_target_key_state.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.name }}"
 
 # AND THE KEY IT DOES NOT MANAGE STILL HAS TO BE THERE. Refusing the source was
 # only half of it: with no source and nothing at the configured path, preflight

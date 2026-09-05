@@ -84,11 +84,33 @@ edited "${CONFIG_A}" "org: acme"
 edited "${CONFIG_A}" "app_id: 12345"
 edited "${CONFIG_A}" "installation_id: 67890"
 
+# A SECOND TARGET, repository-scoped, with a key of its own. The archive has to
+# carry every target's key or refuse, and a restore has to install every one;
+# a rehearsal with a single target would pass with the second key silently
+# dropped. With two targets every tier must say which it belongs to.
+sed -i \
+    -e 's/^  - label: billet-2vcpu-ubuntu-2404$/  - label: billet-2vcpu-ubuntu-2404\n    target: default/' \
+    "${CONFIG_A}"
+edited "${CONFIG_A}" "target: default"
+cat >>"${CONFIG_A}" <<'EOF'
+
+targets:
+  - name: personal
+    repository: someone/widgets
+    app_id: 12346
+    installation_id: 67891
+    private_key_path: /etc/billet/app-private-key-personal.pem
+EOF
+edited "${CONFIG_A}" "private_key_path: /etc/billet/app-private-key-personal.pem"
+
 # A throwaway App key in the shape GitHub issues (PKCS#1), with the mode billet
 # insists on: the hardened read refuses anything group- or world-readable.
 openssl genrsa -traditional -out /etc/billet/app-private-key.pem 2048 2>/dev/null
 chown billet:billet /etc/billet/app-private-key.pem
 chmod 600 /etc/billet/app-private-key.pem
+openssl genrsa -traditional -out /etc/billet/app-private-key-personal.pem 2048 2>/dev/null
+chown billet:billet /etc/billet/app-private-key-personal.pem
+chmod 600 /etc/billet/app-private-key-personal.pem
 
 # THE STATE DIRECTORY AS systemd LEAVES IT: owned by the service account, 0700,
 # empty. That is the case that matters, because StateDirectory= repairs
@@ -119,13 +141,17 @@ mode=$(stat -c '%a' "${ARCHIVE}")
 test "${mode}" = "700" || fail "the archive directory is mode ${mode}, want 700"
 mode=$(stat -c '%a' "${ARCHIVE}/github/app-private-key.pem")
 test "${mode}" = "600" || fail "the archived App key is mode ${mode}, want 600"
+mode=$(stat -c '%a' "${ARCHIVE}/github/personal/app-private-key.pem")
+test "${mode}" = "600" || fail "the archived second target's App key is mode ${mode}, want 600"
 
 step "restore it where nothing has seen it — as root, which is what an operator is"
 sed -e "s#state_dir: ${STATE_A}#state_dir: ${STATE_B}#" \
     -e 's#private_key_path: /etc/billet/app-private-key.pem#private_key_path: /etc/billet/restored-app-private-key.pem#' \
+    -e 's#private_key_path: /etc/billet/app-private-key-personal.pem#private_key_path: /etc/billet/restored-app-private-key-personal.pem#' \
     "${CONFIG_A}" > "${CONFIG_B}"
 edited "${CONFIG_B}" "state_dir: ${STATE_B}"
 edited "${CONFIG_B}" "private_key_path: /etc/billet/restored-app-private-key.pem"
+edited "${CONFIG_B}" "private_key_path: /etc/billet/restored-app-private-key-personal.pem"
 
 # Prepared exactly as the other host's would be by the units it already has
 # installed: created, owned by the service account, and empty.
@@ -146,6 +172,17 @@ cmp "${STATE_A}/ca/ca.key" "${STATE_B}/ca/ca.key" ||
     fail "the restored authority key differs from the original"
 cmp /etc/billet/app-private-key.pem /etc/billet/restored-app-private-key.pem ||
     fail "the restored App key differs from the original; GitHub issues it once"
+cmp /etc/billet/app-private-key-personal.pem /etc/billet/restored-app-private-key-personal.pem ||
+    fail "the restored second target's App key differs from the original; GitHub issues it once"
+
+# BOTH KEYS HANDED TO THE SERVICE ACCOUNT, because a root-run restore that
+# repaired the first and forgot the second would start a control plane that can
+# serve one target and refuses the other.
+for key in /etc/billet/restored-app-private-key.pem /etc/billet/restored-app-private-key-personal.pem; do
+    owner_mode=$(stat -c '%U:%a' "${key}")
+    test "${owner_mode}" = "billet:600" ||
+        fail "${key} is ${owner_mode} after the restore, want billet:600"
+done
 
 # ASKED OF A DIFFERENT TOOL, so this is not billet agreeing with itself: the
 # certificate the ORIGINAL deployment issued still verifies against the restored

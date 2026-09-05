@@ -81,7 +81,14 @@ type Onboarding struct {
 
 // OnboardOptions configures the manifest flow.
 type OnboardOptions struct {
-	Org string
+	// Target is the organization or repository the App will manage runners
+	// for. Required.
+	Target Target
+	// OwnerType says whether Target's owner is a user or an organization, which
+	// decides the manifest form. Optional: an organization target is an
+	// organization, and a repository target's owner is asked of GitHub before
+	// the browser opens when this is empty.
+	OwnerType OwnerType
 	// Name pre-fills the app name. GitHub app names are globally unique, so this
 	// is a suggestion the operator edits on GitHub's own page.
 	Name string
@@ -136,8 +143,8 @@ func (o OnboardOptions) api() string {
 // install it, and the installation is where the installation ID comes from.
 // Anything claiming this is one click is describing only the first half.
 func Onboard(ctx context.Context, opts OnboardOptions) (*Onboarding, error) {
-	if opts.Org == "" {
-		return nil, fmt.Errorf("github: organization is required")
+	if opts.Target.IsZero() {
+		return nil, fmt.Errorf("github: a target (an organization or a repository) is required")
 	}
 
 	if opts.Log == nil {
@@ -151,6 +158,24 @@ func Onboard(ctx context.Context, opts OnboardOptions) (*Onboarding, error) {
 
 	if opts.InstallPoll <= 0 {
 		opts.InstallPoll = 3 * time.Second
+	}
+
+	// THE OWNER'S KIND IS SETTLED BEFORE ANYTHING IS SPENT. A repository owned
+	// by a person registers its App on the personal form, one owned by an
+	// organization on the organization's, and a lookup that fails refuses here,
+	// where refusing is free.
+	if opts.OwnerType == "" {
+		switch opts.Target.Scope() {
+		case ScopeOrganization:
+			opts.OwnerType = OwnerOrganization
+		case ScopeRepository:
+			kind, err := resolveOwnerTypeAt(ctx, opts.Client, opts.api(), opts.Target.Owner)
+			if err != nil {
+				return nil, err
+			}
+
+			opts.OwnerType = kind
+		}
 	}
 
 	// Bind before building any URL: the manifest must carry the real port, and
@@ -288,7 +313,7 @@ func (f *onboardFlow) fail(err error) {
 func (f *onboardFlow) register(ctx context.Context) (*App, error) {
 	startURL := f.base + "/"
 
-	f.opts.Log("Creating the GitHub App for %s.", f.opts.Org)
+	f.opts.Log("Creating the GitHub App for %s.", f.opts.Target)
 	f.opts.Log("")
 	f.openOrPrint(ctx, startURL)
 
@@ -542,7 +567,7 @@ func (f *onboardFlow) persist(app *App) (*App, error) {
 // is what makes the flow survive a closed tab or an install finished elsewhere.
 func (f *onboardFlow) install(ctx context.Context, app *App) (*Installation, error) {
 	f.opts.Log("")
-	f.opts.Log("Creating an app does not install it. Installing it on %s now.", f.opts.Org)
+	f.opts.Log("Creating an app does not install it. Installing it on %s now.", f.opts.Target)
 	f.opts.Log("")
 	f.openOrPrint(ctx, app.InstallURL())
 
@@ -553,8 +578,8 @@ func (f *onboardFlow) install(ctx context.Context, app *App) (*Installation, err
 	pollErr := make(chan error, 1)
 
 	go func() {
-		inst, err := waitForOrgInstallationAt(
-			pollCtx, f.opts.Client, f.opts.api(), app.ID, []byte(app.PEM), f.opts.Org, f.opts.InstallPoll)
+		inst, err := waitForInstallationAt(
+			pollCtx, f.opts.Client, f.opts.api(), app.ID, []byte(app.PEM), f.opts.Target, f.opts.InstallPoll)
 		if err != nil {
 			pollErr <- err
 			return
@@ -610,7 +635,7 @@ func (f *onboardFlow) install(ctx context.Context, app *App) (*Installation, err
 // The app key has already been written by this point, so failing here is
 // recoverable: fix the permissions on GitHub and re-run `billet check`.
 func (f *onboardFlow) verify(inst *Installation) (*Installation, error) {
-	problems := inst.PermissionMismatches()
+	problems := inst.PermissionMismatches(f.opts.Target.Scope())
 	if len(problems) == 0 {
 		return inst, nil
 	}
@@ -622,18 +647,14 @@ func (f *onboardFlow) verify(inst *Installation) (*Installation, error) {
 		f.opts.Log("  - %s", p)
 	}
 
-	// %s/%d, not %s/installations/%d: orgSettingsURL already ends in
+	// %s/%d, not %s/installations/%d: SettingsURL already ends in
 	// /installations, so the old form produced
 	// .../settings/installations/installations/<id> — a 404 handed to an
 	// operator who is already stuck.
 	return nil, fmt.Errorf(
 		"github: installation %d has %d permission mismatch(es); "+
 			"correct them at %s/%d and re-run `billet check`",
-		inst.ID, len(problems), f.orgSettingsURL(), inst.ID)
-}
-
-func (f *onboardFlow) orgSettingsURL() string {
-	return fmt.Sprintf("%s/organizations/%s/settings/installations", webBase, url.PathEscape(f.opts.Org))
+		inst.ID, len(problems), SettingsURL(f.opts.Target.Owner, f.opts.OwnerType), inst.ID)
 }
 
 func (f *onboardFlow) openOrPrint(ctx context.Context, target string) {
@@ -677,7 +698,7 @@ func (f *onboardFlow) openOrPrint(ctx context.Context, target string) {
 // handleStart serves the self-submitting form. A plain redirect cannot work:
 // GitHub requires the manifest in a POST body.
 func (f *onboardFlow) handleStart(w http.ResponseWriter, _ *http.Request) {
-	manifest := NewManifest(f.opts.Name, f.base+"/callback", f.base+"/installed")
+	manifest := NewManifest(f.opts.Name, f.base+"/callback", f.base+"/installed", f.opts.Target.Scope())
 
 	encoded, err := json.Marshal(manifest)
 	if err != nil {
@@ -694,7 +715,7 @@ func (f *onboardFlow) handleStart(w http.ResponseWriter, _ *http.Request) {
 		Action   string
 		Manifest string
 	}{
-		Action:   RegistrationURL(f.opts.Org, f.state),
+		Action:   RegistrationURL(f.opts.Target.Owner, f.opts.OwnerType, f.state),
 		Manifest: string(encoded),
 	}
 
@@ -760,7 +781,7 @@ func (f *onboardFlow) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writePage(w, "App created", "Now install it on your organization. You can close this tab when the CLI says it is done.")
+	writePage(w, "App created", "Now install it on the organization or account that owns the target. You can close this tab when the CLI says it is done.")
 }
 
 // handleInstalled is a wake-up signal and nothing more.

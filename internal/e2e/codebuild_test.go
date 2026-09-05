@@ -413,9 +413,9 @@ func (j *cbJIT) JITConfig(
 	return cbRegistration{name: runnerName}, nil
 }
 
-func (*cbJIT) ValidateTrustedRunnerGroup(context.Context, string, []string) error { return nil }
-func (*cbJIT) RemoveRunner(context.Context, string, int64, string) error          { return nil }
-func (*cbJIT) EnsureRunnerRemoved(context.Context, string) error                  { return nil }
+func (*cbJIT) ValidateTrustedRunnerGroup(context.Context, string, string, []string) error { return nil }
+func (*cbJIT) RemoveRunner(context.Context, string, int64, string) error                  { return nil }
+func (*cbJIT) EnsureRunnerRemoved(context.Context, string) error                          { return nil }
 func (*cbJIT) RecoverRunner(
 	context.Context, string, string, int64, string,
 ) (node.RunnerRecovery, error) {

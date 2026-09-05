@@ -123,7 +123,7 @@ func (c *Converger) makeDirCommand(dir string) string {
 func (c *Converger) requiredDirs(req lifeops.UpRequest) []string {
 	dirs := []string{c.agentsDir, c.logDir}
 
-	for _, path := range []string{req.ConfigPath, req.KeyPath} {
+	for _, path := range append([]string{req.ConfigPath}, req.KeyPaths...) {
 		if path != "" {
 			dirs = append(dirs, filepath.Dir(path))
 		}

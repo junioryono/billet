@@ -155,9 +155,7 @@ func runLocalUp(ctx context.Context, o upOptions) error {
 		// rollout drain the node and then fail to land.
 		BinaryDir: hostPathsFor(hostOS).binaryDir(),
 	}
-	if cfg.GitHub != nil {
-		req.KeyPath = cfg.GitHub.PrivateKeyPath
-	}
+	req.KeyPaths = appKeyFilePaths(cfg)
 
 	c := converge()
 
@@ -872,7 +870,14 @@ func profileRefusals(c converger, cfgPath, servicePath string,
 	// reason is policy: the deployment's credential belongs beside the config
 	// the services read, not in whichever home directory happened to run `init`.
 	confDir := filepath.Dir(servicePath)
-	if req.WantServer && req.KeyPath != "" && !lifeops.Contained(confDir, req.KeyPath) {
+
+	// EVERY TARGET'S KEY, under the same rule: each is a credential the service
+	// reads from beside its config.
+	for _, keyPath := range req.KeyPaths {
+		if !req.WantServer || keyPath == "" || lifeops.Contained(confDir, keyPath) {
+			continue
+		}
+
 		why := "the units set ProtectHome=true, so a key under a home directory is readable " +
 			"by you and invisible to the service — which fails at startup rather than here"
 		if c.ManagerName() == "launchd" {
@@ -882,8 +887,8 @@ func profileRefusals(c converger, cfgPath, servicePath string,
 		}
 
 		refusals = append(refusals, lifeops.Refusal{
-			What: fmt.Sprintf("github.private_key_path is %s, which is outside %s",
-				req.KeyPath, confDir),
+			What: fmt.Sprintf("an App key path is %s, which is outside %s",
+				keyPath, confDir),
 			Remedy: fmt.Sprintf("move the App key into %s; %s", confDir, why),
 		})
 	}

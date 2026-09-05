@@ -275,7 +275,10 @@ func admitted(t *testing.T, a *alloc.Allocator) map[string]string {
 // appKeyPEM is one throwaway App key. Generated once for the package: 2048 bits
 // per test dominates the runtime and proves nothing extra, since what these
 // tests are about is which BYTES land where.
-var appKeyPEM = sync.OnceValues(func() ([]byte, error) {
+var appKeyPEM = sync.OnceValues(generateAppKeyPEM)
+
+// generateAppKeyPEM mints one throwaway App key in the shape GitHub issues.
+func generateAppKeyPEM() ([]byte, error) {
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		return nil, err
@@ -285,12 +288,21 @@ var appKeyPEM = sync.OnceValues(func() ([]byte, error) {
 		Type:  "RSA PRIVATE KEY",
 		Bytes: x509.MarshalPKCS1PrivateKey(key),
 	}), nil
-})
+}
 
 // backUp captures a deployment exactly as `billet local backup` does: through
 // OpenAdmin, against a control plane that is still RUNNING.
 func backUp(t *testing.T, c *controlPlane, appKey []byte, dest string) deployarchive.Manifest {
 	t.Helper()
+
+	// A SECOND TARGET'S KEY TRAVELS WITH THE FIRST. A deployment serving several
+	// GitHub targets holds one App key per target, and an archive that carried
+	// only the first would restore a control plane that serves one owner and
+	// refuses the other; the same second key is what newTarget expects back.
+	second, err := secondTargetKey()
+	if err != nil {
+		t.Fatalf("generate the second target's key: %v", err)
+	}
 
 	admin, err := state.OpenAdmin(t.Context(), c.dir)
 	if err != nil {
@@ -305,9 +317,12 @@ func backUp(t *testing.T, c *controlPlane, appKey []byte, dest string) deployarc
 		DeploymentID: c.deployment,
 		GitHub:       rehearsalApp,
 		AppKeyPEM:    appKey,
-		Snapshot:     admin.SnapshotInto,
-		Now:          time.Now,
-		Hostname:     "rehearsal-source",
+		Targets: []deployarchive.TargetKey{
+			{Name: rehearsalSecondTarget, GitHub: rehearsalSecondApp, AppKeyPEM: second},
+		},
+		Snapshot: admin.SnapshotInto,
+		Now:      time.Now,
+		Hostname: "rehearsal-source",
 	})
 	if err != nil {
 		t.Fatalf("deployarchive.Write: %v", err)
@@ -320,6 +335,21 @@ func backUp(t *testing.T, c *controlPlane, appKey []byte, dest string) deployarc
 // declares. A restore refuses a key that would land beside a config naming a
 // different App.
 var rehearsalApp = deployarchive.GitHubIdentity{Org: "acme", AppID: 12345, InstallationID: 67890}
+
+// rehearsalSecondApp is the second target's App: a repository, because that is
+// the target kind the archive did not carry before targets existed.
+var (
+	rehearsalSecondTarget = "personal"
+	rehearsalSecondApp    = deployarchive.GitHubIdentity{
+		Repository: "someone/widgets", AppID: 12346, InstallationID: 67891,
+	}
+)
+
+// secondTargetKey is the second target's App key, generated once so the
+// archive and the assertion after the restore hold the same bytes, and
+// generated SEPARATELY from the first so a restore that copied the default key
+// into both destinations could not pass both byte-equality assertions.
+var secondTargetKey = sync.OnceValues(generateAppKeyPEM)
 
 // restoreOnto publishes an archive into a directory that has never held a
 // deployment, through the planner and executor the command drives.
@@ -371,6 +401,11 @@ func newTarget(t *testing.T, root string) deployarchive.Target {
 		StateDir:   stateDir,
 		AppKeyPath: filepath.Join(root, "app-private-key.pem"),
 		GitHub:     rehearsalApp,
+		Targets: []deployarchive.TargetPath{{
+			Name:       rehearsalSecondTarget,
+			AppKeyPath: filepath.Join(root, "app-private-key-personal.pem"),
+			GitHub:     rehearsalSecondApp,
+		}},
 	}
 }
 
@@ -438,6 +473,14 @@ func TestARestoredDeploymentServesTheFleetThatTrustedTheOldOne(t *testing.T) {
 		t.Fatalf("generate an App key: %v", err)
 	}
 
+	// TWO DIFFERENT KEYS, or the second assertion below proves nothing.
+	if second, err := secondTargetKey(); err != nil {
+		t.Fatalf("the second target's key: %v", err)
+	} else if bytes.Equal(second, key) {
+		t.Fatal("the two targets' fixture keys are identical, so a restore that copied one " +
+			"into both destinations would pass")
+	}
+
 	// ---- The backup, taken against the live plane above.
 	archiveDir := filepath.Join(root, "archive")
 
@@ -489,6 +532,21 @@ func TestARestoredDeploymentServesTheFleetThatTrustedTheOldOne(t *testing.T) {
 
 	if !bytes.Equal(installed, key) {
 		t.Error("the restored App key is not byte-identical to the original")
+	}
+
+	// AND THE SECOND TARGET'S, at the path the restored config names for it.
+	second, err := secondTargetKey()
+	if err != nil {
+		t.Fatalf("the second target's key: %v", err)
+	}
+
+	installedSecond, err := os.ReadFile(target.Targets[0].AppKeyPath)
+	if err != nil {
+		t.Fatalf("read the restored second target's App key: %v", err)
+	}
+
+	if !bytes.Equal(installedSecond, second) {
+		t.Error("the restored second target's App key is not byte-identical to the original")
 	}
 }
 

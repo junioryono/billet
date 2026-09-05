@@ -580,7 +580,7 @@ func TestAnAmbiguousRejectionRetriesTheSameCode(t *testing.T) {
 	browser := &browser{t: t, fake: fake, client: srv.Client()}
 
 	result, err := Onboard(ctx, OnboardOptions{
-		Org:          "acme",
+		Target:       OrganizationTarget("acme"),
 		OpenBrowser:  browser.open,
 		Log:          func(string, ...any) {},
 		Client:       srv.Client(),
@@ -617,7 +617,7 @@ func TestPermissionsAreMinimal(t *testing.T) {
 		"organization_self_hosted_runners": "write",
 	}
 
-	got := Permissions()
+	got := Permissions(ScopeOrganization)
 
 	if len(got) != len(want) {
 		t.Fatalf("Permissions has %d entries, want %d: %v", len(got), len(want), got)
@@ -642,9 +642,9 @@ func TestPermissionsAreMinimal(t *testing.T) {
 // can mutate it changes the manifest, the CLI's disclosure and the post-install
 // validation in one go.
 func TestPermissionsReturnsACopy(t *testing.T) {
-	Permissions()["contents"] = "write"
+	Permissions(ScopeOrganization)["contents"] = "write"
 
-	if _, leaked := Permissions()["contents"]; leaked {
+	if _, leaked := Permissions(ScopeOrganization)["contents"]; leaked {
 		t.Fatal("mutating the returned map changed the canonical permission set")
 	}
 }
@@ -652,7 +652,7 @@ func TestPermissionsReturnsACopy(t *testing.T) {
 // GitHub marks hook_attributes.url required whenever the object is present, so
 // an inactive hook still needs one. Omitting it rejects the whole registration.
 func TestManifestCarriesAWebhookURLEvenThoughItIsInactive(t *testing.T) {
-	m := NewManifest("billet", "http://127.0.0.1:1/callback", "http://127.0.0.1:1/installed")
+	m := NewManifest("billet", "http://127.0.0.1:1/callback", "http://127.0.0.1:1/installed", ScopeOrganization)
 
 	if m.HookAttributes.URL == "" {
 		t.Error("hook_attributes.url is required by GitHub even when active is false")
@@ -666,7 +666,7 @@ func TestManifestCarriesAWebhookURLEvenThoughItIsInactive(t *testing.T) {
 // setup_on_update would send a later repository-access change to a loopback port
 // that stopped existing when onboarding finished.
 func TestManifestDoesNotAskForUpdateRedirects(t *testing.T) {
-	m := NewManifest("billet", "http://127.0.0.1:1/callback", "http://127.0.0.1:1/installed")
+	m := NewManifest("billet", "http://127.0.0.1:1/callback", "http://127.0.0.1:1/installed", ScopeOrganization)
 
 	if m.SetupOnUpdate {
 		t.Error("setup_on_update must be off: the setup URL is an ephemeral loopback listener")
@@ -676,7 +676,7 @@ func TestManifestDoesNotAskForUpdateRedirects(t *testing.T) {
 // billet long-polls; it must not register a webhook, because a webhook is what
 // would force a deployment to accept inbound internet traffic.
 func TestManifestDisablesWebhook(t *testing.T) {
-	m := NewManifest("billet", "http://127.0.0.1:1/callback", "http://127.0.0.1:1/installed")
+	m := NewManifest("billet", "http://127.0.0.1:1/callback", "http://127.0.0.1:1/installed", ScopeOrganization)
 
 	if m.HookAttributes == nil {
 		t.Fatal("manifest should carry hook_attributes so the webhook is explicitly off")
@@ -692,7 +692,7 @@ func TestManifestDisablesWebhook(t *testing.T) {
 }
 
 func TestManifestRoundTripsThroughJSON(t *testing.T) {
-	m := NewManifest("billet", "http://127.0.0.1:1/callback", "http://127.0.0.1:1/installed")
+	m := NewManifest("billet", "http://127.0.0.1:1/callback", "http://127.0.0.1:1/installed", ScopeOrganization)
 
 	encoded, err := json.Marshal(m)
 	if err != nil {
@@ -721,7 +721,7 @@ func TestManifestRoundTripsThroughJSON(t *testing.T) {
 }
 
 func TestRegistrationURLEscapesOrg(t *testing.T) {
-	got := RegistrationURL("my org/evil", "st/ate+1")
+	got := RegistrationURL("my org/evil", OwnerOrganization, "st/ate+1")
 
 	if strings.Contains(got, "my org") {
 		t.Errorf("org was not escaped: %s", got)

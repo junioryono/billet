@@ -947,7 +947,7 @@ func TestOwnershipCoversTheConfigAndKeyOnly(t *testing.T) {
 
 	req := upRequest()
 	req.ConfigPath = cfg
-	req.KeyPath = key
+	req.KeyPaths = []string{key}
 
 	plan, err := c.Plan(t.Context(), req)
 	if err != nil {
@@ -1056,7 +1056,7 @@ func TestOwnershipRefusesADirectoryEvenWhenItIsTheOneItPlanned(t *testing.T) {
 
 	req := upRequest()
 	req.ConfigPath = cfg
-	req.KeyPath = keyDir
+	req.KeyPaths = []string{keyDir}
 
 	plan, err := c.Plan(t.Context(), req)
 	if err != nil {

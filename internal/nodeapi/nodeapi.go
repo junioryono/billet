@@ -164,6 +164,15 @@ import (
 // checked where it is EMITTED, because an older control plane answers the route
 // with a bare 404 and a node that sent anyway would log a decode failure on
 // every cache request. MinVersion does not move.
+//
+// VERSION 21 LETS A NODE NAME THE TIER whose trusted runner-group policy it asks
+// the control plane to revalidate. A control plane may serve several GitHub
+// targets, each with its own credential, and a runner-group name alone does not
+// say which target's App should be asked; the tier does. ADDITIVE: the field is
+// omitted below this version, and a control plane serving ONE target answers an
+// untargeted request as it always did, while one serving several refuses it and
+// names this version, because guessing which credential to validate with is the
+// substitution the check exists to prevent. MinVersion does not move.
 const (
 	// MinVersion is the oldest wire this build still speaks.
 	//
@@ -176,7 +185,7 @@ const (
 	MinVersion = 12
 
 	// Version is the newest wire this build speaks, and the one it prefers.
-	Version = 20
+	Version = 21
 
 	// VersionNodeRelease is the version from which a registration names the
 	// node's release.
@@ -282,6 +291,16 @@ const (
 	// answers a bare 404. What is lost on an older pairing is one diagnostic
 	// column, never a decision, so nothing is refused for it.
 	VersionCacheObservation = 20
+
+	// VersionTargetedRunnerGroup is the version from which a node names the tier
+	// on a trusted runner-group revalidation, so a control plane serving several
+	// GitHub targets validates with that tier's credential.
+	//
+	// CHECKED WHERE THE REQUEST IS READ: a plane serving one target accepts an
+	// untargeted request from an older node, and one serving several refuses it
+	// naming this version, because a wrong guess would validate one owner's
+	// policy with another owner's App.
+	VersionTargetedRunnerGroup = 21
 )
 
 // Range is the span of wire versions a build speaks, inclusive at both ends.

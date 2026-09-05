@@ -55,9 +55,11 @@ type Server struct {
 	// by a crashed run can be told apart from a live one.
 	owner string
 
-	// org is the GitHub organization these scale sets belong to. A scale set is
-	// org-scoped, so a record of one is only meaningful beside the org it is in.
-	org string
+	// targets are the GitHub organizations and repositories this control plane
+	// serves, each with the provisioner that reaches it. Empty means every tier
+	// goes through prov, which is what a test assembling one provisioner wants;
+	// see WithTargets.
+	targets []Target
 	// maxCapacity, when set, caps every listener. See WithMaxCapacity.
 	maxCapacity *int
 	// reapEvery is how often abandoned capacity is reclaimed.
@@ -161,11 +163,51 @@ func WithNodeRunner(r Runner) ControlPlaneOption {
 	return func(s *Server) { s.runner = r }
 }
 
-// WithOrganization names the GitHub organization this control plane serves, so
-// the scale sets it records can be told apart from another organization's under
-// the same state directory.
-func WithOrganization(org string) ControlPlaneOption {
-	return func(s *Server) { s.org = org }
+// Target is one GitHub organization or repository this control plane serves,
+// and the provisioner holding that target's credential.
+type Target struct {
+	Config      config.GitHubTarget
+	Provisioner Provisioner
+}
+
+// WithTargets names the targets this control plane serves.
+//
+// A TIER IS RESOLVED TO ITS TARGET, AND EVERYTHING ABOUT ITS SCALE SET GOES
+// THROUGH THAT TARGET'S PROVISIONER: reconciliation, the session, the runner
+// registry and the recorded provenance, keyed by the target's GitHub path so a
+// record of one can be told apart from another target's under the same state
+// directory. A tier naming no target resolves to the only one; with several, a
+// tier naming none or naming one not listed here stops Run before any listener
+// starts, because a scale set created with the wrong credential is a scale set
+// on the wrong owner.
+func WithTargets(targets ...Target) ControlPlaneOption {
+	return func(s *Server) { s.targets = targets }
+}
+
+// targetFor resolves the target a tier belongs to.
+//
+// With no targets declared every tier goes through the constructor's
+// provisioner, which is the single-target assembly every unit test uses.
+func (s *Server) targetFor(t *config.Tier) (Target, bool) {
+	if len(s.targets) == 0 {
+		return Target{Provisioner: s.prov}, true
+	}
+
+	if t.Target == "" {
+		if len(s.targets) == 1 {
+			return s.targets[0], true
+		}
+
+		return Target{}, false
+	}
+
+	for _, target := range s.targets {
+		if target.Config.Name == t.Target {
+			return target, true
+		}
+	}
+
+	return Target{}, false
 }
 
 // WithCompletionLedger durably preserves authoritative results until nodes accept them.
@@ -336,11 +378,39 @@ func (s *Server) Run(ctx context.Context) error {
 
 	sets := make(map[string]*ScaleSet, len(s.tiers))
 
-	declared := make(map[scaleSetKey]struct{}, len(s.tiers))
+	// EVERY TIER RESOLVES TO ITS TARGET BEFORE ANYTHING IS RECONCILED, and the
+	// per-target policy is re-applied here: a trusted tier under a repository
+	// target is refused at load, and this is the same rule at the layer that
+	// would otherwise create its scale set with the wrong credential. The
+	// catalogue alloc.New was given may never have gone through Parse.
+	targets := make(map[string]Target, len(s.tiers))
+	declared := make(map[string]map[scaleSetKey]struct{}, len(s.targets))
+
 	for i := range s.tiers {
-		declared[scaleSetKey{
-			group: groupOrDefault(s.tiers[i].RunnerGroup),
-			label: s.tiers[i].Label,
+		t := &s.tiers[i]
+
+		target, ok := s.targetFor(t)
+		if !ok {
+			return fmt.Errorf("server: tier %s names target %q, which this control plane does not "+
+				"serve; every tier belongs to exactly one declared target", t.Label, t.Target)
+		}
+
+		if len(s.targets) > 0 {
+			if errs := config.TierTargetPolicyErrors("tier "+t.Label, *t, target.Config); len(errs) > 0 {
+				return fmt.Errorf("server: refuse tier %s: %w", t.Label, errors.Join(errs...))
+			}
+		}
+
+		targets[t.Label] = target
+
+		path := target.Config.Path()
+		if declared[path] == nil {
+			declared[path] = make(map[scaleSetKey]struct{})
+		}
+
+		declared[path][scaleSetKey{
+			group: groupOrDefault(t.RunnerGroup),
+			label: t.Label,
 		}] = struct{}{}
 	}
 
@@ -350,8 +420,10 @@ func (s *Server) Run(ctx context.Context) error {
 
 	for i := range s.tiers {
 		t := &s.tiers[i]
+		prov := targets[t.Label].Provisioner
+
 		if t.Trust == config.WorkloadTrusted {
-			validator, ok := s.prov.(trustedRunnerGroupValidator)
+			validator, ok := prov.(trustedRunnerGroupValidator)
 			if !ok {
 				return fmt.Errorf("server: tier %s is trusted, but its provisioner cannot verify runner-group policy", t.Label)
 			}
@@ -360,7 +432,7 @@ func (s *Server) Run(ctx context.Context) error {
 			}
 		}
 
-		set, err := s.prov.EnsureScaleSet(ctx, t.Label, t.RunnerGroup, []string{t.Label})
+		set, err := prov.EnsureScaleSet(ctx, t.Label, t.RunnerGroup, []string{t.Label})
 		if err != nil {
 			return fmt.Errorf("server: reconcile scale set for tier %s: %w", t.Label, err)
 		}
@@ -371,16 +443,17 @@ func (s *Server) Run(ctx context.Context) error {
 
 		sets[t.Label] = set
 
-		if s.completionStore != nil {
+		if s.completionStore != nil && len(s.targets) > 0 {
 			rec := state.ScaleSetRecord{
-				Org: s.org, RunnerGroup: set.Group, Label: t.Label, ID: set.ID,
+				Target: targets[t.Label].Config.Path(), RunnerGroup: set.Group, Label: t.Label, ID: set.ID,
 			}
 			if err := s.completionStore.RecordScaleSet(ctx, rec); err != nil {
 				return fmt.Errorf("server: record scale set for tier %s: %w", t.Label, err)
 			}
 		}
 
-		s.log.Info("scale set ready", "tier", t.Label, "scale_set", set.ID, "group", set.Group)
+		s.log.Info("scale set ready", "tier", t.Label, "scale_set", set.ID, "group", set.Group,
+			"target", targets[t.Label].Config.Path())
 	}
 
 	// Reaped ONCE before anything is escrowed, and then on a timer.
@@ -428,7 +501,7 @@ func (s *Server) Run(ctx context.Context) error {
 		go func() {
 			defer wg.Done()
 
-			if err := s.runTier(runCtx, t, sets[t.Label]); err != nil {
+			if err := s.runTier(runCtx, t, sets[t.Label], targets[t.Label].Provisioner); err != nil {
 				mu.Lock()
 				errs = append(errs, err)
 				mu.Unlock()
@@ -472,9 +545,9 @@ var sessionRetryFor = 30 * time.Second
 var ErrSessionHeld = errors.New("server: this scale set already has an active message " +
 	"session, held by a control plane that did not close it")
 
-// runTier opens a session and runs one listener on it.
-func (s *Server) runTier(ctx context.Context, t *config.Tier, set *ScaleSet) error {
-	session, err := s.openSession(ctx, t, set)
+// runTier opens a session on the tier's target and runs one listener on it.
+func (s *Server) runTier(ctx context.Context, t *config.Tier, set *ScaleSet, prov Provisioner) error {
+	session, err := s.openSession(ctx, t, set, prov)
 	if err != nil {
 		return err
 	}
@@ -484,7 +557,7 @@ func (s *Server) runTier(ctx context.Context, t *config.Tier, set *ScaleSet) err
 	// what put them in the wrong order: Go runs Run's defer first, so the escrow
 	// went back while the advertisement was still live.
 
-	return NewListener(s.alloc, t.Label, session, s.listenerOpts()...).Run(ctx)
+	return NewListener(s.alloc, t.Label, session, s.listenerOpts(prov)...).Run(ctx)
 }
 
 // openSession takes this tier's message session, waiting out one an abandoned
@@ -511,9 +584,9 @@ func (s *Server) runTier(ctx context.Context, t *config.Tier, set *ScaleSet) err
 // unacknowledged came back to the successor each time. A
 // measurement rather than a promise, which is why this is a loop and not a
 // sleep, and why nothing here assumes the redelivery.
-func (s *Server) openSession(ctx context.Context, t *config.Tier, set *ScaleSet) (Session, error) {
+func (s *Server) openSession(ctx context.Context, t *config.Tier, set *ScaleSet, prov Provisioner) (Session, error) {
 	for attempt := 1; ; attempt++ {
-		session, err := s.prov.Session(ctx, set.ID, s.owner)
+		session, err := prov.Session(ctx, set.ID, s.owner)
 		if err == nil {
 			return session, nil
 		}
@@ -544,13 +617,14 @@ func (s *Server) openSession(ctx context.Context, t *config.Tier, set *ScaleSet)
 }
 
 // listenerOpts is what every listener this control plane starts is configured
-// with.
+// with, given the provisioner of the tier's target — the registry a listener
+// removes registrations through is that target's, not a deployment-wide one.
 //
 // Factored out of runTier so a test can assert that a control-plane option
 // actually reaches a listener. Asserting on the option alone passes while the
 // value never leaves the config file, which is the whole failure worth catching
 // here.
-func (s *Server) listenerOpts() []Option {
+func (s *Server) listenerOpts(prov Provisioner) []Option {
 	opts := []Option{WithLogger(s.log)}
 	if s.maxCapacity != nil {
 		opts = append(opts, WithMaxCapacity(*s.maxCapacity))
@@ -559,8 +633,8 @@ func (s *Server) listenerOpts() []Option {
 	if s.runner != nil {
 		opts = append(opts, WithRunner(s.runner))
 	}
-	if s.prov != nil {
-		opts = append(opts, WithRunnerRegistry(s.prov))
+	if prov != nil {
+		opts = append(opts, WithRunnerRegistry(prov))
 	}
 	if s.completionStore != nil {
 		opts = append(opts, WithCompletionStore(s.completionStore))

@@ -230,6 +230,19 @@ func WithCachePolicy(policy CachePolicy) HandlerOption {
 	return func(h *handler) { h.cachePolicy = policy }
 }
 
+// WithTargetJIT gives the handler one credential-holding source per GitHub
+// target, keyed by the target's config name.
+//
+// A REGISTRATION IS MINTED WITH THE CREDENTIAL OF THE TIER'S TARGET, and the
+// tier is what every route here already knows — from the lease it acts for, or
+// the label it is asked about — so the target is resolved from the catalogue
+// rather than taken from the request. With this set, the constructor's source
+// serves only tiers the catalogue does not know; a tier whose target is not
+// among these is refused rather than minted through some other owner's App.
+func WithTargetJIT(sources map[string]JITSource) HandlerOption {
+	return func(h *handler) { h.targets = sources }
+}
+
 // Handler serves the OPERATIONAL node wire: every route that acts for a node,
 // and not one that a machine without a certificate can use.
 //
@@ -345,6 +358,7 @@ type handler struct {
 	plane       *Plane
 	store       LeaseStore
 	jit         JITSource
+	targets     map[string]JITSource
 	requireCert bool
 
 	// revocations answers whether a credential has been withdrawn, ca signs
@@ -389,7 +403,12 @@ func (h *handler) scaleSetFor(ctx context.Context, tier config.Tier) (int, error
 		return id, nil
 	}
 
-	set, _, err := h.jit.Describe(ctx, tier.Label, tier.RunnerGroup)
+	src, err := h.jitFor(tier)
+	if err != nil {
+		return 0, err
+	}
+
+	set, _, err := src.Describe(ctx, tier.Label, tier.RunnerGroup)
 	if err != nil {
 		return 0, err
 	}
@@ -1602,14 +1621,21 @@ func (h *handler) describe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if h.jit == nil {
+	if !h.hasJIT() {
 		writeErr(w, http.StatusServiceUnavailable, "",
 			"this control plane has no GitHub client, so it cannot describe scale sets")
 
 		return
 	}
 
-	set, names, err := h.jit.Describe(r.Context(), req.Name, req.Group)
+	src, err := h.jitForLabel(req.Name)
+	if err != nil {
+		writeStoreErr(w, err)
+
+		return
+	}
+
+	set, names, err := src.Describe(r.Context(), req.Name, req.Group)
 	if err != nil {
 		writeStoreErr(w, err)
 
@@ -1642,7 +1668,7 @@ func (h *handler) jitConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if h.jit == nil {
+	if !h.hasJIT() {
 		writeErr(w, http.StatusServiceUnavailable, "",
 			"this control plane has no GitHub client, so it cannot mint registrations")
 
@@ -1733,8 +1759,17 @@ func (h *handler) jitConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// THE TIER'S OWN TARGET MINTS, resolved here beside the scale-set check so a
+	// launch on one owner's tier can never be registered through another's App.
+	src, err := h.jitFor(known)
+	if err != nil {
+		writeStoreErr(w, err)
+
+		return
+	}
+
 	if known.Trust == config.WorkloadTrusted {
-		validator, ok := h.jit.(trustedRunnerGroupValidator)
+		validator, ok := src.(trustedRunnerGroupValidator)
 		if !ok {
 			writeErr(w, http.StatusForbidden, nodeapi.CodeRefused,
 				"trusted runner-group policy cannot be verified before registration")
@@ -1750,7 +1785,7 @@ func (h *handler) jitConfig(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	reg, err := h.jit.JITConfig(r.Context(), req.ScaleSetID, req.RunnerName, req.WorkFolder)
+	reg, err := src.JITConfig(r.Context(), req.ScaleSetID, req.RunnerName, req.WorkFolder)
 	if err != nil {
 		// NOT LOGGED WITH THE REQUEST. A failure to mint can carry the runner name
 		// and the scale set, which are harmless, but this path is one edit away
@@ -1763,7 +1798,7 @@ func (h *handler) jitConfig(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 30*time.Second)
 		defer cancel()
-		if removeErr := h.jit.RemoveRunner(cleanupCtx, reg.ID(), reg.RunnerName()); removeErr != nil {
+		if removeErr := src.RemoveRunner(cleanupCtx, reg.ID(), reg.RunnerName()); removeErr != nil {
 			err = errors.Join(errors.New("nodeplane: the lease store cannot preserve runner identity"),
 				fmt.Errorf("remove unjournaled runner %q: %w", reg.RunnerName(), removeErr))
 		} else {
@@ -1788,7 +1823,7 @@ func (h *handler) jitConfig(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(r.Context()), 30*time.Second)
 		defer cleanupCancel()
-		if removeErr := h.jit.RemoveRunner(cleanupCtx, reg.ID(), reg.RunnerName()); removeErr != nil {
+		if removeErr := src.RemoveRunner(cleanupCtx, reg.ID(), reg.RunnerName()); removeErr != nil {
 			err = errors.Join(err, fmt.Errorf("remove unjournaled runner %q: %w",
 				reg.RunnerName(), removeErr))
 		}
@@ -1874,7 +1909,12 @@ func (h *handler) removeRunner(w http.ResponseWriter, r *http.Request) {
 		writeStoreErr(w, err)
 		return
 	}
-	if err := h.jit.RemoveRunner(r.Context(), binding.RunnerID, binding.RunnerName); err != nil {
+	src, err := h.jitForLabel(binding.Tier)
+	if err != nil {
+		writeStoreErr(w, err)
+		return
+	}
+	if err := src.RemoveRunner(r.Context(), binding.RunnerID, binding.RunnerName); err != nil {
 		writeStoreErr(w, err)
 		return
 	}
@@ -1922,6 +1962,11 @@ func (h *handler) recoverRunner(w http.ResponseWriter, r *http.Request) {
 			"runner recovery name does not match its lease")
 		return
 	}
+	src, err := h.jitForLabel(lease.Tier)
+	if err != nil {
+		writeStoreErr(w, err)
+		return
+	}
 	binding, err := pool.PoolRunnerByLease(r.Context(), leaseID)
 	if err == nil {
 		if binding.Tier != lease.Tier || binding.LaunchRequestID != lease.RequestID {
@@ -1939,7 +1984,7 @@ func (h *handler) recoverRunner(w http.ResponseWriter, r *http.Request) {
 		case alloc.PoolRunnerIdle:
 			req.RunnerName = binding.RunnerName
 		case alloc.PoolRunnerRetiring:
-			if err := h.jit.RemoveRunner(r.Context(), binding.RunnerID, binding.RunnerName); err != nil {
+			if err := src.RemoveRunner(r.Context(), binding.RunnerID, binding.RunnerName); err != nil {
 				writeStoreErr(w, err)
 				return
 			}
@@ -1958,7 +2003,7 @@ func (h *handler) recoverRunner(w http.ResponseWriter, r *http.Request) {
 		writeStoreErr(w, err)
 		return
 	}
-	recovery, err := h.jit.RecoverRunner(r.Context(), req.RunnerName)
+	recovery, err := src.RecoverRunner(r.Context(), req.RunnerName)
 	if err != nil {
 		writeStoreErr(w, err)
 		return
@@ -1985,7 +2030,7 @@ func (h *handler) recoverRunner(w http.ResponseWriter, r *http.Request) {
 	// authoritative busy binding wins and keeps its compute. A crash between the
 	// operations leaves the charged quarantine and is retried safely.
 	if recovery.Present {
-		if err := h.jit.RemoveRunner(r.Context(), recovery.RunnerID, req.RunnerName); err != nil {
+		if err := src.RemoveRunner(r.Context(), recovery.RunnerID, req.RunnerName); err != nil {
 			writeStoreErr(w, err)
 			return
 		}
@@ -2022,7 +2067,35 @@ func (h *handler) validateTrustedRunnerGroup(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	validator, ok := h.jit.(trustedRunnerGroupValidator)
+	// THE TIER NAMES THE TARGET, AND AN UNTARGETED REQUEST IS ANSWERED ONLY WHERE
+	// THERE IS NOTHING TO CHOOSE. A node below VersionTargetedRunnerGroup sends
+	// no tier; on a plane serving one target that is the same question it always
+	// asked, and on one serving several it is refused, because validating one
+	// owner's group with another owner's App is the substitution this route
+	// exists to prevent.
+	var (
+		src JITSource
+		err error
+	)
+
+	switch {
+	case req.Tier != "":
+		src, err = h.jitForLabel(req.Tier)
+	case len(h.targets) > 1:
+		err = fmt.Errorf("this control plane serves %d GitHub targets and the request names no "+
+			"tier, so it cannot choose which target's credential to validate with; a node from "+
+			"wire version %d names its tier", len(h.targets), nodeapi.VersionTargetedRunnerGroup)
+	default:
+		src, err = h.jitForLabel("")
+	}
+
+	if err != nil {
+		writeStoreErr(w, err)
+
+		return
+	}
+
+	validator, ok := src.(trustedRunnerGroupValidator)
 	if !ok {
 		writeErr(w, http.StatusServiceUnavailable, "",
 			"this control plane cannot validate trusted runner-group policy")
@@ -2185,4 +2258,54 @@ func LoopbackOnly(addr string) bool {
 	ip := net.ParseIP(host)
 
 	return ip != nil && ip.IsLoopback()
+}
+
+// hasJIT reports whether any credential-holding source is attached.
+func (h *handler) hasJIT() bool { return h.jit != nil || len(h.targets) > 0 }
+
+// jitFor is the source that holds the credential of a tier's target.
+//
+// With no per-target sources every tier goes through the constructor's; with
+// them, a tier naming no target resolves to the only one, and a tier naming a
+// target that is not attached is refused rather than served by another owner's
+// App. The constructor's source, when both are given, serves only a tier whose
+// target is unresolvable — the single-source assembly a test builds.
+func (h *handler) jitFor(tier config.Tier) (JITSource, error) {
+	if len(h.targets) == 0 {
+		if h.jit == nil {
+			return nil, errors.New("nodeplane: this control plane has no GitHub client")
+		}
+
+		return h.jit, nil
+	}
+
+	name := tier.Target
+	if name == "" && len(h.targets) == 1 {
+		for only := range h.targets {
+			name = only
+		}
+	}
+
+	if src, ok := h.targets[name]; ok {
+		return src, nil
+	}
+
+	if h.jit != nil && name == "" {
+		return h.jit, nil
+	}
+
+	return nil, fmt.Errorf("nodeplane: tier %q names GitHub target %q, which this control plane "+
+		"has no credential for", tier.Label, tier.Target)
+}
+
+// jitForLabel resolves a tier by its label and then its source. A label the
+// catalogue does not know resolves as a tier naming no target, which is served
+// only where there is one source to serve it.
+func (h *handler) jitForLabel(label string) (JITSource, error) {
+	tier, ok := h.plane.tierFor(label)
+	if !ok {
+		tier = config.Tier{Label: label}
+	}
+
+	return h.jitFor(tier)
 }

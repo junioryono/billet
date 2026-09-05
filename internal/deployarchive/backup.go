@@ -2,8 +2,11 @@ package deployarchive
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -37,10 +40,17 @@ type BackupRequest struct {
 	// DeploymentID is what state.PeekDeploymentID answered. Required: a state
 	// directory with no identity is not a deployment to back up.
 	DeploymentID string
-	// GitHub is the App identity from the config.
+	// GitHub is the DEFAULT target's App identity from the config.
 	GitHub GitHubIdentity
-	// AppKeyPEM is the App private key, already validated by the caller.
+	// AppKeyPEM is the default target's App private key, already validated by
+	// the caller.
 	AppKeyPEM []byte
+	// Targets are the further targets the deployment serves, each with its key.
+	//
+	// ALL OR NONE, like every other piece: a backup that captured one target's
+	// key and not another's restores a control plane that serves half its
+	// owners, and the half it does not serve fails hours later with a bare 401.
+	Targets []TargetKey
 	// ConfigBody is the billet.yaml as it stands. Copied for REFERENCE; restore
 	// never installs it, because these paths are the source host's.
 	ConfigBody []byte
@@ -54,6 +64,88 @@ type BackupRequest struct {
 	Now func() time.Time
 	// Hostname is recorded in the manifest as provenance.
 	Hostname string
+}
+
+// TargetKey is one further target's identity and its App private key.
+type TargetKey struct {
+	Name      string
+	GitHub    GitHubIdentity
+	AppKeyPEM []byte
+}
+
+// String renders the target and never its key.
+func (k TargetKey) String() string {
+	return fmt.Sprintf("deployarchive.TargetKey{Name:%q GitHub:%s key:[redacted]}", k.Name, k.GitHub)
+}
+
+// GoString covers %#v, which does not consult String.
+func (k TargetKey) GoString() string { return k.String() }
+
+// Format makes every verb safe: fmt consults Stringer only for some verbs and
+// otherwise formats the fields, key bytes included.
+func (k TargetKey) Format(s fmt.State, _ rune) {
+	//nolint:errcheck // fmt.State has no error channel; a failed write to it is the caller's output problem.
+	io.WriteString(s, k.String())
+}
+
+// MarshalJSON renders the target and never its key.
+func (k TargetKey) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Name   string `json:"name"`
+		GitHub string `json:"github"`
+		Key    string `json:"key"`
+	}{Name: k.Name, GitHub: k.GitHub.String(), Key: "[redacted]"})
+}
+
+// LogValue renders the target and never its key.
+func (k TargetKey) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("name", k.Name),
+		slog.String("github", k.GitHub.String()),
+		slog.String("key", "[redacted]"),
+	)
+}
+
+// String renders the request and never a key.
+func (req BackupRequest) String() string {
+	return fmt.Sprintf("deployarchive.BackupRequest{Dest:%q StateDir:%q DeploymentID:%q GitHub:%s "+
+		"targets:%d key:[redacted]}", req.Dest, req.StateDir, req.DeploymentID, req.GitHub,
+		len(req.Targets))
+}
+
+// GoString covers %#v, which does not consult String.
+func (req BackupRequest) GoString() string { return req.String() }
+
+// Format makes every verb safe.
+func (req BackupRequest) Format(s fmt.State, _ rune) {
+	//nolint:errcheck // fmt.State has no error channel; a failed write to it is the caller's output problem.
+	io.WriteString(s, req.String())
+}
+
+// MarshalJSON renders the request and never a key.
+func (req BackupRequest) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Dest         string `json:"dest"`
+		StateDir     string `json:"state_dir"`
+		DeploymentID string `json:"deployment_id"`
+		GitHub       string `json:"github"`
+		Targets      int    `json:"targets"`
+		Key          string `json:"key"`
+	}{
+		Dest: req.Dest, StateDir: req.StateDir, DeploymentID: req.DeploymentID,
+		GitHub: req.GitHub.String(), Targets: len(req.Targets), Key: "[redacted]",
+	})
+}
+
+// LogValue renders the request and never a key.
+func (req BackupRequest) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("dest", req.Dest),
+		slog.String("deployment_id", req.DeploymentID),
+		slog.String("github", req.GitHub.String()),
+		slog.Int("targets", len(req.Targets)),
+		slog.String("key", "[redacted]"),
+	)
 }
 
 // ExternalLedger describes a ledger the archive deliberately does not contain.
@@ -147,8 +239,31 @@ func (req BackupRequest) validate() error {
 		return errors.New("deployarchive: a backup needs a clock")
 	}
 
+	seen := make(map[string]bool, len(req.Targets))
+
+	for _, target := range req.Targets {
+		switch {
+		case target.Name == "" || target.Name == defaultTargetName:
+			return fmt.Errorf("deployarchive: a further target needs a name of its own; %q is the "+
+				"github block's", target.Name)
+		case seen[target.Name]:
+			return fmt.Errorf("deployarchive: target %q is listed twice", target.Name)
+		case target.GitHub.IsZero():
+			return fmt.Errorf("deployarchive: target %q names no App", target.Name)
+		case len(target.AppKeyPEM) == 0:
+			return fmt.Errorf("deployarchive: target %q's App private key is part of the "+
+				"deployment unit and none was supplied; GitHub issues it exactly once", target.Name)
+		}
+
+		seen[target.Name] = true
+	}
+
 	return nil
 }
+
+// defaultTargetName is the name the `github:` block's target carries in
+// config, which a further target may not take.
+const defaultTargetName = "default"
 
 // PrepareDestination creates a directory an archive may be written into, and
 // refuses the places one must not be.
@@ -295,6 +410,13 @@ func writeLocked(ctx context.Context, req BackupRequest) (Manifest, error) {
 		{name: EntryAppKey, body: req.AppKeyPEM},
 	}
 
+	targets := make([]TargetIdentity, 0, len(req.Targets))
+
+	for _, target := range req.Targets {
+		files = append(files, entry{name: EntryAppKeyFor(target.Name), body: target.AppKeyPEM})
+		targets = append(targets, TargetIdentity{Name: target.Name, GitHubIdentity: target.GitHub})
+	}
+
 	for name, body := range authority.Present {
 		files = append(files, entry{name: AuthorityEntry(name), body: body})
 	}
@@ -387,6 +509,7 @@ func writeLocked(ctx context.Context, req BackupRequest) (Manifest, error) {
 			StateDir:   req.StateDir,
 		},
 		GitHub:    req.GitHub,
+		Targets:   targets,
 		Authority: facts,
 		Ledger:    ledger,
 		Files:     records,

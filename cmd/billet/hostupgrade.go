@@ -1987,7 +1987,7 @@ func (h *systemdHost) ProveStable(ctx context.Context) error {
 	case <-time.After(stabilityWait):
 	}
 
-	report, err := h.inspect.Inspect(ctx, h.configPath(), "")
+	report, err := h.inspect.Inspect(ctx, h.configPath(), nil)
 	if err != nil {
 		return fmt.Errorf("inspecting the restarted services: %w", err)
 	}

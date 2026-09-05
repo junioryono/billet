@@ -35,7 +35,8 @@ Generate a `billet.yaml` that runs. It measures the host, writes a ceiling below
 |---|---|
 | `--profile local\|local-service` | user-session paths for two terminals, or the paths the shipped services read (default `local`) |
 | `--provider docker\|firecracker\|tart\|ec2\|codebuild` | this host's backend (default `docker`) |
-| `--org`, `--runner-group`, `--workflow` (repeatable) | the organization and the trusted pool; group and workflow are required for docker |
+| `--org` or `--repository` | the target: an organization, or one repository as `owner/name`; exactly one of the two |
+| `--runner-group`, `--workflow` (repeatable) | the trusted pool; required for docker, refused with `--repository` (a repository has no runner groups, so docker cannot serve one) |
 | `--listen` | the loopback address the server binds and the node dials (default `127.0.0.1:7717`) |
 | `--image` | the tier image (default: a runner container for docker, a golden generation for firecracker) |
 | `--emit file\|ansible` | write the file, or print the `billet_config` block for an inventory and write nothing |
@@ -54,7 +55,7 @@ Generate the hybrid shape as one unit into `--out DIR`: a Terraform root over th
 |---|---|
 | `--out` | the directory to write into (required) |
 | `--name`, `--region` | the Terraform name prefix and the region (region required) |
-| `--org`, `--runner-group`, `--workflow` (repeatable), `--config` | the organization, the trusted pool (omit both policy flags for untrusted tiers), and the file `github-app create` wrote the App identity into |
+| `--org` or `--repository`, `--runner-group`, `--workflow` (repeatable), `--config` | the target (an organization, or one repository), the trusted pool (omit both policy flags for untrusted tiers; refused with `--repository`), and the file `github-app create` wrote the App identity into |
 | `--control-plane-private-ip` | the controller's address, declared into the root, `server.listen`, every `server_addr` and `ansible_host` before the apply |
 | `--controller-name`, `--local-name` | the two hosts' inventory and certificate names (defaults `<name>-control-plane`, `<name>-fc-1`) |
 | `--local-vcpu`, `--local-memory` | what the Firecracker host has (required); its contribution leaves headroom |
@@ -84,24 +85,25 @@ Print the IAM policy this config's node role needs, derived from the config: cac
 
 ### `billet github-app create`
 
-Create the GitHub App in a browser, install it on the organization, write the five `github:` scalars into an existing config in place, and save the private key beside it. Refuses everything it can before touching GitHub, because the key is issued once.
+Create the GitHub App in a browser, install it on the organization or the repository, write the five identity scalars into an existing config in place, and save the private key beside it. Refuses everything it can before touching GitHub, because the key is issued once. For an organization the App asks for metadata read and organization self-hosted runners write; for a repository it asks for metadata read and repository **administration write**, the only permission GitHub offers for the job, and the command says so. The manifest form follows the owner's account type, resolved before the browser opens.
 
 | Flag | Meaning |
 |---|---|
-| `--org` | the organization (required) |
-| `--config` | the `billet.yaml` to write the `github:` block into |
-| `--key-path` | where to write the key (default: beside the config) |
+| `--org` or `--repository` | the organization, or one repository as `owner/name` (exactly one) |
+| `--target` | which target the App serves: `default` writes `github:`, any other name writes the `targets:` entry of that name, creating it when absent (default `default`) |
+| `--config` | the `billet.yaml` to write the identity into |
+| `--key-path` | where to write the key (default: beside the config, `app-private-key.pem` for the default target and `app-private-key-<name>.pem` otherwise) |
 | `--name` | a suggested App name |
 | `--no-browser` | print URLs instead of opening a browser |
 | `--port` | a fixed loopback callback port, for `ssh -L` |
 
-### `billet github-app store-key --from <path>`
+### `billet github-app store-key --from <path> [--target NAME]`
 
-Publish an existing App private key into a store-backed deployment (`server.identity.backend: aws-ssm`).
+Publish an existing App private key into a store-backed deployment (`server.identity.backend: aws-ssm`), at the `default` target's parameter or at the named target's (`github-app-key-<name>`).
 
 ### `billet check`
 
-Validate the config and the state directory, prove the App key signs a JWT GitHub accepts and the App is installed with exactly the requested permissions, check every trusted tier's runner group, say what this node's guests will get from the site's store, and report registered nodes, images, backups and cloud cost peaks. Works while the control plane is running. A node carrying `node.ebs_s3` with no `node.cache` listener fails the check: that store backs nothing else, so every job would run on the instance's root volume and publish nothing.
+Validate the config and the state directory, prove every target's App key signs a JWT GitHub accepts and its App is installed with exactly the permissions requested for that target's scope (one `target` line per target when there are several; the worst verdict is the report's), check every trusted tier's runner group (a repository target's tiers say the group is not probed and why), say what this node's guests will get from the site's store, and report registered nodes, images, backups and cloud cost peaks. Works while the control plane is running. A node carrying `node.ebs_s3` with no `node.cache` listener fails the check: that store backs nothing else, so every job would run on the instance's root volume and publish nothing.
 
 | Flag | Meaning |
 |---|---|
@@ -145,7 +147,7 @@ Capture a deployment as one unit, put it back as one unit or not at all, or put 
 
 | Command | Meaning |
 |---|---|
-| `billet status` | admission, controller and epoch, capacity, tiers, nodes with protocol versions, cost peaks, unproven hosts |
+| `billet status` | admission, controller and epoch, capacity, tiers (grouped by target when there are several), nodes with protocol versions, cost peaks, unproven hosts |
 | `billet leases held` | every lease whose compute is not confirmed gone |
 | `billet leases quarantined` | capacity held for compute nobody has accounted for |
 | `billet leases failures [--since 24h] [--limit 50]` | jobs GitHub did not report as succeeded on leases billet's infrastructure disrupted; billet re-runs nothing |
@@ -210,7 +212,7 @@ Capture a deployment as one unit, put it back as one unit or not at all, or put 
 
 | Command | Meaning |
 |---|---|
-| `billet teardown --tier <label>\|--all [--runner-group] [--force] [--yes]` | delete the scale sets billet created on GitHub |
+| `billet teardown --tier <label>\|--all [--target NAME] [--runner-group] [--force] [--yes]` | delete the scale sets billet created on GitHub; `--all` walks every target with that target's credential, a declared tier's target comes from the config, and `--target` names it for a tier the config no longer declares |
 | `billet decommission [--yes] [--terminate-instances]` | delete the EC2 instances and EBS+S3 cache billet made outside Terraform; without `--yes` it reports |
 
 ## Acceptance

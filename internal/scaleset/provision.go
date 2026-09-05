@@ -16,11 +16,40 @@ import (
 // DefaultRunnerGroup is where a scale set lands when a tier names no group.
 const DefaultRunnerGroup = gh.DefaultRunnerGroup
 
+// groupFor resolves the runner group a tier's scale set lives in, and refuses
+// a named group on a repository target before anything is asked.
+//
+// A REPOSITORY HAS NO RUNNER GROUPS TO NAME. Its runners are its own, so the
+// only group a scale set there can land in is the service's default, and a tier
+// naming another one is a config error the control plane must not paper over
+// by asking GitHub about a group that cannot exist — the answer would be a
+// "group not found" that reads as a permissions problem.
+func (c *Client) groupFor(group string) (string, error) {
+	if group == "" {
+		group = DefaultRunnerGroup
+	}
+
+	if c.target.Scope() == billetgithub.ScopeRepository && group != DefaultRunnerGroup {
+		return "", fmt.Errorf("scaleset: runner group %q on repository target %s: %w",
+			group, c.target, billetgithub.ErrNoRunnerGroups)
+	}
+
+	return group, nil
+}
+
 // ValidateTrustedRunnerGroup verifies the GitHub-side workflow boundary before
 // Billet gives a pool trusted launch authority.
 func (c *Client) ValidateTrustedRunnerGroup(ctx context.Context, group string,
 	workflows []string,
 ) error {
+	// REFUSED BEFORE ANY CALL. A trusted pool is a policy GitHub enforces on a
+	// runner group, and a repository has none, so there is nothing that could
+	// vouch for trust here; config refuses the tier at load and this is the
+	// same rule at the layer that would otherwise mint.
+	if c.target.Scope() == billetgithub.ScopeRepository {
+		return fmt.Errorf("scaleset: trusted tier on repository target %s: %w",
+			c.target, billetgithub.ErrNoRunnerGroups)
+	}
 	if group == "" {
 		group = DefaultRunnerGroup
 	}
@@ -99,8 +128,9 @@ type ScaleSet struct {
 // the get and the create, and losing that race should be indistinguishable from
 // winning it.
 func (c *Client) EnsureScaleSet(ctx context.Context, name, group string, labels []string) (*ScaleSet, error) {
-	if group == "" {
-		group = DefaultRunnerGroup
+	group, err := c.groupFor(group)
+	if err != nil {
+		return nil, err
 	}
 
 	rg, err := c.gh.GetRunnerGroupByName(ctx, group)
@@ -190,8 +220,9 @@ func (c *Client) EnsureScaleSet(ctx context.Context, name, group string, labels 
 func (c *Client) DeleteScaleSet(
 	ctx context.Context, name, group string, labels []string, force bool,
 ) (bool, error) {
-	if group == "" {
-		group = DefaultRunnerGroup
+	group, err := c.groupFor(group)
+	if err != nil {
+		return false, err
 	}
 
 	rg, err := c.gh.GetRunnerGroupByName(ctx, group)
@@ -241,8 +272,9 @@ func (c *Client) DeleteScaleSet(
 // destructive command can show the operator the actual object rather than the
 // name they typed. Returns nil when there is nothing by that name.
 func (c *Client) Describe(ctx context.Context, name, group string) (*ScaleSet, []string, error) {
-	if group == "" {
-		group = DefaultRunnerGroup
+	group, err := c.groupFor(group)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	rg, err := c.gh.GetRunnerGroupByName(ctx, group)
@@ -528,4 +560,39 @@ func (c *Client) RemoveRunner(ctx context.Context, runnerID int64, runnerName st
 		return fmt.Errorf("scaleset: remove runner %q (%d): %w", runnerName, runnerID, err)
 	}
 	return nil
+}
+
+// RunnerGroup is what the Actions service answered for a group name.
+type RunnerGroup struct {
+	ID        int
+	Name      string
+	IsDefault bool
+}
+
+// ErrRunnerGroupAbsent is LookupRunnerGroup's answer when the service names no
+// group, distinct from a request that failed.
+var ErrRunnerGroupAbsent = errors.New("scaleset: the service answered no runner group by that name")
+
+// LookupRunnerGroup asks the Actions service for a runner group by name and
+// returns exactly what it answered, so a live measurement can record the
+// service's answer at a scope nothing documents. Every provisioning call
+// resolves the group through the same lookup; this is that lookup with nothing
+// decided on top of it, and the repository-scope rule (a named group there is
+// refused before the service is asked) applies here too.
+func (c *Client) LookupRunnerGroup(ctx context.Context, group string) (*RunnerGroup, error) {
+	group, err := c.groupFor(group)
+	if err != nil {
+		return nil, err
+	}
+
+	rg, err := c.gh.GetRunnerGroupByName(ctx, group)
+	if err != nil {
+		return nil, fmt.Errorf("scaleset: find runner group %q: %w", group, err)
+	}
+
+	if rg == nil {
+		return nil, fmt.Errorf("scaleset: find runner group %q: %w", group, ErrRunnerGroupAbsent)
+	}
+
+	return &RunnerGroup{ID: rg.ID, Name: rg.Name, IsDefault: rg.IsDefault}, nil
 }

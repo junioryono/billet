@@ -44,7 +44,7 @@ type RunnerRecovery struct {
 type runnerGroupPolicyClient struct {
 	client         *http.Client
 	base           string
-	org            string
+	target         Target
 	appID          int64
 	installationID int64
 	privateKey     []byte
@@ -54,11 +54,16 @@ type runnerGroupPolicyClient struct {
 	expiresAt time.Time
 }
 
-// NewRunnerGroupPolicyClient builds a client for GitHub.com's organization API.
-func NewRunnerGroupPolicyClient(org string, appID, installationID int64,
+// NewRunnerGroupPolicyClient builds a client for GitHub.com's REST API on one
+// target.
+//
+// A REPOSITORY TARGET GETS A CLIENT TOO, because runner recovery
+// (InspectScaleSetRunner) lists the target's runners, which a repository has;
+// every runner-group question on such a client answers ErrNoRunnerGroups.
+func NewRunnerGroupPolicyClient(target Target, appID, installationID int64,
 	privateKey []byte,
 ) RunnerGroupPolicyClient {
-	return newRunnerGroupPolicyClient(http.DefaultClient, apiBase, org, appID, installationID, privateKey)
+	return newRunnerGroupPolicyClient(http.DefaultClient, apiBase, target, appID, installationID, privateKey)
 }
 
 // NewRunnerGroupPolicyClientAt builds a client for a GitHub Enterprise API base.
@@ -73,21 +78,36 @@ func NewRunnerGroupPolicyClient(org string, appID, installationID int64,
 //
 // That check exists because a misconfigured runner group was the first failure
 // two operators hit on a fresh host, and it could not have caught one.
-func NewRunnerGroupPolicyClientAt(base, org string, appID, installationID int64,
+func NewRunnerGroupPolicyClientAt(base string, target Target, appID, installationID int64,
 	privateKey []byte,
 ) RunnerGroupPolicyClient {
 	if base == "" {
 		base = apiBase
 	}
 
-	return newRunnerGroupPolicyClient(http.DefaultClient, base, org, appID, installationID, privateKey)
+	return newRunnerGroupPolicyClient(http.DefaultClient, base, target, appID, installationID, privateKey)
 }
 
-func newRunnerGroupPolicyClient(client *http.Client, base, org string, appID, installationID int64,
+func newRunnerGroupPolicyClient(client *http.Client, base string, target Target, appID, installationID int64,
 	privateKey []byte,
 ) *runnerGroupPolicyClient {
-	return &runnerGroupPolicyClient{client: client, base: base, org: org, appID: appID,
+	return &runnerGroupPolicyClient{client: client, base: base, target: target, appID: appID,
 		installationID: installationID, privateKey: bytes.Clone(privateKey)}
+}
+
+// configured reports whether this client can authenticate at all.
+func (c *runnerGroupPolicyClient) configured() bool {
+	return c != nil && !c.target.IsZero() && c.appID > 0 && c.installationID > 0 && len(c.privateKey) > 0
+}
+
+// groupsOrRefuse is the guard every runner-group method starts with: a
+// repository target has no groups to ask about.
+func (c *runnerGroupPolicyClient) groupsOrRefuse() error {
+	if c.target.Scope() == ScopeRepository {
+		return fmt.Errorf("%w (target %s)", ErrNoRunnerGroups, c.target)
+	}
+
+	return nil
 }
 
 // ErrRunnerGroupNotFound reports that no runner group carries a given name.
@@ -97,15 +117,17 @@ var ErrRunnerGroupNotFound = errors.New("github: runner group not found")
 func (c *runnerGroupPolicyClient) ValidateTrustedRunnerGroup(ctx context.Context, groupID int,
 	wantWorkflows []string,
 ) error {
-	if c == nil || c.org == "" || c.appID <= 0 || c.installationID <= 0 || len(c.privateKey) == 0 {
+	if !c.configured() {
 		return fmt.Errorf("github: trusted runner-group validation is not configured")
+	}
+	if err := c.groupsOrRefuse(); err != nil {
+		return err
 	}
 	token, err := c.installationToken(ctx)
 	if err != nil {
 		return err
 	}
-	endpoint := fmt.Sprintf("%s/orgs/%s/actions/runner-groups/%d", c.base,
-		url.PathEscape(c.org), groupID)
+	endpoint := fmt.Sprintf("%s/%d", c.target.runnerGroupsEndpoint(c.base), groupID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, http.NoBody)
 	if err != nil {
 		return fmt.Errorf("github: build runner-group policy request: %w", err)
@@ -164,8 +186,12 @@ func (c *runnerGroupPolicyClient) ValidateTrustedRunnerGroup(ctx context.Context
 // third run sat queued for its whole window against a default group that
 // granted no repository, with every surface reporting healthy.
 func (c *runnerGroupPolicyClient) ValidateRunnerGroupReach(ctx context.Context, groupID int) error {
-	if c == nil || c.org == "" || c.appID <= 0 || c.installationID <= 0 || len(c.privateKey) == 0 {
+	if !c.configured() {
 		return fmt.Errorf("github: runner-group validation is not configured")
+	}
+
+	if err := c.groupsOrRefuse(); err != nil {
+		return err
 	}
 
 	token, err := c.installationToken(ctx)
@@ -226,8 +252,7 @@ func (c *runnerGroupPolicyClient) checkRunnerGroupReach(
 func (c *runnerGroupPolicyClient) runnerGroupVisibility(
 	ctx context.Context, token string, groupID int,
 ) (string, error) {
-	endpoint := fmt.Sprintf("%s/orgs/%s/actions/runner-groups/%d", c.base,
-		url.PathEscape(c.org), groupID)
+	endpoint := fmt.Sprintf("%s/%d", c.target.runnerGroupsEndpoint(c.base), groupID)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, http.NoBody)
 	if err != nil {
@@ -268,7 +293,7 @@ func (c *runnerGroupPolicyClient) runnerGroupVisibility(
 func (c *runnerGroupPolicyClient) InspectScaleSetRunner(
 	ctx context.Context, runnerName string, runnerID int64,
 ) (RunnerRecovery, error) {
-	if c == nil || c.org == "" || c.appID <= 0 || c.installationID <= 0 || len(c.privateKey) == 0 {
+	if !c.configured() {
 		return RunnerRecovery{}, fmt.Errorf("github: runner recovery is not configured")
 	}
 	if runnerName == "" {
@@ -282,8 +307,7 @@ func (c *runnerGroupPolicyClient) InspectScaleSetRunner(
 		return RunnerRecovery{}, err
 	}
 	query := url.Values{"name": {runnerName}, "per_page": {"100"}}
-	endpoint := fmt.Sprintf("%s/orgs/%s/actions/runners?%s", c.base,
-		url.PathEscape(c.org), query.Encode())
+	endpoint := c.target.runnersEndpoint(c.base) + "?" + query.Encode()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, http.NoBody)
 	if err != nil {
 		return RunnerRecovery{}, fmt.Errorf("github: build runner recovery request: %w", err)
@@ -409,8 +433,8 @@ func (c *runnerGroupPolicyClient) String() string {
 	if c == nil {
 		return "github.RunnerGroupPolicyClient<nil>"
 	}
-	return fmt.Sprintf("github.RunnerGroupPolicyClient{base:%q org:%q app_id:%d installation_id:%d credentials:[redacted]}",
-		c.base, c.org, c.appID, c.installationID)
+	return fmt.Sprintf("github.RunnerGroupPolicyClient{base:%q target:%q app_id:%d installation_id:%d credentials:[redacted]}",
+		c.base, c.target.Path(), c.appID, c.installationID)
 }
 
 func (c *runnerGroupPolicyClient) GoString() string { return c.String() }
@@ -427,11 +451,11 @@ func (c *runnerGroupPolicyClient) MarshalJSON() ([]byte, error) {
 	}
 	return json.Marshal(struct {
 		Base           string `json:"base"`
-		Org            string `json:"org"`
+		Target         string `json:"target"`
 		AppID          int64  `json:"app_id"`
 		InstallationID int64  `json:"installation_id"`
 		Credentials    string `json:"credentials"`
-	}{c.base, c.org, c.appID, c.installationID, "[redacted]"})
+	}{c.base, c.target.Path(), c.appID, c.installationID, "[redacted]"})
 }
 
 func (c *runnerGroupPolicyClient) LogValue() slog.Value {
@@ -439,7 +463,7 @@ func (c *runnerGroupPolicyClient) LogValue() slog.Value {
 		return slog.StringValue("github.RunnerGroupPolicyClient<nil>")
 	}
 	return slog.GroupValue(
-		slog.String("base", c.base), slog.String("org", c.org),
+		slog.String("base", c.base), slog.String("target", c.target.Path()),
 		slog.Int64("app_id", c.appID), slog.Int64("installation_id", c.installationID),
 		slog.String("credentials", "[redacted]"),
 	)
@@ -451,8 +475,7 @@ func (c *runnerGroupPolicyClient) LogValue() slog.Value {
 func (c *runnerGroupPolicyClient) runnerGroupRepositories(
 	ctx context.Context, token string, groupID int,
 ) (int, error) {
-	endpoint := fmt.Sprintf("%s/orgs/%s/actions/runner-groups/%d/repositories", c.base,
-		url.PathEscape(c.org), groupID)
+	endpoint := fmt.Sprintf("%s/%d/repositories", c.target.runnerGroupsEndpoint(c.base), groupID)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, http.NoBody)
 	if err != nil {
@@ -500,8 +523,12 @@ func (c *runnerGroupPolicyClient) runnerGroupRepositories(
 // group does not exist" and "the lookup failed" are different facts and only
 // one of them is the operator's to fix.
 func (c *runnerGroupPolicyClient) FindRunnerGroupID(ctx context.Context, name string) (int, bool, error) {
-	if c == nil || c.org == "" || c.appID <= 0 || c.installationID <= 0 || len(c.privateKey) == 0 {
+	if !c.configured() {
 		return 0, false, fmt.Errorf("github: runner-group lookup is not configured")
+	}
+
+	if err := c.groupsOrRefuse(); err != nil {
+		return 0, false, err
 	}
 
 	token, err := c.installationToken(ctx)
@@ -509,8 +536,7 @@ func (c *runnerGroupPolicyClient) FindRunnerGroupID(ctx context.Context, name st
 		return 0, false, err
 	}
 
-	endpoint := fmt.Sprintf("%s/orgs/%s/actions/runner-groups?per_page=100", c.base,
-		url.PathEscape(c.org))
+	endpoint := c.target.runnerGroupsEndpoint(c.base) + "?per_page=100"
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, http.NoBody)
 	if err != nil {

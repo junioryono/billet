@@ -1,6 +1,6 @@
 # Configuration
 
-`billet.yaml` has nine top-level blocks. `billet server` reads `server`, `github`, `tiers`, `nodes`, `sites`, `backup`, `images` and `release`; `billet node` reads `node` and `tiers` (and `server`, on a loopback node, to learn which deployment it joins). One machine running both roles reads one file. The annotated [`billet.example.yaml`](https://github.com/junioryono/billet/blob/main/billet.example.yaml) describes the measured Firecracker deployment; `billet init` writes a runnable file for any backend, and both are parsed by the test suite so they cannot drift from the schema.
+`billet.yaml` has ten top-level blocks. `billet server` reads `server`, `github`, `targets`, `tiers`, `nodes`, `sites`, `backup`, `images` and `release`; `billet node` reads `node` and `tiers` (and `server`, on a loopback node, to learn which deployment it joins). One machine running both roles reads one file. The annotated [`billet.example.yaml`](https://github.com/junioryono/billet/blob/main/billet.example.yaml) describes the measured Firecracker deployment; `billet init` writes a runnable file for any backend, and both are parsed by the test suite so they cannot drift from the schema.
 
 Byte sizes are written as `32GiB`, `512MiB` and parsed exactly; durations as Go strings (`30m`, `6h`).
 
@@ -24,13 +24,29 @@ Byte sizes are written as `32GiB`, `512MiB` and parsed exactly; durations as Go 
 
 ## `github`
 
+The first GitHub **target**: the owner whose runners this deployment serves, and the App credential for it. It is the target named `default`; `targets` below adds more.
+
 | Key | Required | Meaning |
 |---|---|---|
-| `org` | yes | the organization; matched exactly, so padding is refused |
+| `org` | one of the two | an organization; matched exactly, so padding is refused |
+| `repository` | one of the two | one repository as `owner/name`, owned by a personal account or an organization; the target is that repository and nothing else the owner has |
 | `app_id` | yes | written by `billet github-app create` |
 | `client_id` | no | when set, the scale-set client signs with it; `billet check` reports which issuer it tested |
 | `installation_id` | yes | creating an App does not install it |
 | `private_key_path` | yes | the key GitHub issued once |
+
+A repository target is **untrusted-only**: a repository has no runner groups, so nothing on GitHub's side can restrict a pool there, and `trust: trusted`, `runner_group`, `workflows` and `intercept` are refused on a tier under one. Its App holds `administration: write` on that repository, the only permission GitHub offers for registering a repository's runners ([ADR-011](decisions/adr-011-targets-and-repository-scope.md)).
+
+## `targets`
+
+Further targets, each an organization or a repository with its own App, served by the same control plane, fleet, CA and identity. `targets` requires the `github` block, which is always the first target and always the one named `default`; a `targets` entry named `default` is refused as a second spelling of it. Two targets may not name one `private_key_path`.
+
+| Key | Required | Meaning |
+|---|---|---|
+| `name` | yes | the target's name, in the tier-label grammar, unique; what `tiers[].target`, `github-app create --target`, the archive and the host role refer to it by |
+| `org` or `repository`, `app_id`, `client_id`, `installation_id`, `private_key_path` | as for `github` | the target and its credential; with a file-backed identity every target needs its own `private_key_path`, with a store-backed one none may set it |
+
+The target's GitHub path (`owner` or `owner/name`) is its identity on the wire and in the ledger; the name is a label for the operator.
 
 ## `node`
 
@@ -79,7 +95,8 @@ Byte sizes are written as `32GiB`, `512MiB` and parsed exactly; durations as Go 
 | Key | Meaning |
 |---|---|
 | `label` | the `runs-on` value and the scale set's name |
-| `trust` | `untrusted` (default) or `trusted`; trusted requires `runner_group` and `workflows` |
+| `target` | which target's scale set this is; defaults to the only target and is required when there are several |
+| `trust` | `untrusted` (default) or `trusted`; trusted requires `runner_group` and `workflows`, and is refused under a repository target |
 | `runner_group` | a non-default group GitHub restricts; empty means GitHub's default group; `&`, `#`, `;`, `%` and `+` are refused because the client does not escape them |
 | `workflows` | the exact allowlist the group must carry, with refs |
 | `provider` or `providers` | one backend, or an ordered preference list; never both |
@@ -91,7 +108,7 @@ Byte sizes are written as `32GiB`, `512MiB` and parsed exactly; durations as Go 
 | `shm`, `buildkit_cache_mount_limit` | the shared-memory size and the per-mount BuildKit ceiling |
 | `image` | a Firecracker image `name@generation` or `name@verified` (a bare name is refused), an AMI id, a container image, or a tart OCI reference |
 | `command` | the guest command; `command-missing` is a conclusive launch failure |
-| `intercept`, `cache_scope` | transparent Actions caching, Linux Firecracker only, with a static scope |
+| `intercept`, `cache_scope` | transparent Actions caching, Linux Firecracker only, with a static scope inside the tier's target (its owner, and for a repository target that repository); refused under a repository target |
 | `max_concurrent`, `reserved` | a ceiling and a floor; a macOS tier's ceiling defaults to what its hosts permit between them |
 | `warm_pool` | refused when non-zero; no backend implements it |
 
@@ -118,8 +135,8 @@ Per-host policy, not a roster: `name`, `provider` (decides only whether an unpin
 ## Rules that are not visible in the schema
 
 - Tiers and `nodes` are read at startup and snapshotted; changing them restarts the control plane. Nodes register dynamically.
-- A path, pool, region or endpoint is trimmed; an identity (`sites[].name`, `tiers[].site`, `node.site`, `github.org`, `tiers[].runner_group`) is refused with padding, because a trimmed identity names a different deployment on another machine.
+- A path, pool, region or endpoint is trimmed; an identity (`sites[].name`, `tiers[].site`, `node.site`, `github.org`, `github.repository`, `targets[].name`, `tiers[].target`, `tiers[].runner_group`) is refused with padding, because a trimmed identity names a different deployment on another machine.
 - `node.ceph` is refused on every backend but firecracker; `node.cache` is refused on docker; `node.ceph` and `node.ebs_s3` are refused on codebuild.
 - The mirror of those — a store with no `node.cache` to serve it — is a `billet check` verdict rather than a load refusal, because `billet decommission` and `billet init iam` both read a store block on a config that has lost its listener. `node.ebs_s3` without a listener FAILS the check; `node.ceph` without one is reported, since `image_pool` still boots every guest and `cache_pool` is a required field.
-- `billet init` writes a whole file and refuses to replace one it cannot prove is its own output (it writes `<path>.new` instead; `--force` overrides); `billet github-app create --config` edits five scalars under `github:` in place and preserves everything else.
+- `billet init` writes a whole file and refuses to replace one it cannot prove is its own output (it writes `<path>.new` instead; `--force` overrides); `billet github-app create --config` edits five scalars under `github:` (or, with `--target NAME`, under the named `targets:` entry, created when absent) in place and preserves everything else.
 - `--config` is never defaulted to the working directory; `billet check -h` prints the per-user default, and the packaged services use `/etc/billet/billet.yaml` (Linux) or `/usr/local/etc/billet/billet.yaml` (macOS).

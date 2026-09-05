@@ -1038,7 +1038,7 @@ func TestLocalCommandsDefaultToTheConfigTheUnitsRead(t *testing.T) {
 		t.Cleanup(func() { inspect = realInspect })
 
 		var asked string
-		inspect = func(_ context.Context, cfgPath, _ string) (lifeops.Report, error) {
+		inspect = func(_ context.Context, cfgPath string, _ []string) (lifeops.Report, error) {
 			asked = cfgPath
 
 			return lifeops.Report{ConfigPath: cfgPath}, nil

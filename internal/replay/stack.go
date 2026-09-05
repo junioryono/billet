@@ -12,6 +12,7 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	billetgithub "github.com/junioryono/billet/internal/github"
 	"github.com/junioryono/billet/internal/node"
 	"github.com/junioryono/billet/internal/nodeclient"
 	"github.com/junioryono/billet/internal/nodeplane"
@@ -67,11 +68,11 @@ func buildStack(t *testing.T, log *slog.Logger, fleet Fleet, tiers []config.Tier
 	t.Helper()
 
 	client, err := scaleset.New(scaleset.Config{
-		ConfigURL:      actions.URL + "/" + DefaultOwner,
+		Target:         billetgithub.OrganizationTarget(DefaultOwner),
+		GitHubURL:      actions.URL,
 		ClientID:       "12345",
 		InstallationID: 67890,
 		PrivateKey:     actions.PrivateKeyPEM(),
-		Org:            DefaultOwner,
 		AppID:          12345,
 		APIURL:         actions.URL + "/api/v3",
 	}, nil)
@@ -201,10 +202,15 @@ func buildStack(t *testing.T, log *slog.Logger, fleet Fleet, tiers []config.Tier
 
 	prov := orderedSessions{Provisioner: wiring.Provisioner{Client: client}, actions: actions}
 
-	ctl := server.New(a, prov, tiers, owner, log,
+	// The one target, assembled the way the CLI assembles one, so the scale-set
+	// record carries the owner's path and every tier resolves through it.
+	ctl := server.New(a, nil, tiers, owner, log,
 		server.WithNodeRunner(plane.NewRunner()),
 		server.WithCompletionLedger(db),
-		server.WithOrganization(DefaultOwner),
+		server.WithTargets(server.Target{
+			Config:      config.GitHubTarget{Name: config.DefaultTargetName, Org: DefaultOwner},
+			Provisioner: prov,
+		}),
 		// NEVER, for a replay: a jumped clock would expire every lease between two
 		// heartbeats. The startup reap still runs, on an empty ledger.
 		server.WithReapInterval(24*time.Hour),

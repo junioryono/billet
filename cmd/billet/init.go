@@ -119,7 +119,8 @@ func cmdInit(ctx context.Context, args []string) error {
 			"ships — systemd units on Linux, launch agents on macOS)")
 	listen := fs.String("listen", "",
 		"loopback address the server binds and the node dials (default "+initconfig.DefaultListen+")")
-	org := fs.String("org", "", "the GitHub organization these runners serve")
+	org := fs.String("org", "", "the GitHub organization these runners serve (exactly one of --org and --repository)")
+	repository := fs.String("repository", "", "the GitHub repository these runners serve, as owner/name")
 	provider := fs.String("provider", string(config.ProviderDocker),
 		"compute backend for this host")
 	image := fs.String("image", "",
@@ -520,6 +521,7 @@ func cmdInit(ctx context.Context, args []string) error {
 
 	params := initconfig.Params{
 		Org:         *org,
+		Repository:  *repository,
 		Provider:    kind,
 		Image:       *image,
 		RunnerGroup: *group,
@@ -766,13 +768,14 @@ func cmdInit(ctx context.Context, args []string) error {
 				"overwrite good values with incomplete ones. Re-run "+
 				"`billet github-app create` to record them together.\n\n",
 				gb.AppID, gb.Org, gb.InstallationID)
-		case ok && params.Org != "" && gb.Org != params.Org:
-			// The App belongs to the OLD org; silently writing it under a new
-			// one would pair an identity with an organization it is not
-			// installed on. Said, not guessed around.
+		case ok && params.TargetPath() != "" && gb.scopePath() != params.TargetPath():
+			// The App belongs to the OLD target; silently writing it under a new
+			// one would pair an identity with an owner it is not installed on.
+			// Said, not guessed around.
 			fmt.Fprintf(notes, "NOTE: the existing App (id %d) belongs to %q, but this run is for %q — "+
 				"the App identity was NOT carried. Run `billet github-app create` for %q, or "+
-				"re-run with --org %s.\n\n", gb.AppID, gb.Org, params.Org, params.Org, shellArg(gb.Org))
+				"re-run with %s.\n\n", gb.AppID, gb.scopePath(), params.TargetPath(), params.TargetPath(),
+				scopeFlag(gb.Org, gb.Repository))
 		case ok:
 			gb.PrivateKeyPath = configuredKeyPathOf(body)
 			rendered, err := renderGitHubBlock(final, gb)
@@ -919,9 +922,10 @@ func cmdInit(ctx context.Context, args []string) error {
 			// the validation. The identity has to be IN the block before the first
 			// converge, which means creating the App against a config on this host
 			// and emitting from that.
-			fmt.Fprint(notes, noIdentityGuidance(*cfgPath, params.Org,
+			fmt.Fprint(notes, noIdentityGuidance(*cfgPath, params.Org, params.Repository,
 				generationFlags(generationInputs{
 					org:             *org,
+					repository:      *repository,
 					provider:        *provider,
 					image:           *image,
 					runnerGroup:     *group,
@@ -1062,25 +1066,88 @@ func cmdInit(ctx context.Context, args []string) error {
 // leniently, because the whole point is surviving a file the strict parser may
 // not love. ok is false when there is no filled identity to carry.
 func existingGitHubBlock(raw []byte) (githubBlock, string, bool) {
+	return existingIdentity(raw, config.DefaultTargetName)
+}
+
+// identityDoc is the lenient shape of the identity-bearing blocks.
+type identityDoc struct {
+	Org            string `yaml:"org"`
+	Repository     string `yaml:"repository"`
+	AppID          int64  `yaml:"app_id"`
+	InstallationID int64  `yaml:"installation_id"`
+	ClientID       string `yaml:"client_id"`
+	PrivateKeyPath string `yaml:"private_key_path"`
+}
+
+// existingIdentity reads one target's App identity out of a config: the github
+// block for the default target, the named targets entry for any other.
+func existingIdentity(raw []byte, target string) (githubBlock, string, bool) {
 	var doc struct {
-		GitHub struct {
-			Org            string `yaml:"org"`
-			AppID          int64  `yaml:"app_id"`
-			InstallationID int64  `yaml:"installation_id"`
-			ClientID       string `yaml:"client_id"`
-			PrivateKeyPath string `yaml:"private_key_path"`
-		} `yaml:"github"`
+		GitHub  identityDoc `yaml:"github"`
+		Targets []struct {
+			Name        string `yaml:"name"`
+			identityDoc `yaml:",inline"`
+		} `yaml:"targets"`
 	}
-	if err := yaml.Unmarshal(raw, &doc); err != nil || doc.GitHub.AppID == 0 {
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		return githubBlock{}, "", false
+	}
+
+	found := doc.GitHub
+	name := config.DefaultTargetName
+
+	if target != "" && target != config.DefaultTargetName {
+		found = identityDoc{}
+		name = target
+
+		for _, entry := range doc.Targets {
+			if entry.Name == target {
+				found = entry.identityDoc
+
+				break
+			}
+		}
+	}
+
+	if found.AppID == 0 {
 		return githubBlock{}, "", false
 	}
 
 	return githubBlock{
-		Org:            doc.GitHub.Org,
-		AppID:          doc.GitHub.AppID,
-		InstallationID: doc.GitHub.InstallationID,
-		ClientID:       doc.GitHub.ClientID,
-	}, doc.GitHub.PrivateKeyPath, true
+		Target:         name,
+		Org:            found.Org,
+		Repository:     found.Repository,
+		AppID:          found.AppID,
+		InstallationID: found.InstallationID,
+		ClientID:       found.ClientID,
+	}, found.PrivateKeyPath, true
+}
+
+// targetName is the block's target name, spelled out for the default.
+func (b githubBlock) targetName() string {
+	if b.isDefault() {
+		return config.DefaultTargetName
+	}
+
+	return b.Target
+}
+
+// describe names the block's scope the way an operator reads it, quoted.
+func (b githubBlock) describe() string {
+	if b.Repository != "" {
+		return fmt.Sprintf("repository %q", b.Repository)
+	}
+
+	return fmt.Sprintf("org %q", b.Org)
+}
+
+// scopePath is the block's GitHub path, whichever scope it names.
+func (b githubBlock) scopePath() string {
+	if b.Repository != "" {
+		return b.Repository
+	}
+
+	return b.Org
 }
 
 // configuredKeyPathOf reads the key path out of a generated body.
@@ -1299,7 +1366,7 @@ func printInitNextFor(cfgPath string, p initconfig.Params, trusted, carried bool
 // tiers, and telling that operator their jobs run isolated on the untrusted
 // bridge would be a dangerous falsehood — the guidance follows the real trust.
 func printInitNext(cfgPath string, p initconfig.Params, trusted bool) {
-	org, kind, profile := p.Org, p.Provider, p.Profile
+	kind, profile := p.Provider, p.Profile
 
 	// These lines are meant to be copy-pasted, so every interpolated value is
 	// shell-quoted. A config path with a space would otherwise split into two
@@ -1307,10 +1374,7 @@ func printInitNext(cfgPath string, p initconfig.Params, trusted bool) {
 	// placeholder rather than a real organization someone might paste as-is — and
 	// shellArg single-quotes it so the shell does not read its `<` as input
 	// redirection. An ordinary path or org name is left untouched.
-	orgFlag := shellArg("<your-org>")
-	if org != "" {
-		orgFlag = shellArg(org)
-	}
+	orgFlag := scopeFlag(p.Org, p.Repository)
 	pathArg := shellArg(cfgPath)
 
 	if kind == config.ProviderFirecracker {
@@ -1343,7 +1407,7 @@ func printInitNext(cfgPath string, p initconfig.Params, trusted bool) {
 	// buries the steps either side of it; the command that is about to act says
 	// the whole thing, before it acts.
 	fmt.Printf("  1. Create the GitHub App and install it (%s):\n", configEditBrief)
-	fmt.Printf("       billet github-app create --org %s --config %s\n", orgFlag, pathArg)
+	fmt.Printf("       billet github-app create %s --config %s\n", orgFlag, pathArg)
 	fmt.Printf("  2. Confirm the config, its host prerequisites and any runner-group policy:\n")
 	fmt.Printf("       billet check --config %s\n", pathArg)
 	if profile == initconfig.ProfileLocalService {
@@ -1670,7 +1734,7 @@ func sameDir(a, b string) bool {
 // config.Parse round trip, so nothing revalidates the result and the command
 // reports success over a config that will not load.
 func (b githubBlock) usable() bool {
-	return strings.TrimSpace(b.Org) != "" && b.AppID > 0 && b.InstallationID > 0
+	return strings.TrimSpace(b.scopePath()) != "" && b.AppID > 0 && b.InstallationID > 0
 }
 
 // wantsAnsibleEmission reports whether these raw args ask for the inventory
@@ -1706,12 +1770,12 @@ func shellArgs(args []string) string {
 // generationInputs are the parsed flag values that DESCRIBE a deployment, as
 // opposed to the ones that say where the generation goes.
 type generationInputs struct {
-	org, provider, image, runnerGroup, listen string
-	workflows                                 []string
-	region, subnet, maxMemory                 string
-	securityGroups, untrustedGroups           []string
-	instanceTypes, priceOverrides             []string
-	maxVCPU                                   int
+	org, repository, provider, image, runnerGroup, listen string
+	workflows                                             []string
+	region, subnet, maxMemory                             string
+	securityGroups, untrustedGroups                       []string
+	instanceTypes, priceOverrides                         []string
+	maxVCPU                                               int
 	// state is where the ledger lives. It is NOT ec2 placement and not a tier
 	// property — it describes the control plane — but it belongs here for the same
 	// reason everything else does: the printed re-emit has to produce the same
@@ -1749,6 +1813,7 @@ func generationFlags(in generationInputs) []string {
 	}
 
 	add("org", in.org)
+	add("repository", in.repository)
 	add("provider", in.provider)
 	add("image", in.image)
 	add("runner-group", in.runnerGroup)
@@ -1800,6 +1865,21 @@ func checkCarried(final []byte) error {
 	return nil
 }
 
+// scopeFlag renders the flag that names a target for a pasted command: the
+// organization, the repository, or the quoted placeholder an operator fills in.
+//
+// QUOTED, because a shell reads `<your-org>` as input redirection.
+func scopeFlag(org, repository string) string {
+	switch {
+	case repository != "":
+		return "--repository " + shellArg(repository)
+	case org != "":
+		return "--org " + shellArg(org)
+	default:
+		return "--org " + shellArg("<your-org>")
+	}
+}
+
 // bootstrapIdentity is the file the printed bootstrap mints an App into. It
 // holds only a github block, never a deployment.
 const bootstrapIdentity = "~/billet-app.yaml"
@@ -1849,7 +1929,7 @@ const bootstrapSeed = "github: {}"
 // that file is the only local record of the App id, installation id and key path,
 // and a plain `>` truncated it before reserveKeyFile noticed the key already
 // existed and refused — the key survived, the identity record did not.
-func noIdentityGuidance(cfgPath, org string, flags []string) string {
+func noIdentityGuidance(cfgPath, org, repository string, flags []string) string {
 	rest := shellArgs(flags)
 	if rest != "" {
 		rest = " " + rest
@@ -1858,10 +1938,7 @@ func noIdentityGuidance(cfgPath, org string, flags []string) string {
 	// QUOTED, because a shell reads `<your-org>` as input redirection: the
 	// placeholder vanished from argv, or the shell failed before billet started,
 	// and the App was never created.
-	orgFlag := "--org " + shellArg("<your-org>")
-	if org != "" {
-		orgFlag = "--org " + shellArg(org)
-	}
+	orgFlag := scopeFlag(org, repository)
 
 	// AT CONFIG LOAD, NOT AT THE GITHUB PROBE. Measured on a real host by the
 	// session that owns `billet local up`: a zero app_id is rejected by

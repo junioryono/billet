@@ -28,7 +28,7 @@ A box under your desk is the cheapest fast CI you will ever have, and the reason
 
 ## Quick start
 
-One Linux machine with Docker, a GitHub organization you own, and about fifteen minutes.
+One Linux machine with Docker, a GitHub organization you own, and about fifteen minutes. (A personal account is served one repository at a time, with `--repository owner/name`, on a backend that admits untrusted work; the docs say why.)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/junioryono/billet/main/scripts/install.sh | sh
@@ -99,7 +99,7 @@ One binary, two roles. `billet server` creates one GitHub runner scale set per t
 
 ## Security
 
-billet is not a sandbox for untrusted code, and says so. Trust belongs to a runner pool, not to the event that scaled it up: every tier is untrusted unless promoted, and a trusted tier requires a workflow-restricted runner group that billet re-checks against GitHub before every registration it mints. Fork pull requests get arbitrary code execution on your hardware and are admitted only on a backend that is a real boundary with a network of its own; [GitHub's own guidance](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/manage-access) against self-hosted runners on public repositories applies. The App billet creates holds two permissions (metadata read, organization self-hosted runners read and write) and cannot read your code. The control plane runs unprivileged; the Linux node runs as root because Firecracker and the Docker socket require it, and the jailer drops every VM to its own uid. Caches are a deliberate cross-job channel, so do not cache secrets. Read [Trust and isolation](https://billet.readthedocs.io/en/latest/concepts/trust-and-isolation.html) before pointing billet at anything. To report a vulnerability, email the maintainer rather than opening an issue.
+billet is not a sandbox for untrusted code, and says so. Trust belongs to a runner pool, not to the event that scaled it up: every tier is untrusted unless promoted, and a trusted tier requires a workflow-restricted runner group that billet re-checks against GitHub before every registration it mints. Fork pull requests get arbitrary code execution on your hardware and are admitted only on a backend that is a real boundary with a network of its own; [GitHub's own guidance](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/manage-access) against self-hosted runners on public repositories applies. The App billet creates holds two permissions (metadata read, organization self-hosted runners read and write; for a repository target, metadata read and repository administration read and write, the only grant GitHub offers for the job) and cannot read your code. One deployment can serve several organizations and repositories, each through its own App. The control plane runs unprivileged; the Linux node runs as root because Firecracker and the Docker socket require it, and the jailer drops every VM to its own uid. Caches are a deliberate cross-job channel, so do not cache secrets. Read [Trust and isolation](https://billet.readthedocs.io/en/latest/concepts/trust-and-isolation.html) before pointing billet at anything. To report a vulnerability, email the maintainer rather than opening an issue.
 
 ## Documentation
 

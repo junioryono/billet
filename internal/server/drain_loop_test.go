@@ -1214,7 +1214,7 @@ func TestTheHurryChannelReachesEveryListener(t *testing.T) {
 
 	s := New(nil, nil, nil, "owner", nil, WithHurry(hurry))
 
-	l := NewListener(nil, "tier", nil, s.listenerOpts()...)
+	l := NewListener(nil, "tier", nil, s.listenerOpts(s.prov)...)
 	if l.hurry == nil {
 		t.Fatal("the hurry channel never reached the listener")
 	}
@@ -1231,7 +1231,7 @@ func TestTheHurryChannelReachesEveryListener(t *testing.T) {
 func TestTheCompletionLedgerReachesEveryListener(t *testing.T) {
 	db := openState(t)
 	s := New(nil, nil, nil, "owner", nil, WithCompletionLedger(db))
-	l := NewListener(nil, "tier", nil, s.listenerOpts()...)
+	l := NewListener(nil, "tier", nil, s.listenerOpts(s.prov)...)
 	if l.completionStore != db {
 		t.Fatal("the control plane's completion ledger never reached the listener")
 	}

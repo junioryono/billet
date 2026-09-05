@@ -16,7 +16,7 @@ func stubInspect(t *testing.T, report lifeops.Report) {
 	t.Helper()
 
 	prev := inspect
-	inspect = func(context.Context, string, string) (lifeops.Report, error) { return report, nil }
+	inspect = func(context.Context, string, []string) (lifeops.Report, error) { return report, nil }
 	t.Cleanup(func() { inspect = prev })
 }
 

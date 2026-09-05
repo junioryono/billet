@@ -5,8 +5,8 @@ import (
 	"fmt"
 )
 
-// scaleSetKey identifies one scale set: an organization's runner group plus the
-// label, since the same label in two groups is two objects.
+// scaleSetKey identifies one scale set within a target: its runner group plus
+// the label, since the same label in two groups is two objects.
 //
 // A struct rather than a joined string, because a delimiter is a decision about
 // characters the two halves may contain and neither the state store nor GitHub
@@ -37,8 +37,10 @@ func groupOrDefault(group string) string {
 	return group
 }
 
-// reportUndeclaredScaleSets names every scale set billet recorded creating that
-// no configured tier claims.
+// reportUndeclaredScaleSets names every scale set billet recorded creating, on
+// any target this control plane serves, that no configured tier claims.
+//
+// declared is keyed by the target's GitHub path, then by the scale set.
 //
 // WHY THIS EXISTS AT ALL: removing a tier from the config is the ordinary way to
 // stop offering a size, and the scale set it created stays on the organization
@@ -57,26 +59,33 @@ func groupOrDefault(group string) string {
 // on purpose; a control plane that tidied up on startup would dismantle the
 // tiers of an operator running a second config against the same ledger.
 func (s *Server) reportUndeclaredScaleSets(
-	ctx context.Context, declared map[scaleSetKey]struct{},
+	ctx context.Context, declared map[string]map[scaleSetKey]struct{},
 ) error {
-	if s.completionStore == nil || s.org == "" {
+	if s.completionStore == nil || len(s.targets) == 0 {
 		return nil
 	}
 
-	recorded, err := s.completionStore.ScaleSets(ctx, s.org)
-	if err != nil {
-		return fmt.Errorf("server: read recorded scale sets: %w", err)
-	}
+	// EVERY TARGET, not only those with a tier left: removing the last tier of a
+	// target is the edit most likely to strand its scale set.
+	for _, target := range s.targets {
+		path := target.Config.Path()
 
-	for _, rec := range recorded {
-		if _, ok := declared[scaleSetKey{group: rec.RunnerGroup, label: rec.Label}]; ok {
-			continue
+		recorded, err := s.completionStore.ScaleSets(ctx, path)
+		if err != nil {
+			return fmt.Errorf("server: read recorded scale sets for %s: %w", path, err)
 		}
 
-		s.log.Warn("a scale set billet created is no longer declared by any tier; "+
-			"it advertises nothing, so a job using that label queues rather than failing. "+
-			"Remove it with `billet teardown --tier <label> --runner-group <group>`",
-			"tier", rec.Label, "group", rec.RunnerGroup, "scale_set", rec.ID)
+		for _, rec := range recorded {
+			if _, ok := declared[path][scaleSetKey{group: rec.RunnerGroup, label: rec.Label}]; ok {
+				continue
+			}
+
+			s.log.Warn("a scale set billet created is no longer declared by any tier; "+
+				"it advertises nothing, so a job using that label queues rather than failing. "+
+				"Remove it with `billet teardown --tier <label> --runner-group <group> --target <name>`",
+				"tier", rec.Label, "group", rec.RunnerGroup, "scale_set", rec.ID,
+				"target", target.Config.Name, "path", path)
+		}
 	}
 
 	return nil

@@ -126,6 +126,7 @@ type HybridParams struct {
 	// an untrusted security group and the firecracker side from the untrusted
 	// bridge.
 	Org         string
+	Repository  string
 	RunnerGroup string
 	Workflows   []string
 
@@ -364,6 +365,17 @@ func checkHybridParams(p *HybridParams) error {
 		}
 	}
 
+	if p.Repository != "" {
+		if err := config.CheckRepository(p.Repository); err != nil {
+			return fmt.Errorf("--repository: %w", err)
+		}
+	}
+
+	if p.Org != "" && p.Repository != "" {
+		return errors.New("--org and --repository are both set, and a target is exactly one " +
+			"of them: an organization, or one repository")
+	}
+
 	// THE NAME IS WHAT billet ca issue MINTS, so config's own node-name rule is
 	// applied here, before the runbook's step 5 would meet it, and the DNS-label
 	// shape on top of it because the same string is an inventory hostname.
@@ -590,14 +602,9 @@ func renderHybridTiers(ts []tier, p HybridParams, trusted bool, ami string) stri
 
 // hybridGitHubYAML renders the github block with whatever identity was carried.
 func hybridGitHubYAML(p HybridParams) string {
-	org := p.Org
-	if org == "" {
-		org = "<your-org>"
-	}
-
 	var b strings.Builder
 
-	fmt.Fprintf(&b, "github:\n  org: %s\n", yamlScalar(org))
+	fmt.Fprintf(&b, "github:\n%s\n", scopeLineFor(p.Org, p.Repository))
 	if p.AppID == 0 {
 		b.WriteString("  # Filled in by `billet github-app create`; the runbook's first step.\n")
 	}
@@ -1338,4 +1345,14 @@ collections:
   - name: ansible.posix
     version: ">=1.5.4"
 `, HybridMarker, p.Name, p.Ref)
+}
+
+// TargetPath is the path of the owner these runners serve, or empty when
+// neither an organization nor a repository was given.
+func (p HybridParams) TargetPath() string {
+	if p.Repository != "" {
+		return p.Repository
+	}
+
+	return p.Org
 }

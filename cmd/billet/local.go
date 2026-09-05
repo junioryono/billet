@@ -79,8 +79,8 @@ func addServiceConfigFlag(fs *flag.FlagSet) *string {
 // internal/lifeops — rightly, since nothing outside it can construct a
 // systemctl reply — so this is what lets the command's rendering be asserted
 // against a host that does not exist.
-var inspect = func(ctx context.Context, cfgPath, keyPath string) (lifeops.Report, error) {
-	return lifeops.NewInspector().Inspect(ctx, cfgPath, keyPath)
+var inspect = func(ctx context.Context, cfgPath string, keyPaths []string) (lifeops.Report, error) {
+	return lifeops.NewInspector().Inspect(ctx, cfgPath, keyPaths)
 }
 
 // cmdLocalStatus reports what this machine is actually doing.
@@ -107,22 +107,22 @@ func cmdLocalStatus(ctx context.Context, args []string) error {
 	// The config is READ FOR ITS PATHS, and a config that will not load is
 	// reported rather than fatal: the units and the binary are still worth
 	// naming, and they are often what explains the config problem.
-	var keyPath string
+	var keyPaths []string
 	cfg, cfgErr := config.Load(*cfgPath)
 	if cfgErr != nil {
 		fmt.Printf("         UNREADABLE: %v\n", cfgErr)
-	} else if cfg.GitHub != nil {
-		keyPath = cfg.GitHub.PrivateKeyPath
+	} else {
+		keyPaths = appKeyFilePaths(cfg)
 	}
 
-	report, err := inspect(ctx, *cfgPath, keyPath)
+	report, err := inspect(ctx, *cfgPath, keyPaths)
 	if err != nil {
 		return err
 	}
 
 	printFileFacts("config", report.Config)
-	if keyPath != "" {
-		printFileFacts("key", report.AppKey)
+	for _, key := range report.AppKeys {
+		printFileFacts("key", key)
 	}
 
 	switch {

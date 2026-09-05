@@ -22,6 +22,12 @@
 #   foreign path — a source is REFUSED, and the file must already be there
 # and the point of both is that a config billet would reject when it LOADS is
 # rejected here, before normal convergence changes anything.
+#
+# THE SAME POLICY FOR A FURTHER TARGET (billet_config.targets), whose owned path
+# is /etc/billet/app-private-key-<name>.pem and whose source is
+# billet_github_target_key_srcs.<name>. The target cases keep the github block
+# on its owned path with a key supplied, so the only thing that can refuse is
+# the target's own rule.
 set -eu
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -114,6 +120,7 @@ cat >"$work/site.yml" <<'EOF'
           - billet_github_key_required is defined
           - billet_github_key_managed is defined
           - billet_github_key_path is defined
+          - billet_github_target_keys is defined
         fail_msg: >-
           The role did not reach its GitHub App key preflight, so a converge
           that succeeded here proves nothing about the policy.
@@ -183,7 +190,7 @@ run_case() {
 
     if [ "$expect" = pass ]; then
         if [ "$status" -ne 0 ]; then
-            echo "FAIL $name: expected the converge to succeed"; sed -n '$p;/fatal/p' "$work/out.log" >&2; exit 1
+            echo "FAIL $name: expected the converge to succeed"; grep -A 20 'fatal:' "$work/out.log" >&2; exit 1
         fi
         # A play that matched no host exits 0 having converged nothing.
         if ! sed -n '/PLAY RECAP/,$p' "$work/out.log" | grep -qE '^[^ ]+ +: +ok=[1-9]'; then
@@ -196,9 +203,12 @@ run_case() {
         # A task FAILED, rather than ansible-playbook failing to start, an
         # unparsable playbook, or a missing interpreter — any of which exit
         # non-zero and would otherwise count as the refusal under test.
-        if ! grep -q 'FAILED!' "$work/out.log"; then
+        # A looped assert prints "failed: [host] (item=...)" per item and no
+        # "FAILED!" summary, so both spellings of a task failing are accepted.
+        if ! grep -q 'FAILED!\|^failed: \[' "$work/out.log"; then
             echo "FAIL $name: the run failed without any task failing" >&2
-            tail -5 "$work/out.log" >&2; exit 1
+            grep -n -A 25 'FAILED!\|fatal:\|ERROR!' "$work/out.log" | head -80 >&2
+            tail -30 "$work/out.log" >&2; exit 1
         fi
         if ! sed -n '/PLAY RECAP/,$p' "$work/out.log" | grep -qE '^[^ ]+ +: +ok=[0-9]+ +changed=0 '; then
             echo "FAIL $name: refused, but the recap reports a change — an invalid" \
@@ -207,7 +217,7 @@ run_case() {
         fi
         if ! grep -Fq -- "$expect" "$work/out.log"; then
             echo "FAIL $name: refused, but not for the expected reason ($expect)" >&2
-            sed -n '/fatal/p' "$work/out.log" >&2; exit 1
+            grep -A 20 'fatal:' "$work/out.log" >&2; exit 1
         fi
     fi
     echo "ok   $name"
@@ -218,6 +228,100 @@ run_case() {
 absent_says="no readable file is there"
 source_says="would leave a secret on the host that billet never reads"
 owned_says="no key is there and none was supplied"
+
+# run_play runs the fixture at $work/gv/all.yml with the extra -e arguments
+# given, and judges the result the one way both case shapes share.
+run_play() {
+    name=$1; expect=$2; shift 2
+
+    set -- --check -i localhost, --connection=local \
+        -e "@$work/gv/all.yml" -e "billet_binary_src=$noop" "$@"
+
+    status=0
+    ANSIBLE_COLLECTIONS_PATH="$collections_root:$HOME/.ansible/collections:/usr/share/ansible/collections" \
+    ANSIBLE_STDOUT_CALLBACK=default ANSIBLE_FORCE_COLOR=0 ANSIBLE_NOCOLOR=1 \
+        ansible-playbook "$@" "$work/site.yml" >"$work/out.log" 2>&1 || status=$?
+
+    if [ "$expect" = pass ]; then
+        if [ "$status" -ne 0 ]; then
+            echo "FAIL $name: expected the converge to succeed"; grep -A 20 'fatal:' "$work/out.log" >&2; exit 1
+        fi
+        if ! sed -n '/PLAY RECAP/,$p' "$work/out.log" | grep -qE '^[^ ]+ +: +ok=[1-9]'; then
+            echo "FAIL $name: the play converged no host" >&2; exit 1
+        fi
+    else
+        if [ "$status" -eq 0 ]; then
+            echo "FAIL $name: expected a refusal, the converge succeeded" >&2; exit 1
+        fi
+        # A looped assert prints "failed: [host] (item=...)" per item and no
+        # "FAILED!" summary, so both spellings of a task failing are accepted.
+        if ! grep -q 'FAILED!\|^failed: \[' "$work/out.log"; then
+            echo "FAIL $name: the run failed without any task failing" >&2
+            grep -n -A 25 'FAILED!\|fatal:\|ERROR!' "$work/out.log" | head -80 >&2
+            tail -30 "$work/out.log" >&2; exit 1
+        fi
+        if ! sed -n '/PLAY RECAP/,$p' "$work/out.log" | grep -qE '^[^ ]+ +: +ok=[0-9]+ +changed=0 '; then
+            echo "FAIL $name: refused, but the recap reports a change" >&2
+            sed -n '/PLAY RECAP/,$p' "$work/out.log" >&2; exit 1
+        fi
+        if ! grep -Fq -- "$expect" "$work/out.log"; then
+            echo "FAIL $name: refused, but not for the expected reason ($expect)" >&2
+            grep -A 20 'fatal:' "$work/out.log" >&2; exit 1
+        fi
+    fi
+    echo "ok   $name"
+}
+
+# run_target_case is run_case for a FURTHER target named personal: the github
+# block stays on its owned path with its key supplied, and a targets entry is
+# appended to the emitted block naming the given key path for the target.
+run_target_case() {
+    name=$1; path=$2; supply=$3; expect=$4
+
+    case $supply in
+        yes|no) ;;
+        *) echo "key-policy-check: $name: supply must be yes or no, got '$supply'" >&2; exit 1 ;;
+    esac
+    if [ -z "$expect" ]; then
+        echo "key-policy-check: $name: an empty expectation matches any failure" >&2
+        exit 1
+    fi
+
+    rm -rf "$work/gv"; mkdir -p "$work/gv"
+    cp "$work/base.yml" "$work/gv/all.yml"
+
+    # The emission ends with billet_config, so a two-space-indented key appended
+    # to it is a key of the config. Proved below by the count rather than assumed.
+    cat >>"$work/gv/all.yml" <<EOF
+  targets:
+    - name: personal
+      repository: someone/widgets
+      app_id: 4722348
+      installation_id: 156647705
+      private_key_path: $path
+EOF
+    if [ "$(grep -Fc -- "private_key_path: $path" "$work/gv/all.yml")" != 1 ]; then
+        echo "key-policy-check: $name: the fixture does not name $path exactly once" >&2
+        exit 1
+    fi
+    if [ "$(grep -Fc -- "private_key_path: $owned" "$work/gv/all.yml")" != 1 ]; then
+        echo "key-policy-check: $name: the fixture lost the github block's owned path" >&2
+        exit 1
+    fi
+
+    set -- -e "expected_key_path=$owned" -e "billet_github_private_key_src=$key"
+    if [ "$supply" = yes ]; then
+        set -- "$@" -e "{\"billet_github_target_key_srcs\": {\"personal\": \"$key\"}}"
+    fi
+
+    run_play "$name" "$expect" "$@"
+}
+
+target_owned=/etc/billet/app-private-key-personal.pem
+target_foreign=$work/operator/personal-key.pem
+target_absent_says="no readable file is there for target personal"
+target_source_says="would leave a secret on the host that billet never reads"
+target_owned_says="none was supplied for target personal"
 
 rm -rf "$work/operator"; mkdir -p "$work/operator"
 run_case "owned path, key supplied"          "$owned"   yes pass
@@ -257,3 +361,20 @@ else
 fi
 
 echo "key-policy-check: every case behaved as the policy requires"
+
+# THE FURTHER TARGET'S OWN CASES. Each runs with the github block satisfied, so
+# a refusal is the target rule's and nothing else's.
+rm -rf "$work/operator"; mkdir -p "$work/operator"
+run_target_case "target owned path, key supplied"        "$target_owned"   yes pass
+
+rm -rf "$work/operator"; mkdir -p "$work/operator"
+run_target_case "target owned path, nothing supplied"    "$target_owned"   no  "$target_owned_says"
+
+rm -rf "$work/operator"; mkdir -p "$work/operator"
+run_target_case "target foreign path, absent"            "$target_foreign" no  "$target_absent_says"
+
+rm -rf "$work/operator"; mkdir -p "$work/operator"; : >"$target_foreign"
+run_target_case "target foreign path, regular file"      "$target_foreign" no  pass
+
+rm -rf "$work/operator"; mkdir -p "$work/operator"; : >"$target_foreign"
+run_target_case "target foreign path, source supplied"   "$target_foreign" yes "$target_source_says"

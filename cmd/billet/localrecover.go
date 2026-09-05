@@ -140,15 +140,7 @@ func runLocalRecover(ctx context.Context, o recoverOptions) error {
 		LedgerBackend: string(cfg.Server.LedgerBackend()),
 	}
 
-	if cfg.GitHub != nil {
-		target.AppKeyPath = cfg.GitHub.PrivateKeyPath
-		target.GitHub = deployarchive.GitHubIdentity{
-			Org:            cfg.GitHub.Org,
-			AppID:          cfg.GitHub.AppID,
-			ClientID:       cfg.GitHub.ClientID,
-			InstallationID: cfg.GitHub.InstallationID,
-		}
-	}
+	archiveTargets(cfg, &target)
 
 	if o.abandon {
 		return runRecoverAbandon(ctx, archive, target)

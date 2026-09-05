@@ -192,20 +192,49 @@ server:
   #
   # placement: pack
 
+# The GitHub target this deployment serves, and the App that manages its runners.
+#
+# A TARGET IS AN ORGANIZATION OR A REPOSITORY. Write `org:` for an organization,
+# whose runners live in runner groups and whose tiers may be trusted; or
+# `repository: owner/name` for one repository, whose runners are its own — a
+# repository has no runner groups, so every tier under it is untrusted. A
+# personal account cannot own runners at all, so it is served one repository at
+# a time, each as its own target. Exactly one of the two is written.
+#
+# This block is the target named `default`. A deployment serving several
+# organizations or repositories declares the rest under `targets:` below, each
+# with its own App, and every tier then names its target.
 github:
   org: your-org
+  # repository: your-account/your-repo
 
-  # Populated by `billet github-app create --org your-org`.
+  # Populated by `billet github-app create --org your-org` (or --repository).
   #
-  # billet requests exactly two permissions: metadata read, and organization
-  # self-hosted runners read+write. It does not request actions:read, which
-  # would expose workflow runs, logs, and artifacts.
+  # billet requests exactly two permissions: metadata read, and for an
+  # organization self-hosted runners read+write — or for a repository the
+  # repository permission administration:write, which is the only permission
+  # GitHub offers for registering a repository's runners; billet uses it for
+  # nothing else. It does not request actions:read, which would expose workflow
+  # runs, logs, and artifacts.
   #
   # Creating the App does not install it — the CLI walks you through both steps,
   # and installation is where installation_id comes from.
   app_id: 0
   installation_id: 0
   private_key_path: /etc/billet/app-private-key.pem
+
+# Further targets, each an organization or a repository with its own App. One
+# control plane, one fleet, one node-wire authority and one deployment identity
+# serve all of them; only the credential and the scale sets are per target.
+# Names are label-shaped and `default` is the github block above. Each tier
+# names its target with `target:` once there are several.
+#
+# targets:
+#   - name: personal
+#     repository: your-account/your-repo
+#     app_id: 0
+#     installation_id: 0
+#     private_key_path: /etc/billet/app-private-key-personal.pem
 
 # Where `billet local backup` puts a copy that is NOT on the disk it protects.
 #
