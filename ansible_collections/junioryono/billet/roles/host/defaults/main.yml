@@ -2,6 +2,15 @@
 billet_binary_src: "{{ lookup('env', 'BILLET_BINARY_PATH') }}"
 billet_config: {}
 billet_github_private_key_src: "{{ lookup('env', 'BILLET_GITHUB_PRIVATE_KEY_PATH') }}"
+# The FURTHER targets' App private keys, for a deployment that serves several
+# GitHub targets (billet_config.targets): the target's name to a local file
+# holding the key `billet github-app create --target <name>` wrote. Each is
+# installed at /etc/billet/app-private-key-<name>.pem, under the same rule the
+# github block's key follows: the role manages exactly that path, refuses a key
+# for a target whose config names another path, and never replaces a key that
+# is already there. Needed on the first converge only; the installed file is
+# enough afterwards.
+billet_github_target_key_srcs: {}
 
 # The control plane's ENVIRONMENT, rendered to /etc/billet/server.env (0640
 # root:billet) and named by the server unit as an EnvironmentFile.
