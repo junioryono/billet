@@ -163,7 +163,7 @@ jobs:
   # and can change under a consumer; a commit SHA cannot change and gets nothing.
   # Both are supported; neither is called the safe one.
   advance-major:
-    name: Advance the moving v0 tag
+    name: Advance the moving major tag
     needs: [cut, release]
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -174,7 +174,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Point v0 at the accepted release
+      - name: Point the major tag at the accepted release
         env:
           TAG: ${{ needs.cut.outputs.tag }}
         run: |
