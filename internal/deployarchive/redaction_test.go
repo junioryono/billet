@@ -47,6 +47,12 @@ func TestTheKeyBearingRequestTypesRedactOnEveryPath(t *testing.T) {
 				}
 			}
 
+			// %#v reaches Format, which takes precedence over GoString, so the
+			// GoString path is exercised by name.
+			if out := subject.(fmt.GoStringer).GoString(); strings.Contains(out, "SECRETKEYBYTES") {
+				t.Errorf("GoString rendered the key: %s", out)
+			}
+
 			out, err := json.Marshal(subject)
 			if err != nil {
 				t.Fatalf("json.Marshal: %v", err)

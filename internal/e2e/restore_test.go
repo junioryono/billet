@@ -275,7 +275,10 @@ func admitted(t *testing.T, a *alloc.Allocator) map[string]string {
 // appKeyPEM is one throwaway App key. Generated once for the package: 2048 bits
 // per test dominates the runtime and proves nothing extra, since what these
 // tests are about is which BYTES land where.
-var appKeyPEM = sync.OnceValues(func() ([]byte, error) {
+var appKeyPEM = sync.OnceValues(generateAppKeyPEM)
+
+// generateAppKeyPEM mints one throwaway App key in the shape GitHub issues.
+func generateAppKeyPEM() ([]byte, error) {
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		return nil, err
@@ -285,7 +288,7 @@ var appKeyPEM = sync.OnceValues(func() ([]byte, error) {
 		Type:  "RSA PRIVATE KEY",
 		Bytes: x509.MarshalPKCS1PrivateKey(key),
 	}), nil
-})
+}
 
 // backUp captures a deployment exactly as `billet local backup` does: through
 // OpenAdmin, against a control plane that is still RUNNING.
@@ -343,8 +346,10 @@ var (
 )
 
 // secondTargetKey is the second target's App key, generated once so the
-// archive and the assertion after the restore hold the same bytes.
-var secondTargetKey = sync.OnceValues(appKeyPEM)
+// archive and the assertion after the restore hold the same bytes, and
+// generated SEPARATELY from the first so a restore that copied the default key
+// into both destinations could not pass both byte-equality assertions.
+var secondTargetKey = sync.OnceValues(generateAppKeyPEM)
 
 // restoreOnto publishes an archive into a directory that has never held a
 // deployment, through the planner and executor the command drives.
@@ -466,6 +471,14 @@ func TestARestoredDeploymentServesTheFleetThatTrustedTheOldOne(t *testing.T) {
 	key, err := appKeyPEM()
 	if err != nil {
 		t.Fatalf("generate an App key: %v", err)
+	}
+
+	// TWO DIFFERENT KEYS, or the second assertion below proves nothing.
+	if second, err := secondTargetKey(); err != nil {
+		t.Fatalf("the second target's key: %v", err)
+	} else if bytes.Equal(second, key) {
+		t.Fatal("the two targets' fixture keys are identical, so a restore that copied one " +
+			"into both destinations would pass")
 	}
 
 	// ---- The backup, taken against the live plane above.
