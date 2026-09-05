@@ -64,6 +64,8 @@ func launched(t *testing.T, a *Allocator, lease *Lease, node string) {
 // wrongly and invisibly. The catalogue is changed BEFORE the lease terminalizes,
 // so an archive that consulted it would be caught.
 func TestTheArchivedPriceIsTheOneInForceWhenTheShapeWasCharged(t *testing.T) {
+	t.Parallel()
+
 	const before, after = config.USDPerHour(340_000), config.USDPerHour(999_000)
 
 	a := pricedCloudAllocator(t, before)
@@ -105,6 +107,8 @@ func TestTheArchivedPriceIsTheOneInForceWhenTheShapeWasCharged(t *testing.T) {
 // A FALLBACK IS A DIFFERENT PURCHASE AT A DIFFERENT RATE, and the row records
 // the shape that was actually bought.
 func TestAFallbackResizeRecordsTheFallbackShapesPrice(t *testing.T) {
+	t.Parallel()
+
 	a := pricedCloudAllocator(t, 200_000)
 
 	lease, err := a.Reserve(t.Context(), "cloud")
@@ -143,6 +147,8 @@ func TestAFallbackResizeRecordsTheFallbackShapesPrice(t *testing.T) {
 // A HOST-BACKED LEASE BUYS NOTHING: no shape, no price, and the tier request is
 // what it was charged. Its site is still recorded.
 func TestAHostBackedLeaseArchivesItsSiteAndNoPrice(t *testing.T) {
+	t.Parallel()
+
 	a := newBareAllocator(t, Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB},
 		[]config.Tier{tier("small", 2, 4*config.GiB)})
 
@@ -186,6 +192,8 @@ func TestAHostBackedLeaseArchivesItsSiteAndNoPrice(t *testing.T) {
 // launched lease is quarantined instead and resolved from a full load, which
 // would carry the provider whatever the projection said.
 func TestABoundLeaseTheReaperFailsKeepsItsProviderInTheHistory(t *testing.T) {
+	t.Parallel()
+
 	a := pricedCloudAllocator(t, 340_000)
 
 	lease, err := a.Reserve(t.Context(), "cloud")
@@ -223,6 +231,8 @@ func TestABoundLeaseTheReaperFailsKeepsItsProviderInTheHistory(t *testing.T) {
 // A QUARANTINED LEASE RESOLVED LATER KEEPS EVERYTHING TOO, from the full load
 // the resolution makes.
 func TestAQuarantinedLeaseKeepsItsPlacementInTheHistory(t *testing.T) {
+	t.Parallel()
+
 	a := pricedCloudAllocator(t, 340_000)
 
 	lease, err := a.Reserve(t.Context(), "cloud")
@@ -259,6 +269,8 @@ func TestAQuarantinedLeaseKeepsItsPlacementInTheHistory(t *testing.T) {
 // AN ESCROW THE REAPER FAILS OUTRIGHT ALSO KEEPS WHAT IT WAS CHARGED, from the
 // reaper's own projection rather than a loaded lease.
 func TestAnExpiredEscrowArchivesItsChargedShape(t *testing.T) {
+	t.Parallel()
+
 	a := pricedCloudAllocator(t, 340_000)
 
 	lease, err := a.Reserve(t.Context(), "cloud")
@@ -292,6 +304,8 @@ func TestAnExpiredEscrowArchivesItsChargedShape(t *testing.T) {
 }
 
 func TestACacheObservationIsFencedAndValidated(t *testing.T) {
+	t.Parallel()
+
 	a := pricedCloudAllocator(t, 340_000)
 
 	lease, err := a.Reserve(t.Context(), "cloud")
@@ -346,6 +360,8 @@ func TestACacheObservationIsFencedAndValidated(t *testing.T) {
 // a different observation, not an archive from a caller that did not load the
 // columns, not the reaper.
 func TestTheFirstCacheObservationSurvivesEverythingAfterIt(t *testing.T) {
+	t.Parallel()
+
 	a := pricedCloudAllocator(t, 340_000)
 
 	lease, err := a.Reserve(t.Context(), "cloud")
@@ -416,6 +432,8 @@ func TestTheFirstCacheObservationSurvivesEverythingAfterIt(t *testing.T) {
 // EACH HALF IS OBSERVED ON ITS OWN: the image store at boot, the Actions cache
 // at the first request. A second call filling the other half is not a repeat.
 func TestTheTwoHalvesOfACacheObservationArriveSeparately(t *testing.T) {
+	t.Parallel()
+
 	a := pricedCloudAllocator(t, 340_000)
 
 	lease, err := a.Reserve(t.Context(), "cloud")

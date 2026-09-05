@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -339,12 +340,16 @@ func TestAnUnreportedObservationIsResentAfterARestart(t *testing.T) {
 // once.
 func blockedCall(
 	t *testing.T, service *CacheService, session *cacheSession,
-) (entered <-chan struct{}, release func(), done <-chan bool) {
+) (entered <-chan struct{}, release func(), done func() bool) {
 	t.Helper()
 
 	enteredCh := make(chan struct{})
 	releaseCh := make(chan struct{})
-	doneCh := make(chan bool, 1)
+	// doneCh is CLOSED when the call finishes, so every waiter sees it: the
+	// test's own join and the fixture's cleanup both wait on it.
+	doneCh := make(chan struct{})
+
+	var handled atomic.Bool
 
 	var once sync.Once
 	service.SetActionsPolicy(actionsPolicyFunc(func(context.Context, string, string) (bool, error) {
@@ -367,11 +372,13 @@ func blockedCall(
 		"https://"+actionsResultsHost+actionsCreatePath, `{"key":"linux-npm-abc","version":"v1"}`)
 
 	go func() {
-		response, handled := proxy.respond(create, session)
+		defer close(doneCh)
+
+		response, answered := proxy.respond(create, session)
 		if response != nil && response.Body != nil {
 			response.Body.Close()
 		}
-		doneCh <- handled
+		handled.Store(answered)
 	}()
 
 	var releaseOnce sync.Once
@@ -388,7 +395,20 @@ func blockedCall(
 		}
 	})
 
-	return enteredCh, release, doneCh
+	// done waits, bounded, for the call to finish and reports whether the proxy
+	// answered it locally; it may be called any number of times.
+	done = func() bool {
+		select {
+		case <-doneCh:
+			return handled.Load()
+		case <-time.After(10 * time.Second):
+			t.Fatal("the blocked call never finished after its release")
+
+			return false
+		}
+	}
+
+	return enteredCh, release, done
 }
 
 // awaitEntered waits, bounded, for the blocked call to reach the policy read; a
@@ -401,21 +421,6 @@ func awaitEntered(t *testing.T, entered <-chan struct{}) {
 	case <-entered:
 	case <-time.After(10 * time.Second):
 		t.Fatal("the dispatched call never reached the kill-switch read")
-	}
-}
-
-// awaitDone waits, bounded, for the blocked call to finish and reports whether
-// the proxy answered it locally.
-func awaitDone(t *testing.T, done <-chan bool) bool {
-	t.Helper()
-
-	select {
-	case handled := <-done:
-		return handled
-	case <-time.After(10 * time.Second):
-		t.Fatal("the blocked call never finished after its release")
-
-		return false
 	}
 }
 
@@ -485,7 +490,7 @@ func TestSettlementLeavesAnInFlightActionsCallAlone(t *testing.T) {
 	// THE CALL FINISHES INTO A CLOSED SESSION: the handler refuses it, the proxy
 	// hands it to GitHub, and that is the outcome recorded and reported.
 	release()
-	if awaitDone(t, done) {
+	if done() {
 		t.Fatal("a call finishing into a closed session was answered locally")
 	}
 
@@ -568,7 +573,7 @@ func TestARecoveredSessionLeavesWhatItDidNotWitnessUnknown(t *testing.T) {
 	// THE CRASHED PROCESS IS JOINED, and its late write lands in its own
 	// directory, never in a replacement's.
 	release()
-	awaitDone(t, done)
+	done()
 
 	// AND A RECOVERED SESSION WITH NO INTERCEPTION STILL SAYS OFF.
 	plain, plainObserver, _ := observedService(t, &fakeCacheStore{})

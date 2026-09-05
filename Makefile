@@ -48,11 +48,15 @@ test: ## Race-enabled test run, instrumented exactly as CI runs it
 	# transition: "" is not terminal` — and the bug was invisible here while being
 	# reliable under coverage. A local gate that is weaker than CI trains you to
 	# trust it and then be surprised.
-	go test -race -count=1 -covermode=atomic -coverprofile=$(COVERPROFILE) ./...
+	#
+	# -timeout 20m IS PER PACKAGE, and matches CI: internal/alloc alone took
+	# 530s under -race and atomic coverage before migration 49 added fourteen
+	# statements to every test ledger's open, against go test's default of 600s.
+	go test -race -count=1 -timeout 20m -covermode=atomic -coverprofile=$(COVERPROFILE) ./...
 
 .PHONY: cover
 cover: ## Coverage profile + HTML report
-	go test -race -count=1 -coverprofile=$(COVERPROFILE) -covermode=atomic ./...
+	go test -race -count=1 -timeout 20m -coverprofile=$(COVERPROFILE) -covermode=atomic ./...
 	go tool cover -func=$(COVERPROFILE) | tail -1
 	go tool cover -html=$(COVERPROFILE)
 
