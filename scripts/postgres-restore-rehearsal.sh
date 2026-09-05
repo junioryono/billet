@@ -232,8 +232,8 @@ manifest_shape=$(jq -r '[
 ] | join("|")' "${ARCHIVE}/manifest.json") ||
     fail "the archive's manifest is not readable JSON"
 
-test "${manifest_shape}" = "2|true|postgres|${DSN_ENV}|0" ||
-    fail "the manifest reads [${manifest_shape}] and an identity-only archive is [2|true|postgres|${DSN_ENV}|0]"
+test "${manifest_shape}" = "3|true|postgres|${DSN_ENV}|0" ||
+    fail "the manifest reads [${manifest_shape}] and an identity-only archive is [3|true|postgres|${DSN_ENV}|0]"
 
 test -e "${ARCHIVE}/ledger" &&
     fail "the archive holds a ledger directory its manifest says does not exist"
