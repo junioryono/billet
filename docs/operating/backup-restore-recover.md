@@ -1,6 +1,6 @@
 # Backup, restore and recover
 
-A deployment is four things and they are useless apart: the ledger, the deployment identity, the GitHub App private key, and the node-wire certificate authority. A ledger without its identity is a fresh authority that cannot see the compute the old one launched; an identity without the CA cannot issue a node certificate; a CA without the App key cannot get a token. So `billet local backup` captures all four as one unit, and `billet local restore` puts back all four or none.
+A deployment is four things and they are useless apart: the ledger, the deployment identity, the GitHub App private key (one per target, on a deployment serving several), and the node-wire certificate authority. A ledger without its identity is a fresh authority that cannot see the compute the old one launched; an identity without the CA cannot issue a node certificate; a CA without the App key cannot get a token. So `billet local backup` captures all four as one unit, and `billet local restore` puts back all four or none.
 
 ## Backup
 
@@ -65,7 +65,7 @@ An interrupted recovery leaves the directory fenced with a journal, and re-runni
 
 A control plane that starts on an empty state directory does not fail; it creates a **new deployment**, indistinguishable afterwards from a genuine new install, and every node trusting the old CA stops authenticating. The state has to arrive on the new host after its ledger volume is mounted and proved, and before anything starts a server on it. The Ansible host role's `billet_server_prepare_only: true` is that stopping point: it mounts and proves the volume, installs the units with their mount fence, and leaves both services installed, disabled and refused by their own units, so nothing can mint an identity until you have copied one in.
 
-1. Stage the existing App key first (`billet_github_private_key_src`); the role refuses a converge without it, and it must be the same key.
+1. Stage the existing App key first (`billet_github_private_key_src`, and `billet_github_target_key_srcs` for every further target); the role refuses a converge without them, and each must be the same key.
 2. Converge the new host with `billet_server_prepare_only: true`.
 3. Drain the old control plane and wait for the barrier; an interrupted `billet drain --wait` exits 2 and means *not drained*.
 4. Stop the old controller and **disable** it, so a reboot cannot resurrect it.

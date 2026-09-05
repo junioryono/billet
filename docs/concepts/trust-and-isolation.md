@@ -6,6 +6,8 @@ Read this before pointing billet at anything.
 
 GitHub registers a runner into a scale set and may give it any job waiting in that set, so billet never derives authority from `push` versus `pull_request`. Every tier is `trust: untrusted` unless you promote it. A `trusted` tier requires a non-default runner group and an exact `workflows` allowlist; billet reads GitHub's runner-group policy at startup and again before minting each registration, and refuses drift. You remain responsible for those workflows not checking out or executing untrusted revisions.
 
+A trusted tier exists only under an **organization** target. A repository has no runner groups, so nothing on GitHub's side can restrict a pool there, and every tier under a repository target is untrusted: refused at load with `trust: trusted`, `runner_group`, `workflows` or `intercept`, and refused again by the control plane at startup. That also decides which backends can serve a repository target: only those that admit untrusted work in the table below.
+
 **Do not use self-hosted runners with public repositories.** That is [GitHub's own guidance](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/manage-access). Fork pull requests do not receive your secrets, but they get arbitrary code execution on your hardware. billet's microVM backends help, because each job gets its own kernel, but billet does not make running untrusted code on your own machine safe and will not pretend otherwise. Private repositories with controlled workflows are the intended trusted shape.
 
 ## What each backend isolates

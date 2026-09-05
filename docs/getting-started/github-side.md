@@ -44,6 +44,16 @@ Two things happen and the command says so: the App is created, and then it is *i
 
 When it finishes, the App ids are in your config and the private key is saved beside it. **That key is issued once.** GitHub cannot reissue it, and billet will not overwrite it: re-running the command stops rather than minting a second App over the first one's key. Back it up with the rest of the deployment ([Backup and restore](../operating/backup-restore-recover.md)).
 
+## A repository instead of an organization
+
+A deployment can also serve one repository, owned by a personal account or by an organization, with `billet github-app create --repository owner/name`. The differences, stated because each one is a trade:
+
+- The App asks for **repository administration, read and write**, beside metadata read. That is the only permission GitHub offers for registering a repository's runners, and it is far wider than the organization permission; billet uses it for runner registration and nothing else. In GitHub's installation form, choose **Only select repositories** and the one repository, not every repository the account owns.
+- The manifest form is the personal account's when the owner is a user (`github.com/settings/apps/new`); billet resolves the owner's type before opening the browser.
+- A repository has no runner groups, so every tier under a repository target is **untrusted**: no trusted pool, no cache interception. Docker refuses untrusted work, so a repository target needs a backend with a boundary of its own ([Trust and isolation](../concepts/trust-and-isolation.md)).
+
+A second owner, organization or repository, is a second **target** with its own App in the same deployment: `billet github-app create --target NAME --repository owner/name` (or `--org`) writes it as a `targets:` entry, and each tier names the target it belongs to ([Configuration](../reference/configuration.md#targets)).
+
 ## Next
 
 [Your first job](first-job.md): check, start, and run a workflow.

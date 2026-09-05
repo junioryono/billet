@@ -6,7 +6,7 @@
 billet check --config ~/billet.yaml
 ```
 
-This proves the key signs a JWT GitHub accepts, the App is installed on the organization you named, the permissions are exactly what was requested, and, for each trusted tier, that its runner group exists, is workflow-restricted to exactly your list, and grants at least one repository. It validates the config and the state directory too, and it works while a control plane is running, so it is the first thing to run whenever something looks wrong.
+This proves the key signs a JWT GitHub accepts, the App is installed on the organization (or repository) you named, the permissions are exactly what was requested for that scope, and, for each trusted tier, that its runner group exists, is workflow-restricted to exactly your list, and grants at least one repository. It validates the config and the state directory too, and it works while a control plane is running, so it is the first thing to run whenever something looks wrong.
 
 ## Start
 

@@ -6,7 +6,7 @@ Every step below was walked on a throwaway Ubuntu 24.04 host against a real orga
 
 ## What you need
 
-- **A GitHub organization you own.** billet cannot onboard a personal account: the App is created against the organization, and the runners it manages are organization runners. If you are not an owner, an owner has to do the two browser steps.
+- **A GitHub organization you own.** This tutorial uses the Docker backend, which runs only trusted work, and trusted work is a workflow-restricted runner group, which only an organization has. If you are not an owner, an owner has to do the two browser steps. A personal account is served **one repository at a time**, as a repository target (`--repository owner/name`) on a backend that admits untrusted work; [Trust and isolation](../concepts/trust-and-isolation.md) says which, and [ADR-011](../reference/decisions/adr-011-targets-and-repository-scope.md) says why.
 - **A Linux machine with Docker** that you can reach a shell on. A laptop is fine. `billet check` deliberately never touches Docker, so run `docker ps` yourself first: a missing daemon or a socket your user cannot reach only shows up when `billet node` starts.
 - **A browser that can reach the machine's loopback.** App registration completes through a callback on `127.0.0.1`. For a remote machine, forward the port with `ssh -L 8765:127.0.0.1:8765 <host>` and pass `--port 8765` when you create the App. Publishing the port does not work: the callback binds loopback only.
 

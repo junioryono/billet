@@ -17,7 +17,9 @@ Two listeners, on purpose. The node wire (`server.listen`) requires a certificat
 
 ## The GitHub App
 
-billet creates its App through GitHub's manifest flow, so every deployment ends up with the same minimal permissions: metadata read, organization self-hosted runners read and write. No Contents permission; billet cannot read your code. It is not literally "no access": the App can manage runners on your organization, which is a real capability, and every token billet mints is scoped to the App's installation on that organization.
+billet creates its App through GitHub's manifest flow, so every deployment ends up with the same minimal permissions for its scope. For an organization target: metadata read, organization self-hosted runners read and write. For a repository target: metadata read, repository administration read and write, which is the only permission GitHub offers for registering a repository's runners and is far wider than the organization one; billet uses it for that and never for the repository's settings, collaborators or branch protection, and the installation should be on that one repository rather than every repository the owner has. No Contents permission either way; billet cannot read your code. It is not literally "no access": the App can manage runners on its owner, which is a real capability, and every token billet mints is scoped to the App's installation there.
+
+A deployment serving several targets holds one App per target, each verified against its own scope's permission set, each backed up as part of the one archive, and each installed by the host role at its own path. The credential is per target; the control plane, the fleet, the CA and the deployment identity are one ([ADR-011](../reference/decisions/adr-011-targets-and-repository-scope.md)).
 
 ## Secrets, and where they may not appear
 
