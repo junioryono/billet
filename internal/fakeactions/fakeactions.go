@@ -321,3 +321,57 @@ func JitConfigJSON(runnerID int, name, encoded string) map[string]any {
 		"encodedJITConfig": encoded,
 	}
 }
+
+// JobFields are the facts a job message may carry beyond what JobJSON fixes.
+//
+// JobJSON fixes one repository, one owner, one workflow and a run id equal to
+// the request id, which is what every scenario about the lifecycle wants. A
+// replay of a real workload wants each job to carry its own, and a started or
+// completed message has to name the RUNNER GitHub bound the job to, which no
+// other message does. A zero field leaves JobJSON's value in place.
+type JobFields struct {
+	Owner, Repository, WorkflowRef, JobID string
+	RunID                                 int64
+	// RunnerID and RunnerName identify the pool member, and Result is GitHub's
+	// conclusion. All three are read only from started and completed messages.
+	RunnerID   int64
+	RunnerName string
+	Result     string
+}
+
+// Apply sets the fields on a job message JobJSON built, and returns it.
+func (f JobFields) Apply(job map[string]any) map[string]any {
+	if f.Owner != "" {
+		job["ownerName"] = f.Owner
+	}
+
+	if f.Repository != "" {
+		job["repositoryName"] = f.Repository
+	}
+
+	if f.WorkflowRef != "" {
+		job["jobWorkflowRef"] = f.WorkflowRef
+	}
+
+	if f.JobID != "" {
+		job["jobId"] = f.JobID
+	}
+
+	if f.RunID != 0 {
+		job["workflowRunId"] = f.RunID
+	}
+
+	if f.RunnerID != 0 {
+		job["runnerId"] = f.RunnerID
+	}
+
+	if f.RunnerName != "" {
+		job["runnerName"] = f.RunnerName
+	}
+
+	if f.Result != "" {
+		job["result"] = f.Result
+	}
+
+	return job
+}

@@ -615,6 +615,38 @@ func (q *Queries) ReadLease(ctx context.Context, id string) (ReadLeaseRow, error
 	return i, err
 }
 
+const readLeaseCharge = `-- name: ReadLeaseCharge :one
+SELECT COALESCE(node, target_node, '') AS host, vcpu, memory, created_at
+  FROM leases WHERE id = $1
+`
+
+type ReadLeaseChargeRow struct {
+	Host      string
+	Vcpu      int64
+	Memory    int64
+	CreatedAt string
+}
+
+// What one lease has charged the fleet since it was escrowed: the host it is
+// charged to, the shape, and when the charge began.
+//
+// FROM ESCROW, NOT ASSIGNMENT. A lease is charged the moment it is inserted,
+// while it is still a discovery slot nobody has been given, and job_history
+// opens its row only at assignment; a reader auditing what a host carried at
+// an instant has to start the interval here. COALESCE(node, target_node) is
+// the host the arithmetic charges, as everywhere else.
+func (q *Queries) ReadLeaseCharge(ctx context.Context, id string) (ReadLeaseChargeRow, error) {
+	row := q.db.QueryRowContext(ctx, readLeaseCharge, id)
+	var i ReadLeaseChargeRow
+	err := row.Scan(
+		&i.Host,
+		&i.Vcpu,
+		&i.Memory,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const readLeaseClosure = `-- name: ReadLeaseClosure :one
 SELECT l.phase, CAST(COALESCE(h.finished_at, '') AS TEXT) AS finished_at
   FROM leases l

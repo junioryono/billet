@@ -535,6 +535,27 @@ jobs:
           cache: true
       - run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
+  # THE ACCEPTANCE-SIZE REPLAY, IN A JOB OF ITS OWN. internal/replay drives a
+  # trace of job arrivals through the real listener, allocator, placer and node
+  # wire over the simulated backend; the suite in the test job replays three
+  # hundred jobs so every gate carries the determinism and overcommit proofs,
+  # and this job replays the two thousand the issue asks for. Without -race,
+  # because the race-instrumented run of two thousand did not finish inside the
+  # test job's cap on a runner (measured 2026-09-05), and the race detector's
+  # value is already spent on the same code by the three-hundred-job run there.
+  replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go test -count=1 -timeout 15m -run TestAFewThousandJobsReplayInMinutes -v ./internal/replay
+        env:
+          BILLET_REPLAY_JOBS: "2000"
+
   # The binary must build for every platform a node can run on, since nodes are
   # deployed by copying one static file. Cross-compilation is the cheapest way to
   # catch a build-tag mistake before someone hits it on a Mac mini.
@@ -604,6 +625,7 @@ jobs:
         terraform-consumer-floor,
         terraform-lint,
         vuln,
+        replay,
         cross-build,
         docs,
       ]

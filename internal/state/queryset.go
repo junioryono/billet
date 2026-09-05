@@ -140,6 +140,7 @@ type ReadOps interface {
 	ReadJobResult(ctx context.Context, leaseID string) (string, error)
 	ReadJobStarted(ctx context.Context, leaseID string) (bool, error)
 	ReadLease(ctx context.Context, id string) (ledgerdb.ReadLeaseRow, error)
+	ReadLeaseCharge(ctx context.Context, id string) (ledgerdb.ReadLeaseChargeRow, error)
 	ReadLeaseClosure(ctx context.Context, id string) (ledgerdb.ReadLeaseClosureRow, error)
 	ReadLeaseEpoch(ctx context.Context, id string) (int64, error)
 	ReadLeaseJob(ctx context.Context, id string) (ledgerdb.ReadLeaseJobRow, error)

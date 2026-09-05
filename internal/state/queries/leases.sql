@@ -186,6 +186,18 @@ SELECT id, tier, node, target_node, macos_slot, chosen_provider, phase, vcpu, me
  ORDER BY expires_at
  LIMIT CAST(@max_rows AS BIGINT);
 
+-- name: ReadLeaseCharge :one
+-- What one lease has charged the fleet since it was escrowed: the host it is
+-- charged to, the shape, and when the charge began.
+--
+-- FROM ESCROW, NOT ASSIGNMENT. A lease is charged the moment it is inserted,
+-- while it is still a discovery slot nobody has been given, and job_history
+-- opens its row only at assignment; a reader auditing what a host carried at
+-- an instant has to start the interval here. COALESCE(node, target_node) is
+-- the host the arithmetic charges, as everywhere else.
+SELECT COALESCE(node, target_node, '') AS host, vcpu, memory, created_at
+  FROM leases WHERE id = @id;
+
 -- name: ReadLease :one
 -- One lease, whatever phase it is in.
 SELECT id, tier, node, target_node, macos_slot, guest_os, providers, chosen_provider,
