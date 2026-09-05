@@ -1986,6 +1986,7 @@ type probeOutput struct {
 	scanned int
 	ready   chan struct{}
 	seen    bool
+	readErr error
 }
 
 func (p *probeOutput) Write(b []byte) (int, error) {
@@ -2038,13 +2039,27 @@ func (p *probeOutput) sawReadyLine() bool {
 }
 
 // drain copies the candidate's output until the last descriptor on it closes,
-// then says so. A read error is written into the record rather than lost.
+// then says so.
+//
+// A READ ERROR IS NOT A CLOSE. The read ending because the pipe broke says nothing
+// about who still holds it or what was left unread, so the error is kept where
+// the verdict can see it, and the verdict treats it as a could-not-tell.
 func (p *probeOutput) drain(r io.Reader, eof chan<- struct{}) {
 	defer close(eof)
 
 	if _, err := io.Copy(p, r); err != nil {
-		fmt.Fprintf(p, "\n(reading the candidate's output: %v)\n", err)
+		p.mu.Lock()
+		p.readErr = err
+		p.mu.Unlock()
 	}
+}
+
+// readError is the error the drain ended on, or nil for a clean end-of-file.
+func (p *probeOutput) readError() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.readErr
 }
 
 // candidateHoldsOnFlag asks the candidate which probe protocol it speaks, by
@@ -2100,6 +2115,10 @@ func candidateHoldsOnFlag(ctx context.Context, what string) (bool, error) {
 		return false, fmt.Errorf("%w: %s -h exited but something it started still holds its "+
 			"output after %s (exit: %v): %s", hostupgrade.ErrUnsafeToRestore, what,
 			probeUsageWaitDelay, err, usage)
+	case usage.readError() != nil:
+		return false, fmt.Errorf("%w: %s -h: its output could not be read to its end, so what "+
+			"it said and what still holds it are both unknown: %w", hostupgrade.ErrUnsafeToRestore,
+			what, usage.readError())
 	case err != nil:
 		return false, fmt.Errorf("%s -h: the candidate's usage could not be read: %w: %s",
 			what, err, usage)
@@ -2118,10 +2137,14 @@ func candidateHoldsOnFlag(ctx context.Context, what string) (bool, error) {
 // until v0.9.1 this parent waited only for exit, so every self-upgrade hung at
 // this step with the services already stopped (the rollout rehearsal,
 // 2026-09-05). To such a candidate the line means "stop me", the stop is sent,
-// and the stop is never read as a verdict; and the line is the ONLY proof it
-// offers, so one that exits without saying it has proved nothing, whatever its
-// status. A candidate that neither exits nor speaks inside the deadline is a
-// could-not-tell, and a could-not-tell fails the probe rather than passing it.
+// and the candidate answers it the way every release through v0.9.0 does: its
+// lifecycle context ends and it exits ZERO. So its exit status is its verdict
+// there too, and a signalled death is a refusal whoever sent the signal: a probe
+// that died by SIGTERM did not shut down, and one that had to be killed has not
+// proved it can stop. The line is the ONLY proof a legacy candidate offers, so one
+// that exits without saying it has proved nothing, whatever its status. A
+// candidate that neither exits nor speaks inside the deadline is a could-not-tell,
+// and a could-not-tell fails the probe rather than passing it.
 //
 // THE CANDIDATE IS NOT REAPED UNTIL THE LAST SIGNAL IT MIGHT BE SENT HAS GONE. A
 // pid is anchored for as long as its process is unreaped, zombie included, so a
@@ -2190,7 +2213,6 @@ func (h *ledgerHost) runCandidate(ctx context.Context, args ...string) error {
 	go out.drain(reader, eof)
 
 	var (
-		stopped bool
 		stopErr error
 		reaped  bool
 	)
@@ -2204,7 +2226,6 @@ func (h *ledgerHost) runCandidate(ctx context.Context, args ...string) error {
 		// no reaping yet, so a stop sent below reaches the candidate and only it.
 		select {
 		case <-out.ready:
-			stopped = true
 			stopErr = signalHandle(cmd, syscall.SIGTERM)
 
 			grace := time.NewTimer(probeStopGrace)
@@ -2239,14 +2260,28 @@ func (h *ledgerHost) runCandidate(ctx context.Context, args ...string) error {
 	closed := awaitClosed(eof, probeOutputGrace)
 	ready := out.sawReadyLine()
 
+	// THE UNSAFE VERDICTS COME FIRST, ahead of any reading of what the candidate
+	// said or how it exited, because they are about whether anything of it is
+	// still alive, and nothing may be restored over a process that is.
 	switch {
 	case !reaped:
-		// NOT ROLLED BACK OVER. A candidate sent SIGKILL whose exit never arrived
-		// is one the kernel is holding, and restoring the ledger under a process
-		// that may still have it open is the one outcome worse than this.
+		// A candidate sent SIGKILL whose exit never arrived is one the kernel is
+		// holding, and restoring the ledger under a process that may still have
+		// it open is the one outcome worse than this.
 		return fmt.Errorf("%w: %s was sent SIGKILL and its exit never arrived within %s "+
 			"(stop signal: %v): %s", hostupgrade.ErrUnsafeToRestore, what, probeOutputGrace,
 			stopErr, out)
+	case !closed:
+		// The open output proves a descendant exists; it cannot prove that
+		// descendant never opened the ledger. Whatever else this candidate did,
+		// that is what decides.
+		return fmt.Errorf("%w: %s has gone but something it started still holds its output "+
+			"after %s (exit: %v, said ready: %t): %s", hostupgrade.ErrUnsafeToRestore, what,
+			probeOutputGrace, err, ready, out)
+	case out.readError() != nil:
+		return fmt.Errorf("%w: %s: its output could not be read to its end, so what it said "+
+			"and what still holds it are both unknown: %w", hostupgrade.ErrUnsafeToRestore, what,
+			out.readError())
 	case holdsOnFlag && ready:
 		// READ FROM THE CLOSED OUTPUT, not from which channel a select picked while
 		// the candidate ran, so a fixed candidate that printed the line and exited
@@ -2261,25 +2296,12 @@ func (h *ledgerHost) runCandidate(ctx context.Context, args ...string) error {
 			"readiness line, and this one never did (exit: %v): %s", what, holdFlagName, err, out)
 	}
 
-	if err := judgeExit(ctx, what, err, out, stopped, ready); err != nil {
+	if err := judgeExit(ctx, what, err, out, ready); err != nil {
 		if stopErr != nil {
-			err = fmt.Errorf("%w (and the stop signal answered: %w)", err, stopErr)
-		}
-
-		if !closed {
-			// A REFUSAL WITH SOMETHING STILL ALIVE BEHIND IT IS NOT ROLLED BACK
-			// OVER EITHER. The open output proves a descendant exists; it cannot
-			// prove that descendant never opened the ledger.
-			return fmt.Errorf("%w: %s refused and something it started still holds its "+
-				"output: %w", hostupgrade.ErrUnsafeToRestore, what, err)
+			return fmt.Errorf("%w (and the stop signal answered: %w)", err, stopErr)
 		}
 
 		return err
-	}
-
-	if !closed {
-		return fmt.Errorf("%w: %s exited but left a process holding its output for %s: %s",
-			hostupgrade.ErrUnsafeToRestore, what, probeOutputGrace, out)
 	}
 
 	return nil
@@ -2325,11 +2347,10 @@ func awaitClosed(eof <-chan struct{}, within time.Duration) bool {
 
 // judgeExit reads the candidate's own exit as its verdict. The deadline is read
 // first, because an answer that arrives as the bound closes is a could-not-tell
-// and the bound is a bound; then zero passes; then a stop this probe asked for is
-// no verdict at all; then anything else is the candidate refusing.
-func judgeExit(
-	ctx context.Context, what string, err error, out *probeOutput, stopped, ready bool,
-) error {
+// and the bound is a bound; then zero passes; then anything else is the candidate
+// refusing, a death by signal included. A stop this probe sent is answered by a
+// legacy candidate with a zero exit, so there is no signal it is right to forgive.
+func judgeExit(ctx context.Context, what string, err error, out *probeOutput, ready bool) error {
 	switch {
 	case errors.Is(ctx.Err(), context.DeadlineExceeded) && ready:
 		return fmt.Errorf("%s: reported ready but neither exited nor stopped within %s: %s",
@@ -2341,13 +2362,6 @@ func judgeExit(
 		return fmt.Errorf("%s: interrupted: %w", what, ctx.Err())
 	case err == nil:
 		return nil
-	}
-
-	if exit, ok := errors.AsType[*exec.ExitError](err); ok && stopped {
-		if status, ok := exit.Sys().(syscall.WaitStatus); ok && status.Signaled() &&
-			(status.Signal() == syscall.SIGTERM || status.Signal() == syscall.SIGKILL) {
-			return nil
-		}
 	}
 
 	return fmt.Errorf("%s: %w: %s", what, err, out)

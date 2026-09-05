@@ -583,7 +583,8 @@
 # alone; from v0.9.1 a probe exits once ready unless told to hold, and this unit
 # needs it to hold. A deliberate downgrade (billet_allow_downgrade) renders the
 # older shape, which is why the candidate is asked rather than the version assumed.
-# BOUNDED AND JUDGED. `timeout` ends a usage that hangs, and a non-zero exit fails
+# BOUNDED AND JUDGED. `timeout` ends a usage that hangs, killing one that ignores
+# the TERM it sends first, and a non-zero exit fails
 # the converge here, before a single service is stopped: every release prints its
 # usage and exits zero, so a candidate that cannot is one that would fail its own
 # probe later, with the host already drained.
@@ -591,6 +592,8 @@
   ansible.builtin.command:
     argv:
       - timeout
+      - -k
+      - "10"
       - "60"
       - "{{ billet_upgrade_recovery_dir }}/billet.candidate"
       - server
