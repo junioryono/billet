@@ -128,7 +128,8 @@ func TestARealOrphanIsDestroyedAfterACrash(t *testing.T) {
 	}
 }
 
-// Another deployment's containers are invisible, against a real daemon.
+// Another deployment's containers are invisible: against a real daemon on the
+// docker leg, and against a host both deployments share on the simulated one.
 //
 // This is what makes recovery safe to run at all. Two billets on one machine
 // share a hostname and therefore a default node name, and they keep separate

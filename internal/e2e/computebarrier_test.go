@@ -25,8 +25,9 @@ import (
 // alloc's absence grace is five minutes, and it is a real duration rather than a
 // tunable — so a test that established a proof by waiting it out would add five
 // minutes to every run of this package. Everything else here is real: a real
-// control plane, a real node wire, a real node loop and a real container
-// runtime. Only the answer to "has this host been empty long enough" is steered.
+// control plane, a real node wire, a real node loop and, on the docker leg, a
+// real container runtime. Only the answer to "has this host been empty long
+// enough" is steered.
 type offsetClock struct {
 	mu     sync.Mutex
 	offset time.Duration
@@ -160,9 +161,10 @@ func (s *stack) ask(t *testing.T, barrierID string) {
 // find it. It is also exactly the window the barrier exists for: the host that
 // would sweep the stray away is the host being stopped.
 //
-// Nothing here is simulated. The stray is a real container under billet's own
-// name shape, the inventory travels the real node wire as a real command, and
-// the list comes back out of a real container runtime.
+// The inventory travels the real node wire as a real command on both legs. On
+// the docker leg the stray is a real container under billet's own name shape and
+// the list comes back out of a real container runtime; on the simulated leg it
+// is the backend's own record, listed the same way.
 func TestTheBarrierSeesRealComputeWhoseLeaseIsGone(t *testing.T) {
 	for _, b := range backends() {
 		t.Run(b.name, func(t *testing.T) {

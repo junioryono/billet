@@ -1,5 +1,6 @@
 // Package e2e drives the whole of billet against a fake Actions service and a
-// real container backend.
+// compute backend: the real docker one, or the simulated one that starts no
+// compute.
 //
 // Every other suite tests one seam. This one tests the relationships between
 // them, which is where the defects that survived unit tests have all lived: a
@@ -423,11 +424,15 @@ type backend struct {
 // subtests: `for _, b := range backends() { t.Run(b.name, ...) }`.
 //
 // THE SCENARIOS THAT DO THIS ARE ABOUT THE PLANE AND THE WIRE, and reach the
-// backend only through the provider contract. Running each over docker AND over
-// the simulated backend proves that, and gives the suite a run on a machine with
-// no daemon: the docker leg skips there and the simulated leg never does. Only
-// the docker leg says anything about a real runtime; a claim in a scenario's
-// comment about a REAL container is a claim about that leg.
+// backend, where they reach it at all, only through the provider contract.
+// Running each over docker AND over the simulated backend gives the suite a run
+// on a machine with no daemon (the docker leg skips there and the simulated leg
+// never does), and for a scenario that launches compute it also proves the
+// scenario measures the plane rather than the runtime. A scenario that never
+// launches anything (the acknowledgement order, the scale-set label, the
+// unreachable host) gains only the daemon-free run. Only the docker leg says
+// anything about a real runtime; a claim in a scenario's comment about a REAL
+// container is a claim about that leg.
 //
 // A Host per call, so each scenario's simulated leg has one of its own that
 // every stack the scenario builds shares: a restart re-adopts what the previous

@@ -137,10 +137,12 @@ func TestAPullRequestIsRefusedBeforeAnythingIsMinted(t *testing.T) {
 			s.plane.queue(fakeactions.StatisticsJSON(0, 1),
 				fakeactions.JobJSON("JobAssigned", 4002, "pull_request", testTier))
 
-			// Give it long enough that a container would have appeared if it were going
-			// to. There is no positive signal for "nothing happened", so this is a wait
-			// rather than a poll.
-			time.Sleep(3 * time.Second)
+			// THE ASSIGNMENT WAS HANDLED, proved by its acknowledgement: the listener acks
+			// a message only after acting on it, and the fake keeps an unacknowledged
+			// head in place. Asserting "nothing happened" after a sleep would pass while
+			// the assignment sat undelivered behind an unacknowledged offer. Message 2
+			// is the JobAssigned.
+			awaitAck(t, s, 2)
 
 			instances, err := s.provider.List(t.Context())
 			if err != nil {
@@ -204,6 +206,12 @@ func TestRefusedWorkReturnsItsCapacity(t *testing.T) {
 				s.plane.queue(fakeactions.StatisticsJSON(0, 1),
 					fakeactions.JobJSON("JobAssigned", id, "pull_request", testTier))
 			}
+
+			// THE LAST ASSIGNMENT WAS HANDLED TOO. Acquiring each next job proves the
+			// refusals before it returned their capacity, but nothing follows the sixth,
+			// so its acknowledgement is what proves it was refused rather than left
+			// sitting. Six offer-and-assign pairs make it message 12.
+			awaitAck(t, s, 2*refusals)
 
 			// And nothing ran, which is the other half: bidding freely would be no
 			// comfort if the refusal had stopped working.
@@ -308,9 +316,11 @@ func TestTheSameJobIsNotStartedTwiceWhenAMessageIsRedelivered(t *testing.T) {
 			s.plane.queue(fakeactions.StatisticsJSON(0, 1),
 				fakeactions.JobJSON("JobAssigned", 4005, "push", testTier))
 
-			// Long enough for a second container to have appeared if billet were going to
-			// start one. There is no positive signal for "nothing happened".
-			time.Sleep(3 * time.Second)
+			// THE DUPLICATE WAS CONSUMED, proved by its acknowledgement rather than by a
+			// sleep: a listener that ignored the redelivery, or left it redelivering
+			// forever, would show one running container either way. Message 3 is the
+			// second JobAssigned.
+			awaitAck(t, s, 3)
 
 			instances, err := s.provider.List(t.Context())
 			if err != nil {

@@ -48,11 +48,7 @@ func TestAJobRunsOnANodeAcrossTheWire(t *testing.T) {
 			// executed it, the JIT registration was minted BY THE CONTROL PLANE and
 			// carried back, and the lease operations behind all of that went over HTTP
 			// rather than through a function call.
-			names := s.awaitOneRunning(t)
-
-			if len(names) != 1 {
-				t.Fatalf("expected one container started across the wire, got %v", names)
-			}
+			s.awaitOneRunning(t)
 
 			s.plane.queue(fakeactions.StatisticsJSON(0, 0),
 				fakeactions.JobJSON("JobCompleted", 4001, "push", testTier))
