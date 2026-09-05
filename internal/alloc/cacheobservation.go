@@ -48,11 +48,15 @@ func (c ImageCache) Valid() bool {
 }
 
 // ActionsCache is what the Actions cache interception did for the FIRST
-// CacheService request a job made, as the node saw it.
+// CacheService call of a job whose disposition was recorded, as the node saw
+// it.
 //
 // RECORDED WHEN THE DISPOSITION IS FINAL, not when it is intended: a call the
 // site store failed to answer is retried through GitHub, and what the guest
-// got was a splice, whatever billet set out to do.
+// got was a splice, whatever billet set out to do. A job's calls run
+// concurrently, so the one recorded first is the one that finished first, not
+// necessarily the one dispatched first; either is an honest account of a call
+// this job made.
 type ActionsCache string
 
 const (

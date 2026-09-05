@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -330,12 +331,62 @@ func TestAnUnreportedObservationIsResentAfterARestart(t *testing.T) {
 	}
 }
 
+// blockedCall dispatches one CacheService call through the real proxy and
+// holds it inside the kill-switch read until released, so a test can look at
+// the session while the call is in flight. The policy blocks the FIRST call
+// only; later calls, such as the ones cleanup's settlement makes, answer at
+// once.
+func blockedCall(
+	t *testing.T, service *CacheService, session *cacheSession,
+) (entered <-chan struct{}, release func(), done <-chan bool) {
+	t.Helper()
+
+	enteredCh := make(chan struct{})
+	releaseCh := make(chan struct{})
+	doneCh := make(chan bool, 1)
+
+	var once sync.Once
+	service.SetActionsPolicy(actionsPolicyFunc(func(context.Context, string, string) (bool, error) {
+		first := false
+		once.Do(func() { first = true })
+		if first {
+			close(enteredCh)
+			<-releaseCh
+		}
+
+		return true, nil
+	}))
+
+	proxy := service.actionsProxy()
+	if proxy == nil {
+		t.Fatal("the intercepting session has no proxy")
+	}
+
+	create := actionsRequestForTest(t, http.MethodPost,
+		"https://"+actionsResultsHost+actionsCreatePath, `{"key":"linux-npm-abc","version":"v1"}`)
+
+	go func() {
+		response, handled := proxy.respond(create, session)
+		if response != nil && response.Body != nil {
+			response.Body.Close()
+		}
+		doneCh <- handled
+	}()
+
+	var releaseOnce sync.Once
+
+	return enteredCh, func() { releaseOnce.Do(func() { close(releaseCh) }) }, doneCh
+}
+
 // A CALL STILL BEING ANSWERED IS NOT SETTLED AS UNUSED. The proxy marks a
-// CacheService call in flight before it is dispatched and clears the mark once
-// its outcome is recorded; a settlement in between leaves the Actions half
-// alone, the outcome recorded afterwards is reported with the lease the
-// session carries, and a session cleanup has already finished is not written
-// back to disk as an orphan.
+// CacheService call in flight, durably for the first one, before it is
+// dispatched, and clears the mark once its outcome is recorded; a settlement in
+// between leaves the Actions half alone, the outcome recorded afterwards is
+// reported with the lease the session carries, and a session cleanup has
+// already finished is not written back to disk as an orphan.
+//
+// DRIVEN THROUGH THE PROXY, so a dispatch that stopped marking the call would
+// fail this rather than a helper called by hand.
 func TestSettlementLeavesAnInFlightActionsCallAlone(t *testing.T) {
 	t.Parallel()
 
@@ -344,7 +395,9 @@ func TestSettlementLeavesAnInFlightActionsCallAlone(t *testing.T) {
 	service.SetCacheObserver(observer)
 	recordPath := filepath.Join(service.stateDir, session.token+".json")
 
-	service.beginActionsCall(session)
+	entered, release, done := blockedCall(t, service, session)
+	defer release()
+	<-entered
 
 	// THE FIRST CALL IS MARKED DURABLY BEFORE IT IS DISPATCHED.
 	if record := sessionRecord(t, service, session.token); !record.Observed.ActionsPending {
@@ -365,11 +418,15 @@ func TestSettlementLeavesAnInFlightActionsCallAlone(t *testing.T) {
 		t.Fatalf("the session record survived its cleanup: %v", err)
 	}
 
-	service.observeActions(t.Context(), session, alloc.ActionsCacheServed)
-	service.endActionsCall(session)
+	// THE CALL FINISHES INTO A CLOSED SESSION: the handler refuses it, the proxy
+	// hands it to GitHub, and that is the outcome recorded and reported.
+	release()
+	if handled := <-done; handled {
+		t.Fatal("a call finishing into a closed session was answered locally")
+	}
 
 	calls = observer.recorded()
-	want := alloc.CacheObservation{ImageCache: alloc.ImageCacheUnused, ActionsCache: alloc.ActionsCacheServed}
+	want := alloc.CacheObservation{ImageCache: alloc.ImageCacheUnused, ActionsCache: alloc.ActionsCacheSpliced}
 	if len(calls) != 2 || calls[1].obs != want {
 		t.Fatalf("the late outcome was reported as %+v, want %+v", calls, want)
 	}
@@ -396,8 +453,11 @@ func TestAnInterruptedFirstActionsCallStaysUnknownAfterARestart(t *testing.T) {
 	service, storage, session, _ := testActionsService(t)
 	service.SetCacheObserver(&recordingObserver{})
 
-	// The crash: the call is dispatched and never returns; the process is gone.
-	service.beginActionsCall(session)
+	// The crash: the call is dispatched through the proxy and never returns
+	// while the "next process" below loads what the record says.
+	entered, release, _ := blockedCall(t, service, session)
+	defer release()
+	<-entered
 
 	restarted, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", service.rootState,
 		storage, &fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
@@ -449,12 +509,21 @@ func TestASessionRefusesALeaseThatNamesAnotherInstance(t *testing.T) {
 		t.Errorf("PrepareScoped refused a session naming no lease: %v", err)
 	}
 
-	// AND ON LOAD, where the record is whatever is on disk.
+	// AND ON LOAD, where the record is whatever is on disk. The token and the
+	// filename pass the earlier checks, so the lease check is the one that
+	// decides.
+	token := strings.Repeat("ab", 32)
 	record := durableCacheSession{
-		Token: "aa", Instance: "billet-other", Trust: provider.TrustTrusted, LeaseID: "two",
+		Token: token, Instance: "billet-other", Trust: provider.TrustTrusted, LeaseID: "two",
 	}
-	if err := record.valid("aa.json"); err == nil {
-		t.Error("a record whose lease names another instance loaded")
+	err := record.valid(token + ".json")
+	if err == nil || !strings.Contains(err.Error(), "names a different instance") {
+		t.Errorf("a record whose lease names another instance loaded, or was refused for another "+
+			"reason: %v", err)
+	}
+	record.LeaseID = "other"
+	if err := record.valid(token + ".json"); err != nil {
+		t.Errorf("a record whose lease names its own instance was refused: %v", err)
 	}
 }
 
