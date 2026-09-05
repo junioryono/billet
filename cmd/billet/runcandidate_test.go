@@ -2,6 +2,9 @@ package main
 
 import (
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -80,6 +83,17 @@ func shortOutputGrace(t *testing.T) {
 	probeOutputGrace = 2 * time.Second
 
 	t.Cleanup(func() { probeOutputGrace = previous })
+}
+
+// shortUsageBounds cuts the usage question's deadline and its waits, for the
+// tests whose -h leaves a holder on its output on purpose.
+func shortUsageBounds(t *testing.T) {
+	t.Helper()
+
+	previousDeadline, previousDelay := probeUsageDeadline, probeUsageWaitDelay
+	probeUsageDeadline, probeUsageWaitDelay = 2*time.Second, 1*time.Second
+
+	t.Cleanup(func() { probeUsageDeadline, probeUsageWaitDelay = previousDeadline, previousDelay })
 }
 
 func recordedPID(t *testing.T, path string) int {
@@ -332,6 +346,7 @@ func TestRunCandidateCordonsAFixedProbeThatPrintsTheLineBehindAHolder(t *testing
 
 	fixedCandidate(t, "sleep 60 &\necho $! > \"$BILLET_TEST_GRANDCHILD_PIDFILE\"\n"+
 		"echo '"+serverProbeReadyLine+"'\nexit 0")
+	shortDeadline(t, 2*time.Second)
 	shortOutputGrace(t)
 
 	err := (&ledgerHost{}).runCandidate(t.Context(), "server")
@@ -455,10 +470,11 @@ func TestRunCandidateRefusesACandidateWhoseUsageLeavesAProcessOnItsOutput(t *tes
 		t.Fatal(err)
 	}
 
-	previous, previousDelay := installedBinary, probeUsageWaitDelay
-	installedBinary, probeUsageWaitDelay = path, 1*time.Second
+	previous := installedBinary
+	installedBinary = path
 
-	t.Cleanup(func() { installedBinary, probeUsageWaitDelay = previous, previousDelay })
+	t.Cleanup(func() { installedBinary = previous })
+	shortUsageBounds(t)
 
 	started := time.Now()
 
@@ -498,10 +514,11 @@ func TestRunCandidateCordonsWhenAFailedUsageLeavesAProcessOnItsOutput(t *testing
 		t.Fatal(err)
 	}
 
-	previous, previousDelay := installedBinary, probeUsageWaitDelay
-	installedBinary, probeUsageWaitDelay = path, 1*time.Second
+	previous := installedBinary
+	installedBinary = path
 
-	t.Cleanup(func() { installedBinary, probeUsageWaitDelay = previous, previousDelay })
+	t.Cleanup(func() { installedBinary = previous })
+	shortUsageBounds(t)
 
 	err := (&ledgerHost{}).runCandidate(t.Context(), "server")
 
@@ -509,5 +526,48 @@ func TestRunCandidateCordonsWhenAFailedUsageLeavesAProcessOnItsOutput(t *testing
 
 	if !errors.Is(err, hostupgrade.ErrUnsafeToRestore) {
 		t.Fatalf("a failed usage with a live descendant did not cordon: %v", err)
+	}
+}
+
+// THE DEADLINE IS THE PROBE'S OWN, NEVER exec.CommandContext's. exec's deadline
+// kill runs beside its Wait, and on a kernel without pidfd that is a signal to a
+// number the Wait may just have freed; the two functions that run the candidate
+// keep the deadline themselves and send every signal through the handle before
+// the one Wait. Asserted on the source, because a pid reuse cannot be staged.
+func TestTheCandidateIsNeverRunUnderExecsOwnDeadline(t *testing.T) {
+	file, err := parser.ParseFile(token.NewFileSet(), "hostupgrade.go", nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	seen := map[string]bool{}
+
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || (fn.Name.Name != "runCandidate" && fn.Name.Name != "candidateHoldsOnFlag") {
+			continue
+		}
+
+		seen[fn.Name.Name] = true
+
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			sel, ok := n.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+
+			if pkg, ok := sel.X.(*ast.Ident); ok && pkg.Name == "exec" && sel.Sel.Name == "CommandContext" {
+				t.Errorf("%s runs the candidate under exec.CommandContext, whose deadline kill races "+
+					"its Wait", fn.Name.Name)
+			}
+
+			return true
+		})
+	}
+
+	for _, name := range []string{"runCandidate", "candidateHoldsOnFlag"} {
+		if !seen[name] {
+			t.Errorf("%s was not found in hostupgrade.go", name)
+		}
 	}
 }

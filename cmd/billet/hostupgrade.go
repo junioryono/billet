@@ -1960,6 +1960,11 @@ var probeStopGrace = 10 * time.Second
 // tests.
 var probeUsageWaitDelay = 10 * time.Second
 
+// probeUsageDeadline bounds the usage question itself: a -h that has neither
+// exited nor closed its output by then is killed and refused. A variable for the
+// tests.
+var probeUsageDeadline = 30 * time.Second
+
 // probeOutputGrace bounds how long the candidate's output may stay open after
 // the candidate itself has exited. A descriptor still open then belongs to a
 // process that kept the candidate's output, which this probe will not hunt by
@@ -2075,7 +2080,7 @@ func (p *probeOutput) readError() error {
 // candidate, which cordons rather than being rolled back over, because a pipe can
 // prove it exists and cannot prove it never opened the ledger.
 func candidateHoldsOnFlag(ctx context.Context, what string) (bool, error) {
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, probeUsageDeadline)
 	defer cancel()
 
 	reader, writer, err := os.Pipe()
@@ -2088,7 +2093,11 @@ func candidateHoldsOnFlag(ctx context.Context, what string) (bool, error) {
 	usage := &probeOutput{ready: make(chan struct{})}
 	eof := make(chan struct{})
 
-	cmd := exec.CommandContext(ctx, installedBinary, what, "-h")
+	// NOT exec.CommandContext: its deadline kill runs beside its Wait, and on a
+	// kernel without pidfd that is a signal to a number the Wait may just have
+	// freed (Go's own os package says so). The deadline is kept here and every
+	// signal goes through the handle before the one Wait.
+	cmd := exec.Command(installedBinary, what, "-h") //nolint:noctx // see above: the deadline is kept here, its kill precedes the one Wait
 	cmd.Stdout = writer
 	cmd.Stderr = writer
 
@@ -2102,15 +2111,23 @@ func candidateHoldsOnFlag(ctx context.Context, what string) (bool, error) {
 
 	go usage.drain(reader, eof)
 
-	// NOTHING IS SIGNALLED HERE, so the reaping may run at once; exec kills the
-	// usage if the deadline passes, and the reaping is bounded all the same.
-	reaped, err := reap(ctx, cmd, probeUsageWaitDelay)
+	// THE OUTPUT CLOSING OR THE DEADLINE, then SIGKILL through the handle while
+	// the usage is still unreaped, then the one Wait. A -h that has exited is a
+	// zombie the kill cannot hurt; one still running past its bound is refused.
+	select {
+	case <-eof:
+	case <-ctx.Done():
+	}
+
+	killErr := signalHandle(cmd, syscall.SIGKILL)
+	reaped, err := reap(cmd, probeUsageWaitDelay)
 	closed := awaitClosed(eof, probeUsageWaitDelay)
 
 	switch {
 	case !reaped:
-		return false, fmt.Errorf("%w: %s -h was killed and its exit never arrived within %s: %s",
-			hostupgrade.ErrUnsafeToRestore, what, probeUsageWaitDelay, usage)
+		return false, fmt.Errorf("%w: %s -h was sent SIGKILL and its exit never arrived within %s "+
+			"(kill: %v): %s", hostupgrade.ErrUnsafeToRestore, what, probeUsageWaitDelay, killErr,
+			usage)
 	case !closed:
 		return false, fmt.Errorf("%w: %s -h exited but something it started still holds its "+
 			"output after %s (exit: %v): %s", hostupgrade.ErrUnsafeToRestore, what,
@@ -2119,6 +2136,9 @@ func candidateHoldsOnFlag(ctx context.Context, what string) (bool, error) {
 		return false, fmt.Errorf("%w: %s -h: its output could not be read to its end, so what "+
 			"it said and what still holds it are both unknown: %w", hostupgrade.ErrUnsafeToRestore,
 			what, usage.readError())
+	case ctx.Err() != nil:
+		return false, fmt.Errorf("%s -h: the candidate's usage neither finished nor closed its "+
+			"output within %s: %w: %s", what, probeUsageDeadline, ctx.Err(), usage)
 	case err != nil:
 		return false, fmt.Errorf("%s -h: the candidate's usage could not be read: %w: %s",
 			what, err, usage)
@@ -2150,12 +2170,16 @@ func candidateHoldsOnFlag(ctx context.Context, what string) (bool, error) {
 // pid is anchored for as long as its process is unreaped, zombie included, so a
 // signal sent before Wait cannot reach anything but the candidate, on every
 // platform; a signal sent after Wait is a number that may be somebody else's.
-// So Wait runs only once no further signal will follow, and the deadline's own
-// kill is exec's, sent while exec still holds the process. Nothing is ever
-// signalled by process-group number. A legacy candidate is always sent SIGKILL
-// before it is reaped, because its output closing proves nothing about it being
-// gone; and a candidate whose exit never arrives after that is one the kernel is
-// holding, which cordons the host rather than being rolled back over.
+// So Wait runs only once no further signal will follow, and the deadline is this
+// function's rather than exec.CommandContext's, whose kill runs beside its Wait
+// and, on a kernel without pidfd, is a signal to a number the Wait may just have
+// freed (Go's own os package says so). Nothing is ever signalled by
+// process-group number. Every candidate is sent SIGKILL before it is reaped,
+// because its output closing proves nothing about it being gone: one that exited
+// is a zombie the kill cannot change, one that closed its output and kept running
+// is killed and refused. A candidate whose exit never arrives after that is one
+// the kernel is holding, which cordons the host rather than being rolled back
+// over.
 //
 // Anything that still holds the candidate's output when the candidate has gone
 // is found by that output staying open, and it is a live descendant, so the host
@@ -2193,7 +2217,9 @@ func (h *ledgerHost) runCandidate(ctx context.Context, args ...string) error {
 	out := &probeOutput{ready: make(chan struct{})}
 	eof := make(chan struct{})
 
-	cmd := exec.CommandContext(ctx, installedBinary, args...)
+	// NOT exec.CommandContext, for the reason candidateHoldsOnFlag gives: the
+	// deadline is this function's, and its kill goes through the handle before Wait.
+	cmd := exec.Command(installedBinary, args...) //nolint:noctx // see above: the deadline is kept here, its kill precedes the one Wait
 	cmd.Stdout = writer
 	cmd.Stderr = writer
 	// THE CANDIDATE DECIDES BY ITS FLAG, NOT BY WHAT IT INHERITS, and a socket
@@ -2212,15 +2238,15 @@ func (h *ledgerHost) runCandidate(ctx context.Context, args ...string) error {
 
 	go out.drain(reader, eof)
 
-	var (
-		stopErr error
-		reaped  bool
-	)
+	var stopErr error
 
 	if holdsOnFlag {
-		// NOTHING IS EVER SIGNALLED HERE, so the candidate may be reaped at once;
-		// exec kills it if the deadline passes, and the reaping is still bounded.
-		reaped, err = reap(ctx, cmd, probeOutputGrace)
+		// A FIXED CANDIDATE IS NEVER SIGNALLED WHILE IT RUNS: it exits by itself,
+		// and its output closing is the first sign of that, or the deadline is.
+		select {
+		case <-eof:
+		case <-ctx.Done():
+		}
 	} else {
 		// THE LINE, OR THE OUTPUT CLOSING, OR THE DEADLINE, whichever comes first;
 		// no reaping yet, so a stop sent below reaches the candidate and only it.
@@ -2239,19 +2265,17 @@ func (h *ledgerHost) runCandidate(ctx context.Context, args ...string) error {
 		case <-eof:
 		case <-ctx.Done():
 		}
-
-		// SIGKILL EVERY TIME, because the output closing proved only that the
-		// output closed, and a candidate that exited on SIGTERM is a zombie the
-		// kill cannot hurt. Then, with every signal behind us, the reaping.
-		if e := signalHandle(cmd, syscall.SIGKILL); e != nil && stopErr == nil {
-			stopErr = e
-		}
-
-		killed, cancelKilled := context.WithCancel(ctx)
-		cancelKilled()
-
-		reaped, err = reap(killed, cmd, probeOutputGrace)
 	}
+
+	// SIGKILL EVERY TIME, because the output closing proved only that the output
+	// closed: a candidate that exited, on the stop or on its own, is a zombie the
+	// kill cannot hurt, and one still running past its bound is not left behind
+	// the transaction. Then, with every signal behind us, the one Wait.
+	if e := signalHandle(cmd, syscall.SIGKILL); e != nil && stopErr == nil {
+		stopErr = e
+	}
+
+	reaped, err := reap(cmd, probeOutputGrace)
 
 	// THE OUTPUT IS READ TO ITS END BEFORE ANY VERDICT IS WRITTEN, on every path,
 	// because Wait and the drain have no order between them and a quick refusal
@@ -2275,9 +2299,9 @@ func (h *ledgerHost) runCandidate(ctx context.Context, args ...string) error {
 		// The open output proves a descendant exists; it cannot prove that
 		// descendant never opened the ledger. Whatever else this candidate did,
 		// that is what decides.
-		return fmt.Errorf("%w: %s has gone but something it started still holds its output "+
-			"after %s (exit: %v, said ready: %t): %s", hostupgrade.ErrUnsafeToRestore, what,
-			probeOutputGrace, err, ready, out)
+		return fmt.Errorf("%w: %s has gone but something it started still holds its output %s "+
+			"after its exit arrived (exit: %v, said ready: %t): %s", hostupgrade.ErrUnsafeToRestore,
+			what, probeOutputGrace, err, ready, out)
 	case out.readError() != nil:
 		return fmt.Errorf("%w: %s: its output could not be read to its end, so what it said "+
 			"and what still holds it are both unknown: %w", hostupgrade.ErrUnsafeToRestore, what,
@@ -2307,19 +2331,14 @@ func (h *ledgerHost) runCandidate(ctx context.Context, args ...string) error {
 	return nil
 }
 
-// reap waits for the candidate's exit: for as long as ctx allows, during which
-// exec kills the candidate if the deadline passes, and then patience more for the
-// kernel to let it go. false means the candidate could not be proved gone.
-func reap(ctx context.Context, cmd *exec.Cmd, patience time.Duration) (bool, error) {
+// reap waits, once the last signal the candidate might be sent has gone, for the
+// kernel to hand over its exit. false means the candidate could not be proved
+// gone; the abandoned Wait is then the one thing left running, and it signals
+// nothing.
+func reap(cmd *exec.Cmd, patience time.Duration) (bool, error) {
 	done := make(chan error, 1)
 
 	go func() { done <- cmd.Wait() }()
-
-	select {
-	case err := <-done:
-		return true, err
-	case <-ctx.Done():
-	}
 
 	last := time.NewTimer(patience)
 	defer last.Stop()
