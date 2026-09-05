@@ -26,6 +26,7 @@ Never hard-wrap prose at a column. Every paragraph in a `.md` or `.txt` file, a 
 | `internal/awssig`, `awscreds`, `awsjson`, `awspolicy`, `awsquota`, `awss3`, `awsssm`, `awssts` | billet's own SigV4 signer and AWS clients; what S3 said in a refusal; least-privilege IAM generation. |
 | `internal/initconfig`, `internal/wiring`, `internal/version`, `internal/tfclass`, `internal/tfpolicy` | Config generation for `billet init`; assembling the pieces the way the CLI does; the version; Terraform plan classification and IAM drift. |
 | `internal/e2e`, `internal/integration` | The end-to-end suite (real plane, wire and runtime against `fakeactions`) and cross-package boundary tests. |
+| `internal/replay`, `internal/importcheck` | The trace replay harness: a workload driven through the real listener, allocator, placer and node over the simulated backend at compressed time, read back from the ledger; and the one walker that proves a test-side package has no production importer. |
 | `deploy/` | The systemd units, launchd plists, packaged config template and package scripts. |
 | `ansible_collections/junioryono/billet` | The `host` and `development_host` roles and their scenario tests. |
 | `terraform/modules` | The AWS infrastructure modules. |

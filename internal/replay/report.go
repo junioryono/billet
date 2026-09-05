@@ -1,0 +1,809 @@
+package replay
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"maps"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/state"
+)
+
+// Record is what the ledger recorded about one job, joined to the trace line
+// that produced it.
+//
+// EVERYTHING BUT Arrival, Repository, WorkflowRef AND Cost COMES FROM THE
+// LEDGER. The arrival is the trace's fact and the join is on the request id
+// billet recorded; the provider, the charged shape and its price, the site and
+// what the cache did are the history row's own columns (migration 49), written
+// from the lease rather than from any catalogue. Cost is the one derived figure
+// and says where its rate came from.
+type Record struct {
+	Seq         int64  `json:"seq"`
+	LeaseID     string `json:"lease_id"`
+	Tier        string `json:"tier"`
+	Owner       string `json:"owner"`
+	Repository  string `json:"repository"`
+	WorkflowRef string `json:"workflow"`
+	Node        string `json:"node"`
+
+	// Provider, InstanceType, VCPU, Memory and Site are what the lease was
+	// charged for: the backend it ran on, the shape placement bought (empty for a
+	// host-backed backend), the charged vCPU and memory, and the host's site.
+	Provider     string          `json:"provider"`
+	InstanceType string          `json:"instance_type,omitempty"`
+	VCPU         int             `json:"vcpu"`
+	Memory       config.ByteSize `json:"memory"`
+	Site         string          `json:"site,omitempty"`
+	// PriceMicrosPerHour is the rate the shape was charged at when the lease was
+	// escrowed, in millionths of a dollar. Zero means no price was recorded,
+	// which is what a host-backed lease has.
+	PriceMicrosPerHour int64 `json:"price_micros_per_hour"`
+	// Cost is the run's cost in dollars and CostSource says what rate produced
+	// it: "ledger" when the recorded price was positive, "fleet-rate" when the
+	// fleet's per-host rate was applied to the charged vCPU-hours, and "" when
+	// neither was available, in which case Cost is zero and means unknown.
+	Cost       float64 `json:"cost"`
+	CostSource string  `json:"cost_source,omitempty"`
+	// ImageCache, CacheGeneration and ActionsCache are what the node observed the
+	// cache do, in the ledger's closed vocabularies; empty means nothing was
+	// observed, which is what a simulated guest reports.
+	ImageCache      string `json:"image_cache,omitempty"`
+	CacheGeneration string `json:"cache_generation,omitempty"`
+	ActionsCache    string `json:"actions_cache,omitempty"`
+
+	Arrival time.Time `json:"arrival"`
+	// ChargedFrom is when the lease was escrowed, which is when its shape began
+	// to count against the host and the deployment: before the job was assigned,
+	// while the lease was still the tier's discovery slot.
+	ChargedFrom time.Time `json:"charged_from"`
+	AssignedAt  time.Time `json:"assigned_at"`
+	StartedAt   time.Time `json:"started_at"`
+	FinishedAt  time.Time `json:"finished_at"`
+
+	// QueueWait is from the trace's arrival to the ledger's recorded start, and
+	// RunDuration from that start to the lease's archive.
+	QueueWait   Duration `json:"queue_wait"`
+	RunDuration Duration `json:"run_duration"`
+
+	Conclusion string `json:"conclusion"`
+	Result     string `json:"result"`
+	Disruption string `json:"disruption,omitempty"`
+
+	// Locality is DERIVED FROM PLACEMENT, not observed: an earlier job of the
+	// same repository was placed on the same node. Beside the observed cache
+	// columns because a simulated guest observes nothing, and locality is the
+	// question a placement policy can be asked without one.
+	Locality bool `json:"locality"`
+}
+
+// Report is what one replay recorded.
+type Report struct {
+	Fleet Fleet
+	// Records are the jobs the ledger knows about, in sequence order.
+	Records []Record
+	// Missing are trace jobs with no ledger row: gaps in the recording, reported
+	// as gaps rather than filled in.
+	Missing []int64
+	// Unstarted are recorded jobs the ledger never saw start.
+	Unstarted []int64
+	// Unfinished are recorded leases the ledger never archived: their charge has
+	// no end, so the sweep charges it and never releases it, and a capacity
+	// verdict over such a ledger is provisional rather than final.
+	Unfinished []int64
+	// EscrowRows counts history rows for leases that were never assigned a job:
+	// the discovery slots released at shutdown. Reported so a reader can tell
+	// them from a missing job.
+	EscrowRows int
+	// escrows are those rows' charges, kept out of the job records and in the
+	// capacity proof: a discovery slot is charged to its host like any lease.
+	escrows []charge
+	// Violations are the overcommits the ledger's charges prove: a host or the
+	// deployment charged more than it has, at some instant.
+	Violations []string
+}
+
+// charge is one lease's claim on a host over an interval. A zero `to` is a
+// charge the ledger never ended, and it is never released in a sweep.
+type charge struct {
+	from, to time.Time
+	vcpu     int
+	memory   config.ByteSize
+	node     string
+}
+
+// open reports whether the ledger never ended this charge.
+func (c charge) open() bool { return c.to.IsZero() }
+
+// historyBound is how many extra rows beyond the trace the read allows for:
+// the discovery escrows every tier holds and releases over a replay. The query
+// is bounded, so a read that fills the bound is refused rather than trusted, a
+// truncated history being a smaller ledger that proves less than it seems to.
+const historyBound = 4096
+
+// readReport reads job_history back and joins it to the trace.
+func readReport(ctx context.Context, db *state.DB, fleet Fleet, trace Trace) (*Report, error) {
+	bound := int64(len(trace.Arrivals)) + historyBound
+
+	rows, err := state.ReadQueries(db.Reader()).ListJobHistory(ctx, bound)
+	if err != nil {
+		return nil, fmt.Errorf("read job history: %w", err)
+	}
+
+	if err := complete(len(rows), bound); err != nil {
+		return nil, err
+	}
+
+	byRequest := make(map[int64]*Arrival, len(trace.Arrivals))
+	for i := range trace.Arrivals {
+		byRequest[trace.Arrivals[i].Seq] = &trace.Arrivals[i]
+	}
+
+	r := &Report{Fleet: fleet}
+	seen := make(map[int64]bool, len(rows))
+	reads := state.ReadQueries(db.Reader())
+
+	for i := range rows {
+		row := &rows[i]
+
+		// THE CHARGE STARTS AT ESCROW, from the lease row, which outlives the
+		// lease: job_history opens at assignment, and a capacity audit that began
+		// there would miss the slot every tier holds before any job is given it.
+		lease, err := reads.ReadLeaseCharge(ctx, row.LeaseID)
+		if err != nil {
+			return nil, fmt.Errorf("read what lease %s charged: %w", row.LeaseID, err)
+		}
+
+		chargedFrom, err := parseStamp(lease.CreatedAt)
+		if err != nil {
+			return nil, fmt.Errorf("lease %s created_at: %w", row.LeaseID, err)
+		}
+
+		finishedAt, err := parseStamp(row.FinishedAt)
+		if err != nil {
+			return nil, fmt.Errorf("lease %s finished_at: %w", row.LeaseID, err)
+		}
+
+		if row.RequestID == 0 {
+			r.EscrowRows++
+			r.escrows = append(r.escrows, charge{
+				from: chargedFrom, to: finishedAt, vcpu: int(lease.Vcpu),
+				memory: config.ByteSize(lease.Memory), node: lease.Host,
+			})
+
+			if err := fleet.checkCharge(r.escrows[len(r.escrows)-1]); err != nil {
+				return nil, fmt.Errorf("escrow lease %s: %w", row.LeaseID, err)
+			}
+
+			continue
+		}
+
+		a, ok := byRequest[row.RequestID]
+		if !ok {
+			return nil, fmt.Errorf("the ledger recorded request %d, which the trace never offered", row.RequestID)
+		}
+
+		if seen[row.RequestID] {
+			return nil, fmt.Errorf("the ledger recorded request %d twice", row.RequestID)
+		}
+
+		seen[row.RequestID] = true
+
+		// THE ROW IS THE TRACE'S JOB, NOT ONLY ITS REQUEST ID. A row recorded under
+		// another tier, or with a result the scripted GitHub never sent, would
+		// describe a different workload than the one replayed.
+		if row.Tier != a.Tier {
+			return nil, fmt.Errorf("request %d was offered on tier %q and the ledger recorded it on %q",
+				row.RequestID, a.Tier, row.Tier)
+		}
+
+		if row.Result != "" && row.Result != a.Result {
+			return nil, fmt.Errorf("request %d completed with result %q and the ledger recorded %q",
+				row.RequestID, a.Result, row.Result)
+		}
+
+		assignedAt, err := parseStamp(row.QueuedAt)
+		if err != nil {
+			return nil, fmt.Errorf("lease %s queued_at: %w", row.LeaseID, err)
+		}
+
+		startedAt, err := parseStamp(row.StartedAt)
+		if err != nil {
+			return nil, fmt.Errorf("lease %s started_at: %w", row.LeaseID, err)
+		}
+
+		rec := Record{
+			Seq:         a.Seq,
+			LeaseID:     row.LeaseID,
+			Tier:        row.Tier,
+			Owner:       a.Owner,
+			Repository:  a.Repository,
+			WorkflowRef: a.WorkflowRef,
+			Node:        row.Node,
+			Arrival:     a.At,
+			ChargedFrom: chargedFrom,
+			AssignedAt:  assignedAt,
+			StartedAt:   startedAt,
+			FinishedAt:  finishedAt,
+			Conclusion:  row.Conclusion.String,
+			Result:      row.Result,
+			Disruption:  row.Disruption,
+		}
+
+		// THE CHARGED SHAPE IS THE ROW'S, and the row is read rather than the
+		// tier's request assumed: the two agree for a host-backed backend, and
+		// reading the ledger is the point of the report.
+		placement, err := state.ReadQueries(db.Reader()).ReadJobPlacement(ctx, row.LeaseID)
+		if err != nil {
+			return nil, fmt.Errorf("read the placement of lease %s: %w", row.LeaseID, err)
+		}
+
+		rec.Provider = placement.ChosenProvider
+		rec.InstanceType = placement.InstanceType
+		rec.VCPU = int(placement.Vcpu)
+		rec.Memory = config.ByteSize(placement.Memory)
+		rec.Site = placement.Site
+		rec.PriceMicrosPerHour = placement.PriceMicrosPerHour
+		rec.ImageCache = placement.ImageCache
+		rec.CacheGeneration = placement.CacheGeneration
+		rec.ActionsCache = placement.ActionsCache
+
+		if err := rec.checkAgainstLease(lease.Host, int(lease.Vcpu), config.ByteSize(lease.Memory)); err != nil {
+			return nil, fmt.Errorf("lease %s of job %d: %w", row.LeaseID, a.Seq, err)
+		}
+
+		if err := rec.checkOrder(); err != nil {
+			return nil, fmt.Errorf("lease %s of job %d: %w", row.LeaseID, a.Seq, err)
+		}
+
+		if rec.FinishedAt.IsZero() {
+			r.Unfinished = append(r.Unfinished, a.Seq)
+		}
+
+		if rec.StartedAt.IsZero() {
+			r.Unstarted = append(r.Unstarted, a.Seq)
+		} else {
+			rec.QueueWait = Duration(rec.StartedAt.Sub(a.At))
+
+			if !rec.FinishedAt.IsZero() {
+				rec.RunDuration = Duration(rec.FinishedAt.Sub(rec.StartedAt))
+			}
+		}
+
+		rec.Cost, rec.CostSource = fleet.cost(&rec)
+
+		if err := fleet.checkCharge(charge{
+			from: rec.ChargedFrom, to: rec.FinishedAt, vcpu: rec.VCPU, memory: rec.Memory, node: rec.Node,
+		}); err != nil {
+			return nil, fmt.Errorf("lease %s of job %d: %w", row.LeaseID, a.Seq, err)
+		}
+
+		r.Records = append(r.Records, rec)
+	}
+
+	for i := range trace.Arrivals {
+		if seq := trace.Arrivals[i].Seq; !seen[seq] {
+			r.Missing = append(r.Missing, seq)
+		}
+	}
+
+	slices.SortFunc(r.Records, func(a, b Record) int { return int(a.Seq - b.Seq) })
+	r.deriveLocality()
+	r.Violations = r.checkCapacity()
+
+	return r, nil
+}
+
+// complete refuses a history read that filled its bound: a truncated ledger
+// proves less than it seems to, and nothing in the rows says they are all.
+func complete(rows int, bound int64) error {
+	if int64(rows) >= bound {
+		return fmt.Errorf("job history holds at least %d rows, which is the most this report reads; "+
+			"a truncated history would prove less than it seems to", bound)
+	}
+
+	return nil
+}
+
+// checkCharge refuses a charge the sweep could not judge honestly.
+//
+// COULD NOT TELL IS NOT NO OVERCOMMIT. A charge with no start would be left
+// out; one ending before it began would release before it charged; a zero
+// shape would count nothing; a host the fleet does not declare would never be
+// compared against a capacity. Each of those is a ledger the report cannot
+// speak for, so it says so instead of sweeping past it.
+func (f Fleet) checkCharge(c charge) error {
+	switch {
+	case c.from.IsZero():
+		return errors.New("the lease has no escrow time to charge from")
+	case !c.open() && c.to.Before(c.from):
+		return fmt.Errorf("the lease is archived at %s, before it was escrowed at %s", c.to, c.from)
+	case c.vcpu <= 0 || c.memory <= 0:
+		return fmt.Errorf("the lease is charged %d vCPU and %s, which the sweep cannot count", c.vcpu, c.memory)
+	}
+
+	if _, ok := f.host(c.node); !ok {
+		return fmt.Errorf("the lease is charged to host %q, which the fleet does not declare", c.node)
+	}
+
+	return nil
+}
+
+// checkAgainstLease refuses a record whose history row and lease row disagree
+// about what was charged to whom.
+//
+// ONE CHARGE, TWO RECORDS OF IT. The lease row and the history row both say
+// what was charged to whom; a report that took the time from one and the shape
+// from the other would sweep a charge that never existed. They have to agree,
+// or the report cannot say what the fleet carried.
+func (rec *Record) checkAgainstLease(host string, vcpu int, memory config.ByteSize) error {
+	if host != rec.Node || vcpu != rec.VCPU || memory != rec.Memory {
+		return fmt.Errorf("charged to %q for %d vCPU and %s on its lease row and to %q for %d vCPU and %s in "+
+			"its history; the report cannot say which the fleet carried",
+			host, vcpu, memory, rec.Node, rec.VCPU, rec.Memory)
+	}
+
+	return nil
+}
+
+// checkOrder refuses a record whose timestamps contradict the lifecycle: a
+// lease is escrowed, then assigned, then (if a job started) started, then
+// archived, and a job cannot start before it arrived. A row out of that order
+// would yield a negative wait or end a charge before it began, and a report
+// built on it would still look authoritative.
+func (rec *Record) checkOrder() error {
+	switch {
+	case rec.AssignedAt.IsZero():
+		return errors.New("the job was recorded with no assignment time")
+	case rec.AssignedAt.Before(rec.ChargedFrom):
+		return fmt.Errorf("assigned at %s, before its lease was escrowed at %s", rec.AssignedAt, rec.ChargedFrom)
+	case rec.AssignedAt.Before(rec.Arrival):
+		return fmt.Errorf("assigned at %s, before it arrived at %s", rec.AssignedAt, rec.Arrival)
+	case !rec.StartedAt.IsZero() && rec.StartedAt.Before(rec.AssignedAt):
+		return fmt.Errorf("started at %s, before it was assigned at %s", rec.StartedAt, rec.AssignedAt)
+	case !rec.StartedAt.IsZero() && rec.StartedAt.Before(rec.Arrival):
+		return fmt.Errorf("started at %s, before it arrived at %s", rec.StartedAt, rec.Arrival)
+	case !rec.FinishedAt.IsZero() && rec.FinishedAt.Before(rec.AssignedAt):
+		return fmt.Errorf("finished at %s, before it was assigned at %s", rec.FinishedAt, rec.AssignedAt)
+	case !rec.FinishedAt.IsZero() && !rec.StartedAt.IsZero() && rec.FinishedAt.Before(rec.StartedAt):
+		return fmt.Errorf("finished at %s, before it started at %s", rec.FinishedAt, rec.StartedAt)
+	}
+
+	return nil
+}
+
+// parseStamp reads a ledger timestamp. The empty string is the one legitimate
+// zero time (a column the ledger never wrote); anything else that does not
+// parse is an error, never an absence, because "could not read" collapsing
+// into "did not happen" is the failure a report must not have.
+func parseStamp(s string) (time.Time, error) {
+	if s == "" {
+		return time.Time{}, nil
+	}
+
+	t, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("timestamp %q: %w", s, err)
+	}
+
+	return t, nil
+}
+
+// charges is every claim the ledger recorded on the fleet: each job's lease
+// from its escrow to its archive, and every discovery slot the same way.
+//
+// A CHARGE WITH NO END IS NOT DROPPED, AND NOT CLOSED EITHER. A lease the
+// ledger never archived is still charged, and leaving it out would let the one
+// thing a swallowed completion leaves behind vanish from the proof. It stays
+// open: the sweeps charge it and never release it, so a charge that began at
+// the last instant the ledger knows still counts there, where an interval
+// closed at that same instant would have released before it charged. Unfinished
+// says the verdict over such a ledger is provisional.
+func (r *Report) charges() []charge {
+	out := make([]charge, 0, len(r.Records)+len(r.escrows))
+
+	for i := range r.Records {
+		rec := &r.Records[i]
+		if rec.ChargedFrom.IsZero() {
+			continue
+		}
+
+		out = append(out, charge{
+			from: rec.ChargedFrom, to: rec.FinishedAt, vcpu: rec.VCPU, memory: rec.Memory, node: rec.Node,
+		})
+	}
+
+	for _, c := range r.escrows {
+		if !c.from.IsZero() {
+			out = append(out, c)
+		}
+	}
+
+	return out
+}
+
+// deriveLocality marks each record whose repository already had a job placed on
+// the same node, in start order.
+func (r *Report) deriveLocality() {
+	order := slices.Clone(r.Records)
+	slices.SortStableFunc(order, func(a, b Record) int { return a.StartedAt.Compare(b.StartedAt) })
+
+	type key struct{ node, repo string }
+
+	seen := map[key]bool{}
+	warm := map[int64]bool{}
+
+	for i := range order {
+		rec := &order[i]
+		if rec.Node == "" || rec.StartedAt.IsZero() {
+			continue
+		}
+
+		k := key{rec.Node, rec.FullName()}
+		warm[rec.Seq] = seen[k]
+		seen[k] = true
+	}
+
+	for i := range r.Records {
+		r.Records[i].Locality = warm[r.Records[i].Seq]
+	}
+}
+
+// checkCapacity sweeps every charge the ledger recorded and reports any instant
+// at which a host or the deployment was charged more than it has.
+//
+// THE HARNESS'S OWN MUTATION TEST. A placer that ignores a host's room lands
+// leases past its capacity, and nothing in a per-lease test sees it; this does,
+// from the ledger's own timestamps. Every lease counts from its escrow to its
+// archive, the discovery slots included, because that is what the ledger
+// charged: a proof over assigned jobs alone would read a host as within its
+// capacity while an escrow it was also carrying took it over.
+func (r *Report) checkCapacity() []string {
+	type change struct {
+		at     time.Time
+		vcpu   int
+		memory config.ByteSize
+		node   string
+	}
+
+	charges := r.charges()
+	changes := make([]change, 0, 2*len(charges))
+
+	for _, c := range charges {
+		changes = append(changes, change{c.from, c.vcpu, c.memory, c.node})
+
+		if !c.open() {
+			changes = append(changes, change{c.to, -c.vcpu, -c.memory, c.node})
+		}
+	}
+
+	// Releases before charges at the same instant, so a job finishing as
+	// another is assigned is not read as an overlap the ledger never had.
+	slices.SortStableFunc(changes, func(a, b change) int {
+		if c := a.at.Compare(b.at); c != 0 {
+			return c
+		}
+
+		return a.vcpu - b.vcpu
+	})
+
+	type load struct {
+		vcpu   int
+		memory config.ByteSize
+	}
+
+	perNode := map[string]load{}
+	total := load{}
+	reported := map[string]bool{}
+
+	var out []string
+
+	for _, c := range changes {
+		l := perNode[c.node]
+		l.vcpu += c.vcpu
+		l.memory += c.memory
+		perNode[c.node] = l
+		total.vcpu += c.vcpu
+		total.memory += c.memory
+
+		if c.vcpu < 0 {
+			continue
+		}
+
+		if h, ok := r.Fleet.host(c.node); ok && (l.vcpu > h.VCPU || l.memory > h.Memory) && !reported[c.node] {
+			reported[c.node] = true
+			out = append(out, fmt.Sprintf("host %s carried %d vCPU and %s at %s against %d vCPU and %s",
+				c.node, l.vcpu, l.memory, c.at.Format(time.RFC3339), h.VCPU, h.Memory))
+		}
+
+		if (total.vcpu > r.Fleet.MaxVCPU || total.memory > r.Fleet.MaxMemory) && !reported[""] {
+			reported[""] = true
+			out = append(out, fmt.Sprintf("the deployment carried %d vCPU and %s at %s against a ceiling of %d vCPU and %s",
+				total.vcpu, total.memory, c.at.Format(time.RFC3339), r.Fleet.MaxVCPU, r.Fleet.MaxMemory))
+		}
+	}
+
+	return out
+}
+
+// Placements is the node each recorded job ran on, by sequence.
+func (r *Report) Placements() map[int64]string {
+	out := make(map[int64]string, len(r.Records))
+	for i := range r.Records {
+		out[r.Records[i].Seq] = r.Records[i].Node
+	}
+
+	return out
+}
+
+// PeakVCPUByNode is the most vCPU each host carried at any instant, escrow
+// included.
+func (r *Report) PeakVCPUByNode() map[string]int {
+	peaks, _ := r.peaks()
+
+	return peaks
+}
+
+// PeakDeploymentVCPU is the most vCPU the whole fleet carried at one instant,
+// escrow included: the number the deployment ceiling bounds. Not the sum of
+// the hosts' peaks, which need not coincide.
+func (r *Report) PeakDeploymentVCPU() int {
+	_, total := r.peaks()
+
+	return total
+}
+
+// peaks sweeps every charge once for the per-host and deployment-wide peaks.
+func (r *Report) peaks() (map[string]int, int) {
+	type change struct {
+		at   time.Time
+		vcpu int
+		node string
+	}
+
+	charges := r.charges()
+	changes := make([]change, 0, 2*len(charges))
+
+	for _, c := range charges {
+		changes = append(changes, change{c.from, c.vcpu, c.node})
+
+		if !c.open() {
+			changes = append(changes, change{c.to, -c.vcpu, c.node})
+		}
+	}
+
+	slices.SortStableFunc(changes, func(a, b change) int {
+		if c := a.at.Compare(b.at); c != 0 {
+			return c
+		}
+
+		return a.vcpu - b.vcpu
+	})
+
+	load := map[string]int{}
+	peak := map[string]int{}
+	total, totalPeak := 0, 0
+
+	for _, c := range changes {
+		load[c.node] += c.vcpu
+		peak[c.node] = max(peak[c.node], load[c.node])
+		total += c.vcpu
+		totalPeak = max(totalPeak, total)
+	}
+
+	return peak, totalPeak
+}
+
+// HostsUsed is how many distinct hosts carried a job.
+func (r *Report) HostsUsed() int {
+	used := map[string]bool{}
+
+	for i := range r.Records {
+		if node := r.Records[i].Node; node != "" {
+			used[node] = true
+		}
+	}
+
+	return len(used)
+}
+
+// Percentiles are the queue-wait figures the summary reports for one group.
+type Percentiles struct {
+	Count         int
+	P50, P95, Max time.Duration
+}
+
+// QueueWaitBy groups the started records by a key and reports each group's
+// queue-wait percentiles.
+func (r *Report) QueueWaitBy(key func(*Record) string) map[string]Percentiles {
+	groups := map[string][]time.Duration{}
+
+	for i := range r.Records {
+		rec := &r.Records[i]
+		if rec.StartedAt.IsZero() {
+			continue
+		}
+
+		k := key(rec)
+		groups[k] = append(groups[k], time.Duration(rec.QueueWait))
+	}
+
+	out := make(map[string]Percentiles, len(groups))
+
+	for k, waits := range groups {
+		slices.Sort(waits)
+		out[k] = Percentiles{
+			Count: len(waits),
+			P50:   percentile(waits, 0.50),
+			P95:   percentile(waits, 0.95),
+			Max:   waits[len(waits)-1],
+		}
+	}
+
+	return out
+}
+
+// percentile is the nearest-rank percentile of a sorted, non-empty slice.
+func percentile(sorted []time.Duration, p float64) time.Duration {
+	i := int(float64(len(sorted))*p+0.999999) - 1
+
+	return sorted[min(max(i, 0), len(sorted)-1)]
+}
+
+// LocalityRate is the share of started jobs whose repository already had a job
+// on the same node.
+func (r *Report) LocalityRate() float64 {
+	started, warm := 0, 0
+
+	for i := range r.Records {
+		rec := &r.Records[i]
+		if rec.StartedAt.IsZero() {
+			continue
+		}
+
+		started++
+
+		if rec.Locality {
+			warm++
+		}
+	}
+
+	if started == 0 {
+		return 0
+	}
+
+	return float64(warm) / float64(started)
+}
+
+// WriteJSONL writes one record per line.
+func (r *Report) WriteJSONL(w io.Writer) error {
+	enc := json.NewEncoder(w)
+
+	for i := range r.Records {
+		if err := enc.Encode(&r.Records[i]); err != nil {
+			return fmt.Errorf("replay: write record %d: %w", r.Records[i].Seq, err)
+		}
+	}
+
+	return nil
+}
+
+// Summary renders the report for a person: what was recorded, what was not, how
+// long jobs queued, where they went, and what the records prove about capacity.
+func (r *Report) Summary() string {
+	var b strings.Builder
+
+	fmt.Fprintf(&b, "jobs recorded: %d (missing %d, never started %d, never finished %d, escrow rows %d)\n",
+		len(r.Records), len(r.Missing), len(r.Unstarted), len(r.Unfinished), r.EscrowRows)
+
+	byTier := r.QueueWaitBy(func(rec *Record) string { return rec.Tier })
+	for _, tier := range slices.Sorted(maps.Keys(byTier)) {
+		p := byTier[tier]
+		fmt.Fprintf(&b, "tier %s: %d jobs, queue wait p50 %s p95 %s max %s\n",
+			tier, p.Count, p.P50, p.P95, p.Max)
+	}
+
+	byRepo := r.QueueWaitBy(func(rec *Record) string { return rec.FullName() })
+	for _, repo := range slices.Sorted(maps.Keys(byRepo)) {
+		p := byRepo[repo]
+		fmt.Fprintf(&b, "repository %s: %d jobs, queue wait p50 %s p95 %s max %s\n",
+			repo, p.Count, p.P50, p.P95, p.Max)
+	}
+
+	peaks := r.PeakVCPUByNode()
+	for _, node := range slices.Sorted(maps.Keys(peaks)) {
+		capacity := "unknown capacity"
+		if h, ok := r.Fleet.host(node); ok {
+			capacity = strconv.Itoa(h.VCPU) + " vCPU"
+		}
+
+		fmt.Fprintf(&b, "host %s: peak %d vCPU of %s\n", node, peaks[node], capacity)
+	}
+
+	fmt.Fprintf(&b, "locality (derived from placement, not observed): %.0f%% of jobs followed their repository onto a host\n",
+		100*r.LocalityRate())
+
+	costs, unpriced := r.CostByTier()
+	for _, tier := range slices.Sorted(maps.Keys(costs)) {
+		fmt.Fprintf(&b, "cost on %s: $%.2f\n", tier, costs[tier])
+	}
+
+	if unpriced > 0 {
+		fmt.Fprintf(&b, "cost: %d jobs had no recorded price and no fleet rate, so their cost is unknown\n", unpriced)
+	}
+
+	observed := r.CacheOutcomes()
+	if len(observed) == 0 {
+		fmt.Fprintf(&b, "cache: the ledger recorded no image or Actions cache observation for any job\n")
+	} else {
+		for _, outcome := range slices.Sorted(maps.Keys(observed)) {
+			fmt.Fprintf(&b, "cache %s: %d jobs\n", outcome, observed[outcome])
+		}
+	}
+
+	fmt.Fprintf(&b, "deployment: peak %d vCPU of a %d vCPU ceiling\n", r.PeakDeploymentVCPU(), r.Fleet.MaxVCPU)
+
+	switch {
+	case len(r.Violations) > 0:
+		fmt.Fprintf(&b, "capacity: %d overcommit(s): %s\n", len(r.Violations), strings.Join(r.Violations, "; "))
+	case len(r.Unfinished) > 0:
+		fmt.Fprintf(&b, "capacity: no overcommit in the recorded intervals, PROVISIONALLY: %d leases were never "+
+			"archived and are swept as still charged\n", len(r.Unfinished))
+	default:
+		fmt.Fprintf(&b, "capacity: no host or deployment overcommit in the recorded intervals\n")
+	}
+
+	return b.String()
+}
+
+// CostByTier sums the priced records' cost per tier, and counts the records
+// whose cost is unknown.
+func (r *Report) CostByTier() (map[string]float64, int) {
+	out := map[string]float64{}
+	unpriced := 0
+
+	for i := range r.Records {
+		rec := &r.Records[i]
+		if rec.CostSource == "" {
+			unpriced++
+
+			continue
+		}
+
+		out[rec.Tier] += rec.Cost
+	}
+
+	return out, unpriced
+}
+
+// CacheOutcomes counts the cache observations the ledger recorded, keyed as
+// "image:<token>" and "actions:<token>". Nothing observed counts nothing.
+func (r *Report) CacheOutcomes() map[string]int {
+	out := map[string]int{}
+
+	for i := range r.Records {
+		rec := &r.Records[i]
+		if rec.ImageCache != "" {
+			out["image:"+rec.ImageCache]++
+		}
+
+		if rec.ActionsCache != "" {
+			out["actions:"+rec.ActionsCache]++
+		}
+	}
+
+	return out
+}
+
+// FullName is the repository as GitHub names it, owner included, because two
+// organizations can each own a repository of one name and they share nothing.
+func (rec *Record) FullName() string { return rec.Owner + "/" + rec.Repository }
+
+func itoa(n int64) string { return strconv.FormatInt(n, 10) }
