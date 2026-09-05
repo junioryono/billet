@@ -242,6 +242,20 @@ func readReport(ctx context.Context, db *state.DB, fleet Fleet, trace Trace) (*R
 		rec.CacheGeneration = placement.CacheGeneration
 		rec.ActionsCache = placement.ActionsCache
 
+		// ONE CHARGE, TWO RECORDS OF IT. The lease row and the history row both
+		// say what was charged to whom; a report that took the time from one and
+		// the shape from the other would sweep a charge that never existed. They
+		// have to agree, or the report cannot say what the fleet carried.
+		if lease.Host != rec.Node || int(lease.Vcpu) != rec.VCPU || config.ByteSize(lease.Memory) != rec.Memory {
+			return nil, fmt.Errorf("lease %s of job %d is charged to %q for %d vCPU and %s on its lease row and to %q "+
+				"for %d vCPU and %s in its history; the report cannot say which the fleet carried",
+				row.LeaseID, a.Seq, lease.Host, lease.Vcpu, config.ByteSize(lease.Memory), rec.Node, rec.VCPU, rec.Memory)
+		}
+
+		if err := rec.checkOrder(); err != nil {
+			return nil, fmt.Errorf("lease %s of job %d: %w", row.LeaseID, a.Seq, err)
+		}
+
 		if rec.FinishedAt.IsZero() {
 			r.Unfinished = append(r.Unfinished, a.Seq)
 		}
@@ -310,6 +324,30 @@ func (f Fleet) checkCharge(c charge) error {
 
 	if _, ok := f.host(c.node); !ok {
 		return fmt.Errorf("the lease is charged to host %q, which the fleet does not declare", c.node)
+	}
+
+	return nil
+}
+
+// checkOrder refuses a record whose timestamps contradict the lifecycle: a
+// lease is escrowed, then assigned, then (if a job started) started, then
+// archived, and a job cannot start before it arrived. A row out of that order
+// would yield a negative wait or end a charge before it began, and a report
+// built on it would still look authoritative.
+func (rec *Record) checkOrder() error {
+	switch {
+	case rec.AssignedAt.IsZero():
+		return errors.New("the job was recorded with no assignment time")
+	case rec.AssignedAt.Before(rec.ChargedFrom):
+		return fmt.Errorf("assigned at %s, before its lease was escrowed at %s", rec.AssignedAt, rec.ChargedFrom)
+	case !rec.StartedAt.IsZero() && rec.StartedAt.Before(rec.AssignedAt):
+		return fmt.Errorf("started at %s, before it was assigned at %s", rec.StartedAt, rec.AssignedAt)
+	case !rec.StartedAt.IsZero() && rec.StartedAt.Before(rec.Arrival):
+		return fmt.Errorf("started at %s, before it arrived at %s", rec.StartedAt, rec.Arrival)
+	case !rec.FinishedAt.IsZero() && rec.FinishedAt.Before(rec.AssignedAt):
+		return fmt.Errorf("finished at %s, before it was assigned at %s", rec.FinishedAt, rec.AssignedAt)
+	case !rec.FinishedAt.IsZero() && !rec.StartedAt.IsZero() && rec.FinishedAt.Before(rec.StartedAt):
+		return fmt.Errorf("finished at %s, before it started at %s", rec.FinishedAt, rec.StartedAt)
 	}
 
 	return nil

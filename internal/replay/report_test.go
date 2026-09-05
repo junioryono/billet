@@ -22,9 +22,11 @@ func oneHost() Fleet {
 	}
 }
 
-func chargeAt(from, to time.Time, vcpu int) Record {
+// chargeAt is one 4 vCPU charge on the host, from escrow to archive; a zero
+// archive is a charge the ledger never ended.
+func chargeAt(from, to time.Time) Record {
 	return Record{
-		Tier: "billet-4vcpu", Node: "only", VCPU: vcpu, Memory: config.ByteSize(vcpu) * 2 * config.GiB,
+		Tier: "billet-4vcpu", Node: "only", VCPU: 4, Memory: 8 * config.GiB,
 		ChargedFrom: from, FinishedAt: to,
 	}
 }
@@ -39,13 +41,13 @@ func TestAnOpenChargeAtTheLastInstantIsStillCounted(t *testing.T) {
 	start := DefaultStart
 
 	r := &Report{Fleet: oneHost(), Records: []Record{
-		chargeAt(start, start.Add(10*time.Minute), 4),
-		chargeAt(start.Add(5*time.Minute), start.Add(10*time.Minute), 4),
+		chargeAt(start, start.Add(10*time.Minute)),
+		chargeAt(start.Add(5*time.Minute), start.Add(10*time.Minute)),
 		// Escrowed at the instant the others end, never archived: with the host
 		// full until then, this is 12 vCPU on an 8 vCPU host from that instant on.
-		chargeAt(start.Add(10*time.Minute), time.Time{}, 4),
-		chargeAt(start.Add(10*time.Minute), time.Time{}, 4),
-		chargeAt(start.Add(10*time.Minute), time.Time{}, 4),
+		chargeAt(start.Add(10*time.Minute), time.Time{}),
+		chargeAt(start.Add(10*time.Minute), time.Time{}),
+		chargeAt(start.Add(10*time.Minute), time.Time{}),
 	}}
 
 	for i := range r.Records {
@@ -63,6 +65,37 @@ func TestAnOpenChargeAtTheLastInstantIsStillCounted(t *testing.T) {
 
 	if !strings.Contains(violations[0], "host only carried 12 vCPU") {
 		t.Errorf("the violation does not name the host and the load: %v", violations)
+	}
+}
+
+// A RECORD WHOSE TIMESTAMPS CONTRADICT THE LIFECYCLE IS REFUSED.
+func TestARecordOutOfOrderIsRefused(t *testing.T) {
+	t.Parallel()
+
+	start := DefaultStart
+	minute := func(n int) time.Time { return start.Add(time.Duration(n) * time.Minute) }
+
+	good := Record{Arrival: minute(1), ChargedFrom: minute(0), AssignedAt: minute(2), StartedAt: minute(3), FinishedAt: minute(9)}
+	if err := good.checkOrder(); err != nil {
+		t.Fatalf("a well-ordered record was refused: %v", err)
+	}
+
+	cancelled := Record{Arrival: minute(1), ChargedFrom: minute(0), AssignedAt: minute(2), FinishedAt: minute(3)}
+	if err := cancelled.checkOrder(); err != nil {
+		t.Fatalf("an assigned-then-cancelled record with no start was refused: %v", err)
+	}
+
+	for name, rec := range map[string]Record{
+		"no assignment":            {Arrival: minute(1), ChargedFrom: minute(0), FinishedAt: minute(3)},
+		"assigned before escrow":   {Arrival: minute(1), ChargedFrom: minute(2), AssignedAt: minute(1), FinishedAt: minute(3)},
+		"started before assigned":  {Arrival: minute(1), ChargedFrom: minute(0), AssignedAt: minute(3), StartedAt: minute(2), FinishedAt: minute(9)},
+		"started before arrival":   {Arrival: minute(5), ChargedFrom: minute(0), AssignedAt: minute(2), StartedAt: minute(3), FinishedAt: minute(9)},
+		"finished before assigned": {Arrival: minute(1), ChargedFrom: minute(0), AssignedAt: minute(4), FinishedAt: minute(3)},
+		"finished before started":  {Arrival: minute(1), ChargedFrom: minute(0), AssignedAt: minute(2), StartedAt: minute(5), FinishedAt: minute(4)},
+	} {
+		if err := rec.checkOrder(); err == nil {
+			t.Errorf("a record %s was accepted", name)
+		}
 	}
 }
 

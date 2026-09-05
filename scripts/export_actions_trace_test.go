@@ -253,7 +253,10 @@ func TestTheExporterWritesATraceTheReplayReads(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, want := range []string{"created=%3E%3D2026-03-01", "runs/101/jobs", "runs/102/jobs"} {
+	// AND EVERY ATTEMPT OF EACH RUN: without filter=all the endpoint answers the
+	// latest attempt only, and a re-run's earlier attempts vanish from the trace.
+	for _, want := range []string{"created=%3E%3D2026-03-01", "runs/101/jobs?per_page=100&filter=all",
+		"runs/102/jobs?per_page=100&filter=all"} {
 		if !strings.Contains(string(log), want) {
 			t.Errorf("gh was never asked %q: %s", want, log)
 		}

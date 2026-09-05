@@ -151,7 +151,10 @@ while IFS=$'\t' read -r run_id path branch; do
 	runs=$((runs + 1))
 	workflow="$repo/$path@refs/heads/$branch"
 
-	gh api --paginate "repos/$repo/actions/runs/$run_id/jobs?per_page=100" >"$work/jobs.json"
+	# EVERY ATTEMPT. The jobs endpoint answers the latest attempt unless told
+	# otherwise, and a re-run's earlier attempts consumed runners too; a trace
+	# without them is a smaller workload than the repository ran.
+	gh api --paginate "repos/$repo/actions/runs/$run_id/jobs?per_page=100&filter=all" >"$work/jobs.json"
 
 	# Only a job that ran to completion has a duration to replay, and only one
 	# whose tier the rule names once. `fromdate` reads GitHub's RFC 3339 stamps;

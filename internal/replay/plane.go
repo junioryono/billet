@@ -85,11 +85,13 @@ type runner struct {
 }
 
 // message is one envelope on a set's queue, with the assignments it carries
-// noted so a mint can be paired with the job whose launch caused it.
+// noted so a mint can be paired with the job whose launch caused it, and the
+// offers it carries so an acquisition can be checked against what was offered.
 type message struct {
 	id       int
 	envelope map[string]any
 	assigned []int64
+	offered  []int64
 }
 
 // scaleSet is one tier's scale set as the service sees it.
@@ -322,16 +324,19 @@ func (p *plane) scaleSets(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case m[2] == "":
 		fakeactions.WriteJSON(p.t, w, p.scaleSetJSON(set))
-	case m[2] == "sessions" && m[3] == "":
+	case m[2] == "sessions" && m[3] == "" && r.Method == http.MethodPost:
 		p.openSession(w, set)
-	case m[2] == "sessions" && r.Method == http.MethodDelete:
+	case m[2] == "sessions" && m[3] != "" && r.Method == http.MethodDelete:
 		w.WriteHeader(http.StatusNoContent)
-	case m[2] == "sessions":
+	case m[2] == "sessions" && m[3] != "" && r.Method == http.MethodPatch:
 		fakeactions.WriteJSON(p.t, w, p.sessionJSON(set))
-	case m[2] == "acquirejobs":
+	case m[2] == "acquirejobs" && r.Method == http.MethodPost:
 		p.acquire(w, r, set)
-	case m[2] == "generatejitconfig":
+	case m[2] == "generatejitconfig" && r.Method == http.MethodPost:
 		p.mint(w, r, set)
+	default:
+		p.t.Errorf("replay: unexpected scale-set call %s %s", r.Method, path)
+		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
 }
 
@@ -451,11 +456,17 @@ func (p *plane) predecessorsParkedLocked(s *scaleSet) bool {
 	return true
 }
 
-// acquire grants every offered id billet bids for and assigns it at once.
+// acquire grants every id billet bids for out of the offer it is holding, and
+// assigns it at once.
 //
 // ASSIGNED ON ACQUISITION is the minimum of GitHub's contract, and it is what
 // every end-to-end scenario does by hand: an acquired offer becomes an
 // assignment, carried on the next message with statistics that count it.
+//
+// ONLY WHAT THE SERVED OFFER CARRIED. A bid for a job that is waiting but was
+// not in the message the listener is holding is a bid for something GitHub
+// did not offer, which the worst defect in this project's history was made of;
+// it is reported and not granted.
 func (p *plane) acquire(w http.ResponseWriter, r *http.Request, s *scaleSet) {
 	var ids []int64
 	if err := json.NewDecoder(r.Body).Decode(&ids); err != nil {
@@ -465,12 +476,26 @@ func (p *plane) acquire(w http.ResponseWriter, r *http.Request, s *scaleSet) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	inOffer := map[int64]bool{}
+
+	if len(s.queue) > 0 && s.served {
+		for _, id := range s.queue[0].offered {
+			inOffer[id] = true
+		}
+	}
+
 	var (
 		granted []int64
 		jobs    []map[string]any
 	)
 
 	for _, id := range ids {
+		if !inOffer[id] {
+			p.t.Errorf("replay: %s bid for request %d, which the offer it holds does not carry", s.name, id)
+
+			continue
+		}
+
 		if _, offered := s.available[id]; !offered {
 			continue
 		}
@@ -482,7 +507,7 @@ func (p *plane) acquire(w http.ResponseWriter, r *http.Request, s *scaleSet) {
 	}
 
 	if len(granted) > 0 {
-		p.pushLocked(s, granted, jobs...)
+		p.pushLocked(s, granted, nil, jobs...)
 	}
 
 	if granted == nil {
@@ -723,7 +748,12 @@ func (p *plane) poll(w http.ResponseWriter, r *http.Request, s *scaleSet) {
 		}
 
 		if s.nudged {
+			// THE NUDGE'S OFFER IS SPENT WITH IT. A nudge consumed while the tier
+			// advertised nothing must not leave an offer pending for a later poll
+			// of the tier's own, or a completion on that tier would re-offer its
+			// backlog ahead of the fleet's order after all.
 			s.nudged = false
+			s.offered = true
 			p.cond.Broadcast()
 			p.mu.Unlock()
 			w.WriteHeader(http.StatusAccepted)
@@ -776,7 +806,7 @@ func (p *plane) reofferLocked(s *scaleSet, capacity int) {
 		jobs = append(jobs, p.jobJSON("JobAvailable", p.jobs[id], fakeactions.JobFields{}))
 	}
 
-	p.pushLocked(s, nil, jobs...)
+	p.pushLocked(s, nil, ids, jobs...)
 }
 
 // nudge makes a parked listener run one iteration of its loop: it re-escrows
@@ -854,13 +884,13 @@ func (p *plane) ack(w http.ResponseWriter, s *scaleSet, msgID int) {
 }
 
 // pushLocked queues one envelope on a set and wakes its parked poll.
-func (p *plane) pushLocked(s *scaleSet, assigned []int64, jobs ...map[string]any) {
+func (p *plane) pushLocked(s *scaleSet, assigned, offered []int64, jobs ...map[string]any) {
 	s.nextMsg++
 
 	env := fakeactions.MessageJSON(p.t, s.nextMsg,
 		fakeactions.StatisticsJSON(len(s.available), len(s.assigned)), jobs...)
 
-	s.queue = append(s.queue, message{id: s.nextMsg, envelope: env, assigned: assigned})
+	s.queue = append(s.queue, message{id: s.nextMsg, envelope: env, assigned: assigned, offered: offered})
 
 	p.wakeLocked(s)
 }
@@ -915,16 +945,16 @@ func (p *plane) deliver(ev event) {
 		}
 
 		s.available[a.Seq] = struct{}{}
-		p.pushLocked(s, nil, p.jobJSON("JobAvailable", a, fakeactions.JobFields{}))
+		p.pushLocked(s, nil, []int64{a.Seq}, p.jobJSON("JobAvailable", a, fakeactions.JobFields{}))
 
 	case eventStarted:
-		p.pushLocked(ev.runner.set, nil, p.jobJSON("JobStarted", a, fakeactions.JobFields{
+		p.pushLocked(ev.runner.set, nil, nil, p.jobJSON("JobStarted", a, fakeactions.JobFields{
 			RunnerID: ev.runner.id, RunnerName: ev.runner.name,
 		}))
 
 	case eventCompleted:
 		delete(ev.runner.set.assigned, a.Seq)
-		p.pushLocked(ev.runner.set, nil, p.jobJSON("JobCompleted", a, fakeactions.JobFields{
+		p.pushLocked(ev.runner.set, nil, nil, p.jobJSON("JobCompleted", a, fakeactions.JobFields{
 			RunnerID: ev.runner.id, RunnerName: ev.runner.name, Result: a.Result,
 		}))
 	}
