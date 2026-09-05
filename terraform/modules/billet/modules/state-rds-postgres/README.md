@@ -76,7 +76,7 @@ The **identity directory** is billet's. `billet local backup` writes an identity
 
 ```hcl
 module "ledger" {
-  source = "github.com/junioryono/billet//terraform/modules/billet/modules/state-rds-postgres?ref=main"
+  source = "github.com/junioryono/billet//terraform/modules/billet/modules/state-rds-postgres?ref=v0.7.0"
 
   name       = "billet"
   vpc_id     = var.vpc_id
@@ -91,7 +91,7 @@ Adopting instead:
 
 ```hcl
 module "ledger" {
-  source = "github.com/junioryono/billet//terraform/modules/billet/modules/state-rds-postgres?ref=main"
+  source = "github.com/junioryono/billet//terraform/modules/billet/modules/state-rds-postgres?ref=v0.7.0"
 
   name     = "billet"
   endpoint = "ledger.internal.example"

@@ -92,13 +92,13 @@ provider "aws" {
 
 # Linux on demand: the inexpensive default.
 module "linux" {
-  source = "github.com/junioryono/billet//terraform/modules/billet/modules/fleet-codebuild?ref=main"
+  source = "github.com/junioryono/billet//terraform/modules/billet/modules/fleet-codebuild?ref=v0.7.0"
   name   = "billet-linux"
 }
 
 # macOS on reserved capacity: an explicit opt-in, and a standing cost.
 module "macos" {
-  source           = "github.com/junioryono/billet//terraform/modules/billet/modules/fleet-codebuild?ref=main"
+  source           = "github.com/junioryono/billet//terraform/modules/billet/modules/fleet-codebuild?ref=v0.7.0"
   name             = "billet-macos"
   environment_type = "MAC_ARM"
   compute_type     = "BUILD_GENERAL1_MEDIUM"
