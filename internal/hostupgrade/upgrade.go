@@ -110,6 +110,15 @@ var ErrRolledBack = errors.New("hostupgrade: the upgrade failed and the previous
 // recovery journal intact and tell a person.
 var ErrCordoned = errors.New("hostupgrade: the upgrade failed and the rollback could not be proved")
 
+// fenceReason is what the maintenance fence says while a transaction owns the
+// ledger, and it is ONE string because the fence is cleared only under the
+// reason it was written with. The commit and the rollback each used to name
+// their own outcome here, so the ledger refused both as somebody else's fence,
+// and every upgrade with a local ledger ended cordoned with its services stopped
+// and the ledger fenced: found by the rollout rehearsal on 2026-09-05, the first
+// time this code met a real fence rather than a fake that ignored the argument.
+const fenceReason = "host upgrade"
+
 // Run carries out one upgrade, or resumes one.
 //
 // THE ORDER IS NOT NEGOTIABLE and every step is placed by what would go wrong if
@@ -277,7 +286,7 @@ func advance(ctx context.Context, req Request, log *slog.Logger) error {
 	}, {
 		step: StepFenced,
 		what: "fencing the ledger",
-		do:   func(ctx context.Context) error { return host.Fence(ctx, "host upgrade") },
+		do:   func(ctx context.Context) error { return host.Fence(ctx, fenceReason) },
 	}, {
 		step: StepSnapshotted,
 		what: "snapshotting the ledger",
@@ -355,7 +364,7 @@ func finish(ctx context.Context, req Request, log *slog.Logger) error {
 	// NO FENCE WAS RAISED ON AN EXTERNAL LEDGER, so none is cleared; the
 	// candidate's own claim is what admits it.
 	if !j.ExternalLedger() {
-		if err := host.ClearFence(ctx, "host upgrade committed"); err != nil {
+		if err := host.ClearFence(ctx, fenceReason); err != nil {
 			return fmt.Errorf("hostupgrade: the upgrade committed but the ledger is still "+
 				"fenced, so nothing can write to it: %w", err)
 		}
@@ -473,7 +482,7 @@ func finishRollback(ctx context.Context, req Request, log *slog.Logger) error {
 	j, host := req.Journal, req.Host
 
 	if j.Reached(StepFenced) && !j.ExternalLedger() {
-		if err := host.ClearFence(ctx, "host upgrade rolled back"); err != nil {
+		if err := host.ClearFence(ctx, fenceReason); err != nil {
 			return fmt.Errorf("clearing the maintenance fence: %w", err)
 		}
 	}

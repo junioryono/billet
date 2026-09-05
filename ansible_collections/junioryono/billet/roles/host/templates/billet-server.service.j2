@@ -82,7 +82,7 @@ UMask=0077
 # data source — is the better diagnostic, and it names the variable.
 EnvironmentFile=-{{ billet_server_environment_path }}
 {% endif %}
-ExecStart=/usr/bin/billet server --config /etc/billet/billet.yaml{{ ' --upgrade-probe' if billet_systemd_upgrade_probe | default(false) else '' }}
+ExecStart=/usr/bin/billet server --config /etc/billet/billet.yaml{{ (' --upgrade-probe' ~ (' --upgrade-probe-hold' if billet_systemd_upgrade_probe_hold | default(false) else '')) if billet_systemd_upgrade_probe | default(false) else '' }}
 TimeoutStartSec=120
 TimeoutStopSec=88200
 KillSignal=SIGTERM
