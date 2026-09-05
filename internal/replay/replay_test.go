@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"testing"
 	"time"
 
@@ -332,8 +333,23 @@ func TestNoPlacementExceedsAHostOrTheDeployment(t *testing.T) {
 // A FEW THOUSAND JOBS REPLAY IN MINUTES AND PRODUCE A PER-LEASE RECORD SET. The
 // acceptance-size run; its wall time is logged and belongs in the record of the
 // change that moved it.
+//
+// SIZED BY WHERE IT RUNS. Two thousand jobs take about a minute and a half on a
+// laptop without the race detector and did not finish inside CI's shared,
+// race-instrumented test job before that job's cap; so the suite replays three
+// hundred by default, which every gate carries, and BILLET_REPLAY_JOBS names
+// the size a dedicated run wants. CI's replay job sets it to two thousand.
 func TestAFewThousandJobsReplayInMinutes(t *testing.T) {
-	const jobs = 2000
+	jobs := 300
+
+	if want := os.Getenv("BILLET_REPLAY_JOBS"); want != "" {
+		n, err := strconv.Atoi(want)
+		if err != nil || n <= 0 {
+			t.Fatalf("BILLET_REPLAY_JOBS=%q is not a positive count", want)
+		}
+
+		jobs = n
+	}
 
 	fleet := Fleet{
 		Hosts: []Host{
@@ -361,7 +377,7 @@ func TestAFewThousandJobsReplayInMinutes(t *testing.T) {
 	started := time.Now()
 	report := Run(t, fleet, trace, Options{})
 	t.Logf("replayed %d jobs in %s", jobs, time.Since(started).Round(time.Second))
-	keep(t, "morning-burst-2000", report)
+	keep(t, "morning-burst", report)
 
 	if len(report.Records) != jobs || len(report.Missing) != 0 || len(report.Unstarted) != 0 {
 		t.Fatalf("recorded %d of %d jobs (missing %v, unstarted %v)", len(report.Records), jobs,
