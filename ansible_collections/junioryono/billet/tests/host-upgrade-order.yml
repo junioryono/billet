@@ -218,12 +218,14 @@
           - "'billet_candidate_probe_holds_on_flag' in billet_candidate_unit_stage.vars.billet_systemd_upgrade_probe_hold"
           # THE QUESTION IS BOUNDED AND JUDGED: `timeout` in front, `server -h` behind, and no
           # failed_when that would read a candidate unable to print its usage as an old one.
-          - billet_candidate_probe_ask['ansible.builtin.command'].argv | length == 5
+          - billet_candidate_probe_ask['ansible.builtin.command'].argv | length == 7
           - billet_candidate_probe_ask['ansible.builtin.command'].argv[0] == 'timeout'
-          - billet_candidate_probe_ask['ansible.builtin.command'].argv[1] == '60'
-          - "'billet.candidate' in billet_candidate_probe_ask['ansible.builtin.command'].argv[2]"
-          - billet_candidate_probe_ask['ansible.builtin.command'].argv[3] == 'server'
-          - billet_candidate_probe_ask['ansible.builtin.command'].argv[4] == '-h'
+          - billet_candidate_probe_ask['ansible.builtin.command'].argv[1] == '-k'
+          - billet_candidate_probe_ask['ansible.builtin.command'].argv[2] == '10'
+          - billet_candidate_probe_ask['ansible.builtin.command'].argv[3] == '60'
+          - "'billet.candidate' in billet_candidate_probe_ask['ansible.builtin.command'].argv[4]"
+          - billet_candidate_probe_ask['ansible.builtin.command'].argv[5] == 'server'
+          - billet_candidate_probe_ask['ansible.builtin.command'].argv[6] == '-h'
           - "'failed_when' not in billet_candidate_probe_ask"
           - billet_candidate_unit_stage.vars.billet_systemd_notify_ready | bool
           - billet_steady_unit_install.vars.billet_systemd_notify_ready | bool

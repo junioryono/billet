@@ -71,11 +71,13 @@ func shortDeadline(t *testing.T, d time.Duration) {
 	t.Cleanup(func() { candidateProbeDeadline = previous })
 }
 
-func shortOutputGrace(t *testing.T, d time.Duration) {
+// shortOutputGrace cuts the wait for the output to close to two seconds, for the
+// tests whose candidate leaves a holder on it on purpose.
+func shortOutputGrace(t *testing.T) {
 	t.Helper()
 
 	previous := probeOutputGrace
-	probeOutputGrace = d
+	probeOutputGrace = 2 * time.Second
 
 	t.Cleanup(func() { probeOutputGrace = previous })
 }
@@ -109,12 +111,14 @@ func killLater(t *testing.T, pid int) {
 	})
 }
 
-// A RELEASE THROUGH v0.9.0 SAYS IT IS READY AND THEN WAITS TO BE STOPPED. A parent
-// that only waited for exit sat behind it forever with the services stopped; this
-// one reads the line, knows from the candidate's own usage that the line means
-// "stop me", stops it, and moves on.
+// A RELEASE THROUGH v0.9.0 SAYS IT IS READY AND THEN WAITS TO BE STOPPED, and
+// answers the stop by exiting zero, which is what its lifecycle context does on
+// SIGTERM. A parent that only waited for exit sat behind it forever with the
+// services stopped; this one reads the line, knows from the candidate's own usage
+// that the line means "stop me", stops it, and reads the zero.
 func TestRunCandidateStopsALegacyProbeThatReportsReadyAndWaits(t *testing.T) {
-	legacyCandidate(t, "echo '"+serverProbeReadyLine+"'\nexec sleep 60")
+	legacyCandidate(t, "trap 'exit 0' TERM\necho '"+serverProbeReadyLine+"'\n"+
+		"while :; do sleep 0.2; done")
 
 	started := time.Now()
 
@@ -174,7 +178,7 @@ func TestRunCandidateKeepsTheWholeRefusal(t *testing.T) {
 func TestRunCandidateRefusesAFixedProbeThatPrintsTheLineAndHolds(t *testing.T) {
 	fixedCandidate(t, "echo '"+serverProbeReadyLine+"'\nexec sleep 60")
 	shortDeadline(t, 2*time.Second)
-	shortOutputGrace(t, 2*time.Second)
+	shortOutputGrace(t)
 
 	err := (&ledgerHost{}).runCandidate(t.Context(), "server")
 	if err == nil {
@@ -273,9 +277,10 @@ func TestRunCandidateGivesUpOnASilentProbe(t *testing.T) {
 	}
 }
 
-// A LEGACY PROBE THAT IGNORES SIGTERM IS KILLED, and a kill this probe sent is no
-// verdict either.
-func TestRunCandidateKillsALegacyProbeThatIgnoresTheStop(t *testing.T) {
+// A LEGACY PROBE THAT IGNORES SIGTERM IS KILLED, AND REFUSED. A real release
+// answers the stop by exiting zero; one that had to be killed has not proved it
+// can stop, and its death by signal is the status it is judged by.
+func TestRunCandidateRefusesALegacyProbeThatIgnoresTheStop(t *testing.T) {
 	legacyCandidate(t, "trap '' TERM\necho '"+serverProbeReadyLine+"'\nwhile :; do sleep 1; done")
 
 	previous := probeStopGrace
@@ -285,12 +290,75 @@ func TestRunCandidateKillsALegacyProbeThatIgnoresTheStop(t *testing.T) {
 
 	started := time.Now()
 
-	if err := (&ledgerHost{}).runCandidate(t.Context(), "server"); err != nil {
-		t.Fatalf("a legacy probe that had to be killed was refused: %v", err)
+	err := (&ledgerHost{}).runCandidate(t.Context(), "server")
+	if err == nil {
+		t.Fatal("a legacy probe that ignored SIGTERM and had to be killed passed")
+	}
+
+	if !strings.Contains(err.Error(), "signal: killed") {
+		t.Fatalf("the kill was not the verdict: %v", err)
 	}
 
 	if took := time.Since(started); took > 15*time.Second {
 		t.Fatalf("killing a legacy probe took %s", took)
+	}
+}
+
+// A LEGACY PROBE THAT DIES BY SIGNAL ON ITS OWN IS REFUSED TOO, whichever channel
+// the scheduler picked: the stop this probe sends is answered with a zero, so a
+// signalled death is never something the stop explains.
+func TestRunCandidateRefusesALegacyProbeThatDiesBySignalAfterReadiness(t *testing.T) {
+	legacyCandidate(t, "echo '"+serverProbeReadyLine+"'\nkill -TERM $$")
+
+	for i := range 10 {
+		err := (&ledgerHost{}).runCandidate(t.Context(), "server")
+		if err == nil {
+			t.Fatalf("run %d: a legacy probe that killed itself after readiness passed", i)
+		}
+
+		if !strings.Contains(err.Error(), "signal: terminated") {
+			t.Fatalf("run %d: the self-inflicted death was misread: %v", i, err)
+		}
+	}
+}
+
+// AN OPEN OUTPUT OUTRANKS EVERY PROTOCOL VERDICT. A fixed candidate that printed
+// the forbidden line, and a legacy candidate that never printed it, are each a
+// refusal on their own; with a descendant still holding the output they are a
+// cordon, because nothing may be restored over a process the pipe proves alive.
+func TestRunCandidateCordonsAFixedProbeThatPrintsTheLineBehindAHolder(t *testing.T) {
+	pidFile := filepath.Join(t.TempDir(), "holder.pid")
+	t.Setenv("BILLET_TEST_GRANDCHILD_PIDFILE", pidFile)
+
+	fixedCandidate(t, "sleep 60 &\necho $! > \"$BILLET_TEST_GRANDCHILD_PIDFILE\"\n"+
+		"echo '"+serverProbeReadyLine+"'\nexit 0")
+	shortOutputGrace(t)
+
+	err := (&ledgerHost{}).runCandidate(t.Context(), "server")
+
+	killLater(t, recordedPID(t, pidFile))
+
+	if !errors.Is(err, hostupgrade.ErrUnsafeToRestore) {
+		t.Fatalf("a broken protocol with a live descendant behind it did not cordon: %v", err)
+	}
+}
+
+func TestRunCandidateCordonsASilentLegacyProbeBehindAHolder(t *testing.T) {
+	pidFile := filepath.Join(t.TempDir(), "holder.pid")
+	t.Setenv("BILLET_TEST_GRANDCHILD_PIDFILE", pidFile)
+
+	legacyCandidate(t, "sleep 60 &\necho $! > \"$BILLET_TEST_GRANDCHILD_PIDFILE\"\nexit 0")
+	// A SILENT LEGACY EXIT WITH A HOLDER REACHES NEITHER THE LINE NOR THE CLOSE, so
+	// the probe waits for its deadline before it can look; shortened here.
+	shortDeadline(t, 2*time.Second)
+	shortOutputGrace(t)
+
+	err := (&ledgerHost{}).runCandidate(t.Context(), "server")
+
+	killLater(t, recordedPID(t, pidFile))
+
+	if !errors.Is(err, hostupgrade.ErrUnsafeToRestore) {
+		t.Fatalf("a silent legacy exit with a live descendant behind it did not cordon: %v", err)
 	}
 }
 
@@ -305,7 +373,7 @@ func TestRunCandidateRefusesAProbeWhoseChildHoldsItsOutput(t *testing.T) {
 
 	legacyCandidate(t, "sleep 60 &\necho $! > \"$BILLET_TEST_GRANDCHILD_PIDFILE\"\n"+
 		"echo '"+serverProbeReadyLine+"'\nexec sleep 60")
-	shortOutputGrace(t, 2*time.Second)
+	shortOutputGrace(t)
 
 	// THE CHILD KEEPS THE OUTPUT OPEN, so the stop is followed by the whole stop
 	// grace before the kill and the whole output grace before the verdict;
@@ -323,7 +391,7 @@ func TestRunCandidateRefusesAProbeWhoseChildHoldsItsOutput(t *testing.T) {
 		t.Fatal("a probe whose child held its output open passed")
 	}
 
-	if !strings.Contains(err.Error(), "holding its output") {
+	if !strings.Contains(err.Error(), "still holds its output") {
 		t.Fatalf("the held output was misread: %v", err)
 	}
 
