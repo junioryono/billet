@@ -148,6 +148,12 @@ func cmdRolloutStart(ctx context.Context, args []string) error {
 		return err
 	}
 
+	if *allowDowngrade {
+		if err := checkConvergibleDowngrade(target.Version); err != nil {
+			return err
+		}
+	}
+
 	current := releasesource.Host(version.Version(),
 		releasesource.Range{Min: nodeapi.MinVersion, Max: nodeapi.Version},
 		state.LatestSchemaVersion(), firecracker.GuestContract)
@@ -259,6 +265,34 @@ func checkDowngrade(target, running string, allowed bool) error {
 		"name with --allow-downgrade, because the ledger has been served by the newer release "+
 		"and an older binary would otherwise be refused by its release watermark, one drain "+
 		"at a time", ErrDowngrade, target, running)
+}
+
+// firstSelfNamingRelease is the first release that names itself by its tag. A
+// release before it reports the bare "0.9.1" and compares it with the rollout's
+// "v0.9.1" as unequal, so a control plane downgraded to one never sees itself on
+// the target and dispatches no node.
+const firstSelfNamingRelease = "v0.9.2"
+
+// checkConvergibleDowngrade refuses a downgrade rollout to a release that could
+// not converge it, and names the way to do it one host at a time.
+//
+// THE DOWNGRADED CONTROL PLANE RUNS THE COORDINATOR. A rollout to a release before
+// firstSelfNamingRelease installs a binary that compares its own bare version to
+// the tag the ledger recorded and never finds itself there, so the rollout waits
+// forever for a controller that is already on the target, and no node is ever
+// told to move. This binary cannot fix that binary; what it can do is refuse to
+// record a decision nothing will finish.
+func checkConvergibleDowngrade(target string) error {
+	order, ok := version.Compare(target, firstSelfNamingRelease)
+	if !ok || order >= 0 {
+		return nil
+	}
+
+	return fmt.Errorf("%w: a rollout to %s cannot converge: releases before %s name themselves "+
+		"without the tag's v and never see themselves on a rollout's target, so the downgraded "+
+		"control plane would dispatch no node. Move hosts one at a time with "+
+		"`billet host-upgrade --version %s --allow-downgrade`", ErrDowngrade, target,
+		firstSelfNamingRelease, target)
 }
 
 // resolveTarget turns a channel or an exact pin into one immutable manifest.

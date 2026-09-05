@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log/slog"
 	"time"
+
+	"github.com/junioryono/billet/internal/version"
 )
 
 // Host is what the coordinator knows about one machine in the fleet.
@@ -198,6 +200,23 @@ func (c *Coordinator) Tick(ctx context.Context) error {
 		return c.observeController(ctx, current)
 	}
 
+	// AND THE BINARY IS ASKED NOW, NOT REMEMBERED. The controller phase records
+	// that a control plane WAS on the target; this coordinator runs in whatever
+	// binary the host runs today. A control plane moved past the target by hand
+	// and restarted would otherwise, in its first tick, tell every pending node to
+	// move to a release it has itself left, before the starter's first pass ends
+	// the stale rollout as superseded (2026-09-05 was one tick from that). Nodes
+	// move only behind a control plane that runs the target now, and a deliberate
+	// downgrade holds the same way: its nodes move once the downgraded control
+	// plane is the one running.
+	if !version.Same(c.ourVersion, current.TargetVersion) {
+		c.log.Warn("the control plane no longer runs this rollout's target; no node is told to "+
+			"move until the rollout is superseded or the control plane is back on it",
+			"running", c.ourVersion, "target", current.TargetVersion, "rollout", current.ID)
+
+		return nil
+	}
+
 	byName := make(map[string]Host, len(hosts))
 	for _, h := range hosts {
 		byName[h.Name] = h
@@ -218,7 +237,10 @@ func (c *Coordinator) Tick(ctx context.Context) error {
 // the one making this observation. What it does is notice — and until it can, no
 // node is told to move.
 func (c *Coordinator) observeController(ctx context.Context, current *Rollout) error {
-	if c.ourVersion != current.TargetVersion {
+	// THROUGH version.Same, NOT !=: a control plane on a release through v0.9.1
+	// names itself "0.9.1" and the target is "v0.9.1", and the inequality read
+	// every such control plane as never on its target.
+	if !version.Same(c.ourVersion, current.TargetVersion) {
 		c.log.Debug("the control plane is not yet on the rollout's target",
 			"running", c.ourVersion, "target", current.TargetVersion,
 			"rollout", current.ID)
@@ -551,7 +573,7 @@ func (c *Coordinator) settleNode(ctx context.Context, current *Rollout, n *Node,
 	// has been through its own transaction, which proved readiness before it
 	// committed; that registration, plus the fact that billet is still in contact
 	// with it, is the fleet-level evidence.
-	if host.Release == current.TargetVersion {
+	if version.Same(host.Release, current.TargetVersion) {
 		return c.settleAtTarget(ctx, current, n, host)
 	}
 

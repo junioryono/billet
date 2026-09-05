@@ -217,7 +217,7 @@ else
 fi
 
 rehearsal_wait_for 600 "the controller to run ${TO}" "${controller}" \
-    sh -c "/usr/bin/billet version | grep -q ' ${TO_VERSION} '" || {
+    sh -c "/usr/bin/billet version | grep -Eq ' v?${TO_VERSION} '" || {
     echo "--- billet-upgrade.service on the controller ---" >&2
     docker exec "${controller}" journalctl -u billet-upgrade.service --no-pager -o short-iso 2>&1 |
         grep -vE '^[[:space:]]|goroutine|\.go:[0-9]' | tail -30 >&2
@@ -237,7 +237,7 @@ docker exec "${controller}" grep -qF "${to_digest}" /var/lib/billet/installed.js
 rehearsal_step "the coordinator moves the node"
 node_upgrade_started=$(date -u +%s)
 rehearsal_wait_for 900 "the node to run ${TO}" "${node}" \
-    sh -c "/usr/bin/billet version | grep -q ' ${TO_VERSION} '" ||
+    sh -c "/usr/bin/billet version | grep -Eq ' v?${TO_VERSION} '" ||
     rehearsal_fail "the node was never moved to ${TO}"
 node_upgrade_took=$(($(date -u +%s) - node_upgrade_started))
 

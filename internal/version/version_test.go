@@ -164,6 +164,9 @@ func TestTheFallbackChain(t *testing.T) {
 		want     string
 	}{
 		{"injected wins over build info", "v1.2.3", tagged, true, "v1.2.3"},
+		{"the release build's bare {{.Version}} is spoken as its tag", "0.9.1", tagged, true, "v0.9.1"},
+		{"a bare build-info version is spoken as its tag too", "", &debug.BuildInfo{Main: debug.Module{Version: "9.9.9"}}, true, "v9.9.9"},
+		{"a snapshot is not a release and passes through", "0.0.0-SNAPSHOT-ab11959", tagged, true, "0.0.0-SNAPSHOT-ab11959"},
 		{"build info when nothing is injected", "", tagged, true, "v9.9.9"},
 		{"(devel) is still better than nothing", "", devel, true, "(devel)"},
 		{"no build info at all", "", nil, false, unknown},

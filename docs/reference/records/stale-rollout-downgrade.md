@@ -1,0 +1,37 @@
+# The stale rollout that downgraded a control plane
+
+What happened on a real deployment on 2026-09-05, why three defects had to line up for it, and what changed. The deployment is the reference one: a control plane with a SQLite ledger on one host, one Firecracker node on another, converged by the Ansible host role from a repository that pins the collection to a release, and on automatic updates from the stable channel.
+
+## What happened
+
+**09:55Z.** The control plane ran release 0.8.0. Its automatic starter saw the stable channel at v0.9.0 and recorded rollout `f71634f196c6dd05`, target v0.9.0, decision 1. The host's `billet-upgrade.timer` had been disabled by hand a little earlier, because the probe deadlock recorded in [Host rehearsals](host-rehearsals.md) was known and unfixed, so nothing acted on the rollout: the controller stayed pending and the node was never dispatched.
+
+**12:58Z.** v0.9.1 was cut with the probe and fence fixes, and the stable channel moved to it. The rollout to v0.9.0 stayed open: a running rollout blocks every later one, and nothing ended it.
+
+**15:51Z.** The control plane was moved to v0.9.1 by the Ansible host role, pinned for that one converge, because a local-ledger controller on v0.8.0 cannot take the fix by rollout ([Host rehearsals](host-rehearsals.md) explains why). The role's transaction succeeded, and the role did what it does under automatic updates: it rendered and enabled `billet-upgrade.timer`.
+
+**15:57:16Z.** The timer fired. `billet host-upgrade --from-rollout`, now the v0.9.1 binary, read the ledger's open rollout: target v0.9.0, decision 1. It ran the whole transaction backwards, `stopped` at 15:57:16, `imaged`, `fenced`, `snapshotted`, `installed`, `migrated`, `probed` and `upgrade committed from=0.9.1 to=v0.9.0` at 15:57:22, and then failed one line later: `the upgrade committed but the services did not start: starting billet-server.service: exit status 1`. The claim stayed held, the journal said committed, `/usr/bin/billet` was v0.9.0 and answered `Permission denied` to any user but root, and the control plane was down. Every timer tick after that said `Another transaction has already installed v0.9.0 ... nothing to do`. A second converge of the role, minutes later, was refused at its first inspection, `/var/lib/billet/upgrades/active is a symlink`, which is the correct refusal over a claim. The node was never dispatched and stayed on v0.8.0 throughout.
+
+## Three defects, and each was necessary
+
+**A release binary was never a release to the code that ordered releases.** The release build stamps the version as GoReleaser's `{{.Version}}`, which is the tag without its leading `v`, so every release from v0.6.0 to v0.9.1 reported itself as `0.9.1`: in `billet version`, in its upgrade journals (`0.9.1 -> v0.9.0` above), in the release a node registers with, and to every guard that compared it with a channel's `v0.9.1`. `version.Compare` accepted only `vX.Y.Z` and answered could-not-tell for the bare form, and the guards, correctly, treat could-not-tell as neither yes nor no. So on a real release `checkDowngrade` refused nothing, the timer's "the rollout's target is older than the release running here" refusal never fired, the automatic starter's own downgrade refusal never fired, the ledger's release watermark neither refused nor, being gated on the same grammar, was ever recorded, `fleetOn` never saw a fleet on its target and the timer never saw a host already on one. The unit tests injected `v1.2.3` and proved every guard against a shape production never had.
+
+**A rollout the fleet had been moved past was never ended.** The starter starts nothing over an open rollout, which is right while the rollout can finish. One whose target is older than the release the control plane now runs cannot finish forwards, and left open it holds the fleet on a decision the channel has left behind, waiting for a controller that can act on it, which is the controller a person just moved by hand.
+
+**The updater installed a binary the service account could not execute.** `billet-upgrade.service` runs as root under `UMask=0077`, and the copy that installs a candidate, and that restores the preserved binary on a rollback, wrote it with `os.WriteFile(..., 0755)`, which the umask cut to `0700 root:root`. `billet-server` runs as the service account. No timer-driven transaction had ever started a control plane: the rehearsals stopped at the signing identity, then at the probe deadlock, then at the fence, and today's run was the first to reach `StartServices` on a control plane and the first to see this. A node host never showed it, because `billet-node` runs as root.
+
+Without the first, the timer would have printed `Rollout f716's target v0.9.0 is older than the 0.9.1 running here; nothing to do`. Without the second, there would have been no stale rollout to read. Without the third, the downgraded control plane would at least have come back up on v0.9.0.
+
+## What changed, in the release after v0.9.1
+
+- A release names itself by its tag whichever way the build stamped it (`version.Version()` canonicalises a bare `X.Y.Z`), and `version.Compare` orders both spellings, because the journals, node registrations and rollouts the earlier releases wrote still carry the bare one. `version.Same` is equality across the spellings and replaces `==` on release strings in the starter and the timer's instruction; `version.Canonical` turns a node's bare report into the tag before the allocator records it; `version.IsRelease` stays the tag grammar for pins and the watermark. The downgrade, instruction and starter tests use the bare shape production had, and making `Compare` strict again turns them red in three packages.
+- The starter finishes a running rollout whose target is older than the release the control plane runs as aborted, with the reason `superseded` on its record, so the next tick starts the channel's target; a rollout that allows a downgrade is an operator's and is left alone.
+- The copy that installs a candidate sets its mode explicitly after the write, which the umask cannot touch, and a test runs it under `0077`.
+
+## What an operator does to a host left this way
+
+With the timer disabled by hand first, so nothing else moves: `chmod 0755 /usr/bin/billet` gives the service account the execute bit the umask stripped; `billet rollout abort --reason ...` retires the stale decision so nothing obeys it again; `billet host-upgrade --resume` finishes the committed journal, which clears a fence that is already gone, starts the services and releases the claim. The host is then serving on the release the rollout installed, with no claim, and the role moves it forward once more with a pin, to a release that carries the fixes, before the timer is enabled again; the fixed starter supersedes whatever rollout the interim control plane recorded, and the fixed timer finds the host already on the target and settles.
+
+## What this record does not claim
+
+The node half of the fleet was never reached by any of this: it stayed pending on v0.8.0 and takes the fixed release by rollout, as [Host rehearsals](host-rehearsals.md) records for a node-only host. Whether a v0.9.1 control plane's *forward* timer-driven upgrade would have started its services is not measured, but the code says no, for the third defect's reason, and that is why the interim control plane is moved by the role rather than by its own timer.

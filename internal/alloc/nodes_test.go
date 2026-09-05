@@ -231,6 +231,18 @@ func TestTheHighestReleaseAHostRegisteredWithNeverDecreases(t *testing.T) {
 		t.Fatalf("a development build moved the highest release to %q", got.HighestRelease)
 	}
 
+	// A RELEASE THROUGH v0.9.1 REPORTS THE BARE FORM, and it is a release: recorded
+	// as its tag, and ordered against the tags, or every such host reads as never
+	// having registered a release at all (which is what happened until v0.9.2).
+	if got := register("0.6.0"); got.HighestRelease != "v0.6.0" {
+		t.Fatalf("a host reporting the bare 0.6.0 recorded %q as its highest release; want v0.6.0",
+			got.HighestRelease)
+	}
+
+	if got := register("0.5.9"); got.HighestRelease != "v0.6.0" {
+		t.Fatalf("a bare older report moved the highest release to %q", got.HighestRelease)
+	}
+
 	if got := register("v0.6.0"); got.HighestRelease != "v0.6.0" {
 		t.Fatalf("a newer release did not raise the highest: %+v", got)
 	}

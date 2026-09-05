@@ -203,7 +203,7 @@ Capture a deployment as one unit, put it back as one unit or not at all, or put 
 
 | Command | Meaning |
 |---|---|
-| `billet rollout start [--channel stable] [--version] [--cohort 1] [--failure-budget 1] [--allow-downgrade] [--skip-signature-verification]` | resolve a channel once into an immutable target and record the decision; a target older than the running release is refused without `--allow-downgrade`. With `release.automatic` on (the default) the control plane does this itself when the channel advances |
+| `billet rollout start [--channel stable] [--version] [--cohort 1] [--failure-budget 1] [--allow-downgrade] [--skip-signature-verification]` | resolve a channel once into an immutable target and record the decision; a target older than the running release is refused without `--allow-downgrade`, and a fleet downgrade to a release before v0.9.2 is refused even with it, because a control plane on such a release could not converge the rollout (`billet host-upgrade --version <tag> --allow-downgrade` moves those hosts one at a time). With `release.automatic` on (the default) the control plane does this itself when the channel advances |
 | `billet rollout status` | where each host has got to and what it proved |
 | `billet rollout abort --reason` | abandon the decision; converged hosts stay converged |
 | `billet rollout retry\|exempt\|decommission <node> [--reason] [--force]` | put a host back to pending, mark it not part of this rollout, or record it gone |
@@ -223,4 +223,4 @@ Capture a deployment as one unit, put it back as one unit or not at all, or put 
 
 ## `billet version`
 
-Print the version and the Go version.
+Print the version and the Go version. A release names itself by its tag, `v0.9.2`, whichever way the build stamped it; releases through v0.9.1 printed `0.9.1`, and every guard that ordered releases read that as not a release.
