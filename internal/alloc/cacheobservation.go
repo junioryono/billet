@@ -54,9 +54,10 @@ func (c ImageCache) Valid() bool {
 // RECORDED WHEN THE DISPOSITION IS FINAL, not when it is intended: a call the
 // site store failed to answer is retried through GitHub, and what the guest
 // got was a splice, whatever billet set out to do. A job's calls run
-// concurrently, so the one recorded first is the one that finished first, not
-// necessarily the one dispatched first; either is an honest account of a call
-// this job made.
+// concurrently, so the one kept is the first completed outcome to take the
+// session's lock and be written, which need not be the call dispatched first
+// or even the one that finished first; any of them is an honest account of a
+// call this job made.
 type ActionsCache string
 
 const (

@@ -375,8 +375,72 @@ func blockedCall(
 	}()
 
 	var releaseOnce sync.Once
+	release = func() { releaseOnce.Do(func() { close(releaseCh) }) }
 
-	return enteredCh, func() { releaseOnce.Do(func() { close(releaseCh) }) }, doneCh
+	// RELEASED AND JOINED WHEN THE TEST ENDS, however it ends, so a failure
+	// before the test's own join leaves no goroutine behind.
+	t.Cleanup(func() {
+		release()
+		select {
+		case <-doneCh:
+		case <-time.After(10 * time.Second):
+			t.Error("the blocked call never finished after its release")
+		}
+	})
+
+	return enteredCh, release, doneCh
+}
+
+// awaitEntered waits, bounded, for the blocked call to reach the policy read; a
+// dispatch that answered without consulting the policy fails here rather than
+// hanging the suite.
+func awaitEntered(t *testing.T, entered <-chan struct{}) {
+	t.Helper()
+
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the dispatched call never reached the kill-switch read")
+	}
+}
+
+// awaitDone waits, bounded, for the blocked call to finish and reports whether
+// the proxy answered it locally.
+func awaitDone(t *testing.T, done <-chan bool) bool {
+	t.Helper()
+
+	select {
+	case handled := <-done:
+		return handled
+	case <-time.After(10 * time.Second):
+		t.Fatal("the blocked call never finished after its release")
+
+		return false
+	}
+}
+
+// snapshotSession copies one session's durable record into a fresh state
+// directory, the way a crashed node's disk looks to the process that replaces
+// it, so the still-running fixture cannot write into the replacement's storage.
+func snapshotSession(t *testing.T, record durableCacheSession) string {
+	t.Helper()
+
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, cacheSessionDirectory), 0o700); err != nil {
+		t.Fatalf("create the snapshot directory: %v", err)
+	}
+
+	encoded, err := json.Marshal(record)
+	if err != nil {
+		t.Fatalf("encode the snapshot: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, cacheSessionDirectory, record.Token+".json"),
+		encoded, 0o600); err != nil {
+		t.Fatalf("write the snapshot: %v", err)
+	}
+
+	return dir
 }
 
 // A CALL STILL BEING ANSWERED IS NOT SETTLED AS UNUSED. The proxy marks a
@@ -397,8 +461,7 @@ func TestSettlementLeavesAnInFlightActionsCallAlone(t *testing.T) {
 	recordPath := filepath.Join(service.stateDir, session.token+".json")
 
 	entered, release, done := blockedCall(t, service, session)
-	defer release()
-	<-entered
+	awaitEntered(t, entered)
 
 	// THE FIRST CALL IS MARKED DURABLY BEFORE IT IS DISPATCHED.
 	if record := sessionRecord(t, service, session.token); !record.Observed.ActionsPending {
@@ -422,7 +485,7 @@ func TestSettlementLeavesAnInFlightActionsCallAlone(t *testing.T) {
 	// THE CALL FINISHES INTO A CLOSED SESSION: the handler refuses it, the proxy
 	// hands it to GitHub, and that is the outcome recorded and reported.
 	release()
-	if handled := <-done; handled {
+	if awaitDone(t, done) {
 		t.Fatal("a call finishing into a closed session was answered locally")
 	}
 
@@ -458,35 +521,54 @@ func TestARecoveredSessionLeavesWhatItDidNotWitnessUnknown(t *testing.T) {
 	service.SetCacheObserver(&recordingObserver{})
 
 	// The crash: the call is dispatched through the proxy and is still being
-	// answered while the "next process" below loads what the record says.
+	// answered when the disk is snapshotted, which is what the next process
+	// finds. The snapshot is a separate directory, so the fixture still running
+	// here cannot write into the replacement's storage.
 	entered, release, done := blockedCall(t, service, session)
-	<-entered
+	awaitEntered(t, entered)
 
-	restarted, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", service.rootState,
-		storage, &fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
-	if err != nil {
-		t.Fatalf("NewCacheService after the restart: %v", err)
-	}
-	after := &recordingObserver{}
-	restarted.SetCacheObserver(after)
-
-	if err := restarted.Cleanup(t.Context(), session.instance); err != nil {
-		t.Fatalf("Cleanup after the restart: %v", err)
+	interrupted := sessionRecord(t, service, session.token)
+	if !interrupted.Observed.ActionsPending {
+		t.Fatalf("the interrupted record = %+v, want the call marked pending", interrupted.Observed)
 	}
 
-	if calls := after.recorded(); len(calls) != 0 {
-		t.Fatalf("the restarted service told its observer %+v, want nothing: it witnessed neither "+
-			"half", calls)
+	// AND A RECORD WITH NO PENDING MARK AT ALL: an older record, or a crash
+	// before the mark's write reached the disk. Recovery alone must leave it
+	// unknown; the pending mark is not what this rule rests on.
+	unmarked := interrupted
+	unmarked.Observed = cacheObserved{}
+
+	for name, record := range map[string]durableCacheSession{
+		"interrupted mid-call":   interrupted,
+		"without a pending mark": unmarked,
+	} {
+		dir := snapshotSession(t, record)
+
+		restarted, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", dir,
+			storage, &fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
+		if err != nil {
+			t.Fatalf("%s: NewCacheService after the restart: %v", name, err)
+		}
+		after := &recordingObserver{}
+		restarted.SetCacheObserver(after)
+
+		if err := restarted.Cleanup(t.Context(), record.Instance); err != nil {
+			t.Fatalf("%s: Cleanup after the restart: %v", name, err)
+		}
+
+		if calls := after.recorded(); len(calls) != 0 {
+			t.Fatalf("%s: the restarted service told its observer %+v, want nothing: it witnessed "+
+				"neither half", name, calls)
+		}
+		if _, err := os.Stat(filepath.Join(dir, cacheSessionDirectory, record.Token+".json")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%s: the recovered session's record survived its cleanup: %v", name, err)
+		}
 	}
 
-	// THE CRASHED PROCESS IS JOINED before the test ends, so nothing of it
-	// outlives the directory it writes to.
+	// THE CRASHED PROCESS IS JOINED, and its late write lands in its own
+	// directory, never in a replacement's.
 	release()
-	select {
-	case <-done:
-	case <-time.After(10 * time.Second):
-		t.Fatal("the blocked call never finished after its release")
-	}
+	awaitDone(t, done)
 
 	// AND A RECOVERED SESSION WITH NO INTERCEPTION STILL SAYS OFF.
 	plain, plainObserver, _ := observedService(t, &fakeCacheStore{})
