@@ -535,7 +535,15 @@ func (p *plane) mint(w http.ResponseWriter, r *http.Request, s *scaleSet) {
 		})
 	}
 
-	fakeactions.WriteJSON(p.t, w, fakeactions.JitConfigJSON(int(rn.id), rn.name, "encoded-jit-config-"+rn.name))
+	// The registration names the scale set it was minted against, not the
+	// shared helper's placeholder, so a reader of the response cannot be handed
+	// an identity that contradicts the request.
+	resp := fakeactions.JitConfigJSON(int(rn.id), rn.name, "encoded-jit-config-"+rn.name)
+	if runner, ok := resp["runner"].(map[string]any); ok {
+		runner["runnerScaleSetId"] = s.id
+	}
+
+	fakeactions.WriteJSON(p.t, w, resp)
 }
 
 // agents answers the runner lookup by name and the removal by id.

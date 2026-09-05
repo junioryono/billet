@@ -15,19 +15,23 @@ import (
 // THE EXPORTER IS EXECUTED, NOT PATTERN-MATCHED. It is the one way a real
 // workload reaches the replay harness, and every rule in it is a shell rule: a
 // failed page must fail the run rather than shorten the trace, a job that never
-// ran must be left out, GitHub's conclusion must arrive spelled as the wire
-// spells it. So it runs here against a fake `gh` that serves fixture pages and
-// evaluates the script's own jq, and what it emits is read back by the reader
-// the replay uses.
+// ran must be left out, the tier must be the label the rule names and never
+// the first one the workflow happened to list, GitHub's conclusion must arrive
+// spelled as the wire spells it. So it runs here against a fake `gh` that
+// serves fixture pages, and what it emits is read back by the reader the replay
+// uses.
 
 const exportScript = "export-actions-trace.sh"
 
 // fakeGH stands in for the CLI. It answers `api` calls from $FAKE_GH_DIR: the
-// runs page from runs.json and each run's jobs from jobs-<id>.json, and refuses
-// any flag but --paginate, because `gh api` has no --arg and takes --jq's filter
-// as the next word, so a script that shaped its answer inside gh would be tested
-// against a jq the real CLI never runs. FAKE_GH_FAIL makes every call fail, the
-// way an expired token would.
+// runs from runs.json and each run's jobs from jobs-<id>.json, each fixture the
+// concatenated pages `gh api --paginate` writes, and it refuses a call without
+// --paginate, because a call without it is a first page presented as the whole
+// history. It refuses any other flag, because `gh api` has no --arg and takes
+// --jq's filter as the next word, so a script that shaped its answer inside gh
+// would be tested against a jq the real CLI never runs. FAKE_GH_FAIL makes
+// every call fail, the way an expired token would; FAKE_GH_FAIL_RUN makes one
+// run's jobs page fail, the way a later page can.
 const fakeGH = `#!/bin/bash
 set -euo pipefail
 if [ -n "${FAKE_GH_FAIL:-}" ]; then
@@ -37,17 +41,22 @@ fi
 [ "$1" = "api" ] || { echo "fake gh: unexpected subcommand $1" >&2; exit 90; }
 shift
 endpoint=""
+paginate=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --paginate) shift ;;
+    --paginate) paginate=yes; shift ;;
     -*) echo "fake gh: unexpected flag $1" >&2; exit 91 ;;
     *) endpoint=$1; shift ;;
   esac
 done
+[ -n "$paginate" ] || { echo "fake gh: a history request without --paginate is one page" >&2; exit 94; }
 path=${endpoint%%\?*}
 case "$path" in
   repos/*/actions/runs) file="$FAKE_GH_DIR/runs.json" ;;
-  repos/*/actions/runs/*/jobs) id=${path%/jobs}; id=${id##*/}; file="$FAKE_GH_DIR/jobs-$id.json" ;;
+  repos/*/actions/runs/*/jobs)
+    id=${path%/jobs}; id=${id##*/}
+    if [ "$id" = "${FAKE_GH_FAIL_RUN:-}" ]; then echo "gh: HTTP 502: Bad gateway" >&2; exit 1; fi
+    file="$FAKE_GH_DIR/jobs-$id.json" ;;
   *) echo "fake gh: unexpected endpoint $path" >&2; exit 92 ;;
 esac
 [ -f "$file" ] || { echo "fake gh: no fixture for $path" >&2; exit 93; }
@@ -55,26 +64,36 @@ printf '%s\n' "$endpoint" >> "$FAKE_GH_LOG"
 cat "$file"
 `
 
-const runsPage = `{"total_count": 2, "workflow_runs": [
-  {"id": 101, "path": ".github/workflows/ci.yml", "head_branch": "main"},
+// runsPages is what --paginate writes for a two-page listing: two objects, one
+// after the other, with no array around them.
+const runsPages = `{"total_count": 2, "workflow_runs": [
+  {"id": 101, "path": ".github/workflows/ci.yml", "head_branch": "main"}
+]}
+{"total_count": 2, "workflow_runs": [
   {"id": 102, "path": ".github/workflows/release.yml", "head_branch": "release/v0.6"}
 ]}`
 
-// Run 101: two completed jobs on two labels, and one still running, which has no
-// duration and must be left out.
+// Run 101: the tier label is listed LAST, after the generic labels a self-hosted
+// job carries, on two completed jobs; a third is still running and has no
+// duration.
 const jobsRun101 = `{"total_count": 3, "jobs": [
-  {"id": 1, "status": "completed", "conclusion": "success", "labels": ["billet-2vcpu"],
+  {"id": 1, "status": "completed", "conclusion": "success", "labels": ["self-hosted", "linux", "billet-2vcpu"],
    "created_at": "2026-03-02T09:00:00Z", "started_at": "2026-03-02T09:00:40Z", "completed_at": "2026-03-02T09:04:45Z"},
-  {"id": 2, "status": "completed", "conclusion": "failure", "labels": ["billet-4vcpu", "self-hosted"],
+  {"id": 2, "status": "completed", "conclusion": "failure", "labels": ["self-hosted", "linux", "billet-4vcpu"],
    "created_at": "2026-03-02T09:00:05Z", "started_at": "2026-03-02T09:01:00Z", "completed_at": "2026-03-02T09:11:00Z"},
-  {"id": 3, "status": "in_progress", "conclusion": null, "labels": ["billet-2vcpu"],
+  {"id": 3, "status": "in_progress", "conclusion": null, "labels": ["self-hosted", "linux", "billet-2vcpu"],
    "created_at": "2026-03-02T09:00:10Z", "started_at": "2026-03-02T09:00:50Z", "completed_at": null}
 ]}`
 
-// Run 102: one job on a hosted label the replay's fleet would not declare.
-const jobsRun102 = `{"total_count": 1, "jobs": [
+// Run 102, over two job pages: a hosted job no billet rule names, and a job
+// that asked for two billet labels, which no prefix rule can name once.
+const jobsRun102 = `{"total_count": 2, "jobs": [
   {"id": 4, "status": "completed", "conclusion": "success", "labels": ["ubuntu-latest"],
    "created_at": "2026-03-02T10:00:00Z", "started_at": "2026-03-02T10:00:10Z", "completed_at": "2026-03-02T10:02:10Z"}
+]}
+{"total_count": 2, "jobs": [
+  {"id": 5, "status": "completed", "conclusion": "success", "labels": ["billet-2vcpu", "billet-4vcpu"],
+   "created_at": "2026-03-02T10:00:01Z", "started_at": "2026-03-02T10:00:20Z", "completed_at": "2026-03-02T10:03:20Z"}
 ]}`
 
 // exportHarness is one run's fake CLI, fixtures and log, on a PATH holding only
@@ -104,7 +123,7 @@ func newExportHarness(t *testing.T) exportHarness {
 		}
 	}
 
-	for _, tool := range []string{"bash", "jq", "mktemp", "rm", "wc", "cat"} {
+	for _, tool := range []string{"bash", "jq", "mktemp", "rm", "cat"} {
 		resolved, err := exec.LookPath(tool)
 		if err != nil {
 			t.Fatalf("this test needs %s on PATH: %v", tool, err)
@@ -120,7 +139,7 @@ func newExportHarness(t *testing.T) exportHarness {
 	}
 
 	for name, body := range map[string]string{
-		"runs.json":     runsPage,
+		"runs.json":     runsPages,
 		"jobs-101.json": jobsRun101,
 		"jobs-102.json": jobsRun102,
 	} {
@@ -155,13 +174,14 @@ func (h exportHarness) run(t *testing.T, env []string, args ...string) (string, 
 	return stdout.String(), stderr.String(), err
 }
 
-// The exporter writes a trace the replay reads: completed jobs only, GitHub's
-// stamps as arrivals, whole-second durations, the wire's spelling of success and
-// the workflow reference the scale-set message would carry.
+// The exporter writes a trace the replay reads: completed jobs only, the tier
+// the prefix rule names once, GitHub's stamps as arrivals, whole-second
+// durations, the wire's spelling of success and the workflow reference the
+// scale-set message would carry, across every page of runs and jobs.
 func TestTheExporterWritesATraceTheReplayReads(t *testing.T) {
 	h := newExportHarness(t)
 
-	stdout, stderr, err := h.run(t, nil, "acme/web", "--since", "2026-03-01")
+	stdout, stderr, err := h.run(t, nil, "acme/web", "--since", "2026-03-01", "--prefix", "billet-")
 	if err != nil {
 		t.Fatalf("the exporter failed: %v\nstderr: %s", err, stderr)
 	}
@@ -171,13 +191,18 @@ func TestTheExporterWritesATraceTheReplayReads(t *testing.T) {
 		t.Fatalf("the replay cannot read what the exporter wrote: %v\n%s", err, stdout)
 	}
 
-	if len(trace.Arrivals) != 3 {
-		t.Fatalf("exported %d jobs, want the 3 completed ones (the in-progress job has no duration):\n%s",
-			len(trace.Arrivals), stdout)
+	// Two jobs and only two: the running job has no duration, the hosted job
+	// carries no billet label, and the job with two billet labels is named by
+	// neither rule once.
+	if len(trace.Arrivals) != 2 {
+		t.Fatalf("exported %d jobs, want 2:\n%s", len(trace.Arrivals), stdout)
 	}
 
 	first := trace.Arrivals[0]
 
+	// THE TIER IS THE LABEL THE RULE NAMED, listed last in the fixture behind
+	// `self-hosted` and `linux`; a first-label rule would have exported
+	// `self-hosted` twice.
 	if first.Tier != "billet-2vcpu" || first.Owner != "acme" || first.Repository != "web" ||
 		first.RunID != 101 || first.Result != replay.ResultSucceeded {
 		t.Errorf("the first job was exported as %+v", first)
@@ -201,33 +226,31 @@ func TestTheExporterWritesATraceTheReplayReads(t *testing.T) {
 		t.Errorf("the failed job was exported as %+v", second)
 	}
 
-	if third := trace.Arrivals[2]; third.Tier != "ubuntu-latest" || third.RunID != 102 ||
-		third.WorkflowRef != "acme/web/.github/workflows/release.yml@refs/heads/release/v0.6" {
-		t.Errorf("the second run's job was exported as %+v", third)
+	if !strings.Contains(stderr, "exported 2 jobs from 2 completed runs") ||
+		!strings.Contains(stderr, "left out 2 completed jobs") {
+		t.Errorf("the summary on stderr does not count what was written and left out: %q", stderr)
 	}
 
-	if !strings.Contains(stderr, "exported 3 jobs from 2 completed runs") {
-		t.Errorf("the summary on stderr does not count what was written: %q", stderr)
-	}
-
-	// AND THE DATE REACHED GITHUB, encoded, on the runs request.
+	// BOTH RUNS WERE ASKED FOR, so the second page of runs reached the loop, and
+	// the date reached GitHub encoded on the runs request.
 	log, err := os.ReadFile(h.log)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if !strings.Contains(string(log), "created=%3E%3D2026-03-01") {
-		t.Errorf("the runs request did not carry the --since date: %s", log)
+	for _, want := range []string{"created=%3E%3D2026-03-01", "runs/101/jobs", "runs/102/jobs"} {
+		if !strings.Contains(string(log), want) {
+			t.Errorf("gh was never asked %q: %s", want, log)
+		}
 	}
 }
 
-// --label keeps only the jobs that asked for that label and names it as their
-// tier, so a repository whose workflows run on several labels can be replayed
-// one tier at a time.
+// --label exports the jobs that asked for that exact label and names it as their
+// tier, whatever else they asked for.
 func TestTheExporterFiltersByLabel(t *testing.T) {
 	h := newExportHarness(t)
 
-	stdout, stderr, err := h.run(t, nil, "acme/web", "--since", "2026-03-01", "--label", "self-hosted")
+	stdout, stderr, err := h.run(t, nil, "acme/web", "--since", "2026-03-01", "--label", "billet-2vcpu")
 	if err != nil {
 		t.Fatalf("the exporter failed: %v\nstderr: %s", err, stderr)
 	}
@@ -237,24 +260,41 @@ func TestTheExporterFiltersByLabel(t *testing.T) {
 		t.Fatalf("unreadable trace: %v\n%s", err, stdout)
 	}
 
-	if len(trace.Arrivals) != 1 || trace.Arrivals[0].Tier != "self-hosted" || trace.Arrivals[0].RunID != 101 {
-		t.Fatalf("--label self-hosted exported %+v, want only run 101's second job under that tier",
+	// Run 101's first job, and run 102's two-label job, which an exact label
+	// names once where a prefix cannot.
+	if len(trace.Arrivals) != 2 || trace.Arrivals[0].RunID != 101 || trace.Arrivals[1].RunID != 102 {
+		t.Fatalf("--label billet-2vcpu exported %+v, want run 101's first job and run 102's two-label job",
 			trace.Arrivals)
+	}
+
+	for _, a := range trace.Arrivals {
+		if a.Tier != "billet-2vcpu" {
+			t.Errorf("job in run %d exported under tier %q, want the label asked for", a.RunID, a.Tier)
+		}
 	}
 }
 
-// A page GitHub refuses fails the run. A trace missing a page is a shorter
-// workload that replays clean, which is the wrong kind of wrong.
+// A page GitHub refuses fails the run, whichever page it is. A trace missing a
+// page is a shorter workload that replays clean, which is the wrong kind of
+// wrong; and a failure on the LAST run's jobs, after every earlier run was
+// written, must still be the exit status.
 func TestAFailedPageFailsTheExport(t *testing.T) {
 	h := newExportHarness(t)
 
-	_, stderr, err := h.run(t, []string{"FAKE_GH_FAIL=1"}, "acme/web", "--since", "2026-03-01")
-	if err == nil {
-		t.Fatal("the exporter exited 0 with every gh call failing")
-	}
+	for name, env := range map[string][]string{
+		"every call refused": {"FAKE_GH_FAIL=1"},
+		"the last run's jobs": {"FAKE_GH_FAIL_RUN=102"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, stderr, err := h.run(t, env, "acme/web", "--since", "2026-03-01", "--prefix", "billet-")
+			if err == nil {
+				t.Fatal("the exporter exited 0 with a gh call failing")
+			}
 
-	if !strings.Contains(stderr, "Bad credentials") {
-		t.Errorf("gh's refusal did not reach stderr: %q", stderr)
+			if !strings.Contains(stderr, "gh: HTTP") {
+				t.Errorf("gh's refusal did not reach stderr: %q", stderr)
+			}
+		})
 	}
 }
 
@@ -263,10 +303,14 @@ func TestTheExporterRefusesBadArguments(t *testing.T) {
 	h := newExportHarness(t)
 
 	for name, args := range map[string][]string{
-		"no repository": {"--since", "2026-03-01"},
-		"no date":       {"acme/web"},
-		"bad date":      {"acme/web", "--since", "yesterday"},
-		"bare repo":     {"web", "--since", "2026-03-01"},
+		"no repository":       {"--since", "2026-03-01", "--prefix", "billet-"},
+		"no date":             {"acme/web", "--prefix", "billet-"},
+		"bad date":            {"acme/web", "--since", "yesterday", "--prefix", "billet-"},
+		"bare repo":           {"web", "--since", "2026-03-01", "--prefix", "billet-"},
+		"no label rule":       {"acme/web", "--since", "2026-03-01"},
+		"two label rules":     {"acme/web", "--since", "2026-03-01", "--label", "a", "--prefix", "b"},
+		"an unknown flag":     {"acme/web", "--since", "2026-03-01", "--prefix", "billet-", "--all"},
+		"a rule with no word": {"acme/web", "--since", "2026-03-01", "--prefix"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, _, err := h.run(t, nil, args...); err == nil {

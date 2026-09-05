@@ -36,11 +36,14 @@ import (
 //
 // NAMED EXCLUSIONS, NOT EVERY HIDDEN DIRECTORY. A hidden directory can hold Go
 // source that ships, so only what is provably not this tree is skipped: the
-// object store, a vendored tree, and another CHECKOUT of this module (sessions
-// park worktrees under .claude), recognised by a go.mod declaring the same
-// module path. A NESTED module with a path of its own is walked: tools/lint is
-// one, and a nested module can reach this module's internals through a replace
-// directive, so a shipping tool under one is exactly a production importer.
+// object store, a vendored tree, and another CHECKOUT of this module, which is
+// a directory under .claude (where sessions park worktrees) whose go.mod
+// declares the same module path. Both conditions, because a nested directory
+// anywhere else declaring this module's path is not a checkout, it is a way
+// past this walk, and it is walked. A NESTED module with a path of its own is
+// walked too: tools/lint is one, and a nested module can reach this module's
+// internals through a replace directive, so a shipping tool under one is
+// exactly a production importer.
 func ProductionImporters(tb testing.TB, importPath string, testSide ...string) []string {
 	tb.Helper()
 
@@ -67,7 +70,8 @@ func ProductionImporters(tb testing.TB, importPath string, testSide ...string) [
 			}
 
 			nested := filepath.Join(path, "go.mod")
-			if _, err := os.Stat(nested); err == nil && modulePath(tb, nested) == module {
+			if _, err := os.Stat(nested); err == nil && underClaude(root, path) &&
+				modulePath(tb, nested) == module {
 				return filepath.SkipDir
 			}
 
@@ -112,6 +116,17 @@ func ProductionImporters(tb testing.TB, importPath string, testSide ...string) [
 	}
 
 	return importers
+}
+
+// underClaude reports whether a directory sits below the module's .claude
+// directory, where sessions park their worktrees.
+func underClaude(root, path string) bool {
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return false
+	}
+
+	return slices.Contains(strings.Split(filepath.ToSlash(rel), "/"), ".claude")
 }
 
 // packageOf is the import path of the package a module-relative file belongs

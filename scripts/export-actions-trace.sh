@@ -3,13 +3,21 @@
 #
 # WHAT IT WRITES. One JSON line per completed job, the shape internal/replay's
 # ReadTrace reads: when the job was queued (`at`, the job's created_at), the
-# runs-on label it asked for (`tier`, its first label unless --label chose one),
-# the owner and repository, the workflow it belongs to spelled the way the
-# scale-set wire spells one (owner/repo/.github/workflows/ci.yml@refs/heads/x),
-# the run id, how long it ran (`duration`, completed_at minus started_at, in
-# seconds) and GitHub's conclusion as the wire spells it (`succeeded` for
-# success; every other conclusion verbatim). The replay maps labels onto the
-# fleet it is given and reports the ones it cannot.
+# runs-on label that names its tier, the owner and repository, the workflow it
+# belongs to spelled the way the scale-set wire spells one
+# (owner/repo/.github/workflows/ci.yml@refs/heads/x), the run id, how long it
+# ran (`duration`, completed_at minus started_at, in seconds) and GitHub's
+# conclusion as the wire spells it (`succeeded` for success; every other
+# conclusion verbatim).
+#
+# WHICH LABEL IS THE TIER IS SAID, NEVER GUESSED. A job's labels come in the
+# order the workflow wrote them, and a self-hosted job commonly lists
+# `self-hosted`, an OS and an architecture beside the label that routes it, so
+# "the first label" is whichever the author typed first. `--label L` exports the
+# jobs that asked for L, under tier L; `--prefix P` exports the jobs with exactly
+# one label starting with P, under that label, which is how a fleet whose tiers
+# are all `billet-*` is exported in one pass. A job matching neither rule, or
+# several labels under the prefix, is left out and counted on stderr.
 #
 # HOW IT ASKS. `gh api --paginate` over the repository's runs since a date, then
 # each run's jobs, each answer written to a file before jq reads it, so gh is
@@ -18,17 +26,19 @@
 # inside gh, because `gh api --jq` takes no variables and the values below come
 # from the command line.
 #
-#   scripts/export-actions-trace.sh OWNER/REPO --since 2026-03-01 [--label billet-2vcpu] > trace.jsonl
+#   scripts/export-actions-trace.sh OWNER/REPO --since 2026-03-01 --prefix billet- > trace.jsonl
+#   scripts/export-actions-trace.sh OWNER/REPO --since 2026-03-01 --label billet-2vcpu > trace.jsonl
 set -euo pipefail
 
 usage() {
-	printf 'usage: %s OWNER/REPO --since YYYY-MM-DD [--label LABEL]\n' "$0" >&2
+	printf 'usage: %s OWNER/REPO --since YYYY-MM-DD (--label LABEL | --prefix PREFIX)\n' "$0" >&2
 	exit 2
 }
 
 repo=""
 since=""
 label=""
+prefix=""
 
 while [ $# -gt 0 ]; do
 	case "$1" in
@@ -40,6 +50,11 @@ while [ $# -gt 0 ]; do
 	--label)
 		[ $# -ge 2 ] || usage
 		label=$2
+		shift 2
+		;;
+	--prefix)
+		[ $# -ge 2 ] || usage
+		prefix=$2
 		shift 2
 		;;
 	-h | --help)
@@ -58,6 +73,16 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$repo" ] && [ -n "$since" ] || usage
+
+if [ -n "$label" ] && [ -n "$prefix" ]; then
+	printf -- '--label and --prefix are two rules for one question; give one\n' >&2
+	exit 2
+fi
+
+if [ -z "$label" ] && [ -z "$prefix" ]; then
+	printf 'say which label names the tier: --label LABEL or --prefix PREFIX\n' >&2
+	exit 2
+fi
 
 case "$repo" in
 */*) ;;
@@ -99,6 +124,7 @@ jq -r '.workflow_runs[] | [.id, .path, .head_branch] | @tsv' "$work/runs.json" >
 
 runs=0
 jobs=0
+skipped=0
 
 while IFS=$'\t' read -r run_id path branch; do
 	[ -n "$run_id" ] || continue
@@ -108,33 +134,44 @@ while IFS=$'\t' read -r run_id path branch; do
 
 	gh api --paginate "repos/$repo/actions/runs/$run_id/jobs?per_page=100" >"$work/jobs.json"
 
-	# Only a job that ran to completion has a duration to replay. `fromdate`
-	# reads GitHub's RFC 3339 stamps; the difference is whole seconds, spelled
-	# as a Go duration.
+	# Only a job that ran to completion has a duration to replay, and only one
+	# whose tier the rule names once. `fromdate` reads GitHub's RFC 3339 stamps;
+	# the difference is whole seconds, spelled as a Go duration.
 	jq -r --arg owner "$owner" --arg name "$name" --arg workflow "$workflow" \
-		--argjson run_id "$run_id" --arg label "$label" '
+		--argjson run_id "$run_id" --arg label "$label" --arg prefix "$prefix" '
 		.jobs[]
 		| select(.status == "completed" and .started_at != null and .completed_at != null)
-		| select($label == "" or (.labels | index($label)) != null)
-		| {
-			at: .created_at,
-			tier: (if $label != "" then $label else (.labels[0] // "") end),
-			owner: $owner,
-			repository: $name,
-			workflow: $workflow,
-			run_id: $run_id,
-			duration: ((((.completed_at | fromdate) - (.started_at | fromdate)) | tostring) + "s"),
-			result: (if .conclusion == "success" then "succeeded" else .conclusion end)
-		}
-		| @json' "$work/jobs.json" >"$work/jobs.jsonl"
+		| (if $label != ""
+		   then (if (.labels | index($label)) != null then [$label] else [] end)
+		   else [.labels[] | select(startswith($prefix))]
+		   end) as $tiers
+		| if ($tiers | length) == 1 then
+			{
+				at: .created_at,
+				tier: $tiers[0],
+				owner: $owner,
+				repository: $name,
+				workflow: $workflow,
+				run_id: $run_id,
+				duration: ((((.completed_at | fromdate) - (.started_at | fromdate)) | tostring) + "s"),
+				result: (if .conclusion == "success" then "succeeded" else .conclusion end)
+			} | @json
+		  else
+			"skipped"
+		  end' "$work/jobs.json" >"$work/jobs.out"
 
-	if [ -s "$work/jobs.jsonl" ]; then
-		jobs=$((jobs + $(wc -l <"$work/jobs.jsonl")))
-		cat "$work/jobs.jsonl"
-	fi
+	while IFS= read -r line; do
+		if [ "$line" = "skipped" ]; then
+			skipped=$((skipped + 1))
+		else
+			jobs=$((jobs + 1))
+			printf '%s\n' "$line"
+		fi
+	done <"$work/jobs.out"
 done <"$work/runs.tsv"
 
-printf 'exported %d jobs from %d completed runs of %s since %s\n' "$jobs" "$runs" "$repo" "$since" >&2
+printf 'exported %d jobs from %d completed runs of %s since %s; left out %d completed jobs the label rule did not name once\n' \
+	"$jobs" "$runs" "$repo" "$since" "$skipped" >&2
 
 if [ "$jobs" -eq 0 ]; then
 	printf 'no completed jobs matched; nothing to replay\n' >&2

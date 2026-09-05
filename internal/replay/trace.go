@@ -42,6 +42,12 @@ func (d *Duration) UnmarshalJSON(b []byte) error {
 }
 
 // Arrival is one job arriving at GitHub's queue: what a trace is made of.
+//
+// A ZERO IS FILLED IN OR REFUSED, NEVER REPLACED ON THE WIRE. The message the
+// scripted service builds overlays these fields on a default, and an overlay
+// cannot tell "zero" from "absent"; so Normalize writes the run id it will use
+// and Validate refuses a job with no time, and what the file says is what is
+// replayed.
 type Arrival struct {
 	// Seq numbers the arrivals from 1 in arrival order. It is the request id the
 	// scripted GitHub offers the job under, so the ledger's request_id joins a
@@ -90,6 +96,11 @@ func (t *Trace) Normalize() {
 		if a.Owner == "" {
 			a.Owner = DefaultOwner
 		}
+
+		// A job with no run of its own is its own run, said in the trace.
+		if a.RunID == 0 {
+			a.RunID = a.Seq
+		}
 	}
 }
 
@@ -109,8 +120,16 @@ func (t *Trace) Validate() error {
 			errs = append(errs, fmt.Errorf("%s: seq is %d; the trace is not normalized", where, a.Seq))
 		}
 
+		if a.At.IsZero() {
+			errs = append(errs, fmt.Errorf("%s: has no arrival time", where))
+		}
+
 		if i > 0 && a.At.Before(t.Arrivals[i-1].At) {
 			errs = append(errs, fmt.Errorf("%s: arrives before the one before it", where))
+		}
+
+		if a.RunID <= 0 {
+			errs = append(errs, fmt.Errorf("%s: run id %d is not positive", where, a.RunID))
 		}
 
 		if strings.TrimSpace(a.Tier) == "" {

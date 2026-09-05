@@ -83,7 +83,13 @@ func Run(t *testing.T, fleet Fleet, trace Trace, opts Options) *Report {
 		timer := time.NewTimer(opts.settleWithin())
 		defer timer.Stop()
 
+		// The watcher ends with the wait it bounds. Left selecting on the timer
+		// alone it would outlive every settle until the test ended: thousands of
+		// goroutines over one replay.
 		deadline := make(chan struct{})
+		settled := make(chan struct{})
+
+		defer close(settled)
 
 		go func() {
 			select {
@@ -91,6 +97,7 @@ func Run(t *testing.T, fleet Fleet, trace Trace, opts Options) *Report {
 				close(deadline)
 			case <-t.Context().Done():
 				close(deadline)
+			case <-settled:
 			}
 		}()
 

@@ -84,6 +84,15 @@ func TestEveryTraceJobHasALedgerRow(t *testing.T) {
 		t.Fatalf("recorded %d jobs for a trace of %d", len(report.Records), len(trace.Arrivals))
 	}
 
+	// THE DISCOVERY SLOTS ARE IN THE PROOF. Each tier holds one escrowed lease
+	// nobody is given until shutdown releases it; the ledger charged it, so the
+	// capacity sweep must count it, or an overcommit made of escrow alone would
+	// read as none.
+	if report.EscrowRows != len(twoHosts(config.PlacementPack).Tiers) || len(report.escrows) != report.EscrowRows {
+		t.Errorf("counted %d escrow rows and swept %d; want one discovery slot per tier (%d)",
+			report.EscrowRows, len(report.escrows), len(twoHosts(config.PlacementPack).Tiers))
+	}
+
 	for _, rec := range report.Records {
 		if rec.Node == "" || rec.FinishedAt.IsZero() || rec.Conclusion == "" {
 			t.Errorf("job %d is recorded without a node, a finish or a conclusion: %+v", rec.Seq, rec)
@@ -112,6 +121,12 @@ func TestEveryTraceJobHasALedgerRow(t *testing.T) {
 
 		// THE LEDGER'S TIMES ARE THE CLOCK'S, not the wall's: a start recorded at
 		// wall time would be dated in September and read as a queue wait of months.
+		// And the charge begins at escrow, before the job was even offered.
+		if rec.ChargedFrom.IsZero() || rec.ChargedFrom.After(rec.AssignedAt) {
+			t.Errorf("job %d is charged from %s, after or without its escrow (assigned %s)",
+				rec.Seq, rec.ChargedFrom, rec.AssignedAt)
+		}
+
 		if rec.StartedAt.Before(rec.Arrival) || rec.FinishedAt.Before(rec.StartedAt) {
 			t.Errorf("job %d is recorded out of order: arrived %s, started %s, finished %s",
 				rec.Seq, rec.Arrival, rec.StartedAt, rec.FinishedAt)
@@ -126,28 +141,35 @@ func TestEveryTraceJobHasALedgerRow(t *testing.T) {
 // where every job landed and when the ledger says it started and finished.
 func TestTheSameTraceReplaysToTheSamePlacements(t *testing.T) {
 	trace := MonorepoFanOut(11, Params{Jobs: 60})
-	fleet := twoHosts(config.PlacementSpread)
 
-	first := Run(t, fleet, trace, Options{})
-	second := Run(t, fleet, trace, Options{})
-	keep(t, "determinism", first)
+	for _, policy := range []config.PlacementPolicy{config.PlacementPack, config.PlacementSpread} {
+		t.Run(string(policy), func(t *testing.T) {
+			fleet := twoHosts(policy)
 
-	if len(first.Records) != len(trace.Arrivals) || len(second.Records) != len(trace.Arrivals) {
-		t.Fatalf("recorded %d and %d jobs for a trace of %d", len(first.Records), len(second.Records),
-			len(trace.Arrivals))
-	}
+			first := Run(t, fleet, trace, Options{})
+			second := Run(t, fleet, trace, Options{})
+			keep(t, "determinism-"+string(policy), first)
 
-	if !reflect.DeepEqual(first.Placements(), second.Placements()) {
-		t.Fatalf("two replays of one trace placed jobs differently:\n%v\n%v",
-			first.Placements(), second.Placements())
-	}
+			if len(first.Records) != len(trace.Arrivals) || len(second.Records) != len(trace.Arrivals) {
+				t.Fatalf("recorded %d and %d jobs for a trace of %d", len(first.Records),
+					len(second.Records), len(trace.Arrivals))
+			}
 
-	for i := range first.Records {
-		a, b := first.Records[i], second.Records[i]
-		if !a.AssignedAt.Equal(b.AssignedAt) || !a.StartedAt.Equal(b.StartedAt) || !a.FinishedAt.Equal(b.FinishedAt) {
-			t.Errorf("job %d was dated differently by two replays: %s/%s/%s and %s/%s/%s", a.Seq,
-				a.AssignedAt, a.StartedAt, a.FinishedAt, b.AssignedAt, b.StartedAt, b.FinishedAt)
-		}
+			if !reflect.DeepEqual(first.Placements(), second.Placements()) {
+				t.Fatalf("two replays of one trace placed jobs differently:\n%v\n%v",
+					first.Placements(), second.Placements())
+			}
+
+			for i := range first.Records {
+				a, b := &first.Records[i], &second.Records[i]
+				if !a.ChargedFrom.Equal(b.ChargedFrom) || !a.AssignedAt.Equal(b.AssignedAt) ||
+					!a.StartedAt.Equal(b.StartedAt) || !a.FinishedAt.Equal(b.FinishedAt) {
+					t.Errorf("job %d was dated differently by two replays: %s/%s/%s/%s and %s/%s/%s/%s",
+						a.Seq, a.ChargedFrom, a.AssignedAt, a.StartedAt, a.FinishedAt,
+						b.ChargedFrom, b.AssignedAt, b.StartedAt, b.FinishedAt)
+				}
+			}
+		})
 	}
 }
 
@@ -167,8 +189,10 @@ func TestPackAndSpreadPlaceDifferently(t *testing.T) {
 			len(trace.Arrivals))
 	}
 
-	// Spread's busiest host carries no more than pack's, and the gap between its
-	// two hosts is smaller: the shape each policy is named for.
+	// Spread's busiest host carries no more at its peak than pack's, and pack
+	// sends a larger share of the jobs to one host: the shape each policy is
+	// named for. Peaks alone cannot separate them once a burst fills both hosts,
+	// which is why the share of jobs is the discriminator.
 	packPeaks, spreadPeaks := pack.PeakVCPUByNode(), spread.PeakVCPUByNode()
 
 	if maxOf(spreadPeaks) > maxOf(packPeaks) {
@@ -176,9 +200,9 @@ func TestPackAndSpreadPlaceDifferently(t *testing.T) {
 			maxOf(spreadPeaks), maxOf(packPeaks))
 	}
 
-	if gap(spreadPeaks) >= gap(packPeaks) {
-		t.Errorf("spread left a gap of %d vCPU between its hosts and pack %d; spread should keep them even",
-			gap(spreadPeaks), gap(packPeaks))
+	if busiestShare(spread) >= busiestShare(pack) {
+		t.Errorf("spread sent %.0f%% of the jobs to its busiest host and pack %.0f%%; pack should "+
+			"concentrate and spread should even out", 100*busiestShare(spread), 100*busiestShare(pack))
 	}
 }
 
@@ -191,16 +215,14 @@ func maxOf(peaks map[string]int) int {
 	return out
 }
 
-func gap(peaks map[string]int) int {
-	lo, hi := -1, 0
-	for _, v := range peaks {
-		hi = max(hi, v)
-		if lo < 0 || v < lo {
-			lo = v
-		}
+// busiestShare is the share of a report's jobs that landed on its busiest host.
+func busiestShare(r *Report) float64 {
+	counts := map[string]int{}
+	for _, node := range r.Placements() {
+		counts[node]++
 	}
 
-	return hi - max(lo, 0)
+	return float64(maxOf(counts)) / float64(len(r.Records))
 }
 
 // NO PLACEMENT EXCEEDS A HOST OR THE DEPLOYMENT, under a burst that saturates
