@@ -2338,12 +2338,12 @@ func (a *Allocator) RegisterNode(ctx context.Context, reg NodeRegistration) (int
 // highestRelease decides what a host's highest-release column holds after a
 // registration reporting `release`.
 //
-// THREE ANSWERS, NONE OF THEM A REFUSAL. The reported release is a tag newer than
-// the recorded one, or there is no recorded one: the reported release. It is a
-// tag that is older or equal: the recorded one stays. It is not a release tag at
-// all: the recorded one stays, because "(devel)" cannot be ordered against
-// anything and must not become the mark every later registration is measured
-// against.
+// THREE ANSWERS, NONE OF THEM A REFUSAL. The reported release, in either spelling,
+// is newer than the recorded one, or there is no recorded one: the reported
+// release, spelled as its tag. It is older or equal: the recorded one stays. It
+// is not a release at all: the recorded one stays, because "(devel)" cannot be
+// ordered against anything and must not become the mark every later registration
+// is measured against.
 func highestRelease(ctx context.Context, q state.ReadOps, name, release string) (string, error) {
 	release = strings.TrimSpace(release)
 
@@ -2357,7 +2357,11 @@ func highestRelease(ctx context.Context, q state.ReadOps, name, release string) 
 			name, err)
 	}
 
-	if !version.IsRelease(release) {
+	// SPELLED AS THE TAG BEFORE IT IS RECORDED. A node on a release through v0.9.1
+	// reports the bare "0.9.1", which is a release and not a tag; recorded as it
+	// came, it would never order against the tags every later comparison uses.
+	release, ok := version.Canonical(release)
+	if !ok {
 		return recorded, nil
 	}
 

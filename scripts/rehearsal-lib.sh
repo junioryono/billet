@@ -402,7 +402,10 @@ rehearsal_as_billet() {
 
 # rehearsal_version prints the version the installed binary reports in a host.
 rehearsal_version() {
-    docker exec "$1" /usr/bin/billet version 2>/dev/null | awk 'NR == 1 { print $2 }'
+    # The second word of the first line, without its leading v: a release through
+    # v0.9.1 prints "billet 0.9.1 ..." and a later one "billet v0.9.2 ...", and the
+    # callers compare against the tag with its v removed.
+    docker exec "$1" /usr/bin/billet version 2>/dev/null | awk 'NR == 1 { sub(/^v/, "", $2); print $2 }'
 }
 
 # rehearsal_active prints a unit's ActiveState in a host, or `unknown` when the

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/junioryono/billet/internal/config"
@@ -35,6 +36,13 @@ func TestADowngradeIsRefusedUnlessNamed(t *testing.T) {
 		{"v0.6.0", "v0.5.0", false, false},
 		{"v0.4.0", "(devel)", false, false},
 		{"(devel)", "v0.5.0", false, false},
+		// THE SHAPE A RELEASE BINARY HAD, through v0.9.1: the running release
+		// without its v against a rollout's tag. This pair was could-not-tell and
+		// the downgrade went through (2026-09-05).
+		{"v0.9.0", "0.9.1", false, true},
+		{"0.9.0", "v0.9.1", false, true},
+		{"v0.9.1", "0.9.1", false, false},
+		{"v0.9.2", "0.9.1", false, false},
 	}
 
 	for _, c := range cases {
@@ -43,6 +51,27 @@ func TestADowngradeIsRefusedUnlessNamed(t *testing.T) {
 		if got := errors.Is(err, ErrDowngrade); got != c.refused {
 			t.Errorf("checkDowngrade(%q, %q, allowed=%v) refused=%v, want %v (err %v)",
 				c.target, c.running, c.allowed, got, c.refused, err)
+		}
+	}
+}
+
+// A DOWNGRADE ROLLOUT TO A RELEASE THAT CANNOT SEE ITSELF ON THE TARGET IS
+// REFUSED, and the refusal names the one-host-at-a-time way. Releases before
+// v0.9.2 compare their bare version with the rollout's tag and never converge the
+// controller, so no node would ever be told; this binary cannot mend that one.
+func TestADowngradeRolloutToASelfBlindReleaseIsRefused(t *testing.T) {
+	t.Parallel()
+
+	for _, target := range []string{"v0.9.1", "v0.9.0", "v0.6.0"} {
+		err := checkConvergibleDowngrade(target)
+		if !errors.Is(err, ErrDowngrade) || !strings.Contains(err.Error(), "host-upgrade --version "+target) {
+			t.Errorf("a downgrade rollout to %s was not refused with the by-hand route: %v", target, err)
+		}
+	}
+
+	for _, target := range []string{"v0.9.2", "v0.10.0", "(devel)"} {
+		if err := checkConvergibleDowngrade(target); err != nil {
+			t.Errorf("a downgrade rollout to %s was refused: %v", target, err)
 		}
 	}
 }

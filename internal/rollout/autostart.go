@@ -192,7 +192,39 @@ func (s *Starter) Tick(ctx context.Context) error {
 		return nil
 	}
 
-	if _, err := s.store.Open(ctx); err == nil {
+	if open, err := s.store.Open(ctx); err == nil {
+		// A ROLLOUT BEHIND THE CONTROL PLANE IS DEAD, AND IS SAID TO BE. A running
+		// rollout blocks every later one, so a channel that moved on while one
+		// waited leaves the fleet on the old decision until that rollout ends —
+		// and one whose target is older than the release running here cannot end
+		// forwards: the control plane's own timer refuses it as a downgrade. It
+		// ended backwards once, when the guard was could-not-tell on a release
+		// binary and a controller moved to v0.9.1 by hand obeyed the morning's
+		// rollout to v0.9.0 (2026-09-05). Finishing it as aborted, with the reason
+		// on the record, is what frees the next tick to start the channel's
+		// target, and the abort keeps that older digest from starting again by
+		// itself. A DIFFERENT rollout stays: one to a release at or above ours is
+		// converging, one the guard cannot order is nobody's to end, and one that
+		// allows a downgrade is an operator's `rollout start --allow-downgrade`,
+		// which is behind the running release by definition and is theirs to
+		// finish or abort.
+		if order, ok := version.Compare(open.TargetVersion, s.ourVersion); ok && order < 0 &&
+			!open.Policy.AllowDowngrade {
+			reason := fmt.Sprintf("superseded: the control plane runs %s, which is newer than "+
+				"this rollout's target %s, and a rollout never moves the fleet backwards",
+				s.ourVersion, open.TargetVersion)
+
+			if err := s.store.Finish(ctx, open.ID, StateAborted, reason); err != nil {
+				return fmt.Errorf("rollout: supersede %s: %w", open.ID, err)
+			}
+
+			s.log.Warn("a running rollout's target is older than the control plane; it is "+
+				"finished as superseded so the channel's target can start",
+				"rollout", open.ID, "target", open.TargetVersion, "running", s.ourVersion)
+
+			return nil
+		}
+
 		s.log.Debug("a rollout is already running; starting no other")
 
 		return nil
@@ -337,12 +369,15 @@ func (s *Starter) Tick(ctx context.Context) error {
 // "already there" — that host is exactly one a rollout exists to move, or to
 // block with a reason a person can read.
 func fleetOn(target, ourVersion string, hosts []Host) bool {
-	if ourVersion != target {
+	// THROUGH version.Same, NOT ==: a host on a release through v0.9.1 registers
+	// its release as the bare "0.9.1" while the target is the tag "v0.9.1", and a
+	// string comparison read every such host as off the target forever.
+	if !version.Same(ourVersion, target) {
 		return false
 	}
 
 	for i := range hosts {
-		if hosts[i].Release != target {
+		if !version.Same(hosts[i].Release, target) {
 			return false
 		}
 	}
