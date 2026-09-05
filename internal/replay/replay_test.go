@@ -173,6 +173,48 @@ func TestTheSameTraceReplaysToTheSamePlacements(t *testing.T) {
 	}
 }
 
+// EVENTS AT ONE TRACE INSTANT ARE DATED AT DISTINCT INSTANTS, IN DELIVERY
+// ORDER. Four jobs arrive at once; each is escrowed and assigned after the one
+// before it, and the ledger's timestamps have to say so, or a sweep over the
+// ledger cannot tell which charge saw which release. A clock that only moved
+// forward to the trace's instant dated all four identically and passed every
+// other test here.
+func TestJobsArrivingAtOneInstantAreDatedInOrder(t *testing.T) {
+	at := DefaultStart
+
+	var trace Trace
+
+	for range 4 {
+		trace.Arrivals = append(trace.Arrivals, Arrival{
+			At: at, Tier: "billet-2vcpu", Repository: "web",
+			WorkflowRef: "acme/web/.github/workflows/ci.yml@refs/heads/main",
+			Duration:    Duration(3 * time.Minute),
+		})
+	}
+
+	trace.Normalize()
+
+	report := Run(t, twoHosts(config.PlacementPack), trace, Options{})
+
+	if len(report.Records) != 4 || len(report.Missing) != 0 {
+		t.Fatalf("recorded %d of 4 jobs (missing %v)", len(report.Records), report.Missing)
+	}
+
+	for i := 1; i < len(report.Records); i++ {
+		prev, next := &report.Records[i-1], &report.Records[i]
+
+		if !next.AssignedAt.After(prev.AssignedAt) {
+			t.Errorf("jobs %d and %d arrived together and are assigned at %s and %s; the second must be "+
+				"dated after the first", prev.Seq, next.Seq, prev.AssignedAt, next.AssignedAt)
+		}
+
+		if !next.ChargedFrom.After(prev.ChargedFrom) {
+			t.Errorf("jobs %d and %d arrived together and are charged from %s and %s; the second must be "+
+				"dated after the first", prev.Seq, next.Seq, prev.ChargedFrom, next.ChargedFrom)
+		}
+	}
+}
+
 // PACK AND SPREAD ARE DISTINGUISHABLE IN THE REPORT. Pack fills a host before
 // starting the next, spread keeps them even; on one trace the two must leave a
 // different footprint, or the harness cannot see the policy it exists to measure.

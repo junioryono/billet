@@ -312,6 +312,34 @@ func TestAFailedPageFailsTheExport(t *testing.T) {
 	}
 }
 
+// A job GitHub says completed before it started is not a short job, it is data
+// nobody can replay honestly, and it fails the export with nothing on stdout.
+func TestAJobThatCompletedBeforeItStartedFailsTheExport(t *testing.T) {
+	h := newExportHarness(t)
+
+	corrupt := `{"total_count": 1, "jobs": [
+  {"id": 9, "status": "completed", "conclusion": "success", "labels": ["billet-2vcpu"],
+   "created_at": "2026-03-02T10:00:00Z", "started_at": "2026-03-02T10:05:00Z", "completed_at": "2026-03-02T10:04:00Z"}
+]}`
+
+	if err := os.WriteFile(filepath.Join(h.fixtures, "jobs-102.json"), []byte(corrupt), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout, stderr, err := h.run(t, nil, "acme/web", "--since", "2026-03-01", "--prefix", "billet-")
+	if err == nil {
+		t.Fatal("the exporter exited 0 on a job that completed before it started")
+	}
+
+	if !strings.Contains(stderr, "completed before it started") {
+		t.Errorf("the refusal did not say what was wrong: %q", stderr)
+	}
+
+	if stdout != "" {
+		t.Errorf("a failed export still wrote a trace to stdout:\n%s", stdout)
+	}
+}
+
 // The arguments are refused before GitHub is asked.
 func TestTheExporterRefusesBadArguments(t *testing.T) {
 	h := newExportHarness(t)

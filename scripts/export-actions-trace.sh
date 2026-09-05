@@ -31,7 +31,9 @@
 # documented `> trace.jsonl` a run that failed on its last page would otherwise
 # leave a shorter file that reads as a complete, smaller workload. A job whose
 # stamps agree to the second is given one second: GitHub's clock is whole
-# seconds, and a zero is not a duration the replay can hold.
+# seconds, and a zero is not a duration the replay can hold. A job that
+# completed before it started is not rounded, it fails the export: that is
+# data nobody can replay honestly.
 #
 #   scripts/export-actions-trace.sh OWNER/REPO --since 2026-03-01 --prefix billet- > trace.jsonl
 #   scripts/export-actions-trace.sh OWNER/REPO --since 2026-03-01 --label billet-2vcpu > trace.jsonl
@@ -149,6 +151,7 @@ while IFS=$'\t' read -r run_id path branch; do
 		--argjson run_id "$run_id" --arg label "$label" --arg prefix "$prefix" '
 		.jobs[]
 		| select(.status == "completed" and .started_at != null and .completed_at != null)
+		| . as $job
 		| (if $label != ""
 		   then (if (.labels | index($label)) != null then [$label] else [] end)
 		   else [.labels[] | select(startswith($prefix))]
@@ -161,7 +164,11 @@ while IFS=$'\t' read -r run_id path branch; do
 				repository: $name,
 				workflow: $workflow,
 				run_id: $run_id,
-				duration: ((((.completed_at | fromdate) - (.started_at | fromdate)) | if . < 1 then 1 else . end | tostring) + "s"),
+				duration: ((((.completed_at | fromdate) - (.started_at | fromdate))
+					| if . < 0 then error("job \($job.id) completed before it started")
+					  elif . == 0 then 1
+					  else . end
+					| tostring) + "s"),
 				result: (if .conclusion == "success" then "succeeded" else .conclusion end)
 			} | @json
 		  else

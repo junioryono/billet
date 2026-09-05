@@ -109,7 +109,8 @@ type Report struct {
 	Violations []string
 }
 
-// charge is one lease's claim on a host over an interval.
+// charge is one lease's claim on a host over an interval. A zero `to` is a
+// charge the ledger never ended, and it is never released in a sweep.
 type charge struct {
 	from, to time.Time
 	vcpu     int
@@ -117,15 +118,27 @@ type charge struct {
 	node     string
 }
 
-// historyBound is how many extra rows beyond the trace the read allows for, so
-// the discovery escrows do not truncate the jobs.
-const historyBound = 1000
+// open reports whether the ledger never ended this charge.
+func (c charge) open() bool { return c.to.IsZero() }
+
+// historyBound is how many extra rows beyond the trace the read allows for:
+// the discovery escrows every tier holds and releases over a replay. The query
+// is bounded, so a read that fills the bound is refused rather than trusted, a
+// truncated history being a smaller ledger that proves less than it seems to.
+const historyBound = 4096
 
 // readReport reads job_history back and joins it to the trace.
 func readReport(ctx context.Context, db *state.DB, fleet Fleet, trace Trace) (*Report, error) {
-	rows, err := state.ReadQueries(db.Reader()).ListJobHistory(ctx, int64(len(trace.Arrivals)+historyBound))
+	bound := int64(len(trace.Arrivals)) + historyBound
+
+	rows, err := state.ReadQueries(db.Reader()).ListJobHistory(ctx, bound)
 	if err != nil {
 		return nil, fmt.Errorf("read job history: %w", err)
+	}
+
+	if int64(len(rows)) >= bound {
+		return nil, fmt.Errorf("job history holds at least %d rows, which is the most this report reads; "+
+			"a truncated history would prove less than it seems to", bound)
 	}
 
 	byRequest := make(map[int64]*Arrival, len(trace.Arrivals))
@@ -277,10 +290,13 @@ func parseStamp(s string) (time.Time, error) {
 // charges is every claim the ledger recorded on the fleet: each job's lease
 // from its escrow to its archive, and every discovery slot the same way.
 //
-// A CHARGE WITH NO END IS NOT DROPPED. A lease the ledger never archived is
-// still charged, and leaving it out would let the one thing a swallowed
-// completion leaves behind vanish from the proof; it is swept as open to the
-// last instant any charge names, and Unfinished says the verdict is provisional.
+// A CHARGE WITH NO END IS NOT DROPPED, AND NOT CLOSED EITHER. A lease the
+// ledger never archived is still charged, and leaving it out would let the one
+// thing a swallowed completion leaves behind vanish from the proof. It stays
+// open: the sweeps charge it and never release it, so a charge that began at
+// the last instant the ledger knows still counts there, where an interval
+// closed at that same instant would have released before it charged. Unfinished
+// says the verdict over such a ledger is provisional.
 func (r *Report) charges() []charge {
 	out := make([]charge, 0, len(r.Records)+len(r.escrows))
 
@@ -298,24 +314,6 @@ func (r *Report) charges() []charge {
 	for _, c := range r.escrows {
 		if !c.from.IsZero() {
 			out = append(out, c)
-		}
-	}
-
-	var last time.Time
-
-	for _, c := range out {
-		if c.to.After(last) {
-			last = c.to
-		}
-
-		if c.from.After(last) {
-			last = c.from
-		}
-	}
-
-	for i := range out {
-		if out[i].to.IsZero() {
-			out[i].to = last
 		}
 	}
 
@@ -366,12 +364,15 @@ func (r *Report) checkCapacity() []string {
 		node   string
 	}
 
-	var changes []change
+	charges := r.charges()
+	changes := make([]change, 0, 2*len(charges))
 
-	for _, c := range r.charges() {
-		changes = append(changes,
-			change{c.from, c.vcpu, c.memory, c.node},
-			change{c.to, -c.vcpu, -c.memory, c.node})
+	for _, c := range charges {
+		changes = append(changes, change{c.from, c.vcpu, c.memory, c.node})
+
+		if !c.open() {
+			changes = append(changes, change{c.to, -c.vcpu, -c.memory, c.node})
+		}
 	}
 
 	// Releases before charges at the same instant, so a job finishing as
@@ -458,12 +459,15 @@ func (r *Report) peaks() (map[string]int, int) {
 		node string
 	}
 
-	var changes []change
+	charges := r.charges()
+	changes := make([]change, 0, 2*len(charges))
 
-	for _, c := range r.charges() {
-		changes = append(changes,
-			change{c.from, c.vcpu, c.node},
-			change{c.to, -c.vcpu, c.node})
+	for _, c := range charges {
+		changes = append(changes, change{c.from, c.vcpu, c.node})
+
+		if !c.open() {
+			changes = append(changes, change{c.to, -c.vcpu, c.node})
+		}
 	}
 
 	slices.SortStableFunc(changes, func(a, b change) int {
