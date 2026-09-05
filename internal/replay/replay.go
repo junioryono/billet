@@ -127,7 +127,11 @@ func Run(t *testing.T, fleet Fleet, trace Trace, opts Options) *Report {
 
 		// THE CONTEST FOR ROOM, IN ONE ORDER. A tier with jobs waiting, or with no
 		// capacity advertised at all, is given one poll to re-escrow and be offered
-		// what waits, tier by tier, each to quiescence before the next.
+		// what waits, tier by tier, each to quiescence before the next. What a
+		// tier does on its OWN poll after its own event is billet's: the listener
+		// whose job finished tops its discovery slot back up before anything is
+		// offered to anyone, exactly as it would in production. What the harness
+		// decides is only who is offered the rest, and that is this order.
 		for _, label := range actions.order {
 			if actions.starved(label) {
 				actions.nudge(label)

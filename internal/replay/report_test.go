@@ -1,0 +1,111 @@
+package replay
+
+import (
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/junioryono/billet/internal/config"
+)
+
+// The report's own arithmetic, driven directly: what the sweep does with a
+// charge the ledger never ended, and what the read does with a history that
+// fills its bound. Neither state arises in a healthy replay, which is why the
+// scenarios cannot reach them and these do.
+
+func oneHost() Fleet {
+	return Fleet{
+		Hosts:     []Host{{Name: "only", VCPU: 8, Memory: 32 * config.GiB}},
+		Tiers:     []TierShape{{Label: "billet-4vcpu", VCPU: 4, Memory: 8 * config.GiB}},
+		MaxVCPU:   8,
+		MaxMemory: 32 * config.GiB,
+	}
+}
+
+func chargeAt(from, to time.Time, vcpu int) Record {
+	return Record{
+		Tier: "billet-4vcpu", Node: "only", VCPU: vcpu, Memory: config.ByteSize(vcpu) * 2 * config.GiB,
+		ChargedFrom: from, FinishedAt: to,
+	}
+}
+
+// AN OPEN CHARGE THAT BEGINS AT THE LAST INSTANT STILL COUNTS. Closed at that
+// instant it would be an empty interval, released before it charged under the
+// tie rule, and the one lease a swallowed completion leaves behind would be the
+// one the proof could not see.
+func TestAnOpenChargeAtTheLastInstantIsStillCounted(t *testing.T) {
+	t.Parallel()
+
+	start := DefaultStart
+
+	r := &Report{Fleet: oneHost(), Records: []Record{
+		chargeAt(start, start.Add(10*time.Minute), 4),
+		chargeAt(start.Add(5*time.Minute), start.Add(10*time.Minute), 4),
+		// Escrowed at the instant the others end, never archived: with the host
+		// full until then, this is 12 vCPU on an 8 vCPU host from that instant on.
+		chargeAt(start.Add(10*time.Minute), time.Time{}, 4),
+		chargeAt(start.Add(10*time.Minute), time.Time{}, 4),
+		chargeAt(start.Add(10*time.Minute), time.Time{}, 4),
+	}}
+
+	for i := range r.Records {
+		r.Records[i].Seq = int64(i + 1)
+	}
+
+	if peak := r.PeakDeploymentVCPU(); peak != 12 {
+		t.Fatalf("the deployment peaked at %d vCPU, want 12 with the three open charges counted", peak)
+	}
+
+	violations := r.checkCapacity()
+	if len(violations) == 0 {
+		t.Fatal("three open 4 vCPU charges on an 8 vCPU host were not reported as an overcommit")
+	}
+
+	if !strings.Contains(violations[0], "host only carried 12 vCPU") {
+		t.Errorf("the violation does not name the host and the load: %v", violations)
+	}
+}
+
+// A HISTORY THAT FILLS ITS BOUND IS REFUSED, one short of it is not.
+func TestAHistoryThatFillsItsBoundIsRefused(t *testing.T) {
+	t.Parallel()
+
+	if err := complete(41, 42); err != nil {
+		t.Fatalf("a history one row short of the bound was refused: %v", err)
+	}
+
+	err := complete(42, 42)
+	if err == nil || !strings.Contains(err.Error(), "truncated") {
+		t.Fatalf("a history that fills its bound was accepted, or the refusal does not say why: %v", err)
+	}
+}
+
+// A CHARGE THE SWEEP COULD NOT JUDGE IS REFUSED, never swept past.
+func TestAChargeTheSweepCannotJudgeIsRefused(t *testing.T) {
+	t.Parallel()
+
+	fleet := oneHost()
+	start := DefaultStart
+
+	for name, c := range map[string]charge{
+		"no escrow time":         {to: start, vcpu: 4, memory: config.GiB, node: "only"},
+		"archived before escrow": {from: start.Add(time.Minute), to: start, vcpu: 4, memory: config.GiB, node: "only"},
+		"zero vcpu":              {from: start, to: start.Add(time.Minute), vcpu: 0, memory: config.GiB, node: "only"},
+		"zero memory":            {from: start, to: start.Add(time.Minute), vcpu: 4, memory: 0, node: "only"},
+		"an unknown host":        {from: start, to: start.Add(time.Minute), vcpu: 4, memory: config.GiB, node: "elsewhere"},
+	} {
+		if err := fleet.checkCharge(c); err == nil {
+			t.Errorf("a charge with %s was accepted", name)
+		}
+	}
+
+	good := charge{from: start, to: start.Add(time.Minute), vcpu: 4, memory: config.GiB, node: "only"}
+	if err := fleet.checkCharge(good); err != nil {
+		t.Errorf("a well-formed charge was refused: %v", err)
+	}
+
+	open := charge{from: start, vcpu: 4, memory: config.GiB, node: "only"}
+	if err := fleet.checkCharge(open); err != nil {
+		t.Errorf("an open charge was refused: %v", err)
+	}
+}

@@ -34,6 +34,7 @@ const exportScript = "export-actions-trace.sh"
 // run's jobs page fail, the way a later page can.
 const fakeGH = `#!/bin/bash
 set -euo pipefail
+: >> "$FAKE_GH_INVOKED"
 if [ -n "${FAKE_GH_FAIL:-}" ]; then
   echo "gh: HTTP 401: Bad credentials" >&2
   exit 1
@@ -103,6 +104,10 @@ const jobsRun102 = `{"total_count": 2, "jobs": [
 // can never be reached.
 type exportHarness struct {
 	bin, fixtures, log string
+	// invoked is touched by the fake before it judges its arguments, so "gh was
+	// never called" is a claim about invocation and not about a call the fake
+	// refused.
+	invoked string
 }
 
 func newExportHarness(t *testing.T) exportHarness {
@@ -117,6 +122,7 @@ func newExportHarness(t *testing.T) exportHarness {
 		bin:      filepath.Join(root, "bin"),
 		fixtures: filepath.Join(root, "fixtures"),
 		log:      filepath.Join(root, "gh.log"),
+		invoked:  filepath.Join(root, "gh.invoked"),
 	}
 
 	for _, dir := range []string{h.bin, h.fixtures} {
@@ -164,6 +170,7 @@ func (h exportHarness) run(t *testing.T, env []string, args ...string) (string, 
 		"HOME=" + t.TempDir(),
 		"FAKE_GH_DIR=" + h.fixtures,
 		"FAKE_GH_LOG=" + h.log,
+		"FAKE_GH_INVOKED=" + h.invoked,
 	}, env...)
 
 	var stdout, stderr bytes.Buffer
@@ -340,6 +347,69 @@ func TestAJobThatCompletedBeforeItStartedFailsTheExport(t *testing.T) {
 	}
 }
 
+// A completed job with no conclusion is not a success and not a failure; it is
+// an answer the export cannot carry, and it fails with nothing on stdout. A run
+// with no head branch has no workflow reference to spell and is left out,
+// counted.
+func TestAJobWithNoConclusionFailsTheExportAndAnUnnamedRunIsLeftOut(t *testing.T) {
+	h := newExportHarness(t)
+
+	runs := `{"total_count": 2, "workflow_runs": [
+  {"id": 101, "path": ".github/workflows/ci.yml", "head_branch": "main"},
+  {"id": 103, "path": ".github/workflows/ci.yml", "head_branch": null}
+]}`
+
+	if err := os.WriteFile(filepath.Join(h.fixtures, "runs.json"), []byte(runs), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout, stderr, err := h.run(t, nil, "acme/web", "--since", "2026-03-01", "--prefix", "billet-")
+	if err != nil {
+		t.Fatalf("the exporter failed: %v\nstderr: %s", err, stderr)
+	}
+
+	if !strings.Contains(stderr, "1 runs with no branch") {
+		t.Errorf("the run with no branch was not counted: %q", stderr)
+	}
+
+	if strings.Contains(string(mustRead(t, h.log)), "runs/103/jobs") {
+		t.Error("the run with no branch was asked for its jobs")
+	}
+
+	if _, err := replay.ReadTrace(strings.NewReader(stdout)); err != nil {
+		t.Fatalf("unreadable trace: %v", err)
+	}
+
+	corrupt := `{"total_count": 1, "jobs": [
+  {"id": 9, "status": "completed", "conclusion": null, "labels": ["billet-2vcpu"],
+   "created_at": "2026-03-02T10:00:00Z", "started_at": "2026-03-02T10:01:00Z", "completed_at": "2026-03-02T10:04:00Z"}
+]}`
+
+	if err := os.WriteFile(filepath.Join(h.fixtures, "jobs-101.json"), []byte(corrupt), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout, stderr, err = h.run(t, nil, "acme/web", "--since", "2026-03-01", "--prefix", "billet-")
+	if err == nil {
+		t.Fatal("the exporter exited 0 on a completed job with no conclusion")
+	}
+
+	if !strings.Contains(stderr, "completed with no conclusion") || stdout != "" {
+		t.Errorf("the refusal did not name the job, or a trace was written anyway: %q\n%s", stderr, stdout)
+	}
+}
+
+func mustRead(t *testing.T, path string) []byte {
+	t.Helper()
+
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return body
+}
+
 // The arguments are refused before GitHub is asked.
 func TestTheExporterRefusesBadArguments(t *testing.T) {
 	h := newExportHarness(t)
@@ -359,7 +429,7 @@ func TestTheExporterRefusesBadArguments(t *testing.T) {
 				t.Fatalf("%v was accepted", args)
 			}
 
-			if _, err := os.Stat(h.log); err == nil {
+			if _, err := os.Stat(h.invoked); err == nil {
 				t.Fatalf("gh was called despite %s", name)
 			}
 		})

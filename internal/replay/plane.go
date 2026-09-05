@@ -115,9 +115,11 @@ type scaleSet struct {
 	served bool
 	// nudged asks the parked poll to return empty once, so the listener runs one
 	// iteration of its loop and re-advertises; offered records that the
-	// outstanding offers were served since the last nudge, wake or capacity
-	// change, so a listener that could not take them is not offered them in a
-	// loop.
+	// outstanding offers were served since the last nudge, so a listener that
+	// could not take them is not offered them in a loop. ONLY A NUDGE CLEARS IT:
+	// the harness offers waiting jobs in the fleet's tier order, one tier at a
+	// time, and a tier that re-offered itself on its own poll after its own
+	// completion would take freed room ahead of that order.
 	nudged  bool
 	offered bool
 	// pollers counts poll handlers inside poll for this set; one listener means
@@ -655,10 +657,14 @@ func (p *plane) queue(w http.ResponseWriter, r *http.Request) {
 // AN OFFER NOT ACQUIRED IS OFFERED AGAIN once the tier advertises capacity, which
 // is what a queued job is: the listener acknowledges an offer it had no escrow
 // for, and GitHub keeps the job for a scale set that later has room. Offered
-// once per wake, because a listener can advertise running work it cannot take
+// once per nudge, because a listener can advertise running work it cannot take
 // an offer against, and offering into that forever would be a loop with no
-// exit. Whether GitHub re-offers on this cadence is not claimed; that a job it
-// holds is offered to a set with capacity is the whole of what is modelled.
+// exit; and only on a nudge, because the harness offers waiting jobs tier by
+// tier in the fleet's order after every event, and a tier that re-offered
+// itself on the poll after its own completion would contest the freed room
+// ahead of that order. Whether GitHub re-offers on this cadence is not
+// claimed; that a job it holds is offered to a set with capacity is the whole
+// of what is modelled.
 //
 // A PARKED POLL RETURNS ONLY WHEN THE HARNESS SAYS SO, by queueing a message or
 // nudging the set. A wall-clock timeout here would let a listener run an escrow
@@ -702,7 +708,6 @@ func (p *plane) poll(w http.ResponseWriter, r *http.Request, s *scaleSet) {
 
 		if capacity != s.lastCap {
 			s.lastCap = capacity
-			s.offered = false
 			p.cond.Broadcast()
 			p.mu.Unlock()
 			w.WriteHeader(http.StatusAccepted)
@@ -899,9 +904,9 @@ func (p *plane) deliver(ev event) {
 
 	a := p.jobs[ev.seq]
 
-	// A DELIVERY IS A FRESH CHANCE: whatever the set could not take before, it is
-	// offered once more on the poll after this message, since the message may
-	// have changed what it can take.
+	// A DELIVERY OFFERS NOTHING BEYOND ITSELF. What the set could not take before
+	// is offered again only when the run loop nudges it, in the fleet's order,
+	// after this event has settled.
 	switch ev.kind {
 	case eventArrival:
 		s := p.byName[a.Tier]
@@ -910,18 +915,15 @@ func (p *plane) deliver(ev event) {
 		}
 
 		s.available[a.Seq] = struct{}{}
-		s.offered = false
 		p.pushLocked(s, nil, p.jobJSON("JobAvailable", a, fakeactions.JobFields{}))
 
 	case eventStarted:
-		ev.runner.set.offered = false
 		p.pushLocked(ev.runner.set, nil, p.jobJSON("JobStarted", a, fakeactions.JobFields{
 			RunnerID: ev.runner.id, RunnerName: ev.runner.name,
 		}))
 
 	case eventCompleted:
 		delete(ev.runner.set.assigned, a.Seq)
-		ev.runner.set.offered = false
 		p.pushLocked(ev.runner.set, nil, p.jobJSON("JobCompleted", a, fakeactions.JobFields{
 			RunnerID: ev.runner.id, RunnerName: ev.runner.name, Result: a.Result,
 		}))

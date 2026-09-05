@@ -3,6 +3,7 @@ package replay
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -94,8 +95,8 @@ type Report struct {
 	// Unstarted are recorded jobs the ledger never saw start.
 	Unstarted []int64
 	// Unfinished are recorded leases the ledger never archived: their charge has
-	// no end, so it is swept as open to the last instant the ledger knows, and a
-	// capacity verdict over them is provisional rather than final.
+	// no end, so the sweep charges it and never releases it, and a capacity
+	// verdict over such a ledger is provisional rather than final.
 	Unfinished []int64
 	// EscrowRows counts history rows for leases that were never assigned a job:
 	// the discovery slots released at shutdown. Reported so a reader can tell
@@ -136,9 +137,8 @@ func readReport(ctx context.Context, db *state.DB, fleet Fleet, trace Trace) (*R
 		return nil, fmt.Errorf("read job history: %w", err)
 	}
 
-	if int64(len(rows)) >= bound {
-		return nil, fmt.Errorf("job history holds at least %d rows, which is the most this report reads; "+
-			"a truncated history would prove less than it seems to", bound)
+	if err := complete(len(rows), bound); err != nil {
+		return nil, err
 	}
 
 	byRequest := make(map[int64]*Arrival, len(trace.Arrivals))
@@ -177,6 +177,10 @@ func readReport(ctx context.Context, db *state.DB, fleet Fleet, trace Trace) (*R
 				from: chargedFrom, to: finishedAt, vcpu: int(lease.Vcpu),
 				memory: config.ByteSize(lease.Memory), node: lease.Host,
 			})
+
+			if err := fleet.checkCharge(r.escrows[len(r.escrows)-1]); err != nil {
+				return nil, fmt.Errorf("escrow lease %s: %w", row.LeaseID, err)
+			}
 
 			continue
 		}
@@ -254,6 +258,12 @@ func readReport(ctx context.Context, db *state.DB, fleet Fleet, trace Trace) (*R
 
 		rec.Cost, rec.CostSource = fleet.cost(&rec)
 
+		if err := fleet.checkCharge(charge{
+			from: rec.ChargedFrom, to: rec.FinishedAt, vcpu: rec.VCPU, memory: rec.Memory, node: rec.Node,
+		}); err != nil {
+			return nil, fmt.Errorf("lease %s of job %d: %w", row.LeaseID, a.Seq, err)
+		}
+
 		r.Records = append(r.Records, rec)
 	}
 
@@ -268,6 +278,41 @@ func readReport(ctx context.Context, db *state.DB, fleet Fleet, trace Trace) (*R
 	r.Violations = r.checkCapacity()
 
 	return r, nil
+}
+
+// complete refuses a history read that filled its bound: a truncated ledger
+// proves less than it seems to, and nothing in the rows says they are all.
+func complete(rows int, bound int64) error {
+	if int64(rows) >= bound {
+		return fmt.Errorf("job history holds at least %d rows, which is the most this report reads; "+
+			"a truncated history would prove less than it seems to", bound)
+	}
+
+	return nil
+}
+
+// checkCharge refuses a charge the sweep could not judge honestly.
+//
+// COULD NOT TELL IS NOT NO OVERCOMMIT. A charge with no start would be left
+// out; one ending before it began would release before it charged; a zero
+// shape would count nothing; a host the fleet does not declare would never be
+// compared against a capacity. Each of those is a ledger the report cannot
+// speak for, so it says so instead of sweeping past it.
+func (f Fleet) checkCharge(c charge) error {
+	switch {
+	case c.from.IsZero():
+		return errors.New("the lease has no escrow time to charge from")
+	case !c.open() && c.to.Before(c.from):
+		return fmt.Errorf("the lease is archived at %s, before it was escrowed at %s", c.to, c.from)
+	case c.vcpu <= 0 || c.memory <= 0:
+		return fmt.Errorf("the lease is charged %d vCPU and %s, which the sweep cannot count", c.vcpu, c.memory)
+	}
+
+	if _, ok := f.host(c.node); !ok {
+		return fmt.Errorf("the lease is charged to host %q, which the fleet does not declare", c.node)
+	}
+
+	return nil
 }
 
 // parseStamp reads a ledger timestamp. The empty string is the one legitimate

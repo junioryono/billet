@@ -32,8 +32,11 @@
 # leave a shorter file that reads as a complete, smaller workload. A job whose
 # stamps agree to the second is given one second: GitHub's clock is whole
 # seconds, and a zero is not a duration the replay can hold. A job that
-# completed before it started is not rounded, it fails the export: that is
-# data nobody can replay honestly.
+# completed before it started, or one that completed with no conclusion, is
+# not rounded or filled in, it fails the export: that is data nobody can replay
+# honestly. A run with no head branch is left out and counted, because its
+# workflow reference cannot be spelled; a run on a tag is spelled as a branch
+# ref, which is a spelling the replay carries and never checks.
 #
 #   scripts/export-actions-trace.sh OWNER/REPO --since 2026-03-01 --prefix billet- > trace.jsonl
 #   scripts/export-actions-trace.sh OWNER/REPO --since 2026-03-01 --label billet-2vcpu > trace.jsonl
@@ -129,15 +132,21 @@ gh api --paginate \
 	"repos/$repo/actions/runs?status=completed&per_page=100&created=%3E%3D$since" \
 	>"$work/runs.json"
 
-jq -r '.workflow_runs[] | [.id, .path, .head_branch] | @tsv' "$work/runs.json" >"$work/runs.tsv"
+jq -r '.workflow_runs[] | [.id, .path, (.head_branch // "")] | @tsv' "$work/runs.json" >"$work/runs.tsv"
 
 runs=0
 jobs=0
 skipped=0
+unnamed=0
 : >"$work/trace.jsonl"
 
 while IFS=$'\t' read -r run_id path branch; do
 	[ -n "$run_id" ] || continue
+
+	if [ -z "$branch" ] || [ -z "$path" ]; then
+		unnamed=$((unnamed + 1))
+		continue
+	fi
 
 	runs=$((runs + 1))
 	workflow="$repo/$path@refs/heads/$branch"
@@ -169,7 +178,9 @@ while IFS=$'\t' read -r run_id path branch; do
 					  elif . == 0 then 1
 					  else . end
 					| tostring) + "s"),
-				result: (if .conclusion == "success" then "succeeded" else .conclusion end)
+				result: (if .conclusion == "success" then "succeeded"
+					 elif (.conclusion // "") == "" then error("job \($job.id) completed with no conclusion")
+					 else .conclusion end)
 			} | @json
 		  else
 			"skipped"
@@ -185,8 +196,8 @@ while IFS=$'\t' read -r run_id path branch; do
 	done <"$work/jobs.out"
 done <"$work/runs.tsv"
 
-printf 'exported %d jobs from %d completed runs of %s since %s; left out %d completed jobs the label rule did not name once\n' \
-	"$jobs" "$runs" "$repo" "$since" "$skipped" >&2
+printf 'exported %d jobs from %d completed runs of %s since %s; left out %d completed jobs the label rule did not name once and %d runs with no branch or workflow path\n' \
+	"$jobs" "$runs" "$repo" "$since" "$skipped" "$unnamed" >&2
 
 if [ "$jobs" -eq 0 ]; then
 	printf 'no completed jobs matched; nothing to replay\n' >&2
