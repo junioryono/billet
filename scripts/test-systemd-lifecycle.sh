@@ -86,15 +86,22 @@ docker run -d --name "${name}" --privileged --cgroupns=host \
     -v "${storage}/containerd:/var/lib/containerd" \
     -e DEBIAN_FRONTEND=noninteractive \
     ubuntu:24.04 sh -c \
-    'apt-get update -qq && apt-get install -y -qq systemd systemd-sysv dbus docker.io >/dev/null 2>&1 && exec /lib/systemd/systemd' \
+    'timeout -v -k 10 300 apt-get -o APT::Update::Error-Mode=any -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update -qq && timeout -v -k 10 300 apt-get -o APT::Update::Error-Mode=any -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y -qq systemd systemd-sysv dbus docker.io >/dev/null && exec /lib/systemd/systemd' \
     >/dev/null
 
+# LONGER THAN THE BOOTSTRAP IT WAITS FOR: the entrypoint may spend up to 300s in
+# each of two bounded apt calls before systemd starts, so 240 x 3s = 720s, and a
+# container that has exited ends the wait as a verdict rather than being polled.
 printf 'waiting for systemd in the container'
 state=
 i=0
-while [ "${i}" -lt 90 ]; do
+while [ "${i}" -lt 240 ]; do
     state=$(docker exec "${name}" systemctl is-system-running 2>/dev/null || true)
     case "${state}" in running | degraded) break ;; esac
+    if [ "$(docker inspect -f '{{.State.Running}}' "${name}" 2>/dev/null)" = "false" ]; then
+        state=exited
+        break
+    fi
     printf '.'
     sleep 3
     i=$((i + 1))
