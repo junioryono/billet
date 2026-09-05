@@ -113,6 +113,22 @@ type backend interface {
 	// backend for what it does instead.
 	beginWrite(ctx context.Context, tx *sql.Tx) error
 
+	// beginMigration runs inside the migration's transaction, after beginWrite
+	// and before its first statement, and is what lets that ONE transaction wait.
+	//
+	// A migration is the only write whose statements take locks the writer's own
+	// exclusion does not cover — DDL locks tables and catalogue rows that an
+	// advisory lock says nothing about — and it is the one place waiting is the
+	// right answer: it runs once, at startup or at promotion, before the process
+	// is doing anything anybody is waiting on. Its bound is the caller's context,
+	// never the writer's contention timeout, which exists for scheduling writes
+	// that must come back to Go on the caller's terms.
+	beginMigration(ctx context.Context, tx *sql.Tx) error
+
+	// migrationTimeoutAdvice says what an operator should look at when a
+	// migration did not finish inside its budget, in this engine's own terms.
+	migrationTimeoutAdvice() string
+
 	// snapshotInto writes a consistent copy of the ledger to a local path, or
 	// refuses when the engine has no such operation billet should own.
 	snapshotInto(ctx context.Context, db *DB, path string) error

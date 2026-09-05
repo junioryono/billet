@@ -119,14 +119,16 @@ resource "aws_iam_role_policy" "builder" {
   policy = local.builder_policy
 }
 
-# THE SPOT INTERRUPTION GRANT, scoped to exactly the queue this module creates and
-# added only when spot is enabled — kept out of the committed rendering so a
-# non-spot node's role does not carry it. The ACTIONS come from the committed
-# policy/spot-actions.json, which internal/tfpolicy byte-compares against
-# ec2.SpotIAMActions() — the same source-of-truth pinning as the node policy,
-# replacing a regex scrape of this file. jsonencode (not the provider's
-# policy-document data source) so the whole document is assertable in the
-# mocked plan tests with the queue ARN overridden to a known value.
+# THE SPOT INTERRUPTION GRANT, scoped to exactly the queues this module creates
+# and added only when spot is enabled — kept out of the committed rendering so a
+# non-spot node's role does not carry it. Every spot node in the co-located root
+# runs under this one role, so the grant covers every queue, from the same list
+# the router's grant and environment are derived from. The ACTIONS come from the
+# committed policy/spot-actions.json, which internal/tfpolicy byte-compares
+# against ec2.SpotIAMActions() — the same source-of-truth pinning as the node
+# policy, replacing a regex scrape of this file. jsonencode (not the provider's
+# policy-document data source) so the whole document is assertable in the mocked
+# plan tests with the queue ARNs overridden to known values.
 resource "aws_iam_role_policy" "spot" {
   count = var.enable_spot ? 1 : 0
 
@@ -138,7 +140,7 @@ resource "aws_iam_role_policy" "spot" {
       Sid      = "BilletSpotInterruptions"
       Effect   = "Allow"
       Action   = jsondecode(file("${path.module}/policy/spot-actions.json"))
-      Resource = aws_sqs_queue.interruptions[0].arn
+      Resource = local.spot_queue_arns
     }]
   })
 }

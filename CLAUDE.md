@@ -17,13 +17,13 @@ Never hard-wrap prose at a column. Every paragraph in a `.md` or `.txt` file, a 
 | `internal/server` | One scale-set listener per tier and the scheduler; the message lifecycle against GitHub. |
 | `internal/scaleset`, `internal/github`, `internal/fakeactions` | The only importer of `actions/scaleset`; App onboarding, JWTs, installation and runner-group policy; the scripted stand-in for GitHub used by tests. |
 | `internal/nodeapi`, `internal/nodeclient`, `internal/nodeplane`, `internal/node` | The node wire: the vocabulary and version range, the node's half, the plane's half, and the node runtime that turns leases into compute and holds custody of what it cannot account for. |
-| `internal/provider` + `docker`, `firecracker`, `tart`, `ec2`, `codebuild` | The compute contract and the five backends. |
+| `internal/provider` + `docker`, `firecracker`, `tart`, `ec2`, `codebuild`, `simulated` | The compute contract and the six backends; `simulated` starts no compute, exists for billet's own test harness, and is refused in a config. |
 | `internal/store` + `ceph`, `ebss3` | The cache-volume contract and the two site stores. |
 | `internal/wirecert`, `internal/wireshare`, `internal/deploymentid` | The node-wire CA and its rotation state machine; carrying an authority between controllers; the deployment identity. |
 | `internal/runnerimages`, `internal/imagesource`, `internal/runnerrelease`, `internal/provenance`, `internal/releasesource`, `internal/guestassets` | The vendored runner-image declaration; fetching and verifying signed guest images; the runner-release deadline; which manifest produced the installed binary; what a billet release contains; scripts installed into every guest. |
 | `internal/lifeops` (+ `launchd`), `internal/deployarchive`, `internal/archivestore`, `internal/durablefile` | The local service lifecycle on systemd and macOS; backup, restore and recover; the no-delete S3 hop; the one fsync ordering for installing a file. |
 | `internal/rollout`, `internal/hostupgrade` | The durable fleet-upgrade decision and coordinator; the journaled transaction that replaces billet on one host. |
-| `internal/awssig`, `awscreds`, `awsjson`, `awspolicy`, `awsquota`, `awsssm`, `awssts` | billet's own SigV4 signer and AWS clients; least-privilege IAM generation. |
+| `internal/awssig`, `awscreds`, `awsjson`, `awspolicy`, `awsquota`, `awss3`, `awsssm`, `awssts` | billet's own SigV4 signer and AWS clients; what S3 said in a refusal; least-privilege IAM generation. |
 | `internal/initconfig`, `internal/wiring`, `internal/version`, `internal/tfclass`, `internal/tfpolicy` | Config generation for `billet init`; assembling the pieces the way the CLI does; the version; Terraform plan classification and IAM drift. |
 | `internal/e2e`, `internal/integration` | The end-to-end suite (real plane, wire and runtime against `fakeactions`) and cross-package boundary tests. |
 | `deploy/` | The systemd units, launchd plists, packaged config template and package scripts. |

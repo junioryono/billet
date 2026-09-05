@@ -213,13 +213,64 @@ variable "enable_kms" {
   }
 }
 
-# SPOT INTERRUPTIONS. The queue is created when enable_spot is true; the
-# EventBridge-to-queue router that a tag-scoped delivery needs is a documented
-# follow-up (see README).
+# SPOT INTERRUPTIONS. enable_spot creates the queue a spot node consumes and the
+# EventBridge-to-Lambda router that a tag-scoped delivery needs, since EventBridge
+# cannot match on the instance tag that says which node owns the warning.
 variable "enable_spot" {
-  description = "Create the SQS interruption queue a spot deployment consumes."
+  description = "Create the SQS interruption queue a spot deployment consumes, and the tag-scoped router that fills it."
   type        = bool
   default     = false
+}
+
+# SEVERAL SPOT NODES ARE SEVERAL QUEUES. Each name creates a queue named exactly
+# it, and fleet-ec2 derives the node grant, the router grant and the router's
+# served set from the same list, so the three converge on every queue from one
+# input — the served set landing first, which is the safe order while a grant
+# propagates. THE CHILD'S EXACT RULES, duplicated on purpose:
+# this root and fleet-ec2 are two entry points, and a rule enforced at only one of
+# them is one that is not enforced.
+variable "spot_node_names" {
+  description = "Further spot nodes beside the one enable_spot creates. One interruption queue is created per entry, named exactly it (billet requires the queue basename to equal the node's node.name); the node grant, the router grant and the router's served set widen to every queue from this one input, and interruption_queue_urls reports each node's queue. Queue names are account-wide per region in SQS. Requires enable_spot."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = length(var.spot_node_names) == 0 || var.enable_spot
+    error_message = "spot_node_names requires enable_spot: the router and the primary queue it serves only exist with spot enabled, and a queue nothing forwards to receives no warning."
+  }
+
+  validation {
+    condition     = alltrue([for n in var.spot_node_names : can(regex("^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$", n))])
+    error_message = "every spot_node_names entry must be a name both billet and SQS accept: 1 to 64 letters, digits, hyphens or underscores, starting with a letter or digit, and no dot (billet allows one in a node name; SQS refuses it in a queue name)."
+  }
+
+  validation {
+    condition     = length(distinct(var.spot_node_names)) == length(var.spot_node_names)
+    error_message = "spot_node_names must not repeat a name: two spot nodes cannot share one interruption queue."
+  }
+
+  validation {
+    condition     = !contains(var.spot_node_names, "${var.name}-spot-interruptions")
+    error_message = "spot_node_names must not name the primary queue enable_spot already creates (<name>-spot-interruptions); that node is served by spot_node_name."
+  }
+
+  validation {
+    condition     = length(var.spot_node_names) <= 16
+    error_message = "spot_node_names admits at most 16 further spot nodes: every queue's ARN is repeated in the node role's and the router's inline policies, and IAM caps a role's inline policies at 10,240 characters combined, which the node role's other grants share. More spot nodes than that are several fleet-ec2 instances."
+  }
+}
+
+# THE ROOT'S EXACT RULE, duplicated on purpose: this root and fleet-ec2 are two
+# entry points, and a rule enforced at only one of them is one that is not enforced.
+variable "spot_router_alarm_actions" {
+  description = "ARNs notified when the spot interruption router fails an invocation — a warning it could not place and re-raised for Lambda to retry. Usually an SNS topic; this module creates none, so an operator supplies their own. Empty leaves the alarm with no action: its state is still visible in the console and to DescribeAlarms, but nothing is sent."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for action in var.spot_router_alarm_actions : can(regex("^arn:", action))])
+    error_message = "every spot_router_alarm_actions entry must be an ARN (an SNS topic's, usually)."
+  }
 }
 
 # THE OFF-SITE COPY. Passed through to the control-plane child, which owns the

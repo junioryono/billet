@@ -405,6 +405,12 @@ type stackConfig struct {
 	// that puts compute on the host after stopping the server is otherwise racing
 	// a destroy that is already on its way.
 	reapEvery time.Duration
+	// kind and backend replace the stack's compute: the kind the node registers
+	// as, and a constructor for the provider over this stack's deployment
+	// identity. Unset means the real docker backend, which every scenario written
+	// before a second backend existed keeps measuring.
+	kind    config.ProviderKind
+	backend func(t *testing.T, deployment string) provider.Provider
 	// nodeDrainTimeout is the node's `drain_timeout`, which decides when a drain
 	// starts SAYING it is long and nothing else.
 	//
@@ -428,13 +434,16 @@ type stackConfig struct {
 type directRunner struct {
 	runner *node.Runner
 	tiers  []config.Tier
+	// kind is the backend the runner drives, which selects the tier's image and
+	// command the way the plane's dispatch does.
+	kind config.ProviderKind
 }
 
 func (d directRunner) Launch(ctx context.Context, lease *alloc.Lease, job server.Job) error {
 	for i := range d.tiers {
 		if d.tiers[i].Label == lease.Tier {
 			return d.runner.Launch(ctx, lease,
-				nodeapi.TierSpecOf(d.tiers[i], config.ProviderDocker), job)
+				nodeapi.TierSpecOf(d.tiers[i], d.kind), job)
 		}
 	}
 
@@ -468,6 +477,17 @@ func withClock(now func() time.Time) stackOpt {
 	return func(c *stackConfig) { c.now = now }
 }
 
+// withBackend runs the stack's node over another compute backend.
+//
+// The constructor is handed the stack's deployment identity rather than a
+// finished provider, because that identity is minted inside the stack and every
+// backend owns its instances by it.
+func withBackend(
+	kind config.ProviderKind, build func(t *testing.T, deployment string) provider.Provider,
+) stackOpt {
+	return func(c *stackConfig) { c.kind, c.backend = kind, build }
+}
+
 // withNodeDrainTimeout sets the node's drain_timeout, so a test can watch a
 // drain run past it. See stackConfig.nodeDrainTimeout.
 func withNodeDrainTimeout(d time.Duration) stackOpt {
@@ -493,8 +513,17 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 		o(&sc)
 	}
 
-	if _, err := exec.LookPath("docker"); err != nil {
-		t.Skip("docker is not installed")
+	kind := sc.kind
+	if kind == "" {
+		kind = config.ProviderDocker
+	}
+
+	// ONLY A DOCKER STACK NEEDS A DAEMON. A stack over another backend runs
+	// wherever the tests do, which is the point of having one.
+	if kind == config.ProviderDocker {
+		if _, err := exec.LookPath("docker"); err != nil {
+			t.Skip("docker is not installed")
+		}
 	}
 
 	client, err := scaleset.New(scaleset.Config{
@@ -523,7 +552,7 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 	if tiers == nil {
 		tiers = []config.Tier{{
 			Label:       testTier,
-			Provider:    config.ProviderDocker,
+			Provider:    kind,
 			VCPU:        2,
 			Memory:      2 * config.GiB,
 			Disk:        10 * config.GiB,
@@ -564,7 +593,7 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 	// that stopped it — the node would bind happily against a row this harness
 	// had helpfully created.
 	if !sc.wire {
-		if _, err := a.RegisterNode(t.Context(), alloc.NodeRegistration{Name: host, Provider: config.ProviderDocker, VCPU: testNodeVCPU, Memory: testNodeMemory}); err != nil {
+		if _, err := a.RegisterNode(t.Context(), alloc.NodeRegistration{Name: host, Provider: kind, VCPU: testNodeVCPU, Memory: testNodeMemory}); err != nil {
 			t.Fatalf("RegisterNode: %v", err)
 		}
 	}
@@ -577,7 +606,10 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 		t.Fatalf("DeploymentID: %v", err)
 	}
 
-	prov := docker.New(deployment)
+	var prov provider.Provider = docker.New(deployment)
+	if sc.backend != nil {
+		prov = sc.backend(t, deployment)
+	}
 
 	// Whatever this test leaves behind goes with it, even on a failure path. Safe
 	// to register per incarnation: it runs after the test body, so nothing it
@@ -633,13 +665,13 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 		var first *nodeLoop
 
 		first, wire, wireAddr, serverOpts = wireUp(
-			t, log, a, client, prov, config.ProviderDocker, nil, tiers, deployment,
+			t, log, a, client, prov, kind, nil, tiers, deployment,
 			computeName, hurry, wireOptions{drainTimeout: sc.nodeDrainTimeout})
 		runner, stopNode = first.runner, first.stop
 	} else {
 		runner = node.New(a, host, wiring.JITSource{Client: client, Pool: a}, prov, log)
 		serverOpts = []server.ControlPlaneOption{
-			server.WithNodeRunner(directRunner{runner: runner, tiers: tiers}),
+			server.WithNodeRunner(directRunner{runner: runner, tiers: tiers, kind: kind}),
 		}
 	}
 

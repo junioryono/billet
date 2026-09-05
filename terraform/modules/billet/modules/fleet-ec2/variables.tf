@@ -69,6 +69,84 @@ variable "enable_spot" {
   default     = false
 }
 
+# SEVERAL SPOT NODES ARE SEVERAL QUEUES, AND ONE INPUT MAKES THEM. billet needs one
+# interruption queue per spot node, its basename equal to that node's node.name;
+# the queue enable_spot creates serves one node. Each name here creates a queue
+# named exactly it, and the node role's consumer grant, the router's forwarding
+# grant and the set of names the router is told it serves all derive from this
+# one list — so telling the router about a queue, granting it, and granting the
+# node converge from one input rather than being three edits an operator makes
+# by hand, with the served set landing before the grants (spot.tf says why that
+# order is the safe one). The hand-made shape is what issue #66 was: a queue
+# granted but never named to the router had its warnings DROPPED while the grant
+# propagated, because the router could not prove the queue was its own.
+variable "spot_node_names" {
+  description = "Further spot nodes beside the one enable_spot creates. One interruption queue is created per entry, named exactly it (billet requires the queue basename to equal the node's node.name), and the node grant, the router grant and the router's served set widen to every queue from this one input. Queue names are account-wide per region in SQS. Requires enable_spot."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = length(var.spot_node_names) == 0 || var.enable_spot
+    error_message = "spot_node_names requires enable_spot: the router and the primary queue it serves only exist with spot enabled, and a queue nothing forwards to receives no warning."
+  }
+
+  validation {
+    # THE INTERSECTION OF TWO RULES, both of which the name has to satisfy:
+    # billet's node name (^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$, config.ValidateNodeName)
+    # and SQS's queue name ([A-Za-z0-9_-]{1,80}). A dot is the case worth spelling
+    # out: legal for billet, refused by SQS, and refusing it here is a plan
+    # failure rather than an apply that dies after the first queue was created.
+    condition     = alltrue([for n in var.spot_node_names : can(regex("^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$", n))])
+    error_message = "every spot_node_names entry must be a name both billet and SQS accept: 1 to 64 letters, digits, hyphens or underscores, starting with a letter or digit, and no dot (billet allows one in a node name; SQS refuses it in a queue name)."
+  }
+
+  validation {
+    # toset() would collapse a duplicate silently, and two nodes named alike would
+    # then share one queue — the shared-consumer shape billet refuses.
+    condition     = length(distinct(var.spot_node_names)) == length(var.spot_node_names)
+    error_message = "spot_node_names must not repeat a name: two spot nodes cannot share one interruption queue."
+  }
+
+  validation {
+    condition     = !contains(var.spot_node_names, local.spot_queue_name)
+    error_message = "spot_node_names must not name the primary queue enable_spot already creates (<name>-spot-interruptions); that node is served by spot_node_name."
+  }
+
+  validation {
+    # BOUNDED, because every queue's ARN is repeated in two inline policies and
+    # its name in the Lambda's environment, and AWS refuses each of those past a
+    # quota Terraform cannot see at plan. A partial apply is the #66 shape again:
+    # queues that exist with neither a grant nor a served name. The binding
+    # quota is IAM's 10,240 characters for ALL of a role's inline policies
+    # combined, which the node role shares between its generated rendering
+    # (about 3 KB with sentinels, more with real values), the builder grant
+    # (1.4 KB), PassRole and the root's backup grant; a worst-case queue ARN
+    # with a 64-character name is 113 characters, so 17 queues cost about 2.1 KB
+    # and fit beside the module's own renderings with room to spare. Lambda's
+    # 4 KB environment would admit about 60 names and is not the limit.
+    #
+    # WHAT THIS BOUNDS IS THIS INPUT'S SHARE. An iam_policy_json override is
+    # installed verbatim and unbounded, and one already near the quota fails the
+    # primary spot grant with no further names at all; that was true before this
+    # input existed and is the override's author's to size.
+    condition     = length(var.spot_node_names) <= 16
+    error_message = "spot_node_names admits at most 16 further spot nodes: every queue's ARN is repeated in the node role's and the router's inline policies, and IAM caps a role's inline policies at 10,240 characters combined, which the node role's other grants share. More spot nodes than that are several fleet-ec2 instances."
+  }
+}
+
+variable "spot_router_alarm_actions" {
+  description = "ARNs notified when the spot interruption router fails an invocation — a warning it could not place and re-raised for Lambda to retry. Usually an SNS topic; this module creates none, so an operator supplies their own. Empty leaves the alarm with no action: its state is still visible in the console and to DescribeAlarms, but nothing is sent."
+  type        = list(string)
+  default     = []
+
+  validation {
+    # An action is an ARN or it is silently ignored by CloudWatch, and an alarm
+    # whose action goes nowhere is worse than no alarm: it reads as covered.
+    condition     = alltrue([for action in var.spot_router_alarm_actions : can(regex("^arn:", action))])
+    error_message = "every spot_router_alarm_actions entry must be an ARN (an SNS topic's, usually)."
+  }
+}
+
 # AN OVERRIDE SUPPLIES THE WHOLE GRANT, BUILDER AND PAYLOAD INCLUDED.
 #
 # There are exactly two supported shapes, and mixing them is refused on `builder`

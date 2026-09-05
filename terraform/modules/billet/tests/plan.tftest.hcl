@@ -147,7 +147,7 @@ run "creates_a_network_and_composes_by_default" {
     error_message = "the cache bucket name should derive from name and account"
   }
   assert {
-    condition     = output.interruption_queue_url == "" && output.spot_node_name == ""
+    condition     = output.interruption_queue_url == "" && output.spot_node_name == "" && length(output.interruption_queue_urls) == 0
     error_message = "spot outputs must be empty when spot is off"
   }
   assert {
@@ -358,12 +358,145 @@ run "spot_surfaces_the_node_name" {
   variables {
     name        = "billet-test"
     enable_spot = true
+    # THE ROUTER'S ALARM ACTION IS SETTABLE FROM THE ROOT. A plan is refused for an
+    # undeclared variable, so this proves the root declares it and accepts an ARN;
+    # what the child does with it is asserted in fleet.tftest.hcl, because a test
+    # run against the root cannot address a child module's resources.
+    spot_router_alarm_actions = ["arn:aws:sns:us-east-1:123456789012:billet-ops"]
+    # A SECOND SPOT NODE, named from the root. The map output is the witness that
+    # the list crossed the module call and the child's queues came back through
+    # it; the queue, the grants and the router's environment are asserted in
+    # fleet.tftest.hcl for the same reason as the alarm action.
+    spot_node_names = ["build-1"]
   }
 
   assert {
     condition     = output.spot_node_name == "billet-test-spot-interruptions"
     error_message = "the spot node name must be the queue basename"
   }
+  assert {
+    condition     = toset(keys(output.interruption_queue_urls)) == toset(["billet-test-spot-interruptions", "build-1"])
+    error_message = "interruption_queue_urls must carry the primary and every spot_node_names entry, keyed by node name, through the root"
+  }
+}
+
+# THE ROOT ENFORCES THE CHILD'S RULES ITSELF, so the refusal names the input the
+# operator typed rather than surfacing from a module they did not write. Each
+# run expects the failure on the ROOT's variable: the child's refusal is
+# module.fleet.var.spot_node_names, a different address, so a root that lost a
+# rule fails these rather than being covered by the child. One run per rule,
+# because a single refusal run would be satisfied by whichever rule survived.
+run "spot_node_names_without_spot_is_refused_at_the_root" {
+  command = plan
+
+  variables {
+    name            = "billet-test"
+    enable_spot     = false
+    spot_node_names = ["build-1"]
+  }
+
+  expect_failures = [var.spot_node_names]
+}
+
+run "a_dotted_spot_node_name_is_refused_at_the_root" {
+  command = plan
+
+  variables {
+    name            = "billet-test"
+    enable_spot     = true
+    spot_node_names = ["build.1"]
+  }
+
+  expect_failures = [var.spot_node_names]
+}
+
+run "a_repeated_spot_node_name_is_refused_at_the_root" {
+  command = plan
+
+  variables {
+    name            = "billet-test"
+    enable_spot     = true
+    spot_node_names = ["build-1", "build-1"]
+  }
+
+  expect_failures = [var.spot_node_names]
+}
+
+run "the_primary_queue_as_a_spot_node_name_is_refused_at_the_root" {
+  command = plan
+
+  variables {
+    name            = "billet-test"
+    enable_spot     = true
+    spot_node_names = ["billet-test-spot-interruptions"]
+  }
+
+  expect_failures = [var.spot_node_names]
+}
+
+run "an_overlong_spot_node_name_is_refused_at_the_root" {
+  command = plan
+
+  variables {
+    name            = "billet-test"
+    enable_spot     = true
+    spot_node_names = ["abcdefghij-abcdefghij-abcdefghij-abcdefghij-abcdefghij-abcdefghij"]
+  }
+
+  expect_failures = [var.spot_node_names]
+}
+
+run "a_seventeenth_spot_node_name_is_refused_at_the_root" {
+  command = plan
+
+  variables {
+    name            = "billet-test"
+    enable_spot     = true
+    spot_node_names = [for i in range(17) : "build-${i}"]
+  }
+
+  expect_failures = [var.spot_node_names]
+}
+
+# ...AND THE ROOT ADMITS EVERYTHING THE CHILD ADMITS: a root rule tightened past
+# the child's would refuse at the entry point operators actually use, with every
+# child test still green. Sixteen names covering every edge of the rule — the
+# 64-character ceiling, an underscore, an uppercase letter, a leading digit and
+# the one-character floor — all reach the output.
+run "the_root_admits_the_edges_of_the_name_rule" {
+  command = plan
+
+  variables {
+    name        = "billet-test"
+    enable_spot = true
+    spot_node_names = concat(
+      ["abcdefghij-abcdefghij-abcdefghij-abcdefghij-abcdefghij-abcdefghi", "build_1", "A", "0"],
+      [for i in range(12) : "build-${i}"],
+    )
+  }
+
+  assert {
+    condition = length(output.interruption_queue_urls) == 17 && alltrue([
+      for n in ["abcdefghij-abcdefghij-abcdefghij-abcdefghij-abcdefghij-abcdefghi", "build_1", "A", "0"] :
+      contains(keys(output.interruption_queue_urls), n)
+    ])
+    error_message = "sixteen further names, the longest, an underscored, an uppercase, a digit-first and a one-character one among them, must all cross the root into interruption_queue_urls"
+  }
+}
+
+# ...and a value that is not an ARN is refused at PLAN, not silently ignored by
+# CloudWatch, which would leave an alarm reading as covered while it notifies
+# nobody.
+run "a_router_alarm_action_that_is_not_an_arn_is_refused" {
+  command = plan
+
+  variables {
+    name                      = "billet-test"
+    enable_spot               = true
+    spot_router_alarm_actions = ["billet-ops"]
+  }
+
+  expect_failures = [var.spot_router_alarm_actions]
 }
 
 # THE CONTROLLER'S ADDRESS CROSSES THE MODULE CALL, on both sides of adopt-or-
