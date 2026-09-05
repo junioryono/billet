@@ -11,7 +11,8 @@ Run the control plane: long-poll GitHub for assigned jobs, own the capacity ledg
 | Flag | Meaning |
 |---|---|
 | `--dry-run` | connect to GitHub and advertise zero capacity: proves the whole path without accepting a job |
-| `--upgrade-probe` | open candidate state without polling, dispatching or accepting work; the host-upgrade transaction's quiescent probe |
+| `--upgrade-probe` | open candidate state without polling, dispatching or accepting work; the host-upgrade transaction's quiescent probe. Proves what it can, prints nothing, and exits zero, which is what `billet host-upgrade` waits for |
+| `--upgrade-probe-hold` | with `--upgrade-probe`, print the readiness line and stay up until stopped; the Ansible role's `Type=notify` probe unit passes it, when the candidate lists it, and stops the unit itself |
 
 ### `billet node`
 
@@ -23,7 +24,8 @@ Run a compute host that dials a control plane. One per machine, including the ma
 | `--ca-fingerprint <fp>` | the control plane's CA fingerprint, from `billet ca show` (required with `--enroll`) |
 | `--join-token <token>` | a short-lived token from `billet ca token` (required with `--enroll`) |
 | `--bootstrap-addr <addr>` | the control plane's enrollment address; overrides `node.bootstrap_addr`, defaults to `node.server_addr` |
-| `--upgrade-probe` | initialise the candidate provider without dialing or accepting work |
+| `--upgrade-probe` | initialise the candidate provider without dialing or accepting work; prints nothing and exits zero |
+| `--upgrade-probe-hold` | with `--upgrade-probe`, print the readiness line and stay up until stopped; passed only by the Ansible role's probe unit, when the candidate lists it |
 
 ## Setup
 

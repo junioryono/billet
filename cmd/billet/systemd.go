@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os"
@@ -11,6 +12,51 @@ import (
 // notification socket. Other service managers and interactive runs are no-ops.
 func notifyReady() error {
 	return notifySystemd("READY=1", "readiness")
+}
+
+// upgradeProbeReady is the sentence a HOLDING probe prints once it has opened
+// what it inherited, and serverProbeReadyLine and nodeProbeReadyFormat are the
+// two whole lines it appears in. `billet host-upgrade` matches those lines, so
+// they are constants here and not strings that happen to agree.
+const (
+	upgradeProbeReady    = "upgrade probe ready"
+	serverProbeReadyLine = "billet server: " + upgradeProbeReady +
+		"; workload polling and dispatch are disabled"
+	nodeProbeReadyFormat = "billet node %s: " + upgradeProbeReady +
+		"; registration and workload polling are disabled"
+)
+
+// holdProbe decides what a ready probe does next: announce itself and stay up
+// for the service manager that started it, or exit silently for the parent that
+// is waiting on it.
+//
+// TWO CALLERS WITH OPPOSITE CONTRACTS. The Ansible host role runs the probe as
+// the unit's own ExecStart under Type=notify and stops it itself, so there it
+// must stay up until told to. `billet host-upgrade` runs it as a plain child and
+// waits for it to EXIT, and a probe that waited there instead hung every
+// self-upgrade at the probe step with the services already stopped: measured
+// 2026-09-05 in the rollout rehearsal, seventeen minutes at ctx.Done() with
+// nobody who would ever tell it to stop.
+//
+// THE FLAG DECIDES, NOT THE ENVIRONMENT. A version of this read NOTIFY_SOCKET as
+// the tell, and it is not one: a node's detached updater inherits its unit's
+// socket, so would the candidate it runs, and a node-dispatched upgrade would
+// have held exactly as before. Only the role's probe unit passes
+// --upgrade-probe-hold, so only the role's probe holds.
+//
+// AND THE LINE IS PRINTED ONLY BY A PROBE THAT WILL HOLD. Every release through
+// v0.9.0 printed it and then held, so to the parent the line MEANS "I will not
+// exit on my own; stop me". A probe that exits once ready says nothing, and its
+// exit status is its whole answer. Keeping those two shapes disjoint is what lets
+// the parent stop a holder without ever mistaking a stop for a verdict.
+func holdProbe(ctx context.Context, hold bool, line string) {
+	if !hold {
+		return
+	}
+
+	fmt.Println(line)
+
+	<-ctx.Done()
 }
 
 // notifyStatus tells the service manager what this process is doing right now.

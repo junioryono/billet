@@ -55,8 +55,11 @@
       ansible.builtin.set_fact:
         billet_legacy_server_unit: "{{ lookup('ansible.builtin.template', playbook_dir + '/../roles/host/templates/billet-server.service.j2') }}"
         billet_legacy_node_unit: "{{ lookup('ansible.builtin.template', playbook_dir + '/../roles/host/templates/billet-node.service.j2') }}"
-        billet_transaction_server_unit: "{{ lookup('ansible.builtin.template', playbook_dir + '/../roles/host/templates/billet-server.service.j2', template_vars={'billet_systemd_notify_ready': true, 'billet_systemd_upgrade_probe': true}) }}"
-        billet_transaction_node_unit: "{{ lookup('ansible.builtin.template', playbook_dir + '/../roles/host/templates/billet-node.service.j2', template_vars={'billet_systemd_notify_ready': true, 'billet_systemd_upgrade_probe': true}) }}"
+        billet_transaction_server_unit: "{{ lookup('ansible.builtin.template', playbook_dir + '/../roles/host/templates/billet-server.service.j2', template_vars={'billet_systemd_notify_ready': true, 'billet_systemd_upgrade_probe': true, 'billet_systemd_upgrade_probe_hold': true}) }}"
+        billet_transaction_node_unit: "{{ lookup('ansible.builtin.template', playbook_dir + '/../roles/host/templates/billet-node.service.j2', template_vars={'billet_systemd_notify_ready': true, 'billet_systemd_upgrade_probe': true, 'billet_systemd_upgrade_probe_hold': true}) }}"
+        billet_older_candidate_server_unit: "{{ lookup('ansible.builtin.template', playbook_dir + '/../roles/host/templates/billet-server.service.j2', template_vars={'billet_systemd_notify_ready': true, 'billet_systemd_upgrade_probe': true, 'billet_systemd_upgrade_probe_hold': false}) }}"
+        billet_older_candidate_node_unit: "{{ lookup('ansible.builtin.template', playbook_dir + '/../roles/host/templates/billet-node.service.j2', template_vars={'billet_systemd_notify_ready': true, 'billet_systemd_upgrade_probe': true, 'billet_systemd_upgrade_probe_hold': false}) }}"
+        billet_candidate_probe_ask: "{{ billet_host_account_tasks | selectattr('name', 'equalto', 'Ask the candidate whether its probe can be told to hold') | first }}"
         billet_unsafe_override_dropin: |
           [Service]
           Type=exec
@@ -202,10 +205,19 @@
           - "'NotifyAccess=main' not in billet_legacy_node_unit"
           - "'Type=notify' in billet_transaction_server_unit"
           - "'Type=notify' in billet_transaction_node_unit"
-          - "'ExecStart=/usr/bin/billet server --config /etc/billet/billet.yaml --upgrade-probe\nTimeoutStartSec=120' in billet_transaction_server_unit"
-          - "'ExecStart=/usr/bin/billet node --config /etc/billet/billet.yaml --upgrade-probe\nTimeoutStartSec=120' in billet_transaction_node_unit"
+          - "'ExecStart=/usr/bin/billet server --config /etc/billet/billet.yaml --upgrade-probe --upgrade-probe-hold\nTimeoutStartSec=120' in billet_transaction_server_unit"
+          - "'ExecStart=/usr/bin/billet node --config /etc/billet/billet.yaml --upgrade-probe --upgrade-probe-hold\nTimeoutStartSec=120' in billet_transaction_node_unit"
           - "'NotifyAccess=main' in billet_transaction_server_unit"
           - "'NotifyAccess=main' in billet_transaction_node_unit"
+          # A CANDIDATE THAT PREDATES THE HOLD FLAG IS RENDERED WITHOUT IT, or a downgrade
+          # would hand an older binary a flag its parser refuses before it probes anything.
+          - "'ExecStart=/usr/bin/billet server --config /etc/billet/billet.yaml --upgrade-probe\nTimeoutStartSec=120' in billet_older_candidate_server_unit"
+          - "'ExecStart=/usr/bin/billet node --config /etc/billet/billet.yaml --upgrade-probe\nTimeoutStartSec=120' in billet_older_candidate_node_unit"
+          - "'--upgrade-probe-hold' not in billet_older_candidate_server_unit"
+          - "'--upgrade-probe-hold' not in billet_older_candidate_node_unit"
+          - "'billet_candidate_probe_holds_on_flag' in billet_candidate_unit_stage.vars.billet_systemd_upgrade_probe_hold"
+          - "'billet.candidate' in (billet_candidate_probe_ask['ansible.builtin.command'].argv | join(' '))"
+          - "'-h' in billet_candidate_probe_ask['ansible.builtin.command'].argv"
           - billet_candidate_unit_stage.vars.billet_systemd_notify_ready | bool
           - billet_steady_unit_install.vars.billet_systemd_notify_ready | bool
           - "'billet_installed_service_types' in (billet_ordinary_unit_install.vars.billet_systemd_notify_ready | string)"
