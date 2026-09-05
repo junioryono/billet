@@ -1952,11 +1952,12 @@ var candidateProbeDeadline = 3 * time.Minute
 // before it is killed. A variable for the tests.
 var probeStopGrace = 10 * time.Second
 
-// probeUsageWaitDelay bounds how long the usage question waits for the
-// candidate's output to close after the candidate has exited. A candidate whose
-// -h left a process holding its output would otherwise hold the transaction, with
+// probeUsageWaitDelay bounds the usage question's reaping and how long it waits
+// for the candidate's output to close after the candidate has exited. A -h that
+// left a process holding its output would otherwise hold the transaction, with
 // the services already stopped, which is the outage this whole step exists to
-// end. A variable for the tests.
+// end; and that process is a live descendant, which cordons. A variable for the
+// tests.
 var probeUsageWaitDelay = 10 * time.Second
 
 // probeOutputGrace bounds how long the candidate's output may stay open after
@@ -2053,21 +2054,58 @@ func (p *probeOutput) drain(r io.Reader, eof chan<- struct{}) {
 // UNLESS TOLD TO HOLD, and the flag that tells it is listed in its usage. Every
 // generation prints its flags to stdout and exits zero on -h, measured, so the
 // question has one honest answer per binary, and a candidate that cannot even
-// say what it accepts is refused here rather than probed.
+// say what it accepts is refused here rather than probed. THE SAME PIPE DISCIPLINE
+// AS THE PROBE: the parent owns the output, reads it to its end, and a process
+// that still holds it once the usage has exited is a live descendant of the
+// candidate, which cordons rather than being rolled back over, because a pipe can
+// prove it exists and cannot prove it never opened the ledger.
 func candidateHoldsOnFlag(ctx context.Context, what string) (bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, installedBinary, what, "-h")
-	cmd.WaitDelay = probeUsageWaitDelay
-
-	usage, err := cmd.CombinedOutput()
+	reader, writer, err := os.Pipe()
 	if err != nil {
+		return false, fmt.Errorf("%s -h: open the usage's output: %w", what, err)
+	}
+
+	defer func() { _ = reader.Close() }()
+
+	usage := &probeOutput{ready: make(chan struct{})}
+	eof := make(chan struct{})
+
+	cmd := exec.CommandContext(ctx, installedBinary, what, "-h")
+	cmd.Stdout = writer
+	cmd.Stderr = writer
+
+	if err := cmd.Start(); err != nil {
+		_ = writer.Close()
+
+		return false, fmt.Errorf("%s -h: %w", what, err)
+	}
+
+	_ = writer.Close()
+
+	go usage.drain(reader, eof)
+
+	// NOTHING IS SIGNALLED HERE, so the reaping may run at once; exec kills the
+	// usage if the deadline passes, and the reaping is bounded all the same.
+	reaped, err := reap(ctx, cmd, probeUsageWaitDelay)
+	closed := awaitClosed(eof, probeUsageWaitDelay)
+
+	switch {
+	case !reaped:
+		return false, fmt.Errorf("%w: %s -h was killed and its exit never arrived within %s: %s",
+			hostupgrade.ErrUnsafeToRestore, what, probeUsageWaitDelay, usage)
+	case !closed:
+		return false, fmt.Errorf("%w: %s -h exited but something it started still holds its "+
+			"output after %s (exit: %v): %s", hostupgrade.ErrUnsafeToRestore, what,
+			probeUsageWaitDelay, err, usage)
+	case err != nil:
 		return false, fmt.Errorf("%s -h: the candidate's usage could not be read: %w: %s",
 			what, err, usage)
 	}
 
-	return bytes.Contains(usage, []byte(holdFlagName)), nil
+	return strings.Contains(usage.String(), holdFlagName), nil
 }
 
 // runCandidate proves the candidate can come up, by running it as a probe.
@@ -2097,8 +2135,10 @@ func candidateHoldsOnFlag(ctx context.Context, what string) (bool, error) {
 // holding, which cordons the host rather than being rolled back over.
 //
 // Anything that still holds the candidate's output when the candidate has gone
-// is found by that output staying open, and fails the probe rather than being
-// hunted; a process that closed the output before detaching is not seen, and
+// is found by that output staying open, and it is a live descendant, so the host
+// is cordoned rather than rolled back over it: the pipe proves the process
+// exists and cannot prove it never opened the ledger. Nothing is hunted by
+// number. A process that closed the output before detaching is not seen, and
 // that is the limit of what a pipe can tell. The parent owns the pipe and reads
 // it to its end before writing any verdict, so a refusal keeps every word.
 func (h *ledgerHost) runCandidate(ctx context.Context, args ...string) error {
@@ -2227,15 +2267,19 @@ func (h *ledgerHost) runCandidate(ctx context.Context, args ...string) error {
 		}
 
 		if !closed {
-			return fmt.Errorf("%w (and something still holds its output)", err)
+			// A REFUSAL WITH SOMETHING STILL ALIVE BEHIND IT IS NOT ROLLED BACK
+			// OVER EITHER. The open output proves a descendant exists; it cannot
+			// prove that descendant never opened the ledger.
+			return fmt.Errorf("%w: %s refused and something it started still holds its "+
+				"output: %w", hostupgrade.ErrUnsafeToRestore, what, err)
 		}
 
 		return err
 	}
 
 	if !closed {
-		return fmt.Errorf("%s: exited but left a process holding its output for %s: %s",
-			what, probeOutputGrace, out)
+		return fmt.Errorf("%w: %s exited but left a process holding its output for %s: %s",
+			hostupgrade.ErrUnsafeToRestore, what, probeOutputGrace, out)
 	}
 
 	return nil
