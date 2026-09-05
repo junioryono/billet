@@ -186,6 +186,25 @@
 # reason the github block's is, and a managed path with nothing there and no
 # source is refused before anything is changed. One fact per target, in a
 # list, so every later task loops over the same decision.
+- name: Refuse a targets list billet will not load
+  ansible.builtin.assert:
+    that:
+      - billet_config.targets is not string
+      - billet_config.targets is not mapping
+      - billet_config.targets is iterable
+    fail_msg: >-
+      billet_config.targets is present but is not a list of targets. billet
+      refuses the config when it LOADS — which, left to billet, happens inside
+      this role's upgrade transaction, after the host has already been changed.
+  when:
+    - billet_config is mapping
+    - billet_config.targets is defined
+    - billet_config.targets is not none
+
+# The policy item carries whether a source was SUPPLIED and never the source
+# itself, so the assertions and stat results below, which have no no_log, can
+# name nothing about the controller; the mapping is read only inside the
+# no_log digest and copy tasks in account.yml.
 - name: Decide what this host's config asks of each further target's App key
   ansible.builtin.set_fact:
     billet_github_target_keys: >-
@@ -194,11 +213,12 @@
            'path': item.private_key_path | default('', true),
            'owned': (item.private_key_path | default('', true))
                     == ('/etc/billet/app-private-key-' ~ (item.name | default('', true)) ~ '.pem'),
-           'src': billet_github_target_key_srcs[item.name | default('', true)] | default('', true)
+           'supplied': (billet_github_target_key_srcs[item.name | default('', true)] | default('', true))
+                       | length > 0
          }] }}
   loop: >-
     {{ (billet_config.targets | default([]))
-       if (billet_config is mapping and (billet_config.targets | default([])) is not string)
+       if (billet_config is mapping and (billet_config.targets | default([])) is not none)
        else [] }}
   loop_control:
     label: "{{ item.name | default('?') }}"
@@ -286,7 +306,7 @@
 - name: Refuse a further target's key this role cannot install where the config reads it
   ansible.builtin.assert:
     that:
-      - item.owned or item.src | length == 0
+      - item.owned or not item.supplied
     fail_msg: >-
       targets[{{ item.name }}].private_key_path is {{ item.path }}, but this role
       installs that target's key only to /etc/billet/app-private-key-{{ item.name }}.pem.
@@ -315,7 +335,7 @@
 - name: Refuse a managed further target's key with nothing to install and none installed
   ansible.builtin.assert:
     that:
-      - not item.item.owned or item.item.src | length > 0 or item.stat.exists
+      - not item.item.owned or item.item.supplied or item.stat.exists
     fail_msg: >-
       targets[{{ item.item.name }}].private_key_path is
       /etc/billet/app-private-key-{{ item.item.name }}.pem, which this role manages,

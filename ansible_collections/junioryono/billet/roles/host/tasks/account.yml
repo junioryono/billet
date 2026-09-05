@@ -703,14 +703,14 @@
   register: billet_installed_target_keys
   become: true
   no_log: true
-  loop: "{{ billet_github_target_keys | selectattr('owned') | selectattr('src') | list }}"
+  loop: "{{ billet_github_target_keys | selectattr('owned') | selectattr('supplied') | list }}"
   loop_control:
     label: "{{ item.name }}"
 
 - name: Refuse to replace an installed further target's App private key implicitly
   ansible.builtin.assert:
     that:
-      - not item.stat.exists or item.stat.checksum == (lookup('ansible.builtin.file', item.item.src, rstrip=false) | hash('sha256'))
+      - not item.stat.exists or item.stat.checksum == (lookup('ansible.builtin.file', billet_github_target_key_srcs[item.item.name], rstrip=false) | hash('sha256'))
     fail_msg: >-
       /etc/billet/app-private-key-{{ item.item.name }}.pem already contains a
       different key. Rotate that credential explicitly before converging the
@@ -722,7 +722,7 @@
 
 - name: Install the further targets' GitHub App private keys without replacing an existing identity
   ansible.builtin.copy:
-    src: "{{ item.src }}"
+    src: "{{ billet_github_target_key_srcs[item.name] }}"
     dest: "/etc/billet/app-private-key-{{ item.name }}.pem"
     owner: "{{ billet_service_user }}"
     group: "{{ billet_service_group }}"
@@ -730,7 +730,7 @@
     force: false
   become: true
   no_log: true
-  loop: "{{ billet_github_target_keys | selectattr('owned') | selectattr('src') | list }}"
+  loop: "{{ billet_github_target_keys | selectattr('owned') | selectattr('supplied') | list }}"
   loop_control:
     label: "{{ item.name }}"
 
