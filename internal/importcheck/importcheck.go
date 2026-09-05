@@ -118,15 +118,18 @@ func ProductionImporters(tb testing.TB, importPath string, testSide ...string) [
 	return importers
 }
 
-// underClaude reports whether a directory sits below the module's .claude
-// directory, where sessions park their worktrees.
+// underClaude reports whether a directory sits below the module root's own
+// .claude directory, where sessions park their worktrees. A .claude directory
+// anywhere deeper is somebody's directory, not a checkout, and is walked.
 func underClaude(root, path string) bool {
 	rel, err := filepath.Rel(root, path)
 	if err != nil {
 		return false
 	}
 
-	return slices.Contains(strings.Split(filepath.ToSlash(rel), "/"), ".claude")
+	rel = filepath.ToSlash(rel)
+
+	return rel == ".claude" || strings.HasPrefix(rel, ".claude/")
 }
 
 // packageOf is the import path of the package a module-relative file belongs

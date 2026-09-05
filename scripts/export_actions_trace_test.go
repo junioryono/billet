@@ -75,14 +75,16 @@ const runsPages = `{"total_count": 2, "workflow_runs": [
 
 // Run 101: the tier label is listed LAST, after the generic labels a self-hosted
 // job carries, on two completed jobs; a third is still running and has no
-// duration.
-const jobsRun101 = `{"total_count": 3, "jobs": [
+// duration; a fourth started and completed within one second of GitHub's clock.
+const jobsRun101 = `{"total_count": 4, "jobs": [
   {"id": 1, "status": "completed", "conclusion": "success", "labels": ["self-hosted", "linux", "billet-2vcpu"],
    "created_at": "2026-03-02T09:00:00Z", "started_at": "2026-03-02T09:00:40Z", "completed_at": "2026-03-02T09:04:45Z"},
   {"id": 2, "status": "completed", "conclusion": "failure", "labels": ["self-hosted", "linux", "billet-4vcpu"],
    "created_at": "2026-03-02T09:00:05Z", "started_at": "2026-03-02T09:01:00Z", "completed_at": "2026-03-02T09:11:00Z"},
   {"id": 3, "status": "in_progress", "conclusion": null, "labels": ["self-hosted", "linux", "billet-2vcpu"],
-   "created_at": "2026-03-02T09:00:10Z", "started_at": "2026-03-02T09:00:50Z", "completed_at": null}
+   "created_at": "2026-03-02T09:00:10Z", "started_at": "2026-03-02T09:00:50Z", "completed_at": null},
+  {"id": 6, "status": "completed", "conclusion": "success", "labels": ["billet-2vcpu"],
+   "created_at": "2026-03-02T09:00:20Z", "started_at": "2026-03-02T09:00:59Z", "completed_at": "2026-03-02T09:00:59Z"}
 ]}`
 
 // Run 102, over two job pages: a hosted job no billet rule names, and a job
@@ -191,11 +193,11 @@ func TestTheExporterWritesATraceTheReplayReads(t *testing.T) {
 		t.Fatalf("the replay cannot read what the exporter wrote: %v\n%s", err, stdout)
 	}
 
-	// Two jobs and only two: the running job has no duration, the hosted job
-	// carries no billet label, and the job with two billet labels is named by
-	// neither rule once.
-	if len(trace.Arrivals) != 2 {
-		t.Fatalf("exported %d jobs, want 2:\n%s", len(trace.Arrivals), stdout)
+	// Three jobs and only three: the running job has no duration, the hosted
+	// job carries no billet label, and the job with two billet labels is named
+	// by neither rule once.
+	if len(trace.Arrivals) != 3 {
+		t.Fatalf("exported %d jobs, want 3:\n%s", len(trace.Arrivals), stdout)
 	}
 
 	first := trace.Arrivals[0]
@@ -226,7 +228,13 @@ func TestTheExporterWritesATraceTheReplayReads(t *testing.T) {
 		t.Errorf("the failed job was exported as %+v", second)
 	}
 
-	if !strings.Contains(stderr, "exported 2 jobs from 2 completed runs") ||
+	// A JOB GITHUB'S CLOCK CANNOT SEPARATE FROM ITS OWN START IS ONE SECOND, not
+	// zero, which the replay would refuse.
+	if third := trace.Arrivals[2]; time.Duration(third.Duration) != time.Second {
+		t.Errorf("the same-second job was exported with duration %s, want 1s", time.Duration(third.Duration))
+	}
+
+	if !strings.Contains(stderr, "exported 3 jobs from 2 completed runs") ||
 		!strings.Contains(stderr, "left out 2 completed jobs") {
 		t.Errorf("the summary on stderr does not count what was written and left out: %q", stderr)
 	}
@@ -260,10 +268,10 @@ func TestTheExporterFiltersByLabel(t *testing.T) {
 		t.Fatalf("unreadable trace: %v\n%s", err, stdout)
 	}
 
-	// Run 101's first job, and run 102's two-label job, which an exact label
-	// names once where a prefix cannot.
-	if len(trace.Arrivals) != 2 || trace.Arrivals[0].RunID != 101 || trace.Arrivals[1].RunID != 102 {
-		t.Fatalf("--label billet-2vcpu exported %+v, want run 101's first job and run 102's two-label job",
+	// Run 101's first and same-second jobs, and run 102's two-label job, which
+	// an exact label names once where a prefix cannot.
+	if len(trace.Arrivals) != 3 || trace.Arrivals[0].RunID != 101 || trace.Arrivals[2].RunID != 102 {
+		t.Fatalf("--label billet-2vcpu exported %+v, want run 101's two jobs and run 102's two-label job",
 			trace.Arrivals)
 	}
 
@@ -282,17 +290,23 @@ func TestAFailedPageFailsTheExport(t *testing.T) {
 	h := newExportHarness(t)
 
 	for name, env := range map[string][]string{
-		"every call refused": {"FAKE_GH_FAIL=1"},
+		"every call refused":  {"FAKE_GH_FAIL=1"},
 		"the last run's jobs": {"FAKE_GH_FAIL_RUN=102"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			_, stderr, err := h.run(t, env, "acme/web", "--since", "2026-03-01", "--prefix", "billet-")
+			stdout, stderr, err := h.run(t, env, "acme/web", "--since", "2026-03-01", "--prefix", "billet-")
 			if err == nil {
 				t.Fatal("the exporter exited 0 with a gh call failing")
 			}
 
 			if !strings.Contains(stderr, "gh: HTTP") {
 				t.Errorf("gh's refusal did not reach stderr: %q", stderr)
+			}
+
+			// AND NOTHING REACHED STDOUT. With `> trace.jsonl` a partial trace is
+			// a complete-looking smaller workload, which is the wrong kind of wrong.
+			if stdout != "" {
+				t.Errorf("a failed export still wrote a trace to stdout:\n%s", stdout)
 			}
 		})
 	}

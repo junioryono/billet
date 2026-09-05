@@ -121,7 +121,7 @@ func Run(t *testing.T, fleet Fleet, trace Trace, opts Options) *Report {
 			break
 		}
 
-		clock.AdvanceTo(ev.at)
+		clock.Step(ev.at)
 		actions.deliver(ev)
 		settle(describe(ev))
 

@@ -31,14 +31,24 @@ func (c *Clock) Now() time.Time {
 	return c.now
 }
 
-// AdvanceTo moves the clock forward to t. A t not after the present leaves it
-// where it is: the harness's events are ordered, and a clock that could step
-// back would let the ledger date a completion before its assignment.
-func (c *Clock) AdvanceTo(t time.Time) {
+// Step moves the clock to t, or one nanosecond past the present if t is not
+// later, so that every event the harness delivers is dated at an instant of
+// its own.
+//
+// THE LEDGER'S ORDER MUST BE ITS TIMESTAMPS' ORDER. Two events at one trace
+// instant are delivered one after the other, and what the first did to the
+// fleet is the state the second was placed against; dated identically, a
+// reader sweeping the ledger cannot tell which came first, and a charge made
+// before a same-instant release reads as made after it. A nanosecond keeps the
+// order and moves nothing a report would notice.
+func (c *Clock) Step(t time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if t.After(c.now) {
-		c.now = t.UTC()
+	next := c.now.Add(time.Nanosecond)
+	if t.After(next) {
+		next = t.UTC()
 	}
+
+	c.now = next
 }

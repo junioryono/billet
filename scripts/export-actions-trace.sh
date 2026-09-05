@@ -26,6 +26,13 @@
 # inside gh, because `gh api --jq` takes no variables and the values below come
 # from the command line.
 #
+# THE TRACE REACHES STDOUT WHOLE OR NOT AT ALL. It is assembled under the work
+# directory and written only after the last page has answered, because with the
+# documented `> trace.jsonl` a run that failed on its last page would otherwise
+# leave a shorter file that reads as a complete, smaller workload. A job whose
+# stamps agree to the second is given one second: GitHub's clock is whole
+# seconds, and a zero is not a duration the replay can hold.
+#
 #   scripts/export-actions-trace.sh OWNER/REPO --since 2026-03-01 --prefix billet- > trace.jsonl
 #   scripts/export-actions-trace.sh OWNER/REPO --since 2026-03-01 --label billet-2vcpu > trace.jsonl
 set -euo pipefail
@@ -125,6 +132,7 @@ jq -r '.workflow_runs[] | [.id, .path, .head_branch] | @tsv' "$work/runs.json" >
 runs=0
 jobs=0
 skipped=0
+: >"$work/trace.jsonl"
 
 while IFS=$'\t' read -r run_id path branch; do
 	[ -n "$run_id" ] || continue
@@ -153,7 +161,7 @@ while IFS=$'\t' read -r run_id path branch; do
 				repository: $name,
 				workflow: $workflow,
 				run_id: $run_id,
-				duration: ((((.completed_at | fromdate) - (.started_at | fromdate)) | tostring) + "s"),
+				duration: ((((.completed_at | fromdate) - (.started_at | fromdate)) | if . < 1 then 1 else . end | tostring) + "s"),
 				result: (if .conclusion == "success" then "succeeded" else .conclusion end)
 			} | @json
 		  else
@@ -165,7 +173,7 @@ while IFS=$'\t' read -r run_id path branch; do
 			skipped=$((skipped + 1))
 		else
 			jobs=$((jobs + 1))
-			printf '%s\n' "$line"
+			printf '%s\n' "$line" >>"$work/trace.jsonl"
 		fi
 	done <"$work/jobs.out"
 done <"$work/runs.tsv"
@@ -177,3 +185,5 @@ if [ "$jobs" -eq 0 ]; then
 	printf 'no completed jobs matched; nothing to replay\n' >&2
 	exit 1
 fi
+
+cat "$work/trace.jsonl"

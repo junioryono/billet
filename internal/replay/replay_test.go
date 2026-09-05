@@ -76,8 +76,8 @@ func TestEveryTraceJobHasALedgerRow(t *testing.T) {
 		t.Fatalf("the ledger has no row for jobs %v", report.Missing)
 	}
 
-	if len(report.Unstarted) != 0 {
-		t.Fatalf("the ledger never saw jobs %v start", report.Unstarted)
+	if len(report.Unstarted) != 0 || len(report.Unfinished) != 0 {
+		t.Fatalf("the ledger never saw jobs %v start or jobs %v finish", report.Unstarted, report.Unfinished)
 	}
 
 	if len(report.Records) != len(trace.Arrivals) {
@@ -275,15 +275,15 @@ func TestNoPlacementExceedsAHostOrTheDeployment(t *testing.T) {
 	}
 
 	// AND THE CEILING, NOT ONLY THE HOSTS, DID SOME OF THE WORK: 16 vCPU of hosts
-	// under a 12 vCPU deployment means the peak sits at the ceiling.
-	total := 0
-	for _, peak := range report.PeakVCPUByNode() {
-		total += peak
+	// under a 12 vCPU deployment means the fleet's peak, escrow included and
+	// measured at one instant, sits at the ceiling.
+	if peak := report.PeakDeploymentVCPU(); peak != fleet.MaxVCPU {
+		t.Errorf("the deployment peaked at %d vCPU under a %d vCPU ceiling; a saturating burst reaches it exactly",
+			peak, fleet.MaxVCPU)
 	}
 
-	if total < fleet.MaxVCPU-4 {
-		t.Errorf("the hosts peaked at %d vCPU between them under a %d vCPU ceiling; the burst did not reach it",
-			total, fleet.MaxVCPU)
+	if len(report.Unfinished) != 0 {
+		t.Fatalf("leases %v were never archived, so the capacity verdict is provisional", report.Unfinished)
 	}
 }
 

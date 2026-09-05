@@ -93,6 +93,10 @@ type Report struct {
 	Missing []int64
 	// Unstarted are recorded jobs the ledger never saw start.
 	Unstarted []int64
+	// Unfinished are recorded leases the ledger never archived: their charge has
+	// no end, so it is swept as open to the last instant the ledger knows, and a
+	// capacity verdict over them is provisional rather than final.
+	Unfinished []int64
 	// EscrowRows counts history rows for leases that were never assigned a job:
 	// the discovery slots released at shutdown. Reported so a reader can tell
 	// them from a missing job.
@@ -221,6 +225,10 @@ func readReport(ctx context.Context, db *state.DB, fleet Fleet, trace Trace) (*R
 		rec.CacheGeneration = placement.CacheGeneration
 		rec.ActionsCache = placement.ActionsCache
 
+		if rec.FinishedAt.IsZero() {
+			r.Unfinished = append(r.Unfinished, a.Seq)
+		}
+
 		if rec.StartedAt.IsZero() {
 			r.Unstarted = append(r.Unstarted, a.Seq)
 		} else {
@@ -268,12 +276,17 @@ func parseStamp(s string) (time.Time, error) {
 
 // charges is every claim the ledger recorded on the fleet: each job's lease
 // from its escrow to its archive, and every discovery slot the same way.
+//
+// A CHARGE WITH NO END IS NOT DROPPED. A lease the ledger never archived is
+// still charged, and leaving it out would let the one thing a swallowed
+// completion leaves behind vanish from the proof; it is swept as open to the
+// last instant any charge names, and Unfinished says the verdict is provisional.
 func (r *Report) charges() []charge {
 	out := make([]charge, 0, len(r.Records)+len(r.escrows))
 
 	for i := range r.Records {
 		rec := &r.Records[i]
-		if rec.ChargedFrom.IsZero() || rec.FinishedAt.IsZero() {
+		if rec.ChargedFrom.IsZero() {
 			continue
 		}
 
@@ -283,8 +296,26 @@ func (r *Report) charges() []charge {
 	}
 
 	for _, c := range r.escrows {
-		if !c.from.IsZero() && !c.to.IsZero() {
+		if !c.from.IsZero() {
 			out = append(out, c)
+		}
+	}
+
+	var last time.Time
+
+	for _, c := range out {
+		if c.to.After(last) {
+			last = c.to
+		}
+
+		if c.from.After(last) {
+			last = c.from
+		}
+	}
+
+	for i := range out {
+		if out[i].to.IsZero() {
+			out[i].to = last
 		}
 	}
 
@@ -405,6 +436,22 @@ func (r *Report) Placements() map[int64]string {
 // PeakVCPUByNode is the most vCPU each host carried at any instant, escrow
 // included.
 func (r *Report) PeakVCPUByNode() map[string]int {
+	peaks, _ := r.peaks()
+
+	return peaks
+}
+
+// PeakDeploymentVCPU is the most vCPU the whole fleet carried at one instant,
+// escrow included: the number the deployment ceiling bounds. Not the sum of
+// the hosts' peaks, which need not coincide.
+func (r *Report) PeakDeploymentVCPU() int {
+	_, total := r.peaks()
+
+	return total
+}
+
+// peaks sweeps every charge once for the per-host and deployment-wide peaks.
+func (r *Report) peaks() (map[string]int, int) {
 	type change struct {
 		at   time.Time
 		vcpu int
@@ -429,13 +476,16 @@ func (r *Report) PeakVCPUByNode() map[string]int {
 
 	load := map[string]int{}
 	peak := map[string]int{}
+	total, totalPeak := 0, 0
 
 	for _, c := range changes {
 		load[c.node] += c.vcpu
 		peak[c.node] = max(peak[c.node], load[c.node])
+		total += c.vcpu
+		totalPeak = max(totalPeak, total)
 	}
 
-	return peak
+	return peak, totalPeak
 }
 
 // HostsUsed is how many distinct hosts carried a job.
@@ -537,8 +587,8 @@ func (r *Report) WriteJSONL(w io.Writer) error {
 func (r *Report) Summary() string {
 	var b strings.Builder
 
-	fmt.Fprintf(&b, "jobs recorded: %d (missing %d, never started %d, escrow rows %d)\n",
-		len(r.Records), len(r.Missing), len(r.Unstarted), r.EscrowRows)
+	fmt.Fprintf(&b, "jobs recorded: %d (missing %d, never started %d, never finished %d, escrow rows %d)\n",
+		len(r.Records), len(r.Missing), len(r.Unstarted), len(r.Unfinished), r.EscrowRows)
 
 	byTier := r.QueueWaitBy(func(rec *Record) string { return rec.Tier })
 	for _, tier := range slices.Sorted(maps.Keys(byTier)) {
@@ -585,10 +635,16 @@ func (r *Report) Summary() string {
 		}
 	}
 
-	if len(r.Violations) == 0 {
-		fmt.Fprintf(&b, "capacity: no host or deployment overcommit in the recorded intervals\n")
-	} else {
+	fmt.Fprintf(&b, "deployment: peak %d vCPU of a %d vCPU ceiling\n", r.PeakDeploymentVCPU(), r.Fleet.MaxVCPU)
+
+	switch {
+	case len(r.Violations) > 0:
 		fmt.Fprintf(&b, "capacity: %d overcommit(s): %s\n", len(r.Violations), strings.Join(r.Violations, "; "))
+	case len(r.Unfinished) > 0:
+		fmt.Fprintf(&b, "capacity: no overcommit in the recorded intervals, PROVISIONALLY: %d leases were never "+
+			"archived and are swept as still charged\n", len(r.Unfinished))
+	default:
+		fmt.Fprintf(&b, "capacity: no host or deployment overcommit in the recorded intervals\n")
 	}
 
 	return b.String()
