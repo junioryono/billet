@@ -49,7 +49,12 @@ func TestTheKeyBearingRequestTypesRedactOnEveryPath(t *testing.T) {
 
 			// %#v reaches Format, which takes precedence over GoString, so the
 			// GoString path is exercised by name.
-			if out := subject.(fmt.GoStringer).GoString(); strings.Contains(out, "SECRETKEYBYTES") {
+			gs, ok := subject.(fmt.GoStringer)
+			if !ok {
+				t.Fatalf("%T has no GoString, so %%#v would format its fields", subject)
+			}
+
+			if out := gs.GoString(); strings.Contains(out, "SECRETKEYBYTES") {
 				t.Errorf("GoString rendered the key: %s", out)
 			}
 

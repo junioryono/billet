@@ -3,6 +3,7 @@ package integration_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -121,10 +122,10 @@ func TestLiveRepositoryScope(t *testing.T) {
 	group, err := client.LookupRunnerGroup(probeCtx(t), "")
 
 	switch {
+	case errors.Is(err, scaleset.ErrRunnerGroupAbsent):
+		report.RunnerGroupLookup = "no group answered"
 	case err != nil:
 		report.RunnerGroupLookup = "error: " + err.Error()
-	case group == nil:
-		report.RunnerGroupLookup = "no group answered"
 	default:
 		report.RunnerGroupLookup = "answered"
 		report.RunnerGroupID = group.ID

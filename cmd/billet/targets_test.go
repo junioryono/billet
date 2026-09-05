@@ -443,7 +443,7 @@ targets:
 	firstTier := position("tier      billet-4vcpu ")
 	secondTier := position("tier      billet-4vcpu-personal ")
 
-	if !(defaultAt < firstTier && firstTier < personalAt && personalAt < secondTier) {
+	if defaultAt >= firstTier || firstTier >= personalAt || personalAt >= secondTier {
 		t.Errorf("tiers are not grouped under their targets (default@%d, its tier@%d, "+
 			"personal@%d, its tier@%d):\n%s", defaultAt, firstTier, personalAt, secondTier, out)
 	}

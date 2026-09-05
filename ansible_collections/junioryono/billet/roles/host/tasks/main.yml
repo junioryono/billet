@@ -194,9 +194,7 @@
     that:
       - >-
         billet_config.targets is none
-        or (billet_config.targets is not string
-            and billet_config.targets is not mapping
-            and billet_config.targets is iterable)
+        or (billet_config.targets | type_debug) == 'list'
     fail_msg: >-
       billet_config.targets is present but is not a list of targets. billet
       refuses the config when it LOADS — which, left to billet, happens inside

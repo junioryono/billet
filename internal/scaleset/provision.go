@@ -569,6 +569,10 @@ type RunnerGroup struct {
 	IsDefault bool
 }
 
+// ErrRunnerGroupAbsent is LookupRunnerGroup's answer when the service names no
+// group, distinct from a request that failed.
+var ErrRunnerGroupAbsent = errors.New("scaleset: the service answered no runner group by that name")
+
 // LookupRunnerGroup asks the Actions service for a runner group by name and
 // returns exactly what it answered, so a live measurement can record the
 // service's answer at a scope nothing documents. Every provisioning call
@@ -587,7 +591,7 @@ func (c *Client) LookupRunnerGroup(ctx context.Context, group string) (*RunnerGr
 	}
 
 	if rg == nil {
-		return nil, nil
+		return nil, fmt.Errorf("scaleset: find runner group %q: %w", group, ErrRunnerGroupAbsent)
 	}
 
 	return &RunnerGroup{ID: rg.ID, Name: rg.Name, IsDefault: rg.IsDefault}, nil

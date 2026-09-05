@@ -96,11 +96,24 @@ func TestTheClientSendsTheTierOnlyOnAWireThatKnowsIt(t *testing.T) {
 				t.Fatal("no trusted-runner-group request reached the plane")
 			}
 
-			if got := strings.Contains(body, `"tier"`); got != tc.want {
-				t.Errorf("wire %d: body carries tier=%v, want %v: %s", tc.version, got, tc.want, body)
+			// DECODED, NOT SEARCHED: the field's presence is the version rule and
+			// its value is the tier that was asked for, and a body carrying some
+			// other tier under that name must fail here.
+			var sent map[string]any
+			if err := json.Unmarshal([]byte(body), &sent); err != nil {
+				t.Fatalf("wire %d: the body is not JSON: %v: %s", tc.version, err, body)
 			}
 
-			if !strings.Contains(body, `"billet-trusted"`) {
+			tier, present := sent["tier"]
+			if present != tc.want {
+				t.Errorf("wire %d: body carries tier=%v, want %v: %s", tc.version, present, tc.want, body)
+			}
+
+			if tc.want && tier != "billet-4vcpu" {
+				t.Errorf("wire %d: the tier sent is %v, want billet-4vcpu", tc.version, tier)
+			}
+
+			if sent["group"] != "billet-trusted" {
 				t.Errorf("wire %d: the group was lost: %s", tc.version, body)
 			}
 		})
