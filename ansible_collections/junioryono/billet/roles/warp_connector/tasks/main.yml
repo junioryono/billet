@@ -10,20 +10,25 @@
 # enrolment exec carries it in argv on the host for its duration, as root, once;
 # that residual is recorded in the security skill rather than hidden.
 #
-# WITHOUT A TOKEN THE ROLE DOES NOTHING, so the shipped fleet playbook can run
-# it on every host and an inventory that says nothing converges unchanged.
+# WITHOUT A TOKEN THE ROLE DOES NOTHING, so a play can run it on every host and
+# an inventory that says nothing converges unchanged.
 
-- name: Record the environment variable this host's connector token is read from
-  ansible.builtin.set_fact:
-    billet_warp_connector_token_env_resolved: "{{ billet_warp_connector_token_env }}"
-
+# A NAME FOR EVERY HOST'S TOKEN, AND NO TWO HOSTS SHARING ONE, computed for
+# every host in the play from its inventory rather than from a fact each host
+# records first, because under `serial` the later batches have recorded nothing
+# when the first batch asks; the fallback formula is the default's, repeated on
+# purpose. Case-sensitive, because environment variable names are.
 - name: Refuse two hosts whose connector tokens would share one environment variable
   vars:
     billet_warp_env_names: >-
-      {{ ansible_play_hosts | map('extract', hostvars, 'billet_warp_connector_token_env_resolved') | list }}
+      {%- set names = [] -%}
+      {%- for h in ansible_play_hosts -%}
+      {%- set _ = names.append(hostvars[h]['billet_warp_connector_token_env'] | default('BILLET_WARP_CONNECTOR_TOKEN_' ~ (h | upper | regex_replace('[^A-Z0-9]', '_')))) -%}
+      {%- endfor -%}
+      {{ names }}
   ansible.builtin.assert:
     that:
-      - billet_warp_env_names | unique | length == billet_warp_env_names | length
+      - billet_warp_env_names | unique(case_sensitive=true) | length == billet_warp_env_names | length
     fail_msg: >-
       Two hosts in this play read their WARP connector token from the same
       environment variable: {{ dict(ansible_play_hosts | zip(billet_warp_env_names)) }}.
@@ -71,6 +76,18 @@
           ansible.builtin.import_tasks: apt.yml
           when: billet_warp_manage_apt | bool
 
+        # THE IPv6 KEYS EXIST ONLY WHERE IPv6 DOES. A host booted with IPv6
+        # disabled has no net.ipv6 tree, and a loop that set IPv4 forwarding
+        # first and then failed on the IPv6 key left the host half-configured
+        # and the play failed; asked first, the IPv4 key is set and the IPv6
+        # ones are skipped, and both are reported.
+        - name: Inspect whether the host has an IPv6 stack
+          ansible.builtin.stat:
+            path: /proc/sys/net/ipv6/conf/all
+          register: billet_warp_ipv6
+          check_mode: false
+          when: billet_warp_sysctls | bool
+
         - name: Set the connector's forwarding sysctls
           ansible.posix.sysctl:
             name: "{{ item.name }}"
@@ -83,7 +100,9 @@
             - { name: net.ipv6.conf.all.forwarding, value: "1" }
             - { name: net.ipv6.conf.all.accept_ra, value: "2" }
           become: true
-          when: billet_warp_sysctls | bool
+          when:
+            - billet_warp_sysctls | bool
+            - item.name is not match('^net\.ipv6\.') or billet_warp_ipv6.stat.exists
 
         # RETRIED, because the decision below is made from this answer and the
         # daemon is often still starting right after the package install.
@@ -102,6 +121,28 @@
           until: billet_warp_status.rc == 0
           become: true
 
+        # ONE STATUS LINE, READ ONCE. The daemon prints `Status update: <state>`;
+        # the state is that line and nothing else in the output, so contradictory
+        # or unrelated text cannot both enrol and skip a connect. A daemon that
+        # answered with no status line at all is not read as any state.
+        - name: Read the state the daemon reported
+          ansible.builtin.set_fact:
+            billet_warp_state: >-
+              {{ ((billet_warp_status.stdout_lines | default([]) | select('match', '^Status update:') | list | first | default(''))
+                  | regex_replace('^Status update: *', '') | trim | lower)
+                 if billet_warp_status.rc == 0 else '' }}
+
+        - name: Refuse a daemon whose answer names no state
+          ansible.builtin.assert:
+            that:
+              - billet_warp_state | length > 0
+            fail_msg: >-
+              {{ billet_warp_cli }} status on {{ inventory_hostname }} exited
+              {{ billet_warp_status.rc }} and printed no `Status update:` line this
+              role reads, so nothing is known about the registration and nothing
+              is enrolled. Its output was: {{ billet_warp_status.stdout | default('') | trim }}
+              {{ billet_warp_status.stderr | default('') | trim }}
+
         # `connector new` is not idempotent (it errors against a registered
         # daemon), so it runs only on the daemon's own "Registration Missing",
         # and ONLY on that: a status the daemon could not answer is not a
@@ -112,18 +153,14 @@
             argv: ["{{ billet_warp_cli }}", --accept-tos, connector, new, "{{ billet_warp_connector_token }}"]
           register: billet_warp_enrol
           no_log: true
-          when:
-            - billet_warp_status.rc == 0
-            - "'registration missing' in (billet_warp_status.stdout | default('') | lower)"
+          when: billet_warp_state == 'registration missing'
           become: true
 
         - name: Connect
           ansible.builtin.command:
             argv: ["{{ billet_warp_cli }}", --accept-tos, connect]
           changed_when: true
-          when:
-            - billet_warp_status.rc == 0
-            - "'Connected' not in (billet_warp_status.stdout | default(''))"
+          when: billet_warp_state != 'connected'
           become: true
 
         # ROTATION IS NOT HANDLED HERE, ON PURPOSE. warp-cli does not expose the
@@ -149,6 +186,6 @@
           changed_when: false
           retries: "{{ billet_warp_connect_retries }}"
           delay: "{{ billet_warp_retry_delay }}"
-          until: "'Connected' in (billet_warp_final.stdout | default(''))"
+          until: "((billet_warp_final.stdout_lines | default([]) | select('match', '^Status update:') | list | first | default('')) | regex_replace('^Status update: *', '') | trim | lower) == 'connected'"
           when: not ansible_check_mode
           become: true

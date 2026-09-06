@@ -27,6 +27,13 @@ billet_warp_apt_suite: "{{ ansible_facts['distribution_release'] }}"
 billet_warp_manage_apt: true
 billet_warp_sysctls: true
 
+# What verifying the key (gpg) and adding the repository (deb822_repository
+# needs python3-debian on the host) need, installed from the distribution's own
+# repositories first; empty for a host that has them. The legacy path is where
+# an earlier convention staged the key, world-writable, and is removed.
+billet_warp_prerequisites: [gnupg, python3-debian]
+billet_warp_legacy_key_path: /tmp/cloudflare-warp.asc
+
 billet_warp_cli: warp-cli
 
 # How long the role waits for the daemon: the status is asked

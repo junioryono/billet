@@ -4,31 +4,42 @@
 # there provision the Cloudflare half of.
 #
 # THE TOKEN NEVER REACHES ARGV. `cloudflared service install` takes it only as
-# a positional argument and writes /etc/cloudflared/token (0600 root) beside a
-# unit that runs `tunnel run --token-file` (measured on cloudflared 2026.7.3);
+# a positional argument and writes /etc/cloudflared/token (0600 root, the bytes
+# verbatim) beside a unit that runs `tunnel run --token-file` (measured on
+# cloudflared 2026.7.3 and read in its source, cmd/cloudflared/common_service.go);
 # this role writes that file and renders that unit itself and never runs the
 # installer, so the credential is in a root-only file and, under no_log, nowhere
-# in a log. A rotation is the file changing and the service restarting.
+# in a log.
 #
-# WITHOUT A TOKEN THE ROLE DOES NOTHING, so the shipped fleet playbook can run
-# it on every host and an inventory that says nothing converges unchanged.
+# A RESTART OF A RUNNING CONNECTOR IS THE DANGEROUS ACT, whatever causes it. A
+# play reaching the host through this connector loses its session when the
+# connector restarts, before the replacement is up; so every write that would
+# restart a running connector (a rotated credential, a changed unit, a changed
+# owner) is predicted first and refused unless the answer to "does this play
+# reach the host through this connector" is a definite false. A first install
+# restarts nothing that carries a session, so it is never refused.
+#
+# WITHOUT A TOKEN THE ROLE DOES NOTHING, so a play can run it on every host and
+# an inventory that says nothing converges unchanged.
 
 # A NAME FOR EVERY HOST'S TOKEN, AND NO TWO HOSTS SHARING ONE. Upper-casing and
 # replacing punctuation maps node-a, node.a and node_a onto NODE_A, and two such
-# hosts would silently read one credential. Each host records its resolved name
-# as a fact (a role default is not visible through hostvars; a fact is), and the
-# names are compared once, for the whole play, before any host acts.
-- name: Record the environment variable this host's connector token is read from
-  ansible.builtin.set_fact:
-    billet_cloudflared_token_env_resolved: "{{ billet_cloudflared_token_env }}"
-
+# hosts would silently read one credential. The names are computed here for
+# every host in the play from its inventory, never from a fact each host records
+# first, because under `serial` the later batches have recorded nothing when the
+# first batch asks; the fallback formula is the default's, repeated on purpose.
+# Case-sensitive, because environment variable names are.
 - name: Refuse two hosts whose connector tokens would share one environment variable
   vars:
     billet_cloudflared_env_names: >-
-      {{ ansible_play_hosts | map('extract', hostvars, 'billet_cloudflared_token_env_resolved') | list }}
+      {%- set names = [] -%}
+      {%- for h in ansible_play_hosts -%}
+      {%- set _ = names.append(hostvars[h]['billet_cloudflared_token_env'] | default('BILLET_CLOUDFLARED_TOKEN_' ~ (h | upper | regex_replace('[^A-Z0-9]', '_')))) -%}
+      {%- endfor -%}
+      {{ names }}
   ansible.builtin.assert:
     that:
-      - billet_cloudflared_env_names | unique | length == billet_cloudflared_env_names | length
+      - billet_cloudflared_env_names | unique(case_sensitive=true) | length == billet_cloudflared_env_names | length
     fail_msg: >-
       Two hosts in this play read their cloudflared token from the same
       environment variable: {{ dict(ansible_play_hosts | zip(billet_cloudflared_env_names)) }}.
@@ -46,7 +57,7 @@
 - name: Configure the cloudflared connector
   when: billet_cloudflared_token | length > 0
   block:
-    # BEFORE ANYTHING IS INSTALLED, a pure computation on a value already held.
+    # BEFORE ANYTHING IS INSTALLED, pure computations on values already held.
     # The shape is checked first with a message that says what a token is,
     # because the decode below runs under no_log and a pasted wrong string would
     # otherwise fail censored; a token that is base64 but not the JSON document
@@ -61,6 +72,22 @@
           account, the secret and the tunnel; `terraform output -raw tunnel_token`
           prints it. Nothing was installed.
 
+    # THE EXPECTED TUNNEL IS REQUIRED, not optional: with it empty the one check
+    # that catches a token for the other host's tunnel would be skipped by
+    # default, and that token installs cleanly and comes up healthy.
+    - name: Refuse a host that names no tunnel to check its token against
+      ansible.builtin.assert:
+        that:
+          - billet_cloudflared_expected_tunnel_id | string | trim | length > 0
+        fail_msg: >-
+          {{ inventory_hostname }} has a connector token in
+          {{ billet_cloudflared_token_env }} and no billet_cloudflared_expected_tunnel_id.
+          The id is what proves the token is this host's: a token for another
+          tunnel installs cleanly and comes up healthy advertising routes this
+          host cannot serve. Set it from `terraform output -raw tunnel_id`; it
+          names a tunnel and authorises nothing, so it belongs in the inventory.
+          Nothing was installed.
+
     - name: Read the tunnel id the supplied token names
       ansible.builtin.set_fact:
         billet_cloudflared_token_tunnel_id: >-
@@ -70,8 +97,7 @@
     - name: Refuse a connector token belonging to a different tunnel
       ansible.builtin.assert:
         that:
-          - billet_cloudflared_expected_tunnel_id | length == 0
-            or billet_cloudflared_token_tunnel_id == billet_cloudflared_expected_tunnel_id
+          - billet_cloudflared_token_tunnel_id == (billet_cloudflared_expected_tunnel_id | string | trim)
         fail_msg: >-
           The token in {{ billet_cloudflared_token_env }} names tunnel
           {{ billet_cloudflared_token_tunnel_id | default('(unreadable)') }}, and
@@ -81,6 +107,20 @@
           as an unrelated timeout later.
         success_msg: >-
           The connector token belongs to the tunnel {{ inventory_hostname }} expects.
+
+    # AN ANSWER THAT IS NEITHER true NOR false IS REFUSED, not read as empty:
+    # "yes" or 1 would otherwise fall through to the derived answer, and a
+    # derived false authorises a rotation over this play's own transport.
+    - name: Refuse an answer about the transport that is neither true nor false
+      ansible.builtin.assert:
+        that:
+          - (billet_cloudflared_carries_ansible_transport | string | trim | lower) in ['', 'true', 'false']
+        fail_msg: >-
+          billet_cloudflared_carries_ansible_transport is
+          "{{ billet_cloudflared_carries_ansible_transport }}" on {{ inventory_hostname }};
+          it must be true, false, or left empty. Any other spelling would fall
+          through to the derived answer and could authorise a rotation over this
+          play's own transport.
 
     - name: Inspect the connector binary
       ansible.builtin.stat:
@@ -115,58 +155,119 @@
           ansible.builtin.import_tasks: apt.yml
           when: billet_cloudflared_manage_apt | bool
 
+        # WHETHER A CONNECTOR IS RUNNING NOW, which is what makes a restart
+        # dangerous: a session may be riding on it. Asked of systemd, not
+        # inferred from files; an absent unit answers inactive.
+        - name: Read whether the connector is running
+          ansible.builtin.command:
+            argv: [systemctl, show, -p, ActiveState, --value, cloudflared]
+          register: billet_cloudflared_active
+          changed_when: false
+          check_mode: false
+          become: true
+
+        # THREE ANSWERS, AND ONLY A DEFINITE "NO" PERMITS A RESTART. An explicit
+        # answer wins. A declared routed address derives one from the address
+        # this play connects to: equal means the play rides the connector; two
+        # DIFFERENT IP literals mean it does not; anything else (no ansible_host,
+        # a name against an address, an instance id) is could-not-tell, because
+        # two spellings can name one address and the role resolves nothing.
+        - name: Decide whether this play reaches the host through the connector
+          vars:
+            billet_cloudflared_transport_explicit: "{{ billet_cloudflared_carries_ansible_transport | string | trim | lower }}"
+            billet_cloudflared_routed: "{{ billet_cloudflared_routed_address | string | trim }}"
+            billet_cloudflared_reached_at: "{{ ansible_host | default('') | string | trim }}"
+            billet_cloudflared_ip_literal: '^([0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9A-Fa-f:]+$'
+          ansible.builtin.set_fact:
+            billet_cloudflared_transport: >-
+              {{ billet_cloudflared_transport_explicit
+                 if billet_cloudflared_transport_explicit in ['true', 'false']
+                 else 'unknown' if (billet_cloudflared_routed | length == 0 or billet_cloudflared_reached_at | length == 0)
+                 else 'true' if billet_cloudflared_reached_at == billet_cloudflared_routed
+                 else 'false' if (billet_cloudflared_reached_at is match(billet_cloudflared_ip_literal)
+                                  and billet_cloudflared_routed is match(billet_cloudflared_ip_literal))
+                 else 'unknown' }}
+
+        # WHAT THE WRITES WOULD CHANGE IS READ BEFORE THEY HAPPEN: the files as
+        # they are against the bytes, owner and mode the role writes. A rotated
+        # token, a drifted unit and a changed owner all count, which is why the
+        # guard reads these rather than comparing the token alone. Read as root
+        # with the module's own failure on a file that exists and cannot be
+        # read, so a read error is a failed task and not a fresh install.
+        - name: Inspect the connector credential and unit
+          ansible.builtin.stat:
+            path: "{{ item }}"
+          loop:
+            - "{{ billet_cloudflared_config_dir }}/token"
+            - "{{ billet_cloudflared_unit_path }}"
+          register: billet_cloudflared_files
+          check_mode: false
+          become: true
+
         - name: Read the installed connector credential
           ansible.builtin.slurp:
             src: "{{ billet_cloudflared_config_dir }}/token"
           register: billet_cloudflared_installed_token
-          failed_when: false
+          when: billet_cloudflared_files.results[0].stat.exists
           no_log: true
           check_mode: false
           become: true
 
-        - name: Decide whether the credential on the host is the one supplied
+        - name: Read the installed connector unit
+          ansible.builtin.slurp:
+            src: "{{ billet_cloudflared_unit_path }}"
+          register: billet_cloudflared_installed_unit
+          when: billet_cloudflared_files.results[1].stat.exists
+          check_mode: false
+          become: true
+
+        - name: Decide what a converge would rewrite
+          vars:
+            billet_cloudflared_token_stat: "{{ billet_cloudflared_files.results[0].stat }}"
+            billet_cloudflared_unit_stat: "{{ billet_cloudflared_files.results[1].stat }}"
           ansible.builtin.set_fact:
-            billet_cloudflared_token_stale: >-
-              {{ billet_cloudflared_installed_token.content is defined
-                 and (billet_cloudflared_installed_token.content | b64decode | trim)
-                     != (billet_cloudflared_token | trim) }}
+            billet_cloudflared_token_would_change: >-
+              {{ not (billet_cloudflared_token_stat.exists
+                      and billet_cloudflared_token_stat.pw_name == billet_cloudflared_owner
+                      and billet_cloudflared_token_stat.gr_name == billet_cloudflared_group
+                      and billet_cloudflared_token_stat.mode == '0600'
+                      and (billet_cloudflared_installed_token.content | default('') | b64decode) == (billet_cloudflared_token | trim)) }}
+            billet_cloudflared_unit_would_change: >-
+              {{ not (billet_cloudflared_unit_stat.exists
+                      and billet_cloudflared_unit_stat.pw_name == billet_cloudflared_owner
+                      and billet_cloudflared_unit_stat.gr_name == billet_cloudflared_group
+                      and billet_cloudflared_unit_stat.mode == '0644'
+                      and (billet_cloudflared_installed_unit.content | default('') | b64decode) == lookup('ansible.builtin.template', 'cloudflared.service.j2')) }}
           no_log: true
 
-        # THREE ANSWERS, AND ONLY A DEFINITE "NO" PERMITS A ROTATION. Restarting
-        # the connector under the play drops the SSH session the play is running
-        # over before the replacement is up; the reference controller was reached
-        # exactly that way. An explicit answer wins; a declared routed address
-        # derives one; nothing at all is could-not-tell, which refuses.
-        - name: Decide whether this play reaches the host through the connector
-          ansible.builtin.set_fact:
-            billet_cloudflared_transport: >-
-              {{ (billet_cloudflared_carries_ansible_transport | string | lower)
-                 if (billet_cloudflared_carries_ansible_transport | string | lower) in ['true', 'false']
-                 else (('true' if ansible_host | default(inventory_hostname) == billet_cloudflared_routed_address else 'false')
-                       if billet_cloudflared_routed_address | length > 0
-                       else 'unknown') }}
-
-        - name: Refuse a credential rotation that could cut this play's own transport
+        - name: Refuse a change that would restart the connector this play may be reaching the host through
+          vars:
+            billet_cloudflared_rewrites: "{{ (['the credential'] if billet_cloudflared_token_would_change | bool else []) + (['the unit'] if billet_cloudflared_unit_would_change | bool else []) }}"
           ansible.builtin.assert:
             that:
-              - not (billet_cloudflared_token_stale | bool) or billet_cloudflared_transport == 'false'
+              - >-
+                (billet_cloudflared_active.stdout | trim) != 'active'
+                or not (billet_cloudflared_token_would_change | bool or billet_cloudflared_unit_would_change | bool)
+                or billet_cloudflared_transport == 'false'
             fail_msg: >-
-              The connector token for {{ inventory_hostname }} has changed, and
+              Converging {{ inventory_hostname }} would rewrite {{ billet_cloudflared_rewrites | join(' and ') }} and restart the running connector, and
               {{ 'this play reaches the host through that connector'
                  if billet_cloudflared_transport == 'true'
                  else 'nothing says whether this play reaches the host through that connector' }}:
-              restarting it would drop this SSH session before the replacement is
+              the restart would drop this SSH session before the replacement is
               running. Converge over a path that does not traverse the tunnel
-              (for example `-e ansible_host=<another address>` with
+              (for example `-e ansible_host=<another IP address>` with
               billet_cloudflared_routed_address set, which makes the derivation
               false for that run), or declare
               billet_cloudflared_carries_ansible_transport: false for a host you
-              reach another way. An unchanged token is never refused.
+              reach another way. A converge that changes nothing is never refused.
 
         - name: Create the connector's configuration directory
           ansible.builtin.file:
             path: "{{ billet_cloudflared_config_dir }}"
             state: directory
+            owner: "{{ billet_cloudflared_owner }}"
+            group: "{{ billet_cloudflared_group }}"
             mode: "0755"
           become: true
 
@@ -174,6 +275,8 @@
           ansible.builtin.copy:
             content: "{{ billet_cloudflared_token | trim }}"
             dest: "{{ billet_cloudflared_config_dir }}/token"
+            owner: "{{ billet_cloudflared_owner }}"
+            group: "{{ billet_cloudflared_group }}"
             mode: "0600"
           no_log: true
           register: billet_cloudflared_token_file
@@ -183,6 +286,8 @@
           ansible.builtin.template:
             src: cloudflared.service.j2
             dest: "{{ billet_cloudflared_unit_path }}"
+            owner: "{{ billet_cloudflared_owner }}"
+            group: "{{ billet_cloudflared_group }}"
             mode: "0644"
           register: billet_cloudflared_unit_file
           become: true
@@ -204,21 +309,38 @@
           when: not ansible_check_mode
           become: true
 
-        # ONLY WHEN THIS RUN STARTED OR RESTARTED IT. cloudflared logs the
-        # registration line at startup and reconnect, never periodically; a
-        # fixed window read on every run was empty once the connector had been
-        # up for longer than the window, and failed a healthy host (measured on
-        # the reference deployment). Anchored on the success line: "Connection "
-        # alone also matches "Connection terminated".
-        - name: Wait for the connector to register a connection
+        # ONLY WHEN THIS RUN STARTED OR RESTARTED THE PROCESS, and only this
+        # invocation's log. cloudflared logs the registration line at startup
+        # and reconnect, never periodically; a fixed window read on every run
+        # was empty once the connector had been up for longer than the window,
+        # and failed a healthy host (measured on the reference deployment). A
+        # window read after a restart could also find the PREVIOUS process's
+        # line, so the wait is keyed on the invocation systemd just started.
+        # Enabling an already-running unit starts no process and awaits nothing.
+        - name: Read the invocation systemd started
           ansible.builtin.command:
-            argv: [journalctl, -u, cloudflared, --no-pager, -n, "200"]
+            argv: [systemctl, show, -p, InvocationID, --value, cloudflared]
+          register: billet_cloudflared_invocation
+          changed_when: false
+          when:
+            - not ansible_check_mode
+            - billet_cloudflared_token_file is changed or billet_cloudflared_unit_file is changed
+              or (billet_cloudflared_active.stdout | trim) != 'active'
+          become: true
+
+        - name: Wait for the connector to register a connection
+          vars:
+            billet_cloudflared_invocation_id: "{{ billet_cloudflared_invocation.stdout | default('') | trim }}"
+          ansible.builtin.command:
+            argv: >-
+              {{ ['journalctl', '--no-pager']
+                 + (['_SYSTEMD_INVOCATION_ID=' ~ billet_cloudflared_invocation_id]
+                    if billet_cloudflared_invocation_id | length > 0
+                    else ['-u', 'cloudflared', '-n', '200']) }}
           register: billet_cloudflared_log
           changed_when: false
           retries: 10
           delay: 3
           until: "'Registered tunnel connection' in (billet_cloudflared_log.stdout | default(''))"
-          when:
-            - not ansible_check_mode
-            - billet_cloudflared_service is changed
+          when: billet_cloudflared_invocation is not skipped
           become: true

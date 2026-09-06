@@ -39,6 +39,8 @@ billet's shell lives in `scripts/` (guest image, guest kernel, release, install,
 
 **`pgrep -f <marker>` matches its own invoking shell.** Split the literal (`billet-surv[i]vor-marker`) or every mechanism reports one survivor and the probe proves nothing. And a trailing `[ -s pid ] && printf pid` makes the whole query exit non-zero when there is no pid, which reads as "could not ask" and silently disabled a conclusive verdict in the guest launcher.
 
+**`stat -f` is the filesystem form on GNU coreutils, so a BSD-first mode read never falls back on Linux.** `stat -f '%Lp' f 2>/dev/null || stat -c '%a' f` reads a mode on this Mac and prints filesystem statistics with status 0 in `ubuntu:24.04` (measured 2026-09-06), so the gate compared inode counts against `600` on the one platform CI runs. Put the GNU form first: BSD `stat` refuses `-c` and falls through.
+
 **Vendored scripts are pinned to LF.** `.gitattributes` marks `scripts/kernel/check-config.sh` `text eol=lf`, because the release gate refuses a copy that does not hash to the pin, and a line-ending conversion on checkout changes every byte.
 
 ## Measured facts

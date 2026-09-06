@@ -3,8 +3,9 @@
 #
 # WHY A GATE OF ITS OWN: the same reason cloudflared-connector-check.sh gives.
 # The role's rules are that a connector is enrolled exactly on the daemon's own
-# "Registration Missing", never on a status the daemon could not answer, never
-# a second time, and only after a signing key with the pinned fingerprint.
+# "Registration Missing", never on a status the daemon could not answer or did
+# not give, never a second time, and only after a signing key with the pinned
+# fingerprint.
 #
 # What this cannot prove, stated: the apt path on a real host and the real
 # daemon's answers; the reference deployment's runs prove those.
@@ -29,14 +30,17 @@ cat >"$work/play.yml" <<'EOF'
   hosts: all
   connection: local
   gather_facts: false
+  serial: "{{ lookup('env', 'BILLET_TEST_SERIAL') | default('100%', true) }}"
   vars:
     ansible_facts:
       distribution_release: noble
     billet_warp_manage_apt: "{{ lookup('env', 'BILLET_TEST_MANAGE_APT') | default('false', true) | bool }}"
+    billet_warp_prerequisites: []
     billet_warp_sysctls: false
     billet_warp_signing_key_url: "file://{{ lookup('env', 'BILLET_TEST_KEY_FILE') }}"
     billet_warp_stage_dir: "{{ lookup('env', 'BILLET_TEST_ROOT') }}/stage"
     billet_warp_keyring_path: "{{ lookup('env', 'BILLET_TEST_ROOT') }}/keyrings/cloudflare-warp-archive-keyring.gpg"
+    billet_warp_legacy_key_path: "{{ lookup('env', 'BILLET_TEST_LEGACY_KEY') }}"
     billet_warp_cli: "{{ lookup('env', 'BILLET_TEST_WARP_CLI') }}"
   roles:
     - role: junioryono.billet.warp_connector
@@ -54,10 +58,11 @@ run() {
     env PATH="$work/bin:$PATH" \
         BILLET_FAKE_CALLS="$work/calls" BILLET_FAKE_STATE="$work/state" BILLET_FAKE_GOOD_FPR="$good_fpr" \
         BILLET_TEST_ROOT="$work/root" BILLET_TEST_KEY_FILE="$work/good-key.asc" BILLET_TEST_WARP_CLI=warp-cli \
+        BILLET_TEST_LEGACY_KEY="$work/legacy/cloudflare-warp.asc" \
         ANSIBLE_COLLECTIONS_PATH="$collections_root:$HOME/.ansible/collections:/usr/share/ansible/collections" \
         ANSIBLE_STDOUT_CALLBACK=default ANSIBLE_FORCE_COLOR=0 ANSIBLE_NOCOLOR=1 \
         $envs \
-        ansible-playbook -i "$work/inventory.ini" -e ansible_become=false "$@" "$work/play.yml" \
+        ansible-playbook -i "$work/inventory.ini" -e ansible_become=false --diff -v "$@" "$work/play.yml" \
         >"$work/out.log" 2>&1 || status=$?
     judge "$name" "$status" "$work/out.log" "$expect" "${BILLET_TEST_STAGED:-}"
 }
@@ -70,7 +75,8 @@ run "no token skips with no change" pass -- -e BILLET_WARP_CONNECTOR_TOKEN_NODE_
 [ ! -s "$work/calls" ] || { echo "FAIL: a token-less run called a fake: $(cat "$work/calls")" >&2; exit 1; }
 
 # 2. Registration Missing: enrolled, connected, and the token in the one argv
-#    the tool leaves no alternative to (and in no other).
+#    the tool leaves no alternative to (and in no other, and not in the output
+#    of a run with --diff -v).
 run "a missing registration is enrolled" pass "BILLET_WARP_CONNECTOR_TOKEN_NODE_A=$token" --
 grep -q "^warp-cli --accept-tos connector new $token\$" "$work/calls" || { echo "FAIL: the connector was not enrolled: $(cat "$work/calls")" >&2; exit 1; }
 grep -q '^warp-cli --accept-tos connect$' "$work/calls" || { echo "FAIL: the connector was not connected" >&2; exit 1; }
@@ -85,27 +91,62 @@ if grep -q '^warp-cli --accept-tos connect$' "$work/calls"; then echo "FAIL: a c
 grep -q 'registration on node-a is left as it is' "$work/out.log" || { echo "FAIL: the manual-rotation note was not printed" >&2; exit 1; }
 
 # 4. A daemon that cannot answer is never enrolled.
-run "a daemon that cannot answer is not enrolled" "Error communicating with daemon" "BILLET_WARP_CONNECTOR_TOKEN_NODE_A=$token" \
+run "a daemon that cannot answer is not enrolled" "printed no \`Status update:\` line this role reads" "BILLET_WARP_CONNECTOR_TOKEN_NODE_A=$token" \
     BILLET_FAKE_WARP_STATUS_RC=3 -- -e billet_warp_status_retries=1 -e billet_warp_connect_retries=1 -e billet_warp_retry_delay=0
 if grep -q 'connector new' "$work/calls"; then echo "FAIL: a daemon that could not answer was enrolled" >&2; exit 1; fi
+grep -q 'Error communicating with daemon' "$work/out.log" || { echo "FAIL: the refusal did not quote the daemon's error" >&2; exit 1; }
 
-# 5. A signing key with another fingerprint refuses the repository.
+# 5. A daemon that exits 0 with no status line is not read as any state.
+run "a daemon that names no state is not enrolled" "printed no \`Status update:\` line this role reads" "BILLET_WARP_CONNECTOR_TOKEN_NODE_A=$token" \
+    BILLET_FAKE_WARP_STATUS=silent -- -e billet_warp_status_retries=1 -e billet_warp_retry_delay=0
+if grep -q 'connector new' "$work/calls"; then echo "FAIL: a silent daemon was enrolled" >&2; exit 1; fi
+if grep -q '^warp-cli --accept-tos connect$' "$work/calls"; then echo "FAIL: a silent daemon was told to connect" >&2; exit 1; fi
+
+# 6. A signing key with another fingerprint refuses the repository; the legacy
+#    world-writable key is removed at the path the role was GIVEN, not at a
+#    hard-coded /tmp path on whatever machine runs this gate.
+mkdir -p "$work/legacy"; printf 'OLD KEY' >"$work/legacy/cloudflare-warp.asc"
 BILLET_TEST_STAGED=staged run "a signing key with another fingerprint is refused" "not exactly one primary key with the pinned fingerprint" \
     BILLET_TEST_MANAGE_APT=true "BILLET_TEST_KEY_FILE=$work/bad-key.asc" "BILLET_WARP_CONNECTOR_TOKEN_NODE_A=$token" --
 [ ! -e "$work/root/keyrings/cloudflare-warp-archive-keyring.gpg" ] || { echo "FAIL: a refused key reached the keyring" >&2; exit 1; }
 if grep -q 'connector new' "$work/calls"; then echo "FAIL: a refused key did not stop the enrolment" >&2; exit 1; fi
+[ ! -e "$work/legacy/cloudflare-warp.asc" ] || { echo "FAIL: the legacy key at the given path was not removed" >&2; exit 1; }
 
-# 6. Two hosts sharing one variable name are refused before any host acts.
+# 7. Two hosts sharing one variable name are refused before any host acts.
 printf 'node-a ansible_host=127.0.0.1\nnode_a ansible_host=127.0.0.1\n' >"$work/inventory.ini"
 run "two hosts sharing one token variable are refused" "read their WARP connector token from the same environment variable" \
     "BILLET_WARP_CONNECTOR_TOKEN_NODE_A=$token" --
 [ ! -s "$work/calls" ] || { echo "FAIL: the collision refusal came after a fake was called" >&2; exit 1; }
+
+# 8. The same through an inventory override of the variable name.
+printf 'node-a ansible_host=127.0.0.1\nnode-b ansible_host=127.0.0.1 billet_warp_connector_token_env=BILLET_WARP_CONNECTOR_TOKEN_NODE_A\n' >"$work/inventory.ini"
+run "two hosts sharing one token variable by override are refused" "read their WARP connector token from the same environment variable" \
+    "BILLET_WARP_CONNECTOR_TOKEN_NODE_A=$token" --
+[ ! -s "$work/calls" ] || { echo "FAIL: the override collision refusal came after a fake was called" >&2; exit 1; }
+
+# 9. Two distinct hosts under serial: 1: the collision check reads the
+#    inventory, so the first batch does not fail on a fact the second has not
+#    recorded; the first enrols, the second finds the daemon connected.
+printf 'node-a ansible_host=127.0.0.1\nnode-b ansible_host=127.0.0.1\n' >"$work/inventory.ini"
+run "two hosts converge one batch at a time" pass BILLET_TEST_SERIAL=1 \
+    "BILLET_WARP_CONNECTOR_TOKEN_NODE_A=$token" "BILLET_WARP_CONNECTOR_TOKEN_NODE_B=$token" --
+[ "$(sed -n '/PLAY RECAP/,$p' "$work/out.log" | grep -cE '^node-[ab] +: +ok=[1-9]')" = 2 ] || { echo "FAIL: both hosts did not converge under serial" >&2; sed -n '/PLAY RECAP/,$p' "$work/out.log" >&2; exit 1; }
+[ "$(grep -c 'connector new' "$work/calls")" = 1 ] || { echo "FAIL: the shared daemon was enrolled other than once: $(cat "$work/calls")" >&2; exit 1; }
 printf 'node-a ansible_host=127.0.0.1\n' >"$work/inventory.ini"
 
-# 7. Check mode on a host with no client: exits 0, reports, enrols nothing.
+# 10. Check mode on a host with no client: exits 0, reports, enrols nothing.
 run "check mode on a fresh host reports and stops" pass "BILLET_WARP_CONNECTOR_TOKEN_NODE_A=$token" \
     BILLET_TEST_WARP_CLI=/nonexistent/warp-cli -- --check
 grep -q 'the real converge stages and verifies' "$work/out.log" || { echo "FAIL: the dry run did not report what it cannot see" >&2; exit 1; }
+if grep -q 'connector new' "$work/calls"; then echo "FAIL: a dry run enrolled the connector" >&2; exit 1; fi
+
+# 11. Check mode on a host with the client but no staged key: the apt path
+#     reports what it cannot verify and stops rather than failing on a file the
+#     dry run never fetched; the registration is still read and nothing enrolled.
+run "check mode without a staged key reports and stops" pass BILLET_TEST_MANAGE_APT=true \
+    "BILLET_WARP_CONNECTOR_TOKEN_NODE_A=$token" -- --check
+grep -q 'fetches and verifies it before trusting the repository' "$work/out.log" || { echo "FAIL: the dry run did not report the unverified key" >&2; exit 1; }
+if grep -q '^gpg' "$work/calls"; then echo "FAIL: a dry run read a key it never fetched" >&2; exit 1; fi
 if grep -q 'connector new' "$work/calls"; then echo "FAIL: a dry run enrolled the connector" >&2; exit 1; fi
 
 echo "warp-connector-check: every case behaved as the role requires"

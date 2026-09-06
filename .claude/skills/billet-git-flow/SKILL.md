@@ -34,6 +34,8 @@ git checkout <branch> && git merge main
 
 History stays append-only, which keeps shared branches safe.
 
+A stacked PR (its base another PR's branch) is closed by GitHub the moment that base branch is deleted, and a closed PR whose base is gone cannot be reopened or retargeted; it has to be opened again from the same branch. So merge the base PR without `--delete-branch`, retarget the stacked PR to `main` first, and delete the branch afterwards (measured: #101 was lost that way, 2026-09-06).
+
 ## Every commit gets a Codex review, before it is pushed
 
 This is a standing requirement, not a suggestion for large changes. Publishing unreviewed code is the wrong order: a second reader is cheapest before the commit is public, and billet holds credentials that make a quiet mistake expensive.

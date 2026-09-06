@@ -36,9 +36,12 @@ case " $* " in
             exit "$BILLET_FAKE_WARP_STATUS_RC"
         fi
         # After an enrolment in this run, the daemon reports Connected. The
-        # keyword is one word because the checks pass settings as words.
+        # keyword is one word because the checks pass settings as words; a
+        # `silent` daemon exits 0 with no status line at all.
         if [ -f "$BILLET_FAKE_STATE/warp-enrolled" ] || [ "${BILLET_FAKE_WARP_STATUS:-missing}" = connected ]; then
             echo "Status update: Connected"
+        elif [ "${BILLET_FAKE_WARP_STATUS:-missing}" = silent ]; then
+            :
         else
             echo "Status update: Registration Missing"
         fi
@@ -86,7 +89,7 @@ printf 'systemctl %s\n' "$*" >>"$BILLET_FAKE_CALLS"
 # and an enabled one is enabled, or a second converge would start it again
 # and no second run could ever be changed=0.
 case " $* " in
-    *" start "*|*" restart "*) : >"$BILLET_FAKE_STATE/unit-active" ;;
+    *" start "*|*" restart "*) printf 'inv%s\n' "$(date +%s%N 2>/dev/null || date +%s)$$" >"$BILLET_FAKE_STATE/unit-active" ;;
     *" enable "*) : >"$BILLET_FAKE_STATE/unit-enabled" ;;
     *" stop "*) rm -f "$BILLET_FAKE_STATE/unit-active" ;;
     *" disable "*) rm -f "$BILLET_FAKE_STATE/unit-enabled" ;;
@@ -94,9 +97,27 @@ esac
 active=inactive; sub=dead; enabled=disabled
 [ -f "$BILLET_FAKE_STATE/unit-active" ] && { active=active; sub=running; }
 [ -f "$BILLET_FAKE_STATE/unit-enabled" ] && enabled=enabled
+# `show -p NAME --value` answers one property, the way the role asks for the
+# ActiveState and the InvocationID; a bare `show` is what the systemd_service
+# module asks and gets the whole set. The invocation id changes on every start
+# or restart, so a wait keyed on it can be told from a wait on an old window.
+prop=""; want_value=false; prev=""
+for a in "$@"; do
+    case "$prev" in -p|--property) prop=$a ;; esac
+    [ "$a" = --value ] && want_value=true
+    prev=$a
+done
 case " $* " in
     *" show "*)
-        printf 'Id=cloudflared.service\nLoadState=loaded\nActiveState=%s\nSubState=%s\nUnitFileState=%s\nFragmentPath=/etc/systemd/system/cloudflared.service\n' "$active" "$sub" "$enabled"
+        if [ "$want_value" = true ]; then
+            case "$prop" in
+                ActiveState) echo "$active" ;;
+                InvocationID) [ -f "$BILLET_FAKE_STATE/unit-active" ] && cat "$BILLET_FAKE_STATE/unit-active" ;;
+                *) echo "" ;;
+            esac
+        else
+            printf 'Id=cloudflared.service\nLoadState=loaded\nActiveState=%s\nSubState=%s\nUnitFileState=%s\nFragmentPath=/etc/systemd/system/cloudflared.service\n' "$active" "$sub" "$enabled"
+        fi
         ;;
     *" is-enabled "*)
         echo "$enabled"
