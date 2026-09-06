@@ -322,6 +322,16 @@ jobs:
       - name: Prove the ssh_access role refuses to lock a host out
         run: make ssh-access-check
 
+      # The two connector roles are the host half of the documented reaching
+      # routes, and no other suite sets a token, so every refusal in them could
+      # be deleted with everything green. These drive them against fakes that
+      # record every call, including that a token reaches no argv.
+      - name: Prove the cloudflared connector role
+        run: make cloudflared-connector-check
+
+      - name: Prove the WARP connector role
+        run: make warp-connector-check
+
       - name: Prove the pinned-release fetch path
         run: make release-fetch-check
 

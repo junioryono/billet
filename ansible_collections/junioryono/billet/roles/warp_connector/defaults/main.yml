@@ -1,0 +1,54 @@
+---
+# THE CONNECTOR TOKEN, READ FROM THE ENVIRONMENT UNDER A PER-HOST NAME, for the
+# reason the cloudflared_connector role gives: two hosts read two variables by
+# construction, the role refuses two hosts that map to one name, and the token
+# never travels in ansible-playbook's argv. Empty means the role does nothing.
+billet_warp_connector_token_env: "BILLET_WARP_CONNECTOR_TOKEN_{{ inventory_hostname | upper | regex_replace('[^A-Z0-9]', '_') }}"
+billet_warp_connector_token: "{{ lookup('env', billet_warp_connector_token_env) }}"
+
+# The key signing pkg.cloudflareclient.com, verified out of band before pinning:
+#   uid = "Cloudflare Package Repository <support@cloudflare.com>"
+# A DIFFERENT KEY from the one signing pkg.cloudflare.com: same vendor, two
+# repositories, two keys, and this one carries no year in its uid. When the
+# verify task fails naming this variable, re-verify from a trusted network.
+billet_warp_signing_fingerprint: C068A2B5771775193CBE1F2F6E2DD2174FA1C3BA
+billet_warp_signing_key_url: https://pkg.cloudflareclient.com/pubkey.gpg
+billet_warp_apt_uri: https://pkg.cloudflareclient.com/
+
+# THE HOST'S REAL CODENAME, unlike the cloudflared repository: Cloudflare
+# publishes the WARP client for newer suites (measured with Ubuntu 26.04's on the
+# reference node), and a missing suite fails as a 404 during apt update rather
+# than as anything naming the problem.
+billet_warp_apt_suite: "{{ ansible_facts['distribution_release'] }}"
+
+# Whether the role installs the repository and the package, and whether it sets
+# the forwarding sysctls a connector host needs (Cloudflare's own requirement;
+# accept_ra=2 keeps IPv6 router advertisements honoured once forwarding is on).
+billet_warp_manage_apt: true
+billet_warp_sysctls: true
+
+# What verifying the key (gpg) and adding the repository (deb822_repository
+# needs python3-debian on the host) need, installed from the distribution's own
+# repositories first; empty for a host that has them. The legacy path is where
+# an earlier convention staged the key, world-writable, and is removed.
+billet_warp_prerequisites: [gnupg, python3-debian]
+billet_warp_legacy_key_path: /tmp/cloudflare-warp.asc
+
+billet_warp_cli: warp-cli
+
+# How long the role waits for the daemon: the status is asked
+# billet_warp_status_retries times before the enrolment decision (the daemon is
+# often still starting after the package install), and the final Connected is
+# awaited billet_warp_connect_retries times, billet_warp_retry_delay seconds
+# apart.
+billet_warp_status_retries: 6
+billet_warp_connect_retries: 12
+billet_warp_retry_delay: 5
+billet_warp_stage_dir: /var/cache/billet-provision
+billet_warp_keyring_path: /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+billet_warp_sysctl_file: /etc/sysctl.d/99-zzz-cloudflare-warp-connector.conf
+
+# Every fetch is bounded and retried; see the host role's defaults for why.
+billet_fetch_timeout: 30
+billet_fetch_retries: 5
+billet_fetch_retry_delay: 5

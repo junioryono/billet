@@ -1,0 +1,136 @@
+---
+# Cloudflare's WARP client repository, trusted only after its signing key has
+# been verified against the pinned fingerprint; staged root-only and verified
+# before it lands at the trusted path, as the cloudflared role does.
+
+- name: Install what verifying the key and adding the repository need
+  ansible.builtin.apt:
+    name: "{{ billet_warp_prerequisites }}"
+    state: present
+  when: billet_warp_prerequisites | length > 0
+  become: true
+
+- name: Remove the key an earlier convention staged in world-writable /tmp
+  ansible.builtin.file:
+    path: "{{ billet_warp_legacy_key_path }}"
+    state: absent
+  become: true
+
+- name: Create a private staging directory for the signing key
+  ansible.builtin.file:
+    path: "{{ billet_warp_stage_dir }}"
+    state: directory
+    mode: "0700"
+  become: true
+
+- name: Stage the Cloudflare WARP signing key
+  ansible.builtin.get_url:
+    url: "{{ billet_warp_signing_key_url }}"
+    dest: "{{ billet_warp_stage_dir }}/cloudflare-warp.asc"
+    mode: "0600"
+    timeout: "{{ billet_fetch_timeout }}"
+  register: billet_warp_key_fetch
+  until: billet_warp_key_fetch is succeeded
+  retries: "{{ billet_fetch_retries }}"
+  delay: "{{ billet_fetch_retry_delay }}"
+  # NOT IN A DRY RUN: get_url still fetches in check mode to compare, and fails
+  # when the staging directory the dry run did not create is absent. What a
+  # dry run can say about the key is said below, from the staged file if any.
+  when: not ansible_check_mode
+  become: true
+
+# A DRY RUN VERIFIES ONLY A KEY THAT IS THERE, for the reason the cloudflared
+# role gives: get_url fetches nothing in check mode, and a verification of a
+# file that does not exist is not a verification.
+- name: Inspect the staged signing key
+  ansible.builtin.stat:
+    path: "{{ billet_warp_stage_dir }}/cloudflare-warp.asc"
+  register: billet_warp_staged_key
+  check_mode: false
+  become: true
+
+# AND ONLY WITH THE TOOLS THE VERIFICATION NEEDS ALREADY THERE: a dry run
+# predicts the prerequisite install and does not do it, and the gpg read and
+# the repository module below run for real.
+- name: Inspect whether the verification's tools are installed
+  ansible.builtin.command:
+    argv: [sh, -c, 'command -v gpg >/dev/null && python3 -c "import debian"']
+  register: billet_warp_tools
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: ansible_check_mode
+
+- name: Report what a dry run cannot verify without the staged key or its tools
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'No signing key is staged' if not billet_warp_staged_key.stat.exists
+         else 'gpg or python3-debian is not installed' }} on {{ inventory_hostname }}
+      and this is a dry run: the real converge fetches and verifies it before
+      trusting the repository, then adds the repository and installs the client.
+  when:
+    - ansible_check_mode
+    - not billet_warp_staged_key.stat.exists or billet_warp_tools.rc != 0
+
+- name: Verify the signing key and trust the repository
+  when: not (ansible_check_mode and (not billet_warp_staged_key.stat.exists or billet_warp_tools.rc != 0))
+  block:
+    - name: Read the staged signing key's fingerprint
+      ansible.builtin.command:
+        argv: [gpg, --show-keys, --with-colons, "{{ billet_warp_stage_dir }}/cloudflare-warp.asc"]
+      register: billet_warp_key
+      changed_when: false
+      check_mode: false
+      become: true
+
+    - name: Verify the Cloudflare WARP signing key
+      ansible.builtin.assert:
+        that:
+          - (billet_warp_key.stdout_lines | default([]) | select('match', '^pub:') | list | length) == 1
+          - ((billet_warp_key.stdout_lines | default([]) | select('match', '^fpr:::::::::') | list | first) | default(''))
+            == ('fpr:::::::::' ~ billet_warp_signing_fingerprint ~ ':')
+        fail_msg: >-
+          The Cloudflare WARP signing key is not exactly one primary key with the
+          pinned fingerprint {{ billet_warp_signing_fingerprint }}. Refusing to add
+          the repository. Either the download was intercepted or Cloudflare rotated
+          the key: confirm against pkg.cloudflareclient.com from a trusted network
+          before updating billet_warp_signing_fingerprint.
+
+    # REWRITTEN FROM THE VERIFIED SOURCE EVERY RUN, never gated on the keyring
+    # existing: that froze a rotated upstream key out of the trusted path forever.
+    - name: Convert the verified key to a keyring
+      ansible.builtin.command:
+        argv: [gpg, --yes, --dearmor, -o, "{{ billet_warp_keyring_path }}", "{{ billet_warp_stage_dir }}/cloudflare-warp.asc"]
+      changed_when: false
+      become: true
+
+    - name: Add the Cloudflare WARP apt repository
+      ansible.builtin.deb822_repository:
+        name: cloudflare-client
+        types: [deb]
+        uris: "{{ billet_warp_apt_uri }}"
+        suites: ["{{ billet_warp_apt_suite }}"]
+        components: [main]
+        signed_by: "{{ billet_warp_keyring_path }}"
+        state: present
+        enabled: true
+      register: billet_warp_repo
+      become: true
+
+    - name: Remove a superseded one-line repository file
+      ansible.builtin.file:
+        path: /etc/apt/sources.list.d/cloudflare-client.list
+        state: absent
+      become: true
+
+    - name: Refresh the apt cache for the Cloudflare WARP repository
+      ansible.builtin.apt:
+        update_cache: true
+      when: billet_warp_repo is changed
+      become: true
+
+    - name: Install the Cloudflare WARP client
+      ansible.builtin.apt:
+        name: cloudflare-warp
+        state: present
+      become: true

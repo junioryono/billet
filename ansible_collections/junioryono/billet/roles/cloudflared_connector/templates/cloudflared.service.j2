@@ -1,0 +1,22 @@
+{#- The cloudflared connector, rendered by junioryono.billet.cloudflared_connector.
+    Byte for byte what `cloudflared service install` writes (its template in
+    cmd/cloudflared/linux_service.go, measured on 2026.7.3), so a host the
+    installer set up converges to changed=0. A Jinja comment, because a line of
+    `#` would be rendered into the unit and make the two differ, and a differing
+    unit restarts the connector. Rendered rather than installed because the
+    installer takes the token only in argv and this role never puts a credential
+    there. -#}
+[Unit]
+Description=Cloudflare Tunnel client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+TimeoutStartSec=15
+Type=notify
+ExecStart={{ billet_cloudflared_binary }} --no-autoupdate tunnel run --token-file {{ billet_cloudflared_config_dir }}/token
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

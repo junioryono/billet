@@ -1,0 +1,232 @@
+---
+# Join the host to a Cloudflare Zero Trust network as a headless WARP Connector:
+# the host half of Route D in docs/deploying/reaching-hosts.md, whose module
+# provisions the Cloudflare half.
+#
+# THE TOKEN IS A BEARER CREDENTIAL. It is read from the environment, never
+# committed and never passed as `-e`, and every task that handles it is no_log.
+# `warp-cli connector new` takes it only as a positional argument (measured on
+# warp-cli 2026.6.880.0: no file, stdin or environment form exists), so the one
+# enrolment exec carries it in argv on the host for its duration, as root, once;
+# that residual is recorded in the security skill rather than hidden.
+#
+# WITHOUT A TOKEN THE ROLE DOES NOTHING, so a play can run it on every host and
+# an inventory that says nothing converges unchanged.
+
+# A NAME FOR EVERY HOST'S TOKEN, AND NO TWO HOSTS SHARING ONE, computed for
+# every host in the play (failed ones included) from its inventory rather than
+# from a fact each host records first, because under `serial` the later batches
+# have recorded nothing when the first batch asks; the fallback formula is the
+# default's, repeated on purpose. Case-sensitive, because environment variable
+# names are. Each host then checks the name it reads is the one computed for
+# it, which is what an override the computation cannot see would break.
+- name: Compute the environment variable every host in this play reads its token from
+  ansible.builtin.set_fact:
+    billet_warp_env_names: >-
+      {%- set names = [] -%}
+      {%- for h in ansible_play_hosts_all -%}
+      {%- set _ = names.append(hostvars[h]['billet_warp_connector_token_env'] | default('BILLET_WARP_CONNECTOR_TOKEN_' ~ (h | upper | regex_replace('[^A-Z0-9]', '_')))) -%}
+      {%- endfor -%}
+      {{ names }}
+
+# EVERY HOST ASSERTS BOTH, never one host for all: a run_once task is skipped
+# for every host when the first host's inherited `when` is false, and a
+# consumer may well invoke the role under a condition. The computation is
+# pure, so the cost is nothing.
+- name: Refuse two hosts whose connector tokens would share one environment variable
+  ansible.builtin.assert:
+    that:
+      - billet_warp_env_names | unique(case_sensitive=true) | length == billet_warp_env_names | length
+    fail_msg: >-
+      Two hosts in this play read their WARP connector token from the same
+      environment variable: {{ dict(ansible_play_hosts_all | zip(billet_warp_env_names)) }}.
+      Set billet_warp_connector_token_env on one of them to a distinct name.
+
+# THE NAME THIS HOST READS IS THE NAME THE PLAY-WIDE LIST HOLDS FOR IT. An
+# override at a scope hostvars does not see (the vars of a role invocation)
+# would make this host read one name while the list above showed distinct
+# fallbacks and passed; a host whose own name is the computed one is safe to
+# act whatever its neighbour was refused for.
+- name: Refuse a token variable name the play-wide check could not see
+  ansible.builtin.assert:
+    that:
+      - billet_warp_connector_token_env == billet_warp_env_names[ansible_play_hosts_all.index(inventory_hostname)]
+    fail_msg: >-
+      {{ inventory_hostname }} reads its WARP connector token from a variable the play-wide
+      collision check could not see: it reads {{ billet_warp_connector_token_env }} and the check
+      computed {{ billet_warp_env_names[ansible_play_hosts_all.index(inventory_hostname)] }}
+      from the inventory. billet_warp_connector_token_env is set somewhere the check cannot see (the
+      vars of a role invocation, say); set it in the inventory for the host
+      that needs it.
+
+- name: Report that no connector token was supplied
+  ansible.builtin.debug:
+    msg: >-
+      {{ billet_warp_connector_token_env }} is not set, so the WARP connector is
+      not configured on {{ inventory_hostname }}. This is not a failure; export
+      the token under that name to enrol the host.
+  when: billet_warp_connector_token | length == 0
+
+- name: Configure the WARP connector
+  when: billet_warp_connector_token | length > 0
+  block:
+    - name: Inspect the WARP client
+      ansible.builtin.command:
+        argv: [sh, -c, 'command -v "$0"', "{{ billet_warp_cli }}"]
+      register: billet_warp_cli_present
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    # A DRY RUN ON A HOST THAT HAS NEVER HAD THE CLIENT STOPS HERE, for the
+    # reason the cloudflared role gives: check mode fetches, adds and installs
+    # nothing, so nothing below can be described.
+    - name: Report what a dry run cannot see on a host with no WARP client yet
+      ansible.builtin.debug:
+        msg: >-
+          {{ billet_warp_cli }} is not installed on {{ inventory_hostname }} and
+          this is a dry run: the real converge stages and verifies Cloudflare's
+          signing key against the pinned fingerprint, adds the repository,
+          installs the client, sets the forwarding sysctls, enrols the connector
+          and waits for it to connect.
+      when:
+        - ansible_check_mode
+        - billet_warp_cli_present.rc != 0
+
+    - name: Install and enrol the connector
+      when: not (ansible_check_mode and billet_warp_cli_present.rc != 0)
+      block:
+        - name: Install the WARP client from Cloudflare's repository
+          ansible.builtin.import_tasks: apt.yml
+          when: billet_warp_manage_apt | bool
+
+        # THE IPv6 KEYS EXIST ONLY WHERE IPv6 DOES. A host booted with IPv6
+        # disabled has no net.ipv6 tree, and a loop that set IPv4 forwarding
+        # first and then failed on the IPv6 key left the host half-configured
+        # and the play failed; asked first, the IPv4 key is set and the IPv6
+        # ones are skipped, and both are reported. A file written on an earlier
+        # boot that had IPv6 still carries the keys, and `sysctl -p` of that
+        # file fails on them before any condition here helps, so they are
+        # removed first, without a reload.
+        - name: Inspect whether the host has an IPv6 stack
+          ansible.builtin.stat:
+            path: /proc/sys/net/ipv6/conf/all
+          register: billet_warp_ipv6
+          check_mode: false
+          when: billet_warp_sysctls | bool
+
+        - name: Remove IPv6 sysctls the file carries from a boot that had IPv6
+          ansible.posix.sysctl:
+            name: "{{ item }}"
+            sysctl_file: "{{ billet_warp_sysctl_file }}"
+            state: absent
+            reload: false
+          loop:
+            - net.ipv6.conf.all.forwarding
+            - net.ipv6.conf.all.accept_ra
+          become: true
+          when:
+            - billet_warp_sysctls | bool
+            - not billet_warp_ipv6.stat.exists
+
+        - name: Set the connector's forwarding sysctls
+          ansible.posix.sysctl:
+            name: "{{ item.name }}"
+            value: "{{ item.value }}"
+            sysctl_file: "{{ billet_warp_sysctl_file }}"
+            state: present
+            reload: true
+          loop:
+            - { name: net.ipv4.ip_forward, value: "1" }
+            - { name: net.ipv6.conf.all.forwarding, value: "1" }
+            - { name: net.ipv6.conf.all.accept_ra, value: "2" }
+          become: true
+          when:
+            - billet_warp_sysctls | bool
+            - item.name is not match('^net\.ipv6\.') or billet_warp_ipv6.stat.exists
+
+        # RETRIED, because the decision below is made from this answer and the
+        # daemon is often still starting right after the package install.
+        # failed_when false so exhausted retries do not abort the play: the
+        # guards below read the output and decline to act on it, which is the
+        # safe direction.
+        - name: Read the connector's registration state
+          ansible.builtin.command:
+            argv: ["{{ billet_warp_cli }}", --accept-tos, status]
+          register: billet_warp_status
+          changed_when: false
+          failed_when: false
+          check_mode: false
+          retries: "{{ billet_warp_status_retries }}"
+          delay: "{{ billet_warp_retry_delay }}"
+          until: billet_warp_status.rc == 0
+          become: true
+
+        # ONE STATUS LINE, READ ONCE. The daemon prints `Status update: <state>`;
+        # the state is that line and nothing else in the output, so contradictory
+        # or unrelated text cannot both enrol and skip a connect. A daemon that
+        # answered with no status line at all is not read as any state.
+        - name: Read the state the daemon reported
+          ansible.builtin.set_fact:
+            billet_warp_state: >-
+              {{ ((billet_warp_status.stdout_lines | default([]) | select('match', '^Status update:') | list | first | default(''))
+                  | regex_replace('^Status update: *', '') | trim | lower)
+                 if billet_warp_status.rc == 0 else '' }}
+
+        - name: Refuse a daemon whose answer names no state
+          ansible.builtin.assert:
+            that:
+              - billet_warp_state | length > 0
+            fail_msg: >-
+              {{ billet_warp_cli }} status on {{ inventory_hostname }} exited
+              {{ billet_warp_status.rc }} and printed no `Status update:` line this
+              role reads, so nothing is known about the registration and nothing
+              is enrolled. Its output was: {{ billet_warp_status.stdout | default('') | trim }}
+              {{ billet_warp_status.stderr | default('') | trim }}
+
+        # `connector new` is not idempotent (it errors against a registered
+        # daemon), so it runs only on the daemon's own "Registration Missing",
+        # and ONLY on that: a status the daemon could not answer is not a
+        # missing registration, and re-enrolling over the very transport Ansible
+        # may be connected through is the expensive way to find that out.
+        - name: Enrol the connector
+          ansible.builtin.command:
+            argv: ["{{ billet_warp_cli }}", --accept-tos, connector, new, "{{ billet_warp_connector_token }}"]
+          register: billet_warp_enrol
+          no_log: true
+          when: billet_warp_state == 'registration missing'
+          become: true
+
+        - name: Connect
+          ansible.builtin.command:
+            argv: ["{{ billet_warp_cli }}", --accept-tos, connect]
+          changed_when: true
+          when: billet_warp_state != 'connected'
+          become: true
+
+        # ROTATION IS NOT HANDLED HERE, ON PURPOSE. warp-cli does not expose the
+        # token behind a registration, so a recreated or rotated connector looks
+        # identical to a healthy one; and re-enrolling tears down the interface
+        # the play may be running over. Rotate from a path that does not depend
+        # on the mesh, with `registration delete` on the host first.
+        - name: Note that a rotated connector credential needs a manual re-enrolment
+          ansible.builtin.debug:
+            msg: >-
+              The WARP registration on {{ inventory_hostname }} is left as it is.
+              This role never re-enrols a registered daemon, because doing so
+              would drop the transport Ansible may be connected through. If the
+              connector was recreated or its token rotated, run
+              `warp-cli --accept-tos registration delete` on the host over a
+              path that does not depend on the mesh, then converge again.
+          when: billet_warp_enrol is skipped
+
+        - name: Wait for the connector to report Connected
+          ansible.builtin.command:
+            argv: ["{{ billet_warp_cli }}", --accept-tos, status]
+          register: billet_warp_final
+          changed_when: false
+          retries: "{{ billet_warp_connect_retries }}"
+          delay: "{{ billet_warp_retry_delay }}"
+          until: "((billet_warp_final.stdout_lines | default([]) | select('match', '^Status update:') | list | first | default('')) | regex_replace('^Status update: *', '') | trim | lower) == 'connected'"
+          when: not ansible_check_mode
+          become: true

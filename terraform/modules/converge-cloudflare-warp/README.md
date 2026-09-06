@@ -6,7 +6,7 @@ Reach Billet hosts from CI as a **WARP client enrolled with a service token**, s
 
 ## When this is the right route
 
-Your hosts are **already reachable on private addresses** inside your Zero Trust network: a machine at home that is a Mesh node, a controller in a VPC that a `cloudflared` connector advertises a route to. What is missing is a way for a GitHub-hosted runner to be *on* that network for the length of a converge. This module puts it there.
+Your hosts are **already reachable on private addresses** inside your Zero Trust network: a machine at home that is a Mesh node (the collection's `junioryono.billet.warp_connector` role enrols it), a controller in a VPC that a `cloudflared` connector advertises a route to (the `junioryono.billet.cloudflared_connector` role runs it). What is missing is a way for a GitHub-hosted runner to be *on* that network for the length of a converge. This module puts it there.
 
 It is the route that worked first time on a real hybrid deployment where [Route C](../converge-cloudflare)'s Access-for-Infrastructure SSH proxy never engaged: the target, the CA, the identity-provider pin and the hostname were all correct, no certificate was ever issued, and the Access logs stayed empty. A WARP client and plain SSH have no proxy to engage.
 

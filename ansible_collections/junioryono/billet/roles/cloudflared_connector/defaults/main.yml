@@ -1,0 +1,90 @@
+---
+# THE CONNECTOR TOKEN, READ FROM THE ENVIRONMENT UNDER A PER-HOST NAME. Two
+# hosts read two variables by construction (BILLET_CLOUDFLARED_TOKEN_NODE_A,
+# BILLET_CLOUDFLARED_TOKEN_CONTROL_1), so the credential of one cannot be handed
+# to the other by a single `-e`, which is how the reference deployment once had
+# two healthy connectors advertising routes neither could serve. The name is
+# the inventory hostname upper-cased with everything outside [A-Z0-9] replaced
+# by an underscore; the role refuses two hosts in one play that map to the same
+# name, and billet_cloudflared_token_env names it explicitly for a host whose
+# name collides. The token travels in the environment because ansible-playbook's
+# argv is world-readable on the controller for the length of the run and its
+# environment is not. Empty means the role does nothing on this host.
+billet_cloudflared_token_env: "BILLET_CLOUDFLARED_TOKEN_{{ inventory_hostname | upper | regex_replace('[^A-Z0-9]', '_') }}"
+billet_cloudflared_token: "{{ lookup('env', billet_cloudflared_token_env) }}"
+
+# The tunnel this host's token MUST belong to, REQUIRED whenever a token is
+# supplied. The token is base64({"a": account, "s": secret, "t": tunnel id}),
+# so the intended tunnel is checkable against the credential before anything is
+# installed; a token for another tunnel installs cleanly and fails somewhere
+# else, days later, which is why an empty value refuses rather than skipping
+# the check. An id is not a credential (it names a tunnel and authorises
+# nothing), so it lives in the inventory in the clear; `terraform output
+# tunnel_id` prints it.
+billet_cloudflared_expected_tunnel_id: ""
+
+# THE ADDRESS THIS CONNECTOR ADVERTISES, when Ansible may be reaching the host
+# through it. With it set, the role derives whether this play's own transport
+# runs over the connector (ansible_host equals it) and refuses to rotate the
+# credential when it does, because restarting the connector under the play
+# drops the SSH session before the replacement is running. An operator who
+# converges the same host over another path (`-e ansible_host=<other>`) makes
+# the derivation false for that run without editing anything.
+billet_cloudflared_routed_address: ""
+
+# WHETHER ANSIBLE REACHES THIS HOST THROUGH THE CONNECTOR, three-valued. An
+# explicit true or false wins (any other spelling is refused). Empty (the
+# default) derives the answer from billet_cloudflared_routed_address when that
+# is set: ansible_host equal to it is true, ansible_host a DIFFERENT IP literal
+# is false, and anything else (no ansible_host, a name, an instance id) stays
+# could-not-tell, because two spellings can name one address and this role
+# resolves nothing. Could-not-tell REFUSES any change that would restart a
+# running connector: a role that assumed "false" for a host nobody described
+# would cut its own transport on the first rotation of a controller reached
+# through its connector. A converge that changes nothing is never refused.
+billet_cloudflared_carries_ansible_transport: ""
+
+# The key signing pkg.cloudflare.com, verified out of band before pinning:
+#   uid = "CloudFlare Software Packaging 2025 <help@cloudflare.com>"
+# EXPECT IT TO ROTATE: the uid carries a year. When the verify task fails naming
+# this variable, re-verify the new key against pkg.cloudflare.com from a trusted
+# network and update the pin; that is the pin working, not an intrusion.
+billet_cloudflared_signing_fingerprint: CC94B39C77AE7342A68B89628A682D308D4E5E73
+billet_cloudflared_signing_key_url: https://pkg.cloudflare.com/cloudflare-main.gpg
+billet_cloudflared_apt_uri: https://pkg.cloudflare.com/cloudflared
+
+# PINNED TO noble, NOT THE HOST'S CODENAME. Measured on the reference node
+# (Ubuntu 26.04, 2026-09): Cloudflare publishes no cloudflared suite for newer
+# codenames, so the host's own name 404s during apt update. The WARP repository
+# does publish them, which is why warp_connector uses the real codename.
+billet_cloudflared_apt_suite: noble
+
+# Whether the role installs the repository and the package. False for a host
+# that gets cloudflared another way; the role then only manages the token, the
+# unit and the service. The prerequisites are what verifying the key (gpg) and
+# adding the repository (deb822_repository needs python3-debian on the host)
+# need, installed from the distribution's own repositories first; empty for a
+# host that has them.
+billet_cloudflared_manage_apt: true
+billet_cloudflared_prerequisites: [gnupg, python3-debian]
+
+# WHO OWNS THE CREDENTIAL. 0600 restricts the file to its owner, so the owner
+# is the boundary: a token file some earlier convention left owned by another
+# account would keep that owner under a bare mode, and that account could read
+# every replacement. The installer writes it as root; so does this role.
+billet_cloudflared_owner: root
+billet_cloudflared_group: root
+
+# Where things land. The paths are the ones `cloudflared service install`
+# writes (measured on cloudflared 2026.7.3), so a host that was set up by the
+# installer converges to changed=0 under this role.
+billet_cloudflared_binary: /usr/bin/cloudflared
+billet_cloudflared_config_dir: /etc/cloudflared
+billet_cloudflared_unit_path: /etc/systemd/system/cloudflared.service
+billet_cloudflared_stage_dir: /var/cache/billet-provision
+billet_cloudflared_keyring_path: /usr/share/keyrings/cloudflare-main.gpg
+
+# Every fetch is bounded and retried; see the host role's defaults for why.
+billet_fetch_timeout: 30
+billet_fetch_retries: 5
+billet_fetch_retry_delay: 5
