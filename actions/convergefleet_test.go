@@ -236,6 +236,19 @@ func (f *convergeFixture) run(t *testing.T, r convergeRun) (string, error) {
 	return string(out), err
 }
 
+// readRecorded reads what a fake recorded. An absent file is what a fake that
+// was never called leaves, and several assertions are about exactly that, so
+// absence reads as nothing recorded; any other error is a failed test rather
+// than an empty record.
+func readRecorded(t *testing.T, p string) []byte {
+	t.Helper()
+	body, err := os.ReadFile(p)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("read %s: %v", p, err)
+	}
+	return body
+}
+
 func mustAbs(t *testing.T, p string) string {
 	t.Helper()
 	a, err := filepath.Abs(p)
@@ -247,7 +260,7 @@ func mustAbs(t *testing.T, p string) string {
 
 func (f *convergeFixture) callsOf(t *testing.T, name string) []string {
 	t.Helper()
-	body, _ := os.ReadFile(f.calls)
+	body := readRecorded(t, f.calls)
 	var out []string
 	for _, line := range strings.Split(string(body), "\n") {
 		if strings.HasPrefix(line, name+" ") || line == name {
@@ -259,7 +272,7 @@ func (f *convergeFixture) callsOf(t *testing.T, name string) []string {
 
 func (f *convergeFixture) playbookInvocations(t *testing.T) []string {
 	t.Helper()
-	body, _ := os.ReadFile(f.pbArgs)
+	body := readRecorded(t, f.pbArgs)
 	var out []string
 	for _, inv := range strings.Split(string(body), "--\n") {
 		if strings.TrimSpace(inv) != "" {
@@ -280,7 +293,7 @@ func TestConvergeRunsTwicAndReportsTheRecap(t *testing.T) {
 	if n := len(f.playbookInvocations(t)); n != 2 {
 		t.Fatalf("ansible-playbook ran %d times, want 2 (the converge and the proof)\n%s", n, out)
 	}
-	body, _ := os.ReadFile(f.output)
+	body := readRecorded(t, f.output)
 	if !strings.Contains(string(body), "recap<<BILLET_RECAP_EOF") || !strings.Contains(string(body), "node-a") {
 		t.Errorf("the recap output was not written:\n%s", body)
 	}
@@ -421,14 +434,14 @@ func TestEnvironmentLinesReachTheChildAndNotItsArgv(t *testing.T) {
 	if err != nil {
 		t.Fatalf("converge failed: %v\n%s", err, out)
 	}
-	env, _ := os.ReadFile(f.pbEnv)
+	env := readRecorded(t, f.pbEnv)
 	for _, want := range []string{"BILLET_CLOUDFLARED_TOKEN_NODE_A=tok-SECRET-1", "BILLET_WARP_CONNECTOR_TOKEN_NODE_A=tok-SECRET-2", "ANSIBLE_HOST_KEY_CHECKING=True"} {
 		if !strings.Contains(string(env), want+"\n") {
 			t.Errorf("ansible-playbook's environment lacks %q", want)
 		}
 	}
-	args, _ := os.ReadFile(f.pbArgs)
-	calls, _ := os.ReadFile(f.calls)
+	args := readRecorded(t, f.pbArgs)
+	calls := readRecorded(t, f.calls)
 	if strings.Contains(string(args), "SECRET") || strings.Contains(string(calls), "SECRET") {
 		t.Errorf("a token reached argv:\n%s\n%s", args, calls)
 	}
@@ -463,12 +476,12 @@ func TestTheCredentialsAreWrittenReadOnlyToTheOwnerAndExported(t *testing.T) {
 		if info.Mode().Perm() != 0o600 {
 			t.Errorf("%s is mode %o, want 0600", name, info.Mode().Perm())
 		}
-		env, _ := os.ReadFile(f.pbEnv)
+		env := readRecorded(t, f.pbEnv)
 		if !strings.Contains(string(env), envName+"="+filepath.Join(f.runnerTm, name)+"\n") {
 			t.Errorf("ansible-playbook's environment lacks %s", envName)
 		}
 	}
-	args, _ := os.ReadFile(f.pbArgs)
+	args := readRecorded(t, f.pbArgs)
 	if strings.Contains(string(args), "SECRET") {
 		t.Errorf("a key reached argv:\n%s", args)
 	}
@@ -510,7 +523,7 @@ func TestThePinsAreAppendedAndAnOperatorsLineSurvives(t *testing.T) {
 	if err != nil {
 		t.Fatalf("converge failed: %v\n%s", err, out)
 	}
-	body, _ := os.ReadFile(existing)
+	body := readRecorded(t, existing)
 	got := string(body)
 	if !strings.Contains(got, "github.com ssh-ed25519 AAAAGH\n") {
 		t.Errorf("the operator's line was lost:\n%s", got)
@@ -567,19 +580,19 @@ func TestATemplatedAnsibleHostIsRenderedAndProbed(t *testing.T) {
 	t.Parallel()
 	f := newConvergeFixture(t)
 
-	debug := debugLine("cp-1", "10.3.1.117", 22, "") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n"
+	debug := debugLine("cp-1", "10.3.1.117", 2222, "") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n"
 	out, err := f.run(t, convergeRun{debug: debug})
 	if err != nil {
 		t.Fatalf("converge failed: %v\n%s", err, out)
 	}
 	found := false
 	for _, c := range f.callsOf(t, "nc") {
-		if strings.Contains(c, "10.3.1.117 22") {
+		if strings.Contains(c, "10.3.1.117 2222") {
 			found = true
 		}
 	}
 	if !found {
-		t.Errorf("the rendered address was not probed: %v", f.callsOf(t, "nc"))
+		t.Errorf("the rendered address was not probed on the inventory's port: %v", f.callsOf(t, "nc"))
 	}
 }
 
@@ -650,7 +663,7 @@ func TestPrepareRefusesABilletManagedRunnerAndAnUnknownMode(t *testing.T) {
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("prepare refused an ordinary runner: %v\n%s", err, out)
 		}
-		body, _ := os.ReadFile(output)
+		body := readRecorded(t, output)
 		if !strings.Contains(string(body), "billet_ref=v0.10.0\n") {
 			t.Errorf("the ref was not reported:\n%s", body)
 		}
@@ -687,7 +700,7 @@ func TestReachVerifiesTheKeyAgainstTheRolesPinAndMarksTheRegistration(t *testing
 	if _, err := os.Stat(filepath.Join(f.runnerTm, "billet-warp-registered")); err != nil {
 		t.Error("the registration marker was not written")
 	}
-	calls, _ := os.ReadFile(f.calls)
+	calls := readRecorded(t, f.calls)
 	if strings.Contains(string(calls), "SECRET") {
 		t.Errorf("the service token reached argv:\n%s", calls)
 	}
@@ -707,7 +720,7 @@ func TestReachRefusesAKeyWithAnotherFingerprint(t *testing.T) {
 	if !strings.Contains(out, "not exactly one primary key with the pinned fingerprint") {
 		t.Errorf("the refusal does not say why:\n%s", out)
 	}
-	calls, _ := os.ReadFile(f.calls)
+	calls := readRecorded(t, f.calls)
 	if strings.Contains(string(calls), "apt-get install") {
 		t.Errorf("the package was installed after a refused key:\n%s", calls)
 	}
