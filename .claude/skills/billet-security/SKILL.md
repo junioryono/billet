@@ -43,6 +43,8 @@ billet holds a GitHub App private key per target that can mint tokens for a whol
 
 **The IAM grants have no delete where the credential would sit beside what it could destroy.** The backup grant (`internal/archivestore`) and the identity-store grant carry no delete; the CodeBuild controller sweep grant is list-and-delete on the registration path with no `GetParameter` and no KMS, and the missing KMS grant is not the confidentiality boundary under the default key (measured: `WithDecryption=true` returned plaintext with no `kms:*` anywhere), so the boundary is billet's request stating no decryption and a response type with no `Value` field. The build's service role is a different principal from the node role.
 
+**The converge action's credentials land in files or the environment, never argv, and its cleanup removes only what the run created.** The CI key and the App key are written with `install -m 0600 /dev/stdin` under `RUNNER_TEMP` and named through `ANSIBLE_PRIVATE_KEY_FILE` and `BILLET_GITHUB_PRIVATE_KEY_PATH`; the WARP service token goes into `mdm.xml` the same way; the `environment` input is exported into `ansible-playbook`'s environment line by line, which is how the per-host connector tokens reach the roles (`-e` is for non-secret values, because argv is world-readable for the run). Host-key pins are appended to the runner user's `known_hosts` and an inventory that disables checking is refused, since an inventory's own SSH arguments replace anything the action sets. Cleanup removes the key files unconditionally and deletes a WARP registration only when this run's marker says it enrolled, so a deploy runner's or a laptop's own registration survives `reach: none`. The residual is the roles' own: `warp-cli connector new <TOKEN>` on the host, once, at enrolment.
+
 ## Measured facts
 
 - `%+v` on `awscreds.IMDS` printed the secret access key and session token through an unexported field.
@@ -57,6 +59,7 @@ billet holds a GitHub App private key per target that can mint tokens for a whol
 - `internal/awscreds/*_test.go` and the provider clients' redaction tables; `internal/github`'s `App` redaction tests.
 - `internal/provider/firecracker/*_test.go` (pid proof, chown scope), `internal/lifeops/*_test.go` (descriptor rules, link counts).
 - `internal/nodeplane/*_test.go` (JIT entitlement, register-before-decode with a counting body), `internal/e2e/wire_test.go`.
+- `actions/convergefleet_test.go` (credentials 0600 and exported, environment lines never in argv, pins appended, `ssh-keyscan` never run, cleanup scoped to the run's marker).
 - `internal/provider/codebuild/*_test.go` (never echoes its registration, `TestTheSweepNeverDecodesAValue`), `internal/provider/tart/*_test.go` (`Accepts` and the flag builder), `internal/provider/ec2/*_test.go` (metadata options, endpoint scheme).
 
 ## Related skills

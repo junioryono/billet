@@ -1,6 +1,6 @@
 # Action versioning
 
-Billet publishes four composite actions — `build-push-action`, `setup-docker-builder`, `stickydisk` and `stop-docker-builder` — and there are three ways to reference one. They are not ranked, because the thing that makes one better is exactly what makes it worse.
+Billet publishes five composite actions — `build-push-action`, `setup-docker-builder`, `stickydisk`, `stop-docker-builder` and `converge-fleet` — and there are three ways to reference one. They are not ranked, because the thing that makes one better is exactly what makes it worse.
 
 ## The three references
 
@@ -17,6 +17,8 @@ The honest version is short. A moving major means Billet can fix a bug in an act
 There is no configuration that gets both. What narrows the gap is that `@v0` only ever advances to a release that has already been proved: the `advance-major` job in `cut-release.yml` runs after `release.yml`, which proves the release immutable and verifies GitHub's attestation for the tag before it finishes. A tag whose build failed is never pointed at. That bounds *which* releases the major can reach; it does not make a release you have not read into one you have.
 
 If your threat model includes this repository being compromised, use a SHA. If it includes you forgetting to update a pin for two years, use `@v0`. Most people running self-hosted CI have the second problem.
+
+On `converge-fleet` the reference carries more: the action runs the Ansible collection from the same checkout, so its ref pins the roles a converge runs as well as the action. A moving reference there moves what the next converge does to your hosts, and the `check` job of the pull request that moves it is where you read the difference before it runs. The release workflow rewrites the documented reference to the tag being cut, and `scripts/check-module-sources.sh` holds it at `main` in the tree, the same rule the Terraform module sources follow.
 
 ## Nested actions resolve to one release
 

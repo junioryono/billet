@@ -237,14 +237,18 @@ jobs:
         with:
           python-version: "3.13"
 
+      # ONE PIN, read from the two files actions/converge-fleet reads, so the
+      # runtime these gates prove the roles on is the runtime the action
+      # installs on a consumer's runner; actions/convergefleet_test.go refuses
+      # a drift between this step and those files.
       - name: Install the pinned Ansible runtime
         run: |
-          python -m pip install ansible-core==2.19.4
+          python -m pip install "ansible-core==$(cat ansible_collections/junioryono/billet/tests/ansible-core-version)"
           # The host role's guest-network tasks use ansible.posix.sysctl, and
           # the fresh-check parses the WHOLE role (static imports resolve
           # modules even for tasks a controller-only run skips), so bare
           # ansible-core is not enough.
-          ansible-galaxy collection install ansible.posix:2.2.2
+          ansible-galaxy collection install "ansible.posix:$(cat ansible_collections/junioryono/billet/tests/ansible-posix-version)"
 
       - name: Exercise alert ownership migration and teardown
         run: make alert-lifecycle
