@@ -14,9 +14,10 @@ import (
 
 type placementRegistrar struct {
 	countingRegistrar
-	lease  *alloc.Lease
-	err    error
-	lookup func(context.Context, string) (*alloc.Lease, error)
+	lease   *alloc.Lease
+	err     error
+	lookup  func(context.Context, string) (*alloc.Lease, error)
+	resolve func(context.Context, string, []string, int64) (int, error)
 }
 
 func (r placementRegistrar) Lease(ctx context.Context, id string) (*alloc.Lease, error) {
@@ -24,6 +25,13 @@ func (r placementRegistrar) Lease(ctx context.Context, id string) (*alloc.Lease,
 		return r.lookup(ctx, id)
 	}
 	return r.lease, r.err
+}
+
+func (r placementRegistrar) ResolveQuarantineFor(ctx context.Context, node string, ids []string, epoch int64) (int, error) {
+	if r.resolve != nil {
+		return r.resolve(ctx, node, ids, epoch)
+	}
+	return 0, nil
 }
 
 func TestInProcessRegistrationChecksInventoryPlacement(t *testing.T) {
@@ -93,11 +101,21 @@ func TestInventoryReadsEachDistinctPlacementOnlyOnce(t *testing.T) {
 func TestInventoryPlacementReadsLeaveThePlaneAvailableAndRecheckIncarnation(t *testing.T) {
 	t.Parallel()
 
-	for _, replace := range []bool{false, true} {
-		t.Run(map[bool]string{false: "current", true: "superseded"}[replace], func(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		incarnation string
+		replace     bool
+	}{
+		{name: "current", incarnation: "first"},
+		{name: "superseded", incarnation: "first", replace: true},
+		{name: "legacy-current"},
+		{name: "legacy-superseded", replace: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
 			entered, proceed := make(chan struct{}), make(chan struct{})
+			resolutions := 0
 			p := New(slog.New(slog.DiscardHandler), deployment, time.Minute,
 				WithRegistrar(placementRegistrar{lookup: func(ctx context.Context, _ string) (*alloc.Lease, error) {
 					close(entered)
@@ -107,9 +125,12 @@ func TestInventoryPlacementReadsLeaveThePlaneAvailableAndRecheckIncarnation(t *t
 					case <-ctx.Done():
 						return nil, ctx.Err()
 					}
+				}, resolve: func(context.Context, string, []string, int64) (int, error) {
+					resolutions++
+					return 0, nil
 				}}))
 			_, err := p.Register(t.Context(), nodeapi.RegisterRequest{
-				Version: nodeapi.Version, Node: "n1", Incarnation: "first",
+				Version: nodeapi.Version, Node: "n1", Incarnation: tc.incarnation,
 				Provider: config.ProviderDocker, Deployment: deployment,
 				VCPU: 8, Memory: 32 * config.GiB,
 			})
@@ -120,7 +141,7 @@ func TestInventoryPlacementReadsLeaveThePlaneAvailableAndRecheckIncarnation(t *t
 			defer cancel()
 			done := make(chan error, 1)
 			go func() {
-				_, reconcileErr := p.ReconcileInventory(ctx, "n1", "first", []string{"l1"})
+				_, reconcileErr := p.ReconcileInventory(ctx, "n1", tc.incarnation, []string{"l1"})
 				done <- reconcileErr
 			}()
 			select {
@@ -135,7 +156,7 @@ func TestInventoryPlacementReadsLeaveThePlaneAvailableAndRecheckIncarnation(t *t
 				<-done
 				t.Fatal("a blocked placement read holds the shared plane mutex")
 			}
-			if replace {
+			if tc.replace {
 				p.nodes["n1"].incarnation = "replacement"
 				p.nodes["n1"].ledgerEpoch++
 			}
@@ -143,12 +164,12 @@ func TestInventoryPlacementReadsLeaveThePlaneAvailableAndRecheckIncarnation(t *t
 			close(proceed)
 			err = <-done
 			_, owned := p.OwnerOfLease("l1")
-			if replace {
-				if !errors.Is(err, ErrSuperseded) || owned {
-					t.Fatalf("superseded inventory err=%v owned=%v", err, owned)
+			if tc.replace {
+				if !errors.Is(err, ErrSuperseded) || owned || resolutions != 0 {
+					t.Fatalf("superseded inventory err=%v owned=%v resolutions=%d", err, owned, resolutions)
 				}
-			} else if err != nil || !owned {
-				t.Fatalf("current inventory err=%v owned=%v", err, owned)
+			} else if err != nil || owned != (tc.incarnation != "") || resolutions != 1 {
+				t.Fatalf("current inventory err=%v owned=%v resolutions=%d", err, owned, resolutions)
 			}
 		})
 	}

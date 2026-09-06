@@ -1423,10 +1423,8 @@ func (p *Plane) ReconcileInventory(
 	if !ok {
 		return 0, fmt.Errorf("%w: %s", ErrUnregistered, node)
 	}
-	if n.incarnation != "" && incarnation != "" && n.incarnation != incarnation {
-		return 0, fmt.Errorf(
-			"%w: node %q is registered by process %s and this report came from %s",
-			ErrSuperseded, node, n.incarnation, incarnation)
+	if err := supersededLocked(n, node, incarnation); err != nil {
+		return 0, err
 	}
 
 	freed, err := p.registrar.ResolveQuarantineFor(ctx, node, running, n.ledgerEpoch)
