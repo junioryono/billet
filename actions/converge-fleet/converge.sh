@@ -19,48 +19,82 @@
 # templates unexpanded, and an inventory that spells a controller's address
 # once and templates ansible_host from it is an ordinary shape; the debug
 # module templates every host's connection variables without opening a
-# connection.
+# connection. Every expected host must render exactly once, or the run stops:
+# a partial render is a partial probe. What the render reads is the inventory's
+# connection variables, and a play that overrides ansible_host, ansible_port or
+# the SSH arguments at play level is outside what this can see; the collection's
+# fleet playbook sets none, and a consumer's own play must not either.
 #
 # HOST KEYS ARE PINS. The known-hosts input is appended to the runner user's
 # known_hosts line by line (never a truncation: a deploy runner's file is an
 # operator's), host key checking is on, and an inventory that turns it off or
-# points at another file through ansible_ssh_common_args, ansible_ssh_extra_args
-# or ansible_ssh_args is refused, because those variables replace anything the
-# action could set in the environment. ssh-keyscan is never run.
+# points at another file, through ansible_ssh_common_args, ansible_ssh_extra_args,
+# ansible_ssh_args or ansible_host_key_checking, is refused, because those
+# variables replace anything the action could set in the environment.
+# ssh-keyscan is never run.
+#
+# THE ENVIRONMENT INPUT NEVER TOUCHES THIS SHELL. Its lines go to
+# ansible-playbook through env(1), so a line naming `mode` or `inventory` cannot
+# rewrite a decision this script already made, and names that would change how
+# Ansible or the runner behaves (ANSIBLE_*, GITHUB_*, RUNNER_*, PATH, HOME and
+# their kin) are refused by name. A malformed line is reported by its line
+# number, never by its contents, because its contents may be a credential.
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 checkout=$(cd "$here/../.." && pwd)
 
-mode=${BILLET_MODE:?}
-inventory=${BILLET_INVENTORY:?}
-playbook=${BILLET_PLAYBOOK:-junioryono.billet.fleet}
-reach=${BILLET_REACH:-none}
+# THE DECISIONS, FIXED BEFORE ANY INPUT IS READ. readonly, so nothing later in
+# this file can reassign them, whatever an input says.
+readonly mode=${BILLET_MODE:?}
+readonly inventory=${BILLET_INVENTORY:?}
+readonly playbook=${BILLET_PLAYBOOK:-junioryono.billet.fleet}
+readonly reach=${BILLET_REACH:-none}
+readonly limit=${BILLET_LIMIT:-}
+readonly extra_vars=${BILLET_EXTRA_VARS:-}
+readonly prove=${BILLET_PROVE_IDEMPOTENT:-true}
+readonly known_hosts_input=${BILLET_KNOWN_HOSTS:-}
+readonly runner_temp=${RUNNER_TEMP:?}
 
 [[ -f $inventory ]] || { echo "::error::inventory $inventory does not exist"; exit 1; }
 
-export ANSIBLE_COLLECTIONS_PATH="$checkout:$RUNNER_TEMP/billet-collections"
+export ANSIBLE_COLLECTIONS_PATH="$checkout:$runner_temp/billet-collections"
 export ANSIBLE_HOST_KEY_CHECKING=True
 export ANSIBLE_STDOUT_CALLBACK=default
 export ANSIBLE_RESULT_FORMAT=yaml
 export ANSIBLE_FORCE_COLOR=0
 export ANSIBLE_NOCOLOR=1
 
-# --- the environment input: NAME=value lines into the environment ------------
-#
-# Into this process's environment, which ansible-playbook inherits, and never
-# into its argv. A line that is not NAME=value is refused rather than exported
-# as something else.
+# --- the environment input: NAME=value lines for the child, and only the child ---
+child_env=()
 if [[ -n ${BILLET_ENVIRONMENT:-} ]]; then
-  while IFS= read -r line; do
+  n=0
+  while IFS= read -r line || [[ -n $line ]]; do
+    n=$((n + 1))
+    line=${line%$'\r'}
     [[ -z $line ]] && continue
-    if [[ ! $line =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
-      echo "::error::the environment input has a line that is not NAME=value (line starts with '${line%%=*}')"
+    if [[ ! $line =~ ^([A-Za-z_][A-Za-z0-9_]*)= ]]; then
+      echo "::error::the environment input's line $n is not NAME=value. Every line is one variable for ansible-playbook's environment; a value with newlines (a key) cannot be carried this way."
       exit 1
     fi
-    export "$line"
+    name=${BASH_REMATCH[1]}
+    case "$name" in
+      ANSIBLE_*|GITHUB_*|RUNNER_*|BILLET_ACTION*|LD_*|PYTHON*|PATH|HOME|SHELL|TMPDIR|IFS|ENV|BASH_ENV|CDPATH)
+        echo "::error::the environment input's line $n sets $name, which changes how Ansible or this runner behaves rather than what a role reads; it is refused. Connection and host-key policy are the action's, and extra-vars is the input for a non-secret flag."
+        exit 1
+        ;;
+    esac
+    child_env+=("$line")
   done <<<"$BILLET_ENVIRONMENT"
 fi
+
+# run_ansible runs an Ansible command with the environment input applied to
+# that process alone.
+run_ansible() {
+  # The `[@]+` form: an empty array under set -u is an unbound variable in
+  # bash 3.2, which is what a macOS developer runs these scripts under.
+  env "${child_env[@]+"${child_env[@]}"}" "$@"
+}
 
 # --- the credentials, written 0600 from the environment ----------------------
 #
@@ -74,100 +108,141 @@ write_secret() {
 }
 
 if [[ -n ${BILLET_GITHUB_APP_PRIVATE_KEY:-} ]]; then
-  write_secret "$BILLET_GITHUB_APP_PRIVATE_KEY" "$RUNNER_TEMP/billet-app-key.pem"
-  export BILLET_GITHUB_PRIVATE_KEY_PATH="$RUNNER_TEMP/billet-app-key.pem"
+  write_secret "$BILLET_GITHUB_APP_PRIVATE_KEY" "$runner_temp/billet-app-key.pem"
+  export BILLET_GITHUB_PRIVATE_KEY_PATH="$runner_temp/billet-app-key.pem"
 fi
 unset BILLET_GITHUB_APP_PRIVATE_KEY
 
 if [[ -n ${BILLET_SSH_PRIVATE_KEY:-} ]]; then
-  write_secret "$BILLET_SSH_PRIVATE_KEY" "$RUNNER_TEMP/billet-ssh-key"
-  export ANSIBLE_PRIVATE_KEY_FILE="$RUNNER_TEMP/billet-ssh-key"
+  write_secret "$BILLET_SSH_PRIVATE_KEY" "$runner_temp/billet-ssh-key"
+  export ANSIBLE_PRIVATE_KEY_FILE="$runner_temp/billet-ssh-key"
 fi
 unset BILLET_SSH_PRIVATE_KEY
 
 # --- the host-key pins ----------------------------------------------------------
-if [[ $reach == cloudflare-warp && -z ${BILLET_KNOWN_HOSTS:-} ]]; then
+if [[ $reach == cloudflare-warp && -z $known_hosts_input ]]; then
   echo "::error::reach cloudflare-warp needs known-hosts: a hosted runner holds no host-key pins, and the action never runs ssh-keyscan"
   exit 1
 fi
-if [[ -n ${BILLET_KNOWN_HOSTS:-} ]]; then
-  [[ -f $BILLET_KNOWN_HOSTS ]] || { echo "::error::known-hosts $BILLET_KNOWN_HOSTS does not exist"; exit 1; }
+if [[ -n $known_hosts_input ]]; then
+  [[ -f $known_hosts_input ]] || { echo "::error::known-hosts $known_hosts_input does not exist"; exit 1; }
   install -d -m 0700 "$HOME/.ssh"
   touch "$HOME/.ssh/known_hosts"
   chmod 0600 "$HOME/.ssh/known_hosts"
+  # An existing file that does not end in a newline would otherwise have the
+  # first pin glued onto its last line.
+  if [[ -s $HOME/.ssh/known_hosts && $(tail -c 1 "$HOME/.ssh/known_hosts" | od -An -c | tr -d ' ') != '\n' ]]; then
+    printf '\n' >>"$HOME/.ssh/known_hosts"
+  fi
   added=0
-  while IFS= read -r line; do
+  # `|| [[ -n $line ]]` so a last line without a newline is read too; a
+  # one-line pins file without one installed no pin before.
+  while IFS= read -r line || [[ -n $line ]]; do
+    line=${line%$'\r'}
     [[ -z $line || $line == \#* ]] && continue
     if ! grep -qxF -- "$line" "$HOME/.ssh/known_hosts"; then
       printf '%s\n' "$line" >>"$HOME/.ssh/known_hosts"
       added=$((added + 1))
     fi
-  done <"$BILLET_KNOWN_HOSTS"
+  done <"$known_hosts_input"
   echo "host-key pins: $added line(s) added to $HOME/.ssh/known_hosts"
 fi
 
 # --- the common arguments ----------------------------------------------------------
 args=(-i "$inventory")
-if [[ -n ${BILLET_LIMIT:-} ]]; then
-  args+=(--limit "$BILLET_LIMIT")
+if [[ -n $limit ]]; then
+  args+=(--limit "$limit")
 fi
-if [[ -n ${BILLET_EXTRA_VARS:-} ]]; then
-  if [[ ${BILLET_EXTRA_VARS:0:1} != "{" ]]; then
+if [[ -n $extra_vars ]]; then
+  if [[ ${extra_vars:0:1} != "{" ]]; then
     echo "::error::extra-vars must be a JSON object (it is passed as -e and lands in argv, so it is for non-secret flags only)"
     exit 1
   fi
-  args+=(-e "$BILLET_EXTRA_VARS")
+  args+=(-e "$extra_vars")
 fi
 
 # --- the hosts this run will touch -----------------------------------------------------
-listing=$(ansible-playbook "${args[@]}" --list-hosts "$playbook")
-expected=$RUNNER_TEMP/billet-expected-hosts
+listing=$(run_ansible ansible-playbook "${args[@]}" --list-hosts "$playbook")
+expected=$runner_temp/billet-expected-hosts
 # The listing indents each host by six spaces under "hosts (N):"; nothing else
 # in it is indented that deep.
-printf '%s\n' "$listing" | awk '/^      [^ ]/ { print $1 }' | sort -u >"$expected"
+printf '%s\n' "$listing" | awk '/^      [^ ]/ { sub(/^      /, ""); print }' | sort -u >"$expected"
 if [[ ! -s $expected ]]; then
-  echo "::error::$playbook matches no host in $inventory${BILLET_LIMIT:+ under --limit $BILLET_LIMIT}. A playbook that matches no host exits 0 having converged nothing, so this is refused in both modes."
+  echo "::error::$playbook matches no host in $inventory${limit:+ under --limit $limit}. A playbook that matches no host exits 0 having converged nothing, so this is refused in both modes."
   printf '%s\n' "$listing"
   exit 1
 fi
+# A NAME IS ONE WORD WITHOUT A PATTERN SEPARATOR: the render below names the
+# hosts as one host pattern, where ':' and ',' mean "or", and the recap rows
+# and this listing split on whitespace. An IPv6 literal or a name with a space
+# is an inventory name to change; ansible_host carries the address.
+while IFS= read -r host; do
+  if [[ ! $host =~ ^[A-Za-z0-9._-]+$ ]]; then
+    echo "::error::the inventory names a host as '$host', which this action cannot carry through a host pattern or a recap row; name it with letters, digits, dots and hyphens and put the address in ansible_host"
+    exit 1
+  fi
+done <"$expected"
 echo "hosts this run touches: $(paste -sd' ' "$expected")"
 
 # --- every host's connection, rendered ----------------------------------------------------
 #
 # One debug call over the expected hosts, one line per host (-o), the values as
 # one JSON document each; the module templates on the controller and opens no
-# connection.
+# connection. Without the environment input: nothing here needs a token.
 pattern=$(paste -sd: "$expected")
 rendered=$(ansible "${args[@]}" -o -m debug \
-  -a "msg={{ {'host': ansible_host | default(inventory_hostname), 'port': ansible_port | default(22), 'common': ansible_ssh_common_args | default(''), 'extra': ansible_ssh_extra_args | default(''), 'args': ansible_ssh_args | default('')} | to_json }}" \
+  -a "msg={{ {'host': ansible_host | default(inventory_hostname), 'port': ansible_port | default(22), 'common': ansible_ssh_common_args | default(''), 'extra': ansible_ssh_extra_args | default(''), 'args': ansible_ssh_args | default(''), 'checking': ansible_host_key_checking | default(true)} | to_json }}" \
   "$pattern")
 
-reach_targets=$RUNNER_TEMP/billet-reach-targets
+reach_targets=$runner_temp/billet-reach-targets
 : >"$reach_targets"
 while IFS= read -r line; do
   [[ -z $line ]] && continue
   host=${line%% *}
   json=${line#*=> }
-  # The msg is a JSON string holding a JSON document: two decodes.
-  fields=$(printf '%s' "$json" | python3 -c '
-import json, sys
+  # The msg is a JSON string holding a JSON document: two decodes. The SSH
+  # arguments are judged inside python and never printed, because a
+  # ProxyCommand may carry something an operator would not want in a log.
+  verdict=$(printf '%s' "$json" | python3 -c '
+import json, re, sys
 outer = json.loads(sys.stdin.read())
 inner = json.loads(outer["msg"])
-print(inner["host"], inner["port"], json.dumps(" ".join(str(inner[k]) for k in ("common", "extra", "args"))))
+sshargs = " ".join(str(inner[k]) for k in ("common", "extra", "args"))
+bad = None
+if str(inner.get("checking", True)).lower() in ("false", "no", "0", "off"):
+    bad = "ansible_host_key_checking"
+else:
+    m = re.search(r"(stricthostkeychecking)[= ](no|off|accept-new)|(userknownhostsfile)|(checkhostip)[= ](no|off)", sshargs, re.IGNORECASE)
+    if m:
+        bad = m.group(1) or m.group(3) or m.group(4)
+print(inner["host"], inner["port"], bad or "-")
 ')
-  addr=${fields%% *}
-  rest=${fields#* }
-  port=${rest%% *}
-  sshargs=${rest#* }
+  read -r addr port bad <<<"$verdict"
   # THE PIN POLICY IS ENFORCED ON WHAT SSH WILL ACTUALLY SEE. An inventory may
   # add a ProxyCommand; it may not turn host-key checking off or point it at
   # another file, because that quietly discards the pins.
-  if printf '%s' "$sshargs" | grep -Eq 'StrictHostKeyChecking=(no|off|accept-new)|StrictHostKeyChecking (no|off|accept-new)|UserKnownHostsFile|CheckHostIP=no|CheckHostIP no'; then
-    echo "::error::$host sets SSH options that disable or redirect host-key checking ($sshargs); the pins the action installs would be discarded. Remove the option from ansible_ssh_common_args, ansible_ssh_extra_args or ansible_ssh_args."
+  if [[ $bad != - ]]; then
+    echo "::error::$host sets $bad in its SSH options, which would disable or redirect host-key checking and discard the pins the action installs. Remove it from ansible_ssh_common_args, ansible_ssh_extra_args, ansible_ssh_args or ansible_host_key_checking."
     exit 1
   fi
   printf '%s %s %s\n' "$host" "$addr" "$port" >>"$reach_targets"
 done <<<"$rendered"
+
+# EVERY EXPECTED HOST RENDERED, EXACTLY ONCE. A render that answered for some
+# hosts and not others (a dynamic inventory that moved, a host the pattern did
+# not reach) would otherwise be probed for the ones that arrived and trusted
+# for the rest.
+while IFS= read -r host; do
+  count=$(awk -v h="$host" '$1 == h' "$reach_targets" | wc -l | tr -d ' ')
+  if [[ $count != 1 ]]; then
+    echo "::error::$host was listed by the playbook but rendered $count times; every host the run will touch has to render exactly once before it is probed"
+    exit 1
+  fi
+done <"$expected"
+if [[ $(wc -l <"$reach_targets" | tr -d ' ') != $(wc -l <"$expected" | tr -d ' ') ]]; then
+  echo "::error::the render answered for a host the playbook did not list; the expected set and the rendered set must be the same hosts"
+  exit 1
+fi
 
 # --- prove the path before trusting it ----------------------------------------------------
 #
@@ -184,16 +259,19 @@ while read -r host addr port; do
 done <"$reach_targets"
 
 # --- the run ---------------------------------------------------------------------------
+#
+# Both modes stream through tee and both publish the recap, so a check run's
+# consumer reads what the dry run said.
+log="$runner_temp/billet-converge-1.log"
 if [[ $mode == check ]]; then
-  ansible-playbook "${args[@]}" --check --diff "$playbook"
-  exit 0
-fi
-
-log="$RUNNER_TEMP/billet-converge-1.log"
-ansible-playbook "${args[@]}" "$playbook" 2>&1 | tee "$log"
-if [[ ${BILLET_PROVE_IDEMPOTENT:-true} == true ]]; then
-  "$here/prove-idempotent.sh" "$expected" -- "${args[@]}" "$playbook"
-  log="$RUNNER_TEMP/billet-converge-2.log"
+  run_ansible ansible-playbook "${args[@]}" --check --diff "$playbook" 2>&1 | tee "$log"
+else
+  run_ansible ansible-playbook "${args[@]}" "$playbook" 2>&1 | tee "$log"
+  if [[ $prove == true ]]; then
+    BILLET_CHILD_ENV=$(printf '%s\n' "${child_env[@]+"${child_env[@]}"}") \
+      "$here/prove-idempotent.sh" "$expected" -- "${args[@]}" "$playbook"
+    log="$runner_temp/billet-converge-2.log"
+  fi
 fi
 
 {

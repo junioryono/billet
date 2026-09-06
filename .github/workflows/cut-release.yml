@@ -105,7 +105,7 @@ jobs:
           # block a consumer copies out of a release has to name that release.
           # Same shape as the module sweep, for the same reasons.
           set +e
-          fleet_refs=$(grep -rlE 'uses: junioryono/billet/actions/converge-fleet@(main|v[0-9]+\.[0-9]+\.[0-9]+)' --include='*.md' docs actions)
+          fleet_refs=$(grep -rlE 'uses: *["'"'"']?junioryono/billet/actions/converge-fleet@(main|v[0-9]+\.[0-9]+\.[0-9]+)' --include='*.md' docs actions)
           grep_status=$?
           set -e
           if [ "${grep_status}" -gt 1 ] || [ -z "${fleet_refs}" ]; then
@@ -113,7 +113,7 @@ jobs:
             exit 1
           fi
           while IFS= read -r fleet_ref_file; do
-            sed -E -i "s#(uses: junioryono/billet/actions/converge-fleet)@(main|v[0-9]+\.[0-9]+\.[0-9]+)#\\1@${TAG}#g" "${fleet_ref_file}"
+            sed -E -i "s#(uses: *[\"']?junioryono/billet/actions/converge-fleet)@(main|v[0-9]+\.[0-9]+\.[0-9]+)#\\1@${TAG}#g" "${fleet_ref_file}"
             git add "${fleet_ref_file}"
           done <<< "${fleet_refs}"
 

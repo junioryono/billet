@@ -118,8 +118,27 @@ exit 1
 printf 'warp-cli %s\n' "$*" >>"$BILLET_FAKE_CALLS"
 case " $* " in
   *" status "*) if [ "${BILLET_FAKE_WARP_CONNECTS:-yes}" = yes ]; then echo "Status update: Connected"; else echo "Status update: Registered"; fi ;;
+  *" registration show "*) if [ "${BILLET_FAKE_WARP_REGISTERED:-no}" = yes ]; then echo "Device ID: abc"; else echo "Registration Missing"; exit 1; fi ;;
 esac
 exit "${BILLET_FAKE_WARP_EXIT:-0}"
+`,
+		// A timeout(1) shim: macOS has none, and the scripts bound every call
+		// with it; the bound itself is not what these tests measure.
+		"timeout": "#!/bin/sh\nshift\nexec \"$@\"\n",
+		// python3 for install-ansible.sh: `-m venv DIR` writes a venv whose
+		// python, ansible and ansible-galaxy are recorders; anything else runs
+		// the real interpreter, which converge.sh uses to parse JSON.
+		"python3": `#!/bin/sh
+if [ "${1:-}" = -m ] && [ "${2:-}" = venv ]; then
+  printf 'python3 %s\n' "$*" >>"$BILLET_FAKE_CALLS"
+  mkdir -p "$3/bin"
+  for tool in python ansible ansible-galaxy; do
+    printf '#!/bin/sh\nprintf "%%s %%s\\n" "$(basename "$0")" "$*" >>"$BILLET_FAKE_CALLS"\nexit 0\n' >"$3/bin/$tool"
+    chmod +x "$3/bin/$tool"
+  done
+  exit 0
+fi
+exec "$BILLET_REAL_PYTHON3" "$@"
 `,
 		"sudo": `#!/bin/sh
 printf 'sudo %s\n' "$*" >>"$BILLET_FAKE_CALLS"
@@ -203,10 +222,11 @@ func (f *convergeFixture) run(t *testing.T, r convergeRun) (string, error) {
 	cmd := exec.CommandContext(t.Context(), "bash", filepath.Join("converge-fleet", "converge.sh"))
 	cmd.Env = []string{
 		"PATH=" + f.bin + ":" + os.Getenv("PATH"),
+		"BILLET_REAL_PYTHON3=" + realPython3(t),
 		"HOME=" + f.home,
 		"RUNNER_TEMP=" + f.runnerTm,
 		"GITHUB_OUTPUT=" + f.output,
-		"GITHUB_ACTION_PATH=" + mustAbs(t, "converge-fleet"),
+		"GITHUB_ACTION_PATH=" + actionDir(t),
 		"BILLET_FAKE_CALLS=" + f.calls,
 		"BILLET_FAKE_PB_ARGS=" + f.pbArgs,
 		"BILLET_FAKE_PB_ENV=" + f.pbEnv,
@@ -236,6 +256,17 @@ func (f *convergeFixture) run(t *testing.T, r convergeRun) (string, error) {
 	return string(out), err
 }
 
+// realPython3 is the interpreter the fake python3 hands everything but a
+// venv creation to.
+func realPython3(t *testing.T) string {
+	t.Helper()
+	p, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 is not on PATH")
+	}
+	return p
+}
+
 // readRecorded reads what a fake recorded. An absent file is what a fake that
 // was never called leaves, and several assertions are about exactly that, so
 // absence reads as nothing recorded; any other error is a failed test rather
@@ -249,9 +280,9 @@ func readRecorded(t *testing.T, p string) []byte {
 	return body
 }
 
-func mustAbs(t *testing.T, p string) string {
+func actionDir(t *testing.T) string {
 	t.Helper()
-	a, err := filepath.Abs(p)
+	a, err := filepath.Abs("converge-fleet")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -678,7 +709,7 @@ func runReach(t *testing.T, f *convergeFixture, connects bool, keyBody string) (
 		"PATH=" + f.bin + ":" + os.Getenv("PATH"),
 		"HOME=" + f.home,
 		"RUNNER_TEMP=" + f.runnerTm,
-		"GITHUB_ACTION_PATH=" + mustAbs(t, "converge-fleet"),
+		"GITHUB_ACTION_PATH=" + actionDir(t),
 		"BILLET_FAKE_CALLS=" + f.calls,
 		"BILLET_FAKE_GOOD_FPR=" + fpr,
 		"BILLET_FAKE_KEY_BODY=" + keyBody,
@@ -737,6 +768,11 @@ func TestReachTimesOutNamingTheEnrolmentPolicy(t *testing.T) {
 	if !strings.Contains(out, "enrolment policy") {
 		t.Errorf("the failure does not name the enrolment policy:\n%s", out)
 	}
+	// A registration may exist although the device never connected, so the
+	// marker is there for cleanup to act on.
+	if _, err := os.Stat(filepath.Join(f.runnerTm, "billet-warp-registered")); err != nil {
+		t.Error("the marker was not written before the daemon could register")
+	}
 }
 
 func runCleanup(t *testing.T, f *convergeFixture, warpExit string) (string, error) {
@@ -768,7 +804,7 @@ func TestCleanupRemovesOnlyWhatThisRunCreated(t *testing.T) {
 		}
 	})
 
-	t.Run("a registration this run made is deleted even when warp-cli fails, and the keys go first", func(t *testing.T) {
+	t.Run("a registration this run made is deleted and the marker goes with it", func(t *testing.T) {
 		t.Parallel()
 		f := newConvergeFixture(t)
 		for _, name := range []string{"billet-ssh-key", "billet-app-key.pem", "billet-warp-registered"} {
@@ -776,13 +812,39 @@ func TestCleanupRemovesOnlyWhatThisRunCreated(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		if out, err := runCleanup(t, f, "1"); err != nil {
-			t.Fatalf("cleanup failed on a failing warp-cli: %v\n%s", err, out)
+		if out, err := runCleanup(t, f, "0"); err != nil {
+			t.Fatalf("cleanup failed: %v\n%s", err, out)
 		}
-		calls := f.callsOf(t, "warp-cli")
-		joined := strings.Join(calls, "\n")
-		if !strings.Contains(joined, "registration delete") {
-			t.Errorf("the registration was not deleted: %v", calls)
+		if joined := strings.Join(f.callsOf(t, "warp-cli"), "\n"); !strings.Contains(joined, "registration delete") {
+			t.Errorf("the registration was not deleted: %s", joined)
+		}
+		for _, name := range []string{"billet-ssh-key", "billet-app-key.pem", "billet-warp-registered"} {
+			if _, err := os.Stat(filepath.Join(f.runnerTm, name)); !os.IsNotExist(err) {
+				t.Errorf("%s survived cleanup", name)
+			}
+		}
+	})
+
+	// A cleanup that could not delete the registration says so, exits non-zero
+	// and keeps its marker, so the registration is not forgotten; the keys are
+	// gone regardless, because they go first.
+	t.Run("a failed registration delete is a failed cleanup that keeps the marker", func(t *testing.T) {
+		t.Parallel()
+		f := newConvergeFixture(t)
+		for _, name := range []string{"billet-ssh-key", "billet-app-key.pem", "billet-warp-registered"} {
+			if err := os.WriteFile(filepath.Join(f.runnerTm, name), []byte("x"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		out, err := runCleanup(t, f, "1")
+		if err == nil {
+			t.Fatalf("cleanup reported success with warp-cli failing:\n%s", out)
+		}
+		if !strings.Contains(out, "registration delete failed") {
+			t.Errorf("the failure does not name the registration:\n%s", out)
+		}
+		if _, err := os.Stat(filepath.Join(f.runnerTm, "billet-warp-registered")); err != nil {
+			t.Error("the marker was removed although the registration may still exist")
 		}
 		for _, name := range []string{"billet-ssh-key", "billet-app-key.pem"} {
 			if _, err := os.Stat(filepath.Join(f.runnerTm, name)); !os.IsNotExist(err) {

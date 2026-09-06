@@ -18,7 +18,7 @@ There is no configuration that gets both. What narrows the gap is that `@v0` onl
 
 If your threat model includes this repository being compromised, use a SHA. If it includes you forgetting to update a pin for two years, use `@v0`. Most people running self-hosted CI have the second problem.
 
-On `converge-fleet` the reference carries more: the action runs the Ansible collection from the same checkout, so its ref pins the roles a converge runs as well as the action. A moving reference there moves what the next converge does to your hosts, and the `check` job of the pull request that moves it is where you read the difference before it runs. The release workflow rewrites the documented reference to the tag being cut, and `scripts/check-module-sources.sh` holds it at `main` in the tree, the same rule the Terraform module sources follow.
+On `converge-fleet` the reference carries more: the action runs the Ansible collection from the same checkout, so its ref pins the roles a converge runs as well as the action. With an exact tag, Dependabot's `github-actions` ecosystem opens a pull request for each release, and that pull request's `check` job is where you read what the new roles would change before anything runs. With `@v0` there is no pull request: the tag moves when a release is accepted and the next converge, whenever a change to the fleet triggers one, runs the new roles, so the moving reference is a choice to take the roles unread. The release workflow rewrites the documented reference to the tag being cut, and `scripts/check-module-sources.sh` holds it at `main` in the tree, the same rule the Terraform module sources follow.
 
 ## Nested actions resolve to one release
 

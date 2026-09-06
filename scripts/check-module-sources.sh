@@ -146,7 +146,8 @@ done < <(git ls-files -- 'terraform/**/versions.tf' 'terraform/versions.tf')
 action='junioryono/billet/actions/converge-fleet@'
 
 set +e
-git grep -nE "uses: ${action}[^[:space:]]+" -- '*.md' >"$work/action-matches"
+# Quoted or bare: `uses: "junioryono/...@main"` is the same reference YAML reads.
+git grep -nE "uses: *[\"']?${action}[^[:space:]\"']+" -- '*.md' >"$work/action-matches"
 status=$?
 set -e
 
@@ -167,7 +168,7 @@ while IFS= read -r match; do
 	where=${match%%:*}
 	rest=${match#*:}
 	line=${rest%%:*}
-	ref=$(printf '%s\n' "$match" | sed -E "s#.*uses: ${action}([^[:space:]]+).*#\1#")
+	ref=$(printf '%s\n' "$match" | sed -E "s#.*uses: *[\"']?${action}([^[:space:]\"']+).*#\1#")
 
 	if [ "$ref" != "$expected_ref" ]; then
 		printf '%s:%s names %s%s, expected @%s\n' "$where" "$line" "$action" "$ref" "$expected_ref" >&2

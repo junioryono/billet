@@ -22,7 +22,7 @@ Converge a billet fleet from GitHub Actions with one `uses:` line. The action re
 
 ## The one pin
 
-GitHub checks out this whole repository at the ref in `uses:` to run the action, so the Ansible collection under `ansible_collections/` in that same checkout is the collection the converge runs. There is no Galaxy fetch of billet's collection, no `requirements.yml`, no wrapper script: the ref pins the action and the roles together. Dependabot's `github-actions` ecosystem opens a pull request for every billet release, and that pull request's `check` job is a `--check --diff` against your live fleet showing exactly what the new roles would change. A `@v0` reference moves with every accepted release, which is the trade-off [Action versioning](https://billet.readthedocs.io/en/latest/reference/action-versioning.html) states; on this action a moving ref moves the roles a converge runs, so a `@v0` consumer's `check` job is what tells it what changed.
+GitHub checks out this whole repository at the ref in `uses:` to run the action, so the Ansible collection under `ansible_collections/` in that same checkout is the collection the converge runs. There is no Galaxy fetch of billet's collection, no `requirements.yml`, no wrapper script: the ref pins the action and the roles together. With an exact tag, Dependabot's `github-actions` ecosystem opens a pull request for every billet release, and that pull request's `check` job is a `--check --diff` against your live fleet showing exactly what the new roles would change. A `@v0` reference moves with every accepted release and opens no pull request: the next converge runs the new roles, which is the trade-off [Action versioning](https://billet.readthedocs.io/en/latest/reference/action-versioning.html) states, and on this action it is a trade-off about the roles as well as the action.
 
 What the action installs on the runner: `ansible-core` at the version pinned in `ansible_collections/junioryono/billet/tests/ansible-core-version` (into a venv, because Ubuntu 24.04's system Python is externally managed) and `ansible.posix` at the version pinned beside it (the collection's one dependency, fetched from Galaxy with retries). CI's host-lifecycle job tests the roles on the same two pins, and `actions/actions_test.go` fails if the two could disagree.
 
@@ -74,6 +74,10 @@ BILLET_MODE=check BILLET_INVENTORY=fleet/inventory.yml BILLET_KNOWN_HOSTS=fleet/
   BILLET_ENVIRONMENT="BILLET_CLOUDFLARED_TOKEN_CONTROL_1=$(terraform output -raw tunnel_token)" \
   "$GITHUB_ACTION_PATH/converge.sh"
 ```
+
+## What is not covered
+
+- The render of each host's connection reads the inventory's variables. A play that sets `ansible_host`, `ansible_port` or the SSH arguments at play level is outside what the render and the probe can see; the collection's fleet playbook sets none, and a consumer's own play must not either.
 
 ## Measured
 

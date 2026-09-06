@@ -483,6 +483,10 @@ func TestReleaseMetadataMustMatchTheTag(t *testing.T) {
 		// immutable tag still saying @main would run main's roles that day.
 		{name: "fleet action still pinned to main", tag: "v0.4.3", collectionVersion: "0.4.3", actionVersion: "v0.4.3", moduleRef: "v0.4.3", fleetRef: "main", wantOutput: "expected @v0.4.3"},
 		{name: "fleet action undocumented", tag: "v0.4.3", collectionVersion: "0.4.3", actionVersion: "v0.4.3", moduleRef: "v0.4.3", fleetRef: "", wantOutput: "no documented uses: junioryono/billet/actions/converge-fleet@"},
+		// A QUOTED SPELLING IS THE SAME REFERENCE: YAML reads `uses: "x@main"` as
+		// x@main, so the gate must too, or a quoted line still naming main ships.
+		{name: "quoted fleet action still pinned to main", tag: "v0.4.3", collectionVersion: "0.4.3", actionVersion: "v0.4.3", moduleRef: "v0.4.3", fleetRef: `"main"`, wantOutput: "expected @v0.4.3"},
+		{name: "quoted fleet action release", tag: "v0.4.3", collectionVersion: "0.4.3", actionVersion: "v0.4.3", moduleRef: "v0.4.3", fleetRef: `"v0.4.3"`, wantSuccess: true},
 		{name: "invalid tag", tag: "release-4", collectionVersion: "4.0.0", actionVersion: "release-4", moduleRef: "release-4", fleetRef: "release-4"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -524,7 +528,11 @@ func TestReleaseMetadataMustMatchTheTag(t *testing.T) {
 				if err := os.MkdirAll(fleet, 0o755); err != nil {
 					t.Fatalf("create fleet action directory: %v", err)
 				}
+				// A fleetRef wrapped in quotes renders the quoted YAML spelling.
 				usage := "- uses: junioryono/billet/actions/converge-fleet@" + tc.fleetRef + "\n"
+				if strings.HasPrefix(tc.fleetRef, `"`) {
+					usage = `- uses: "junioryono/billet/actions/converge-fleet@` + strings.Trim(tc.fleetRef, `"`) + `"` + "\n"
+				}
 				if err := os.WriteFile(filepath.Join(fleet, "README.md"), []byte(usage), 0o600); err != nil {
 					t.Fatalf("write fleet action readme: %v", err)
 				}
