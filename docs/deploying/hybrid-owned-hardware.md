@@ -105,7 +105,7 @@ The facts a deployment needs arrive in three waves, so the generation has three 
 1. Mint the App into a file holding nothing else, and generate again with `--config` pointing at it.
 2. Apply the Terraform root and save `terraform output -json`.
 3. Render the prepare phase.
-4. Converge the controller alone, with the App key, over whichever [route](reaching-hosts.md) you chose: the role mounts and proves the ledger volume, installs the binary and units, and holds both services so nothing mints an identity yet.
+4. Converge the controller alone, with the App key, over whichever [route](reaching-hosts.md) you chose. The generated `site.yml` is one line, `- import_playbook: junioryono.billet.fleet`, the collection's own playbook (the control plane first, then the Linux hosts, with the SSH access, host and connector roles, each skipping cleanly on absent inputs): the host role mounts and proves the ledger volume, installs the binary and units, and holds both services so nothing mints an identity yet.
 5. On the controller, as the service user, `billet ca issue` for both hosts; install the controller's own bundle at `/etc/billet/tls` and stream the local host's to its `/etc/billet/tls`.
 6. From a workstation with your own AWS credentials, `billet ami build` with the subnet, security group and payload bucket from the outputs, and `--ca-cert` when the generation has a cache; the node role carries no builder grant unless `--builder` was passed.
 7. Render the commission phase, converge the controller alone (no key this time), then the local host alone, and `billet check` on each.

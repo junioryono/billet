@@ -1318,29 +1318,33 @@ output %[1]q {
 	return b.String()
 }
 
-// renderHybridSite writes the playbook: the control plane first, then the
-// Firecracker host.
+// renderHybridSite writes the playbook: the collection's fleet playbook, which
+// converges the control plane first and then the Linux hosts with every role
+// the fleet needs, and a commented example of a play a consumer appends.
 func renderHybridSite(p HybridParams) string {
 	return fmt.Sprintf(`# %s for the %s deployment.
 #
-# THE CONTROL PLANE FIRST. The node wire negotiates a protocol range and the
-# control plane is upgraded first, so a skew is survivable in this order and
-# not the other. The runbook converges one host at a time with -l; a bare run
-# reaching the local host before its certificate is installed fails at billet
-# check after a wasted drain.
-- name: billet control plane
-  hosts: control_plane
-  become: true
-  gather_facts: true
-  roles:
-    - role: junioryono.billet.host
+# THE COLLECTION'S FLEET PLAYBOOK: the control plane first (the node wire
+# negotiates a protocol range and the control plane is upgraded first, so a skew
+# is survivable in this order and not the other), then the Linux hosts, each
+# with the roles the fleet needs (ssh_access, host, the two connector roles,
+# development_host when billet_development_enabled). Every role skips cleanly on
+# absent inputs, so the inventory decides what each host gets. The runbook
+# converges one host at a time with -l; a bare run reaching the local host before
+# its certificate is installed fails at billet check after a wasted drain.
+- import_playbook: junioryono.billet.fleet
 
-- name: billet Firecracker host
-  hosts: linux
-  become: true
-  gather_facts: true
-  roles:
-    - role: junioryono.billet.host
+# Your own plays go after it, in this file: a package list, a developer tool,
+# anything that is this deployment's rather than billet's. A play CI must never
+# run (one that copies credentials off a laptop) belongs in another file.
+#
+# - name: this deployment's own configuration
+#   hosts: linux
+#   tasks:
+#     - name: Install the tools an operator wants on the host
+#       ansible.builtin.apt:
+#         name: [tmux, jq]
+#       become: true
 `, HybridMarker, p.Name)
 }
 

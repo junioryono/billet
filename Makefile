@@ -355,6 +355,10 @@ cloudflared-connector-check: ## Prove the cloudflared_connector role's refusals,
 warp-connector-check: ## Prove the warp_connector role enrols exactly on a missing registration and never over its own transport
 	ansible_collections/junioryono/billet/tests/warp-connector-check.sh
 
+.PHONY: fleet-playbook-check
+fleet-playbook-check: ## Prove the shipped fleet playbook's shape and that its converge guard fires before ssh_access
+	ansible_collections/junioryono/billet/tests/fleet-playbook-check.sh
+
 .PHONY: release-fetch-check
 release-fetch-check: ## Prove the billet_version fetch path and the URL it builds
 	ansible_collections/junioryono/billet/tests/release-fetch-check.sh
