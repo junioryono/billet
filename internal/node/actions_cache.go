@@ -23,6 +23,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/provider"
 	storecontract "github.com/junioryono/billet/internal/store"
@@ -33,6 +35,7 @@ const (
 	actionsFinalizePath = "/twirp/github.actions.results.api.v1.CacheService/FinalizeCacheEntryUpload"
 	actionsDownloadPath = "/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL"
 	actionsBlobPrefix   = "/_billet/actions-cache/"
+	actionsStorePrefix  = "actions-cache/"
 	actionsArchiveLimit = int64(10 << 30)
 	actionsVolumeSize   = int64(22 << 30)
 	actionsArchiveCount = 32
@@ -401,7 +404,7 @@ func actionsScopeDigest(session *cacheSession) string {
 func actionsVersionPrefix(session *cacheSession, version string) string {
 	digest := sha256.Sum256([]byte(version))
 
-	return "actions-cache/" + actionsScopeDigest(session) + "/" + hex.EncodeToString(digest[:]) + "/"
+	return actionsStorePrefix + actionsScopeDigest(session) + "/" + hex.EncodeToString(digest[:]) + "/"
 }
 
 func (s *CacheService) actionsStoreKey(session *cacheSession, key, version string) string {
@@ -918,10 +921,13 @@ func (s *CacheService) findActionsCache(
 	if err := s.actionIO.MountReadOnly(ctx, volume.Device, mountPath); err != nil {
 		return nil, errors.Join(err, s.store.Discard(ctx, volume))
 	}
-	if info, err := os.Stat(s.actionsArchivePath(session, archive)); err != nil ||
-		!info.Mode().IsRegular() || info.Size() > actionsArchiveLimit {
+	file, err := s.openActionsArchive(session, archive)
+	if err != nil {
 		return nil, errors.Join(errors.New("published Actions cache has no usable archive"),
 			s.actionIO.Unmount(ctx, mountPath), s.store.Discard(ctx, volume))
+	}
+	if err := file.Close(); err != nil {
+		return nil, errors.Join(err, s.actionIO.Unmount(ctx, mountPath), s.store.Discard(ctx, volume))
 	}
 
 	session.actions[id] = archive
@@ -1222,6 +1228,33 @@ func decodeActionsBlockList(body io.Reader) ([]string, error) {
 	return blocks, nil
 }
 
+// openActionsArchive confines reads to the mounted volume and rejects links and
+// special files before any bytes are served. Stored filesystems are not host authority.
+func (s *CacheService) openActionsArchive(session *cacheSession, archive *actionsArchive) (*os.File, error) {
+	root, err := os.OpenFile(s.actionsMountPath(session, archive),
+		os.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+
+	fd, err := unix.Openat(int(root.Fd()), "archive",
+		unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(fd), "actions-cache archive")
+	info, err := file.Stat()
+	if err != nil {
+		return nil, errors.Join(err, file.Close())
+	}
+	if !info.Mode().IsRegular() || info.Size() > actionsArchiveLimit {
+		return nil, errors.Join(errors.New("published Actions cache has no usable archive"), file.Close())
+	}
+
+	return file, nil
+}
+
 func (s *CacheService) downloadActionsBlob(
 	req *http.Request,
 	session *cacheSession,
@@ -1230,7 +1263,7 @@ func (s *CacheService) downloadActionsBlob(
 	if req.Method != http.MethodGet && req.Method != http.MethodHead {
 		return actionsBlobError(http.StatusMethodNotAllowed, "download method is unavailable"), nil
 	}
-	file, err := os.Open(s.actionsArchivePath(session, archive))
+	file, err := s.openActionsArchive(session, archive)
 	if err != nil {
 		return nil, err
 	}

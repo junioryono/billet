@@ -1235,6 +1235,13 @@ func (h *handler) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if req.InventoryKnown {
+		if err := checkInventoryPlacement(r.Context(), req.Node, req.Instances, h.store.Lease); err != nil {
+			writeStoreErr(w, err)
+
+			return
+		}
+	}
 	res, err := h.plane.register(r.Context(), req, intent, negotiated, nodeWire)
 	if err != nil {
 		// TWO KINDS OF NO, and conflating them was the bug. A verdict — wrong
@@ -2192,7 +2199,7 @@ func writeStoreErr(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, ErrSuperseded):
 		writeErr(w, http.StatusConflict, nodeapi.CodeSuperseded, err.Error())
-	case errors.Is(err, ErrNotEntitled):
+	case errors.Is(err, ErrNotEntitled), errors.Is(err, ErrRefused):
 		writeErr(w, http.StatusForbidden, nodeapi.CodeRefused, err.Error())
 	case errors.Is(err, ErrTakeCustody):
 		// 409, NOT AN ERROR STATUS THE NODE WILL RETRY. The report was accepted;

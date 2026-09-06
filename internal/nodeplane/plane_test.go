@@ -1834,6 +1834,10 @@ func TestReconcileMarksTheReportingIncarnationInventoryKnown(t *testing.T) {
 // so a test can reach the plane's own decisions.
 type countingRegistrar struct{}
 
+func (countingRegistrar) Lease(context.Context, string) (*alloc.Lease, error) {
+	return nil, alloc.ErrLeaseNotFound
+}
+
 func (countingRegistrar) RegisterNode(context.Context, alloc.NodeRegistration) (int64, error) {
 	return 1, nil
 }

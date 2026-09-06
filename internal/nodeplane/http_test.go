@@ -65,6 +65,13 @@ type fakeRegistrar struct {
 	withdrawErr error
 }
 
+func (f *fakeRegistrar) Lease(context.Context, string) (*alloc.Lease, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return f.lease, f.leaseErr
+}
+
 // withdrawal is one host's withdrawal as the ledger was told it.
 type withdrawal struct {
 	name        string

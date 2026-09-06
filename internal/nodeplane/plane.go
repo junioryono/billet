@@ -626,6 +626,9 @@ func (p *Plane) recordGone(ctx context.Context, gone []goneNode) []goneNode {
 // commands and then had every Bind refused — which looked like a broken node
 // rather than a missing row.
 type Registrar interface {
+	// Lease supplies durable placement before a reported inventory grants ownership.
+	Lease(ctx context.Context, leaseID string) (*alloc.Lease, error)
+
 	// RegisterNode records the host and returns the row's new fencing epoch, which
 	// NodeGone must present to prove which incarnation it is talking about.
 	RegisterNode(ctx context.Context, reg alloc.NodeRegistration) (int64, error)
@@ -1121,6 +1124,11 @@ func (p *Plane) register(
 	ctx context.Context, req nodeapi.RegisterRequest, intent registrationIntent,
 	negotiated int, nodeWire nodeapi.Range,
 ) (nodeapi.RegisterResponse, error) {
+	if req.InventoryKnown && p.registrar != nil {
+		if err := checkInventoryPlacement(ctx, req.Node, req.Instances, p.registrar.Lease); err != nil {
+			return nodeapi.RegisterResponse{}, err
+		}
+	}
 	p.mu.Lock()
 	currentIntent := p.activeRegistration[req.Node]
 	p.mu.Unlock()
@@ -1416,6 +1424,9 @@ func (p *Plane) ReconcileInventory(
 			ErrSuperseded, node, n.incarnation, incarnation)
 	}
 
+	if err := checkInventoryPlacement(ctx, node, running, p.registrar.Lease); err != nil {
+		return 0, err
+	}
 	freed, err := p.registrar.ResolveQuarantineFor(ctx, node, running, n.ledgerEpoch)
 	if err != nil {
 		return 0, err
@@ -1423,6 +1434,35 @@ func (p *Plane) ReconcileInventory(
 	p.adoptOwnershipLocked(node, incarnation, running, true)
 
 	return freed, nil
+}
+
+// checkInventoryPlacement keeps a node's observation from becoming authority over
+// another host. Missing leases remain reportable so orphaned compute stays visible.
+func checkInventoryPlacement(ctx context.Context, node string, ids []string,
+	lookup func(context.Context, string) (*alloc.Lease, error),
+) error {
+	for _, id := range ids {
+		lease, err := lookup(ctx, id)
+		if errors.Is(err, alloc.ErrLeaseNotFound) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("nodeplane: could not verify reported lease %s: %w", id, err)
+		}
+		if lease == nil {
+			continue
+		}
+		placed := lease.Node
+		if placed == "" {
+			placed = lease.TargetNode
+		}
+		if placed != "" && placed != node {
+			return fmt.Errorf("%w: reported lease %s belongs to node %q, not %q",
+				ErrRefused, id, placed, node)
+		}
+	}
+
+	return nil
 }
 
 // CheckIncarnation reports whether a request came from the current node process.

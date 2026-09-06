@@ -134,6 +134,30 @@ func TestARealSignatureFromThisProjectVerifies(t *testing.T) {
 	}
 }
 
+func TestARealSignatureMustMatchTheSourceRepository(t *testing.T) {
+	t.Parallel()
+
+	manifest, err := os.ReadFile("testdata/signed-manifest.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle, err := os.ReadFile("testdata/signed-manifest.sigstore.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := defaultPolicy(t)
+	if policy.SourceRepositoryURI != "https://github.com/"+DefaultRepo {
+		t.Fatalf("default policy does not bind the source repository: %+v", policy)
+	}
+	if err := VerifySignature(manifest, bundle, policy); err != nil {
+		t.Fatalf("the genuine repository was refused: %v", err)
+	}
+	policy.SourceRepositoryURI = "https://github.com/another-owner/another-project"
+	if err := VerifySignature(manifest, bundle, policy); err == nil {
+		t.Fatal("the same signing workflow was accepted for a different source repository")
+	}
+}
+
 // AND THE SAME SIGNATURE OVER CHANGED BYTES IS REFUSED. Without this the test
 // above proves only that the code runs.
 func TestARealSignatureDoesNotCoverAChangedManifest(t *testing.T) {

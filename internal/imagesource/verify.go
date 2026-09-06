@@ -102,6 +102,7 @@ func VerifySignature(manifest, bundleJSON []byte, p Policy) error {
 	if err != nil {
 		return fmt.Errorf("imagesource: the signing policy is not usable: %w", err)
 	}
+	identity.Extensions = certificate.Extensions{SourceRepositoryURI: p.SourceRepositoryURI}
 
 	verifier, err := verify.NewVerifier(tr,
 		// EACH OF THESE IS A SEPARATE CLAIM AND ALL THREE ARE REQUIRED.
@@ -146,15 +147,3 @@ func looksLegacy(bundleJSON []byte) bool {
 
 	return strings.Contains(text, `"base64Signature"`) || strings.Contains(text, `"rekorBundle"`)
 }
-
-// certificateExtensions is kept as documentation of what a stricter policy would
-// pin, and as the place to put it when the identity becomes configurable per
-// deployment.
-//
-// NOT ENFORCED YET, DELIBERATELY. Pinning SourceRepositoryURI, RunnerEnvironment
-// and BuildConfigURI is strictly better than the SAN alone -- the last of those is
-// the one that closes reusable-workflow confusion -- but every value has to be
-// known to be correct before it can be required, and requiring a wrong one refuses
-// every genuine image. The SAN already encodes repository, workflow and ref, which
-// is the primary binding.
-var _ = certificate.Extensions{}
