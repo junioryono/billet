@@ -1,0 +1,96 @@
+# One backup of this deployment. Rendered by the junioryono.billet.host role;
+# the packaged unit in billet's deploy/ directory is the same unit, and
+# tests/unit-parity.yml holds the two together.
+#
+# THE ROLE RENDERS AND ENABLES THIS where the package only installs it: a host
+# converged from a release tarball ran no postinstall and has no `billet local
+# up` to arm the timer, so without the role nothing on it ever writes an archive.
+# The timer is enabled under billet_backup_timer (default true) on every host
+# whose control plane may run; false installs both units disabled.
+#
+# `billet check` names the newest local archive and how old it is, and the
+# bucket's when one is configured: a timer that stopped firing looks exactly like
+# one that is working, and that is the failure worth catching.
+[Unit]
+Description=billet deployment backup
+Documentation=https://github.com/junioryono/billet/blob/main/docs/reference/records/restore-rehearsal.md
+After=network-online.target
+Wants=network-online.target
+{% if billet_ledger_volume_id | default('') | length > 0 %}
+# The ledger lives on a dedicated volume, and this unit is the other thing that
+# opens its directory. The same two directives billet-server.service carries,
+# for the same reason: Requires= on the EXACT mount unit fails the start even
+# when that unit is absent, and RequiresMountsFor= orders the start after every
+# mount the path needs. billet_ledger_mount_unit_name is set by the role before
+# any unit render; a missing value fails the render rather than emitting a unit
+# with no fence.
+Requires={{ billet_ledger_mount_unit_name }}
+After={{ billet_ledger_mount_unit_name }}
+{% endif %}
+# THE SAME FENCE THE SERVER HAS, on every host: RequiresMountsFor= names the
+# PATH, so systemd resolves whichever mount serves it, and the root filesystem
+# satisfies it where no mount unit exists. In [Unit], where systemd reads it.
+RequiresMountsFor={{ billet_candidate_server_state_dir }}
+
+[Service]
+Type=oneshot
+
+# THE SAME ACCOUNT THE CONTROL PLANE RUNS AS, because that is who can read the
+# ledger, the deployment identity and the node-wire authority. The App key is
+# owned by this account too (0600), which is what the role's account tasks and a
+# restore both make true.
+User={{ billet_service_user }}
+Group={{ billet_service_group }}
+UMask=0077
+
+# THE LEDGER'S ENVIRONMENT, for a PostgreSQL controller: `dsn_env` names a
+# variable, the role writes it to this file, and a backup opens the ledger
+# through the same connection the server uses (an identity-only archive still
+# opens it, and billet refuses an empty variable before writing anything). With
+# the leading `-`, so a SQLite host, where the file does not exist, runs rather
+# than failing.
+EnvironmentFile=-{{ billet_server_environment_path }}
+
+# The archive is a directory of 0600 files inside a 0700 directory, and it holds
+# TWO private keys. StateDirectory= creates this owned by the service account
+# with the mode below and nothing else on the machine can read it.
+StateDirectory=billet/backups
+StateDirectoryMode=0700
+
+# EACH RUN WRITES A NEW DIRECTORY, because `billet local backup` refuses a
+# destination that is not empty. The name is the UTC time to the second (the
+# doubled percent signs are systemd's escape for date's own fields; the hostname
+# is not part of the name).
+ExecStart=/usr/bin/sh -c '/usr/bin/billet local backup --config /etc/billet/billet.yaml --out /var/lib/billet/backups/$(date -u +%%Y-%%m-%%dT%%H-%%M-%%SZ)'
+
+# LOCAL COPIES ARE NOT PRUNED BY BILLET. Every archive holds a copy of the GitHub
+# App private key GitHub issues exactly once, and a unit that removes credentials
+# on a timer is not something to add quietly. Prune /var/lib/billet/backups
+# deliberately, or point backup.s3 at a bucket with a lifecycle rule.
+
+# A backup reads the ledger through the operator handle and runs against a LIVE
+# control plane; it holds SQLite's single writer slot for the length of the
+# snapshot and takes the same authority lock `billet ca rotate` does.
+TimeoutStartSec=1800
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+
+# The ledger and the authority, which the archive is made of. Quoted, as the
+# server unit quotes it: the directive takes a space-separated list of paths.
+ReadWritePaths="{{ billet_candidate_server_state_dir }}"
+
+# The config and the App key, read-only.
+ReadOnlyPaths=/etc/billet

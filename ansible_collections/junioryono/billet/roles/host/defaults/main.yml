@@ -165,6 +165,18 @@ billet_release_channel: ""
 # it.
 billet_automatic_updates: true
 
+# Whether this host's control plane archives itself daily.
+#
+# TRUE BY DEFAULT, and the role renders and enables billet-backup.{service,timer}
+# on every host whose server may run, because a host converged from a release
+# tarball has no package to install them and no `billet local up` to arm the
+# timer. False installs both units disabled, so an operator who turns the
+# archive on later has nothing left to render. The archive lands under
+# /var/lib/billet/backups and, with backup.s3 configured, in the bucket; nothing
+# here deletes one, because each holds a copy of the App key. A drop-in on the
+# unit is refused, as on the two services: the mount fence is rendered into it.
+billet_backup_timer: true
+
 # Whether a converge may move a host to a release OLDER than the one it runs.
 #
 # FALSE BY DEFAULT, AND THE REFUSAL IS BEFORE THE DRAIN. A stale billet_version

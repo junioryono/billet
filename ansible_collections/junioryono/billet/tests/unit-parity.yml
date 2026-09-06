@@ -90,12 +90,19 @@
           billet-upgrade.timer: "{{ lookup('ansible.builtin.file', billet_repo_root + '/deploy/billet-upgrade.timer') }}"
           billet-images-refresh.service: "{{ lookup('ansible.builtin.file', billet_repo_root + '/deploy/billet-images-refresh.service') }}"
           billet-images-refresh.timer: "{{ lookup('ansible.builtin.file', billet_repo_root + '/deploy/billet-images-refresh.timer') }}"
+          billet-backup.service: "{{ lookup('ansible.builtin.file', billet_repo_root + '/deploy/billet-backup.service') }}"
+          billet-backup.timer: "{{ lookup('ansible.builtin.file', billet_repo_root + '/deploy/billet-backup.timer') }}"
         role_scheduled:
           billet-upgrade.service: "{{ lookup('ansible.builtin.template', billet_role_templates + '/billet-upgrade.service.j2',
             template_vars={'billet_server_environment_path': '/etc/billet/server.env'}) }}"
           billet-upgrade.timer: "{{ lookup('ansible.builtin.template', billet_role_templates + '/billet-upgrade.timer.j2') }}"
           billet-images-refresh.service: "{{ lookup('ansible.builtin.template', billet_role_templates + '/billet-images-refresh.service.j2') }}"
           billet-images-refresh.timer: "{{ lookup('ansible.builtin.template', billet_role_templates + '/billet-images-refresh.timer.j2') }}"
+          # THE BACKUP WITHOUT A LEDGER VOLUME, which is the shape the package can
+          # express; the volume-fenced render is pinned in ledger-mount-render.yml.
+          billet-backup.service: "{{ lookup('ansible.builtin.template', billet_role_templates + '/billet-backup.service.j2',
+            template_vars={'billet_ledger_volume_id': '', 'billet_server_environment_path': '/etc/billet/server.env'}) }}"
+          billet-backup.timer: "{{ lookup('ansible.builtin.template', billet_role_templates + '/billet-backup.timer.j2') }}"
 
     # THE NODE IMPORTS THE SERVER'S ENVIRONMENT EXACTLY WHEN ONE IS SET. A
     # dispatched updater inherits the node's environment, and on a PostgreSQL
@@ -251,8 +258,81 @@
         - { unit: billet-images-refresh.timer, directive: Persistent }
         - { unit: billet-images-refresh.timer, directive: Unit }
         - { unit: billet-images-refresh.timer, directive: WantedBy }
+        - { unit: billet-backup.service, directive: Description }
+        - { unit: billet-backup.service, directive: Documentation }
+        - { unit: billet-backup.service, directive: After }
+        - { unit: billet-backup.service, directive: Wants }
+        - { unit: billet-backup.service, directive: RequiresMountsFor }
+        - { unit: billet-backup.service, directive: Type }
+        - { unit: billet-backup.service, directive: User }
+        - { unit: billet-backup.service, directive: Group }
+        - { unit: billet-backup.service, directive: UMask }
+        - { unit: billet-backup.service, directive: EnvironmentFile }
+        - { unit: billet-backup.service, directive: StateDirectory }
+        - { unit: billet-backup.service, directive: StateDirectoryMode }
+        - { unit: billet-backup.service, directive: ExecStart }
+        - { unit: billet-backup.service, directive: TimeoutStartSec }
+        - { unit: billet-backup.service, directive: NoNewPrivileges }
+        - { unit: billet-backup.service, directive: PrivateTmp }
+        - { unit: billet-backup.service, directive: ProtectSystem }
+        - { unit: billet-backup.service, directive: ProtectHome }
+        - { unit: billet-backup.service, directive: ProtectKernelTunables }
+        - { unit: billet-backup.service, directive: ProtectKernelModules }
+        - { unit: billet-backup.service, directive: ProtectControlGroups }
+        - { unit: billet-backup.service, directive: RestrictSUIDSGID }
+        - { unit: billet-backup.service, directive: RestrictNamespaces }
+        - { unit: billet-backup.service, directive: LockPersonality }
+        - { unit: billet-backup.service, directive: MemoryDenyWriteExecute }
+        - { unit: billet-backup.service, directive: SystemCallArchitectures }
+        - { unit: billet-backup.service, directive: SystemCallFilter }
+        - { unit: billet-backup.service, directive: CapabilityBoundingSet }
+        - { unit: billet-backup.service, directive: ReadOnlyPaths }
+        - { unit: billet-backup.timer, directive: Description }
+        - { unit: billet-backup.timer, directive: OnCalendar }
+        - { unit: billet-backup.timer, directive: RandomizedDelaySec }
+        - { unit: billet-backup.timer, directive: Persistent }
+        - { unit: billet-backup.timer, directive: Unit }
+        - { unit: billet-backup.timer, directive: WantedBy }
       loop_control:
         label: "{{ item.unit }} {{ item.directive }}"
+
+    # THE FENCE IS READ ONLY IN [Unit]. A RequiresMountsFor= under [Service]
+    # satisfies the line-anchored equality above and does nothing, so both
+    # copies are held to the section as well as the value.
+    - name: The backup unit's mount fence is in the section systemd reads it from
+      ansible.builtin.assert:
+        that:
+          # WHOLE LINES, compared by line number: a bare substring index of the
+          # directive name matched the comment explaining it, and a split on the
+          # section name matched a comment naming the section, so both stayed
+          # green with the directive moved under [Service] (measured). The line
+          # that IS the directive must sit between the line that IS [Unit] and
+          # the line that IS [Service]: before [Unit] is outside every section.
+          - (packaged_scheduled['billet-backup.service'].splitlines()).index('[Unit]')
+            < (packaged_scheduled['billet-backup.service'].splitlines()).index(packaged_scheduled['billet-backup.service'].splitlines() | select('match', '^RequiresMountsFor=') | first)
+          - (role_scheduled['billet-backup.service'].splitlines()).index('[Unit]')
+            < (role_scheduled['billet-backup.service'].splitlines()).index(role_scheduled['billet-backup.service'].splitlines() | select('match', '^RequiresMountsFor=') | first)
+          - (packaged_scheduled['billet-backup.service'].splitlines() | select('match', '^RequiresMountsFor=') | list | length) == 1
+          - (packaged_scheduled['billet-backup.service'].splitlines()).index(packaged_scheduled['billet-backup.service'].splitlines() | select('match', '^RequiresMountsFor=') | first)
+            < (packaged_scheduled['billet-backup.service'].splitlines()).index('[Service]')
+          - (role_scheduled['billet-backup.service'].splitlines() | select('match', '^RequiresMountsFor=') | list | length) == 1
+          - (role_scheduled['billet-backup.service'].splitlines()).index(role_scheduled['billet-backup.service'].splitlines() | select('match', '^RequiresMountsFor=') | first)
+            < (role_scheduled['billet-backup.service'].splitlines()).index('[Service]')
+          # THE ENVIRONMENT IMPORT IS READ ONLY IN [Service]: the line that IS the
+          # directive must come after the line that IS [Service] in both copies.
+          - (packaged_scheduled['billet-backup.service'].splitlines() | select('match', '^EnvironmentFile=') | list | length) == 1
+          - (packaged_scheduled['billet-backup.service'].splitlines()).index('[Service]')
+            < (packaged_scheduled['billet-backup.service'].splitlines()).index(packaged_scheduled['billet-backup.service'].splitlines() | select('match', '^EnvironmentFile=') | first)
+          - (role_scheduled['billet-backup.service'].splitlines() | select('match', '^EnvironmentFile=') | list | length) == 1
+          - (role_scheduled['billet-backup.service'].splitlines()).index('[Service]')
+            < (role_scheduled['billet-backup.service'].splitlines()).index(role_scheduled['billet-backup.service'].splitlines() | select('match', '^EnvironmentFile=') | first)
+          # And neither copy has an [Install] section: the timer is what is enabled.
+          - "'[Install]' not in packaged_scheduled['billet-backup.service']"
+          - "'[Install]' not in role_scheduled['billet-backup.service']"
+        fail_msg: >-
+          billet-backup.service must carry RequiresMountsFor= inside [Unit] in both
+          the packaged copy and the role's render; under [Service] systemd ignores
+          it and the backup runs against whatever is at the path.
 
     # THE READINESS RULE ITSELF, which no render can show: the templates take
     # the protocol as an input, so what decides it on an ordinary converge is
@@ -311,6 +391,12 @@
             == ['-/etc/billet/tls -/srv/jailer']
           - role_node_steady | regex_findall('(?m)^ReadWritePaths=(.*)$') | map('trim') | list
             == ['-/etc/billet/tls -/srv/jailer "/var/lib/billet/node"']
+          # The backup's writable path is the server's, quoted the way the
+          # server template quotes it; the package writes it bare.
+          - packaged_scheduled['billet-backup.service'] | regex_findall('(?m)^ReadWritePaths=(.*)$') | map('trim') | list
+            == ['/var/lib/billet/server']
+          - role_scheduled['billet-backup.service'] | regex_findall('(?m)^ReadWritePaths=(.*)$') | map('trim') | list
+            == ['"/var/lib/billet/server"']
 
           # The node's dependencies are backend-shaped. The package cannot know
           # the backend, so it orders after docker.service and requires nothing;

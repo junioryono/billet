@@ -529,5 +529,8 @@
 - name: Configure or remove the guest image refresh timer
   ansible.builtin.import_tasks: images-refresh.yml
 
+- name: Configure or remove the deployment backup timer
+  ansible.builtin.import_tasks: backup.yml
+
 - name: Configure billet services
   ansible.builtin.import_tasks: services.yml

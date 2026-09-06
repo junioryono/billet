@@ -11,6 +11,8 @@
     billet_host_recovery_dispatch_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/upgrade-recover.yml') | from_yaml }}"
     billet_host_recovery_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/upgrade-rollback.yml') | from_yaml }}"
     billet_host_finalization_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/upgrade-finalize.yml') | from_yaml }}"
+    billet_host_backup_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/backup.yml') | from_yaml }}"
+    billet_host_backup_text: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/backup.yml') }}"
     billet_server_unit: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/templates/billet-server.service.j2') }}"
     billet_node_unit: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/templates/billet-node.service.j2') }}"
   tasks:
@@ -459,6 +461,54 @@
       loop: "{{ billet_gated_expectations }}"
       loop_control:
         label: "{{ item.task }}"
+
+    # THE BACKUP UNITS, GATED LIKE EVERY OTHER START. The task file is its own,
+    # so the services.yml count above stays exact; it may name the should_run
+    # predicate and never the bare flag, because a prepared host holds its
+    # server and must not be archived before it is commissioned. It comes after
+    # the refresh timer and before the services, and it refuses a drop-in the
+    # way the two services' guards do: by asking systemd for DropInPaths after a
+    # reload, judging the command's status, and asserting an empty answer.
+    - name: Record the backup task file's shape
+      vars:
+        billet_backup_probe_name: "Inspect the deployment backup unit's drop-ins"
+      ansible.builtin.set_fact:
+        billet_backup_names: "{{ billet_host_backup_tasks | map(attribute='name') | list }}"
+        billet_backup_dropin_probe: "{{ billet_host_backup_tasks | selectattr('name', 'equalto', billet_backup_probe_name) | first }}"
+        billet_backup_dropin_guard: "{{ billet_host_backup_tasks | selectattr('name', 'equalto', 'Refuse a drop-in on the deployment backup unit') | first }}"
+        billet_backup_install: "{{ billet_host_backup_tasks | selectattr('name', 'equalto', 'Install the deployment backup units') | first }}"
+        billet_backup_enable: "{{ billet_host_backup_tasks | selectattr('name', 'equalto', 'Enable the deployment backup timer') | first }}"
+
+    - name: The backup units are installed, fenced and refused on the right terms
+      vars:
+        billet_backup_probe_name: "Inspect the deployment backup unit's drop-ins"
+      ansible.builtin.assert:
+        that:
+          - billet_host_backup_text | regex_findall('billet_enable_server') | length == 0
+          - billet_host_backup_text | regex_findall('billet_server_should_run') | length >= 6
+          - billet_main_names.index('Configure or remove the guest image refresh timer') < billet_main_names.index('Configure or remove the deployment backup timer')
+          - billet_main_names.index('Configure or remove the deployment backup timer') < billet_main_names.index('Configure billet services')
+          - billet_backup_names.index('Install the deployment backup units') < billet_backup_names.index('Apply deployment backup unit changes')
+          - billet_backup_names.index('Apply deployment backup unit changes') < billet_backup_names.index(billet_backup_probe_name)
+          - billet_backup_names.index(billet_backup_probe_name) < billet_backup_names.index('Refuse a drop-in on the deployment backup unit')
+          - billet_backup_names.index('Refuse a drop-in on the deployment backup unit') < billet_backup_names.index('Enable the deployment backup timer')
+          - "'--property=DropInPaths' in billet_backup_dropin_probe['ansible.builtin.command'].argv"
+          - "'billet-backup.service' in billet_backup_dropin_probe['ansible.builtin.command'].argv"
+          - billet_backup_dropin_probe.check_mode == false
+          - billet_backup_dropin_probe.changed_when == false
+          - "'.rc != 0' in (billet_backup_dropin_probe.failed_when | string)"
+          - "'billet_backup_dropins.stdout | trim | length == 0' in billet_backup_dropin_guard['ansible.builtin.assert'].that"
+          - "'billet_server_should_run' in (billet_backup_install.when | string)"
+          - "'not billet_server_should_run' not in (billet_backup_install.when | string)"
+          - "'billet_server_should_run' in (billet_backup_enable.when | string)"
+          - "'not billet_server_should_run' not in (billet_backup_enable.when | string)"
+          - "'billet_backup_timer' in (billet_backup_enable['ansible.builtin.systemd_service'].enabled | string)"
+          - billet_backup_enable['ansible.builtin.systemd_service'].name == 'billet-backup.timer'
+        fail_msg: >-
+          backup.yml must install the backup units and enable the timer only where
+          billet_server_should_run, never on the bare flag, between the refresh
+          timer and the services, and refuse an effective drop-in by asking systemd
+          after a reload and judging the command's status.
 
     # BOTH SPELLINGS OF A RELEASE ARE A RELEASE TO THE DOWNGRADE CHECK. A release
     # through v0.9.1 prints its version without the tag's v, and a pattern that

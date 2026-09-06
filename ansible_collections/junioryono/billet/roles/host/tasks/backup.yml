@@ -1,0 +1,134 @@
+---
+# THE DEPLOYMENT BACKUP TIMER, the same units the package ships, rendered here
+# because this fleet installs no package: a control plane converged from a
+# release tarball ran no postinstall, has no `billet local up` to arm the timer,
+# and so writes no archive at all until something puts these units there.
+# Installed and enabled on every host whose control plane may run
+# (billet_server_should_run, never the bare flag: a prepared host holds its
+# server and must not be archived before it is commissioned), enabled under
+# billet_backup_timer and installed disabled when that is false, removed where
+# the server may not run.
+#
+# A DROP-IN ON THIS UNIT IS REFUSED, like one on billet-server or billet-node.
+# The fence the unit needs (RequiresMountsFor on the state directory, and the
+# exact mount unit when a ledger volume is configured) is rendered into the unit
+# itself; a drop-in carrying its own copy is a second answer to what the unit
+# depends on, and one the next render silently disagrees with.
+
+- name: Install the deployment backup units
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: "/etc/systemd/system/{{ item }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - billet-backup.service
+    - billet-backup.timer
+  become: true
+  notify: Reload systemd
+  when: billet_server_should_run
+
+- name: Apply deployment backup unit changes
+  ansible.builtin.meta: flush_handlers
+
+# ASKED OF SYSTEMD, NOT OF THE FILESYSTEM, because a drop-in is effective
+# wherever systemd's search path found it. check_mode false because the answer
+# is an observation, and a probe that could not ask is not "no drop-ins":
+# failed_when names the status, so an error from systemctl fails the converge
+# rather than reading as an empty answer.
+- name: Inspect the deployment backup unit's drop-ins
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - show
+      - --property=DropInPaths
+      - --value
+      - billet-backup.service
+  register: billet_backup_dropins
+  changed_when: false
+  failed_when: billet_backup_dropins.rc != 0
+  check_mode: false
+  become: true
+  when: billet_server_should_run
+
+- name: Refuse a drop-in on the deployment backup unit
+  ansible.builtin.assert:
+    that:
+      - billet_backup_dropins.stdout | trim | length == 0
+    fail_msg: >-
+      billet-backup.service has effective systemd drop-ins:
+      {{ billet_backup_dropins.stdout | trim }}. This role renders the unit
+      itself, including RequiresMountsFor on {{ billet_candidate_server_state_dir }}
+      and the exact ledger mount unit when billet_ledger_volume_id is set, so a
+      drop-in is a second answer to what the unit depends on. Remove it (and its
+      .d directory), run systemctl daemon-reload, and converge again.
+  when: billet_server_should_run
+
+# A DRY RUN CANNOT SEE A DROP-IN THROUGH A UNIT IT HAS NOT INSTALLED: systemd
+# answers an absent unit with an empty DropInPaths. The .d directory is the best
+# answer a dry run can give, and it is reported as that rather than asserted,
+# because a real converge asks the question above with the unit in place.
+- name: Look for a drop-in directory a dry run would otherwise miss
+  ansible.builtin.find:
+    paths: /etc/systemd/system/billet-backup.service.d
+    patterns: "*.conf"
+  register: billet_backup_dropin_files
+  failed_when: false
+  become: true
+  when:
+    - billet_server_should_run
+    - ansible_check_mode
+
+- name: Report a drop-in directory the real converge will refuse
+  ansible.builtin.debug:
+    msg: >-
+      /etc/systemd/system/billet-backup.service.d holds
+      {{ billet_backup_dropin_files.files | map(attribute='path') | list }};
+      the real converge refuses an effective drop-in on billet-backup.service,
+      so remove it before converging for real.
+  when:
+    - billet_server_should_run
+    - ansible_check_mode
+    - (billet_backup_dropin_files.files | default([])) | length > 0
+
+# THE TIMER, NOT THE SERVICE: the service is a oneshot the timer triggers, and
+# enabling a oneshot directly runs it at every boot and then never again.
+- name: Enable the deployment backup timer
+  ansible.builtin.systemd_service:
+    name: billet-backup.timer
+    enabled: "{{ billet_backup_timer | bool }}"
+    state: "{{ 'started' if billet_backup_timer | bool else 'stopped' }}"
+  become: true
+  when:
+    - billet_server_should_run
+    - not ansible_check_mode
+
+- name: Inspect the deployment backup timer on a host whose server may not run
+  ansible.builtin.stat:
+    path: /etc/systemd/system/billet-backup.timer
+  register: billet_backup_timer_unit
+  become: true
+  when: not billet_server_should_run
+
+- name: Stop and disable the deployment backup timer on a host whose server may not run
+  ansible.builtin.systemd_service:
+    name: billet-backup.timer
+    enabled: false
+    state: stopped
+  become: true
+  when:
+    - not billet_server_should_run
+    - billet_backup_timer_unit.stat.exists
+    - not ansible_check_mode
+
+- name: Remove the deployment backup units from a host whose server may not run
+  ansible.builtin.file:
+    path: "/etc/systemd/system/{{ item }}"
+    state: absent
+  loop:
+    - billet-backup.timer
+    - billet-backup.service
+  become: true
+  notify: Reload systemd
+  when: not billet_server_should_run
