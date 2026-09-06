@@ -316,6 +316,12 @@ jobs:
       - name: Prove a converge cannot be driven from a billet runner
         run: make converge-guard-check
 
+      # The ssh_access role's whole value is one refusal, and no other suite
+      # configures a key, so every other gate takes its "nothing configured"
+      # branch. This runs the refusals and the install against a fake sshd.
+      - name: Prove the ssh_access role refuses to lock a host out
+        run: make ssh-access-check
+
       - name: Prove the pinned-release fetch path
         run: make release-fetch-check
 

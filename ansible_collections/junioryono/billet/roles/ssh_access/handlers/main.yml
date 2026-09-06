@@ -1,0 +1,7 @@
+---
+- name: Restart sshd
+  ansible.builtin.systemd_service:
+    name: "{{ billet_ssh_service_name }}"
+    state: restarted
+  become: true
+  when: billet_ssh_manage_service | bool
