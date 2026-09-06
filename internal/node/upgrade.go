@@ -235,6 +235,8 @@ type ExecUpgrader struct {
 	ConfigPath string
 	// AckDir is the node's private, writable state directory.
 	AckDir string
+	// DSNEnv names the configured PostgreSQL variable; its value never enters argv.
+	DSNEnv string
 }
 
 // StartUpgrade waits only for the updater's acceptance or refusal, never its drain.
@@ -249,11 +251,10 @@ func (e ExecUpgrader) StartUpgrade(_ context.Context, spec nodeapi.UpgradeSpec) 
 		binary = self
 	}
 
-	if e.AckDir == "" {
-		return errors.New("node: the updater's answer needs the node's state directory")
+	ackPath, err := e.ackPath()
+	if err != nil {
+		return err
 	}
-
-	ackPath := filepath.Join(e.AckDir, "upgrade-ack-"+rand.Text())
 
 	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: ackPath, Net: "unix"})
 	if err != nil {
@@ -283,6 +284,40 @@ func (e ExecUpgrader) StartUpgrade(_ context.Context, spec nodeapi.UpgradeSpec) 
 	return awaitAck(conn, spec.Version)
 }
 
+// Check refuses a state-directory path that cannot carry an upgrade answer.
+// The CLI calls this before starting the node or its candidate probe.
+func (e ExecUpgrader) Check() error {
+	_, err := e.ackPath()
+
+	return err
+}
+
+// ackPath bounds the absolute pathname, including the random name and separator.
+func (e ExecUpgrader) ackPath() (string, error) {
+	if e.AckDir == "" {
+		return "", errors.New("node: the updater's answer needs the node's state directory")
+	}
+
+	path, err := filepath.Abs(filepath.Join(e.AckDir, "upgrade-ack-"+rand.Text()))
+	if err != nil {
+		return "", fmt.Errorf("node: resolve the updater's answer path: %w", err)
+	}
+
+	// Measured with ListenUnix on macOS and Linux, 2026-09-06. The pathname
+	// needs one byte for its terminator in sockaddr_un.sun_path.
+	limit := 107
+	if runtime.GOOS == "darwin" {
+		limit = 103
+	}
+
+	if len(path) > limit {
+		return "", fmt.Errorf("node.state_dir makes the upgrade answer socket path %d bytes; "+
+			"the maximum on %s is %d; use a shorter node.state_dir path", len(path), runtime.GOOS, limit)
+	}
+
+	return path, nil
+}
+
 // underSystemd and systemdRun are seams for exercising both launch shapes.
 // Tests replacing either must stay serial, as must tests replacing ackWait.
 var (
@@ -296,7 +331,7 @@ func (e ExecUpgrader) launch(binary string, args []string, spec nodeapi.UpgradeS
 	if underSystemd() {
 		// No CommandContext: the transaction must survive the node's shutdown.
 		//nolint:noctx,gosec // the updater must outlive the node; systemdRun is a fixed binary name, variable only for tests
-		cmd := exec.Command(systemdRun, systemdRunArgs(binary, args, spec)...)
+		cmd := exec.Command(systemdRun, e.systemdRunArgs(binary, args, spec)...)
 
 		if out, err := cmd.CombinedOutput(); err != nil {
 			return fmt.Errorf("node: start the updater for %s through systemd-run: %w: %s",
@@ -320,16 +355,24 @@ func (e ExecUpgrader) launch(binary string, args []string, spec nodeapi.UpgradeS
 }
 
 // systemdRunArgs names one unit per instruction, so a redelivery cannot run beside it.
-func systemdRunArgs(binary string, args []string, spec nodeapi.UpgradeSpec) []string {
+func (e ExecUpgrader) systemdRunArgs(binary string, args []string, spec nodeapi.UpgradeSpec) []string {
 	unit := fmt.Sprintf("billet-host-upgrade-%s-g%d", spec.RolloutID, spec.Generation)
-	prefix := make([]string, 0, 9+len(args))
+	prefix := make([]string, 0, 10+len(args))
 	prefix = append(prefix,
 		"--unit="+unit,
 		"--description=billet host upgrade to "+spec.Version,
 		"--service-type=oneshot", "--collect", "--quiet", "--no-block",
 		// Match the scheduled root updater's largest drain plus teardown and margin.
-		"--property=TimeoutStartSec=88200", "--", binary,
+		"--property=TimeoutStartSec=88200",
 	)
+
+	if e.DSNEnv != "" {
+		// With no '=value', systemd-run copies its own environment variable over
+		// the bus. Only the configured name is visible in argv, never the DSN.
+		prefix = append(prefix, "--setenv="+e.DSNEnv)
+	}
+
+	prefix = append(prefix, "--", binary)
 
 	return append(prefix, args...)
 }

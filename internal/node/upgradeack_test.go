@@ -218,6 +218,18 @@ func TestFakeUpdaterProcess(t *testing.T) {
 
 	defer func() { _ = conn.Close() }()
 
+	if mode == "ledger-env" {
+		answer := AckRefused + "the ledger environment was missing or unrelated values were inherited"
+		if os.Getenv("BILLET_UPGRADE_TEST_DSN") == "postgres://fixture:private-fixture@localhost/ledger" &&
+			os.Getenv("BILLET_UPGRADE_UNRELATED") == "" {
+			answer = AckAccepted
+		}
+
+		if _, err := fmt.Fprintln(conn, answer); err != nil {
+			t.Fatal(err)
+		}
+	}
+
 	if mode == "answer" {
 		if _, err := fmt.Fprintln(conn, os.Getenv("BILLET_FAKE_UPDATER_ANSWER")); err != nil {
 			t.Fatal(err)

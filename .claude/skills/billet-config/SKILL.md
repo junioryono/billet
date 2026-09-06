@@ -28,6 +28,8 @@ Provider kinds are `firecracker`, `tart`, `ec2`, `codebuild`, `docker`, and `sim
 
 ## Rules
 
+**The node's upgrade acknowledgement needs a short absolute state-directory path.** `cmd/billet/nodeupgrade.go` builds the updater and calls `ExecUpgrader.Check` at node startup, before identity/provider work and before an upgrade probe may succeed. The absolute state-directory path plus `/upgrade-ack-<random>` must fit in 107 bytes on Linux or 103 on macOS (Go `ListenUnix`, measured 2026-09-06); the current separator and generated name use 39 bytes. This is a check on the host running the node, not a configuration parser limit on another host. A longer path is refused with the byte count and a request for a shorter `node.state_dir` path.
+
 **`config` is a leaf, and `alloc.New` re-applies the safety rules anyway.** `alloc.New` is exported, so it cannot assume its catalog came through `config.Load`; a rule enforced in only one of the two has a second entry point that does not enforce it. The same argument makes `config.CheckEC2Endpoint` (https required, loopback the one exception) callable from the provider constructor as well as from `Load`.
 
 **`release.automatic` is the one zero value that does not refuse, and it is a pointer so absence and `false` differ.** A deployment that says nothing updates itself; `automatic: false` is the opt-out. Every reader goes through `AutomaticUpdates()`, because a reader of the field reads an absent block as off, which is the old default coming back one call site at a time. `billet init` appends a commented `release:` block stating the default and the two lines that change it (`initconfig.releaseBlock`).

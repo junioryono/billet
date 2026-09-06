@@ -97,12 +97,19 @@ func cmdHostUpgrade(ctx context.Context, args []string) error {
 		return err
 	}
 
+	ack := newUpgradeAck(*ackPath)
+	defer ack.close()
+
 	if err := checkFleetInstruction(*rolloutID, *generation); err != nil {
+		ack.refuse(err)
+
 		return err
 	}
 
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
+		ack.refuse(err)
+
 		return err
 	}
 
@@ -119,16 +126,16 @@ func cmdHostUpgrade(ctx context.Context, args []string) error {
 		// command line can retarget it.
 		if *pin != "" || *digest != "" || *rolloutID != "" || *generation != 0 || *resume ||
 			*reinstall || *ackPath != "" {
-			return errors.New("--from-rollout takes its whole instruction from the ledger and " +
+			err := errors.New("--from-rollout takes its whole instruction from the ledger and " +
 				"accepts no --version, --manifest-sha256, --rollout, --generation, " +
 				"--reinstall, --resume or --ack-path beside it")
+			ack.refuse(err)
+
+			return err
 		}
 
 		return hostUpgradeFromRollout(ctx, cfg, *cfgPath, *skipVerify)
 	}
-
-	ack := newUpgradeAck(*ackPath)
-	defer ack.close()
 
 	if *resume {
 		err := resumeHostUpgrade(ctx, cfg)

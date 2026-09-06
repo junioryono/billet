@@ -31,7 +31,24 @@ func fakeSystemdRun(t *testing.T, systemd bool, refusal string) string {
 	if refusal != "" {
 		body += "printf '%s\\n' " + shellQuoteUpgrade(refusal) + " >&2\nexit 1\n"
 	} else {
-		body += "while [ \"$1\" != -- ]; do shift; done\nshift\n\"$@\" >/dev/null 2>&1 &\n"
+		body += `dsn_name=''
+dsn_value=''
+while [ "$1" != -- ]; do
+    case "$1" in
+        --setenv=*)
+            dsn_name=${1#--setenv=}
+            dsn_value=$(printenv "$dsn_name")
+            ;;
+    esac
+    shift
+done
+shift
+if [ -n "$dsn_name" ]; then
+    env -i "$dsn_name=$dsn_value" "$@" >/dev/null 2>&1 &
+else
+    env -i "$@" >/dev/null 2>&1 &
+fi
+`
 	}
 
 	if err := os.WriteFile(filepath.Join(dir, "systemd-run"), []byte(body), 0o700); err != nil {
@@ -152,4 +169,35 @@ func TestDispatchOutsideSystemdLaunchesDirectly(t *testing.T) {
 	}
 
 	assertNoAckSockets(t, e.AckDir)
+}
+
+// The manager starts with its own environment; the launcher must explicitly carry
+// the configured ledger variable, without exposing its value in the command line.
+func TestSystemdDispatchPreservesTheLedgerEnvironmentWithoutExposingIt(t *testing.T) {
+	const name = "BILLET_UPGRADE_TEST_DSN"
+	const value = "postgres://fixture:private-fixture@localhost/ledger"
+
+	t.Setenv(name, value)
+	t.Setenv("BILLET_UPGRADE_UNRELATED", "must not be forwarded")
+	record := fakeSystemdRun(t, true, "")
+	e := ExecUpgrader{Binary: fakeUpdaterMode(t, "ledger-env", ""),
+		AckDir: shortAckDir(t), DSNEnv: name}
+
+	if err := e.StartUpgrade(t.Context(), nodeapi.UpgradeSpec{Version: "v0.9.3"}); err != nil {
+		t.Fatalf("the updater did not receive its ledger environment: %v", err)
+	}
+
+	body, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	args := strings.Split(strings.TrimSpace(string(body)), "\n")
+	if !slices.Contains(args, "--setenv="+name) {
+		t.Errorf("the configured variable name was not forwarded: %q", args)
+	}
+
+	if strings.Contains(string(body), value) {
+		t.Error("the ledger credential appeared in systemd-run's argv")
+	}
 }
