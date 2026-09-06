@@ -237,31 +237,63 @@ outer = json.loads(sys.stdin.read())
 inner = json.loads(outer["msg"])
 
 
-def unquote(text):
-    # THE PART OF THE OPENSSH VALUE GRAMMAR THIS IMPLEMENTS, and nothing beyond it:
-    # readconf hands a value to argv_split, which joins concatenated quoted
-    # fragments in single or double quotes, honours a backslash, and stops at an
-    # unquoted # or whitespace, so a single-quoted no, n"o" and no # comment are all no. An
-    # unbalanced quote is unreadable.
+def first_argument(text):
+    # ONE ARGUMENT THE WAY argv_split READS IT, and nothing beyond that: a single
+    # or double quote opens a fragment to its matching close and fragments
+    # concatenate (n"o" is no), a backslash before a quote, a backslash, a hash
+    # or a space is that character in either quote mode and any other escape is
+    # kept as written, an unquoted # or whitespace ends the argument, and an
+    # unclosed quote is unreadable.
     out = []
+    quote = None
     i = 0
     while i < len(text):
         ch = text[i]
-        if ch in ("\"", chr(39)):
-            j = text.find(ch, i + 1)
-            if j < 0:
-                return None
-            out.append(text[i + 1:j])
-            i = j + 1
-        elif ch == "\\" and i + 1 < len(text):
+        if ch == "\\" and i + 1 < len(text) and text[i + 1] in ("\\", "\"", chr(39), "#", " ", "\t"):
             out.append(text[i + 1])
             i += 2
-        elif ch == "#" or ch.isspace():
-            break
-        else:
-            out.append(ch)
+            continue
+        if quote:
+            if ch == quote:
+                quote = None
+            else:
+                out.append(ch)
             i += 1
+            continue
+        if ch in ("\"", chr(39)):
+            quote = ch
+            i += 1
+            continue
+        if ch == "#" or ch.isspace():
+            break
+        out.append(ch)
+        i += 1
+    if quote:
+        return None
     return "".join(out)
+
+
+def keyword_and_rest(opt):
+    # THE KEYWORD THE WAY strdelim READS IT: one that opens with a double quote
+    # runs to its closing quote and the value starts right after it, so
+    # "StrictHostKeyChecking"no is the keyword and no; otherwise it runs to the
+    # first whitespace or =. A keyword that is not letters (a quote in its
+    # middle, nothing at all) is unreadable rather than compared.
+    opt = opt.lstrip()
+    if opt.startswith("\""):
+        j = opt.find("\"", 1)
+        if j < 0:
+            return None, None
+        key, rest = opt[1:j], opt[j + 1:]
+    else:
+        m = re.match(r"^([^\s=]*)(.*)$", opt, re.DOTALL)
+        key, rest = m.group(1), m.group(2)
+    if not re.match(r"^[A-Za-z]+$", key):
+        return None, None
+    rest = rest.lstrip()
+    if rest.startswith("="):
+        rest = rest[1:].lstrip()
+    return key.lower(), rest
 
 
 def judge(tokens):
@@ -270,8 +302,9 @@ def judge(tokens):
     # checking off and -4F/tmp/x reads a configuration file; rather than model
     # clusters, the action admits an inventory that says what it means with -o
     # and refuses the rest (AddressFamily=inet is the -o spelling of -4). Inside
-    # an option, keyword and value are unquoted the way readconf does before the
-    # keyword is compared case-insensitively. Refused keywords, each a way of
+    # an option, the keyword is read as strdelim reads it and the value as
+    # argv_split reads one argument, and what those two do not model is refused
+    # as unreadable rather than guessed at. Refused keywords, each a way of
     # accepting a key the pins do not hold: a configuration file or Include, a
     # second known-hosts file or a command producing keys, checking turned off,
     # CheckHostIP off, the loopback exemption, DNS-published keys, and an alias
@@ -289,14 +322,10 @@ def judge(tokens):
             return tok[:2] + " (an ssh flag the action does not interpret; spell it as -o)"
         else:
             continue
-        m = re.match(r"^\s*([^\s=]+)\s*(?:=|\s)\s*(.*)$", opt, re.DOTALL)
-        if not m:
-            return "an SSH option the action cannot read"
-        key = unquote(m.group(1))
-        value = unquote(m.group(2).strip())
+        key, rest = keyword_and_rest(opt)
+        value = None if key is None else first_argument(rest)
         if key is None or value is None:
             return "an SSH option the action cannot read"
-        key = key.lower()
         value = value.lower()
         if key == "include":
             return "Include (an ssh configuration file the action cannot read)"

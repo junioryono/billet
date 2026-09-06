@@ -315,26 +315,28 @@ func TestOtherSpellingsOfCheckingOffAreRefused(t *testing.T) {
 	t.Parallel()
 
 	for name, debug := range map[string]string{
-		"false":         debugLine("cp-1", "10.0.0.1", 22, "-o StrictHostKeyChecking=false") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
-		"spaced":        debugLine("cp-1", "10.0.0.1", 22, `-o "StrictHostKeyChecking = no"`) + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
-		"ssh alias":     debugLineChecking("cp-1", "10.0.0.1", "False") + "\n" + debugLineChecking("node-a", "10.0.0.2", true) + "\n",
-		"checkhostip":   debugLine("cp-1", "10.0.0.1", 22, "-o CheckHostIP=false") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
-		"quoted value":  debugLine("cp-1", "10.0.0.1", 22, `-o StrictHostKeyChecking="no"`) + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
-		"inner quotes":  debugLine("cp-1", "10.0.0.1", 22, `-o 'StrictHostKeyChecking="no"'`) + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
-		"tab":           debugLine("cp-1", "10.0.0.1", 22, "-o 'StrictHostKeyChecking\tno'") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
-		"no separator":  debugLine("cp-1", "10.0.0.1", 22, "-oStrictHostKeyChecking=off") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
-		"config file":   debugLine("cp-1", "10.0.0.1", 22, "-F /tmp/ssh_config") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
-		"include":       debugLine("cp-1", "10.0.0.1", 22, "-o Include=/tmp/ssh_config") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
-		"global file":   debugLine("cp-1", "10.0.0.1", 22, "-o GlobalKnownHostsFile=/tmp/keys") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
-		"keys command":  debugLine("cp-1", "10.0.0.1", 22, "-o KnownHostsCommand=/tmp/keys.sh") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
-		"single quotes": debugLine("cp-1", "10.0.0.1", 22, `-o "StrictHostKeyChecking='no'"`) + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
-		"fragments":     debugLine("cp-1", "10.0.0.1", 22, `-o 'StrictHostKeyChecking=n"o"'`) + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
-		"comment":       debugLine("cp-1", "10.0.0.1", 22, `-o 'StrictHostKeyChecking=no # comment'`) + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
-		"cluster":       debugLine("cp-1", "10.0.0.1", 22, "-4oStrictHostKeyChecking=no") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
-		"cluster file":  debugLine("cp-1", "10.0.0.1", 22, "-4F/tmp/ssh_config") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
-		"localhost":     debugLine("cp-1", "10.0.0.1", 22, "-o NoHostAuthenticationForLocalhost=yes") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
-		"dns":           debugLine("cp-1", "10.0.0.1", 22, "-o VerifyHostKeyDNS=yes") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
-		"alias":         debugLine("cp-1", "10.0.0.1", 22, "-o HostKeyAlias=other") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"false":          debugLine("cp-1", "10.0.0.1", 22, "-o StrictHostKeyChecking=false") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"spaced":         debugLine("cp-1", "10.0.0.1", 22, `-o "StrictHostKeyChecking = no"`) + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"ssh alias":      debugLineChecking("cp-1", "10.0.0.1", "False") + "\n" + debugLineChecking("node-a", "10.0.0.2", true) + "\n",
+		"checkhostip":    debugLine("cp-1", "10.0.0.1", 22, "-o CheckHostIP=false") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"quoted value":   debugLine("cp-1", "10.0.0.1", 22, `-o StrictHostKeyChecking="no"`) + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"inner quotes":   debugLine("cp-1", "10.0.0.1", 22, `-o 'StrictHostKeyChecking="no"'`) + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"tab":            debugLine("cp-1", "10.0.0.1", 22, "-o 'StrictHostKeyChecking\tno'") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"no separator":   debugLine("cp-1", "10.0.0.1", 22, "-oStrictHostKeyChecking=off") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"config file":    debugLine("cp-1", "10.0.0.1", 22, "-F /tmp/ssh_config") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"include":        debugLine("cp-1", "10.0.0.1", 22, "-o Include=/tmp/ssh_config") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"global file":    debugLine("cp-1", "10.0.0.1", 22, "-o GlobalKnownHostsFile=/tmp/keys") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"keys command":   debugLine("cp-1", "10.0.0.1", 22, "-o KnownHostsCommand=/tmp/keys.sh") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"single quotes":  debugLine("cp-1", "10.0.0.1", 22, `-o "StrictHostKeyChecking='no'"`) + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"fragments":      debugLine("cp-1", "10.0.0.1", 22, `-o 'StrictHostKeyChecking=n"o"'`) + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"comment":        debugLine("cp-1", "10.0.0.1", 22, `-o 'StrictHostKeyChecking=no # comment'`) + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"cluster":        debugLine("cp-1", "10.0.0.1", 22, "-4oStrictHostKeyChecking=no") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"cluster file":   debugLine("cp-1", "10.0.0.1", 22, "-4F/tmp/ssh_config") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"localhost":      debugLine("cp-1", "10.0.0.1", 22, "-o NoHostAuthenticationForLocalhost=yes") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"dns":            debugLine("cp-1", "10.0.0.1", 22, "-o VerifyHostKeyDNS=yes") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"alias":          debugLine("cp-1", "10.0.0.1", 22, "-o HostKeyAlias=other") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"quoted keyword": debugLine("cp-1", "10.0.0.1", 22, `-o '"StrictHostKeyChecking"no # comment'`) + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"split keyword":  debugLine("cp-1", "10.0.0.1", 22, `-o 'Strict"Host"KeyChecking=no'`) + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -343,13 +345,59 @@ func TestOtherSpellingsOfCheckingOffAreRefused(t *testing.T) {
 			if err == nil {
 				t.Fatalf("%s was accepted:\n%s", name, out)
 			}
-			if !strings.Contains(out, "cp-1 sets ") {
-				t.Errorf("the refusal does not name the host:\n%s", out)
+			// THE REFUSAL NAMES THE OPTION THAT CAUSED IT, so a walker that
+			// answered "cannot read" for every quoted spelling would fail here.
+			want, ok := refusedOption[name]
+			if !ok || want == "" {
+				t.Fatalf("%s has no canonical refusal in refusedOption, so its assertion would be vacuous", name)
+			}
+			if !strings.Contains(out, "cp-1 sets "+want) {
+				t.Errorf("the refusal does not name %s:\n%s", want, out)
 			}
 			if len(f.playbookInvocations(t)) != 0 {
 				t.Error("ansible-playbook ran after the refusal")
 			}
 		})
+	}
+}
+
+// refusedOption is the canonical name each spelling above must be refused by.
+var refusedOption = map[string]string{
+	"false":          "StrictHostKeyChecking",
+	"spaced":         "StrictHostKeyChecking",
+	"ssh alias":      "ansible_host_key_checking (or its ansible_ssh_ alias)",
+	"checkhostip":    "CheckHostIP",
+	"quoted value":   "StrictHostKeyChecking",
+	"inner quotes":   "StrictHostKeyChecking",
+	"tab":            "StrictHostKeyChecking",
+	"no separator":   "StrictHostKeyChecking",
+	"config file":    "-F (an ssh flag the action does not interpret",
+	"include":        "Include",
+	"global file":    "GlobalKnownHostsFile",
+	"keys command":   "KnownHostsCommand",
+	"single quotes":  "StrictHostKeyChecking",
+	"fragments":      "StrictHostKeyChecking",
+	"comment":        "StrictHostKeyChecking",
+	"cluster":        "-4 (an ssh flag the action does not interpret",
+	"cluster file":   "-4 (an ssh flag the action does not interpret",
+	"localhost":      "NoHostAuthenticationForLocalhost",
+	"dns":            "VerifyHostKeyDNS",
+	"alias":          "HostKeyAlias",
+	"quoted keyword": "StrictHostKeyChecking",
+	"split keyword":  "an SSH option the action cannot read",
+}
+
+// QUOTED VALUES THAT KEEP CHECKING ON ARE ACCEPTED, escaped quotes included:
+// a walker that refused every quoted spelling as unreadable would pass the
+// table above and fail here.
+func TestQuotedValuesThatKeepCheckingOnAreAccepted(t *testing.T) {
+	t.Parallel()
+	f := newConvergeFixture(t)
+
+	debug := debugLine("cp-1", "10.0.0.1", 22, `-o 'IdentityFile="key\"name"' -o "StrictHostKeyChecking='yes'" -o VerifyHostKeyDNS=no -o 'ProxyCommand=nc -w -1 %h %p'`) + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n"
+	out, err := f.run(t, convergeRun{debug: debug})
+	if err != nil {
+		t.Fatalf("quoted values that keep checking on were refused: %v\n%s", err, out)
 	}
 }
 
