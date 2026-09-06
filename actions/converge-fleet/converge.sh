@@ -33,12 +33,16 @@
 # variables replace anything the action could set in the environment.
 # ssh-keyscan is never run.
 #
-# THE ENVIRONMENT INPUT NEVER TOUCHES THIS SHELL. Its lines go to
-# ansible-playbook through env(1), so a line naming `mode` or `inventory` cannot
-# rewrite a decision this script already made, and names that would change how
-# Ansible or the runner behaves (ANSIBLE_*, GITHUB_*, RUNNER_*, PATH, HOME and
-# their kin) are refused by name. A malformed line is reported by its line
-# number, never by its contents, because its contents may be a credential.
+# THE ENVIRONMENT INPUT NEVER TOUCHES THIS SHELL AND NEVER AN ARGV. Its lines
+# are written to a 0600 file and with-environment.py puts them into the child's
+# environment as a dictionary before execvpe, so a line naming `mode` or
+# `inventory` cannot rewrite a decision this script already made, no shell
+# assignment evaluates a value (bash treats RANDOM's and SECONDS' as
+# arithmetic), and no process ever carries a value as an argument. Names that
+# would change how Ansible or the runner behaves (ANSIBLE_*, GITHUB_*,
+# RUNNER_*, PATH, HOME and their kin) are refused by name. A malformed line is
+# reported by its line number, never by its contents, because its contents may
+# be a credential.
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -46,8 +50,8 @@ checkout=$(cd "$here/../.." && pwd)
 
 # THE DECISIONS, FIXED BEFORE ANY INPUT IS READ. readonly, so nothing later in
 # this file can reassign them, whatever an input says; under a prefix the
-# environment input refuses by name, because the subshell that exports the
-# input's lines inherits these and an export of a readonly name fails there.
+# environment input refuses by name, so no line of the input can even be spelled
+# as one of them.
 readonly billet_action_mode=${BILLET_MODE:?}
 readonly billet_action_inventory=${BILLET_INVENTORY:?}
 readonly billet_action_playbook=${BILLET_PLAYBOOK:-junioryono.billet.fleet}
@@ -68,7 +72,9 @@ export ANSIBLE_FORCE_COLOR=0
 export ANSIBLE_NOCOLOR=1
 
 # --- the environment input: NAME=value lines for the child, and only the child ---
-child_env=()
+child_env_file="$billet_action_runner_temp/billet-child-env"
+rm -f "$child_env_file"
+(umask 077 && : >"$child_env_file")
 if [[ -n ${BILLET_ENVIRONMENT:-} ]]; then
   n=0
   while IFS= read -r line || [[ -n $line ]]; do
@@ -93,7 +99,7 @@ if [[ -n ${BILLET_ENVIRONMENT:-} ]]; then
         exit 1
         ;;
     esac
-    child_env+=("$line")
+    printf '%s\n' "$line" >>"$child_env_file"
   done <<<"$BILLET_ENVIRONMENT"
 fi
 # The raw block goes: every line it carried is in child_env now, and a child
@@ -102,22 +108,12 @@ fi
 unset BILLET_ENVIRONMENT
 
 # run_ansible runs an Ansible command with the environment input applied to
-# that process alone: a subshell exports the lines into ITS environment and
-# execs, so no value is ever an argument of any process (env(1) would carry
-# them in its own argv until it execs), and this shell's variables are never
-# touched. Every Ansible call goes through it, the listing and the render
-# included, so what the render judges is what the play will see: an inventory
-# that reads an option through lookup('env') renders with the same value.
-#
-# The `[@]+` form: an empty array under set -u is an unbound variable in bash
-# 3.2, which is what a macOS developer runs these scripts under.
+# that process alone, through with-environment.py. Every Ansible call goes
+# through it, the listing and the render included, so what the render judges is
+# what the play will see: an inventory that reads an option through
+# lookup('env') renders with the same value.
 run_ansible() {
-  (
-    for kv in "${child_env[@]+"${child_env[@]}"}"; do
-      export "${kv?}"
-    done
-    exec "$@"
-  )
+  python3 "$here/with-environment.py" "$child_env_file" -- "$@"
 }
 
 # --- the credentials, written 0600 from the environment ----------------------
@@ -229,10 +225,17 @@ while IFS= read -r line; do
   # arguments are judged inside python and never printed, because a
   # ProxyCommand may carry something an operator would not want in a log.
   verdict=$(printf '%s' "$json" | python3 -c '
-import json, re, sys
+import json, re, shlex, sys
 outer = json.loads(sys.stdin.read())
 inner = json.loads(outer["msg"])
-sshargs = " ".join(str(inner[k]) for k in ("common", "extra", "args"))
+# Ansible splits each argument string with shlex before handing it to ssh, so
+# -o StrictHostKeyChecking="no" reaches ssh unquoted; the judgement reads the
+# tokens ssh will see, and a string shlex cannot split is refused as unreadable.
+try:
+    sshargs = " ".join(" ".join(shlex.split(str(inner[k]))) for k in ("common", "extra", "args"))
+except ValueError:
+    print(inner["host"], inner["port"], "an SSH argument string that cannot be tokenised")
+    sys.exit(0)
 bad = None
 # Ansible boolean conversion of the variable, and OpenSSH spellings of an
 # option value: false is one, and whitespace around = is allowed.
@@ -297,7 +300,7 @@ if [[ $billet_action_mode == check ]]; then
 else
   run_ansible ansible-playbook "${args[@]}" "$billet_action_playbook" 2>&1 | tee "$log" || status=$?
   if [[ $status == 0 && $billet_action_prove == true ]]; then
-    BILLET_CHILD_ENV=$(printf '%s\n' "${child_env[@]+"${child_env[@]}"}") \
+    BILLET_CHILD_ENV_FILE="$child_env_file" \
       "$here/prove-idempotent.sh" "$expected" -- "${args[@]}" "$billet_action_playbook" || status=$?
     log="$billet_action_runner_temp/billet-converge-2.log"
   fi

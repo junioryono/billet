@@ -49,7 +49,7 @@ fi
 # and could-not-tell does not authorise a takeover.
 if command -v warp-cli >/dev/null 2>&1; then
   existing=$(timeout -k 5 30 warp-cli --accept-tos registration show 2>&1) || true
-  if ! grep -qiE 'registration missing|not registered|no registration' <<<"$existing"; then
+  if ! grep -qiE 'registration missing|missing registration|not registered|no registration' <<<"$existing"; then
     echo "::error::this runner has a WARP client whose registration state is not 'missing' (it answered: ${existing:-nothing}), so the action cannot enrol a registration it can later delete without deleting somebody's. Use a runner with no registration, or reach: none on a runner that already reaches the hosts."
     exit 1
   fi

@@ -4,9 +4,9 @@
 #
 #   prove-idempotent.sh <expected-hosts-file> -- <ansible-playbook arguments...>
 #
-# with BILLET_CHILD_ENV holding the environment input's lines, one per line,
-# applied to ansible-playbook the way converge.sh applies them: exported by a
-# subshell that execs, never into this shell and never as an argument.
+# with BILLET_CHILD_ENV_FILE naming the 0600 file of environment lines
+# converge.sh validated, applied to ansible-playbook the way converge.sh applies
+# them: through with-environment.py, never this shell and never an argument.
 #
 # STREAMED THROUGH tee, because a second converge that hangs (a drain that never
 # returns, a stalled image pull) would otherwise be killed at the job timeout
@@ -29,22 +29,15 @@ shift
 
 [[ -s $expected ]] || { echo "::error::the expected-hosts file $expected is missing or empty; nothing can be proved against no hosts"; exit 1; }
 
-child_env=()
-if [[ -n ${BILLET_CHILD_ENV:-} ]]; then
-  while IFS= read -r line || [[ -n $line ]]; do
-    [[ -n $line ]] && child_env+=("$line")
-  done <<<"$BILLET_CHILD_ENV"
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+child_env_file=${BILLET_CHILD_ENV_FILE:-}
+if [[ -z $child_env_file ]]; then
+  child_env_file="$RUNNER_TEMP/billet-child-env-empty"
+  (umask 077 && : >"$child_env_file")
 fi
 
-# A subshell that exports and execs, as converge.sh's run_ansible does: never
-# env(1), whose own argv would carry the values until it execs.
 log="$RUNNER_TEMP/billet-converge-2.log"
-(
-  for kv in "${child_env[@]+"${child_env[@]}"}"; do
-    export "${kv?}"
-  done
-  exec ansible-playbook "$@"
-) 2>&1 | tee "$log"
+python3 "$here/with-environment.py" "$child_env_file" -- ansible-playbook "$@" 2>&1 | tee "$log"
 
 recap=$(sed -n '/PLAY RECAP/,$p' "$log" | grep -E '^[^ ]+ +: +ok=' || true)
 printf '%s\n' "--- second-pass recap ---" "$recap"

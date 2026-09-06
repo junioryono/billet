@@ -118,6 +118,40 @@ func TestAnInventoryHostKeyCheckingFalseIsRefused(t *testing.T) {
 	if !strings.Contains(out, "cp-1 sets ansible_host_key_checking") {
 		t.Errorf("the refusal does not name the variable:\n%s", out)
 	}
+	// The SSH plugin's own alias outranks the generic variable, and the render
+	// must ask for it first; the fake answers from a fixture, so the recorded
+	// render expression is the only evidence the alias is read.
+	render := strings.Join(f.callsOf(t, "ansible"), "\n")
+	if !strings.Contains(render, "'checking': ansible_ssh_host_key_checking | default(ansible_host_key_checking | default(true))") {
+		t.Errorf("the render does not read the SSH plugin's alias before the generic variable:\n%s", render)
+	}
+}
+
+// NO SHELL ASSIGNMENT SEES A VALUE: a name bash treats specially (RANDOM's
+// value is evaluated as arithmetic, where a subscript can run a command) and a
+// name that collides with a launcher's own bookkeeping both reach the child as
+// plain variables holding exactly their text.
+func TestEnvironmentValuesAreNeverEvaluated(t *testing.T) {
+	t.Parallel()
+	f := newConvergeFixture(t)
+
+	canary := filepath.Join(f.dir, "canary")
+	out, err := f.run(t, convergeRun{environment: "RANDOM=x[$(touch " + canary + ")0]=0\nkv=first\nTOKEN=second\nSECONDS=$(touch " + canary + ")\n"})
+	if err != nil {
+		t.Fatalf("converge failed: %v\n%s", err, out)
+	}
+	if _, err := os.Stat(canary); err == nil {
+		t.Fatal("a value in the environment input was evaluated by a shell")
+	}
+	// RANDOM and SECONDS are bash's own in the fake's shell and are not
+	// re-exported by it, so what the record can show is that the canary was
+	// never touched and that the ordinary names arrived whole.
+	env := recordedEnv(t, f.pbEnv)
+	for name, want := range map[string]string{"kv": "first", "TOKEN": "second"} {
+		if env[name] != want {
+			t.Errorf("the child has %s=%q, want the literal %q", name, env[name], want)
+		}
+	}
 }
 
 // EVERY EXPECTED HOST RENDERS EXACTLY ONCE, or nothing is probed and nothing
@@ -239,10 +273,11 @@ func TestOtherSpellingsOfCheckingOffAreRefused(t *testing.T) {
 	t.Parallel()
 
 	for name, debug := range map[string]string{
-		"false":       debugLine("cp-1", "10.0.0.1", 22, "-o StrictHostKeyChecking=false") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
-		"spaced":      debugLine("cp-1", "10.0.0.1", 22, `-o "StrictHostKeyChecking = no"`) + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
-		"ssh alias":   debugLineChecking("cp-1", "10.0.0.1", "False") + "\n" + debugLineChecking("node-a", "10.0.0.2", true) + "\n",
-		"checkhostip": debugLine("cp-1", "10.0.0.1", 22, "-o CheckHostIP=false") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"false":        debugLine("cp-1", "10.0.0.1", 22, "-o StrictHostKeyChecking=false") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"spaced":       debugLine("cp-1", "10.0.0.1", 22, `-o "StrictHostKeyChecking = no"`) + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"ssh alias":    debugLineChecking("cp-1", "10.0.0.1", "False") + "\n" + debugLineChecking("node-a", "10.0.0.2", true) + "\n",
+		"checkhostip":  debugLine("cp-1", "10.0.0.1", 22, "-o CheckHostIP=false") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"quoted value": debugLine("cp-1", "10.0.0.1", 22, `-o StrictHostKeyChecking="no"`) + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -358,8 +393,8 @@ func TestARecapWithAMissingCounterOrAnExtraHostFails(t *testing.T) {
 	})
 }
 
-// THE ENVIRONMENT INPUT REACHES THE SECOND PASS TOO, through the same env(1)
-// path; a proof that ran without the tokens would find the connector roles
+// THE ENVIRONMENT INPUT REACHES THE SECOND PASS TOO, through the same
+// launcher; a proof that ran without the tokens would find the connector roles
 // skipping and call that idempotent.
 func TestTheSecondPassCarriesTheEnvironmentInput(t *testing.T) {
 	t.Parallel()

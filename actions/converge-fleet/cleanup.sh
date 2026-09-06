@@ -18,7 +18,7 @@ set -u
 
 failed=0
 
-for f in "$RUNNER_TEMP/billet-ssh-key" "$RUNNER_TEMP/billet-app-key.pem"; do
+for f in "$RUNNER_TEMP/billet-ssh-key" "$RUNNER_TEMP/billet-app-key.pem" "$RUNNER_TEMP/billet-child-env" "$RUNNER_TEMP/billet-child-env-empty"; do
   if ! rm -f "$f" || [[ -e $f ]]; then
     echo "::error::$f could not be removed"
     failed=1
@@ -31,7 +31,7 @@ if [[ -f "$RUNNER_TEMP/billet-warp-registered" ]]; then
   timeout -k 5 60 warp-cli --accept-tos disconnect || echo "::warning::warp-cli disconnect failed; continuing with the registration"
   if output=$(timeout -k 5 60 warp-cli --accept-tos registration delete 2>&1); then
     registration_gone=1
-  elif grep -qiE 'registration missing|not registered|no registration' <<<"$output"; then
+  elif grep -qiE 'registration missing|missing registration|not registered|no registration' <<<"$output"; then
     echo "the registration is already gone"
     registration_gone=1
   else

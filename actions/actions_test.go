@@ -179,6 +179,7 @@ func TestTheBuilderStarterIsExecutable(t *testing.T) {
 		"converge-fleet/converge.sh",
 		"converge-fleet/prove-idempotent.sh",
 		"converge-fleet/cleanup.sh",
+		"converge-fleet/with-environment.py",
 	} {
 		info, err := os.Stat(filepath.FromSlash(name))
 		if err != nil {
