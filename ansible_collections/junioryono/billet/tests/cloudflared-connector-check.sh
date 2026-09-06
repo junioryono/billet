@@ -74,6 +74,12 @@ EOF
 # catches it.
 sed -e 's/^    - role: junioryono.billet.cloudflared_connector$/    - role: junioryono.billet.cloudflared_connector\n      vars:\n        billet_cloudflared_token_env: BILLET_CLOUDFLARED_TOKEN_NODE_A/' "$work/play.yml" >"$work/play-rolevar.yml"
 
+# The same again with the role skipped on the first host, which is the shape
+# that defeated a run_once assertion: Ansible picks the first host for the
+# task before evaluating its inherited `when`, so the assertion ran nowhere
+# and the two later hosts sharing one name went on to read one credential.
+sed -e 's/^    - role: junioryono.billet.cloudflared_connector$/    - role: junioryono.billet.cloudflared_connector\n      when: inventory_hostname != "node-a"\n      vars:\n        billet_cloudflared_token_env: BILLET_CLOUDFLARED_TOKEN_NODE_B/' "$work/play.yml" >"$work/play-cond.yml"
+
 # run <name> <expect> [env NAME=value ...] -- [ansible args ...]
 #
 # The temporary root is recreated unless BILLET_TEST_KEEP_ROOT=1 is among the
@@ -108,7 +114,7 @@ run() {
     # shells (measured: the serial case ran the previous case's play and the
     # staged allowance leaked into every later refusal), so a case's settings
     # are cleared here and each case states its own.
-    BILLET_TEST_STAGED=; BILLET_TEST_PLAY=
+    BILLET_TEST_STAGED=; BILLET_TEST_PLAY=; BILLET_TEST_FAILS=
 }
 
 # The token must be in the token file and nowhere else: not in any fake's
@@ -191,6 +197,7 @@ expected_unit >"$work/expected.service"
 cmp -s "$unit" "$work/expected.service" || { echo "FAIL: the rendered unit is not byte-equal to the installer's:" >&2; diff "$work/expected.service" "$unit" >&2; exit 1; }
 grep -q '^systemctl .*daemon-reload' "$work/calls" || { echo "FAIL: systemd was not reloaded after the unit was written: $(cat "$work/calls")" >&2; exit 1; }
 awaited_current_invocation "the right token installs the connector"
+[ -f "$work/state/unit-enabled" ] || { echo "FAIL: the connector was not enabled: $(grep '^systemctl' "$work/calls")" >&2; exit 1; }
 no_secret_leaked "the right token installs the connector"
 cp -R "$work/root" "$work/root-installed"; cp -R "$work/state" "$work/state-installed"
 
@@ -309,7 +316,8 @@ run "a dry run over a unit carrying an inline token discloses nothing" pass BILL
 grep -Fq -- "--token $token_b" "$unit" || { echo "FAIL: a dry run rewrote the unit" >&2; exit 1; }
 # The service task did run and read the unit's status (a skipped task would
 # disclose nothing and prove nothing): the module's bare `show` is the record.
-grep -qE '^systemctl show cloudflared' "$work/calls" || { echo "FAIL: the dry run never asked systemd about the unit, so the disclosure was not exercised: $(grep '^systemctl' "$work/calls")" >&2; exit 1; }
+[ "$(grep -cE '^systemctl show cloudflared' "$work/calls")" -ge 2 ] || { echo "FAIL: the dry run did not run both service tasks against the unit, so the disclosure was not exercised: $(grep '^systemctl' "$work/calls")" >&2; exit 1; }
+grep -qE '^systemctl is-enabled cloudflared' "$work/calls" || { echo "FAIL: the dry run's enable task never asked systemd: $(grep '^systemctl' "$work/calls")" >&2; exit 1; }
 # The unit still carries it by construction; argv and the output must not.
 if grep -Fq -- "$token_b" "$work/calls"; then echo "FAIL: the adopted unit's token reached a command's argv" >&2; exit 1; fi
 if grep -Fq -- "$token_b" "$work/out.log"; then echo "FAIL: the adopted unit's token appears in the dry run's output" >&2; exit 1; fi
@@ -331,33 +339,41 @@ grep -q '^gpg .*--show-keys' "$work/calls" || { echo "FAIL: the key was never re
 
 # 18. Two hosts mapping to one variable name are refused before any host acts.
 printf 'node-a ansible_host=127.0.0.1\nnode.a ansible_host=127.0.0.1\n' >"$work/inventory.ini"
-run "two hosts sharing one token variable are refused" "read their cloudflared token from the same environment variable" \
+BILLET_TEST_FAILS="node-a node.a" run "two hosts sharing one token variable are refused" "read their cloudflared token from the same environment variable" \
     "BILLET_CLOUDFLARED_TOKEN_NODE_A=$token_a" -- -e "billet_cloudflared_expected_tunnel_id=$tunnel_a"
 [ ! -s "$work/calls" ] || { echo "FAIL: the collision refusal came after a fake was called" >&2; exit 1; }
 
 # 19. The same through an inventory override of the variable name, which is
 #     the hostvars path the collision check reads.
 printf 'node-a ansible_host=127.0.0.1\nnode-b ansible_host=127.0.0.1 billet_cloudflared_token_env=BILLET_CLOUDFLARED_TOKEN_NODE_A\n' >"$work/inventory.ini"
-run "two hosts sharing one token variable by override are refused" "read their cloudflared token from the same environment variable" \
+BILLET_TEST_FAILS="node-a node-b" run "two hosts sharing one token variable by override are refused" "read their cloudflared token from the same environment variable" \
     "BILLET_CLOUDFLARED_TOKEN_NODE_A=$token_a" -- -e "billet_cloudflared_expected_tunnel_id=$tunnel_a"
 [ ! -s "$work/calls" ] || { echo "FAIL: the override collision refusal came after a fake was called" >&2; exit 1; }
 
 # 19b. A name shared through a scope every host sees (-e) is refused too.
 printf 'node-a ansible_host=127.0.0.1\nnode-b ansible_host=127.0.0.1\n' >"$work/inventory.ini"
-run "two hosts sharing one token variable through -e are refused" "cloudflared token" \
+BILLET_TEST_FAILS="node-a node-b" run "two hosts sharing one token variable through -e are refused" "cloudflared token" \
     "BILLET_CLOUDFLARED_TOKEN_NODE_A=$token_a" -- -e "billet_cloudflared_expected_tunnel_id=$tunnel_a" -e billet_cloudflared_token_env=BILLET_CLOUDFLARED_TOKEN_NODE_A
 [ ! -s "$work/calls" ] || { echo "FAIL: the -e collision refusal came after a fake was called" >&2; exit 1; }
 
 # A name set on the role invocation itself, which the play-wide check cannot
 # see: refused by the per-host check, before any fake is called.
 printf 'node-a ansible_host=127.0.0.1\nnode-b ansible_host=127.0.0.1\n' >"$work/inventory.ini"
-BILLET_TEST_STAGED=staged BILLET_TEST_PLAY=play-rolevar run "a name the play-wide check cannot see is refused" "a variable the play-wide collision check could not see" \
+BILLET_TEST_STAGED=staged BILLET_TEST_PLAY=play-rolevar BILLET_TEST_FAILS=node-b run "a name the play-wide check cannot see is refused" "a variable the play-wide collision check could not see" \
     "BILLET_CLOUDFLARED_TOKEN_NODE_A=$token_a" -- -e "billet_cloudflared_expected_tunnel_id=$tunnel_a"
 # node-a's own name IS the computed one, so it converges; node-b, which reads
 # node-a's variable, is the host refused. The staged allowance is for node-a's
 # writes; node-b's row must be unchanged.
 sed -n '/PLAY RECAP/,$p' "$work/out.log" | grep -qE '^node-b +: +ok=[0-9]+ +changed=0 .*failed=1' || { echo "FAIL: node-b was not the host refused, unchanged" >&2; sed -n '/PLAY RECAP/,$p' "$work/out.log" >&2; exit 1; }
 sed -n '/PLAY RECAP/,$p' "$work/out.log" | grep -qE '^node-a +: .*failed=0' || { echo "FAIL: node-a, whose name is its own, was refused too" >&2; exit 1; }
+
+# The role skipped on the first host and two later hosts sharing a name
+# through the role's vars: node-c, which reads node-b's variable, must be the
+# host refused, unchanged; node-b's own name is the computed one, so it acts.
+printf 'node-a ansible_host=127.0.0.1\nnode-b ansible_host=127.0.0.1\nnode-c ansible_host=127.0.0.1\n' >"$work/inventory.ini"
+BILLET_TEST_STAGED=staged BILLET_TEST_PLAY=play-cond BILLET_TEST_FAILS=node-c run "a shared name behind a role skipped on the first host is refused" "a variable the play-wide collision check could not see" \
+    "BILLET_CLOUDFLARED_TOKEN_NODE_B=$token_a" -- -e "billet_cloudflared_expected_tunnel_id=$tunnel_a"
+sed -n '/PLAY RECAP/,$p' "$work/out.log" | grep -qE '^node-b +: .*failed=0' || { echo "FAIL: node-b, whose name is its own, was refused too" >&2; exit 1; }
 
 # 20. Two distinct hosts under serial: 1 converge, one batch at a time: the
 #     collision check reads the inventory, not a fact a later batch has not

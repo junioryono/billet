@@ -52,6 +52,12 @@ EOF
 # catches it.
 sed -e 's/^    - role: junioryono.billet.warp_connector$/    - role: junioryono.billet.warp_connector\n      vars:\n        billet_warp_connector_token_env: BILLET_WARP_CONNECTOR_TOKEN_NODE_A/' "$work/play.yml" >"$work/play-rolevar.yml"
 
+# The same again with the role skipped on the first host, which is the shape
+# that defeated a run_once assertion: Ansible picks the first host for the
+# task before evaluating its inherited `when`, so the assertion ran nowhere
+# and the two later hosts sharing one name went on to read one credential.
+sed -e 's/^    - role: junioryono.billet.warp_connector$/    - role: junioryono.billet.warp_connector\n      when: inventory_hostname != "node-a"\n      vars:\n        billet_warp_connector_token_env: BILLET_WARP_CONNECTOR_TOKEN_NODE_B/' "$work/play.yml" >"$work/play-cond.yml"
+
 run() {
     name=$1; expect=$2; shift 2
     envs=""
@@ -75,7 +81,7 @@ run() {
     # shells (measured: the serial case ran the previous case's play and the
     # staged allowance leaked into every later refusal), so a case's settings
     # are cleared here and each case states its own.
-    BILLET_TEST_STAGED=; BILLET_TEST_PLAY=
+    BILLET_TEST_STAGED=; BILLET_TEST_PLAY=; BILLET_TEST_FAILS=
 }
 
 printf 'node-a ansible_host=127.0.0.1\n' >"$work/inventory.ini"
@@ -133,32 +139,40 @@ if grep -q 'connector new' "$work/calls"; then echo "FAIL: a refused key did not
 
 # 7. Two hosts sharing one variable name are refused before any host acts.
 printf 'node-a ansible_host=127.0.0.1\nnode_a ansible_host=127.0.0.1\n' >"$work/inventory.ini"
-run "two hosts sharing one token variable are refused" "read their WARP connector token from the same environment variable" \
+BILLET_TEST_FAILS="node-a node_a" run "two hosts sharing one token variable are refused" "read their WARP connector token from the same environment variable" \
     "BILLET_WARP_CONNECTOR_TOKEN_NODE_A=$token" --
 [ ! -s "$work/calls" ] || { echo "FAIL: the collision refusal came after a fake was called" >&2; exit 1; }
 
 # 8. The same through an inventory override of the variable name.
 printf 'node-a ansible_host=127.0.0.1\nnode-b ansible_host=127.0.0.1 billet_warp_connector_token_env=BILLET_WARP_CONNECTOR_TOKEN_NODE_A\n' >"$work/inventory.ini"
-run "two hosts sharing one token variable by override are refused" "read their WARP connector token from the same environment variable" \
+BILLET_TEST_FAILS="node-a node-b" run "two hosts sharing one token variable by override are refused" "read their WARP connector token from the same environment variable" \
     "BILLET_WARP_CONNECTOR_TOKEN_NODE_A=$token" --
 [ ! -s "$work/calls" ] || { echo "FAIL: the override collision refusal came after a fake was called" >&2; exit 1; }
 
 # 8b. A name shared through a scope every host sees (-e) is refused too.
 printf 'node-a ansible_host=127.0.0.1\nnode-b ansible_host=127.0.0.1\n' >"$work/inventory.ini"
-run "two hosts sharing one token variable through -e are refused" "WARP connector token" \
+BILLET_TEST_FAILS="node-a node-b" run "two hosts sharing one token variable through -e are refused" "WARP connector token" \
     "BILLET_WARP_CONNECTOR_TOKEN_NODE_A=$token" -- -e billet_warp_connector_token_env=BILLET_WARP_CONNECTOR_TOKEN_NODE_A
 [ ! -s "$work/calls" ] || { echo "FAIL: the -e collision refusal came after a fake was called" >&2; exit 1; }
 
 # A name set on the role invocation itself, which the play-wide check cannot
 # see: refused by the per-host check, before any fake is called.
 printf 'node-a ansible_host=127.0.0.1\nnode-b ansible_host=127.0.0.1\n' >"$work/inventory.ini"
-BILLET_TEST_STAGED=staged BILLET_TEST_PLAY=play-rolevar run "a name the play-wide check cannot see is refused" "a variable the play-wide collision check could not see" \
+BILLET_TEST_STAGED=staged BILLET_TEST_PLAY=play-rolevar BILLET_TEST_FAILS=node-b run "a name the play-wide check cannot see is refused" "a variable the play-wide collision check could not see" \
     "BILLET_WARP_CONNECTOR_TOKEN_NODE_A=$token" --
 # node-a's own name IS the computed one, so it converges; node-b, which reads
 # node-a's variable, is the host refused. The staged allowance is for node-a's
 # writes; node-b's row must be unchanged.
 sed -n '/PLAY RECAP/,$p' "$work/out.log" | grep -qE '^node-b +: +ok=[0-9]+ +changed=0 .*failed=1' || { echo "FAIL: node-b was not the host refused, unchanged" >&2; sed -n '/PLAY RECAP/,$p' "$work/out.log" >&2; exit 1; }
 sed -n '/PLAY RECAP/,$p' "$work/out.log" | grep -qE '^node-a +: .*failed=0' || { echo "FAIL: node-a, whose name is its own, was refused too" >&2; exit 1; }
+
+# The role skipped on the first host and two later hosts sharing a name
+# through the role's vars: node-c, which reads node-b's variable, must be the
+# host refused, unchanged; node-b's own name is the computed one, so it acts.
+printf 'node-a ansible_host=127.0.0.1\nnode-b ansible_host=127.0.0.1\nnode-c ansible_host=127.0.0.1\n' >"$work/inventory.ini"
+BILLET_TEST_STAGED=staged BILLET_TEST_PLAY=play-cond BILLET_TEST_FAILS=node-c run "a shared name behind a role skipped on the first host is refused" "a variable the play-wide collision check could not see" \
+    "BILLET_WARP_CONNECTOR_TOKEN_NODE_B=$token" --
+sed -n '/PLAY RECAP/,$p' "$work/out.log" | grep -qE '^node-b +: .*failed=0' || { echo "FAIL: node-b, whose name is its own, was refused too" >&2; exit 1; }
 
 # 9. Two distinct hosts under serial: 1: the collision check reads the
 #    inventory, so the first batch does not fail on a fact the second has not

@@ -176,6 +176,11 @@ EOF
 # key is fetched into a private staging directory BEFORE it is verified, and
 # that fetch is a change; what the refusal must precede there is the trusted
 # path, which the caller proves by the keyring's absence.
+#
+# BILLET_TEST_FAILS names the hosts the refusal must come FROM, each with its
+# own failed=1 and changed=0 row: a run_once assertion that failed on one host
+# ends the play for the others without their ever having asserted anything,
+# and a judge that only asked "did the run fail" could not tell the two apart.
 judge() {
     name=$1; status=$2; log=$3; expect=$4; staged=${5:-}
 
@@ -206,6 +211,12 @@ judge() {
         if ! grep -Fq -- "$expect" "$log"; then
             echo "FAIL $name: refused, but not for the expected reason ($expect)" >&2; grep -A 20 'fatal:' "$log" >&2; exit 1
         fi
+        for h in ${BILLET_TEST_FAILS:-}; do
+            if ! sed -n '/PLAY RECAP/,$p' "$log" | grep -qE "^$h +: +ok=[0-9]+ +changed=0 .*failed=1"; then
+                echo "FAIL $name: $h must be a host that refused, unchanged, and its row says otherwise" >&2
+                sed -n '/PLAY RECAP/,$p' "$log" >&2; exit 1
+            fi
+        done
     fi
     echo "ok   $name"
 }
