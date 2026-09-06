@@ -7,6 +7,13 @@
 # group_vars, byte for byte.
 all:
   children:
+    # The fleet playbook targets three groups; the two this example does not
+    # populate are declared empty so a strict host-pattern setting
+    # (ANSIBLE_HOST_PATTERN_MISMATCH=error) cannot fail a play with nothing to do.
+    control_plane:
+      hosts: {}
+    macos:
+      hosts: {}
     linux:
       hosts:
         billet-fc-1:

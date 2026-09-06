@@ -495,14 +495,36 @@ func TestGenerateHybridPinsOneRelease(t *testing.T) {
 		t.Error("both hosts must pin billet_version to the release")
 	}
 
+	// THE INVENTORY DECLARES EVERY GROUP THE PLAYBOOK TARGETS, the empty macos
+	// one included, because a targeted group the inventory never declares fails
+	// the run under ANSIBLE_HOST_PATTERN_MISMATCH=error after the earlier plays
+	// have converged.
+	var inventory struct {
+		All struct {
+			Children map[string]any `yaml:"children"`
+		} `yaml:"all"`
+	}
+	if err := yaml.Unmarshal([]byte(files[HybridInventoryFile]), &inventory); err != nil {
+		t.Fatalf("inventory.yml is not YAML: %v", err)
+	}
+	for _, group := range []string{"control_plane", "linux", "macos"} {
+		if _, ok := inventory.All.Children[group]; !ok {
+			t.Errorf("inventory.yml must declare the %s group the fleet playbook targets, got %v", group, inventory.All.Children)
+		}
+	}
+
+	// THE PLAYBOOK IS THE COLLECTION'S, imported by its fully qualified name, so
+	// the release the requirements pin is the release whose plays run; the
+	// order (control plane first) lives in the collection and is pinned by
+	// tests/fleet-playbook-check.sh there.
 	var site []struct {
-		Hosts string `yaml:"hosts"`
+		Import string `yaml:"import_playbook"`
 	}
 	if err := yaml.Unmarshal([]byte(files[HybridSiteFile]), &site); err != nil {
 		t.Fatalf("site.yml is not YAML: %v", err)
 	}
-	if len(site) != 2 || site[0].Hosts != "control_plane" || site[1].Hosts != "linux" {
-		t.Errorf("site.yml must converge the control plane first, then the local host, got %+v", site)
+	if len(site) != 1 || site[0].Import != "junioryono.billet.fleet" {
+		t.Errorf("site.yml must import junioryono.billet.fleet and nothing else, got %+v", site)
 	}
 }
 
