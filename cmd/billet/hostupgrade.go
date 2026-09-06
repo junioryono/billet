@@ -86,8 +86,8 @@ func cmdHostUpgrade(ctx context.Context, args []string) error {
 	status := fs.Bool("status", false,
 		"report what this machine holds — a transaction in progress, its journal, the "+
 			"fleet decision it last acted on, and which release manifest produced it")
-	ackFD := fs.Int("ack-fd", 0,
-		"a descriptor to report acceptance or refusal on; a node passes this so a "+
+	ackPath := fs.String("ack-path", "",
+		"a Unix socket to report acceptance or refusal on; a node passes this so a "+
 			"preflight refusal reaches the control plane instead of being invisible")
 	fromRollout := fs.Bool("from-rollout", false,
 		"act on the rollout this deployment's ledger records, the way the scheduled "+
@@ -97,12 +97,19 @@ func cmdHostUpgrade(ctx context.Context, args []string) error {
 		return err
 	}
 
+	ack := newUpgradeAck(*ackPath)
+	defer ack.close()
+
 	if err := checkFleetInstruction(*rolloutID, *generation); err != nil {
+		ack.refuse(err)
+
 		return err
 	}
 
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
+		ack.refuse(err)
+
 		return err
 	}
 
@@ -118,17 +125,17 @@ func cmdHostUpgrade(ctx context.Context, args []string) error {
 		// ledger already holds, and the point of this mode is that nothing on the
 		// command line can retarget it.
 		if *pin != "" || *digest != "" || *rolloutID != "" || *generation != 0 || *resume ||
-			*reinstall || *ackFD != 0 {
-			return errors.New("--from-rollout takes its whole instruction from the ledger and " +
+			*reinstall || *ackPath != "" {
+			err := errors.New("--from-rollout takes its whole instruction from the ledger and " +
 				"accepts no --version, --manifest-sha256, --rollout, --generation, " +
-				"--reinstall, --resume or --ack-fd beside it")
+				"--reinstall, --resume or --ack-path beside it")
+			ack.refuse(err)
+
+			return err
 		}
 
 		return hostUpgradeFromRollout(ctx, cfg, *cfgPath, *skipVerify)
 	}
-
-	ack := newUpgradeAck(*ackFD)
-	defer ack.close()
 
 	if *resume {
 		err := resumeHostUpgrade(ctx, cfg)
@@ -182,10 +189,10 @@ func hostUpgradeFromRollout(ctx context.Context, cfg *config.Config, cfgPath str
 
 	target.skipVerify = skipVerify
 
-	// NO ACK FD. There is no node waiting on the far end of a pipe; the timer
+	// NO ACK SOCKET. There is no node waiting for an answer; the timer
 	// reads the exit status and the journal, and `billet host-upgrade --status`
 	// reads the rest.
-	return startHostUpgrade(ctx, cfg, cfgPath, target, newUpgradeAck(0))
+	return startHostUpgrade(ctx, cfg, cfgPath, target, newUpgradeAck(""))
 }
 
 // runningRelease is the release this binary is, as the upgrade decisions read

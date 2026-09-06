@@ -4,12 +4,14 @@ import (
 	"bufio"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/node"
@@ -49,24 +51,39 @@ func installedManifest(t *testing.T) *releasesource.Manifest {
 func ackReader(t *testing.T) (*upgradeAck, func() string) {
 	t.Helper()
 
-	r, w, err := os.Pipe()
+	dir, err := os.MkdirTemp("/tmp", "billet-ack-") //nolint:usetesting // t.TempDir exceeds Darwin's Unix socket address limit
 	if err != nil {
-		t.Fatalf("os.Pipe: %v", err)
+		t.Fatal(err)
 	}
 
-	t.Cleanup(func() { _ = r.Close() })
-	t.Cleanup(func() { _ = w.Close() })
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 
-	ack := &upgradeAck{f: w}
+	path := filepath.Join(dir, "ack")
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	// IT ONLY READS. An earlier version called ack.close() here, which MANUFACTURES
-	// a generic refusal when nothing was sent — so a test asserting that a refusal
-	// was reported could pass without the code under test having reported one.
-	// Closing the writer is the caller's business, exactly as it is cmdHostUpgrade's.
-	return ack, func() string {
-		_ = w.Close()
+	t.Cleanup(func() { _ = listener.Close() })
 
-		line, err := bufio.NewReader(r).ReadString('\n')
+	// Only observe: calling ack.close here would manufacture a missing refusal.
+	return newUpgradeAck(path), func() string {
+		if err := listener.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+
+		conn, err := listener.AcceptUnix()
+		if err != nil {
+			t.Fatalf("accept the updater's answer: %v", err)
+		}
+
+		defer func() { _ = conn.Close() }()
+
+		if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+
+		line, err := bufio.NewReader(conn).ReadString('\n')
 		if err != nil && !errors.Is(err, io.EOF) {
 			t.Errorf("read the updater's answer: %v", err)
 		}
