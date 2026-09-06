@@ -218,9 +218,12 @@ func TestFakeUpdaterProcess(t *testing.T) {
 
 	defer func() { _ = conn.Close() }()
 
-	if mode == "ledger-env" {
-		answer := AckRefused + "the ledger environment was missing or unrelated values were inherited"
+	if mode == "host-env" {
+		answer := AckRefused + "the required environment was missing or unrelated values were inherited"
 		if os.Getenv("BILLET_UPGRADE_TEST_DSN") == "postgres://fixture:private-fixture@localhost/ledger" &&
+			os.Getenv("AWS_ACCESS_KEY_ID") == "AKID-UPGRADE-FIXTURE" &&
+			os.Getenv("AWS_SECRET_ACCESS_KEY") == "upgrade-secret-fixture" &&
+			os.Getenv("AWS_SESSION_TOKEN") == os.Getenv("BILLET_FAKE_UPDATER_ANSWER") &&
 			os.Getenv("BILLET_UPGRADE_UNRELATED") == "" {
 			answer = AckAccepted
 		}

@@ -357,7 +357,7 @@ func (e ExecUpgrader) launch(binary string, args []string, spec nodeapi.UpgradeS
 // systemdRunArgs names one unit per instruction, so a redelivery cannot run beside it.
 func (e ExecUpgrader) systemdRunArgs(binary string, args []string, spec nodeapi.UpgradeSpec) []string {
 	unit := fmt.Sprintf("billet-host-upgrade-%s-g%d", spec.RolloutID, spec.Generation)
-	prefix := make([]string, 0, 10+len(args))
+	prefix := make([]string, 0, 13+len(args))
 	prefix = append(prefix,
 		"--unit="+unit,
 		"--description=billet host upgrade to "+spec.Version,
@@ -370,6 +370,14 @@ func (e ExecUpgrader) systemdRunArgs(binary string, args []string, spec nodeapi.
 		// With no '=value', systemd-run copies its own environment variable over
 		// the bus. Only the configured name is visible in argv, never the DSN.
 		prefix = append(prefix, "--setenv="+e.DSNEnv)
+	}
+
+	// Candidate probes on a combined-role host may read the App key from SSM.
+	// Preserve explicit credentials so losing them cannot select an instance role.
+	for _, name := range []string{"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"} {
+		if _, present := os.LookupEnv(name); present {
+			prefix = append(prefix, "--setenv="+name)
+		}
 	}
 
 	prefix = append(prefix, "--", binary)
