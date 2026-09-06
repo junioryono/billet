@@ -233,6 +233,10 @@ func releasePolicyFor(cfg *config.Config, skipVerify bool) (releasesource.Policy
 	}
 
 	if cfg.Release.SigningIdentity != "" {
+		if cfg.Release.SigningIdentity != policy.Identity ||
+			cfg.Release.SigningIssuer != policy.Issuer {
+			policy.SourceRepositoryURI = ""
+		}
 		policy.Identity = cfg.Release.SigningIdentity
 		policy.Issuer = cfg.Release.SigningIssuer
 	}

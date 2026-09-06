@@ -52,6 +52,8 @@ type Policy struct {
 	Identity string
 	// Issuer is the OIDC issuer that certificate must come from.
 	Issuer string
+	// SourceRepositoryURI binds a reusable workflow to the repository it builds.
+	SourceRepositoryURI string
 }
 
 // PolicyFor decides what verification a source demands.
@@ -80,9 +82,10 @@ func PolicyFor(src Source, identity, issuer string, skip bool) (Policy, error) {
 	if identity == "" && issuer == "" {
 		if src.IsDefault() {
 			return Policy{
-				Required: true,
-				Identity: DefaultSigningIdentity,
-				Issuer:   GitHubOIDCIssuer,
+				Required:            true,
+				Identity:            DefaultSigningIdentity,
+				Issuer:              GitHubOIDCIssuer,
+				SourceRepositoryURI: "https://github.com/" + DefaultRepo,
 			}, nil
 		}
 
@@ -115,5 +118,10 @@ func PolicyFor(src Source, identity, issuer string, skip bool) (Policy, error) {
 			"usable pattern: %w", err)
 	}
 
-	return Policy{Required: true, Identity: identity, Issuer: issuer}, nil
+	policy := Policy{Required: true, Identity: identity, Issuer: issuer}
+	if identity == DefaultSigningIdentity && issuer == GitHubOIDCIssuer {
+		policy.SourceRepositoryURI = "https://github.com/" + DefaultRepo
+	}
+
+	return policy, nil
 }

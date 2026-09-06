@@ -108,7 +108,7 @@ func TestTheUpdaterIsGivenTheWholeInstructionOnItsCommandLine(t *testing.T) {
 		ManifestSHA256: strings.Repeat("a", 64),
 		RolloutID:      "abc123",
 		Generation:     7,
-	}, "/etc/billet/billet.yaml")
+	}, "/etc/billet/billet.yaml", "/state/upgrade-ack-test")
 
 	line := strings.Join(got, " ")
 
@@ -118,6 +118,7 @@ func TestTheUpdaterIsGivenTheWholeInstructionOnItsCommandLine(t *testing.T) {
 		"--rollout abc123",
 		"--generation 7",
 		"--config /etc/billet/billet.yaml",
+		"--ack-path /state/upgrade-ack-test",
 	} {
 		if !strings.Contains(line, want) {
 			t.Errorf("the updater's command line does not carry %q: %s", want, line)
@@ -132,7 +133,7 @@ func TestTheUpdaterIsGivenTheWholeInstructionOnItsCommandLine(t *testing.T) {
 // nothing, and the updater refuses on a mismatch. Omitting the flag is what makes
 // "nobody pinned this" distinct from "this was pinned to nothing".
 func TestAnUnfencedUpgradePassesNoFenceFlags(t *testing.T) {
-	line := strings.Join(upgradeArgs(nodeapi.UpgradeSpec{Version: "v0.4.0"}, ""), " ")
+	line := strings.Join(upgradeArgs(nodeapi.UpgradeSpec{Version: "v0.4.0"}, "", "/state/upgrade-ack-test"), " ")
 
 	for _, unwanted := range []string{"--manifest-sha256", "--rollout", "--generation", "--config"} {
 		if strings.Contains(line, unwanted) {

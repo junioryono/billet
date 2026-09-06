@@ -71,8 +71,11 @@ fi
 # deployment identity and the mTLS CA's private key, invalidating every node
 # certificate in the fleet.
 mkdir -p "${STATE_DIR}"
-chown billet:billet "${STATE_DIR}"
-chmod 0700 "${STATE_DIR}"
+# The parent belongs to root: the service account may write its server child,
+# but must not rename the root node, kernel or upgrade directories beside it.
+# StateDirectory in the units creates each private child under its own identity.
+chown root:root "${STATE_DIR}"
+chmod 0755 "${STATE_DIR}"
 
 # CREATED RATHER THAN PACKAGED, so removing the package cannot erase a jail that
 # still holds guest state. The node unit makes this path writable through its

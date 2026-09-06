@@ -47,6 +47,10 @@ func newLedger() *ledger {
 	return &ledger{gone: map[string]int64{}, withdrawn: map[string]withdrawal{}}
 }
 
+func (*ledger) Lease(context.Context, string) (*alloc.Lease, error) {
+	return nil, alloc.ErrLeaseNotFound
+}
+
 // withdrawal is one host's withdrawal as the ledger was told it.
 //
 // DECLARED HERE AS WELL AS IN THE EXTERNAL TEST PACKAGE, because the two

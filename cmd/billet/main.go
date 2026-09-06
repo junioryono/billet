@@ -1535,6 +1535,11 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 		return enrollNode(ctx, cfg, bootstrapBase(cfg, *bootstrapAddr), *caFingerprint, *joinToken)
 	}
 
+	upgrader, err := nodeUpgrader(cfg, *cfgPath)
+	if err != nil {
+		return err
+	}
+
 	// LOADED BEFORE THE IDENTITY IS CLAIMED, because the certificate is what
 	// decides the identity. A node JOINS a deployment; it does not found one.
 	bundle, err := nodeBundle(cfg)
@@ -1655,9 +1660,7 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 	// runner refusing the command with a sentence an operator can act on is better
 	// than one attempting a transaction against a machine that is not shaped for
 	// it.
-	runnerOpts = append(runnerOpts, node.WithUpgrader(node.ExecUpgrader{
-		ConfigPath: *cfgPath,
-	}))
+	runnerOpts = append(runnerOpts, node.WithUpgrader(upgrader))
 
 	runner := node.New(client, cfg.Node.Name, client, p, slog.Default(), runnerOpts...)
 

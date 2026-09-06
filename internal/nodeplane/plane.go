@@ -626,6 +626,9 @@ func (p *Plane) recordGone(ctx context.Context, gone []goneNode) []goneNode {
 // commands and then had every Bind refused — which looked like a broken node
 // rather than a missing row.
 type Registrar interface {
+	// Lease supplies durable placement before a reported inventory grants ownership.
+	Lease(ctx context.Context, leaseID string) (*alloc.Lease, error)
+
 	// RegisterNode records the host and returns the row's new fencing epoch, which
 	// NodeGone must present to prove which incarnation it is talking about.
 	RegisterNode(ctx context.Context, reg alloc.NodeRegistration) (int64, error)
@@ -1121,6 +1124,11 @@ func (p *Plane) register(
 	ctx context.Context, req nodeapi.RegisterRequest, intent registrationIntent,
 	negotiated int, nodeWire nodeapi.Range,
 ) (nodeapi.RegisterResponse, error) {
+	if req.InventoryKnown && p.registrar != nil {
+		if err := checkInventoryPlacement(ctx, req.Node, req.Instances, p.registrar.Lease); err != nil {
+			return nodeapi.RegisterResponse{}, err
+		}
+	}
 	p.mu.Lock()
 	currentIntent := p.activeRegistration[req.Node]
 	p.mu.Unlock()
@@ -1394,6 +1402,11 @@ func (p *Plane) ReconcileInventory(
 		return 0, nil
 	}
 
+	// Placement reads may wait on the ledger; unrelated nodes must keep polling.
+	if err := checkInventoryPlacement(ctx, node, running, p.registrar.Lease); err != nil {
+		return 0, err
+	}
+
 	// THE INVENTORY, ITS FENCED LEDGER DECISION AND ITS OWNERSHIP ADOPTION ARE
 	// ONE ORDERED FACT. A completion cannot consume the previous snapshot in the
 	// gap, and a replacement cannot install a new incarnation while the old one
@@ -1410,10 +1423,8 @@ func (p *Plane) ReconcileInventory(
 	if !ok {
 		return 0, fmt.Errorf("%w: %s", ErrUnregistered, node)
 	}
-	if n.incarnation != "" && incarnation != "" && n.incarnation != incarnation {
-		return 0, fmt.Errorf(
-			"%w: node %q is registered by process %s and this report came from %s",
-			ErrSuperseded, node, n.incarnation, incarnation)
+	if err := supersededLocked(n, node, incarnation); err != nil {
+		return 0, err
 	}
 
 	freed, err := p.registrar.ResolveQuarantineFor(ctx, node, running, n.ledgerEpoch)
@@ -1423,6 +1434,40 @@ func (p *Plane) ReconcileInventory(
 	p.adoptOwnershipLocked(node, incarnation, running, true)
 
 	return freed, nil
+}
+
+// checkInventoryPlacement keeps a node's observation from becoming authority over
+// another host. Missing leases remain reportable so orphaned compute stays visible.
+func checkInventoryPlacement(ctx context.Context, node string, ids []string,
+	lookup func(context.Context, string) (*alloc.Lease, error),
+) error {
+	seen := make(map[string]struct{})
+	for _, id := range ids {
+		if _, duplicate := seen[id]; duplicate {
+			continue
+		}
+		seen[id] = struct{}{}
+		lease, err := lookup(ctx, id)
+		if errors.Is(err, alloc.ErrLeaseNotFound) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("nodeplane: could not verify reported lease %s: %w", id, err)
+		}
+		if lease == nil {
+			continue
+		}
+		placed := lease.Node
+		if placed == "" {
+			placed = lease.TargetNode
+		}
+		if placed != "" && placed != node {
+			return fmt.Errorf("%w: reported lease %s belongs to node %q, not %q",
+				ErrRefused, id, placed, node)
+		}
+	}
+
+	return nil
 }
 
 // CheckIncarnation reports whether a request came from the current node process.
