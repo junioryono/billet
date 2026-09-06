@@ -495,6 +495,24 @@ func TestGenerateHybridPinsOneRelease(t *testing.T) {
 		t.Error("both hosts must pin billet_version to the release")
 	}
 
+	// THE INVENTORY DECLARES EVERY GROUP THE PLAYBOOK TARGETS, the empty macos
+	// one included, because a targeted group the inventory never declares fails
+	// the run under ANSIBLE_HOST_PATTERN_MISMATCH=error after the earlier plays
+	// have converged.
+	var inventory struct {
+		All struct {
+			Children map[string]any `yaml:"children"`
+		} `yaml:"all"`
+	}
+	if err := yaml.Unmarshal([]byte(files[HybridInventoryFile]), &inventory); err != nil {
+		t.Fatalf("inventory.yml is not YAML: %v", err)
+	}
+	for _, group := range []string{"control_plane", "linux", "macos"} {
+		if _, ok := inventory.All.Children[group]; !ok {
+			t.Errorf("inventory.yml must declare the %s group the fleet playbook targets, got %v", group, inventory.All.Children)
+		}
+	}
+
 	// THE PLAYBOOK IS THE COLLECTION'S, imported by its fully qualified name, so
 	// the release the requirements pin is the release whose plays run; the
 	// order (control plane first) lives in the collection and is pinned by

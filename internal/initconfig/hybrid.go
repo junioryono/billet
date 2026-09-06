@@ -969,6 +969,12 @@ all:
 
           billet_config:
 %s            tiers: *billet_tier_catalogue
+
+    # The fleet playbook targets three groups. An empty one is declared so a
+    # strict host-pattern setting cannot fail a play that has nothing to do;
+    # a Mac added here gets development_host when billet_development_enabled.
+    macos:
+      hosts: {}
 `,
 		yamlScalar(p.Ref),
 		indentYAML(controller, "            "),

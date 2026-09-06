@@ -47,30 +47,34 @@ if [p["hosts"] for p in plays] != list(want):
 for play in plays:
     if "become" in play:
         sys.exit(f"fleet-playbook-check: the {play['hosts']} play sets become; development_host would run as root")
-    if not play.get("gather_facts", False):
-        sys.exit(f"fleet-playbook-check: the {play['hosts']} play does not gather facts; the roles read them")
+    if play.get("gather_facts") is not True:
+        sys.exit(f"fleet-playbook-check: the {play['hosts']} play does not gather facts (exactly true); the roles read them")
     pre = play.get("pre_tasks") or []
     first = pre[0] if pre else {}
     guard = first.get("ansible.builtin.include_role") or first.get("include_role") or {}
     if guard.get("name") != "junioryono.billet.host" or guard.get("tasks_from") != "converge-guard":
         sys.exit(f"fleet-playbook-check: the {play['hosts']} play's first pre_task is not the converge guard")
+    if first.get("tags") != ["always"] or (guard.get("apply") or {}).get("tags") != ["always"]:
+        sys.exit(f"fleet-playbook-check: the {play['hosts']} play's guard is not tagged always on the include and on what it includes; a run under --tags could skip it")
     roles = [r["role"] if isinstance(r, dict) else r for r in play.get("roles", [])]
     if roles != want[play["hosts"]]:
         sys.exit(f"fleet-playbook-check: the {play['hosts']} play runs {roles}, want {want[play['hosts']]}")
     for r in play["roles"]:
         if isinstance(r, dict) and r["role"] == "junioryono.billet.development_host":
-            if "billet_development_enabled" not in str(r.get("when", "")):
-                sys.exit(f"fleet-playbook-check: development_host in the {play['hosts']} play is not gated on billet_development_enabled")
+            if r.get("when") != "billet_development_enabled | default(false) | bool":
+                sys.exit(f"fleet-playbook-check: development_host in the {play['hosts']} play is not gated on exactly `billet_development_enabled | default(false) | bool`, got {r.get('when')!r}")
 print("ok   the playbook has the shape the collection documents")
 EOF
 
 # --- the guard fires before ssh_access ----------------------------------------
 #
-# One local host in each Linux group, a key configured for both, and a
-# billet-managed RUNNER_NAME: each play, run alone with -l, must be refused by
-# the guard, and the key file must not exist afterwards. Alone, because a play
-# whose every host failed ends the playbook, so one run would prove the first
-# play's guard and nothing about the second's.
+# One local host in each Linux group, an EMPTY macos group, a key configured
+# for both, and a billet-managed RUNNER_NAME: each play, run alone with -l,
+# must be refused by the guard, and the key file must not exist afterwards.
+# Alone, because a play whose every host failed ends the playbook, so one run
+# would prove the first play's guard and nothing about the second's. Under
+# ANSIBLE_HOST_PATTERN_MISMATCH=error, because an inventory that declares the
+# three groups, empty ones included, is the contract that setting tests.
 cat >"$work/inventory.yml" <<EOF
 all:
   vars:
@@ -91,12 +95,26 @@ all:
     linux:
       hosts:
         node-1: {}
+    macos:
+      hosts: {}
 EOF
 mkdir -p "$work/sshd_config.d"
 
+# EVERY PLAY'S PATTERN RESOLVES against an inventory that declares the three
+# groups with the macos one empty, under the strict setting. --list-hosts
+# resolves every play without running one, which the guard runs below cannot
+# (a refused first play ends the playbook before the macos play is reached);
+# an undeclared group fails here with "Could not match supplied host pattern".
+if ! env ANSIBLE_HOST_PATTERN_MISMATCH=error \
+        ANSIBLE_COLLECTIONS_PATH="$collections_root:$HOME/.ansible/collections:/usr/share/ansible/collections" \
+        ansible-playbook --list-hosts -i "$work/inventory.yml" "$playbook" >"$work/list.log" 2>&1; then
+    echo "FAIL: a play's group did not resolve under ANSIBLE_HOST_PATTERN_MISMATCH=error with every group declared" >&2; tail -5 "$work/list.log" >&2; exit 1
+fi
+echo "ok   every play resolves under strict host-pattern handling with the contract inventory"
+
 for host in cp-1 node-1; do
     status=0
-    env RUNNER_NAME=billet-lease-abc123 \
+    env RUNNER_NAME=billet-lease-abc123 ANSIBLE_HOST_PATTERN_MISMATCH=error \
         ANSIBLE_COLLECTIONS_PATH="$collections_root:$HOME/.ansible/collections:/usr/share/ansible/collections" \
         ANSIBLE_STDOUT_CALLBACK=default ANSIBLE_FORCE_COLOR=0 ANSIBLE_NOCOLOR=1 \
         ansible-playbook -i "$work/inventory.yml" -l "$host" -e ansible_become=false "$playbook" >"$work/out.log" 2>&1 || status=$?

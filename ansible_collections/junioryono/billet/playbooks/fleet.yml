@@ -23,7 +23,14 @@
 # job running the playbook from a runner billet manages. The host role refuses
 # that shape as its first task; the refusal is repeated here as the first task
 # of every play so that ssh_access, which runs before the host role, cannot
-# change a host before it fires.
+# change a host before it fires. Tagged `always`, and applied `always` to the
+# included tasks, so a run under --tags cannot skip it.
+#
+# THE INVENTORY DECLARES ALL THREE GROUPS, empty ones allowed (`macos: {hosts:
+# {}}`), which is what `billet init hybrid` and the examples write: a group a
+# play targets and the inventory never declares is a warning by default and a
+# failure under ANSIBLE_HOST_PATTERN_MISMATCH=error, after the earlier plays
+# have already converged. A macOS host gets no connector from this playbook.
 
 - name: billet control plane
   hosts: control_plane
@@ -33,6 +40,9 @@
       ansible.builtin.include_role:
         name: junioryono.billet.host
         tasks_from: converge-guard
+        apply:
+          tags: [always]
+      tags: [always]
   roles:
     - role: junioryono.billet.ssh_access
     - role: junioryono.billet.host
@@ -46,6 +56,9 @@
       ansible.builtin.include_role:
         name: junioryono.billet.host
         tasks_from: converge-guard
+        apply:
+          tags: [always]
+      tags: [always]
   roles:
     - role: junioryono.billet.ssh_access
     - role: junioryono.billet.host
@@ -62,6 +75,9 @@
       ansible.builtin.include_role:
         name: junioryono.billet.host
         tasks_from: converge-guard
+        apply:
+          tags: [always]
+      tags: [always]
   roles:
     - role: junioryono.billet.development_host
       when: billet_development_enabled | default(false) | bool
