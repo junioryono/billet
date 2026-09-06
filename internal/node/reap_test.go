@@ -41,7 +41,7 @@ func TestTheUpdaterIsReapedRatherThanReleased(t *testing.T) {
 
 	for _, decl := range file.Decls {
 		d, ok := decl.(*ast.FuncDecl)
-		if !ok || d.Name.Name != "StartUpgrade" || d.Recv == nil {
+		if !ok || d.Name.Name != "launch" || d.Recv == nil {
 			continue
 		}
 
@@ -49,7 +49,7 @@ func TestTheUpdaterIsReapedRatherThanReleased(t *testing.T) {
 	}
 
 	if dispatch == nil {
-		t.Fatal("ExecUpgrader.StartUpgrade is gone; this gate is watching a name that moved")
+		t.Fatal("ExecUpgrader.launch is gone; this gate is watching a name that moved")
 
 		// UNREACHABLE, AND SAID SO. t.Fatal ends the goroutine, but staticcheck
 		// does not model that here and reports the dereference below as a

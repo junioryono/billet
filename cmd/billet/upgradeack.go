@@ -2,51 +2,29 @@ package main
 
 import (
 	"fmt"
-	"os"
+	"net"
 	"strings"
+	"time"
 
 	"github.com/junioryono/billet/internal/node"
 )
 
-// upgradeAck tells whoever started this updater whether it took the job.
-//
-// WHY THIS EXISTS AT ALL: THE UPDATER IS DETACHED, AND A SPAWN IS NOT AN ANSWER.
-// A node that dispatched an upgrade returns as soon as the process starts, so
-// every refusal this program makes before it touches anything — a digest that
-// disagrees with the fleet's decision, a candidate this build cannot run, a claim
-// another upgrade already holds — was invisible to the control plane. The
-// coordinator recorded the host as draining and waited forever: the host keeps
-// running the old release, stays live, reports the same version, and no
-// registration ever contradicts it. One machine wedged the whole rollout, with
-// nothing anywhere saying why. A review caught it, and it was made worse by this
-// very change adding a new refusal.
-//
-// IT IS NOT A PROGRESS CHANNEL. It reports exactly one thing — did this updater
-// accept responsibility — and closes. Everything after that point is on the disk,
-// in the journal, which is what a resume and an operator read.
+// upgradeAck reports whether the updater took responsibility. Progress after
+// acceptance belongs to the recovery journal.
 type upgradeAck struct {
-	f    *os.File
+	path string
 	sent bool
 }
 
-// newUpgradeAck adopts the descriptor the caller passed, or nothing.
-//
-// AN ABSENT DESCRIPTOR IS NOT AN ERROR: an operator runs this command by hand and
-// has a terminal to read instead.
-func newUpgradeAck(fd int) *upgradeAck {
-	if fd <= 0 {
-		return &upgradeAck{}
-	}
-
-	return &upgradeAck{f: os.NewFile(uintptr(fd), "upgrade-ack")}
+// newUpgradeAck accepts an empty path for an operator running the command by hand.
+func newUpgradeAck(path string) *upgradeAck {
+	return &upgradeAck{path: path}
 }
 
-// accept says this updater has taken responsibility and the caller may stop
-// waiting. Everything that can refuse without consequence has already run.
+// accept follows every preflight that can refuse without consequence.
 func (a *upgradeAck) accept() { a.send(node.AckAccepted) }
 
-// refuse reports why nothing was done. A nil error, or an acceptance already
-// sent, writes nothing.
+// refuse leaves an acceptance already sent alone.
 func (a *upgradeAck) refuse(err error) {
 	if err == nil {
 		return
@@ -56,48 +34,34 @@ func (a *upgradeAck) refuse(err error) {
 }
 
 func (a *upgradeAck) send(line string) {
-	if a.f == nil || a.sent {
+	if a.path == "" || a.sent {
 		return
 	}
 
 	a.sent = true
 
-	// BOUNDED WITH ROOM FOR THE NEWLINE THIS ADDS. The reader takes MaxAckBytes+1
-	// so that a maximal payload still arrives terminated; truncating to the limit
-	// and then appending would be one byte over on the wire, and an answer the
-	// reader saw unterminated is one it refuses.
+	// Best effort: a node that has gone away cannot hold a claimed transaction.
+	conn, err := net.DialTimeout("unix", a.path, 5*time.Second) //nolint:noctx // best-effort answer has its own bound, independent of an interrupted transaction
+	if err != nil {
+		return
+	}
+
+	defer func() { _ = conn.Close() }()
+
+	if err := conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return
+	}
+
+	// Leave room for the newline in the reader's MaxAckBytes+1 limit.
 	if len(line) > node.MaxAckBytes {
 		line = line[:node.MaxAckBytes]
 	}
 
-	// BEST EFFORT, AND DELIBERATELY NOT FATAL. The caller may have gone away, and
-	// an updater that refused to proceed because nobody was listening would turn a
-	// diagnostic channel into a dependency of the upgrade.
-	_, _ = fmt.Fprintln(a.f, line)
-
-	// CLOSED IMMEDIATELY, so a caller reading this gets EOF rather than waiting on
-	// a descriptor an unbounded drain is holding open.
-	_ = a.f.Close()
-	a.f = nil
+	_, _ = fmt.Fprintln(conn, line)
 }
 
-// close ends the channel for an updater that neither accepted nor refused.
-//
-// AN UNEXPLAINED SILENCE IS STILL AN ANSWER, and it has to be one the reader can
-// act on: closing gives it EOF now instead of a wait that ends in a timeout the
-// operator then has to interpret.
+// close gives an unexplained exit a refusal the node can act on.
 func (a *upgradeAck) close() {
-	if a.f == nil {
-		return
-	}
-
-	if !a.sent {
-		a.send(node.AckRefused + "this updater stopped without saying why; look at " +
-			upgradeRoot + " on that machine")
-
-		return
-	}
-
-	_ = a.f.Close()
-	a.f = nil
+	a.send(node.AckRefused + "this updater stopped without saying why; look at " +
+		upgradeRoot + " on that machine")
 }
