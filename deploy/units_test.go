@@ -341,6 +341,47 @@ func TestTheBackupUnitRunsAsTheServiceAccountAndIsNotEnabledDirectly(t *testing.
 			"then never again, which reads exactly like a working schedule", deploy.BackupUnitName)
 	}
 
+	// THE SAME FENCE THE SERVER HAS. The backup is the other thing that opens the
+	// state directory, so on a host whose ledger lives on its own volume it must
+	// wait for that mount the way billet-server.service does. IN [Unit]: systemd
+	// reads RequiresMountsFor= only there and silently ignores it under
+	// [Service], and a substring test alone passes the ignored placement.
+	const fence = "\nRequiresMountsFor=/var/lib/billet/server\n"
+
+	fenceAt := strings.Index(deploy.BackupUnit, fence)
+	unitAt := strings.Index(deploy.BackupUnit, "\n[Unit]\n")
+	serviceAt := strings.Index(deploy.BackupUnit, "\n[Service]\n")
+
+	switch {
+	case fenceAt < 0:
+		t.Errorf("%s does not carry %q, so a failed ledger mount leaves the timer archiving "+
+			"whatever is at the path", deploy.BackupUnitName, strings.TrimSpace(fence))
+	case unitAt < 0 || serviceAt < 0:
+		t.Errorf("%s lacks a [Unit] or a [Service] section", deploy.BackupUnitName)
+	case fenceAt < unitAt || fenceAt > serviceAt:
+		// BOTH BOUNDS: before [Unit] is outside every section, after [Service]
+		// is the wrong one, and systemd ignores the directive in either place.
+		t.Errorf("%s carries RequiresMountsFor= outside [Unit], where systemd ignores it",
+			deploy.BackupUnitName)
+	}
+
+	// THE LEDGER'S ENVIRONMENT. A PostgreSQL controller's backup opens the
+	// ledger through the connection string the server reads from this file, and
+	// billet refuses an empty variable before it writes anything, so a backup
+	// unit that does not import it fails on every scheduled run of such a host.
+	envAt := strings.Index(deploy.BackupUnit, "\nEnvironmentFile=-/etc/billet/server.env\n")
+
+	switch {
+	case envAt < 0:
+		t.Errorf("%s does not import /etc/billet/server.env, so a PostgreSQL controller's "+
+			"backup has no connection string", deploy.BackupUnitName)
+	case serviceAt < 0 || envAt < serviceAt:
+		// IN [Service], where systemd reads it; under [Unit] it is ignored and
+		// the import is a line that does nothing.
+		t.Errorf("%s carries EnvironmentFile= outside [Service], where systemd ignores it",
+			deploy.BackupUnitName)
+	}
+
 	// AND THE TIMER IS THE THING THAT IS ENABLED, so it needs one.
 	if !strings.Contains(deploy.BackupTimer, "[Install]") {
 		t.Errorf("%s has no [Install] section, so `systemctl enable` cannot reach it",

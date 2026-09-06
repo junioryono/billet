@@ -41,7 +41,7 @@ This is a standing requirement, not a suggestion for large changes. Publishing u
 Run it from the repo root, as a **background task** (~3–6 min), and wait for the completion notification rather than polling:
 
 ```bash
-codex exec -m gpt-5.6-sol -c model_reasoning_effort="high" \
+codex exec -m gpt-6-astra -c model_reasoning_effort="high" \
   --sandbox read-only \
   -o /tmp/codex-billet-<topic>.md \
   -C /path/to/billet \
@@ -57,7 +57,7 @@ Details that each cost a debugging session to learn:
 
 - **The trailing `< /dev/null` is mandatory.** With an open non-TTY stdin — every background shell — `codex exec` prints "Reading additional input from stdin..." and hangs forever. Harmless in the foreground, so always include it.
 - **`--sandbox read-only`, and say "do not build or test" in the prompt.** A `go build` inside a long reasoning run recompiles the tree and is the most common way one of these dies mid-flight. You run every gate yourself anyway.
-- **Pass the model and reasoning effort explicitly.** Never rely on `~/.codex/config.toml` defaults; they vary per machine.
+- **Pass the model and reasoning effort explicitly.** Never rely on `~/.codex/config.toml` defaults; they vary per machine. `gpt-6-astra` needs Codex CLI 0.153 or newer: 0.145.0 answers it with a 400, "requires a newer version of Codex", before reading anything, so an old CLI is upgraded (`npm install -g @openai/codex@latest`) rather than pointed at an older model.
 - **State the design intent in the prompt.** A reviewer that does not know the App key must never be overwritten cannot tell you that it can be.
 - **Write output to a deterministic path** keyed to the topic, so a fresh shell can re-derive it after the notification.
 

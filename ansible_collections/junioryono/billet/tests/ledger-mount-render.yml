@@ -223,6 +223,66 @@
           mismatched name makes systemd refuse the mount unit (Where does not
           match the unit name), which fails closed but blocks every converge.
 
+    # THE BACKUP IS THE OTHER THING THAT OPENS THE DIRECTORY, and it carries the
+    # same fence on the same terms: the exact mount unit exactly when a volume is
+    # configured, RequiresMountsFor on the state directory always, both inside
+    # [Unit] where systemd reads them.
+    - name: Render the backup unit with and without a ledger volume
+      ansible.builtin.set_fact:
+        billet_backup_unit_plain: >-
+          {{ lookup('ansible.builtin.template', template_dir + '/billet-backup.service.j2',
+             template_vars={'billet_ledger_volume_id': '', 'billet_server_environment_path': '/etc/billet/server.env'}) }}
+        billet_backup_unit_ledger: >-
+          {{ lookup('ansible.builtin.template', template_dir + '/billet-backup.service.j2',
+             template_vars={'billet_ledger_volume_id': 'vol-0123456789abcdef0', 'billet_server_environment_path': '/etc/billet/server.env'}) }}
+
+    - name: The backup unit is fenced on the ledger the way the server is
+      ansible.builtin.assert:
+        that:
+          - billet_backup_unit_ledger | regex_findall('(?m)^Requires=(.*)$') | map('trim') | list == ['var-lib-billet-server.mount']
+          - billet_backup_unit_ledger | regex_findall('(?m)^After=(.*)$') | map('trim') | list | last == 'var-lib-billet-server.mount'
+          - billet_backup_unit_ledger | regex_findall('(?m)^RequiresMountsFor=(.*)$') | map('trim') | list == ['/var/lib/billet/server']
+          - billet_backup_unit_plain | regex_findall('(?m)^Requires=') | length == 0
+          - "'var-lib-billet-server.mount' not in billet_backup_unit_plain"
+          - billet_backup_unit_plain | regex_findall('(?m)^RequiresMountsFor=(.*)$') | map('trim') | list == ['/var/lib/billet/server']
+          # WHOLE LINES, by line number: a substring index of the name matches
+          # the comment that explains the directive (measured), so the line that
+          # IS each mount directive must sit between the line that IS [Unit] and
+          # the line that IS [Service]; before [Unit] is outside every section.
+          - (billet_backup_unit_ledger.splitlines()).index('[Unit]')
+            < (billet_backup_unit_ledger.splitlines()).index(billet_backup_unit_ledger.splitlines() | select('match', '^RequiresMountsFor=') | first)
+          - (billet_backup_unit_ledger.splitlines()).index('[Unit]')
+            < (billet_backup_unit_ledger.splitlines()).index(billet_backup_unit_ledger.splitlines() | select('match', '^Requires=') | first)
+          - (billet_backup_unit_ledger.splitlines()).index(billet_backup_unit_ledger.splitlines() | select('match', '^Requires=') | first)
+            < (billet_backup_unit_ledger.splitlines()).index('[Service]')
+          - (billet_backup_unit_ledger.splitlines()).index('[Unit]')
+            < (billet_backup_unit_ledger.splitlines()).index(billet_backup_unit_ledger.splitlines() | select('match', '^After=var-lib-billet-server.mount$') | first)
+          - (billet_backup_unit_ledger.splitlines()).index(billet_backup_unit_ledger.splitlines() | select('match', '^After=var-lib-billet-server.mount$') | first)
+            < (billet_backup_unit_ledger.splitlines()).index('[Service]')
+          - (billet_backup_unit_plain.splitlines()).index('[Unit]')
+            < (billet_backup_unit_plain.splitlines()).index(billet_backup_unit_plain.splitlines() | select('match', '^RequiresMountsFor=') | first)
+          - (billet_backup_unit_ledger.splitlines() | select('match', '^RequiresMountsFor=') | list | length) == 1
+          - (billet_backup_unit_ledger.splitlines()).index(billet_backup_unit_ledger.splitlines() | select('match', '^RequiresMountsFor=') | first)
+            < (billet_backup_unit_ledger.splitlines()).index('[Service]')
+          - (billet_backup_unit_plain.splitlines() | select('match', '^RequiresMountsFor=') | list | length) == 1
+          - (billet_backup_unit_plain.splitlines()).index(billet_backup_unit_plain.splitlines() | select('match', '^RequiresMountsFor=') | first)
+            < (billet_backup_unit_plain.splitlines()).index('[Service]')
+        fail_msg: >-
+          billet-backup.service must require the exact ledger mount unit exactly when
+          billet_ledger_volume_id is set, carry RequiresMountsFor on the state
+          directory always, and keep both inside [Unit].
+
+    - name: The mount's Where and the backup unit's RequiresMountsFor name the same path
+      ansible.builtin.assert:
+        that:
+          - >-
+            billet_ledger_mount_unit_text | regex_findall('(?m)^Where=(.*)$') | first | trim ==
+            billet_backup_unit_ledger | regex_findall('(?m)^RequiresMountsFor=(.*)$') | first | trim
+        fail_msg: >-
+          The mount unit's Where and the backup unit's RequiresMountsFor no longer
+          name the same path; the backup would wait on a mount that never appears
+          or not on the one that does.
+
     - name: The mount's Where and the unit's RequiresMountsFor name the same path
       ansible.builtin.assert:
         that:

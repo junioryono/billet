@@ -20,6 +20,16 @@ Documentation=https://github.com/junioryono/billet/blob/main/docs/reference/reco
 After=network-online.target
 Wants=network-online.target
 
+# THE SAME FENCE THE SERVER HAS. On a host whose ledger lives on its own volume,
+# billet-server.service refuses to start until that volume is mounted, so a
+# failed mount cannot fork the deployment onto the root disk. This unit is the
+# other thing that opens the state directory, and without this line it would
+# run against whatever is at the path when the timer fires. RequiresMountsFor=
+# names the PATH, so systemd resolves whichever mount unit serves it, and on a
+# host with no mount unit for it the root filesystem satisfies it. In [Unit],
+# where systemd reads it; under [Service] it is silently ignored.
+RequiresMountsFor=/var/lib/billet/server
+
 [Service]
 Type=oneshot
 
@@ -31,6 +41,14 @@ User=billet
 Group=billet
 UMask=0077
 
+# THE LEDGER'S ENVIRONMENT, for a PostgreSQL controller: `dsn_env` names a
+# variable, the Ansible host role writes it to this file, and a backup opens
+# the ledger through the same connection the server uses (an identity-only
+# archive still opens it, and billet refuses an empty variable before writing
+# anything). With the leading `-`, so a SQLite host, where the file does not
+# exist, runs rather than failing.
+EnvironmentFile=-/etc/billet/server.env
+
 # The archive is a directory of 0600 files inside a 0700 directory, and it holds
 # TWO private keys. StateDirectory= creates this owned by the service account
 # with the mode below and nothing else on the machine can read it.
@@ -39,9 +57,11 @@ StateDirectoryMode=0700
 
 # EACH RUN WRITES A NEW DIRECTORY, because `billet local backup` refuses a
 # destination that is not empty — a backup is one whole unit and billet will not
-# mix one into a directory that already holds something. %H is the hostname and
-# the date makes the name unique; an operator wanting a different scheme edits
-# this line.
+# mix one into a directory that already holds something. The name is the UTC
+# time to the second (the doubled percent signs are systemd's escape for
+# date's own %Y, %m, %d, %H, %M and %S; nothing here is a systemd specifier, and
+# the hostname is not part of the name); an operator wanting a different scheme
+# edits this line.
 ExecStart=/usr/bin/sh -c '/usr/bin/billet local backup --config /etc/billet/billet.yaml --out /var/lib/billet/backups/$(date -u +%%Y-%%m-%%dT%%H-%%M-%%SZ)'
 
 # LOCAL COPIES ARE NOT PRUNED BY BILLET. Nothing here deletes an archive: every
