@@ -2,9 +2,10 @@ package node
 
 import (
 	"errors"
+	"fmt"
+	"net"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -140,29 +141,88 @@ func TestTheAnswerChannelIsBounded(t *testing.T) {
 	}
 }
 
-// fakeUpdater writes a script that answers on fd 3 the way a real updater would.
-//
-// A SCRIPT RATHER THAN A MOCK, because what is under test is the WIRING: whether
-// ExecUpgrader passes the descriptor, waits for the answer, and honours it. A
-// fake Upgrader would prove none of that — the defect this covers was three
-// fields built and never passed, in exactly the layer a mock replaces.
+// shortAckDir stays below Darwin's Unix socket address limit even in a test.
+func shortAckDir(t *testing.T) string {
+	t.Helper()
+
+	dir, err := os.MkdirTemp("/tmp", "billet-ack-") //nolint:usetesting // t.TempDir paths exceed Darwin's socket address limit
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Error(err)
+		}
+	})
+
+	return dir
+}
+
+// fakeUpdater executes the test binary so its answer uses a real Unix socket.
 func fakeUpdater(t *testing.T, answer string) string {
 	t.Helper()
 
-	path := filepath.Join(t.TempDir(), "updater.sh")
-
-	body := "#!/bin/sh\n"
-	if answer != "" {
-		body += "printf '%s\\n' " + strconv.Quote(answer) + " >&3\n"
+	mode := "answer"
+	if answer == "" {
+		mode = "silent"
 	}
 
-	body += "exit 0\n"
+	return fakeUpdaterMode(t, mode, answer)
+}
+
+func fakeUpdaterMode(t *testing.T, mode, answer string) string {
+	t.Helper()
+
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(t.TempDir(), "updater.sh")
+	body := "#!/bin/sh\nBILLET_FAKE_UPDATER_MODE=" + shellQuoteUpgrade(mode) +
+		" BILLET_FAKE_UPDATER_ANSWER=" + shellQuoteUpgrade(answer) + " exec " +
+		shellQuoteUpgrade(self) + " -test.run '^TestFakeUpdaterProcess$' -- \"$@\"\n"
 
 	if err := os.WriteFile(path, []byte(body), 0o700); err != nil {
-		t.Fatalf("write the fake updater: %v", err)
+		t.Fatal(err)
 	}
 
 	return path
+}
+
+func shellQuoteUpgrade(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
+}
+
+// TestFakeUpdaterProcess runs only when explicitly re-executed by the script.
+func TestFakeUpdaterProcess(t *testing.T) {
+	mode := os.Getenv("BILLET_FAKE_UPDATER_MODE")
+	if mode == "" || mode == "never" {
+		return
+	}
+
+	var path string
+
+	for i, arg := range os.Args {
+		if arg == "--ack-path" && i+1 < len(os.Args) {
+			path = os.Args[i+1]
+		}
+	}
+
+	dialer := net.Dialer{Timeout: 5 * time.Second}
+	conn, err := dialer.DialContext(t.Context(), "unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer func() { _ = conn.Close() }()
+
+	if mode == "answer" {
+		if _, err := fmt.Fprintln(conn, os.Getenv("BILLET_FAKE_UPDATER_ANSWER")); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 // THE DISPATCH WAITS FOR THE UPDATER'S ANSWER AND HONOURS IT.
@@ -172,7 +232,9 @@ func fakeUpdater(t *testing.T, answer string) string {
 // started — which is what the code did — left the rollout believing a host was
 // draining when the updater had already declined and exited.
 func TestTheDispatchReportsAnUpdaterThatRefused(t *testing.T) {
-	e := ExecUpgrader{Binary: fakeUpdater(t, AckRefused+"the release moved underneath")}
+	t.Setenv("INVOCATION_ID", "")
+
+	e := ExecUpgrader{Binary: fakeUpdater(t, AckRefused+"the release moved underneath"), AckDir: shortAckDir(t)}
 
 	err := e.StartUpgrade(t.Context(), nodeapi.UpgradeSpec{Version: "v0.4.0"})
 	if !errors.Is(err, ErrUpgradeRefused) {
@@ -186,7 +248,9 @@ func TestTheDispatchReportsAnUpdaterThatRefused(t *testing.T) {
 
 // AND AN UPDATER THAT ACCEPTED IS A SUCCESSFUL DISPATCH.
 func TestTheDispatchSucceedsWhenTheUpdaterAccepts(t *testing.T) {
-	e := ExecUpgrader{Binary: fakeUpdater(t, AckAccepted)}
+	t.Setenv("INVOCATION_ID", "")
+
+	e := ExecUpgrader{Binary: fakeUpdater(t, AckAccepted), AckDir: shortAckDir(t)}
 
 	if err := e.StartUpgrade(t.Context(), nodeapi.UpgradeSpec{Version: "v0.4.0"}); err != nil {
 		t.Errorf("a dispatch the updater accepted was reported as failing: %v", err)
@@ -198,11 +262,39 @@ func TestTheDispatchSucceedsWhenTheUpdaterAccepts(t *testing.T) {
 // The process started, which is all the old code checked, and then did nothing at
 // all. The control plane would have waited for a convergence that could not come.
 func TestTheDispatchReportsAnUpdaterThatSaidNothing(t *testing.T) {
-	e := ExecUpgrader{Binary: fakeUpdater(t, "")}
+	t.Setenv("INVOCATION_ID", "")
+
+	e := ExecUpgrader{Binary: fakeUpdater(t, ""), AckDir: shortAckDir(t)}
 
 	err := e.StartUpgrade(t.Context(), nodeapi.UpgradeSpec{Version: "v0.4.0"})
 	if !errors.Is(err, ErrUpgradeRefused) {
 		t.Fatalf("a silent updater returned %v, want ErrUpgradeRefused", err)
+	}
+
+	if !strings.Contains(err.Error(), "without saying why") {
+		t.Errorf("the connected updater did not report EOF: %v", err)
+	}
+}
+
+// A process that never connects must release the node's command slot too.
+func TestTheDispatchBoundsAnUpdaterThatNeverConnects(t *testing.T) {
+	t.Setenv("INVOCATION_ID", "")
+
+	original := ackWait
+	ackWait = 50 * time.Millisecond
+
+	t.Cleanup(func() { ackWait = original })
+
+	e := ExecUpgrader{Binary: fakeUpdaterMode(t, "never", ""), AckDir: shortAckDir(t)}
+	start := time.Now()
+	err := e.StartUpgrade(t.Context(), nodeapi.UpgradeSpec{Version: "v0.4.0"})
+
+	if !errors.Is(err, ErrUpgradeRefused) || !strings.Contains(err.Error(), "did not say within") {
+		t.Fatalf("a never-connected updater returned %v, want an acknowledgement timeout", err)
+	}
+
+	if time.Since(start) > time.Second {
+		t.Error("the accept deadline did not bound the dispatch")
 	}
 }
 

@@ -3,11 +3,15 @@ package node
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -41,9 +45,9 @@ func WithUpgrader(u Upgrader) Option {
 // ErrNoUpgrader means this node cannot replace its own billet.
 var ErrNoUpgrader = errors.New("node: this node has no transactional updater")
 
-// StartUpgrade launches the updater and returns as soon as it is running.
+// StartUpgrade launches the updater and waits only for it to accept responsibility.
 //
-// IT DOES NOT WAIT, AND THAT IS THE WHOLE CONTRACT. A node executes commands one
+// IT DOES NOT WAIT FOR THE TRANSACTION. A node executes commands one
 // at a time and each command's timeout starts when it is QUEUED, so an upgrade
 // carried out inline would hold the node's single slot for as long as the drain
 // takes — which is as long as the longest job, with no bound on it. Every other
@@ -74,7 +78,7 @@ func (r *Runner) StartUpgrade(ctx context.Context, spec nodeapi.UpgradeSpec) err
 // runs; the rollout id and generation are what let an operator who finds a
 // machine mid-upgrade know which fleet decision it belongs to. Sending only the
 // version turned a fenced instruction into a bare request to install a tag.
-func upgradeArgs(spec nodeapi.UpgradeSpec, configPath string) []string {
+func upgradeArgs(spec nodeapi.UpgradeSpec, configPath, ackPath string) []string {
 	args := []string{"host-upgrade", "--version", spec.Version}
 
 	if spec.ManifestSHA256 != "" {
@@ -93,8 +97,7 @@ func upgradeArgs(spec nodeapi.UpgradeSpec, configPath string) []string {
 		args = append(args, "--config", configPath)
 	}
 
-	// FD 3 IS WHERE THE UPDATER ANSWERS; see AckFD.
-	args = append(args, "--ack-fd", strconv.Itoa(AckFD))
+	args = append(args, "--ack-path", ackPath)
 
 	return args
 }
@@ -113,13 +116,8 @@ func upgradeArgs(spec nodeapi.UpgradeSpec, configPath string) []string {
 // A VAR RATHER THAN A CONST, so a test can prove the bound actually applies.
 // Without that this is an untested branch in the one mechanism standing between a
 // silent updater and a node that waits forever.
-// NO TEST THAT SWAPS THIS MAY CALL t.Parallel, and three of them swap it. They
-// are safe today by construction rather than by argument: a parallel test parks
-// at its t.Parallel() call until every serial test has finished, so a serial
-// test's mutation window cannot overlap a parallel test's read. EVERY OTHER TEST
-// IN upgradeack_test.go IS PARALLEL, which makes adding t.Parallel() to one of
-// the three the most natural-looking edit available and a data race the moment
-// it lands.
+// Tests that replace this must stay serial. Parallel reader tests park until all
+// serial tests finish, so their reads cannot overlap a mutation window.
 var ackWait = 90 * time.Second
 
 // ErrUpgradeRefused means the updater started, decided against the instruction,
@@ -140,12 +138,9 @@ var ErrUpgradeRefused = errors.New("node: the updater refused this upgrade")
 // EOF WITH NOTHING WRITTEN IS A REFUSAL TOO. It means the updater died before it
 // could say anything, which is exactly the case a silent spawn hid.
 //
-// THE DEADLINE IS NOT DECORATION. A descriptor passed through ExtraFiles is NOT
-// close-on-exec in the child, so anything the updater execs before it answers
-// inherits this pipe and holds it open past the updater's own exit — at which
-// point EOF never comes. Nothing in the updater spawns a process before it
-// answers, and this is what bounds the damage if something ever does.
-func awaitAck(r *os.File, version string) error {
+// A connected updater may stall before finishing its answer; the read deadline
+// bounds that separately from the listener's wait for a connection.
+func awaitAck(r ackConn, version string) error {
 	defer func() { _ = r.Close() }()
 
 	if err := r.SetReadDeadline(time.Now().Add(ackWait)); err != nil {
@@ -184,9 +179,7 @@ func awaitAck(r *os.File, version string) error {
 
 	case line == "" || incomplete:
 		if errors.Is(err, os.ErrDeadlineExceeded) {
-			return fmt.Errorf("%w: it did not say within %s whether it had taken the job; "+
-				"nothing here can tell whether it is installing %s or stuck, so look at "+
-				"/var/lib/billet/upgrades on this machine", ErrUpgradeRefused, ackWait, version)
+			return ackTimeout(version)
 		}
 
 		if line != "" {
@@ -197,9 +190,8 @@ func awaitAck(r *os.File, version string) error {
 		return fmt.Errorf("%w: it stopped without saying why", ErrUpgradeRefused)
 
 	default:
-		// QUOTED, AND SAFE TO QUOTE. This descriptor is inherited by a program this
-		// node execs, not by anything a job can reach, and the updater bounds and
-		// flattens what it writes.
+		// The socket is in the node's private state directory; the updater bounds
+		// and flattens the reason it writes.
 		return fmt.Errorf("%w: %s", ErrUpgradeRefused, strings.TrimPrefix(line, AckRefused))
 	}
 }
@@ -220,31 +212,33 @@ const (
 	// MaxAckBytes bounds what either end will write or read. An acknowledgement is
 	// one short line.
 	MaxAckBytes = 4 << 10
-	// AckFD is the child descriptor the answer travels on: the first after the
-	// standard three, which is what ExtraFiles[0] becomes in the child.
-	AckFD = 3
 )
 
-// ExecUpgrader runs billet's own updater as a detached process.
+// ackConn lets the bounded reader use a socket or a test pipe.
+type ackConn interface {
+	io.Reader
+	SetReadDeadline(deadline time.Time) error
+	Close() error
+}
+
+func ackTimeout(version string) error {
+	return fmt.Errorf("%w: it did not say within %s whether it had taken the job; "+
+		"nothing here can tell whether it is installing %s or stuck, so look at "+
+		"the upgrade journal on this machine", ErrUpgradeRefused, ackWait, version)
+}
+
+// ExecUpgrader runs billet's own updater outside the node's service lifetime.
 type ExecUpgrader struct {
 	// Binary is the billet to exec. Empty means the running executable.
 	Binary string
 	// ConfigPath is the config the updater reads.
 	ConfigPath string
+	// AckDir is the node's private, writable state directory.
+	AckDir string
 }
 
-// StartUpgrade execs `billet host-upgrade` and does not wait for it.
-//
-// DETACHED FROM THIS PROCESS'S CONTEXT, ON PURPOSE. The updater's whole job is to
-// stop the very service that started it, so inheriting a context this node
-// cancels on shutdown would kill the updater at the exact moment it succeeded —
-// leaving a machine with both services stopped and nothing running that knows
-// what to do about it. context.WithoutCancel is what breaks that link.
-//
-// Setpgid puts it in its own process group for the same reason: a signal sent to
-// the node's group must not reach a transaction midway through replacing a
-// binary.
-func (e ExecUpgrader) StartUpgrade(ctx context.Context, spec nodeapi.UpgradeSpec) error {
+// StartUpgrade waits only for the updater's acceptance or refusal, never its drain.
+func (e ExecUpgrader) StartUpgrade(_ context.Context, spec nodeapi.UpgradeSpec) error {
 	binary := e.Binary
 	if binary == "" {
 		self, err := os.Executable()
@@ -255,51 +249,87 @@ func (e ExecUpgrader) StartUpgrade(ctx context.Context, spec nodeapi.UpgradeSpec
 		binary = self
 	}
 
-	args := upgradeArgs(spec, e.ConfigPath)
+	if e.AckDir == "" {
+		return errors.New("node: the updater's answer needs the node's state directory")
+	}
 
-	reader, writer, err := os.Pipe()
+	ackPath := filepath.Join(e.AckDir, "upgrade-ack-"+rand.Text())
+
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: ackPath, Net: "unix"})
 	if err != nil {
 		return fmt.Errorf("node: open the updater's answer channel: %w", err)
 	}
 
-	defer func() { _ = writer.Close() }()
+	// Close unlinks the socket on every exit, including a failed launch.
+	defer func() { _ = listener.Close() }()
 
-	// NOT CommandContext. The updater must outlive this process, and
-	// CommandContext kills the child when the context ends — which for a node is
-	// the moment the updater successfully stops it.
-	cmd := exec.Command(binary, args...) //nolint:noctx // see the comment above: the updater must outlive this process
+	if err := e.launch(binary, upgradeArgs(spec, e.ConfigPath, ackPath), spec); err != nil {
+		return err
+	}
+
+	if err := listener.SetDeadline(time.Now().Add(ackWait)); err != nil {
+		return fmt.Errorf("node: bound the wait for the updater to connect: %w", err)
+	}
+
+	conn, err := listener.AcceptUnix()
+	if err != nil {
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			return ackTimeout(spec.Version)
+		}
+
+		return fmt.Errorf("node: accept the updater's answer: %w", err)
+	}
+
+	return awaitAck(conn, spec.Version)
+}
+
+// underSystemd and systemdRun are seams for exercising both launch shapes.
+// Tests replacing either must stay serial, as must tests replacing ackWait.
+var (
+	underSystemd = func() bool { return runtime.GOOS == "linux" && os.Getenv("INVOCATION_ID") != "" }
+	systemdRun   = "systemd-run"
+)
+
+// launch escapes systemd's mount namespace and cgroup through the system manager.
+// A setsid child escapes a launch agent, but remains inside a systemd service.
+func (e ExecUpgrader) launch(binary string, args []string, spec nodeapi.UpgradeSpec) error {
+	if underSystemd() {
+		// No CommandContext: the transaction must survive the node's shutdown.
+		//nolint:noctx,gosec // the updater must outlive the node; systemdRun is a fixed binary name, variable only for tests
+		cmd := exec.Command(systemdRun, systemdRunArgs(binary, args, spec)...)
+
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("node: start the updater for %s through systemd-run: %w: %s",
+				spec.Version, err, strings.TrimSpace(string(out)))
+		}
+
+		return nil
+	}
+
+	cmd := exec.Command(binary, args...) //nolint:noctx // the updater must outlive the node
 	cmd.SysProcAttr = detachedAttr()
-	cmd.ExtraFiles = []*os.File{writer}
 
 	if err := cmd.Start(); err != nil {
-		_ = reader.Close()
-
 		return fmt.Errorf("node: start the updater for %s: %w", spec.Version, err)
 	}
 
-	// REAPED IN THE BACKGROUND, AND Release WAS WRONG HERE.
-	//
-	// Release drops Go's handle on the process; it does not reparent it. The node
-	// is still the parent, so an updater that exits leaves a zombie until the node
-	// itself exits — which the original reasoning assumed was imminent, because a
-	// SUCCESSFUL updater stops this very service. A REFUSED one does not: the node
-	// keeps running, the rollout retries every few minutes, and the process table
-	// fills with the corpses of updaters that declined.
-	//
-	// Waiting neither signals the child nor ties it to this process's lifetime, so
-	// the detachment is unaffected; the goroutine simply sits until the updater
-	// ends, which for a successful upgrade is after this node has been stopped.
-	// THE STATUS IS NOT READ BECAUSE REAPING IS THE WHOLE PURPOSE. Whether the
-	// updater succeeded is answered by the acknowledgement below and then by the
-	// host's next registration; this only stops a refused one becoming a zombie.
+	// Release does not reparent a child. Reap refusals while the node keeps serving.
 	go func() { _ = cmd.Wait() }() //nolint:errcheck // reaping is the purpose; the outcome arrives on the answer channel
 
-	// THIS END IS CLOSED BEFORE READING, or the read never sees EOF: the parent's
-	// own copy of the write end would hold the pipe open forever and an updater
-	// that died silently would look like one still thinking.
-	_ = writer.Close()
+	return nil
+}
 
-	_ = ctx
+// systemdRunArgs names one unit per instruction, so a redelivery cannot run beside it.
+func systemdRunArgs(binary string, args []string, spec nodeapi.UpgradeSpec) []string {
+	unit := fmt.Sprintf("billet-host-upgrade-%s-g%d", spec.RolloutID, spec.Generation)
+	prefix := make([]string, 0, 9+len(args))
+	prefix = append(prefix,
+		"--unit="+unit,
+		"--description=billet host upgrade to "+spec.Version,
+		"--service-type=oneshot", "--collect", "--quiet", "--no-block",
+		// Match the scheduled root updater's largest drain plus teardown and margin.
+		"--property=TimeoutStartSec=88200", "--", binary,
+	)
 
-	return awaitAck(reader, spec.Version)
+	return append(prefix, args...)
 }

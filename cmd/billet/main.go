@@ -1657,6 +1657,7 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 	// it.
 	runnerOpts = append(runnerOpts, node.WithUpgrader(node.ExecUpgrader{
 		ConfigPath: *cfgPath,
+		AckDir:     cfg.Node.StateDir,
 	}))
 
 	runner := node.New(client, cfg.Node.Name, client, p, slog.Default(), runnerOpts...)

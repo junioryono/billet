@@ -51,6 +51,9 @@ billet's suite is 450-odd `_test.go` files across unit tests, structural tests t
 
 ## Measured facts
 
+- A fake updater that must dial a Unix socket re-executes the test binary through a two-line shell script with an explicit mode and `-test.run '^TestFakeUpdaterProcess$' -- "$@"`; the Go helper finds `--ack-path`, dials and writes, dials and exits for EOF, or never dials for the accept timeout. A shell alone has no portable socket client. Use a cleaned-up `os.MkdirTemp("/tmp", ...)` for socket directories: macOS `t.TempDir` paths exceed the Unix address limit. Tests changing `ackWait`, `underSystemd` or `systemdRun` stay serial.
+- Named pipes cannot replace this socket: a FIFO with no writer reads EOF immediately, and holding a writer open hides an updater's death. On Darwin Go does not poll FIFOs (kqueue, Go issue 24164), so `SetReadDeadline` refuses with "file type does not support deadline"; reported by the probes for #98 on 2026-09-06. Unix sockets support the bound on both platforms.
+
 - Discarded-error vacuity: seven instances (five in `internal/alloc`, two in `internal/github`).
 - `errcheck` on tests: 19 sites, two real bugs.
 - The onboarding fake's concurrent slice read survived six clean `-race` runs.
