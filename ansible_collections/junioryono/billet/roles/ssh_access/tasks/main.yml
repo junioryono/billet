@@ -1,0 +1,355 @@
+---
+# SSH access for a converge: the keys a converge connects with, an operator's
+# break-glass key beside them, and sshd hardened only once those leave a way in.
+#
+# WHY THE ROLE EXISTS. Every fleet converged from CI needs the same three
+# things on every host, and every consumer wrote its own role for them; the
+# reference deployment's carried the one rule worth shipping, which is that
+# password authentication is never turned off on a host with no key installed.
+# That rule is an assertion here, before anything is written, and it cannot be
+# gated: a `when: key is defined` on the install beside an unconditional
+# hardening is exactly the asymmetry that once produced a green run and a host
+# reachable only from its console.
+#
+# A KEY IS EXACTLY A TYPE, ITS MATERIAL AND AN OPTIONAL COMMENT, AND ITS IDENTITY
+# IS THE MATERIAL. ansible.posix.authorized_key removes a key by its material
+# alone and replaces the options of a key it already holds (measured in the
+# module's source, 2.2.2), so a line that carries options, a value that spans
+# lines, two entries for one material, or the same material under two types
+# are each a way for the last task to decide what the guard was meant to. This
+# role refuses every one of them before it writes, and judges every rule on the
+# material. A key that needs options is not this role's to install.
+#
+# NOTHING CONFIGURED, NOTHING DONE. The collection's fleet playbook is meant to
+# run this role on every host (until it ships, a consumer lists the role before
+# the host role), so an inventory that says nothing about SSH must converge
+# exactly as it did before this role existed.
+
+- name: Decide what this host's inventory asks of SSH access
+  ansible.builtin.set_fact:
+    billet_ssh_entries: "{{ billet_ssh_authorized_keys | default([]) }}"
+    billet_ssh_breakglass: "{{ billet_ssh_breakglass_key | default('') | trim }}"
+
+- name: Report that no SSH access is configured for this host
+  ansible.builtin.debug:
+    msg: >-
+      billet_ssh_authorized_keys is empty and billet_ssh_breakglass_key is not
+      set, so the ssh_access role installs no key and hardens nothing on
+      {{ inventory_hostname }}. This is not a failure.
+  when:
+    - billet_ssh_entries | length == 0
+    - billet_ssh_breakglass | length == 0
+
+- name: Configure SSH access
+  when: billet_ssh_entries | length > 0 or billet_ssh_breakglass | length > 0
+  block:
+    # THE ACCOUNT THE KEYS ARE FOR, discovered when the inventory does not name
+    # it: a connection may select its user through SSH configuration and leave
+    # ansible_user unset, which the hybrid generation deliberately allows.
+    # Asked of the host without escalation, so the answer is the connecting
+    # account and not root.
+    - name: Discover the account this converge connects as
+      ansible.builtin.command:
+        argv: [id, -un]
+      register: billet_ssh_whoami
+      changed_when: false
+      check_mode: false
+      become: false
+      vars:
+        # A task variable outranks an inventory's ansible_become, so the answer
+        # is the connecting account even where the inventory escalates.
+        ansible_become: false
+      when: (billet_ssh_user | default('') | trim) | length == 0
+
+    - name: Settle the account the keys are installed for
+      ansible.builtin.set_fact:
+        billet_ssh_account: >-
+          {{ (billet_ssh_user | default('') | trim)
+             if (billet_ssh_user | default('') | trim) | length > 0
+             else (billet_ssh_whoami.stdout | default('') | trim) }}
+
+    - name: Refuse an authorized-key entry with no key or an unknown state
+      ansible.builtin.assert:
+        that:
+          - item.key is defined
+          - (item.key | trim) | length > 0
+          - (item.state | default('present')) in ['present', 'absent']
+        fail_msg: >-
+          billet_ssh_authorized_keys carries an entry with no key or a state that
+          is neither present nor absent. Every entry names the whole public key
+          line and, optionally, the state it should be in.
+      loop: "{{ billet_ssh_entries }}"
+      loop_control:
+        label: "{{ (item.key | default('') | split)[:2] | join(' ') }}"
+
+    # THE GRAMMAR, AND THE IDENTITY. A line is a type, a space, the material,
+    # and optionally a space and a comment; nothing before the type (no options)
+    # and nothing across lines. The material is what the module removes by and
+    # therefore what every rule below compares.
+    - name: Compute the keys this converge leaves installed
+      vars:
+        # No control character anywhere (a carriage return or a newline inside
+        # a value would carry a second line the module reads and this grammar
+        # would not), and the comment may not itself hold a key pair.
+        billet_ssh_key_line: '^(ssh-[a-z0-9-]+|ecdsa-sha2-[a-z0-9-]+|sk-[a-z0-9@.-]+) ([A-Za-z0-9+/]+=*)( [^\x00-\x1f\x7f]*)?$'
+      ansible.builtin.set_fact:
+        billet_ssh_present_lines: >-
+          {{ billet_ssh_entries | rejectattr('state', 'defined') | map(attribute='key') | map('trim') | list
+             + billet_ssh_entries | selectattr('state', 'defined') | selectattr('state', 'equalto', 'present') | map(attribute='key') | map('trim') | list }}
+        billet_ssh_absent_lines: >-
+          {{ billet_ssh_entries | selectattr('state', 'defined') | selectattr('state', 'equalto', 'absent') | map(attribute='key') | map('trim') | list }}
+        billet_ssh_all_lines: "{{ billet_ssh_entries | map(attribute='key') | map('trim') | list + ([billet_ssh_breakglass] if billet_ssh_breakglass | length > 0 else []) }}"
+        billet_ssh_root_policy: "{{ billet_ssh_permit_root_login | string | trim | lower }}"
+        billet_ssh_key_grammar: "{{ billet_ssh_key_line }}"
+        billet_ssh_key_pair: '(ssh-[a-z0-9-]+|ecdsa-sha2-[a-z0-9-]+|sk-[a-z0-9@.-]+) [A-Za-z0-9+/]+=*'
+
+    - name: Refuse a value this role does not read as a key
+      ansible.builtin.assert:
+        that:
+          - billet_ssh_all_lines | reject('match', billet_ssh_key_grammar) | list | length == 0
+          - billet_ssh_all_lines | map('regex_findall', billet_ssh_key_pair) | map('length') | reject('equalto', 1) | list | length == 0
+        fail_msg: >-
+          A value in billet_ssh_authorized_keys or billet_ssh_breakglass_key on
+          {{ inventory_hostname }} is not exactly one public key: a type, the
+          material and an optional comment on one line, with nothing in front of
+          the type. Options (a forced command, from=, expiry-time) and values
+          that span lines are refused, because the module installs and removes
+          by the material and this role cannot judge what an option leaves
+          usable; a key that needs options is not this role's to install. A
+          comment or a blank where a key should be is refused for the same
+          reason: nothing would be installed and the hardening would count it.
+
+    # A LINE THAT PARSES IS NOT A KEY. The module installs whatever material it
+    # is given and sshd -t reads no authorized_keys file, so a well-formed line
+    # with material that decodes to nothing would be installed, counted as the
+    # way in, and refused by sshd at login. Every key this converge installs is
+    # asked of ssh-keygen on the host first; the absent ones are not, because
+    # a value that is not a key removes nothing.
+    - name: Prove every key this converge installs is one sshd can read
+      ansible.builtin.command:
+        argv: [ssh-keygen, -l, -f, "-"]
+        stdin: "{{ item }}"
+      register: billet_ssh_keygen
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      loop: "{{ billet_ssh_present_lines + ([billet_ssh_breakglass] if billet_ssh_breakglass | length > 0 else []) }}"
+      loop_control:
+        label: "{{ (item | split)[:1] | join }} {{ (item | split)[2:] | join(' ') }}"
+
+    - name: Refuse material ssh-keygen cannot read as a public key
+      ansible.builtin.assert:
+        that:
+          - billet_ssh_keygen.results | map(attribute='rc') | reject('equalto', 0) | list | length == 0
+        fail_msg: >-
+          A key this converge would install on {{ inventory_hostname }} is not one
+          ssh-keygen can read ({{ billet_ssh_keygen.results | rejectattr('rc', 'equalto', 0) | map(attribute='stderr') | list | join('; ') }}).
+          The module would install the line anyway, the hardening would count it
+          as the way in, and sshd would refuse it at login.
+
+    - name: Compute the material of every key
+      ansible.builtin.set_fact:
+        billet_ssh_present_ids: "{{ billet_ssh_present_lines | map('split') | map(attribute=1) | list }}"
+        billet_ssh_absent_ids: "{{ billet_ssh_absent_lines | map('split') | map(attribute=1) | list }}"
+        billet_ssh_breakglass_id: "{{ (billet_ssh_breakglass | split)[1] if billet_ssh_breakglass | length > 0 else '' }}"
+
+    - name: Refuse one key with two states, or two entries for one key
+      ansible.builtin.assert:
+        that:
+          - billet_ssh_present_ids | intersect(billet_ssh_absent_ids) | length == 0
+          - billet_ssh_present_ids | unique(case_sensitive=true) | length == billet_ssh_present_ids | length
+          - billet_ssh_breakglass_id | length == 0 or billet_ssh_breakglass_id not in billet_ssh_absent_ids
+        fail_msg: >-
+          A key on {{ inventory_hostname }} appears more than once in this
+          converge: as present and absent, twice as present, or as the
+          break-glass key beside an absent entry with the same material under
+          any type or comment. The module installs and removes by the material,
+          so the last task to run would win. Say one thing about it.
+
+    - name: Refuse a break-glass key that is also a converge key
+      ansible.builtin.assert:
+        that:
+          - billet_ssh_breakglass_id | length == 0 or billet_ssh_breakglass_id not in billet_ssh_present_ids
+        fail_msg: >-
+          billet_ssh_breakglass_key on {{ inventory_hostname }} is the same key as
+          a present entry in billet_ssh_authorized_keys. The break-glass key is
+          the way in when the converge key is revoked or lost, and one private
+          key is not two.
+
+    - name: Refuse to harden sshd on a host the converge would leave with no way in
+      ansible.builtin.assert:
+        that:
+          - not (billet_ssh_harden | bool)
+            or billet_ssh_present_ids | length > 0
+            or billet_ssh_breakglass_id | length > 0
+        fail_msg: >-
+          billet_ssh_harden is true and this converge would install no key for
+          {{ billet_ssh_account }} on {{ inventory_hostname }}: every entry in
+          billet_ssh_authorized_keys is absent and billet_ssh_breakglass_key is
+          empty. The hardening below turns password authentication off, and with
+          no key installed that leaves only the console. Refusing before anything
+          is written.
+
+    - name: Refuse a root-login policy sshd would not read as written
+      ansible.builtin.assert:
+        that:
+          - billet_ssh_root_policy in ['yes', 'no', 'prohibit-password', 'forced-commands-only']
+        fail_msg: >-
+          billet_ssh_permit_root_login is "{{ billet_ssh_permit_root_login }}", which
+          is none of yes, no, prohibit-password or forced-commands-only.
+
+    - name: Refuse to lock out the account the keys are installed for
+      ansible.builtin.assert:
+        that:
+          - not (billet_ssh_harden | bool)
+            or billet_ssh_account != 'root'
+            or billet_ssh_root_policy in ['yes', 'prohibit-password']
+        fail_msg: >-
+          The keys would be installed for root and the hardening would then set
+          PermitRootLogin {{ billet_ssh_root_policy }}, which refuses root's login
+          whichever key it presents (forced-commands-only needs a forced command
+          these keys do not carry). Connect as another account, or set
+          billet_ssh_permit_root_login to prohibit-password.
+
+    - name: Install the break-glass key
+      ansible.posix.authorized_key:
+        user: "{{ billet_ssh_account }}"
+        key: "{{ billet_ssh_breakglass }}"
+        state: present
+        path: "{{ billet_ssh_authorized_keys_path | default('', true) or omit }}"
+        manage_dir: "{{ billet_ssh_authorized_keys_path | default('', true) | length == 0 }}"
+      become: true
+      when: billet_ssh_breakglass | length > 0
+
+    # EVERY PRESENT KEY BEFORE ANY ABSENT ONE, whatever order the inventory
+    # lists them in: a rotation written as the old key absent and the new key
+    # present must not have a moment, on an already hardened host, with the old
+    # key gone and the new one not yet there.
+    - name: Install each present converge key
+      ansible.posix.authorized_key:
+        user: "{{ billet_ssh_account }}"
+        key: "{{ item }}"
+        state: present
+        path: "{{ billet_ssh_authorized_keys_path | default('', true) or omit }}"
+        manage_dir: "{{ billet_ssh_authorized_keys_path | default('', true) | length == 0 }}"
+      become: true
+      loop: "{{ billet_ssh_present_lines }}"
+      loop_control:
+        label: "{{ (item | split)[:1] | join }} {{ (item | split)[2:] | join(' ') }}"
+
+    - name: Remove each absent converge key
+      ansible.posix.authorized_key:
+        user: "{{ billet_ssh_account }}"
+        key: "{{ item }}"
+        state: absent
+        path: "{{ billet_ssh_authorized_keys_path | default('', true) or omit }}"
+        manage_dir: "{{ billet_ssh_authorized_keys_path | default('', true) | length == 0 }}"
+      become: true
+      loop: "{{ billet_ssh_absent_lines }}"
+      loop_control:
+        label: "{{ (item | split)[:1] | join }} {{ (item | split)[2:] | join(' ') }}"
+
+    # VALIDATED AS THE CONFIGURATION SSHD WILL READ, NOT AS A FRAGMENT. A
+    # drop-in that parses on its own can still make the whole configuration
+    # unsatisfiable (an AuthenticationMethods elsewhere that requires the
+    # password this turns off), and sshd refuses to start on that. So the
+    # drop-in is written with a backup, the whole configuration is checked, and
+    # a refusal puts the previous file back or removes the new one before the
+    # play fails. On Ubuntu 24.04 and later sshd is socket activated, so an
+    # invalid configuration does not fail a restart: the socket keeps accepting
+    # and every new connection dies parsing it, which reads as "SSH stopped
+    # working" beside a green run.
+    - name: Harden sshd
+      when: billet_ssh_harden | bool
+      block:
+        # WHAT WAS THERE BEFORE, recorded by this role rather than inferred from
+        # the copy's return: a copy that failed before it took a backup returns
+        # no backup_file either, and reading that as "nothing was there" would
+        # delete a working drop-in.
+        - name: Inspect the hardening drop-in already in place
+          ansible.builtin.stat:
+            path: "{{ billet_ssh_sshd_config_dir }}/{{ billet_ssh_hardening_file }}"
+          register: billet_ssh_hardening_before
+          check_mode: false
+          become: true
+
+        - name: Write the hardening drop-in
+          ansible.builtin.copy:
+            dest: "{{ billet_ssh_sshd_config_dir }}/{{ billet_ssh_hardening_file }}"
+            mode: "0644"
+            backup: true
+            content: |
+              # Managed by the junioryono.billet.ssh_access role.
+              #
+              # Password authentication stays off: the way in is a key this role
+              # installed, and the role refuses to write this file on a host where
+              # its own converge would leave none.
+              PasswordAuthentication no
+              KbdInteractiveAuthentication no
+              PermitRootLogin {{ billet_ssh_root_policy }}
+          register: billet_ssh_hardening
+          become: true
+
+        # THE RESTART IS OWED ONLY TO A CONFIGURATION SSHD ACCEPTED, so it is
+        # this task that notifies, and only when the drop-in changed: a
+        # notification queued on the copy would restart sshd after a rollback,
+        # onto whichever other file sshd was refusing.
+        - name: Validate the whole sshd configuration with the drop-in in place
+          ansible.builtin.command: "{{ billet_ssh_validate_command }}"
+          register: billet_ssh_validation
+          changed_when: billet_ssh_hardening is changed
+          notify: Restart sshd
+          become: true
+          when:
+            - billet_ssh_hardening is changed
+            - not ansible_check_mode
+      rescue:
+        # The copy may never have run (the stat before it failed), so every
+        # reading of its result is defaulted; an absent result is "unchanged".
+        - name: Put the previous drop-in back
+          ansible.builtin.copy:
+            src: "{{ billet_ssh_hardening.backup_file }}"
+            dest: "{{ billet_ssh_sshd_config_dir }}/{{ billet_ssh_hardening_file }}"
+            remote_src: true
+            mode: "0644"
+          become: true
+          when:
+            - (billet_ssh_hardening | default({})) is changed
+            - (billet_ssh_hardening | default({})).backup_file is defined
+
+        - name: Remove the drop-in sshd refused
+          ansible.builtin.file:
+            path: "{{ billet_ssh_sshd_config_dir }}/{{ billet_ssh_hardening_file }}"
+            state: absent
+          become: true
+          when:
+            - (billet_ssh_hardening | default({})) is changed
+            - not (billet_ssh_hardening_before | default({})).stat.exists | default(true)
+
+        - name: Fail on the configuration sshd refused
+          ansible.builtin.fail:
+            msg: >-
+              {{ 'sshd refused the configuration with the hardening drop-in in place on '
+                 ~ inventory_hostname ~ '; the previous state was put back. '
+                 ~ ((billet_ssh_validation | default({})).stderr | default(''))
+                 if (billet_ssh_hardening | default({})) is changed
+                 else 'the hardening could not be applied on ' ~ inventory_hostname
+                      ~ ': ' ~ (ansible_failed_result.msg | default('')) }}
+
+    - name: Set the hostname from the inventory
+      ansible.builtin.hostname:
+        name: "{{ inventory_hostname }}"
+      become: true
+      when: billet_ssh_hostname_from_inventory | bool
+
+    - name: Enable unattended security upgrades
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/20auto-upgrades
+        mode: "0644"
+        content: |
+          APT::Periodic::Update-Package-Lists "1";
+          APT::Periodic::Unattended-Upgrade "1";
+      become: true
+      when:
+        - billet_ssh_unattended_upgrades | bool
+        - ansible_facts['os_family'] | default('') == 'Debian'

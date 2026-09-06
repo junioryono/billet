@@ -190,6 +190,47 @@ func TestGenerateHybridPlanRenderLoadsOnBothHosts(t *testing.T) {
 	}
 }
 
+// THE INVENTORY NAMES THE SSH VARIABLES A CONSUMER FILLS IN, as a comment beside
+// the catalogue: a consumer that reaches the shipped playbook's ssh_access role
+// with no keys converges unchanged, and one that wants a CI converge finds the
+// two variables where its hosts are declared rather than in a role's defaults.
+func TestGenerateHybridInventoryNamesTheSSHAccessVariables(t *testing.T) {
+	t.Parallel()
+
+	files, _ := mustGenerateHybrid(t, hybridParams())
+
+	for _, want := range []string{"# billet_ssh_authorized_keys:", "# billet_ssh_breakglass_key:", "state: absent"} {
+		if !strings.Contains(files[HybridInventoryFile], want) {
+			t.Errorf("the inventory does not carry %q in its all.vars comment", want)
+		}
+	}
+
+	// A COMMENT, NOT A VALUE: nothing here may set a key, because a generated
+	// key is a key nobody holds. The examples live in all.vars, which is where
+	// a value would be set too, so that scope is read directly rather than
+	// through the per-host view that discards it.
+	var doc struct {
+		All struct {
+			Vars map[string]any `yaml:"vars"`
+		} `yaml:"all"`
+	}
+	if err := yaml.Unmarshal([]byte(files[HybridInventoryFile]), &doc); err != nil {
+		t.Fatalf("the inventory is not YAML: %v", err)
+	}
+	for _, key := range []string{"billet_ssh_authorized_keys", "billet_ssh_breakglass_key"} {
+		if _, set := doc.All.Vars[key]; set {
+			t.Errorf("all.vars sets %s; the generation must only name it", key)
+		}
+	}
+	for name, vars := range inventoryHosts(t, files[HybridInventoryFile]) {
+		for _, key := range []string{"billet_ssh_authorized_keys", "billet_ssh_breakglass_key"} {
+			if _, set := vars[key]; set {
+				t.Errorf("%s sets %s; the generation must only name it", name, key)
+			}
+		}
+	}
+}
+
 // EVERY PLACEHOLDER NAMES AN OUTPUT THE ROOT DECLARES. A placeholder for an
 // output that does not exist is a phase 2 that can never fill it; an output
 // nobody consumes is noise, so both directions are checked for the consumed

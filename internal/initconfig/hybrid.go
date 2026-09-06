@@ -864,6 +864,20 @@ func renderHybridInventory(
 # The runbook says which host to converge when; every step uses -l.
 all:
   vars:
+    # THE KEYS A CONVERGE CONNECTS WITH, installed on both hosts by the
+    # junioryono.billet.ssh_access role, which then turns password
+    # authentication off. A key CI holds and a break-glass key an operator holds,
+    # so revoking or losing either leaves the other; the role refuses to harden
+    # sshd on a host its converge would leave with no key. Revoke a key with
+    # state: absent while the line is still written out (the raw string this is
+    # rendered from cannot carry backticks), and delete the entry only after that
+    # has converged everywhere.
+    #
+    # billet_ssh_authorized_keys:
+    #   - key: "ssh-ed25519 AAAA... fleet-converge@ci"
+    #     state: present
+    # billet_ssh_breakglass_key: "ssh-ed25519 AAAA... operator@laptop"
+
     # THE TIER CATALOGUE, DEFINED ONCE AND CONSUMED BY BOTH HOSTS. The server
     # reads it at startup and turns each tier into a GitHub scale set; the
     # Firecracker node reads it to know which golden images it must be able to

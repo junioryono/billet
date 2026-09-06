@@ -1,0 +1,66 @@
+---
+# THE ACCOUNT THE KEYS ARE INSTALLED FOR: the one Ansible connects as, which is
+# the one a converge from CI will connect as next time. Empty (an inventory that
+# leaves the user to SSH configuration) is discovered on the host with `id -un`,
+# asked without escalation so the answer is the connecting account.
+billet_ssh_user: "{{ ansible_user | default('') }}"
+
+# The keys a converge connects with, each with the state it should be in:
+#
+#   billet_ssh_authorized_keys:
+#     - key: "ssh-ed25519 AAAA... fleet-converge@ci"
+#       state: present
+#
+# EACH KEY IS EXACTLY A TYPE, ITS MATERIAL AND AN OPTIONAL COMMENT, on one line
+# with nothing in front of the type: the module installs and removes by the
+# material alone and replaces the options of a key it already holds, so a line
+# carrying options, a value spanning lines, two entries for one material or the
+# same material under two types would each let the last task decide what the
+# refusal below was meant to. All of those are refused; a key that needs options
+# is not this role's to install.
+#
+# REVOKING IS `state: absent` WITH THE KEY STILL WRITTEN OUT, because the module
+# removes by material, whatever the comment says; delete the entry only after
+# that has converged everywhere. A key held by a CI secret is revocable this way
+# without touching the break-glass key below.
+billet_ssh_authorized_keys: []
+
+# A second, independent way in: an operator's own key, never the one CI holds,
+# so that revoking or losing either leaves the other; the same key in both
+# places is refused, because one private key is not two. Empty installs none.
+billet_ssh_breakglass_key: ""
+
+# THE HARDENING, AND THE RULE THAT GUARDS IT. With billet_ssh_harden true the
+# role writes an sshd drop-in that turns password and keyboard-interactive
+# authentication off, and it refuses to write it unless the keys above leave a
+# way in: at least one key present, no key both installed and removed, and not
+# an account the hardening itself locks out (root under a policy other than yes
+# or prohibit-password). That refusal is not gated on anything: the two halves
+# were asymmetric once in the reference deployment (a conditional key install
+# beside an unconditional hardening) and a missing variable produced a green run
+# and a host reachable only from its console. The drop-in is validated as part
+# of the WHOLE configuration sshd will read, put back or removed when sshd
+# refuses it, and sshd is restarted only after that validation, because a
+# fragment that parses alone can still make the configuration unsatisfiable.
+billet_ssh_harden: true
+# One of yes, no, prohibit-password or forced-commands-only, in any case.
+billet_ssh_permit_root_login: "no"
+
+# Set the hostname to the inventory name, and turn on unattended security
+# upgrades (Debian-family hosts only; the file is apt's).
+billet_ssh_hostname_from_inventory: true
+billet_ssh_unattended_upgrades: true
+
+# WHERE THINGS LAND AND HOW THEY ARE PROVED, overridable so the role can be
+# driven against a directory that is not /etc/ssh: tests/ssh-access-check.sh
+# points these at a temporary tree and a fake sshd, which is how the refusal
+# cases are proved without root. An operator has no reason to change them.
+billet_ssh_sshd_config_dir: /etc/ssh/sshd_config.d
+billet_ssh_hardening_file: 10-billet-hardening.conf
+# Run with the drop-in in place; it must read the whole configuration.
+billet_ssh_validate_command: "/usr/sbin/sshd -t"
+# Empty means the account's own ~/.ssh/authorized_keys.
+billet_ssh_authorized_keys_path: ""
+# Whether the role restarts sshd after a change to the drop-in.
+billet_ssh_manage_service: true
+billet_ssh_service_name: ssh

@@ -343,6 +343,10 @@ key-policy-check: ## Prove the role's GitHub App key policy, owned path and fore
 converge-guard-check: ## Prove a converge driven from a billet-managed runner is refused
 	ansible_collections/junioryono/billet/tests/converge-guard-check.sh
 
+.PHONY: ssh-access-check
+ssh-access-check: ## Prove the ssh_access role never hardens sshd on a host its converge leaves with no way in
+	ansible_collections/junioryono/billet/tests/ssh-access-check.sh
+
 .PHONY: release-fetch-check
 release-fetch-check: ## Prove the billet_version fetch path and the URL it builds
 	ansible_collections/junioryono/billet/tests/release-fetch-check.sh
