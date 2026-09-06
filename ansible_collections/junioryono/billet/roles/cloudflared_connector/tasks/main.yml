@@ -1,0 +1,224 @@
+---
+# Run cloudflared on the host as the connector for a Cloudflare Tunnel: the host
+# half of Routes C and D in docs/deploying/reaching-hosts.md, which the modules
+# there provision the Cloudflare half of.
+#
+# THE TOKEN NEVER REACHES ARGV. `cloudflared service install` takes it only as
+# a positional argument and writes /etc/cloudflared/token (0600 root) beside a
+# unit that runs `tunnel run --token-file` (measured on cloudflared 2026.7.3);
+# this role writes that file and renders that unit itself and never runs the
+# installer, so the credential is in a root-only file and, under no_log, nowhere
+# in a log. A rotation is the file changing and the service restarting.
+#
+# WITHOUT A TOKEN THE ROLE DOES NOTHING, so the shipped fleet playbook can run
+# it on every host and an inventory that says nothing converges unchanged.
+
+# A NAME FOR EVERY HOST'S TOKEN, AND NO TWO HOSTS SHARING ONE. Upper-casing and
+# replacing punctuation maps node-a, node.a and node_a onto NODE_A, and two such
+# hosts would silently read one credential. Each host records its resolved name
+# as a fact (a role default is not visible through hostvars; a fact is), and the
+# names are compared once, for the whole play, before any host acts.
+- name: Record the environment variable this host's connector token is read from
+  ansible.builtin.set_fact:
+    billet_cloudflared_token_env_resolved: "{{ billet_cloudflared_token_env }}"
+
+- name: Refuse two hosts whose connector tokens would share one environment variable
+  vars:
+    billet_cloudflared_env_names: >-
+      {{ ansible_play_hosts | map('extract', hostvars, 'billet_cloudflared_token_env_resolved') | list }}
+  ansible.builtin.assert:
+    that:
+      - billet_cloudflared_env_names | unique | length == billet_cloudflared_env_names | length
+    fail_msg: >-
+      Two hosts in this play read their cloudflared token from the same
+      environment variable: {{ dict(ansible_play_hosts | zip(billet_cloudflared_env_names)) }}.
+      Set billet_cloudflared_token_env on one of them to a distinct name.
+  run_once: true
+
+- name: Report that no connector token was supplied
+  ansible.builtin.debug:
+    msg: >-
+      {{ billet_cloudflared_token_env }} is not set, so the cloudflared connector
+      is not configured on {{ inventory_hostname }}. This is not a failure;
+      export the token under that name to install it.
+  when: billet_cloudflared_token | length == 0
+
+- name: Configure the cloudflared connector
+  when: billet_cloudflared_token | length > 0
+  block:
+    # BEFORE ANYTHING IS INSTALLED, a pure computation on a value already held.
+    # The shape is checked first with a message that says what a token is,
+    # because the decode below runs under no_log and a pasted wrong string would
+    # otherwise fail censored; a token that is base64 but not the JSON document
+    # still fails there, censored, before anything is written.
+    - name: Refuse a connector token that is not a base64 document
+      ansible.builtin.assert:
+        that:
+          - (billet_cloudflared_token | trim) is match('^[A-Za-z0-9+/]+=*$')
+        fail_msg: >-
+          The value in {{ billet_cloudflared_token_env }} is not a base64 token. A
+          cloudflared connector token is the base64 of a JSON document naming the
+          account, the secret and the tunnel; `terraform output -raw tunnel_token`
+          prints it. Nothing was installed.
+
+    - name: Read the tunnel id the supplied token names
+      ansible.builtin.set_fact:
+        billet_cloudflared_token_tunnel_id: >-
+          {{ (billet_cloudflared_token | trim | b64decode | from_json).get('t', '') }}
+      no_log: true
+
+    - name: Refuse a connector token belonging to a different tunnel
+      ansible.builtin.assert:
+        that:
+          - billet_cloudflared_expected_tunnel_id | length == 0
+            or billet_cloudflared_token_tunnel_id == billet_cloudflared_expected_tunnel_id
+        fail_msg: >-
+          The token in {{ billet_cloudflared_token_env }} names tunnel
+          {{ billet_cloudflared_token_tunnel_id | default('(unreadable)') }}, and
+          {{ inventory_hostname }} expects {{ billet_cloudflared_expected_tunnel_id }}.
+          Refusing to install it: a connector on the wrong token comes up healthy
+          and advertises routes this host cannot serve, and the failure shows up
+          as an unrelated timeout later.
+        success_msg: >-
+          The connector token belongs to the tunnel {{ inventory_hostname }} expects.
+
+    - name: Inspect the connector binary
+      ansible.builtin.stat:
+        path: "{{ billet_cloudflared_binary }}"
+      register: billet_cloudflared_binary_stat
+      check_mode: false
+      become: true
+
+    # A DRY RUN ON A HOST THAT HAS NEVER HAD THE CONNECTOR STOPS HERE. Check mode
+    # fetches nothing, adds no repository and installs no package, so every task
+    # below would act on files the dry run did not create and either fail or
+    # report a change it cannot describe; the reference deployment measured a
+    # dry run failing at the package install for exactly that. What a dry run
+    # can say about such a host is that the real converge installs and verifies
+    # the connector, so it says that and ends the role.
+    - name: Report what a dry run cannot see on a host with no connector yet
+      ansible.builtin.debug:
+        msg: >-
+          {{ billet_cloudflared_binary }} is not installed on {{ inventory_hostname }}
+          and this is a dry run: the real converge stages and verifies Cloudflare's
+          signing key against the pinned fingerprint, adds the repository, installs
+          the package, writes the token file and the unit, and waits for the tunnel
+          to register. Nothing further can be described without those files.
+      when:
+        - ansible_check_mode
+        - not billet_cloudflared_binary_stat.stat.exists
+
+    - name: Install and run the connector
+      when: not (ansible_check_mode and not billet_cloudflared_binary_stat.stat.exists)
+      block:
+        - name: Install the cloudflared package from Cloudflare's repository
+          ansible.builtin.import_tasks: apt.yml
+          when: billet_cloudflared_manage_apt | bool
+
+        - name: Read the installed connector credential
+          ansible.builtin.slurp:
+            src: "{{ billet_cloudflared_config_dir }}/token"
+          register: billet_cloudflared_installed_token
+          failed_when: false
+          no_log: true
+          check_mode: false
+          become: true
+
+        - name: Decide whether the credential on the host is the one supplied
+          ansible.builtin.set_fact:
+            billet_cloudflared_token_stale: >-
+              {{ billet_cloudflared_installed_token.content is defined
+                 and (billet_cloudflared_installed_token.content | b64decode | trim)
+                     != (billet_cloudflared_token | trim) }}
+          no_log: true
+
+        # THREE ANSWERS, AND ONLY A DEFINITE "NO" PERMITS A ROTATION. Restarting
+        # the connector under the play drops the SSH session the play is running
+        # over before the replacement is up; the reference controller was reached
+        # exactly that way. An explicit answer wins; a declared routed address
+        # derives one; nothing at all is could-not-tell, which refuses.
+        - name: Decide whether this play reaches the host through the connector
+          ansible.builtin.set_fact:
+            billet_cloudflared_transport: >-
+              {{ (billet_cloudflared_carries_ansible_transport | string | lower)
+                 if (billet_cloudflared_carries_ansible_transport | string | lower) in ['true', 'false']
+                 else (('true' if ansible_host | default(inventory_hostname) == billet_cloudflared_routed_address else 'false')
+                       if billet_cloudflared_routed_address | length > 0
+                       else 'unknown') }}
+
+        - name: Refuse a credential rotation that could cut this play's own transport
+          ansible.builtin.assert:
+            that:
+              - not (billet_cloudflared_token_stale | bool) or billet_cloudflared_transport == 'false'
+            fail_msg: >-
+              The connector token for {{ inventory_hostname }} has changed, and
+              {{ 'this play reaches the host through that connector'
+                 if billet_cloudflared_transport == 'true'
+                 else 'nothing says whether this play reaches the host through that connector' }}:
+              restarting it would drop this SSH session before the replacement is
+              running. Converge over a path that does not traverse the tunnel
+              (for example `-e ansible_host=<another address>` with
+              billet_cloudflared_routed_address set, which makes the derivation
+              false for that run), or declare
+              billet_cloudflared_carries_ansible_transport: false for a host you
+              reach another way. An unchanged token is never refused.
+
+        - name: Create the connector's configuration directory
+          ansible.builtin.file:
+            path: "{{ billet_cloudflared_config_dir }}"
+            state: directory
+            mode: "0755"
+          become: true
+
+        - name: Write the connector credential
+          ansible.builtin.copy:
+            content: "{{ billet_cloudflared_token | trim }}"
+            dest: "{{ billet_cloudflared_config_dir }}/token"
+            mode: "0600"
+          no_log: true
+          register: billet_cloudflared_token_file
+          become: true
+
+        - name: Render the connector unit
+          ansible.builtin.template:
+            src: cloudflared.service.j2
+            dest: "{{ billet_cloudflared_unit_path }}"
+            mode: "0644"
+          register: billet_cloudflared_unit_file
+          become: true
+
+        - name: Load the connector unit
+          ansible.builtin.systemd_service:
+            daemon_reload: true
+          when:
+            - billet_cloudflared_unit_file is changed
+            - not ansible_check_mode
+          become: true
+
+        - name: Start and enable the connector
+          ansible.builtin.systemd_service:
+            name: cloudflared
+            state: "{{ 'restarted' if (billet_cloudflared_token_file is changed or billet_cloudflared_unit_file is changed) else 'started' }}"
+            enabled: true
+          register: billet_cloudflared_service
+          when: not ansible_check_mode
+          become: true
+
+        # ONLY WHEN THIS RUN STARTED OR RESTARTED IT. cloudflared logs the
+        # registration line at startup and reconnect, never periodically; a
+        # fixed window read on every run was empty once the connector had been
+        # up for longer than the window, and failed a healthy host (measured on
+        # the reference deployment). Anchored on the success line: "Connection "
+        # alone also matches "Connection terminated".
+        - name: Wait for the connector to register a connection
+          ansible.builtin.command:
+            argv: [journalctl, -u, cloudflared, --no-pager, -n, "200"]
+          register: billet_cloudflared_log
+          changed_when: false
+          retries: 10
+          delay: 3
+          until: "'Registered tunnel connection' in (billet_cloudflared_log.stdout | default(''))"
+          when:
+            - not ansible_check_mode
+            - billet_cloudflared_service is changed
+          become: true

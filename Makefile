@@ -347,6 +347,14 @@ converge-guard-check: ## Prove a converge driven from a billet-managed runner is
 ssh-access-check: ## Prove the ssh_access role never hardens sshd on a host its converge leaves with no way in
 	ansible_collections/junioryono/billet/tests/ssh-access-check.sh
 
+.PHONY: cloudflared-connector-check
+cloudflared-connector-check: ## Prove the cloudflared_connector role's refusals, its token handling and its idempotence against fakes
+	ansible_collections/junioryono/billet/tests/cloudflared-connector-check.sh
+
+.PHONY: warp-connector-check
+warp-connector-check: ## Prove the warp_connector role enrols exactly on a missing registration and never over its own transport
+	ansible_collections/junioryono/billet/tests/warp-connector-check.sh
+
 .PHONY: release-fetch-check
 release-fetch-check: ## Prove the billet_version fetch path and the URL it builds
 	ansible_collections/junioryono/billet/tests/release-fetch-check.sh
