@@ -33,7 +33,10 @@ here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 child_env_file=${BILLET_CHILD_ENV_FILE:-}
 if [[ -z $child_env_file ]]; then
   child_env_file="$RUNNER_TEMP/billet-child-env-empty"
-  (umask 077 && : >"$child_env_file")
+  # Removed and created afresh under noclobber, so an existing permissive file
+  # or a symlink at the name is never reused or written through.
+  rm -f "$child_env_file"
+  (umask 077 && set -C && : >"$child_env_file")
 fi
 
 log="$RUNNER_TEMP/billet-converge-2.log"

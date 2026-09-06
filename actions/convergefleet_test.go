@@ -156,7 +156,10 @@ case " $* " in
 esac
 exit 0
 `,
-		"sleep":       "#!/bin/sh\nexit 0\n",
+		"sleep": "#!/bin/sh\nexit 0\n",
+		// A recorder in front of the real env: a launcher that went back to
+		// `env NAME=value cmd` would show the values here, in an argv.
+		"env":         "#!/bin/sh\nprintf 'env %s\\n' \"$*\" >>\"$BILLET_FAKE_CALLS\"\nexec /usr/bin/env \"$@\"\n",
 		"apt-get":     "#!/bin/sh\nprintf 'apt-get %s\\n' \"$*\" >>\"$BILLET_FAKE_CALLS\"\nexit 0\n",
 		"lsb_release": "#!/bin/sh\necho noble\n",
 		"curl": `#!/bin/sh

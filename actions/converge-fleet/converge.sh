@@ -81,6 +81,13 @@ if [[ -n ${BILLET_ENVIRONMENT:-} ]]; then
     n=$((n + 1))
     line=${line%$'\r'}
     [[ -z $line ]] && continue
+    # A CONTROL CHARACTER INSIDE A LINE IS REFUSED, a carriage return first of
+    # all: the launcher reads the file without newline translation and refuses
+    # the same bytes, so a value cannot become a second line anywhere.
+    if [[ $line == *[[:cntrl:]]* ]]; then
+      echo "::error::the environment input's line $n carries a control character; a value is one line of printable text"
+      exit 1
+    fi
     if [[ ! $line =~ ^([A-Za-z_][A-Za-z0-9_]*)= ]]; then
       echo "::error::the environment input's line $n is not NAME=value. Every line is one variable for ansible-playbook's environment; a value with newlines (a key) cannot be carried this way."
       exit 1
@@ -88,7 +95,7 @@ if [[ -n ${BILLET_ENVIRONMENT:-} ]]; then
     name=${BASH_REMATCH[1]}
     lowered=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')
     case "$name" in
-      ANSIBLE_*|GITHUB_*|RUNNER_*|LD_*|PYTHON*|PATH|HOME|SHELL|TMPDIR|IFS|ENV|BASH_ENV|CDPATH)
+      ANSIBLE_*|GITHUB_*|RUNNER_*|LD_*|PYTHON*|SSH_*|DISPLAY|PATH|HOME|SHELL|TMPDIR|IFS|ENV|BASH_ENV|CDPATH)
         echo "::error::the environment input's line $n sets $name, which changes how Ansible or this runner behaves rather than what a role reads; it is refused. Connection and host-key policy are the action's, and extra-vars is the input for a non-secret flag."
         exit 1
         ;;
@@ -228,23 +235,65 @@ while IFS= read -r line; do
 import json, re, shlex, sys
 outer = json.loads(sys.stdin.read())
 inner = json.loads(outer["msg"])
-# Ansible splits each argument string with shlex before handing it to ssh, so
-# -o StrictHostKeyChecking="no" reaches ssh unquoted; the judgement reads the
-# tokens ssh will see, and a string shlex cannot split is refused as unreadable.
-try:
-    sshargs = " ".join(" ".join(shlex.split(str(inner[k]))) for k in ("common", "extra", "args"))
-except ValueError:
-    print(inner["host"], inner["port"], "an SSH argument string that cannot be tokenised")
-    sys.exit(0)
+
+
+def judge(tokens):
+    # THE OPTION GRAMMAR SSH APPLIES, token by token, never a regex over the
+    # joined string: Ansible shlex-splits each argument string, so ssh sees
+    # -o KEY=VALUE, -o "KEY VALUE" or -oKEY=VALUE, and inside the token it strips
+    # quotes and allows any whitespace between keyword and value, so
+    # StrictHostKeyChecking="no" and a tab-separated pair both mean no. A
+    # configuration file (-F) or an Include directive carries options the action
+    # cannot read and is refused as such; a second known-hosts file or a
+    # command that produces host keys adds keys ssh will accept beside the
+    # pins, which is the same bypass by another name.
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        i += 1
+        if tok == "-F" or tok.startswith("-F"):
+            return "-F (an ssh configuration file the action cannot read)"
+        if tok == "-o":
+            opt = tokens[i] if i < len(tokens) else ""
+            i += 1
+        elif tok.startswith("-o"):
+            opt = tok[2:]
+        else:
+            continue
+        m = re.match(r"^\s*\"?([A-Za-z]+)\"?\s*(?:=|\s)\s*(.*)$", opt, re.DOTALL)
+        if not m:
+            return "an SSH option the action cannot read"
+        key = m.group(1).lower()
+        value = m.group(2).strip().strip("\"").strip().lower()
+        if key == "include":
+            return "Include (an ssh configuration file the action cannot read)"
+        if key == "userknownhostsfile":
+            return "UserKnownHostsFile"
+        if key == "globalknownhostsfile":
+            return "GlobalKnownHostsFile"
+        if key == "knownhostscommand":
+            return "KnownHostsCommand"
+        if key == "stricthostkeychecking" and value in ("no", "off", "false", "accept-new"):
+            return "StrictHostKeyChecking"
+        if key == "checkhostip" and value in ("no", "off", "false"):
+            return "CheckHostIP"
+    return None
+
+
 bad = None
-# Ansible boolean conversion of the variable, and OpenSSH spellings of an
-# option value: false is one, and whitespace around = is allowed.
+# Ansible boolean conversion of the variable.
 if str(inner.get("checking", True)).strip().lower() in ("false", "no", "0", "off", "n", "f"):
     bad = "ansible_host_key_checking (or its ansible_ssh_ alias)"
 else:
-    m = re.search(r"(stricthostkeychecking)\s*[= ]\s*(no|off|false|accept-new)|(userknownhostsfile)|(checkhostip)\s*[= ]\s*(no|off|false)", sshargs, re.IGNORECASE)
-    if m:
-        bad = m.group(1) or m.group(3) or m.group(4)
+    for k in ("common", "extra", "args"):
+        try:
+            tokens = shlex.split(str(inner[k]))
+        except ValueError:
+            bad = "an SSH argument string that cannot be tokenised"
+            break
+        bad = judge(tokens)
+        if bad:
+            break
 print(inner["host"], inner["port"], bad or "-")
 ')
   read -r addr port bad <<<"$verdict"

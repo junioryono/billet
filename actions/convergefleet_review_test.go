@@ -49,7 +49,7 @@ func TestAReservedEnvironmentNameIsRefusedByName(t *testing.T) {
 	t.Parallel()
 	f := newConvergeFixture(t)
 
-	for _, line := range []string{"ANSIBLE_HOST_KEY_CHECKING=False", "ANSIBLE_SSH_ARGS=-o StrictHostKeyChecking=no", "PATH=/tmp/evil", "RUNNER_TEMP=/tmp/elsewhere", "GITHUB_OUTPUT=/tmp/out"} {
+	for _, line := range []string{"ANSIBLE_HOST_KEY_CHECKING=False", "ANSIBLE_SSH_ARGS=-o StrictHostKeyChecking=no", "PATH=/tmp/evil", "RUNNER_TEMP=/tmp/elsewhere", "GITHUB_OUTPUT=/tmp/out", "SSH_ASKPASS=/tmp/askpass", "SSH_AUTH_SOCK=/tmp/agent", "DISPLAY=:0"} {
 		out, err := f.run(t, convergeRun{environment: line + "\n"})
 		if err == nil {
 			t.Fatalf("%q was accepted:\n%s", line, out)
@@ -97,7 +97,7 @@ func TestHostKeyRefusalIsCaseInsensitiveAndNamesOnlyTheOption(t *testing.T) {
 	if err == nil {
 		t.Fatalf("a lowercase stricthostkeychecking=no was accepted:\n%s", out)
 	}
-	if !strings.Contains(out, "cp-1 sets stricthostkeychecking") {
+	if !strings.Contains(out, "cp-1 sets StrictHostKeyChecking") {
 		t.Errorf("the refusal does not name the host and the option:\n%s", out)
 	}
 	if strings.Contains(out, "PROXY-SECRET") {
@@ -151,6 +151,48 @@ func TestEnvironmentValuesAreNeverEvaluated(t *testing.T) {
 		if env[name] != want {
 			t.Errorf("the child has %s=%q, want the literal %q", name, env[name], want)
 		}
+	}
+	// NO env(1) EVER CARRIED A VALUE: the recorder in front of the real env
+	// logs every argv it was handed.
+	for _, call := range strings.Split(string(readRecorded(t, f.calls)), "\n") {
+		if strings.HasPrefix(call, "env ") && (strings.Contains(call, "first") || strings.Contains(call, "second")) {
+			t.Errorf("a value reached env(1)'s argv: %s", call)
+		}
+	}
+}
+
+// A CARRIAGE RETURN INSIDE A VALUE IS REFUSED BY BOTH VALIDATORS: the shell
+// sees one line, and a launcher reading with newline translation would have
+// seen two, the second setting PATH. Each validator is tested on its own.
+func TestAControlCharacterInsideAValueIsRefused(t *testing.T) {
+	t.Parallel()
+	f := newConvergeFixture(t)
+
+	out, err := f.run(t, convergeRun{environment: "TOKEN=x\rPATH=" + f.dir + "\nkv=first\n"})
+	if err == nil {
+		t.Fatalf("a value with a carriage return was accepted:\n%s", out)
+	}
+	if !strings.Contains(out, "line 1 carries a control character") {
+		t.Errorf("the refusal does not name the line:\n%s", out)
+	}
+	if strings.Contains(out, "PATH=") {
+		t.Errorf("the refusal printed the line:\n%s", out)
+	}
+	if len(f.playbookInvocations(t)) != 0 {
+		t.Error("ansible-playbook ran after the refusal")
+	}
+
+	file := filepath.Join(f.dir, "child-env")
+	if err := os.WriteFile(file, []byte("TOKEN=x\rPATH="+f.dir+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.CommandContext(t.Context(), realPython3(t), filepath.Join(actionDir(t), "with-environment.py"), file, "--", "true")
+	launcherOut, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("the launcher accepted a line with a carriage return:\n%s", launcherOut)
+	}
+	if !strings.Contains(string(launcherOut), "line 1 of") || !strings.Contains(string(launcherOut), "carries a control character") {
+		t.Errorf("the launcher's refusal does not name the line:\n%s", launcherOut)
 	}
 }
 
@@ -278,6 +320,13 @@ func TestOtherSpellingsOfCheckingOffAreRefused(t *testing.T) {
 		"ssh alias":    debugLineChecking("cp-1", "10.0.0.1", "False") + "\n" + debugLineChecking("node-a", "10.0.0.2", true) + "\n",
 		"checkhostip":  debugLine("cp-1", "10.0.0.1", 22, "-o CheckHostIP=false") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
 		"quoted value": debugLine("cp-1", "10.0.0.1", 22, `-o StrictHostKeyChecking="no"`) + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"inner quotes": debugLine("cp-1", "10.0.0.1", 22, `-o 'StrictHostKeyChecking="no"'`) + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"tab":          debugLine("cp-1", "10.0.0.1", 22, "-o 'StrictHostKeyChecking\tno'") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"no separator": debugLine("cp-1", "10.0.0.1", 22, "-oStrictHostKeyChecking=off") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"config file":  debugLine("cp-1", "10.0.0.1", 22, "-F /tmp/ssh_config") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"include":      debugLine("cp-1", "10.0.0.1", 22, "-o Include=/tmp/ssh_config") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"global file":  debugLine("cp-1", "10.0.0.1", 22, "-o GlobalKnownHostsFile=/tmp/keys") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"keys command": debugLine("cp-1", "10.0.0.1", 22, "-o KnownHostsCommand=/tmp/keys.sh") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
