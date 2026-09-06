@@ -2,8 +2,11 @@ package nodeplane_test
 
 import (
 	"errors"
+	"log/slog"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
@@ -71,5 +74,48 @@ func TestInventoryCannotGrantOwnershipAgainstLedgerPlacement(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestAdoptedEndedInventoryDoesNotAuthorizeForeignRunnerRemoval(t *testing.T) {
+	t.Parallel()
+
+	for _, history := range []string{"n1", "n2", ""} {
+		t.Run("history="+history, func(t *testing.T) {
+			t.Parallel()
+
+			store := &fakeStore{
+				leaseErr:    alloc.ErrLeaseNotFound,
+				historyNode: map[string]string{"l1": history},
+				pool: map[string]alloc.PoolRunner{"runner": {
+					LeaseID: "l1", Tier: "billet-2vcpu", RunnerID: 91,
+					RunnerName: "runner", Status: alloc.PoolRunnerBusy,
+				}},
+			}
+			jit := &returnedJIT{}
+			log := slog.New(slog.DiscardHandler)
+			p := nodeplane.New(log, deployment, time.Minute)
+			srv := httptest.NewServer(nodeplane.Handler(log, p, store, jit))
+			t.Cleanup(srv.Close)
+			c := dial(t, srv.URL)
+			if err := c.Register(t.Context(), nodeclient.Registration{
+				Provider: config.ProviderDocker, Deployment: deployment,
+				VCPU: testNodeVCPU, Memory: testNodeMemory,
+				InventoryKnown: true, Instances: []string{"l1"},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if owner, ok := p.OwnerOfLease("l1"); !ok || owner.Node != "n1" {
+				t.Fatalf("ended inventory was not adopted: owner=%+v present=%v", owner, ok)
+			}
+			err := c.EnsureRunnerRemoved(t.Context(), "l1")
+			if history == "n1" {
+				if err != nil || len(jit.removed) != 1 || len(store.retired) != 1 {
+					t.Fatalf("own ended runner removal: err=%v removed=%v retired=%v", err, jit.removed, store.retired)
+				}
+			} else if !errors.Is(err, nodeclient.ErrRefused) || len(jit.removed) != 0 || len(store.retired) != 0 {
+				t.Fatalf("unproved ended runner removal: err=%v removed=%v retired=%v", err, jit.removed, store.retired)
+			}
+		})
 	}
 }

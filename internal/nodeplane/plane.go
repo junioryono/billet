@@ -1402,6 +1402,11 @@ func (p *Plane) ReconcileInventory(
 		return 0, nil
 	}
 
+	// Placement reads may wait on the ledger; unrelated nodes must keep polling.
+	if err := checkInventoryPlacement(ctx, node, running, p.registrar.Lease); err != nil {
+		return 0, err
+	}
+
 	// THE INVENTORY, ITS FENCED LEDGER DECISION AND ITS OWNERSHIP ADOPTION ARE
 	// ONE ORDERED FACT. A completion cannot consume the previous snapshot in the
 	// gap, and a replacement cannot install a new incarnation while the old one
@@ -1424,9 +1429,6 @@ func (p *Plane) ReconcileInventory(
 			ErrSuperseded, node, n.incarnation, incarnation)
 	}
 
-	if err := checkInventoryPlacement(ctx, node, running, p.registrar.Lease); err != nil {
-		return 0, err
-	}
 	freed, err := p.registrar.ResolveQuarantineFor(ctx, node, running, n.ledgerEpoch)
 	if err != nil {
 		return 0, err
@@ -1441,7 +1443,12 @@ func (p *Plane) ReconcileInventory(
 func checkInventoryPlacement(ctx context.Context, node string, ids []string,
 	lookup func(context.Context, string) (*alloc.Lease, error),
 ) error {
+	seen := make(map[string]struct{})
 	for _, id := range ids {
+		if _, duplicate := seen[id]; duplicate {
+			continue
+		}
+		seen[id] = struct{}{}
 		lease, err := lookup(ctx, id)
 		if errors.Is(err, alloc.ErrLeaseNotFound) {
 			continue

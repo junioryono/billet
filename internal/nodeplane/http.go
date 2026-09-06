@@ -1887,12 +1887,8 @@ func (h *handler) removeRunner(w http.ResponseWriter, r *http.Request) {
 			"runner identity does not match the durable registration")
 		return
 	}
-	// A LEASE THE LEDGER HAS ENDED STILL OWES ITS REGISTRATION'S REMOVAL. The
-	// guard admitted this process on the strength of the lease it was given;
-	// the durable binding names the registration; and a registration GitHub can
-	// route work to is exactly what must go before the guest does, whatever the
-	// ledger says about the capacity. Only an OPEN lease is checked for the node
-	// it is placed on, because an ended one has no placement left to compare.
+	// Inventory can preserve custody after a lease ends, but only durable history
+	// can authorize removal of its runner registration.
 	lease, err := h.store.Lease(r.Context(), binding.LeaseID)
 	ended := errors.Is(err, alloc.ErrLeaseNotFound)
 	if err != nil && !ended {
@@ -1902,6 +1898,11 @@ func (h *handler) removeRunner(w http.ResponseWriter, r *http.Request) {
 	if !ended && lease == nil {
 		writeErr(w, http.StatusConflict, nodeapi.CodeRefused,
 			"runner registration no longer has a lease")
+		return
+	}
+	if ended && !h.endedOnThisNode(r, binding.LeaseID, r.PathValue("node")) {
+		writeErr(w, http.StatusForbidden, nodeapi.CodeRefused,
+			"ended runner registration is not attributed to this node")
 		return
 	}
 	if !ended && lease.Node != r.PathValue("node") {

@@ -58,3 +58,5 @@ A node dials out and never listens. `internal/nodeapi` declares the request and 
 ## Related skills
 
 `billet-identity-and-ca` (the authority the wire trusts), `billet-capacity` (what the commands and fences protect), `billet-security` (what a node may and may not ask for), `billet-releases-and-upgrades` (server-first rollouts).
+
+**Placement reads do not hold the shared plane mutex.** Inventory validation reads each distinct lease once before locking; incarnation and the fenced quarantine decision are checked afterward under the lock. Orphan inventory may preserve custody, but removing an ended runner always requires its durable history to name the requesting node, even when inventory created an owner record.
