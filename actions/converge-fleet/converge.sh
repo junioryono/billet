@@ -237,46 +237,79 @@ outer = json.loads(sys.stdin.read())
 inner = json.loads(outer["msg"])
 
 
+def unquote(text):
+    # THE PART OF THE OPENSSH VALUE GRAMMAR THIS IMPLEMENTS, and nothing beyond it:
+    # readconf hands a value to argv_split, which joins concatenated quoted
+    # fragments in single or double quotes, honours a backslash, and stops at an
+    # unquoted # or whitespace, so a single-quoted no, n"o" and no # comment are all no. An
+    # unbalanced quote is unreadable.
+    out = []
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch in ("\"", chr(39)):
+            j = text.find(ch, i + 1)
+            if j < 0:
+                return None
+            out.append(text[i + 1:j])
+            i = j + 1
+        elif ch == "\\" and i + 1 < len(text):
+            out.append(text[i + 1])
+            i += 2
+        elif ch == "#" or ch.isspace():
+            break
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
 def judge(tokens):
-    # THE OPTION GRAMMAR SSH APPLIES, token by token, never a regex over the
-    # joined string: Ansible shlex-splits each argument string, so ssh sees
-    # -o KEY=VALUE, -o "KEY VALUE" or -oKEY=VALUE, and inside the token it strips
-    # quotes and allows any whitespace between keyword and value, so
-    # StrictHostKeyChecking="no" and a tab-separated pair both mean no. A
-    # configuration file (-F) or an Include directive carries options the action
-    # cannot read and is refused as such; a second known-hosts file or a
-    # command that produces host keys adds keys ssh will accept beside the
-    # pins, which is the same bypass by another name.
+    # ONLY -o IS INTERPRETED; EVERY OTHER FLAG IS REFUSED BY NAME. ssh parses its
+    # flags with getopt, so -4oStrictHostKeyChecking=no is a cluster that turns
+    # checking off and -4F/tmp/x reads a configuration file; rather than model
+    # clusters, the action admits an inventory that says what it means with -o
+    # and refuses the rest (AddressFamily=inet is the -o spelling of -4). Inside
+    # an option, keyword and value are unquoted the way readconf does before the
+    # keyword is compared case-insensitively. Refused keywords, each a way of
+    # accepting a key the pins do not hold: a configuration file or Include, a
+    # second known-hosts file or a command producing keys, checking turned off,
+    # CheckHostIP off, the loopback exemption, DNS-published keys, and an alias
+    # that looks the pins up under another name.
     i = 0
     while i < len(tokens):
         tok = tokens[i]
         i += 1
-        if tok == "-F" or tok.startswith("-F"):
-            return "-F (an ssh configuration file the action cannot read)"
         if tok == "-o":
             opt = tokens[i] if i < len(tokens) else ""
             i += 1
         elif tok.startswith("-o"):
             opt = tok[2:]
+        elif tok.startswith("-"):
+            return tok[:2] + " (an ssh flag the action does not interpret; spell it as -o)"
         else:
             continue
-        m = re.match(r"^\s*\"?([A-Za-z]+)\"?\s*(?:=|\s)\s*(.*)$", opt, re.DOTALL)
+        m = re.match(r"^\s*([^\s=]+)\s*(?:=|\s)\s*(.*)$", opt, re.DOTALL)
         if not m:
             return "an SSH option the action cannot read"
-        key = m.group(1).lower()
-        value = m.group(2).strip().strip("\"").strip().lower()
+        key = unquote(m.group(1))
+        value = unquote(m.group(2).strip())
+        if key is None or value is None:
+            return "an SSH option the action cannot read"
+        key = key.lower()
+        value = value.lower()
         if key == "include":
             return "Include (an ssh configuration file the action cannot read)"
-        if key == "userknownhostsfile":
-            return "UserKnownHostsFile"
-        if key == "globalknownhostsfile":
-            return "GlobalKnownHostsFile"
-        if key == "knownhostscommand":
-            return "KnownHostsCommand"
+        if key in ("userknownhostsfile", "globalknownhostsfile", "knownhostscommand", "hostkeyalias"):
+            return {"userknownhostsfile": "UserKnownHostsFile", "globalknownhostsfile": "GlobalKnownHostsFile", "knownhostscommand": "KnownHostsCommand", "hostkeyalias": "HostKeyAlias"}[key]
         if key == "stricthostkeychecking" and value in ("no", "off", "false", "accept-new"):
             return "StrictHostKeyChecking"
         if key == "checkhostip" and value in ("no", "off", "false"):
             return "CheckHostIP"
+        if key == "nohostauthenticationforlocalhost" and value != "no":
+            return "NoHostAuthenticationForLocalhost"
+        if key == "verifyhostkeydns" and value != "no":
+            return "VerifyHostKeyDNS"
     return None
 
 

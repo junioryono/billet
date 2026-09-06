@@ -315,18 +315,26 @@ func TestOtherSpellingsOfCheckingOffAreRefused(t *testing.T) {
 	t.Parallel()
 
 	for name, debug := range map[string]string{
-		"false":        debugLine("cp-1", "10.0.0.1", 22, "-o StrictHostKeyChecking=false") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
-		"spaced":       debugLine("cp-1", "10.0.0.1", 22, `-o "StrictHostKeyChecking = no"`) + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
-		"ssh alias":    debugLineChecking("cp-1", "10.0.0.1", "False") + "\n" + debugLineChecking("node-a", "10.0.0.2", true) + "\n",
-		"checkhostip":  debugLine("cp-1", "10.0.0.1", 22, "-o CheckHostIP=false") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
-		"quoted value": debugLine("cp-1", "10.0.0.1", 22, `-o StrictHostKeyChecking="no"`) + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
-		"inner quotes": debugLine("cp-1", "10.0.0.1", 22, `-o 'StrictHostKeyChecking="no"'`) + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
-		"tab":          debugLine("cp-1", "10.0.0.1", 22, "-o 'StrictHostKeyChecking\tno'") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
-		"no separator": debugLine("cp-1", "10.0.0.1", 22, "-oStrictHostKeyChecking=off") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
-		"config file":  debugLine("cp-1", "10.0.0.1", 22, "-F /tmp/ssh_config") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
-		"include":      debugLine("cp-1", "10.0.0.1", 22, "-o Include=/tmp/ssh_config") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
-		"global file":  debugLine("cp-1", "10.0.0.1", 22, "-o GlobalKnownHostsFile=/tmp/keys") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
-		"keys command": debugLine("cp-1", "10.0.0.1", 22, "-o KnownHostsCommand=/tmp/keys.sh") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"false":         debugLine("cp-1", "10.0.0.1", 22, "-o StrictHostKeyChecking=false") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"spaced":        debugLine("cp-1", "10.0.0.1", 22, `-o "StrictHostKeyChecking = no"`) + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"ssh alias":     debugLineChecking("cp-1", "10.0.0.1", "False") + "\n" + debugLineChecking("node-a", "10.0.0.2", true) + "\n",
+		"checkhostip":   debugLine("cp-1", "10.0.0.1", 22, "-o CheckHostIP=false") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"quoted value":  debugLine("cp-1", "10.0.0.1", 22, `-o StrictHostKeyChecking="no"`) + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"inner quotes":  debugLine("cp-1", "10.0.0.1", 22, `-o 'StrictHostKeyChecking="no"'`) + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"tab":           debugLine("cp-1", "10.0.0.1", 22, "-o 'StrictHostKeyChecking\tno'") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"no separator":  debugLine("cp-1", "10.0.0.1", 22, "-oStrictHostKeyChecking=off") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"config file":   debugLine("cp-1", "10.0.0.1", 22, "-F /tmp/ssh_config") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"include":       debugLine("cp-1", "10.0.0.1", 22, "-o Include=/tmp/ssh_config") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"global file":   debugLine("cp-1", "10.0.0.1", 22, "-o GlobalKnownHostsFile=/tmp/keys") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"keys command":  debugLine("cp-1", "10.0.0.1", 22, "-o KnownHostsCommand=/tmp/keys.sh") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"single quotes": debugLine("cp-1", "10.0.0.1", 22, `-o "StrictHostKeyChecking='no'"`) + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"fragments":     debugLine("cp-1", "10.0.0.1", 22, `-o 'StrictHostKeyChecking=n"o"'`) + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"comment":       debugLine("cp-1", "10.0.0.1", 22, `-o 'StrictHostKeyChecking=no # comment'`) + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"cluster":       debugLine("cp-1", "10.0.0.1", 22, "-4oStrictHostKeyChecking=no") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"cluster file":  debugLine("cp-1", "10.0.0.1", 22, "-4F/tmp/ssh_config") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"localhost":     debugLine("cp-1", "10.0.0.1", 22, "-o NoHostAuthenticationForLocalhost=yes") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"dns":           debugLine("cp-1", "10.0.0.1", 22, "-o VerifyHostKeyDNS=yes") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"alias":         debugLine("cp-1", "10.0.0.1", 22, "-o HostKeyAlias=other") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
