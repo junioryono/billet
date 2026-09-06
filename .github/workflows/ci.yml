@@ -229,7 +229,10 @@ jobs:
 
   host-lifecycle:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Sized from what the gates measurably take: the run was cancelled at 15
+    # minutes after the two connector gates and the fleet gate joined it
+    # (measured 2026-09-06, 15m03s with every gate green until the cap).
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
 
