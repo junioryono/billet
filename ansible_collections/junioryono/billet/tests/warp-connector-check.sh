@@ -46,6 +46,12 @@ cat >"$work/play.yml" <<'EOF'
     - role: junioryono.billet.warp_connector
 EOF
 
+# The same play with the variable name set on the role invocation, a scope
+# hostvars does not see: the play-wide list shows distinct fallbacks while
+# every host reads the one name, and only the per-host consistency check
+# catches it.
+sed -e 's/^    - role: junioryono.billet.warp_connector$/    - role: junioryono.billet.warp_connector\n      vars:\n        billet_warp_connector_token_env: BILLET_WARP_CONNECTOR_TOKEN_NODE_A/' "$work/play.yml" >"$work/play-rolevar.yml"
+
 run() {
     name=$1; expect=$2; shift 2
     envs=""
@@ -62,9 +68,14 @@ run() {
         ANSIBLE_COLLECTIONS_PATH="$collections_root:$HOME/.ansible/collections:/usr/share/ansible/collections" \
         ANSIBLE_STDOUT_CALLBACK=default ANSIBLE_FORCE_COLOR=0 ANSIBLE_NOCOLOR=1 \
         $envs \
-        ansible-playbook -i "$work/inventory.ini" -e ansible_become=false --diff -v "$@" "$work/play.yml" \
+        ansible-playbook -i "$work/inventory.ini" -e ansible_become=false --diff -v "$@" "$work/${BILLET_TEST_PLAY:-play}.yml" \
         >"$work/out.log" 2>&1 || status=$?
     judge "$name" "$status" "$work/out.log" "$expect" "${BILLET_TEST_STAGED:-}"
+    # A PREFIX ASSIGNMENT ON A FUNCTION CALL PERSISTS AFTER THE CALL in some
+    # shells (measured: the serial case ran the previous case's play and the
+    # staged allowance leaked into every later refusal), so a case's settings
+    # are cleared here and each case states its own.
+    BILLET_TEST_STAGED=; BILLET_TEST_PLAY=
 }
 
 printf 'node-a ansible_host=127.0.0.1\n' >"$work/inventory.ini"
@@ -109,8 +120,18 @@ mkdir -p "$work/legacy"; printf 'OLD KEY' >"$work/legacy/cloudflare-warp.asc"
 BILLET_TEST_STAGED=staged run "a signing key with another fingerprint is refused" "not exactly one primary key with the pinned fingerprint" \
     BILLET_TEST_MANAGE_APT=true "BILLET_TEST_KEY_FILE=$work/bad-key.asc" "BILLET_WARP_CONNECTOR_TOKEN_NODE_A=$token" --
 [ ! -e "$work/root/keyrings/cloudflare-warp-archive-keyring.gpg" ] || { echo "FAIL: a refused key reached the keyring" >&2; exit 1; }
+if grep -q -- '--dearmor' "$work/calls"; then echo "FAIL: a refused key was dearmored" >&2; exit 1; fi
 if grep -q 'connector new' "$work/calls"; then echo "FAIL: a refused key did not stop the enrolment" >&2; exit 1; fi
 [ ! -e "$work/legacy/cloudflare-warp.asc" ] || { echo "FAIL: the legacy key at the given path was not removed" >&2; exit 1; }
+
+# 6b. The pinned key is dearmored into the keyring the role names, and only
+#     then is the repository added: the repository module is the first task
+#     this machine cannot run (no python3-debian), so its refusal is where the
+#     apt path ends here, with the keyring already written by a verified key.
+BILLET_TEST_STAGED=staged run "the pinned key reaches the keyring before the repository" "python3-debian is not installed" \
+    BILLET_TEST_MANAGE_APT=true "BILLET_WARP_CONNECTOR_TOKEN_NODE_A=$token" --
+[ -s "$work/root/keyrings/cloudflare-warp-archive-keyring.gpg" ] || { echo "FAIL: the verified key was not dearmored into the keyring" >&2; exit 1; }
+grep -q '^gpg .*--show-keys' "$work/calls" || { echo "FAIL: the key was never read by gpg" >&2; exit 1; }
 
 # 7. Two hosts sharing one variable name are refused before any host acts.
 printf 'node-a ansible_host=127.0.0.1\nnode_a ansible_host=127.0.0.1\n' >"$work/inventory.ini"
@@ -123,6 +144,19 @@ printf 'node-a ansible_host=127.0.0.1\nnode-b ansible_host=127.0.0.1 billet_warp
 run "two hosts sharing one token variable by override are refused" "read their WARP connector token from the same environment variable" \
     "BILLET_WARP_CONNECTOR_TOKEN_NODE_A=$token" --
 [ ! -s "$work/calls" ] || { echo "FAIL: the override collision refusal came after a fake was called" >&2; exit 1; }
+
+# 8b. A name shared through a scope every host sees (-e) is refused too.
+printf 'node-a ansible_host=127.0.0.1\nnode-b ansible_host=127.0.0.1\n' >"$work/inventory.ini"
+run "two hosts sharing one token variable through -e are refused" "WARP connector token" \
+    "BILLET_WARP_CONNECTOR_TOKEN_NODE_A=$token" -- -e billet_warp_connector_token_env=BILLET_WARP_CONNECTOR_TOKEN_NODE_A
+[ ! -s "$work/calls" ] || { echo "FAIL: the -e collision refusal came after a fake was called" >&2; exit 1; }
+
+# A name set on the role invocation itself, which the play-wide check cannot
+# see: refused by the per-host check, before any fake is called.
+printf 'node-a ansible_host=127.0.0.1\nnode-b ansible_host=127.0.0.1\n' >"$work/inventory.ini"
+BILLET_TEST_PLAY=play-rolevar run "a name the play-wide check cannot see is refused" "a variable the play-wide collision check could not see" \
+    "BILLET_WARP_CONNECTOR_TOKEN_NODE_A=$token" -- 
+[ ! -s "$work/calls" ] || { echo "FAIL: the role-vars refusal came after a fake was called" >&2; exit 1; }
 
 # 9. Two distinct hosts under serial: 1: the collision check reads the
 #    inventory, so the first batch does not fail on a fact the second has not

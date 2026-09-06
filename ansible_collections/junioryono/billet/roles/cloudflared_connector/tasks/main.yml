@@ -29,21 +29,53 @@
 # first, because under `serial` the later batches have recorded nothing when the
 # first batch asks; the fallback formula is the default's, repeated on purpose.
 # Case-sensitive, because environment variable names are.
-- name: Refuse two hosts whose connector tokens would share one environment variable
-  vars:
+- name: Compute the environment variable every host in this play reads its token from
+  ansible.builtin.set_fact:
     billet_cloudflared_env_names: >-
       {%- set names = [] -%}
-      {%- for h in ansible_play_hosts -%}
+      {%- for h in ansible_play_hosts_all -%}
       {%- set _ = names.append(hostvars[h]['billet_cloudflared_token_env'] | default('BILLET_CLOUDFLARED_TOKEN_' ~ (h | upper | regex_replace('[^A-Z0-9]', '_')))) -%}
       {%- endfor -%}
       {{ names }}
+
+- name: Refuse two hosts whose connector tokens would share one environment variable
   ansible.builtin.assert:
     that:
       - billet_cloudflared_env_names | unique(case_sensitive=true) | length == billet_cloudflared_env_names | length
     fail_msg: >-
       Two hosts in this play read their cloudflared token from the same
-      environment variable: {{ dict(ansible_play_hosts | zip(billet_cloudflared_env_names)) }}.
+      environment variable: {{ dict(ansible_play_hosts_all | zip(billet_cloudflared_env_names)) }}.
       Set billet_cloudflared_token_env on one of them to a distinct name.
+  run_once: true
+
+# THE NAME THIS HOST READS IS THE NAME THE PLAY-WIDE LIST HOLDS FOR IT. An
+# override at a scope hostvars does not see (the vars of a role invocation)
+# would make every host read one name while the list above showed distinct
+# fallbacks and passed.
+- name: Record the environment variable this host reads its token from
+  ansible.builtin.set_fact:
+    billet_cloudflared_token_env_effective: "{{ billet_cloudflared_token_env }}"
+
+# THE NAME EACH HOST READS IS THE NAME THE PLAY-WIDE LIST HOLDS FOR IT, asked
+# once of every host in the batch (each recorded its effective name in the
+# task above, before this one runs anywhere), so that a mismatch on one host
+# refuses before ANY host acts. An override at a scope hostvars does not see
+# (the vars of a role invocation) would make every host read one name while
+# the list showed distinct fallbacks and passed.
+- name: Refuse a token variable name the play-wide check could not see
+  vars:
+    billet_cloudflared_effective_names: "{{ ansible_play_batch | map('extract', hostvars, 'billet_cloudflared_token_env_effective') | list }}"
+    billet_cloudflared_computed_names: "{{ ansible_play_batch | map('extract', dict(ansible_play_hosts_all | zip(billet_cloudflared_env_names))) | list }}"
+  ansible.builtin.assert:
+    that:
+      - billet_cloudflared_effective_names == billet_cloudflared_computed_names
+    fail_msg: >-
+      A host in this play reads its cloudflared token from a variable the play-wide
+      collision check could not see: the hosts read
+      {{ dict(ansible_play_batch | zip(billet_cloudflared_effective_names)) }} and the check
+      computed {{ dict(ansible_play_batch | zip(billet_cloudflared_computed_names)) }} from the
+      inventory. billet_cloudflared_token_env is set somewhere the check cannot see (the vars of a
+      role invocation, say); set it in the inventory for the host that needs it.
   run_once: true
 
 - name: Report that no connector token was supplied
@@ -157,7 +189,10 @@
 
         # WHETHER A CONNECTOR IS RUNNING NOW, which is what makes a restart
         # dangerous: a session may be riding on it. Asked of systemd, not
-        # inferred from files; an absent unit answers inactive.
+        # inferred from files; an absent unit answers inactive. Only `inactive`
+        # and `failed` are evidence that no process serves traffic; `activating`
+        # (a long ExecStartPost), `deactivating`, `reloading` and anything
+        # unrecognised are read as running.
         - name: Read whether the connector is running
           ansible.builtin.command:
             argv: [systemctl, show, -p, ActiveState, --value, cloudflared]
@@ -169,15 +204,17 @@
         # THREE ANSWERS, AND ONLY A DEFINITE "NO" PERMITS A RESTART. An explicit
         # answer wins. A declared routed address derives one from the address
         # this play connects to: equal means the play rides the connector; two
-        # DIFFERENT IP literals mean it does not; anything else (no ansible_host,
-        # a name against an address, an instance id) is could-not-tell, because
-        # two spellings can name one address and the role resolves nothing.
+        # DIFFERENT IPv4 literals mean it does not; anything else (no
+        # ansible_host, a name against an address, an instance id, IPv6) is
+        # could-not-tell, because two spellings can name one address (a name,
+        # or 2001:db8::1 beside 2001:0db8:0:0:0:0:0:1) and the role resolves
+        # and canonicalises nothing.
         - name: Decide whether this play reaches the host through the connector
           vars:
             billet_cloudflared_transport_explicit: "{{ billet_cloudflared_carries_ansible_transport | string | trim | lower }}"
             billet_cloudflared_routed: "{{ billet_cloudflared_routed_address | string | trim }}"
             billet_cloudflared_reached_at: "{{ ansible_host | default('') | string | trim }}"
-            billet_cloudflared_ip_literal: '^([0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9A-Fa-f:]+$'
+            billet_cloudflared_ip_literal: '^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$'
           ansible.builtin.set_fact:
             billet_cloudflared_transport: >-
               {{ billet_cloudflared_transport_explicit
@@ -213,11 +250,15 @@
           check_mode: false
           become: true
 
+        # UNDER no_log LIKE THE CREDENTIAL: an older `cloudflared service
+        # install` wrote the token into ExecStart as `--token <TOKEN>`, so a
+        # unit being adopted may carry it, and so may the diff of replacing it.
         - name: Read the installed connector unit
           ansible.builtin.slurp:
             src: "{{ billet_cloudflared_unit_path }}"
           register: billet_cloudflared_installed_unit
           when: billet_cloudflared_files.results[1].stat.exists
+          no_log: true
           check_mode: false
           become: true
 
@@ -246,7 +287,7 @@
           ansible.builtin.assert:
             that:
               - >-
-                (billet_cloudflared_active.stdout | trim) != 'active'
+                (billet_cloudflared_active.stdout | trim) in ['inactive', 'failed']
                 or not (billet_cloudflared_token_would_change | bool or billet_cloudflared_unit_would_change | bool)
                 or billet_cloudflared_transport == 'false'
             fail_msg: >-
@@ -290,6 +331,7 @@
             group: "{{ billet_cloudflared_group }}"
             mode: "0644"
           register: billet_cloudflared_unit_file
+          no_log: true
           become: true
 
         - name: Load the connector unit
@@ -306,7 +348,10 @@
             state: "{{ 'restarted' if (billet_cloudflared_token_file is changed or billet_cloudflared_unit_file is changed) else 'started' }}"
             enabled: true
           register: billet_cloudflared_service
-          when: not ansible_check_mode
+          # In a dry run only where the unit exists: the module predicts a start
+          # or an enable from `systemctl show`, and a unit the dry run did not
+          # write cannot be asked about.
+          when: not ansible_check_mode or billet_cloudflared_files.results[1].stat.exists
           become: true
 
         # ONLY WHEN THIS RUN STARTED OR RESTARTED THE PROCESS, and only this
@@ -325,18 +370,26 @@
           when:
             - not ansible_check_mode
             - billet_cloudflared_token_file is changed or billet_cloudflared_unit_file is changed
-              or (billet_cloudflared_active.stdout | trim) != 'active'
+              or (billet_cloudflared_active.stdout | trim) in ['inactive', 'failed']
           become: true
 
+        # NO INVOCATION ID IS A REFUSAL, not a window read: a window of the
+        # unit's journal holds the previous process's registration line, and
+        # a wait that can be satisfied by it proves nothing about this start.
+        - name: Refuse to judge a start whose invocation systemd did not name
+          ansible.builtin.assert:
+            that:
+              - billet_cloudflared_invocation.stdout | default('') | trim | length > 0
+            fail_msg: >-
+              systemd reported no InvocationID for cloudflared on
+              {{ inventory_hostname }} after it was started, so this role cannot
+              tell which process's log to read for the registration. The
+              connector was started; check `journalctl -u cloudflared` by hand.
+          when: billet_cloudflared_invocation is not skipped
+
         - name: Wait for the connector to register a connection
-          vars:
-            billet_cloudflared_invocation_id: "{{ billet_cloudflared_invocation.stdout | default('') | trim }}"
           ansible.builtin.command:
-            argv: >-
-              {{ ['journalctl', '--no-pager']
-                 + (['_SYSTEMD_INVOCATION_ID=' ~ billet_cloudflared_invocation_id]
-                    if billet_cloudflared_invocation_id | length > 0
-                    else ['-u', 'cloudflared', '-n', '200']) }}
+            argv: [journalctl, --no-pager, "_SYSTEMD_INVOCATION_ID={{ billet_cloudflared_invocation.stdout | trim }}"]
           register: billet_cloudflared_log
           changed_when: false
           retries: 10

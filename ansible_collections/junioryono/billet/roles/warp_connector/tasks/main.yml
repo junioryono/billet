@@ -14,25 +14,55 @@
 # an inventory that says nothing converges unchanged.
 
 # A NAME FOR EVERY HOST'S TOKEN, AND NO TWO HOSTS SHARING ONE, computed for
-# every host in the play from its inventory rather than from a fact each host
-# records first, because under `serial` the later batches have recorded nothing
-# when the first batch asks; the fallback formula is the default's, repeated on
-# purpose. Case-sensitive, because environment variable names are.
-- name: Refuse two hosts whose connector tokens would share one environment variable
-  vars:
+# every host in the play (failed ones included) from its inventory rather than
+# from a fact each host records first, because under `serial` the later batches
+# have recorded nothing when the first batch asks; the fallback formula is the
+# default's, repeated on purpose. Case-sensitive, because environment variable
+# names are. Each host then checks the name it reads is the one computed for
+# it, which is what an override the computation cannot see would break.
+- name: Compute the environment variable every host in this play reads its token from
+  ansible.builtin.set_fact:
     billet_warp_env_names: >-
       {%- set names = [] -%}
-      {%- for h in ansible_play_hosts -%}
+      {%- for h in ansible_play_hosts_all -%}
       {%- set _ = names.append(hostvars[h]['billet_warp_connector_token_env'] | default('BILLET_WARP_CONNECTOR_TOKEN_' ~ (h | upper | regex_replace('[^A-Z0-9]', '_')))) -%}
       {%- endfor -%}
       {{ names }}
+
+- name: Refuse two hosts whose connector tokens would share one environment variable
   ansible.builtin.assert:
     that:
       - billet_warp_env_names | unique(case_sensitive=true) | length == billet_warp_env_names | length
     fail_msg: >-
       Two hosts in this play read their WARP connector token from the same
-      environment variable: {{ dict(ansible_play_hosts | zip(billet_warp_env_names)) }}.
+      environment variable: {{ dict(ansible_play_hosts_all | zip(billet_warp_env_names)) }}.
       Set billet_warp_connector_token_env on one of them to a distinct name.
+  run_once: true
+
+- name: Record the environment variable this host reads its token from
+  ansible.builtin.set_fact:
+    billet_warp_connector_token_env_effective: "{{ billet_warp_connector_token_env }}"
+
+# THE NAME EACH HOST READS IS THE NAME THE PLAY-WIDE LIST HOLDS FOR IT, asked
+# once of every host in the batch (each recorded its effective name in the
+# task above, before this one runs anywhere), so that a mismatch on one host
+# refuses before ANY host acts. An override at a scope hostvars does not see
+# (the vars of a role invocation) would make every host read one name while
+# the list showed distinct fallbacks and passed.
+- name: Refuse a token variable name the play-wide check could not see
+  vars:
+    billet_warp_effective_names: "{{ ansible_play_batch | map('extract', hostvars, 'billet_warp_connector_token_env_effective') | list }}"
+    billet_warp_computed_names: "{{ ansible_play_batch | map('extract', dict(ansible_play_hosts_all | zip(billet_warp_env_names))) | list }}"
+  ansible.builtin.assert:
+    that:
+      - billet_warp_effective_names == billet_warp_computed_names
+    fail_msg: >-
+      A host in this play reads its WARP connector token from a variable the play-wide
+      collision check could not see: the hosts read
+      {{ dict(ansible_play_batch | zip(billet_warp_effective_names)) }} and the check
+      computed {{ dict(ansible_play_batch | zip(billet_warp_computed_names)) }} from the
+      inventory. billet_warp_connector_token_env is set somewhere the check cannot see (the vars of a
+      role invocation, say); set it in the inventory for the host that needs it.
   run_once: true
 
 - name: Report that no connector token was supplied
@@ -80,13 +110,30 @@
         # disabled has no net.ipv6 tree, and a loop that set IPv4 forwarding
         # first and then failed on the IPv6 key left the host half-configured
         # and the play failed; asked first, the IPv4 key is set and the IPv6
-        # ones are skipped, and both are reported.
+        # ones are skipped, and both are reported. A file written on an earlier
+        # boot that had IPv6 still carries the keys, and `sysctl -p` of that
+        # file fails on them before any condition here helps, so they are
+        # removed first, without a reload.
         - name: Inspect whether the host has an IPv6 stack
           ansible.builtin.stat:
             path: /proc/sys/net/ipv6/conf/all
           register: billet_warp_ipv6
           check_mode: false
           when: billet_warp_sysctls | bool
+
+        - name: Remove IPv6 sysctls the file carries from a boot that had IPv6
+          ansible.posix.sysctl:
+            name: "{{ item }}"
+            sysctl_file: "{{ billet_warp_sysctl_file }}"
+            state: absent
+            reload: false
+          loop:
+            - net.ipv6.conf.all.forwarding
+            - net.ipv6.conf.all.accept_ra
+          become: true
+          when:
+            - billet_warp_sysctls | bool
+            - not billet_warp_ipv6.stat.exists
 
         - name: Set the connector's forwarding sysctls
           ansible.posix.sysctl:

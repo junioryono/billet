@@ -68,6 +68,12 @@ cat >"$work/play.yml" <<'EOF'
     - role: junioryono.billet.cloudflared_connector
 EOF
 
+# The same play with the variable name set on the role invocation, a scope
+# hostvars does not see: the play-wide list shows distinct fallbacks while
+# every host reads the one name, and only the per-host consistency check
+# catches it.
+sed -e 's/^    - role: junioryono.billet.cloudflared_connector$/    - role: junioryono.billet.cloudflared_connector\n      vars:\n        billet_cloudflared_token_env: BILLET_CLOUDFLARED_TOKEN_NODE_A/' "$work/play.yml" >"$work/play-rolevar.yml"
+
 # run <name> <expect> [env NAME=value ...] -- [ansible args ...]
 #
 # The temporary root is recreated unless BILLET_TEST_KEEP_ROOT=1 is among the
@@ -95,9 +101,14 @@ run() {
         ANSIBLE_COLLECTIONS_PATH="$collections_root:$HOME/.ansible/collections:/usr/share/ansible/collections" \
         ANSIBLE_STDOUT_CALLBACK=default ANSIBLE_FORCE_COLOR=0 ANSIBLE_NOCOLOR=1 \
         $envs \
-        ansible-playbook -i "$work/inventory.ini" -e ansible_become=false --diff -v "$@" "$work/play.yml" \
+        ansible-playbook -i "$work/inventory.ini" -e ansible_become=false --diff -v "$@" "$work/${BILLET_TEST_PLAY:-play}.yml" \
         >"$work/out.log" 2>&1 || status=$?
     judge "$name" "$status" "$work/out.log" "$expect" "${BILLET_TEST_STAGED:-}"
+    # A PREFIX ASSIGNMENT ON A FUNCTION CALL PERSISTS AFTER THE CALL in some
+    # shells (measured: the serial case ran the previous case's play and the
+    # staged allowance leaked into every later refusal), so a case's settings
+    # are cleared here and each case states its own.
+    BILLET_TEST_STAGED=; BILLET_TEST_PLAY=
 }
 
 # The token must be in the token file and nowhere else: not in any fake's
@@ -123,6 +134,15 @@ no_secret_leaked() {
 expected_unit() {
     printf '[Unit]\nDescription=Cloudflare Tunnel client\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nTimeoutStartSec=15\nType=notify\nExecStart=%s --no-autoupdate tunnel run --token-file %s\nRestart=on-failure\nRestartSec=5s\n\n[Install]\nWantedBy=multi-user.target\n' \
         "$work/root/bin/cloudflared" "$work/root/etc/cloudflared/token"
+}
+
+# The wait asked the journal for exactly the invocation systemd runs now, and
+# nothing else: an old window or a guessed id would not be this.
+awaited_current_invocation() {
+    current=$(cat "$work/state/unit-active")
+    [ -n "$current" ] || { echo "FAIL $1: the fake systemd holds no invocation" >&2; exit 1; }
+    grep -q "^journalctl --no-pager _SYSTEMD_INVOCATION_ID=$current\$" "$work/calls" || { echo "FAIL $1: the registration was not awaited on the current invocation $current: $(grep '^journalctl' "$work/calls")" >&2; exit 1; }
+    if grep '^journalctl' "$work/calls" | grep -qv "_SYSTEMD_INVOCATION_ID=$current"; then echo "FAIL $1: the journal was read other than by the current invocation: $(grep '^journalctl' "$work/calls")" >&2; exit 1; fi
 }
 
 restore_installed() {
@@ -170,7 +190,7 @@ unit=$work/root/etc/systemd/system/cloudflared.service
 expected_unit >"$work/expected.service"
 cmp -s "$unit" "$work/expected.service" || { echo "FAIL: the rendered unit is not byte-equal to the installer's:" >&2; diff "$work/expected.service" "$unit" >&2; exit 1; }
 grep -q '^systemctl .*daemon-reload' "$work/calls" || { echo "FAIL: systemd was not reloaded after the unit was written: $(cat "$work/calls")" >&2; exit 1; }
-grep -q '^journalctl .*_SYSTEMD_INVOCATION_ID=inv' "$work/calls" || { echo "FAIL: the registration was not awaited on the started invocation: $(cat "$work/calls")" >&2; exit 1; }
+awaited_current_invocation "the right token installs the connector"
 no_secret_leaked "the right token installs the connector"
 cp -R "$work/root" "$work/root-installed"; cp -R "$work/state" "$work/state-installed"
 
@@ -230,7 +250,7 @@ run "a rotation applies when the play reaches the host another way" pass BILLET_
     "BILLET_CLOUDFLARED_TOKEN_NODE_A=$token_a2" -- -e "billet_cloudflared_expected_tunnel_id=$tunnel_a" -e billet_cloudflared_routed_address=10.9.9.9
 [ "$(cat "$tok")" = "$token_a2" ] || { echo "FAIL: the rotation did not rewrite the token" >&2; exit 1; }
 grep -q '^systemctl .*restart' "$work/calls" || { echo "FAIL: the rotation did not restart the connector: $(cat "$work/calls")" >&2; exit 1; }
-grep -q '^journalctl .*_SYSTEMD_INVOCATION_ID=inv' "$work/calls" || { echo "FAIL: the registration was not awaited after a restart" >&2; exit 1; }
+awaited_current_invocation "a rotation applies when the play reaches the host another way"
 no_secret_leaked "a rotation applies when the play reaches the host another way"
 
 # 14. An explicit false applies the rotation whatever the address says.
@@ -259,7 +279,25 @@ run "a drifted unit is restored when the play reaches the host another way" pass
 cmp -s "$unit" "$work/expected.service" || { echo "FAIL: the drifted unit was not restored" >&2; exit 1; }
 grep -q '^systemctl .*daemon-reload' "$work/calls" || { echo "FAIL: the restored unit was not reloaded" >&2; exit 1; }
 grep -q '^systemctl .*restart' "$work/calls" || { echo "FAIL: the restored unit did not restart the connector" >&2; exit 1; }
-grep -q '^journalctl .*_SYSTEMD_INVOCATION_ID=inv' "$work/calls" || { echo "FAIL: the registration was not awaited after the restart" >&2; exit 1; }
+awaited_current_invocation "a drifted unit is restored when the play reaches the host another way"
+
+# 16b. A connector still activating (a long ExecStartPost) is a running one:
+#      the drift is refused under an unknown transport exactly as for active.
+restore_installed
+printf '# drift\n' >>"$unit"
+run "a drifted unit is not rewritten while the connector is activating" "would rewrite the unit and restart the running connector" BILLET_TEST_KEEP_ROOT=1 \
+    BILLET_FAKE_ACTIVE_STATE=activating "BILLET_CLOUDFLARED_TOKEN_NODE_A=$token_a" -- -e "billet_cloudflared_expected_tunnel_id=$tunnel_a"
+grep -q '^# drift$' "$unit" || { echo "FAIL: a refused unit rewrite rewrote the unit while activating" >&2; exit 1; }
+
+# 16c. A unit an older installer wrote with the token in ExecStart is adopted
+#      under a definite false, and neither the old unit's token nor the new
+#      one appears anywhere but the token file.
+restore_installed
+printf '[Service]\nExecStart=%s --no-autoupdate tunnel run --token %s\n' "$work/root/bin/cloudflared" "$token_b" >"$unit"
+run "a unit carrying an inline token is replaced without disclosing it" pass BILLET_TEST_KEEP_ROOT=1 \
+    "BILLET_CLOUDFLARED_TOKEN_NODE_A=$token_a" -- -e "billet_cloudflared_expected_tunnel_id=$tunnel_a" -e billet_cloudflared_carries_ansible_transport=false
+cmp -s "$unit" "$work/expected.service" || { echo "FAIL: the inline-token unit was not replaced" >&2; exit 1; }
+no_secret_leaked "a unit carrying an inline token is replaced without disclosing it"
 
 # 17. The apt path with a key that is not the pinned one: refused before the
 #     keyring copy, the repository and the package.
@@ -280,6 +318,19 @@ printf 'node-a ansible_host=127.0.0.1\nnode-b ansible_host=127.0.0.1 billet_clou
 run "two hosts sharing one token variable by override are refused" "read their cloudflared token from the same environment variable" \
     "BILLET_CLOUDFLARED_TOKEN_NODE_A=$token_a" -- -e "billet_cloudflared_expected_tunnel_id=$tunnel_a"
 [ ! -s "$work/calls" ] || { echo "FAIL: the override collision refusal came after a fake was called" >&2; exit 1; }
+
+# 19b. A name shared through a scope every host sees (-e) is refused too.
+printf 'node-a ansible_host=127.0.0.1\nnode-b ansible_host=127.0.0.1\n' >"$work/inventory.ini"
+run "two hosts sharing one token variable through -e are refused" "cloudflared token" \
+    "BILLET_CLOUDFLARED_TOKEN_NODE_A=$token_a" -- -e "billet_cloudflared_expected_tunnel_id=$tunnel_a" -e billet_cloudflared_token_env=BILLET_CLOUDFLARED_TOKEN_NODE_A
+[ ! -s "$work/calls" ] || { echo "FAIL: the -e collision refusal came after a fake was called" >&2; exit 1; }
+
+# A name set on the role invocation itself, which the play-wide check cannot
+# see: refused by the per-host check, before any fake is called.
+printf 'node-a ansible_host=127.0.0.1\nnode-b ansible_host=127.0.0.1\n' >"$work/inventory.ini"
+BILLET_TEST_PLAY=play-rolevar run "a name the play-wide check cannot see is refused" "a variable the play-wide collision check could not see" \
+    "BILLET_CLOUDFLARED_TOKEN_NODE_A=$token_a" -- -e "billet_cloudflared_expected_tunnel_id=$tunnel_a"
+[ ! -s "$work/calls" ] || { echo "FAIL: the role-vars refusal came after a fake was called" >&2; exit 1; }
 
 # 20. Two distinct hosts under serial: 1 converge, one batch at a time: the
 #     collision check reads the inventory, not a fact a later batch has not

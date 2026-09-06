@@ -98,10 +98,7 @@ Body: **why**, not what — the diff already says what. If the change encodes an
 ```
 Take an exclusive lock on the state directory
 
-SQLite's single-writer rule stops two connections writing at once. It does
-not stop two billet processes both long-polling GitHub and taking turns
-writing conflicting scheduling decisions to one ledger, which double-admits
-jobs onto a host that cannot hold them and fails silently.
+SQLite's single-writer rule stops two connections writing at once. It does not stop two billet processes both long-polling GitHub and taking turns writing conflicting scheduling decisions to one ledger, which double-admits jobs onto a host that cannot hold them and fails silently.
 
 flock rather than a PID file so a crashed server releases it automatically.
 ```

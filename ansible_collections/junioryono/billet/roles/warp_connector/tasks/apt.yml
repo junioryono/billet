@@ -49,18 +49,31 @@
   check_mode: false
   become: true
 
-- name: Report what a dry run cannot verify without the staged key
+# AND ONLY WITH THE TOOLS THE VERIFICATION NEEDS ALREADY THERE: a dry run
+# predicts the prerequisite install and does not do it, and the gpg read and
+# the repository module below run for real.
+- name: Inspect whether the verification's tools are installed
+  ansible.builtin.command:
+    argv: [sh, -c, 'command -v gpg >/dev/null && python3 -c "import debian"']
+  register: billet_warp_tools
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: ansible_check_mode
+
+- name: Report what a dry run cannot verify without the staged key or its tools
   ansible.builtin.debug:
     msg: >-
-      No signing key is staged on {{ inventory_hostname }} and this is a dry run:
-      the real converge fetches and verifies it before trusting the repository,
-      then adds the repository and installs the client.
+      {{ 'No signing key is staged' if not billet_warp_staged_key.stat.exists
+         else 'gpg or python3-debian is not installed' }} on {{ inventory_hostname }}
+      and this is a dry run: the real converge fetches and verifies it before
+      trusting the repository, then adds the repository and installs the client.
   when:
     - ansible_check_mode
-    - not billet_warp_staged_key.stat.exists
+    - not billet_warp_staged_key.stat.exists or billet_warp_tools.rc != 0
 
 - name: Verify the signing key and trust the repository
-  when: not (ansible_check_mode and not billet_warp_staged_key.stat.exists)
+  when: not (ansible_check_mode and (not billet_warp_staged_key.stat.exists or billet_warp_tools.rc != 0))
   block:
     - name: Read the staged signing key's fingerprint
       ansible.builtin.command:

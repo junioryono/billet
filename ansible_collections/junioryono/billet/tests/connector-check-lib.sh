@@ -62,8 +62,16 @@ if [ ! -f "$file" ]; then
     echo "fake gpg: no such file: $file" >&2
     exit 2
 fi
+# --dearmor writes the output it was asked for, so a gate that asserts the
+# keyring is absent after a refusal is asserting something a role that
+# dearmored before verifying would violate.
+out=""; prev=""
+for arg in "$@"; do
+    [ "$prev" = -o ] && out=$arg
+    prev=$arg
+done
 case " $* " in
-    *" --dearmor "*) exit 0 ;;
+    *" --dearmor "*) [ -n "$out" ] && printf 'DEARMORED %s' "$(cat "$file")" >"$out"; exit 0 ;;
 esac
 # The fingerprint follows the FILE, never the environment: a good key is the
 # fixture's bytes and anything else is a different key.
@@ -75,10 +83,24 @@ fi
 exit 0
 EOF
 
+    # THE JOURNAL ANSWERS FOR THE INVOCATION ASKED ABOUT: the registration line
+    # of the invocation systemd currently runs, an OLD registration line for a
+    # window read that named no invocation (which a role that fell back to a
+    # window would accept), and nothing for any other invocation.
     cat >"$bin/journalctl" <<'EOF'
 #!/bin/sh
 printf 'journalctl %s\n' "$*" >>"$BILLET_FAKE_CALLS"
-echo "Sep 06 00:00:00 host cloudflared[1]: INF Registered tunnel connection connIndex=0"
+current=""
+[ -f "$BILLET_FAKE_STATE/unit-active" ] && current=$(cat "$BILLET_FAKE_STATE/unit-active")
+asked=""
+for arg in "$@"; do
+    case "$arg" in _SYSTEMD_INVOCATION_ID=*) asked=${arg#_SYSTEMD_INVOCATION_ID=} ;; esac
+done
+if [ -z "$asked" ]; then
+    echo "Sep 01 00:00:00 host cloudflared[1]: INF Registered tunnel connection connIndex=0"
+elif [ -n "$current" ] && [ "$asked" = "$current" ]; then
+    echo "Sep 06 00:00:00 host cloudflared[1]: INF Registered tunnel connection connIndex=0"
+fi
 exit 0
 EOF
 
@@ -97,6 +119,8 @@ esac
 active=inactive; sub=dead; enabled=disabled
 [ -f "$BILLET_FAKE_STATE/unit-active" ] && { active=active; sub=running; }
 [ -f "$BILLET_FAKE_STATE/unit-enabled" ] && enabled=enabled
+# A unit in a transitional state, for the guard's reading of it.
+[ -n "${BILLET_FAKE_ACTIVE_STATE:-}" ] && { active=$BILLET_FAKE_ACTIVE_STATE; sub=start-post; }
 # `show -p NAME --value` answers one property, the way the role asks for the
 # ActiveState and the InvocationID; a bare `show` is what the systemd_service
 # module asks and gets the whole set. The invocation id changes on every start
