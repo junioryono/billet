@@ -124,14 +124,12 @@ if grep -q -- '--dearmor' "$work/calls"; then echo "FAIL: a refused key was dear
 if grep -q 'connector new' "$work/calls"; then echo "FAIL: a refused key did not stop the enrolment" >&2; exit 1; fi
 [ ! -e "$work/legacy/cloudflare-warp.asc" ] || { echo "FAIL: the legacy key at the given path was not removed" >&2; exit 1; }
 
-# 6b. The pinned key is dearmored into the keyring the role names, and only
-#     then is the repository added: the repository module is the first task
-#     this machine cannot run (no python3-debian), so its refusal is where the
-#     apt path ends here, with the keyring already written by a verified key.
-BILLET_TEST_STAGED=staged run "the pinned key reaches the keyring before the repository" "python3-debian is not installed" \
-    BILLET_TEST_MANAGE_APT=true "BILLET_WARP_CONNECTOR_TOKEN_NODE_A=$token" --
-[ -s "$work/root/keyrings/cloudflare-warp-archive-keyring.gpg" ] || { echo "FAIL: the verified key was not dearmored into the keyring" >&2; exit 1; }
-grep -q '^gpg .*--show-keys' "$work/calls" || { echo "FAIL: the key was never read by gpg" >&2; exit 1; }
+# What is NOT run here, on purpose: the apt path past the keyring. The
+# repository module writes under /etc/apt with no path seam, so a case that
+# ran it would touch the real machine wherever it happened to have
+# python3-debian; the ordering (verify, then dearmor, then repository) is
+# proved by the refusal above, whose fake gpg would have written the keyring
+# had the role dearmored first.
 
 # 7. Two hosts sharing one variable name are refused before any host acts.
 printf 'node-a ansible_host=127.0.0.1\nnode_a ansible_host=127.0.0.1\n' >"$work/inventory.ini"
@@ -154,9 +152,13 @@ run "two hosts sharing one token variable through -e are refused" "WARP connecto
 # A name set on the role invocation itself, which the play-wide check cannot
 # see: refused by the per-host check, before any fake is called.
 printf 'node-a ansible_host=127.0.0.1\nnode-b ansible_host=127.0.0.1\n' >"$work/inventory.ini"
-BILLET_TEST_PLAY=play-rolevar run "a name the play-wide check cannot see is refused" "a variable the play-wide collision check could not see" \
-    "BILLET_WARP_CONNECTOR_TOKEN_NODE_A=$token" -- 
-[ ! -s "$work/calls" ] || { echo "FAIL: the role-vars refusal came after a fake was called" >&2; exit 1; }
+BILLET_TEST_STAGED=staged BILLET_TEST_PLAY=play-rolevar run "a name the play-wide check cannot see is refused" "a variable the play-wide collision check could not see" \
+    "BILLET_WARP_CONNECTOR_TOKEN_NODE_A=$token" --
+# node-a's own name IS the computed one, so it converges; node-b, which reads
+# node-a's variable, is the host refused. The staged allowance is for node-a's
+# writes; node-b's row must be unchanged.
+sed -n '/PLAY RECAP/,$p' "$work/out.log" | grep -qE '^node-b +: +ok=[0-9]+ +changed=0 .*failed=1' || { echo "FAIL: node-b was not the host refused, unchanged" >&2; sed -n '/PLAY RECAP/,$p' "$work/out.log" >&2; exit 1; }
+sed -n '/PLAY RECAP/,$p' "$work/out.log" | grep -qE '^node-a +: .*failed=0' || { echo "FAIL: node-a, whose name is its own, was refused too" >&2; exit 1; }
 
 # 9. Two distinct hosts under serial: 1: the collision check reads the
 #    inventory, so the first batch does not fail on a fact the second has not

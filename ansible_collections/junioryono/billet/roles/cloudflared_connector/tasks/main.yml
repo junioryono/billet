@@ -38,6 +38,10 @@
       {%- endfor -%}
       {{ names }}
 
+# EVERY HOST ASSERTS BOTH, never one host for all: a run_once task is skipped
+# for every host when the first host's inherited `when` is false, and a
+# consumer may well invoke the role under a condition. The computation is
+# pure, so the cost is nothing.
 - name: Refuse two hosts whose connector tokens would share one environment variable
   ansible.builtin.assert:
     that:
@@ -46,37 +50,23 @@
       Two hosts in this play read their cloudflared token from the same
       environment variable: {{ dict(ansible_play_hosts_all | zip(billet_cloudflared_env_names)) }}.
       Set billet_cloudflared_token_env on one of them to a distinct name.
-  run_once: true
 
 # THE NAME THIS HOST READS IS THE NAME THE PLAY-WIDE LIST HOLDS FOR IT. An
 # override at a scope hostvars does not see (the vars of a role invocation)
-# would make every host read one name while the list above showed distinct
-# fallbacks and passed.
-- name: Record the environment variable this host reads its token from
-  ansible.builtin.set_fact:
-    billet_cloudflared_token_env_effective: "{{ billet_cloudflared_token_env }}"
-
-# THE NAME EACH HOST READS IS THE NAME THE PLAY-WIDE LIST HOLDS FOR IT, asked
-# once of every host in the batch (each recorded its effective name in the
-# task above, before this one runs anywhere), so that a mismatch on one host
-# refuses before ANY host acts. An override at a scope hostvars does not see
-# (the vars of a role invocation) would make every host read one name while
-# the list showed distinct fallbacks and passed.
+# would make this host read one name while the list above showed distinct
+# fallbacks and passed; a host whose own name is the computed one is safe to
+# act whatever its neighbour was refused for.
 - name: Refuse a token variable name the play-wide check could not see
-  vars:
-    billet_cloudflared_effective_names: "{{ ansible_play_batch | map('extract', hostvars, 'billet_cloudflared_token_env_effective') | list }}"
-    billet_cloudflared_computed_names: "{{ ansible_play_batch | map('extract', dict(ansible_play_hosts_all | zip(billet_cloudflared_env_names))) | list }}"
   ansible.builtin.assert:
     that:
-      - billet_cloudflared_effective_names == billet_cloudflared_computed_names
+      - billet_cloudflared_token_env == billet_cloudflared_env_names[ansible_play_hosts_all.index(inventory_hostname)]
     fail_msg: >-
-      A host in this play reads its cloudflared token from a variable the play-wide
-      collision check could not see: the hosts read
-      {{ dict(ansible_play_batch | zip(billet_cloudflared_effective_names)) }} and the check
-      computed {{ dict(ansible_play_batch | zip(billet_cloudflared_computed_names)) }} from the
-      inventory. billet_cloudflared_token_env is set somewhere the check cannot see (the vars of a
-      role invocation, say); set it in the inventory for the host that needs it.
-  run_once: true
+      {{ inventory_hostname }} reads its cloudflared token from a variable the play-wide
+      collision check could not see: it reads {{ billet_cloudflared_token_env }} and the check
+      computed {{ billet_cloudflared_env_names[ansible_play_hosts_all.index(inventory_hostname)] }}
+      from the inventory. billet_cloudflared_token_env is set somewhere the check cannot see (the
+      vars of a role invocation, say); set it in the inventory for the host
+      that needs it.
 
 - name: Report that no connector token was supplied
   ansible.builtin.debug:
@@ -342,26 +332,41 @@
             - not ansible_check_mode
           become: true
 
-        - name: Start and enable the connector
+        # TWO TASKS, BOTH UNDER no_log. The module returns the unit's whole
+        # status, ExecStart included, and an adopted unit may still carry an
+        # inline token in a dry run that did not rewrite it. The state and the
+        # enablement are separate so that "the state task changed" means a
+        # process was started or restarted (from `inactive`, `failed` or
+        # `deactivating` alike) and nothing else, which is what the wait keys on.
+        - name: Start or restart the connector
           ansible.builtin.systemd_service:
             name: cloudflared
             state: "{{ 'restarted' if (billet_cloudflared_token_file is changed or billet_cloudflared_unit_file is changed) else 'started' }}"
-            enabled: true
           register: billet_cloudflared_service
+          no_log: true
           # In a dry run only where the unit exists: the module predicts a start
-          # or an enable from `systemctl show`, and a unit the dry run did not
-          # write cannot be asked about.
+          # from `systemctl show`, and a unit the dry run did not write cannot be
+          # asked about.
           when: not ansible_check_mode or billet_cloudflared_files.results[1].stat.exists
           become: true
 
-        # ONLY WHEN THIS RUN STARTED OR RESTARTED THE PROCESS, and only this
-        # invocation's log. cloudflared logs the registration line at startup
+        - name: Enable the connector
+          ansible.builtin.systemd_service:
+            name: cloudflared
+            enabled: true
+          no_log: true
+          when: not ansible_check_mode or billet_cloudflared_files.results[1].stat.exists
+          become: true
+
+        # ONLY WHEN THIS RUN STARTED OR RESTARTED THE PROCESS (the state task
+        # reports changed for exactly that), and only this invocation's log. cloudflared logs the registration line at startup
         # and reconnect, never periodically; a fixed window read on every run
         # was empty once the connector had been up for longer than the window,
         # and failed a healthy host (measured on the reference deployment). A
         # window read after a restart could also find the PREVIOUS process's
         # line, so the wait is keyed on the invocation systemd just started.
-        # Enabling an already-running unit starts no process and awaits nothing.
+        # Enabling is its own task above, so it starts no process and awaits
+        # nothing here.
         - name: Read the invocation systemd started
           ansible.builtin.command:
             argv: [systemctl, show, -p, InvocationID, --value, cloudflared]
@@ -369,8 +374,7 @@
           changed_when: false
           when:
             - not ansible_check_mode
-            - billet_cloudflared_token_file is changed or billet_cloudflared_unit_file is changed
-              or (billet_cloudflared_active.stdout | trim) in ['inactive', 'failed']
+            - billet_cloudflared_service is changed
           become: true
 
         # NO INVOCATION ID IS A REFUSAL, not a window read: a window of the

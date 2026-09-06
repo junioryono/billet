@@ -299,6 +299,29 @@ run "a unit carrying an inline token is replaced without disclosing it" pass BIL
 cmp -s "$unit" "$work/expected.service" || { echo "FAIL: the inline-token unit was not replaced" >&2; exit 1; }
 no_secret_leaked "a unit carrying an inline token is replaced without disclosing it"
 
+# 16d. The same adoption in a dry run, which rewrites nothing: the service
+#      task reads the unit systemd still runs, ExecStart and token included,
+#      and that must not reach the output either.
+restore_installed
+printf '[Service]\nExecStart=%s --no-autoupdate tunnel run --token %s\n' "$work/root/bin/cloudflared" "$token_b" >"$unit"
+run "a dry run over a unit carrying an inline token discloses nothing" pass BILLET_TEST_KEEP_ROOT=1 \
+    "BILLET_CLOUDFLARED_TOKEN_NODE_A=$token_a" -- --check -e "billet_cloudflared_expected_tunnel_id=$tunnel_a" -e billet_cloudflared_carries_ansible_transport=false
+grep -Fq -- "--token $token_b" "$unit" || { echo "FAIL: a dry run rewrote the unit" >&2; exit 1; }
+# The service task did run and read the unit's status (a skipped task would
+# disclose nothing and prove nothing): the module's bare `show` is the record.
+grep -qE '^systemctl show cloudflared' "$work/calls" || { echo "FAIL: the dry run never asked systemd about the unit, so the disclosure was not exercised: $(grep '^systemctl' "$work/calls")" >&2; exit 1; }
+# The unit still carries it by construction; argv and the output must not.
+if grep -Fq -- "$token_b" "$work/calls"; then echo "FAIL: the adopted unit's token reached a command's argv" >&2; exit 1; fi
+if grep -Fq -- "$token_b" "$work/out.log"; then echo "FAIL: the adopted unit's token appears in the dry run's output" >&2; exit 1; fi
+
+# 16e. A connector caught deactivating with nothing to rewrite is started, and
+#      that start is awaited on its invocation like any other.
+restore_installed
+run "a start from deactivating awaits the registration" pass BILLET_TEST_KEEP_ROOT=1 \
+    BILLET_FAKE_ACTIVE_STATE=deactivating "BILLET_CLOUDFLARED_TOKEN_NODE_A=$token_a" -- -e "billet_cloudflared_expected_tunnel_id=$tunnel_a"
+grep -q '^systemctl .*start' "$work/calls" || { echo "FAIL: a deactivating connector was not started: $(cat "$work/calls")" >&2; exit 1; }
+awaited_current_invocation "a start from deactivating awaits the registration"
+
 # 17. The apt path with a key that is not the pinned one: refused before the
 #     keyring copy, the repository and the package.
 BILLET_TEST_STAGED=staged run "a signing key with another fingerprint is refused" "not exactly one primary key with the pinned fingerprint" \
@@ -328,9 +351,13 @@ run "two hosts sharing one token variable through -e are refused" "cloudflared t
 # A name set on the role invocation itself, which the play-wide check cannot
 # see: refused by the per-host check, before any fake is called.
 printf 'node-a ansible_host=127.0.0.1\nnode-b ansible_host=127.0.0.1\n' >"$work/inventory.ini"
-BILLET_TEST_PLAY=play-rolevar run "a name the play-wide check cannot see is refused" "a variable the play-wide collision check could not see" \
+BILLET_TEST_STAGED=staged BILLET_TEST_PLAY=play-rolevar run "a name the play-wide check cannot see is refused" "a variable the play-wide collision check could not see" \
     "BILLET_CLOUDFLARED_TOKEN_NODE_A=$token_a" -- -e "billet_cloudflared_expected_tunnel_id=$tunnel_a"
-[ ! -s "$work/calls" ] || { echo "FAIL: the role-vars refusal came after a fake was called" >&2; exit 1; }
+# node-a's own name IS the computed one, so it converges; node-b, which reads
+# node-a's variable, is the host refused. The staged allowance is for node-a's
+# writes; node-b's row must be unchanged.
+sed -n '/PLAY RECAP/,$p' "$work/out.log" | grep -qE '^node-b +: +ok=[0-9]+ +changed=0 .*failed=1' || { echo "FAIL: node-b was not the host refused, unchanged" >&2; sed -n '/PLAY RECAP/,$p' "$work/out.log" >&2; exit 1; }
+sed -n '/PLAY RECAP/,$p' "$work/out.log" | grep -qE '^node-a +: .*failed=0' || { echo "FAIL: node-a, whose name is its own, was refused too" >&2; exit 1; }
 
 # 20. Two distinct hosts under serial: 1 converge, one batch at a time: the
 #     collision check reads the inventory, not a fact a later batch has not

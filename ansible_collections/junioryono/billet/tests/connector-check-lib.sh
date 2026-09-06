@@ -140,7 +140,13 @@ case " $* " in
                 *) echo "" ;;
             esac
         else
-            printf 'Id=cloudflared.service\nLoadState=loaded\nActiveState=%s\nSubState=%s\nUnitFileState=%s\nFragmentPath=/etc/systemd/system/cloudflared.service\n' "$active" "$sub" "$enabled"
+            # ExecStart from the unit on disk, as systemd reports it: the module
+            # returns the whole status, and an adopted unit's ExecStart is where
+            # an inline token would be.
+            exec_start=""
+            unit_file="${BILLET_TEST_ROOT:-/nonexistent}/etc/systemd/system/cloudflared.service"
+            [ -f "$unit_file" ] && exec_start=$(sed -n 's/^ExecStart=//p' "$unit_file" | head -n1)
+            printf 'Id=cloudflared.service\nLoadState=loaded\nActiveState=%s\nSubState=%s\nUnitFileState=%s\nFragmentPath=/etc/systemd/system/cloudflared.service\nExecStart={ path=%s ; argv[]=%s }\n' "$active" "$sub" "$enabled" "${exec_start%% *}" "$exec_start"
         fi
         ;;
     *" is-enabled "*)
@@ -187,7 +193,13 @@ judge() {
         if ! grep -q 'FAILED!\|^failed: \[' "$log"; then
             echo "FAIL $name: the run failed without any task failing" >&2; tail -30 "$log" >&2; exit 1
         fi
-        if [ "$staged" != staged ] && ! sed -n '/PLAY RECAP/,$p' "$log" | grep -qE '^[^ ]+ +: +ok=[0-9]+ +changed=0 '; then
+        # EVERY host's row, not any one: a refusal on one host beside a write on
+        # another is a refusal that did not precede every write.
+        rows=$(sed -n '/PLAY RECAP/,$p' "$log" | grep -cE '^[^ ]+ +: +ok=[0-9]+ +changed=[0-9]+ ')
+        if [ "$rows" -lt 1 ]; then
+            echo "FAIL $name: the recap names no host" >&2; tail -30 "$log" >&2; exit 1
+        fi
+        if [ "$staged" != staged ] && sed -n '/PLAY RECAP/,$p' "$log" | grep -qE '^[^ ]+ +: +ok=[0-9]+ +changed=[1-9]'; then
             echo "FAIL $name: refused, but the recap reports a change; a refusal must precede every write" >&2
             sed -n '/PLAY RECAP/,$p' "$log" >&2; exit 1
         fi

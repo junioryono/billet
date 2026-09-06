@@ -29,6 +29,10 @@
       {%- endfor -%}
       {{ names }}
 
+# EVERY HOST ASSERTS BOTH, never one host for all: a run_once task is skipped
+# for every host when the first host's inherited `when` is false, and a
+# consumer may well invoke the role under a condition. The computation is
+# pure, so the cost is nothing.
 - name: Refuse two hosts whose connector tokens would share one environment variable
   ansible.builtin.assert:
     that:
@@ -37,33 +41,23 @@
       Two hosts in this play read their WARP connector token from the same
       environment variable: {{ dict(ansible_play_hosts_all | zip(billet_warp_env_names)) }}.
       Set billet_warp_connector_token_env on one of them to a distinct name.
-  run_once: true
 
-- name: Record the environment variable this host reads its token from
-  ansible.builtin.set_fact:
-    billet_warp_connector_token_env_effective: "{{ billet_warp_connector_token_env }}"
-
-# THE NAME EACH HOST READS IS THE NAME THE PLAY-WIDE LIST HOLDS FOR IT, asked
-# once of every host in the batch (each recorded its effective name in the
-# task above, before this one runs anywhere), so that a mismatch on one host
-# refuses before ANY host acts. An override at a scope hostvars does not see
-# (the vars of a role invocation) would make every host read one name while
-# the list showed distinct fallbacks and passed.
+# THE NAME THIS HOST READS IS THE NAME THE PLAY-WIDE LIST HOLDS FOR IT. An
+# override at a scope hostvars does not see (the vars of a role invocation)
+# would make this host read one name while the list above showed distinct
+# fallbacks and passed; a host whose own name is the computed one is safe to
+# act whatever its neighbour was refused for.
 - name: Refuse a token variable name the play-wide check could not see
-  vars:
-    billet_warp_effective_names: "{{ ansible_play_batch | map('extract', hostvars, 'billet_warp_connector_token_env_effective') | list }}"
-    billet_warp_computed_names: "{{ ansible_play_batch | map('extract', dict(ansible_play_hosts_all | zip(billet_warp_env_names))) | list }}"
   ansible.builtin.assert:
     that:
-      - billet_warp_effective_names == billet_warp_computed_names
+      - billet_warp_connector_token_env == billet_warp_env_names[ansible_play_hosts_all.index(inventory_hostname)]
     fail_msg: >-
-      A host in this play reads its WARP connector token from a variable the play-wide
-      collision check could not see: the hosts read
-      {{ dict(ansible_play_batch | zip(billet_warp_effective_names)) }} and the check
-      computed {{ dict(ansible_play_batch | zip(billet_warp_computed_names)) }} from the
-      inventory. billet_warp_connector_token_env is set somewhere the check cannot see (the vars of a
-      role invocation, say); set it in the inventory for the host that needs it.
-  run_once: true
+      {{ inventory_hostname }} reads its WARP connector token from a variable the play-wide
+      collision check could not see: it reads {{ billet_warp_connector_token_env }} and the check
+      computed {{ billet_warp_env_names[ansible_play_hosts_all.index(inventory_hostname)] }}
+      from the inventory. billet_warp_connector_token_env is set somewhere the check cannot see (the
+      vars of a role invocation, say); set it in the inventory for the host
+      that needs it.
 
 - name: Report that no connector token was supplied
   ansible.builtin.debug:
