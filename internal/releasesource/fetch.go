@@ -386,8 +386,9 @@ func PolicyForRelease(skip bool) (Policy, error) {
 	}
 
 	return Policy{
-		Required: true,
-		Identity: DefaultSigningIdentity,
-		Issuer:   imagesource.GitHubOIDCIssuer,
+		Required:            true,
+		Identity:            DefaultSigningIdentity,
+		Issuer:              imagesource.GitHubOIDCIssuer,
+		SourceRepositoryURI: "https://github.com/" + DefaultRepo,
 	}, nil
 }

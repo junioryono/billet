@@ -1101,7 +1101,8 @@ func (s *CacheService) attach(w http.ResponseWriter, r *http.Request, session *c
 
 	if strings.TrimSpace(request.Key) == "" || strings.TrimSpace(request.Key) != request.Key ||
 		len(request.Key) > cacheKeyLimit ||
-		strings.HasPrefix(request.Key, dockerStoreKey) || request.SizeBytes <= 0 ||
+		strings.HasPrefix(request.Key, dockerStoreKey) ||
+		strings.HasPrefix(request.Key, actionsStorePrefix) || request.SizeBytes <= 0 ||
 		request.SizeBytes > cacheVolumeLimit {
 		http.Error(w, "cache key or size is outside the allowed range", http.StatusBadRequest)
 

@@ -634,6 +634,21 @@ func TestOrdinaryCacheRequestsCannotClaimTheDockerImageStoreNamespace(t *testing
 	}
 }
 
+func TestOrdinaryCacheRequestsCannotClaimTheActionsNamespace(t *testing.T) {
+	t.Parallel()
+
+	service, storage, token := testCacheService(t, provider.TrustTrusted)
+	response := cacheRequest(t, service, token, "/v1/volumes", map[string]any{
+		"key": "actions-cache/scope/version/key", "size_bytes": int64(1 << 30),
+	})
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("reserved Actions key returned HTTP %d: %s", response.Code, response.Body.String())
+	}
+	if storage.created != 0 || storage.cloned != 0 {
+		t.Fatalf("reserved Actions key allocated storage: created=%d cloned=%d", storage.created, storage.cloned)
+	}
+}
+
 func TestCacheKeysAreNamespacedByDeployment(t *testing.T) {
 	t.Parallel()
 

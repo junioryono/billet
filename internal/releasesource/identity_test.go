@@ -27,6 +27,9 @@ func TestTheSigningIdentityAcceptsWhatTheReleaseWorkflowSignsWith(t *testing.T) 
 	if !policy.Required {
 		t.Fatal("the default release policy does not require a signature")
 	}
+	if policy.SourceRepositoryURI != "https://github.com/"+DefaultRepo {
+		t.Fatalf("release policy does not bind the source repository: %+v", policy)
+	}
 
 	if policy.Issuer != "https://token.actions.githubusercontent.com" {
 		t.Fatalf("the default release policy trusts issuer %q, want GitHub Actions", policy.Issuer)

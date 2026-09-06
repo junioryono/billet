@@ -32,8 +32,8 @@ jobs:
     # `release.yml@refs/heads/main`, the exact identity every deployment trusts,
     # over whatever source that caller checked out. The job never runs there,
     # so no token is minted and no certificate exists to present. The other half
-    # of the guard, pinning the source repository extension in the verifier, is
-    # deliberately not enforced yet (internal/imagesource/verify.go).
+    # of the guard pins the source repository extension in the verifier, including
+    # when an older tagged copy of this workflow lacks the caller guard.
     if: github.repository == 'junioryono/billet'
     runs-on: ubuntu-latest
     timeout-minutes: 30
