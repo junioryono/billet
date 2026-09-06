@@ -95,13 +95,14 @@ case " $* " in
   *" --list-hosts "*) cat "$BILLET_FAKE_LIST_HOSTS"; exit 0 ;;
 esac
 { printf '%s\n' "$@"; echo "--"; } >>"$BILLET_FAKE_PB_ARGS"
-env | sort >"$BILLET_FAKE_PB_ENV"
+env -0 >"$BILLET_FAKE_PB_ENV"
 n=$(cat "$BILLET_FAKE_PASS" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" >"$BILLET_FAKE_PASS"
 if [ "$n" = 1 ]; then cat "$BILLET_FAKE_RECAP_1"; else cat "$BILLET_FAKE_RECAP_2"; fi
 exit "${BILLET_FAKE_PB_EXIT:-0}"
 `,
 		"ansible": `#!/bin/sh
 printf 'ansible %s\n' "$*" >>"$BILLET_FAKE_CALLS"
+env -0 >"$BILLET_FAKE_ANSIBLE_ENV"
 cat "$BILLET_FAKE_DEBUG"
 `,
 		"nc": `#!/bin/sh
@@ -118,13 +119,19 @@ exit 1
 printf 'warp-cli %s\n' "$*" >>"$BILLET_FAKE_CALLS"
 case " $* " in
   *" status "*) if [ "${BILLET_FAKE_WARP_CONNECTS:-yes}" = yes ]; then echo "Status update: Connected"; else echo "Status update: Registered"; fi ;;
-  *" registration show "*) if [ "${BILLET_FAKE_WARP_REGISTERED:-no}" = yes ]; then echo "Device ID: abc"; else echo "Registration Missing"; exit 1; fi ;;
+  *" registration show "*)
+    case "${BILLET_FAKE_WARP_REGISTERED:-no}" in
+      yes) echo "Device ID: abc" ;;
+      error) echo "Error communicating with daemon" >&2; exit 3 ;;
+      *) echo "Registration Missing"; exit 1 ;;
+    esac ;;
+  *" registration delete "*) if [ "${BILLET_FAKE_WARP_DELETE_SAYS:-}" = missing ]; then echo "Registration Missing"; exit 1; fi ;;
 esac
 exit "${BILLET_FAKE_WARP_EXIT:-0}"
 `,
 		// A timeout(1) shim: macOS has none, and the scripts bound every call
 		// with it; the bound itself is not what these tests measure.
-		"timeout": "#!/bin/sh\nshift\nexec \"$@\"\n",
+		"timeout": "#!/bin/sh\nwhile [ \"${1#-}\" != \"$1\" ]; do shift 2; done\nshift\nexec \"$@\"\n",
 		// python3 for install-ansible.sh: `-m venv DIR` writes a venv whose
 		// python, ansible and ansible-galaxy are recorders; anything else runs
 		// the real interpreter, which converge.sh uses to parse JSON.
@@ -144,6 +151,9 @@ exec "$BILLET_REAL_PYTHON3" "$@"
 printf 'sudo %s\n' "$*" >>"$BILLET_FAKE_CALLS"
 # A recorder: nothing here may write under /etc or /var.
 cat >/dev/null 2>&1 || true
+case " $* " in
+  *" rm -f /var/lib/cloudflare-warp/mdm.xml "*) [ "${BILLET_FAKE_SUDO_RM_FAIL:-no}" = yes ] && exit 1 ;;
+esac
 exit 0
 `,
 		"sleep":       "#!/bin/sh\nexit 0\n",
@@ -230,6 +240,7 @@ func (f *convergeFixture) run(t *testing.T, r convergeRun) (string, error) {
 		"BILLET_FAKE_CALLS=" + f.calls,
 		"BILLET_FAKE_PB_ARGS=" + f.pbArgs,
 		"BILLET_FAKE_PB_ENV=" + f.pbEnv,
+		"BILLET_FAKE_ANSIBLE_ENV=" + filepath.Join(f.dir, "ansible-env"),
 		"BILLET_FAKE_PASS=" + filepath.Join(f.dir, "pass"),
 		"BILLET_FAKE_LIST_HOSTS=" + write("list-hosts", r.listHosts),
 		"BILLET_FAKE_DEBUG=" + write("debug", r.debug),
@@ -254,6 +265,25 @@ func (f *convergeFixture) run(t *testing.T, r convergeRun) (string, error) {
 	}
 	out, err := cmd.CombinedOutput()
 	return string(out), err
+}
+
+// recordedEnv reads a fake's NUL-separated environment record as exact
+// NAME=value entries.
+//
+// EXACT ENTRIES, NOT A SUBSTRING OF `env`'s OUTPUT: a value with newlines
+// prints across lines, and a substring check on the newline-separated form
+// matched a later line of one variable's value as if it were a variable of
+// its own, which is how a test about the child's environment passed against a
+// script that never exported anything (measured on this file's first version).
+func recordedEnv(t *testing.T, p string) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	for _, entry := range strings.Split(string(readRecorded(t, p)), "\x00") {
+		if name, value, ok := strings.Cut(entry, "="); ok {
+			out[name] = value
+		}
+	}
+	return out
 }
 
 // realPython3 is the interpreter the fake python3 hands everything but a
@@ -465,11 +495,14 @@ func TestEnvironmentLinesReachTheChildAndNotItsArgv(t *testing.T) {
 	if err != nil {
 		t.Fatalf("converge failed: %v\n%s", err, out)
 	}
-	env := readRecorded(t, f.pbEnv)
-	for _, want := range []string{"BILLET_CLOUDFLARED_TOKEN_NODE_A=tok-SECRET-1", "BILLET_WARP_CONNECTOR_TOKEN_NODE_A=tok-SECRET-2", "ANSIBLE_HOST_KEY_CHECKING=True"} {
-		if !strings.Contains(string(env), want+"\n") {
-			t.Errorf("ansible-playbook's environment lacks %q", want)
+	env := recordedEnv(t, f.pbEnv)
+	for name, want := range map[string]string{"BILLET_CLOUDFLARED_TOKEN_NODE_A": "tok-SECRET-1", "BILLET_WARP_CONNECTOR_TOKEN_NODE_A": "tok-SECRET-2", "ANSIBLE_HOST_KEY_CHECKING": "True"} {
+		if env[name] != want {
+			t.Errorf("ansible-playbook's environment has %s=%q, want %q", name, env[name], want)
 		}
+	}
+	if _, present := env["BILLET_ENVIRONMENT"]; present {
+		t.Error("the raw environment block reached the child under its own name")
 	}
 	args := readRecorded(t, f.pbArgs)
 	calls := readRecorded(t, f.calls)
@@ -507,9 +540,8 @@ func TestTheCredentialsAreWrittenReadOnlyToTheOwnerAndExported(t *testing.T) {
 		if info.Mode().Perm() != 0o600 {
 			t.Errorf("%s is mode %o, want 0600", name, info.Mode().Perm())
 		}
-		env := readRecorded(t, f.pbEnv)
-		if !strings.Contains(string(env), envName+"="+filepath.Join(f.runnerTm, name)+"\n") {
-			t.Errorf("ansible-playbook's environment lacks %s", envName)
+		if got := recordedEnv(t, f.pbEnv)[envName]; got != filepath.Join(f.runnerTm, name) {
+			t.Errorf("ansible-playbook's environment has %s=%q, want the key file", envName, got)
 		}
 	}
 	args := readRecorded(t, f.pbArgs)
@@ -775,10 +807,10 @@ func TestReachTimesOutNamingTheEnrolmentPolicy(t *testing.T) {
 	}
 }
 
-func runCleanup(t *testing.T, f *convergeFixture, warpExit string) (string, error) {
+func runCleanup(t *testing.T, f *convergeFixture, warpExit string, extra ...string) (string, error) {
 	t.Helper()
 	cmd := exec.CommandContext(t.Context(), "bash", filepath.Join("converge-fleet", "cleanup.sh"))
-	cmd.Env = []string{"PATH=" + f.bin + ":" + os.Getenv("PATH"), "RUNNER_TEMP=" + f.runnerTm, "BILLET_FAKE_CALLS=" + f.calls, "BILLET_FAKE_WARP_EXIT=" + warpExit}
+	cmd.Env = append([]string{"PATH=" + f.bin + ":" + os.Getenv("PATH"), "RUNNER_TEMP=" + f.runnerTm, "BILLET_FAKE_CALLS=" + f.calls, "BILLET_FAKE_WARP_EXIT=" + warpExit}, extra...)
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }

@@ -43,10 +43,14 @@ if [[ ! $key_fpr =~ ^[0-9A-F]{40}$ ]]; then
 fi
 
 # A registration already on this runner is somebody's; refuse before anything
-# is written, because cleanup would delete it.
+# is written, because cleanup would delete it. ONLY A POSITIVE "MISSING" LETS
+# THIS RUN PROCEED: a client that answered anything else, or did not answer
+# (a stopped daemon still has its registration on disk), is could-not-tell,
+# and could-not-tell does not authorise a takeover.
 if command -v warp-cli >/dev/null 2>&1; then
-  if existing=$(timeout 30 warp-cli --accept-tos registration show 2>/dev/null) && [[ -n $existing ]] && ! grep -qi 'missing' <<<"$existing"; then
-    echo "::error::this runner already holds a WARP registration, so the action cannot enrol one it can later delete without deleting somebody's. Use a runner with no registration, or reach: none on a runner that already reaches the hosts."
+  existing=$(timeout -k 5 30 warp-cli --accept-tos registration show 2>&1) || true
+  if ! grep -qiE 'registration missing|not registered|no registration' <<<"$existing"; then
+    echo "::error::this runner has a WARP client whose registration state is not 'missing' (it answered: ${existing:-nothing}), so the action cannot enrol a registration it can later delete without deleting somebody's. Use a runner with no registration, or reach: none on a runner that already reaches the hosts."
     exit 1
   fi
 fi
@@ -63,8 +67,8 @@ fi
 sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg "$key"
 echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" |
   sudo tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null
-sudo timeout 300 apt-get update -qq
-sudo timeout 600 apt-get install -y -qq cloudflare-warp
+sudo timeout -k 10 300 apt-get update -qq
+sudo timeout -k 10 600 apt-get install -y -qq cloudflare-warp
 
 sudo mkdir -p /var/lib/cloudflare-warp
 printf '%s\n' \
@@ -83,20 +87,21 @@ printf '%s\n' \
 
 sudo systemctl restart warp-svc
 sleep 3
-timeout 60 warp-cli --accept-tos connect || true
+timeout -k 5 60 warp-cli --accept-tos connect || true
 connected=
 deadline=$((SECONDS + 90))
 for _ in $(seq 1 30); do
-  if timeout 30 warp-cli --accept-tos status 2>/dev/null | grep -q 'Connected'; then
+  # Each call is capped by what is left of the deadline, and killed if it
+  # ignores the first signal, so no single call can hold the loop past it.
+  remaining=$((deadline - SECONDS))
+  (( remaining > 0 )) || break
+  if timeout -k 5 "$remaining" warp-cli --accept-tos status 2>/dev/null | grep -q 'Connected'; then
     connected=1
-    break
-  fi
-  if (( SECONDS >= deadline )); then
     break
   fi
   sleep 2
 done
-timeout 30 warp-cli --accept-tos status || true
+timeout -k 5 30 warp-cli --accept-tos status || true
 if [[ -z $connected ]]; then
   echo "::error::The WARP client did not reach Connected within its bound (30 tries or 90s). A device that registered and cannot connect is usually the enrolment policy: the module's enrollment_policy_id is not attached to the WARP enrolment application, or the token expired. It is not the Gateway rule, which decides what an enrolled device reaches."
   exit 1

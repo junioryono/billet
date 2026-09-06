@@ -5,8 +5,8 @@
 #   prove-idempotent.sh <expected-hosts-file> -- <ansible-playbook arguments...>
 #
 # with BILLET_CHILD_ENV holding the environment input's lines, one per line,
-# applied to ansible-playbook the way converge.sh applies them: through env(1),
-# never into this shell.
+# applied to ansible-playbook the way converge.sh applies them: exported by a
+# subshell that execs, never into this shell and never as an argument.
 #
 # STREAMED THROUGH tee, because a second converge that hangs (a drain that never
 # returns, a stalled image pull) would otherwise be killed at the job timeout
@@ -36,8 +36,15 @@ if [[ -n ${BILLET_CHILD_ENV:-} ]]; then
   done <<<"$BILLET_CHILD_ENV"
 fi
 
+# A subshell that exports and execs, as converge.sh's run_ansible does: never
+# env(1), whose own argv would carry the values until it execs.
 log="$RUNNER_TEMP/billet-converge-2.log"
-env "${child_env[@]+"${child_env[@]}"}" ansible-playbook "$@" 2>&1 | tee "$log"
+(
+  for kv in "${child_env[@]+"${child_env[@]}"}"; do
+    export "${kv?}"
+  done
+  exec ansible-playbook "$@"
+) 2>&1 | tee "$log"
 
 recap=$(sed -n '/PLAY RECAP/,$p' "$log" | grep -E '^[^ ]+ +: +ok=' || true)
 printf '%s\n' "--- second-pass recap ---" "$recap"

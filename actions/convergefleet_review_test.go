@@ -37,8 +37,7 @@ func TestAnEnvironmentLineCannotTurnACheckIntoAConverge(t *testing.T) {
 	if len(invs) != 1 || !strings.Contains(invs[0], "--check\n--diff\n") || strings.Contains(invs[0], "other.yml") {
 		t.Fatalf("the environment input changed the run: %d invocations\n%s", len(invs), strings.Join(invs, "\n=====\n"))
 	}
-	env := readRecorded(t, f.pbEnv)
-	if !strings.Contains(string(env), "mode=converge\n") {
+	if recordedEnv(t, f.pbEnv)["mode"] != "converge" {
 		t.Error("the line did not reach the child's environment, where it is harmless")
 	}
 }
@@ -186,15 +185,146 @@ func TestPinsWithoutFinalNewlinesAreAppendedWhole(t *testing.T) {
 	}
 }
 
-// A FAILING PASS BEHIND tee FAILS THE RUN: pipefail is what carries the status.
+// A FAILING PASS BEHIND tee FAILS THE RUN, on its own: the first pass with no
+// proof after it, and a check, so the status is converge.sh's pipefail and not
+// prove-idempotent.sh's. The recap is published either way.
 func TestAFailingPassBehindTeeFailsTheRun(t *testing.T) {
+	t.Parallel()
+
+	for name, run := range map[string]convergeRun{
+		"first pass": {pbExit: "2", prove: "false"},
+		"check":      {pbExit: "2", mode: "check"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			f := newConvergeFixture(t)
+			out, err := f.run(t, run)
+			if err == nil {
+				t.Fatalf("a failing ansible-playbook behind tee passed:\n%s", out)
+			}
+			if n := len(f.playbookInvocations(t)); n != 1 {
+				t.Errorf("ansible-playbook ran %d times, want 1", n)
+			}
+			body := string(readRecorded(t, f.output))
+			if !strings.Contains(body, "recap<<BILLET_RECAP_EOF") || !strings.Contains(body, "node-a") {
+				t.Errorf("the failed pass's recap was not published:\n%s", body)
+			}
+		})
+	}
+}
+
+// THE RENDER SEES THE ENVIRONMENT INPUT, as the play will: an inventory that
+// reads an SSH option through lookup('env') must render with the same value
+// the play runs with, or the judgement is made on different arguments.
+func TestTheRenderRunsUnderTheEnvironmentInput(t *testing.T) {
 	t.Parallel()
 	f := newConvergeFixture(t)
 
-	out, err := f.run(t, convergeRun{pbExit: "2"})
-	if err == nil {
-		t.Fatalf("a failing ansible-playbook behind tee passed:\n%s", out)
+	out, err := f.run(t, convergeRun{environment: "BILLET_CLOUDFLARED_TOKEN_NODE_A=tok-SECRET-1\nFLEET_SSH_OPTS=-o ProxyCommand=x\n"})
+	if err != nil {
+		t.Fatalf("converge failed: %v\n%s", err, out)
 	}
+	env := recordedEnv(t, filepath.Join(f.dir, "ansible-env"))
+	if env["FLEET_SSH_OPTS"] != "-o ProxyCommand=x" {
+		t.Errorf("the render did not run under the environment input: %v", env["FLEET_SSH_OPTS"])
+	}
+	if strings.Contains(string(readRecorded(t, f.calls)), "SECRET") {
+		t.Error("a token reached argv")
+	}
+}
+
+// OPENSSH'S OWN SPELLINGS: `false` is a value, and whitespace around `=` is
+// allowed; the SSH plugin's alias outranks the generic variable.
+func TestOtherSpellingsOfCheckingOffAreRefused(t *testing.T) {
+	t.Parallel()
+
+	for name, debug := range map[string]string{
+		"false":       debugLine("cp-1", "10.0.0.1", 22, "-o StrictHostKeyChecking=false") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"spaced":      debugLine("cp-1", "10.0.0.1", 22, `-o "StrictHostKeyChecking = no"`) + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"ssh alias":   debugLineChecking("cp-1", "10.0.0.1", "False") + "\n" + debugLineChecking("node-a", "10.0.0.2", true) + "\n",
+		"checkhostip": debugLine("cp-1", "10.0.0.1", 22, "-o CheckHostIP=false") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			f := newConvergeFixture(t)
+			out, err := f.run(t, convergeRun{debug: debug})
+			if err == nil {
+				t.Fatalf("%s was accepted:\n%s", name, out)
+			}
+			if !strings.Contains(out, "cp-1 sets ") {
+				t.Errorf("the refusal does not name the host:\n%s", out)
+			}
+			if len(f.playbookInvocations(t)) != 0 {
+				t.Error("ansible-playbook ran after the refusal")
+			}
+		})
+	}
+}
+
+// A CLIENT WHOSE REGISTRATION STATE COULD NOT BE READ IS NOT A CLIENT WITH NONE:
+// a stopped daemon still has its registration on disk.
+func TestReachRefusesWhenTheRegistrationStateCannotBeRead(t *testing.T) {
+	t.Parallel()
+	f := newConvergeFixture(t)
+
+	cmd := exec.CommandContext(t.Context(), "bash", filepath.Join("converge-fleet", "reach-cloudflare-warp.sh"))
+	cmd.Env = []string{
+		"PATH=" + f.bin + ":" + os.Getenv("PATH"),
+		"HOME=" + f.home,
+		"RUNNER_TEMP=" + f.runnerTm,
+		"GITHUB_ACTION_PATH=" + actionDir(t),
+		"BILLET_FAKE_CALLS=" + f.calls,
+		"BILLET_FAKE_GOOD_FPR=C068A2B5771775193CBE1F2F6E2DD2174FA1C3BA",
+		"BILLET_FAKE_KEY_BODY=GOOD KEY",
+		"BILLET_FAKE_WARP_REGISTERED=error",
+		"CF_TEAM=example", "CF_CLIENT_ID=id-SECRET", "CF_CLIENT_SECRET=secret-SECRET",
+	}
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("an unreadable registration state was taken as none:\n%s", out)
+	}
+	if !strings.Contains(string(out), "registration state is not 'missing'") {
+		t.Errorf("the refusal does not say why:\n%s", out)
+	}
+	if _, err := os.Stat(filepath.Join(f.runnerTm, "billet-warp-registered")); err == nil {
+		t.Error("a marker was written without proof there was no registration")
+	}
+}
+
+// THE MARKER OUTLIVES A HALF-DONE CLEANUP, and a retry that finds the
+// registration already gone finishes the job.
+func TestCleanupKeepsItsMarkerUntilBothTheRegistrationAndTheTokenAreGone(t *testing.T) {
+	t.Parallel()
+
+	t.Run("token removal fails", func(t *testing.T) {
+		t.Parallel()
+		f := newConvergeFixture(t)
+		if err := os.WriteFile(filepath.Join(f.runnerTm, "billet-warp-registered"), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		out, err := runCleanup(t, f, "0", "BILLET_FAKE_SUDO_RM_FAIL=yes")
+		if err == nil {
+			t.Fatalf("cleanup reported success with the token file left behind:\n%s", out)
+		}
+		if _, err := os.Stat(filepath.Join(f.runnerTm, "billet-warp-registered")); err != nil {
+			t.Error("the marker was removed although the token file stayed")
+		}
+	})
+
+	t.Run("a retry meets a registration already gone", func(t *testing.T) {
+		t.Parallel()
+		f := newConvergeFixture(t)
+		if err := os.WriteFile(filepath.Join(f.runnerTm, "billet-warp-registered"), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		out, err := runCleanup(t, f, "0", "BILLET_FAKE_WARP_DELETE_SAYS=missing")
+		if err != nil {
+			t.Fatalf("a retry over a gone registration failed: %v\n%s", err, out)
+		}
+		if _, err := os.Stat(filepath.Join(f.runnerTm, "billet-warp-registered")); !os.IsNotExist(err) {
+			t.Error("the marker survived a cleanup that left nothing behind")
+		}
+	})
 }
 
 // A RECAP ROW MISSING A COUNTER IS NOT A CLEAN ROW, and a row for a host the
@@ -241,8 +371,7 @@ func TestTheSecondPassCarriesTheEnvironmentInput(t *testing.T) {
 	}
 	// The fake overwrites its environment record on every call, so what is
 	// left is the second pass's.
-	env := readRecorded(t, f.pbEnv)
-	if !strings.Contains(string(env), "BILLET_CLOUDFLARED_TOKEN_NODE_A=tok-SECRET-1\n") {
+	if recordedEnv(t, f.pbEnv)["BILLET_CLOUDFLARED_TOKEN_NODE_A"] != "tok-SECRET-1" {
 		t.Error("the second pass did not carry the environment input")
 	}
 	if n := len(f.playbookInvocations(t)); n != 2 {
@@ -311,7 +440,7 @@ func TestReachRefusesARunnerThatAlreadyHoldsARegistration(t *testing.T) {
 	if err == nil {
 		t.Fatalf("a runner with a registration was enrolled:\n%s", out)
 	}
-	if !strings.Contains(string(out), "already holds a WARP registration") {
+	if !strings.Contains(string(out), "registration state is not 'missing'") {
 		t.Errorf("the refusal does not say why:\n%s", out)
 	}
 	calls := string(readRecorded(t, f.calls))

@@ -45,20 +45,22 @@ here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 checkout=$(cd "$here/../.." && pwd)
 
 # THE DECISIONS, FIXED BEFORE ANY INPUT IS READ. readonly, so nothing later in
-# this file can reassign them, whatever an input says.
-readonly mode=${BILLET_MODE:?}
-readonly inventory=${BILLET_INVENTORY:?}
-readonly playbook=${BILLET_PLAYBOOK:-junioryono.billet.fleet}
-readonly reach=${BILLET_REACH:-none}
-readonly limit=${BILLET_LIMIT:-}
-readonly extra_vars=${BILLET_EXTRA_VARS:-}
-readonly prove=${BILLET_PROVE_IDEMPOTENT:-true}
-readonly known_hosts_input=${BILLET_KNOWN_HOSTS:-}
-readonly runner_temp=${RUNNER_TEMP:?}
+# this file can reassign them, whatever an input says; under a prefix the
+# environment input refuses by name, because the subshell that exports the
+# input's lines inherits these and an export of a readonly name fails there.
+readonly billet_action_mode=${BILLET_MODE:?}
+readonly billet_action_inventory=${BILLET_INVENTORY:?}
+readonly billet_action_playbook=${BILLET_PLAYBOOK:-junioryono.billet.fleet}
+readonly billet_action_reach=${BILLET_REACH:-none}
+readonly billet_action_limit=${BILLET_LIMIT:-}
+readonly billet_action_extra_vars=${BILLET_EXTRA_VARS:-}
+readonly billet_action_prove=${BILLET_PROVE_IDEMPOTENT:-true}
+readonly billet_action_known_hosts_input=${BILLET_KNOWN_HOSTS:-}
+readonly billet_action_runner_temp=${RUNNER_TEMP:?}
 
-[[ -f $inventory ]] || { echo "::error::inventory $inventory does not exist"; exit 1; }
+[[ -f $billet_action_inventory ]] || { echo "::error::inventory $billet_action_inventory does not exist"; exit 1; }
 
-export ANSIBLE_COLLECTIONS_PATH="$checkout:$runner_temp/billet-collections"
+export ANSIBLE_COLLECTIONS_PATH="$checkout:$billet_action_runner_temp/billet-collections"
 export ANSIBLE_HOST_KEY_CHECKING=True
 export ANSIBLE_STDOUT_CALLBACK=default
 export ANSIBLE_RESULT_FORMAT=yaml
@@ -78,8 +80,15 @@ if [[ -n ${BILLET_ENVIRONMENT:-} ]]; then
       exit 1
     fi
     name=${BASH_REMATCH[1]}
+    lowered=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')
     case "$name" in
-      ANSIBLE_*|GITHUB_*|RUNNER_*|BILLET_ACTION*|LD_*|PYTHON*|PATH|HOME|SHELL|TMPDIR|IFS|ENV|BASH_ENV|CDPATH)
+      ANSIBLE_*|GITHUB_*|RUNNER_*|LD_*|PYTHON*|PATH|HOME|SHELL|TMPDIR|IFS|ENV|BASH_ENV|CDPATH)
+        echo "::error::the environment input's line $n sets $name, which changes how Ansible or this runner behaves rather than what a role reads; it is refused. Connection and host-key policy are the action's, and extra-vars is the input for a non-secret flag."
+        exit 1
+        ;;
+    esac
+    case "$lowered" in
+      billet_action*)
         echo "::error::the environment input's line $n sets $name, which changes how Ansible or this runner behaves rather than what a role reads; it is refused. Connection and host-key policy are the action's, and extra-vars is the input for a non-secret flag."
         exit 1
         ;;
@@ -87,13 +96,28 @@ if [[ -n ${BILLET_ENVIRONMENT:-} ]]; then
     child_env+=("$line")
   done <<<"$BILLET_ENVIRONMENT"
 fi
+# The raw block goes: every line it carried is in child_env now, and a child
+# does not need the whole input under one name (a test reading `env` would
+# also mistake its continuation lines for variables of their own).
+unset BILLET_ENVIRONMENT
 
 # run_ansible runs an Ansible command with the environment input applied to
-# that process alone.
+# that process alone: a subshell exports the lines into ITS environment and
+# execs, so no value is ever an argument of any process (env(1) would carry
+# them in its own argv until it execs), and this shell's variables are never
+# touched. Every Ansible call goes through it, the listing and the render
+# included, so what the render judges is what the play will see: an inventory
+# that reads an option through lookup('env') renders with the same value.
+#
+# The `[@]+` form: an empty array under set -u is an unbound variable in bash
+# 3.2, which is what a macOS developer runs these scripts under.
 run_ansible() {
-  # The `[@]+` form: an empty array under set -u is an unbound variable in
-  # bash 3.2, which is what a macOS developer runs these scripts under.
-  env "${child_env[@]+"${child_env[@]}"}" "$@"
+  (
+    for kv in "${child_env[@]+"${child_env[@]}"}"; do
+      export "${kv?}"
+    done
+    exec "$@"
+  )
 }
 
 # --- the credentials, written 0600 from the environment ----------------------
@@ -108,24 +132,24 @@ write_secret() {
 }
 
 if [[ -n ${BILLET_GITHUB_APP_PRIVATE_KEY:-} ]]; then
-  write_secret "$BILLET_GITHUB_APP_PRIVATE_KEY" "$runner_temp/billet-app-key.pem"
-  export BILLET_GITHUB_PRIVATE_KEY_PATH="$runner_temp/billet-app-key.pem"
+  write_secret "$BILLET_GITHUB_APP_PRIVATE_KEY" "$billet_action_runner_temp/billet-app-key.pem"
+  export BILLET_GITHUB_PRIVATE_KEY_PATH="$billet_action_runner_temp/billet-app-key.pem"
 fi
 unset BILLET_GITHUB_APP_PRIVATE_KEY
 
 if [[ -n ${BILLET_SSH_PRIVATE_KEY:-} ]]; then
-  write_secret "$BILLET_SSH_PRIVATE_KEY" "$runner_temp/billet-ssh-key"
-  export ANSIBLE_PRIVATE_KEY_FILE="$runner_temp/billet-ssh-key"
+  write_secret "$BILLET_SSH_PRIVATE_KEY" "$billet_action_runner_temp/billet-ssh-key"
+  export ANSIBLE_PRIVATE_KEY_FILE="$billet_action_runner_temp/billet-ssh-key"
 fi
 unset BILLET_SSH_PRIVATE_KEY
 
 # --- the host-key pins ----------------------------------------------------------
-if [[ $reach == cloudflare-warp && -z $known_hosts_input ]]; then
+if [[ $billet_action_reach == cloudflare-warp && -z $billet_action_known_hosts_input ]]; then
   echo "::error::reach cloudflare-warp needs known-hosts: a hosted runner holds no host-key pins, and the action never runs ssh-keyscan"
   exit 1
 fi
-if [[ -n $known_hosts_input ]]; then
-  [[ -f $known_hosts_input ]] || { echo "::error::known-hosts $known_hosts_input does not exist"; exit 1; }
+if [[ -n $billet_action_known_hosts_input ]]; then
+  [[ -f $billet_action_known_hosts_input ]] || { echo "::error::known-hosts $billet_action_known_hosts_input does not exist"; exit 1; }
   install -d -m 0700 "$HOME/.ssh"
   touch "$HOME/.ssh/known_hosts"
   chmod 0600 "$HOME/.ssh/known_hosts"
@@ -144,31 +168,31 @@ if [[ -n $known_hosts_input ]]; then
       printf '%s\n' "$line" >>"$HOME/.ssh/known_hosts"
       added=$((added + 1))
     fi
-  done <"$known_hosts_input"
+  done <"$billet_action_known_hosts_input"
   echo "host-key pins: $added line(s) added to $HOME/.ssh/known_hosts"
 fi
 
 # --- the common arguments ----------------------------------------------------------
-args=(-i "$inventory")
-if [[ -n $limit ]]; then
-  args+=(--limit "$limit")
+args=(-i "$billet_action_inventory")
+if [[ -n $billet_action_limit ]]; then
+  args+=(--limit "$billet_action_limit")
 fi
-if [[ -n $extra_vars ]]; then
-  if [[ ${extra_vars:0:1} != "{" ]]; then
+if [[ -n $billet_action_extra_vars ]]; then
+  if [[ ${billet_action_extra_vars:0:1} != "{" ]]; then
     echo "::error::extra-vars must be a JSON object (it is passed as -e and lands in argv, so it is for non-secret flags only)"
     exit 1
   fi
-  args+=(-e "$extra_vars")
+  args+=(-e "$billet_action_extra_vars")
 fi
 
 # --- the hosts this run will touch -----------------------------------------------------
-listing=$(run_ansible ansible-playbook "${args[@]}" --list-hosts "$playbook")
-expected=$runner_temp/billet-expected-hosts
+listing=$(run_ansible ansible-playbook "${args[@]}" --list-hosts "$billet_action_playbook")
+expected=$billet_action_runner_temp/billet-expected-hosts
 # The listing indents each host by six spaces under "hosts (N):"; nothing else
 # in it is indented that deep.
 printf '%s\n' "$listing" | awk '/^      [^ ]/ { sub(/^      /, ""); print }' | sort -u >"$expected"
 if [[ ! -s $expected ]]; then
-  echo "::error::$playbook matches no host in $inventory${limit:+ under --limit $limit}. A playbook that matches no host exits 0 having converged nothing, so this is refused in both modes."
+  echo "::error::$billet_action_playbook matches no host in $billet_action_inventory${billet_action_limit:+ under --limit $billet_action_limit}. A playbook that matches no host exits 0 having converged nothing, so this is refused in both modes."
   printf '%s\n' "$listing"
   exit 1
 fi
@@ -188,13 +212,14 @@ echo "hosts this run touches: $(paste -sd' ' "$expected")"
 #
 # One debug call over the expected hosts, one line per host (-o), the values as
 # one JSON document each; the module templates on the controller and opens no
-# connection. Without the environment input: nothing here needs a token.
+# connection. `checking` is the SSH plugin's effective setting: its own alias
+# outranks the generic variable, as the plugin reads them.
 pattern=$(paste -sd: "$expected")
-rendered=$(ansible "${args[@]}" -o -m debug \
-  -a "msg={{ {'host': ansible_host | default(inventory_hostname), 'port': ansible_port | default(22), 'common': ansible_ssh_common_args | default(''), 'extra': ansible_ssh_extra_args | default(''), 'args': ansible_ssh_args | default(''), 'checking': ansible_host_key_checking | default(true)} | to_json }}" \
+rendered=$(run_ansible ansible "${args[@]}" -o -m debug \
+  -a "msg={{ {'host': ansible_host | default(inventory_hostname), 'port': ansible_port | default(22), 'common': ansible_ssh_common_args | default(''), 'extra': ansible_ssh_extra_args | default(''), 'args': ansible_ssh_args | default(''), 'checking': ansible_ssh_host_key_checking | default(ansible_host_key_checking | default(true))} | to_json }}" \
   "$pattern")
 
-reach_targets=$runner_temp/billet-reach-targets
+reach_targets=$billet_action_runner_temp/billet-reach-targets
 : >"$reach_targets"
 while IFS= read -r line; do
   [[ -z $line ]] && continue
@@ -209,10 +234,12 @@ outer = json.loads(sys.stdin.read())
 inner = json.loads(outer["msg"])
 sshargs = " ".join(str(inner[k]) for k in ("common", "extra", "args"))
 bad = None
-if str(inner.get("checking", True)).lower() in ("false", "no", "0", "off"):
-    bad = "ansible_host_key_checking"
+# Ansible boolean conversion of the variable, and OpenSSH spellings of an
+# option value: false is one, and whitespace around = is allowed.
+if str(inner.get("checking", True)).strip().lower() in ("false", "no", "0", "off", "n", "f"):
+    bad = "ansible_host_key_checking (or its ansible_ssh_ alias)"
 else:
-    m = re.search(r"(stricthostkeychecking)[= ](no|off|accept-new)|(userknownhostsfile)|(checkhostip)[= ](no|off)", sshargs, re.IGNORECASE)
+    m = re.search(r"(stricthostkeychecking)\s*[= ]\s*(no|off|false|accept-new)|(userknownhostsfile)|(checkhostip)\s*[= ]\s*(no|off|false)", sshargs, re.IGNORECASE)
     if m:
         bad = m.group(1) or m.group(3) or m.group(4)
 print(inner["host"], inner["port"], bad or "-")
@@ -222,7 +249,7 @@ print(inner["host"], inner["port"], bad or "-")
   # add a ProxyCommand; it may not turn host-key checking off or point it at
   # another file, because that quietly discards the pins.
   if [[ $bad != - ]]; then
-    echo "::error::$host sets $bad in its SSH options, which would disable or redirect host-key checking and discard the pins the action installs. Remove it from ansible_ssh_common_args, ansible_ssh_extra_args, ansible_ssh_args or ansible_host_key_checking."
+    echo "::error::$host sets $bad in its SSH options, which would disable or redirect host-key checking and discard the pins the action installs. Remove it from ansible_ssh_common_args, ansible_ssh_extra_args, ansible_ssh_args, ansible_host_key_checking or ansible_ssh_host_key_checking."
     exit 1
   fi
   printf '%s %s %s\n' "$host" "$addr" "$port" >>"$reach_targets"
@@ -260,22 +287,25 @@ done <"$reach_targets"
 
 # --- the run ---------------------------------------------------------------------------
 #
-# Both modes stream through tee and both publish the recap, so a check run's
-# consumer reads what the dry run said.
-log="$runner_temp/billet-converge-1.log"
-if [[ $mode == check ]]; then
-  run_ansible ansible-playbook "${args[@]}" --check --diff "$playbook" 2>&1 | tee "$log"
+# Both modes stream through tee and both publish the recap, a failed pass
+# included, so a consumer reads what the run said before it read that it
+# failed; the pass's own status is what this script exits with.
+log="$billet_action_runner_temp/billet-converge-1.log"
+status=0
+if [[ $billet_action_mode == check ]]; then
+  run_ansible ansible-playbook "${args[@]}" --check --diff "$billet_action_playbook" 2>&1 | tee "$log" || status=$?
 else
-  run_ansible ansible-playbook "${args[@]}" "$playbook" 2>&1 | tee "$log"
-  if [[ $prove == true ]]; then
+  run_ansible ansible-playbook "${args[@]}" "$billet_action_playbook" 2>&1 | tee "$log" || status=$?
+  if [[ $status == 0 && $billet_action_prove == true ]]; then
     BILLET_CHILD_ENV=$(printf '%s\n' "${child_env[@]+"${child_env[@]}"}") \
-      "$here/prove-idempotent.sh" "$expected" -- "${args[@]}" "$playbook"
-    log="$runner_temp/billet-converge-2.log"
+      "$here/prove-idempotent.sh" "$expected" -- "${args[@]}" "$billet_action_playbook" || status=$?
+    log="$billet_action_runner_temp/billet-converge-2.log"
   fi
 fi
 
 {
   echo "recap<<BILLET_RECAP_EOF"
-  sed -n '/PLAY RECAP/,$p' "$log" | grep -E '^[^ ]+ +: +ok=' || true
+  sed -n '/PLAY RECAP/,$p' "$log" 2>/dev/null | grep -E '^[^ ]+ +: +ok=' || true
   echo "BILLET_RECAP_EOF"
 } >>"$GITHUB_OUTPUT"
+exit "$status"
