@@ -9,12 +9,15 @@ import (
 func cmdRelease(ctx context.Context, args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("usage: billet release record --manifest <path> --archive " +
-			"<path> --binary <path>")
+			"<path> --binary <path>, or billet release inspect [--json] [--config <path>]")
 	}
 
-	if args[0] == "record" {
+	switch args[0] {
+	case "record":
 		return cmdReleaseRecord(ctx, args[1:])
+	case "inspect":
+		return cmdReleaseInspect(ctx, args[1:])
 	}
 
-	return fmt.Errorf("unknown release command %q; try record", args[0])
+	return fmt.Errorf("unknown release command %q; try record or inspect", args[0])
 }
