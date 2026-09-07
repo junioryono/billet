@@ -240,19 +240,24 @@ inner = json.loads(outer["msg"])
 def first_argument(text):
     # ONE ARGUMENT THE WAY argv_split READS IT, and nothing beyond that: a single
     # or double quote opens a fragment to its matching close and fragments
-    # concatenate (n"o" is no), a backslash before a quote, a backslash, a hash
-    # or a space is that character in either quote mode and any other escape is
-    # kept as written, an unquoted # or whitespace ends the argument, and an
-    # unclosed quote is unreadable.
+    # concatenate (n"o" is no); a backslash escapes a quote or a backslash in
+    # either quote mode and a space outside quotes only, and any other backslash
+    # is kept as written; a hash is a comment only where a token would begin,
+    # never inside one; unquoted whitespace ends the argument; an unclosed quote
+    # is unreadable.
+    if text.startswith("#"):
+        return None
     out = []
     quote = None
     i = 0
     while i < len(text):
         ch = text[i]
-        if ch == "\\" and i + 1 < len(text) and text[i + 1] in ("\\", "\"", chr(39), "#", " ", "\t"):
-            out.append(text[i + 1])
-            i += 2
-            continue
+        if ch == "\\" and i + 1 < len(text):
+            nxt = text[i + 1]
+            if nxt in ("\\", "\"", chr(39)) or (quote is None and nxt == " "):
+                out.append(nxt)
+                i += 2
+                continue
         if quote:
             if ch == quote:
                 quote = None
@@ -264,7 +269,7 @@ def first_argument(text):
             quote = ch
             i += 1
             continue
-        if ch == "#" or ch.isspace():
+        if ch.isspace():
             break
         out.append(ch)
         i += 1
@@ -277,8 +282,9 @@ def keyword_and_rest(opt):
     # THE KEYWORD THE WAY strdelim READS IT: one that opens with a double quote
     # runs to its closing quote and the value starts right after it, so
     # "StrictHostKeyChecking"no is the keyword and no; otherwise it runs to the
-    # first whitespace or =. A keyword that is not letters (a quote in its
-    # middle, nothing at all) is unreadable rather than compared.
+    # first whitespace or =. A keyword that is not a letter followed by letters
+    # and digits (ForwardX11 is one; a quote in the middle is not) is unreadable
+    # rather than compared.
     opt = opt.lstrip()
     if opt.startswith("\""):
         j = opt.find("\"", 1)
@@ -288,7 +294,7 @@ def keyword_and_rest(opt):
     else:
         m = re.match(r"^([^\s=]*)(.*)$", opt, re.DOTALL)
         key, rest = m.group(1), m.group(2)
-    if not re.match(r"^[A-Za-z]+$", key):
+    if not re.match(r"^[A-Za-z][A-Za-z0-9]*$", key):
         return None, None
     rest = rest.lstrip()
     if rest.startswith("="):
@@ -307,8 +313,10 @@ def judge(tokens):
     # as unreadable rather than guessed at. Refused keywords, each a way of
     # accepting a key the pins do not hold: a configuration file or Include, a
     # second known-hosts file or a command producing keys, checking turned off,
-    # CheckHostIP off, the loopback exemption, DNS-published keys, and an alias
-    # that looks the pins up under another name.
+    # CheckHostIP off, the loopback exemption, DNS-published keys, an alias
+    # that looks the pins up under another name, and a control socket, because
+    # ssh reuses an existing master before it verifies anything, under whatever
+    # checking that master was made with.
     i = 0
     while i < len(tokens):
         tok = tokens[i]
@@ -329,8 +337,9 @@ def judge(tokens):
         value = value.lower()
         if key == "include":
             return "Include (an ssh configuration file the action cannot read)"
-        if key in ("userknownhostsfile", "globalknownhostsfile", "knownhostscommand", "hostkeyalias"):
-            return {"userknownhostsfile": "UserKnownHostsFile", "globalknownhostsfile": "GlobalKnownHostsFile", "knownhostscommand": "KnownHostsCommand", "hostkeyalias": "HostKeyAlias"}[key]
+        always = {"userknownhostsfile": "UserKnownHostsFile", "globalknownhostsfile": "GlobalKnownHostsFile", "knownhostscommand": "KnownHostsCommand", "hostkeyalias": "HostKeyAlias", "controlpath": "ControlPath", "controlmaster": "ControlMaster"}
+        if key in always:
+            return always[key]
         if key == "stricthostkeychecking" and value in ("no", "off", "false", "accept-new"):
             return "StrictHostKeyChecking"
         if key == "checkhostip" and value in ("no", "off", "false"):

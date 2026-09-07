@@ -337,6 +337,8 @@ func TestOtherSpellingsOfCheckingOffAreRefused(t *testing.T) {
 		"alias":          debugLine("cp-1", "10.0.0.1", 22, "-o HostKeyAlias=other") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
 		"quoted keyword": debugLine("cp-1", "10.0.0.1", 22, `-o '"StrictHostKeyChecking"no # comment'`) + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
 		"split keyword":  debugLine("cp-1", "10.0.0.1", 22, `-o 'Strict"Host"KeyChecking=no'`) + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"control path":   debugLine("cp-1", "10.0.0.1", 22, "-o ControlPath=/tmp/master -o ControlMaster=auto") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"control master": debugLine("cp-1", "10.0.0.1", 22, "-o ControlMaster=auto") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -385,16 +387,19 @@ var refusedOption = map[string]string{
 	"alias":          "HostKeyAlias",
 	"quoted keyword": "StrictHostKeyChecking",
 	"split keyword":  "an SSH option the action cannot read",
+	"control path":   "ControlPath",
+	"control master": "ControlMaster",
 }
 
-// QUOTED VALUES THAT KEEP CHECKING ON ARE ACCEPTED, escaped quotes included:
-// a walker that refused every quoted spelling as unreadable would pass the
+// QUOTED VALUES THAT KEEP CHECKING ON ARE ACCEPTED, escaped quotes, an escaped
+// space and digit-bearing keywords included: a walker that refused every quoted
+// spelling as unreadable, or every keyword that is not letters, would pass the
 // table above and fail here.
 func TestQuotedValuesThatKeepCheckingOnAreAccepted(t *testing.T) {
 	t.Parallel()
 	f := newConvergeFixture(t)
 
-	debug := debugLine("cp-1", "10.0.0.1", 22, `-o 'IdentityFile="key\"name"' -o "StrictHostKeyChecking='yes'" -o VerifyHostKeyDNS=no -o 'ProxyCommand=nc -w -1 %h %p'`) + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n"
+	debug := debugLine("cp-1", "10.0.0.1", 22, `-o 'IdentityFile="key\"name"' -o "StrictHostKeyChecking='yes'" -o VerifyHostKeyDNS=no -o 'ProxyCommand=nc -w -1 %h %p' -o ForwardX11=no -o PKCS11Provider=/opt/p11.so -o 'IdentityFile=key\ name'`) + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n"
 	out, err := f.run(t, convergeRun{debug: debug})
 	if err != nil {
 		t.Fatalf("quoted values that keep checking on were refused: %v\n%s", err, out)
