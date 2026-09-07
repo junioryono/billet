@@ -339,6 +339,9 @@ func TestOtherSpellingsOfCheckingOffAreRefused(t *testing.T) {
 		"split keyword":  debugLine("cp-1", "10.0.0.1", 22, `-o 'Strict"Host"KeyChecking=no'`) + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
 		"control path":   debugLine("cp-1", "10.0.0.1", 22, "-o ControlPath=/tmp/master -o ControlMaster=auto") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
 		"control master": debugLine("cp-1", "10.0.0.1", 22, "-o ControlMaster=auto") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"leading space":  debugLine("cp-1", "10.0.0.1", 22, `' -oStrictHostKeyChecking=no'`) + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"spaced socket":  debugLine("cp-1", "10.0.0.1", 22, `' -oControlPath=/tmp/master'`) + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
+		"gssapi":         debugLine("cp-1", "10.0.0.1", 22, "-o GSSAPIKeyExchange=yes") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -389,6 +392,40 @@ var refusedOption = map[string]string{
 	"split keyword":  "an SSH option the action cannot read",
 	"control path":   "ControlPath",
 	"control master": "ControlMaster",
+	"leading space":  "StrictHostKeyChecking",
+	"spaced socket":  "ControlPath",
+	"gssapi":         "GSSAPIKeyExchange",
+}
+
+// THE READER DECODES AS OPENSSH DOES, observed directly: the policy never
+// compares an IdentityFile, so an escape rule dropped from the reader would
+// leave every policy case green while ssh read a different file.
+func TestTheSSHOptionReaderDecodesAsOpenSSHDoes(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct{ opt, want string }{
+		{`IdentityFile=key\ name`, "identityfile\tkey name"},
+		{`StrictHostKeyChecking=n"o"`, "stricthostkeychecking\tno"},
+		{`StrictHostKeyChecking='no'`, "stricthostkeychecking\tno"},
+		{`StrictHostKeyChecking=no # comment`, "stricthostkeychecking\tno"},
+		{`StrictHostKeyChecking=no#comment`, "stricthostkeychecking\tno#comment"},
+		{`"StrictHostKeyChecking"no`, "stricthostkeychecking\tno"},
+		{"StrictHostKeyChecking\tno", "stricthostkeychecking\tno"},
+		{`IdentityFile="key\"name"`, "identityfile\tkey\"name"},
+		{`IdentityFile=key\name`, "identityfile\tkey\\name"},
+		{`ForwardX11=no`, "forwardx11\tno"},
+		{`Strict"Host"KeyChecking=no`, "unreadable"},
+		{`IdentityFile="open`, "unreadable"},
+		{`=no`, "unreadable"},
+	} {
+		out, err := exec.CommandContext(t.Context(), realPython3(t), filepath.Join(actionDir(t), "judge-ssh-options.py"), "--decode", tc.opt).CombinedOutput()
+		if err != nil {
+			t.Fatalf("decode %q: %v\n%s", tc.opt, err, out)
+		}
+		if got := strings.TrimSuffix(string(out), "\n"); got != tc.want {
+			t.Errorf("decode %q = %q, want %q", tc.opt, got, tc.want)
+		}
+	}
 }
 
 // QUOTED VALUES THAT KEEP CHECKING ON ARE ACCEPTED, escaped quotes, an escaped
