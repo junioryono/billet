@@ -136,8 +136,48 @@ while IFS= read -r versions; do
 	fi
 done < <(git ls-files -- 'terraform/**/versions.tf' 'terraform/versions.tf')
 
+# THE FLEET ACTION IS HELD TO THE SAME RULE, because its ref is also the pin
+# on the collection a converge runs: the documentation on main says @main, a
+# release says its tag, and cut-release.yml rewrites one to the other beside
+# the module sources. Only this action. The builder actions' READMEs describe
+# a ref the operator chooses (@v0, a tag, a SHA) and are not rewritten; this
+# one's README is the block a consumer copies, and a block naming main inside
+# a release would run whatever main's roles are that day.
+action='junioryono/billet/actions/converge-fleet@'
+
+set +e
+# Quoted or bare: `uses: "junioryono/...@main"` is the same reference YAML reads.
+git grep -nE "uses: *[\"']?${action}[^[:space:]\"']+" -- '*.md' >"$work/action-matches"
+status=$?
+set -e
+
+if [ "$status" -gt 1 ]; then
+	printf 'could not search the tracked markdown files for the fleet action reference (git grep exited %d)\n' "$status" >&2
+	exit 1
+fi
+
+if [ ! -s "$work/action-matches" ]; then
+	printf 'no documented uses: %s<ref> found in any tracked .md file\n' "$action" >&2
+	printf 'the fleet action is the pin on the collection, and nothing documents how to write it\n' >&2
+	exit 1
+fi
+
+while IFS= read -r match; do
+	[ -n "$match" ] || continue
+
+	where=${match%%:*}
+	rest=${match#*:}
+	line=${rest%%:*}
+	ref=$(printf '%s\n' "$match" | sed -E "s#.*uses: *[\"']?${action}([^[:space:]\"']+).*#\1#")
+
+	if [ "$ref" != "$expected_ref" ]; then
+		printf '%s:%s names %s%s, expected @%s\n' "$where" "$line" "$action" "$ref" "$expected_ref" >&2
+		failed=true
+	fi
+done <"$work/action-matches"
+
 if [ "$failed" = true ]; then
 	exit 1
 fi
 
-printf 'documented Terraform module sources all resolve to ?ref=%s\n' "$expected_ref"
+printf 'documented Terraform module sources and the fleet action reference all resolve to %s\n' "$expected_ref"

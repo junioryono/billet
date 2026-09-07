@@ -100,6 +100,23 @@ jobs:
             git add "${module_source_file}"
           done <<< "${module_sources}"
 
+          # AND THE FLEET ACTION'S DOCUMENTED REFERENCE, because on that action
+          # the ref is also the pin on the collection a converge runs, so the
+          # block a consumer copies out of a release has to name that release.
+          # Same shape as the module sweep, for the same reasons.
+          set +e
+          fleet_refs=$(grep -rlE 'uses: *["'"'"']?junioryono/billet/actions/converge-fleet@(main|v[0-9]+\.[0-9]+\.[0-9]+)' --include='*.md' docs actions)
+          grep_status=$?
+          set -e
+          if [ "${grep_status}" -gt 1 ] || [ -z "${fleet_refs}" ]; then
+            echo "::error::found no documented fleet action reference to pin to ${TAG} (grep exited ${grep_status})"
+            exit 1
+          fi
+          while IFS= read -r fleet_ref_file; do
+            sed -E -i "s#(uses: *[\"']?junioryono/billet/actions/converge-fleet)@(main|v[0-9]+\.[0-9]+\.[0-9]+)#\\1@${TAG}#g" "${fleet_ref_file}"
+            git add "${fleet_ref_file}"
+          done <<< "${fleet_refs}"
+
           # A COLLECTION INSTALLED FROM A GIT TAG STILL READS galaxy.yml. The
           # tag and that metadata must describe the same artifact, or Ansible
           # reports a different version from the one the operator pinned.

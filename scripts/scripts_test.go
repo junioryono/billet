@@ -465,16 +465,29 @@ func TestReleaseMetadataMustMatchTheTag(t *testing.T) {
 		collectionVersion string
 		actionVersion     string
 		moduleRef         string
-		wantSuccess       bool
+		// fleetRef is the ref the documented `uses:` of the fleet action names;
+		// empty writes no such documentation at all.
+		fleetRef    string
+		wantSuccess bool
+		wantOutput  string
 	}{
-		{name: "matching release", tag: "v0.4.3", collectionVersion: "0.4.3", actionVersion: "v0.4.3", moduleRef: "v0.4.3", wantSuccess: true},
-		{name: "stale collection", tag: "v0.4.3", collectionVersion: "0.4.2", actionVersion: "v0.4.3", moduleRef: "v0.4.3"},
-		{name: "stale action", tag: "v0.4.3", collectionVersion: "0.4.3", actionVersion: "v0.4.2", moduleRef: "v0.4.3"},
+		{name: "matching release", tag: "v0.4.3", collectionVersion: "0.4.3", actionVersion: "v0.4.3", moduleRef: "v0.4.3", fleetRef: "v0.4.3", wantSuccess: true},
+		{name: "stale collection", tag: "v0.4.3", collectionVersion: "0.4.2", actionVersion: "v0.4.3", moduleRef: "v0.4.3", fleetRef: "v0.4.3"},
+		{name: "stale action", tag: "v0.4.3", collectionVersion: "0.4.3", actionVersion: "v0.4.2", moduleRef: "v0.4.3", fleetRef: "v0.4.3"},
 		// THE MODULE IS RELEASE METADATA TOO. `terraform/` was in no tag for
 		// months and nothing said so, so a source still naming main at the moment
 		// of tagging has to fail the release the way a stale collection does.
-		{name: "module still pinned to main", tag: "v0.4.3", collectionVersion: "0.4.3", actionVersion: "v0.4.3", moduleRef: "main"},
-		{name: "invalid tag", tag: "release-4", collectionVersion: "4.0.0", actionVersion: "release-4", moduleRef: "release-4"},
+		{name: "module still pinned to main", tag: "v0.4.3", collectionVersion: "0.4.3", actionVersion: "v0.4.3", moduleRef: "main", fleetRef: "v0.4.3", wantOutput: "expected ?ref=v0.4.3"},
+		// AND SO IS THE FLEET ACTION'S DOCUMENTED REFERENCE, because on that
+		// action the ref pins the collection a converge runs: a README inside an
+		// immutable tag still saying @main would run main's roles that day.
+		{name: "fleet action still pinned to main", tag: "v0.4.3", collectionVersion: "0.4.3", actionVersion: "v0.4.3", moduleRef: "v0.4.3", fleetRef: "main", wantOutput: "expected @v0.4.3"},
+		{name: "fleet action undocumented", tag: "v0.4.3", collectionVersion: "0.4.3", actionVersion: "v0.4.3", moduleRef: "v0.4.3", fleetRef: "", wantOutput: "no documented uses: junioryono/billet/actions/converge-fleet@"},
+		// A QUOTED SPELLING IS THE SAME REFERENCE: YAML reads `uses: "x@main"` as
+		// x@main, so the gate must too, or a quoted line still naming main ships.
+		{name: "quoted fleet action still pinned to main", tag: "v0.4.3", collectionVersion: "0.4.3", actionVersion: "v0.4.3", moduleRef: "v0.4.3", fleetRef: `"main"`, wantOutput: "expected @v0.4.3"},
+		{name: "quoted fleet action release", tag: "v0.4.3", collectionVersion: "0.4.3", actionVersion: "v0.4.3", moduleRef: "v0.4.3", fleetRef: `"v0.4.3"`, wantSuccess: true},
+		{name: "invalid tag", tag: "release-4", collectionVersion: "4.0.0", actionVersion: "release-4", moduleRef: "release-4", fleetRef: "release-4"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -510,6 +523,20 @@ func TestReleaseMetadataMustMatchTheTag(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(module, "README.md"), []byte(readme), 0o600); err != nil {
 				t.Fatalf("write module readme: %v", err)
 			}
+			if tc.fleetRef != "" {
+				fleet := filepath.Join(actions, "converge-fleet")
+				if err := os.MkdirAll(fleet, 0o755); err != nil {
+					t.Fatalf("create fleet action directory: %v", err)
+				}
+				// A fleetRef wrapped in quotes renders the quoted YAML spelling.
+				usage := "- uses: junioryono/billet/actions/converge-fleet@" + tc.fleetRef + "\n"
+				if strings.HasPrefix(tc.fleetRef, `"`) {
+					usage = `- uses: "junioryono/billet/actions/converge-fleet@` + strings.Trim(tc.fleetRef, `"`) + `"` + "\n"
+				}
+				if err := os.WriteFile(filepath.Join(fleet, "README.md"), []byte(usage), 0o600); err != nil {
+					t.Fatalf("write fleet action readme: %v", err)
+				}
+			}
 			gitInit(t, repository)
 
 			cmd := exec.CommandContext(t.Context(), checker)
@@ -518,6 +545,12 @@ func TestReleaseMetadataMustMatchTheTag(t *testing.T) {
 			output, err := cmd.CombinedOutput()
 			if (err == nil) != tc.wantSuccess {
 				t.Fatalf("metadata check error = %v; want success %t\n%s", err, tc.wantSuccess, output)
+			}
+			// THE DIAGNOSTIC, not only the status: a refusal for the wrong reason
+			// (a fixture the checker could not read, say) would pass a case
+			// that expects a refusal.
+			if tc.wantOutput != "" && !strings.Contains(string(output), tc.wantOutput) {
+				t.Fatalf("metadata check refused without %q:\n%s", tc.wantOutput, output)
 			}
 		})
 	}

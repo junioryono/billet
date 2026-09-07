@@ -1,0 +1,145 @@
+name: billet converge fleet
+description: >-
+  Converge a billet fleet from CI with the collection this action ships beside:
+  reach the hosts, prove them, run the fleet playbook, and prove the converge
+  idempotent with a second run that must report changed=0 on every host.
+
+# THE ONE PIN. GitHub checks out this repository at the `uses:` ref to run the
+# action, so the Ansible collection under ansible_collections/ in that same
+# checkout is the collection the converge runs: no Galaxy fetch, no
+# requirements.yml, no wrapper script. The ref names the action and the role
+# together, and Dependabot's github-actions ecosystem turns every billet release
+# into a pull request whose `check` run is a `--check --diff` against the live
+# fleet.
+#
+# NOT ON A BILLET LABEL. A converge that changes the binary or the guest network
+# drains the node and restarts the services, which kills the job running the
+# playbook, and GitHub does not requeue a job whose runner vanished. The first
+# step refuses a RUNNER_NAME beginning `billet-` before anything is enrolled;
+# the host role refuses the same shape again before its transaction.
+#
+# SECRETS NEVER REACH ARGV. Every credential is an input that lands in a step's
+# environment: the CI key and the App key are written with `install -m 0600
+# /dev/stdin`, the WARP secret goes into mdm.xml the same way, and the
+# `environment` input is exported into ansible-playbook's environment, which is
+# how per-host connector tokens travel to the roles that read them.
+
+inputs:
+  mode:
+    description: "`check` (--check --diff) or `converge` (the real thing, then a changed=0 proof)"
+    required: true
+  inventory:
+    description: The inventory file, relative to the repository
+    required: true
+  playbook:
+    description: The playbook to run; the collection's fleet playbook by default
+    required: false
+    default: junioryono.billet.fleet
+  known-hosts:
+    description: >-
+      A committed known_hosts file pinning every host's key. Required when reach is
+      cloudflare-warp (a hosted runner holds no pins); the action never runs
+      ssh-keyscan. Its lines are appended to the runner user's known_hosts.
+    required: false
+    default: ""
+  ssh-private-key:
+    description: The private half of the key the inventory installs for the converge
+    required: false
+    default: ""
+  reach:
+    description: "`none` (the runner can already reach the hosts) or `cloudflare-warp` (enrol as a WARP client with a service token)"
+    required: false
+    default: none
+  cloudflare-team-name:
+    description: The Zero Trust team name (reach cloudflare-warp)
+    required: false
+    default: ""
+  cloudflare-service-token-id:
+    description: Client ID of the service token the converge-cloudflare-warp module created
+    required: false
+    default: ""
+  cloudflare-service-token-secret:
+    description: Its client secret
+    required: false
+    default: ""
+  environment:
+    description: >-
+      NAME=value lines exported into ansible-playbook's environment and never its
+      argv: per-host connector tokens (BILLET_CLOUDFLARED_TOKEN_<HOST>,
+      BILLET_WARP_CONNECTOR_TOKEN_<HOST>) and anything else a role reads from the
+      environment.
+    required: false
+    default: ""
+  github-app-private-key:
+    description: >-
+      The GitHub App private key, for a control plane's first converge only; written
+      0600, exported as BILLET_GITHUB_PRIVATE_KEY_PATH, and deleted when the job ends.
+    required: false
+    default: ""
+  extra-vars:
+    description: A JSON object of non-secret extra variables, passed as -e
+    required: false
+    default: ""
+  limit:
+    description: An Ansible host pattern to limit the run to
+    required: false
+    default: ""
+  prove-idempotent:
+    description: After a converge, run again and require changed=0 on every host
+    required: false
+    default: "true"
+
+outputs:
+  recap:
+    description: The recap lines of the last pass
+    value: ${{ steps.converge.outputs.recap }}
+  billet-ref:
+    description: The billet ref this action, and therefore the collection, ran from
+    value: ${{ steps.prepare.outputs.billet_ref }}
+
+runs:
+  using: composite
+  steps:
+    - name: Refuse an unknown mode and a billet-managed runner
+      id: prepare
+      shell: bash
+      env:
+        BILLET_MODE: ${{ inputs.mode }}
+        BILLET_REACH: ${{ inputs.reach }}
+        BILLET_ACTION_REF: ${{ github.action_ref }}
+      run: "${{ github.action_path }}/prepare.sh"
+
+    - name: Install the pinned ansible-core and the collection's dependency
+      shell: bash
+      run: "${{ github.action_path }}/install-ansible.sh"
+
+    - name: Join the Zero Trust network as a service-token device
+      if: ${{ inputs.reach == 'cloudflare-warp' }}
+      shell: bash
+      env:
+        CF_TEAM: ${{ inputs.cloudflare-team-name }}
+        CF_CLIENT_ID: ${{ inputs.cloudflare-service-token-id }}
+        CF_CLIENT_SECRET: ${{ inputs.cloudflare-service-token-secret }}
+      run: "${{ github.action_path }}/reach-cloudflare-warp.sh"
+
+    - name: Converge
+      id: converge
+      shell: bash
+      env:
+        BILLET_MODE: ${{ inputs.mode }}
+        BILLET_INVENTORY: ${{ inputs.inventory }}
+        BILLET_PLAYBOOK: ${{ inputs.playbook }}
+        BILLET_KNOWN_HOSTS: ${{ inputs.known-hosts }}
+        BILLET_REACH: ${{ inputs.reach }}
+        BILLET_SSH_PRIVATE_KEY: ${{ inputs.ssh-private-key }}
+        BILLET_ENVIRONMENT: ${{ inputs.environment }}
+        BILLET_GITHUB_APP_PRIVATE_KEY: ${{ inputs.github-app-private-key }}
+        BILLET_EXTRA_VARS: ${{ inputs.extra-vars }}
+        BILLET_LIMIT: ${{ inputs.limit }}
+        BILLET_PROVE_IDEMPOTENT: ${{ inputs.prove-idempotent }}
+      run: "${{ github.action_path }}/converge.sh"
+
+    - name: Leave nothing behind
+      if: ${{ always() }}
+      shell: bash
+      run: "${{ github.action_path }}/cleanup.sh"

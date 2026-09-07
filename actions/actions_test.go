@@ -60,6 +60,18 @@ func TestEveryActionMetadataNamesRunnableFiles(t *testing.T) {
 					t.Errorf("%s does not exist: %v", script, err)
 				}
 			}
+
+			// A composite action names its scripts through github.action_path,
+			// and one that does not exist fails at a consumer's first run.
+			for _, step := range metadata.Runs.Steps {
+				script, ok := strings.CutPrefix(step.Run, "${{ github.action_path }}/")
+				if !ok {
+					continue
+				}
+				if _, err := os.Stat(filepath.Join(dir, script)); err != nil {
+					t.Errorf("step script %s does not exist: %v", script, err)
+				}
+			}
 		})
 	}
 }
@@ -158,8 +170,19 @@ func TestTheBuilderStarterIsExecutable(t *testing.T) {
 		t.Skip("Windows has no executable mode bit")
 	}
 
-	for _, name := range []string{"resolve-policy.sh", "start.sh"} {
-		info, err := os.Stat(filepath.Join("setup-docker-builder", name))
+	for _, name := range []string{
+		"setup-docker-builder/resolve-policy.sh",
+		"setup-docker-builder/start.sh",
+		"converge-fleet/prepare.sh",
+		"converge-fleet/install-ansible.sh",
+		"converge-fleet/reach-cloudflare-warp.sh",
+		"converge-fleet/converge.sh",
+		"converge-fleet/prove-idempotent.sh",
+		"converge-fleet/cleanup.sh",
+		"converge-fleet/with-environment.py",
+		"converge-fleet/judge-ssh-options.py",
+	} {
+		info, err := os.Stat(filepath.FromSlash(name))
 		if err != nil {
 			t.Errorf("Stat %s: %v", name, err)
 			continue

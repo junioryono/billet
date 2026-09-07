@@ -30,7 +30,7 @@ Never hard-wrap prose at a column. Every paragraph in a `.md` or `.txt` file, a 
 | `deploy/` | The systemd units, launchd plists, packaged config template and package scripts. |
 | `ansible_collections/junioryono/billet` | The `host` and `development_host` roles and their scenario tests. |
 | `terraform/modules` | The AWS infrastructure modules. |
-| `actions/` | The published Actions: `stickydisk`, `setup-docker-builder`, `stop-docker-builder`, `build-push-action`. |
+| `actions/` | The published Actions: `stickydisk`, `setup-docker-builder`, `stop-docker-builder`, `build-push-action`, and `converge-fleet`, which runs the collection from its own checkout. |
 | `scripts/` | Guest image and kernel builds, release tooling, `install.sh`, rehearsals, repository gates, and the Go tests that execute those scripts. |
 | `tools/lint` | billet's own analyzers (`parallelshared`, `rawsql`), a nested module so `go/analysis` never ships in the binary. |
 | `docs/` | The Sphinx site: getting started, concepts, deploying, operating, reference (CLI, configuration, decisions, records). |
