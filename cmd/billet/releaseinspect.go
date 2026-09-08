@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -88,6 +89,9 @@ var (
 	// the file in either window and prove the report notices.
 	inspectAfterConfig func()
 	inspectBeforeClose func()
+	// inspectBetweenClosingChecks runs between the closing check of the
+	// descriptor and the closing stat of the name.
+	inspectBetweenClosingChecks func()
 )
 
 // inspectSchema is the report's schema version; a field renamed or removed
@@ -128,6 +132,10 @@ type inspectConfig struct {
 	Path     string `json:"path"`
 	Readable bool   `json:"readable"`
 	Error    string `json:"error,omitempty"`
+	// Presence is the typed answer behind Readable: `present` (read and
+	// parsed), `absent` (positively no file at the path), `malformed` (read but
+	// not parsed) or `unreadable` (could not be read, which is not absence).
+	Presence string `json:"presence"`
 	// SameAsInstalled says whether, at the end of the report, the path still
 	// names the file the report read: a replacement by rename after the parse
 	// leaves the retained descriptor's metadata unchanged and is caught here.
@@ -164,6 +172,11 @@ type inspectService struct {
 	Shape            maybe  `json:"shape"`
 	ShapeReason      string `json:"shape_reason,omitempty"`
 	NeedDaemonReload maybe  `json:"need_daemon_reload"`
+
+	// fromObservation marks a service whose config digest and mtime were taken
+	// from the configuration observation, so the closing check can withdraw
+	// them with it.
+	fromObservation bool
 
 	RunningSHA256                  maybe `json:"running_sha256"`
 	SameAsExecutable               maybe `json:"same_as_executable"`
@@ -252,10 +265,10 @@ type inspectPreparation struct {
 }
 
 func cmdReleaseInspect(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet release inspect")
-	configPath := fs.String("config", defaultConfigPath(), "path to billet.yaml")
-	asJSON := fs.Bool("json", false, "print the report as JSON")
-	if err := parse(fs, args); err != nil {
+	flags := newFlagSet("billet release inspect")
+	configPath := flags.String("config", defaultConfigPath(), "path to billet.yaml")
+	asJSON := flags.Bool("json", false, "print the report as JSON")
+	if err := parse(flags, args); err != nil {
 		return err
 	}
 	report := inspectHostRelease(ctx, *configPath)
@@ -294,19 +307,28 @@ func inspectHostRelease(ctx context.Context, configPath string) inspectReport {
 	var inspectorInfo os.FileInfo
 	var digest maybe
 	inspectorSHA := ""
-	if obsErr != nil {
+	switch {
+	case errors.Is(obsErr, fs.ErrNotExist):
+		report.Config.Presence = "absent"
 		report.Config.Error = obsErr.Error()
 		digest = unknown(obsErr.Error())
 		report.Config.SameAsInstalled = unknown(obsErr.Error())
-	} else {
+	case obsErr != nil:
+		report.Config.Presence = "unreadable"
+		report.Config.Error = obsErr.Error()
+		digest = unknown(obsErr.Error())
+		report.Config.SameAsInstalled = unknown(obsErr.Error())
+	default:
 		defer obs.file.Close()
 		inspectorInfo = obs.info
 		inspectorSHA = obs.sha
 		digest = known(obs.sha)
 		parsed, err := config.Parse(configPath, obs.body)
 		if err != nil {
+			report.Config.Presence = "malformed"
 			report.Config.Error = err.Error()
 		} else {
+			report.Config.Presence = "present"
 			cfg = parsed
 			report.Config.Readable = true
 		}
@@ -340,12 +362,12 @@ func inspectHostRelease(ctx context.Context, configPath string) inspectReport {
 	// different identity makes the binding false (the host holds a
 	// configuration this report does not describe). A false stays false.
 	if obsErr == nil {
-		if again, err := obs.file.Stat(); err != nil || again.Size() != obs.info.Size() || !again.ModTime().Equal(obs.info.ModTime()) {
-			why := "the configuration changed while the report was being made"
-			if report.ConfigBinding.known && report.ConfigBinding.value == true {
-				report.ConfigBinding = unknown(why)
-			}
-			report.Installed.SHA256 = unknown(why)
+		changed := "the configuration changed while the report was being made"
+		if again, err := obs.file.Stat(); err != nil || !sameMetadata(again, obs.info) {
+			withdrawObservation(&report, changed)
+		}
+		if inspectBetweenClosingChecks != nil {
+			inspectBetweenClosingChecks()
 		}
 		pathInfo, err := os.Stat(configPath)
 		switch {
@@ -358,11 +380,43 @@ func inspectHostRelease(ctx context.Context, configPath string) inspectReport {
 		case !os.SameFile(pathInfo, obs.info):
 			report.Config.SameAsInstalled = known(false)
 			report.ConfigBinding = known(false)
+		case !sameMetadata(pathInfo, obs.info):
+			// The name still holds the file, and the stat of the name is
+			// evidence of a rewrite the descriptor's own stat came too early
+			// to see; it is not discarded.
+			report.Config.SameAsInstalled = known(true)
+			withdrawObservation(&report, changed)
 		default:
 			report.Config.SameAsInstalled = known(true)
 		}
 	}
 	return report
+}
+
+// sameMetadata is the bracket every hash here uses: equal size and equal
+// modification time, which is refusal evidence and not proof of equal bytes.
+func sameMetadata(a, b os.FileInfo) bool {
+	return a.Size() == b.Size() && a.ModTime().Equal(b.ModTime())
+}
+
+// withdrawObservation is what the closing check does when the configuration
+// observed is no longer the configuration on disk: a binding that said true
+// says nothing, the observation's digest says nothing, and so does every
+// service field that was copied from the observation; a false binding and the
+// fields a service observed on its own (another configuration's digest) stay.
+func withdrawObservation(report *inspectReport, why string) {
+	if report.ConfigBinding.known && report.ConfigBinding.value == true {
+		report.ConfigBinding = unknown(why)
+	}
+	report.Installed.SHA256 = unknown(why)
+	for role := range report.Services {
+		svc := report.Services[role]
+		if !svc.fromObservation {
+			continue
+		}
+		svc.ConfigSHA256, svc.ConfigChangedSinceStart = unknown(why), unknown(why)
+		report.Services[role] = svc
+	}
 }
 
 // configObservation is one bracketed read of the configuration: its bytes, their
@@ -1097,6 +1151,7 @@ func inspectRunningProcess(ctx context.Context, svc *inspectService, role, unit 
 			// bytes this report parsed are the bytes to publish for it, and a
 			// pathname opened again could already name a replacement.
 			binding = known(true)
+			svc.fromObservation = true
 			svc.ConfigSHA256 = known(inspectorSHA)
 			if startErr == nil {
 				svc.ConfigChangedSinceStart = known(inspectorInfo.ModTime().After(startedAt))

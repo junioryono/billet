@@ -75,8 +75,8 @@ func newInspectFixture(t *testing.T) *inspectFixture {
 	upgradeRoot = filepath.Join(dir, "upgrades")
 	provenance.Path = filepath.Join(dir, "installed.json")
 	inspectAfterOpen = nil
-	inspectAfterConfig, inspectBeforeClose = nil, nil
-	t.Cleanup(func() { inspectAfterConfig, inspectBeforeClose = nil, nil })
+	inspectAfterConfig, inspectBeforeClose, inspectBetweenClosingChecks = nil, nil, nil
+	t.Cleanup(func() { inspectAfterConfig, inspectBeforeClose, inspectBetweenClosingChecks = nil, nil, nil })
 	openImage = func(path string) (*os.File, error) {
 		f.opened = append(f.opened, path)
 		return os.Open(path)
@@ -905,15 +905,38 @@ func TestReleaseInspectBindsOneConfigurationObservation(t *testing.T) {
 			t.Errorf("has_server = %v", got)
 		}
 	})
-	t.Run("rewritten in place during the report", func(t *testing.T) {
-		f := newInspectFixture(t)
-		inspectAfterConfig = func() {
-			writeFile(t, f.configPath, f.serverConfig()+"# B\n", 0o644)
-		}
-		r := f.report(t)
-		mustUnknown(t, "config_binding", r.ConfigBinding, "changed while the report")
-		mustUnknown(t, "installed_config.sha256", r.Installed.SHA256, "changed while the report")
-	})
+	rewritten := func(t *testing.T, f *inspectFixture) {
+		t.Helper()
+		writeFile(t, f.configPath, f.serverConfig()+"# B\n", 0o644)
+	}
+	for name, arm := range map[string]func(t *testing.T, f *inspectFixture){
+		"rewritten in place after the parse": func(t *testing.T, f *inspectFixture) {
+			t.Helper()
+			inspectAfterConfig = func() { rewritten(t, f) }
+		},
+		"rewritten in place after the sample": func(t *testing.T, f *inspectFixture) {
+			t.Helper()
+			inspectBeforeClose = func() { rewritten(t, f) }
+		},
+		"rewritten in place between the closing checks": func(t *testing.T, f *inspectFixture) {
+			t.Helper()
+			// The descriptor's own stat came too early to see this; the stat
+			// of the name is the evidence, and it is not discarded.
+			inspectBetweenClosingChecks = func() { rewritten(t, f) }
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newInspectFixture(t)
+			arm(t, f)
+			r := f.report(t)
+			mustUnknown(t, "config_binding", r.ConfigBinding, "changed while the report")
+			mustUnknown(t, "installed_config.sha256", r.Installed.SHA256, "changed while the report")
+			// The service copied its digest from the observation, so it goes
+			// with it.
+			mustUnknown(t, "config_sha256", r.Services["server"].ConfigSHA256, "changed while the report")
+			mustUnknown(t, "config_changed_since_start", r.Services["server"].ConfigChangedSinceStart, "changed while the report")
+		})
+	}
 	t.Run("replaced by rename after the sample", func(t *testing.T) {
 		// The process's view matched the observation, so the binding was true
 		// and the service's digest is the observation's; then the name is
@@ -939,6 +962,29 @@ func TestReleaseInspectBindsOneConfigurationObservation(t *testing.T) {
 		if got := mustKnown(t, "config_sha256", r.Services["server"].ConfigSHA256); got != shaOf(f.serverConfig()) {
 			t.Errorf("services.server.config_sha256 = %v, want the observation's digest, not the replacement's", got)
 		}
+	})
+	t.Run("rewritten in place and then replaced after the sample", func(t *testing.T) {
+		// The name check sees another file and says false; only the
+		// descriptor's own stat can see that the file the service was bound
+		// to was rewritten before it was replaced, so the service's copied
+		// digest goes too.
+		f := newInspectFixture(t)
+		inspectBeforeClose = func() {
+			writeFile(t, f.configPath, f.serverConfig()+"# rewritten\n", 0o644)
+			writeFile(t, f.configPath+".new", f.serverConfig()+"# B\n", 0o644)
+			if err := os.Rename(f.configPath+".new", f.configPath); err != nil {
+				t.Fatal(err)
+			}
+		}
+		r := f.report(t)
+		if got := mustKnown(t, "config_binding", r.ConfigBinding); got != false {
+			t.Errorf("config_binding = %v, want false", got)
+		}
+		if got := mustKnown(t, "config.same_as_installed", r.Config.SameAsInstalled); got != false {
+			t.Errorf("same_as_installed = %v, want false", got)
+		}
+		mustUnknown(t, "config_sha256", r.Services["server"].ConfigSHA256, "changed while the report")
+		mustUnknown(t, "installed_config.sha256", r.Installed.SHA256, "changed while the report")
 	})
 	t.Run("replaced by rename on a stopped host", func(t *testing.T) {
 		// No process, so no view is ever compared; the closing check of the
@@ -1017,7 +1063,7 @@ func TestReleaseInspectReportsThePendingReloadAsAFact(t *testing.T) {
 				t.Errorf("need_daemon_reload = %v, want %v", got, want)
 			}
 			if got := mustKnown(t, "shape", svc.Shape); got != "supported" {
-				t.Errorf("shape = %v (%s), want supported whatever the manager's flag says", got, svc.ShapeReason)
+				t.Errorf("shape = %v (%s), want supported whatever NeedDaemonReload says", got, svc.ShapeReason)
 			}
 			if got := mustKnown(t, "config_binding", r.ConfigBinding); got != true {
 				t.Errorf("config_binding = %v, want true", got)
@@ -1027,6 +1073,24 @@ func TestReleaseInspectReportsThePendingReloadAsAFact(t *testing.T) {
 	f := newInspectFixture(t)
 	f.unitProperty(t, "NeedDaemonReload", "")
 	mustUnknown(t, "need_daemon_reload", f.report(t).Services["server"].NeedDaemonReload, "NeedDaemonReload=")
+}
+
+// PRESENCE IS TYPED: a consumer that must tell an absent configuration (a
+// retired host) from one it could not read or parse gets the word, not a
+// boolean that folds the three together.
+func TestReleaseInspectTypesTheConfigurationsPresence(t *testing.T) {
+	f := newInspectFixture(t)
+	if got := f.report(t).Config.Presence; got != "present" {
+		t.Errorf("presence = %q, want present", got)
+	}
+	if err := os.Remove(f.configPath); err != nil {
+		t.Fatal(err)
+	}
+	r := f.report(t)
+	if r.Config.Presence != "absent" || r.Config.Readable {
+		t.Errorf("config = %+v, want absent", r.Config)
+	}
+	mustUnknown(t, "installed_config.sha256", r.Installed.SHA256, "no such file")
 }
 
 // A PROCESS WHOSE --config IS RELATIVE CANNOT BE COMPARED: it is relative to a
@@ -1145,29 +1209,23 @@ func TestReleaseInspectRefusesAnImageModifiedDuringTheHash(t *testing.T) {
 	mustUnknown(t, "executable.sha256", r.Executable.SHA256, "changed while it was being read")
 }
 
-// THE CONFIGURATION IS OPENED ONCE. A service whose view is the observation's
-// file publishes the observation's digest; a second open of the pathname would
-// be a window in which a replacement's bytes are paired with the parsed
-// configuration and a true binding, so the seam counts the opens.
+// THE CONFIGURATION'S CONTENT IS READ ONCE. A service whose view is the
+// observation's file publishes the observation's digest; a second content read
+// of the pathname would be a window in which a replacement's bytes are paired
+// with the parsed configuration and a true binding. The seam counts the
+// seam-covered content reads (observeConfig and hashImage), not every open:
+// the process-view open, which reads no bytes, is deliberately outside it.
 func TestReleaseInspectOpensTheConfigurationOnce(t *testing.T) {
 	f := newInspectFixture(t)
 	opens := 0
 	inspectAfterOpen = func(path string) {
-		if path != f.configPath {
-			return
-		}
-		opens++
-		if opens > 1 {
-			// Only a second open could see this replacement.
-			writeFile(t, f.configPath+".new", f.serverConfig()+"# B\n", 0o644)
-			if err := os.Rename(f.configPath+".new", f.configPath); err != nil {
-				t.Fatal(err)
-			}
+		if path == f.configPath {
+			opens++
 		}
 	}
 	r := f.report(t)
 	if opens != 1 {
-		t.Errorf("the configuration was opened %d times, want once", opens)
+		t.Errorf("the configuration's content was read %d times, want once", opens)
 	}
 	if got := mustKnown(t, "config_sha256", r.Services["server"].ConfigSHA256); got != shaOf(f.serverConfig()) {
 		t.Errorf("services.server.config_sha256 = %v, want the observation's digest", got)
@@ -1265,8 +1323,8 @@ func TestReleaseInspectAnUnreadableConfigLeavesDependentSectionsUnknown(t *testi
 	f := newInspectFixture(t)
 	f.writeConfig(t, "server: [not a mapping\n")
 	r := f.report(t)
-	if r.Config.Readable {
-		t.Fatal("a broken config read as readable")
+	if r.Config.Readable || r.Config.Presence != "malformed" {
+		t.Fatalf("a broken config read as %+v, want malformed and unreadable", r.Config)
 	}
 	mustUnknown(t, "dsn_env", r.Services["server"].DSNEnv, "configuration could not be read")
 	mustUnknown(t, "has_server", r.Installed.HasServer, "load")
@@ -1606,6 +1664,7 @@ func assertFieldSet(t *testing.T, r inspectReport, want string) {
 // report; an unknown field appears as <field>.unknown.
 const inspectFieldSet = `
 config.path
+config.presence
 config.readable
 config.same_as_installed
 config_binding
@@ -1829,6 +1888,7 @@ func TestReleaseInspectCommandRuns(t *testing.T) {
 // a converge guard with a provenance record.
 const inspectFieldSetGuarded = `
 config.path
+config.presence
 config.readable
 config.same_as_installed
 config_binding
@@ -1916,6 +1976,7 @@ transaction.root
 // bundle, a retirement journal and a Go claim with a readable journal.
 const inspectFieldSetNode = `
 config.path
+config.presence
 config.readable
 config.same_as_installed
 config_binding
