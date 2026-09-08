@@ -532,6 +532,12 @@ func hashImage(path string) (string, os.FileInfo, error) {
 		return "", nil, fmt.Errorf("open %s: %w", path, err)
 	}
 	defer func() { _ = f.Close() }()
+	return hashOpenFile(f, path)
+}
+
+// hashOpenFile is the bracketed hash of an already open descriptor: its own
+// stat before and after the read must agree in size and modification time.
+func hashOpenFile(f *os.File, path string) (string, os.FileInfo, error) {
 	before, err := f.Stat()
 	if err != nil {
 		return "", nil, fmt.Errorf("stat %s: %w", path, err)
@@ -618,9 +624,11 @@ func unitProperties(ctx context.Context, unit string) (map[string][]string, erro
 // unitEnablement reads systemd's UnitFileState literally and derives `enabled`
 // from it: `enabled` and `enabled-runtime` are both enablement (a runtime
 // enablement is one systemd honours until the next boot, so it is not
-// "disabled"), every other state systemd defines is not, and an answer outside
-// systemd's set is could-not-tell rather than false, because a consumer that
-// reads false as "positively disabled" must never be handed an empty answer.
+// "disabled"); false means A RECOGNISED STATE OTHER THAN THOSE TWO, which is
+// not "positively disabled" (`static`, `alias`, `indirect` and `generated`
+// units can still be started by something else), so a consumer that needs a
+// particular state reads unit_file_state against its own accepted set; and an
+// answer outside systemd's set is could-not-tell rather than false.
 func unitEnablement(answer string) (maybe, maybe) {
 	switch answer {
 	case "enabled", "enabled-runtime":
@@ -833,6 +841,9 @@ func inspectServiceSection(ctx context.Context, role, unit string, cfg *config.C
 		switch {
 		case pidErr != nil:
 			svc.MainPID = unknown("systemd reported a MainPID that is not a number")
+		case pid == 0:
+			// No process is null here as it is for a loaded unit, never 0.
+			svc.MainPID = known(nil)
 		default:
 			svc.MainPID = known(pid)
 		}
@@ -970,9 +981,10 @@ type processSample struct {
 	cmdline    []string
 	environ    []byte
 	// view is the file the process's own root resolves its --config path to,
-	// opened through /proc/<pid>/root inside the sample; viewErr says why it
-	// could not be.
+	// opened through /proc/<pid>/root inside the sample, viewSHA its bracketed
+	// digest, and viewErr says why neither could be had.
 	view    os.FileInfo
+	viewSHA string
 	viewErr string
 }
 
@@ -1044,9 +1056,9 @@ func sampleProcess(ctx context.Context, unit string, pid int, first map[string][
 		// the file is opened through /proc/<pid>/root, inside the sample, and
 		// compared by identity rather than by the root's name.
 		var view os.FileInfo
-		viewErr := ""
+		viewSHA, viewErr := "", ""
 		if len(args) == 4 && filepath.IsAbs(args[3]) {
-			view, viewErr = statThroughRoot(dir, args[3])
+			view, viewSHA, viewErr = hashThroughRoot(dir, args[3])
 		}
 		again, err := unitProperties(ctx, unit)
 		if err != nil {
@@ -1069,29 +1081,43 @@ func sampleProcess(ctx context.Context, unit string, pid int, first map[string][
 		if before != after {
 			continue
 		}
-		return processSample{sha: sum, startTicks: before, cmdline: args, environ: environ, view: view, viewErr: viewErr}, nil
+		return processSample{sha: sum, startTicks: before, cmdline: args, environ: environ, view: view, viewSHA: viewSHA, viewErr: viewErr}, nil
 	}
 	return processSample{}, errors.New("the service restarted during the observation, or its unit changed under it")
 }
 
-// statThroughRoot opens an absolute path as the process sees it and returns the
-// opened file's identity. The open goes through the /proc/<pid>/root magic
-// link WITH ROOT-SCOPED RESOLUTION (openInRoot): a plain open of the joined
+// hashThroughRoot opens an absolute path as the process sees it and returns the
+// opened file's identity and bracketed digest. The open goes through the
+// /proc/<pid>/root magic link WITH ROOT-SCOPED RESOLUTION (openInRoot): a plain open of the joined
 // path would resolve an absolute symlink met on the way against the
 // inspector's root, so a config that is a symlink into a directory the service
 // has mounted differently would be opened in the inspector's namespace and
 // compare equal to a file the service never reads.
-func statThroughRoot(procDir, path string) (os.FileInfo, string) {
+func hashThroughRoot(procDir, path string) (os.FileInfo, string, string) {
 	f, err := openInRoot(filepath.Join(procDir, "root"), path)
 	if err != nil {
-		return nil, fmt.Sprintf("the process's view of %s (through %s) could not be opened: %v", path, filepath.Join(procDir, "root"), err)
+		return nil, "", fmt.Sprintf("the process's view of %s (through %s) could not be opened: %v", path, filepath.Join(procDir, "root"), err)
 	}
-	defer f.Close()
-	info, err := f.Stat()
+	defer func() { _ = f.Close() }()
+	sum, info, err := hashOpenFile(f, path)
 	if err != nil {
-		return nil, fmt.Sprintf("the process's view of %s could not be read: %v", path, err)
+		return nil, "", fmt.Sprintf("the process's view of %s could not be read: %v", path, err)
 	}
-	return info, ""
+	return info, sum, ""
+}
+
+// viewEvidence is a service's config digest and mtime verdict taken from its
+// own view of the path it names, or could-not-tell when that view could not be
+// read; the inspector's namespace is never consulted for a path it does not
+// itself hold.
+func viewEvidence(sample processSample, startedAt time.Time, startKnown bool) (maybe, maybe) {
+	if sample.viewErr != "" {
+		return unknown(sample.viewErr), unknown(sample.viewErr)
+	}
+	if !startKnown {
+		return known(sample.viewSHA), unknown("the process start time is unknown")
+	}
+	return known(sample.viewSHA), known(sample.view.ModTime().After(startedAt))
 }
 
 // inspectRunningProcess binds a running process to the inspector's
@@ -1153,8 +1179,12 @@ func inspectRunningProcess(ctx context.Context, svc *inspectService, role, unit 
 		// be compared and is could-not-tell.
 		switch {
 		case cmdlineConfig != inspectorConfig:
+			// ANOTHER CONFIGURATION, READ IN THE PROCESS'S OWN NAMESPACE: the
+			// inspector's file at that name may be another file entirely, so
+			// the digest and mtime come from the sampled view or are
+			// could-not-tell.
 			binding = known(false)
-			svc.ConfigSHA256, svc.ConfigChangedSinceStart = fileHashAndChanged(cmdlineConfig, startedAt, startErr == nil)
+			svc.ConfigSHA256, svc.ConfigChangedSinceStart = viewEvidence(sample, startedAt, startErr == nil)
 		case sample.viewErr != "":
 			why = sample.viewErr
 			binding = unknown(why)

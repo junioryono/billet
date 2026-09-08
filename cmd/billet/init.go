@@ -1203,7 +1203,7 @@ func serviceOwnership(path string) {
 	grp, err := user.LookupGroup(initconfig.ServiceGroup)
 	if err == nil {
 		if gid, convErr := strconv.Atoi(grp.Gid); convErr == nil {
-			if err := os.Chown(path, -1, gid); err == nil {
+			if err := os.Chown(path, -1, gid); err == nil { //nolint:gosec // path is the config file this command just wrote at the operator's own --config; handing it to the service group is the point
 				return
 			}
 		}

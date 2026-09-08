@@ -989,6 +989,7 @@ func TestReleaseInspectBindsOneConfigurationObservation(t *testing.T) {
 		if got := mustKnown(t, "config_sha256", r.Services["server"].ConfigSHA256); got != shaOf(f.serverConfig()+"# other\n") {
 			t.Errorf("a service that hashed another configuration lost its own digest: %v", got)
 		}
+		mustKnown(t, "config_changed_since_start", r.Services["server"].ConfigChangedSinceStart)
 		mustUnknown(t, "installed_config.sha256", r.Installed.SHA256, "changed while the report")
 	})
 	t.Run("rewritten to the same length with a later mtime", func(t *testing.T) {
@@ -1015,6 +1016,30 @@ func TestReleaseInspectBindsOneConfigurationObservation(t *testing.T) {
 				mustUnknown(t, "config_sha256", r.Services["server"].ConfigSHA256, "changed while the report")
 			})
 		}
+	})
+	t.Run("rewritten to the same length, then replaced after the sample", func(t *testing.T) {
+		// The name check sees another file; only the descriptor's own stat,
+		// and only its mtime, can see the rewrite that preceded it.
+		f := newInspectFixture(t)
+		inspectBeforeClose = func() {
+			body := f.serverConfig()
+			writeFile(t, f.configPath, body[:len(body)-2]+"X\n", 0o644)
+			later := time.Now().Add(2 * time.Hour)
+			if err := os.Chtimes(f.configPath, later, later); err != nil {
+				t.Fatal(err)
+			}
+			writeFile(t, f.configPath+".new", body+"# B\n", 0o644)
+			if err := os.Rename(f.configPath+".new", f.configPath); err != nil {
+				t.Fatal(err)
+			}
+		}
+		r := f.report(t)
+		if got := mustKnown(t, "config_binding", r.ConfigBinding); got != false {
+			t.Errorf("config_binding = %v, want false", got)
+		}
+		mustUnknown(t, "installed_config.sha256", r.Installed.SHA256, "changed while the report")
+		mustUnknown(t, "config_sha256", r.Services["server"].ConfigSHA256, "changed while the report")
+		mustUnknown(t, "config_changed_since_start", r.Services["server"].ConfigChangedSinceStart, "changed while the report")
 	})
 	t.Run("rewritten in place and then replaced after the sample", func(t *testing.T) {
 		// The name check sees another file and says false; only the
@@ -1132,7 +1157,11 @@ func TestReleaseInspectReportsThePendingReloadAsAFact(t *testing.T) {
 // systemd's set is could-not-tell, never false, because a consumer that reads
 // false as "positively disabled" must not be handed an empty answer.
 func TestReleaseInspectReadsEnablementLiterally(t *testing.T) {
-	for state, want := range map[string]any{"enabled": true, "enabled-runtime": true, "static": false, "disabled": false, "masked": false} {
+	for state, want := range map[string]any{
+		"enabled": true, "enabled-runtime": true,
+		"disabled": false, "static": false, "masked": false, "masked-runtime": false, "indirect": false,
+		"generated": false, "transient": false, "linked": false, "linked-runtime": false, "alias": false, "bad": false,
+	} {
 		t.Run(state, func(t *testing.T) {
 			f := newInspectFixture(t)
 			f.unitProperty(t, "UnitFileState", state)
@@ -1145,11 +1174,23 @@ func TestReleaseInspectReadsEnablementLiterally(t *testing.T) {
 			}
 		})
 	}
+	for _, answer := range []string{"", "frobnicated"} {
+		f := newInspectFixture(t)
+		f.unitProperty(t, "UnitFileState", answer)
+		svc := f.report(t).Services["server"]
+		mustUnknown(t, "enabled", svc.Enabled, "UnitFileState=")
+		mustUnknown(t, "unit_file_state", svc.UnitFileState, "UnitFileState=")
+	}
+	// A unit whose fragment is gone has no file state and no process: null,
+	// not false and not 0.
 	f := newInspectFixture(t)
-	f.unitProperty(t, "UnitFileState", "")
+	f.unitAbsent(t, "billet-server.service")
 	svc := f.report(t).Services["server"]
-	mustUnknown(t, "enabled", svc.Enabled, "UnitFileState=")
-	mustUnknown(t, "unit_file_state", svc.UnitFileState, "UnitFileState=")
+	for name, m := range map[string]maybe{"enabled": svc.Enabled, "unit_file_state": svc.UnitFileState, "main_pid": svc.MainPID} {
+		if got := mustKnown(t, name, m); got != nil {
+			t.Errorf("%s = %v for a not-found unit, want null", name, got)
+		}
+	}
 }
 
 // PRESENCE IS TYPED: a consumer that must tell an absent configuration (a
@@ -1269,6 +1310,41 @@ func TestReleaseInspectResolvesTheProcessViewUnderItsRoot(t *testing.T) {
 	})
 }
 
+// ANOTHER CONFIGURATION IS READ IN THE PROCESS'S NAMESPACE: the inspector's
+// file at that name may be a different file, so a service that names another
+// path publishes the digest of what its own root resolves that path to, or
+// could-not-tell when that view cannot be read; never the inspector's copy.
+func TestReleaseInspectHashesAnotherConfigurationThroughTheProcessView(t *testing.T) {
+	t.Run("the view's bytes, not the inspector's", func(t *testing.T) {
+		f := newInspectFixture(t)
+		other := filepath.Join(f.dir, "other.yaml")
+		writeFile(t, other, "inspector: copy\n", 0o644)
+		view := filepath.Join(f.dir, "view")
+		writeFile(t, filepath.Join(view, other), "process: copy\n", 0o644)
+		f.unitRunning(t, "billet-server.service", "server", other, nil)
+		f.process(t, []string{f.binPath, "server", "--config", other}, nil)
+		f.processRoot(t, view)
+		r := f.report(t)
+		if got := mustKnown(t, "config_binding", r.ConfigBinding); got != false {
+			t.Errorf("config_binding = %v, want false", got)
+		}
+		if got := mustKnown(t, "config_sha256", r.Services["server"].ConfigSHA256); got != shaOf("process: copy\n") {
+			t.Errorf("config_sha256 = %v, want the digest of the process's view, not the inspector's copy", got)
+		}
+	})
+	t.Run("an unreadable view is could-not-tell", func(t *testing.T) {
+		f := newInspectFixture(t)
+		other := filepath.Join(f.dir, "other.yaml")
+		writeFile(t, other, "inspector: copy\n", 0o644)
+		f.unitRunning(t, "billet-server.service", "server", other, nil)
+		f.process(t, []string{f.binPath, "server", "--config", other}, nil)
+		f.processRoot(t, filepath.Join(f.dir, "empty-view"))
+		svc := f.report(t).Services["server"]
+		mustUnknown(t, "config_sha256", svc.ConfigSHA256, "could not be opened")
+		mustUnknown(t, "config_changed_since_start", svc.ConfigChangedSinceStart, "could not be opened")
+	})
+}
+
 // A ZOMBIE KEEPS ITS START TIME, so equal ticks before and after the sample
 // would not prove the process lived through it; a zombie or dead process is
 // could-not-tell.
@@ -1297,12 +1373,13 @@ func TestReleaseInspectRefusesAnImageModifiedDuringTheHash(t *testing.T) {
 	mustUnknown(t, "executable.sha256", r.Executable.SHA256, "changed while it was being read")
 }
 
-// THE CONFIGURATION'S CONTENT IS READ ONCE. A service whose view is the
-// observation's file publishes the observation's digest; a second content read
-// of the pathname would be a window in which a replacement's bytes are paired
-// with the parsed configuration and a true binding. The seam counts the
-// seam-covered content reads (observeConfig and hashImage), not every open:
-// the process-view open, which reads no bytes, is deliberately outside it.
+// THE CONFIGURATION'S CONTENT IS READ TWICE AND NO MORE: once as the
+// observation, whose digest a bound service publishes, and once through the
+// process's own root inside the sample, which is the process's namespace and
+// not the inspector's. A third content read, of the pathname in the
+// inspector's namespace, would be a window in which a replacement's bytes are
+// paired with the parsed configuration and a true binding. The seam counts the
+// seam-covered content reads (observeConfig, hashImage and the view's hash).
 func TestReleaseInspectOpensTheConfigurationOnce(t *testing.T) {
 	f := newInspectFixture(t)
 	opens := 0
@@ -1312,8 +1389,8 @@ func TestReleaseInspectOpensTheConfigurationOnce(t *testing.T) {
 		}
 	}
 	r := f.report(t)
-	if opens != 1 {
-		t.Errorf("the configuration's content was read %d times, want once", opens)
+	if opens != 2 {
+		t.Errorf("the configuration's content was read %d times, want two: the observation and the process's own view", opens)
 	}
 	if got := mustKnown(t, "config_sha256", r.Services["server"].ConfigSHA256); got != shaOf(f.serverConfig()) {
 		t.Errorf("services.server.config_sha256 = %v, want the observation's digest", got)
