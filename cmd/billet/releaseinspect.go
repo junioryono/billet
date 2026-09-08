@@ -83,9 +83,11 @@ var (
 	// systemctlTimeout bounds one systemctl show.
 	systemctlTimeout = 10 * time.Second
 	// inspectAfterConfig runs after the configuration has been read and parsed
-	// and before anything is observed, so a test can replace or rewrite the
-	// file and prove the report notices.
+	// and before anything is observed, and inspectBeforeClose after every
+	// observation and before the closing check, so a test can replace or rewrite
+	// the file in either window and prove the report notices.
 	inspectAfterConfig func()
+	inspectBeforeClose func()
 )
 
 // inspectSchema is the report's schema version; a field renamed or removed
@@ -126,6 +128,10 @@ type inspectConfig struct {
 	Path     string `json:"path"`
 	Readable bool   `json:"readable"`
 	Error    string `json:"error,omitempty"`
+	// SameAsInstalled says whether, at the end of the report, the path still
+	// names the file the report read: a replacement by rename after the parse
+	// leaves the retained descriptor's metadata unchanged and is caught here.
+	SameAsInstalled maybe `json:"same_as_installed"`
 }
 
 type inspectExecutable struct {
@@ -287,12 +293,15 @@ func inspectHostRelease(ctx context.Context, configPath string) inspectReport {
 	var cfg *config.Config
 	var inspectorInfo os.FileInfo
 	var digest maybe
+	inspectorSHA := ""
 	if obsErr != nil {
 		report.Config.Error = obsErr.Error()
 		digest = unknown(obsErr.Error())
+		report.Config.SameAsInstalled = unknown(obsErr.Error())
 	} else {
 		defer obs.file.Close()
 		inspectorInfo = obs.info
+		inspectorSHA = obs.sha
 		digest = known(obs.sha)
 		parsed, err := config.Parse(configPath, obs.body)
 		if err != nil {
@@ -311,7 +320,7 @@ func inspectHostRelease(ctx context.Context, configPath string) inspectReport {
 	report.Services = map[string]inspectService{}
 	binding := known(true)
 	for role, unit := range map[string]string{"server": deploy.ServerUnitName, "node": deploy.NodeUnitName} {
-		svc, bound := inspectServiceSection(ctx, role, unit, cfg, configPath, inspectorInfo, exeSHA, exeInfo)
+		svc, bound := inspectServiceSection(ctx, role, unit, cfg, configPath, inspectorInfo, inspectorSHA, exeSHA, exeInfo)
 		report.Services[role] = svc
 		binding = weaker(binding, bound)
 	}
@@ -319,10 +328,17 @@ func inspectHostRelease(ctx context.Context, configPath string) inspectReport {
 	report.Installed = inspectInstalledSection(cfg, configPath, report.Config, digest)
 	report.Host = inspectHostSection(cfg)
 	report.Transaction = inspectTransactionSection()
-	// THE FILE DESCRIBED MUST STILL BE THE FILE ON DISK: a rewrite in place
-	// during the report keeps the identity the views were compared with and
-	// changes the bytes, so a binding that said true no longer says anything,
-	// and neither does the digest. A false stays false.
+	if inspectBeforeClose != nil {
+		inspectBeforeClose()
+	}
+	// THE FILE DESCRIBED MUST STILL BE THE FILE ON DISK, BY BYTES AND BY NAME.
+	// A rewrite in place during the report keeps the identity the views were
+	// compared with and changes the bytes, so a binding that said true no
+	// longer says anything, and neither does the digest; a replacement by
+	// rename after the parse leaves the retained descriptor's metadata as it
+	// was and puts another file at the name, so the name is stat'ed too and a
+	// different identity makes the binding false (the host holds a
+	// configuration this report does not describe). A false stays false.
 	if obsErr == nil {
 		if again, err := obs.file.Stat(); err != nil || again.Size() != obs.info.Size() || !again.ModTime().Equal(obs.info.ModTime()) {
 			why := "the configuration changed while the report was being made"
@@ -330,6 +346,20 @@ func inspectHostRelease(ctx context.Context, configPath string) inspectReport {
 				report.ConfigBinding = unknown(why)
 			}
 			report.Installed.SHA256 = unknown(why)
+		}
+		pathInfo, err := os.Stat(configPath)
+		switch {
+		case err != nil:
+			why := fmt.Sprintf("stat %s at the end of the report: %v", configPath, err)
+			report.Config.SameAsInstalled = unknown(why)
+			if report.ConfigBinding.known && report.ConfigBinding.value == true {
+				report.ConfigBinding = unknown(why)
+			}
+		case !os.SameFile(pathInfo, obs.info):
+			report.Config.SameAsInstalled = known(false)
+			report.ConfigBinding = known(false)
+		default:
+			report.Config.SameAsInstalled = known(true)
 		}
 	}
 	return report
@@ -355,6 +385,9 @@ func observeConfig(path string) (*configObservation, error) {
 	if err != nil {
 		_ = f.Close()
 		return nil, fmt.Errorf("stat %s: %w", path, err)
+	}
+	if inspectAfterOpen != nil {
+		inspectAfterOpen(path)
 	}
 	body, err := io.ReadAll(f)
 	if err != nil {
@@ -702,7 +735,7 @@ func environmentFilesOfAll(lines []string) ([]string, error) {
 // inspector's config, false on a disagreement, unknown when a shape could not
 // be read.
 func inspectServiceSection(ctx context.Context, role, unit string, cfg *config.Config,
-	inspectorConfig string, inspectorInfo os.FileInfo, exeSHA string, exeInfo os.FileInfo,
+	inspectorConfig string, inspectorInfo os.FileInfo, inspectorSHA string, exeSHA string, exeInfo os.FileInfo,
 ) (inspectService, maybe) {
 	svc := inspectService{LoadedConfig: unknown("nothing on the disk proves what a process read at start")}
 	if hostOS == "darwin" {
@@ -764,8 +797,9 @@ func inspectServiceSection(ctx context.Context, role, unit string, cfg *config.C
 	// EnvironmentFile (the package has none, the role's template adds one), and
 	// no Environment= directive. Anything else is could-not-tell for the
 	// binding below. The pending-reload flag is deliberately NOT a shape
-	// requirement: the loaded records are what systemd runs, and the flag is
-	// the manager's, not this unit's (needDaemonReload).
+	// requirement: the loaded records are what systemd runs, and the flag has
+	// two causes, this unit's own file and the manager-wide one, which it does
+	// not tell apart (needDaemonReload).
 	unitConfigPath := ""
 	shapeWhy := ""
 	records, execErr := unitExecStart(ctx, unit)
@@ -821,7 +855,7 @@ func inspectServiceSection(ctx context.Context, role, unit string, cfg *config.C
 		return svc, binding
 	}
 	svc.MainPID = known(pid)
-	processBinding := inspectRunningProcess(ctx, &svc, role, unit, pid, props, records, cfg, inspectorConfig, inspectorInfo, exeSHA, exeInfo, unitConfigPath, envFiles)
+	processBinding := inspectRunningProcess(ctx, &svc, role, unit, pid, props, records, cfg, inspectorConfig, inspectorInfo, inspectorSHA, exeSHA, exeInfo, unitConfigPath, envFiles)
 	return svc, weaker(binding, processBinding)
 }
 
@@ -989,7 +1023,7 @@ func statThroughRoot(procDir, path string) (os.FileInfo, string) {
 // the executable's; the second answer is that binding.
 func inspectRunningProcess(ctx context.Context, svc *inspectService, role, unit string, pid int,
 	props map[string][]string, records []execRecord, cfg *config.Config, inspectorConfig string,
-	inspectorInfo os.FileInfo, exeSHA string, exeInfo os.FileInfo, unitConfigPath string, envFiles []string,
+	inspectorInfo os.FileInfo, inspectorSHA string, exeSHA string, exeInfo os.FileInfo, unitConfigPath string, envFiles []string,
 ) maybe {
 	sample, err := sampleProcess(ctx, unit, pid, props, records)
 	if err != nil {
@@ -1058,8 +1092,17 @@ func inspectRunningProcess(ctx context.Context, svc *inspectService, role, unit 
 			binding = known(false)
 			svc.ConfigSHA256, svc.ConfigChangedSinceStart = unknown(why), unknown(why)
 		default:
+			// THE OBSERVATION'S DIGEST, not a second open of the pathname: the
+			// process's view is the observation's file by identity, so the
+			// bytes this report parsed are the bytes to publish for it, and a
+			// pathname opened again could already name a replacement.
 			binding = known(true)
-			svc.ConfigSHA256, svc.ConfigChangedSinceStart = fileHashAndChanged(cmdlineConfig, startedAt, startErr == nil)
+			svc.ConfigSHA256 = known(inspectorSHA)
+			if startErr == nil {
+				svc.ConfigChangedSinceStart = known(inspectorInfo.ModTime().After(startedAt))
+			} else {
+				svc.ConfigChangedSinceStart = unknown("the process start time is unknown")
+			}
 		}
 	}
 	switch len(envFiles) {

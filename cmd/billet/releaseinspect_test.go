@@ -75,8 +75,8 @@ func newInspectFixture(t *testing.T) *inspectFixture {
 	upgradeRoot = filepath.Join(dir, "upgrades")
 	provenance.Path = filepath.Join(dir, "installed.json")
 	inspectAfterOpen = nil
-	inspectAfterConfig = nil
-	t.Cleanup(func() { inspectAfterConfig = nil })
+	inspectAfterConfig, inspectBeforeClose = nil, nil
+	t.Cleanup(func() { inspectAfterConfig, inspectBeforeClose = nil, nil })
 	openImage = func(path string) (*os.File, error) {
 		f.opened = append(f.opened, path)
 		return os.Open(path)
@@ -914,6 +914,58 @@ func TestReleaseInspectBindsOneConfigurationObservation(t *testing.T) {
 		mustUnknown(t, "config_binding", r.ConfigBinding, "changed while the report")
 		mustUnknown(t, "installed_config.sha256", r.Installed.SHA256, "changed while the report")
 	})
+	t.Run("replaced by rename after the sample", func(t *testing.T) {
+		// The process's view matched the observation, so the binding was true
+		// and the service's digest is the observation's; then the name is
+		// given another file. The name no longer holds what the report
+		// describes, so the binding is false and both digests are A's.
+		f := newInspectFixture(t)
+		inspectBeforeClose = func() {
+			writeFile(t, f.configPath+".new", f.serverConfig()+"# B\n", 0o644)
+			if err := os.Rename(f.configPath+".new", f.configPath); err != nil {
+				t.Fatal(err)
+			}
+		}
+		r := f.report(t)
+		if got := mustKnown(t, "config_binding", r.ConfigBinding); got != false {
+			t.Errorf("config_binding = %v, want false once the name holds another file", got)
+		}
+		if got := mustKnown(t, "config.same_as_installed", r.Config.SameAsInstalled); got != false {
+			t.Errorf("same_as_installed = %v, want false", got)
+		}
+		if got := mustKnown(t, "installed_config.sha256", r.Installed.SHA256); got != shaOf(f.serverConfig()) {
+			t.Errorf("installed_config.sha256 = %v, want the parsed bytes' digest", got)
+		}
+		if got := mustKnown(t, "config_sha256", r.Services["server"].ConfigSHA256); got != shaOf(f.serverConfig()) {
+			t.Errorf("services.server.config_sha256 = %v, want the observation's digest, not the replacement's", got)
+		}
+	})
+	t.Run("replaced by rename on a stopped host", func(t *testing.T) {
+		// No process, so no view is ever compared; the closing check of the
+		// name is the only thing that can notice the replacement.
+		f := newInspectFixture(t)
+		f.unitWith(t, "billet-server.service", f.binPath+" server --config "+f.configPath, nil, "", 0, "inactive", "dead")
+		inspectAfterConfig = func() {
+			writeFile(t, f.configPath+".new", f.serverConfig()+"# B\n", 0o644)
+			if err := os.Rename(f.configPath+".new", f.configPath); err != nil {
+				t.Fatal(err)
+			}
+		}
+		r := f.report(t)
+		if got := mustKnown(t, "config_binding", r.ConfigBinding); got != false {
+			t.Errorf("config_binding = %v, want false on a stopped host whose configuration was replaced after the parse", got)
+		}
+		if got := mustKnown(t, "installed_config.sha256", r.Installed.SHA256); got != shaOf(f.serverConfig()) {
+			t.Errorf("installed_config.sha256 = %v, want the parsed bytes' digest", got)
+		}
+	})
+	t.Run("untouched", func(t *testing.T) {
+		f := newInspectFixture(t)
+		r := f.report(t)
+		if got := mustKnown(t, "config.same_as_installed", r.Config.SameAsInstalled); got != true {
+			t.Errorf("same_as_installed = %v, want true", got)
+		}
+	})
 }
 
 // THE CONFIRMING READ COVERS EVERYTHING THE SHAPE RESTS ON: a reload under the
@@ -947,12 +999,12 @@ func TestReleaseInspectDiscardsASampleWhenTheLoadedShapeMoves(t *testing.T) {
 	}
 }
 
-// THE PENDING-RELOAD FLAG IS REPORTED, NOT JUDGED: on systemd 255 it is the
-// manager's (`unit_file_state_outdated`, set by any enable or disable that
-// changed something and cleared only by a reload; measured at 464 of 464 units
-// on the reference controller after a snap refresh), so it cannot say whether
-// THIS unit's file differs from what was loaded, and the loaded records are
-// what systemd runs either way. A yes leaves the shape supported and the binding
+// THE PENDING-RELOAD FLAG IS REPORTED, NOT JUDGED: on systemd 255 it answers
+// yes when this unit's own file changed since load AND for every unit while
+// the manager's `unit_file_state_outdated` is set (any enable or disable that
+// changed something, cleared only by a reload; measured at 464 of 464 units on
+// the reference controller after a snap refresh), so it cannot say which, and
+// the loaded records are what systemd runs either way. A yes leaves the shape supported and the binding
 // true; an answer that is neither yes nor no is could-not-tell.
 func TestReleaseInspectReportsThePendingReloadAsAFact(t *testing.T) {
 	for answer, want := range map[string]any{"yes": true, "no": false} {
@@ -1076,8 +1128,57 @@ func TestReleaseInspectRefusesAZombie(t *testing.T) {
 	mustUnknown(t, "config_binding", f.report(t).ConfigBinding, "zombie")
 }
 
-// A FILE WRITTEN WHILE IT IS HASHED IS COULD-NOT-TELL: a hash paired with
-// either stat would describe a file that never existed whole.
+// AN IMAGE WRITTEN WHILE IT IS HASHED IS COULD-NOT-TELL: the bracket around
+// every hash is the descriptor's own metadata before and after the read.
+func TestReleaseInspectRefusesAnImageModifiedDuringTheHash(t *testing.T) {
+	f := newInspectFixture(t)
+	inspectAfterOpen = func(path string) {
+		if path != f.binPath {
+			return
+		}
+		// An in-place write: the same inode, new bytes, a new size.
+		if err := os.WriteFile(f.binPath, []byte("IMAGE-A-touched\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r := f.report(t)
+	mustUnknown(t, "executable.sha256", r.Executable.SHA256, "changed while it was being read")
+}
+
+// THE CONFIGURATION IS OPENED ONCE. A service whose view is the observation's
+// file publishes the observation's digest; a second open of the pathname would
+// be a window in which a replacement's bytes are paired with the parsed
+// configuration and a true binding, so the seam counts the opens.
+func TestReleaseInspectOpensTheConfigurationOnce(t *testing.T) {
+	f := newInspectFixture(t)
+	opens := 0
+	inspectAfterOpen = func(path string) {
+		if path != f.configPath {
+			return
+		}
+		opens++
+		if opens > 1 {
+			// Only a second open could see this replacement.
+			writeFile(t, f.configPath+".new", f.serverConfig()+"# B\n", 0o644)
+			if err := os.Rename(f.configPath+".new", f.configPath); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	r := f.report(t)
+	if opens != 1 {
+		t.Errorf("the configuration was opened %d times, want once", opens)
+	}
+	if got := mustKnown(t, "config_sha256", r.Services["server"].ConfigSHA256); got != shaOf(f.serverConfig()) {
+		t.Errorf("services.server.config_sha256 = %v, want the observation's digest", got)
+	}
+}
+
+// A FILE WRITTEN WHILE IT IS READ IS COULD-NOT-TELL: a digest paired with
+// either stat would describe a file that never existed whole. The
+// configuration is read once, as the observation, so that is where the bracket
+// is exercised; every dependent section then says the configuration could not
+// be read.
 func TestReleaseInspectRefusesAFileModifiedDuringTheHash(t *testing.T) {
 	f := newInspectFixture(t)
 	inspectAfterOpen = func(path string) {
@@ -1089,9 +1190,13 @@ func TestReleaseInspectRefusesAFileModifiedDuringTheHash(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	svc := f.report(t).Services["server"]
-	mustUnknown(t, "config_sha256", svc.ConfigSHA256, "changed while it was being read")
-	mustUnknown(t, "config_changed_since_start", svc.ConfigChangedSinceStart, "changed while it was being read")
+	r := f.report(t)
+	if r.Config.Readable || !strings.Contains(r.Config.Error, "changed while it was being read") {
+		t.Errorf("config = %+v, want unreadable for a file written while it was read", r.Config)
+	}
+	mustUnknown(t, "installed_config.sha256", r.Installed.SHA256, "changed while it was being read")
+	mustUnknown(t, "config_sha256", r.Services["server"].ConfigSHA256, "could not be read")
+	mustUnknown(t, "config_binding", r.ConfigBinding, "could not be read")
 }
 
 // AN ENVIRONMENT FILE'S WHOLE NAME IS KEPT, " (" included: a parser cutting at
@@ -1502,6 +1607,7 @@ func assertFieldSet(t *testing.T, r inspectReport, want string) {
 const inspectFieldSet = `
 config.path
 config.readable
+config.same_as_installed
 config_binding
 executable.image
 executable.installed_path
@@ -1623,6 +1729,7 @@ func TestReleaseInspectReadsTheFilesystemOnlyWhereListed(t *testing.T) {
 		`f, err := os.OpenFile(filepath.Join(upgradeRoot, txLockName), os.O_RDONLY|syscall.O_NOFOLLOW, 0)`,
 		`info, err := os.Lstat(active)`,
 		`installed, err := os.Stat(installedBinary)`,
+		`pathInfo, err := os.Stat(configPath)`,
 		`rootInfo, err := os.Lstat(upgradeRoot)`,
 	}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
@@ -1723,6 +1830,7 @@ func TestReleaseInspectCommandRuns(t *testing.T) {
 const inspectFieldSetGuarded = `
 config.path
 config.readable
+config.same_as_installed
 config_binding
 executable.image
 executable.installed_path
@@ -1809,6 +1917,7 @@ transaction.root
 const inspectFieldSetNode = `
 config.path
 config.readable
+config.same_as_installed
 config_binding
 executable.image
 executable.installed_path
