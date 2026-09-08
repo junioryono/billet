@@ -162,6 +162,7 @@ type inspectProvenance struct {
 
 type inspectService struct {
 	UnitPresent      maybe  `json:"unit_present"`
+	UnitFileState    maybe  `json:"unit_file_state"`
 	Enabled          maybe  `json:"enabled"`
 	ActiveState      maybe  `json:"active_state"`
 	SubState         maybe  `json:"sub_state"`
@@ -614,6 +615,25 @@ func unitProperties(ctx context.Context, unit string) (map[string][]string, erro
 	return props, nil
 }
 
+// unitEnablement reads systemd's UnitFileState literally and derives `enabled`
+// from it: `enabled` and `enabled-runtime` are both enablement (a runtime
+// enablement is one systemd honours until the next boot, so it is not
+// "disabled"), every other state systemd defines is not, and an answer outside
+// systemd's set is could-not-tell rather than false, because a consumer that
+// reads false as "positively disabled" must never be handed an empty answer.
+func unitEnablement(answer string) (maybe, maybe) {
+	switch answer {
+	case "enabled", "enabled-runtime":
+		return known(answer), known(true)
+	case "disabled", "static", "masked", "masked-runtime", "indirect", "generated", "transient",
+		"linked", "linked-runtime", "alias", "bad":
+		return known(answer), known(false)
+	default:
+		why := "systemd answered UnitFileState=" + strconv.Quote(answer)
+		return unknown(why), unknown(why)
+	}
+}
+
 // needDaemonReload reads systemd's NeedDaemonReload as the three-valued fact
 // it is. On systemd 255 it is true when this unit's fragment, source or drop-ins
 // changed since load OR when the manager's `unit_file_state_outdated` is set,
@@ -805,7 +825,8 @@ func inspectServiceSection(ctx context.Context, role, unit string, cfg *config.C
 		// THE FRAGMENT IS GONE; THE RUNTIME FACTS ARE NOT DISCARDED WITH IT: a
 		// unit whose file was removed while its service runs still runs.
 		svc.UnitPresent = known(false)
-		svc.Enabled, svc.ExecStart, svc.Shape, svc.EnvironmentFiles = known(nil), known(nil), known(nil), known(nil)
+		svc.UnitFileState, svc.Enabled = known(nil), known(nil)
+		svc.ExecStart, svc.Shape, svc.EnvironmentFiles = known(nil), known(nil), known(nil)
 		svc.NeedDaemonReload = needDaemonReload(props)
 		svc.ActiveState, svc.SubState = known(active), known(firstProp(props, "SubState"))
 		svc.ExecMainStart = known(firstProp(props, "ExecMainStartTimestamp"))
@@ -826,7 +847,7 @@ func inspectServiceSection(ctx context.Context, role, unit string, cfg *config.C
 		return svc, unknown(why)
 	}
 	svc.UnitPresent = known(true)
-	svc.Enabled = known(firstProp(props, "UnitFileState") == "enabled")
+	svc.UnitFileState, svc.Enabled = unitEnablement(firstProp(props, "UnitFileState"))
 	svc.ActiveState = known(active)
 	svc.SubState = known(firstProp(props, "SubState"))
 	svc.ExecMainStart = known(firstProp(props, "ExecMainStartTimestamp"))
@@ -916,7 +937,8 @@ func inspectServiceSection(ctx context.Context, role, unit string, cfg *config.C
 // serviceAllUnknown is a unit nothing could be asked about.
 func serviceAllUnknown(svc inspectService, why string) inspectService {
 	svc.UnitPresent = unknown(why)
-	svc.Enabled, svc.ActiveState, svc.SubState, svc.MainPID = unknown(why), unknown(why), unknown(why), unknown(why)
+	svc.UnitFileState, svc.Enabled = unknown(why), unknown(why)
+	svc.ActiveState, svc.SubState, svc.MainPID = unknown(why), unknown(why), unknown(why)
 	svc.ExecMainStart, svc.ExecStart, svc.Shape, svc.EnvironmentFiles = unknown(why), unknown(why), unknown(why), unknown(why)
 	svc.NeedDaemonReload = unknown(why)
 	fillRunningUnknown(&svc, why)

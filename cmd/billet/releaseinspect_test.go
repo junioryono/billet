@@ -963,6 +963,59 @@ func TestReleaseInspectBindsOneConfigurationObservation(t *testing.T) {
 			t.Errorf("services.server.config_sha256 = %v, want the observation's digest, not the replacement's", got)
 		}
 	})
+	t.Run("withdrawn from a bound node, not only a server", func(t *testing.T) {
+		// The fixture has one process, so the node is the bound service here;
+		// a withdrawal that only knew the server's name would leave it known.
+		f := newInspectFixture(t)
+		f.unitAbsent(t, "billet-server.service")
+		f.unitRunning(t, "billet-node.service", "node", f.configPath, nil)
+		f.process(t, []string{f.binPath, "node", "--config", f.configPath}, nil)
+		inspectBeforeClose = func() { rewritten(t, f) }
+		r := f.report(t)
+		mustUnknown(t, "node config_sha256", r.Services["node"].ConfigSHA256, "changed while the report")
+		mustUnknown(t, "node config_changed_since_start", r.Services["node"].ConfigChangedSinceStart, "changed while the report")
+	})
+	t.Run("a service that hashed another configuration keeps its own evidence", func(t *testing.T) {
+		f := newInspectFixture(t)
+		other := filepath.Join(f.dir, "other.yaml")
+		writeFile(t, other, f.serverConfig()+"# other\n", 0o644)
+		f.unitRunning(t, "billet-server.service", "server", other, nil)
+		f.process(t, []string{f.binPath, "server", "--config", other}, nil)
+		inspectBeforeClose = func() { rewritten(t, f) }
+		r := f.report(t)
+		if got := mustKnown(t, "config_binding", r.ConfigBinding); got != false {
+			t.Errorf("config_binding = %v, want false", got)
+		}
+		if got := mustKnown(t, "config_sha256", r.Services["server"].ConfigSHA256); got != shaOf(f.serverConfig()+"# other\n") {
+			t.Errorf("a service that hashed another configuration lost its own digest: %v", got)
+		}
+		mustUnknown(t, "installed_config.sha256", r.Installed.SHA256, "changed while the report")
+	})
+	t.Run("rewritten to the same length with a later mtime", func(t *testing.T) {
+		// Equal size, so only the modification time can tell; the closing
+		// checks compare both.
+		for name, arm := range map[string]func(touch func()){
+			"between the closing checks": func(touch func()) { inspectBetweenClosingChecks = touch },
+			"after the sample":           func(touch func()) { inspectBeforeClose = touch },
+		} {
+			t.Run(name, func(t *testing.T) {
+				f := newInspectFixture(t)
+				body := f.serverConfig()
+				same := body[:len(body)-2] + "X\n"
+				arm(func() {
+					writeFile(t, f.configPath, same, 0o644)
+					later := time.Now().Add(2 * time.Hour)
+					if err := os.Chtimes(f.configPath, later, later); err != nil {
+						t.Fatal(err)
+					}
+				})
+				r := f.report(t)
+				mustUnknown(t, "config_binding", r.ConfigBinding, "changed while the report")
+				mustUnknown(t, "installed_config.sha256", r.Installed.SHA256, "changed while the report")
+				mustUnknown(t, "config_sha256", r.Services["server"].ConfigSHA256, "changed while the report")
+			})
+		}
+	})
 	t.Run("rewritten in place and then replaced after the sample", func(t *testing.T) {
 		// The name check sees another file and says false; only the
 		// descriptor's own stat can see that the file the service was bound
@@ -1075,6 +1128,30 @@ func TestReleaseInspectReportsThePendingReloadAsAFact(t *testing.T) {
 	mustUnknown(t, "need_daemon_reload", f.report(t).Services["server"].NeedDaemonReload, "NeedDaemonReload=")
 }
 
+// ENABLEMENT IS READ LITERALLY: a runtime enablement is one, an answer outside
+// systemd's set is could-not-tell, never false, because a consumer that reads
+// false as "positively disabled" must not be handed an empty answer.
+func TestReleaseInspectReadsEnablementLiterally(t *testing.T) {
+	for state, want := range map[string]any{"enabled": true, "enabled-runtime": true, "static": false, "disabled": false, "masked": false} {
+		t.Run(state, func(t *testing.T) {
+			f := newInspectFixture(t)
+			f.unitProperty(t, "UnitFileState", state)
+			svc := f.report(t).Services["server"]
+			if got := mustKnown(t, "enabled", svc.Enabled); got != want {
+				t.Errorf("enabled = %v for %q, want %v", got, state, want)
+			}
+			if got := mustKnown(t, "unit_file_state", svc.UnitFileState); got != state {
+				t.Errorf("unit_file_state = %v, want %q", got, state)
+			}
+		})
+	}
+	f := newInspectFixture(t)
+	f.unitProperty(t, "UnitFileState", "")
+	svc := f.report(t).Services["server"]
+	mustUnknown(t, "enabled", svc.Enabled, "UnitFileState=")
+	mustUnknown(t, "unit_file_state", svc.UnitFileState, "UnitFileState=")
+}
+
 // PRESENCE IS TYPED: a consumer that must tell an absent configuration (a
 // retired host) from one it could not read or parse gets the word, not a
 // boolean that folds the three together.
@@ -1091,6 +1168,17 @@ func TestReleaseInspectTypesTheConfigurationsPresence(t *testing.T) {
 		t.Errorf("config = %+v, want absent", r.Config)
 	}
 	mustUnknown(t, "installed_config.sha256", r.Installed.SHA256, "no such file")
+	// A directory at the path is a failed read, and a failed read is never
+	// absence; a permission error would be the same case, but root reads
+	// through one, so the directory is the deterministic form.
+	if err := os.Mkdir(f.configPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r = f.report(t)
+	if r.Config.Presence != "unreadable" || r.Config.Readable {
+		t.Errorf("config = %+v, want unreadable for a directory at the path", r.Config)
+	}
+	mustUnknown(t, "installed_config.sha256", r.Installed.SHA256, "is a directory")
 }
 
 // A PROCESS WHOSE --config IS RELATIVE CANNOT BE COMPARED: it is relative to a
@@ -1249,7 +1337,7 @@ func TestReleaseInspectRefusesAFileModifiedDuringTheHash(t *testing.T) {
 		}
 	}
 	r := f.report(t)
-	if r.Config.Readable || !strings.Contains(r.Config.Error, "changed while it was being read") {
+	if r.Config.Readable || r.Config.Presence != "unreadable" || !strings.Contains(r.Config.Error, "changed while it was being read") {
 		t.Errorf("config = %+v, want unreadable for a file written while it was read", r.Config)
 	}
 	mustUnknown(t, "installed_config.sha256", r.Installed.SHA256, "changed while it was being read")
@@ -1715,6 +1803,7 @@ services.node.same_as_executable
 services.node.shape
 services.node.started_at
 services.node.sub_state
+services.node.unit_file_state
 services.node.unit_present
 services.server.active_state
 services.server.cmdline_config_path
@@ -1735,6 +1824,7 @@ services.server.same_as_executable
 services.server.shape
 services.server.started_at
 services.server.sub_state
+services.server.unit_file_state
 services.server.unit_present
 transaction.active
 transaction.converge_guard
@@ -1935,6 +2025,7 @@ services.node.same_as_executable
 services.node.shape
 services.node.started_at
 services.node.sub_state
+services.node.unit_file_state
 services.node.unit_present
 services.server.active_state
 services.server.cmdline_config_path
@@ -1957,6 +2048,7 @@ services.server.same_as_executable
 services.server.shape
 services.server.started_at
 services.server.sub_state
+services.server.unit_file_state
 services.server.unit_present
 transaction.active
 transaction.converge_guard.claimed_at
@@ -2025,6 +2117,7 @@ services.node.same_as_executable
 services.node.shape
 services.node.started_at
 services.node.sub_state
+services.node.unit_file_state
 services.node.unit_present
 services.server.active_state
 services.server.cmdline_config_path
@@ -2045,6 +2138,7 @@ services.server.same_as_executable
 services.server.shape
 services.server.started_at
 services.server.sub_state
+services.server.unit_file_state
 services.server.unit_present
 transaction.active
 transaction.converge_guard
