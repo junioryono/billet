@@ -989,7 +989,9 @@ func TestReleaseInspectBindsOneConfigurationObservation(t *testing.T) {
 		if got := mustKnown(t, "config_sha256", r.Services["server"].ConfigSHA256); got != shaOf(f.serverConfig()+"# other\n") {
 			t.Errorf("a service that hashed another configuration lost its own digest: %v", got)
 		}
-		mustKnown(t, "config_changed_since_start", r.Services["server"].ConfigChangedSinceStart)
+		if got := mustKnown(t, "config_changed_since_start", r.Services["server"].ConfigChangedSinceStart); got != true {
+			t.Errorf("config_changed_since_start = %v, want true for the other configuration written after the start", got)
+		}
 		mustUnknown(t, "installed_config.sha256", r.Installed.SHA256, "changed while the report")
 	})
 	t.Run("rewritten to the same length with a later mtime", func(t *testing.T) {
@@ -1153,9 +1155,12 @@ func TestReleaseInspectReportsThePendingReloadAsAFact(t *testing.T) {
 	mustUnknown(t, "need_daemon_reload", f.report(t).Services["server"].NeedDaemonReload, "NeedDaemonReload=")
 }
 
-// ENABLEMENT IS READ LITERALLY: a runtime enablement is one, an answer outside
-// systemd's set is could-not-tell, never false, because a consumer that reads
-// false as "positively disabled" must not be handed an empty answer.
+// ENABLEMENT IS READ LITERALLY: a runtime enablement is one, false means a
+// recognised state other than the two enabled ones (not "positively disabled":
+// a static or generated unit can still be started by something else), and an
+// answer outside systemd's set is could-not-tell, never false, so a consumer
+// that reads the literal against its own accepted set is never handed an empty
+// answer as either.
 func TestReleaseInspectReadsEnablementLiterally(t *testing.T) {
 	for state, want := range map[string]any{
 		"enabled": true, "enabled-runtime": true,
@@ -1181,11 +1186,18 @@ func TestReleaseInspectReadsEnablementLiterally(t *testing.T) {
 		mustUnknown(t, "enabled", svc.Enabled, "UnitFileState=")
 		mustUnknown(t, "unit_file_state", svc.UnitFileState, "UnitFileState=")
 	}
+	// A service that cannot be read at all says why, for the enablement as for
+	// everything else.
+	f := newInspectFixture(t)
+	writeFile(t, systemctlBinary, "#!/bin/sh\nexit 1\n", 0o755)
+	svc := f.report(t).Services["server"]
+	mustUnknown(t, "enabled", svc.Enabled, "systemctl show")
+	mustUnknown(t, "unit_file_state", svc.UnitFileState, "systemctl show")
 	// A unit whose fragment is gone has no file state and no process: null,
 	// not false and not 0.
-	f := newInspectFixture(t)
+	f = newInspectFixture(t)
 	f.unitAbsent(t, "billet-server.service")
-	svc := f.report(t).Services["server"]
+	svc = f.report(t).Services["server"]
 	for name, m := range map[string]maybe{"enabled": svc.Enabled, "unit_file_state": svc.UnitFileState, "main_pid": svc.MainPID} {
 		if got := mustKnown(t, name, m); got != nil {
 			t.Errorf("%s = %v for a not-found unit, want null", name, got)
@@ -1310,6 +1322,28 @@ func TestReleaseInspectResolvesTheProcessViewUnderItsRoot(t *testing.T) {
 	})
 }
 
+// AN UNSUPPORTED COMMAND LINE'S OPERAND IS NEVER OPENED: a fourth argument
+// that is absolute is not a configuration until the whole shape says so, and
+// following it into the filesystem would read whatever it names, a key
+// included.
+func TestReleaseInspectNeverOpensAnUnsupportedCommandsOperand(t *testing.T) {
+	f := newInspectFixture(t)
+	key := filepath.Join(f.dir, "node.key")
+	writeFile(t, key, "-----BEGIN PRIVATE KEY-----\nnot really\n-----END PRIVATE KEY-----\n", 0o600)
+	f.process(t, []string{"/usr/local/bin/helper", "serve", "--key", key}, nil)
+	reads := 0
+	inspectAfterOpen = func(path string) {
+		if path == key {
+			reads++
+		}
+	}
+	r := f.report(t)
+	if reads != 0 {
+		t.Errorf("the unsupported command's operand was read %d times, want never", reads)
+	}
+	mustUnknown(t, "cmdline_config_path", r.Services["server"].CmdlineConfigPath, "not `")
+}
+
 // ANOTHER CONFIGURATION IS READ IN THE PROCESS'S NAMESPACE: the inspector's
 // file at that name may be a different file, so a service that names another
 // path publishes the digest of what its own root resolves that path to, or
@@ -1319,6 +1353,9 @@ func TestReleaseInspectHashesAnotherConfigurationThroughTheProcessView(t *testin
 		f := newInspectFixture(t)
 		other := filepath.Join(f.dir, "other.yaml")
 		writeFile(t, other, "inspector: copy\n", 0o644)
+		// The inspector's copy predates the process start and the process's
+		// copy does not, so the mtime verdict tells the two apart as well.
+		f.touchBeforeStart(t, other)
 		view := filepath.Join(f.dir, "view")
 		writeFile(t, filepath.Join(view, other), "process: copy\n", 0o644)
 		f.unitRunning(t, "billet-server.service", "server", other, nil)
@@ -1330,6 +1367,23 @@ func TestReleaseInspectHashesAnotherConfigurationThroughTheProcessView(t *testin
 		}
 		if got := mustKnown(t, "config_sha256", r.Services["server"].ConfigSHA256); got != shaOf("process: copy\n") {
 			t.Errorf("config_sha256 = %v, want the digest of the process's view, not the inspector's copy", got)
+		}
+		if got := mustKnown(t, "config_changed_since_start", r.Services["server"].ConfigChangedSinceStart); got != true {
+			t.Errorf("config_changed_since_start = %v, want true from the process's copy, written after the start", got)
+		}
+	})
+	t.Run("the view's mtime, not the inspector's", func(t *testing.T) {
+		f := newInspectFixture(t)
+		other := filepath.Join(f.dir, "other.yaml")
+		writeFile(t, other, "inspector: copy\n", 0o644)
+		view := filepath.Join(f.dir, "view")
+		writeFile(t, filepath.Join(view, other), "process: copy\n", 0o644)
+		f.touchBeforeStart(t, filepath.Join(view, other))
+		f.unitRunning(t, "billet-server.service", "server", other, nil)
+		f.process(t, []string{f.binPath, "server", "--config", other}, nil)
+		f.processRoot(t, view)
+		if got := mustKnown(t, "config_changed_since_start", f.report(t).Services["server"].ConfigChangedSinceStart); got != false {
+			t.Errorf("config_changed_since_start = %v, want false from the process's copy, dated before the start", got)
 		}
 	})
 	t.Run("an unreadable view is could-not-tell", func(t *testing.T) {
@@ -1373,13 +1427,13 @@ func TestReleaseInspectRefusesAnImageModifiedDuringTheHash(t *testing.T) {
 	mustUnknown(t, "executable.sha256", r.Executable.SHA256, "changed while it was being read")
 }
 
-// THE CONFIGURATION'S CONTENT IS READ TWICE AND NO MORE: once as the
-// observation, whose digest a bound service publishes, and once through the
-// process's own root inside the sample, which is the process's namespace and
-// not the inspector's. A third content read, of the pathname in the
-// inspector's namespace, would be a window in which a replacement's bytes are
-// paired with the parsed configuration and a true binding. The seam counts the
-// seam-covered content reads (observeConfig, hashImage and the view's hash).
+// THE CONFIGURATION'S CONTENT IS READ ONCE, as the observation whose digest a
+// bound service publishes; the process's view of the same path is opened for
+// identity alone and reads no bytes, and only a view of ANOTHER path is hashed,
+// in the process's namespace. A second content read of this path would be a
+// window in which a replacement's bytes are paired with the parsed
+// configuration and a true binding. The seam counts the seam-covered content
+// reads (observeConfig, hashImage and a view's hash).
 func TestReleaseInspectOpensTheConfigurationOnce(t *testing.T) {
 	f := newInspectFixture(t)
 	opens := 0
@@ -1389,8 +1443,8 @@ func TestReleaseInspectOpensTheConfigurationOnce(t *testing.T) {
 		}
 	}
 	r := f.report(t)
-	if opens != 2 {
-		t.Errorf("the configuration's content was read %d times, want two: the observation and the process's own view", opens)
+	if opens != 1 {
+		t.Errorf("the configuration's content was read %d times, want once, as the observation", opens)
 	}
 	if got := mustKnown(t, "config_sha256", r.Services["server"].ConfigSHA256); got != shaOf(f.serverConfig()) {
 		t.Errorf("services.server.config_sha256 = %v, want the observation's digest", got)

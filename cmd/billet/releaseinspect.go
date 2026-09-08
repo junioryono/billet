@@ -1026,7 +1026,7 @@ func recordsKey(records []execRecord) string {
 // time at the end, and a unit that changed under the sample has a different
 // identity, so evidence about the image is never attributed to a process the
 // other reads saw. Three samples at most, then could-not-tell.
-func sampleProcess(ctx context.Context, unit string, pid int, first map[string][]string, records []execRecord) (processSample, error) {
+func sampleProcess(ctx context.Context, unit, role string, pid int, first map[string][]string, records []execRecord, inspectorConfig string) (processSample, error) {
 	dir := filepath.Join(procRoot, strconv.Itoa(pid))
 	identity := unitIdentity(first, records)
 	for range inspectSamples {
@@ -1055,9 +1055,20 @@ func sampleProcess(ctx context.Context, unit string, pid int, first map[string][
 		// unit while the running process keeps the namespace it started in. So
 		// the file is opened through /proc/<pid>/root, inside the sample, and
 		// compared by identity rather than by the root's name.
+		// ONLY THE SUPPORTED COMMAND LINE IS FOLLOWED INTO THE FILESYSTEM: an
+		// unsupported process's fourth argument is not a configuration and is
+		// never opened, let alone read (it could name a key). The inspector's
+		// own path is opened for identity alone, since the observation's bytes
+		// are the ones a bound service publishes; another path is hashed
+		// through the process's root, because the inspector's file at that
+		// name may be another file.
 		var view os.FileInfo
 		viewSHA, viewErr := "", ""
-		if len(args) == 4 && filepath.IsAbs(args[3]) {
+		switch {
+		case !supportedCmdline(args, role):
+		case args[3] == inspectorConfig:
+			view, viewErr = statThroughRoot(dir, args[3])
+		default:
 			view, viewSHA, viewErr = hashThroughRoot(dir, args[3])
 		}
 		again, err := unitProperties(ctx, unit)
@@ -1093,6 +1104,34 @@ func sampleProcess(ctx context.Context, unit string, pid int, first map[string][
 // inspector's root, so a config that is a symlink into a directory the service
 // has mounted differently would be opened in the inspector's namespace and
 // compare equal to a file the service never reads.
+// supportedCmdlineWords is the four-word shape billet ships, `<managed path>
+// <role> --config <path>`, without regard to the path's form.
+func supportedCmdlineWords(args []string, role string) bool {
+	return len(args) == 4 && args[0] == installedBinary && args[1] == role && args[2] == "--config"
+}
+
+// supportedCmdline is the shape with an absolute path, the one predicate the
+// sample and the report share, so nothing is opened for a command line the
+// report would not read.
+func supportedCmdline(args []string, role string) bool {
+	return supportedCmdlineWords(args, role) && filepath.IsAbs(args[3])
+}
+
+// statThroughRoot opens an absolute path as the process sees it and returns the
+// opened file's identity, reading no bytes.
+func statThroughRoot(procDir, path string) (os.FileInfo, string) {
+	f, err := openInRoot(filepath.Join(procDir, "root"), path)
+	if err != nil {
+		return nil, fmt.Sprintf("the process's view of %s (through %s) could not be opened: %v", path, filepath.Join(procDir, "root"), err)
+	}
+	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Sprintf("the process's view of %s could not be read: %v", path, err)
+	}
+	return info, ""
+}
+
 func hashThroughRoot(procDir, path string) (os.FileInfo, string, string) {
 	f, err := openInRoot(filepath.Join(procDir, "root"), path)
 	if err != nil {
@@ -1127,7 +1166,7 @@ func inspectRunningProcess(ctx context.Context, svc *inspectService, role, unit 
 	props map[string][]string, records []execRecord, cfg *config.Config, inspectorConfig string,
 	inspectorInfo os.FileInfo, inspectorSHA string, exeSHA string, exeInfo os.FileInfo, unitConfigPath string, envFiles []string,
 ) maybe {
-	sample, err := sampleProcess(ctx, unit, pid, props, records)
+	sample, err := sampleProcess(ctx, unit, role, pid, props, records, inspectorConfig)
 	if err != nil {
 		fillRunningUnknown(svc, err.Error())
 		svc.DSNEnv = unknown(err.Error())
@@ -1152,7 +1191,7 @@ func inspectRunningProcess(ctx context.Context, svc *inspectService, role, unit 
 	why := "the process command line is not `" + installedBinary + " " + role + " --config <absolute path>`"
 	binding := unknown(why)
 	switch {
-	case len(sample.cmdline) != 4 || sample.cmdline[0] != installedBinary || sample.cmdline[1] != role || sample.cmdline[2] != "--config":
+	case !supportedCmdlineWords(sample.cmdline, role):
 		svc.CmdlineConfigPath, svc.CmdlineMatchesUnit = unknown(why), unknown(why)
 		svc.ConfigSHA256, svc.ConfigChangedSinceStart = unknown(why), unknown(why)
 	case !filepath.IsAbs(sample.cmdline[3]):
