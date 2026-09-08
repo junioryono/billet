@@ -18,7 +18,9 @@
 // rollout already knows how to read.
 //
 // A LEAF, ON PURPOSE. The updater in cmd/billet writes this and the node client
-// in internal/nodeclient reads it, so it can depend on neither; stdlib only.
+// in internal/nodeclient reads it, so it can depend on neither; the standard
+// library and internal/regularfile, the one open of a file by pathname that
+// waits on no FIFO, and nothing above them.
 package provenance
 
 import (

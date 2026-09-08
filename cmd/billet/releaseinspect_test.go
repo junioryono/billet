@@ -89,7 +89,7 @@ func newInspectFixture(t *testing.T) *inspectFixture {
 	// applies (a FIFO is could-not-tell, not a wait) is what the fixtures run.
 	readPublicFile = func(path string) ([]byte, error) {
 		f.read = append(f.read, path)
-		return readRegularFile(path)
+		return readRegularFile(path, maxPublicBytes)
 	}
 
 	writeFile(t, f.binPath, "IMAGE-A\n", 0o755)
@@ -1672,6 +1672,39 @@ func TestReleaseInspectRefusesASpecialFileAtItsOwnInputs(t *testing.T) {
 			t.Fatal("the inspector blocked opening the bundle's CA file until the test wrote to it")
 		}
 		mustUnknown(t, "node_trust", r.Host.NodeTrust, "not a regular file")
+	})
+}
+
+// THE INSPECTOR'S WHOLE-FILE READS ARE BOUNDED: a configuration or an
+// environment file longer than what billet writes is refused with the reason,
+// never parsed from a prefix, because a prefix describes a file that never was.
+func TestReleaseInspectRefusesAnInputLargerThanItsBound(t *testing.T) {
+	t.Run("the configuration", func(t *testing.T) {
+		f := newInspectFixture(t)
+		body, err := os.ReadFile(f.configPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, f.configPath, string(body)+"# "+strings.Repeat("x", maxConfigBytes)+"\n", 0o644)
+		r := f.report(t)
+		if r.Config.Presence != "unreadable" || !strings.Contains(r.Config.Error, "larger than the limit") {
+			t.Errorf("config = %+v, want unreadable naming the bound", r.Config)
+		}
+	})
+	t.Run("an environment file", func(t *testing.T) {
+		f := newInspectFixture(t)
+		f.writeConfig(t, f.postgresConfig())
+		envFile := filepath.Join(f.dir, "server.env")
+		writeFile(t, envFile, "BILLET_PG_DSN=postgres://x\n# "+strings.Repeat("x", maxEnvironmentBytes)+"\n", 0o640)
+		f.touchBeforeStart(t, envFile)
+		f.touchBeforeStart(t, f.configPath)
+		f.unitRunning(t, "billet-server.service", "server", f.configPath, []string{envFile})
+		f.process(t, []string{f.binPath, "server", "--config", f.configPath}, []string{"BILLET_PG_DSN=postgres://x"})
+		d, ok := mustKnown(t, "dsn_env", f.report(t).Services["server"].DSNEnv).(inspectDSNEnv)
+		if !ok {
+			t.Fatal("dsn_env is not a DSN report")
+		}
+		mustUnknown(t, "matches_file", d.MatchesFile, "larger than the limit")
 	})
 }
 

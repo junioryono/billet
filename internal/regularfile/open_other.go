@@ -12,6 +12,8 @@ import (
 // writer, and nothing is read through the descriptor until reopen has applied
 // the regular-file rule. A device is opened by this call and then refused; that
 // is the limit of what this platform offers, and the package comment says so.
+// There is no pseudo-filesystem rule here either: the platform has no procfs
+// and its inspector observes no services.
 func openForIdentity(path string, opts Options) (*os.File, error) {
 	flags := os.O_RDONLY | syscall.O_NONBLOCK | syscall.O_CLOEXEC
 	if opts.NoFollow {
@@ -28,9 +30,14 @@ func reopen(id *os.File) (*os.File, os.FileInfo, error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	if reopenFailure != nil {
+		if err := reopenFailure(); err != nil {
+			return nil, nil, reopenError(id, err)
+		}
+	}
 	fd, err := syscall.Dup(int(id.Fd()))
 	if err != nil {
-		return nil, nil, &os.PathError{Op: "dup", Path: id.Name(), Err: err}
+		return nil, nil, reopenError(id, err)
 	}
 	syscall.CloseOnExec(fd)
 	return os.NewFile(uintptr(fd), id.Name()), info, nil

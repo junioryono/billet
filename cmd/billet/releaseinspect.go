@@ -70,7 +70,7 @@ var (
 	busctlBinary = "busctl"
 	// readPublicFile reads a certificate, a bundle's CA file or the retirement
 	// journal; a test records the paths to prove the key file is never asked for.
-	readPublicFile     = readRegularFile
+	readPublicFile     = func(path string) ([]byte, error) { return readRegularFile(path, maxPublicBytes) }
 	retiredJournalPath = "/var/lib/billet/retired/journal.json"
 	// inspectSamples bounds how often a running process's image is re-read when
 	// the process changes under the observation.
@@ -449,10 +449,10 @@ func observeConfig(path string) (*configObservation, error) {
 	if inspectAfterOpen != nil {
 		inspectAfterOpen(path)
 	}
-	body, err := io.ReadAll(f)
+	body, err := regularfile.ReadAllLimited(f, path, maxConfigBytes)
 	if err != nil {
 		_ = f.Close()
-		return nil, fmt.Errorf("read %s: %w", path, err)
+		return nil, err
 	}
 	after, err := f.Stat()
 	if err != nil {
@@ -571,22 +571,31 @@ func hashOpenFile(f *os.File, path string) (string, os.FileInfo, error) {
 	return hex.EncodeToString(h.Sum(nil)), after, nil
 }
 
-// readRegularFile reads a whole file through openRegular (regularfile.Open):
-// EVERY FILE THIS PACKAGE READS BY PATHNAME goes through that one open, for
-// identity first and then only a regular file, because the inspector's inputs
-// are named by its configuration or by systemd's answer, and a plain open of a
-// FIFO at any of them blocks before any stat, which neither the sample count
-// nor systemctl's timeout bounds. A special file is could-not-tell with the
-// reason instead. The readers this package delegates to (provenance.Read,
-// state.PeekDeploymentID, hostupgrade.ReadJournal, wirecert.SnapshotAuthority)
-// read through the same package, each behind its own boundary.
-func readRegularFile(path string) ([]byte, error) {
-	f, _, err := openRegular(path, false)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = f.Close() }()
-	return io.ReadAll(f)
+// The bounds on what the inspector reads whole: a configuration, an environment
+// file, a guard record, a certificate or bundle. Each is a statement about what
+// billet or systemd writes there; a longer file is refused, never cut.
+const (
+	maxConfigBytes      = 8 << 20
+	maxEnvironmentBytes = 1 << 20
+	maxGuardBytes       = 64 << 10
+	maxPublicBytes      = 1 << 20
+)
+
+// readRegularFile reads a whole file of at most limit bytes through openRegular
+// (regularfile.Open). EVERY CONTENT INPUT THE INSPECTOR NAMES BY PATHNAME, its
+// configuration, the transaction lock, an environment file systemd names,
+// guard.json, the recorded release executable, darwin's managed binary and
+// every readPublicFile read, goes through that one open, for identity first and
+// then only a regular file on a filesystem that stores bytes, because a plain
+// open of a FIFO at any of them blocks before any stat, which neither the
+// sample count nor systemctl's timeout bounds. A special file is could-not-tell
+// with the reason instead. The readers the inspector delegates to
+// (provenance.Read, state.PeekDeploymentID, hostupgrade.ReadJournal,
+// wirecert.SnapshotAuthority) read through the same package, each behind its
+// own boundary with its own limit; the /proc reads are the kernel's own files
+// and stay plain.
+func readRegularFile(path string, limit int64) ([]byte, error) {
+	return regularfile.ReadFile(path, limit, regularfile.Options{})
 }
 
 // hashRegular is the bracketed hash of a file the inspector names by path and
@@ -1460,7 +1469,7 @@ func inspectDSN(env []byte, role string, cfg *config.Config, envFiles []string) 
 // than read the way systemd might read it, and a name assigned twice is refused
 // because systemd's last assignment wins.
 func environmentFileValue(path, name string) (string, bool, error) {
-	body, err := readRegularFile(path)
+	body, err := readRegularFile(path, maxEnvironmentBytes)
 	if err != nil {
 		return "", false, err
 	}
@@ -1784,7 +1793,7 @@ func inspectJournalOf(active string) maybe {
 // inspectGuardOf classifies a directory claim: guard.json makes it a converge
 // guard, its absence an unpublished one that a hold never returned from.
 func inspectGuardOf(active string) (maybe, maybe) {
-	body, err := readRegularFile(filepath.Join(active, "guard.json"))
+	body, err := readRegularFile(filepath.Join(active, "guard.json"), maxGuardBytes)
 	switch {
 	case err != nil && errors.Is(err, fs.ErrNotExist):
 		return known("unpublished-guard"), known(nil)

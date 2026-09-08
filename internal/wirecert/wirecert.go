@@ -880,6 +880,11 @@ const maxPEM = 1 << 20
 // to be signed and has to meet the same bar as one that already is.
 func ReadSecret(path string) ([]byte, error) { return readSecret(path) }
 
+// beforeContentRead runs after a reader's checks of the name and before the
+// file's content is acquired, so a test can replace the file in that window and
+// prove the descriptor that is read is the one that is judged.
+var beforeContentRead func(path string)
+
 func readSecret(path string) ([]byte, error) {
 	info, err := os.Lstat(path)
 	if err != nil {
@@ -896,13 +901,33 @@ func readSecret(path string) ([]byte, error) {
 		return nil, fmt.Errorf("wirecert: %s is not a regular file", path)
 	}
 
+	if err := secretMode(path, info); err != nil {
+		return nil, err
+	}
+
+	// THE MODE IS JUDGED ON THE FILE THAT IS READ, not on the name's earlier
+	// answer: a regular 0644 key renamed over a regular 0600 one between the
+	// Lstat above and the open passes every check of the name and is refused
+	// here, on the descriptor's own fstat, before a byte of it is read.
+	body, read, err := readCappedInfo(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := secretMode(path, read); err != nil {
+		return nil, err
+	}
+
+	return body, nil
+}
+
+// secretMode is the refusal of a private key readable by anyone else.
+func secretMode(path string, info os.FileInfo) error {
 	if perm := info.Mode().Perm(); perm&0o077 != 0 {
-		return nil, fmt.Errorf(
+		return fmt.Errorf(
 			"wirecert: %s is mode %04o and must not be readable by anyone else; it signs every "+
 				"node identity in this deployment. Run: chmod 600 %s", path, perm, path)
 	}
-
-	return readCapped(path)
+	return nil
 }
 
 // readPublic reads a certificate, which is not a secret but is still a file
@@ -924,26 +949,45 @@ func readPublic(path string) ([]byte, error) {
 	return readCapped(path)
 }
 
-// readCapped reads THE FILE THE CHECKS ABOVE LOOKED AT, or refuses: the open is
-// for identity first, with a symlink refused again at the last component and
-// the regular-file rule applied to the descriptor that is read, so a FIFO or a
-// device renamed over the name between the Lstat and this read is refused
-// rather than waited on or opened.
+// readCapped reads the file at path with the checks the Lstat above cannot make
+// stick: the open is for identity first, a symlink is refused again at the last
+// component, and the regular-file rule is applied to the descriptor that is
+// read, so a FIFO or a device renamed over the name between the Lstat and this
+// read is refused rather than waited on or opened. What it does NOT promise is
+// that the file is the one the Lstat saw: a regular file renamed over another
+// regular file passes, and a check that must hold for the bytes read (a key's
+// mode) is made on the descriptor's own fstat by the caller.
 func readCapped(path string) ([]byte, error) {
-	body, err := regularfile.ReadFile(path, maxPEM, regularfile.Options{NoFollow: true})
+	body, _, err := readCappedInfo(path)
+	return body, err
+}
+
+// readCappedInfo is readCapped returning the fstat of the descriptor it read.
+func readCappedInfo(path string) ([]byte, os.FileInfo, error) {
+	if beforeContentRead != nil {
+		beforeContentRead(path)
+	}
+	f, info, err := regularfile.Open(path, regularfile.Options{NoFollow: true})
+	if err != nil {
+		if errors.Is(err, regularfile.ErrNotRegular) {
+			return nil, nil, fmt.Errorf("wirecert: %s is not a regular file: %w", path, err)
+		}
+
+		return nil, nil, err
+	}
+	defer func() { _ = f.Close() }()
+
+	body, err := regularfile.ReadAllLimited(f, path, maxPEM)
 	if err != nil {
 		if errors.Is(err, regularfile.ErrTooLarge) {
-			return nil, fmt.Errorf("wirecert: %s is larger than %d bytes, which no key or "+
+			return nil, nil, fmt.Errorf("wirecert: %s is larger than %d bytes, which no key or "+
 				"certificate is", path, maxPEM)
 		}
-		if errors.Is(err, regularfile.ErrNotRegular) {
-			return nil, fmt.Errorf("wirecert: %s is not a regular file: %w", path, err)
-		}
 
-		return nil, err
+		return nil, nil, err
 	}
 
-	return body, nil
+	return body, info, nil
 }
 
 func writeSecret(path string, body []byte) error {
