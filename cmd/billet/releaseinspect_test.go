@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/junioryono/billet/internal/hostupgrade"
 	"github.com/junioryono/billet/internal/provenance"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/wirecert"
@@ -25,8 +27,9 @@ import (
 // managed path, and every other seam pointed under one temp directory.
 type inspectFixture struct {
 	dir, procDir, unitsDir, configPath, stateDir, binPath string
-	// opened records every path the report opened as an image.
-	opened []string
+	// opened records every path the report opened as an image; read records
+	// every path it read as a public file.
+	opened, read []string
 }
 
 const (
@@ -50,21 +53,24 @@ func newInspectFixture(t *testing.T) *inspectFixture {
 		}
 	}
 	prev := struct {
-		hostOS, procRoot, selfExe, installed, systemctl, receipt, root, provenance string
-		open                                                                       func(string) (*os.File, error)
-		after                                                                      func(string)
-		samples                                                                    int
-	}{hostOS, procRoot, selfExePath, installedBinary, systemctlBinary, retiredJournalPath, upgradeRoot,
-		provenance.Path, openImage, inspectAfterOpen, inspectSamples}
+		hostOS, procRoot, selfExe, installed, systemctl, busctl, receipt, root, provenance string
+		open                                                                               func(string) (*os.File, error)
+		read                                                                               func(string) ([]byte, error)
+		after                                                                              func(string)
+		samples                                                                            int
+	}{hostOS, procRoot, selfExePath, installedBinary, systemctlBinary, busctlBinary, retiredJournalPath, upgradeRoot,
+		provenance.Path, openImage, readPublicFile, inspectAfterOpen, inspectSamples}
 	t.Cleanup(func() {
 		hostOS, procRoot, selfExePath, installedBinary = prev.hostOS, prev.procRoot, prev.selfExe, prev.installed
-		systemctlBinary, retiredJournalPath, upgradeRoot = prev.systemctl, prev.receipt, prev.root
-		provenance.Path, openImage, inspectAfterOpen, inspectSamples = prev.provenance, prev.open, prev.after, prev.samples
+		systemctlBinary, busctlBinary, retiredJournalPath, upgradeRoot = prev.systemctl, prev.busctl, prev.receipt, prev.root
+		provenance.Path, openImage, readPublicFile = prev.provenance, prev.open, prev.read
+		inspectAfterOpen, inspectSamples = prev.after, prev.samples
 	})
 	hostOS = "linux"
 	procRoot = f.procDir
 	selfExePath, installedBinary = f.binPath, f.binPath
 	systemctlBinary = filepath.Join(dir, "bin", "systemctl")
+	busctlBinary = filepath.Join(dir, "bin", "busctl")
 	retiredJournalPath = filepath.Join(dir, "retired", "journal.json")
 	upgradeRoot = filepath.Join(dir, "upgrades")
 	provenance.Path = filepath.Join(dir, "installed.json")
@@ -73,10 +79,20 @@ func newInspectFixture(t *testing.T) *inspectFixture {
 		f.opened = append(f.opened, path)
 		return os.Open(path)
 	}
+	readPublicFile = func(path string) ([]byte, error) {
+		f.read = append(f.read, path)
+		return os.ReadFile(path)
+	}
 
 	writeFile(t, f.binPath, "IMAGE-A\n", 0o755)
 	writeFile(t, filepath.Join(f.procDir, "stat"), "cpu  1 2 3 4\nbtime "+strconv.FormatInt(inspectBootTime, 10)+"\nprocesses 9\n", 0o644)
-	writeFile(t, systemctlBinary, "#!/bin/sh\nverb=$1\nunit=\"\"\nfor a in \"$@\"; do unit=$a; done\nif [ \"$verb\" = cat ]; then cat \"$BILLET_FAKE_UNITS/$unit.cat\"; else cat \"$BILLET_FAKE_UNITS/$unit\"; fi\n", 0o755)
+	// Like the real `systemctl show --property=A --property=B -- unit`, the fake
+	// prints only the properties requested: a property the inspector stops
+	// asking for stops arriving, so a refusal that depends on it fails its test.
+	writeFile(t, systemctlBinary, "#!/bin/sh\nunit=\"\"\nnames=\"\"\nfor a in \"$@\"; do case \"$a\" in --property=*) names=\"$names ${a#--property=}\";; --|show) ;; *) unit=$a;; esac; done\n"+
+		"for n in $names; do grep \"^$n=\" \"$BILLET_FAKE_UNITS/$unit\"; done\nexit 0\n", 0o755)
+	// busctl --json=short get-property org.freedesktop.systemd1 <object> <iface> ExecStart
+	writeFile(t, busctlBinary, "#!/bin/sh\ncat \"$BILLET_FAKE_UNITS/$(basename \"$4\").exec\"\n", 0o755)
 	t.Setenv("BILLET_FAKE_UNITS", f.unitsDir)
 
 	f.writeConfig(t, f.serverConfig())
@@ -203,7 +219,7 @@ func (f *inspectFixture) unitAbsent(t *testing.T, unit string) {
 // runtime facts it still reports.
 func (f *inspectFixture) unitAbsentWith(t *testing.T, unit, active, sub string, pid int) {
 	t.Helper()
-	writeFile(t, filepath.Join(f.unitsDir, unit), "LoadState=not-found\nUnitFileState=\nActiveState="+active+"\nSubState="+sub+"\nMainPID="+strconv.Itoa(pid)+"\nInvocationID=\nExecMainStartTimestamp=\nEnvironmentFiles=\nEnvironment=\n", 0o644)
+	writeFile(t, filepath.Join(f.unitsDir, unit), "LoadState=not-found\nUnitFileState=\nActiveState="+active+"\nSubState="+sub+"\nMainPID="+strconv.Itoa(pid)+"\nInvocationID=\nNeedDaemonReload=no\nExecMainStartTimestamp=\nEnvironmentFiles=\nEnvironment=\n", 0o644)
 }
 
 // unitRunning renders the properties systemd reports for a unit with the
@@ -215,13 +231,16 @@ func (f *inspectFixture) unitRunning(t *testing.T, unit, role, configPath string
 
 // unitWith renders a unit both ways systemd shows it: the properties of
 // `systemctl show` (argv joined by spaces, one EnvironmentFiles line per file,
-// as systemd 255 prints) and the text of `systemctl cat`.
+// as systemd 255 prints) and the loaded ExecStart records the bus property
+// holds (here derived by splitting argv on spaces; a test that needs other
+// boundaries overrides them with unitExec).
 func (f *inspectFixture) unitWith(t *testing.T, unit, argv string, envFiles []string, environment string, pid int, active, sub string) {
 	t.Helper()
-	path := strings.Fields(argv)[0]
+	words := strings.Fields(argv)
 	body := "LoadState=loaded\nUnitFileState=enabled\nActiveState=" + active + "\nSubState=" + sub + "\nMainPID=" + strconv.Itoa(pid) + "\n" +
-		"InvocationID=0123456789abcdef0123456789abcdef\nExecMainStartTimestamp=Tue 2023-11-14 22:14:00 UTC\n" +
-		"ExecStart={ path=" + path + " ; argv[]=" + argv + " ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }\n"
+		"InvocationID=0123456789abcdef0123456789abcdef\nNeedDaemonReload=no\nExecMainStartTimestamp=Tue 2023-11-14 22:14:00 UTC\n" +
+		"RootDirectory=\nRootImage=\nBindPaths=\nBindReadOnlyPaths=\nMountImages=\nExtensionImages=\nExtensionDirectories=\nTemporaryFileSystem=\n" +
+		"ExecStart={ path=" + words[0] + " ; argv[]=" + argv + " ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }\n"
 	if len(envFiles) == 0 {
 		body += "EnvironmentFiles=\n"
 	}
@@ -230,20 +249,40 @@ func (f *inspectFixture) unitWith(t *testing.T, unit, argv string, envFiles []st
 	}
 	body += "Environment=" + environment + "\n"
 	writeFile(t, filepath.Join(f.unitsDir, unit), body, 0o644)
-	text := "# /etc/systemd/system/" + unit + "\n[Service]\nExecStart=" + argv + "\n"
-	for _, e := range envFiles {
-		text += "EnvironmentFile=-" + e + "\n"
-	}
-	if environment != "" {
-		text += "Environment=" + environment + "\n"
-	}
-	f.unitText(t, unit, text)
+	f.unitExec(t, unit, [][]string{words})
 }
 
-// unitText overrides what `systemctl cat` returns for a unit.
-func (f *inspectFixture) unitText(t *testing.T, unit, text string) {
+// unitExec sets the loaded ExecStart records busctl answers for a unit: each
+// record's path is its argv[0].
+func (f *inspectFixture) unitExec(t *testing.T, unit string, records [][]string) {
 	t.Helper()
-	writeFile(t, filepath.Join(f.unitsDir, unit+".cat"), text, 0o644)
+	data := make([]any, 0, len(records))
+	for _, argv := range records {
+		data = append(data, []any{argv[0], argv, false, 0, 0, 0, 0, 0, 0, 0})
+	}
+	body, err := json.Marshal(map[string]any{"type": "a(sasbttttuii)", "data": data})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(f.unitsDir, busLabel(unit)+".exec"), string(body), 0o644)
+}
+
+// unitProperty rewrites one rendered property of the server unit.
+func (f *inspectFixture) unitProperty(t *testing.T, name, value string) {
+	t.Helper()
+	path := filepath.Join(f.unitsDir, "billet-server.service")
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, line := range strings.Split(strings.TrimRight(string(body), "\n"), "\n") {
+		if strings.HasPrefix(line, name+"=") {
+			line = name + "=" + value
+		}
+		out = append(out, line)
+	}
+	writeFile(t, path, strings.Join(out, "\n")+"\n", 0o644)
 }
 
 // process lays down a pid's exe, stat, cmdline and environ.
@@ -265,15 +304,37 @@ func (f *inspectFixture) process(t *testing.T, cmdline, environ []string) {
 	f.processStart(t, pid, startTicks)
 	writeFile(t, filepath.Join(dir, "cmdline"), strings.Join(cmdline, "\x00")+"\x00", 0o644)
 	writeFile(t, filepath.Join(dir, "environ"), strings.Join(environ, "\x00")+"\x00", 0o644)
+	f.processRoot(t, "/")
+}
+
+// processRoot sets what /proc/<pid>/root resolves to.
+func (f *inspectFixture) processRoot(t *testing.T, target string) {
+	t.Helper()
+	link := filepath.Join(f.procDir, strconv.Itoa(inspectPID), "root")
+	_ = os.Remove(link)
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func (f *inspectFixture) processStart(t *testing.T, pid int, startTicks int64) {
+	t.Helper()
+	f.processStat(t, pid, startTicks, "S")
+}
+
+// processState rewrites the fixture process's stat with the given state field.
+func (f *inspectFixture) processState(t *testing.T, procState string) {
+	t.Helper()
+	f.processStat(t, inspectPID, inspectStartTicks, procState)
+}
+
+func (f *inspectFixture) processStat(t *testing.T, pid int, startTicks int64, procState string) {
 	t.Helper()
 	fields := make([]string, 50)
 	for i := range fields {
 		fields[i] = "0"
 	}
-	fields[0] = "S"
+	fields[0] = procState
 	fields[19] = strconv.FormatInt(startTicks, 10)
 	body := strconv.Itoa(pid) + " (billet (server)) " + strings.Join(fields, " ") + "\n"
 	writeFile(t, filepath.Join(f.procDir, strconv.Itoa(pid), "stat"), body, 0o644)
@@ -594,6 +655,14 @@ func TestReleaseInspectDSNStates(t *testing.T) {
 		"quote inside":   {[]string{"BILLET_PG_DSN=" + dsn}, true, "BILLET_PG_DSN=\"a\"b\"\n", "", "unsupported environment file syntax"},
 		"backslash":      {[]string{"BILLET_PG_DSN=" + dsn}, true, "BILLET_PG_DSN=a\\\\b\n", "", "unsupported environment file syntax"},
 		"bad other line": {[]string{"BILLET_PG_DSN=" + dsn}, true, "BILLET_PG_DSN=" + dsn + "\nexport OTHER=1\n", "", "unsupported environment file syntax"},
+		"leading space":  {[]string{"BILLET_PG_DSN=" + dsn}, true, "BILLET_PG_DSN= " + dsn + "\n", "", "unsupported environment file syntax"},
+		"trailing space": {[]string{"BILLET_PG_DSN=" + dsn}, true, "BILLET_PG_DSN=" + dsn + " \n", "", "unsupported environment file syntax"},
+		"indented name":  {[]string{"BILLET_PG_DSN=" + dsn}, true, "  BILLET_PG_DSN=" + dsn + "\n", "", "unsupported environment file syntax"},
+		"cr in comment":  {[]string{"BILLET_PG_DSN=" + dsn}, true, "BILLET_PG_DSN=" + dsn + "\n# comment\rBILLET_PG_DSN=postgres://new\n", "", "control character"},
+		"crlf":           {[]string{"BILLET_PG_DSN=" + dsn}, true, "BILLET_PG_DSN=" + dsn + "\r\n", "", "control character"},
+		"nul":            {[]string{"BILLET_PG_DSN=" + dsn}, true, "BILLET_PG_DSN=" + dsn + "\x00\n", "", "control character"},
+		"not utf8":       {[]string{"BILLET_PG_DSN=" + dsn}, true, "BILLET_PG_DSN=" + dsn + "\xff\n", "", "not UTF-8"},
+		"del":            {[]string{"BILLET_PG_DSN=" + dsn}, true, "BILLET_PG_DSN=" + dsn + "\x7f\n", "", "control character"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			f := newInspectFixture(t)
@@ -748,30 +817,231 @@ func TestReleaseInspectReadsEveryEnvironmentFileLine(t *testing.T) {
 	}
 }
 
-// ARGUMENT BOUNDARIES COME FROM THE UNIT TEXT: `systemctl show` joins argv with
-// spaces, so a two-argument `billet "server --config x"` displays like the
-// supported four-argument form and only `systemctl cat` tells them apart.
-func TestReleaseInspectReadsArgumentBoundariesFromTheUnitText(t *testing.T) {
+// ARGUMENT BOUNDARIES COME FROM THE LOADED RECORDS: `systemctl show` joins argv
+// with spaces, so a two-argument `billet "server --config x"` displays like the
+// supported four-argument form, and only the bus property tells them apart;
+// the rendered view must agree with the loaded one, a second record, a unit
+// file changed since load, and a relative path are each could-not-tell.
+func TestReleaseInspectReadsArgumentBoundariesFromTheLoadedUnit(t *testing.T) {
+	cases := map[string]struct {
+		arrange func(t *testing.T, f *inspectFixture)
+		reason  string
+	}{
+		"two arguments": {func(t *testing.T, f *inspectFixture) {
+			t.Helper()
+			f.unitExec(t, "billet-server.service", [][]string{{f.binPath, "server --config " + f.configPath}})
+		}, "ExecStart is not"},
+		"rendered disagrees": {func(t *testing.T, f *inspectFixture) {
+			t.Helper()
+			f.unitProperty(t, "ExecStart", "{ path=/usr/bin/env ; argv[]=/usr/bin/env billet server --config "+f.configPath+" ; ignore_errors=no }")
+		}, "rendered ExecStart does not match"},
+		"two records": {func(t *testing.T, f *inspectFixture) {
+			t.Helper()
+			f.unitExec(t, "billet-server.service", [][]string{{f.binPath, "server", "--config", f.configPath}, {"/bin/true"}})
+		}, "2 ExecStart records"},
+		"relative config": {func(t *testing.T, f *inspectFixture) {
+			t.Helper()
+			f.unitExec(t, "billet-server.service", [][]string{{f.binPath, "server", "--config", "billet.yaml"}})
+			f.unitProperty(t, "ExecStart", "{ path="+f.binPath+" ; argv[]="+f.binPath+" server --config billet.yaml ; ignore_errors=no }")
+		}, "not absolute"},
+		"another root": {func(t *testing.T, f *inspectFixture) {
+			t.Helper()
+			f.unitProperty(t, "RootDirectory", "/srv/B")
+		}, "remapping directive (RootDirectory)"},
+		"bind paths": {func(t *testing.T, f *inspectFixture) {
+			t.Helper()
+			f.unitProperty(t, "BindReadOnlyPaths", "/srv/B/etc/billet:/etc/billet")
+		}, "remapping directive (BindReadOnlyPaths)"},
+		"extension directories": {func(t *testing.T, f *inspectFixture) {
+			t.Helper()
+			f.unitProperty(t, "ExtensionDirectories", "/var/lib/confexts/B")
+		}, "remapping directive (ExtensionDirectories)"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newInspectFixture(t)
+			tc.arrange(t, f)
+			r := f.report(t)
+			svc := r.Services["server"]
+			if mustKnown(t, "shape", svc.Shape) != "unsupported" || !strings.Contains(svc.ShapeReason, tc.reason) {
+				t.Errorf("shape = %v (%s), want unsupported for %q", svc.Shape.value, svc.ShapeReason, tc.reason)
+			}
+			mustUnknown(t, "config_binding", r.ConfigBinding, "")
+		})
+	}
+}
+
+// THE PENDING-RELOAD FLAG IS REPORTED, NOT JUDGED: on systemd 255 it is the
+// manager's (`unit_file_state_outdated`, set by any enable or disable that
+// changed something and cleared only by a reload; measured at 464 of 464 units
+// on the reference controller after a snap refresh), so it cannot say whether
+// THIS unit's file differs from what was loaded, and the loaded records are
+// what systemd runs either way. A yes leaves the shape supported and the binding
+// true; an answer that is neither yes nor no is could-not-tell.
+func TestReleaseInspectReportsThePendingReloadAsAFact(t *testing.T) {
+	for answer, want := range map[string]any{"yes": true, "no": false} {
+		t.Run(answer, func(t *testing.T) {
+			f := newInspectFixture(t)
+			f.unitProperty(t, "NeedDaemonReload", answer)
+			r := f.report(t)
+			svc := r.Services["server"]
+			if got := mustKnown(t, "need_daemon_reload", svc.NeedDaemonReload); got != want {
+				t.Errorf("need_daemon_reload = %v, want %v", got, want)
+			}
+			if got := mustKnown(t, "shape", svc.Shape); got != "supported" {
+				t.Errorf("shape = %v (%s), want supported whatever the manager's flag says", got, svc.ShapeReason)
+			}
+			if got := mustKnown(t, "config_binding", r.ConfigBinding); got != true {
+				t.Errorf("config_binding = %v, want true", got)
+			}
+		})
+	}
 	f := newInspectFixture(t)
-	f.unitText(t, "billet-server.service", "[Service]\nExecStart="+f.binPath+" \"server --config "+f.configPath+"\"\n")
+	f.unitProperty(t, "NeedDaemonReload", "")
+	mustUnknown(t, "need_daemon_reload", f.report(t).Services["server"].NeedDaemonReload, "NeedDaemonReload=")
+}
+
+// A PROCESS WHOSE --config IS RELATIVE CANNOT BE COMPARED: it is relative to a
+// working directory this inspector does not share.
+func TestReleaseInspectRefusesARelativeProcessConfigPath(t *testing.T) {
+	f := newInspectFixture(t)
+	f.process(t, []string{f.binPath, "server", "--config", "billet.yaml"}, nil)
 	r := f.report(t)
+	mustUnknown(t, "cmdline_config_path", r.Services["server"].CmdlineConfigPath, "relative")
+	mustUnknown(t, "config_binding", r.ConfigBinding, "relative")
+}
+
+// A PROCESS UNDER ANOTHER ROOT CANNOT BE COMPARED: its absolute --config names
+// a file under that root, which the inspector opens through /proc/<pid>/root
+// and, when it is not there, cannot compare.
+func TestReleaseInspectRefusesAProcessUnderAnotherRoot(t *testing.T) {
+	f := newInspectFixture(t)
+	f.processRoot(t, "/srv/B")
+	r := f.report(t)
+	mustUnknown(t, "config_sha256", r.Services["server"].ConfigSHA256, "could not be opened")
+	mustUnknown(t, "config_binding", r.ConfigBinding, "could not be opened")
+}
+
+// A PROCESS WHOSE VIEW OF THE PATH IS ANOTHER FILE DOES NOT BIND, whatever the
+// loaded unit says: a bind mount removed from the unit and reloaded without a
+// restart leaves the running process in the namespace it started in, where the
+// same absolute path is a different file, so the file is compared by identity
+// through the process's own root and not by the path's spelling.
+func TestReleaseInspectRefusesAProcessWhoseViewIsAnotherFile(t *testing.T) {
+	f := newInspectFixture(t)
+	view := filepath.Join(f.dir, "view")
+	// Byte-identical, so only identity tells the two apart.
+	writeFile(t, filepath.Join(view, f.configPath), f.serverConfig(), 0o644)
+	f.processRoot(t, view)
+	r := f.report(t)
+	if got := mustKnown(t, "config_binding", r.ConfigBinding); got != false {
+		t.Errorf("config_binding = %v, want false for a process whose view of the path is another file", got)
+	}
 	svc := r.Services["server"]
+	if got := mustKnown(t, "cmdline_config_path", svc.CmdlineConfigPath); got != f.configPath {
+		t.Errorf("cmdline_config_path = %v", got)
+	}
+	mustUnknown(t, "config_sha256", svc.ConfigSHA256, "is not the inspector's file")
+}
+
+// A SYMLINK INSIDE THE PROCESS'S VIEW RESOLVES UNDER THE PROCESS'S ROOT, never
+// the inspector's: a plain open of "<root>/<path>" would follow an absolute
+// symlink back into the inspector's namespace and open the inspector's own
+// file, so a config that is a symlink into a directory the service mounts
+// differently would compare equal to a file the service never reads.
+func TestReleaseInspectResolvesTheProcessViewUnderItsRoot(t *testing.T) {
+	t.Run("an absolute symlink does not escape the root", func(t *testing.T) {
+		f := newInspectFixture(t)
+		view := filepath.Join(f.dir, "view")
+		// Under the view, the config path is a symlink to the inspector's real
+		// file by its absolute name; under the process's root that name does
+		// not exist, so the view cannot be opened and nothing binds.
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(view, f.configPath)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(f.configPath, filepath.Join(view, f.configPath)); err != nil {
+			t.Fatal(err)
+		}
+		f.processRoot(t, view)
+		r := f.report(t)
+		mustUnknown(t, "config_binding", r.ConfigBinding, "could not be opened")
+		mustUnknown(t, "config_sha256", r.Services["server"].ConfigSHA256, "could not be opened")
+	})
+	t.Run("an absolute symlink resolves inside the root", func(t *testing.T) {
+		f := newInspectFixture(t)
+		view := filepath.Join(f.dir, "view")
+		// The symlink names /other/billet.yaml, which exists under the view as
+		// a byte-identical copy: the process reads that copy, not the
+		// inspector's file, so only identity tells them apart.
+		writeFile(t, filepath.Join(view, "other", "billet.yaml"), f.serverConfig(), 0o644)
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(view, f.configPath)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink("/other/billet.yaml", filepath.Join(view, f.configPath)); err != nil {
+			t.Fatal(err)
+		}
+		f.processRoot(t, view)
+		r := f.report(t)
+		if got := mustKnown(t, "config_binding", r.ConfigBinding); got != false {
+			t.Errorf("config_binding = %v, want false for a symlink resolving to another file under the process's root", got)
+		}
+		mustUnknown(t, "config_sha256", r.Services["server"].ConfigSHA256, "is not the inspector's file")
+	})
+}
+
+// A ZOMBIE KEEPS ITS START TIME, so equal ticks before and after the sample
+// would not prove the process lived through it; a zombie or dead process is
+// could-not-tell.
+func TestReleaseInspectRefusesAZombie(t *testing.T) {
+	f := newInspectFixture(t)
+	f.processState(t, "Z")
+	svc := f.report(t).Services["server"]
+	mustUnknown(t, "running_sha256", svc.RunningSHA256, "zombie")
+	mustUnknown(t, "config_binding", f.report(t).ConfigBinding, "zombie")
+}
+
+// A FILE WRITTEN WHILE IT IS HASHED IS COULD-NOT-TELL: a hash paired with
+// either stat would describe a file that never existed whole.
+func TestReleaseInspectRefusesAFileModifiedDuringTheHash(t *testing.T) {
+	f := newInspectFixture(t)
+	inspectAfterOpen = func(path string) {
+		if path != f.configPath {
+			return
+		}
+		// An in-place write: the same inode, new bytes, a new mtime.
+		if err := os.WriteFile(f.configPath, []byte(f.serverConfig()+"# touched\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	svc := f.report(t).Services["server"]
+	mustUnknown(t, "config_sha256", svc.ConfigSHA256, "changed while it was being read")
+	mustUnknown(t, "config_changed_since_start", svc.ConfigChangedSinceStart, "changed while it was being read")
+}
+
+// AN ENVIRONMENT FILE'S WHOLE NAME IS KEPT, " (" included: a parser cutting at
+// the first " (" would name a sibling file and compare the DSN against it.
+func TestReleaseInspectKeepsTheWholeEnvironmentFileName(t *testing.T) {
+	f := newInspectFixture(t)
+	f.writeConfig(t, f.postgresConfig())
+	envFile := filepath.Join(f.dir, "server (prod.env")
+	writeFile(t, envFile, "BILLET_PG_DSN=postgres://real\n", 0o640)
+	writeFile(t, filepath.Join(f.dir, "server"), "BILLET_PG_DSN=postgres://sibling\n", 0o640)
+	f.touchBeforeStart(t, envFile)
+	f.touchBeforeStart(t, f.configPath)
+	f.unitRunning(t, "billet-server.service", "server", f.configPath, []string{envFile})
+	f.process(t, []string{f.binPath, "server", "--config", f.configPath}, []string{"BILLET_PG_DSN=postgres://real"})
+	svc := f.report(t).Services["server"]
+	if mustKnown(t, "shape", svc.Shape) != "supported" {
+		t.Fatalf("shape = %v (%s)", svc.Shape.value, svc.ShapeReason)
+	}
+	d, ok := mustKnown(t, "dsn_env", svc.DSNEnv).(inspectDSNEnv)
+	if !ok || mustKnown(t, "matches_file", d.MatchesFile) != "equal" {
+		t.Errorf("dsn_env = %+v, want equal against the file whose name holds \" (\"", svc.DSNEnv.value)
+	}
+	f.unitProperty(t, "EnvironmentFiles", envFile+" (something else)")
+	svc = f.report(t).Services["server"]
 	if mustKnown(t, "shape", svc.Shape) != "unsupported" {
-		t.Errorf("shape = %v, want unsupported for a quoted two-argument ExecStart", svc.Shape.value)
-	}
-	mustUnknown(t, "config_binding", r.ConfigBinding, "unsupported")
-	// The rendered properties must agree with the text: a unit text that reads
-	// as the supported shape beside a rendered argv that does not is refused
-	// on the rendered side.
-	f.unitWith(t, "billet-server.service", "/usr/bin/env billet server --config "+f.configPath, nil, "", inspectPID, "active", "running")
-	f.unitText(t, "billet-server.service", "[Service]\nExecStart="+f.binPath+" server --config "+f.configPath+"\n")
-	if svc := f.report(t).Services["server"]; mustKnown(t, "shape", svc.Shape) != "unsupported" || !strings.Contains(svc.ShapeReason, "rendered ExecStart does not match") {
-		t.Errorf("shape = %v (%s), want the rendered mismatch refused", svc.Shape.value, svc.ShapeReason)
-	}
-	// A drop-in adding a second ExecStart is visible in the text too.
-	f.unitText(t, "billet-server.service", "[Service]\nExecStart="+f.binPath+" server --config "+f.configPath+"\n# /etc/systemd/system/billet-server.service.d/x.conf\n[Service]\nExecStart=/bin/true\n")
-	if svc := f.report(t).Services["server"]; mustKnown(t, "shape", svc.Shape) != "unsupported" {
-		t.Errorf("shape = %v, want unsupported for a drop-in ExecStart", svc.Shape.value)
+		t.Error("an EnvironmentFiles line in another form was read")
 	}
 }
 
@@ -899,8 +1169,9 @@ func TestReleaseInspectReportsANodesTrustStoreWithoutItsKey(t *testing.T) {
 	cert, key, caFile := filepath.Join(f.dir, "node.crt"), filepath.Join(f.dir, "node.key"), filepath.Join(f.dir, "ca.crt")
 	writeFile(t, cert, string(bundle.CertPEM), 0o644)
 	writeFile(t, key, string(bundle.KeyPEM), 0o600)
-	// THE KEY IS UNREADABLE, so a read of it, by any path, would surface as an
-	// error in the report rather than go unnoticed.
+	// THE KEY IS UNREADABLE, so a read of it whose result the report uses
+	// would surface as an error; a discarded read would not, which is what the
+	// exact-reads assertion below and the source-level call list are for.
 	if err := os.Chmod(key, 0); err != nil {
 		t.Fatal(err)
 	}
@@ -927,6 +1198,15 @@ func TestReleaseInspectReportsANodesTrustStoreWithoutItsKey(t *testing.T) {
 	}
 	if strings.Contains(string(body), "node.key") {
 		t.Errorf("the report mentions the node's key, so something read it:\n%s", body)
+	}
+	// EXACTLY THE PUBLIC FILES, THROUGH THE SEAM: the journal (absent), the
+	// leaf and the CA file, and never the key.
+	want := []string{retiredJournalPath, cert, caFile}
+	sort.Strings(want)
+	got := append([]string(nil), f.read...)
+	sort.Strings(got)
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("public reads = %q, want exactly %q", got, want)
 	}
 }
 
@@ -1089,10 +1369,15 @@ func TestReleaseInspectJSONFieldSet(t *testing.T) {
 		f.unitRunning(t, "billet-node.service", "node", f.configPath, nil)
 		f.process(t, []string{f.binPath, "node", "--config", f.configPath}, nil)
 		writeFile(t, retiredJournalPath, `{"phase":"done"}`, 0o600)
-		if err := os.MkdirAll(upgradeRoot, 0o700); err != nil {
+		claim := filepath.Join(upgradeRoot, "upgrade-1")
+		if err := os.MkdirAll(claim, 0o700); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.Symlink(filepath.Join(upgradeRoot, "gone"), filepath.Join(upgradeRoot, "active")); err != nil {
+		journal := &hostupgrade.Journal{Dir: claim, FromVersion: "v0.9.3", ToVersion: "v0.9.4", TargetDigest: "sha256:m", Step: hostupgrade.StepStaged, StartedAt: "2026-09-06T00:00:00Z", Failure: "the probe never answered"}
+		if err := journal.Write(); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(claim, filepath.Join(upgradeRoot, "active")); err != nil {
 			t.Fatal(err)
 		}
 		assertFieldSet(t, f.report(t), inspectFieldSetNode)
@@ -1160,9 +1445,12 @@ host.node_name
 host.node_trust
 host.os
 host.retirement
+installed_config.controllers
 installed_config.has_node
 installed_config.has_server
+installed_config.ledger_backend
 installed_config.path
+installed_config.sha256
 provenance.reason
 provenance.verdict
 schema
@@ -1179,6 +1467,7 @@ services.node.exec_main_start
 services.node.exec_start
 services.node.loaded_config.unknown
 services.node.main_pid
+services.node.need_daemon_reload
 services.node.running_sha256
 services.node.same_as_executable
 services.node.shape
@@ -1198,6 +1487,7 @@ services.server.exec_main_start
 services.server.exec_start
 services.server.loaded_config.unknown
 services.server.main_pid
+services.server.need_daemon_reload
 services.server.running_sha256
 services.server.same_as_executable
 services.server.shape
@@ -1211,6 +1501,73 @@ transaction.lock_held
 transaction.preparation.transaction_lock
 transaction.root
 `
+
+// EVERY DIRECT FILESYSTEM CALL IN THE INSPECTOR IS LISTED HERE. The public
+// reads go through readPublicFile and openImage, which a test observes; a call
+// beside them (a discarded read of the key, say) would leave no trace in any
+// report, so the source is held to this list. THE BOUNDARY IS THE ENUMERATED
+// FORMS: the os package's file-opening functions and factories (os.DirFS,
+// os.OpenRoot) named directly, plus any alias of an os function other than the
+// two seams; a call reached some other way (a helper in another file, a
+// syscall) is outside what this test sees, and the two openInRoot files are the
+// root-scoped resolution helper, read on their own.
+func TestReleaseInspectReadsTheFilesystemOnlyWhereListed(t *testing.T) {
+	src, err := os.ReadFile("releaseinspect.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	call := regexp.MustCompile(`\bos\s*\.\s*(ReadFile|ReadDir|Open|OpenFile|OpenRoot|DirFS|Create|CreateTemp|Stat|Lstat|Readlink|WriteFile|Mkdir|MkdirAll|MkdirTemp|Remove|RemoveAll|Rename|Chmod|Chown|Lchown|Link|Symlink|Truncate)\b`)
+	alias := regexp.MustCompile(`=\s*os\.[A-Z]\w*\s*$`)
+	var got, aliases []string
+	for _, line := range strings.Split(string(src), "\n") {
+		if alias.MatchString(line) {
+			aliases = append(aliases, strings.TrimSpace(line))
+			continue
+		}
+		if call.MatchString(line) {
+			got = append(got, strings.TrimSpace(line))
+		}
+	}
+	sort.Strings(aliases)
+	if strings.Join(aliases, "\n") != "openImage = os.Open\nreadPublicFile     = os.ReadFile" {
+		t.Errorf("os function aliases in releaseinspect.go:\n%s\nwant exactly the two seams", strings.Join(aliases, "\n"))
+	}
+	sort.Strings(got)
+	want := []string{
+		`_, err := os.Lstat(path)`,
+		`body, err := os.ReadFile(filepath.Join(active, "guard.json"))`,
+		`body, err := os.ReadFile(filepath.Join(dir, "stat"))`,
+		`body, err := os.ReadFile(path)`,
+		`cmdlineBody, err := os.ReadFile(filepath.Join(dir, "cmdline"))`,
+		`dir, err := os.Readlink(active)`,
+		`environ, err := os.ReadFile(filepath.Join(dir, "environ"))`,
+		`f, err := os.Open(filepath.Join(procRoot, "stat"))`,
+		`f, err := os.OpenFile(filepath.Join(upgradeRoot, txLockName), os.O_RDONLY|syscall.O_NOFOLLOW, 0)`,
+		`info, err := os.Lstat(active)`,
+		`inspectorInfo, statErr := os.Stat(inspectorConfig)`,
+		`installed, err := os.Stat(installedBinary)`,
+		`rootInfo, err := os.Lstat(upgradeRoot)`,
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("direct filesystem calls in releaseinspect.go:\n%s\nwant exactly:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+// THE BUS LABEL IS SYSTEMD'S, by literal example: the fixture names its files
+// through the same function, so only literals can catch a wrong escape.
+func TestBusLabelEscapesLikeSystemd(t *testing.T) {
+	for in, want := range map[string]string{
+		"billet-server.service": "billet_2dserver_2eservice",
+		"billet-node.service":   "billet_2dnode_2eservice",
+		"9lives.service":        "_39lives_2eservice",
+		"a_b.service":           "a_5fb_2eservice",
+		"getty@tty1.service":    "getty_40tty1_2eservice",
+	} {
+		if got := busLabel(in); got != want {
+			t.Errorf("busLabel(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
 
 // THE COMMAND PARSES ITS FLAGS AND RENDERS: a smoke test of the entry point.
 func TestReleaseInspectCommandRuns(t *testing.T) {
@@ -1248,9 +1605,12 @@ host.node_name
 host.node_trust
 host.os
 host.retirement
+installed_config.controllers
 installed_config.has_node
 installed_config.has_server
+installed_config.ledger_backend
 installed_config.path
+installed_config.sha256
 provenance.binary_sha256
 provenance.manifest_digest
 provenance.verdict
@@ -1269,6 +1629,7 @@ services.node.exec_main_start
 services.node.exec_start
 services.node.loaded_config.unknown
 services.node.main_pid
+services.node.need_daemon_reload
 services.node.running_sha256
 services.node.same_as_executable
 services.node.shape
@@ -1290,6 +1651,7 @@ services.server.exec_main_start
 services.server.exec_start
 services.server.loaded_config.unknown
 services.server.main_pid
+services.server.need_daemon_reload
 services.server.running_sha256
 services.server.same_as_executable
 services.server.shape
@@ -1311,7 +1673,7 @@ transaction.root
 `
 
 // inspectFieldSetNode is the sorted key set of a node-only host with a trust
-// bundle, a retirement journal and a dangling Go claim.
+// bundle, a retirement journal and a Go claim with a readable journal.
 const inspectFieldSetNode = `
 config.path
 config.readable
@@ -1333,9 +1695,12 @@ host.node_trust.leaf.pem
 host.node_trust.leaf.subject
 host.os
 host.retirement.phase
+installed_config.controllers
 installed_config.has_node
 installed_config.has_server
+installed_config.ledger_backend
 installed_config.path
+installed_config.sha256
 provenance.reason
 provenance.verdict
 schema
@@ -1352,6 +1717,7 @@ services.node.exec_main_start
 services.node.exec_start
 services.node.loaded_config.unknown
 services.node.main_pid
+services.node.need_daemon_reload
 services.node.running_sha256
 services.node.same_as_executable
 services.node.shape
@@ -1371,6 +1737,7 @@ services.server.exec_main_start
 services.server.exec_start
 services.server.loaded_config.unknown
 services.server.main_pid
+services.server.need_daemon_reload
 services.server.running_sha256
 services.server.same_as_executable
 services.server.shape
@@ -1379,7 +1746,11 @@ services.server.sub_state
 services.server.unit_present
 transaction.active
 transaction.converge_guard
-transaction.journal.unknown
+transaction.journal.failure
+transaction.journal.from_version
+transaction.journal.started_at
+transaction.journal.step
+transaction.journal.to_version
 transaction.lock_held
 transaction.preparation.transaction_lock
 transaction.root

@@ -2,6 +2,7 @@ package wirecert
 
 import (
 	"bytes"
+	"crypto/x509"
 	"errors"
 	"os"
 	"path/filepath"
@@ -155,6 +156,7 @@ func TestSnapshotAuthorityRefusesACertificateFileWithMoreInIt(t *testing.T) {
 		"key material":       []byte("-----BEGIN EC PRIVATE KEY-----\nAAAA\n-----END EC PRIVATE KEY-----\n"),
 		"trailing bytes":     []byte("not pem\n"),
 		"leading bytes":      []byte("PREFIX"),
+		"malformed block":    []byte("-----BEGIN CERTIFICATE-----\n!\n-----END CERTIFICATE-----\n"),
 	} {
 		t.Run(name, func(t *testing.T) {
 			stateDir := t.TempDir()
@@ -166,7 +168,7 @@ func TestSnapshotAuthorityRefusesACertificateFileWithMoreInIt(t *testing.T) {
 			switch {
 			case extra == nil:
 				body = append(body, ca.CertPEM()...)
-			case name == "leading bytes":
+			case name == "leading bytes", name == "malformed block":
 				body = append(append([]byte(nil), extra...), body...)
 			default:
 				body = append(body, extra...)
@@ -228,6 +230,53 @@ func TestParseCertificatesReadsEveryBlockAndRefusesOtherKinds(t *testing.T) {
 	}
 	if _, err := ParseCertificates(append([]byte("prefix "), ca.CertPEM()...)); err == nil {
 		t.Error("a bundle with bytes before its first block was accepted")
+	}
+	// pem.Decode skips a malformed block and recovers at the next BEGIN; the
+	// bundle parser must not.
+	malformed := []byte("-----BEGIN CERTIFICATE-----\n!\n-----END CERTIFICATE-----\n")
+	if _, err := ParseCertificates(append(append([]byte(nil), malformed...), ca.CertPEM()...)); err == nil {
+		t.Error("a bundle whose first block is malformed was read for its second")
+	}
+	if _, err := ParseCertificates(append(append(append([]byte(nil), ca.CertPEM()...), malformed...), ca.CertPEM()...)); err == nil {
+		t.Error("a bundle with a malformed block between two certificates was accepted")
+	}
+	// Two blocks glued together without a newline after the END marker are a
+	// malformed boundary, not two certificates: Go's decoder and the TLS loader
+	// refuse them, so the inspector must not report what they would not load.
+	glued := append(append([]byte(nil), bytes.TrimRight(ca.CertPEM(), "\n")...), ca.CertPEM()...)
+	if _, err := ParseCertificates(glued); err == nil {
+		t.Error("two blocks glued together without a line ending were accepted")
+	}
+	if _, err := ParseCertificates(append(append([]byte(nil), bytes.TrimRight(ca.CertPEM(), "\n")...), []byte(" trailing\n")...)); err == nil {
+		t.Error("an END marker with more text on its line was accepted")
+	}
+	// AN INDENTED BEGIN IS NOT A BLOCK THE LOADER SEES: Go's decoder takes a
+	// BEGIN marker only at the start of the text or after a newline, so the
+	// TLS loader's pool would not hold this certificate and the report must
+	// not say it does; a blank line, even one holding whitespace, hides nothing.
+	indented := append([]byte(" "), ca.CertPEM()...)
+	if x509.NewCertPool().AppendCertsFromPEM(indented) {
+		t.Fatal("the premise is wrong: the loader accepted an indented BEGIN")
+	}
+	if _, err := ParseCertificates(indented); err == nil {
+		t.Error("an indented first block was accepted, which the TLS loader would not load")
+	}
+	if _, err := ParseCertificates(append(append([]byte(nil), ca.CertPEM()...), indented...)); err == nil {
+		t.Error("an indented later block was accepted, which the TLS loader would not load")
+	}
+	spaced := append(append(append([]byte("\n \n"), ca.CertPEM()...), []byte("\t\n\n")...), ca.CertPEM()...)
+	if certs, err := ParseCertificates(spaced); err != nil || len(certs) != 2 {
+		t.Errorf("blank lines around the blocks were refused: %v", err)
+	}
+	// Go's decoder lets the END line end in spaces or tabs, and so does this
+	// parser; a retire refused over formatting is the failure ADR-005 names.
+	padded := append(append([]byte(nil), bytes.TrimRight(ca.CertPEM(), "\n")...), []byte(" \t\n")...)
+	if certs, err := ParseCertificates(padded); err != nil || len(certs) != 1 {
+		t.Errorf("an END line with trailing spaces was refused: %v", err)
+	}
+	crlf := bytes.ReplaceAll(ca.CertPEM(), []byte("\n"), []byte("\r\n"))
+	if certs, err := ParseCertificates(crlf); err != nil || len(certs) != 1 {
+		t.Errorf("a CRLF certificate was refused: %v", err)
 	}
 	node, err := ca.IssueNode("node-a")
 	if err != nil {

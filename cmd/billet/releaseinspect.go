@@ -20,6 +20,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/junioryono/billet/deploy"
 	"github.com/junioryono/billet/internal/config"
@@ -57,9 +59,16 @@ import (
 // configured directory so a host whose config lost its server: block still
 // reports it.
 var (
-	procRoot           = "/proc"
-	selfExePath        = "/proc/self/exe"
-	systemctlBinary    = "systemctl"
+	procRoot        = "/proc"
+	selfExePath     = "/proc/self/exe"
+	systemctlBinary = "systemctl"
+	// busctlBinary answers the LOADED ExecStart as structured records, argument
+	// boundaries intact; `systemctl show` joins argv with spaces and `systemctl
+	// cat` shows text systemd may not have loaded.
+	busctlBinary = "busctl"
+	// readPublicFile reads a certificate, a bundle's CA file or the retirement
+	// journal; a test records the paths to prove the key file is never asked for.
+	readPublicFile     = os.ReadFile
 	retiredJournalPath = "/var/lib/billet/retired/journal.json"
 	// inspectSamples bounds how often a running process's image is re-read when
 	// the process changes under the observation.
@@ -144,6 +153,7 @@ type inspectService struct {
 	EnvironmentFiles maybe  `json:"environment_files"`
 	Shape            maybe  `json:"shape"`
 	ShapeReason      string `json:"shape_reason,omitempty"`
+	NeedDaemonReload maybe  `json:"need_daemon_reload"`
 
 	RunningSHA256                  maybe `json:"running_sha256"`
 	SameAsExecutable               maybe `json:"same_as_executable"`
@@ -164,9 +174,12 @@ type inspectDSNEnv struct {
 }
 
 type inspectInstalledConfig struct {
-	Path      maybe `json:"path"`
-	HasServer maybe `json:"has_server"`
-	HasNode   maybe `json:"has_node"`
+	Path          maybe `json:"path"`
+	SHA256        maybe `json:"sha256"`
+	HasServer     maybe `json:"has_server"`
+	HasNode       maybe `json:"has_node"`
+	LedgerBackend maybe `json:"ledger_backend"`
+	Controllers   maybe `json:"controllers"`
 }
 
 type inspectHost struct {
@@ -253,6 +266,12 @@ func cmdReleaseInspect(ctx context.Context, args []string) error {
 // what the executable and the upgrade root say is worth having on a host whose
 // configuration is the thing that broke.
 func inspectHostRelease(ctx context.Context, configPath string) inspectReport {
+	// The binding compares paths as strings, so the inspector's own is made
+	// absolute first; a relative one would compare equal to a service's
+	// relative argument that names another directory's file.
+	if abs, err := filepath.Abs(configPath); err == nil {
+		configPath = abs
+	}
 	report := inspectReport{Schema: inspectSchema, Config: inspectConfig{Path: configPath}}
 	cfg, err := config.Load(configPath)
 	if err != nil {
@@ -334,25 +353,38 @@ func inspectExecutableSection(report *inspectReport) (string, os.FileInfo) {
 }
 
 // hashImage opens an image by the path given and hashes it through that one
-// descriptor, returning the descriptor's own stat.
+// descriptor, returning the descriptor's own stat. THE READ IS BRACKETED BY THE
+// DESCRIPTOR'S METADATA: a stat before and after the hash that disagree in
+// size or modification time mean the bytes were written while they were read,
+// and a hash paired with either stat would describe a file that never existed
+// whole; that is could-not-tell. A write after the second stat is outside this
+// observation, and equal size and mtime are not proof the bytes never changed:
+// the bracket refuses what it can see and claims nothing more.
 func hashImage(path string) (string, os.FileInfo, error) {
 	f, err := openImage(path)
 	if err != nil {
 		return "", nil, fmt.Errorf("open %s: %w", path, err)
 	}
 	defer func() { _ = f.Close() }()
-	if inspectAfterOpen != nil {
-		inspectAfterOpen(path)
-	}
-	info, err := f.Stat()
+	before, err := f.Stat()
 	if err != nil {
 		return "", nil, fmt.Errorf("stat %s: %w", path, err)
+	}
+	if inspectAfterOpen != nil {
+		inspectAfterOpen(path)
 	}
 	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {
 		return "", nil, fmt.Errorf("read %s: %w", path, err)
 	}
-	return hex.EncodeToString(h.Sum(nil)), info, nil
+	after, err := f.Stat()
+	if err != nil {
+		return "", nil, fmt.Errorf("stat %s: %w", path, err)
+	}
+	if before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) {
+		return "", nil, fmt.Errorf("%s changed while it was being read", path)
+	}
+	return hex.EncodeToString(h.Sum(nil)), after, nil
 }
 
 // inspectProvenanceSection computes the verdict the way provenance.Installed
@@ -391,7 +423,9 @@ func unitProperties(ctx context.Context, unit string) (map[string][]string, erro
 	ctx, cancel := context.WithTimeout(ctx, systemctlTimeout)
 	defer cancel()
 	names := []string{"LoadState", "UnitFileState", "ActiveState", "SubState", "MainPID",
-		"InvocationID", "ExecMainStartTimestamp", "ExecStart", "EnvironmentFiles", "Environment"}
+		"InvocationID", "NeedDaemonReload", "ExecMainStartTimestamp", "ExecStart", "EnvironmentFiles",
+		"Environment", "RootDirectory", "RootImage", "BindPaths", "BindReadOnlyPaths", "MountImages",
+		"ExtensionImages", "ExtensionDirectories", "TemporaryFileSystem"}
 	args := make([]string, 0, len(names)+3)
 	args = append(args, "show")
 	for _, n := range names {
@@ -413,6 +447,26 @@ func unitProperties(ctx context.Context, unit string) (map[string][]string, erro
 		props[key] = append(props[key], value)
 	}
 	return props, nil
+}
+
+// needDaemonReload reads systemd's NeedDaemonReload as the three-valued fact
+// it is. ON SYSTEMD 255 THE FLAG IS THE MANAGER'S, NOT THE UNIT'S: any unit-file
+// operation over the bus that changed something (enable, disable, preset, mask,
+// link, revert) sets `unit_file_state_outdated`, which makes EVERY unit answer
+// yes until the next daemon-reload (measured on the reference controller,
+// 2026-09-07: 464 of 464 units after snapd enabled a new mount unit, billet's
+// own files untouched since the last reload). So it says a reload is pending
+// somewhere, and nothing about whether this unit's file differs from what was
+// loaded; the loaded records above are what systemd runs either way.
+func needDaemonReload(props map[string][]string) maybe {
+	switch v := firstProp(props, "NeedDaemonReload"); v {
+	case "yes":
+		return known(true)
+	case "no":
+		return known(false)
+	default:
+		return unknown("systemd answered NeedDaemonReload=" + strconv.Quote(v))
+	}
 }
 
 func firstProp(props map[string][]string, name string) string {
@@ -437,86 +491,121 @@ func execStartArgvOf(rendered string) string {
 	return strings.TrimSpace(rest)
 }
 
-// unitFragmentText is `systemctl cat` of a unit: the fragment and every
-// drop-in as written, the one place argument boundaries are still visible.
-// `systemctl show` renders ExecStart's argv joined by spaces, so a two-argument
-// `billet "server --config x"` displays like the supported four-argument form.
-func unitFragmentText(ctx context.Context, unit string) (string, error) {
+// execRecord is one loaded ExecStart entry as systemd holds it: the executable
+// path and the argument vector with its boundaries.
+type execRecord struct {
+	Path string
+	Argv []string
+}
+
+// unitExecStart reads the LOADED ExecStart of a unit as structured records
+// over D-Bus (`busctl --json=short get-property ... Service ExecStart`, whose
+// value is a(sasbttttuii)). `systemctl show` renders argv joined by spaces, so
+// `billet "server --config x"` displays like the supported four-argument form,
+// and `systemctl cat` shows text systemd may not have loaded or may parse
+// otherwise (whitespace around `=`, a later assignment resetting the list); the
+// bus property is the one place the loaded vector is what it is.
+func unitExecStart(ctx context.Context, unit string) ([]execRecord, error) {
 	ctx, cancel := context.WithTimeout(ctx, systemctlTimeout)
 	defer cancel()
+	object := "/org/freedesktop/systemd1/unit/" + busLabel(unit)
 	var stdout, stderr bytes.Buffer
-	cmd := exec.CommandContext(ctx, systemctlBinary, "cat", "--", unit)
+	cmd := exec.CommandContext(ctx, busctlBinary, "--json=short", "get-property",
+		"org.freedesktop.systemd1", object, "org.freedesktop.systemd1.Service", "ExecStart")
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("systemctl cat %s: %w: %s", unit, err, strings.TrimSpace(stderr.String()))
+		return nil, fmt.Errorf("busctl get-property ExecStart of %s: %w: %s", unit, err, strings.TrimSpace(stderr.String()))
 	}
-	return stdout.String(), nil
+	var reply struct {
+		Type string            `json:"type"`
+		Data []json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &reply); err != nil {
+		return nil, fmt.Errorf("busctl answered for %s in a form the inspector does not read: %w", unit, err)
+	}
+	if reply.Type != "a(sasbttttuii)" {
+		return nil, fmt.Errorf("busctl answered for %s with type %q, not the ExecStart record type", unit, reply.Type)
+	}
+	out := make([]execRecord, 0, len(reply.Data))
+	for _, raw := range reply.Data {
+		var fields []json.RawMessage
+		if err := json.Unmarshal(raw, &fields); err != nil || len(fields) < 2 {
+			return nil, fmt.Errorf("busctl answered for %s with an ExecStart record the inspector does not read", unit)
+		}
+		var rec execRecord
+		if err := json.Unmarshal(fields[0], &rec.Path); err != nil {
+			return nil, fmt.Errorf("busctl answered for %s with an ExecStart path the inspector does not read", unit)
+		}
+		if err := json.Unmarshal(fields[1], &rec.Argv); err != nil {
+			return nil, fmt.Errorf("busctl answered for %s with an ExecStart argv the inspector does not read", unit)
+		}
+		out = append(out, rec)
+	}
+	return out, nil
 }
 
-// unitDirectives counts the directives the supported shape constrains, over
-// the fragment and its drop-ins as written.
-type unitDirectives struct {
-	execStart   []string
-	envFiles    int
-	environment int
-}
-
-func parseUnitDirectives(text string) unitDirectives {
-	var d unitDirectives
-	for _, line := range strings.Split(text, "\n") {
-		line = strings.TrimSpace(line)
-		switch {
-		case strings.HasPrefix(line, "ExecStart="):
-			d.execStart = append(d.execStart, strings.TrimSpace(strings.TrimPrefix(line, "ExecStart=")))
-		case strings.HasPrefix(line, "EnvironmentFile="):
-			d.envFiles++
-		case strings.HasPrefix(line, "Environment="):
-			d.environment++
+// remapped names the first directive that gives the unit's processes a view
+// of the filesystem in which an absolute path means another file, or "" when
+// none is set: another root, a bind mount, a mounted image, a temporary
+// filesystem, or an extension image or directory (a system extension overlays
+// /usr, where the binary is, and a configuration extension /etc, where the
+// config is, both under a root that still reads "/"). Sandboxing that hides
+// paths (ProtectSystem, ProtectHome, InaccessiblePaths) does not substitute the
+// configuration and is not listed here.
+func remapped(props map[string][]string) string {
+	for _, name := range []string{"RootDirectory", "RootImage", "BindPaths", "BindReadOnlyPaths",
+		"MountImages", "ExtensionImages", "ExtensionDirectories", "TemporaryFileSystem"} {
+		if strings.TrimSpace(firstProp(props, name)) != "" {
+			return name
 		}
 	}
-	return d
+	return ""
+}
+
+// busLabel escapes a unit name the way systemd names its bus objects: letters
+// and digits stay (a leading digit is escaped), everything else becomes _XX.
+func busLabel(name string) string {
+	var b strings.Builder
+	for i := range len(name) {
+		ch := name[i]
+		alnum := (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')
+		leadingDigit := i == 0 && ch >= '0' && ch <= '9'
+		if alnum && !leadingDigit {
+			b.WriteByte(ch)
+			continue
+		}
+		fmt.Fprintf(&b, "_%02x", ch)
+	}
+	return b.String()
 }
 
 // environmentFilesOfAll reads every EnvironmentFiles property line systemd
-// printed (one per file on systemd 255) into one list.
-func environmentFilesOfAll(lines []string) []string {
+// printed (one per file on systemd 255, `<path> (ignore_errors=yes|no)`). The
+// suffix is stripped exactly and the WHOLE path is kept, because a path can
+// itself contain " (" and a parser that cut at the first one would name a
+// sibling file; a line in any other form is refused rather than guessed at.
+func environmentFilesOfAll(lines []string) ([]string, error) {
 	out := make([]string, 0, len(lines))
 	for _, line := range lines {
-		out = append(out, environmentFilesOf(line)...)
-	}
-	return out
-}
-
-// execStartPathOf reads the executable path out of systemd's rendered
-// ExecStart (`{ path=... ; argv[]=... }`).
-func execStartPathOf(rendered string) string {
-	const marker = "path="
-	i := strings.Index(rendered, marker)
-	if i < 0 {
-		return ""
-	}
-	rest := rendered[i+len(marker):]
-	if end := strings.Index(rest, " ;"); end >= 0 {
-		rest = rest[:end]
-	}
-	return strings.TrimSpace(rest)
-}
-
-// environmentFilesOf reads the paths out of systemd's EnvironmentFiles
-// (`/etc/billet/server.env (ignore_errors=yes)`, several separated by spaces).
-func environmentFilesOf(rendered string) []string {
-	var out []string
-	for _, part := range strings.Split(rendered, ")") {
-		part = strings.TrimSpace(part)
-		if part == "" {
+		line = strings.TrimRight(line, "\r")
+		if strings.TrimSpace(line) == "" {
 			continue
 		}
-		if i := strings.Index(part, " ("); i >= 0 {
-			part = part[:i]
+		var path string
+		switch {
+		case strings.HasSuffix(line, " (ignore_errors=yes)"):
+			path = strings.TrimSuffix(line, " (ignore_errors=yes)")
+		case strings.HasSuffix(line, " (ignore_errors=no)"):
+			path = strings.TrimSuffix(line, " (ignore_errors=no)")
+		default:
+			return nil, fmt.Errorf("an EnvironmentFiles entry in a form the inspector does not read")
 		}
-		out = append(out, strings.TrimSpace(part))
+		if !filepath.IsAbs(path) {
+			return nil, fmt.Errorf("an EnvironmentFiles entry that is not an absolute path")
+		}
+		out = append(out, path)
 	}
-	return out
+	return out, nil
 }
 
 // inspectServiceSection reports one unit and says whether it is bound to the
@@ -545,6 +634,7 @@ func inspectServiceSection(ctx context.Context, role, unit string, cfg *config.C
 		// unit whose file was removed while its service runs still runs.
 		svc.UnitPresent = known(false)
 		svc.Enabled, svc.ExecStart, svc.Shape, svc.EnvironmentFiles = known(nil), known(nil), known(nil), known(nil)
+		svc.NeedDaemonReload = needDaemonReload(props)
 		svc.ActiveState, svc.SubState = known(active), known(firstProp(props, "SubState"))
 		svc.ExecMainStart = known(firstProp(props, "ExecMainStartTimestamp"))
 		switch {
@@ -568,47 +658,60 @@ func inspectServiceSection(ctx context.Context, role, unit string, cfg *config.C
 	svc.ActiveState = known(active)
 	svc.SubState = known(firstProp(props, "SubState"))
 	svc.ExecMainStart = known(firstProp(props, "ExecMainStartTimestamp"))
-	argv, execPath := "", ""
+	rendered := ""
 	if len(props["ExecStart"]) > 0 {
-		argv = execStartArgvOf(props["ExecStart"][0])
-		execPath = execStartPathOf(props["ExecStart"][0])
+		rendered = execStartArgvOf(props["ExecStart"][0])
 	}
-	svc.ExecStart = known(argv)
-	envFiles := environmentFilesOfAll(props["EnvironmentFiles"])
-	svc.EnvironmentFiles = known(envFiles)
+	svc.ExecStart = known(rendered)
+	envFiles, envErr := environmentFilesOfAll(props["EnvironmentFiles"])
+	if envErr != nil {
+		svc.EnvironmentFiles = unknown(envErr.Error())
+	} else {
+		svc.EnvironmentFiles = known(envFiles)
+	}
+	svc.NeedDaemonReload = needDaemonReload(props)
 
-	// THE SHAPE BILLET SHIPS, AND NOTHING ELSE, read where its boundaries are
-	// visible: `systemctl show` joins argv with spaces, so the fragment text
-	// from `systemctl cat` must carry exactly one ExecStart line that is
-	// textually `<managed path> <role> --config <path>`, at most one
-	// EnvironmentFile (the package has none, the role's template adds one), no
-	// Environment= directive; and the rendered properties must agree. Anything
-	// else is could-not-tell for the binding below.
+	// THE SHAPE BILLET SHIPS, AND NOTHING ELSE, read where the loaded argument
+	// vector is what it is: the bus property holds ExecStart as records with
+	// boundaries, so the one record's argv must be exactly `<managed path>
+	// <role> --config <absolute path>` and its path the managed path; the
+	// rendered `systemctl show` view must agree word for word; at most one
+	// EnvironmentFile (the package has none, the role's template adds one), and
+	// no Environment= directive. Anything else is could-not-tell for the
+	// binding below. The pending-reload flag is deliberately NOT a shape
+	// requirement: the loaded records are what systemd runs, and the flag is
+	// the manager's, not this unit's (needDaemonReload).
 	unitConfigPath := ""
 	shapeWhy := ""
-	text, err := unitFragmentText(ctx, unit)
-	directives := parseUnitDirectives(text)
-	words := strings.Fields(argv)
-	wantExec := installedBinary + " " + role + " --config "
+	records, execErr := unitExecStart(ctx, unit)
 	switch {
-	case err != nil:
-		shapeWhy = err.Error()
-	case len(directives.execStart) != 1 || len(props["ExecStart"]) != 1:
-		shapeWhy = fmt.Sprintf("%d ExecStart lines in the unit text and %d rendered", len(directives.execStart), len(props["ExecStart"]))
-	case !strings.HasPrefix(directives.execStart[0], wantExec) || len(strings.Fields(directives.execStart[0])) != 4 ||
-		strings.ContainsAny(directives.execStart[0], "\"'\\$"):
-		shapeWhy = "ExecStart is not `" + wantExec + "<path>`: " + directives.execStart[0]
-	case len(words) != 4 || words[0] != installedBinary || words[1] != role || words[2] != "--config" ||
-		words[3] != strings.Fields(directives.execStart[0])[3]:
-		shapeWhy = "the rendered ExecStart does not match the unit text"
-	case execPath != installedBinary:
+	case execErr != nil:
+		shapeWhy = execErr.Error()
+	case remapped(props) != "":
+		// A directive that gives the service another view of the filesystem
+		// makes its `--config /etc/billet/billet.yaml` name a file the
+		// inspector's `/etc/billet/billet.yaml` is not; equal paths would then
+		// bind two configurations.
+		shapeWhy = "a filesystem remapping directive (" + remapped(props) + ")"
+	case len(records) != 1:
+		shapeWhy = fmt.Sprintf("%d ExecStart records loaded", len(records))
+	case len(records[0].Argv) != 4 || records[0].Argv[0] != installedBinary || records[0].Argv[1] != role ||
+		records[0].Argv[2] != "--config":
+		shapeWhy = "ExecStart is not `" + installedBinary + " " + role + " --config <path>`: " + strings.Join(records[0].Argv, " ")
+	case !filepath.IsAbs(records[0].Argv[3]):
+		shapeWhy = "ExecStart's --config path is not absolute"
+	case records[0].Path != installedBinary:
 		shapeWhy = "ExecStart's executable path is not " + installedBinary
-	case directives.envFiles > 1 || len(envFiles) > 1:
-		shapeWhy = fmt.Sprintf("%d EnvironmentFile directives", max(directives.envFiles, len(envFiles)))
-	case directives.environment > 0 || strings.TrimSpace(firstProp(props, "Environment")) != "":
+	case rendered != strings.Join(records[0].Argv, " "):
+		shapeWhy = "the rendered ExecStart does not match the loaded one"
+	case envErr != nil:
+		shapeWhy = envErr.Error()
+	case len(envFiles) > 1:
+		shapeWhy = fmt.Sprintf("%d EnvironmentFile directives", len(envFiles))
+	case strings.TrimSpace(firstProp(props, "Environment")) != "":
 		shapeWhy = "an Environment= directive"
 	default:
-		unitConfigPath = words[3]
+		unitConfigPath = records[0].Argv[3]
 	}
 	binding := unknown("the unit's shape is unsupported, so it names no single config path")
 	if shapeWhy != "" {
@@ -670,6 +773,11 @@ type processSample struct {
 	startTicks int64
 	cmdline    []string
 	environ    []byte
+	// view is the file the process's own root resolves its --config path to,
+	// opened through /proc/<pid>/root inside the sample; viewErr says why it
+	// could not be.
+	view    os.FileInfo
+	viewErr string
 }
 
 // unitIdentity is what must not move across a sample: which process systemd
@@ -713,6 +821,20 @@ func sampleProcess(ctx context.Context, unit string, pid int, first map[string][
 		if err != nil {
 			return processSample{}, fmt.Errorf("read the process environment: %w", err)
 		}
+		args := strings.Split(strings.TrimRight(string(cmdlineBody), "\x00"), "\x00")
+		// THE PROCESS'S OWN VIEW OF ITS CONFIG PATH. An absolute path in its
+		// command line is resolved under its root and inside its mount
+		// namespace, where a RootDirectory, a bind mount or an extension
+		// overlay makes it another file than the inspector's; and a directive
+		// removed and reloaded without a restart no longer shows in the loaded
+		// unit while the running process keeps the namespace it started in. So
+		// the file is opened through /proc/<pid>/root, inside the sample, and
+		// compared by identity rather than by the root's name.
+		var view os.FileInfo
+		viewErr := ""
+		if len(args) == 4 && filepath.IsAbs(args[3]) {
+			view, viewErr = statThroughRoot(dir, args[3])
+		}
 		again, err := unitProperties(ctx, unit)
 		if err != nil {
 			return processSample{}, err
@@ -727,10 +849,29 @@ func sampleProcess(ctx context.Context, unit string, pid int, first map[string][
 		if before != after {
 			continue
 		}
-		args := strings.Split(strings.TrimRight(string(cmdlineBody), "\x00"), "\x00")
-		return processSample{sha: sum, startTicks: before, cmdline: args, environ: environ}, nil
+		return processSample{sha: sum, startTicks: before, cmdline: args, environ: environ, view: view, viewErr: viewErr}, nil
 	}
 	return processSample{}, errors.New("the service restarted during the observation")
+}
+
+// statThroughRoot opens an absolute path as the process sees it and returns the
+// opened file's identity. The open goes through the /proc/<pid>/root magic
+// link WITH ROOT-SCOPED RESOLUTION (openInRoot): a plain open of the joined
+// path would resolve an absolute symlink met on the way against the
+// inspector's root, so a config that is a symlink into a directory the service
+// has mounted differently would be opened in the inspector's namespace and
+// compare equal to a file the service never reads.
+func statThroughRoot(procDir, path string) (os.FileInfo, string) {
+	f, err := openInRoot(filepath.Join(procDir, "root"), path)
+	if err != nil {
+		return nil, fmt.Sprintf("the process's view of %s (through %s) could not be opened: %v", path, filepath.Join(procDir, "root"), err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Sprintf("the process's view of %s could not be read: %v", path, err)
+	}
+	return info, ""
 }
 
 // inspectRunningProcess binds a running process to the inspector's
@@ -762,12 +903,21 @@ func inspectRunningProcess(ctx context.Context, svc *inspectService, role, unit 
 	// THE COMMAND LINE MUST BE THE SUPPORTED SHAPE TOO: exactly
 	// `<managed path> <role> --config <path>`, so a process started some other
 	// way is could-not-tell rather than read for the first --config it carries.
-	why := "the process command line is not `" + installedBinary + " " + role + " --config <path>`"
+	why := "the process command line is not `" + installedBinary + " " + role + " --config <absolute path>`"
 	binding := unknown(why)
-	if len(sample.cmdline) != 4 || sample.cmdline[0] != installedBinary || sample.cmdline[1] != role || sample.cmdline[2] != "--config" {
+	switch {
+	case len(sample.cmdline) != 4 || sample.cmdline[0] != installedBinary || sample.cmdline[1] != role || sample.cmdline[2] != "--config":
 		svc.CmdlineConfigPath, svc.CmdlineMatchesUnit = unknown(why), unknown(why)
 		svc.ConfigSHA256, svc.ConfigChangedSinceStart = unknown(why), unknown(why)
-	} else {
+	case !filepath.IsAbs(sample.cmdline[3]):
+		// A relative path is relative to the process's working directory,
+		// which this inspector does not share; read here it would name a file
+		// the service never opened.
+		why = "the process's --config path is relative, so it cannot be compared with the inspector's"
+		binding = unknown(why)
+		svc.CmdlineConfigPath, svc.CmdlineMatchesUnit = unknown(why), unknown(why)
+		svc.ConfigSHA256, svc.ConfigChangedSinceStart = unknown(why), unknown(why)
+	default:
 		cmdlineConfig := sample.cmdline[3]
 		svc.CmdlineConfigPath = known(cmdlineConfig)
 		if unitConfigPath == "" {
@@ -775,8 +925,32 @@ func inspectRunningProcess(ctx context.Context, svc *inspectService, role, unit 
 		} else {
 			svc.CmdlineMatchesUnit = known(cmdlineConfig == unitConfigPath)
 		}
-		binding = known(cmdlineConfig == inspectorConfig)
-		svc.ConfigSHA256, svc.ConfigChangedSinceStart = fileHashAndChanged(cmdlineConfig, startedAt, startErr == nil)
+		// THE PATH AND THE FILE: the process must name the inspector's path,
+		// and the file its own root resolves that path to must be the
+		// inspector's file, or equal paths bind two configurations. Under
+		// another root or in another mount namespace a view that could not be
+		// opened cannot be compared and is could-not-tell.
+		inspectorInfo, statErr := os.Stat(inspectorConfig)
+		switch {
+		case cmdlineConfig != inspectorConfig:
+			binding = known(false)
+			svc.ConfigSHA256, svc.ConfigChangedSinceStart = fileHashAndChanged(cmdlineConfig, startedAt, startErr == nil)
+		case sample.viewErr != "":
+			why = sample.viewErr
+			binding = unknown(why)
+			svc.ConfigSHA256, svc.ConfigChangedSinceStart = unknown(why), unknown(why)
+		case statErr != nil:
+			why = fmt.Sprintf("stat %s: %v", inspectorConfig, statErr)
+			binding = unknown(why)
+			svc.ConfigSHA256, svc.ConfigChangedSinceStart = unknown(why), unknown(why)
+		case !os.SameFile(sample.view, inspectorInfo):
+			why = "the process's view of " + cmdlineConfig + " is not the inspector's file"
+			binding = known(false)
+			svc.ConfigSHA256, svc.ConfigChangedSinceStart = unknown(why), unknown(why)
+		default:
+			binding = known(true)
+			svc.ConfigSHA256, svc.ConfigChangedSinceStart = fileHashAndChanged(cmdlineConfig, startedAt, startErr == nil)
+		}
 	}
 	switch len(envFiles) {
 	case 0:
@@ -791,15 +965,12 @@ func inspectRunningProcess(ctx context.Context, svc *inspectService, role, unit 
 }
 
 // fileHashAndChanged hashes a file and says whether its mtime is later than the
-// process start. The mtime is REFUSAL EVIDENCE ONLY: a later mtime says the
-// file moved; an earlier one proves nothing about what the process loaded.
+// process start, both from ONE descriptor, so a rename between two operations
+// cannot pair the replacement's hash with the old file's mtime. The mtime is
+// REFUSAL EVIDENCE ONLY: a later mtime says the file moved; an earlier one
+// proves nothing about what the process loaded.
 func fileHashAndChanged(path string, startedAt time.Time, startKnown bool) (maybe, maybe) {
-	info, err := os.Stat(path)
-	if err != nil {
-		why := fmt.Sprintf("stat %s: %v", path, err)
-		return unknown(why), unknown(why)
-	}
-	sum, _, err := hashImage(path)
+	sum, info, err := hashImage(path)
 	if err != nil {
 		return unknown(err.Error()), unknown(err.Error())
 	}
@@ -826,6 +997,11 @@ func processStartTicks(dir string) (int64, error) {
 	// Field 3 (state) is fields[0], so field 22 is fields[19].
 	if len(fields) < 20 {
 		return 0, errors.New("the process stat is truncated")
+	}
+	// A zombie or a dead process keeps its start time, so equal ticks before
+	// and after would not prove the process lived through the sample.
+	if fields[0] == "Z" || fields[0] == "X" || fields[0] == "x" {
+		return 0, errors.New("the process is a zombie or dead (state " + fields[0] + ")")
 	}
 	ticks, err := strconv.ParseInt(fields[19], 10, 64)
 	if err != nil {
@@ -904,22 +1080,35 @@ func inspectDSN(env []byte, role string, cfg *config.Config, envFiles []string) 
 
 // environmentFileValue reads one variable out of a systemd environment file
 // written the way the role's template writes it, and VALIDATES THE WHOLE FILE
-// first: every line is blank, a comment, or `NAME=value`; a value is unquoted
-// with no quote, backslash or hash in it, or wholly quoted in one kind of quote
-// with none of that kind inside and no backslash; a name assigned twice is
-// refused, because systemd's last assignment wins and a reader that stopped at
-// the first would compare the wrong value. Anything else is unsupported
-// syntax, refused rather than read the way systemd might read it.
+// first. The grammar is exactly: a line is empty or whitespace, or a comment
+// beginning with # or ; in column 0, or `NAME=value` with NAME in column 0; a
+// value is unquoted with no leading or trailing whitespace and no quote,
+// backslash or hash in it, or wholly quoted in one kind of quote with none of
+// that kind and no backslash inside. systemd trims and unescapes more than
+// that, so anything outside the grammar is unsupported syntax, refused rather
+// than read the way systemd might read it, and a name assigned twice is refused
+// because systemd's last assignment wins.
 func environmentFileValue(path, name string) (string, bool, error) {
 	body, err := os.ReadFile(path)
 	if err != nil {
 		return "", false, err
 	}
+	// THE DELIMITERS FIRST: systemd treats a carriage return as a newline, so a
+	// CR inside a line this reader would skip as a comment hides an assignment
+	// systemd applies. Only LF-terminated, valid UTF-8 text with no control
+	// character (C0, DEL or C1) but LF and TAB is inside the grammar.
+	if !utf8.Valid(body) {
+		return "", false, errors.New("unsupported environment file syntax: not UTF-8")
+	}
+	for _, r := range string(body) {
+		if unicode.IsControl(r) && r != '\n' && r != '\t' {
+			return "", false, errors.New("unsupported environment file syntax: a control character")
+		}
+	}
 	seen := map[string]bool{}
 	value, found := "", false
 	for _, line := range strings.Split(string(body), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+		if strings.TrimSpace(line) == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
 			continue
 		}
 		k, v, ok := strings.Cut(line, "=")
@@ -943,9 +1132,9 @@ func environmentFileValue(path, name string) (string, bool, error) {
 
 var environmentNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
-// environmentValue is the restricted value grammar: unquoted with no quote,
-// backslash or hash, or wholly quoted in one kind with none of that kind
-// inside and no backslash.
+// environmentValue is the restricted value grammar: wholly quoted in one kind
+// with none of that kind and no backslash inside, or unquoted with no leading
+// or trailing whitespace and no quote, backslash or hash.
 func environmentValue(v string) (string, bool) {
 	if len(v) >= 2 && (v[0] == '"' || v[0] == '\'') && v[len(v)-1] == v[0] {
 		inner := v[1 : len(v)-1]
@@ -954,22 +1143,39 @@ func environmentValue(v string) (string, bool) {
 		}
 		return inner, true
 	}
-	if strings.ContainsAny(v, "\"'\\#") {
+	if v != strings.TrimSpace(v) || strings.ContainsAny(v, "\"'\\#") {
 		return "", false
 	}
 	return v, true
 }
 
 // inspectInstalledSection says which roles the inspector's configuration
-// declares; config_binding is what makes that the units' configuration too, so
-// a node-only host with a dormant packaged server unit is not mistaken for a
+// declares, and for a controller which ledger backend and controller mode;
+// config_binding is what makes that the units' configuration too, so a
+// node-only host with a dormant packaged server unit is not mistaken for a
 // controller.
 func inspectInstalledSection(cfg *config.Config, configPath string, loaded inspectConfig) inspectInstalledConfig {
+	// The digest is the file's, bracketed like every hash here, and is
+	// independent of any running process: a stopped host still answers what
+	// configuration it holds.
+	var digest maybe
+	if sum, _, err := hashImage(configPath); err != nil {
+		digest = unknown(err.Error())
+	} else {
+		digest = known(sum)
+	}
 	if cfg == nil {
 		why := fmt.Sprintf("load %s: %s", configPath, loaded.Error)
-		return inspectInstalledConfig{Path: known(configPath), HasServer: unknown(why), HasNode: unknown(why)}
+		return inspectInstalledConfig{Path: known(configPath), SHA256: digest, HasServer: unknown(why), HasNode: unknown(why),
+			LedgerBackend: unknown(why), Controllers: unknown(why)}
 	}
-	return inspectInstalledConfig{Path: known(configPath), HasServer: known(cfg.Server != nil), HasNode: known(cfg.Node != nil)}
+	out := inspectInstalledConfig{Path: known(configPath), SHA256: digest, HasServer: known(cfg.Server != nil), HasNode: known(cfg.Node != nil),
+		LedgerBackend: known(nil), Controllers: known(nil)}
+	if cfg.Server != nil {
+		out.LedgerBackend = known(string(cfg.Server.LedgerBackend()))
+		out.Controllers = known(string(cfg.Server.Controllers))
+	}
+	return out
 }
 
 // inspectHostSection reports identity and trust evidence from the disk, and
@@ -1020,7 +1226,7 @@ func inspectRetirement() maybe {
 	if hostOS == "darwin" {
 		return unknown("retirement is not tracked on darwin: a launch agent's account owns no /var/lib/billet")
 	}
-	body, err := os.ReadFile(retiredJournalPath)
+	body, err := readPublicFile(retiredJournalPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return known(nil)
@@ -1060,7 +1266,7 @@ func inspectAuthoritySection(stateDir string) maybe {
 }
 
 func inspectNodeTrustSection(certPath, caPath string) maybe {
-	leafPEM, err := os.ReadFile(certPath)
+	leafPEM, err := readPublicFile(certPath)
 	if err != nil {
 		return unknown(fmt.Sprintf("read %s: %v", certPath, err))
 	}
@@ -1068,7 +1274,7 @@ func inspectNodeTrustSection(certPath, caPath string) maybe {
 	if err != nil || len(leaves) != 1 {
 		return unknown(fmt.Sprintf("%s does not hold exactly one certificate", certPath))
 	}
-	caPEM, err := os.ReadFile(caPath)
+	caPEM, err := readPublicFile(caPath)
 	if err != nil {
 		return unknown(fmt.Sprintf("read %s: %v", caPath, err))
 	}

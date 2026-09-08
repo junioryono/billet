@@ -133,17 +133,18 @@ func (p publicAuthority) parse(stateDir string) (AuthoritySnapshot, error) {
 }
 
 // parseCertPEM parses EXACTLY one PEM certificate: a file holding a second
-// block, or anything but whitespace around the one block, is not a
-// certificate authority's public half and is refused rather than read for its
-// first block, because a caller that publishes the file's bytes would publish
-// the rest too.
+// block, a malformed block, or anything but whitespace around the one block,
+// is not a certificate authority's public half and is refused rather than read
+// for a block pem.Decode would recover to, because a caller that publishes the
+// file's bytes would publish the rest too.
 func parseCertPEM(body []byte) (*x509.Certificate, error) {
 	// isOnePEMBlock is the one answer to "is this file exactly one block":
-	// nothing skipped before it, nothing after it, no headers.
+	// nothing skipped before it, nothing after it, no headers, no malformed
+	// block pem.Decode would skip.
 	if !isOnePEMBlock(body, "CERTIFICATE") {
 		return nil, errors.New("not exactly one PEM certificate")
 	}
-	block, _ := pem.Decode(bytes.TrimSpace(body))
+	block, _, _ := decodeFirstPEM(skipBlankLines(body), "CERTIFICATE")
 	cert, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
 		return nil, fmt.Errorf("parse the certificate: %w", err)
@@ -152,26 +153,19 @@ func parseCertPEM(body []byte) (*x509.Certificate, error) {
 }
 
 // ParseCertificates parses every CERTIFICATE block in a PEM bundle, in order,
-// and refuses a bundle with none, with a block that is not a certificate, or
-// with any bytes between, before or after the blocks that are not whitespace
-// (pem.Decode skips such bytes silently, which is the trap isOnePEMBlock
-// documents).
+// and refuses a bundle with none, with a block that is not a certificate or
+// does not decode, or with any bytes between, before or after the blocks that
+// are not whitespace. pem.Decode skips such bytes, and a malformed block, to
+// reach the next BEGIN, which is the trap decodeFirstPEM exists to refuse.
 func ParseCertificates(body []byte) ([]*x509.Certificate, error) {
 	var out []*x509.Certificate
-	rest := bytes.TrimSpace(body)
+	rest := skipBlankLines(body)
 	for len(rest) != 0 {
-		if !bytes.HasPrefix(rest, []byte("-----BEGIN CERTIFICATE-----")) {
-			return nil, errors.New("wirecert: bytes that are not a PEM certificate block in the bundle")
+		block, after, ok := decodeFirstPEM(rest, "CERTIFICATE")
+		if !ok {
+			return nil, errors.New("wirecert: bytes that are not one well-formed PEM certificate block in the bundle")
 		}
-		var block *pem.Block
-		block, rest = pem.Decode(rest)
-		if block == nil {
-			return nil, errors.New("wirecert: a PEM block that does not decode in the bundle")
-		}
-		rest = bytes.TrimSpace(rest)
-		if block.Type != "CERTIFICATE" || len(block.Headers) != 0 {
-			return nil, fmt.Errorf("wirecert: a %s block where only certificates belong", block.Type)
-		}
+		rest = skipBlankLines(after)
 		cert, err := x509.ParseCertificate(block.Bytes)
 		if err != nil {
 			return nil, fmt.Errorf("wirecert: parse a certificate in the bundle: %w", err)
@@ -182,4 +176,68 @@ func ParseCertificates(body []byte) ([]*x509.Certificate, error) {
 		return nil, errors.New("wirecert: no certificate in the bundle")
 	}
 	return out, nil
+}
+
+// skipBlankLines drops whole lines holding only whitespace, and nothing else.
+// Go's decoder, and so the TLS loader, recognises a BEGIN marker only at the
+// start of the text or after a newline, so indentation before a BEGIN hides
+// the block from the loader and must hide it from this parser too, or the
+// report would publish a certificate the trust store does not hold; a blank
+// line between blocks hides nothing.
+func skipBlankLines(text []byte) []byte {
+	for {
+		nl := bytes.IndexByte(text, '\n')
+		if nl < 0 {
+			if len(bytes.TrimSpace(text)) == 0 {
+				return nil
+			}
+			return text
+		}
+		if len(bytes.TrimSpace(text[:nl])) != 0 {
+			return text
+		}
+		text = text[nl+1:]
+	}
+}
+
+// decodeFirstPEM decodes the block at the very start of text, refusing what
+// pem.Decode would forgive: text that does not begin with the BEGIN line of
+// the kind asked for, a block whose END line is missing or is not a whole line
+// (an END marker with more than whitespace after it on its line is a malformed
+// boundary that Go's decoder and the TLS loader refuse, so two blocks glued
+// together without a newline are not two blocks), a block that does not decode (pem.Decode skips
+// a malformed block and recovers at the next BEGIN, which would read a later
+// certificate as the first), a second BEGIN inside the span, or headers. rest
+// is what follows the END line's terminator.
+func decodeFirstPEM(text []byte, kind string) (*pem.Block, []byte, bool) {
+	begin := []byte("-----BEGIN " + kind + "-----")
+	end := []byte("-----END " + kind + "-----")
+	if !bytes.HasPrefix(text, begin) {
+		return nil, nil, false
+	}
+	endAt := bytes.Index(text, end)
+	if endAt < 0 {
+		return nil, nil, false
+	}
+	// Go's decoder lets the END line end in spaces or tabs; it is still the
+	// whole line, so they are consumed before the terminator is required.
+	after := bytes.TrimLeft(text[endAt+len(end):], " \t")
+	switch {
+	case len(after) == 0:
+	case bytes.HasPrefix(after, []byte("\n")):
+		after = after[1:]
+	case bytes.HasPrefix(after, []byte("\r\n")):
+		after = after[2:]
+	default:
+		return nil, nil, false
+	}
+	span := text[:endAt+len(end)]
+	if bytes.Count(span, []byte("-----BEGIN ")) != 1 {
+		return nil, nil, false
+	}
+	block, leftover := pem.Decode(span)
+	if block == nil || block.Type != kind || len(block.Headers) != 0 || len(bytes.TrimSpace(leftover)) != 0 {
+		return nil, nil, false
+	}
+	return block, after, true
 }

@@ -483,10 +483,15 @@ func refusePreviousPairThatIsNotOurs(dir, prevKeyPath, deployment string) error 
 // line wrapping, and refusing a legitimate retire over formatting is the failure
 // direction ADR-005 names — the next thing anybody does is delete the check.
 func isOnePEMBlock(body []byte, kind string) bool {
-	trimmed := bytes.TrimSpace(body)
+	// Whole blank lines only: an indented BEGIN is a block the TLS loader
+	// does not see, so it is not one block here either.
+	trimmed := skipBlankLines(body)
 
-	block, rest := pem.Decode(trimmed)
-	if block == nil || block.Type != kind || len(block.Headers) != 0 {
+	// decodeFirstPEM rather than pem.Decode, which skips a malformed block to
+	// recover at a later BEGIN and would call a file with garbage in front of
+	// its certificate one block.
+	block, rest, ok := decodeFirstPEM(trimmed, kind)
+	if !ok || block.Type != kind || len(block.Headers) != 0 {
 		return false
 	}
 
