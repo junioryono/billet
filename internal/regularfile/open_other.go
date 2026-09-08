@@ -22,6 +22,9 @@ func openForIdentity(path string, opts Options) (*os.File, error) {
 	return os.OpenFile(path, flags, 0)
 }
 
+// pseudoFilesystemName names no filesystem here: the denylist is Linux's.
+func pseudoFilesystemName(int64) string { return "" }
+
 // reopen duplicates the descriptor after the regular-file rule, so the readable
 // descriptor is THE SAME OPEN FILE and no pathname is resolved a second time; a
 // regular file reads normally through a non-blocking descriptor.

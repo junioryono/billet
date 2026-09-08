@@ -908,16 +908,9 @@ func readSecret(path string) ([]byte, error) {
 	// THE MODE IS JUDGED ON THE FILE THAT IS READ, not on the name's earlier
 	// answer: a regular 0644 key renamed over a regular 0600 one between the
 	// Lstat above and the open passes every check of the name and is refused
-	// here, on the descriptor's own fstat, before a byte of it is read.
-	body, read, err := readCappedInfo(path)
-	if err != nil {
-		return nil, err
-	}
-	if err := secretMode(path, read); err != nil {
-		return nil, err
-	}
-
-	return body, nil
+	// on the descriptor's own fstat, between the open and the read, so no byte
+	// of it is read.
+	return readCappedChecked(path, func(read os.FileInfo) error { return secretMode(path, read) })
 }
 
 // secretMode is the refusal of a private key readable by anyone else.
@@ -958,36 +951,42 @@ func readPublic(path string) ([]byte, error) {
 // regular file passes, and a check that must hold for the bytes read (a key's
 // mode) is made on the descriptor's own fstat by the caller.
 func readCapped(path string) ([]byte, error) {
-	body, _, err := readCappedInfo(path)
-	return body, err
+	return readCappedChecked(path, nil)
 }
 
-// readCappedInfo is readCapped returning the fstat of the descriptor it read.
-func readCappedInfo(path string) ([]byte, os.FileInfo, error) {
+// readCappedChecked is readCapped with a check of the opened descriptor's fstat
+// BETWEEN the open and the read, so a file the check refuses has no byte read.
+func readCappedChecked(path string, check func(os.FileInfo) error) ([]byte, error) {
 	if beforeContentRead != nil {
 		beforeContentRead(path)
 	}
 	f, info, err := regularfile.Open(path, regularfile.Options{NoFollow: true})
 	if err != nil {
 		if errors.Is(err, regularfile.ErrNotRegular) {
-			return nil, nil, fmt.Errorf("wirecert: %s is not a regular file: %w", path, err)
+			return nil, fmt.Errorf("wirecert: %s is not a regular file: %w", path, err)
 		}
 
-		return nil, nil, err
+		return nil, err
 	}
 	defer func() { _ = f.Close() }()
+
+	if check != nil {
+		if err := check(info); err != nil {
+			return nil, err
+		}
+	}
 
 	body, err := regularfile.ReadAllLimited(f, path, maxPEM)
 	if err != nil {
 		if errors.Is(err, regularfile.ErrTooLarge) {
-			return nil, nil, fmt.Errorf("wirecert: %s is larger than %d bytes, which no key or "+
+			return nil, fmt.Errorf("wirecert: %s is larger than %d bytes, which no key or "+
 				"certificate is", path, maxPEM)
 		}
 
-		return nil, nil, err
+		return nil, err
 	}
 
-	return body, info, nil
+	return body, nil
 }
 
 func writeSecret(path string, body []byte) error {

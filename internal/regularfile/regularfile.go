@@ -26,8 +26,11 @@
 // for the original.
 //
 // WHAT THIS DOES NOT BOUND: a read from ordinary storage that stalls (a network
-// filesystem, a failing disk) is not refused here; that residual is the
-// filesystem's and is said to be.
+// filesystem, a failing disk) is not refused here; the pseudo-filesystem rule is
+// an enumerated denylist, and one outside it that dispatches reads to a driver
+// would be read; and a write lease on the file is broken, not waited for: its
+// holder is signalled and the lease marked for downgrade before the kernel
+// answers EWOULDBLOCK. Each is the platform's residual and is said to be.
 package regularfile
 
 import (

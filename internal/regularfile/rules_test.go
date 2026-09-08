@@ -81,6 +81,20 @@ func TestARegularFileOnAPseudoFilesystemIsRefused(t *testing.T) {
 	}
 }
 
+// THE DENYLIST NAMES THE PSEUDO-FILESYSTEMS A SUPPORTED HOST MOUNTS, configfs
+// among them, whose regular-mode attributes dispatch reads to a subsystem; a
+// fixture cannot mount one, so the rule's table is what is asserted.
+func TestTheDenylistNamesTheKernelPseudoFilesystems(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("the denylist exists on Linux only")
+	}
+	for magic, name := range map[int64]string{0x62656570: "configfs", 0x9fa0: "procfs", 0x62656572: "sysfs"} {
+		if got := pseudoFilesystemName(magic); got != name {
+			t.Errorf("magic %#x is %q in the denylist, want %q", magic, got, name)
+		}
+	}
+}
+
 // THE READABLE DESCRIPTOR IS NON-BLOCKING ON LINUX, so a write lease another
 // process holds on the file answers EWOULDBLOCK instead of a wait.
 func TestTheReadableDescriptorIsNonBlocking(t *testing.T) {

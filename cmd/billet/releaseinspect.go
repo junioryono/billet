@@ -509,7 +509,7 @@ func inspectExecutableSection(report *inspectReport) (string, os.FileInfo) {
 	// regular-file rule, so a FIFO or a device there is could-not-tell.
 	hash := hashImage
 	if hostOS == "darwin" {
-		hash = hashRegular
+		hash = func(p string) (string, os.FileInfo, error) { return hashRegular(p, maxExecutableBytes) }
 	}
 	sum, info, err := hash(image)
 	if err != nil {
@@ -544,12 +544,16 @@ func hashImage(path string) (string, os.FileInfo, error) {
 		return "", nil, fmt.Errorf("open %s: %w", path, err)
 	}
 	defer func() { _ = f.Close() }()
-	return hashOpenFile(f, path)
+	return hashOpenFile(f, path, maxExecutableBytes)
 }
 
 // hashOpenFile is the bracketed hash of an already open descriptor: its own
 // stat before and after the read must agree in size and modification time.
-func hashOpenFile(f *os.File, path string) (string, os.FileInfo, error) {
+// THE READ IS BOUNDED BY ITS PURPOSE: a file longer than limit is refused, never
+// hashed as a prefix, because a prefix's digest describes a file that never was,
+// and an enormous or fast-growing regular file would otherwise cost the whole
+// of its bytes before any refusal.
+func hashOpenFile(f *os.File, path string, limit int64) (string, os.FileInfo, error) {
 	before, err := f.Stat()
 	if err != nil {
 		return "", nil, fmt.Errorf("stat %s: %w", path, err)
@@ -558,8 +562,12 @@ func hashOpenFile(f *os.File, path string) (string, os.FileInfo, error) {
 		inspectAfterOpen(path)
 	}
 	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
+	n, err := io.Copy(h, io.LimitReader(f, limit+1))
+	if err != nil {
 		return "", nil, fmt.Errorf("read %s: %w", path, err)
+	}
+	if n > limit {
+		return "", nil, fmt.Errorf("%s is %w of %d bytes", path, regularfile.ErrTooLarge, limit)
 	}
 	after, err := f.Stat()
 	if err != nil {
@@ -579,6 +587,9 @@ const (
 	maxEnvironmentBytes = 1 << 20
 	maxGuardBytes       = 64 << 10
 	maxPublicBytes      = 1 << 20
+	// maxExecutableBytes bounds the hash of an image or a recorded release
+	// executable; billet's own binary is under a tenth of it.
+	maxExecutableBytes = 1 << 30
 )
 
 // readRegularFile reads a whole file of at most limit bytes through openRegular
@@ -602,13 +613,13 @@ func readRegularFile(path string, limit int64) ([]byte, error) {
 // that is not a process image: an environment file, a recorded release
 // executable. The process images stay with hashImage, opened by their /proc
 // link path, which the kernel resolves to the executed inode.
-func hashRegular(path string) (string, os.FileInfo, error) {
+func hashRegular(path string, limit int64) (string, os.FileInfo, error) {
 	f, _, err := openRegular(path, false)
 	if err != nil {
 		return "", nil, err
 	}
 	defer func() { _ = f.Close() }()
-	return hashOpenFile(f, path)
+	return hashOpenFile(f, path, limit)
 }
 
 // inspectProvenanceSection computes the verdict the way provenance.Installed
@@ -1219,7 +1230,7 @@ func hashThroughRoot(procDir, path string) (os.FileInfo, string, string) {
 		return nil, "", fmt.Sprintf("the process's view of %s is not a regular file this inspector reads: %v", path, err)
 	}
 	defer func() { _ = r.Close() }()
-	sum, info, err := hashOpenFile(r, path)
+	sum, info, err := hashOpenFile(r, path, maxConfigBytes)
 	if err != nil {
 		return nil, "", fmt.Sprintf("the process's view of %s could not be read: %v", path, err)
 	}
@@ -1350,7 +1361,7 @@ func inspectRunningProcess(ctx context.Context, svc *inspectService, role, unit 
 // REFUSAL EVIDENCE ONLY: a later mtime says the file moved; an earlier one
 // proves nothing about what the process loaded.
 func fileHashAndChanged(path string, startedAt time.Time, startKnown bool) (maybe, maybe) {
-	sum, info, err := hashRegular(path)
+	sum, info, err := hashRegular(path, maxEnvironmentBytes)
 	if err != nil {
 		return unknown(err.Error()), unknown(err.Error())
 	}
@@ -1822,7 +1833,7 @@ func inspectGuardOf(active string) (maybe, maybe) {
 	case guard.ReleaseExecutable == "" || guard.ReleaseExecutableSHA256 == "":
 		out.ReleaseExecutableVerified = unknown("the guard records no release executable")
 	default:
-		sum, _, err := hashRegular(guard.ReleaseExecutable)
+		sum, _, err := hashRegular(guard.ReleaseExecutable, maxExecutableBytes)
 		if err != nil {
 			out.ReleaseExecutableVerified = unknown(err.Error())
 		} else {

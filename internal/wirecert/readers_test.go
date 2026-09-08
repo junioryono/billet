@@ -49,8 +49,11 @@ func TestReadSecretJudgesTheModeOfTheKeyItReads(t *testing.T) {
 	if err := os.WriteFile(key, []byte("secret\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	// THE LOOSE KEY IS LONGER THAN A KEY MAY BE, so a reader that read it before
+	// judging its mode would refuse it for its size and not for its mode: the
+	// mode refusal below is what proves no byte of it was read.
 	loose := filepath.Join(dir, "loose.key")
-	if err := os.WriteFile(loose, []byte("loose\n"), 0o644); err != nil {
+	if err := os.WriteFile(loose, []byte(strings.Repeat("l", maxPEM+2)), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	beforeContentRead = func(path string) {

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -1700,12 +1701,56 @@ func TestReleaseInspectRefusesAnInputLargerThanItsBound(t *testing.T) {
 		f.touchBeforeStart(t, f.configPath)
 		f.unitRunning(t, "billet-server.service", "server", f.configPath, []string{envFile})
 		f.process(t, []string{f.binPath, "server", "--config", f.configPath}, []string{"BILLET_PG_DSN=postgres://x"})
-		d, ok := mustKnown(t, "dsn_env", f.report(t).Services["server"].DSNEnv).(inspectDSNEnv)
+		svc := f.report(t).Services["server"]
+		d, ok := mustKnown(t, "dsn_env", svc.DSNEnv).(inspectDSNEnv)
 		if !ok {
 			t.Fatal("dsn_env is not a DSN report")
 		}
 		mustUnknown(t, "matches_file", d.MatchesFile, "larger than the limit")
+		// The hash of the environment file runs before the DSN read, and it is
+		// bounded too: an unbounded hash would consume the whole file first.
+		mustUnknown(t, "environment_file_changed_since_start", svc.EnvironmentFileChangedSinceRun, "larger than the limit")
 	})
+	t.Run("another configuration through the process's view", func(t *testing.T) {
+		f := newInspectFixture(t)
+		other := filepath.Join(f.dir, "other.yaml")
+		writeFile(t, other, "inspector: copy\n", 0o644)
+		view := filepath.Join(f.dir, "view")
+		writeFile(t, filepath.Join(view, other), "process: copy\n# "+strings.Repeat("x", maxConfigBytes)+"\n", 0o644)
+		f.unitRunning(t, "billet-server.service", "server", other, nil)
+		f.process(t, []string{f.binPath, "server", "--config", other}, nil)
+		f.processRoot(t, view)
+		mustUnknown(t, "config_sha256", f.report(t).Services["server"].ConfigSHA256, "larger than the limit")
+	})
+}
+
+// THE HASH READS AT MOST ONE BYTE PAST ITS BOUND: a file longer than the bound
+// is refused without its digest, and the bytes consumed are the bound plus one,
+// which the descriptor's offset shows.
+func TestHashOpenFileStopsAtItsBound(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "file")
+	writeFile(t, path, strings.Repeat("x", 4096), 0o644)
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+	if _, _, err := hashOpenFile(f, path, 100); err == nil || !strings.Contains(err.Error(), "larger than the limit") {
+		t.Fatalf("a file over the bound was hashed: %v", err)
+	}
+	offset, err := f.Seek(0, io.SeekCurrent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if offset != 101 {
+		t.Errorf("the hash consumed %d bytes of a file over a bound of 100, want exactly 101", offset)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	if sum, _, err := hashOpenFile(f, path, 4096); err != nil || sum != shaOf(strings.Repeat("x", 4096)) {
+		t.Errorf("a file exactly at the bound was refused or mis-hashed: %v", err)
+	}
 }
 
 // THE BYTES HASHED ARE THE FILE THE VIEW OPENED, not whatever the name holds
