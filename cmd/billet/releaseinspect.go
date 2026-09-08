@@ -69,7 +69,7 @@ var (
 	busctlBinary = "busctl"
 	// readPublicFile reads a certificate, a bundle's CA file or the retirement
 	// journal; a test records the paths to prove the key file is never asked for.
-	readPublicFile     = os.ReadFile
+	readPublicFile     = readRegularFile
 	retiredJournalPath = "/var/lib/billet/retired/journal.json"
 	// inspectSamples bounds how often a running process's image is re-read when
 	// the process changes under the observation.
@@ -436,7 +436,7 @@ type configObservation struct {
 // observeConfig reads the configuration through one descriptor, bracketed by
 // its metadata like every hash here, and hands the descriptor back open.
 func observeConfig(path string) (*configObservation, error) {
-	f, err := os.Open(path)
+	f, _, err := openRegular(path, false)
 	if err != nil {
 		return nil, err
 	}
@@ -561,6 +561,34 @@ func hashOpenFile(f *os.File, path string) (string, os.FileInfo, error) {
 		return "", nil, fmt.Errorf("%s changed while it was being read", path)
 	}
 	return hex.EncodeToString(h.Sum(nil)), after, nil
+}
+
+// readRegularFile reads a whole file through openRegular (releaserecord.go): EVERY
+// FILE THE INSPECTOR READS BY PATHNAME goes through that one open, non-blocking
+// and then fstat'ed, because the inspector's inputs are named by its
+// configuration or by systemd's answer, and a plain open of a FIFO at any of
+// them blocks before any stat, which neither the sample count nor systemctl's
+// timeout bounds. A special file is could-not-tell with the reason instead.
+func readRegularFile(path string) ([]byte, error) {
+	f, _, err := openRegular(path, false)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+	return io.ReadAll(f)
+}
+
+// hashRegular is the bracketed hash of a file the inspector names by path and
+// that is not a process image: an environment file, a recorded release
+// executable. The process images stay with hashImage, opened by their /proc
+// link path, which the kernel resolves to the executed inode.
+func hashRegular(path string) (string, os.FileInfo, error) {
+	f, _, err := openRegular(path, false)
+	if err != nil {
+		return "", nil, err
+	}
+	defer func() { _ = f.Close() }()
+	return hashOpenFile(f, path)
 }
 
 // inspectProvenanceSection computes the verdict the way provenance.Installed
@@ -1296,7 +1324,7 @@ func inspectRunningProcess(ctx context.Context, svc *inspectService, role, unit 
 // REFUSAL EVIDENCE ONLY: a later mtime says the file moved; an earlier one
 // proves nothing about what the process loaded.
 func fileHashAndChanged(path string, startedAt time.Time, startKnown bool) (maybe, maybe) {
-	sum, info, err := hashImage(path)
+	sum, info, err := hashRegular(path)
 	if err != nil {
 		return unknown(err.Error()), unknown(err.Error())
 	}
@@ -1415,7 +1443,7 @@ func inspectDSN(env []byte, role string, cfg *config.Config, envFiles []string) 
 // than read the way systemd might read it, and a name assigned twice is refused
 // because systemd's last assignment wins.
 func environmentFileValue(path, name string) (string, bool, error) {
-	body, err := os.ReadFile(path)
+	body, err := readRegularFile(path)
 	if err != nil {
 		return "", false, err
 	}
@@ -1558,7 +1586,7 @@ func inspectRetirement() maybe {
 	}
 	body, err := readPublicFile(retiredJournalPath)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, fs.ErrNotExist) {
 			return known(nil)
 		}
 		return unknown(fmt.Sprintf("read %s: %v", retiredJournalPath, err))
@@ -1641,7 +1669,7 @@ func inspectTransactionSection() inspectTransaction {
 	tx := inspectTransaction{}
 	rootInfo, err := os.Lstat(upgradeRoot)
 	switch {
-	case err != nil && os.IsNotExist(err):
+	case err != nil && errors.Is(err, fs.ErrNotExist):
 		tx.Root = "absent"
 		tx.Active, tx.LockHeld = known("none"), known(false)
 		tx.Journal, tx.ConvergeGuard = known(nil), known(nil)
@@ -1664,7 +1692,7 @@ func inspectTransactionSection() inspectTransaction {
 	active := activePath()
 	info, err := os.Lstat(active)
 	switch {
-	case err != nil && os.IsNotExist(err):
+	case err != nil && errors.Is(err, fs.ErrNotExist):
 		tx.Active, tx.Journal, tx.ConvergeGuard = known("none"), known(nil), known(nil)
 	case err != nil:
 		tx.Active, tx.Journal, tx.ConvergeGuard = unknown(err.Error()), unknown(err.Error()), unknown(err.Error())
@@ -1691,7 +1719,7 @@ func exists(path string) maybe {
 	switch {
 	case err == nil:
 		return known(true)
-	case os.IsNotExist(err):
+	case errors.Is(err, fs.ErrNotExist):
 		return known(false)
 	default:
 		return unknown(fmt.Sprintf("lstat %s: %v", path, err))
@@ -1701,9 +1729,9 @@ func exists(path string) maybe {
 // inspectLockHeld tries the transaction lock non-blocking through a read-only
 // descriptor and releases it at once; an absent lock file is held by nobody.
 func inspectLockHeld() maybe {
-	f, err := os.OpenFile(filepath.Join(upgradeRoot, txLockName), os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	f, _, err := openRegular(filepath.Join(upgradeRoot, txLockName), true)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, fs.ErrNotExist) {
 			return known(false)
 		}
 		return unknown(fmt.Sprintf("open the transaction lock: %v", err))
@@ -1739,9 +1767,9 @@ func inspectJournalOf(active string) maybe {
 // inspectGuardOf classifies a directory claim: guard.json makes it a converge
 // guard, its absence an unpublished one that a hold never returned from.
 func inspectGuardOf(active string) (maybe, maybe) {
-	body, err := os.ReadFile(filepath.Join(active, "guard.json"))
+	body, err := readRegularFile(filepath.Join(active, "guard.json"))
 	switch {
-	case err != nil && os.IsNotExist(err):
+	case err != nil && errors.Is(err, fs.ErrNotExist):
 		return known("unpublished-guard"), known(nil)
 	case err != nil:
 		return unknown(fmt.Sprintf("read the guard: %v", err)), unknown(err.Error())
@@ -1768,7 +1796,7 @@ func inspectGuardOf(active string) (maybe, maybe) {
 	case guard.ReleaseExecutable == "" || guard.ReleaseExecutableSHA256 == "":
 		out.ReleaseExecutableVerified = unknown("the guard records no release executable")
 	default:
-		sum, _, err := hashImage(guard.ReleaseExecutable)
+		sum, _, err := hashRegular(guard.ReleaseExecutable)
 		if err != nil {
 			out.ReleaseExecutableVerified = unknown(err.Error())
 		} else {

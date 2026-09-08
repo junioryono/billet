@@ -22,12 +22,12 @@ import (
 // IS O_PATH: it names the inode without opening it for reading, so a FIFO the
 // process's namespace puts at that name cannot block the inspector waiting for
 // a writer and a device node gets no open of its own; reopenForReading is the
-// one step from there to bytes. A kernel without openat2 (before 5.6) answers
-// ENOSYS, which the caller reports as could-not-tell.
+// one step from there to bytes. A kernel without openat2 (before 5.6) answers ENOSYS, which
+// the caller reports as could-not-tell.
 func openInRoot(rootLink, path string) (*os.File, error) {
 	rootFD, err := unix.Open(rootLink, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return nil, fmt.Errorf("open the process root %s: %w", rootLink, err)
+		return nil, fmt.Errorf("open %s: %w", rootLink, err)
 	}
 	defer unix.Close(rootFD)
 	how := unix.OpenHow{
@@ -36,7 +36,7 @@ func openInRoot(rootLink, path string) (*os.File, error) {
 	}
 	fd, err := unix.Openat2(rootFD, strings.TrimPrefix(path, "/"), &how)
 	if err != nil {
-		return nil, fmt.Errorf("open %s under the process root %s: %w", path, rootLink, err)
+		return nil, fmt.Errorf("open %s under %s: %w", path, rootLink, err)
 	}
 	return os.NewFile(uintptr(fd), path), nil
 }
@@ -52,7 +52,7 @@ func reopenForReading(f *os.File) (*os.File, error) {
 		return nil, err
 	}
 	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("not a regular file (%s)", info.Mode().Type())
+		return nil, &os.PathError{Op: "open", Path: f.Name(), Err: fmt.Errorf("not a regular file (%s)", info.Mode().Type())}
 	}
 	// The name is this process's own descriptor number and nothing from the
 	// host: the reopen is of an inode already held, never a path resolved again.

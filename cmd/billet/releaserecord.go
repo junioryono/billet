@@ -26,7 +26,7 @@ import (
 // is refused outright: a FIFO named as a manifest never ends, and this command
 // runs at the end of an install where hanging is indistinguishable from working.
 func readBounded(path string, limit int) ([]byte, error) {
-	f, _, err := openRegular(path)
+	f, _, err := openRegular(path, false)
 	if err != nil {
 		return nil, err
 	}
@@ -59,8 +59,16 @@ func readBounded(path string, limit int) ([]byte, error) {
 // FSTAT ON THE DESCRIPTOR, NOT STAT ON THE PATH, so what is refused and what is
 // read are the same object. A stat of the name answers about whatever the name
 // meant at that instant.
-func openRegular(path string) (*os.File, int64, error) {
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+//
+// noFollow refuses a symlink at the last component, which the upgrade
+// transaction's lock file requires; everything else follows a symlink the way
+// the process that named the path would.
+func openRegular(path string, noFollow bool) (*os.File, int64, error) {
+	flags := os.O_RDONLY | syscall.O_NONBLOCK
+	if noFollow {
+		flags |= syscall.O_NOFOLLOW
+	}
+	f, err := os.OpenFile(path, flags, 0)
 	if err != nil {
 		return nil, 0, fmt.Errorf("open %s: %w", path, err)
 	}
@@ -518,7 +526,7 @@ func cmdReleaseRecord(_ context.Context, args []string) error {
 	// on its own — a rename is closed, but another writer can still modify the same
 	// inode between the passes — so there is only ONE pass, and the archive's hash
 	// comes out of the same read that finds its member.
-	archive, archiveSize, err := openRegular(*archivePath)
+	archive, archiveSize, err := openRegular(*archivePath, false)
 	if err != nil {
 		return err
 	}
@@ -543,7 +551,7 @@ func cmdReleaseRecord(_ context.Context, args []string) error {
 
 	// THE SAME TREATMENT AS THE ARCHIVE: opened once, refused if it is not an
 	// ordinary file, and hashed from that descriptor.
-	binaryFile, binarySize, err := openRegular(*binaryPath)
+	binaryFile, binarySize, err := openRegular(*binaryPath, false)
 	if err != nil {
 		return err
 	}

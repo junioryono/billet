@@ -85,9 +85,11 @@ func newInspectFixture(t *testing.T) *inspectFixture {
 		f.opened = append(f.opened, path)
 		return os.Open(path)
 	}
+	// The recorder wraps the PRODUCTION reader, so the regular-file rule it
+	// applies (a FIFO is could-not-tell, not a wait) is what the fixtures run.
 	readPublicFile = func(path string) ([]byte, error) {
 		f.read = append(f.read, path)
-		return os.ReadFile(path)
+		return readRegularFile(path)
 	}
 
 	writeFile(t, f.binPath, "IMAGE-A\n", 0o755)
@@ -1235,7 +1237,7 @@ func TestReleaseInspectTypesTheConfigurationsPresence(t *testing.T) {
 	if r.Config.Presence != "unreadable" || r.Config.Readable {
 		t.Errorf("config = %+v, want unreadable for a directory at the path", r.Config)
 	}
-	mustUnknown(t, "installed_config.sha256", r.Installed.SHA256, "is a directory")
+	mustUnknown(t, "installed_config.sha256", r.Installed.SHA256, "not a regular file")
 }
 
 // A PROCESS WHOSE --config IS RELATIVE CANNOT BE COMPARED: it is relative to a
@@ -1331,9 +1333,11 @@ func TestReleaseInspectResolvesTheProcessViewUnderItsRoot(t *testing.T) {
 // following it into the filesystem would read whatever it names, a key
 // included.
 func TestReleaseInspectNeverOpensAnUnsupportedCommandsOperand(t *testing.T) {
-	// Each case is wrong in ONE word of the shape, so a gate that dropped one
-	// comparison would let its case through; the last two are the supported
-	// four words with an empty fifth, which a lossy argv decoding would erase.
+	// The first case is another program altogether (the legacy fixture); each
+	// of the next three is wrong in ONE word of the shape, so a gate that
+	// dropped one comparison would let its case through; the last two are the
+	// supported four words with an empty fifth, which a lossy argv decoding
+	// would erase.
 	for _, name := range []string{"another program", "another executable path", "another role", "another flag",
 		"a trailing empty argument", "two trailing empty arguments"} {
 		t.Run(name, func(t *testing.T) {
@@ -1396,7 +1400,7 @@ func TestReleaseInspectRefusesASpecialFileInTheProcessView(t *testing.T) {
 			t.Fatal(err)
 		}
 		f.processRoot(t, view)
-		blocked := unblockFIFOAfter(t, fifo, fifoPatience)
+		blocked := unblockFIFOAfter(t, fifo)
 		r := f.report(t)
 		if blocked() {
 			t.Fatal("the inspector blocked opening the FIFO for reading until the test wrote to it")
@@ -1420,7 +1424,7 @@ func TestReleaseInspectRefusesASpecialFileInTheProcessView(t *testing.T) {
 		f.unitRunning(t, "billet-server.service", "server", other, nil)
 		f.process(t, []string{f.binPath, "server", "--config", other}, nil)
 		f.processRoot(t, view)
-		blocked := unblockFIFOAfter(t, fifo, fifoPatience)
+		blocked := unblockFIFOAfter(t, fifo)
 		svc := f.report(t).Services["server"]
 		if blocked() {
 			t.Fatal("the inspector blocked opening the FIFO for reading until the test wrote to it")
@@ -1440,12 +1444,14 @@ const fifoPatience = 5 * time.Second
 // test named (which is how the special-file mutant was first caught). The
 // returned function stops the writer and says whether it ever had to act; a
 // correct inspector returns long before the deadline and it never does.
-func unblockFIFOAfter(t *testing.T, fifo string, after time.Duration) func() bool {
+func unblockFIFOAfter(t *testing.T, fifo string) func() bool {
 	t.Helper()
 	stop := make(chan struct{})
+	done := make(chan struct{})
 	var acted atomic.Bool
 	go func() {
-		timer := time.NewTimer(after)
+		defer close(done)
+		timer := time.NewTimer(fifoPatience)
 		defer timer.Stop()
 		select {
 		case <-stop:
@@ -1473,7 +1479,135 @@ func unblockFIFOAfter(t *testing.T, fifo string, after time.Duration) func() boo
 	var once sync.Once
 	return func() bool {
 		once.Do(func() { close(stop) })
+		// The worker's open wakes the reader BEFORE the worker records that it
+		// acted; joining it is what makes the answer the worker's last word.
+		<-done
 		return acted.Load()
+	}
+}
+
+// THE INSPECTOR'S OWN INPUTS ARE OPENED FOR IDENTITY FIRST: its configuration,
+// the transaction lock, an environment file systemd names and a certificate
+// bundle the configuration names are each a pathname a host could put a FIFO
+// at, and a plain open of a FIFO blocks before any stat, which nothing else in
+// the report bounds. Each is could-not-tell with the reason, and none waits.
+func TestReleaseInspectRefusesASpecialFileAtItsOwnInputs(t *testing.T) {
+	t.Run("the configuration", func(t *testing.T) {
+		f := newInspectFixture(t)
+		if err := os.Remove(f.configPath); err != nil {
+			t.Fatal(err)
+		}
+		if err := syscall.Mkfifo(f.configPath, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		blocked := unblockFIFOAfter(t, f.configPath)
+		r := f.report(t)
+		if blocked() {
+			t.Fatal("the inspector blocked opening its configuration for reading until the test wrote to it")
+		}
+		if r.Config.Presence != "unreadable" || !strings.Contains(r.Config.Error, "not a regular file") {
+			t.Errorf("config = %+v, want presence unreadable for a FIFO with the reason", r.Config)
+		}
+		if r.ConfigBinding.known {
+			t.Errorf("config_binding = %v, want unknown when the configuration could not be read", r.ConfigBinding.value)
+		}
+	})
+	t.Run("the transaction lock", func(t *testing.T) {
+		f := newInspectFixture(t)
+		lockPath := filepath.Join(upgradeRoot, txLockName)
+		if err := os.MkdirAll(upgradeRoot, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := syscall.Mkfifo(lockPath, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		blocked := unblockFIFOAfter(t, lockPath)
+		r := f.report(t)
+		if blocked() {
+			t.Fatal("the inspector blocked opening the transaction lock until the test wrote to it")
+		}
+		mustUnknown(t, "lock_held", r.Transaction.LockHeld, "not a regular file")
+	})
+	t.Run("an environment file", func(t *testing.T) {
+		f := newInspectFixture(t)
+		f.writeConfig(t, f.postgresConfig())
+		envFile := filepath.Join(f.dir, "server.env")
+		if err := syscall.Mkfifo(envFile, 0o640); err != nil {
+			t.Fatal(err)
+		}
+		f.touchBeforeStart(t, f.configPath)
+		f.unitRunning(t, "billet-server.service", "server", f.configPath, []string{envFile})
+		f.process(t, []string{f.binPath, "server", "--config", f.configPath}, []string{"BILLET_PG_DSN=postgres://x"})
+		blocked := unblockFIFOAfter(t, envFile)
+		svc := f.report(t).Services["server"]
+		if blocked() {
+			t.Fatal("the inspector blocked opening the environment file until the test wrote to it")
+		}
+		d, ok := mustKnown(t, "dsn_env", svc.DSNEnv).(inspectDSNEnv)
+		if !ok {
+			t.Fatal("dsn_env is not a DSN report")
+		}
+		mustUnknown(t, "matches_file", d.MatchesFile, "not a regular file")
+		mustUnknown(t, "environment_file_changed_since_start", svc.EnvironmentFileChangedSinceRun, "not a regular file")
+	})
+	t.Run("a certificate bundle", func(t *testing.T) {
+		f := newInspectFixture(t)
+		ca, err := wirecert.LoadOrCreateCA(f.stateDir, "dep-1234")
+		if err != nil {
+			t.Fatal(err)
+		}
+		bundle, err := ca.IssueNode("node-a")
+		if err != nil {
+			t.Fatal(err)
+		}
+		cert, key, caFile := filepath.Join(f.dir, "node.crt"), filepath.Join(f.dir, "node.key"), filepath.Join(f.dir, "ca.crt")
+		writeFile(t, cert, string(bundle.CertPEM), 0o644)
+		writeFile(t, key, string(bundle.KeyPEM), 0o600)
+		if err := syscall.Mkfifo(caFile, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		f.writeConfig(t, f.nodeTLSConfig(cert, key, caFile))
+		f.unitAbsent(t, "billet-server.service")
+		blocked := unblockFIFOAfter(t, caFile)
+		r := f.report(t)
+		if blocked() {
+			t.Fatal("the inspector blocked opening the bundle's CA file until the test wrote to it")
+		}
+		mustUnknown(t, "node_trust", r.Host.NodeTrust, "not a regular file")
+	})
+}
+
+// THE BYTES HASHED ARE THE FILE THE VIEW OPENED, not whatever the name holds
+// afterwards: the identity descriptor is reopened on the same inode (through
+// /proc/self/fd on Linux, by duplication elsewhere), so a replacement renamed
+// over the name between the identity open and the read is not read for the
+// original. A reopen by pathname would pass every other view test and
+// reintroduce that race.
+func TestReleaseInspectHashesTheViewItOpenedNotTheNameAfterwards(t *testing.T) {
+	f := newInspectFixture(t)
+	other := filepath.Join(f.dir, "other.yaml")
+	writeFile(t, other, "inspector: copy\n", 0o644)
+	view := filepath.Join(f.dir, "view")
+	writeFile(t, filepath.Join(view, other), "process: copy A\n", 0o644)
+	writeFile(t, filepath.Join(view, other+".next"), "process: copy B\n", 0o644)
+	f.unitRunning(t, "billet-server.service", "server", other, nil)
+	f.process(t, []string{f.binPath, "server", "--config", other}, nil)
+	f.processRoot(t, view)
+	renamed := 0
+	inspectAfterViewOpen = func(path string) {
+		if path != other {
+			return
+		}
+		if err := os.Rename(filepath.Join(view, other+".next"), filepath.Join(view, other)); err == nil {
+			renamed++
+		}
+	}
+	r := f.report(t)
+	if renamed != 1 {
+		t.Fatalf("the replacement was renamed over the view %d times, want once between the identity open and the read", renamed)
+	}
+	if got := mustKnown(t, "config_sha256", r.Services["server"].ConfigSHA256); got != shaOf("process: copy A\n") {
+		t.Errorf("config_sha256 = %v, want the digest of the file the view opened, not of the replacement renamed over its name", got)
 	}
 }
 
@@ -2125,21 +2259,20 @@ func TestReleaseInspectReadsTheFilesystemOnlyWhereListed(t *testing.T) {
 		}
 	}
 	sort.Strings(aliases)
-	if strings.Join(aliases, "\n") != "openImage = os.Open\nreadPublicFile     = os.ReadFile" {
-		t.Errorf("os function aliases in releaseinspect.go:\n%s\nwant exactly the two seams", strings.Join(aliases, "\n"))
+	if strings.Join(aliases, "\n") != "openImage = os.Open" {
+		t.Errorf("os function aliases in releaseinspect.go:\n%s\nwant exactly the image seam (the public-read seam is readRegularFile, not an os function)", strings.Join(aliases, "\n"))
 	}
 	sort.Strings(got)
+	// EVERY PATHNAME THE INSPECTOR READS goes through openRegular (its
+	// configuration, the lock, an environment file, the guard, a bundle);
+	// what remains here is /proc, whose files the kernel serves, and stats.
 	want := []string{
 		`_, err := os.Lstat(path)`,
-		`body, err := os.ReadFile(filepath.Join(active, "guard.json"))`,
 		`body, err := os.ReadFile(filepath.Join(dir, "stat"))`,
-		`body, err := os.ReadFile(path)`,
 		`cmdlineBody, err := os.ReadFile(filepath.Join(dir, "cmdline"))`,
 		`dir, err := os.Readlink(active)`,
 		`environ, err := os.ReadFile(filepath.Join(dir, "environ"))`,
 		`f, err := os.Open(filepath.Join(procRoot, "stat"))`,
-		`f, err := os.Open(path)`,
-		`f, err := os.OpenFile(filepath.Join(upgradeRoot, txLockName), os.O_RDONLY|syscall.O_NOFOLLOW, 0)`,
 		`info, err := os.Lstat(active)`,
 		`installed, err := os.Stat(installedBinary)`,
 		`pathInfo, err := os.Stat(configPath)`,
@@ -2147,6 +2280,28 @@ func TestReleaseInspectReadsTheFilesystemOnlyWhereListed(t *testing.T) {
 	}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Errorf("direct filesystem calls in releaseinspect.go:\n%s\nwant exactly:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+	// The platform files hold the view's identity open and its reopen, and
+	// nothing else that names a path: the Linux reopen is of this process's own
+	// descriptor, and the other build's one os call is the resolved view. The
+	// inspector's own inputs go through openRegular in releaserecord.go.
+	for file, want := range map[string][]string{
+		"releaseinspect_linux.go": {`return os.Open(fmt.Sprintf("/proc/self/fd/%d", f.Fd())) //nolint:gosec // built from the held descriptor's number, not from any input`},
+		"releaseinspect_other.go": {`return os.OpenFile(resolved, os.O_RDONLY|syscall.O_NONBLOCK, 0)`},
+	} {
+		src, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got []string
+		for _, line := range strings.Split(string(src), "\n") {
+			if call.MatchString(line) {
+				got = append(got, strings.TrimSpace(line))
+			}
+		}
+		if strings.Join(got, "\n") != strings.Join(want, "\n") {
+			t.Errorf("direct filesystem calls in %s:\n%s\nwant exactly:\n%s", file, strings.Join(got, "\n"), strings.Join(want, "\n"))
+		}
 	}
 }
 
