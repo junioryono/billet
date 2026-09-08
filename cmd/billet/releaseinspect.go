@@ -92,6 +92,10 @@ var (
 	// inspectBetweenClosingChecks runs between the closing check of the
 	// descriptor and the closing stat of the name.
 	inspectBetweenClosingChecks func()
+	// inspectAfterViewOpen runs after a process's view of a path has been
+	// opened, for identity or for reading, so a test can prove an unsupported
+	// command line's operand is never opened at all.
+	inspectAfterViewOpen func(path string)
 )
 
 // inspectSchema is the report's schema version; a field renamed or removed
@@ -1046,7 +1050,16 @@ func sampleProcess(ctx context.Context, unit, role string, pid int, first map[st
 		if err != nil {
 			return processSample{}, fmt.Errorf("read the process environment: %w", err)
 		}
-		args := strings.Split(strings.TrimRight(string(cmdlineBody), "\x00"), "\x00")
+		// EVERY ARGUMENT IS KEPT, EMPTY ONES INCLUDED: the kernel writes each
+		// argument NUL-terminated, so exactly one terminator comes off and the
+		// rest splits; trimming every trailing NUL would erase a trailing empty
+		// argument and let a five-argument command line pass as the supported
+		// four.
+		body := string(cmdlineBody)
+		if body == "" || !strings.HasSuffix(body, "\x00") {
+			return processSample{}, errors.New("the process command line is empty or not NUL-terminated")
+		}
+		args := strings.Split(body[:len(body)-1], "\x00")
 		// THE PROCESS'S OWN VIEW OF ITS CONFIG PATH. An absolute path in its
 		// command line is resolved under its root and inside its mount
 		// namespace, where a RootDirectory, a bind mount or an extension
@@ -1097,13 +1110,6 @@ func sampleProcess(ctx context.Context, unit, role string, pid int, first map[st
 	return processSample{}, errors.New("the service restarted during the observation, or its unit changed under it")
 }
 
-// hashThroughRoot opens an absolute path as the process sees it and returns the
-// opened file's identity and bracketed digest. The open goes through the
-// /proc/<pid>/root magic link WITH ROOT-SCOPED RESOLUTION (openInRoot): a plain open of the joined
-// path would resolve an absolute symlink met on the way against the
-// inspector's root, so a config that is a symlink into a directory the service
-// has mounted differently would be opened in the inspector's namespace and
-// compare equal to a file the service never reads.
 // supportedCmdlineWords is the four-word shape billet ships, `<managed path>
 // <role> --config <path>`, without regard to the path's form.
 func supportedCmdlineWords(args []string, role string) bool {
@@ -1125,6 +1131,9 @@ func statThroughRoot(procDir, path string) (os.FileInfo, string) {
 		return nil, fmt.Sprintf("the process's view of %s (through %s) could not be opened: %v", path, filepath.Join(procDir, "root"), err)
 	}
 	defer func() { _ = f.Close() }()
+	if inspectAfterViewOpen != nil {
+		inspectAfterViewOpen(path)
+	}
 	info, err := f.Stat()
 	if err != nil {
 		return nil, fmt.Sprintf("the process's view of %s could not be read: %v", path, err)
@@ -1132,13 +1141,31 @@ func statThroughRoot(procDir, path string) (os.FileInfo, string) {
 	return info, ""
 }
 
+// hashThroughRoot opens an absolute path as the process sees it and returns the
+// opened file's identity and bracketed digest. The open goes through the
+// /proc/<pid>/root magic link WITH ROOT-SCOPED RESOLUTION (openInRoot): a plain
+// open of the joined path would resolve an absolute symlink met on the way
+// against the inspector's root, so a config that is a symlink into a directory
+// the service has mounted differently would be opened in the inspector's
+// namespace and compare equal to a file the service never reads. The identity
+// descriptor is reopened for reading on the same inode, and only when it is a
+// regular file: a FIFO or a device at that name is could-not-tell, never a wait
+// or an open with a side effect.
 func hashThroughRoot(procDir, path string) (os.FileInfo, string, string) {
 	f, err := openInRoot(filepath.Join(procDir, "root"), path)
 	if err != nil {
 		return nil, "", fmt.Sprintf("the process's view of %s (through %s) could not be opened: %v", path, filepath.Join(procDir, "root"), err)
 	}
 	defer func() { _ = f.Close() }()
-	sum, info, err := hashOpenFile(f, path)
+	if inspectAfterViewOpen != nil {
+		inspectAfterViewOpen(path)
+	}
+	r, err := reopenForReading(f)
+	if err != nil {
+		return nil, "", fmt.Sprintf("the process's view of %s is not a regular file this inspector reads: %v", path, err)
+	}
+	defer func() { _ = r.Close() }()
+	sum, info, err := hashOpenFile(r, path)
 	if err != nil {
 		return nil, "", fmt.Sprintf("the process's view of %s could not be read: %v", path, err)
 	}

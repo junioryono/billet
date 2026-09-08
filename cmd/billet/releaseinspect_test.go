@@ -12,6 +12,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -75,8 +77,10 @@ func newInspectFixture(t *testing.T) *inspectFixture {
 	upgradeRoot = filepath.Join(dir, "upgrades")
 	provenance.Path = filepath.Join(dir, "installed.json")
 	inspectAfterOpen = nil
-	inspectAfterConfig, inspectBeforeClose, inspectBetweenClosingChecks = nil, nil, nil
-	t.Cleanup(func() { inspectAfterConfig, inspectBeforeClose, inspectBetweenClosingChecks = nil, nil, nil })
+	inspectAfterConfig, inspectBeforeClose, inspectBetweenClosingChecks, inspectAfterViewOpen = nil, nil, nil, nil
+	t.Cleanup(func() {
+		inspectAfterConfig, inspectBeforeClose, inspectBetweenClosingChecks, inspectAfterViewOpen = nil, nil, nil, nil
+	})
 	openImage = func(path string) (*os.File, error) {
 		f.opened = append(f.opened, path)
 		return os.Open(path)
@@ -1327,21 +1331,150 @@ func TestReleaseInspectResolvesTheProcessViewUnderItsRoot(t *testing.T) {
 // following it into the filesystem would read whatever it names, a key
 // included.
 func TestReleaseInspectNeverOpensAnUnsupportedCommandsOperand(t *testing.T) {
+	// Each case is wrong in ONE word of the shape, so a gate that dropped one
+	// comparison would let its case through; the last two are the supported
+	// four words with an empty fifth, which a lossy argv decoding would erase.
+	for _, name := range []string{"another program", "another executable path", "another role", "another flag",
+		"a trailing empty argument", "two trailing empty arguments"} {
+		t.Run(name, func(t *testing.T) {
+			f := newInspectFixture(t)
+			key := filepath.Join(f.dir, "node.key")
+			writeFile(t, key, "-----BEGIN PRIVATE KEY-----\nnot really\n-----END PRIVATE KEY-----\n", 0o600)
+			cmdline := map[string][]string{
+				"another program":              {"/usr/local/bin/helper", "serve", "--key", key},
+				"another executable path":      {f.binPath + "-other", "server", "--config", key},
+				"another role":                 {f.binPath, "node", "--config", key},
+				"another flag":                 {f.binPath, "server", "--conf", key},
+				"a trailing empty argument":    {f.binPath, "server", "--config", key, ""},
+				"two trailing empty arguments": {f.binPath, "server", "--config", key, "", ""},
+			}[name]
+			f.process(t, cmdline, nil)
+			opens, reads := 0, 0
+			inspectAfterViewOpen = func(path string) {
+				if path == key {
+					opens++
+				}
+			}
+			inspectAfterOpen = func(path string) {
+				if path == key {
+					reads++
+				}
+			}
+			r := f.report(t)
+			if opens != 0 || reads != 0 {
+				t.Errorf("the unsupported command's operand was opened %d times and read %d times, want never", opens, reads)
+			}
+			mustUnknown(t, "cmdline_config_path", r.Services["server"].CmdlineConfigPath, "not `")
+			mustUnknown(t, "config_binding", r.ConfigBinding, "not `")
+		})
+	}
+}
+
+// A TRAILING EMPTY ARGUMENT IS AN ARGUMENT: a five-argument command line whose
+// fifth is empty is not the supported four, and must not bind.
+func TestReleaseInspectKeepsATrailingEmptyArgument(t *testing.T) {
 	f := newInspectFixture(t)
-	key := filepath.Join(f.dir, "node.key")
-	writeFile(t, key, "-----BEGIN PRIVATE KEY-----\nnot really\n-----END PRIVATE KEY-----\n", 0o600)
-	f.process(t, []string{"/usr/local/bin/helper", "serve", "--key", key}, nil)
-	reads := 0
-	inspectAfterOpen = func(path string) {
-		if path == key {
-			reads++
-		}
-	}
+	f.process(t, []string{f.binPath, "server", "--config", f.configPath, ""}, nil)
 	r := f.report(t)
-	if reads != 0 {
-		t.Errorf("the unsupported command's operand was read %d times, want never", reads)
+	mustUnknown(t, "cmdline_matches_unit", r.Services["server"].CmdlineMatchesUnit, "not `")
+	mustUnknown(t, "config_binding", r.ConfigBinding, "not `")
+}
+
+// A SPECIAL FILE IN THE PROCESS'S VIEW NEITHER BLOCKS NOR BINDS: the view is
+// opened for identity without opening it for reading, so a FIFO with no writer
+// does not hold the inspector; and only a regular file is reopened for its
+// bytes, so a FIFO at another path is could-not-tell.
+func TestReleaseInspectRefusesASpecialFileInTheProcessView(t *testing.T) {
+	t.Run("a FIFO at the inspector's path does not bind", func(t *testing.T) {
+		f := newInspectFixture(t)
+		view := filepath.Join(f.dir, "view")
+		fifo := filepath.Join(view, f.configPath)
+		if err := os.MkdirAll(filepath.Dir(fifo), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := syscall.Mkfifo(fifo, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		f.processRoot(t, view)
+		blocked := unblockFIFOAfter(t, fifo, fifoPatience)
+		r := f.report(t)
+		if blocked() {
+			t.Fatal("the inspector blocked opening the FIFO for reading until the test wrote to it")
+		}
+		if got := mustKnown(t, "config_binding", r.ConfigBinding); got != false {
+			t.Errorf("config_binding = %v, want false for a FIFO where the configuration should be", got)
+		}
+	})
+	t.Run("a FIFO at another path is could-not-tell", func(t *testing.T) {
+		f := newInspectFixture(t)
+		other := filepath.Join(f.dir, "other.yaml")
+		writeFile(t, other, "inspector: copy\n", 0o644)
+		view := filepath.Join(f.dir, "view")
+		fifo := filepath.Join(view, other)
+		if err := os.MkdirAll(filepath.Dir(fifo), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := syscall.Mkfifo(fifo, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		f.unitRunning(t, "billet-server.service", "server", other, nil)
+		f.process(t, []string{f.binPath, "server", "--config", other}, nil)
+		f.processRoot(t, view)
+		blocked := unblockFIFOAfter(t, fifo, fifoPatience)
+		svc := f.report(t).Services["server"]
+		if blocked() {
+			t.Fatal("the inspector blocked opening the FIFO for reading until the test wrote to it")
+		}
+		mustUnknown(t, "config_sha256", svc.ConfigSHA256, "not a regular file")
+	})
+}
+
+// fifoPatience is how long a FIFO case gives the inspector before concluding it
+// is blocked: a correct report over the fixtures returns in well under a second,
+// and an open blocked on a FIFO never returns on its own.
+const fifoPatience = 5 * time.Second
+
+// unblockFIFOAfter opens the FIFO for writing once the deadline passes, so an
+// inspector blocked in a reading open returns and the case FAILS IN SECONDS,
+// naming what happened, rather than hanging to the package timeout with no
+// test named (which is how the special-file mutant was first caught). The
+// returned function stops the writer and says whether it ever had to act; a
+// correct inspector returns long before the deadline and it never does.
+func unblockFIFOAfter(t *testing.T, fifo string, after time.Duration) func() bool {
+	t.Helper()
+	stop := make(chan struct{})
+	var acted atomic.Bool
+	go func() {
+		timer := time.NewTimer(after)
+		defer timer.Stop()
+		select {
+		case <-stop:
+			return
+		case <-timer.C:
+		}
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			// A non-blocking write open succeeds only once a reader holds
+			// the FIFO open, which is exactly the blocked reader being freed.
+			fd, err := syscall.Open(fifo, syscall.O_WRONLY|syscall.O_NONBLOCK, 0)
+			if err == nil {
+				acted.Store(true)
+				time.Sleep(50 * time.Millisecond)
+				_ = syscall.Close(fd)
+				return
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}()
+	var once sync.Once
+	return func() bool {
+		once.Do(func() { close(stop) })
+		return acted.Load()
 	}
-	mustUnknown(t, "cmdline_config_path", r.Services["server"].CmdlineConfigPath, "not `")
 }
 
 // ANOTHER CONFIGURATION IS READ IN THE PROCESS'S NAMESPACE: the inspector's
@@ -1434,7 +1567,7 @@ func TestReleaseInspectRefusesAnImageModifiedDuringTheHash(t *testing.T) {
 // window in which a replacement's bytes are paired with the parsed
 // configuration and a true binding. The seam counts the seam-covered content
 // reads (observeConfig, hashImage and a view's hash).
-func TestReleaseInspectOpensTheConfigurationOnce(t *testing.T) {
+func TestReleaseInspectReadsTheConfigurationsContentOnce(t *testing.T) {
 	f := newInspectFixture(t)
 	opens := 0
 	inspectAfterOpen = func(path string) {
