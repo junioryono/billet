@@ -82,6 +82,10 @@ var (
 	inspectAfterOpen func(path string)
 	// systemctlTimeout bounds one systemctl show.
 	systemctlTimeout = 10 * time.Second
+	// inspectAfterConfig runs after the configuration has been read and parsed
+	// and before anything is observed, so a test can replace or rewrite the
+	// file and prove the report notices.
+	inspectAfterConfig func()
 )
 
 // inspectSchema is the report's schema version; a field renamed or removed
@@ -273,11 +277,33 @@ func inspectHostRelease(ctx context.Context, configPath string) inspectReport {
 		configPath = abs
 	}
 	report := inspectReport{Schema: inspectSchema, Config: inspectConfig{Path: configPath}}
-	cfg, err := config.Load(configPath)
-	if err != nil {
-		report.Config.Error = err.Error()
+	// ONE OBSERVATION OF THE CONFIGURATION. The bytes parsed, the digest
+	// reported and the file identity every process's view is compared with all
+	// come from one bracketed read of one descriptor, held open to the end of
+	// the report; otherwise a file replaced after the parse would give a report
+	// that describes configuration A's roles, backend and identity beside
+	// configuration B's digest and binding, and no single hash would notice.
+	obs, obsErr := observeConfig(configPath)
+	var cfg *config.Config
+	var inspectorInfo os.FileInfo
+	var digest maybe
+	if obsErr != nil {
+		report.Config.Error = obsErr.Error()
+		digest = unknown(obsErr.Error())
 	} else {
-		report.Config.Readable = true
+		defer obs.file.Close()
+		inspectorInfo = obs.info
+		digest = known(obs.sha)
+		parsed, err := config.Parse(configPath, obs.body)
+		if err != nil {
+			report.Config.Error = err.Error()
+		} else {
+			cfg = parsed
+			report.Config.Readable = true
+		}
+	}
+	if inspectAfterConfig != nil {
+		inspectAfterConfig()
 	}
 
 	exeSHA, exeInfo := inspectExecutableSection(&report)
@@ -285,15 +311,67 @@ func inspectHostRelease(ctx context.Context, configPath string) inspectReport {
 	report.Services = map[string]inspectService{}
 	binding := known(true)
 	for role, unit := range map[string]string{"server": deploy.ServerUnitName, "node": deploy.NodeUnitName} {
-		svc, bound := inspectServiceSection(ctx, role, unit, cfg, configPath, exeSHA, exeInfo)
+		svc, bound := inspectServiceSection(ctx, role, unit, cfg, configPath, inspectorInfo, exeSHA, exeInfo)
 		report.Services[role] = svc
 		binding = weaker(binding, bound)
 	}
 	report.ConfigBinding = binding
-	report.Installed = inspectInstalledSection(cfg, configPath, report.Config)
+	report.Installed = inspectInstalledSection(cfg, configPath, report.Config, digest)
 	report.Host = inspectHostSection(cfg)
 	report.Transaction = inspectTransactionSection()
+	// THE FILE DESCRIBED MUST STILL BE THE FILE ON DISK: a rewrite in place
+	// during the report keeps the identity the views were compared with and
+	// changes the bytes, so a binding that said true no longer says anything,
+	// and neither does the digest. A false stays false.
+	if obsErr == nil {
+		if again, err := obs.file.Stat(); err != nil || again.Size() != obs.info.Size() || !again.ModTime().Equal(obs.info.ModTime()) {
+			why := "the configuration changed while the report was being made"
+			if report.ConfigBinding.known && report.ConfigBinding.value == true {
+				report.ConfigBinding = unknown(why)
+			}
+			report.Installed.SHA256 = unknown(why)
+		}
+	}
 	return report
+}
+
+// configObservation is one bracketed read of the configuration: its bytes, their
+// digest and the descriptor's identity, with the descriptor kept open.
+type configObservation struct {
+	file *os.File
+	info os.FileInfo
+	body []byte
+	sha  string
+}
+
+// observeConfig reads the configuration through one descriptor, bracketed by
+// its metadata like every hash here, and hands the descriptor back open.
+func observeConfig(path string) (*configObservation, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	before, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("stat %s: %w", path, err)
+	}
+	body, err := io.ReadAll(f)
+	if err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+	after, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("stat %s: %w", path, err)
+	}
+	if before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) {
+		_ = f.Close()
+		return nil, fmt.Errorf("%s changed while it was being read", path)
+	}
+	sum := sha256.Sum256(body)
+	return &configObservation{file: f, info: after, body: body, sha: hex.EncodeToString(sum[:])}, nil
 }
 
 // inspectExecutableSection hashes THE IMAGE THIS PROCESS EXECUTES. On Linux
@@ -450,14 +528,16 @@ func unitProperties(ctx context.Context, unit string) (map[string][]string, erro
 }
 
 // needDaemonReload reads systemd's NeedDaemonReload as the three-valued fact
-// it is. ON SYSTEMD 255 THE FLAG IS THE MANAGER'S, NOT THE UNIT'S: any unit-file
-// operation over the bus that changed something (enable, disable, preset, mask,
-// link, revert) sets `unit_file_state_outdated`, which makes EVERY unit answer
-// yes until the next daemon-reload (measured on the reference controller,
-// 2026-09-07: 464 of 464 units after snapd enabled a new mount unit, billet's
-// own files untouched since the last reload). So it says a reload is pending
-// somewhere, and nothing about whether this unit's file differs from what was
-// loaded; the loaded records above are what systemd runs either way.
+// it is. On systemd 255 it is true when this unit's fragment, source or drop-ins
+// changed since load OR when the manager's `unit_file_state_outdated` is set,
+// which any unit-file operation over the bus that changed something (enable,
+// disable, preset, mask, link, revert) does, for every unit, until the next
+// daemon-reload; the second cause dominates in practice (measured on the
+// reference controller, 2026-09-07: 464 of 464 units after snapd enabled a new
+// mount unit, billet's own files untouched since the last reload). So a yes
+// does not say that THIS unit's file differs from what was loaded, and the
+// loaded records above are what systemd runs either way; the fact is reported
+// and left out of the shape.
 func needDaemonReload(props map[string][]string) maybe {
 	switch v := firstProp(props, "NeedDaemonReload"); v {
 	case "yes":
@@ -553,14 +633,19 @@ func unitExecStart(ctx context.Context, unit string) ([]execRecord, error) {
 // paths (ProtectSystem, ProtectHome, InaccessiblePaths) does not substitute the
 // configuration and is not listed here.
 func remapped(props map[string][]string) string {
-	for _, name := range []string{"RootDirectory", "RootImage", "BindPaths", "BindReadOnlyPaths",
-		"MountImages", "ExtensionImages", "ExtensionDirectories", "TemporaryFileSystem"} {
+	for _, name := range remappingDirectives {
 		if strings.TrimSpace(firstProp(props, name)) != "" {
 			return name
 		}
 	}
 	return ""
 }
+
+// remappingDirectives are the exec settings under which an absolute path names
+// another file; the shape refuses any of them set, and the confirming read of
+// a sample requires them unchanged.
+var remappingDirectives = []string{"RootDirectory", "RootImage", "BindPaths", "BindReadOnlyPaths",
+	"MountImages", "ExtensionImages", "ExtensionDirectories", "TemporaryFileSystem"}
 
 // busLabel escapes a unit name the way systemd names its bus objects: letters
 // and digits stay (a leading digit is escaped), everything else becomes _XX.
@@ -617,7 +702,7 @@ func environmentFilesOfAll(lines []string) ([]string, error) {
 // inspector's config, false on a disagreement, unknown when a shape could not
 // be read.
 func inspectServiceSection(ctx context.Context, role, unit string, cfg *config.Config,
-	inspectorConfig string, exeSHA string, exeInfo os.FileInfo,
+	inspectorConfig string, inspectorInfo os.FileInfo, exeSHA string, exeInfo os.FileInfo,
 ) (inspectService, maybe) {
 	svc := inspectService{LoadedConfig: unknown("nothing on the disk proves what a process read at start")}
 	if hostOS == "darwin" {
@@ -736,7 +821,7 @@ func inspectServiceSection(ctx context.Context, role, unit string, cfg *config.C
 		return svc, binding
 	}
 	svc.MainPID = known(pid)
-	processBinding := inspectRunningProcess(ctx, &svc, role, unit, pid, props, cfg, inspectorConfig, exeSHA, exeInfo, unitConfigPath, envFiles)
+	processBinding := inspectRunningProcess(ctx, &svc, role, unit, pid, props, records, cfg, inspectorConfig, inspectorInfo, exeSHA, exeInfo, unitConfigPath, envFiles)
 	return svc, weaker(binding, processBinding)
 }
 
@@ -745,6 +830,7 @@ func serviceAllUnknown(svc inspectService, why string) inspectService {
 	svc.UnitPresent = unknown(why)
 	svc.Enabled, svc.ActiveState, svc.SubState, svc.MainPID = unknown(why), unknown(why), unknown(why), unknown(why)
 	svc.ExecMainStart, svc.ExecStart, svc.Shape, svc.EnvironmentFiles = unknown(why), unknown(why), unknown(why), unknown(why)
+	svc.NeedDaemonReload = unknown(why)
 	fillRunningUnknown(&svc, why)
 	svc.DSNEnv = unknown(why)
 	return svc
@@ -783,12 +869,29 @@ type processSample struct {
 // unitIdentity is what must not move across a sample: which process systemd
 // calls the unit's main one, which invocation it is, and the exec-shaping
 // properties whose change would make the unit another unit.
-func unitIdentity(props map[string][]string) string {
-	return strings.Join([]string{
+func unitIdentity(props map[string][]string, records []execRecord) string {
+	parts := make([]string, 0, 6+len(remappingDirectives))
+	parts = append(parts,
 		firstProp(props, "MainPID"), firstProp(props, "InvocationID"),
 		strings.Join(props["ExecStart"], "\x00"), strings.Join(props["EnvironmentFiles"], "\x00"),
-		strings.Join(props["Environment"], "\x00"),
-	}, "\x01")
+		strings.Join(props["Environment"], "\x00"), recordsKey(records),
+	)
+	// The remapping directives and the structured records are part of the
+	// shape, so a reload that adds a bind mount or moves an argument boundary
+	// under the sample, leaving the rendered strings alone, must discard it.
+	for _, name := range remappingDirectives {
+		parts = append(parts, firstProp(props, name))
+	}
+	return strings.Join(parts, "\x01")
+}
+
+// recordsKey is the loaded ExecStart records as one comparable string.
+func recordsKey(records []execRecord) string {
+	parts := make([]string, 0, len(records))
+	for _, r := range records {
+		parts = append(parts, r.Path+"\x00"+strings.Join(r.Argv, "\x00"))
+	}
+	return strings.Join(parts, "\x02")
 }
 
 // sampleProcess reads a unit's main process as ONE SAMPLE bound to one
@@ -801,9 +904,9 @@ func unitIdentity(props map[string][]string) string {
 // time at the end, and a unit that changed under the sample has a different
 // identity, so evidence about the image is never attributed to a process the
 // other reads saw. Three samples at most, then could-not-tell.
-func sampleProcess(ctx context.Context, unit string, pid int, first map[string][]string) (processSample, error) {
+func sampleProcess(ctx context.Context, unit string, pid int, first map[string][]string, records []execRecord) (processSample, error) {
 	dir := filepath.Join(procRoot, strconv.Itoa(pid))
-	identity := unitIdentity(first)
+	identity := unitIdentity(first, records)
 	for range inspectSamples {
 		before, err := processStartTicks(dir)
 		if err != nil {
@@ -839,7 +942,14 @@ func sampleProcess(ctx context.Context, unit string, pid int, first map[string][
 		if err != nil {
 			return processSample{}, err
 		}
-		if unitIdentity(again) != identity {
+		// A failed re-read of the records is a nil key; equal to the first
+		// read only when that failed too, so a shape that appeared or vanished
+		// under the sample discards it.
+		againRecords, againErr := unitExecStart(ctx, unit)
+		if againErr != nil {
+			againRecords = nil
+		}
+		if unitIdentity(again, againRecords) != identity {
 			continue
 		}
 		after, err := processStartTicks(dir)
@@ -851,7 +961,7 @@ func sampleProcess(ctx context.Context, unit string, pid int, first map[string][
 		}
 		return processSample{sha: sum, startTicks: before, cmdline: args, environ: environ, view: view, viewErr: viewErr}, nil
 	}
-	return processSample{}, errors.New("the service restarted during the observation")
+	return processSample{}, errors.New("the service restarted during the observation, or its unit changed under it")
 }
 
 // statThroughRoot opens an absolute path as the process sees it and returns the
@@ -878,10 +988,10 @@ func statThroughRoot(procDir, path string) (os.FileInfo, string) {
 // configuration through its own command line and reports its image against
 // the executable's; the second answer is that binding.
 func inspectRunningProcess(ctx context.Context, svc *inspectService, role, unit string, pid int,
-	props map[string][]string, cfg *config.Config, inspectorConfig string, exeSHA string,
-	exeInfo os.FileInfo, unitConfigPath string, envFiles []string,
+	props map[string][]string, records []execRecord, cfg *config.Config, inspectorConfig string,
+	inspectorInfo os.FileInfo, exeSHA string, exeInfo os.FileInfo, unitConfigPath string, envFiles []string,
 ) maybe {
-	sample, err := sampleProcess(ctx, unit, pid, props)
+	sample, err := sampleProcess(ctx, unit, pid, props, records)
 	if err != nil {
 		fillRunningUnknown(svc, err.Error())
 		svc.DSNEnv = unknown(err.Error())
@@ -926,11 +1036,11 @@ func inspectRunningProcess(ctx context.Context, svc *inspectService, role, unit 
 			svc.CmdlineMatchesUnit = known(cmdlineConfig == unitConfigPath)
 		}
 		// THE PATH AND THE FILE: the process must name the inspector's path,
-		// and the file its own root resolves that path to must be the
-		// inspector's file, or equal paths bind two configurations. Under
-		// another root or in another mount namespace a view that could not be
-		// opened cannot be compared and is could-not-tell.
-		inspectorInfo, statErr := os.Stat(inspectorConfig)
+		// and the file its own root resolves that path to must be the file the
+		// inspector read (the one observation's identity, not a fresh stat of
+		// the path), or equal paths bind two configurations. Under another root
+		// or in another mount namespace a view that could not be opened cannot
+		// be compared and is could-not-tell.
 		switch {
 		case cmdlineConfig != inspectorConfig:
 			binding = known(false)
@@ -939,8 +1049,8 @@ func inspectRunningProcess(ctx context.Context, svc *inspectService, role, unit 
 			why = sample.viewErr
 			binding = unknown(why)
 			svc.ConfigSHA256, svc.ConfigChangedSinceStart = unknown(why), unknown(why)
-		case statErr != nil:
-			why = fmt.Sprintf("stat %s: %v", inspectorConfig, statErr)
+		case inspectorInfo == nil:
+			why = "the inspector's configuration could not be read, so the process's view cannot be compared with it"
 			binding = unknown(why)
 			svc.ConfigSHA256, svc.ConfigChangedSinceStart = unknown(why), unknown(why)
 		case !os.SameFile(sample.view, inspectorInfo):
@@ -1104,6 +1214,9 @@ func environmentFileValue(path, name string) (string, bool, error) {
 		if unicode.IsControl(r) && r != '\n' && r != '\t' {
 			return "", false, errors.New("unsupported environment file syntax: a control character")
 		}
+		if isNoncharacter(r) {
+			return "", false, errors.New("unsupported environment file syntax: a Unicode noncharacter")
+		}
 	}
 	seen := map[string]bool{}
 	value, found := "", false
@@ -1132,6 +1245,13 @@ func environmentFileValue(path, name string) (string, bool, error) {
 
 var environmentNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
+// isNoncharacter is systemd's stricter UTF-8 rule: its environment loader
+// refuses U+FDD0 to U+FDEF and the last two code points of every plane, which
+// Go's utf8.Valid accepts, so a file Go reads is one systemd fails to load.
+func isNoncharacter(r rune) bool {
+	return (r >= 0xFDD0 && r <= 0xFDEF) || r&0xFFFE == 0xFFFE
+}
+
 // environmentValue is the restricted value grammar: wholly quoted in one kind
 // with none of that kind and no backslash inside, or unquoted with no leading
 // or trailing whitespace and no quote, backslash or hash.
@@ -1154,16 +1274,10 @@ func environmentValue(v string) (string, bool) {
 // config_binding is what makes that the units' configuration too, so a
 // node-only host with a dormant packaged server unit is not mistaken for a
 // controller.
-func inspectInstalledSection(cfg *config.Config, configPath string, loaded inspectConfig) inspectInstalledConfig {
-	// The digest is the file's, bracketed like every hash here, and is
+func inspectInstalledSection(cfg *config.Config, configPath string, loaded inspectConfig, digest maybe) inspectInstalledConfig {
+	// The digest is the one observation's, the bytes that were parsed, and is
 	// independent of any running process: a stopped host still answers what
 	// configuration it holds.
-	var digest maybe
-	if sum, _, err := hashImage(configPath); err != nil {
-		digest = unknown(err.Error())
-	} else {
-		digest = known(sum)
-	}
 	if cfg == nil {
 		why := fmt.Sprintf("load %s: %s", configPath, loaded.Error)
 		return inspectInstalledConfig{Path: known(configPath), SHA256: digest, HasServer: unknown(why), HasNode: unknown(why),

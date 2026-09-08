@@ -503,6 +503,18 @@ linters:
           - forbidigo
         text: ledgerdb\.New
 
+      # THE USER-SPACE RESOLVER IS THE CONTAINMENT. resolveInRoot walks a path
+      # component by component under a root and stats every step, which is how
+      # it keeps the walk inside the root; gosec's taint analysis (G703) sees a
+      # parameter reach os.Lstat and reports it, and only on darwin, where the
+      # !linux openInRoot gives it a production caller (the Linux build reaches
+      # the kernel's openat2 instead), so a nolint directive is used on one
+      # GOOS and reported unused on the other. Excluded here, by file and rule.
+      - path: (^|/)cmd/billet/releaseinspect_resolve\.go$
+        linters:
+          - gosec
+        text: G703
+
       # ----- tests: relax noise-heavy rules -----
       #
       # errcheck is deliberately NOT in this list. It was, on the assumption that

@@ -99,6 +99,32 @@ func TestSnapshotAuthorityIsUnknownWhileTheFilesChange(t *testing.T) {
 }
 
 // ONE DISTURBED ATTEMPT IS NOT A FAILURE: the second attempt's two reads agree.
+// AN ABSENT PREDECESSOR AND AN EMPTY ONE ARE DIFFERENT OBSERVATIONS: a
+// confirming read that called them equal would parse the first (no
+// predecessor, no rotation) while the disk holds a malformed file the second
+// saw.
+func TestSnapshotAuthorityDoesNotConfirmAnAbsentFileWithAnEmptyOne(t *testing.T) {
+	stateDir := t.TempDir()
+	if _, err := LoadOrCreateCA(stateDir, "dep-1234"); err != nil {
+		t.Fatal(err)
+	}
+	created := false
+	prev := snapshotBetweenReads
+	t.Cleanup(func() { snapshotBetweenReads = prev })
+	snapshotBetweenReads = func() {
+		if created {
+			return
+		}
+		created = true
+		if err := os.WriteFile(AuthorityPath(stateDir, "ca-previous.crt"), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := SnapshotAuthority(stateDir); err == nil {
+		t.Fatal("a snapshot whose predecessor went from absent to empty between the reads was confirmed")
+	}
+}
+
 func TestSnapshotAuthorityRetriesOnceDisturbed(t *testing.T) {
 	stateDir := t.TempDir()
 	ca, err := LoadOrCreateCA(stateDir, "dep-1234")

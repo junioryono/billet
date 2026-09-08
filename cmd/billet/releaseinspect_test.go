@@ -75,6 +75,8 @@ func newInspectFixture(t *testing.T) *inspectFixture {
 	upgradeRoot = filepath.Join(dir, "upgrades")
 	provenance.Path = filepath.Join(dir, "installed.json")
 	inspectAfterOpen = nil
+	inspectAfterConfig = nil
+	t.Cleanup(func() { inspectAfterConfig = nil })
 	openImage = func(path string) (*os.File, error) {
 		f.opened = append(f.opened, path)
 		return os.Open(path)
@@ -395,6 +397,9 @@ func TestReleaseInspectHashesTheOpenedImageAndBindsTheRunningProcess(t *testing.
 	if same := mustKnown(t, "installed_path_same", r.Executable.InstalledPathSame); same != true {
 		t.Errorf("installed_path_same = %v, want true", same)
 	}
+	if got := mustKnown(t, "installed_config.sha256", r.Installed.SHA256); got != shaOf(f.serverConfig()) {
+		t.Errorf("installed_config.sha256 = %v, want the digest of the configuration parsed", got)
+	}
 	if r.Provenance.Verdict != "none" {
 		t.Errorf("provenance verdict = %q, want none with no record", r.Provenance.Verdict)
 	}
@@ -645,24 +650,26 @@ func TestReleaseInspectDSNStates(t *testing.T) {
 		want     string
 		unknown  string
 	}{
-		"equal":          {[]string{"BILLET_PG_DSN=" + dsn}, true, "BILLET_PG_DSN=\"" + dsn + "\"\n", "equal", ""},
-		"equal unquoted": {[]string{"BILLET_PG_DSN=" + dsn}, true, "# rendered\nBILLET_PG_DSN=" + dsn + "\n", "equal", ""},
-		"differs":        {[]string{"BILLET_PG_DSN=" + dsn}, true, "BILLET_PG_DSN=postgres://other\n", "differs", ""},
-		"not in file":    {[]string{"BILLET_PG_DSN=" + dsn}, true, "OTHER=1\n", "not_in_file", ""},
-		"absent":         {[]string{"PATH=/usr/bin"}, true, "BILLET_PG_DSN=x\n", "absent", ""},
-		"no file":        {[]string{"BILLET_PG_DSN=" + dsn}, false, "", "", "no single environment file"},
-		"assigned twice": {[]string{"BILLET_PG_DSN=" + dsn}, true, "BILLET_PG_DSN=postgres://first\nBILLET_PG_DSN=" + dsn + "\n", "", "assigned twice"},
-		"quote inside":   {[]string{"BILLET_PG_DSN=" + dsn}, true, "BILLET_PG_DSN=\"a\"b\"\n", "", "unsupported environment file syntax"},
-		"backslash":      {[]string{"BILLET_PG_DSN=" + dsn}, true, "BILLET_PG_DSN=a\\\\b\n", "", "unsupported environment file syntax"},
-		"bad other line": {[]string{"BILLET_PG_DSN=" + dsn}, true, "BILLET_PG_DSN=" + dsn + "\nexport OTHER=1\n", "", "unsupported environment file syntax"},
-		"leading space":  {[]string{"BILLET_PG_DSN=" + dsn}, true, "BILLET_PG_DSN= " + dsn + "\n", "", "unsupported environment file syntax"},
-		"trailing space": {[]string{"BILLET_PG_DSN=" + dsn}, true, "BILLET_PG_DSN=" + dsn + " \n", "", "unsupported environment file syntax"},
-		"indented name":  {[]string{"BILLET_PG_DSN=" + dsn}, true, "  BILLET_PG_DSN=" + dsn + "\n", "", "unsupported environment file syntax"},
-		"cr in comment":  {[]string{"BILLET_PG_DSN=" + dsn}, true, "BILLET_PG_DSN=" + dsn + "\n# comment\rBILLET_PG_DSN=postgres://new\n", "", "control character"},
-		"crlf":           {[]string{"BILLET_PG_DSN=" + dsn}, true, "BILLET_PG_DSN=" + dsn + "\r\n", "", "control character"},
-		"nul":            {[]string{"BILLET_PG_DSN=" + dsn}, true, "BILLET_PG_DSN=" + dsn + "\x00\n", "", "control character"},
-		"not utf8":       {[]string{"BILLET_PG_DSN=" + dsn}, true, "BILLET_PG_DSN=" + dsn + "\xff\n", "", "not UTF-8"},
-		"del":            {[]string{"BILLET_PG_DSN=" + dsn}, true, "BILLET_PG_DSN=" + dsn + "\x7f\n", "", "control character"},
+		"equal":                   {[]string{"BILLET_PG_DSN=" + dsn}, true, "BILLET_PG_DSN=\"" + dsn + "\"\n", "equal", ""},
+		"equal unquoted":          {[]string{"BILLET_PG_DSN=" + dsn}, true, "# rendered\nBILLET_PG_DSN=" + dsn + "\n", "equal", ""},
+		"differs":                 {[]string{"BILLET_PG_DSN=" + dsn}, true, "BILLET_PG_DSN=postgres://other\n", "differs", ""},
+		"not in file":             {[]string{"BILLET_PG_DSN=" + dsn}, true, "OTHER=1\n", "not_in_file", ""},
+		"absent":                  {[]string{"PATH=/usr/bin"}, true, "BILLET_PG_DSN=x\n", "absent", ""},
+		"no file":                 {[]string{"BILLET_PG_DSN=" + dsn}, false, "", "", "no single environment file"},
+		"assigned twice":          {[]string{"BILLET_PG_DSN=" + dsn}, true, "BILLET_PG_DSN=postgres://first\nBILLET_PG_DSN=" + dsn + "\n", "", "assigned twice"},
+		"quote inside":            {[]string{"BILLET_PG_DSN=" + dsn}, true, "BILLET_PG_DSN=\"a\"b\"\n", "", "unsupported environment file syntax"},
+		"backslash":               {[]string{"BILLET_PG_DSN=" + dsn}, true, "BILLET_PG_DSN=a\\\\b\n", "", "unsupported environment file syntax"},
+		"bad other line":          {[]string{"BILLET_PG_DSN=" + dsn}, true, "BILLET_PG_DSN=" + dsn + "\nexport OTHER=1\n", "", "unsupported environment file syntax"},
+		"leading space":           {[]string{"BILLET_PG_DSN=" + dsn}, true, "BILLET_PG_DSN= " + dsn + "\n", "", "unsupported environment file syntax"},
+		"trailing space":          {[]string{"BILLET_PG_DSN=" + dsn}, true, "BILLET_PG_DSN=" + dsn + " \n", "", "unsupported environment file syntax"},
+		"indented name":           {[]string{"BILLET_PG_DSN=" + dsn}, true, "  BILLET_PG_DSN=" + dsn + "\n", "", "unsupported environment file syntax"},
+		"cr in comment":           {[]string{"BILLET_PG_DSN=" + dsn}, true, "BILLET_PG_DSN=" + dsn + "\n# comment\rBILLET_PG_DSN=postgres://new\n", "", "control character"},
+		"crlf":                    {[]string{"BILLET_PG_DSN=" + dsn}, true, "BILLET_PG_DSN=" + dsn + "\r\n", "", "control character"},
+		"nul":                     {[]string{"BILLET_PG_DSN=" + dsn}, true, "BILLET_PG_DSN=" + dsn + "\x00\n", "", "control character"},
+		"not utf8":                {[]string{"BILLET_PG_DSN=" + dsn}, true, "BILLET_PG_DSN=" + dsn + "\xff\n", "", "not UTF-8"},
+		"del":                     {[]string{"BILLET_PG_DSN=" + dsn}, true, "BILLET_PG_DSN=" + dsn + "\x7f\n", "", "control character"},
+		"noncharacter elsewhere":  {[]string{"BILLET_PG_DSN=" + dsn}, true, "BILLET_PG_DSN=" + dsn + "\nOTHER=\uFDD0\n", "", "noncharacter"},
+		"noncharacter in the dsn": {[]string{"BILLET_PG_DSN=" + dsn}, true, "BILLET_PG_DSN=" + dsn + "\U0001FFFE\n", "", "noncharacter"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			f := newInspectFixture(t)
@@ -820,8 +827,8 @@ func TestReleaseInspectReadsEveryEnvironmentFileLine(t *testing.T) {
 // ARGUMENT BOUNDARIES COME FROM THE LOADED RECORDS: `systemctl show` joins argv
 // with spaces, so a two-argument `billet "server --config x"` displays like the
 // supported four-argument form, and only the bus property tells them apart;
-// the rendered view must agree with the loaded one, a second record, a unit
-// file changed since load, and a relative path are each could-not-tell.
+// the rendered view must agree with the loaded one, and a second record, a
+// remapping directive and a relative path are each could-not-tell.
 func TestReleaseInspectReadsArgumentBoundariesFromTheLoadedUnit(t *testing.T) {
 	cases := map[string]struct {
 		arrange func(t *testing.T, f *inspectFixture)
@@ -867,6 +874,75 @@ func TestReleaseInspectReadsArgumentBoundariesFromTheLoadedUnit(t *testing.T) {
 				t.Errorf("shape = %v (%s), want unsupported for %q", svc.Shape.value, svc.ShapeReason, tc.reason)
 			}
 			mustUnknown(t, "config_binding", r.ConfigBinding, "")
+		})
+	}
+}
+
+// ONE OBSERVATION OF THE CONFIGURATION BINDS THE REPORT: the bytes parsed, the
+// digest and the identity the process views are compared with are one read of
+// one descriptor, so a file replaced after the parse is a binding that says
+// false (the views name another inode than the one read) beside the digest of
+// what was parsed, and a file rewritten in place is a binding and a digest that
+// say nothing; never A's roles beside B's digest and a true.
+func TestReleaseInspectBindsOneConfigurationObservation(t *testing.T) {
+	t.Run("replaced by rename after the parse", func(t *testing.T) {
+		f := newInspectFixture(t)
+		other := f.serverConfig() + "# B\n"
+		inspectAfterConfig = func() {
+			writeFile(t, f.configPath+".new", other, 0o644)
+			if err := os.Rename(f.configPath+".new", f.configPath); err != nil {
+				t.Fatal(err)
+			}
+		}
+		r := f.report(t)
+		if got := mustKnown(t, "config_binding", r.ConfigBinding); got != false {
+			t.Errorf("config_binding = %v, want false when the process's view is the replacement and the parse was the original", got)
+		}
+		if got := mustKnown(t, "installed_config.sha256", r.Installed.SHA256); got != shaOf(f.serverConfig()) {
+			t.Errorf("installed_config.sha256 = %v, want the digest of the bytes parsed, not the replacement's", got)
+		}
+		if got := mustKnown(t, "has_server", r.Installed.HasServer); got != true {
+			t.Errorf("has_server = %v", got)
+		}
+	})
+	t.Run("rewritten in place during the report", func(t *testing.T) {
+		f := newInspectFixture(t)
+		inspectAfterConfig = func() {
+			writeFile(t, f.configPath, f.serverConfig()+"# B\n", 0o644)
+		}
+		r := f.report(t)
+		mustUnknown(t, "config_binding", r.ConfigBinding, "changed while the report")
+		mustUnknown(t, "installed_config.sha256", r.Installed.SHA256, "changed while the report")
+	})
+}
+
+// THE CONFIRMING READ COVERS EVERYTHING THE SHAPE RESTS ON: a reload under the
+// sample that adds a bind mount, or moves an argument boundary while the
+// rendered string stays the same, changes what the loaded unit is without
+// changing the strings the first identity compared, so the structured records
+// and the remapping directives are part of the identity.
+func TestReleaseInspectDiscardsASampleWhenTheLoadedShapeMoves(t *testing.T) {
+	for name, disturb := range map[string]func(t *testing.T, f *inspectFixture){
+		"a bind mount appears": func(t *testing.T, f *inspectFixture) {
+			t.Helper()
+			f.unitProperty(t, "BindReadOnlyPaths", "/srv/B/etc/billet:/etc/billet")
+		},
+		"an argument boundary moves under the same rendering": func(t *testing.T, f *inspectFixture) {
+			t.Helper()
+			f.unitExec(t, "billet-server.service", [][]string{{f.binPath, "server --config " + f.configPath}})
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newInspectFixture(t)
+			exe := filepath.Join(f.procDir, strconv.Itoa(inspectPID), "exe")
+			inspectAfterOpen = func(path string) {
+				if path == exe {
+					disturb(t, f)
+				}
+			}
+			r := f.report(t)
+			mustUnknown(t, "running_sha256", r.Services["server"].RunningSHA256, "unit changed under it")
+			mustUnknown(t, "config_binding", r.ConfigBinding, "unit changed under it")
 		})
 	}
 }
@@ -1312,6 +1388,7 @@ func TestReleaseInspectOnDarwinIsPathEvidence(t *testing.T) {
 		t.Errorf("darwin image = %s, want the managed path %s", r.Executable.Image, installedBinary)
 	}
 	mustUnknown(t, "unit_present", r.Services["server"].UnitPresent, "launchd")
+	mustUnknown(t, "need_daemon_reload", r.Services["server"].NeedDaemonReload, "launchd")
 	mustUnknown(t, "running_sha256", r.Services["server"].RunningSHA256, "launchd")
 	mustUnknown(t, "retirement", r.Host.Retirement, "darwin")
 	mustUnknown(t, "config_binding", r.ConfigBinding, "launchd")
@@ -1542,14 +1619,69 @@ func TestReleaseInspectReadsTheFilesystemOnlyWhereListed(t *testing.T) {
 		`dir, err := os.Readlink(active)`,
 		`environ, err := os.ReadFile(filepath.Join(dir, "environ"))`,
 		`f, err := os.Open(filepath.Join(procRoot, "stat"))`,
+		`f, err := os.Open(path)`,
 		`f, err := os.OpenFile(filepath.Join(upgradeRoot, txLockName), os.O_RDONLY|syscall.O_NOFOLLOW, 0)`,
 		`info, err := os.Lstat(active)`,
-		`inspectorInfo, statErr := os.Stat(inspectorConfig)`,
 		`installed, err := os.Stat(installedBinary)`,
 		`rootInfo, err := os.Lstat(upgradeRoot)`,
 	}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Errorf("direct filesystem calls in releaseinspect.go:\n%s\nwant exactly:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+// THE USER-SPACE RESOLVER FOLLOWS THE KERNEL'S PATH RULES, which is what makes
+// the fixtures on a Mac prove what openat2 proves on Linux: ".." applies after
+// the symlink before it, an absolute target restarts at the root, a regular
+// file followed by anything is ENOTDIR, and a loop ends.
+func TestResolveInRootFollowsTheKernelsPathRules(t *testing.T) {
+	// The temp dir may itself sit under a symlink (macOS's /var), and the
+	// resolver follows the root as the kernel follows the magic link.
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(root, "b", "config"), "b\n", 0o644)
+	writeFile(t, filepath.Join(root, "b", "c", "config"), "bc\n", 0o644)
+	writeFile(t, filepath.Join(root, "a", "file"), "f\n", 0o644)
+	if err := os.Symlink("/b/c", filepath.Join(root, "a", "link")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../b/c", filepath.Join(root, "a", "rel")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/a/file/", filepath.Join(root, "a", "slash")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/a/loop", filepath.Join(root, "a", "loop")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(root, "b", "config"), filepath.Join(root, "a", "escape")); err != nil {
+		t.Fatal(err)
+	}
+	for path, want := range map[string]string{
+		"/a/link/../config": filepath.Join(root, "b", "config"),
+		"/a/rel/../config":  filepath.Join(root, "b", "config"),
+		"/a/link/config":    filepath.Join(root, "b", "c", "config"),
+		"/../b/config":      filepath.Join(root, "b", "config"),
+		"/a/./file":         filepath.Join(root, "a", "file"),
+	} {
+		got, err := resolveInRoot(root, path)
+		if err != nil || got != want {
+			t.Errorf("resolveInRoot(%q) = %q, %v; want %q", path, got, err, want)
+		}
+	}
+	for path, fragment := range map[string]string{
+		"/a/file/..": "not a directory",
+		"/a/file/":   "not a directory",
+		"/a/slash":   "not a directory",
+		"/a/loop":    "too many",
+		"/a/escape":  "no such file",
+		"/a/missing": "no such file",
+	} {
+		if got, err := resolveInRoot(root, path); err == nil || !strings.Contains(err.Error(), fragment) {
+			t.Errorf("resolveInRoot(%q) = %q, %v; want an error containing %q", path, got, err, fragment)
+		}
 	}
 }
 

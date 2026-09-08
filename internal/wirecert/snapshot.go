@@ -74,7 +74,11 @@ type publicAuthority struct {
 }
 
 func (p publicAuthority) equal(q publicAuthority) bool {
-	return bytes.Equal(p.current, q.current) && bytes.Equal(p.previous, q.previous) &&
+	// An absent file (nil) and an empty one are different observations, and
+	// bytes.Equal alone would call them the same, confirming a read that saw
+	// no predecessor with one that saw a malformed one.
+	return (p.current == nil) == (q.current == nil) && bytes.Equal(p.current, q.current) &&
+		(p.previous == nil) == (q.previous == nil) && bytes.Equal(p.previous, q.previous) &&
 		p.marker == q.marker
 }
 
