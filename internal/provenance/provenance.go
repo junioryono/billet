@@ -28,9 +28,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
+
+	"github.com/junioryono/billet/internal/regularfile"
 )
 
 // Path is where the record lives.
@@ -169,18 +172,19 @@ func Write(record Record) error {
 // operator reading it want to see what is written down even when it no longer
 // matches; anything that DECIDES from provenance goes through Installed.
 func Read() (Record, error) {
-	body, err := os.ReadFile(Path)
+	// THE RECORD IS READ FOR IDENTITY FIRST: a FIFO at its name would block a
+	// plain read before any stat, and `release inspect` reads it on every host.
+	body, err := regularfile.ReadFile(Path, maxRecordBytes, regularfile.Options{})
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, fs.ErrNotExist) {
 			return Record{}, ErrNoRecord
+		}
+		if errors.Is(err, regularfile.ErrTooLarge) {
+			return Record{}, fmt.Errorf("provenance: %s is larger than %d bytes, which is not "+
+				"a record billet wrote", Path, maxRecordBytes)
 		}
 
 		return Record{}, fmt.Errorf("provenance: read %s: %w", Path, err)
-	}
-
-	if len(body) > maxRecordBytes {
-		return Record{}, fmt.Errorf("provenance: %s is %d bytes, which is not a record "+
-			"billet wrote", Path, len(body))
 	}
 
 	var record Record

@@ -18,10 +18,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
 	"time"
+
+	"github.com/junioryono/billet/internal/regularfile"
 )
 
 // Step is how far one upgrade has got.
@@ -202,18 +205,20 @@ var ErrNoJournal = errors.New("hostupgrade: no upgrade is in progress")
 
 // ReadJournal loads the record for an upgrade in progress.
 func ReadJournal(dir string) (*Journal, error) {
-	body, err := os.ReadFile(filepath.Join(dir, JournalName))
+	// For identity first, then only a regular file of at most maxJournalBytes:
+	// a FIFO at the name would block a plain read, and `release inspect` reads
+	// the journal of any claim it finds.
+	body, err := regularfile.ReadFile(filepath.Join(dir, JournalName), maxJournalBytes, regularfile.Options{})
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, fs.ErrNotExist) {
 			return nil, ErrNoJournal
+		}
+		if errors.Is(err, regularfile.ErrTooLarge) {
+			return nil, fmt.Errorf("hostupgrade: the recovery journal is larger than %d bytes, which is "+
+				"not a journal billet wrote; refusing to act on it", maxJournalBytes)
 		}
 
 		return nil, fmt.Errorf("hostupgrade: read the recovery journal: %w", err)
-	}
-
-	if len(body) > maxJournalBytes {
-		return nil, fmt.Errorf("hostupgrade: the recovery journal is %d bytes, which is not a "+
-			"journal billet wrote; refusing to act on it", len(body))
 	}
 
 	var j Journal

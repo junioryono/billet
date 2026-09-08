@@ -1477,13 +1477,111 @@ func unblockFIFOAfter(t *testing.T, fifo string) func() bool {
 		}
 	}()
 	var once sync.Once
-	return func() bool {
+	stopAndJoin := func() bool {
 		once.Do(func() { close(stop) })
 		// The worker's open wakes the reader BEFORE the worker records that it
 		// acted; joining it is what makes the answer the worker's last word.
 		<-done
 		return acted.Load()
 	}
+	// A case that fails before it asks still joins the worker.
+	t.Cleanup(func() { stopAndJoin() })
+	return stopAndJoin
+}
+
+// THE READERS THE INSPECTOR DELEGATES TO read through the same rule: the
+// provenance record, the deployment identity, an upgrade claim's journal and
+// the authority's certificate are pathnames under billet's own state that a
+// host could put a FIFO at, and each reader's package opens for identity
+// first. Darwin's managed executable is a pathname too, and goes through the
+// rule rather than the process-image opener.
+func TestReleaseInspectRefusesASpecialFileAtADelegatedInput(t *testing.T) {
+	t.Run("the provenance record", func(t *testing.T) {
+		f := newInspectFixture(t)
+		if err := syscall.Mkfifo(provenance.Path, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		blocked := unblockFIFOAfter(t, provenance.Path)
+		r := f.report(t)
+		if blocked() {
+			t.Fatal("the inspector blocked reading the provenance record until the test wrote to it")
+		}
+		if r.Provenance.Verdict != "unreadable" || !strings.Contains(r.Provenance.Reason, "a FIFO") {
+			t.Errorf("provenance = %+v, want unreadable naming the FIFO", r.Provenance)
+		}
+	})
+	t.Run("the deployment identity", func(t *testing.T) {
+		f := newInspectFixture(t)
+		idPath := filepath.Join(f.stateDir, "deployment-id")
+		if err := syscall.Mkfifo(idPath, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		blocked := unblockFIFOAfter(t, idPath)
+		r := f.report(t)
+		if blocked() {
+			t.Fatal("the inspector blocked reading the deployment identity until the test wrote to it")
+		}
+		mustUnknown(t, "deployment_id", r.Host.DeploymentID, "a FIFO")
+	})
+	t.Run("an upgrade claim's journal", func(t *testing.T) {
+		f := newInspectFixture(t)
+		claim := filepath.Join(upgradeRoot, "upgrade-1")
+		if err := os.MkdirAll(claim, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		journalPath := filepath.Join(claim, hostupgrade.JournalName)
+		if err := syscall.Mkfifo(journalPath, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(claim, filepath.Join(upgradeRoot, "active")); err != nil {
+			t.Fatal(err)
+		}
+		blocked := unblockFIFOAfter(t, journalPath)
+		r := f.report(t)
+		if blocked() {
+			t.Fatal("the inspector blocked reading the upgrade journal until the test wrote to it")
+		}
+		mustUnknown(t, "journal", r.Transaction.Journal, "a FIFO")
+	})
+	t.Run("the authority's certificate", func(t *testing.T) {
+		f := newInspectFixture(t)
+		id, err := state.DeploymentID(f.stateDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := wirecert.LoadOrCreateCA(f.stateDir, id); err != nil {
+			t.Fatal(err)
+		}
+		caPath := wirecert.AuthorityPath(f.stateDir, "ca.crt")
+		if err := os.Remove(caPath); err != nil {
+			t.Fatal(err)
+		}
+		if err := syscall.Mkfifo(caPath, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		blocked := unblockFIFOAfter(t, caPath)
+		r := f.report(t)
+		if blocked() {
+			t.Fatal("the inspector blocked reading the authority's certificate until the test wrote to it")
+		}
+		mustUnknown(t, "authority", r.Host.Authority, "not a regular file")
+	})
+	t.Run("darwin's managed executable", func(t *testing.T) {
+		f := newInspectFixture(t)
+		hostOS = "darwin"
+		if err := os.Remove(installedBinary); err != nil {
+			t.Fatal(err)
+		}
+		if err := syscall.Mkfifo(installedBinary, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		blocked := unblockFIFOAfter(t, installedBinary)
+		r := f.report(t)
+		if blocked() {
+			t.Fatal("the inspector blocked hashing the managed path until the test wrote to it")
+		}
+		mustUnknown(t, "executable.sha256", r.Executable.SHA256, "a FIFO")
+	})
 }
 
 // THE INSPECTOR'S OWN INPUTS ARE OPENED FOR IDENTITY FIRST: its configuration,
@@ -2281,12 +2379,16 @@ func TestReleaseInspectReadsTheFilesystemOnlyWhereListed(t *testing.T) {
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Errorf("direct filesystem calls in releaseinspect.go:\n%s\nwant exactly:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
 	}
-	// The platform files hold the view's identity open and its reopen, and
-	// nothing else that names a path: the Linux reopen is of this process's own
-	// descriptor, and the other build's one os call is the resolved view. The
-	// inspector's own inputs go through openRegular in releaserecord.go.
+	// The platform files hold the view's identity open and nothing else that
+	// names a path: on Linux that is openat2 (a syscall this regex does not see,
+	// which is the boundary of this test), and off Linux the resolved view's one
+	// non-blocking open. The inspector's own inputs go through openRegular
+	// (regularfile.Open), and the readers it delegates to (provenance.Read,
+	// state.PeekDeploymentID, hostupgrade.ReadJournal, wirecert.SnapshotAuthority)
+	// read through the same package behind their own boundaries, which the FIFO
+	// cases prove behaviourally and this source scan does not.
 	for file, want := range map[string][]string{
-		"releaseinspect_linux.go": {`return os.Open(fmt.Sprintf("/proc/self/fd/%d", f.Fd())) //nolint:gosec // built from the held descriptor's number, not from any input`},
+		"releaseinspect_linux.go": {},
 		"releaseinspect_other.go": {`return os.OpenFile(resolved, os.O_RDONLY|syscall.O_NONBLOCK, 0)`},
 	} {
 		src, err := os.ReadFile(file)

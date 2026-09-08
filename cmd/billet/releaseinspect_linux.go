@@ -21,8 +21,8 @@ import (
 // RESOLVE_NO_MAGICLINKS refuses a second procfs link on the way. THE DESCRIPTOR
 // IS O_PATH: it names the inode without opening it for reading, so a FIFO the
 // process's namespace puts at that name cannot block the inspector waiting for
-// a writer and a device node gets no open of its own; reopenForReading is the
-// one step from there to bytes. A kernel without openat2 (before 5.6) answers ENOSYS, which
+// a writer and a device node gets no open of its own; reopenForReading
+// (regularfile.Reopen) is the one step from there to bytes. A kernel without openat2 (before 5.6) answers ENOSYS, which
 // the caller reports as could-not-tell.
 func openInRoot(rootLink, path string) (*os.File, error) {
 	rootFD, err := unix.Open(rootLink, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
@@ -39,22 +39,4 @@ func openInRoot(rootLink, path string) (*os.File, error) {
 		return nil, fmt.Errorf("open %s under %s: %w", path, rootLink, err)
 	}
 	return os.NewFile(uintptr(fd), path), nil
-}
-
-// reopenForReading turns an identity descriptor into a readable one on THE SAME
-// INODE, through /proc/self/fd, so no pathname is resolved a second time and a
-// replacement between the two cannot be read for the original. Only a regular
-// file is reopened: a FIFO would block, a device would be opened, and neither
-// is a configuration.
-func reopenForReading(f *os.File) (*os.File, error) {
-	info, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if !info.Mode().IsRegular() {
-		return nil, &os.PathError{Op: "open", Path: f.Name(), Err: fmt.Errorf("not a regular file (%s)", info.Mode().Type())}
-	}
-	// The name is this process's own descriptor number and nothing from the
-	// host: the reopen is of an inode already held, never a path resolved again.
-	return os.Open(fmt.Sprintf("/proc/self/fd/%d", f.Fd())) //nolint:gosec // built from the held descriptor's number, not from any input
 }

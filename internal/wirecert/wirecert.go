@@ -24,13 +24,14 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"io"
 	"math/big"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/junioryono/billet/internal/regularfile"
 )
 
 // ClockSkew is how far before its issuance a certificate becomes valid.
@@ -923,22 +924,23 @@ func readPublic(path string) ([]byte, error) {
 	return readCapped(path)
 }
 
+// readCapped reads THE FILE THE CHECKS ABOVE LOOKED AT, or refuses: the open is
+// for identity first, with a symlink refused again at the last component and
+// the regular-file rule applied to the descriptor that is read, so a FIFO or a
+// device renamed over the name between the Lstat and this read is refused
+// rather than waited on or opened.
 func readCapped(path string) ([]byte, error) {
-	f, err := os.Open(path)
+	body, err := regularfile.ReadFile(path, maxPEM, regularfile.Options{NoFollow: true})
 	if err != nil {
+		if errors.Is(err, regularfile.ErrTooLarge) {
+			return nil, fmt.Errorf("wirecert: %s is larger than %d bytes, which no key or "+
+				"certificate is", path, maxPEM)
+		}
+		if errors.Is(err, regularfile.ErrNotRegular) {
+			return nil, fmt.Errorf("wirecert: %s is not a regular file: %w", path, err)
+		}
+
 		return nil, err
-	}
-
-	defer func() { _ = f.Close() }()
-
-	body, err := io.ReadAll(io.LimitReader(f, maxPEM+1))
-	if err != nil {
-		return nil, fmt.Errorf("wirecert: read %s: %w", path, err)
-	}
-
-	if len(body) > maxPEM {
-		return nil, fmt.Errorf("wirecert: %s is larger than %d bytes, which no key or "+
-			"certificate is", path, maxPEM)
 	}
 
 	return body, nil

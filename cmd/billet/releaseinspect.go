@@ -28,6 +28,7 @@ import (
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/hostupgrade"
 	"github.com/junioryono/billet/internal/provenance"
+	"github.com/junioryono/billet/internal/regularfile"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/version"
 	"github.com/junioryono/billet/internal/wirecert"
@@ -503,7 +504,14 @@ func inspectExecutableSection(report *inspectReport) (string, os.FileInfo) {
 	}
 	exe.Image = image
 
-	sum, info, err := hashImage(image)
+	// THE PROCESS IMAGE IS OPENED BY ITS /proc LINK (hashImage); darwin's
+	// managed path is a pathname like any other and goes through the
+	// regular-file rule, so a FIFO or a device there is could-not-tell.
+	hash := hashImage
+	if hostOS == "darwin" {
+		hash = hashRegular
+	}
+	sum, info, err := hash(image)
 	if err != nil {
 		exe.SHA256 = unknown(err.Error())
 		exe.InstalledPathSame = unknown("the image could not be hashed")
@@ -563,12 +571,15 @@ func hashOpenFile(f *os.File, path string) (string, os.FileInfo, error) {
 	return hex.EncodeToString(h.Sum(nil)), after, nil
 }
 
-// readRegularFile reads a whole file through openRegular (releaserecord.go): EVERY
-// FILE THE INSPECTOR READS BY PATHNAME goes through that one open, non-blocking
-// and then fstat'ed, because the inspector's inputs are named by its
-// configuration or by systemd's answer, and a plain open of a FIFO at any of
-// them blocks before any stat, which neither the sample count nor systemctl's
-// timeout bounds. A special file is could-not-tell with the reason instead.
+// readRegularFile reads a whole file through openRegular (regularfile.Open):
+// EVERY FILE THIS PACKAGE READS BY PATHNAME goes through that one open, for
+// identity first and then only a regular file, because the inspector's inputs
+// are named by its configuration or by systemd's answer, and a plain open of a
+// FIFO at any of them blocks before any stat, which neither the sample count
+// nor systemctl's timeout bounds. A special file is could-not-tell with the
+// reason instead. The readers this package delegates to (provenance.Read,
+// state.PeekDeploymentID, hostupgrade.ReadJournal, wirecert.SnapshotAuthority)
+// read through the same package, each behind its own boundary.
 func readRegularFile(path string) ([]byte, error) {
 	f, _, err := openRegular(path, false)
 	if err != nil {
@@ -1149,6 +1160,12 @@ func supportedCmdlineWords(args []string, role string) bool {
 // report would not read.
 func supportedCmdline(args []string, role string) bool {
 	return supportedCmdlineWords(args, role) && filepath.IsAbs(args[3])
+}
+
+// reopenForReading is regularfile.Reopen: the regular-file rule on the identity
+// descriptor, then a readable descriptor on the same file.
+func reopenForReading(f *os.File) (*os.File, error) {
+	return regularfile.Reopen(f)
 }
 
 // statThroughRoot opens an absolute path as the process sees it and returns the
