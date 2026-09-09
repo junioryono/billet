@@ -102,7 +102,10 @@ func TestADrainsReRegistrationPublishesAndSupersessionDoesNot(t *testing.T) {
 			done := make(chan struct{})
 			t.Cleanup(nodeclient.SetDrainServingDoneForTest(func() { close(done) }))
 
-			compute := &fakeCompute{}
+			// RECOVERY IS HELD after the first publication, so no ordinary poll can
+			// run before the stop: the drain's first poll is then the FIRST poll,
+			// and nothing else can consume the gate's release meant for it.
+			compute := &fakeCompute{recoverGate: make(chan struct{}), recoverStarted: make(chan struct{})}
 			c := h.client(t)
 
 			ctx, cancel := context.WithCancel(t.Context())
@@ -126,15 +129,22 @@ func TestADrainsReRegistrationPublishesAndSupersessionDoesNot(t *testing.T) {
 			// The initial record, then the node holds compute and is told to stop:
 			// it drains, polling for the destroy that would free it.
 			initial := awaitRecord(t, path, "")
+			<-compute.recoverStarted
 			compute.setHolding(true)
 
 			pollGate := h.hold(pollPath)
 			regGate := h.hold("/v1/register")
 
-			// EVERY BASELINE PRECEDES THE ACTION THAT MOVES IT: the drain's first
-			// poll can arrive before a count taken after the stop.
+			// EVERY BASELINE PRECEDES THE ACTION THAT MOVES IT, and the stop
+			// arrives while recovery is still held, so no poll has happened yet:
+			// the count is zero and the next poll is the drain's.
 			polls := h.count(pollPath)
+			if polls != 0 {
+				t.Fatalf("%d polls before the stop; recovery was not holding the loop", polls)
+			}
+
 			cancel()
+			close(compute.recoverGate)
 
 			// The drain's first poll waits at the gate.
 			waitFor(t, func() bool { return h.count(pollPath) > polls })
