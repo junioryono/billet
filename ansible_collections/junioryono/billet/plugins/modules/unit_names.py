@@ -189,7 +189,13 @@ def _classify(path, unit_path):
     # target that chases to /dev/null itself is the mask.
     if chased == "/dev/null":
         return {"kind": "mask", "path": path, "target": target}
-    if not any(chased.startswith(p.rstrip("/") + "/") for p in unit_path):
+    # MEMBERSHIP INCLUDES EQUALITY, as systemd's path_startswith does (an empty
+    # remainder is still inside the search path): a target that is a lookup
+    # directory itself is then validated as an alias whose name is that
+    # directory's, which is not a unit name, and refuses, where a prefix test
+    # requiring a further component would have called it a linked unit that
+    # claims the name and hides the alias below it.
+    if not any(chased == p.rstrip("/") or chased.startswith(p.rstrip("/") + "/") for p in unit_path):
         return {"kind": "external", "path": path, "target": target}
     target_name = os.path.basename(chased)
     _validate_alias(path, target_name)
@@ -213,9 +219,9 @@ def _name_parts(name):
         return None
     if "@" not in stem:
         return stem, None
+    # The first @ is the delimiter; an instance may itself contain @ (unit-name.c,
+    # v255), so other@x@y.service is the instance x@y of other@.service.
     prefix, instance = stem.split("@", 1)
-    if "@" in instance:
-        return None
     return prefix, instance
 
 
@@ -353,8 +359,10 @@ def follow(name, entries):
 
     As systemd's unit_ids_map_get (v255): a target that is an instance name
     with no entry falls back to its template's entry (other@x.service ->
-    actual@x.service resolves through actual@.service), and at most eight hops
-    are followed, a longer chain failing to load.
+    actual@x.service resolves through actual@.service), and at most seven alias
+    hops are followed, the eighth lookup having to reach a terminal entry (the
+    loop runs FOLLOW_MAX times and the terminal lookup takes one), a longer
+    chain failing to load.
     """
     chain = [name]
     seen = {name}

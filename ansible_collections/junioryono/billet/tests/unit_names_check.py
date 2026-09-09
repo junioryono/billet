@@ -423,6 +423,9 @@ def instance_alias_falls_back_to_template(mod, t):
     result, problems = mod.resolve(t.unit_path, BILLET)
     assert problems == [], problems
     assert result["aliases"] == [], result
+    end, chain, why = mod.follow("other@x.service", mod.source_name_map(t.unit_path)[0])
+    assert (end, why) == ("actual@.service", None), (end, chain, why)
+    assert chain == ["other@x.service", "actual@x.service", "actual@.service"], chain
 
 
 @case("an instance alias whose template does not exist either is dangling")
@@ -433,14 +436,62 @@ def instance_alias_without_template_dangles(mod, t):
     assert problems and "dangling" in problems[0], problems
 
 
-@case("a chain of eight hops refuses, as systemd follows at most seven")
+@case("seven alias hops resolve and an eighth refuses, as systemd's lookup does")
 def hop_limit(mod, t):
+    # a0 -> a1 -> ... -> a7 -> billet-server.service: a1 reaches the fragment
+    # through seven aliases and resolves; a0 needs eight and refuses.
     t.fragment(t.lib, "billet-server.service")
     names = ["a%d.service" % i for i in range(8)]
     for i, name in enumerate(names):
         t.link(t.etc, name, names[i + 1] if i + 1 < len(names) else "billet-server.service")
     result, problems = mod.resolve(t.unit_path, BILLET)
-    assert any("hops" in p for p in problems), (problems, result)
+    assert len(problems) == 1 and problems[0].startswith("a0.service ") and "hops" in problems[0], (problems, result)
+    a1 = [a for a in result["aliases"] if a["name"] == "a1.service"]
+    assert a1 and a1[0]["target"] == "billet-server.service", result
+    assert a1[0]["chain"] == names[1:] + ["billet-server.service"], a1[0]["chain"]
+
+
+@case("a target that is a lookup directory itself refuses, since its name is no unit name")
+def lookup_dir_target_refuses(mod, t):
+    # etc/runner.service -> /usr/lib/systemd/system: systemd's prefix match
+    # includes equality, validates the basename `system` as an alias name and
+    # skips the link, so lib/runner.service -> billet-server.service is what it
+    # loads; a membership test requiring a further component would have called
+    # the upper link external and let it hide that alias.
+    t.fragment(t.lib, "billet-server.service")
+    t.link(t.etc, "runner.service", str(t.lib))
+    t.link(t.lib, "runner.service", "billet-server.service")
+    try:
+        mod.resolve(t.unit_path, BILLET)
+    except mod.Unreadable as exc:
+        assert "not a .service unit name" in str(exc), exc
+        return
+    raise AssertionError("a link to a lookup directory was accepted as a linked unit")
+
+
+@case("an instance whose name carries another @ is the instance systemd reads and resolves through its template")
+def instance_with_extra_at(mod, t):
+    t.fragment(t.lib, "billet-server.service")
+    t.fragment(t.lib, "actual@.service")
+    t.link(t.etc, "other@x@y.service", "actual@x@y.service")
+    result, problems = mod.resolve(t.unit_path, BILLET)
+    assert problems == [], problems
+    end, chain, why = mod.follow("other@x@y.service", mod.source_name_map(t.unit_path)[0])
+    assert (end, why) == ("actual@.service", None), (end, chain, why)
+    assert chain == ["other@x@y.service", "actual@x@y.service", "actual@.service"], chain
+
+
+@case("an instance alias to another instance refuses, since systemd rejects it")
+def instance_mismatch_refuses(mod, t):
+    t.fragment(t.lib, "billet-server.service")
+    t.fragment(t.lib, "actual@.service")
+    t.link(t.etc, "other@x.service", "actual@y.service")
+    try:
+        mod.resolve(t.unit_path, BILLET)
+    except mod.Unreadable as exc:
+        assert "another instance" in str(exc), exc
+        return
+    raise AssertionError("an instance alias to another instance was accepted")
 
 
 def _link_chain(t, count):

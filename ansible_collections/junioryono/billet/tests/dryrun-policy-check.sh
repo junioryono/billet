@@ -275,6 +275,70 @@ ansible-playbook -i localhost, "$work/rendered/render.yml" >"$work/rendered/rend
 grep -c '^After=' "$work/rendered/lib/billet-server.service" | grep -q '^2$' || fail "the rendered unit does not carry the repeated After= this case exists for" rendered
 allowed rendered "the role's server unit rendered with a ledger volume and an environment file passes"
 
+# THE OTHER BRANCHES OF THE TEMPLATES ARE PASSING FIXTURES TOO: the server held
+# by prepare-only (AssertPathExists=!/ in [Unit]) and the node template with and
+# without firecracker's network unit and an environment file, so a directive
+# any branch writes that the allowlist lacks refuses here and not on a host.
+fixture renderedprepare
+sed "s|billet_server_prepare_only: false|billet_server_prepare_only: true|" "$work/rendered/render.yml" | sed "s|$work/rendered/lib|$work/renderedprepare/lib|" >"$work/renderedprepare/render.yml"
+ansible-playbook -i localhost, "$work/renderedprepare/render.yml" >"$work/renderedprepare/render.txt" 2>&1 || { sed -n '1,40p' "$work/renderedprepare/render.txt" >&2; exit 1; }
+grep -q '^AssertPathExists=!/' "$work/renderedprepare/lib/billet-server.service" || fail "the prepare-only render does not carry the hold this case exists for" renderedprepare
+allowed renderedprepare "the role's server unit rendered held by prepare-only passes"
+
+fixture renderednode
+cat >"$work/renderednode/render.yml" <<PLAY
+---
+- name: Render the role's node unit both ways
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Render with firecracker and an environment file
+      ansible.builtin.template:
+        src: $collection/roles/host/templates/billet-node.service.j2
+        dest: $work/renderednode/lib/billet-node.service
+        mode: "0644"
+      vars:
+        billet_service_user: root
+        billet_service_group: root
+        billet_systemd_notify_ready: true
+        billet_firecracker_enabled: true
+        billet_config:
+          node:
+            state_dir: /var/lib/billet/node
+        billet_server_prepare_only: false
+        billet_server_environment:
+          BILLET_EXAMPLE: value
+        billet_server_environment_path: /etc/billet/node.env
+    - name: Render without firecracker and without an environment file
+      ansible.builtin.template:
+        src: $collection/roles/host/templates/billet-node.service.j2
+        dest: $work/renderednode/lib/billet-node-plain.service
+        mode: "0644"
+      vars:
+        billet_service_user: root
+        billet_service_group: root
+        billet_systemd_notify_ready: false
+        billet_firecracker_enabled: false
+        billet_config: {}
+        billet_server_prepare_only: false
+        billet_server_environment: {}
+        billet_server_environment_path: /etc/billet/node.env
+PLAY
+ansible-playbook -i localhost, "$work/renderednode/render.yml" >"$work/renderednode/render.txt" 2>&1 || { sed -n '1,40p' "$work/renderednode/render.txt" >&2; exit 1; }
+grep -q '^Requires=billet-network.service' "$work/renderednode/lib/billet-node.service" || fail "the node render does not carry the firecracker dependency this case exists for" renderednode
+grep -q '^EnvironmentFile=' "$work/renderednode/lib/billet-node.service" || fail "the node render does not carry the environment file this case exists for" renderednode
+sed -i.bak 's/^NeedDaemonReload=no/NeedDaemonReload=yes/' "$work/renderednode/fake/billet-node.service.props"
+allowed renderednode "the role's node unit rendered with firecracker and an environment file passes"
+grep -q 'billet-node.service: systemd reports' "$work/renderednode/out.txt" || fail "the rendered node unit was not compared" renderednode
+# The plain render is compared as the node unit of its own fixture: the loaded
+# Type must be exec to match it.
+fixture renderednodeplain
+cp "$work/renderednode/lib/billet-node-plain.service" "$work/renderednodeplain/lib/billet-node.service"
+sed -i.bak 's/^NeedDaemonReload=no/NeedDaemonReload=yes/; s/^Type=notify/Type=exec/' "$work/renderednodeplain/fake/billet-node.service.props"
+allowed renderednodeplain "the role's node unit rendered without firecracker or an environment file passes"
+grep -q 'billet-node.service: systemd reports' "$work/renderednodeplain/out.txt" || fail "the plain rendered node unit was not compared" renderednodeplain
+
 fixture quote
 sed -i.bak 's|^ExecStart=.*|ExecStart=/usr/bin/billet server --config "/etc/billet/billet.yaml"|' "$work/quote/lib/billet-server.service"
 refused quote "a quoted argument refuses" "not one line this dry run can compare"
