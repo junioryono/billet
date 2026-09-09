@@ -65,6 +65,21 @@ func newGuardFixture(t *testing.T) *guardFixture {
 
 func (f *guardFixture) active() string { return filepath.Join(f.root, "active") }
 
+// openRootForTest opens the upgrade root the way the lock hands it to the
+// claim helpers, for a fixture that calls them without taking the lock.
+func openRootForTest(t *testing.T) *os.File {
+	t.Helper()
+
+	root, err := os.OpenFile(upgradeRoot, os.O_RDONLY|syscall.O_DIRECTORY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() { _ = root.Close() })
+
+	return root
+}
+
 func (f *guardFixture) record(t *testing.T) guardRecord {
 	t.Helper()
 
@@ -253,11 +268,14 @@ func TestAHoldPublishesInOneOrder(t *testing.T) {
 				"rename upgrades/active/guard.json", "fsync upgrades/active", "fsync upgrades",
 			}
 
-			// A ROOT CREATED HERE HAS ITS PARENT FLUSHED BY THE ACQUISITION, before
-			// anything is written under it: an acquisition that failed later would
-			// otherwise leave a root whose entry is not durable and whose next
-			// acquisition finds it existing and flushes nothing.
-			if !existing {
+			// THE PARENT IS FLUSHED BY EVERY ACQUISITION, right after the root is
+			// found or made and before anything is written under it: an acquisition
+			// that made the root and died before its flush leaves a root the next
+			// one finds existing, and a flush only the creator performed would then
+			// be owed by nobody.
+			if existing {
+				want = slices.Insert(want, 1, "fsync "+f.parent)
+			} else {
 				want = slices.Insert(want, 1, "mkdir upgrades", "fsync "+f.parent)
 			}
 
@@ -655,6 +673,41 @@ func helperArgs(args ...string) map[string]string {
 	return map[string]string{guardHelperArgsEnv: strings.Join(args, "\x1f")}
 }
 
+// G2b: A ROOT LEFT BY AN ACQUISITION KILLED BETWEEN ITS MKDIR AND ITS PARENT
+// FLUSH is flushed by the next acquisition, which finds it existing.
+func TestARootAKilledAcquisitionLeftUnflushedIsFlushedByTheNext(t *testing.T) {
+	f := newGuardFixture(t)
+
+	env := helperArgs("hold", "--holder", "ci-1")
+	env[guardHelperStopEnv] = "fsync " + f.parent
+
+	h := startGuardHelper(t, "command", env)
+	h.await(t, "STOPPED")
+	h.kill(t)
+
+	if _, err := os.Lstat(f.root); err != nil {
+		t.Fatalf("the killed acquisition left no root: %v", err)
+	}
+
+	var flushed []string
+
+	guardHook = func(op guardOp) error {
+		if op.Kind == "fsync" {
+			flushed = append(flushed, op.Path)
+		}
+
+		return nil
+	}
+
+	mustHold(t, "ci-1")
+
+	guardHook = nil
+
+	if !slices.Contains(flushed, f.parent) {
+		t.Errorf("the next acquisition flushed %q, want the root's parent among them", flushed)
+	}
+}
+
 // G3: INTERRUPTION AT EACH PUBLICATION STEP, by a helper killed where it
 // stands: the remainder is what the durability table names and its recovery
 // answers.
@@ -783,9 +836,10 @@ func TestASameHolderHoldValidatesAndTouchesNothing(t *testing.T) {
 		}
 	}
 
-	// THE TWO DIRECTORY FLUSHES, in publication order, and no file's.
-	if want := []string{f.active(), f.root}; !reflect.DeepEqual(flushed, want) {
-		t.Errorf("a same-holder hold flushed %q, want the guard directory then the root", flushed)
+	// THE ACQUISITION'S PARENT FLUSH, then the two directory flushes in
+	// publication order, and no file's.
+	if want := []string{f.parent, f.active(), f.root}; !reflect.DeepEqual(flushed, want) {
+		t.Errorf("a same-holder hold flushed %q, want the parent, the guard directory then the root", flushed)
 	}
 
 	bytesAfter, err := os.ReadFile(filepath.Join(f.active(), guardRecordName))
@@ -1398,20 +1452,20 @@ func TestTheGoClaimHelpersPreserveAGuard(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := publishClaim(staged); err == nil || !strings.Contains(err.Error(), "already in progress") {
+	if err := publishClaim(tx.dir, staged); err == nil || !strings.Contains(err.Error(), "already in progress") {
 		t.Errorf("publishClaim over a guard: err = %v, want the in-progress refusal", err)
 	}
 
 	for _, dir := range []string{recovery, filepath.Join(f.root, "recovery-other")} {
-		if err := releaseClaim(dir); err == nil || !strings.Contains(err.Error(), "converge-guard") {
+		if err := releaseClaim(tx.dir, dir); err == nil || !strings.Contains(err.Error(), "converge-guard") {
 			t.Errorf("releaseClaim(%s) over a guard: err = %v, want a refusal naming the guard", dir, err)
 		}
 
-		if err := refuseClaimed(dir, errors.New("refused")); err == nil {
+		if err := refuseClaimed(tx.dir, dir, errors.New("refused")); err == nil {
 			t.Errorf("refuseClaimed(%s) over a guard succeeded", dir)
 		}
 
-		if err := abandonClaim(dir); err == nil {
+		if err := abandonClaim(tx.dir, dir); err == nil {
 			t.Errorf("abandonClaim(%s) over a guard succeeded", dir)
 		}
 	}
@@ -1812,14 +1866,21 @@ func TestATakeoverRelabelsAndKeepsEverythingElse(t *testing.T) {
 		mustOK(t, os.Remove(tmp))
 	}
 
-	// A TRUSTED STALE TEMPORARY IS TRUNCATED ONLY AFTER ITS DESCRIPTOR IS
-	// VALIDATED: with the truncation refused by the hook, the bytes the open
-	// found are still there, which an open with O_TRUNC would have discarded.
+	// A TRUSTED STALE TEMPORARY IS EXAMINED THROUGH AN IDENTITY DESCRIPTOR AND
+	// THEN REMOVED BY ITS NAME, never opened for writing and never truncated:
+	// with the removal refused by the hook, the bytes are still there, and no
+	// operation opened the temporary for writing or truncated it.
 	mustOK(t, os.WriteFile(tmp, []byte("the previous takeover's half-written record"), 0o600))
 
+	var kinds []string
+
 	guardHook = func(op guardOp) error {
-		if op.Kind == "truncate" {
-			return errors.New("injected: the truncation refused")
+		if strings.HasSuffix(op.Path, guardTmpName) {
+			kinds = append(kinds, op.Kind)
+		}
+
+		if op.Kind == "unlink" && strings.HasSuffix(op.Path, guardTmpName) {
+			return errors.New("injected: the removal refused")
 		}
 
 		return nil
@@ -1827,7 +1888,11 @@ func TestATakeoverRelabelsAndKeepsEverythingElse(t *testing.T) {
 
 	if err := guardRun(t, "hold", "--holder", "ci-2", "--recover-from", "ci-1", "--old-driver-stopped"); err == nil ||
 		!strings.Contains(err.Error(), "injected") {
-		t.Errorf("the injected truncation failure: err = %v", err)
+		t.Errorf("the injected removal failure: err = %v", err)
+	}
+
+	if !reflect.DeepEqual(kinds, []string{"create", "unlink"}) {
+		t.Errorf("the operations on the stale temporary were %v, want the exclusive create's refusal then the unlink", kinds)
 	}
 
 	guardHook = nil

@@ -15,7 +15,6 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/junioryono/billet/internal/hostupgrade"
 	"github.com/junioryono/billet/internal/regularfile"
 )
 
@@ -422,7 +421,7 @@ func openGuardTmpAt(dir *os.File, replace bool) (*os.File, error) {
 	}
 
 	// A FRESH TEMPORARY IS CREATED EXCLUSIVELY, in both modes; only a takeover
-	// meeting one that exists goes on to examine and replace it.
+	// meeting one that exists goes on to examine, remove and re-create it.
 	fd, err := unix.Openat(int(dir.Fd()), guardTmpName,
 		unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0o600)
 
@@ -435,50 +434,45 @@ func openGuardTmpAt(dir *os.File, replace bool) (*os.File, error) {
 		return nil, fmt.Errorf("%s exists; the guard was not published cleanly", tmp)
 	}
 
-	fd, err = unix.Openat(int(dir.Fd()), guardTmpName,
-		unix.O_WRONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	// A STALE TEMPORARY IS EXAMINED, THEN REMOVED, NEVER OPENED FOR WRITING: the
+	// entry is opened for its identity alone (a device's driver never invoked
+	// on Linux, a FIFO never waited on), judged on that descriptor (regular,
+	// owned, writable by nobody else, ONE LINK: a temporary that is another
+	// name of the record, of a preserved binary or of a journal is not this
+	// hold's leftover, whatever removing one name would do), and only then
+	// unlinked by its name relative to the directory, so no inode is ever
+	// truncated in place; a fresh temporary is then created exclusively.
+	stale, opened, err := regularfile.OpenAt(dir, guardTmpName)
 	if err != nil {
-		return nil, fmt.Errorf("the stale %s cannot be replaced: %w: open it: %w", guardTmpName, errTrustBoundary, err)
+		return nil, fmt.Errorf("the stale %s cannot be replaced: %w: examine it: %w", guardTmpName, errTrustBoundary, err)
 	}
 
-	f := os.NewFile(uintptr(fd), tmp)
-
-	opened, err := f.Stat()
-	if err != nil {
-		_ = f.Close()
-
-		return nil, fmt.Errorf("examine the opened %s: %w", guardTmpName, err)
-	}
+	_ = stale.Close()
 
 	if err := requireTrustedFile(tmp, opened); err != nil {
-		_ = f.Close()
-
 		return nil, fmt.Errorf("the stale %s cannot be replaced: %w", guardTmpName, err)
 	}
 
-	// ONE LINK: a temporary hard-linked to the record, to a preserved binary or
-	// to a journal would be truncated in place, and that inode's other name
-	// would lose its bytes before anything was published.
 	if links := linkCountOf(opened); links != 1 {
-		_ = f.Close()
-
-		return nil, fmt.Errorf("the stale %s cannot be replaced: %w: it has %d links, and truncating it would "+
-			"empty every name of that inode", guardTmpName, errTrustBoundary, links)
+		return nil, fmt.Errorf("the stale %s cannot be replaced: %w: it has %d links, so it is another name of "+
+			"something and not this hold's leftover", guardTmpName, errTrustBoundary, links)
 	}
 
-	if err := guardObserve("truncate", tmp, f); err != nil {
-		_ = f.Close()
-
+	if err := guardObserve("unlink", tmp, nil); err != nil {
 		return nil, err
 	}
 
-	if err := f.Truncate(0); err != nil {
-		_ = f.Close()
-
-		return nil, fmt.Errorf("truncate the stale %s: %w", guardTmpName, err)
+	if err := unix.Unlinkat(int(dir.Fd()), guardTmpName, 0); err != nil {
+		return nil, fmt.Errorf("remove the stale %s: %w", guardTmpName, err)
 	}
 
-	return f, nil
+	fd, err = unix.Openat(int(dir.Fd()), guardTmpName,
+		unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("stage the guard after removing the stale %s: %w", guardTmpName, err)
+	}
+
+	return os.NewFile(uintptr(fd), tmp), nil
 }
 
 // requireTrustedFile is the trust boundary for one regular file: regular, owned
@@ -768,17 +762,12 @@ func hashCandidate(root *txLock, candidate string) (string, string, error) {
 		return "", "", err
 	}
 
-	f, err := openRegularAt(dir, filepath.Base(cleaned))
+	f, info, err := regularfile.OpenAt(dir, filepath.Base(cleaned))
 	if err != nil {
 		return "", "", fmt.Errorf("open the candidate %s: %w", cleaned, err)
 	}
 
 	defer func() { _ = f.Close() }()
-
-	info, err := f.Stat()
-	if err != nil {
-		return "", "", fmt.Errorf("examine the candidate: %w", err)
-	}
 
 	if err := requireTrustedFile(cleaned, info); err != nil {
 		return "", "", err
@@ -1140,14 +1129,10 @@ func takeOverGuard(root *txLock, old, holder string) error {
 		return fmt.Errorf("the transaction pointer names %s: %w", target, err)
 	}
 
-	// THE JOURNAL IS READ BY ITS NAME, so the root must still be the root the
-	// lock validated: a root replaced at its name would resolve the target
-	// through another tree.
-	if err := requireRootInPlace(root); err != nil {
-		return err
-	}
-
-	if _, err := hostupgrade.ReadJournal(target); err != nil {
+	// THE JOURNAL IS READ THROUGH THE ROOT THE LOCK VALIDATED, the pointer's
+	// target opened relative to it, so a root displaced at its name resolves
+	// nothing here.
+	if _, err := readJournalUnder(root.dir, target); err != nil {
 		return fmt.Errorf("the transaction pointer names %s, whose journal cannot be read: %w; nothing "+
 			"was taken over", target, err)
 	}
@@ -1381,43 +1366,27 @@ func openActiveOf(root *os.File) (*os.File, error) {
 }
 
 // readRecordAt reads `guard.json` through the guard directory's descriptor:
-// opened O_NOFOLLOW and O_NONBLOCK, required regular, bounded.
+// opened identity first relative to it, required regular, AND REQUIRED INSIDE
+// THE TRUST BOUNDARY on the descriptor read (owned by the account, writable by
+// nobody else), bounded. The directory's mode says who can name a record; it
+// says nothing about a record that is another name of a file someone else
+// owns, which a hard link makes, and a record another account can write is
+// one that can name any holder it likes.
 func readRecordAt(dir *os.File) ([]byte, error) {
 	path := filepath.Join(dir.Name(), guardRecordName)
 
-	f, err := openRegularAt(dir, guardRecordName)
+	f, info, err := regularfile.OpenAt(dir, guardRecordName)
 	if err != nil {
 		return nil, err
 	}
 
 	defer func() { _ = f.Close() }()
 
-	return regularfile.ReadAllLimited(f, path, maxGuardRecordBytes)
-}
-
-// openRegularAt opens one entry of a directory for reading, IDENTITY FIRST:
-// the name is opened for its identity alone relative to the directory (an
-// O_PATH descriptor on Linux, which invokes no driver; a non-blocking open
-// elsewhere, where the platform has nothing better and the regularfile package
-// says so), and regularfile.Reopen turns that into a readable descriptor of
-// the same inode only when it is a regular file on a filesystem that stores
-// bytes. A device or a pseudo-file at the name is refused without being read.
-func openRegularAt(dir *os.File, name string) (*os.File, error) {
-	path := filepath.Join(dir.Name(), name)
-
-	id, err := openIdentityAt(dir, name)
-	if err != nil {
-		return nil, &os.PathError{Op: "open", Path: path, Err: err}
-	}
-
-	defer func() { _ = id.Close() }()
-
-	f, err := regularfile.Reopen(id)
-	if err != nil {
+	if err := requireTrustedFile(path, info); err != nil {
 		return nil, err
 	}
 
-	return f, nil
+	return regularfile.ReadAllLimited(f, path, maxGuardRecordBytes)
 }
 
 func (s claimShape) String() string {

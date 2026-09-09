@@ -24,6 +24,12 @@ func openForIdentity(path string, opts Options) (*os.File, error) {
 	return os.NewFile(uintptr(fd), path), nil
 }
 
+// openIdentityAt is openForIdentity relative to a directory descriptor, the
+// entry itself admitted whatever it is (a link included) and never followed.
+func openIdentityAt(dirFD int, name string) (int, error) {
+	return unix.Openat(dirFD, name, unix.O_PATH|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+}
+
 // configfsMagic is configfs's superblock magic, which x/sys/unix does not name:
 // its attributes are regular-mode files whose reads dispatch to a subsystem's
 // callback (a TSM report attribute produces an attestation report when read).

@@ -209,6 +209,29 @@ func ReadJournal(dir string) (*Journal, error) {
 	// a FIFO at the name would block a plain read, and `release inspect` reads
 	// the journal of any claim it finds.
 	body, err := regularfile.ReadFile(filepath.Join(dir, JournalName), maxJournalBytes, regularfile.Options{})
+
+	return parseJournal(body, err)
+}
+
+// ReadJournalAt is ReadJournal for a recovery directory the caller holds open,
+// the journal opened relative to that descriptor and never by a name a root
+// displaced in the meantime would resolve elsewhere.
+func ReadJournalAt(dir *os.File) (*Journal, error) {
+	f, _, err := regularfile.OpenAt(dir, JournalName)
+	if err != nil {
+		return parseJournal(nil, err)
+	}
+
+	defer func() { _ = f.Close() }()
+
+	body, err := regularfile.ReadAllLimited(f, filepath.Join(dir.Name(), JournalName), maxJournalBytes)
+
+	return parseJournal(body, err)
+}
+
+// parseJournal is the one reading of a journal's bytes, whichever open
+// produced them.
+func parseJournal(body []byte, err error) (*Journal, error) {
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, ErrNoJournal

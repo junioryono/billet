@@ -16,6 +16,8 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/hostupgrade"
 	"github.com/junioryono/billet/internal/initconfig"
@@ -712,8 +714,8 @@ var (
 // journal records a decision that was refused rather than an upgrade somebody
 // needs to read about — and a rollout retries every few minutes, which would
 // otherwise leave one behind each time.
-func refuseClaimed(dir string, err error) error {
-	claimErr := releaseClaim(dir)
+func refuseClaimed(root *os.File, dir string, err error) error {
+	claimErr := releaseClaim(root, dir)
 	if claimErr == nil {
 		_ = os.RemoveAll(dir)
 	}
@@ -742,7 +744,7 @@ func refuseClaimed(dir string, err error) error {
 // how a caller is told, since nothing else can enforce it.
 func actOnResolved(ctx context.Context, cfg *config.Config, cfgPath string,
 	target hostUpgradeTarget, ack *upgradeAck, client *releasesource.Client,
-	manifest *releasesource.Manifest, digest string, _ *txLock,
+	manifest *releasesource.Manifest, digest string, tx *txLock,
 ) error {
 	if err := checkResolvedDigest(target, digest); err != nil {
 		return err
@@ -881,7 +883,7 @@ func actOnResolved(ctx context.Context, cfg *config.Config, cfgPath string,
 		return err
 	}
 
-	if err := publishClaim(dir); err != nil {
+	if err := publishClaim(tx.dir, dir); err != nil {
 		return err
 	}
 
@@ -897,7 +899,7 @@ func actOnResolved(ctx context.Context, cfg *config.Config, cfgPath string,
 	// SECOND instruction, and the window that matters is the whole length of this
 	// one — which is unbounded, because it contains a drain.
 	if err := checkAndRecordDecision(target); err != nil {
-		return refuseClaimed(dir, err)
+		return refuseClaimed(tx.dir, dir, err)
 	}
 
 	// A SELF-READ INSTRUCTION IS READ AGAIN, NOW THAT THE CLAIM HOLDS THE HOST
@@ -906,7 +908,7 @@ func actOnResolved(ctx context.Context, cfg *config.Config, cfgPath string,
 	// ask.
 	if target.fromRollout {
 		if err := confirmFleetDecision(ctx, cfg, target); err != nil {
-			return refuseClaimed(dir, err)
+			return refuseClaimed(tx.dir, dir, err)
 		}
 	}
 
@@ -942,7 +944,7 @@ func actOnResolved(ctx context.Context, cfg *config.Config, cfgPath string,
 		return err
 	}
 
-	return finishHostUpgrade(ctx, journal, host)
+	return finishHostUpgrade(ctx, tx.dir, journal, host)
 }
 
 // ledgerKindFor says which shape of transaction a host's ledger needs.
@@ -992,14 +994,12 @@ func resumeHostUpgrade(ctx context.Context, cfg *config.Config) error {
 
 	dir := shape.Target
 
-	// THE JOURNAL IS READ BY ITS NAME under the root's name: the root must still
-	// be the one the lock validated, or the resume would read another tree's
-	// journal and act on this one's claim.
-	if err := requireRootInPlace(tx); err != nil {
-		return err
-	}
-
-	journal, err := hostupgrade.ReadJournal(dir)
+	// THE JOURNAL IS READ THROUGH THE ROOT THE LOCK VALIDATED: the claim's target
+	// is required to be a direct child of the root, that child is opened
+	// relative to the root's descriptor, and the journal is read relative to
+	// that, so a root displaced at its name between the lock and this read
+	// resolves nothing.
+	journal, err := readJournalUnder(tx.dir, dir)
 	if errors.Is(err, hostupgrade.ErrNoJournal) {
 		// A CLAIM WITH NO JOURNAL IS A TRANSACTION THAT NEVER BEGAN, and it is
 		// recoverable precisely because of what the ordering guarantees: the journal
@@ -1022,7 +1022,7 @@ func resumeHostUpgrade(ctx context.Context, cfg *config.Config) error {
 			dir)
 		fmt.Printf("machine was touched. Releasing the claim; nothing else is needed.\n")
 
-		return releaseClaim(dir)
+		return releaseClaim(tx.dir, dir)
 	}
 
 	if err != nil {
@@ -1043,7 +1043,7 @@ func resumeHostUpgrade(ctx context.Context, cfg *config.Config) error {
 	fmt.Printf("Resuming the upgrade %s -> %s, which reached %s.\n",
 		journal.FromVersion, journal.ToVersion, journal.Step)
 
-	if done, err := settleResumedDecision(journal); err != nil || done {
+	if done, err := settleResumedDecision(tx.dir, journal); err != nil || done {
 		return err
 	}
 
@@ -1052,7 +1052,7 @@ func resumeHostUpgrade(ctx context.Context, cfg *config.Config) error {
 		return err
 	}
 
-	return finishHostUpgrade(ctx, journal, host)
+	return finishHostUpgrade(ctx, tx.dir, journal, host)
 }
 
 // finishHostUpgrade runs the transaction and releases the claim only once the
@@ -1069,7 +1069,7 @@ func resumeHostUpgrade(ctx context.Context, cfg *config.Config) error {
 // cordon, a committed upgrade whose services did not come back, a failure this
 // build cannot classify — keeps it, because keeping it is what makes `--resume`
 // find the transaction and what stops a rollout starting a second one on top.
-func finishHostUpgrade(ctx context.Context, journal *hostupgrade.Journal,
+func finishHostUpgrade(ctx context.Context, root *os.File, journal *hostupgrade.Journal,
 	host hostupgrade.Host,
 ) error {
 	err := hostupgrade.Run(ctx, hostupgrade.Request{Journal: journal, Host: host})
@@ -1106,7 +1106,7 @@ func finishHostUpgrade(ctx context.Context, journal *hostupgrade.Journal,
 		return err
 	}
 
-	if claimErr := releaseClaim(journal.Dir); claimErr != nil {
+	if claimErr := releaseClaim(root, journal.Dir); claimErr != nil {
 		return errors.Join(err, claimErr)
 	}
 
@@ -1344,7 +1344,7 @@ func describeTarget(target hostUpgradeTarget) string {
 // ambiguous, and the ambiguity is resolved toward FINISHING: a superseded release
 // installed on one host is a rollout that dispatches again, while a host left
 // stopped is one a person has to go and find.
-func settleResumedDecision(journal *hostupgrade.Journal) (bool, error) {
+func settleResumedDecision(root *os.File, journal *hostupgrade.Journal) (bool, error) {
 	if journal.Generation <= 0 {
 		return false, nil
 	}
@@ -1361,11 +1361,41 @@ func settleResumedDecision(journal *hostupgrade.Journal) (bool, error) {
 		fmt.Printf("has left behind. It never got past claiming, so nothing here was\n")
 		fmt.Printf("touched. Abandoning it.\n")
 
-		return true, abandonClaim(journal.Dir)
+		return true, abandonClaim(root, journal.Dir)
 	}
 
 	// RECORDED NOW, because the crash is what stopped it being recorded before.
 	return false, recordDecision(journal.Generation)
+}
+
+// readJournalUnder reads the journal of a recovery directory that must be a
+// direct child of the upgrade root, opening the child relative to the root's
+// descriptor (a directory, never a link) and the journal relative to the
+// child. The path is what the claim or the journal recorded; the read is not
+// through it.
+func readJournalUnder(root *os.File, dir string) (*hostupgrade.Journal, error) {
+	if err := underUpgradeRoot(dir); err != nil {
+		return nil, err
+	}
+
+	if err := guardObserve("openat", dir, nil); err != nil {
+		return nil, err
+	}
+
+	fd, err := unix.Openat(int(root.Fd()), filepath.Base(filepath.Clean(dir)),
+		unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, hostupgrade.ErrNoJournal
+		}
+
+		return nil, fmt.Errorf("open the recovery directory %s: %w", dir, err)
+	}
+
+	recovery := os.NewFile(uintptr(fd), dir)
+	defer func() { _ = recovery.Close() }()
+
+	return hostupgrade.ReadJournalAt(recovery)
 }
 
 // abandonClaim releases a claim and removes the directory behind it.
@@ -1377,7 +1407,7 @@ func settleResumedDecision(journal *hostupgrade.Journal) (bool, error) {
 // decision that was refused rather than an upgrade anybody needs to read about.
 // Keeping them accumulates one directory per superseded instruction on a fleet
 // that retries every few minutes.
-func abandonClaim(dir string) error {
+func abandonClaim(root *os.File, dir string) error {
 	// IT ONLY EVER REMOVES SOMETHING UNDER THE UPGRADE ROOT. The path arrives from
 	// a claim pointer or a journal field, and this is the one operation here that
 	// deletes a tree — so it is bounded by construction rather than by everything
@@ -1387,10 +1417,12 @@ func abandonClaim(dir string) error {
 		return err
 	}
 
-	if err := releaseClaim(dir); err != nil {
+	if err := releaseClaim(root, dir); err != nil {
 		return err
 	}
 
+	// THE TREE IS REMOVED BY ITS NAME, a direct child of the root by the check
+	// above, after the pointer that named it is gone through the descriptor.
 	if err := os.RemoveAll(dir); err != nil {
 		return fmt.Errorf("remove the abandoned recovery directory %s: %w", dir, err)
 	}
@@ -1486,8 +1518,8 @@ func stageClaim() (string, error) {
 }
 
 // publishClaim takes the exclusion, for a directory that already holds a journal.
-func publishClaim(dir string) error {
-	if err := os.Symlink(dir, activePath()); err != nil {
+func publishClaim(root *os.File, dir string) error {
+	if err := unix.Symlinkat(dir, int(root.Fd()), activePointer); err != nil {
 		// THE STAGED DIRECTORY GOES WITH IT. Nothing outside it knows the name, and
 		// this run has touched nothing else, so leaving it would accumulate a
 		// directory per refused attempt on a machine a rollout retries every few
@@ -1503,7 +1535,7 @@ func publishClaim(dir string) error {
 	// A claim that did not survive a power cut leaves a machine mid-upgrade with
 	// `--resume` answering "no upgrade is in progress" — and a second `start` then
 	// takes a fresh claim and begins a new transaction on top of the first.
-	return syncUpgradeDir(upgradeRoot)
+	return syncDirFD(root)
 }
 
 // activePath is the pointer to the transaction in progress.
@@ -1517,7 +1549,7 @@ func activePath() string { return filepath.Join(upgradeRoot, activePointer) }
 // with the pointer would delete the evidence an operator reads after a rollback,
 // and the snapshot a second attempt might still need. Ordinary retention is a
 // person's decision, not this command's.
-func releaseClaim(dir string) error {
+func releaseClaim(root *os.File, dir string) error {
 	// IT REMOVES THE CLAIM IT WAS GIVEN, NOT WHATEVER CLAIM EXISTS.
 	//
 	// Unlinking the pointer blind was a defect a review caught: by the time a
@@ -1539,15 +1571,17 @@ func releaseClaim(dir string) error {
 			"billet cannot tell whose claim this is")
 	}
 
+	// EVERYTHING HERE IS RELATIVE TO THE ROOT THE LOCK VALIDATED, so a root
+	// displaced at its name is not the thing acted on.
 	{
-		switch held, err := os.Readlink(activePath()); {
-		case os.IsNotExist(err):
+		switch held, err := readlinkAt(root, activePointer); {
+		case errors.Is(err, os.ErrNotExist):
 			return nil
 		case err != nil:
 			// A CLAIM THAT IS NOT A SYMLINK IS NOT THIS TRANSACTION'S, and it is
 			// named for what it is: a converge guard or a role's pointer is never
 			// released or removed from here.
-			if shape, classifyErr := classifyClaim(); classifyErr == nil && shape.Kind != claimHostUpgrade {
+			if shape, classifyErr := classifyClaimAt(root); classifyErr == nil && shape.Kind != claimHostUpgrade {
 				return fmt.Errorf("release the upgrade claim: the claim is not this transaction's: %s", shape)
 			}
 
@@ -1560,14 +1594,14 @@ func releaseClaim(dir string) error {
 		}
 	}
 
-	if err := os.Remove(activePath()); err != nil && !os.IsNotExist(err) {
+	if err := unix.Unlinkat(int(root.Fd()), activePointer, 0); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("release the upgrade claim: %w", err)
 	}
 
 	// FLUSHED FOR THE SAME REASON THE CLAIM IS. A removal that did not survive a
 	// power cut leaves a pointer to a finished transaction, and the next start is
 	// refused against an upgrade that is over.
-	return syncUpgradeDir(upgradeRoot)
+	return syncDirFD(root)
 }
 
 // stageCandidate downloads and unpacks the candidate binary.

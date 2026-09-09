@@ -114,22 +114,23 @@ func takeTxLock() (*txLock, error) {
 		if err := unix.Mkdirat(int(parent.Fd()), rootName, 0o700); err != nil {
 			return nil, fmt.Errorf("prepare %s: %w", upgradeRoot, err)
 		}
-
-		// THE PARENT IS FLUSHED HERE, by the acquisition that created the root:
-		// an acquisition that failed later would otherwise leave a root whose
-		// entry is not durable and whose next acquisition finds it existing and
-		// flushes nothing.
-		if err := guardObserve("fsync", parentPath, parent); err != nil {
-			return nil, err
-		}
-
-		if err := parent.Sync(); err != nil {
-			return nil, fmt.Errorf("flush %s: %w", parentPath, err)
-		}
 	case err != nil:
 		return nil, fmt.Errorf("%w: examine %s: %w", errTrustBoundary, upgradeRoot, err)
 	case rootInfo.Mode()&os.ModeSymlink != 0:
 		return nil, fmt.Errorf("%w: %s is a symlink", errTrustBoundary, upgradeRoot)
+	}
+
+	// THE PARENT IS FLUSHED BY EVERY ACQUISITION, whether or not this one made
+	// the root: an acquisition that made it and died before its flush leaves a
+	// root whose entry is not durable and which the next acquisition finds
+	// existing, so a flush that only the creator performed would be owed by
+	// nobody. One fsync of a directory that rarely changes is the price.
+	if err := guardObserve("fsync", parentPath, parent); err != nil {
+		return nil, err
+	}
+
+	if err := parent.Sync(); err != nil {
+		return nil, fmt.Errorf("flush %s: %w", parentPath, err)
 	}
 
 	if err := guardObserve("openat", upgradeRoot, nil); err != nil {
@@ -165,7 +166,7 @@ func takeTxLock() (*txLock, error) {
 	// THE LOCK FILE, RELATIVE TO THE VALIDATED ROOT, never followed: a symlink at
 	// its name is ELOOP, a directory ENOTDIR through the fstat below, a FIFO is
 	// never waited on.
-	f, err := openLockFile(rootFD)
+	f, err := openLockFile(root)
 	if err != nil {
 		_ = root.Close()
 
@@ -245,12 +246,19 @@ func requireRootInPlace(tx *txLock) error {
 
 // openTrustedDir walks to a directory from the filesystem root, each component
 // opened relative to the descriptor of the one above it and never followed as
-// a link by that open; a component that is a link is read and its target walked
-// the same way (an absolute target from the root, a relative one from where the
-// link stands), at most maxTrustedLinks times, because macOS spells /var as a
-// link to /private/var. Every directory on the way is judged: owned by root or
-// by the expected account, and writable by group or others only under the
-// sticky bit, which keeps another account from renaming what it did not make.
+// a link by that open, THE COMPONENTS AS WRITTEN: a `..` is opened where it
+// stands, relative to the directory reached (as the kernel resolves it, after
+// the links before it; a lexical collapse would climb out of a link's target
+// through the link's own parent), and a `.` is nothing. A component that is a
+// link is admitted only when THE LINK ITSELF is owned by root or by the
+// expected account, because a sticky directory keeps another account from
+// renaming billet's entries and says nothing about a link that account made
+// there, which it can repoint at will; its target is then walked the same way
+// (an absolute target from the root, a relative one from where the link
+// stands), at most maxTrustedLinks times, because macOS spells /var as a link
+// to /private/var. Every directory on the way is judged: owned by root or by
+// the expected account, and writable by group or others only under the sticky
+// bit, which keeps another account from renaming what it did not make.
 func openTrustedDir(path string) (*os.File, error) {
 	if !filepath.IsAbs(path) {
 		return nil, fmt.Errorf("%w: %s is not an absolute path", errTrustBoundary, path)
@@ -261,7 +269,7 @@ func openTrustedDir(path string) (*os.File, error) {
 		return nil, fmt.Errorf("%w: open /: %w", errTrustBoundary, err)
 	}
 
-	remaining := splitComponents(filepath.Clean(path))
+	remaining := splitComponents(path)
 	walked := "/"
 	links := 0
 
@@ -274,13 +282,12 @@ func openTrustedDir(path string) (*os.File, error) {
 		switch {
 		case err == nil:
 		case errors.Is(err, unix.ELOOP) || errors.Is(err, unix.ENOTDIR):
-			// A LINK, OR NOT A DIRECTORY. Read it as a link; a component that is
-			// neither a directory nor a link is refused by the read.
-			target, rerr := readlinkAt(dir, name)
-			if rerr != nil {
+			// A LINK, OR NOT A DIRECTORY: examined as itself, judged, then read.
+			target, lerr := readTrustedLink(dir, walked, name)
+			if lerr != nil {
 				_ = dir.Close()
 
-				return nil, fmt.Errorf("%w: %s is not a directory: %w", errTrustBoundary, filepath.Join(walked, name), err)
+				return nil, lerr
 			}
 
 			links++
@@ -301,7 +308,7 @@ func openTrustedDir(path string) (*os.File, error) {
 				walked = "/"
 			}
 
-			remaining = append(splitComponents(filepath.Clean(target)), remaining...)
+			remaining = append(splitComponents(target), remaining...)
 
 			continue
 		default:
@@ -312,7 +319,12 @@ func openTrustedDir(path string) (*os.File, error) {
 
 		_ = dir.Close()
 
-		walked = filepath.Join(walked, name)
+		if name == ".." {
+			walked = filepath.Dir(walked)
+		} else {
+			walked = filepath.Join(walked, name)
+		}
+
 		dir = os.NewFile(uintptr(fd), walked)
 
 		info, err := dir.Stat()
@@ -332,10 +344,47 @@ func openTrustedDir(path string) (*os.File, error) {
 	return dir, nil
 }
 
+// readTrustedLink is a link component on the way to the root: opened as itself
+// relative to the directory it stands in, required to BE a link owned by root
+// or by the expected account, and only then read. A component that is neither
+// a directory nor a link is refused here.
+func readTrustedLink(dir *os.File, walked, name string) (string, error) {
+	at := filepath.Join(walked, name)
+
+	id, err := regularfile.OpenIdentityAt(dir, name)
+	if err != nil {
+		return "", fmt.Errorf("%w: examine %s: %w", errTrustBoundary, at, err)
+	}
+
+	defer func() { _ = id.Close() }()
+
+	info, err := id.Stat()
+	if err != nil {
+		return "", fmt.Errorf("%w: examine %s: %w", errTrustBoundary, at, err)
+	}
+
+	if info.Mode()&os.ModeSymlink == 0 {
+		return "", fmt.Errorf("%w: %s is not a directory (%s)", errTrustBoundary, at, info.Mode().Type())
+	}
+
+	uid, ok := guardOwnerOf(info)
+	if !ok {
+		return "", fmt.Errorf("%w: the link %s carries no owner this platform reports", errTrustBoundary, at)
+	}
+
+	if uid != 0 && uid != guardExpectedOwner() {
+		return "", fmt.Errorf("%w: the link %s is owned by uid %d, want root or uid %d, and a link another "+
+			"account made is a name it can repoint", errTrustBoundary, at, uid, guardExpectedOwner())
+	}
+
+	return readlinkAt(dir, name)
+}
+
 // maxTrustedLinks bounds the links openTrustedDir follows on one walk.
 const maxTrustedLinks = 32
 
-// splitComponents is a cleaned absolute path's components, without the root.
+// splitComponents is a path's components as written, `.` and empty ones
+// dropped and `..` kept for the walk to open where it stands.
 func splitComponents(path string) []string {
 	var out []string
 
@@ -383,7 +432,7 @@ func requireTrustedAncestor(path string, info os.FileInfo) error {
 // (measured 2026-09-09 in the two-holds fixture). An exclusive create that
 // finds the file existing opens it plainly; an open that finds it absent
 // creates it; a few rounds of that cover the window.
-func openLockFile(rootFD int) (*os.File, error) {
+func openLockFile(root *os.File) (*os.File, error) {
 	path := filepath.Join(upgradeRoot, txLockName)
 
 	var err error
@@ -391,7 +440,7 @@ func openLockFile(rootFD int) (*os.File, error) {
 	for range 8 {
 		var fd int
 
-		fd, err = unix.Openat(rootFD, txLockName, unix.O_RDWR|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0o600)
+		fd, err = unix.Openat(int(root.Fd()), txLockName, unix.O_RDWR|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0o600)
 		if err == nil {
 			return os.NewFile(uintptr(fd), path), nil
 		}
@@ -400,20 +449,12 @@ func openLockFile(rootFD int) (*os.File, error) {
 			return nil, err
 		}
 
-		// AN EXISTING LOCK IS OPENED IDENTITY FIRST, so a device planted at its
-		// name is refused without its driver being invoked, and the readable
-		// descriptor is of the same inode that was judged. The root's descriptor
-		// is the caller's and is never wrapped here: an *os.File over it would
-		// close it when collected.
-		id, err := openIdentityFD(rootFD, txLockName, path)
+		// AN EXISTING LOCK IS OPENED IDENTITY FIRST, relative to the root, so a
+		// device planted at its name is refused without its driver being invoked
+		// and a link at its name is the link's own inode, refused as not regular;
+		// the readable descriptor is of the inode that was judged.
+		f, _, err := regularfile.OpenAt(root, txLockName)
 		if err == nil {
-			f, rerr := regularfile.Reopen(id)
-			_ = id.Close()
-
-			if rerr != nil {
-				return nil, rerr
-			}
-
 			return f, nil
 		}
 

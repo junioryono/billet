@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -214,8 +215,10 @@ func TestTheTrustBoundaryRefusesWhatOnlyAnotherAccountCouldHaveMade(t *testing.T
 			t.Fatal(err)
 		}
 
-		if err := guardRun(t, "hold", "--holder", "ci-1"); !errors.Is(err, errTrustBoundary) || !errors.Is(err, syscall.ELOOP) {
-			t.Errorf("a symlink at the lock: err = %v, want the trust boundary with ELOOP", err)
+		// The link is opened as itself, relative to the root, and refused as not
+		// a regular file: one answer on every platform, never a followed target.
+		if err := guardRun(t, "hold", "--holder", "ci-1"); !errors.Is(err, errTrustBoundary) || !errors.Is(err, regularfile.ErrNotRegular) {
+			t.Errorf("a symlink at the lock: err = %v, want the trust boundary refusing a non-regular file", err)
 		}
 	})
 
@@ -976,6 +979,62 @@ func TestEveryAncestorOfTheUpgradeRootIsJudged(t *testing.T) {
 
 	guardOwnerOf = saved
 
+	// A LINK ANOTHER ACCOUNT MADE is refused however trusted its target: under
+	// the sticky bit that account cannot rename billet's entries, and can
+	// repoint its own link at will.
+	foreign := filepath.Join(base, "foreign")
+	mustOK(t, os.Symlink(anc, foreign))
+
+	linkInfo, err := os.Lstat(foreign)
+	mustOK(t, err)
+
+	linkSt, ok := linkInfo.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatal("the link's stat carries no Stat_t")
+	}
+
+	linkIno := linkSt.Ino
+	guardOwnerOf = func(info os.FileInfo) (uint32, bool) {
+		if st, ok := info.Sys().(*syscall.Stat_t); ok && st.Ino == linkIno && info.Mode()&os.ModeSymlink != 0 {
+			return uint32(os.Geteuid()) + 1, true
+		}
+
+		return ownerFromInfo(info)
+	}
+
+	mustOK(t, os.Chmod(anc, 0o777|os.ModeSticky))
+
+	upgradeRoot = filepath.Join(foreign, "lib", "billet", "upgrades")
+
+	if err := guardRun(t, "hold", "--holder", "ci-1"); !errors.Is(err, errTrustBoundary) ||
+		!strings.Contains(err.Error(), "the link ") || !strings.Contains(err.Error(), "/foreign is owned by uid") {
+		t.Errorf("another account's link on the way: err = %v", err)
+	}
+
+	guardOwnerOf = saved
+
+	// A TARGET WITH `..` BEHIND A LINK is walked as the kernel walks it: the
+	// link before the `..` is resolved first, so `link -> a/../parent` with
+	// `a -> elsewhere/child` reaches elsewhere/parent, where a lexical collapse
+	// would have reached base/parent, which does not exist.
+	nested := filepath.Join(t.TempDir(), "nested")
+	mustOK(t, os.MkdirAll(filepath.Join(nested, "elsewhere", "child"), 0o700))
+	mustOK(t, os.MkdirAll(filepath.Join(nested, "elsewhere", "parent"), 0o700))
+	mustOK(t, os.Symlink("elsewhere/child", filepath.Join(nested, "a")))
+	mustOK(t, os.Symlink("a/../parent", filepath.Join(nested, "link")))
+
+	upgradeRoot = filepath.Join(nested, "link", "upgrades")
+
+	if err := guardRun(t, "hold", "--holder", "ci-1"); err != nil {
+		t.Errorf("a target with .. behind a link: %v", err)
+	}
+
+	if _, err := os.Lstat(filepath.Join(nested, "elsewhere", "parent", "upgrades", "active", guardRecordName)); err != nil {
+		t.Errorf("the root was not made where the kernel's walk leads: %v", err)
+	}
+
+	mustOK(t, guardRun(t, "release", "--holder", "ci-1"))
+
 	// A LINK TO ITSELF on the way is refused, never followed forever.
 	loop := filepath.Join(base, "loop")
 	mustOK(t, os.Symlink("loop", loop))
@@ -1019,12 +1078,14 @@ func TestACandidateThatIsNotARegularFileIsRefusedWithoutAWait(t *testing.T) {
 	}
 }
 
-// G23: THE JOURNAL A RESUME OR A TAKEOVER READS IS NAMED UNDER THE ROOT'S NAME,
-// so each re-checks, right before that read and under the lock it holds, that
-// the name still holds the root it locked. The root is displaced from inside
-// the hook that fires on the claim's readlink: renamed aside, and a symlink at
-// its name pointing at an outside tree that holds its own claim and journal.
-// Both refuse naming the root; neither reads the outside journal.
+// G23: THE JOURNAL A RESUME OR A TAKEOVER READS IS OPENED THROUGH THE ROOT THE
+// LOCK VALIDATED, the recovery directory relative to the root's descriptor and
+// the journal relative to that. The root is displaced AFTER the lock's own
+// check, from inside the hook that fires on the claim's readlink: renamed
+// aside, and a symlink at its name pointing at an outside tree whose journal
+// is not JSON. Neither command reads the outside journal: the resume finds
+// the retained root's claim has no journal and releases it there, and the
+// takeover reads the retained journal and relabels the retained record.
 func TestAJournalIsNeverReadThroughADisplacedRoot(t *testing.T) {
 	displace := func(t *testing.T, f *guardFixture, outside string) func(guardOp) error {
 		t.Helper()
@@ -1049,28 +1110,47 @@ func TestAJournalIsNeverReadThroughADisplacedRoot(t *testing.T) {
 		f := newGuardedFixture(t)
 		mustOK(t, os.Mkdir(f.root, 0o700))
 
+		// The retained root's claim points at a recovery directory with NO
+		// journal; the outside tree's has one that is not JSON.
 		recovery := filepath.Join(f.root, "recovery-x")
 		mustOK(t, os.Mkdir(recovery, 0o700))
-		writeJournalFixture(t, recovery, "installed")
 		mustOK(t, os.Symlink(recovery, f.active()))
 
-		// The outside tree: the same names, another journal.
 		outside := filepath.Join(t.TempDir(), "outside")
 		mustOK(t, os.MkdirAll(filepath.Join(outside, "recovery-x"), 0o700))
-		writeJournalFixture(t, filepath.Join(outside, "recovery-x"), "claimed")
+		mustOK(t, os.WriteFile(filepath.Join(outside, "recovery-x", "journal.json"), []byte("not json"), 0o600))
+		mustOK(t, os.Symlink(filepath.Join(outside, "recovery-x"), filepath.Join(outside, "active")))
 
 		guardHook = displace(t, f.guardFixture, outside)
 
-		err := resumeHostUpgrade(t.Context(), f.cfg)
+		out := capture(t, func() {
+			if err := resumeHostUpgrade(t.Context(), f.cfg); err != nil {
+				t.Errorf("a resume over a root displaced under its lock: %v", err)
+			}
+		})
 
 		guardHook = nil
 
-		if !errors.Is(err, errTrustBoundary) || !strings.Contains(err.Error(), "no longer names the directory the lock was taken inside") {
-			t.Errorf("a resume over a root displaced under its lock: err = %v, want the refusal naming the root", err)
+		if !strings.Contains(out, "never wrote its journal") {
+			t.Errorf("the resume printed %q, want the retained claim's empty journal", out)
+		}
+
+		// THE RETAINED CLAIM WAS RELEASED, through the descriptor; the outside
+		// tree's claim and journal are untouched.
+		if _, err := os.Lstat(filepath.Join(f.root+".aside", "active")); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("the retained claim survived the resume: %v", err)
+		}
+
+		if body, err := os.ReadFile(filepath.Join(outside, "recovery-x", "journal.json")); err != nil || string(body) != "not json" {
+			t.Errorf("the outside journal changed: %q, %v", body, err)
+		}
+
+		if _, err := os.Lstat(filepath.Join(outside, "active")); err != nil {
+			t.Errorf("the outside claim was removed: %v", err)
 		}
 
 		if len(f.reached) != 0 {
-			t.Errorf("the refused resume reached %v", f.reached)
+			t.Errorf("the resume reached %v", f.reached)
 		}
 	})
 
@@ -1086,7 +1166,7 @@ func TestAJournalIsNeverReadThroughADisplacedRoot(t *testing.T) {
 
 		outside := filepath.Join(t.TempDir(), "outside")
 		mustOK(t, os.MkdirAll(filepath.Join(outside, "recovery-x"), 0o700))
-		writeJournalFixture(t, filepath.Join(outside, "recovery-x"), "claimed")
+		mustOK(t, os.WriteFile(filepath.Join(outside, "recovery-x", "journal.json"), []byte("not json"), 0o600))
 
 		rec := f.record(t)
 
@@ -1096,11 +1176,12 @@ func TestAJournalIsNeverReadThroughADisplacedRoot(t *testing.T) {
 
 		guardHook = nil
 
-		if !errors.Is(err, errTrustBoundary) || !strings.Contains(err.Error(), "no longer names the directory the lock was taken inside") {
-			t.Errorf("a takeover over a root displaced under its lock: err = %v, want the refusal naming the root", err)
+		if err != nil {
+			t.Errorf("a takeover over a root displaced under its lock: %v", err)
 		}
 
-		// The retained root's record is untouched.
+		// THE RETAINED RECORD WAS RELABELLED, through the descriptor, and the
+		// outside tree holds no record at all.
 		body, err := os.ReadFile(filepath.Join(f.root+".aside", "active", guardRecordName))
 		mustOK(t, err)
 
@@ -1108,8 +1189,84 @@ func TestAJournalIsNeverReadThroughADisplacedRoot(t *testing.T) {
 
 		mustOK(t, json.Unmarshal(body, &got))
 
+		rec.Holder = "ci-2"
+
 		if got != rec {
-			t.Errorf("the refused takeover changed the record to %+v", got)
+			t.Errorf("the takeover left the retained record as %+v, want %+v", got, rec)
 		}
+
+		if _, err := os.Lstat(filepath.Join(outside, "active")); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("the takeover wrote into the outside tree: %v", err)
+		}
+	})
+}
+
+// G24: A RECORD IS TRUSTED ONLY ON ITS OWN DESCRIPTOR: one another account
+// could write (a loose mode, or another owner, which a hard link from outside
+// the directory makes) names no holder, however trusted the directory around
+// it. Every command that reads it refuses naming the boundary, and the record
+// is not changed.
+func TestARecordOutsideTheTrustBoundaryNamesNoHolder(t *testing.T) {
+	f := newGuardFixture(t)
+	mustHold(t, "ci-1")
+	cleanScan(t)
+
+	record := filepath.Join(f.active(), guardRecordName)
+	bytesBefore, err := os.ReadFile(record)
+	mustOK(t, err)
+
+	commands := map[string][]string{
+		"status":   {"status"},
+		"holder":   {"holder"},
+		"hold":     {"hold", "--holder", "ci-1"},
+		"release":  {"release", "--holder", "ci-1"},
+		"recover":  {"recover", "--holder", "ci-1", "--old-driver-stopped"},
+		"takeover": {"hold", "--holder", "ci-2", "--recover-from", "ci-1", "--old-driver-stopped"},
+	}
+
+	check := func(t *testing.T, what string) {
+		t.Helper()
+
+		for name, args := range commands {
+			if err := guardRun(t, args...); !errors.Is(err, errTrustBoundary) {
+				t.Errorf("%s over %s: err = %v, want the trust boundary", name, what, err)
+			}
+		}
+
+		if bytesAfter, err := os.ReadFile(record); err != nil || !bytes.Equal(bytesBefore, bytesAfter) {
+			t.Errorf("%s changed the record: %q, %v", what, bytesAfter, err)
+		}
+	}
+
+	t.Run("a loose mode", func(t *testing.T) {
+		mustOK(t, os.Chmod(record, 0o666))
+		t.Cleanup(func() { mustOK(t, os.Chmod(record, 0o600)) })
+
+		check(t, "a 0666 record")
+	})
+
+	t.Run("another owner", func(t *testing.T) {
+		info, err := os.Lstat(record)
+		mustOK(t, err)
+
+		st, ok := info.Sys().(*syscall.Stat_t)
+		if !ok {
+			t.Fatal("the record's stat carries no Stat_t")
+		}
+
+		ino := st.Ino
+
+		saved := guardOwnerOf
+		guardOwnerOf = func(info os.FileInfo) (uint32, bool) {
+			if st, ok := info.Sys().(*syscall.Stat_t); ok && st.Ino == ino {
+				return uint32(os.Geteuid()) + 1, true
+			}
+
+			return ownerFromInfo(info)
+		}
+
+		t.Cleanup(func() { guardOwnerOf = saved })
+
+		check(t, "another account's record")
 	})
 }
