@@ -298,3 +298,56 @@ billet_service_policy_unit_path_allowlist:
   - /usr/lib/systemd/system
   - /lib/systemd/system
   - /run/systemd/generator.late
+
+# The directives the packaged units and the role's templates write, per section.
+# A dry run reads a billet unit's fragment only through this grammar: an
+# assignment outside it is could-not-tell, because a directive the gate does not
+# know could stop systemd's parser before the compared ones (an ExecStartPre=
+# whose executable ends in / fails the load with ENOEXEC), and ignoring it would
+# report agreement over a unit systemd never finished reading. A change that
+# ships a new directive adds it here in the same change.
+billet_service_policy_known_directives:
+  '[Unit]':
+    - Description
+    - Documentation
+    - After
+    - Wants
+    - Requires
+    - RequiresMountsFor
+    - AssertPathExists
+  '[Service]':
+    - Type
+    - NotifyAccess
+    - User
+    - Group
+    - UMask
+    - EnvironmentFile
+    - ExecStart
+    - StateDirectory
+    - StateDirectoryMode
+    - RuntimeDirectory
+    - RuntimeDirectoryMode
+    - TimeoutStopSec
+    - TimeoutStartSec
+    - KillSignal
+    - KillMode
+    - Restart
+    - RestartSec
+    - NoNewPrivileges
+    - PrivateTmp
+    - ProtectSystem
+    - ProtectHome
+    - ProtectKernelTunables
+    - ProtectKernelModules
+    - ProtectControlGroups
+    - RestrictSUIDSGID
+    - RestrictNamespaces
+    - LockPersonality
+    - MemoryDenyWriteExecute
+    - SystemCallArchitectures
+    - SystemCallFilter
+    - CapabilityBoundingSet
+    - ReadOnlyPaths
+    - ReadWritePaths
+  '[Install]':
+    - WantedBy

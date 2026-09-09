@@ -244,13 +244,22 @@
         {%- set loaded_state = ((loaded.stdout | regex_findall('(?m)^LoadState=(.*)$')) + ['']) | first | trim -%}
         {%- set loaded_fragment = ((loaded.stdout | regex_findall('(?m)^FragmentPath=(.*)$')) + ['']) | first | trim -%}
         {%- set winning = (billet_service_policy_aliases.entries | default({}))[unit] | default({}) -%}
+        {#- Every location find was given exists and is a directory (the stat
+            above established that, failing the run on any other error), so
+            anything find could not walk is a failed examination, and a location
+            whose drop-ins are unknown is not an empty one, whether or not the
+            unit has a fragment. -#}
+        {%- set on_disk = billet_service_policy_dropins_on_disk.results | selectattr('item', 'equalto', unit) | first -%}
+        {%- set bad_skips = (on_disk.skipped_paths | default({})) | dict2items | map(attribute='key') | list -%}
         {%- if frag.skipped | default(false) -%}
           {#- ABSENCE IS A POSITIVE ANSWER OR NOTHING: no FragmentPath with
               LoadState=not-found is a unit the manager does not know, which has
               nothing loaded to compare; no FragmentPath with any other state is
               a read this dry run cannot account for. -#}
-          {%- if loaded_state == 'not-found' and winning | length == 0 -%}
+          {%- if loaded_state == 'not-found' and winning | length == 0 and bad_skips | length == 0 -%}
             {%- set _ = out.append({'unit': unit, 'ok': true, 'absent': true, 'why': 'no fragment on disk, nothing loaded to compare (LoadState=not-found)'}) -%}
+          {%- elif bad_skips | length > 0 -%}
+            {%- set _ = out.append({'unit': unit, 'ok': false, 'why': 'drop-in locations could not be examined (' ~ (bad_skips | join(', ')) ~ '), so their absence is not established'}) -%}
           {%- elif loaded_state == 'not-found' -%}
             {%- set _ = out.append({'unit': unit, 'ok': false, 'why': 'the manager knows no unit (LoadState=not-found) but ' ~ winning.path ~ ' is on disk in a lookup path, and the next reload would load it'}) -%}
           {%- else -%}
@@ -271,14 +280,18 @@
               {%- set _ = ns.bad.append('a continued line [' ~ line ~ ']') -%}
             {%- elif line | trim | length == 0 or line[0] in '#;' -%}
             {%- elif line[0] == '[' -%}
-              {#- systemd stops parsing at a malformed section header; a
-                  comparator that skipped it would read assignments systemd
-                  never reaches. -#}
-              {%- if line is match('^\[[A-Za-z0-9_.-]+\]$') -%}
-                {%- set ns.section = line -%}
-              {%- else -%}
-                {%- set _ = ns.bad.append('a malformed section header [' ~ line ~ '], at which systemd stops parsing') -%}
+              {#- A header outside the grammar this dry run reads is could-not-tell
+                  (a genuinely malformed one is a parse error systemd stops at), and
+                  so is a section this dry run does not know, since an assignment
+                  in it could stop the parser before the compared directives. -#}
+              {%- if line is not match('^\[[A-Za-z0-9_.-]+\]$') -%}
+                {%- set _ = ns.bad.append('not a section header this dry run can read [' ~ line ~ ']') -%}
                 {%- set ns.section = '' -%}
+              {%- elif line not in billet_service_policy_known_directives -%}
+                {%- set _ = ns.bad.append('a section this dry run does not know [' ~ line ~ ']') -%}
+                {%- set ns.section = '' -%}
+              {%- else -%}
+                {%- set ns.section = line -%}
               {%- endif -%}
             {%- elif line[0] in ' \t' -%}
               {%- set _ = ns.bad.append('an indented line [' ~ line ~ ']') -%}
@@ -294,6 +307,16 @@
                 {%- set _ = ns.bad.append('whitespace around = in [' ~ line ~ ']') -%}
               {%- elif key in ['User', 'Group', 'Type', 'ExecStart'] and ns.section != '[Service]' -%}
                 {%- set _ = ns.bad.append(key ~ '= outside [Service] (in ' ~ (ns.section or 'no section') ~ ')') -%}
+              {%- elif ns.section == '' -%}
+                {%- set _ = ns.bad.append('an assignment outside any section this dry run knows [' ~ line ~ ']') -%}
+              {%- elif key not in billet_service_policy_known_directives[ns.section] -%}
+                {#- EVERY ASSIGNMENT IS HELD TO THE DIRECTIVES THE SHIPPED POLICY
+                    WRITES: a directive this dry run does not know is not ignored,
+                    because its value can stop systemd's parser before the compared
+                    directives (ExecStartPre=/ fails the load with ENOEXEC) and an
+                    agreement read past it would be over a unit systemd never
+                    finished reading. -#}
+                {%- set _ = ns.bad.append('a directive this dry run does not know (' ~ key ~ ' in ' ~ ns.section ~ '), whose value could stop the parser before the compared directives') -%}
               {%- elif key == 'User' -%}{%- set _ = ns.user.append(val) -%}
               {%- elif key == 'Group' -%}{%- set _ = ns.group.append(val) -%}
               {%- elif key == 'Type' -%}{%- set _ = ns.type.append(val) -%}
@@ -313,7 +336,6 @@
           {%- set records = (exec.stdout | from_json).data if exec.rc == 0 else [] -%}
           {%- set loaded_path = records[0][0] if records | length == 1 else '' -%}
           {%- set loaded_argv = records[0][1] if records | length == 1 else [] -%}
-          {%- set on_disk = billet_service_policy_dropins_on_disk.results | selectattr('item', 'equalto', unit) | first -%}
           {%- set why = [] -%}
           {#- THE FRAGMENT COMPARED IS THE ONE THE NEXT RELOAD WOULD LOAD: the
               manager's source-name map (unit_names) names the winning entry per
@@ -327,11 +349,6 @@
           {%- elif winning.path != loaded_fragment -%}
             {%- set _ = why.append('the next reload would load ' ~ winning.path ~ ', a higher-priority fragment, while the manager loaded ' ~ loaded_fragment) -%}
           {%- endif -%}
-          {#- Every location find was given exists and is a directory (the stat
-              above established that, failing the run on any other error), so
-              anything find could not walk is a failed examination, and a
-              location whose drop-ins are unknown is not an empty one. -#}
-          {%- set bad_skips = (on_disk.skipped_paths | default({})) | dict2items | map(attribute='key') | list -%}
           {%- if bad_skips | length > 0 -%}
             {%- set _ = why.append('drop-in locations could not be examined (' ~ (bad_skips | join(', ')) ~ '), so their absence is not established') -%}
           {%- endif -%}

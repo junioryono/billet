@@ -343,6 +343,106 @@ def dotdot_read_error(mod, t):
         mod.os.lstat = real_lstat
 
 
+@case("a mask spelled through a missing component refuses instead of shadowing the alias below it")
+def mask_through_missing_component(mod, t):
+    # etc/runner.service -> /missing/../dev/null: normpath would call it a mask
+    # and let it shadow lib/runner.service -> billet-server.service, whose
+    # drop-ins then go unsearched; systemd's chase refuses the spelling and
+    # skips the entry, so the lower alias is the one it loads.
+    t.fragment(t.lib, "billet-server.service")
+    t.link(t.etc, "runner.service", "/missing/../dev/null")
+    t.link(t.lib, "runner.service", "billet-server.service")
+    try:
+        mod.resolve(t.unit_path, BILLET)
+    except mod.Unreadable as exc:
+        assert "climbs" in str(exc), exc
+        return
+    raise AssertionError("a mask spelled through a missing component was accepted")
+
+
+@case("a mask spelled with a dot component still chases to /dev/null and is a mask")
+def mask_spelled_with_dot(mod, t):
+    t.fragment(t.lib, "billet-server.service")
+    t.link(t.etc, "snapd.service", "/dev/./null")
+    result, problems = mod.resolve(t.unit_path, BILLET)
+    assert problems == [], problems
+    entries, _ = mod.source_name_map(t.unit_path)
+    assert entries["snapd.service"]["kind"] == "mask", entries
+
+
+@case("a plain alias to a template refuses, since systemd rejects it and loads the entry below")
+def plain_alias_to_template_refuses(mod, t):
+    # etc/runner.service -> other@.service is not an alias systemd accepts; it
+    # skips the link and lib/runner.service -> billet-server.service is what
+    # the manager loads, so accepting the upper link would hide a billet alias.
+    t.fragment(t.lib, "billet-server.service")
+    t.fragment(t.lib, "other@.service")
+    t.link(t.etc, "runner.service", "other@.service")
+    t.link(t.lib, "runner.service", "billet-server.service")
+    try:
+        mod.resolve(t.unit_path, BILLET)
+    except mod.Unreadable as exc:
+        assert "template" in str(exc), exc
+        return
+    raise AssertionError("a plain alias to a template was accepted")
+
+
+@case("an alias whose target is another unit type refuses")
+def alias_to_other_type_refuses(mod, t):
+    t.fragment(t.lib, "billet-server.service")
+    t.link(t.etc, "runner.service", "billet.socket")
+    try:
+        mod.resolve(t.unit_path, BILLET)
+    except mod.Unreadable as exc:
+        assert "not a .service unit name" in str(exc), exc
+        return
+    raise AssertionError("an alias to another unit type was accepted")
+
+
+@case("a self-alias refuses, since systemd ignores it and loads the entry below")
+def self_alias_refuses(mod, t):
+    t.fragment(t.lib, "billet-server.service")
+    t.link(t.etc, "runner.service", str(t.lib / "runner.service"))
+    t.link(t.lib, "runner.service", "billet-server.service")
+    try:
+        mod.resolve(t.unit_path, BILLET)
+    except mod.Unreadable as exc:
+        assert "self-alias" in str(exc), exc
+        return
+    raise AssertionError("a self-alias was accepted")
+
+
+@case("an instance alias to an instance of a template installed only as the template passes")
+def instance_alias_falls_back_to_template(mod, t):
+    # other@x.service -> actual@x.service with only actual@.service on disk:
+    # systemd's map lookup falls back from the instance to its template, so
+    # this is a valid unrelated alias and not a dangling one.
+    t.fragment(t.lib, "billet-server.service")
+    t.fragment(t.lib, "actual@.service")
+    t.link(t.etc, "other@x.service", "actual@x.service")
+    result, problems = mod.resolve(t.unit_path, BILLET)
+    assert problems == [], problems
+    assert result["aliases"] == [], result
+
+
+@case("an instance alias whose template does not exist either is dangling")
+def instance_alias_without_template_dangles(mod, t):
+    t.fragment(t.lib, "billet-server.service")
+    t.link(t.etc, "other@x.service", "actual@x.service")
+    result, problems = mod.resolve(t.unit_path, BILLET)
+    assert problems and "dangling" in problems[0], problems
+
+
+@case("a chain of eight hops refuses, as systemd follows at most seven")
+def hop_limit(mod, t):
+    t.fragment(t.lib, "billet-server.service")
+    names = ["a%d.service" % i for i in range(8)]
+    for i, name in enumerate(names):
+        t.link(t.etc, name, names[i + 1] if i + 1 < len(names) else "billet-server.service")
+    result, problems = mod.resolve(t.unit_path, BILLET)
+    assert any("hops" in p for p in problems), (problems, result)
+
+
 def _link_chain(t, count):
     # The chain is spelled from the RESOLVED root: a temporary directory that is
     # itself reached through a symlink (macOS's /var) would otherwise add a link

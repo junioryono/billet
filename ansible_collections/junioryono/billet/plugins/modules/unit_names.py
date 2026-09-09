@@ -152,9 +152,6 @@ def _classify(path, unit_path):
         target = os.readlink(path)
     except OSError as exc:
         raise Unreadable("%s: %s" % (path, exc.strerror))
-    # A mask is a symlink to /dev/null, by target text, as systemd tests it.
-    if os.path.normpath(target) == "/dev/null":
-        return {"kind": "mask", "path": path, "target": target}
     # An absolute target is read as written; a relative one is interpreted
     # from the link's own directory. Either names a unit only when the
     # directory it reduces to is a lookup path.
@@ -185,10 +182,68 @@ def _classify(path, unit_path):
     # out of the search path, missing the drop-ins searched under the alias's
     # name either way.
     chased = resolved
+    # A MASK IS DECIDED AFTER THE CHASE, never from the target's text: systemd
+    # chases every symlink first and skips one whose chase fails, so a spelling
+    # such as /missing/../dev/null is not a mask that shadows a lower alias but
+    # an entry systemd never maps (the chase above refuses it), and only a
+    # target that chases to /dev/null itself is the mask.
+    if chased == "/dev/null":
+        return {"kind": "mask", "path": path, "target": target}
     if not any(chased.startswith(p.rstrip("/") + "/") for p in unit_path):
         return {"kind": "external", "path": path, "target": target}
+    target_name = os.path.basename(chased)
+    _validate_alias(path, target_name)
     return {"kind": "alias", "path": path, "target": target,
-            "target_name": os.path.basename(chased)}
+            "target_name": target_name}
+
+
+_NAME_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789:_.\\-@")
+
+
+def _name_parts(name):
+    """(prefix, instance) of a .service unit name, or None when it is not one.
+
+    instance is None for a plain name, "" for a template (x@.service) and the
+    text after the @ for an instance (x@y.service).
+    """
+    if not name.endswith(".service") or len(name) > 255 or not set(name) <= _NAME_CHARS:
+        return None
+    stem = name[:-len(".service")]
+    if not stem or stem[0] == "@":
+        return None
+    if "@" not in stem:
+        return stem, None
+    prefix, instance = stem.split("@", 1)
+    if "@" in instance:
+        return None
+    return prefix, instance
+
+
+def _validate_alias(path, target_name):
+    """Refuse an alias systemd's name map would not accept.
+
+    systemd (unit_validate_alias_symlink_or_warn, v255) skips a symlink inside
+    the search path whose names do not fit: a self-alias, a target that is not a
+    unit name, a target of another unit type, a name type that differs (a plain
+    name may alias a plain name, a template a template, an instance an
+    instance of the same instance name or a template), and it then loads the
+    next lower entry of that name. This classifier refuses such a link as
+    could-not-tell rather than deciding which entry then wins, because an
+    accepted-but-invalid alias would claim the name and hide that lower entry.
+    """
+    src = os.path.basename(path)
+    if src == target_name:
+        raise Unreadable("%s: a self-alias, which systemd ignores; the next lower entry of that name would be loaded" % path)
+    sp = _name_parts(src)
+    tp = _name_parts(target_name)
+    if sp is None or tp is None:
+        raise Unreadable("%s: alias target %s is not a .service unit name systemd would accept for this link" % (path, target_name))
+    src_kind = "plain" if sp[1] is None else ("template" if sp[1] == "" else "instance")
+    dst_kind = "plain" if tp[1] is None else ("template" if tp[1] == "" else "instance")
+    if not (src_kind == dst_kind or (src_kind == "instance" and dst_kind == "template")):
+        raise Unreadable("%s: alias target %s is a %s name while the link is a %s name, which systemd rejects; the next lower entry of that name would be loaded" % (path, target_name, dst_kind, src_kind))
+    if dst_kind == "instance" and sp[1] != tp[1]:
+        raise Unreadable("%s: alias target %s names another instance than the link, which systemd rejects" % (path, target_name))
 
 
 def _chase(raw, path, target):
@@ -290,17 +345,38 @@ def source_name_map(unit_path):
     return entries, scanned
 
 
+FOLLOW_MAX = 8
+
+
 def follow(name, entries):
-    """The unit name an alias chain ends at, or why it cannot be followed."""
+    """The unit name an alias chain ends at, or why it cannot be followed.
+
+    As systemd's unit_ids_map_get (v255): a target that is an instance name
+    with no entry falls back to its template's entry (other@x.service ->
+    actual@x.service resolves through actual@.service), and at most eight hops
+    are followed, a longer chain failing to load.
+    """
     chain = [name]
     seen = {name}
     current = name
+    hops = 0
     while True:
         entry = entries.get(current)
+        if entry is None and hops > 0:
+            parts = _name_parts(current)
+            if parts is not None and parts[1]:
+                template = "%s@.service" % parts[0]
+                entry = entries.get(template)
+                if entry is not None:
+                    chain.append(template)
+                    current = template
         if entry is None:
             return None, chain, "dangling: no lookup directory holds %s" % current
         if entry["kind"] != "alias":
             return current, chain, None
+        hops += 1
+        if hops >= FOLLOW_MAX:
+            return None, chain, "more than %d hops through %s, which systemd does not follow" % (FOLLOW_MAX - 1, " -> ".join(chain))
         nxt = entry["target_name"]
         chain.append(nxt)
         if nxt in seen:

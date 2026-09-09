@@ -217,7 +217,18 @@ refused indented "an indented assignment refuses" "an indented line"
 
 fixture brokenheader
 printf '[Broken\n[Service]\nUser=billet\nGroup=billet\nType=notify\nExecStart=/usr/bin/billet server --config /etc/billet/billet.yaml\n' >"$work/brokenheader/lib/billet-server.service"
-refused brokenheader "a malformed section header refuses, since systemd stops parsing there" "a malformed section header"
+refused brokenheader "a malformed section header refuses, since systemd stops parsing there" "not a section header this dry run can read"
+
+# A DIRECTIVE THIS DRY RUN DOES NOT KNOW IS NOT IGNORED: ExecStartPre=/ fails
+# systemd's load with ENOEXEC before it reads the compared directives, so an
+# agreement read past it would be over a unit systemd never finished reading.
+fixture execstartpre
+printf '[Unit]\nDescription=billet server\n\n[Service]\nExecStartPre=/\nUser=billet\nGroup=billet\nType=notify\nExecStart=/usr/bin/billet server --config /etc/billet/billet.yaml\n' >"$work/execstartpre/lib/billet-server.service"
+refused execstartpre "a directive outside the shipped policy refuses rather than being ignored" "a directive this dry run does not know"
+
+fixture xsection
+printf '[Unit]\nDescription=billet server\n\n[X-Meta]\nFoo=bar\n\n[Service]\nUser=billet\nGroup=billet\nType=notify\nExecStart=/usr/bin/billet server --config /etc/billet/billet.yaml\n' >"$work/xsection/lib/billet-server.service"
+refused xsection "a section outside the shipped policy refuses rather than being ignored" "a section this dry run does not know"
 
 fixture spaced
 printf '[Service]\nUser = billet\nGroup=billet\nType=notify\nExecStart=/usr/bin/billet server --config /etc/billet/billet.yaml\n' >"$work/spaced/lib/billet-server.service"
@@ -351,6 +362,15 @@ if [ "$(id -u)" -ne 0 ]; then
     chmod 000 "$work/statfails/locked"
     if run statfails; then chmod 755 "$work/statfails/locked"; fail "a drop-in location whose stat fails was passed over" statfails; fi
     chmod 755 "$work/statfails/locked"
+    # A NOT-FOUND UNIT IS HELD TO THE SAME RULE: a drop-in directory that could
+    # not be walked refuses even where there is no fragment to compare.
+    fixture notfoundskipped
+    sed -i.bak 's|^FragmentPath=.*|FragmentPath=|; s|^LoadState=.*|LoadState=not-found|' "$work/notfoundskipped/fake/billet-server.service.props"
+    rm "$work/notfoundskipped/lib/billet-server.service" "$work/notfoundskipped/fake/billet-server.service.exec.json"
+    mkdir -p "$work/notfoundskipped/etc/billet-server.service.d"
+    chmod 000 "$work/notfoundskipped/etc/billet-server.service.d"
+    refused notfoundskipped "a not-found unit beside a drop-in directory that could not be read refuses" "could not be examined"
+    chmod 700 "$work/notfoundskipped/etc/billet-server.service.d"
     # THE FAILURE IS THE STAT TASK'S OWN: its block of the output (from its TASK
     # line to the next) carries a failed item naming the location and the
     # permission error, so a downstream failure after a passing stat cannot
