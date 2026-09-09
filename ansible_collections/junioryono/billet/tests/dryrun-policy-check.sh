@@ -306,7 +306,7 @@ cat >"$work/renderednode/render.yml" <<PLAY
         billet_config:
           node:
             state_dir: /var/lib/billet/node
-        billet_server_prepare_only: false
+        billet_server_prepare_only: true
         billet_server_environment:
           BILLET_EXAMPLE: value
         billet_server_environment_path: /etc/billet/node.env
@@ -328,6 +328,7 @@ PLAY
 ansible-playbook -i localhost, "$work/renderednode/render.yml" >"$work/renderednode/render.txt" 2>&1 || { sed -n '1,40p' "$work/renderednode/render.txt" >&2; exit 1; }
 grep -q '^Requires=billet-network.service' "$work/renderednode/lib/billet-node.service" || fail "the node render does not carry the firecracker dependency this case exists for" renderednode
 grep -q '^EnvironmentFile=' "$work/renderednode/lib/billet-node.service" || fail "the node render does not carry the environment file this case exists for" renderednode
+grep -q '^AssertPathExists=!/' "$work/renderednode/lib/billet-node.service" || fail "the node render does not carry the prepare-only hold this case exists for" renderednode
 sed -i.bak 's/^NeedDaemonReload=no/NeedDaemonReload=yes/' "$work/renderednode/fake/billet-node.service.props"
 allowed renderednode "the role's node unit rendered with firecracker and an environment file passes"
 grep -q 'billet-node.service: systemd reports' "$work/renderednode/out.txt" || fail "the rendered node unit was not compared" renderednode
@@ -338,6 +339,93 @@ cp "$work/renderednode/lib/billet-node-plain.service" "$work/renderednodeplain/l
 sed -i.bak 's/^NeedDaemonReload=no/NeedDaemonReload=yes/; s/^Type=notify/Type=exec/' "$work/renderednodeplain/fake/billet-node.service.props"
 allowed renderednodeplain "the role's node unit rendered without firecracker or an environment file passes"
 grep -q 'billet-node.service: systemd reports' "$work/renderednodeplain/out.txt" || fail "the plain rendered node unit was not compared" renderednodeplain
+
+# The server's false branches: no ledger volume, no environment file, readiness
+# off (Type=exec, so the loaded Type is rewritten to match).
+fixture renderedplain
+cat >"$work/renderedplain/render.yml" <<PLAY
+---
+- name: Render the role's server unit with every optional branch off
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Render
+      ansible.builtin.template:
+        src: $collection/roles/host/templates/billet-server.service.j2
+        dest: $work/renderedplain/lib/billet-server.service
+        mode: "0644"
+      vars:
+        billet_service_user: billet
+        billet_service_group: billet
+        billet_systemd_notify_ready: false
+        billet_ledger_volume_id: ""
+        billet_candidate_server_state_dir: /var/lib/billet/server
+        billet_server_prepare_only: false
+        billet_server_environment: {}
+        billet_server_environment_path: /etc/billet/server.env
+PLAY
+ansible-playbook -i localhost, "$work/renderedplain/render.yml" >"$work/renderedplain/render.txt" 2>&1 || { sed -n '1,40p' "$work/renderedplain/render.txt" >&2; exit 1; }
+grep -q '^Type=exec' "$work/renderedplain/lib/billet-server.service" || fail "the plain server render does not carry Type=exec this case exists for" renderedplain
+grep -q '^EnvironmentFile=' "$work/renderedplain/lib/billet-server.service" && fail "the plain server render carries an environment file" renderedplain
+sed -i.bak 's/^Type=notify/Type=exec/' "$work/renderedplain/fake/billet-server.service.props"
+allowed renderedplain "the role's server unit rendered with every optional branch off passes"
+
+# The upgrade-probe branches of ExecStart, on both templates, with the loaded
+# records carrying the same words: the probe alone, and the probe with its hold.
+for variant in probe probehold; do
+    fixture rendered$variant
+    hold=false; words='"--upgrade-probe"'; tail=' --upgrade-probe'
+    if [ "$variant" = probehold ]; then hold=true; words='"--upgrade-probe","--upgrade-probe-hold"'; tail=' --upgrade-probe --upgrade-probe-hold'; fi
+    cat >"$work/rendered$variant/render.yml" <<PLAY
+---
+- name: Render both units with the upgrade probe
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Render the server
+      ansible.builtin.template:
+        src: $collection/roles/host/templates/billet-server.service.j2
+        dest: $work/rendered$variant/lib/billet-server.service
+        mode: "0644"
+      vars:
+        billet_service_user: billet
+        billet_service_group: billet
+        billet_systemd_notify_ready: true
+        billet_systemd_upgrade_probe: true
+        billet_systemd_upgrade_probe_hold: $hold
+        billet_ledger_volume_id: ""
+        billet_candidate_server_state_dir: /var/lib/billet/server
+        billet_server_prepare_only: false
+        billet_server_environment: {}
+        billet_server_environment_path: /etc/billet/server.env
+    - name: Render the node
+      ansible.builtin.template:
+        src: $collection/roles/host/templates/billet-node.service.j2
+        dest: $work/rendered$variant/lib/billet-node.service
+        mode: "0644"
+      vars:
+        billet_service_user: root
+        billet_service_group: root
+        billet_systemd_notify_ready: true
+        billet_systemd_upgrade_probe: true
+        billet_systemd_upgrade_probe_hold: $hold
+        billet_firecracker_enabled: false
+        billet_server_prepare_only: false
+        billet_server_environment: {}
+        billet_server_environment_path: /etc/billet/node.env
+        billet_config: {}
+PLAY
+    ansible-playbook -i localhost, "$work/rendered$variant/render.yml" >"$work/rendered$variant/render.txt" 2>&1 || { sed -n '1,40p' "$work/rendered$variant/render.txt" >&2; exit 1; }
+    for role in server node; do
+        grep -q "^ExecStart=/usr/bin/billet $role --config /etc/billet/billet.yaml$tail\$" "$work/rendered$variant/lib/billet-$role.service" || fail "the $variant render of the $role unit does not carry the probe words this case exists for" rendered$variant
+        printf '{"type":"a(sasbttttuii)","data":[["/usr/bin/billet",["/usr/bin/billet","%s","--config","/etc/billet/billet.yaml",%s],false,0,0,0,0,0,0,0]]}\n' "$role" "$words" >"$work/rendered$variant/fake/billet-$role.service.exec.json"
+    done
+    sed -i.bak 's/^NeedDaemonReload=no/NeedDaemonReload=yes/' "$work/rendered$variant/fake/billet-node.service.props"
+    allowed rendered$variant "both units rendered with the upgrade probe ($variant) pass"
+    grep -q 'billet-node.service: systemd reports' "$work/rendered$variant/out.txt" || fail "the $variant node unit was not compared" rendered$variant
+done
 
 fixture quote
 sed -i.bak 's|^ExecStart=.*|ExecStart=/usr/bin/billet server --config "/etc/billet/billet.yaml"|' "$work/quote/lib/billet-server.service"

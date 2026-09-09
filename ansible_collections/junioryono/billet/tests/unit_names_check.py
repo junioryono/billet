@@ -481,6 +481,21 @@ def instance_with_extra_at(mod, t):
     assert chain == ["other@x@y.service", "actual@x@y.service", "actual@.service"], chain
 
 
+@case("instances that differ only after their second @ are different instances")
+def instance_mismatch_after_extra_at_refuses(mod, t):
+    # other@x@y.service -> actual@x@z.service: a parser that kept only the text
+    # before the second @ would read both as instance x and accept the link.
+    t.fragment(t.lib, "billet-server.service")
+    t.fragment(t.lib, "actual@.service")
+    t.link(t.etc, "other@x@y.service", "actual@x@z.service")
+    try:
+        mod.resolve(t.unit_path, BILLET)
+    except mod.Unreadable as exc:
+        assert "another instance" in str(exc), exc
+        return
+    raise AssertionError("instances differing after their second @ were read as equal")
+
+
 @case("an instance alias to another instance refuses, since systemd rejects it")
 def instance_mismatch_refuses(mod, t):
     t.fragment(t.lib, "billet-server.service")
