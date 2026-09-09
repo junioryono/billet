@@ -333,3 +333,69 @@ func TestAPostgresInspectionReadsUnderAReadOnlyDefaultAndClaimsNothing(t *testin
 
 	_ = successor.Close()
 }
+
+// AN INSPECTION'S VIEW IS ONE SNAPSHOT, PROVED THROUGH THE VIEW ITSELF: a row
+// replaced and committed on another connection in the middle of a callback is
+// not seen until the next View. Under PostgreSQL's default READ COMMITTED a
+// second read inside the callback would see the replacement, so this is what a
+// View that began its transaction without the inspection's options would fail;
+// the transaction's settings were asked directly above, and this asks the
+// transaction View actually made.
+func TestAPostgresInspectionsViewIsOneSnapshot(t *testing.T) {
+	dsn := requirePostgres(t)
+	ctx := t.Context()
+
+	plane, err := OpenPostgres(ctx, t.TempDir(), dsn)
+	if err != nil {
+		t.Fatalf("OpenPostgres: %v", err)
+	}
+
+	t.Cleanup(func() { _ = plane.Close() })
+
+	seedNode(t, plane, "epyc-1", "docker")
+
+	inspect, err := OpenPostgresInspect(ctx, t.TempDir(), dsn)
+	if err != nil {
+		t.Fatalf("OpenPostgresInspect: %v", err)
+	}
+
+	t.Cleanup(func() { _ = inspect.Close() })
+
+	read := func(q Querier) string {
+		t.Helper()
+
+		got, err := ReadQueries(q).ReadNodeProvider(ctx, "epyc-1")
+		if err != nil {
+			t.Fatalf("read the node's provider: %v", err)
+		}
+
+		return got
+	}
+
+	if err := inspect.View(ctx, func(q Querier) error {
+		if got := read(q); got != "docker" {
+			t.Fatalf("the first read inside the View saw %q, want docker", got)
+		}
+
+		// COMMITTED ON ANOTHER CONNECTION while this View's transaction is open.
+		if err := plane.Tx(ctx, func(tx *sql.Tx) error {
+			_, err := tx.ExecContext(ctx, `UPDATE nodes SET provider = 'tart' WHERE name = 'epyc-1'`)
+
+			return err
+		}); err != nil {
+			t.Fatalf("replace the row on the control plane: %v", err)
+		}
+
+		if got := read(q); got != "docker" {
+			t.Errorf("the second read inside the same View saw %q, want the snapshot's docker", got)
+		}
+
+		return nil
+	}); err != nil {
+		t.Fatalf("View: %v", err)
+	}
+
+	if got := providerVia(t, inspect, "epyc-1"); got != "tart" {
+		t.Errorf("the next View saw %q, want the committed tart", got)
+	}
+}

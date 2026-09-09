@@ -207,7 +207,14 @@ func hostUpgradeFromRollout(ctx context.Context, cfg *config.Config, cfgPath str
 
 	// A GUARDED HOST IS NOTHING TO DO, said with the guard's words and exit 0,
 	// because a converge is what holds it and the timer is not what ends that.
+	// A CLAIM THAT COULD NOT BE CLASSIFIED IS A FAILURE, not a guard: the timer
+	// reporting success while the claim is unreadable would hide a broken
+	// inspection behind a scheduled unit's zero exit.
 	if err := refuseGuardedHost(tx); err != nil {
+		if !errors.Is(err, errHostGuarded) {
+			return err
+		}
+
 		fmt.Printf("%v; nothing to do.\n", err)
 
 		return nil
@@ -984,6 +991,13 @@ func resumeHostUpgrade(ctx context.Context, cfg *config.Config) error {
 	}
 
 	dir := shape.Target
+
+	// THE JOURNAL IS READ BY ITS NAME under the root's name: the root must still
+	// be the one the lock validated, or the resume would read another tree's
+	// journal and act on this one's claim.
+	if err := requireRootInPlace(tx); err != nil {
+		return err
+	}
 
 	journal, err := hostupgrade.ReadJournal(dir)
 	if errors.Is(err, hostupgrade.ErrNoJournal) {

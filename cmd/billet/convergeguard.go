@@ -39,8 +39,8 @@ import (
 //
 // PUBLICATION IS ONE ORDER, UNDER THE LOCK: `active` absent, `mkdir`, write
 // `guard.json.tmp`, fsync it, rename it to `guard.json`, fsync `active`, fsync
-// the root, and fsync the root's parent when this preparation created the root.
-// Release is the reverse: unlink `guard.json`, fsync `active`, `rmdir`, fsync
+// the root (the root's parent was flushed by the acquisition that created the
+// root, before anything was written under it). Release is the reverse: unlink `guard.json`, fsync `active`, `rmdir`, fsync
 // the root. Every interruption leaves a state a reader classifies, and the
 // durability table in convergeguard_test.go names each with its answer.
 //
@@ -95,6 +95,10 @@ var (
 	errTrustBoundary = errors.New("the upgrade root is not trusted")
 	// errScanRefused means the process scan found a driver or could not look.
 	errScanRefused = errors.New("the process scan refuses")
+	// errHostGuarded is what a transaction's entry meets on a host a converge
+	// holds: a recognised guard, published or not, as distinct from a claim
+	// that could not be classified.
+	errHostGuarded = errors.New("this host is held by a converge")
 )
 
 // guardOp is one filesystem operation of the guard, as the hook sees it: its
@@ -132,6 +136,17 @@ var (
 // made by somebody else; the launch agent's account on a Mac, for the same
 // reason under that account.
 func defaultGuardOwner() uint32 { return uint32(os.Geteuid()) }
+
+// linkCountOf is a file's link count from its stat, or zero when the platform
+// reports none (which refuses, the way an unreported owner does).
+func linkCountOf(info os.FileInfo) uint64 {
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0
+	}
+
+	return uint64(st.Nlink)
+}
 
 func ownerFromInfo(info os.FileInfo) (uint32, bool) {
 	st, ok := info.Sys().(*syscall.Stat_t)
@@ -255,19 +270,23 @@ func cmdGuardHold(args []string) error {
 // through the root's descriptor, so a name replaced under the lock is not the
 // thing used.
 func holdGuard(root *txLock, holder, candidate string) error {
-	shape, err := classifyClaimAt(root.dir)
+	dir, shape, err := openGuardForMutation(root)
 	if err != nil {
 		return err
+	}
+
+	if dir != nil {
+		defer func() { _ = dir.Close() }()
 	}
 
 	switch shape.Kind {
 	case claimNone:
 	case claimGuard:
-		if shape.Guard.Holder != holder {
+		if shape.RecordErr != "" || shape.Guard.Holder != holder {
 			return refuseHeld(shape)
 		}
 
-		return validateSameHolder(root, shape, candidate)
+		return validateSameHolder(root, dir, shape, candidate)
 	default:
 		return refuseShape(shape)
 	}
@@ -334,17 +353,7 @@ func publishGuard(root *txLock, record guardRecord) error {
 		return err
 	}
 
-	if err := syncDirFD(root.dir); err != nil {
-		return err
-	}
-
-	if root.created {
-		if err := syncPathDir(filepath.Dir(upgradeRoot)); err != nil {
-			return err
-		}
-	}
-
-	return nil
+	return syncDirFD(root.dir)
 }
 
 // writeGuardRecordAt writes the record as `guard.json.tmp` inside the guard
@@ -447,6 +456,16 @@ func openGuardTmpAt(dir *os.File, replace bool) (*os.File, error) {
 		return nil, fmt.Errorf("the stale %s cannot be replaced: %w", guardTmpName, err)
 	}
 
+	// ONE LINK: a temporary hard-linked to the record, to a preserved binary or
+	// to a journal would be truncated in place, and that inode's other name
+	// would lose its bytes before anything was published.
+	if links := linkCountOf(opened); links != 1 {
+		_ = f.Close()
+
+		return nil, fmt.Errorf("the stale %s cannot be replaced: %w: it has %d links, and truncating it would "+
+			"empty every name of that inode", guardTmpName, errTrustBoundary, links)
+	}
+
 	if err := guardObserve("truncate", tmp, f); err != nil {
 		_ = f.Close()
 
@@ -516,26 +535,6 @@ func requireTrustedOwner(path string, info os.FileInfo) error {
 
 	if want := guardExpectedOwner(); uid != want {
 		return fmt.Errorf("%w: %s is owned by uid %d, want %d", errTrustBoundary, path, uid, want)
-	}
-
-	return nil
-}
-
-// syncPathDir flushes a directory by name, through its own descriptor.
-func syncPathDir(dir string) error {
-	f, err := os.OpenFile(dir, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
-	if err != nil {
-		return fmt.Errorf("open %s to flush it: %w", dir, err)
-	}
-
-	defer func() { _ = f.Close() }()
-
-	if err := guardObserve("fsync", dir, f); err != nil {
-		return err
-	}
-
-	if err := f.Sync(); err != nil {
-		return fmt.Errorf("flush %s: %w", dir, err)
 	}
 
 	return nil
@@ -614,28 +613,64 @@ func fileTypeOf(mode uint32) string {
 	return "an entry of an unknown type"
 }
 
-// validateSameHolder is a hold by the holder that already holds: the guard is
-// validated through the root's descriptor and nothing is touched. A stale
-// temporary beside the record, a candidate that is not the recorded
-// executable, or a guard directory outside the trust boundary refuses.
-func validateSameHolder(root *txLock, shape claimShape, candidate string) error {
-	active := activePath()
+// openGuardForMutation is what every mutator classifies through: `active`
+// examined relative to the root; when it is a directory, opened relative to
+// the root, VALIDATED as the guard directory this command would have made
+// (0700, owned by the expected account), classified through that descriptor,
+// and the descriptor returned so the mutation acts on the directory that was
+// validated and classified. Any other shape is classified and returned with no
+// descriptor, for the caller to refuse.
+func openGuardForMutation(root *txLock) (*os.File, claimShape, error) {
+	st, err := statAt(root.dir, activePointer)
+
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return nil, claimShape{Kind: claimNone}, nil
+	case err != nil:
+		return nil, claimShape{}, fmt.Errorf("examine %s: %w", activePath(), err)
+	case modeOf(st)&unix.S_IFMT != unix.S_IFDIR:
+		shape, err := classifyClaimAt(root.dir)
+
+		return nil, shape, err
+	}
 
 	dir, err := openActive(root)
 	if err != nil {
-		return fmt.Errorf("examine %s: %w", active, err)
+		return nil, claimShape{}, err
 	}
-
-	defer func() { _ = dir.Close() }()
 
 	info, err := dir.Stat()
 	if err != nil {
-		return fmt.Errorf("examine %s: %w", active, err)
+		_ = dir.Close()
+
+		return nil, claimShape{}, fmt.Errorf("examine %s: %w", activePath(), err)
 	}
 
-	if err := requireTrustedDir(active, info, 0o700); err != nil {
-		return err
+	if err := requireTrustedDir(activePath(), info, 0o700); err != nil {
+		_ = dir.Close()
+
+		return nil, claimShape{}, err
 	}
+
+	shape, err := classifyGuardDirFrom(dir)
+	if err != nil {
+		_ = dir.Close()
+
+		return nil, claimShape{}, err
+	}
+
+	return dir, shape, nil
+}
+
+// validateSameHolder is a hold by the holder that already holds: the guard was
+// validated through the root's descriptor and nothing is written; what a retry
+// still owes is the DURABILITY of a publication it may have interrupted (a hold
+// killed after its rename and before its flushes leaves a record that is in the
+// directory and not yet on the disk), so the guard directory and the root are
+// flushed again. A stale temporary beside the record, or a candidate that is
+// not the recorded executable, refuses.
+func validateSameHolder(root *txLock, dir *os.File, shape claimShape, candidate string) error {
+	active := activePath()
 
 	if _, err := statAt(dir, guardTmpName); err == nil {
 		return fmt.Errorf("%s holds a %s beside its record, which a hold does not leave; "+
@@ -656,7 +691,11 @@ func validateSameHolder(root *txLock, shape claimShape, candidate string) error 
 		}
 	}
 
-	return nil
+	if err := syncDirFD(dir); err != nil {
+		return err
+	}
+
+	return syncDirFD(root.dir)
 }
 
 // recordExecutable is the path and digest the guard records: the candidate
@@ -729,12 +768,11 @@ func hashCandidate(root *txLock, candidate string) (string, string, error) {
 		return "", "", err
 	}
 
-	fd, err := unix.Openat(dirFD, filepath.Base(cleaned), unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	f, err := openRegularAt(dir, filepath.Base(cleaned))
 	if err != nil {
 		return "", "", fmt.Errorf("open the candidate %s: %w", cleaned, err)
 	}
 
-	f := os.NewFile(uintptr(fd), cleaned)
 	defer func() { _ = f.Close() }()
 
 	info, err := f.Stat()
@@ -785,17 +823,12 @@ func hashManagedBinary() (string, string, error) {
 		return "", "", err
 	}
 
-	f, err := os.OpenFile(installedBinary, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	f, info, err := regularfile.Open(installedBinary, regularfile.Options{NoFollow: true})
 	if err != nil {
 		return "", "", fmt.Errorf("open the managed binary %s: %w", installedBinary, err)
 	}
 
 	defer func() { _ = f.Close() }()
-
-	info, err := f.Stat()
-	if err != nil {
-		return "", "", fmt.Errorf("examine %s: %w", installedBinary, err)
-	}
 
 	if err := requireTrustedFile(installedBinary, info); err != nil {
 		return "", "", err
@@ -832,9 +865,13 @@ func cmdGuardRelease(args []string) error {
 
 	defer root.close()
 
-	shape, err := classifyClaimAt(root.dir)
+	dir, shape, err := openGuardForMutation(root)
 	if err != nil {
 		return err
+	}
+
+	if dir != nil {
+		defer func() { _ = dir.Close() }()
 	}
 
 	switch shape.Kind {
@@ -845,17 +882,14 @@ func cmdGuardRelease(args []string) error {
 		return refuseShape(shape)
 	}
 
+	if shape.RecordErr != "" {
+		return fmt.Errorf("%w, and its record cannot be read (%s); nothing was released", errGuardHeld, shape.RecordErr)
+	}
+
 	if shape.Guard.Holder != *holder {
 		return fmt.Errorf("%w: it names %s and this release is by %s; nothing was released",
 			errGuardHeld, shape.Guard.Holder, *holder)
 	}
-
-	dir, err := openActive(root)
-	if err != nil {
-		return err
-	}
-
-	defer func() { _ = dir.Close() }()
 
 	if err := requireNoPointerAt(dir); err != nil {
 		return err
@@ -964,9 +998,13 @@ func cmdGuardRecover(args []string) error {
 // nothing but the publication's temporary, every entry examined through the
 // directory's descriptor before any is removed.
 func recoverUnpublished(root *txLock) error {
-	shape, err := classifyClaimAt(root.dir)
+	dir, shape, err := openGuardForMutation(root)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w; nothing was removed", err)
+	}
+
+	if dir != nil {
+		defer func() { _ = dir.Close() }()
 	}
 
 	if shape.Kind != claimUnpublished {
@@ -977,13 +1015,6 @@ func recoverUnpublished(root *txLock) error {
 
 		return refuseShape(shape)
 	}
-
-	dir, err := openActive(root)
-	if err != nil {
-		return fmt.Errorf("%w; nothing was removed", err)
-	}
-
-	defer func() { _ = dir.Close() }()
 
 	entries, err := dir.ReadDir(-1)
 	if err != nil {
@@ -1020,9 +1051,13 @@ func recoverUnpublished(root *txLock) error {
 // recoverHolder removes a guard naming holder that carries no pointer, under
 // the operator's assertion and a clean process scan.
 func recoverHolder(root *txLock, holder string) error {
-	shape, err := classifyClaimAt(root.dir)
+	dir, shape, err := openGuardForMutation(root)
 	if err != nil {
 		return err
+	}
+
+	if dir != nil {
+		defer func() { _ = dir.Close() }()
 	}
 
 	switch shape.Kind {
@@ -1033,16 +1068,13 @@ func recoverHolder(root *txLock, holder string) error {
 		return refuseShape(shape)
 	}
 
+	if shape.RecordErr != "" {
+		return fmt.Errorf("%w, and its record cannot be read (%s); nothing was removed", errGuardHeld, shape.RecordErr)
+	}
+
 	if shape.Guard.Holder != holder {
 		return fmt.Errorf("%w: it names %s, not %s; nothing was removed", errGuardHeld, shape.Guard.Holder, holder)
 	}
-
-	dir, err := openActive(root)
-	if err != nil {
-		return err
-	}
-
-	defer func() { _ = dir.Close() }()
 
 	if err := requireNoPointerAt(dir); err != nil {
 		return fmt.Errorf("%w; `hold --recover-from %s --old-driver-stopped` takes the transaction over "+
@@ -1059,9 +1091,13 @@ func recoverHolder(root *txLock, holder string) error {
 // takeOverGuard re-labels a guard another holder left with its transaction
 // pointer, keeping the pointer and the recorded executable.
 func takeOverGuard(root *txLock, old, holder string) error {
-	shape, err := classifyClaimAt(root.dir)
+	dir, shape, err := openGuardForMutation(root)
 	if err != nil {
 		return err
+	}
+
+	if dir != nil {
+		defer func() { _ = dir.Close() }()
 	}
 
 	switch shape.Kind {
@@ -1072,16 +1108,13 @@ func takeOverGuard(root *txLock, old, holder string) error {
 		return refuseShape(shape)
 	}
 
+	if shape.RecordErr != "" {
+		return fmt.Errorf("%w, and its record cannot be read (%s); nothing was taken over", errGuardHeld, shape.RecordErr)
+	}
+
 	if shape.Guard.Holder != old {
 		return fmt.Errorf("%w: it names %s, not %s; nothing was taken over", errGuardHeld, shape.Guard.Holder, old)
 	}
-
-	dir, err := openActive(root)
-	if err != nil {
-		return err
-	}
-
-	defer func() { _ = dir.Close() }()
 
 	pointer := filepath.Join(dir.Name(), guardPointerName)
 
@@ -1094,6 +1127,10 @@ func takeOverGuard(root *txLock, old, holder string) error {
 		return fmt.Errorf("examine %s: %w", pointer, err)
 	}
 
+	if err := guardObserve("readlink", pointer, nil); err != nil {
+		return err
+	}
+
 	target, err := readlinkAt(dir, guardPointerName)
 	if err != nil {
 		return fmt.Errorf("read the transaction pointer %s: %w", pointer, err)
@@ -1101,6 +1138,13 @@ func takeOverGuard(root *txLock, old, holder string) error {
 
 	if err := underUpgradeRoot(target); err != nil {
 		return fmt.Errorf("the transaction pointer names %s: %w", target, err)
+	}
+
+	// THE JOURNAL IS READ BY ITS NAME, so the root must still be the root the
+	// lock validated: a root replaced at its name would resolve the target
+	// through another tree.
+	if err := requireRootInPlace(root); err != nil {
+		return err
 	}
 
 	if _, err := hostupgrade.ReadJournal(target); err != nil {
@@ -1169,6 +1213,10 @@ func cmdGuardHolder(args []string) error {
 
 	if shape.Kind != claimGuard {
 		return fmt.Errorf("%w: %s", errNoGuard, shape)
+	}
+
+	if shape.RecordErr != "" {
+		return fmt.Errorf("%w, and its record cannot be read (%s)", errGuardHeld, shape.RecordErr)
 	}
 
 	fmt.Println(shape.Guard.Holder)
@@ -1245,14 +1293,24 @@ func classifyClaimAt(root *os.File) (claimShape, error) {
 	case unix.S_IFLNK:
 		shape := claimShape{Kind: claimHostUpgrade}
 
+		if err := guardObserve("readlink", active, nil); err != nil {
+			return claimShape{}, err
+		}
+
 		shape.Target, err = readlinkAt(root, activePointer)
 		if err != nil {
 			return claimShape{}, fmt.Errorf("read %s: %w", active, err)
 		}
 
+		// DANGLING IS A POSITIVE ABSENCE OF THE TARGET; any other failure to
+		// examine it is could-not-tell.
 		var followed unix.Stat_t
-		if err := unix.Fstatat(int(root.Fd()), activePointer, &followed, 0); err != nil {
+
+		switch err := unix.Fstatat(int(root.Fd()), activePointer, &followed, 0); {
+		case errors.Is(err, fs.ErrNotExist):
 			shape.Dangling = true
+		case err != nil:
+			return claimShape{}, fmt.Errorf("examine the claim's target %s: %w", shape.Target, err)
 		}
 
 		return shape, nil
@@ -1274,6 +1332,12 @@ func classifyGuardDirAt(root *os.File) (claimShape, error) {
 
 	defer func() { _ = dir.Close() }()
 
+	return classifyGuardDirFrom(dir)
+}
+
+// classifyGuardDirFrom classifies a guard directory through a descriptor the
+// caller holds and keeps.
+func classifyGuardDirFrom(dir *os.File) (claimShape, error) {
 	record := filepath.Join(dir.Name(), guardRecordName)
 
 	body, err := readRecordAt(dir)
@@ -1319,27 +1383,41 @@ func openActiveOf(root *os.File) (*os.File, error) {
 // readRecordAt reads `guard.json` through the guard directory's descriptor:
 // opened O_NOFOLLOW and O_NONBLOCK, required regular, bounded.
 func readRecordAt(dir *os.File) ([]byte, error) {
-	fd, err := unix.Openat(int(dir.Fd()), guardRecordName,
-		unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	path := filepath.Join(dir.Name(), guardRecordName)
+
+	f, err := openRegularAt(dir, guardRecordName)
 	if err != nil {
 		return nil, err
 	}
-
-	path := filepath.Join(dir.Name(), guardRecordName)
-	f := os.NewFile(uintptr(fd), path)
 
 	defer func() { _ = f.Close() }()
 
-	info, err := f.Stat()
+	return regularfile.ReadAllLimited(f, path, maxGuardRecordBytes)
+}
+
+// openRegularAt opens one entry of a directory for reading, IDENTITY FIRST:
+// the name is opened for its identity alone relative to the directory (an
+// O_PATH descriptor on Linux, which invokes no driver; a non-blocking open
+// elsewhere, where the platform has nothing better and the regularfile package
+// says so), and regularfile.Reopen turns that into a readable descriptor of
+// the same inode only when it is a regular file on a filesystem that stores
+// bytes. A device or a pseudo-file at the name is refused without being read.
+func openRegularAt(dir *os.File, name string) (*os.File, error) {
+	path := filepath.Join(dir.Name(), name)
+
+	id, err := openIdentityAt(dir, name)
+	if err != nil {
+		return nil, &os.PathError{Op: "open", Path: path, Err: err}
+	}
+
+	defer func() { _ = id.Close() }()
+
+	f, err := regularfile.Reopen(id)
 	if err != nil {
 		return nil, err
 	}
 
-	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("%s is %s, not a regular file", path, info.Mode().Type())
-	}
-
-	return regularfile.ReadAllLimited(f, path, maxGuardRecordBytes)
+	return f, nil
 }
 
 func (s claimShape) String() string {
@@ -1547,8 +1625,8 @@ func describeGuardAge(shape claimShape) string {
 // guardRefusal is the refusal a host under a guard gives a transaction: "guarded
 // by H since T", the words a node's acknowledgement carries to the coordinator.
 func guardRefusal(shape claimShape) error {
-	return fmt.Errorf("guarded by %s since %s (%s); `billet converge-guard status` on the host says more",
-		shape.Guard.Holder, shape.Guard.ClaimedAt, shape.Guard.Hostname)
+	return fmt.Errorf("%w: guarded by %s since %s (%s); `billet converge-guard status` on the host says more",
+		errHostGuarded, shape.Guard.Holder, shape.Guard.ClaimedAt, shape.Guard.Hostname)
 }
 
 // refuseGuardedHost is what a transaction's entry runs immediately after the
@@ -1562,13 +1640,13 @@ func refuseGuardedHost(tx *txLock) error {
 	switch shape.Kind {
 	case claimGuard:
 		if shape.RecordErr != "" {
-			return fmt.Errorf("guarded by a converge whose record cannot be read (%s); "+
-				"`billet converge-guard status` on the host says more", shape.RecordErr)
+			return fmt.Errorf("%w: guarded by a converge whose record cannot be read (%s); "+
+				"`billet converge-guard status` on the host says more", errHostGuarded, shape.RecordErr)
 		}
 
 		return guardRefusal(shape)
 	case claimUnpublished:
-		return refuseShape(shape)
+		return fmt.Errorf("%w: %w", errHostGuarded, refuseShape(shape))
 	}
 
 	return nil

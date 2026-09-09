@@ -102,7 +102,7 @@ func TestAnUpgradeRefusesAGuardedHostBeforeAnythingElse(t *testing.T) {
 		t.Fatalf("the command on a guarded host: err = %v", err)
 	}
 
-	if got := answer(); !strings.HasPrefix(got, node.AckRefused+"guarded by ci-1 since") {
+	if got := answer(); !strings.HasPrefix(got, node.AckRefused+"this host is held by a converge: guarded by ci-1 since") {
 		t.Errorf("the ack carried %q", got)
 	}
 
@@ -344,6 +344,46 @@ func TestTheTimerHoldsOneLockFromClassificationThroughSettlement(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// AN UNPUBLISHED GUARD is a converge's too: exit 0 with its words, no read.
+	// (The rollout ledger fixture gives the timer a root of its own.)
+	active := filepath.Join(upgradeRoot, activePointer)
+	mustOK(t, os.Mkdir(active, 0o700))
+
+	timerBarrier = func(string) { read = true }
+
+	out = capture(t, func() {
+		if err := hostUpgradeFromRollout(t.Context(), cfg, cfgPath, false); err != nil {
+			t.Errorf("the timer on a host with an unpublished guard: %v", err)
+		}
+	})
+
+	timerBarrier = nil
+
+	if !strings.Contains(out, "nothing to do") || !strings.Contains(out, "recover --unpublished") || read {
+		t.Errorf("the timer over an unpublished guard printed %q (read=%v)", out, read)
+	}
+
+	// A CLAIM THAT CANNOT BE CLASSIFIED IS A FAILURE, never a guard's exit 0: a
+	// guard directory whose record is a FIFO. The ledger is not read, the lock
+	// is released, and the error is the classifier's.
+	mustOK(t, syscall.Mkfifo(filepath.Join(active, guardRecordName), 0o600))
+
+	timerBarrier = func(string) { read = true }
+
+	err := hostUpgradeFromRollout(t.Context(), cfg, cfgPath, false)
+
+	timerBarrier = nil
+
+	if err == nil || !strings.Contains(err.Error(), "not a regular file") || errors.Is(err, errHostGuarded) {
+		t.Errorf("the timer over an unclassifiable claim: err = %v, want the classifier's failure", err)
+	}
+
+	if read || !lockFreeInProcess(t) {
+		t.Errorf("the timer over an unclassifiable claim read the ledger (%v) or kept the lock", read)
+	}
+
+	mustOK(t, os.RemoveAll(active))
+
 	// A HELD LOCK: nothing to decide, exit 0, no read.
 	end := startLockHolder(t)
 	timerBarrier = func(string) { read = true }
@@ -425,6 +465,11 @@ func TestUpgradeStatusNamesEveryClaimShape(t *testing.T) {
 func TestTheNodeReadsTheGuardsRefusalFromTheUpdaterItLaunched(t *testing.T) {
 	f := newGuardedFixture(t)
 	mustHold(t, "ci-1")
+
+	// THE DIRECT LAUNCH SHAPE, on every platform: under systemd (a CI runner
+	// carries INVOCATION_ID) the launcher would go through systemd-run, which
+	// needs root and a manager; the socket the refusal travels is the same.
+	t.Setenv("INVOCATION_ID", "")
 
 	// The test binary, re-executed as the command by a wrapper the launcher
 	// execs.

@@ -253,9 +253,12 @@ func TestAHoldPublishesInOneOrder(t *testing.T) {
 				"rename upgrades/active/guard.json", "fsync upgrades/active", "fsync upgrades",
 			}
 
+			// A ROOT CREATED HERE HAS ITS PARENT FLUSHED BY THE ACQUISITION, before
+			// anything is written under it: an acquisition that failed later would
+			// otherwise leave a root whose entry is not durable and whose next
+			// acquisition finds it existing and flushes nothing.
 			if !existing {
-				want = slices.Insert(want, 1, "mkdir upgrades")
-				want = append(want, "fsync "+strings.TrimPrefix(f.parent, f.parent+"/"))
+				want = slices.Insert(want, 1, "mkdir upgrades", "fsync "+f.parent)
 			}
 
 			// THE LOCK IS RELEASED LAST, after the last flush.
@@ -716,17 +719,39 @@ func TestAHoldKilledAtEachStepLeavesAClassifiedRemainder(t *testing.T) {
 					t.Error("recover --unpublished removed a published guard")
 				}
 
-				// The same holder validates it.
+				// THE SAME HOLDER VALIDATES IT AND COMPLETES ITS DURABILITY: the
+				// remainder of a hold killed between its rename and its flushes is
+				// in the directory and not yet on the disk, and the retry is what
+				// flushes the guard directory and the root.
+				var flushed []string
+
+				guardHook = func(op guardOp) error {
+					if op.Kind == "fsync" {
+						flushed = append(flushed, op.Path)
+					}
+
+					return nil
+				}
+
 				if err := guardRun(t, "hold", "--holder", "ci-1"); err != nil {
 					t.Errorf("a same-holder hold on the remainder: %v", err)
+				}
+
+				guardHook = nil
+
+				if !slices.Contains(flushed, f.active()) || !slices.Contains(flushed, f.root) {
+					t.Errorf("the retry flushed %q, want the guard directory and the root", flushed)
 				}
 			}
 		})
 	}
 }
 
-// G4: A SAME-HOLDER HOLD TOUCHES NOTHING, and validates: a stale temporary, a
-// wrong mode, another owner, or a different candidate refuses.
+// G4: A SAME-HOLDER HOLD WRITES NOTHING AND COMPLETES DURABILITY: it flushes
+// the guard directory and the root (a retry of a hold killed after its rename
+// and before its flushes owes exactly that), touches no file, and validates: a
+// stale temporary, a wrong mode, another owner, or a different candidate
+// refuses.
 func TestASameHolderHoldValidatesAndTouchesNothing(t *testing.T) {
 	f := newGuardFixture(t)
 	mustHold(t, "ci-1")
@@ -745,13 +770,22 @@ func TestASameHolderHoldValidatesAndTouchesNothing(t *testing.T) {
 
 	guardHook = nil
 
+	var flushed []string
+
 	for _, op := range ops {
 		switch op.Kind {
-		case "write", "rename", "fsync", "unlink", "mkdir", "create", "rmdir", "truncate":
+		case "write", "rename", "unlink", "mkdir", "create", "rmdir", "truncate":
 			if strings.Contains(op.Path, "active") {
 				t.Errorf("a same-holder hold performed %s %s", op.Kind, op.Path)
 			}
+		case "fsync":
+			flushed = append(flushed, op.Path)
 		}
+	}
+
+	// THE TWO DIRECTORY FLUSHES, in publication order, and no file's.
+	if want := []string{f.active(), f.root}; !reflect.DeepEqual(flushed, want) {
+		t.Errorf("a same-holder hold flushed %q, want the guard directory then the root", flushed)
 	}
 
 	bytesAfter, err := os.ReadFile(filepath.Join(f.active(), guardRecordName))
@@ -761,6 +795,22 @@ func TestASameHolderHoldValidatesAndTouchesNothing(t *testing.T) {
 		!bytes.Equal(bytesBefore, bytesAfter) {
 		t.Error("a same-holder hold changed the guard")
 	}
+
+	t.Run("a flush that fails fails the hold", func(t *testing.T) {
+		guardHook = func(op guardOp) error {
+			if op.Kind == "fsync" && op.Path == f.active() {
+				return errors.New("injected: the guard directory's flush refused")
+			}
+
+			return nil
+		}
+
+		t.Cleanup(func() { guardHook = nil })
+
+		if err := guardRun(t, "hold", "--holder", "ci-1"); err == nil || !strings.Contains(err.Error(), "injected") {
+			t.Errorf("a same-holder hold whose flush failed: err = %v, want the failure", err)
+		}
+	})
 
 	t.Run("a stale temporary refuses", func(t *testing.T) {
 		tmp := filepath.Join(f.active(), guardTmpName)
@@ -1228,9 +1278,42 @@ func TestStatusNamesEveryShapeWithoutLockingOrCreating(t *testing.T) {
 		t.Errorf("a dangling claim is not reported dangling: %q", out)
 	}
 
+	// DANGLING IS A POSITIVE ABSENCE: a target that cannot be examined (a link
+	// to itself, which the kernel refuses with ELOOP) is could-not-tell, and
+	// status says so rather than reporting a claim whose target does not exist.
+	_ = os.RemoveAll(f.active())
+	mustOK(t, os.Symlink(activePointer, f.active()))
+
+	if err := guardRun(t, "status"); err == nil || !strings.Contains(err.Error(), "examine the claim's target") ||
+		strings.Contains(err.Error(), "does not exist") {
+		t.Errorf("status over a claim whose target cannot be examined: err = %v, want could-not-tell", err)
+	}
+
+	if err := guardRun(t, "holder"); err == nil || !strings.Contains(err.Error(), "examine the claim's target") {
+		t.Errorf("holder over a claim whose target cannot be examined: err = %v", err)
+	}
+
 	_ = os.RemoveAll(f.active())
 	mustOK(t, os.Mkdir(f.active(), 0o700))
 	mustOK(t, os.WriteFile(filepath.Join(f.active(), guardRecordName), []byte("not json"), 0o600))
+
+	// A RECORD THAT CANNOT BE READ NAMES NO HOLDER: every command that would
+	// act on the holder refuses, naming the record, and the record stays.
+	for name, args := range map[string][]string{
+		"holder":   {"holder"},
+		"release":  {"release", "--holder", "ci-1"},
+		"recover":  {"recover", "--holder", "ci-1", "--old-driver-stopped"},
+		"takeover": {"hold", "--holder", "ci-2", "--recover-from", "ci-1", "--old-driver-stopped"},
+		"hold":     {"hold", "--holder", "ci-1"},
+	} {
+		if err := guardRun(t, args...); !errors.Is(err, errGuardHeld) || !strings.Contains(err.Error(), "cannot be read") {
+			t.Errorf("%s over an unreadable record: err = %v, want the guard's refusal naming the record", name, err)
+		}
+
+		if body, err := os.ReadFile(filepath.Join(f.active(), guardRecordName)); err != nil || string(body) != "not json" {
+			t.Errorf("%s changed the unreadable record: %q, %v", name, body, err)
+		}
+	}
 
 	out = capture(t, func() {
 		if err := guardRun(t, "status", "--json"); err != nil {
@@ -1354,50 +1437,69 @@ func TestTwoSimultaneousHoldsLeaveOneGuard(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		b := startGuardHelper(t, "command", helperArgs("hold", "--holder", "ci-b"))
-		c := startGuardHelper(t, "command", helperArgs("hold", "--holder", "ci-c"))
+		// BOTH HELPERS STOP AT THE FLOCK ITSELF, each holding its open of the
+		// lock file, and are released together, so the race is the lock's and
+		// not the process start's.
+		helpers := map[string]*guardHelper{}
+
+		for _, holder := range []string{"ci-b", "ci-c"} {
+			env := helperArgs("hold", "--holder", holder)
+			env[guardHelperStopEnv] = "flock " + txLockName
+			env[guardHelperContinueEnv] = "1"
+			helpers[holder] = startGuardHelper(t, "command", env)
+		}
+
+		for _, h := range helpers {
+			h.await(t, "STOPPED")
+		}
+
+		for _, h := range helpers {
+			if _, err := h.stdin.Write([]byte{'\n'}); err != nil {
+				t.Fatalf("round %d: release a helper: %v", round, err)
+			}
+		}
 
 		outcomes := map[string]string{}
 
-		for _, h := range []*guardHelper{b, c} {
-			select {
-			case line := <-h.lines:
-				outcomes[fmt.Sprint(h.pid)] = line
-			case <-time.After(30 * time.Second):
-				t.Fatalf("round %d: a helper never answered", round)
+		for holder, h := range helpers {
+			outcomes[holder] = h.await(t, "")
+
+			if err := h.cmd.Wait(); err != nil {
+				t.Logf("round %d: %s ended: %v", round, holder, err)
 			}
 
-			h.release(t)
+			h.reaped = true
 		}
 
-		var winners, losers int
+		var winners, losers []string
 
-		for pid, line := range outcomes {
+		for holder, line := range outcomes {
 			switch {
 			case line == "DONE":
-				winners++
+				winners = append(winners, holder)
 			case strings.HasPrefix(line, "REFUSED:"):
-				losers++
+				losers = append(losers, holder)
 
 				if !strings.Contains(line, "held by") && !strings.Contains(line, "already running") {
-					t.Errorf("round %d: the loser %s refused with %q", round, pid, line)
+					t.Errorf("round %d: the loser %s refused with %q", round, holder, line)
 				}
 			default:
-				t.Errorf("round %d: helper %s answered %q", round, pid, line)
+				t.Errorf("round %d: helper %s answered %q", round, holder, line)
 			}
 		}
 
-		if winners != 1 || losers != 1 {
-			t.Fatalf("round %d: %d winners and %d losers", round, winners, losers)
+		if len(winners) != 1 || len(losers) != 1 {
+			t.Fatalf("round %d: winners %v and losers %v", round, winners, losers)
 		}
 
+		// THE GUARD NAMES THE HELPER THAT SUCCEEDED, not either.
 		shape, err := classifyClaim()
 		if err != nil || shape.Kind != claimGuard {
 			t.Fatalf("round %d: the remainder is %v (%v)", round, shape.Kind, err)
 		}
 
-		if shape.Guard.Holder != "ci-b" && shape.Guard.Holder != "ci-c" {
-			t.Errorf("round %d: the guard names %q", round, shape.Guard.Holder)
+		if shape.Guard.Holder != winners[0] {
+			t.Errorf("round %d: the guard names %q, want the winner %s", round, shape.Guard.Holder, winners[0])
 		}
 
 		if _, err := os.Lstat(filepath.Join(f.active(), guardTmpName)); err == nil {
@@ -1678,6 +1780,38 @@ func TestATakeoverRelabelsAndKeepsEverythingElse(t *testing.T) {
 
 	mustOK(t, os.Remove(tmp))
 
+	// A HARD-LINKED TEMPORARY IS NEVER TRUNCATED: a temporary that is another
+	// name of the record, or of a preserved binary, would be emptied in place
+	// under its other name. Both are refused before the truncation, and the
+	// other name keeps its bytes.
+	preserved := filepath.Join(recovery, "billet.previous")
+	mustOK(t, os.WriteFile(preserved, []byte("the previous binary"), 0o700))
+
+	for name, target := range map[string]string{
+		"the record":         filepath.Join(f.active(), guardRecordName),
+		"a preserved binary": preserved,
+	} {
+		bytesBefore, err := os.ReadFile(target)
+		mustOK(t, err)
+
+		mustOK(t, os.Link(target, tmp))
+
+		if err := guardRun(t, "hold", "--holder", "ci-2", "--recover-from", "ci-1", "--old-driver-stopped"); !errors.Is(err, errTrustBoundary) ||
+			!strings.Contains(err.Error(), "links") {
+			t.Errorf("a temporary hard-linked to %s: err = %v, want the trust boundary naming the links", name, err)
+		}
+
+		if bytesAfter, err := os.ReadFile(target); err != nil || !bytes.Equal(bytesBefore, bytesAfter) {
+			t.Errorf("a temporary hard-linked to %s: the other name's bytes are %q, %v", name, bytesAfter, err)
+		}
+
+		if got := f.record(t); got != rec {
+			t.Errorf("a temporary hard-linked to %s: the record changed to %+v", name, got)
+		}
+
+		mustOK(t, os.Remove(tmp))
+	}
+
 	// A TRUSTED STALE TEMPORARY IS TRUNCATED ONLY AFTER ITS DESCRIPTOR IS
 	// VALIDATED: with the truncation refused by the hook, the bytes the open
 	// found are still there, which an open with O_TRUNC would have discarded.
@@ -1730,8 +1864,8 @@ func TestATakeoverRelabelsAndKeepsEverythingElse(t *testing.T) {
 
 	guardHook = nil
 
-	want := []string{"lstat " + f.root, "openat " + f.root, "create active/guard.json.tmp", "write active/guard.json.tmp",
-		"fsync active/guard.json.tmp", "rename active/guard.json", "fsync active", "fsync " + f.root}
+	want := []string{"lstat " + f.root, "openat " + f.root, "readlink active/recovery", "create active/guard.json.tmp",
+		"write active/guard.json.tmp", "fsync active/guard.json.tmp", "rename active/guard.json", "fsync active", "fsync " + f.root}
 	if !reflect.DeepEqual(ops, want) {
 		t.Errorf("the takeover's operations:\n got %q\nwant %q", ops, want)
 	}

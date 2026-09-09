@@ -277,8 +277,8 @@ func inspectScheduledUnit(ctx context.Context, unit string, service bool) inspec
 		svc.UnitPresent = known(true)
 		svc.UnitFileState, svc.Enabled = unitEnablement(firstProp(props, "UnitFileState"))
 	}
-	svc.ActiveState = known(firstProp(props, "ActiveState"))
-	svc.SubState = known(firstProp(props, "SubState"))
+	svc.ActiveState = knownOrMissing(props, "ActiveState", unit)
+	svc.SubState = knownOrMissing(props, "SubState", unit)
 	if !service {
 		return svc
 	}
@@ -292,6 +292,15 @@ func inspectScheduledUnit(ctx context.Context, unit string, service bool) inspec
 		svc.MainPID = known(pid)
 	}
 	return svc
+}
+
+// knownOrMissing is a property systemd answered as a value, or unknown when the
+// answer carried no such line: an empty state is not a state.
+func knownOrMissing(props map[string][]string, name, unit string) maybe {
+	if v := firstProp(props, name); v != "" {
+		return known(v)
+	}
+	return unknown("systemd answered no " + name + " for " + unit)
 }
 
 type inspectDSNEnv struct {

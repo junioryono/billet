@@ -125,7 +125,11 @@ func TestReleaseInspectScheduledUnitPIDs(t *testing.T) {
 	mustUnknown(t, "a pid that is not a number", f.report(t).Services["backup_service"].MainPID, "not a number")
 
 	writeFile(t, f.unitsDir+"/billet-upgrade.timer", "", 0o644)
-	mustUnknown(t, "a unit systemd did not answer for", f.report(t).Services["upgrade_timer"].UnitPresent, "no LoadState")
+
+	empty := f.report(t).Services["upgrade_timer"]
+	mustUnknown(t, "a unit systemd did not answer for", empty.UnitPresent, "no LoadState")
+	mustUnknown(t, "the active state of a unit systemd did not answer for", empty.ActiveState, "no ActiveState")
+	mustUnknown(t, "the sub state of a unit systemd did not answer for", empty.SubState, "no SubState")
 }
 
 // I3: THE EXEMPTION'S SCOPE. A healthy host with all five units binds true;
