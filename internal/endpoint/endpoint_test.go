@@ -2,6 +2,9 @@ package endpoint
 
 import (
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"net/netip"
 	"net/url"
 	"strings"
@@ -260,13 +263,39 @@ func TestParseCanonicalAdmitsOnlyTheCanonicalText(t *testing.T) {
 }
 
 // A representation never resolves a name: `localhost` is a DNS spelling whose
-// resolution is nobody's business here, and the resolver seam is never asked.
+// resolution is nobody's business here. The prohibition is STRUCTURAL, over
+// the package's source: the only selector on `net` is SplitHostPort, no
+// resolver type or lookup is named, and no import beyond net, net/netip and
+// net/url reaches the network; a seam production never called proved nothing.
 func TestNoNameIsEverResolved(t *testing.T) {
-	saved := resolveForTest
-	called := false
-	resolveForTest = func(string) { called = true }
+	fset := token.NewFileSet()
 
-	t.Cleanup(func() { resolveForTest = saved })
+	file, err := parser.ParseFile(fset, "endpoint.go", nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, imp := range file.Imports {
+		switch path := strings.Trim(imp.Path.Value, `"`); path {
+		case "errors", "fmt", "net", "net/netip", "net/url", "strconv", "strings":
+		default:
+			t.Errorf("endpoint.go imports %q, which the representation has no business with", path)
+		}
+	}
+
+	ast.Inspect(file, func(n ast.Node) bool {
+		sel, ok := n.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+
+		if id, ok := sel.X.(*ast.Ident); ok && id.Name == "net" && sel.Sel.Name != "SplitHostPort" {
+			t.Errorf("endpoint.go names net.%s at %s; the representation splits a host from its port and does nothing else with net",
+				sel.Sel.Name, fset.Position(sel.Pos()))
+		}
+
+		return true
+	})
 
 	for _, s := range []string{"localhost:8443", "control.example:8443", "192.0.2.1.:8443", "xn--bcher-kva.example:8443"} {
 		e, err := Parse(s, true)
@@ -277,9 +306,5 @@ func TestNoNameIsEverResolved(t *testing.T) {
 		if e.Host.Kind != HostDNS {
 			t.Errorf("%q is typed %v, want a DNS spelling", s, e.Host.Kind)
 		}
-	}
-
-	if called {
-		t.Error("a name was resolved")
 	}
 }

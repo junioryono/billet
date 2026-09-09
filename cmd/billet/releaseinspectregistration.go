@@ -131,6 +131,13 @@ func readRegistrationRecord(path string) registrationEvidence {
 		return registrationEvidence{why: fmt.Sprintf("the registration record is mode %04o, want 0600", perm)}
 	}
 
+	// THE ADMITTED INODE'S SIZE, from the same fstat: a record over the bound at
+	// admission is refused whatever it holds by the time it is read, and the
+	// bounded read below still refuses one that grows afterwards.
+	if info.Size() > maxRegistrationRecordBytes {
+		return registrationEvidence{why: fmt.Sprintf("the registration record is larger than %d bytes", maxRegistrationRecordBytes)}
+	}
+
 	body, err := registrationRead(f, path, maxRegistrationRecordBytes)
 	if err != nil {
 		if errors.Is(err, regularfile.ErrTooLarge) {
@@ -218,8 +225,9 @@ func decodeRegistrationRecord(body []byte) (*registrationRecord, error) {
 		}
 	}
 
-	var schema json.Number
-	if err := json.Unmarshal(members["schema"], &schema); err != nil || schema.String() != "1" {
+	// THE NUMERIC TOKEN `1`, by its bytes: json.Number would also accept the
+	// string "1", and 1.0 is not the schema the node writes.
+	if string(bytes.TrimSpace(members["schema"])) != "1" {
 		return nil, fmt.Errorf("schema is %s, want 1", string(members["schema"]))
 	}
 
@@ -393,8 +401,13 @@ func hostRegistration(node inspectService, cfg *config.Config) maybe {
 		return unknown("no runtime record on this platform")
 	}
 
+	// RUNNING IS A BOUND PROCESS, not the word "active": a node systemd reports
+	// `deactivating` is draining, still serving what it holds and still able
+	// to re-register, and its sample binds like any other; a unit with no main
+	// process, or in a terminal state, has nothing a record can be bound to.
 	active, isString := node.ActiveState.value.(string)
-	if !node.ActiveState.known || !isString || active != "active" || !node.MainPID.known || node.MainPID.value == nil {
+	if !node.ActiveState.known || !isString || active == "inactive" || active == "failed" ||
+		!node.MainPID.known || node.MainPID.value == nil {
 		return unknown("the node is not running, so no registration record is bound to a process")
 	}
 

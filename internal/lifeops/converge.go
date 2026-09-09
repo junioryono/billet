@@ -347,8 +347,11 @@ func (c *Converger) Plan(ctx context.Context, req UpRequest) (UpPlan, error) {
 		}
 	}
 
-	if req.WantServer && report.Server.StateDirectory != "" {
-		plan.ServerState = filepath.Join(stateRoot, report.Server.StateDirectory)
+	// THE CONFIGURED DIRECTORY, which directoryRefusals admitted as one entry
+	// of the unit's list; the directive's rendered text can name several and
+	// is not a path.
+	if req.WantServer && req.ServerStateDir != "" {
+		plan.ServerState = filepath.Clean(req.ServerStateDir)
 	}
 
 	if len(accountRefusals) == 0 {

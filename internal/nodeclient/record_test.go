@@ -190,14 +190,21 @@ func recordDir(t *testing.T) (string, string) {
 func runRecordLoop(t *testing.T, c *nodeclient.Client, compute nodeclient.Compute, path string, now func() time.Time) context.CancelFunc {
 	t.Helper()
 
+	cancel, _ := runRecordLoopWithDone(t, c, compute, path, now)
+
+	return cancel
+}
+
+// runRecordLoopWithDone is runRecordLoop for a fixture that must observe the
+// loop's RETURN, not only its cancellation: done is closed when Run returns.
+func runRecordLoopWithDone(t *testing.T, c *nodeclient.Client, compute nodeclient.Compute, path string, now func() time.Time) (context.CancelFunc, <-chan struct{}) {
+	t.Helper()
+
 	ctx, cancel := context.WithCancel(t.Context())
-
-	var wg sync.WaitGroup
-
-	wg.Add(1)
+	done := make(chan struct{})
 
 	go func() {
-		defer wg.Done()
+		defer close(done)
 
 		err := nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
 			VCPU: testNodeVCPU, Memory: testNodeMemory, Provider: config.ProviderDocker,
@@ -212,10 +219,10 @@ func runRecordLoop(t *testing.T, c *nodeclient.Client, compute nodeclient.Comput
 
 	t.Cleanup(func() {
 		cancel()
-		wg.Wait()
+		<-done
 	})
 
-	return cancel
+	return cancel, done
 }
 
 // readRecord decodes the record at path into a map, refusing a duplicate key
@@ -696,11 +703,12 @@ func TestNoPathWritesNothingAndTheNodeRemovesNothing(t *testing.T) {
 	}))
 
 	c := h.client(t)
-	cancel := runRecordLoop(t, c, &fakeCompute{}, "", nil)
+	cancel, done := runRecordLoopWithDone(t, c, &fakeCompute{}, "", nil)
 
 	waitFor(t, func() bool { return h.count("/v1/register") >= 1 })
 	time.Sleep(50 * time.Millisecond)
 	cancel()
+	<-done
 
 	if installs.Load() != 0 {
 		t.Errorf("the installer was called %d times with no path", installs.Load())
@@ -709,16 +717,13 @@ func TestNoPathWritesNothingAndTheNodeRemovesNothing(t *testing.T) {
 	h2 := newRecordHarness(t)
 	_, path := recordDir(t)
 	c2 := h2.client(t)
-	cancel2 := runRecordLoop(t, c2, &fakeCompute{}, path, nil)
+	cancel2, done2 := runRecordLoopWithDone(t, c2, &fakeCompute{}, path, nil)
 
 	rec := awaitRecord(t, path, "")
 	cancel2()
-
-	waitFor(t, func() bool {
-		_, err := os.Lstat(path)
-
-		return err == nil
-	})
+	// AFTER RUN HAS RETURNED, so a removal on the way out cannot hide behind
+	// an assertion made while the loop was still shutting down.
+	<-done2
 
 	after := readRecord(t, path)
 	if after["registered_at"] != rec["registered_at"] {

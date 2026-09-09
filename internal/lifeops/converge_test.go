@@ -639,6 +639,34 @@ func TestPlanReadsARuntimeDirectoryDirectiveAsAList(t *testing.T) {
 	}
 }
 
+// THE REPAIR TARGET IS THE CONFIGURED DIRECTORY, not the directive's text: a
+// server unit declaring two state directories admits the configured one as an
+// entry, and the plan repairs exactly that directory.
+func TestPlanRepairsTheConfiguredStateDirectoryUnderAListDirective(t *testing.T) {
+	h := newHost(t)
+	a := &answers{reply: map[string]string{
+		deploy.ServerUnitName: healthyServer(t, h, map[string]string{"StateDirectory": "billet/server billet/extra"}),
+		deploy.NodeUnitName:   healthyNode(t, h, nil),
+	}}
+	c, _ := h.converger(t, a)
+
+	req := upRequest()
+	req.ServerStateDir = "/var/lib/billet/server"
+
+	plan, err := c.Plan(t.Context(), req)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+
+	if joined := strings.Join(refusalText(plan.Refusals), "\n"); strings.Contains(joined, "state_dir is ") {
+		t.Fatalf("the configured directory was refused under a two-entry directive:\n%s", joined)
+	}
+
+	if plan.ServerState != "/var/lib/billet/server" {
+		t.Errorf("plan.ServerState = %q, want the configured directory", plan.ServerState)
+	}
+}
+
 // AND A UNIT THAT DECLARES NO DIRECTORY IS UNCERTAINTY, not permission.
 func TestPlanRefusesAUnitThatDeclaresNoStateDirectory(t *testing.T) {
 	h := newHost(t)

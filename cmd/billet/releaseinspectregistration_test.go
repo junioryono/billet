@@ -276,6 +276,28 @@ func TestReleaseInspectRegistrationIsCurrentOnlyForTheNodesInvocation(t *testing
 
 		mustUnknown(t, "host.registration", f.report(t).Host.Registration, "the node is not running")
 	})
+
+	t.Run("a draining node is running", func(t *testing.T) {
+		// systemd reports `deactivating` for the whole drain, during which the
+		// process serves what it holds and can re-register; its sample binds.
+		f := nodeTLSFixture(t, true)
+		f.writeRecord(t, f.record(nil))
+		f.nodeProperty(t, "ActiveState", "deactivating")
+		f.nodeProperty(t, "SubState", "stop-sigterm")
+
+		if rec := registrationOf(t, f.report(t)); rec.InvocationID != nodeInvocation {
+			t.Errorf("a draining node's registration reads %+v", rec)
+		}
+	})
+
+	t.Run("a failed unit with a stale main pid is not running", func(t *testing.T) {
+		f := nodeTLSFixture(t, true)
+		f.writeRecord(t, f.record(nil))
+		f.nodeProperty(t, "ActiveState", "failed")
+		f.nodeProperty(t, "SubState", "failed")
+
+		mustUnknown(t, "host.registration", f.report(t).Host.Registration, "the node is not running")
+	})
 }
 
 // I2, THE SAMPLE BINDS EVERYTHING: the record is read between the identity
@@ -488,15 +510,17 @@ func TestReleaseInspectRegistrationValidity(t *testing.T) {
 		body string
 		want string
 	}{
-		"not JSON":        {"not json\n", "malformed"},
-		"schema 2":        {string(mustJSON(t, f.record(map[string]any{"schema": 2}))), "schema is 2"},
-		"an unknown key":  {string(mustJSON(t, f.record(map[string]any{"extra": "x"}))), `"extra" is not one the node writes`},
-		"a missing key":   {string(mustJSON(t, f.record(map[string]any{"endpoint": nil}))), `"endpoint" is missing`},
-		"a null value":    {strings.Replace(string(valid), `"node":"node-a"`, `"node":null`, 1), `"node" is null`},
-		"an empty value":  {string(mustJSON(t, f.record(map[string]any{"deployment": ""}))), `"deployment" is empty`},
-		"a duplicate key": {strings.Replace(string(valid), `"node":"node-a"`, `"node":"node-a","node":"node-a"`, 1), `"node" appears twice`},
-		"trailing bytes":  {string(valid) + "{}", "bytes follow the object"},
-		"a case variant":  {strings.Replace(string(valid), `"schema":1`, `"Schema":1`, 1), `"schema" is missing`},
+		"not JSON":                   {"not json\n", "malformed"},
+		"schema 2":                   {string(mustJSON(t, f.record(map[string]any{"schema": 2}))), "schema is 2"},
+		"schema as the string \"1\"": {strings.Replace(string(valid), `"schema":1`, `"schema":"1"`, 1), `schema is "1"`},
+		"schema 1.0":                 {strings.Replace(string(valid), `"schema":1`, `"schema":1.0`, 1), "schema is 1.0"},
+		"an unknown key":             {string(mustJSON(t, f.record(map[string]any{"extra": "x"}))), `"extra" is not one the node writes`},
+		"a missing key":              {string(mustJSON(t, f.record(map[string]any{"endpoint": nil}))), `"endpoint" is missing`},
+		"a null value":               {strings.Replace(string(valid), `"node":"node-a"`, `"node":null`, 1), `"node" is null`},
+		"an empty value":             {string(mustJSON(t, f.record(map[string]any{"deployment": ""}))), `"deployment" is empty`},
+		"a duplicate key":            {strings.Replace(string(valid), `"node":"node-a"`, `"node":"node-a","node":"node-a"`, 1), `"node" appears twice`},
+		"trailing bytes":             {string(valid) + "{}", "bytes follow the object"},
+		"a case variant":             {strings.Replace(string(valid), `"schema":1`, `"Schema":1`, 1), `"schema" is missing`},
 		"a canonical member beside its case variant": {strings.Replace(string(valid), `"schema":1`, `"schema":1,"Schema":1`, 1), `"Schema" is not one the node writes`},
 		"a time that is not RFC 3339":                {string(mustJSON(t, f.record(map[string]any{"registered_at": "yesterday"}))), "not RFC 3339"},
 		"an incarnation of 31 hex":                   {string(mustJSON(t, f.record(map[string]any{"incarnation": testIncarnation[:31]}))), "incarnation is not 32 hex"},
@@ -575,6 +599,22 @@ func TestReleaseInspectRegistrationValidity(t *testing.T) {
 
 	t.Run("5 KiB", func(t *testing.T) {
 		f.writeRecordRaw(t, string(valid)+strings.Repeat(" ", 5*1024))
+		mustUnknown(t, "host.registration", f.report(t).Host.Registration, "larger than 4096 bytes")
+	})
+
+	t.Run("5 KiB at admission, truncated to a valid record before the read", func(t *testing.T) {
+		// THE ADMITTED DESCRIPTOR'S SIZE IS THE JUDGEMENT: the bounded read
+		// alone would accept the bytes that are there by the time it runs.
+		f.writeRecordRaw(t, string(valid)+strings.Repeat(" ", 5*1024))
+
+		saved := registrationRead
+		registrationRead = func(file *os.File, path string, limit int64) ([]byte, error) {
+			mustOK(t, os.WriteFile(path, valid, 0o600))
+
+			return regularfile.ReadAllLimited(file, path, limit)
+		}
+		t.Cleanup(func() { registrationRead = saved })
+
 		mustUnknown(t, "host.registration", f.report(t).Host.Registration, "larger than 4096 bytes")
 	})
 

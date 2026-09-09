@@ -82,6 +82,26 @@ func TestTheDefaultSyncSeamsCallSync(t *testing.T) {
 	if !dirDefault {
 		t.Error("syncDirectory does not call Sync on the directory it opened")
 	}
+
+	// AND THE ZERO-VALUE INSTALLER DISPATCHES TO THEM: a Sync on a closed file
+	// and a flush of a directory that does not exist each answer an error,
+	// where a no-op default would answer nil.
+	closed, err := os.CreateTemp(t.TempDir(), "closed")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := closed.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := (Installer{}).syncFile()(closed); !errors.Is(err, os.ErrClosed) {
+		t.Errorf("the default file-sync seam on a closed file answered %v, want the Sync error", err)
+	}
+
+	if err := (Installer{}).syncDir()(t.TempDir() + "/absent"); err == nil {
+		t.Error("the default directory-sync seam on an absent directory answered nil")
+	}
 }
 
 // D3: THE COMPLETE SEQUENCE, THE CLOSE INCLUDED: create, write, mode, sync,

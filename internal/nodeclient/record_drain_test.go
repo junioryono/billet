@@ -131,10 +131,12 @@ func TestADrainsReRegistrationPublishesAndSupersessionDoesNot(t *testing.T) {
 			pollGate := h.hold(pollPath)
 			regGate := h.hold("/v1/register")
 
+			// EVERY BASELINE PRECEDES THE ACTION THAT MOVES IT: the drain's first
+			// poll can arrive before a count taken after the stop.
+			polls := h.count(pollPath)
 			cancel()
 
 			// The drain's first poll waits at the gate.
-			polls := h.count(pollPath)
 			waitFor(t, func() bool { return h.count(pollPath) > polls })
 
 			baseline := installs.Load()
@@ -146,9 +148,8 @@ func TestADrainsReRegistrationPublishesAndSupersessionDoesNot(t *testing.T) {
 			h.answerPollsUnregistered(t, 1)
 			clock.Store(now().Add(time.Minute).UnixNano())
 			polls = h.count(pollPath)
-			pollGate <- struct{}{}
-
 			regs := h.count("/v1/register")
+			pollGate <- struct{}{}
 			waitFor(t, func() bool { return h.count("/v1/register") > regs })
 			regGate <- struct{}{}
 
@@ -176,9 +177,8 @@ func TestADrainsReRegistrationPublishesAndSupersessionDoesNot(t *testing.T) {
 			})
 			h.answerPollsUnregistered(t, 1)
 			polls = h.count(pollPath)
-			pollGate <- struct{}{}
-
 			regs = h.count("/v1/register")
+			pollGate <- struct{}{}
 			waitFor(t, func() bool { return h.count("/v1/register") > regs })
 			regGate <- struct{}{}
 
@@ -205,9 +205,8 @@ func TestADrainsReRegistrationPublishesAndSupersessionDoesNot(t *testing.T) {
 					return true
 				})
 				h.answerPollsUnregistered(t, 1)
-				pollGate <- struct{}{}
-
 				regs = h.count("/v1/register")
+				pollGate <- struct{}{}
 				waitFor(t, func() bool { return h.count("/v1/register") > regs })
 				regGate <- struct{}{}
 			case "a poll":

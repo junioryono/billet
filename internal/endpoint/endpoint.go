@@ -93,10 +93,6 @@ type Endpoint struct {
 	Port   uint16
 }
 
-// resolveForTest is a seam a test installs to prove no name is resolved: the
-// package never calls it, and a test that sees it called has found a resolver.
-var resolveForTest func(name string)
-
 // Parse reads a spelling under the node's TLS state: a bare `host:port`, a
 // bare host (the scheme's default port), or a URL whose scheme must agree with
 // the TLS state.
