@@ -246,6 +246,7 @@
     state: started
     daemon_reload: "{{ billet_ledger_mount_installed is changed }}"
   become: true
+  notify: billet unit files changed
 
 - name: Prove the state directory is served by the expected volume
   ansible.builtin.command:

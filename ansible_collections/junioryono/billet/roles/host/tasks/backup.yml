@@ -103,6 +103,7 @@
   when:
     - billet_server_should_run
     - not ansible_check_mode
+  notify: billet unit files changed
 
 - name: Inspect the deployment backup timer on a host whose server may not run
   ansible.builtin.stat:
@@ -121,6 +122,7 @@
     - not billet_server_should_run
     - billet_backup_timer_unit.stat.exists
     - not ansible_check_mode
+  notify: billet unit files changed
 
 - name: Remove the deployment backup units from a host whose server may not run
   ansible.builtin.file:

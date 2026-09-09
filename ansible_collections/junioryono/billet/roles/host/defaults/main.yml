@@ -277,3 +277,24 @@ billet_smtp_password: "{{ lookup('env', 'SES_SMTP_PASSWORD') }}"
 # outcome is a deploy job that destroys itself when the node it runs on drains.
 # Set it only when the runner is provably not backed by the host being converged.
 billet_allow_converge_from_billet_runner: false
+
+# The unit lookup paths a dry run knows how to scan for drop-ins and aliases.
+# The running manager's own list (Manager.UnitPath) is what is scanned; a path
+# in it that is not listed here refuses the dry run, because the gate cannot
+# promise to have looked where it does not know. Extend it deliberately, after
+# auditing what the manager finds there. systemd 255's list, in its order,
+# plus the pre-merged-usr /lib/systemd/system.
+billet_service_policy_unit_path_allowlist:
+  - /etc/systemd/system.control
+  - /run/systemd/system.control
+  - /run/systemd/transient
+  - /etc/systemd/system.attached
+  - /run/systemd/system.attached
+  - /etc/systemd/system
+  - /run/systemd/generator.early
+  - /run/systemd/system
+  - /run/systemd/generator
+  - /usr/local/lib/systemd/system
+  - /usr/lib/systemd/system
+  - /lib/systemd/system
+  - /run/systemd/generator.late

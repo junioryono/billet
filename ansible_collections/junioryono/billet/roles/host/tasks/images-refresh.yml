@@ -33,6 +33,7 @@
   when:
     - billet_firecracker_enabled and billet_ceph_enabled
     - not ansible_check_mode
+  notify: billet unit files changed
 
 - name: Inspect the guest image refresh timer on a host that boots no guests
   ansible.builtin.stat:
@@ -50,6 +51,7 @@
     - not (billet_firecracker_enabled and billet_ceph_enabled)
     - billet_images_refresh_timer_unit.stat.exists
     - not ansible_check_mode
+  notify: billet unit files changed
 
 - name: Remove the guest image refresh units from a host that boots no guests
   ansible.builtin.file:

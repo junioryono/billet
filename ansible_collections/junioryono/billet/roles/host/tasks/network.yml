@@ -149,6 +149,7 @@
     - not ansible_check_mode
     - item.stdout | trim != 'not-found'
   become: true
+  notify: billet unit files changed
 
 - name: Remove retired dnsmasq definitions
   ansible.builtin.file:
@@ -279,6 +280,7 @@
     state: started
   when: not ansible_check_mode
   become: true
+  notify: billet unit files changed
 
 - name: Enable DHCP and DNS on billet guest bridges
   ansible.builtin.systemd_service:
@@ -288,3 +290,4 @@
   loop: "{{ billet_networks }}"
   when: not ansible_check_mode
   become: true
+  notify: billet unit files changed

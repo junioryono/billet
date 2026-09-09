@@ -7,6 +7,8 @@
     billet_host_main_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/main.yml') | from_yaml }}"
     billet_host_service_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/services.yml') | from_yaml }}"
     billet_host_account_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/account.yml') | from_yaml }}"
+    billet_host_dryrun_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/dryrun-policy.yml') | from_yaml }}"
+    billet_host_handlers: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/handlers/main.yml') | from_yaml }}"
     billet_host_inspection_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/upgrade-inspect.yml') | from_yaml }}"
     billet_host_recovery_dispatch_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/upgrade-recover.yml') | from_yaml }}"
     billet_host_recovery_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/upgrade-rollback.yml') | from_yaml }}"
@@ -15,6 +17,8 @@
     billet_host_backup_text: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/backup.yml') }}"
     billet_server_unit: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/templates/billet-server.service.j2') }}"
     billet_node_unit: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/templates/billet-node.service.j2') }}"
+    billet_host_defaults: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/defaults/main.yml') | from_yaml }}"
+    billet_service_policy_unit_path_allowlist: "{{ billet_host_defaults.billet_service_policy_unit_path_allowlist }}"
   tasks:
     - name: Locate the upgrade transaction and recovery path
       ansible.builtin.set_fact:
@@ -23,6 +27,8 @@
         billet_account_names: "{{ billet_host_account_tasks | map(attribute='name') | list }}"
         billet_inspection_names: "{{ billet_host_inspection_tasks | map(attribute='name') | list }}"
         billet_main_names: "{{ billet_host_main_tasks | map(attribute='name') | list }}"
+        billet_dryrun_names: "{{ billet_host_dryrun_tasks | map(attribute='name') | list }}"
+        billet_handler_names: "{{ billet_host_handlers | map(attribute='name') | list }}"
         billet_recovery_dispatch_names: "{{ billet_host_recovery_dispatch_tasks | map(attribute='name') | list }}"
         billet_recovery_names: "{{ billet_host_recovery_tasks | map(attribute='name') | list }}"
         billet_finalization_names: "{{ billet_host_finalization_tasks | map(attribute='name') | list }}"
@@ -38,8 +44,20 @@
         billet_candidate_unit_stage: "{{ billet_host_account_tasks | selectattr('name', 'equalto', 'Stage candidate systemd units for the upgrade transaction') | first }}"
         billet_ordinary_unit_install: "{{ billet_host_account_tasks | selectattr('name', 'equalto', 'Install the billet systemd units') | first }}"
         billet_service_policy_reload: "{{ billet_host_account_tasks | selectattr('name', 'equalto', 'Reload systemd before inspecting installed service policy') | first }}"
-        billet_service_policy_pending_probe: "{{ billet_host_account_tasks | selectattr('name', 'equalto', 'Inspect pending Billet service policy during a dry run') | first }}"
-        billet_service_policy_pending_guard: "{{ billet_host_account_tasks | selectattr('name', 'equalto', 'Refuse a dry run against stale Billet service policy') | first }}"
+        billet_service_policy_pending_probe: "{{ billet_host_dryrun_tasks | selectattr('name', 'equalto', 'Inspect pending Billet service policy during a dry run') | first }}"
+        billet_service_policy_pending_guard: "{{ billet_host_dryrun_tasks | selectattr('name', 'equalto', 'Refuse a dry run against stale Billet service policy') | first }}"
+        billet_service_policy_loaded_probe: "{{ billet_host_dryrun_tasks | selectattr('name', 'equalto', 'Inspect the loaded identity of Billet units during a dry run') | first }}"
+        billet_service_policy_exec_probe: "{{ billet_host_dryrun_tasks | selectattr('name', 'equalto', 'Inspect the loaded ExecStart of Billet units during a dry run') | first }}"
+        billet_service_policy_fragment_read: "{{ billet_host_dryrun_tasks | selectattr('name', 'equalto', 'Read the on-disk fragment of Billet units during a dry run') | first }}"
+        billet_service_policy_unit_path_probe: "{{ billet_host_dryrun_tasks | selectattr('name', 'equalto', \"Read the running manager's unit lookup paths during a dry run\") | first }}"
+        billet_service_policy_unit_path_guard: "{{ billet_host_dryrun_tasks | selectattr('name', 'equalto', 'Refuse a unit lookup path this dry run does not know') | first }}"
+        billet_service_policy_alias_probe: "{{ billet_host_dryrun_tasks | selectattr('name', 'equalto', 'Resolve on-disk aliases of the Billet units the way the manager would') | first }}"
+        billet_service_policy_alias_guard: "{{ billet_host_dryrun_tasks | selectattr('name', 'equalto', 'Refuse an on-disk alias of a Billet unit during a dry run') | first }}"
+        billet_service_policy_dropin_find: "{{ billet_host_dryrun_tasks | selectattr('name', 'equalto', 'Look for drop-ins on disk in every location the manager searches') | first }}"
+        billet_service_policy_compare: "{{ billet_host_dryrun_tasks | selectattr('name', 'equalto', 'Compare the on-disk Billet unit policy with what the manager loaded') | first }}"
+        billet_service_policy_reload_after_probe: "{{ billet_host_handlers | selectattr('name', 'equalto', 'Inspect whether the manager reports a pending reload after unit-file changes') | first }}"
+        billet_service_policy_final_reload: "{{ billet_host_handlers | selectattr('name', 'equalto', \"Reload systemd after the role's own unit-file changes\") | first }}"
+        billet_service_policy_final_flush: "{{ billet_host_main_tasks | selectattr('name', 'equalto', \"Apply the reload the role's own unit-file changes left pending\") | first }}"
         billet_steady_unit_install: "{{ billet_upgrade_task.block | selectattr('name', 'equalto', 'Install steady-state units without the quiescent probe') | first }}"
         billet_recovery_stop_proof: "{{ billet_host_recovery_tasks | selectattr('name', 'equalto', 'Refuse recovery without conclusive process and cgroup evidence') | first }}"
         billet_recovery_cgroup_probe: "{{ billet_host_recovery_tasks | selectattr('name', 'equalto', 'Inspect service cgroups before recovering upgrade inputs') | first }}"
@@ -155,8 +173,61 @@
           - billet_service_policy_pending_probe.changed_when == false
           - billet_service_policy_pending_probe.check_mode == false
           - "'ansible_check_mode' in (billet_service_policy_pending_probe.when | string)"
-          - "\"item.stdout | trim == 'no'\" in billet_service_policy_pending_guard['ansible.builtin.assert'].that"
+          - "'item.ok | bool' in billet_service_policy_pending_guard['ansible.builtin.assert'].that"
           - "'ansible_check_mode' in (billet_service_policy_pending_guard.when | string)"
+          - "'disagrees with what the manager loaded' in billet_service_policy_pending_guard['ansible.builtin.assert'].fail_msg"
+          - billet_account_names[0] == "Compare a dry run's view of Billet service policy with what the manager loaded"
+          - billet_host_account_tasks[0]['ansible.builtin.import_tasks'] == 'dryrun-policy.yml'
+          - billet_dryrun_names.index('Inspect pending Billet service policy during a dry run') < billet_dryrun_names.index('Inspect the loaded identity of Billet units during a dry run')
+          - billet_dryrun_names.index('Inspect the loaded identity of Billet units during a dry run') < billet_dryrun_names.index('Read the on-disk fragment of Billet units during a dry run')
+          - billet_dryrun_names.index('Read the running manager\'s unit lookup paths during a dry run') < billet_dryrun_names.index('Refuse a unit lookup path this dry run does not know')
+          - billet_dryrun_names.index('Refuse a unit lookup path this dry run does not know') < billet_dryrun_names.index('Resolve on-disk aliases of the Billet units the way the manager would')
+          - billet_dryrun_names.index('Resolve on-disk aliases of the Billet units the way the manager would') < billet_dryrun_names.index('Refuse an on-disk alias of a Billet unit during a dry run')
+          - billet_dryrun_names.index('Refuse an on-disk alias of a Billet unit during a dry run') < billet_dryrun_names.index('Look for drop-ins on disk in every location the manager searches')
+          - billet_dryrun_names.index('Look for drop-ins on disk in every location the manager searches') < billet_dryrun_names.index('Compare the on-disk Billet unit policy with what the manager loaded')
+          - billet_dryrun_names.index('Compare the on-disk Billet unit policy with what the manager loaded') < billet_dryrun_names.index('Refuse a dry run against stale Billet service policy')
+          - billet_dryrun_names.index('Refuse a dry run against stale Billet service policy') < billet_dryrun_names.index('Report a pending daemon-reload the dry run could compare across')
+          - "'--property=FragmentPath' in billet_service_policy_loaded_probe['ansible.builtin.command'].argv"
+          - "'--property=DropInPaths' in billet_service_policy_loaded_probe['ansible.builtin.command'].argv"
+          - "'--property=Names' in billet_service_policy_loaded_probe['ansible.builtin.command'].argv"
+          - "'--property=User' in billet_service_policy_loaded_probe['ansible.builtin.command'].argv"
+          - "'--property=Group' in billet_service_policy_loaded_probe['ansible.builtin.command'].argv"
+          - "'--property=Type' in billet_service_policy_loaded_probe['ansible.builtin.command'].argv"
+          - billet_service_policy_loaded_probe.check_mode == false
+          - "'busctl' in billet_service_policy_exec_probe['ansible.builtin.command'].argv"
+          - "'ExecStart' in billet_service_policy_exec_probe['ansible.builtin.command'].argv"
+          - billet_service_policy_exec_probe.check_mode == false
+          - "'FragmentPath' in billet_service_policy_fragment_read['ansible.builtin.slurp'].src"
+          - "'UnitPath' in billet_service_policy_unit_path_probe['ansible.builtin.command'].argv"
+          - "'billet_service_policy_unit_path_allowlist' in (billet_service_policy_unit_path_guard['ansible.builtin.assert'].that | string)"
+          - "'/run/systemd/generator.early' in billet_service_policy_unit_path_allowlist"
+          - "'/run/systemd/system.control' in billet_service_policy_unit_path_allowlist"
+          - "'/run/systemd/transient' in billet_service_policy_unit_path_allowlist"
+          - "'/etc/systemd/system.attached' in billet_service_policy_unit_path_allowlist"
+          - "'/run/systemd/generator.late' in billet_service_policy_unit_path_allowlist"
+          - "'junioryono.billet.unit_names' in billet_service_policy_alias_probe"
+          - "'billet_service_policy_manager_unit_paths' in billet_service_policy_alias_probe['junioryono.billet.unit_names'].unit_path"
+          - "'billet_service_policy_aliases.aliases | length == 0' in billet_service_policy_alias_guard['ansible.builtin.assert'].that"
+          - "'billet-.service.d' in (billet_service_policy_dropin_find['ansible.builtin.find'].paths | string)"
+          - "'service.d' in (billet_service_policy_dropin_find['ansible.builtin.find'].paths | string)"
+          - "'dropin_dirs' in (billet_service_policy_dropin_find['ansible.builtin.find'].paths | string)"
+          - "'billet_service_policy_manager_unit_paths' in (billet_service_policy_dropin_find['ansible.builtin.find'].paths | string)"
+          - billet_service_policy_dropin_find.check_mode == false
+          - "'Type=' in (billet_service_policy_compare['ansible.builtin.set_fact'].billet_service_policy_comparison | string)"
+          - "'drop-ins are loaded' in (billet_service_policy_compare['ansible.builtin.set_fact'].billet_service_policy_comparison | string)"
+          - "'drop-ins are on disk' in (billet_service_policy_compare['ansible.builtin.set_fact'].billet_service_policy_comparison | string)"
+          - "'other names' in (billet_service_policy_compare['ansible.builtin.set_fact'].billet_service_policy_comparison | string)"
+          - "\"split(' ')\" in (billet_service_policy_compare['ansible.builtin.set_fact'].billet_service_policy_comparison | string)"
+          - "'loaded_path' in (billet_service_policy_compare['ansible.builtin.set_fact'].billet_service_policy_comparison | string)"
+          - billet_main_names[-1] == "Apply the reload the role's own unit-file changes left pending"
+          - billet_service_policy_final_flush['ansible.builtin.meta'] == 'flush_handlers'
+          - "'--property=NeedDaemonReload' in billet_service_policy_reload_after_probe['ansible.builtin.command'].argv"
+          - billet_service_policy_reload_after_probe.changed_when == false
+          - billet_service_policy_reload_after_probe.listen == 'billet unit files changed'
+          - billet_service_policy_final_reload['ansible.builtin.systemd_service'].daemon_reload | bool
+          - billet_service_policy_final_reload.listen == 'billet unit files changed'
+          - "\"== 'yes'\" in (billet_service_policy_final_reload.when | string)"
+          - billet_handler_names.index('Inspect whether the manager reports a pending reload after unit-file changes') < billet_handler_names.index('Reload systemd after the role\'s own unit-file changes')
           - billet_account_names.index('Refuse an implicit installed service identity migration') < billet_account_names.index('Create the billet service group')
           - billet_account_names.index('Refuse an implicit installed service identity migration') < billet_account_names.index('Create billet directories')
           - billet_account_names.index('Refuse to move installed billet state implicitly') < billet_account_names.index('Render billet configuration')

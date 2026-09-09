@@ -5,6 +5,41 @@
   when: not (_billet_alert_skip_service_control | default(false))
   become: "{{ _billet_alert_become | default(true) }}"
 
+# EVERY ENABLE, DISABLE OR MASK THAT CHANGED SOMETHING sets systemd's
+# manager-wide pending-reload flag, which every unit then reports until a
+# daemon-reload clears it. The role reloaded when it started; a flag at its end
+# arose in this run, from its own operations, so the converge ends with the
+# reload they left pending. It adopts whatever else is pending on the host too
+# (a concurrent snap or package operation is not excluded), and says so rather
+# than claiming the flag was its own. Two handlers on one listen name, because a
+# handler cannot hold a block: the probe, then the reload it justifies.
+- name: Inspect whether the manager reports a pending reload after unit-file changes
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - show
+      - --property=NeedDaemonReload
+      - --value
+      - billet-server.service
+  register: billet_service_policy_reload_after
+  changed_when: false
+  failed_when: billet_service_policy_reload_after.rc != 0
+  when:
+    - not ansible_check_mode
+    - not (_billet_alert_skip_service_control | default(false))
+  become: "{{ _billet_alert_become | default(true) }}"
+  listen: billet unit files changed
+
+- name: Reload systemd after the role's own unit-file changes
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  when:
+    - not ansible_check_mode
+    - not (_billet_alert_skip_service_control | default(false))
+    - billet_service_policy_reload_after.stdout | default('') | trim == 'yes'
+  become: "{{ _billet_alert_become | default(true) }}"
+  listen: billet unit files changed
+
 - name: Reload billet guest networking
   ansible.builtin.command: networkctl reload
   changed_when: true

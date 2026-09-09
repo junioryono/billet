@@ -182,6 +182,7 @@
         - not ansible_check_mode
         - not (_billet_alert_skip_service_control | default(false))
       become: "{{ _billet_alert_become | default(true) }}"
+      notify: billet unit files changed
 
 - name: Remove disabled Ceph email health alerts
   when: not billet_ceph_enabled or billet_alert_email | length == 0
@@ -196,6 +197,7 @@
         - not ansible_check_mode
         - not (_billet_alert_skip_service_control | default(false))
       become: "{{ _billet_alert_become | default(true) }}"
+      notify: billet unit files changed
 
     - name: Remove the Ceph health monitor and units
       ansible.builtin.file:

@@ -564,6 +564,7 @@
           enabled: "{{ billet_node_should_run }}"
       loop_control:
         label: "{{ item.name }}"
+      notify: billet unit files changed
 
     - name: Durably flush every mutated host filesystem before commit
       ansible.builtin.command:
@@ -721,6 +722,7 @@
     - billet_server_should_run
     - not ansible_check_mode
   become: true
+  notify: billet unit files changed
 
 - name: Enable and start the billet node
   ansible.builtin.systemd_service:
@@ -731,6 +733,7 @@
     - billet_node_should_run
     - not ansible_check_mode
   become: true
+  notify: billet unit files changed
 
 # Covers BOTH "this host is no longer the control plane" and "it is, but is not
 # commissioned yet". Disabling is what keeps a prepared host from starting the
@@ -745,6 +748,7 @@
     - not billet_server_should_run
     - not ansible_check_mode
   become: true
+  notify: billet unit files changed
 
 - name: Stop and disable the billet node unless it may run here
   ansible.builtin.systemd_service:
@@ -755,6 +759,7 @@
     - not billet_node_should_run
     - not ansible_check_mode
   become: true
+  notify: billet unit files changed
 
 # THE SCHEDULED UPDATER, INSTALLED ON EVERY HOST WITH A CONTROL PLANE AND
 # ENABLED WHEN THE DEPLOYMENT UPDATES ITSELF. The upgrade timer acts on the
@@ -806,3 +811,4 @@
     - item.wanted | bool
     - not ansible_check_mode
   become: true
+  notify: billet unit files changed

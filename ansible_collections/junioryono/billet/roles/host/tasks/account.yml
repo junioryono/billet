@@ -1,31 +1,9 @@
 ---
-- name: Inspect pending Billet service policy during a dry run
-  ansible.builtin.command:
-    argv:
-      - systemctl
-      - show
-      - --property=NeedDaemonReload
-      - --value
-      - "{{ item }}"
-  loop:
-    - billet-server.service
-    - billet-node.service
-  register: billet_service_policy_reload_pending
-  changed_when: false
-  failed_when: billet_service_policy_reload_pending.rc != 0
-  check_mode: false
-  when: ansible_check_mode
-  become: true
-
-- name: Refuse a dry run against stale Billet service policy
-  ansible.builtin.assert:
-    that:
-      - item.stdout | trim == 'no'
-    fail_msg: "{{ item.item }} has pending on-disk systemd policy. A dry run will not daemon-reload the live manager; run systemctl daemon-reload after auditing the pending unit changes, then retry --check."
-  loop: "{{ billet_service_policy_reload_pending.results }}"
-  loop_control:
-    label: "{{ item.item }}"
-  when: ansible_check_mode
+# A dry run cannot reload the live manager, and on systemd 255 the pending-reload
+# flag it would otherwise refuse on is set by any enable on the host; the gate
+# in dryrun-policy.yml compares the loaded facts with the fragment instead.
+- name: Compare a dry run's view of Billet service policy with what the manager loaded
+  ansible.builtin.import_tasks: dryrun-policy.yml
 
 - name: Reload systemd before inspecting installed service policy
   ansible.builtin.systemd_service:
