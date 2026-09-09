@@ -328,20 +328,65 @@ func channelOrPin(channel, pin string) string {
 }
 
 // cmdRolloutStatus reports where one fleet decision has got to.
+//
+// THROUGH THE INSPECTION OPEN, NEVER THE OPERATOR ONE, and as the ledger's
+// owner when run as root: a status read is what a converge's check job runs
+// on every controller, and one that migrated, locked, minted or left a
+// root-owned file behind would hand the converge a host the check changed.
 func cmdRolloutStatus(ctx context.Context, args []string) error {
 	fs := newFlagSet("billet rollout status")
 	cfgPath := addConfigFlag(fs)
+	asJSON := fs.Bool("json", false, "print the report as JSON: the rollout, its hosts with the "+
+		"reason their last dispatch was refused, every host's current registration, and the "+
+		"ledger's deployment binding")
+	environmentFile := fs.String("environment-file", "", "read the PostgreSQL connection string "+
+		"from this systemd environment file, the one the unit names, instead of the process "+
+		"environment")
 
 	if err := parse(fs, args); err != nil {
 		return err
 	}
 
-	store, _, closeDB, err := rolloutStore(ctx, *cfgPath)
+	cfg, err := config.Load(*cfgPath)
 	if err != nil {
 		return err
 	}
 
-	defer closeDB()
+	if cfg.Server == nil {
+		return errors.New("a rollout is a property of the control plane, " +
+			"and this config has no server section")
+	}
+
+	// A REFUSAL TO DECIDE IS A REFUSAL: an owner that could not be read is not
+	// "run in place", or root would run the report over a directory it could
+	// not judge and leave its sidecars there.
+	done, err := runAsLedgerOwner(ctx, cfg, append([]string{"rollout", "status"}, args...))
+	if err != nil || done {
+		return err
+	}
+
+	dsn, err := ledgerDSNFrom(cfg, *environmentFile)
+	if err != nil {
+		return err
+	}
+
+	db, err := openStateInspect(ctx, cfg, dsn)
+	if err != nil {
+		return fmt.Errorf("server state: %w", err)
+	}
+
+	defer func() { _ = db.Close() }()
+
+	store := rollout.New(db)
+
+	if *asJSON {
+		report, err := buildRolloutStatusReport(ctx, db, store)
+		if err != nil {
+			return err
+		}
+
+		return printRolloutStatusJSON(report)
+	}
 
 	current, err := store.Open(ctx)
 	if err != nil {
@@ -461,12 +506,17 @@ func printRolloutNodes(nodes []rollout.Node) {
 	for i := range nodes {
 		n := &nodes[i]
 
+		// THE REFUSAL IS THE LAST RESORT: a blocker, an exemption and a rollback
+		// result each say more about where the host is than why its last
+		// dispatch was refused, and a host with any of them is past retrying.
 		detail := n.Blocker
 		switch {
 		case detail == "" && n.ExemptReason != "":
 			detail = n.ExemptReason
 		case detail == "" && n.RollbackResult != "":
 			detail = n.RollbackResult
+		case detail == "" && n.LastRefusal != "":
+			detail = "last dispatch refused: " + n.LastRefusal
 		}
 
 		next := n.NextAttemptAt

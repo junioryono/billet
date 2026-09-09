@@ -107,8 +107,8 @@ func TestEveryLedgerOpenNamesTheRunningRelease(t *testing.T) {
 
 	// THE COUNT IS ASSERTED, or a refactor that moved every open out of this
 	// file would leave a test that inspects nothing and passes.
-	if opens < 6 {
-		t.Fatalf("found %d state.Open* calls in ledger.go, want the six open helpers; if they "+
+	if opens < 8 {
+		t.Fatalf("found %d state.Open* calls in ledger.go, want the eight open helpers; if they "+
 			"moved, move this test with them", opens)
 	}
 }

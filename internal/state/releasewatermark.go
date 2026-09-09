@@ -47,22 +47,22 @@ func WithRunningRelease(release string) OpenOption {
 // what an unmigrated ledger means.
 const releaseWatermarkMigration = 48
 
-// enforceReleaseWatermark refuses a proved downgrade and, for the one handle
-// entitled to, records a proved upgrade.
+// enforceReleaseWatermark refuses a proved downgrade and records nothing.
 //
-// THREE ANSWERS, AND ONLY TWO OF THEM ACT. The running release is provably older
-// than the mark: refused, whoever is asking. Provably newer: recorded, but only by
-// the control plane that holds the exclusion — an operator command run from a
-// newer binary records nothing, or a `billet check` from a laptop would fence the
-// running server out of its own next restart. Equal, or not comparable at all (a
-// development build, a snapshot, an unstamped binary against a release, or no
-// running release named): nothing, said at debug level, because "could not tell"
-// must not become "refuse" in either direction.
+// THREE ANSWERS, AND ONLY ONE OF THEM ACTS HERE. The running release is provably
+// older than the mark: refused, whoever is asking. Provably newer: recorded by
+// NOBODY AT OPEN; the control plane records it inside its claim's transaction
+// (raiseReleaseWatermarkIn), because an operator command or an inspection run
+// from a newer binary must record nothing, or a `billet check` from a laptop
+// would fence the running server out of its own next restart. Equal, or not
+// comparable at all (a development build, a snapshot, an unstamped binary
+// against a release, or no running release named): nothing, said at debug
+// level, because "could not tell" must not become "refuse" in either direction.
 //
 // AFTER THE SCHEMA IS SETTLED, never before: the table this reads arrived in a
 // migration, and the migrate or verify that precedes this is what makes reading
 // it a question with an answer.
-func (db *DB) enforceReleaseWatermark(ctx context.Context, running string, record bool) error {
+func (db *DB) enforceReleaseWatermark(ctx context.Context, running string) error {
 	if running == "" {
 		return nil
 	}
@@ -78,13 +78,6 @@ func (db *DB) enforceReleaseWatermark(ctx context.Context, running string, recor
 	}
 
 	if recorded == "" {
-		// ONLY A RELEASE TAG IS EVER RECORDED, on a fresh mark as much as on a
-		// raise: "(devel)" written here would make every later open "could not
-		// tell" for as long as the row lived.
-		if record && version.IsRelease(running) {
-			return db.writeReleaseWatermark(ctx, running)
-		}
-
 		return nil
 	}
 
@@ -96,14 +89,11 @@ func (db *DB) enforceReleaseWatermark(ctx context.Context, running string, recor
 		return nil
 	}
 
-	switch {
-	case order < 0:
+	if order < 0 {
 		return fmt.Errorf("%w: it was last served by %s (recorded %s) and this binary is %s. "+
 			"Install %s or newer, or restore the archive that matches this binary. To run %s "+
 			"here on purpose: `billet host-upgrade --version %s --allow-downgrade`",
 			ErrReleaseBehind, recorded, recordedAt, running, recorded, running, running)
-	case order > 0 && record:
-		return db.writeReleaseWatermark(ctx, running)
 	}
 
 	return nil
@@ -312,6 +302,8 @@ func (db *DB) SetReleaseWatermark(ctx context.Context, release string) error {
 
 // writeReleaseWatermark records one release as the one serving this ledger.
 func (db *DB) writeReleaseWatermark(ctx context.Context, release string) error {
+	noteOpenSideEffect("watermark")
+
 	err := db.Tx(ctx, func(tx *sql.Tx) error {
 		return WriteQueries(tx).SetReleaseWatermark(ctx, ledgerdb.SetReleaseWatermarkParams{
 			Release:    release,

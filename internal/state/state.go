@@ -116,6 +116,10 @@ type DB struct {
 	// is after the handle has been read from — see ClaimController.
 	revalidate atomic.Bool
 
+	// inspect marks a handle opened for a report, whose every write transaction
+	// is refused with ErrInspect. See OpenInspect.
+	inspect bool
+
 	// standby marks a control plane that is waiting to become the controller, and
 	// while it is set every write transaction is refused.
 	//
@@ -216,6 +220,12 @@ type openMode struct {
 	// not a NEVER-leader. A standby's only protection is that Tx refuses it.
 	standby bool
 
+	// inspect marks a handle opened for a REPORT, which may validate everything
+	// an open validates and mutate nothing: no directory created or tightened,
+	// no lock, no claim, no migration, no watermark write, and no Tx. See
+	// OpenInspect.
+	inspect bool
+
 	// release is the billet opening the ledger, for the release watermark, or
 	// empty for a caller that named none and gets neither the check nor the
 	// record. See WithRunningRelease.
@@ -231,7 +241,7 @@ type openMode struct {
 // service that then serves it, so a rollback that never reaches that service has
 // nothing to undo.
 func (m openMode) records() bool {
-	return !m.admin && !m.maintenanceProbe && !m.standby
+	return !m.admin && !m.maintenanceProbe && !m.standby && !m.inspect
 }
 
 // with applies the caller's options to a mode.
@@ -241,6 +251,19 @@ func (m openMode) with(opts []OpenOption) openMode {
 	}
 
 	return m
+}
+
+// onOpenSideEffect observes every mutation an open can make on the host or the
+// ledger, named by operation: "mkdir", "chmod", "lock", "integrity", "claim",
+// "migrate" and "watermark". Nil in production; a test sets it to prove an
+// inspection makes none of them, which no assertion on the state afterwards
+// can, since an implementation that mutated and restored would pass that.
+var onOpenSideEffect func(op string)
+
+func noteOpenSideEffect(op string) {
+	if onOpenSideEffect != nil {
+		onOpenSideEffect(op)
+	}
 }
 
 // openDir is the shared body of every entry point.
@@ -256,13 +279,23 @@ func openDir(
 		return nil, err
 	}
 
-	if err := os.MkdirAll(stateDir, 0o700); err != nil {
-		return nil, fmt.Errorf("create state dir %s: %w", stateDir, err)
-	}
-	// MkdirAll leaves an existing directory's mode alone, and this directory will
-	// hold the mTLS CA key. Tighten it rather than inheriting whatever was there.
-	if err := os.Chmod(stateDir, 0o700); err != nil {
-		return nil, fmt.Errorf("tighten state dir %s: %w", stateDir, err)
+	// AN INSPECTION CREATES AND TIGHTENS NOTHING: its caller has already proved
+	// the directory and the ledger exist (requireLedgerFile), and a report that
+	// repaired the directory's mode on its way past would be a report with a
+	// side effect on the host it describes.
+	if !mode.inspect {
+		noteOpenSideEffect("mkdir")
+
+		if err := os.MkdirAll(stateDir, 0o700); err != nil {
+			return nil, fmt.Errorf("create state dir %s: %w", stateDir, err)
+		}
+
+		noteOpenSideEffect("chmod")
+		// MkdirAll leaves an existing directory's mode alone, and this directory will
+		// hold the mTLS CA key. Tighten it rather than inheriting whatever was there.
+		if err := os.Chmod(stateDir, 0o700); err != nil {
+			return nil, fmt.Errorf("tighten state dir %s: %w", stateDir, err)
+		}
 	}
 
 	// ONLY THE TYPED ENTRY crosses the fence. This used to also honor
@@ -282,18 +315,31 @@ func openDir(
 
 	// A NIL LOCK MEANS "SOMEBODY ELSE IS THE CONTROL PLANE HERE", and it is
 	// reachable only for an admin caller. Everything downstream branches on this
-	// one value rather than re-deriving the situation.
-	lock, err := lockDir(stateDir)
+	// one value rather than re-deriving the situation. AN INSPECTION TAKES NO
+	// LOCK AT ALL: it is not a control plane and holds nothing open, so it is
+	// the unlocked, revalidating handle whether or not a control plane is here.
+	var lock *dirLock
 
-	switch {
-	case err == nil:
-	case admin && errors.Is(err, ErrLocked):
-		lock = nil
-	default:
-		return nil, err
+	if !mode.inspect {
+		noteOpenSideEffect("lock")
+
+		held, err := lockDir(stateDir)
+
+		switch {
+		case err == nil:
+			lock = held
+		case admin && errors.Is(err, ErrLocked):
+			lock = nil
+		default:
+			return nil, err
+		}
 	}
 
 	pools, err := be.dataSources()
+	if mode.inspect {
+		pools, err = be.inspectDataSources()
+	}
+
 	if err != nil {
 		return nil, errors.Join(err, lock.release())
 	}
@@ -321,8 +367,9 @@ func openDir(
 		r:                 r,
 		lock:              lock,
 		backend:           be,
-		admin:             admin,
+		admin:             admin || mode.inspect,
 		unlocked:          lock == nil,
+		inspect:           mode.inspect,
 		stateDir:          stateDir,
 		maintenanceBypass: maintenanceBypass,
 		runningRelease:    mode.release,
@@ -360,8 +407,11 @@ func openDir(
 	// `check` — under the shared thirty-second startup budget, so a large or
 	// loaded deployment could lose EVERY live administration command, including
 	// the emergency one. A control plane opens the ledger once and is about to
-	// make scheduling decisions against it; a command is neither.
-	if !admin {
+	// make scheduling decisions against it; a command is neither, and an
+	// inspection is not even that.
+	if !admin && !mode.inspect {
+		noteOpenSideEffect("integrity")
+
 		if err := db.backend.integrityCheck(startupCtx, db.w); err != nil {
 			return nil, errors.Join(err, db.Close())
 		}
@@ -408,7 +458,23 @@ func openDir(
 		// A STANDBY IS REFUSED AS A DOWNGRADE TOO, and records nothing. What it
 		// would be promoted into is a ledger a newer release has served; that it
 		// waits rather than serves changes nothing about which binary is older.
-		if err := db.enforceReleaseWatermark(startupCtx, mode.release, false); err != nil {
+		if err := db.enforceReleaseWatermark(startupCtx, mode.release); err != nil {
+			return nil, errors.Join(err, db.Close())
+		}
+
+		return db, nil
+	}
+
+	// AN INSPECTION VERIFIES AND NEVER MIGRATES, whatever it finds: no claim is
+	// taken, the schema must be exactly this binary's (a ledger behind it is
+	// ErrSchemaBehind naming the control plane's restart, never a migration the
+	// report performed), and the watermark is checked and never raised.
+	if mode.inspect {
+		if err := db.verifySchema(startupCtx); err != nil {
+			return nil, errors.Join(err, db.Close())
+		}
+
+		if err := db.enforceReleaseWatermark(startupCtx, mode.release); err != nil {
 			return nil, errors.Join(err, db.Close())
 		}
 
@@ -416,6 +482,8 @@ func openDir(
 	}
 
 	if lock != nil {
+		noteOpenSideEffect("claim")
+
 		if err := be.claimController(startupCtx, db); err != nil {
 			// AN OPERATOR COMMAND IS NOT A SECOND CONTROLLER, so a held exclusion
 			// puts it on the same footing as one that could not take the directory
@@ -434,12 +502,14 @@ func openDir(
 			return nil, errors.Join(err, db.Close())
 		}
 
-		if err := db.enforceReleaseWatermark(startupCtx, mode.release, false); err != nil {
+		if err := db.enforceReleaseWatermark(startupCtx, mode.release); err != nil {
 			return nil, errors.Join(err, db.Close())
 		}
 
 		return db, nil
 	}
+
+	noteOpenSideEffect("migrate")
 
 	if err := db.migrate(startupCtx); err != nil {
 		return nil, errors.Join(fmt.Errorf("migrate state db: %w", err), db.Close())
@@ -452,7 +522,7 @@ func openDir(
 	// its own. Recorded here, a newer binary pointed at another deployment's
 	// ledger would raise that ledger's mark on the way to being refused, and
 	// fence its real controller out of its own restart. See openMode.records.
-	if err := db.enforceReleaseWatermark(startupCtx, mode.release, false); err != nil {
+	if err := db.enforceReleaseWatermark(startupCtx, mode.release); err != nil {
 		return nil, errors.Join(err, db.Close())
 	}
 
@@ -501,7 +571,7 @@ func (db *DB) PingContext(ctx context.Context) error {
 		return fmt.Errorf("ping state db: %w", err)
 	}
 
-	return db.backend.verifyDurability(ctx, db.w)
+	return db.backend.verifyDurability(ctx, db.w, db.inspect)
 }
 
 // IntegrityCheck refuses to serve from a corrupt ledger.
@@ -560,6 +630,13 @@ func (db *DB) Tx(ctx context.Context, fn func(*sql.Tx) error) error {
 	// nothing takes the writer slot on the way to being told no.
 	if db.standby.Load() {
 		return ErrStandby
+	}
+
+	// A REPORT WRITES NOTHING, and the refusal is here for the reason the
+	// standby's is: this is the one choke point every write crosses, and the
+	// read-only connection underneath is the second line rather than the first.
+	if db.inspect {
+		return ErrInspect
 	}
 
 	tx, err := db.beginWrite(ctx)

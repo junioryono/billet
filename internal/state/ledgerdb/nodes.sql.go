@@ -197,6 +197,63 @@ func (q *Queries) ListCodeBuildRegistrationPaths(ctx context.Context, provider s
 	return items, nil
 }
 
+const listNodeRegistrations = `-- name: ListNodeRegistrations :many
+SELECT name, live, epoch, incarnation, node_release, node_digest, highest_release
+  FROM nodes
+ ORDER BY name
+`
+
+type ListNodeRegistrationsRow struct {
+	Name           string
+	Live           int64
+	Epoch          int64
+	Incarnation    string
+	NodeRelease    string
+	NodeDigest     string
+	HighestRelease string
+}
+
+// Every host's CURRENT registration: the process that made it and the fence it
+// holds, beside what it said it runs.
+//
+// FROM THE REGISTRATIONS, NEVER FROM A ROLLOUT'S ROWS. A rollout row records the
+// epoch a host was DISPATCHED against, which is the epoch before the upgrade it
+// was told to make; what a report of the fleet's registrations answers is which
+// incarnation each host presents now and how many times it has registered, for a
+// reader that proves a node's receipt names the process the controller knows.
+// Offline hosts included: a row outlives the connection, and a reader compares
+// the incarnation, not the liveness.
+func (q *Queries) ListNodeRegistrations(ctx context.Context) ([]ListNodeRegistrationsRow, error) {
+	rows, err := q.db.QueryContext(ctx, listNodeRegistrations)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListNodeRegistrationsRow
+	for rows.Next() {
+		var i ListNodeRegistrationsRow
+		if err := rows.Scan(
+			&i.Name,
+			&i.Live,
+			&i.Epoch,
+			&i.Incarnation,
+			&i.NodeRelease,
+			&i.NodeDigest,
+			&i.HighestRelease,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listNodeWireVersions = `-- name: ListNodeWireVersions :many
 SELECT name, live, node_release, wire_min, wire_max, wire_version, epoch,
        node_digest, highest_release
