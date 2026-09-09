@@ -268,6 +268,26 @@ def main():
         else:
             fail("a writable ancestor behind a link was admitted")
 
+    # THE FILESYSTEM ROOT ITSELF is judged, through a stat the check makes
+    # answer as a world-writable `/` without the sticky bit.
+    with tempfile.TemporaryDirectory() as base:
+        tree = Tree(base)
+        real_lstat = mod.os.lstat
+
+        def writable_root(path, *args, **kwargs):
+            st = real_lstat(path, *args, **kwargs)
+            if path == os.sep:
+                fields = list(st)
+                fields[0] = stat.S_IFDIR | 0o777
+                return os.stat_result(fields)
+            return st
+
+        mod.os.lstat = writable_root
+        try:
+            expect_refusal(mod, tree, owner, "a writable filesystem root", "metadata", "/ is mode 0777")
+        finally:
+            mod.os.lstat = real_lstat
+
     # HARD LINKS ARE ADMITTED: the command imposes no one-link rule.
     with tempfile.TemporaryDirectory() as base:
         tree = Tree(base)

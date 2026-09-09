@@ -250,6 +250,12 @@ if os.path.lexists(active):
     sys.exit(1)
 os.makedirs(root, mode=0o700, exist_ok=True)
 os.mkdir(active, 0o700)
+# An updater finishing its install in the last instant before the hold
+# excludes it (S10): the managed binary gains a byte.
+replace = os.environ.get("BILLET_FAKE_HOLD_REPLACE", "")
+if replace:
+    with open(replace, "ab") as f:
+        f.write(b"# installed by an updater during the hold\n")
 digest = hashlib.sha256(open(exe, "rb").read()).hexdigest()
 record = {"holder": holder, "claimed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
           "hostname": socket.gethostname(), "release_executable": exe, "release_executable_sha256": digest}
@@ -1429,5 +1435,17 @@ for c in "$work"/cases/*/log; do
   if grep -q '^role=systemctl' "$c"; then fail "the preparation called systemctl in $(basename "$(dirname "$c")")"; fi
 done
 echo "ok   S9: a downgrade refuses before the hold, and no preparation case reached systemctl"
+
+# S10. The installed binary replaced between the decision and the hold.
+plant s10
+run_case s10 escalated BILLET_FAKE_HOLD_REPLACE="$work/cases/s10/bin/billet" -- -e billet_binary_src="$work/cases/s10/src/billet"
+expect_refused s10 "Refuse a converge whose installed binary moved before the hold" "changed between this converge's decision and its hold" "converge-guard release --holder h1"
+expect_calls s10 candidate "converge-guard hold --holder h1 --candidate" 1
+rd test -f "$(root_of s10)/active/guard.json" || fail "s10: the guard was not left held"
+plant s10-absent
+rm -f "$work/cases/s10-absent/bin/billet"
+run_case s10-absent escalated BILLET_FAKE_HOLD_REPLACE="$work/cases/s10-absent/bin/billet" -- -e billet_binary_src="$work/cases/s10-absent/src/billet"
+expect_refused s10-absent "Refuse a converge whose installed binary moved before the hold" "absent when the binary change was decided"
+echo "ok   S10: a binary that moved between the decision and the hold refuses under the guard"
 
 echo "converge guard: every guard, preparation and staging case passes"

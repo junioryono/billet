@@ -669,6 +669,43 @@
         billet_exclusion_executable: "{{ billet_exclusion_hold_executable }}"
       when: billet_exclusion_hold is changed
 
+    # THE DECISION WAS MADE BEFORE THE HOLD, against a binary an updater could
+    # still replace until the guard excluded it. The installed binary is
+    # observed again under the guard, and a decision made against a binary
+    # that has since moved is refused rather than acted on: an older candidate
+    # admitted against A is a downgrade against the C an updater installed.
+    - name: Inspect the installed billet binary under the guard
+      ansible.builtin.stat:
+        path: "{{ billet_exclusion_binary }}"
+        checksum_algorithm: sha256
+      register: billet_exclusion_binary_under_guard
+      check_mode: false
+      become: "{{ billet_exclusion_become }}"
+      when:
+        - billet_exclusion_hold is changed
+        - not billet_exclusion_darwin | bool
+
+    - name: Refuse a converge whose installed binary moved before the hold
+      ansible.builtin.assert:
+        that:
+          - billet_exclusion_binary_under_guard.stat.exists == billet_installed_binary.stat.exists
+          - >-
+            not billet_installed_binary.stat.exists
+            or billet_exclusion_binary_under_guard.stat.checksum == billet_installed_binary.stat.checksum
+        fail_msg: >-
+          {{ billet_exclusion_binary }} changed between this converge's decision
+          and its hold ({{ 'absent' if not billet_installed_binary.stat.exists else 'digest ' ~ billet_installed_binary.stat.checksum }}
+          when the binary change was decided,
+          {{ 'absent' if not billet_exclusion_binary_under_guard.stat.exists else 'digest ' ~ billet_exclusion_binary_under_guard.stat.checksum }}
+          under the guard): an updater installed something in between, and the
+          decision no longer describes this host. Nothing further is done;
+          {{ billet_exclusion_holder }} holds the guard, which
+          `{{ billet_exclusion_executable }} converge-guard release --holder {{ billet_exclusion_holder }}`
+          releases. Converge again.
+      when:
+        - billet_exclusion_hold is changed
+        - not billet_exclusion_darwin | bool
+
     # THE LEGACY PROTOCOL is admitted only when no executable able to hold
     # exists: a managed binary that predates the guard, no candidate staged,
     # and not a PostgreSQL controller (which stage-candidate.yml refused).

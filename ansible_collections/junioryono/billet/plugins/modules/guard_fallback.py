@@ -158,6 +158,9 @@ def require_trusted_ancestors(phase, parent, owner):
     # ancestors.
     components = components[:-1]
     at = os.sep
+    # THE FILESYSTEM ROOT ITSELF FIRST: a `/` another account could write is the
+    # one ancestor a walk over children never reaches.
+    require_ancestor(phase, at, lstat_or_refuse(phase, at), owner)
     links = 0
     pending = list(components)
     while pending:
