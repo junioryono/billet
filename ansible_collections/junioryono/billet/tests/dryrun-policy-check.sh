@@ -107,7 +107,7 @@ fixture() {
         printf '[Unit]\nDescription=billet %s\n\n[Service]\nUser=%s\nGroup=%s\nType=notify\nExecStart=/usr/bin/billet %s --config /etc/billet/billet.yaml\n' "$role" \
             "$([ $role = server ] && echo billet || echo root)" "$([ $role = server ] && echo billet || echo root)" "$role" \
             >"$d/lib/billet-$role.service"
-        printf 'NeedDaemonReload=%s\nFragmentPath=%s\nDropInPaths=\nNames=billet-%s.service\nUser=%s\nGroup=%s\nType=notify\n' \
+        printf 'NeedDaemonReload=%s\nLoadState=loaded\nFragmentPath=%s\nDropInPaths=\nNames=billet-%s.service\nUser=%s\nGroup=%s\nType=notify\n' \
             "$([ $role = server ] && echo yes || echo no)" "$d/lib/billet-$role.service" "$role" \
             "$([ $role = server ] && echo billet || echo root)" "$([ $role = server ] && echo billet || echo root)" \
             >"$d/fake/billet-$role.service.props"
@@ -132,7 +132,9 @@ run() {
 
 fail() {
     echo "FAIL: $1" >&2
-    sed -n '1,80p' "$work/$2/out.txt" >&2
+    # The failing task is usually last, after the probes' long JSON results.
+    grep -nE 'fatal:|\[ERROR\]|"why"|"msg"' "$work/$2/out.txt" | tail -20 >&2
+    tail -40 "$work/$2/out.txt" >&2
     exit 1
 }
 
@@ -212,6 +214,10 @@ refused crlf "a carriage return in the fragment refuses" "a carriage return"
 fixture indented
 printf '[Service]\n  User=billet\nGroup=billet\nType=notify\nExecStart=/usr/bin/billet server --config /etc/billet/billet.yaml\n' >"$work/indented/lib/billet-server.service"
 refused indented "an indented assignment refuses" "an indented line"
+
+fixture brokenheader
+printf '[Broken\n[Service]\nUser=billet\nGroup=billet\nType=notify\nExecStart=/usr/bin/billet server --config /etc/billet/billet.yaml\n' >"$work/brokenheader/lib/billet-server.service"
+refused brokenheader "a malformed section header refuses, since systemd stops parsing there" "a malformed section header"
 
 fixture spaced
 printf '[Service]\nUser = billet\nGroup=billet\nType=notify\nExecStart=/usr/bin/billet server --config /etc/billet/billet.yaml\n' >"$work/spaced/lib/billet-server.service"
@@ -296,7 +302,71 @@ fixture aliasdropin
 ln -s billet-server.service "$work/aliasdropin/etc/runner.service"
 mkdir -p "$work/aliasdropin/etc/runner.service.d"
 echo '[Service]' >"$work/aliasdropin/etc/runner.service.d/10-x.conf"
-refused aliasdropin "a drop-in under an alias's .d is found through the alias" "runner.service is an alias"
+refused aliasdropin "an alias with a drop-in under its .d refuses by the alias itself, before the drop-in scan" "runner.service is an alias"
+
+# THE FRAGMENT COMPARED IS THE ONE THE NEXT RELOAD WOULD LOAD. FragmentPath is
+# what the manager loaded; a higher-priority fragment or a mask that appeared
+# since is what a reload adopts.
+fixture higherfragment
+sed 's/^User=billet$/User=root/' "$work/higherfragment/lib/billet-server.service" >"$work/higherfragment/etc/billet-server.service"
+refused higherfragment "a higher-priority fragment that appeared since the load refuses although the loaded one agrees" "the next reload would load"
+
+fixture maskedwinner
+ln -s /dev/null "$work/maskedwinner/etc/billet-server.service"
+refused maskedwinner "a mask that appeared above the loaded fragment refuses" "(mask)"
+
+# ABSENCE IS POSITIVE OR NOTHING: no FragmentPath with LoadState=not-found and
+# no entry on disk is a unit the manager does not know; without that state, or
+# with a file on disk the manager has not loaded, it refuses.
+fixture ghost
+sed -i.bak 's|^FragmentPath=.*|FragmentPath=|' "$work/ghost/fake/billet-server.service.props"
+refused ghost "no fragment path with LoadState=loaded refuses as could-not-tell" "not a positive absence"
+
+# No fragment path, no file anywhere and LoadState=loaded is still not a positive
+# absence: only LoadState=not-found makes nothing-on-disk an answer.
+fixture ghostnofile
+sed -i.bak 's|^FragmentPath=.*|FragmentPath=|' "$work/ghostnofile/fake/billet-server.service.props"
+rm "$work/ghostnofile/lib/billet-server.service"
+refused ghostnofile "no fragment path and no file on disk with LoadState=loaded refuses as could-not-tell" "not a positive absence"
+
+fixture unloadedfile
+sed -i.bak 's|^FragmentPath=.*|FragmentPath=|; s|^LoadState=.*|LoadState=not-found|' "$work/unloadedfile/fake/billet-server.service.props"
+refused unloadedfile "a not-found unit whose file is on disk refuses, since the next reload would load it" "the next reload would load it"
+
+# A DROP-IN LOCATION THAT COULD NOT BE EXAMINED is not an empty one.
+if [ "$(id -u)" -ne 0 ]; then
+    fixture skippedpath
+    mkdir -p "$work/skippedpath/etc/billet-server.service.d"
+    chmod 000 "$work/skippedpath/etc/billet-server.service.d"
+    refused skippedpath "a drop-in directory that could not be read refuses rather than counting as empty" "could not be examined"
+    chmod 700 "$work/skippedpath/etc/billet-server.service.d"
+    # A LOCATION WHOSE OWN STAT FAILS fails the stat task itself, before find is
+    # given anything: the location is a link into a directory that cannot be
+    # searched, so the lookup directory stays readable (an unreadable lookup
+    # directory is the alias module's refusal, above) and the followed stat is
+    # what meets the permission error.
+    fixture statfails
+    mkdir -p "$work/statfails/locked/dropins"
+    ln -s "$work/statfails/locked/dropins" "$work/statfails/etc/billet-server.service.d"
+    chmod 000 "$work/statfails/locked"
+    if run statfails; then chmod 755 "$work/statfails/locked"; fail "a drop-in location whose stat fails was passed over" statfails; fi
+    chmod 755 "$work/statfails/locked"
+    # THE FAILURE IS THE STAT TASK'S OWN: its block of the output (from its TASK
+    # line to the next) carries a failed item naming the location and the
+    # permission error, so a downstream failure after a passing stat cannot
+    # satisfy this case.
+    awk '/^TASK \[.*Stat every drop-in location/{p=1; next} /^TASK \[/{p=0} p' "$work/statfails/out.txt" >"$work/statfails/stat-block.txt"
+    grep -qE 'failed: \[localhost\] \(item=.*statfails/etc/billet-server\.service\.d\)' "$work/statfails/stat-block.txt" || fail "the stat task did not fail on the denied location" statfails
+    grep -q 'Permission denied' "$work/statfails/stat-block.txt" || fail "the stat task's failure did not carry the permission error" statfails
+    echo "ok   a drop-in location whose stat fails fails the dry run"
+else
+    echo "skip a drop-in directory that could not be read (root reads everything; the permission fixtures need an unprivileged user)"
+fi
+
+# THE FLAG'S ANSWER IS YES OR NO; anything else is could-not-tell.
+fixture oddflag
+sed -i.bak 's/^NeedDaemonReload=yes/NeedDaemonReload=maybe/' "$work/oddflag/fake/billet-server.service.props"
+refused oddflag "an unfamiliar NeedDaemonReload answer refuses" "neither yes nor no"
 
 fixture chain
 ln -s "$work/chain/etc/billet-server.service" "$work/chain/lib/b.service"
@@ -345,11 +415,14 @@ allowed both "both units pending and agreeing continue"
 [ "$(grep -c 'the run continues' "$work/both/out.txt")" -ge 1 ] || fail "both units were not reported" both
 grep -q 'billet-node.service: systemd reports' "$work/both/out.txt" || fail "the node unit was not compared" both
 
-# 11. A unit the manager does not know has no fragment, and nothing to compare.
+# 11. A unit the manager does not know (LoadState=not-found, no file in any
+#     lookup path) has nothing to compare.
 fixture notfound
-sed -i.bak 's|^FragmentPath=.*|FragmentPath=|' "$work/notfound/fake/billet-server.service.props"
+sed -i.bak 's|^FragmentPath=.*|FragmentPath=|; s|^LoadState=.*|LoadState=not-found|' "$work/notfound/fake/billet-server.service.props"
+rm "$work/notfound/lib/billet-server.service" "$work/notfound/fake/billet-server.service.exec.json"
 run notfound || fail "a not-found unit with the flag was refused" notfound
-grep -q 'no fragment on disk' "$work/notfound/out.txt" || fail "the not-found unit was not reported as such" notfound
-echo "ok   a unit with no fragment on disk has nothing to compare"
+grep -q 'there is nothing to compare and the run continues' "$work/notfound/out.txt" || fail "the not-found unit was not reported with its own report" notfound
+if grep -q 'agrees with what the manager loaded on every fact' "$work/notfound/out.txt"; then fail "the not-found unit was reported as agreeing on facts that were never compared" notfound; fi
+echo "ok   a unit the manager does not know, with no file on disk, has nothing to compare"
 
 echo "dry-run policy gate: all cases pass"

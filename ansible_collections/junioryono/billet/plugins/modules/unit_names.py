@@ -159,39 +159,111 @@ def _classify(path, unit_path):
     # from the link's own directory. Either names a unit only when the
     # directory it reduces to is a lookup path.
     raw = target if os.path.isabs(target) else os.path.join(os.path.dirname(path), target)
-    # systemd identifies components skipping `.` and redundant separators, so a
-    # target spelled `<unit>/` or `<unit>/.` would make the unit-name component
-    # an intermediate one to follow through; that spelling is refused rather
-    # than read through the symlink the unit name may be.
-    if raw.endswith("/") or raw.endswith("/.") or "/./" in raw:
+    # systemd consumes a trailing separator or `.` component when it identifies
+    # components and keeps the final symlink; this classifier does not model
+    # that and refuses such a spelling as could-not-tell, a restricted admission
+    # of its own that no shipped policy needs.
+    if raw.endswith("/") or raw.endswith("/."):
         raise Unreadable("%s: target %s ends in a separator or a `.` component, which this classifier does not read through" % (path, target))
-    # systemd refuses an unsafe remainder past a component that does not exist
-    # (a `..` there has nothing to apply to) rather than normalising it away, so
-    # the check runs on the target AS WRITTEN, before normpath folds it.
-    cur, missing = "/", False
-    for component in [c for c in raw.split("/") if c not in ("", ".")]:
-        if missing and component == "..":
-            raise Unreadable("%s: target %s climbs through a component that does not exist" % (path, target))
-        cur = os.path.join(cur, component)
-        if not missing and not os.path.lexists(cur):
-            missing = True
-    resolved = os.path.normpath(raw)
-    # AS SYSTEMD CLASSIFIES IT (CHASE_NOFOLLOW | CHASE_NONEXISTENT): the
-    # target's DIRECTORY is chased (realpath tolerates components that do not
-    # exist, as systemd's chase does) and its FINAL COMPONENT is kept as
-    # written, so a target that is itself a symlink is the unit NAME it spells
-    # and not what that link resolves to; the lookup paths are kept in both
-    # their original and resolved spellings, and the target is an alias when
-    # it lies UNDER any of them, nested or not, with the basename as the unit
-    # name. Equality of the immediate directory would call a nested or a
-    # not-yet-existing target external, and a full chase would follow a
-    # shadowed lower-priority symlink out of the search path, missing the
-    # drop-ins searched under the alias's name either way.
-    chased = os.path.join(os.path.realpath(os.path.dirname(resolved)), os.path.basename(resolved))
+    # THE TARGET IS CHASED COMPONENT BY COMPONENT, as systemd's chase is: an
+    # intermediate symlink is resolved when it is reached, `..` then applies to
+    # the RESOLVED parent (normpath first would fold `link/../x` into the link's
+    # own directory and lose an alias that lives where the link points), a
+    # component that does not exist is tolerated and everything after it is
+    # kept as written, a `..` after one refuses (systemd refuses that unsafe
+    # remainder rather than normalising it away), and the FINAL component is
+    # kept as written: the unit name the target spells.
+    resolved = _chase(raw, path, target)
+    # AS SYSTEMD CLASSIFIES IT (CHASE_NOFOLLOW | CHASE_NONEXISTENT): the chased
+    # path above keeps its final component as written, so a target that is
+    # itself a symlink is the unit NAME it spells and not what that link
+    # resolves to; the lookup paths are kept in both their original and
+    # resolved spellings, and the target is an alias when it lies UNDER any of
+    # them, nested or not, with the basename as the unit name. Equality of the
+    # immediate directory would call a nested or a not-yet-existing target
+    # external, and a full chase would follow a shadowed lower-priority symlink
+    # out of the search path, missing the drop-ins searched under the alias's
+    # name either way.
+    chased = resolved
     if not any(chased.startswith(p.rstrip("/") + "/") for p in unit_path):
         return {"kind": "external", "path": path, "target": target}
     return {"kind": "alias", "path": path, "target": target,
             "target_name": os.path.basename(chased)}
+
+
+def _chase(raw, path, target):
+    """The target as systemd chases it (CHASE_NOFOLLOW | CHASE_NONEXISTENT).
+
+    Component by component, over ONE QUEUE: an intermediate symlink met on the
+    way is read and its own components are put at the front of the queue (an
+    absolute one restarting at the root, a relative one continuing from the
+    link's directory), so what lies inside a link's target is walked by the same
+    rules as what was written, missing components and all; `..` applies to the
+    resolved parent reached so far and is itself examined there, since systemd
+    opens it relative to the directory it holds and a directory that cannot be
+    searched fails the climb; a component that does not exist is tolerated
+    and everything after it is kept as written; a `..` after one refuses, as
+    systemd refuses that unsafe remainder rather than normalising it away; a
+    read that fails for any reason but absence refuses, the final component's
+    included (systemd opens it O_PATH|O_NOFOLLOW and keeps every error but
+    ENOENT); an existing intermediate component must be a directory, since
+    systemd cannot walk through a file and a lexical `..` past one would; the
+    thirty-second symlink refuses, as systemd 255's CHASE_MAX of 32 does; and
+    the FINAL component is kept as written, the unit name the target spells,
+    whatever it is a link to. lexists and realpath would collapse an error into
+    "absent" and fold a missing component inside a link's target away, which is
+    why neither is used here.
+    """
+    queue = [c for c in raw.split("/") if c not in ("", ".")]
+    cur, missing, links = "/", False, 0
+    while queue:
+        component = queue.pop(0)
+        last = not queue
+        if component == "..":
+            if missing:
+                raise Unreadable("%s: target %s climbs through a component that does not exist" % (path, target))
+            # systemd opens `..` relative to the directory it holds, so a
+            # directory it may not search fails the climb; a lexical dirname
+            # would climb out of it without looking.
+            up = os.path.join(cur, "..")
+            try:
+                st = os.lstat(up)
+            except OSError as exc:
+                raise Unreadable("%s: target %s: %s: %s" % (path, target, up, exc.strerror))
+            if not stat.S_ISDIR(st.st_mode):
+                raise Unreadable("%s: target %s: %s is not a directory" % (path, target, up))
+            cur = os.path.dirname(cur) if cur != "/" else "/"
+            continue
+        nxt = os.path.join(cur, component)
+        if missing:
+            cur = nxt
+            continue
+        try:
+            st = os.lstat(nxt)
+        except OSError as exc:
+            if exc.errno == errno.ENOENT:
+                missing = True
+                cur = nxt
+                continue
+            raise Unreadable("%s: target %s: %s: %s" % (path, target, nxt, exc.strerror))
+        if last:
+            return nxt
+        if stat.S_ISLNK(st.st_mode):
+            links += 1
+            if links >= 32:
+                raise Unreadable("%s: target %s: the thirty-second symlink on the way, where systemd stops" % (path, target))
+            try:
+                link = os.readlink(nxt)
+            except OSError as exc:
+                raise Unreadable("%s: target %s: %s: %s" % (path, target, nxt, exc.strerror))
+            if os.path.isabs(link):
+                cur = "/"
+            queue = [c for c in link.split("/") if c not in ("", ".")] + queue
+            continue
+        if not stat.S_ISDIR(st.st_mode):
+            raise Unreadable("%s: target %s: %s is not a directory" % (path, target, nxt))
+        cur = nxt
+    return cur
 
 
 def source_name_map(unit_path):
@@ -208,7 +280,13 @@ def source_name_map(unit_path):
             scanned += 1
             if name in entries:
                 continue
-            entries[name] = _classify(os.path.join(directory, name), lookup)
+            entry = _classify(os.path.join(directory, name), lookup)
+            # systemd builds its name map from regular files and symlinks only:
+            # a directory or a device named like a unit claims no name, so a
+            # lower-priority alias of that name is the one it loads.
+            if entry["kind"] == "other":
+                continue
+            entries[name] = entry
     return entries, scanned
 
 

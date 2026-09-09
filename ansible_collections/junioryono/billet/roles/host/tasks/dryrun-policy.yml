@@ -41,11 +41,24 @@
          | map(attribute='item') | list }}
   when: ansible_check_mode
 
+# THE ANSWER IS YES OR NO: an empty or unfamiliar answer is not "no pending
+# reload", and a unit it was given for is not silently left out of the set.
+- name: Refuse a reload answer this dry run does not read
+  ansible.builtin.assert:
+    that:
+      - item.stdout | trim in ['yes', 'no']
+    fail_msg: "{{ item.item }}: systemd answered NeedDaemonReload={{ item.stdout | trim | to_json }}, which is neither yes nor no; the dry run cannot tell whether a reload is pending for it."
+  loop: "{{ billet_service_policy_reload_pending.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: ansible_check_mode
+
 - name: Inspect the loaded identity of Billet units during a dry run
   ansible.builtin.command:
     argv:
       - systemctl
       - show
+      - --property=LoadState
       - --property=FragmentPath
       - --property=DropInPaths
       - --property=Names
@@ -169,13 +182,43 @@
 # EVERY LOCATION THE MANAGER SEARCHES: `<unit>.d`, every `<alias>.d`, the
 # prefix directory `billet-.service.d` and `service.d`, under every lookup
 # path, because a drop-in can change User= without changing the file set.
+- name: Note every drop-in location the manager searches
+  ansible.builtin.set_fact:
+    billet_service_policy_dropin_locations: >-
+      {%- set out = {} -%}
+      {%- for unit in billet_service_policy_pending_units | default([]) -%}
+        {%- set _ = out.update({unit: (billet_service_policy_manager_unit_paths
+            | product([unit ~ '.d', 'billet-.service.d', 'service.d'])
+            | map('join', '/') | list)
+           + (billet_service_policy_aliases.aliases | default([]) | map(attribute='dropin_dirs') | flatten)}) -%}
+      {%- endfor -%}
+      {{ out }}
+  when: ansible_check_mode
+
+# ABSENCE BY A STAT THAT KEEPS ITS ERROR: find answers "is not a directory" for
+# any failed stat of a location, permission denied included, so absence is
+# established here first, where a failed stat fails the task, and find is
+# given only the directories that exist.
+- name: Stat every drop-in location the manager searches
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: true
+    get_checksum: false
+    get_mime: false
+    get_attributes: false
+  loop: "{{ billet_service_policy_dropin_locations | default({}) | dict2items | map(attribute='value') | flatten | unique }}"
+  register: billet_service_policy_dropin_location_stats
+  check_mode: false
+  when: ansible_check_mode
+  become: true
+
 - name: Look for drop-ins on disk in every location the manager searches
   ansible.builtin.find:
     paths: >-
-      {{ (billet_service_policy_manager_unit_paths
-          | product([item ~ '.d', 'billet-.service.d', 'service.d'])
-          | map('join', '/') | list)
-         + (billet_service_policy_aliases.aliases | default([]) | map(attribute='dropin_dirs') | flatten) }}
+      {{ billet_service_policy_dropin_locations[item]
+         | select('in', billet_service_policy_dropin_location_stats.results
+                        | selectattr('stat.exists') | selectattr('stat.isdir') | map(attribute='item') | list)
+         | list }}
     patterns: '*.conf'
     file_type: any
   loop: "{{ billet_service_policy_pending_units | default([]) }}"
@@ -198,8 +241,21 @@
         {%- set loaded = billet_service_policy_loaded.results | selectattr('item', 'equalto', unit) | first -%}
         {%- set frag = billet_service_policy_fragments.results | selectattr('item.item', 'equalto', unit) | first -%}
         {%- set exec = billet_service_policy_loaded_exec.results | selectattr('item', 'equalto', unit) | first -%}
+        {%- set loaded_state = ((loaded.stdout | regex_findall('(?m)^LoadState=(.*)$')) + ['']) | first | trim -%}
+        {%- set loaded_fragment = ((loaded.stdout | regex_findall('(?m)^FragmentPath=(.*)$')) + ['']) | first | trim -%}
+        {%- set winning = (billet_service_policy_aliases.entries | default({}))[unit] | default({}) -%}
         {%- if frag.skipped | default(false) -%}
-          {%- set _ = out.append({'unit': unit, 'ok': true, 'why': 'no fragment on disk, nothing loaded to compare'}) -%}
+          {#- ABSENCE IS A POSITIVE ANSWER OR NOTHING: no FragmentPath with
+              LoadState=not-found is a unit the manager does not know, which has
+              nothing loaded to compare; no FragmentPath with any other state is
+              a read this dry run cannot account for. -#}
+          {%- if loaded_state == 'not-found' and winning | length == 0 -%}
+            {%- set _ = out.append({'unit': unit, 'ok': true, 'absent': true, 'why': 'no fragment on disk, nothing loaded to compare (LoadState=not-found)'}) -%}
+          {%- elif loaded_state == 'not-found' -%}
+            {%- set _ = out.append({'unit': unit, 'ok': false, 'why': 'the manager knows no unit (LoadState=not-found) but ' ~ winning.path ~ ' is on disk in a lookup path, and the next reload would load it'}) -%}
+          {%- else -%}
+            {%- set _ = out.append({'unit': unit, 'ok': false, 'why': 'no fragment path was reported while LoadState=' ~ (loaded_state or 'empty') ~ ', which is not a positive absence'}) -%}
+          {%- endif -%}
         {%- else -%}
           {%- set text = frag.content | b64decode -%}
           {#- THE FRAGMENT IS READ AS SYSTEMD READS IT, not as text: an assignment
@@ -215,7 +271,15 @@
               {%- set _ = ns.bad.append('a continued line [' ~ line ~ ']') -%}
             {%- elif line | trim | length == 0 or line[0] in '#;' -%}
             {%- elif line[0] == '[' -%}
-              {%- set ns.section = line | trim -%}
+              {#- systemd stops parsing at a malformed section header; a
+                  comparator that skipped it would read assignments systemd
+                  never reaches. -#}
+              {%- if line is match('^\[[A-Za-z0-9_.-]+\]$') -%}
+                {%- set ns.section = line -%}
+              {%- else -%}
+                {%- set _ = ns.bad.append('a malformed section header [' ~ line ~ '], at which systemd stops parsing') -%}
+                {%- set ns.section = '' -%}
+              {%- endif -%}
             {%- elif line[0] in ' \t' -%}
               {%- set _ = ns.bad.append('an indented line [' ~ line ~ ']') -%}
             {%- elif '=' not in line -%}
@@ -251,6 +315,26 @@
           {%- set loaded_argv = records[0][1] if records | length == 1 else [] -%}
           {%- set on_disk = billet_service_policy_dropins_on_disk.results | selectattr('item', 'equalto', unit) | first -%}
           {%- set why = [] -%}
+          {#- THE FRAGMENT COMPARED IS THE ONE THE NEXT RELOAD WOULD LOAD: the
+              manager's source-name map (unit_names) names the winning entry per
+              unit name, and a higher-priority fragment, a mask or an alias that
+              has appeared since the load is what a reload adopts, not the file
+              FragmentPath still points at. -#}
+          {%- if winning | length == 0 -%}
+            {%- set _ = why.append('no entry for the unit was found in any lookup path, while the manager loaded ' ~ loaded_fragment) -%}
+          {%- elif winning.kind != 'fragment' -%}
+            {%- set _ = why.append('the next reload would find ' ~ winning.path ~ ' (' ~ winning.kind ~ ') for the unit name, not the loaded fragment ' ~ loaded_fragment) -%}
+          {%- elif winning.path != loaded_fragment -%}
+            {%- set _ = why.append('the next reload would load ' ~ winning.path ~ ', a higher-priority fragment, while the manager loaded ' ~ loaded_fragment) -%}
+          {%- endif -%}
+          {#- Every location find was given exists and is a directory (the stat
+              above established that, failing the run on any other error), so
+              anything find could not walk is a failed examination, and a
+              location whose drop-ins are unknown is not an empty one. -#}
+          {%- set bad_skips = (on_disk.skipped_paths | default({})) | dict2items | map(attribute='key') | list -%}
+          {%- if bad_skips | length > 0 -%}
+            {%- set _ = why.append('drop-in locations could not be examined (' ~ (bad_skips | join(', ')) ~ '), so their absence is not established') -%}
+          {%- endif -%}
           {%- for b in ns.bad -%}
             {%- set _ = why.append('the fragment is outside the grammar this dry run compares: ' ~ b) -%}
           {%- endfor -%}
@@ -306,13 +390,17 @@
 - name: Report a pending daemon-reload the dry run could compare across
   ansible.builtin.debug:
     msg: >-
-      {{ item.unit }}: systemd reports a pending daemon-reload, and the unit
-      file on disk agrees with what the manager loaded on every fact this dry
-      run reads (User, Group, Type, ExecStart; no drop-in, no alias), so the
-      run continues. On systemd 255 the property is also set for every unit by
-      any enable, disable, preset or mask that changed something (a snap
-      refresh, a package install) until the next daemon-reload; a real
-      converge reloads before it inspects and again after its own enables.
+      {% if item.absent | default(false) %}{{ item.unit }}: systemd reports a
+      pending daemon-reload for a unit it does not know (LoadState=not-found)
+      and no lookup path holds a file for; there is nothing to compare and the
+      run continues.{% else %}{{ item.unit }}: systemd reports a pending
+      daemon-reload, and the unit file the next reload would load agrees with
+      what the manager loaded on every fact this dry run reads (User, Group,
+      Type, ExecStart; no drop-in, no alias), so the run continues.{% endif %}
+      On systemd 255 the property is also set for every unit by any enable,
+      disable, preset or mask that changed something (a snap refresh, a
+      package install) until the next daemon-reload; a real converge reloads
+      before it inspects and again after its own enables.
   loop: "{{ billet_service_policy_comparison | default([]) }}"
   loop_control:
     label: "{{ item.unit }}"

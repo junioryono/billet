@@ -54,6 +54,8 @@
         billet_service_policy_alias_probe: "{{ billet_host_dryrun_tasks | selectattr('name', 'equalto', 'Resolve on-disk aliases of the Billet units the way the manager would') | first }}"
         billet_service_policy_alias_guard: "{{ billet_host_dryrun_tasks | selectattr('name', 'equalto', 'Refuse an on-disk alias of a Billet unit during a dry run') | first }}"
         billet_service_policy_dropin_find: "{{ billet_host_dryrun_tasks | selectattr('name', 'equalto', 'Look for drop-ins on disk in every location the manager searches') | first }}"
+        billet_service_policy_dropin_locations_note: "{{ billet_host_dryrun_tasks | selectattr('name', 'equalto', 'Note every drop-in location the manager searches') | first }}"
+        billet_service_policy_dropin_stat: "{{ billet_host_dryrun_tasks | selectattr('name', 'equalto', 'Stat every drop-in location the manager searches') | first }}"
         billet_service_policy_compare: "{{ billet_host_dryrun_tasks | selectattr('name', 'equalto', 'Compare the on-disk Billet unit policy with what the manager loaded') | first }}"
         billet_service_policy_reload_after_probe: "{{ billet_host_handlers | selectattr('name', 'equalto', 'Inspect whether the manager reports a pending reload after unit-file changes') | first }}"
         billet_service_policy_final_reload: "{{ billet_host_handlers | selectattr('name', 'equalto', \"Reload systemd after the role's own unit-file changes\") | first }}"
@@ -183,11 +185,20 @@
           - billet_dryrun_names.index('Read the running manager\'s unit lookup paths during a dry run') < billet_dryrun_names.index('Refuse a unit lookup path this dry run does not know')
           - billet_dryrun_names.index('Refuse a unit lookup path this dry run does not know') < billet_dryrun_names.index('Resolve on-disk aliases of the Billet units the way the manager would')
           - billet_dryrun_names.index('Resolve on-disk aliases of the Billet units the way the manager would') < billet_dryrun_names.index('Refuse an on-disk alias of a Billet unit during a dry run')
-          - billet_dryrun_names.index('Refuse an on-disk alias of a Billet unit during a dry run') < billet_dryrun_names.index('Look for drop-ins on disk in every location the manager searches')
+          - billet_dryrun_names.index('Refuse an on-disk alias of a Billet unit during a dry run') < billet_dryrun_names.index('Note every drop-in location the manager searches')
+          - billet_dryrun_names.index('Note every drop-in location the manager searches') < billet_dryrun_names.index('Stat every drop-in location the manager searches')
+          - billet_dryrun_names.index('Stat every drop-in location the manager searches') < billet_dryrun_names.index('Look for drop-ins on disk in every location the manager searches')
           - billet_dryrun_names.index('Look for drop-ins on disk in every location the manager searches') < billet_dryrun_names.index('Compare the on-disk Billet unit policy with what the manager loaded')
           - billet_dryrun_names.index('Compare the on-disk Billet unit policy with what the manager loaded') < billet_dryrun_names.index('Refuse a dry run against stale Billet service policy')
           - billet_dryrun_names.index('Refuse a dry run against stale Billet service policy') < billet_dryrun_names.index('Report a pending daemon-reload the dry run could compare across')
           - "'--property=FragmentPath' in billet_service_policy_loaded_probe['ansible.builtin.command'].argv"
+          - "'--property=LoadState' in billet_service_policy_loaded_probe['ansible.builtin.command'].argv"
+          - billet_dryrun_names.index('Inspect pending Billet service policy during a dry run') < billet_dryrun_names.index('Refuse a reload answer this dry run does not read')
+          - billet_dryrun_names.index('Refuse a reload answer this dry run does not read') < billet_dryrun_names.index('Inspect the loaded identity of Billet units during a dry run')
+          - "'LoadState' in (billet_service_policy_compare['ansible.builtin.set_fact'].billet_service_policy_comparison | string)"
+          - "'skipped_paths' in (billet_service_policy_compare['ansible.builtin.set_fact'].billet_service_policy_comparison | string)"
+          - "'winning.path != loaded_fragment' in (billet_service_policy_compare['ansible.builtin.set_fact'].billet_service_policy_comparison | string)"
+          - "'a malformed section header' in (billet_service_policy_compare['ansible.builtin.set_fact'].billet_service_policy_comparison | string)"
           - "'--property=DropInPaths' in billet_service_policy_loaded_probe['ansible.builtin.command'].argv"
           - "'--property=Names' in billet_service_policy_loaded_probe['ansible.builtin.command'].argv"
           - "'--property=User' in billet_service_policy_loaded_probe['ansible.builtin.command'].argv"
@@ -208,11 +219,15 @@
           - "'junioryono.billet.unit_names' in billet_service_policy_alias_probe"
           - "'billet_service_policy_manager_unit_paths' in billet_service_policy_alias_probe['junioryono.billet.unit_names'].unit_path"
           - "'billet_service_policy_aliases.aliases | length == 0' in billet_service_policy_alias_guard['ansible.builtin.assert'].that"
-          - "'billet-.service.d' in (billet_service_policy_dropin_find['ansible.builtin.find'].paths | string)"
-          - "'service.d' in (billet_service_policy_dropin_find['ansible.builtin.find'].paths | string)"
-          - "'dropin_dirs' in (billet_service_policy_dropin_find['ansible.builtin.find'].paths | string)"
-          - "'billet_service_policy_manager_unit_paths' in (billet_service_policy_dropin_find['ansible.builtin.find'].paths | string)"
+          - "'billet-.service.d' in (billet_service_policy_dropin_locations_note['ansible.builtin.set_fact'].billet_service_policy_dropin_locations | string)"
+          - "'service.d' in (billet_service_policy_dropin_locations_note['ansible.builtin.set_fact'].billet_service_policy_dropin_locations | string)"
+          - "'dropin_dirs' in (billet_service_policy_dropin_locations_note['ansible.builtin.set_fact'].billet_service_policy_dropin_locations | string)"
+          - "'billet_service_policy_manager_unit_paths' in (billet_service_policy_dropin_locations_note['ansible.builtin.set_fact'].billet_service_policy_dropin_locations | string)"
           - billet_service_policy_dropin_find.check_mode == false
+          - "'billet_service_policy_dropin_location_stats' in (billet_service_policy_dropin_find['ansible.builtin.find'].paths | string)"
+          - "'stat.isdir' in (billet_service_policy_dropin_find['ansible.builtin.find'].paths | string)"
+          - billet_service_policy_dropin_stat.check_mode == false
+          - billet_service_policy_dropin_stat['ansible.builtin.stat'].follow | bool
           - "'Type=' in (billet_service_policy_compare['ansible.builtin.set_fact'].billet_service_policy_comparison | string)"
           - "'drop-ins are loaded' in (billet_service_policy_compare['ansible.builtin.set_fact'].billet_service_policy_comparison | string)"
           - "'drop-ins are on disk' in (billet_service_policy_compare['ansible.builtin.set_fact'].billet_service_policy_comparison | string)"

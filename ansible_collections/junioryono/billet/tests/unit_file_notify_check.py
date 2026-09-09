@@ -11,15 +11,19 @@ own operations left pending, and the mechanism is a handler every one of those
 operations notifies. An enable added without the notify leaves the flag set
 and this gate red, which is the point.
 
-THE RULE: every task in the host role's tasks/ and handlers/ trees whose module
-is systemd_service (fully qualified or short, `systemd` included) and whose
-arguments carry `enabled` or `masked` notifies `billet unit files changed`,
-directly or in a list. Tasks inside block/rescue/always are walked.
+THE RULE: every task under the host role's tasks/ and handlers/ trees, at any
+depth, whose module is systemd_service (fully qualified or short, `systemd`
+included) and whose arguments carry `enabled` or `masked` notifies
+`billet unit files changed`, directly or in a list. Handlers are held to it too:
+a handler that enables a unit sets the flag like any task. Tasks inside
+block/rescue/always are walked. The closing reload handlers themselves carry no
+`enabled` or `masked` and are outside the rule by construction.
 
 A VACUOUS PASS IS A FAILURE: zero such tasks means the walk stopped seeing them.
 
-`--self-test` runs the rule against a fixture that must fail and one that must
-pass, because a gate that has never refused anything proves nothing.
+`--self-test` runs the rule against fixtures that must fail (a task without the
+notify, a handler without it, a task in a nested directory without it) and one
+that must pass, because a gate that has never refused anything proves nothing.
 """
 
 import pathlib
@@ -71,16 +75,14 @@ def check(role_dir):
     found = 0
     failures = []
     for sub in ("tasks", "handlers"):
-        for path in sorted((role_dir / sub).glob("*.yml")):
+        for path in sorted((role_dir / sub).rglob("*.yml")):
             doc = yaml.safe_load(path.read_text()) or []
             for task, module in unit_file_tasks(doc):
                 found += 1
-                if sub == "handlers":
-                    continue
                 if not notifies(task):
                     failures.append(
                         "%s: task %r (%s) changes unit-file state and does not notify %r"
-                        % (path.name, task.get("name", "<unnamed>"), module, HANDLER)
+                        % (path.relative_to(role_dir), task.get("name", "<unnamed>"), module, HANDLER)
                     )
     if found == 0:
         failures.append("no systemd_service task with enabled/masked was found under %s; the walk is broken" % role_dir)
@@ -90,18 +92,35 @@ def check(role_dir):
 def self_test():
     with tempfile.TemporaryDirectory() as root:
         role = pathlib.Path(root)
-        (role / "tasks").mkdir()
+        (role / "tasks" / "nested").mkdir(parents=True)
         (role / "handlers").mkdir()
+        good = "- name: ok\n  ansible.builtin.systemd_service:\n    name: a\n    enabled: true\n  notify: billet unit files changed\n"
+        (role / "tasks/main.yml").write_text(good)
+        (role / "handlers/main.yml").write_text("- name: Reload systemd\n  ansible.builtin.systemd_service:\n    daemon_reload: true\n")
+        assert check(role) == [], check(role)
+
         (role / "tasks/main.yml").write_text(
-            "- name: ok\n  ansible.builtin.systemd_service:\n    name: a\n    enabled: true\n  notify: billet unit files changed\n"
-            "- name: nested\n  block:\n    - name: bad\n      systemd:\n        name: b\n        masked: true\n"
+            good + "- name: nested\n  block:\n    - name: bad\n      systemd:\n        name: b\n        masked: true\n"
         )
         failures = check(role)
         assert len(failures) == 1 and "'bad'" in failures[0], failures
+
+        (role / "tasks/main.yml").write_text(good)
+        (role / "tasks/nested/deep.yml").write_text("- name: deep\n  ansible.builtin.systemd_service:\n    name: c\n    enabled: false\n")
+        failures = check(role)
+        assert len(failures) == 1 and "'deep'" in failures[0] and "nested" in failures[0], failures
+        (role / "tasks/nested/deep.yml").unlink()
+
+        (role / "handlers/main.yml").write_text("- name: handler enable\n  ansible.builtin.systemd_service:\n    name: d\n    enabled: true\n")
+        failures = check(role)
+        assert len(failures) == 1 and "'handler enable'" in failures[0], failures
+        (role / "handlers/main.yml").write_text("")
+
         (role / "tasks/main.yml").write_text(
             "- name: ok\n  ansible.builtin.systemd_service:\n    name: a\n    enabled: true\n  notify:\n    - other\n    - billet unit files changed\n"
         )
         assert check(role) == [], check(role)
+
         (role / "tasks/main.yml").write_text("- name: none\n  ansible.builtin.debug:\n    msg: hi\n")
         failures = check(role)
         assert len(failures) == 1 and "walk is broken" in failures[0], failures
