@@ -1,0 +1,424 @@
+---
+# ON SYSTEMD 255 NeedDaemonReload IS NOT THIS UNIT'S ALONE. It answers yes when
+# the unit's fragment or drop-ins changed since load, and ALSO for every unit
+# while the manager's unit_file_state_outdated flag is set, which every bus
+# unit-file operation that changed something (enable, disable, preset, mask,
+# link, revert: a snap refresh, a package install, this role's own enables)
+# does until the next daemon-reload. Measured on the reference controller,
+# 2026-09-07 (systemd 255.4): 464 of 464 units answered yes after snapd enabled
+# one mount unit, billet's own files untouched since the previous day. A dry
+# run will not reload the live manager, so it compares what its inspection
+# relies on from the loaded state (User, Group, Type, the loaded ExecStart
+# records) with the on-disk fragment it would read for the same facts, and
+# refuses only a pair that differs or cannot be compared. THE COMPARISON IS
+# COMPLETE OR IT REFUSES: a drop-in anywhere the manager searches, an alias
+# on disk or in memory, or a fragment outside the grammar the role's own
+# templates write is could-not-tell, never a pass.
+- name: Inspect pending Billet service policy during a dry run
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - show
+      - --property=NeedDaemonReload
+      - --value
+      - "{{ item }}"
+  loop:
+    - billet-server.service
+    - billet-node.service
+  register: billet_service_policy_reload_pending
+  changed_when: false
+  failed_when: billet_service_policy_reload_pending.rc != 0
+  check_mode: false
+  when: ansible_check_mode
+  become: true
+
+- name: Note the Billet units the manager reports a pending reload for
+  ansible.builtin.set_fact:
+    billet_service_policy_pending_units: >-
+      {{ billet_service_policy_reload_pending.results | default([])
+         | selectattr('stdout', 'defined')
+         | selectattr('stdout', 'search', '^\s*yes\s*$')
+         | map(attribute='item') | list }}
+  when: ansible_check_mode
+
+# THE ANSWER IS YES OR NO: an empty or unfamiliar answer is not "no pending
+# reload", and a unit it was given for is not silently left out of the set.
+- name: Refuse a reload answer this dry run does not read
+  ansible.builtin.assert:
+    that:
+      - item.stdout | trim in ['yes', 'no']
+    fail_msg: "{{ item.item }}: systemd answered NeedDaemonReload={{ item.stdout | trim | to_json }}, which is neither yes nor no; the dry run cannot tell whether a reload is pending for it."
+  loop: "{{ billet_service_policy_reload_pending.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: ansible_check_mode
+
+- name: Inspect the loaded identity of Billet units during a dry run
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - show
+      - --property=LoadState
+      - --property=FragmentPath
+      - --property=DropInPaths
+      - --property=Names
+      - --property=User
+      - --property=Group
+      - --property=Type
+      - --
+      - "{{ item }}"
+  loop: "{{ billet_service_policy_pending_units | default([]) }}"
+  register: billet_service_policy_loaded
+  changed_when: false
+  failed_when: billet_service_policy_loaded.rc != 0
+  check_mode: false
+  when: ansible_check_mode
+  become: true
+
+# THE STRUCTURED RECORDS, not `systemctl show`'s rendering: the bus property
+# keeps argument boundaries, and a rendering joined by spaces would compare a
+# two-argument record equal to the ordinary four.
+- name: Inspect the loaded ExecStart of Billet units during a dry run
+  ansible.builtin.command:
+    argv:
+      - busctl
+      - --json=short
+      - get-property
+      - org.freedesktop.systemd1
+      - "/org/freedesktop/systemd1/unit/{{ billet_service_policy_bus_labels[item] }}"
+      - org.freedesktop.systemd1.Service
+      - ExecStart
+  vars:
+    # systemd's bus object names escape `-` as _2d and `.` as _2e.
+    billet_service_policy_bus_labels:
+      billet-server.service: billet_2dserver_2eservice
+      billet-node.service: billet_2dnode_2eservice
+  loop: "{{ billet_service_policy_pending_units | default([]) }}"
+  register: billet_service_policy_loaded_exec
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: ansible_check_mode
+  become: true
+
+- name: Read the on-disk fragment of Billet units during a dry run
+  ansible.builtin.slurp:
+    src: >-
+      {{ (item.stdout | regex_findall('(?m)^FragmentPath=(.+)$')) | first }}
+  loop: "{{ billet_service_policy_loaded.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item }}"
+  register: billet_service_policy_fragments
+  when:
+    - ansible_check_mode
+    - item.stdout is defined
+    - item.stdout is search('(?m)^FragmentPath=.+$')
+  become: true
+
+# THE MANAGER'S OWN LIST, not one computed here: `Manager.UnitPath` is PID 1's
+# search path as it loaded it, and a path this gate does not know is one whose
+# drop-ins and aliases it cannot promise to have looked at.
+- name: Read the running manager's unit lookup paths during a dry run
+  ansible.builtin.command:
+    argv:
+      - busctl
+      - --json=short
+      - get-property
+      - org.freedesktop.systemd1
+      - /org/freedesktop/systemd1
+      - org.freedesktop.systemd1.Manager
+      - UnitPath
+  register: billet_service_policy_unit_paths
+  changed_when: false
+  failed_when: billet_service_policy_unit_paths.rc != 0
+  check_mode: false
+  when: ansible_check_mode and billet_service_policy_pending_units | default([]) | length > 0
+  become: true
+
+- name: Note the unit lookup paths the manager searches
+  ansible.builtin.set_fact:
+    billet_service_policy_manager_unit_paths: "{{ (billet_service_policy_unit_paths.stdout | from_json).data }}"
+  when: ansible_check_mode and billet_service_policy_pending_units | default([]) | length > 0
+
+- name: Refuse a unit lookup path this dry run does not know
+  ansible.builtin.assert:
+    that:
+      - billet_service_policy_manager_unit_paths | length > 0
+      - billet_service_policy_manager_unit_paths | difference(billet_service_policy_unit_path_allowlist) | length == 0
+    fail_msg: >-
+      the manager searches unit paths this dry run does not know
+      ({{ billet_service_policy_manager_unit_paths | difference(billet_service_policy_unit_path_allowlist) | join(', ') }}),
+      so it cannot promise to have looked at every drop-in and alias a reload
+      would adopt; extend billet_service_policy_unit_path_allowlist deliberately
+      after auditing them.
+  when: ansible_check_mode and billet_service_policy_pending_units | default([]) | length > 0
+
+# AN ALIAS ADDED ON DISK AFTER LOAD is not in `Names` yet, and a drop-in under
+# its `.d` is not in DropInPaths yet, while the next reload adopts both. The
+# module resolves aliases BY UNIT NAME as systemd does (the highest-priority
+# entry per name, masks and linked units set apart, chains followed), which no
+# find over symlinks can.
+- name: Resolve on-disk aliases of the Billet units the way the manager would
+  junioryono.billet.unit_names:
+    unit_path: "{{ billet_service_policy_manager_unit_paths }}"
+    units: "{{ billet_service_policy_pending_units }}"
+  register: billet_service_policy_aliases
+  check_mode: false
+  when: ansible_check_mode and billet_service_policy_pending_units | default([]) | length > 0
+  become: true
+
+- name: Refuse an on-disk alias of a Billet unit during a dry run
+  ansible.builtin.assert:
+    that:
+      - billet_service_policy_aliases.aliases | length == 0
+    fail_msg: >-
+      {% for a in billet_service_policy_aliases.aliases %}{{ a.path }} is an
+      alias of {{ a.target }} on disk ({{ a.chain | join(' -> ') }}){{ '; ' if not loop.last }}{% endfor %}.
+      Drop-ins are searched under alias names too, and an alias added since the
+      last reload is not in the loaded Names yet, so a dry run cannot compare
+      across it; audit it, run systemctl daemon-reload, then retry --check.
+  when: ansible_check_mode and billet_service_policy_pending_units | default([]) | length > 0
+
+# EVERY LOCATION THE MANAGER SEARCHES: `<unit>.d`, every `<alias>.d`, the
+# prefix directory `billet-.service.d` and `service.d`, under every lookup
+# path, because a drop-in can change User= without changing the file set.
+- name: Note every drop-in location the manager searches
+  ansible.builtin.set_fact:
+    billet_service_policy_dropin_locations: >-
+      {%- set out = {} -%}
+      {%- for unit in billet_service_policy_pending_units | default([]) -%}
+        {%- set _ = out.update({unit: (billet_service_policy_manager_unit_paths
+            | product([unit ~ '.d', 'billet-.service.d', 'service.d'])
+            | map('join', '/') | list)
+           + (billet_service_policy_aliases.aliases | default([]) | map(attribute='dropin_dirs') | flatten)}) -%}
+      {%- endfor -%}
+      {{ out }}
+  when: ansible_check_mode
+
+# ABSENCE BY A STAT THAT KEEPS ITS ERROR: find answers "is not a directory" for
+# any failed stat of a location, permission denied included, so absence is
+# established here first, where a failed stat fails the task, and find is
+# given only the directories that exist.
+- name: Stat every drop-in location the manager searches
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: true
+    get_checksum: false
+    get_mime: false
+    get_attributes: false
+  loop: "{{ billet_service_policy_dropin_locations | default({}) | dict2items | map(attribute='value') | flatten | unique }}"
+  register: billet_service_policy_dropin_location_stats
+  check_mode: false
+  when: ansible_check_mode
+  become: true
+
+- name: Look for drop-ins on disk in every location the manager searches
+  ansible.builtin.find:
+    paths: >-
+      {{ billet_service_policy_dropin_locations[item]
+         | select('in', billet_service_policy_dropin_location_stats.results
+                        | selectattr('stat.exists') | selectattr('stat.isdir') | map(attribute='item') | list)
+         | list }}
+    patterns: '*.conf'
+    file_type: any
+  loop: "{{ billet_service_policy_pending_units | default([]) }}"
+  register: billet_service_policy_dropins_on_disk
+  check_mode: false
+  when: ansible_check_mode
+  become: true
+
+# THE GRAMMAR IS THE ROLE'S OWN TEMPLATES': exactly one User=, one Group=, one
+# Type= and one ExecStart= line, the ExecStart value words of plain characters
+# separated by single spaces, with no execution prefix, no specifier, no quote,
+# backslash or $, and no tab or other whitespace (systemd splits an unquoted
+# tab, `split(' ')` would not). The words are compared as an ARRAY with the
+# one loaded record's argv, and the record's path with the first word.
+- name: Compare the on-disk Billet unit policy with what the manager loaded
+  ansible.builtin.set_fact:
+    billet_service_policy_comparison: >-
+      {%- set out = [] -%}
+      {%- for unit in billet_service_policy_pending_units | default([]) -%}
+        {%- set loaded = billet_service_policy_loaded.results | selectattr('item', 'equalto', unit) | first -%}
+        {%- set frag = billet_service_policy_fragments.results | selectattr('item.item', 'equalto', unit) | first -%}
+        {%- set exec = billet_service_policy_loaded_exec.results | selectattr('item', 'equalto', unit) | first -%}
+        {%- set loaded_state = ((loaded.stdout | regex_findall('(?m)^LoadState=(.*)$')) + ['']) | first | trim -%}
+        {%- set loaded_fragment = ((loaded.stdout | regex_findall('(?m)^FragmentPath=(.*)$')) + ['']) | first | trim -%}
+        {%- set winning = (billet_service_policy_aliases.entries | default({}))[unit] | default({}) -%}
+        {#- Every location find was given exists and is a directory (the stat
+            above established that, failing the run on any other error), so
+            anything find could not walk is a failed examination, and a location
+            whose drop-ins are unknown is not an empty one, whether or not the
+            unit has a fragment. -#}
+        {%- set on_disk = billet_service_policy_dropins_on_disk.results | selectattr('item', 'equalto', unit) | first -%}
+        {%- set bad_skips = (on_disk.skipped_paths | default({})) | dict2items | map(attribute='key') | list -%}
+        {%- if frag.skipped | default(false) -%}
+          {#- ABSENCE IS A POSITIVE ANSWER OR NOTHING: no FragmentPath with
+              LoadState=not-found is a unit the manager does not know, which has
+              nothing loaded to compare; no FragmentPath with any other state is
+              a read this dry run cannot account for. -#}
+          {%- if loaded_state == 'not-found' and winning | length == 0 and bad_skips | length == 0 -%}
+            {%- set _ = out.append({'unit': unit, 'ok': true, 'absent': true, 'why': 'no fragment on disk, nothing loaded to compare (LoadState=not-found)'}) -%}
+          {%- elif bad_skips | length > 0 -%}
+            {%- set _ = out.append({'unit': unit, 'ok': false, 'why': 'drop-in locations could not be examined (' ~ (bad_skips | join(', ')) ~ '), so their absence is not established'}) -%}
+          {%- elif loaded_state == 'not-found' -%}
+            {%- set _ = out.append({'unit': unit, 'ok': false, 'why': 'the manager knows no unit (LoadState=not-found) but ' ~ winning.path ~ ' is on disk in a lookup path, and the next reload would load it'}) -%}
+          {%- else -%}
+            {%- set _ = out.append({'unit': unit, 'ok': false, 'why': 'no fragment path was reported while LoadState=' ~ (loaded_state or 'empty') ~ ', which is not a positive absence'}) -%}
+          {%- endif -%}
+        {%- else -%}
+          {%- set text = frag.content | b64decode -%}
+          {#- THE FRAGMENT IS READ AS SYSTEMD READS IT, not as text: an assignment
+              counts only inside [Service] (User= under [Unit] is a warning and no
+              user), a line ending in a backslash continues into the next (which
+              would swallow a matching-looking assignment), and an indented line,
+              a carriage return or a line that is not an assignment is outside the
+              grammar the role's templates write. Each of those refuses. -#}
+          {%- set ns = namespace(section='', bad=[], user=[], group=[], type=[], exec=[]) -%}
+          {%- if '\r' in text -%}{%- set _ = ns.bad.append('a carriage return') -%}{%- endif -%}
+          {%- for line in text.split('\n') -%}
+            {%- if line.endswith('\\') -%}
+              {%- set _ = ns.bad.append('a continued line [' ~ line ~ ']') -%}
+            {%- elif line | trim | length == 0 or line[0] in '#;' -%}
+            {%- elif line[0] == '[' -%}
+              {#- A header outside the grammar this dry run reads is could-not-tell
+                  (a genuinely malformed one is a parse error systemd stops at), and
+                  so is a section this dry run does not know, since an assignment
+                  in it could stop the parser before the compared directives. -#}
+              {%- if line is not match('^\[[A-Za-z0-9_.-]+\]$') -%}
+                {%- set _ = ns.bad.append('not a section header this dry run can read [' ~ line ~ ']') -%}
+                {%- set ns.section = '' -%}
+              {%- elif line not in billet_service_policy_known_directives -%}
+                {%- set _ = ns.bad.append('a section this dry run does not know [' ~ line ~ ']') -%}
+                {%- set ns.section = '' -%}
+              {%- else -%}
+                {%- set ns.section = line -%}
+              {%- endif -%}
+            {%- elif line[0] in ' \t' -%}
+              {%- set _ = ns.bad.append('an indented line [' ~ line ~ ']') -%}
+            {%- elif '=' not in line -%}
+              {%- set _ = ns.bad.append('a line that is not an assignment [' ~ line ~ ']') -%}
+            {%- else -%}
+              {%- set key = line.split('=', 1)[0] -%}
+              {%- set val = line.split('=', 1)[1] -%}
+              {#- systemd strips whitespace around `=`; the templates write none,
+                  so a spelling with any is outside the grammar rather than
+                  normalised, and never silently ignored as another key. -#}
+              {%- if (key | trim) in ['User', 'Group', 'Type', 'ExecStart'] and (key != key | trim or val != val | trim) -%}
+                {%- set _ = ns.bad.append('whitespace around = in [' ~ line ~ ']') -%}
+              {%- elif key in ['User', 'Group', 'Type', 'ExecStart'] and ns.section != '[Service]' -%}
+                {%- set _ = ns.bad.append(key ~ '= outside [Service] (in ' ~ (ns.section or 'no section') ~ ')') -%}
+              {%- elif ns.section == '' -%}
+                {%- set _ = ns.bad.append('an assignment outside any section this dry run knows [' ~ line ~ ']') -%}
+              {%- elif key not in billet_service_policy_known_directives[ns.section] -%}
+                {#- EVERY ASSIGNMENT IS HELD TO THE DIRECTIVES THE SHIPPED POLICY
+                    WRITES: a directive this dry run does not know is not ignored,
+                    because its value can stop systemd's parser before the compared
+                    directives (ExecStartPre=/ fails the load with ENOEXEC) and an
+                    agreement read past it would be over a unit systemd never
+                    finished reading. -#}
+                {%- set _ = ns.bad.append('a directive this dry run does not know (' ~ key ~ ' in ' ~ ns.section ~ '), whose value could stop the parser before the compared directives') -%}
+              {%- elif key == 'User' -%}{%- set _ = ns.user.append(val) -%}
+              {%- elif key == 'Group' -%}{%- set _ = ns.group.append(val) -%}
+              {%- elif key == 'Type' -%}{%- set _ = ns.type.append(val) -%}
+              {%- elif key == 'ExecStart' -%}{%- set _ = ns.exec.append(val) -%}
+              {%- endif -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {%- set disk_user = ns.user -%}
+          {%- set disk_group = ns.group -%}
+          {%- set disk_type = ns.type -%}
+          {%- set disk_exec = ns.exec -%}
+          {%- set loaded_user = ((loaded.stdout | regex_findall('(?m)^User=(.*)$')) + ['']) | first -%}
+          {%- set loaded_group = ((loaded.stdout | regex_findall('(?m)^Group=(.*)$')) + ['']) | first -%}
+          {%- set loaded_type = ((loaded.stdout | regex_findall('(?m)^Type=(.*)$')) + ['']) | first -%}
+          {%- set loaded_dropins = ((loaded.stdout | regex_findall('(?m)^DropInPaths=(.*)$')) + ['']) | first -%}
+          {%- set names = (((loaded.stdout | regex_findall('(?m)^Names=(.*)$')) + ['']) | first) | trim | split(' ') | select | list -%}
+          {%- set records = (exec.stdout | from_json).data if exec.rc == 0 else [] -%}
+          {%- set loaded_path = records[0][0] if records | length == 1 else '' -%}
+          {%- set loaded_argv = records[0][1] if records | length == 1 else [] -%}
+          {%- set why = [] -%}
+          {#- THE FRAGMENT COMPARED IS THE ONE THE NEXT RELOAD WOULD LOAD: the
+              manager's source-name map (unit_names) names the winning entry per
+              unit name, and a higher-priority fragment, a mask or an alias that
+              has appeared since the load is what a reload adopts, not the file
+              FragmentPath still points at. -#}
+          {%- if winning | length == 0 -%}
+            {%- set _ = why.append('no entry for the unit was found in any lookup path, while the manager loaded ' ~ loaded_fragment) -%}
+          {%- elif winning.kind != 'fragment' -%}
+            {%- set _ = why.append('the next reload would find ' ~ winning.path ~ ' (' ~ winning.kind ~ ') for the unit name, not the loaded fragment ' ~ loaded_fragment) -%}
+          {%- elif winning.path != loaded_fragment -%}
+            {%- set _ = why.append('the next reload would load ' ~ winning.path ~ ', a higher-priority fragment, while the manager loaded ' ~ loaded_fragment) -%}
+          {%- endif -%}
+          {%- if bad_skips | length > 0 -%}
+            {%- set _ = why.append('drop-in locations could not be examined (' ~ (bad_skips | join(', ')) ~ '), so their absence is not established') -%}
+          {%- endif -%}
+          {%- for b in ns.bad -%}
+            {%- set _ = why.append('the fragment is outside the grammar this dry run compares: ' ~ b) -%}
+          {%- endfor -%}
+          {%- if names != [unit] -%}
+            {%- set _ = why.append('the unit is loaded under other names too (' ~ (names | join(' ')) ~ '), and drop-ins are searched under aliases') -%}
+          {%- endif -%}
+          {%- if loaded_dropins | trim | length > 0 -%}
+            {%- set _ = why.append('drop-ins are loaded (' ~ loaded_dropins ~ '), and a drop-in can change any of these without changing the fragment') -%}
+          {%- endif -%}
+          {%- if (on_disk.files | default([])) | length > 0 -%}
+            {%- set _ = why.append('drop-ins are on disk (' ~ (on_disk.files | map(attribute='path') | join(', ')) ~ ') in a location the manager searches, and an unreloaded one is not in DropInPaths yet') -%}
+          {%- endif -%}
+          {%- if disk_user | length != 1 or disk_user[0] != loaded_user -%}
+            {%- set _ = why.append('User on disk [' ~ (disk_user | join(', ')) ~ '] vs loaded [' ~ loaded_user ~ ']') -%}
+          {%- endif -%}
+          {%- if disk_group | length != 1 or disk_group[0] != loaded_group -%}
+            {%- set _ = why.append('Group on disk [' ~ (disk_group | join(', ')) ~ '] vs loaded [' ~ loaded_group ~ ']') -%}
+          {%- endif -%}
+          {%- if disk_type | length != 1 or disk_type[0] != loaded_type -%}
+            {%- set _ = why.append('Type on disk [' ~ (disk_type | join(', ')) ~ '] vs loaded [' ~ loaded_type ~ ']') -%}
+          {%- endif -%}
+          {%- if records | length != 1 -%}
+            {%- set _ = why.append('the loaded ExecStart could not be read as exactly one record (' ~ (records | length) ~ ' read' ~ ('' if exec.rc == 0 else ', busctl failed') ~ ')') -%}
+          {%- elif disk_exec | length != 1 or disk_exec[0] is not match('^[A-Za-z0-9_./:=,+@-]+( [A-Za-z0-9_./:=,+@-]+)*$') or disk_exec[0][0] in '-@:+!' -%}
+            {%- set _ = why.append('the on-disk ExecStart is not one line this dry run can compare (words of plain characters separated by single spaces: no execution prefix, no specifier, no quote, backslash or $, no tab): [' ~ (disk_exec | join(' | ')) ~ ']') -%}
+          {%- elif (disk_exec[0] | split(' ')) != loaded_argv or (disk_exec[0] | split(' '))[0] != loaded_path -%}
+            {%- set _ = why.append('ExecStart on disk [' ~ disk_exec[0] ~ '] vs loaded [' ~ (loaded_argv | join(' ')) ~ '] with record path [' ~ loaded_path ~ '], compared word by word') -%}
+          {%- endif -%}
+          {%- set _ = out.append({'unit': unit, 'ok': why | length == 0, 'why': why | join('; ')}) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ out }}
+  when: ansible_check_mode
+
+- name: Refuse a dry run against stale Billet service policy
+  ansible.builtin.assert:
+    that:
+      - item.ok | bool
+    fail_msg: >-
+      {{ item.unit }}: systemd reports a pending daemon-reload and the unit
+      file on disk disagrees with what the manager loaded, or cannot be
+      compared ({{ item.why }}). The property has two causes, this unit's own
+      file changed since load and the manager-wide flag any enable sets, and a
+      comparison this small cannot tell which. A dry run will not reload the
+      live manager, and its inspection of the installed service reads the
+      loaded state: audit the pending unit changes, run systemctl
+      daemon-reload, then retry --check.
+  loop: "{{ billet_service_policy_comparison | default([]) }}"
+  loop_control:
+    label: "{{ item.unit }}"
+  when: ansible_check_mode
+
+- name: Report a pending daemon-reload the dry run could compare across
+  ansible.builtin.debug:
+    msg: >-
+      {% if item.absent | default(false) %}{{ item.unit }}: systemd reports a
+      pending daemon-reload for a unit it does not know (LoadState=not-found)
+      and no lookup path holds a file for; there is nothing to compare and the
+      run continues.{% else %}{{ item.unit }}: systemd reports a pending
+      daemon-reload, and the unit file the next reload would load agrees with
+      what the manager loaded on every fact this dry run reads (User, Group,
+      Type, ExecStart; no drop-in, no alias), so the run continues.{% endif %}
+      On systemd 255 the property is also set for every unit by any enable,
+      disable, preset or mask that changed something (a snap refresh, a
+      package install) until the next daemon-reload; a real converge reloads
+      before it inspects and again after its own enables.
+  loop: "{{ billet_service_policy_comparison | default([]) }}"
+  loop_control:
+    label: "{{ item.unit }}"
+  when: ansible_check_mode

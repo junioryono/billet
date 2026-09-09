@@ -371,6 +371,10 @@ firecracker-example-check: ## Prove the role accepts a firecracker emission, up 
 fetch-retry-check: ## Prove every network fetch in both roles is bounded and retried
 	ansible_collections/junioryono/billet/tests/fetch-retry-check.sh
 
+.PHONY: dryrun-policy-check
+dryrun-policy-check: ## Prove the host role's dry run compares across a pending daemon-reload and refuses only billet-owned policy that disagrees
+	ansible_collections/junioryono/billet/tests/dryrun-policy-check.sh
+
 .PHONY: hybrid-emission-check
 hybrid-emission-check: ## Prove the inventory and playbook `billet init hybrid` writes are ones Ansible reads
 	ansible_collections/junioryono/billet/tests/hybrid-emission-check.sh

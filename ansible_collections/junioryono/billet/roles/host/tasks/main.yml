@@ -534,3 +534,11 @@
 
 - name: Configure billet services
   ansible.builtin.import_tasks: services.yml
+
+# THE ROLE RELOADED THE MANAGER WHEN IT STARTED (account.yml); every enable,
+# disable or mask of this run notifies the closing reload (handlers/main.yml),
+# and flushing here, rather than at the end of the play, is what makes "a
+# converge ends with the reload its own operations left pending" true of the
+# role and not of whatever follows it in a play.
+- name: Apply the reload the role's own unit-file changes left pending
+  ansible.builtin.meta: flush_handlers

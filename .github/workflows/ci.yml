@@ -354,6 +354,14 @@ jobs:
       - name: Prove every fetch is bounded and retried
         run: make fetch-retry-check
 
+      # On systemd 255 the pending-reload flag is set for every unit by any
+      # enable on the host, and the old dry run refused the whole fleet on it.
+      # The gate compares the loaded facts with the fragment instead, resolves
+      # aliases by unit name through a module of this collection, and the role
+      # ends with the reload its own enables left pending.
+      - name: Prove the dry run compares across a pending daemon-reload
+        run: make dryrun-policy-check
+
       # The hybrid generator writes an inventory and a playbook that the Go
       # tests parse with a YAML library. Ansible is what has to read them, and
       # the anchor carrying one tier catalogue to both hosts is the seam a
