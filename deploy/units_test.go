@@ -455,3 +455,43 @@ func TestTheImageRefreshUnitIsAPersistentDailyTimerRunAsRoot(t *testing.T) {
 		}
 	}
 }
+
+// THE NODE DECLARES ITS TWO RUNTIME DIRECTORIES ONCE, IN [Service], AND THE
+// SERVER DECLARES NONE. The registration record lives under
+// billet/registration; a second assignment or a later empty one would reset
+// the list, a placement under [Unit] would be ignored, a RuntimeDirectoryPreserve
+// other than no would keep a record across a restart (the empty directory at a
+// start is what the inspector's currency rule rests on), and a server unit
+// declaring the same directory would re-own and remove the node's record.
+func TestTheNodeUnitDeclaresItsRuntimeDirectoriesAndTheServerDeclaresNone(t *testing.T) {
+	const want = "RuntimeDirectory=billet/locks billet/registration"
+
+	lines := strings.Split(deploy.NodeUnit, "\n")
+	section := ""
+
+	var declared []string
+	var preserve []string
+
+	for _, line := range lines {
+		switch {
+		case strings.HasPrefix(line, "["):
+			section = line
+		case strings.HasPrefix(line, "RuntimeDirectory="):
+			declared = append(declared, section+" "+line)
+		case strings.HasPrefix(line, "RuntimeDirectoryPreserve="):
+			preserve = append(preserve, strings.TrimPrefix(line, "RuntimeDirectoryPreserve="))
+		}
+	}
+
+	if len(declared) != 1 || declared[0] != "[Service] "+want {
+		t.Errorf("%s declares %q, want exactly one %q in [Service]", deploy.NodeUnitName, declared, want)
+	}
+
+	if len(preserve) > 1 || (len(preserve) == 1 && preserve[0] != "no") {
+		t.Errorf("%s sets RuntimeDirectoryPreserve=%v; only an absent or a `no` keeps the directory empty at a start", deploy.NodeUnitName, preserve)
+	}
+
+	if strings.Contains(deploy.ServerUnit, "RuntimeDirectory") {
+		t.Errorf("%s declares a RuntimeDirectory; a server declaring the node's would re-own and remove its record", deploy.ServerUnitName)
+	}
+}

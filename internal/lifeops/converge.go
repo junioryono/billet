@@ -10,6 +10,7 @@ import (
 	"os/user"
 	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -735,8 +736,16 @@ func directoryRefusals(s ServiceFacts, spec unitSpec) []Refusal {
 			continue
 		}
 
-		want := filepath.Join(d.root, d.declared)
-		if filepath.Clean(d.configured) != want {
+		// systemd renders a directory directive as its entries separated by
+		// spaces (the node unit declares its locks and its registration
+		// record); the configured directory must be one of them, whole.
+		var wants []string
+		for _, entry := range strings.Fields(d.declared) {
+			wants = append(wants, filepath.Join(d.root, entry))
+		}
+
+		if !slices.Contains(wants, filepath.Clean(d.configured)) {
+			want := strings.Join(wants, " or ")
 			refusals = append(refusals, Refusal{
 				What: fmt.Sprintf("%s is %s, but %s can only write %s",
 					d.what, d.configured, s.Name, want),

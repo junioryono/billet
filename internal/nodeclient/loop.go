@@ -156,6 +156,15 @@ type LoopOptions struct {
 	// It governs BOTH registration and poll failures, so a caller lengthening it
 	// to calm a flapping link is not left hammering the poll endpoint.
 	Backoff time.Duration
+
+	// RegistrationRecordPath is where the node publishes its registration
+	// record after every successful registration (see record.go), or empty to
+	// publish nothing, which is what a Mac's launch agent passes: no manager
+	// makes a runtime directory there.
+	RegistrationRecordPath string
+	// Now is the clock the record's registered_at is read from. Nil is the
+	// wall clock.
+	Now func() time.Time
 }
 
 // registration is what this node tells the control plane about itself.
@@ -396,6 +405,15 @@ func register(
 			"node", c.node, "provider", opts.Provider, "lease_ttl", c.LeaseTTL(),
 			"protocol", c.WireVersion())
 
+		// PUBLISHED RIGHT HERE, after the acceptance and before recovery: an
+		// accepted registration whose recovery then fails is still a registration
+		// the control plane holds, and the record is evidence of it. A failure to
+		// record is logged on every registration that fails to record and the
+		// node keeps serving, because a node that stopped over evidence of itself
+		// would be worse evidence; the write is tried again at the next
+		// registration and never without one.
+		recordRegistration(c, log, opts)
+
 		// Now that the TTL is known, the janitor can pick a cadence that matches
 		// the deadline the reaper on the other side actually enforces.
 		startJanitor()
@@ -456,6 +474,19 @@ func register(
 		if !sleep(ctx, backoff) {
 			return ctx.Err()
 		}
+	}
+}
+
+// drainServingDone is a test hook the drain's serving worker calls as it
+// returns; nil in production.
+var drainServingDone func()
+
+// recordRegistration publishes the record for an accepted registration, or
+// logs why it could not, with the path and the operation, on every failure.
+func recordRegistration(c *Client, log *slog.Logger, opts LoopOptions) {
+	if err := publishRegistration(c, opts); err != nil {
+		log.Error("could not record this registration; the node keeps serving and tries "+
+			"again at its next registration", "path", opts.RegistrationRecordPath, "error", err)
 	}
 }
 
@@ -585,6 +616,13 @@ func stopGracefully(ctx context.Context, c *Client, compute Compute, log *slog.L
 
 	go func() {
 		defer serving.Done()
+		// A test hook, closed as the worker returns, so a fixture can observe
+		// the worker's completion independently of the shutdown join.
+		defer func() {
+			if drainServingDone != nil {
+				drainServingDone()
+			}
+		}()
 
 		for drainCtx.Err() == nil {
 			err := serve(drainCtx, c, compute, log, opts, true)
@@ -610,11 +648,28 @@ func stopGracefully(ctx context.Context, c *Client, compute Compute, log *slog.L
 					"so it can still be told to destroy what is running here")
 
 				if err := c.Register(drainCtx, opts.registration()); err != nil {
+					// SUPERSEDED BY THE REGISTRATION ITSELF IS STILL SUPERSESSION: the
+					// plane rejecting this registration because another process
+					// holds the name is the same fact a poll answers with, and is
+					// handled the same way, at once, rather than retried into a
+					// second refusal.
+					if errors.Is(err, ErrSuperseded) {
+						log.Warn("another process registered as this node while it was draining; " +
+							"keeping its leases renewed until what is running here finishes")
+						compute.Superseded()
+						superseded.Store(true)
+
+						return
+					}
+
 					log.Error("could not register again while draining", "error", err)
 
 					if !sleep(drainCtx, backoffFor(opts)) {
 						return
 					}
+				} else {
+					// A DRAIN'S RE-REGISTRATION IS A REGISTRATION, and publishes.
+					recordRegistration(c, log, opts)
 				}
 
 				continue

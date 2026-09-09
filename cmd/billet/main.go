@@ -1609,11 +1609,7 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 		tlsConf = identity.ClientTLS(host)
 	}
 
-	client, err := nodeclient.New(nodeclient.Options{
-		Base: cfg.Node.ServerAddr,
-		Node: cfg.Node.Name,
-		TLS:  tlsConf,
-	})
+	client, err := newNodeClientFor(cfg, tlsConf)
 	if err != nil {
 		return err
 	}
@@ -1713,6 +1709,22 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 		DrainTimeout:              drainTimeout,
 		// The second signal, reaching the wait that honours it.
 		Hurry: lc.hurry,
+		// Where the node publishes its registration record after every accepted
+		// registration, for the inspector to read: the one spelling, empty on a
+		// Mac.
+		RegistrationRecordPath: nodeRegistrationRecordPath(hostOS),
+	})
+}
+
+// newNodeClientFor is THE ONE CONSTRUCTION of the node's client from its
+// configuration: the address, the name and the TLS state as the command
+// resolves them, so a fixture that builds the client the way the command does
+// and the command itself cannot disagree about the request base.
+func newNodeClientFor(cfg *config.Config, tlsConf *tls.Config) (*nodeclient.Client, error) {
+	return nodeclient.New(nodeclient.Options{
+		Base: cfg.Node.ServerAddr,
+		Node: cfg.Node.Name,
+		TLS:  tlsConf,
 	})
 }
 

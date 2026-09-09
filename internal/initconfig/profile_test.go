@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 
@@ -114,9 +115,12 @@ func TestGenerateLocalServiceMatchesThePackagedUnits(t *testing.T) {
 		t.Errorf("node.state_dir %q does not match the node unit's StateDirectory (%q)",
 			cfg.Node.StateDir, want)
 	}
-	if want := "/run/" + unitValue(t, nodeUnit, "RuntimeDirectory"); cfg.Node.LockDir != want {
-		t.Errorf("node.lock_dir %q does not match the node unit's RuntimeDirectory (%q)",
-			cfg.Node.LockDir, want)
+	// The node unit declares more than one runtime directory (its locks and
+	// its registration record); the lock directory must be one of them.
+	runtimeDirs := strings.Fields(unitValue(t, nodeUnit, "RuntimeDirectory"))
+	if !slices.Contains(runtimeDirs, strings.TrimPrefix(cfg.Node.LockDir, "/run/")) {
+		t.Errorf("node.lock_dir %q is not one of the node unit's RuntimeDirectory entries (%q)",
+			cfg.Node.LockDir, runtimeDirs)
 	}
 
 	// Both units read the config from the path their ExecStart names — parsed

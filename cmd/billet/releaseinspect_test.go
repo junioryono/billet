@@ -21,6 +21,7 @@ import (
 
 	"github.com/junioryono/billet/internal/hostupgrade"
 	"github.com/junioryono/billet/internal/provenance"
+	"github.com/junioryono/billet/internal/regularfile"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/wirecert"
 )
@@ -2296,6 +2297,32 @@ func TestReleaseInspectJSONFieldSet(t *testing.T) {
 		if err := os.Symlink(claim, filepath.Join(upgradeRoot, "active")); err != nil {
 			t.Fatal(err)
 		}
+		// A CURRENT RECORD, root-owned through the owner seam, so the golden
+		// carries host.registration's six members rather than an unknown.
+		recordDir := filepath.Join(f.dir, "registration")
+		if err := os.Mkdir(recordDir, 0o750); err != nil {
+			t.Fatal(err)
+		}
+		savedPath, savedOpen := registrationRecordPath, registrationOpen
+		t.Cleanup(func() { registrationRecordPath, registrationOpen = savedPath, savedOpen })
+		registrationRecordPath = filepath.Join(recordDir, "current")
+		registrationOpen = func(path string) (*os.File, os.FileInfo, error) {
+			file, info, err := regularfile.Open(path, regularfile.Options{NoFollow: true})
+			if err != nil {
+				return nil, nil, err
+			}
+			st, ok := info.Sys().(*syscall.Stat_t)
+			if !ok {
+				return file, info, nil
+			}
+			asRoot := *st
+			asRoot.Uid = 0
+			return file, ownedInfo{FileInfo: info, sys: &asRoot}, nil
+		}
+		writeFile(t, registrationRecordPath, `{"schema":1,"node":"node-a","deployment":"dep-1234","incarnation":"00112233445566778899aabbccddeeff","invocation_id":"0123456789abcdef0123456789abcdef","endpoint":"https://10.0.0.5:7717","registered_at":"2026-09-09T12:00:00Z"}`+"\n", 0o600)
+		if err := os.Chmod(registrationRecordPath, 0o600); err != nil {
+			t.Fatal(err)
+		}
 		assertFieldSet(t, f.report(t), inspectFieldSetNode)
 	})
 }
@@ -2359,9 +2386,11 @@ host.authority.current.subject
 host.authority.previous
 host.authority.rotation_in_progress
 host.deployment_id
+host.installed_endpoint
 host.node_name
 host.node_trust
 host.os
+host.registration.unknown
 host.retirement
 installed_config.controllers
 installed_config.has_node
@@ -2394,6 +2423,7 @@ services.node.environment_file_changed_since_start
 services.node.environment_files
 services.node.exec_main_start
 services.node.exec_start
+services.node.invocation_id
 services.node.loaded_config.unknown
 services.node.main_pid
 services.node.need_daemon_reload
@@ -2415,6 +2445,7 @@ services.server.environment_file_changed_since_start
 services.server.environment_files
 services.server.exec_main_start
 services.server.exec_start
+services.server.invocation_id
 services.server.loaded_config.unknown
 services.server.main_pid
 services.server.need_daemon_reload
@@ -2620,9 +2651,11 @@ executable.sha256
 executable.version
 host.authority
 host.deployment_id.unknown
+host.installed_endpoint
 host.node_name
 host.node_trust
 host.os
+host.registration.unknown
 host.retirement
 installed_config.controllers
 installed_config.has_node
@@ -2657,6 +2690,7 @@ services.node.environment_file_changed_since_start
 services.node.environment_files
 services.node.exec_main_start
 services.node.exec_start
+services.node.invocation_id
 services.node.loaded_config.unknown
 services.node.main_pid
 services.node.need_daemon_reload
@@ -2680,6 +2714,7 @@ services.server.environment_file_changed_since_start
 services.server.environment_files
 services.server.exec_main_start
 services.server.exec_start
+services.server.invocation_id
 services.server.loaded_config.unknown
 services.server.main_pid
 services.server.need_daemon_reload
@@ -2726,6 +2761,7 @@ executable.sha256
 executable.version
 host.authority
 host.deployment_id
+host.installed_endpoint
 host.node_name
 host.node_trust.cas
 host.node_trust.leaf.der_sha256
@@ -2733,6 +2769,12 @@ host.node_trust.leaf.not_after
 host.node_trust.leaf.pem
 host.node_trust.leaf.subject
 host.os
+host.registration.deployment
+host.registration.endpoint
+host.registration.incarnation
+host.registration.invocation_id
+host.registration.node
+host.registration.registered_at
 host.retirement.phase
 installed_config.controllers
 installed_config.has_node
@@ -2765,6 +2807,7 @@ services.node.environment_file_changed_since_start
 services.node.environment_files
 services.node.exec_main_start
 services.node.exec_start
+services.node.invocation_id
 services.node.loaded_config.unknown
 services.node.main_pid
 services.node.need_daemon_reload
@@ -2786,6 +2829,7 @@ services.server.environment_file_changed_since_start
 services.server.environment_files
 services.server.exec_main_start
 services.server.exec_start
+services.server.invocation_id
 services.server.loaded_config.unknown
 services.server.main_pid
 services.server.need_daemon_reload

@@ -93,6 +93,10 @@ var (
 	// inspectBetweenClosingChecks runs between the closing check of the
 	// descriptor and the closing stat of the name.
 	inspectBetweenClosingChecks func()
+	// inspectAfterRecordRead runs after the node's registration record was
+	// read inside a sample and before the confirming identity read, so a
+	// fixture can move the unit there.
+	inspectAfterRecordRead func()
 	// inspectAfterViewOpen runs after a process's view of a path has been
 	// opened, for identity or for reading, so a test can prove an unsupported
 	// command line's operand is never opened at all.
@@ -172,6 +176,7 @@ type inspectService struct {
 	ActiveState      maybe  `json:"active_state"`
 	SubState         maybe  `json:"sub_state"`
 	MainPID          maybe  `json:"main_pid"`
+	InvocationID     maybe  `json:"invocation_id"`
 	ExecMainStart    maybe  `json:"exec_main_start"`
 	ExecStart        maybe  `json:"exec_start"`
 	EnvironmentFiles maybe  `json:"environment_files"`
@@ -193,6 +198,9 @@ type inspectService struct {
 	// hasMainPID says a scheduled unit is the service, whose main pid is
 	// reported; a timer has none.
 	hasMainPID bool
+	// registration is the node's registration record as its sample read it,
+	// or why not; host.registration is judged from it after the services.
+	registration registrationEvidence
 
 	RunningSHA256                  maybe `json:"running_sha256"`
 	SameAsExecutable               maybe `json:"same_as_executable"`
@@ -325,6 +333,11 @@ type inspectHost struct {
 	Retirement   maybe  `json:"retirement"`
 	Authority    maybe  `json:"authority"`
 	NodeTrust    maybe  `json:"node_trust"`
+	// Registration is the node's registration record when it is usable
+	// evidence (releaseinspectregistration.go), and InstalledEndpoint the
+	// installed configuration's node endpoint as the one representation.
+	Registration      maybe `json:"registration"`
+	InstalledEndpoint maybe `json:"installed_endpoint"`
 }
 
 type inspectCertificate struct {
@@ -468,6 +481,8 @@ func inspectHostRelease(ctx context.Context, configPath string) inspectReport {
 	report.ConfigBinding = binding
 	report.Installed = inspectInstalledSection(cfg, configPath, report.Config, digest)
 	report.Host = inspectHostSection(cfg)
+	report.Host.Registration = hostRegistration(report.Services["node"], cfg)
+	report.Host.InstalledEndpoint = installedEndpoint(cfg, report.Config.Readable)
 	report.Transaction = inspectTransactionSection()
 	if inspectBeforeClose != nil {
 		inspectBeforeClose()
@@ -1005,6 +1020,7 @@ func inspectServiceSection(ctx context.Context, role, unit string, cfg *config.C
 	}
 	active := firstProp(props, "ActiveState")
 	pid, pidErr := strconv.Atoi(firstProp(props, "MainPID"))
+	svc.InvocationID = invocationOf(props)
 	if firstProp(props, "LoadState") == "not-found" {
 		// THE FRAGMENT IS GONE; THE RUNTIME FACTS ARE NOT DISCARDED WITH IT: a
 		// unit whose file was removed while its service runs still runs.
@@ -1121,9 +1137,20 @@ func inspectServiceSection(ctx context.Context, role, unit string, cfg *config.C
 	return svc, weaker(binding, processBinding)
 }
 
+// invocationOf is systemd's InvocationID for a unit: null when systemd
+// answered empty (a unit that is not running has none), the value otherwise.
+func invocationOf(props map[string][]string) maybe {
+	if v := firstProp(props, "InvocationID"); v != "" {
+		return known(v)
+	}
+	return known(nil)
+}
+
 // serviceAllUnknown is a unit nothing could be asked about.
 func serviceAllUnknown(svc inspectService, why string) inspectService {
 	svc.UnitPresent = unknown(why)
+	svc.InvocationID = unknown(why)
+	svc.registration = registrationEvidence{why: why}
 	svc.UnitFileState, svc.Enabled = unknown(why), unknown(why)
 	svc.ActiveState, svc.SubState, svc.MainPID = unknown(why), unknown(why), unknown(why)
 	svc.ExecMainStart, svc.ExecStart, svc.Shape, svc.EnvironmentFiles = unknown(why), unknown(why), unknown(why), unknown(why)
@@ -1162,6 +1189,10 @@ type processSample struct {
 	view    os.FileInfo
 	viewSHA string
 	viewErr string
+	// registration is the node's record read INSIDE the sample, between the
+	// identity reads, so it is never reported beside evidence of another
+	// incarnation.
+	registration registrationEvidence
 }
 
 // unitIdentity is what must not move across a sample: which process systemd
@@ -1256,6 +1287,20 @@ func sampleProcess(ctx context.Context, unit, role string, pid int, first map[st
 		default:
 			view, viewSHA, viewErr = hashThroughRoot(dir, args[3])
 		}
+		// THE REGISTRATION RECORD IS READ HERE, inside the sample and only for
+		// the node: a record beside process evidence of another incarnation is
+		// discarded with that evidence.
+		registration := registrationEvidence{why: "this unit publishes no registration record"}
+		if role == "node" {
+			if registrationRecordPath == "" {
+				registration = registrationEvidence{why: "no runtime record on this platform"}
+			} else {
+				registration = readRegistrationRecord(registrationRecordPath)
+			}
+		}
+		if inspectAfterRecordRead != nil {
+			inspectAfterRecordRead()
+		}
 		again, err := unitProperties(ctx, unit)
 		if err != nil {
 			return processSample{}, err
@@ -1277,7 +1322,7 @@ func sampleProcess(ctx context.Context, unit, role string, pid int, first map[st
 		if before != after {
 			continue
 		}
-		return processSample{sha: sum, startTicks: before, cmdline: args, environ: environ, view: view, viewSHA: viewSHA, viewErr: viewErr}, nil
+		return processSample{sha: sum, startTicks: before, cmdline: args, environ: environ, view: view, viewSHA: viewSHA, viewErr: viewErr, registration: registration}, nil
 	}
 	return processSample{}, errors.New("the service restarted during the observation, or its unit changed under it")
 }
@@ -1375,8 +1420,10 @@ func inspectRunningProcess(ctx context.Context, svc *inspectService, role, unit 
 	if err != nil {
 		fillRunningUnknown(svc, err.Error())
 		svc.DSNEnv = unknown(err.Error())
+		svc.registration = registrationEvidence{why: err.Error()}
 		return unknown(err.Error())
 	}
+	svc.registration = sample.registration
 	svc.RunningSHA256 = known(sample.sha)
 	if exeSHA == "" || exeInfo == nil {
 		svc.SameAsExecutable = unknown("the executable could not be hashed")

@@ -21,13 +21,13 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/endpoint"
 	"github.com/junioryono/billet/internal/node"
 	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/provenance"
@@ -74,7 +74,10 @@ var ErrSuperseded = errors.New("nodeclient: another process is registered as thi
 // Client talks to a control plane.
 type Client struct {
 	base string
-	node string
+	// endpoint is the request base as the one representation, derived from
+	// base at construction and fixed for the client's life.
+	endpoint endpoint.Endpoint
+	node     string
 	// installedDigest is the release manifest that produced this binary, proved
 	// against the bytes running, or empty when nothing on this machine can say.
 	//
@@ -167,8 +170,17 @@ func New(opts Options) (*Client, error) {
 		return nil, err
 	}
 
+	// THE ACCESSOR IS DERIVED FROM THE BASE, so the endpoint the record names and
+	// the request base every call is built from cannot diverge: one is the
+	// other's canonical text, read back.
+	ep, err := endpoint.ParseCanonical(base)
+	if err != nil {
+		return nil, fmt.Errorf("nodeclient: the request base %q is not an endpoint's canonical text: %w", base, err)
+	}
+
 	c := &Client{
 		base:        base,
+		endpoint:    ep,
 		node:        opts.Node,
 		incarnation: incarnation,
 		http:        opts.HTTP,
@@ -228,50 +240,25 @@ func New(opts Options) (*Client, error) {
 // command could not make one call. Every test dialled an httptest server, whose
 // URL already carries a scheme, so the whole suite was green.
 func normaliseBase(raw string, secure bool) (string, error) {
-	raw = strings.TrimSuffix(raw, "/")
-
-	scheme := "http"
-	if secure {
-		scheme = "https"
-	}
-
-	if !strings.Contains(raw, "://") {
-		raw = scheme + "://" + raw
-	}
-
-	u, err := url.Parse(raw)
+	e, err := endpoint.Parse(raw, secure)
 	if err != nil {
-		return "", fmt.Errorf("nodeclient: control plane address %q: %w", raw, err)
+		return "", fmt.Errorf("nodeclient: control plane address: %w", err)
 	}
 
-	if u.Host == "" {
-		return "", fmt.Errorf(
-			"nodeclient: control plane address %q names no host", raw)
-	}
+	return e.String(), nil
+}
 
-	switch u.Scheme {
-	case "http":
-		// A CERTIFICATE THAT WOULD NEVER BE PRESENTED IS A CONFIGURATION ERROR, not
-		// a fallback. The handshake would fail anyway against a plane that requires
-		// one; refusing here says why, instead of leaving an operator reading TLS
-		// errors from a node they believed was configured for TLS.
-		if secure {
-			return "", fmt.Errorf(
-				"nodeclient: control plane address %q is http, but this node has a certificate "+
-					"to present; drop the scheme or write https", raw)
-		}
-	case "https":
-		if !secure {
-			return "", fmt.Errorf(
-				"nodeclient: control plane address %q is https, but this node has no certificate "+
-					"to present, so the control plane will reject the handshake", raw)
-		}
-	default:
-		return "", fmt.Errorf(
-			"nodeclient: control plane address %q must be http or https", raw)
-	}
+// Endpoint is the control-plane endpoint this client dials: the request base
+// it was built with, as the one representation. It is the process's request
+// base and not an observed peer, so name resolution, translation and redirects
+// are outside what it says.
+func (c *Client) Endpoint() endpoint.Endpoint { return c.endpoint }
 
-	return u.Scheme + "://" + u.Host + strings.TrimSuffix(u.Path, "/"), nil
+// ReplaceTransportForTest installs a transport on a built client and changes
+// nothing else, so a fixture can observe the requests a production-built
+// client sends without building its own.
+func ReplaceTransportForTest(c *Client, rt http.RoundTripper) {
+	c.http = &http.Client{Transport: rt, Timeout: c.http.Timeout}
 }
 
 // BaseForTest reports the URL requests are built from.
