@@ -12,9 +12,9 @@ import (
 	"io"
 	"os"
 	"runtime"
-	"syscall"
 
 	"github.com/junioryono/billet/internal/provenance"
+	"github.com/junioryono/billet/internal/regularfile"
 	"github.com/junioryono/billet/internal/releasesource"
 )
 
@@ -26,7 +26,7 @@ import (
 // is refused outright: a FIFO named as a manifest never ends, and this command
 // runs at the end of an install where hanging is indistinguishable from working.
 func readBounded(path string, limit int) ([]byte, error) {
-	f, _, err := openRegular(path)
+	f, _, err := openRegular(path, false)
 	if err != nil {
 		return nil, err
 	}
@@ -46,39 +46,16 @@ func readBounded(path string, limit int) ([]byte, error) {
 }
 
 // openRegular opens a file that cannot make this command wait, and reports its
-// size.
-//
-// O_NONBLOCK IS WHAT MAKES THE CHECK A CHECK. Opening a FIFO read-only BLOCKS
-// until somebody writes to it, so stat-then-open leaves the hang in front of the
-// guard and open-then-stat never reaches it — an earlier version did the latter
-// and its comment claimed a FIFO was refused. With O_NONBLOCK the open returns
-// immediately whatever the path is, and the fstat below then refuses anything
-// that is not an ordinary file. It is harmless on a regular file, which is the
-// only thing this goes on to read.
-//
-// FSTAT ON THE DESCRIPTOR, NOT STAT ON THE PATH, so what is refused and what is
-// read are the same object. A stat of the name answers about whatever the name
-// meant at that instant.
-func openRegular(path string) (*os.File, int64, error) {
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+// size: regularfile.Open, the one implementation of the identity-first open with
+// the regular-file rule (a FIFO returns at once, a device is never opened for
+// reading on Linux, and what is fstat'ed is what is read). noFollow refuses a
+// symlink at the last component, which the upgrade transaction's lock file
+// requires.
+func openRegular(path string, noFollow bool) (*os.File, int64, error) {
+	f, info, err := regularfile.Open(path, regularfile.Options{NoFollow: noFollow})
 	if err != nil {
-		return nil, 0, fmt.Errorf("open %s: %w", path, err)
+		return nil, 0, err
 	}
-
-	info, err := f.Stat()
-	if err != nil {
-		_ = f.Close()
-
-		return nil, 0, fmt.Errorf("stat %s: %w", path, err)
-	}
-
-	if !info.Mode().IsRegular() {
-		_ = f.Close()
-
-		return nil, 0, fmt.Errorf("%s is not a regular file, so billet will not read it "+
-			"as one", path)
-	}
-
 	return f, info.Size(), nil
 }
 
@@ -518,7 +495,7 @@ func cmdReleaseRecord(_ context.Context, args []string) error {
 	// on its own — a rename is closed, but another writer can still modify the same
 	// inode between the passes — so there is only ONE pass, and the archive's hash
 	// comes out of the same read that finds its member.
-	archive, archiveSize, err := openRegular(*archivePath)
+	archive, archiveSize, err := openRegular(*archivePath, false)
 	if err != nil {
 		return err
 	}
@@ -543,7 +520,7 @@ func cmdReleaseRecord(_ context.Context, args []string) error {
 
 	// THE SAME TREATMENT AS THE ARCHIVE: opened once, refused if it is not an
 	// ordinary file, and hashed from that descriptor.
-	binaryFile, binarySize, err := openRegular(*binaryPath)
+	binaryFile, binarySize, err := openRegular(*binaryPath, false)
 	if err != nil {
 		return err
 	}

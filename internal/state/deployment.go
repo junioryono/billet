@@ -3,12 +3,15 @@ package state
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/junioryono/billet/internal/deploymentid"
+	"github.com/junioryono/billet/internal/regularfile"
 )
 
 // deploymentIDFile holds the identity of one billet installation.
@@ -17,6 +20,10 @@ import (
 // readable by things that have not opened the database and must survive the
 // database being rebuilt. Its lifetime is the state directory's.
 const deploymentIDFile = "deployment-id"
+
+// maxDeploymentIDBytes bounds a peek: an identity is a few dozen bytes, and a
+// file longer than this is not one billet wrote.
+const maxDeploymentIDBytes = 4096
 
 // recoverIdentityAdvice is what an operator is told when the identity is gone or
 // unusable. One string, used by every branch that can say it.
@@ -159,9 +166,11 @@ func AdoptDeploymentID(stateDir, id string) (string, error) {
 func PeekDeploymentID(stateDir string) (string, bool, error) {
 	path := filepath.Join(stateDir, deploymentIDFile)
 
-	raw, err := os.ReadFile(path)
+	// For identity first, then only a regular file: a FIFO at the name would
+	// block a plain read, and a read-only inspector peeks this on every host.
+	raw, err := regularfile.ReadFile(path, maxDeploymentIDBytes, regularfile.Options{})
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, fs.ErrNotExist) {
 			return "", false, nil
 		}
 
