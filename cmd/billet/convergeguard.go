@@ -414,11 +414,12 @@ func writeGuardRecordAt(dir *os.File, record guardRecord, replace bool) error {
 
 // openGuardTmpAt opens the temporary the record is written through, relative
 // to the guard directory: created exclusively for a fresh guard; for a retried
-// takeover, created or opened WITHOUT truncation, O_NOFOLLOW (a symlink at the
-// name is ELOOP) and O_NONBLOCK (a FIFO with no reader is ENXIO rather than a
-// wait), judged on the descriptor (a regular file the trust boundary accepts;
-// a FIFO that had a reader, a loose mode or another owner refuses) and only
-// then truncated through it.
+// takeover that meets an existing one, that one is examined through an
+// identity descriptor (never opened for writing), judged on it (a regular
+// file the trust boundary accepts with exactly one link; a FIFO, a link, a
+// loose mode, another owner or a second name refuses), removed by its name
+// relative to the directory, and a fresh one is created exclusively in its
+// place. No inode is ever truncated.
 func openGuardTmpAt(dir *os.File, replace bool) (*os.File, error) {
 	tmp := filepath.Join(dir.Name(), guardTmpName)
 

@@ -705,6 +705,10 @@ var (
 	checkBinaryDir = checkBinaryDirWritable
 	resolveRelease = resolveTarget
 	timerBarrier   func(step string)
+	// resumeBarrier is where a resume has passed every refusal and is about to
+	// act on the journal it read; a fixture that must prove a refusal happened
+	// before any action observes it here and stops the resume with an error.
+	resumeBarrier func() error
 )
 
 // refuseClaimed gives back a claim whose transaction was refused before it was
@@ -1042,6 +1046,12 @@ func resumeHostUpgrade(ctx context.Context, cfg *config.Config) error {
 
 	fmt.Printf("Resuming the upgrade %s -> %s, which reached %s.\n",
 		journal.FromVersion, journal.ToVersion, journal.Step)
+
+	if resumeBarrier != nil {
+		if err := resumeBarrier(); err != nil {
+			return err
+		}
+	}
 
 	if done, err := settleResumedDecision(tx.dir, journal); err != nil || done {
 		return err

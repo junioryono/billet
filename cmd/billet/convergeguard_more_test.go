@@ -1115,6 +1115,7 @@ func TestAJournalIsNeverReadThroughADisplacedRoot(t *testing.T) {
 
 	t.Run("resume", func(t *testing.T) {
 		f := newGuardedFixture(t)
+		continued := observeResumeContinuation(t)
 		mustOK(t, os.Mkdir(f.root, 0o700))
 
 		// The retained root's claim points at a recovery directory with NO
@@ -1156,8 +1157,8 @@ func TestAJournalIsNeverReadThroughADisplacedRoot(t *testing.T) {
 			t.Errorf("the outside claim was removed: %v", err)
 		}
 
-		if len(f.reached) != 0 {
-			t.Errorf("the resume reached %v", f.reached)
+		if continued() {
+			t.Error("the resume continued past the journal read")
 		}
 	})
 
@@ -1289,6 +1290,7 @@ func TestAClaimTargetIsExactlyOneChildOfTheRootByItsText(t *testing.T) {
 	for _, spelling := range []string{"/hop/../recovery-x", "/./recovery-x", "/recovery-x/", "//recovery-x", "/..", "/recovery-x/.."} {
 		t.Run(spelling, func(t *testing.T) {
 			f := newGuardedFixture(t)
+			continued := observeResumeContinuation(t)
 			mustOK(t, os.Mkdir(f.root, 0o700))
 
 			outside := filepath.Join(t.TempDir(), "outside")
@@ -1318,8 +1320,8 @@ func TestAClaimTargetIsExactlyOneChildOfTheRootByItsText(t *testing.T) {
 				t.Errorf("the outside tree was touched: %v", err)
 			}
 
-			if len(f.reached) != 0 {
-				t.Errorf("the refused resume reached %v", f.reached)
+			if continued() {
+				t.Error("the refused resume continued into the transaction")
 			}
 		})
 	}
@@ -1421,6 +1423,7 @@ func TestARecoveryDirectoryAndItsJournalAreJudgedBeforeTheyAreBelieved(t *testin
 	for name, plant := range cases {
 		t.Run("resume over "+name, func(t *testing.T) {
 			f := newGuardedFixture(t)
+			continued := observeResumeContinuation(t)
 			mustOK(t, os.Mkdir(f.root, 0o700))
 
 			recovery := filepath.Join(f.root, "recovery-x")
@@ -1442,8 +1445,8 @@ func TestARecoveryDirectoryAndItsJournalAreJudgedBeforeTheyAreBelieved(t *testin
 				t.Errorf("the refused resume removed the recovery directory: %v", err)
 			}
 
-			if len(f.reached) != 0 {
-				t.Errorf("the refused resume reached %v", f.reached)
+			if continued() {
+				t.Error("the refused resume continued into the transaction")
 			}
 		})
 
@@ -1469,5 +1472,52 @@ func TestARecoveryDirectoryAndItsJournalAreJudgedBeforeTheyAreBelieved(t *testin
 				t.Errorf("the refused takeover changed the record to %+v", got)
 			}
 		})
+	}
+}
+
+// observeResumeContinuation installs the resume barrier: a resume that passes
+// every refusal reaches it, is recorded, and is stopped there with an error a
+// fixture can recognise. The returned function says whether it fired.
+func observeResumeContinuation(t *testing.T) func() bool {
+	t.Helper()
+
+	fired := false
+	saved := resumeBarrier
+	resumeBarrier = func() error {
+		fired = true
+
+		return errStoppedAtTheBarrier
+	}
+
+	t.Cleanup(func() { resumeBarrier = saved })
+
+	return func() bool { return fired }
+}
+
+var errStoppedAtTheBarrier = errors.New("stopped at the resume barrier")
+
+// G27: THE OBSERVATION FIRES, so the fixtures that require it not to are not
+// vacuous: a trusted recovery directory holding a trusted journal takes a
+// resume past every refusal to the barrier, whose error is the resume's.
+func TestATrustedJournalTakesAResumeToTheBarrier(t *testing.T) {
+	f := newGuardedFixture(t)
+	continued := observeResumeContinuation(t)
+	mustOK(t, os.Mkdir(f.root, 0o700))
+
+	recovery := filepath.Join(f.root, "recovery-x")
+	mustOK(t, os.Mkdir(recovery, 0o700))
+	writeJournalFixture(t, recovery, "claimed")
+	mustOK(t, os.Symlink(recovery, f.active()))
+
+	if err := resumeHostUpgrade(t.Context(), f.cfg); !errors.Is(err, errStoppedAtTheBarrier) {
+		t.Fatalf("a resume over a trusted journal: err = %v, want the barrier's", err)
+	}
+
+	if !continued() {
+		t.Error("the barrier did not fire")
+	}
+
+	if _, err := os.Lstat(f.active()); err != nil {
+		t.Errorf("the claim is gone: %v", err)
 	}
 }
