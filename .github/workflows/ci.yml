@@ -29,8 +29,12 @@ jobs:
     # more, so a 15-minute job was cancelling itself AFTER every step had passed,
     # in the coverage upload -- a gate failing a correct change on wall clock it
     # never controlled. Two branches raised it to 25 for that reason the same
-    # day. Raise it again when the suite grows; do not trim tests to fit it.
-    timeout-minutes: 25
+    # day. By 2026-09-09 the race suite alone took 21 minutes (internal/alloc
+    # 848s, cmd/billet 640s, internal/replay 596s) and the job passed at 24m28s
+    # three times in a row before one runner spent three minutes more and the
+    # PostgreSQL step was cancelled after every test had passed; it is 40 now.
+    # Raise it again when the suite grows; do not trim tests to fit it.
+    timeout-minutes: 40
 
     # THE POSTGRESQL BACKEND IS TESTED AGAINST A REAL SERVER OR NOT AT ALL.
     # Every fact internal/state pins about it is a fact about the server rather
