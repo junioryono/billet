@@ -1,0 +1,98 @@
+---
+# THE VERIFIED FALLBACK. A guard directory beside a managed binary that cannot
+# answer for it (absent, after an interrupted bootstrap; or one that predates
+# the guard and answers "unknown command") is answered by the executable the
+# guard's record names: the candidate a converge staged in a recovery
+# directory under the upgrade root. The guard_fallback module reads that
+# record under the trust boundary in three phases (the metadata of every
+# component before the record is read; the record's content before the
+# candidate is looked at; the candidate's every component and its digest,
+# through the descriptor, before its path is answered), and an executable
+# that fails any step is NEVER RUN. There is no legacy fallback after a
+# failed verification: the play ends naming what to install by hand.
+
+- name: Inspect the guard's record before anything answers for it
+  ansible.builtin.stat:
+    path: "{{ billet_exclusion_root }}/active/guard.json"
+    follow: false
+    get_checksum: false
+    get_mime: false
+  register: billet_exclusion_record
+  check_mode: false
+  become: "{{ billet_exclusion_become }}"
+
+# A DIRECTORY WITHOUT A RECORD is a hold that never returned from publishing,
+# and with no executable able to say so, the operator is told what to install
+# and what to run then.
+- name: Refuse an unpublished guard no executable can recover
+  ansible.builtin.assert:
+    that:
+      - billet_exclusion_record.stat.exists
+    fail_msg: >-
+      {{ billet_exclusion_root }}/active is a hold that never returned from
+      publishing its record, and {{ billet_exclusion_binary }}
+      {{ 'is absent' if not billet_exclusion_binary_present | bool else 'predates the converge guard' }},
+      so nothing here can recover it. Install a billet at or after the release
+      that carries the converge guard at {{ billet_exclusion_binary }}, then run
+      `{{ billet_exclusion_binary }} converge-guard recover --unpublished` and
+      converge again.
+
+- name: Read the guard's record
+  junioryono.billet.guard_fallback:
+    root: "{{ billet_exclusion_root }}"
+    owner: "{{ billet_exclusion_owner_uid | int }}"
+  register: billet_exclusion_fallback
+  failed_when: false
+  check_mode: false
+  become: "{{ billet_exclusion_become }}"
+
+- name: Judge the guard's record
+  ansible.builtin.assert:
+    that:
+      - billet_exclusion_fallback.phase | default('') not in ['metadata', 'content']
+    fail_msg: >-
+      {{ billet_exclusion_binary }} cannot answer for the guard at
+      {{ billet_exclusion_root }}/active
+      ({{ 'it is absent' if not billet_exclusion_binary_present | bool else 'it predates the converge guard' }}),
+      and the guard's record cannot be trusted:
+      {{ billet_exclusion_fallback.msg | default('no reason') }}. Nothing was
+      read past that point and nothing was run. Install a billet at or after the
+      release that carries the converge guard at {{ billet_exclusion_binary }}
+      and converge again.
+
+- name: Judge the recorded executable
+  ansible.builtin.assert:
+    that:
+      - billet_exclusion_fallback.executable is defined
+      - billet_exclusion_fallback.executable | length > 0
+    fail_msg: >-
+      {{ billet_exclusion_binary }} cannot answer for the guard at
+      {{ billet_exclusion_root }}/active
+      ({{ 'it is absent' if not billet_exclusion_binary_present | bool else 'it predates the converge guard' }}),
+      and the executable the guard records cannot be trusted:
+      {{ billet_exclusion_fallback.msg | default('no reason') }}. It was not run.
+      Install a billet at or after the release that carries the converge guard
+      at {{ billet_exclusion_binary }} and converge again.
+
+- name: Note the recorded executable
+  ansible.builtin.set_fact:
+    billet_exclusion_fallback_executable: "{{ billet_exclusion_fallback.executable }}"
+
+- name: Ask the recorded executable for the claim's status
+  junioryono.billet.guard_status:
+    executable: "{{ billet_exclusion_fallback_executable }}"
+    timeout: "{{ billet_guard_timeout }}"
+    expect: directory
+  register: billet_exclusion_status_fallback
+  check_mode: false
+  become: "{{ billet_exclusion_become }}"
+
+- name: Report the fallback
+  ansible.builtin.debug:
+    msg: >-
+      {{ billet_exclusion_binary }}
+      {{ 'is absent' if not billet_exclusion_binary_present | bool else 'predates the converge guard' }};
+      the guard at {{ billet_exclusion_root }}/active is answered by the
+      executable it records, {{ billet_exclusion_fallback_executable }}
+      (digest {{ billet_exclusion_fallback.sha256 }}, verified), which every
+      guard operation of this converge runs.

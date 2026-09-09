@@ -47,23 +47,26 @@
       delegate_to: localhost
       become: false
 
+    # INTO THE PRIVATE RESOLVED VARIABLE, never the public pin: an input a task
+    # assigns is one a frozen inventory cannot stand for, and everything below
+    # reads the resolved value.
     - name: Take the release the channel names
       ansible.builtin.set_fact:
-        billet_version: "{{ billet_channel_statement.json.tag }}"
+        billet_resolved_version: "{{ billet_channel_statement.json.tag }}"
 
     - name: Report which release the channel resolved to
       ansible.builtin.debug:
         msg: >-
-          The {{ billet_release_channel }} channel names {{ billet_version }};
+          The {{ billet_release_channel }} channel names {{ billet_resolved_version }};
           this converge installs that. Pin billet_version to make the same
           playbook install the same binary on a later day.
 
 - name: Refuse an unpinned billet version
   ansible.builtin.assert:
     that:
-      - billet_version | lower not in ['latest', 'main', 'head']
+      - billet_resolved_version | lower not in ['latest', 'main', 'head']
     fail_msg: >-
-      billet_version must name one release, not {{ billet_version }}. A moving
+      billet_version must name one release, not {{ billet_resolved_version }}. A moving
       target makes a converge non-deterministic: the same playbook installs
       different binaries on different days, and does it through the drain and
       restart of a real upgrade transaction. Server and node cannot negotiate
@@ -91,9 +94,9 @@
     # goreleaser's archive name drops the tag's leading v, while the release
     # itself keeps it. Both spellings appear in one URL.
     billet_release_archive: >-
-      billet_{{ billet_version | regex_replace('^v', '') }}_linux_{{ billet_release_arch }}.tar.gz
-    billet_release_base: "{{ billet_release_url_base }}/{{ billet_version }}"
-    billet_release_candidate: "{{ billet_release_stage }}/billet-{{ billet_version }}"
+      billet_{{ billet_resolved_version | regex_replace('^v', '') }}_linux_{{ billet_release_arch }}.tar.gz
+    billet_release_base: "{{ billet_release_url_base }}/{{ billet_resolved_version }}"
+    billet_release_candidate: "{{ billet_release_stage }}/billet-{{ billet_resolved_version }}"
 
 - name: Inspect the release candidate already staged for this version
   ansible.builtin.stat:
@@ -111,7 +114,7 @@
       - billet_release_candidate_stat.stat.isreg
       - not billet_release_candidate_stat.stat.islnk
     fail_msg: >-
-      {{ billet_release_candidate }} is reused as {{ billet_version }} without
+      {{ billet_release_candidate }} is reused as {{ billet_resolved_version }} without
       re-verifying it, so it must be a regular file owned by root and writable by
       nobody else. It is owned by
       {{ billet_release_candidate_stat.stat.pw_name | default('?') }}. Remove it

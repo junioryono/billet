@@ -1,0 +1,689 @@
+---
+# THE EXCLUSION, PREPARED BEFORE ANYTHING ELSE. A converge that changes a host
+# must not race a rollout's `billet host-upgrade` for the same binaries, so a
+# converge HOLDS the host: one durable claim under the upgrade root,
+# `<root>/active`, a directory holding `guard.json`, which every transaction
+# entry of billet refuses under and no timer expires. This file is the first
+# thing the host role runs (main.yml imports it right after the converge guard)
+# and the first pre_task of every play of the fleet playbook, so ssh_access,
+# the connectors and the development role are under it too.
+#
+# TWO LIFETIMES. The EXCLUSION facts (the holder, whether this run holds) live
+# for the run: the hold is taken once per host, and a later inclusion of this
+# file skips it. The CLASSIFICATION runs on EVERY inclusion, because a `status`
+# is cheap and its answer is the only truth about the claim's shape: a later
+# inclusion that finds anything but this holder's guard refuses, since the
+# exclusion this run held has moved. The TRANSACTION facts are per invocation
+# and belong to stage-candidate.yml.
+#
+# WHICH EXECUTABLE ANSWERS. The managed binary, when it answers the command;
+# when it does not (it is absent, or predates the guard and answers "unknown
+# command"), the executable the guard's record names, read by
+# guard-fallback.yml under its trust boundary. The executable that answered is
+# the one every later guard operation of this run uses.
+#
+# ON A MAC the host role manages no binary (everything past this file asserts
+# Linux and systemd), so the preparation only classifies and holds through the
+# managed binary, whose hold creates the root when it is absent; a Mac with
+# neither a binary nor a root has nothing to hold and says so. The root's
+# owner is the one rule for every proof: root on Linux, the launch agent's
+# account (the account converging) on a Mac.
+
+- name: Refuse a converge that would destroy the job running it
+  ansible.builtin.import_tasks: converge-guard.yml
+
+- name: Resolve the exclusion's platform and paths
+  ansible.builtin.set_fact:
+    billet_exclusion_darwin: "{{ billet_exclusion_platform == 'Darwin' }}"
+    billet_exclusion_root: >-
+      {{ billet_upgrade_root if billet_upgrade_root | length > 0
+         else ('/usr/local/var/lib/billet/upgrades' if billet_exclusion_platform == 'Darwin' else '/var/lib/billet/upgrades') }}
+    billet_exclusion_binary: >-
+      {{ billet_managed_binary if billet_managed_binary | length > 0
+         else ('/usr/local/bin/billet' if billet_exclusion_platform == 'Darwin' else '/usr/bin/billet') }}
+    billet_exclusion_become: "{{ billet_exclusion_platform != 'Darwin' }}"
+
+- name: Resolve the converge guard's holder
+  ansible.builtin.set_fact:
+    billet_exclusion_holder: "{{ billet_converge_guard_holder | default('', true) }}"
+  when: not (billet_exclusion_held | default(false))
+
+# A HOLDER IS REQUIRED OUTSIDE CHECK MODE, before anything is classified: a
+# converge holds this host under a name the operator or the action chose,
+# never a default, because the name is what a takeover, a release and a
+# recovery are addressed to.
+- name: Refuse a converge without a holder
+  ansible.builtin.assert:
+    that:
+      - ansible_check_mode or (billet_exclusion_holder | length > 0)
+    fail_msg: >-
+      A converge holds this host under a name, and none was given. Export
+      BILLET_CONVERGE_GUARD_HOLDER on the controller, or pass
+      -e billet_converge_guard_holder=<name>; the action sets it to its run id.
+      A dry run (--check) needs none, because it holds nothing.
+
+# THE RESOLVED RELEASE IS RESET HERE, before anything reads it: the pin for a
+# direct pin, empty for a channel, which binary.yml resolves into it. The
+# public billet_version is never assigned by a task.
+- name: Reset the resolved release
+  ansible.builtin.set_fact:
+    billet_resolved_version: "{{ billet_version }}"
+
+- name: Read the account converging a Mac
+  ansible.builtin.command:
+    argv:
+      - id
+      - -u
+  register: billet_exclusion_account
+  changed_when: false
+  check_mode: false
+  become: false
+  when: billet_exclusion_darwin | bool
+
+- name: Resolve the upgrade root's owner
+  ansible.builtin.set_fact:
+    billet_exclusion_owner_uid: >-
+      {{ billet_upgrade_root_owner_uid | string if billet_upgrade_root_owner_uid | string | length > 0
+         else ((billet_exclusion_account.stdout | trim) if billet_exclusion_darwin | bool else '0') }}
+
+- name: Inspect the managed binary and the upgrade root
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+    get_checksum: false
+    get_mime: false
+  loop:
+    - "{{ billet_exclusion_binary }}"
+    - "{{ billet_exclusion_root | dirname }}"
+    - "{{ billet_exclusion_root }}"
+  register: billet_exclusion_paths
+  failed_when: false
+  check_mode: false
+  become: "{{ billet_exclusion_become }}"
+
+# A STAT THAT FAILED FOR ANY REASON BUT ENOENT is could-not-tell: the module
+# answers no `stat` member at all, and that is never read as absence.
+- name: Refuse a path the role could not examine
+  ansible.builtin.assert:
+    that:
+      - item.stat is defined
+    fail_msg: >-
+      {{ item.item }} could not be examined: {{ item.msg | default('no reason') }}.
+      A path that cannot be examined is not one that is absent; nothing was held.
+  loop: "{{ billet_exclusion_paths.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Note what the managed binary and the root are
+  ansible.builtin.set_fact:
+    billet_exclusion_binary_present: "{{ billet_exclusion_paths.results[0].stat.exists }}"
+    billet_exclusion_parent_stat: "{{ billet_exclusion_paths.results[1].stat }}"
+    billet_exclusion_root_stat: "{{ billet_exclusion_paths.results[2].stat }}"
+    # A Mac with neither a billet nor a root has nothing to hold; anything
+    # else on a Mac is classified exactly as on Linux.
+    billet_exclusion_pristine_mac: >-
+      {{ billet_exclusion_darwin | bool
+         and not billet_exclusion_paths.results[0].stat.exists
+         and not billet_exclusion_paths.results[2].stat.exists }}
+
+- name: Report a Mac with no billet to hold
+  ansible.builtin.debug:
+    msg: >-
+      {{ billet_exclusion_binary }} and {{ billet_exclusion_root }} are both
+      absent: no billet is installed here, so there is nothing to hold.
+  when: billet_exclusion_pristine_mac | bool
+
+- name: Record that a Mac with no billet holds nothing
+  ansible.builtin.set_fact:
+    billet_upgrade_claim_shape: none
+    billet_interrupted_upgrade: false
+    billet_upgrade_recovery_dir: ""
+    billet_exclusion_executable: ""
+  when: billet_exclusion_pristine_mac | bool
+
+- name: Prepare the exclusion
+  when: not billet_exclusion_pristine_mac | bool
+  block:
+    # THE ROOT IS ESTABLISHED ON LINUX before any allocation, because the
+    # allocator's mkdir cannot create a missing parent and account.yml, which
+    # creates these directories today, runs after the hold. An existing root
+    # or parent must be what the role makes: a directory, not a link, owned by
+    # the root's owner and writable by nobody else, the same rule the fallback
+    # reader applies. On a Mac nothing is created: the hold creates the root.
+    - name: Refuse an upgrade root that is not what the role makes
+      ansible.builtin.assert:
+        that:
+          - not item.stat.exists or not (item.stat.islnk | default(false))
+          - not item.stat.exists or item.stat.isdir | default(False)
+          - not item.stat.exists or item.stat.uid | default(-1) == (billet_exclusion_owner_uid | int)
+          - not item.stat.exists or not item.stat.wgrp | default(False)
+          - not item.stat.exists or not item.stat.woth | default(False)
+        fail_msg: >-
+          {{ item.item }} exists and is not what the role makes: it must be a
+          directory (not a symlink), owned by uid {{ billet_exclusion_owner_uid }}
+          and writable by nobody else; it is
+          {{ 'a symlink' if item.stat.islnk | default(false)
+             else ('not a directory' if not item.stat.isdir | default(False)
+             else ('owned by uid ' ~ item.stat.uid | default(-1) if item.stat.uid | default(-1) != (billet_exclusion_owner_uid | int)
+             else 'writable by its group or by others')) }}.
+          Nothing was allocated or held.
+      loop:
+        - "{{ billet_exclusion_paths.results[1] }}"
+        - "{{ billet_exclusion_paths.results[2] }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Establish the upgrade root's parent
+      ansible.builtin.file:
+        path: "{{ billet_exclusion_root | dirname }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      when:
+        - not billet_exclusion_darwin | bool
+        - not billet_exclusion_parent_stat.exists
+        - not ansible_check_mode
+      become: true
+
+    - name: Establish the upgrade root
+      ansible.builtin.file:
+        path: "{{ billet_exclusion_root }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+      register: billet_exclusion_root_made
+      when:
+        - not billet_exclusion_darwin | bool
+        - not billet_exclusion_root_stat.exists
+        - not ansible_check_mode
+      become: true
+
+    - name: Flush the upgrade root's parent
+      ansible.builtin.command:
+        argv:
+          - sync
+          - -f
+          - "{{ billet_exclusion_root | dirname }}"
+      changed_when: false
+      when:
+        - not billet_exclusion_darwin | bool
+        - billet_exclusion_root_made is changed
+        - not ansible_check_mode
+      become: true
+
+    # THE CLAIM'S SHAPE, by a stat that follows nothing: a symlink is a Go
+    # transaction's, a regular file the pre-R role's, a directory a guard's
+    # (asked below), anything else a type the role refuses to read.
+    - name: Inspect the durable claim
+      ansible.builtin.stat:
+        path: "{{ billet_exclusion_root }}/active"
+        follow: false
+        get_checksum: false
+        get_mime: false
+      register: billet_exclusion_active
+      failed_when: false
+      check_mode: false
+      become: "{{ billet_exclusion_become }}"
+
+    - name: Refuse a claim that could not be examined
+      ansible.builtin.assert:
+        that:
+          - billet_exclusion_active.stat is defined
+        fail_msg: >-
+          {{ billet_exclusion_root }}/active could not be examined:
+          {{ billet_exclusion_active.msg | default('no reason') }}. A claim that
+          cannot be examined is not one that is absent; nothing was held.
+
+    # A LATER INCLUSION'S CLASSIFICATION GOVERNS: once this run holds the host,
+    # the claim must still be a guard (a directory) and, below, this holder's.
+    # Anything else is the exclusion having moved under this converge, and
+    # nothing is reacquired.
+    - name: Refuse a converge whose exclusion moved
+      ansible.builtin.assert:
+        that:
+          - billet_exclusion_active.stat.exists
+          - billet_exclusion_active.stat.isdir | default(False)
+        fail_msg: >-
+          This run held {{ billet_exclusion_root }}/active as
+          {{ billet_exclusion_holder }} earlier in this run, and the claim is now
+          {{ 'absent' if not billet_exclusion_active.stat.exists
+             else ('a symlink (a `billet host-upgrade` transaction)' if billet_exclusion_active.stat.islnk | default(false)
+             else ('a regular file (a legacy converge transaction)' if billet_exclusion_active.stat.isreg | default(False)
+             else 'neither a directory nor anything this role writes')) }}.
+          The exclusion moved under this converge; nothing is reacquired and
+          nothing further is done to this host.
+      when:
+        - billet_exclusion_held | default(false)
+        - not ansible_check_mode
+
+    - name: Refuse to converge over a host upgrade billet itself is running
+      ansible.builtin.assert:
+        that:
+          - not (billet_exclusion_active.stat.islnk | default(false))
+        fail_msg: >-
+          {{ billet_exclusion_root }}/active is a symlink, which is how
+          `billet host-upgrade` claims a host: a rollout, or an operator, has a
+          transaction on this machine that this role must not converge over. Run
+          `billet host-upgrade --status` there to see which decision it belongs
+          to and how far it has got, let it finish or resume it with
+          `billet host-upgrade --resume`, and converge again once
+          {{ billet_exclusion_root }}/active is gone.
+      when: billet_exclusion_active.stat.exists
+
+    - name: Refuse a claim of a type the role does not know
+      ansible.builtin.assert:
+        that:
+          - billet_exclusion_active.stat.isreg | default(False) or billet_exclusion_active.stat.isdir | default(False)
+        fail_msg: >-
+          {{ billet_exclusion_root }}/active is neither a regular file nor a
+          directory{{ ' (a FIFO)' if billet_exclusion_active.stat.isfifo | default(false)
+                       else (' (a socket)' if billet_exclusion_active.stat.issock | default(false) else '') }},
+          which no billet writes there. Refusing to read it; inspect it by hand.
+      when: billet_exclusion_active.stat.exists
+
+    # A REGULAR FILE IS THE PRE-R ROLE'S CLAIM: an interrupted transaction of a
+    # collection that predates the guard. No hold is taken beside it (the reader
+    # of that vintage cannot classify a directory); the role's existing recovery
+    # runs from upgrade-inspect.yml and ends the play requiring a fresh converge.
+    # The race that protocol leaves open is the pre-R race, stated.
+    - name: Classify a legacy pointer
+      ansible.builtin.set_fact:
+        billet_upgrade_claim_shape: legacy-file
+        billet_interrupted_upgrade: true
+        billet_upgrade_recovery_dir: ""
+        billet_exclusion_executable: ""
+      when:
+        - billet_exclusion_active.stat.exists
+        - billet_exclusion_active.stat.isreg | default(False)
+
+    - name: Report a legacy pointer
+      ansible.builtin.debug:
+        msg: >-
+          {{ billet_exclusion_root }}/active is a regular file: the claim of a
+          collection that predates the converge guard. The role recovers that
+          transaction and ends the play; converge again afterwards. That
+          collection's race between a converge and a rollout stays open until
+          this host has been converged under the guard once.
+      when: billet_upgrade_claim_shape | default('') == 'legacy-file'
+
+    - name: Classify the claim through the guard
+      when: billet_upgrade_claim_shape | default('') != 'legacy-file'
+      block:
+        # THE STATUS PROTOCOL, judged by the module in three stages: the
+        # envelope, then a record the command could not read, then the healthy
+        # record's members. The outcome is one word, and a refusal names the
+        # member it stopped at.
+        - name: Ask the managed binary for the claim's status
+          junioryono.billet.guard_status:
+            executable: "{{ billet_exclusion_binary }}"
+            timeout: "{{ billet_guard_timeout }}"
+            expect: "{{ 'directory' if billet_exclusion_active.stat.exists else 'any' }}"
+          register: billet_exclusion_status_managed
+          check_mode: false
+          become: "{{ billet_exclusion_become }}"
+          when: billet_exclusion_binary_present | bool
+
+        - name: Note whether the managed binary answers for the guard
+          ansible.builtin.set_fact:
+            billet_exclusion_managed_capable: >-
+              {{ billet_exclusion_binary_present | bool
+                 and billet_exclusion_status_managed.outcome | default('') == 'capable' }}
+            billet_exclusion_managed_pre_r: >-
+              {{ billet_exclusion_binary_present | bool
+                 and billet_exclusion_status_managed.outcome | default('') == 'pre_r' }}
+
+        # A MANAGED BINARY THAT ANSWERS BADLY IS REFUSED, never read as absence
+        # and never as the pre-R protocol: only "unknown command" is that.
+        - name: Judge the claim's status
+          ansible.builtin.assert:
+            that:
+              - billet_exclusion_status_managed.outcome in ['capable', 'pre_r']
+            fail_msg: >-
+              {{ billet_exclusion_binary }} converge-guard status --json could not
+              be read: {{ billet_exclusion_status_managed.problem }}. The claim
+              cannot be classified through it; nothing was held.
+          when: billet_exclusion_binary_present | bool
+
+        # THE FALLBACK: a guard directory beside a binary that cannot answer for
+        # it (absent, or pre-R) is answered by the executable the record names,
+        # read under its trust boundary.
+        - name: Read the guard's record for the executable that can answer
+          ansible.builtin.import_tasks: guard-fallback.yml
+          when:
+            - billet_exclusion_active.stat.exists
+            - billet_exclusion_active.stat.isdir | default(False)
+            - not billet_exclusion_managed_capable | bool
+
+        - name: Settle which executable answers for the guard
+          ansible.builtin.set_fact:
+            billet_exclusion_executable: >-
+              {{ billet_exclusion_binary if billet_exclusion_managed_capable | bool
+                 else (billet_exclusion_fallback_executable | default('')) }}
+            billet_exclusion_status: >-
+              {{ billet_exclusion_status_managed if billet_exclusion_managed_capable | bool
+                 else (billet_exclusion_status_fallback | default({})) }}
+
+        - name: Judge the claim's status through the executable that answered
+          ansible.builtin.assert:
+            that:
+              - billet_exclusion_status.outcome | default('') == 'capable'
+            fail_msg: >-
+              The claim at {{ billet_exclusion_root }}/active could not be
+              classified through {{ billet_exclusion_executable }}:
+              {{ billet_exclusion_status.problem | default('no executable answered') }}.
+              Nothing was held.
+          when:
+            - billet_exclusion_active.stat.exists
+            - billet_exclusion_active.stat.isdir | default(False)
+
+        - name: Note the claim's parts
+          vars:
+            billet_exclusion_report: "{{ billet_exclusion_status.report | default({'active': 'none'}) }}"
+          ansible.builtin.set_fact:
+            billet_exclusion_active_word: "{{ billet_exclusion_report.active | default('none') }}"
+            billet_exclusion_why: "{{ billet_exclusion_report.why | default('') }}"
+            billet_exclusion_guard: "{{ billet_exclusion_report.guard | default({}) }}"
+            billet_exclusion_pointer: "{{ (billet_exclusion_report.guard | default({})).recovery_pointer | default(false) }}"
+            billet_exclusion_guard_holder: "{{ (billet_exclusion_report.guard | default({})).holder | default('') }}"
+            billet_exclusion_record_error: "{{ (billet_exclusion_report.guard | default({})).record_error | default('') }}"
+            billet_exclusion_verified: "{{ (billet_exclusion_report.guard | default({})).release_executable_verified | default(true) }}"
+
+        # THE DECISION TABLE, one refusal per row, each with the exact words the
+        # operator acts on. In check mode a foreign guard is reported and the
+        # dry run continues; the shapes that stop a dry run are the interrupted
+        # transactions, which main.yml refuses to dry-run over as it always did.
+        - name: Refuse a converge whose exclusion moved to another holder
+          ansible.builtin.assert:
+            that:
+              - billet_exclusion_active_word == 'converge-guard'
+              - billet_exclusion_guard_holder == billet_exclusion_holder
+            fail_msg: >-
+              This run held {{ billet_exclusion_root }}/active as
+              {{ billet_exclusion_holder }} earlier in this run, and the claim is now
+              {{ ('a guard held by ' ~ billet_exclusion_guard_holder) if billet_exclusion_active_word == 'converge-guard'
+                 else billet_exclusion_active_word }}.
+              The exclusion moved under this converge; nothing is reacquired and
+              nothing further is done to this host.
+          when:
+            - billet_exclusion_held | default(false)
+            - not ansible_check_mode
+
+        - name: Refuse a claim that cannot be classified
+          ansible.builtin.assert:
+            that:
+              - billet_exclusion_active_word != 'unknown'
+            fail_msg: >-
+              The claim at {{ billet_exclusion_root }}/active cannot be classified:
+              {{ billet_exclusion_why }}. The guard, if one is there, is kept;
+              inspect {{ billet_exclusion_root }}/active by hand.
+
+        - name: Refuse a hold that never returned from publishing
+          ansible.builtin.assert:
+            that:
+              - billet_exclusion_active_word != 'unpublished-guard'
+            fail_msg: >-
+              {{ billet_exclusion_root }}/active is a hold that never returned from
+              publishing its record. Run
+              `{{ billet_exclusion_executable }} converge-guard recover --unpublished`
+              on this host, then converge again.
+
+        - name: Refuse a guard whose record cannot be read
+          ansible.builtin.assert:
+            that:
+              - billet_exclusion_record_error | length == 0
+            fail_msg: >-
+              The guard at {{ billet_exclusion_root }}/active has a record billet
+              cannot read ({{ billet_exclusion_record_error }}). The guard is kept:
+              no recovery command clears a published record that cannot be read.
+              Inspect {{ billet_exclusion_root }}/active/guard.json by hand.
+
+        - name: Refuse a guard whose recorded executable does not verify
+          ansible.builtin.assert:
+            that:
+              - billet_exclusion_verified is sameas true
+            fail_msg: >-
+              The guard by {{ billet_exclusion_guard_holder }} at
+              {{ billet_exclusion_root }}/active records
+              {{ billet_exclusion_guard.release_executable | default('?') }} with digest
+              {{ billet_exclusion_guard.release_executable_sha256 | default('?') }}, and
+              {{ "the file's digest differs" if billet_exclusion_verified is sameas false
+                 else 'the file cannot be verified: ' ~ (billet_exclusion_verified.unknown | default('no reason')) }}.
+              The guard is kept.
+              {{ 'Restore that executable and recover its transaction before the guard can be released; a release refuses while the transaction pointer exists.'
+                 if billet_exclusion_pointer | bool
+                 else 'Restore that executable, or release the guard by its holder (`' ~ billet_exclusion_executable ~ ' converge-guard release --holder ' ~ billet_exclusion_guard_holder ~ '`).' }}
+          when: billet_exclusion_active_word == 'converge-guard'
+
+        - name: Report the claim a dry run found
+          ansible.builtin.debug:
+            msg: >-
+              {{ billet_exclusion_root }}/active is
+              {{ 'absent' if billet_exclusion_active_word == 'none'
+                 else 'a guard held by ' ~ billet_exclusion_guard_holder ~ ' since '
+                      ~ (billet_exclusion_guard.claimed_at | default('?'))
+                      ~ (' with a transaction pointer inside it' if billet_exclusion_pointer | bool else '') }}.
+              A dry run holds nothing and reports what it found.
+          when: ansible_check_mode
+
+        - name: Refuse a guard another converge holds
+          vars:
+            billet_exclusion_age_days: >-
+              {{ (now(utc=true) - (billet_exclusion_guard.claimed_at | default('1970-01-01T00:00:00Z') | to_datetime('%Y-%m-%dT%H:%M:%SZ'))).days }}
+          ansible.builtin.assert:
+            that:
+              - billet_exclusion_guard_holder == billet_exclusion_holder
+            fail_msg: >-
+              {{ billet_exclusion_guard_holder }} holds this host since
+              {{ billet_exclusion_guard.claimed_at | default('?') }}
+              ({{ billet_exclusion_age_days }} days ago).
+              {{ '`' ~ billet_exclusion_executable ~ ' converge-guard hold --holder ' ~ billet_exclusion_holder ~ ' --recover-from ' ~ billet_exclusion_guard_holder ~ ' --old-driver-stopped` takes over its transaction, under the assertion that its driver is stopped and its remote work has finished'
+                 if billet_exclusion_pointer | bool
+                 else '`' ~ billet_exclusion_executable ~ ' converge-guard recover --holder ' ~ billet_exclusion_guard_holder ~ ' --old-driver-stopped` removes it, under the assertion that its driver is stopped' }}.
+              Nothing expires a guard.
+          when:
+            - billet_exclusion_active_word == 'converge-guard'
+            - not ansible_check_mode
+
+        # THE POINTER, READ BY readlink and never by a stat that follows it: an
+        # entry at `active/recovery` that is not a symlink is not a pointer this
+        # role wrote, whatever the status reports, and its target must be a real
+        # directory named by one of the two recovery grammars, a direct child
+        # of the root.
+        - name: Inspect the transaction pointer
+          ansible.builtin.stat:
+            path: "{{ billet_exclusion_root }}/active/recovery"
+            follow: false
+            get_checksum: false
+            get_mime: false
+          register: billet_exclusion_pointer_stat
+          check_mode: false
+          become: "{{ billet_exclusion_become }}"
+          when:
+            - billet_exclusion_active_word == 'converge-guard'
+            - billet_exclusion_pointer | bool
+
+        - name: Read the transaction pointer
+          ansible.builtin.command:
+            argv:
+              - readlink
+              - "{{ billet_exclusion_root }}/active/recovery"
+          register: billet_exclusion_pointer_target
+          changed_when: false
+          check_mode: false
+          become: "{{ billet_exclusion_become }}"
+          when:
+            - billet_exclusion_active_word == 'converge-guard'
+            - billet_exclusion_pointer | bool
+            - billet_exclusion_pointer_stat.stat.islnk | default(false)
+
+        - name: Inspect the transaction pointer's target
+          ansible.builtin.stat:
+            path: "{{ billet_exclusion_pointer_target.stdout | trim }}"
+            follow: false
+            get_checksum: false
+            get_mime: false
+          register: billet_exclusion_pointer_target_stat
+          check_mode: false
+          become: "{{ billet_exclusion_become }}"
+          when:
+            - billet_exclusion_active_word == 'converge-guard'
+            - billet_exclusion_pointer | bool
+            - billet_exclusion_pointer_stat.stat.islnk | default(false)
+            - (billet_exclusion_pointer_target.stdout | trim) is match('^/')
+
+        - name: Refuse a transaction pointer outside the recovery grammar
+          vars:
+            billet_exclusion_pointer_text: "{{ billet_exclusion_pointer_target.stdout | default('') | trim }}"
+            billet_exclusion_pointer_grammar: "{{ '^' ~ (billet_exclusion_root | regex_escape) ~ '/(recovery-[0-9]{8}T[0-9]{6}-[0-9a-f]{8}|[0-9]{8}T[0-9]{15})$' }}"
+          ansible.builtin.assert:
+            that:
+              - billet_exclusion_pointer_stat.stat.exists
+              - billet_exclusion_pointer_stat.stat.islnk | default(false)
+              - billet_exclusion_pointer_text is match(billet_exclusion_pointer_grammar)
+              - billet_exclusion_pointer_target_stat.stat.exists | default(false)
+              - billet_exclusion_pointer_target_stat.stat.isdir | default(false)
+              - not (billet_exclusion_pointer_target_stat.stat.islnk | default(false))
+            fail_msg: >-
+              {{ billet_exclusion_root }}/active/recovery
+              {{ 'is absent, though the guard reports a transaction pointer'
+                 if not billet_exclusion_pointer_stat.stat.exists
+                 else ('is ' ~ ('a directory' if billet_exclusion_pointer_stat.stat.isdir | default(False) else ('a regular file' if billet_exclusion_pointer_stat.stat.isreg | default(False) else 'not a symlink')) ~ ', not the symlink pointer this role writes'
+                 if not (billet_exclusion_pointer_stat.stat.islnk | default(false))
+                 else ('names ' ~ billet_exclusion_pointer_text ~ ', which is not a recovery directory this role allocates (a direct child of the root named recovery-<stamp>-<suffix>, or a legacy <stamp>)'
+                 if not (billet_exclusion_pointer_text is match(billet_exclusion_pointer_grammar))
+                 else ('names ' ~ billet_exclusion_pointer_text ~ ', which does not exist'
+                 if not (billet_exclusion_pointer_target_stat.stat.exists | default(false))
+                 else 'names ' ~ billet_exclusion_pointer_text ~ ', which is not a real directory'))) }}.
+              Refusing to use it; inspect the pointer by hand.
+          when:
+            - billet_exclusion_active_word == 'converge-guard'
+            - billet_exclusion_pointer | bool
+
+        - name: Classify this holder's guard
+          ansible.builtin.set_fact:
+            billet_upgrade_claim_shape: >-
+              {{ 'guard-pointer' if (billet_exclusion_active_word == 'converge-guard' and billet_exclusion_pointer | bool)
+                 else ('guard' if billet_exclusion_active_word == 'converge-guard' else 'none') }}
+            # AN INTERRUPTED TRANSACTION IS THE POINTER'S PRESENCE, whoever holds
+            # the guard (a dry run over a foreign guard with a pointer is a dry
+            # run over an interrupted upgrade), never `active`'s existence.
+            billet_interrupted_upgrade: >-
+              {{ billet_exclusion_active_word == 'converge-guard' and billet_exclusion_pointer | bool }}
+            billet_upgrade_recovery_dir: >-
+              {{ (billet_exclusion_pointer_target.stdout | trim)
+                 if (billet_exclusion_active_word == 'converge-guard' and billet_exclusion_pointer | bool)
+                 else '' }}
+
+        # THE VALIDATION HOLD, for a guard this holder already holds: finding a
+        # published record proves nothing about whether its publication
+        # finished, and only the command's same-holder path completes the
+        # interrupted flushes, refuses a stale temporary and validates the
+        # directory's ownership and mode. Once per process, before any recovery
+        # task; never in check mode, which creates and flushes nothing. Bounded
+        # by `timeout` on Linux and by the task's own async bound on a Mac,
+        # which has no `timeout`.
+        - name: Hold this host for the converge
+          ansible.builtin.command:
+            argv: >-
+              {{ ([] if billet_exclusion_darwin | bool else ['timeout', '-k', '10', billet_guard_timeout | string])
+                 + [billet_exclusion_executable, 'converge-guard', 'hold', '--holder', billet_exclusion_holder] }}
+          async: "{{ 0 if not billet_exclusion_darwin | bool else (billet_guard_timeout | int) + 10 }}"
+          poll: 5
+          register: billet_exclusion_validation
+          changed_when: false
+          failed_when: billet_exclusion_validation.rc | default(1) != 0
+          check_mode: false
+          become: "{{ billet_exclusion_become }}"
+          when:
+            - billet_upgrade_claim_shape in ['guard', 'guard-pointer']
+            - not (billet_exclusion_held | default(false))
+            - not ansible_check_mode
+
+        - name: Record that this converge holds the host
+          ansible.builtin.set_fact:
+            billet_exclusion_held: true
+          when:
+            - billet_upgrade_claim_shape in ['guard', 'guard-pointer']
+            - not ansible_check_mode
+
+    # THE BINARY CHANGE IS DECIDED BEFORE THE HOLD, and a same-holder rerun's
+    # intent is compared with what the guard records there.
+    - name: Decide the binary change and stage its candidate
+      ansible.builtin.import_tasks: stage-candidate.yml
+      when: billet_upgrade_claim_shape | default('none') != 'legacy-file'
+
+    - name: Resolve what will hold this host
+      ansible.builtin.set_fact:
+        billet_exclusion_hold_executable: >-
+          {{ (billet_upgrade_recovery_dir ~ '/billet.candidate') if billet_binary_upgrade | default(false)
+             else billet_exclusion_binary }}
+        billet_exclusion_will_hold: >-
+          {{ billet_upgrade_claim_shape | default('none') == 'none'
+             and not ansible_check_mode
+             and (billet_binary_upgrade | default(false) or billet_exclusion_managed_capable | default(false) | bool) }}
+
+    # THE TWO WAYS OUT, printed before the hold: a play that stops between the
+    # hold and its transaction's pointer leaves the guard with none, and what
+    # the tasks between the hold and the failure changed is not rolled back
+    # by the binary journal.
+    - name: Report the exclusion
+      ansible.builtin.debug:
+        msg: >-
+          {{ billet_exclusion_root }}/active is
+          {{ 'held by ' ~ billet_exclusion_holder ~ ' for this converge' if billet_exclusion_held | default(false)
+             else ('about to be held by ' ~ billet_exclusion_holder ~ ' through ' ~ billet_exclusion_hold_executable if billet_exclusion_will_hold | bool
+             else 'not held (' ~ (billet_upgrade_claim_shape | default('none')) ~ ')') }}.
+          {{ 'If this converge stops before its transaction publishes a pointer, the guard remains with none: `'
+             ~ billet_exclusion_hold_executable ~ ' converge-guard release --holder ' ~ billet_exclusion_holder
+             ~ '` releases it, and `' ~ billet_exclusion_hold_executable ~ ' converge-guard recover --holder '
+             ~ billet_exclusion_holder ~ ' --old-driver-stopped` removes it under the assertion that its driver is stopped; what the tasks between the hold and the failure changed is not rolled back by the binary journal.'
+             if (billet_exclusion_held | default(false) or billet_exclusion_will_hold | bool) else '' }}
+
+    # THE HOLD, for a new acquisition: through the candidate when this run
+    # staged one (the floor proved it can), else through the managed binary
+    # when it answers the command.
+    - name: Hold this host for the converge
+      ansible.builtin.command:
+        argv: >-
+          {{ ([] if billet_exclusion_darwin | bool else ['timeout', '-k', '10', billet_guard_timeout | string])
+             + [billet_exclusion_hold_executable, 'converge-guard', 'hold', '--holder', billet_exclusion_holder]
+             + (['--candidate', billet_upgrade_recovery_dir ~ '/billet.candidate'] if billet_binary_upgrade | default(false) else []) }}
+      async: "{{ 0 if not billet_exclusion_darwin | bool else (billet_guard_timeout | int) + 10 }}"
+      poll: 5
+      register: billet_exclusion_hold
+      changed_when: billet_exclusion_hold.rc | default(1) == 0
+      failed_when: billet_exclusion_hold.rc | default(1) != 0
+      check_mode: false
+      become: "{{ billet_exclusion_become }}"
+      when: billet_exclusion_will_hold | bool
+
+    - name: Record the hold
+      ansible.builtin.set_fact:
+        billet_upgrade_claim_shape: guard
+        billet_exclusion_held: true
+        billet_exclusion_executable: "{{ billet_exclusion_hold_executable }}"
+      when: billet_exclusion_hold is changed
+
+    # THE LEGACY PROTOCOL is admitted only when no executable able to hold
+    # exists: a managed binary that predates the guard, no candidate staged,
+    # and not a PostgreSQL controller (which stage-candidate.yml refused).
+    - name: Record that a release before the guard runs the legacy protocol
+      ansible.builtin.set_fact:
+        billet_upgrade_claim_shape: legacy
+      when:
+        - billet_upgrade_claim_shape | default('none') == 'none'
+        - not ansible_check_mode
+        - billet_exclusion_managed_pre_r | default(false) | bool
+        - not (billet_binary_upgrade | default(false))
+
+    - name: Warn that a release before the guard runs the legacy protocol
+      ansible.builtin.debug:
+        msg: >-
+          {{ billet_exclusion_binary }} predates the converge guard, and no newer
+          candidate is staged, so this converge runs the legacy protocol: its
+          transaction claims the host by the regular file
+          {{ billet_exclusion_root }}/active and no guard excludes a rollout from
+          it. Pin a release that carries the guard to close that race.
+      when: billet_upgrade_claim_shape | default('none') == 'legacy'

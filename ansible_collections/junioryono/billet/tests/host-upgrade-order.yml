@@ -15,6 +15,17 @@
     billet_host_finalization_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/upgrade-finalize.yml') | from_yaml }}"
     billet_host_backup_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/backup.yml') | from_yaml }}"
     billet_host_backup_text: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/backup.yml') }}"
+    billet_host_prepare_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/prepare-exclusion.yml') | from_yaml }}"
+    billet_host_prepare_text: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/prepare-exclusion.yml') }}"
+    billet_host_stage_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/stage-candidate.yml') | from_yaml }}"
+    billet_host_allocate_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/allocate-recovery.yml') | from_yaml }}"
+    billet_host_fallback_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/guard-fallback.yml') | from_yaml }}"
+    billet_host_fallback_text: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/guard-fallback.yml') }}"
+    billet_host_services_text: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/services.yml') }}"
+    billet_host_inspection_text: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/upgrade-inspect.yml') }}"
+    billet_host_finalization_text: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/upgrade-finalize.yml') }}"
+    billet_host_recovery_dispatch_text: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/upgrade-recover.yml') }}"
+    billet_host_account_text: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/account.yml') }}"
     billet_server_unit: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/templates/billet-server.service.j2') }}"
     billet_node_unit: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/templates/billet-node.service.j2') }}"
     billet_host_defaults: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/defaults/main.yml') | from_yaml }}"
@@ -40,7 +51,8 @@
         billet_upgrade_stop_node: "{{ billet_upgrade_task.block | selectattr('name', 'equalto', 'Gracefully stop the billet node before changing its guest contract') | first }}"
         billet_upgrade_stop_server: "{{ billet_upgrade_task.block | selectattr('name', 'equalto', 'Gracefully stop the billet server after compute has drained') | first }}"
         billet_upgrade_backup_ledger: "{{ billet_upgrade_task.block | selectattr('name', 'equalto', 'Preserve the stopped control-plane ledger') | first }}"
-        billet_candidate_stage: "{{ billet_host_account_tasks | selectattr('name', 'equalto', 'Stage the immutable candidate binary inside its recovery journal') | first }}"
+        billet_stage_names: "{{ billet_host_stage_tasks | map(attribute='name') | list }}"
+        billet_stage_block: "{{ (billet_host_stage_tasks | selectattr('name', 'equalto', \"Resolve and stage this invocation's candidate\") | first).block }}"
         billet_candidate_unit_stage: "{{ billet_host_account_tasks | selectattr('name', 'equalto', 'Stage candidate systemd units for the upgrade transaction') | first }}"
         billet_ordinary_unit_install: "{{ billet_host_account_tasks | selectattr('name', 'equalto', 'Install the billet systemd units') | first }}"
         billet_service_policy_reload: "{{ billet_host_account_tasks | selectattr('name', 'equalto', 'Reload systemd before inspecting installed service policy') | first }}"
@@ -82,6 +94,14 @@
         billet_older_candidate_server_unit: "{{ lookup('ansible.builtin.template', playbook_dir + '/../roles/host/templates/billet-server.service.j2', template_vars={'billet_systemd_notify_ready': true, 'billet_systemd_upgrade_probe': true, 'billet_systemd_upgrade_probe_hold': false}) }}"
         billet_older_candidate_node_unit: "{{ lookup('ansible.builtin.template', playbook_dir + '/../roles/host/templates/billet-node.service.j2', template_vars={'billet_systemd_notify_ready': true, 'billet_systemd_upgrade_probe': true, 'billet_systemd_upgrade_probe_hold': false}) }}"
         billet_candidate_probe_ask: "{{ billet_host_account_tasks | selectattr('name', 'equalto', 'Ask the candidate whether its probe can be told to hold') | first }}"
+        billet_stage_inner: "{{ (billet_stage_block | selectattr('name', 'equalto', 'Stage the candidate for the transaction') | first).block }}"
+        billet_stage_block_names: "{{ billet_stage_block | map(attribute='name') | list }}"
+        billet_stage_inner_names: "{{ (billet_stage_block | selectattr('name', 'equalto', 'Stage the candidate for the transaction') | first).block | map(attribute='name') | list }}"
+        billet_candidate_stage: "{{ (billet_stage_block | selectattr('name', 'equalto', 'Stage the candidate for the transaction') | first).block | selectattr('name', 'equalto', 'Stage the immutable candidate binary inside its recovery journal') | first }}"
+        billet_prepare_names: "{{ billet_host_prepare_tasks | map(attribute='name') | list }}"
+        billet_prepare_block: "{{ (billet_host_prepare_tasks | selectattr('name', 'equalto', 'Prepare the exclusion') | first).block }}"
+        billet_classify_block: "{{ ((billet_host_prepare_tasks | selectattr('name', 'equalto', 'Prepare the exclusion') | first).block | selectattr('name', 'equalto', 'Classify the claim through the guard') | first).block }}"
+        billet_fallback_names: "{{ billet_host_fallback_tasks | map(attribute='name') | list }}"
         billet_unsafe_override_dropin: |
           [Service]
           Type=exec
@@ -252,8 +272,8 @@
           - billet_account_names.index('Refuse an implicit installed service identity migration') < billet_account_names.index('Create the billet service group')
           - billet_account_names.index('Refuse an implicit installed service identity migration') < billet_account_names.index('Create billet directories')
           - billet_account_names.index('Refuse to move installed billet state implicitly') < billet_account_names.index('Render billet configuration')
-          - billet_account_names.index('Create the upgrade recovery directory') < billet_account_names.index('Stage the immutable candidate binary inside its recovery journal')
-          - billet_account_names.index('Stage the immutable candidate binary inside its recovery journal') < billet_account_names.index('Bind the host transaction to the inspected candidate digest')
+          - billet_stage_inner_names.index("Allocate the transaction's recovery directory") < billet_stage_inner_names.index('Stage the immutable candidate binary inside its recovery journal')
+          - billet_stage_inner_names.index('Stage the immutable candidate binary inside its recovery journal') < billet_stage_inner_names.index('Bind the host transaction to the inspected candidate digest')
           - billet_account_names.index('Refuse redirected or non-file upgrade inputs') < billet_account_names.index('Preserve configuration and units before replacing them')
           - billet_account_names.index('Preserve configuration and units before replacing them') < billet_account_names.index('Stage candidate systemd units for the upgrade transaction')
           - "'Preserve the previous billet binary before live mutation' in billet_account_names"
@@ -261,10 +281,9 @@
           - billet_main_names.index('Inspect a durable host-upgrade journal before normal convergence') < billet_main_names.index('Recover an interrupted billet upgrade before converging anything else')
           - billet_main_names.index('Recover an interrupted billet upgrade before converging anything else') < billet_main_names.index('Configure billet account and files')
           - billet_main_names.index('Configure billet account and files') < billet_main_names.index('Configure billet services')
-          - billet_account_names.index('Decide whether the billet binary needs a transactional upgrade') < billet_account_names.index('Reload systemd before inspecting host-upgrade service overlays')
           - billet_account_names.index('Reload systemd before inspecting host-upgrade service overlays') < billet_account_names.index('Inspect billet service drop-ins before the upgrade transaction')
           - billet_account_names.index('Inspect billet service drop-ins before the upgrade transaction') < billet_account_names.index('Refuse service drop-ins the transaction cannot replace or recover')
-          - billet_account_names.index('Refuse service drop-ins the transaction cannot replace or recover') < billet_account_names.index('Allocate a unique recovery directory before replacing upgrade inputs')
+          - billet_account_names.index('Refuse service drop-ins the transaction cannot replace or recover') < billet_account_names.index('Inspect configuration and units before replacing them')
           - billet_top_level_names.index('Persist the host-upgrade recovery manifest before live mutation') < billet_top_level_names.index("Stage this transaction's atomic host-upgrade claim")
           - billet_top_level_names.index('Durably commit host-upgrade recovery inputs before publishing the pointer') < billet_top_level_names.index("Stage this transaction's atomic host-upgrade claim")
           - billet_top_level_names.index("Stage this transaction's atomic host-upgrade claim") < billet_top_level_names.index('Durably stage the atomic host-upgrade claim')
@@ -608,7 +627,7 @@
     # assertion passed without comparing and an unnamed downgrade went through.
     - name: The downgrade check recognises a release with or without its v
       vars:
-        billet_downgrade_task: "{{ billet_host_account_tasks | selectattr('name', 'equalto', 'Refuse a converge that would downgrade this host') | first }}"
+        billet_downgrade_task: "{{ billet_stage_inner | selectattr('name', 'equalto', 'Refuse a converge that would downgrade this host') | first }}"
         billet_release_pattern: "{{ billet_downgrade_task.vars.billet_release_tag }}"
       ansible.builtin.assert:
         that:
@@ -620,5 +639,305 @@
           - "not ('v1.2.3-rc1' is match(billet_release_pattern))"
           - "not ('(devel)' is match(billet_release_pattern))"
         fail_msg: >-
-          account.yml's downgrade check must recognise both spellings of a release,
+          stage-candidate.yml's downgrade check must recognise both spellings of a release,
           v0.9.2 and 0.9.1, and nothing that is not one; pattern {{ billet_release_pattern }}.
+
+    # THE EXCLUSION IS PREPARED BEFORE ANYTHING ELSE, AND ITS TRANSACTION RUNS
+    # INSIDE THE GUARD. What no scenario can see: which task holds and when, that
+    # the classification is asked on every inclusion while the hold is taken
+    # once, that every read of `active`'s content is gated by the legacy shapes,
+    # that the claim under the guard is a pointer outside the transaction block,
+    # and that recovery and finalization prove ownership by shape first.
+    - name: Record the preparation's shape
+      ansible.builtin.set_fact:
+        billet_prepare_holds: "{{ (billet_classify_block + billet_prepare_block) | selectattr('name', 'equalto', 'Hold this host for the converge') | list }}"
+        billet_prepare_holder_refusal: "{{ billet_host_prepare_tasks | selectattr('name', 'equalto', 'Refuse a converge without a holder') | first }}"
+        billet_prepare_root_guard: "{{ billet_prepare_block | selectattr('name', 'equalto', 'Refuse an upgrade root that is not what the role makes') | first }}"
+        billet_prepare_root_make: "{{ billet_prepare_block | selectattr('name', 'equalto', 'Establish the upgrade root') | first }}"
+        billet_prepare_claim_stat: "{{ billet_prepare_block | selectattr('name', 'equalto', 'Inspect the durable claim') | first }}"
+        billet_prepare_moved: "{{ billet_prepare_block | selectattr('name', 'equalto', 'Refuse a converge whose exclusion moved') | first }}"
+        billet_prepare_status: "{{ billet_classify_block | selectattr('name', 'equalto', \"Ask the managed binary for the claim's status\") | first }}"
+        billet_prepare_judge: "{{ billet_classify_block | selectattr('name', 'equalto', \"Judge the claim's status\") | first }}"
+        billet_prepare_pointer_read: "{{ billet_classify_block | selectattr('name', 'equalto', 'Read the transaction pointer') | first }}"
+        billet_prepare_classify: "{{ billet_classify_block | selectattr('name', 'equalto', \"Classify this holder's guard\") | first }}"
+        billet_prepare_stage_import: "{{ billet_prepare_block | selectattr('name', 'equalto', 'Decide the binary change and stage its candidate') | first }}"
+        billet_prepare_report: "{{ billet_prepare_block | selectattr('name', 'equalto', 'Report the exclusion') | first }}"
+        billet_prepare_block_names: "{{ billet_prepare_block | map(attribute='name') | list }}"
+        billet_classify_names: "{{ billet_classify_block | map(attribute='name') | list }}"
+        billet_stage_reset: "{{ billet_host_stage_tasks | selectattr('name', 'equalto', 'Reset the transaction facts for this invocation') | first }}"
+        billet_stage_intent: "{{ billet_stage_block | selectattr('name', 'equalto', 'Refuse a same-holder rerun with a different intent') | first }}"
+        billet_stage_capability_judge: "{{ billet_stage_inner | selectattr('name', 'equalto', \"Judge the candidate's capability\") | first }}"
+        billet_stage_capability_ask: "{{ billet_stage_inner | selectattr('name', 'equalto', 'Ask the candidate whether it can take part in the exclusion') | first }}"
+        billet_stage_versions: "{{ billet_stage_inner | selectattr('name', 'equalto', 'Read the installed and candidate releases') | first }}"
+        billet_allocate_task: "{{ billet_host_allocate_tasks | selectattr('name', 'equalto', 'Allocate a recovery directory exclusively') | first }}"
+        billet_previous_binary_copy: "{{ billet_host_account_tasks | selectattr('name', 'equalto', 'Preserve the previous billet binary before live mutation') | first }}"
+        billet_fallback_read: "{{ billet_host_fallback_tasks | selectattr('name', 'equalto', \"Read the guard's record\") | first }}"
+        billet_fallback_judge_record: "{{ billet_host_fallback_tasks | selectattr('name', 'equalto', \"Judge the guard's record\") | first }}"
+        billet_fallback_judge_candidate: "{{ billet_host_fallback_tasks | selectattr('name', 'equalto', 'Judge the recorded executable') | first }}"
+        billet_claim_outside: "{{ billet_host_service_tasks | selectattr('name', 'equalto', 'Refuse a transaction outside the exclusion') | first }}"
+        billet_claim_legacy: "{{ billet_host_service_tasks | selectattr('name', 'equalto', 'Claim the host upgrade without replacing another transaction') | first }}"
+        billet_claim_guard: "{{ billet_host_service_tasks | selectattr('name', 'equalto', 'Claim the host upgrade inside the converge guard') | first }}"
+        billet_claim_guard_flush: "{{ billet_host_service_tasks | selectattr('name', 'equalto', 'Durably publish the transaction pointer inside the guard') | first }}"
+        billet_claim_guard_read: "{{ billet_host_service_tasks | selectattr('name', 'equalto', 'Read back the transaction pointer before live mutation') | first }}"
+        billet_claim_legacy_read: "{{ billet_host_service_tasks | selectattr('name', 'equalto', 'Read back the exclusive host-upgrade claim before live mutation') | first }}"
+        billet_claim_prove: "{{ billet_host_service_tasks | selectattr('name', 'equalto', 'Prove this transaction owns the host before live mutation') | first }}"
+        billet_claim_record: "{{ billet_host_service_tasks | selectattr('name', 'equalto', 'Record that the transaction is claimed inside the guard') | first }}"
+        billet_finalize_guard: "{{ billet_host_finalization_tasks | selectattr('name', 'equalto', 'Refuse finalization without a real owned host-upgrade claim') | first }}"
+        billet_finalize_slurp: "{{ billet_host_finalization_tasks | selectattr('name', 'equalto', 'Read the host-upgrade claim before finalization') | first }}"
+        billet_finalize_readlink: "{{ billet_host_finalization_tasks | selectattr('name', 'equalto', 'Read the transaction pointer before finalization') | first }}"
+        billet_finalize_close: "{{ billet_host_finalization_tasks | selectattr('name', 'equalto', 'Close the durable host-upgrade transaction after stable service startup') | first }}"
+        billet_finalize_shape: "{{ billet_host_finalization_tasks | selectattr('name', 'equalto', 'Record that the guard holds no transaction after the close') | first }}"
+        billet_recover_entry: "{{ billet_host_recovery_dispatch_tasks | selectattr('name', 'equalto', 'Refuse recovery without an owned transaction claim') | first }}"
+        billet_recover_slurp: "{{ billet_host_recovery_dispatch_tasks | selectattr('name', 'equalto', 'Read the legacy claim before recovery') | first }}"
+        billet_inspect_slurp: "{{ billet_host_inspection_tasks | selectattr('name', 'equalto', 'Read the durable host-upgrade pointer') | first }}"
+        billet_inspect_grammar: "{{ billet_host_inspection_tasks | selectattr('name', 'equalto', 'Refuse an unsafe or malformed host-upgrade pointer') | first }}"
+        billet_services_slurp: "{{ billet_host_service_tasks | selectattr('name', 'equalto', 'Read back the exclusive host-upgrade claim before live mutation') | first }}"
+
+    - name: The preparation runs first, holds once, classifies always and stages before the hold
+      ansible.builtin.assert:
+        that:
+          - billet_main_names[0] == 'Refuse a converge that would destroy the job running it'
+          - billet_main_names[1] == 'Prepare the exclusion before anything changes this host'
+          - billet_host_main_tasks[1]['ansible.builtin.import_tasks'] == 'prepare-exclusion.yml'
+          - billet_prepare_names[0] == 'Refuse a converge that would destroy the job running it'
+          - billet_host_prepare_tasks[0]['ansible.builtin.import_tasks'] == 'converge-guard.yml'
+          - billet_prepare_names.index('Refuse a converge without a holder') < billet_prepare_names.index('Inspect the managed binary and the upgrade root')
+          - "'ansible_check_mode or' in (billet_prepare_holder_refusal['ansible.builtin.assert'].that | join(' '))"
+          # THE ROOT: stat'ed without following, created only under ENOENT on Linux, judged by five properties.
+          - "'not billet_exclusion_root_stat.exists' in (billet_prepare_root_make.when | string)"
+          - "'not billet_exclusion_darwin' in (billet_prepare_root_make.when | string)"
+          - billet_prepare_root_make['ansible.builtin.file'].mode == '0700'
+          - "'islnk' in (billet_prepare_root_guard['ansible.builtin.assert'].that | join(' '))"
+          - "'isdir' in (billet_prepare_root_guard['ansible.builtin.assert'].that | join(' '))"
+          - "'item.stat.uid | default(-1) == (billet_exclusion_owner_uid | int)' in (billet_prepare_root_guard['ansible.builtin.assert'].that | join(' '))"
+          - "'wgrp' in (billet_prepare_root_guard['ansible.builtin.assert'].that | join(' '))"
+          - "'woth' in (billet_prepare_root_guard['ansible.builtin.assert'].that | join(' '))"
+          - billet_prepare_block_names.index('Refuse an upgrade root that is not what the role makes') < billet_prepare_block_names.index('Establish the upgrade root')
+          - billet_prepare_block_names.index('Establish the upgrade root') < billet_prepare_block_names.index('Inspect the durable claim')
+          # THE CLAIM: stat'ed without following, never trusted when the stat failed, and the later classification governs.
+          - billet_prepare_claim_stat['ansible.builtin.stat'].follow == false
+          - billet_prepare_claim_stat.failed_when == false
+          - "'billet_exclusion_active.stat is defined' in (billet_host_prepare_tasks | to_json)"
+          - "'billet_exclusion_held' in (billet_prepare_moved.when | string)"
+          - billet_prepare_block_names.index('Refuse a converge whose exclusion moved') < billet_prepare_block_names.index('Refuse to converge over a host upgrade billet itself is running')
+          # THE STATUS PROTOCOL: the module, unconditionally on every inclusion (no held gate), judged as one word.
+          - "'junioryono.billet.guard_status' in billet_prepare_status"
+          - "'billet_exclusion_held' not in (billet_prepare_status.when | string)"
+          - "'billet_exclusion_held' not in (billet_classify_names | join(' '))"
+          - "\"in ['capable', 'pre_r']\" in (billet_prepare_judge['ansible.builtin.assert'].that | join(' '))"
+          - billet_classify_names.index('Judge the claim\'s status') < billet_classify_names.index('Refuse a converge whose exclusion moved to another holder')
+          - billet_classify_names.index('Refuse a converge whose exclusion moved to another holder') < billet_classify_names.index('Refuse a claim that cannot be classified')
+          - billet_classify_names.index('Refuse a claim that cannot be classified') < billet_classify_names.index('Refuse a hold that never returned from publishing')
+          - billet_classify_names.index('Refuse a hold that never returned from publishing') < billet_classify_names.index('Refuse a guard whose record cannot be read')
+          - billet_classify_names.index('Refuse a guard whose record cannot be read') < billet_classify_names.index('Refuse a guard whose recorded executable does not verify')
+          - billet_classify_names.index('Refuse a guard whose recorded executable does not verify') < billet_classify_names.index('Refuse a guard another converge holds')
+          - billet_classify_names.index('Refuse a guard another converge holds') < billet_classify_names.index('Inspect the transaction pointer')
+          # THE POINTER by readlink, its type and grammar judged, and the shape derived from it, never from active's existence.
+          - "'readlink' in billet_prepare_pointer_read['ansible.builtin.command'].argv"
+          - "'islnk' in (billet_prepare_pointer_read.when | string)"
+          - "'recovery-[0-9]{8}T[0-9]{6}-[0-9a-f]{8}|[0-9]{8}T[0-9]{15}' in billet_host_prepare_text"
+          - "'billet_exclusion_pointer | bool' in (billet_prepare_classify['ansible.builtin.set_fact'].billet_interrupted_upgrade | string)"
+          - "'stat.exists' not in (billet_prepare_classify['ansible.builtin.set_fact'].billet_interrupted_upgrade | string)"
+          # TWO HOLDS AND NO MORE: the validation hold before the staging, gated once per process; the acquisition after it.
+          - billet_prepare_holds | length == 2
+          - "'not (billet_exclusion_held' in (billet_prepare_holds[0].when | string)"
+          - "\"in ['guard', 'guard-pointer']\" in (billet_prepare_holds[0].when | string)"
+          - "'not ansible_check_mode' in (billet_prepare_holds[0].when | string)"
+          - "'--candidate' not in (billet_prepare_holds[0]['ansible.builtin.command'].argv | string)"
+          - "'billet_exclusion_will_hold' in (billet_prepare_holds[1].when | string)"
+          - "'--candidate' in (billet_prepare_holds[1]['ansible.builtin.command'].argv | string)"
+          - billet_classify_names.index('Classify this holder\'s guard') < billet_classify_names.index('Hold this host for the converge')
+          - billet_prepare_block_names.index('Classify the claim through the guard') < billet_prepare_block_names.index('Decide the binary change and stage its candidate')
+          - billet_prepare_block_names.index('Decide the binary change and stage its candidate') < billet_prepare_block_names.index('Report the exclusion')
+          - billet_prepare_block_names.index('Report the exclusion') < billet_prepare_block_names.index('Hold this host for the converge')
+          - billet_prepare_stage_import['ansible.builtin.import_tasks'] == 'stage-candidate.yml'
+          - "'release --holder' in billet_prepare_report['ansible.builtin.debug'].msg"
+          - "'recover --holder' in billet_prepare_report['ansible.builtin.debug'].msg"
+          - "'--old-driver-stopped' in billet_prepare_report['ansible.builtin.debug'].msg"
+          # EACH HOLD is bounded and escalated by platform: `timeout` on Linux, the task's async bound and no escalation on a Mac.
+          - "'timeout' in (billet_prepare_holds[0]['ansible.builtin.command'].argv | string)"
+          - "'billet_exclusion_darwin' in (billet_prepare_holds[0]['ansible.builtin.command'].argv | string)"
+          - "'billet_exclusion_darwin' in (billet_prepare_holds[0]['async'] | string)"
+          - billet_prepare_holds[0].poll is defined
+          - "'billet_exclusion_become' in (billet_prepare_holds[0].become | string)"
+          - "'timeout' in (billet_prepare_holds[1]['ansible.builtin.command'].argv | string)"
+          - "'billet_exclusion_darwin' in (billet_prepare_holds[1]['async'] | string)"
+          - billet_prepare_holds[1].poll is defined
+          - "'billet_exclusion_become' in (billet_prepare_holds[1].become | string)"
+          # THE LEGACY PROTOCOL only when no capable executable exists.
+          - "'billet_exclusion_managed_pre_r' in ((billet_prepare_block | selectattr('name', 'equalto', 'Record that a release before the guard runs the legacy protocol') | first).when | string)"
+          - "'not (billet_binary_upgrade' in ((billet_prepare_block | selectattr('name', 'equalto', 'Record that a release before the guard runs the legacy protocol') | first).when | string)"
+        fail_msg: >-
+          prepare-exclusion.yml must run the guard first, refuse an absent holder
+          before any stat, establish the root only under ENOENT, classify the claim
+          through the status module on every inclusion, derive the interruption
+          from the pointer, hold exactly twice (a validation before the staging, an
+          acquisition after it) under a bound, and name the two ways out before
+          the hold.
+
+    - name: Every stat of the preparation follows nothing and reads no content
+      ansible.builtin.assert:
+        that:
+          - item['ansible.builtin.stat'].follow == false
+          - item['ansible.builtin.stat'].get_checksum == false
+          - item['ansible.builtin.stat'].get_mime == false
+        fail_msg: >-
+          The preparation's stat "{{ item.name }}" must carry follow false,
+          get_checksum false and get_mime false: it judges a path's type and
+          metadata before anything reads its content.
+      # select('contains', ...) rather than selectattr, whose dotted attribute
+      # would look for tasks['ansible']['builtin']['stat'].
+      loop: >-
+        {{ (billet_host_prepare_tasks + billet_prepare_block + billet_classify_block + billet_host_fallback_tasks)
+           | select('contains', 'ansible.builtin.stat') | list }}
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: The fallback reader judges the record before the candidate and runs nothing
+      ansible.builtin.assert:
+        that:
+          - "'junioryono.billet.guard_fallback' in billet_fallback_read"
+          - billet_fallback_read.failed_when == false
+          - "\"not in ['metadata', 'content']\" in (billet_fallback_judge_record['ansible.builtin.assert'].that | join(' '))"
+          - billet_fallback_names.index('Refuse an unpublished guard no executable can recover') < billet_fallback_names.index('Read the guard\'s record')
+          - billet_fallback_names.index('Read the guard\'s record') < billet_fallback_names.index('Judge the guard\'s record')
+          - billet_fallback_names.index('Judge the guard\'s record') < billet_fallback_names.index('Judge the recorded executable')
+          - billet_fallback_names.index('Judge the recorded executable') < billet_fallback_names.index('Ask the recorded executable for the claim\'s status')
+          - "'ansible.builtin.command' not in billet_host_fallback_text"
+          - "'ansible.builtin.shell' not in billet_host_fallback_text"
+        fail_msg: >-
+          guard-fallback.yml must read the record through the module with its
+          failure kept as an answer, judge the metadata and content phases before
+          the candidate's, and execute nothing itself.
+
+    - name: The staging resets only the transaction facts and decides before the hold
+      ansible.builtin.assert:
+        that:
+          - "'billet_binary_upgrade' in billet_stage_reset['ansible.builtin.set_fact']"
+          - "'billet_candidate_on_target' in billet_stage_reset['ansible.builtin.set_fact']"
+          - "'billet_candidate_path' in billet_stage_reset['ansible.builtin.set_fact']"
+          - "'billet_candidate_selected' in billet_stage_reset['ansible.builtin.set_fact']"
+          - "'billet_candidate_binary' in billet_stage_reset['ansible.builtin.set_fact']"
+          - "'billet_candidate_source' in billet_stage_reset['ansible.builtin.set_fact']"
+          - "'billet_upgrade_recovery_dir' not in billet_stage_reset['ansible.builtin.set_fact']"
+          - "'billet_interrupted_upgrade' not in billet_stage_reset['ansible.builtin.set_fact']"
+          - "'billet_upgrade_claim_shape' not in billet_stage_reset['ansible.builtin.set_fact']"
+          - "'release --holder' in billet_stage_intent['ansible.builtin.assert'].fail_msg"
+          - "\"== 'guard'\" in (billet_stage_intent.when | string)"
+          - billet_stage_block_names.index('Decide whether the billet binary needs a transactional upgrade') < billet_stage_block_names.index('Refuse a same-holder rerun with a different intent')
+          - billet_stage_block_names.index('Refuse a same-holder rerun with a different intent') < billet_stage_block_names.index('Refuse a transactional binary change against an external ledger')
+          - billet_stage_block_names.index('Refuse a transactional binary change against an external ledger') < billet_stage_block_names.index('Refuse a PostgreSQL controller whose binary predates the guard')
+          - billet_stage_block_names.index('Refuse a bootstrap over a root that holds something the role did not write') < billet_stage_block_names.index('Stage the candidate for the transaction')
+          - billet_stage_inner_names.index('Bind the host transaction to the inspected candidate digest') < billet_stage_inner_names.index('Read the installed and candidate releases')
+          - billet_stage_inner_names.index('Read the installed and candidate releases') < billet_stage_inner_names.index('Refuse a converge that would downgrade this host')
+          - billet_stage_inner_names.index('Refuse a converge that would downgrade this host') < billet_stage_inner_names.index('Ask the candidate whether it can take part in the exclusion')
+          - billet_stage_inner_names.index('Ask the candidate whether it can take part in the exclusion') < billet_stage_inner_names.index('Judge the candidate\'s capability')
+          - "'billet.candidate' in (billet_stage_versions.loop | string)"
+          - "'billet_candidate_source' not in (billet_stage_versions.loop | string)"
+          - "'junioryono.billet.guard_status' in billet_stage_capability_ask"
+          - billet_stage_capability_ask['junioryono.billet.guard_status'].expect == 'capability'
+          - "'pre_r' in billet_stage_capability_judge['ansible.builtin.assert'].fail_msg"
+          - "'could not be determined' in billet_stage_capability_judge['ansible.builtin.assert'].fail_msg"
+          - "'billet_upgrade_recovery_dir' in billet_candidate_stage['ansible.builtin.copy'].dest"
+          - (billet_stage_inner | selectattr('name', 'equalto', "Allocate the transaction's recovery directory") | first)['ansible.builtin.import_tasks'] == 'allocate-recovery.yml'
+          # THE PREVIOUS BINARY is copied inside the transaction, after the hold, under exactly four conditions.
+          - billet_previous_binary_copy.when | length == 4
+          - "'billet_binary_upgrade | default(false)' in billet_previous_binary_copy.when"
+          - "'not billet_interrupted_upgrade | bool' in billet_previous_binary_copy.when"
+          - "'not ansible_check_mode' in billet_previous_binary_copy.when"
+          - "'billet_installed_binary.stat.exists' in billet_previous_binary_copy.when"
+          - billet_previous_binary_copy['ansible.builtin.copy'].dest.endswith('billet.previous')
+        fail_msg: >-
+          stage-candidate.yml must reset the transaction facts and never the
+          classification's, compare a same-holder rerun's intent with the record,
+          refuse the external ledger and the pre-R controller before any
+          allocation, and ask the STAGED copy for its version and its capability
+          before the hold.
+
+    - name: The allocator is one exclusive mkdir inside a bounded retry
+      vars:
+        billet_allocate_argv: "{{ billet_allocate_task['ansible.builtin.command'].argv }}"
+      ansible.builtin.assert:
+        that:
+          - billet_allocate_argv | length == 6
+          - billet_allocate_argv[0] == '/bin/sh'
+          - billet_allocate_argv[1] == '-c'
+          - billet_allocate_argv[3] == 'billet-recovery'
+          - "'billet_exclusion_root' in billet_allocate_argv[4]"
+          - "'billet_recovery_dir_suffix_command' in billet_allocate_argv[5]"
+          - "'sh -c \"$2\"' in billet_allocate_argv[2]"
+          - "'mkdir -m 0700 \"$d\"' in billet_allocate_argv[2]"
+          - "'[ -e \"$d\" ] || [ -L \"$d\" ]' in billet_allocate_argv[2]"
+          - "'-lt 5' in billet_allocate_argv[2]"
+          - "'[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]' in billet_allocate_argv[2]"
+          - "'the suffix generator exited non-zero' in billet_allocate_argv[2]"
+          - "'the stamp could not be drawn' in billet_allocate_argv[2]"
+          - "'mkdir -p' not in billet_allocate_argv[2]"
+          - "'state: directory' not in (billet_host_allocate_tasks | to_json)"
+        fail_msg: >-
+          allocate-recovery.yml must be one `mkdir -m 0700` without -p inside a
+          five-attempt loop that draws its suffix from `sh -c "$2"` on every
+          attempt, validates the stamp once and the suffix each time, and reads a
+          collision only from the name's presence afterwards.
+
+    - name: The transaction claims by shape outside its block and every reader of the claim is gated by the legacy shapes
+      ansible.builtin.assert:
+        that:
+          - "\"in ['guard', 'legacy']\" in (billet_claim_outside['ansible.builtin.assert'].that | join(' '))"
+          - billet_top_level_names.index('Refuse a transaction outside the exclusion') < billet_top_level_names.index("Stage this transaction's atomic host-upgrade claim")
+          - "\"== 'legacy'\" in (billet_claim_legacy.when | string)"
+          - "\"== 'guard'\" in (billet_claim_guard.when | string)"
+          - billet_claim_guard['ansible.builtin.command'].argv[0] == 'ln'
+          - billet_claim_guard['ansible.builtin.command'].argv[1] == '-sT'
+          - "'/active/recovery' in billet_claim_guard['ansible.builtin.command'].argv[3]"
+          - billet_top_level_names.index('Claim the host upgrade inside the converge guard') < billet_top_level_names.index('Durably publish the transaction pointer inside the guard')
+          - "'/active' in (billet_claim_guard_flush.loop | string)"
+          - billet_top_level_names.index('Durably publish the transaction pointer inside the guard') < billet_top_level_names.index('Read back the transaction pointer before live mutation')
+          - "'readlink' in billet_claim_guard_read['ansible.builtin.command'].argv"
+          - billet_top_level_names.index('Read back the transaction pointer before live mutation') < billet_top_level_names.index('Prove this transaction owns the host before live mutation')
+          - billet_top_level_names.index('Prove this transaction owns the host before live mutation') < billet_top_level_names.index('Record that the transaction is claimed inside the guard')
+          - billet_top_level_names.index('Record that the transaction is claimed inside the guard') < billet_top_level_names.index('Upgrade billet as one recoverable host transaction')
+          - billet_claim_record['ansible.builtin.set_fact'].billet_upgrade_claim_shape == 'guard-pointer'
+          - "'billet_published_upgrade_pointer.stdout | trim == billet_upgrade_recovery_dir' in (billet_claim_prove['ansible.builtin.assert'].that | join(' '))"
+          # EVERY slurp OF active IS GATED BY A LEGACY SHAPE, and there are exactly four.
+          - "\"== 'legacy'\" in (billet_services_slurp.when | string)"
+          - "\"== 'legacy-file'\" in (billet_inspect_slurp.when | string)"
+          - "\"in ['legacy', 'legacy-file']\" in (billet_finalize_slurp.when | string)"
+          - "\"in ['legacy', 'legacy-file']\" in (billet_recover_slurp.when | string)"
+          - >-
+            ((billet_host_service_tasks + billet_host_inspection_tasks + billet_host_finalization_tasks
+              + billet_host_recovery_dispatch_tasks + billet_host_account_tasks + billet_host_prepare_tasks
+              + billet_prepare_block + billet_classify_block + billet_host_fallback_tasks
+              + billet_host_stage_tasks + billet_stage_block + billet_stage_inner) | to_json)
+            | regex_findall('"src": "\{\{ billet_exclusion_root \}\}/active"') | length == 4
+          - "'/var/lib/billet/upgrades/active' not in billet_host_services_text"
+          - "'/var/lib/billet/upgrades/active' not in billet_host_inspection_text"
+          - "'/var/lib/billet/upgrades/active' not in billet_host_finalization_text"
+          - "'/var/lib/billet/upgrades/active' not in billet_host_recovery_dispatch_text"
+          # THE INSPECTION reads both grammars and derives nothing from active's existence.
+          - "'recovery-[0-9]{8}T[0-9]{6}-[0-9a-f]{8}|[0-9]{8}T[0-9]{15}' in (billet_inspect_grammar['ansible.builtin.assert'].that | join(' '))"
+          - "'billet_active_upgrade_pointer' not in billet_host_inspection_text"
+          # RECOVERY'S ENTRY is the owned claim, before the ledger volume is examined or anything is stopped.
+          - billet_recovery_dispatch_names.index('Refuse recovery without an owned transaction claim') < billet_recovery_dispatch_names.index("Resolve the ledger volume's stable device path for recovery")
+          - billet_recovery_dispatch_names.index('Refuse recovery without an owned transaction claim') < billet_recovery_dispatch_names.index('Inspect whether the durable host transaction already committed')
+          - "'nothing to recover' in billet_recover_entry['ansible.builtin.assert'].fail_msg"
+          - "\"in ['guard-pointer', 'legacy', 'legacy-file']\" in (billet_recover_entry['ansible.builtin.assert'].that | join(' '))"
+          # FINALIZATION proves ownership by shape before the fence opens, removes the pointer alone and sets the shape back.
+          - billet_finalization_names.index('Refuse finalization without a real owned host-upgrade claim') < billet_finalization_names.index('Prove this transaction still owns the host before finalization')
+          - billet_finalization_names.index('Prove this transaction still owns the host before finalization') < billet_finalization_names.index('Open the committed ledger to operator commands')
+          - "\"== 'guard-pointer'\" in (billet_finalize_readlink.when | string)"
+          - "'readlink' in billet_finalize_readlink['ansible.builtin.command'].argv"
+          - "\"in ['guard-pointer', 'legacy', 'legacy-file']\" in (billet_finalize_guard['ansible.builtin.assert'].that | join(' '))"
+          - "'/active/recovery' in (billet_finalize_close['ansible.builtin.file'].path | string)"
+          - "\"== 'guard-pointer'\" in (billet_finalize_close['ansible.builtin.file'].path | string)"
+          - billet_finalization_names[-1] == 'Record that the guard holds no transaction after the close'
+          - billet_finalize_shape['ansible.builtin.set_fact'].billet_upgrade_claim_shape == 'guard'
+          - "\"== 'guard-pointer'\" in (billet_finalize_shape.when | string)"
+        fail_msg: >-
+          The transaction under the guard must claim by `ln -sT` of the pointer
+          inside the guard, outside the rescue's block, prove it by readlink,
+          record the guard-pointer shape, read the claim's content only under a
+          legacy shape, enter recovery only over an owned claim, and finalize by
+          proving ownership by shape, removing the pointer alone and setting the
+          shape back to guard.
+

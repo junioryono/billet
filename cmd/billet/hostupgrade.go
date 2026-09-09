@@ -1384,6 +1384,62 @@ func settleResumedDecision(root *os.File, journal *hostupgrade.Journal) (bool, e
 // child. The path is what the claim or the journal recorded; the read is not
 // through it.
 func readJournalUnder(root *os.File, dir string) (*hostupgrade.Journal, error) {
+	recovery, err := openRecoveryUnder(root, dir)
+	if err != nil {
+		return nil, err
+	}
+
+	defer func() { _ = recovery.Close() }()
+
+	journal, err := hostupgrade.ReadJournalAt(recovery, func(info os.FileInfo) error {
+		return requireTrustedFile(filepath.Join(dir, hostupgrade.JournalName), info)
+	})
+
+	// A DIRECTORY WITH THE ROLE'S JOURNAL AND NOT THIS PROGRAM'S is a converge's
+	// transaction, which the role resumes; it is neither a Go journal to load
+	// nor a directory with no journal to release.
+	if errors.Is(err, hostupgrade.ErrNoJournal) {
+		if _, statErr := statAt(recovery, roleJournalName); statErr == nil {
+			return nil, fmt.Errorf("%w: %s holds %s", errRoleJournal, dir, roleJournalName)
+		}
+	}
+
+	return journal, err
+}
+
+// validateRecoveryUnder proves a recovery directory holds a complete journal
+// of EITHER program, for a takeover: it answers which, and loads neither.
+func validateRecoveryUnder(root *os.File, dir string) (recoveryKind, error) {
+	recovery, err := openRecoveryUnder(root, dir)
+	if err != nil {
+		return recoveryNone, err
+	}
+
+	defer func() { _ = recovery.Close() }()
+
+	_, err = hostupgrade.ReadJournalAt(recovery, func(info os.FileInfo) error {
+		return requireTrustedFile(filepath.Join(dir, hostupgrade.JournalName), info)
+	})
+
+	switch {
+	case err == nil:
+		return recoveryGo, nil
+	case !errors.Is(err, hostupgrade.ErrNoJournal):
+		return recoveryNone, err
+	}
+
+	if _, err := readRoleJournalAt(recovery, dir); err != nil {
+		return recoveryNone, err
+	}
+
+	return recoveryRole, nil
+}
+
+// openRecoveryUnder opens a recovery directory that must be a direct child of
+// the upgrade root, relative to the root's descriptor (a directory, never a
+// link), and judges it before anything under it is read. The path is what
+// the claim or the journal recorded; the open is not through it.
+func openRecoveryUnder(root *os.File, dir string) (*os.File, error) {
 	name, err := recoveryChild(dir)
 	if err != nil {
 		return nil, err
@@ -1403,7 +1459,6 @@ func readJournalUnder(root *os.File, dir string) (*hostupgrade.Journal, error) {
 	}
 
 	recovery := os.NewFile(uintptr(fd), dir)
-	defer func() { _ = recovery.Close() }()
 
 	// THE RECOVERY DIRECTORY AND THE JOURNAL ARE JUDGED BEFORE THEY ARE
 	// BELIEVED, each on the descriptor that is then read: the directory owned
@@ -1416,18 +1471,18 @@ func readJournalUnder(root *os.File, dir string) (*hostupgrade.Journal, error) {
 	// about an inode reached through a second name.
 	info, err := recovery.Stat()
 	if err != nil {
+		_ = recovery.Close()
+
 		return nil, fmt.Errorf("examine the recovery directory %s: %w", dir, err)
 	}
 
 	if err := requireTrustedDir(dir, info, 0); err != nil {
+		_ = recovery.Close()
+
 		return nil, err
 	}
 
-	journalPath := filepath.Join(dir, hostupgrade.JournalName)
-
-	return hostupgrade.ReadJournalAt(recovery, func(info os.FileInfo) error {
-		return requireTrustedFile(journalPath, info)
-	})
+	return recovery, nil
 }
 
 // abandonClaim releases a claim and removes the directory behind it.

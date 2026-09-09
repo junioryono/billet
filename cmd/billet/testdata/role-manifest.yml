@@ -1,0 +1,31 @@
+version: 2
+server_state_dir: /var/lib/billet/server
+node_state_dir: /var/lib/billet/node
+service_user: billet
+service_group: billet
+binary_existed: true
+server_was_active: true
+node_was_active: true
+candidate_server_active: true
+candidate_node_active: true
+server_enablement: enabled
+node_enablement: enabled
+inputs:
+- path: /etc/billet/billet.yaml
+  backup: billet.yaml.previous
+  existed: true
+  owner: root
+  group: billet
+  mode: '0640'
+- path: /etc/systemd/system/billet-server.service
+  backup: billet-server.service.previous
+  existed: true
+  owner: root
+  group: root
+  mode: '0644'
+- path: /etc/systemd/system/billet-node.service
+  backup: billet-node.service.previous
+  existed: true
+  owner: root
+  group: root
+  mode: '0644'

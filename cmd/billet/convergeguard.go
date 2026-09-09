@@ -117,6 +117,18 @@ type guardOp struct {
 // not.
 var guardHook func(op guardOp) error
 
+// guardSync is the one flush the guard makes, on the descriptor of the object
+// named: the record's temporary, the guard directory, the root, and a hold's
+// candidate with its directory. A test fails it for one object; production
+// runs syncFD, whose body is exactly the Sync, which the structural witness in
+// the tests holds it to.
+var guardSync = syncFD
+
+// syncFD flushes one descriptor and returns what the kernel said.
+func syncFD(f *os.File) error {
+	return f.Sync()
+}
+
 // The other seams: the clock a record is stamped with, the hostname, and who
 // the trust boundary expects to own the root.
 var (
@@ -306,7 +318,11 @@ func holdGuard(root *txLock, holder, candidate string) error {
 
 	record.Hostname = hostname
 
-	path, sum, err := recordExecutable(root, candidate)
+	// THE CANDIDATE IS FLUSHED BEFORE THE RECORD NAMES IT: the file, its
+	// directory and the root, through the descriptors the digest was taken
+	// on, so a guard that survives a power loss records an executable that
+	// survived it too. A hold of the managed binary flushes nothing extra.
+	path, sum, err := recordExecutable(root, candidate, true)
 	if err != nil {
 		return err
 	}
@@ -395,7 +411,7 @@ func writeGuardRecordAt(dir *os.File, record guardRecord, replace bool) error {
 		return err
 	}
 
-	if err := f.Sync(); err != nil {
+	if err := guardSync(f); err != nil {
 		return fmt.Errorf("flush the guard: %w", err)
 	}
 
@@ -547,7 +563,7 @@ func syncDirFD(dir *os.File) error {
 		return err
 	}
 
-	if err := dir.Sync(); err != nil {
+	if err := guardSync(dir); err != nil {
 		return fmt.Errorf("flush %s: %w", dir.Name(), err)
 	}
 
@@ -702,12 +718,12 @@ func validateSameHolder(root *txLock, dir *os.File, shape claimShape, candidate 
 // recordExecutable is the path and digest the guard records: the candidate
 // when one is named, else the managed binary, each opened through descriptors
 // and digested by this command.
-func recordExecutable(root *txLock, candidate string) (string, string, error) {
+func recordExecutable(root *txLock, candidate string, flush bool) (string, string, error) {
 	if candidate == "" {
 		return hashManagedBinary()
 	}
 
-	return hashCandidate(root, candidate)
+	return hashCandidate(root, candidate, flush)
 }
 
 // candidatePath is the cleaned absolute path of a candidate, or a refusal: a
@@ -736,7 +752,7 @@ func candidatePath(candidate string) (string, error) {
 // the recovery directory's, each examined on its descriptor, the digest taken
 // through the file's descriptor, and the name checked against that descriptor
 // at the end.
-func hashCandidate(root *txLock, candidate string) (string, string, error) {
+func hashCandidate(root *txLock, candidate string, flush bool) (string, string, error) {
 	cleaned, err := candidatePath(candidate)
 	if err != nil {
 		return "", "", err
@@ -803,6 +819,38 @@ func hashCandidate(root *txLock, candidate string) (string, string, error) {
 
 	if !os.SameFile(named, info) {
 		return "", "", fmt.Errorf("%s changed while it was being recorded; nothing was recorded", cleaned)
+	}
+
+	if !flush {
+		return cleaned, sum, nil
+	}
+
+	// THE FLUSHES, in the order the durability needs: the file's bytes, the
+	// directory entry that names it, the root's entry that names the
+	// directory; each on the descriptor already judged, before guard.json
+	// exists anywhere.
+	if err := guardObserve("fsync", cleaned, f); err != nil {
+		return "", "", err
+	}
+
+	if err := guardSync(f); err != nil {
+		return "", "", fmt.Errorf("flush the candidate %s: %w", cleaned, err)
+	}
+
+	if err := guardObserve("fsync", filepath.Dir(cleaned), dir); err != nil {
+		return "", "", err
+	}
+
+	if err := guardSync(dir); err != nil {
+		return "", "", fmt.Errorf("flush the recovery directory %s: %w", filepath.Dir(cleaned), err)
+	}
+
+	if err := guardObserve("fsync", upgradeRoot, root.dir); err != nil {
+		return "", "", err
+	}
+
+	if err := guardSync(root.dir); err != nil {
+		return "", "", fmt.Errorf("flush the upgrade root: %w", err)
 	}
 
 	return cleaned, sum, nil
@@ -1136,10 +1184,12 @@ func takeOverGuard(root *txLock, old, holder string) error {
 		return fmt.Errorf("the transaction pointer names %s: %w", target, err)
 	}
 
-	// THE JOURNAL IS READ THROUGH THE ROOT THE LOCK VALIDATED, the pointer's
+	// THE JOURNAL IS JUDGED THROUGH THE ROOT THE LOCK VALIDATED, the pointer's
 	// target opened relative to it, so a root displaced at its name resolves
-	// nothing here.
-	if _, err := readJournalUnder(root.dir, target); err != nil {
+	// nothing here. A takeover proves the transaction COMPLETE, whichever
+	// program journals it: a Go transaction's journal.json, or the role's
+	// manifest.yml; it loads neither, because it resumes nothing itself.
+	if _, err := validateRecoveryUnder(root.dir, target); err != nil {
 		return fmt.Errorf("the transaction pointer names %s, whose journal cannot be read: %w; nothing "+
 			"was taken over", target, err)
 	}

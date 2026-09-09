@@ -1,4 +1,70 @@
 ---
+# RECOVERY'S ENTRY CONDITION IS AN OWNED TRANSACTION CLAIM, from either caller
+# (main.yml's interrupted-upgrade path and the in-run rescue in services.yml):
+# under `guard-pointer` the symlink `<root>/active/recovery` whose target is
+# this run's recovery directory; under the legacy shapes the regular file
+# `<root>/active` whose text is that directory. `guard` (a held host with no
+# transaction) and `none` refuse before anything is stopped: there is nothing
+# to recover, and a rollback entered without a claim would restore state no
+# transaction journaled.
+- name: Inspect the transaction claim before recovery
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+    get_checksum: false
+    get_mime: false
+  loop:
+    - "{{ billet_exclusion_root }}/active"
+    - "{{ billet_exclusion_root }}/active/recovery"
+  register: billet_recovery_claim_states
+  check_mode: false
+  become: true
+
+- name: Read the transaction pointer before recovery
+  ansible.builtin.command:
+    argv:
+      - readlink
+      - "{{ billet_exclusion_root }}/active/recovery"
+  register: billet_recovery_pointer
+  changed_when: false
+  check_mode: false
+  failed_when: false
+  when:
+    - billet_upgrade_claim_shape | default('none') == 'guard-pointer'
+    - billet_recovery_claim_states.results[1].stat.islnk | default(false)
+  become: true
+
+- name: Read the legacy claim before recovery
+  ansible.builtin.slurp:
+    src: "{{ billet_exclusion_root }}/active"
+  register: billet_recovery_legacy_claim
+  when:
+    - billet_upgrade_claim_shape | default('none') in ['legacy', 'legacy-file']
+    - billet_recovery_claim_states.results[0].stat.isreg | default(false)
+  become: true
+
+- name: Refuse recovery without an owned transaction claim
+  ansible.builtin.assert:
+    that:
+      - billet_upgrade_claim_shape | default('none') in ['guard-pointer', 'legacy', 'legacy-file']
+      - billet_upgrade_recovery_dir | default('') | length > 0
+      - >-
+        (billet_upgrade_claim_shape == 'guard-pointer'
+         and billet_recovery_claim_states.results[1].stat.islnk | default(false)
+         and billet_recovery_pointer.rc | default(1) == 0
+         and billet_recovery_pointer.stdout | trim == billet_upgrade_recovery_dir)
+        or
+        (billet_upgrade_claim_shape in ['legacy', 'legacy-file']
+         and billet_recovery_claim_states.results[0].stat.isreg | default(false)
+         and billet_recovery_legacy_claim.content | default('') | b64decode | trim == billet_upgrade_recovery_dir)
+    fail_msg: >-
+      {{ 'No transaction is claimed at ' ~ billet_exclusion_root ~ '/active (the host is in the '
+         ~ (billet_upgrade_claim_shape | default('none')) ~ ' shape); nothing to recover.'
+         if billet_upgrade_claim_shape | default('none') not in ['guard-pointer', 'legacy', 'legacy-file']
+         else 'The transaction claim at ' ~ billet_exclusion_root ~ '/active is not this run\'s ('
+              ~ (billet_upgrade_recovery_dir | default('')) ~ '); leave it for the run that owns it.' }}
+      Nothing was stopped, hidden, restored or finalized.
+
 # WITH A LEDGER VOLUME CONFIGURED, RECOVERY MUST NOT TOUCH AN UNMOUNTED (or
 # wrong-device) STATE DIRECTORY: both finalize and rollback restore or replace
 # ledger content, and doing that against the root disk — or a bind mount, or an

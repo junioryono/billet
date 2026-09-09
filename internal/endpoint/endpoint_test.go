@@ -1,20 +1,39 @@
 package endpoint
 
 import (
+	"encoding/json"
 	"errors"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"net/netip"
 	"net/url"
+	"os"
+	"strconv"
 	"strings"
 	"testing"
 )
 
-// vectors is the vector table of PR 6b commit 3, the canonical contract both
-// billet's Go and its Python are held to: each accepted spelling with the typed
-// fields Parse must yield and the canonical text String must print.
-var vectors = []struct {
+// vectorsPath is the ONE vector table both billet's Go and its Python are
+// held to: `ansible_collections/junioryono/billet/tests/fixtures/endpoint-vectors.json`,
+// read from the package directory. A row added to one language's reading
+// alone is a row the other never sees, which is why there is no Go literal.
+const vectorsPath = "../../ansible_collections/junioryono/billet/tests/fixtures/endpoint-vectors.json"
+
+type vectorRow struct {
+	Input     string   `json:"input"`
+	TLS       bool     `json:"tls"`
+	Scheme    string   `json:"scheme"`
+	Kind      string   `json:"kind"`
+	Host      string   `json:"host"`
+	Rooted    bool     `json:"rooted"`
+	Port      uint16   `json:"port"`
+	Canonical string   `json:"canonical"`
+	Refused   string   `json:"refused"`
+	Words     []string `json:"words"`
+}
+
+type vector struct {
 	input     string
 	tls       bool
 	scheme    string
@@ -23,73 +42,97 @@ var vectors = []struct {
 	rooted    bool
 	port      uint16
 	canonical string
-}{
-	{"control.example:8443", true, "https", HostDNS, "control.example", false, 8443, "https://control.example:8443"},
-	{"control.example.:8443", true, "https", HostDNS, "control.example", true, 8443, "https://control.example.:8443"},
-	{"CONTROL.Example:8443", true, "https", HostDNS, "control.example", false, 8443, "https://control.example:8443"},
-	{"control.example", true, "https", HostDNS, "control.example", false, 443, "https://control.example:443"},
-	{"control.example", false, "http", HostDNS, "control.example", false, 80, "http://control.example:80"},
-	{"control.example:08443", true, "https", HostDNS, "control.example", false, 8443, "https://control.example:8443"},
-	{"http://control.example:443", false, "http", HostDNS, "control.example", false, 443, "http://control.example:443"},
-	{"https://control.example", true, "https", HostDNS, "control.example", false, 443, "https://control.example:443"},
-	{"127.0.0.1:8080", false, "http", HostLiteral, "127.0.0.1", false, 8080, "http://127.0.0.1:8080"},
-	{"127.0.0.1:8443", true, "https", HostLiteral, "127.0.0.1", false, 8443, "https://127.0.0.1:8443"},
-	{"203.0.113.7:8443", false, "http", HostLiteral, "203.0.113.7", false, 8443, "http://203.0.113.7:8443"},
-	{"localhost:8080", false, "http", HostDNS, "localhost", false, 8080, "http://localhost:8080"},
-	{"[2001:DB8::1]:8443", true, "https", HostLiteral, "2001:db8::1", false, 8443, "https://[2001:db8::1]:8443"},
-	{"[2001:db8:0:0:0:0:0:1]:8443", true, "https", HostLiteral, "2001:db8::1", false, 8443, "https://[2001:db8::1]:8443"},
-	{"[2001:db8::1:0:0:1]:8443", true, "https", HostLiteral, "2001:db8::1:0:0:1", false, 8443, "https://[2001:db8::1:0:0:1]:8443"},
-	{"[2001:db8:0:0:1::1]:8443", true, "https", HostLiteral, "2001:db8::1:0:0:1", false, 8443, "https://[2001:db8::1:0:0:1]:8443"},
-	{"[::ffff:192.0.2.1]:8443", true, "https", HostLiteral, "192.0.2.1", false, 8443, "https://192.0.2.1:8443"},
-	{"192.0.2.1.:8443", true, "https", HostDNS, "192.0.2.1", true, 8443, "https://192.0.2.1.:8443"},
-	{"0.0.0.0:8443", true, "https", HostLiteral, "0.0.0.0", false, 8443, "https://0.0.0.0:8443"},
-	{"[::]:8443", true, "https", HostLiteral, "::", false, 8443, "https://[::]:8443"},
-	{"xn--bcher-kva.example:8443", true, "https", HostDNS, "xn--bcher-kva.example", false, 8443, "https://xn--bcher-kva.example:8443"},
-	{"control.example:1", true, "https", HostDNS, "control.example", false, 1, "https://control.example:1"},
-	{"control.example:65535", true, "https", HostDNS, "control.example", false, 65535, "https://control.example:65535"},
 }
 
-// refusals is the table's refused half: each spelling with the ONE reason it
-// is refused for, so a refusal for another reason (an empty host where a range
-// was meant, a syntax error where a zone was) is a failure.
-var refusals = []struct {
+type refusal struct {
 	input  string
 	tls    bool
 	reason error
-	words  string
-}{
-	{"[fe80::1%25eth0]:8443", true, ErrZone, "zone"},
-	{"[::ffff:192.0.2.1%25eth0]:8443", true, ErrZone, "zone"},
-	{"[fe80::1%eth0]:8443", true, ErrSyntax, "escape"},
-	{"https://control.example:8443?", true, ErrRoute, "query"},
-	{"https://control.example:8443#", true, ErrRoute, "fragment"},
-	{"https://control.example:8443/%2F", true, ErrRoute, "path"},
-	{"https://control.example:8443/v1", true, ErrRoute, "path"},
-	{"https://control.example:8443/", true, ErrRoute, "path"},
-	{"https://u:p@control.example:8443", true, ErrRoute, "userinfo"},
-	{"https://control.example:8443?x", true, ErrRoute, "query"},
-	{"https://control.example:8443#f", true, ErrRoute, "fragment"},
-	{"2001:db8::1:8443", true, ErrSyntax, "port"},
-	{"control.example:+8443", true, ErrSyntax, "port"},
-	{"control.example:0", true, ErrPort, "1 to 65535"},
-	{"control.example:65536", true, ErrPort, "1 to 65535"},
-	{"control.example:", true, ErrPort, "empty"},
-	{"https://:8443", true, ErrHost, "no host"},
-	{"", true, ErrHost, "no host"},
-	{"bücher.example:8443", true, ErrGrammar, "ASCII"},
-	{"under_score.example:8443", true, ErrGrammar, "underscore"},
-	{"a..b:8443", true, ErrGrammar, "empty label"},
-	{".a:8443", true, ErrGrammar, "empty label"},
-	{"-a.example:8443", true, ErrGrammar, "begins with a hyphen"},
-	{"a-.example:8443", true, ErrGrammar, "ends with a hyphen"},
-	{"http://x:1", true, ErrScheme, "contradicts"},
-	{"https://x:1", false, ErrScheme, "contradicts"},
-	{"ftp://x:1", false, ErrScheme, "http or https"},
+	words  []string
+}
+
+var refusalKinds = map[string]error{
+	"syntax": ErrSyntax, "scheme": ErrScheme, "host": ErrHost, "route": ErrRoute,
+	"zone": ErrZone, "port": ErrPort, "grammar": ErrGrammar,
+}
+
+// loadVectors reads the table, refusing an empty one, a duplicated input and
+// TLS pair, a row of neither shape, and a refused kind the package does not
+// name, so a table that drifted from either language is a failed test.
+func loadVectors(t *testing.T) ([]vector, []refusal) {
+	t.Helper()
+
+	body, err := os.ReadFile(vectorsPath)
+	if err != nil {
+		t.Fatalf("the vector table: %v", err)
+	}
+
+	var doc struct {
+		Vectors []vectorRow `json:"vectors"`
+	}
+
+	if err := json.Unmarshal(body, &doc); err != nil {
+		t.Fatalf("the vector table: %v", err)
+	}
+
+	if len(doc.Vectors) == 0 {
+		t.Fatal("the vector table is empty")
+	}
+
+	seen := map[[2]string]bool{}
+
+	var (
+		vectors  []vector
+		refusals []refusal
+	)
+
+	for i := range doc.Vectors {
+		r := &doc.Vectors[i]
+		key := [2]string{r.Input, strconv.FormatBool(r.TLS)}
+		if seen[key] {
+			t.Fatalf("the vector table lists %q (tls %v) twice", r.Input, r.TLS)
+		}
+
+		seen[key] = true
+
+		switch {
+		case r.Refused != "" && r.Canonical == "":
+			reason, ok := refusalKinds[r.Refused]
+			if !ok {
+				t.Fatalf("%q is refused for %q, which is not a kind this package names", r.Input, r.Refused)
+			}
+
+			if len(r.Words) == 0 {
+				t.Fatalf("%q is refused with no words to assert", r.Input)
+			}
+
+			refusals = append(refusals, refusal{r.Input, r.TLS, reason, r.Words})
+		case r.Refused == "" && r.Canonical != "":
+			var kind HostKind
+
+			switch r.Kind {
+			case "literal":
+				kind = HostLiteral
+			case "dns":
+				kind = HostDNS
+			default:
+				t.Fatalf("%q has host kind %q", r.Input, r.Kind)
+			}
+
+			vectors = append(vectors, vector{r.Input, r.TLS, r.Scheme, kind, r.Host, r.Rooted, r.Port, r.Canonical})
+		default:
+			t.Fatalf("%q is a row of neither shape", r.Input)
+		}
+	}
+
+	return vectors, refusals
 }
 
 // N1: THE VECTOR TABLE, ROW BY ROW. Parse yields exactly the typed fields and
 // String the canonical text; the refused rows refuse for their one reason.
 func TestParseYieldsTheVectorTable(t *testing.T) {
+	vectors, refusals := loadVectors(t)
+
 	for _, v := range vectors {
 		e, err := Parse(v.input, v.tls)
 		if err != nil {
@@ -127,8 +170,10 @@ func TestParseYieldsTheVectorTable(t *testing.T) {
 			continue
 		}
 
-		if !strings.Contains(err.Error(), r.words) {
-			t.Errorf("Parse(%q, tls=%v): %v does not say %q", r.input, r.tls, err, r.words)
+		for _, word := range r.words {
+			if !strings.Contains(err.Error(), word) {
+				t.Errorf("Parse(%q, tls=%v): %v does not say %q", r.input, r.tls, err, word)
+			}
 		}
 	}
 }
@@ -160,6 +205,8 @@ func TestAZoneIsRefusedBeforeAnyUnmapping(t *testing.T) {
 // N2: EQUALITY is over the scheme, the typed host and the port, nothing less
 // and nothing more.
 func TestEqualIsOverSchemeTypedHostAndPort(t *testing.T) {
+	vectors, _ := loadVectors(t)
+
 	// Every canonical text re-parses to an equal endpoint.
 	for _, v := range vectors {
 		e, err := Parse(v.input, v.tls)
@@ -240,6 +287,8 @@ func TestEqualIsOverSchemeTypedHostAndPort(t *testing.T) {
 // and nothing looser: a record that says `https://CONTROL.example:8443` or
 // `https://control.example` was not written by billet.
 func TestParseCanonicalAdmitsOnlyTheCanonicalText(t *testing.T) {
+	vectors, _ := loadVectors(t)
+
 	for _, v := range vectors {
 		e, err := ParseCanonical(v.canonical)
 		if err != nil {

@@ -321,11 +321,16 @@ jobs:
       # whether the URL the role builds is one it publishes, which check mode
       # cannot see: get_url does not fetch there, so every dry run passes
       # against a 404.
-      # No other suite sets RUNNER_NAME, so none of them reaches the guard --
-      # delete it and they all stay green. The refusal it makes is the difference
-      # between a converge that fails and one that destroys the job running it.
-      - name: Prove a converge cannot be driven from a billet runner
+      # No other suite sets RUNNER_NAME or a holder, so none of them reaches the
+      # guard or the exclusion's preparation -- delete either and they all stay
+      # green. The refusals they make are the difference between a converge that
+      # fails and one that destroys the job running it, or races a rollout for
+      # the binaries. The preparation's cases run under sudo, and here that
+      # launch is required rather than skipped.
+      - name: Prove a converge cannot be driven from a billet runner and prepares its exclusion
         run: make converge-guard-check
+        env:
+          BILLET_GATE_REQUIRE_ROOT: "1"
 
       # The ssh_access role's whole value is one refusal, and no other suite
       # configures a key, so every other gate takes its "nothing configured"

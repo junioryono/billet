@@ -1,0 +1,67 @@
+---
+# THE RECOVERY DIRECTORY, ALLOCATED EXCLUSIVELY. The role's binary transaction
+# journals itself in `<root>/recovery-<UTC stamp>-<8 hex>`: the candidate, the
+# previous inputs, the manifest, the ledger snapshot. Ansible's
+# `file: state=directory` accepts an EXISTING directory, so two stagers that
+# chose one name would share one journal; this is one `mkdir` without `-p`,
+# which fails on an existing name, in a script that draws its suffix INSIDE
+# its loop (an `until:` re-runs a task with the argv it was templated with,
+# measured on ansible-core 2.21, so a draw outside the script would be one
+# draw).
+#
+# STATED AS THE BOUNDED RETRY IT IS. The script reads no errno: a collision is
+# "mkdir failed and the name exists afterwards" (a directory, a file or a
+# dangling link, which `[ -e ]` alone misses), any other failure refuses with
+# mkdir's message (captured by substitution, never through a file under the
+# root, which an unwritable root refuses before mkdir runs), and five
+# collisions refuse as exhausted. The stamp is drawn
+# once and validated before any mkdir; the suffix generator is shell source
+# run by a separate shell (the default is a pipeline, and only a shell makes
+# it one), its output held to eight lowercase hex digits and its status to
+# zero.
+
+- name: Allocate a recovery directory exclusively
+  ansible.builtin.command:
+    argv:
+      - /bin/sh
+      - -c
+      - |
+        set -u
+        root=$1
+        stamp=$(date -u +%Y%m%dT%H%M%S) || { echo "the stamp could not be drawn: date exited $?" >&2; exit 1; }
+        case "$stamp" in
+          [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]) ;;
+          *) echo "the stamp '$stamp' is not <YYYYMMDD>T<HHMMSS>" >&2; exit 1 ;;
+        esac
+        attempt=0
+        while [ "$attempt" -lt 5 ]; do
+          attempt=$((attempt + 1))
+          suffix=$(sh -c "$2") || { echo "the suffix generator exited non-zero on attempt $attempt" >&2; exit 1; }
+          case "$suffix" in
+            [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+            *) echo "the suffix generator printed '$suffix', not eight lowercase hex digits" >&2; exit 1 ;;
+          esac
+          d="$root/recovery-$stamp-$suffix"
+          if reason=$(mkdir -m 0700 "$d" 2>&1); then
+            printf '%s\n' "$d"
+            exit 0
+          fi
+          if [ -e "$d" ] || [ -L "$d" ]; then
+            continue
+          fi
+          echo "attempt $attempt: mkdir $d failed and the name is absent: $reason" >&2
+          exit 1
+        done
+        echo "five names collided under $root; the allocator is exhausted" >&2
+        exit 1
+      - billet-recovery
+      - "{{ billet_exclusion_root }}"
+      - "{{ billet_recovery_dir_suffix_command }}"
+  register: billet_recovery_allocation
+  changed_when: billet_recovery_allocation.rc == 0
+  failed_when: billet_recovery_allocation.rc != 0
+  become: "{{ billet_exclusion_become }}"
+
+- name: Record the upgrade recovery directory
+  ansible.builtin.set_fact:
+    billet_upgrade_recovery_dir: "{{ billet_recovery_allocation.stdout | trim }}"

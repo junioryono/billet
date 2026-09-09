@@ -1,0 +1,15 @@
+{
+  "active": "converge-guard",
+  "guard": {
+    "holder": "",
+    "claimed_at": "",
+    "hostname": "",
+    "recovery_pointer": false,
+    "release_executable": "",
+    "release_executable_sha256": "",
+    "release_executable_verified": {
+      "unknown": "the record is not JSON: invalid character 'o' in literal null (expecting 'u')"
+    },
+    "record_error": "the record is not JSON: invalid character 'o' in literal null (expecting 'u')"
+  }
+}

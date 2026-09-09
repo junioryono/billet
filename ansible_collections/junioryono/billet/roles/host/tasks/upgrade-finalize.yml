@@ -1,31 +1,67 @@
 ---
+# OWNERSHIP BY SHAPE, before the fence opens. Under `guard-pointer` this
+# transaction's claim is the symlink `<root>/active/recovery` whose target is
+# this run's recovery directory, inside the guard this converge holds; under
+# the legacy shapes it is the regular file `<root>/active` whose text is that
+# directory. A missing, foreign, wrong-typed or changed claim leaves the fence,
+# the pointer and the services untouched.
 - name: Inspect the host-upgrade claim before finalization
   ansible.builtin.stat:
-    path: /var/lib/billet/upgrades/active
+    path: "{{ item }}"
     follow: false
-  register: billet_finalization_claim_state
+    get_checksum: false
+    get_mime: false
+  loop:
+    - "{{ billet_exclusion_root }}/active"
+    - "{{ billet_exclusion_root }}/active/recovery"
+  register: billet_finalization_claim_states
   become: true
 
 - name: Refuse finalization without a real owned host-upgrade claim
   ansible.builtin.assert:
     that:
-      - billet_finalization_claim_state.stat.exists
-      - billet_finalization_claim_state.stat.isreg
-      - not billet_finalization_claim_state.stat.islnk | default(false)
+      - billet_upgrade_claim_shape in ['guard-pointer', 'legacy', 'legacy-file']
+      - billet_finalization_claim_states.results[0].stat.exists
+      - not (billet_finalization_claim_states.results[0].stat.islnk | default(false))
+      - >-
+        (billet_upgrade_claim_shape == 'guard-pointer'
+         and billet_finalization_claim_states.results[0].stat.isdir
+         and billet_finalization_claim_states.results[1].stat.exists
+         and billet_finalization_claim_states.results[1].stat.islnk | default(false))
+        or
+        (billet_upgrade_claim_shape in ['legacy', 'legacy-file']
+         and billet_finalization_claim_states.results[0].stat.isreg)
     fail_msg: >-
-      The committed host transaction no longer has a real active claim. Leave
-      its fence intact instead of guessing whether another run owns the host.
+      The committed host transaction no longer has a real active claim in the
+      {{ billet_upgrade_claim_shape }} shape. Leave its fence intact instead of
+      guessing whether another run owns the host.
 
 - name: Read the host-upgrade claim before finalization
   ansible.builtin.slurp:
-    src: /var/lib/billet/upgrades/active
+    src: "{{ billet_exclusion_root }}/active"
   register: billet_finalization_claim
+  when: billet_upgrade_claim_shape in ['legacy', 'legacy-file']
+  become: true
+
+- name: Read the transaction pointer before finalization
+  ansible.builtin.command:
+    argv:
+      - readlink
+      - "{{ billet_exclusion_root }}/active/recovery"
+  register: billet_finalization_pointer
+  changed_when: false
+  when: billet_upgrade_claim_shape == 'guard-pointer'
   become: true
 
 - name: Prove this transaction still owns the host before finalization
   ansible.builtin.assert:
     that:
-      - billet_finalization_claim.content | b64decode | trim == billet_upgrade_recovery_dir
+      - >-
+        (billet_upgrade_claim_shape == 'guard-pointer'
+         and billet_finalization_pointer.stdout | trim == billet_upgrade_recovery_dir)
+        or
+        (billet_upgrade_claim_shape in ['legacy', 'legacy-file']
+         and billet_finalization_claim.content | b64decode | trim == billet_upgrade_recovery_dir)
     fail_msg: >-
       The active host-upgrade claim belongs to another transaction. Leave its
       fence and pointer intact instead of finalizing state this run does not own.
@@ -256,9 +292,17 @@
     label: "{{ item.1.item.name }}"
   when: not (item.1.skipped | default(false))
 
+# THE CLOSE, BY SHAPE. Under the guard the transaction's pointer is removed
+# ALONE and the guard stays held (the converge releases nothing; the operator
+# releases with the holder they exported), and the shape goes back to `guard`
+# so a task later in this invocation reads the shape the host is in. Under the
+# legacy shapes the claim file itself is removed.
 - name: Close the durable host-upgrade transaction after stable service startup
   ansible.builtin.file:
-    path: /var/lib/billet/upgrades/active
+    path: >-
+      {{ billet_exclusion_root ~ '/active/recovery'
+         if billet_upgrade_claim_shape == 'guard-pointer'
+         else billet_exclusion_root ~ '/active' }}
     state: absent
   become: true
 
@@ -267,6 +311,16 @@
     argv:
       - sync
       - -f
-      - /var/lib/billet/upgrades
+      - "{{ item }}"
+  loop: >-
+    {{ [billet_exclusion_root ~ '/active', billet_exclusion_root]
+       if billet_upgrade_claim_shape == 'guard-pointer'
+       else [billet_exclusion_root] }}
   changed_when: false
   become: true
+
+- name: Record that the guard holds no transaction after the close
+  ansible.builtin.set_fact:
+    billet_upgrade_claim_shape: guard
+    billet_interrupted_upgrade: false
+  when: billet_upgrade_claim_shape == 'guard-pointer'
