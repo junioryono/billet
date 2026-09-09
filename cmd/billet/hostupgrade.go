@@ -1374,7 +1374,8 @@ func settleResumedDecision(root *os.File, journal *hostupgrade.Journal) (bool, e
 // child. The path is what the claim or the journal recorded; the read is not
 // through it.
 func readJournalUnder(root *os.File, dir string) (*hostupgrade.Journal, error) {
-	if err := underUpgradeRoot(dir); err != nil {
+	name, err := recoveryChild(dir)
+	if err != nil {
 		return nil, err
 	}
 
@@ -1382,8 +1383,7 @@ func readJournalUnder(root *os.File, dir string) (*hostupgrade.Journal, error) {
 		return nil, err
 	}
 
-	fd, err := unix.Openat(int(root.Fd()), filepath.Base(filepath.Clean(dir)),
-		unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	fd, err := unix.Openat(int(root.Fd()), name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, hostupgrade.ErrNoJournal
@@ -1395,7 +1395,29 @@ func readJournalUnder(root *os.File, dir string) (*hostupgrade.Journal, error) {
 	recovery := os.NewFile(uintptr(fd), dir)
 	defer func() { _ = recovery.Close() }()
 
-	return hostupgrade.ReadJournalAt(recovery)
+	// THE RECOVERY DIRECTORY AND THE JOURNAL ARE JUDGED BEFORE THEY ARE
+	// BELIEVED, each on the descriptor that is then read: the directory owned
+	// by the account and writable by nobody else (a writable one lets another
+	// account remove a journal, which reads as a transaction that never began
+	// and releases the claim), the journal owned and unwritable likewise (a
+	// journal that is another name of a file someone else owns is a step and a
+	// generation that account chooses, and a resume acts on both). What the
+	// root's boundary proves is who can name entries in it; it proves nothing
+	// about an inode reached through a second name.
+	info, err := recovery.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("examine the recovery directory %s: %w", dir, err)
+	}
+
+	if err := requireTrustedDir(dir, info, 0); err != nil {
+		return nil, err
+	}
+
+	journalPath := filepath.Join(dir, hostupgrade.JournalName)
+
+	return hostupgrade.ReadJournalAt(recovery, func(info os.FileInfo) error {
+		return requireTrustedFile(journalPath, info)
+	})
 }
 
 // abandonClaim releases a claim and removes the directory behind it.
@@ -1451,18 +1473,33 @@ func underUpgradeRoot(dir string) error {
 			"billet will not act on it")
 	}
 
-	// A DIRECT CHILD, not merely something underneath. Recovery directories are
-	// created by MkdirTemp directly in the root, so anything deeper is a path this
-	// code did not make — and the operation on the other side of this check deletes
-	// a tree.
-	rel, err := filepath.Rel(upgradeRoot, filepath.Clean(dir))
-	if err != nil || rel == "." || strings.Contains(rel, string(filepath.Separator)) ||
-		strings.HasPrefix(rel, "..") {
-		return fmt.Errorf("%s is not a recovery directory in %s, so billet will not "+
-			"act on it", dir, upgradeRoot)
+	// A DIRECT CHILD, not merely something underneath, AND BY ITS TEXT: recovery
+	// directories are created by MkdirTemp directly in the root, so anything
+	// deeper is a path this code did not make, and the operation on the other
+	// side of this check deletes a tree. The text is judged as written, never
+	// cleaned first: `<root>/hop/../x` collapses to `<root>/x` lexically while
+	// the kernel resolves `hop` first, so a cleaned check would prove one path
+	// and a later operation by name would act on another.
+	if _, err := recoveryChild(dir); err != nil {
+		return err
 	}
 
 	return nil
+}
+
+// recoveryChild is the one component under the upgrade root a recovery
+// directory's path names, or the refusal: the path must be exactly
+// `<upgrade root>/<name>` with a name that is no separator, no `.` and no `..`.
+func recoveryChild(dir string) (string, error) {
+	prefix := upgradeRoot + string(filepath.Separator)
+
+	name, ok := strings.CutPrefix(dir, prefix)
+	if !ok || name == "" || name == "." || name == ".." || strings.Contains(name, string(filepath.Separator)) {
+		return "", fmt.Errorf("%s is not a recovery directory in %s, so billet will not "+
+			"act on it", dir, upgradeRoot)
+	}
+
+	return name, nil
 }
 
 // hostCompatibility describes the running deployment for the preflight.

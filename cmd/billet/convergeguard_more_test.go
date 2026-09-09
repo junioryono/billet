@@ -963,6 +963,9 @@ func TestEveryAncestorOfTheUpgradeRootIsJudged(t *testing.T) {
 	// ANOTHER ACCOUNT'S DIRECTORY on the way is refused whatever its mode.
 	ancID := fileIdentityOf(t, anc)
 	saved := guardOwnerOf
+
+	t.Cleanup(func() { guardOwnerOf = saved })
+
 	guardOwnerOf = func(info os.FileInfo) (uint32, bool) {
 		if st, ok := info.Sys().(*syscall.Stat_t); ok && st.Ino == ancID.Ino {
 			return uint32(os.Geteuid()) + 1, true
@@ -979,10 +982,14 @@ func TestEveryAncestorOfTheUpgradeRootIsJudged(t *testing.T) {
 
 	guardOwnerOf = saved
 
-	// A LINK ANOTHER ACCOUNT MADE is refused however trusted its target: under
-	// the sticky bit that account cannot rename billet's entries, and can
-	// repoint its own link at will.
-	foreign := filepath.Join(base, "foreign")
+	// A LINK ANOTHER ACCOUNT MADE INSIDE A STICKY DIRECTORY is refused however
+	// trusted its target: under the sticky bit that account cannot rename
+	// billet's entries there, and can repoint its own link at will.
+	sticky := filepath.Join(base, "sticky")
+	mustOK(t, os.Mkdir(sticky, 0o777))
+	mustOK(t, os.Chmod(sticky, 0o777|os.ModeSticky))
+
+	foreign := filepath.Join(sticky, "foreign")
 	mustOK(t, os.Symlink(anc, foreign))
 
 	linkInfo, err := os.Lstat(foreign)
@@ -1002,7 +1009,7 @@ func TestEveryAncestorOfTheUpgradeRootIsJudged(t *testing.T) {
 		return ownerFromInfo(info)
 	}
 
-	mustOK(t, os.Chmod(anc, 0o777|os.ModeSticky))
+	mustOK(t, os.Chmod(anc, 0o700))
 
 	upgradeRoot = filepath.Join(foreign, "lib", "billet", "upgrades")
 
@@ -1269,4 +1276,198 @@ func TestARecordOutsideTheTrustBoundaryNamesNoHolder(t *testing.T) {
 
 		check(t, "another account's record")
 	})
+}
+
+// G25: THE CLAIM'S TARGET IS EXACTLY ONE CHILD OF THE ROOT, BY ITS TEXT. A
+// target spelled `<root>/hop/../x` is `<root>/x` to a lexical check and
+// `/outside/x` to the kernel once `hop` is a link out of the root, so a
+// resume that admitted it would read one directory's journal and remove
+// another's tree. The spelling is refused before anything is read; the claim
+// and the outside tree are untouched. The takeover's pointer is held to the
+// same rule.
+func TestAClaimTargetIsExactlyOneChildOfTheRootByItsText(t *testing.T) {
+	for _, spelling := range []string{"/hop/../recovery-x", "/./recovery-x", "/recovery-x/", "//recovery-x", "/..", "/recovery-x/.."} {
+		t.Run(spelling, func(t *testing.T) {
+			f := newGuardedFixture(t)
+			mustOK(t, os.Mkdir(f.root, 0o700))
+
+			outside := filepath.Join(t.TempDir(), "outside")
+			mustOK(t, os.MkdirAll(filepath.Join(outside, "child"), 0o700))
+			mustOK(t, os.MkdirAll(filepath.Join(outside, "recovery-x"), 0o700))
+			writeJournalFixture(t, filepath.Join(outside, "recovery-x"), "claimed")
+			mustOK(t, os.Symlink(filepath.Join(outside, "child"), filepath.Join(f.root, "hop")))
+
+			recovery := filepath.Join(f.root, "recovery-x")
+			mustOK(t, os.Mkdir(recovery, 0o700))
+			writeJournalFixture(t, recovery, "claimed")
+
+			// STRING CONCATENATION, so the spelling reaches the pointer as written.
+			target := f.root + spelling
+			mustOK(t, os.Symlink(target, f.active()))
+
+			err := resumeHostUpgrade(t.Context(), f.cfg)
+			if err == nil || !strings.Contains(err.Error(), "is not a recovery directory in") {
+				t.Errorf("a resume over the target %q: err = %v, want the refusal naming the root", target, err)
+			}
+
+			if got, err := os.Readlink(f.active()); err != nil || got != target {
+				t.Errorf("the claim moved to %q (%v)", got, err)
+			}
+
+			if _, err := os.Stat(filepath.Join(outside, "recovery-x", "journal.json")); err != nil {
+				t.Errorf("the outside tree was touched: %v", err)
+			}
+
+			if len(f.reached) != 0 {
+				t.Errorf("the refused resume reached %v", f.reached)
+			}
+		})
+	}
+
+	t.Run("the takeover's pointer", func(t *testing.T) {
+		f := newGuardFixture(t)
+		mustHold(t, "ci-1")
+		cleanScan(t)
+
+		recovery := filepath.Join(f.root, "recovery-x")
+		mustOK(t, os.Mkdir(recovery, 0o700))
+		writeJournalFixture(t, recovery, "installed")
+		mustOK(t, os.Symlink(f.root+"/hop/../recovery-x", filepath.Join(f.active(), guardPointerName)))
+
+		rec := f.record(t)
+
+		if err := guardRun(t, "hold", "--holder", "ci-2", "--recover-from", "ci-1", "--old-driver-stopped"); err == nil ||
+			!strings.Contains(err.Error(), "is not a recovery directory in") {
+			t.Errorf("a takeover over a pointer spelled through ..: err = %v", err)
+		}
+
+		if got := f.record(t); got != rec {
+			t.Errorf("the refused takeover changed the record to %+v", got)
+		}
+	})
+}
+
+// G26: THE RECOVERY DIRECTORY AND THE JOURNAL ARE JUDGED BEFORE THEY ARE
+// BELIEVED: a recovery directory another account could write, or a journal
+// another account owns or could write, refuses the resume and the takeover
+// with the trust boundary, the claim retained and nothing removed; and a
+// journal ABSENT from a directory outside the boundary is a refusal, never a
+// transaction that never began.
+func TestARecoveryDirectoryAndItsJournalAreJudgedBeforeTheyAreBelieved(t *testing.T) {
+	type plant func(t *testing.T, recovery string)
+
+	journalIno := func(t *testing.T, recovery string) uint64 {
+		t.Helper()
+
+		info, err := os.Lstat(filepath.Join(recovery, "journal.json"))
+		mustOK(t, err)
+
+		st, ok := info.Sys().(*syscall.Stat_t)
+		if !ok {
+			t.Fatal("no Stat_t")
+		}
+
+		return st.Ino
+	}
+
+	cases := map[string]plant{
+		"a group-writable recovery directory": func(t *testing.T, recovery string) {
+			t.Helper()
+			mustOK(t, os.Chmod(recovery, 0o775))
+		},
+		"a group-writable journal": func(t *testing.T, recovery string) {
+			t.Helper()
+			mustOK(t, os.Chmod(filepath.Join(recovery, "journal.json"), 0o660))
+		},
+		"another account's journal": func(t *testing.T, recovery string) {
+			t.Helper()
+
+			ino := journalIno(t, recovery)
+			saved := guardOwnerOf
+
+			t.Cleanup(func() { guardOwnerOf = saved })
+
+			guardOwnerOf = func(info os.FileInfo) (uint32, bool) {
+				if st, ok := info.Sys().(*syscall.Stat_t); ok && st.Ino == ino {
+					return uint32(os.Geteuid()) + 1, true
+				}
+
+				return ownerFromInfo(info)
+			}
+		},
+		"another account's recovery directory": func(t *testing.T, recovery string) {
+			t.Helper()
+
+			id := fileIdentityOf(t, recovery)
+			saved := guardOwnerOf
+
+			t.Cleanup(func() { guardOwnerOf = saved })
+
+			guardOwnerOf = func(info os.FileInfo) (uint32, bool) {
+				if st, ok := info.Sys().(*syscall.Stat_t); ok && st.Ino == id.Ino && info.IsDir() {
+					return uint32(os.Geteuid()) + 1, true
+				}
+
+				return ownerFromInfo(info)
+			}
+		},
+		"a group-writable recovery directory with no journal": func(t *testing.T, recovery string) {
+			t.Helper()
+			mustOK(t, os.Remove(filepath.Join(recovery, "journal.json")))
+			mustOK(t, os.Chmod(recovery, 0o775))
+		},
+	}
+
+	for name, plant := range cases {
+		t.Run("resume over "+name, func(t *testing.T) {
+			f := newGuardedFixture(t)
+			mustOK(t, os.Mkdir(f.root, 0o700))
+
+			recovery := filepath.Join(f.root, "recovery-x")
+			mustOK(t, os.Mkdir(recovery, 0o700))
+			writeJournalFixture(t, recovery, "claimed")
+			mustOK(t, os.Symlink(recovery, f.active()))
+
+			plant(t, recovery)
+
+			if err := resumeHostUpgrade(t.Context(), f.cfg); !errors.Is(err, errTrustBoundary) {
+				t.Errorf("a resume over %s: err = %v, want the trust boundary", name, err)
+			}
+
+			if _, err := os.Lstat(f.active()); err != nil {
+				t.Errorf("the refused resume released the claim: %v", err)
+			}
+
+			if _, err := os.Lstat(recovery); err != nil {
+				t.Errorf("the refused resume removed the recovery directory: %v", err)
+			}
+
+			if len(f.reached) != 0 {
+				t.Errorf("the refused resume reached %v", f.reached)
+			}
+		})
+
+		t.Run("takeover over "+name, func(t *testing.T) {
+			f := newGuardFixture(t)
+			mustHold(t, "ci-1")
+			cleanScan(t)
+
+			recovery := filepath.Join(f.root, "recovery-x")
+			mustOK(t, os.Mkdir(recovery, 0o700))
+			writeJournalFixture(t, recovery, "installed")
+			mustOK(t, os.Symlink(recovery, filepath.Join(f.active(), guardPointerName)))
+
+			rec := f.record(t)
+
+			plant(t, recovery)
+
+			if err := guardRun(t, "hold", "--holder", "ci-2", "--recover-from", "ci-1", "--old-driver-stopped"); !errors.Is(err, errTrustBoundary) {
+				t.Errorf("a takeover over %s: err = %v, want the trust boundary", name, err)
+			}
+
+			if got := f.record(t); got != rec {
+				t.Errorf("the refused takeover changed the record to %+v", got)
+			}
+		})
+	}
 }

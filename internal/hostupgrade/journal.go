@@ -215,14 +215,22 @@ func ReadJournal(dir string) (*Journal, error) {
 
 // ReadJournalAt is ReadJournal for a recovery directory the caller holds open,
 // the journal opened relative to that descriptor and never by a name a root
-// displaced in the meantime would resolve elsewhere.
-func ReadJournalAt(dir *os.File) (*Journal, error) {
-	f, _, err := regularfile.OpenAt(dir, JournalName)
+// displaced in the meantime would resolve elsewhere. trust, when given, judges
+// the journal's own metadata (the fstat of the descriptor that is then read)
+// before a byte of it is believed; its refusal is returned as it is.
+func ReadJournalAt(dir *os.File, trust func(os.FileInfo) error) (*Journal, error) {
+	f, info, err := regularfile.OpenAt(dir, JournalName)
 	if err != nil {
 		return parseJournal(nil, err)
 	}
 
 	defer func() { _ = f.Close() }()
+
+	if trust != nil {
+		if err := trust(info); err != nil {
+			return nil, err
+		}
+	}
 
 	body, err := regularfile.ReadAllLimited(f, filepath.Join(dir.Name(), JournalName), maxJournalBytes)
 
