@@ -141,6 +141,11 @@ root=${BILLET_FAKE_ROOT:-/nonexistent}
 case "${1:-}" in
   version)
     v=$(var VERSION)
+    seq=$(var VERSION_SEQUENCE)
+    if [ -n "$seq" ] && [ -s "$seq" ]; then
+      v=$(head -n1 "$seq")
+      tail -n +2 "$seq" >"$seq.next" && mv "$seq.next" "$seq"
+    fi
     printf 'billet %s linux/amd64\n' "${v:-v0.10.0}"
     exit 0 ;;
   converge-guard) ;;
@@ -433,6 +438,7 @@ fi
 HOLDER=h1
 RUNNER=""
 KEEP_OWNER=0
+CASE_DIR_MODE=0755
 status=0
 
 # run_case NAME escalated|unescalated [NAME=VALUE ...] -- [ansible args ...]
@@ -470,16 +476,21 @@ run_case() {
     sudo -n chown root "$work" "$work/cases"
     sudo -n chmod 1777 "$work" "$work/cases"
     sudo -n chown root "$case_dir"
-    sudo -n chmod 0755 "$case_dir"
+    sudo -n chmod "${CASE_DIR_MODE:-0755}" "$case_dir"
     if [ -d "$case_dir/lib" ] && [ "$KEEP_OWNER" = 0 ]; then sudo -n chown -R root:root "$case_dir/lib"; fi
   fi
+  # Ansible's temporary directory: under the case directory while the invoker
+  # can write there, else beside it (an unescalated case over a root-owned
+  # case directory).
+  local tmp="$case_dir/tmp"
+  if [ ! -w "$case_dir" ]; then tmp="$work/tmp-$name"; mkdir -p "$tmp"; fi
   set +e
   "${launcher[@]+"${launcher[@]}"}" env \
     PATH="$fakes:$PATH" \
     HOME="$HOME" \
     ANSIBLE_COLLECTIONS_PATH="$collections_path" \
     ANSIBLE_STDOUT_CALLBACK=default ANSIBLE_NOCOLOR=1 ANSIBLE_FORCE_COLOR=0 \
-    ANSIBLE_LOCAL_TEMP="$case_dir/tmp" ANSIBLE_REMOTE_TEMP="$case_dir/tmp" \
+    ANSIBLE_LOCAL_TEMP="$tmp" ANSIBLE_REMOTE_TEMP="$tmp" \
     RUNNER_NAME="$RUNNER" \
     BILLET_CONVERGE_GUARD_HOLDER="$HOLDER" \
     BILLET_FAKE_LOG="$case_dir/log" \
@@ -846,7 +857,10 @@ plant p6-socket
 run_case p6-socket escalated --
 expect_refused p6-socket "Refuse a claim of a type the role does not know" "a socket"
 plant p6-denied
-as_root chown root:root "$work/cases/p6-denied/lib/billet" "$(root_of p6-denied)"
+# The chain above the root is root's (the ancestors judgement runs before the
+# claim's stat); only the root's contents are denied to the invoker.
+as_root chown root:root "$work/cases/p6-denied" "$work/cases/p6-denied/lib" "$work/cases/p6-denied/lib/billet" "$(root_of p6-denied)"
+as_root chmod 0755 "$work/cases/p6-denied" "$work/cases/p6-denied/lib"
 as_root chmod 0700 "$(root_of p6-denied)"
 run_case p6-denied unescalated --
 expect_refused p6-denied "Refuse a claim that could not be examined" "could not be examined" "not one that is absent"
@@ -1189,7 +1203,15 @@ p17_unsafe symlink 'sudo -n rmdir upgrades; sudo -n mkdir elsewhere; sudo -n ln 
 p17_unsafe file 'sudo -n rmdir upgrades; sudo -n touch upgrades' "not a directory"
 p17_unsafe owner 'sudo -n chown 1000 upgrades' "owned by uid 1000"
 p17_unsafe group-writable 'sudo -n chmod 0770 upgrades' "writable by its group or by others"
-echo "ok   P17: the root is established 0755/0700 root on a fresh host and an unsafe one refuses before any allocation"
+# THE CHAIN ABOVE THE ROOT: an ancestor another account can rename refuses
+# before anything is allocated, staged, executed or held.
+plant p17-ancestor
+CASE_DIR_MODE=0775; run_case p17-ancestor escalated -- -e billet_binary_src="$work/cases/p17-ancestor/src/billet" -e billet_recovery_dir_suffix_command="$fakes/suffix"; CASE_DIR_MODE=0755
+expect_refused p17-ancestor "Refuse an upgrade root whose ancestors another account can rename" "writable by group or others without the sticky bit"
+expect_calls p17-ancestor suffix "" 0
+marker_absent p17-ancestor
+log_empty p17-ancestor
+echo "ok   P17: the root is established 0755/0700 root on a fresh host, an unsafe one refuses before any allocation, and so does an unsafe ancestor"
 
 # =============================================================================
 # S. The staging.
@@ -1228,7 +1250,7 @@ expect_calls s1 candidate "version @$journal/billet.candidate" 1
 expect_calls s1 candidate "converge-guard status --json @$journal/billet.candidate" 1
 expect_calls s1 candidate "converge-guard hold --holder h1 --candidate $journal/billet.candidate @$journal/billet.candidate" 1
 order=$(calls s1 | grep -v '^timeout\|^mkdir\|^date' | awk -F'[: ]' '{print $1 ":" $3}' | tr '\n' ' ')
-[ "$order" = "managed:converge-guard suffix: managed:version candidate:version candidate:converge-guard candidate:converge-guard " ] || fail "s1: the order is not status, allocation, versions, capability, hold: $order" "$work/cases/s1/log"
+[ "$order" = "managed:converge-guard suffix: managed:version candidate:version candidate:converge-guard candidate:converge-guard managed:version " ] || fail "s1: the order is not status, allocation, versions, capability, hold, the release re-read: $order" "$work/cases/s1/log"
 expect_calls s1 systemctl "" 0
 echo "ok   S1: a pinned release is staged into an exclusive journal and asked, proved and held as the staged copy, in order"
 
@@ -1447,5 +1469,14 @@ rm -f "$work/cases/s10-absent/bin/billet"
 run_case s10-absent escalated BILLET_FAKE_HOLD_REPLACE="$work/cases/s10-absent/bin/billet" -- -e billet_binary_src="$work/cases/s10-absent/src/billet"
 expect_refused s10-absent "Refuse a converge whose installed binary moved before the hold" "absent when the binary change was decided"
 echo "ok   S10: a binary that moved between the decision and the hold refuses under the guard"
+
+# S11. The installed release read as B between the digest (A) and the hold,
+# then A again under the guard: the digest agrees and the decision does not.
+plant s11
+printf 'v0.9.0\nv0.10.0\n' >"$work/cases/s11/versions"
+run_case s11 escalated BILLET_FAKE_MANAGED_VERSION_SEQUENCE="$work/cases/s11/versions" BILLET_FAKE_CANDIDATE_VERSION=v0.9.5 -- -e billet_binary_src="$work/cases/s11/src/billet"
+expect_refused s11 "Refuse a converge whose installed release moved before the hold" "billet v0.9.0" "billet v0.10.0" "converge-guard release --holder h1"
+expect_calls s11 managed "version" 2
+echo "ok   S11: an installed release that moved behind an unchanged digest refuses under the guard"
 
 echo "converge guard: every guard, preparation and staging case passes"

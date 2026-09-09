@@ -53,12 +53,14 @@
 
     # Skipped unless a version or a channel is named AND no binary was
     # supplied, so an ordinary billet_binary_src host never reaches the network.
+    # NOT GATED ON CHECK MODE: binary.yml refuses a moving pin and reports what
+    # a dry run would fetch, and a gate on the import would skip those with the
+    # fetch (a dry run once admitted `latest` that way).
     - name: Fetch the pinned billet release onto the target
       ansible.builtin.import_tasks: binary.yml
       when:
         - billet_version | length > 0 or billet_release_channel | length > 0
         - billet_binary_src | length == 0
-        - not ansible_check_mode
 
     - name: Inspect the supplied candidate billet binary on the controller
       ansible.builtin.stat:

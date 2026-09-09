@@ -768,7 +768,15 @@
           - billet_prepare_block_names.index('Record the hold') < billet_prepare_block_names.index('Inspect the installed billet binary under the guard')
           - billet_prepare_block_names.index('Inspect the installed billet binary under the guard') < billet_prepare_block_names.index('Refuse a converge whose installed binary moved before the hold')
           - "'billet_installed_binary.stat.checksum' in ((billet_prepare_block | selectattr('name', 'equalto', 'Refuse a converge whose installed binary moved before the hold') | first)['ansible.builtin.assert'].that | join(' '))"
-          - "'billet_exclusion_hold is changed' in ((billet_prepare_block | selectattr('name', 'equalto', 'Refuse a converge whose installed binary moved before the hold') | first).when | string)"
+          - (billet_prepare_block | selectattr('name', 'equalto', 'Inspect the installed billet binary under the guard') | first).when == ['billet_exclusion_hold is changed', 'not billet_exclusion_darwin | bool']
+          - (billet_prepare_block | selectattr('name', 'equalto', 'Refuse a converge whose installed binary moved before the hold') | first).when == ['billet_exclusion_hold is changed', 'not billet_exclusion_darwin | bool']
+          - (billet_prepare_block | selectattr('name', 'equalto', 'Read the installed release under the guard') | first).when == ['billet_exclusion_hold is changed', 'not billet_exclusion_darwin | bool', 'billet_binary_upgrade | default(false)', 'billet_installed_binary.stat.exists']
+          - (billet_prepare_block | selectattr('name', 'equalto', 'Refuse a converge whose installed release moved before the hold') | first).when == ['billet_exclusion_hold is changed', 'not billet_exclusion_darwin | bool', 'billet_binary_upgrade | default(false)', 'billet_installed_binary.stat.exists']
+          - billet_prepare_block_names.index('Refuse a converge whose installed binary moved before the hold') < billet_prepare_block_names.index('Read the installed release under the guard')
+          - billet_prepare_block_names.index('Read the installed release under the guard') < billet_prepare_block_names.index('Refuse a converge whose installed release moved before the hold')
+          # THE CHAIN ABOVE THE ROOT is judged before the claim is inspected, through the module's ancestors judgement.
+          - billet_prepare_block_names.index('Judge the ancestors of the upgrade root') < billet_prepare_block_names.index('Inspect the durable claim')
+          - (billet_prepare_block | selectattr('name', 'equalto', 'Judge the ancestors of the upgrade root') | first)['junioryono.billet.guard_fallback'].judge == 'ancestors'
           # THE LEGACY PROTOCOL only when no capable executable exists.
           - "'billet_exclusion_managed_pre_r' in ((billet_prepare_block | selectattr('name', 'equalto', 'Record that a release before the guard runs the legacy protocol') | first).when | string)"
           - "'not (billet_binary_upgrade' in ((billet_prepare_block | selectattr('name', 'equalto', 'Record that a release before the guard runs the legacy protocol') | first).when | string)"

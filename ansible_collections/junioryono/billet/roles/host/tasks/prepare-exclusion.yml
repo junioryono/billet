@@ -216,6 +216,33 @@
         - not ansible_check_mode
       become: true
 
+    # THE CHAIN EVERY PATH UNDER THE ROOT RESOLVES THROUGH, judged before
+    # anything under it is executed: the staged candidate answers `version`
+    # and `converge-guard status` by pathname before the hold's own boundary
+    # check runs, and an ancestor another account can rename (writable
+    # without the sticky bit, or a link that account made) would let it
+    # substitute the executable after its digest was taken. The same walk the
+    # fallback reader makes, from the filesystem root down.
+    - name: Judge the ancestors of the upgrade root
+      junioryono.billet.guard_fallback:
+        root: "{{ billet_exclusion_root }}"
+        owner: "{{ billet_exclusion_owner_uid | int }}"
+        judge: ancestors
+      register: billet_exclusion_ancestors
+      failed_when: false
+      check_mode: false
+      become: "{{ billet_exclusion_become }}"
+
+    - name: Refuse an upgrade root whose ancestors another account can rename
+      ansible.builtin.assert:
+        that:
+          - not (billet_exclusion_ancestors.failed | default(false))
+          - billet_exclusion_ancestors.phase is not defined
+        fail_msg: >-
+          {{ billet_exclusion_ancestors.msg | default('the chain above ' ~ billet_exclusion_root ~ ' could not be judged') }}.
+          Nothing under {{ billet_exclusion_root }} is executed, allocated or held
+          through a chain another account can rename.
+
     # THE CLAIM'S SHAPE, by a stat that follows nothing: a symlink is a Go
     # transaction's, a regular file the pre-R role's, a directory a guard's
     # (asked below), anything else a type the role refuses to read.
@@ -705,6 +732,47 @@
       when:
         - billet_exclusion_hold is changed
         - not billet_exclusion_darwin | bool
+
+    # AND ITS RELEASE, read again: the downgrade decision read the installed
+    # binary's `version` apart from its digest, and an updater that installed
+    # another release and restored this one in between leaves the digest as
+    # it was beside a decision made against the other release.
+    - name: Read the installed release under the guard
+      ansible.builtin.command:
+        argv:
+          - "{{ billet_exclusion_binary }}"
+          - version
+      register: billet_exclusion_release_under_guard
+      changed_when: false
+      check_mode: false
+      become: "{{ billet_exclusion_become }}"
+      when:
+        - billet_exclusion_hold is changed
+        - not billet_exclusion_darwin | bool
+        - billet_binary_upgrade | default(false)
+        - billet_installed_binary.stat.exists
+
+    - name: Refuse a converge whose installed release moved before the hold
+      ansible.builtin.assert:
+        that:
+          - >-
+            (billet_exclusion_release_under_guard.stdout_lines[0] | default(''))
+            == (billet_release_of.results[0].stdout_lines[0] | default(''))
+        fail_msg: >-
+          {{ billet_exclusion_binary }} reported
+          "{{ billet_release_of.results[0].stdout_lines[0] | default('') }}" when
+          the binary change was decided and
+          "{{ billet_exclusion_release_under_guard.stdout_lines[0] | default('') }}"
+          under the guard: an updater moved this host in between and the
+          decision no longer describes it. Nothing further is done;
+          {{ billet_exclusion_holder }} holds the guard, which
+          `{{ billet_exclusion_executable }} converge-guard release --holder {{ billet_exclusion_holder }}`
+          releases. Converge again.
+      when:
+        - billet_exclusion_hold is changed
+        - not billet_exclusion_darwin | bool
+        - billet_binary_upgrade | default(false)
+        - billet_installed_binary.stat.exists
 
     # THE LEGACY PROTOCOL is admitted only when no executable able to hold
     # exists: a managed binary that predates the guard, no candidate staged,

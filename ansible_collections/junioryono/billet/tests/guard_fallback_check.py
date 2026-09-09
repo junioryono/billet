@@ -288,6 +288,41 @@ def main():
         finally:
             mod.os.lstat = real_lstat
 
+    # THE ANCESTORS ALONE, as the preparation asks before it executes anything
+    # under the root: a fresh host's absent parent is admitted, an unsafe
+    # ancestor refused, an unsafe existing root refused.
+    with tempfile.TemporaryDirectory() as base:
+        try:
+            mod.judge_ancestors(os.path.join(base, "billet", "upgrades"), owner)
+        except mod.Refusal as exc:
+            fail("a fresh host's absent parent was refused: %s" % exc)
+        os.chmod(base, 0o777)
+        try:
+            mod.judge_ancestors(os.path.join(base, "billet", "upgrades"), owner)
+        except mod.Refusal as exc:
+            if exc.phase != "ancestors" or "writable by group or others" not in str(exc):
+                fail("the unsafe ancestor refused for the wrong reason: %s" % exc)
+        else:
+            fail("an unsafe ancestor was admitted by the ancestors judgement")
+    with tempfile.TemporaryDirectory() as base:
+        # An absent ancestor above the parent ends the walk: nothing under it
+        # exists to be renamed, and the caller's own stat answers for what it
+        # asked about.
+        try:
+            mod.judge_ancestors(os.path.join(base, "missing", "billet", "upgrades"), owner)
+        except mod.Refusal as exc:
+            fail("an absent ancestor was refused: %s" % exc)
+    with tempfile.TemporaryDirectory() as base:
+        tree = Tree(base)
+        tree.root.chmod(0o770)
+        try:
+            mod.judge_ancestors(str(tree.root), owner)
+        except mod.Refusal as exc:
+            if "writable by its group" not in str(exc):
+                fail("the group-writable root refused for the wrong reason: %s" % exc)
+        else:
+            fail("a group-writable root was admitted by the ancestors judgement")
+
     # HARD LINKS ARE ADMITTED: the command imposes no one-link rule.
     with tempfile.TemporaryDirectory() as base:
         tree = Tree(base)

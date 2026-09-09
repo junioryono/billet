@@ -56,6 +56,15 @@ options:
     description: The uid that must own every component (root on Linux; the launch agent's account on a Mac).
     type: int
     required: true
+  judge:
+    description:
+      - C(record) reads the guard's record and answers the recorded executable;
+        C(ancestors) judges only the chain above and including the root's
+        parent (and the root when it exists), which the preparation asks before
+        anything under the root is executed.
+    type: str
+    choices: [record, ancestors]
+    default: record
 author:
   - junioryono
 """
@@ -167,11 +176,19 @@ def require_trusted_ancestors(phase, parent, owner):
         name = pending.pop(0)
         if name == "..":
             at = os.path.dirname(at.rstrip(os.sep)) or os.sep
-            st = lstat_or_refuse(phase, at)
-            require_ancestor(phase, at, st, owner)
+            require_ancestor(phase, at, lstat_or_refuse(phase, at), owner)
             continue
         candidate = os.path.join(at, name)
-        st = lstat_or_refuse(phase, candidate)
+        # AN ABSENT ANCESTOR ENDS THE WALK: nothing lies under it to rename, and
+        # what the caller asks about below it is answered by its own stat (a
+        # fresh host's parent not yet made; a held converge whose tree vanished,
+        # which the claim's stat then refuses as the exclusion having moved).
+        try:
+            st = os.lstat(candidate)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise Refusal(phase, "%s could not be examined: %s" % (candidate, exc))
         if stat.S_ISLNK(st.st_mode):
             if st.st_uid not in (0, owner):
                 raise Refusal(phase, "the link %s is owned by uid %d, want root or uid %d, and a link another account made is a name it can repoint" % (candidate, st.st_uid, owner))
@@ -289,6 +306,21 @@ def admit_candidate(root, owner, executable, digest):
     return actual
 
 
+def judge_ancestors(root, owner):
+    """The chain a candidate's pathname resolves through, judged before the
+    preparation executes anything under the root: every ancestor from `/`,
+    the root's parent when it exists (a fresh host's does not yet), and the
+    root when it exists."""
+    parent = os.path.dirname(root)
+    require_trusted_ancestors("ancestors", parent, owner)
+    for path in (parent, root):
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            continue
+        require_dir("ancestors", path, owner)
+
+
 def find(root, owner):
     record = read_record(root, owner)
     digest = admit_candidate(root, owner, record["release_executable"], record["release_executable_sha256"])
@@ -300,12 +332,21 @@ def main():
         argument_spec=dict(
             root=dict(type="path", required=True),
             owner=dict(type="int", required=True),
+            judge=dict(type="str", default="record", choices=["record", "ancestors"]),
         ),
         supports_check_mode=True,
     )
     root = os.path.normpath(module.params["root"])
     if not os.path.isabs(root):
         module.fail_json(msg="root %s is not an absolute path" % root)
+        return
+    if module.params["judge"] == "ancestors":
+        try:
+            judge_ancestors(root, module.params["owner"])
+        except Refusal as exc:
+            module.fail_json(msg="the upgrade root's chain cannot be trusted: %s" % exc, phase=exc.phase)
+            return
+        module.exit_json(changed=False, executable="", sha256="")
         return
     try:
         executable, digest = find(root, module.params["owner"])
