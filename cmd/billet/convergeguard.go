@@ -144,8 +144,13 @@ func linkCountOf(info os.FileInfo) uint64 {
 		return 0
 	}
 
-	return uint64(st.Nlink)
+	return widen(st.Nlink)
 }
+
+// widen is the one spelling of a stat field's conversion to 64 bits: Nlink is
+// 16 bits on darwin, 32 on linux/arm64 and 64 on linux/amd64, and a conversion
+// written for one of them is flagged as unnecessary on another.
+func widen[T ~uint16 | ~uint32 | ~uint64](v T) uint64 { return uint64(v) }
 
 func ownerFromInfo(info os.FileInfo) (uint32, bool) {
 	st, ok := info.Sys().(*syscall.Stat_t)
@@ -358,9 +363,10 @@ func publishGuard(root *txLock, record guardRecord) error {
 // writeGuardRecordAt writes the record as `guard.json.tmp` inside the guard
 // directory and renames it into place, the tmp fsynced before the rename, every
 // name relative to the directory's descriptor. replace says an existing tmp may
-// be replaced (a takeover retrying): it is opened without truncation, validated
-// on the descriptor, and only then truncated through it; a tmp of any other
-// shape refuses without touching it.
+// be replaced (a takeover retrying): it is examined through an identity
+// descriptor, removed by its name only when it is a regular, owned, one-link
+// file, and a fresh one is created exclusively; a tmp of any other shape
+// refuses without touching it.
 func writeGuardRecordAt(dir *os.File, record guardRecord, replace bool) error {
 	body, err := json.MarshalIndent(record, "", "  ")
 	if err != nil {
