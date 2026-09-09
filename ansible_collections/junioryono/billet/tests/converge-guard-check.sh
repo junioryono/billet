@@ -1211,7 +1211,18 @@ expect_refused p17-ancestor "Refuse an upgrade root whose ancestors another acco
 expect_calls p17-ancestor suffix "" 0
 marker_absent p17-ancestor
 log_empty p17-ancestor
-echo "ok   P17: the root is established 0755/0700 root on a fresh host, an unsafe one refuses before any allocation, and so does an unsafe ancestor"
+plant p17-ancestor-fresh
+rm -rf "$work/cases/p17-ancestor-fresh/lib"
+CASE_DIR_MODE=0775; run_case p17-ancestor-fresh escalated -- -e billet_binary_src="$work/cases/p17-ancestor-fresh/src/billet" -e billet_recovery_dir_suffix_command="$fakes/suffix"; CASE_DIR_MODE=0755
+expect_refused p17-ancestor-fresh "Refuse an upgrade root whose ancestors another account can rename" "writable by group or others without the sticky bit"
+[ ! -e "$work/cases/p17-ancestor-fresh/lib" ] || fail "p17-ancestor-fresh: the root's parent was made under an unsafe ancestor"
+expect_no_task p17-ancestor-fresh "Establish the upgrade root's parent"
+log_empty p17-ancestor-fresh
+plant p17-module-error
+run_case p17-module-error escalated -- -e billet_upgrade_root=relative/upgrades -e billet_binary_src="$work/cases/p17-module-error/src/billet"
+expect_refused p17-module-error "Refuse an upgrade root whose ancestors another account can rename" "not an absolute path"
+log_empty p17-module-error
+echo "ok   P17: the root is established 0755/0700 root on a fresh host, an unsafe one refuses before any allocation, and so does an unsafe ancestor, before the parent is made, and a judgement that did not complete"
 
 # =============================================================================
 # S. The staging.

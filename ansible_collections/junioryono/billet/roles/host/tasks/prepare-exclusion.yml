@@ -176,10 +176,40 @@
       loop_control:
         label: "{{ item.item }}"
 
+    # THE CHAIN EVERY PATH UNDER THE ROOT RESOLVES THROUGH, judged before
+    # anything under it is made or executed: the root's parent and the root
+    # are created below by name, and the staged candidate answers `version`
+    # and `converge-guard status` by pathname before the hold's own boundary
+    # check runs; an ancestor another account can rename (writable without
+    # the sticky bit, or a link that account made) would let it redirect the
+    # creation or substitute the executable after its digest was taken. The
+    # same walk the fallback reader makes, from the filesystem root down, and
+    # THE ANSWER IS POSITIVE: `judged` is set only after a completed walk, so a
+    # module that failed any other way is a refusal and never an admission.
+    - name: Judge the ancestors of the upgrade root
+      junioryono.billet.guard_fallback:
+        root: "{{ billet_exclusion_root }}"
+        owner: "{{ billet_exclusion_owner_uid | int }}"
+        judge: ancestors
+      register: billet_exclusion_ancestors
+      failed_when: false
+      check_mode: false
+      become: "{{ billet_exclusion_become }}"
+
+    - name: Refuse an upgrade root whose ancestors another account can rename
+      ansible.builtin.assert:
+        that:
+          - billet_exclusion_ancestors.judged | default(false) | bool
+        fail_msg: >-
+          {{ billet_exclusion_ancestors.msg | default('the chain above ' ~ billet_exclusion_root ~ ' could not be judged') }}.
+          Nothing under {{ billet_exclusion_root }} is executed, allocated or held
+          through a chain another account can rename.
+
     - name: Establish the upgrade root's parent
       ansible.builtin.file:
         path: "{{ billet_exclusion_root | dirname }}"
         state: directory
+        follow: false
         owner: root
         group: root
         mode: "0755"
@@ -193,6 +223,7 @@
       ansible.builtin.file:
         path: "{{ billet_exclusion_root }}"
         state: directory
+        follow: false
         owner: root
         group: root
         mode: "0700"
@@ -215,33 +246,6 @@
         - billet_exclusion_root_made is changed
         - not ansible_check_mode
       become: true
-
-    # THE CHAIN EVERY PATH UNDER THE ROOT RESOLVES THROUGH, judged before
-    # anything under it is executed: the staged candidate answers `version`
-    # and `converge-guard status` by pathname before the hold's own boundary
-    # check runs, and an ancestor another account can rename (writable
-    # without the sticky bit, or a link that account made) would let it
-    # substitute the executable after its digest was taken. The same walk the
-    # fallback reader makes, from the filesystem root down.
-    - name: Judge the ancestors of the upgrade root
-      junioryono.billet.guard_fallback:
-        root: "{{ billet_exclusion_root }}"
-        owner: "{{ billet_exclusion_owner_uid | int }}"
-        judge: ancestors
-      register: billet_exclusion_ancestors
-      failed_when: false
-      check_mode: false
-      become: "{{ billet_exclusion_become }}"
-
-    - name: Refuse an upgrade root whose ancestors another account can rename
-      ansible.builtin.assert:
-        that:
-          - not (billet_exclusion_ancestors.failed | default(false))
-          - billet_exclusion_ancestors.phase is not defined
-        fail_msg: >-
-          {{ billet_exclusion_ancestors.msg | default('the chain above ' ~ billet_exclusion_root ~ ' could not be judged') }}.
-          Nothing under {{ billet_exclusion_root }} is executed, allocated or held
-          through a chain another account can rename.
 
     # THE CLAIM'S SHAPE, by a stat that follows nothing: a symlink is a Go
     # transaction's, a regular file the pre-R role's, a directory a guard's

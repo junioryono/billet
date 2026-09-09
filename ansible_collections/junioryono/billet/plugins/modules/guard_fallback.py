@@ -346,7 +346,7 @@ def main():
         except Refusal as exc:
             module.fail_json(msg="the upgrade root's chain cannot be trusted: %s" % exc, phase=exc.phase)
             return
-        module.exit_json(changed=False, executable="", sha256="")
+        module.exit_json(changed=False, judged=True, executable="", sha256="")
         return
     try:
         executable, digest = find(root, module.params["owner"])

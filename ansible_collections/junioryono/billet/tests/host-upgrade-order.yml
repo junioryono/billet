@@ -776,6 +776,10 @@
           - billet_prepare_block_names.index('Read the installed release under the guard') < billet_prepare_block_names.index('Refuse a converge whose installed release moved before the hold')
           # THE CHAIN ABOVE THE ROOT is judged before the claim is inspected, through the module's ancestors judgement.
           - billet_prepare_block_names.index('Judge the ancestors of the upgrade root') < billet_prepare_block_names.index('Inspect the durable claim')
+          - billet_prepare_block_names.index('Refuse an upgrade root whose ancestors another account can rename') < billet_prepare_block_names.index("Establish the upgrade root's parent")
+          - "'billet_exclusion_ancestors.judged' in ((billet_prepare_block | selectattr('name', 'equalto', 'Refuse an upgrade root whose ancestors another account can rename') | first)['ansible.builtin.assert'].that | join(' '))"
+          - (billet_prepare_block | selectattr('name', 'equalto', "Establish the upgrade root's parent") | first)['ansible.builtin.file'].follow == false
+          - billet_prepare_root_make['ansible.builtin.file'].follow == false
           - (billet_prepare_block | selectattr('name', 'equalto', 'Judge the ancestors of the upgrade root') | first)['junioryono.billet.guard_fallback'].judge == 'ancestors'
           # THE LEGACY PROTOCOL only when no capable executable exists.
           - "'billet_exclusion_managed_pre_r' in ((billet_prepare_block | selectattr('name', 'equalto', 'Record that a release before the guard runs the legacy protocol') | first).when | string)"
