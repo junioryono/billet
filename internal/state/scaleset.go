@@ -83,16 +83,23 @@ func (db *DB) ForgetScaleSet(ctx context.Context, target, group, label string) e
 
 // ScaleSets returns every scale set billet recorded creating for one target.
 //
-// On the read-only pool: a read routed through Tx would reserve the single
-// writer slot while it scans. One statement needs no snapshot, so it does not go
-// through View either — which is exactly why it has to translate a cancellation
-// ITSELF. Server.Run calls this before any listener starts and returns what comes
-// back, so a stop landing in that window used to leave the unit `failed` over a
-// read the shutdown had interrupted. See asCancellation.
+// Through View, on the read-only pool: a read routed through Tx would reserve
+// the single writer slot while it scans, and one outside View would skip the
+// fence and the schema revalidation an inspection depends on. View translates a
+// cancellation, which Server.Run needs: it calls this before any listener starts
+// and returns what comes back, so a stop landing in that window used to leave
+// the unit `failed` over a read the shutdown had interrupted.
 func (db *DB) ScaleSets(ctx context.Context, target string) ([]ScaleSetRecord, error) {
-	rows, err := ReadQueries(db.bareReader()).ListScaleSets(ctx, target)
-	if err != nil {
-		return nil, fmt.Errorf("state: list scale sets: %w", db.asCancellation(ctx, err))
+	var rows []ledgerdb.ListScaleSetsRow
+
+	if err := db.View(ctx, func(q Querier) error {
+		var err error
+
+		rows, err = ReadQueries(q).ListScaleSets(ctx, target)
+
+		return err
+	}); err != nil {
+		return nil, fmt.Errorf("state: list scale sets: %w", err)
 	}
 
 	var out []ScaleSetRecord

@@ -423,6 +423,193 @@ func TestAConvergedHostLosesTheRefusalItsAcceptedDispatchCouldNotClear(t *testin
 	}
 }
 
+// A HOST THAT CONVERGED BY AN OPERATOR'S HAND AFTER ONLY A REFUSED DISPATCH IS
+// NOT STUCK ON THAT REFUSAL EITHER: the record means the refusal the host is
+// still stuck on, and its commit clears it whatever moved the host.
+func TestAConvergedHostLosesARefusalNothingAccepted(t *testing.T) {
+	_, s := open(t)
+
+	fleet := &fakeFleet{}
+	fleet.set("epyc-1", "v0.3.26", 14, true)
+
+	r, err := s.Start(t.Context(), StartRequest{
+		TargetVersion: targetVersion, TargetDigest: targetDigest,
+		PriorVersion: "v0.3.26", Policy: DefaultPolicy(), CreatedBy: "ops",
+		Nodes: []string{"epyc-1"},
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	dispatch := &fakeDispatcher{fail: errors.New("the host holds a converge guard for holder ci-42")}
+	c := NewCoordinator(s, fleet, dispatch, targetVersion, 14,
+		WithCoordinatorLogger(slog.New(slog.DiscardHandler)))
+
+	tick(t, c) // controller
+
+	if err := c.Tick(t.Context()); err == nil {
+		t.Fatal("the injected dispatch failure was not reported")
+	}
+
+	if got := refusalOf(t, s, r); got == "" {
+		t.Fatal("the refusal was not recorded")
+	}
+
+	// Nothing accepted; the operator moved the host by hand and it registers on
+	// the target.
+	fleet.set("epyc-1", targetVersion, 14, true)
+	fleet.digest("epyc-1", targetDigest)
+
+	tick(t, c)
+
+	if got := phaseOf(t, s, r); got != PhaseCommitted {
+		t.Fatalf("the host is %s, want committed", got)
+	}
+
+	if got := refusalOf(t, s, r); got != "" {
+		t.Errorf("a converged host still carries the refusal %q", got)
+	}
+}
+
+// EACH OF THE SNAPSHOT'S READS CAN FAIL AFTER THE TRANSACTION WAS ENTERED, and
+// the failure is the snapshot's, never an empty part: the binding, the open
+// rollout, the history, the nodes and the registrations, the last of them after
+// every other field was collected.
+func TestAStatusSnapshotReportsTheReadThatFailed(t *testing.T) {
+	db, s := open(t)
+	registerNode(t, db, "epyc-1", "v0.3.26", "inc-a")
+
+	r := start(t, s)
+
+	if err := s.Finish(t.Context(), r.ID, StateAborted, "so the history read runs"); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.Start(t.Context(), StartRequest{
+		Channel: "stable", TargetVersion: "v0.5.0", TargetDigest: otherDigest,
+		PriorVersion: "v0.4.0", Policy: DefaultPolicy(), CreatedBy: "ops", Nodes: []string{"epyc-1"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	steps := []string{"binding", "rollout", "nodes", "registrations"}
+
+	for _, step := range steps {
+		t.Run(step, func(t *testing.T) {
+			failing := &failingReads{step: step, err: errors.New("the " + step + " read failed, staged by the test")}
+
+			snapshotReads = func(reads state.ReadOps) state.ReadOps {
+				failing.ReadOps = reads
+
+				return failing
+			}
+
+			t.Cleanup(func() { snapshotReads = nil })
+
+			snapshot, err := s.StatusSnapshot(t.Context())
+			if !errors.Is(err, failing.err) {
+				t.Fatalf("StatusSnapshot: err = %v, want the injected failure", err)
+			}
+
+			if !failing.ran {
+				t.Fatal("the failing read never ran for this step")
+			}
+
+			if snapshot.Rollout != nil || snapshot.Nodes != nil || snapshot.Registrations != nil || snapshot.Binding != "" {
+				t.Errorf("a failed snapshot carries parts: %+v", snapshot)
+			}
+		})
+	}
+
+	// The history read runs only when no rollout is open.
+	t.Run("history", func(t *testing.T) {
+		open, err := s.Open(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := s.Finish(t.Context(), open.ID, StateAborted, "so the history read runs"); err != nil {
+			t.Fatal(err)
+		}
+
+		failing := &failingReads{step: "history", err: errors.New("the history read failed, staged by the test")}
+
+		snapshotReads = func(reads state.ReadOps) state.ReadOps {
+			failing.ReadOps = reads
+
+			return failing
+		}
+
+		t.Cleanup(func() { snapshotReads = nil })
+
+		if _, err := s.StatusSnapshot(t.Context()); !errors.Is(err, failing.err) {
+			t.Fatalf("StatusSnapshot: err = %v, want the injected failure", err)
+		}
+
+		if !failing.ran {
+			t.Fatal("the failing history read never ran")
+		}
+	})
+}
+
+// failingReads is the snapshot's reads with one of them failing, by name.
+type failingReads struct {
+	state.ReadOps
+	step string
+	err  error
+	ran  bool
+}
+
+func (f *failingReads) fail(step string) error {
+	if step != f.step {
+		return nil
+	}
+
+	f.ran = true
+
+	return f.err
+}
+
+func (f *failingReads) ReadDeploymentBinding(ctx context.Context) (ledgerdb.ReadDeploymentBindingRow, error) {
+	if err := f.fail("binding"); err != nil {
+		return ledgerdb.ReadDeploymentBindingRow{}, err
+	}
+
+	return f.ReadOps.ReadDeploymentBinding(ctx)
+}
+
+func (f *failingReads) ReadRolloutInState(ctx context.Context, st string) (ledgerdb.Rollout, error) {
+	if err := f.fail("rollout"); err != nil {
+		return ledgerdb.Rollout{}, err
+	}
+
+	return f.ReadOps.ReadRolloutInState(ctx, st)
+}
+
+func (f *failingReads) ListRolloutHistory(ctx context.Context, maxRows int64) ([]ledgerdb.Rollout, error) {
+	if err := f.fail("history"); err != nil {
+		return nil, err
+	}
+
+	return f.ReadOps.ListRolloutHistory(ctx, maxRows)
+}
+
+func (f *failingReads) ListRolloutNodes(ctx context.Context, id string) ([]ledgerdb.ListRolloutNodesRow, error) {
+	if err := f.fail("nodes"); err != nil {
+		return nil, err
+	}
+
+	return f.ReadOps.ListRolloutNodes(ctx, id)
+}
+
+func (f *failingReads) ListNodeRegistrations(ctx context.Context) ([]ledgerdb.ListNodeRegistrationsRow, error) {
+	if err := f.fail("registrations"); err != nil {
+		return nil, err
+	}
+
+	return f.ReadOps.ListNodeRegistrations(ctx)
+}
+
 // registerNode writes one registration the way the allocator does, returning
 // the epoch the ledger assigned.
 func registerNode(t *testing.T, db *state.DB, name, release, incarnation string) int64 {

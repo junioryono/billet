@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"database/sql"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -73,18 +74,6 @@ func seedNode(t *testing.T, db *DB, name, provider string) {
 	}
 }
 
-func providerOf(t *testing.T, q Querier, name string) string {
-	t.Helper()
-
-	var provider string
-	if err := q.QueryRowContext(t.Context(),
-		`SELECT provider FROM nodes WHERE name = $1`, name).Scan(&provider); err != nil {
-		t.Fatalf("read the node's provider: %v", err)
-	}
-
-	return provider
-}
-
 // queryOne runs `SELECT 1` through a querier and returns whatever it refused
 // with, draining and closing the rows when it did not refuse.
 func queryOne(t *testing.T, q Querier) error {
@@ -107,14 +96,20 @@ func queryOne(t *testing.T, q Querier) error {
 	return rows.Err()
 }
 
-// providerVia reads through View, the one read an inspection admits.
+// providerVia reads through View and the generated query, the one read an
+// inspection admits.
 func providerVia(t *testing.T, db *DB, name string) string {
 	t.Helper()
 
 	var provider string
 
 	if err := db.View(t.Context(), func(q Querier) error {
-		provider = providerOf(t, q, name)
+		got, err := ReadQueries(q).ReadNodeProvider(t.Context(), name)
+		if err != nil {
+			return fmt.Errorf("read the node's provider: %w", err)
+		}
+
+		provider = got
 
 		return nil
 	}); err != nil {
@@ -210,8 +205,8 @@ func TestAnInspectionRefusesEveryWriteTransaction(t *testing.T) {
 	if err := db.View(t.Context(), func(q Querier) error {
 		err := q.QueryRowContext(t.Context(),
 			`UPDATE nodes SET provider = 'tart' WHERE name = 'epyc-1' RETURNING name`).Scan(&name)
-		if err == nil || !strings.Contains(err.Error(), "readonly") {
-			t.Errorf("a write inside View was not refused by the engine: err = %v", err)
+		if err == nil || !strings.Contains(err.Error(), "admits only the named reads") {
+			t.Errorf("a write inside View was not refused before the engine: err = %v", err)
 		}
 
 		return nil
@@ -265,7 +260,8 @@ func TestAnInspectionOpensReadOnlyAndNeverImmutable(t *testing.T) {
 	}
 
 	// AND THE OPEN USES THEM: the writer pool the handle holds refuses a write
-	// with the engine's own answer, which the ordinary writer DSN would accept.
+	// with the engine's own answer, which the ordinary writer DSN would accept,
+	// and so does the read transaction View begins, asked directly.
 	dir := ledgerWithRow(t)
 
 	db, err := OpenInspect(t.Context(), dir)
@@ -278,6 +274,20 @@ func TestAnInspectionOpensReadOnlyAndNeverImmutable(t *testing.T) {
 	if _, err := db.w.ExecContext(t.Context(), `UPDATE nodes SET provider = 'tart'`); err == nil ||
 		!strings.Contains(err.Error(), "readonly") {
 		t.Errorf("the inspection's writer pool accepted a write: err = %v", err)
+	}
+
+	tx, err := db.r.BeginTx(t.Context(), db.readTxOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := tx.ExecContext(t.Context(), `UPDATE nodes SET provider = 'tart'`); err == nil ||
+		!strings.Contains(err.Error(), "readonly") {
+		t.Errorf("the inspection's read transaction accepted a write: err = %v", err)
+	}
+
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -745,6 +755,44 @@ func TestAnInspectionRevalidatesInsideEveryRead(t *testing.T) {
 	}
 }
 
+// EVERY READ AN INSPECTION OFFERS GOES THROUGH VIEW, ScaleSets included: a
+// fence raised after the open and a version this binary does not know each
+// refuse it, as they refuse a View, because a read outside View would skip
+// both.
+func TestAnInspectionsScaleSetsHonourTheFenceAndTheSchema(t *testing.T) {
+	dir := ledgerWithRow(t)
+
+	db, err := OpenInspect(t.Context(), dir)
+	if err != nil {
+		t.Fatalf("OpenInspect: %v", err)
+	}
+
+	t.Cleanup(func() { _ = db.Close() })
+
+	if _, err := db.ScaleSets(t.Context(), "acme"); err != nil {
+		t.Fatalf("ScaleSets before any change: %v", err)
+	}
+
+	if _, err := WriteMaintenanceFence(dir, "host upgrade"); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := db.ScaleSets(t.Context(), "acme"); !errors.Is(err, ErrMaintenance) {
+		t.Errorf("ScaleSets across a fence: err = %v, want ErrMaintenance", err)
+	}
+
+	if err := ClearMaintenanceFence(dir, "host upgrade"); err != nil {
+		t.Fatal(err)
+	}
+
+	plainExec(t, dir, `INSERT INTO schema_migrations (version, name, checksum, applied_at) `+
+		`VALUES (?, 'from_the_future', 'x', 't')`, latestVersion(t)+1)
+
+	if _, err := db.ScaleSets(t.Context(), "acme"); err == nil || !strings.Contains(err.Error(), "newer version") {
+		t.Errorf("ScaleSets against a newer version: err = %v, want the newer-version refusal", err)
+	}
+}
+
 // A BINARY WHOSE MIGRATION SET CANNOT BE READ REFUSES TO INSPECT, FIRST: before
 // any operation, with the reason.
 func TestAnInspectionRefusesAnUnreadableMigrationSetFirst(t *testing.T) {
@@ -838,13 +886,9 @@ func TestAnInspectionReadsTheWALAndLeavesSidecarsItOwns(t *testing.T) {
 		t.Cleanup(func() { _ = mainInspect.Close() })
 
 		if err := mainInspect.View(t.Context(), func(q Querier) error {
-			var n int64
-			if err := q.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM nodes WHERE name = 'wal-row'`).Scan(&n); err != nil {
-				return err
-			}
-
-			if n != 0 {
-				t.Errorf("the main file alone holds the row (%d), so the fixture proves nothing about the WAL", n)
+			got, err := ReadQueries(q).ReadNodeProvider(t.Context(), "wal-row")
+			if !errors.Is(err, sql.ErrNoRows) {
+				t.Errorf("the main file alone answers %q (err %v) for the row, so the fixture proves nothing about the WAL", got, err)
 			}
 
 			return nil

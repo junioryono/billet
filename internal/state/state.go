@@ -39,6 +39,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -777,7 +779,105 @@ func (db *DB) View(ctx context.Context, fn func(Querier) error) error {
 		}
 	}
 
-	return db.asCancellation(ctx, fn(tx))
+	var q Querier = tx
+	if db.inspect {
+		q = inspectQuerier{tx: tx, r: db.r}
+	}
+
+	return db.asCancellation(ctx, fn(q))
+}
+
+// inspectQuerier is what an inspection's View hands its callback: the
+// transaction, admitting ONLY THE NAMED READS sqlc generated.
+//
+// A READ ONLY transaction refuses a write and refuses nothing else: a callback
+// handed the bare transaction could COMMIT it (database/sql would not notice,
+// and the deferred rollback would undo nothing after it), turn the session's
+// read-only default off, and write in autocommit; or take a session advisory
+// lock inside the read-only transaction, which rollback does not release, and
+// so exclude the real controller. So a statement reaches the transaction only
+// when it is one sqlc generated for ReadOps: it carries sqlc's `-- name: X
+// :one|:many` header, X is a method of ReadOps (whose every member is
+// classified from its first keyword by TestReadOpsHoldsExactlyTheQueriesThatOnlyRead),
+// its body begins with SELECT or WITH, and it names no function that acts on
+// the session rather than the rows. billet's own code cannot issue anything
+// else through this handle without also failing the rawsql gate; this is what
+// makes that a guarantee rather than a convention.
+type inspectQuerier struct {
+	tx *sql.Tx
+	// r is where a refused QueryRowContext gets its erroring Row: a statement
+	// the engine refuses, run OUTSIDE the transaction, because on PostgreSQL a
+	// failed statement aborts the transaction it ran in and every later read of
+	// the callback would then fail for that reason rather than its own.
+	r *sql.DB
+}
+
+func (q inspectQuerier) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	if err := admitInspectRead(query); err != nil {
+		return nil, err
+	}
+
+	//billet:ignore rawsql // forwards a statement sqlc generated, after admitInspectRead proved it is one
+	return q.tx.QueryContext(ctx, query, args...)
+}
+
+func (q inspectQuerier) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	if err := admitInspectRead(query); err != nil {
+		//billet:ignore rawsql // not a query: a name no ledger holds, so the Row the signature demands carries the refusal
+		return q.r.QueryRowContext(ctx,
+			`SELECT 1 FROM "an inspection admits only the named reads sqlc generated; this statement is not one"`)
+	}
+
+	//billet:ignore rawsql // forwards a statement sqlc generated, after admitInspectRead proved it is one
+	return q.tx.QueryRowContext(ctx, query, args...)
+}
+
+// sessionEffectFunctions are what a SELECT can do to a PostgreSQL session
+// besides read rows; no generated read names one, which a test in
+// queryset_test.go holds.
+var sessionEffectFunctions = []string{
+	"set_config", "pg_advisory", "pg_try_advisory", "pg_terminate_backend", "pg_cancel_backend",
+	"pg_reload_conf", "pg_sleep", "dblink", "lo_import", "lo_export", "pg_rotate_logfile",
+}
+
+var readOpsType = reflect.TypeOf((*ReadOps)(nil)).Elem()
+
+// admitInspectRead is the rule above, stated on one statement.
+func admitInspectRead(query string) error {
+	first, rest, ok := strings.Cut(query, "\n")
+	if !ok || !strings.HasPrefix(first, "-- name: ") {
+		return fmt.Errorf("%w: only the named reads sqlc generated are admitted, and this statement carries "+
+			"no `-- name:` header", ErrInspect)
+	}
+
+	fields := strings.Fields(strings.TrimPrefix(first, "-- name: "))
+	if len(fields) != 2 || (fields[1] != ":one" && fields[1] != ":many") {
+		return fmt.Errorf("%w: %q is not a `-- name: X :one|:many` header", ErrInspect, first)
+	}
+
+	if _, isRead := readOpsType.MethodByName(fields[0]); !isRead {
+		return fmt.Errorf("%w: %s is not one of the reads ReadOps holds", ErrInspect, fields[0])
+	}
+
+	body := rest
+	for strings.HasPrefix(strings.TrimSpace(body), "--") {
+		_, body, _ = strings.Cut(body, "\n")
+	}
+
+	keyword := strings.ToUpper(strings.Fields(body)[0])
+	if keyword != "SELECT" && keyword != "WITH" {
+		return fmt.Errorf("%w: %s begins with %s, which is not a read", ErrInspect, fields[0], keyword)
+	}
+
+	lowered := strings.ToLower(query)
+	for _, fn := range sessionEffectFunctions {
+		if strings.Contains(lowered, fn) {
+			return fmt.Errorf("%w: %s names %s, which acts on the session rather than the rows", ErrInspect,
+				fields[0], fn)
+		}
+	}
+
+	return nil
 }
 
 // readTxOptions is how a read transaction begins: the engine's default for an

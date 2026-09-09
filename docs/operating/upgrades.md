@@ -120,7 +120,7 @@ A host records which signed manifest produced its binary — written by `billet 
 | `version only` | It reached the target version and could not say which bytes it installed. Every host does this until one billet-driven upgrade has run. |
 | `-` | It has not converged. |
 
-A host whose dispatch keeps being refused shows why under `DETAIL` (`last dispatch refused: ...`), from a column the coordinator writes on every refused dispatch and clears on the next accepted one; a blocker, an exemption or a rollback result takes the column's place, because each says more about where the host is. `billet rollout status --json` prints the same facts as a document a machine can read, with the ledger's deployment binding and every registered host's current registration epoch and incarnation beside them, through a read-only open that changes nothing on the host.
+A host whose dispatch keeps being refused shows why under `DETAIL` (`last dispatch refused: ...`), from a column the coordinator writes on every refused dispatch and clears when a dispatch is accepted or the host converges, so it always means the refusal the host is still stuck on and never a history; a blocker, an exemption or a rollback result takes the column's place, because each says more about where the host is. `billet rollout status --json` prints the same facts as a document a machine can read, with the ledger's deployment binding and every registered host's current registration epoch and incarnation beside them, through a read-only open that changes nothing on the host.
 
 A host that names a **different** manifest is **blocked**, not converged: it is running the right version from bytes this decision did not name. Repairing it takes **two** steps, and the blocker says both:
 

@@ -136,13 +136,18 @@ type Node struct {
 	// recorded, and nothing is concluded from it.
 	DispatchEpoch int64
 	// LastRefusal is why this host's last dispatch was refused, or empty when no
-	// dispatch has been refused since the last one that was accepted.
+	// dispatch has been refused since the host was last accepted or converged.
 	//
-	// WRITTEN BY THE FAILED-DISPATCH PATH, CLEARED BY A SUCCESSFUL ONE, KEPT BY
-	// EVERYTHING ELSE. A host under a converge guard refuses every dispatch for
-	// as long as the guard is held, and before this the reason went to the log
-	// and the operator saw a host that kept trying; this is the reason, on the
-	// row `billet rollout status` reads.
+	// WRITTEN BY THE FAILED-DISPATCH PATH, CLEARED BY AN ACCEPTED DISPATCH AND BY
+	// THE HOST'S CONVERGENCE, KEPT BY EVERYTHING ELSE. A host under a converge
+	// guard refuses every dispatch for as long as the guard is held, and before
+	// this the reason went to the log and the operator saw a host that kept
+	// trying; this is the reason, on the row `billet rollout status` reads, for
+	// as long as the host is still to be moved. A host that converged, by the
+	// dispatch it accepted or by an operator's hand, is not being refused, and
+	// the acceptance's own clear is a write that can fail after the updater is
+	// already running, so the commit clears too: what the record means is "the
+	// refusal this host is still stuck on", never a history.
 	LastRefusal string
 }
 
@@ -426,6 +431,11 @@ type StatusSnapshot struct {
 	Registrations []Registration
 }
 
+// snapshotReads is a seam a test uses to stand a failing read in for one of
+// the snapshot's reads after the transaction was entered, so the read's OWN
+// error is what the snapshot must report. Nil in production.
+var snapshotReads func(state.ReadOps) state.ReadOps
+
 // StatusSnapshot reads the whole report inside one read transaction, so a
 // rollout started between two of its reads cannot appear in one and not the
 // other, and a binding written after the caller's identity check is what the
@@ -437,6 +447,10 @@ func (s *Store) StatusSnapshot(ctx context.Context) (StatusSnapshot, error) {
 	err := s.db.View(ctx, func(q state.Querier) error {
 		out = StatusSnapshot{}
 		reads := state.ReadQueries(q)
+
+		if snapshotReads != nil {
+			reads = snapshotReads(reads)
+		}
 
 		binding, err := reads.ReadDeploymentBinding(ctx)
 
@@ -487,8 +501,11 @@ func (s *Store) StatusSnapshot(ctx context.Context) (StatusSnapshot, error) {
 
 		return nil
 	})
+	if err != nil {
+		return StatusSnapshot{}, err
+	}
 
-	return out, err
+	return out, nil
 }
 
 // Nodes reads where every host in one rollout has got to, in a stable order.
