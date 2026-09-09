@@ -994,10 +994,11 @@ func TestRolloutStatusReadsTheDSNFromTheEnvironmentFile(t *testing.T) {
 	})
 }
 
-// THE REPORT RUNS AS THE LEDGER'S OWNER when this process is root and the
-// identity directory belongs to another account, with this command's own
-// arguments, and nothing runs in this process then; every other case runs the
-// report in place.
+// THE REPORT RUNS AS THE LEDGER'S OWNER AND AS NOBODY ELSE: root over another
+// account's directory re-executes with this command's own arguments and runs
+// nothing here; the owner runs in place; and another account is refused
+// before the ledger is opened, because the sidecars a read-only open of a
+// stopped SQLite ledger creates belong to whoever opened it.
 func TestRolloutStatusRunsAsTheLedgersOwner(t *testing.T) {
 	stateDir := t.TempDir()
 	cfgPath := writeCAConfig(t, stateDir)
@@ -1081,7 +1082,7 @@ func TestRolloutStatusRunsAsTheLedgersOwner(t *testing.T) {
 		ownerErr error
 	}{
 		"root over a root-owned directory": {euid: 0, uid: 0},
-		"not root":                         {euid: 501, uid: 1001},
+		"the owner":                        {euid: 1001, uid: 1001},
 		"root, directory absent":           {euid: 0, ownerErr: fs.ErrNotExist},
 	} {
 		t.Run(name+" runs in place", func(t *testing.T) {
@@ -1108,6 +1109,42 @@ func TestRolloutStatusRunsAsTheLedgersOwner(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("another account with access to the directory is refused before the open", func(t *testing.T) {
+		calls := seams(t, 501, 1001, 1001, nil, 0, nil)
+
+		opened := false
+		savedAfterOpen := statusAfterOpen
+		statusAfterOpen = func(*state.DB) { opened = true }
+
+		t.Cleanup(func() { statusAfterOpen = savedAfterOpen })
+
+		err := cmdRolloutStatus(t.Context(), []string{"--json", "--config", cfgPath})
+		if err == nil || !strings.Contains(err.Error(), "owned by uid 1001") || !strings.Contains(err.Error(), "uid 501") {
+			t.Errorf("err = %v", err)
+		}
+
+		if opened {
+			t.Error("the ledger was opened by an account that is not its owner")
+		}
+
+		if len(*calls) != 0 {
+			t.Errorf("re-executed: %v", *calls)
+		}
+	})
+
+	t.Run("another account, owner unreadable, refuses", func(t *testing.T) {
+		calls := seams(t, 501, 0, 0, syscall.EACCES, 0, nil)
+
+		err := cmdRolloutStatus(t.Context(), []string{"--json", "--config", cfgPath})
+		if err == nil || !strings.Contains(err.Error(), "read who owns") || !errors.Is(err, syscall.EACCES) {
+			t.Errorf("err = %v", err)
+		}
+
+		if len(*calls) != 0 {
+			t.Errorf("re-executed: %v", *calls)
+		}
+	})
 
 	t.Run("root, owner unreadable, refuses", func(t *testing.T) {
 		calls := seams(t, 0, 0, 0, syscall.EACCES, 0, nil)

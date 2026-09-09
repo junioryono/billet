@@ -34,6 +34,7 @@ package state
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -640,8 +641,7 @@ func (db *DB) bareReader() Querier { return db.r }
 
 // inspectReader is the querier an inspection's Reader hands out: every call is
 // refused with ErrInspect. QueryRowContext cannot return an error directly, so
-// it asks the engine a question the engine refuses, and the refusal names this
-// rule; the caller's Scan returns it.
+// the Row it answers with comes from refusalRows, a source that never connects.
 type inspectReader struct{ r *sql.DB }
 
 func (inspectReader) QueryContext(context.Context, string, ...any) (*sql.Rows, error) {
@@ -649,11 +649,37 @@ func (inspectReader) QueryContext(context.Context, string, ...any) (*sql.Rows, e
 		ErrInspect)
 }
 
-func (q inspectReader) QueryRowContext(ctx context.Context, _ string, _ ...any) *sql.Row {
-	//billet:ignore rawsql // not a query: a name no ledger holds, so the Row the signature demands carries the refusal
-	return q.r.QueryRowContext(ctx,
-		`SELECT 1 FROM "an inspection reads through View only; its bare reader is refused"`)
+func (inspectReader) QueryRowContext(ctx context.Context, _ string, _ ...any) *sql.Row {
+	return refusedRow(ctx)
 }
+
+// errInspectRefusedRow is what a refused QueryRowContext's Scan returns.
+var errInspectRefusedRow = fmt.Errorf("%w: an inspection admits only the named reads sqlc generated, through "+
+	"View; its bare reader is refused", ErrInspect)
+
+// refusalRows is a database that never connects, so a Row carrying the refusal
+// costs no ledger connection: a refused QueryRowContext on a pooled connection
+// would wait for a second connection of the same pool while its View held one,
+// and four Views refusing at once would wait on each other forever.
+var refusalRows = sql.OpenDB(refusingConnector{})
+
+// refusedRow is the Row a refused QueryRowContext answers with; its Scan
+// returns errInspectRefusedRow.
+func refusedRow(ctx context.Context) *sql.Row {
+	//billet:ignore rawsql // not a query: a source that never connects, so the Row the signature demands carries the refusal
+	return refusalRows.QueryRowContext(ctx, "")
+}
+
+type refusingConnector struct{}
+
+func (refusingConnector) Connect(context.Context) (driver.Conn, error) {
+	return nil, errInspectRefusedRow
+}
+func (refusingConnector) Driver() driver.Driver { return refusingDriver{} }
+
+type refusingDriver struct{}
+
+func (refusingDriver) Open(string) (driver.Conn, error) { return nil, errInspectRefusedRow }
 
 // Tx runs fn inside a single write transaction. Every mutation goes through here
 // so that an allocation decision — read current usage, decide, record it — is one
@@ -781,7 +807,7 @@ func (db *DB) View(ctx context.Context, fn func(Querier) error) error {
 
 	var q Querier = tx
 	if db.inspect {
-		q = inspectQuerier{tx: tx, r: db.r}
+		q = inspectQuerier{tx: tx}
 	}
 
 	return db.asCancellation(ctx, fn(q))
@@ -796,24 +822,29 @@ func (db *DB) View(ctx context.Context, fn func(Querier) error) error {
 // read-only default off, and write in autocommit; or take a session advisory
 // lock inside the read-only transaction, which rollback does not release, and
 // so exclude the real controller. So a statement reaches the transaction only
-// when it is one sqlc generated for ReadOps: it carries sqlc's `-- name: X
-// :one|:many` header, X is a method of ReadOps (whose every member is
-// classified from its first keyword by TestReadOpsHoldsExactlyTheQueriesThatOnlyRead),
-// its body begins with SELECT or WITH, and it names no function that acts on
-// the session rather than the rows. billet's own code cannot issue anything
+// when it is EXACTLY one of the statements sqlc generated for ReadOps
+// (generatedReads, learned from the generated code itself), and then, as the
+// shape that set is held to: sqlc's `-- name: X :one|:many` header with X a
+// method of ReadOps (whose every member is classified from its first keyword
+// by TestReadOpsHoldsExactlyTheQueriesThatOnlyRead), a body beginning with
+// SELECT or WITH, and no function that acts on the session rather than the
+// rows. The exact text is the rule; the shape is what the text is held to. A
+// grammar of the text on its own is not enough, because an engine decodes
+// spellings a scanner does not (`U&"pg\005ftry_advisory_lock"` is
+// pg_try_advisory_lock to PostgreSQL). billet's own code cannot issue anything
 // else through this handle without also failing the rawsql gate; this is what
 // makes that a guarantee rather than a convention.
+//
+// A refused QueryRowContext answers with a Row from refusalRows, a source that
+// never connects, so the refusal costs no ledger connection and runs no
+// statement in the transaction (on PostgreSQL a failed statement aborts the
+// transaction it ran in).
 type inspectQuerier struct {
 	tx *sql.Tx
-	// r is where a refused QueryRowContext gets its erroring Row: a statement
-	// the engine refuses, run OUTSIDE the transaction, because on PostgreSQL a
-	// failed statement aborts the transaction it ran in and every later read of
-	// the callback would then fail for that reason rather than its own.
-	r *sql.DB
 }
 
 func (q inspectQuerier) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
-	if err := admitInspectRead(query); err != nil {
+	if err := admitInspectRead(ctx, query); err != nil {
 		return nil, err
 	}
 
@@ -822,10 +853,8 @@ func (q inspectQuerier) QueryContext(ctx context.Context, query string, args ...
 }
 
 func (q inspectQuerier) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
-	if err := admitInspectRead(query); err != nil {
-		//billet:ignore rawsql // not a query: a name no ledger holds, so the Row the signature demands carries the refusal
-		return q.r.QueryRowContext(ctx,
-			`SELECT 1 FROM "an inspection admits only the named reads sqlc generated; this statement is not one"`)
+	if err := admitInspectRead(ctx, query); err != nil {
+		return refusedRow(ctx)
 	}
 
 	//billet:ignore rawsql // forwards a statement sqlc generated, after admitInspectRead proved it is one
@@ -842,8 +871,73 @@ var sessionEffectFunctions = []string{
 
 var readOpsType = reflect.TypeOf((*ReadOps)(nil)).Elem()
 
-// admitInspectRead is the rule above, stated on one statement.
-func admitInspectRead(query string) error {
+// generatedReads is the exact text of every statement a ReadOps method runs,
+// learned once by calling each method against a recording adapter: the
+// generated code hands its constant to QueryContext or QueryRowContext, the
+// adapter keeps the text and answers with an error, and the method returns.
+// The context reaches only the adapter's answer, never the recording, so the
+// first caller's context decides nothing about the set.
+var (
+	generatedReadsOnce sync.Once
+	generatedReadSet   map[string]bool
+)
+
+func generatedReads(ctx context.Context) map[string]bool {
+	generatedReadsOnce.Do(func() {
+		seen := map[string]bool{}
+		q := reflect.ValueOf(ledgerdb.New(recordingDBTX{seen: seen}))
+
+		for i := range readOpsType.NumMethod() {
+			fn := q.MethodByName(readOpsType.Method(i).Name)
+			args := make([]reflect.Value, fn.Type().NumIn())
+
+			for j := range args {
+				args[j] = reflect.Zero(fn.Type().In(j))
+			}
+
+			args[0] = reflect.ValueOf(ctx)
+			fn.Call(args)
+		}
+
+		generatedReadSet = seen
+	})
+
+	return generatedReadSet
+}
+
+// recordingDBTX keeps every statement text it is handed and answers nothing.
+type recordingDBTX struct{ seen map[string]bool }
+
+var errRecording = errors.New("state: recording the generated reads")
+
+func (recordingDBTX) ExecContext(context.Context, string, ...any) (sql.Result, error) {
+	return nil, errRecording
+}
+
+func (recordingDBTX) PrepareContext(context.Context, string) (*sql.Stmt, error) {
+	return nil, errRecording
+}
+
+func (r recordingDBTX) QueryContext(_ context.Context, query string, _ ...any) (*sql.Rows, error) {
+	r.seen[query] = true
+
+	return nil, errRecording
+}
+
+func (r recordingDBTX) QueryRowContext(ctx context.Context, query string, _ ...any) *sql.Row {
+	r.seen[query] = true
+
+	return refusedRow(ctx)
+}
+
+// admitInspectRead is the rule above, stated on one statement: the exact
+// generated text first, then the shape that text is held to.
+func admitInspectRead(ctx context.Context, query string) error {
+	if !generatedReads(ctx)[query] {
+		return fmt.Errorf("%w: only the named reads sqlc generated are admitted through an inspection's View, "+
+			"and this statement is not one of them", ErrInspect)
+	}
+
 	first, rest, ok := strings.Cut(query, "\n")
 	if !ok || !strings.HasPrefix(first, "-- name: ") {
 		return fmt.Errorf("%w: only the named reads sqlc generated are admitted, and this statement carries "+
@@ -864,7 +958,12 @@ func admitInspectRead(query string) error {
 		_, body, _ = strings.Cut(body, "\n")
 	}
 
-	keyword := strings.ToUpper(strings.Fields(body)[0])
+	words := strings.Fields(body)
+	if len(words) == 0 {
+		return fmt.Errorf("%w: %s has no statement after its header", ErrInspect, fields[0])
+	}
+
+	keyword := strings.ToUpper(words[0])
 	if keyword != "SELECT" && keyword != "WITH" {
 		return fmt.Errorf("%w: %s begins with %s, which is not a read", ErrInspect, fields[0], keyword)
 	}

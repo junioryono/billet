@@ -254,14 +254,26 @@ func pathOwner(path string) (uint32, uint32, error) {
 	return st.Uid, st.Gid, nil
 }
 
-// runAsLedgerOwner re-executes this command under the identity directory's
-// owner when it runs as root and that owner is another account, and reports
-// whether it did so (the caller then returns the child's outcome and does
-// nothing itself). A directory owned by root, or a process that is not root,
-// runs the report in place; a directory that does not exist is left for the
-// open to refuse with its own diagnostic.
+// runAsLedgerOwner runs the report as the identity directory's owner and as
+// nobody else: root over another account's directory re-executes this command
+// under that account and reports that it did (the caller then returns the
+// child's outcome and does nothing itself); the owner runs the report in
+// place; and on a SQLite ledger ANY OTHER ACCOUNT IS REFUSED before the ledger
+// is opened, because a read-only open of a stopped SQLite ledger creates
+// sidecars owned by whoever opened it, and an operator with group access to
+// the directory would leave files the service account cannot write exactly as
+// root would. A PostgreSQL ledger has no sidecar, so there the rule is root's
+// alone. A directory that does not exist is left for the open to refuse with
+// its own diagnostic.
 func runAsLedgerOwner(ctx context.Context, cfg *config.Config, args []string) (bool, error) {
-	if cfg.Server == nil || statusEUID() != 0 {
+	if cfg.Server == nil {
+		return false, nil
+	}
+
+	euid := statusEUID()
+	sqlite := cfg.Server.LedgerBackend() != config.StatePostgres
+
+	if euid != 0 && !sqlite {
 		return false, nil
 	}
 
@@ -271,8 +283,12 @@ func runAsLedgerOwner(ctx context.Context, cfg *config.Config, args []string) (b
 		return false, nil
 	case err != nil:
 		return false, fmt.Errorf("read who owns %s: %w", cfg.Server.IdentityDir, err)
-	case uid == 0:
+	case int(uid) == euid:
 		return false, nil
+	case euid != 0:
+		return false, fmt.Errorf("%s is owned by uid %d and this process runs as uid %d; a status read of a "+
+			"SQLite ledger leaves files owned by whoever read it, so run this as the ledger's owner, or as root, "+
+			"which runs it as the owner", cfg.Server.IdentityDir, uid, euid)
 	}
 
 	code, err := statusReexec(ctx, uid, gid, args)
