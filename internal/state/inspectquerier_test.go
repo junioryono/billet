@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -119,16 +120,37 @@ func TestARefusedRowBorrowsNoConnection(t *testing.T) {
 	const views = 4
 
 	var (
-		arrived = make(chan struct{}, views)
-		release = make(chan struct{})
-		done    = make(chan error, views)
+		arrived     = make(chan struct{}, views)
+		release     = make(chan struct{})
+		releaseOnce sync.Once
+		done        = make(chan error, views)
 	)
+
+	releaseAll := func() { releaseOnce.Do(func() { close(release) }) }
+	collected := 0
+
+	// EVERY WORKER IS RELEASED AND COLLECTED however the test ends, so a View
+	// blocked at the barrier cannot outlive a fatal assertion.
+	t.Cleanup(func() {
+		cancel()
+		releaseAll()
+
+		for collected < views {
+			<-done
+			collected++
+		}
+	})
 
 	for range views {
 		go func() {
 			done <- db.View(ctx, func(q Querier) error {
 				arrived <- struct{}{}
-				<-release
+
+				select {
+				case <-release:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
 
 				var v int
 				if err := q.QueryRowContext(ctx, "SELECT 1").Scan(&v); !errors.Is(err, ErrInspect) {
@@ -149,11 +171,13 @@ func TestARefusedRowBorrowsNoConnection(t *testing.T) {
 		}
 	}
 
-	close(release)
+	releaseAll()
 
 	for range views {
 		select {
 		case err := <-done:
+			collected++
+
 			if err != nil {
 				t.Error(err)
 			}

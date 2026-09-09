@@ -5,10 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
+	"strings"
 	"syscall"
+	"unicode"
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/rollout"
@@ -184,9 +187,47 @@ func printRolloutStatusJSON(report *rolloutStatusReport) error {
 		return fmt.Errorf("render the report: %w", err)
 	}
 
-	fmt.Println(string(body))
+	// A REPORT THAT DID NOT ARRIVE IS A FAILURE: a machine reading a redirected
+	// file must not find a cut JSON behind a zero exit.
+	var out io.Writer = os.Stdout
+	if statusOut != nil {
+		out = statusOut
+	}
+
+	if _, err := fmt.Fprintln(out, string(body)); err != nil {
+		return fmt.Errorf("write the report: %w", err)
+	}
 
 	return nil
+}
+
+// escapeControl renders a string a foreign process produced for one line of a
+// text report: every control character becomes its escape, and so does every
+// format character and line or paragraph separator (a bidi override or a
+// U+2028 would reorder or break the row as a raw newline would), so a
+// multi-line dispatch error cannot break the row structure and a terminal
+// escape cannot alter the report. The stored value and the JSON are untouched.
+func escapeControl(s string) string {
+	var b strings.Builder
+
+	for _, r := range s {
+		switch {
+		case r == '\n':
+			b.WriteString(`\n`)
+		case r == '\t':
+			b.WriteString(`\t`)
+		case r == '\r':
+			b.WriteString(`\r`)
+		case r < 0x20 || r == 0x7f:
+			fmt.Fprintf(&b, `\x%02x`, r)
+		case unicode.IsControl(r), unicode.Is(unicode.Cf, r), unicode.Is(unicode.Zl, r), unicode.Is(unicode.Zp, r):
+			fmt.Fprintf(&b, `\u%04x`, r)
+		default:
+			b.WriteRune(r)
+		}
+	}
+
+	return b.String()
 }
 
 // ledgerDSNFrom is the connection string for a PostgreSQL ledger, from an
@@ -236,6 +277,9 @@ var (
 	statusOwnerOf   = pathOwner
 	statusReexec    = reexecAs
 	statusAfterOpen func(*state.DB)
+	// statusOut replaces standard output for the JSON report; a test stands a
+	// failing writer in. Resolved at the write, so a captured stdout is seen.
+	statusOut io.Writer
 )
 
 // pathOwner reads the owner of a path without following a symlink, or reports

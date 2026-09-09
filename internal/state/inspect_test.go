@@ -2,6 +2,7 @@ package state
 
 import (
 	"bufio"
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -171,17 +172,36 @@ func TestAnInspectionRefusesEveryWriteTransaction(t *testing.T) {
 
 	t.Cleanup(func() { _ = db.Close() })
 
+	// THE WRITER POOL'S ONLY CONNECTION IS HELD HERE, so a Tx that began a
+	// transaction before refusing would wait for it and answer the deadline,
+	// never ErrInspect; the refusal must come before any BEGIN.
+	held, err := db.w.Conn(t.Context())
+	if err != nil {
+		t.Fatalf("hold the writer connection: %v", err)
+	}
+
+	t.Cleanup(func() { _ = held.Close() })
+
 	ran := false
 
-	err = db.Tx(t.Context(), func(tx *sql.Tx) error {
+	deadline, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+
+	started := time.Now()
+
+	err = db.Tx(deadline, func(tx *sql.Tx) error {
 		ran = true
 
-		_, err := tx.ExecContext(t.Context(), `UPDATE nodes SET provider = 'tart' WHERE name = 'epyc-1'`)
+		_, err := tx.ExecContext(deadline, `UPDATE nodes SET provider = 'tart' WHERE name = 'epyc-1'`)
 
 		return err
 	})
 	if !errors.Is(err, ErrInspect) {
-		t.Fatalf("Tx on an inspection: err = %v, want ErrInspect", err)
+		t.Fatalf("Tx on an inspection with the writer connection held: err = %v, want ErrInspect", err)
+	}
+
+	if waited := time.Since(started); waited > time.Second {
+		t.Errorf("Tx waited %s for a connection before refusing", waited)
 	}
 
 	if ran {

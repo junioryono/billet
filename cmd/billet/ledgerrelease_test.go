@@ -32,6 +32,11 @@ func TestEveryLedgerOpenNamesTheRunningRelease(t *testing.T) {
 
 	var opens int
 
+	// THE TWO INSPECTION OPENERS ARE REQUIRED BY NAME: the report's open is the
+	// one an older binary could quietly serve through, and a count alone would
+	// be satisfied by any eight opens.
+	seen := map[string]int{}
+
 	// THE ONE EXEMPTION, BY NAME: the instruction reader. A standby's timer is an
 	// older binary reading what it should become, and the watermark the newer
 	// leader recorded would refuse it. Its opens are asserted the other way
@@ -87,6 +92,7 @@ func TestEveryLedgerOpenNamesTheRunningRelease(t *testing.T) {
 		}
 
 		opens++
+		seen[name]++
 
 		for _, arg := range call.Args {
 			inner, ok := arg.(*ast.CallExpr)
@@ -95,6 +101,28 @@ func TestEveryLedgerOpenNamesTheRunningRelease(t *testing.T) {
 			}
 
 			if p, fn, ok := selector(inner.Fun); ok && p == "state" && fn == "WithRunningRelease" {
+				// AND THE ARGUMENT IS THE RUNNING RELEASE ITSELF: WithRunningRelease("")
+				// names nothing and would satisfy the call's presence.
+				if len(inner.Args) != 1 {
+					t.Errorf("%s: state.WithRunningRelease takes one argument, got %d",
+						fset.Position(inner.Pos()), len(inner.Args))
+
+					return true
+				}
+
+				vcall, ok := inner.Args[0].(*ast.CallExpr)
+				if !ok {
+					t.Errorf("%s: state.WithRunningRelease's argument is not version.Version()",
+						fset.Position(inner.Pos()))
+
+					return true
+				}
+
+				if vp, vf, ok := selector(vcall.Fun); !ok || vp != "version" || vf != "Version" || len(vcall.Args) != 0 {
+					t.Errorf("%s: state.WithRunningRelease's argument is not version.Version()",
+						fset.Position(inner.Pos()))
+				}
+
 				return true
 			}
 		}
@@ -104,6 +132,13 @@ func TestEveryLedgerOpenNamesTheRunningRelease(t *testing.T) {
 
 		return true
 	})
+
+	for _, opener := range []string{"OpenInspect", "OpenPostgresInspect"} {
+		if seen[opener] != 1 {
+			t.Errorf("ledger.go calls state.%s %d times, want exactly once, in the report's open",
+				opener, seen[opener])
+		}
+	}
 
 	// THE COUNT IS ASSERTED, or a refactor that moved every open out of this
 	// file would leave a test that inspects nothing and passes.

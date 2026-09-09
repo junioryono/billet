@@ -1160,6 +1160,66 @@ func TestRolloutStatusRunsAsTheLedgersOwner(t *testing.T) {
 	})
 }
 
+// A JSON REPORT THAT COULD NOT BE WRITTEN IS THE COMMAND'S FAILURE: a machine
+// reading a redirected file must not find a cut report behind a zero exit.
+func TestRolloutStatusJSONReportsAFailedWrite(t *testing.T) {
+	stateDir := t.TempDir()
+	cfgPath := writeCAConfig(t, stateDir)
+
+	statusPlane(t, stateDir, func(*state.DB) {})
+
+	savedOut := statusOut
+	statusOut = failingWriter{}
+
+	t.Cleanup(func() { statusOut = savedOut })
+
+	err := cmdRolloutStatus(t.Context(), []string{"--json", "--config", cfgPath})
+	if err == nil || !strings.Contains(err.Error(), "write the report") || !errors.Is(err, errDiskFull) {
+		t.Errorf("err = %v, want the write's failure", err)
+	}
+}
+
+var errDiskFull = errors.New("no space left on device")
+
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) { return 0, errDiskFull }
+
+// THE TEXT REPORT ESCAPES A REFUSAL'S CONTROL CHARACTERS: a multi-line dispatch
+// error stays one row, a tab does not move a column, and a terminal escape is
+// shown rather than obeyed. The stored value is untouched.
+func TestRolloutStatusTextEscapesTheRefusal(t *testing.T) {
+	nodes := []rollout.Node{
+		{Node: "refused", Phase: rollout.PhasePending, LastRefusal: "line one\nline two\ttabbed\x1b[31mred\r\u2028\u202eb\u0085"},
+		{Node: "quiet", Phase: rollout.PhasePending},
+	}
+
+	out := capture(t, func() { printRolloutNodes(nodes) })
+
+	line := lineFor(t, out, "refused")
+	if want := `last dispatch refused: line one\nline two\ttabbed\x1b[31mred\r\u2028\u202eb\u0085`; !strings.Contains(line, want) {
+		t.Errorf("the refused row reads %q, want it to carry %q", line, want)
+	}
+
+	for _, raw := range []string{"\x1b", "line two\t", "\r", "\u2028", "\u202e", "\u0085"} {
+		if strings.Contains(out, raw) {
+			t.Errorf("the report carries the raw control sequence %q", raw)
+		}
+	}
+
+	// ONE ROW PER HOST: a raw newline would start a line with the refusal's
+	// second half.
+	for _, l := range strings.Split(out, "\n") {
+		if strings.HasPrefix(l, "line two") {
+			t.Errorf("the refusal broke the row structure:\n%s", out)
+		}
+	}
+
+	if nodes[0].LastRefusal != "line one\nline two\ttabbed\x1b[31mred\r\u2028\u202eb\u0085" {
+		t.Error("rendering changed the stored refusal")
+	}
+}
+
 // THE TEXT REPORT'S DETAIL HAS ONE PRECEDENCE: a blocker, then an exemption,
 // then a rollback result, and the last refusal only when none of them says
 // where the host is.

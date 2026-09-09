@@ -527,7 +527,8 @@ func printRolloutNodes(nodes []rollout.Node) {
 		case detail == "" && n.RollbackResult != "":
 			detail = n.RollbackResult
 		case detail == "" && n.LastRefusal != "":
-			detail = "last dispatch refused: " + n.LastRefusal
+			// A DISPATCH ERROR IS A FOREIGN PROCESS'S TEXT and the row is one line.
+			detail = "last dispatch refused: " + escapeControl(n.LastRefusal)
 		}
 
 		next := n.NextAttemptAt
