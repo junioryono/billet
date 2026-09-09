@@ -41,6 +41,7 @@ _SCHEME = "scheme"
 _HOST = "host"
 _ROUTE = "route"
 _ZONE = "zone"
+_ASCII_DIGITS = re.compile(r"^[0-9]+$")
 _PORT = "port"
 _GRAMMAR = "grammar"
 _NOT_CANONICAL = "not_canonical"
@@ -192,7 +193,9 @@ def parse(text, tls):
             port_raw = None
         bracketed = False
 
-    if port_raw and not port_raw.isdigit():
+    # ASCII DIGITS ONLY: str.isdigit admits every Unicode digit (a fullwidth
+    # 8443 became 8443, which Go refuses) and a superscript int() then refuses.
+    if port_raw and not _ASCII_DIGITS.match(port_raw):
         raise EndpointError(_SYNTAX, "not a URL: %r has an invalid port %r after its host" % (text, ":" + port_raw))
 
     if bracketed:

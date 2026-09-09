@@ -1397,10 +1397,15 @@ func readJournalUnder(root *os.File, dir string) (*hostupgrade.Journal, error) {
 
 	// A DIRECTORY WITH THE ROLE'S JOURNAL AND NOT THIS PROGRAM'S is a converge's
 	// transaction, which the role resumes; it is neither a Go journal to load
-	// nor a directory with no journal to release.
+	// nor a directory with no journal to release. A journal that cannot be
+	// examined is neither: "no journal" is what a resume releases the claim
+	// on, and only a positive absence may say it.
 	if errors.Is(err, hostupgrade.ErrNoJournal) {
-		if _, statErr := statAt(recovery, roleJournalName); statErr == nil {
+		switch _, statErr := guardStatAt(recovery, roleJournalName); {
+		case statErr == nil:
 			return nil, fmt.Errorf("%w: %s holds %s", errRoleJournal, dir, roleJournalName)
+		case !errors.Is(statErr, os.ErrNotExist):
+			return nil, fmt.Errorf("examine %s: %w", filepath.Join(dir, roleJournalName), statErr)
 		}
 	}
 

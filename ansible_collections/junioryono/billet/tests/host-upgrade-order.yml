@@ -822,6 +822,9 @@
           - "'billet_upgrade_recovery_dir' not in billet_stage_reset['ansible.builtin.set_fact']"
           - "'billet_interrupted_upgrade' not in billet_stage_reset['ansible.builtin.set_fact']"
           - "'billet_upgrade_claim_shape' not in billet_stage_reset['ansible.builtin.set_fact']"
+          # A MAC STAGES NOTHING: the resolution block and the installed-binary stat are Linux's.
+          - "'billet_exclusion_darwin' in ((billet_host_stage_tasks | selectattr('name', 'equalto', \"Resolve and stage this invocation's candidate\") | first).when | string)"
+          - "'billet_exclusion_darwin' in ((billet_host_stage_tasks | selectattr('name', 'equalto', 'Inspect the installed billet binary') | first).when | string)"
           - "'release --holder' in billet_stage_intent['ansible.builtin.assert'].fail_msg"
           - "\"== 'guard'\" in (billet_stage_intent.when | string)"
           - billet_stage_block_names.index('Decide whether the billet binary needs a transactional upgrade') < billet_stage_block_names.index('Refuse a same-holder rerun with a different intent')
@@ -932,6 +935,9 @@
           - "\"== 'guard-pointer'\" in (billet_finalize_close['ansible.builtin.file'].path | string)"
           - billet_finalization_names[-1] == 'Record that the guard holds no transaction after the close'
           - billet_finalize_shape['ansible.builtin.set_fact'].billet_upgrade_claim_shape == 'guard'
+          # THE INTERRUPTION FLAG SURVIVES THE CLOSE: main.yml requires a fresh converge on it.
+          - "'billet_interrupted_upgrade' not in billet_finalize_shape['ansible.builtin.set_fact']"
+          - "'billet_interrupted_upgrade' not in (billet_host_finalization_text | regex_findall('billet_interrupted_upgrade:'))"
           - "\"== 'guard-pointer'\" in (billet_finalize_shape.when | string)"
         fail_msg: >-
           The transaction under the guard must claim by `ln -sT` of the pointer

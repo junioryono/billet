@@ -17,6 +17,8 @@ import (
 	"syscall"
 	"testing"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/junioryono/billet/internal/hostupgrade"
 )
 
@@ -355,6 +357,36 @@ func TestATakeoverProvesTheRolesTransactionCompleteWithoutLoadingIt(t *testing.T
 		}
 
 		_ = f
+	})
+
+	t.Run("a role journal that cannot be examined is not no journal", func(t *testing.T) {
+		f := newGuardFixture(t)
+		mustHold(t, "ci-1")
+
+		recovery := filepath.Join(f.root, "recovery-20260909T120000-0badcafe")
+		mustOK(t, os.Mkdir(recovery, 0o700))
+
+		saved := guardStatAt
+		guardStatAt = func(dir *os.File, name string) (*unix.Stat_t, error) {
+			if name == roleJournalName {
+				return nil, syscall.EIO
+			}
+
+			return saved(dir, name)
+		}
+		t.Cleanup(func() { guardStatAt = saved })
+
+		root := openRootForTest(t)
+
+		_, err := readJournalUnder(root, recovery)
+		switch {
+		case err == nil:
+			t.Fatal("readJournalUnder over an unexaminable role journal: no error")
+		case errors.Is(err, hostupgrade.ErrNoJournal):
+			t.Fatalf("readJournalUnder read an unexaminable role journal as no journal: %v", err)
+		case !errors.Is(err, syscall.EIO) || !strings.Contains(err.Error(), "examine"):
+			t.Fatalf("readJournalUnder: err = %v, want the examination's failure named", err)
+		}
 	})
 
 	t.Run("a Go resume over a role-only claim refuses naming the role", func(t *testing.T) {

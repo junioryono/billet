@@ -296,7 +296,10 @@
 # ALONE and the guard stays held (the converge releases nothing; the operator
 # releases with the holder they exported), and the shape goes back to `guard`
 # so a task later in this invocation reads the shape the host is in. Under the
-# legacy shapes the claim file itself is removed.
+# legacy shapes the claim file itself is removed. THE INTERRUPTION FLAG IS NOT
+# TOUCHED: main.yml requires a fresh converge after a recovered transaction on
+# that flag, and clearing it here let the play go on into a second transaction
+# over the journal it had just closed.
 - name: Close the durable host-upgrade transaction after stable service startup
   ansible.builtin.file:
     path: >-
@@ -322,5 +325,4 @@
 - name: Record that the guard holds no transaction after the close
   ansible.builtin.set_fact:
     billet_upgrade_claim_shape: guard
-    billet_interrupted_upgrade: false
   when: billet_upgrade_claim_shape == 'guard-pointer'

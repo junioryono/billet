@@ -11,7 +11,10 @@
 # and resets nothing the classification owns.
 #
 # IN CHECK MODE it resolves and inspects, fetches nothing, allocates nothing
-# and stages nothing, as binary.yml already says of a dry run.
+# and stages nothing, as binary.yml already says of a dry run. ON A MAC it
+# resets and does nothing else: the host role manages no Mac's binary, so a
+# candidate or a pin an inventory carries for the Linux hosts is not staged,
+# fetched or executed there, and a Mac holds through its managed binary.
 
 - name: Reset the transaction facts for this invocation
   ansible.builtin.set_fact:
@@ -29,9 +32,12 @@
   register: billet_installed_binary
   check_mode: false
   become: "{{ billet_exclusion_become }}"
+  when: not (billet_exclusion_darwin | default(false) | bool)
 
 - name: Resolve and stage this invocation's candidate
-  when: not (billet_interrupted_upgrade | default(false))
+  when:
+    - not (billet_interrupted_upgrade | default(false))
+    - not (billet_exclusion_darwin | default(false) | bool)
   block:
     # billet_binary_src WINS, and says so rather than ignoring the other input
     # quietly. Overriding a pinned inventory for one run is the supported way

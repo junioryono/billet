@@ -124,6 +124,11 @@ var guardHook func(op guardOp) error
 // the tests holds it to.
 var guardSync = syncFD
 
+// guardStatAt is the seam through which the role journal's presence is
+// examined, so a test can make the examination fail without a filesystem
+// that fails one entry of a directory and not another.
+var guardStatAt = statAt
+
 // syncFD flushes one descriptor and returns what the kernel said.
 func syncFD(f *os.File) error {
 	return f.Sync()

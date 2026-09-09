@@ -468,6 +468,22 @@
       ]
     },
     {
+      "input": "https://control.example:８４４３",
+      "tls": true,
+      "refused": "syntax",
+      "words": [
+        "port"
+      ]
+    },
+    {
+      "input": "control.example:²",
+      "tls": true,
+      "refused": "syntax",
+      "words": [
+        "port"
+      ]
+    },
+    {
       "input": "control.example:0",
       "tls": true,
       "refused": "port",

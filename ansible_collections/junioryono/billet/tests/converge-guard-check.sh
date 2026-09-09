@@ -1123,7 +1123,19 @@ write_guard p15-e2 h1 "$work/cases/p15-e2/bin/billet"
 run_case p15-e2 unescalated BILLET_FAKE_MANAGED_HOLD_HANG=1 -- -e billet_exclusion_platform=Darwin -e billet_guard_timeout=1
 [ "$status" -ne 0 ] || fail "p15-e2: a hung darwin hold was not bounded" "$work/cases/p15-e2/out"
 [ "$(failed_at p15-e2)" = "Hold this host for the converge" ] || fail "p15-e2: the hung hold failed elsewhere: $(failed_at p15-e2)" "$work/cases/p15-e2/out"
-echo "ok   P15: a Mac classifies and holds as the agent's account, bounded, and a pristine Mac holds nothing"
+plant p15-f
+run_case p15-f unescalated -- -e billet_exclusion_platform=Darwin -e billet_binary_src="$work/cases/p15-f/src/billet" -e billet_recovery_dir_suffix_command="$fakes/suffix"
+expect_allowed p15-f
+expect_calls p15-f suffix "" 0
+expect_calls p15-f candidate "" 0
+marker_absent p15-f
+expect_calls p15-f managed "converge-guard hold --holder h1" 1
+expect_calls p15-f managed "--candidate" 0
+plant p15-g
+run_case p15-g unescalated -- -e billet_exclusion_platform=Darwin -e billet_gate_inclusions=2 -e "$(json_var billet_gate_between "rm -rf $work/cases/p15-g/lib $work/cases/p15-g/bin/billet")"
+expect_refused p15-g "Refuse a converge whose exclusion moved" "as h1" "absent"
+expect_calls p15-g managed "converge-guard hold" 1
+echo "ok   P15: a Mac classifies and holds as the agent's account, bounded, stages nothing, and a pristine Mac holds nothing unless this run already held it"
 
 # P17. The root established on a fresh Linux host; an unsafe existing root refuses.
 plant p17-fresh

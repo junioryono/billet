@@ -120,9 +120,12 @@
     billet_exclusion_parent_stat: "{{ billet_exclusion_paths.results[1].stat }}"
     billet_exclusion_root_stat: "{{ billet_exclusion_paths.results[2].stat }}"
     # A Mac with neither a billet nor a root has nothing to hold; anything
-    # else on a Mac is classified exactly as on Linux.
+    # else on a Mac is classified exactly as on Linux. Once this run holds the
+    # host the shortcut is closed: a root that vanished under a held converge
+    # is the exclusion having moved, which the classification below refuses.
     billet_exclusion_pristine_mac: >-
       {{ billet_exclusion_darwin | bool
+         and not (billet_exclusion_held | default(false))
          and not billet_exclusion_paths.results[0].stat.exists
          and not billet_exclusion_paths.results[2].stat.exists }}
 
