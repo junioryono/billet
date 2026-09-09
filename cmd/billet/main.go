@@ -156,6 +156,8 @@ func commands(lc *lifecycle) []command {
 			cmdRollout},
 		{"host-upgrade", "replace billet on THIS machine transactionally, with rollback",
 			cmdHostUpgrade},
+		{"converge-guard", "hold the upgrade root's one claim for a converge, so no transaction " +
+			"moves this host under it", cmdConvergeGuard},
 		{"release", "record which signed manifest produced the billet installed here",
 			cmdRelease},
 		{"acceptance", "stand an ISOLATED deployment up beside this one, run a real job on " +
@@ -2815,6 +2817,11 @@ func cmdStatus(ctx context.Context, args []string) error {
 	// a node reporting nothing. `billet rollout status` is the full picture; this
 	// is what says to go and look at it.
 	printRollout(ctx, db)
+
+	// AND THE HOST'S OWN GUARD, read from this host's upgrade root and never
+	// from the ledger: a converge holding this host is why a rollout is refusing
+	// to move it.
+	printGuard()
 
 	// AND WHO THE DEPLOYMENT'S CONTROLLER IS, because the epoch beside it is a
 	// fence rather than a note. Every write is refused once that number moves, so

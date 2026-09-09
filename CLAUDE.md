@@ -10,7 +10,7 @@ Never hard-wrap prose at a column. Every paragraph in a `.md` or `.txt` file, a 
 
 | Path | What it is |
 |---|---|
-| `cmd/billet` | The binary: the `server` and `node` roles and the whole operator CLI (`init`, `github-app`, `check`, `local *`, `ca *`, `nodes *`, `leases *`, `drain`, `images *`, `ami *`, `rollout *`, `host-upgrade`, `cache *`, `acceptance *`, `teardown`, `decommission`). The only package allowed stdout and `os.Exit`. |
+| `cmd/billet` | The binary: the `server` and `node` roles and the whole operator CLI (`init`, `github-app`, `check`, `local *`, `ca *`, `nodes *`, `leases *`, `drain`, `images *`, `ami *`, `rollout *`, `host-upgrade`, `converge-guard *`, `cache *`, `acceptance *`, `teardown`, `decommission`). The only package allowed stdout and `os.Exit`. |
 | `internal/config` | `billet.yaml` schema and validation. A leaf: it imports nothing else of billet's. |
 | `internal/state` | The ledger: SQLite or PostgreSQL behind one seam, migrations (`migrations/`, `pgmigrations/`), the sqlc query set (`queries/`, `ledgerdb/`), locks, fences, the controller claim. |
 | `internal/alloc` | The capacity allocator: escrow, leases and their state machine, placement, floors, the compute barrier, quarantine, force operations, enrollment records. |

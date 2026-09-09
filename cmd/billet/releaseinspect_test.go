@@ -107,6 +107,11 @@ func newInspectFixture(t *testing.T) *inspectFixture {
 	f.writeConfig(t, f.serverConfig())
 	f.unitAbsent(t, "billet-node.service")
 	f.unitRunning(t, "billet-server.service", "server", f.configPath, nil)
+	// The three scheduled units, each in a distinct state, so a report that
+	// copied one unit's answer onto the others is told apart.
+	f.scheduledUnit(t, "billet-upgrade.timer", "loaded", "enabled", "active", "waiting", 0)
+	f.scheduledUnit(t, "billet-backup.timer", "loaded", "disabled", "inactive", "dead", 0)
+	f.scheduledUnit(t, "billet-backup.service", "loaded", "static", "inactive", "dead", 0)
 	f.process(t, []string{f.binPath, "server", "--config", f.configPath}, nil)
 	// The config predates the process start, so nothing has changed since.
 	f.touchBeforeStart(t, f.configPath)
@@ -222,6 +227,15 @@ func (f *inspectFixture) touchBeforeStart(t *testing.T, path string) {
 func (f *inspectFixture) unitAbsent(t *testing.T, unit string) {
 	t.Helper()
 	f.unitAbsentWith(t, unit, "inactive", "dead", 0)
+}
+
+// scheduledUnit renders the properties systemd reports for a timer or the
+// backup service: no ExecStart shape the report reads.
+func (f *inspectFixture) scheduledUnit(t *testing.T, unit, load, fileState, active, sub string, pid int) {
+	t.Helper()
+	writeFile(t, filepath.Join(f.unitsDir, unit), "LoadState="+load+"\nUnitFileState="+fileState+"\nActiveState="+active+
+		"\nSubState="+sub+"\nMainPID="+strconv.Itoa(pid)+"\nInvocationID=\nNeedDaemonReload=no\nExecMainStartTimestamp=\n"+
+		"EnvironmentFiles=\nEnvironment=\n", 0o644)
 }
 
 // unitAbsentWith is a unit whose fragment systemd no longer finds, with the
@@ -2358,6 +2372,17 @@ installed_config.sha256
 provenance.reason
 provenance.verdict
 schema
+services.backup_service.active_state
+services.backup_service.enabled
+services.backup_service.main_pid
+services.backup_service.sub_state
+services.backup_service.unit_file_state
+services.backup_service.unit_present
+services.backup_timer.active_state
+services.backup_timer.enabled
+services.backup_timer.sub_state
+services.backup_timer.unit_file_state
+services.backup_timer.unit_present
 services.node.active_state
 services.node.cmdline_config_path
 services.node.cmdline_matches_unit
@@ -2400,6 +2425,11 @@ services.server.started_at
 services.server.sub_state
 services.server.unit_file_state
 services.server.unit_present
+services.upgrade_timer.active_state
+services.upgrade_timer.enabled
+services.upgrade_timer.sub_state
+services.upgrade_timer.unit_file_state
+services.upgrade_timer.unit_present
 transaction.active
 transaction.converge_guard
 transaction.journal
@@ -2605,6 +2635,17 @@ provenance.manifest_digest
 provenance.verdict
 provenance.version
 schema
+services.backup_service.active_state
+services.backup_service.enabled
+services.backup_service.main_pid
+services.backup_service.sub_state
+services.backup_service.unit_file_state
+services.backup_service.unit_present
+services.backup_timer.active_state
+services.backup_timer.enabled
+services.backup_timer.sub_state
+services.backup_timer.unit_file_state
+services.backup_timer.unit_present
 services.node.active_state
 services.node.cmdline_config_path
 services.node.cmdline_matches_unit
@@ -2649,6 +2690,11 @@ services.server.started_at
 services.server.sub_state
 services.server.unit_file_state
 services.server.unit_present
+services.upgrade_timer.active_state
+services.upgrade_timer.enabled
+services.upgrade_timer.sub_state
+services.upgrade_timer.unit_file_state
+services.upgrade_timer.unit_present
 transaction.active
 transaction.converge_guard.claimed_at
 transaction.converge_guard.holder
@@ -2697,6 +2743,17 @@ installed_config.sha256
 provenance.reason
 provenance.verdict
 schema
+services.backup_service.active_state
+services.backup_service.enabled
+services.backup_service.main_pid
+services.backup_service.sub_state
+services.backup_service.unit_file_state
+services.backup_service.unit_present
+services.backup_timer.active_state
+services.backup_timer.enabled
+services.backup_timer.sub_state
+services.backup_timer.unit_file_state
+services.backup_timer.unit_present
 services.node.active_state
 services.node.cmdline_config_path
 services.node.cmdline_matches_unit
@@ -2739,6 +2796,11 @@ services.server.started_at
 services.server.sub_state
 services.server.unit_file_state
 services.server.unit_present
+services.upgrade_timer.active_state
+services.upgrade_timer.enabled
+services.upgrade_timer.sub_state
+services.upgrade_timer.unit_file_state
+services.upgrade_timer.unit_present
 transaction.active
 transaction.converge_guard
 transaction.journal.failure

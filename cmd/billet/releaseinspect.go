@@ -183,6 +183,16 @@ type inspectService struct {
 	// from the configuration observation, so the closing check can withdraw
 	// them with it.
 	fromObservation bool
+	// scheduled marks a unit observed for its runtime facts alone: the upgrade
+	// timer, the backup timer and the backup service, which have no ExecStart
+	// shape the binding reads and run no billet role, so they carry only
+	// unit_present, unit_file_state, enabled, active_state, sub_state and, for
+	// the service, main_pid. They are EXEMPT from the binding, the shape rule
+	// and the executable comparison, which are server's and node's alone.
+	scheduled bool
+	// hasMainPID says a scheduled unit is the service, whose main pid is
+	// reported; a timer has none.
+	hasMainPID bool
 
 	RunningSHA256                  maybe `json:"running_sha256"`
 	SameAsExecutable               maybe `json:"same_as_executable"`
@@ -194,6 +204,94 @@ type inspectService struct {
 	EnvironmentFileChangedSinceRun maybe `json:"environment_file_changed_since_start"`
 	LoadedConfig                   maybe `json:"loaded_config"`
 	DSNEnv                         maybe `json:"dsn_env"`
+}
+
+// scheduledUnitJSON is what a scheduled unit's entry marshals as: the six
+// runtime facts and nothing else, so a consumer reading the shape fields of
+// `server` or `node` finds none on a timer.
+type scheduledUnitJSON struct {
+	UnitPresent   maybe  `json:"unit_present"`
+	UnitFileState maybe  `json:"unit_file_state"`
+	Enabled       maybe  `json:"enabled"`
+	ActiveState   maybe  `json:"active_state"`
+	SubState      maybe  `json:"sub_state"`
+	MainPID       *maybe `json:"main_pid,omitempty"`
+}
+
+// MarshalJSON emits the service's whole record, or a scheduled unit's six
+// facts.
+func (s inspectService) MarshalJSON() ([]byte, error) {
+	if !s.scheduled {
+		type plain inspectService
+
+		return json.Marshal(plain(s))
+	}
+
+	out := scheduledUnitJSON{UnitPresent: s.UnitPresent, UnitFileState: s.UnitFileState, Enabled: s.Enabled,
+		ActiveState: s.ActiveState, SubState: s.SubState}
+
+	if s.hasMainPID {
+		pid := s.MainPID
+		out.MainPID = &pid
+	}
+
+	return json.Marshal(out)
+}
+
+// scheduledUnits are the units the report observes for their runtime facts
+// alone, keyed as they appear in the services map.
+var scheduledUnits = map[string]string{
+	"upgrade_timer":  deploy.UpgradeTimerName,
+	"backup_timer":   deploy.BackupTimerName,
+	"backup_service": deploy.BackupUnitName,
+}
+
+// inspectScheduledUnit reads a scheduled unit's runtime facts: presence,
+// systemd's enablement answer and its derivation, the active and sub states,
+// and for the service its main pid (null for an observed zero, the number for
+// a running one whether or not its fragment is still found, unknown for a
+// value that is not a number). `LoadState=not-found` is a positive answer.
+func inspectScheduledUnit(ctx context.Context, unit string, service bool) inspectService {
+	svc := inspectService{scheduled: true, hasMainPID: service}
+	if hostOS == "darwin" {
+		why := "launchd has no unit shape this inspector reads"
+		svc.UnitPresent, svc.UnitFileState, svc.Enabled = unknown(why), unknown(why), unknown(why)
+		svc.ActiveState, svc.SubState, svc.MainPID = unknown(why), unknown(why), unknown(why)
+		return svc
+	}
+	props, err := unitProperties(ctx, unit)
+	if err != nil {
+		why := err.Error()
+		svc.UnitPresent, svc.UnitFileState, svc.Enabled = unknown(why), unknown(why), unknown(why)
+		svc.ActiveState, svc.SubState, svc.MainPID = unknown(why), unknown(why), unknown(why)
+		return svc
+	}
+	switch load := firstProp(props, "LoadState"); load {
+	case "not-found":
+		svc.UnitPresent = known(false)
+		svc.UnitFileState, svc.Enabled = known(nil), known(nil)
+	case "":
+		why := "systemd answered no LoadState for " + unit
+		svc.UnitPresent, svc.UnitFileState, svc.Enabled = unknown(why), unknown(why), unknown(why)
+	default:
+		svc.UnitPresent = known(true)
+		svc.UnitFileState, svc.Enabled = unitEnablement(firstProp(props, "UnitFileState"))
+	}
+	svc.ActiveState = known(firstProp(props, "ActiveState"))
+	svc.SubState = known(firstProp(props, "SubState"))
+	if !service {
+		return svc
+	}
+	pid, pidErr := strconv.Atoi(firstProp(props, "MainPID"))
+	switch {
+	case pidErr != nil:
+		svc.MainPID = unknown("systemd reported a MainPID that is not a number")
+	case pid == 0:
+		svc.MainPID = known(nil)
+	default:
+		svc.MainPID = known(pid)
+	}
+	return svc
 }
 
 type inspectDSNEnv struct {
@@ -351,6 +449,12 @@ func inspectHostRelease(ctx context.Context, configPath string) inspectReport {
 		svc, bound := inspectServiceSection(ctx, role, unit, cfg, configPath, inspectorInfo, inspectorSHA, exeSHA, exeInfo)
 		report.Services[role] = svc
 		binding = weaker(binding, bound)
+	}
+	// THE SCHEDULED UNITS ARE OBSERVED AND BIND NOTHING: a retirement's
+	// postconditions read them, and nothing about a timer's state says which
+	// configuration the two services are bound to.
+	for key, unit := range scheduledUnits {
+		report.Services[key] = inspectScheduledUnit(ctx, unit, key == "backup_service")
 	}
 	report.ConfigBinding = binding
 	report.Installed = inspectInstalledSection(cfg, configPath, report.Config, digest)
@@ -1863,6 +1967,15 @@ func printInspectReport(r inspectReport) {
 		}
 		fmt.Printf("%-13s %s/%s shape=%s image=%s\n", role, describeMaybe(svc.ActiveState),
 			describeMaybe(svc.SubState), describeMaybe(svc.Shape), describeMaybe(svc.SameAsExecutable))
+	}
+	for _, key := range []string{"upgrade_timer", "backup_timer", "backup_service"} {
+		svc := r.Services[key]
+		if svc.UnitPresent.known && svc.UnitPresent.value == false {
+			fmt.Printf("%-13s no unit (%s/%s)\n", key, describeMaybe(svc.ActiveState), describeMaybe(svc.SubState))
+			continue
+		}
+		fmt.Printf("%-13s %s/%s enabled=%s\n", key, describeMaybe(svc.ActiveState),
+			describeMaybe(svc.SubState), describeMaybe(svc.Enabled))
 	}
 	fmt.Printf("binding       %s\n", describeMaybe(r.ConfigBinding))
 	fmt.Printf("deployment    %s\n", describeMaybe(r.Host.DeploymentID))
