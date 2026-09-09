@@ -7,30 +7,39 @@
 # the pointer and the services untouched.
 - name: Inspect the host-upgrade claim before finalization
   ansible.builtin.stat:
-    path: "{{ item }}"
+    path: "{{ billet_exclusion_root }}/active"
     follow: false
     get_checksum: false
     get_mime: false
-  loop:
-    - "{{ billet_exclusion_root }}/active"
-    - "{{ billet_exclusion_root }}/active/recovery"
-  register: billet_finalization_claim_states
+  register: billet_finalization_claim_state
+  become: true
+
+# ONLY UNDER THE GUARD: under a legacy shape `active` is a regular file, and a
+# stat of a name beneath it is ENOTDIR, which the stat module fails on.
+- name: Inspect the transaction pointer before finalization
+  ansible.builtin.stat:
+    path: "{{ billet_exclusion_root }}/active/recovery"
+    follow: false
+    get_checksum: false
+    get_mime: false
+  register: billet_finalization_pointer_state
+  when: billet_upgrade_claim_shape == 'guard-pointer'
   become: true
 
 - name: Refuse finalization without a real owned host-upgrade claim
   ansible.builtin.assert:
     that:
       - billet_upgrade_claim_shape in ['guard-pointer', 'legacy', 'legacy-file']
-      - billet_finalization_claim_states.results[0].stat.exists
-      - not (billet_finalization_claim_states.results[0].stat.islnk | default(false))
+      - billet_finalization_claim_state.stat.exists
+      - not (billet_finalization_claim_state.stat.islnk | default(false))
       - >-
         (billet_upgrade_claim_shape == 'guard-pointer'
-         and billet_finalization_claim_states.results[0].stat.isdir
-         and billet_finalization_claim_states.results[1].stat.exists
-         and billet_finalization_claim_states.results[1].stat.islnk | default(false))
+         and billet_finalization_claim_state.stat.isdir | default(false)
+         and billet_finalization_pointer_state.stat.exists | default(false)
+         and billet_finalization_pointer_state.stat.islnk | default(false))
         or
         (billet_upgrade_claim_shape in ['legacy', 'legacy-file']
-         and billet_finalization_claim_states.results[0].stat.isreg)
+         and billet_finalization_claim_state.stat.isreg | default(false))
     fail_msg: >-
       The committed host transaction no longer has a real active claim in the
       {{ billet_upgrade_claim_shape }} shape. Leave its fence intact instead of

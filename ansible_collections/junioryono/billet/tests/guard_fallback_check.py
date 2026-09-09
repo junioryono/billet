@@ -231,6 +231,43 @@ def main():
         tree.write_record(dict(tree.valid_record(), release_executable=str(tree.recovery) + "/../recovery-20260909T120000-0badcafe/billet.candidate"))
         expect_refusal(mod, tree, owner, "a dot segment in the candidate", "candidate", "not a normalised path")
 
+    # THE ANCESTORS ABOVE THE ROOT'S PARENT are judged as the Go boundary judges
+    # them: a writable one refuses unless sticky, a foreign-owned one refuses, a
+    # link on the way is admitted when the owner made it.
+    with tempfile.TemporaryDirectory() as base:
+        tree = Tree(base)
+        os.chmod(base, 0o777)
+        expect_refusal(mod, tree, owner, "an other-writable ancestor", "metadata", "writable by group or others without the sticky bit")
+    with tempfile.TemporaryDirectory() as base:
+        tree = Tree(base)
+        os.chmod(base, 0o1777)
+        try:
+            mod.find(str(tree.root), owner)
+        except mod.Refusal as exc:
+            fail("a sticky world-writable ancestor was refused: %s" % exc)
+    with tempfile.TemporaryDirectory() as base:
+        tree = Tree(base)
+        link = pathlib.Path(base) / "via"
+        link.symlink_to(base)
+        # The root is named through the link, and so is the candidate the
+        # record names: the recorded path must lie inside the root as spelled.
+        via_root = link / "billet" / "upgrades"
+        tree.write_record(dict(tree.valid_record(),
+                               release_executable=str(via_root / tree.recovery.name / "billet.candidate")))
+        try:
+            mod.find(str(via_root), owner)
+        except mod.Refusal as exc:
+            fail("a link the owner made on the way was refused: %s" % exc)
+        # Its ancestors are examined through the link, not the link's name.
+        os.chmod(base, 0o777)
+        try:
+            mod.find(str(via_root), owner)
+        except mod.Refusal as exc:
+            if "writable by group or others" not in str(exc):
+                fail("the writable ancestor behind a link refused for the wrong reason: %s" % exc)
+        else:
+            fail("a writable ancestor behind a link was admitted")
+
     # HARD LINKS ARE ADMITTED: the command imposes no one-link rule.
     with tempfile.TemporaryDirectory() as base:
         tree = Tree(base)

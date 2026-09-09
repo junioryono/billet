@@ -12,7 +12,12 @@ predates the guard (it answers "unknown command"), the only executable that
 can answer is the candidate the guard's record names, staged in a recovery
 directory under the upgrade root. This module is the reader of that record,
 and it reads in THREE PHASES so that nothing is believed before the thing it
-rests on is proved: the METADATA of the root's parent, the root, the guard
+rests on is proved: the METADATA of every ancestor from the filesystem root
+down to the root's parent (owned by root or the root's owner, writable by
+others only under the sticky bit, a link on the way owned by one of them and
+walked as written, the Go boundary's rule, because the candidate is later
+executed by pathname and a writable ancestor lets another account rename the
+chain the name resolves through), then the root's parent, the root, the guard
 directory and the record (each examined without following a link, owned by
 the root's owner, writable by nobody else, the record a regular file of mode
 0600 and at most 4 KiB) before the record is read; the record's CONTENT
@@ -135,12 +140,67 @@ def require_regular(phase, path, owner):
     return st
 
 
+MAX_ANCESTOR_LINKS = 32
+
+
+def require_trusted_ancestors(phase, parent, owner):
+    """Every directory above the root's parent, from the filesystem root down,
+    judged as the Go boundary judges it: a directory owned by root or by the
+    owner, writable by group or others only under the sticky bit (a writable
+    ancestor lets another account rename the whole chain, and a sticky one
+    keeps it from renaming entries it does not own); a link on the way admitted
+    only when the link itself is owned by root or by the owner, its target then
+    walked as written. The candidate's later execution is by PATHNAME, so the
+    chain the name resolves through is what must hold, not only the inode
+    that was hashed."""
+    components = [c for c in parent.split(os.sep) if c not in ("", ".")]
+    # The root's parent itself is judged by its own stricter rule; here its
+    # ancestors.
+    components = components[:-1]
+    at = os.sep
+    links = 0
+    pending = list(components)
+    while pending:
+        name = pending.pop(0)
+        if name == "..":
+            at = os.path.dirname(at.rstrip(os.sep)) or os.sep
+            st = lstat_or_refuse(phase, at)
+            require_ancestor(phase, at, st, owner)
+            continue
+        candidate = os.path.join(at, name)
+        st = lstat_or_refuse(phase, candidate)
+        if stat.S_ISLNK(st.st_mode):
+            if st.st_uid not in (0, owner):
+                raise Refusal(phase, "the link %s is owned by uid %d, want root or uid %d, and a link another account made is a name it can repoint" % (candidate, st.st_uid, owner))
+            links += 1
+            if links > MAX_ANCESTOR_LINKS:
+                raise Refusal(phase, "%s: more than %d links on the way" % (candidate, MAX_ANCESTOR_LINKS))
+            target = os.readlink(candidate)
+            target_components = [c for c in target.split(os.sep) if c not in ("", ".")]
+            if target.startswith(os.sep):
+                at = os.sep
+            pending = target_components + pending
+            continue
+        require_ancestor(phase, candidate, st, owner)
+        at = candidate
+
+
+def require_ancestor(phase, path, st, owner):
+    if not stat.S_ISDIR(st.st_mode):
+        raise Refusal(phase, "%s is not a directory" % path)
+    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH) and not st.st_mode & stat.S_ISVTX:
+        raise Refusal(phase, "%s is mode %04o, writable by group or others without the sticky bit, so another account could rename what lies under it" % (path, stat.S_IMODE(st.st_mode)))
+    if st.st_uid not in (0, owner):
+        raise Refusal(phase, "%s is owned by uid %d, want root or uid %d" % (path, st.st_uid, owner))
+
+
 def read_record(root, owner):
     """The metadata phase, then the content phase; answers the decoded record."""
     parent = os.path.dirname(root)
     active = os.path.join(root, "active")
     record = os.path.join(active, "guard.json")
 
+    require_trusted_ancestors("metadata", parent, owner)
     require_dir("metadata", parent, owner)
     require_dir("metadata", root, owner)
     require_dir("metadata", active, owner)
@@ -201,6 +261,7 @@ def admit_candidate(root, owner, executable, digest):
     if os.path.dirname(recovery) != root or not os.path.basename(recovery).startswith(RECOVERY_PREFIX):
         raise Refusal("candidate", "%s is not inside a %s* child of %s" % (executable, RECOVERY_PREFIX, root))
     parent = os.path.dirname(root)
+    require_trusted_ancestors("candidate", parent, owner)
     require_dir("candidate", parent, owner)
     require_dir("candidate", root, owner)
     require_dir("candidate", recovery, owner)

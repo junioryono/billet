@@ -279,6 +279,7 @@ FAKE
   fi
   cat >"$fakes/$tool" <<FAKE
 #!/bin/sh
+if [ "$tool" = systemctl ] && [ "\${1:-}" = --version ]; then exec "$real" "\$@"; fi
 printf 'role=$tool\nargv0=%s\nargv=%s\nuid=%s\n---\n' "\$0" "\$*" "\$(id -u)" >>"\${BILLET_FAKE_LOG:-/dev/null}"
 FAKE
   case $tool in
@@ -293,7 +294,10 @@ exec "$real" "\$@"
 FAKE
       ;;
     systemctl)
-      # NEVER REACHED BY THE PREPARATION; a call is a finding.
+      # NEVER REACHED BY THE PREPARATION; a call is a finding. Fact gathering
+      # on a systemd host asks `systemctl --version` for the service manager
+      # (measured on CI's runner), which is not the preparation's and passes
+      # through unrecorded.
       echo 'echo "systemctl was called by the preparation" >&2; exit 97' >>"$fakes/$tool" ;;
     *)
       echo "exec \"$real\" \"\$@\"" >>"$fakes/$tool" ;;
@@ -438,8 +442,29 @@ run_case() {
   while [ "$1" != -- ]; do envs+=("$1"); shift; done
   shift
   local launcher=()
+  # The out and log files are the invoker's own, so the redirections below
+  # can truncate them; a case launched twice has a root-owned directory by its
+  # second launch, so they are made through the escalation and handed back.
+  for f in out log; do
+    if [ ! -e "$case_dir/$f" ]; then
+      if [ -w "$case_dir" ]; then : >"$case_dir/$f"; else rd touch "$case_dir/$f"; rd chown "$(id -u)" "$case_dir/$f"; fi
+    fi
+    : >"$case_dir/$f"
+  done
   if [ "$mode" = escalated ]; then
     launcher=(sudo -n)
+    # THE ANCESTORS OF AN ESCALATED TREE ARE ROOT'S, as the fallback module
+    # requires of every directory above the root's parent (owned by root or the
+    # root's owner, writable by others only under the sticky bit). The two
+    # directories the invoker keeps creating cases under are sticky and
+    # world-writable; the case directory itself is 0755, because the kernel's
+    # fs.protected_regular refuses even root an O_CREAT open of another
+    # account's file inside a sticky world-writable directory, and the fakes
+    # append to the invoker's log there (measured: an empty log under 1777).
+    sudo -n chown root "$work" "$work/cases"
+    sudo -n chmod 1777 "$work" "$work/cases"
+    sudo -n chown root "$case_dir"
+    sudo -n chmod 0755 "$case_dir"
     if [ -d "$case_dir/lib" ] && [ "$KEEP_OWNER" = 0 ]; then sudo -n chown -R root:root "$case_dir/lib"; fi
   fi
   set +e
@@ -1254,7 +1279,7 @@ first=$(root_of s3-b)/recovery-20260909T120000-0badcafe
 [ "$(fact s3-b recovery)" = "$first" ] || fail "s3-b: the first stager did not land in 0badcafe: $(fact s3-b recovery)" "$work/cases/s3-b/out"
 [ "$(sha "$first/billet.candidate")" = "$(sha "$work/cases/s3-b/src/billet")" ] || fail "s3-b: the first stager's candidate is not A"
 first_mtime=$(rd stat -c %Y "$first/billet.candidate")
-mv "$work/cases/s3-b/log" "$work/cases/s3-b/log.first"
+rd mv "$work/cases/s3-b/log" "$work/cases/s3-b/log.first"
 # shellcheck disable=SC2086
 run_case s3-b escalated BILLET_FAKE_DATE_MODE=frozen BILLET_FAKE_SUFFIXES="$work/cases/s3-b/suffixes" -- $s3b_args -e "$s3b_json" -e billet_binary_src="$work/cases/s3-b/src/other"
 expect_allowed s3-b

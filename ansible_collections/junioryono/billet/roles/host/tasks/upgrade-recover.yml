@@ -9,15 +9,26 @@
 # transaction journaled.
 - name: Inspect the transaction claim before recovery
   ansible.builtin.stat:
-    path: "{{ item }}"
+    path: "{{ billet_exclusion_root }}/active"
     follow: false
     get_checksum: false
     get_mime: false
-  loop:
-    - "{{ billet_exclusion_root }}/active"
-    - "{{ billet_exclusion_root }}/active/recovery"
-  register: billet_recovery_claim_states
+  register: billet_recovery_claim_state
   check_mode: false
+  become: true
+
+# ONLY UNDER THE GUARD: under a legacy shape `active` is a regular file, and a
+# stat of a name beneath it is ENOTDIR, which the stat module fails on rather
+# than answering as absent.
+- name: Inspect the transaction pointer before recovery
+  ansible.builtin.stat:
+    path: "{{ billet_exclusion_root }}/active/recovery"
+    follow: false
+    get_checksum: false
+    get_mime: false
+  register: billet_recovery_pointer_state
+  check_mode: false
+  when: billet_upgrade_claim_shape | default('none') == 'guard-pointer'
   become: true
 
 - name: Read the transaction pointer before recovery
@@ -31,7 +42,7 @@
   failed_when: false
   when:
     - billet_upgrade_claim_shape | default('none') == 'guard-pointer'
-    - billet_recovery_claim_states.results[1].stat.islnk | default(false)
+    - billet_recovery_pointer_state.stat.islnk | default(false)
   become: true
 
 - name: Read the legacy claim before recovery
@@ -40,7 +51,7 @@
   register: billet_recovery_legacy_claim
   when:
     - billet_upgrade_claim_shape | default('none') in ['legacy', 'legacy-file']
-    - billet_recovery_claim_states.results[0].stat.isreg | default(false)
+    - billet_recovery_claim_state.stat.isreg | default(false)
   become: true
 
 - name: Refuse recovery without an owned transaction claim
@@ -50,12 +61,12 @@
       - billet_upgrade_recovery_dir | default('') | length > 0
       - >-
         (billet_upgrade_claim_shape == 'guard-pointer'
-         and billet_recovery_claim_states.results[1].stat.islnk | default(false)
+         and billet_recovery_pointer_state.stat.islnk | default(false)
          and billet_recovery_pointer.rc | default(1) == 0
          and billet_recovery_pointer.stdout | trim == billet_upgrade_recovery_dir)
         or
         (billet_upgrade_claim_shape in ['legacy', 'legacy-file']
-         and billet_recovery_claim_states.results[0].stat.isreg | default(false)
+         and billet_recovery_claim_state.stat.isreg | default(false)
          and billet_recovery_legacy_claim.content | default('') | b64decode | trim == billet_upgrade_recovery_dir)
     fail_msg: >-
       {{ 'No transaction is claimed at ' ~ billet_exclusion_root ~ '/active (the host is in the '
