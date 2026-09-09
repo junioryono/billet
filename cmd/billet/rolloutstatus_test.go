@@ -673,8 +673,20 @@ func TestRolloutStatusRefusesALedgerBehindItsBinaryWithoutMigrating(t *testing.T
 	}
 }
 
+// afterOpen installs the seam that runs between the command's open and its one
+// read, and restores it afterwards. Not parallel: the seam is package state.
+func afterOpen(t *testing.T, fn func(db *state.DB)) {
+	t.Helper()
+
+	statusAfterOpen = fn
+
+	t.Cleanup(func() { statusAfterOpen = nil })
+}
+
 // A READ THAT FAILS IS THE COMMAND'S FAILURE, never an empty fleet or an
-// unbound deployment: a fence raised after the open refuses the report.
+// unbound deployment: a fence raised AFTER the open, so the report's own read
+// is what fails, refuses the report with nothing printed; and so does a fence
+// raised before the open.
 func TestRolloutStatusFailsRatherThanReportingAnEmptyFleet(t *testing.T) {
 	stateDir := t.TempDir()
 	cfgPath := writeCAConfig(t, stateDir)
@@ -683,23 +695,144 @@ func TestRolloutStatusFailsRatherThanReportingAnEmptyFleet(t *testing.T) {
 		registerStatusNode(t, db, "epyc-1", "v0.9.3", statusDigestA, "inc-1")
 	})
 
-	if _, err := state.WriteMaintenanceFence(stateDir, "host upgrade"); err != nil {
-		t.Fatal(err)
+	for name, when := range map[string]string{"after the open": "after", "before the open": "before"} {
+		t.Run(name, func(t *testing.T) {
+			raised := false
+
+			if when == "after" {
+				afterOpen(t, func(*state.DB) {
+					if _, err := state.WriteMaintenanceFence(stateDir, "host upgrade"); err != nil {
+						t.Fatal(err)
+					}
+
+					raised = true
+				})
+			} else if _, err := state.WriteMaintenanceFence(stateDir, "host upgrade"); err != nil {
+				t.Fatal(err)
+			}
+
+			t.Cleanup(func() {
+				if err := state.ClearMaintenanceFence(stateDir, "host upgrade"); err != nil {
+					t.Errorf("clear the fence: %v", err)
+				}
+			})
+
+			var runErr error
+
+			out := capture(t, func() {
+				runErr = cmdRolloutStatus(t.Context(), []string{"--json", "--config", cfgPath})
+			})
+
+			if when == "after" && !raised {
+				t.Fatal("the seam never ran, so the fence was never raised after the open")
+			}
+
+			if !errors.Is(runErr, state.ErrMaintenance) {
+				t.Errorf("a fenced ledger: err = %v, want ErrMaintenance", runErr)
+			}
+
+			if out != "" {
+				t.Errorf("a refused status printed:\n%s", out)
+			}
+		})
 	}
+}
 
-	var runErr error
+// THE REPORT IS ONE SNAPSHOT, AND THE BINDING IS COMPARED INSIDE IT: a ledger
+// bound to another deployment between the open and the read is refused, not
+// printed under this host's identity; and structurally the report reads through
+// the store's one snapshot and no other read of the store or the handle.
+func TestRolloutStatusReadsOneSnapshotAndRefusesABindingThatMovedUnderIt(t *testing.T) {
+	t.Run("a binding written after the open", func(t *testing.T) {
+		stateDir := t.TempDir()
+		cfgPath := writeCAConfig(t, stateDir)
 
-	out := capture(t, func() {
-		runErr = cmdRolloutStatus(t.Context(), []string{"--json", "--config", cfgPath})
+		if _, err := state.DeploymentID(stateDir); err != nil {
+			t.Fatal(err)
+		}
+
+		statusPlane(t, stateDir, func(*state.DB) {})
+
+		bound := false
+
+		afterOpen(t, func(*state.DB) {
+			// The inspection holds no lock, so a control plane can claim beside
+			// it and bind the ledger to a deployment that is not this host's.
+			statusPlane(t, stateDir, func(db *state.DB) {
+				if _, err := db.ClaimController(t.Context(), "elsewhere", "fedcba9876543210fedcba9876543210"); err != nil {
+					t.Fatal(err)
+				}
+			})
+
+			bound = true
+		})
+
+		var runErr error
+
+		out := capture(t, func() {
+			runErr = cmdRolloutStatus(t.Context(), []string{"--json", "--config", cfgPath})
+		})
+
+		if !bound {
+			t.Fatal("the seam never ran")
+		}
+
+		if !errors.Is(runErr, state.ErrForeignLedger) {
+			t.Errorf("a binding that moved under the report: err = %v, want ErrForeignLedger", runErr)
+		}
+
+		if out != "" {
+			t.Errorf("a refused status printed:\n%s", out)
+		}
 	})
 
-	if !errors.Is(runErr, state.ErrMaintenance) {
-		t.Errorf("a fenced ledger: err = %v, want ErrMaintenance", runErr)
-	}
+	t.Run("structure", func(t *testing.T) {
+		fset := token.NewFileSet()
 
-	if out != "" {
-		t.Errorf("a refused status printed:\n%s", out)
-	}
+		file, err := parser.ParseFile(fset, "rolloutstatus.go", nil, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var build *ast.FuncDecl
+
+		for _, decl := range file.Decls {
+			if fn, ok := decl.(*ast.FuncDecl); ok && fn.Name.Name == "buildRolloutStatusReport" {
+				build = fn
+			}
+		}
+
+		if build == nil {
+			t.Fatal("buildRolloutStatusReport was not found")
+		}
+
+		snapshots := 0
+
+		ast.Inspect(build.Body, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+
+			switch sel.Sel.Name {
+			case "StatusSnapshot":
+				snapshots++
+			case "Open", "History", "Nodes", "Registrations", "DeploymentBinding", "View", "Reader":
+				t.Errorf("%s: the report reads through %s outside the snapshot", fset.Position(call.Pos()), sel.Sel.Name)
+			}
+
+			return true
+		})
+
+		if snapshots != 1 {
+			t.Errorf("the report takes %d snapshots, want exactly one", snapshots)
+		}
+	})
 }
 
 // writePostgresConfig is a control-plane config whose ledger is in PostgreSQL,

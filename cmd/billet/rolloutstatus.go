@@ -106,37 +106,36 @@ type rolloutStatusRegistration struct {
 	HighestRelease string `json:"highest_release"`
 }
 
-// buildRolloutStatusReport assembles the report from one inspect handle. Every
-// read goes through the store's and the handle's View methods; a read that
-// fails is the command's error, never an empty fleet, no rollout or an unbound
-// deployment.
-func buildRolloutStatusReport(ctx context.Context, db *state.DB, store *rollout.Store) (*rolloutStatusReport, error) {
+// buildRolloutStatusReport assembles the report from ONE SNAPSHOT of the
+// ledger (rollout.Store.StatusSnapshot, one read transaction), so the binding,
+// the rollout, its hosts and the registrations describe the same instant. A
+// read that fails is the command's error, never an empty fleet, no rollout or
+// an unbound deployment.
+//
+// THE BINDING IS COMPARED AGAIN INSIDE THE SNAPSHOT. The open refused a foreign
+// ledger already, but a ledger unbound at the open can be bound to another
+// deployment by the time the report is read, and a report that then printed
+// that binding under this host's identity would be the foreign-ledger case the
+// open exists to refuse. identity is the host's own deployment id when the
+// identity file holds one, and empty when it does not.
+func buildRolloutStatusReport(ctx context.Context, store *rollout.Store, identity string,
+) (*rolloutStatusReport, error) {
 	report := &rolloutStatusReport{Schema: rolloutStatusSchema, Nodes: []rolloutStatusNode{},
 		Registrations: []rolloutStatusRegistration{}}
 
-	binding, err := db.DeploymentBinding(ctx)
+	snapshot, err := store.StatusSnapshot(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	report.Deployment = rolloutStatusDeployment{Bound: binding != "", ID: binding}
-
-	current, err := store.Open(ctx)
-
-	switch {
-	case err == nil:
-	case errors.Is(err, rollout.ErrNoRollout):
-		history, err := store.History(ctx, 1)
-		if err != nil {
-			return nil, err
-		}
-
-		if len(history) > 0 {
-			current = &history[0]
-		}
-	default:
-		return nil, err
+	if identity != "" && snapshot.Binding != "" && snapshot.Binding != identity {
+		return nil, fmt.Errorf("%w: this ledger is bound to deployment %s and this host's identity "+
+			"directory says %s", state.ErrForeignLedger, snapshot.Binding, identity)
 	}
+
+	report.Deployment = rolloutStatusDeployment{Bound: snapshot.Binding != "", ID: snapshot.Binding}
+
+	current := snapshot.Rollout
 
 	if current != nil {
 		report.Rollout = &rolloutStatusRollout{
@@ -152,10 +151,7 @@ func buildRolloutStatusReport(ctx context.Context, db *state.DB, store *rollout.
 			FinishedAt: current.FinishedAt, TerminalReason: current.TerminalReason,
 		}
 
-		nodes, err := store.Nodes(ctx, current.ID)
-		if err != nil {
-			return nil, err
-		}
+		nodes := snapshot.Nodes
 
 		for i := range nodes {
 			n := &nodes[i]
@@ -169,10 +165,7 @@ func buildRolloutStatusReport(ctx context.Context, db *state.DB, store *rollout.
 		}
 	}
 
-	registrations, err := store.Registrations(ctx)
-	if err != nil {
-		return nil, err
-	}
+	registrations := snapshot.Registrations
 
 	for i := range registrations {
 		r := &registrations[i]
@@ -236,11 +229,13 @@ func ledgerDSNFrom(cfg *config.Config, environmentFile string) (string, error) {
 }
 
 // The seams the report's re-execution goes through: who this process is, who
-// owns a path, and how the child is run.
+// owns a path, and how the child is run; and statusAfterOpen, which a test uses
+// to change the ledger between the open and the report's one read.
 var (
-	statusEUID    = os.Geteuid
-	statusOwnerOf = pathOwner
-	statusReexec  = reexecAs
+	statusEUID      = os.Geteuid
+	statusOwnerOf   = pathOwner
+	statusReexec    = reexecAs
+	statusAfterOpen func(*state.DB)
 )
 
 // pathOwner reads the owner of a path without following a symlink, or reports

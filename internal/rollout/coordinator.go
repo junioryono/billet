@@ -317,6 +317,13 @@ func (c *Coordinator) walkTo(ctx context.Context, rolloutID, node string,
 		req := AdvanceRequest{RolloutID: rolloutID, Node: node, To: phase}
 		if phase == to {
 			req.ConvergedDigest = provedBy
+			// A HOST THAT CONVERGED HAD ITS DISPATCH ACCEPTED, whether or not the
+			// clear that acceptance carried was written: the accepted dispatch's
+			// Advance can fail after the updater is already running, and the host
+			// then registers on the target and is walked here from pending, with the
+			// refusal it no longer deserves still on its row. The commit is the other
+			// place acceptance is proved, so it clears too.
+			req.ClearRefusal = node != ""
 		}
 
 		if err := c.store.Advance(ctx, req); err != nil {

@@ -375,30 +375,115 @@ func (s *Store) Registrations(ctx context.Context) ([]Registration, error) {
 	var out []Registration
 
 	err := s.db.View(ctx, func(q state.Querier) error {
-		out = nil
+		rows, err := registrationsIn(ctx, state.ReadQueries(q))
+		out = rows
 
-		rows, err := state.ReadQueries(q).ListNodeRegistrations(ctx)
-		if err != nil {
-			return fmt.Errorf("rollout: list the fleet's registrations: %w", err)
+		return err
+	})
+
+	return out, err
+}
+
+func registrationsIn(ctx context.Context, reads state.ReadOps) ([]Registration, error) {
+	rows, err := reads.ListNodeRegistrations(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("rollout: list the fleet's registrations: %w", err)
+	}
+
+	var out []Registration
+
+	for i := range rows {
+		row := &rows[i]
+
+		if row.Live != 0 && row.Live != 1 {
+			return nil, fmt.Errorf("rollout: registered node %q has invalid liveness %d", row.Name, row.Live)
 		}
 
-		for i := range rows {
-			row := &rows[i]
+		out = append(out, Registration{
+			Name:           row.Name,
+			Live:           row.Live == 1,
+			Epoch:          row.Epoch,
+			Incarnation:    row.Incarnation,
+			Release:        row.NodeRelease,
+			Digest:         row.NodeDigest,
+			HighestRelease: row.HighestRelease,
+		})
+	}
 
-			if row.Live != 0 && row.Live != 1 {
-				return fmt.Errorf("rollout: registered node %q has invalid liveness %d", row.Name, row.Live)
+	return out, nil
+}
+
+// StatusSnapshot is the ledger's account of the fleet's decision, read as ONE
+// SNAPSHOT: the deployment binding, the open rollout or else the newest
+// finished one (nil when the ledger holds none), that rollout's hosts, and
+// every registered host's current registration.
+type StatusSnapshot struct {
+	// Binding is the deployment this ledger says it belongs to, or empty for a
+	// ledger nobody has bound.
+	Binding       string
+	Rollout       *Rollout
+	Nodes         []Node
+	Registrations []Registration
+}
+
+// StatusSnapshot reads the whole report inside one read transaction, so a
+// rollout started between two of its reads cannot appear in one and not the
+// other, and a binding written after the caller's identity check is what the
+// caller compares, not what it saw earlier. Every read is on the read-only pool
+// and a read that fails is the error, never an empty part.
+func (s *Store) StatusSnapshot(ctx context.Context) (StatusSnapshot, error) {
+	var out StatusSnapshot
+
+	err := s.db.View(ctx, func(q state.Querier) error {
+		out = StatusSnapshot{}
+		reads := state.ReadQueries(q)
+
+		binding, err := reads.ReadDeploymentBinding(ctx)
+
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+		case err != nil:
+			return fmt.Errorf("rollout: read the ledger's deployment binding: %w", err)
+		default:
+			out.Binding = binding.DeploymentID
+		}
+
+		current, err := readOpen(ctx, reads)
+
+		switch {
+		case errors.Is(err, ErrNoRollout):
+			history, err := reads.ListRolloutHistory(ctx, 1)
+			if err != nil {
+				return fmt.Errorf("rollout: list rollouts: %w", err)
 			}
 
-			out = append(out, Registration{
-				Name:           row.Name,
-				Live:           row.Live == 1,
-				Epoch:          row.Epoch,
-				Incarnation:    row.Incarnation,
-				Release:        row.NodeRelease,
-				Digest:         row.NodeDigest,
-				HighestRelease: row.HighestRelease,
-			})
+			if len(history) > 0 {
+				current, err = rolloutFrom(&history[0])
+				if err != nil {
+					return err
+				}
+			}
+		case err != nil:
+			return err
 		}
+
+		out.Rollout = current
+
+		if current != nil {
+			nodes, err := nodesIn(ctx, reads, current.ID)
+			if err != nil {
+				return err
+			}
+
+			out.Nodes = nodes
+		}
+
+		registrations, err := registrationsIn(ctx, reads)
+		if err != nil {
+			return err
+		}
+
+		out.Registrations = registrations
 
 		return nil
 	})
@@ -411,38 +496,45 @@ func (s *Store) Nodes(ctx context.Context, rolloutID string) ([]Node, error) {
 	var out []Node
 
 	err := s.db.View(ctx, func(q state.Querier) error {
-		out = nil
+		rows, err := nodesIn(ctx, state.ReadQueries(q), rolloutID)
+		out = rows
 
-		rows, err := state.ReadQueries(q).ListRolloutNodes(ctx, rolloutID)
-		if err != nil {
-			return fmt.Errorf("rollout: list the nodes in %s: %w", rolloutID, err)
-		}
-
-		// INDEXED RATHER THAN RANGED BY VALUE: a row is 160 bytes and this list is
-		// the whole fleet.
-		for i := range rows {
-			row := &rows[i]
-
-			out = append(out, Node{
-				Node:            row.Node,
-				Phase:           Phase(row.Phase),
-				Attempts:        int(row.Attempts),
-				NextAttemptAt:   row.NextAttemptAt,
-				Blocker:         row.Blocker,
-				PriorRelease:    row.PriorRelease,
-				RollbackResult:  row.RollbackResult,
-				ExemptReason:    row.ExemptReason,
-				UpdatedAt:       row.UpdatedAt,
-				DispatchEpoch:   row.DispatchEpoch,
-				ConvergedDigest: row.ConvergedDigest,
-				LastRefusal:     row.LastRefusal,
-			})
-		}
-
-		return nil
+		return err
 	})
 
 	return out, err
+}
+
+func nodesIn(ctx context.Context, reads state.ReadOps, rolloutID string) ([]Node, error) {
+	rows, err := reads.ListRolloutNodes(ctx, rolloutID)
+	if err != nil {
+		return nil, fmt.Errorf("rollout: list the nodes in %s: %w", rolloutID, err)
+	}
+
+	var out []Node
+
+	// INDEXED RATHER THAN RANGED BY VALUE: a row is 160 bytes and this list is
+	// the whole fleet.
+	for i := range rows {
+		row := &rows[i]
+
+		out = append(out, Node{
+			Node:            row.Node,
+			Phase:           Phase(row.Phase),
+			Attempts:        int(row.Attempts),
+			NextAttemptAt:   row.NextAttemptAt,
+			Blocker:         row.Blocker,
+			PriorRelease:    row.PriorRelease,
+			RollbackResult:  row.RollbackResult,
+			ExemptReason:    row.ExemptReason,
+			UpdatedAt:       row.UpdatedAt,
+			DispatchEpoch:   row.DispatchEpoch,
+			ConvergedDigest: row.ConvergedDigest,
+			LastRefusal:     row.LastRefusal,
+		})
+	}
+
+	return out, nil
 }
 
 // AdvanceRequest is one component moving to a new phase.
@@ -488,12 +580,14 @@ const maxRefusalBytes = 4096
 const refusalCutMarker = " [cut]"
 
 // boundRefusal makes a refusal storable on both engines and no longer than the
-// bound: invalid UTF-8 is replaced (PostgreSQL's text refuses it; SQLite's
-// would store bytes a JSON report cannot render), and a longer text is cut at
-// a rune boundary and marked, so the record never holds a partial character
-// and always says it is partial.
+// bound: invalid UTF-8 and NUL are replaced (PostgreSQL's text refuses both,
+// and NUL is valid UTF-8; SQLite would store bytes a JSON report cannot render;
+// a refusal the engine refuses would lose the attempt count and the backoff
+// written in the same transaction), and a longer text is cut at a rune
+// boundary and marked, so the record never holds a partial character and
+// always says it is partial.
 func boundRefusal(text string) string {
-	text = strings.ToValidUTF8(text, "\uFFFD")
+	text = strings.ReplaceAll(strings.ToValidUTF8(text, "\uFFFD"), "\x00", "\uFFFD")
 	if len(text) <= maxRefusalBytes {
 		return text
 	}

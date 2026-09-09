@@ -377,10 +377,21 @@ func cmdRolloutStatus(ctx context.Context, args []string) error {
 
 	defer func() { _ = db.Close() }()
 
+	if statusAfterOpen != nil {
+		statusAfterOpen(db)
+	}
+
 	store := rollout.New(db)
 
 	if *asJSON {
-		report, err := buildRolloutStatusReport(ctx, db, store)
+		// PEEKED, NEVER MINTED: an absent identity file is an empty identity, and
+		// the report then carries the ledger's binding alone.
+		identity, _, err := state.PeekDeploymentID(cfg.Server.IdentityDir)
+		if err != nil {
+			return err
+		}
+
+		report, err := buildRolloutStatusReport(ctx, store, identity)
 		if err != nil {
 			return err
 		}

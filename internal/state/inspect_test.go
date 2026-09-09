@@ -85,6 +85,45 @@ func providerOf(t *testing.T, q Querier, name string) string {
 	return provider
 }
 
+// queryOne runs `SELECT 1` through a querier and returns whatever it refused
+// with, draining and closing the rows when it did not refuse.
+func queryOne(t *testing.T, q Querier) error {
+	t.Helper()
+
+	rows, err := q.QueryContext(t.Context(), `SELECT 1`)
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		if err := rows.Close(); err != nil {
+			t.Errorf("close rows: %v", err)
+		}
+	}()
+
+	for rows.Next() {
+	}
+
+	return rows.Err()
+}
+
+// providerVia reads through View, the one read an inspection admits.
+func providerVia(t *testing.T, db *DB, name string) string {
+	t.Helper()
+
+	var provider string
+
+	if err := db.View(t.Context(), func(q Querier) error {
+		provider = providerOf(t, q, name)
+
+		return nil
+	}); err != nil {
+		t.Fatalf("View: %v", err)
+	}
+
+	return provider
+}
+
 // AN INSPECTION OPENS AN EXISTING LEDGER, READS IT, AND DOES NONE OF THE THINGS AN
 // OPEN MAY DO: the seam sees no mkdir, chmod, lock, integrity scan, claim,
 // migration or watermark write across the open, a read and the close.
@@ -101,7 +140,7 @@ func TestAnInspectionMutatesNothingOnTheWayIn(t *testing.T) {
 			t.Fatalf("OpenInspect: %v", err)
 		}
 
-		if got := providerOf(t, db.Reader(), "epyc-1"); got != "docker" {
+		if got := providerVia(t, db, "epyc-1"); got != "docker" {
 			t.Errorf("the inspection read provider %q, want docker", got)
 		}
 
@@ -154,14 +193,18 @@ func TestAnInspectionRefusesEveryWriteTransaction(t *testing.T) {
 		t.Error("the write callback ran on an inspection")
 	}
 
-	// AND THE CONNECTION UNDERNEATH REFUSES TOO, whichever way a write arrives:
-	// a statement, and a statement disguised as a query.
+	// THE BARE READER IS REFUSED, both ways it can be asked, because a pooled
+	// connection's read-only default is a session setting a statement can undo
+	// on PostgreSQL; and a write inside View is refused by the engine.
 	var name string
 
-	if err := db.Reader().QueryRowContext(t.Context(),
-		`UPDATE nodes SET provider = 'tart' WHERE name = 'epyc-1' RETURNING name`).Scan(&name); err == nil ||
-		!strings.Contains(err.Error(), "readonly") {
-		t.Errorf("a write through the reader was not refused by the engine: err = %v", err)
+	if err := queryOne(t, db.Reader()); !errors.Is(err, ErrInspect) {
+		t.Errorf("Reader().QueryContext on an inspection: err = %v, want ErrInspect", err)
+	}
+
+	if err := db.Reader().QueryRowContext(t.Context(), `SELECT 1`).Scan(&name); err == nil ||
+		!strings.Contains(err.Error(), "bare reader is refused") {
+		t.Errorf("Reader().QueryRowContext on an inspection: err = %v, want the refusal", err)
 	}
 
 	if err := db.View(t.Context(), func(q Querier) error {
@@ -176,8 +219,24 @@ func TestAnInspectionRefusesEveryWriteTransaction(t *testing.T) {
 		t.Fatalf("View: %v", err)
 	}
 
-	if got := providerOf(t, db.Reader(), "epyc-1"); got != "docker" {
+	if got := providerVia(t, db, "epyc-1"); got != "docker" {
 		t.Errorf("the sentinel row reads %q after the refused writes, want docker", got)
+	}
+
+	// AND THE CLAIM IS REFUSED BEFORE THE BACKEND IS ASKED: on PostgreSQL the
+	// backend's claim is an advisory lock a refused write would only give back.
+	ops := sideEffects(t, func() {
+		if _, err := db.ClaimController(t.Context(), "inspector", "0123456789abcdef0123456789abcdef"); !errors.Is(err, ErrInspect) {
+			t.Errorf("ClaimController on an inspection: err = %v, want ErrInspect", err)
+		}
+	})
+
+	if len(ops) != 0 {
+		t.Errorf("a refused claim performed %v", ops)
+	}
+
+	if got := countRows(t, dir, "controller_claim"); got != 0 {
+		t.Errorf("controller_claim holds %d rows after a refused claim", got)
 	}
 }
 
@@ -708,6 +767,16 @@ func TestAnInspectionRefusesAnUnreadableMigrationSetFirst(t *testing.T) {
 	if len(ops) != 0 {
 		t.Errorf("the refused inspection performed %v", ops)
 	}
+
+	// FIRST MEANS BEFORE THE PATHNAME: with no ledger at all the answer is still
+	// the broken binary, never "no ledger", which would send an operator to the
+	// wrong machine.
+	missing := filepath.Join(t.TempDir(), "never")
+
+	err = OpenInspectErr(t, missing)
+	if !errors.Is(err, errMigrationsUnavailable) || errors.Is(err, ErrNoLedger) {
+		t.Errorf("an unreadable migration set beside an absent ledger: err = %v, want the migration error first", err)
+	}
 }
 
 // WHAT A READ-ONLY OPEN SEES AND LEAVES, MEASURED WITH THE BUNDLED DRIVER: a
@@ -725,24 +794,63 @@ func TestAnInspectionReadsTheWALAndLeavesSidecarsItOwns(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		seedNode(t, db, "wal-row", "docker")
-
-		// Copied while open, so the row is in the WAL and no checkpoint has
-		// folded it into the main file; the copy carries no -shm.
-		crashed := t.TempDir()
-
-		for _, name := range []string{"billet.db", "billet.db-wal"} {
-			body, err := os.ReadFile(filepath.Join(live, name))
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			if err := os.WriteFile(filepath.Join(crashed, name), body, 0o600); err != nil {
-				t.Fatal(err)
-			}
+		// THE SCHEMA CHECKPOINTED INTO THE MAIN FILE FIRST, then no automatic
+		// checkpoint, so the row below is provably in the WAL and not in the main
+		// file: the copy of the main file alone is a migrated ledger that lacks it.
+		if _, err := db.w.ExecContext(t.Context(), `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+			t.Fatal(err)
 		}
 
+		if _, err := db.w.ExecContext(t.Context(), `PRAGMA wal_autocheckpoint = 0`); err != nil {
+			t.Fatal(err)
+		}
+
+		seedNode(t, db, "wal-row", "docker")
+
+		copyLedger := func(names ...string) string {
+			dir := t.TempDir()
+
+			for _, name := range names {
+				body, err := os.ReadFile(filepath.Join(live, name))
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				if err := os.WriteFile(filepath.Join(dir, name), body, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			return dir
+		}
+
+		mainOnly := copyLedger("billet.db")
+		crashed := copyLedger("billet.db", "billet.db-wal")
+
 		_ = db.Close()
+
+		// The main file alone does not hold the row: proof the row is WAL-resident.
+		mainInspect, err := OpenInspect(t.Context(), mainOnly)
+		if err != nil {
+			t.Fatalf("OpenInspect on the main file alone: %v", err)
+		}
+
+		t.Cleanup(func() { _ = mainInspect.Close() })
+
+		if err := mainInspect.View(t.Context(), func(q Querier) error {
+			var n int64
+			if err := q.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM nodes WHERE name = 'wal-row'`).Scan(&n); err != nil {
+				return err
+			}
+
+			if n != 0 {
+				t.Errorf("the main file alone holds the row (%d), so the fixture proves nothing about the WAL", n)
+			}
+
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
 
 		inspect, err := OpenInspect(t.Context(), crashed)
 		if err != nil {
@@ -751,7 +859,7 @@ func TestAnInspectionReadsTheWALAndLeavesSidecarsItOwns(t *testing.T) {
 
 		t.Cleanup(func() { _ = inspect.Close() })
 
-		if got := providerOf(t, inspect.Reader(), "wal-row"); got != "docker" {
+		if got := providerVia(t, inspect, "wal-row"); got != "docker" {
 			t.Errorf("the WAL-resident row reads %q", got)
 		}
 	})
@@ -775,14 +883,8 @@ func TestAnInspectionReadsTheWALAndLeavesSidecarsItOwns(t *testing.T) {
 
 		seedNode(t, plane, "later", "tart")
 
-		if err := inspect.View(t.Context(), func(q Querier) error {
-			if got := providerOf(t, q, "later"); got != "tart" {
-				t.Errorf("a commit made after the inspection opened reads %q", got)
-			}
-
-			return nil
-		}); err != nil {
-			t.Fatal(err)
+		if got := providerVia(t, inspect, "later"); got != "tart" {
+			t.Errorf("a commit made after the inspection opened reads %q", got)
 		}
 	})
 
@@ -800,19 +902,43 @@ func TestAnInspectionReadsTheWALAndLeavesSidecarsItOwns(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		_ = providerOf(t, db.Reader(), "epyc-1")
-		_ = db.Close()
+		_ = providerVia(t, db, "epyc-1")
 
+		// WHILE THE HANDLE IS OPEN the sidecars exist (the measured behaviour the
+		// re-execution answers) and are owned by whoever opened; a lookup that
+		// fails for any reason is a failed fixture, never a skipped one.
 		for _, name := range []string{"billet.db-wal", "billet.db-shm"} {
 			info, err := os.Lstat(filepath.Join(dir, name))
 			if err != nil {
-				// The driver may also have removed them at close; either way
-				// nothing owned by another account is left.
-				continue
+				t.Fatalf("%s while the inspection is open: %v", name, err)
 			}
 
-			if st, ok := info.Sys().(*syscall.Stat_t); ok && int(st.Uid) != os.Geteuid() {
+			st, ok := info.Sys().(*syscall.Stat_t)
+			if !ok {
+				t.Fatalf("%s carries no owner", name)
+			}
+
+			if int(st.Uid) != os.Geteuid() {
 				t.Errorf("%s is owned by uid %d, not the inspector's %d", name, st.Uid, os.Geteuid())
+			}
+		}
+
+		_ = db.Close()
+
+		// After the close the driver may have removed them; what is permitted is
+		// absence or a file this account owns, nothing else.
+		for _, name := range []string{"billet.db-wal", "billet.db-shm"} {
+			info, err := os.Lstat(filepath.Join(dir, name))
+
+			switch {
+			case errors.Is(err, fs.ErrNotExist):
+				continue
+			case err != nil:
+				t.Fatalf("%s after the close: %v", name, err)
+			}
+
+			if st, ok := info.Sys().(*syscall.Stat_t); !ok || int(st.Uid) != os.Geteuid() {
+				t.Errorf("%s left behind is not the inspector's", name)
 			}
 		}
 	})

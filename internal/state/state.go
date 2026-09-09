@@ -449,7 +449,7 @@ func openDir(
 	// refusing it would make staging one impossible; the migration is the claim's
 	// right, and it happens at promotion.
 	if mode.standby {
-		if err := verifySchemaNotAhead(startupCtx, be, db.Reader()); err != nil {
+		if err := verifySchemaNotAhead(startupCtx, be, db.bareReader()); err != nil {
 			return nil, errors.Join(err, db.Close())
 		}
 
@@ -613,7 +613,45 @@ func (db *DB) closeDBs() error {
 }
 
 // Reader returns the query-only pool.
-func (db *DB) Reader() Querier { return db.r }
+//
+// AN INSPECTION HAS NO BARE READER. Its reads are refused here and answered
+// only through View, because on PostgreSQL the pool's read-only default is a
+// session setting a statement can undo (`set_config('default_transaction_read_only',
+// 'off', false)` followed by an UPDATE on the same pooled connection wrote a
+// row, measured 2026-09-09), and only a transaction begun READ ONLY refuses a
+// write whatever the session says. View begins exactly that for an inspection.
+func (db *DB) Reader() Querier {
+	if db.inspect {
+		return inspectReader{r: db.r}
+	}
+
+	return db.bareReader()
+}
+
+// bareReader is the read pool with no transaction around it, for the package's
+// own reads on the open path and the two accounted readers; every call site is
+// listed in TestEveryUntransactedReadIsAccountedFor, because a read outside Tx
+// and View owes the cancellation translation nothing makes for it. An
+// inspection's open path reads through it too: what Reader refuses is the
+// handle's caller, not the open that proves the handle.
+func (db *DB) bareReader() Querier { return db.r }
+
+// inspectReader is the querier an inspection's Reader hands out: every call is
+// refused with ErrInspect. QueryRowContext cannot return an error directly, so
+// it asks the engine a question the engine refuses, and the refusal names this
+// rule; the caller's Scan returns it.
+type inspectReader struct{ r *sql.DB }
+
+func (inspectReader) QueryContext(context.Context, string, ...any) (*sql.Rows, error) {
+	return nil, fmt.Errorf("%w: read through View, whose transaction is read-only on every engine",
+		ErrInspect)
+}
+
+func (q inspectReader) QueryRowContext(ctx context.Context, _ string, _ ...any) *sql.Row {
+	//billet:ignore rawsql // not a query: a name no ledger holds, so the Row the signature demands carries the refusal
+	return q.r.QueryRowContext(ctx,
+		`SELECT 1 FROM "an inspection reads through View only; its bare reader is refused"`)
+}
 
 // Tx runs fn inside a single write transaction. Every mutation goes through here
 // so that an allocation decision — read current usage, decide, record it — is one
@@ -717,7 +755,7 @@ func (db *DB) View(ctx context.Context, fn func(Querier) error) error {
 
 	// Deferred, deliberately: the reader takes no write lock, which is the whole
 	// point, and nothing here can be promoted.
-	tx, err := db.r.BeginTx(ctx, nil)
+	tx, err := db.r.BeginTx(ctx, db.readTxOptions())
 	if err != nil {
 		return fmt.Errorf("begin read tx: %w", db.asCancellation(ctx, err))
 	}
@@ -740,6 +778,27 @@ func (db *DB) View(ctx context.Context, fn func(Querier) error) error {
 	}
 
 	return db.asCancellation(ctx, fn(tx))
+}
+
+// readTxOptions is how a read transaction begins: the engine's default for an
+// ordinary handle, and for an inspection an EXPLICIT READ ONLY transaction at
+// REPEATABLE READ.
+//
+// READ ONLY BECAUSE THE SESSION DEFAULT CAN BE UNDONE: PostgreSQL's
+// default_transaction_read_only is a setting any statement on the connection
+// can turn off, and a transaction begun READ ONLY refuses a write whatever the
+// session says (measured 2026-09-09: an UPDATE after set_config succeeded on a
+// bare connection and was refused with SQLSTATE 25006 inside such a
+// transaction). REPEATABLE READ so the several reads of one report are one
+// snapshot on PostgreSQL, where READ COMMITTED would let a rollout started
+// between two of them appear in one and not the other; SQLite's transaction is
+// a snapshot already and accepts both options (measured on the bundled driver).
+func (db *DB) readTxOptions() *sql.TxOptions {
+	if !db.inspect {
+		return nil
+	}
+
+	return &sql.TxOptions{ReadOnly: true, Isolation: sql.LevelRepeatableRead}
 }
 
 // asCancellation substitutes the caller's context error for a driver's own

@@ -201,7 +201,7 @@ func (db *DB) checkReleaseWatermarkIn(ctx context.Context, q Querier) error {
 func (db *DB) releaseWatermarkApplied(ctx context.Context) (bool, error) {
 	// THROUGH THE BARE READER, because View re-verifies the schema on a handle
 	// that holds no exclusion, and there is no schema to verify yet.
-	exists, err := db.backend.bookkeepingTableExists(ctx, db.Reader())
+	exists, err := db.backend.bookkeepingTableExists(ctx, db.bareReader())
 	if err != nil {
 		return false, fmt.Errorf("state: read whether the ledger has been created: %w",
 			db.asCancellation(ctx, err))

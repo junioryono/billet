@@ -43,11 +43,20 @@ var ErrNoLedger = errors.New("state: no ledger to inspect")
 // reason OpenAdmin gives: a whole-file read in front of a report is a cost
 // with no decision behind it.
 func OpenInspect(ctx context.Context, stateDir string, opts ...OpenOption) (*DB, error) {
+	be := newSQLiteBackend(stateDir)
+
+	// THE MIGRATION SET FIRST, before the pathname is looked at, as openDir
+	// orders it: a binary that cannot read its own migrations must say so, not
+	// answer "no ledger" for a directory it never got to judge.
+	if err := be.timeline().require(); err != nil {
+		return nil, err
+	}
+
 	if err := requireLedgerFile(stateDir, LedgerPath(stateDir)); err != nil {
 		return nil, err
 	}
 
-	return openDir(ctx, stateDir, newSQLiteBackend(stateDir), openMode{inspect: true}.with(opts))
+	return openDir(ctx, stateDir, be, openMode{inspect: true}.with(opts))
 }
 
 // OpenPostgresInspect is OpenInspect for a ledger in PostgreSQL: the state
@@ -55,11 +64,17 @@ func OpenInspect(ctx context.Context, stateDir string, opts ...OpenOption) (*DB,
 // created or locked, the connection's default transaction is read-only, the
 // schema is verified exactly and never migrated, and Tx is refused.
 func OpenPostgresInspect(ctx context.Context, stateDir, dsn string, opts ...OpenOption) (*DB, error) {
+	be := newPostgresBackend(dsn)
+
+	if err := be.timeline().require(); err != nil {
+		return nil, err
+	}
+
 	if err := requireLedgerFile(stateDir, ""); err != nil {
 		return nil, err
 	}
 
-	return openDir(ctx, stateDir, newPostgresBackend(dsn), openMode{inspect: true}.with(opts))
+	return openDir(ctx, stateDir, be, openMode{inspect: true}.with(opts))
 }
 
 // requireLedgerFile proves the state directory, and the ledger file when one is

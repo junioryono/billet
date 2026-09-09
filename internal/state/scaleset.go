@@ -90,7 +90,7 @@ func (db *DB) ForgetScaleSet(ctx context.Context, target, group, label string) e
 // back, so a stop landing in that window used to leave the unit `failed` over a
 // read the shutdown had interrupted. See asCancellation.
 func (db *DB) ScaleSets(ctx context.Context, target string) ([]ScaleSetRecord, error) {
-	rows, err := ReadQueries(db.Reader()).ListScaleSets(ctx, target)
+	rows, err := ReadQueries(db.bareReader()).ListScaleSets(ctx, target)
 	if err != nil {
 		return nil, fmt.Errorf("state: list scale sets: %w", db.asCancellation(ctx, err))
 	}

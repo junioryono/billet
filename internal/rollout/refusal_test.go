@@ -191,6 +191,19 @@ func TestARefusalIsBoundedAndStorable(t *testing.T) {
 		t.Errorf("invalid bytes were stored as %q", got)
 	}
 
+	// NUL IS VALID UTF-8 AND NOT STORABLE TEXT ON POSTGRESQL, so it is replaced
+	// too, or the refusal, the attempt count and the backoff in the same
+	// transaction would all be lost there.
+	if err := s.Advance(t.Context(), AdvanceRequest{
+		RolloutID: r.ID, Node: "epyc-1", To: PhasePending, Refusal: "failed\x00detail",
+	}); err != nil {
+		t.Fatalf("Advance with a NUL: %v", err)
+	}
+
+	if got := refusalOf(t, s, r); got != "failed�detail" || strings.ContainsRune(got, 0) {
+		t.Errorf("a NUL was stored as %q", got)
+	}
+
 	// Exactly at the bound nothing is cut.
 	exact := strings.Repeat("b", maxRefusalBytes)
 
@@ -302,6 +315,111 @@ func TestTheCoordinatorRecordsARefusalAndClearsItOnAcceptance(t *testing.T) {
 
 	if got := phaseOf(t, store, r); got != PhaseDraining {
 		t.Errorf("the accepted host is %s, want draining", got)
+	}
+}
+
+// fencingDispatcher accepts the dispatch and then fences the ledger, so the
+// Advance that would clear the refusal fails after the updater is already
+// running: the shape of a control plane whose ledger write failed at exactly
+// that moment.
+type fencingDispatcher struct {
+	dir  string
+	told int
+}
+
+func (d *fencingDispatcher) Upgrade(context.Context, string, string, string, string, int64) error {
+	d.told++
+
+	if _, err := state.WriteMaintenanceFence(d.dir, "a write failure staged by the test"); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// A REFUSAL IS CLEARED BY THE CONVERGENCE TOO. The accepted dispatch's clear can
+// fail after the host is already upgrading; the host then registers on the
+// target and is walked from pending to committed, and without this the old
+// refusal would outlive the upgrade it described.
+func TestAConvergedHostLosesTheRefusalItsAcceptedDispatchCouldNotClear(t *testing.T) {
+	dir := t.TempDir()
+
+	db, err := state.Open(t.Context(), dir)
+	if err != nil {
+		t.Fatalf("state.Open: %v", err)
+	}
+
+	t.Cleanup(func() { _ = db.Close() })
+
+	s := New(db)
+
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+
+	fleet := &fakeFleet{}
+	fleet.set("epyc-1", "v0.3.26", 14, true)
+
+	r, err := s.Start(t.Context(), StartRequest{
+		TargetVersion: targetVersion, TargetDigest: targetDigest,
+		PriorVersion: "v0.3.26", Policy: DefaultPolicy(), CreatedBy: "ops",
+		Nodes: []string{"epyc-1"},
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	store := New(db, WithClock(clock))
+
+	// A refusal on the row first, the way a guarded host leaves one.
+	if err := store.Advance(t.Context(), AdvanceRequest{
+		RolloutID: r.ID, Node: "epyc-1", To: PhasePending, Backoff: retryAfter,
+		Refusal: "the host holds a converge guard for holder ci-42",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	dispatch := &fencingDispatcher{dir: dir}
+	c := NewCoordinator(store, fleet, dispatch, targetVersion, 14,
+		WithCoordinatorClock(clock), WithCoordinatorLogger(slog.New(slog.DiscardHandler)))
+
+	tick(t, c) // controller
+
+	now = now.Add(retryAfter + time.Minute)
+
+	// The dispatch is accepted and the clear that follows fails on the fence.
+	err = c.Tick(t.Context())
+	if !errors.Is(err, state.ErrMaintenance) {
+		t.Fatalf("the tick after the fenced write: err = %v, want ErrMaintenance", err)
+	}
+
+	if dispatch.told != 1 {
+		t.Fatalf("the host was told %d times, want 1", dispatch.told)
+	}
+
+	if err := state.ClearMaintenanceFence(dir, "a write failure staged by the test"); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := refusalOf(t, store, r); got != "the host holds a converge guard for holder ci-42" {
+		t.Fatalf("after the failed clear the record reads %q; the fixture stages nothing", got)
+	}
+
+	if got := phaseOf(t, store, r); got != PhasePending {
+		t.Fatalf("after the failed clear the host is %s, want pending", got)
+	}
+
+	// The updater ran anyway: the host comes back on the target.
+	fleet.set("epyc-1", targetVersion, 14, true)
+	fleet.digest("epyc-1", targetDigest)
+
+	tick(t, c)
+
+	if got := phaseOf(t, store, r); got != PhaseCommitted {
+		t.Fatalf("the host that came back on the target is %s, want committed", got)
+	}
+
+	if got := refusalOf(t, store, r); got != "" {
+		t.Errorf("a converged host still carries the refusal %q", got)
 	}
 }
 

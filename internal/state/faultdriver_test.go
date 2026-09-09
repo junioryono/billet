@@ -528,8 +528,10 @@ func readerCallSites(t *testing.T) map[string]bool {
 				continue
 			}
 
-			// The method's own declaration is not a use of it.
-			if fn.Name.Name == "Reader" && fn.Recv != nil {
+			// The methods' own declarations are not uses of them; Reader hands the
+			// pool to a caller and bareReader to the package, and both are
+			// untransacted reads.
+			if (fn.Name.Name == "Reader" || fn.Name.Name == "bareReader") && fn.Recv != nil {
 				continue
 			}
 
@@ -540,7 +542,7 @@ func readerCallSites(t *testing.T) map[string]bool {
 				}
 
 				sel, ok := call.Fun.(*ast.SelectorExpr)
-				if !ok || sel.Sel.Name != "Reader" {
+				if !ok || (sel.Sel.Name != "Reader" && sel.Sel.Name != "bareReader") {
 					return true
 				}
 
