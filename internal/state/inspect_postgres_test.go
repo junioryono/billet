@@ -7,6 +7,136 @@ import (
 	"testing"
 )
 
+// THE PROBE OVER A LEDGER ONE MIGRATION BEHIND ITS BINARY: the host transaction's
+// candidate, stamped with its release, opens the ledger the old controller still
+// serves; its open's watermark check reads through View, and a View that
+// re-checked the exact schema refused it with ErrSchemaBehind before the
+// candidate could claim and migrate, which made every PostgreSQL upgrade that
+// carried a migration roll back. The probe revalidates under the policy it was
+// admitted with.
+func TestThePostgresProbeReadsALedgerOneMigrationBehind(t *testing.T) {
+	dsn := requirePostgres(t)
+	ctx := t.Context()
+
+	full := pgTimeline.migrations
+	t.Cleanup(func() { pgTimeline.migrations = full })
+
+	behind := full[len(full)-1].Version - 1
+
+	var truncated []migration
+
+	for _, m := range full {
+		if m.Version <= behind {
+			truncated = append(truncated, m)
+		}
+	}
+
+	pgTimeline.migrations = truncated
+
+	old, err := OpenPostgres(ctx, t.TempDir(), dsn, WithRunningRelease("v0.5.0"))
+	if err != nil {
+		t.Fatalf("OpenPostgres at %d: %v", behind, err)
+	}
+
+	if _, err := old.ClaimController(ctx, "controller", "deployment-a"); err != nil {
+		t.Fatalf("ClaimController at %d: %v", behind, err)
+	}
+
+	if err := old.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	pgTimeline.migrations = full
+
+	probe, err := OpenPostgresProbe(ctx, t.TempDir(), dsn, WithRunningRelease("v0.6.0"))
+	if err != nil {
+		t.Fatalf("a stamped probe over a ledger one migration behind: %v", err)
+	}
+
+	t.Cleanup(func() { _ = probe.Close() })
+
+	release, _, err := probe.ReleaseWatermark(ctx)
+	if err != nil {
+		t.Fatalf("the probe's read: %v", err)
+	}
+
+	if release != "v0.5.0" {
+		t.Errorf("the probe read the watermark %q, want v0.5.0", release)
+	}
+
+	if err := probe.Tx(ctx, func(*sql.Tx) error { return nil }); !errors.Is(err, ErrStandby) {
+		t.Errorf("the probe's Tx: err = %v, want ErrStandby", err)
+	}
+
+	// AND A STANDBY, the same handle without the fence bypass.
+	standby, err := OpenPostgresStandby(ctx, t.TempDir(), dsn, WithRunningRelease("v0.6.0"))
+	if err != nil {
+		t.Fatalf("a stamped standby over a ledger one migration behind: %v", err)
+	}
+
+	t.Cleanup(func() { _ = standby.Close() })
+
+	if _, _, err := standby.ReleaseWatermark(ctx); err != nil {
+		t.Errorf("the standby's read: %v", err)
+	}
+}
+
+// A POSTGRESQL INSPECTION RE-READS THE WATERMARK ON EVERY VIEW.
+func TestAPostgresInspectionRevalidatesTheWatermark(t *testing.T) {
+	dsn := requirePostgres(t)
+	ctx := t.Context()
+
+	first, err := OpenPostgres(ctx, t.TempDir(), dsn, WithRunningRelease("v0.5.0"))
+	if err != nil {
+		t.Fatalf("OpenPostgres: %v", err)
+	}
+
+	if _, err := first.ClaimController(ctx, "controller", "deployment-a"); err != nil {
+		t.Fatalf("ClaimController: %v", err)
+	}
+
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	inspect, err := OpenPostgresInspect(ctx, t.TempDir(), dsn, WithRunningRelease("v0.6.0"))
+	if err != nil {
+		t.Fatalf("OpenPostgresInspect: %v", err)
+	}
+
+	t.Cleanup(func() { _ = inspect.Close() })
+
+	if err := inspect.View(ctx, func(Querier) error { return nil }); err != nil {
+		t.Fatalf("a View before the newer claim: %v", err)
+	}
+
+	newer, err := OpenPostgres(ctx, t.TempDir(), dsn, WithRunningRelease("v0.7.0"))
+	if err != nil {
+		t.Fatalf("OpenPostgres as v0.7.0: %v", err)
+	}
+
+	t.Cleanup(func() { _ = newer.Close() })
+
+	if _, err := newer.ClaimController(ctx, "controller-b", "deployment-a"); err != nil {
+		t.Fatalf("ClaimController as v0.7.0: %v", err)
+	}
+
+	ran := false
+
+	err = inspect.View(ctx, func(Querier) error {
+		ran = true
+
+		return nil
+	})
+	if !errors.Is(err, ErrReleaseBehind) {
+		t.Errorf("a View after a newer release claimed: err = %v, want ErrReleaseBehind", err)
+	}
+
+	if ran {
+		t.Error("the callback ran on a ledger a newer release has served")
+	}
+}
+
 // A POSTGRESQL INSPECTION OPENS UNDER A READ-ONLY DEFAULT ON EVERY CONNECTION,
 // TAKES NO ADVISORY EXCLUSION, AND IS REFUSED NOTHING BY ITS OWN READ-ONLY
 // WRITER: the durability check that refuses a read-only writer on a control

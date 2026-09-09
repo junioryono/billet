@@ -15,6 +15,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/junioryono/billet/internal/state/ledgerdb"
 )
 
 // AN INSPECTION VALIDATES EVERYTHING AN OPEN VALIDATES AND MUTATES NOTHING.
@@ -184,10 +186,10 @@ func TestAnInspectionRefusesEveryWriteTransaction(t *testing.T) {
 
 	ran := false
 
+	// The deadline is what a Tx that began first would answer with; a correct
+	// refusal never waits on the pool at all.
 	deadline, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 	defer cancel()
-
-	started := time.Now()
 
 	err = db.Tx(deadline, func(tx *sql.Tx) error {
 		ran = true
@@ -198,10 +200,6 @@ func TestAnInspectionRefusesEveryWriteTransaction(t *testing.T) {
 	})
 	if !errors.Is(err, ErrInspect) {
 		t.Fatalf("Tx on an inspection with the writer connection held: err = %v, want ErrInspect", err)
-	}
-
-	if waited := time.Since(started); waited > time.Second {
-		t.Errorf("Tx waited %s for a connection before refusing", waited)
 	}
 
 	if ran {
@@ -608,6 +606,113 @@ func TestAnInspectionChecksTheWatermarkAndRecordsNothing(t *testing.T) {
 			t.Errorf("the watermark row moved from %v to %v under inspections", before, after)
 		}
 	})
+}
+
+// AN INSPECTION RE-READS THE WATERMARK ON EVERY VIEW: a newer release that
+// claims the same-schema ledger after the report's open is what a write
+// transaction's revalidation refuses, and a report read past it would describe
+// a ledger a fresh inspection is refused.
+func TestAnInspectionRevalidatesTheWatermarkOnEveryRead(t *testing.T) {
+	dir := t.TempDir()
+	serveAs(t, dir, "v0.5.0")
+
+	db, err := OpenInspect(t.Context(), dir, WithRunningRelease("v0.6.0"))
+	if err != nil {
+		t.Fatalf("OpenInspect: %v", err)
+	}
+
+	t.Cleanup(func() { _ = db.Close() })
+
+	if err := db.View(t.Context(), func(Querier) error { return nil }); err != nil {
+		t.Fatalf("a View before the newer claim: %v", err)
+	}
+
+	// A NEWER RELEASE CLAIMS THE LEDGER while the inspection is open.
+	serveAs(t, dir, "v0.7.0")
+
+	ran := false
+
+	err = db.View(t.Context(), func(Querier) error {
+		ran = true
+
+		return nil
+	})
+	if !errors.Is(err, ErrReleaseBehind) {
+		t.Errorf("a View after a newer release claimed: err = %v, want ErrReleaseBehind", err)
+	}
+
+	if ran {
+		t.Error("the callback ran on a ledger a newer release has served")
+	}
+
+	if _, err := OpenInspect(t.Context(), dir, WithRunningRelease("v0.6.0")); !errors.Is(err, ErrReleaseBehind) {
+		t.Errorf("a fresh inspection: err = %v, want ErrReleaseBehind", err)
+	}
+}
+
+// A STANDBY REVALIDATES UNDER THE POLICY IT WAS ADMITTED WITH. It is admitted
+// over a ledger BEHIND its binary (the follower-first shape), and the watermark
+// check inside its open reads through View; a View that re-checked the exact
+// schema refused every stamped standby and probe over a ledger one migration
+// behind, before the candidate could claim and migrate. The SQLite half opens
+// the standby mode directly, since only PostgreSQL exposes it.
+func TestAStandbyRevalidatesUnderItsOwnSchemaPolicy(t *testing.T) {
+	dir := t.TempDir()
+	behind := latestVersion(t) - 1
+
+	old := openAt(t, dir, behind)
+
+	if _, err := old.ClaimController(t.Context(), "controller", "deployment-a"); err != nil {
+		t.Fatalf("ClaimController at %d: %v", behind, err)
+	}
+
+	_ = old.Close()
+
+	db, err := openDir(t.Context(), dir, newSQLiteBackend(dir), openMode{standby: true, release: "v0.9.4"})
+	if err != nil {
+		t.Fatalf("a stamped standby over a ledger one migration behind: %v", err)
+	}
+
+	t.Cleanup(func() { _ = db.Close() })
+
+	if err := db.View(t.Context(), func(q Querier) error {
+		_, err := ReadQueries(q).ReadReleaseWatermark(t.Context())
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+
+		return err
+	}); err != nil {
+		t.Errorf("a standby's View over a ledger one migration behind: %v", err)
+	}
+
+	if err := db.Tx(t.Context(), func(*sql.Tx) error { return nil }); !errors.Is(err, ErrStandby) {
+		t.Errorf("a standby's Tx: err = %v, want ErrStandby", err)
+	}
+
+	// A LEDGER AHEAD IS STILL REFUSED by the same policy, at the read. The row
+	// is written through the handle's own writer pool (the standby holds the
+	// SQLite directory lock, so no second open can write), which its Tx refuses
+	// and this fixture bypasses on purpose.
+	tx, err := db.w.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := WriteQueries(tx).RecordMigration(t.Context(), ledgerdb.RecordMigrationParams{
+		Version: 9999, Name: "from-the-future", Checksum: "x",
+		AppliedAt: time.Now().UTC().Format(time.RFC3339Nano),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.View(t.Context(), func(Querier) error { return nil }); err == nil {
+		t.Error("a standby read a ledger carrying a migration its binary has never heard of")
+	}
 }
 
 func watermarkRow(t *testing.T, dir string) [2]string {

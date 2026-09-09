@@ -74,6 +74,21 @@ func registerStatusNode(t *testing.T, db *state.DB, name, release, digest, incar
 	return epoch
 }
 
+// markStatusNodeGone records that the control plane gave up on a host, the
+// way the plane does when a registration expires.
+func markStatusNodeGone(t *testing.T, db *state.DB, name string, epoch int64) {
+	t.Helper()
+
+	a, err := alloc.New(db, alloc.Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB}, nil)
+	if err != nil {
+		t.Fatalf("alloc.New: %v", err)
+	}
+
+	if err := a.NodeGone(t.Context(), name, epoch); err != nil {
+		t.Fatalf("NodeGone(%s): %v", name, err)
+	}
+}
+
 func startStatusRollout(t *testing.T, store *rollout.Store, target, digest string, nodes ...string) *rollout.Rollout {
 	t.Helper()
 
@@ -205,8 +220,12 @@ func TestRolloutStatusJSONPinsTheReport(t *testing.T) {
 		registerStatusNode(t, db, "epyc-1", "v0.9.3", statusDigestA, "inc-1a")
 		registerStatusNode(t, db, "epyc-1", "v0.9.3", statusDigestA, "inc-1b")
 		epochs["epyc-1"] = registerStatusNode(t, db, "epyc-1", "v0.9.4", statusDigestB, "inc-1c")
+		// epyc-2 came back on an OLDER release than it once ran, so its highest
+		// release is not its current one; outside-1 is OFFLINE, and stays reported.
+		registerStatusNode(t, db, "epyc-2", "v0.9.4", statusDigestB, "inc-2z")
 		epochs["epyc-2"] = registerStatusNode(t, db, "epyc-2", "v0.9.3", statusDigestA, "inc-2a")
 		epochs["outside-1"] = registerStatusNode(t, db, "outside-1", "v0.9.3", statusDigestA, "inc-o")
+		markStatusNodeGone(t, db, "outside-1", epochs["outside-1"])
 
 		store := rollout.New(db)
 
@@ -286,14 +305,24 @@ func TestRolloutStatusJSONPinsTheReport(t *testing.T) {
 			{Name: "epyc-1", Live: true, Epoch: epochs["epyc-1"], Incarnation: "inc-1c",
 				Release: "v0.9.4", Digest: statusDigestB, HighestRelease: "v0.9.4"},
 			{Name: "epyc-2", Live: true, Epoch: epochs["epyc-2"], Incarnation: "inc-2a",
-				Release: "v0.9.3", Digest: statusDigestA, HighestRelease: "v0.9.3"},
-			{Name: "outside-1", Live: true, Epoch: epochs["outside-1"], Incarnation: "inc-o",
+				Release: "v0.9.3", Digest: statusDigestA, HighestRelease: "v0.9.4"},
+			{Name: "outside-1", Live: false, Epoch: epochs["outside-1"], Incarnation: "inc-o",
 				Release: "v0.9.3", Digest: statusDigestA, HighestRelease: "v0.9.3"},
 		},
 	}
 
-	if epochs["epyc-1"] != 3 {
-		t.Errorf("three registrations of epyc-1 gave epoch %d, want 3", epochs["epyc-1"])
+	if epochs["epyc-1"] != 3 || epochs["epyc-2"] != 2 {
+		t.Errorf("the registrations gave epochs %v, want epyc-1 3 and epyc-2 2", epochs)
+	}
+
+	// THE JSON SAYS SO TOO, by membership: an offline host is in the array with
+	// live false, and a host's highest release is its own field with its own value.
+	if !strings.Contains(out, `"name": "outside-1"`) || !strings.Contains(out, `"live": false`) {
+		t.Errorf("the offline host is not reported offline:\n%s", out)
+	}
+
+	if !strings.Contains(out, `"highest_release": "v0.9.4"`) || strings.Count(out, `"highest_release": "v0.9.3"`) != 1 {
+		t.Errorf("the highest releases are not reported as their own values:\n%s", out)
 	}
 
 	if !reflect.DeepEqual(report, want) {

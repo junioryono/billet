@@ -615,6 +615,14 @@ func (f *failingReads) ListNodeRegistrations(ctx context.Context) ([]ledgerdb.Li
 func registerNode(t *testing.T, db *state.DB, name, release, incarnation string) int64 {
 	t.Helper()
 
+	return registerNodeHighest(t, db, name, release, release, incarnation)
+}
+
+// registerNodeHighest registers a host whose highest release is not its
+// current one: a host that came back on an older release.
+func registerNodeHighest(t *testing.T, db *state.DB, name, release, highest, incarnation string) int64 {
+	t.Helper()
+
 	var epoch int64
 
 	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
@@ -623,7 +631,7 @@ func registerNode(t *testing.T, db *state.DB, name, release, incarnation string)
 		epoch, err = state.WriteQueries(tx).UpsertNodeRegistration(t.Context(), ledgerdb.UpsertNodeRegistrationParams{
 			Name: name, Provider: "docker", TotalVcpu: 8, TotalMemory: 1 << 34,
 			LastSeenAt: "2026-09-08T12:00:00Z", NodeRelease: release, WireMin: 12, WireMax: 14,
-			WireVersion: 14, NodeDigest: otherDigest, Incarnation: incarnation, HighestRelease: release,
+			WireVersion: 14, NodeDigest: otherDigest, Incarnation: incarnation, HighestRelease: highest,
 		})
 
 		return err
@@ -632,6 +640,17 @@ func registerNode(t *testing.T, db *state.DB, name, release, incarnation string)
 	}
 
 	return epoch
+}
+
+// markNodeNotLive records that the plane gave up on a host at its epoch.
+func markNodeNotLive(t *testing.T, db *state.DB, name string, epoch int64) {
+	t.Helper()
+
+	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
+		return state.WriteQueries(tx).MarkNodeNotLive(t.Context(), ledgerdb.MarkNodeNotLiveParams{Name: name, Epoch: epoch})
+	}); err != nil {
+		t.Fatalf("mark %s not live: %v", name, err)
+	}
 }
 
 // REGISTRATIONS ARE THE LEDGER'S REGISTRATIONS, NOT A ROLLOUT'S ROWS: every
@@ -653,8 +672,12 @@ func TestRegistrationsReportEveryHostsCurrentRegistration(t *testing.T) {
 		t.Fatalf("three registrations gave epochs %v, want 1 2 3", epochs)
 	}
 
-	// A host outside any rollout, registered once.
-	registerNode(t, db, "outside-1", "v0.3.26", "inc-x")
+	// A host outside any rollout, registered once and then given up on: an
+	// offline host is still a registration. And one that came back on an older
+	// release than its highest.
+	outside := registerNode(t, db, "outside-1", "v0.3.26", "inc-x")
+	markNodeNotLive(t, db, "outside-1", outside)
+	registerNodeHighest(t, db, "older-1", "v0.3.26", "v0.4.0", "inc-y")
 
 	// A rollout naming epyc-1 and a host that never registered.
 	r := start(t, s, "epyc-1", "never-registered")
@@ -673,7 +696,9 @@ func TestRegistrationsReportEveryHostsCurrentRegistration(t *testing.T) {
 	want := []Registration{
 		{Name: "epyc-1", Live: true, Epoch: 3, Incarnation: "inc-c", Release: "v0.4.0",
 			Digest: otherDigest, HighestRelease: "v0.4.0"},
-		{Name: "outside-1", Live: true, Epoch: 1, Incarnation: "inc-x", Release: "v0.3.26",
+		{Name: "older-1", Live: true, Epoch: 1, Incarnation: "inc-y", Release: "v0.3.26",
+			Digest: otherDigest, HighestRelease: "v0.4.0"},
+		{Name: "outside-1", Live: false, Epoch: 1, Incarnation: "inc-x", Release: "v0.3.26",
 			Digest: otherDigest, HighestRelease: "v0.3.26"},
 	}
 

@@ -796,12 +796,34 @@ func (db *DB) View(ctx context.Context, fn func(Querier) error) error {
 	// Re-checked for the same reason Tx does it, and it matters here too: a read
 	// against a schema a newer billet has since rebuilt would report rows that no
 	// longer mean what this binary thinks they mean.
+	//
+	// UNDER THE POLICY THE HANDLE WAS ADMITTED WITH. A standby (and the upgrade
+	// probe, which is one) was admitted by verifySchemaNotAhead: a ledger behind
+	// its binary is the follower-first shape it exists for, and the exact check
+	// here refused every read of a stamped candidate over a ledger one migration
+	// behind, at the watermark check inside the open, before the candidate could
+	// claim and migrate. Every other revalidating handle keeps the exact check.
 	if db.revalidate.Load() {
 		if err := db.checkMaintenance(); err != nil {
 			return err
 		}
-		if err := verifySchemaIn(ctx, db.backend, tx); err != nil {
+
+		if db.standby.Load() {
+			if err := verifySchemaNotAhead(ctx, db.backend, tx); err != nil {
+				return db.asCancellation(ctx, err)
+			}
+		} else if err := verifySchemaIn(ctx, db.backend, tx); err != nil {
 			return db.asCancellation(ctx, err)
+		}
+
+		// AN INSPECTION RE-READS THE WATERMARK TOO, as a write transaction does:
+		// a newer release that claimed the same-schema ledger after the report's
+		// open would otherwise be read past, and the report would describe a
+		// ledger a fresh inspection is refused.
+		if db.inspect {
+			if err := db.checkReleaseWatermarkIn(ctx, tx); err != nil {
+				return db.asCancellation(ctx, err)
+			}
 		}
 	}
 
