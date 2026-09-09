@@ -45,7 +45,11 @@ STATE_B=/var/lib/billet/restored
 CONFIG_A=/etc/billet/billet.yaml
 CONFIG_B=/etc/billet/billet-restored.yaml
 ARCHIVE=/var/backups/billet/a
-BUNDLE=/var/lib/billet/node-a-tls
+# UNDER THE DIRECTORY THE SERVICE ACCOUNT OWNS. /var/lib/billet itself belongs
+# to root since the package stopped letting the server rename the root-owned
+# node, kernel and upgrade directories beside its own, so a bundle issued as
+# the service account can only be written inside a child it owns.
+BUNDLE=/var/lib/billet/bundles/node-a
 
 step "install the package onto a machine that has never run billet"
 export DEBIAN_FRONTEND=noninteractive
