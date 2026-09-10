@@ -996,7 +996,7 @@
           - billet_answer_names.index("Judge the preparation's answer") < billet_answer_names.index("Refuse the preparation's answer")
           - billet_answer_names.index("Refuse the preparation's answer") < billet_answer_names.index("Take the preparation's answer as this run's facts")
           - billet_answer_names.index("Take the preparation's answer as this run's facts") < billet_answer_names.index("Report the preparation's answer")
-          - billet_answer_judge.vars.billet_exclusion_checks | map(attribute='name') | list == ['outcome', 'exit', 'reason', 'why', 'id', 'holder', 'preparing', 'token', 'record', 'pointer', 'pointer_target', 'managed', 'downgrade']
+          - billet_answer_judge.vars.billet_exclusion_checks | map(attribute='name') | list == ['outcome', 'exit', 'reason', 'why', 'id', 'holder', 'preparing', 'token', 'record', 'pointer', 'recovery_dir', 'pointer_target', 'managed', 'downgrade']
           - "'item.ok | bool' in (billet_answer_judge['ansible.builtin.assert'].that | join(' '))"
           - "'(billet_exclusion_raw.rc | default(1)) == 0' in ((billet_answer_judge.vars.billet_exclusion_checks | selectattr('name', 'equalto', 'exit') | first).ok | string)"
           - "'recovery-[0-9]{8}T[0-9]{6}-[0-9a-f]{8}|[0-9]{8}T[0-9]{15}' in billet_host_answer_text"
@@ -1012,6 +1012,18 @@
           - "'unknown (converge-guard )?command' in billet_host_answer_text"
           # A RUN THE BOUND ENDED IS NEVER THE PRE-R OBSERVATION: every match of the diagnostic first requires an exit that is defined and not the bound's.
           - "'billet_exclusion_raw.rc not in [124, 137]' in ((billet_host_answer_tasks | selectattr('name', 'equalto', 'Note whether the executable answered \"unknown command\"') | first)['ansible.builtin.set_fact'].billet_exclusion_unknown_command | string)"
+          # A SIGNAL IS NOT AN ANSWER EITHER: Ansible reports a process the kill reached as a negative status, so every match requires a positive exit.
+          - "'billet_exclusion_raw.rc > 0' in ((billet_host_answer_tasks | selectattr('name', 'equalto', 'Note whether the executable answered \"unknown command\"') | first)['ansible.builtin.set_fact'].billet_exclusion_unknown_command | string)"
+          - "'billet_exclusion_dry.rc > 0' in ((billet_prepare_block | selectattr('name', 'equalto', 'Note whether the managed binary predates the guard in a dry run') | first)['ansible.builtin.set_fact'].billet_exclusion_managed_pre_r | string)"
+          - "'billet_exclusion_dry_recorded.rc > 0' in (billet_prepare_dry_recorded_floor['ansible.builtin.assert'].that | join(' '))"
+          - "'billet_exclusion_legacy_recheck.rc > 0' in ((billet_protocol_block | selectattr('name', 'equalto', 'Refuse a converge whose managed binary moved') | first)['ansible.builtin.assert'].that | join(' '))"
+          # THE RECOVERY DIRECTORY IS THE VALIDATED POINTER TARGET ALONE, and a recovery_dir beside it must equal it.
+          - "'recovery_dir' in (billet_answer_judge.vars.billet_exclusion_checks | map(attribute='name') | list)"
+          - "'billet_exclusion_a.recovery_dir == billet_exclusion_a.pointer_target' in (billet_answer_judge.vars.billet_exclusion_checks | string)"
+          - "'answer.recovery_dir' not in (billet_answer_facts['ansible.builtin.set_fact'].billet_upgrade_recovery_dir | string)"
+          - "'billet_exclusion_answer.pointer_target' in (billet_answer_facts['ansible.builtin.set_fact'].billet_upgrade_recovery_dir | string)"
+          # ADOPTION NEEDS EXACTLY THE FIVE MEMBERS, in the command and in the fallback reader alike.
+          - "'without an id' in billet_fallback_module_text"
           - "'billet_exclusion_dry.rc not in [124, 137]' in ((billet_prepare_block | selectattr('name', 'equalto', 'Note whether the managed binary predates the guard in a dry run') | first)['ansible.builtin.set_fact'].billet_exclusion_managed_pre_r | string)"
           - "'billet_exclusion_dry_recorded.rc not in [124, 137]' in (billet_prepare_dry_recorded_floor['ansible.builtin.assert'].that | join(' '))"
           - "'billet_exclusion_legacy_recheck.rc not in [124, 137]' in ((billet_protocol_block | selectattr('name', 'equalto', 'Refuse a converge whose managed binary moved') | first)['ansible.builtin.assert'].that | join(' '))"

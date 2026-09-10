@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -434,6 +435,39 @@ func TestACandidateThatKeepsItsOutputOpenIsNotCapable(t *testing.T) {
 
 	if !strings.Contains(o.str("why"), "not read whole") {
 		t.Errorf("why %q does not name the open output", o.str("why"))
+	}
+}
+
+// A record that lost its id but kept its token and preparing flag is not a
+// legacy record to adopt: the validation refuses it and leaves its bytes.
+func TestAProtocolRecordWithoutAnIDIsNotAdopted(t *testing.T) {
+	f := newGuardFixture(t)
+	mustOutcome(t, runPrepare(t, "--holder", "ci-1", "--validate"), prepareAcquired)
+
+	path := filepath.Join(f.active(), guardRecordName)
+	body, err := os.ReadFile(path)
+	mustOK(t, err)
+
+	var doc map[string]any
+	mustOK(t, json.Unmarshal(body, &doc))
+	delete(doc, "id")
+
+	damaged, err := json.MarshalIndent(doc, "", "  ")
+	mustOK(t, err)
+	mustOK(t, os.WriteFile(path, damaged, 0o600))
+
+	o := runPrepare(t, "--holder", "ci-1", "--validate")
+	mustRefusal(t, o, reasonRecord)
+
+	if !strings.Contains(o.str("why"), "without an id") {
+		t.Errorf("why %q does not name the missing id", o.str("why"))
+	}
+
+	after, err := os.ReadFile(path)
+	mustOK(t, err)
+
+	if !bytes.Equal(after, damaged) {
+		t.Error("the damaged record was rewritten")
 	}
 }
 

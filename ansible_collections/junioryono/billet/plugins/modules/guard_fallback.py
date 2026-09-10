@@ -292,6 +292,13 @@ def read_record(root, owner):
                 raise Refusal("content", "%s: %s is not a boolean" % (record, name))
         elif not isinstance(value, str) or not _HEX32.fullmatch(value):
             raise Refusal("content", "%s: %s is not 32 lowercase hex digits" % (record, name))
+    # A RECORD FROM BEFORE THE PROTOCOL IS EXACTLY THE FIVE MEMBERS: a token or
+    # a preparing flag without an id is a protocol record that lost its id, and
+    # the command refuses it rather than adopting it.
+    if "id" not in decoded:
+        for name in ("token", "preparing"):
+            if name in decoded:
+                raise Refusal("content", "%s: %s without an id is neither a legacy record nor a whole one" % (record, name))
     for name in RECORD_MEMBERS:
         value = decoded[name]
         if value is None:

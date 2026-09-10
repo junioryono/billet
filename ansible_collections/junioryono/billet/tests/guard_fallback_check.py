@@ -204,9 +204,8 @@ def main():
     content_cases.append(("an id with a trailing newline", dict(valid, id="0123456789abcdef0123456789abcdef\n"), "id is not 32 lowercase hex"))
     content_cases.append(("a token with a trailing newline", dict(valid, token="0123456789abcdef0123456789abcdef\n"), "token is not 32 lowercase hex"))
     content_cases.append(("a digest with a trailing newline", dict(valid, release_executable_sha256="a" * 64 + "\n"), "not 64 lowercase hex"))
-    content_cases.append(("an id with a trailing newline", dict(valid, id="0123456789abcdef0123456789abcdef\n"), "id is not 32 lowercase hex"))
-    content_cases.append(("a token with a trailing newline", dict(valid, token="0123456789abcdef0123456789abcdef\n"), "token is not 32 lowercase hex"))
-    content_cases.append(("a digest with a trailing newline", dict(valid, release_executable_sha256="a" * 64 + "\n"), "not 64 lowercase hex"))
+    content_cases.append(("a token without an id", dict(valid, token="0123456789abcdef0123456789abcdef", preparing=True), "without an id"))
+    content_cases.append(("preparing without an id", dict(valid, preparing=False), "without an id"))
     for name, record, words in content_cases:
         with tempfile.TemporaryDirectory() as base:
             tree = Tree(base)

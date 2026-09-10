@@ -193,7 +193,14 @@ case "${1:-}" in
 esac
 echo 'unknown command "converge-guard"' >&2
 hang=${BILLET_GATE_PRE_R_HANG:-}
-if [ "$hang" = all ] || [ "$hang" = "$cmd" ]; then sleep 3600; fi
+if [ "$hang" = all ] || [ "$hang" = "$cmd" ]; then
+  # IGNORING TERM keeps the fake alive through the bound's first signal, so
+  # the kill after the grace period is what ends it, as a binary that
+  # ignores TERM would be ended; the loop outlives each sleep the signal
+  # reaches.
+  if [ "${BILLET_GATE_PRE_R_IGNORE_TERM:-0}" = 1 ]; then trap '' TERM; while :; do sleep 1; done; fi
+  sleep 3600
+fi
 exit 2
 FAKE
 } >"$fakes/billet-pre-r"
@@ -1179,7 +1186,31 @@ a b7u-dry-run-hang --check -e billet_guard_timeout=2
 e b7u-dry-run-hang "BILLET_GATE_PRE_R_HANG=prepare"
 HOLDER=""; ns_case b7u-dry-run-hang escalated; HOLDER=h1
 expect_refused b7u-dry-run-hang "Judge the dry run's answer" "with no answer"
-echo "ok   B6: a pre-R host runs the legacy protocol only while its binary still predates the guard and no claim appeared, and never on a diagnostic the bound ended"
+# B6h. The diagnostic, then a hang that ignores TERM: the kill after the grace
+# period ends the run with a signal, which is not an exit the executable chose.
+plant b6h-diagnostic-then-kill
+p b6h-diagnostic-then-kill 'plant_root; plant_pre_r'
+a b6h-diagnostic-then-kill -e billet_guard_timeout=1
+e b6h-diagnostic-then-kill "BILLET_GATE_PRE_R_HANG=prepare"
+e b6h-diagnostic-then-kill "BILLET_GATE_PRE_R_IGNORE_TERM=1"
+ns_case b6h-diagnostic-then-kill escalated
+expect_refused b6h-diagnostic-then-kill "Refuse a preparation that did not answer" "ended by the bound"
+expect_no_task b6h-diagnostic-then-kill "Record that a release before the guard runs the legacy protocol"
+plant b6i-recheck-kill
+p b6i-recheck-kill 'plant_root; plant_pre_r'
+a b6i-recheck-kill -e billet_guard_timeout=1
+e b6i-recheck-kill "BILLET_GATE_PRE_R_HANG=holder"
+e b6i-recheck-kill "BILLET_GATE_PRE_R_IGNORE_TERM=1"
+ns_case b6i-recheck-kill escalated
+expect_refused b6i-recheck-kill "Refuse a converge whose managed binary moved" "did not answer within the bound"
+plant b7v-dry-run-kill
+p b7v-dry-run-kill 'plant_root; plant_pre_r'
+a b7v-dry-run-kill --check -e billet_guard_timeout=1
+e b7v-dry-run-kill "BILLET_GATE_PRE_R_HANG=prepare"
+e b7v-dry-run-kill "BILLET_GATE_PRE_R_IGNORE_TERM=1"
+HOLDER=""; ns_case b7v-dry-run-kill escalated; HOLDER=h1
+expect_refused b7v-dry-run-kill "Judge the dry run's answer" "with no answer"
+echo "ok   B6: a pre-R host runs the legacy protocol only while its binary still predates the guard and no claim appeared, and never on a diagnostic the bound ended or a kill reached"
 
 # B7. Check mode: `prepare --dry-run` before any shape dispatch, no holder,
 # every shape reported, nothing held or made, then the read-only staging.
@@ -1398,19 +1429,22 @@ adopted_id=$(state b8b-adopt record_id)
 [ -n "$adopted_id" ] || fail "b8b: the adopted record carries no id"
 expect_calls b8b-adopt candidate "--expect-id $adopted_id" 3
 expect_calls b8b-adopt candidate "converge-guard prepare --validate --holder h1 --json --expect-id $adopted_id" 1
-# B8c. A record with a malformed protocol member: the fallback refuses naming it, and prints no token.
-for member in preparing token id; do
+# B8c. A record with a malformed protocol member, or a protocol member without an id: the fallback refuses naming it, and prints no token.
+for member in preparing token id no-id; do
   plant "b8c-$member"
   p "b8c-$member" "plant_root; plant_pre_r; plant_recovery $REC_A v0.10.1; plant_guard h1 $ROOT/$REC_A/billet.candidate preparing"
   p "b8c-$member" "\"\$PYTHON\" - <<'PY'
 import json
 p = '/var/lib/billet/upgrades/active/guard.json'
 r = json.load(open(p))
-r['$member'] = {'preparing': 'yes', 'token': 'FEDCBA9876543210FEDCBA9876543210', 'id': 'short'}['$member']
+if '$member' == 'no-id':
+    del r['id']
+else:
+    r['$member'] = {'preparing': 'yes', 'token': 'FEDCBA9876543210FEDCBA9876543210', 'id': 'short'}['$member']
 json.dump(r, open(p, 'w'))
 PY"
   ns_case "b8c-$member" escalated
-  expect_refused "b8c-$member" "Judge the guard's record" "$member"
+  expect_refused "b8c-$member" "Judge the guard's record" "$([ "$member" = no-id ] && echo 'without an id' || echo "$member")"
   ! grep -q "fedcba9876543210" "$work/cases/b8c-$member/out" || fail "b8c-$member: the record's token reached the output"
   expect_calls "b8c-$member" candidate "" 0
 done
@@ -1459,6 +1493,22 @@ ns_case b9b-pointer-late escalated
 expect_allowed b9b-pointer-late
 expect_fact b9b-pointer-late interrupted True
 expect_fact b9b-pointer-late recovery "$ROOT/$REC_A"
+# B9e. An answer naming a recovery_dir beside its pointer_target that is not it: refused at the parser, no fact taken.
+plant b9e-recovery-dir-other
+p b9e-recovery-dir-other "plant_root; plant_managed v0.10.0; plant_guard h1 /usr/bin/billet; mkdir -m 0700 $ROOT/$REC_A; plant_pointer $REC_A"
+"$python" - "$work/corpus/validated-settled.json" "$work/cases/b9e-recovery-dir-other/answer.json" "$ROOT/$REC_A" "$ROOT/$REC_B" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+d["pointer"] = True
+d["pointer_target"] = sys.argv[3]
+d["recovery_dir"] = sys.argv[4]
+json.dump(d, open(sys.argv[2], "w"), indent=2)
+PY
+e b9e-recovery-dir-other "BILLET_GATE_ANSWER=prepare:1:$work/cases/b9e-recovery-dir-other/answer.json"
+ns_case b9e-recovery-dir-other escalated
+expect_refused b9e-recovery-dir-other "Judge the preparation's answer" "recovery_dir"
+expect_fact b9e-recovery-dir-other recovery ""
+expect_calls b9e-recovery-dir-other managed "converge-guard prepare --holder h1 --json --recovery" 0
 plant b9c-malformed
 p b9c-malformed "plant_root; plant_managed v0.10.0; plant_guard h1 /usr/bin/billet; touch $ROOT/active/recovery"
 ns_case b9c-malformed escalated

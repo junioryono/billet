@@ -1493,6 +1493,18 @@ func checkGuardRecord(raw map[string]json.RawMessage, g guardRecord) string {
 		return "the record's token is not 32 hex characters"
 	}
 
+	// A RECORD FROM BEFORE THE PROTOCOL IS EXACTLY THE FIVE MEMBERS: one that
+	// carries a token or a preparing flag without an id is a protocol record
+	// that lost its id, and adopting it would mint another id, erase the
+	// token and settle it without a settlement.
+	if _, ok := raw["id"]; !ok {
+		for _, k := range []string{"token", "preparing"} {
+			if _, present := raw[k]; present {
+				return "the record carries " + k + " without an id, so it is neither a legacy record nor a whole one"
+			}
+		}
+	}
+
 	return ""
 }
 

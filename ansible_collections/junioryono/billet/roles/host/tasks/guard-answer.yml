@@ -22,15 +22,19 @@
 # executable that answered the first, so "unknown command" there is that
 # executable having moved under this converge, refused below.
 # A RUN THE BOUND ENDED IS NOT THE OBSERVATION, whatever it printed first: an
-# executable that prints the diagnostic and then hangs exits 124 or 137
-# under `timeout` and answers nothing under the async bound, and is refused
-# as not having answered rather than read as a release before the guard.
+# executable that prints the diagnostic and then hangs exits 124 under
+# `timeout`, 137 through a shell when the kill after the grace period lands,
+# a NEGATIVE status when that kill reaches `timeout`'s own process group as
+# Ansible reports it, and nothing under the async bound; every one is refused
+# as not having answered rather than read as a release before the guard. The
+# observation is an exit the executable itself chose: defined, positive, and
+# not the bound's.
 - name: Note whether the executable answered "unknown command"
   ansible.builtin.set_fact:
     billet_exclusion_unknown_command: >-
       {{ billet_exclusion_raw.rc is defined
+         and billet_exclusion_raw.rc > 0
          and billet_exclusion_raw.rc not in [124, 137]
-         and billet_exclusion_raw.rc != 0
          and not ((billet_exclusion_raw.stdout | default('') | trim) is match('^\{'))
          and ((billet_exclusion_raw.stdout | default('')) ~ "\n" ~ (billet_exclusion_raw.stderr | default(''))) is search('unknown (converge-guard )?command') }}
   no_log: true
@@ -51,7 +55,7 @@
       {{ (billet_exclusion_answered_by ~ ' answered "unknown command" to the preparation\'s second call after answering its first: the executable that answered this converge moved under it. Nothing was acted on; ')
          if billet_exclusion_unknown_command | bool
          else (billet_exclusion_answered_by ~ ' did not answer the preparation\'s ' ~ billet_exclusion_call ~ ' call (exit ' ~ (billet_exclusion_raw.rc | default('none')) ~ ', '
-               ~ ('ended by the bound' if (billet_exclusion_raw.rc is not defined or billet_exclusion_raw.rc in [124, 137]) else 'no output') ~ '). Nothing this run can act on was learned; ') }}
+               ~ ('ended by the bound' if (billet_exclusion_raw.rc is not defined or billet_exclusion_raw.rc < 0 or billet_exclusion_raw.rc in [124, 137]) else 'no output') ~ '). Nothing this run can act on was learned; ') }}
       `{{ billet_exclusion_answered_by }} converge-guard status`
       shows the host, and a guard this run acquired is released by its holder
       with `release --holder {{ billet_exclusion_holder }}`.
@@ -100,6 +104,12 @@
         ok: "{{ billet_exclusion_a.outcome | default('') in ['refused', 'unknown'] or ((billet_exclusion_a.record | default({})).release_executable | default('') is string and (billet_exclusion_a.record | default({})).release_executable | default('') is match('^/') and (billet_exclusion_a.record | default({})).release_executable_sha256 | default('') is string and (billet_exclusion_a.record | default({})).release_executable_sha256 | default('') is match(billet_exclusion_sha) and ((billet_exclusion_a.record | default({})).verified | default('x') is sameas true)) }}"
       - name: pointer
         ok: "{{ billet_exclusion_a.outcome | default('') in ['refused', 'unknown'] or (billet_exclusion_a.pointer | default('x') is sameas true) or (billet_exclusion_a.pointer | default('x') is sameas false) }}"
+      # THE RECOVERY DIRECTORY IS THE VALIDATED POINTER TARGET ALONE: the
+      # command answers `recovery_dir` beside it on a validation, and an
+      # answer naming two directories is refused rather than read from the
+      # one the grammar never judged.
+      - name: recovery_dir
+        ok: "{{ billet_exclusion_a.outcome | default('') in ['refused', 'unknown'] or ('recovery_dir' not in billet_exclusion_a) or (billet_exclusion_a.recovery_dir is string and billet_exclusion_a.recovery_dir == billet_exclusion_a.pointer_target | default('')) }}"
       - name: pointer_target
         ok: "{{ billet_exclusion_a.outcome | default('') in ['refused', 'unknown'] or not (billet_exclusion_a.pointer | default(false) is sameas true) or (billet_exclusion_a.pointer_target | default('') is string and billet_exclusion_a.pointer_target | default('') is match('^' ~ (billet_exclusion_root | regex_escape) ~ billet_exclusion_pointer_tail)) }}"
       - name: managed
@@ -149,7 +159,7 @@
     billet_exclusion_executable: "{{ billet_exclusion_answered_by }}"
     billet_interrupted_upgrade: "{{ billet_exclusion_answer.pointer }}"
     billet_upgrade_recovery_dir: >-
-      {{ billet_exclusion_answer.recovery_dir | default(billet_exclusion_answer.pointer_target | default(''))
+      {{ billet_exclusion_answer.pointer_target
          if billet_exclusion_answer.pointer else (billet_upgrade_recovery_dir | default('')) }}
     billet_upgrade_claim_shape: "{{ 'guard-pointer' if billet_exclusion_answer.pointer else 'guard' }}"
     billet_exclusion_record_executable: "{{ billet_exclusion_answer.record.release_executable }}"
