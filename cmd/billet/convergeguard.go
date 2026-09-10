@@ -485,28 +485,12 @@ func openGuardTmpAt(dir *os.File, replace bool) (*os.File, error) {
 		return nil, fmt.Errorf("%s exists; the guard was not published cleanly", tmp)
 	}
 
-	// A STALE TEMPORARY IS EXAMINED, THEN REMOVED, NEVER OPENED FOR WRITING: the
-	// entry is opened for its identity alone (a device's driver never invoked
-	// on Linux, a FIFO never waited on), judged on that descriptor (regular,
-	// owned, writable by nobody else, ONE LINK: a temporary that is another
-	// name of the record, of a preserved binary or of a journal is not this
-	// hold's leftover, whatever removing one name would do), and only then
-	// unlinked by its name relative to the directory, so no inode is ever
-	// truncated in place; a fresh temporary is then created exclusively.
-	stale, opened, err := regularfile.OpenAt(dir, guardTmpName)
-	if err != nil {
-		return nil, fmt.Errorf("the stale %s cannot be replaced: %w: examine it: %w", guardTmpName, errTrustBoundary, err)
-	}
-
-	_ = stale.Close()
-
-	if err := requireTrustedFile(tmp, opened); err != nil {
+	// A STALE TEMPORARY IS EXAMINED, THEN REMOVED, NEVER OPENED FOR WRITING
+	// (judgeStaleTemporary), and only then unlinked by its name relative to the
+	// directory, so no inode is ever truncated in place; a fresh temporary is
+	// then created exclusively.
+	if err := judgeStaleTemporary(dir); err != nil {
 		return nil, fmt.Errorf("the stale %s cannot be replaced: %w", guardTmpName, err)
-	}
-
-	if links := linkCountOf(opened); links != 1 {
-		return nil, fmt.Errorf("the stale %s cannot be replaced: %w: it has %d links, so it is another name of "+
-			"something and not this hold's leftover", guardTmpName, errTrustBoundary, links)
 	}
 
 	if err := guardObserve("unlink", tmp, nil); err != nil {
@@ -524,6 +508,36 @@ func openGuardTmpAt(dir *os.File, replace bool) (*os.File, error) {
 	}
 
 	return os.NewFile(uintptr(fd), tmp), nil
+}
+
+// judgeStaleTemporary is the one judgement of an existing `guard.json.tmp`
+// before any command removes it: the entry is opened for its identity alone
+// (a device's driver never invoked on Linux, a FIFO never waited on, a link at
+// the name the link's own inode), judged on that descriptor as regular, owned,
+// writable by nobody else, and with ONE LINK, because a temporary that is
+// another name of the record, of a preserved binary or of a journal is not a
+// hold's leftover, whatever removing one name would do. Nothing is written or
+// removed here.
+func judgeStaleTemporary(dir *os.File) error {
+	tmp := filepath.Join(dir.Name(), guardTmpName)
+
+	stale, opened, err := regularfile.OpenAt(dir, guardTmpName)
+	if err != nil {
+		return fmt.Errorf("%w: examine it: %w", errTrustBoundary, err)
+	}
+
+	_ = stale.Close()
+
+	if err := requireTrustedFile(tmp, opened); err != nil {
+		return err
+	}
+
+	if links := linkCountOf(opened); links != 1 {
+		return fmt.Errorf("%w: it has %d links, so it is another name of something and not a hold's leftover",
+			errTrustBoundary, links)
+	}
+
+	return nil
 }
 
 // requireTrustedFile is the trust boundary for one regular file: regular, owned

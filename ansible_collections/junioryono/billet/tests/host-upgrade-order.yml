@@ -646,6 +646,11 @@
         billet_prepare_moved: "{{ billet_prepare_block | selectattr('name', 'equalto', 'Refuse a converge whose exclusion moved') | first }}"
         billet_prepare_dry_ask: "{{ billet_prepare_block | selectattr('name', 'equalto', 'Ask the managed binary to report the claim') | first }}"
         billet_prepare_dry_judge: "{{ billet_prepare_block | selectattr('name', 'equalto', \"Judge the dry run's answer\") | first }}"
+        billet_prepare_dry_via_record: "{{ billet_prepare_block | selectattr('name', 'equalto', 'Note whether a dry run is answered by the executable the guard records') | first }}"
+        billet_prepare_dry_fallback: "{{ billet_prepare_block | selectattr('name', 'equalto', \"Read the guard's record for the executable that can report in a dry run\") | first }}"
+        billet_prepare_dry_recorded_ask: "{{ billet_prepare_block | selectattr('name', 'equalto', 'Ask the recorded executable to report the claim') | first }}"
+        billet_prepare_dry_recorded_floor: "{{ billet_prepare_block | selectattr('name', 'equalto', 'Refuse a recorded executable that predates the guard in a dry run') | first }}"
+        billet_prepare_dry_shape: "{{ billet_prepare_block | selectattr('name', 'equalto', \"Take the dry run's shape as this run's facts\") | first }}"
         billet_prepare_dry_stage: "{{ billet_prepare_block | selectattr('name', 'equalto', 'Decide the binary change in a dry run') | first }}"
         billet_prepare_legacy: "{{ billet_prepare_block | selectattr('name', 'equalto', 'Classify a legacy pointer') | first }}"
         billet_prepare_protocol: "{{ billet_prepare_block | selectattr('name', 'equalto', 'Prepare through the guard') | first }}"
@@ -695,7 +700,8 @@
         # in the block and in its rescue.
         billet_guard_commands: >-
           {{ (billet_prepare_block + billet_protocol_block + billet_rescue_block)
-             | selectattr('name', 'in', ['Ask the managed binary to report the claim', 'Ask the managed binary to prepare',
+             | selectattr('name', 'in', ['Ask the managed binary to report the claim', 'Ask the recorded executable to report the claim',
+                                        'Ask the managed binary to prepare',
                                         'Ask the recorded executable to prepare', 'Ask the staged candidate to prepare',
                                         "Declare this converge's intent to the guard", 'Ask the managed binary again whether it predates the guard',
                                         'Settle the guard this converge acquired', 'Release the guard this converge acquired before it changed anything',
@@ -794,6 +800,34 @@
           - billet_prepare_dry_stage.when == 'ansible_check_mode'
           - "'ansible_check_mode' in (billet_prepare_dry_judge.when | string)"
           - "'billet_exclusion_dry_wrong' in (billet_prepare_dry_judge['ansible.builtin.assert'].that | join(' '))"
+          # THE DRY RUN'S FALLBACK is the converge's: a guard directory beside a managed binary that is absent or predates the guard is reported through the executable the record names, read by guard-fallback.yml, before the parser; the pre-R floor holds for it; the parser reads whichever answered.
+          - billet_prepare_block_names.index('Ask the managed binary to report the claim') < billet_prepare_block_names.index('Note whether the managed binary predates the guard in a dry run')
+          - billet_prepare_block_names.index('Note whether the managed binary predates the guard in a dry run') < billet_prepare_block_names.index('Note whether a dry run is answered by the executable the guard records')
+          - billet_prepare_block_names.index('Note whether a dry run is answered by the executable the guard records') < billet_prepare_block_names.index("Read the guard's record for the executable that can report in a dry run")
+          - billet_prepare_block_names.index("Read the guard's record for the executable that can report in a dry run") < billet_prepare_block_names.index('Ask the recorded executable to report the claim')
+          - billet_prepare_block_names.index('Ask the recorded executable to report the claim') < billet_prepare_block_names.index('Refuse a recorded executable that predates the guard in a dry run')
+          - billet_prepare_block_names.index('Refuse a recorded executable that predates the guard in a dry run') < billet_prepare_block_names.index("Read the dry run's answer")
+          - billet_prepare_block_names.index("Read the dry run's answer") < billet_prepare_block_names.index("Read the dry run's report")
+          - billet_prepare_block_names.index("Read the dry run's report") < billet_prepare_block_names.index("Judge the dry run's answer")
+          - "'isdir' in (billet_prepare_dry_via_record['ansible.builtin.set_fact'].billet_exclusion_dry_via_record | string)"
+          - "'billet_exclusion_binary_present' in (billet_prepare_dry_via_record['ansible.builtin.set_fact'].billet_exclusion_dry_via_record | string)"
+          - "'billet_exclusion_managed_pre_r' in (billet_prepare_dry_via_record['ansible.builtin.set_fact'].billet_exclusion_dry_via_record | string)"
+          - billet_prepare_dry_fallback['ansible.builtin.import_tasks'] == 'guard-fallback.yml'
+          - "'ansible_check_mode' in (billet_prepare_dry_fallback.when | string)"
+          - "'billet_exclusion_dry_via_record' in (billet_prepare_dry_fallback.when | string)"
+          - "'--dry-run' in (billet_prepare_dry_recorded_ask['ansible.builtin.command'].argv | string)"
+          - "'billet_exclusion_fallback_executable' in (billet_prepare_dry_recorded_ask['ansible.builtin.command'].argv | string)"
+          - "'billet_exclusion_dry_via_record' in (billet_prepare_dry_recorded_ask.when | string)"
+          - billet_prepare_dry_recorded_ask.no_log is not defined
+          - "'unknown (converge-guard )?command' in (billet_prepare_dry_recorded_floor['ansible.builtin.assert'].that | join(' '))"
+          - "'billet_exclusion_dry_answered' in (billet_prepare_dry_judge.when | string)"
+          - "'record_error' in (billet_prepare_dry_judge.vars.billet_exclusion_dry_wrong | string)"
+          - "'billet_exclusion_dry_answer.rc' in (billet_prepare_dry_judge.vars.billet_exclusion_dry_wrong | string)"
+          # THE DRY RUN'S SHAPE keeps what was found: the stat's legacy file and symlink, the report's guard and pointer, the report's word for an unpublished guard or an unknown shape; none is never a shape a converge would refuse.
+          - "'islnk' in (billet_prepare_dry_shape['ansible.builtin.set_fact'].billet_upgrade_claim_shape | string)"
+          - "'host-upgrade' in (billet_prepare_dry_shape['ansible.builtin.set_fact'].billet_upgrade_claim_shape | string)"
+          - "'unpublished-guard' in (billet_prepare_dry_shape['ansible.builtin.set_fact'].billet_upgrade_claim_shape | string)"
+          - "'guard-pointer' in (billet_prepare_dry_shape['ansible.builtin.set_fact'].billet_upgrade_claim_shape | string)"
           # THE ROLE'S OWN MEMORY precedes the shape dispatch, and the legacy file is the role's stat's to classify, outside check mode.
           - "'billet_exclusion_held' in (billet_prepare_moved.when | string)"
           - "'not ansible_check_mode' in (billet_prepare_moved.when | string)"
@@ -961,7 +995,7 @@
     - name: Every command of the protocol is bounded by platform
       ansible.builtin.assert:
         that:
-          - billet_guard_commands | length == 9
+          - billet_guard_commands | length == 10
           - "'converge-guard' in (item['ansible.builtin.command'].argv | string)"
           - "'timeout' in (item['ansible.builtin.command'].argv | string)"
           - "item.name == 'Ask the staged candidate to prepare' or 'billet_exclusion_darwin' in (item['ansible.builtin.command'].argv | string)"

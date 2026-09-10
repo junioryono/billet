@@ -1377,6 +1377,20 @@ func TestTheStatusJudgeRefusesEachCorruptionByName(t *testing.T) {
 	}{
 		{"not JSON", []byte("nope"), "not JSON"},
 		{"a list", []byte("[]"), "not JSON"},
+		{"bytes after the object", []byte(`{"active": "none"} garbage`), "bytes after its object"},
+		{"two objects", []byte(`{"active": "none"}{}`), "bytes after its object"},
+		{"active null", corrupt([]string{"active"}, nil, false), "active is missing or not a string"},
+		{"why null under unknown", []byte(`{"active": "unknown", "why": null}`), "why is not a string"},
+		{"guard null", corrupt([]string{"guard"}, nil, false), "guard: missing or not an object"},
+		{"record_error null", corrupt([]string{"guard", "record_error"}, nil, false), "record_error is not a non-empty string"},
+		{"holder null", corrupt([]string{"guard", "holder"}, nil, false), "holder is missing or not a string"},
+		{"claimed_at null", corrupt([]string{"guard", "claimed_at"}, nil, false), "claimed_at is not an RFC 3339 time"},
+		{"hostname null", corrupt([]string{"guard", "hostname"}, nil, false), "hostname is missing or not a string"},
+		{"recovery_pointer null", corrupt([]string{"guard", "recovery_pointer"}, nil, false), "recovery_pointer is missing or not a boolean"},
+		{"release_executable null", corrupt([]string{"guard", "release_executable"}, nil, false), "not an absolute path"},
+		{"sha256 null", corrupt([]string{"guard", "release_executable_sha256"}, nil, false), "not 64 lowercase hex"},
+		{"verified null", corrupt([]string{"guard", "release_executable_verified"}, nil, false), "neither true, false nor an object"},
+		{"verified unknown null", corrupt([]string{"guard", "release_executable_verified"}, map[string]any{"unknown": nil}, false), "neither true, false nor an object"},
 		{"no active", corrupt([]string{"active"}, nil, true), "active is missing"},
 		{"active a number", corrupt([]string{"active"}, 1, false), "active is missing or not a string"},
 		{"active an unfamiliar word", corrupt([]string{"active"}, "held", false), "not a word this command knows"},
@@ -1418,6 +1432,7 @@ func TestTheStatusJudgeRefusesEachCorruptionByName(t *testing.T) {
 		body []byte
 	}{
 		{"healthy", corrupt(nil, nil, false)},
+		{"healthy with a trailing newline", append(corrupt(nil, nil, false), '\n')},
 		{"a record error", []byte(`{"active": "converge-guard", "guard": {"record_error": "not JSON"}}`)},
 		{"none", []byte(`{"active": "none"}`)},
 		{"unknown with why", []byte(`{"active": "unknown", "why": "x"}`)},

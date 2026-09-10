@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
@@ -259,6 +260,81 @@ func TestARecordIsReadAsTheCommandWritesIt(t *testing.T) {
 
 // A dry run over a guard whose pointer cannot be followed reports the
 // pointer as present with its problem, never as a guard with no transaction.
+// A stray `guard.json.tmp` is removed only when it is the leftover a rewrite
+// leaves: a regular file the trust boundary accepts with one link. One
+// another account could have written, or one that is another name of the
+// record, refuses at the preparation, the settlement and the release, and
+// survives each refusal untouched.
+func TestAStrayTemporaryIsJudgedBeforeItIsRemoved(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		plant func(t *testing.T, f *guardFixture)
+	}{
+		{"writable by others", func(t *testing.T, f *guardFixture) {
+			t.Helper()
+			mustOK(t, os.WriteFile(filepath.Join(f.active(), guardTmpName), []byte("{"), 0o600))
+			mustOK(t, os.Chmod(filepath.Join(f.active(), guardTmpName), 0o666))
+		}},
+		{"another name of the record", func(t *testing.T, f *guardFixture) {
+			t.Helper()
+			mustOK(t, os.Link(filepath.Join(f.active(), guardRecordName), filepath.Join(f.active(), guardTmpName)))
+		}},
+		{"a symlink", func(t *testing.T, f *guardFixture) {
+			t.Helper()
+			mustOK(t, os.Symlink(filepath.Join(f.active(), guardRecordName), filepath.Join(f.active(), guardTmpName)))
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newGuardFixture(t)
+			first := runPrepare(t, "--holder", "ci-1", "--validate")
+			mustOutcome(t, first, prepareAcquired)
+			token := first.str("token")
+
+			tmp := filepath.Join(f.active(), guardTmpName)
+			c.plant(t, f)
+
+			before, err := os.Lstat(tmp)
+			mustOK(t, err)
+
+			recordBefore, err := os.ReadFile(filepath.Join(f.active(), guardRecordName))
+			mustOK(t, err)
+
+			o := runPrepare(t, "--holder", "ci-1", "--validate")
+			mustRefusal(t, o, reasonStray)
+
+			if !strings.Contains(o.str("why"), "not the leftover a rewrite leaves") {
+				t.Errorf("why %q does not say what the temporary is not", o.str("why"))
+			}
+
+			if err := guardRun(t, "settle", "--holder", "ci-1", "--token", token); err == nil ||
+				!strings.Contains(err.Error(), "not the leftover a rewrite leaves") {
+				t.Errorf("the settlement answered %v, want the temporary's refusal", err)
+			}
+
+			if err := guardRun(t, "release", "--holder", "ci-1", "--cleanup", "--token", token); err == nil ||
+				!strings.Contains(err.Error(), "not the leftover a rewrite leaves") {
+				t.Errorf("the cleanup answered %v, want the temporary's refusal", err)
+			}
+
+			after, err := os.Lstat(tmp)
+			if err != nil {
+				t.Fatalf("the temporary was removed: %v", err)
+			}
+
+			if !os.SameFile(before, after) || before.Mode() != after.Mode() {
+				t.Error("the temporary was replaced or changed by a refusal")
+			}
+
+			recordAfter, err := os.ReadFile(filepath.Join(f.active(), guardRecordName))
+			mustOK(t, err)
+
+			if !bytes.Equal(recordBefore, recordAfter) {
+				t.Error("the record changed under a refusal")
+			}
+		})
+	}
+}
+
 func TestADryRunReportsABrokenPointer(t *testing.T) {
 	f := newGuardFixture(t)
 	mustHold(t, "ci-1")

@@ -686,19 +686,23 @@ func rewriteGuardRecord(root *txLock, dir *os.File, record guardRecord) error {
 	return syncDirFD(root.dir)
 }
 
-// removeStrayTemporary removes `guard.json.tmp` when it is the regular file an
-// interrupted rewrite leaves; anything else at that name refuses.
+// removeStrayTemporary removes `guard.json.tmp` when it is the leftover an
+// interrupted rewrite leaves, judged through the identity descriptor as the
+// takeover judges the one it replaces (judgeStaleTemporary); anything else at
+// that name refuses without being touched.
 func removeStrayTemporary(dir *os.File) (bool, *prepareRefusal) {
-	st, err := statAt(dir, guardTmpName)
+	_, err := statAt(dir, guardTmpName)
 
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
 		return false, nil
 	case err != nil:
 		return false, couldNotTell(fmt.Sprintf("examine %s: %v", guardTmpName, err))
-	case modeOf(st)&unix.S_IFMT != unix.S_IFREG:
-		return false, refuse(reasonStray, string(claimGuard), fmt.Sprintf("%s beside the record is %s, which no "+
-			"rewrite leaves", guardTmpName, fileTypeOf(modeOf(st))), "inspect it by hand")
+	}
+
+	if err := judgeStaleTemporary(dir); err != nil {
+		return false, refuse(reasonStray, string(claimGuard), fmt.Sprintf("%s beside the record is not the "+
+			"leftover a rewrite leaves: %v", guardTmpName, err), "inspect it by hand")
 	}
 
 	if err := guardObserve("unlink", filepath.Join(dir.Name(), guardTmpName), nil); err != nil {
@@ -1267,8 +1271,14 @@ func judgeStatusAnswer(rc int, stdout, stderr []byte, timedOut bool) string {
 		return "envelope: the answer is not a JSON object"
 	}
 
-	var active string
-	if err := json.Unmarshal(report["active"], &active); err != nil || report["active"] == nil {
+	// ONE OBJECT AND NOTHING AFTER IT: the decoder stops at the object's end,
+	// so what follows is read on purpose, as the record's reader reads it.
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return "envelope: the answer carries bytes after its object"
+	}
+
+	active, ok := jsonString(report["active"])
+	if !ok {
 		return "envelope: active is missing or not a string"
 	}
 
@@ -1280,7 +1290,7 @@ func judgeStatusAnswer(rc int, stdout, stderr []byte, timedOut bool) string {
 
 	var why string
 	if raw, ok := report["why"]; ok {
-		if err := json.Unmarshal(raw, &why); err != nil {
+		if why, ok = jsonString(raw); !ok {
 			return "envelope: why is not a string"
 		}
 	}
@@ -1299,16 +1309,15 @@ func judgeStatusAnswer(rc int, stdout, stderr []byte, timedOut bool) string {
 	}
 
 	if raw, ok := guard["record_error"]; ok {
-		var recordErr string
-		if err := json.Unmarshal(raw, &recordErr); err != nil || recordErr == "" {
+		if recordErr, ok := jsonString(raw); !ok || recordErr == "" {
 			return "guard: record_error is not a non-empty string"
 		}
 
 		return ""
 	}
 
-	var holder string
-	if err := json.Unmarshal(guard["holder"], &holder); err != nil || guard["holder"] == nil {
+	holder, ok := jsonString(guard["holder"])
+	if !ok {
 		return "guard: holder is missing or not a string"
 	}
 
@@ -1316,8 +1325,8 @@ func judgeStatusAnswer(rc int, stdout, stderr []byte, timedOut bool) string {
 		return fmt.Sprintf("guard: holder %q is not a name", holder)
 	}
 
-	var claimed string
-	if err := json.Unmarshal(guard["claimed_at"], &claimed); err != nil || guard["claimed_at"] == nil {
+	claimed, ok := jsonString(guard["claimed_at"])
+	if !ok {
 		return "guard: claimed_at is not an RFC 3339 time"
 	}
 
@@ -1325,23 +1334,19 @@ func judgeStatusAnswer(rc int, stdout, stderr []byte, timedOut bool) string {
 		return "guard: claimed_at is not an RFC 3339 time"
 	}
 
-	var hostname string
-	if err := json.Unmarshal(guard["hostname"], &hostname); err != nil || guard["hostname"] == nil {
+	if _, ok := jsonString(guard["hostname"]); !ok {
 		return "guard: hostname is missing or not a string"
 	}
 
-	var pointer bool
-	if err := json.Unmarshal(guard["recovery_pointer"], &pointer); err != nil || guard["recovery_pointer"] == nil {
+	if !isJSONBool(guard["recovery_pointer"]) {
 		return "guard: recovery_pointer is missing or not a boolean"
 	}
 
-	var exe string
-	if err := json.Unmarshal(guard["release_executable"], &exe); err != nil || !strings.HasPrefix(exe, "/") {
+	if exe, ok := jsonString(guard["release_executable"]); !ok || !strings.HasPrefix(exe, "/") {
 		return "guard: release_executable is not an absolute path"
 	}
 
-	var digest string
-	if err := json.Unmarshal(guard["release_executable_sha256"], &digest); err != nil || !sha256Hex.MatchString(digest) {
+	if digest, ok := jsonString(guard["release_executable_sha256"]); !ok || !sha256Hex.MatchString(digest) {
 		return "guard: release_executable_sha256 is not 64 lowercase hex digits"
 	}
 
@@ -1350,21 +1355,47 @@ func judgeStatusAnswer(rc int, stdout, stderr []byte, timedOut bool) string {
 		return "guard: release_executable_verified is missing"
 	}
 
-	var verifiedBool bool
-	if err := json.Unmarshal(raw, &verifiedBool); err == nil {
+	if isJSONBool(raw) {
 		return ""
 	}
 
 	var verifiedObj map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &verifiedObj); err == nil && len(verifiedObj) == 1 {
-		var reason string
-		if err := json.Unmarshal(verifiedObj["unknown"], &reason); err == nil && reason != "" {
+		if reason, ok := jsonString(verifiedObj["unknown"]); ok && reason != "" {
 			return ""
 		}
 	}
 
 	return "guard: release_executable_verified is neither true, false nor an object whose one member is a " +
 		"non-empty string unknown"
+}
+
+// jsonString reads a member as a JSON string: absent, null or any other type
+// is not one, because Go's decoder leaves a string alone on null and a null
+// would otherwise read as the empty string.
+func jsonString(raw json.RawMessage) (string, bool) {
+	if raw == nil || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return "", false
+	}
+
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return "", false
+	}
+
+	return s, true
+}
+
+// isJSONBool says whether a member is a JSON boolean, null being none, as
+// jsonString reads a string.
+func isJSONBool(raw json.RawMessage) bool {
+	if raw == nil || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return false
+	}
+
+	var b bool
+
+	return json.Unmarshal(raw, &b) == nil
 }
 
 // sha256Hex is the shape of a digest.

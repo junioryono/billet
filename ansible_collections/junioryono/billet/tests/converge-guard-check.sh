@@ -1182,10 +1182,16 @@ check_case b7-own "plant_root; plant_managed v0.10.0; plant_guard h1 /usr/bin/bi
 expect_state b7-own record_preparing True
 check_case b7-legacy "plant_root; plant_managed v0.10.0; printf '%s\n' $ROOT/$LEGACY_DIR >$ROOT/active" "is legacy-role"
 expect_state b7-legacy active file
-check_case b7-go "plant_root; plant_managed v0.10.0; ln -s $ROOT/$LEGACY_DIR $ROOT/active" "is host-upgrade"
+check_case b7-go "plant_root; plant_managed v0.10.0; ln -s $ROOT/$LEGACY_DIR $ROOT/active" "is host-upgrade" "a converge would refuse this shape"
 expect_state b7-go active symlink
-check_case b7-unpublished "plant_root; plant_managed v0.10.0; mkdir -m 0700 $ROOT/active" "is unpublished-guard"
+expect_fact b7-go shape host-upgrade
+check_case b7-unpublished "plant_root; plant_managed v0.10.0; mkdir -m 0700 $ROOT/active" "is unpublished-guard" "a converge would refuse this shape"
 expect_state b7-unpublished active dir
+expect_fact b7-unpublished shape unpublished-guard
+# A guard whose record cannot be read: reported with the problem and kept as a guard; the refusal is the converge's.
+check_case b7h-record-error "plant_root; plant_managed v0.10.0; plant_guard h2 /usr/bin/billet; printf 'nope\n' >$ROOT/active/guard.json" "a guard whose record cannot be read" "not JSON"
+expect_fact b7h-record-error shape guard
+expect_fact b7h-record-error interrupted False
 # A guard whose pointer cannot be followed: reported as a guard WITH a pointer and the problem.
 check_case b7g-dangling-pointer "plant_root; plant_managed v0.10.0; plant_guard h2 /usr/bin/billet; ln -sT $ROOT/$REC_A $ROOT/active/recovery" "a guard held by h2" "with a transaction pointer inside it" "whose pointer cannot be followed" "does not exist"
 expect_fact b7g-dangling-pointer shape guard-pointer
@@ -1229,6 +1235,57 @@ HOLDER=""; ns_case b7f-moving escalated; HOLDER=h1
 expect_refused b7f-moving "Refuse an unpinned billet version" "must name one release"
 expect_state b7f-moving active absent
 echo "ok   B7: a dry run reports every shape through prepare --dry-run before any dispatch, needs no holder, then takes the read-only staging path"
+
+# B7n. A dry run over a guard directory beside a managed binary that cannot
+# answer for it (absent, or pre-R): the fallback reads the record, the
+# recorded candidate reports, a transaction pointer is the interrupted
+# transaction it is, and what the converge refuses the dry run refuses.
+dry_via_record() { # name plant-line managed-role fragment...
+  local name=$1 plant_line=$2 role=$3; shift 3
+  plant "$name"
+  p "$name" "$plant_line"
+  a "$name" --check
+  HOLDER=""; ns_case "$name" escalated; HOLDER=h1
+  expect_allowed "$name"
+  for frag in "$@"; do
+    grep -qF -- "$frag" "$work/cases/$name/out" || fail "$name: the dry run did not report: $frag" "$work/cases/$name/out"
+  done
+  expect_ran "$name" "Read the guard's record"
+  expect_calls "$name" candidate "converge-guard prepare --dry-run --json" 1
+  expect_calls "$name" candidate "converge-guard prepare --validate" 0
+  expect_calls "$name" candidate "converge-guard settle" 0
+  [ "$role" = none ] || expect_calls "$name" "$role" "converge-guard prepare --dry-run --json" 1
+}
+dry_via_record b7i-absent-pointer "plant_root; plant_recovery $REC_A v0.10.1; plant_guard h1 $ROOT/$REC_A/billet.candidate; plant_pointer $REC_A" none "answered by the executable the guard records" "/usr/bin/billet is absent" "with a transaction pointer inside it"
+expect_fact b7i-absent-pointer shape guard-pointer
+expect_fact b7i-absent-pointer interrupted True
+expect_fact b7i-absent-pointer recovery "$ROOT/$REC_A"
+dry_via_record b7j-pre-r-pointer "plant_root; plant_pre_r; plant_recovery $REC_A v0.10.1; plant_guard h1 $ROOT/$REC_A/billet.candidate; plant_pointer $REC_A" pre-r "answered by the executable the guard records" "/usr/bin/billet predates the converge guard" "with a transaction pointer inside it"
+expect_fact b7j-pre-r-pointer shape guard-pointer
+expect_fact b7j-pre-r-pointer interrupted True
+dry_via_record b7k-absent-guard "plant_root; plant_recovery $REC_A v0.10.1; plant_guard h1 $ROOT/$REC_A/billet.candidate" none "a guard held by h1 since 2026-09-09T12:00:00Z, settled"
+expect_fact b7k-absent-guard shape guard
+expect_fact b7k-absent-guard interrupted False
+# An unpublished guard, and a record the fallback cannot trust: refused as the converge refuses them, and the candidate is never run.
+plant b7l-absent-unpublished
+p b7l-absent-unpublished "plant_root; mkdir -m 0700 $ROOT/active"
+a b7l-absent-unpublished --check
+HOLDER=""; ns_case b7l-absent-unpublished escalated; HOLDER=h1
+expect_refused b7l-absent-unpublished "Refuse an unpublished guard no executable can recover" "never returned from publishing"
+plant b7m-absent-corrupt
+p b7m-absent-corrupt "plant_root; plant_recovery $REC_A v0.10.1; plant_guard h1 $ROOT/$REC_A/billet.candidate preparing"
+p b7m-absent-corrupt "\"\$PYTHON\" - <<'PY'
+import json
+p = '/var/lib/billet/upgrades/active/guard.json'
+r = json.load(open(p))
+r['preparing'] = 'yes'
+json.dump(r, open(p, 'w'))
+PY"
+a b7m-absent-corrupt --check
+HOLDER=""; ns_case b7m-absent-corrupt escalated; HOLDER=h1
+expect_refused b7m-absent-corrupt "Judge the guard's record" "preparing"
+expect_calls b7m-absent-corrupt candidate "" 0
+echo "ok   B7n: a dry run over a guard the managed binary cannot answer for is reported by the recorded executable, keeps an interrupted transaction, and refuses what the converge refuses"
 
 # B8. The fallback: a pre-R or absent managed binary and a guard recording an
 # R candidate; the calls run through the candidate.
