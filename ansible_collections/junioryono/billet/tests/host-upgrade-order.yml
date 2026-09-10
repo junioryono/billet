@@ -1024,6 +1024,13 @@
           - "'billet_exclusion_answer.pointer_target' in (billet_answer_facts['ansible.builtin.set_fact'].billet_upgrade_recovery_dir | string)"
           # ADOPTION NEEDS EXACTLY THE FIVE MEMBERS, in the command and in the fallback reader alike.
           - "'without an id' in billet_fallback_module_text"
+          # THE STAGING'S OBSERVATION OF THE MANAGED BINARY IS HELD TO THE HOLD'S, after the second answer and before the settlement, on every held route.
+          - billet_protocol_names.index('Judge the second answer') < billet_protocol_names.index('Refuse a converge whose managed binary moved under the staging')
+          - billet_protocol_names.index('Refuse a converge whose managed binary moved under the staging') < billet_protocol_names.index('Settle the guard this converge acquired')
+          - "'billet_exclusion_managed_sha256 == billet_installed_binary.stat.checksum' in ((billet_protocol_block | selectattr('name', 'equalto', 'Refuse a converge whose managed binary moved under the staging') | first)['ansible.builtin.assert'].that | join(' '))"
+          - "'billet_exclusion_managed_present is sameas billet_installed_binary.stat.exists' in ((billet_protocol_block | selectattr('name', 'equalto', 'Refuse a converge whose managed binary moved under the staging') | first)['ansible.builtin.assert'].that | join(' '))"
+          - "\"in ['managed', 'fallback', 'candidate']\" in ((billet_protocol_block | selectattr('name', 'equalto', 'Refuse a converge whose managed binary moved under the staging') | first).when | string)"
+          - "'billet_exclusion_answer.managed.present' in (billet_answer_facts['ansible.builtin.set_fact'].billet_exclusion_managed_present | string)"
           - "'billet_exclusion_dry.rc not in [124, 137]' in ((billet_prepare_block | selectattr('name', 'equalto', 'Note whether the managed binary predates the guard in a dry run') | first)['ansible.builtin.set_fact'].billet_exclusion_managed_pre_r | string)"
           - "'billet_exclusion_dry_recorded.rc not in [124, 137]' in (billet_prepare_dry_recorded_floor['ansible.builtin.assert'].that | join(' '))"
           - "'billet_exclusion_legacy_recheck.rc not in [124, 137]' in ((billet_protocol_block | selectattr('name', 'equalto', 'Refuse a converge whose managed binary moved') | first)['ansible.builtin.assert'].that | join(' '))"

@@ -888,6 +888,35 @@
               no exclusion was established, and a converge does not run unheld.
               Nothing was changed; inspect the host and rerun.
 
+        # THE STAGING'S OBSERVATION OF THE MANAGED BINARY IS HELD TO THE HOLD'S:
+        # on the candidate-first routes the staging examined the managed binary
+        # BEFORE anything was held, and its observation (whether the binary
+        # exists, and its digest) is what the transaction backs up from and
+        # what its rollback restores, so an updater that moved the binary
+        # between that examination and the hold would leave a transaction
+        # whose rollback removes an installation it never backed up. The
+        # second answer carries the command's own observation under the lock;
+        # the two must agree, or nothing further is done and the rescue
+        # releases what this run acquired.
+        - name: Refuse a converge whose managed binary moved under the staging
+          ansible.builtin.assert:
+            that:
+              - billet_exclusion_managed_present is sameas billet_installed_binary.stat.exists
+              - not billet_installed_binary.stat.exists or billet_exclusion_managed_sha256 == billet_installed_binary.stat.checksum
+            fail_msg: >-
+              {{ billet_exclusion_binary }} moved between the staging's examination
+              and the hold: the staging saw it
+              {{ ('present with digest ' ~ billet_installed_binary.stat.checksum) if billet_installed_binary.stat.exists else 'absent' }},
+              and the guard's own observation under the lock is
+              {{ ('present with digest ' ~ billet_exclusion_managed_sha256) if billet_exclusion_managed_present is sameas true
+                 else ('absent' if billet_exclusion_managed_present is sameas false else 'could not be examined') }}.
+              An updater or an operator changed the managed binary under this
+              converge; nothing was changed, and a guard this run acquired is
+              released on the way out. Converge again.
+          when:
+            - not billet_exclusion_darwin | bool
+            - billet_exclusion_route in ['managed', 'fallback', 'candidate']
+
         # THE WAYS OUT, printed before the window closes: a play that stops
         # after this leaves the guard, and what its tasks changed is not rolled
         # back by the binary journal.

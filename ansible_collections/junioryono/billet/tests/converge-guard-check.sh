@@ -123,6 +123,11 @@ mkdir -p "$fakes" "$bins" "$mnt" "$work/cases"
 cat >"$fakes/billet-fake" <<'FAKE'
 #!/bin/bash
 set -u
+# UNDER REAL ESCALATION THE ENVIRONMENT IS SUDO'S: the gate's variables (the
+# log, the private log, the hooks, the failure modes) arrive through the
+# file the namespace runner wrote inside this case's overlay when the
+# environment carries none of them.
+if [ -z "${BILLET_GATE_LOG:-}" ] && [ -r /var/lib/billet-gate.env ]; then . /var/lib/billet-gate.env; fi
 log=${BILLET_FAKE_LOG:-/dev/null}
 {
   printf 'role=fake\nargv0=%s\nargv=%s\ncwd=%s\nuid=%s\n---\n' "$0" "$*" "$PWD" "$(id -u)"
@@ -177,6 +182,11 @@ fi
   cat <<'FAKE'
 #!/bin/bash
 set -u
+# UNDER REAL ESCALATION THE ENVIRONMENT IS SUDO'S: the gate's variables (the
+# log, the private log, the hooks, the failure modes) arrive through the
+# file the namespace runner wrote inside this case's overlay when the
+# environment carries none of them.
+if [ -z "${BILLET_GATE_LOG:-}" ] && [ -r /var/lib/billet-gate.env ]; then . /var/lib/billet-gate.env; fi
 log=${BILLET_GATE_LOG:-/dev/null}
 priv=${BILLET_GATE_PRIVATE:-/dev/null}
 cmd=${1:-}
@@ -229,6 +239,11 @@ write_wrapper() { # path backing role
     cat <<WRAP
 #!/bin/bash
 set -u
+# UNDER REAL ESCALATION THE ENVIRONMENT IS SUDO'S: the gate's variables (the
+# log, the private log, the hooks, the failure modes) arrive through the
+# file the namespace runner wrote inside this case's overlay when the
+# environment carries none of them.
+if [ -z "${BILLET_GATE_LOG:-}" ] && [ -r /var/lib/billet-gate.env ]; then . /var/lib/billet-gate.env; fi
 BACKING="$2"
 ROLE="$3"
 WRAP
@@ -751,7 +766,7 @@ if ! command -v go >/dev/null 2>&1; then
   echo "converge guard: no go on PATH; the namespace cases were skipped"
   exit 0
 fi
-invoker_uid=$(id -u); invoker_gid=$(id -g)
+invoker_uid=$(id -u); invoker_gid=$(id -g); invoker_name=$(id -un)
 [ "$invoker_uid" != 0 ] || fail "the gate must be invoked as a non-root account (its unescalated cases run as the invoker)"
 
 # =============================================================================
@@ -851,12 +866,33 @@ envs=(PATH="$FAKES:$PATH" ANSIBLE_COLLECTIONS_PATH="$COLLECTIONS" \
   BILLET_GATE_LOG="$case_dir/log" BILLET_GATE_PRIVATE="$case_dir/private")
 while IFS= read -r line; do [ -n "$line" ] && envs+=("$line"); done <"$case_dir/env"
 mapfile -t args <"$case_dir/args"
+# THE GATE'S VARIABLES, FOR A WRAPPER RUN UNDER SUDO: written into this case's
+# overlay of /var/lib (never the host's), shell-quoted, sourced by a wrapper
+# or fake whose environment carries none of them (the become mode).
+{
+  for kv in "${envs[@]}"; do
+    case "$kv" in BILLET_GATE_*=*) printf '%s=%q\n' "${kv%%=*}" "${kv#*=}" ;; esac
+  done
+} >/var/lib/billet-gate.env
+chmod 0644 /var/lib/billet-gate.env
 mkdir -p "$case_dir/tmp"
 if [ "$mode" = escalated ]; then
   env "${envs[@]}" HOME="$HOME_DIR" "$ANSIBLE_PLAYBOOK" -i "$INVENTORY" "$play" -e ansible_become=false -e billet_gate_expect_uid=0 "${args[@]+"${args[@]}"}" >"$case_dir/out" 2>&1
+elif [ "$mode" = become ]; then
+  # THE INVOKER, WITH THE ROLE'S OWN ESCALATION: no ansible_become is forced,
+  # so a task the role marks `become` goes through sudo and one it does not
+  # runs as the invoker; the wrapper's log says which uid each call ran as.
+  # THE INVOKER'S NAME TRAVELS WITH ITS UID: the namespace was entered
+  # through sudo, whose environment names root, and Ansible's local
+  # connection takes its remote user from that name; a play believing it
+  # runs as root skips every become to root (measured: the probe's task ran
+  # as the invoker, unescalated, with "ESTABLISH LOCAL CONNECTION FOR USER:
+  # root"), which is the opposite of what this mode proves.
+  chown -R "$INVOKER_UID:$INVOKER_GID" "$case_dir/tmp"
+  setpriv --reuid="$INVOKER_UID" --regid="$INVOKER_GID" --init-groups env "${envs[@]}" HOME="$HOME_DIR" USER="$INVOKER_NAME" LOGNAME="$INVOKER_NAME" "$ANSIBLE_PLAYBOOK" -i "$INVENTORY" "$play" -e "billet_gate_expect_uid=$INVOKER_UID" "${args[@]+"${args[@]}"}" >"$case_dir/out" 2>&1
 else
   chown -R "$INVOKER_UID:$INVOKER_GID" "$case_dir/tmp"
-  setpriv --reuid="$INVOKER_UID" --regid="$INVOKER_GID" --init-groups env "${envs[@]}" HOME="$HOME_DIR" "$ANSIBLE_PLAYBOOK" -i "$INVENTORY" "$play" -e ansible_become=false -e "billet_gate_expect_uid=$INVOKER_UID" "${args[@]+"${args[@]}"}" >"$case_dir/out" 2>&1
+  setpriv --reuid="$INVOKER_UID" --regid="$INVOKER_GID" --init-groups env "${envs[@]}" HOME="$HOME_DIR" USER="$INVOKER_NAME" LOGNAME="$INVOKER_NAME" "$ANSIBLE_PLAYBOOK" -i "$INVENTORY" "$play" -e ansible_become=false -e "billet_gate_expect_uid=$INVOKER_UID" "${args[@]+"${args[@]}"}" >"$case_dir/out" 2>&1
 fi
 echo "$?" >"$case_dir/status"
 if [ -s "$case_dir/post.sh" ]; then
@@ -912,13 +948,18 @@ p() { printf '%s\n' "$2" >>"$work/cases/$1/plant.sh"; }
 e() { printf '%s\n' "$2" >>"$work/cases/$1/env"; }
 a() { local name=$1; shift; for x in "$@"; do printf '%s\n' "$x" >>"$work/cases/$name/args"; done; }
 post() { printf '%s\n' "$2" >>"$work/cases/$1/post.sh"; }
-# ns_case CASE MODE [PLAY]: MODE escalated (the play runs as root) or
-# unescalated (as the invoker); PLAY play (default) or play2.
+# ns_case CASE MODE [PLAY]: MODE escalated (the play runs as root, so every
+# task's own escalation is a no-op and the case is about the protocol),
+# unescalated (as the invoker, with escalation refused, so the role's refusals
+# as an unprivileged account are the case), or become (as the invoker WITH
+# the role's own per-task escalation through sudo, so what the role marks
+# `become` is proved to run as root and the rest as the invoker); PLAY play
+# (default), play2 or probe.
 ns_case() {
   local name=$1 mode=$2 play=${3:-play}
   local case_dir=$work/cases/$name
   sudo -n env BINS="$bins" FAKES="$fakes" PYTHON="$python" NSLIB="$work/ns-lib.sh" HOME_DIR="$HOME" MNT="$mnt" \
-    COLLECTIONS="$collections_path" RUNNER="$RUNNER" HOLDER="$HOLDER" INVOKER_UID="$invoker_uid" INVOKER_GID="$invoker_gid" \
+    COLLECTIONS="$collections_path" RUNNER="$RUNNER" HOLDER="$HOLDER" INVOKER_UID="$invoker_uid" INVOKER_GID="$invoker_gid" INVOKER_NAME="$invoker_name" \
     ANSIBLE_PLAYBOOK="$ansible_playbook" INVENTORY="$work/inventory.ini" \
     unshare -m --propagation private /bin/bash "$work/ns-run.sh" "$case_dir" "$mode" "$work/$play.yml"
   local rc=$?
@@ -933,9 +974,10 @@ ns_case() {
 # =============================================================================
 plant launch
 p launch 'plant_root; plant_managed v0.10.0'
-HOLDER=from-the-environment ns_case launch escalated probe; HOLDER=h1
+HOLDER=from-the-environment ns_case launch become probe; HOLDER=h1
 [ "$status" -eq 0 ] || fail "M8: the probe play failed" "$work/cases/launch/out"
 grep -q '^uid=0$' "$work/cases/launch/log" || fail "M8: the wrapper did not run as root under become" "$work/cases/launch/log"
+[ "$invoker_uid" != 0 ] || fail "M8: the invoker is root, so the become mode proves nothing; run the gate as an account with passwordless sudo"
 grep -q 'argv0=/usr/bin/billet' "$work/cases/launch/log" || fail "M8: the managed wrapper is not at /usr/bin/billet" "$work/cases/launch/log"
 grep -q 'billet v0.10.0' "$work/cases/launch/private" || fail "M8: the backing binary did not answer version v0.10.0" "$work/cases/launch/private"
 grep -qF "GATE holder=from-the-environment" "$work/cases/launch/out" || fail "M8: the role default did not resolve the holder from the environment" "$work/cases/launch/out"
@@ -1072,15 +1114,23 @@ p b4c-older-managed 'plant_root; plant_pre_r'
 a b4c-older-managed -e "billet_binary_src=$bins/wrap-candidate-v0.10.0"
 e b4c-older-managed "BILLET_GATE_HOOK=prepare:3:cp $bins/wrap-managed-v0.9.0 /usr/bin/billet.new; chmod 0755 /usr/bin/billet.new; mv -f /usr/bin/billet.new /usr/bin/billet"
 ns_case b4c-older-managed escalated
-expect_allowed b4c-older-managed
+# THE MANAGED BINARY MOVED AFTER THE HOLD: no downgrade, but the staging's
+# observation (the pre-R binary) is no longer what the guard sees, so the
+# role refuses before anything changes and releases what it acquired.
+expect_refused b4c-older-managed "Refuse a converge whose managed binary moved under the staging" "moved between the staging's examination and the hold"
+expect_final b4c-older-managed "the cleanup released the guard" "is now none"
+expect_state b4c-older-managed active absent
 plant b4d-allowed-downgrade
 p b4d-allowed-downgrade 'plant_root; plant_pre_r'
 a b4d-allowed-downgrade -e "billet_binary_src=$bins/wrap-candidate-v0.10.0" -e billet_allow_downgrade=true
 e b4d-allowed-downgrade "BILLET_GATE_HOOK=prepare:3:cp $bins/wrap-managed-v0.10.1 /usr/bin/billet.new; chmod 0755 /usr/bin/billet.new; mv -f /usr/bin/billet.new /usr/bin/billet"
 ns_case b4d-allowed-downgrade escalated
-expect_allowed b4d-allowed-downgrade
+# The downgrade is admitted BY NAME under the lock (the second answer says so), and the moved binary is then refused as above.
 expect_calls b4d-allowed-downgrade candidate "--allow-downgrade" 1
-echo "ok   B4: a pre-R host with a candidate acquires through it, and the downgrade is judged against the managed binary under the lock"
+grep -q '"downgrade": true' "$work/cases/b4d-allowed-downgrade/private" || fail "b4d: the second answer did not admit the downgrade by name" "$work/cases/b4d-allowed-downgrade/private"
+expect_refused b4d-allowed-downgrade "Refuse a converge whose managed binary moved under the staging" "moved between the staging's examination and the hold"
+expect_final b4d-allowed-downgrade "the cleanup released the guard" "is now none"
+echo "ok   B4: a pre-R host with a candidate acquires through it, the downgrade is judged against the managed binary under the lock, and a managed binary moved after the hold is refused before anything changes"
 
 # B5. No billet, nothing to install: no call, the closing re-stats, allowed
 # unheld; a binary or a guard that appears in between refuses.
@@ -1187,6 +1237,21 @@ a b7u-dry-run-hang --check -e billet_guard_timeout=2
 e b7u-dry-run-hang "BILLET_GATE_PRE_R_HANG=prepare"
 HOLDER=""; ns_case b7u-dry-run-hang escalated; HOLDER=h1
 expect_refused b7u-dry-run-hang "Judge the dry run's answer" "with no answer"
+# B6j. The managed binary replaced between the staging's examination and the
+# candidate's hold (the pre-R route stages before it holds): the second
+# answer's own observation under the lock disagrees with the staging's, the
+# role refuses before anything changes, and the guard it acquired is released.
+plant b6j-moved-under-staging
+p b6j-moved-under-staging 'plant_root; plant_pre_r'
+a b6j-moved-under-staging -e "billet_binary_src=$bins/wrap-candidate-v0.10.1"
+e b6j-moved-under-staging "BILLET_GATE_HOOK=prepare:2:cp $bins/wrap-managed-v0.10.0 /usr/bin/billet.new; chmod 0755 /usr/bin/billet.new; mv -f /usr/bin/billet.new /usr/bin/billet"
+ns_case b6j-moved-under-staging escalated
+expect_refused b6j-moved-under-staging "Refuse a converge whose managed binary moved under the staging" "moved between the staging's examination and the hold"
+expect_final b6j-moved-under-staging "the cleanup released the guard" "is now none"
+expect_state b6j-moved-under-staging active absent
+expect_no_task b6j-moved-under-staging "Settle the guard this converge acquired"
+echo "ok   B6j: a managed binary moved between the staging and the hold is refused at the hold's own observation, and the guard is released"
+
 # B6h. The diagnostic, then a hang that ignores TERM: the kill after the grace
 # period ends the run with a signal, which is not an exit the executable chose.
 plant b6h-diagnostic-then-kill
@@ -1293,6 +1358,31 @@ HOLDER=""; ns_case b7f-moving escalated; HOLDER=h1
 expect_refused b7f-moving "Refuse an unpinned billet version" "must name one release"
 expect_state b7f-moving active absent
 echo "ok   B7: a dry run reports every shape through prepare --dry-run before any dispatch, needs no holder, then takes the read-only staging path"
+
+# B1b. The role's escalation proved: the same acquisition and dry run as the
+# invoker with the role's own `become`, every guard call and the root's
+# establishment as root, the play itself as the invoker. A `billet_exclusion_become`
+# that stopped escalating would fail here at the root's establishment.
+plant b1b-become
+p b1b-become 'plant_managed v0.10.0'
+ns_case b1b-become become
+expect_allowed b1b-become
+expect_fact b1b-become acquired True
+expect_calls b1b-become managed "converge-guard prepare --validate --holder h1 --json" 1
+expect_calls b1b-become managed "converge-guard settle --holder h1 --token" 1
+grep -q '^uid=0$' "$work/cases/b1b-become/log" || fail "b1b: the guard calls did not run as root under the role's become" "$work/cases/b1b-become/log"
+! grep -q "^uid=$invoker_uid\$" "$work/cases/b1b-become/log" || fail "b1b: a guard call ran as the invoker" "$work/cases/b1b-become/log"
+expect_state b1b-become active dir
+expect_state b1b-become record_holder h1
+plant b7w-become-dry-run
+p b7w-become-dry-run 'plant_root; plant_managed v0.10.0; plant_guard h2 /usr/bin/billet'
+a b7w-become-dry-run --check
+HOLDER=""; ns_case b7w-become-dry-run become; HOLDER=h1
+expect_allowed b7w-become-dry-run
+expect_calls b7w-become-dry-run managed "converge-guard prepare --dry-run --json" 1
+grep -q '^uid=0$' "$work/cases/b7w-become-dry-run/log" || fail "b7w: the dry run's call did not run as root under the role's become" "$work/cases/b7w-become-dry-run/log"
+grep -qF "a guard held by h2" "$work/cases/b7w-become-dry-run/out" || fail "b7w: the dry run did not report the guard" "$work/cases/b7w-become-dry-run/out"
+echo "ok   B1b: the role's own escalation runs every guard call as root from an unprivileged invoker, in a converge and in a dry run"
 
 # B7n. A dry run over a guard directory beside a managed binary that cannot
 # answer for it (absent, or pre-R): the fallback reads the record, the

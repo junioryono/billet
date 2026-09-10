@@ -514,14 +514,24 @@ func TestAVersionLineThatNamesNoBuildIsNotNoRelease(t *testing.T) {
 		t.Errorf("why %q over the managed binary", o.str("why"))
 	}
 
-	for _, form := range []string{"v0.0.0-20260811035856-83de6dda9f5b+dirty", "0.0.0-SNAPSHOT-83de6dda", "(devel)"} {
+	for _, form := range []string{
+		"v0.0.0-20260811035856-83de6dda9f5b+dirty", "v0.0.0-20260811035856-83de6dda9f5b",
+		"v0.10.1-0.20260909120000-83de6dda9f5b", "v0.10.1-pre.0.20260909120000-83de6dda9f5b",
+		"v0.10.2-rc1.0.20260909120000-83de6dda9f5b+incompatible",
+		"0.0.0-SNAPSHOT-83de6dda", "v0.10.1-SNAPSHOT-83de6dda9f5b", "(devel)", "(unknown)",
+	} {
 		if !namesADevelopmentBuild(form) {
 			t.Errorf("%q is not read as a development build", form)
 		}
 	}
 
-	if namesADevelopmentBuild("go") || namesADevelopmentBuild("") {
-		t.Error("a token that names no build was read as one")
+	for _, form := range []string{
+		"go", "", "v0.0.0-", "0.0.0-", "v0.0.0-garbage", "v0.0.0-2026081103585-83de6dda9f5b",
+		"v0.0.0-20260811035856-83de6dda9f5", "v0.0.0-20260811035856-83de6dda9f5b extra", "0.0.0-SNAPSHOT-", "v0.10.1",
+	} {
+		if namesADevelopmentBuild(form) {
+			t.Errorf("%q was read as a development build", form)
+		}
 	}
 }
 
