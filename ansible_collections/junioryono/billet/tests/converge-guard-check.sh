@@ -192,6 +192,8 @@ case "${1:-}" in
   version) echo "billet ${BILLET_GATE_PRE_R_VERSION:-0.9.1} linux/amd64"; exit 0 ;;
 esac
 echo 'unknown command "converge-guard"' >&2
+hang=${BILLET_GATE_PRE_R_HANG:-}
+if [ "$hang" = all ] || [ "$hang" = "$cmd" ]; then sleep 3600; fi
 exit 2
 FAKE
 } >"$fakes/billet-pre-r"
@@ -1154,7 +1156,30 @@ e b6d-guard-appeared "BILLET_GATE_HOOK=prepare:1:$mnt/bin/billet-v0.10.0 converg
 ns_case b6d-guard-appeared escalated
 expect_refused b6d-guard-appeared "Refuse an unheld converge over a claim that appeared" "another converge holds this host"
 expect_state b6d-guard-appeared record_holder h2
-echo "ok   B6: a pre-R host runs the legacy protocol only while its binary still predates the guard and no claim appeared"
+# B6f. The diagnostic followed by a hang is not the pre-R observation: the
+# first call, the closing recheck and the dry run each refuse it as not having
+# answered, and the legacy protocol is never selected on it.
+plant b6f-diagnostic-then-hang
+p b6f-diagnostic-then-hang 'plant_root; plant_pre_r'
+a b6f-diagnostic-then-hang -e billet_guard_timeout=2
+e b6f-diagnostic-then-hang "BILLET_GATE_PRE_R_HANG=prepare"
+ns_case b6f-diagnostic-then-hang escalated
+expect_refused b6f-diagnostic-then-hang "Refuse a preparation that did not answer" "ended by the bound"
+expect_no_task b6f-diagnostic-then-hang "Record that a release before the guard runs the legacy protocol"
+plant b6g-recheck-hang
+p b6g-recheck-hang 'plant_root; plant_pre_r'
+a b6g-recheck-hang -e billet_guard_timeout=2
+e b6g-recheck-hang "BILLET_GATE_PRE_R_HANG=holder"
+ns_case b6g-recheck-hang escalated
+expect_refused b6g-recheck-hang "Refuse a converge whose managed binary moved" "did not answer within the bound"
+expect_fact b6g-recheck-hang route pre-r
+plant b7u-dry-run-hang
+p b7u-dry-run-hang 'plant_root; plant_pre_r'
+a b7u-dry-run-hang --check -e billet_guard_timeout=2
+e b7u-dry-run-hang "BILLET_GATE_PRE_R_HANG=prepare"
+HOLDER=""; ns_case b7u-dry-run-hang escalated; HOLDER=h1
+expect_refused b7u-dry-run-hang "Judge the dry run's answer" "with no answer"
+echo "ok   B6: a pre-R host runs the legacy protocol only while its binary still predates the guard and no claim appeared, and never on a diagnostic the bound ended"
 
 # B7. Check mode: `prepare --dry-run` before any shape dispatch, no holder,
 # every shape reported, nothing held or made, then the read-only staging.
@@ -1528,19 +1553,21 @@ expect_fact b12-repeated token_known False
 expect_final b12-repeated "no cleanup was attempted" "release --holder h1"
 expect_state b12-repeated record_preparing True
 expect_calls b12-repeated managed "converge-guard release" 0
-# A numeric token or id of 32 digits: refused as not a string before any fact is taken, so the rescue reads no number.
-for member in token id; do
-  plant "b12n-$member"
-  p "b12n-$member" 'plant_root; plant_managed v0.10.0'
-  "$python" - "$work/corpus/acquired.json" "$work/cases/b12n-$member/answer.json" "$member" <<'PY'
+# A numeric token or id of 32 digits, or one with a trailing newline: refused as not the member's shape before any fact is taken, so the rescue reads no number and the settlement is never handed a token the command refuses.
+for spec in token:number id:number token:newline id:newline; do
+  member=${spec%%:*}; kind=${spec#*:}
+  plant "b12n-$member-$kind"
+  p "b12n-$member-$kind" 'plant_root; plant_managed v0.10.0'
+  "$python" - "$work/corpus/acquired.json" "$work/cases/b12n-$member-$kind/answer.json" "$member" "$kind" <<'PY'
 import json, sys
 d = json.load(open(sys.argv[1]))
-d[sys.argv[3]] = 12345678901234567890123456789012
+d[sys.argv[3]] = 12345678901234567890123456789012 if sys.argv[4] == "number" else "0123456789abcdef0123456789abcdef\n"
 json.dump(d, open(sys.argv[2], "w"), indent=2)
 PY
+  member="$member-$kind"
   e "b12n-$member" "BILLET_GATE_ANSWER=prepare:1:$work/cases/b12n-$member/answer.json"
   ns_case "b12n-$member" escalated
-  expect_refused "b12n-$member" "Judge the preparation's answer" "$member"
+  expect_refused "b12n-$member" "Judge the preparation's answer" "${member%%-*}"
   expect_fact "b12n-$member" token_known False
   expect_final "b12n-$member" "no cleanup was attempted" "release --holder h1"
   expect_state "b12n-$member" record_preparing True

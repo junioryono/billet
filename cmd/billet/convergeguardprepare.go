@@ -1308,8 +1308,11 @@ func judgeStatusAnswer(rc int, stdout, stderr []byte, timedOut bool) string {
 	// ONE VALUE PER MEMBER, at every depth: Go's decoder keeps the last of a
 	// repeated member, so `"active": null, "active": "none"` would read as
 	// the healthy value its writer never meant.
-	if key := jsonRepeatedMember(stdout); key != "" {
-		return "envelope: the answer repeats " + key
+	switch key, repeated, err := jsonRepeatedMember(stdout); {
+	case err != nil:
+		return "envelope: the answer could not be walked member by member: " + err.Error()
+	case repeated:
+		return fmt.Sprintf("envelope: the answer repeats the member %q", key)
 	}
 
 	active, ok := jsonString(report["active"])
@@ -1405,10 +1408,12 @@ func judgeStatusAnswer(rc int, stdout, stderr []byte, timedOut bool) string {
 		"non-empty string unknown"
 }
 
-// jsonRepeatedMember names the first member repeated inside any object of a
-// document that decodes, or "" when none repeats; a document that does not
-// decode is the decoder's to refuse.
-func jsonRepeatedMember(body []byte) string {
+// jsonRepeatedMember names the first member repeated inside any object of the
+// document, walked as a token stream with numbers kept as text (a number the
+// walk could not hold, `1e1000`, is not a reason to stop looking); a walk
+// that fails is an error and never the clean answer, and a repeated empty
+// name is reported as repeated, not as none.
+func jsonRepeatedMember(body []byte) (string, bool, error) {
 	type frame struct {
 		object    bool
 		seen      map[string]bool
@@ -1416,13 +1421,18 @@ func jsonRepeatedMember(body []byte) string {
 	}
 
 	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
 
 	var stack []*frame
 
 	for {
 		tok, err := dec.Token()
-		if err != nil {
-			return ""
+
+		switch {
+		case errors.Is(err, io.EOF):
+			return "", false, nil
+		case err != nil:
+			return "", false, err
 		}
 
 		var top *frame
@@ -1454,11 +1464,11 @@ func jsonRepeatedMember(body []byte) string {
 		if top.expectKey {
 			key, ok := tok.(string)
 			if !ok {
-				return ""
+				return "", false, fmt.Errorf("a member name is %T, not a string", tok)
 			}
 
 			if top.seen[key] {
-				return key
+				return key, true, nil
 			}
 
 			top.seen[key] = true

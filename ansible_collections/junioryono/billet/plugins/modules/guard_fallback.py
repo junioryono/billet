@@ -105,6 +105,10 @@ RECORD_MEMBERS = ("holder", "claimed_at", "hostname", "release_executable", "rel
 # before the protocol carries none of them and reads as settled. The token is
 # judged as a string and never printed by this module.
 OPTIONAL_MEMBERS = {"id": "hex32", "token": "hex32", "preparing": "bool"}
+# MATCHED WHOLE (fullmatch): `$` also matches before a final newline, so a
+# digest or an id followed by one passed here and was refused by the command.
+# MATCHED WHOLE (fullmatch): `$` also matches before a final newline, so a
+# digest or an id followed by one passed here and was refused by the command.
 _HEX32 = re.compile(r"^[0-9a-f]{32}$")
 MAX_RECORD_BYTES = 4096
 RECOVERY_PREFIX = "recovery-"
@@ -286,7 +290,7 @@ def read_record(root, owner):
         if kind == "bool":
             if not isinstance(value, bool):
                 raise Refusal("content", "%s: %s is not a boolean" % (record, name))
-        elif not isinstance(value, str) or not _HEX32.match(value):
+        elif not isinstance(value, str) or not _HEX32.fullmatch(value):
             raise Refusal("content", "%s: %s is not 32 lowercase hex digits" % (record, name))
     for name in RECORD_MEMBERS:
         value = decoded[name]
@@ -296,7 +300,7 @@ def read_record(root, owner):
             raise Refusal("content", "%s: %s is not a string" % (record, name))
         if value == "":
             raise Refusal("content", "%s: %s is empty" % (record, name))
-    if not _SHA256.match(decoded["release_executable_sha256"]):
+    if not _SHA256.fullmatch(decoded["release_executable_sha256"]):
         raise Refusal("content", "%s: release_executable_sha256 is not 64 lowercase hex digits" % record)
     if not os.path.isabs(decoded["release_executable"]):
         raise Refusal("content", "%s: release_executable is not an absolute path" % record)

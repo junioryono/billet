@@ -22,7 +22,7 @@
     that:
       - billet_upgrade_claim_shape in ['legacy-file', 'guard-pointer']
       - >-
-        billet_upgrade_recovery_dir is match('^' ~ (billet_exclusion_root | regex_escape) ~ '/(recovery-[0-9]{8}T[0-9]{6}-[0-9a-f]{8}|[0-9]{8}T[0-9]{15})$')
+        billet_upgrade_recovery_dir is match('^' ~ (billet_exclusion_root | regex_escape) ~ '/(recovery-[0-9]{8}T[0-9]{6}-[0-9a-f]{8}|[0-9]{8}T[0-9]{15})\Z')
     fail_msg: >-
       {{ billet_exclusion_root }}/active does not name a role-created recovery
       directory. Refusing to use an untrusted path for ledger restoration.

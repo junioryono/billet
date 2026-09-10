@@ -300,7 +300,9 @@
       ansible.builtin.set_fact:
         billet_exclusion_managed_pre_r: >-
           {{ billet_exclusion_dry is not skipped
-             and (billet_exclusion_dry.rc | default(1)) != 0
+             and billet_exclusion_dry.rc is defined
+             and billet_exclusion_dry.rc not in [124, 137]
+             and billet_exclusion_dry.rc != 0
              and not ((billet_exclusion_dry.stdout | default('') | trim) is match('^\{'))
              and ((billet_exclusion_dry.stdout | default('')) ~ "\n" ~ (billet_exclusion_dry.stderr | default(''))) is search('unknown (converge-guard )?command') }}
       when: ansible_check_mode
@@ -347,7 +349,9 @@
       ansible.builtin.assert:
         that:
           - >-
-            not ((billet_exclusion_dry_recorded.rc | default(1)) != 0
+            not (billet_exclusion_dry_recorded.rc is defined
+                 and billet_exclusion_dry_recorded.rc not in [124, 137]
+                 and billet_exclusion_dry_recorded.rc != 0
                  and not ((billet_exclusion_dry_recorded.stdout | default('') | trim) is match('^\{'))
                  and ((billet_exclusion_dry_recorded.stdout | default('')) ~ "\n" ~ (billet_exclusion_dry_recorded.stderr | default(''))) is search('unknown (converge-guard )?command'))
         fail_msg: >-
@@ -788,12 +792,17 @@
         - name: Refuse a converge whose managed binary moved
           ansible.builtin.assert:
             that:
-              - (billet_exclusion_legacy_recheck.rc | default(1)) != 0
+              - billet_exclusion_legacy_recheck.rc is defined
+              - billet_exclusion_legacy_recheck.rc not in [124, 137]
+              - billet_exclusion_legacy_recheck.rc != 0
               - ((billet_exclusion_legacy_recheck.stdout | default('')) ~ "\n" ~ (billet_exclusion_legacy_recheck.stderr | default(''))) is search('unknown (converge-guard )?command')
             fail_msg: >-
               {{ billet_exclusion_binary }} predated the converge guard when this
-              converge began and now answers `converge-guard`: an updater moved the
-              managed binary under this converge. Nothing was held; converge again.
+              converge began and
+              {{ 'did not answer within the bound (exit ' ~ (billet_exclusion_legacy_recheck.rc | default('none')) ~ '), which proves nothing about what it is now'
+                 if (billet_exclusion_legacy_recheck.rc is not defined or billet_exclusion_legacy_recheck.rc in [124, 137])
+                 else 'now answers `converge-guard`: an updater moved the managed binary under this converge' }}.
+              Nothing was held; converge again.
           when: billet_exclusion_route == 'pre-r'
 
         - name: Inspect the managed binary and the claim again before an unheld converge

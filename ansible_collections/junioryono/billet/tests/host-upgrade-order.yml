@@ -1010,6 +1010,17 @@
           - (billet_host_answer_tasks | selectattr('name', 'equalto', "Read the preparation's answer") | first).no_log == true
           - "'token' not in billet_answer_report['ansible.builtin.debug'].msg"
           - "'unknown (converge-guard )?command' in billet_host_answer_text"
+          # A RUN THE BOUND ENDED IS NEVER THE PRE-R OBSERVATION: every match of the diagnostic first requires an exit that is defined and not the bound's.
+          - "'billet_exclusion_raw.rc not in [124, 137]' in ((billet_host_answer_tasks | selectattr('name', 'equalto', 'Note whether the executable answered \"unknown command\"') | first)['ansible.builtin.set_fact'].billet_exclusion_unknown_command | string)"
+          - "'billet_exclusion_dry.rc not in [124, 137]' in ((billet_prepare_block | selectattr('name', 'equalto', 'Note whether the managed binary predates the guard in a dry run') | first)['ansible.builtin.set_fact'].billet_exclusion_managed_pre_r | string)"
+          - "'billet_exclusion_dry_recorded.rc not in [124, 137]' in (billet_prepare_dry_recorded_floor['ansible.builtin.assert'].that | join(' '))"
+          - "'billet_exclusion_legacy_recheck.rc not in [124, 137]' in ((billet_protocol_block | selectattr('name', 'equalto', 'Refuse a converge whose managed binary moved') | first)['ansible.builtin.assert'].that | join(' '))"
+          # EVERY ID, TOKEN AND DIGEST PATTERN ENDS AT THE END OF THE TEXT, never before a final newline.
+          - "billet_answer_judge.vars.billet_exclusion_hex32 == '^[0-9a-f]{32}\\Z'"
+          - "billet_answer_judge.vars.billet_exclusion_sha == '^[0-9a-f]{64}\\Z'"
+          - "billet_answer_judge.vars.billet_exclusion_pointer_tail is search('\\\\Z$')"
+          - "'_HEX32.fullmatch(' in billet_fallback_module_text and '_SHA256.fullmatch(' in billet_fallback_module_text"
+          - "'_HEX32.match(' not in billet_fallback_module_text and '_SHA256.match(' not in billet_fallback_module_text"
         fail_msg: >-
           guard-answer.yml must refuse an answer that did not arrive, judge every
           member of one by name, refuse a refusal in the command's words, take the
