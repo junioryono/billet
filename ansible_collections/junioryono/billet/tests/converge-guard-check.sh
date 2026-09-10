@@ -1479,7 +1479,21 @@ expect_fact s7 resolved v0.10.0
 plant s7-moving
 run_case s7-moving escalated -- -e billet_gate_facts=true -e billet_release_channel=moving -e billet_release_channel_base="$origin_url" -e billet_release_url_base="$origin_url" -e billet_release_stage="$work/cases/s7-moving/stage" -e billet_fetch_retries=1
 expect_refused s7-moving "Refuse an unpinned billet version" "not latest"
-echo "ok   S7: a channel resolves into the private variable and the public pin is never assigned"
+# THE SAME UNDER --check: the channel is read, the release reported, nothing
+# staged or held; a moving channel is refused by name.
+plant s7-check
+HOLDER=""; run_case s7-check escalated -- --check -e billet_gate_facts=true -e billet_release_channel=stable -e billet_release_channel_base="$origin_url" -e billet_release_url_base="$origin_url" -e billet_release_stage="$work/cases/s7-check/stage" -e billet_fetch_retries=1; HOLDER=h1
+expect_allowed s7-check
+expect_fact s7-check resolved v0.10.0
+grep -q "The stable channel names v0.10.0" "$work/cases/s7-check/out" || fail "s7-check: the dry run did not report the release the channel names" "$work/cases/s7-check/out"
+[ ! -e "$work/cases/s7-check/stage" ] || fail "s7-check: a dry run staged something"
+[ -z "$(root_ls s7-check)" ] || fail "s7-check: a dry run allocated under the root: $(root_ls s7-check)"
+expect_calls s7-check managed "converge-guard hold" 0
+expect_calls s7-check candidate "converge-guard hold" 0
+plant s7-moving-check
+HOLDER=""; run_case s7-moving-check escalated -- --check -e billet_gate_facts=true -e billet_release_channel=moving -e billet_release_channel_base="$origin_url" -e billet_release_url_base="$origin_url" -e billet_release_stage="$work/cases/s7-moving-check/stage" -e billet_fetch_retries=1; HOLDER=h1
+expect_refused s7-moving-check "Refuse an unpinned billet version" "not latest"
+echo "ok   S7: a channel resolves into the private variable and the public pin is never assigned, in a dry run too"
 
 # S8. A controller-side source: the version and the status are asked of the staged copy.
 plant s8

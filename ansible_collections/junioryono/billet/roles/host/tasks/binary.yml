@@ -46,6 +46,11 @@
       delay: "{{ billet_fetch_retry_delay }}"
       delegate_to: localhost
       become: false
+      # A DRY RUN READS THE CHANNEL: the GET changes nothing, and a module
+      # skipped in check mode would leave the next task reading a statement
+      # that was never fetched, so a dry run of a channel could neither report
+      # the release it would install nor refuse a moving one.
+      check_mode: false
 
     # INTO THE PRIVATE RESOLVED VARIABLE, never the public pin: an input a task
     # assigns is one a frozen inventory cannot stand for, and everything below

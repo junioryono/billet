@@ -18,6 +18,7 @@
     billet_host_prepare_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/prepare-exclusion.yml') | from_yaml }}"
     billet_host_prepare_text: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/prepare-exclusion.yml') }}"
     billet_host_stage_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/stage-candidate.yml') | from_yaml }}"
+    billet_host_binary_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/binary.yml') | from_yaml }}"
     billet_host_allocate_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/allocate-recovery.yml') | from_yaml }}"
     billet_host_fallback_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/guard-fallback.yml') | from_yaml }}"
     billet_host_fallback_text: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/guard-fallback.yml') }}"
@@ -781,8 +782,15 @@
           - (billet_prepare_block | selectattr('name', 'equalto', "Establish the upgrade root's parent") | first)['ansible.builtin.file'].follow == false
           - billet_prepare_root_make['ansible.builtin.file'].follow == false
           - billet_prepare_block_names | last == 'Refuse a converge whose exclusion was never established'
-          - "'billet_exclusion_held' in ((billet_prepare_block | selectattr('name', 'equalto', 'Refuse a converge whose exclusion was never established') | first)['ansible.builtin.assert'].that | join(' '))"
-          - "'ansible_check_mode' in ((billet_prepare_block | selectattr('name', 'equalto', 'Refuse a converge whose exclusion was never established') | first)['ansible.builtin.assert'].that | join(' '))"
+          # THE CLOSING PREDICATE WHOLE, whitespace folded: a weaker branch
+          # that still names the held flag and check mode is not this one.
+          - >-
+            ((billet_prepare_block | selectattr('name', 'equalto', 'Refuse a converge whose exclusion was never established') | first)['ansible.builtin.assert'].that
+             | join(' ') | regex_replace('\\s+', ' ') | trim)
+            == "ansible_check_mode or (billet_exclusion_held | default(false) | bool) or (billet_upgrade_claim_shape | default('none') in ['legacy-file', 'legacy']) or (not (billet_exclusion_binary_present | bool) and not (billet_binary_upgrade | default(false) | bool) and billet_upgrade_claim_shape | default('none') == 'none')"
+          # THE CHANNEL'S GET RUNS IN A DRY RUN, or the task after it reads a
+          # statement that was never fetched.
+          - ((billet_host_binary_tasks | selectattr('name', 'equalto', 'Resolve the release channel') | first).block | selectattr('name', 'equalto', 'Read the signed channel statement') | first).check_mode == false
           - (billet_prepare_block | selectattr('name', 'equalto', 'Judge the ancestors of the upgrade root') | first)['junioryono.billet.guard_fallback'].judge == 'ancestors'
           # THE LEGACY PROTOCOL only when no capable executable exists.
           - "'billet_exclusion_managed_pre_r' in ((billet_prepare_block | selectattr('name', 'equalto', 'Record that a release before the guard runs the legacy protocol') | first).when | string)"
