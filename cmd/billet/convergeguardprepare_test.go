@@ -108,9 +108,27 @@ func mustRefusal(t *testing.T, o prepareOut, reason string) {
 	}
 }
 
+// capableAnswer is the shell that answers `converge-guard prepare --dry-run
+// --json` the way a capable release does on this fixture's host: the dry-run
+// report naming the guard the host holds, its id read from the record at the
+// time of the call (the record beside the recovery directory the candidate
+// was staged in, found from the candidate's own path so the script's bytes
+// carry no fixture path and the committed fixtures' digests stay the same
+// from run to run), so a fake written before the acquisition still names the
+// guard the probe is judged against.
+func capableAnswer() string {
+	return `id=$(sed -n 's/.*"id": *"\([0-9a-f]*\)".*/\1/p' "$(dirname "$(dirname "$0")")/active/` + guardRecordName +
+		`" 2>/dev/null | head -1); ` +
+		`printf '{"outcome": "reported", "shape": "converge-guard", "guard": {"id": "%s", "holder": "ci-1", ` +
+		`"claimed_at": "2026-09-09T12:00:00Z", "hostname": "billet-control-01", "preparing": true, ` +
+		`"record": {"release_executable": "/usr/bin/billet", "release_executable_sha256": "` + strings.Repeat("ab", 32) +
+		`", "verified": true}, "pointer": false, "stray_temporary": false}, ` +
+		`"managed": {"path": "/usr/bin/billet", "present": true}}\n' "$id"`
+}
+
 // candidateScript writes a candidate answering `version` and `converge-guard
-// status --json` the way a capable release does (the status from the
-// committed corpus's `none` shape), or as a pre-R release, or one that hangs.
+// prepare --dry-run --json` the way a capable release does (the dry-run
+// report naming the fixture's guard), or as a pre-R release, or one that hangs.
 func guardCandidateScript(t *testing.T, f *guardFixture, dir, version, mode string) string {
 	t.Helper()
 
@@ -119,7 +137,7 @@ func guardCandidateScript(t *testing.T, f *guardFixture, dir, version, mode stri
 	switch mode {
 	case "capable":
 		body = "#!/bin/sh\ncase \"$1\" in\n  version) echo \"billet " + version + " linux/amd64\";;\n" +
-			"  converge-guard) printf '{\"active\": \"none\"}\\n';;\nesac\nexit 0\n"
+			"  converge-guard) " + capableAnswer() + ";;\nesac\nexit 0\n"
 	case "pre-r":
 		body = "#!/bin/sh\ncase \"$1\" in\n  version) echo \"billet " + version + " linux/amd64\"; exit 0;;\nesac\n" +
 			"echo 'unknown command \"converge-guard\"' >&2\nexit 2\n"
@@ -1326,42 +1344,51 @@ func TestPrepareDryRunReportsEveryShape(t *testing.T) {
 	})
 }
 
-// A7: THE JUDGE, over the corpus the Python module carried.
-func TestTheStatusJudgeRefusesEachCorruptionByName(t *testing.T) {
-	healthy := map[string]any{
-		"active": "converge-guard",
-		"guard": map[string]any{
-			"holder": "ci-1", "claimed_at": "2026-09-09T12:00:00Z", "hostname": "billet-control-01",
-			"recovery_pointer": false, "release_executable": "/usr/bin/billet",
-			"release_executable_sha256": strings.Repeat("ab", 32), "release_executable_verified": true,
-		},
+// A7: THE JUDGE, over the command's own dry-run report (the committed
+// fixture, so a corruption is a corruption of a shape the command produces),
+// each corruption refused by name, and a report of another guard refused.
+func TestTheDryRunJudgeRefusesEachCorruptionByName(t *testing.T) {
+	fixture, err := os.ReadFile(filepath.Join("..", "..", "ansible_collections", "junioryono", "billet", "tests",
+		"fixtures", "guard-prepare", "dry-run-guard.json"))
+	mustOK(t, err)
+
+	var healthy map[string]any
+	mustOK(t, json.Unmarshal(fixture, &healthy))
+
+	heldID, ok := asMap(healthy["guard"])["id"].(string)
+	if !ok || !guardHex32.MatchString(heldID) {
+		t.Fatalf("the fixture's guard id %q", heldID)
 	}
 
-	corrupt := func(path []string, value any, del bool) []byte {
+	type change struct {
+		path  []string
+		value any
+		del   bool
+	}
+
+	corrupt := func(changes ...change) []byte {
 		body, err := json.Marshal(healthy)
 		mustOK(t, err)
 
 		var doc map[string]any
 		mustOK(t, json.Unmarshal(body, &doc))
 
-		if len(path) == 0 {
-			return body
-		}
+		for _, c := range changes {
+			cur := doc
+			for _, p := range c.path[:len(c.path)-1] {
+				next, ok := cur[p].(map[string]any)
+				if !ok {
+					t.Fatalf("the healthy answer has no object at %s", p)
+				}
 
-		cur := doc
-		for _, p := range path[:len(path)-1] {
-			next, ok := cur[p].(map[string]any)
-			if !ok {
-				t.Fatalf("the healthy answer has no object at %s", p)
+				cur = next
 			}
 
-			cur = next
-		}
-
-		if del {
-			delete(cur, path[len(path)-1])
-		} else {
-			cur[path[len(path)-1]] = value
+			if c.del {
+				delete(cur, c.path[len(c.path)-1])
+			} else {
+				cur[c.path[len(c.path)-1]] = c.value
+			}
 		}
 
 		body, err = json.Marshal(doc)
@@ -1370,6 +1397,9 @@ func TestTheStatusJudgeRefusesEachCorruptionByName(t *testing.T) {
 		return body
 	}
 
+	set := func(value any, path ...string) change { return change{path: path, value: value} }
+	del := func(path ...string) change { return change{path: path, del: true} }
+
 	for _, c := range []struct {
 		name  string
 		body  []byte
@@ -1377,56 +1407,78 @@ func TestTheStatusJudgeRefusesEachCorruptionByName(t *testing.T) {
 	}{
 		{"not JSON", []byte("nope"), "not JSON"},
 		{"a list", []byte("[]"), "not JSON"},
-		{"bytes after the object", []byte(`{"active": "none"} garbage`), "bytes after its object"},
-		{"active repeated, valid last", []byte(`{"active": null, "active": "none"}`), `repeats the member "active"`},
-		{"active repeated, valid first", []byte(`{"active": "none", "active": null}`), `repeats the member "active"`},
-		{"a nested member repeated", []byte(`{"active": "converge-guard", "guard": {"record_error": "x", "record_error": "y"}}`), `repeats the member "record_error"`},
-		{"a member repeated inside a list", []byte(`{"active": "none", "why": [{"a": 1, "a": 2}]}`), `repeats the member "a"`},
-		{"a repeat behind a number the walk cannot hold", []byte(`{"padding": 1e1000, "active": null, "active": "none"}`), `repeats the member "active"`},
-		{"an empty member repeated", []byte(`{"": 0, "": 1, "active": "none"}`), `repeats the member ""`},
-		{"two objects", []byte(`{"active": "none"}{}`), "bytes after its object"},
-		{"active null", corrupt([]string{"active"}, nil, false), "active is missing or not a string"},
-		{"why null under unknown", []byte(`{"active": "unknown", "why": null}`), "why is not a string"},
-		{"guard null", corrupt([]string{"guard"}, nil, false), "guard: missing or not an object"},
-		{"record_error null", corrupt([]string{"guard", "record_error"}, nil, false), "record_error is not a non-empty string"},
-		{"holder null", corrupt([]string{"guard", "holder"}, nil, false), "holder is missing or not a string"},
-		{"claimed_at null", corrupt([]string{"guard", "claimed_at"}, nil, false), "claimed_at is not an RFC 3339 time"},
-		{"hostname null", corrupt([]string{"guard", "hostname"}, nil, false), "hostname is missing or not a string"},
-		{"recovery_pointer null", corrupt([]string{"guard", "recovery_pointer"}, nil, false), "recovery_pointer is missing or not a boolean"},
-		{"release_executable null", corrupt([]string{"guard", "release_executable"}, nil, false), "not an absolute path"},
-		{"sha256 null", corrupt([]string{"guard", "release_executable_sha256"}, nil, false), "not 64 lowercase hex"},
-		{"verified null", corrupt([]string{"guard", "release_executable_verified"}, nil, false), "neither true, false nor an object"},
-		{"verified unknown null", corrupt([]string{"guard", "release_executable_verified"}, map[string]any{"unknown": nil}, false), "neither true, false nor an object"},
-		{"no active", corrupt([]string{"active"}, nil, true), "active is missing"},
-		{"active a number", corrupt([]string{"active"}, 1, false), "active is missing or not a string"},
-		{"active an unfamiliar word", corrupt([]string{"active"}, "held", false), "not a word this command knows"},
-		{"unknown without why", []byte(`{"active": "unknown"}`), "why is missing"},
-		{"unknown with why a number", []byte(`{"active": "unknown", "why": 1}`), "why is not a string"},
-		{"unknown with why empty", []byte(`{"active": "unknown", "why": ""}`), "why is missing or empty"},
-		{"converge-guard without guard", corrupt([]string{"guard"}, nil, true), "guard: missing"},
-		{"guard a string", corrupt([]string{"guard"}, "x", false), "guard: missing or not an object"},
-		{"record_error a number", corrupt([]string{"guard", "record_error"}, 1, false), "record_error is not a non-empty string"},
-		{"holder missing", corrupt([]string{"guard", "holder"}, nil, true), "holder is missing"},
-		{"holder a number", corrupt([]string{"guard", "holder"}, 1, false), "holder is missing or not a string"},
-		{"holder empty", corrupt([]string{"guard", "holder"}, "", false), "is not a name"},
-		{"holder with a space", corrupt([]string{"guard", "holder"}, "ci 1", false), "is not a name"},
-		{"holder with a slash", corrupt([]string{"guard", "holder"}, "ci/1", false), "is not a name"},
-		{"holder of 300 bytes", corrupt([]string{"guard", "holder"}, strings.Repeat("c", 300), false), "is not a name"},
-		{"claimed_at not RFC 3339", corrupt([]string{"guard", "claimed_at"}, "yesterday", false), "claimed_at is not an RFC 3339 time"},
-		{"hostname a number", corrupt([]string{"guard", "hostname"}, 7, false), "hostname is missing or not a string"},
-		{"recovery_pointer missing", corrupt([]string{"guard", "recovery_pointer"}, nil, true), "recovery_pointer is missing"},
-		{"recovery_pointer a string", corrupt([]string{"guard", "recovery_pointer"}, "false", false), "recovery_pointer is missing or not a boolean"},
-		{"release_executable relative", corrupt([]string{"guard", "release_executable"}, "billet", false), "not an absolute path"},
-		{"sha256 of 63 hex", corrupt([]string{"guard", "release_executable_sha256"}, strings.Repeat("a", 63), false), "not 64 lowercase hex"},
-		{"sha256 uppercase", corrupt([]string{"guard", "release_executable_sha256"}, strings.Repeat("A", 64), false), "not 64 lowercase hex"},
-		{"verified missing", corrupt([]string{"guard", "release_executable_verified"}, nil, true), "release_executable_verified is missing"},
-		{"verified the string unknown", corrupt([]string{"guard", "release_executable_verified"}, "unknown", false), "neither true, false nor an object"},
-		{"verified an empty object", corrupt([]string{"guard", "release_executable_verified"}, map[string]any{}, false), "neither true, false nor an object"},
-		{"verified unknown a number", corrupt([]string{"guard", "release_executable_verified"}, map[string]any{"unknown": 1}, false), "neither true, false nor an object"},
-		{"verified unknown with more", corrupt([]string{"guard", "release_executable_verified"}, map[string]any{"unknown": "x", "more": 1}, false), "neither true, false nor an object"},
+		{"bytes after the object", append(corrupt(), []byte(" garbage")...), "bytes after its object"},
+		{"two objects", append(corrupt(), []byte("{}")...), "bytes after its object"},
+		{"outcome repeated, valid last", []byte(`{"outcome": null, "outcome": "reported"}`), `repeats the member "outcome"`},
+		{"outcome repeated, valid first", []byte(`{"outcome": "reported", "outcome": null}`), `repeats the member "outcome"`},
+		{"a nested member repeated", []byte(`{"outcome": "reported", "guard": {"id": "x", "id": "y"}}`), `repeats the member "id"`},
+		{"a member repeated inside a list", []byte(`{"outcome": "reported", "why": [{"a": 1, "a": 2}]}`), `repeats the member "a"`},
+		{"a repeat behind a number the walk cannot hold", []byte(`{"padding": 1e1000, "outcome": null, "outcome": "reported"}`), `repeats the member "outcome"`},
+		{"an empty member repeated", []byte(`{"": 0, "": 1, "outcome": "reported"}`), `repeats the member ""`},
+		{"a status answer", []byte(`{"active": "none"}`), "outcome is missing"},
+		{"outcome null", corrupt(set(nil, "outcome")), "outcome is missing or not a string"},
+		{"outcome refused", corrupt(set("refused", "outcome"), set("x", "why")), `outcome is "refused", not "reported": x`},
+		{"outcome unknown", corrupt(set("unknown", "outcome"), set("x", "why")), `outcome is "unknown", not "reported": x`},
+		{"why a number", corrupt(set(1, "why")), "why is not a string"},
+		{"shape missing", corrupt(del("shape")), "shape is missing"},
+		{"shape a number", corrupt(set(1, "shape")), "shape is missing or not a string"},
+		{"shape an unfamiliar word", corrupt(set("held", "shape")), "not a word this command knows"},
+		{"shape unknown without why", corrupt(set("unknown", "shape"), set(nil, "guard")), "why is missing or empty under shape unknown"},
+		{"shape none", corrupt(set("none", "shape"), set(nil, "guard")), `reports the claim as "none" where this command holds a guard`},
+		{"shape none with a guard object", corrupt(set("none", "shape")), `reports the claim as "none" where this command holds a guard`},
+		{"shape host-upgrade", corrupt(set("host-upgrade", "shape"), set(nil, "guard")), `reports the claim as "host-upgrade"`},
+		{"managed missing", corrupt(del("managed")), "managed: missing or not an object"},
+		{"managed null", corrupt(set(nil, "managed")), "managed: missing or not an object"},
+		{"managed path relative", corrupt(set("billet", "managed", "path")), "managed: path is not an absolute path"},
+		{"managed path missing", corrupt(del("managed", "path")), "managed: path is not an absolute path"},
+		{"managed present a word", corrupt(set("yes", "managed", "present")), `managed: present is neither true, false nor "unknown"`},
+		{"managed present null", corrupt(set(nil, "managed", "present")), `managed: present is neither true, false nor "unknown"`},
+		{"managed present unknown without why", corrupt(set("unknown", "managed", "present")), "managed: why is missing or empty under present unknown"},
+		{"managed version a number", corrupt(set(1, "managed", "version")), "managed: version is not a string"},
+		{"managed sha256 of 63 hex", corrupt(set(strings.Repeat("a", 63), "managed", "sha256")), "managed: sha256 is not 64 lowercase hex"},
+		{"guard missing", corrupt(del("guard")), "guard: missing or not an object"},
+		{"guard null", corrupt(set(nil, "guard")), "guard: missing or not an object"},
+		{"guard a string", corrupt(set("x", "guard")), "guard: missing or not an object"},
+		{"record_error", corrupt(set("not JSON", "guard", "record_error")), "could not read the record it would be asked to settle or release: not JSON"},
+		{"record_error null", corrupt(set(nil, "guard", "record_error")), "record_error is not a non-empty string"},
+		{"record_error empty", corrupt(set("", "guard", "record_error")), "record_error is not a non-empty string"},
+		{"holder missing", corrupt(del("guard", "holder")), "holder is missing"},
+		{"holder null", corrupt(set(nil, "guard", "holder")), "holder is missing or not a string"},
+		{"holder a number", corrupt(set(1, "guard", "holder")), "holder is missing or not a string"},
+		{"holder empty", corrupt(set("", "guard", "holder")), "is not a name"},
+		{"holder with a space", corrupt(set("ci 1", "guard", "holder")), "is not a name"},
+		{"holder with a slash", corrupt(set("ci/1", "guard", "holder")), "is not a name"},
+		{"holder of 300 bytes", corrupt(set(strings.Repeat("c", 300), "guard", "holder")), "is not a name"},
+		{"claimed_at null", corrupt(set(nil, "guard", "claimed_at")), "claimed_at is not an RFC 3339 time"},
+		{"claimed_at not RFC 3339", corrupt(set("yesterday", "guard", "claimed_at")), "claimed_at is not an RFC 3339 time"},
+		{"hostname null", corrupt(set(nil, "guard", "hostname")), "hostname is missing or not a string"},
+		{"hostname a number", corrupt(set(7, "guard", "hostname")), "hostname is missing or not a string"},
+		{"preparing missing", corrupt(del("guard", "preparing")), "preparing is missing or not a boolean"},
+		{"preparing a string", corrupt(set("true", "guard", "preparing")), "preparing is missing or not a boolean"},
+		{"id missing", corrupt(del("guard", "id")), "id is missing or not a 32-hex id"},
+		{"id null", corrupt(set(nil, "guard", "id")), "id is missing or not a 32-hex id"},
+		{"id of 31 hex", corrupt(set(strings.Repeat("a", 31), "guard", "id")), "id is missing or not a 32-hex id"},
+		{"id uppercase", corrupt(set(strings.Repeat("A", 32), "guard", "id")), "id is missing or not a 32-hex id"},
+		{"another guard's id", corrupt(set(strings.Repeat("f", 32), "guard", "id")), "reports the guard " + strings.Repeat("f", 32) + ", not the one this command holds (" + heldID + ")"},
+		{"record missing", corrupt(del("guard", "record")), "record: missing or not an object"},
+		{"record null", corrupt(set(nil, "guard", "record")), "record: missing or not an object"},
+		{"release_executable relative", corrupt(set("billet", "guard", "record", "release_executable")), "record: release_executable is not an absolute path"},
+		{"release_executable null", corrupt(set(nil, "guard", "record", "release_executable")), "record: release_executable is not an absolute path"},
+		{"sha256 of 63 hex", corrupt(set(strings.Repeat("a", 63), "guard", "record", "release_executable_sha256")), "record: release_executable_sha256 is not 64 lowercase hex"},
+		{"sha256 uppercase", corrupt(set(strings.Repeat("A", 64), "guard", "record", "release_executable_sha256")), "record: release_executable_sha256 is not 64 lowercase hex"},
+		{"verified missing", corrupt(del("guard", "record", "verified")), `verified is neither true, false nor "unknown"`},
+		{"verified null", corrupt(set(nil, "guard", "record", "verified")), `verified is neither true, false nor "unknown"`},
+		{"verified a word", corrupt(set("maybe", "guard", "record", "verified")), `verified is neither true, false nor "unknown"`},
+		{"verified an object", corrupt(set(map[string]any{"unknown": "x"}, "guard", "record", "verified")), `verified is neither true, false nor "unknown"`},
+		{"pointer missing", corrupt(del("guard", "pointer")), "pointer is missing or not a boolean"},
+		{"pointer a string", corrupt(set("false", "guard", "pointer")), "pointer is missing or not a boolean"},
+		{"pointer_target a number", corrupt(set(1, "guard", "pointer_target")), "pointer_target is not a string"},
+		{"pointer_problem null", corrupt(set(nil, "guard", "pointer_problem")), "pointer_problem is not a string"},
+		{"stray_temporary missing", corrupt(del("guard", "stray_temporary")), "stray_temporary is missing or not a boolean"},
+		{"stray_temporary null", corrupt(set(nil, "guard", "stray_temporary")), "stray_temporary is missing or not a boolean"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			problem := judgeStatusAnswer(0, c.body, nil, false)
+			problem := judgeDryRunAnswer(0, c.body, nil, false, heldID)
 			if !strings.Contains(problem, c.words) {
 				t.Errorf("problem %q, want %q", problem, c.words)
 			}
@@ -1437,27 +1489,31 @@ func TestTheStatusJudgeRefusesEachCorruptionByName(t *testing.T) {
 		name string
 		body []byte
 	}{
-		{"healthy", corrupt(nil, nil, false)},
-		{"healthy with a trailing newline", append(corrupt(nil, nil, false), '\n')},
-		{"the same name in two objects", []byte(`{"active": "unknown", "why": "x", "guard": {"why": "y"}}`)},
-		{"a record error", []byte(`{"active": "converge-guard", "guard": {"record_error": "not JSON"}}`)},
-		{"none", []byte(`{"active": "none"}`)},
-		{"unknown with why", []byte(`{"active": "unknown", "why": "x"}`)},
-		{"verified false", corrupt([]string{"guard", "release_executable_verified"}, false, false)},
-		{"verified unknown", corrupt([]string{"guard", "release_executable_verified"}, map[string]any{"unknown": "x"}, false)},
+		{"healthy", corrupt()},
+		{"healthy with a trailing newline", append(corrupt(), '\n')},
+		{"a why beside a report", corrupt(set("x", "why"))},
+		{"verified false", corrupt(set(false, "guard", "record", "verified"))},
+		{"verified unknown", corrupt(set("unknown", "guard", "record", "verified"))},
+		{"a pointer with its target", corrupt(set(true, "guard", "pointer"), set("/x", "guard", "pointer_target"))},
+		{"a pointer with its problem", corrupt(set(true, "guard", "pointer"), set("x", "guard", "pointer_problem"))},
+		{"a stray temporary", corrupt(set(true, "guard", "stray_temporary"))},
+		{"preparing false", corrupt(set(false, "guard", "preparing"))},
+		{"managed absent", corrupt(set(false, "managed", "present"), del("managed", "sha256"), del("managed", "version"))},
+		{"managed unknown with why", corrupt(set("unknown", "managed", "present"), set("x", "managed", "why"))},
+		{"managed with a version problem", corrupt(del("managed", "version"), set("x", "managed", "version_problem"))},
 	} {
 		t.Run(c.name+" admitted", func(t *testing.T) {
-			if problem := judgeStatusAnswer(0, c.body, nil, false); problem != "" {
+			if problem := judgeDryRunAnswer(0, c.body, nil, false, heldID); problem != "" {
 				t.Errorf("refused: %s", problem)
 			}
 		})
 	}
 
-	if problem := judgeStatusAnswer(0, nil, nil, true); !strings.Contains(problem, "within the bound") {
+	if problem := judgeDryRunAnswer(0, nil, nil, true, heldID); !strings.Contains(problem, "within the bound") {
 		t.Errorf("a timeout: %q", problem)
 	}
 
-	if problem := judgeStatusAnswer(1, nil, []byte("boom"), false); !strings.Contains(problem, "exited 1: boom") {
+	if problem := judgeDryRunAnswer(1, nil, []byte("boom"), false, heldID); !strings.Contains(problem, "exited 1: boom") {
 		t.Errorf("a failure: %q", problem)
 	}
 }

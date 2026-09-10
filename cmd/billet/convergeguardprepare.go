@@ -144,7 +144,8 @@ type prepareExecutable struct {
 	// VersionProblem is why `version` could not be read; a development build
 	// that reports no release has an empty Version and no problem.
 	VersionProblem string `json:"version_problem,omitempty"`
-	// Capable is set on a candidate: whether it answers the guard's commands.
+	// Capable is set on a candidate: whether its `prepare --dry-run` reports
+	// the guard this command holds.
 	Capable *bool `json:"capable,omitempty"`
 }
 
@@ -601,9 +602,9 @@ func judgeCandidate(ctx context.Context, root *txLock, dir *os.File, base *prepa
 	cand := &prepareExecutable{Path: cleaned, Present: true, SHA256: sum}
 	base.Candidate = cand
 
-	// CAPABILITY: the candidate executed under a bound and its answer judged
-	// as the status protocol's schema.
-	capable, problem := candidateCapable(ctx, cleaned)
+	// CAPABILITY: the candidate's own preparation protocol, executed under a
+	// bound and its answer judged as the dry-run report naming this guard.
+	capable, problem := candidateCapable(ctx, cleaned, shape.Guard.ID)
 	cand.Capable = &capable
 
 	if !capable {
@@ -1017,10 +1018,15 @@ var (
 	snapshotVersionForm = regexp.MustCompile(`^v\d+\.\d+\.\d+-SNAPSHOT-[0-9a-f]{7,40}$`)
 )
 
-// candidateCapable executes the candidate's `converge-guard status --json`
-// under the bound and judges the answer as the status protocol's schema.
-func candidateCapable(ctx context.Context, binary string) (bool, string) {
-	stdout, stderr, rc, err := runBounded(ctx, binary, "converge-guard", "status", "--json")
+// candidateCapable executes the candidate's `converge-guard prepare --dry-run
+// --json` under the bound and judges the answer as the dry-run report's
+// schema, naming the guard this command holds. THE PROBE IS THE PREPARATION
+// PROTOCOL ITSELF, because that is what every later converge and a recovery
+// through the recorded candidate ask of it: a build that answers `status` and
+// not `prepare` would pass a status probe, be installed, and then answer
+// "unknown command" to every converge that followed.
+func candidateCapable(ctx context.Context, binary, heldID string) (bool, string) {
+	stdout, stderr, rc, err := runBounded(ctx, binary, "converge-guard", "prepare", "--dry-run", "--json")
 
 	var timedOut bool
 
@@ -1029,22 +1035,22 @@ func candidateCapable(ctx context.Context, binary string) (bool, string) {
 		case errors.Is(err, context.DeadlineExceeded):
 			timedOut = true
 		case errors.Is(err, errOutputOverflow):
-			return false, "the candidate's status answer is not one object: " + err.Error()
+			return false, "the candidate's dry-run answer is not one object: " + err.Error()
 		case rc < 0:
 			return false, "the candidate could not be run: " + err.Error()
 		case rc == 0:
 			// EXIT 0 BESIDE AN ERROR is an answer not read whole: a descendant
 			// kept the output open past the wait, or the pipe failed, and
 			// what was kept is what arrived before that, not the answer.
-			return false, "the candidate's status answer was not read whole: " + err.Error()
+			return false, "the candidate's dry-run answer was not read whole: " + err.Error()
 		}
 	}
 
 	if !timedOut && rc != 0 && unknownCommandPattern.Match(append(append([]byte{}, stdout...), stderr...)) {
-		return false, "the candidate answered \"unknown command\" to converge-guard"
+		return false, "the candidate answered \"unknown command\" to converge-guard prepare"
 	}
 
-	if problem := judgeStatusAnswer(rc, stdout, stderr, timedOut); problem != "" {
+	if problem := judgeDryRunAnswer(rc, stdout, stderr, timedOut, heldID); problem != "" {
 		return false, problem
 	}
 
@@ -1343,13 +1349,12 @@ func prepareDryRun(ctx context.Context) error {
 	return answerJSON(report, 0, "")
 }
 
-// judgeStatusAnswer judges a `converge-guard status --json` answer as the
-// status protocol's schema, in the three stages the Python module read it:
-// the envelope, a record the command could not read, the healthy record's
-// members. It answers the problem, or "" for an admitted answer.
-func judgeStatusAnswer(rc int, stdout, stderr []byte, timedOut bool) string {
+// judgeAnswerEnvelope reads one answer of the guard's protocol as far as its
+// object: within the bound, exit 0, one JSON object, nothing after it, one
+// value per member at every depth. It answers the members, or the problem.
+func judgeAnswerEnvelope(rc int, stdout, stderr []byte, timedOut bool) (map[string]json.RawMessage, string) {
 	if timedOut {
-		return "envelope: the executable did not answer within the bound"
+		return nil, "envelope: the executable did not answer within the bound"
 	}
 
 	if rc != 0 {
@@ -1362,45 +1367,55 @@ func judgeStatusAnswer(rc int, stdout, stderr []byte, timedOut bool) string {
 			text = text[len(text)-500:]
 		}
 
-		return fmt.Sprintf("envelope: the executable exited %d: %s", rc, text)
+		return nil, fmt.Sprintf("envelope: the executable exited %d: %s", rc, text)
 	}
 
 	var report map[string]json.RawMessage
 
 	dec := json.NewDecoder(bytes.NewReader(stdout))
 	if err := dec.Decode(&report); err != nil {
-		return "envelope: the answer is not JSON (" + err.Error() + ")"
+		return nil, "envelope: the answer is not JSON (" + err.Error() + ")"
 	}
 
 	if report == nil {
-		return "envelope: the answer is not a JSON object"
+		return nil, "envelope: the answer is not a JSON object"
 	}
 
 	// ONE OBJECT AND NOTHING AFTER IT: the decoder stops at the object's end,
 	// so what follows is read on purpose, as the record's reader reads it.
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
-		return "envelope: the answer carries bytes after its object"
+		return nil, "envelope: the answer carries bytes after its object"
 	}
 
 	// ONE VALUE PER MEMBER, at every depth: Go's decoder keeps the last of a
-	// repeated member, so `"active": null, "active": "none"` would read as
-	// the healthy value its writer never meant.
+	// repeated member, so `"guard": null, "guard": {...}` would read as the
+	// healthy value its writer never meant.
 	switch key, repeated, err := jsonRepeatedMember(stdout); {
 	case err != nil:
-		return "envelope: the answer could not be walked member by member: " + err.Error()
+		return nil, "envelope: the answer could not be walked member by member: " + err.Error()
 	case repeated:
-		return fmt.Sprintf("envelope: the answer repeats the member %q", key)
+		return nil, fmt.Sprintf("envelope: the answer repeats the member %q", key)
 	}
 
-	active, ok := jsonString(report["active"])
+	return report, ""
+}
+
+// judgeDryRunAnswer judges a candidate's `converge-guard prepare --dry-run
+// --json` answer as the dry-run report's schema and requires it to name the
+// guard this command holds, so a candidate is capable only when it reads the
+// record it will be asked to settle or release, through the root this host
+// uses. A dry run that refused, could not read the record or reports another
+// claim proves no such thing, and is the problem it names. It answers the
+// problem, or "" for an admitted answer.
+func judgeDryRunAnswer(rc int, stdout, stderr []byte, timedOut bool, heldID string) string {
+	report, problem := judgeAnswerEnvelope(rc, stdout, stderr, timedOut)
+	if problem != "" {
+		return problem
+	}
+
+	outcome, ok := jsonString(report["outcome"])
 	if !ok {
-		return "envelope: active is missing or not a string"
-	}
-
-	switch claimKind(active) {
-	case claimNone, claimHostUpgrade, claimLegacyRole, claimGuard, claimUnpublished, claimUnknown:
-	default:
-		return fmt.Sprintf("envelope: active is %q, which is not a word this command knows", active)
+		return "envelope: outcome is missing or not a string"
 	}
 
 	var why string
@@ -1410,25 +1425,45 @@ func judgeStatusAnswer(rc int, stdout, stderr []byte, timedOut bool) string {
 		}
 	}
 
-	if active == string(claimUnknown) && why == "" {
-		return "envelope: why is missing or empty under active unknown"
+	if outcome != prepareReported {
+		return fmt.Sprintf("envelope: the dry run's outcome is %q, not %q: %s", outcome, prepareReported, why)
 	}
 
-	if active != string(claimGuard) {
-		return ""
+	shape, ok := jsonString(report["shape"])
+	if !ok {
+		return "envelope: shape is missing or not a string"
+	}
+
+	switch claimKind(shape) {
+	case claimNone, claimHostUpgrade, claimLegacyRole, claimGuard, claimUnpublished, claimUnknown:
+	default:
+		return fmt.Sprintf("envelope: shape is %q, which is not a word this command knows", shape)
+	}
+
+	if shape == string(claimUnknown) && why == "" {
+		return "envelope: why is missing or empty under shape unknown"
+	}
+
+	if problem := judgeDryRunManaged(report["managed"]); problem != "" {
+		return problem
+	}
+
+	if shape != string(claimGuard) {
+		return fmt.Sprintf("guard: the candidate's dry run reports the claim as %q where this command holds a guard", shape)
 	}
 
 	var guard map[string]json.RawMessage
 	if err := json.Unmarshal(report["guard"], &guard); err != nil || guard == nil {
-		return "guard: missing or not an object under active converge-guard"
+		return "guard: missing or not an object under shape converge-guard"
 	}
 
 	if raw, ok := guard["record_error"]; ok {
-		if recordErr, ok := jsonString(raw); !ok || recordErr == "" {
+		recordErr, ok := jsonString(raw)
+		if !ok || recordErr == "" {
 			return "guard: record_error is not a non-empty string"
 		}
 
-		return ""
+		return "guard: the candidate could not read the record it would be asked to settle or release: " + recordErr
 	}
 
 	holder, ok := jsonString(guard["holder"])
@@ -1453,36 +1488,94 @@ func judgeStatusAnswer(rc int, stdout, stderr []byte, timedOut bool) string {
 		return "guard: hostname is missing or not a string"
 	}
 
-	if !isJSONBool(guard["recovery_pointer"]) {
-		return "guard: recovery_pointer is missing or not a boolean"
+	if !isJSONBool(guard["preparing"]) {
+		return "guard: preparing is missing or not a boolean"
 	}
 
-	if exe, ok := jsonString(guard["release_executable"]); !ok || !strings.HasPrefix(exe, "/") {
-		return "guard: release_executable is not an absolute path"
+	id, ok := jsonString(guard["id"])
+	if !ok || !guardHex32.MatchString(id) {
+		return "guard: id is missing or not a 32-hex id"
 	}
 
-	if digest, ok := jsonString(guard["release_executable_sha256"]); !ok || !sha256Hex.MatchString(digest) {
-		return "guard: release_executable_sha256 is not 64 lowercase hex digits"
+	if id != heldID {
+		return fmt.Sprintf("guard: the candidate's dry run reports the guard %s, not the one this command holds (%s)",
+			id, heldID)
 	}
 
-	raw, ok := guard["release_executable_verified"]
-	if !ok {
-		return "guard: release_executable_verified is missing"
+	var record map[string]json.RawMessage
+	if err := json.Unmarshal(guard["record"], &record); err != nil || record == nil {
+		return "record: missing or not an object"
 	}
 
-	if isJSONBool(raw) {
-		return ""
+	if exe, ok := jsonString(record["release_executable"]); !ok || !strings.HasPrefix(exe, "/") {
+		return "record: release_executable is not an absolute path"
 	}
 
-	var verifiedObj map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &verifiedObj); err == nil && len(verifiedObj) == 1 {
-		if reason, ok := jsonString(verifiedObj["unknown"]); ok && reason != "" {
-			return ""
+	if digest, ok := jsonString(record["release_executable_sha256"]); !ok || !sha256Hex.MatchString(digest) {
+		return "record: release_executable_sha256 is not 64 lowercase hex digits"
+	}
+
+	if verified, ok := jsonString(record["verified"]); !isJSONBool(record["verified"]) && (!ok || verified != "unknown") {
+		return "record: verified is neither true, false nor \"unknown\""
+	}
+
+	if !isJSONBool(guard["pointer"]) {
+		return "guard: pointer is missing or not a boolean"
+	}
+
+	for _, member := range []string{"pointer_target", "pointer_problem"} {
+		if raw, ok := guard[member]; ok {
+			if _, ok := jsonString(raw); !ok {
+				return "guard: " + member + " is not a string"
+			}
 		}
 	}
 
-	return "guard: release_executable_verified is neither true, false nor an object whose one member is a " +
-		"non-empty string unknown"
+	if !isJSONBool(guard["stray_temporary"]) {
+		return "guard: stray_temporary is missing or not a boolean"
+	}
+
+	return ""
+}
+
+// judgeDryRunManaged judges the report's `managed` member: the managed
+// binary as the candidate examined it, typed the way describeManaged writes it.
+func judgeDryRunManaged(raw json.RawMessage) string {
+	var managed map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &managed); err != nil || managed == nil {
+		return "managed: missing or not an object"
+	}
+
+	if path, ok := jsonString(managed["path"]); !ok || !strings.HasPrefix(path, "/") {
+		return "managed: path is not an absolute path"
+	}
+
+	if !isJSONBool(managed["present"]) {
+		present, ok := jsonString(managed["present"])
+		if !ok || present != "unknown" {
+			return "managed: present is neither true, false nor \"unknown\""
+		}
+
+		if why, ok := jsonString(managed["why"]); !ok || why == "" {
+			return "managed: why is missing or empty under present unknown"
+		}
+	}
+
+	for _, member := range []string{"why", "version", "version_problem"} {
+		if raw, ok := managed[member]; ok {
+			if _, ok := jsonString(raw); !ok {
+				return "managed: " + member + " is not a string"
+			}
+		}
+	}
+
+	if raw, ok := managed["sha256"]; ok {
+		if digest, ok := jsonString(raw); !ok || !sha256Hex.MatchString(digest) {
+			return "managed: sha256 is not 64 lowercase hex digits"
+		}
+	}
+
+	return ""
 }
 
 // jsonRepeatedMember names the first member repeated inside any object of the

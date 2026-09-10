@@ -22,7 +22,7 @@ func TestACandidateWhoseReleaseCannotBeReadIsNotJudged(t *testing.T) {
 	mustOutcome(t, runPrepare(t, "--holder", "ci-1", "--validate"), prepareAcquired)
 
 	body := "#!/bin/sh\ncase \"$1\" in\n  version) echo broken >&2; exit 1;;\n" +
-		"  converge-guard) printf '{\"active\": \"none\"}\\n';;\nesac\nexit 0\n"
+		"  converge-guard) " + capableAnswer() + ";;\nesac\nexit 0\n"
 	cand := stageGuardCandidate(t, f, "recovery-20260909T120000-0badcafe", []byte(body))
 
 	o := runPrepare(t, "--holder", "ci-1", "--candidate", cand)
@@ -39,7 +39,7 @@ func TestACandidateWhoseReleaseCannotBeReadIsNotJudged(t *testing.T) {
 	// A development build that names no release is admitted with no
 	// downgrade judged, because there is nothing to compare.
 	body = "#!/bin/sh\ncase \"$1\" in\n  version) echo \"billet (devel) linux/amd64\";;\n" +
-		"  converge-guard) printf '{\"active\": \"none\"}\\n';;\nesac\nexit 0\n"
+		"  converge-guard) " + capableAnswer() + ";;\nesac\nexit 0\n"
 	cand = stageGuardCandidate(t, f, "recovery-20260909T120000-1badcafe", []byte(body))
 
 	o = runPrepare(t, "--holder", "ci-1", "--candidate", cand)
@@ -392,7 +392,7 @@ func TestATakeoverRetiresTheAcquirersWindow(t *testing.T) {
 	}
 }
 
-// A candidate whose status answer overflows the bound is not capable: what
+// A candidate whose dry-run answer overflows the bound is not capable: what
 // was kept is a prefix, and a valid object followed by padding past the bound
 // and garbage would otherwise read as one complete object.
 func TestACandidateWhoseAnswerOverflowsTheBoundIsNotCapable(t *testing.T) {
@@ -401,7 +401,7 @@ func TestACandidateWhoseAnswerOverflowsTheBoundIsNotCapable(t *testing.T) {
 	mustOutcome(t, runPrepare(t, "--holder", "ci-1", "--validate"), prepareAcquired)
 
 	body := "#!/bin/sh\ncase \"$1\" in\n  version) echo \"billet v0.10.2 linux/amd64\";;\n" +
-		"  converge-guard) printf '{\"active\": \"none\"}'; head -c " + strconv.Itoa(maxCommandOutput+16) +
+		"  converge-guard) " + capableAnswer() + "; head -c " + strconv.Itoa(maxCommandOutput+16) +
 		" /dev/zero | tr '\\0' ' '; printf 'garbage\\n';;\nesac\nexit 0\n"
 	cand := stageGuardCandidate(t, f, "recovery-20260909T120000-0badcafe", []byte(body))
 
@@ -427,7 +427,7 @@ func TestACandidateThatKeepsItsOutputOpenIsNotCapable(t *testing.T) {
 	t.Cleanup(func() { guardWaitDelay = prev })
 
 	body := "#!/bin/sh\ncase \"$1\" in\n  version) echo \"billet v0.10.2 linux/amd64\";;\n" +
-		"  converge-guard) printf '{\"active\": \"none\"}\\n'; sleep 4 &\n;;\nesac\nexit 0\n"
+		"  converge-guard) " + capableAnswer() + "; sleep 4 &\n;;\nesac\nexit 0\n"
 	cand := stageGuardCandidate(t, f, "recovery-20260909T120000-0badcafe", []byte(body))
 
 	o := runPrepare(t, "--holder", "ci-1", "--candidate", cand)
@@ -482,7 +482,7 @@ func TestAVersionLineThatNamesNoBuildIsNotNoRelease(t *testing.T) {
 
 	script := func(versionLine string) []byte {
 		return []byte("#!/bin/sh\ncase \"$1\" in\n  version) printf '" + versionLine + "';;\n" +
-			"  converge-guard) printf '{\"active\": \"none\"}\\n';;\nesac\nexit 0\n")
+			"  converge-guard) " + capableAnswer() + ";;\nesac\nexit 0\n")
 	}
 
 	for _, c := range []struct{ name, line, words string }{
@@ -567,7 +567,7 @@ func TestADirtyBuildAtAReleaseTagIsADevelopmentBuild(t *testing.T) {
 	mustOutcome(t, runPrepare(t, "--holder", "ci-1", "--validate"), prepareAcquired)
 
 	dirty := "#!/bin/sh\ncase \"$1\" in\n  version) echo \"billet v0.10.1+dirty 83de6dda9f5b 2026-09-10T12:00:00Z\";;\n" +
-		"  converge-guard) printf '{\"active\": \"none\"}\\n';;\nesac\nexit 0\n"
+		"  converge-guard) " + capableAnswer() + ";;\nesac\nexit 0\n"
 
 	cand := stageGuardCandidate(t, f, "recovery-20260909T120000-0badcafe", []byte(dirty))
 	o := runPrepare(t, "--holder", "ci-1", "--candidate", cand)
@@ -617,5 +617,86 @@ func TestADryRunReportsABrokenPointer(t *testing.T) {
 
 	if _, ok := guard["pointer_target"]; ok {
 		t.Error("a dangling pointer was given a target")
+	}
+}
+
+// THE FLOOR ASKS THE PREPARATION PROTOCOL, never `status` alone: a build that
+// answers `status` and "unknown command" to `prepare` (the guard's first
+// commits, before the preparation) is refused at the floor, naming `prepare`,
+// and nothing is re-bound, because once installed it would answer every
+// later converge with "unknown command" and block the recovery through the
+// recorded candidate as well.
+func TestACandidateThatAnswersStatusButNotPrepareIsNotCapable(t *testing.T) {
+	f := newGuardFixture(t)
+	managedScript(t, f, "v0.10.1")
+	mustOutcome(t, runPrepare(t, "--holder", "ci-1", "--validate"), prepareAcquired)
+
+	calls := filepath.Join(t.TempDir(), "calls")
+	body := "#!/bin/sh\necho \"$*\" >> " + calls + "\ncase \"$1\" in\n  version) echo \"billet v0.10.2 linux/amd64\"; exit 0;;\n" +
+		"  converge-guard) case \"$2\" in status) printf '{\"active\": \"none\"}\\n'; exit 0;; esac;;\nesac\n" +
+		"echo 'unknown command \"prepare\"' >&2\nexit 2\n"
+	cand := stageGuardCandidate(t, f, "recovery-20260909T120000-0badcafe", []byte(body))
+
+	o := runPrepare(t, "--holder", "ci-1", "--candidate", cand)
+	mustRefusal(t, o, reasonFloor)
+
+	if !strings.Contains(o.str("why"), `"unknown command" to converge-guard prepare`) {
+		t.Errorf("why %q does not name prepare", o.str("why"))
+	}
+
+	if got := f.record(t).ReleaseExecutable; got != f.binary {
+		t.Errorf("the record was re-bound to %s past the floor", got)
+	}
+
+	asked, err := os.ReadFile(calls)
+	mustOK(t, err)
+
+	if lines := strings.Split(strings.TrimSpace(string(asked)), "\n"); len(lines) != 1 ||
+		lines[0] != "converge-guard prepare --dry-run --json" {
+		t.Errorf("the probe asked %q, want one dry run of prepare", lines)
+	}
+}
+
+// A candidate whose dry run does not report the guard this command holds is
+// not capable: one that reports another claim, another guard, or a record it
+// could not read has not proved it reads the record it will be asked to
+// settle or release.
+func TestACandidateWhoseDryRunDoesNotSeeThisGuardIsNotCapable(t *testing.T) {
+	for _, c := range []struct{ name, answer, words string }{
+		{"another claim", `{"outcome": "reported", "shape": "none", "guard": null, "managed": {"path": "/usr/bin/billet", "present": true}}`,
+			`reports the claim as "none" where this command holds a guard`},
+		{"another guard", `{"outcome": "reported", "shape": "converge-guard", "guard": {"id": "` + strings.Repeat("f", 32) +
+			`", "holder": "ci-1", "claimed_at": "2026-09-09T12:00:00Z", "hostname": "h", "preparing": true, ` +
+			`"record": {"release_executable": "/usr/bin/billet", "release_executable_sha256": "` + strings.Repeat("ab", 32) +
+			`", "verified": true}, "pointer": false, "stray_temporary": false}, "managed": {"path": "/usr/bin/billet", "present": true}}`,
+			"not the one this command holds"},
+		{"a record it could not read", `{"outcome": "reported", "shape": "converge-guard", "guard": {"id": null, "holder": "", ` +
+			`"claimed_at": "", "hostname": "", "preparing": false, "record": {"release_executable": "", "release_executable_sha256": "", ` +
+			`"verified": "unknown"}, "record_error": "not JSON", "pointer": false, "stray_temporary": false}, ` +
+			`"managed": {"path": "/usr/bin/billet", "present": true}}`,
+			"could not read the record it would be asked to settle or release"},
+		{"a refusal", `{"outcome": "refused", "reason": "trust", "shape": "converge-guard", "why": "another root"}`,
+			`outcome is "refused", not "reported": another root`},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newGuardFixture(t)
+			managedScript(t, f, "v0.10.1")
+			mustOutcome(t, runPrepare(t, "--holder", "ci-1", "--validate"), prepareAcquired)
+
+			body := "#!/bin/sh\ncase \"$1\" in\n  version) echo \"billet v0.10.2 linux/amd64\";;\n" +
+				"  converge-guard) printf '%s\\n' '" + c.answer + "';;\nesac\nexit 0\n"
+			cand := stageGuardCandidate(t, f, "recovery-20260909T120000-0badcafe", []byte(body))
+
+			o := runPrepare(t, "--holder", "ci-1", "--candidate", cand)
+			mustRefusal(t, o, reasonFloor)
+
+			if !strings.Contains(o.str("why"), c.words) {
+				t.Errorf("why %q, want %q", o.str("why"), c.words)
+			}
+
+			if got := f.record(t).ReleaseExecutable; got != f.binary {
+				t.Errorf("the record was re-bound to %s past the floor", got)
+			}
+		})
 	}
 }

@@ -218,6 +218,20 @@ chmod 0755 "$fakes/billet-pre-r"
 # A SECOND PRE-R BINARY with other bytes, for a pre-R candidate on a pre-R host.
 { cat "$fakes/billet-pre-r"; echo "# another build of the same release"; } >"$fakes/billet-pre-r-other"
 chmod 0755 "$fakes/billet-pre-r-other"
+# A BUILD THAT ANSWERS `status` AND NOT `prepare`: the guard's first commits,
+# before the preparation protocol; the floor must refuse it as a candidate.
+"$python" - "$fakes/billet-pre-r" "$fakes/billet-status-only" <<'PY'
+import sys
+src, dst = sys.argv[1:3]
+lines = open(src).read().split("\n")
+marker = "echo 'unknown command \"converge-guard\"' >&2"
+if lines.count(marker) != 1:
+    sys.exit("the pre-R fake's refusal line was not found once: %d" % lines.count(marker))
+i = lines.index(marker)
+lines[i:i] = ['if [ "$cmd" = status ]; then printf \'{"active": "none"}\\n\'; exit 0; fi']
+open(dst, "w").write("\n".join(lines))
+PY
+chmod 0755 "$fakes/billet-status-only"
 
 cat >"$fakes/billet-hang" <<'FAKE'
 #!/bin/bash
@@ -822,6 +836,7 @@ for v in v0.10.0 v0.10.1 v0.9.0; do
 done
 # A candidate that carries the pre-R fake's bytes: the floor's case.
 cp "$fakes/billet-pre-r-other" "$bins/wrap-candidate-pre-r"
+cp "$fakes/billet-status-only" "$bins/wrap-candidate-status-only"
 
 # A FAKE RELEASE ORIGIN for the pinned cases: v0.10.1's archive with its
 # checksums.txt holds the candidate wrapper; v0.10.2 is not published.
@@ -1050,7 +1065,8 @@ expect_calls b1-first managed "converge-guard prepare --validate --holder h1 --j
 expect_calls b1-first managed "converge-guard prepare --holder h1 --json --candidate $(fact b1-first recovery)/billet.candidate" 1
 expect_calls b1-first managed "converge-guard settle --holder h1 --token" 1
 expect_calls b1-first managed "converge-guard hold" 0
-expect_calls b1-first candidate "converge-guard status --json" 1
+expect_calls b1-first candidate "converge-guard prepare --dry-run --json" 1
+expect_calls b1-first candidate "converge-guard status" 0
 expect_no_task b1-first "Read the installed and candidate releases"
 expect_no_task b1-first "Ask the candidate whether it can take part in the exclusion"
 expect_no_task b1-first "Hold this host for the converge"
@@ -1059,14 +1075,18 @@ expect_no_task b1-first "Hold this host for the converge"
 # call (which reads the managed version and probes the candidate under the
 # lock, before any re-binding), the settlement.
 order=$(commands b1-first | tr '\n' ';')
-[ "$order" = "managed prepare;managed version;managed prepare;managed version;candidate status;candidate version;managed settle;" ] \
+# THE CANDIDATE'S DRY RUN DESCRIBES THE MANAGED BINARY, its version included,
+# so one `managed version` sits inside the candidate's probe.
+[ "$order" = "managed prepare;managed version;managed prepare;managed version;candidate prepare;managed version;candidate version;managed settle;" ] \
   || fail "b1-first: the order of the calls is not validate, the second call with the candidate's probes under the lock, settle: $order" "$work/cases/b1-first/log"
 expect_state b1-first record_release_executable "$(fact b1-first recovery)/billet.candidate"
 expect_state b1-first record_preparing False
 expect_state b1-first record_holder h1
 expect_state b1-first pointer absent
 [ "$(state b1-first record_id)" = "$(fact b1-first id)" ] || fail "b1-first: the record's id is not the fact's"
-[ "$(backing_runs b1-first prepare)" -eq 2 ] || fail "b1-first: the backing binary ran prepare $(backing_runs b1-first prepare) times, want 2"
+# THREE RUNS OF PREPARE reach a backing binary: the two calls through the
+# managed wrapper and the candidate's dry run, the capability probe.
+[ "$(backing_runs b1-first prepare)" -eq 3 ] || fail "b1-first: the backing binaries ran prepare $(backing_runs b1-first prepare) times, want 3"
 expect_calls b1-first systemctl "" 0
 echo "ok   B1: a candidate is acquired over, staged, re-bound and settled in order, and the role asks nothing of its own"
 
@@ -1940,6 +1960,15 @@ expect_refused c2-floor "Refuse the preparation's answer" "floor" "cannot take p
 expect_final c2-floor "the cleanup released the guard"
 expect_state c2-floor active absent
 grep -q '^recovery=' "$work/cases/c2-floor/state" || fail "c2-floor: the staged directory was not retained"
+# A candidate that answers `status` and not `prepare` is refused at the same
+# floor, naming `prepare`: the probe is the preparation protocol itself.
+plant c2d-floor-status-only
+p c2d-floor-status-only 'plant_root; plant_managed v0.10.0'
+a c2d-floor-status-only -e "billet_binary_src=$bins/wrap-candidate-status-only"
+ns_case c2d-floor-status-only escalated
+expect_refused c2d-floor-status-only "Refuse the preparation's answer" "floor" "cannot take part in the exclusion" "to converge-guard prepare"
+expect_final c2d-floor-status-only "the cleanup released the guard"
+expect_state c2d-floor-status-only active absent
 plant c2b-floor-pre-r
 p c2b-floor-pre-r 'plant_root; plant_pre_r'
 a c2b-floor-pre-r -e "billet_binary_src=$bins/wrap-candidate-pre-r"
