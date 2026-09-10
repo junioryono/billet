@@ -927,9 +927,16 @@ func executableVersion(ctx context.Context, binary string) (string, error) {
 		return "", fmt.Errorf("%s version exited %d: %s", binary, rc, strings.TrimSpace(string(stderr)))
 	}
 
-	fields := strings.Fields(string(stdout))
+	// THE FIRST LINE ALONE, AND IT NAMES A BUILD: the command prints one line,
+	// `billet <version> ...`, and a build that is not a release still names
+	// itself as one of the development forms the version package prints; a
+	// second token of any other shape is a line this parser does not read,
+	// never "no release to compare".
+	line, _, _ := strings.Cut(string(stdout), "\n")
+
+	fields := strings.Fields(line)
 	if len(fields) < 2 || fields[0] != "billet" {
-		return "", fmt.Errorf("%s version answered %q, not `billet <version> <platform>`", binary,
+		return "", fmt.Errorf("%s version answered %q, not `billet <version> ...`", binary,
 			strings.TrimSpace(string(stdout)))
 	}
 
@@ -937,7 +944,25 @@ func executableVersion(ctx context.Context, binary string) (string, error) {
 		return v, nil
 	}
 
-	return "", nil
+	if namesADevelopmentBuild(fields[1]) {
+		return "", nil
+	}
+
+	return "", fmt.Errorf("%s version names %q, which is neither a release nor a development build", binary, fields[1])
+}
+
+// namesADevelopmentBuild says whether a version token is one of the forms a
+// build that is not a release prints: Go's "(devel)", the package's
+// "(unknown)", a pseudo-version or a snapshot, each on 0.0.0.
+func namesADevelopmentBuild(token string) bool {
+	switch {
+	case token == "(devel)", token == "(unknown)":
+		return true
+	case strings.HasPrefix(token, "v0.0.0-"), strings.HasPrefix(token, "0.0.0-"):
+		return true
+	}
+
+	return false
 }
 
 // candidateCapable executes the candidate's `converge-guard status --json`

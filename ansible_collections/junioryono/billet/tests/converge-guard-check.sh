@@ -354,7 +354,8 @@ import json, sys
 d = json.load(open(sys.argv[1]))
 m = sys.argv[3]
 bad = {"outcome": 7, "id": "zz", "holder": "h2", "preparing": "yes", "token": "short",
-       "record": {}, "pointer": "no", "managed": {"present": "maybe"}, "downgrade": "x"}
+       "record": {}, "pointer": "no", "managed": {"present": "maybe"}, "downgrade": "x",
+       "next": None, "shape": 7}
 d[m] = bad[m]
 json.dump(d, open(sys.argv[2], "w"), indent=2)
 PY
@@ -1509,6 +1510,21 @@ ns_case b9e-recovery-dir-other escalated
 expect_refused b9e-recovery-dir-other "Judge the preparation's answer" "recovery_dir"
 expect_fact b9e-recovery-dir-other recovery ""
 expect_calls b9e-recovery-dir-other managed "converge-guard prepare --holder h1 --json --recovery" 0
+# B9f. A pointer_target with a trailing newline: refused at the parser, since the grammar ends at the end of the text.
+plant b9f-pointer-target-newline
+p b9f-pointer-target-newline "plant_root; plant_managed v0.10.0; plant_guard h1 /usr/bin/billet; mkdir -m 0700 $ROOT/$REC_A; plant_pointer $REC_A"
+"$python" - "$work/corpus/validated-settled.json" "$work/cases/b9f-pointer-target-newline/answer.json" "$ROOT/$REC_A" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+d["pointer"] = True
+d["pointer_target"] = sys.argv[3] + "\n"
+d["recovery_dir"] = sys.argv[3] + "\n"
+json.dump(d, open(sys.argv[2], "w"), indent=2)
+PY
+e b9f-pointer-target-newline "BILLET_GATE_ANSWER=prepare:1:$work/cases/b9f-pointer-target-newline/answer.json"
+ns_case b9f-pointer-target-newline escalated
+expect_refused b9f-pointer-target-newline "Judge the preparation's answer" "pointer_target"
+expect_fact b9f-pointer-target-newline recovery ""
 plant b9c-malformed
 p b9c-malformed "plant_root; plant_managed v0.10.0; plant_guard h1 /usr/bin/billet; touch $ROOT/active/recovery"
 ns_case b9c-malformed escalated
@@ -1574,7 +1590,7 @@ echo "ok   B11: a record re-bound under the second call refuses and is kept"
 # B12. The answer corrupted, one member at a time: the parser names the
 # member; a corrupted first answer leaves the guard (no token known); a
 # corrupted second answer after `acquired` is cleaned up.
-for member in outcome id holder preparing token record pointer managed downgrade; do
+for member in outcome id holder preparing token record pointer managed downgrade next shape; do
   plant "b12-$member"
   p "b12-$member" 'plant_root; plant_managed v0.10.0'
   corrupt "$work/corpus/acquired.json" "$work/cases/b12-$member/answer.json" "$member"
@@ -1633,6 +1649,16 @@ expect_fact b12-exit held False
 expect_final b12-exit "no cleanup was attempted" "release --holder h1"
 expect_state b12-exit record_preparing True
 expect_calls b12-exit managed "converge-guard release" 0
+# A null `next` on a successful second answer: refused at the parser naming it, and the guard cleaned up.
+plant b12-second-next
+p b12-second-next 'plant_root; plant_managed v0.10.0'
+corrupt "$work/corpus/no-change.json" "$work/cases/b12-second-next/answer.json" next
+e b12-second-next "BILLET_GATE_ANSWER=prepare:2:$work/cases/b12-second-next/answer.json"
+ns_case b12-second-next escalated
+expect_refused b12-second-next "Judge the preparation's answer" "next"
+expect_final b12-second-next "the cleanup released the guard" "is now none"
+expect_fact b12-second-next released True
+expect_state b12-second-next active absent
 plant b12-second
 p b12-second 'plant_root; plant_managed v0.10.0'
 e b12-second "BILLET_GATE_ANSWER=prepare:2:$work/corpus/no-change-outcome.json"

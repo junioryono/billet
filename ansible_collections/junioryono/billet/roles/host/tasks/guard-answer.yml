@@ -104,6 +104,15 @@
         ok: "{{ billet_exclusion_a.outcome | default('') in ['refused', 'unknown'] or ((billet_exclusion_a.record | default({})).release_executable | default('') is string and (billet_exclusion_a.record | default({})).release_executable | default('') is match('^/') and (billet_exclusion_a.record | default({})).release_executable_sha256 | default('') is string and (billet_exclusion_a.record | default({})).release_executable_sha256 | default('') is match(billet_exclusion_sha) and ((billet_exclusion_a.record | default({})).verified | default('x') is sameas true)) }}"
       - name: pointer
         ok: "{{ billet_exclusion_a.outcome | default('') in ['refused', 'unknown'] or (billet_exclusion_a.pointer | default('x') is sameas true) or (billet_exclusion_a.pointer | default('x') is sameas false) }}"
+      # THE OPTIONAL TEXT MEMBERS A DIAGNOSTIC READS are strings whenever they
+      # are present, whatever the outcome: the refusal's message below is
+      # templated before the assertion decides, so a null `next` on a
+      # successful answer would fail there, after the judgement and before the
+      # facts, losing the token.
+      - name: shape
+        ok: "{{ ('shape' not in billet_exclusion_a) or (billet_exclusion_a.shape is string) }}"
+      - name: next
+        ok: "{{ ('next' not in billet_exclusion_a) or (billet_exclusion_a.next is string) }}"
       # THE RECOVERY DIRECTORY IS THE VALIDATED POINTER TARGET ALONE: the
       # command answers `recovery_dir` beside it on a validation, and an
       # answer naming two directories is refused rather than read from the
@@ -139,9 +148,9 @@
       The preparation's {{ billet_exclusion_call }} call through
       {{ billet_exclusion_answered_by }} was
       {{ 'refused' if billet_exclusion_answer.outcome == 'refused' else 'could not examine the host' }}
-      ({{ billet_exclusion_answer.reason | default('no reason') }}{{ (', ' ~ billet_exclusion_answer.shape) if billet_exclusion_answer.shape | default('') | length > 0 else '' }}):
-      {{ billet_exclusion_answer.why | default('no reason') }}.
-      {{ ('Next: ' ~ billet_exclusion_answer.next ~ '.') if billet_exclusion_answer.next | default('') | length > 0 else '' }}
+      ({{ billet_exclusion_answer.reason if billet_exclusion_answer.reason | default('') is string and billet_exclusion_answer.reason | default('') | length > 0 else 'no reason' }}{{ (', ' ~ billet_exclusion_answer.shape) if (billet_exclusion_answer.shape | default('') is string and billet_exclusion_answer.shape | default('') | length > 0) else '' }}):
+      {{ billet_exclusion_answer.why if billet_exclusion_answer.why | default('') is string and billet_exclusion_answer.why | default('') | length > 0 else 'no reason' }}.
+      {{ ('Next: ' ~ billet_exclusion_answer.next ~ '.') if (billet_exclusion_answer.next | default('') is string and billet_exclusion_answer.next | default('') | length > 0) else '' }}
   when: not billet_exclusion_pre_r | bool
 
 # THE FACTS, from the answer and from nothing read before it. The token is

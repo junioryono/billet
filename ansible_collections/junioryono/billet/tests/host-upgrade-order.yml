@@ -996,7 +996,7 @@
           - billet_answer_names.index("Judge the preparation's answer") < billet_answer_names.index("Refuse the preparation's answer")
           - billet_answer_names.index("Refuse the preparation's answer") < billet_answer_names.index("Take the preparation's answer as this run's facts")
           - billet_answer_names.index("Take the preparation's answer as this run's facts") < billet_answer_names.index("Report the preparation's answer")
-          - billet_answer_judge.vars.billet_exclusion_checks | map(attribute='name') | list == ['outcome', 'exit', 'reason', 'why', 'id', 'holder', 'preparing', 'token', 'record', 'pointer', 'recovery_dir', 'pointer_target', 'managed', 'downgrade']
+          - billet_answer_judge.vars.billet_exclusion_checks | map(attribute='name') | list == ['outcome', 'exit', 'reason', 'why', 'id', 'holder', 'preparing', 'token', 'record', 'pointer', 'shape', 'next', 'recovery_dir', 'pointer_target', 'managed', 'downgrade']
           - "'item.ok | bool' in (billet_answer_judge['ansible.builtin.assert'].that | join(' '))"
           - "'(billet_exclusion_raw.rc | default(1)) == 0' in ((billet_answer_judge.vars.billet_exclusion_checks | selectattr('name', 'equalto', 'exit') | first).ok | string)"
           - "'recovery-[0-9]{8}T[0-9]{6}-[0-9a-f]{8}|[0-9]{8}T[0-9]{15}' in billet_host_answer_text"
@@ -1030,7 +1030,12 @@
           # EVERY ID, TOKEN AND DIGEST PATTERN ENDS AT THE END OF THE TEXT, never before a final newline.
           - "billet_answer_judge.vars.billet_exclusion_hex32 == '^[0-9a-f]{32}\\Z'"
           - "billet_answer_judge.vars.billet_exclusion_sha == '^[0-9a-f]{64}\\Z'"
-          - "billet_answer_judge.vars.billet_exclusion_pointer_tail is search('\\\\Z$')"
+          - "billet_answer_judge.vars.billet_exclusion_pointer_tail == '/(recovery-[0-9]{8}T[0-9]{6}-[0-9a-f]{8}|[0-9]{8}T[0-9]{15})\\Z'"
+          # THE OPTIONAL TEXT MEMBERS ARE TYPED BY THE CHECKS, and the refusal's message reads none of them untyped.
+          - "\"('shape' not in billet_exclusion_a) or (billet_exclusion_a.shape is string)\" in (billet_answer_judge.vars.billet_exclusion_checks | string)"
+          - "\"('next' not in billet_exclusion_a) or (billet_exclusion_a.next is string)\" in (billet_answer_judge.vars.billet_exclusion_checks | string)"
+          - "'billet_exclusion_answer.shape | default(\\'\\') is string' in ((billet_host_answer_tasks | selectattr('name', 'equalto', \"Refuse the preparation's answer\") | first)['ansible.builtin.assert'].fail_msg | string)"
+          - "'billet_exclusion_answer.next | default(\\'\\') is string' in ((billet_host_answer_tasks | selectattr('name', 'equalto', \"Refuse the preparation's answer\") | first)['ansible.builtin.assert'].fail_msg | string)"
           - "'_HEX32.fullmatch(' in billet_fallback_module_text and '_SHA256.fullmatch(' in billet_fallback_module_text"
           - "'_HEX32.match(' not in billet_fallback_module_text and '_SHA256.match(' not in billet_fallback_module_text"
         fail_msg: >-

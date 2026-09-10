@@ -471,6 +471,60 @@ func TestAProtocolRecordWithoutAnIDIsNotAdopted(t *testing.T) {
 	}
 }
 
+// A version line whose second token names no build is not a build with no
+// release: the candidate's version becomes an error and it is not judged, and
+// the managed binary's version becomes could-not-tell with no downgrade judged
+// over it. A line with fewer fields is refused by the shape check before.
+func TestAVersionLineThatNamesNoBuildIsNotNoRelease(t *testing.T) {
+	f := newGuardFixture(t)
+	managedScript(t, f, "v0.10.1")
+	mustOutcome(t, runPrepare(t, "--holder", "ci-1", "--validate"), prepareAcquired)
+
+	script := func(versionLine string) []byte {
+		return []byte("#!/bin/sh\ncase \"$1\" in\n  version) printf '" + versionLine + "';;\n" +
+			"  converge-guard) printf '{\"active\": \"none\"}\\n';;\nesac\nexit 0\n")
+	}
+
+	for _, c := range []struct{ name, line, words string }{
+		{"a second token that names no build", "billet go go1.26.0\\n", "neither a release nor a development build"},
+		{"a build named on the second line", "billet\\n  go go1.26.0\\n", "not `billet <version> ...`"},
+	} {
+		cand := stageGuardCandidate(t, f, "recovery-20260909T120000-0badcafe", script(c.line))
+		o := runPrepare(t, "--holder", "ci-1", "--candidate", cand)
+		mustOutcome(t, o, prepareUnknown)
+
+		if !strings.Contains(o.str("why"), c.words) {
+			t.Errorf("%s: why %q", c.name, o.str("why"))
+		}
+
+		mustOK(t, os.RemoveAll(filepath.Dir(cand)))
+	}
+
+	// THE MANAGED BINARY answering the same: the record is re-bound to a
+	// candidate first, so the recorded executable verifies and the judgement
+	// reaches the managed binary's version.
+	cand := guardCandidateScript(t, f, "recovery-20260909T120000-1badcafe", "v0.9.0", "capable")
+	mustOutcome(t, runPrepare(t, "--holder", "ci-1", "--candidate", cand, "--allow-downgrade"), prepareRebound)
+	mustOK(t, os.WriteFile(f.binary, script("billet go go1.26.0\\n"), 0o755))
+
+	o := runPrepare(t, "--holder", "ci-1", "--candidate", cand, "--allow-downgrade")
+	mustOutcome(t, o, prepareUnknown)
+
+	if !strings.Contains(o.str("why"), "neither a release nor a development build") {
+		t.Errorf("why %q over the managed binary", o.str("why"))
+	}
+
+	for _, form := range []string{"v0.0.0-20260811035856-83de6dda9f5b+dirty", "0.0.0-SNAPSHOT-83de6dda", "(devel)"} {
+		if !namesADevelopmentBuild(form) {
+			t.Errorf("%q is not read as a development build", form)
+		}
+	}
+
+	if namesADevelopmentBuild("go") || namesADevelopmentBuild("") {
+		t.Error("a token that names no build was read as one")
+	}
+}
+
 func TestADryRunReportsABrokenPointer(t *testing.T) {
 	f := newGuardFixture(t)
 	mustHold(t, "ci-1")
