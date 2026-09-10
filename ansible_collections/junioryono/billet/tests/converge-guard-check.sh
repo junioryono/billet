@@ -1399,6 +1399,21 @@ expect_refused b7f-moving "Refuse an unpinned billet version" "must name one rel
 expect_state b7f-moving active absent
 echo "ok   B7: a dry run reports every shape through prepare --dry-run before any dispatch, needs no holder, then takes the read-only staging path"
 
+# B1c. A holder spelled with an environment reference is published as spelled:
+# the module expands nothing, the guard's holder is the literal, the parser
+# takes it as this run's, and the settlement and a cleanup address it.
+plant b1c-literal-holder
+p b1c-literal-holder 'plant_root; plant_managed v0.10.0'
+a b1c-literal-holder -e '{"billet_converge_guard_holder": "h-${USER}"}'
+HOLDER=""; ns_case b1c-literal-holder escalated; HOLDER=h1
+expect_allowed b1c-literal-holder
+expect_fact b1c-literal-holder acquired True
+expect_state b1c-literal-holder record_holder 'h-${USER}'
+expect_calls b1c-literal-holder managed 'converge-guard prepare --validate --holder h-${USER} --json' 1
+expect_calls b1c-literal-holder managed 'converge-guard settle --holder h-${USER} --token' 1
+expect_state b1c-literal-holder record_preparing False
+echo "ok   B1c: a holder is published as spelled, with no argument expanded by the module"
+
 # B1b. The role's escalation proved: the same acquisition and dry run as the
 # invoker with the role's own `become`, every guard call and the root's
 # establishment as root, the play itself as the invoker. A `billet_exclusion_become`

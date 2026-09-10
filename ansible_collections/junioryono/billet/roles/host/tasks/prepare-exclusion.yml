@@ -36,6 +36,13 @@
 # when the guard is gone or replaced, and never re-acquires. The transaction
 # facts are per invocation and belong to stage-candidate.yml.
 #
+# NO ARGUMENT IS EXPANDED BY THE MODULE: `ansible.builtin.command` expands
+# environment variables inside argv unless told not to, so a holder spelled
+# `ci-${USER}` (a name the command accepts) would be published as `ci-root`,
+# the parser would refuse the answer's holder as not this run's, and the
+# rescue, knowing no token, would leave a guard nobody asked for. Every
+# guard command carries `expand_argument_vars: false`.
+#
 # ON A MAC the host role manages no binary (everything past this file asserts
 # Linux and systemd), so the preparation classifies and holds through the
 # managed binary; a Mac with no billet takes the no-billet path with its
@@ -280,6 +287,7 @@
         argv: >-
           {{ ([] if billet_exclusion_darwin | bool else ['timeout', '-k', '10', billet_guard_timeout | string])
              + [billet_exclusion_binary, 'converge-guard', 'prepare', '--dry-run', '--json'] }}
+        expand_argument_vars: false
       async: "{{ 0 if not billet_exclusion_darwin | bool else (billet_guard_timeout | int) + 10 }}"
       poll: 5
       register: billet_exclusion_dry
@@ -334,6 +342,7 @@
         argv: >-
           {{ ([] if billet_exclusion_darwin | bool else ['timeout', '-k', '10', billet_guard_timeout | string])
              + [billet_exclusion_fallback_executable, 'converge-guard', 'prepare', '--dry-run', '--json'] }}
+        expand_argument_vars: false
       async: "{{ 0 if not billet_exclusion_darwin | bool else (billet_guard_timeout | int) + 10 }}"
       poll: 5
       register: billet_exclusion_dry_recorded
@@ -608,6 +617,7 @@
               {{ ([] if billet_exclusion_darwin | bool else ['timeout', '-k', '10', billet_guard_timeout | string])
                  + [billet_exclusion_binary, 'converge-guard', 'prepare', '--validate', '--holder', billet_exclusion_holder, '--json']
                  + (['--expect-id', billet_exclusion_id] if billet_exclusion_id | default('') | length > 0 else []) }}
+            expand_argument_vars: false
           async: "{{ 0 if not billet_exclusion_darwin | bool else (billet_guard_timeout | int) + 10 }}"
           poll: 5
           register: billet_exclusion_first_managed
@@ -647,6 +657,7 @@
               {{ ([] if billet_exclusion_darwin | bool else ['timeout', '-k', '10', billet_guard_timeout | string])
                  + [billet_exclusion_fallback_executable, 'converge-guard', 'prepare', '--validate', '--holder', billet_exclusion_holder, '--json']
                  + (['--expect-id', billet_exclusion_id] if billet_exclusion_id | default('') | length > 0 else []) }}
+            expand_argument_vars: false
           async: "{{ 0 if not billet_exclusion_darwin | bool else (billet_guard_timeout | int) + 10 }}"
           poll: 5
           register: billet_exclusion_first_fallback
@@ -694,6 +705,7 @@
                   '--holder', billet_exclusion_holder, '--candidate', billet_upgrade_recovery_dir ~ '/billet.candidate', '--json']
                  + (['--expect-bootstrap'] if billet_exclusion_route == 'unheld' else [])
                  + (['--expect-id', billet_exclusion_id] if billet_exclusion_id | default('') | length > 0 else []) }}
+            expand_argument_vars: false
           register: billet_exclusion_first_candidate
           changed_when: false
           failed_when: false
@@ -752,6 +764,7 @@
                           if billet_binary_upgrade | default(false) | bool
                           else ['--no-change']))
                  + (['--expect-id', billet_exclusion_id] if billet_exclusion_id | default('') | length > 0 else []) }}
+            expand_argument_vars: false
           async: "{{ 0 if not billet_exclusion_darwin | bool else (billet_guard_timeout | int) + 10 }}"
           poll: 5
           register: billet_exclusion_second
@@ -780,6 +793,7 @@
             argv: >-
               {{ ([] if billet_exclusion_darwin | bool else ['timeout', '-k', '10', billet_guard_timeout | string])
                  + [billet_exclusion_binary, 'converge-guard', 'holder'] }}
+            expand_argument_vars: false
           async: "{{ 0 if not billet_exclusion_darwin | bool else (billet_guard_timeout | int) + 10 }}"
           poll: 5
           register: billet_exclusion_legacy_recheck
@@ -941,6 +955,7 @@
             argv: >-
               {{ ([] if billet_exclusion_darwin | bool else ['timeout', '-k', '10', billet_guard_timeout | string])
                  + [billet_exclusion_executable, 'converge-guard', 'settle', '--holder', billet_exclusion_holder, '--token', billet_exclusion_cleanup_token] }}
+            expand_argument_vars: false
           async: "{{ 0 if not billet_exclusion_darwin | bool else (billet_guard_timeout | int) + 10 }}"
           poll: 5
           register: billet_exclusion_settle
@@ -966,6 +981,7 @@
             argv: >-
               {{ ([] if billet_exclusion_darwin | bool else ['timeout', '-k', '10', billet_guard_timeout | string])
                  + [billet_exclusion_executable | default(billet_exclusion_binary), 'converge-guard', 'release', '--holder', billet_exclusion_holder, '--cleanup', '--token', billet_exclusion_cleanup_token] }}
+            expand_argument_vars: false
           async: "{{ 0 if not billet_exclusion_darwin | bool else (billet_guard_timeout | int) + 10 }}"
           poll: 5
           register: billet_exclusion_cleanup
@@ -994,6 +1010,7 @@
             argv: >-
               {{ ([] if billet_exclusion_darwin | bool else ['timeout', '-k', '10', billet_guard_timeout | string])
                  + [billet_exclusion_executable | default(billet_exclusion_binary), 'converge-guard', 'status', '--json'] }}
+            expand_argument_vars: false
           async: "{{ 0 if not billet_exclusion_darwin | bool else (billet_guard_timeout | int) + 10 }}"
           poll: 5
           register: billet_exclusion_remainder_status

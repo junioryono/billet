@@ -1071,10 +1071,12 @@
           - "item.name == 'Ask the staged candidate to prepare' or item.poll is defined"
           - "item.name == 'Ask the staged candidate to prepare' or 'billet_exclusion_become' in (item.become | string)"
           - item.check_mode == false
+          - item['ansible.builtin.command'].expand_argument_vars == false
         fail_msg: >-
           The preparation's command "{{ item.name }}" must run under `timeout -k 10`
-          on Linux and the task's async bound on a Mac, escalated by platform, and
-          never in check mode's simulation.
+          on Linux and the task's async bound on a Mac, escalated by platform,
+          never in check mode's simulation, and with no argument expanded by
+          the module (a holder spelled `ci-${USER}` is published as spelled).
       loop: "{{ billet_guard_commands }}"
       loop_control:
         label: "{{ item.name }}"
