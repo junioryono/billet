@@ -488,6 +488,8 @@ func TestAVersionLineThatNamesNoBuildIsNotNoRelease(t *testing.T) {
 	for _, c := range []struct{ name, line, words string }{
 		{"a second token that names no build", "billet go go1.26.0\\n", "neither a release nor a development build"},
 		{"a build named on the second line", "billet\\n  go go1.26.0\\n", "not `billet <version> ...`"},
+		{"a pseudo-version with month thirteen", "billet v0.10.2-0.20261309120000-83de6dda9f5b\\n", "neither a release nor a development build"},
+		{"a pseudo-version before patch zero", "billet v0.10.0-0.20260909120000-83de6dda9f5b\\n", "neither a release nor a development build"},
 	} {
 		cand := stageGuardCandidate(t, f, "recovery-20260909T120000-0badcafe", script(c.line))
 		o := runPrepare(t, "--holder", "ci-1", "--candidate", cand)
@@ -505,7 +507,7 @@ func TestAVersionLineThatNamesNoBuildIsNotNoRelease(t *testing.T) {
 	// reaches the managed binary's version.
 	cand := guardCandidateScript(t, f, "recovery-20260909T120000-1badcafe", "v0.9.0", "capable")
 	mustOutcome(t, runPrepare(t, "--holder", "ci-1", "--candidate", cand, "--allow-downgrade"), prepareRebound)
-	mustOK(t, os.WriteFile(f.binary, script("billet v0.10.1-20260909120000-83de6dda9f5b\\n"), 0o755))
+	mustOK(t, os.WriteFile(f.binary, script("billet v0.10.0-0.20260909120000-83de6dda9f5b\\n"), 0o755))
 
 	recordBefore, err := os.ReadFile(filepath.Join(f.active(), guardRecordName))
 	mustOK(t, err)
@@ -547,6 +549,8 @@ func TestAVersionLineThatNamesNoBuildIsNotNoRelease(t *testing.T) {
 		"v0.0.0-20260811035856-83de6dda9f5", "v0.0.0-20260811035856-83de6dda9f5b extra", "0.0.0-SNAPSHOT-", "v0.10.1",
 		"v0.10.1-20260909120000-83de6dda9f5b", "v0.10.1-rc10.20260909120000-83de6dda9f5b",
 		"v0.10.1-rc1.0.20260909120000-", "v0.10.1-rc1", "v01.0.0-20260909120000-83de6dda9f5b", "v0.10.1-dirty",
+		"v0.10.2-0.20261309120000-83de6dda9f5b", "v0.10.2-0.20260931120000-83de6dda9f5b",
+		"v0.10.0-0.20260909120000-83de6dda9f5b", "v0.10.0-0.20260909120000-83de6dda9f5b+dirty",
 	} {
 		if namesADevelopmentBuild(form) {
 			t.Errorf("%q was read as a development build", form)

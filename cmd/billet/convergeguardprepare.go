@@ -979,9 +979,24 @@ func namesADevelopmentBuild(token string) bool {
 
 	switch {
 	case module.IsPseudoVersion(v):
-		rev, err := module.PseudoVersionRev(v)
+		// THE SHAPE, THEN WHAT IT CLAIMS: the revision `cmd/go` writes, a
+		// timestamp that is a time, and a base that has a predecessor
+		// (`vX.Y.0-0.<stamp>-<rev>` names a patch before zero); Go's parser
+		// judges each, on the token without its build suffix.
+		bare := strings.TrimSuffix(v, semver.Build(v))
 
-		return err == nil && pseudoRevisionForm.MatchString(rev)
+		rev, err := module.PseudoVersionRev(bare)
+		if err != nil || !pseudoRevisionForm.MatchString(rev) {
+			return false
+		}
+
+		if _, err := module.PseudoVersionTime(bare); err != nil {
+			return false
+		}
+
+		_, err = module.PseudoVersionBase(bare)
+
+		return err == nil
 	case semver.Prerelease(v) == "" && semver.Build(v) != "":
 		// A DIRTY CHECKOUT AT A RELEASE TAG, or any other build suffix on a
 		// release base: the base names a release, the suffix says these are
