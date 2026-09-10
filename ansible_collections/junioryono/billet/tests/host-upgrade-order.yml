@@ -1038,6 +1038,9 @@
           - "billet_answer_judge.vars.billet_exclusion_hex32 == '^[0-9a-f]{32}\\Z'"
           - "billet_answer_judge.vars.billet_exclusion_sha == '^[0-9a-f]{64}\\Z'"
           - "billet_answer_judge.vars.billet_exclusion_pointer_tail == '/(recovery-[0-9]{8}T[0-9]{6}-[0-9a-f]{8}|[0-9]{8}T[0-9]{15})\\Z'"
+          # ACQUIRED IS THE FIRST CALL'S OUTCOME ALONE, and the cleanup token is taken from that acquisition and never replaced.
+          - "\"(billet_exclusion_call == 'first' or billet_exclusion_a.outcome | default('') != 'acquired')\" in (billet_answer_judge.vars.billet_exclusion_checks | string)"
+          - "\"(billet_exclusion_call == 'first' and billet_exclusion_answer.outcome == 'acquired')\" in (billet_answer_facts['ansible.builtin.set_fact'].billet_exclusion_cleanup_token | string)"
           # THE OPTIONAL TEXT MEMBERS ARE TYPED BY THE CHECKS, and the refusal's message reads none of them untyped.
           - "\"('shape' not in billet_exclusion_a) or (billet_exclusion_a.shape is string)\" in (billet_answer_judge.vars.billet_exclusion_checks | string)"
           - "\"('next' not in billet_exclusion_a) or (billet_exclusion_a.next is string)\" in (billet_answer_judge.vars.billet_exclusion_checks | string)"

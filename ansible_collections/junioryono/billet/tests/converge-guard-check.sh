@@ -1739,6 +1739,16 @@ expect_fact b12-exit held False
 expect_final b12-exit "no cleanup was attempted" "release --holder h1"
 expect_state b12-exit record_preparing True
 expect_calls b12-exit managed "converge-guard release" 0
+# A second answer claiming `acquired` with another token: refused at the parser naming the outcome, no fact taken, and the cleanup releases with the token the first call gave.
+plant b12-second-acquired
+p b12-second-acquired 'plant_root; plant_managed v0.10.0'
+e b12-second-acquired "BILLET_GATE_ANSWER=prepare:2:$work/corpus/acquired.json"
+ns_case b12-second-acquired escalated
+expect_refused b12-second-acquired "Judge the preparation's answer" "outcome"
+expect_final b12-second-acquired "the cleanup released the guard" "is now none"
+expect_fact b12-second-acquired released True
+expect_state b12-second-acquired active absent
+expect_calls b12-second-acquired managed "converge-guard release --holder h1 --cleanup --token" 1
 # A null `next` on a successful second answer: refused at the parser naming it, and the guard cleaned up.
 plant b12-second-next
 p b12-second-next 'plant_root; plant_managed v0.10.0'

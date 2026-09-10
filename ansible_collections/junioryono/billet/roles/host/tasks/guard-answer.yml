@@ -81,8 +81,14 @@
     billet_exclusion_sha: '^[0-9a-f]{64}\Z'
     billet_exclusion_pointer_tail: '/(recovery-[0-9]{8}T[0-9]{6}-[0-9a-f]{8}|[0-9]{8}T[0-9]{15})\Z'
     billet_exclusion_checks:
+      # THE OUTCOME BY CALL: `acquired` is the first call's alone, since the
+      # second call declares an intent on a guard this run already holds and
+      # answers validated, rebound, refused or unknown; a second answer saying
+      # `acquired` with another token would otherwise replace the cleanup
+      # token of the acquisition this run made, and the settlement and the
+      # rescue would then be refused with a token that was never this guard's.
       - name: outcome
-        ok: "{{ billet_exclusion_a.outcome | default('') in ['acquired', 'validated', 'rebound', 'refused', 'unknown'] }}"
+        ok: "{{ billet_exclusion_a.outcome | default('') in ['acquired', 'validated', 'rebound', 'refused', 'unknown'] and (billet_exclusion_call == 'first' or billet_exclusion_a.outcome | default('') != 'acquired') }}"
       - name: exit
         ok: "{{ billet_exclusion_a.outcome | default('') in ['refused', 'unknown'] or (billet_exclusion_raw.rc | default(1)) == 0 }}"
       # EVERY TEXT MEMBER IS A STRING BEFORE ITS SHAPE IS JUDGED: a coerced
@@ -162,7 +168,7 @@
       {{ billet_exclusion_answer.outcome == 'acquired' if billet_exclusion_call == 'first'
          else billet_exclusion_acquired | default(false) }}
     billet_exclusion_cleanup_token: >-
-      {{ billet_exclusion_answer.token | default('') if billet_exclusion_answer.outcome == 'acquired'
+      {{ billet_exclusion_answer.token | default('') if (billet_exclusion_call == 'first' and billet_exclusion_answer.outcome == 'acquired')
          else billet_exclusion_cleanup_token | default('') }}
     billet_exclusion_held: true
     billet_exclusion_executable: "{{ billet_exclusion_answered_by }}"
