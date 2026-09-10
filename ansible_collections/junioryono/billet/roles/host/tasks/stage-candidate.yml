@@ -34,6 +34,24 @@
   become: "{{ billet_exclusion_become }}"
   when: not (billet_exclusion_darwin | default(false) | bool)
 
+# THE PREPARATION'S OBSERVATION HOLDS OR THE STAGING REFUSES: the managed
+# binary's presence decided whether the guard's status was asked of it, and a
+# binary that appeared since (an updater that finished and released its claim
+# between the preparation's inspection and the claim's) or vanished since is a
+# host whose exclusion state the preparation never saw. The classification is
+# not repeated here; the converge is refused and rerun from its start.
+- name: Refuse a converge whose managed binary appeared or vanished before the staging
+  ansible.builtin.assert:
+    that:
+      - billet_installed_binary.stat.exists == (billet_exclusion_binary_present | bool)
+    fail_msg: >-
+      {{ billet_exclusion_binary }} {{ 'appeared' if billet_installed_binary.stat.exists | default(false) else 'vanished' }}
+      between the preparation's inspection and this staging: an updater is at
+      work on this host and the claim it held was never seen. Nothing was
+      staged or held; rerun the converge once
+      `{{ billet_exclusion_binary }} converge-guard status` answers.
+  when: not (billet_exclusion_darwin | default(false) | bool)
+
 - name: Resolve and stage this invocation's candidate
   when:
     - not (billet_interrupted_upgrade | default(false))

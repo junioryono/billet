@@ -169,24 +169,31 @@ def require_trusted_ancestors(phase, parent, owner):
     at = os.sep
     # THE FILESYSTEM ROOT ITSELF FIRST: a `/` another account could write is the
     # one ancestor a walk over children never reaches.
-    require_ancestor(phase, at, lstat_or_refuse(phase, at), owner)
+    at_st = lstat_or_refuse(phase, at)
+    require_ancestor(phase, at, at_st, owner)
     links = 0
     pending = list(components)
     while pending:
         name = pending.pop(0)
         if name == "..":
             at = os.path.dirname(at.rstrip(os.sep)) or os.sep
-            require_ancestor(phase, at, lstat_or_refuse(phase, at), owner)
+            at_st = lstat_or_refuse(phase, at)
+            require_ancestor(phase, at, at_st, owner)
             continue
         candidate = os.path.join(at, name)
-        # AN ABSENT ANCESTOR ENDS THE WALK: nothing lies under it to rename, and
-        # what the caller asks about below it is answered by its own stat (a
-        # fresh host's parent not yet made; a held converge whose tree vanished,
-        # which the claim's stat then refuses as the exclusion having moved).
+        # AN ABSENT ANCESTOR ENDS THE WALK when nobody else can supply it:
+        # nothing lies under it to rename, and what the caller asks about below
+        # it is answered by its own stat (a fresh host's parent not yet made; a
+        # held converge whose tree vanished, which the claim's stat then refuses
+        # as the exclusion having moved). But the sticky bit protects the
+        # entries a directory holds and reserves no absent name, so an absent
+        # component under a directory other accounts can write is one another
+        # account creates between this judgement and the role's own creation.
         try:
             st = os.lstat(candidate)
         except FileNotFoundError:
-            return
+            refuse_absent_under(phase, candidate, at, at_st)
+            return at, at_st
         except OSError as exc:
             raise Refusal(phase, "%s could not be examined: %s" % (candidate, exc))
         if stat.S_ISLNK(st.st_mode):
@@ -199,10 +206,17 @@ def require_trusted_ancestors(phase, parent, owner):
             target_components = [c for c in target.split(os.sep) if c not in ("", ".")]
             if target.startswith(os.sep):
                 at = os.sep
+                at_st = lstat_or_refuse(phase, at)
             pending = target_components + pending
             continue
         require_ancestor(phase, candidate, st, owner)
-        at = candidate
+        at, at_st = candidate, st
+    return at, at_st
+
+
+def refuse_absent_under(phase, absent, at, at_st):
+    if at_st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise Refusal(phase, "%s is absent under %s, which is mode %04o and writable by group or others, so another account could create it before the role does" % (absent, at, stat.S_IMODE(at_st.st_mode)))
 
 
 def require_ancestor(phase, path, st, owner):
@@ -312,11 +326,19 @@ def judge_ancestors(root, owner):
     the root's parent when it exists (a fresh host's does not yet), and the
     root when it exists."""
     parent = os.path.dirname(root)
-    require_trusted_ancestors("ancestors", parent, owner)
+    at, at_st = require_trusted_ancestors("ancestors", parent, owner)
     for path in (parent, root):
         try:
             os.lstat(path)
         except FileNotFoundError:
+            # The parent the role is about to make must be one nobody else
+            # can make first: it is judged against the deepest directory the
+            # walk reached (its own container, or the container of the first
+            # absent component above it, whose maker owns everything below).
+            # An absent root lies under a parent judged owned and writable by
+            # nobody else, or under an absent parent.
+            if path == parent:
+                refuse_absent_under("ancestors", parent, at, at_st)
             continue
         require_dir("ancestors", path, owner)
 

@@ -275,7 +275,7 @@ PY
 # shows they were reached and in what order. The mkdir wrapper records only
 # the allocator's own form (`-m 0700 <dir>`), because Ansible creates its
 # temporary directories with the same command on the same PATH.
-for tool in timeout date mkdir systemctl; do
+for tool in timeout date mkdir systemctl sync; do
   real=$(command -v "$tool" || true)
   if [ "$tool" = mkdir ]; then
     cat >"$fakes/$tool" <<FAKE
@@ -301,6 +301,16 @@ case "\${BILLET_FAKE_DATE_MODE:-}" in
   short) echo 2026-09-09; exit 0 ;;
   frozen) echo "\${BILLET_FAKE_DATE_STAMP:-20260909T120000}"; exit 0 ;;
 esac
+exec "$real" "\$@"
+FAKE
+      ;;
+    sync)
+      # THE FLUSH OF A FRESHLY MADE ROOT'S PARENT is the one thing the
+      # preparation runs between its inspection of the managed binary and
+      # its inspection of the claim, so a case stages an updater finishing
+      # there: the wrapper puts a binary back before the real flush.
+      cat >>"$fakes/$tool" <<FAKE
+if [ -n "\${BILLET_FAKE_SYNC_RESTORE:-}" ]; then cp "\$BILLET_FAKE_SYNC_RESTORE" "\$BILLET_FAKE_SYNC_RESTORE_TO"; fi
 exec "$real" "\$@"
 FAKE
       ;;
@@ -1222,7 +1232,30 @@ plant p17-module-error
 run_case p17-module-error escalated -- -e billet_upgrade_root=relative/upgrades -e billet_binary_src="$work/cases/p17-module-error/src/billet"
 expect_refused p17-module-error "Refuse an upgrade root whose ancestors another account can rename" "not an absolute path"
 log_empty p17-module-error
-echo "ok   P17: the root is established 0755/0700 root on a fresh host, an unsafe one refuses before any allocation, and so does an unsafe ancestor, before the parent is made, and a judgement that did not complete"
+plant p17-ancestor-sticky
+rm -rf "$work/cases/p17-ancestor-sticky/lib"
+CASE_DIR_MODE=1777; run_case p17-ancestor-sticky escalated -- -e billet_binary_src="$work/cases/p17-ancestor-sticky/src/billet" -e billet_recovery_dir_suffix_command="$fakes/suffix"; CASE_DIR_MODE=0755
+expect_refused p17-ancestor-sticky "Refuse an upgrade root whose ancestors another account can rename" "is absent under" "writable by group or others, so another account could create it"
+[ ! -e "$work/cases/p17-ancestor-sticky/lib" ] || fail "p17-ancestor-sticky: the root's parent was made under a sticky world-writable ancestor"
+expect_no_task p17-ancestor-sticky "Establish the upgrade root's parent"
+log_empty p17-ancestor-sticky
+echo "ok   P17: the root is established 0755/0700 root on a fresh host, an unsafe one refuses before any allocation, and so does an unsafe ancestor, before the parent is made, an absent parent under a sticky directory, and a judgement that did not complete"
+
+# P18. THE MANAGED BINARY APPEARS between the preparation's inspection and the
+# claim's: an updater that finished and released its claim in that window.
+# The preparation saw no binary and asked nothing for the guard's status; the
+# staging sees one and refuses rather than converging unheld beside it.
+plant p18-appeared
+mv "$work/cases/p18-appeared/bin/billet" "$work/cases/p18-appeared/bin/billet.aside"
+rm -rf "$(root_of p18-appeared)"
+run_case p18-appeared escalated BILLET_FAKE_SYNC_RESTORE="$work/cases/p18-appeared/bin/billet.aside" BILLET_FAKE_SYNC_RESTORE_TO="$work/cases/p18-appeared/bin/billet" --
+expect_refused p18-appeared "Refuse a converge whose managed binary appeared or vanished before the staging" "appeared between the preparation's inspection and this staging"
+expect_task p18-appeared "Flush the upgrade root's parent"
+[ -e "$work/cases/p18-appeared/bin/billet" ] || fail "p18-appeared: the binary was never put back, so the case staged nothing"
+! grep -q 'converge-guard' "$work/cases/p18-appeared/log" || fail "p18-appeared: the managed binary was asked or held" "$work/cases/p18-appeared/log"
+expect_no_task p18-appeared "Hold this host for the converge"
+marker_absent p18-appeared
+echo "ok   P18: a managed binary that appears between the preparation's inspection and the claim's refuses the converge before anything is staged or held"
 
 # =============================================================================
 # S. The staging.
@@ -1309,7 +1342,7 @@ printf '0badcafe\n0badcafe\n1badcafe\n' >"$work/cases/s3-b/suffixes"
 { cat "$fakes/billet-candidate"; echo "# candidate B"; } >"$work/cases/s3-b/src/other"; chmod 0755 "$work/cases/s3-b/src/other"
 # THE BOOLEANS AS JSON: a `-e name=false` is the string "false", which Jinja
 # reads as true in `not billet_interrupted_upgrade`.
-s3b_json='{"billet_exclusion_become": false, "billet_exclusion_darwin": false, "billet_interrupted_upgrade": false, "billet_exclusion_managed_pre_r": false, "billet_upgrade_claim_shape": "none", "billet_resolved_version": ""}'
+s3b_json='{"billet_exclusion_become": false, "billet_exclusion_darwin": false, "billet_interrupted_upgrade": false, "billet_exclusion_managed_pre_r": false, "billet_exclusion_binary_present": true, "billet_upgrade_claim_shape": "none", "billet_resolved_version": ""}'
 s3b_args="-e billet_gate_entry=stage-candidate -e billet_exclusion_root=$(root_of s3-b) -e billet_exclusion_binary=$work/cases/s3-b/bin/billet -e billet_recovery_dir_suffix_command=$fakes/suffix"
 # shellcheck disable=SC2086
 run_case s3-b escalated BILLET_FAKE_DATE_MODE=frozen BILLET_FAKE_SUFFIXES="$work/cases/s3-b/suffixes" -- $s3b_args -e "$s3b_json" -e billet_binary_src="$work/cases/s3-b/src/billet"

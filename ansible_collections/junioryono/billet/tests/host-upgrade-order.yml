@@ -780,6 +780,9 @@
           - "'billet_exclusion_ancestors.judged' in ((billet_prepare_block | selectattr('name', 'equalto', 'Refuse an upgrade root whose ancestors another account can rename') | first)['ansible.builtin.assert'].that | join(' '))"
           - (billet_prepare_block | selectattr('name', 'equalto', "Establish the upgrade root's parent") | first)['ansible.builtin.file'].follow == false
           - billet_prepare_root_make['ansible.builtin.file'].follow == false
+          - billet_prepare_block_names | last == 'Refuse a converge whose exclusion was never established'
+          - "'billet_exclusion_held' in ((billet_prepare_block | selectattr('name', 'equalto', 'Refuse a converge whose exclusion was never established') | first)['ansible.builtin.assert'].that | join(' '))"
+          - "'ansible_check_mode' in ((billet_prepare_block | selectattr('name', 'equalto', 'Refuse a converge whose exclusion was never established') | first)['ansible.builtin.assert'].that | join(' '))"
           - (billet_prepare_block | selectattr('name', 'equalto', 'Judge the ancestors of the upgrade root') | first)['junioryono.billet.guard_fallback'].judge == 'ancestors'
           # THE LEGACY PROTOCOL only when no capable executable exists.
           - "'billet_exclusion_managed_pre_r' in ((billet_prepare_block | selectattr('name', 'equalto', 'Record that a release before the guard runs the legacy protocol') | first).when | string)"
@@ -846,6 +849,9 @@
           # A MAC STAGES NOTHING: the resolution block and the installed-binary stat are Linux's.
           - "'billet_exclusion_darwin' in ((billet_host_stage_tasks | selectattr('name', 'equalto', \"Resolve and stage this invocation's candidate\") | first).when | string)"
           - "'billet_exclusion_darwin' in ((billet_host_stage_tasks | selectattr('name', 'equalto', 'Inspect the installed billet binary') | first).when | string)"
+          - billet_stage_names.index('Inspect the installed billet binary') < billet_stage_names.index('Refuse a converge whose managed binary appeared or vanished before the staging')
+          - billet_stage_names.index('Refuse a converge whose managed binary appeared or vanished before the staging') < billet_stage_names.index("Resolve and stage this invocation's candidate")
+          - "'billet_exclusion_binary_present' in ((billet_host_stage_tasks | selectattr('name', 'equalto', 'Refuse a converge whose managed binary appeared or vanished before the staging') | first)['ansible.builtin.assert'].that | join(' '))"
           - "'release --holder' in billet_stage_intent['ansible.builtin.assert'].fail_msg"
           - "\"== 'guard'\" in (billet_stage_intent.when | string)"
           - billet_stage_block_names.index('Decide whether the billet binary needs a transactional upgrade') < billet_stage_block_names.index('Refuse a same-holder rerun with a different intent')

@@ -313,6 +313,25 @@ def main():
         except mod.Refusal as exc:
             fail("an absent ancestor was refused: %s" % exc)
     with tempfile.TemporaryDirectory() as base:
+        # An absent ancestor under a directory other accounts can write is
+        # refused even under the sticky bit, which reserves no absent name.
+        os.chmod(base, 0o1777)
+        try:
+            mod.judge_ancestors(os.path.join(base, "missing", "billet", "upgrades"), owner)
+        except mod.Refusal as exc:
+            if "is absent under" not in str(exc) or exc.phase != "ancestors":
+                fail("the absent ancestor under a sticky directory refused for the wrong reason: %s" % exc)
+        else:
+            fail("an absent ancestor under a sticky world-writable directory was admitted")
+        try:
+            mod.judge_ancestors(os.path.join(base, "billet", "upgrades"), owner)
+        except mod.Refusal as exc:
+            if "is absent under" not in str(exc):
+                fail("the absent parent under a sticky directory refused for the wrong reason: %s" % exc)
+        else:
+            fail("an absent parent under a sticky world-writable directory was admitted")
+        os.chmod(base, 0o700)
+    with tempfile.TemporaryDirectory() as base:
         tree = Tree(base)
         tree.root.chmod(0o770)
         try:

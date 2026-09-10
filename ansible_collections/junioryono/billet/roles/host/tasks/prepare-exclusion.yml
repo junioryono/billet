@@ -799,3 +799,29 @@
           {{ billet_exclusion_root }}/active and no guard excludes a rollout from
           it. Pin a release that carries the guard to close that race.
       when: billet_upgrade_claim_shape | default('none') == 'legacy'
+
+    # THE PREPARATION ENDS IN A STATE IT CAN NAME, outside a dry run: this
+    # converge holds the host; the host is under a legacy pointer, which the
+    # recovery ends the play over; the legacy protocol, admitted above; or no
+    # billet is installed and none is to be installed, so there is nothing to
+    # hold and no updater to exclude. Anything else (a managed binary that was
+    # not there to be asked, a candidate that was never held through) is a
+    # converge that would run unheld beside whatever put the host in that
+    # state, and refuses.
+    - name: Refuse a converge whose exclusion was never established
+      ansible.builtin.assert:
+        that:
+          - >-
+            ansible_check_mode
+            or (billet_exclusion_held | default(false) | bool)
+            or (billet_upgrade_claim_shape | default('none') in ['legacy-file', 'legacy'])
+            or (not (billet_exclusion_binary_present | bool)
+                and not (billet_binary_upgrade | default(false) | bool)
+                and billet_upgrade_claim_shape | default('none') == 'none')
+        fail_msg: >-
+          The preparation ends with {{ billet_exclusion_root }}/active in shape
+          {{ billet_upgrade_claim_shape | default('none') }}, this converge not
+          holding it, the managed binary {{ 'present' if billet_exclusion_binary_present | bool else 'absent' }}
+          and {{ 'a' if billet_binary_upgrade | default(false) | bool else 'no' }} binary change staged:
+          no exclusion was established, and a converge does not run unheld.
+          Nothing was changed; inspect the host and rerun.
