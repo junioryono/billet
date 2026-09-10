@@ -1378,6 +1378,10 @@ func TestTheStatusJudgeRefusesEachCorruptionByName(t *testing.T) {
 		{"not JSON", []byte("nope"), "not JSON"},
 		{"a list", []byte("[]"), "not JSON"},
 		{"bytes after the object", []byte(`{"active": "none"} garbage`), "bytes after its object"},
+		{"active repeated, valid last", []byte(`{"active": null, "active": "none"}`), "repeats active"},
+		{"active repeated, valid first", []byte(`{"active": "none", "active": null}`), "repeats active"},
+		{"a nested member repeated", []byte(`{"active": "converge-guard", "guard": {"record_error": "x", "record_error": "y"}}`), "repeats record_error"},
+		{"a member repeated inside a list", []byte(`{"active": "none", "why": [{"a": 1, "a": 2}]}`), "repeats a"},
 		{"two objects", []byte(`{"active": "none"}{}`), "bytes after its object"},
 		{"active null", corrupt([]string{"active"}, nil, false), "active is missing or not a string"},
 		{"why null under unknown", []byte(`{"active": "unknown", "why": null}`), "why is not a string"},
@@ -1433,6 +1437,7 @@ func TestTheStatusJudgeRefusesEachCorruptionByName(t *testing.T) {
 	}{
 		{"healthy", corrupt(nil, nil, false)},
 		{"healthy with a trailing newline", append(corrupt(nil, nil, false), '\n')},
+		{"the same name in two objects", []byte(`{"active": "unknown", "why": "x", "guard": {"why": "y"}}`)},
 		{"a record error", []byte(`{"active": "converge-guard", "guard": {"record_error": "not JSON"}}`)},
 		{"none", []byte(`{"active": "none"}`)},
 		{"unknown with why", []byte(`{"active": "unknown", "why": "x"}`)},

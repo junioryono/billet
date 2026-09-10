@@ -86,6 +86,7 @@ fail() {
 
 # --- the module's own check -------------------------------------------------
 "$python" "$here/guard_fallback_check.py"
+"$python" "$here/strict_json_check.py"
 
 # --- the guard runs first, the preparation second ---------------------------
 first_task=$(grep -n '^- name:' "$role_tasks/main.yml" | head -1 | cut -d: -f1)
@@ -1286,7 +1287,7 @@ HOLDER=""; ns_case b7m-absent-corrupt escalated; HOLDER=h1
 expect_refused b7m-absent-corrupt "Judge the guard's record" "preparing"
 expect_calls b7m-absent-corrupt candidate "" 0
 # The parser requires the guard object under converge-guard and reads its members by type.
-for variant in no-guard null-error numeric-holder; do
+for variant in no-guard null-error numeric-holder null-error-healthy numeric-pointer-problem; do
   plant "b7o-$variant"
   p "b7o-$variant" 'plant_root; plant_managed v0.10.0'
   a "b7o-$variant" --check
@@ -1294,11 +1295,21 @@ for variant in no-guard null-error numeric-holder; do
     no-guard) printf '{"outcome": "reported", "shape": "converge-guard", "guard": null, "managed": {"path": "/usr/bin/billet", "present": true}}\n' ;;
     null-error) printf '{"outcome": "reported", "shape": "converge-guard", "guard": {"record_error": null, "pointer": true}, "managed": {"path": "/usr/bin/billet", "present": true}}\n' ;;
     numeric-holder) printf '{"outcome": "reported", "shape": "converge-guard", "guard": {"holder": 7, "claimed_at": "2026-09-09T12:00:00Z", "preparing": false, "pointer": true}, "managed": {"path": "/usr/bin/billet", "present": true}}\n' ;;
+    null-error-healthy) printf '{"outcome": "reported", "shape": "converge-guard", "guard": {"holder": "h2", "claimed_at": "2026-09-09T12:00:00Z", "preparing": false, "record_error": null, "pointer": false}, "managed": {"path": "/usr/bin/billet", "present": true}}\n' ;;
+    numeric-pointer-problem) printf '{"outcome": "reported", "shape": "converge-guard", "guard": {"holder": "h2", "claimed_at": "2026-09-09T12:00:00Z", "preparing": false, "pointer": true, "pointer_problem": 7}, "managed": {"path": "/usr/bin/billet", "present": true}}\n' ;;
   esac >"$work/cases/b7o-$variant/dry.json"
   e "b7o-$variant" "BILLET_GATE_ANSWER=prepare:1:$work/cases/b7o-$variant/dry.json"
   HOLDER=""; ns_case "b7o-$variant" escalated; HOLDER=h1
   expect_refused "b7o-$variant" "Judge the dry run's answer" "guard"
 done
+# A repeated member in a dry run's report is refused by the strict read, before any judgement.
+plant b7o-repeated
+p b7o-repeated 'plant_root; plant_managed v0.10.0'
+a b7o-repeated --check
+printf '{"outcome": "reported", "shape": "none", "guard": null, "managed": {"path": "/usr/bin/billet", "present": true}, "shape": "none"}\n' >"$work/cases/b7o-repeated/dry.json"
+e b7o-repeated "BILLET_GATE_ANSWER=prepare:1:$work/cases/b7o-repeated/dry.json"
+HOLDER=""; ns_case b7o-repeated escalated; HOLDER=h1
+expect_refused b7o-repeated "Read the dry run's report" "repeated"
 # A claim that appeared between the stat and the report is the report's: a legacy file, a Go transaction.
 plant b7q-legacy-appeared
 p b7q-legacy-appeared 'plant_root; plant_managed v0.10.0'
@@ -1502,6 +1513,39 @@ for member in outcome id holder preparing token record pointer managed downgrade
 done
 # A success answer under a non-zero exit is refused at the member `exit`,
 # before any fact is taken: no token known, nothing released.
+# A repeated member, the valid value last: the strict read refuses before any fact is taken.
+plant b12-repeated
+p b12-repeated 'plant_root; plant_managed v0.10.0'
+"$python" - "$work/corpus/acquired.json" "$work/cases/b12-repeated/answer.json" <<'PY'
+import sys
+text = open(sys.argv[1]).read().rstrip().rstrip("}")
+open(sys.argv[2], "w").write(text + ', "pointer": true, "pointer": false}\n')
+PY
+e b12-repeated "BILLET_GATE_ANSWER=prepare:1:$work/cases/b12-repeated/answer.json"
+ns_case b12-repeated escalated
+expect_refused b12-repeated "Read the preparation's answer" "repeated"
+expect_fact b12-repeated token_known False
+expect_final b12-repeated "no cleanup was attempted" "release --holder h1"
+expect_state b12-repeated record_preparing True
+expect_calls b12-repeated managed "converge-guard release" 0
+# A numeric token or id of 32 digits: refused as not a string before any fact is taken, so the rescue reads no number.
+for member in token id; do
+  plant "b12n-$member"
+  p "b12n-$member" 'plant_root; plant_managed v0.10.0'
+  "$python" - "$work/corpus/acquired.json" "$work/cases/b12n-$member/answer.json" "$member" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+d[sys.argv[3]] = 12345678901234567890123456789012
+json.dump(d, open(sys.argv[2], "w"), indent=2)
+PY
+  e "b12n-$member" "BILLET_GATE_ANSWER=prepare:1:$work/cases/b12n-$member/answer.json"
+  ns_case "b12n-$member" escalated
+  expect_refused "b12n-$member" "Judge the preparation's answer" "$member"
+  expect_fact "b12n-$member" token_known False
+  expect_final "b12n-$member" "no cleanup was attempted" "release --holder h1"
+  expect_state "b12n-$member" record_preparing True
+  expect_calls "b12n-$member" managed "converge-guard release" 0
+done
 plant b12-exit
 p b12-exit 'plant_root; plant_managed v0.10.0'
 e b12-exit "BILLET_GATE_FAIL=prepare:1:exit:1"

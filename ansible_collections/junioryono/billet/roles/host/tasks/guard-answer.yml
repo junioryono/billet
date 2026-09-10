@@ -51,9 +51,13 @@
       with `release --holder {{ billet_exclusion_holder }}`.
   when: not billet_exclusion_pre_r | bool
 
+# ONE VALUE PER MEMBER: `from_json` keeps the last of a repeated member, so an
+# answer ending `"pointer": true, "pointer": false` would read as settled
+# where the command's own decoder refuses it; the strict filter refuses it
+# here, and a refusal in this task ends the block with no fact taken.
 - name: Read the preparation's answer
   ansible.builtin.set_fact:
-    billet_exclusion_answer: "{{ billet_exclusion_raw.stdout | from_json }}"
+    billet_exclusion_answer: "{{ billet_exclusion_raw.stdout | junioryono.billet.from_json_strict }}"
   no_log: true
   when: not billet_exclusion_pre_r | bool
 
@@ -67,24 +71,27 @@
         ok: "{{ billet_exclusion_a.outcome | default('') in ['acquired', 'validated', 'rebound', 'refused', 'unknown'] }}"
       - name: exit
         ok: "{{ billet_exclusion_a.outcome | default('') in ['refused', 'unknown'] or (billet_exclusion_raw.rc | default(1)) == 0 }}"
+      # EVERY TEXT MEMBER IS A STRING BEFORE ITS SHAPE IS JUDGED: a coerced
+      # number of 32 digits matched the id's and the token's pattern, was
+      # stored as a number, and the next `length` over it ended the rescue.
       - name: reason
-        ok: "{{ billet_exclusion_a.outcome | default('') not in ['refused', 'unknown'] or (billet_exclusion_a.reason | default('') | string | length > 0) }}"
+        ok: "{{ billet_exclusion_a.outcome | default('') not in ['refused', 'unknown'] or (billet_exclusion_a.reason | default('') is string and billet_exclusion_a.reason | default('') | length > 0) }}"
       - name: why
-        ok: "{{ billet_exclusion_a.outcome | default('') not in ['refused', 'unknown'] or (billet_exclusion_a.why | default('') | string | length > 0) }}"
+        ok: "{{ billet_exclusion_a.outcome | default('') not in ['refused', 'unknown'] or (billet_exclusion_a.why | default('') is string and billet_exclusion_a.why | default('') | length > 0) }}"
       - name: id
-        ok: "{{ billet_exclusion_a.outcome | default('') in ['refused', 'unknown'] or (billet_exclusion_a.id | default('') | string is match(billet_exclusion_hex32)) }}"
+        ok: "{{ billet_exclusion_a.outcome | default('') in ['refused', 'unknown'] or (billet_exclusion_a.id | default('') is string and billet_exclusion_a.id | default('') is match(billet_exclusion_hex32)) }}"
       - name: holder
         ok: "{{ billet_exclusion_a.outcome | default('') in ['refused', 'unknown'] or (billet_exclusion_a.holder | default('') == billet_exclusion_holder) }}"
       - name: preparing
         ok: "{{ billet_exclusion_a.outcome | default('') in ['refused', 'unknown'] or (billet_exclusion_a.preparing | default('x') is sameas true) or (billet_exclusion_a.preparing | default('x') is sameas false) }}"
       - name: token
-        ok: "{{ billet_exclusion_a.outcome | default('') != 'acquired' or (billet_exclusion_a.token | default('') | string is match(billet_exclusion_hex32)) }}"
+        ok: "{{ billet_exclusion_a.outcome | default('') != 'acquired' or (billet_exclusion_a.token | default('') is string and billet_exclusion_a.token | default('') is match(billet_exclusion_hex32)) }}"
       - name: record
-        ok: "{{ billet_exclusion_a.outcome | default('') in ['refused', 'unknown'] or ((billet_exclusion_a.record | default({})).release_executable | default('') is match('^/') and (billet_exclusion_a.record | default({})).release_executable_sha256 | default('') is match(billet_exclusion_sha) and ((billet_exclusion_a.record | default({})).verified | default('x') is sameas true)) }}"
+        ok: "{{ billet_exclusion_a.outcome | default('') in ['refused', 'unknown'] or ((billet_exclusion_a.record | default({})).release_executable | default('') is string and (billet_exclusion_a.record | default({})).release_executable | default('') is match('^/') and (billet_exclusion_a.record | default({})).release_executable_sha256 | default('') is string and (billet_exclusion_a.record | default({})).release_executable_sha256 | default('') is match(billet_exclusion_sha) and ((billet_exclusion_a.record | default({})).verified | default('x') is sameas true)) }}"
       - name: pointer
         ok: "{{ billet_exclusion_a.outcome | default('') in ['refused', 'unknown'] or (billet_exclusion_a.pointer | default('x') is sameas true) or (billet_exclusion_a.pointer | default('x') is sameas false) }}"
       - name: pointer_target
-        ok: "{{ billet_exclusion_a.outcome | default('') in ['refused', 'unknown'] or not (billet_exclusion_a.pointer | default(false) is sameas true) or (billet_exclusion_a.pointer_target | default('') is match('^' ~ (billet_exclusion_root | regex_escape) ~ '/(recovery-[0-9]{8}T[0-9]{6}-[0-9a-f]{8}|[0-9]{8}T[0-9]{15})$')) }}"
+        ok: "{{ billet_exclusion_a.outcome | default('') in ['refused', 'unknown'] or not (billet_exclusion_a.pointer | default(false) is sameas true) or (billet_exclusion_a.pointer_target | default('') is string and billet_exclusion_a.pointer_target | default('') is match('^' ~ (billet_exclusion_root | regex_escape) ~ '/(recovery-[0-9]{8}T[0-9]{6}-[0-9a-f]{8}|[0-9]{8}T[0-9]{15})$')) }}"
       - name: managed
         ok: "{{ billet_exclusion_a.outcome | default('') in ['refused', 'unknown'] or ((billet_exclusion_a.managed | default({})).present | default('x') is sameas true) or ((billet_exclusion_a.managed | default({})).present | default('x') is sameas false) or ((billet_exclusion_a.managed | default({})).present | default('x') == 'unknown') }}"
       - name: downgrade

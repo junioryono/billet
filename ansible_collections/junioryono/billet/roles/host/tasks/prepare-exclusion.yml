@@ -377,7 +377,7 @@
     - name: Read the dry run's report
       ansible.builtin.set_fact:
         billet_exclusion_dry_report: >-
-          {{ (billet_exclusion_dry_answer.stdout | from_json)
+          {{ (billet_exclusion_dry_answer.stdout | junioryono.billet.from_json_strict)
              if (billet_exclusion_dry_answered | bool
                  and billet_exclusion_dry_answer.rc | default(1) == 0
                  and (billet_exclusion_dry_answer.stdout | default('') | trim) is match('^\{'))
@@ -388,9 +388,11 @@
     # exactly where the command writes one (under converge-guard and nowhere
     # else, so an answer that dropped it cannot hide a pointer), which is
     # either a record the command could read (holder, claimed_at, preparing,
-    # each of its type) or one it could not (record_error, a non-empty
-    # string, reported and shown, never refused here: the refusal is the
-    # converge's), each with its pointer boolean.
+    # each of its type, with no record_error member) or one it could not
+    # (record_error present, a non-empty string, reported and shown, never
+    # refused here: the refusal is the converge's), each with its pointer
+    # boolean and, when present, a pointer_problem and a pointer_target that
+    # are non-empty strings, so the report below reads nothing untyped.
     - name: Judge the dry run's answer
       vars:
         billet_exclusion_dry_shapes: [none, converge-guard, host-upgrade, legacy-role, unpublished-guard, unknown]
@@ -403,9 +405,15 @@
              else ('guard' if not (((billet_exclusion_dry_report.shape == 'converge-guard') == (billet_exclusion_dry_guard_present | bool))
                                    and (not (billet_exclusion_dry_guard_present | bool)
                                         or ((billet_exclusion_dry_report.guard.pointer | default('x') is sameas true or billet_exclusion_dry_report.guard.pointer | default('x') is sameas false)
-                                            and ((billet_exclusion_dry_report.guard.record_error | default('') is string
-                                                  and billet_exclusion_dry_report.guard.record_error | default('') | length > 0)
-                                                 or (billet_exclusion_dry_report.guard.holder | default('') is string
+                                            and (('pointer_problem' not in billet_exclusion_dry_report.guard)
+                                                 or (billet_exclusion_dry_report.guard.pointer_problem is string and billet_exclusion_dry_report.guard.pointer_problem | length > 0))
+                                            and (('pointer_target' not in billet_exclusion_dry_report.guard)
+                                                 or (billet_exclusion_dry_report.guard.pointer_target is string and billet_exclusion_dry_report.guard.pointer_target | length > 0))
+                                            and ((('record_error' in billet_exclusion_dry_report.guard)
+                                                  and billet_exclusion_dry_report.guard.record_error is string
+                                                  and billet_exclusion_dry_report.guard.record_error | length > 0)
+                                                 or (('record_error' not in billet_exclusion_dry_report.guard)
+                                                     and billet_exclusion_dry_report.guard.holder | default('') is string
                                                      and billet_exclusion_dry_report.guard.holder | default('') | length > 0
                                                      and billet_exclusion_dry_report.guard.claimed_at | default('') is string
                                                      and billet_exclusion_dry_report.guard.claimed_at | default('') | length > 0
@@ -964,7 +972,7 @@
         # final diagnostic below is reached whatever the answer was.
         - name: Read the remainder's answer
           ansible.builtin.set_fact:
-            billet_exclusion_remainder_doc: "{{ billet_exclusion_remainder_status.stdout | from_json }}"
+            billet_exclusion_remainder_doc: "{{ billet_exclusion_remainder_status.stdout | junioryono.billet.from_json_strict }}"
           ignore_errors: true
           when:
             - billet_exclusion_remainder_status is not skipped

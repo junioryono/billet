@@ -116,6 +116,10 @@ var guardRandom = func(n int) ([]byte, error) {
 // the bound and refused.
 var guardCommandTimeout = 60 * time.Second
 
+// guardWaitDelay is how long a bounded command's output is waited for after
+// the process exited, when a descendant kept it open; a test shortens it.
+var guardWaitDelay = 10 * time.Second
+
 // hex32 is the shape of an id and of a token.
 var guardHex32 = regexp.MustCompile(`^[0-9a-f]{32}$`)
 
@@ -951,6 +955,11 @@ func candidateCapable(ctx context.Context, binary string) (bool, string) {
 			return false, "the candidate's status answer is not one object: " + err.Error()
 		case rc < 0:
 			return false, "the candidate could not be run: " + err.Error()
+		case rc == 0:
+			// EXIT 0 BESIDE AN ERROR is an answer not read whole: a descendant
+			// kept the output open past the wait, or the pipe failed, and
+			// what was kept is what arrived before that, not the answer.
+			return false, "the candidate's status answer was not read whole: " + err.Error()
 		}
 	}
 
@@ -972,7 +981,7 @@ func runBounded(ctx context.Context, binary string, args ...string) ([]byte, []b
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, binary, args...)
-	cmd.WaitDelay = 10 * time.Second
+	cmd.WaitDelay = guardWaitDelay
 	cmd.Stdin = nil
 	cmd.Env = withoutNotifySocket(os.Environ())
 
@@ -1296,6 +1305,13 @@ func judgeStatusAnswer(rc int, stdout, stderr []byte, timedOut bool) string {
 		return "envelope: the answer carries bytes after its object"
 	}
 
+	// ONE VALUE PER MEMBER, at every depth: Go's decoder keeps the last of a
+	// repeated member, so `"active": null, "active": "none"` would read as
+	// the healthy value its writer never meant.
+	if key := jsonRepeatedMember(stdout); key != "" {
+		return "envelope: the answer repeats " + key
+	}
+
 	active, ok := jsonString(report["active"])
 	if !ok {
 		return "envelope: active is missing or not a string"
@@ -1387,6 +1403,70 @@ func judgeStatusAnswer(rc int, stdout, stderr []byte, timedOut bool) string {
 
 	return "guard: release_executable_verified is neither true, false nor an object whose one member is a " +
 		"non-empty string unknown"
+}
+
+// jsonRepeatedMember names the first member repeated inside any object of a
+// document that decodes, or "" when none repeats; a document that does not
+// decode is the decoder's to refuse.
+func jsonRepeatedMember(body []byte) string {
+	type frame struct {
+		object    bool
+		seen      map[string]bool
+		expectKey bool
+	}
+
+	dec := json.NewDecoder(bytes.NewReader(body))
+
+	var stack []*frame
+
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return ""
+		}
+
+		var top *frame
+		if len(stack) > 0 {
+			top = stack[len(stack)-1]
+		}
+
+		if delim, ok := tok.(json.Delim); ok {
+			switch delim {
+			case '{':
+				stack = append(stack, &frame{object: true, seen: map[string]bool{}, expectKey: true})
+			case '[':
+				stack = append(stack, &frame{})
+			case '}', ']':
+				stack = stack[:len(stack)-1]
+
+				if len(stack) > 0 && stack[len(stack)-1].object {
+					stack[len(stack)-1].expectKey = true
+				}
+			}
+
+			continue
+		}
+
+		if top == nil || !top.object {
+			continue
+		}
+
+		if top.expectKey {
+			key, ok := tok.(string)
+			if !ok {
+				return ""
+			}
+
+			if top.seen[key] {
+				return key
+			}
+
+			top.seen[key] = true
+			top.expectKey = false
+		} else {
+			top.expectKey = true
+		}
+	}
 }
 
 // jsonString reads a member as a JSON string: absent, null or any other type

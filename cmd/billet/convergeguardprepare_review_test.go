@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // The first code review of the preparation found five windows; each is a
@@ -408,6 +409,31 @@ func TestACandidateWhoseAnswerOverflowsTheBoundIsNotCapable(t *testing.T) {
 
 	if !strings.Contains(o.str("why"), "not read whole") {
 		t.Errorf("why %q does not name the overflow", o.str("why"))
+	}
+}
+
+// A candidate that exits 0 and leaves a descendant holding its output is not
+// capable: the run ends at the wait delay with the prefix that arrived, and
+// a prefix is not the answer.
+func TestACandidateThatKeepsItsOutputOpenIsNotCapable(t *testing.T) {
+	f := newGuardFixture(t)
+	managedScript(t, f, "v0.10.1")
+	mustOutcome(t, runPrepare(t, "--holder", "ci-1", "--validate"), prepareAcquired)
+
+	prev := guardWaitDelay
+	guardWaitDelay = time.Second
+
+	t.Cleanup(func() { guardWaitDelay = prev })
+
+	body := "#!/bin/sh\ncase \"$1\" in\n  version) echo \"billet v0.10.2 linux/amd64\";;\n" +
+		"  converge-guard) printf '{\"active\": \"none\"}\\n'; sleep 4 &\n;;\nesac\nexit 0\n"
+	cand := stageGuardCandidate(t, f, "recovery-20260909T120000-0badcafe", []byte(body))
+
+	o := runPrepare(t, "--holder", "ci-1", "--candidate", cand)
+	mustRefusal(t, o, reasonFloor)
+
+	if !strings.Contains(o.str("why"), "not read whole") {
+		t.Errorf("why %q does not name the open output", o.str("why"))
 	}
 }
 
