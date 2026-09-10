@@ -505,7 +505,10 @@ func TestAVersionLineThatNamesNoBuildIsNotNoRelease(t *testing.T) {
 	// reaches the managed binary's version.
 	cand := guardCandidateScript(t, f, "recovery-20260909T120000-1badcafe", "v0.9.0", "capable")
 	mustOutcome(t, runPrepare(t, "--holder", "ci-1", "--candidate", cand, "--allow-downgrade"), prepareRebound)
-	mustOK(t, os.WriteFile(f.binary, script("billet go go1.26.0\\n"), 0o755))
+	mustOK(t, os.WriteFile(f.binary, script("billet v0.10.1-20260909120000-83de6dda9f5b\\n"), 0o755))
+
+	recordBefore, err := os.ReadFile(filepath.Join(f.active(), guardRecordName))
+	mustOK(t, err)
 
 	o := runPrepare(t, "--holder", "ci-1", "--candidate", cand, "--allow-downgrade")
 	mustOutcome(t, o, prepareUnknown)
@@ -514,10 +517,20 @@ func TestAVersionLineThatNamesNoBuildIsNotNoRelease(t *testing.T) {
 		t.Errorf("why %q over the managed binary", o.str("why"))
 	}
 
+	recordAfter, err := os.ReadFile(filepath.Join(f.active(), guardRecordName))
+	mustOK(t, err)
+
+	if !bytes.Equal(recordBefore, recordAfter) {
+		t.Error("the record was rewritten under a version that names no build")
+	}
+
 	for _, form := range []string{
 		"v0.0.0-20260811035856-83de6dda9f5b+dirty", "v0.0.0-20260811035856-83de6dda9f5b",
+		"v1.0.0-20260909120000-83de6dda9f5b",
 		"v0.10.1-0.20260909120000-83de6dda9f5b", "v0.10.1-pre.0.20260909120000-83de6dda9f5b",
+		"v0.10.1-rc1.0.20260909120000-83de6dda9f5b",
 		"v0.10.2-rc1.0.20260909120000-83de6dda9f5b+incompatible",
+		"v0.10.1+dirty", "0.10.1+dirty", "v0.10.1+incompatible",
 		"0.0.0-SNAPSHOT-83de6dda", "v0.10.1-SNAPSHOT-83de6dda9f5b", "(devel)", "(unknown)",
 	} {
 		if !namesADevelopmentBuild(form) {
@@ -525,13 +538,54 @@ func TestAVersionLineThatNamesNoBuildIsNotNoRelease(t *testing.T) {
 		}
 	}
 
+	// THE THREE SHAPES AND NOTHING LOOSER: the timestamp-only form needs a
+	// vX.0.0 base, a prerelease base needs its own `.0.` before the stamp, the
+	// revision is twelve hex digits, and a release tag with a prerelease and
+	// no stamp is not a build Go mints.
 	for _, form := range []string{
 		"go", "", "v0.0.0-", "0.0.0-", "v0.0.0-garbage", "v0.0.0-2026081103585-83de6dda9f5b",
 		"v0.0.0-20260811035856-83de6dda9f5", "v0.0.0-20260811035856-83de6dda9f5b extra", "0.0.0-SNAPSHOT-", "v0.10.1",
+		"v0.10.1-20260909120000-83de6dda9f5b", "v0.10.1-rc10.20260909120000-83de6dda9f5b",
+		"v0.10.1-rc1.0.20260909120000-", "v0.10.1-rc1", "v01.0.0-20260909120000-83de6dda9f5b", "v0.10.1-dirty",
 	} {
 		if namesADevelopmentBuild(form) {
 			t.Errorf("%q was read as a development build", form)
 		}
+	}
+}
+
+// A dirty checkout at a release tag names a development build: a candidate
+// answering it is judged with no downgrade, and a managed binary answering it
+// compares nothing rather than blocking every candidate.
+func TestADirtyBuildAtAReleaseTagIsADevelopmentBuild(t *testing.T) {
+	f := newGuardFixture(t)
+	managedScript(t, f, "v0.10.1")
+	mustOutcome(t, runPrepare(t, "--holder", "ci-1", "--validate"), prepareAcquired)
+
+	dirty := "#!/bin/sh\ncase \"$1\" in\n  version) echo \"billet v0.10.1+dirty 83de6dda9f5b 2026-09-10T12:00:00Z\";;\n" +
+		"  converge-guard) printf '{\"active\": \"none\"}\\n';;\nesac\nexit 0\n"
+
+	cand := stageGuardCandidate(t, f, "recovery-20260909T120000-0badcafe", []byte(dirty))
+	o := runPrepare(t, "--holder", "ci-1", "--candidate", cand)
+	mustOutcome(t, o, prepareRebound)
+
+	if o.boolean("downgrade") {
+		t.Error("a dirty build at a tag was judged a downgrade")
+	}
+
+	// The managed binary dirty at a tag (a fresh guard, since one holder
+	// keeps one intent): an older release candidate is re-bound with nothing
+	// compared, and no --allow-downgrade is needed.
+	f = newGuardFixture(t)
+	mustOK(t, os.WriteFile(f.binary, []byte(dirty), 0o755))
+	mustOutcome(t, runPrepare(t, "--holder", "ci-1", "--validate"), prepareAcquired)
+
+	cand = guardCandidateScript(t, f, "recovery-20260909T120000-1badcafe", "v0.9.0", "capable")
+	o = runPrepare(t, "--holder", "ci-1", "--candidate", cand)
+	mustOutcome(t, o, prepareRebound)
+
+	if o.boolean("downgrade") {
+		t.Error("a candidate under a dirty managed build was judged a downgrade")
 	}
 }
 

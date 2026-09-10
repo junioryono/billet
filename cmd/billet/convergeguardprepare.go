@@ -17,6 +17,8 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/mod/module"
+	"golang.org/x/mod/semver"
 	"golang.org/x/sys/unix"
 
 	"github.com/junioryono/billet/internal/version"
@@ -953,15 +955,39 @@ func executableVersion(ctx context.Context, binary string) (string, error) {
 
 // namesADevelopmentBuild says whether a version token is one of the complete
 // forms a build that is not a release prints: Go's "(devel)", the package's
-// "(unknown)", a Go pseudo-version (on any base: an untagged module's
-// `vX.0.0-<stamp>-<hash>`, a tagged one's `vX.Y.Z-pre.0.<stamp>-<hash>` or
-// `vX.Y.Z-0.<stamp>-<hash>`, with a `+dirty` or build suffix) or a snapshot
-// (`X.Y.Z-SNAPSHOT-<hash>`). A prefix alone, or text after it, names nothing.
+// "(unknown)", a Go pseudo-version in exactly the three shapes `cmd/go` mints
+// (judged by Go's own parser, with the twelve-hex revision the tool writes),
+// a dirty checkout at a release tag (`vX.Y.Z+dirty`, which the version
+// package passes through and Canonical refuses), or GoReleaser's snapshot
+// (`X.Y.Z-SNAPSHOT-<hash>`); every one a valid semantic version. A token of
+// any other shape names no build, and reads as an error, never as "no
+// release to compare".
 func namesADevelopmentBuild(token string) bool {
-	switch {
-	case token == "(devel)", token == "(unknown)":
+	switch token {
+	case "(devel)", "(unknown)":
 		return true
-	case pseudoVersionForm.MatchString(token), snapshotVersionForm.MatchString(token):
+	}
+
+	v := token
+	if !strings.HasPrefix(v, "v") {
+		v = "v" + v
+	}
+
+	if !semver.IsValid(v) {
+		return false
+	}
+
+	switch {
+	case module.IsPseudoVersion(v):
+		rev, err := module.PseudoVersionRev(v)
+
+		return err == nil && pseudoRevisionForm.MatchString(rev)
+	case semver.Prerelease(v) == "" && semver.Build(v) != "":
+		// A DIRTY CHECKOUT AT A RELEASE TAG, or any other build suffix on a
+		// release base: the base names a release, the suffix says these are
+		// not its bytes.
+		return true
+	case snapshotVersionForm.MatchString(v):
 		return true
 	}
 
@@ -969,11 +995,11 @@ func namesADevelopmentBuild(token string) bool {
 }
 
 var (
-	// pseudoVersionForm is Go's pseudo-version grammar (the three shapes
-	// `cmd/go` mints), an optional `+` suffix admitted.
-	pseudoVersionForm = regexp.MustCompile(`^v?\d+\.\d+\.\d+-(?:[0-9A-Za-z.-]*?0\.)?\d{14}-[0-9a-f]{12}(?:\+[0-9A-Za-z.-]+)?$`)
+	// pseudoRevisionForm is the revision `cmd/go` writes into a
+	// pseudo-version: twelve hex digits, where Go's parser admits any length.
+	pseudoRevisionForm = regexp.MustCompile(`^[0-9a-f]{12}$`)
 	// snapshotVersionForm is GoReleaser's snapshot on any base.
-	snapshotVersionForm = regexp.MustCompile(`^v?\d+\.\d+\.\d+-SNAPSHOT-[0-9a-f]{7,40}$`)
+	snapshotVersionForm = regexp.MustCompile(`^v\d+\.\d+\.\d+-SNAPSHOT-[0-9a-f]{7,40}$`)
 )
 
 // candidateCapable executes the candidate's `converge-guard status --json`
