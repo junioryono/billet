@@ -98,8 +98,14 @@
         ok: "{{ billet_exclusion_a.outcome | default('') not in ['refused', 'unknown'] or (billet_exclusion_a.reason | default('') is string and billet_exclusion_a.reason | default('') | length > 0) }}"
       - name: why
         ok: "{{ billet_exclusion_a.outcome | default('') not in ['refused', 'unknown'] or (billet_exclusion_a.why | default('') is string and billet_exclusion_a.why | default('') | length > 0) }}"
+      # THE ID NAMES THE GUARD ALREADY HELD: once this run knows a guard's id
+      # (after its first acquisition, and on every later inclusion), a
+      # successful answer must name that id, because the fact below is what
+      # every later call sends as --expect-id, and an answer naming another
+      # id would make the next inclusion refuse the unchanged, settled guard
+      # as replaced, outside the window the cleanup can act in.
       - name: id
-        ok: "{{ billet_exclusion_a.outcome | default('') in ['refused', 'unknown'] or (billet_exclusion_a.id | default('') is string and billet_exclusion_a.id | default('') is match(billet_exclusion_hex32)) }}"
+        ok: "{{ billet_exclusion_a.outcome | default('') in ['refused', 'unknown'] or (billet_exclusion_a.id | default('') is string and billet_exclusion_a.id | default('') is match(billet_exclusion_hex32) and (billet_exclusion_id | default('') | length == 0 or billet_exclusion_a.id == billet_exclusion_id)) }}"
       - name: holder
         ok: "{{ billet_exclusion_a.outcome | default('') in ['refused', 'unknown'] or (billet_exclusion_a.holder | default('') == billet_exclusion_holder) }}"
       - name: preparing
