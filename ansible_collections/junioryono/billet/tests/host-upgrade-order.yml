@@ -1097,6 +1097,18 @@
       loop_control:
         label: "{{ item.name }}"
 
+    - name: The collection's floor admits the parameter every guard command passes
+      vars:
+        billet_runtime_meta: "{{ lookup('ansible.builtin.file', playbook_dir + '/../meta/runtime.yml') | from_yaml }}"
+      ansible.builtin.assert:
+        that:
+          - billet_runtime_meta.requires_ansible is match('^>=2\\.(1[6-9]|[2-9][0-9])\\.')
+        fail_msg: >-
+          meta/runtime.yml declares {{ billet_runtime_meta.requires_ansible }}, and
+          `expand_argument_vars`, which every guard command passes, exists from
+          ansible-core 2.16; a 2.15 controller would refuse the parameter before
+          billet runs.
+
     - name: The four calls, the settlement and the cleanup are all present
       ansible.builtin.assert:
         that:
