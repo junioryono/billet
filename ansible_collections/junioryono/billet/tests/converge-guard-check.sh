@@ -212,7 +212,8 @@ chmod 0755 "$fakes/billet-hang"
 # wrapper with no backing run, hung, or crashed at a boundary of the seam
 # (BILLET_GATE_FAIL=<cmd>:refuse | <cmd>:hang | <cmd>:<n>:unknown, the n-th
 # invocation answering "unknown command" as a binary from before the guard
-# would | <cmd>:crash:<kind> <path>[:n]).
+# would | <cmd>:<n>:exit:<code>, the real answer printed under another exit
+# status | <cmd>:crash:<kind> <path>[:n]).
 write_wrapper() { # path backing role
   {
     cat <<WRAP
@@ -234,10 +235,12 @@ WRAP
     printf '%s' "$hook_lines"
     cat <<'WRAP'
 failspec=${BILLET_GATE_FAIL:-}
+forced_exit=""
 case "$failspec" in
   "$cmd:refuse") printf 'backing=0 cmd=%s\n' "$cmd" >>"$priv"; echo "billet: refused by the gate's wrapper; nothing was run" >&2; exit 1 ;;
   "$cmd:hang") printf 'backing=0 cmd=%s\n' "$cmd" >>"$priv"; sleep 3600 ;;
   "$cmd:$n:unknown") printf 'backing=0 cmd=%s\n' "$cmd" >>"$priv"; echo 'unknown command "converge-guard"' >&2; exit 2 ;;
+  "$cmd:$n:exit:"*) forced_exit="${failspec#"$cmd:$n:exit:"}" ;;
   "$cmd:crash:"*) export BILLET_GUARD_CRASH_AT="${failspec#"$cmd:crash:"}" ;;
 esac
 out=$(mktemp); err=$(mktemp)
@@ -255,6 +258,7 @@ for spec in "${specs[@]+"${specs[@]}"}"; do
 done
 if [ -n "$substituted" ]; then cat "$substituted"; else cat "$out"; fi
 rm -f "$out" "$err"
+if [ -n "$forced_exit" ]; then exit "$forced_exit"; fi
 exit "$status"
 WRAP
   } >"$1"
@@ -1393,6 +1397,18 @@ for member in outcome id holder preparing token record pointer managed downgrade
   expect_state "b12-$member" record_preparing True
   expect_calls "b12-$member" managed "converge-guard release" 0
 done
+# A success answer under a non-zero exit is refused at the member `exit`,
+# before any fact is taken: no token known, nothing released.
+plant b12-exit
+p b12-exit 'plant_root; plant_managed v0.10.0'
+e b12-exit "BILLET_GATE_FAIL=prepare:1:exit:1"
+ns_case b12-exit escalated
+expect_refused b12-exit "Judge the preparation's answer" "exit"
+expect_fact b12-exit token_known False
+expect_fact b12-exit held False
+expect_final b12-exit "no cleanup was attempted" "release --holder h1"
+expect_state b12-exit record_preparing True
+expect_calls b12-exit managed "converge-guard release" 0
 plant b12-second
 p b12-second 'plant_root; plant_managed v0.10.0'
 e b12-second "BILLET_GATE_ANSWER=prepare:2:$work/corpus/no-change-outcome.json"
@@ -1596,12 +1612,15 @@ expect_refused c7c-after-rmdir "Judge the preparation's answer" "outcome"
 expect_final c7c-after-rmdir "is now none" "durability is not proved"
 expect_fact c7c-after-rmdir released False
 expect_state c7c-after-rmdir active absent
+# The remainder's answer is JSON that stops mid-object, so the rescue's
+# decoder runs and fails, and the final diagnostic is reached regardless.
 c7_plant c7d-status-malformed
-printf 'not json\n' >"$work/cases/c7d-status-malformed/status.txt"
+printf '{"active": "converge-guard", "gu' >"$work/cases/c7d-status-malformed/status.txt"
 e c7d-status-malformed "BILLET_GATE_ANSWER=prepare:2:$work/corpus/no-change-outcome.json;status:1:$work/cases/c7d-status-malformed/status.txt"
 e c7d-status-malformed "BILLET_GATE_FAIL=release:refuse"
 ns_case c7d-status-malformed escalated
-expect_final c7d-status-malformed "is now unknown" "inspect the host by hand"
+expect_refused c7d-status-malformed "Judge the preparation's answer" "outcome"
+expect_final c7d-status-malformed "Judge the preparation's answer" "is now unknown" "inspect the host by hand"
 c7_plant c7f-unexpected-entry
 e c7f-unexpected-entry "BILLET_GATE_HOOK=release:1:touch $ROOT/active/unexpected"
 ns_case c7f-unexpected-entry escalated

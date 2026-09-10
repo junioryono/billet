@@ -11,8 +11,8 @@
     "release_executable": "",
     "release_executable_sha256": "",
     "release_executable_verified": {
-      "unknown": "the record is not JSON: invalid character 'o' in literal null (expecting 'u')"
+      "unknown": "the record is not JSON: not one object"
     },
-    "record_error": "the record is not JSON: invalid character 'o' in literal null (expecting 'u')"
+    "record_error": "the record is not JSON: not one object"
   }
 }

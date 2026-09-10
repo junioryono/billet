@@ -612,9 +612,14 @@ func judgeCandidate(ctx context.Context, root *txLock, dir *os.File, base *prepa
 
 	cand.Version = candVersion
 
-	if managed.Present == true && managed.VersionProblem != "" {
+	switch {
+	case managed.Present == true && managed.VersionProblem != "":
 		return nil, couldNotTell("the managed binary's release could not be read, so no downgrade can be judged: " +
 			managed.VersionProblem)
+	case managed.Present != true && managed.Present != false:
+		// AN UNEXAMINABLE MANAGED PATH is not an absent one: a bootstrap has
+		// nothing to compare, this has something it could not read.
+		return nil, couldNotTell("the managed binary could not be examined, so no downgrade can be judged: " + managed.Why)
 	}
 
 	// THE DOWNGRADE, proved through version.Compare and nothing weaker.
@@ -1213,15 +1218,15 @@ func prepareDryRun(ctx context.Context) error {
 				// dry run never shows a guard without its interrupted transaction.
 				g.Pointer, g.PointerProblem = true, r.Why
 			case r != nil:
-				g.PointerProblem = r.Why
+				g.Pointer, g.PointerProblem = shape.Pointer, r.Why
 			default:
 				g.Pointer, g.PointerTarget = pointer, target
 			}
 		} else {
-			g.PointerProblem = fmt.Sprintf("examine the guard directory: %v", err)
+			g.Pointer, g.PointerProblem = shape.Pointer, fmt.Sprintf("examine the guard directory: %v", err)
 		}
 	} else {
-		g.PointerProblem = fmt.Sprintf("open the upgrade root: %v", err)
+		g.Pointer, g.PointerProblem = shape.Pointer, fmt.Sprintf("open the upgrade root: %v", err)
 	}
 
 	report.Guard = g

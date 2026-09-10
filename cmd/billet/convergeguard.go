@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -1433,12 +1435,7 @@ func classifyGuardDirAt(root *os.File) (claimShape, error) {
 // included) is malformed, never a record from before the protocol: the
 // legacy record is the one with NO `id` member, because adoption mints one
 // and an adopted null would be a record two writers disagree about.
-func checkGuardRecord(body []byte, g guardRecord) string {
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(body, &raw); err != nil {
-		return "the record is not a JSON object"
-	}
-
+func checkGuardRecord(raw map[string]json.RawMessage, g guardRecord) string {
 	for _, k := range []string{"holder", "claimed_at", "hostname", "release_executable", "release_executable_sha256"} {
 		if _, ok := raw[k]; !ok {
 			return "the record lacks " + k
@@ -1471,6 +1468,95 @@ func checkGuardRecord(body []byte, g guardRecord) string {
 	return ""
 }
 
+// guardRecordTypes holds every present member to its type: `preparing` a
+// boolean, every other member a string.
+func guardRecordTypes(raw map[string]json.RawMessage) string {
+	for k, v := range raw {
+		var (
+			s   string
+			b   bool
+			err error
+		)
+
+		if k == "preparing" {
+			err = json.Unmarshal(v, &b)
+		} else {
+			err = json.Unmarshal(v, &s)
+		}
+
+		if err != nil {
+			if k == "preparing" {
+				return "the record's preparing is not a boolean"
+			}
+
+			return "the record's " + k + " is not a string"
+		}
+	}
+
+	return ""
+}
+
+// guardRecordMembers reads the record as a token stream: one object whose
+// keys are the members the command writes, spelled exactly, each at most
+// once, each value kept raw. Go's decoder would match a key case-insensitively
+// and let a repeated key's null leave the earlier value standing, and the
+// Python reader refuses both, so a record admitted here is one both readers
+// read the same way.
+func guardRecordMembers(body []byte) (map[string]json.RawMessage, string) {
+	known := map[string]bool{"holder": true, "claimed_at": true, "hostname": true, "release_executable": true,
+		"release_executable_sha256": true, "id": true, "token": true, "preparing": true}
+
+	dec := json.NewDecoder(bytes.NewReader(body))
+
+	tok, err := dec.Token()
+	if err != nil || tok != json.Delim('{') {
+		return nil, "the record is not JSON: not one object"
+	}
+
+	members := map[string]json.RawMessage{}
+
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return nil, "the record is not JSON: not one object"
+		}
+
+		key, ok := tok.(string)
+		if !ok {
+			return nil, "the record is not JSON: not one object"
+		}
+
+		if !known[key] {
+			return nil, "the record carries a member the command does not write: " + key
+		}
+
+		if _, seen := members[key]; seen {
+			return nil, "the record repeats " + key
+		}
+
+		var value json.RawMessage
+		if err := dec.Decode(&value); err != nil {
+			return nil, "the record is not JSON: not one object"
+		}
+
+		if string(value) == "null" {
+			return nil, "the record's " + key + " is null"
+		}
+
+		members[key] = value
+	}
+
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('}') {
+		return nil, "the record is not JSON: not one object"
+	}
+
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, "the record carries bytes after its object"
+	}
+
+	return members, ""
+}
+
 // classifyGuardDirFrom classifies a guard directory through a descriptor the
 // caller holds and keeps.
 func classifyGuardDirFrom(dir *os.File) (claimShape, error) {
@@ -1487,10 +1573,16 @@ func classifyGuardDirFrom(dir *os.File) (claimShape, error) {
 
 	shape := claimShape{Kind: claimGuard}
 
-	if err := json.Unmarshal(body, &shape.Guard); err != nil {
+	// THE MEMBERS AND THEIR TYPES FIRST, from the token stream, so a malformed
+	// member is named rather than reported as the decoder's complaint.
+	if raw, problem := guardRecordMembers(body); problem != "" {
+		shape.RecordErr = problem
+	} else if problem := guardRecordTypes(raw); problem != "" {
+		shape.RecordErr = problem
+	} else if err := json.Unmarshal(body, &shape.Guard); err != nil {
 		shape.RecordErr = "the record is not JSON: " + err.Error()
 	} else {
-		shape.RecordErr = checkGuardRecord(body, shape.Guard)
+		shape.RecordErr = checkGuardRecord(raw, shape.Guard)
 	}
 
 	_, err = statAt(dir, guardPointerName)

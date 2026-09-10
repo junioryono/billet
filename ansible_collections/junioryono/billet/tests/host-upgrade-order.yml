@@ -936,6 +936,7 @@
           - billet_answer_names.index("Take the preparation's answer as this run's facts") < billet_answer_names.index("Report the preparation's answer")
           - billet_answer_judge.vars.billet_exclusion_checks | map(attribute='name') | list == ['outcome', 'exit', 'reason', 'why', 'id', 'holder', 'preparing', 'token', 'record', 'pointer', 'pointer_target', 'managed', 'downgrade']
           - "'item.ok | bool' in (billet_answer_judge['ansible.builtin.assert'].that | join(' '))"
+          - "'(billet_exclusion_raw.rc | default(1)) == 0' in ((billet_answer_judge.vars.billet_exclusion_checks | selectattr('name', 'equalto', 'exit') | first).ok | string)"
           - "'recovery-[0-9]{8}T[0-9]{6}-[0-9a-f]{8}|[0-9]{8}T[0-9]{15}' in billet_host_answer_text"
           - "'billet_exclusion_id' in billet_answer_facts['ansible.builtin.set_fact']"
           - "'billet_exclusion_cleanup_token' in billet_answer_facts['ansible.builtin.set_fact']"

@@ -121,9 +121,11 @@ func TestThePointerTargetIsCanonicalAndOwned(t *testing.T) {
 		{"a target writable by others", func(t *testing.T, f *guardFixture) string {
 			t.Helper()
 			mustOK(t, os.Mkdir(filepath.Join(f.root, name), 0o777))
+			// Past the umask: the mode the trust rule sees is the one set.
+			mustOK(t, os.Chmod(filepath.Join(f.root, name), 0o777))
 
 			return filepath.Join(f.root, name)
-		}, "writable"},
+		}, "is mode 0777, want 0700"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			f := newGuardFixture(t)
@@ -155,7 +157,7 @@ func TestAdoptionRequiresTheFiveMembers(t *testing.T) {
 	}{
 		{"no claimed_at", `{"holder":"ci-1","hostname":"h","release_executable":"%s","release_executable_sha256":"%s"}`, "lacks claimed_at"},
 		{"a claimed_at that is not a time", `{"holder":"ci-1","claimed_at":"yesterday","hostname":"h","release_executable":"%s","release_executable_sha256":"%s"}`, "not a time"},
-		{"a null id", `{"holder":"ci-1","claimed_at":"2026-09-09T12:00:00Z","hostname":"h","release_executable":"%s","release_executable_sha256":"%s","id":null}`, "id is not 32 hex"},
+		{"a null id", `{"holder":"ci-1","claimed_at":"2026-09-09T12:00:00Z","hostname":"h","release_executable":"%s","release_executable_sha256":"%s","id":null}`, "id is null"},
 		{"a relative executable", `{"holder":"ci-1","claimed_at":"2026-09-09T12:00:00Z","hostname":"h","release_executable":"billet","release_executable_sha256":"%s"}`, "not an absolute path"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
@@ -188,6 +190,68 @@ func TestAdoptionRequiresTheFiveMembers(t *testing.T) {
 
 			if strings.Contains(o.str("why"), "adopted") || o.boolean("adopted") {
 				t.Error("a malformed record was adopted")
+			}
+		})
+	}
+}
+
+// A managed path that cannot be examined is could-not-tell for the
+// downgrade; only a positively absent one has nothing to compare.
+func TestAnUnexaminableManagedPathJudgesNoDowngrade(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root examines everything")
+	}
+
+	f := newGuardFixture(t)
+	managedScript(t, f, "v0.10.1")
+	mustOutcome(t, runPrepare(t, "--holder", "ci-1", "--validate"), prepareAcquired)
+
+	// The record names the candidate, so the recorded executable verifies
+	// and the judgement reaches the managed binary's part.
+	cand := guardCandidateScript(t, f, "recovery-20260909T120000-0badcafe", "v0.9.0", "capable")
+	mustOutcome(t, runPrepare(t, "--holder", "ci-1", "--candidate", cand, "--allow-downgrade"), prepareRebound)
+
+	// The managed binary's directory is closed, so its lstat is EACCES: the
+	// path is neither present nor absent.
+	parent := filepath.Dir(f.binary)
+	mustOK(t, os.Chmod(parent, 0))
+	t.Cleanup(func() {
+		if err := os.Chmod(parent, 0o755); err != nil {
+			t.Errorf("reopen %s: %v", parent, err)
+		}
+	})
+
+	o := runPrepare(t, "--holder", "ci-1", "--candidate", cand)
+	mustOutcome(t, o, prepareUnknown)
+
+	if !strings.Contains(o.str("why"), "could not be examined") {
+		t.Errorf("why %q", o.str("why"))
+	}
+}
+
+// The record is read as a token stream: a null value, a repeated member and
+// a case-aliased member are malformed, as the Python reader has them.
+func TestARecordIsReadAsTheCommandWritesIt(t *testing.T) {
+	for _, c := range []struct{ name, extra, want string }{
+		{"a null preparing", `,"preparing":null`, "preparing is null"},
+		{"a preparing that is not a boolean", `,"preparing":"yes"`, "preparing is not a boolean"},
+		{"a repeated id", `,"id":"0123456789abcdef0123456789abcdef","id":null`, "repeats id"},
+		{"a case-aliased member", `,"Token":"0123456789abcdef0123456789abcdef"`, "does not write: Token"},
+		{"bytes after the object", `}{`, "bytes after its object"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newGuardFixture(t)
+			mustHold(t, "ci-1")
+
+			body := `{"holder":"ci-1","claimed_at":"2026-09-09T12:00:00Z","hostname":"h","release_executable":"` + f.binary +
+				`","release_executable_sha256":"` + f.binarySHA + `"` + c.extra + `}`
+			mustOK(t, os.WriteFile(filepath.Join(f.active(), guardRecordName), []byte(body), 0o600))
+
+			o := runPrepare(t, "--holder", "ci-1", "--validate")
+			mustRefusal(t, o, reasonRecord)
+
+			if !strings.Contains(o.str("why"), c.want) {
+				t.Errorf("why %q, want %q", o.str("why"), c.want)
 			}
 		})
 	}
