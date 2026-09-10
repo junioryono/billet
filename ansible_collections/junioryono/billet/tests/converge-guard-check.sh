@@ -281,7 +281,23 @@ IFS=';' read -r -a specs <<<"${BILLET_GATE_ANSWER:-}"
 for spec in "${specs[@]+"${specs[@]}"}"; do
   case "$spec" in "$cmd:$n:"*) substituted="${spec#"$cmd:$n:"}" ;; esac
 done
-if [ -n "$substituted" ]; then cat "$substituted"; else cat "$out"; fi
+if [ -n "$substituted" ]; then
+  # THE REAL ANSWER'S ID, where the substitute asks for it: a second-call
+  # corruption that carried another id would be refused for the id and
+  # prove nothing about the member it corrupts.
+  if grep -q '"@ID@"' "$substituted"; then
+    real_id=$("${PYTHON:-python3}" -c 'import json, sys
+try:
+    print(json.load(open(sys.argv[1])).get("id", ""))
+except Exception:
+    print("")' "$out")
+    sed "s/\"@ID@\"/\"$real_id\"/" "$substituted"
+  else
+    cat "$substituted"
+  fi
+else
+  cat "$out"
+fi
 rm -f "$out" "$err"
 if [ -n "$forced_exit" ]; then exit "$forced_exit"; fi
 exit "$status"
@@ -536,6 +552,16 @@ expect_refused() { # case task fragment...
   done
   echo "ok   $name: refused at \"$task\""
 }
+# expect_refused_member CASE MEMBER: the parser's refusal at exactly one of its
+# checks, the one named, read from the failed item's own line and not from a
+# grep over the play (the loop prints every passing member's label too).
+expect_refused_member() {
+  local name=$1 member=$2 items
+  expect_refused "$name" "Judge the preparation's answer" "$member"
+  items=$(grep -c '^failed: \[localhost\] (item=' "$work/cases/$name/out" || true)
+  [ "$items" -eq 1 ] || fail "$name: $items failed items of the parser, want exactly one" "$work/cases/$name/out"
+  grep -q "^failed: \[localhost\] (item=$member)" "$work/cases/$name/out" || fail "$name: the failed item is not $member" "$work/cases/$name/out"
+}
 # expect_final CASE FRAGMENT...: the rescue's re-failure, the last fatal line.
 expect_final() {
   local name=$1; shift
@@ -667,6 +693,20 @@ for f in acquired no-change validated-settled refused-downgrade; do
   readdress "$fixtures/$f.json" "$work/corpus/$f.json" "$HOLDER"
 done
 corrupt "$work/corpus/no-change.json" "$work/corpus/no-change-outcome.json" outcome
+# SECOND-CALL VARIANTS carry the marker the wrapper replaces with the real
+# guard's id, so a corruption of another member is refused for that member.
+mark_id() { # in out
+  "$python" - "$1" "$2" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+if "id" in d:
+    d["id"] = "@ID@"
+json.dump(d, open(sys.argv[2], "w"), indent=2)
+PY
+}
+mark_id "$work/corpus/no-change.json" "$work/corpus/no-change-second.json"
+mark_id "$work/corpus/no-change-outcome.json" "$work/corpus/no-change-outcome-second.json"
+mark_id "$work/corpus/acquired.json" "$work/corpus/acquired-second.json"
 
 plant_plain guard-refused
 RUNNER="billet-lease-abc123"; run_plain guard-refused -- -e billet_gate_entry=converge-guard; RUNNER=""
@@ -733,7 +773,7 @@ expect_calls p15-f fake "--candidate" 0
 plant_plain p15-h
 mkdir -p "$work/cases/p15-h/lib/billet/upgrades/active"
 run_plain p15-h BILLET_FAKE_PREPARE2="$work/corpus/no-change-outcome.json" -- -e billet_exclusion_platform=Darwin
-expect_refused p15-h "Judge the preparation's answer" "outcome"
+expect_refused_member p15-h "outcome"
 expect_final p15-h "the cleanup released the guard" "is now none"
 expect_calls p15-h fake "converge-guard release --holder h1 --cleanup --token" 1
 expect_calls p15-h timeout "" 0
@@ -742,7 +782,7 @@ expect_fact p15-h released True
 plant_plain p15-h2
 mkdir -p "$work/cases/p15-h2/lib/billet/upgrades/active"
 run_plain p15-h2 BILLET_FAKE_PREPARE2="$work/corpus/no-change-outcome.json" BILLET_FAKE_RELEASE_HANG=1 -- -e billet_exclusion_platform=Darwin -e billet_guard_timeout=1
-expect_refused p15-h2 "Judge the preparation's answer" "outcome"
+expect_refused_member p15-h2 "outcome"
 expect_final p15-h2 "ended by its bound"
 expect_fact p15-h2 released False
 echo "ok   P15: a Mac calls prepare as the agent's account under the async bound, stages nothing, takes the no-billet path, and cleans up without timeout"
@@ -1597,7 +1637,7 @@ json.dump(d, open(sys.argv[2], "w"), indent=2)
 PY
 e b9e-recovery-dir-other "BILLET_GATE_ANSWER=prepare:1:$work/cases/b9e-recovery-dir-other/answer.json"
 ns_case b9e-recovery-dir-other escalated
-expect_refused b9e-recovery-dir-other "Judge the preparation's answer" "recovery_dir"
+expect_refused_member b9e-recovery-dir-other "recovery_dir"
 expect_fact b9e-recovery-dir-other recovery ""
 expect_calls b9e-recovery-dir-other managed "converge-guard prepare --holder h1 --json --recovery" 0
 # B9f. A pointer_target with a trailing newline: refused at the parser, since the grammar ends at the end of the text.
@@ -1613,7 +1653,7 @@ json.dump(d, open(sys.argv[2], "w"), indent=2)
 PY
 e b9f-pointer-target-newline "BILLET_GATE_ANSWER=prepare:1:$work/cases/b9f-pointer-target-newline/answer.json"
 ns_case b9f-pointer-target-newline escalated
-expect_refused b9f-pointer-target-newline "Judge the preparation's answer" "pointer_target"
+expect_refused_member b9f-pointer-target-newline "pointer_target"
 expect_fact b9f-pointer-target-newline recovery ""
 plant b9c-malformed
 p b9c-malformed "plant_root; plant_managed v0.10.0; plant_guard h1 /usr/bin/billet; touch $ROOT/active/recovery"
@@ -1686,7 +1726,7 @@ for member in outcome id holder preparing token record pointer managed downgrade
   corrupt "$work/corpus/acquired.json" "$work/cases/b12-$member/answer.json" "$member"
   e "b12-$member" "BILLET_GATE_ANSWER=prepare:1:$work/cases/b12-$member/answer.json"
   ns_case "b12-$member" escalated
-  expect_refused "b12-$member" "Judge the preparation's answer" "$member"
+  expect_refused_member "b12-$member" "$member"
   expect_fact "b12-$member" token_known False
   expect_final "b12-$member" "no cleanup was attempted" "release --holder h1"
   expect_state "b12-$member" record_preparing True
@@ -1723,7 +1763,7 @@ PY
   member="$member-$kind"
   e "b12n-$member" "BILLET_GATE_ANSWER=prepare:1:$work/cases/b12n-$member/answer.json"
   ns_case "b12n-$member" escalated
-  expect_refused "b12n-$member" "Judge the preparation's answer" "${member%%-*}"
+  expect_refused_member "b12n-$member" "${member%%-*}"
   expect_fact "b12n-$member" token_known False
   expect_final "b12n-$member" "no cleanup was attempted" "release --holder h1"
   expect_state "b12n-$member" record_preparing True
@@ -1733,7 +1773,7 @@ plant b12-exit
 p b12-exit 'plant_root; plant_managed v0.10.0'
 e b12-exit "BILLET_GATE_FAIL=prepare:1:exit:1"
 ns_case b12-exit escalated
-expect_refused b12-exit "Judge the preparation's answer" "exit"
+expect_refused_member b12-exit "exit"
 expect_fact b12-exit token_known False
 expect_fact b12-exit held False
 expect_final b12-exit "no cleanup was attempted" "release --holder h1"
@@ -1744,7 +1784,7 @@ plant b12-second-id-other
 p b12-second-id-other 'plant_root; plant_managed v0.10.0'
 e b12-second-id-other "BILLET_GATE_ANSWER=prepare:2:$work/corpus/no-change.json"
 ns_case b12-second-id-other escalated
-expect_refused b12-second-id-other "Judge the preparation's answer" "id"
+expect_refused_member b12-second-id-other "id"
 expect_final b12-second-id-other "the cleanup released the guard" "is now none"
 expect_fact b12-second-id-other released True
 expect_state b12-second-id-other active absent
@@ -1752,9 +1792,9 @@ expect_calls b12-second-id-other managed "converge-guard release --holder h1 --c
 # A second answer claiming `acquired` with another token: refused at the parser naming the outcome, no fact taken, and the cleanup releases with the token the first call gave.
 plant b12-second-acquired
 p b12-second-acquired 'plant_root; plant_managed v0.10.0'
-e b12-second-acquired "BILLET_GATE_ANSWER=prepare:2:$work/corpus/acquired.json"
+e b12-second-acquired "BILLET_GATE_ANSWER=prepare:2:$work/corpus/acquired-second.json"
 ns_case b12-second-acquired escalated
-expect_refused b12-second-acquired "Judge the preparation's answer" "outcome"
+expect_refused_member b12-second-acquired "outcome"
 expect_final b12-second-acquired "the cleanup released the guard" "is now none"
 expect_fact b12-second-acquired released True
 expect_state b12-second-acquired active absent
@@ -1762,19 +1802,19 @@ expect_calls b12-second-acquired managed "converge-guard release --holder h1 --c
 # A null `next` on a successful second answer: refused at the parser naming it, and the guard cleaned up.
 plant b12-second-next
 p b12-second-next 'plant_root; plant_managed v0.10.0'
-corrupt "$work/corpus/no-change.json" "$work/cases/b12-second-next/answer.json" next
+corrupt "$work/corpus/no-change-second.json" "$work/cases/b12-second-next/answer.json" next
 e b12-second-next "BILLET_GATE_ANSWER=prepare:2:$work/cases/b12-second-next/answer.json"
 ns_case b12-second-next escalated
-expect_refused b12-second-next "Judge the preparation's answer" "next"
+expect_refused_member b12-second-next "next"
 expect_final b12-second-next "the cleanup released the guard" "is now none"
 expect_fact b12-second-next released True
 expect_state b12-second-next active absent
 plant b12-second
 p b12-second 'plant_root; plant_managed v0.10.0'
-e b12-second "BILLET_GATE_ANSWER=prepare:2:$work/corpus/no-change-outcome.json"
+e b12-second "BILLET_GATE_ANSWER=prepare:2:$work/corpus/no-change-outcome-second.json"
 a b12-second -vvv
 ns_case b12-second escalated
-expect_refused b12-second "Judge the preparation's answer" "outcome"
+expect_refused_member b12-second "outcome"
 expect_final b12-second "the cleanup released the guard" "is now none"
 expect_fact b12-second released True
 expect_state b12-second active absent
@@ -1949,26 +1989,26 @@ expect_calls c6-answer-lost managed "converge-guard release" 0
 c7_plant() { # name
   plant "$1"
   p "$1" 'plant_root; plant_managed v0.10.0'
-  e "$1" "BILLET_GATE_ANSWER=prepare:2:$work/corpus/no-change-outcome.json"
+  e "$1" "BILLET_GATE_ANSWER=prepare:2:$work/corpus/no-change-outcome-second.json"
 }
 c7_plant c7-refused
 e c7-refused "BILLET_GATE_FAIL=release:refuse"
 ns_case c7-refused escalated
-expect_refused c7-refused "Judge the preparation's answer" "outcome"
+expect_refused_member c7-refused "outcome"
 expect_final c7-refused "the cleanup was refused" "refused by the gate's wrapper" "guard held by h1" "release --holder h1"
 [ "$(backing_runs c7-refused release)" -eq 0 ] || fail "c7-refused: the backing release ran"
 expect_state c7-refused record_preparing True
 c7_plant c7b-after-unlink
 e c7b-after-unlink "BILLET_GATE_FAIL=release:crash:rmdir $ROOT/active"
 ns_case c7b-after-unlink escalated
-expect_refused c7b-after-unlink "Judge the preparation's answer" "outcome"
+expect_refused_member c7b-after-unlink "outcome"
 expect_final c7b-after-unlink "is now unpublished-guard" "recover --unpublished"
 expect_state c7b-after-unlink active dir
 expect_state c7b-after-unlink record absent
 c7_plant c7c-after-rmdir
 e c7c-after-rmdir "BILLET_GATE_FAIL=release:crash:fsync $ROOT"
 ns_case c7c-after-rmdir escalated
-expect_refused c7c-after-rmdir "Judge the preparation's answer" "outcome"
+expect_refused_member c7c-after-rmdir "outcome"
 expect_final c7c-after-rmdir "is now none" "durability is not proved"
 expect_fact c7c-after-rmdir released False
 expect_state c7c-after-rmdir active absent
@@ -1976,10 +2016,10 @@ expect_state c7c-after-rmdir active absent
 # decoder runs and fails, and the final diagnostic is reached regardless.
 c7_plant c7d-status-malformed
 printf '{"active": "converge-guard", "gu' >"$work/cases/c7d-status-malformed/status.txt"
-e c7d-status-malformed "BILLET_GATE_ANSWER=prepare:2:$work/corpus/no-change-outcome.json;status:1:$work/cases/c7d-status-malformed/status.txt"
+e c7d-status-malformed "BILLET_GATE_ANSWER=prepare:2:$work/corpus/no-change-outcome-second.json;status:1:$work/cases/c7d-status-malformed/status.txt"
 e c7d-status-malformed "BILLET_GATE_FAIL=release:refuse"
 ns_case c7d-status-malformed escalated
-expect_refused c7d-status-malformed "Judge the preparation's answer" "outcome"
+expect_refused_member c7d-status-malformed "outcome"
 expect_final c7d-status-malformed "Judge the preparation's answer" "is now unknown" "inspect the host by hand"
 c7_plant c7f-unexpected-entry
 e c7f-unexpected-entry "BILLET_GATE_HOOK=release:1:touch $ROOT/active/unexpected"
@@ -1996,11 +2036,11 @@ expect_state c7g-release-hangs record_preparing True
 plant c8-after-settle
 p c8-after-settle 'plant_root; plant_managed v0.10.0'
 a c8-after-settle -e billet_gate_inclusions=2 -e "{\"billet_gate_between\": \"touch $ROOT/mutated\"}"
-e c8-after-settle "BILLET_GATE_ANSWER=prepare:4:$work/corpus/no-change-outcome.json"
+e c8-after-settle "BILLET_GATE_ANSWER=prepare:4:$work/corpus/no-change-outcome-second.json"
 post c8-after-settle 'tok=$(sed -n "s/^ *\"token\": \"\([0-9a-f]*\)\".*/\1/p" "$1/private" | head -n1); "$MNT/bin/billet-v0.10.0" converge-guard release --holder h1 --cleanup --token "$tok"; echo "direct=$?"'
 sed -i "s#\"\$1/private\"#\"$work/cases/c8-after-settle/private\"#" "$work/cases/c8-after-settle/post.sh"
 ns_case c8-after-settle escalated
-expect_refused c8-after-settle "Judge the preparation's answer" "outcome"
+expect_refused_member c8-after-settle "outcome"
 expect_final c8-after-settle "no cleanup was attempted" "release --holder h1"
 expect_calls c8-after-settle managed "converge-guard release" 0
 expect_state c8-after-settle record_preparing False
@@ -2008,9 +2048,9 @@ grep -q "^direct=2$" "$work/cases/c8-after-settle/post" || fail "c8: a direct cl
 grep -q "window has closed" "$work/cases/c8-after-settle/post" || fail "c8: the direct cleanup's refusal does not name the closed window" "$work/cases/c8-after-settle/post"
 plant c8b-after-settle-play
 p c8b-after-settle-play 'plant_root; plant_managed v0.10.0'
-e c8b-after-settle-play "BILLET_GATE_ANSWER=prepare:4:$work/corpus/no-change-outcome.json"
+e c8b-after-settle-play "BILLET_GATE_ANSWER=prepare:4:$work/corpus/no-change-outcome-second.json"
 ns_case c8b-after-settle-play escalated play2
-expect_refused c8b-after-settle-play "Judge the preparation's answer" "outcome"
+expect_refused_member c8b-after-settle-play "outcome"
 expect_final c8b-after-settle-play "no cleanup was attempted"
 expect_calls c8b-after-settle-play managed "converge-guard release" 0
 expect_state c8b-after-settle-play active dir
