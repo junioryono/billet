@@ -218,6 +218,18 @@ def main():
         tree = Tree(base)
         tree.write_record(None, raw=b"[]\n")
         expect_refusal(mod, tree, owner, "a JSON list", "content", "not a JSON object")
+    # A REPEATED MEMBER, in both orderings: the last value being valid must not
+    # admit the record (json.loads would keep it), and neither must the first.
+    for name, tail in (
+        ("id repeated, valid last", ', "id": null, "id": "0123456789abcdef0123456789abcdef"}\n'),
+        ("id repeated, valid first", ', "id": "0123456789abcdef0123456789abcdef", "id": null}\n'),
+        ("holder repeated", ', "holder": "ci-1"}\n'),
+    ):
+        with tempfile.TemporaryDirectory() as base:
+            tree = Tree(base)
+            raw = json.dumps(tree.valid_record())[:-1] + tail
+            tree.write_record(None, raw=raw.encode("utf-8"))
+            expect_refusal(mod, tree, owner, name, "content", "is repeated")
 
     # The candidate's place and digest.
     with tempfile.TemporaryDirectory() as base:

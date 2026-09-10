@@ -1285,7 +1285,53 @@ a b7m-absent-corrupt --check
 HOLDER=""; ns_case b7m-absent-corrupt escalated; HOLDER=h1
 expect_refused b7m-absent-corrupt "Judge the guard's record" "preparing"
 expect_calls b7m-absent-corrupt candidate "" 0
-echo "ok   B7n: a dry run over a guard the managed binary cannot answer for is reported by the recorded executable, keeps an interrupted transaction, and refuses what the converge refuses"
+# The parser requires the guard object under converge-guard and reads its members by type.
+for variant in no-guard null-error numeric-holder; do
+  plant "b7o-$variant"
+  p "b7o-$variant" 'plant_root; plant_managed v0.10.0'
+  a "b7o-$variant" --check
+  case $variant in
+    no-guard) printf '{"outcome": "reported", "shape": "converge-guard", "guard": null, "managed": {"path": "/usr/bin/billet", "present": true}}\n' ;;
+    null-error) printf '{"outcome": "reported", "shape": "converge-guard", "guard": {"record_error": null, "pointer": true}, "managed": {"path": "/usr/bin/billet", "present": true}}\n' ;;
+    numeric-holder) printf '{"outcome": "reported", "shape": "converge-guard", "guard": {"holder": 7, "claimed_at": "2026-09-09T12:00:00Z", "preparing": false, "pointer": true}, "managed": {"path": "/usr/bin/billet", "present": true}}\n' ;;
+  esac >"$work/cases/b7o-$variant/dry.json"
+  e "b7o-$variant" "BILLET_GATE_ANSWER=prepare:1:$work/cases/b7o-$variant/dry.json"
+  HOLDER=""; ns_case "b7o-$variant" escalated; HOLDER=h1
+  expect_refused "b7o-$variant" "Judge the dry run's answer" "guard"
+done
+# A claim that appeared between the stat and the report is the report's: a legacy file, a Go transaction.
+plant b7q-legacy-appeared
+p b7q-legacy-appeared 'plant_root; plant_managed v0.10.0'
+a b7q-legacy-appeared --check
+e b7q-legacy-appeared "BILLET_GATE_HOOK=prepare:1:printf '%s\n' $ROOT/$LEGACY_DIR >$ROOT/active"
+HOLDER=""; ns_case b7q-legacy-appeared escalated; HOLDER=h1
+expect_allowed b7q-legacy-appeared
+grep -qF "is legacy-role" "$work/cases/b7q-legacy-appeared/out" || fail "b7q: the dry run did not report the legacy claim" "$work/cases/b7q-legacy-appeared/out"
+expect_fact b7q-legacy-appeared shape legacy-file
+expect_fact b7q-legacy-appeared interrupted True
+plant b7r-go-appeared
+p b7r-go-appeared 'plant_root; plant_managed v0.10.0'
+a b7r-go-appeared --check
+e b7r-go-appeared "BILLET_GATE_HOOK=prepare:1:ln -s $ROOT/$LEGACY_DIR $ROOT/active"
+HOLDER=""; ns_case b7r-go-appeared escalated; HOLDER=h1
+expect_allowed b7r-go-appeared
+expect_fact b7r-go-appeared shape host-upgrade
+expect_fact b7r-go-appeared interrupted False
+# A claim of a type the role does not know, beside no billet: the stat alone classifies it, and never as none.
+plant b7s-fifo-absent
+p b7s-fifo-absent 'plant_root; mkfifo -m 0600 $ROOT/active'
+a b7s-fifo-absent --check
+HOLDER=""; ns_case b7s-fifo-absent escalated; HOLDER=h1
+expect_allowed b7s-fifo-absent
+grep -qF "neither a directory nor anything this role writes; a converge would refuse it" "$work/cases/b7s-fifo-absent/out" || fail "b7s: the dry run did not report the FIFO" "$work/cases/b7s-fifo-absent/out"
+expect_fact b7s-fifo-absent shape unknown
+plant b7t-symlink-absent
+p b7t-symlink-absent "plant_root; ln -s $ROOT/$LEGACY_DIR $ROOT/active"
+a b7t-symlink-absent --check
+HOLDER=""; ns_case b7t-symlink-absent escalated; HOLDER=h1
+expect_allowed b7t-symlink-absent
+expect_fact b7t-symlink-absent shape host-upgrade
+echo "ok   B7n: a dry run over a guard the managed binary cannot answer for is reported by the recorded executable, keeps an interrupted transaction, refuses what the converge refuses, requires the guard object by type, and keeps every shape it observed"
 
 # B8. The fallback: a pre-R or absent managed binary and a guard recording an
 # R candidate; the calls run through the candidate.

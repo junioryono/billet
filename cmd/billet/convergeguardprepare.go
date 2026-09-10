@@ -944,9 +944,12 @@ func candidateCapable(ctx context.Context, binary string) (bool, string) {
 	var timedOut bool
 
 	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
+		switch {
+		case errors.Is(err, context.DeadlineExceeded):
 			timedOut = true
-		} else if rc < 0 {
+		case errors.Is(err, errOutputOverflow):
+			return false, "the candidate's status answer is not one object: " + err.Error()
+		case rc < 0:
 			return false, "the candidate could not be run: " + err.Error()
 		}
 	}
@@ -975,8 +978,9 @@ func runBounded(ctx context.Context, binary string, args ...string) ([]byte, []b
 
 	var stdout, stderr bytes.Buffer
 
-	cmd.Stdout = &limitedWriter{w: &stdout, n: maxCommandOutput}
-	cmd.Stderr = &limitedWriter{w: &stderr, n: maxCommandOutput}
+	outW := &limitedWriter{w: &stdout, n: maxCommandOutput}
+	errW := &limitedWriter{w: &stderr, n: maxCommandOutput}
+	cmd.Stdout, cmd.Stderr = outW, errW
 
 	err := cmd.Run()
 
@@ -985,26 +989,41 @@ func runBounded(ctx context.Context, binary string, args ...string) ([]byte, []b
 		rc = cmd.ProcessState.ExitCode()
 	}
 
-	if ctx.Err() != nil {
+	switch {
+	case ctx.Err() != nil:
 		return stdout.Bytes(), stderr.Bytes(), rc, context.DeadlineExceeded
+	case outW.overflow || errW.overflow:
+		// AN ANSWER THAT OVERFLOWED IS NOT AN ANSWER: what was kept ends
+		// where the bound fell, so a decoder reading it to its end would be
+		// reading a prefix, and whatever followed was never seen.
+		return stdout.Bytes(), stderr.Bytes(), rc, errOutputOverflow
 	}
 
 	return stdout.Bytes(), stderr.Bytes(), rc, err
 }
 
-// limitedWriter keeps the first n bytes and drops the rest.
+// errOutputOverflow says a bounded command wrote more than the bound keeps.
+var errOutputOverflow = fmt.Errorf("the answer exceeded %d bytes and was not read whole", maxCommandOutput)
+
+// limitedWriter keeps the first n bytes, drops the rest, and remembers that
+// it dropped any.
 type limitedWriter struct {
-	w *bytes.Buffer
-	n int
+	w        *bytes.Buffer
+	n        int
+	overflow bool
 }
 
 func (l *limitedWriter) Write(p []byte) (int, error) {
-	if room := l.n - l.w.Len(); room > 0 {
-		if len(p) > room {
-			l.w.Write(p[:room])
-		} else {
-			l.w.Write(p)
-		}
+	room := l.n - l.w.Len()
+
+	switch {
+	case room <= 0:
+		l.overflow = l.overflow || len(p) > 0
+	case len(p) > room:
+		l.w.Write(p[:room])
+		l.overflow = true
+	default:
+		l.w.Write(p)
 	}
 
 	return len(p), nil

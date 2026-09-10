@@ -1186,13 +1186,27 @@ func TestRecoverUnpublishedExaminesBeforeItRemoves(t *testing.T) {
 				t.Fatal(err)
 			}
 		},
+		"a tmp writable by others": func(t *testing.T) {
+			t.Helper()
+
+			tmp := filepath.Join(f.active(), guardTmpName)
+			mustOK(t, os.WriteFile(tmp, []byte("{"), 0o600))
+			mustOK(t, os.Chmod(tmp, 0o666))
+		},
+		"a tmp that is another name of a file": func(t *testing.T) {
+			t.Helper()
+
+			other := filepath.Join(f.root, "elsewhere")
+			mustOK(t, os.WriteFile(other, []byte("x"), 0o600))
+			mustOK(t, os.Link(other, filepath.Join(f.active(), guardTmpName)))
+		},
 	} {
 		t.Run(name+" refuses and removes nothing", func(t *testing.T) {
 			makeActive(t)
 
 			// A legitimate tmp first in directory order, so a recover that
 			// removed as it walked would have removed it.
-			if name != "a symlink named as the tmp" && name != "a FIFO named as the tmp" {
+			if !strings.Contains(name, "named as the tmp") && !strings.HasPrefix(name, "a tmp ") {
 				if err := os.WriteFile(filepath.Join(f.active(), guardTmpName), []byte("{"), 0o600); err != nil {
 					t.Fatal(err)
 				}

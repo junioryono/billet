@@ -384,24 +384,32 @@
              else {} }}
       when: ansible_check_mode
 
-    # THE DRY RUN'S PARSER: the envelope, the shape, and a guard that is
-    # either a record the command could read (holder, claimed_at, preparing)
-    # or one it could not (record_error, reported and shown, never refused
-    # here: the refusal is the converge's), each with its pointer boolean.
+    # THE DRY RUN'S PARSER: the envelope, the shape, and the guard object
+    # exactly where the command writes one (under converge-guard and nowhere
+    # else, so an answer that dropped it cannot hide a pointer), which is
+    # either a record the command could read (holder, claimed_at, preparing,
+    # each of its type) or one it could not (record_error, a non-empty
+    # string, reported and shown, never refused here: the refusal is the
+    # converge's), each with its pointer boolean.
     - name: Judge the dry run's answer
       vars:
         billet_exclusion_dry_shapes: [none, converge-guard, host-upgrade, legacy-role, unpublished-guard, unknown]
+        billet_exclusion_dry_guard_present: "{{ billet_exclusion_dry_report.guard | default(none) is not none }}"
         billet_exclusion_dry_wrong: >-
           {{ 'exit ' ~ (billet_exclusion_dry_answer.rc | default('none')) ~ ' with no answer'
              if billet_exclusion_dry_answer.rc | default(1) != 0
              else ('outcome' if billet_exclusion_dry_report.outcome | default('') != 'reported'
              else ('shape' if billet_exclusion_dry_report.shape | default('') not in billet_exclusion_dry_shapes
-             else ('guard' if not (billet_exclusion_dry_report.guard | default(none) is none
-                                   or ((billet_exclusion_dry_report.guard.pointer | default('x') is sameas true or billet_exclusion_dry_report.guard.pointer | default('x') is sameas false)
-                                       and ((billet_exclusion_dry_report.guard.record_error | default('') | string | length > 0)
-                                            or (billet_exclusion_dry_report.guard.holder | default('') | string | length > 0
-                                                and billet_exclusion_dry_report.guard.claimed_at | default('') | string | length > 0
-                                                and (billet_exclusion_dry_report.guard.preparing | default('x') is sameas true or billet_exclusion_dry_report.guard.preparing | default('x') is sameas false)))))
+             else ('guard' if not (((billet_exclusion_dry_report.shape == 'converge-guard') == (billet_exclusion_dry_guard_present | bool))
+                                   and (not (billet_exclusion_dry_guard_present | bool)
+                                        or ((billet_exclusion_dry_report.guard.pointer | default('x') is sameas true or billet_exclusion_dry_report.guard.pointer | default('x') is sameas false)
+                                            and ((billet_exclusion_dry_report.guard.record_error | default('') is string
+                                                  and billet_exclusion_dry_report.guard.record_error | default('') | length > 0)
+                                                 or (billet_exclusion_dry_report.guard.holder | default('') is string
+                                                     and billet_exclusion_dry_report.guard.holder | default('') | length > 0
+                                                     and billet_exclusion_dry_report.guard.claimed_at | default('') is string
+                                                     and billet_exclusion_dry_report.guard.claimed_at | default('') | length > 0
+                                                     and (billet_exclusion_dry_report.guard.preparing | default('x') is sameas true or billet_exclusion_dry_report.guard.preparing | default('x') is sameas false))))))
              else ''))) }}
       ansible.builtin.assert:
         that:
@@ -428,9 +436,9 @@
         billet_exclusion_dry_stat_text: >-
           {{ 'absent' if not billet_exclusion_active.stat.exists
              else ('a directory' if billet_exclusion_active.stat.isdir | default(False)
-             else ('a symlink (a `billet host-upgrade` transaction)' if billet_exclusion_active.stat.islnk | default(false)
+             else ('a symlink (a `billet host-upgrade` transaction; a converge would refuse it)' if billet_exclusion_active.stat.islnk | default(false)
              else ('a regular file (the claim of a collection that predates the guard)' if billet_exclusion_active.stat.isreg | default(False)
-             else 'neither a directory nor anything this role writes'))) }}
+             else 'neither a directory nor anything this role writes; a converge would refuse it'))) }}
       ansible.builtin.debug:
         msg: >-
           {{ (billet_exclusion_binary ~ ' predates the converge guard (it answers "unknown command"): a converge would run the legacy protocol, unheld, unless a candidate that carries the guard is pinned. ' ~ billet_exclusion_root ~ '/active is ' ~ billet_exclusion_dry_stat_text ~ ", read from this role's stat alone.")
@@ -446,25 +454,34 @@
           A dry run holds nothing and reports what it found.
       when: ansible_check_mode
 
-    # A DRY RUN'S SHAPE, for the tasks after the preparation: the role's own
-    # stat for a legacy file and for a Go transaction (as outside check mode),
-    # the report's guard and its pointer for a guard, the report's word for an
-    # unpublished guard or a shape the command does not know; none only when
-    # nothing was found. A shape a converge would refuse is never read as none.
+    # A DRY RUN'S SHAPE, for the tasks after the preparation: EVERY SHAPE THE
+    # COMMAND REPORTED when one answered (the report is later than the stat,
+    # and a claim that appeared between them is the claim), the guard's
+    # pointer as the interrupted transaction, a legacy role's claim as the
+    # legacy file; and when nothing answered, the whole of the role's own stat
+    # (a regular file, a symlink, a type the role does not know). None is
+    # observed absence alone, never a shape a converge would refuse.
     - name: Take the dry run's shape as this run's facts
       vars:
         billet_exclusion_dry_guard: "{{ billet_exclusion_dry_report.guard | default(none) }}"
         billet_exclusion_dry_pointer: "{{ billet_exclusion_dry_guard is not none and billet_exclusion_dry_guard.pointer | default(false) | bool }}"
-      ansible.builtin.set_fact:
-        billet_upgrade_claim_shape: >-
-          {{ 'legacy-file' if billet_exclusion_active.stat.isreg | default(False)
+        billet_exclusion_dry_reported_shape: >-
+          {{ {'none': 'none', 'converge-guard': ('guard-pointer' if billet_exclusion_dry_pointer | bool else 'guard'),
+              'host-upgrade': 'host-upgrade', 'legacy-role': 'legacy-file',
+              'unpublished-guard': 'unpublished-guard', 'unknown': 'unknown'}[billet_exclusion_dry_report.shape | default('unknown')] }}
+        billet_exclusion_dry_stat_shape: >-
+          {{ 'none' if not billet_exclusion_active.stat.exists
+             else ('legacy-file' if billet_exclusion_active.stat.isreg | default(False)
              else ('host-upgrade' if billet_exclusion_active.stat.islnk | default(false)
-             else ('guard-pointer' if billet_exclusion_dry_pointer | bool
-             else ('guard' if billet_exclusion_dry_report.shape | default('') == 'converge-guard'
-             else (billet_exclusion_dry_report.shape if billet_exclusion_dry_report.shape | default('') in ['unpublished-guard', 'unknown']
-             else 'none')))) }}
-        billet_interrupted_upgrade: "{{ billet_exclusion_active.stat.isreg | default(False) or billet_exclusion_dry_pointer | bool }}"
-        billet_upgrade_recovery_dir: "{{ billet_exclusion_dry_guard.pointer_target | default('') if billet_exclusion_dry_pointer | bool else '' }}"
+             else ('unpublished-guard' if billet_exclusion_active.stat.isdir | default(False)
+             else 'unknown'))) }}
+        billet_exclusion_dry_shape: >-
+          {{ billet_exclusion_dry_reported_shape if billet_exclusion_dry_answered | default(false) | bool
+             else billet_exclusion_dry_stat_shape }}
+      ansible.builtin.set_fact:
+        billet_upgrade_claim_shape: "{{ billet_exclusion_dry_shape }}"
+        billet_interrupted_upgrade: "{{ billet_exclusion_dry_shape in ['legacy-file', 'guard-pointer'] }}"
+        billet_upgrade_recovery_dir: "{{ billet_exclusion_dry_guard.pointer_target | default('') if billet_exclusion_dry_shape == 'guard-pointer' else '' }}"
       when:
         - ansible_check_mode
         - not (billet_exclusion_held | default(false))

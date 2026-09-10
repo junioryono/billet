@@ -1138,6 +1138,13 @@ func recoverUnpublished(root *txLock) error {
 			return fmt.Errorf("%s holds %s (%s), which a publication does not leave; nothing was removed",
 				dir.Name(), e.Name(), fileTypeOf(modeOf(st)))
 		}
+
+		// THE TEMPORARY IS JUDGED AS EVERY REMOVAL JUDGES IT: owned, writable
+		// by nobody else, one link; a publication leaves nothing else.
+		if err := judgeStaleTemporary(dir); err != nil {
+			return fmt.Errorf("%s holds %s that is not a publication's leftover: %w; nothing was removed",
+				dir.Name(), guardTmpName, err)
+		}
 	}
 
 	for _, e := range entries {
@@ -1261,8 +1268,15 @@ func takeOverGuard(root *txLock, old, holder string) error {
 		return err
 	}
 
+	// THE ACQUIRER'S WINDOW IS RETIRED WITH THE HOLDER: the token and the
+	// preparing flag authorise a cleanup release by the invocation that
+	// acquired the guard, and the new holder never did; a takeover that kept
+	// them would let the old token release the guard once the recovery
+	// removed its pointer.
 	record := shape.Guard
 	record.Holder = holder
+	record.Token = ""
+	record.Preparing = false
 
 	if err := writeGuardRecordAt(dir, record, true); err != nil {
 		return err

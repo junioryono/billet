@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -332,6 +333,81 @@ func TestAStrayTemporaryIsJudgedBeforeItIsRemoved(t *testing.T) {
 				t.Error("the record changed under a refusal")
 			}
 		})
+	}
+}
+
+// A takeover retires the acquirer's window with the holder: the token and the
+// preparing flag are the acquiring invocation's, and the new holder never
+// acquired, so the old token releases nothing once the pointer is gone.
+func TestATakeoverRetiresTheAcquirersWindow(t *testing.T) {
+	f := newGuardFixture(t)
+
+	first := runPrepare(t, "--holder", "ci-1", "--validate")
+	mustOutcome(t, first, prepareAcquired)
+	token := first.str("token")
+
+	before := f.record(t)
+	if before.Token == "" || !before.Preparing {
+		t.Fatalf("the acquired record carries no window: %+v", before)
+	}
+
+	recovery := filepath.Join(f.root, "recovery-20260909T120000-0badcafe")
+	mustOK(t, os.Mkdir(recovery, 0o700))
+	writeJournalFixture(t, recovery, "installed")
+	mustOK(t, os.Symlink(recovery, filepath.Join(f.active(), guardPointerName)))
+	cleanScan(t)
+
+	if err := guardRun(t, "hold", "--holder", "ci-2", "--recover-from", "ci-1", "--old-driver-stopped"); err != nil {
+		t.Fatalf("the takeover: %v", err)
+	}
+
+	after := f.record(t)
+
+	switch {
+	case after.Holder != "ci-2":
+		t.Errorf("holder %q after the takeover", after.Holder)
+	case after.Token != "" || after.Preparing:
+		t.Errorf("the takeover kept the acquirer's window: token %q, preparing %v", after.Token, after.Preparing)
+	case after.ID != before.ID:
+		t.Errorf("the takeover changed the id: %q, then %q", before.ID, after.ID)
+	}
+
+	if _, err := os.Lstat(filepath.Join(f.active(), guardPointerName)); err != nil {
+		t.Errorf("the pointer after the takeover: %v", err)
+	}
+
+	mustOK(t, os.Remove(filepath.Join(f.active(), guardPointerName)))
+
+	for _, holder := range []string{"ci-1", "ci-2"} {
+		err := guardRun(t, "release", "--holder", holder, "--cleanup", "--token", token)
+		if err == nil {
+			t.Errorf("the old token released the guard for %s after the takeover", holder)
+		}
+	}
+
+	if _, err := os.Lstat(filepath.Join(f.active(), guardRecordName)); err != nil {
+		t.Errorf("the record after the refused cleanups: %v", err)
+	}
+}
+
+// A candidate whose status answer overflows the bound is not capable: what
+// was kept is a prefix, and a valid object followed by padding past the bound
+// and garbage would otherwise read as one complete object.
+func TestACandidateWhoseAnswerOverflowsTheBoundIsNotCapable(t *testing.T) {
+	f := newGuardFixture(t)
+	managedScript(t, f, "v0.10.1")
+	mustOutcome(t, runPrepare(t, "--holder", "ci-1", "--validate"), prepareAcquired)
+
+	body := "#!/bin/sh\ncase \"$1\" in\n  version) echo \"billet v0.10.2 linux/amd64\";;\n" +
+		"  converge-guard) printf '{\"active\": \"none\"}'; head -c " + strconv.Itoa(maxCommandOutput+16) +
+		" /dev/zero | tr '\\0' ' '; printf 'garbage\\n';;\nesac\nexit 0\n"
+	cand := stageGuardCandidate(t, f, "recovery-20260909T120000-0badcafe", []byte(body))
+
+	o := runPrepare(t, "--holder", "ci-1", "--candidate", cand)
+	mustRefusal(t, o, reasonFloor)
+
+	if !strings.Contains(o.str("why"), "not read whole") {
+		t.Errorf("why %q does not name the overflow", o.str("why"))
 	}
 }
 

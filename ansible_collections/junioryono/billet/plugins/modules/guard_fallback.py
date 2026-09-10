@@ -263,8 +263,12 @@ def read_record(root, owner):
     if len(body) > MAX_RECORD_BYTES:
         raise Refusal("metadata", "%s grew past %d bytes while it was read" % (record, MAX_RECORD_BYTES))
 
+    # A REPEATED MEMBER REFUSES, as the Go decoder refuses it: json.loads
+    # keeps the last value, so a record ending `"id": null, "id": "<hex>"`
+    # would pass here and be refused there, one guard usable through one
+    # route and not the other.
     try:
-        decoded = json.loads(body.decode("utf-8"))
+        decoded = json.loads(body.decode("utf-8"), object_pairs_hook=_one_of_each)
     except (UnicodeDecodeError, ValueError) as exc:
         raise Refusal("content", "%s is not JSON: %s" % (record, exc))
     if not isinstance(decoded, dict):
@@ -355,6 +359,16 @@ def judge_ancestors(root, owner):
                 refuse_absent_under("ancestors", parent, at, at_st)
             continue
         require_dir("ancestors", path, owner)
+
+
+def _one_of_each(pairs):
+    """Build an object from its members, refusing a member that repeats."""
+    out = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError("the member %s is repeated" % key)
+        out[key] = value
+    return out
 
 
 def find(root, owner):
