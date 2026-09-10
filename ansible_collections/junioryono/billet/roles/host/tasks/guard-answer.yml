@@ -114,8 +114,16 @@
         ok: "{{ billet_exclusion_a.outcome | default('') != 'acquired' or (billet_exclusion_a.token | default('') is string and billet_exclusion_a.token | default('') is match(billet_exclusion_hex32)) }}"
       - name: record
         ok: "{{ billet_exclusion_a.outcome | default('') in ['refused', 'unknown'] or ((billet_exclusion_a.record | default({})).release_executable | default('') is string and (billet_exclusion_a.record | default({})).release_executable | default('') is match('^/') and (billet_exclusion_a.record | default({})).release_executable_sha256 | default('') is string and (billet_exclusion_a.record | default({})).release_executable_sha256 | default('') is match(billet_exclusion_sha) and ((billet_exclusion_a.record | default({})).verified | default('x') is sameas true)) }}"
+      # THE POINTER AGREES WITH THE INTENT THE SECOND CALL DECLARED: the
+      # second call was sent `--recovery` exactly when the first answer carried
+      # a pointer (billet_interrupted_upgrade), so a successful second answer
+      # must carry the same pointer and, with it, the same target; one that
+      # cleared it would otherwise have the ordinary path write over the
+      # recovery directory's material before the pointer refused its
+      # publication, and one that set it would send a recovery over a
+      # directory no pointer names.
       - name: pointer
-        ok: "{{ billet_exclusion_a.outcome | default('') in ['refused', 'unknown'] or (billet_exclusion_a.pointer | default('x') is sameas true) or (billet_exclusion_a.pointer | default('x') is sameas false) }}"
+        ok: "{{ billet_exclusion_a.outcome | default('') in ['refused', 'unknown'] or (((billet_exclusion_a.pointer | default('x') is sameas true) or (billet_exclusion_a.pointer | default('x') is sameas false)) and (billet_exclusion_call == 'first' or (billet_exclusion_a.pointer is sameas (billet_interrupted_upgrade | default(false) | bool)))) }}"
       # THE OPTIONAL TEXT MEMBERS A DIAGNOSTIC READS are strings whenever they
       # are present, whatever the outcome: the refusal's message below is
       # templated before the assertion decides, so a null `next` on a
@@ -132,7 +140,7 @@
       - name: recovery_dir
         ok: "{{ billet_exclusion_a.outcome | default('') in ['refused', 'unknown'] or ('recovery_dir' not in billet_exclusion_a) or (billet_exclusion_a.recovery_dir is string and billet_exclusion_a.recovery_dir == billet_exclusion_a.pointer_target | default('')) }}"
       - name: pointer_target
-        ok: "{{ billet_exclusion_a.outcome | default('') in ['refused', 'unknown'] or not (billet_exclusion_a.pointer | default(false) is sameas true) or (billet_exclusion_a.pointer_target | default('') is string and billet_exclusion_a.pointer_target | default('') is match('^' ~ (billet_exclusion_root | regex_escape) ~ billet_exclusion_pointer_tail)) }}"
+        ok: "{{ billet_exclusion_a.outcome | default('') in ['refused', 'unknown'] or not (billet_exclusion_a.pointer | default(false) is sameas true) or (billet_exclusion_a.pointer_target | default('') is string and billet_exclusion_a.pointer_target | default('') is match('^' ~ (billet_exclusion_root | regex_escape) ~ billet_exclusion_pointer_tail) and (billet_exclusion_call == 'first' or billet_exclusion_a.pointer_target == billet_upgrade_recovery_dir | default(''))) }}"
       - name: managed
         ok: "{{ billet_exclusion_a.outcome | default('') in ['refused', 'unknown'] or ((billet_exclusion_a.managed | default({})).present | default('x') is sameas true) or ((billet_exclusion_a.managed | default({})).present | default('x') is sameas false) or ((billet_exclusion_a.managed | default({})).present | default('x') == 'unknown') }}"
       - name: downgrade
@@ -178,11 +186,16 @@
          else billet_exclusion_cleanup_token | default('') }}
     billet_exclusion_held: true
     billet_exclusion_executable: "{{ billet_exclusion_answered_by }}"
-    billet_interrupted_upgrade: "{{ billet_exclusion_answer.pointer }}"
+    # THE INTERRUPTION IS THE FIRST ANSWER'S: the second call declared its
+    # intent from these facts and its answer was held to agree above, so the
+    # second answer neither clears nor sets them.
+    billet_interrupted_upgrade: "{{ billet_exclusion_answer.pointer if billet_exclusion_call == 'first' else billet_interrupted_upgrade | default(false) }}"
     billet_upgrade_recovery_dir: >-
       {{ billet_exclusion_answer.pointer_target
-         if billet_exclusion_answer.pointer else (billet_upgrade_recovery_dir | default('')) }}
-    billet_upgrade_claim_shape: "{{ 'guard-pointer' if billet_exclusion_answer.pointer else 'guard' }}"
+         if (billet_exclusion_call == 'first' and billet_exclusion_answer.pointer) else (billet_upgrade_recovery_dir | default('')) }}
+    billet_upgrade_claim_shape: >-
+      {{ ('guard-pointer' if billet_exclusion_answer.pointer else 'guard') if billet_exclusion_call == 'first'
+         else billet_upgrade_claim_shape | default('guard') }}
     billet_exclusion_record_executable: "{{ billet_exclusion_answer.record.release_executable }}"
     billet_exclusion_record_sha256: "{{ billet_exclusion_answer.record.release_executable_sha256 }}"
     billet_exclusion_downgrade: "{{ billet_exclusion_answer.downgrade | default(false) }}"

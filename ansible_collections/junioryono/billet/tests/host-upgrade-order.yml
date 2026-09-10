@@ -1038,6 +1038,12 @@
           - "billet_answer_judge.vars.billet_exclusion_hex32 == '^[0-9a-f]{32}\\Z'"
           - "billet_answer_judge.vars.billet_exclusion_sha == '^[0-9a-f]{64}\\Z'"
           - "billet_answer_judge.vars.billet_exclusion_pointer_tail == '/(recovery-[0-9]{8}T[0-9]{6}-[0-9a-f]{8}|[0-9]{8}T[0-9]{15})\\Z'"
+          # THE POINTER AGREES WITH THE INTENT THE SECOND CALL DECLARED, its target with the recovery directory the first answer named, and the interruption facts are the first answer's alone.
+          - "\"(billet_exclusion_call == 'first' or (billet_exclusion_a.pointer is sameas (billet_interrupted_upgrade | default(false) | bool)))\" in ((billet_answer_judge.vars.billet_exclusion_checks | selectattr('name', 'equalto', 'pointer') | first).ok | string)"
+          - "\"(billet_exclusion_call == 'first' or billet_exclusion_a.pointer_target == billet_upgrade_recovery_dir | default(''))\" in ((billet_answer_judge.vars.billet_exclusion_checks | selectattr('name', 'equalto', 'pointer_target') | first).ok | string)"
+          - "\"billet_exclusion_answer.pointer if billet_exclusion_call == 'first' else billet_interrupted_upgrade\" in (billet_answer_facts['ansible.builtin.set_fact'].billet_interrupted_upgrade | string)"
+          - "\"(billet_exclusion_call == 'first' and billet_exclusion_answer.pointer)\" in (billet_answer_facts['ansible.builtin.set_fact'].billet_upgrade_recovery_dir | string)"
+          - "\"if billet_exclusion_call == 'first'\" in (billet_answer_facts['ansible.builtin.set_fact'].billet_upgrade_claim_shape | string)"
           # THE ID NAMES THE GUARD ALREADY HELD: a successful answer after the first acquisition must carry the saved id.
           - "\"(billet_exclusion_id | default('') | length == 0 or billet_exclusion_a.id == billet_exclusion_id)\" in (billet_answer_judge.vars.billet_exclusion_checks | string)"
           # ACQUIRED IS THE FIRST CALL'S OUTCOME ALONE, and the cleanup token is taken from that acquisition and never replaced.

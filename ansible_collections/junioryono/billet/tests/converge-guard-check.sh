@@ -1675,6 +1675,31 @@ ns_case b9e-recovery-dir-other escalated
 expect_refused_member b9e-recovery-dir-other "recovery_dir"
 expect_fact b9e-recovery-dir-other recovery ""
 expect_calls b9e-recovery-dir-other managed "converge-guard prepare --holder h1 --json --recovery" 0
+# B9g. A SECOND ANSWER THAT CLEARS THE POINTER after the first answer chose
+# `--recovery`, every other member the real answer's: refused at the parser
+# naming the pointer, the interruption fact and the pointer kept, nothing
+# recovered or converged, no release (the guard was not this run's).
+plant b9g-second-pointer-cleared
+p b9g-second-pointer-cleared "plant_root; plant_managed v0.10.0; plant_guard h1 /usr/bin/billet; mkdir -m 0700 $ROOT/$REC_A; plant_pointer $REC_A"
+"$python" - "$work/corpus/validated-settled.json" "$work/cases/b9g-second-pointer-cleared/answer.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+d["id"] = "@ID@"
+d["pointer"] = False
+d.pop("pointer_target", None)
+d.pop("recovery_dir", None)
+json.dump(d, open(sys.argv[2], "w"), indent=2)
+PY
+e b9g-second-pointer-cleared "BILLET_GATE_ANSWER=prepare:2:$work/cases/b9g-second-pointer-cleared/answer.json"
+ns_case b9g-second-pointer-cleared escalated
+expect_refused_member b9g-second-pointer-cleared "pointer"
+expect_fact b9g-second-pointer-cleared interrupted True
+expect_fact b9g-second-pointer-cleared recovery "$ROOT/$REC_A"
+expect_state b9g-second-pointer-cleared pointer symlink
+expect_calls b9g-second-pointer-cleared managed "converge-guard prepare --holder h1 --json --recovery" 1
+expect_calls b9g-second-pointer-cleared managed "converge-guard release" 0
+expect_calls b9g-second-pointer-cleared managed "converge-guard settle" 0
+expect_no_task b9g-second-pointer-cleared "Stage the immutable candidate binary inside its recovery journal"
 # B9f. A pointer_target with a trailing newline: refused at the parser, since the grammar ends at the end of the text.
 plant b9f-pointer-target-newline
 p b9f-pointer-target-newline "plant_root; plant_managed v0.10.0; plant_guard h1 /usr/bin/billet; mkdir -m 0700 $ROOT/$REC_A; plant_pointer $REC_A"
