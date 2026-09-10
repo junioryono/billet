@@ -235,8 +235,15 @@ jobs:
     runs-on: ubuntu-latest
     # Sized from what the gates measurably take: the run was cancelled at 15
     # minutes after the two connector gates and the fleet gate joined it
-    # (measured 2026-09-06, 15m03s with every gate green until the cap).
-    timeout-minutes: 30
+    # (measured 2026-09-06, 15m03s with every gate green until the cap), and
+    # at 30 minutes once the preparation's gate grew to two hundred cases on a
+    # runner that ran every step 1.5 to 2 times slower than the run before it
+    # (measured 2026-09-10: the guard gate 16m47s against 8m46s, the key-policy
+    # gate 4m46s against 2m52s, the job cancelled at 30m05s inside the
+    # cloudflared gate with every earlier gate green). The gate launches its
+    # playbooks one case at a time, so the follow-up that buys the time back
+    # is batching compatible cases into one launch, not a larger budget.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
 
