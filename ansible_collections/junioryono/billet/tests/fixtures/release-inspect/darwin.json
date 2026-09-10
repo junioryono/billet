@@ -1,0 +1,254 @@
+{
+  "config": {
+    "path": "/usr/local/etc/billet/billet.yaml",
+    "presence": "present",
+    "readable": true,
+    "same_as_installed": true
+  },
+  "config_binding": {
+    "unknown": "launchd has no unit shape this inspector reads"
+  },
+  "executable": {
+    "image": "/usr/local/bin/billet",
+    "installed_path": "/usr/local/bin/billet",
+    "installed_path_same": true,
+    "is_release": false,
+    "process_bound": false,
+    "sha256": "abababababababababababababababababababababababababababababababab",
+    "version": "(devel)"
+  },
+  "host": {
+    "authority": null,
+    "deployment_id": {
+      "unknown": "not minted"
+    },
+    "endpoint_receipt": {
+      "unknown": "no endpoint receipt on this platform"
+    },
+    "installed_endpoint": null,
+    "node_name": null,
+    "node_trust": null,
+    "os": "darwin",
+    "registration": {
+      "unknown": "no runtime record on this platform"
+    },
+    "retirement": {
+      "unknown": "retirement is not tracked on darwin: a launch agent's account owns no /var/lib/billet"
+    }
+  },
+  "installed_config": {
+    "controllers": "single",
+    "has_node": false,
+    "has_server": true,
+    "ledger_backend": "sqlite",
+    "path": "/usr/local/etc/billet/billet.yaml",
+    "sha256": "abababababababababababababababababababababababababababababababab"
+  },
+  "provenance": {
+    "reason": "no provenance record",
+    "verdict": "none"
+  },
+  "schema": 1,
+  "services": {
+    "backup_service": {
+      "active_state": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "enabled": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "main_pid": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "sub_state": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "unit_file_state": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "unit_present": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      }
+    },
+    "backup_timer": {
+      "active_state": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "enabled": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "sub_state": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "unit_file_state": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "unit_present": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      }
+    },
+    "node": {
+      "active_state": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "cmdline_config_path": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "cmdline_matches_unit": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "config_changed_since_start": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "config_sha256": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "dsn_env": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "enabled": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "environment_file_changed_since_start": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "environment_files": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "exec_main_start": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "exec_start": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "invocation_id": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "loaded_config": {
+        "unknown": "nothing on the disk proves what a process read at start"
+      },
+      "main_pid": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "need_daemon_reload": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "running_sha256": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "same_as_executable": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "shape": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "started_at": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "sub_state": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "unit_file_state": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "unit_present": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      }
+    },
+    "server": {
+      "active_state": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "cmdline_config_path": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "cmdline_matches_unit": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "config_changed_since_start": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "config_sha256": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "dsn_env": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "enabled": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "environment_file_changed_since_start": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "environment_files": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "exec_main_start": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "exec_start": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "invocation_id": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "loaded_config": {
+        "unknown": "nothing on the disk proves what a process read at start"
+      },
+      "main_pid": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "need_daemon_reload": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "running_sha256": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "same_as_executable": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "shape": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "started_at": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "sub_state": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "unit_file_state": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "unit_present": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      }
+    },
+    "upgrade_timer": {
+      "active_state": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "enabled": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "sub_state": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "unit_file_state": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "unit_present": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      }
+    }
+  },
+  "transaction": {
+    "active": "none",
+    "converge_guard": null,
+    "journal": null,
+    "lock_held": false,
+    "preparation": {
+      "transaction_lock": false
+    },
+    "root": "absent"
+  }
+}

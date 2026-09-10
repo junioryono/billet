@@ -686,12 +686,12 @@ func TestTheRecordedExecutableIsNeverRun(t *testing.T) {
 // G18: THE FLAG SET PER SUBCOMMAND, pinned, and the invalid combinations.
 func TestTheGuardsFlagsArePinned(t *testing.T) {
 	want := map[string][]string{
-		"hold":    {"candidate", "holder", "old-driver-stopped", "recover-from"},
+		"hold":    {"candidate", "holder", "note", "old-driver-stopped", "recover-from"},
 		"release": {"cleanup", "holder", "token"},
 		"status":  {"json"},
 		"recover": {"holder", "old-driver-stopped", "unpublished"},
 		"holder":  {},
-		"prepare": {"allow-downgrade", "candidate", "dry-run", "expect-bootstrap", "expect-id", "holder", "json", "no-change", "recovery", "token", "validate"},
+		"prepare": {"allow-downgrade", "candidate", "dry-run", "expect-bootstrap", "expect-id", "holder", "json", "no-change", "note", "recovery", "token", "validate"},
 		"settle":  {"holder", "json", "token"},
 	}
 

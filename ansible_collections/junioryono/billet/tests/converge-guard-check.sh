@@ -400,7 +400,7 @@ d = json.load(open(sys.argv[1]))
 m = sys.argv[3]
 bad = {"outcome": 7, "id": "zz", "holder": "h2", "preparing": "yes", "token": "short",
        "record": {}, "pointer": "no", "managed": {"present": "maybe"}, "downgrade": "x",
-       "next": None, "shape": 7}
+       "next": None, "shape": 7, "note": 7}
 d[m] = bad[m]
 json.dump(d, open(sys.argv[2], "w"), indent=2)
 PY
@@ -973,7 +973,7 @@ fi
     "$PYTHON" - <<'PY'
 import json
 r = json.load(open("/var/lib/billet/upgrades/active/guard.json"))
-for k in ("holder", "id", "release_executable", "release_executable_sha256", "claimed_at"):
+for k in ("holder", "id", "release_executable", "release_executable_sha256", "claimed_at", "note"):
     print("record_%s=%s" % (k, r.get(k, "")))
 print("record_preparing=%s" % r.get("preparing", False))
 print("record_has_token=%s" % ("token" in r))
@@ -1090,6 +1090,19 @@ expect_state b1-first pointer absent
 expect_calls b1-first systemctl "" 0
 echo "ok   B1: a candidate is acquired over, staged, re-bound and settled in order, and the role asks nothing of its own"
 
+# B1d. THE NOTE: the input set → the first call carries `--note`, the record
+# carries it, and the second call and the settlement carry no note flag; the
+# default leaves the argv without it (B1's first-call pin has no `--note`).
+plant b1d-note
+p b1d-note 'plant_root; plant_managed v0.10.0'
+a b1d-note -e "billet_converge_guard_note=run 12 of owner/repo"
+ns_case b1d-note escalated
+expect_allowed b1d-note
+expect_calls b1d-note managed "converge-guard prepare --validate --holder h1 --json --note run 12 of owner/repo" 1
+expect_calls b1d-note managed "--no-change --note" 0
+expect_calls b1d-note managed "converge-guard settle --holder h1 --token" 1
+expect_state b1d-note record_note "run 12 of owner/repo"
+expect_state b1d-note record_preparing False
 # B2. No change: acquired, nothing staged, --no-change validated, settled.
 plant b2-unchanged
 p b2-unchanged 'plant_root; plant_managed v0.10.0'
@@ -1859,6 +1872,16 @@ expect_final b12-second-acquired "the cleanup released the guard" "is now none"
 expect_fact b12-second-acquired released True
 expect_state b12-second-acquired active absent
 expect_calls b12-second-acquired managed "converge-guard release --holder h1 --cleanup --token" 1
+# A note that is not a string on a successful second answer: refused at the parser naming it, and the guard cleaned up.
+plant b12-second-note
+p b12-second-note 'plant_root; plant_managed v0.10.0'
+corrupt "$work/corpus/no-change-second.json" "$work/cases/b12-second-note/answer.json" note
+e b12-second-note "BILLET_GATE_ANSWER=prepare:2:$work/cases/b12-second-note/answer.json"
+ns_case b12-second-note escalated
+expect_refused_member b12-second-note "note"
+expect_final b12-second-note "the cleanup released the guard" "is now none"
+expect_fact b12-second-note released True
+expect_state b12-second-note active absent
 # A null `next` on a successful second answer: refused at the parser naming it, and the guard cleaned up.
 plant b12-second-next
 p b12-second-next 'plant_root; plant_managed v0.10.0'

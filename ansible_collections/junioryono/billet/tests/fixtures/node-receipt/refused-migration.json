@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "outcome": "refused",
+  "reason": "migration",
+  "why": "the running node dials http://127.0.0.1:7717 and the installed configuration names http://127.0.0.1:7719; a migration is owed",
+  "next": "billet node migrate-endpoint, which the converge runs before the node's restart"
+}

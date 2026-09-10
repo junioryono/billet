@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "outcome": "reported",
+  "planned": false,
+  "first_start": false,
+  "node_removed": true,
+  "from": null,
+  "to": null,
+  "effective": null,
+  "record": "none",
+  "config": "present",
+  "unit": {
+    "load_state": "not-found",
+    "active_state": "inactive",
+    "kill_mode": "mixed"
+  }
+}

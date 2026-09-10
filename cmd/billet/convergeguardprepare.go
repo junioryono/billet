@@ -174,6 +174,10 @@ type prepareAnswer struct {
 	Managed       prepareExecutable  `json:"managed"`
 	Candidate     *prepareExecutable `json:"candidate,omitempty"`
 	Downgrade     bool               `json:"downgrade"`
+	// Note is the record's, as recorded at acquisition: the first call's own
+	// note on an acquisition, and the recorded one on every later answer,
+	// whatever note that call carried.
+	Note string `json:"note,omitempty"`
 }
 
 // prepareRefusal is the answer of a refusal (exit 2) or of something that
@@ -207,6 +211,7 @@ type prepareDryGuard struct {
 	PointerTarget  string        `json:"pointer_target,omitempty"`
 	PointerProblem string        `json:"pointer_problem,omitempty"`
 	StrayTemporary bool          `json:"stray_temporary"`
+	Note           string        `json:"note,omitempty"`
 }
 
 // prepareMode is what the flag table admitted.
@@ -217,6 +222,7 @@ type prepareMode struct {
 	expectID                             string
 	allowDowngrade                       bool
 	token                                string
+	note                                 string
 }
 
 // refuse builds a refusal with its exit status; the JSON is printed by the
@@ -269,6 +275,8 @@ func cmdGuardPrepare(ctx context.Context, args []string) error {
 		"replaced refuses, and nothing is acquired")
 	allowDowngrade := flags.Bool("allow-downgrade", false, "with --candidate: admit a candidate older than the managed binary")
 	token := flags.String("token", "", "the acquiring invocation's token; accepted by the second call and ignored")
+	note := flags.String("note", "", "with --validate: one line for whoever finds this guard, written when the "+
+		"guard is acquired and kept for its life; ignored when the guard already exists")
 	asJSON := flags.Bool("json", false, "print the answer as JSON (the only form)")
 
 	if err := parse(flags, args); err != nil {
@@ -281,7 +289,7 @@ func cmdGuardPrepare(ctx context.Context, args []string) error {
 
 	mode := prepareMode{validate: *validate, noChange: *noChange, recovery: *recovery, dryRun: *dryRun,
 		candidate: *candidate, expectBootstrap: *expectBootstrap, expectID: *expectID,
-		allowDowngrade: *allowDowngrade, token: *token}
+		allowDowngrade: *allowDowngrade, token: *token, note: *note}
 
 	if r := checkPrepareCombination(mode); r != nil {
 		return answerRefusal(r)
@@ -303,6 +311,10 @@ func cmdGuardPrepare(ctx context.Context, args []string) error {
 
 	if mode.token != "" && !guardHex32.MatchString(mode.token) {
 		return answerRefusal(refuse(reasonCombination, "", "--token is not a 32-hex token", ""))
+	}
+
+	if err := checkNote(mode.note); err != nil {
+		return answerRefusal(refuse(reasonCombination, "", err.Error(), ""))
 	}
 
 	if mode.dryRun {
@@ -358,6 +370,8 @@ func checkPrepareCombination(m prepareMode) *prepareRefusal {
 		return bad("--dry-run takes no other flag")
 	case m.allowDowngrade && (m.validate || m.noChange || m.recovery):
 		return bad("--allow-downgrade belongs to --candidate C")
+	case m.note != "" && !m.validate:
+		return bad("--note belongs to --validate, the call that may acquire")
 	}
 
 	return nil
@@ -470,7 +484,7 @@ func prepareUnderLock(ctx context.Context, root *txLock, holder string, m prepar
 
 	base := &prepareAnswer{
 		ID: shape.Guard.ID, Adopted: adopted, Holder: shape.Guard.Holder, ClaimedAt: shape.Guard.ClaimedAt,
-		Hostname: shape.Guard.Hostname, Preparing: shape.Guard.Preparing,
+		Hostname: shape.Guard.Hostname, Preparing: shape.Guard.Preparing, Note: shape.Guard.Note,
 		Record: prepareRecord{ReleaseExecutable: shape.Guard.ReleaseExecutable,
 			ReleaseExecutableSHA256: shape.Guard.ReleaseExecutableSHA256, Verified: true},
 		Pointer: pointer, PointerTarget: target, StrayRemoved: strayRemoved, Managed: managed,
@@ -527,7 +541,7 @@ func acquireGuard(ctx context.Context, root *txLock, holder string, m prepareMod
 		return nil, refuse(reasonRandomness, string(claimNone), err.Error(), "")
 	}
 
-	record := guardRecord{Holder: holder, ID: id, Token: token, Preparing: true}
+	record := guardRecord{Holder: holder, ID: id, Token: token, Preparing: true, Note: m.note}
 	record.ClaimedAt = guardNow().UTC().Format(time.RFC3339)
 
 	hostname, err := guardHostname()
@@ -554,7 +568,7 @@ func acquireGuard(ctx context.Context, root *txLock, holder string, m prepareMod
 
 	answer := &prepareAnswer{
 		Outcome: prepareAcquired, ID: id, Holder: holder, ClaimedAt: record.ClaimedAt, Hostname: hostname,
-		Preparing: true, Token: token,
+		Preparing: true, Token: token, Note: m.note,
 		Record:  prepareRecord{ReleaseExecutable: path, ReleaseExecutableSHA256: sum, Verified: true},
 		Managed: describeManaged(ctx),
 	}
@@ -1291,7 +1305,7 @@ func prepareDryRun(ctx context.Context) error {
 
 	g := &prepareDryGuard{
 		Holder: shape.Guard.Holder, ClaimedAt: shape.Guard.ClaimedAt, Hostname: shape.Guard.Hostname,
-		Preparing: shape.Guard.Preparing, RecordError: shape.RecordErr,
+		Preparing: shape.Guard.Preparing, RecordError: shape.RecordErr, Note: shape.Guard.Note,
 		Record: prepareRecord{ReleaseExecutable: shape.Guard.ReleaseExecutable,
 			ReleaseExecutableSHA256: shape.Guard.ReleaseExecutableSHA256},
 		StrayTemporary: shape.StrayTemporary,

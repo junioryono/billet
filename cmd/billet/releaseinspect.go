@@ -338,6 +338,9 @@ type inspectHost struct {
 	// installed configuration's node endpoint as the one representation.
 	Registration      maybe `json:"registration"`
 	InstalledEndpoint maybe `json:"installed_endpoint"`
+	// EndpointReceipt is the durable migration receipt, typed by presence
+	// (releaseinspectreceipt.go), judged whether or not the node runs.
+	EndpointReceipt maybe `json:"endpoint_receipt"`
 }
 
 type inspectCertificate struct {
@@ -482,6 +485,7 @@ func inspectHostRelease(ctx context.Context, configPath string) inspectReport {
 	report.Installed = inspectInstalledSection(cfg, configPath, report.Config, digest)
 	report.Host = inspectHostSection(cfg)
 	report.Host.Registration = hostRegistration(report.Services["node"], cfg)
+	report.Host.EndpointReceipt = hostEndpointReceipt()
 	report.Host.InstalledEndpoint = installedEndpoint(cfg, report.Config.Readable)
 	report.Transaction = inspectTransactionSection()
 	if inspectBeforeClose != nil {

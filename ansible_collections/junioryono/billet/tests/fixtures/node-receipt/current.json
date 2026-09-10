@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "outcome": "current",
+  "receipt": {
+    "schema": 1,
+    "run": "ci-run-12",
+    "node": "node-a",
+    "deployment": "dddddddddddddddddddddddddddddddd",
+    "installed_sha256": "abababababababababababababababababababababababababababababababab",
+    "installed_endpoint": "http://127.0.0.1:7719",
+    "effective_endpoint": "http://127.0.0.1:7719",
+    "invocation_id": "abcdefabcdefabcdefabcdefabcdefab",
+    "incarnation": "ffeeddccbbaa99887766554433221100",
+    "written_at": "2026-09-10T12:00:00.5Z"
+  }
+}

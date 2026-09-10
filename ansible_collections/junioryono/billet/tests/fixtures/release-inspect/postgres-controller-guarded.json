@@ -1,0 +1,156 @@
+{
+  "config": {
+    "path": "/etc/billet/billet.yaml",
+    "presence": "present",
+    "readable": true,
+    "same_as_installed": true
+  },
+  "config_binding": true,
+  "executable": {
+    "image": "/usr/bin/billet",
+    "installed_path": "/usr/bin/billet",
+    "installed_path_same": true,
+    "is_release": false,
+    "process_bound": true,
+    "sha256": "abababababababababababababababababababababababababababababababab",
+    "version": "(devel)"
+  },
+  "host": {
+    "authority": {
+      "created": true,
+      "current": {
+        "der_sha256": "abababababababababababababababababababababababababababababababab",
+        "not_after": "2026-09-10T12:00:00Z",
+        "pem": "-----BEGIN CERTIFICATE-----\nMIIB...\n-----END CERTIFICATE-----\n",
+        "subject": "CN=billet node wire CA,O=dddddddddddddddddddddddddddddddd"
+      },
+      "previous": null,
+      "rotation_in_progress": false
+    },
+    "deployment_id": "dddddddddddddddddddddddddddddddd",
+    "endpoint_receipt": {
+      "presence": "absent"
+    },
+    "installed_endpoint": null,
+    "node_name": null,
+    "node_trust": null,
+    "os": "linux",
+    "registration": {
+      "unknown": "the node is not running, so no registration record is bound to a process"
+    },
+    "retirement": null
+  },
+  "installed_config": {
+    "controllers": "single",
+    "has_node": false,
+    "has_server": true,
+    "ledger_backend": "postgres",
+    "path": "/etc/billet/billet.yaml",
+    "sha256": "abababababababababababababababababababababababababababababababab"
+  },
+  "provenance": {
+    "reason": "no provenance record",
+    "verdict": "none"
+  },
+  "schema": 1,
+  "services": {
+    "backup_service": {
+      "active_state": "inactive",
+      "enabled": false,
+      "main_pid": null,
+      "sub_state": "dead",
+      "unit_file_state": "static",
+      "unit_present": true
+    },
+    "backup_timer": {
+      "active_state": "inactive",
+      "enabled": false,
+      "sub_state": "dead",
+      "unit_file_state": "disabled",
+      "unit_present": true
+    },
+    "node": {
+      "active_state": "inactive",
+      "cmdline_config_path": null,
+      "cmdline_matches_unit": null,
+      "config_changed_since_start": null,
+      "config_sha256": null,
+      "dsn_env": null,
+      "enabled": null,
+      "environment_file_changed_since_start": null,
+      "environment_files": null,
+      "exec_main_start": "",
+      "exec_start": null,
+      "invocation_id": null,
+      "loaded_config": {
+        "unknown": "nothing on the disk proves what a process read at start"
+      },
+      "main_pid": null,
+      "need_daemon_reload": false,
+      "running_sha256": null,
+      "same_as_executable": null,
+      "shape": null,
+      "started_at": null,
+      "sub_state": "dead",
+      "unit_file_state": null,
+      "unit_present": false
+    },
+    "server": {
+      "active_state": "active",
+      "cmdline_config_path": "/etc/billet/billet.yaml",
+      "cmdline_matches_unit": true,
+      "config_changed_since_start": false,
+      "config_sha256": "abababababababababababababababababababababababababababababababab",
+      "dsn_env": {
+        "matches_file": "equal",
+        "name": "BILLET_PG_DSN",
+        "present": true
+      },
+      "enabled": true,
+      "environment_file_changed_since_start": false,
+      "environment_files": [
+        "/var/lib/billet-fixture/server.env"
+      ],
+      "exec_main_start": "Tue 2023-11-14 22:14:00 UTC",
+      "exec_start": "/usr/bin/billet server --config /etc/billet/billet.yaml",
+      "invocation_id": "0123456789abcdef0123456789abcdef",
+      "loaded_config": {
+        "unknown": "nothing on the disk proves what a process read at start"
+      },
+      "main_pid": 4242,
+      "need_daemon_reload": false,
+      "running_sha256": "abababababababababababababababababababababababababababababababab",
+      "same_as_executable": true,
+      "shape": "supported",
+      "started_at": "2026-09-10T12:00:00Z",
+      "sub_state": "running",
+      "unit_file_state": "enabled",
+      "unit_present": true
+    },
+    "upgrade_timer": {
+      "active_state": "active",
+      "enabled": true,
+      "sub_state": "waiting",
+      "unit_file_state": "enabled",
+      "unit_present": true
+    }
+  },
+  "transaction": {
+    "active": "converge-guard",
+    "converge_guard": {
+      "claimed_at": "2026-09-10T12:00:00Z",
+      "holder": "ci-1",
+      "hostname": "billet-control-01",
+      "recovery_pointer": false,
+      "release_executable": "/usr/bin/billet",
+      "release_executable_sha256": "abababababababababababababababababababababababababababababababab",
+      "release_executable_verified": true
+    },
+    "journal": null,
+    "lock_held": false,
+    "preparation": {
+      "transaction_lock": true
+    },
+    "root": "present"
+  }
+}

@@ -18,6 +18,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/junioryono/billet/deploy"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/hostupgrade"
 	"github.com/junioryono/billet/internal/initconfig"
@@ -1802,10 +1803,15 @@ func newLedgerHost(cfg *config.Config, cfgPath string, journal *hostupgrade.Jour
 	return h
 }
 
+// newHostInspector builds the inspector the transaction's systemd host runs
+// systemctl through. A variable so a test can observe the deadline each
+// operation is given.
+var newHostInspector = func() *lifeops.Inspector { return lifeops.NewInspector() }
+
 func newSystemdHost(cfg *config.Config, cfgPath, staged string,
 	journal *hostupgrade.Journal,
 ) *systemdHost {
-	inspector := lifeops.NewInspector()
+	inspector := newHostInspector()
 
 	return &systemdHost{
 		ledgerHost: newLedgerHost(cfg, cfgPath, journal),
@@ -1846,7 +1852,9 @@ const (
 // UNBOUNDED BY ANYTHING HERE. The node's SIGTERM is a drain that waits for the
 // compute already running for as long as it runs, and `TimeoutStopSec` in the
 // unit is what eventually bounds it — losing billet's bookkeeping rather than the
-// jobs. Nothing in this command imposes a shorter one.
+// jobs. Nothing in this command imposes a shorter one: the stop runs under the
+// transaction's own context, which carries no deadline, and lifeops applies
+// none of its own to a stop.
 func (h *systemdHost) StopNode(ctx context.Context) error {
 	return h.stop(ctx, nodeUnit)
 }
@@ -2762,7 +2770,12 @@ func (h *systemdHost) StartServices(ctx context.Context) error {
 			continue
 		}
 
-		if _, err := h.converge.StartAndProve(ctx, unit); err != nil {
+		// UNDER THE UNIT'S OWN START BOUND, as `local up` starts one.
+		startCtx, cancelStart := context.WithTimeout(ctx, deploy.UnitStartTimeout+lifecycleDeadlineMargin)
+		_, err := h.converge.StartAndProve(startCtx, unit)
+		cancelStart()
+
+		if err != nil {
 			return fmt.Errorf("starting %s: %w", unit, err)
 		}
 	}

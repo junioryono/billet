@@ -341,11 +341,25 @@ func runAsLedgerOwner(ctx context.Context, cfg *config.Config, args []string) (b
 	}
 
 	if code != 0 {
-		return true, fmt.Errorf("%w: exit status %d", errStatusChildFailed, code)
+		return true, &ledgerChildExit{code: code}
 	}
 
 	return true, nil
 }
+
+// ledgerChildExit is a non-zero exit of the command re-executed as the
+// ledger's owner: the child has already printed its answer or its failure,
+// so the parent exits with the same status and prints nothing more (a
+// registration's 2 and 3 are answers; a status's 1 is its failure).
+type ledgerChildExit struct{ code int }
+
+func (e *ledgerChildExit) Error() string {
+	return fmt.Sprintf("billet rollout failed as the ledger's owner: exit status %d", e.code)
+}
+
+// Is says a child's non-zero exit is the status's own failure, for the
+// caller that asks by errors.Is.
+func (e *ledgerChildExit) Is(target error) bool { return target == errStatusChildFailed }
 
 // errStatusChildFailed is the report's own failure, run as the ledger's owner;
 // the child has already printed why.

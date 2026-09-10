@@ -996,7 +996,7 @@
           - billet_answer_names.index("Judge the preparation's answer") < billet_answer_names.index("Refuse the preparation's answer")
           - billet_answer_names.index("Refuse the preparation's answer") < billet_answer_names.index("Take the preparation's answer as this run's facts")
           - billet_answer_names.index("Take the preparation's answer as this run's facts") < billet_answer_names.index("Report the preparation's answer")
-          - billet_answer_judge.vars.billet_exclusion_checks | map(attribute='name') | list == ['outcome', 'exit', 'reason', 'why', 'id', 'holder', 'preparing', 'token', 'record', 'pointer', 'shape', 'next', 'recovery_dir', 'pointer_target', 'managed', 'downgrade']
+          - billet_answer_judge.vars.billet_exclusion_checks | map(attribute='name') | list == ['outcome', 'exit', 'reason', 'why', 'id', 'holder', 'preparing', 'token', 'record', 'pointer', 'shape', 'next', 'note', 'recovery_dir', 'pointer_target', 'managed', 'downgrade']
           - "'item.ok | bool' in (billet_answer_judge['ansible.builtin.assert'].that | join(' '))"
           - "'(billet_exclusion_raw.rc | default(1)) == 0' in ((billet_answer_judge.vars.billet_exclusion_checks | selectattr('name', 'equalto', 'exit') | first).ok | string)"
           - "'recovery-[0-9]{8}T[0-9]{6}-[0-9a-f]{8}|[0-9]{8}T[0-9]{15}' in billet_host_answer_text"
@@ -1153,7 +1153,7 @@
           - "'ansible.builtin.command' not in billet_host_fallback_text"
           - "'ansible.builtin.shell' not in billet_host_fallback_text"
           # THE RECORD'S SCHEMA: the five members required, the protocol's three admitted and typed.
-          - "'OPTIONAL_MEMBERS = {\"id\": \"hex32\", \"token\": \"hex32\", \"preparing\": \"bool\"}' in billet_fallback_module_text"
+          - "'OPTIONAL_MEMBERS = {\"id\": \"hex32\", \"token\": \"hex32\", \"preparing\": \"bool\", \"note\": \"note\"}' in billet_fallback_module_text"
           - "'RECORD_MEMBERS = (\"holder\", \"claimed_at\", \"hostname\", \"release_executable\", \"release_executable_sha256\")' in billet_fallback_module_text"
         fail_msg: >-
           guard-fallback.yml must read the record through the module with its

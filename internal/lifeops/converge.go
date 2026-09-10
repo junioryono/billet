@@ -1276,8 +1276,14 @@ func (c *Converger) Identity(req UpRequest) (int, int, error) {
 // IS the readiness signal. The window that follows exists for what readiness
 // cannot cover — a service that reaches ready and then dies, which
 // Restart=on-failure turns into a crash loop reading "active" at any instant.
+//
+// THE START RUNS UNDER THE CALLER'S CONTEXT AND NO DEADLINE OF ITS OWN: the
+// caller derives one from the unit's own bound (deploy.UnitStartTimeout plus
+// a margin), because a unit's start takes as long as its readiness takes and
+// the inspector's timeout is a property read's. The stability samples that
+// follow are property reads, bounded as every property read is.
 func (c *Converger) StartAndProve(ctx context.Context, unit string) (string, error) {
-	if _, err := c.inspector.run(ctx, c.inspector.systemctl, []string{"start", "--", unit}); err != nil {
+	if _, err := c.inspector.exec(ctx, []string{"start", "--", unit}); err != nil {
 		// A FAILED START IS NOT ALWAYS A BROKEN ONE. The host role can render the
 		// server unit with an assertion that holds it deliberately: a host whose
 		// ledger volume is mounted and proved but which has not been given a
@@ -1481,7 +1487,10 @@ const unitDisabled = "disabled"
 
 // Enable commits a unit to future boots.
 func (c *Converger) Enable(ctx context.Context, unit string) error {
-	if _, err := c.inspector.run(ctx, c.inspector.systemctl, []string{"enable", "--", unit}); err != nil {
+	ctx, cancel := c.inspector.bounded(ctx)
+	defer cancel()
+
+	if _, err := c.inspector.exec(ctx, []string{"enable", "--", unit}); err != nil {
 		return fmt.Errorf("enable %s: %w", unit, err)
 	}
 
@@ -1496,12 +1505,16 @@ func (c *Converger) Enable(ctx context.Context, unit string) error {
 // calls because `enable --now` commits a unit to every future boot before
 // anything proved it can run, the rule every other unit here follows.
 func (c *Converger) StartTimer(ctx context.Context, unit string) error {
-	if _, err := c.inspector.run(ctx, c.inspector.systemctl, []string{"start", "--", unit}); err != nil {
+	// A TIMER'S START IS IMMEDIATE, a property read's kind of operation, so it
+	// runs under the inspector's timeout as the read after it does.
+	ctx, cancel := c.inspector.bounded(ctx)
+	defer cancel()
+
+	if _, err := c.inspector.exec(ctx, []string{"start", "--", unit}); err != nil {
 		return fmt.Errorf("start %s: %w", unit, err)
 	}
 
-	out, err := c.inspector.run(ctx, c.inspector.systemctl,
-		[]string{"show", "--property=ActiveState", "--value", "--", unit})
+	out, err := c.inspector.exec(ctx, []string{"show", "--property=ActiveState", "--value", "--", unit})
 	if err != nil {
 		return fmt.Errorf("prove %s is armed: %w", unit, err)
 	}
@@ -1571,8 +1584,15 @@ type StopResult struct {
 // whose main process ignored SIGTERM is killed at TimeoutStopSec — after which
 // the unit is inactive and `failed`. A caller about to report "this host is
 // down" needs the state the manager holds now, not the return code of a command.
+//
+// THE STOP RUNS UNDER THE CALLER'S CONTEXT AND NO DEADLINE OF ITS OWN: a
+// node's stop is a drain that takes as long as the compute it waits for, and
+// the caller decides the bound (deploy.UnitStopTimeout plus a margin for the
+// lifecycle commands, the migration's own deadline for an endpoint migration,
+// none at all for the host transaction). The observation that follows is a
+// property read, bounded as every property read is.
 func (c *Converger) StopAndProve(ctx context.Context, unit string) (StopResult, error) {
-	if _, err := c.inspector.run(ctx, c.inspector.systemctl, []string{"stop", "--", unit}); err != nil {
+	if _, err := c.inspector.exec(ctx, []string{"stop", "--", unit}); err != nil {
 		return StopResult{}, fmt.Errorf("stop %s: %w", unit, err)
 	}
 
@@ -1712,7 +1732,10 @@ func (c *Converger) CollateralNote() string {
 // boot that nothing established can run — and must equally not disable one an
 // operator had enabled before it arrived.
 func (c *Converger) Disable(ctx context.Context, unit string) error {
-	if _, err := c.inspector.run(ctx, c.inspector.systemctl, []string{"disable", "--", unit}); err != nil {
+	ctx, cancel := c.inspector.bounded(ctx)
+	defer cancel()
+
+	if _, err := c.inspector.exec(ctx, []string{"disable", "--", unit}); err != nil {
 		return fmt.Errorf("disable %s: %w", unit, err)
 	}
 

@@ -111,6 +111,12 @@ func main() {
 			os.Exit(0)
 		}
 
+		// A QUIET EXIT carries a child's status whose output was already
+		// passed through: nothing more is printed.
+		if coded, ok := errors.AsType[*exitError](err); ok && coded.msg == "" {
+			os.Exit(coded.code)
+		}
+
 		fmt.Fprintf(os.Stderr, "billet: %v\n", err)
 		os.Exit(exitStatus(err))
 	}
@@ -1491,6 +1497,18 @@ func nodeBundle(cfg *config.Config) (*wirecert.Bundle, error) {
 }
 
 func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
+	// THE NODE'S OWN SUBCOMMANDS, before the role's flags: the endpoint
+	// migration and the receipt are commands about the node this host runs,
+	// invoked by the role and never by the service.
+	if len(args) > 0 {
+		switch args[0] {
+		case "migrate-endpoint":
+			return cmdNodeMigrate(ctx, args[1:])
+		case "receipt":
+			return cmdNodeReceipt(ctx, args[1:])
+		}
+	}
+
 	fs := newFlagSet("billet node")
 	cfgPath := addConfigFlag(fs)
 	enroll := fs.Bool("enroll", false,

@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/deploy"
 )
@@ -493,5 +494,36 @@ func TestTheNodeUnitDeclaresItsRuntimeDirectoriesAndTheServerDeclaresNone(t *tes
 
 	if strings.Contains(deploy.ServerUnit, "RuntimeDirectory") {
 		t.Errorf("%s declares a RuntimeDirectory; a server declaring the node's would re-own and remove its record", deploy.ServerUnitName)
+	}
+}
+
+// THE CONSTANTS ARE THE UNITS' OWN BOUNDS: a caller that starts or stops a
+// unit under deploy.UnitStartTimeout or deploy.UnitStopTimeout waits exactly
+// as long as systemd would, plus its own margin, and a unit edited without
+// the constant following it fails here.
+func TestTheUnitBoundConstantsAreTheUnitsOwn(t *testing.T) {
+	for _, pair := range []struct{ what, unit string }{
+		{"node", deploy.NodeUnit},
+		{"server", deploy.ServerUnit},
+	} {
+		if got := time.Duration(timeoutStopSec(t, pair.what, pair.unit)) * time.Second; got != deploy.UnitStopTimeout {
+			t.Errorf("the %s unit's TimeoutStopSec is %s and deploy.UnitStopTimeout is %s", pair.what, got,
+				deploy.UnitStopTimeout)
+		}
+
+		m := regexp.MustCompile(`(?m)^TimeoutStartSec=(\d+)$`).FindStringSubmatch(pair.unit)
+		if m == nil {
+			t.Fatalf("the %s unit has no TimeoutStartSec", pair.what)
+		}
+
+		n, err := strconv.Atoi(m[1])
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if got := time.Duration(n) * time.Second; got != deploy.UnitStartTimeout {
+			t.Errorf("the %s unit's TimeoutStartSec is %s and deploy.UnitStartTimeout is %s", pair.what, got,
+				deploy.UnitStartTimeout)
+		}
 	}
 }

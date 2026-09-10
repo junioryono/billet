@@ -114,6 +114,34 @@ def main():
         # A foreign owner is refused at the parent, the first component judged.
         expect_refusal(mod, tree, owner + 1, "a foreign owner", "metadata", "owned by uid")
 
+    # THE NOTE: a record carrying the holder's one line is admitted (E5, E6),
+    # and one carrying a note the command would not write is refused naming
+    # it: not a string, empty, a newline, a control character, over the bound.
+    with tempfile.TemporaryDirectory() as base:
+        tree = Tree(base)
+        noted = tree.valid_record()
+        noted["note"] = "run 12 of owner/repo"
+        tree.write_record(noted)
+        try:
+            executable, _ = mod.find(str(tree.root), owner)
+        except mod.Refusal as exc:
+            raise SystemExit("guard_fallback_check: a record with a note was refused: %s" % exc)
+        if executable != str(tree.candidate):
+            fail("a record with a note answered %r" % executable)
+    for name, bad in [
+        ("a note that is not a string", 7),
+        ("an empty note", ""),
+        ("a note with a newline", "run 12\nof owner/repo"),
+        ("a note with a control character", "run\x0112"),
+        ("a note over the bound", "n" * 201),
+    ]:
+        with tempfile.TemporaryDirectory() as base:
+            tree = Tree(base)
+            noted = tree.valid_record()
+            noted["note"] = bad
+            tree.write_record(noted)
+            expect_refusal(mod, tree, owner, name, "content", "note is not one line of printable text")
+
     # THE COMPONENT × PROPERTY TABLE, one invalid property per case over a
     # fresh valid tree, refused in the phase that judges it.
     def component_cases():

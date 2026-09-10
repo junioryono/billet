@@ -616,6 +616,7 @@
             argv: >-
               {{ ([] if billet_exclusion_darwin | bool else ['timeout', '-k', '10', billet_guard_timeout | string])
                  + [billet_exclusion_binary, 'converge-guard', 'prepare', '--validate', '--holder', billet_exclusion_holder, '--json']
+                 + (['--note', billet_converge_guard_note] if billet_converge_guard_note | default('') | length > 0 else [])
                  + (['--expect-id', billet_exclusion_id] if billet_exclusion_id | default('') | length > 0 else []) }}
             expand_argument_vars: false
           async: "{{ 0 if not billet_exclusion_darwin | bool else (billet_guard_timeout | int) + 10 }}"
@@ -656,6 +657,7 @@
             argv: >-
               {{ ([] if billet_exclusion_darwin | bool else ['timeout', '-k', '10', billet_guard_timeout | string])
                  + [billet_exclusion_fallback_executable, 'converge-guard', 'prepare', '--validate', '--holder', billet_exclusion_holder, '--json']
+                 + (['--note', billet_converge_guard_note] if billet_converge_guard_note | default('') | length > 0 else [])
                  + (['--expect-id', billet_exclusion_id] if billet_exclusion_id | default('') | length > 0 else []) }}
             expand_argument_vars: false
           async: "{{ 0 if not billet_exclusion_darwin | bool else (billet_guard_timeout | int) + 10 }}"
@@ -704,6 +706,7 @@
                   billet_upgrade_recovery_dir ~ '/billet.candidate', 'converge-guard', 'prepare', '--validate',
                   '--holder', billet_exclusion_holder, '--candidate', billet_upgrade_recovery_dir ~ '/billet.candidate', '--json']
                  + (['--expect-bootstrap'] if billet_exclusion_route == 'unheld' else [])
+                 + (['--note', billet_converge_guard_note] if billet_converge_guard_note | default('') | length > 0 else [])
                  + (['--expect-id', billet_exclusion_id] if billet_exclusion_id | default('') | length > 0 else []) }}
             expand_argument_vars: false
           register: billet_exclusion_first_candidate

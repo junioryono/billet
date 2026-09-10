@@ -97,6 +97,7 @@ import json
 import os
 import re
 import stat
+import unicodedata
 
 from ansible.module_utils.basic import AnsibleModule
 
@@ -104,7 +105,10 @@ RECORD_MEMBERS = ("holder", "claimed_at", "hostname", "release_executable", "rel
 # THE PROTOCOL'S MEMBERS, admitted and typed when present: a record written
 # before the protocol carries none of them and reads as settled. The token is
 # judged as a string and never printed by this module.
-OPTIONAL_MEMBERS = {"id": "hex32", "token": "hex32", "preparing": "bool"}
+# `note` is the holder's one line, typed as the command types it: a non-empty
+# string of at most MAX_NOTE_BYTES with no control character.
+OPTIONAL_MEMBERS = {"id": "hex32", "token": "hex32", "preparing": "bool", "note": "note"}
+MAX_NOTE_BYTES = 200
 # MATCHED WHOLE (fullmatch): `$` also matches before a final newline, so a
 # digest or an id followed by one passed here and was refused by the command.
 # MATCHED WHOLE (fullmatch): `$` also matches before a final newline, so a
@@ -290,6 +294,11 @@ def read_record(root, owner):
         if kind == "bool":
             if not isinstance(value, bool):
                 raise Refusal("content", "%s: %s is not a boolean" % (record, name))
+        elif kind == "note":
+            if (not isinstance(value, str) or value == "" or len(value.encode("utf-8")) > MAX_NOTE_BYTES
+                    or any(ch.isspace() and ch != " " for ch in value)
+                    or any(unicodedata.category(ch).startswith("C") for ch in value)):
+                raise Refusal("content", "%s: note is not one line of printable text" % record)
         elif not isinstance(value, str) or not _HEX32.fullmatch(value):
             raise Refusal("content", "%s: %s is not 32 lowercase hex digits" % (record, name))
     # A RECORD FROM BEFORE THE PROTOCOL IS EXACTLY THE FIVE MEMBERS: a token or

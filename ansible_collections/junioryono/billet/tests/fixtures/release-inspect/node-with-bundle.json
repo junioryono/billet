@@ -1,0 +1,164 @@
+{
+  "config": {
+    "path": "/etc/billet/billet.yaml",
+    "presence": "present",
+    "readable": true,
+    "same_as_installed": true
+  },
+  "config_binding": true,
+  "executable": {
+    "image": "/usr/bin/billet",
+    "installed_path": "/usr/bin/billet",
+    "installed_path_same": true,
+    "is_release": false,
+    "process_bound": true,
+    "sha256": "abababababababababababababababababababababababababababababababab",
+    "version": "(devel)"
+  },
+  "host": {
+    "authority": null,
+    "deployment_id": null,
+    "endpoint_receipt": {
+      "presence": "present",
+      "receipt": {
+        "deployment": "dddddddddddddddddddddddddddddddd",
+        "effective_endpoint": "http://127.0.0.1:7719",
+        "incarnation": "ffeeddccbbaa99887766554433221100",
+        "installed_endpoint": "http://127.0.0.1:7719",
+        "installed_sha256": "abababababababababababababababababababababababababababababababab",
+        "invocation_id": "abcdefabcdefabcdefabcdefabcdefab",
+        "node": "node-a",
+        "run": "ci-run-12",
+        "schema": 1,
+        "written_at": "2026-09-10T12:00:00Z"
+      }
+    },
+    "installed_endpoint": "https://10.0.0.5:7717",
+    "node_name": "node-a",
+    "node_trust": {
+      "cas": [
+        {
+          "der_sha256": "abababababababababababababababababababababababababababababababab",
+          "not_after": "2026-09-10T12:00:00Z",
+          "pem": "-----BEGIN CERTIFICATE-----\nMIIB...\n-----END CERTIFICATE-----\n",
+          "subject": "CN=billet node wire CA,O=dep-1234"
+        }
+      ],
+      "leaf": {
+        "der_sha256": "abababababababababababababababababababababababababababababababab",
+        "not_after": "2026-09-10T12:00:00Z",
+        "pem": "-----BEGIN CERTIFICATE-----\nMIIB...\n-----END CERTIFICATE-----\n",
+        "subject": "CN=node-a,O=dep-1234"
+      }
+    },
+    "os": "linux",
+    "registration": {
+      "deployment": "dep-1234",
+      "endpoint": "https://10.0.0.5:7717",
+      "incarnation": "00112233445566778899aabbccddeeff",
+      "invocation_id": "0123456789abcdef0123456789abcdef",
+      "node": "node-a",
+      "registered_at": "2026-09-10T12:00:00Z"
+    },
+    "retirement": null
+  },
+  "installed_config": {
+    "controllers": null,
+    "has_node": true,
+    "has_server": false,
+    "ledger_backend": null,
+    "path": "/etc/billet/billet.yaml",
+    "sha256": "abababababababababababababababababababababababababababababababab"
+  },
+  "provenance": {
+    "reason": "no provenance record",
+    "verdict": "none"
+  },
+  "schema": 1,
+  "services": {
+    "backup_service": {
+      "active_state": "inactive",
+      "enabled": false,
+      "main_pid": null,
+      "sub_state": "dead",
+      "unit_file_state": "static",
+      "unit_present": true
+    },
+    "backup_timer": {
+      "active_state": "inactive",
+      "enabled": false,
+      "sub_state": "dead",
+      "unit_file_state": "disabled",
+      "unit_present": true
+    },
+    "node": {
+      "active_state": "active",
+      "cmdline_config_path": "/etc/billet/billet.yaml",
+      "cmdline_matches_unit": true,
+      "config_changed_since_start": false,
+      "config_sha256": "abababababababababababababababababababababababababababababababab",
+      "dsn_env": null,
+      "enabled": true,
+      "environment_file_changed_since_start": null,
+      "environment_files": [],
+      "exec_main_start": "Tue 2023-11-14 22:14:00 UTC",
+      "exec_start": "/usr/bin/billet node --config /etc/billet/billet.yaml",
+      "invocation_id": "0123456789abcdef0123456789abcdef",
+      "loaded_config": {
+        "unknown": "nothing on the disk proves what a process read at start"
+      },
+      "main_pid": 4242,
+      "need_daemon_reload": false,
+      "running_sha256": "abababababababababababababababababababababababababababababababab",
+      "same_as_executable": true,
+      "shape": "supported",
+      "started_at": "2026-09-10T12:00:00Z",
+      "sub_state": "running",
+      "unit_file_state": "enabled",
+      "unit_present": true
+    },
+    "server": {
+      "active_state": "inactive",
+      "cmdline_config_path": null,
+      "cmdline_matches_unit": null,
+      "config_changed_since_start": null,
+      "config_sha256": null,
+      "dsn_env": null,
+      "enabled": null,
+      "environment_file_changed_since_start": null,
+      "environment_files": null,
+      "exec_main_start": "",
+      "exec_start": null,
+      "invocation_id": null,
+      "loaded_config": {
+        "unknown": "nothing on the disk proves what a process read at start"
+      },
+      "main_pid": null,
+      "need_daemon_reload": false,
+      "running_sha256": null,
+      "same_as_executable": null,
+      "shape": null,
+      "started_at": null,
+      "sub_state": "dead",
+      "unit_file_state": null,
+      "unit_present": false
+    },
+    "upgrade_timer": {
+      "active_state": "active",
+      "enabled": true,
+      "sub_state": "waiting",
+      "unit_file_state": "enabled",
+      "unit_present": true
+    }
+  },
+  "transaction": {
+    "active": "none",
+    "converge_guard": null,
+    "journal": null,
+    "lock_held": false,
+    "preparation": {
+      "transaction_lock": false
+    },
+    "root": "absent"
+  }
+}

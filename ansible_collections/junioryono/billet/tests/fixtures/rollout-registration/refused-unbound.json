@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "outcome": "refused",
+  "reason": "unbound",
+  "why": "this ledger is bound to no deployment, so no registration in it is this deployment's"
+}

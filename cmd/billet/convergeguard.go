@@ -86,6 +86,32 @@ type guardRecord struct {
 	ID                      string `json:"id,omitempty"`
 	Token                   string `json:"token,omitempty"`
 	Preparing               bool   `json:"preparing,omitempty"`
+	// Note is what the holder wrote at acquisition (a run's identity, an
+	// operator's reason), for the operator who finds the guard: Puppet's
+	// disable message and balena's lock reason are its ancestors. Written
+	// once, never rewritten by a later validation, a re-binding, a settlement
+	// or a takeover; absent on a record whose holder wrote none.
+	Note string `json:"note,omitempty"`
+}
+
+// maxNoteBytes bounds a note: one line an operator reads on a held host.
+const maxNoteBytes = 200
+
+// checkNote refuses a note that is not one line of printable text: empty is
+// admitted (no note), a control character, a newline or more bytes than a
+// note needs is not.
+func checkNote(note string) error {
+	if len(note) > maxNoteBytes {
+		return fmt.Errorf("--note is %d bytes; a note is one short line (at most %d bytes)", len(note), maxNoteBytes)
+	}
+
+	for _, r := range note {
+		if unicode.IsControl(r) || r == unicode.ReplacementChar {
+			return errors.New("--note is not one line of printable text: no control character or newline")
+		}
+	}
+
+	return nil
 }
 
 // The guard's errors, each its own value because a caller decides on them.
@@ -262,6 +288,8 @@ func cmdGuardHold(args []string) error {
 		"pointer, after that holder's driver is stopped")
 	oldStopped := flags.Bool("old-driver-stopped", false, "assert that the driver which held --recover-from is "+
 		"stopped or cannot dispatch further work, and that its remote work has finished")
+	note := flags.String("note", "", "one line for whoever finds this guard: the run that holds it, or why an "+
+		"operator does; written at acquisition and kept for the guard's life")
 
 	if err := parse(flags, args); err != nil {
 		return err
@@ -271,7 +299,13 @@ func cmdGuardHold(args []string) error {
 		return err
 	}
 
+	if err := checkNote(*note); err != nil {
+		return err
+	}
+
 	switch {
+	case *recoverFrom != "" && *note != "":
+		return errors.New("a takeover keeps the note the guard records; --note is refused beside --recover-from")
 	case *recoverFrom != "" && *candidate != "":
 		return errors.New("a takeover keeps the executable the guard records; --candidate is refused beside --recover-from")
 	case *recoverFrom != "" && !*oldStopped:
@@ -296,14 +330,14 @@ func cmdGuardHold(args []string) error {
 		return takeOverGuard(root, *recoverFrom, *holder)
 	}
 
-	return holdGuard(root, *holder, *candidate)
+	return holdGuard(root, *holder, *candidate, *note)
 }
 
 // holdGuard publishes a new guard, or validates an existing one this holder
 // already holds. Everything it examines or makes under the root is reached
 // through the root's descriptor, so a name replaced under the lock is not the
 // thing used.
-func holdGuard(root *txLock, holder, candidate string) error {
+func holdGuard(root *txLock, holder, candidate, note string) error {
 	dir, shape, err := openGuardForMutation(root)
 	if err != nil {
 		return err
@@ -325,7 +359,7 @@ func holdGuard(root *txLock, holder, candidate string) error {
 		return refuseShape(shape)
 	}
 
-	record := guardRecord{Holder: holder}
+	record := guardRecord{Holder: holder, Note: note}
 
 	// AN ID FOR EVERY RECORD WRITTEN FROM HERE ON, so the preparation's
 	// continuity holds over a guard an operator's hold made; no token and not
@@ -1493,6 +1527,18 @@ func checkGuardRecord(raw map[string]json.RawMessage, g guardRecord) string {
 		return "the record's token is not 32 hex characters"
 	}
 
+	// THE NOTE IS TYPED WHEN PRESENT, to the shape the command writes: a record
+	// carrying one the command would have refused was not written by it.
+	if _, ok := raw["note"]; ok {
+		if g.Note == "" {
+			return "the record's note is empty; a record without a note carries none"
+		}
+
+		if err := checkNote(g.Note); err != nil {
+			return "the record's note is not one the command writes: " + err.Error()
+		}
+	}
+
 	// A RECORD FROM BEFORE THE PROTOCOL IS EXACTLY THE FIVE MEMBERS: one that
 	// carries a token or a preparing flag without an id is a protocol record
 	// that lost its id, and adopting it would mint another id, erase the
@@ -1544,7 +1590,7 @@ func guardRecordTypes(raw map[string]json.RawMessage) string {
 // read the same way.
 func guardRecordMembers(body []byte) (map[string]json.RawMessage, string) {
 	known := map[string]bool{"holder": true, "claimed_at": true, "hostname": true, "release_executable": true,
-		"release_executable_sha256": true, "id": true, "token": true, "preparing": true}
+		"release_executable_sha256": true, "id": true, "token": true, "preparing": true, "note": true}
 
 	dec := json.NewDecoder(bytes.NewReader(body))
 
@@ -1734,6 +1780,7 @@ type guardStatusRec struct {
 	ReleaseExecutableSHA256   string `json:"release_executable_sha256"`
 	ReleaseExecutableVerified maybe  `json:"release_executable_verified"`
 	RecordError               string `json:"record_error,omitempty"`
+	Note                      string `json:"note,omitempty"`
 }
 
 func (s claimShape) report() guardStatusReport {
@@ -1748,6 +1795,7 @@ func (s claimShape) report() guardStatusReport {
 		ID: s.Guard.ID, Preparing: s.Guard.Preparing, StrayTemporary: s.StrayTemporary,
 		RecoveryPointer: s.Pointer, ReleaseExecutable: s.Guard.ReleaseExecutable,
 		ReleaseExecutableSHA256: s.Guard.ReleaseExecutableSHA256, RecordError: s.RecordErr,
+		Note: s.Guard.Note,
 	}
 
 	// VERIFIED, NEVER RUN: the recorded executable's digest now against the

@@ -291,6 +291,13 @@ billet_allow_converge_from_billet_runner: false
 # exported, and the preparation prints the command.
 billet_converge_guard_holder: "{{ lookup('env', 'BILLET_CONVERGE_GUARD_HOLDER') }}"
 
+# ONE LINE FOR WHOEVER FINDS THE GUARD, written into its record when this
+# converge acquires it and kept for the guard's life (a later inclusion, a
+# re-binding, a settlement or a takeover never rewrites it): the action writes
+# the run's identity and repository, an operator writes why. Empty writes none.
+# At most 200 bytes of printable text, no newline.
+billet_converge_guard_note: ""
+
 # Seconds a converge-guard command (a status, a hold) may take before it is
 # ended. `timeout -k 10` on Linux; the task's own async bound on a Mac, which
 # has no `timeout`.

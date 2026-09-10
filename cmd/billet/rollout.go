@@ -48,10 +48,12 @@ func cmdRollout(ctx context.Context, args []string) error {
 		return cmdRolloutNodePhase(ctx, args[1:], rollout.PhaseExempt, "exempt")
 	case "decommission":
 		return cmdRolloutNodePhase(ctx, args[1:], rollout.PhaseDecommissioned, "decommission")
+	case "registration":
+		return cmdRolloutRegistration(ctx, args[1:])
 	}
 
-	return fmt.Errorf("unknown rollout command %q; try status, start, abort, retry, exempt "+
-		"or decommission", args[0])
+	return fmt.Errorf("unknown rollout command %q; try status, start, abort, retry, exempt, "+
+		"decommission or registration", args[0])
 }
 
 // rolloutStore opens the ledger the way every operator command does, through

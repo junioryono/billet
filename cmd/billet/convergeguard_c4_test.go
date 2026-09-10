@@ -658,6 +658,11 @@ func TestTheGuardStatusFixturesAreTheCommandsOwn(t *testing.T) {
 
 			mustHold(t, "ci-1")
 		},
+		"healthy-note": func(t *testing.T, _ *guardFixture) {
+			t.Helper()
+
+			mustOK(t, guardRun(t, "hold", "--holder", "ci-1", "--note", "kernel patch, back by 15:00"))
+		},
 		"healthy-with-pointer": func(t *testing.T, f *guardFixture) {
 			t.Helper()
 

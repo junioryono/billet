@@ -1,0 +1,20 @@
+{
+  "deployment": {
+    "bound": true,
+    "id": "dddddddddddddddddddddddddddddddd"
+  },
+  "nodes": [],
+  "registrations": [
+    {
+      "digest": "abababababababababababababababababababababababababababababababab",
+      "epoch": 1,
+      "highest_release": "v0.9.3",
+      "incarnation": "0000000000000000000000000000bbbb",
+      "live": true,
+      "name": "node-a",
+      "release": "v0.9.3"
+    }
+  ],
+  "rollout": null,
+  "schema": 1
+}

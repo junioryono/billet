@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/junioryono/billet/deploy"
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/lifeops"
@@ -416,7 +417,12 @@ func stopAndDisable(ctx context.Context, c converger, cfg *config.Config, req li
 			return partialDown(ctx, c, cfg, req, stoppedUnits, disabledUnits, err)
 		}
 
-		stopped, stopErr := c.StopAndProve(ctx, unit)
+		// UNDER THE UNIT'S OWN STOP BOUND: a node's stop is a drain that
+		// systemd bounds at TimeoutStopSec, so that plus a margin is the
+		// deadline, and a shorter one would report a draining host as down.
+		stopCtx, cancelStop := context.WithTimeout(ctx, deploy.UnitStopTimeout+lifecycleDeadlineMargin)
+		stopped, stopErr := c.StopAndProve(stopCtx, unit)
+		cancelStop()
 
 		// OBSERVED WHATEVER THE COMMAND ANSWERED. A manager can move a
 		// transaction and THEN fail — an interrupted stop, one that stopped

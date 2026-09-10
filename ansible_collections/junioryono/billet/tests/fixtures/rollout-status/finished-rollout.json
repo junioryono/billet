@@ -1,0 +1,53 @@
+{
+  "deployment": {
+    "bound": true,
+    "id": "dddddddddddddddddddddddddddddddd"
+  },
+  "nodes": [
+    {
+      "attempts": 0,
+      "blocker": "",
+      "converged_digest": "",
+      "dispatch_epoch": 0,
+      "exempt_reason": "",
+      "last_refusal": "",
+      "next_attempt_at": "",
+      "node": "node-a",
+      "phase": "committed",
+      "prior_release": "",
+      "rollback_result": "",
+      "updated_at": "2026-09-10T12:00:00Z"
+    }
+  ],
+  "registrations": [
+    {
+      "digest": "abababababababababababababababababababababababababababababababab",
+      "epoch": 1,
+      "highest_release": "v0.9.4",
+      "incarnation": "0000000000000000000000000000bbbb",
+      "live": true,
+      "name": "node-a",
+      "release": "v0.9.4"
+    }
+  ],
+  "rollout": {
+    "channel": "stable",
+    "controller_phase": "committed",
+    "created_at": "2026-09-10T12:00:00Z",
+    "created_by": "ops",
+    "finished_at": "2026-09-10T12:00:00Z",
+    "generation": 1,
+    "id": "1111111111111111",
+    "policy": {
+      "allow_downgrade": false,
+      "cohort": 2,
+      "failure_budget": 1
+    },
+    "prior_version": "v0.9.3",
+    "state": "completed",
+    "target_digest": "abababababababababababababababababababababababababababababababab",
+    "target_version": "v0.9.4",
+    "terminal_reason": "every host converged"
+  },
+  "schema": 1
+}

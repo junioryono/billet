@@ -78,6 +78,11 @@ func newInspectFixture(t *testing.T) *inspectFixture {
 	retiredJournalPath = filepath.Join(dir, "retired", "journal.json")
 	upgradeRoot = filepath.Join(dir, "upgrades")
 	provenance.Path = filepath.Join(dir, "installed.json")
+	// The receipt's path is this fixture's own on every platform, so the
+	// report's shape (an absent receipt) is the same wherever the tests run.
+	prevReceiptPath := receiptPath
+	receiptPath = filepath.Join(dir, "node", "endpoint-migration.json")
+	t.Cleanup(func() { receiptPath = prevReceiptPath })
 	inspectAfterOpen = nil
 	inspectAfterConfig, inspectBeforeClose, inspectBetweenClosingChecks, inspectAfterViewOpen = nil, nil, nil, nil
 	t.Cleanup(func() {
@@ -2386,6 +2391,7 @@ host.authority.current.subject
 host.authority.previous
 host.authority.rotation_in_progress
 host.deployment_id
+host.endpoint_receipt.presence
 host.installed_endpoint
 host.node_name
 host.node_trust
@@ -2651,6 +2657,7 @@ executable.sha256
 executable.version
 host.authority
 host.deployment_id.unknown
+host.endpoint_receipt.presence
 host.installed_endpoint
 host.node_name
 host.node_trust
@@ -2761,6 +2768,7 @@ executable.sha256
 executable.version
 host.authority
 host.deployment_id
+host.endpoint_receipt.presence
 host.installed_endpoint
 host.node_name
 host.node_trust.cas

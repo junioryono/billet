@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "outcome": "refused",
+  "reason": "pre-r",
+  "why": "the running node is a release before the converge guard; a binary upgrade restarts it into one that carries the guard, and the action then judges that process",
+  "next": "upgrade the binary first",
+  "state": "nothing"
+}

@@ -537,7 +537,13 @@ func startUnits(ctx context.Context, c converger, req lifeops.UpRequest,
 			// established there is that one process survived the window — and
 			// printing "ready" for both would tell a Mac operator something
 			// nothing checked.
-			proof, err := c.StartAndProve(ctx, unit.Name)
+			// UNDER THE UNIT'S OWN START BOUND: the start runs under the
+			// caller's context and the unit's TimeoutStartSec is what
+			// systemd gives it, so that plus a margin is the deadline.
+			startCtx, cancelStart := context.WithTimeout(ctx, deploy.UnitStartTimeout+lifecycleDeadlineMargin)
+			proof, err := c.StartAndProve(startCtx, unit.Name)
+			cancelStart()
+
 			if err != nil {
 				return rollback(err)
 			}
@@ -705,6 +711,11 @@ func orDefaultDetail(unit lifeops.UnitPlan) string {
 // disable — or the query that decides whether to issue one — inherits that
 // cancellation and fails, leaving the host committed to booting a service
 // nothing proved.
+// lifecycleDeadlineMargin is what a stop's or a start's deadline carries
+// beyond the unit's own bound, so systemd's own timeout is what ends a slow
+// operation and the deadline here catches only a manager that never answered.
+const lifecycleDeadlineMargin = 30 * time.Second
+
 func liveFor(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(ctx), rollbackGrace)
 }

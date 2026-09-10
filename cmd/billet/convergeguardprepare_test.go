@@ -1623,6 +1623,28 @@ func TestTheGuardPrepareFixturesAreTheCommandsOwn(t *testing.T) {
 
 			return []string{"--holder", "ci-1", "--validate"}
 		},
+		"acquired-note": func(t *testing.T, f *guardFixture) []string {
+			t.Helper()
+			managedScript(t, f, "v0.10.0")
+
+			return []string{"--holder", "ci-1", "--validate", "--note", "run 12 of owner/repo"}
+		},
+		"validated-note": func(t *testing.T, f *guardFixture) []string {
+			t.Helper()
+			managedScript(t, f, "v0.10.0")
+			mustOutcome(t, runPrepare(t, "--holder", "ci-1", "--validate", "--note", "run 12 of owner/repo"), prepareAcquired)
+
+			// A later validation's own note is not the record's: the answer
+			// carries the note as recorded.
+			return []string{"--holder", "ci-1", "--validate", "--note", "another"}
+		},
+		"dry-run-guard-note": func(t *testing.T, f *guardFixture) []string {
+			t.Helper()
+			managedScript(t, f, "v0.10.0")
+			mustOutcome(t, runPrepare(t, "--holder", "ci-1", "--validate", "--note", "run 12 of owner/repo"), prepareAcquired)
+
+			return []string{"--dry-run"}
+		},
 		"validated-settled": func(t *testing.T, f *guardFixture) []string {
 			t.Helper()
 			managedScript(t, f, "v0.10.0")

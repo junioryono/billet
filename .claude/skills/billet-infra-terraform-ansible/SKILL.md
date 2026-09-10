@@ -51,6 +51,8 @@ Three layers own three things. Terraform creates cloud resources and returns nar
 
 **The collection's `galaxy.yml` carries the release version.** A collection installed from a Git tag reports the version in that file, so the cut-release workflow rewrites it.
 
+**Every JSON a role consumes has fixtures written by the Go test that produces it.** `tests/fixtures/<command>/*.json` for `guard-status`, `guard-prepare`, `node-migrate-endpoint`, `rollout-registration`, `node-receipt`, `rollout-status` and `release-inspect` are the commands' own answers over planted shapes (cmd/billet's `TestThe*FixturesAreTheCommandsOwn`), with paths, identifiers, digests and times spelled as the packaged host's; `fixtureSetIs` refuses a committed file no producer writes and a producer no file matches. A gate's fake answers from those files and never from a shape written by hand; a role-side parser is written against the complete object of every fixture, nullability per branch included (a migration's `unchanged` has a null `endpoint` only under `record: none` or `unread`, a `reported` a null `to` only beside `node_removed: true`).
+
 ## Measured facts
 
 - `DeleteProject` succeeds during a live build; the build runs to completion and `BatchGetBuilds` keeps answering for it.

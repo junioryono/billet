@@ -133,6 +133,8 @@
         ok: "{{ ('shape' not in billet_exclusion_a) or (billet_exclusion_a.shape is string) }}"
       - name: next
         ok: "{{ ('next' not in billet_exclusion_a) or (billet_exclusion_a.next is string) }}"
+      - name: note
+        ok: "{{ ('note' not in billet_exclusion_a) or (billet_exclusion_a.note is string) }}"
       # THE RECOVERY DIRECTORY IS THE VALIDATED POINTER TARGET ALONE: the
       # command answers `recovery_dir` beside it on a validation, and an
       # answer naming two directories is refused rather than read from the
