@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -53,6 +54,12 @@ func newGuardFixture(t *testing.T) *guardFixture {
 	savedRoot, savedBinary, savedNow, savedHost := upgradeRoot, installedBinary, guardNow, guardHostname
 	upgradeRoot, installedBinary = f.root, f.binary
 	guardNow = func() time.Time { return time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC) }
+
+	// DETERMINISTIC IDS AND TOKENS, so a fixture's record and the committed
+	// corpus are the same on every run: each draw is the next in a sequence.
+	savedRandom := guardRandom
+	guardRandom = deterministicGuardRandom()
+	t.Cleanup(func() { guardRandom = savedRandom })
 	guardHostname = func() (string, error) { return "billet-control-01", nil }
 
 	t.Cleanup(func() {
@@ -64,6 +71,23 @@ func newGuardFixture(t *testing.T) *guardFixture {
 }
 
 func (f *guardFixture) active() string { return filepath.Join(f.root, "active") }
+
+// deterministicGuardRandom answers the n-th draw with bytes that spell it,
+// distinct per draw and stable across runs.
+func deterministicGuardRandom() func(int) ([]byte, error) {
+	draw := 0
+
+	return func(n int) ([]byte, error) {
+		draw++
+
+		buf := make([]byte, n)
+		for i := range buf {
+			buf[i] = byte(draw*16 + i)
+		}
+
+		return buf, nil
+	}
+}
 
 // openRootForTest opens the upgrade root the way the lock hands it to the
 // claim helpers, for a fixture that calls them without taking the lock.
@@ -189,7 +213,7 @@ func TestAHoldPublishesTheRecordAndReleasesTheLock(t *testing.T) {
 
 	slices.Sort(keys)
 
-	if want := []string{"claimed_at", "holder", "hostname", "release_executable", "release_executable_sha256"}; !reflect.DeepEqual(keys, want) {
+	if want := []string{"claimed_at", "holder", "hostname", "id", "release_executable", "release_executable_sha256"}; !reflect.DeepEqual(keys, want) {
 		t.Errorf("the record's keys are %v, want %v", keys, want)
 	}
 
@@ -474,8 +498,25 @@ func TestGuardHelperProcess(t *testing.T) {
 			// what the rest of the command meets.
 			continues := os.Getenv(guardHelperContinueEnv) != ""
 
+			// A STOP MAY NAME AN OCCURRENCE, `<kind> <path>#N`, for an operation
+			// a command performs more than once (a readmission flushes the
+			// guard directory before a rewrite flushes it again).
+			occurrence := 1
+			if i := strings.LastIndex(stop, "#"); i > 0 {
+				if n, err := strconv.Atoi(stop[i+1:]); err == nil {
+					stop, occurrence = stop[:i], n
+				}
+			}
+
+			seen := 0
+
 			guardHook = func(op guardOp) error {
 				if op.Kind+" "+strings.TrimPrefix(op.Path, root+"/") == stop {
+					seen++
+					if seen < occurrence {
+						return nil
+					}
+
 					announce("STOPPED:" + stop)
 					waitForParent()
 
@@ -1272,6 +1313,7 @@ func TestStatusNamesEveryShapeWithoutLockingOrCreating(t *testing.T) {
 
 	want := map[string]any{
 		"holder": "ci-1", "claimed_at": "2026-09-09T12:00:00Z", "hostname": "billet-control-01",
+		"id": f.record(t).ID, "preparing": false, "stray_temporary": false,
 		"recovery_pointer": false, "release_executable": f.binary, "release_executable_sha256": f.binarySHA,
 		"release_executable_verified": true,
 	}

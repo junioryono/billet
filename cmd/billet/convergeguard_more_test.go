@@ -687,10 +687,12 @@ func TestTheRecordedExecutableIsNeverRun(t *testing.T) {
 func TestTheGuardsFlagsArePinned(t *testing.T) {
 	want := map[string][]string{
 		"hold":    {"candidate", "holder", "old-driver-stopped", "recover-from"},
-		"release": {"holder"},
+		"release": {"cleanup", "holder", "token"},
 		"status":  {"json"},
 		"recover": {"holder", "old-driver-stopped", "unpublished"},
 		"holder":  {},
+		"prepare": {"allow-downgrade", "candidate", "dry-run", "expect-bootstrap", "expect-id", "holder", "json", "no-change", "recovery", "token", "validate"},
+		"settle":  {"holder", "json", "token"},
 	}
 
 	for sub, flags := range want {
@@ -726,6 +728,9 @@ func TestTheGuardsFlagsArePinned(t *testing.T) {
 		"a candidate on a takeover":      {"hold", "--holder", "ci-2", "--recover-from", "ci-1", "--old-driver-stopped", "--candidate", "/x"},
 		"holder with unpublished":        {"recover", "--holder", "ci-1", "--unpublished"},
 		"json on a mutator":              {"release", "--holder", "ci-1", "--json"},
+		"a cleanup without its token":    {"release", "--holder", "ci-1", "--cleanup"},
+		"a token without cleanup":        {"release", "--holder", "ci-1", "--token", "00000000000000000000000000000000"},
+		"a settlement without a token":   {"settle", "--holder", "ci-1"},
 	} {
 		if err := guardRun(t, args...); err == nil {
 			t.Errorf("%s: accepted", name)

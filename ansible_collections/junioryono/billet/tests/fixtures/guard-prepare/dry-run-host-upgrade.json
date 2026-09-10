@@ -1,0 +1,10 @@
+{
+  "outcome": "reported",
+  "shape": "host-upgrade",
+  "guard": null,
+  "managed": {
+    "path": "/usr/bin/billet",
+    "present": true,
+    "sha256": "abababababababababababababababababababababababababababababababab"
+  }
+}

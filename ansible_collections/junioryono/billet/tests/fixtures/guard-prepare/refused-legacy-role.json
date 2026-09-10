@@ -1,0 +1,7 @@
+{
+  "outcome": "refused",
+  "reason": "shape",
+  "shape": "legacy-role",
+  "why": "a pre-R role transaction's pointer claims this host; the role's own recovery (upgrade-recover.yml) is what handles it, and a fresh converge follows",
+  "next": "the role's own recovery (upgrade-recover.yml), then a fresh converge"
+}

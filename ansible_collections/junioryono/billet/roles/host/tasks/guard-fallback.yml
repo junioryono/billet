@@ -3,7 +3,8 @@
 # answer for it (absent, after an interrupted bootstrap; or one that predates
 # the guard and answers "unknown command") is answered by the executable the
 # guard's record names: the candidate a converge staged in a recovery
-# directory under the upgrade root. The guard_fallback module reads that
+# directory under the upgrade root, through which prepare-exclusion.yml then
+# makes its calls. The guard_fallback module reads that
 # record under the trust boundary in three phases (the metadata of every
 # component before the record is read; the record's content before the
 # candidate is looked at; the candidate's every component and its digest,
@@ -78,15 +79,6 @@
   ansible.builtin.set_fact:
     billet_exclusion_fallback_executable: "{{ billet_exclusion_fallback.executable }}"
 
-- name: Ask the recorded executable for the claim's status
-  junioryono.billet.guard_status:
-    executable: "{{ billet_exclusion_fallback_executable }}"
-    timeout: "{{ billet_guard_timeout }}"
-    expect: directory
-  register: billet_exclusion_status_fallback
-  check_mode: false
-  become: "{{ billet_exclusion_become }}"
-
 - name: Report the fallback
   ansible.builtin.debug:
     msg: >-
@@ -94,5 +86,5 @@
       {{ 'is absent' if not billet_exclusion_binary_present | bool else 'predates the converge guard' }};
       the guard at {{ billet_exclusion_root }}/active is answered by the
       executable it records, {{ billet_exclusion_fallback_executable }}
-      (digest {{ billet_exclusion_fallback.sha256 }}, verified), which every
-      guard operation of this converge runs.
+      (digest {{ billet_exclusion_fallback.sha256 }}, verified), through which
+      every guard call of this converge is made.

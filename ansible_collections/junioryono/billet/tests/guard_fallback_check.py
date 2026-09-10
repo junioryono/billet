@@ -196,6 +196,11 @@ def main():
     content_cases.append(("a 63-hex digest", dict(valid, release_executable_sha256="a" * 63), "not 64 lowercase hex"))
     content_cases.append(("an uppercase digest", dict(valid, release_executable_sha256="A" * 64), "not 64 lowercase hex"))
     content_cases.append(("a relative executable", dict(valid, release_executable="billet"), "not an absolute path"))
+    # THE PROTOCOL'S MEMBERS, typed when present.
+    content_cases.append(("a short id", dict(valid, id="abc"), "id is not 32 lowercase hex"))
+    content_cases.append(("an uppercase token", dict(valid, token="A" * 32), "token is not 32 lowercase hex"))
+    content_cases.append(("preparing as text", dict(valid, preparing="yes"), "preparing is not a boolean"))
+    content_cases.append(("id null", dict(valid, id=None), "id is not 32 lowercase hex"))
     for name, record, words in content_cases:
         with tempfile.TemporaryDirectory() as base:
             tree = Tree(base)
@@ -341,6 +346,22 @@ def main():
                 fail("the group-writable root refused for the wrong reason: %s" % exc)
         else:
             fail("a group-writable root was admitted by the ancestors judgement")
+
+    # A RECORD WITH THE PROTOCOL'S MEMBERS is admitted, and the module's answer
+    # carries the executable and its digest and never the token.
+    with tempfile.TemporaryDirectory() as base:
+        tree = Tree(base)
+        tree.write_record(dict(tree.valid_record(), id="0" * 32, token="1" * 32, preparing=True))
+        try:
+            executable, digest = mod.find(str(tree.root), owner)
+        except mod.Refusal as exc:
+            fail("a record with the protocol's members was refused: %s" % exc)
+        else:
+            if executable != str(tree.candidate):
+                fail("the eight-member record's executable is %s" % executable)
+        text = "%s %s" % (executable, digest)
+        if "1" * 32 in text:
+            fail("the module's answer carries the token")
 
     # HARD LINKS ARE ADMITTED: the command imposes no one-link rule.
     with tempfile.TemporaryDirectory() as base:

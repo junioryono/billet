@@ -1,11 +1,11 @@
 ---
-# THE BINARY CHANGE, DECIDED BEFORE THE HOLD. This file resolves what this
-# invocation intends for the binary (a supplied file, a pinned release, a
-# channel, or nothing), compares it with what is installed and with what a
-# guard this holder already holds records, and, when the binary changes,
-# allocates the transaction's journal, stages the candidate into it, and
-# asks the STAGED copy what it is and whether it can take part in the
-# exclusion, all before the hold. It runs on EVERY invocation of the role
+# THE STAGING. This file resolves what this invocation intends for the binary
+# (a supplied file, a pinned release, a channel, or nothing), compares it
+# with what is installed, and, when the binary changes, allocates the
+# transaction's journal and stages the candidate into it. It judges nothing
+# about the guard: the intent against the record, the capability floor, the
+# downgrade and the bootstrap's premise are `billet converge-guard prepare`'s
+# (prepare-exclusion.yml, the second call), under the lock. It runs on EVERY invocation of the role
 # (its facts are per invocation: a host in two plays decides "no change" in
 # the second from the installed digest, and never reuses a completed journal)
 # and resets nothing the classification owns.
@@ -32,24 +32,6 @@
   register: billet_installed_binary
   check_mode: false
   become: "{{ billet_exclusion_become }}"
-  when: not (billet_exclusion_darwin | default(false) | bool)
-
-# THE PREPARATION'S OBSERVATION HOLDS OR THE STAGING REFUSES: the managed
-# binary's presence decided whether the guard's status was asked of it, and a
-# binary that appeared since (an updater that finished and released its claim
-# between the preparation's inspection and the claim's) or vanished since is a
-# host whose exclusion state the preparation never saw. The classification is
-# not repeated here; the converge is refused and rerun from its start.
-- name: Refuse a converge whose managed binary appeared or vanished before the staging
-  ansible.builtin.assert:
-    that:
-      - billet_installed_binary.stat.exists == (billet_exclusion_binary_present | bool)
-    fail_msg: >-
-      {{ billet_exclusion_binary }} {{ 'appeared' if billet_installed_binary.stat.exists | default(false) else 'vanished' }}
-      between the preparation's inspection and this staging: an updater is at
-      work on this host and the claim it held was never seen. Nothing was
-      staged or held; rerun the converge once
-      `{{ billet_exclusion_binary }} converge-guard status` answers.
   when: not (billet_exclusion_darwin | default(false) | bool)
 
 - name: Resolve and stage this invocation's candidate
@@ -136,41 +118,6 @@
             )
           }}
 
-    # A SAME-HOLDER RERUN'S INTENT AGAINST THE RECORD. A guard this holder
-    # already holds records one executable, and a run under that guard must
-    # intend the same one: the managed binary (no change, or a candidate whose
-    # digest is the installed one's) or the recorded candidate (this run's
-    # candidate has its digest and the managed binary does not, the earlier run
-    # having held and never installed; a bootstrap retry included). Anything
-    # else is a DIFFERENT INTENT, refused: the command allows a retained guard
-    # around another transaction, and the role refuses it, because a guard that
-    # recorded one executable must not be the exclusion under which a second is
-    # installed. The remedy is a release and a fresh converge.
-    - name: Refuse a same-holder rerun with a different intent
-      vars:
-        billet_recorded_digest: "{{ (billet_exclusion_guard | default({})).release_executable_sha256 | default('') }}"
-        billet_managed_digest: "{{ billet_installed_binary.stat.checksum | default('') if billet_installed_binary.stat.exists else '' }}"
-        billet_intent_digest: "{{ billet_candidate_binary.stat.checksum | default('') if billet_candidate_selected | bool else '' }}"
-      ansible.builtin.assert:
-        that:
-          - >-
-            (billet_recorded_digest == billet_managed_digest and billet_managed_digest | length > 0
-             and (billet_intent_digest | length == 0 or billet_intent_digest == billet_managed_digest))
-            or
-            (billet_recorded_digest == billet_intent_digest and billet_intent_digest | length > 0
-             and billet_intent_digest != billet_managed_digest)
-        fail_msg: >-
-          The guard by {{ billet_exclusion_holder }} at {{ billet_exclusion_root }}/active
-          records an executable with digest {{ billet_recorded_digest }}; this run
-          {{ ('intends a candidate with digest ' ~ billet_intent_digest) if billet_intent_digest | length > 0 else 'intends no binary change' }}
-          over a managed binary {{ ('with digest ' ~ billet_managed_digest) if billet_managed_digest | length > 0 else 'that is absent' }}.
-          A guard that recorded one executable is not the exclusion under which another
-          is installed: release it (`{{ billet_exclusion_executable }} converge-guard
-          release --holder {{ billet_exclusion_holder }}`) and converge again.
-      when:
-        - billet_upgrade_claim_shape | default('none') == 'guard'
-        - not ansible_check_mode
-
     # THIS ROLE'S TRANSACTION IS THE SQLITE ONE, and refusing here is the
     # difference between a sentence and a wedged host. The transaction fences
     # the deployment, SNAPSHOTS the ledger, installs the candidate, and restores
@@ -216,45 +163,6 @@
           with billet-server and billet-node STOPPED, then converge again.
       when: billet_configured_state_backend != 'sqlite'
 
-    # A BOOTSTRAP is eligible when the root holds nothing the role did not write.
-    # Judged on an UNHELD host only: a bootstrap retried under this holder's
-    # guard finds `active` in the root, which is that guard, and the same-holder
-    # comparison above is what admits or refuses the retry.
-    - name: Inspect the upgrade root's entries before a bootstrap
-      ansible.builtin.find:
-        paths: "{{ billet_exclusion_root }}"
-        file_type: any
-        recurse: false
-        hidden: true
-      register: billet_exclusion_root_entries
-      check_mode: false
-      become: "{{ billet_exclusion_become }}"
-      when:
-        - billet_binary_upgrade | default(false)
-        - not billet_installed_binary.stat.exists
-        - billet_upgrade_claim_shape | default('none') == 'none'
-        - not ansible_check_mode
-
-    - name: Refuse a bootstrap over a root that holds something the role did not write
-      ansible.builtin.assert:
-        that:
-          - >-
-            billet_exclusion_root_entries.files | map(attribute='path') | map('basename')
-            | reject('match', '^(recovery-[0-9]{8}T[0-9]{6}-[0-9a-f]{8}|[0-9]{8}T[0-9]{15}|transaction\.lock)$')
-            | list | length == 0
-        fail_msg: >-
-          {{ billet_exclusion_binary }} is absent, so this converge would install
-          billet for the first time, but {{ billet_exclusion_root }} holds
-          {{ billet_exclusion_root_entries.files | map(attribute='path') | map('basename')
-             | reject('match', '^(recovery-[0-9]{8}T[0-9]{6}-[0-9a-f]{8}|[0-9]{8}T[0-9]{15}|transaction\.lock)$')
-             | list | join(', ') }},
-          which the role did not write. Inspect the root by hand before a bootstrap.
-      when:
-        - billet_binary_upgrade | default(false)
-        - not billet_installed_binary.stat.exists
-        - billet_upgrade_claim_shape | default('none') == 'none'
-        - not ansible_check_mode
-
     - name: Stage the candidate for the transaction
       when:
         - billet_binary_upgrade | default(false)
@@ -292,79 +200,3 @@
               {{ billet_candidate_source }} changed while the transaction was being
               prepared. Refusing to upgrade from an artifact other than the one whose
               digest selected this transaction.
-
-        # A DOWNGRADE IS REFUSED BEFORE THE DRAIN, unless asked for by name. The
-        # ledger's release watermark would refuse an older candidate at the
-        # transaction's probe and roll it back, after the node had drained; the
-        # two binaries' own `version` output answers the question for nothing.
-        # ASKED OF THE STAGED COPY, on the target, which a controller-side
-        # billet_binary_src could never be asked. Only a proved order refuses: a
-        # development build reports no release tag and is neither refused nor
-        # waved through on that basis.
-        - name: Read the installed and candidate releases
-          ansible.builtin.command:
-            argv:
-              - "{{ item }}"
-              - version
-          loop:
-            - "{{ billet_exclusion_binary }}"
-            - "{{ billet_upgrade_recovery_dir }}/billet.candidate"
-          register: billet_release_of
-          changed_when: false
-          check_mode: false
-          when: billet_installed_binary.stat.exists
-          become: true
-
-        - name: Refuse a converge that would downgrade this host
-          vars:
-            # `billet version` prints "billet vX.Y.Z ..." on its first line, and a
-            # release through v0.9.1 prints "billet X.Y.Z ..." without the v; the
-            # second word is the release either way. Sliced rather than indexed so
-            # a line with one word reads as no release instead of an error naming
-            # neither binary. THE v IS OPTIONAL IN THE PATTERN, because a pattern
-            # that required it read every older candidate as "not a release" and
-            # let an unnamed downgrade to one through: the comparison strips the v
-            # from both before ordering.
-            billet_installed_release: "{{ (billet_release_of.results[0].stdout_lines[0] | default('') | split)[1:2] | join }}"
-            billet_candidate_release: "{{ (billet_release_of.results[1].stdout_lines[0] | default('') | split)[1:2] | join }}"
-            billet_release_tag: '^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
-          ansible.builtin.assert:
-            that:
-              - billet_allow_downgrade | bool
-                or not (billet_installed_release is match(billet_release_tag))
-                or not (billet_candidate_release is match(billet_release_tag))
-                or (billet_candidate_release | regex_replace('^v', '')) is version(billet_installed_release | regex_replace('^v', ''), '>=')
-            fail_msg: >-
-              This host runs {{ billet_installed_release }} and this converge would
-              install {{ billet_candidate_release }}, which is older. A rollout has
-              most likely moved the fleet past the pin in billet_version; leave
-              billet_version and billet_binary_src empty so an ordinary converge keeps
-              what is installed, or set billet_allow_downgrade: true in the same run as
-              a pin you mean. Nothing was drained; the staged candidate stays in
-              {{ billet_upgrade_recovery_dir }}.
-          when: billet_installed_binary.stat.exists
-
-        # THE CAPABILITY FLOOR. A candidate that cannot take part in the
-        # exclusion (it answers "unknown command" to converge-guard) is a release
-        # before the guard existed, refused before the hold naming the legacy
-        # collection; a candidate whose answer cannot be read is refused as could
-        # not determine, never as pre-R. Not downgrade prevention:
-        # billet_allow_downgrade stays what it is.
-        - name: Ask the candidate whether it can take part in the exclusion
-          junioryono.billet.guard_status:
-            executable: "{{ billet_upgrade_recovery_dir }}/billet.candidate"
-            timeout: "{{ billet_guard_timeout }}"
-            expect: capability
-          register: billet_candidate_capability
-          check_mode: false
-          become: true
-
-        - name: Judge the candidate's capability
-          ansible.builtin.assert:
-            that:
-              - billet_candidate_capability.outcome == 'capable'
-            fail_msg: >-
-              {{ 'The candidate ' ~ billet_upgrade_recovery_dir ~ '/billet.candidate predates the converge guard (it answers "unknown command" to `converge-guard`): a release before it cannot take part in the exclusion; use the legacy collection at that release, or pin a release that carries the guard.'
-                 if billet_candidate_capability.outcome == 'pre_r'
-                 else 'Whether the candidate ' ~ billet_upgrade_recovery_dir ~ '/billet.candidate can take part in the exclusion could not be determined: ' ~ billet_candidate_capability.problem ~ '. Nothing was held.' }}
-              The staged candidate stays in {{ billet_upgrade_recovery_dir }}.

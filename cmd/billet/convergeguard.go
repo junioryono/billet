@@ -68,13 +68,22 @@ const (
 	maxHolderBytes = 200
 )
 
-// guardRecord is `guard.json`.
+// guardRecord is `guard.json`: the five members every guard has carried, and
+// the three the preparation protocol added (convergeguardprepare.go): a public
+// `id` for continuity across a run's inclusions, the acquiring invocation's
+// `token` (printed once, in the answer that acquired, and by nothing else)
+// and `preparing`, true from acquisition to settlement. A record without an
+// id is one written before the protocol, adopted by the first `prepare` that
+// finds it.
 type guardRecord struct {
 	Holder                  string `json:"holder"`
 	ClaimedAt               string `json:"claimed_at"`
 	Hostname                string `json:"hostname"`
 	ReleaseExecutable       string `json:"release_executable"`
 	ReleaseExecutableSHA256 string `json:"release_executable_sha256"`
+	ID                      string `json:"id,omitempty"`
+	Token                   string `json:"token,omitempty"`
+	Preparing               bool   `json:"preparing,omitempty"`
 }
 
 // The guard's errors, each its own value because a caller decides on them.
@@ -199,10 +208,14 @@ func guardObserve(kind, path string, f *os.File) error {
 // cmdConvergeGuard is the operator's and the role's entry to the guard.
 func cmdConvergeGuard(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: billet converge-guard hold|release|status|recover|holder")
+		return errors.New("usage: billet converge-guard prepare|settle|hold|release|status|recover|holder")
 	}
 
 	switch args[0] {
+	case "prepare":
+		return cmdGuardPrepare(ctx, args[1:])
+	case "settle":
+		return cmdGuardSettle(args[1:])
 	case "hold":
 		return cmdGuardHold(args[1:])
 	case "release":
@@ -215,9 +228,7 @@ func cmdConvergeGuard(ctx context.Context, args []string) error {
 		return cmdGuardHolder(args[1:])
 	}
 
-	_ = ctx
-
-	return fmt.Errorf("unknown converge-guard command %q; try hold, release, status, recover or holder", args[0])
+	return fmt.Errorf("unknown converge-guard command %q; try prepare, settle, hold, release, status, recover or holder", args[0])
 }
 
 // checkHolder refuses a holder that is not a name, before any lock is taken:
@@ -313,6 +324,16 @@ func holdGuard(root *txLock, holder, candidate string) error {
 	}
 
 	record := guardRecord{Holder: holder}
+
+	// AN ID FOR EVERY RECORD WRITTEN FROM HERE ON, so the preparation's
+	// continuity holds over a guard an operator's hold made; no token and not
+	// preparing, since a hold has no preparation window to clean up.
+	id, err := newGuardID()
+	if err != nil {
+		return err
+	}
+
+	record.ID = id
 
 	record.ClaimedAt = guardNow().UTC().Format(time.RFC3339)
 
@@ -898,6 +919,9 @@ func hashManagedBinary() (string, string, error) {
 func cmdGuardRelease(args []string) error {
 	flags := newFlagSet("billet converge-guard release")
 	holder := flags.String("holder", "", "the holder releasing its guard")
+	cleanup := flags.Bool("cleanup", false, "the acquiring invocation releasing, inside its preparation window; "+
+		"needs --token")
+	token := flags.String("token", "", "the acquiring invocation's token, with --cleanup")
 
 	if err := parse(flags, args); err != nil {
 		return err
@@ -905,6 +929,13 @@ func cmdGuardRelease(args []string) error {
 
 	if err := checkHolder(*holder); err != nil {
 		return err
+	}
+
+	switch {
+	case *cleanup && !guardHex32.MatchString(*token):
+		return errors.New("--cleanup needs --token, the acquiring invocation's 32-hex token")
+	case !*cleanup && *token != "":
+		return errors.New("--token belongs to --cleanup")
 	}
 
 	root, err := prepareUpgradeRoot()
@@ -929,6 +960,10 @@ func cmdGuardRelease(args []string) error {
 		return fmt.Errorf("%w; nothing was released", errNoGuard)
 	default:
 		return refuseShape(shape)
+	}
+
+	if *cleanup {
+		return cleanupRelease(root, dir, shape, *holder, *token)
 	}
 
 	if shape.RecordErr != "" {
@@ -968,6 +1003,13 @@ func requireNoPointerAt(dir *os.File) error {
 
 // removeGuardAt is the release order, through the descriptors.
 func removeGuardAt(root *txLock, dir *os.File) error {
+	// A STRAY TEMPORARY of an interrupted rewrite goes first, when it is the
+	// regular file a rewrite leaves, so the directory can be removed; any
+	// other shape at that name is not this guard's and refuses.
+	if _, r := removeStrayTemporary(dir); r != nil {
+		return errors.New(r.Why)
+	}
+
 	record := filepath.Join(dir.Name(), guardRecordName)
 
 	if err := guardObserve("unlink", record, nil); err != nil {
@@ -1296,6 +1338,9 @@ type claimShape struct {
 	RecordErr string
 	// Pointer says whether the guard carries the role's transaction pointer.
 	Pointer bool
+	// StrayTemporary says whether `guard.json.tmp` lies beside the record, the
+	// remainder of an interrupted rewrite.
+	StrayTemporary bool
 	// Why is the reason a shape is unknown.
 	Why string
 }
@@ -1400,8 +1445,15 @@ func classifyGuardDirFrom(dir *os.File) (claimShape, error) {
 
 	if err := json.Unmarshal(body, &shape.Guard); err != nil {
 		shape.RecordErr = "the record is not JSON: " + err.Error()
-	} else if shape.Guard.Holder == "" {
-		shape.RecordErr = "the record names no holder"
+	} else {
+		switch {
+		case shape.Guard.Holder == "":
+			shape.RecordErr = "the record names no holder"
+		case shape.Guard.ID != "" && !guardHex32.MatchString(shape.Guard.ID):
+			shape.RecordErr = "the record's id is not 32 hex characters"
+		case shape.Guard.Token != "" && !guardHex32.MatchString(shape.Guard.Token):
+			shape.RecordErr = "the record's token is not 32 hex characters"
+		}
 	}
 
 	_, err = statAt(dir, guardPointerName)
@@ -1411,6 +1463,15 @@ func classifyGuardDirFrom(dir *os.File) (claimShape, error) {
 		shape.Pointer = true
 	case !errors.Is(err, fs.ErrNotExist):
 		return claimShape{}, fmt.Errorf("examine the guard's pointer: %w", err)
+	}
+
+	_, err = statAt(dir, guardTmpName)
+
+	switch {
+	case err == nil:
+		shape.StrayTemporary = true
+	case !errors.Is(err, fs.ErrNotExist):
+		return claimShape{}, fmt.Errorf("examine the guard's temporary: %w", err)
 	}
 
 	return shape, nil
@@ -1496,6 +1557,9 @@ type guardStatusRec struct {
 	Holder                    string `json:"holder"`
 	ClaimedAt                 string `json:"claimed_at"`
 	Hostname                  string `json:"hostname"`
+	ID                        string `json:"id"`
+	Preparing                 bool   `json:"preparing"`
+	StrayTemporary            bool   `json:"stray_temporary"`
 	RecoveryPointer           bool   `json:"recovery_pointer"`
 	ReleaseExecutable         string `json:"release_executable"`
 	ReleaseExecutableSHA256   string `json:"release_executable_sha256"`
@@ -1512,6 +1576,7 @@ func (s claimShape) report() guardStatusReport {
 
 	rec := &guardStatusRec{
 		Holder: s.Guard.Holder, ClaimedAt: s.Guard.ClaimedAt, Hostname: s.Guard.Hostname,
+		ID: s.Guard.ID, Preparing: s.Guard.Preparing, StrayTemporary: s.StrayTemporary,
 		RecoveryPointer: s.Pointer, ReleaseExecutable: s.Guard.ReleaseExecutable,
 		ReleaseExecutableSHA256: s.Guard.ReleaseExecutableSHA256, RecordError: s.RecordErr,
 	}

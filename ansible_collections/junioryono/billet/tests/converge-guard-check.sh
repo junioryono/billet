@@ -1,67 +1,70 @@
 #!/usr/bin/env bash
 # The host role's PREPARATION, proved case by case: the converge guard's
 # refusal of a billet-managed runner (the file's original purpose), and the
-# exclusion the role prepares before anything else (prepare-exclusion.yml):
-# the holder, the trust boundary of the upgrade root, the classification of
-# the claim through `converge-guard status`, the verified fallback to the
-# executable a guard records, the same-holder rerun, the interrupted
-# transaction, the binary change decided and its candidate staged before the
-# hold, the exclusive allocation of the recovery directory, the capability
-# floor, and the hold itself.
+# exclusion the role prepares before anything else (prepare-exclusion.yml)
+# through `billet converge-guard prepare`: the two calls, the routes (the
+# managed binary, the verified fallback, the candidate-first acquisition, the
+# legacy protocol, no billet), the staging between them, the settlement, and
+# the cleanup release of a guard this run acquired.
 #
 # WHY A GATE OF ITS OWN. Every other suite here runs with no RUNNER_NAME and no
 # holder in the environment, so none of them reaches these branches: delete the
-# guard, the holder refusal or the hold and they all stay green.
+# guard, the holder refusal or the calls and they all stay green.
 #
-# HOW IT RUNS. The role is pointed at a temporary tree through the two role
-# defaults that exist for this purpose (billet_upgrade_root and
-# billet_managed_binary), with FAKES first on PATH: a `billet` that records
-# every invocation (argv, cwd, uid, PATH) to a log and answers per the
-# environment, a candidate (a second executable that writes a marker before
-# anything else, so "never run" is asserted by a file), and recording
-# wrappers for `timeout`, `date`, `mkdir`, `systemctl` and the recovery
-# directory's suffix generator. The fake's own statuses are the answers the
-# REAL command produced over planted shapes (tests/fixtures/guard-status/,
-# written by cmd/billet's test), corrupted one member at a time; a fake never
-# invents a shape the command does not produce.
-#
-# THE LAUNCH IS ESCALATED: `sudo -n env <every variable the role or a fake
-# reads> ansible-playbook ...`, nothing inherited through sudo, and the role
-# runs with ansible_become=false because the whole process is already root and
-# sudo's env_reset would otherwise scrub the fakes' PATH and variables from
-# every escalated task. The launch is PROVED first (M8): a probe play runs the
-# fake `billet version` under become and the log must show uid 0, the fake's
-# own path as argv[0] and the holder the role default resolved. In CI
-# (BILLET_GATE_REQUIRE_ROOT=1) a failed launch fails the gate; elsewhere the
-# escalated cases skip with the reason. The cases that need a NON-ROOT
-# identity (a denied stat, a Mac's unescalated hold, an unwritable root) run
-# without sudo as the invoking user over fixtures the escalated leg planted,
-# and prove their uid with a separate unescalated task before the role runs.
-# Every tree an escalated case reads is root-owned by then, because the
-# preparation's trust boundary requires it; what the gate reads back from
-# such a tree it reads with the same escalation.
+# THE REAL BINARY AT ITS REAL PATHS. Each Linux case runs inside its own mount
+# namespace (`sudo -n unshare -m --propagation private`), where a tmpfs backs
+# an overlay over /usr/bin and one over /var/lib, so /usr/bin/billet and
+# /var/lib/billet are ordinary entries that can be absent, made, replaced by
+# rename, unlinked and chowned, and nothing reaches the host (measured
+# 2026-09-10 in the gate container, kernel 6.12.76-linuxkit, util-linux 2.39.3;
+# an upper directory on the container's own overlay root is refused, hence the
+# tmpfs). The managed binary and every staged candidate are RECORDING WRAPPERS
+# around immutable backing binaries built once from this checkout with three
+# version stamps and `-tags billetgatecrash` (the crash seam, compiled into the
+# gate's binaries and no shipped one): a wrapper logs its argv and its
+# invocation number, fires the case's hook for exactly its own invocation,
+# runs its backing binary EXACTLY ONCE, keeps the real answer in a private
+# capture, and hands the real answer, a substituted one or none to the caller.
+# The guard's record names the wrapper's path and digest, as the contract
+# requires; the backing binary's identity is in the private capture only. A
+# script that answers "unknown command" stands in for a managed binary from
+# before the guard, and one that sleeps for a hang. The unescalated cases (a
+# root another account owns, a claim the account cannot examine) run inside
+# their namespace as the gate's invoker, never root; the simulated-darwin
+# cases run on the fake billet with the role's path overrides, because a
+# Linux-built binary answers for Linux's paths and the role's darwin branch is
+# what they prove (a real Mac stays the measurement). The copy-out of the
+# upper directories is diagnostic only: every assertion about the tree reads
+# the state the namespace dumped after the play.
 #
 # EVERY ALLOWED CASE MUST EXIT SUCCESSFULLY; every refusal is judged by the
-# FAILING TASK'S NAME and its diagnostic; a prohibited effect (a hold, an
-# allocation, an execution of an untrusted candidate) is asserted directly
-# from the log, the marker and the tree.
+# FAILING TASK'S NAME and its diagnostic, and the rescue's final re-failure by
+# its own message; a prohibited effect is asserted from the log, the state
+# dump and the facts the play reports from an `always` section. The token an
+# `acquired` answer carries is captured privately and grepped for in every
+# case's output (one case under -vvv): any occurrence fails the gate.
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
 collection_root=$(cd "$here/../../../.." && pwd)
+repo_root=$collection_root
 role_tasks="$here/../roles/host/tasks"
-fixtures="$here/fixtures/guard-status"
+fixtures="$here/fixtures/guard-prepare"
 
 work=$(mktemp -d)
 have_root=0
 if sudo -n true 2>/dev/null; then have_root=1; fi
 # rd CMD...: read or remove what an escalated case left root-owned.
 rd() { if [ "$have_root" = 1 ]; then sudo -n "$@"; else "$@"; fi; }
-cleanup() { rd rm -rf "$work"; }
+origin_pid=""
+# BILLET_GATE_KEEP=1 keeps the work directory (every case's output, log,
+# private capture and state) for a failure's diagnosis.
+cleanup() {
+  [ -z "$origin_pid" ] || kill "$origin_pid" 2>/dev/null || true
+  if [ "${BILLET_GATE_KEEP:-0}" = 1 ]; then echo "converge guard: the work directory is kept at $work"; else rd rm -rf "$work"; fi
+}
 trap cleanup EXIT
 
-# ANSIBLE'S OWN INTERPRETER, which has PyYAML and is the one the modules run
-# under; the first python3 on PATH need not have it.
 python=$(ansible --version 2>/dev/null | sed -n 's/.*python version.*(\(.*\)).*/\1/p' | head -n1)
 if [ -z "$python" ] || [ ! -x "$python" ]; then
   python=$(command -v python3) || { echo "converge-guard-check: no python3" >&2; exit 1; }
@@ -72,7 +75,6 @@ collections_path="$collection_root:$HOME/.ansible/collections:/usr/share/ansible
 fail() {
   echo "FAIL: $1" >&2
   if [ -n "${2:-}" ] && [ -f "$2" ]; then
-    # The failing task and its diagnostic, when there is one; else the tail.
     if grep -Eq "^(fatal|failed): " "$2"; then
       grep -En -B8 -A25 -m1 "^(fatal|failed): " "$2" >&2
     else
@@ -81,207 +83,192 @@ fail() {
   fi
   exit 1
 }
-# json_var NAME VALUE: an -e argument whose value may carry spaces or quotes.
-json_var() { "$python" -c 'import json,sys; print(json.dumps({sys.argv[1]: sys.argv[2]}))' "$1" "$2"; }
 
-# --- the modules' own checks -------------------------------------------------
-"$python" "$here/guard_status_check.py"
+# --- the module's own check -------------------------------------------------
 "$python" "$here/guard_fallback_check.py"
 
-# --- the guard runs first ----------------------------------------------------
-#
-# A REFUSAL IS ONLY USEFUL BEFORE THE TRANSACTION IT PROTECTS HAS STARTED, and
-# nothing below can observe that ordering: the cases prove the guard fires, not
-# that it fires first. A task inserted above it would leave them all green.
+# --- the guard runs first, the preparation second ---------------------------
 first_task=$(grep -n '^- name:' "$role_tasks/main.yml" | head -1 | cut -d: -f1)
-guard_task=$(grep -n '^- name: Refuse a converge that would destroy the job running it' \
-  "$role_tasks/main.yml" | head -1 | cut -d: -f1)
+guard_task=$(grep -n '^- name: Refuse a converge that would destroy the job running it' "$role_tasks/main.yml" | head -1 | cut -d: -f1)
 if [ -z "$guard_task" ] || [ "$first_task" != "$guard_task" ]; then
   fail "the converge guard is not the first task in main.yml (first task at line ${first_task:-none}, guard at line ${guard_task:-none})"
 fi
 second_task=$(grep -n '^- name:' "$role_tasks/main.yml" | sed -n 2p | cut -d: -f1)
 prepare_task=$(grep -n '^- name: Prepare the exclusion before anything changes this host' "$role_tasks/main.yml" | head -1 | cut -d: -f1)
 if [ -z "$prepare_task" ] || [ "$second_task" != "$prepare_task" ]; then
-  fail "the exclusion's preparation is not the second task in main.yml (second at line ${second_task:-none}, preparation at line ${prepare_task:-none}); a task between the guard and the hold runs on a host a rollout may be moving"
+  fail "the exclusion's preparation is not the second task in main.yml (second at line ${second_task:-none}, preparation at line ${prepare_task:-none})"
 fi
 first_prep=$(grep '^- name:' "$role_tasks/prepare-exclusion.yml" | head -1)
 case "$first_prep" in
   *"Refuse a converge that would destroy the job running it") ;;
   *) fail "prepare-exclusion.yml's first task is not the converge guard's import: $first_prep" ;;
 esac
+if [ -e "$here/../plugins/modules/guard_status.py" ] || [ -e "$here/guard_status_check.py" ]; then
+  fail "the status module is gone from the role; its files must be gone from the collection"
+fi
 echo "ok   the guard is the first task in the role, the preparation the second, and the guard the preparation's first import"
 
 # --- the fakes ---------------------------------------------------------------
 fakes="$work/fakes"
-mkdir -p "$fakes"
+bins="$work/bins"
+mnt="$work/mnt"
+mkdir -p "$fakes" "$bins" "$mnt" "$work/cases"
 
-# THE FAKE billet. Generated twice, as the MANAGED binary and as the CANDIDATE
-# (which writes its marker first and answers its own variables), so the two
-# differ by digest and the log says which one answered.
-write_billet() { # path role
-  cat >"$1" <<'FAKE'
+# THE FAKE billet FOR THE SIMULATED-DARWIN CASES: records every invocation and
+# answers `prepare` from the committed corpus (the first call from
+# BILLET_FAKE_PREPARE, later ones from BILLET_FAKE_PREPARE2), `version` per the
+# environment, `settle` and `release --cleanup` per the environment, and
+# nothing else.
+cat >"$fakes/billet-fake" <<'FAKE'
 #!/bin/bash
-# The fake billet: records every invocation and answers per the environment.
 set -u
-ROLE=__ROLE__
-U=$(printf '%s' "$ROLE" | tr a-z A-Z)
-if [ "$ROLE" = candidate ] && [ -n "${BILLET_FAKE_MARKER:-}" ]; then : >"$BILLET_FAKE_MARKER"; fi
 log=${BILLET_FAKE_LOG:-/dev/null}
 {
-  printf 'role=%s\n' "$ROLE"
-  printf 'argv0=%s\n' "$0"
-  printf 'argv=%s\n' "$*"
-  printf 'cwd=%s\n' "$PWD"
-  printf 'uid=%s\n' "$(id -u)"
-  printf 'path=%s\n' "$PATH"
-  printf -- '---\n'
+  printf 'role=fake\nargv0=%s\nargv=%s\ncwd=%s\nuid=%s\n---\n' "$0" "$*" "$PWD" "$(id -u)"
 } >>"$log"
-var() { eval "printf '%s' \"\${BILLET_FAKE_${U}_$1:-}\""; }
-root=${BILLET_FAKE_ROOT:-/nonexistent}
 case "${1:-}" in
-  version)
-    v=$(var VERSION)
-    seq=$(var VERSION_SEQUENCE)
-    if [ -n "$seq" ] && [ -s "$seq" ]; then
-      v=$(head -n1 "$seq")
-      tail -n +2 "$seq" >"$seq.next" && mv "$seq.next" "$seq"
-    fi
-    printf 'billet %s linux/amd64\n' "${v:-v0.10.0}"
-    exit 0 ;;
+  version) printf 'billet %s darwin/arm64\n' "${BILLET_FAKE_VERSION:-v0.10.0}"; exit 0 ;;
   converge-guard) ;;
   *) exit 0 ;;
 esac
 shift
-if [ -n "$(var PRE_R)" ]; then
-  echo 'unknown command "converge-guard"' >&2
-  exit 2
-fi
-if [ -n "$(var HANG)" ]; then sleep 3600; fi
+if [ -n "${BILLET_FAKE_PRE_R:-}" ]; then echo 'unknown command "converge-guard"' >&2; exit 2; fi
+if [ -n "${BILLET_FAKE_HANG:-}" ]; then sleep 3600; fi
+answer() { # file
+  cat "$1"
+  case "$(basename "$1")" in refused-*) exit 2 ;; unknown*) exit 3 ;; *) exit 0 ;; esac
+}
 case "${1:-}" in
-  status)
-    f=$(var STATUS)
-    if [ "$f" = exit1 ]; then echo 'cannot examine the claim' >&2; exit 1; fi
-    if [ -n "$f" ]; then cat "$f"; exit 0; fi
-    exec "$BILLET_FAKE_PYTHON" "$BILLET_FAKE_STATUS_EMULATOR" "$root"
-    ;;
-  hold)
-    if [ -n "$(var HOLD_HANG)" ]; then sleep 3600; fi
-    r=$(var HOLD_REFUSE)
-    if [ -n "$r" ]; then printf '%s\n' "$r" >&2; exit 1; fi
-    holder=""; candidate=""
-    while [ $# -gt 0 ]; do
-      case "$1" in
-        --holder) holder=$2; shift 2 ;;
-        --candidate) candidate=$2; shift 2 ;;
-        *) shift ;;
-      esac
-    done
-    exe=${candidate:-$(readlink -f "$0")}
-    exec "$BILLET_FAKE_PYTHON" "$BILLET_FAKE_HOLD_EMULATOR" "$root" "$holder" "$exe"
-    ;;
-  *)
-    echo "the fake does not emulate converge-guard ${1:-}" >&2
-    exit 1 ;;
+  prepare)
+    n=$(( $(grep -c '^prepare$' "$log.count" 2>/dev/null || true) + 1 ))
+    echo prepare >>"$log.count"
+    if [ "$n" -le 1 ]; then answer "${BILLET_FAKE_PREPARE:?}"; else answer "${BILLET_FAKE_PREPARE2:?}"; fi ;;
+  settle) exit "${BILLET_FAKE_SETTLE_STATUS:-0}" ;;
+  release)
+    if [ -n "${BILLET_FAKE_RELEASE_HANG:-}" ]; then sleep 3600; fi
+    rm -rf "${BILLET_FAKE_ROOT:?}/active"
+    exit "${BILLET_FAKE_RELEASE_STATUS:-0}" ;;
+  status) printf '{"active": "none"}\n'; exit 0 ;;
+  holder) echo 'unknown command "converge-guard"' >&2; exit 2 ;;
+  *) echo "the fake does not emulate converge-guard ${1:-}" >&2; exit 1 ;;
 esac
 FAKE
-  sed -i.bak "s/__ROLE__/$2/" "$1" && rm -f "$1.bak"
+chmod 0755 "$fakes/billet-fake"
+
+# A hook that replaces the managed binary does it BY RENAME, as an updater
+# does: a script running from that name keeps its inode.
+# THE HOOK a wrapper or the pre-R fake fires: BILLET_GATE_HOOK=<cmd>:<n>:<script>
+# runs <script> once, before the n-th invocation of <cmd> through any of them,
+# and records that it fired.
+hook_lines='
+hook=${BILLET_GATE_HOOK:-}
+if [ -n "$hook" ]; then
+  case "$hook" in
+    "$cmd:$n:"*) sh -c "${hook#"$cmd:$n:"}"; printf "hook=%s:%s fired\n" "$cmd" "$n" >>"$log" ;;
+  esac
+fi
+'
+
+# A MANAGED BINARY FROM BEFORE THE GUARD: answers `version`, and "unknown
+# command" to every converge-guard subcommand; counts its calls with the
+# wrappers and fires hooks like them.
+{
+  cat <<'FAKE'
+#!/bin/bash
+set -u
+log=${BILLET_GATE_LOG:-/dev/null}
+priv=${BILLET_GATE_PRIVATE:-/dev/null}
+cmd=${1:-}
+if [ "$cmd" = converge-guard ]; then cmd="${2:-}"; fi
+n=1
+if [ -f "$priv" ]; then n=$(( $(grep -c "^call=$cmd\$" "$priv" || true) + 1 )); fi
+printf 'call=%s\n' "$cmd" >>"$priv"
+printf 'role=pre-r\ninvocation=%s\ncmd=%s\nargv0=%s\nargv=%s\nuid=%s\n---\n' "$n" "$cmd" "$0" "$*" "$(id -u)" >>"$log"
+FAKE
+  printf '%s' "$hook_lines"
+  cat <<'FAKE'
+case "${1:-}" in
+  version) echo "billet ${BILLET_GATE_PRE_R_VERSION:-0.9.1} linux/amd64"; exit 0 ;;
+esac
+echo 'unknown command "converge-guard"' >&2
+exit 2
+FAKE
+} >"$fakes/billet-pre-r"
+chmod 0755 "$fakes/billet-pre-r"
+# A SECOND PRE-R BINARY with other bytes, for a pre-R candidate on a pre-R host.
+{ cat "$fakes/billet-pre-r"; echo "# another build of the same release"; } >"$fakes/billet-pre-r-other"
+chmod 0755 "$fakes/billet-pre-r-other"
+
+cat >"$fakes/billet-hang" <<'FAKE'
+#!/bin/bash
+printf 'role=hang\nargv0=%s\nargv=%s\nuid=%s\n---\n' "$0" "$*" "$(id -u)" >>"${BILLET_GATE_LOG:-/dev/null}"
+sleep 3600
+FAKE
+chmod 0755 "$fakes/billet-hang"
+
+# THE RECORDING WRAPPER, one per backing binary and role. Its answer can be
+# substituted (BILLET_GATE_ANSWER=<cmd>:<n>:<file>, several separated by `;`),
+# dropped (BILLET_GATE_DROP_ANSWER=<cmd>:<n>), or the invocation refused in the
+# wrapper with no backing run, hung, or crashed at a boundary of the seam
+# (BILLET_GATE_FAIL=<cmd>:refuse | <cmd>:hang | <cmd>:crash:<kind> <path>[:n]).
+write_wrapper() { # path backing role
+  {
+    cat <<WRAP
+#!/bin/bash
+set -u
+BACKING="$2"
+ROLE="$3"
+WRAP
+    cat <<'WRAP'
+log=${BILLET_GATE_LOG:-/dev/null}
+priv=${BILLET_GATE_PRIVATE:-/dev/null}
+cmd=${1:-}
+if [ "$cmd" = converge-guard ]; then cmd="${2:-}"; fi
+n=1
+if [ -f "$priv" ]; then n=$(( $(grep -c "^call=$cmd\$" "$priv" || true) + 1 )); fi
+printf 'call=%s\n' "$cmd" >>"$priv"
+printf 'role=%s\ninvocation=%s\ncmd=%s\nargv0=%s\nargv=%s\nuid=%s\n---\n' "$ROLE" "$n" "$cmd" "$0" "$*" "$(id -u)" >>"$log"
+WRAP
+    printf '%s' "$hook_lines"
+    cat <<'WRAP'
+failspec=${BILLET_GATE_FAIL:-}
+case "$failspec" in
+  "$cmd:refuse") printf 'backing=0 cmd=%s\n' "$cmd" >>"$priv"; echo "billet: refused by the gate's wrapper; nothing was run" >&2; exit 1 ;;
+  "$cmd:hang") printf 'backing=0 cmd=%s\n' "$cmd" >>"$priv"; sleep 3600 ;;
+  "$cmd:crash:"*) export BILLET_GUARD_CRASH_AT="${failspec#"$cmd:crash:"}" ;;
+esac
+out=$(mktemp); err=$(mktemp)
+"$BACKING" "$@" >"$out" 2>"$err"
+status=$?
+printf 'backing=1 cmd=%s status=%s\n' "$cmd" "$status" >>"$priv"
+{ printf '=== %s:%s stdout\n' "$cmd" "$n"; cat "$out"; printf '=== %s:%s stderr\n' "$cmd" "$n"; cat "$err"; printf '=== end\n'; } >>"$priv"
+cat "$err" >&2
+drop=${BILLET_GATE_DROP_ANSWER:-}
+if [ "$drop" = "$cmd:$n" ]; then rm -f "$out" "$err"; exit "$status"; fi
+substituted=""
+IFS=';' read -r -a specs <<<"${BILLET_GATE_ANSWER:-}"
+for spec in "${specs[@]+"${specs[@]}"}"; do
+  case "$spec" in "$cmd:$n:"*) substituted="${spec#"$cmd:$n:"}" ;; esac
+done
+if [ -n "$substituted" ]; then cat "$substituted"; else cat "$out"; fi
+rm -f "$out" "$err"
+exit "$status"
+WRAP
+  } >"$1"
   chmod 0755 "$1"
 }
-write_billet "$fakes/billet-managed" managed
-write_billet "$fakes/billet-candidate" candidate
 
-cat >"$fakes/status-emulator.py" <<'PY'
-"""Answer `converge-guard status --json` the way the command does, over the
-planted tree: the shape by lstat, the record's members, the pointer's
-presence by any entry named `recovery`, and the recorded executable's digest
-now against the one recorded."""
-import hashlib, json, os, stat as s, sys
-root = sys.argv[1]
-active = os.path.join(root, "active")
-try:
-    st = os.lstat(active)
-except FileNotFoundError:
-    print(json.dumps({"active": "none"})); sys.exit(0)
-if s.S_ISLNK(st.st_mode):
-    print(json.dumps({"active": "host-upgrade"})); sys.exit(0)
-if s.S_ISREG(st.st_mode):
-    print(json.dumps({"active": "legacy-role"})); sys.exit(0)
-if not s.S_ISDIR(st.st_mode):
-    print(json.dumps({"active": "unknown", "why": "the claim is neither a symlink, a file nor a directory"})); sys.exit(0)
-record = os.path.join(active, "guard.json")
-if not os.path.exists(record):
-    print(json.dumps({"active": "unpublished-guard"})); sys.exit(0)
-pointer = os.path.lexists(os.path.join(active, "recovery"))
-try:
-    g = json.load(open(record))
-    if not g.get("holder"):
-        raise ValueError("the record names no holder")
-except Exception as exc:
-    print(json.dumps({"active": "converge-guard", "guard": {
-        "holder": "", "claimed_at": "", "hostname": "", "recovery_pointer": pointer,
-        "release_executable": "", "release_executable_sha256": "",
-        "release_executable_verified": {"unknown": "the record is not JSON: %s" % exc},
-        "record_error": "the record is not JSON: %s" % exc}}))
-    sys.exit(0)
-exe = g.get("release_executable", "")
-try:
-    digest = hashlib.sha256(open(exe, "rb").read()).hexdigest()
-    verified = digest == g.get("release_executable_sha256")
-except OSError as exc:
-    verified = {"unknown": "cannot read the executable: %s" % exc}
-print(json.dumps({"active": "converge-guard", "guard": {
-    "holder": g.get("holder", ""), "claimed_at": g.get("claimed_at", ""),
-    "hostname": g.get("hostname", ""), "recovery_pointer": pointer,
-    "release_executable": exe, "release_executable_sha256": g.get("release_executable_sha256", ""),
-    "release_executable_verified": verified}}))
-PY
-
-cat >"$fakes/hold-emulator.py" <<'PY'
-"""Emulate `converge-guard hold`: a same-holder guard validates and touches
-nothing; another holder's refuses; no claim creates the root when absent and
-publishes the five-member record naming the executable and its digest."""
-import hashlib, json, os, socket, sys, time
-root, holder, exe = sys.argv[1:4]
-active = os.path.join(root, "active")
-if os.path.lexists(active):
-    record = os.path.join(active, "guard.json")
-    if os.path.isdir(active) and os.path.exists(record):
-        g = json.load(open(record))
-        if g.get("holder") == holder:
-            sys.exit(0)
-        sys.stderr.write("converge-guard: a converge guard is held on this host: held by %s since %s\n" % (g.get("holder"), g.get("claimed_at")))
-        sys.exit(1)
-    sys.stderr.write("converge-guard: %s exists and is not a guard\n" % active)
-    sys.exit(1)
-os.makedirs(root, mode=0o700, exist_ok=True)
-os.mkdir(active, 0o700)
-# An updater finishing its install in the last instant before the hold
-# excludes it (S10): the managed binary gains a byte.
-replace = os.environ.get("BILLET_FAKE_HOLD_REPLACE", "")
-if replace:
-    with open(replace, "ab") as f:
-        f.write(b"# installed by an updater during the hold\n")
-digest = hashlib.sha256(open(exe, "rb").read()).hexdigest()
-record = {"holder": holder, "claimed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-          "hostname": socket.gethostname(), "release_executable": exe, "release_executable_sha256": digest}
-tmp = os.path.join(active, "guard.json.tmp")
-with open(tmp, "w") as f:
-    json.dump(record, f, indent=2); f.write("\n")
-os.chmod(tmp, 0o600)
-os.rename(tmp, os.path.join(active, "guard.json"))
-PY
-
-# RECORDING WRAPPERS around the real tools the preparation runs, so the log
-# shows they were reached and in what order. The mkdir wrapper records only
-# the allocator's own form (`-m 0700 <dir>`), because Ansible creates its
-# temporary directories with the same command on the same PATH.
+# RECORDING WRAPPERS around the tools the preparation runs, `systemctl`
+# refusing (nothing in the preparation may call it), and a `sync` whose
+# wrapper carries the one no-command hook (a fresh root's flush is the one
+# thing the no-billet path runs between its two observations).
 for tool in timeout date mkdir systemctl sync; do
   real=$(command -v "$tool" || true)
   if [ "$tool" = mkdir ]; then
     cat >"$fakes/$tool" <<FAKE
 #!/bin/sh
 case "\$1 \$2" in
-  "-m 0700") printf 'role=mkdir\nargv0=%s\nargv=%s\nuid=%s\n---\n' "\$0" "\$*" "\$(id -u)" >>"\${BILLET_FAKE_LOG:-/dev/null}" ;;
+  "-m 0700") printf 'role=mkdir\nargv0=%s\nargv=%s\nuid=%s\n---\n' "\$0" "\$*" "\$(id -u)" >>"\${BILLET_GATE_LOG:-/dev/null}" ;;
 esac
 exec "$real" "\$@"
 FAKE
@@ -291,7 +278,7 @@ FAKE
   cat >"$fakes/$tool" <<FAKE
 #!/bin/sh
 if [ "$tool" = systemctl ] && [ "\${1:-}" = --version ]; then exec "$real" "\$@"; fi
-printf 'role=$tool\nargv0=%s\nargv=%s\nuid=%s\n---\n' "\$0" "\$*" "\$(id -u)" >>"\${BILLET_FAKE_LOG:-/dev/null}"
+printf 'role=$tool\nargv0=%s\nargv=%s\nuid=%s\n---\n' "\$0" "\$*" "\$(id -u)" >>"\${BILLET_GATE_LOG:-/dev/null}"
 FAKE
   case $tool in
     date)
@@ -305,20 +292,12 @@ exec "$real" "\$@"
 FAKE
       ;;
     sync)
-      # THE FLUSH OF A FRESHLY MADE ROOT'S PARENT is the one thing the
-      # preparation runs between its inspection of the managed binary and
-      # its inspection of the claim, so a case stages an updater finishing
-      # there: the wrapper puts a binary back before the real flush.
       cat >>"$fakes/$tool" <<FAKE
-if [ -n "\${BILLET_FAKE_SYNC_RESTORE:-}" ]; then cp "\$BILLET_FAKE_SYNC_RESTORE" "\$BILLET_FAKE_SYNC_RESTORE_TO"; fi
+if [ -n "\${BILLET_GATE_SYNC_HOOK:-}" ]; then sh -c "\$BILLET_GATE_SYNC_HOOK"; printf 'hook=sync fired\n' >>"\${BILLET_GATE_LOG:-/dev/null}"; fi
 exec "$real" "\$@"
 FAKE
       ;;
     systemctl)
-      # NEVER REACHED BY THE PREPARATION; a call is a finding. Fact gathering
-      # on a systemd host asks `systemctl --version` for the service manager
-      # (measured on CI's runner), which is not the preparation's and passes
-      # through unrecorded.
       echo 'echo "systemctl was called by the preparation" >&2; exit 97' >>"$fakes/$tool" ;;
     *)
       echo "exec \"$real\" \"\$@\"" >>"$fakes/$tool" ;;
@@ -326,11 +305,9 @@ FAKE
   chmod 0755 "$fakes/$tool"
 done
 
-# THE SUFFIX GENERATOR: records each draw and pops the next line of the
-# case's sequence file, or draws from urandom when there is none.
 cat >"$fakes/suffix" <<'FAKE'
 #!/bin/sh
-printf 'role=suffix\nargv0=%s\nargv=%s\nuid=%s\n---\n' "$0" "$*" "$(id -u)" >>"${BILLET_FAKE_LOG:-/dev/null}"
+printf 'role=suffix\nargv0=%s\nargv=%s\nuid=%s\n---\n' "$0" "$*" "$(id -u)" >>"${BILLET_GATE_LOG:-/dev/null}"
 seq=${BILLET_FAKE_SUFFIXES:-}
 if [ -n "$seq" ] && [ -s "$seq" ]; then
   head -n1 "$seq"
@@ -342,16 +319,100 @@ exit "${BILLET_FAKE_SUFFIX_STATUS:-0}"
 FAKE
 chmod 0755 "$fakes/suffix"
 
+# THE CORPUS, RE-ADDRESSED AND CORRUPTED: the committed answers name the
+# holder `ci-1` and the packaged paths; a substituted answer carries this
+# gate's holder, and a corruption changes exactly one member of it.
+readdress() { # in out holder
+  "$python" - "$1" "$2" "$3" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+if "holder" in d:
+    d["holder"] = sys.argv[3]
+json.dump(d, open(sys.argv[2], "w"), indent=2)
+PY
+}
+corrupt() { # in out member
+  "$python" - "$1" "$2" "$3" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+m = sys.argv[3]
+bad = {"outcome": 7, "id": "zz", "holder": "h2", "preparing": "yes", "token": "short",
+       "record": {}, "pointer": "no", "managed": {"present": "maybe"}, "downgrade": "x"}
+d[m] = bad[m]
+json.dump(d, open(sys.argv[2], "w"), indent=2)
+PY
+}
+
 # --- the plays ---------------------------------------------------------------
 cat >"$work/inventory.ini" <<'INV'
 [billet_hosts]
 localhost ansible_connection=local
 INV
 
-# ONE PLAY FOR EVERY CASE: the entry point the case names (the preparation by
-# default; the allocator, the staging or the fallback reader driven directly),
-# a hook between two inclusions, and a report of the facts the gate reads.
-cat >"$work/play.yml" <<'PLAY'
+# ONE PLAY FOR EVERY CASE: the entry point the case names, an optional second
+# inclusion with a command between them, and the facts the gate reads from an
+# `always` section, so a refusal's facts are read too. The token is never
+# printed; whether one is known is.
+gate_play_body() {
+  cat <<'PLAY'
+  tasks:
+    - name: The case
+      block:
+        - name: Prove the identity this case runs under
+          ansible.builtin.command:
+            argv: [id, -u]
+          register: billet_gate_uid
+          changed_when: false
+          check_mode: false
+          become: false
+
+        - name: Refuse the wrong identity for this case
+          ansible.builtin.assert:
+            that:
+              - (billet_gate_expect_uid | string) == (billet_gate_uid.stdout | trim)
+            fail_msg: "this case runs as uid {{ billet_gate_uid.stdout | trim }}, want {{ billet_gate_expect_uid }}"
+
+        - name: Run the entry under test
+          ansible.builtin.include_role:
+            name: junioryono.billet.host
+            tasks_from: "{{ billet_gate_entry }}"
+
+        - name: Change the host between two inclusions
+          ansible.builtin.command:
+            argv: [/bin/sh, -c, "{{ billet_gate_between }}"]
+          changed_when: true
+          check_mode: false
+          when: billet_gate_between | length > 0
+
+        - name: Run the entry under test again
+          ansible.builtin.include_role:
+            name: junioryono.billet.host
+            tasks_from: "{{ billet_gate_entry }}"
+          when: billet_gate_inclusions | int >= 2
+      always:
+        - name: Report the facts the gate reads
+          ansible.builtin.debug:
+            msg: >-
+              GATE shape={{ billet_upgrade_claim_shape | default('undef') }}
+              interrupted={{ billet_interrupted_upgrade | default('undef') }}
+              recovery={{ billet_upgrade_recovery_dir | default('undef') }}
+              upgrade={{ billet_binary_upgrade | default('undef') }}
+              held={{ billet_exclusion_held | default('undef') }}
+              acquired={{ billet_exclusion_acquired | default('undef') }}
+              released={{ billet_exclusion_released | default('undef') }}
+              token_known={{ (billet_exclusion_cleanup_token | default('')) | length > 0 }}
+              id={{ billet_exclusion_id | default('undef') }}
+              route={{ billet_exclusion_route | default('undef') }}
+              executable={{ billet_exclusion_executable | default('undef') }}
+              holder={{ billet_exclusion_holder | default('undef') }}
+              adopted={{ billet_exclusion_adopted | default('undef') }}
+              version={{ billet_version | default('undef') }}
+              resolved={{ billet_resolved_version | default('undef') }}
+              end=.
+PLAY
+}
+{
+  cat <<'PLAY'
 ---
 - name: Exercise the host role's preparation
   hosts: billet_hosts
@@ -360,53 +421,43 @@ cat >"$work/play.yml" <<'PLAY'
     billet_gate_entry: prepare-exclusion
     billet_gate_inclusions: 1
     billet_gate_between: ""
-  tasks:
-    - name: Prove the identity this case runs under
+PLAY
+  gate_play_body
+} >"$work/play.yml"
+
+# TWO PLAYS OVER ONE HOST in one process: the facts of the first survive into
+# the second, which is the rerun shape a fleet playbook's plays have.
+{
+  cat <<'PLAY'
+---
+- name: The first play over the host
+  hosts: billet_hosts
+  gather_facts: "{{ billet_gate_facts | default(false) | bool }}"
+  vars:
+    billet_gate_entry: prepare-exclusion
+    billet_gate_inclusions: 1
+    billet_gate_between: ""
+PLAY
+  gate_play_body
+  cat <<'PLAY'
+
+- name: The second play over the same host
+  hosts: billet_hosts
+  gather_facts: false
+  vars:
+    billet_gate_entry: prepare-exclusion
+    billet_gate_inclusions: 1
+    billet_gate_between: ""
+  pre_tasks:
+    - name: Change the host between two plays
       ansible.builtin.command:
-        argv: [id, -u]
-      register: billet_gate_uid
-      changed_when: false
-      check_mode: false
-      become: false
-
-    - name: Refuse the wrong identity for this case
-      ansible.builtin.assert:
-        that:
-          - (billet_gate_expect_root | default(true) | bool) == (billet_gate_uid.stdout | trim == '0')
-        fail_msg: "this case runs as uid {{ billet_gate_uid.stdout | trim }}, want {{ 'root' if billet_gate_expect_root | default(true) | bool else 'an ordinary account' }}"
-
-    - name: Run the entry under test
-      ansible.builtin.include_role:
-        name: junioryono.billet.host
-        tasks_from: "{{ billet_gate_entry }}"
-
-    - name: Change the host between two inclusions
-      ansible.builtin.command:
-        argv: [/bin/sh, -c, "{{ billet_gate_between }}"]
+        argv: [/bin/sh, -c, "{{ billet_gate_between_plays | default('') }}"]
       changed_when: true
       check_mode: false
-      when: billet_gate_between | length > 0
-
-    - name: Run the entry under test again
-      ansible.builtin.include_role:
-        name: junioryono.billet.host
-        tasks_from: "{{ billet_gate_entry }}"
-      when: billet_gate_inclusions | int >= 2
-
-    - name: Report the facts the gate reads
-      ansible.builtin.debug:
-        msg: >-
-          GATE shape={{ billet_upgrade_claim_shape | default('undef') }}
-          interrupted={{ billet_interrupted_upgrade | default('undef') }}
-          recovery={{ billet_upgrade_recovery_dir | default('undef') }}
-          upgrade={{ billet_binary_upgrade | default('undef') }}
-          held={{ billet_exclusion_held | default('undef') }}
-          executable={{ billet_exclusion_executable | default('undef') }}
-          holder={{ billet_exclusion_holder | default('undef') }}
-          version={{ billet_version | default('undef') }}
-          resolved={{ billet_resolved_version | default('undef') }}
-          end=.
+      when: billet_gate_between_plays | default('') | length > 0
 PLAY
+  gate_play_body
+} >"$work/play2.yml"
 
 cat >"$work/probe.yml" <<'PLAY'
 ---
@@ -414,15 +465,11 @@ cat >"$work/probe.yml" <<'PLAY'
   hosts: billet_hosts
   gather_facts: false
   tasks:
-    - name: Run the fake billet under escalation
+    - name: Run the managed wrapper under escalation
       ansible.builtin.command:
-        argv: ["{{ billet_gate_managed }}", version]
-      environment:
-        BILLET_FAKE_LOG: "{{ billet_gate_log }}"
+        argv: [/usr/bin/billet, version]
       changed_when: false
       become: true
-    # The role's defaults, made visible to the play, so the holder is the one
-    # the role default resolves and not a copy of its expression.
     - name: Load the role's defaults
       ansible.builtin.include_role:
         name: junioryono.billet.host
@@ -433,98 +480,17 @@ cat >"$work/probe.yml" <<'PLAY'
         msg: "GATE holder={{ billet_converge_guard_holder }}"
 PLAY
 
-# --- the launch --------------------------------------------------------------
-require_root=${BILLET_GATE_REQUIRE_ROOT:-0}
-if [ "$have_root" = 0 ]; then
-  if [ "$require_root" = 1 ]; then
-    fail "BILLET_GATE_REQUIRE_ROOT=1 and sudo -n is not available; the escalated cases cannot run"
-  fi
-  echo "skip the escalated cases: sudo -n is not available here (set BILLET_GATE_REQUIRE_ROOT=1 to make that a failure)"
-fi
-
-# THE HOLDER AND THE RUNNER every case launches with; a case that needs another
-# sets them before its launch and puts them back after, never through a prefix
-# assignment on the function call, whose scope a shell need not honour.
+# --- the helpers over a case's output ----------------------------------------
 HOLDER=h1
 RUNNER=""
-KEEP_OWNER=0
-CASE_DIR_MODE=0755
-status=0
-
-# run_case NAME escalated|unescalated [NAME=VALUE ...] -- [ansible args ...]
-# Every variable the role or a fake reads is passed after the escalation;
-# nothing is inherited through sudo. The case's tree is $work/cases/NAME, and
-# an escalated case's tree is root-owned before the launch (the trust
-# boundary the preparation requires), unless the case planted its own owners.
-run_case() {
-  local name=$1 mode=$2; shift 2
-  local case_dir=$work/cases/$name
-  mkdir -p "$case_dir"
-  local envs=()
-  while [ "$1" != -- ]; do envs+=("$1"); shift; done
-  shift
-  local launcher=()
-  # The out and log files are the invoker's own, so the redirections below
-  # can truncate them; a case launched twice has a root-owned directory by its
-  # second launch, so they are made through the escalation and handed back.
-  for f in out log; do
-    if [ ! -e "$case_dir/$f" ]; then
-      if [ -w "$case_dir" ]; then : >"$case_dir/$f"; else rd touch "$case_dir/$f"; rd chown "$(id -u)" "$case_dir/$f"; fi
-    fi
-    : >"$case_dir/$f"
-  done
-  if [ "$mode" = escalated ]; then
-    launcher=(sudo -n)
-    # THE ANCESTORS OF AN ESCALATED TREE ARE ROOT'S, as the fallback module
-    # requires of every directory above the root's parent (owned by root or the
-    # root's owner, writable by others only under the sticky bit). The two
-    # directories the invoker keeps creating cases under are sticky and
-    # world-writable; the case directory itself is 0755, because the kernel's
-    # fs.protected_regular refuses even root an O_CREAT open of another
-    # account's file inside a sticky world-writable directory, and the fakes
-    # append to the invoker's log there (measured: an empty log under 1777).
-    sudo -n chown root "$work" "$work/cases"
-    sudo -n chmod 1777 "$work" "$work/cases"
-    sudo -n chown root "$case_dir"
-    sudo -n chmod "${CASE_DIR_MODE:-0755}" "$case_dir"
-    if [ -d "$case_dir/lib" ] && [ "$KEEP_OWNER" = 0 ]; then sudo -n chown -R root:root "$case_dir/lib"; fi
-  fi
-  # Ansible's temporary directory: under the case directory while the invoker
-  # can write there, else beside it (an unescalated case over a root-owned
-  # case directory).
-  local tmp="$case_dir/tmp"
-  if [ ! -w "$case_dir" ]; then tmp="$work/tmp-$name"; mkdir -p "$tmp"; fi
-  set +e
-  "${launcher[@]+"${launcher[@]}"}" env \
-    PATH="$fakes:$PATH" \
-    HOME="$HOME" \
-    ANSIBLE_COLLECTIONS_PATH="$collections_path" \
-    ANSIBLE_STDOUT_CALLBACK=default ANSIBLE_NOCOLOR=1 ANSIBLE_FORCE_COLOR=0 \
-    ANSIBLE_LOCAL_TEMP="$tmp" ANSIBLE_REMOTE_TEMP="$tmp" \
-    RUNNER_NAME="$RUNNER" \
-    BILLET_CONVERGE_GUARD_HOLDER="$HOLDER" \
-    BILLET_FAKE_LOG="$case_dir/log" \
-    BILLET_FAKE_ROOT="$case_dir/lib/billet/upgrades" \
-    BILLET_FAKE_MARKER="$case_dir/marker" \
-    BILLET_FAKE_PYTHON="$python" \
-    BILLET_FAKE_STATUS_EMULATOR="$fakes/status-emulator.py" \
-    BILLET_FAKE_HOLD_EMULATOR="$fakes/hold-emulator.py" \
-    "${envs[@]+"${envs[@]}"}" \
-    "$ansible_playbook" -i "$work/inventory.ini" "$work/play.yml" \
-    -e billet_upgrade_root="$case_dir/lib/billet/upgrades" \
-    -e billet_managed_binary="$case_dir/bin/billet" \
-    -e ansible_become=false \
-    -e billet_gate_expect_root="$([ "$mode" = escalated ] && echo true || echo false)" \
-    "$@" >"$case_dir/out" 2>&1
-  status=$?
-  set -e
-}
-
-# The FAILING TASK'S NAME: the last TASK header before the first fatal line,
-# without the role prefix.
 failed_at() {
   awk '/^TASK \[/ { t=$0; sub(/^TASK \[/, "", t); sub(/\] \*+$/, "", t); sub(/^junioryono\.billet\.host : /, "", t) }
        /^(fatal|failed): / { print t; exit }' "$work/cases/$1/out"
+}
+# The last fatal result with the lines that belong to it (under -vvv the
+# message follows the fatal line rather than sitting on it).
+final_fatal() {
+  awk '/^(fatal|failed): / { buf = ""; on = 1 } on { buf = buf $0 "\n" } /^(PLAY RECAP|TASK \[)/ { on = 0 } END { printf "%s", buf }' "$work/cases/$1/out"
 }
 expect_refused() { # case task fragment...
   local name=$1 task=$2; shift 2
@@ -536,6 +502,15 @@ expect_refused() { # case task fragment...
     grep -qF -- "$frag" "$work/cases/$name/out" || fail "$name: the refusal does not say: $frag" "$work/cases/$name/out"
   done
   echo "ok   $name: refused at \"$task\""
+}
+# expect_final CASE FRAGMENT...: the rescue's re-failure, the last fatal line.
+expect_final() {
+  local name=$1; shift
+  local line
+  line=$(final_fatal "$name")
+  for frag in "$@"; do
+    printf '%s' "$line" | grep -qF -- "$frag" || fail "$name: the final refusal does not say: $frag" "$work/cases/$name/out"
+  done
 }
 expect_allowed() {
   [ "$status" -eq 0 ] || fail "$1: the play failed at \"$(failed_at "$1")\", want success" "$work/cases/$1/out"
@@ -554,13 +529,15 @@ calls() { # case [role]
   awk -v want="${2:-}" '/^role=/ {r=substr($0,6)} /^argv=/ {a=substr($0,6)} /^argv0=/ {z=substr($0,7)} /^---/ { if (want=="" || r==want) print r ": " a " @" z }' "$work/cases/$1/log"
 }
 count_calls() { calls "$1" "$2" | grep -cF -- "$3" || true; }
+# The binaries' invocations as "role cmd" lines, in order.
+commands() { # case
+  awk '/^role=/ {r=substr($0,6)} /^cmd=/ {c=substr($0,5)} /^---/ { if (r=="managed"||r=="candidate"||r=="pre-r") print r, c }' "$work/cases/$1/log"
+}
 expect_calls() { # case role fragment count
   local n
   n=$(count_calls "$1" "$2" "$3")
   [ "$n" -eq "$4" ] || fail "$1: $2 '$3' called $n times, want $4" "$work/cases/$1/log"
 }
-# A statically imported task prints its header even when its `when` skips it,
-# so "did not run" is: no header, or a header followed by a skip.
 expect_no_task() { # case task
   local verdict
   verdict=$(awk -v want="TASK [junioryono.billet.host : $2]" '
@@ -568,711 +545,220 @@ expect_no_task() { # case task
     seen && /^skipping: / { seen = 0; next }
     seen && /^(ok|changed|fatal|failed): / { print "ran"; exit }
     seen && /^TASK \[/ { seen = 0 }' "$work/cases/$1/out")
-  if [ "$verdict" = ran ]; then
-    fail "$1: the task \"$2\" ran, and must not have" "$work/cases/$1/out"
+  [ "$verdict" != ran ] || fail "$1: the task \"$2\" ran, and it must not" "$work/cases/$1/out"
+}
+expect_ran() { # case task
+  local verdict
+  verdict=$(awk -v want="TASK [junioryono.billet.host : $2]" '
+    index($0, want) == 1 { seen = 1; next }
+    seen && /^skipping: / { seen = 0; next }
+    seen && /^(ok|changed): / { print "ran"; exit }
+    seen && /^TASK \[/ { seen = 0 }' "$work/cases/$1/out")
+  [ "$verdict" = ran ] || fail "$1: the task \"$2\" did not run" "$work/cases/$1/out"
+}
+log_empty() { [ ! -s "$work/cases/$1/log" ] || fail "$1: a fake was called, and none may be" "$work/cases/$1/log"; }
+# state CASE KEY: one line of the namespace's state dump.
+state() { sed -n "s/^$2=//p" "$work/cases/$1/state" | head -n1; }
+expect_state() { # case key value
+  local got
+  got=$(state "$1" "$2")
+  [ "$got" = "$3" ] || fail "$1: state $2=$got, want $3" "$work/cases/$1/state"
+}
+# The tokens and ids the case's private capture carries.
+tokens_of() { sed -n 's/^ *"token": "\([0-9a-f]\{32\}\)".*/\1/p' "$work/cases/$1/private" 2>/dev/null | sort -u; }
+id_of() { sed -n 's/^ *"id": "\([0-9a-f]\{32\}\)".*/\1/p' "$work/cases/$1/private" | head -n1; }
+# The number of backing invocations of one command, from the private capture.
+backing_runs() { # case cmd
+  grep -c "^backing=1 cmd=$2 " "$work/cases/$1/private" || true
+}
+# THE SENTINEL: no token an `acquired` answer carried reaches the play's output.
+check_sentinel() {
+  local t
+  for t in $(tokens_of "$1"); do
+    if grep -qF "$t" "$work/cases/$1/out"; then fail "$1: the token reached the play's output" "$work/cases/$1/out"; fi
+  done
+}
+# The hook a case declared must have fired.
+check_hook() {
+  if grep -q '^BILLET_GATE_HOOK=' "$work/cases/$1/env" 2>/dev/null; then
+    grep -q '^hook=.* fired$' "$work/cases/$1/log" || fail "$1: the case's hook never fired" "$work/cases/$1/log"
+  fi
+  if grep -q '^BILLET_GATE_SYNC_HOOK=' "$work/cases/$1/env" 2>/dev/null; then
+    grep -q '^hook=sync fired$' "$work/cases/$1/log" || fail "$1: the root-flush hook never fired" "$work/cases/$1/log"
   fi
 }
-expect_task() { grep -qF "TASK [junioryono.billet.host : $2]" "$work/cases/$1/out" || fail "$1: the task \"$2\" did not run" "$work/cases/$1/out"; }
-log_empty() { [ ! -s "$work/cases/$1/log" ] || fail "$1: a fake was called, and none may be" "$work/cases/$1/log"; }
-marker_absent() { [ ! -e "$work/cases/$1/marker" ] || fail "$1: the candidate was RUN (its marker exists), and it must never be"; }
-marker_present() { [ -e "$work/cases/$1/marker" ] || fail "$1: the candidate was never run, and this case expects it to answer"; }
-sha() { rd sha256sum "$1" | cut -d' ' -f1; }
-root_of() { printf '%s' "$work/cases/$1/lib/billet/upgrades"; }
-root_ls() { rd ls "$(root_of "$1")"; }
 
-# plant NAME: a fresh case tree with the managed fake and the candidate source.
-plant() {
+# =============================================================================
+# The converge guard's own cases (the file's original purpose), unescalated:
+# the guard reads RUNNER_NAME on the controller.
+# =============================================================================
+# plant_plain CASE: a temporary tree for the unescalated launch (the guard's
+# cases and the simulated-darwin cases, on the fake billet).
+plant_plain() {
   local case_dir=$work/cases/$1
-  rd rm -rf "$case_dir"
+  rm -rf "$case_dir"
   mkdir -p "$case_dir/bin" "$case_dir/lib/billet/upgrades" "$case_dir/src"
-  cp "$fakes/billet-managed" "$case_dir/bin/billet"
-  cp "$fakes/billet-candidate" "$case_dir/src/billet"
+  cp "$fakes/billet-fake" "$case_dir/bin/billet"
+  cp "$fakes/billet-fake" "$case_dir/src/billet"
   chmod 0755 "$case_dir/lib/billet"
   chmod 0700 "$case_dir/lib/billet/upgrades"
 }
-as_root() { sudo -n "$@"; }
-# write_guard CASE HOLDER EXE [CLAIMED_AT]: a published guard recording EXE.
-write_guard() {
-  local case_dir=$work/cases/$1 holder=$2 exe=$3 at=${4:-2026-09-09T12:00:00Z}
-  mkdir -p "$case_dir/lib/billet/upgrades/active"
-  chmod 0700 "$case_dir/lib/billet/upgrades/active"
-  "$python" - "$case_dir/lib/billet/upgrades/active/guard.json" "$holder" "$exe" "$at" "$(sha "$exe")" <<'PY'
-import json, os, sys
-path, holder, exe, at, digest = sys.argv[1:6]
-with open(path, "w") as f:
-    json.dump({"holder": holder, "claimed_at": at, "hostname": "billet-control-01",
-               "release_executable": exe, "release_executable_sha256": digest}, f, indent=2)
-    f.write("\n")
-os.chmod(path, 0o600)
-PY
+# run_plain CASE [ENV...] -- [PLAY ARGS...]
+run_plain() {
+  local name=$1; shift
+  local case_dir=$work/cases/$name
+  mkdir -p "$case_dir"
+  local envs=()
+  while [ "$1" != -- ]; do envs+=("$1"); shift; done
+  shift
+  : >"$case_dir/out"; : >"$case_dir/log"; rm -f "$case_dir/log.count"
+  set +e
+  env PATH="$fakes:$PATH" HOME="$HOME" ANSIBLE_COLLECTIONS_PATH="$collections_path" \
+    ANSIBLE_STDOUT_CALLBACK=default ANSIBLE_NOCOLOR=1 ANSIBLE_FORCE_COLOR=0 \
+    ANSIBLE_LOCAL_TEMP="$case_dir/tmp" ANSIBLE_REMOTE_TEMP="$case_dir/tmp" \
+    RUNNER_NAME="$RUNNER" BILLET_CONVERGE_GUARD_HOLDER="$HOLDER" \
+    BILLET_FAKE_LOG="$case_dir/log" BILLET_FAKE_ROOT="$case_dir/lib/billet/upgrades" \
+    BILLET_FAKE_PREPARE="$work/corpus/acquired.json" BILLET_FAKE_PREPARE2="$work/corpus/no-change.json" \
+    "${envs[@]+"${envs[@]}"}" \
+    "$ansible_playbook" -i "$work/inventory.ini" "$work/play.yml" \
+    -e billet_upgrade_root="$case_dir/lib/billet/upgrades" \
+    -e billet_managed_binary="$case_dir/bin/billet" \
+    -e ansible_become=false \
+    -e billet_gate_expect_uid="$(id -u)" \
+    "$@" >"$case_dir/out" 2>&1
+  status=$?
+  set -e
 }
-# plant_recorded CASE: a recovery directory holding the candidate, recorded by a guard of h1.
-plant_recorded() {
-  local case_dir=$work/cases/$1 dir
-  dir=$case_dir/lib/billet/upgrades/recovery-20260909T120000-0badcafe
-  mkdir -p "$dir"
-  cp "$case_dir/src/billet" "$dir/billet.candidate"
-  write_guard "$1" "${2:-h1}" "$dir/billet.candidate"
-}
-# A corrupted status answer from the real command's fixtures (P5).
-mkstatus() { # out-file case-id
-  "$python" - "$fixtures" "$1" "$2" <<'PY'
-import copy, json, sys
-fixtures, out, case = sys.argv[1:4]
-def fx(n): return json.load(open("%s/%s.json" % (fixtures, n)))
-h = fx("healthy")
-def corrupt(path, value=None, delete=False):
-    r = copy.deepcopy(h); d = r
-    for k in path[:-1]: d = d[k]
-    if delete: del d[path[-1]]
-    else: d[path[-1]] = value
-    return r
-aa_pointer = corrupt(["guard", "recovery_pointer"], True)
-aa_pointer["guard"]["release_executable_verified"] = False
-table = {
-    "d": [], "e": "x",
-    "f": corrupt(["active"], delete=True), "g": corrupt(["active"], 1), "h": corrupt(["active"], "held"),
-    "i": fx("none"), "j": fx("host-upgrade"), "k": fx("legacy-file"),
-    "l": {"active": "unknown", "why": "the claim is neither a symlink, a file nor a directory"},
-    "l2": {"active": "unknown"}, "l3": {"active": "unknown", "why": None},
-    "l4": {"active": "unknown", "why": 1}, "l5": {"active": "unknown", "why": ""},
-    "m": corrupt(["guard"], delete=True), "n": corrupt(["guard"], "x"),
-    "o": corrupt(["guard", "holder"], delete=True), "o2": corrupt(["guard", "holder"], 1),
-    "p": corrupt(["guard", "holder"], ""), "p2": corrupt(["guard", "holder"], "h 1"),
-    "p3": corrupt(["guard", "holder"], "h\t1"), "p4": corrupt(["guard", "holder"], "h\x011"),
-    "p5": corrupt(["guard", "holder"], "h" * 300), "q": corrupt(["guard", "holder"], "h/1"),
-    "q2": corrupt(["guard", "record_error"], 1), "r": corrupt(["guard", "claimed_at"], "yesterday"),
-    "s": corrupt(["guard", "recovery_pointer"], delete=True), "t": corrupt(["guard", "recovery_pointer"], "false"),
-    "u": corrupt(["guard", "release_executable"], "billet"),
-    "v": corrupt(["guard", "release_executable_sha256"], "a" * 63),
-    "w": corrupt(["guard", "release_executable_verified"], delete=True),
-    "x": corrupt(["guard", "release_executable_verified"], "unknown"),
-    "x2": corrupt(["guard", "release_executable_verified"], {}),
-    "x3": corrupt(["guard", "release_executable_verified"], {"unknown": 1}),
-    "x4": corrupt(["guard", "release_executable_verified"], {"unknown": "x", "more": 1}),
-    "y": fx("unpublished"), "z": fx("malformed-record"),
-    "aa-no-pointer": fx("verification-false"),
-    "aa-pointer": aa_pointer,
-    "ab": corrupt(["guard", "release_executable_verified"], {"unknown": "cannot read the executable"}),
-}
-if case == "c":
-    open(out, "w").write("not json\n")
-else:
-    json.dump(table[case], open(out, "w"))
-PY
-}
+mkdir -p "$work/corpus"
+for f in acquired no-change validated-settled refused-downgrade; do
+  readdress "$fixtures/$f.json" "$work/corpus/$f.json" "$HOLDER"
+done
+corrupt "$work/corpus/no-change.json" "$work/corpus/no-change-outcome.json" outcome
 
-# =============================================================================
-# The converge guard's own cases (the file's original purpose), through the
-# unescalated launch: the guard reads RUNNER_NAME on the controller.
-# =============================================================================
-plant guard-refused
-RUNNER="billet-lease-abc123"; run_case guard-refused unescalated -- -e billet_gate_entry=converge-guard; RUNNER=""
+plant_plain guard-refused
+RUNNER="billet-lease-abc123"; run_plain guard-refused -- -e billet_gate_entry=converge-guard; RUNNER=""
 expect_refused guard-refused "Refuse a converge driven from a billet-managed runner" "runner billet itself manages"
-
-plant guard-override
-RUNNER="billet-lease-abc123"; run_case guard-override unescalated -- -e billet_gate_entry=converge-guard -e billet_allow_converge_from_billet_runner=true; RUNNER=""
+plant_plain guard-override
+RUNNER="billet-lease-abc123"; run_plain guard-override -- -e billet_gate_entry=converge-guard -e billet_allow_converge_from_billet_runner=true; RUNNER=""
 expect_allowed guard-override
-
-plant guard-plain
-RUNNER="gh-deploy-runner-1"; run_case guard-plain unescalated -- -e billet_gate_entry=converge-guard; RUNNER=""
+plant_plain guard-plain
+RUNNER="gh-deploy-runner-1"; run_plain guard-plain -- -e billet_gate_entry=converge-guard; RUNNER=""
 expect_allowed guard-plain
-
-plant guard-workstation
-run_case guard-workstation unescalated -- -e billet_gate_entry=converge-guard
+plant_plain guard-workstation
+run_plain guard-workstation -- -e billet_gate_entry=converge-guard
 expect_allowed guard-workstation
-
-plant guard-substring
-RUNNER="ci-billet-deploy"; run_case guard-substring unescalated -- -e billet_gate_entry=converge-guard; RUNNER=""
+plant_plain guard-substring
+RUNNER="ci-billet-deploy"; run_plain guard-substring -- -e billet_gate_entry=converge-guard; RUNNER=""
 expect_allowed guard-substring
-
-# THE GUARD IS THE PREPARATION'S FIRST REFUSAL TOO: through the whole
-# preparation, a managed runner is refused before any stat, the log empty.
-plant guard-in-preparation
-RUNNER="billet-lease-abc123"; run_case guard-in-preparation unescalated --; RUNNER=""
+plant_plain guard-in-preparation
+RUNNER="billet-lease-abc123"; run_plain guard-in-preparation --; RUNNER=""
 expect_refused guard-in-preparation "Refuse a converge driven from a billet-managed runner" "runner billet itself manages"
 expect_no_task guard-in-preparation "Inspect the durable claim"
 log_empty guard-in-preparation
-
-if [ "$have_root" = 0 ]; then
-  echo "converge guard: the guard's cases pass; the preparation's escalated cases were skipped (no sudo -n)"
-  exit 0
-fi
-
-# =============================================================================
-# M8: the escalated launch is proved before it is relied on.
-# =============================================================================
-plant launch
-set +e
-sudo -n env PATH="$fakes:$PATH" HOME="$HOME" ANSIBLE_COLLECTIONS_PATH="$collections_path" \
-  ANSIBLE_STDOUT_CALLBACK=default ANSIBLE_NOCOLOR=1 ANSIBLE_FORCE_COLOR=0 \
-  ANSIBLE_LOCAL_TEMP="$work/cases/launch/tmp" ANSIBLE_REMOTE_TEMP="$work/cases/launch/tmp" \
-  RUNNER_NAME="" BILLET_CONVERGE_GUARD_HOLDER=from-the-environment \
-  "$ansible_playbook" -i "$work/inventory.ini" "$work/probe.yml" \
-  -e billet_gate_managed="$work/cases/launch/bin/billet" -e billet_gate_log="$work/cases/launch/log" \
-  >"$work/cases/launch/out" 2>&1
-status=$?
-set -e
-[ "$status" -eq 0 ] || fail "M8: the escalated launch failed" "$work/cases/launch/out"
-grep -q '^uid=0$' "$work/cases/launch/log" || fail "M8: the fake did not run as root under become" "$work/cases/launch/log"
-grep -qF "argv0=$work/cases/launch/bin/billet" "$work/cases/launch/log" || fail "M8: argv[0] is not the fake's own path" "$work/cases/launch/log"
-grep -qF "GATE holder=from-the-environment" "$work/cases/launch/out" || fail "M8: the role default did not resolve the holder from the environment" "$work/cases/launch/out"
-echo "ok   M8: the escalated launch runs the fake as root by its own path and resolves the holder from the environment"
+plant_plain no-holder
+HOLDER=""; run_plain no-holder --; HOLDER=h1
+expect_refused no-holder "Refuse a converge without a holder" "BILLET_CONVERGE_GUARD_HOLDER"
+log_empty no-holder
+echo "ok   the converge guard refuses a billet-managed runner before the preparation, and a converge needs a holder"
 
 # =============================================================================
-# P. The preparation.
+# THE SIMULATED-DARWIN CASES, unescalated, on the fake with the role's path
+# overrides: the calls run as the agent's account under the async bound with
+# no `timeout`, the staging stages nothing, and the cleanup releases.
 # =============================================================================
-
-# P1. No holder outside check mode; -e and the environment each admit; -e wins.
-plant p1-none
-HOLDER=""; run_case p1-none escalated --; HOLDER=h1
-expect_refused p1-none "Refuse a converge without a holder" "BILLET_CONVERGE_GUARD_HOLDER"
-expect_no_task p1-none "Inspect the durable claim"
-log_empty p1-none
-
-plant p1-env
-HOLDER="env-holder"; run_case p1-env escalated --; HOLDER=h1
-expect_allowed p1-env
-rd grep -q '"holder": "env-holder"' "$(root_of p1-env)/active/guard.json" || fail "p1-env: the guard does not name the environment's holder"
-
-plant p1-extra
-HOLDER="env-holder"; run_case p1-extra escalated -- -e billet_converge_guard_holder=extra-holder; HOLDER=h1
-expect_allowed p1-extra
-rd grep -q '"holder": "extra-holder"' "$(root_of p1-extra)/active/guard.json" || fail "p1-extra: -e did not win over the environment"
-echo "ok   P1: the holder is required, comes from the environment or -e, and -e wins"
-
-# P2. An absent claim holds through the managed binary; a second inclusion
-# classifies again and never holds again; the later classification governs.
-plant p2
-run_case p2 escalated -- -e billet_gate_inclusions=2
-expect_allowed p2
-expect_calls p2 managed "converge-guard status --json" 2
-expect_calls p2 managed "converge-guard hold --holder h1" 1
-expect_fact p2 shape guard
-expect_fact p2 held True
-rd cat "$(root_of p2)/active/guard.json" | "$python" -c 'import json,sys; g=json.load(sys.stdin); assert sorted(g)==["claimed_at","holder","hostname","release_executable","release_executable_sha256"], g' || fail "p2: guard.json does not carry exactly the five members"
-[ "$(calls p2 managed | awk '{print $3}' | tr '\n' ' ')" = "status hold status " ] || fail "p2: the managed binary's calls are not status, hold, status" "$work/cases/p2/log"
-echo "ok   P2: an absent claim is held once through the managed binary and re-classified on every inclusion"
-
-for moved in absent foreign legacy symlink; do
-  plant "p2-moved-$moved"
-  root=$(root_of "p2-moved-$moved")
-  case $moved in
-    absent) between="rm -rf $root/active" ;;
-    foreign) between="printf '{\"holder\": \"h2\", \"claimed_at\": \"2026-09-09T12:00:00Z\", \"hostname\": \"x\", \"release_executable\": \"$work/cases/p2-moved-$moved/bin/billet\", \"release_executable_sha256\": \"$(sha "$work/cases/p2-moved-$moved/bin/billet")\"}' > $root/active/guard.json" ;;
-    legacy) between="rm -rf $root/active; printf '%s\\n' $root/20260909T120000000000000 > $root/active" ;;
-    symlink) between="rm -rf $root/active; ln -s $root/upgrade-x $root/active" ;;
-  esac
-  run_case "p2-moved-$moved" escalated -- -e billet_gate_inclusions=2 -e "$(json_var billet_gate_between "$between")"
-  case $moved in
-    foreign) expect_refused "p2-moved-$moved" "Refuse a converge whose exclusion moved to another holder" "as h1" "a guard held by h2" ;;
-    *) expect_refused "p2-moved-$moved" "Refuse a converge whose exclusion moved" "as h1" ;;
-  esac
-  expect_calls "p2-moved-$moved" managed "converge-guard hold" 1
-  expect_no_task "p2-moved-$moved" "Allocate a recovery directory exclusively"
-done
-echo "ok   P2: a later inclusion whose claim moved refuses without reacquiring"
-
-# P3. A symlink at active.
-plant p3
-ln -s "$(root_of p3)/upgrade-20260909" "$(root_of p3)/active"
-run_case p3 escalated --
-expect_refused p3 "Refuse to converge over a host upgrade billet itself is running" "billet host-upgrade --status" "--resume"
-log_empty p3
-
-# P4. A regular file at active is a legacy pointer: nothing held, nothing logged.
-plant p4
-printf '%s\n' "$(root_of p4)/20260909T120000000000000" >"$(root_of p4)/active"
-run_case p4 escalated --
-expect_allowed p4
-expect_fact p4 shape legacy-file
-expect_fact p4 interrupted True
-log_empty p4
-grep -q "predates the converge guard" "$work/cases/p4/out" || fail "p4: the report does not name the pre-R race"
-echo "ok   P3, P4: a Go claim refuses and a legacy pointer holds nothing"
-
-# P5. The status schema, one member corrupted per case, over a directory claim.
-p5_case() { # id expected-task fragment...
-  local id=$1 task=$2; shift 2
-  plant "p5-$id"
-  write_guard "p5-$id" h1 "$work/cases/p5-$id/bin/billet"
-  mkstatus "$work/cases/p5-$id/status.json" "$id"
-  run_case "p5-$id" escalated BILLET_FAKE_MANAGED_STATUS="$work/cases/p5-$id/status.json" --
-  expect_refused "p5-$id" "$task" "$@"
-  expect_calls "p5-$id" managed "converge-guard hold" 0
-}
-plant p5-a
-write_guard p5-a h1 "$work/cases/p5-a/bin/billet"
-run_case p5-a escalated BILLET_FAKE_MANAGED_STATUS=exit1 --
-expect_refused p5-a "Judge the claim's status" "exited 1"
-plant p5-b
-write_guard p5-b h1 "$work/cases/p5-b/bin/billet"
-run_case p5-b escalated BILLET_FAKE_MANAGED_HANG=1 -- -e billet_guard_timeout=2
-expect_refused p5-b "Judge the claim's status" "did not answer within the bound"
-p5_case c "Judge the claim's status" "not JSON"
-p5_case d "Judge the claim's status" "not a JSON object"
-p5_case e "Judge the claim's status" "not a JSON object"
-p5_case f "Judge the claim's status" "active is missing"
-p5_case g "Judge the claim's status" "active is missing or not a string"
-p5_case h "Judge the claim's status" "not a word this role knows"
-p5_case i "Judge the claim's status" "disagrees with the directory"
-p5_case j "Judge the claim's status" "disagrees with the directory"
-p5_case k "Judge the claim's status" "disagrees with the directory"
-p5_case l "Refuse a claim that cannot be classified" "the claim is neither a symlink, a file nor a directory" "if one is there, is kept"
-p5_case l2 "Judge the claim's status" "why is missing"
-p5_case l3 "Judge the claim's status" "why is not a string"
-p5_case l4 "Judge the claim's status" "why is not a string"
-p5_case l5 "Judge the claim's status" "why is missing or empty"
-p5_case m "Judge the claim's status" "guard: missing"
-p5_case n "Judge the claim's status" "guard: missing or not an object"
-p5_case o "Judge the claim's status" "holder is missing"
-p5_case o2 "Judge the claim's status" "holder is missing or not a string"
-p5_case p "Judge the claim's status" "holder '' is not a name"
-p5_case p2 "Judge the claim's status" "is not a name"
-p5_case p3 "Judge the claim's status" "is not a name"
-p5_case p4 "Judge the claim's status" "is not a name"
-p5_case p5 "Judge the claim's status" "is not a name"
-p5_case q "Judge the claim's status" "is not a name"
-p5_case q2 "Judge the claim's status" "record_error is not a non-empty string"
-p5_case r "Judge the claim's status" "claimed_at is not an RFC 3339 time"
-p5_case s "Judge the claim's status" "recovery_pointer is missing"
-p5_case t "Judge the claim's status" "recovery_pointer is missing or not a boolean"
-p5_case u "Judge the claim's status" "not an absolute path"
-p5_case v "Judge the claim's status" "not 64 lowercase hex"
-p5_case w "Judge the claim's status" "release_executable_verified is missing"
-p5_case x "Judge the claim's status" "neither true, false nor an object"
-p5_case x2 "Judge the claim's status" "neither true, false nor an object"
-p5_case x3 "Judge the claim's status" "neither true, false nor an object"
-p5_case x4 "Judge the claim's status" "neither true, false nor an object"
-p5_case y "Refuse a hold that never returned from publishing" "$work/cases/p5-y/bin/billet converge-guard recover --unpublished"
-p5_case z "Refuse a guard whose record cannot be read" "the record is not JSON" "The guard is kept" "guard.json by hand"
-if grep -q "converge-guard recover" "$work/cases/p5-z/out"; then fail "p5-z: a recover command was named for a record nothing clears"; fi
-if grep -q "holder is missing" "$work/cases/p5-z/out"; then fail "p5-z: the healthy schema was asked of a record the command could not read"; fi
-p5_case aa-no-pointer "Refuse a guard whose recorded executable does not verify" "the file's digest differs" "The guard is kept" "converge-guard release --holder ci-1"
-if grep -q -- "--recover-from" "$work/cases/p5-aa-no-pointer/out"; then fail "p5-aa-no-pointer: a takeover was named for a guard whose binding is bad"; fi
-p5_case aa-pointer "Refuse a guard whose recorded executable does not verify" "the file's digest differs" "recover its transaction before the guard can be released"
-if grep -q -- "release --holder" "$work/cases/p5-aa-pointer/out"; then fail "p5-aa-pointer: a release was named beside a pointer"; fi
-if grep -q -- "--recover-from" "$work/cases/p5-aa-pointer/out"; then fail "p5-aa-pointer: a takeover was named for a guard whose binding is bad"; fi
-p5_case ab "Refuse a guard whose recorded executable does not verify" "cannot read the executable" "The guard is kept"
-echo "ok   P5: every corrupted status member refuses naming it, and the decision table names the right way out"
-
-# P6. A special file at active; a denied stat is could-not-tell.
-plant p6-fifo
-mkfifo "$(root_of p6-fifo)/active"
-run_case p6-fifo escalated --
-expect_refused p6-fifo "Refuse a claim of a type the role does not know" "a FIFO"
-log_empty p6-fifo
-plant p6-socket
-"$python" -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1])' "$(root_of p6-socket)/active"
-run_case p6-socket escalated --
-expect_refused p6-socket "Refuse a claim of a type the role does not know" "a socket"
-plant p6-denied
-# The chain above the root is root's (the ancestors judgement runs before the
-# claim's stat); only the root's contents are denied to the invoker.
-as_root chown root:root "$work/cases/p6-denied" "$work/cases/p6-denied/lib" "$work/cases/p6-denied/lib/billet" "$(root_of p6-denied)"
-as_root chmod 0755 "$work/cases/p6-denied" "$work/cases/p6-denied/lib"
-as_root chmod 0700 "$(root_of p6-denied)"
-run_case p6-denied unescalated --
-expect_refused p6-denied "Refuse a claim that could not be examined" "could not be examined" "not one that is absent"
-log_empty p6-denied
-echo "ok   P6: a FIFO, a socket and a denied stat each refuse without reading or running anything"
-
-# P7. Another holder's guard, two days old, with and without a pointer.
-two_days_ago=$("$python" -c 'import time; print(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time()-2*86400)))')
-plant p7
-write_guard p7 h2 "$work/cases/p7/bin/billet" "$two_days_ago"
-run_case p7 escalated --
-expect_refused p7 "Refuse a guard another converge holds" "h2 holds this host since $two_days_ago" "(2 days ago)" "$work/cases/p7/bin/billet converge-guard recover --holder h2 --old-driver-stopped" "Nothing expires a guard"
-expect_calls p7 managed "converge-guard hold" 0
-plant p7-pointer
-write_guard p7-pointer h2 "$work/cases/p7-pointer/bin/billet" "$two_days_ago"
-mkdir -p "$(root_of p7-pointer)/recovery-20260909T120000-0badcafe"
-ln -s "$(root_of p7-pointer)/recovery-20260909T120000-0badcafe" "$(root_of p7-pointer)/active/recovery"
-run_case p7-pointer escalated --
-expect_refused p7-pointer "Refuse a guard another converge holds" "h2 holds this host" "$work/cases/p7-pointer/bin/billet converge-guard hold --holder h1 --recover-from h2 --old-driver-stopped"
-expect_calls p7-pointer managed "converge-guard hold" 0
-echo "ok   P7: a foreign guard refuses naming its holder, its age and the right command for its pointer state"
-
-# P8. The same-holder rerun.
-plant p8-a
-write_guard p8-a h1 "$work/cases/p8-a/bin/billet"
-run_case p8-a escalated -- -e billet_gate_inclusions=2
-expect_allowed p8-a
-expect_calls p8-a managed "converge-guard hold --holder h1" 1
-expect_calls p8-a managed "--candidate" 0
-expect_calls p8-a suffix "" 0
-expect_fact p8-a upgrade False
-expect_fact p8-a shape guard
-plant p8-b
-mkdir -p "$(root_of p8-b)/recovery-20260909T120000-0badcafe"
-cp "$work/cases/p8-b/bin/billet" "$(root_of p8-b)/recovery-20260909T120000-0badcafe/billet.candidate"
-write_guard p8-b h1 "$(root_of p8-b)/recovery-20260909T120000-0badcafe/billet.candidate"
-cp "$work/cases/p8-b/bin/billet" "$work/cases/p8-b/src/billet"
-run_case p8-b escalated -- -e billet_binary_src="$work/cases/p8-b/src/billet"
-expect_allowed p8-b
-expect_calls p8-b managed "converge-guard hold --holder h1" 1
-expect_calls p8-b suffix "" 0
-expect_fact p8-b upgrade False
-plant p8-c
-planted=$(root_of p8-c)/recovery-20260909T120000-0badcafe
-mkdir -p "$planted/server"
-cp "$work/cases/p8-c/src/billet" "$planted/billet.candidate"
-echo "host upgrade committed" >"$planted/commit.complete"
-echo "version: 2" >"$planted/manifest.yml"
-write_guard p8-c h1 "$planted/billet.candidate"
-before_candidate=$(stat -c %Y "$planted/billet.candidate")
-before_record=$(sha "$(root_of p8-c)/active/guard.json")
-run_case p8-c escalated -- -e billet_binary_src="$work/cases/p8-c/src/billet" -e billet_recovery_dir_suffix_command="$fakes/suffix"
-expect_allowed p8-c
-expect_calls p8-c managed "converge-guard hold --holder h1" 1
-expect_calls p8-c candidate "converge-guard hold" 0
-expect_calls p8-c suffix "" 1
-expect_fact p8-c upgrade True
-fresh=$(fact p8-c recovery)
-[ "$fresh" != "$planted" ] || fail "p8-c: the recorded directory was reused as the journal"
-case "$fresh" in "$(root_of p8-c)/recovery-"*) ;; *) fail "p8-c: the fresh journal is not under the root: $fresh" ;; esac
-[ "$(sha "$fresh/billet.candidate")" = "$(sha "$work/cases/p8-c/src/billet")" ] || fail "p8-c: the fresh journal's candidate is not this run's"
-[ "$(rd stat -c %Y "$planted/billet.candidate")" = "$before_candidate" ] || fail "p8-c: the planted candidate was touched"
-[ "$(sha "$(root_of p8-c)/active/guard.json")" = "$before_record" ] || fail "p8-c: the record changed"
-for word in commit.complete manifest.yml "$planted/server"; do
-  if grep -qF "$word" "$work/cases/p8-c/log"; then fail "p8-c: the planted journal's $word appears in an argv"; fi
-done
-hold_line=$(calls p8-c | grep -n 'managed: converge-guard hold' | head -1 | cut -d: -f1)
-suffix_line=$(calls p8-c | grep -n '^suffix:' | head -1 | cut -d: -f1)
-[ "$hold_line" -lt "$suffix_line" ] || fail "p8-c: the validation hold did not precede the allocation" "$work/cases/p8-c/log"
-plant p8-d
-write_guard p8-d h1 "$work/cases/p8-d/bin/billet"
-run_case p8-d escalated -- -e billet_binary_src="$work/cases/p8-d/src/billet"
-expect_refused p8-d "Refuse a same-holder rerun with a different intent" "$(sha "$work/cases/p8-d/bin/billet")" "$(sha "$work/cases/p8-d/src/billet")" "converge-guard release --holder h1"
-expect_calls p8-d suffix "" 0
-plant p8-e
-mkdir -p "$(root_of p8-e)/recovery-20260909T120000-0badcafe"
-printf '#!/bin/sh\nexit 0\n' >"$(root_of p8-e)/recovery-20260909T120000-0badcafe/billet.candidate"
-chmod 0755 "$(root_of p8-e)/recovery-20260909T120000-0badcafe/billet.candidate"
-write_guard p8-e h1 "$(root_of p8-e)/recovery-20260909T120000-0badcafe/billet.candidate"
-run_case p8-e escalated -- -e billet_binary_src="$work/cases/p8-e/src/billet"
-expect_refused p8-e "Refuse a same-holder rerun with a different intent" "converge-guard release --holder h1"
-plant p8-f
-plant_recorded p8-f
-run_case p8-f escalated --
-expect_refused p8-f "Refuse a same-holder rerun with a different intent" "intends no binary change" "converge-guard release --holder h1"
-plant p8-h
-plant_recorded p8-h
-cp "$work/cases/p8-h/src/billet" "$work/cases/p8-h/bin/billet"
-cp "$fakes/billet-managed" "$work/cases/p8-h/src/other"
-run_case p8-h escalated -- -e billet_binary_src="$work/cases/p8-h/src/other"
-expect_refused p8-h "Refuse a same-holder rerun with a different intent" "$(sha "$work/cases/p8-h/bin/billet")" "$(sha "$work/cases/p8-h/src/other")" "converge-guard release --holder h1"
-plant p8-i
-rm -f "$work/cases/p8-i/bin/billet"
-plant_recorded p8-i
-run_case p8-i escalated -- -e billet_binary_src="$work/cases/p8-i/src/billet"
-expect_allowed p8-i
-marker_present p8-i
-expect_calls p8-i candidate "converge-guard hold --holder h1" 1
-expect_calls p8-i candidate "--candidate" 0
-expect_fact p8-i upgrade True
-[ "$(fact p8-i recovery)" != "$(root_of p8-i)/recovery-20260909T120000-0badcafe" ] || fail "p8-i: the recorded directory was reused"
-plant p8-i2
-rm -f "$work/cases/p8-i2/bin/billet"
-plant_recorded p8-i2
-cp "$fakes/billet-managed" "$work/cases/p8-i2/src/other"
-run_case p8-i2 escalated -- -e billet_binary_src="$work/cases/p8-i2/src/other"
-expect_refused p8-i2 "Refuse a same-holder rerun with a different intent" "converge-guard release --holder h1"
-for refusal in "holds a guard.json.tmp beside its record, which a hold does not leave" "the guard directory is mode 0755, want 0700" "flush the guard directory: input/output error"; do
-  plant p8-g
-  write_guard p8-g h1 "$work/cases/p8-g/bin/billet"
-  run_case p8-g escalated BILLET_FAKE_MANAGED_HOLD_REFUSE="converge-guard: $refusal" -- -e billet_binary_src="$work/cases/p8-g/src/billet"
-  expect_refused p8-g "Hold this host for the converge" "$refusal"
-  expect_calls p8-g suffix "" 0
-  expect_no_task p8-g "Allocate a recovery directory exclusively"
-done
-echo "ok   P8: a same-holder rerun validates, keeps its record, refuses a different intent and never reuses a journal"
-
-# P9. This holder's guard with a pointer: the interrupted transaction.
-plant p9
-write_guard p9 h1 "$work/cases/p9/bin/billet"
-mkdir -p "$(root_of p9)/recovery-20260909T120000-0badcafe"
-ln -s "$(root_of p9)/recovery-20260909T120000-0badcafe" "$(root_of p9)/active/recovery"
-run_case p9 escalated -- -e billet_gate_inclusions=2 -e billet_binary_src="$work/cases/p9/src/billet"
-expect_allowed p9
-expect_fact p9 shape guard-pointer
-expect_fact p9 interrupted True
-expect_fact p9 recovery "$(root_of p9)/recovery-20260909T120000-0badcafe"
-expect_calls p9 managed "converge-guard hold --holder h1" 1
-expect_calls p9 managed "--candidate" 0
-expect_calls p9 suffix "" 0
-expect_no_task p9 "Stage the immutable candidate binary inside its recovery journal"
-for refusal in "the guard directory is owned by uid 1000, want 0" "holds a guard.json.tmp beside its record" "flush the guard directory: input/output error"; do
-  plant p9-refused
-  write_guard p9-refused h1 "$work/cases/p9-refused/bin/billet"
-  mkdir -p "$(root_of p9-refused)/recovery-20260909T120000-0badcafe"
-  ln -s "$(root_of p9-refused)/recovery-20260909T120000-0badcafe" "$(root_of p9-refused)/active/recovery"
-  run_case p9-refused escalated BILLET_FAKE_MANAGED_HOLD_REFUSE="converge-guard: $refusal" --
-  expect_refused p9-refused "Hold this host for the converge" "$refusal"
-  expect_no_task p9-refused "Inspect the transaction claim before recovery"
-done
-echo "ok   P9: an interrupted transaction is classified by its pointer, validated once and staged over never"
-
-# P10. The pointer's target outside both grammars, dangling, a file, a directory.
-p10_case() { # id plant-command fragment
-  plant "p10-$1"
-  write_guard "p10-$1" h1 "$work/cases/p10-$1/bin/billet"
-  (cd "$(root_of "p10-$1")" && eval "$2")
-  run_case "p10-$1" escalated --
-  expect_refused "p10-$1" "Refuse a transaction pointer outside the recovery grammar" "$3"
-}
-p10_case grammar 'mkdir notes; ln -s "$PWD/notes" active/recovery' "not a recovery directory this role allocates"
-p10_case dangling 'ln -s "$PWD/recovery-20260909T120000-0badcafe" active/recovery' "does not exist"
-p10_case file 'touch active/recovery' "a regular file, not the symlink pointer"
-p10_case dir 'mkdir active/recovery' "a directory, not the symlink pointer"
-echo "ok   P10: a pointer is trusted by grammar, existence and type"
-
-# P11. A guard with a pointer and no managed binary: the same holder continues
-# through the recorded candidate; another holder is refused naming the takeover.
-plant p11
-rm -f "$work/cases/p11/bin/billet"
-plant_recorded p11
-ln -s "$(root_of p11)/recovery-20260909T120000-0badcafe" "$(root_of p11)/active/recovery"
-run_case p11 escalated --
-expect_allowed p11
-marker_present p11
-expect_fact p11 shape guard-pointer
-expect_calls p11 candidate "converge-guard status --json" 1
-expect_calls p11 candidate "converge-guard hold --holder h1" 1
-plant p11-h3
-rm -f "$work/cases/p11-h3/bin/billet"
-plant_recorded p11-h3
-ln -s "$(root_of p11-h3)/recovery-20260909T120000-0badcafe" "$(root_of p11-h3)/active/recovery"
-HOLDER=h3; run_case p11-h3 escalated --; HOLDER=h1
-expect_refused p11-h3 "Refuse a guard another converge holds" "$(root_of p11-h3)/recovery-20260909T120000-0badcafe/billet.candidate converge-guard hold --holder h3 --recover-from h1 --old-driver-stopped"
-echo "ok   P11: a guarded interrupted bootstrap continues for its holder and names the takeover for another"
-
-# P12. The verified fallback: a pre-R managed binary and a guard naming the candidate.
-plant p12
-plant_recorded p12
-run_case p12 escalated BILLET_FAKE_MANAGED_PRE_R=1 -- -e billet_binary_src="$work/cases/p12/src/billet"
-expect_allowed p12
-marker_present p12
-[ "$(calls p12 | grep 'converge-guard status' | head -2 | awk '{print $1}' | tr '\n' ' ')" = "managed: candidate: " ] || fail "p12: the managed binary's failed status was not followed by the candidate's" "$work/cases/p12/log"
-grep -q "answered by the executable it records" "$work/cases/p12/out" || fail "p12: the report does not name the fallback"
-expect_calls p12 candidate "converge-guard hold --holder h1" 1
-expect_calls p12 managed "converge-guard hold" 0
-echo "ok   P12: a pre-R managed binary defers to the verified recorded candidate, which every later guard operation runs"
-
-# P13. The fallback reader's phases, through tasks_from: guard-fallback over an
-# otherwise-valid tree (the component × property table is the module's own
-# check, guard_fallback_check.py, run above).
-p13_args() {
-  printf -- '-e billet_gate_entry=guard-fallback -e billet_exclusion_root=%s -e billet_exclusion_become=false -e billet_exclusion_owner_uid=0 -e billet_exclusion_binary_present=false -e billet_exclusion_binary=%s -e billet_exclusion_darwin=false' \
-    "$(root_of "$1")" "$work/cases/$1/bin/billet"
-}
-p13_plant() { plant "$1"; rm -f "$work/cases/$1/bin/billet"; plant_recorded "$1"; }
-p13_plant p13-pass
-# shellcheck disable=SC2046
-run_case p13-pass escalated -- $(p13_args p13-pass)
-expect_allowed p13-pass
-marker_present p13-pass
-p13_plant p13-record-mode
-chmod 0644 "$(root_of p13-record-mode)/active/guard.json"
-# shellcheck disable=SC2046
-run_case p13-record-mode escalated -- $(p13_args p13-record-mode)
-expect_refused p13-record-mode "Judge the guard's record" "want 0600"
-marker_absent p13-record-mode
-expect_no_task p13-record-mode "Judge the recorded executable"
-p13_plant p13-record-content
-echo "not json" >"$(root_of p13-record-content)/active/guard.json"
-# shellcheck disable=SC2046
-run_case p13-record-content escalated -- $(p13_args p13-record-content)
-expect_refused p13-record-content "Judge the guard's record" "is not JSON"
-marker_absent p13-record-content
-p13_plant p13-candidate-digest
-printf '\n' >>"$(root_of p13-candidate-digest)/recovery-20260909T120000-0badcafe/billet.candidate"
-# shellcheck disable=SC2046
-run_case p13-candidate-digest escalated -- $(p13_args p13-candidate-digest)
-expect_refused p13-candidate-digest "Judge the recorded executable" "has digest"
-marker_absent p13-candidate-digest
-p13_plant p13-candidate-writable
-chmod 0775 "$(root_of p13-candidate-writable)/recovery-20260909T120000-0badcafe"
-# shellcheck disable=SC2046
-run_case p13-candidate-writable escalated -- $(p13_args p13-candidate-writable)
-expect_refused p13-candidate-writable "Judge the recorded executable" "writable by its group"
-marker_absent p13-candidate-writable
-p13_plant p13-hardlinks
-ln "$(root_of p13-hardlinks)/recovery-20260909T120000-0badcafe/billet.candidate" "$(root_of p13-hardlinks)/recovery-20260909T120000-0badcafe/second-name"
-ln "$(root_of p13-hardlinks)/active/guard.json" "$(root_of p13-hardlinks)/active/record-second-name"
-# shellcheck disable=SC2046
-run_case p13-hardlinks escalated -- $(p13_args p13-hardlinks)
-expect_allowed p13-hardlinks
-p13_plant p13-unpublished
-rm -f "$(root_of p13-unpublished)/active/guard.json"
-# shellcheck disable=SC2046
-run_case p13-unpublished escalated -- $(p13_args p13-unpublished)
-expect_refused p13-unpublished "Refuse an unpublished guard no executable can recover" "Install a billet at or after the release that carries the converge guard at $work/cases/p13-unpublished/bin/billet" "converge-guard recover --unpublished"
-marker_absent p13-unpublished
-echo "ok   P13: the fallback's refusals come from the phase that judges them, hard links are admitted, and a refused candidate is never run"
-
-# P14. Check mode: status only, nothing created; a foreign guard reported and
-# the preparation continues; a legacy pointer reported.
-plant p14-absent
-HOLDER=""; run_case p14-absent escalated -- --check; HOLDER=h1
-expect_allowed p14-absent
-expect_calls p14-absent managed "converge-guard status --json" 1
-expect_calls p14-absent managed "converge-guard hold" 0
-if rd test -e "$(root_of p14-absent)/active"; then fail "p14-absent: a dry run created the claim"; fi
-plant p14-foreign
-write_guard p14-foreign h2 "$work/cases/p14-foreign/bin/billet"
-HOLDER=""; run_case p14-foreign escalated -- --check; HOLDER=h1
-expect_allowed p14-foreign
-grep -q "a guard held by h2" "$work/cases/p14-foreign/out" || fail "p14-foreign: the dry run did not report the foreign guard"
-expect_calls p14-foreign managed "converge-guard hold" 0
-plant p14-legacy
-printf '%s\n' "$(root_of p14-legacy)/20260909T120000000000000" >"$(root_of p14-legacy)/active"
-HOLDER=""; run_case p14-legacy escalated -- --check; HOLDER=h1
-expect_allowed p14-legacy
-expect_fact p14-legacy shape legacy-file
-echo "ok   P14: a dry run asks, reports and holds nothing"
-
-# P15. Darwin (fake facts), unescalated: the launch agent's account owns the tree.
 me=$(id -u)
-plant p15-a
+plant_plain p15-a
 rm -rf "$work/cases/p15-a/lib" "$work/cases/p15-a/bin/billet"
-run_case p15-a unescalated -- -e billet_exclusion_platform=Darwin
+run_plain p15-a -- -e billet_exclusion_platform=Darwin
 expect_allowed p15-a
-grep -q "nothing to hold" "$work/cases/p15-a/out" || fail "p15-a: a pristine Mac was not reported as nothing to hold"
+expect_fact p15-a route unheld
+expect_fact p15-a held undef
+expect_ran p15-a "Inspect the managed binary and the claim again before an unheld converge"
 log_empty p15-a
-plant p15-b
-rm -f "$work/cases/p15-b/bin/billet"
-plant_recorded p15-b
-ln -s "$(root_of p15-b)/recovery-20260909T120000-0badcafe" "$(root_of p15-b)/active/recovery"
-run_case p15-b unescalated -- -e billet_exclusion_platform=Darwin
-expect_allowed p15-b
-expect_fact p15-b shape guard-pointer
-marker_present p15-b
-grep -q "^uid=$me$" "$work/cases/p15-b/log" || fail "p15-b: the candidate did not run as the agent's account"
-plant p15-b2
-rm -f "$work/cases/p15-b2/bin/billet"
-plant_recorded p15-b2
-ln -s "$(root_of p15-b2)/recovery-20260909T120000-0badcafe" "$(root_of p15-b2)/active/recovery"
-as_root chown root "$(root_of p15-b2)/active/guard.json"
-run_case p15-b2 unescalated -- -e billet_exclusion_platform=Darwin
-expect_refused p15-b2 "Judge the guard's record" "is owned by uid 0, want $me"
-marker_absent p15-b2
-plant p15-c
-rm -f "$work/cases/p15-c/bin/billet"
-mkdir -p "$(root_of p15-c)/active"
-chmod 0700 "$(root_of p15-c)/active"
-run_case p15-c unescalated -- -e billet_exclusion_platform=Darwin
-expect_refused p15-c "Refuse an unpublished guard no executable can recover" "Install a billet at or after the release that carries the converge guard at $work/cases/p15-c/bin/billet" "converge-guard recover --unpublished"
-plant p15-d
-run_case p15-d unescalated -- -e billet_exclusion_platform=Darwin
+[ ! -e "$work/cases/p15-a/lib" ] || fail "p15-a: a Mac with no billet had a root made for it"
+plant_plain p15-d
+run_plain p15-d -- -e billet_exclusion_platform=Darwin
 expect_allowed p15-d
-expect_calls p15-d managed "converge-guard hold --holder h1" 1
-grep -q "^uid=$me$" "$work/cases/p15-d/log" || fail "p15-d: the hold did not run as the agent's account"
+expect_fact p15-d acquired True
+expect_fact p15-d held True
+expect_calls p15-d fake "converge-guard prepare --validate --holder h1 --json" 1
+expect_calls p15-d fake "converge-guard prepare --holder h1 --json --no-change" 1
+expect_calls p15-d fake "converge-guard settle --holder h1 --token" 1
+grep -q "^uid=$me$" "$work/cases/p15-d/log" || fail "p15-d: the calls did not run as the agent's account"
 expect_calls p15-d timeout "" 0
-grep -q "ASYNC" "$work/cases/p15-d/out" || fail "p15-d: the darwin hold did not run under the task's async bound" "$work/cases/p15-d/out"
-plant p15-e
-run_case p15-e unescalated BILLET_FAKE_MANAGED_HANG=1 -- -e billet_exclusion_platform=Darwin -e billet_guard_timeout=1
-expect_refused p15-e "Judge the claim's status" "did not answer within the bound"
-plant p15-e2
-write_guard p15-e2 h1 "$work/cases/p15-e2/bin/billet"
-run_case p15-e2 unescalated BILLET_FAKE_MANAGED_HOLD_HANG=1 -- -e billet_exclusion_platform=Darwin -e billet_guard_timeout=1
-[ "$status" -ne 0 ] || fail "p15-e2: a hung darwin hold was not bounded" "$work/cases/p15-e2/out"
-[ "$(failed_at p15-e2)" = "Hold this host for the converge" ] || fail "p15-e2: the hung hold failed elsewhere: $(failed_at p15-e2)" "$work/cases/p15-e2/out"
-plant p15-f
-run_case p15-f unescalated -- -e billet_exclusion_platform=Darwin -e billet_binary_src="$work/cases/p15-f/src/billet" -e billet_recovery_dir_suffix_command="$fakes/suffix"
+grep -q "ASYNC" "$work/cases/p15-d/out" || fail "p15-d: the darwin calls did not run under the task's async bound" "$work/cases/p15-d/out"
+plant_plain p15-e
+run_plain p15-e BILLET_FAKE_HANG=1 -- -e billet_exclusion_platform=Darwin -e billet_guard_timeout=1
+expect_refused p15-e "Refuse a preparation that did not answer" "ended by the bound"
+plant_plain p15-f
+run_plain p15-f -- -e billet_exclusion_platform=Darwin -e billet_binary_src="$work/cases/p15-f/src/billet" -e billet_recovery_dir_suffix_command="$fakes/suffix"
 expect_allowed p15-f
 expect_calls p15-f suffix "" 0
-expect_calls p15-f candidate "" 0
-marker_absent p15-f
-expect_calls p15-f managed "converge-guard hold --holder h1" 1
-expect_calls p15-f managed "--candidate" 0
-plant p15-g
-run_case p15-g unescalated -- -e billet_exclusion_platform=Darwin -e billet_gate_inclusions=2 -e "$(json_var billet_gate_between "rm -rf $work/cases/p15-g/lib $work/cases/p15-g/bin/billet")"
-expect_refused p15-g "Refuse a converge whose exclusion moved" "as h1" "absent"
-expect_calls p15-g managed "converge-guard hold" 1
-echo "ok   P15: a Mac classifies and holds as the agent's account, bounded, stages nothing, and a pristine Mac holds nothing unless this run already held it"
+expect_calls p15-f fake "--candidate" 0
+# C12: a simulated Mac acquires, the second answer is corrupted, the cleanup
+# runs unescalated with no `timeout` and the async bound, and releases.
+plant_plain p15-h
+mkdir -p "$work/cases/p15-h/lib/billet/upgrades/active"
+run_plain p15-h BILLET_FAKE_PREPARE2="$work/corpus/no-change-outcome.json" -- -e billet_exclusion_platform=Darwin
+expect_refused p15-h "Judge the preparation's answer" "outcome"
+expect_final p15-h "the cleanup released the guard" "is now none"
+expect_calls p15-h fake "converge-guard release --holder h1 --cleanup --token" 1
+expect_calls p15-h timeout "" 0
+expect_fact p15-h released True
+[ ! -e "$work/cases/p15-h/lib/billet/upgrades/active" ] || fail "p15-h: the guard remains after the darwin cleanup"
+plant_plain p15-h2
+mkdir -p "$work/cases/p15-h2/lib/billet/upgrades/active"
+run_plain p15-h2 BILLET_FAKE_PREPARE2="$work/corpus/no-change-outcome.json" BILLET_FAKE_RELEASE_HANG=1 -- -e billet_exclusion_platform=Darwin -e billet_guard_timeout=1
+expect_refused p15-h2 "Judge the preparation's answer" "outcome"
+expect_final p15-h2 "ended by its bound"
+expect_fact p15-h2 released False
+echo "ok   P15: a Mac calls prepare as the agent's account under the async bound, stages nothing, takes the no-billet path, and cleans up without timeout"
 
-# P17. The root established on a fresh Linux host; an unsafe existing root refuses.
-plant p17-fresh
-rm -rf "$work/cases/p17-fresh/lib" "$work/cases/p17-fresh/bin/billet"
-run_case p17-fresh escalated -- -e billet_binary_src="$work/cases/p17-fresh/src/billet"
-expect_allowed p17-fresh
-[ "$(rd stat -c %a:%u "$work/cases/p17-fresh/lib/billet")" = "755:0" ] || fail "p17-fresh: the parent is not 0755 root"
-[ "$(rd stat -c %a:%u "$(root_of p17-fresh)")" = "700:0" ] || fail "p17-fresh: the root is not 0700 root"
-expect_calls p17-fresh candidate "converge-guard hold --holder h1 --candidate" 1
-expect_task p17-fresh "Flush the upgrade root's parent"
-p17_unsafe() { # id plant-command fragment
-  plant "p17-$1"
-  as_root chown -R root:root "$work/cases/p17-$1/lib"
-  (cd "$work/cases/p17-$1/lib/billet" && eval "$2")
-  KEEP_OWNER=1; run_case "p17-$1" escalated -- -e billet_binary_src="$work/cases/p17-$1/src/billet"; KEEP_OWNER=0
-  expect_refused "p17-$1" "Refuse an upgrade root that is not what the role makes" "$3"
-  expect_calls "p17-$1" suffix "" 0
-}
-p17_unsafe symlink 'sudo -n rmdir upgrades; sudo -n mkdir elsewhere; sudo -n ln -s elsewhere upgrades' "a symlink"
-p17_unsafe file 'sudo -n rmdir upgrades; sudo -n touch upgrades' "not a directory"
-p17_unsafe owner 'sudo -n chown 1000 upgrades' "owned by uid 1000"
-p17_unsafe group-writable 'sudo -n chmod 0770 upgrades' "writable by its group or by others"
-# THE CHAIN ABOVE THE ROOT: an ancestor another account can rename refuses
-# before anything is allocated, staged, executed or held.
-plant p17-ancestor
-CASE_DIR_MODE=0775; run_case p17-ancestor escalated -- -e billet_binary_src="$work/cases/p17-ancestor/src/billet" -e billet_recovery_dir_suffix_command="$fakes/suffix"; CASE_DIR_MODE=0755
-expect_refused p17-ancestor "Refuse an upgrade root whose ancestors another account can rename" "writable by group or others without the sticky bit"
-expect_calls p17-ancestor suffix "" 0
-marker_absent p17-ancestor
-log_empty p17-ancestor
-plant p17-ancestor-fresh
-rm -rf "$work/cases/p17-ancestor-fresh/lib"
-CASE_DIR_MODE=0775; run_case p17-ancestor-fresh escalated -- -e billet_binary_src="$work/cases/p17-ancestor-fresh/src/billet" -e billet_recovery_dir_suffix_command="$fakes/suffix"; CASE_DIR_MODE=0755
-expect_refused p17-ancestor-fresh "Refuse an upgrade root whose ancestors another account can rename" "writable by group or others without the sticky bit"
-[ ! -e "$work/cases/p17-ancestor-fresh/lib" ] || fail "p17-ancestor-fresh: the root's parent was made under an unsafe ancestor"
-expect_no_task p17-ancestor-fresh "Establish the upgrade root's parent"
-log_empty p17-ancestor-fresh
-plant p17-module-error
-run_case p17-module-error escalated -- -e billet_upgrade_root=relative/upgrades -e billet_binary_src="$work/cases/p17-module-error/src/billet"
-expect_refused p17-module-error "Refuse an upgrade root whose ancestors another account can rename" "not an absolute path"
-log_empty p17-module-error
-plant p17-ancestor-sticky
-rm -rf "$work/cases/p17-ancestor-sticky/lib"
-CASE_DIR_MODE=1777; run_case p17-ancestor-sticky escalated -- -e billet_binary_src="$work/cases/p17-ancestor-sticky/src/billet" -e billet_recovery_dir_suffix_command="$fakes/suffix"; CASE_DIR_MODE=0755
-expect_refused p17-ancestor-sticky "Refuse an upgrade root whose ancestors another account can rename" "is absent under" "writable by group or others, so another account could create it"
-[ ! -e "$work/cases/p17-ancestor-sticky/lib" ] || fail "p17-ancestor-sticky: the root's parent was made under a sticky world-writable ancestor"
-expect_no_task p17-ancestor-sticky "Establish the upgrade root's parent"
-log_empty p17-ancestor-sticky
-echo "ok   P17: the root is established 0755/0700 root on a fresh host, an unsafe one refuses before any allocation, and so does an unsafe ancestor, before the parent is made, an absent parent under a sticky directory, and a judgement that did not complete"
-
-# P18. THE MANAGED BINARY APPEARS between the preparation's inspection and the
-# claim's: an updater that finished and released its claim in that window.
-# The preparation saw no binary and asked nothing for the guard's status; the
-# staging sees one and refuses rather than converging unheld beside it.
-plant p18-appeared
-mv "$work/cases/p18-appeared/bin/billet" "$work/cases/p18-appeared/bin/billet.aside"
-rm -rf "$(root_of p18-appeared)"
-run_case p18-appeared escalated BILLET_FAKE_SYNC_RESTORE="$work/cases/p18-appeared/bin/billet.aside" BILLET_FAKE_SYNC_RESTORE_TO="$work/cases/p18-appeared/bin/billet" --
-expect_refused p18-appeared "Refuse a converge whose managed binary appeared or vanished before the staging" "appeared between the preparation's inspection and this staging"
-expect_task p18-appeared "Flush the upgrade root's parent"
-[ -e "$work/cases/p18-appeared/bin/billet" ] || fail "p18-appeared: the binary was never put back, so the case staged nothing"
-! grep -q 'converge-guard' "$work/cases/p18-appeared/log" || fail "p18-appeared: the managed binary was asked or held" "$work/cases/p18-appeared/log"
-expect_no_task p18-appeared "Hold this host for the converge"
-marker_absent p18-appeared
-echo "ok   P18: a managed binary that appears between the preparation's inspection and the claim's refuses the converge before anything is staged or held"
+if [ "$have_root" = 0 ]; then
+  if [ "${BILLET_GATE_REQUIRE_ROOT:-0}" = 1 ]; then
+    fail "BILLET_GATE_REQUIRE_ROOT=1 and sudo -n is not available; the namespace cases cannot run"
+  fi
+  echo "converge guard: the guard's and the darwin cases pass; the namespace cases were skipped (no sudo -n)"
+  exit 0
+fi
+if [ "$(uname -s)" != Linux ]; then
+  if [ "${BILLET_GATE_REQUIRE_ROOT:-0}" = 1 ]; then
+    fail "BILLET_GATE_REQUIRE_ROOT=1 on $(uname -s); the namespace cases need Linux"
+  fi
+  echo "converge guard: the guard's and the darwin cases pass; the namespace cases need Linux and were skipped"
+  exit 0
+fi
+if ! command -v go >/dev/null 2>&1; then
+  if [ "${BILLET_GATE_REQUIRE_ROOT:-0}" = 1 ]; then fail "no go on PATH; the backing binaries cannot be built"; fi
+  echo "converge guard: no go on PATH; the namespace cases were skipped"
+  exit 0
+fi
+invoker_uid=$(id -u); invoker_gid=$(id -g)
+[ "$invoker_uid" != 0 ] || fail "the gate must be invoked as a non-root account (its unescalated cases run as the invoker)"
 
 # =============================================================================
-# S. The staging.
+# THE BACKING BINARIES, built once from this checkout, and their wrappers.
 # =============================================================================
+echo "building the backing binaries ..."
+for v in v0.10.0 v0.10.1 v0.9.0; do
+  (cd "$repo_root" && go build -tags billetgatecrash -ldflags "-X github.com/junioryono/billet/internal/version.version=$v" -o "$bins/billet-$v" ./cmd/billet)
+done
+for v in v0.10.0 v0.10.1 v0.9.0; do
+  write_wrapper "$bins/wrap-managed-$v" "$mnt/bin/billet-$v" managed
+  write_wrapper "$bins/wrap-candidate-$v" "$mnt/bin/billet-$v" candidate
+done
+# A candidate that carries the pre-R fake's bytes: the floor's case.
+cp "$fakes/billet-pre-r-other" "$bins/wrap-candidate-pre-r"
 
-# A fake release origin for the pinned and channel cases: the candidate in a
-# release-shaped archive with its checksums.txt, and a channel statement.
+# A FAKE RELEASE ORIGIN for the pinned cases: v0.10.1's archive with its
+# checksums.txt holds the candidate wrapper; v0.10.2 is not published.
 origin=$work/origin
-mkdir -p "$origin/v0.10.0"
+mkdir -p "$origin/v0.10.1"
 arch=$(uname -m); case $arch in x86_64) rel_arch=amd64 ;; aarch64|arm64) rel_arch=arm64 ;; *) rel_arch=$arch ;; esac
-(cd "$fakes" && cp billet-candidate billet && tar -czf "$origin/v0.10.0/billet_0.10.0_linux_${rel_arch}.tar.gz" billet && rm -f billet)
-(cd "$origin/v0.10.0" && sha256sum "billet_0.10.0_linux_${rel_arch}.tar.gz" >checksums.txt)
-printf '{"tag": "v0.10.0"}\n' >"$origin/stable.json"
-printf '{"tag": "latest"}\n' >"$origin/moving.json"
+(cd "$bins" && cp wrap-candidate-v0.10.1 billet && tar -czf "$origin/v0.10.1/billet_0.10.1_linux_${rel_arch}.tar.gz" billet && rm -f billet)
+(cd "$origin/v0.10.1" && sha256sum "billet_0.10.1_linux_${rel_arch}.tar.gz" >checksums.txt)
 "$python" -u -m http.server --bind 127.0.0.1 --directory "$origin" 0 >"$work/origin.log" 2>&1 &
 origin_pid=$!
-cleanup() { kill "$origin_pid" 2>/dev/null || true; rd rm -rf "$work"; }
 port=""
 for _ in $(seq 1 100); do
   port=$(sed -n 's/.*port \([0-9]*\).*/\1/p' "$work/origin.log" | head -1)
@@ -1282,259 +768,940 @@ done
 [ -n "$port" ] || fail "the fake release origin did not start" "$work/origin.log"
 origin_url="http://127.0.0.1:$port"
 
-# S1. A pin with a differing digest: staged, asked as the staged copy, held through it, in order.
-plant s1
-run_case s1 escalated -- -e billet_gate_facts=true -e billet_version=v0.10.0 -e billet_release_url_base="$origin_url" -e billet_release_stage="$work/cases/s1/stage" -e billet_fetch_retries=1 -e billet_recovery_dir_suffix_command="$fakes/suffix"
-expect_allowed s1
-expect_fact s1 upgrade True
-journal=$(fact s1 recovery)
-[ "$(rd stat -c %a:%u "$journal")" = "700:0" ] || fail "s1: the recovery directory is not 0700 root: $journal"
-[ "$(sha "$journal/billet.candidate")" = "$(sha "$fakes/billet-candidate")" ] || fail "s1: the staged candidate is not the release's"
-expect_calls s1 candidate "version @$journal/billet.candidate" 1
-expect_calls s1 candidate "converge-guard status --json @$journal/billet.candidate" 1
-expect_calls s1 candidate "converge-guard hold --holder h1 --candidate $journal/billet.candidate @$journal/billet.candidate" 1
-order=$(calls s1 | grep -v '^timeout\|^mkdir\|^date' | awk -F'[: ]' '{print $1 ":" $3}' | tr '\n' ' ')
-[ "$order" = "managed:converge-guard suffix: managed:version candidate:version candidate:converge-guard candidate:converge-guard managed:version " ] || fail "s1: the order is not status, allocation, versions, capability, hold, the release re-read: $order" "$work/cases/s1/log"
-expect_calls s1 systemctl "" 0
-echo "ok   S1: a pinned release is staged into an exclusive journal and asked, proved and held as the staged copy, in order"
-
-# S2. A candidate whose digest equals the managed binary's changes nothing.
-plant s2
-cp "$work/cases/s2/bin/billet" "$work/cases/s2/src/billet"
-run_case s2 escalated -- -e billet_binary_src="$work/cases/s2/src/billet" -e billet_recovery_dir_suffix_command="$fakes/suffix"
-expect_allowed s2
-expect_fact s2 upgrade False
-expect_calls s2 suffix "" 0
-expect_calls s2 managed "converge-guard hold --holder h1" 1
-expect_calls s2 managed "--candidate" 0
-echo "ok   S2: an unchanged binary stages nothing and holds through the managed binary"
-
-# S3. The allocator, driven directly.
-s3_run() { # case [env...] -- [extra args]
-  local name=$1; shift
-  local envs=()
-  while [ "$1" != -- ]; do envs+=("$1"); shift; done
-  shift
-  run_case "$name" escalated "${envs[@]+"${envs[@]}"}" -- -e billet_gate_entry=allocate-recovery -e billet_exclusion_root="$(root_of "$name")" -e billet_exclusion_become=false "$@"
+# =============================================================================
+# THE NAMESPACE RUNNER. A case is a directory holding plant.sh (run inside the
+# namespace as root before the play), env (one NAME=value per line, given to
+# the play), args (the play's arguments, one per line), and optionally post.sh
+# (run inside the namespace as root after the play, its output to `post`).
+# After the play the namespace dumps the tree's state to `state` and copies
+# the two upper directories out for diagnosis.
+# =============================================================================
+cat >"$work/ns-lib.sh" <<'LIB'
+# Sourced inside the namespace by plant and post scripts: the tree at its real paths.
+ROOT=/var/lib/billet/upgrades
+plant_root() { mkdir -p /var/lib/billet; chmod 0755 /var/lib/billet; chown root:root /var/lib/billet; mkdir -p "$ROOT"; chmod 0700 "$ROOT"; chown root:root "$ROOT"; }
+plant_managed() { cp "$BINS/wrap-managed-${1:-v0.10.0}" /usr/bin/billet; chmod 0755 /usr/bin/billet; chown root:root /usr/bin/billet; }
+plant_managed_file() { cp "$1" /usr/bin/billet; chmod 0755 /usr/bin/billet; chown root:root /usr/bin/billet; }
+plant_pre_r() { plant_managed_file "$FAKES/billet-pre-r"; }
+plant_recovery() { mkdir -p "$ROOT/$1"; chmod 0700 "$ROOT/$1"; cp "$BINS/wrap-candidate-${2:-v0.10.1}" "$ROOT/$1/billet.candidate"; chmod 0755 "$ROOT/$1/billet.candidate"; }
+# plant_guard HOLDER EXE [settled|preparing|legacy] [ID]
+plant_guard() {
+  mkdir -p "$ROOT/active"; chmod 0700 "$ROOT/active"
+  "$PYTHON" - "$1" "$2" "${3:-settled}" "${4:-}" "$ROOT" <<'PY'
+import hashlib, json, os, sys
+holder, exe, mode, ident, root = sys.argv[1:6]
+digest = hashlib.sha256(open(exe, "rb").read()).hexdigest()
+rec = {"holder": holder, "claimed_at": "2026-09-09T12:00:00Z", "hostname": "billet-control-01",
+       "release_executable": exe, "release_executable_sha256": digest}
+if mode != "legacy":
+    rec["id"] = ident or "0123456789abcdef0123456789abcdef"
+    if mode == "preparing":
+        rec["preparing"] = True
+        rec["token"] = "fedcba9876543210fedcba9876543210"
+with open(root + "/active/guard.json", "w") as f:
+    json.dump(rec, f, indent=2); f.write("\n")
+os.chmod(root + "/active/guard.json", 0o600)
+PY
 }
-plant s3-a0
-s3_run s3-a0 --
-expect_allowed s3-a0
-root_ls s3-a0 | grep -Eq '^recovery-[0-9]{8}T[0-9]{6}-[0-9a-f]{8}$' || fail "s3-a0: the default generator did not produce one recovery directory: $(root_ls s3-a0)"
-[ "$(root_ls s3-a0 | wc -l)" -eq 1 ] || fail "s3-a0: more than one directory was allocated"
-plant s3-a
-s3_run s3-a BILLET_FAKE_DATE_MODE=frozen -- -e billet_recovery_dir_suffix_command="$fakes/suffix"
-expect_allowed s3-a
-expect_calls s3-a date "-u +%Y%m%dT%H%M%S" 1
-expect_calls s3-a suffix "" 1
-root_ls s3-a | grep -Eq '^recovery-20260909T120000-[0-9a-f]{8}$' || fail "s3-a: no directory under the frozen stamp: $(root_ls s3-a)"
-plant s3-a1-fail
-s3_run s3-a1-fail BILLET_FAKE_DATE_MODE=fail -- -e billet_recovery_dir_suffix_command="$fakes/suffix"
-expect_refused s3-a1-fail "Allocate a recovery directory exclusively" "the stamp could not be drawn"
-expect_calls s3-a1-fail mkdir "" 0
-plant s3-a1-short
-s3_run s3-a1-short BILLET_FAKE_DATE_MODE=short -- -e billet_recovery_dir_suffix_command="$fakes/suffix"
-expect_refused s3-a1-short "Allocate a recovery directory exclusively" "is not <YYYYMMDD>T<HHMMSS>"
-expect_calls s3-a1-short mkdir "" 0
-# (b) two stagers through stage-candidate.yml, one draw sequence shared.
-plant s3-b
-printf '0badcafe\n0badcafe\n1badcafe\n' >"$work/cases/s3-b/suffixes"
-{ cat "$fakes/billet-candidate"; echo "# candidate B"; } >"$work/cases/s3-b/src/other"; chmod 0755 "$work/cases/s3-b/src/other"
-# THE BOOLEANS AS JSON: a `-e name=false` is the string "false", which Jinja
-# reads as true in `not billet_interrupted_upgrade`.
-s3b_json='{"billet_exclusion_become": false, "billet_exclusion_darwin": false, "billet_interrupted_upgrade": false, "billet_exclusion_managed_pre_r": false, "billet_exclusion_binary_present": true, "billet_upgrade_claim_shape": "none", "billet_resolved_version": ""}'
-s3b_args="-e billet_gate_entry=stage-candidate -e billet_exclusion_root=$(root_of s3-b) -e billet_exclusion_binary=$work/cases/s3-b/bin/billet -e billet_recovery_dir_suffix_command=$fakes/suffix"
-# shellcheck disable=SC2086
-run_case s3-b escalated BILLET_FAKE_DATE_MODE=frozen BILLET_FAKE_SUFFIXES="$work/cases/s3-b/suffixes" -- $s3b_args -e "$s3b_json" -e billet_binary_src="$work/cases/s3-b/src/billet"
-expect_allowed s3-b
-first=$(root_of s3-b)/recovery-20260909T120000-0badcafe
-[ "$(fact s3-b recovery)" = "$first" ] || fail "s3-b: the first stager did not land in 0badcafe: $(fact s3-b recovery)" "$work/cases/s3-b/out"
-[ "$(sha "$first/billet.candidate")" = "$(sha "$work/cases/s3-b/src/billet")" ] || fail "s3-b: the first stager's candidate is not A"
-first_mtime=$(rd stat -c %Y "$first/billet.candidate")
-rd mv "$work/cases/s3-b/log" "$work/cases/s3-b/log.first"
-# shellcheck disable=SC2086
-run_case s3-b escalated BILLET_FAKE_DATE_MODE=frozen BILLET_FAKE_SUFFIXES="$work/cases/s3-b/suffixes" -- $s3b_args -e "$s3b_json" -e billet_binary_src="$work/cases/s3-b/src/other"
-expect_allowed s3-b
-second=$(root_of s3-b)/recovery-20260909T120000-1badcafe
-[ "$(fact s3-b recovery)" = "$second" ] || fail "s3-b: the second stager did not land in 1badcafe: $(fact s3-b recovery)" "$work/cases/s3-b/out"
-[ "$(sha "$second/billet.candidate")" = "$(sha "$work/cases/s3-b/src/other")" ] || fail "s3-b: the second stager's candidate is not B"
-expect_calls s3-b suffix "" 2
-expect_calls s3-b mkdir "-m 0700 $first" 1
-expect_calls s3-b mkdir "-m 0700 $second" 1
-[ "$(sha "$first/billet.candidate")" = "$(sha "$work/cases/s3-b/src/billet")" ] || fail "s3-b: the loser's write changed the winner's candidate"
-[ "$(rd stat -c %Y "$first/billet.candidate")" = "$first_mtime" ] || fail "s3-b: the winner's candidate was touched by the loser"
-[ ! -s "$work/cases/s3-b/suffixes" ] || fail "s3-b: the draw sequence was not consumed: $(cat "$work/cases/s3-b/suffixes")"
-# (c) a dangling symlink at the first name is a collision.
-plant s3-c
-printf '0badcafe\n1badcafe\n' >"$work/cases/s3-c/suffixes"
-ln -s "$work/cases/s3-c/nowhere" "$(root_of s3-c)/recovery-20260909T120000-0badcafe"
-s3_run s3-c BILLET_FAKE_DATE_MODE=frozen BILLET_FAKE_SUFFIXES="$work/cases/s3-c/suffixes" -- -e billet_recovery_dir_suffix_command="$fakes/suffix"
-expect_allowed s3-c
-rd test -d "$(root_of s3-c)/recovery-20260909T120000-1badcafe" || fail "s3-c: a dangling symlink was not treated as a collision"
-expect_calls s3-c suffix "" 2
-# (d) a generator's bad output.
-for bad in "0badcaf" "0BADCAFE" ""; do
-  plant s3-d
-  printf '%s\n' "$bad" >"$work/cases/s3-d/suffixes"
-  s3_run s3-d BILLET_FAKE_DATE_MODE=frozen BILLET_FAKE_SUFFIXES="$work/cases/s3-d/suffixes" -- -e billet_recovery_dir_suffix_command="$fakes/suffix"
-  expect_refused s3-d "Allocate a recovery directory exclusively" "not eight lowercase hex digits"
-  expect_calls s3-d mkdir "" 0
+plant_pointer() { ln -sT "$ROOT/$1" "$ROOT/active/recovery"; }
+LIB
+
+cat >"$work/ns-run.sh" <<'NSRUN'
+#!/bin/bash
+# Inside the namespace, as root: the mounts, the backing binaries, the plant,
+# the play, the post script, the state dump, the copy-out.
+set -u
+case_dir=$1; mode=$2; play=$3
+export BINS PYTHON FAKES ROOT=/var/lib/billet/upgrades
+mount -t tmpfs tmpfs "$MNT" || exit 90
+mkdir -p "$MNT/ub-upper" "$MNT/ub-work" "$MNT/vl-upper" "$MNT/vl-work" "$MNT/bin"
+mount -t overlay overlay -o "lowerdir=/usr/bin,upperdir=$MNT/ub-upper,workdir=$MNT/ub-work" /usr/bin || exit 91
+mount -t overlay overlay -o "lowerdir=/var/lib,upperdir=$MNT/vl-upper,workdir=$MNT/vl-work" /var/lib || exit 92
+cp "$BINS"/billet-v* "$MNT/bin/" && chmod 0755 "$MNT/bin"/* && chown root:root "$MNT/bin"/*
+rm -f /usr/bin/billet
+rm -rf /var/lib/billet
+. "$NSLIB"
+if [ -s "$case_dir/plant.sh" ]; then
+  if ! (set -e; . "$case_dir/plant.sh"); then echo "plant failed" >"$case_dir/state"; exit 94; fi
+fi
+: >"$case_dir/log"; : >"$case_dir/private"; : >"$case_dir/out"
+chown "$INVOKER_UID:$INVOKER_GID" "$case_dir/log" "$case_dir/private" "$case_dir/out"
+envs=(PATH="$FAKES:$PATH" ANSIBLE_COLLECTIONS_PATH="$COLLECTIONS" \
+  ANSIBLE_STDOUT_CALLBACK=default ANSIBLE_NOCOLOR=1 ANSIBLE_FORCE_COLOR=0 \
+  ANSIBLE_LOCAL_TEMP="$case_dir/tmp" ANSIBLE_REMOTE_TEMP="$case_dir/tmp" \
+  RUNNER_NAME="$RUNNER" BILLET_CONVERGE_GUARD_HOLDER="$HOLDER" \
+  BILLET_GATE_LOG="$case_dir/log" BILLET_GATE_PRIVATE="$case_dir/private")
+while IFS= read -r line; do [ -n "$line" ] && envs+=("$line"); done <"$case_dir/env"
+mapfile -t args <"$case_dir/args"
+mkdir -p "$case_dir/tmp"
+if [ "$mode" = escalated ]; then
+  env "${envs[@]}" HOME="$HOME_DIR" "$ANSIBLE_PLAYBOOK" -i "$INVENTORY" "$play" -e ansible_become=false -e billet_gate_expect_uid=0 "${args[@]+"${args[@]}"}" >"$case_dir/out" 2>&1
+else
+  chown -R "$INVOKER_UID:$INVOKER_GID" "$case_dir/tmp"
+  setpriv --reuid="$INVOKER_UID" --regid="$INVOKER_GID" --init-groups env "${envs[@]}" HOME="$HOME_DIR" "$ANSIBLE_PLAYBOOK" -i "$INVENTORY" "$play" -e ansible_become=false -e "billet_gate_expect_uid=$INVOKER_UID" "${args[@]+"${args[@]}"}" >"$case_dir/out" 2>&1
+fi
+echo "$?" >"$case_dir/status"
+if [ -s "$case_dir/post.sh" ]; then
+  (. "$case_dir/post.sh") >"$case_dir/post" 2>&1
+  echo "post=$?" >>"$case_dir/post"
+fi
+# THE STATE DUMP, read by the outer assertions.
+{
+  t() { if [ -L "$1" ]; then echo symlink; elif [ -d "$1" ]; then echo dir; elif [ -f "$1" ]; then echo file; elif [ -e "$1" ]; then echo other; else echo absent; fi; }
+  echo "managed=$(t /usr/bin/billet)"
+  echo "managed_sha=$( [ -f /usr/bin/billet ] && sha256sum /usr/bin/billet | cut -d' ' -f1 )"
+  echo "root=$(t $ROOT)"
+  echo "parent=$(t /var/lib/billet)"
+  echo "root_mode=$( [ -d $ROOT ] && stat -c %a:%u $ROOT )"
+  echo "parent_mode=$( [ -d /var/lib/billet ] && stat -c %a:%u /var/lib/billet )"
+  echo "active=$(t $ROOT/active)"
+  echo "record=$(t $ROOT/active/guard.json)"
+  echo "record_tmp=$(t $ROOT/active/guard.json.tmp)"
+  echo "pointer=$(t $ROOT/active/recovery)"
+  echo "entries=$( [ -d $ROOT ] && ls -A $ROOT | tr '\n' ' ' )"
+  echo "active_entries=$( [ -d $ROOT/active ] && ls -A $ROOT/active | tr '\n' ' ' )"
+  if [ -f $ROOT/active/guard.json ]; then
+    "$PYTHON" - <<'PY'
+import json
+r = json.load(open("/var/lib/billet/upgrades/active/guard.json"))
+for k in ("holder", "id", "release_executable", "release_executable_sha256", "claimed_at"):
+    print("record_%s=%s" % (k, r.get(k, "")))
+print("record_preparing=%s" % r.get("preparing", False))
+print("record_has_token=%s" % ("token" in r))
+PY
+  fi
+  for d in $ROOT/recovery-* $ROOT/[0-9]*; do
+    [ -d "$d" ] || continue
+    echo "recovery=$(basename "$d") $( [ -f "$d/billet.candidate" ] && sha256sum "$d/billet.candidate" | cut -d' ' -f1 )"
+  done
+  echo "status_json=$("$MNT/bin/billet-v0.10.0" converge-guard status --json 2>/dev/null | tr -d '\n ')"
+} >"$case_dir/state" 2>/dev/null
+mkdir -p "$case_dir/upper" && cp -a "$MNT/ub-upper" "$case_dir/upper/usr-bin" 2>/dev/null; cp -a "$MNT/vl-upper" "$case_dir/upper/var-lib" 2>/dev/null
+chown -R "$INVOKER_UID:$INVOKER_GID" "$case_dir" 2>/dev/null || true
+exit 0
+NSRUN
+chmod 0755 "$work/ns-run.sh"
+
+# plant CASE: start a case; p/e/a/post append plant lines, environment lines,
+# play arguments and post lines to it.
+plant() {
+  local case_dir=$work/cases/$1
+  rd rm -rf "$case_dir"
+  mkdir -p "$case_dir"
+  : >"$case_dir/plant.sh"; : >"$case_dir/env"; : >"$case_dir/args"; : >"$case_dir/post.sh"
+}
+p() { printf '%s\n' "$2" >>"$work/cases/$1/plant.sh"; }
+e() { printf '%s\n' "$2" >>"$work/cases/$1/env"; }
+a() { local name=$1; shift; for x in "$@"; do printf '%s\n' "$x" >>"$work/cases/$name/args"; done; }
+post() { printf '%s\n' "$2" >>"$work/cases/$1/post.sh"; }
+# ns_case CASE MODE [PLAY]: MODE escalated (the play runs as root) or
+# unescalated (as the invoker); PLAY play (default) or play2.
+ns_case() {
+  local name=$1 mode=$2 play=${3:-play}
+  local case_dir=$work/cases/$name
+  sudo -n env BINS="$bins" FAKES="$fakes" PYTHON="$python" NSLIB="$work/ns-lib.sh" HOME_DIR="$HOME" MNT="$mnt" \
+    COLLECTIONS="$collections_path" RUNNER="$RUNNER" HOLDER="$HOLDER" INVOKER_UID="$invoker_uid" INVOKER_GID="$invoker_gid" \
+    ANSIBLE_PLAYBOOK="$ansible_playbook" INVENTORY="$work/inventory.ini" \
+    unshare -m --propagation private /bin/bash "$work/ns-run.sh" "$case_dir" "$mode" "$work/$play.yml"
+  local rc=$?
+  [ "$rc" -eq 0 ] || fail "$name: the namespace runner failed ($rc): $(cat "$case_dir/state" 2>/dev/null)"
+  status=$(cat "$case_dir/status")
+  check_sentinel "$name"
+  check_hook "$name"
+}
+
+# =============================================================================
+# M8: the namespace launch is proved before it is relied on.
+# =============================================================================
+plant launch
+p launch 'plant_root; plant_managed v0.10.0'
+HOLDER=from-the-environment ns_case launch escalated probe; HOLDER=h1
+[ "$status" -eq 0 ] || fail "M8: the probe play failed" "$work/cases/launch/out"
+grep -q '^uid=0$' "$work/cases/launch/log" || fail "M8: the wrapper did not run as root under become" "$work/cases/launch/log"
+grep -q 'argv0=/usr/bin/billet' "$work/cases/launch/log" || fail "M8: the managed wrapper is not at /usr/bin/billet" "$work/cases/launch/log"
+grep -q 'billet v0.10.0' "$work/cases/launch/private" || fail "M8: the backing binary did not answer version v0.10.0" "$work/cases/launch/private"
+grep -qF "GATE holder=from-the-environment" "$work/cases/launch/out" || fail "M8: the role default did not resolve the holder from the environment" "$work/cases/launch/out"
+expect_state launch managed file
+[ ! -e /usr/bin/billet ] || fail "M8: /usr/bin/billet leaked outside the namespace"
+[ ! -e /var/lib/billet ] || fail "M8: /var/lib/billet leaked outside the namespace"
+echo "ok   M8: the namespace launch runs the managed wrapper as root at its real path, resolves the holder from the environment, and leaks nothing"
+
+ROOT=/var/lib/billet/upgrades
+REC_A=recovery-20260909T120000-0badcafe
+REC_B=recovery-20260909T120000-1badcafe
+LEGACY_DIR=20260909T120000000000000
+
+# =============================================================================
+# B. The role's order and its routes.
+# =============================================================================
+# B1. A capable host, a candidate with a differing digest: acquired, staged,
+# re-bound to the candidate, settled; the role reads no version or status of
+# its own.
+plant b1-first
+p b1-first 'plant_root; plant_managed v0.10.0'
+a b1-first -e "billet_binary_src=$bins/wrap-candidate-v0.10.1"
+ns_case b1-first escalated
+expect_allowed b1-first
+expect_fact b1-first acquired True
+expect_fact b1-first held True
+expect_fact b1-first upgrade True
+expect_fact b1-first route managed
+expect_calls b1-first managed "converge-guard prepare --validate --holder h1 --json" 1
+expect_calls b1-first managed "converge-guard prepare --holder h1 --json --candidate $(fact b1-first recovery)/billet.candidate" 1
+expect_calls b1-first managed "converge-guard settle --holder h1 --token" 1
+expect_calls b1-first managed "converge-guard hold" 0
+expect_calls b1-first candidate "converge-guard status --json" 1
+expect_no_task b1-first "Read the installed and candidate releases"
+expect_no_task b1-first "Ask the candidate whether it can take part in the exclusion"
+expect_no_task b1-first "Hold this host for the converge"
+# THE ORDER of the binaries' invocations, as role and command: the first
+# call (which reads the managed binary's version to record it), the second
+# call (which reads the managed version and probes the candidate under the
+# lock, before any re-binding), the settlement.
+order=$(commands b1-first | tr '\n' ';')
+[ "$order" = "managed prepare;managed version;managed prepare;managed version;candidate status;candidate version;managed settle;" ] \
+  || fail "b1-first: the order of the calls is not validate, the second call with the candidate's probes under the lock, settle: $order" "$work/cases/b1-first/log"
+expect_state b1-first record_release_executable "$(fact b1-first recovery)/billet.candidate"
+expect_state b1-first record_preparing False
+expect_state b1-first record_holder h1
+expect_state b1-first pointer absent
+[ "$(state b1-first record_id)" = "$(fact b1-first id)" ] || fail "b1-first: the record's id is not the fact's"
+[ "$(backing_runs b1-first prepare)" -eq 2 ] || fail "b1-first: the backing binary ran prepare $(backing_runs b1-first prepare) times, want 2"
+expect_calls b1-first systemctl "" 0
+echo "ok   B1: a candidate is acquired over, staged, re-bound and settled in order, and the role asks nothing of its own"
+
+# B2. No change: acquired, nothing staged, --no-change validated, settled.
+plant b2-unchanged
+p b2-unchanged 'plant_root; plant_managed v0.10.0'
+ns_case b2-unchanged escalated
+expect_allowed b2-unchanged
+expect_fact b2-unchanged acquired True
+expect_fact b2-unchanged upgrade False
+expect_calls b2-unchanged managed "converge-guard prepare --holder h1 --json --no-change" 1
+expect_calls b2-unchanged managed "converge-guard settle --holder h1 --token" 1
+expect_calls b2-unchanged suffix "" 0
+expect_no_task b2-unchanged "Allocate a recovery directory exclusively"
+expect_state b2-unchanged record_release_executable /usr/bin/billet
+expect_state b2-unchanged record_preparing False
+echo "ok   B2: a converge with no binary change acquires, declares no change and settles"
+
+# B3. A bootstrap: no billet, no root; the root established, the staging
+# first, then the candidate acquires with the bootstrap's premise.
+plant b3-bootstrap
+a b3-bootstrap -e "billet_binary_src=$bins/wrap-candidate-v0.10.1"
+ns_case b3-bootstrap escalated
+expect_allowed b3-bootstrap
+expect_fact b3-bootstrap route candidate
+expect_fact b3-bootstrap acquired True
+rec=$(fact b3-bootstrap recovery)
+expect_calls b3-bootstrap candidate "converge-guard prepare --validate --holder h1 --candidate $rec/billet.candidate --json --expect-bootstrap" 1
+expect_calls b3-bootstrap candidate "converge-guard prepare --holder h1 --json --candidate $rec/billet.candidate" 1
+expect_calls b3-bootstrap candidate "converge-guard settle --holder h1 --token" 1
+expect_calls b3-bootstrap managed "" 0
+expect_state b3-bootstrap managed absent
+expect_state b3-bootstrap root_mode 700:0
+expect_state b3-bootstrap parent_mode 755:0
+expect_state b3-bootstrap record_release_executable "$rec/billet.candidate"
+expect_state b3-bootstrap record_preparing False
+# B3b. A managed binary placed before the first call refuses the premise.
+plant b3b-gained
+a b3b-gained -e "billet_binary_src=$bins/wrap-candidate-v0.10.1"
+e b3b-gained "BILLET_GATE_HOOK=prepare:1:cp $bins/wrap-managed-v0.10.0 /usr/bin/billet.new; chmod 0755 /usr/bin/billet.new; mv -f /usr/bin/billet.new /usr/bin/billet"
+ns_case b3b-gained escalated
+expect_refused b3b-gained "Refuse the preparation's answer" "bootstrap"
+expect_fact b3b-gained acquired False
+expect_state b3b-gained active absent
+expect_final b3b-gained "no cleanup was attempted"
+# B3c. A stray regular file under the root refuses; a legacy stamp directory is admitted.
+plant b3c-stray
+p b3c-stray "plant_root; touch $ROOT/stray-file"
+a b3c-stray -e "billet_binary_src=$bins/wrap-candidate-v0.10.1"
+ns_case b3c-stray escalated
+expect_refused b3c-stray "Refuse the preparation's answer" "bootstrap" "stray-file"
+expect_state b3c-stray active absent
+plant b3c-legacy-dir
+p b3c-legacy-dir "plant_root; mkdir -m 0700 $ROOT/$LEGACY_DIR"
+a b3c-legacy-dir -e "billet_binary_src=$bins/wrap-candidate-v0.10.1"
+ns_case b3c-legacy-dir escalated
+expect_allowed b3c-legacy-dir
+expect_fact b3c-legacy-dir acquired True
+echo "ok   B3: a bootstrap establishes the root, stages first and acquires through the candidate under its premise"
+
+# B4. A pre-R managed binary with an R candidate: the candidate acquires (no
+# bootstrap premise); the second call judges the downgrade against the
+# managed binary as it is THEN.
+plant b4-pre-r-candidate
+p b4-pre-r-candidate 'plant_root; plant_pre_r'
+a b4-pre-r-candidate -e "billet_binary_src=$bins/wrap-candidate-v0.10.1"
+ns_case b4-pre-r-candidate escalated
+expect_allowed b4-pre-r-candidate
+expect_fact b4-pre-r-candidate route candidate
+rec=$(fact b4-pre-r-candidate recovery)
+expect_calls b4-pre-r-candidate candidate "converge-guard prepare --validate --holder h1 --candidate $rec/billet.candidate --json" 1
+expect_calls b4-pre-r-candidate candidate "--expect-bootstrap" 0
+expect_calls b4-pre-r-candidate pre-r "converge-guard prepare" 1
+expect_state b4-pre-r-candidate record_release_executable "$rec/billet.candidate"
+plant b4b-newer-managed
+p b4b-newer-managed 'plant_root; plant_pre_r'
+a b4b-newer-managed -e "billet_binary_src=$bins/wrap-candidate-v0.10.0"
+e b4b-newer-managed "BILLET_GATE_HOOK=prepare:3:cp $bins/wrap-managed-v0.10.1 /usr/bin/billet.new; chmod 0755 /usr/bin/billet.new; mv -f /usr/bin/billet.new /usr/bin/billet"
+ns_case b4b-newer-managed escalated
+expect_refused b4b-newer-managed "Refuse the preparation's answer" "downgrade"
+expect_final b4b-newer-managed "the cleanup released the guard" "is now none"
+expect_state b4b-newer-managed active absent
+plant b4c-older-managed
+p b4c-older-managed 'plant_root; plant_pre_r'
+a b4c-older-managed -e "billet_binary_src=$bins/wrap-candidate-v0.10.0"
+e b4c-older-managed "BILLET_GATE_HOOK=prepare:3:cp $bins/wrap-managed-v0.9.0 /usr/bin/billet.new; chmod 0755 /usr/bin/billet.new; mv -f /usr/bin/billet.new /usr/bin/billet"
+ns_case b4c-older-managed escalated
+expect_allowed b4c-older-managed
+plant b4d-allowed-downgrade
+p b4d-allowed-downgrade 'plant_root; plant_pre_r'
+a b4d-allowed-downgrade -e "billet_binary_src=$bins/wrap-candidate-v0.10.0" -e billet_allow_downgrade=true
+e b4d-allowed-downgrade "BILLET_GATE_HOOK=prepare:3:cp $bins/wrap-managed-v0.10.1 /usr/bin/billet.new; chmod 0755 /usr/bin/billet.new; mv -f /usr/bin/billet.new /usr/bin/billet"
+ns_case b4d-allowed-downgrade escalated
+expect_allowed b4d-allowed-downgrade
+expect_calls b4d-allowed-downgrade candidate "--allow-downgrade" 1
+echo "ok   B4: a pre-R host with a candidate acquires through it, and the downgrade is judged against the managed binary under the lock"
+
+# B5. No billet, nothing to install: no call, the closing re-stats, allowed
+# unheld; a binary or a guard that appears in between refuses.
+plant b5-no-billet
+ns_case b5-no-billet escalated
+expect_allowed b5-no-billet
+expect_fact b5-no-billet route unheld
+expect_fact b5-no-billet shape none
+expect_ran b5-no-billet "Inspect the managed binary and the claim again before an unheld converge"
+expect_calls b5-no-billet managed "" 0
+expect_calls b5-no-billet candidate "" 0
+expect_state b5-no-billet active absent
+expect_state b5-no-billet root dir
+plant b5b-appeared
+e b5b-appeared "BILLET_GATE_SYNC_HOOK=cp $bins/wrap-managed-v0.10.0 /usr/bin/billet.new; chmod 0755 /usr/bin/billet.new; mv -f /usr/bin/billet.new /usr/bin/billet"
+ns_case b5b-appeared escalated
+expect_refused b5b-appeared "Refuse a converge whose managed binary appeared" "is now present"
+expect_state b5b-appeared active absent
+plant b5c-dangling
+p b5c-dangling 'plant_root; ln -s /nonexistent/billet /usr/bin/billet'
+ns_case b5c-dangling escalated
+expect_refused b5c-dangling "Refuse a preparation that did not answer" "did not answer"
+expect_state b5c-dangling active absent
+plant b5d-guard-appeared
+e b5d-guard-appeared "BILLET_GATE_SYNC_HOOK=mkdir -m 0700 $ROOT/$REC_A && cp $bins/wrap-candidate-v0.10.1 $ROOT/$REC_A/billet.candidate && $mnt/bin/billet-v0.10.1 converge-guard prepare --validate --holder h2 --candidate $ROOT/$REC_A/billet.candidate --json >/dev/null"
+ns_case b5d-guard-appeared escalated
+# The flush precedes the claim's stat, so a guard published at the flush is
+# found by the stat and answered through the executable it records: refused
+# as another holder's, nothing acquired.
+expect_refused b5d-guard-appeared "Refuse the preparation's answer" "held by h2"
+expect_fact b5d-guard-appeared route fallback
+expect_fact b5d-guard-appeared acquired False
+expect_final b5d-guard-appeared "no cleanup was attempted"
+expect_state b5d-guard-appeared record_holder h2
+echo "ok   B5: a host with no billet converges unheld only while it still has none and no claim appeared"
+
+# B6. A pre-R managed binary and nothing to stage: the legacy protocol, no
+# call but the closing re-ask; a binary that moved or a guard that appeared
+# refuses.
+plant b6-pre-r-none
+p b6-pre-r-none 'plant_root; plant_pre_r'
+ns_case b6-pre-r-none escalated
+expect_allowed b6-pre-r-none
+expect_fact b6-pre-r-none shape legacy
+expect_fact b6-pre-r-none route pre-r
+grep -q "runs the legacy protocol" "$work/cases/b6-pre-r-none/out" || fail "b6: the legacy protocol was not warned about"
+expect_calls b6-pre-r-none pre-r "converge-guard prepare --validate" 1
+expect_calls b6-pre-r-none pre-r "converge-guard holder" 1
+expect_state b6-pre-r-none active absent
+plant b6b-moved
+p b6b-moved 'plant_root; plant_pre_r'
+e b6b-moved "BILLET_GATE_HOOK=prepare:1:cp $bins/wrap-managed-v0.10.0 /usr/bin/billet.new; chmod 0755 /usr/bin/billet.new; mv -f /usr/bin/billet.new /usr/bin/billet"
+ns_case b6b-moved escalated
+expect_refused b6b-moved "Refuse a converge whose managed binary moved" "an updater moved the managed binary"
+expect_state b6b-moved active absent
+plant b6c-equal-candidate
+p b6c-equal-candidate 'plant_root; plant_pre_r'
+a b6c-equal-candidate -e "billet_binary_src=$bins/wrap-managed-v0.10.0"
+e b6c-equal-candidate "BILLET_GATE_HOOK=prepare:1:cp $bins/wrap-managed-v0.10.0 /usr/bin/billet.new; chmod 0755 /usr/bin/billet.new; mv -f /usr/bin/billet.new /usr/bin/billet"
+ns_case b6c-equal-candidate escalated
+expect_refused b6c-equal-candidate "Refuse a converge whose managed binary moved" "an updater moved the managed binary"
+expect_fact b6c-equal-candidate upgrade False
+expect_calls b6c-equal-candidate suffix "" 0
+expect_state b6c-equal-candidate active absent
+plant b6d-guard-appeared
+p b6d-guard-appeared 'plant_root; plant_pre_r'
+e b6d-guard-appeared "BILLET_GATE_HOOK=prepare:1:$mnt/bin/billet-v0.10.0 converge-guard prepare --validate --holder h2 --json >/dev/null"
+ns_case b6d-guard-appeared escalated
+expect_refused b6d-guard-appeared "Refuse an unheld converge over a claim that appeared" "another converge holds this host"
+expect_state b6d-guard-appeared record_holder h2
+echo "ok   B6: a pre-R host runs the legacy protocol only while its binary still predates the guard and no claim appeared"
+
+# B7. Check mode: `prepare --dry-run` before any shape dispatch, no holder,
+# every shape reported, nothing held or made, then the read-only staging.
+check_case() { # name plant-line fragment...
+  local name=$1 plant_line=$2; shift 2
+  plant "$name"
+  p "$name" "$plant_line"
+  a "$name" --check
+  HOLDER=""; ns_case "$name" escalated; HOLDER=h1
+  expect_allowed "$name"
+  for frag in "$@"; do
+    grep -qF -- "$frag" "$work/cases/$name/out" || fail "$name: the dry run did not report: $frag" "$work/cases/$name/out"
+  done
+  expect_calls "$name" managed "converge-guard prepare --dry-run --json" 1
+  expect_calls "$name" managed "converge-guard prepare --validate" 0
+  expect_calls "$name" managed "converge-guard settle" 0
+  expect_no_task "$name" "Classify a legacy pointer"
+  expect_no_task "$name" "Refuse a converge whose exclusion moved"
+}
+check_case b7-none 'plant_root; plant_managed v0.10.0' "is none"
+expect_state b7-none active absent
+check_case b7-foreign "plant_root; plant_managed v0.10.0; plant_guard h2 /usr/bin/billet" "a guard held by h2 since 2026-09-09T12:00:00Z, settled"
+expect_state b7-foreign record_holder h2
+check_case b7-foreign-pointer "plant_root; plant_managed v0.10.0; plant_guard h2 /usr/bin/billet; mkdir -m 0700 $ROOT/$REC_A; plant_pointer $REC_A" "a guard held by h2" "with a transaction pointer inside it"
+check_case b7-own "plant_root; plant_managed v0.10.0; plant_guard h1 /usr/bin/billet preparing" "a guard held by h1" "preparing"
+expect_state b7-own record_preparing True
+check_case b7-legacy "plant_root; plant_managed v0.10.0; printf '%s\n' $ROOT/$LEGACY_DIR >$ROOT/active" "is legacy-role"
+expect_state b7-legacy active file
+check_case b7-go "plant_root; plant_managed v0.10.0; ln -s $ROOT/$LEGACY_DIR $ROOT/active" "is host-upgrade"
+expect_state b7-go active symlink
+check_case b7-unpublished "plant_root; plant_managed v0.10.0; mkdir -m 0700 $ROOT/active" "is unpublished-guard"
+expect_state b7-unpublished active dir
+# B7b. A pre-R managed binary: the capability refusal read as pre-R.
+plant b7b-pre-r
+p b7b-pre-r 'plant_root; plant_pre_r'
+a b7b-pre-r --check
+HOLDER=""; ns_case b7b-pre-r escalated; HOLDER=h1
+expect_allowed b7b-pre-r
+grep -qF "predates the converge guard (it answers" "$work/cases/b7b-pre-r/out" || fail "b7b: the dry run did not report the pre-R binary" "$work/cases/b7b-pre-r/out"
+expect_calls b7b-pre-r pre-r "converge-guard prepare --dry-run --json" 1
+# No billet: reported from the role's stat alone.
+plant b7c-absent
+a b7c-absent --check
+HOLDER=""; ns_case b7c-absent escalated; HOLDER=h1
+expect_allowed b7c-absent
+grep -qF "read from this role's stat alone" "$work/cases/b7c-absent/out" || fail "b7c: the dry run over no billet did not report from the stat" "$work/cases/b7c-absent/out"
+expect_state b7c-absent root absent
+# A corrupted dry-run answer refuses at the one parser.
+plant b7d-corrupt
+p b7d-corrupt 'plant_root; plant_managed v0.10.0'
+a b7d-corrupt --check
+printf '{"outcome": 7}\n' >"$work/cases/b7d-corrupt/dry.json"
+e b7d-corrupt "BILLET_GATE_ANSWER=prepare:1:$work/cases/b7d-corrupt/dry.json"
+HOLDER=""; ns_case b7d-corrupt escalated; HOLDER=h1
+expect_refused b7d-corrupt "Judge the dry run's answer" "outcome"
+# The read-only staging path after the report: a pin resolved and reported, a moving pin refused, nothing fetched or made.
+plant b7e-pinned
+p b7e-pinned 'plant_root; plant_managed v0.10.0'
+a b7e-pinned --check -e billet_gate_facts=true -e billet_version=v0.10.1 -e "billet_release_url_base=$origin_url" -e "billet_release_stage=$work/cases/b7e-pinned/stage" -e billet_fetch_retries=1
+HOLDER=""; ns_case b7e-pinned escalated; HOLDER=h1
+expect_allowed b7e-pinned
+expect_ran b7e-pinned "Report that a dry run does not fetch"
+expect_calls b7e-pinned suffix "" 0
+[ ! -e "$work/cases/b7e-pinned/stage" ] || fail "b7e: a dry run fetched"
+expect_state b7e-pinned active absent
+plant b7f-moving
+p b7f-moving 'plant_root; plant_managed v0.10.0'
+a b7f-moving --check -e billet_gate_facts=true -e billet_version=latest
+HOLDER=""; ns_case b7f-moving escalated; HOLDER=h1
+expect_refused b7f-moving "Refuse an unpinned billet version" "must name one release"
+expect_state b7f-moving active absent
+echo "ok   B7: a dry run reports every shape through prepare --dry-run before any dispatch, needs no holder, then takes the read-only staging path"
+
+# B8. The fallback: a pre-R or absent managed binary and a guard recording an
+# R candidate; the calls run through the candidate.
+plant b8-fallback
+p b8-fallback "plant_root; plant_pre_r; plant_recovery $REC_A v0.10.1; plant_guard h1 $ROOT/$REC_A/billet.candidate"
+a b8-fallback -e "billet_binary_src=$bins/wrap-candidate-v0.10.1"
+ns_case b8-fallback escalated
+expect_allowed b8-fallback
+expect_fact b8-fallback route fallback
+expect_fact b8-fallback acquired False
+expect_fact b8-fallback executable "$ROOT/$REC_A/billet.candidate"
+expect_calls b8-fallback candidate "converge-guard prepare --validate --holder h1 --json" 1
+expect_calls b8-fallback candidate "converge-guard prepare --holder h1 --json --candidate" 1
+expect_calls b8-fallback candidate "converge-guard settle" 0
+expect_ran b8-fallback "Read the guard's record"
+expect_state b8-fallback record_release_executable "$ROOT/$REC_A/billet.candidate"
+# B8b. A five-member record is adopted; the role keeps the id and sends --expect-id afterwards.
+plant b8b-adopt
+p b8b-adopt "plant_root; plant_pre_r; plant_recovery $REC_A v0.10.1; plant_guard h1 $ROOT/$REC_A/billet.candidate legacy"
+a b8b-adopt -e "billet_binary_src=$bins/wrap-candidate-v0.10.1" -e billet_gate_inclusions=2
+ns_case b8b-adopt escalated
+expect_allowed b8b-adopt
+expect_fact b8b-adopt adopted False
+grep -q '"adopted": true' "$work/cases/b8b-adopt/private" || fail "b8b: the first call did not adopt the record" "$work/cases/b8b-adopt/private"
+expect_state b8b-adopt record_preparing False
+expect_state b8b-adopt record_has_token False
+adopted_id=$(state b8b-adopt record_id)
+[ -n "$adopted_id" ] || fail "b8b: the adopted record carries no id"
+expect_calls b8b-adopt candidate "--expect-id $adopted_id" 3
+expect_calls b8b-adopt candidate "converge-guard prepare --validate --holder h1 --json --expect-id $adopted_id" 1
+# B8c. A record with a malformed protocol member: the fallback refuses naming it, and prints no token.
+for member in preparing token id; do
+  plant "b8c-$member"
+  p "b8c-$member" "plant_root; plant_pre_r; plant_recovery $REC_A v0.10.1; plant_guard h1 $ROOT/$REC_A/billet.candidate preparing"
+  p "b8c-$member" "\"\$PYTHON\" - <<'PY'
+import json
+p = '/var/lib/billet/upgrades/active/guard.json'
+r = json.load(open(p))
+r['$member'] = {'preparing': 'yes', 'token': 'FEDCBA9876543210FEDCBA9876543210', 'id': 'short'}['$member']
+json.dump(r, open(p, 'w'))
+PY"
+  ns_case "b8c-$member" escalated
+  expect_refused "b8c-$member" "Judge the guard's record" "$member"
+  ! grep -q "fedcba9876543210" "$work/cases/b8c-$member/out" || fail "b8c-$member: the record's token reached the output"
+  expect_calls "b8c-$member" candidate "" 0
 done
-# (e) a generator exiting non-zero while printing valid digits.
-plant s3-e
-printf '0badcafe\n' >"$work/cases/s3-e/suffixes"
-s3_run s3-e BILLET_FAKE_DATE_MODE=frozen BILLET_FAKE_SUFFIXES="$work/cases/s3-e/suffixes" BILLET_FAKE_SUFFIX_STATUS=1 -- -e billet_recovery_dir_suffix_command="$fakes/suffix"
-expect_refused s3-e "Allocate a recovery directory exclusively" "the suffix generator exited non-zero"
-expect_calls s3-e mkdir "" 0
-# (f) five collisions exhaust.
-plant s3-f
-mkdir "$(root_of s3-f)/recovery-20260909T120000-0badcafe"
-printf '0badcafe\n0badcafe\n0badcafe\n0badcafe\n0badcafe\n0badcafe\n' >"$work/cases/s3-f/suffixes"
-s3_run s3-f BILLET_FAKE_DATE_MODE=frozen BILLET_FAKE_SUFFIXES="$work/cases/s3-f/suffixes" -- -e billet_recovery_dir_suffix_command="$fakes/suffix"
-expect_refused s3-f "Allocate a recovery directory exclusively" "five names collided" "exhausted"
-expect_calls s3-f mkdir "" 5
-# (g) a non-collision failure: the root unwritable, as the invoking user.
-plant s3-g
-as_root chown root:root "$work/cases/s3-g/lib/billet" "$(root_of s3-g)"
-as_root chmod 0555 "$(root_of s3-g)"
-run_case s3-g unescalated BILLET_FAKE_DATE_MODE=frozen -- -e billet_gate_entry=allocate-recovery -e billet_exclusion_root="$(root_of s3-g)" -e billet_exclusion_become=false -e billet_recovery_dir_suffix_command="$fakes/suffix"
-expect_refused s3-g "Allocate a recovery directory exclusively" "attempt 1" "the name is absent" "Permission denied"
-expect_calls s3-g mkdir "" 1
-echo "ok   S3: the allocator draws inside its loop, reads a collision by the name's presence and refuses everything else at once"
+# B8d. The managed path absent: with a pointer and without, through the candidate.
+plant b8d-absent-pointer
+p b8d-absent-pointer "plant_root; plant_recovery $REC_A v0.10.1; plant_guard h1 $ROOT/$REC_A/billet.candidate; plant_pointer $REC_A"
+ns_case b8d-absent-pointer escalated
+expect_allowed b8d-absent-pointer
+expect_fact b8d-absent-pointer route fallback
+expect_fact b8d-absent-pointer interrupted True
+expect_fact b8d-absent-pointer shape guard-pointer
+expect_fact b8d-absent-pointer recovery "$ROOT/$REC_A"
+expect_calls b8d-absent-pointer candidate "converge-guard prepare --holder h1 --json --recovery" 1
+plant b8d-absent-none
+p b8d-absent-none "plant_root; plant_recovery $REC_A v0.10.1; plant_guard h1 $ROOT/$REC_A/billet.candidate"
+a b8d-absent-none -e "billet_binary_src=$bins/wrap-candidate-v0.10.1"
+ns_case b8d-absent-none escalated
+expect_allowed b8d-absent-none
+expect_fact b8d-absent-none route fallback
+expect_calls b8d-absent-none candidate "converge-guard prepare --holder h1 --json --candidate" 1
+echo "ok   B8: the verified fallback answers through the recorded candidate, adopts a five-member record, refuses a malformed one, and covers an absent managed path"
 
-# S4. The floor and the staging failures.
-plant s4-a
-run_case s4-a escalated BILLET_FAKE_CANDIDATE_PRE_R=1 -- -e billet_binary_src="$work/cases/s4-a/src/billet"
-expect_refused s4-a "Judge the candidate's capability" "predates the converge guard" "legacy collection"
-expect_calls s4-a candidate "converge-guard hold" 0
-expect_calls s4-a managed "converge-guard hold" 0
-root_ls s4-a | grep -q '^recovery-' || fail "s4-a: the staged directory was not retained"
-plant s4-b
-run_case s4-b escalated BILLET_FAKE_CANDIDATE_HANG=1 -- -e billet_binary_src="$work/cases/s4-b/src/billet" -e billet_guard_timeout=2
-expect_refused s4-b "Judge the candidate's capability" "could not be determined" "did not answer within the bound"
-expect_calls s4-b candidate "converge-guard hold" 0
-plant s4-c
-echo "not json" >"$work/cases/s4-c/status.json"
-run_case s4-c escalated BILLET_FAKE_CANDIDATE_STATUS="$work/cases/s4-c/status.json" -- -e billet_binary_src="$work/cases/s4-c/src/billet"
-expect_refused s4-c "Judge the candidate's capability" "could not be determined" "not JSON"
-for id in d e f g h l2 l3 l4 l5 m n o o2 p p2 p3 p4 p5 q q2 r s t u v w x x2 x3 x4; do
-  plant "s4-d-$id"
-  mkstatus "$work/cases/s4-d-$id/status.json" "$id"
-  run_case "s4-d-$id" escalated BILLET_FAKE_CANDIDATE_STATUS="$work/cases/s4-d-$id/status.json" -- -e billet_binary_src="$work/cases/s4-d-$id/src/billet"
-  expect_refused "s4-d-$id" "Judge the candidate's capability" "could not be determined"
-  expect_calls "s4-d-$id" candidate "converge-guard hold" 0
-  root_ls "s4-d-$id" | grep -q '^recovery-' || fail "s4-d-$id: the staged directory was not retained"
+# B9. This holder's settled guard with a valid pointer: validated, then
+# --recovery, no staging, no re-binding, no settle.
+plant b9-pointer
+p b9-pointer "plant_root; plant_managed v0.10.0; plant_guard h1 /usr/bin/billet; mkdir -m 0700 $ROOT/$REC_A; plant_pointer $REC_A"
+a b9-pointer -e "billet_binary_src=$bins/wrap-candidate-v0.10.1"
+ns_case b9-pointer escalated
+expect_allowed b9-pointer
+expect_fact b9-pointer shape guard-pointer
+expect_fact b9-pointer interrupted True
+expect_fact b9-pointer recovery "$ROOT/$REC_A"
+expect_fact b9-pointer acquired False
+expect_calls b9-pointer managed "converge-guard prepare --validate --holder h1 --json" 1
+expect_calls b9-pointer managed "converge-guard prepare --holder h1 --json --recovery" 1
+expect_calls b9-pointer managed "--candidate" 0
+expect_calls b9-pointer managed "converge-guard settle" 0
+expect_calls b9-pointer suffix "" 0
+expect_no_task b9-pointer "Stage the immutable candidate binary inside its recovery journal"
+expect_state b9-pointer record_release_executable /usr/bin/billet
+expect_state b9-pointer pointer symlink
+plant b9b-pointer-late
+p b9b-pointer-late "plant_root; plant_managed v0.10.0; plant_guard h1 /usr/bin/billet; mkdir -m 0700 $ROOT/$REC_A"
+e b9b-pointer-late "BILLET_GATE_HOOK=prepare:1:ln -sT $ROOT/$REC_A $ROOT/active/recovery"
+ns_case b9b-pointer-late escalated
+expect_allowed b9b-pointer-late
+expect_fact b9b-pointer-late interrupted True
+expect_fact b9b-pointer-late recovery "$ROOT/$REC_A"
+plant b9c-malformed
+p b9c-malformed "plant_root; plant_managed v0.10.0; plant_guard h1 /usr/bin/billet; touch $ROOT/active/recovery"
+ns_case b9c-malformed escalated
+expect_refused b9c-malformed "Refuse the preparation's answer" "pointer"
+expect_state b9c-malformed active dir
+# B9d. --recovery with the managed bytes absent, older, and equal to the candidate.
+plant b9d-older
+p b9d-older "plant_root; plant_managed v0.9.0; plant_recovery $REC_A v0.10.1; plant_guard h1 $ROOT/$REC_A/billet.candidate; plant_pointer $REC_A"
+ns_case b9d-older escalated
+expect_allowed b9d-older
+expect_fact b9d-older route managed
+expect_fact b9d-older interrupted True
+plant b9d-equal
+p b9d-equal "plant_root; plant_recovery $REC_A v0.10.1; plant_managed_file $ROOT/$REC_A/billet.candidate; plant_guard h1 $ROOT/$REC_A/billet.candidate; plant_pointer $REC_A"
+ns_case b9d-equal escalated
+expect_allowed b9d-equal
+expect_fact b9d-equal interrupted True
+echo "ok   B9: an interrupted transaction is validated by its pointer, declared as a recovery, and never staged over or re-bound"
+
+# B10. A guard by h1 published between the stat and the first call: validated,
+# not acquired, and a later refusal releases nothing; gone or replaced under
+# --expect-id refuses.
+plant b10-none-then-held
+p b10-none-then-held 'plant_root; plant_managed v0.10.0'
+a b10-none-then-held -e "billet_binary_src=$bins/wrap-candidate-v0.9.0"
+e b10-none-then-held "BILLET_GATE_HOOK=prepare:1:$mnt/bin/billet-v0.10.0 converge-guard prepare --validate --holder h1 --json >/dev/null"
+ns_case b10-none-then-held escalated
+expect_refused b10-none-then-held "Refuse the preparation's answer" "downgrade"
+expect_fact b10-none-then-held acquired False
+expect_final b10-none-then-held "no cleanup was attempted" "release --holder h1"
+expect_state b10-none-then-held record_holder h1
+expect_state b10-none-then-held record_preparing True
+plant b10b-gone
+p b10b-gone 'plant_root; plant_managed v0.10.0'
+a b10b-gone -e billet_gate_inclusions=2
+e b10b-gone "BILLET_GATE_HOOK=prepare:3:rm -rf $ROOT/active"
+ns_case b10b-gone escalated
+expect_refused b10b-gone "Refuse the preparation's answer" "gone"
+expect_state b10b-gone active absent
+expect_final b10b-gone "no cleanup was attempted"
+plant b10c-replaced
+p b10c-replaced 'plant_root; plant_managed v0.10.0'
+a b10c-replaced -e billet_gate_inclusions=2
+e b10c-replaced "BILLET_GATE_HOOK=prepare:3:rm -rf $ROOT/active; $mnt/bin/billet-v0.10.0 converge-guard prepare --validate --holder h1 --json >/dev/null"
+ns_case b10c-replaced escalated
+expect_refused b10c-replaced "Refuse the preparation's answer" "replaced"
+expect_final b10c-replaced "no cleanup was attempted"
+expect_state b10c-replaced active dir
+[ "$(state b10c-replaced record_id)" != "$(fact b10c-replaced id)" ] || fail "b10c: the replaced guard kept the id"
+echo "ok   B10: a guard that appears under the same holder is validated and never released; a guard gone or replaced under this run refuses"
+
+# B11. The record re-bound to X between the stat and the second call with Y: refused, kept.
+plant b11-record-moved
+p b11-record-moved "plant_root; plant_managed v0.10.0; plant_guard h1 /usr/bin/billet; plant_recovery $REC_A v0.10.0"
+a b11-record-moved -e "billet_binary_src=$bins/wrap-candidate-v0.10.1"
+e b11-record-moved "BILLET_GATE_HOOK=prepare:2:$mnt/bin/billet-v0.10.0 converge-guard prepare --holder h1 --candidate $ROOT/$REC_A/billet.candidate --json >/dev/null"
+ns_case b11-record-moved escalated
+expect_refused b11-record-moved "Refuse the preparation's answer" "candidate"
+expect_state b11-record-moved record_release_executable "$ROOT/$REC_A/billet.candidate"
+expect_final b11-record-moved "no cleanup was attempted"
+echo "ok   B11: a record re-bound under the second call refuses and is kept"
+
+# B12. The answer corrupted, one member at a time: the parser names the
+# member; a corrupted first answer leaves the guard (no token known); a
+# corrupted second answer after `acquired` is cleaned up.
+for member in outcome id holder preparing token record pointer managed downgrade; do
+  plant "b12-$member"
+  p "b12-$member" 'plant_root; plant_managed v0.10.0'
+  corrupt "$work/corpus/acquired.json" "$work/cases/b12-$member/answer.json" "$member"
+  e "b12-$member" "BILLET_GATE_ANSWER=prepare:1:$work/cases/b12-$member/answer.json"
+  ns_case "b12-$member" escalated
+  expect_refused "b12-$member" "Judge the preparation's answer" "$member"
+  expect_fact "b12-$member" token_known False
+  expect_final "b12-$member" "no cleanup was attempted" "release --holder h1"
+  expect_state "b12-$member" record_preparing True
+  expect_calls "b12-$member" managed "converge-guard release" 0
 done
-plant s4-e
-run_case s4-e escalated BILLET_FAKE_CANDIDATE_VERSION=v0.9.0 -- -e billet_binary_src="$work/cases/s4-e/src/billet" -e billet_allow_downgrade=true
-expect_allowed s4-e
-expect_calls s4-e candidate "converge-guard hold --holder h1 --candidate" 1
-plant s4-f
-run_case s4-f escalated -- -e billet_gate_facts=true -e billet_version=v0.10.0 -e billet_release_url_base=http://127.0.0.1:1 -e billet_release_stage="$work/cases/s4-f/stage" -e billet_fetch_retries=1 -e billet_fetch_timeout=2 -e billet_fetch_retry_delay=0 -e billet_recovery_dir_suffix_command="$fakes/suffix"
-expect_refused s4-f "Download the pinned billet release"
-expect_calls s4-f suffix "" 0
-expect_calls s4-f managed "converge-guard hold" 0
-expect_no_task s4-f "Configure billet account and files"
-echo "ok   S4: a pre-R candidate, an unreadable capability and a failed fetch each end the play before the hold"
+plant b12-second
+p b12-second 'plant_root; plant_managed v0.10.0'
+e b12-second "BILLET_GATE_ANSWER=prepare:2:$work/corpus/no-change-outcome.json"
+a b12-second -vvv
+ns_case b12-second escalated
+expect_refused b12-second "Judge the preparation's answer" "outcome"
+expect_final b12-second "the cleanup released the guard" "is now none"
+expect_fact b12-second released True
+expect_state b12-second active absent
+expect_calls b12-second managed "converge-guard release --holder h1 --cleanup --token" 1
+[ -n "$(tokens_of b12-second)" ] || fail "b12-second: no token was captured to grep for"
+echo "ok   B12: a corrupted answer refuses at the one parser naming the member, cleans up only inside the acquirer's window, and no token reaches the output (one case under -vvv)"
 
-# S5. A pre-R managed binary and no candidate: the legacy protocol; PostgreSQL refuses.
-plant s5
-run_case s5 escalated BILLET_FAKE_MANAGED_PRE_R=1 --
-expect_allowed s5
-expect_fact s5 shape legacy
-grep -q "runs the legacy protocol" "$work/cases/s5/out" || fail "s5: the legacy protocol was not warned about"
-expect_calls s5 managed "converge-guard hold" 0
-plant s5-pg
-run_case s5-pg escalated BILLET_FAKE_MANAGED_PRE_R=1 -- -e '{"billet_config": {"server": {"state": {"backend": "postgres"}}}}'
-expect_refused s5-pg "Refuse a PostgreSQL controller whose binary predates the guard" "predates the converge guard" "billet host-upgrade"
-plant s5-pg-bootstrap
-rm -f "$work/cases/s5-pg-bootstrap/bin/billet"
-run_case s5-pg-bootstrap escalated -- -e '{"billet_config": {"server": {"state": {"backend": "postgres"}}}}' -e billet_binary_src="$work/cases/s5-pg-bootstrap/src/billet" -e billet_recovery_dir_suffix_command="$fakes/suffix"
-expect_refused s5-pg-bootstrap "Refuse a transactional binary change against an external ledger" "at or after the release that carries the converge guard"
-expect_calls s5-pg-bootstrap suffix "" 0
-echo "ok   S5: a pre-R binary runs the legacy protocol with a warning, and a PostgreSQL controller refuses instead"
+# B13. The rerun shapes.
+plant b13-inclusions
+p b13-inclusions 'plant_root; plant_managed v0.10.0'
+a b13-inclusions -e billet_gate_inclusions=2
+ns_case b13-inclusions escalated
+expect_allowed b13-inclusions
+expect_fact b13-inclusions acquired False
+expect_fact b13-inclusions held True
+run_id=$(fact b13-inclusions id)
+expect_calls b13-inclusions managed "converge-guard prepare --validate --holder h1 --json --expect-id $run_id" 1
+expect_calls b13-inclusions managed "converge-guard prepare --validate --holder h1 --json" 2
+expect_calls b13-inclusions managed "converge-guard settle" 1
+expect_state b13-inclusions record_id "$run_id"
+plant b13-plays
+p b13-plays 'plant_root; plant_managed v0.10.0'
+ns_case b13-plays escalated play2
+expect_allowed b13-plays
+run_id=$(fact b13-plays id)
+expect_calls b13-plays managed "converge-guard prepare --validate --holder h1 --json --expect-id $run_id" 1
+expect_calls b13-plays managed "converge-guard settle" 1
+expect_fact b13-plays held True
+plant b13-fresh-settled
+p b13-fresh-settled 'plant_root; plant_managed v0.10.0; plant_guard h1 /usr/bin/billet'
+ns_case b13-fresh-settled escalated
+expect_allowed b13-fresh-settled
+expect_fact b13-fresh-settled acquired False
+# A fresh process knows no id before its first call; the second call, inside
+# the same inclusion, carries the id the first answered.
+expect_calls b13-fresh-settled managed "converge-guard prepare --validate --holder h1 --json --expect-id" 0
+expect_calls b13-fresh-settled managed "converge-guard prepare --validate --holder h1 --json" 1
+expect_calls b13-fresh-settled managed "converge-guard settle" 0
+expect_state b13-fresh-settled record_preparing False
+plant b13-fresh-preparing
+p b13-fresh-preparing 'plant_root; plant_managed v0.10.0; plant_guard h1 /usr/bin/billet preparing'
+ns_case b13-fresh-preparing escalated
+expect_allowed b13-fresh-preparing
+expect_fact b13-fresh-preparing acquired False
+expect_fact b13-fresh-preparing token_known False
+expect_calls b13-fresh-preparing managed "converge-guard settle" 0
+expect_state b13-fresh-preparing record_preparing True
+echo "ok   B13: a second inclusion and a second play validate under --expect-id and settle once; a fresh process validates a settled or a preparing guard and settles nothing"
 
-# S6. Bootstrap eligibility.
-plant s6
-rm -f "$work/cases/s6/bin/billet"
-touch "$(root_of s6)/transaction.lock"
-mkdir "$(root_of s6)/20260908T120000000000000"
-run_case s6 escalated -- -e billet_binary_src="$work/cases/s6/src/billet"
-expect_allowed s6
-expect_calls s6 candidate "converge-guard hold --holder h1 --candidate" 1
-plant s6-stray
-rm -f "$work/cases/s6-stray/bin/billet"
-touch "$(root_of s6-stray)/notes"
-run_case s6-stray escalated -- -e billet_binary_src="$work/cases/s6-stray/src/billet" -e billet_recovery_dir_suffix_command="$fakes/suffix"
-expect_refused s6-stray "Refuse a bootstrap over a root that holds something the role did not write" "notes"
-expect_calls s6-stray suffix "" 0
-echo "ok   S6: a bootstrap admits the role's own entries and refuses a stray"
-
-# S7. A channel writes the resolved version and leaves the pin empty.
-plant s7
-run_case s7 escalated -- -e billet_gate_facts=true -e billet_release_channel=stable -e billet_release_channel_base="$origin_url" -e billet_release_url_base="$origin_url" -e billet_release_stage="$work/cases/s7/stage" -e billet_fetch_retries=1
-expect_allowed s7
-[ "$(fact s7 version)" != "v0.10.0" ] || fail "s7: the public billet_version was assigned the resolved tag" "$work/cases/s7/out"
-expect_fact s7 resolved v0.10.0
-plant s7-moving
-run_case s7-moving escalated -- -e billet_gate_facts=true -e billet_release_channel=moving -e billet_release_channel_base="$origin_url" -e billet_release_url_base="$origin_url" -e billet_release_stage="$work/cases/s7-moving/stage" -e billet_fetch_retries=1
-expect_refused s7-moving "Refuse an unpinned billet version" "not latest"
-# THE SAME UNDER --check: the channel is read, the release reported, nothing
-# staged or held; a moving channel is refused by name.
-plant s7-check
-HOLDER=""; run_case s7-check escalated -- --check -e billet_gate_facts=true -e billet_release_channel=stable -e billet_release_channel_base="$origin_url" -e billet_release_url_base="$origin_url" -e billet_release_stage="$work/cases/s7-check/stage" -e billet_fetch_retries=1; HOLDER=h1
-expect_allowed s7-check
-expect_fact s7-check resolved v0.10.0
-grep -q "The stable channel names v0.10.0" "$work/cases/s7-check/out" || fail "s7-check: the dry run did not report the release the channel names" "$work/cases/s7-check/out"
-[ ! -e "$work/cases/s7-check/stage" ] || fail "s7-check: a dry run staged something"
-[ -z "$(root_ls s7-check)" ] || fail "s7-check: a dry run allocated under the root: $(root_ls s7-check)"
-expect_calls s7-check managed "converge-guard hold" 0
-expect_calls s7-check candidate "converge-guard hold" 0
-plant s7-moving-check
-HOLDER=""; run_case s7-moving-check escalated -- --check -e billet_gate_facts=true -e billet_release_channel=moving -e billet_release_channel_base="$origin_url" -e billet_release_url_base="$origin_url" -e billet_release_stage="$work/cases/s7-moving-check/stage" -e billet_fetch_retries=1; HOLDER=h1
-expect_refused s7-moving-check "Refuse an unpinned billet version" "not latest"
-echo "ok   S7: a channel resolves into the private variable and the public pin is never assigned, in a dry run too"
-
-# S8. A controller-side source: the version and the status are asked of the staged copy.
-plant s8
-run_case s8 escalated -- -e billet_binary_src="$work/cases/s8/src/billet"
-expect_allowed s8
-expect_calls s8 candidate "@$work/cases/s8/src/billet" 0
-journal=$(fact s8 recovery)
-expect_calls s8 candidate "version @$journal/billet.candidate" 1
-echo "ok   S8: a controller-side source is never executed; the staged copy is"
-
-# S9. The downgrade refusal precedes the hold; the preparation never reaches systemctl.
-plant s9
-run_case s9 escalated BILLET_FAKE_CANDIDATE_VERSION=v0.9.0 -- -e billet_binary_src="$work/cases/s9/src/billet"
-expect_refused s9 "Refuse a converge that would downgrade this host" "v0.9.0" "which is older" "Nothing was drained"
-expect_calls s9 candidate "converge-guard hold" 0
-expect_calls s9 managed "converge-guard hold" 0
-for c in "$work"/cases/*/log; do
-  [ -f "$c" ] || continue
-  if grep -q '^role=systemctl' "$c"; then fail "the preparation called systemctl in $(basename "$(dirname "$c")")"; fi
+# B14. A regular file at `active`: the pre-R role's claim, classified by the
+# role's own stat whatever the managed binary is; no call, nothing acquired.
+for variant in capable pre-r absent; do
+  plant "b14-$variant"
+  case $variant in
+    capable) p "b14-$variant" 'plant_root; plant_managed v0.10.0' ;;
+    pre-r) p "b14-$variant" 'plant_root; plant_pre_r' ;;
+    absent) p "b14-$variant" 'plant_root' ;;
+  esac
+  p "b14-$variant" "printf '%s\n' $ROOT/$LEGACY_DIR >$ROOT/active"
+  ns_case "b14-$variant" escalated
+  expect_allowed "b14-$variant"
+  expect_fact "b14-$variant" shape legacy-file
+  expect_fact "b14-$variant" interrupted True
+  expect_ran "b14-$variant" "Classify a legacy pointer"
+  expect_calls "b14-$variant" managed "converge-guard" 0
+  expect_calls "b14-$variant" pre-r "converge-guard" 0
+  expect_state "b14-$variant" active file
 done
-echo "ok   S9: a downgrade refuses before the hold, and no preparation case reached systemctl"
+plant b14b-moved
+p b14b-moved 'plant_root; plant_managed v0.10.0'
+# A value with spaces goes to -e as JSON: `-e k=v` splits on whitespace.
+a b14b-moved -e billet_gate_inclusions=2 -e "{\"billet_gate_between\": \"rm -rf $ROOT/active; echo $ROOT/$LEGACY_DIR >$ROOT/active\"}"
+ns_case b14b-moved escalated
+expect_refused b14b-moved "Refuse a converge whose exclusion moved" "a regular file (a legacy converge transaction)"
+expect_no_task b14b-moved "Classify a legacy pointer"
+expect_calls b14b-moved managed "converge-guard release" 0
+expect_state b14b-moved active file
+plant b14c-moved-play
+p b14c-moved-play 'plant_root; plant_managed v0.10.0'
+a b14c-moved-play -e "{\"billet_gate_between_plays\": \"rm -rf $ROOT/active; echo $ROOT/$LEGACY_DIR >$ROOT/active\"}"
+ns_case b14c-moved-play escalated play2
+expect_refused b14c-moved-play "Refuse a converge whose exclusion moved" "a regular file (a legacy converge transaction)"
+expect_calls b14c-moved-play managed "converge-guard release" 0
+echo "ok   B14: a legacy claim is classified by the role's stat under any managed binary, and an exclusion that moved under a held run refuses without recovery or cleanup"
 
-# S10. The installed binary replaced between the decision and the hold.
-plant s10
-run_case s10 escalated BILLET_FAKE_HOLD_REPLACE="$work/cases/s10/bin/billet" -- -e billet_binary_src="$work/cases/s10/src/billet"
-expect_refused s10 "Refuse a converge whose installed binary moved before the hold" "changed between this converge's decision and its hold" "converge-guard release --holder h1"
-expect_calls s10 candidate "converge-guard hold --holder h1 --candidate" 1
-rd test -f "$(root_of s10)/active/guard.json" || fail "s10: the guard was not left held"
-plant s10-absent
-rm -f "$work/cases/s10-absent/bin/billet"
-run_case s10-absent escalated BILLET_FAKE_HOLD_REPLACE="$work/cases/s10-absent/bin/billet" -- -e billet_binary_src="$work/cases/s10-absent/src/billet"
-expect_refused s10-absent "Refuse a converge whose installed binary moved before the hold" "absent when the binary change was decided"
-echo "ok   S10: a binary that moved between the decision and the hold refuses under the guard"
+# =============================================================================
+# C. The cleanup release.
+# =============================================================================
+# C1. Acquired, the second call refuses the downgrade: released.
+plant c1-downgrade
+p c1-downgrade 'plant_root; plant_managed v0.10.1'
+a c1-downgrade -e "billet_binary_src=$bins/wrap-candidate-v0.9.0"
+ns_case c1-downgrade escalated
+expect_refused c1-downgrade "Refuse the preparation's answer" "downgrade" "v0.9.0"
+expect_final c1-downgrade "Refuse the preparation's answer" "the cleanup released the guard" "is now none"
+expect_fact c1-downgrade acquired True
+expect_fact c1-downgrade released True
+expect_fact c1-downgrade held False
+expect_state c1-downgrade active absent
+expect_calls c1-downgrade managed "converge-guard release --holder h1 --cleanup --token" 1
+expect_calls c1-downgrade managed "converge-guard settle" 0
+# C2. The floor: a pre-R candidate on a capable host is held over and released.
+plant c2-floor
+p c2-floor 'plant_root; plant_managed v0.10.0'
+a c2-floor -e "billet_binary_src=$bins/wrap-candidate-pre-r"
+ns_case c2-floor escalated
+expect_refused c2-floor "Refuse the preparation's answer" "floor" "cannot take part in the exclusion"
+expect_final c2-floor "the cleanup released the guard"
+expect_state c2-floor active absent
+grep -q '^recovery=' "$work/cases/c2-floor/state" || fail "c2-floor: the staged directory was not retained"
+plant c2b-floor-pre-r
+p c2b-floor-pre-r 'plant_root; plant_pre_r'
+a c2b-floor-pre-r -e "billet_binary_src=$bins/wrap-candidate-pre-r"
+ns_case c2b-floor-pre-r escalated
+expect_refused c2b-floor-pre-r "Refuse a staged candidate that predates the guard" "cannot take part in the exclusion"
+expect_final c2b-floor-pre-r "no cleanup was attempted"
+expect_state c2b-floor-pre-r active absent
+plant c2c-fetch
+p c2c-fetch 'plant_root; plant_managed v0.10.0'
+a c2c-fetch -e billet_gate_facts=true -e billet_version=v0.10.2 -e "billet_release_url_base=$origin_url" -e "billet_release_stage=$work/cases/c2c-fetch/stage" -e billet_fetch_retries=1 -e billet_fetch_retry_delay=0
+ns_case c2c-fetch escalated
+expect_refused c2c-fetch "Download the pinned billet release" "404"
+expect_final c2c-fetch "the cleanup released the guard" "is now none"
+expect_state c2c-fetch active absent
+# C3. The PostgreSQL refusals: a capable host holds and releases; a pre-R host holds nothing.
+plant c3-pg
+p c3-pg 'plant_root; plant_managed v0.10.0'
+a c3-pg -e '{"billet_config": {"server": {"state": {"backend": "postgres"}}}}' -e "billet_binary_src=$bins/wrap-candidate-v0.10.1"
+ns_case c3-pg escalated
+expect_refused c3-pg "Refuse a transactional binary change against an external ledger" "at or after the release that carries the converge guard"
+expect_final c3-pg "the cleanup released the guard"
+expect_state c3-pg active absent
+plant c3b-pg-pre-r
+p c3b-pg-pre-r 'plant_root; plant_pre_r'
+a c3b-pg-pre-r -e '{"billet_config": {"server": {"state": {"backend": "postgres"}}}}'
+ns_case c3b-pg-pre-r escalated
+expect_refused c3b-pg-pre-r "Refuse a PostgreSQL controller whose binary predates the guard" "predates the converge guard" "billet host-upgrade"
+expect_final c3b-pg-pre-r "no cleanup was attempted"
+expect_state c3b-pg-pre-r active absent
+plant c3c-pg-bootstrap
+a c3c-pg-bootstrap -e '{"billet_config": {"server": {"state": {"backend": "postgres"}}}}' -e "billet_binary_src=$bins/wrap-candidate-v0.10.1"
+ns_case c3c-pg-bootstrap escalated
+expect_refused c3c-pg-bootstrap "Refuse a transactional binary change against an external ledger" "at or after the release that carries the converge guard"
+expect_calls c3c-pg-bootstrap suffix "" 0
+expect_state c3c-pg-bootstrap active absent
+# C4. A fresh process over a preparing guard: validated; a refusal releases nothing.
+plant c4-preparing-rerun
+p c4-preparing-rerun 'plant_root; plant_managed v0.10.1; plant_guard h1 /usr/bin/billet preparing'
+a c4-preparing-rerun -e "billet_binary_src=$bins/wrap-candidate-v0.9.0"
+ns_case c4-preparing-rerun escalated
+expect_refused c4-preparing-rerun "Refuse the preparation's answer" "downgrade"
+expect_final c4-preparing-rerun "no cleanup was attempted"
+expect_state c4-preparing-rerun record_preparing True
+# C5. A settled guard naming X, this run staging Y: refused, kept.
+plant c5-rerun-kept
+p c5-rerun-kept "plant_root; plant_managed v0.10.0; plant_recovery $REC_A v0.10.0; plant_guard h1 $ROOT/$REC_A/billet.candidate"
+a c5-rerun-kept -e "billet_binary_src=$bins/wrap-candidate-v0.10.1"
+ns_case c5-rerun-kept escalated
+expect_refused c5-rerun-kept "Refuse the preparation's answer" "candidate"
+expect_final c5-rerun-kept "no cleanup was attempted" "release --holder h1"
+expect_state c5-rerun-kept record_release_executable "$ROOT/$REC_A/billet.candidate"
+# C6. The answer of an acquired first call lost: nothing released, the guard remains preparing.
+plant c6-answer-lost
+p c6-answer-lost 'plant_root; plant_managed v0.10.0'
+e c6-answer-lost "BILLET_GATE_DROP_ANSWER=prepare:1"
+ns_case c6-answer-lost escalated
+expect_refused c6-answer-lost "Refuse a preparation that did not answer" "did not answer"
+expect_final c6-answer-lost "no cleanup was attempted" "release --holder h1"
+expect_state c6-answer-lost record_preparing True
+expect_calls c6-answer-lost managed "converge-guard release" 0
+# C7. The release that fails, at each boundary.
+c7_plant() { # name
+  plant "$1"
+  p "$1" 'plant_root; plant_managed v0.10.0'
+  e "$1" "BILLET_GATE_ANSWER=prepare:2:$work/corpus/no-change-outcome.json"
+}
+c7_plant c7-refused
+e c7-refused "BILLET_GATE_FAIL=release:refuse"
+ns_case c7-refused escalated
+expect_refused c7-refused "Judge the preparation's answer" "outcome"
+expect_final c7-refused "the cleanup was refused" "refused by the gate's wrapper" "guard held by h1" "release --holder h1"
+[ "$(backing_runs c7-refused release)" -eq 0 ] || fail "c7-refused: the backing release ran"
+expect_state c7-refused record_preparing True
+c7_plant c7b-after-unlink
+e c7b-after-unlink "BILLET_GATE_FAIL=release:crash:rmdir $ROOT/active"
+ns_case c7b-after-unlink escalated
+expect_refused c7b-after-unlink "Judge the preparation's answer" "outcome"
+expect_final c7b-after-unlink "is now unpublished-guard" "recover --unpublished"
+expect_state c7b-after-unlink active dir
+expect_state c7b-after-unlink record absent
+c7_plant c7c-after-rmdir
+e c7c-after-rmdir "BILLET_GATE_FAIL=release:crash:fsync $ROOT"
+ns_case c7c-after-rmdir escalated
+expect_refused c7c-after-rmdir "Judge the preparation's answer" "outcome"
+expect_final c7c-after-rmdir "is now none" "durability is not proved"
+expect_fact c7c-after-rmdir released False
+expect_state c7c-after-rmdir active absent
+c7_plant c7d-status-malformed
+printf 'not json\n' >"$work/cases/c7d-status-malformed/status.txt"
+e c7d-status-malformed "BILLET_GATE_ANSWER=prepare:2:$work/corpus/no-change-outcome.json;status:1:$work/cases/c7d-status-malformed/status.txt"
+e c7d-status-malformed "BILLET_GATE_FAIL=release:refuse"
+ns_case c7d-status-malformed escalated
+expect_final c7d-status-malformed "is now unknown" "inspect the host by hand"
+c7_plant c7f-unexpected-entry
+e c7f-unexpected-entry "BILLET_GATE_HOOK=release:1:touch $ROOT/active/unexpected"
+ns_case c7f-unexpected-entry escalated
+expect_final c7f-unexpected-entry "is now unpublished-guard" "anything else is for the operator to inspect"
+expect_state c7f-unexpected-entry active dir
+c7_plant c7g-release-hangs
+e c7g-release-hangs "BILLET_GATE_FAIL=release:hang"
+a c7g-release-hangs -e billet_guard_timeout=2
+ns_case c7g-release-hangs escalated
+expect_final c7g-release-hangs "the cleanup was ended by its bound" "guard held by h1"
+expect_state c7g-release-hangs record_preparing True
+# C8. After the settlement no token is known: a later refusal invokes no cleanup.
+plant c8-after-settle
+p c8-after-settle 'plant_root; plant_managed v0.10.0'
+a c8-after-settle -e billet_gate_inclusions=2 -e "{\"billet_gate_between\": \"touch $ROOT/mutated\"}"
+e c8-after-settle "BILLET_GATE_ANSWER=prepare:4:$work/corpus/no-change-outcome.json"
+post c8-after-settle 'tok=$(sed -n "s/^ *\"token\": \"\([0-9a-f]*\)\".*/\1/p" "$1/private" | head -n1); "$MNT/bin/billet-v0.10.0" converge-guard release --holder h1 --cleanup --token "$tok"; echo "direct=$?"'
+sed -i "s#\"\$1/private\"#\"$work/cases/c8-after-settle/private\"#" "$work/cases/c8-after-settle/post.sh"
+ns_case c8-after-settle escalated
+expect_refused c8-after-settle "Judge the preparation's answer" "outcome"
+expect_final c8-after-settle "no cleanup was attempted" "release --holder h1"
+expect_calls c8-after-settle managed "converge-guard release" 0
+expect_state c8-after-settle record_preparing False
+grep -q "^direct=2$" "$work/cases/c8-after-settle/post" || fail "c8: a direct cleanup with the captured token after the settlement was not refused" "$work/cases/c8-after-settle/post"
+grep -q "window has closed" "$work/cases/c8-after-settle/post" || fail "c8: the direct cleanup's refusal does not name the closed window" "$work/cases/c8-after-settle/post"
+plant c8b-after-settle-play
+p c8b-after-settle-play 'plant_root; plant_managed v0.10.0'
+e c8b-after-settle-play "BILLET_GATE_ANSWER=prepare:4:$work/corpus/no-change-outcome.json"
+ns_case c8b-after-settle-play escalated play2
+expect_refused c8b-after-settle-play "Judge the preparation's answer" "outcome"
+expect_final c8b-after-settle-play "no cleanup was attempted"
+expect_calls c8b-after-settle-play managed "converge-guard release" 0
+expect_state c8b-after-settle-play active dir
+echo "ok   C: a refusal inside the acquirer's window releases the guard this run acquired, one outside it never does, and every release failure names the remainder"
 
-# S11. The installed release read as B between the digest (A) and the hold,
-# then A again under the guard: the digest agrees and the decision does not.
-plant s11
-printf 'v0.9.0\nv0.10.0\n' >"$work/cases/s11/versions"
-run_case s11 escalated BILLET_FAKE_MANAGED_VERSION_SEQUENCE="$work/cases/s11/versions" BILLET_FAKE_CANDIDATE_VERSION=v0.9.5 -- -e billet_binary_src="$work/cases/s11/src/billet"
-expect_refused s11 "Refuse a converge whose installed release moved before the hold" "billet v0.9.0" "billet v0.10.0" "converge-guard release --holder h1"
-expect_calls s11 managed "version" 2
-echo "ok   S11: an installed release that moved behind an unchanged digest refuses under the guard"
+# =============================================================================
+# D. The intent, as the second call judges it, end to end through the role.
+# =============================================================================
+plant d3-same-candidate
+p d3-same-candidate "plant_root; plant_managed v0.10.0; plant_recovery $REC_A v0.10.1; plant_guard h1 $ROOT/$REC_A/billet.candidate"
+a d3-same-candidate -e "billet_binary_src=$bins/wrap-candidate-v0.10.1"
+ns_case d3-same-candidate escalated
+expect_allowed d3-same-candidate
+expect_fact d3-same-candidate acquired False
+expect_state d3-same-candidate record_release_executable "$ROOT/$REC_A/billet.candidate"
+plant d5-committed
+p d5-committed "plant_root; plant_recovery $REC_A v0.10.1; plant_managed_file $ROOT/$REC_A/billet.candidate; plant_guard h1 $ROOT/$REC_A/billet.candidate"
+ns_case d5-committed escalated
+expect_allowed d5-committed
+expect_calls d5-committed candidate "converge-guard prepare --holder h1 --json --no-change" 1
+plant d6-candidate-not-installed
+p d6-candidate-not-installed "plant_root; plant_managed v0.10.0; plant_recovery $REC_A v0.10.1; plant_guard h1 $ROOT/$REC_A/billet.candidate"
+ns_case d6-candidate-not-installed escalated
+expect_refused d6-candidate-not-installed "Refuse the preparation's answer" "intent"
+expect_final d6-candidate-not-installed "no cleanup was attempted"
+plant d7-completed-then-other
+p d7-completed-then-other "plant_root; plant_recovery $REC_A v0.10.1; plant_managed_file $ROOT/$REC_A/billet.candidate; plant_guard h1 $ROOT/$REC_A/billet.candidate"
+a d7-completed-then-other -e "billet_binary_src=$bins/wrap-candidate-v0.10.0"
+ns_case d7-completed-then-other escalated
+expect_refused d7-completed-then-other "Refuse the preparation's answer" "candidate"
+expect_state d7-completed-then-other record_release_executable "$ROOT/$REC_A/billet.candidate"
+plant d8-unverifiable
+p d8-unverifiable "plant_root; plant_managed v0.10.0; plant_guard h1 /usr/bin/billet; cp \$BINS/wrap-managed-v0.10.1 /usr/bin/billet"
+ns_case d8-unverifiable escalated
+expect_refused d8-unverifiable "Refuse the preparation's answer" "verification"
+expect_final d8-unverifiable "no cleanup was attempted"
+expect_state d8-unverifiable active dir
+plant d10-recovery-without-pointer
+p d10-recovery-without-pointer "plant_root; plant_managed v0.10.0; plant_guard h1 /usr/bin/billet; mkdir -m 0700 $ROOT/$REC_A; plant_pointer $REC_A"
+e d10-recovery-without-pointer "BILLET_GATE_HOOK=prepare:2:rm $ROOT/active/recovery"
+ns_case d10-recovery-without-pointer escalated
+expect_refused d10-recovery-without-pointer "Refuse the preparation's answer" "pointer"
+expect_final d10-recovery-without-pointer "no cleanup was attempted"
+echo "ok   D: the second call judges the intent against the record under the lock, end to end through the role"
 
-echo "converge guard: every guard, preparation and staging case passes"
+# =============================================================================
+# U. The unescalated cases, as the gate's invoker inside their namespace.
+# =============================================================================
+plant u1-foreign-root
+p u1-foreign-root 'plant_root; plant_managed v0.10.0'
+a u1-foreign-root -e "billet_upgrade_root_owner_uid=$invoker_uid"
+ns_case u1-foreign-root unescalated
+expect_refused u1-foreign-root "Refuse an upgrade root that is not what the role makes" "owned by uid 0"
+expect_calls u1-foreign-root managed "" 0
+plant u2-denied
+p u2-denied "plant_root; chmod 0700 /var/lib/billet; plant_managed v0.10.0"
+a u2-denied -e "billet_upgrade_root_owner_uid=$invoker_uid"
+ns_case u2-denied unescalated
+expect_refused u2-denied "Refuse a path the role could not examine" "could not be examined"
+expect_calls u2-denied managed "" 0
+grep -q "^uid=$invoker_uid$" "$work/cases/u1-foreign-root/out" 2>/dev/null || true
+echo "ok   U: an ordinary account is refused at the trust boundary before anything is asked"
+
+# =============================================================================
+# S. The staging: a pinned release fetched from the origin into an exclusive
+# journal, and the allocator's collision.
+# =============================================================================
+plant s1-pinned
+p s1-pinned 'plant_root; plant_managed v0.10.0'
+a s1-pinned -e billet_gate_facts=true -e billet_version=v0.10.1 -e "billet_release_url_base=$origin_url" -e "billet_release_stage=$work/cases/s1-pinned/stage" -e billet_fetch_retries=1 -e "billet_recovery_dir_suffix_command=$fakes/suffix"
+ns_case s1-pinned escalated
+expect_allowed s1-pinned
+expect_fact s1-pinned upgrade True
+rec=$(fact s1-pinned recovery)
+printf '%s' "$rec" | grep -Eq "^$ROOT/recovery-[0-9]{8}T[0-9]{6}-[0-9a-f]{8}$" || fail "s1: the recovery directory is not in the grammar: $rec"
+expect_calls s1-pinned suffix "" 1
+expect_calls s1-pinned mkdir "-m 0700 $rec" 1
+expect_state s1-pinned record_release_executable "$rec/billet.candidate"
+grep -q "^recovery=$(basename "$rec") $(sha256sum "$bins/wrap-candidate-v0.10.1" | cut -d' ' -f1)$" "$work/cases/s1-pinned/state" || fail "s1: the staged candidate is not the release's" "$work/cases/s1-pinned/state"
+plant s3-collision
+p s3-collision "plant_root; plant_managed v0.10.0; mkdir -m 0700 $ROOT/recovery-20260909T120000-0badcafe"
+printf '0badcafe\n1badcafe\n' >"$work/cases/s3-collision/suffixes"
+e s3-collision "BILLET_FAKE_DATE_MODE=frozen"
+e s3-collision "BILLET_FAKE_SUFFIXES=$work/cases/s3-collision/suffixes"
+a s3-collision -e "billet_binary_src=$bins/wrap-candidate-v0.10.1" -e "billet_recovery_dir_suffix_command=$fakes/suffix"
+ns_case s3-collision escalated
+expect_allowed s3-collision
+expect_fact s3-collision recovery "$ROOT/$REC_B"
+expect_calls s3-collision suffix "" 2
+echo "ok   S: a pinned release is fetched and staged into an exclusive journal under the guard, and a collision retries"
+
+echo "converge guard: every case passed"

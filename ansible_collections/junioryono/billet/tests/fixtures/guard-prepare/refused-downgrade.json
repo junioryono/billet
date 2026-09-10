@@ -1,0 +1,7 @@
+{
+  "outcome": "refused",
+  "reason": "downgrade",
+  "shape": "converge-guard",
+  "why": "the candidate v0.9.0 is older than the managed binary's v0.10.1",
+  "next": "--allow-downgrade, deliberately"
+}

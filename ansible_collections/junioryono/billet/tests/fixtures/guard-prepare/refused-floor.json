@@ -1,0 +1,7 @@
+{
+  "outcome": "refused",
+  "reason": "floor",
+  "shape": "converge-guard",
+  "why": "a release before the converge guard cannot take part in the exclusion: the candidate answered \"unknown command\" to converge-guard",
+  "next": "pin a release that carries the guard"
+}

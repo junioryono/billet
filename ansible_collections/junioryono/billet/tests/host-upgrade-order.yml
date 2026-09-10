@@ -22,6 +22,9 @@
     billet_host_allocate_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/allocate-recovery.yml') | from_yaml }}"
     billet_host_fallback_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/guard-fallback.yml') | from_yaml }}"
     billet_host_fallback_text: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/guard-fallback.yml') }}"
+    billet_host_answer_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/guard-answer.yml') | from_yaml }}"
+    billet_host_answer_text: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/guard-answer.yml') }}"
+    billet_fallback_module_text: "{{ lookup('ansible.builtin.file', playbook_dir + '/../plugins/modules/guard_fallback.py') }}"
     billet_host_services_text: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/services.yml') }}"
     billet_host_inspection_text: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/upgrade-inspect.yml') }}"
     billet_host_finalization_text: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/upgrade-finalize.yml') }}"
@@ -101,7 +104,8 @@
         billet_candidate_stage: "{{ (billet_stage_block | selectattr('name', 'equalto', 'Stage the candidate for the transaction') | first).block | selectattr('name', 'equalto', 'Stage the immutable candidate binary inside its recovery journal') | first }}"
         billet_prepare_names: "{{ billet_host_prepare_tasks | map(attribute='name') | list }}"
         billet_prepare_block: "{{ (billet_host_prepare_tasks | selectattr('name', 'equalto', 'Prepare the exclusion') | first).block }}"
-        billet_classify_block: "{{ ((billet_host_prepare_tasks | selectattr('name', 'equalto', 'Prepare the exclusion') | first).block | selectattr('name', 'equalto', 'Classify the claim through the guard') | first).block }}"
+        billet_protocol_block: "{{ ((billet_host_prepare_tasks | selectattr('name', 'equalto', 'Prepare the exclusion') | first).block | selectattr('name', 'equalto', 'Prepare through the guard') | first).block }}"
+        billet_rescue_block: "{{ ((billet_host_prepare_tasks | selectattr('name', 'equalto', 'Prepare the exclusion') | first).block | selectattr('name', 'equalto', 'Prepare through the guard') | first).rescue }}"
         billet_fallback_names: "{{ billet_host_fallback_tasks | map(attribute='name') | list }}"
         billet_unsafe_override_dropin: |
           [Service]
@@ -622,54 +626,48 @@
           timer and the services, and refuse an effective drop-in by asking systemd
           after a reload and judging the command's status.
 
-    # BOTH SPELLINGS OF A RELEASE ARE A RELEASE TO THE DOWNGRADE CHECK. A release
-    # through v0.9.1 prints its version without the tag's v, and a pattern that
-    # required it read every such candidate as not a release, at which point the
-    # assertion passed without comparing and an unnamed downgrade went through.
-    - name: The downgrade check recognises a release with or without its v
-      vars:
-        billet_downgrade_task: "{{ billet_stage_inner | selectattr('name', 'equalto', 'Refuse a converge that would downgrade this host') | first }}"
-        billet_release_pattern: "{{ billet_downgrade_task.vars.billet_release_tag }}"
-      ansible.builtin.assert:
-        that:
-          - "'0.9.1' is match(billet_release_pattern)"
-          - "'v0.9.2' is match(billet_release_pattern)"
-          - "'0.10.0' is match(billet_release_pattern)"
-          - "not ('latest' is match(billet_release_pattern))"
-          - "not ('01.2.3' is match(billet_release_pattern))"
-          - "not ('v1.2.3-rc1' is match(billet_release_pattern))"
-          - "not ('(devel)' is match(billet_release_pattern))"
-        fail_msg: >-
-          stage-candidate.yml's downgrade check must recognise both spellings of a release,
-          v0.9.2 and 0.9.1, and nothing that is not one; pattern {{ billet_release_pattern }}.
-
+    # THE DOWNGRADE IS THE COMMAND'S TO JUDGE (`billet converge-guard prepare
+    # --candidate`, through version.Compare, both spellings), so no task of the
+    # staging reads a version, and no pattern here to pin.
     # THE EXCLUSION IS PREPARED BEFORE ANYTHING ELSE, AND ITS TRANSACTION RUNS
-    # INSIDE THE GUARD. What no scenario can see: which task holds and when, that
-    # the classification is asked on every inclusion while the hold is taken
-    # once, that every read of `active`'s content is gated by the legacy shapes,
-    # that the claim under the guard is a pointer outside the transaction block,
-    # and that recovery and finalization prove ownership by shape first.
+    # INSIDE THE GUARD. What no scenario can see: that the two calls of the
+    # protocol are made in order through one parser, that a dry run reports
+    # before any shape dispatch, that the settlement is last and the cleanup
+    # release is the rescue's, that every read of `active`'s content is gated by
+    # the legacy shapes, that the claim under the guard is a pointer outside
+    # the transaction block, and that recovery and finalization prove ownership
+    # by shape first.
     - name: Record the preparation's shape
       ansible.builtin.set_fact:
-        billet_prepare_holds: "{{ (billet_classify_block + billet_prepare_block) | selectattr('name', 'equalto', 'Hold this host for the converge') | list }}"
         billet_prepare_holder_refusal: "{{ billet_host_prepare_tasks | selectattr('name', 'equalto', 'Refuse a converge without a holder') | first }}"
         billet_prepare_root_guard: "{{ billet_prepare_block | selectattr('name', 'equalto', 'Refuse an upgrade root that is not what the role makes') | first }}"
         billet_prepare_root_make: "{{ billet_prepare_block | selectattr('name', 'equalto', 'Establish the upgrade root') | first }}"
         billet_prepare_claim_stat: "{{ billet_prepare_block | selectattr('name', 'equalto', 'Inspect the durable claim') | first }}"
         billet_prepare_moved: "{{ billet_prepare_block | selectattr('name', 'equalto', 'Refuse a converge whose exclusion moved') | first }}"
-        billet_prepare_status: "{{ billet_classify_block | selectattr('name', 'equalto', \"Ask the managed binary for the claim's status\") | first }}"
-        billet_prepare_judge: "{{ billet_classify_block | selectattr('name', 'equalto', \"Judge the claim's status\") | first }}"
-        billet_prepare_pointer_read: "{{ billet_classify_block | selectattr('name', 'equalto', 'Read the transaction pointer') | first }}"
-        billet_prepare_classify: "{{ billet_classify_block | selectattr('name', 'equalto', \"Classify this holder's guard\") | first }}"
-        billet_prepare_stage_import: "{{ billet_prepare_block | selectattr('name', 'equalto', 'Decide the binary change and stage its candidate') | first }}"
-        billet_prepare_report: "{{ billet_prepare_block | selectattr('name', 'equalto', 'Report the exclusion') | first }}"
+        billet_prepare_dry_ask: "{{ billet_prepare_block | selectattr('name', 'equalto', 'Ask the managed binary to report the claim') | first }}"
+        billet_prepare_dry_judge: "{{ billet_prepare_block | selectattr('name', 'equalto', \"Judge the dry run's answer\") | first }}"
+        billet_prepare_dry_stage: "{{ billet_prepare_block | selectattr('name', 'equalto', 'Decide the binary change in a dry run') | first }}"
+        billet_prepare_legacy: "{{ billet_prepare_block | selectattr('name', 'equalto', 'Classify a legacy pointer') | first }}"
+        billet_prepare_protocol: "{{ billet_prepare_block | selectattr('name', 'equalto', 'Prepare through the guard') | first }}"
+        billet_prepare_first_managed: "{{ billet_protocol_block | selectattr('name', 'equalto', 'Ask the managed binary to prepare') | first }}"
+        billet_prepare_first_fallback: "{{ billet_protocol_block | selectattr('name', 'equalto', 'Ask the recorded executable to prepare') | first }}"
+        billet_prepare_first_candidate: "{{ billet_protocol_block | selectattr('name', 'equalto', 'Ask the staged candidate to prepare') | first }}"
+        billet_prepare_second: "{{ billet_protocol_block | selectattr('name', 'equalto', \"Declare this converge's intent to the guard\") | first }}"
+        billet_prepare_settle: "{{ billet_protocol_block | selectattr('name', 'equalto', 'Settle the guard this converge acquired') | first }}"
+        billet_prepare_legacy_reask: "{{ billet_protocol_block | selectattr('name', 'equalto', 'Ask the managed binary again whether it predates the guard') | first }}"
+        billet_prepare_unheld_restat: "{{ billet_protocol_block | selectattr('name', 'equalto', 'Inspect the managed binary and the claim again before an unheld converge') | first }}"
+        billet_prepare_stage_import: "{{ billet_protocol_block | selectattr('name', 'equalto', 'Decide the binary change and stage its candidate') | first }}"
+        billet_prepare_report: "{{ billet_protocol_block | selectattr('name', 'equalto', 'Report the exclusion') | first }}"
+        billet_prepare_cleanup: "{{ billet_rescue_block | selectattr('name', 'equalto', 'Release the guard this converge acquired before it changed anything') | first }}"
+        billet_prepare_remainder_ask: "{{ billet_rescue_block | selectattr('name', 'equalto', 'Ask what the remainder is') | first }}"
         billet_prepare_block_names: "{{ billet_prepare_block | map(attribute='name') | list }}"
-        billet_classify_names: "{{ billet_classify_block | map(attribute='name') | list }}"
+        billet_protocol_names: "{{ billet_protocol_block | map(attribute='name') | list }}"
+        billet_rescue_names: "{{ billet_rescue_block | map(attribute='name') | list }}"
+        billet_answer_names: "{{ billet_host_answer_tasks | map(attribute='name') | list }}"
+        billet_answer_judge: "{{ billet_host_answer_tasks | selectattr('name', 'equalto', \"Judge the preparation's answer\") | first }}"
+        billet_answer_facts: "{{ billet_host_answer_tasks | selectattr('name', 'equalto', \"Take the preparation's answer as this run's facts\") | first }}"
+        billet_answer_report: "{{ billet_host_answer_tasks | selectattr('name', 'equalto', \"Report the preparation's answer\") | first }}"
         billet_stage_reset: "{{ billet_host_stage_tasks | selectattr('name', 'equalto', 'Reset the transaction facts for this invocation') | first }}"
-        billet_stage_intent: "{{ billet_stage_block | selectattr('name', 'equalto', 'Refuse a same-holder rerun with a different intent') | first }}"
-        billet_stage_capability_judge: "{{ billet_stage_inner | selectattr('name', 'equalto', \"Judge the candidate's capability\") | first }}"
-        billet_stage_capability_ask: "{{ billet_stage_inner | selectattr('name', 'equalto', 'Ask the candidate whether it can take part in the exclusion') | first }}"
-        billet_stage_versions: "{{ billet_stage_inner | selectattr('name', 'equalto', 'Read the installed and candidate releases') | first }}"
         billet_allocate_task: "{{ billet_host_allocate_tasks | selectattr('name', 'equalto', 'Allocate a recovery directory exclusively') | first }}"
         billet_previous_binary_copy: "{{ billet_host_account_tasks | selectattr('name', 'equalto', 'Preserve the previous billet binary before live mutation') | first }}"
         billet_fallback_read: "{{ billet_host_fallback_tasks | selectattr('name', 'equalto', \"Read the guard's record\") | first }}"
@@ -693,8 +691,50 @@
         billet_inspect_slurp: "{{ billet_host_inspection_tasks | selectattr('name', 'equalto', 'Read the durable host-upgrade pointer') | first }}"
         billet_inspect_grammar: "{{ billet_host_inspection_tasks | selectattr('name', 'equalto', 'Refuse an unsafe or malformed host-upgrade pointer') | first }}"
         billet_services_slurp: "{{ billet_host_service_tasks | selectattr('name', 'equalto', 'Read back the exclusive host-upgrade claim before live mutation') | first }}"
+        # THE COMMANDS OF THE PROTOCOL: every command that speaks to the guard,
+        # in the block and in its rescue.
+        billet_guard_commands: >-
+          {{ (billet_prepare_block + billet_protocol_block + billet_rescue_block)
+             | selectattr('name', 'in', ['Ask the managed binary to report the claim', 'Ask the managed binary to prepare',
+                                        'Ask the recorded executable to prepare', 'Ask the staged candidate to prepare',
+                                        "Declare this converge's intent to the guard", 'Ask the managed binary again whether it predates the guard',
+                                        'Settle the guard this converge acquired', 'Release the guard this converge acquired before it changed anything',
+                                        'Ask what the remainder is'])
+             | list }}
+        # THE TASKS THE REWORK REMOVED, absent by name from every file of the preparation.
+        billet_removed_task_names:
+          - Classify the claim through the guard
+          - "Ask the managed binary for the claim's status"
+          - "Judge the claim's status"
+          - Read the transaction pointer
+          - "Classify this holder's guard"
+          - Hold this host for the converge
+          - Record the hold
+          - Inspect the installed billet binary under the guard
+          - Refuse a converge whose installed binary moved before the hold
+          - Read the installed release under the guard
+          - Refuse a converge whose installed release moved before the hold
+          - Refuse a converge whose managed binary appeared or vanished before the staging
+          - Refuse a same-holder rerun with a different intent
+          - Read the installed and candidate releases
+          - Refuse a converge that would downgrade this host
+          - Ask the candidate whether it can take part in the exclusion
+          - "Judge the candidate's capability"
+          - Refuse a bootstrap over a root that holds something the role did not write
+          - Inspect the upgrade root's entries
+          - "Ask the recorded executable for the claim's status"
+          - Report a Mac with no billet to hold
+          - Record that a Mac with no billet holds nothing
 
-    - name: The preparation runs first, holds once, classifies always and stages before the hold
+    - name: The status module is gone from the collection
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      register: billet_status_module_files
+      loop:
+        - "{{ playbook_dir }}/../plugins/modules/guard_status.py"
+        - "{{ playbook_dir }}/guard_status_check.py"
+
+    - name: The preparation runs first, calls twice through one parser, settles last and cleans up in its rescue
       ansible.builtin.assert:
         that:
           - billet_main_names[0] == 'Refuse a converge that would destroy the job running it'
@@ -704,6 +744,15 @@
           - billet_host_prepare_tasks[0]['ansible.builtin.import_tasks'] == 'converge-guard.yml'
           - billet_prepare_names.index('Refuse a converge without a holder') < billet_prepare_names.index('Inspect the managed binary and the upgrade root')
           - "'ansible_check_mode or' in (billet_prepare_holder_refusal['ansible.builtin.assert'].that | join(' '))"
+          # THE REMOVED TASKS ARE GONE, from every file of the preparation, and so is the status module.
+          - >-
+            (billet_host_prepare_tasks + billet_prepare_block + billet_protocol_block + billet_rescue_block
+             + billet_host_stage_tasks + billet_stage_block + billet_stage_inner + billet_host_fallback_tasks + billet_host_answer_tasks)
+            | map(attribute='name') | select('in', billet_removed_task_names) | list | length == 0
+          - billet_status_module_files.results | selectattr('stat.exists') | list | length == 0
+          - "'guard_status' not in billet_host_prepare_text"
+          - "'guard_status' not in billet_host_fallback_text"
+          - "'guard_status' not in billet_host_answer_text"
           # THE ROOT: stat'ed without following, created only under ENOENT on Linux, judged by five properties.
           - "'not billet_exclusion_root_stat.exists' in (billet_prepare_root_make.when | string)"
           - "'not billet_exclusion_darwin' in (billet_prepare_root_make.when | string)"
@@ -715,93 +764,226 @@
           - "'woth' in (billet_prepare_root_guard['ansible.builtin.assert'].that | join(' '))"
           - billet_prepare_block_names.index('Refuse an upgrade root that is not what the role makes') < billet_prepare_block_names.index('Establish the upgrade root')
           - billet_prepare_block_names.index('Establish the upgrade root') < billet_prepare_block_names.index('Inspect the durable claim')
-          # THE CLAIM: stat'ed without following, never trusted when the stat failed, and the later classification governs.
-          - billet_prepare_claim_stat['ansible.builtin.stat'].follow == false
-          - billet_prepare_claim_stat.failed_when == false
-          - "'billet_exclusion_active.stat is defined' in (billet_host_prepare_tasks | to_json)"
-          - "'billet_exclusion_held' in (billet_prepare_moved.when | string)"
-          - billet_prepare_block_names.index('Refuse a converge whose exclusion moved') < billet_prepare_block_names.index('Refuse to converge over a host upgrade billet itself is running')
-          # THE STATUS PROTOCOL: the module, unconditionally on every inclusion (no held gate), judged as one word.
-          - "'junioryono.billet.guard_status' in billet_prepare_status"
-          - "'billet_exclusion_held' not in (billet_prepare_status.when | string)"
-          - "'billet_exclusion_held' not in (billet_classify_names | join(' '))"
-          - "\"in ['capable', 'pre_r']\" in (billet_prepare_judge['ansible.builtin.assert'].that | join(' '))"
-          - billet_classify_names.index('Judge the claim\'s status') < billet_classify_names.index('Refuse a converge whose exclusion moved to another holder')
-          - billet_classify_names.index('Refuse a converge whose exclusion moved to another holder') < billet_classify_names.index('Refuse a claim that cannot be classified')
-          - billet_classify_names.index('Refuse a claim that cannot be classified') < billet_classify_names.index('Refuse a hold that never returned from publishing')
-          - billet_classify_names.index('Refuse a hold that never returned from publishing') < billet_classify_names.index('Refuse a guard whose record cannot be read')
-          - billet_classify_names.index('Refuse a guard whose record cannot be read') < billet_classify_names.index('Refuse a guard whose recorded executable does not verify')
-          - billet_classify_names.index('Refuse a guard whose recorded executable does not verify') < billet_classify_names.index('Refuse a guard another converge holds')
-          - billet_classify_names.index('Refuse a guard another converge holds') < billet_classify_names.index('Inspect the transaction pointer')
-          # THE POINTER by readlink, its type and grammar judged, and the shape derived from it, never from active's existence.
-          - "'readlink' in billet_prepare_pointer_read['ansible.builtin.command'].argv"
-          - "'islnk' in (billet_prepare_pointer_read.when | string)"
-          - "'recovery-[0-9]{8}T[0-9]{6}-[0-9a-f]{8}|[0-9]{8}T[0-9]{15}' in billet_host_prepare_text"
-          - "'billet_exclusion_pointer | bool' in (billet_prepare_classify['ansible.builtin.set_fact'].billet_interrupted_upgrade | string)"
-          - "'stat.exists' not in (billet_prepare_classify['ansible.builtin.set_fact'].billet_interrupted_upgrade | string)"
-          # TWO HOLDS AND NO MORE: the validation hold before the staging, gated once per process; the acquisition after it.
-          - billet_prepare_holds | length == 2
-          - "'not (billet_exclusion_held' in (billet_prepare_holds[0].when | string)"
-          - "\"in ['guard', 'guard-pointer']\" in (billet_prepare_holds[0].when | string)"
-          - "'not ansible_check_mode' in (billet_prepare_holds[0].when | string)"
-          - "'--candidate' not in (billet_prepare_holds[0]['ansible.builtin.command'].argv | string)"
-          - "'billet_exclusion_will_hold' in (billet_prepare_holds[1].when | string)"
-          - "'--candidate' in (billet_prepare_holds[1]['ansible.builtin.command'].argv | string)"
-          - billet_classify_names.index('Classify this holder\'s guard') < billet_classify_names.index('Hold this host for the converge')
-          - billet_prepare_block_names.index('Classify the claim through the guard') < billet_prepare_block_names.index('Decide the binary change and stage its candidate')
-          - billet_prepare_block_names.index('Decide the binary change and stage its candidate') < billet_prepare_block_names.index('Report the exclusion')
-          - billet_prepare_block_names.index('Report the exclusion') < billet_prepare_block_names.index('Hold this host for the converge')
-          - billet_prepare_stage_import['ansible.builtin.import_tasks'] == 'stage-candidate.yml'
-          - "'release --holder' in billet_prepare_report['ansible.builtin.debug'].msg"
-          - "'recover --holder' in billet_prepare_report['ansible.builtin.debug'].msg"
-          - "'--old-driver-stopped' in billet_prepare_report['ansible.builtin.debug'].msg"
-          # EACH HOLD is bounded and escalated by platform: `timeout` on Linux, the task's async bound and no escalation on a Mac.
-          - "'timeout' in (billet_prepare_holds[0]['ansible.builtin.command'].argv | string)"
-          - "'billet_exclusion_darwin' in (billet_prepare_holds[0]['ansible.builtin.command'].argv | string)"
-          - "'billet_exclusion_darwin' in (billet_prepare_holds[0]['async'] | string)"
-          - billet_prepare_holds[0].poll is defined
-          - "'billet_exclusion_become' in (billet_prepare_holds[0].become | string)"
-          - "'timeout' in (billet_prepare_holds[1]['ansible.builtin.command'].argv | string)"
-          - "'billet_exclusion_darwin' in (billet_prepare_holds[1]['async'] | string)"
-          - billet_prepare_holds[1].poll is defined
-          - "'billet_exclusion_become' in (billet_prepare_holds[1].become | string)"
-          # THE INSTALLED BINARY IS RE-OBSERVED UNDER A FRESH GUARD, and a moved one refuses.
-          - billet_prepare_block_names.index('Record the hold') < billet_prepare_block_names.index('Inspect the installed billet binary under the guard')
-          - billet_prepare_block_names.index('Inspect the installed billet binary under the guard') < billet_prepare_block_names.index('Refuse a converge whose installed binary moved before the hold')
-          - "'billet_installed_binary.stat.checksum' in ((billet_prepare_block | selectattr('name', 'equalto', 'Refuse a converge whose installed binary moved before the hold') | first)['ansible.builtin.assert'].that | join(' '))"
-          - (billet_prepare_block | selectattr('name', 'equalto', 'Inspect the installed billet binary under the guard') | first).when == ['billet_exclusion_hold is changed', 'not billet_exclusion_darwin | bool']
-          - (billet_prepare_block | selectattr('name', 'equalto', 'Refuse a converge whose installed binary moved before the hold') | first).when == ['billet_exclusion_hold is changed', 'not billet_exclusion_darwin | bool']
-          - (billet_prepare_block | selectattr('name', 'equalto', 'Read the installed release under the guard') | first).when == ['billet_exclusion_hold is changed', 'not billet_exclusion_darwin | bool', 'billet_binary_upgrade | default(false)', 'billet_installed_binary.stat.exists']
-          - (billet_prepare_block | selectattr('name', 'equalto', 'Refuse a converge whose installed release moved before the hold') | first).when == ['billet_exclusion_hold is changed', 'not billet_exclusion_darwin | bool', 'billet_binary_upgrade | default(false)', 'billet_installed_binary.stat.exists']
-          - billet_prepare_block_names.index('Refuse a converge whose installed binary moved before the hold') < billet_prepare_block_names.index('Read the installed release under the guard')
-          - billet_prepare_block_names.index('Read the installed release under the guard') < billet_prepare_block_names.index('Refuse a converge whose installed release moved before the hold')
           # THE CHAIN ABOVE THE ROOT is judged before the claim is inspected, through the module's ancestors judgement.
           - billet_prepare_block_names.index('Judge the ancestors of the upgrade root') < billet_prepare_block_names.index('Inspect the durable claim')
           - billet_prepare_block_names.index('Refuse an upgrade root whose ancestors another account can rename') < billet_prepare_block_names.index("Establish the upgrade root's parent")
           - "'billet_exclusion_ancestors.judged' in ((billet_prepare_block | selectattr('name', 'equalto', 'Refuse an upgrade root whose ancestors another account can rename') | first)['ansible.builtin.assert'].that | join(' '))"
+          - (billet_prepare_block | selectattr('name', 'equalto', 'Judge the ancestors of the upgrade root') | first)['junioryono.billet.guard_fallback'].judge == 'ancestors'
           - (billet_prepare_block | selectattr('name', 'equalto', "Establish the upgrade root's parent") | first)['ansible.builtin.file'].follow == false
           - billet_prepare_root_make['ansible.builtin.file'].follow == false
-          - billet_prepare_block_names | last == 'Refuse a converge whose exclusion was never established'
+          # THE CLAIM: stat'ed without following, never trusted when the stat failed.
+          - billet_prepare_claim_stat['ansible.builtin.stat'].follow == false
+          - billet_prepare_claim_stat.failed_when == false
+          - "'billet_exclusion_active.stat is defined' in (billet_host_prepare_tasks | to_json)"
+          # THE DRY RUN FIRST: `prepare --dry-run` before the memory check and the shape dispatch, judged by its own parser, then the read-only staging, all of it before the protocol's block.
+          - "'--dry-run' in (billet_prepare_dry_ask['ansible.builtin.command'].argv | string)"
+          - "'ansible_check_mode' in (billet_prepare_dry_ask.when | string)"
+          - billet_prepare_dry_ask.no_log is not defined
+          - billet_prepare_block_names.index('Inspect the durable claim') < billet_prepare_block_names.index('Ask the managed binary to report the claim')
+          - billet_prepare_block_names.index('Ask the managed binary to report the claim') < billet_prepare_block_names.index("Judge the dry run's answer")
+          - billet_prepare_block_names.index("Judge the dry run's answer") < billet_prepare_block_names.index('Report what a dry run found')
+          - billet_prepare_block_names.index('Report what a dry run found') < billet_prepare_block_names.index('Decide the binary change in a dry run')
+          - billet_prepare_block_names.index('Decide the binary change in a dry run') < billet_prepare_block_names.index('Refuse a converge whose exclusion moved')
+          - billet_prepare_dry_stage['ansible.builtin.import_tasks'] == 'stage-candidate.yml'
+          - billet_prepare_dry_stage.when == 'ansible_check_mode'
+          - "'ansible_check_mode' in (billet_prepare_dry_judge.when | string)"
+          - "'billet_exclusion_dry_wrong' in (billet_prepare_dry_judge['ansible.builtin.assert'].that | join(' '))"
+          # THE ROLE'S OWN MEMORY precedes the shape dispatch, and the legacy file is the role's stat's to classify, outside check mode.
+          - "'billet_exclusion_held' in (billet_prepare_moved.when | string)"
+          - "'not ansible_check_mode' in (billet_prepare_moved.when | string)"
+          - billet_prepare_block_names.index('Refuse a converge whose exclusion moved') < billet_prepare_block_names.index('Refuse to converge over a host upgrade billet itself is running')
+          - billet_prepare_block_names.index('Refuse to converge over a host upgrade billet itself is running') < billet_prepare_block_names.index('Refuse a claim of a type the role does not know')
+          - billet_prepare_block_names.index('Refuse a claim of a type the role does not know') < billet_prepare_block_names.index('Classify a legacy pointer')
+          - billet_prepare_block_names.index('Classify a legacy pointer') < billet_prepare_block_names.index('Prepare through the guard')
+          - "'isreg' in (billet_prepare_legacy.when | string)"
+          - "'not ansible_check_mode' in (billet_prepare_legacy.when | string)"
+          - billet_prepare_legacy['ansible.builtin.set_fact'].billet_upgrade_claim_shape == 'legacy-file'
+          - "\"!= 'legacy-file'\" in (billet_prepare_protocol.when | string)"
+          - "'not ansible_check_mode' in (billet_prepare_protocol.when | string)"
+          - billet_prepare_block_names | last == 'Prepare through the guard'
+          # THE TWO CALLS, in order, through the one parser, and the staging between them.
+          - "'--validate' in (billet_prepare_first_managed['ansible.builtin.command'].argv | string)"
+          - "'--expect-id' in (billet_prepare_first_managed['ansible.builtin.command'].argv | string)"
+          - "'billet_exclusion_binary_present' in (billet_prepare_first_managed.when | string)"
+          - "'--validate' in (billet_prepare_first_fallback['ansible.builtin.command'].argv | string)"
+          - "'billet_exclusion_fallback_executable' in (billet_prepare_first_fallback['ansible.builtin.command'].argv | string)"
+          - "\"== 'fallback'\" in (billet_prepare_first_fallback.when | string)"
+          - "'--validate' in (billet_prepare_first_candidate['ansible.builtin.command'].argv | string)"
+          - "'--candidate' in (billet_prepare_first_candidate['ansible.builtin.command'].argv | string)"
+          - "\"'--expect-bootstrap'] if billet_exclusion_route == 'unheld'\" in (billet_prepare_first_candidate['ansible.builtin.command'].argv | string)"
+          - "\"in ['pre-r', 'unheld']\" in (billet_prepare_first_candidate.when | string)"
+          - "'billet_binary_upgrade' in (billet_prepare_first_candidate.when | string)"
+          - "'--recovery' in (billet_prepare_second['ansible.builtin.command'].argv | string)"
+          - "'--no-change' in (billet_prepare_second['ansible.builtin.command'].argv | string)"
+          - "'--candidate' in (billet_prepare_second['ansible.builtin.command'].argv | string)"
+          - "'--allow-downgrade' in (billet_prepare_second['ansible.builtin.command'].argv | string)"
+          - "'billet_allow_downgrade' in (billet_prepare_second['ansible.builtin.command'].argv | string)"
+          - "'--validate' not in (billet_prepare_second['ansible.builtin.command'].argv | string)"
+          - "'billet_exclusion_executable' in (billet_prepare_second['ansible.builtin.command'].argv | string)"
+          - "\"in ['managed', 'fallback', 'candidate']\" in (billet_prepare_second.when | string)"
+          - billet_protocol_names[0] == "Reset this invocation's route"
+          - billet_protocol_names.index('Ask the managed binary to prepare') < billet_protocol_names.index("Judge the managed binary's first answer")
+          - billet_protocol_names.index("Judge the managed binary's first answer") < billet_protocol_names.index("Note the route the managed binary's answer chose")
+          - billet_protocol_names.index("Note the route the managed binary's answer chose") < billet_protocol_names.index('Read the guard\'s record for the executable that can answer')
+          - billet_protocol_names.index('Read the guard\'s record for the executable that can answer') < billet_protocol_names.index('Ask the recorded executable to prepare')
+          - billet_protocol_names.index('Ask the recorded executable to prepare') < billet_protocol_names.index("Judge the recorded executable's first answer")
+          - billet_protocol_names.index("Judge the recorded executable's first answer") < billet_protocol_names.index('Refuse a recorded executable that predates the guard')
+          - billet_protocol_names.index('Refuse a recorded executable that predates the guard') < billet_protocol_names.index('Decide the binary change and stage its candidate')
+          - billet_protocol_names.index('Decide the binary change and stage its candidate') < billet_protocol_names.index('Ask the staged candidate to prepare')
+          - billet_protocol_names.index('Ask the staged candidate to prepare') < billet_protocol_names.index("Judge the staged candidate's first answer")
+          - billet_protocol_names.index("Judge the staged candidate's first answer") < billet_protocol_names.index('Refuse a staged candidate that predates the guard')
+          - billet_protocol_names.index('Refuse a staged candidate that predates the guard') < billet_protocol_names.index('Note that the candidate answers for this run')
+          - billet_protocol_names.index('Note that the candidate answers for this run') < billet_protocol_names.index("Declare this converge's intent to the guard")
+          - billet_protocol_names.index("Declare this converge's intent to the guard") < billet_protocol_names.index('Judge the second answer')
+          - billet_protocol_names.index('Judge the second answer') < billet_protocol_names.index('Ask the managed binary again whether it predates the guard')
+          - billet_protocol_names.index('Ask the managed binary again whether it predates the guard') < billet_protocol_names.index('Refuse a converge whose managed binary moved')
+          - billet_protocol_names.index('Refuse a converge whose managed binary moved') < billet_protocol_names.index('Inspect the managed binary and the claim again before an unheld converge')
+          - billet_protocol_names.index('Inspect the managed binary and the claim again before an unheld converge') < billet_protocol_names.index('Refuse a converge whose managed binary appeared')
+          - billet_protocol_names.index('Refuse a converge whose managed binary appeared') < billet_protocol_names.index('Refuse an unheld converge over a claim that appeared')
+          - billet_protocol_names.index('Refuse an unheld converge over a claim that appeared') < billet_protocol_names.index('Record that a release before the guard runs the legacy protocol')
+          - billet_protocol_names.index('Record that a release before the guard runs the legacy protocol') < billet_protocol_names.index('Refuse a converge whose exclusion was never established')
+          - billet_protocol_names.index('Refuse a converge whose exclusion was never established') < billet_protocol_names.index('Report the exclusion')
+          - billet_protocol_names.index('Report the exclusion') < billet_protocol_names.index('Settle the guard this converge acquired')
+          - billet_protocol_names.index('Settle the guard this converge acquired') < billet_protocol_names.index('Close the preparation window')
+          - billet_protocol_names | last == 'Close the preparation window'
+          - billet_prepare_stage_import['ansible.builtin.import_tasks'] == 'stage-candidate.yml'
+          # EVERY JUDGEMENT IS THE ONE PARSER, told which call it judges.
+          - (billet_protocol_block | selectattr('name', 'equalto', "Judge the managed binary's first answer") | first)['ansible.builtin.include_tasks'] == 'guard-answer.yml'
+          - (billet_protocol_block | selectattr('name', 'equalto', "Judge the managed binary's first answer") | first).vars.billet_exclusion_call == 'first'
+          - (billet_protocol_block | selectattr('name', 'equalto', "Judge the recorded executable's first answer") | first)['ansible.builtin.include_tasks'] == 'guard-answer.yml'
+          - (billet_protocol_block | selectattr('name', 'equalto', "Judge the staged candidate's first answer") | first)['ansible.builtin.include_tasks'] == 'guard-answer.yml'
+          - (billet_protocol_block | selectattr('name', 'equalto', 'Judge the second answer') | first)['ansible.builtin.include_tasks'] == 'guard-answer.yml'
+          - (billet_protocol_block | selectattr('name', 'equalto', 'Judge the second answer') | first).vars.billet_exclusion_call == 'second'
+          - billet_protocol_block | select('contains', 'ansible.builtin.include_tasks') | list | length == 4
+          # THE UNHELD PATHS RE-EXAMINE what they rested on, at their end.
+          - "'holder' in (billet_prepare_legacy_reask['ansible.builtin.command'].argv | string)"
+          - "\"== 'pre-r'\" in (billet_prepare_legacy_reask.when | string)"
+          - "\"in ['pre-r', 'unheld']\" in (billet_prepare_unheld_restat.when | string)"
+          - billet_prepare_unheld_restat['ansible.builtin.stat'].follow == false
+          - "'billet_exclusion_unheld_recheck.results[0].stat is defined' in ((billet_protocol_block | selectattr('name', 'equalto', 'Refuse a converge whose managed binary appeared') | first)['ansible.builtin.assert'].that | join(' '))"
+          - "'billet_exclusion_unheld_recheck.results[1].stat is defined' in ((billet_protocol_block | selectattr('name', 'equalto', 'Refuse an unheld converge over a claim that appeared') | first)['ansible.builtin.assert'].that | join(' '))"
+          - "'unknown (converge-guard )?command' in ((billet_protocol_block | selectattr('name', 'equalto', 'Refuse a converge whose managed binary moved') | first)['ansible.builtin.assert'].that | join(' '))"
+          # THE SETTLEMENT is last, exactly when this inclusion acquired, and the token is cleared after it.
+          - "'settle' in (billet_prepare_settle['ansible.builtin.command'].argv | string)"
+          - "'--token' in (billet_prepare_settle['ansible.builtin.command'].argv | string)"
+          - "'billet_exclusion_cleanup_token' in (billet_prepare_settle['ansible.builtin.command'].argv | string)"
+          - "'billet_exclusion_acquired' in (billet_prepare_settle.when | string)"
+          - (billet_protocol_block | selectattr('name', 'equalto', 'Close the preparation window') | first)['ansible.builtin.set_fact'].billet_exclusion_cleanup_token == ''
           # THE CLOSING PREDICATE WHOLE, whitespace folded: a weaker branch
           # that still names the held flag and check mode is not this one.
           - >-
-            ((billet_prepare_block | selectattr('name', 'equalto', 'Refuse a converge whose exclusion was never established') | first)['ansible.builtin.assert'].that
+            ((billet_protocol_block | selectattr('name', 'equalto', 'Refuse a converge whose exclusion was never established') | first)['ansible.builtin.assert'].that
              | join(' ') | regex_replace('\\s+', ' ') | trim)
             == "ansible_check_mode or (billet_exclusion_held | default(false) | bool) or (billet_upgrade_claim_shape | default('none') in ['legacy-file', 'legacy']) or (not (billet_exclusion_binary_present | bool) and not (billet_binary_upgrade | default(false) | bool) and billet_upgrade_claim_shape | default('none') == 'none')"
+          - "'release --holder' in billet_prepare_report['ansible.builtin.debug'].msg"
+          - "'recover --holder' in billet_prepare_report['ansible.builtin.debug'].msg"
+          - "'--old-driver-stopped' in billet_prepare_report['ansible.builtin.debug'].msg"
+          # THE RESCUE: the cleanup release with the token, never past a pointer, then the remainder examined and the original refusal re-raised, last and unconditionally.
+          - billet_rescue_names[0] == 'Release the guard this converge acquired before it changed anything'
+          - "'--cleanup' in (billet_prepare_cleanup['ansible.builtin.command'].argv | string)"
+          - "'--token' in (billet_prepare_cleanup['ansible.builtin.command'].argv | string)"
+          - "'billet_exclusion_cleanup_token' in (billet_prepare_cleanup['ansible.builtin.command'].argv | string)"
+          - "'billet_exclusion_cleanup_token' in (billet_prepare_cleanup.when | string)"
+          - "'not (billet_interrupted_upgrade' in (billet_prepare_cleanup.when | string)"
+          - billet_prepare_cleanup.failed_when == false
+          - billet_rescue_names.index('Release the guard this converge acquired before it changed anything') < billet_rescue_names.index('Examine what remains after the cleanup')
+          - billet_rescue_names.index('Examine what remains after the cleanup') < billet_rescue_names.index('Ask what the remainder is')
+          - billet_rescue_names.index('Ask what the remainder is') < billet_rescue_names.index('Record what the cleanup did')
+          - billet_rescue_names.index('Record what the cleanup did') < billet_rescue_names.index('Close the preparation window after the cleanup')
+          - billet_rescue_names | last == 'Fail with the refusal that ended the preparation'
+          - (billet_rescue_block | last).when is not defined
+          - "'status' in (billet_prepare_remainder_ask['ansible.builtin.command'].argv | string)"
+          - (billet_rescue_block | selectattr('name', 'equalto', 'Examine what remains after the cleanup') | first)['ansible.builtin.stat'].follow == false
+          - "'durability is not proved' in ((billet_rescue_block | last)['ansible.builtin.fail'].msg)"
+          - "'recover --unpublished' in ((billet_rescue_block | last)['ansible.builtin.fail'].msg)"
+          # THE LEGACY PROTOCOL only when no capable executable exists.
+          - "'billet_exclusion_managed_pre_r' in ((billet_protocol_block | selectattr('name', 'equalto', 'Record that a release before the guard runs the legacy protocol') | first).when | string)"
+          - "'not (billet_binary_upgrade' in ((billet_protocol_block | selectattr('name', 'equalto', 'Record that a release before the guard runs the legacy protocol') | first).when | string)"
           # THE CHANNEL'S GET RUNS IN A DRY RUN, or the task after it reads a
           # statement that was never fetched.
           - ((billet_host_binary_tasks | selectattr('name', 'equalto', 'Resolve the release channel') | first).block | selectattr('name', 'equalto', 'Read the signed channel statement') | first).check_mode == false
-          - (billet_prepare_block | selectattr('name', 'equalto', 'Judge the ancestors of the upgrade root') | first)['junioryono.billet.guard_fallback'].judge == 'ancestors'
-          # THE LEGACY PROTOCOL only when no capable executable exists.
-          - "'billet_exclusion_managed_pre_r' in ((billet_prepare_block | selectattr('name', 'equalto', 'Record that a release before the guard runs the legacy protocol') | first).when | string)"
-          - "'not (billet_binary_upgrade' in ((billet_prepare_block | selectattr('name', 'equalto', 'Record that a release before the guard runs the legacy protocol') | first).when | string)"
         fail_msg: >-
           prepare-exclusion.yml must run the guard first, refuse an absent holder
-          before any stat, establish the root only under ENOENT, classify the claim
-          through the status module on every inclusion, derive the interruption
-          from the pointer, hold exactly twice (a validation before the staging, an
-          acquisition after it) under a bound, and name the two ways out before
-          the hold.
+          before any stat, establish the root only under ENOENT, run the dry run's
+          report before the memory check and the shape dispatch, classify a
+          legacy file by its own stat, make the two calls in order through the one
+          parser with the staging between them, re-examine the unheld paths at
+          their end, settle last, and clean up only in its rescue.
+
+    # THE PARSER: one file, every member judged by name, the token kept in a
+    # fact no report prints, the facts taken from the answer alone.
+    - name: The answer's parser judges every member and prints no token
+      ansible.builtin.assert:
+        that:
+          - billet_answer_names[0] == 'Note whether the executable predates the guard'
+          - billet_answer_names.index('Refuse a preparation that did not answer') < billet_answer_names.index("Read the preparation's answer")
+          - billet_answer_names.index("Read the preparation's answer") < billet_answer_names.index("Judge the preparation's answer")
+          - billet_answer_names.index("Judge the preparation's answer") < billet_answer_names.index("Refuse the preparation's answer")
+          - billet_answer_names.index("Refuse the preparation's answer") < billet_answer_names.index("Take the preparation's answer as this run's facts")
+          - billet_answer_names.index("Take the preparation's answer as this run's facts") < billet_answer_names.index("Report the preparation's answer")
+          - billet_answer_judge.vars.billet_exclusion_checks | map(attribute='name') | list == ['outcome', 'reason', 'why', 'id', 'holder', 'preparing', 'token', 'record', 'pointer', 'pointer_target', 'managed', 'downgrade']
+          - "'item.ok | bool' in (billet_answer_judge['ansible.builtin.assert'].that | join(' '))"
+          - "'recovery-[0-9]{8}T[0-9]{6}-[0-9a-f]{8}|[0-9]{8}T[0-9]{15}' in billet_host_answer_text"
+          - "'billet_exclusion_id' in billet_answer_facts['ansible.builtin.set_fact']"
+          - "'billet_exclusion_cleanup_token' in billet_answer_facts['ansible.builtin.set_fact']"
+          - "'billet_exclusion_held' in billet_answer_facts['ansible.builtin.set_fact']"
+          - "'billet_interrupted_upgrade' in billet_answer_facts['ansible.builtin.set_fact']"
+          - "'billet_upgrade_claim_shape' in billet_answer_facts['ansible.builtin.set_fact']"
+          - "\"== 'acquired'\" in (billet_answer_facts['ansible.builtin.set_fact'].billet_exclusion_cleanup_token | string)"
+          - billet_answer_facts.no_log == true
+          - (billet_host_answer_tasks | selectattr('name', 'equalto', "Read the preparation's answer") | first).no_log == true
+          - "'token' not in billet_answer_report['ansible.builtin.debug'].msg"
+          - "'unknown (converge-guard )?command' in billet_host_answer_text"
+        fail_msg: >-
+          guard-answer.yml must refuse an answer that did not arrive, judge every
+          member of one by name, refuse a refusal in the command's words, take the
+          facts from the answer alone with the token kept unprinted, and report
+          without it.
+
+    # THE COMMANDS OF THE PROTOCOL: each bounded by platform (`timeout -k 10`
+    # on Linux, the task's async bound and no escalation on a Mac; the
+    # candidate's first call is Linux's alone), and the calls that carry or
+    # could carry the token under no_log.
+    - name: Every command of the protocol is bounded by platform
+      ansible.builtin.assert:
+        that:
+          - billet_guard_commands | length == 9
+          - "'converge-guard' in (item['ansible.builtin.command'].argv | string)"
+          - "'timeout' in (item['ansible.builtin.command'].argv | string)"
+          - "item.name == 'Ask the staged candidate to prepare' or 'billet_exclusion_darwin' in (item['ansible.builtin.command'].argv | string)"
+          - "item.name == 'Ask the staged candidate to prepare' or 'billet_exclusion_darwin' in (item['async'] | string)"
+          - "item.name == 'Ask the staged candidate to prepare' or item.poll is defined"
+          - "item.name == 'Ask the staged candidate to prepare' or 'billet_exclusion_become' in (item.become | string)"
+          - item.check_mode == false
+        fail_msg: >-
+          The preparation's command "{{ item.name }}" must run under `timeout -k 10`
+          on Linux and the task's async bound on a Mac, escalated by platform, and
+          never in check mode's simulation.
+      loop: "{{ billet_guard_commands }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: The calls that speak the token run under no_log
+      ansible.builtin.assert:
+        that:
+          - item.no_log == true
+        fail_msg: >-
+          "{{ item.name }}" carries or can carry the acquiring invocation's token
+          and must run under no_log.
+      loop: >-
+        {{ billet_guard_commands
+           | selectattr('name', 'in', ['Ask the managed binary to prepare', 'Ask the recorded executable to prepare',
+                                      'Ask the staged candidate to prepare', "Declare this converge's intent to the guard",
+                                      'Settle the guard this converge acquired',
+                                      'Release the guard this converge acquired before it changed anything']) | list }}
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: The four calls, the settlement and the cleanup are all present
+      ansible.builtin.assert:
+        that:
+          - billet_guard_commands | map(attribute='name') | select('in', ['Ask the managed binary to prepare', 'Ask the recorded executable to prepare', 'Ask the staged candidate to prepare', "Declare this converge's intent to the guard", 'Settle the guard this converge acquired', 'Release the guard this converge acquired before it changed anything']) | list | length == 6
+        fail_msg: the protocol's six commands must all exist under their names.
 
     - name: Every stat of the preparation follows nothing and reads no content
       ansible.builtin.assert:
@@ -814,18 +996,14 @@
           get_checksum false and get_mime false: it judges a path's type and
           metadata before anything reads its content.
       # select('contains', ...) rather than selectattr, whose dotted attribute
-      # would look for tasks['ansible']['builtin']['stat']. The one stat that
-      # reads content is the managed binary's digest under a fresh guard, the
-      # staging's own decision re-observed; it is named here so nothing else
-      # can join it unnoticed.
+      # would look for tasks['ansible']['builtin']['stat'].
       loop: >-
-        {{ (billet_host_prepare_tasks + billet_prepare_block + billet_classify_block + billet_host_fallback_tasks)
-           | select('contains', 'ansible.builtin.stat')
-           | rejectattr('name', 'equalto', 'Inspect the installed billet binary under the guard') | list }}
+        {{ (billet_host_prepare_tasks + billet_prepare_block + billet_protocol_block + billet_rescue_block + billet_host_fallback_tasks)
+           | select('contains', 'ansible.builtin.stat') | list }}
       loop_control:
         label: "{{ item.name }}"
 
-    - name: The fallback reader judges the record before the candidate and runs nothing
+    - name: The fallback reader judges the record before the candidate, admits the protocol's members and runs nothing
       ansible.builtin.assert:
         that:
           - "'junioryono.billet.guard_fallback' in billet_fallback_read"
@@ -834,15 +1012,20 @@
           - billet_fallback_names.index('Refuse an unpublished guard no executable can recover') < billet_fallback_names.index('Read the guard\'s record')
           - billet_fallback_names.index('Read the guard\'s record') < billet_fallback_names.index('Judge the guard\'s record')
           - billet_fallback_names.index('Judge the guard\'s record') < billet_fallback_names.index('Judge the recorded executable')
-          - billet_fallback_names.index('Judge the recorded executable') < billet_fallback_names.index('Ask the recorded executable for the claim\'s status')
+          - billet_fallback_names.index('Judge the recorded executable') < billet_fallback_names.index('Note the recorded executable')
+          - billet_fallback_names | last == 'Report the fallback'
           - "'ansible.builtin.command' not in billet_host_fallback_text"
           - "'ansible.builtin.shell' not in billet_host_fallback_text"
+          # THE RECORD'S SCHEMA: the five members required, the protocol's three admitted and typed.
+          - "'OPTIONAL_MEMBERS = {\"id\": \"hex32\", \"token\": \"hex32\", \"preparing\": \"bool\"}' in billet_fallback_module_text"
+          - "'RECORD_MEMBERS = (\"holder\", \"claimed_at\", \"hostname\", \"release_executable\", \"release_executable_sha256\")' in billet_fallback_module_text"
         fail_msg: >-
           guard-fallback.yml must read the record through the module with its
           failure kept as an answer, judge the metadata and content phases before
-          the candidate's, and execute nothing itself.
+          the candidate's, admit the protocol's three members typed, name the
+          executable for the calls, and execute nothing itself.
 
-    - name: The staging resets only the transaction facts and decides before the hold
+    - name: The staging resets only the transaction facts and judges nothing about the guard
       ansible.builtin.assert:
         that:
           - "'billet_binary_upgrade' in billet_stage_reset['ansible.builtin.set_fact']"
@@ -857,27 +1040,18 @@
           # A MAC STAGES NOTHING: the resolution block and the installed-binary stat are Linux's.
           - "'billet_exclusion_darwin' in ((billet_host_stage_tasks | selectattr('name', 'equalto', \"Resolve and stage this invocation's candidate\") | first).when | string)"
           - "'billet_exclusion_darwin' in ((billet_host_stage_tasks | selectattr('name', 'equalto', 'Inspect the installed billet binary') | first).when | string)"
-          - billet_stage_names.index('Inspect the installed billet binary') < billet_stage_names.index('Refuse a converge whose managed binary appeared or vanished before the staging')
-          - billet_stage_names.index('Refuse a converge whose managed binary appeared or vanished before the staging') < billet_stage_names.index("Resolve and stage this invocation's candidate")
-          - "'billet_exclusion_binary_present' in ((billet_host_stage_tasks | selectattr('name', 'equalto', 'Refuse a converge whose managed binary appeared or vanished before the staging') | first)['ansible.builtin.assert'].that | join(' '))"
-          - "'release --holder' in billet_stage_intent['ansible.builtin.assert'].fail_msg"
-          - "\"== 'guard'\" in (billet_stage_intent.when | string)"
-          - billet_stage_block_names.index('Decide whether the billet binary needs a transactional upgrade') < billet_stage_block_names.index('Refuse a same-holder rerun with a different intent')
-          - billet_stage_block_names.index('Refuse a same-holder rerun with a different intent') < billet_stage_block_names.index('Refuse a transactional binary change against an external ledger')
+          - billet_stage_names.index('Inspect the installed billet binary') < billet_stage_names.index("Resolve and stage this invocation's candidate")
+          # THE REFUSALS OF AN EXTERNAL LEDGER before any allocation; the guard's judgements are the command's.
+          - billet_stage_block_names.index('Decide whether the billet binary needs a transactional upgrade') < billet_stage_block_names.index('Refuse a transactional binary change against an external ledger')
           - billet_stage_block_names.index('Refuse a transactional binary change against an external ledger') < billet_stage_block_names.index('Refuse a PostgreSQL controller whose binary predates the guard')
-          - billet_stage_block_names.index('Refuse a bootstrap over a root that holds something the role did not write') < billet_stage_block_names.index('Stage the candidate for the transaction')
-          - billet_stage_inner_names.index('Bind the host transaction to the inspected candidate digest') < billet_stage_inner_names.index('Read the installed and candidate releases')
-          - billet_stage_inner_names.index('Read the installed and candidate releases') < billet_stage_inner_names.index('Refuse a converge that would downgrade this host')
-          - billet_stage_inner_names.index('Refuse a converge that would downgrade this host') < billet_stage_inner_names.index('Ask the candidate whether it can take part in the exclusion')
-          - billet_stage_inner_names.index('Ask the candidate whether it can take part in the exclusion') < billet_stage_inner_names.index('Judge the candidate\'s capability')
-          - "'billet.candidate' in (billet_stage_versions.loop | string)"
-          - "'billet_candidate_source' not in (billet_stage_versions.loop | string)"
-          - "'junioryono.billet.guard_status' in billet_stage_capability_ask"
-          - billet_stage_capability_ask['junioryono.billet.guard_status'].expect == 'capability'
-          - "'pre_r' in billet_stage_capability_judge['ansible.builtin.assert'].fail_msg"
-          - "'could not be determined' in billet_stage_capability_judge['ansible.builtin.assert'].fail_msg"
+          - billet_stage_block_names.index('Refuse a PostgreSQL controller whose binary predates the guard') < billet_stage_block_names.index('Stage the candidate for the transaction')
+          - billet_stage_block_names | last == 'Stage the candidate for the transaction'
+          - billet_stage_inner_names == ["Allocate the transaction's recovery directory", 'Stage the immutable candidate binary inside its recovery journal', 'Inspect the journaled candidate billet binary', 'Bind the host transaction to the inspected candidate digest']
+          - "'guard_status' not in (billet_host_stage_tasks | to_json)"
+          - "'converge-guard' not in (billet_host_stage_tasks | to_json)"
           - "'billet_upgrade_recovery_dir' in billet_candidate_stage['ansible.builtin.copy'].dest"
           - (billet_stage_inner | selectattr('name', 'equalto', "Allocate the transaction's recovery directory") | first)['ansible.builtin.import_tasks'] == 'allocate-recovery.yml'
+          - "'not ansible_check_mode' in ((billet_stage_block | selectattr('name', 'equalto', 'Stage the candidate for the transaction') | first).when | string)"
           # THE PREVIOUS BINARY is copied inside the transaction, after the hold, under exactly four conditions.
           - billet_previous_binary_copy.when | length == 4
           - "'billet_binary_upgrade | default(false)' in billet_previous_binary_copy.when"
@@ -887,10 +1061,10 @@
           - billet_previous_binary_copy['ansible.builtin.copy'].dest.endswith('billet.previous')
         fail_msg: >-
           stage-candidate.yml must reset the transaction facts and never the
-          classification's, compare a same-holder rerun's intent with the record,
-          refuse the external ledger and the pre-R controller before any
-          allocation, and ask the STAGED copy for its version and its capability
-          before the hold.
+          classification's, refuse the external ledger and the pre-R controller
+          before any allocation, stage the candidate into the exclusively
+          allocated journal and bind its digest, and judge nothing about the guard
+          (the intent, the floor and the downgrade are the command's).
 
     - name: The allocator is one exclusive mkdir inside a bounded retry
       vars:
@@ -945,7 +1119,7 @@
           - >-
             ((billet_host_service_tasks + billet_host_inspection_tasks + billet_host_finalization_tasks
               + billet_host_recovery_dispatch_tasks + billet_host_account_tasks + billet_host_prepare_tasks
-              + billet_prepare_block + billet_classify_block + billet_host_fallback_tasks
+              + billet_prepare_block + billet_protocol_block + billet_rescue_block + billet_host_fallback_tasks
               + billet_host_stage_tasks + billet_stage_block + billet_stage_inner) | to_json)
             | regex_findall('"src": "\{\{ billet_exclusion_root \}\}/active"') | length == 4
           - "'/var/lib/billet/upgrades/active' not in billet_host_services_text"

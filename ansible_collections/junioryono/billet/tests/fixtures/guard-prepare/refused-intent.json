@@ -1,0 +1,7 @@
+{
+  "outcome": "refused",
+  "reason": "intent",
+  "shape": "converge-guard",
+  "why": "this guard records /var/lib/billet/upgrades/recovery-20260909T120000-0badcafe/billet.candidate (e8e97575b4a045c8f8f0d338dcb2d3b35b83c2c1222d1b0fb1863cd6cac95480) and this converge stages /var/lib/billet/upgrades/recovery-20260909T120000-1badcafe/billet.candidate (421d91ec7a0ac61661010714f6b39357d56abbc99fb312c7c58f32708eb325f5); a converge under one holder keeps one intent",
+  "next": "release the guard and converge afresh"
+}

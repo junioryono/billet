@@ -1,0 +1,7 @@
+{
+  "outcome": "refused",
+  "reason": "pointer",
+  "shape": "converge-guard",
+  "why": "the guard carries the transaction pointer /var/lib/billet/upgrades/recovery-20260909T120000-0badcafe, which only `--recovery` admits",
+  "next": "`prepare --recovery`"
+}

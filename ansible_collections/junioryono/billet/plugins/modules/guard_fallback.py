@@ -101,6 +101,11 @@ import stat
 from ansible.module_utils.basic import AnsibleModule
 
 RECORD_MEMBERS = ("holder", "claimed_at", "hostname", "release_executable", "release_executable_sha256")
+# THE PROTOCOL'S MEMBERS, admitted and typed when present: a record written
+# before the protocol carries none of them and reads as settled. The token is
+# judged as a string and never printed by this module.
+OPTIONAL_MEMBERS = {"id": "hex32", "token": "hex32", "preparing": "bool"}
+_HEX32 = re.compile(r"^[0-9a-f]{32}$")
 MAX_RECORD_BYTES = 4096
 RECOVERY_PREFIX = "recovery-"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -268,8 +273,17 @@ def read_record(root, owner):
         if name not in decoded:
             raise Refusal("content", "%s: %s is missing" % (record, name))
     for name in decoded:
-        if name not in RECORD_MEMBERS:
+        if name not in RECORD_MEMBERS and name not in OPTIONAL_MEMBERS:
             raise Refusal("content", "%s: %s is not a member the command writes" % (record, name))
+    for name, kind in OPTIONAL_MEMBERS.items():
+        if name not in decoded:
+            continue
+        value = decoded[name]
+        if kind == "bool":
+            if not isinstance(value, bool):
+                raise Refusal("content", "%s: %s is not a boolean" % (record, name))
+        elif not isinstance(value, str) or not _HEX32.match(value):
+            raise Refusal("content", "%s: %s is not 32 lowercase hex digits" % (record, name))
     for name in RECORD_MEMBERS:
         value = decoded[name]
         if value is None:
