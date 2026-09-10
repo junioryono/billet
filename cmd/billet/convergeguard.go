@@ -1427,6 +1427,50 @@ func classifyGuardDirAt(root *os.File) (claimShape, error) {
 	return classifyGuardDirFrom(dir)
 }
 
+// checkGuardRecord holds a decoded record to its schema: the five members
+// every record has, present and typed, and the protocol's three typed when
+// present. A record whose `id` is present but not 32 hex characters (null
+// included) is malformed, never a record from before the protocol: the
+// legacy record is the one with NO `id` member, because adoption mints one
+// and an adopted null would be a record two writers disagree about.
+func checkGuardRecord(body []byte, g guardRecord) string {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return "the record is not a JSON object"
+	}
+
+	for _, k := range []string{"holder", "claimed_at", "hostname", "release_executable", "release_executable_sha256"} {
+		if _, ok := raw[k]; !ok {
+			return "the record lacks " + k
+		}
+	}
+
+	switch {
+	case g.Holder == "":
+		return "the record names no holder"
+	case g.Hostname == "":
+		return "the record names no hostname"
+	case !filepath.IsAbs(g.ReleaseExecutable):
+		return "the record's release_executable is not an absolute path"
+	case !sha256Hex.MatchString(g.ReleaseExecutableSHA256):
+		return "the record's release_executable_sha256 is not a sha256"
+	}
+
+	if _, err := time.Parse(time.RFC3339, g.ClaimedAt); err != nil {
+		return "the record's claimed_at is not a time (RFC 3339)"
+	}
+
+	if _, ok := raw["id"]; ok && !guardHex32.MatchString(g.ID) {
+		return "the record's id is not 32 hex characters"
+	}
+
+	if _, ok := raw["token"]; ok && !guardHex32.MatchString(g.Token) {
+		return "the record's token is not 32 hex characters"
+	}
+
+	return ""
+}
+
 // classifyGuardDirFrom classifies a guard directory through a descriptor the
 // caller holds and keeps.
 func classifyGuardDirFrom(dir *os.File) (claimShape, error) {
@@ -1446,14 +1490,7 @@ func classifyGuardDirFrom(dir *os.File) (claimShape, error) {
 	if err := json.Unmarshal(body, &shape.Guard); err != nil {
 		shape.RecordErr = "the record is not JSON: " + err.Error()
 	} else {
-		switch {
-		case shape.Guard.Holder == "":
-			shape.RecordErr = "the record names no holder"
-		case shape.Guard.ID != "" && !guardHex32.MatchString(shape.Guard.ID):
-			shape.RecordErr = "the record's id is not 32 hex characters"
-		case shape.Guard.Token != "" && !guardHex32.MatchString(shape.Guard.Token):
-			shape.RecordErr = "the record's token is not 32 hex characters"
-		}
+		shape.RecordErr = checkGuardRecord(body, shape.Guard)
 	}
 
 	_, err = statAt(dir, guardPointerName)

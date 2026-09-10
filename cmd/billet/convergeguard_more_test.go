@@ -809,7 +809,8 @@ func TestCheckWarnsOnAGuardHeldPastADay(t *testing.T) {
 	}
 
 	if err := os.WriteFile(filepath.Join(f.active(), guardRecordName),
-		[]byte(`{"holder":"ci-42","claimed_at":"yesterday","hostname":"h"}`), 0o600); err != nil {
+		[]byte(`{"holder":"ci-42","claimed_at":"yesterday","hostname":"h","release_executable":"/usr/bin/billet",`+
+			`"release_executable_sha256":"`+strings.Repeat("ab", 32)+`"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 

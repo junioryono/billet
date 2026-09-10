@@ -743,6 +743,12 @@
           - billet_prepare_names[0] == 'Refuse a converge that would destroy the job running it'
           - billet_host_prepare_tasks[0]['ansible.builtin.import_tasks'] == 'converge-guard.yml'
           - billet_prepare_names.index('Refuse a converge without a holder') < billet_prepare_names.index('Inspect the managed binary and the upgrade root')
+          # THE CLAIM'S FACTS are defined on every path before the block, and a dry run takes its shape from the report.
+          - billet_prepare_names.index('Note what the managed binary and the root are') < billet_prepare_names.index("Start the claim's facts at none")
+          - billet_prepare_names.index("Start the claim's facts at none") < billet_prepare_names.index('Prepare the exclusion')
+          - billet_prepare_block_names.index('Report what a dry run found') < billet_prepare_block_names.index("Take the dry run's shape as this run's facts")
+          - billet_prepare_block_names.index("Take the dry run's shape as this run's facts") < billet_prepare_block_names.index('Decide the binary change in a dry run')
+          - "'ansible_check_mode' in ((billet_prepare_block | selectattr('name', 'equalto', \"Take the dry run's shape as this run's facts\") | first).when | string)"
           - "'ansible_check_mode or' in (billet_prepare_holder_refusal['ansible.builtin.assert'].that | join(' '))"
           # THE REMOVED TASKS ARE GONE, from every file of the preparation, and so is the status module.
           - >-
@@ -888,7 +894,10 @@
           - billet_prepare_cleanup.failed_when == false
           - billet_rescue_names.index('Release the guard this converge acquired before it changed anything') < billet_rescue_names.index('Examine what remains after the cleanup')
           - billet_rescue_names.index('Examine what remains after the cleanup') < billet_rescue_names.index('Ask what the remainder is')
-          - billet_rescue_names.index('Ask what the remainder is') < billet_rescue_names.index('Record what the cleanup did')
+          - billet_rescue_names.index('Ask what the remainder is') < billet_rescue_names.index("Read the remainder's answer")
+          - billet_rescue_names.index("Read the remainder's answer") < billet_rescue_names.index('Record what the cleanup did')
+          # THE REMAINDER'S ANSWER cannot end the rescue: read under ignore_errors, in a task of its own.
+          - (billet_rescue_block | selectattr('name', 'equalto', "Read the remainder's answer") | first).ignore_errors == true
           - billet_rescue_names.index('Record what the cleanup did') < billet_rescue_names.index('Close the preparation window after the cleanup')
           - billet_rescue_names | last == 'Fail with the refusal that ended the preparation'
           - (billet_rescue_block | last).when is not defined
@@ -915,13 +924,17 @@
     - name: The answer's parser judges every member and prints no token
       ansible.builtin.assert:
         that:
-          - billet_answer_names[0] == 'Note whether the executable predates the guard'
+          - billet_answer_names[0] == 'Note whether the executable answered "unknown command"'
+          - billet_answer_names[1] == 'Note whether the executable predates the guard'
+          # PRE-R IS THE FIRST CALL'S OBSERVATION ALONE; "unknown command" on the second call refuses.
+          - "\"billet_exclusion_call == 'first'\" in ((billet_host_answer_tasks | selectattr('name', 'equalto', 'Note whether the executable predates the guard') | first)['ansible.builtin.set_fact'].billet_exclusion_pre_r | string)"
+          - "'not (billet_exclusion_unknown_command | bool)' in ((billet_host_answer_tasks | selectattr('name', 'equalto', 'Refuse a preparation that did not answer') | first)['ansible.builtin.assert'].that | join(' '))"
           - billet_answer_names.index('Refuse a preparation that did not answer') < billet_answer_names.index("Read the preparation's answer")
           - billet_answer_names.index("Read the preparation's answer") < billet_answer_names.index("Judge the preparation's answer")
           - billet_answer_names.index("Judge the preparation's answer") < billet_answer_names.index("Refuse the preparation's answer")
           - billet_answer_names.index("Refuse the preparation's answer") < billet_answer_names.index("Take the preparation's answer as this run's facts")
           - billet_answer_names.index("Take the preparation's answer as this run's facts") < billet_answer_names.index("Report the preparation's answer")
-          - billet_answer_judge.vars.billet_exclusion_checks | map(attribute='name') | list == ['outcome', 'reason', 'why', 'id', 'holder', 'preparing', 'token', 'record', 'pointer', 'pointer_target', 'managed', 'downgrade']
+          - billet_answer_judge.vars.billet_exclusion_checks | map(attribute='name') | list == ['outcome', 'exit', 'reason', 'why', 'id', 'holder', 'preparing', 'token', 'record', 'pointer', 'pointer_target', 'managed', 'downgrade']
           - "'item.ok | bool' in (billet_answer_judge['ansible.builtin.assert'].that | join(' '))"
           - "'recovery-[0-9]{8}T[0-9]{6}-[0-9a-f]{8}|[0-9]{8}T[0-9]{15}' in billet_host_answer_text"
           - "'billet_exclusion_id' in billet_answer_facts['ansible.builtin.set_fact']"

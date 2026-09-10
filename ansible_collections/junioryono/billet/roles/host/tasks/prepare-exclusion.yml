@@ -133,6 +133,15 @@
     billet_exclusion_parent_stat: "{{ billet_exclusion_paths.results[1].stat }}"
     billet_exclusion_root_stat: "{{ billet_exclusion_paths.results[2].stat }}"
 
+# THE CLAIM'S FACTS START AT NONE for a run that holds nothing yet, on every
+# path (a dry run's included, because the tasks after the preparation read
+# them); an answer below sets them, and a run that held keeps what it learned.
+- name: Start the claim's facts at none
+  ansible.builtin.set_fact:
+    billet_upgrade_claim_shape: "{{ billet_upgrade_claim_shape | default('none') if billet_exclusion_held | default(false) else 'none' }}"
+    billet_interrupted_upgrade: "{{ billet_interrupted_upgrade | default(false) if billet_exclusion_held | default(false) else false }}"
+    billet_upgrade_recovery_dir: "{{ billet_upgrade_recovery_dir | default('') if billet_exclusion_held | default(false) else '' }}"
+
 - name: Prepare the exclusion
   block:
     # THE ROOT IS ESTABLISHED ON LINUX before any allocation: the command's
@@ -339,11 +348,31 @@
              else ('The claim at ' ~ billet_exclusion_root ~ '/active is ' ~ billet_exclusion_dry_report.shape
                    ~ ((', a guard held by ' ~ billet_exclusion_dry_report.guard.holder ~ ' since ' ~ billet_exclusion_dry_report.guard.claimed_at
                        ~ (', preparing' if billet_exclusion_dry_report.guard.preparing else ', settled')
-                       ~ (' with a transaction pointer inside it' if billet_exclusion_dry_report.guard.pointer else ''))
+                       ~ (' with a transaction pointer inside it' if billet_exclusion_dry_report.guard.pointer else '')
+                       ~ ((' whose pointer cannot be followed: ' ~ billet_exclusion_dry_report.guard.pointer_problem) if billet_exclusion_dry_report.guard.pointer_problem | default('') | length > 0 else ''))
                       if billet_exclusion_dry_report.guard | default(none) is not none else '')
                    ~ '.')) }}
           A dry run holds nothing and reports what it found.
       when: ansible_check_mode
+
+    # A DRY RUN'S SHAPE, for the tasks after the preparation: the role's own
+    # stat for a legacy file (as outside check mode), the report's guard and
+    # its pointer for a guard; a Go transaction or an unpublished directory
+    # was reported above and holds nothing a dry run can act on.
+    - name: Take the dry run's shape as this run's facts
+      vars:
+        billet_exclusion_dry_guard: "{{ billet_exclusion_dry_report.guard | default(none) }}"
+        billet_exclusion_dry_pointer: "{{ billet_exclusion_dry_guard is not none and billet_exclusion_dry_guard.pointer | default(false) | bool }}"
+      ansible.builtin.set_fact:
+        billet_upgrade_claim_shape: >-
+          {{ 'legacy-file' if billet_exclusion_active.stat.isreg | default(False)
+             else ('guard-pointer' if billet_exclusion_dry_pointer | bool
+             else ('guard' if billet_exclusion_dry_report.shape | default('') == 'converge-guard' else 'none')) }}
+        billet_interrupted_upgrade: "{{ billet_exclusion_active.stat.isreg | default(False) or billet_exclusion_dry_pointer | bool }}"
+        billet_upgrade_recovery_dir: "{{ billet_exclusion_dry_guard.pointer_target | default('') if billet_exclusion_dry_pointer | bool else '' }}"
+      when:
+        - ansible_check_mode
+        - not (billet_exclusion_held | default(false))
 
     # THE READ-ONLY STAGING PATH of a dry run: the intent resolved and
     # reported (a channel resolved, a moving pin refused), nothing fetched,
@@ -438,17 +467,12 @@
         - not ansible_check_mode
         - billet_upgrade_claim_shape | default('none') != 'legacy-file'
       block:
-        # THE CLAIM'S FACTS START AT NONE for a run that holds nothing yet; an
-        # answer below sets them, and a run that held keeps what it learned.
         - name: Reset this invocation's route
           ansible.builtin.set_fact:
             billet_exclusion_route: ""
             billet_exclusion_managed_pre_r: false
             billet_exclusion_acquired: false
             billet_exclusion_adopted: false
-            billet_upgrade_claim_shape: "{{ billet_upgrade_claim_shape | default('none') if billet_exclusion_held | default(false) else 'none' }}"
-            billet_interrupted_upgrade: "{{ billet_interrupted_upgrade | default(false) if billet_exclusion_held | default(false) else false }}"
-            billet_upgrade_recovery_dir: "{{ billet_upgrade_recovery_dir | default('') if billet_exclusion_held | default(false) else '' }}"
 
         # THE FIRST CALL THROUGH THE MANAGED BINARY, when there is one. A binary
         # from before the guard answers "unknown command" and is noted as
@@ -823,21 +847,31 @@
             - billet_exclusion_remainder.stat is defined
             - billet_exclusion_remainder.stat.exists
 
+        # THE REMAINDER'S ANSWER IS READ IN A TASK THAT CANNOT END THE RESCUE:
+        # a truncated or unexpected answer leaves the remainder unknown, and the
+        # final diagnostic below is reached whatever the answer was.
+        - name: Read the remainder's answer
+          ansible.builtin.set_fact:
+            billet_exclusion_remainder_doc: "{{ billet_exclusion_remainder_status.stdout | from_json }}"
+          ignore_errors: true
+          when:
+            - billet_exclusion_remainder_status is not skipped
+            - billet_exclusion_remainder_status.rc | default(1) == 0
+            - (billet_exclusion_remainder_status.stdout | default('') | trim) is match('^\{')
+
         - name: Record what the cleanup did
           vars:
-            billet_exclusion_remainder_doc: >-
-              {{ (billet_exclusion_remainder_status.stdout | from_json)
-                 if (billet_exclusion_remainder_status is not skipped and billet_exclusion_remainder_status.rc | default(1) == 0
-                     and (billet_exclusion_remainder_status.stdout | default('') | trim) is match('^\{'))
-                 else {} }}
+            billet_exclusion_remainder_read: "{{ billet_exclusion_remainder_doc | default({}) }}"
+            billet_exclusion_remainder_active: "{{ (billet_exclusion_remainder_read.active | default('')) if billet_exclusion_remainder_read is mapping else '' }}"
+            billet_exclusion_remainder_holder: "{{ ((billet_exclusion_remainder_read.guard | default({})).holder | default('')) if billet_exclusion_remainder_read is mapping else '' }}"
           ansible.builtin.set_fact:
             billet_exclusion_released: "{{ billet_exclusion_cleanup is not skipped and billet_exclusion_cleanup.rc | default(1) == 0 }}"
             billet_exclusion_remainder_word: >-
               {{ 'unknown' if billet_exclusion_remainder.stat is not defined
                  else ('none' if not billet_exclusion_remainder.stat.exists
-                 else ('unknown' if billet_exclusion_remainder_doc | length == 0
-                 else ((('guard held by ' ~ billet_exclusion_remainder_doc.guard.holder) if billet_exclusion_remainder_doc.active == 'converge-guard'
-                        else billet_exclusion_remainder_doc.active)))) }}
+                 else ('unknown' if billet_exclusion_remainder_active | string | length == 0
+                 else ((('guard held by ' ~ billet_exclusion_remainder_holder) if (billet_exclusion_remainder_active == 'converge-guard' and billet_exclusion_remainder_holder | string | length > 0)
+                        else billet_exclusion_remainder_active)))) }}
             billet_exclusion_cleanup_words: >-
               {{ 'no cleanup was attempted (this run acquired no guard, or the guard carries a transaction pointer)'
                  if billet_exclusion_cleanup is skipped

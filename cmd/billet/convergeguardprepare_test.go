@@ -1686,6 +1686,7 @@ func TestTheGuardPrepareFixturesAreTheCommandsOwn(t *testing.T) {
 		},
 		"dry-run-host-upgrade": func(t *testing.T, f *guardFixture) []string {
 			t.Helper()
+			managedScript(t, f, "v0.10.0")
 			mustOK(t, os.Mkdir(f.root, 0o700))
 			mustOK(t, os.Symlink(filepath.Join(f.root, "recovery-x"), f.active()))
 
@@ -1693,6 +1694,7 @@ func TestTheGuardPrepareFixturesAreTheCommandsOwn(t *testing.T) {
 		},
 		"dry-run-legacy-role": func(t *testing.T, f *guardFixture) []string {
 			t.Helper()
+			managedScript(t, f, "v0.10.0")
 			mustOK(t, os.Mkdir(f.root, 0o700))
 			mustOK(t, os.WriteFile(f.active(), []byte("legacy"), 0o600))
 
@@ -1700,6 +1702,7 @@ func TestTheGuardPrepareFixturesAreTheCommandsOwn(t *testing.T) {
 		},
 		"dry-run-unpublished": func(t *testing.T, f *guardFixture) []string {
 			t.Helper()
+			managedScript(t, f, "v0.10.0")
 			mustOK(t, os.MkdirAll(f.active(), 0o700))
 
 			return []string{"--dry-run"}

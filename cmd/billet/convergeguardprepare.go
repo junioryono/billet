@@ -135,6 +135,9 @@ type prepareExecutable struct {
 	Why     string `json:"why,omitempty"`
 	SHA256  string `json:"sha256,omitempty"`
 	Version string `json:"version,omitempty"`
+	// VersionProblem is why `version` could not be read; a development build
+	// that reports no release has an empty Version and no problem.
+	VersionProblem string `json:"version_problem,omitempty"`
 	// Capable is set on a candidate: whether it answers the guard's commands.
 	Capable *bool `json:"capable,omitempty"`
 }
@@ -419,7 +422,7 @@ func prepareUnderLock(ctx context.Context, root *txLock, holder string, m prepar
 
 	// THE POINTER, validated; THE RECORD, verified; THE FLUSHES an
 	// interruption may owe, completed. Each on every branch that found a guard.
-	pointer, target, r := validatePointer(dir)
+	pointer, target, r := validatePointer(root.dir, dir)
 	if r != nil {
 		return nil, r
 	}
@@ -602,7 +605,17 @@ func judgeCandidate(ctx context.Context, root *txLock, dir *os.File, base *prepa
 			"the exclusion: "+problem, "pin a release that carries the guard")
 	}
 
-	cand.Version = executableVersion(ctx, cleaned)
+	candVersion, err := executableVersion(ctx, cleaned)
+	if err != nil {
+		return nil, couldNotTell("the candidate's release could not be read, so no downgrade can be judged: " + err.Error())
+	}
+
+	cand.Version = candVersion
+
+	if managed.Present == true && managed.VersionProblem != "" {
+		return nil, couldNotTell("the managed binary's release could not be read, so no downgrade can be judged: " +
+			managed.VersionProblem)
+	}
 
 	// THE DOWNGRADE, proved through version.Compare and nothing weaker.
 	if cand.Version != "" && managed.Version != "" {
@@ -616,16 +629,24 @@ func judgeCandidate(ctx context.Context, root *txLock, dir *os.File, base *prepa
 		}
 	}
 
+	// THE CANDIDATE JUDGED IS THE CANDIDATE RECORDED: hashed and flushed again
+	// after the probes executed it, so a file replaced under the judgement is
+	// refused rather than recorded under the judged digest.
+	_, again, err := hashCandidate(root, m.candidate, true)
+	if err != nil {
+		return nil, couldNotTell(err.Error())
+	}
+
+	if again != sum {
+		return nil, refuse(reasonCandidate, string(claimGuard), fmt.Sprintf("%s changed while it was being judged "+
+			"(digest %s, then %s)", cleaned, sum, again), "stage it again")
+	}
+
 	// THE INTENT against the record.
 	switch {
 	case shape.Guard.ReleaseExecutable == installedBinary:
 		record := shape.Guard
 		record.ReleaseExecutable, record.ReleaseExecutableSHA256 = cleaned, sum
-
-		// THE CANDIDATE IS FLUSHED BEFORE THE RECORD NAMES IT.
-		if _, _, err := hashCandidate(root, m.candidate, true); err != nil {
-			return nil, couldNotTell(err.Error())
-		}
 
 		if err := rewriteGuardRecord(root, dir, record); err != nil {
 			return nil, couldNotTell(err.Error())
@@ -687,9 +708,14 @@ func removeStrayTemporary(dir *os.File) (bool, *prepareRefusal) {
 }
 
 // validatePointer validates `active/recovery` as the role's transaction
-// pointer: absent, or a symlink whose target lies directly under the root,
-// matches a recovery directory's grammar and is a directory.
-func validatePointer(dir *os.File) (bool, string, *prepareRefusal) {
+// pointer: absent, or a symlink whose target is the canonical absolute name
+// of a recovery directory directly under the root, opened by that name
+// relative to the root's descriptor (following nothing, so a symlink at the
+// name is not a directory) and judged owned by the root's owner and writable
+// by nobody else. A target spelled through `..` or a symlink is refused
+// rather than resolved, because the name the record answers must be the
+// directory the transaction runs from.
+func validatePointer(rootDir, dir *os.File) (bool, string, *prepareRefusal) {
 	st, err := statAt(dir, guardPointerName)
 
 	switch {
@@ -707,26 +733,51 @@ func validatePointer(dir *os.File) (bool, string, *prepareRefusal) {
 		return false, "", couldNotTell(fmt.Sprintf("read the pointer: %v", err))
 	}
 
-	cleaned := filepath.Clean(target)
-	if filepath.Dir(cleaned) != upgradeRoot || !recoveryNameGrammar.MatchString(filepath.Base(cleaned)) {
+	if !filepath.IsAbs(target) || filepath.Clean(target) != target {
+		return false, "", refuse(reasonPointer, string(claimGuard), fmt.Sprintf("the transaction pointer names %q, "+
+			"which is not a canonical absolute path", target), "inspect it by hand")
+	}
+
+	if filepath.Dir(target) != upgradeRoot || !recoveryNameGrammar.MatchString(filepath.Base(target)) {
 		return false, "", refuse(reasonPointer, string(claimGuard), fmt.Sprintf("the transaction pointer names %s, "+
 			"which is not a recovery directory directly under %s", target, upgradeRoot), "inspect it by hand")
 	}
 
-	var followed unix.Stat_t
+	fd, err := unix.Openat(int(rootDir.Fd()), filepath.Base(target),
+		unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 
-	switch err := unix.Fstatat(int(dir.Fd()), guardPointerName, &followed, 0); {
+	switch {
 	case errors.Is(err, fs.ErrNotExist):
 		return false, "", refuse(reasonPointer, string(claimGuard), fmt.Sprintf("the transaction pointer names %s, "+
 			"which does not exist", target), "inspect it by hand")
+	case errors.Is(err, unix.ELOOP):
+		return false, "", refuse(reasonPointer, string(claimGuard), fmt.Sprintf("the transaction pointer names %s, "+
+			"which is a symlink", target), "inspect it by hand")
+	case errors.Is(err, unix.ENOTDIR):
+		what := "not a directory"
+		if st, err := statAt(rootDir, filepath.Base(target)); err == nil {
+			what = fileTypeOf(modeOf(st))
+		}
+
+		return false, "", refuse(reasonPointer, string(claimGuard), fmt.Sprintf("the transaction pointer names %s, "+
+			"which is %s", target, what), "inspect it by hand")
 	case err != nil:
 		return false, "", couldNotTell(fmt.Sprintf("examine the pointer's target: %v", err))
-	case modeOf(&followed)&unix.S_IFMT != unix.S_IFDIR:
-		return false, "", refuse(reasonPointer, string(claimGuard), fmt.Sprintf("the transaction pointer names %s, "+
-			"which is %s", target, fileTypeOf(modeOf(&followed))), "inspect it by hand")
 	}
 
-	return true, cleaned, nil
+	recovery := os.NewFile(uintptr(fd), target)
+	defer func() { _ = recovery.Close() }()
+
+	info, err := recovery.Stat()
+	if err != nil {
+		return false, "", couldNotTell(fmt.Sprintf("examine the pointer's target: %v", err))
+	}
+
+	if err := requireTrustedDir(target, info, 0o700); err != nil {
+		return false, "", refuse(reasonTrust, string(claimGuard), err.Error(), "inspect it by hand")
+	}
+
+	return true, target, nil
 }
 
 // verifyRecorded verifies the recorded executable's digest now.
@@ -840,29 +891,40 @@ func describeManaged(ctx context.Context) prepareExecutable {
 		out.Why = err.Error()
 	}
 
-	out.Version = executableVersion(ctx, installedBinary)
+	out.Version, err = executableVersion(ctx, installedBinary)
+	if err != nil {
+		out.VersionProblem = err.Error()
+	}
 
 	return out
 }
 
 // executableVersion runs `<binary> version` under the bound and answers the
-// release it names, canonical, or nothing.
-func executableVersion(ctx context.Context, binary string) string {
-	stdout, _, _, err := runBounded(ctx, binary, "version")
-	if err != nil {
-		return ""
+// release it names, canonical; a development build that names no release
+// answers nothing with no error, and an invocation that did not run, exited
+// non-zero or answered another shape is an error, because a downgrade
+// judgement over an unread version is no judgement.
+func executableVersion(ctx context.Context, binary string) (string, error) {
+	stdout, stderr, rc, err := runBounded(ctx, binary, "version")
+
+	switch {
+	case err != nil:
+		return "", fmt.Errorf("%s version: %w", binary, err)
+	case rc != 0:
+		return "", fmt.Errorf("%s version exited %d: %s", binary, rc, strings.TrimSpace(string(stderr)))
 	}
 
 	fields := strings.Fields(string(stdout))
-	if len(fields) < 2 {
-		return ""
+	if len(fields) < 2 || fields[0] != "billet" {
+		return "", fmt.Errorf("%s version answered %q, not `billet <version> <platform>`", binary,
+			strings.TrimSpace(string(stdout)))
 	}
 
 	if v, ok := version.Canonical(fields[1]); ok {
-		return v
+		return v, nil
 	}
 
-	return ""
+	return "", nil
 }
 
 // candidateCapable executes the candidate's `converge-guard status --json`
@@ -1142,13 +1204,24 @@ func prepareDryRun(ctx context.Context) error {
 		if active, err := openActiveOf(rootDir); err == nil {
 			defer func() { _ = active.Close() }()
 
-			pointer, target, r := validatePointer(active)
-			if r != nil {
+			pointer, target, r := validatePointer(rootDir, active)
+
+			switch {
+			case r != nil && r.Outcome == prepareRefused:
+				// AN ENTRY EXISTS AND IS WRONG: a pointer nobody can follow is
+				// still a pointer, reported as present with its problem, so a
+				// dry run never shows a guard without its interrupted transaction.
+				g.Pointer, g.PointerProblem = true, r.Why
+			case r != nil:
 				g.PointerProblem = r.Why
-			} else {
+			default:
 				g.Pointer, g.PointerTarget = pointer, target
 			}
+		} else {
+			g.PointerProblem = fmt.Sprintf("examine the guard directory: %v", err)
 		}
+	} else {
+		g.PointerProblem = fmt.Sprintf("open the upgrade root: %v", err)
 	}
 
 	report.Guard = g

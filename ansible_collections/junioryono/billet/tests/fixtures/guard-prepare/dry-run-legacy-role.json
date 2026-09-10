@@ -5,6 +5,7 @@
   "managed": {
     "path": "/usr/bin/billet",
     "present": true,
-    "sha256": "abababababababababababababababababababababababababababababababab"
+    "sha256": "abababababababababababababababababababababababababababababababab",
+    "version": "v0.10.0"
   }
 }

@@ -17,13 +17,21 @@
 # A BINARY FROM BEFORE THE GUARD answers "unknown command" and NO JSON: an
 # answer whose stdout is a JSON object is the command's, whatever its stderr
 # quotes (a refusal at the capability floor repeats the candidate's own
-# "unknown command"), and is judged below rather than read as pre-R.
-- name: Note whether the executable predates the guard
+# "unknown command"), and is judged below rather than read as pre-R. And that
+# observation belongs to the FIRST call alone: the second call goes to the
+# executable that answered the first, so "unknown command" there is that
+# executable having moved under this converge, refused below.
+- name: Note whether the executable answered "unknown command"
   ansible.builtin.set_fact:
-    billet_exclusion_pre_r: >-
+    billet_exclusion_unknown_command: >-
       {{ (billet_exclusion_raw.rc | default(1)) != 0
          and not ((billet_exclusion_raw.stdout | default('') | trim) is match('^\{'))
          and ((billet_exclusion_raw.stdout | default('')) ~ "\n" ~ (billet_exclusion_raw.stderr | default(''))) is search('unknown (converge-guard )?command') }}
+  no_log: true
+
+- name: Note whether the executable predates the guard
+  ansible.builtin.set_fact:
+    billet_exclusion_pre_r: "{{ billet_exclusion_unknown_command | bool and billet_exclusion_call == 'first' }}"
   no_log: true
 
 - name: Refuse a preparation that did not answer
@@ -31,12 +39,14 @@
     that:
       - billet_exclusion_raw.rc is defined
       - not (billet_exclusion_raw.msg | default('') is search('non-zero return code|No such file|not found') and billet_exclusion_raw.rc is not defined)
-      - billet_exclusion_pre_r | bool or (billet_exclusion_raw.stdout | default('') | trim | length > 0)
+      - not (billet_exclusion_unknown_command | bool)
+      - billet_exclusion_raw.stdout | default('') | trim | length > 0
     fail_msg: >-
-      {{ billet_exclusion_answered_by }} did not answer the preparation's
-      {{ billet_exclusion_call }} call (exit {{ billet_exclusion_raw.rc | default('none') }},
-      {{ 'ended by the bound' if (billet_exclusion_raw.rc is not defined or billet_exclusion_raw.rc in [124, 137]) else 'no output' }}).
-      Nothing this run can act on was learned; `{{ billet_exclusion_answered_by }} converge-guard status`
+      {{ (billet_exclusion_answered_by ~ ' answered "unknown command" to the preparation\'s second call after answering its first: the executable that answered this converge moved under it. Nothing was acted on; ')
+         if billet_exclusion_unknown_command | bool
+         else (billet_exclusion_answered_by ~ ' did not answer the preparation\'s ' ~ billet_exclusion_call ~ ' call (exit ' ~ (billet_exclusion_raw.rc | default('none')) ~ ', '
+               ~ ('ended by the bound' if (billet_exclusion_raw.rc is not defined or billet_exclusion_raw.rc in [124, 137]) else 'no output') ~ '). Nothing this run can act on was learned; ') }}
+      `{{ billet_exclusion_answered_by }} converge-guard status`
       shows the host, and a guard this run acquired is released by its holder
       with `release --holder {{ billet_exclusion_holder }}`.
   when: not billet_exclusion_pre_r | bool
@@ -55,6 +65,8 @@
     billet_exclusion_checks:
       - name: outcome
         ok: "{{ billet_exclusion_a.outcome | default('') in ['acquired', 'validated', 'rebound', 'refused', 'unknown'] }}"
+      - name: exit
+        ok: "{{ billet_exclusion_a.outcome | default('') in ['refused', 'unknown'] or (billet_exclusion_raw.rc | default(1)) == 0 }}"
       - name: reason
         ok: "{{ billet_exclusion_a.outcome | default('') not in ['refused', 'unknown'] or (billet_exclusion_a.reason | default('') | string | length > 0) }}"
       - name: why

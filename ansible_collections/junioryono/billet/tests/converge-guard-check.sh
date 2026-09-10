@@ -210,7 +210,9 @@ chmod 0755 "$fakes/billet-hang"
 # substituted (BILLET_GATE_ANSWER=<cmd>:<n>:<file>, several separated by `;`),
 # dropped (BILLET_GATE_DROP_ANSWER=<cmd>:<n>), or the invocation refused in the
 # wrapper with no backing run, hung, or crashed at a boundary of the seam
-# (BILLET_GATE_FAIL=<cmd>:refuse | <cmd>:hang | <cmd>:crash:<kind> <path>[:n]).
+# (BILLET_GATE_FAIL=<cmd>:refuse | <cmd>:hang | <cmd>:<n>:unknown, the n-th
+# invocation answering "unknown command" as a binary from before the guard
+# would | <cmd>:crash:<kind> <path>[:n]).
 write_wrapper() { # path backing role
   {
     cat <<WRAP
@@ -235,6 +237,7 @@ failspec=${BILLET_GATE_FAIL:-}
 case "$failspec" in
   "$cmd:refuse") printf 'backing=0 cmd=%s\n' "$cmd" >>"$priv"; echo "billet: refused by the gate's wrapper; nothing was run" >&2; exit 1 ;;
   "$cmd:hang") printf 'backing=0 cmd=%s\n' "$cmd" >>"$priv"; sleep 3600 ;;
+  "$cmd:$n:unknown") printf 'backing=0 cmd=%s\n' "$cmd" >>"$priv"; echo 'unknown command "converge-guard"' >&2; exit 2 ;;
   "$cmd:crash:"*) export BILLET_GUARD_CRASH_AT="${failspec#"$cmd:crash:"}" ;;
 esac
 out=$(mktemp); err=$(mktemp)
@@ -1127,6 +1130,19 @@ expect_refused b6c-equal-candidate "Refuse a converge whose managed binary moved
 expect_fact b6c-equal-candidate upgrade False
 expect_calls b6c-equal-candidate suffix "" 0
 expect_state b6c-equal-candidate active absent
+# B6e. The executable that answered the first call answers "unknown command"
+# to the second: it moved under this converge; refused, never read as pre-R.
+# The wrapper itself answers "unknown command" on the second call (a file
+# replaced on disk is refused by the backing binary's digest check instead,
+# which is the verification refusal and not this path).
+plant b6e-second-call-moved
+p b6e-second-call-moved 'plant_root; plant_managed v0.10.0'
+e b6e-second-call-moved "BILLET_GATE_FAIL=prepare:2:unknown"
+ns_case b6e-second-call-moved escalated
+expect_refused b6e-second-call-moved "Refuse a preparation that did not answer" "moved under it"
+expect_calls b6e-second-call-moved managed "converge-guard settle" 0
+expect_final b6e-second-call-moved "the cleanup released the guard" "is now none"
+expect_state b6e-second-call-moved active absent
 plant b6d-guard-appeared
 p b6d-guard-appeared 'plant_root; plant_pre_r'
 e b6d-guard-appeared "BILLET_GATE_HOOK=prepare:1:$mnt/bin/billet-v0.10.0 converge-guard prepare --validate --holder h2 --json >/dev/null"
@@ -1166,6 +1182,9 @@ check_case b7-go "plant_root; plant_managed v0.10.0; ln -s $ROOT/$LEGACY_DIR $RO
 expect_state b7-go active symlink
 check_case b7-unpublished "plant_root; plant_managed v0.10.0; mkdir -m 0700 $ROOT/active" "is unpublished-guard"
 expect_state b7-unpublished active dir
+# A guard whose pointer cannot be followed: reported as a guard WITH a pointer and the problem.
+check_case b7g-dangling-pointer "plant_root; plant_managed v0.10.0; plant_guard h2 /usr/bin/billet; ln -sT $ROOT/$REC_A $ROOT/active/recovery" "a guard held by h2" "with a transaction pointer inside it" "whose pointer cannot be followed" "does not exist"
+expect_fact b7g-dangling-pointer shape guard-pointer
 # B7b. A pre-R managed binary: the capability refusal read as pre-R.
 plant b7b-pre-r
 p b7b-pre-r 'plant_root; plant_pre_r'
@@ -1538,7 +1557,7 @@ plant c5-rerun-kept
 p c5-rerun-kept "plant_root; plant_managed v0.10.0; plant_recovery $REC_A v0.10.0; plant_guard h1 $ROOT/$REC_A/billet.candidate"
 a c5-rerun-kept -e "billet_binary_src=$bins/wrap-candidate-v0.10.1"
 ns_case c5-rerun-kept escalated
-expect_refused c5-rerun-kept "Refuse the preparation's answer" "candidate"
+expect_refused c5-rerun-kept "Refuse the preparation's answer" "intent" "this guard records"
 expect_final c5-rerun-kept "no cleanup was attempted" "release --holder h1"
 expect_state c5-rerun-kept record_release_executable "$ROOT/$REC_A/billet.candidate"
 # C6. The answer of an acquired first call lost: nothing released, the guard remains preparing.
@@ -1640,9 +1659,10 @@ expect_refused d6-candidate-not-installed "Refuse the preparation's answer" "int
 expect_final d6-candidate-not-installed "no cleanup was attempted"
 plant d7-completed-then-other
 p d7-completed-then-other "plant_root; plant_recovery $REC_A v0.10.1; plant_managed_file $ROOT/$REC_A/billet.candidate; plant_guard h1 $ROOT/$REC_A/billet.candidate"
-a d7-completed-then-other -e "billet_binary_src=$bins/wrap-candidate-v0.10.0"
+# The downgrade is admitted by name so the refusal proved is the intent's, not the downgrade's.
+a d7-completed-then-other -e "billet_binary_src=$bins/wrap-candidate-v0.10.0" -e billet_allow_downgrade=true
 ns_case d7-completed-then-other escalated
-expect_refused d7-completed-then-other "Refuse the preparation's answer" "candidate"
+expect_refused d7-completed-then-other "Refuse the preparation's answer" "intent" "this guard records"
 expect_state d7-completed-then-other record_release_executable "$ROOT/$REC_A/billet.candidate"
 plant d8-unverifiable
 p d8-unverifiable "plant_root; plant_managed v0.10.0; plant_guard h1 /usr/bin/billet; cp \$BINS/wrap-managed-v0.10.1 /usr/bin/billet"
