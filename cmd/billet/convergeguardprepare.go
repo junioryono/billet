@@ -1489,6 +1489,17 @@ func judgeDryRunAnswer(rc int, stdout, stderr []byte, timedOut bool, heldID stri
 		return fmt.Sprintf("guard: holder %q is not a name", holder)
 	}
 
+	if raw, ok := guard["note"]; ok {
+		note, ok := jsonString(raw)
+		if !ok || note == "" {
+			return "guard: note is not a non-empty string"
+		}
+
+		if err := checkNote(note); err != nil {
+			return "guard: note is not one line of printable text"
+		}
+	}
+
 	claimed, ok := jsonString(guard["claimed_at"])
 	if !ok {
 		return "guard: claimed_at is not an RFC 3339 time"

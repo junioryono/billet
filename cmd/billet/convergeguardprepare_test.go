@@ -1417,6 +1417,8 @@ func TestTheDryRunJudgeRefusesEachCorruptionByName(t *testing.T) {
 		{"an empty member repeated", []byte(`{"": 0, "": 1, "outcome": "reported"}`), `repeats the member ""`},
 		{"a status answer", []byte(`{"active": "none"}`), "outcome is missing"},
 		{"outcome null", corrupt(set(nil, "outcome")), "outcome is missing or not a string"},
+		{"guard.note not a string", corrupt(set(7, "guard", "note")), "note is not a non-empty string"},
+		{"guard.note two lines", corrupt(set("a\nb", "guard", "note")), "note is not one line of printable text"},
 		{"outcome refused", corrupt(set("refused", "outcome"), set("x", "why")), `outcome is "refused", not "reported": x`},
 		{"outcome unknown", corrupt(set("unknown", "outcome"), set("x", "why")), `outcome is "unknown", not "reported": x`},
 		{"why a number", corrupt(set(1, "why")), "why is not a string"},

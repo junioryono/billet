@@ -416,10 +416,29 @@ func publishReceipt(ctx context.Context, insp *lifeops.Inspector, installed *ins
 			return nil, endpointUnknown(endpointReasonTrust, fmt.Sprintf("flush %s after creating the receipt directory: %v",
 				parent, err), "converge again; the flush is retried", "")
 		}
+
+		if dirInfo, err = receiptLstat(dir); err != nil || dirInfo.Mode()&os.ModeSymlink != 0 || !dirInfo.IsDir() {
+			return nil, endpointUnknown(endpointReasonTrust, fmt.Sprintf("the receipt directory %s is not the directory just "+
+				"created (%v)", dir, err), "", "")
+		}
 	case err != nil:
 		return nil, endpointUnknown(endpointReasonTrust, fmt.Sprintf("examine the receipt directory %s: %v", dir, err), "", "")
 	case dirInfo.Mode()&os.ModeSymlink != 0 || !dirInfo.IsDir():
 		return nil, endpointRefuse(endpointReasonTrust, "the receipt directory "+dir+" is not a directory", "", "")
+	}
+
+	// sameDirectory says the name still holds the examined directory: the
+	// write and the flushes resolve the pathname again, so a directory
+	// swapped for another after the examination is caught here, before the
+	// answer and never as `written`.
+	sameDirectory := func(when string) *endpointRefusal {
+		now, err := receiptLstat(dir)
+		if err != nil || !os.SameFile(now, dirInfo) {
+			return endpointUnknown(endpointReasonTrust, fmt.Sprintf("the receipt directory %s is not the one examined (%s; %v)",
+				dir, when, err), "", "")
+		}
+
+		return nil
 	}
 
 	// THE EXISTING FILE, validated whole before any shortcut; a file that
@@ -430,7 +449,7 @@ func publishReceipt(ctx context.Context, insp *lifeops.Inspector, installed *ins
 	case receiptUnreadable:
 		return nil, endpointUnknown(endpointReasonTrust, existing.why, "", "")
 	case receiptInvalid:
-		if err := receiptRemoveInvalid(receiptPath); err != nil {
+		if err := receiptRemoveInvalid(receiptPath, existing.info); err != nil {
 			return nil, endpointRefuse(endpointReasonTrust, "the receipt path "+receiptPath+" holds something billet did not "+
 				"write and cannot replace: "+existing.why+" ("+err.Error()+")", "remove it by hand", "")
 		}
@@ -460,6 +479,19 @@ func publishReceipt(ctx context.Context, insp *lifeops.Inspector, installed *ins
 	// directory and parent flushed all the same (a flush an earlier
 	// interruption owed is completed here).
 	if allowCurrent && existing.presence == receiptPresent && existing.receipt.evidentialEqual(rec) {
+		// THE FILE JUDGED IS STILL THE FILE AT THE NAME: the read is evidence
+		// about an inode, and `current` is a claim about the name.
+		if r := sameDirectory("before the shortcut"); r != nil {
+			return nil, r
+		}
+
+		now, err := receiptLstat(receiptPath)
+		if err != nil || !os.SameFile(now, existing.info) || now.Size() != existing.info.Size() ||
+			!now.ModTime().Equal(existing.info.ModTime()) {
+			return nil, endpointUnknown(endpointReasonTrust, fmt.Sprintf("the receipt %s moved after it was read (%v)",
+				receiptPath, err), "converge again", "")
+		}
+
 		for _, d := range []string{dir, parent} {
 			if err := receiptSyncDir(d); err != nil {
 				return nil, endpointUnknown(endpointReasonTrust, fmt.Sprintf("flush %s: %v", d, err), "converge again; the flush is retried", "")
@@ -467,6 +499,10 @@ func publishReceipt(ctx context.Context, insp *lifeops.Inspector, installed *ins
 		}
 
 		return receiptAnswer{Schema: endpointSchema, Outcome: outcomeCurrent, Receipt: existing.receipt}, nil
+	}
+
+	if r := sameDirectory("before the write"); r != nil {
+		return nil, r
 	}
 
 	rec.WrittenAt = receiptNow().UTC().Format(time.RFC3339Nano)
@@ -491,19 +527,37 @@ func publishReceipt(ctx context.Context, insp *lifeops.Inspector, installed *ins
 			"converge again; the flush is retried", "")
 	}
 
+	// THE PUBLISHED FILE READ BACK through the reader, at the examined
+	// directory: what the name holds now is what this answer claims.
+	if r := sameDirectory("after the write"); r != nil {
+		return nil, r
+	}
+
+	if back := readEndpointReceipt(receiptPath); back.presence != receiptPresent || !back.receipt.evidentialEqual(rec) ||
+		back.receipt.Run != rec.Run || back.receipt.WrittenAt != rec.WrittenAt {
+		return nil, endpointUnknown(endpointReasonTrust, "the receipt read back after the write is not the one written ("+
+			string(back.presence)+": "+back.why+")", "converge again", "")
+	}
+
 	return receiptAnswer{Schema: endpointSchema, Outcome: outcomeWritten, Receipt: &rec}, nil
 }
 
 // receiptRemoveInvalid removes a regular file that is not a receipt, never
-// following a link and never removing anything else.
-func receiptRemoveInvalid(path string) error {
-	info, err := os.Lstat(path)
+// following a link, never removing anything else, and only the file the
+// reader judged (the same inode, size and modification time), so a valid
+// receipt installed after the read is never the one removed.
+func receiptRemoveInvalid(path string, judged os.FileInfo) error {
+	info, err := receiptLstat(path)
 	if err != nil {
 		return err
 	}
 
 	if !info.Mode().IsRegular() {
 		return fmt.Errorf("%s is %s, not a regular file", path, info.Mode().Type())
+	}
+
+	if judged == nil || !os.SameFile(info, judged) || info.Size() != judged.Size() || !info.ModTime().Equal(judged.ModTime()) {
+		return fmt.Errorf("%s is not the file that was judged invalid; it moved after the read", path)
 	}
 
 	return os.Remove(path)
@@ -519,6 +573,14 @@ func readMigrationEvidence(path string) (*migrateEvidence, *endpointRefusal) {
 	}
 
 	if problem := strictObject(body); problem != "" {
+		return nil, endpointRefuse(endpointReasonEvidence, "the evidence: "+problem, "", "")
+	}
+
+	// THE MEMBER SETS BY THEIR EXACT SPELLING, at both depths, before the
+	// struct decode: Go matches a member name case-insensitively, so an
+	// alias such as "Node" beside "node" would be admitted by the decoder
+	// and the last one would win.
+	if problem := exactAnswerMembers(body, evidenceMembers, map[string][]string{"stopped": stoppedMembers}); problem != "" {
 		return nil, endpointRefuse(endpointReasonEvidence, "the evidence: "+problem, "", "")
 	}
 
@@ -575,6 +637,10 @@ func readConfirmation(path string) (*receiptConfirmation, *endpointRefusal) {
 		return nil, endpointRefuse(endpointReasonConfirm, "the confirmation: "+problem, "", "")
 	}
 
+	if problem := exactAnswerMembers(body, confirmationMembers, map[string][]string{"deployment": confirmationDepMembers}); problem != "" {
+		return nil, endpointRefuse(endpointReasonConfirm, "the confirmation: "+problem, "", "")
+	}
+
 	// THE BOOLEANS BY THEIR BYTES: a decoder would read "true" as a string
 	// into nothing and a fixture writer could not tell.
 	var raw map[string]json.RawMessage
@@ -614,6 +680,65 @@ func readConfirmation(path string) (*receiptConfirmation, *endpointRefusal) {
 	}
 
 	return &conf, nil
+}
+
+// The member sets the two answers carry, exactly.
+var (
+	evidenceMembers = []string{"schema", "outcome", "node", "deployment", "from", "to", "config_path", "installed_sha256",
+		"invocation_id", "incarnation", "registered_at", "stopped"}
+	stoppedMembers         = []string{"active_state", "sub_state", "result"}
+	confirmationMembers    = []string{"schema", "outcome", "node", "incarnation", "epoch", "live", "deployment"}
+	confirmationDepMembers = []string{"bound", "id"}
+)
+
+// exactAnswerMembers requires the object's member names to be exactly the given
+// set, case-sensitively, and each named nested object's likewise.
+func exactAnswerMembers(body []byte, want []string, nested map[string][]string) string {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return "not one JSON object"
+	}
+
+	if problem := exactAnswerMemberSet(raw, want); problem != "" {
+		return problem
+	}
+
+	for name, members := range nested {
+		var inner map[string]json.RawMessage
+		if err := json.Unmarshal(raw[name], &inner); err != nil || inner == nil {
+			return name + " is not an object"
+		}
+
+		if problem := exactAnswerMemberSet(inner, members); problem != "" {
+			return name + ": " + problem
+		}
+	}
+
+	return ""
+}
+
+func exactAnswerMemberSet(raw map[string]json.RawMessage, want []string) string {
+	for _, name := range want {
+		if _, ok := raw[name]; !ok {
+			return fmt.Sprintf("the member %q is missing", name)
+		}
+	}
+
+	for name := range raw {
+		known := false
+
+		for _, w := range want {
+			if name == w {
+				known = true
+			}
+		}
+
+		if !known {
+			return fmt.Sprintf("the member %q is not one the producer writes", name)
+		}
+	}
+
+	return ""
 }
 
 // strictObject requires one JSON object with one value per member at every

@@ -1095,7 +1095,7 @@ echo "ok   B1: a candidate is acquired over, staged, re-bound and settled in ord
 # default leaves the argv without it (B1's first-call pin has no `--note`).
 plant b1d-note
 p b1d-note 'plant_root; plant_managed v0.10.0'
-a b1d-note -e "billet_converge_guard_note=run 12 of owner/repo"
+a b1d-note -e '{"billet_converge_guard_note": "run 12 of owner/repo"}'
 ns_case b1d-note escalated
 expect_allowed b1d-note
 expect_calls b1d-note managed "converge-guard prepare --validate --holder h1 --json --note run 12 of owner/repo" 1

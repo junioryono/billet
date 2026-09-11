@@ -286,15 +286,10 @@ func TestMigrateRecordWaitsBeforeAndAfterTheStart(t *testing.T) {
 
 		// The fake's start publishes nothing; the record arrives a little
 		// after the start was recorded.
-		go func() {
-			for f.calls(t, "start") == 0 {
-				time.Sleep(5 * time.Millisecond)
-			}
-
-			time.Sleep(40 * time.Millisecond)
+		f.afterCall(t, "start", 40*time.Millisecond, func() {
 			f.writeRecord(t, f.record(map[string]any{"deployment": f.deployment, "endpoint": canonicalB,
 				"invocation_id": newInvocation, "incarnation": newIncarnation}))
-		}()
+		})
 
 		o := f.migrate(t, f.rendering(endpointB), "--wait", "3s")
 		mustEndpointOutcome(t, o, outcomeMigrated)
@@ -306,10 +301,9 @@ func TestMigrateRecordWaitsBeforeAndAfterTheStart(t *testing.T) {
 		f.rBinary(t)
 		mustOK(t, os.Remove(f.recordPath))
 
-		go func() {
-			time.Sleep(50 * time.Millisecond)
+		f.later(t, 50*time.Millisecond, func() {
 			f.writeRecord(t, f.record(map[string]any{"deployment": f.deployment, "endpoint": canonicalA}))
-		}()
+		})
 
 		o := f.migrate(t, f.rendering(endpointB), "--dry-run", "--wait", "3s")
 		mustEndpointOutcome(t, o, outcomeReported)
@@ -689,7 +683,7 @@ func TestTheMigrationFixturesAreTheCommandsOwn(t *testing.T) {
 		},
 		"unknown-process": func(t *testing.T, f *endpointFixture) endpointOut {
 			t.Helper()
-			f.afterShows(t, 3, nodeUnitBody("active", "running", 9999, newInvocation, "mixed", "success"))
+			f.everyShow(t, 4, nodeUnitBody("active", "running", 9999, newInvocation, "mixed", "success"))
 
 			return f.migrate(t, f.rendering(endpointA))
 		},

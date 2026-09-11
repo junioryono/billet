@@ -297,6 +297,7 @@ def read_record(root, owner):
         elif kind == "note":
             if (not isinstance(value, str) or value == "" or len(value.encode("utf-8")) > MAX_NOTE_BYTES
                     or any(ch.isspace() and ch != " " for ch in value)
+                    or "\ufffd" in value
                     or any(unicodedata.category(ch).startswith("C") for ch in value)):
                 raise Refusal("content", "%s: note is not one line of printable text" % record)
         elif not isinstance(value, str) or not _HEX32.fullmatch(value):

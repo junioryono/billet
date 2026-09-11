@@ -62,6 +62,7 @@ func newEndpointFixture(t *testing.T) *endpointFixture {
 	f.logPath = filepath.Join(f.dir, "systemctl.log")
 	t.Setenv("BILLET_FAKE_LOG", f.logPath)
 	t.Setenv("BILLET_FAKE_RECORD", f.recordPath)
+	t.Setenv("BILLET_FAKE_CONFIG", f.configPath)
 
 	// THE FAKE SYSTEMCTL: show from the unit files as the inspector's fake
 	// does; stop and start per mode file, each applying the unit's after-state
@@ -79,6 +80,8 @@ case "$cmd" in
     if [ "$unit" = billet-node.service ]; then
       count=$(grep -c '^show' "$BILLET_FAKE_LOG")
       if [ -f "$BILLET_FAKE_UNITS/after.n" ] && [ "$count" -gt "$(cat "$BILLET_FAKE_UNITS/after.n")" ]; then file="$BILLET_FAKE_UNITS/after.body"; fi
+      if [ -f "$BILLET_FAKE_UNITS/until.n" ] && [ "$count" -gt "$(cat "$BILLET_FAKE_UNITS/until.n")" ]; then file="$BILLET_FAKE_UNITS/$unit"; fi
+      if [ -f "$BILLET_FAKE_UNITS/every.n" ] && [ $((count % $(cat "$BILLET_FAKE_UNITS/every.n"))) -eq 0 ]; then file="$BILLET_FAKE_UNITS/after.body"; fi
       if [ -f "$BILLET_FAKE_UNITS/alternate.body" ] && [ $((count % 2)) -eq 0 ]; then file="$BILLET_FAKE_UNITS/alternate.body"; fi
     fi
     for n in $names; do grep "^$n=" "$file"; done
@@ -89,6 +92,7 @@ case "$cmd" in
       hang) exec sleep 30 ;;
       hang-ignoring-term) trap '' TERM; exec sleep 30 ;;
       fail) exit 1 ;;
+      replace-config) cp "$BILLET_FAKE_CONFIG" "$BILLET_FAKE_CONFIG.new" && mv "$BILLET_FAKE_CONFIG.new" "$BILLET_FAKE_CONFIG" ;;
     esac
     [ -f "$BILLET_FAKE_UNITS/$unit.after-stop" ] && cp "$BILLET_FAKE_UNITS/$unit.after-stop" "$BILLET_FAKE_UNITS/$unit"
     exit 0 ;;
@@ -176,6 +180,84 @@ func (f *endpointFixture) afterShows(t *testing.T, n int, body string) {
 	t.Helper()
 	writeFile(t, f.unitFile("after.n"), strconv.Itoa(n)+"\n", 0o644)
 	writeFile(t, f.unitFile("after.body"), body, 0o644)
+}
+
+// everyShow makes every n-th show of the node unit answer body: with the
+// judgement's four shows per attempt, n = 4 makes each attempt's closing
+// observation see another process, so the judgement keeps moving.
+func (f *endpointFixture) everyShow(t *testing.T, n int, body string) {
+	t.Helper()
+	writeFile(t, f.unitFile("every.n"), strconv.Itoa(n)+"\n", 0o644)
+	writeFile(t, f.unitFile("after.body"), body, 0o644)
+}
+
+// showsBetween makes the shows after the n-th and up to the m-th answer
+// body, the unit file again afterwards: one movement, then stability.
+func (f *endpointFixture) showsBetween(t *testing.T, n, m int, body string) {
+	t.Helper()
+	f.afterShows(t, n, body)
+	writeFile(t, f.unitFile("until.n"), strconv.Itoa(m)+"\n", 0o644)
+}
+
+// later runs fn in its own goroutine after d, unless the test ended first;
+// the goroutine is joined at cleanup, so nothing it does outlives the test.
+func (f *endpointFixture) later(t *testing.T, d time.Duration, fn func()) {
+	t.Helper()
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		select {
+		case <-time.After(d):
+			fn()
+		case <-stop:
+		}
+	}()
+
+	t.Cleanup(func() {
+		close(stop)
+		<-done
+	})
+}
+
+// afterCall runs fn once, after the fake recorded its first call of verb
+// (a start, say), polling the log until the test ends; joined at cleanup.
+func (f *endpointFixture) afterCall(t *testing.T, verb string, d time.Duration, fn func()) {
+	t.Helper()
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(5 * time.Millisecond):
+			}
+
+			body, err := os.ReadFile(f.logPath)
+			if err == nil && strings.Contains(string(body), verb+" ") {
+				break
+			}
+		}
+
+		select {
+		case <-time.After(d):
+			fn()
+		case <-stop:
+		}
+	}()
+
+	t.Cleanup(func() {
+		close(stop)
+		<-done
+	})
 }
 
 // alternating makes every even show of the node unit answer body, so a
@@ -575,17 +657,13 @@ func TestMigrateStopDeadlineSignalsOnlyItsOwnSubprocess(t *testing.T) {
 			// The unit's state after the expiry: the fake's stop never applied
 			// an after-state (it hung), so the file is rewritten here to what
 			// the post-expiry observation should see.
-			done := make(chan struct{})
-			go func() {
-				time.Sleep(300 * time.Millisecond)
+			f.afterCall(t, "stop", 300*time.Millisecond, func() {
 				writeFile(t, f.unitFile(nodeUnit), nodeUnitBody(c.after, "dead", 0, nodeInvocation, "mixed", "success"), 0o644)
-				close(done)
-			}()
+			})
 
 			started := time.Now()
 
 			o := f.migrate(t, f.rendering(endpointB), "--stop-timeout", "1s")
-			<-done
 
 			mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonUnproved)
 
@@ -835,11 +913,10 @@ func TestMigrateClosesEveryAnswerAgainstTheConfigurationAndTheProcess(t *testing
 		f := newEndpointFixture(t)
 		mustOK(t, os.Remove(f.recordPath))
 
-		go func() {
-			time.Sleep(50 * time.Millisecond)
+		f.later(t, 50*time.Millisecond, func() {
 			f.installB(t)
 			f.writeRecord(t, f.record(map[string]any{"deployment": f.deployment, "endpoint": canonicalB}))
-		}()
+		})
 
 		o := f.migrate(t, f.rendering(endpointB), "--dry-run", "--wait", "2s")
 		mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonConfig)
@@ -849,8 +926,8 @@ func TestMigrateClosesEveryAnswerAgainstTheConfigurationAndTheProcess(t *testing
 		t.Helper()
 		f := newEndpointFixture(t)
 		// The first observation, the bracket's two, then the closing one
-		// sees another process; the retries see it too.
-		f.afterShows(t, 3, nodeUnitBody("active", "running", 9999, newInvocation, "mixed", "success"))
+		// sees another process; each retry's closing observation does too.
+		f.everyShow(t, 4, nodeUnitBody("active", "running", 9999, newInvocation, "mixed", "success"))
 
 		o := f.migrate(t, f.rendering(endpointA))
 		mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonProcess)
@@ -995,11 +1072,10 @@ func TestMigrateObservesTheUnitWithNoConfigurationInstalled(t *testing.T) {
 		mustOK(t, os.Remove(f.configPath))
 		mustOK(t, os.Remove(f.recordPath))
 
-		go func() {
-			time.Sleep(50 * time.Millisecond)
+		f.later(t, 50*time.Millisecond, func() {
 			f.writeConfig(t, rendering)
 			f.writeRecord(t, f.record(map[string]any{"deployment": f.deployment, "endpoint": canonicalB}))
-		}()
+		})
 
 		o := f.migrate(t, rendering, "--dry-run", "--wait", "2s")
 		mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonConfig)

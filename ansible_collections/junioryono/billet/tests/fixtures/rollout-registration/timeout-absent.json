@@ -3,9 +3,9 @@
   "outcome": "timeout",
   "node": "node-a",
   "incarnation": "0000000000000000000000000000bbbb",
-  "live": false,
   "deployment": {
     "bound": true,
     "id": "dddddddddddddddddddddddddddddddd"
-  }
+  },
+  "last": null
 }

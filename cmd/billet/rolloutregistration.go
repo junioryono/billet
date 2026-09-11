@@ -23,16 +23,26 @@ import (
 // under the same incarnation bumps it, and a comparison would read a
 // re-registration as news.
 
-// registrationAnswer is the confirmation, or the timeout with the last row.
+// registrationAnswer is the confirmation: exactly the members the receipt's
+// reader decodes.
 type registrationAnswer struct {
+	Schema      int             `json:"schema"`
+	Outcome     string          `json:"outcome"`
+	Node        string          `json:"node"`
+	Incarnation string          `json:"incarnation"`
+	Epoch       int64           `json:"epoch"`
+	Live        bool            `json:"live"`
+	Deployment  registrationDep `json:"deployment"`
+}
+
+// registrationTimeout is the timeout, with the last row seen or null.
+type registrationTimeout struct {
 	Schema      int              `json:"schema"`
 	Outcome     string           `json:"outcome"`
 	Node        string           `json:"node"`
 	Incarnation string           `json:"incarnation"`
-	Epoch       int64            `json:"epoch,omitempty"`
-	Live        bool             `json:"live"`
 	Deployment  registrationDep  `json:"deployment"`
-	Last        *registrationRow `json:"last,omitempty"`
+	Last        *registrationRow `json:"last"`
 }
 
 type registrationDep struct {
@@ -123,13 +133,13 @@ func cmdRolloutRegistration(ctx context.Context, args []string) error {
 
 	defer func() { _ = db.Close() }()
 
-	answer, r := awaitRegistration(ctx, rollout.New(db), cfg, *node, *incarnation, *wait)
+	answer, timeout, r := awaitRegistration(ctx, rollout.New(db), cfg, *node, *incarnation, *wait)
 	if r != nil {
 		return answerEndpointRefusal(r)
 	}
 
-	if answer.Outcome == outcomeTimeout {
-		return answerJSON(answer, exitUnknown, "the ledger did not show "+*node+" registered as incarnation "+
+	if timeout != nil {
+		return answerJSON(timeout, exitUnknown, "the ledger did not show "+*node+" registered as incarnation "+
 			*incarnation+" within "+wait.String())
 	}
 
@@ -140,7 +150,7 @@ func cmdRolloutRegistration(ctx context.Context, args []string) error {
 // is live, the ledger refuses, or the wait elapses.
 func awaitRegistration(ctx context.Context, store *rollout.Store, cfg *config.Config, node, incarnation string,
 	wait time.Duration,
-) (*registrationAnswer, *endpointRefusal) {
+) (*registrationAnswer, *registrationTimeout, *endpointRefusal) {
 	deadline := time.Now().Add(wait)
 
 	var last *registrationRow
@@ -148,24 +158,30 @@ func awaitRegistration(ctx context.Context, store *rollout.Store, cfg *config.Co
 	for {
 		// PEEKED, NEVER MINTED, AT EVERY POLL: the identity file is what the
 		// snapshot's binding is compared with, and a host whose identity
-		// moved under the polls is refused at the poll that sees it.
-		identity, _, err := state.PeekDeploymentID(cfg.Server.IdentityDir)
+		// moved under the polls is refused at the poll that sees it. An
+		// identity that is ABSENT proves nothing, so it confirms nothing.
+		identity, found, err := state.PeekDeploymentID(cfg.Server.IdentityDir)
 		if err != nil {
-			return nil, endpointUnknown(endpointReasonUnexamined, "read the deployment identity: "+err.Error(), "", "")
+			return nil, nil, endpointUnknown(endpointReasonUnexamined, "read the deployment identity: "+err.Error(), "", "")
+		}
+
+		if !found {
+			return nil, nil, endpointRefuse(endpointReasonTrust, "this host has no deployment identity in "+
+				cfg.Server.IdentityDir+", so no ledger binding can be proved to be this host's", "", "")
 		}
 
 		snapshot, err := registrationPoll(ctx, store)
 		if err != nil {
-			return nil, endpointUnknown(endpointReasonUnexamined, "read the ledger: "+err.Error(), "", "")
+			return nil, nil, endpointUnknown(endpointReasonUnexamined, "read the ledger: "+err.Error(), "", "")
 		}
 
 		if snapshot.Binding == "" {
-			return nil, endpointRefuse(endpointReasonUnbound, "this ledger is bound to no deployment, so no registration "+
+			return nil, nil, endpointRefuse(endpointReasonUnbound, "this ledger is bound to no deployment, so no registration "+
 				"in it is this deployment's", "", "")
 		}
 
-		if identity != "" && snapshot.Binding != identity {
-			return nil, endpointRefuse(endpointReasonTrust, fmt.Sprintf("%v: this ledger is bound to deployment %s and "+
+		if snapshot.Binding != identity {
+			return nil, nil, endpointRefuse(endpointReasonTrust, fmt.Sprintf("%v: this ledger is bound to deployment %s and "+
 				"this host's identity directory says %s", state.ErrForeignLedger, snapshot.Binding, identity), "", "")
 		}
 
@@ -182,13 +198,13 @@ func awaitRegistration(ctx context.Context, store *rollout.Store, cfg *config.Co
 
 			if row.Incarnation == incarnation && row.Live {
 				return &registrationAnswer{Schema: endpointSchema, Outcome: outcomeConfirmed, Node: node,
-					Incarnation: incarnation, Epoch: row.Epoch, Live: true, Deployment: dep}, nil
+					Incarnation: incarnation, Epoch: row.Epoch, Live: true, Deployment: dep}, nil, nil
 			}
 		}
 
 		if time.Now().After(deadline) || ctx.Err() != nil {
-			return &registrationAnswer{Schema: endpointSchema, Outcome: outcomeTimeout, Node: node, Incarnation: incarnation,
-				Deployment: dep, Last: last}, nil
+			return nil, &registrationTimeout{Schema: endpointSchema, Outcome: outcomeTimeout, Node: node,
+				Incarnation: incarnation, Deployment: dep, Last: last}, nil
 		}
 
 		select {

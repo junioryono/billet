@@ -61,7 +61,7 @@ const (
 	endpointReasonAgreement   = "agreement"
 	endpointReasonTrust       = "trust"
 	endpointReasonUnbound     = "unbound"
-	endpointReasonUnexamined  = "unexaminable"
+	endpointReasonUnexamined  = "unexamined"
 
 	// The states a migration is left in, named on every refusal.
 	stateNothing         = "nothing"
@@ -482,7 +482,16 @@ func preRProcess(ctx context.Context, pid int) (bool, string) {
 	}
 
 	stdout, stderr, rc, err := runBounded(ctx, installedBinary, "converge-guard", "prepare", "--dry-run", "--json")
-	if err != nil && !errors.Is(err, context.DeadlineExceeded) && rc < 0 {
+
+	// ONLY A COMPLETED RUN IS JUDGED: a run the bound ended, one whose output
+	// overflowed, or one that could not be run has no answer, and a prefix
+	// holding the words is not the diagnostic.
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return false, "the managed binary did not answer the preparation's dry run within its bound"
+	case errors.Is(err, errOutputOverflow):
+		return false, "the managed binary's answer to the preparation's dry run overflowed its bound"
+	case rc < 0:
 		return false, "the managed binary could not be run: " + err.Error()
 	}
 

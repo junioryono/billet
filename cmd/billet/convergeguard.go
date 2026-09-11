@@ -105,9 +105,17 @@ func checkNote(note string) error {
 		return fmt.Errorf("--note is %d bytes; a note is one short line (at most %d bytes)", len(note), maxNoteBytes)
 	}
 
+	// ONE LINE OF PRINTABLE TEXT, by the rule the fallback reader applies:
+	// the ASCII space, or a graphic rune that is not a space of any kind
+	// (a format character such as U+200B, a line or paragraph separator, a
+	// control, an unassigned code point and the replacement rune all refuse).
 	for _, r := range note {
-		if unicode.IsControl(r) || r == unicode.ReplacementChar {
-			return errors.New("--note is not one line of printable text: no control character or newline")
+		if r == ' ' {
+			continue
+		}
+
+		if !unicode.IsGraphic(r) || unicode.IsSpace(r) || r == unicode.ReplacementChar {
+			return errors.New("--note is not one line of printable text: no control, format or non-space whitespace character")
 		}
 	}
 

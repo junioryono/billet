@@ -214,8 +214,14 @@ func TestRegistrationTimesOutNamingTheLastRow(t *testing.T) {
 			t.Errorf("last %v", last)
 		}
 
-		if o.doc["live"] != false || o.doc["epoch"] != nil {
-			t.Errorf("a timeout carried a confirmation's members: %v", o.doc)
+		for _, member := range []string{"live", "epoch"} {
+			if _, present := o.doc[member]; present {
+				t.Errorf("a timeout carried the confirmation's member %s: %v", member, o.doc)
+			}
+		}
+
+		if len(o.doc) != 6 {
+			t.Errorf("a timeout's members: %v", o.doc)
 		}
 
 		if *n < 2 {
@@ -230,8 +236,8 @@ func TestRegistrationTimesOutNamingTheLastRow(t *testing.T) {
 		o := l.run(t)
 		mustTimeout(t, o)
 
-		if _, present := o.doc["last"]; present && o.doc["last"] != nil {
-			t.Errorf("last %v, want null", o.doc["last"])
+		if last, present := o.doc["last"]; !present || last != nil {
+			t.Errorf("last %v (present %v), want a null member", last, present)
 		}
 	})
 
@@ -493,6 +499,10 @@ func TestTheRegistrationFixturesAreTheCommandsOwn(t *testing.T) {
 			l := newRegLedger(t, name != "refused-unbound")
 
 			o := produce(t, l)
+
+			if name == "unknown-read" && o.str("reason") != "unexamined" {
+				t.Errorf("reason %q, want the protocol's spelling unexamined", o.str("reason"))
+			}
 
 			out := strings.ReplaceAll(o.raw, l.deployment, strings.Repeat("d", 32))
 			compareFixture(t, "rollout-registration", name, out)

@@ -134,6 +134,10 @@ func TestANoteThatIsNotOneLineIsRefusedBeforeTheLock(t *testing.T) {
 		{"a newline", "run 12\nof owner/repo"},
 		{"a control character", "run\x0112"},
 		{"a replacement rune", "run � 12"},
+		{"a zero-width space", "run\u200b12"},
+		{"a line separator", "run\u202812"},
+		{"a no-break space", "run\u00a012"},
+		{"a tab", "run\t12"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			f := newGuardFixture(t)

@@ -102,6 +102,10 @@ type receiptEvidence struct {
 	presence receiptPresence
 	receipt  *endpointReceipt
 	why      string
+	// info is the examined file's metadata (the name's, for a name that is
+	// not a regular file; the opened descriptor's otherwise), so a writer
+	// can prove the file it judged is still the file at the name.
+	info os.FileInfo
 }
 
 // readEndpointReceipt reads the receipt at path under the reader's rules.
@@ -130,10 +134,10 @@ func readEndpointReceipt(path string) receiptEvidence {
 	case err != nil:
 		return receiptEvidence{presence: receiptUnreadable, why: fmt.Sprintf("examine the receipt %s: %v", path, err)}
 	case nameInfo.Mode()&os.ModeSymlink != 0:
-		return receiptEvidence{presence: receiptInvalid, why: "the receipt " + path + " is a symlink"}
+		return receiptEvidence{presence: receiptInvalid, why: "the receipt " + path + " is a symlink", info: nameInfo}
 	case !nameInfo.Mode().IsRegular():
 		return receiptEvidence{presence: receiptInvalid, why: fmt.Sprintf("the receipt %s is %s, not a regular file", path,
-			nameInfo.Mode().Type())}
+			nameInfo.Mode().Type()), info: nameInfo}
 	}
 
 	f, info, err := receiptOpen(path)
@@ -150,25 +154,25 @@ func readEndpointReceipt(path string) receiptEvidence {
 
 	uid, ok := receiptOwnerOf(info)
 	if !ok {
-		return receiptEvidence{presence: receiptInvalid, why: "the receipt carries no owner this platform reports"}
+		return receiptEvidence{presence: receiptInvalid, why: "the receipt carries no owner this platform reports", info: info}
 	}
 
 	if uid != 0 {
-		return receiptEvidence{presence: receiptInvalid, why: fmt.Sprintf("the receipt is owned by uid %d, want root", uid)}
+		return receiptEvidence{presence: receiptInvalid, why: fmt.Sprintf("the receipt is owned by uid %d, want root", uid), info: info}
 	}
 
 	if perm := info.Mode().Perm(); perm != 0o600 {
-		return receiptEvidence{presence: receiptInvalid, why: fmt.Sprintf("the receipt is mode %04o, want 0600", perm)}
+		return receiptEvidence{presence: receiptInvalid, why: fmt.Sprintf("the receipt is mode %04o, want 0600", perm), info: info}
 	}
 
 	if info.Size() > maxReceiptBytes {
-		return receiptEvidence{presence: receiptInvalid, why: fmt.Sprintf("the receipt is larger than %d bytes", maxReceiptBytes)}
+		return receiptEvidence{presence: receiptInvalid, why: fmt.Sprintf("the receipt is larger than %d bytes", maxReceiptBytes), info: info}
 	}
 
 	body, err := receiptRead(f, path, maxReceiptBytes)
 	if err != nil {
 		if errors.Is(err, regularfile.ErrTooLarge) {
-			return receiptEvidence{presence: receiptInvalid, why: fmt.Sprintf("the receipt is larger than %d bytes", maxReceiptBytes)}
+			return receiptEvidence{presence: receiptInvalid, why: fmt.Sprintf("the receipt is larger than %d bytes", maxReceiptBytes), info: info}
 		}
 
 		return receiptEvidence{presence: receiptUnreadable, why: fmt.Sprintf("read the receipt %s: %v", path, err)}
@@ -176,10 +180,10 @@ func readEndpointReceipt(path string) receiptEvidence {
 
 	rec, err := decodeEndpointReceipt(body)
 	if err != nil {
-		return receiptEvidence{presence: receiptInvalid, why: "the receipt is malformed: " + err.Error()}
+		return receiptEvidence{presence: receiptInvalid, why: "the receipt is malformed: " + err.Error(), info: info}
 	}
 
-	return receiptEvidence{presence: receiptPresent, receipt: rec}
+	return receiptEvidence{presence: receiptPresent, receipt: rec, info: info}
 }
 
 // decodeEndpointReceipt decodes the receipt's bytes under the exact member

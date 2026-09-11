@@ -223,204 +223,78 @@ func migrateEndpoint(ctx context.Context, m migrateMode) (any, *endpointRefusal)
 		}
 	}
 
-	// (6) THE UNIT'S FIRST OBSERVATION.
 	insp := endpointInspector()
 
-	obs, problem := observeUnit(ctx, insp, nodeUnit)
-	if problem != "" {
-		return nil, endpointUnknown(endpointReasonUnit, problem, "", stateNothing)
+	in := migrateInputs{installed: installed, rendering: rendering, installedEP: installedEP,
+		installedHasNode: installedHasNode, renderedEP: renderedEP, renderedHasNode: renderedHasNode, identity: identity}
+
+	// (6) TO (10) THE JUDGEMENT, retried from the unit's first observation
+	// when the closing observation finds the process moved under it (three
+	// attempts), never when the unit is found stopping or the configuration
+	// moved, and never once the stop has begun.
+	var j judgedMigration
+
+	for attempt := 1; ; attempt++ {
+		var (
+			r     *endpointRefusal
+			moved bool
+		)
+
+		j, r, moved = judgeMigration(ctx, m, insp, in)
+		if r == nil {
+			break
+		}
+
+		if moved && attempt < migrateJudgementAttempts {
+			continue
+		}
+
+		return nil, r
 	}
 
-	if obs.ActiveState == "deactivating" {
-		return nil, endpointRefuse(endpointReasonStopping, fmt.Sprintf("%s is still stopping (since %s); wait or "+
-			"inspect the drain; nothing to do here", nodeUnit, orUnknownWord(obs.StateChangeTimestamp)),
+	if j.answer != nil {
+		return j.answer, nil
+	}
+
+	br, effective := j.br, j.effective
+
+	// (11) THE POLICY AND THE UNIT, ON A FRESH OBSERVATION IMMEDIATELY BEFORE
+	// THE STOP: the judgement's observation is from before the record wait,
+	// and what authorises the stop is the unit as it is now: the same process
+	// the record was read from, not stopping, loaded, under a KillMode whose
+	// stop proves something; and the configuration still the one judged.
+	if problem := closeInstalledConfig(installed); problem != "" {
+		return nil, endpointUnknown(endpointReasonConfig, problem, "", stateNothing)
+	}
+
+	pre, problem := observeUnit(ctx, insp, nodeUnit)
+	if problem != "" {
+		return nil, endpointUnknown(endpointReasonUnit, "before the stop: "+problem, "", stateNothing)
+	}
+
+	if pre.ActiveState == "deactivating" {
+		return nil, endpointRefuse(endpointReasonStopping, fmt.Sprintf("%s began stopping under the judgement (since %s); "+
+			"wait or inspect the drain; nothing to do here", nodeUnit, orUnknownWord(pre.StateChangeTimestamp)),
 			"wait for the stop to complete, then check and approve afresh", stateNothing)
 	}
 
-	// (7) THE EFFECTIVE ENDPOINT, from the running node's record under the
-	// bracket, waited for while a node that just started has none. With no
-	// node section on either side there is no identity and no endpoint to
-	// judge, so the branch is OBSERVATION-ONLY: the unit's state alone, the
-	// record not consulted.
-	var (
-		br      bracketedRecord
-		elapsed bool
-	)
-
-	if !installedHasNode && !renderedHasNode {
-		_, running, problem := runningPID(obs)
-		if problem != "" {
-			return nil, endpointUnknown(endpointReasonUnit, problem, "", stateNothing)
-		}
-
-		br = bracketedRecord{obs: obs, running: running, class: recordAbsent}
-	} else {
-		br, elapsed, problem = waitForRecord(ctx, insp, nodeUnit, identity, m.wait)
-		if problem != "" {
-			return nil, endpointUnknown(endpointReasonUnit, problem, "", stateNothing)
-		}
+	if _, running, problem := runningPID(pre); problem != "" || !running || processMoved(br.obs, pre) {
+		return nil, endpointUnknown(endpointReasonProcess, fmt.Sprintf("%s moved between the judgement and the stop (pid %s, "+
+			"invocation %s, %s now; pid %s, invocation %s when judged)", nodeUnit, pre.MainPID, pre.InvocationID,
+			pre.ActiveState, br.obs.MainPID, br.obs.InvocationID), "check and approve afresh", stateNothing)
 	}
 
-	var (
-		effective    *endpoint.Endpoint
-		recordKind   = recordNone
-		effectiveRec registrationReport
-	)
-
-	switch {
-	case !br.running:
-		recordKind = recordNone
-	case !installedHasNode && !renderedHasNode:
-		recordKind = recordUnread
-	case br.class == recordForeign:
-		return nil, endpointUnknown(endpointReasonRecord, "the running node's record cannot be judged: "+br.why, "",
-			stateNothing)
-	case br.class == recordUsable:
-		e, err := endpoint.ParseCanonical(br.record.Endpoint)
-		if err != nil {
-			return nil, endpointUnknown(endpointReasonRecord, "the record's endpoint: "+err.Error(), "", stateNothing)
-		}
-
-		effective, effectiveRec, recordKind = &e, br.record, recordCurrent
-	case elapsed:
-		// A RUNNING NODE WITHOUT A USABLE RECORD: positively a release before
-		// the guard, or could-not-tell.
-		pid, _, _ := runningPID(br.obs)
-
-		preR, why := preRProcess(ctx, pid)
-		if !preR {
-			return nil, endpointUnknown(endpointReasonRecord, "the running node published no record within the wait ("+
-				why+"): an R process that has not registered, or whose record write failed; wait, or restart it",
-				"", stateNothing)
-		}
-
-		if !installedHasNode {
-			return nil, endpointUnknown(endpointReasonRecord, "a release before the guard runs here and its configured "+
-				"endpoint cannot be read (the installed configuration has no node section); stop it, or restore "+
-				"its configuration, before this converge", "", stateNothing)
-		}
-
-		if !m.dryRun {
-			return nil, endpointRefuse(endpointReasonPreR, "the running node is a release before the converge guard; "+
-				"a binary upgrade restarts it into one that carries the guard, and the action then judges that process",
-				"upgrade the binary first", stateNothing)
-		}
-
-		recordKind = recordAbsentPreR
-	default:
-		recordKind = recordUnread
-	}
-
-	unit := migrateUnit{LoadState: obs.LoadState, ActiveState: obs.ActiveState, KillMode: obs.KillMode}
-
-	// (8) THE DRY RUN.
-	if m.dryRun {
-		report := migrateReport{
-			Schema: endpointSchema, Outcome: outcomeReported, Record: recordKind, Unit: unit,
-			Config: configWord(installed.present), Effective: canonicalPtr(effective),
-		}
-
-		if effective != nil {
-			report.From = canonicalPtr(effective)
-		} else if installedHasNode {
-			report.From = canonicalOrNull(installedEP, true)
-		}
-
-		if rendering != nil {
-			report.To = canonicalOrNull(renderedEP, renderedHasNode)
-			report.NodeRemoved = !renderedHasNode
-			report.FirstStart = !installedHasNode && renderedHasNode && !br.running
-
-			if renderedHasNode {
-				if effective != nil && !effective.Equal(renderedEP) {
-					report.Planned = true
-				}
-
-				if installedHasNode && !installedEP.Equal(renderedEP) {
-					report.Planned = true
-				}
-			}
-		} else if effective != nil && installedHasNode && !effective.Equal(installedEP) {
-			report.Planned = true
-		}
-
-		if problem := closeInstalledConfig(installed); problem != "" {
-			return nil, endpointUnknown(endpointReasonConfig, problem, "", stateNothing)
-		}
-
-		if problem := closeUnitObservation(ctx, insp, br); problem != nil {
-			return nil, problem
-		}
-
-		return report, nil
-	}
-
-	// (9) THE RENDERING MUST BE INSTALLED.
-	if !installed.present {
-		return nil, endpointRefuse(endpointReasonConfig, "no configuration is installed at "+installed.path+
-			"; the render precedes this command", "", stateNothing)
-	}
-
-	if renderedHasNode != installedHasNode || (renderedHasNode && !renderedEP.Equal(installedEP)) {
-		return nil, endpointRefuse(endpointReasonDesired, "the rendering was not installed: the installed configuration's "+
-			"node endpoint is not the rendering's", "the render precedes this command", stateNothing)
-	}
-
-	// (10) NOTHING TO MIGRATE.
-	unchanged := func() (any, *endpointRefusal) {
-		if problem := closeInstalledConfig(installed); problem != "" {
-			return nil, endpointUnknown(endpointReasonConfig, problem, "", stateNothing)
-		}
-
-		if problem := closeUnitObservation(ctx, insp, br); problem != nil {
-			return nil, problem
-		}
-
-		out := migrateUnchanged{Schema: endpointSchema, Outcome: outcomeUnchanged, Record: recordKind, Unit: unit,
-			Effective: canonicalPtr(effective), NodeRemoved: rendering != nil && !renderedHasNode}
-
-		if installedHasNode {
-			out.Endpoint = canonicalOrNull(installedEP, true)
-			// THE IDENTITY IS SEPARATE from the record's judgement: the name is
-			// the configuration's effective one whenever a node section exists,
-			// and the deployment a string only where a certificate or an
-			// existing identity file gives it, never minted.
-			name := identity.node
-			if name == "" {
-				name = installed.cfg.Node.Name
-			}
-
-			out.Node = stringOrNull(name)
-			out.Deployment = stringOrNull(identity.deployment)
-		}
-
-		return out, nil
-	}
-
-	if !br.running || !renderedHasNode || (effective != nil && effective.Equal(installedEP)) {
-		return unchanged()
-	}
-
-	if effective == nil {
-		// A running node with a record that is neither usable nor a positively
-		// pre-R absence is already refused above; what remains is a node
-		// running beside configurations without endpoints, an observation-only
-		// answer.
-		return unchanged()
-	}
-
-	// (11) THE POLICY AND THE UNIT.
-	switch obs.KillMode {
+	switch pre.KillMode {
 	case "mixed", "control-group":
 	default:
 		return nil, endpointRefuse(endpointReasonPolicy, fmt.Sprintf("%s has KillMode=%s, under which a stop proves nothing "+
-			"about the processes that remain; only mixed or control-group is migrated", nodeUnit, orUnknownWord(obs.KillMode)),
+			"about the processes that remain; only mixed or control-group is migrated", nodeUnit, orUnknownWord(pre.KillMode)),
 			"", stateNothing)
 	}
 
-	if obs.LoadState == "not-found" {
-		return nil, endpointRefuse(endpointReasonUnit, nodeUnit+" is not found by systemd, so it cannot be started after "+
-			"the stop", "", stateNothing)
+	if pre.LoadState != "loaded" {
+		return nil, endpointRefuse(endpointReasonUnit, fmt.Sprintf("%s has LoadState=%s, so it cannot be started after the "+
+			"stop", nodeUnit, orUnknownWord(pre.LoadState)), "", stateNothing)
 	}
 
 	// (12) THE STOP under the migration's own deadline: the context bounds
@@ -453,6 +327,14 @@ func migrateEndpoint(ctx context.Context, m migrateMode) (any, *endpointRefusal)
 			"ActiveState=%s SubState=%s Result=%s, and only inactive/dead/success proves the process gone", nodeUnit,
 			orUnknownWord(post.ActiveState), orUnknownWord(post.SubState), orUnknownWord(post.Result)),
 			"inspect the unit; check and approve afresh", stateStopped)
+	}
+
+	// THE CONFIGURATION AGAIN, before the start: a file replaced or modified
+	// under the stop is not the one judged, and the node stays stopped rather
+	// than starting on it.
+	if problem := closeInstalledConfig(installed); problem != "" {
+		return nil, endpointUnknown(endpointReasonConfig, problem+"; the node is stopped and was not started on it",
+			"check and approve afresh", stateStopped)
 	}
 
 	// (14) THE START under the unit's own start bound.
@@ -496,6 +378,15 @@ func migrateEndpoint(ctx context.Context, m migrateMode) (any, *endpointRefusal)
 			m.wait.String()+" ("+newBr.why+")", "wait for it to register, then converge again", stateStartedNoRecord)
 	}
 
+	// THE RECORD IS THE STARTED INVOCATION'S: a restart under the wait would
+	// publish a record under a later invocation, which is not the process
+	// this migration started.
+	if newBr.obs.InvocationID != started.InvocationID || newBr.obs.MainPID != started.MainPID {
+		return nil, endpointUnknown(endpointReasonProcess, fmt.Sprintf("the node started as pid %s invocation %s and its "+
+			"record was read from pid %s invocation %s; it moved under the wait", started.MainPID, started.InvocationID,
+			newBr.obs.MainPID, newBr.obs.InvocationID), "", stateStarted)
+	}
+
 	newEP, err := endpoint.ParseCanonical(newBr.record.Endpoint)
 	if err != nil || !newEP.Equal(installedEP) {
 		return nil, endpointUnknown(endpointReasonUnproved, fmt.Sprintf("the started node dials %s, not the installed "+
@@ -519,8 +410,6 @@ func migrateEndpoint(ctx context.Context, m migrateMode) (any, *endpointRefusal)
 			closing.ActiveState, newBr.obs.MainPID, newBr.obs.InvocationID), "", stateStarted)
 	}
 
-	_ = effectiveRec
-
 	return migrateEvidence{
 		Schema: endpointSchema, Outcome: outcomeMigrated, Node: newBr.record.Node, Deployment: newBr.record.Deployment,
 		From: effective.String(), To: installedEP.String(), ConfigPath: installed.path,
@@ -529,36 +418,262 @@ func migrateEndpoint(ctx context.Context, m migrateMode) (any, *endpointRefusal)
 	}, nil
 }
 
+// migrateJudgementAttempts bounds the judgement's retries when the process
+// moves under it.
+const migrateJudgementAttempts = 3
+
+// migrateInputs is what the judgement reads: the two configurations, their
+// endpoints and the identity the record must name.
+type migrateInputs struct {
+	installed                         *installedConfigObservation
+	rendering                         *configObservationLite
+	installedEP, renderedEP           endpoint.Endpoint
+	installedHasNode, renderedHasNode bool
+	identity                          registrationIdentity
+}
+
+// judgedMigration is the judgement's result: an answer (a dry run's report
+// or `unchanged`), or the evidence a migration proceeds from.
+type judgedMigration struct {
+	answer    any
+	obs       unitObservation
+	br        bracketedRecord
+	effective *endpoint.Endpoint
+	unit      migrateUnit
+}
+
+// judgeMigration is steps (6) to (10): the unit's first observation, the
+// effective endpoint from the record under the bracket, the dry run's
+// report or the `unchanged` answer with their closing checks, or the
+// decision to migrate. The third result says the closing observation found
+// the process moved, which the caller retries.
+func judgeMigration(ctx context.Context, m migrateMode, insp *lifeops.Inspector, in migrateInputs) (judgedMigration, *endpointRefusal, bool) {
+	installed, rendering := in.installed, in.rendering
+	installedEP, installedHasNode := in.installedEP, in.installedHasNode
+	renderedEP, renderedHasNode := in.renderedEP, in.renderedHasNode
+	identity := in.identity
+
+	// (6) THE UNIT'S FIRST OBSERVATION.
+	obs, problem := observeUnit(ctx, insp, nodeUnit)
+	if problem != "" {
+		return judgedMigration{}, endpointUnknown(endpointReasonUnit, problem, "", stateNothing), false
+	}
+
+	if obs.ActiveState == "deactivating" {
+		return judgedMigration{}, endpointRefuse(endpointReasonStopping, fmt.Sprintf("%s is still stopping (since %s); wait or "+
+			"inspect the drain; nothing to do here", nodeUnit, orUnknownWord(obs.StateChangeTimestamp)),
+			"wait for the stop to complete, then check and approve afresh", stateNothing), false
+	}
+
+	// (7) THE EFFECTIVE ENDPOINT, from the running node's record under the
+	// bracket, waited for while a node that just started has none. With no
+	// node section on either side there is no identity and no endpoint to
+	// judge, so the branch is OBSERVATION-ONLY: the unit's state alone, the
+	// record not consulted.
+	var (
+		br      bracketedRecord
+		elapsed bool
+	)
+
+	if !installedHasNode && !renderedHasNode {
+		_, running, problem := runningPID(obs)
+		if problem != "" {
+			return judgedMigration{}, endpointUnknown(endpointReasonUnit, problem, "", stateNothing), false
+		}
+
+		br = bracketedRecord{obs: obs, running: running, class: recordAbsent}
+	} else {
+		br, elapsed, problem = waitForRecord(ctx, insp, nodeUnit, identity, m.wait)
+		if problem != "" {
+			return judgedMigration{}, endpointUnknown(endpointReasonUnit, problem, "", stateNothing), false
+		}
+	}
+
+	var (
+		effective  *endpoint.Endpoint
+		recordKind = recordNone
+	)
+
+	switch {
+	case !br.running:
+		recordKind = recordNone
+	case !installedHasNode && !renderedHasNode:
+		recordKind = recordUnread
+	case br.class == recordForeign:
+		return judgedMigration{}, endpointUnknown(endpointReasonRecord, "the running node's record cannot be judged: "+br.why, "",
+			stateNothing), false
+	case br.class == recordUsable:
+		e, err := endpoint.ParseCanonical(br.record.Endpoint)
+		if err != nil {
+			return judgedMigration{}, endpointUnknown(endpointReasonRecord, "the record's endpoint: "+err.Error(), "", stateNothing), false
+		}
+
+		effective, recordKind = &e, recordCurrent
+	case elapsed:
+		// A RUNNING NODE WITHOUT A USABLE RECORD: positively a release before
+		// the guard, or could-not-tell.
+		pid, _, _ := runningPID(br.obs)
+
+		preR, why := preRProcess(ctx, pid)
+		if !preR {
+			return judgedMigration{}, endpointUnknown(endpointReasonRecord, "the running node published no record within the wait ("+
+				why+"): an R process that has not registered, or whose record write failed; wait, or restart it",
+				"", stateNothing), false
+		}
+
+		if !installedHasNode {
+			return judgedMigration{}, endpointUnknown(endpointReasonRecord, "a release before the guard runs here and its configured "+
+				"endpoint cannot be read (the installed configuration has no node section); stop it, or restore "+
+				"its configuration, before this converge", "", stateNothing), false
+		}
+
+		if !m.dryRun {
+			return judgedMigration{}, endpointRefuse(endpointReasonPreR, "the running node is a release before the converge guard; "+
+				"a binary upgrade restarts it into one that carries the guard, and the action then judges that process",
+				"upgrade the binary first", stateNothing), false
+		}
+
+		recordKind = recordAbsentPreR
+	default:
+		recordKind = recordUnread
+	}
+
+	unit := migrateUnit{LoadState: obs.LoadState, ActiveState: obs.ActiveState, KillMode: obs.KillMode}
+
+	// (8) THE DRY RUN.
+	if m.dryRun {
+		report := migrateReport{
+			Schema: endpointSchema, Outcome: outcomeReported, Record: recordKind, Unit: unit,
+			Config: configWord(installed.present), Effective: canonicalPtr(effective),
+		}
+
+		if effective != nil {
+			report.From = canonicalPtr(effective)
+		} else if installedHasNode {
+			report.From = canonicalOrNull(installedEP, true)
+		}
+
+		if rendering != nil {
+			report.To = canonicalOrNull(renderedEP, renderedHasNode)
+			report.NodeRemoved = !renderedHasNode
+			report.FirstStart = !installedHasNode && renderedHasNode && !br.running
+
+			if renderedHasNode {
+				if effective != nil && !effective.Equal(renderedEP) {
+					report.Planned = true
+				}
+
+				if installedHasNode && !installedEP.Equal(renderedEP) {
+					report.Planned = true
+				}
+			}
+		} else if effective != nil && installedHasNode && !effective.Equal(installedEP) {
+			report.Planned = true
+		}
+
+		if problem := closeInstalledConfig(installed); problem != "" {
+			return judgedMigration{}, endpointUnknown(endpointReasonConfig, problem, "", stateNothing), false
+		}
+
+		if problem, moved := closeUnitObservation(ctx, insp, br); problem != nil {
+			return judgedMigration{}, problem, moved
+		}
+
+		return judgedMigration{answer: report}, nil, false
+	}
+
+	// (9) THE RENDERING MUST BE INSTALLED.
+	if !installed.present {
+		return judgedMigration{}, endpointRefuse(endpointReasonConfig, "no configuration is installed at "+installed.path+
+			"; the render precedes this command", "", stateNothing), false
+	}
+
+	if renderedHasNode != installedHasNode || (renderedHasNode && !renderedEP.Equal(installedEP)) {
+		return judgedMigration{}, endpointRefuse(endpointReasonDesired, "the rendering was not installed: the installed configuration's "+
+			"node endpoint is not the rendering's", "the render precedes this command", stateNothing), false
+	}
+
+	// (10) NOTHING TO MIGRATE.
+	unchanged := func() (judgedMigration, *endpointRefusal, bool) {
+		if problem := closeInstalledConfig(installed); problem != "" {
+			return judgedMigration{}, endpointUnknown(endpointReasonConfig, problem, "", stateNothing), false
+		}
+
+		if problem, moved := closeUnitObservation(ctx, insp, br); problem != nil {
+			return judgedMigration{}, problem, moved
+		}
+
+		out := migrateUnchanged{Schema: endpointSchema, Outcome: outcomeUnchanged, Record: recordKind, Unit: unit,
+			Effective: canonicalPtr(effective), NodeRemoved: rendering != nil && !renderedHasNode}
+
+		if installedHasNode {
+			out.Endpoint = canonicalOrNull(installedEP, true)
+			// THE IDENTITY IS SEPARATE from the record's judgement: the name is
+			// the configuration's effective one whenever a node section exists,
+			// and the deployment a string only where a certificate or an
+			// existing identity file gives it, never minted.
+			name := identity.node
+			if name == "" {
+				name = installed.cfg.Node.Name
+			}
+
+			if name == "" {
+				return judgedMigration{}, endpointUnknown(endpointReasonConfig, "the installed configuration has a node "+
+					"section whose effective name cannot be resolved ("+identity.why+")", "", stateNothing), false
+			}
+
+			out.Node = stringOrNull(name)
+			out.Deployment = stringOrNull(identity.deployment)
+		}
+
+		return judgedMigration{answer: out}, nil, false
+	}
+
+	if !br.running || !renderedHasNode || (effective != nil && effective.Equal(installedEP)) {
+		return unchanged()
+	}
+
+	if effective == nil {
+		// A running node with a record that is neither usable nor a positively
+		// pre-R absence is already refused above; what remains is a node
+		// running beside configurations without endpoints, an observation-only
+		// answer.
+		return unchanged()
+	}
+
+	return judgedMigration{obs: obs, br: br, effective: effective, unit: unit}, nil, false
+}
+
 // closeUnitObservation is the closing check of a reported or unchanged
 // answer: the unit observed once more and compared with the bracket the
-// answer rests on; a process that moved retries nothing here (the caller's
-// whole judgement is what a retry would repeat) and is could-not-tell, a
-// unit found stopping refuses.
-func closeUnitObservation(ctx context.Context, insp *lifeops.Inspector, br bracketedRecord) *endpointRefusal {
+// answer rests on; a process that moved is could-not-tell here and true in
+// the second result, which the caller's judgement retries; a unit found
+// stopping refuses.
+func closeUnitObservation(ctx context.Context, insp *lifeops.Inspector, br bracketedRecord) (*endpointRefusal, bool) {
 	closing, problem := observeUnit(ctx, insp, nodeUnit)
 	if problem != "" {
-		return endpointUnknown(endpointReasonProcess, "at the close: "+problem, "", stateNothing)
+		return endpointUnknown(endpointReasonProcess, "at the close: "+problem, "", stateNothing), false
 	}
 
 	if closing.ActiveState == "deactivating" {
 		return endpointRefuse(endpointReasonStopping, fmt.Sprintf("%s began stopping under the judgement (since %s); "+
 			"wait or inspect the drain; nothing to do here", nodeUnit, orUnknownWord(closing.StateChangeTimestamp)),
-			"wait for the stop to complete, then check and approve afresh", stateNothing)
+			"wait for the stop to complete, then check and approve afresh", stateNothing), false
 	}
 
 	_, running, problem := runningPID(closing)
 	if problem != "" {
-		return endpointUnknown(endpointReasonProcess, "at the close: "+problem, "", stateNothing)
+		return endpointUnknown(endpointReasonProcess, "at the close: "+problem, "", stateNothing), false
 	}
 
 	if running != br.running || (running && processMoved(br.obs, closing)) {
 		return endpointUnknown(endpointReasonProcess, fmt.Sprintf("%s moved under the judgement (pid %s, invocation "+
 			"%s, %s at the close; pid %s, invocation %s, %s when judged)", nodeUnit, closing.MainPID, closing.InvocationID,
 			closing.ActiveState, br.obs.MainPID, br.obs.InvocationID, br.obs.ActiveState),
-			"check and approve afresh", stateNothing)
+			"check and approve afresh", stateNothing), true
 	}
 
-	return nil
+	return nil, false
 }
 
 // configObservationLite is a rendering: its bytes and its parse.

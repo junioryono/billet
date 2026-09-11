@@ -595,11 +595,10 @@ func TestReceiptRefreshKeepsTheReceiptCurrent(t *testing.T) {
 		f.migrated(t)
 		mustOK(t, os.Remove(f.recordPath))
 
-		go func() {
-			time.Sleep(60 * time.Millisecond)
+		f.later(t, 60*time.Millisecond, func() {
 			f.writeRecord(t, f.record(map[string]any{"deployment": f.deployment, "endpoint": canonicalB,
 				"invocation_id": newInvocation, "incarnation": newIncarnation}))
-		}()
+		})
 
 		o := f.refresh(t, f.rendering(endpointB), "--wait", "3s")
 		mustWritten(t, o)
@@ -808,6 +807,10 @@ func TestReceiptRefreshValidatesTheExistingFileBeforeTheShortcut(t *testing.T) {
 
 			o := f.refresh(t, f.rendering(endpointB))
 			mustWritten(t, o)
+
+			// The mapping is by inode, and a filesystem may hand the rewritten
+			// file the inode the removed one had.
+			clear(f.owners)
 
 			if disk := f.receiptOnDisk(t); disk.Run != receiptRun || disk.InvocationID != newInvocation {
 				t.Errorf("on disk %+v", disk)
