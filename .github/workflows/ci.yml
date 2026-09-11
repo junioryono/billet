@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   test:
-    runs-on: billet-ci-16vcpu-ubuntu-2404
+    runs-on: billet-16vcpu-ubuntu-2404
     # THIS JOB RUNS THE SUITE TWICE AND TALKS TO TWO REAL SERVICES, so it is the
     # one job whose runtime is not mostly Go. `-race -covermode=atomic` over the
     # whole tree, against a real Docker daemon for internal/e2e and a real
@@ -166,7 +166,7 @@ jobs:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
   lint:
-    runs-on: billet-ci-8vcpu-ubuntu-2404
+    runs-on: billet-8vcpu-ubuntu-2404
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v6
@@ -232,7 +232,7 @@ jobs:
   # it is actually about, and `go install` fetches through proxy.golang.org,
   # which is a cache rather than a redirect to the same CDN.
   release-config:
-    runs-on: billet-ci-2vcpu-ubuntu-2404
+    runs-on: billet-2vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
@@ -263,7 +263,7 @@ jobs:
         run: make module-sources
 
   host-lifecycle:
-    runs-on: billet-ci-8vcpu-ubuntu-2404
+    runs-on: billet-8vcpu-ubuntu-2404
     # Sized from what the gates measurably take: the run was cancelled at 15
     # minutes after the two connector gates and the fleet gate joined it
     # (measured 2026-09-06, 15m03s with every gate green until the cap).
@@ -432,7 +432,7 @@ jobs:
   # phony and runs again for the second target, but the Go build cache is warm
   # by then and it costs about a minute.
   package-lifecycle:
-    runs-on: billet-ci-8vcpu-ubuntu-2404
+    runs-on: billet-8vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
@@ -479,7 +479,7 @@ jobs:
     # configured against a name that embeds the pin would silently stop being
     # satisfied on the next version bump.
     name: terraform (${{ matrix.label }})
-    runs-on: billet-ci-2vcpu-ubuntu-2404
+    runs-on: billet-2vcpu-ubuntu-2404
     timeout-minutes: 15
     strategy:
       fail-fast: false
@@ -556,7 +556,7 @@ jobs:
   # consumer floor would be an untested claim that rots. It validates exactly
   # what a consumer resolves: the module sources without tests.
   terraform-consumer-floor:
-    runs-on: billet-ci-2vcpu-ubuntu-2404
+    runs-on: billet-2vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
@@ -589,7 +589,7 @@ jobs:
   # Versions are read from the Makefile, the way goreleaser's is, so the
   # workflow and `make tf-lint`/`make tf-scan` cannot drift apart.
   terraform-lint:
-    runs-on: billet-ci-2vcpu-ubuntu-2404
+    runs-on: billet-2vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
@@ -630,7 +630,7 @@ jobs:
   # test job's cap on a runner (measured 2026-09-05), and the race detector's
   # value is already spent on the same code by the three-hundred-job run there.
   replay:
-    runs-on: billet-ci-8vcpu-ubuntu-2404
+    runs-on: billet-8vcpu-ubuntu-2404
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
@@ -646,7 +646,7 @@ jobs:
   # broken cross-reference or a page missing from the toctree fails here rather
   # than publishing.
   docs:
-    runs-on: billet-ci-2vcpu-ubuntu-2404
+    runs-on: billet-2vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v6
         with:
@@ -670,7 +670,7 @@ jobs:
   # required check blocks the merge with nothing saying why.
   verify-all-checks:
     name: Verify All Checks Passed
-    runs-on: billet-ci-2vcpu-ubuntu-2404
+    runs-on: billet-2vcpu-ubuntu-2404
     needs:
       [
         test,
