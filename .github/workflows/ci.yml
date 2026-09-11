@@ -89,11 +89,11 @@ jobs:
       # index sets are fetched and a package comes from whichever lists it
       # (measured on a guest the same day with the first URI black-holed: the
       # install came from the second in 4 s; a lenient update passes). The
-      # sources file lists Ubuntu mirrors and nothing else, so the whole line
-      # is rewritten.
+      # rewrite matches the archive line's exact spelling (and ports.ubuntu.com's,
+      # for an arm64 runner), so any other source is left alone.
       - name: Install the AppArmor tools the vendored kernel checker grades
         run: |
-          sudo sed -i 's,^URIs: .*$,URIs: https://archive.ubuntu.com/ubuntu/ https://mirrors.edge.kernel.org/ubuntu/,' /etc/apt/sources.list.d/ubuntu.sources
+          sudo sed -i -e 's,^URIs: http://archive[.]ubuntu[.]com/ubuntu/$,URIs: https://archive.ubuntu.com/ubuntu/ https://mirrors.edge.kernel.org/ubuntu/,' -e 's,^URIs: http://ports[.]ubuntu[.]com/ubuntu-ports/$,URIs: https://ports.ubuntu.com/ubuntu-ports/,' /etc/apt/sources.list.d/ubuntu.sources
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends apparmor
 
@@ -313,7 +313,7 @@ jobs:
       # The hosted image carries it; the fleet's guest image does not yet.
       - name: Install python3-apt for the apt module's check mode
         run: |
-          sudo sed -i 's,^URIs: .*$,URIs: https://archive.ubuntu.com/ubuntu/ https://mirrors.edge.kernel.org/ubuntu/,' /etc/apt/sources.list.d/ubuntu.sources
+          sudo sed -i -e 's,^URIs: http://archive[.]ubuntu[.]com/ubuntu/$,URIs: https://archive.ubuntu.com/ubuntu/ https://mirrors.edge.kernel.org/ubuntu/,' -e 's,^URIs: http://ports[.]ubuntu[.]com/ubuntu-ports/$,URIs: https://ports.ubuntu.com/ubuntu-ports/,' /etc/apt/sources.list.d/ubuntu.sources
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends python3-apt
 
