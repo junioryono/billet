@@ -5,44 +5,52 @@
   register: billet_development_apt_stage_stat
   become: true
 
-- name: Install development package prerequisites
-  ansible.builtin.apt:
-    name:
-      - ca-certificates
-      - curl
-      - debian-keyring
-      - debian-archive-keyring
-      - gnupg
-      - libnss3-tools
-      - mkcert
-      - python3-debian
-    state: present
-    update_cache: true
-  become: true
-
-- name: Inspect development repository artifacts
-  ansible.builtin.stat:
-    path: "{{ item }}"
-  loop:
-    - "{{ billet_development_apt_stage }}/caddy.asc"
-    - "{{ billet_development_apt_stage }}/hashicorp.asc"
-    - /etc/apt/keyrings/caddy.asc
-    - /etc/apt/keyrings/hashicorp.asc
-    - /etc/apt/sources.list.d/caddy-stable.sources
-    - /etc/apt/sources.list.d/hashicorp.sources
-  register: billet_development_apt_artifacts
-  become: true
-
-- name: Inspect deb822 repository support
+# THE KEYRINGS ARE REPAIRED BEFORE ANY CACHE UPDATE. A publisher that rotates
+# its signing key leaves every host holding the previous one, and from then on
+# every apt cache update on that host fails with NO_PUBKEY, the prerequisites'
+# included; so the verified keys go in first, or the role could never repair a
+# rotation it knows about (HashiCorp's of 2026-09-09, measured on the reference
+# deployment's node, whose converge failed at its first apt task).
+#
+# THE BOOTSTRAP: the download needs a CA store and the verifier needs gpg, and
+# a host may lack either (a minimal image; a host provisioned with the
+# repositories and keyrings but not the tool). Both are probed as root, the
+# account the verifier runs as, since a gpg on the connecting user's PATH says
+# nothing about root's. The bootstrap refreshes the lists with apt-get itself
+# and not the apt module: apt-get reports a source it cannot verify as a
+# warning and exits 0 (measured 2026-09-11 in ubuntu:24.04 with a deb822 source
+# whose Signed-By names no key), so a stale third-party keyring on such a host
+# does not stop the distribution's own packages from installing, where the
+# module reads the same warning as a failed update and would leave the host
+# unable to repair itself.
+- name: Inspect whether gpg and a CA store are present for the key download and verifier
   ansible.builtin.command:
-    argv:
-      - "{{ ansible_facts['python']['executable'] }}"
-      - -c
-      - import debian.deb822
-  register: billet_development_deb822_support
+    argv: [sh, -c, "command -v gpg >/dev/null && test -r /etc/ssl/certs/ca-certificates.crt"]
+  register: billet_development_bootstrap_probe
   changed_when: false
   failed_when: false
   check_mode: false
+  become: true
+
+- name: Refresh the distribution's package lists before the bootstrap
+  ansible.builtin.command:
+    argv: [apt-get, -o, Acquire::Retries=3, update]
+  changed_when: false
+  when:
+    - not ansible_check_mode
+    - billet_development_bootstrap_probe.rc != 0
+  become: true
+
+- name: Install gnupg and ca-certificates before any repository key is fetched or verified
+  ansible.builtin.apt:
+    name:
+      - ca-certificates
+      - gnupg
+    state: present
+  when:
+    - not ansible_check_mode
+    - billet_development_bootstrap_probe.rc != 0
+  become: true
 
 - name: Create the development package staging directory
   ansible.builtin.file:
@@ -109,8 +117,48 @@
   loop:
     - caddy
     - hashicorp
+  register: billet_development_key_install
   when: not ansible_check_mode
   become: true
+
+- name: Install development package prerequisites
+  ansible.builtin.apt:
+    name:
+      - ca-certificates
+      - curl
+      - debian-keyring
+      - debian-archive-keyring
+      - gnupg
+      - libnss3-tools
+      - mkcert
+      - python3-debian
+    state: present
+    update_cache: true
+  become: true
+
+- name: Inspect development repository artifacts
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ billet_development_apt_stage }}/caddy.asc"
+    - "{{ billet_development_apt_stage }}/hashicorp.asc"
+    - /etc/apt/keyrings/caddy.asc
+    - /etc/apt/keyrings/hashicorp.asc
+    - /etc/apt/sources.list.d/caddy-stable.sources
+    - /etc/apt/sources.list.d/hashicorp.sources
+  register: billet_development_apt_artifacts
+  become: true
+
+- name: Inspect deb822 repository support
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_facts['python']['executable'] }}"
+      - -c
+      - import debian.deb822
+  register: billet_development_deb822_support
+  changed_when: false
+  failed_when: false
+  check_mode: false
 
 - name: Add the Caddy repository
   ansible.builtin.deb822_repository:
@@ -142,6 +190,8 @@
     - not ansible_check_mode or billet_development_deb822_support.rc == 0
   become: true
 
+# A key-only replacement (a rotation) refreshes the cache too: the repository
+# definitions keep their signed_by paths, so nothing else would notice.
 - name: Refresh apt for development repositories
   ansible.builtin.apt:
     update_cache: true
@@ -149,7 +199,8 @@
     - not ansible_check_mode
     - >-
       billet_development_caddy_repository is changed or
-      billet_development_hashicorp_repository is changed
+      billet_development_hashicorp_repository is changed or
+      billet_development_key_install is changed
   become: true
 
 - name: Decide whether Linux package metadata is ready
