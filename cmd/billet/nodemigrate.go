@@ -164,8 +164,9 @@ func checkMigrateCombination(m migrateMode) *endpointRefusal {
 // migrateEndpoint is the command's order of operations; every step's refusal
 // names the state the host is left in.
 func migrateEndpoint(ctx context.Context, m migrateMode) (any, *endpointRefusal) {
-	// (3) THE INSTALLED CONFIGURATION, one observation.
-	installed, r := observeInstalledConfig(m.configPath)
+	// (3) THE INSTALLED CONFIGURATION, one observation; the loader's whole
+	// judgement for the action, the node section's for a dry run.
+	installed, r := observeInstalledConfig(m.configPath, !m.dryRun)
 	if r != nil {
 		return nil, r
 	}
@@ -176,7 +177,7 @@ func migrateEndpoint(ctx context.Context, m migrateMode) (any, *endpointRefusal)
 	)
 
 	if m.desired != "" {
-		body, cfg, r := readRendering(m.desired)
+		body, cfg, r := readRendering(m.desired, !m.dryRun)
 		if r != nil {
 			return nil, r
 		}

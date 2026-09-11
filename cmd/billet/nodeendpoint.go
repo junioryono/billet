@@ -139,8 +139,13 @@ type installedConfigObservation struct {
 // observeConfig reads the configuration at path through the identity-first
 // open and parses it. The three outcomes are typed: present and parsed; absent
 // (the positive ENOENT); or a refusal (unreadable is could-not-tell, malformed
-// is refused).
-func observeInstalledConfig(path string) (*installedConfigObservation, *endpointRefusal) {
+// is refused). STRICT is the loader's whole judgement, for a call that stops,
+// installs or starts on the configuration; a dry run reads it leniently, the
+// node section validated alone, because an operator's first emission (its
+// GitHub App ids still zero, refused at load by design) is a configuration the
+// role's own `billet check` judges at converge and a dry run must describe,
+// not refuse.
+func observeInstalledConfig(path string, strict bool) (*installedConfigObservation, *endpointRefusal) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return nil, endpointUnknown(endpointReasonConfig, fmt.Sprintf("resolve %s: %v", path, err), "", stateNothing)
@@ -165,7 +170,7 @@ func observeInstalledConfig(path string) (*installedConfigObservation, *endpoint
 			"", stateNothing)
 	}
 
-	cfg, err := config.Parse(abs, body)
+	cfg, err := parseConfiguration(abs, body, strict)
 	if err != nil {
 		return nil, endpointRefuse(endpointReasonConfig, fmt.Sprintf("the installed configuration %s does not parse: %v",
 			abs, err), "", stateNothing)
@@ -225,9 +230,30 @@ func inputReadUnknown(err error) bool {
 		!errors.Is(err, regularfile.ErrTooLarge)
 }
 
+// parseConfiguration is the one parse of an installed configuration or a
+// rendering: the loader's whole judgement when strict, the node section's
+// alone otherwise (see observeInstalledConfig).
+func parseConfiguration(name string, body []byte, strict bool) (*config.Config, error) {
+	if strict {
+		return config.Parse(name, body)
+	}
+
+	cfg, err := config.ParseUnvalidated(name, body)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := cfg.ValidateNodeSection(); err != nil {
+		return nil, fmt.Errorf("invalid node section in %s: %w", name, err)
+	}
+
+	return cfg, nil
+}
+
 // readRendering reads the rendering the role passes: "-" is stdin, anything
-// else a file; bounded, and parsed under the configuration's own rules.
-func readRendering(source string) ([]byte, *config.Config, *endpointRefusal) {
+// else a file; bounded, and parsed under the configuration's own rules (the
+// whole of them when strict, the node section's alone for a dry run).
+func readRendering(source string, strict bool) ([]byte, *config.Config, *endpointRefusal) {
 	var (
 		body []byte
 		err  error
@@ -252,7 +278,7 @@ func readRendering(source string) ([]byte, *config.Config, *endpointRefusal) {
 			"", stateNothing)
 	}
 
-	cfg, err := config.Parse("the rendering", body)
+	cfg, err := parseConfiguration("the rendering", body, strict)
 	if err != nil {
 		return nil, nil, endpointRefuse(endpointReasonDesired, "the rendering does not parse: "+err.Error(), "",
 			stateNothing)

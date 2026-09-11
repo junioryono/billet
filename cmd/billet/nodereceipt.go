@@ -191,7 +191,7 @@ func writeReceiptFromEvidence(ctx context.Context, m receiptMode) (any, *endpoin
 			abs, ev.ConfigPath), "", "")
 	}
 
-	installed, r := observeInstalledConfig(m.configPath)
+	installed, r := observeInstalledConfig(m.configPath, true)
 	if r != nil {
 		return nil, r
 	}
@@ -256,7 +256,7 @@ func writeReceiptFromEvidence(ctx context.Context, m receiptMode) (any, *endpoin
 
 // refreshReceipt is refresh mode.
 func refreshReceipt(ctx context.Context, m receiptMode) (any, *endpointRefusal) {
-	installed, r := observeInstalledConfig(m.configPath)
+	installed, r := observeInstalledConfig(m.configPath, !m.dryRun)
 	if r != nil {
 		return nil, r
 	}
@@ -291,7 +291,7 @@ func refreshReceipt(ctx context.Context, m receiptMode) (any, *endpointRefusal) 
 	)
 
 	if m.desired != "" {
-		_, cfg, r := readRendering(m.desired)
+		_, cfg, r := readRendering(m.desired, !m.dryRun)
 		if r != nil {
 			return nil, r
 		}
