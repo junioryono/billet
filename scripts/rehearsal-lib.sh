@@ -319,10 +319,11 @@ rehearsal_start_host() {
         --privileged --cgroupns=host \
         -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
         ${volumes[@]+"${volumes[@]}"} \
+        -v /etc/ssl/certs/ca-certificates.crt:/usr/local/share/billet-host-ca.crt:ro \
         -e DEBIAN_FRONTEND=noninteractive \
         --platform "linux/${REHEARSAL_ARCH}" \
         ubuntu:24.04 sh -c \
-        "timeout -v -k 10 300 apt-get -o APT::Update::Error-Mode=any -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update -qq && timeout -v -k 10 300 apt-get -o APT::Update::Error-Mode=any -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y -qq ${packages} >/dev/null && exec /lib/systemd/systemd" \
+        "sed -i -e 's,^URIs: http://archive[.]ubuntu[.]com/ubuntu/$,URIs: https://archive.ubuntu.com/ubuntu/ https://mirrors.edge.kernel.org/ubuntu/,' -e 's,^URIs: http://ports[.]ubuntu[.]com/ubuntu-ports/$,URIs: https://ports.ubuntu.com/ubuntu-ports/,' /etc/apt/sources.list.d/ubuntu.sources && timeout -v -k 10 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::CAInfo=/usr/local/share/billet-host-ca.crt update -qq && ls /var/lib/apt/lists/*InRelease >/dev/null && timeout -v -k 10 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::CAInfo=/usr/local/share/billet-host-ca.crt install -y -qq ${packages} >/dev/null && exec /lib/systemd/systemd" \
         >/dev/null || rehearsal_fail "could not start the ${name} container"
 
     # LONGER THAN THE BOOTSTRAP IT WAITS FOR. The entrypoint may spend up to
@@ -359,7 +360,7 @@ rehearsal_install_package() {
     local name=$1 deb=$2
 
     docker cp "${deb}" "${name}":/tmp/billet.deb
-    docker exec "${name}" sh -c 'timeout -v -k 10 300 apt-get -o APT::Update::Error-Mode=any -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y -qq /tmp/billet.deb >/dev/null' ||
+    docker exec "${name}" sh -c 'timeout -v -k 10 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::CAInfo=/usr/local/share/billet-host-ca.crt install -y -qq /tmp/billet.deb >/dev/null' ||
         rehearsal_fail "the package would not install in ${name}"
     docker exec "${name}" rm -f /tmp/billet.deb
 }

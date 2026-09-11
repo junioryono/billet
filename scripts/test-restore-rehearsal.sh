@@ -34,5 +34,6 @@ fi
 
 docker run --rm --platform "linux/${package_arch}" \
     --volume "${deb_path}:/tmp/billet.deb:ro" \
+    --volume /etc/ssl/certs/ca-certificates.crt:/usr/local/share/billet-host-ca.crt:ro \
     --volume "$(pwd)/scripts/restore-rehearsal.sh:/tmp/restore-rehearsal.sh:ro" \
     ubuntu:24.04 sh /tmp/restore-rehearsal.sh

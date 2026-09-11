@@ -85,6 +85,16 @@ jobs:
       # grades the HOST as well as the config: with AppArmor enabled in the
       # kernel it refuses a host without apparmor_parser. The hosted image has
       # it; the fleet's guest image does not yet.
+      # APT OVER HTTPS, FROM TWO SOURCES: every archive.ubuntu.com address
+      # refused port 80 from the fleet's site and from AWS for hours
+      # (2026-09-11), two of them answered nothing on 443 either, and a job's
+      # apt sat 30 s per attempt on one of those; every gate that ran apt failed
+      # on it. Two URIs in one deb822 stanza are two repositories to apt: both
+      # index sets are fetched and a package comes from whichever lists it
+      # (measured on a guest the same day with the first URI black-holed: the
+      # install came from the second in 4 s; a lenient update passes). The
+      # rewrite matches the archive line's exact spelling (and ports.ubuntu.com's,
+      # for an arm64 runner), so any other source is left alone.
       - name: Install the AppArmor tools the vendored kernel checker grades
         # A guest image that already carries the package never reaches the archive:
         # the fleet's uplink is shared with everything else at its site, and every
@@ -93,6 +103,7 @@ jobs:
         # `dpkg -s` exits 0 for a removed package whose configuration remains.
         run: |
           [ "$(dpkg-query -W -f '${db:Status-Status}' apparmor 2>/dev/null)" = installed ] && { echo "apparmor already installed"; exit 0; }
+          sudo sed -i -e 's,^URIs: http://archive[.]ubuntu[.]com/ubuntu/$,URIs: https://archive.ubuntu.com/ubuntu/ https://mirrors.edge.kernel.org/ubuntu/,' -e 's,^URIs: http://ports[.]ubuntu[.]com/ubuntu-ports/$,URIs: https://ports.ubuntu.com/ubuntu-ports/,' /etc/apt/sources.list.d/ubuntu.sources
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends apparmor
 
@@ -320,6 +331,7 @@ jobs:
       - name: Install python3-apt for the apt module's check mode
         run: |
           [ "$(dpkg-query -W -f '${db:Status-Status}' python3-apt 2>/dev/null)" = installed ] && { echo "python3-apt already installed"; exit 0; }
+          sudo sed -i -e 's,^URIs: http://archive[.]ubuntu[.]com/ubuntu/$,URIs: https://archive.ubuntu.com/ubuntu/ https://mirrors.edge.kernel.org/ubuntu/,' -e 's,^URIs: http://ports[.]ubuntu[.]com/ubuntu-ports/$,URIs: https://ports.ubuntu.com/ubuntu-ports/,' /etc/apt/sources.list.d/ubuntu.sources
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends python3-apt
 
