@@ -10,25 +10,46 @@
 # every apt cache update on that host fails with NO_PUBKEY, the prerequisites'
 # included; so the verified keys go in first, or the role could never repair a
 # rotation it knows about (HashiCorp's of 2026-09-09, measured on the reference
-# deployment's node, whose converge failed at its first apt task). The verifier
-# needs gpg, which a fresh host may lack; such a host holds no third-party
-# keyring yet, so installing gnupg there updates the cache safely.
-- name: Inspect whether gpg is present for the key verifier
+# deployment's node, whose converge failed at its first apt task).
+#
+# THE BOOTSTRAP: the download needs a CA store and the verifier needs gpg, and
+# a host may lack either (a minimal image; a host provisioned with the
+# repositories and keyrings but not the tool). Both are probed as root, the
+# account the verifier runs as, since a gpg on the connecting user's PATH says
+# nothing about root's. The bootstrap refreshes the lists with apt-get itself
+# and not the apt module: apt-get reports a source it cannot verify as a
+# warning and exits 0 (measured 2026-09-11 in ubuntu:24.04 with a deb822 source
+# whose Signed-By names no key), so a stale third-party keyring on such a host
+# does not stop the distribution's own packages from installing, where the
+# module reads the same warning as a failed update and would leave the host
+# unable to repair itself.
+- name: Inspect whether gpg and a CA store are present for the key download and verifier
   ansible.builtin.command:
-    argv: [sh, -c, "command -v gpg"]
-  register: billet_development_gpg_present
+    argv: [sh, -c, "command -v gpg >/dev/null && test -r /etc/ssl/certs/ca-certificates.crt"]
+  register: billet_development_bootstrap_probe
   changed_when: false
   failed_when: false
   check_mode: false
+  become: true
 
-- name: Install gnupg before any repository key is verified
-  ansible.builtin.apt:
-    name: gnupg
-    state: present
-    update_cache: true
+- name: Refresh the distribution's package lists before the bootstrap
+  ansible.builtin.command:
+    argv: [apt-get, -o, Acquire::Retries=3, update]
+  changed_when: false
   when:
     - not ansible_check_mode
-    - billet_development_gpg_present.rc != 0
+    - billet_development_bootstrap_probe.rc != 0
+  become: true
+
+- name: Install gnupg and ca-certificates before any repository key is fetched or verified
+  ansible.builtin.apt:
+    name:
+      - ca-certificates
+      - gnupg
+    state: present
+  when:
+    - not ansible_check_mode
+    - billet_development_bootstrap_probe.rc != 0
   become: true
 
 - name: Create the development package staging directory
