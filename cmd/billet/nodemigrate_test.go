@@ -946,10 +946,10 @@ func TestMigrateClosesEveryAnswerAgainstTheConfigurationAndTheProcess(t *testing
 		t.Helper()
 		f := newEndpointFixture(t)
 
-		prev := closingLstat
-		closingLstat = func(string) (os.FileInfo, error) { return nil, syscall.EACCES }
+		prev := closingStat
+		closingStat = func(string) (os.FileInfo, error) { return nil, syscall.EACCES }
 
-		t.Cleanup(func() { closingLstat = prev })
+		t.Cleanup(func() { closingStat = prev })
 
 		o := f.migrate(t, f.rendering(endpointA))
 		mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonConfig)

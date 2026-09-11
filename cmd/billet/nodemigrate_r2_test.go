@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -195,7 +196,19 @@ func TestMigrateRefusesAnUnchangedAnswerWhoseNodeNameCannotBeResolved(t *testing
 	f := newEndpointFixture(t)
 	f.writeConfig(t, string(body))
 	f.setNode(t, "inactive", "dead", 0, "", "mixed")
-	mustOK(t, os.Chmod(cert[1], 0))
+
+	// The certificate's read fails through the public-read seam (a chmod
+	// proves nothing under root).
+	prev := readPublicFile
+	readPublicFile = func(path string) ([]byte, error) {
+		if path == cert[1] {
+			return nil, &os.PathError{Op: "open", Path: path, Err: syscall.EACCES}
+		}
+
+		return prev(path)
+	}
+
+	t.Cleanup(func() { readPublicFile = prev })
 
 	o := f.migrate(t, string(body))
 	mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonConfig)
@@ -203,6 +216,30 @@ func TestMigrateRefusesAnUnchangedAnswerWhoseNodeNameCannotBeResolved(t *testing
 	if !strings.Contains(o.str("why"), "effective name") {
 		t.Errorf("why %q", o.str("why"))
 	}
+}
+
+// A configuration that is a symlink is closed through its target: unchanged
+// when the target is the file opened, could-not-tell when retargeted.
+func TestMigrateClosesASymlinkedConfigurationThroughItsTarget(t *testing.T) {
+	f := newEndpointFixture(t)
+	target := f.configPath + ".real"
+	mustOK(t, os.Rename(f.configPath, target))
+	mustOK(t, os.Symlink(target, f.configPath))
+
+	o := f.migrate(t, f.rendering(endpointA))
+	mustEndpointOutcome(t, o, outcomeUnchanged)
+
+	t.Run("retargeted under the judgement", func(t *testing.T) {
+		other := f.configPath + ".other"
+		writeFile(t, other, f.nodeOnlyConfig(), 0o644)
+		f.onRecordRead(t, 1, func() {
+			mustOK(t, os.Remove(f.configPath))
+			mustOK(t, os.Symlink(other, f.configPath))
+		})
+
+		o := f.migrate(t, f.rendering(endpointA))
+		mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonConfig)
+	})
 }
 
 // A pre-R probe the bound ended is no probe: the diagnostic's words in a

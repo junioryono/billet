@@ -177,14 +177,17 @@ func observeInstalledConfig(path string) (*installedConfigObservation, *endpoint
 	return obs, nil
 }
 
-// closingLstat is the closing examination's stat; a test fails it.
-var closingLstat = os.Lstat
+// closingStat is the closing examination's stat, FOLLOWING the name as the
+// open did: a configuration that is a symlink is compared through its
+// target (the same file, or one retargeted since), never as the link's own
+// inode against the target's. A test fails it.
+var closingStat = os.Stat
 
 // closeConfigObservation re-examines the pathname: the file must still be the
 // one observed (identity, size, modification time), and an absence must still
 // be an absence. The problem names what moved; "" means unchanged.
 func closeInstalledConfig(obs *installedConfigObservation) string {
-	info, err := closingLstat(obs.path)
+	info, err := closingStat(obs.path)
 
 	switch {
 	case !obs.present && errors.Is(err, os.ErrNotExist):
@@ -201,6 +204,13 @@ func closeInstalledConfig(obs *installedConfigObservation) string {
 
 	return ""
 }
+
+// The input readers, seams so a test can fail a read the way a filesystem
+// does (a chmod proves nothing under root).
+var (
+	renderingReadFile = regularfile.ReadFile
+	answerReadFile    = regularfile.ReadFile
+)
 
 // inputReadUnknown says whether a failed read of an input file establishes
 // nothing about the file: a positive absence, a special file at the name
@@ -226,10 +236,10 @@ func readRendering(source string) ([]byte, *config.Config, *endpointRefusal) {
 	if source == "-" {
 		body, err = io.ReadAll(io.LimitReader(renderingStdin, maxRenderingBytes+1))
 		if err == nil && len(body) > maxRenderingBytes {
-			err = fmt.Errorf("more than %d bytes", maxRenderingBytes)
+			err = fmt.Errorf("%w: more than %d bytes", regularfile.ErrTooLarge, maxRenderingBytes)
 		}
 	} else {
-		body, err = regularfile.ReadFile(source, maxRenderingBytes, regularfile.Options{})
+		body, err = renderingReadFile(source, maxRenderingBytes, regularfile.Options{})
 	}
 
 	if err != nil {
@@ -342,15 +352,20 @@ func processMoved(a, b unitObservation) bool {
 type recordClass int
 
 const (
-	recordUsable  recordClass = iota + 1 // a record naming this invocation, this node, this deployment, canonical
-	recordAbsent                         // no record, or one naming an earlier invocation: a node that has not registered yet
-	recordForeign                        // a record that is not this node's, or malformed: refused at once
+	recordUsable     recordClass = iota + 1 // a record naming this invocation, this node, this deployment, canonical
+	recordAbsent                            // no record, or one naming an earlier invocation: a node that has not registered yet
+	recordForeign                           // a record that is not this node's, or malformed: refused at once
+	recordUnreadable                        // the read failed: could-not-tell, never absence
 )
 
 // classifyRecord judges the evidence as the inspector judges it, typed rather
 // than by its words: usable, absent-or-stale (worth another poll), or foreign
 // (refused at once), with the reason.
 func classifyRecord(ev registrationEvidence, invocation string, identity registrationIdentity) (registrationReport, recordClass, string) {
+	if ev.unreadable {
+		return registrationReport{}, recordUnreadable, ev.why
+	}
+
 	if ev.record == nil {
 		return registrationReport{}, recordAbsent, ev.why
 	}

@@ -228,6 +228,8 @@ func writeReceiptFromEvidence(ctx context.Context, m receiptMode) (any, *endpoin
 	case !br.running:
 		return nil, endpointRefuse(endpointReasonRecord, "the node is not running now; the migration's receipt cannot be "+
 			"bound to a process", "start it and let the refresh write the receipt", "")
+	case br.class == recordUnreadable:
+		return nil, endpointUnknown(endpointReasonRecord, "the running node's record could not be read: "+br.why, "", "")
 	case br.class != recordUsable:
 		return nil, endpointRefuse(endpointReasonRecord, "the running node's record is not current: "+br.why,
 			"a node restarted since the migration gets its receipt from the refresh", "")
@@ -329,6 +331,8 @@ func refreshReceipt(ctx context.Context, m receiptMode) (any, *endpointRefusal) 
 		}
 
 		return nil, endpointRefuse(endpointReasonNotRunning, "the node stopped running under the wait", "", "")
+	case br.class == recordUnreadable:
+		return nil, endpointUnknown(endpointReasonRecord, "the running node's record could not be read: "+br.why, "", "")
 	case br.class == recordForeign:
 		return nil, endpointRefuse(endpointReasonRecord, "the running node's record cannot be judged: "+br.why, "", "")
 	case elapsed || br.class != recordUsable:
@@ -560,6 +564,19 @@ func publishReceipt(ctx context.Context, insp *lifeops.Inspector, installed *ins
 		return nil, r
 	}
 
+	// THE LEAF, immediately before the write: the rename replaces a regular
+	// file or an absence, and nothing else; a link or a special file that
+	// appeared at the name since the read is refused, never renamed over.
+	switch leaf, err := receiptLstat(receiptPath); {
+	case errors.Is(err, os.ErrNotExist):
+	case err != nil:
+		return nil, endpointUnknown(endpointReasonTrust, fmt.Sprintf("examine %s before the write: %v", receiptPath, err),
+			"converge again", "")
+	case !leaf.Mode().IsRegular():
+		return nil, endpointRefuse(endpointReasonTrust, fmt.Sprintf("the receipt path %s holds %s, which billet did not write "+
+			"and cannot replace", receiptPath, leaf.Mode().Type()), "remove it by hand", "")
+	}
+
 	rec.WrittenAt = receiptNow().UTC().Format(time.RFC3339Nano)
 
 	body, err := json.MarshalIndent(rec, "", "  ")
@@ -612,7 +629,7 @@ func publishReceipt(ctx context.Context, insp *lifeops.Inspector, installed *ins
 // one value per member, the outcome `migrated`, every member typed as the
 // producer writes it, and the stopped triple exactly inactive/dead/success.
 func readMigrationEvidence(path string) (*migrateEvidence, *endpointRefusal) {
-	body, err := regularfile.ReadFile(path, maxEvidenceBytes, regularfile.Options{NoFollow: true})
+	body, err := answerReadFile(path, maxEvidenceBytes, regularfile.Options{NoFollow: true})
 	if err != nil {
 		if inputReadUnknown(err) {
 			return nil, endpointUnknown(endpointReasonEvidence, fmt.Sprintf("read the evidence %s: %v", path, err), "", "")
@@ -677,7 +694,7 @@ func readMigrationEvidence(path string) (*migrateEvidence, *endpointRefusal) {
 // `confirmed`, `live` and `deployment.bound` JSON booleans true, the
 // identifiers typed.
 func readConfirmation(path string) (*receiptConfirmation, *endpointRefusal) {
-	body, err := regularfile.ReadFile(path, maxEvidenceBytes, regularfile.Options{NoFollow: true})
+	body, err := answerReadFile(path, maxEvidenceBytes, regularfile.Options{NoFollow: true})
 	if err != nil {
 		if inputReadUnknown(err) {
 			return nil, endpointUnknown(endpointReasonConfirm, fmt.Sprintf("read the confirmation %s: %v", path, err), "", "")

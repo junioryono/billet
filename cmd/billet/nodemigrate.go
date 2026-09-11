@@ -370,6 +370,9 @@ func migrateEndpoint(ctx context.Context, m migrateMode) (any, *endpointRefusal)
 	case !newBr.running:
 		return nil, endpointUnknown(endpointReasonUnproved, "the node was started and is not running now ("+
 			newBr.obs.ActiveState+"); its journal says why", "", stateStartedNoRecord)
+	case newBr.class == recordUnreadable:
+		return nil, endpointUnknown(endpointReasonUnproved, "the started node's record could not be read: "+newBr.why, "",
+			stateStartedNoRecord)
 	case newBr.class == recordForeign:
 		return nil, endpointUnknown(endpointReasonUnproved, "the started node's record cannot be judged: "+newBr.why, "",
 			stateStartedNoRecord)
@@ -499,6 +502,9 @@ func judgeMigration(ctx context.Context, m migrateMode, insp *lifeops.Inspector,
 		recordKind = recordNone
 	case !installedHasNode && !renderedHasNode:
 		recordKind = recordUnread
+	case br.class == recordUnreadable:
+		return judgedMigration{}, endpointUnknown(endpointReasonRecord, "the running node's record could not be read: "+br.why,
+			"", stateNothing), false
 	case br.class == recordForeign:
 		return judgedMigration{}, endpointUnknown(endpointReasonRecord, "the running node's record cannot be judged: "+br.why, "",
 			stateNothing), false

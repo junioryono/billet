@@ -1,12 +1,17 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/durablefile"
+	"github.com/junioryono/billet/internal/regularfile"
+	"github.com/junioryono/billet/internal/rollout"
 )
 
 // The second review round's receipt and registration cases: the answers'
@@ -337,14 +342,30 @@ func TestReceiptDirectoryMustBeRootsAndPrivate(t *testing.T) {
 }
 
 // A failed read of an input establishes nothing: could-not-tell, never a
-// refusal.
+// refusal. The failures are injected through the read seams, because a
+// chmod proves nothing under root.
 func TestReceiptInputsThatCannotBeReadAreCouldNotTell(t *testing.T) {
 	f := newReceiptCmdFixture(t)
 	f.migrated(t)
 
+	failing := func(t *testing.T, name string) {
+		t.Helper()
+
+		prev := answerReadFile
+		answerReadFile = func(path string, limit int64, opts regularfile.Options) ([]byte, error) {
+			if filepath.Base(path) == name {
+				return nil, &os.PathError{Op: "read", Path: path, Err: syscall.EIO}
+			}
+
+			return prev(path, limit, opts)
+		}
+
+		t.Cleanup(func() { answerReadFile = prev })
+	}
+
 	t.Run("the confirmation unreadable", func(t *testing.T) {
+		failing(t, "confirmation-unreadable.json")
 		conf := f.file(t, "confirmation-unreadable.json", f.confirmationObject(nil))
-		mustOK(t, os.Chmod(conf, 0))
 
 		o := runEndpoint(t, cmdNodeReceipt, "", "--evidence", f.file(t, "evidence-a.json", f.evidenceObject(t, nil)),
 			"--confirmation", conf, "--config", f.configPath, "--run", receiptRun)
@@ -352,12 +373,26 @@ func TestReceiptInputsThatCannotBeReadAreCouldNotTell(t *testing.T) {
 	})
 
 	t.Run("the evidence unreadable", func(t *testing.T) {
+		failing(t, "evidence-unreadable.json")
 		ev := f.file(t, "evidence-unreadable.json", f.evidenceObject(t, nil))
-		mustOK(t, os.Chmod(ev, 0))
 
 		o := runEndpoint(t, cmdNodeReceipt, "", "--evidence", ev, "--confirmation",
 			f.file(t, "confirmation-b.json", f.confirmationObject(nil)), "--config", f.configPath, "--run", receiptRun)
 		mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonEvidence)
+	})
+
+	t.Run("the record unreadable", func(t *testing.T) {
+		prev := registrationRead
+		registrationRead = func(*os.File, string, int64) ([]byte, error) { return nil, syscall.EIO }
+
+		t.Cleanup(func() { registrationRead = prev })
+
+		o := f.evidence(t, f.evidenceObject(t, nil), f.confirmationObject(nil))
+		mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonRecord)
+
+		o = f.refresh(t, f.rendering(endpointB))
+		mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonRecord)
+		f.noReceipt(t)
 	})
 
 	t.Run("the evidence absent", func(t *testing.T) {
@@ -368,11 +403,93 @@ func TestReceiptInputsThatCannotBeReadAreCouldNotTell(t *testing.T) {
 
 	t.Run("the rendering unreadable", func(t *testing.T) {
 		rendering := f.file(t, "rendering.yaml", []byte(f.rendering(endpointB)))
-		mustOK(t, os.Chmod(rendering, 0))
+
+		prev := renderingReadFile
+		renderingReadFile = func(path string, _ int64, _ regularfile.Options) ([]byte, error) {
+			return nil, &os.PathError{Op: "read", Path: path, Err: syscall.EACCES}
+		}
+
+		t.Cleanup(func() { renderingReadFile = prev })
 
 		o := runEndpoint(t, cmdNodeMigrate, "", "--config", f.configPath, "--desired", rendering, "--dry-run")
 		mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonDesired)
 	})
+
+	t.Run("a rendering over the bound on stdin", func(t *testing.T) {
+		big := f.rendering(endpointB) + "# " + strings.Repeat("x", maxRenderingBytes) + "\n"
+
+		o := runEndpoint(t, cmdNodeMigrate, big, "--config", f.configPath, "--desired", "-", "--dry-run")
+		mustEndpointRefusal(t, o, outcomeRefused, endpointReasonDesired)
+	})
+}
+
+// A special file that appeared at the receipt's name after the read is
+// never renamed over: refused, and left where it is.
+func TestReceiptNeverRenamesOverASpecialFileThatAppearedAfterTheRead(t *testing.T) {
+	f := newReceiptCmdFixture(t)
+	f.migrated(t)
+	mustOK(t, os.Mkdir(f.dir, 0o700))
+	f.write(t, "not json\n")
+
+	prev := receiptRead
+	ran := false
+	receiptRead = func(file *os.File, path string, limit int64) ([]byte, error) {
+		body, err := prev(file, path, limit)
+		if path == f.path && !ran {
+			ran = true
+			mustOK(t, os.Remove(f.path))
+			mustOK(t, syscall.Mkfifo(f.path, 0o600))
+		}
+
+		return body, err
+	}
+
+	t.Cleanup(func() { receiptRead = prev })
+
+	o := f.refresh(t, f.rendering(endpointB))
+	mustEndpointRefusal(t, o, outcomeRefused, endpointReasonTrust)
+
+	info, err := os.Lstat(f.path)
+	mustOK(t, err)
+
+	if info.Mode()&os.ModeNamedPipe == 0 {
+		t.Errorf("the FIFO was replaced: %v", info.Mode())
+	}
+}
+
+// The wait bounds every poll: a ledger that holds a query past --wait
+// answers the timeout with the last row a completed poll saw.
+func TestRegistrationEndsAPollTheWaitOutlasts(t *testing.T) {
+	l := newRegLedger(t, true)
+	l.register(t, "node-a", regIncarnationOld)
+
+	prev := registrationPoll
+	n := 0
+	registrationPoll = func(ctx context.Context, store *rollout.Store) (rollout.StatusSnapshot, error) {
+		n++
+		if n == 2 {
+			<-ctx.Done()
+
+			return rollout.StatusSnapshot{}, ctx.Err()
+		}
+
+		return store.StatusSnapshot(ctx)
+	}
+
+	t.Cleanup(func() { registrationPoll = prev })
+
+	started := time.Now()
+
+	o := l.run(t)
+	mustTimeout(t, o)
+
+	if took := time.Since(started); took > 3*time.Second {
+		t.Errorf("the wait took %s", took)
+	}
+
+	if last := asMap(o.doc["last"]); last["incarnation"] != regIncarnationOld {
+		t.Errorf("last %v", last)
+	}
 }
 
 // A parent or a directory that moved between the writer's examination and

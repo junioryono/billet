@@ -83,6 +83,9 @@ var hex32 = regexp.MustCompile(`^[0-9a-f]{32}$`)
 type registrationEvidence struct {
 	record *registrationRecord
 	why    string
+	// unreadable says the read FAILED (an examination, an open, a reopen or
+	// a read that errored), which is never absence and never invalidity.
+	unreadable bool
 }
 
 // readRegistrationRecord reads the record at path under the reader's rules:
@@ -98,7 +101,7 @@ func readRegistrationRecord(path string) registrationEvidence {
 	dirInfo, err := registrationLstat(dir)
 	switch {
 	case err != nil:
-		return registrationEvidence{why: fmt.Sprintf("examine the registration directory %s: %v", dir, err)}
+		return registrationEvidence{why: fmt.Sprintf("examine the registration directory %s: %v", dir, err), unreadable: true}
 	case dirInfo.Mode()&os.ModeSymlink != 0:
 		return registrationEvidence{why: "the registration directory " + dir + " is a symlink"}
 	case !dirInfo.IsDir():
@@ -110,7 +113,7 @@ func readRegistrationRecord(path string) registrationEvidence {
 	case errors.Is(err, os.ErrNotExist) && !errors.Is(err, regularfile.ErrReopen):
 		return registrationEvidence{why: "no registration record at " + path}
 	case err != nil:
-		return registrationEvidence{why: fmt.Sprintf("open the registration record %s: %v", path, err)}
+		return registrationEvidence{why: fmt.Sprintf("open the registration record %s: %v", path, err), unreadable: true}
 	}
 
 	defer func() { _ = f.Close() }()
@@ -144,7 +147,7 @@ func readRegistrationRecord(path string) registrationEvidence {
 			return registrationEvidence{why: fmt.Sprintf("the registration record is larger than %d bytes", maxRegistrationRecordBytes)}
 		}
 
-		return registrationEvidence{why: fmt.Sprintf("read the registration record %s: %v", path, err)}
+		return registrationEvidence{why: fmt.Sprintf("read the registration record %s: %v", path, err), unreadable: true}
 	}
 
 	rec, err := decodeRegistrationRecord(body)

@@ -151,9 +151,20 @@ func cmdRolloutRegistration(ctx context.Context, args []string) error {
 func awaitRegistration(ctx context.Context, store *rollout.Store, cfg *config.Config, node, incarnation string,
 	wait time.Duration,
 ) (*registrationAnswer, *registrationTimeout, *endpointRefusal) {
+	// EVERY POLL RUNS UNDER THE WAIT: a query the ledger holds past the
+	// deadline is ended by it, and the answer is the timeout with the last
+	// row a completed poll saw.
+	ctx, cancel := context.WithTimeout(ctx, wait)
+	defer cancel()
+
 	deadline := time.Now().Add(wait)
 
 	var last *registrationRow
+
+	timeout := func(dep registrationDep) *registrationTimeout {
+		return &registrationTimeout{Schema: endpointSchema, Outcome: outcomeTimeout, Node: node, Incarnation: incarnation,
+			Deployment: dep, Last: last}
+	}
 
 	for {
 		// PEEKED, NEVER MINTED, AT EVERY POLL: the identity file is what the
@@ -172,6 +183,10 @@ func awaitRegistration(ctx context.Context, store *rollout.Store, cfg *config.Co
 
 		snapshot, err := registrationPoll(ctx, store)
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil, timeout(registrationDep{Bound: true, ID: identity}), nil
+			}
+
 			return nil, nil, endpointUnknown(endpointReasonUnexamined, "read the ledger: "+err.Error(), "", "")
 		}
 
@@ -203,8 +218,7 @@ func awaitRegistration(ctx context.Context, store *rollout.Store, cfg *config.Co
 		}
 
 		if time.Now().After(deadline) || ctx.Err() != nil {
-			return nil, &registrationTimeout{Schema: endpointSchema, Outcome: outcomeTimeout, Node: node,
-				Incarnation: incarnation, Deployment: dep, Last: last}, nil
+			return nil, timeout(dep), nil
 		}
 
 		select {

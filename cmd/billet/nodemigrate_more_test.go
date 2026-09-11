@@ -379,10 +379,10 @@ func TestMigrateClosesAnAbsenceToo(t *testing.T) {
 	rendering := f.rendering(endpointB)
 	mustOK(t, os.Remove(f.configPath))
 
-	prev := closingLstat
-	closingLstat = func(string) (os.FileInfo, error) { return nil, syscall.EACCES }
+	prev := closingStat
+	closingStat = func(string) (os.FileInfo, error) { return nil, syscall.EACCES }
 
-	t.Cleanup(func() { closingLstat = prev })
+	t.Cleanup(func() { closingStat = prev })
 
 	o := f.migrate(t, rendering, "--dry-run")
 	mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonConfig)
