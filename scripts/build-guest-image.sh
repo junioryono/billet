@@ -675,8 +675,9 @@ APT
 	# THE SHIPPED IMAGE FETCHES OVER HTTPS FROM TWO SOURCES, EVERY FETCH BOUNDED BY
 	# AN INACTIVITY TIMEOUT. Two URIs in one deb822 stanza are TWO REPOSITORIES to
 	# apt: it fetches both index sets (twice the index traffic) and takes a package
-	# from whichever lists the version, so an install survives one mirror being
-	# down while `apt-get update` under Error-Mode=any still reports the dead one.
+	# from whichever lists the version, so an install can succeed from the
+	# surviving repository when it indexes and serves the selected version, while
+	# `apt-get update` under Error-Mode=any still fails naming the dead one.
 	# Measured on a fleet guest 2026-09-11 with the first URI black-holed and a 5 s
 	# timeout: a strict update failed in 13 s naming the dead mirror, a lenient one
 	# passed in 13 s, and a package installed from the second mirror in 4 s. The
