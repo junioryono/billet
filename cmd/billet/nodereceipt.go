@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"time"
 
 	"github.com/junioryono/billet/internal/durablefile"
@@ -405,6 +406,11 @@ func publishReceipt(ctx context.Context, insp *lifeops.Inspector, installed *ins
 		return nil, endpointRefuse(endpointReasonTrust, parent+" is not owned by root", "", "")
 	}
 
+	if parentInfo.Mode().Perm()&0o022 != 0 {
+		return nil, endpointRefuse(endpointReasonTrust, fmt.Sprintf("%s is mode %04o, writable by others; a directory another "+
+			"writer can rename in cannot hold durable evidence", parent, parentInfo.Mode().Perm()), "", "")
+	}
+
 	dirInfo, err := receiptLstat(dir)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
@@ -417,14 +423,20 @@ func publishReceipt(ctx context.Context, insp *lifeops.Inspector, installed *ins
 				parent, err), "converge again; the flush is retried", "")
 		}
 
-		if dirInfo, err = receiptLstat(dir); err != nil || dirInfo.Mode()&os.ModeSymlink != 0 || !dirInfo.IsDir() {
-			return nil, endpointUnknown(endpointReasonTrust, fmt.Sprintf("the receipt directory %s is not the directory just "+
-				"created (%v)", dir, err), "", "")
+		if dirInfo, err = receiptLstat(dir); err != nil {
+			return nil, endpointUnknown(endpointReasonTrust, fmt.Sprintf("examine the receipt directory %s just created: %v",
+				dir, err), "", "")
+		}
+
+		if why := receiptDirectoryProblem(dir, dirInfo); why != "" {
+			return nil, endpointUnknown(endpointReasonTrust, "the receipt directory just created: "+why, "", "")
 		}
 	case err != nil:
 		return nil, endpointUnknown(endpointReasonTrust, fmt.Sprintf("examine the receipt directory %s: %v", dir, err), "", "")
-	case dirInfo.Mode()&os.ModeSymlink != 0 || !dirInfo.IsDir():
-		return nil, endpointRefuse(endpointReasonTrust, "the receipt directory "+dir+" is not a directory", "", "")
+	default:
+		if why := receiptDirectoryProblem(dir, dirInfo); why != "" {
+			return nil, endpointRefuse(endpointReasonTrust, why, "", "")
+		}
 	}
 
 	// sameDirectory says the name still holds the examined directory: the
@@ -449,9 +461,8 @@ func publishReceipt(ctx context.Context, insp *lifeops.Inspector, installed *ins
 	case receiptUnreadable:
 		return nil, endpointUnknown(endpointReasonTrust, existing.why, "", "")
 	case receiptInvalid:
-		if err := receiptRemoveInvalid(receiptPath, existing.info); err != nil {
-			return nil, endpointRefuse(endpointReasonTrust, "the receipt path "+receiptPath+" holds something billet did not "+
-				"write and cannot replace: "+existing.why+" ("+err.Error()+")", "remove it by hand", "")
+		if r := receiptRemoveInvalid(receiptPath, existing.info, existing.why); r != nil {
+			return nil, r
 		}
 	}
 
@@ -533,10 +544,23 @@ func publishReceipt(ctx context.Context, insp *lifeops.Inspector, installed *ins
 		return nil, r
 	}
 
-	if back := readEndpointReceipt(receiptPath); back.presence != receiptPresent || !back.receipt.evidentialEqual(rec) ||
-		back.receipt.Run != rec.Run || back.receipt.WrittenAt != rec.WrittenAt {
+	back := readEndpointReceipt(receiptPath)
+	if back.presence != receiptPresent || !back.receipt.evidentialEqual(rec) || back.receipt.Run != rec.Run ||
+		back.receipt.WrittenAt != rec.WrittenAt {
 		return nil, endpointUnknown(endpointReasonTrust, "the receipt read back after the write is not the one written ("+
 			string(back.presence)+": "+back.why+")", "converge again", "")
+	}
+
+	// THE READ-BACK IS EVIDENCE ABOUT AN INODE; the name is checked once more
+	// against it, in the examined directory.
+	if r := sameDirectory("after the read-back"); r != nil {
+		return nil, r
+	}
+
+	if now, err := receiptLstat(receiptPath); err != nil || !os.SameFile(now, back.info) || now.Size() != back.info.Size() ||
+		!now.ModTime().Equal(back.info.ModTime()) {
+		return nil, endpointUnknown(endpointReasonTrust, fmt.Sprintf("the receipt %s moved after it was written (%v)",
+			receiptPath, err), "converge again", "")
 	}
 
 	return receiptAnswer{Schema: endpointSchema, Outcome: outcomeWritten, Receipt: &rec}, nil
@@ -545,22 +569,34 @@ func publishReceipt(ctx context.Context, insp *lifeops.Inspector, installed *ins
 // receiptRemoveInvalid removes a regular file that is not a receipt, never
 // following a link, never removing anything else, and only the file the
 // reader judged (the same inode, size and modification time), so a valid
-// receipt installed after the read is never the one removed.
-func receiptRemoveInvalid(path string, judged os.FileInfo) error {
+// receipt installed after the read is never the one removed. THREE
+// ANSWERS: nothing (removed); a positive refusal for a name that holds
+// something billet cannot replace (a link, a special file, a directory);
+// could-not-tell for an examination that failed or a file that moved after
+// it was judged, which the next converge judges afresh.
+func receiptRemoveInvalid(path string, judged os.FileInfo, why string) *endpointRefusal {
 	info, err := receiptLstat(path)
 	if err != nil {
-		return err
+		return endpointUnknown(endpointReasonTrust, fmt.Sprintf("examine the receipt %s judged invalid (%s): %v", path, why, err),
+			"converge again", "")
 	}
 
 	if !info.Mode().IsRegular() {
-		return fmt.Errorf("%s is %s, not a regular file", path, info.Mode().Type())
+		return endpointRefuse(endpointReasonTrust, fmt.Sprintf("the receipt path %s holds something billet did not write and "+
+			"cannot replace: %s (%s, not a regular file)", path, why, info.Mode().Type()), "remove it by hand", "")
 	}
 
 	if judged == nil || !os.SameFile(info, judged) || info.Size() != judged.Size() || !info.ModTime().Equal(judged.ModTime()) {
-		return fmt.Errorf("%s is not the file that was judged invalid; it moved after the read", path)
+		return endpointUnknown(endpointReasonTrust, fmt.Sprintf("the receipt %s judged invalid (%s) moved after it was read",
+			path, why), "converge again", "")
 	}
 
-	return os.Remove(path)
+	if err := os.Remove(path); err != nil {
+		return endpointUnknown(endpointReasonTrust, fmt.Sprintf("remove the receipt %s judged invalid (%s): %v", path, why, err),
+			"converge again", "")
+	}
+
+	return nil
 }
 
 // readMigrationEvidence reads a migration's answer strictly: one object,
@@ -675,12 +711,22 @@ func readConfirmation(path string) (*receiptConfirmation, *endpointRefusal) {
 		return nil, endpointRefuse(endpointReasonConfirm, "the confirmation says the node is not live", "", "")
 	case !conf.Deployment.Bound || conf.Deployment.ID == "":
 		return nil, endpointRefuse(endpointReasonConfirm, "the confirmation's ledger is unbound", "", "")
+	case !isJSONInteger(raw["epoch"]):
+		return nil, endpointRefuse(endpointReasonConfirm, "the confirmation's epoch is not an integer", "", "")
 	case conf.Node == "" || !hex32.MatchString(conf.Incarnation):
 		return nil, endpointRefuse(endpointReasonConfirm, "the confirmation's node or incarnation is not typed", "", "")
 	}
 
 	return &conf, nil
 }
+
+// isJSONInteger says the raw member is a JSON integer literal (never null,
+// never a string, never a fraction).
+func isJSONInteger(raw json.RawMessage) bool {
+	return jsonIntegerPattern.Match(bytes.TrimSpace(raw))
+}
+
+var jsonIntegerPattern = regexp.MustCompile(`^-?(0|[1-9]\d*)$`)
 
 // The member sets the two answers carry, exactly.
 var (

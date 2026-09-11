@@ -805,11 +805,16 @@ func TestReceiptRefreshValidatesTheExistingFileBeforeTheShortcut(t *testing.T) {
 			mustOK(t, os.Mkdir(f.dir, 0o700))
 			plant(t, f)
 
+			// THE JUDGED INODE IS HELD OPEN through the refresh: the owner
+			// mapping is by inode, and a filesystem hands a freed inode to the
+			// next file at once, which the command's own read-back would then
+			// judge as the planted owner's.
+			if held, err := os.Open(f.path); err == nil {
+				defer func() { _ = held.Close() }()
+			}
+
 			o := f.refresh(t, f.rendering(endpointB))
 			mustWritten(t, o)
-
-			// The mapping is by inode, and a filesystem may hand the rewritten
-			// file the inode the removed one had.
 			clear(f.owners)
 
 			if disk := f.receiptOnDisk(t); disk.Run != receiptRun || disk.InvocationID != newInvocation {

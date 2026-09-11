@@ -132,6 +132,8 @@ def main():
         ("a note that is not a string", 7),
         ("an empty note", ""),
         ("a note with a zero-width space", "run\u200b12"),
+        ("a note with a lone high surrogate", "run\ud80012"),
+        ("a note with a lone low surrogate", "run\udc0012"),
         ("a note with a replacement character", "run \ufffd 12"),
         ("a note with a newline", "run 12\nof owner/repo"),
         ("a note with a control character", "run\x0112"),

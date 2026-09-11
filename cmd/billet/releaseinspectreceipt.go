@@ -108,6 +108,31 @@ type receiptEvidence struct {
 	info os.FileInfo
 }
 
+// receiptDirectoryProblem says why the examined name is not the receipt
+// directory billet writes: a link, not a directory, not root's, or not
+// 0700 (a directory another writer can rename in cannot hold durable
+// evidence). Empty when it is.
+func receiptDirectoryProblem(dir string, info os.FileInfo) string {
+	switch {
+	case info.Mode()&os.ModeSymlink != 0:
+		return "the receipt directory " + dir + " is a symlink"
+	case !info.IsDir():
+		return "the receipt directory " + dir + " is not a directory"
+	}
+
+	uid, ok := receiptOwnerOf(info)
+	switch {
+	case !ok:
+		return "the receipt directory " + dir + " carries no owner this platform reports"
+	case uid != 0:
+		return fmt.Sprintf("the receipt directory %s is owned by uid %d, want root", dir, uid)
+	case info.Mode().Perm() != 0o700:
+		return fmt.Sprintf("the receipt directory %s is mode %04o, want 0700", dir, info.Mode().Perm())
+	}
+
+	return ""
+}
+
 // readEndpointReceipt reads the receipt at path under the reader's rules.
 func readEndpointReceipt(path string) receiptEvidence {
 	dir := filepath.Dir(path)
@@ -118,10 +143,10 @@ func readEndpointReceipt(path string) receiptEvidence {
 		return receiptEvidence{presence: receiptAbsent, why: "no receipt directory at " + dir}
 	case err != nil:
 		return receiptEvidence{presence: receiptUnreadable, why: fmt.Sprintf("examine the receipt directory %s: %v", dir, err)}
-	case dirInfo.Mode()&os.ModeSymlink != 0:
-		return receiptEvidence{presence: receiptInvalid, why: "the receipt directory " + dir + " is a symlink"}
-	case !dirInfo.IsDir():
-		return receiptEvidence{presence: receiptInvalid, why: "the receipt directory " + dir + " is not a directory"}
+	}
+
+	if why := receiptDirectoryProblem(dir, dirInfo); why != "" {
+		return receiptEvidence{presence: receiptInvalid, why: why}
 	}
 
 	// THE NAME EXAMINED BEFORE THE OPEN: a link or a special file at the

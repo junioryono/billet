@@ -21,9 +21,30 @@ func TestReceiptRefusesMemberAliases(t *testing.T) {
 	f.migrated(t)
 
 	t.Run("live beside LIVE in the confirmation", func(t *testing.T) {
-		o := f.evidence(t, f.evidenceObject(t, nil), f.confirmationObject(map[string]any{"live": false, "LIVE": true}))
+		// THE ORDER THAT MATTERS: `live` first and `LIVE` last, so a
+		// case-insensitive decoder ends with true and only the exact member
+		// set refuses; a marshalled map would sort LIVE first.
+		rest := mustMarshal(t, f.confirmationObject(map[string]any{"live": nil}))
+		raw := []byte(`{"live": false, "LIVE": true, ` + string(rest[1:]))
+
+		o := f.evidence(t, f.evidenceObject(t, nil), raw)
 		mustEndpointRefusal(t, o, outcomeRefused, endpointReasonConfirm)
+
+		if !strings.Contains(o.str("why"), `"LIVE"`) {
+			t.Errorf("why %q does not name the member", o.str("why"))
+		}
+
 		f.noReceipt(t)
+	})
+
+	t.Run("a null epoch", func(t *testing.T) {
+		o := f.evidence(t, f.evidenceObject(t, nil), f.confirmationObject(map[string]any{"epoch": nil}))
+		mustEndpointRefusal(t, o, outcomeRefused, endpointReasonConfirm)
+	})
+
+	t.Run("an epoch that is a string", func(t *testing.T) {
+		o := f.evidence(t, f.evidenceObject(t, nil), f.confirmationObject(map[string]any{"epoch": "3"}))
+		mustEndpointRefusal(t, o, outcomeRefused, endpointReasonConfirm)
 	})
 
 	t.Run("Node beside node in the evidence", func(t *testing.T) {
@@ -183,11 +204,96 @@ func TestReceiptShortcutAndRemovalActOnTheFileJudged(t *testing.T) {
 			mustOK(t, os.Rename(tmp, f.path))
 		})
 
+		// The file judged moved: could-not-tell, and the next converge judges
+		// what the name holds then.
 		o := f.refresh(t, f.rendering(endpointB))
-		mustEndpointRefusal(t, o, outcomeRefused, endpointReasonTrust)
+		mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonTrust)
 
 		if disk := f.receiptOnDisk(t); disk.Run != "ci-run-99" {
 			t.Errorf("the receipt installed after the read was removed: %+v", disk)
+		}
+	})
+
+	t.Run("the written receipt removed after the read-back", func(t *testing.T) {
+		f := newReceiptCmdFixture(t)
+		f.migrated(t)
+
+		// The only read of the receipt's path in a refresh with no existing
+		// receipt is the read-back after the write.
+		afterRead(t, f, func() { mustOK(t, os.Remove(f.path)) })
+
+		o := f.refresh(t, f.rendering(endpointB))
+		mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonTrust)
+
+		if !strings.Contains(o.str("why"), "moved after it was written") {
+			t.Errorf("why %q", o.str("why"))
+		}
+	})
+}
+
+// The receipt directory is root's and private, existing or just created,
+// for the writer and the reader alike; the parent is writable by nobody
+// else.
+func TestReceiptDirectoryMustBeRootsAndPrivate(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		plant func(t *testing.T, f *receiptCmdFixture)
+	}{
+		{"a directory of another owner", func(t *testing.T, f *receiptCmdFixture) {
+			t.Helper()
+			mustOK(t, os.Mkdir(f.dir, 0o700))
+			info, err := os.Lstat(f.dir)
+			mustOK(t, err)
+			f.owners[inodeOf(t, info)] = 1001
+		}},
+		{"a directory that is not private", func(t *testing.T, f *receiptCmdFixture) {
+			t.Helper()
+			mustOK(t, os.Mkdir(f.dir, 0o755))
+		}},
+		{"a parent writable by others", func(t *testing.T, f *receiptCmdFixture) {
+			t.Helper()
+			mustOK(t, os.Chmod(f.parent, 0o777))
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newReceiptCmdFixture(t)
+			f.migrated(t)
+			c.plant(t, f)
+
+			o := f.refresh(t, f.rendering(endpointB))
+			mustEndpointRefusal(t, o, outcomeRefused, endpointReasonTrust)
+
+			if contains(*f.events, "rename") {
+				t.Error("something was written")
+			}
+		})
+	}
+
+	t.Run("the reader", func(t *testing.T) {
+		for _, c := range []struct {
+			name  string
+			plant func(t *testing.T, f *receiptFixture)
+		}{
+			{"a directory of another owner", func(t *testing.T, f *receiptFixture) {
+				t.Helper()
+				info, err := os.Lstat(f.dir)
+				mustOK(t, err)
+				f.owners[inodeOf(t, info)] = 1001
+			}},
+			{"a directory that is not private", func(t *testing.T, f *receiptFixture) {
+				t.Helper()
+				mustOK(t, os.Chmod(f.dir, 0o755))
+			}},
+		} {
+			t.Run(c.name, func(t *testing.T) {
+				f := newReceiptFixture(t)
+				f.writeReceipt(t, validReceipt())
+				c.plant(t, f)
+
+				if ev := readEndpointReceipt(f.path); ev.presence != receiptInvalid {
+					t.Errorf("presence %s why %q, want invalid", ev.presence, ev.why)
+				}
+			})
 		}
 	})
 }

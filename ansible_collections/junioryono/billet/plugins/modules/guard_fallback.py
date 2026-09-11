@@ -295,10 +295,13 @@ def read_record(root, owner):
             if not isinstance(value, bool):
                 raise Refusal("content", "%s: %s is not a boolean" % (record, name))
         elif kind == "note":
-            if (not isinstance(value, str) or value == "" or len(value.encode("utf-8")) > MAX_NOTE_BYTES
+            # The category check comes first: a lone surrogate is category Cs,
+            # and encoding it would raise before any refusal.
+            if (not isinstance(value, str) or value == ""
+                    or any(unicodedata.category(ch).startswith("C") for ch in value)
                     or any(ch.isspace() and ch != " " for ch in value)
                     or "\ufffd" in value
-                    or any(unicodedata.category(ch).startswith("C") for ch in value)):
+                    or len(value.encode("utf-8", "surrogatepass")) > MAX_NOTE_BYTES):
                 raise Refusal("content", "%s: note is not one line of printable text" % record)
         elif not isinstance(value, str) or not _HEX32.fullmatch(value):
             raise Refusal("content", "%s: %s is not 32 lowercase hex digits" % (record, name))
