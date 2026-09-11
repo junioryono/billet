@@ -77,6 +77,15 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      # moby's check-config.sh, which the kernel gate runs for real on Linux,
+      # grades the HOST as well as the config: with AppArmor enabled in the
+      # kernel it refuses a host without apparmor_parser. The hosted image has
+      # it; the fleet's guest image does not yet.
+      - name: Install the AppArmor tools the vendored kernel checker grades
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends apparmor
+
       # -race matters more than usual here: the control plane is a capacity
       # allocator with concurrent scale-set listeners, and a data race in that
       # code double-admits jobs onto a machine that cannot hold them.
@@ -252,6 +261,14 @@ jobs:
           # modules even for tasks a controller-only run skips), so bare
           # ansible-core is not enough.
           ansible-galaxy collection install "ansible.posix:$(cat ansible_collections/junioryono/billet/tests/ansible-posix-version)"
+
+      # The check-mode scenario pins /usr/bin/python3, and the apt module in
+      # check mode needs python3-apt there (a real run installs it itself).
+      # The hosted image carries it; the fleet's guest image does not yet.
+      - name: Install python3-apt for the apt module's check mode
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-apt
 
       - name: Exercise alert ownership migration and teardown
         run: make alert-lifecycle
@@ -451,6 +468,14 @@ jobs:
           # plain `make` invocations; these jobs only need the real binary.
           terraform_wrapper: false
 
+      # Before the classification gate below, which is a Go program: on the
+      # hosted image a Go happened to be on PATH already, and on the fleet's
+      # guest nothing is until this step runs.
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
       - name: Format, validate, and plan-test the module
         run: |
           make tf-fmt-check
@@ -480,11 +505,6 @@ jobs:
       # The root `billet init hybrid` writes is HCL rendered as text, and only
       # terraform can read it: a module input renamed on one side and not the
       # other passes every Go test and fails an operator's first init.
-      - uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          cache: true
-
       - name: Prove the generated hybrid root validates against the module
         run: make hybrid-root-check
 
