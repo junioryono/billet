@@ -9,6 +9,8 @@ dhcp-option=option:dns-server,{{ item.address }}
 domain-needed
 bogus-priv
 no-resolv
+cache-size={{ billet_guest_dns_cache_size | int }}
+dns-forward-max={{ billet_guest_dns_forward_max | int }}
 {% for server in billet_guest_dns_servers %}
 server={{ server }}
 {% endfor %}

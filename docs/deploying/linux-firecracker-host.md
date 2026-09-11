@@ -21,7 +21,7 @@ You supply what it cannot safely guess:
 | `billet_version` or `billet_binary_src` | an exact release the host fetches and verifies, or a binary you built; `latest` is refused |
 | `billet_config` | the whole `billet.yaml`, which `billet init --provider firecracker --emit ansible` prints for you |
 | `billet_github_private_key_src` | the App key created by `billet github-app create` |
-| `billet_networks`, `billet_guest_dns_servers` | the bridges and what guests may reach |
+| `billet_networks`, `billet_guest_dns_servers`, `billet_guest_dns_cache_size`, `billet_guest_dns_forward_max` | the bridges, what guests may reach, and how much the bridge's resolver holds and forwards; the defaults suit a compute host behind one shared uplink (see [the shared-uplink record](../reference/records/shared-uplink.md)) |
 | `billet_ceph_*` | client credentials, or the explicit bootstrap facts |
 | `billet_ledger_volume_id` | on AWS, the module's ledger volume, mounted fail-closed |
 | `billet_firecracker_version` and checksums | the Firecracker release to install |
