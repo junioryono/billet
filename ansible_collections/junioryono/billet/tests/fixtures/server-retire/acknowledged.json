@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "outcome": "acknowledged",
+  "transition_id": "0123456789abcdef0123456789abcdef",
+  "completed_by": "control-b"
+}

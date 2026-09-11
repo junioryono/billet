@@ -13,8 +13,8 @@ const (
 	AnswerSchema     = 1
 )
 
-// maxCompletionBytes bounds a read of either document.
-const maxCompletionBytes = 16 << 10
+// MaxDocumentBytes bounds a read of either document.
+const MaxDocumentBytes = 16 << 10
 
 // Completion is what the retiring host emits at its journal's `done`: the
 // binding fields of its retirement, for the survivor to complete the ledger
@@ -58,7 +58,7 @@ var ErrDocument = errors.New("retirement: the document does not hold")
 // DecodeCompletion decodes a completion document strictly and requires every
 // binding field.
 func DecodeCompletion(raw []byte) (Completion, error) {
-	if len(raw) > maxCompletionBytes {
+	if len(raw) > MaxDocumentBytes {
 		return Completion{}, fmt.Errorf("%w: %d bytes is longer than any completion billet writes", ErrDocument, len(raw))
 	}
 
@@ -102,7 +102,7 @@ func CompletionOf(j Journal) Completion {
 
 // DecodeAnswer decodes the survivor's answer strictly and requires every field.
 func DecodeAnswer(raw []byte) (Answer, error) {
-	if len(raw) > maxCompletionBytes {
+	if len(raw) > MaxDocumentBytes {
 		return Answer{}, fmt.Errorf("%w: %d bytes is longer than any answer billet writes", ErrDocument, len(raw))
 	}
 

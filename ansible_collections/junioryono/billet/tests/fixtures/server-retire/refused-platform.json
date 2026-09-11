@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "outcome": "refused",
+  "reason": "platform",
+  "why": "a controller's retirement needs systemd and the global authority exclusion, and this platform has neither",
+  "state": "nothing"
+}

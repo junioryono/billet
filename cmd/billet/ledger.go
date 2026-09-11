@@ -138,7 +138,17 @@ func openStateAdmin(ctx context.Context, cfg *config.Config) (*state.DB, error) 
 		return nil, err
 	}
 
-	var db *state.DB
+	return openStateAdminWith(ctx, cfg, dsn)
+}
+
+// openStateAdminWith is openStateAdmin with the caller's connection string,
+// for a command handed the environment file the unit names rather than the
+// process environment.
+func openStateAdminWith(ctx context.Context, cfg *config.Config, dsn string) (*state.DB, error) {
+	var (
+		db  *state.DB
+		err error
+	)
 
 	// Under the identity exclusion and with the hand-back on the attempt, as in
 	// openStateForDecision.

@@ -306,6 +306,12 @@ func addConfigFlag(fs *flag.FlagSet) *string {
 }
 
 func cmdServer(ctx context.Context, lc *lifecycle, args []string) error {
+	// `billet server retire` is a controller's retirement, an operator command
+	// that runs under a converge guard; it never starts the plane.
+	if len(args) > 0 && args[0] == "retire" {
+		return cmdServerRetire(ctx, args[1:])
+	}
+
 	fs := newFlagSet("billet server")
 	cfgPath := addConfigFlag(fs)
 	dryRun := fs.Bool("dry-run", false,

@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "outcome": "refused",
+  "reason": "combination",
+  "why": "exactly one of --reserve, --abandon-reservation, --complete-row, --acknowledge-row and --dry-run",
+  "state": "nothing"
+}

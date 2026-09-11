@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "outcome": "reported",
+  "journal": null,
+  "status": null,
+  "stage": "absent",
+  "guard": "converge-guard",
+  "marker": {
+    "kind": "retirement",
+    "id": "0123456789abcdef0123456789abcdef"
+  },
+  "row": {
+    "retiring": "control-a",
+    "survivor": "control-b",
+    "run": "ci-1",
+    "state": "reserved",
+    "transition_id": "0123456789abcdef0123456789abcdef",
+    "reserved_at": "2026-09-11T10:00:00Z"
+  },
+  "row_fact": "reserved-mine",
+  "dispatch": "adopt"
+}

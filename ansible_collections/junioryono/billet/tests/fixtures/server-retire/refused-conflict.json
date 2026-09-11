@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "outcome": "refused",
+  "reason": "conflict",
+  "why": "the ledger's retirement row is control-a's (run ci-a, state reserved), not control-x's; nothing was written",
+  "state": "nothing"
+}

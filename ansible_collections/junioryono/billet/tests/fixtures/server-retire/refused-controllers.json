@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "outcome": "refused",
+  "reason": "controllers",
+  "why": "a retirement is defined for an active-passive pair, and this deployment's controllers are single",
+  "state": "nothing"
+}

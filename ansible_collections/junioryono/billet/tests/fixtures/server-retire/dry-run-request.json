@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "outcome": "reported",
+  "journal": null,
+  "status": null,
+  "stage": "absent",
+  "guard": "none",
+  "marker": null,
+  "row": null,
+  "row_fact": "absent",
+  "dispatch": "request"
+}
