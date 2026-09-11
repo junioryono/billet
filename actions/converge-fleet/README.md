@@ -3,7 +3,7 @@
 Converge a billet fleet from GitHub Actions with one `uses:` line. The action reaches your hosts, proves each one answers, runs the collection's fleet playbook, and in converge mode runs it a second time and fails unless every host reports `changed=0`.
 
 ```yaml
-- uses: junioryono/billet/actions/converge-fleet@main
+- uses: junioryono/billet/actions/converge-fleet@v0.10.0
   with:
     mode: check                       # or converge
     inventory: fleet/inventory.yml
