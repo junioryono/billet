@@ -5,44 +5,31 @@
   register: billet_development_apt_stage_stat
   become: true
 
-- name: Install development package prerequisites
-  ansible.builtin.apt:
-    name:
-      - ca-certificates
-      - curl
-      - debian-keyring
-      - debian-archive-keyring
-      - gnupg
-      - libnss3-tools
-      - mkcert
-      - python3-debian
-    state: present
-    update_cache: true
-  become: true
-
-- name: Inspect development repository artifacts
-  ansible.builtin.stat:
-    path: "{{ item }}"
-  loop:
-    - "{{ billet_development_apt_stage }}/caddy.asc"
-    - "{{ billet_development_apt_stage }}/hashicorp.asc"
-    - /etc/apt/keyrings/caddy.asc
-    - /etc/apt/keyrings/hashicorp.asc
-    - /etc/apt/sources.list.d/caddy-stable.sources
-    - /etc/apt/sources.list.d/hashicorp.sources
-  register: billet_development_apt_artifacts
-  become: true
-
-- name: Inspect deb822 repository support
+# THE KEYRINGS ARE REPAIRED BEFORE ANY CACHE UPDATE. A publisher that rotates
+# its signing key leaves every host holding the previous one, and from then on
+# every apt cache update on that host fails with NO_PUBKEY, the prerequisites'
+# included; so the verified keys go in first, or the role could never repair a
+# rotation it knows about (HashiCorp's of 2026-09-09, measured on the reference
+# deployment's node, whose converge failed at its first apt task). The verifier
+# needs gpg, which a fresh host may lack; such a host holds no third-party
+# keyring yet, so installing gnupg there updates the cache safely.
+- name: Inspect whether gpg is present for the key verifier
   ansible.builtin.command:
-    argv:
-      - "{{ ansible_facts['python']['executable'] }}"
-      - -c
-      - import debian.deb822
-  register: billet_development_deb822_support
+    argv: [sh, -c, "command -v gpg"]
+  register: billet_development_gpg_present
   changed_when: false
   failed_when: false
   check_mode: false
+
+- name: Install gnupg before any repository key is verified
+  ansible.builtin.apt:
+    name: gnupg
+    state: present
+    update_cache: true
+  when:
+    - not ansible_check_mode
+    - billet_development_gpg_present.rc != 0
+  become: true
 
 - name: Create the development package staging directory
   ansible.builtin.file:
@@ -109,8 +96,48 @@
   loop:
     - caddy
     - hashicorp
+  register: billet_development_key_install
   when: not ansible_check_mode
   become: true
+
+- name: Install development package prerequisites
+  ansible.builtin.apt:
+    name:
+      - ca-certificates
+      - curl
+      - debian-keyring
+      - debian-archive-keyring
+      - gnupg
+      - libnss3-tools
+      - mkcert
+      - python3-debian
+    state: present
+    update_cache: true
+  become: true
+
+- name: Inspect development repository artifacts
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ billet_development_apt_stage }}/caddy.asc"
+    - "{{ billet_development_apt_stage }}/hashicorp.asc"
+    - /etc/apt/keyrings/caddy.asc
+    - /etc/apt/keyrings/hashicorp.asc
+    - /etc/apt/sources.list.d/caddy-stable.sources
+    - /etc/apt/sources.list.d/hashicorp.sources
+  register: billet_development_apt_artifacts
+  become: true
+
+- name: Inspect deb822 repository support
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_facts['python']['executable'] }}"
+      - -c
+      - import debian.deb822
+  register: billet_development_deb822_support
+  changed_when: false
+  failed_when: false
+  check_mode: false
 
 - name: Add the Caddy repository
   ansible.builtin.deb822_repository:
@@ -142,6 +169,8 @@
     - not ansible_check_mode or billet_development_deb822_support.rc == 0
   become: true
 
+# A key-only replacement (a rotation) refreshes the cache too: the repository
+# definitions keep their signed_by paths, so nothing else would notice.
 - name: Refresh apt for development repositories
   ansible.builtin.apt:
     update_cache: true
@@ -149,7 +178,8 @@
     - not ansible_check_mode
     - >-
       billet_development_caddy_repository is changed or
-      billet_development_hashicorp_repository is changed
+      billet_development_hashicorp_repository is changed or
+      billet_development_key_install is changed
   become: true
 
 - name: Decide whether Linux package metadata is ready
