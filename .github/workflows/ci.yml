@@ -81,8 +81,14 @@ jobs:
       # grades the HOST as well as the config: with AppArmor enabled in the
       # kernel it refuses a host without apparmor_parser. The hosted image has
       # it; the fleet's guest image does not yet.
+      # APT OVER HTTPS: Canonical's plain-HTTP mirrors were unreachable from
+      # the fleet's guests, from AWS and from a laptop for hours (2026-09-11)
+      # while HTTPS answered; every gate that ran apt failed on it. The
+      # sources file lists Ubuntu mirrors and nothing else, so the scheme is
+      # rewritten wholesale.
       - name: Install the AppArmor tools the vendored kernel checker grades
         run: |
+          sudo sed -i 's|http://|https://|' /etc/apt/sources.list.d/ubuntu.sources
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends apparmor
 
@@ -302,6 +308,7 @@ jobs:
       # The hosted image carries it; the fleet's guest image does not yet.
       - name: Install python3-apt for the apt module's check mode
         run: |
+          sudo sed -i 's|http://|https://|' /etc/apt/sources.list.d/ubuntu.sources
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends python3-apt
 
