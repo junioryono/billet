@@ -1,26 +1,50 @@
 #!/usr/bin/env python3
-"""Hold the collection's holder filter (plugins/filter/holder.py) to the vector
-table the Go `checkHolder` wrote (tests/fixtures/holder-vectors.json), row by
-row, and refuse a vacuous pass: an empty table, a table with no refused row or
-no accepted row, or a row of the wrong shape fails before any assertion.
+"""Hold the collection's holder predicate (plugins/module_utils/holder.py, the
+one the filter and the fallback reader share) to the vector table the Go
+`checkHolder` wrote (tests/fixtures/holder-vectors.json), row by row, and
+refuse a vacuous pass: an empty table, a table with no refused row or no
+accepted row, or a row of the wrong shape fails before any assertion. The
+filter is imported by the collection's dotted name too, so a filter that
+stopped exposing the shared predicate fails here.
 """
 
-import importlib.util
+import importlib
 import json
+import os
 import pathlib
 import sys
+import tempfile
 
 sys.dont_write_bytecode = True
 
 HERE = pathlib.Path(__file__).resolve().parent
-FILTER = HERE.parent / "plugins" / "filter" / "holder.py"
+CHECKOUT = HERE.parents[3]
 VECTORS = HERE / "fixtures" / "holder-vectors.json"
 
 
+def load():
+    if not (CHECKOUT / "ansible_collections" / "junioryono" / "billet").is_dir():
+        raise SystemExit("holder_check: %s does not contain ansible_collections/junioryono/billet" % CHECKOUT)
+    sys.path.insert(0, str(CHECKOUT))
+    with tempfile.TemporaryDirectory() as elsewhere:
+        cwd = os.getcwd()
+        os.chdir(elsewhere)
+        try:
+            mod = importlib.import_module("ansible_collections.junioryono.billet.plugins.module_utils.holder")
+            flt = importlib.import_module("ansible_collections.junioryono.billet.plugins.filter.holder")
+        finally:
+            os.chdir(cwd)
+    for m in (mod, flt):
+        where = pathlib.Path(m.__file__).resolve()
+        if CHECKOUT not in where.parents:
+            raise SystemExit("holder_check: imported %s from outside the checkout %s" % (where, CHECKOUT))
+    if flt.FilterModule().filters().get("valid_holder") is not mod.valid_holder:
+        raise SystemExit("holder_check: the filter does not expose the shared predicate")
+    return mod
+
+
 def main():
-    spec = importlib.util.spec_from_file_location("billet_holder", FILTER)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    mod = load()
 
     doc = json.loads(VECTORS.read_text(encoding="utf-8"))
     rows = doc.get("vectors")

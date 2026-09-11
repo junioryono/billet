@@ -1319,24 +1319,63 @@ func recoverHolder(root *txLock, holder string) error {
 // on the host: the retirement's tail is work a new holder may finish. A marker
 // beside no journal (an abandoned reservation) and a guard with neither refuse
 // naming the way out.
-func admitRetirementTakeover(shape claimShape, old string) error {
-	if shape.Guard.Transition == nil {
-		return fmt.Errorf("the guard held by %s carries no transaction pointer and no retirement marker, so "+
+func admitRetirementTakeover(shape claimShape, old string) (*guardTransition, error) {
+	marker := shape.Guard.Transition
+	j, presence, err := retirement.ReadJournal()
+
+	switch {
+	case presence == retirement.JournalPresent:
+	case marker == nil && presence == retirement.JournalAbsent:
+		return nil, fmt.Errorf("the guard held by %s carries no transaction pointer and no retirement marker, so "+
 			"there is nothing to take over; `recover --holder %s --old-driver-stopped` removes it", old, old)
+	case marker == nil:
+		return nil, fmt.Errorf("the guard held by %s carries no transaction pointer and no retirement marker, and "+
+			"the retirement journal could not be judged: %v; nothing was taken over", old, err)
+	case presence == retirement.JournalAbsent:
+		return nil, fmt.Errorf("the guard held by %s carries the retirement marker %s but no retirement journal exists, "+
+			"so it is a reservation nothing has started; `billet server retire --abandon-reservation --run %s` "+
+			"releases it", old, marker.ID, old)
+	default:
+		return nil, fmt.Errorf("the guard held by %s carries the retirement marker %s and its journal could not be "+
+			"judged: %v; nothing was taken over", old, marker.ID, err)
 	}
 
-	_, presence, err := retirement.ReadJournal()
+	// THE JOURNAL IS THE OLD HOLDER'S, by its owner or the guard's chain,
+	// before the guard is associated with it; a settled journal is past
+	// ownership and passes here.
+	if err := j.Validate(retirement.JournalExpectation{Holder: old, TakenOverFrom: shape.Guard.TakenOverFrom}); err != nil {
+		return nil, fmt.Errorf("the guard held by %s is not taken over: %w", old, err)
+	}
 
-	switch presence {
-	case retirement.JournalPresent:
-		return nil
-	case retirement.JournalAbsent:
-		return fmt.Errorf("the guard held by %s carries the retirement marker %s but no retirement journal exists, "+
-			"so it is a reservation nothing has started; `billet server retire --abandon-reservation --run %s` "+
-			"releases it", old, shape.Guard.Transition.ID, old)
+	if marker != nil {
+		// THE MARKER NAMES THE JOURNAL'S TRANSITION, or the record is kept as
+		// it is: a guard marked for one retirement beside another's journal is
+		// two records that disagree, not one to relabel.
+		if j.Provenance.TransitionID != marker.ID {
+			return nil, fmt.Errorf("the guard held by %s carries the retirement marker %s and the retirement journal is "+
+				"transition %s's; the record is kept as it is and nothing was taken over", old, marker.ID,
+				j.Provenance.TransitionID)
+		}
+
+		return marker, nil
+	}
+
+	// NO MARKER: the tail clears the marker and then writes settled, so a
+	// done journal not yet settled beside a guard with no marker is the one
+	// window between those two writes, and the takeover RESTORES the marker
+	// from the journal so the tail can finish under the new holder. A
+	// settled journal leaves nothing to take over; any other phase without a
+	// marker is a state no step of the protocol produces.
+	switch {
+	case j.Phase == retirement.PhaseDone && !j.Settled:
+		return &guardTransition{Kind: transitionRetirement, ID: j.Provenance.TransitionID}, nil
+	case j.Settled:
+		return nil, fmt.Errorf("the guard held by %s carries no marker and the retirement journal is settled, so there "+
+			"is nothing to take over; `release --holder %s` or `recover --holder %s --old-driver-stopped` removes it",
+			old, old, old)
 	default:
-		return fmt.Errorf("the guard held by %s carries the retirement marker %s and its journal could not be "+
-			"judged: %v; nothing was taken over", old, shape.Guard.Transition.ID, err)
+		return nil, fmt.Errorf("the guard held by %s carries no retirement marker beside a retirement journal at %s, "+
+			"which no step of the protocol produces; nothing was taken over", old, j.Phase)
 	}
 }
 
@@ -1370,6 +1409,7 @@ func takeOverGuard(root *txLock, old, holder string) error {
 	}
 
 	pointer := filepath.Join(dir.Name(), guardPointerName)
+	marker := shape.Guard.Transition
 
 	_, err = statAt(dir, guardPointerName)
 
@@ -1397,6 +1437,13 @@ func takeOverGuard(root *txLock, old, holder string) error {
 			return fmt.Errorf("the transaction pointer names %s, whose journal cannot be read: %w; nothing "+
 				"was taken over", target, err)
 		}
+
+		// A MARKER BESIDE A POINTER is still held to its journal.
+		if marker != nil {
+			if _, err := admitRetirementTakeover(shape, old); err != nil {
+				return err
+			}
+		}
 	case !errors.Is(err, fs.ErrNotExist):
 		return fmt.Errorf("examine %s: %w", pointer, err)
 	default:
@@ -1405,7 +1452,8 @@ func takeOverGuard(root *txLock, old, holder string) error {
 		// journal is an abandoned reservation, which `billet server retire
 		// --abandon-reservation` clears, and a guard with neither is removed by
 		// `recover`, not taken over.
-		if err := admitRetirementTakeover(shape, old); err != nil {
+		marker, err = admitRetirementTakeover(shape, old)
+		if err != nil {
 			return err
 		}
 	}
@@ -1424,6 +1472,7 @@ func takeOverGuard(root *txLock, old, holder string) error {
 	record.Holder = holder
 	record.Token = ""
 	record.Preparing = false
+	record.Transition = marker
 	record.TakenOverFrom = append(append([]string{}, record.TakenOverFrom...), old)
 
 	if err := writeGuardRecordAt(dir, record, true); err != nil {

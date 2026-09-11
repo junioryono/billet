@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"slices"
@@ -160,9 +161,25 @@ func readJournalAt(path string) (Journal, JournalPresence, error) {
 		return Journal{}, JournalMalformed, fmt.Errorf("retirement: %s is %d bytes, longer than any journal billet writes", path, info.Size())
 	}
 
-	raw := make([]byte, info.Size())
-	if _, err := readFull(f, raw); err != nil {
+	// THROUGH EOF, never to the size a stat reported: a file grown under the
+	// read can hold a complete document in that prefix with more behind it,
+	// and a prefix that decodes is not proof of a whole file.
+	raw, err := io.ReadAll(io.LimitReader(f, maxJournalBytes+1))
+	if err != nil {
 		return Journal{}, JournalUnreadable, fmt.Errorf("retirement: read %s: %w", path, err)
+	}
+
+	if len(raw) > maxJournalBytes {
+		return Journal{}, JournalMalformed, fmt.Errorf("retirement: %s is longer than %d bytes, longer than any journal billet writes", path, maxJournalBytes)
+	}
+
+	after, err := f.Stat()
+	if err != nil {
+		return Journal{}, JournalUnreadable, fmt.Errorf("retirement: examine %s after the read: %w", path, err)
+	}
+
+	if after.Size() != int64(len(raw)) || after.Size() != info.Size() || !after.ModTime().Equal(info.ModTime()) {
+		return Journal{}, JournalUnreadable, fmt.Errorf("retirement: %s changed under the read", path)
 	}
 
 	var j Journal
@@ -175,21 +192,6 @@ func readJournalAt(path string) (Journal, JournalPresence, error) {
 	}
 
 	return j, JournalPresent, nil
-}
-
-func readFull(f *os.File, buf []byte) (int, error) {
-	n := 0
-
-	for n < len(buf) {
-		m, err := f.Read(buf[n:])
-		n += m
-
-		if err != nil {
-			return n, err
-		}
-	}
-
-	return n, nil
 }
 
 // trustJournal is the ownership rule: the file belongs to the account reading
@@ -238,6 +240,31 @@ func (j *Journal) wellFormed() error {
 		return fmt.Errorf("journal carries an unparseable written_at: %w", err)
 	}
 
+	return j.tailWellFormed()
+}
+
+// tailWellFormed is the order of the tail as invariants: done_at with done,
+// the row acknowledged only at done and only by someone, settled only after
+// the acknowledgement. A journal that says "settled" over a row nobody
+// completed would authorise the release the acknowledgement exists to gate.
+func (j *Journal) tailWellFormed() error {
+	switch {
+	case j.Phase != PhaseDone && (j.DoneAt != "" || j.RowDone || j.CompletedBy != "" || j.Settled):
+		return fmt.Errorf("journal at %s carries the tail's members (done_at, row_done, completed_by, settled), which only done carries", j.Phase)
+	case j.Phase == PhaseDone && j.DoneAt == "":
+		return errors.New("journal at done carries no done_at")
+	case j.RowDone != (j.CompletedBy != ""):
+		return errors.New("journal's row_done and completed_by disagree: the row is acknowledged by someone or not at all")
+	case j.Settled && !j.RowDone:
+		return errors.New("journal is settled over a row nobody acknowledged; settlement follows the acknowledgement")
+	}
+
+	if j.Phase == PhaseDone {
+		if _, err := time.Parse(time.RFC3339, j.DoneAt); err != nil {
+			return fmt.Errorf("journal carries an unparseable done_at: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -261,33 +288,68 @@ func (j *Journal) Write(now time.Time) error {
 		return fmt.Errorf("retirement: encode the journal: %w", err)
 	}
 
-	return publish(JournalPath(), append(body, '\n'), 0o600)
+	body = append(body, '\n')
+
+	// THE WRITER IS HELD TO THE READER'S BOUND, before anything is published:
+	// a journal its own reader refuses is a retirement nothing can resume.
+	if len(body) > maxJournalBytes {
+		return fmt.Errorf("retirement: refuse to write a %d-byte journal, longer than the %d bytes its reader "+
+			"admits (%d nodes recorded); the previous journal is kept", len(body), maxJournalBytes, len(j.Nodes))
+	}
+
+	return publish(JournalPath(), body, 0o600)
 }
 
 // EnsureRetiredDir creates the private retirement directory 0700 when it is
-// absent and flushes its parent, so its entry is durable before anything is
-// written into it. An existing directory is examined and never re-owned.
+// absent, and in every case examines it (this account's, 0700, not a link)
+// and flushes its parent: an existing directory is never re-owned, and the
+// parent is flushed on readmission too, because the invocation that created
+// the directory may have died before its own flush and the obligation is
+// still owed.
 func EnsureRetiredDir() error {
 	dir := RetiredDir()
-
-	info, err := os.Lstat(dir)
-
-	switch {
-	case err == nil:
-		if !info.IsDir() {
-			return fmt.Errorf("retirement: %s exists and is not a directory", dir)
-		}
-
-		return nil
-	case !errors.Is(err, fs.ErrNotExist):
-		return fmt.Errorf("retirement: examine %s: %w", dir, err)
-	}
 
 	if err := os.Mkdir(dir, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
 		return fmt.Errorf("retirement: create %s: %w", dir, err)
 	}
 
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return fmt.Errorf("retirement: examine %s: %w", dir, err)
+	}
+
+	if err := trustRetiredDir(dir, info); err != nil {
+		return err
+	}
+
 	return syncDir(Root)
+}
+
+// trustRetiredDir is the retirement directory's ownership rule: a directory,
+// not a link, owned by the account writing into it, with no group or other
+// bits. A 0600 journal in a directory another account can write is a journal
+// that account can remove or replace by its entry.
+func trustRetiredDir(dir string, info os.FileInfo) error {
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return fmt.Errorf("retirement: %s exists and is not a directory", dir)
+	}
+
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("retirement: %s: ownership could not be read", dir)
+	}
+
+	if int(st.Uid) != os.Geteuid() {
+		return fmt.Errorf("retirement: %s is owned by uid %d, not by this process's account (uid %d); billet does "+
+			"not write a retirement into a directory it does not own", dir, st.Uid, os.Geteuid())
+	}
+
+	if info.Mode().Perm() != 0o700 {
+		return fmt.Errorf("retirement: %s has mode %04o, not 0700; a retirement directory another account could "+
+			"write is not one billet trusts", dir, info.Mode().Perm())
+	}
+
+	return nil
 }
 
 // JournalExpectation is what a reader that will ACT on a journal knows from

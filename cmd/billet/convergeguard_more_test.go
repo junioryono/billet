@@ -1204,6 +1204,7 @@ func TestAJournalIsNeverReadThroughADisplacedRoot(t *testing.T) {
 		mustOK(t, json.Unmarshal(body, &got))
 
 		rec.Holder = "ci-2"
+		rec.TakenOverFrom = []string{"ci-1"}
 
 		if !reflect.DeepEqual(got, rec) {
 			t.Errorf("the takeover left the retained record as %+v, want %+v", got, rec)

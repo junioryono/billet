@@ -193,6 +193,13 @@ func TestTheStrictDecoderProvesEOFAndRefusesARepeatedMember(t *testing.T) {
 		"repeated nested":       `{"a":"x","d":{"e":"1","e":"2"}}`,
 		"unknown member":        `{"a":"x","zzz":1}`,
 		"repeated after nested": `{"d":{"e":"1"},"b":1,"d":{"e":"2"}}`,
+		// encoding/json matches a member case-insensitively, so "A" would land in
+		// a past DisallowUnknownFields and "a" beside it is two values for one
+		// field; the member check spells every name exactly.
+		"case alias":          `{"a":"x","A":"y","b":1}`,
+		"case alias alone":    `{"A":"x","b":1}`,
+		"case alias nested":   `{"a":"x","d":{"E":"1"}}`,
+		"case alias in array": `{"a":"x","d":{"e":"1"},"c":["a"],"B":1}`,
 	} {
 		var into record
 		if err := strictDecode([]byte(raw), &into); err == nil {

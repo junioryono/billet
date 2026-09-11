@@ -193,6 +193,7 @@ func TestValidationNamesEachMismatchedFieldAndSettledDoneNeedsNoOwner(t *testing
 
 	settled := base
 	settled.Phase, settled.Settled = PhaseDone, true
+	settled.RowDone, settled.CompletedBy = true, "control-b"
 	settled.DoneAt = "2026-09-11T09:00:00Z"
 
 	unrelated := exp

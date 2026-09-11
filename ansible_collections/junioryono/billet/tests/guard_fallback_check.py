@@ -28,6 +28,7 @@ import types
 
 HERE = pathlib.Path(__file__).resolve().parent
 MODULE = HERE.parent / "plugins" / "modules" / "guard_fallback.py"
+HOLDER = HERE.parent / "plugins" / "module_utils" / "holder.py"
 
 failures = []
 
@@ -46,6 +47,17 @@ def load_module():
         sys.modules.setdefault("ansible", ansible)
         sys.modules.setdefault("ansible.module_utils", module_utils)
         sys.modules["ansible.module_utils.basic"] = basic
+    # The module imports the holder predicate by the collection's dotted name;
+    # the checkout's file is stood in under that name, so the predicate the
+    # module judges by is the one holder_check holds to the Go vectors.
+    holder_spec = importlib.util.spec_from_file_location("billet_holder", HOLDER)
+    holder = importlib.util.module_from_spec(holder_spec)
+    holder_spec.loader.exec_module(holder)
+    pkg = "ansible_collections.junioryono.billet.plugins.module_utils"
+    for name in ("ansible_collections", "ansible_collections.junioryono", "ansible_collections.junioryono.billet",
+                 "ansible_collections.junioryono.billet.plugins", pkg):
+        sys.modules.setdefault(name, types.ModuleType(name))
+    sys.modules[pkg + ".holder"] = holder
     spec = importlib.util.spec_from_file_location("guard_fallback", MODULE)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -248,6 +260,8 @@ def main():
     content_cases.append(("an empty takeover chain", dict(valid, id=good_id, taken_over_from=[]), "non-empty list of holder names"))
     content_cases.append(("a takeover chain with a blank", dict(valid, id=good_id, taken_over_from=["ci-1", ""]), "non-empty list of holder names"))
     content_cases.append(("a takeover chain with a slash", dict(valid, id=good_id, taken_over_from=["ci/1"]), "non-empty list of holder names"))
+    content_cases.append(("a takeover chain with a C1 control", dict(valid, id=good_id, taken_over_from=["ci\x85"]), "non-empty list of holder names"))
+    content_cases.append(("a takeover chain with a 201-byte holder", dict(valid, id=good_id, taken_over_from=["é" * 101]), "non-empty list of holder names"))
     content_cases.append(("a takeover chain that is a string", dict(valid, id=good_id, taken_over_from="ci-1"), "non-empty list of holder names"))
     for name, record, words in content_cases:
         with tempfile.TemporaryDirectory() as base:

@@ -1324,6 +1324,7 @@ func prepareDryRun(ctx context.Context) error {
 		Record: prepareRecord{ReleaseExecutable: shape.Guard.ReleaseExecutable,
 			ReleaseExecutableSHA256: shape.Guard.ReleaseExecutableSHA256},
 		StrayTemporary: shape.StrayTemporary,
+		Transition:     shape.Guard.Transition, TakenOverFrom: shape.Guard.TakenOverFrom,
 	}
 
 	if shape.Guard.ID != "" {

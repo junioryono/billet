@@ -214,9 +214,13 @@ func Decide(variant Variant, phase Phase, f Facts) Decision {
 
 		switch {
 		case retained && f.Config == ConfigStaged:
-			// ALWAYS the restart, whatever the verdict: false cannot tell a
+			// ALWAYS the restart, under either verdict: false cannot tell a
 			// completed restart from a node never restarted whose file kept an
-			// old mtime.
+			// old mtime. An unobservable verdict refuses, as at archived.
+			if f.NodeChanged == VerdictUnknown {
+				return refuseOn("node_changed", f.NodeChanged)
+			}
+
 			return Decision{Action: ActionRestart}
 		case !retained && f.Config == ConfigAbsent:
 			return Decision{Action: ActionDone}

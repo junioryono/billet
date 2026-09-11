@@ -32,8 +32,14 @@ func markGuard(t *testing.T, f *guardFixture, transition *guardTransition, taken
 }
 
 // plantJournal writes a journal at the pinned retirement root, at the phase
-// given, owned by the reserving holder.
+// given, owned by the reserving holder, for the marker's transition.
 func plantJournal(t *testing.T, phase retirement.Phase, owner string, settled bool) {
+	t.Helper()
+	plantJournalFor(t, phase, owner, settled, markerID)
+}
+
+// plantJournalFor is plantJournal for the transition named.
+func plantJournalFor(t *testing.T, phase retirement.Phase, owner string, settled bool, transition string) {
 	t.Helper()
 
 	j := retirement.Journal{
@@ -44,7 +50,7 @@ func plantJournal(t *testing.T, phase retirement.Phase, owner string, settled bo
 		IdentityDir: "/var/lib/billet/server", Archive: "/var/lib/billet/retired/identity-2026-09-11T08:00:00Z",
 		InstalledSHA256: strings.Repeat("a", 64), Config: "absent",
 		Provenance: retirement.Provenance{
-			ReservingHolder: owner, TransitionID: markerID, Reservation: "2026-09-11T08:00:00Z",
+			ReservingHolder: owner, TransitionID: transition, Reservation: "2026-09-11T08:00:00Z",
 			Deployment: strings.Repeat("d", 32), Retiring: "control-a", Survivor: "control-b",
 		},
 		Ownership: retirement.Ownership{Owner: owner},
@@ -53,6 +59,12 @@ func plantJournal(t *testing.T, phase retirement.Phase, owner string, settled bo
 
 	if phase == retirement.PhaseDone {
 		j.DoneAt = "2026-09-11T09:00:00Z"
+	}
+
+	// Settlement follows the row's acknowledgement, and the journal's own
+	// shape check holds it to that.
+	if settled {
+		j.RowDone, j.CompletedBy = true, "control-b"
 	}
 
 	mustOK(t, j.Write(time.Date(2026, 9, 11, 8, 30, 0, 0, time.UTC)))
@@ -148,6 +160,86 @@ func TestATakeoverOfAMarkedGuardNeedsAJournalAndKeepsTheMarker(t *testing.T) {
 
 	if err := guardRun(t, "release", "--holder", "ci-4"); !errors.Is(err, errGuardTransition) {
 		t.Fatalf("an unsettled done journal must keep the guard, got %v", err)
+	}
+}
+
+// A MARKER IS HELD TO ITS JOURNAL: a guard marked for one transition beside
+// another transition's journal, or beside a journal another holder owns, is
+// refused naming both and the record is left byte for byte; and a journal the
+// chain does not reach is refused.
+func TestATakeoverRefusesAMarkerThatIsNotTheJournals(t *testing.T) {
+	useRetirementRoot(t)
+	f := newGuardFixture(t)
+	mustHold(t, "ci-1")
+	markGuard(t, f, &guardTransition{Kind: transitionRetirement, ID: markerID}, nil)
+	cleanScan(t)
+
+	before, err := os.ReadFile(filepath.Join(f.active(), guardRecordName))
+	mustOK(t, err)
+
+	other := "0123456789abcdef0123456789abcdef"
+	plantJournalFor(t, retirement.PhaseStopped, "ci-1", false, other)
+
+	err = guardRun(t, "hold", "--holder", "ci-2", "--recover-from", "ci-1", "--old-driver-stopped")
+	if err == nil || !strings.Contains(err.Error(), markerID) || !strings.Contains(err.Error(), other) {
+		t.Fatalf("a marker beside another transition's journal must refuse naming both ids, got %v", err)
+	}
+
+	// The journal is the marker's transition but ANOTHER HOLDER'S, one the
+	// guard's chain never reached.
+	plantJournal(t, retirement.PhaseStopped, "ci-elsewhere", false)
+
+	err = guardRun(t, "hold", "--holder", "ci-2", "--recover-from", "ci-1", "--old-driver-stopped")
+	if err == nil || !strings.Contains(err.Error(), "owned by") {
+		t.Fatalf("a journal outside the guard's chain must refuse the takeover, got %v", err)
+	}
+
+	after, err := os.ReadFile(filepath.Join(f.active(), guardRecordName))
+	mustOK(t, err)
+
+	if !bytes.Equal(before, after) {
+		t.Fatalf("the refused takeovers changed the record:\n%s\n%s", before, after)
+	}
+}
+
+// THE TAIL'S ONE CRASH WINDOW IS TAKEN OVER: the tail clears the marker and
+// then writes settled, so a done journal not yet settled beside a guard with
+// no marker is that window, and the takeover restores the marker from the
+// journal. A guard with no marker beside a journal at any other phase, or a
+// settled one, is refused.
+func TestATakeoverRestoresTheMarkerAcrossTheTailsCrashWindow(t *testing.T) {
+	useRetirementRoot(t)
+	f := newGuardFixture(t)
+	mustHold(t, "ci-1")
+	cleanScan(t)
+
+	plantJournal(t, retirement.PhaseStopped, "ci-1", false)
+
+	err := guardRun(t, "hold", "--holder", "ci-2", "--recover-from", "ci-1", "--old-driver-stopped")
+	if err == nil || !strings.Contains(err.Error(), "no step of the protocol produces") {
+		t.Fatalf("no marker beside an incomplete journal must refuse, got %v", err)
+	}
+
+	plantJournal(t, retirement.PhaseDone, "ci-1", true)
+
+	err = guardRun(t, "hold", "--holder", "ci-2", "--recover-from", "ci-1", "--old-driver-stopped")
+	if err == nil || !strings.Contains(err.Error(), "settled") {
+		t.Fatalf("no marker beside a settled journal leaves nothing to take over, got %v", err)
+	}
+
+	plantJournal(t, retirement.PhaseDone, "ci-1", false)
+
+	mustOK(t, guardRun(t, "hold", "--holder", "ci-2", "--recover-from", "ci-1", "--old-driver-stopped"))
+
+	rec := f.record(t)
+	if rec.Holder != "ci-2" || rec.Transition == nil || rec.Transition.ID != markerID ||
+		rec.Transition.Kind != transitionRetirement || !reflect.DeepEqual(rec.TakenOverFrom, []string{"ci-1"}) {
+		t.Fatalf("the takeover must restore the marker from the journal, got %+v", rec)
+	}
+
+	// And the restored marker keeps the guard until the tail settles.
+	if err := guardRun(t, "release", "--holder", "ci-2"); !errors.Is(err, errGuardTransition) {
+		t.Fatalf("the restored marker must keep the guard, got %v", err)
 	}
 }
 

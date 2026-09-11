@@ -1786,6 +1786,16 @@ func TestTheGuardPrepareFixturesAreTheCommandsOwn(t *testing.T) {
 
 			return []string{"--dry-run"}
 		},
+		// A guard carrying the retirement marker and a takeover chain reports
+		// both in the dry run, as status and the mutating preparation do.
+		"dry-run-guard-marker": func(t *testing.T, f *guardFixture) []string {
+			t.Helper()
+			managedScript(t, f, "v0.10.0")
+			mustOutcome(t, runPrepare(t, "--holder", "ci-1", "--validate"), prepareAcquired)
+			markGuard(t, f, &guardTransition{Kind: transitionRetirement, ID: markerID}, []string{"ci-0"})
+
+			return []string{"--dry-run"}
+		},
 		"dry-run-host-upgrade": func(t *testing.T, f *guardFixture) []string {
 			t.Helper()
 			managedScript(t, f, "v0.10.0")

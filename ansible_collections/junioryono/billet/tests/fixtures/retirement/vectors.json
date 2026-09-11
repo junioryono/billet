@@ -20601,7 +20601,8 @@
         "node_unit": "ready"
       },
       "decision": {
-        "action": "restart"
+        "action": "refuse",
+        "reason": "node_changed: unknown"
       }
     },
     {
