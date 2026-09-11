@@ -282,15 +282,25 @@ func (r *osRoot) OpenFile(name string, flag int, perm fs.FileMode) (ownedFile, e
 	return r.Root.OpenFile(name, flag, perm)
 }
 
+// OpenRegular keeps the root's containment for a nested name: the PARENT is
+// resolved by os.Root, which refuses a component that escapes the directory
+// (a symlink planted at `ca` after its own check would otherwise carry the
+// walk to another directory's `ca.key`), and only the final component is
+// opened by the regular-file rule relative to that held parent descriptor.
 func (r *osRoot) OpenRegular(name string) (ownedFile, error) {
-	dir, err := r.Root.OpenFile(".", os.O_RDONLY|syscall.O_DIRECTORY, 0)
+	parent := filepath.Dir(name)
+	if parent == "" {
+		parent = "."
+	}
+
+	dir, err := r.Root.OpenFile(parent, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, err
 	}
 
 	defer func() { _ = dir.Close() }()
 
-	f, _, err := regularfile.OpenAt(dir, name)
+	f, _, err := regularfile.OpenAt(dir, filepath.Base(name))
 	if err != nil {
 		return nil, err
 	}
