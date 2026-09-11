@@ -16,6 +16,9 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/sys/unix"
+
+	"github.com/junioryono/billet/deploy"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/hostupgrade"
 	"github.com/junioryono/billet/internal/initconfig"
@@ -182,17 +185,84 @@ func cmdHostUpgrade(ctx context.Context, args []string) error {
 func hostUpgradeFromRollout(ctx context.Context, cfg *config.Config, cfgPath string,
 	skipVerify bool,
 ) error {
-	target, ok, err := rolloutInstruction(ctx, cfg)
+	if !rolloutTimerApplies(cfg) {
+		return nil
+	}
+
+	// THE LOCK FIRST, AND ONE LOCK FROM HERE THROUGH SETTLEMENT: the claim is
+	// classified under it, the instruction is read under it, and a host found on
+	// the target settles under it, because the binary this process runs may be a
+	// candidate another updater installed and has yet to prove. A lock somebody
+	// else holds is nothing to decide now, said out loud, and the timer asks
+	// again in five minutes.
+	tx, err := takeTxLock()
+	if err != nil {
+		if errors.Is(err, ErrUpgradeInProgress) {
+			fmt.Printf("An upgrade transaction holds this host; nothing to decide until it finishes.\n")
+
+			return nil
+		}
+
+		return err
+	}
+
+	defer tx.release()
+
+	// A GUARDED HOST IS NOTHING TO DO, said with the guard's words and exit 0,
+	// because a converge is what holds it and the timer is not what ends that.
+	// A CLAIM THAT COULD NOT BE CLASSIFIED IS A FAILURE, not a guard: the timer
+	// reporting success while the claim is unreadable would hide a broken
+	// inspection behind a scheduled unit's zero exit.
+	if err := refuseGuardedHost(tx); err != nil {
+		if !errors.Is(err, errHostGuarded) {
+			return err
+		}
+
+		fmt.Printf("%v; nothing to do.\n", err)
+
+		return nil
+	}
+
+	target, ok, err := rolloutInstructionHolding(ctx, cfg, tx)
 	if err != nil || !ok {
 		return err
 	}
 
 	target.skipVerify = skipVerify
 
+	policy, err := releasePolicyFor(cfg, target.skipVerify)
+	if err != nil {
+		return err
+	}
+
+	if _, err := newHostFor(cfg, cfgPath, "", nil); err != nil {
+		return err
+	}
+
 	// NO ACK SOCKET. There is no node waiting for an answer; the timer
 	// reads the exit status and the journal, and `billet host-upgrade --status`
 	// reads the rest.
-	return startHostUpgrade(ctx, cfg, cfgPath, target, newUpgradeAck(""))
+	return startHostUpgradeHolding(ctx, cfg, cfgPath, target, newUpgradeAck(""), policy, tx)
+}
+
+// rolloutTimerApplies is the two answers the timer gives from the configuration
+// alone, before any lock: no control plane here, or automatic updates off.
+func rolloutTimerApplies(cfg *config.Config) bool {
+	if cfg.Server == nil {
+		fmt.Printf("This host runs no control plane, so no rollout is recorded here; " +
+			"nothing to do.\n")
+
+		return false
+	}
+
+	if !cfg.Release.AutomaticUpdates() {
+		fmt.Printf("release.automatic is false on this host, so the recorded rollout is left " +
+			"to an operator; nothing to do.\n")
+
+		return false
+	}
+
+	return true
 }
 
 // runningRelease is the release this binary is, as the upgrade decisions read
@@ -223,18 +293,32 @@ var runningRelease = version.Version
 // fence to finish; one this same process left open would be one it waited on
 // forever.
 func rolloutInstruction(ctx context.Context, cfg *config.Config) (hostUpgradeTarget, bool, error) {
-	if cfg.Server == nil {
-		fmt.Printf("This host runs no control plane, so no rollout is recorded here; " +
-			"nothing to do.\n")
-
+	if !rolloutTimerApplies(cfg) {
 		return hostUpgradeTarget{}, false, nil
 	}
 
-	if !cfg.Release.AutomaticUpdates() {
-		fmt.Printf("release.automatic is false on this host, so the recorded rollout is left " +
-			"to an operator; nothing to do.\n")
+	tx, err := takeTxLock()
+	if err != nil {
+		if errors.Is(err, ErrUpgradeInProgress) {
+			fmt.Printf("An upgrade transaction holds this host; nothing to decide until it finishes.\n")
 
-		return hostUpgradeTarget{}, false, nil
+			return hostUpgradeTarget{}, false, nil
+		}
+
+		return hostUpgradeTarget{}, false, err
+	}
+
+	defer tx.release()
+
+	return rolloutInstructionHolding(ctx, cfg, tx)
+}
+
+// rolloutInstructionHolding reads the instruction under a lock the caller
+// holds and keeps holding: what it settles, it settles under that lock.
+func rolloutInstructionHolding(ctx context.Context, cfg *config.Config, tx *txLock,
+) (hostUpgradeTarget, bool, error) {
+	if timerBarrier != nil {
+		timerBarrier("instruction")
 	}
 
 	current, found, err := readFleetDecision(ctx, cfg)
@@ -294,7 +378,7 @@ func rolloutInstruction(ctx context.Context, cfg *config.Config) (hostUpgradeTar
 	// Only a POSITIVE disagreement reinstalls; a host with no record is on it.
 	if version.Same(current.TargetVersion, runningRelease()) {
 		if !installedDisagrees(current.TargetDigest) {
-			if err := settleOnTarget(current, target); err != nil {
+			if err := settleOnTarget(current, target, tx); err != nil {
 				return hostUpgradeTarget{}, false, err
 			}
 
@@ -346,26 +430,21 @@ func rolloutInstruction(ctx context.Context, cfg *config.Config) (hostUpgradeTar
 // settles on the decision, so a completed rollout is not followed again after an
 // operator moves this host by hand.
 //
-// UNDER THE TRANSACTION LOCK, because the binary this process is running may be
-// a candidate another updater installed a moment ago and has yet to prove: a
-// host that is a node in the rollout as well has a dispatched updater of its
-// own, and blessing its candidate from outside its transaction would settle on a
-// decision that transaction may still roll back. A held lock is nothing to do
-// now, said out loud, and the timer asks again.
-func settleOnTarget(current *rollout.Rollout, target hostUpgradeTarget) error {
-	tx, err := takeTxLock()
-	if err != nil {
-		if errors.Is(err, ErrUpgradeInProgress) {
-			fmt.Printf("This host runs %s, rollout %s's target, but an upgrade transaction holds "+
-				"it; nothing to decide until that finishes.\n", current.TargetVersion, current.ID)
-
-			return nil
-		}
-
-		return err
+// UNDER THE TRANSACTION LOCK THE CALLER HOLDS, because the binary this process
+// is running may be a candidate another updater installed a moment ago and has
+// yet to prove: a host that is a node in the rollout as well has a dispatched
+// updater of its own, and blessing its candidate from outside its transaction
+// would settle on a decision that transaction may still roll back. The lock is
+// the caller's, taken before the instruction was read, so nothing between the
+// read and the settlement can be another process's.
+func settleOnTarget(current *rollout.Rollout, target hostUpgradeTarget, tx *txLock) error {
+	if tx == nil || tx.f == nil {
+		return errors.New("settleOnTarget needs the held transaction lock")
 	}
 
-	defer tx.release()
+	if timerBarrier != nil {
+		timerBarrier("settlement")
+	}
 
 	if err := checkAndRecordDecision(target); err != nil {
 		if errors.Is(err, ErrSuperseded) {
@@ -581,26 +660,57 @@ func startHostUpgrade(ctx context.Context, cfg *config.Config, cfgPath string,
 
 	defer tx.release()
 
+	return startHostUpgradeHolding(ctx, cfg, cfgPath, target, ack, policy, tx)
+}
+
+// startHostUpgradeHolding is the transaction's entry once the lock is held.
+//
+// THE CLAIM IS CLASSIFIED IMMEDIATELY AFTER THE LOCK, before the platform check
+// and before the network: a converge guard on this host refuses here, with the
+// words a node's acknowledgement carries to the coordinator ("guarded by H
+// since T"), and a hold that never returned from its publication refuses naming
+// its recovery. Nothing below the classification runs on a guarded host.
+func startHostUpgradeHolding(ctx context.Context, cfg *config.Config, cfgPath string,
+	target hostUpgradeTarget, ack *upgradeAck, policy releasesource.Policy, tx *txLock,
+) error {
+	if err := refuseGuardedHost(tx); err != nil {
+		return err
+	}
+
 	// A BINARY DIRECTORY THIS ACCOUNT CANNOT WRITE IS REFUSED HERE, under the
 	// lock and before the network: on a Mac /usr/local/bin is root-owned until
 	// the setup's chown, and finding that at the rename would be a rollback
 	// after a drain nobody needed. After the lock, so a second start is still
 	// refused for the lock and nothing else.
 	if hostOS == "darwin" {
-		if err := checkBinaryDirWritable(hostPathsFor(hostOS)); err != nil {
+		if err := checkBinaryDir(hostPathsFor(hostOS)); err != nil {
 			return err
 		}
 	}
 
 	client := &releasesource.Client{}
 
-	manifest, digest, err := resolveTarget(ctx, client, policy, target.channel, target.pin)
+	manifest, digest, err := resolveRelease(ctx, client, policy, target.channel, target.pin)
 	if err != nil {
 		return err
 	}
 
 	return actOnResolved(ctx, cfg, cfgPath, target, ack, client, manifest, digest, tx)
 }
+
+// The transaction's two seams after the lock: the platform check and the
+// resolver, each a step a guarded host must never reach; and timerBarrier, a
+// seam the timer's fixtures use to observe the lock at its instruction read
+// and its settlement.
+var (
+	checkBinaryDir = checkBinaryDirWritable
+	resolveRelease = resolveTarget
+	timerBarrier   func(step string)
+	// resumeBarrier is where a resume has passed every refusal and is about to
+	// act on the journal it read; a fixture that must prove a refusal happened
+	// before any action observes it here and stops the resume with an error.
+	resumeBarrier func() error
+)
 
 // refuseClaimed gives back a claim whose transaction was refused before it was
 // accepted.
@@ -609,8 +719,8 @@ func startHostUpgrade(ctx context.Context, cfg *config.Config, cfgPath string,
 // journal records a decision that was refused rather than an upgrade somebody
 // needs to read about — and a rollout retries every few minutes, which would
 // otherwise leave one behind each time.
-func refuseClaimed(dir string, err error) error {
-	claimErr := releaseClaim(dir)
+func refuseClaimed(root *os.File, dir string, err error) error {
+	claimErr := releaseClaim(root, dir)
 	if claimErr == nil {
 		_ = os.RemoveAll(dir)
 	}
@@ -639,7 +749,7 @@ func refuseClaimed(dir string, err error) error {
 // how a caller is told, since nothing else can enforce it.
 func actOnResolved(ctx context.Context, cfg *config.Config, cfgPath string,
 	target hostUpgradeTarget, ack *upgradeAck, client *releasesource.Client,
-	manifest *releasesource.Manifest, digest string, _ *txLock,
+	manifest *releasesource.Manifest, digest string, tx *txLock,
 ) error {
 	if err := checkResolvedDigest(target, digest); err != nil {
 		return err
@@ -778,7 +888,7 @@ func actOnResolved(ctx context.Context, cfg *config.Config, cfgPath string,
 		return err
 	}
 
-	if err := publishClaim(dir); err != nil {
+	if err := publishClaim(tx.dir, dir); err != nil {
 		return err
 	}
 
@@ -794,7 +904,7 @@ func actOnResolved(ctx context.Context, cfg *config.Config, cfgPath string,
 	// SECOND instruction, and the window that matters is the whole length of this
 	// one — which is unbounded, because it contains a drain.
 	if err := checkAndRecordDecision(target); err != nil {
-		return refuseClaimed(dir, err)
+		return refuseClaimed(tx.dir, dir, err)
 	}
 
 	// A SELF-READ INSTRUCTION IS READ AGAIN, NOW THAT THE CLAIM HOLDS THE HOST
@@ -803,7 +913,7 @@ func actOnResolved(ctx context.Context, cfg *config.Config, cfgPath string,
 	// ask.
 	if target.fromRollout {
 		if err := confirmFleetDecision(ctx, cfg, target); err != nil {
-			return refuseClaimed(dir, err)
+			return refuseClaimed(tx.dir, dir, err)
 		}
 	}
 
@@ -839,7 +949,7 @@ func actOnResolved(ctx context.Context, cfg *config.Config, cfgPath string,
 		return err
 	}
 
-	return finishHostUpgrade(ctx, journal, host)
+	return finishHostUpgrade(ctx, tx.dir, journal, host)
 }
 
 // ledgerKindFor says which shape of transaction a host's ledger needs.
@@ -870,18 +980,31 @@ func resumeHostUpgrade(ctx context.Context, cfg *config.Config) error {
 
 	defer tx.release()
 
-	dir, err := os.Readlink(activePath())
+	// THE CLAIM'S SHAPE BEFORE ANY JOURNAL IS READ, through the root the lock
+	// validated: a resume acts on a Go transaction's claim and on nothing else.
+	shape, err := classifyClaimAt(tx.dir)
 	if err != nil {
-		if os.IsNotExist(err) {
-			fmt.Printf("No upgrade is in progress on this machine.\n")
-
-			return nil
-		}
-
-		return fmt.Errorf("read the upgrade pointer: %w", err)
+		return err
 	}
 
-	journal, err := hostupgrade.ReadJournal(dir)
+	switch shape.Kind {
+	case claimNone:
+		fmt.Printf("No upgrade is in progress on this machine.\n")
+
+		return nil
+	case claimHostUpgrade:
+	default:
+		return refuseShape(shape)
+	}
+
+	dir := shape.Target
+
+	// THE JOURNAL IS READ THROUGH THE ROOT THE LOCK VALIDATED: the claim's target
+	// is required to be a direct child of the root, that child is opened
+	// relative to the root's descriptor, and the journal is read relative to
+	// that, so a root displaced at its name between the lock and this read
+	// resolves nothing.
+	journal, err := readJournalUnder(tx.dir, dir)
 	if errors.Is(err, hostupgrade.ErrNoJournal) {
 		// A CLAIM WITH NO JOURNAL IS A TRANSACTION THAT NEVER BEGAN, and it is
 		// recoverable precisely because of what the ordering guarantees: the journal
@@ -904,7 +1027,7 @@ func resumeHostUpgrade(ctx context.Context, cfg *config.Config) error {
 			dir)
 		fmt.Printf("machine was touched. Releasing the claim; nothing else is needed.\n")
 
-		return releaseClaim(dir)
+		return releaseClaim(tx.dir, dir)
 	}
 
 	if err != nil {
@@ -925,7 +1048,13 @@ func resumeHostUpgrade(ctx context.Context, cfg *config.Config) error {
 	fmt.Printf("Resuming the upgrade %s -> %s, which reached %s.\n",
 		journal.FromVersion, journal.ToVersion, journal.Step)
 
-	if done, err := settleResumedDecision(journal); err != nil || done {
+	if resumeBarrier != nil {
+		if err := resumeBarrier(); err != nil {
+			return err
+		}
+	}
+
+	if done, err := settleResumedDecision(tx.dir, journal); err != nil || done {
 		return err
 	}
 
@@ -934,7 +1063,7 @@ func resumeHostUpgrade(ctx context.Context, cfg *config.Config) error {
 		return err
 	}
 
-	return finishHostUpgrade(ctx, journal, host)
+	return finishHostUpgrade(ctx, tx.dir, journal, host)
 }
 
 // finishHostUpgrade runs the transaction and releases the claim only once the
@@ -951,7 +1080,7 @@ func resumeHostUpgrade(ctx context.Context, cfg *config.Config) error {
 // cordon, a committed upgrade whose services did not come back, a failure this
 // build cannot classify — keeps it, because keeping it is what makes `--resume`
 // find the transaction and what stops a rollout starting a second one on top.
-func finishHostUpgrade(ctx context.Context, journal *hostupgrade.Journal,
+func finishHostUpgrade(ctx context.Context, root *os.File, journal *hostupgrade.Journal,
 	host hostupgrade.Host,
 ) error {
 	err := hostupgrade.Run(ctx, hostupgrade.Request{Journal: journal, Host: host})
@@ -988,7 +1117,7 @@ func finishHostUpgrade(ctx context.Context, journal *hostupgrade.Journal,
 		return err
 	}
 
-	if claimErr := releaseClaim(journal.Dir); claimErr != nil {
+	if claimErr := releaseClaim(root, journal.Dir); claimErr != nil {
 		return errors.Join(err, claimErr)
 	}
 
@@ -1100,18 +1229,26 @@ func reportUpgradeStatus() {
 
 // reportUpgradeJournal describes the transaction on this machine, if there is one.
 func reportUpgradeJournal() {
-	dir, err := os.Readlink(activePath())
+	shape, err := classifyClaim()
 	if err != nil {
-		if os.IsNotExist(err) {
-			fmt.Printf("journal       no upgrade has claimed this machine\n")
-
-			return
-		}
-
 		fmt.Printf("journal       the claim could not be read: %v\n", err)
 
 		return
 	}
+
+	switch {
+	case shape.Kind == claimNone:
+		fmt.Printf("journal       no upgrade has claimed this machine\n")
+
+		return
+	case shape.Kind == claimHostUpgrade && !shape.Dangling:
+	default:
+		fmt.Printf("claim         %s\n", shape)
+
+		return
+	}
+
+	dir := shape.Target
 
 	journal, err := hostupgrade.ReadJournal(dir)
 	if err != nil {
@@ -1218,7 +1355,7 @@ func describeTarget(target hostUpgradeTarget) string {
 // ambiguous, and the ambiguity is resolved toward FINISHING: a superseded release
 // installed on one host is a rollout that dispatches again, while a host left
 // stopped is one a person has to go and find.
-func settleResumedDecision(journal *hostupgrade.Journal) (bool, error) {
+func settleResumedDecision(root *os.File, journal *hostupgrade.Journal) (bool, error) {
 	if journal.Generation <= 0 {
 		return false, nil
 	}
@@ -1235,11 +1372,123 @@ func settleResumedDecision(journal *hostupgrade.Journal) (bool, error) {
 		fmt.Printf("has left behind. It never got past claiming, so nothing here was\n")
 		fmt.Printf("touched. Abandoning it.\n")
 
-		return true, abandonClaim(journal.Dir)
+		return true, abandonClaim(root, journal.Dir)
 	}
 
 	// RECORDED NOW, because the crash is what stopped it being recorded before.
 	return false, recordDecision(journal.Generation)
+}
+
+// readJournalUnder reads the journal of a recovery directory that must be a
+// direct child of the upgrade root, opening the child relative to the root's
+// descriptor (a directory, never a link) and the journal relative to the
+// child. The path is what the claim or the journal recorded; the read is not
+// through it.
+func readJournalUnder(root *os.File, dir string) (*hostupgrade.Journal, error) {
+	recovery, err := openRecoveryUnder(root, dir)
+	if err != nil {
+		return nil, err
+	}
+
+	defer func() { _ = recovery.Close() }()
+
+	journal, err := hostupgrade.ReadJournalAt(recovery, func(info os.FileInfo) error {
+		return requireTrustedFile(filepath.Join(dir, hostupgrade.JournalName), info)
+	})
+
+	// A DIRECTORY WITH THE ROLE'S JOURNAL AND NOT THIS PROGRAM'S is a converge's
+	// transaction, which the role resumes; it is neither a Go journal to load
+	// nor a directory with no journal to release. A journal that cannot be
+	// examined is neither: "no journal" is what a resume releases the claim
+	// on, and only a positive absence may say it.
+	if errors.Is(err, hostupgrade.ErrNoJournal) {
+		switch _, statErr := guardStatAt(recovery, roleJournalName); {
+		case statErr == nil:
+			return nil, fmt.Errorf("%w: %s holds %s", errRoleJournal, dir, roleJournalName)
+		case !errors.Is(statErr, os.ErrNotExist):
+			return nil, fmt.Errorf("examine %s: %w", filepath.Join(dir, roleJournalName), statErr)
+		}
+	}
+
+	return journal, err
+}
+
+// validateRecoveryUnder proves a recovery directory holds a complete journal
+// of EITHER program, for a takeover: it answers which, and loads neither.
+func validateRecoveryUnder(root *os.File, dir string) (recoveryKind, error) {
+	recovery, err := openRecoveryUnder(root, dir)
+	if err != nil {
+		return recoveryNone, err
+	}
+
+	defer func() { _ = recovery.Close() }()
+
+	_, err = hostupgrade.ReadJournalAt(recovery, func(info os.FileInfo) error {
+		return requireTrustedFile(filepath.Join(dir, hostupgrade.JournalName), info)
+	})
+
+	switch {
+	case err == nil:
+		return recoveryGo, nil
+	case !errors.Is(err, hostupgrade.ErrNoJournal):
+		return recoveryNone, err
+	}
+
+	if _, err := readRoleJournalAt(recovery, dir); err != nil {
+		return recoveryNone, err
+	}
+
+	return recoveryRole, nil
+}
+
+// openRecoveryUnder opens a recovery directory that must be a direct child of
+// the upgrade root, relative to the root's descriptor (a directory, never a
+// link), and judges it before anything under it is read. The path is what
+// the claim or the journal recorded; the open is not through it.
+func openRecoveryUnder(root *os.File, dir string) (*os.File, error) {
+	name, err := recoveryChild(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := guardObserve("openat", dir, nil); err != nil {
+		return nil, err
+	}
+
+	fd, err := unix.Openat(int(root.Fd()), name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, hostupgrade.ErrNoJournal
+		}
+
+		return nil, fmt.Errorf("open the recovery directory %s: %w", dir, err)
+	}
+
+	recovery := os.NewFile(uintptr(fd), dir)
+
+	// THE RECOVERY DIRECTORY AND THE JOURNAL ARE JUDGED BEFORE THEY ARE
+	// BELIEVED, each on the descriptor that is then read: the directory owned
+	// by the account and writable by nobody else (a writable one lets another
+	// account remove a journal, which reads as a transaction that never began
+	// and releases the claim), the journal owned and unwritable likewise (a
+	// journal that is another name of a file someone else owns is a step and a
+	// generation that account chooses, and a resume acts on both). What the
+	// root's boundary proves is who can name entries in it; it proves nothing
+	// about an inode reached through a second name.
+	info, err := recovery.Stat()
+	if err != nil {
+		_ = recovery.Close()
+
+		return nil, fmt.Errorf("examine the recovery directory %s: %w", dir, err)
+	}
+
+	if err := requireTrustedDir(dir, info, 0); err != nil {
+		_ = recovery.Close()
+
+		return nil, err
+	}
+
+	return recovery, nil
 }
 
 // abandonClaim releases a claim and removes the directory behind it.
@@ -1251,7 +1500,7 @@ func settleResumedDecision(journal *hostupgrade.Journal) (bool, error) {
 // decision that was refused rather than an upgrade anybody needs to read about.
 // Keeping them accumulates one directory per superseded instruction on a fleet
 // that retries every few minutes.
-func abandonClaim(dir string) error {
+func abandonClaim(root *os.File, dir string) error {
 	// IT ONLY EVER REMOVES SOMETHING UNDER THE UPGRADE ROOT. The path arrives from
 	// a claim pointer or a journal field, and this is the one operation here that
 	// deletes a tree — so it is bounded by construction rather than by everything
@@ -1261,10 +1510,12 @@ func abandonClaim(dir string) error {
 		return err
 	}
 
-	if err := releaseClaim(dir); err != nil {
+	if err := releaseClaim(root, dir); err != nil {
 		return err
 	}
 
+	// THE TREE IS REMOVED BY ITS NAME, a direct child of the root by the check
+	// above, after the pointer that named it is gone through the descriptor.
 	if err := os.RemoveAll(dir); err != nil {
 		return fmt.Errorf("remove the abandoned recovery directory %s: %w", dir, err)
 	}
@@ -1293,18 +1544,33 @@ func underUpgradeRoot(dir string) error {
 			"billet will not act on it")
 	}
 
-	// A DIRECT CHILD, not merely something underneath. Recovery directories are
-	// created by MkdirTemp directly in the root, so anything deeper is a path this
-	// code did not make — and the operation on the other side of this check deletes
-	// a tree.
-	rel, err := filepath.Rel(upgradeRoot, filepath.Clean(dir))
-	if err != nil || rel == "." || strings.Contains(rel, string(filepath.Separator)) ||
-		strings.HasPrefix(rel, "..") {
-		return fmt.Errorf("%s is not a recovery directory in %s, so billet will not "+
-			"act on it", dir, upgradeRoot)
+	// A DIRECT CHILD, not merely something underneath, AND BY ITS TEXT: recovery
+	// directories are created by MkdirTemp directly in the root, so anything
+	// deeper is a path this code did not make, and the operation on the other
+	// side of this check deletes a tree. The text is judged as written, never
+	// cleaned first: `<root>/hop/../x` collapses to `<root>/x` lexically while
+	// the kernel resolves `hop` first, so a cleaned check would prove one path
+	// and a later operation by name would act on another.
+	if _, err := recoveryChild(dir); err != nil {
+		return err
 	}
 
 	return nil
+}
+
+// recoveryChild is the one component under the upgrade root a recovery
+// directory's path names, or the refusal: the path must be exactly
+// `<upgrade root>/<name>` with a name that is no separator, no `.` and no `..`.
+func recoveryChild(dir string) (string, error) {
+	prefix := upgradeRoot + string(filepath.Separator)
+
+	name, ok := strings.CutPrefix(dir, prefix)
+	if !ok || name == "" || name == "." || name == ".." || strings.Contains(name, string(filepath.Separator)) {
+		return "", fmt.Errorf("%s is not a recovery directory in %s, so billet will not "+
+			"act on it", dir, upgradeRoot)
+	}
+
+	return name, nil
 }
 
 // hostCompatibility describes the running deployment for the preflight.
@@ -1360,8 +1626,8 @@ func stageClaim() (string, error) {
 }
 
 // publishClaim takes the exclusion, for a directory that already holds a journal.
-func publishClaim(dir string) error {
-	if err := os.Symlink(dir, activePath()); err != nil {
+func publishClaim(root *os.File, dir string) error {
+	if err := unix.Symlinkat(dir, int(root.Fd()), activePointer); err != nil {
 		// THE STAGED DIRECTORY GOES WITH IT. Nothing outside it knows the name, and
 		// this run has touched nothing else, so leaving it would accumulate a
 		// directory per refused attempt on a machine a rollout retries every few
@@ -1377,7 +1643,7 @@ func publishClaim(dir string) error {
 	// A claim that did not survive a power cut leaves a machine mid-upgrade with
 	// `--resume` answering "no upgrade is in progress" — and a second `start` then
 	// takes a fresh claim and begins a new transaction on top of the first.
-	return syncUpgradeDir(upgradeRoot)
+	return syncDirFD(root)
 }
 
 // activePath is the pointer to the transaction in progress.
@@ -1391,7 +1657,7 @@ func activePath() string { return filepath.Join(upgradeRoot, activePointer) }
 // with the pointer would delete the evidence an operator reads after a rollback,
 // and the snapshot a second attempt might still need. Ordinary retention is a
 // person's decision, not this command's.
-func releaseClaim(dir string) error {
+func releaseClaim(root *os.File, dir string) error {
 	// IT REMOVES THE CLAIM IT WAS GIVEN, NOT WHATEVER CLAIM EXISTS.
 	//
 	// Unlinking the pointer blind was a defect a review caught: by the time a
@@ -1413,11 +1679,20 @@ func releaseClaim(dir string) error {
 			"billet cannot tell whose claim this is")
 	}
 
+	// EVERYTHING HERE IS RELATIVE TO THE ROOT THE LOCK VALIDATED, so a root
+	// displaced at its name is not the thing acted on.
 	{
-		switch held, err := os.Readlink(activePath()); {
-		case os.IsNotExist(err):
+		switch held, err := readlinkAt(root, activePointer); {
+		case errors.Is(err, os.ErrNotExist):
 			return nil
 		case err != nil:
+			// A CLAIM THAT IS NOT A SYMLINK IS NOT THIS TRANSACTION'S, and it is
+			// named for what it is: a converge guard or a role's pointer is never
+			// released or removed from here.
+			if shape, classifyErr := classifyClaimAt(root); classifyErr == nil && shape.Kind != claimHostUpgrade {
+				return fmt.Errorf("release the upgrade claim: the claim is not this transaction's: %s", shape)
+			}
+
 			return fmt.Errorf("read the upgrade claim before releasing it: %w", err)
 		case held != dir:
 			// SOMEBODY ELSE'S CLAIM, AND LEAVING IT IS THE ONLY SAFE ANSWER. This is
@@ -1427,14 +1702,14 @@ func releaseClaim(dir string) error {
 		}
 	}
 
-	if err := os.Remove(activePath()); err != nil && !os.IsNotExist(err) {
+	if err := unix.Unlinkat(int(root.Fd()), activePointer, 0); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("release the upgrade claim: %w", err)
 	}
 
 	// FLUSHED FOR THE SAME REASON THE CLAIM IS. A removal that did not survive a
 	// power cut leaves a pointer to a finished transaction, and the next start is
 	// refused against an upgrade that is over.
-	return syncUpgradeDir(upgradeRoot)
+	return syncDirFD(root)
 }
 
 // stageCandidate downloads and unpacks the candidate binary.
@@ -1528,10 +1803,15 @@ func newLedgerHost(cfg *config.Config, cfgPath string, journal *hostupgrade.Jour
 	return h
 }
 
+// newHostInspector builds the inspector the transaction's systemd host runs
+// systemctl through. A variable so a test can observe the deadline each
+// operation is given.
+var newHostInspector = func() *lifeops.Inspector { return lifeops.NewInspector() }
+
 func newSystemdHost(cfg *config.Config, cfgPath, staged string,
 	journal *hostupgrade.Journal,
 ) *systemdHost {
-	inspector := lifeops.NewInspector()
+	inspector := newHostInspector()
 
 	return &systemdHost{
 		ledgerHost: newLedgerHost(cfg, cfgPath, journal),
@@ -1572,7 +1852,9 @@ const (
 // UNBOUNDED BY ANYTHING HERE. The node's SIGTERM is a drain that waits for the
 // compute already running for as long as it runs, and `TimeoutStopSec` in the
 // unit is what eventually bounds it — losing billet's bookkeeping rather than the
-// jobs. Nothing in this command imposes a shorter one.
+// jobs. Nothing in this command imposes a shorter one: the stop runs under the
+// transaction's own context, which carries no deadline, and lifeops applies
+// none of its own to a stop.
 func (h *systemdHost) StopNode(ctx context.Context) error {
 	return h.stop(ctx, nodeUnit)
 }
@@ -2488,7 +2770,12 @@ func (h *systemdHost) StartServices(ctx context.Context) error {
 			continue
 		}
 
-		if _, err := h.converge.StartAndProve(ctx, unit); err != nil {
+		// UNDER THE UNIT'S OWN START BOUND, as `local up` starts one.
+		startCtx, cancelStart := context.WithTimeout(ctx, deploy.UnitStartTimeout+lifecycleDeadlineMargin)
+		_, err := h.converge.StartAndProve(startCtx, unit)
+		cancelStart()
+
+		if err != nil {
 			return fmt.Errorf("starting %s: %w", unit, err)
 		}
 	}

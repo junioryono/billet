@@ -29,8 +29,12 @@ jobs:
     # more, so a 15-minute job was cancelling itself AFTER every step had passed,
     # in the coverage upload -- a gate failing a correct change on wall clock it
     # never controlled. Two branches raised it to 25 for that reason the same
-    # day. Raise it again when the suite grows; do not trim tests to fit it.
-    timeout-minutes: 25
+    # day. By 2026-09-09 the race suite alone took 21 minutes (internal/alloc
+    # 848s, cmd/billet 640s, internal/replay 596s) and the job passed at 24m28s
+    # three times in a row before one runner spent three minutes more and the
+    # PostgreSQL step was cancelled after every test had passed; it is 40 now.
+    # Raise it again when the suite grows; do not trim tests to fit it.
+    timeout-minutes: 40
 
     # THE POSTGRESQL BACKEND IS TESTED AGAINST A REAL SERVER OR NOT AT ALL.
     # Every fact internal/state pins about it is a fact about the server rather
@@ -283,8 +287,15 @@ jobs:
     runs-on: billet-8vcpu-ubuntu-2404
     # Sized from what the gates measurably take: the run was cancelled at 15
     # minutes after the two connector gates and the fleet gate joined it
-    # (measured 2026-09-06, 15m03s with every gate green until the cap).
-    timeout-minutes: 30
+    # (measured 2026-09-06, 15m03s with every gate green until the cap), and
+    # at 30 minutes once the preparation's gate grew to two hundred cases on a
+    # runner that ran every step 1.5 to 2 times slower than the run before it
+    # (measured 2026-09-10: the guard gate 16m47s against 8m46s, the key-policy
+    # gate 4m46s against 2m52s, the job cancelled at 30m05s inside the
+    # cloudflared gate with every earlier gate green). The gate launches its
+    # playbooks one case at a time, so the follow-up that buys the time back
+    # is batching compatible cases into one launch, not a larger budget.
+    timeout-minutes: 45
     # THE COLLECTION'S GATES RUN WITH NO RUNNER_NAME, which every gate but the
     # guard's own assumes (converge-guard-check.sh says so, and sets the name
     # it tests itself): their plays converge the throwaway machine the job runs
@@ -395,10 +406,15 @@ jobs:
       # whether the URL the role builds is one it publishes, which check mode
       # cannot see: get_url does not fetch there, so every dry run passes
       # against a 404.
-      # No other suite sets RUNNER_NAME, so none of them reaches the guard --
-      # delete it and they all stay green. The refusal it makes is the difference
-      # between a converge that fails and one that destroys the job running it.
-      - name: Prove a converge cannot be driven from a billet runner
+      # No other suite sets RUNNER_NAME or a holder, so none of them reaches the
+      # guard or the exclusion's preparation -- delete either and they all stay
+      # green. The refusals they make are the difference between a converge that
+      # fails and one that destroys the job running it, or races a rollout for
+      # the binaries. The preparation's cases run under sudo, and here that
+      # launch is required rather than skipped.
+      - name: Prove a converge cannot be driven from a billet runner and prepares its exclusion
+        env:
+          BILLET_GATE_REQUIRE_ROOT: "1"
         run: make converge-guard-check
 
       # The ssh_access role's whole value is one refusal, and no other suite

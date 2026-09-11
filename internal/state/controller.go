@@ -122,6 +122,14 @@ type ControllerClaim struct {
 func (db *DB) ClaimController(
 	ctx context.Context, holder, deployment string,
 ) (ControllerClaim, error) {
+	// BEFORE THE BACKEND, not at the write below it: on PostgreSQL the backend's
+	// claim is a session advisory lock taken on an ordinary connection, and an
+	// inspection that reached it would exclude the real controller for as long
+	// as it took the refused write to give the lock back.
+	if db.inspect {
+		return ControllerClaim{}, ErrInspect
+	}
+
 	if err := db.backend.claimController(ctx, db); err != nil {
 		return ControllerClaim{}, err
 	}

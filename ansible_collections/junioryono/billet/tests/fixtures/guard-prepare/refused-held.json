@@ -1,0 +1,6 @@
+{
+  "outcome": "refused",
+  "reason": "held",
+  "shape": "converge-guard",
+  "why": "a converge guard is held on this host: held by ci-1 since 2026-09-09T12:00:00Z (0s ago) on billet-control-01. If that driver is stopped, `billet converge-guard recover --holder ci-1 --old-driver-stopped` removes it, or `hold --recover-from ci-1 --old-driver-stopped` takes over its transaction"
+}

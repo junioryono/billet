@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "outcome": "migrated",
+  "node": "node-a",
+  "deployment": "dddddddddddddddddddddddddddddddd",
+  "from": "http://127.0.0.1:7717",
+  "to": "http://127.0.0.1:7719",
+  "config_path": "/etc/billet/billet.yaml",
+  "installed_sha256": "abababababababababababababababababababababababababababababababab",
+  "invocation_id": "abcdefabcdefabcdefabcdefabcdefab",
+  "incarnation": "ffeeddccbbaa99887766554433221100",
+  "registered_at": "2026-09-09T12:00:00Z",
+  "stopped": {
+    "active_state": "inactive",
+    "sub_state": "dead",
+    "result": "success"
+  }
+}

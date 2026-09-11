@@ -67,7 +67,7 @@ func (i Installer) Install(
 
 	final := filepath.Join(dir, name)
 
-	tmp, err := os.CreateTemp(dir, ".durable-*")
+	tmp, err := createStaged(dir)
 	if err != nil {
 		return "", fmt.Errorf("durablefile: cannot stage a file in %s: %w", dir, err)
 	}
@@ -99,7 +99,7 @@ func (i Installer) Install(
 
 	// CLOSED BEFORE THE RENAME, so a write buffered in the file object cannot land
 	// after the name is published. The deferred Close then does nothing.
-	if err := tmp.Close(); err != nil {
+	if err := closeStaged(tmp); err != nil {
 		return "", fmt.Errorf("durablefile: cannot close the staged %s: %w", final, err)
 	}
 
@@ -116,6 +116,18 @@ func (i Installer) Install(
 
 	return final, nil
 }
+
+// createStaged and closeStaged are the two steps of an install that no exported
+// seam reaches: the staged file's creation and its close before the rename.
+// They are variables so this package's own tests can fail them (a close that
+// fails after a successful sync is a real outcome, and a create that fails is
+// what a full or missing directory produces); nothing outside the package sets
+// them, and the record writer that installs through the zero-value Installer is
+// held to that by its own structural test.
+var (
+	createStaged = func(dir string) (*os.File, error) { return os.CreateTemp(dir, ".durable-*") }
+	closeStaged  = func(f *os.File) error { return f.Close() }
+)
 
 // SyncDirectory flushes a directory's entries, so a rename into it survives a crash.
 //

@@ -139,6 +139,11 @@ func runCheck(ctx context.Context, opts checkOptions) (checkReport, error) {
 	}
 	fmt.Printf("config   %s\n", opts.configPath)
 
+	// THE HOST'S GUARD, before anything that could take long: a converge holding
+	// this host is the answer to why a rollout is refusing it, and a guard older
+	// than a day is one somebody has forgotten.
+	checkGuard()
+
 	// The probe flag skips the network; so does the BILLET_MAINTENANCE
 	// environment variable — for the SKIPS ONLY, never the fence. The env form
 	// exists for binary-vintage compatibility: the Ansible upgrade transaction

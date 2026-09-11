@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "outcome": "unknown",
+  "reason": "record",
+  "why": "the running node published no record within the wait (the managed binary answers the preparation, so the running process is a release that carries the guard): an R process that has not registered, or whose record write failed; wait, or restart it",
+  "state": "nothing"
+}

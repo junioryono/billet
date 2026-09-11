@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "outcome": "unknown",
+  "reason": "process",
+  "why": "billet-node.service moved under the judgement (pid 9999, invocation abcdefabcdefabcdefabcdefabcdefab, active at the close; pid 4242, invocation 0123456789abcdef0123456789abcdef, active when judged)",
+  "next": "check and approve afresh",
+  "state": "nothing"
+}

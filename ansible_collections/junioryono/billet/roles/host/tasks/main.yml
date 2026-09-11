@@ -6,6 +6,14 @@
 - name: Refuse a converge that would destroy the job running it
   ansible.builtin.import_tasks: converge-guard.yml
 
+# THE EXCLUSION, IMMEDIATELY AFTER THE GUARD: the host is held under the
+# converge guard, the claim at the upgrade root classified, and the binary
+# change decided and its candidate staged, before any other task reads or
+# changes the host. The fleet playbook includes the same file as every play's
+# first pre_task; here it re-classifies and skips the hold it already took.
+- name: Prepare the exclusion before anything changes this host
+  ansible.builtin.import_tasks: prepare-exclusion.yml
+
 - name: Inspect persisted billet installation inputs
   ansible.builtin.stat:
     path: "{{ item }}"
@@ -112,14 +120,18 @@
       with a fresh ledger. Set billet_ledger_volume_id, or deliberately remove
       the mount unit and migrate the ledger off the volume first.
 
+# THE INTERRUPTION IS DERIVED FROM THE CLAIM'S SHAPE by the preparation (a
+# legacy pointer, or a guard carrying a transaction pointer, whoever holds
+# it), never from the claim's existence: a guard without a pointer is a held
+# host, not an interrupted one.
 - name: Refuse a dry run that cannot recover an interrupted upgrade
   ansible.builtin.assert:
     that:
       - not billet_interrupted_upgrade | bool
     fail_msg: >-
       An interrupted billet upgrade is recorded at
-      /var/lib/billet/upgrades/active. Run the playbook without --check so the
-      role can prove both services stopped and restore the durable recovery
+      {{ billet_exclusion_root }}/active. Run the playbook without --check so
+      the role can prove both services stopped and restore the durable recovery
       copy before applying any other host changes.
   when: ansible_check_mode
 
@@ -233,7 +245,7 @@
 - name: Validate billet host inputs
   ansible.builtin.assert:
     that:
-      - billet_binary_src | length > 0 or billet_version | length > 0 or billet_persisted_inputs.results[0].stat.exists
+      - billet_binary_src | length > 0 or billet_version | length > 0 or billet_release_channel | length > 0 or billet_persisted_inputs.results[0].stat.exists
       - billet_config is mapping
       - billet_config | length > 0
       - not billet_ceph_bootstrap or billet_ceph_mon_ip | length > 0
@@ -461,33 +473,10 @@
   ansible.builtin.import_tasks: network-disable.yml
   when: not billet_firecracker_enabled
 
-- name: Clear any candidate carried over from an earlier play
-  ansible.builtin.set_fact:
-    billet_candidate_on_target: false
-    billet_candidate_path: ""
-
-# billet_binary_src WINS, and says so rather than ignoring the other input
-# quietly. Overriding a pinned inventory for one run is the supported way to try
-# a build, so this is a report and not a refusal.
-- name: Report that a supplied binary overrides the pinned version
-  ansible.builtin.debug:
-    msg: >-
-      billet_binary_src is set, so billet_version {{ billet_version }} is NOT
-      being fetched; the supplied binary is what will be installed.
-  when:
-    - billet_version | length > 0
-    - billet_binary_src | length > 0
-
-# BEFORE account.yml, which is what inspects and journals the candidate, and
-# which creates the staging directory this needs — so binary.yml makes its own.
-# Skipped unless a version is named AND no binary was supplied, so an ordinary
-# billet_binary_src host never reaches the network.
-- name: Fetch the pinned billet release onto the target
-  ansible.builtin.import_tasks: binary.yml
-  when:
-    - billet_version | length > 0
-    - billet_binary_src | length == 0
-
+# THE CANDIDATE WAS RESOLVED, FETCHED AND STAGED BY THE PREPARATION
+# (stage-candidate.yml, before the hold), so by here billet_binary_upgrade and
+# the transaction's recovery directory are settled and nothing below reaches
+# the network for a binary.
 - name: Configure billet account and files
   ansible.builtin.import_tasks: account.yml
 

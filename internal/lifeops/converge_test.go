@@ -62,13 +62,14 @@ func healthyNode(t *testing.T, h *host, over map[string]string) string {
 	t.Helper()
 
 	fields := map[string]string{
-		"ExecStart":        unitExec(h.selfPath, "node", probeConfig),
-		"ExecStartEx":      unitExecEx(h.selfPath, "node", probeConfig, ""),
-		"Names":            deploy.NodeUnitName,
-		"User":             "root",
-		"Group":            "root",
-		"StateDirectory":   "billet/node",
-		"RuntimeDirectory": "billet/locks",
+		"ExecStart":      unitExec(h.selfPath, "node", probeConfig),
+		"ExecStartEx":    unitExecEx(h.selfPath, "node", probeConfig, ""),
+		"Names":          deploy.NodeUnitName,
+		"User":           "root",
+		"Group":          "root",
+		"StateDirectory": "billet/node",
+		// The packaged node unit's two entries, as systemctl renders them.
+		"RuntimeDirectory": "billet/locks billet/registration",
 	}
 	maps.Copy(fields, over)
 
@@ -594,6 +595,75 @@ func TestPlanRefusesStateTheUnitCannotWrite(t *testing.T) {
 				t.Errorf("the refusal does not name the directory the unit does make writable:\n%s", joined)
 			}
 		})
+	}
+}
+
+// A DIRECTORY DIRECTIVE IS A LIST, rendered by systemctl as entries separated
+// by spaces: the node unit declares its locks beside its registration
+// record, so the lock directory is admitted as one entry of two, a prefix of
+// an entry is refused naming both, and the joined text is never a directory.
+func TestPlanReadsARuntimeDirectoryDirectiveAsAList(t *testing.T) {
+	cases := []struct {
+		name, dir string
+		refused   bool
+	}{
+		{"the first entry", "/run/billet/locks", false},
+		{"the second entry", "/run/billet/registration", false},
+		{"a prefix of an entry", "/run/billet/regist", true},
+		{"the entries' parent", "/run/billet", true},
+		{"the rendered text", "/run/billet/locks billet/registration", true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHost(t)
+			c, _ := h.converger(t, healthyHost(t, h))
+
+			req := upRequest()
+			req.NodeLockDir = tc.dir
+
+			plan, err := c.Plan(t.Context(), req)
+			if err != nil {
+				t.Fatalf("Plan: %v", err)
+			}
+
+			joined := strings.Join(refusalText(plan.Refusals), "\n")
+			if refused := strings.Contains(joined, "lock_dir is "); refused != tc.refused {
+				t.Fatalf("lock_dir %q refused=%v, want %v:\n%s", tc.dir, refused, tc.refused, joined)
+			}
+
+			if tc.refused && !strings.Contains(joined, "/run/billet/locks or /run/billet/registration") {
+				t.Errorf("the refusal does not name both directories the unit makes writable:\n%s", joined)
+			}
+		})
+	}
+}
+
+// THE REPAIR TARGET IS THE CONFIGURED DIRECTORY, not the directive's text: a
+// server unit declaring two state directories admits the configured one as an
+// entry, and the plan repairs exactly that directory.
+func TestPlanRepairsTheConfiguredStateDirectoryUnderAListDirective(t *testing.T) {
+	h := newHost(t)
+	a := &answers{reply: map[string]string{
+		deploy.ServerUnitName: healthyServer(t, h, map[string]string{"StateDirectory": "billet/server billet/extra"}),
+		deploy.NodeUnitName:   healthyNode(t, h, nil),
+	}}
+	c, _ := h.converger(t, a)
+
+	req := upRequest()
+	req.ServerStateDir = "/var/lib/billet/server"
+
+	plan, err := c.Plan(t.Context(), req)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+
+	if joined := strings.Join(refusalText(plan.Refusals), "\n"); strings.Contains(joined, "state_dir is ") {
+		t.Fatalf("the configured directory was refused under a two-entry directive:\n%s", joined)
+	}
+
+	if plan.ServerState != "/var/lib/billet/server" {
+		t.Errorf("plan.ServerState = %q, want the configured directory", plan.ServerState)
 	}
 }
 

@@ -93,6 +93,10 @@ var (
 	// inspectBetweenClosingChecks runs between the closing check of the
 	// descriptor and the closing stat of the name.
 	inspectBetweenClosingChecks func()
+	// inspectAfterRecordRead runs after the node's registration record was
+	// read inside a sample and before the confirming identity read, so a
+	// fixture can move the unit there.
+	inspectAfterRecordRead func()
 	// inspectAfterViewOpen runs after a process's view of a path has been
 	// opened, for identity or for reading, so a test can prove an unsupported
 	// command line's operand is never opened at all.
@@ -172,6 +176,7 @@ type inspectService struct {
 	ActiveState      maybe  `json:"active_state"`
 	SubState         maybe  `json:"sub_state"`
 	MainPID          maybe  `json:"main_pid"`
+	InvocationID     maybe  `json:"invocation_id"`
 	ExecMainStart    maybe  `json:"exec_main_start"`
 	ExecStart        maybe  `json:"exec_start"`
 	EnvironmentFiles maybe  `json:"environment_files"`
@@ -183,6 +188,19 @@ type inspectService struct {
 	// from the configuration observation, so the closing check can withdraw
 	// them with it.
 	fromObservation bool
+	// scheduled marks a unit observed for its runtime facts alone: the upgrade
+	// timer, the backup timer and the backup service, which have no ExecStart
+	// shape the binding reads and run no billet role, so they carry only
+	// unit_present, unit_file_state, enabled, active_state, sub_state and, for
+	// the service, main_pid. They are EXEMPT from the binding, the shape rule
+	// and the executable comparison, which are server's and node's alone.
+	scheduled bool
+	// hasMainPID says a scheduled unit is the service, whose main pid is
+	// reported; a timer has none.
+	hasMainPID bool
+	// registration is the node's registration record as its sample read it,
+	// or why not; host.registration is judged from it after the services.
+	registration registrationEvidence
 
 	RunningSHA256                  maybe `json:"running_sha256"`
 	SameAsExecutable               maybe `json:"same_as_executable"`
@@ -194,6 +212,103 @@ type inspectService struct {
 	EnvironmentFileChangedSinceRun maybe `json:"environment_file_changed_since_start"`
 	LoadedConfig                   maybe `json:"loaded_config"`
 	DSNEnv                         maybe `json:"dsn_env"`
+}
+
+// scheduledUnitJSON is what a scheduled unit's entry marshals as: the six
+// runtime facts and nothing else, so a consumer reading the shape fields of
+// `server` or `node` finds none on a timer.
+type scheduledUnitJSON struct {
+	UnitPresent   maybe  `json:"unit_present"`
+	UnitFileState maybe  `json:"unit_file_state"`
+	Enabled       maybe  `json:"enabled"`
+	ActiveState   maybe  `json:"active_state"`
+	SubState      maybe  `json:"sub_state"`
+	MainPID       *maybe `json:"main_pid,omitempty"`
+}
+
+// MarshalJSON emits the service's whole record, or a scheduled unit's six
+// facts.
+func (s inspectService) MarshalJSON() ([]byte, error) {
+	if !s.scheduled {
+		type plain inspectService
+
+		return json.Marshal(plain(s))
+	}
+
+	out := scheduledUnitJSON{UnitPresent: s.UnitPresent, UnitFileState: s.UnitFileState, Enabled: s.Enabled,
+		ActiveState: s.ActiveState, SubState: s.SubState}
+
+	if s.hasMainPID {
+		pid := s.MainPID
+		out.MainPID = &pid
+	}
+
+	return json.Marshal(out)
+}
+
+// scheduledUnits are the units the report observes for their runtime facts
+// alone, keyed as they appear in the services map.
+var scheduledUnits = map[string]string{
+	"upgrade_timer":  deploy.UpgradeTimerName,
+	"backup_timer":   deploy.BackupTimerName,
+	"backup_service": deploy.BackupUnitName,
+}
+
+// inspectScheduledUnit reads a scheduled unit's runtime facts: presence,
+// systemd's enablement answer and its derivation, the active and sub states,
+// and for the service its main pid (null for an observed zero, the number for
+// a running one whether or not its fragment is still found, unknown for a
+// value that is not a number). `LoadState=not-found` is a positive answer.
+func inspectScheduledUnit(ctx context.Context, unit string, service bool) inspectService {
+	svc := inspectService{scheduled: true, hasMainPID: service}
+	if hostOS == "darwin" {
+		why := "launchd has no unit shape this inspector reads"
+		svc.UnitPresent, svc.UnitFileState, svc.Enabled = unknown(why), unknown(why), unknown(why)
+		svc.ActiveState, svc.SubState, svc.MainPID = unknown(why), unknown(why), unknown(why)
+		return svc
+	}
+	props, err := unitProperties(ctx, unit)
+	if err != nil {
+		why := err.Error()
+		svc.UnitPresent, svc.UnitFileState, svc.Enabled = unknown(why), unknown(why), unknown(why)
+		svc.ActiveState, svc.SubState, svc.MainPID = unknown(why), unknown(why), unknown(why)
+		return svc
+	}
+	switch load := firstProp(props, "LoadState"); load {
+	case "not-found":
+		svc.UnitPresent = known(false)
+		svc.UnitFileState, svc.Enabled = known(nil), known(nil)
+	case "":
+		why := "systemd answered no LoadState for " + unit
+		svc.UnitPresent, svc.UnitFileState, svc.Enabled = unknown(why), unknown(why), unknown(why)
+	default:
+		svc.UnitPresent = known(true)
+		svc.UnitFileState, svc.Enabled = unitEnablement(firstProp(props, "UnitFileState"))
+	}
+	svc.ActiveState = knownOrMissing(props, "ActiveState", unit)
+	svc.SubState = knownOrMissing(props, "SubState", unit)
+	if !service {
+		return svc
+	}
+	pid, pidErr := strconv.Atoi(firstProp(props, "MainPID"))
+	switch {
+	case pidErr != nil:
+		svc.MainPID = unknown("systemd reported a MainPID that is not a number")
+	case pid == 0:
+		svc.MainPID = known(nil)
+	default:
+		svc.MainPID = known(pid)
+	}
+	return svc
+}
+
+// knownOrMissing is a property systemd answered as a value, or unknown when the
+// answer carried no such line: an empty state is not a state.
+func knownOrMissing(props map[string][]string, name, unit string) maybe {
+	if v := firstProp(props, name); v != "" {
+		return known(v)
+	}
+	return unknown("systemd answered no " + name + " for " + unit)
 }
 
 type inspectDSNEnv struct {
@@ -218,6 +333,14 @@ type inspectHost struct {
 	Retirement   maybe  `json:"retirement"`
 	Authority    maybe  `json:"authority"`
 	NodeTrust    maybe  `json:"node_trust"`
+	// Registration is the node's registration record when it is usable
+	// evidence (releaseinspectregistration.go), and InstalledEndpoint the
+	// installed configuration's node endpoint as the one representation.
+	Registration      maybe `json:"registration"`
+	InstalledEndpoint maybe `json:"installed_endpoint"`
+	// EndpointReceipt is the durable migration receipt, typed by presence
+	// (releaseinspectreceipt.go), judged whether or not the node runs.
+	EndpointReceipt maybe `json:"endpoint_receipt"`
 }
 
 type inspectCertificate struct {
@@ -352,9 +475,18 @@ func inspectHostRelease(ctx context.Context, configPath string) inspectReport {
 		report.Services[role] = svc
 		binding = weaker(binding, bound)
 	}
+	// THE SCHEDULED UNITS ARE OBSERVED AND BIND NOTHING: a retirement's
+	// postconditions read them, and nothing about a timer's state says which
+	// configuration the two services are bound to.
+	for key, unit := range scheduledUnits {
+		report.Services[key] = inspectScheduledUnit(ctx, unit, key == "backup_service")
+	}
 	report.ConfigBinding = binding
 	report.Installed = inspectInstalledSection(cfg, configPath, report.Config, digest)
 	report.Host = inspectHostSection(cfg)
+	report.Host.Registration = hostRegistration(report.Services["node"], cfg)
+	report.Host.EndpointReceipt = hostEndpointReceipt()
+	report.Host.InstalledEndpoint = installedEndpoint(cfg, report.Config.Readable)
 	report.Transaction = inspectTransactionSection()
 	if inspectBeforeClose != nil {
 		inspectBeforeClose()
@@ -892,6 +1024,7 @@ func inspectServiceSection(ctx context.Context, role, unit string, cfg *config.C
 	}
 	active := firstProp(props, "ActiveState")
 	pid, pidErr := strconv.Atoi(firstProp(props, "MainPID"))
+	svc.InvocationID = invocationOf(props)
 	if firstProp(props, "LoadState") == "not-found" {
 		// THE FRAGMENT IS GONE; THE RUNTIME FACTS ARE NOT DISCARDED WITH IT: a
 		// unit whose file was removed while its service runs still runs.
@@ -1008,9 +1141,20 @@ func inspectServiceSection(ctx context.Context, role, unit string, cfg *config.C
 	return svc, weaker(binding, processBinding)
 }
 
+// invocationOf is systemd's InvocationID for a unit: null when systemd
+// answered empty (a unit that is not running has none), the value otherwise.
+func invocationOf(props map[string][]string) maybe {
+	if v := firstProp(props, "InvocationID"); v != "" {
+		return known(v)
+	}
+	return known(nil)
+}
+
 // serviceAllUnknown is a unit nothing could be asked about.
 func serviceAllUnknown(svc inspectService, why string) inspectService {
 	svc.UnitPresent = unknown(why)
+	svc.InvocationID = unknown(why)
+	svc.registration = registrationEvidence{why: why}
 	svc.UnitFileState, svc.Enabled = unknown(why), unknown(why)
 	svc.ActiveState, svc.SubState, svc.MainPID = unknown(why), unknown(why), unknown(why)
 	svc.ExecMainStart, svc.ExecStart, svc.Shape, svc.EnvironmentFiles = unknown(why), unknown(why), unknown(why), unknown(why)
@@ -1049,6 +1193,10 @@ type processSample struct {
 	view    os.FileInfo
 	viewSHA string
 	viewErr string
+	// registration is the node's record read INSIDE the sample, between the
+	// identity reads, so it is never reported beside evidence of another
+	// incarnation.
+	registration registrationEvidence
 }
 
 // unitIdentity is what must not move across a sample: which process systemd
@@ -1143,6 +1291,20 @@ func sampleProcess(ctx context.Context, unit, role string, pid int, first map[st
 		default:
 			view, viewSHA, viewErr = hashThroughRoot(dir, args[3])
 		}
+		// THE REGISTRATION RECORD IS READ HERE, inside the sample and only for
+		// the node: a record beside process evidence of another incarnation is
+		// discarded with that evidence.
+		registration := registrationEvidence{why: "this unit publishes no registration record"}
+		if role == "node" {
+			if registrationRecordPath == "" {
+				registration = registrationEvidence{why: "no runtime record on this platform"}
+			} else {
+				registration = readRegistrationRecord(registrationRecordPath)
+			}
+		}
+		if inspectAfterRecordRead != nil {
+			inspectAfterRecordRead()
+		}
 		again, err := unitProperties(ctx, unit)
 		if err != nil {
 			return processSample{}, err
@@ -1164,7 +1326,7 @@ func sampleProcess(ctx context.Context, unit, role string, pid int, first map[st
 		if before != after {
 			continue
 		}
-		return processSample{sha: sum, startTicks: before, cmdline: args, environ: environ, view: view, viewSHA: viewSHA, viewErr: viewErr}, nil
+		return processSample{sha: sum, startTicks: before, cmdline: args, environ: environ, view: view, viewSHA: viewSHA, viewErr: viewErr, registration: registration}, nil
 	}
 	return processSample{}, errors.New("the service restarted during the observation, or its unit changed under it")
 }
@@ -1262,8 +1424,10 @@ func inspectRunningProcess(ctx context.Context, svc *inspectService, role, unit 
 	if err != nil {
 		fillRunningUnknown(svc, err.Error())
 		svc.DSNEnv = unknown(err.Error())
+		svc.registration = registrationEvidence{why: err.Error()}
 		return unknown(err.Error())
 	}
+	svc.registration = sample.registration
 	svc.RunningSHA256 = known(sample.sha)
 	if exeSHA == "" || exeInfo == nil {
 		svc.SameAsExecutable = unknown("the executable could not be hashed")
@@ -1863,6 +2027,15 @@ func printInspectReport(r inspectReport) {
 		}
 		fmt.Printf("%-13s %s/%s shape=%s image=%s\n", role, describeMaybe(svc.ActiveState),
 			describeMaybe(svc.SubState), describeMaybe(svc.Shape), describeMaybe(svc.SameAsExecutable))
+	}
+	for _, key := range []string{"upgrade_timer", "backup_timer", "backup_service"} {
+		svc := r.Services[key]
+		if svc.UnitPresent.known && svc.UnitPresent.value == false {
+			fmt.Printf("%-13s no unit (%s/%s)\n", key, describeMaybe(svc.ActiveState), describeMaybe(svc.SubState))
+			continue
+		}
+		fmt.Printf("%-13s %s/%s enabled=%s\n", key, describeMaybe(svc.ActiveState),
+			describeMaybe(svc.SubState), describeMaybe(svc.Enabled))
 	}
 	fmt.Printf("binding       %s\n", describeMaybe(r.ConfigBinding))
 	fmt.Printf("deployment    %s\n", describeMaybe(r.Host.DeploymentID))

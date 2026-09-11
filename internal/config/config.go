@@ -2923,6 +2923,26 @@ func PeekIdentityBackend(data []byte) IdentityBackend {
 // decode, defaulting and validation as a file on disk, rather than a second copy
 // of the rules that drifts from this one.
 func Parse(name string, data []byte) (*Config, error) {
+	c, err := ParseUnvalidated(name, data)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := c.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid config %s: %w", name, err)
+	}
+
+	return c, nil
+}
+
+// ParseUnvalidated decodes, expands and applies defaults exactly as Parse does
+// and stops before Validate, for a reader that judges one section of a
+// configuration the loader as a whole would refuse: an endpoint decision's dry
+// run over an operator's first emission (whose GitHub App ids are still zero,
+// and refused at load by design) needs the node section and nothing else. The
+// caller validates what it reads (ValidateNodeSection), and anything that
+// installs or starts on the configuration goes through Parse.
+func ParseUnvalidated(name string, data []byte) (*Config, error) {
 	var c Config
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true) // typos in a CI config should be loud, not ignored
@@ -2960,10 +2980,41 @@ func Parse(name string, data []byte) (*Config, error) {
 	c.Tiers = expanded
 
 	c.applyDefaults()
-	if err := c.Validate(); err != nil {
-		return nil, fmt.Errorf("invalid config %s: %w", name, err)
-	}
+
 	return &c, nil
+}
+
+// ValidateNodeSection judges the node section alone, as Validate judges it
+// inside the whole: the provider (a test-only one refused as the whole
+// validation refuses it), the addresses, the TLS material and the node's own
+// limits. A configuration with no node section validates.
+func (c *Config) ValidateNodeSection() error {
+	if c.Node == nil {
+		return nil
+	}
+
+	errs := c.validateNode()
+	if err := c.testOnlyNodeProvider(); err != nil {
+		errs = append(errs, err)
+	}
+
+	return errors.Join(errs...)
+}
+
+// testOnlyNodeProvider is the node half of validateNoTestOnlyBackend, shared
+// with ValidateNodeSection so the node-only judgement cannot admit a provider
+// the whole one refuses.
+func (c *Config) testOnlyNodeProvider() error {
+	if c.Node != nil && c.Node.Provider.TestOnly() {
+		return testOnlyProviderError("node.provider", c.Node.Provider)
+	}
+
+	return nil
+}
+
+func testOnlyProviderError(where string, p ProviderKind) error {
+	return fmt.Errorf("%s: provider %q starts no compute and fabricates completions; it exists for billet's own test "+
+		"harness and cannot be named in a configuration", where, p)
 }
 
 // relocatedKeyHint turns "unknown field" into "that key moved, and here is where".
@@ -3371,13 +3422,11 @@ func (c *Config) validateNoTestOnlyBackend() []error {
 	var errs []error
 
 	refuse := func(where string, p ProviderKind) {
-		errs = append(errs, fmt.Errorf("%s: provider %q starts no compute and fabricates "+
-			"completions; it exists for billet's own test harness and cannot be named in a "+
-			"configuration", where, p))
+		errs = append(errs, testOnlyProviderError(where, p))
 	}
 
-	if c.Node != nil && c.Node.Provider.TestOnly() {
-		refuse("node.provider", c.Node.Provider)
+	if err := c.testOnlyNodeProvider(); err != nil {
+		errs = append(errs, err)
 	}
 
 	for i := range c.Tiers {

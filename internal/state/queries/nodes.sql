@@ -24,6 +24,21 @@ SELECT name, live, node_release, wire_min, wire_max, wire_version, epoch,
   FROM nodes
  ORDER BY name;
 
+-- name: ListNodeRegistrations :many
+-- Every host's CURRENT registration: the process that made it and the fence it
+-- holds, beside what it said it runs.
+--
+-- FROM THE REGISTRATIONS, NEVER FROM A ROLLOUT'S ROWS. A rollout row records the
+-- epoch a host was DISPATCHED against, which is the epoch before the upgrade it
+-- was told to make; what a report of the fleet's registrations answers is which
+-- incarnation each host presents now and how many times it has registered, for a
+-- reader that proves a node's receipt names the process the controller knows.
+-- Offline hosts included: a row outlives the connection, and a reader compares
+-- the incarnation, not the liveness.
+SELECT name, live, epoch, incarnation, node_release, node_digest, highest_release
+  FROM nodes
+ ORDER BY name;
+
 -- name: ReadNodeHighestRelease :one
 -- The newest release one host has registered with, for the registration that is
 -- about to decide whether this one is newer still.

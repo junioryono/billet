@@ -8,7 +8,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/state/ledgerdb"
@@ -133,6 +135,42 @@ type Node struct {
 	// a HIGHER one provably postdates the instruction. Zero means nothing was
 	// recorded, and nothing is concluded from it.
 	DispatchEpoch int64
+	// LastRefusal is why this host's last dispatch was refused, or empty when no
+	// dispatch has been refused since the host was last accepted or converged.
+	//
+	// WRITTEN BY THE FAILED-DISPATCH PATH, CLEARED BY AN ACCEPTED DISPATCH AND BY
+	// THE HOST'S CONVERGENCE, KEPT BY EVERYTHING ELSE. A host under a converge
+	// guard refuses every dispatch for as long as the guard is held, and before
+	// this the reason went to the log and the operator saw a host that kept
+	// trying; this is the reason, on the row `billet rollout status` reads, for
+	// as long as the host is still to be moved. A host that converged, by the
+	// dispatch it accepted or by an operator's hand, is not being refused, and
+	// the acceptance's own clear is a write that can fail after the updater is
+	// already running, so the commit clears too: what the record means is "the
+	// refusal this host is still stuck on", never a history.
+	LastRefusal string
+}
+
+// Registration is one host's CURRENT registration as the ledger holds it: the
+// process that made it and the fence it holds, beside what it said it runs.
+//
+// FROM THE REGISTRATIONS, NEVER FROM A ROLLOUT'S ROWS, and reported whether or
+// not a rollout exists: a rollout row records the epoch a host was dispatched
+// against, and what a reader of the fleet needs is which incarnation each host
+// presents now, so a receipt that names an incarnation can be checked against
+// the controller's own record of it.
+type Registration struct {
+	Name string
+	Live bool
+	// Epoch counts this host's registrations; a registration bumps it and
+	// nothing else does.
+	Epoch int64
+	// Incarnation is the value the registering process minted for its whole
+	// life, or empty for a host that presented none.
+	Incarnation    string
+	Release        string
+	Digest         string
+	HighestRelease string
 }
 
 // Store is the durable half of a rollout.
@@ -335,42 +373,185 @@ func (s *Store) Open(ctx context.Context) (*Rollout, error) {
 	return out, err
 }
 
+// Registrations reads every registered host's current registration, in a stable
+// order, on the read-only pool. Offline hosts are included: a row outlives the
+// connection, and a reader compares the incarnation, not the liveness.
+func (s *Store) Registrations(ctx context.Context) ([]Registration, error) {
+	var out []Registration
+
+	err := s.db.View(ctx, func(q state.Querier) error {
+		rows, err := registrationsIn(ctx, state.ReadQueries(q))
+		out = rows
+
+		return err
+	})
+
+	return out, err
+}
+
+func registrationsIn(ctx context.Context, reads state.ReadOps) ([]Registration, error) {
+	rows, err := reads.ListNodeRegistrations(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("rollout: list the fleet's registrations: %w", err)
+	}
+
+	var out []Registration
+
+	for i := range rows {
+		row := &rows[i]
+
+		if row.Live != 0 && row.Live != 1 {
+			return nil, fmt.Errorf("rollout: registered node %q has invalid liveness %d", row.Name, row.Live)
+		}
+
+		out = append(out, Registration{
+			Name:           row.Name,
+			Live:           row.Live == 1,
+			Epoch:          row.Epoch,
+			Incarnation:    row.Incarnation,
+			Release:        row.NodeRelease,
+			Digest:         row.NodeDigest,
+			HighestRelease: row.HighestRelease,
+		})
+	}
+
+	return out, nil
+}
+
+// StatusSnapshot is the ledger's account of the fleet's decision, read as ONE
+// SNAPSHOT: the deployment binding, the open rollout or else the newest
+// finished one (nil when the ledger holds none), that rollout's hosts, and
+// every registered host's current registration.
+type StatusSnapshot struct {
+	// Binding is the deployment this ledger says it belongs to, or empty for a
+	// ledger nobody has bound.
+	Binding       string
+	Rollout       *Rollout
+	Nodes         []Node
+	Registrations []Registration
+}
+
+// snapshotReads is a seam a test uses to stand a failing read in for one of
+// the snapshot's reads after the transaction was entered, so the read's OWN
+// error is what the snapshot must report. Nil in production.
+var snapshotReads func(state.ReadOps) state.ReadOps
+
+// StatusSnapshot reads the whole report inside one read transaction, so a
+// rollout started between two of its reads cannot appear in one and not the
+// other, and a binding written after the caller's identity check is what the
+// caller compares, not what it saw earlier. Every read is on the read-only pool
+// and a read that fails is the error, never an empty part.
+func (s *Store) StatusSnapshot(ctx context.Context) (StatusSnapshot, error) {
+	var out StatusSnapshot
+
+	err := s.db.View(ctx, func(q state.Querier) error {
+		out = StatusSnapshot{}
+		reads := state.ReadQueries(q)
+
+		if snapshotReads != nil {
+			reads = snapshotReads(reads)
+		}
+
+		binding, err := reads.ReadDeploymentBinding(ctx)
+
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+		case err != nil:
+			return fmt.Errorf("rollout: read the ledger's deployment binding: %w", err)
+		default:
+			out.Binding = binding.DeploymentID
+		}
+
+		current, err := readOpen(ctx, reads)
+
+		switch {
+		case errors.Is(err, ErrNoRollout):
+			history, err := reads.ListRolloutHistory(ctx, 1)
+			if err != nil {
+				return fmt.Errorf("rollout: list rollouts: %w", err)
+			}
+
+			if len(history) > 0 {
+				current, err = rolloutFrom(&history[0])
+				if err != nil {
+					return err
+				}
+			}
+		case err != nil:
+			return err
+		}
+
+		out.Rollout = current
+
+		if current != nil {
+			nodes, err := nodesIn(ctx, reads, current.ID)
+			if err != nil {
+				return err
+			}
+
+			out.Nodes = nodes
+		}
+
+		registrations, err := registrationsIn(ctx, reads)
+		if err != nil {
+			return err
+		}
+
+		out.Registrations = registrations
+
+		return nil
+	})
+	if err != nil {
+		return StatusSnapshot{}, err
+	}
+
+	return out, nil
+}
+
 // Nodes reads where every host in one rollout has got to, in a stable order.
 func (s *Store) Nodes(ctx context.Context, rolloutID string) ([]Node, error) {
 	var out []Node
 
 	err := s.db.View(ctx, func(q state.Querier) error {
-		out = nil
+		rows, err := nodesIn(ctx, state.ReadQueries(q), rolloutID)
+		out = rows
 
-		rows, err := state.ReadQueries(q).ListRolloutNodes(ctx, rolloutID)
-		if err != nil {
-			return fmt.Errorf("rollout: list the nodes in %s: %w", rolloutID, err)
-		}
-
-		// INDEXED RATHER THAN RANGED BY VALUE: a row is 160 bytes and this list is
-		// the whole fleet.
-		for i := range rows {
-			row := &rows[i]
-
-			out = append(out, Node{
-				Node:            row.Node,
-				Phase:           Phase(row.Phase),
-				Attempts:        int(row.Attempts),
-				NextAttemptAt:   row.NextAttemptAt,
-				Blocker:         row.Blocker,
-				PriorRelease:    row.PriorRelease,
-				RollbackResult:  row.RollbackResult,
-				ExemptReason:    row.ExemptReason,
-				UpdatedAt:       row.UpdatedAt,
-				DispatchEpoch:   row.DispatchEpoch,
-				ConvergedDigest: row.ConvergedDigest,
-			})
-		}
-
-		return nil
+		return err
 	})
 
 	return out, err
+}
+
+func nodesIn(ctx context.Context, reads state.ReadOps, rolloutID string) ([]Node, error) {
+	rows, err := reads.ListRolloutNodes(ctx, rolloutID)
+	if err != nil {
+		return nil, fmt.Errorf("rollout: list the nodes in %s: %w", rolloutID, err)
+	}
+
+	var out []Node
+
+	// INDEXED RATHER THAN RANGED BY VALUE: a row is 160 bytes and this list is
+	// the whole fleet.
+	for i := range rows {
+		row := &rows[i]
+
+		out = append(out, Node{
+			Node:            row.Node,
+			Phase:           Phase(row.Phase),
+			Attempts:        int(row.Attempts),
+			NextAttemptAt:   row.NextAttemptAt,
+			Blocker:         row.Blocker,
+			PriorRelease:    row.PriorRelease,
+			RollbackResult:  row.RollbackResult,
+			ExemptReason:    row.ExemptReason,
+			UpdatedAt:       row.UpdatedAt,
+			DispatchEpoch:   row.DispatchEpoch,
+			ConvergedDigest: row.ConvergedDigest,
+			LastRefusal:     row.LastRefusal,
+		})
+	}
+
+	return out, nil
 }
 
 // AdvanceRequest is one component moving to a new phase.
@@ -399,6 +580,41 @@ type AdvanceRequest struct {
 	// ConvergedDigest, when non-empty, records the release manifest that proved a
 	// host converged. See Node.ConvergedDigest.
 	ConvergedDigest string
+	// Refusal, when non-empty, records why the dispatch this advance follows was
+	// refused, bounded to maxRefusalBytes. ClearRefusal empties the record; it
+	// is what a successful dispatch passes. Both together are refused. Neither
+	// leaves the record as it is. See Node.LastRefusal.
+	Refusal      string
+	ClearRefusal bool
+}
+
+// maxRefusalBytes bounds what a refusal record may hold, marker included: a
+// refusal is one sentence from an updater, and an unbounded one would let a
+// host write the ledger's row as long as it liked.
+const maxRefusalBytes = 4096
+
+// refusalCutMarker ends a refusal that was longer than the bound.
+const refusalCutMarker = " [cut]"
+
+// boundRefusal makes a refusal storable on both engines and no longer than the
+// bound: invalid UTF-8 and NUL are replaced (PostgreSQL's text refuses both,
+// and NUL is valid UTF-8; SQLite would store bytes a JSON report cannot render;
+// a refusal the engine refuses would lose the attempt count and the backoff
+// written in the same transaction), and a longer text is cut at a rune
+// boundary and marked, so the record never holds a partial character and
+// always says it is partial.
+func boundRefusal(text string) string {
+	text = strings.ReplaceAll(strings.ToValidUTF8(text, "\uFFFD"), "\x00", "\uFFFD")
+	if len(text) <= maxRefusalBytes {
+		return text
+	}
+
+	limit := maxRefusalBytes - len(refusalCutMarker)
+	for limit > 0 && !utf8.RuneStart(text[limit]) {
+		limit--
+	}
+
+	return text[:limit] + refusalCutMarker
 }
 
 // Advance moves one component through the state machine.
@@ -420,6 +636,11 @@ func (s *Store) Advance(ctx context.Context, req AdvanceRequest) error {
 		return fmt.Errorf("rollout: recording a component as %s needs the operator's reason, "+
 			"because it is what lets the rollout complete without that component "+
 			"converging", req.To)
+	}
+
+	if req.Refusal != "" && req.ClearRefusal {
+		return errors.New("rollout: an advance cannot both record a refusal and clear one; " +
+			"a refused dispatch records, an accepted one clears")
 	}
 
 	return s.db.Tx(ctx, func(tx *sql.Tx) error {
@@ -451,6 +672,14 @@ func (s *Store) Advance(ctx context.Context, req AdvanceRequest) error {
 			next = ts(s.now().Add(req.Backoff))
 		}
 
+		// THE REFUSAL IS WRITTEN ONLY WHEN THIS ADVANCE SAYS SO, as the statement's
+		// own guard: an empty parameter cannot stand for "keep what is there",
+		// because clearing is a write of exactly that empty value.
+		var setRefusal int64
+		if req.Refusal != "" || req.ClearRefusal {
+			setRefusal = 1
+		}
+
 		if err := q.AdvanceRolloutNode(ctx, ledgerdb.AdvanceRolloutNodeParams{
 			Phase:           string(req.To),
 			Attempts:        attempts,
@@ -461,6 +690,8 @@ func (s *Store) Advance(ctx context.Context, req AdvanceRequest) error {
 			PriorRelease:    req.PriorRelease,
 			DispatchEpoch:   req.DispatchEpoch,
 			ConvergedDigest: req.ConvergedDigest,
+			SetLastRefusal:  setRefusal,
+			LastRefusal:     boundRefusal(req.Refusal),
 			UpdatedAt:       ts(s.now()),
 			RolloutID:       req.RolloutID,
 			Node:            req.Node,

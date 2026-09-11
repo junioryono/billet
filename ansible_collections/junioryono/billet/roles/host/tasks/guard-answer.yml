@@ -1,0 +1,225 @@
+---
+# THE ONE PARSER OF A `converge-guard prepare` ANSWER. Every call the
+# preparation makes (the first, the second, the candidate-first first call)
+# hands its raw result here, and this file turns it into the facts the role
+# reads or refuses naming the member that was wrong. The answer is JSON on
+# stdout, exit 0 for an outcome, 2 for a refusal, 3 for something the command
+# could not examine; a managed binary from before the guard answers "unknown
+# command" and a non-zero exit, which is the pre-R observation and not a
+# corruption. The raw result is never printed (no_log on the calls, because
+# an `acquired` answer carries the token), so the assertions here re-state
+# the members they judged.
+#
+# Inputs: billet_exclusion_raw (the registered command result),
+# billet_exclusion_call ('first' or 'second'), billet_exclusion_answered_by
+# (the executable that answered, for the diagnostics).
+
+# A BINARY FROM BEFORE THE GUARD answers "unknown command" and NO JSON: an
+# answer whose stdout is a JSON object is the command's, whatever its stderr
+# quotes (a refusal at the capability floor repeats the candidate's own
+# "unknown command"), and is judged below rather than read as pre-R. And that
+# observation belongs to the FIRST call alone: the second call goes to the
+# executable that answered the first, so "unknown command" there is that
+# executable having moved under this converge, refused below.
+# A RUN THE BOUND ENDED IS NOT THE OBSERVATION, whatever it printed first: an
+# executable that prints the diagnostic and then hangs exits 124 under
+# `timeout`, 137 through a shell when the kill after the grace period lands,
+# a NEGATIVE status when that kill reaches `timeout`'s own process group as
+# Ansible reports it, and nothing under the async bound; every one is refused
+# as not having answered rather than read as a release before the guard. The
+# observation is an exit the executable itself chose: defined, positive, and
+# not the bound's.
+- name: Note whether the executable answered "unknown command"
+  ansible.builtin.set_fact:
+    billet_exclusion_unknown_command: >-
+      {{ billet_exclusion_raw.rc is defined
+         and billet_exclusion_raw.rc > 0
+         and billet_exclusion_raw.rc not in [124, 137]
+         and not ((billet_exclusion_raw.stdout | default('') | trim) is match('^\{'))
+         and ((billet_exclusion_raw.stdout | default('')) ~ "\n" ~ (billet_exclusion_raw.stderr | default(''))) is search('unknown (converge-guard )?command') }}
+  no_log: true
+
+- name: Note whether the executable predates the guard
+  ansible.builtin.set_fact:
+    billet_exclusion_pre_r: "{{ billet_exclusion_unknown_command | bool and billet_exclusion_call == 'first' }}"
+  no_log: true
+
+- name: Refuse a preparation that did not answer
+  ansible.builtin.assert:
+    that:
+      - billet_exclusion_raw.rc is defined
+      - not (billet_exclusion_raw.msg | default('') is search('non-zero return code|No such file|not found') and billet_exclusion_raw.rc is not defined)
+      - not (billet_exclusion_unknown_command | bool)
+      - billet_exclusion_raw.stdout | default('') | trim | length > 0
+    fail_msg: >-
+      {{ (billet_exclusion_answered_by ~ ' answered "unknown command" to the preparation\'s second call after answering its first: the executable that answered this converge moved under it. Nothing was acted on; ')
+         if billet_exclusion_unknown_command | bool
+         else (billet_exclusion_answered_by ~ ' did not answer the preparation\'s ' ~ billet_exclusion_call ~ ' call (exit ' ~ (billet_exclusion_raw.rc | default('none')) ~ ', '
+               ~ ('ended by the bound' if (billet_exclusion_raw.rc is not defined or billet_exclusion_raw.rc < 0 or billet_exclusion_raw.rc in [124, 137]) else 'no output') ~ '). Nothing this run can act on was learned; ') }}
+      `{{ billet_exclusion_answered_by }} converge-guard status`
+      shows the host, and a guard this run acquired is released by its holder
+      with `release --holder {{ billet_exclusion_holder }}`.
+  when: not billet_exclusion_pre_r | bool
+
+# ONE VALUE PER MEMBER: `from_json` keeps the last of a repeated member, so an
+# answer ending `"pointer": true, "pointer": false` would read as settled
+# where the command's own decoder refuses it; the strict filter refuses it
+# here, and a refusal in this task ends the block with no fact taken.
+- name: Read the preparation's answer
+  ansible.builtin.set_fact:
+    billet_exclusion_answer: "{{ billet_exclusion_raw.stdout | junioryono.billet.from_json_strict }}"
+  no_log: true
+  when: not billet_exclusion_pre_r | bool
+
+- name: Judge the preparation's answer
+  vars:
+    billet_exclusion_a: "{{ billet_exclusion_answer | default({}) }}"
+    # ANCHORED AT THE END OF THE TEXT (\Z): Python's `$` also matches before a
+    # final newline, so an id or a token followed by one passed here and was
+    # refused by the command at the settlement, leaving the guard behind.
+    billet_exclusion_hex32: '^[0-9a-f]{32}\Z'
+    billet_exclusion_sha: '^[0-9a-f]{64}\Z'
+    billet_exclusion_pointer_tail: '/(recovery-[0-9]{8}T[0-9]{6}-[0-9a-f]{8}|[0-9]{8}T[0-9]{15})\Z'
+    billet_exclusion_checks:
+      # THE OUTCOME BY CALL: `acquired` is the first call's alone, since the
+      # second call declares an intent on a guard this run already holds and
+      # answers validated, rebound, refused or unknown; a second answer saying
+      # `acquired` with another token would otherwise replace the cleanup
+      # token of the acquisition this run made, and the settlement and the
+      # rescue would then be refused with a token that was never this guard's.
+      - name: outcome
+        ok: "{{ billet_exclusion_a.outcome | default('') in ['acquired', 'validated', 'rebound', 'refused', 'unknown'] and (billet_exclusion_call == 'first' or billet_exclusion_a.outcome | default('') != 'acquired') }}"
+      - name: exit
+        ok: "{{ billet_exclusion_a.outcome | default('') in ['refused', 'unknown'] or (billet_exclusion_raw.rc | default(1)) == 0 }}"
+      # EVERY TEXT MEMBER IS A STRING BEFORE ITS SHAPE IS JUDGED: a coerced
+      # number of 32 digits matched the id's and the token's pattern, was
+      # stored as a number, and the next `length` over it ended the rescue.
+      - name: reason
+        ok: "{{ billet_exclusion_a.outcome | default('') not in ['refused', 'unknown'] or (billet_exclusion_a.reason | default('') is string and billet_exclusion_a.reason | default('') | length > 0) }}"
+      - name: why
+        ok: "{{ billet_exclusion_a.outcome | default('') not in ['refused', 'unknown'] or (billet_exclusion_a.why | default('') is string and billet_exclusion_a.why | default('') | length > 0) }}"
+      # THE ID NAMES THE GUARD ALREADY HELD: once this run knows a guard's id
+      # (after its first acquisition, and on every later inclusion), a
+      # successful answer must name that id, because the fact below is what
+      # every later call sends as --expect-id, and an answer naming another
+      # id would make the next inclusion refuse the unchanged, settled guard
+      # as replaced, outside the window the cleanup can act in.
+      - name: id
+        ok: "{{ billet_exclusion_a.outcome | default('') in ['refused', 'unknown'] or (billet_exclusion_a.id | default('') is string and billet_exclusion_a.id | default('') is match(billet_exclusion_hex32) and (billet_exclusion_id | default('') | length == 0 or billet_exclusion_a.id == billet_exclusion_id)) }}"
+      - name: holder
+        ok: "{{ billet_exclusion_a.outcome | default('') in ['refused', 'unknown'] or (billet_exclusion_a.holder | default('') == billet_exclusion_holder) }}"
+      - name: preparing
+        ok: "{{ billet_exclusion_a.outcome | default('') in ['refused', 'unknown'] or (billet_exclusion_a.preparing | default('x') is sameas true) or (billet_exclusion_a.preparing | default('x') is sameas false) }}"
+      - name: token
+        ok: "{{ billet_exclusion_a.outcome | default('') != 'acquired' or (billet_exclusion_a.token | default('') is string and billet_exclusion_a.token | default('') is match(billet_exclusion_hex32)) }}"
+      - name: record
+        ok: "{{ billet_exclusion_a.outcome | default('') in ['refused', 'unknown'] or ((billet_exclusion_a.record | default({})).release_executable | default('') is string and (billet_exclusion_a.record | default({})).release_executable | default('') is match('^/') and (billet_exclusion_a.record | default({})).release_executable_sha256 | default('') is string and (billet_exclusion_a.record | default({})).release_executable_sha256 | default('') is match(billet_exclusion_sha) and ((billet_exclusion_a.record | default({})).verified | default('x') is sameas true)) }}"
+      # THE POINTER AGREES WITH THE INTENT THE SECOND CALL DECLARED: the
+      # second call was sent `--recovery` exactly when the first answer carried
+      # a pointer (billet_interrupted_upgrade), so a successful second answer
+      # must carry the same pointer and, with it, the same target; one that
+      # cleared it would otherwise have the ordinary path write over the
+      # recovery directory's material before the pointer refused its
+      # publication, and one that set it would send a recovery over a
+      # directory no pointer names.
+      - name: pointer
+        ok: "{{ billet_exclusion_a.outcome | default('') in ['refused', 'unknown'] or (((billet_exclusion_a.pointer | default('x') is sameas true) or (billet_exclusion_a.pointer | default('x') is sameas false)) and (billet_exclusion_call == 'first' or (billet_exclusion_a.pointer is sameas (billet_interrupted_upgrade | default(false) | bool)))) }}"
+      # THE OPTIONAL TEXT MEMBERS A DIAGNOSTIC READS are strings whenever they
+      # are present, whatever the outcome: the refusal's message below is
+      # templated before the assertion decides, so a null `next` on a
+      # successful answer would fail there, after the judgement and before the
+      # facts, losing the token.
+      - name: shape
+        ok: "{{ ('shape' not in billet_exclusion_a) or (billet_exclusion_a.shape is string) }}"
+      - name: next
+        ok: "{{ ('next' not in billet_exclusion_a) or (billet_exclusion_a.next is string) }}"
+      - name: note
+        ok: "{{ ('note' not in billet_exclusion_a) or (billet_exclusion_a.note is string) }}"
+      # THE RECOVERY DIRECTORY IS THE VALIDATED POINTER TARGET ALONE: the
+      # command answers `recovery_dir` beside it on a validation, and an
+      # answer naming two directories is refused rather than read from the
+      # one the grammar never judged.
+      - name: recovery_dir
+        ok: "{{ billet_exclusion_a.outcome | default('') in ['refused', 'unknown'] or ('recovery_dir' not in billet_exclusion_a) or (billet_exclusion_a.recovery_dir is string and billet_exclusion_a.recovery_dir == billet_exclusion_a.pointer_target | default('')) }}"
+      - name: pointer_target
+        ok: "{{ billet_exclusion_a.outcome | default('') in ['refused', 'unknown'] or not (billet_exclusion_a.pointer | default(false) is sameas true) or (billet_exclusion_a.pointer_target | default('') is string and billet_exclusion_a.pointer_target | default('') is match('^' ~ (billet_exclusion_root | regex_escape) ~ billet_exclusion_pointer_tail) and (billet_exclusion_call == 'first' or billet_exclusion_a.pointer_target == billet_upgrade_recovery_dir | default(''))) }}"
+      - name: managed
+        ok: "{{ billet_exclusion_a.outcome | default('') in ['refused', 'unknown'] or ((billet_exclusion_a.managed | default({})).present | default('x') is sameas true) or ((billet_exclusion_a.managed | default({})).present | default('x') is sameas false) or ((billet_exclusion_a.managed | default({})).present | default('x') == 'unknown') }}"
+      - name: downgrade
+        ok: "{{ billet_exclusion_a.outcome | default('') in ['refused', 'unknown'] or (billet_exclusion_a.downgrade | default('x') is sameas true) or (billet_exclusion_a.downgrade | default('x') is sameas false) }}"
+  ansible.builtin.assert:
+    that:
+      - item.ok | bool
+    fail_msg: >-
+      The preparation's {{ billet_exclusion_call }} call through
+      {{ billet_exclusion_answered_by }} answered with a member this role cannot
+      read: {{ item.name }}. Nothing was acted on.
+      {{ 'A guard this run acquired earlier is released on the way out.' if billet_exclusion_cleanup_token | default('') | length > 0
+         else '`' ~ billet_exclusion_answered_by ~ ' converge-guard status` shows the host, and a guard this run may have acquired is released by its holder with `release --holder ' ~ billet_exclusion_holder ~ '`.' }}
+  loop: "{{ billet_exclusion_checks }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: not billet_exclusion_pre_r | bool
+
+# THE REFUSAL, in the command's words with its reason and the next step.
+- name: Refuse the preparation's answer
+  ansible.builtin.assert:
+    that:
+      - billet_exclusion_answer.outcome not in ['refused', 'unknown']
+    fail_msg: >-
+      The preparation's {{ billet_exclusion_call }} call through
+      {{ billet_exclusion_answered_by }} was
+      {{ 'refused' if billet_exclusion_answer.outcome == 'refused' else 'could not examine the host' }}
+      ({{ billet_exclusion_answer.reason if billet_exclusion_answer.reason | default('') is string and billet_exclusion_answer.reason | default('') | length > 0 else 'no reason' }}{{ (', ' ~ billet_exclusion_answer.shape) if (billet_exclusion_answer.shape | default('') is string and billet_exclusion_answer.shape | default('') | length > 0) else '' }}):
+      {{ billet_exclusion_answer.why if billet_exclusion_answer.why | default('') is string and billet_exclusion_answer.why | default('') | length > 0 else 'no reason' }}.
+      {{ ('Next: ' ~ billet_exclusion_answer.next ~ '.') if (billet_exclusion_answer.next | default('') is string and billet_exclusion_answer.next | default('') | length > 0) else '' }}
+  when: not billet_exclusion_pre_r | bool
+
+# THE FACTS, from the answer and from nothing read before it. The token is
+# kept in a fact no report prints, for the cleanup release alone.
+- name: Take the preparation's answer as this run's facts
+  ansible.builtin.set_fact:
+    billet_exclusion_id: "{{ billet_exclusion_answer.id }}"
+    billet_exclusion_acquired: >-
+      {{ billet_exclusion_answer.outcome == 'acquired' if billet_exclusion_call == 'first'
+         else billet_exclusion_acquired | default(false) }}
+    billet_exclusion_cleanup_token: >-
+      {{ billet_exclusion_answer.token | default('') if (billet_exclusion_call == 'first' and billet_exclusion_answer.outcome == 'acquired')
+         else billet_exclusion_cleanup_token | default('') }}
+    billet_exclusion_held: true
+    billet_exclusion_executable: "{{ billet_exclusion_answered_by }}"
+    # THIS INVOCATION'S OWN ANSWER: a fact an earlier inclusion left behind
+    # (a candidate that answered a preparation whose guard was then released)
+    # is never this converge's answerer; the preparation resets this at entry.
+    billet_exclusion_answered_now: true
+    # THE INTERRUPTION IS THE FIRST ANSWER'S: the second call declared its
+    # intent from these facts and its answer was held to agree above, so the
+    # second answer neither clears nor sets them.
+    billet_interrupted_upgrade: "{{ billet_exclusion_answer.pointer if billet_exclusion_call == 'first' else billet_interrupted_upgrade | default(false) }}"
+    billet_upgrade_recovery_dir: >-
+      {{ billet_exclusion_answer.pointer_target
+         if (billet_exclusion_call == 'first' and billet_exclusion_answer.pointer) else (billet_upgrade_recovery_dir | default('')) }}
+    billet_upgrade_claim_shape: >-
+      {{ ('guard-pointer' if billet_exclusion_answer.pointer else 'guard') if billet_exclusion_call == 'first'
+         else billet_upgrade_claim_shape | default('guard') }}
+    billet_exclusion_record_executable: "{{ billet_exclusion_answer.record.release_executable }}"
+    billet_exclusion_record_sha256: "{{ billet_exclusion_answer.record.release_executable_sha256 }}"
+    billet_exclusion_downgrade: "{{ billet_exclusion_answer.downgrade | default(false) }}"
+    billet_exclusion_managed_present: "{{ billet_exclusion_answer.managed.present }}"
+    billet_exclusion_managed_sha256: "{{ billet_exclusion_answer.managed.sha256 | default('') }}"
+    billet_exclusion_adopted: "{{ billet_exclusion_answer.adopted | default(false) }}"
+  no_log: true
+  when: not billet_exclusion_pre_r | bool
+
+- name: Report the preparation's answer
+  ansible.builtin.debug:
+    msg: >-
+      The preparation's {{ billet_exclusion_call }} call through
+      {{ billet_exclusion_answered_by }}: {{ billet_exclusion_answer.outcome }}
+      (guard {{ billet_exclusion_answer.id }} by {{ billet_exclusion_answer.holder }}
+      since {{ billet_exclusion_answer.claimed_at }}, {{ 'preparing' if billet_exclusion_answer.preparing else 'settled' }},
+      recording {{ billet_exclusion_answer.record.release_executable }}
+      {{ ', carrying the transaction pointer to ' ~ billet_exclusion_answer.pointer_target if billet_exclusion_answer.pointer else '' }}
+      {{ ', adopted from a record written before the protocol' if billet_exclusion_answer.adopted | default(false) else '' }}
+      {{ ', a downgrade admitted by name' if billet_exclusion_answer.downgrade | default(false) else '' }}).
+  when: not billet_exclusion_pre_r | bool

@@ -1,0 +1,7 @@
+{
+  "outcome": "refused",
+  "reason": "shape",
+  "shape": "unpublished-guard",
+  "why": "an unpublished converge guard is on this host; `billet converge-guard recover --unpublished` removes it",
+  "next": "`billet converge-guard recover --unpublished`"
+}

@@ -1,0 +1,7 @@
+{
+  "outcome": "refused",
+  "reason": "shape",
+  "shape": "host-upgrade",
+  "why": "a Go transaction (`billet host-upgrade`) claims this host: host-upgrade: a Go transaction's claim pointing at /var/lib/billet/upgrades/recovery-x, which does not exist; `billet host-upgrade --status` and `--resume` are its commands",
+  "next": "`billet host-upgrade --status`, `--resume`"
+}

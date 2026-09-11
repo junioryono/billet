@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "outcome": "reported",
+  "planned": false,
+  "first_start": true,
+  "node_removed": false,
+  "from": null,
+  "to": "http://127.0.0.1:7719",
+  "effective": null,
+  "record": "none",
+  "config": "present",
+  "unit": {
+    "load_state": "loaded",
+    "active_state": "inactive",
+    "kill_mode": "mixed"
+  }
+}

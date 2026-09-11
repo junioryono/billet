@@ -1,0 +1,140 @@
+---
+# THE ONE PARSER OF A `node migrate-endpoint` ANSWER, for the decision's dry
+# run and the migration's action alike. The answer is JSON on stdout, exit 0
+# for `reported`, `unchanged` or `migrated`, 2 for a refusal, 3 for something
+# the command could not examine; a run the bound ended (124, 137, a negative
+# status) did not answer and is never read as an outcome. Every member is held
+# to the producer's shape, the nullability rules per branch included, and a
+# member outside the rules refuses naming it: `from_json` would coerce and
+# keep the last of a repeated member, and a role reading a null as an empty
+# string would plan a migration from nothing. A refusal or a could-not-tell
+# always names the state the host was left in (`nothing`, `stopped`,
+# `started`, `started-no-record`): an answer without it is not read as
+# "nothing done".
+#
+# Inputs: billet_endpoint_raw (the registered command result),
+# billet_endpoint_call ('decision' or 'action'), billet_endpoint_answered_by
+# (the executable that answered, for the diagnostics).
+
+- name: Refuse a migration call that did not answer
+  ansible.builtin.assert:
+    that:
+      - billet_endpoint_raw.rc is defined
+      - billet_endpoint_raw.rc >= 0
+      - billet_endpoint_raw.rc not in [124, 137]
+      - billet_endpoint_raw.stdout | default('') | trim | length > 0
+      - (billet_endpoint_raw.stdout | default('') | trim) is match('^\{')
+    fail_msg: >-
+      {{ billet_endpoint_answered_by }} did not answer the endpoint
+      migration's {{ billet_endpoint_call }} (exit {{ billet_endpoint_raw.rc | default('none') }},
+      {{ 'ended by the bound' if (billet_endpoint_raw.rc is not defined or billet_endpoint_raw.rc < 0 or billet_endpoint_raw.rc in [124, 137]) else 'no JSON answer' }}).
+      Nothing this run can act on was learned{{ (': ' ~ (billet_endpoint_raw.stderr | default('') | trim)) if (billet_endpoint_raw.stderr | default('') | trim | length > 0) else '' }}.
+
+- name: Read the migration's answer
+  ansible.builtin.set_fact:
+    billet_endpoint_answer: "{{ billet_endpoint_raw.stdout | junioryono.billet.from_json_strict }}"
+  no_log: true
+
+- name: Judge the migration's answer
+  vars:
+    billet_endpoint_a: "{{ billet_endpoint_answer | default({}) }}"
+    billet_endpoint_outcome: "{{ billet_endpoint_a.outcome | default('') }}"
+    billet_endpoint_hex32: '^[0-9a-f]{32}\Z'
+    billet_endpoint_sha: '^[0-9a-f]{64}\Z'
+    billet_endpoint_failed: "{{ billet_endpoint_outcome in ['refused', 'unknown'] }}"
+    billet_endpoint_members:
+      reported: [schema, outcome, planned, first_start, node_removed, from, to, effective, record, config, unit]
+      unchanged: [schema, outcome, node, deployment, endpoint, effective, record, node_removed, unit]
+      migrated: [schema, outcome, node, deployment, from, to, config_path, installed_sha256, invocation_id, incarnation, registered_at, stopped]
+      refused: [schema, outcome, reason, why, next, state]
+      unknown: [schema, outcome, reason, why, next, state]
+    billet_endpoint_required:
+      reported: [schema, outcome, planned, first_start, node_removed, from, to, effective, record, config, unit]
+      unchanged: [schema, outcome, node, deployment, endpoint, effective, record, node_removed, unit]
+      migrated: [schema, outcome, node, deployment, from, to, config_path, installed_sha256, invocation_id, incarnation, registered_at, stopped]
+      refused: [schema, outcome, reason, why, state]
+      unknown: [schema, outcome, reason, why, state]
+    billet_endpoint_checks:
+      - name: outcome
+        ok: "{{ billet_endpoint_outcome in (['reported', 'refused', 'unknown'] if billet_endpoint_call == 'decision' else ['unchanged', 'migrated', 'refused', 'unknown']) }}"
+      - name: schema
+        ok: "{{ billet_endpoint_a.schema | default(0) is integer and billet_endpoint_a.schema | default(0) == 1 }}"
+      - name: exit
+        ok: "{{ (billet_endpoint_raw.rc | default(1)) == ({'refused': 2, 'unknown': 3}[billet_endpoint_outcome] if billet_endpoint_failed else 0) }}"
+      # THE MEMBER SET IS THE PRODUCER'S: nothing missing, nothing unknown.
+      - name: members
+        ok: "{{ billet_endpoint_outcome in billet_endpoint_members and (billet_endpoint_a.keys() | list | difference(billet_endpoint_members[billet_endpoint_outcome]) | length == 0) and (billet_endpoint_required[billet_endpoint_outcome] | difference(billet_endpoint_a.keys() | list) | length == 0) }}"
+      - name: reason
+        ok: "{{ not billet_endpoint_failed or (billet_endpoint_a.reason | default('') is string and billet_endpoint_a.reason | default('') | length > 0) }}"
+      - name: why
+        ok: "{{ not billet_endpoint_failed or (billet_endpoint_a.why | default('') is string and billet_endpoint_a.why | default('') | length > 0) }}"
+      - name: next
+        ok: "{{ ('next' not in billet_endpoint_a) or (billet_endpoint_a.next is string) }}"
+      - name: state
+        ok: "{{ not billet_endpoint_failed or (billet_endpoint_a.state | default('') in ['nothing', 'stopped', 'started', 'started-no-record']) }}"
+      # THE REPORT: the booleans by their type, the endpoints strings or null
+      # under the rules (a null `to` only beside a removed node; a null `from`
+      # only beside a null `effective` and a first start, an absent
+      # configuration or a removed node), the record and the configuration
+      # from their vocabularies.
+      - name: planned
+        ok: "{{ billet_endpoint_outcome != 'reported' or (billet_endpoint_a.planned | default('x') is sameas true) or (billet_endpoint_a.planned | default('x') is sameas false) }}"
+      - name: first_start
+        ok: "{{ billet_endpoint_outcome != 'reported' or (billet_endpoint_a.first_start | default('x') is sameas true) or (billet_endpoint_a.first_start | default('x') is sameas false) }}"
+      - name: node_removed
+        ok: "{{ billet_endpoint_outcome not in ['reported', 'unchanged'] or (billet_endpoint_a.node_removed | default('x') is sameas true) or (billet_endpoint_a.node_removed | default('x') is sameas false) }}"
+      - name: config
+        ok: "{{ billet_endpoint_outcome != 'reported' or billet_endpoint_a.config | default('') in ['present', 'absent'] }}"
+      - name: record
+        ok: "{{ billet_endpoint_outcome not in ['reported', 'unchanged'] or billet_endpoint_a.record | default('') in ['current', 'none', 'absent-pre-r', 'unread'] }}"
+      - name: to
+        ok: "{{ billet_endpoint_outcome != 'reported' or ((billet_endpoint_a.to | default('x')) is string and (billet_endpoint_a.to | default('')) | length > 0) or ((billet_endpoint_a.to | default('x')) is none and (billet_endpoint_a.node_removed | default(false) is sameas true)) }}"
+      - name: effective
+        ok: "{{ billet_endpoint_outcome not in ['reported', 'unchanged'] or ((billet_endpoint_a.effective | default('x')) is string and (billet_endpoint_a.effective | default('')) | length > 0) or ((billet_endpoint_a.effective | default('x')) is none and billet_endpoint_a.record | default('') != 'current') }}"
+      - name: from
+        ok: "{{ billet_endpoint_outcome != 'reported' or ((billet_endpoint_a.from | default('x')) is string and (billet_endpoint_a.from | default('')) | length > 0) or ((billet_endpoint_a.from | default('x')) is none and (billet_endpoint_a.effective | default('x')) is none and ((billet_endpoint_a.to | default('x')) is none or (billet_endpoint_a.first_start | default(false) is sameas true) or billet_endpoint_a.config | default('') == 'absent')) }}"
+      - name: unit
+        ok: "{{ billet_endpoint_outcome not in ['reported', 'unchanged'] or ((billet_endpoint_a.unit | default('x')) is mapping and (billet_endpoint_a.unit.keys() | list | sort) == ['active_state', 'kill_mode', 'load_state'] and (billet_endpoint_a.unit.load_state is string) and (billet_endpoint_a.unit.active_state is string) and (billet_endpoint_a.unit.kill_mode is string)) }}"
+      # THE UNCHANGED ANSWER: a retained node always names itself and its
+      # endpoint (the producer refuses a name it cannot resolve), so a null
+      # node or endpoint is admitted only in the observation-only branch, no
+      # node section on either side (`node_removed: true`) and the record
+      # `none` (not running) or `unread`, never beside a `current` record; a
+      # null deployment is the positively unminted identity of a stopped
+      # certless host (`none`), the observation-only branch (`unread`) or a
+      # removed node.
+      - name: node
+        ok: "{{ billet_endpoint_outcome not in ['unchanged', 'migrated'] or ((billet_endpoint_a.node | default('x')) is string and (billet_endpoint_a.node | default('')) | length > 0) or (billet_endpoint_outcome == 'unchanged' and (billet_endpoint_a.node | default('x')) is none and (billet_endpoint_a.node_removed | default(false) is sameas true) and billet_endpoint_a.record | default('') in ['none', 'unread']) }}"
+      - name: deployment
+        ok: "{{ billet_endpoint_outcome not in ['unchanged', 'migrated'] or ((billet_endpoint_a.deployment | default('x')) is string and (billet_endpoint_a.deployment | default('')) is match(billet_endpoint_hex32)) or (billet_endpoint_outcome == 'unchanged' and (billet_endpoint_a.deployment | default('x')) is none and (billet_endpoint_a.record | default('') in ['none', 'unread'] or (billet_endpoint_a.node_removed | default(false) is sameas true))) }}"
+      - name: endpoint
+        ok: "{{ billet_endpoint_outcome != 'unchanged' or ((billet_endpoint_a.endpoint | default('x')) is string and (billet_endpoint_a.endpoint | default('')) | length > 0) or ((billet_endpoint_a.endpoint | default('x')) is none and (billet_endpoint_a.node_removed | default(false) is sameas true) and billet_endpoint_a.record | default('') in ['none', 'unread']) }}"
+      # THE MIGRATED ANSWER: every member a string of its shape, the stopped
+      # triple exactly inactive/dead/success, the configuration path the
+      # installed one.
+      - name: migrated_endpoints
+        ok: "{{ billet_endpoint_outcome != 'migrated' or ((billet_endpoint_a.from | default('x')) is string and (billet_endpoint_a.from | default('')) | length > 0 and (billet_endpoint_a.to | default('x')) is string and (billet_endpoint_a.to | default('')) | length > 0) }}"
+      - name: config_path
+        ok: "{{ billet_endpoint_outcome != 'migrated' or billet_endpoint_a.config_path | default('') == '/etc/billet/billet.yaml' }}"
+      - name: installed_sha256
+        ok: "{{ billet_endpoint_outcome != 'migrated' or ((billet_endpoint_a.installed_sha256 | default('x')) is string and (billet_endpoint_a.installed_sha256 | default('')) is match(billet_endpoint_sha)) }}"
+      - name: invocation_id
+        ok: "{{ billet_endpoint_outcome != 'migrated' or ((billet_endpoint_a.invocation_id | default('x')) is string and (billet_endpoint_a.invocation_id | default('')) is match(billet_endpoint_hex32)) }}"
+      - name: incarnation
+        ok: "{{ billet_endpoint_outcome != 'migrated' or ((billet_endpoint_a.incarnation | default('x')) is string and (billet_endpoint_a.incarnation | default('')) is match(billet_endpoint_hex32)) }}"
+      - name: registered_at
+        ok: "{{ billet_endpoint_outcome != 'migrated' or ((billet_endpoint_a.registered_at | default('x')) is string and (billet_endpoint_a.registered_at | default('')) | length > 0) }}"
+      - name: stopped
+        ok: "{{ billet_endpoint_outcome != 'migrated' or ((billet_endpoint_a.stopped | default('x')) is mapping and (billet_endpoint_a.stopped.keys() | list | sort) == ['active_state', 'result', 'sub_state'] and billet_endpoint_a.stopped.active_state | default('') == 'inactive' and billet_endpoint_a.stopped.sub_state | default('') == 'dead' and billet_endpoint_a.stopped.result | default('') == 'success') }}"
+  ansible.builtin.assert:
+    that:
+      - item.ok | bool
+    fail_msg: >-
+      The endpoint migration's {{ billet_endpoint_call }} through
+      {{ billet_endpoint_answered_by }} answered with a member this role cannot
+      read: {{ item.name }}.
+      {{ 'Nothing was stopped or installed.' if billet_endpoint_call == 'decision'
+         else 'The configuration is installed, and whether the node was stopped or restarted cannot be established from this answer; inspect billet-node.service and converge again.' }}
+  loop: "{{ billet_endpoint_checks }}"
+  loop_control:
+    label: "{{ item.name }}"

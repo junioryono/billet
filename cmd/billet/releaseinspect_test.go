@@ -21,6 +21,7 @@ import (
 
 	"github.com/junioryono/billet/internal/hostupgrade"
 	"github.com/junioryono/billet/internal/provenance"
+	"github.com/junioryono/billet/internal/regularfile"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/wirecert"
 )
@@ -77,6 +78,14 @@ func newInspectFixture(t *testing.T) *inspectFixture {
 	retiredJournalPath = filepath.Join(dir, "retired", "journal.json")
 	upgradeRoot = filepath.Join(dir, "upgrades")
 	provenance.Path = filepath.Join(dir, "installed.json")
+	// The receipt's path is this fixture's own on every platform, so the
+	// report's shape (an absent receipt) is the same wherever the tests run.
+	prevReceiptPath, prevReceiptOwner := receiptPath, receiptOwnerOf
+	receiptPath = filepath.Join(dir, "node", "endpoint-migration.json")
+	// The receipt's parent (this fixture's root) stands in for /var/lib/billet,
+	// root's and 0755: the reader judges the parent before the receipt.
+	receiptOwnerOf = func(os.FileInfo) (uint32, bool) { return 0, true }
+	t.Cleanup(func() { receiptPath, receiptOwnerOf = prevReceiptPath, prevReceiptOwner })
 	inspectAfterOpen = nil
 	inspectAfterConfig, inspectBeforeClose, inspectBetweenClosingChecks, inspectAfterViewOpen = nil, nil, nil, nil
 	t.Cleanup(func() {
@@ -107,6 +116,11 @@ func newInspectFixture(t *testing.T) *inspectFixture {
 	f.writeConfig(t, f.serverConfig())
 	f.unitAbsent(t, "billet-node.service")
 	f.unitRunning(t, "billet-server.service", "server", f.configPath, nil)
+	// The three scheduled units, each in a distinct state, so a report that
+	// copied one unit's answer onto the others is told apart.
+	f.scheduledUnit(t, "billet-upgrade.timer", "loaded", "enabled", "active", "waiting", 0)
+	f.scheduledUnit(t, "billet-backup.timer", "loaded", "disabled", "inactive", "dead", 0)
+	f.scheduledUnit(t, "billet-backup.service", "loaded", "static", "inactive", "dead", 0)
 	f.process(t, []string{f.binPath, "server", "--config", f.configPath}, nil)
 	// The config predates the process start, so nothing has changed since.
 	f.touchBeforeStart(t, f.configPath)
@@ -222,6 +236,15 @@ func (f *inspectFixture) touchBeforeStart(t *testing.T, path string) {
 func (f *inspectFixture) unitAbsent(t *testing.T, unit string) {
 	t.Helper()
 	f.unitAbsentWith(t, unit, "inactive", "dead", 0)
+}
+
+// scheduledUnit renders the properties systemd reports for a timer or the
+// backup service: no ExecStart shape the report reads.
+func (f *inspectFixture) scheduledUnit(t *testing.T, unit, load, fileState, active, sub string, pid int) {
+	t.Helper()
+	writeFile(t, filepath.Join(f.unitsDir, unit), "LoadState="+load+"\nUnitFileState="+fileState+"\nActiveState="+active+
+		"\nSubState="+sub+"\nMainPID="+strconv.Itoa(pid)+"\nInvocationID=\nNeedDaemonReload=no\nExecMainStartTimestamp=\n"+
+		"EnvironmentFiles=\nEnvironment=\n", 0o644)
 }
 
 // unitAbsentWith is a unit whose fragment systemd no longer finds, with the
@@ -1651,7 +1674,7 @@ func TestReleaseInspectRefusesASpecialFileAtItsOwnInputs(t *testing.T) {
 	})
 	t.Run("a certificate bundle", func(t *testing.T) {
 		f := newInspectFixture(t)
-		ca, err := wirecert.LoadOrCreateCA(f.stateDir, "dep-1234")
+		ca, err := wirecert.LoadOrCreateCA(f.stateDir, "1234567890abcdef1234567890abcdef")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2059,7 +2082,7 @@ func TestReleaseInspectADormantUnitIsNotAController(t *testing.T) {
 
 func TestReleaseInspectReportsANodesTrustStoreWithoutItsKey(t *testing.T) {
 	f := newInspectFixture(t)
-	ca, err := wirecert.LoadOrCreateCA(f.stateDir, "dep-1234")
+	ca, err := wirecert.LoadOrCreateCA(f.stateDir, "1234567890abcdef1234567890abcdef")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2230,7 +2253,7 @@ func TestReleaseInspectJSONFieldSet(t *testing.T) {
 		if _, err := state.DeploymentID(f.stateDir); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := wirecert.LoadOrCreateCA(f.stateDir, "dep-1234"); err != nil {
+		if _, err := wirecert.LoadOrCreateCA(f.stateDir, "1234567890abcdef1234567890abcdef"); err != nil {
 			t.Fatal(err)
 		}
 		assertFieldSet(t, f.report(t), inspectFieldSet)
@@ -2254,7 +2277,7 @@ func TestReleaseInspectJSONFieldSet(t *testing.T) {
 	})
 	t.Run("node with a bundle and a journal", func(t *testing.T) {
 		f := newInspectFixture(t)
-		ca, err := wirecert.LoadOrCreateCA(f.stateDir, "dep-1234")
+		ca, err := wirecert.LoadOrCreateCA(f.stateDir, "1234567890abcdef1234567890abcdef")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2280,6 +2303,32 @@ func TestReleaseInspectJSONFieldSet(t *testing.T) {
 			t.Fatal(err)
 		}
 		if err := os.Symlink(claim, filepath.Join(upgradeRoot, "active")); err != nil {
+			t.Fatal(err)
+		}
+		// A CURRENT RECORD, root-owned through the owner seam, so the golden
+		// carries host.registration's six members rather than an unknown.
+		recordDir := filepath.Join(f.dir, "registration")
+		if err := os.Mkdir(recordDir, 0o750); err != nil {
+			t.Fatal(err)
+		}
+		savedPath, savedOpen := registrationRecordPath, registrationOpen
+		t.Cleanup(func() { registrationRecordPath, registrationOpen = savedPath, savedOpen })
+		registrationRecordPath = filepath.Join(recordDir, "current")
+		registrationOpen = func(path string) (*os.File, os.FileInfo, error) {
+			file, info, err := regularfile.Open(path, regularfile.Options{NoFollow: true})
+			if err != nil {
+				return nil, nil, err
+			}
+			st, ok := info.Sys().(*syscall.Stat_t)
+			if !ok {
+				return file, info, nil
+			}
+			asRoot := *st
+			asRoot.Uid = 0
+			return file, ownedInfo{FileInfo: info, sys: &asRoot}, nil
+		}
+		writeFile(t, registrationRecordPath, `{"schema":1,"node":"node-a","deployment":"1234567890abcdef1234567890abcdef","incarnation":"00112233445566778899aabbccddeeff","invocation_id":"0123456789abcdef0123456789abcdef","endpoint":"https://10.0.0.5:7717","registered_at":"2026-09-09T12:00:00Z"}`+"\n", 0o600)
+		if err := os.Chmod(registrationRecordPath, 0o600); err != nil {
 			t.Fatal(err)
 		}
 		assertFieldSet(t, f.report(t), inspectFieldSetNode)
@@ -2345,9 +2394,12 @@ host.authority.current.subject
 host.authority.previous
 host.authority.rotation_in_progress
 host.deployment_id
+host.endpoint_receipt.presence
+host.installed_endpoint
 host.node_name
 host.node_trust
 host.os
+host.registration.unknown
 host.retirement
 installed_config.controllers
 installed_config.has_node
@@ -2358,6 +2410,17 @@ installed_config.sha256
 provenance.reason
 provenance.verdict
 schema
+services.backup_service.active_state
+services.backup_service.enabled
+services.backup_service.main_pid
+services.backup_service.sub_state
+services.backup_service.unit_file_state
+services.backup_service.unit_present
+services.backup_timer.active_state
+services.backup_timer.enabled
+services.backup_timer.sub_state
+services.backup_timer.unit_file_state
+services.backup_timer.unit_present
 services.node.active_state
 services.node.cmdline_config_path
 services.node.cmdline_matches_unit
@@ -2369,6 +2432,7 @@ services.node.environment_file_changed_since_start
 services.node.environment_files
 services.node.exec_main_start
 services.node.exec_start
+services.node.invocation_id
 services.node.loaded_config.unknown
 services.node.main_pid
 services.node.need_daemon_reload
@@ -2390,6 +2454,7 @@ services.server.environment_file_changed_since_start
 services.server.environment_files
 services.server.exec_main_start
 services.server.exec_start
+services.server.invocation_id
 services.server.loaded_config.unknown
 services.server.main_pid
 services.server.need_daemon_reload
@@ -2400,6 +2465,11 @@ services.server.started_at
 services.server.sub_state
 services.server.unit_file_state
 services.server.unit_present
+services.upgrade_timer.active_state
+services.upgrade_timer.enabled
+services.upgrade_timer.sub_state
+services.upgrade_timer.unit_file_state
+services.upgrade_timer.unit_present
 transaction.active
 transaction.converge_guard
 transaction.journal
@@ -2590,9 +2660,12 @@ executable.sha256
 executable.version
 host.authority
 host.deployment_id.unknown
+host.endpoint_receipt.presence
+host.installed_endpoint
 host.node_name
 host.node_trust
 host.os
+host.registration.unknown
 host.retirement
 installed_config.controllers
 installed_config.has_node
@@ -2605,6 +2678,17 @@ provenance.manifest_digest
 provenance.verdict
 provenance.version
 schema
+services.backup_service.active_state
+services.backup_service.enabled
+services.backup_service.main_pid
+services.backup_service.sub_state
+services.backup_service.unit_file_state
+services.backup_service.unit_present
+services.backup_timer.active_state
+services.backup_timer.enabled
+services.backup_timer.sub_state
+services.backup_timer.unit_file_state
+services.backup_timer.unit_present
 services.node.active_state
 services.node.cmdline_config_path
 services.node.cmdline_matches_unit
@@ -2616,6 +2700,7 @@ services.node.environment_file_changed_since_start
 services.node.environment_files
 services.node.exec_main_start
 services.node.exec_start
+services.node.invocation_id
 services.node.loaded_config.unknown
 services.node.main_pid
 services.node.need_daemon_reload
@@ -2639,6 +2724,7 @@ services.server.environment_file_changed_since_start
 services.server.environment_files
 services.server.exec_main_start
 services.server.exec_start
+services.server.invocation_id
 services.server.loaded_config.unknown
 services.server.main_pid
 services.server.need_daemon_reload
@@ -2649,6 +2735,11 @@ services.server.started_at
 services.server.sub_state
 services.server.unit_file_state
 services.server.unit_present
+services.upgrade_timer.active_state
+services.upgrade_timer.enabled
+services.upgrade_timer.sub_state
+services.upgrade_timer.unit_file_state
+services.upgrade_timer.unit_present
 transaction.active
 transaction.converge_guard.claimed_at
 transaction.converge_guard.holder
@@ -2680,6 +2771,8 @@ executable.sha256
 executable.version
 host.authority
 host.deployment_id
+host.endpoint_receipt.presence
+host.installed_endpoint
 host.node_name
 host.node_trust.cas
 host.node_trust.leaf.der_sha256
@@ -2687,6 +2780,12 @@ host.node_trust.leaf.not_after
 host.node_trust.leaf.pem
 host.node_trust.leaf.subject
 host.os
+host.registration.deployment
+host.registration.endpoint
+host.registration.incarnation
+host.registration.invocation_id
+host.registration.node
+host.registration.registered_at
 host.retirement.phase
 installed_config.controllers
 installed_config.has_node
@@ -2697,6 +2796,17 @@ installed_config.sha256
 provenance.reason
 provenance.verdict
 schema
+services.backup_service.active_state
+services.backup_service.enabled
+services.backup_service.main_pid
+services.backup_service.sub_state
+services.backup_service.unit_file_state
+services.backup_service.unit_present
+services.backup_timer.active_state
+services.backup_timer.enabled
+services.backup_timer.sub_state
+services.backup_timer.unit_file_state
+services.backup_timer.unit_present
 services.node.active_state
 services.node.cmdline_config_path
 services.node.cmdline_matches_unit
@@ -2708,6 +2818,7 @@ services.node.environment_file_changed_since_start
 services.node.environment_files
 services.node.exec_main_start
 services.node.exec_start
+services.node.invocation_id
 services.node.loaded_config.unknown
 services.node.main_pid
 services.node.need_daemon_reload
@@ -2729,6 +2840,7 @@ services.server.environment_file_changed_since_start
 services.server.environment_files
 services.server.exec_main_start
 services.server.exec_start
+services.server.invocation_id
 services.server.loaded_config.unknown
 services.server.main_pid
 services.server.need_daemon_reload
@@ -2739,6 +2851,11 @@ services.server.started_at
 services.server.sub_state
 services.server.unit_file_state
 services.server.unit_present
+services.upgrade_timer.active_state
+services.upgrade_timer.enabled
+services.upgrade_timer.sub_state
+services.upgrade_timer.unit_file_state
+services.upgrade_timer.unit_present
 transaction.active
 transaction.converge_guard
 transaction.journal.failure

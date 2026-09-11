@@ -106,8 +106,12 @@ lint: ## golangci-lint (pinned version), for this platform AND linux
 	@# and failed CI. Three defects on one branch had exactly this shape.
 	@#
 	@# It costs one more pass, and it is the only way this gate speaks for the
-	@# platform the thing actually runs on.
-	GOOS=linux golangci-lint run --timeout=5m
+	@# platform the thing actually runs on. ON CI'S ARCHITECTURE: a stat field's
+	@# width differs between linux/amd64 (Nlink is uint64) and linux/arm64
+	@# (uint32), so a linux pass at this Mac's arm64 missed a conversion CI
+	@# refused as unnecessary (2026-09-09); a conversion that must exist on one
+	@# architecture and not another is spelled through a generic widening.
+	GOOS=linux GOARCH=amd64 golangci-lint run --timeout=5m
 
 .PHONY: lint-custom
 lint-custom: ## billet's own analyzers, and the tests that prove they still detect

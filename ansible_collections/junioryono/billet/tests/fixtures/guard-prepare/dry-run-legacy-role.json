@@ -1,0 +1,11 @@
+{
+  "outcome": "reported",
+  "shape": "legacy-role",
+  "guard": null,
+  "managed": {
+    "path": "/usr/bin/billet",
+    "present": true,
+    "sha256": "abababababababababababababababababababababababababababababababab",
+    "version": "v0.10.0"
+  }
+}

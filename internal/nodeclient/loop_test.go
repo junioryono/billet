@@ -87,6 +87,13 @@ type fakeCompute struct {
 	// follows it microseconds later.
 	launchGate    chan struct{}
 	launchStarted chan struct{}
+
+	// recoverGate holds the first Recover open the same way, after closing
+	// recoverStarted, so a test can look at the world between an accepted
+	// registration and the recovery that follows it.
+	recoverGate    chan struct{}
+	recoverStarted chan struct{}
+	recoverOnce    sync.Once
 }
 
 // Instances is what this fake says it is running, which the loop sends at
@@ -243,12 +250,27 @@ func (f *fakeCompute) DestroyCompleted(ctx context.Context, requestID int64, res
 	return f.Destroy(ctx, requestID)
 }
 
-func (f *fakeCompute) Recover(context.Context) error {
+func (f *fakeCompute) Recover(ctx context.Context) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-
 	f.recovered++
 	f.order = append(f.order, "recover")
+	gate, started := f.recoverGate, f.recoverStarted
+	f.mu.Unlock()
+
+	if started != nil {
+		f.recoverOnce.Do(func() { close(started) })
+	}
+
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
 
 	return f.recoverErr
 }

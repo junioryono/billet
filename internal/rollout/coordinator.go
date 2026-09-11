@@ -317,6 +317,12 @@ func (c *Coordinator) walkTo(ctx context.Context, rolloutID, node string,
 		req := AdvanceRequest{RolloutID: rolloutID, Node: node, To: phase}
 		if phase == to {
 			req.ConvergedDigest = provedBy
+			// A HOST THAT CONVERGED IS NOT STUCK ON A REFUSAL, whether it converged by
+			// the dispatch it accepted (whose own clear is a write that can fail
+			// after the updater is already running) or by an operator's hand after a
+			// refused one: the record means the refusal the host is still stuck on,
+			// and a converged host is stuck on nothing. See Node.LastRefusal.
+			req.ClearRefusal = node != ""
 		}
 
 		if err := c.store.Advance(ctx, req); err != nil {
@@ -816,10 +822,13 @@ func (c *Coordinator) dispatchUpgrade(ctx context.Context, current *Rollout, n *
 		// A BACKOFF, NOT A BLOCK. A dispatch that failed says nothing about the host
 		// except that billet could not reach it just then, and the attempt count is
 		// durable so a host that keeps refusing becomes visible without a timer
-		// deciding anything about it.
+		// deciding anything about it. THE REASON IS RECORDED WITH IT: a host under
+		// a converge guard refuses every dispatch for as long as the guard is held,
+		// and the refusal's text is what tells an operator reading the rollout's
+		// status why the host keeps trying.
 		if advanceErr := c.store.Advance(ctx, AdvanceRequest{
 			RolloutID: current.ID, Node: n.Node, To: PhasePending,
-			Backoff: retryAfter,
+			Backoff: retryAfter, Refusal: err.Error(),
 		}); advanceErr != nil {
 			return errors.Join(err, advanceErr)
 		}
@@ -831,10 +840,12 @@ func (c *Coordinator) dispatchUpgrade(ctx context.Context, current *Rollout, n *
 
 	// THE EPOCH THE INSTRUCTION WAS SENT AGAINST is recorded with the phase, and
 	// it is the only thing that later distinguishes a host still draining from one
-	// that rolled itself back onto the same release.
+	// that rolled itself back onto the same release. The refusal a failed attempt
+	// recorded is cleared here, because the dispatch it described has been
+	// accepted; nothing else clears it.
 	if err := c.store.Advance(ctx, AdvanceRequest{
 		RolloutID: current.ID, Node: n.Node, To: PhaseDraining,
-		DispatchEpoch: host.Epoch,
+		DispatchEpoch: host.Epoch, ClearRefusal: true,
 	}); err != nil {
 		return fmt.Errorf("rollout: mark %s draining: %w", n.Node, err)
 	}

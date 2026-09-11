@@ -353,7 +353,7 @@ func TestWriterDurabilityPragmas(t *testing.T) {
 
 	// The backend's durability readback is what runs at startup; exercise it
 	// directly too.
-	if err := db.backend.verifyDurability(ctx, db.w); err != nil {
+	if err := db.backend.verifyDurability(ctx, db.w, false); err != nil {
 		t.Errorf("verifyDurability: %v", err)
 	}
 }

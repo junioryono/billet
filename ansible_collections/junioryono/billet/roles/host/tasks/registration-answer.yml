@@ -1,0 +1,93 @@
+---
+# THE ONE PARSER OF A `rollout registration` ANSWER, the controller's
+# confirmation of a migrated node's registration: `confirmed` (exit 0) with the
+# epoch and the ledger's binding, `timeout` (exit 3) with the last row a
+# completed poll saw, `refused` (exit 2) or `unknown` (exit 3). The node and
+# the incarnation are held to what was asked, the binding to `bound: true`,
+# and a member outside the producer's set refuses naming it.
+#
+# Inputs: billet_registration_raw (the registered command result on the
+# controller), billet_registration_node, billet_registration_incarnation,
+# billet_registration_answered_by (the controller's executable).
+
+- name: Refuse a confirmation call that did not answer
+  ansible.builtin.assert:
+    that:
+      - billet_registration_raw.rc is defined
+      - billet_registration_raw.rc >= 0
+      - billet_registration_raw.rc not in [124, 137]
+      - billet_registration_raw.stdout | default('') | trim | length > 0
+      - (billet_registration_raw.stdout | default('') | trim) is match('^\{')
+    fail_msg: >-
+      {{ billet_registration_answered_by }} on {{ billet_migration_controller }}
+      did not answer the registration's confirmation (exit {{ billet_registration_raw.rc | default('none') }},
+      {{ 'ended by the bound' if (billet_registration_raw.rc is not defined or billet_registration_raw.rc < 0 or billet_registration_raw.rc in [124, 137]) else 'no JSON answer' }}).
+      The node was migrated and is running on its new endpoint; whether the
+      controller saw it register is not known{{ (': ' ~ (billet_registration_raw.stderr | default('') | trim)) if (billet_registration_raw.stderr | default('') | trim | length > 0) else '' }}.
+      Converge again once the controller answers: the refresh receipts a
+      registered node.
+
+- name: Read the confirmation's answer
+  ansible.builtin.set_fact:
+    billet_registration_answer: "{{ billet_registration_raw.stdout | junioryono.billet.from_json_strict }}"
+  no_log: true
+
+- name: Judge the confirmation's answer
+  vars:
+    billet_registration_a: "{{ billet_registration_answer | default({}) }}"
+    billet_registration_outcome: "{{ billet_registration_a.outcome | default('') }}"
+    billet_registration_hex32: '^[0-9a-f]{32}\Z'
+    billet_registration_failed: "{{ billet_registration_outcome in ['refused', 'unknown'] }}"
+    billet_registration_members:
+      confirmed: [schema, outcome, node, incarnation, epoch, live, deployment]
+      timeout: [schema, outcome, node, incarnation, deployment, last]
+      refused: [schema, outcome, reason, why, next]
+      unknown: [schema, outcome, reason, why, next]
+    billet_registration_required:
+      confirmed: [schema, outcome, node, incarnation, epoch, live, deployment]
+      timeout: [schema, outcome, node, incarnation, deployment, last]
+      refused: [schema, outcome, reason, why]
+      unknown: [schema, outcome, reason, why]
+    billet_registration_checks:
+      - name: outcome
+        ok: "{{ billet_registration_outcome in ['confirmed', 'timeout', 'refused', 'unknown'] }}"
+      - name: schema
+        ok: "{{ billet_registration_a.schema | default(0) is integer and billet_registration_a.schema | default(0) == 1 }}"
+      - name: exit
+        ok: "{{ (billet_registration_raw.rc | default(1)) == ({'confirmed': 0, 'timeout': 3, 'refused': 2, 'unknown': 3}[billet_registration_outcome] if billet_registration_outcome in ['confirmed', 'timeout', 'refused', 'unknown'] else -1) }}"
+      - name: members
+        ok: "{{ billet_registration_outcome in billet_registration_members and (billet_registration_a.keys() | list | difference(billet_registration_members[billet_registration_outcome]) | length == 0) and (billet_registration_required[billet_registration_outcome] | difference(billet_registration_a.keys() | list) | length == 0) }}"
+      - name: reason
+        ok: "{{ not billet_registration_failed or (billet_registration_a.reason | default('') is string and billet_registration_a.reason | default('') | length > 0) }}"
+      - name: why
+        ok: "{{ not billet_registration_failed or (billet_registration_a.why | default('') is string and billet_registration_a.why | default('') | length > 0) }}"
+      - name: next
+        ok: "{{ ('next' not in billet_registration_a) or (billet_registration_a.next is string) }}"
+      # THE ANSWER IS ABOUT THE NODE ASKED FOR, under the incarnation asked for.
+      - name: node
+        ok: "{{ billet_registration_failed or billet_registration_a.node | default('') == billet_registration_node }}"
+      - name: incarnation
+        ok: "{{ billet_registration_failed or billet_registration_a.incarnation | default('') == billet_registration_incarnation }}"
+      - name: deployment
+        ok: "{{ billet_registration_failed or ((billet_registration_a.deployment | default('x')) is mapping and (billet_registration_a.deployment.keys() | list | sort) == ['bound', 'id'] and (billet_registration_a.deployment.bound | default('x') is sameas true) and (billet_registration_a.deployment.id | default('x')) is string and (billet_registration_a.deployment.id | default('')) is match(billet_registration_hex32)) }}"
+      - name: epoch
+        ok: "{{ billet_registration_outcome != 'confirmed' or ((billet_registration_a.epoch | default('x')) is integer and (billet_registration_a.epoch | default(0)) >= 1) }}"
+      - name: live
+        ok: "{{ billet_registration_outcome != 'confirmed' or (billet_registration_a.live | default('x') is sameas true) }}"
+      # THE LAST REGISTRATION SEEN: its incarnation is the one the registering
+      # process presented, which a host from before incarnations presented
+      # as nothing, so the ledger holds it empty and the answer copies it.
+      - name: last
+        ok: "{{ billet_registration_outcome != 'timeout' or ('last' in billet_registration_a and ((billet_registration_a.last is none) or ((billet_registration_a.last is mapping) and (billet_registration_a.last.keys() | list | sort) == ['epoch', 'incarnation', 'live'] and (billet_registration_a.last.incarnation is string) and (billet_registration_a.last.incarnation == '' or billet_registration_a.last.incarnation is match(billet_registration_hex32)) and (billet_registration_a.last.epoch is integer) and (billet_registration_a.last.epoch >= 1) and ((billet_registration_a.last.live is sameas true) or (billet_registration_a.last.live is sameas false))))) }}"
+  ansible.builtin.assert:
+    that:
+      - item.ok | bool
+    fail_msg: >-
+      The registration's confirmation through {{ billet_registration_answered_by }}
+      on {{ billet_migration_controller }} answered with a member this role
+      cannot read: {{ item.name }}. The node was migrated; whether the
+      controller saw it register is not known. Converge again once the
+      controller answers.
+  loop: "{{ billet_registration_checks }}"
+  loop_control:
+    label: "{{ item.name }}"

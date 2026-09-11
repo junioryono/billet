@@ -34,11 +34,14 @@ package state
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -115,6 +118,10 @@ type DB struct {
 	// ATOMIC because a standby clears it at PROMOTION rather than at open, which
 	// is after the handle has been read from — see ClaimController.
 	revalidate atomic.Bool
+
+	// inspect marks a handle opened for a report, whose every write transaction
+	// is refused with ErrInspect. See OpenInspect.
+	inspect bool
 
 	// standby marks a control plane that is waiting to become the controller, and
 	// while it is set every write transaction is refused.
@@ -216,6 +223,12 @@ type openMode struct {
 	// not a NEVER-leader. A standby's only protection is that Tx refuses it.
 	standby bool
 
+	// inspect marks a handle opened for a REPORT, which may validate everything
+	// an open validates and mutate nothing: no directory created or tightened,
+	// no lock, no claim, no migration, no watermark write, and no Tx. See
+	// OpenInspect.
+	inspect bool
+
 	// release is the billet opening the ledger, for the release watermark, or
 	// empty for a caller that named none and gets neither the check nor the
 	// record. See WithRunningRelease.
@@ -231,7 +244,7 @@ type openMode struct {
 // service that then serves it, so a rollback that never reaches that service has
 // nothing to undo.
 func (m openMode) records() bool {
-	return !m.admin && !m.maintenanceProbe && !m.standby
+	return !m.admin && !m.maintenanceProbe && !m.standby && !m.inspect
 }
 
 // with applies the caller's options to a mode.
@@ -241,6 +254,19 @@ func (m openMode) with(opts []OpenOption) openMode {
 	}
 
 	return m
+}
+
+// onOpenSideEffect observes every mutation an open can make on the host or the
+// ledger, named by operation: "mkdir", "chmod", "lock", "integrity", "claim",
+// "migrate" and "watermark". Nil in production; a test sets it to prove an
+// inspection makes none of them, which no assertion on the state afterwards
+// can, since an implementation that mutated and restored would pass that.
+var onOpenSideEffect func(op string)
+
+func noteOpenSideEffect(op string) {
+	if onOpenSideEffect != nil {
+		onOpenSideEffect(op)
+	}
 }
 
 // openDir is the shared body of every entry point.
@@ -256,13 +282,23 @@ func openDir(
 		return nil, err
 	}
 
-	if err := os.MkdirAll(stateDir, 0o700); err != nil {
-		return nil, fmt.Errorf("create state dir %s: %w", stateDir, err)
-	}
-	// MkdirAll leaves an existing directory's mode alone, and this directory will
-	// hold the mTLS CA key. Tighten it rather than inheriting whatever was there.
-	if err := os.Chmod(stateDir, 0o700); err != nil {
-		return nil, fmt.Errorf("tighten state dir %s: %w", stateDir, err)
+	// AN INSPECTION CREATES AND TIGHTENS NOTHING: its caller has already proved
+	// the directory and the ledger exist (requireLedgerFile), and a report that
+	// repaired the directory's mode on its way past would be a report with a
+	// side effect on the host it describes.
+	if !mode.inspect {
+		noteOpenSideEffect("mkdir")
+
+		if err := os.MkdirAll(stateDir, 0o700); err != nil {
+			return nil, fmt.Errorf("create state dir %s: %w", stateDir, err)
+		}
+
+		noteOpenSideEffect("chmod")
+		// MkdirAll leaves an existing directory's mode alone, and this directory will
+		// hold the mTLS CA key. Tighten it rather than inheriting whatever was there.
+		if err := os.Chmod(stateDir, 0o700); err != nil {
+			return nil, fmt.Errorf("tighten state dir %s: %w", stateDir, err)
+		}
 	}
 
 	// ONLY THE TYPED ENTRY crosses the fence. This used to also honor
@@ -282,18 +318,31 @@ func openDir(
 
 	// A NIL LOCK MEANS "SOMEBODY ELSE IS THE CONTROL PLANE HERE", and it is
 	// reachable only for an admin caller. Everything downstream branches on this
-	// one value rather than re-deriving the situation.
-	lock, err := lockDir(stateDir)
+	// one value rather than re-deriving the situation. AN INSPECTION TAKES NO
+	// LOCK AT ALL: it is not a control plane and holds nothing open, so it is
+	// the unlocked, revalidating handle whether or not a control plane is here.
+	var lock *dirLock
 
-	switch {
-	case err == nil:
-	case admin && errors.Is(err, ErrLocked):
-		lock = nil
-	default:
-		return nil, err
+	if !mode.inspect {
+		noteOpenSideEffect("lock")
+
+		held, err := lockDir(stateDir)
+
+		switch {
+		case err == nil:
+			lock = held
+		case admin && errors.Is(err, ErrLocked):
+			lock = nil
+		default:
+			return nil, err
+		}
 	}
 
 	pools, err := be.dataSources()
+	if mode.inspect {
+		pools, err = be.inspectDataSources()
+	}
+
 	if err != nil {
 		return nil, errors.Join(err, lock.release())
 	}
@@ -321,8 +370,9 @@ func openDir(
 		r:                 r,
 		lock:              lock,
 		backend:           be,
-		admin:             admin,
+		admin:             admin || mode.inspect,
 		unlocked:          lock == nil,
+		inspect:           mode.inspect,
 		stateDir:          stateDir,
 		maintenanceBypass: maintenanceBypass,
 		runningRelease:    mode.release,
@@ -360,8 +410,11 @@ func openDir(
 	// `check` — under the shared thirty-second startup budget, so a large or
 	// loaded deployment could lose EVERY live administration command, including
 	// the emergency one. A control plane opens the ledger once and is about to
-	// make scheduling decisions against it; a command is neither.
-	if !admin {
+	// make scheduling decisions against it; a command is neither, and an
+	// inspection is not even that.
+	if !admin && !mode.inspect {
+		noteOpenSideEffect("integrity")
+
 		if err := db.backend.integrityCheck(startupCtx, db.w); err != nil {
 			return nil, errors.Join(err, db.Close())
 		}
@@ -399,7 +452,7 @@ func openDir(
 	// refusing it would make staging one impossible; the migration is the claim's
 	// right, and it happens at promotion.
 	if mode.standby {
-		if err := verifySchemaNotAhead(startupCtx, be, db.Reader()); err != nil {
+		if err := verifySchemaNotAhead(startupCtx, be, db.bareReader()); err != nil {
 			return nil, errors.Join(err, db.Close())
 		}
 
@@ -408,7 +461,23 @@ func openDir(
 		// A STANDBY IS REFUSED AS A DOWNGRADE TOO, and records nothing. What it
 		// would be promoted into is a ledger a newer release has served; that it
 		// waits rather than serves changes nothing about which binary is older.
-		if err := db.enforceReleaseWatermark(startupCtx, mode.release, false); err != nil {
+		if err := db.enforceReleaseWatermark(startupCtx, mode.release); err != nil {
+			return nil, errors.Join(err, db.Close())
+		}
+
+		return db, nil
+	}
+
+	// AN INSPECTION VERIFIES AND NEVER MIGRATES, whatever it finds: no claim is
+	// taken, the schema must be exactly this binary's (a ledger behind it is
+	// ErrSchemaBehind naming the control plane's restart, never a migration the
+	// report performed), and the watermark is checked and never raised.
+	if mode.inspect {
+		if err := db.verifySchema(startupCtx); err != nil {
+			return nil, errors.Join(err, db.Close())
+		}
+
+		if err := db.enforceReleaseWatermark(startupCtx, mode.release); err != nil {
 			return nil, errors.Join(err, db.Close())
 		}
 
@@ -416,6 +485,8 @@ func openDir(
 	}
 
 	if lock != nil {
+		noteOpenSideEffect("claim")
+
 		if err := be.claimController(startupCtx, db); err != nil {
 			// AN OPERATOR COMMAND IS NOT A SECOND CONTROLLER, so a held exclusion
 			// puts it on the same footing as one that could not take the directory
@@ -434,12 +505,14 @@ func openDir(
 			return nil, errors.Join(err, db.Close())
 		}
 
-		if err := db.enforceReleaseWatermark(startupCtx, mode.release, false); err != nil {
+		if err := db.enforceReleaseWatermark(startupCtx, mode.release); err != nil {
 			return nil, errors.Join(err, db.Close())
 		}
 
 		return db, nil
 	}
+
+	noteOpenSideEffect("migrate")
 
 	if err := db.migrate(startupCtx); err != nil {
 		return nil, errors.Join(fmt.Errorf("migrate state db: %w", err), db.Close())
@@ -452,7 +525,7 @@ func openDir(
 	// its own. Recorded here, a newer binary pointed at another deployment's
 	// ledger would raise that ledger's mark on the way to being refused, and
 	// fence its real controller out of its own restart. See openMode.records.
-	if err := db.enforceReleaseWatermark(startupCtx, mode.release, false); err != nil {
+	if err := db.enforceReleaseWatermark(startupCtx, mode.release); err != nil {
 		return nil, errors.Join(err, db.Close())
 	}
 
@@ -501,7 +574,7 @@ func (db *DB) PingContext(ctx context.Context) error {
 		return fmt.Errorf("ping state db: %w", err)
 	}
 
-	return db.backend.verifyDurability(ctx, db.w)
+	return db.backend.verifyDurability(ctx, db.w, db.inspect)
 }
 
 // IntegrityCheck refuses to serve from a corrupt ledger.
@@ -543,7 +616,70 @@ func (db *DB) closeDBs() error {
 }
 
 // Reader returns the query-only pool.
-func (db *DB) Reader() Querier { return db.r }
+//
+// AN INSPECTION HAS NO BARE READER. Its reads are refused here and answered
+// only through View, because on PostgreSQL the pool's read-only default is a
+// session setting a statement can undo (`set_config('default_transaction_read_only',
+// 'off', false)` followed by an UPDATE on the same pooled connection wrote a
+// row, measured 2026-09-09), and only a transaction begun READ ONLY refuses a
+// write whatever the session says. View begins exactly that for an inspection.
+func (db *DB) Reader() Querier {
+	if db.inspect {
+		return inspectReader{r: db.r}
+	}
+
+	return db.bareReader()
+}
+
+// bareReader is the read pool with no transaction around it, for the package's
+// own reads on the open path and the two accounted readers; every call site is
+// listed in TestEveryUntransactedReadIsAccountedFor, because a read outside Tx
+// and View owes the cancellation translation nothing makes for it. An
+// inspection's open path reads through it too: what Reader refuses is the
+// handle's caller, not the open that proves the handle.
+func (db *DB) bareReader() Querier { return db.r }
+
+// inspectReader is the querier an inspection's Reader hands out: every call is
+// refused with ErrInspect. QueryRowContext cannot return an error directly, so
+// the Row it answers with comes from refusalRows, a source that never connects.
+type inspectReader struct{ r *sql.DB }
+
+func (inspectReader) QueryContext(context.Context, string, ...any) (*sql.Rows, error) {
+	return nil, fmt.Errorf("%w: read through View, whose transaction is read-only on every engine",
+		ErrInspect)
+}
+
+func (inspectReader) QueryRowContext(ctx context.Context, _ string, _ ...any) *sql.Row {
+	return refusedRow(ctx)
+}
+
+// errInspectRefusedRow is what a refused QueryRowContext's Scan returns.
+var errInspectRefusedRow = fmt.Errorf("%w: an inspection admits only the named reads sqlc generated, through "+
+	"View; its bare reader is refused", ErrInspect)
+
+// refusalRows is a database that never connects, so a Row carrying the refusal
+// costs no ledger connection: a refused QueryRowContext on a pooled connection
+// would wait for a second connection of the same pool while its View held one,
+// and four Views refusing at once would wait on each other forever.
+var refusalRows = sql.OpenDB(refusingConnector{})
+
+// refusedRow is the Row a refused QueryRowContext answers with; its Scan
+// returns errInspectRefusedRow.
+func refusedRow(ctx context.Context) *sql.Row {
+	//billet:ignore rawsql // not a query: a source that never connects, so the Row the signature demands carries the refusal
+	return refusalRows.QueryRowContext(ctx, "")
+}
+
+type refusingConnector struct{}
+
+func (refusingConnector) Connect(context.Context) (driver.Conn, error) {
+	return nil, errInspectRefusedRow
+}
+func (refusingConnector) Driver() driver.Driver { return refusingDriver{} }
+
+type refusingDriver struct{}
+
+func (refusingDriver) Open(string) (driver.Conn, error) { return nil, errInspectRefusedRow }
 
 // Tx runs fn inside a single write transaction. Every mutation goes through here
 // so that an allocation decision — read current usage, decide, record it — is one
@@ -560,6 +696,13 @@ func (db *DB) Tx(ctx context.Context, fn func(*sql.Tx) error) error {
 	// nothing takes the writer slot on the way to being told no.
 	if db.standby.Load() {
 		return ErrStandby
+	}
+
+	// A REPORT WRITES NOTHING, and the refusal is here for the reason the
+	// standby's is: this is the one choke point every write crosses, and the
+	// read-only connection underneath is the second line rather than the first.
+	if db.inspect {
+		return ErrInspect
 	}
 
 	tx, err := db.beginWrite(ctx)
@@ -640,7 +783,7 @@ func (db *DB) View(ctx context.Context, fn func(Querier) error) error {
 
 	// Deferred, deliberately: the reader takes no write lock, which is the whole
 	// point, and nothing here can be promoted.
-	tx, err := db.r.BeginTx(ctx, nil)
+	tx, err := db.r.BeginTx(ctx, db.readTxOptions())
 	if err != nil {
 		return fmt.Errorf("begin read tx: %w", db.asCancellation(ctx, err))
 	}
@@ -653,16 +796,230 @@ func (db *DB) View(ctx context.Context, fn func(Querier) error) error {
 	// Re-checked for the same reason Tx does it, and it matters here too: a read
 	// against a schema a newer billet has since rebuilt would report rows that no
 	// longer mean what this binary thinks they mean.
+	//
+	// UNDER THE POLICY THE HANDLE WAS ADMITTED WITH. A standby (and the upgrade
+	// probe, which is one) was admitted by verifySchemaNotAhead: a ledger behind
+	// its binary is the follower-first shape it exists for, and the exact check
+	// here refused every read of a stamped candidate over a ledger one migration
+	// behind, at the watermark check inside the open, before the candidate could
+	// claim and migrate. Every other revalidating handle keeps the exact check.
 	if db.revalidate.Load() {
 		if err := db.checkMaintenance(); err != nil {
 			return err
 		}
-		if err := verifySchemaIn(ctx, db.backend, tx); err != nil {
+
+		if db.standby.Load() {
+			if err := verifySchemaNotAhead(ctx, db.backend, tx); err != nil {
+				return db.asCancellation(ctx, err)
+			}
+		} else if err := verifySchemaIn(ctx, db.backend, tx); err != nil {
 			return db.asCancellation(ctx, err)
+		}
+
+		// AN INSPECTION RE-READS THE WATERMARK TOO, as a write transaction does:
+		// a newer release that claimed the same-schema ledger after the report's
+		// open would otherwise be read past, and the report would describe a
+		// ledger a fresh inspection is refused.
+		if db.inspect {
+			if err := db.checkReleaseWatermarkIn(ctx, tx); err != nil {
+				return db.asCancellation(ctx, err)
+			}
 		}
 	}
 
-	return db.asCancellation(ctx, fn(tx))
+	var q Querier = tx
+	if db.inspect {
+		q = inspectQuerier{tx: tx}
+	}
+
+	return db.asCancellation(ctx, fn(q))
+}
+
+// inspectQuerier is what an inspection's View hands its callback: the
+// transaction, admitting ONLY THE NAMED READS sqlc generated.
+//
+// A READ ONLY transaction refuses a write and refuses nothing else: a callback
+// handed the bare transaction could COMMIT it (database/sql would not notice,
+// and the deferred rollback would undo nothing after it), turn the session's
+// read-only default off, and write in autocommit; or take a session advisory
+// lock inside the read-only transaction, which rollback does not release, and
+// so exclude the real controller. So a statement reaches the transaction only
+// when it is EXACTLY one of the statements sqlc generated for ReadOps
+// (generatedReads, learned from the generated code itself), and then, as the
+// shape that set is held to: sqlc's `-- name: X :one|:many` header with X a
+// method of ReadOps (whose every member is classified from its first keyword
+// by TestReadOpsHoldsExactlyTheQueriesThatOnlyRead), a body beginning with
+// SELECT or WITH, and no function that acts on the session rather than the
+// rows. The exact text is the rule; the shape is what the text is held to. A
+// grammar of the text on its own is not enough, because an engine decodes
+// spellings a scanner does not (`U&"pg\005ftry_advisory_lock"` is
+// pg_try_advisory_lock to PostgreSQL). billet's own code cannot issue anything
+// else through this handle without also failing the rawsql gate; this is what
+// makes that a guarantee rather than a convention.
+//
+// A refused QueryRowContext answers with a Row from refusalRows, a source that
+// never connects, so the refusal costs no ledger connection and runs no
+// statement in the transaction (on PostgreSQL a failed statement aborts the
+// transaction it ran in).
+type inspectQuerier struct {
+	tx *sql.Tx
+}
+
+func (q inspectQuerier) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	if err := admitInspectRead(ctx, query); err != nil {
+		return nil, err
+	}
+
+	//billet:ignore rawsql // forwards a statement sqlc generated, after admitInspectRead proved it is one
+	return q.tx.QueryContext(ctx, query, args...)
+}
+
+func (q inspectQuerier) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	if err := admitInspectRead(ctx, query); err != nil {
+		return refusedRow(ctx)
+	}
+
+	//billet:ignore rawsql // forwards a statement sqlc generated, after admitInspectRead proved it is one
+	return q.tx.QueryRowContext(ctx, query, args...)
+}
+
+// sessionEffectFunctions are what a SELECT can do to a PostgreSQL session
+// besides read rows; no generated read names one, which a test in
+// queryset_test.go holds.
+var sessionEffectFunctions = []string{
+	"set_config", "pg_advisory", "pg_try_advisory", "pg_terminate_backend", "pg_cancel_backend",
+	"pg_reload_conf", "pg_sleep", "dblink", "lo_import", "lo_export", "pg_rotate_logfile",
+}
+
+var readOpsType = reflect.TypeOf((*ReadOps)(nil)).Elem()
+
+// generatedReads is the exact text of every statement a ReadOps method runs,
+// learned once by calling each method against a recording adapter: the
+// generated code hands its constant to QueryContext or QueryRowContext, the
+// adapter keeps the text and answers with an error, and the method returns.
+// The context reaches only the adapter's answer, never the recording, so the
+// first caller's context decides nothing about the set.
+var (
+	generatedReadsOnce sync.Once
+	generatedReadSet   map[string]bool
+)
+
+func generatedReads(ctx context.Context) map[string]bool {
+	generatedReadsOnce.Do(func() {
+		seen := map[string]bool{}
+		q := reflect.ValueOf(ledgerdb.New(recordingDBTX{seen: seen}))
+
+		for i := range readOpsType.NumMethod() {
+			fn := q.MethodByName(readOpsType.Method(i).Name)
+			args := make([]reflect.Value, fn.Type().NumIn())
+
+			for j := range args {
+				args[j] = reflect.Zero(fn.Type().In(j))
+			}
+
+			args[0] = reflect.ValueOf(ctx)
+			fn.Call(args)
+		}
+
+		generatedReadSet = seen
+	})
+
+	return generatedReadSet
+}
+
+// recordingDBTX keeps every statement text it is handed and answers nothing.
+type recordingDBTX struct{ seen map[string]bool }
+
+var errRecording = errors.New("state: recording the generated reads")
+
+func (recordingDBTX) ExecContext(context.Context, string, ...any) (sql.Result, error) {
+	return nil, errRecording
+}
+
+func (recordingDBTX) PrepareContext(context.Context, string) (*sql.Stmt, error) {
+	return nil, errRecording
+}
+
+func (r recordingDBTX) QueryContext(_ context.Context, query string, _ ...any) (*sql.Rows, error) {
+	r.seen[query] = true
+
+	return nil, errRecording
+}
+
+func (r recordingDBTX) QueryRowContext(ctx context.Context, query string, _ ...any) *sql.Row {
+	r.seen[query] = true
+
+	return refusedRow(ctx)
+}
+
+// admitInspectRead is the rule above, stated on one statement: the exact
+// generated text first, then the shape that text is held to.
+func admitInspectRead(ctx context.Context, query string) error {
+	if !generatedReads(ctx)[query] {
+		return fmt.Errorf("%w: only the named reads sqlc generated are admitted through an inspection's View, "+
+			"and this statement is not one of them", ErrInspect)
+	}
+
+	first, rest, ok := strings.Cut(query, "\n")
+	if !ok || !strings.HasPrefix(first, "-- name: ") {
+		return fmt.Errorf("%w: only the named reads sqlc generated are admitted, and this statement carries "+
+			"no `-- name:` header", ErrInspect)
+	}
+
+	fields := strings.Fields(strings.TrimPrefix(first, "-- name: "))
+	if len(fields) != 2 || (fields[1] != ":one" && fields[1] != ":many") {
+		return fmt.Errorf("%w: %q is not a `-- name: X :one|:many` header", ErrInspect, first)
+	}
+
+	if _, isRead := readOpsType.MethodByName(fields[0]); !isRead {
+		return fmt.Errorf("%w: %s is not one of the reads ReadOps holds", ErrInspect, fields[0])
+	}
+
+	body := rest
+	for strings.HasPrefix(strings.TrimSpace(body), "--") {
+		_, body, _ = strings.Cut(body, "\n")
+	}
+
+	words := strings.Fields(body)
+	if len(words) == 0 {
+		return fmt.Errorf("%w: %s has no statement after its header", ErrInspect, fields[0])
+	}
+
+	keyword := strings.ToUpper(words[0])
+	if keyword != "SELECT" && keyword != "WITH" {
+		return fmt.Errorf("%w: %s begins with %s, which is not a read", ErrInspect, fields[0], keyword)
+	}
+
+	lowered := strings.ToLower(query)
+	for _, fn := range sessionEffectFunctions {
+		if strings.Contains(lowered, fn) {
+			return fmt.Errorf("%w: %s names %s, which acts on the session rather than the rows", ErrInspect,
+				fields[0], fn)
+		}
+	}
+
+	return nil
+}
+
+// readTxOptions is how a read transaction begins: the engine's default for an
+// ordinary handle, and for an inspection an EXPLICIT READ ONLY transaction at
+// REPEATABLE READ.
+//
+// READ ONLY BECAUSE THE SESSION DEFAULT CAN BE UNDONE: PostgreSQL's
+// default_transaction_read_only is a setting any statement on the connection
+// can turn off, and a transaction begun READ ONLY refuses a write whatever the
+// session says (measured 2026-09-09: an UPDATE after set_config succeeded on a
+// bare connection and was refused with SQLSTATE 25006 inside such a
+// transaction). REPEATABLE READ so the several reads of one report are one
+// snapshot on PostgreSQL, where READ COMMITTED would let a rollout started
+// between two of them appear in one and not the other; SQLite's transaction is
+// a snapshot already and accepts both options (measured on the bundled driver).
+func (db *DB) readTxOptions() *sql.TxOptions {
+	if !db.inspect {
+		return nil
+	}
+
+	return &sql.TxOptions{ReadOnly: true, Isolation: sql.LevelRepeatableRead}
 }
 
 // asCancellation substitutes the caller's context error for a driver's own

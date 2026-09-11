@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "outcome": "refused",
+  "reason": "stopping",
+  "why": "billet-node.service is still stopping (since Tue 2026-09-09 12:00:00 UTC); wait or inspect the drain; nothing to do here",
+  "next": "wait for the stop to complete, then check and approve afresh",
+  "state": "nothing"
+}

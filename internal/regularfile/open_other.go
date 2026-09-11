@@ -5,6 +5,8 @@ package regularfile
 import (
 	"os"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 // openForIdentity has no identity-only open to use: the file is opened read-only
@@ -20,6 +22,14 @@ func openForIdentity(path string, opts Options) (*os.File, error) {
 		flags |= syscall.O_NOFOLLOW
 	}
 	return os.OpenFile(path, flags, 0)
+}
+
+// openIdentityAt is openForIdentity relative to a directory descriptor: a
+// non-blocking read-only open of the entry ITSELF, O_SYMLINK making a link at
+// the name the link's own inode (which Stat reports as a symlink and reopen
+// refuses) rather than an ELOOP or a followed target.
+func openIdentityAt(dirFD int, name string) (int, error) {
+	return unix.Openat(dirFD, name, unix.O_RDONLY|unix.O_SYMLINK|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 }
 
 // pseudoFilesystemName names no filesystem here: the denylist is Linux's.

@@ -49,7 +49,7 @@ func OpenAdmin(ctx context.Context, stateDir string, opts ...OpenOption) (*DB, e
 // database a control plane is actively writing to, and query_only makes that
 // structural rather than a promise.
 func (db *DB) verifySchema(ctx context.Context) error {
-	return verifySchemaIn(ctx, db.backend, db.Reader())
+	return verifySchemaIn(ctx, db.backend, db.bareReader())
 }
 
 // verifySchemaNotAhead is the weaker half of verifySchemaIn, for a STANDBY.

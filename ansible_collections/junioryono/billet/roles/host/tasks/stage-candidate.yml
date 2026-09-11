@@ -1,0 +1,202 @@
+---
+# THE STAGING. This file resolves what this invocation intends for the binary
+# (a supplied file, a pinned release, a channel, or nothing), compares it
+# with what is installed, and, when the binary changes, allocates the
+# transaction's journal and stages the candidate into it. It judges nothing
+# about the guard: the intent against the record, the capability floor, the
+# downgrade and the bootstrap's premise are `billet converge-guard prepare`'s
+# (prepare-exclusion.yml, the second call), under the lock. It runs on EVERY invocation of the role
+# (its facts are per invocation: a host in two plays decides "no change" in
+# the second from the installed digest, and never reuses a completed journal)
+# and resets nothing the classification owns.
+#
+# IN CHECK MODE it resolves and inspects, fetches nothing, allocates nothing
+# and stages nothing, as binary.yml already says of a dry run. ON A MAC it
+# resets and does nothing else: the host role manages no Mac's binary, so a
+# candidate or a pin an inventory carries for the Linux hosts is not staged,
+# fetched or executed there, and a Mac holds through its managed binary.
+
+- name: Reset the transaction facts for this invocation
+  ansible.builtin.set_fact:
+    billet_binary_upgrade: "{{ billet_interrupted_upgrade | default(false) }}"
+    billet_candidate_on_target: false
+    billet_candidate_path: ""
+    billet_candidate_selected: false
+    billet_candidate_binary: {}
+    billet_candidate_source: ""
+
+- name: Inspect the installed billet binary
+  ansible.builtin.stat:
+    path: "{{ billet_exclusion_binary }}"
+    checksum_algorithm: sha256
+  register: billet_installed_binary
+  check_mode: false
+  become: "{{ billet_exclusion_become }}"
+  when: not (billet_exclusion_darwin | default(false) | bool)
+
+- name: Resolve and stage this invocation's candidate
+  when:
+    - not (billet_interrupted_upgrade | default(false))
+    - not (billet_exclusion_darwin | default(false) | bool)
+  block:
+    # billet_binary_src WINS, and says so rather than ignoring the other input
+    # quietly. Overriding a pinned inventory for one run is the supported way
+    # to try a build, so this is a report and not a refusal.
+    - name: Report that a supplied binary overrides the pinned version
+      ansible.builtin.debug:
+        msg: >-
+          billet_binary_src is set, so billet_version {{ billet_version }} is NOT
+          being fetched; the supplied binary is what will be installed.
+      when:
+        - billet_version | length > 0 or billet_release_channel | length > 0
+        - billet_binary_src | length > 0
+
+    # Skipped unless a version or a channel is named AND no binary was
+    # supplied, so an ordinary billet_binary_src host never reaches the network.
+    # NOT GATED ON CHECK MODE: binary.yml refuses a moving pin and reports what
+    # a dry run would fetch, and a gate on the import would skip those with the
+    # fetch (a dry run once admitted `latest` that way).
+    - name: Fetch the pinned billet release onto the target
+      ansible.builtin.import_tasks: binary.yml
+      when:
+        - billet_version | length > 0 or billet_release_channel | length > 0
+        - billet_binary_src | length == 0
+
+    - name: Inspect the supplied candidate billet binary on the controller
+      ansible.builtin.stat:
+        path: "{{ billet_binary_src }}"
+        checksum_algorithm: sha256
+      register: billet_controller_candidate
+      delegate_to: localhost
+      become: false
+      when: billet_binary_src | length > 0
+
+    - name: Inspect the fetched candidate billet binary on the target
+      ansible.builtin.stat:
+        path: "{{ billet_candidate_path | default('') }}"
+        checksum_algorithm: sha256
+      register: billet_target_candidate
+      check_mode: false
+      become: "{{ billet_exclusion_become }}"
+      when:
+        - billet_binary_src | length == 0
+        - billet_candidate_on_target | default(false) | bool
+
+    # ONE name for the candidate from here down, so the transaction is written
+    # once. Which side it came from decides nothing after this point.
+    - name: Resolve the candidate billet binary for this transaction
+      ansible.builtin.set_fact:
+        billet_candidate_selected: >-
+          {{ (billet_binary_src | length > 0) or
+             (billet_candidate_on_target | default(false) | bool) }}
+        billet_candidate_binary: >-
+          {{ billet_controller_candidate if billet_binary_src | length > 0
+             else billet_target_candidate | default({}) }}
+        billet_candidate_source: >-
+          {{ billet_binary_src if billet_binary_src | length > 0
+             else billet_candidate_path | default('') }}
+
+    - name: Refuse a missing or redirected candidate billet binary
+      ansible.builtin.assert:
+        that:
+          - billet_candidate_binary.stat.exists
+          - billet_candidate_binary.stat.isreg
+          - not billet_candidate_binary.stat.islnk | default(false)
+        fail_msg: >-
+          {{ billet_candidate_source }} must name one real regular file so the
+          transaction can bind an immutable journal copy to its inspected digest.
+      when: billet_candidate_selected | bool
+
+    - name: Decide whether the billet binary needs a transactional upgrade
+      ansible.builtin.set_fact:
+        billet_binary_upgrade: >-
+          {{
+            billet_candidate_selected | bool and
+            (
+              not billet_installed_binary.stat.exists or
+              billet_installed_binary.stat.checksum != billet_candidate_binary.stat.checksum
+            )
+          }}
+
+    # THIS ROLE'S TRANSACTION IS THE SQLITE ONE, and refusing here is the
+    # difference between a sentence and a wedged host. The transaction fences
+    # the deployment, SNAPSHOTS the ledger, installs the candidate, and restores
+    # that snapshot if anything fails; an external ledger has no directory to
+    # snapshot. billet's own `billet host-upgrade` carries that shape, and
+    # billet-upgrade.timer runs it on every controller, so a PostgreSQL
+    # controller on automatic updates is upgraded by billet rather than by this
+    # role. REFUSED BEFORE ANYTHING IS ALLOCATED OR HELD; a first install is a
+    # binary change too, which is why the message names installation, and why
+    # the floor applies: the binary a PostgreSQL controller runs is put in place
+    # by the package or by `host-upgrade` at or after the release that carries
+    # the converge guard, BEFORE its first guarded converge.
+    - name: Refuse a transactional binary change against an external ledger
+      ansible.builtin.assert:
+        that:
+          - not (billet_binary_upgrade | default(false))
+        fail_msg: >-
+          This host's ledger is {{ billet_configured_state_backend }} and this
+          role's transaction snapshots a state directory an external ledger does
+          not have. billet upgrades such a host itself: billet-upgrade.timer runs
+          `billet host-upgrade --from-rollout` against the rollout the ledger
+          records, fencing, snapshotting and migrating nothing and letting the
+          candidate migrate when it claims. For a first install, put
+          {{ billet_exclusion_binary }} in place yourself, at or after the release
+          that carries the converge guard, with billet-server and billet-node
+          STOPPED, then converge this role again; with the binary already in place
+          the role does everything else, including the config, the units, the
+          timers and {{ billet_server_environment_path }}. See
+          docs/deploying/postgres-and-active-passive.md.
+      when: billet_configured_state_backend != 'sqlite'
+
+    # A PRE-R MANAGED BINARY ON A POSTGRESQL CONTROLLER is a controller the role
+    # cannot move and cannot hold: refused, naming the same route.
+    - name: Refuse a PostgreSQL controller whose binary predates the guard
+      ansible.builtin.assert:
+        that:
+          - not (billet_exclusion_managed_pre_r | default(false) | bool)
+        fail_msg: >-
+          {{ billet_exclusion_binary }} predates the converge guard, and this host's
+          ledger is {{ billet_configured_state_backend }}, which this role's
+          transaction cannot move. Put a billet at or after the release that carries
+          the converge guard in place by the package or by `billet host-upgrade`,
+          with billet-server and billet-node STOPPED, then converge again.
+      when: billet_configured_state_backend != 'sqlite'
+
+    - name: Stage the candidate for the transaction
+      when:
+        - billet_binary_upgrade | default(false)
+        - not ansible_check_mode
+      block:
+        - name: Allocate the transaction's recovery directory
+          ansible.builtin.import_tasks: allocate-recovery.yml
+
+        - name: Stage the immutable candidate binary inside its recovery journal
+          ansible.builtin.copy:
+            src: "{{ billet_candidate_source }}"
+            remote_src: "{{ billet_binary_src | length == 0 }}"
+            dest: "{{ billet_upgrade_recovery_dir }}/billet.candidate"
+            owner: root
+            group: root
+            mode: "0755"
+          become: true
+
+        - name: Inspect the journaled candidate billet binary
+          ansible.builtin.stat:
+            path: "{{ billet_upgrade_recovery_dir }}/billet.candidate"
+            checksum_algorithm: sha256
+          register: billet_journaled_candidate_binary
+          check_mode: false
+          become: true
+
+        - name: Bind the host transaction to the inspected candidate digest
+          ansible.builtin.assert:
+            that:
+              - billet_journaled_candidate_binary.stat.exists
+              - billet_journaled_candidate_binary.stat.isreg
+              - not billet_journaled_candidate_binary.stat.islnk | default(false)
+              - billet_journaled_candidate_binary.stat.checksum == billet_candidate_binary.stat.checksum
+            fail_msg: >-
+              {{ billet_candidate_source }} changed while the transaction was being
+              prepared. Refusing to upgrade from an artifact other than the one whose
+              digest selected this transaction.

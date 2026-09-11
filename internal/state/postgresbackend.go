@@ -97,6 +97,24 @@ func (b *postgresBackend) dataSources() (ledgerPools, error) {
 	return ledgerPools{writer: writer, reader: reader}, nil
 }
 
+// inspectDataSources is both pools under a read-only default transaction, the
+// reader's own refusal applied to the writer's slot as well, so an inspection
+// cannot write through either.
+func (b *postgresBackend) inspectDataSources() (ledgerPools, error) {
+	if strings.TrimSpace(b.dsn) == "" {
+		return ledgerPools{}, errors.New(
+			"state: the PostgreSQL data source is empty; it is read from the environment " +
+				"variable named by server.state.postgres.dsn_env")
+	}
+
+	inspect, err := registerConn(b.dsn, map[string]string{"default_transaction_read_only": "on"})
+	if err != nil {
+		return ledgerPools{}, err
+	}
+
+	return ledgerPools{writer: inspect, reader: inspect}, nil
+}
+
 // registerConn parses the operator's DSN, adds billet's own startup parameters
 // and hands back the opaque name database/sql should open.
 //
@@ -133,7 +151,7 @@ func registerConn(dsn string, params map[string]string) (string, error) {
 // THE READ-ONLY DEFAULT IS CHECKED ON THE WRITER for the opposite reason: a
 // deployment whose role or database has been set read-only would fail every
 // scheduling write later, one lease at a time, rather than at startup.
-func (*postgresBackend) verifyDurability(ctx context.Context, w *sql.DB) error {
+func (*postgresBackend) verifyDurability(ctx context.Context, w *sql.DB, inspect bool) error {
 	var errs []error
 
 	var synchronous string
@@ -155,7 +173,12 @@ func (*postgresBackend) verifyDurability(ctx context.Context, w *sql.DB) error {
 		return fmt.Errorf("read default_transaction_read_only: %w", err)
 	}
 
-	if strings.EqualFold(readOnly, "on") {
+	// AN INSPECTION'S WRITER IS READ-ONLY BY DESIGN (inspectDataSources), so
+	// the refusal below, which is about a deployment whose role or database has
+	// been set read-only under a control plane, would refuse every healthy
+	// inspection; the setting is still read, so a server answering something
+	// else is noticed.
+	if strings.EqualFold(readOnly, "on") && !inspect {
 		errs = append(errs, errors.New(
 			"default_transaction_read_only is on for the writer, so every scheduling write "+
 				"would be refused; check the role and database settings"))

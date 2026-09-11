@@ -286,6 +286,78 @@ billet_smtp_password: "{{ lookup('env', 'SES_SMTP_PASSWORD') }}"
 # Set it only when the runner is provably not backed by the host being converged.
 billet_allow_converge_from_billet_runner: false
 
+# THE NAME THIS CONVERGE HOLDS EVERY HOST UNDER. A converge that changes a
+# host must not race a rollout's `billet host-upgrade` for the same binaries,
+# so before anything else it HOLDS the host (`billet converge-guard hold`),
+# under this name, and every transaction entry of billet refuses while the
+# guard stands. The name is what a takeover, a release and a recovery are
+# addressed to, so there is no default: the action sets it to its run id, and
+# a laptop exports BILLET_CONVERGE_GUARD_HOLDER or passes
+# -e billet_converge_guard_holder=<name> (which wins). Empty outside check mode
+# refuses before anything is classified; a dry run needs none, because it holds
+# nothing. THE ROLE NEVER RELEASES: the operator releases with the holder they
+# exported, and the preparation prints the command.
+billet_converge_guard_holder: "{{ lookup('env', 'BILLET_CONVERGE_GUARD_HOLDER') }}"
+
+# ONE LINE FOR WHOEVER FINDS THE GUARD, written into its record when this
+# converge acquires it and kept for the guard's life (a later inclusion, a
+# re-binding, a settlement or a takeover never rewrites it): the action writes
+# the run's identity and repository, an operator writes why. Empty writes none.
+# At most 200 bytes of printable text, no newline.
+billet_converge_guard_note: ""
+
+# Seconds a converge-guard command (a status, a hold) may take before it is
+# ended. `timeout -k 10` on Linux; the task's own async bound on a Mac, which
+# has no `timeout`.
+billet_guard_timeout: 60
+
+# THE UPGRADE ROOT AND THE MANAGED BINARY, as the preparation reads them.
+# Empty means the platform's own path (/var/lib/billet/upgrades and
+# /usr/bin/billet on Linux; /usr/local/var/lib/billet/upgrades and
+# /usr/local/bin/billet on a Mac), which billet's own commands are fixed to.
+# They exist so the collection's gates can point the preparation at a
+# temporary tree with a fake billet; a deployment leaves them empty.
+billet_upgrade_root: ""
+billet_managed_binary: ""
+
+# THE NODE'S ENDPOINT MIGRATION, which an ordinary converge that changes
+# `node.server_addr` (or the TLS state that decides the scheme) performs through
+# `billet node migrate-endpoint`, confirms on the controller through `billet
+# rollout registration` and receipts through `billet node receipt` (the role's
+# endpoint-decision, endpoint-migration and endpoint-receipt entries). Seconds
+# throughout. The stop deadline is the migration's own, set from what the
+# fleet's jobs take: the node's drain continues past its DrainTimeout on
+# purpose, and systemd's TimeoutStopSec stays the unit's own bound; a stop the
+# deadline ends leaves the migration unproved and nothing installed or
+# started by it, the unit still stopping under systemd's bound.
+billet_migration_stop_timeout: 3600
+# How long the migration waits for the started node's own record under the
+# new invocation, and the receipt's refresh for a running node's current one.
+billet_migration_record_wait: 120
+billet_receipt_wait: 60
+# How long the controller polls its ledger for the node's registration under
+# the new incarnation.
+billet_registration_wait: 300
+# THE CONTROLLER THAT CONFIRMS: the inventory host the registration is asked
+# on, by default the first host of the fleet playbook's control_plane group.
+# A planned migration without one is refused before anything is stopped.
+billet_migration_controller: "{{ (groups['control_plane'] | default([]) | first) | default('') }}"
+# The platform the exclusion is prepared for: Linux, or Darwin for the fleet
+# playbook's macOS play. From the gathered facts, because the preparation runs
+# before the role's own platform assertion and on a Mac holds without
+# escalation.
+billet_exclusion_platform: "{{ ansible_facts['system'] | default('Linux') }}"
+# The uid that must own the upgrade root and everything the role trusts under
+# it. Empty means the rule: root on Linux, the account converging on a Mac (the
+# launch agent's). A gate sets it to run the trust checks as an ordinary user.
+billet_upgrade_root_owner_uid: ""
+
+# HOW THE TRANSACTION'S RECOVERY DIRECTORY GETS ITS RANDOM SUFFIX: shell source
+# run by `sh -c`, printing exactly eight lowercase hex digits. The allocator
+# runs it inside its retry loop, so two converges that draw one name do not
+# share one journal. A gate replaces it with a recording script.
+billet_recovery_dir_suffix_command: "od -An -N4 -tx1 /dev/urandom | tr -d ' \\n'"
+
 # The unit lookup paths a dry run knows how to scan for drop-ins and aliases.
 # The running manager's own list (Manager.UnitPath) is what is scanned; a path
 # in it that is not listed here refuses the dry run, because the gate cannot

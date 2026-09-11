@@ -191,7 +191,7 @@ func TestAResumeRecoversAClaimThatNeverWroteAJournal(t *testing.T) {
 		t.Fatalf("stageClaim: %v", err)
 	}
 
-	if err := publishClaim(dir); err != nil {
+	if err := publishClaim(openRootForTest(t), dir); err != nil {
 		t.Fatalf("publishClaim: %v", err)
 	}
 
@@ -214,7 +214,7 @@ func TestAResumeRecoversAClaimThatNeverWroteAJournal(t *testing.T) {
 		t.Fatalf("stageClaim: %v", err)
 	}
 
-	if err := publishClaim(fresh); err != nil {
+	if err := publishClaim(openRootForTest(t), fresh); err != nil {
 		t.Errorf("a new upgrade could not claim after the empty one was recovered: %v", err)
 	}
 

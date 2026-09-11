@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "outcome": "unknown",
+  "reason": "unexamined",
+  "why": "read the ledger: the ledger's disk answered EIO"
+}

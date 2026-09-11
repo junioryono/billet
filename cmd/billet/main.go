@@ -111,6 +111,12 @@ func main() {
 			os.Exit(0)
 		}
 
+		// A QUIET EXIT carries a child's status whose output was already
+		// passed through: nothing more is printed.
+		if coded, ok := errors.AsType[*exitError](err); ok && coded.msg == "" {
+			os.Exit(coded.code)
+		}
+
 		fmt.Fprintf(os.Stderr, "billet: %v\n", err)
 		os.Exit(exitStatus(err))
 	}
@@ -156,6 +162,8 @@ func commands(lc *lifecycle) []command {
 			cmdRollout},
 		{"host-upgrade", "replace billet on THIS machine transactionally, with rollback",
 			cmdHostUpgrade},
+		{"converge-guard", "hold the upgrade root's one claim for a converge, so no transaction " +
+			"moves this host under it", cmdConvergeGuard},
 		{"release", "record which signed manifest produced the billet installed here",
 			cmdRelease},
 		{"acceptance", "stand an ISOLATED deployment up beside this one, run a real job on " +
@@ -1489,6 +1497,18 @@ func nodeBundle(cfg *config.Config) (*wirecert.Bundle, error) {
 }
 
 func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
+	// THE NODE'S OWN SUBCOMMANDS, before the role's flags: the endpoint
+	// migration and the receipt are commands about the node this host runs,
+	// invoked by the role and never by the service.
+	if len(args) > 0 {
+		switch args[0] {
+		case "migrate-endpoint":
+			return cmdNodeMigrate(ctx, args[1:])
+		case "receipt":
+			return cmdNodeReceipt(ctx, args[1:])
+		}
+	}
+
 	fs := newFlagSet("billet node")
 	cfgPath := addConfigFlag(fs)
 	enroll := fs.Bool("enroll", false,
@@ -1607,11 +1627,7 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 		tlsConf = identity.ClientTLS(host)
 	}
 
-	client, err := nodeclient.New(nodeclient.Options{
-		Base: cfg.Node.ServerAddr,
-		Node: cfg.Node.Name,
-		TLS:  tlsConf,
-	})
+	client, err := newNodeClientFor(cfg, tlsConf)
 	if err != nil {
 		return err
 	}
@@ -1711,6 +1727,22 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 		DrainTimeout:              drainTimeout,
 		// The second signal, reaching the wait that honours it.
 		Hurry: lc.hurry,
+		// Where the node publishes its registration record after every accepted
+		// registration, for the inspector to read: the one spelling, empty on a
+		// Mac.
+		RegistrationRecordPath: nodeRegistrationRecordPath(hostOS),
+	})
+}
+
+// newNodeClientFor is THE ONE CONSTRUCTION of the node's client from its
+// configuration: the address, the name and the TLS state as the command
+// resolves them, so a fixture that builds the client the way the command does
+// and the command itself cannot disagree about the request base.
+func newNodeClientFor(cfg *config.Config, tlsConf *tls.Config) (*nodeclient.Client, error) {
+	return nodeclient.New(nodeclient.Options{
+		Base: cfg.Node.ServerAddr,
+		Node: cfg.Node.Name,
+		TLS:  tlsConf,
 	})
 }
 
@@ -2815,6 +2847,11 @@ func cmdStatus(ctx context.Context, args []string) error {
 	// a node reporting nothing. `billet rollout status` is the full picture; this
 	// is what says to go and look at it.
 	printRollout(ctx, db)
+
+	// AND THE HOST'S OWN GUARD, read from this host's upgrade root and never
+	// from the ledger: a converge holding this host is why a rollout is refusing
+	// to move it.
+	printGuard()
 
 	// AND WHO THE DEPLOYMENT'S CONTROLLER IS, because the epoch beside it is a
 	// fence rather than a note. Every write is refused once that number moves, so

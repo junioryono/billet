@@ -174,6 +174,36 @@ func verifyLedgerIdentity(ctx context.Context, cfg *config.Config, db *state.DB)
 	return db.VerifyDeploymentBinding(ctx, deployment)
 }
 
+// openStateInspect opens the ledger for a REPORT, through state.OpenInspect: an
+// existing ledger only, nothing created, locked, claimed, migrated or recorded,
+// the schema exactly this binary's and the identity verified. The DSN is the
+// caller's, because a report may be handed the environment file the unit
+// names rather than the process environment.
+func openStateInspect(ctx context.Context, cfg *config.Config, dsn string) (*state.DB, error) {
+	var (
+		db  *state.DB
+		err error
+	)
+
+	if cfg.Server.LedgerBackend() == config.StatePostgres {
+		db, err = state.OpenPostgresInspect(ctx, cfg.Server.IdentityDir, dsn,
+			state.WithRunningRelease(version.Version()))
+	} else {
+		db, err = state.OpenInspect(ctx, cfg.Server.IdentityDir,
+			state.WithRunningRelease(version.Version()))
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	if err := verifyLedgerIdentity(ctx, cfg, db); err != nil {
+		return nil, errors.Join(err, db.Close())
+	}
+
+	return db, nil
+}
+
 // openStateMaintenance opens the ledger for the quiescent upgrade probe, which
 // crosses a host-upgrade fence without admitting operator or workload writes.
 func openStateMaintenance(ctx context.Context, cfg *config.Config) (*state.DB, error) {
