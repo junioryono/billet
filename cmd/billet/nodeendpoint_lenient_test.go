@@ -92,7 +92,17 @@ func TestADryRunParsesTheNodeSectionAloneAndTheActionTheWhole(t *testing.T) {
 			o := f.migrate(t, bad, "--dry-run")
 			mustEndpointRefusal(t, o, outcomeRefused, endpointReasonDesired)
 
-			if !strings.Contains(o.str("why"), "node.provider") {
+			// THE TEST-ONLY PROVIDER is a known one (`simulated` is in the
+			// provider list), so its refusal is the shared one and never the
+			// unknown-provider diagnostic; a node-only judgement without the
+			// shared call would report, and a refusal by the wrong rule would
+			// say "is not one of".
+			want := "node.provider"
+			if provider == "simulated" {
+				want = `provider "simulated" starts no compute and fabricates completions`
+			}
+
+			if !strings.Contains(o.str("why"), want) || (provider == "simulated" && strings.Contains(o.str("why"), "is not one of")) {
 				t.Errorf("why %q", o.str("why"))
 			}
 		})
