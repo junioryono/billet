@@ -783,6 +783,13 @@
       billet_systemd_units.changed | default(false)
   become: true
 
+# THE ENDPOINT MIGRATION, in place of the ordinary restart: the command judges
+# afresh whether the running node dials the installed endpoint and, when it
+# does not, stops and starts it under the migration protocol; a migrated node
+# is not restarted again below.
+- name: Migrate the node's endpoint before the ordinary restart
+  ansible.builtin.import_tasks: endpoint-migration.yml
+
 - name: Restart the billet node after non-binary inputs change
   ansible.builtin.systemd_service:
     name: billet-node.service
@@ -791,6 +798,7 @@
     - billet_node_should_run
     - not ansible_check_mode
     - not billet_binary_upgrade | default(false)
+    - not billet_endpoint_migrated | default(false) | bool
     - >-
       billet_config_install.changed | default(false) or
       billet_firecracker_install.changed | default(false) or
@@ -821,6 +829,11 @@
     - not ansible_check_mode
   become: true
   notify: billet unit files changed
+
+# THE RECEIPT'S REFRESH, after the last task that can start the node: every
+# ordinary converge keeps the receipt current for the running invocation.
+- name: Refresh the node's endpoint receipt after the start
+  ansible.builtin.import_tasks: endpoint-receipt.yml
 
 # Covers BOTH "this host is no longer the control plane" and "it is, but is not
 # commissioned yet". Disabling is what keeps a prepared host from starting the

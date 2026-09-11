@@ -1,0 +1,233 @@
+---
+# THE ENDPOINT MIGRATION, in place of the ordinary node restart, after the
+# render, the units and the environment are installed. RUN WHATEVER THE
+# DECISION SAID: `billet node migrate-endpoint` judges afresh when it acts
+# (the unit observed, the effective endpoint established again, the rendering
+# required to be what is installed) and answers `unchanged` for a node that is
+# not running or one whose record names the installed endpoint, leaving the
+# ordinary restart's gate untouched; otherwise it stops the node under the
+# migration's own deadline (only the command's own `systemctl` is ever
+# signalled; a stop systemd has begun continues under the unit's own
+# TimeoutStopSec), proves the stop by observation, starts the node and waits
+# for the node's own record under the new invocation. It installs nothing: a
+# failed migration's remainder is a configuration already installed while the
+# old invocation still runs or drains, and the next converge re-decides from
+# the running node.
+#
+# THEN THE PROTOCOL'S OTHER TWO HALVES: the controller confirms, through its
+# read-only ledger open, that the node registered under the new incarnation
+# (`rollout registration`, delegated to the controller with its managed
+# binary and, on a PostgreSQL controller, its environment file), and the
+# receipt binds the migration's evidence and the confirmation durably on the
+# node (`node receipt --evidence --confirmation`). The two answers travel as
+# root-owned temporary files the receipt reads strictly, removed on every
+# exit.
+#
+# THE EXECUTABLE: the one that answered the preparation, replaced by the
+# managed binary once this converge's transaction committed the candidate.
+# Skipped on a Mac, in check mode, under the compatibility rule and on a host
+# with no billet, where the decision already said what applies.
+
+- name: Migrate the node's endpoint in place of the ordinary restart
+  when:
+    - not billet_exclusion_darwin | default(false) | bool
+    - not ansible_check_mode
+    - not billet_endpoint_compat | default(false) | bool
+    - not billet_endpoint_no_billet | default(false) | bool
+    - billet_endpoint_answerer | default('') | length > 0
+  vars:
+    billet_endpoint_action_executable: >-
+      {{ billet_exclusion_binary if billet_binary_upgrade | default(false) | bool else billet_endpoint_answerer }}
+    billet_endpoint_action_bound: >-
+      {{ (billet_migration_stop_timeout | int) + (billet_migration_record_wait | int) + (billet_guard_timeout | int) }}
+  block:
+    - name: Run the endpoint migration
+      ansible.builtin.command:
+        argv: >-
+          {{ ['timeout', '-k', '10', billet_endpoint_action_bound | string,
+              billet_endpoint_action_executable, 'node', 'migrate-endpoint', '--config', '/etc/billet/billet.yaml',
+              '--desired', '-', '--stop-timeout', (billet_migration_stop_timeout | string) ~ 's',
+              '--wait', (billet_migration_record_wait | string) ~ 's', '--json'] }}
+        stdin: "{{ billet_endpoint_rendering }}"
+        expand_argument_vars: false
+      register: billet_endpoint_action
+      changed_when: false
+      failed_when: false
+      become: true
+      no_log: true
+
+    - name: Judge the endpoint migration's answer
+      ansible.builtin.import_tasks: endpoint-answer.yml
+      vars:
+        billet_endpoint_raw: "{{ billet_endpoint_action }}"
+        billet_endpoint_call: action
+        billet_endpoint_answered_by: "{{ billet_endpoint_action_executable }}"
+
+    # A refusal names the state the host was left in: `nothing` (nothing
+    # stopped), `started` (the node restarted and registered, the receipt
+    # owed) or `started-no-record` (restarted, its record not seen within the
+    # wait); an unproved stop leaves the unit stopping under systemd's bound.
+    - name: Refuse the migration's answer
+      ansible.builtin.assert:
+        that:
+          - billet_endpoint_answer.outcome in ['unchanged', 'migrated']
+        fail_msg: >-
+          The endpoint migration through {{ billet_endpoint_action_executable }}
+          {{ 'was refused' if billet_endpoint_answer.outcome == 'refused' else 'could not be proved' }}
+          ({{ billet_endpoint_answer.reason | default('no reason') }}, the host left with
+          {{ billet_endpoint_answer.state | default('nothing') }} done):
+          {{ billet_endpoint_answer.why | default('no reason') }}.
+          {{ ('Next: ' ~ billet_endpoint_answer.next ~ '.') if (billet_endpoint_answer.next | default('') | length > 0) else '' }}
+
+    - name: Report an unchanged endpoint
+      ansible.builtin.debug:
+        msg: >-
+          The node's endpoint is unchanged
+          {{ '(the record names the installed endpoint ' ~ billet_endpoint_answer.endpoint ~ ')' if billet_endpoint_answer.record == 'current'
+             else ('(no node is running; the ordinary start starts it on ' ~ (billet_endpoint_answer.endpoint | default('the installed endpoint', true)) ~ ')' if billet_endpoint_answer.record == 'none'
+             else '(the node unit was observed without a record to read: ' ~ billet_endpoint_answer.record ~ ')') }};
+          nothing was stopped.
+      when: billet_endpoint_answer.outcome == 'unchanged'
+
+    - name: Confirm and receipt the migration
+      when: billet_endpoint_answer.outcome == 'migrated'
+      vars:
+        billet_registration_executable: >-
+          {{ hostvars[billet_migration_controller].billet_managed_binary | default('', true)
+             if hostvars[billet_migration_controller].billet_managed_binary | default('', true) | length > 0
+             else '/usr/bin/billet' }}
+        billet_registration_environment: >-
+          {{ (hostvars[billet_migration_controller].billet_server_environment | default({})) | length > 0 }}
+      block:
+        - name: Keep the migration's evidence for the receipt
+          ansible.builtin.tempfile:
+            state: file
+            prefix: billet-endpoint-evidence-
+          register: billet_endpoint_evidence_file
+          become: true
+
+        - name: Write the migration's evidence
+          ansible.builtin.copy:
+            content: "{{ billet_endpoint_action.stdout }}\n"
+            dest: "{{ billet_endpoint_evidence_file.path }}"
+            owner: root
+            group: root
+            mode: "0600"
+          become: true
+          no_log: true
+
+        # THE CONTROLLER'S CONFIRMATION, on the controller: one snapshot at a
+        # time through the read-only open, the binding judged at every poll,
+        # until the node's current registration carries the new incarnation.
+        - name: Confirm the node's registration on the controller
+          ansible.builtin.command:
+            argv: >-
+              {{ ['timeout', '-k', '10', ((billet_registration_wait | int) + (billet_guard_timeout | int)) | string,
+                  billet_registration_executable, 'rollout', 'registration', '--config', '/etc/billet/billet.yaml',
+                  '--node', billet_endpoint_answer.node, '--incarnation', billet_endpoint_answer.incarnation,
+                  '--wait', (billet_registration_wait | string) ~ 's', '--json']
+                 + (['--environment-file', billet_server_environment_path] if billet_registration_environment | bool else []) }}
+            expand_argument_vars: false
+          delegate_to: "{{ billet_migration_controller }}"
+          register: billet_registration_raw
+          changed_when: false
+          failed_when: false
+          become: true
+          no_log: true
+
+        - name: Judge the registration's confirmation
+          ansible.builtin.import_tasks: registration-answer.yml
+          vars:
+            billet_registration_node: "{{ billet_endpoint_answer.node }}"
+            billet_registration_incarnation: "{{ billet_endpoint_answer.incarnation }}"
+            billet_registration_answered_by: "{{ billet_registration_executable }}"
+
+        - name: Refuse an unconfirmed registration
+          ansible.builtin.assert:
+            that:
+              - billet_registration_answer.outcome == 'confirmed'
+            fail_msg: >-
+              The controller {{ billet_migration_controller }} did not confirm the migrated node's
+              registration under incarnation {{ billet_endpoint_answer.incarnation }}:
+              {{ 'the wait of ' ~ billet_registration_wait ~ 's ended with the node\'s current registration '
+                 ~ (('under incarnation ' ~ billet_registration_answer.last.incarnation ~ ' (epoch ' ~ billet_registration_answer.last.epoch ~ ', ' ~ ('live' if billet_registration_answer.last.live else 'not live') ~ ')')
+                    if billet_registration_answer.last | default(none) is not none else 'absent')
+                 if billet_registration_answer.outcome == 'timeout'
+                 else ((billet_registration_answer.reason | default('no reason')) ~ ': ' ~ (billet_registration_answer.why | default('no reason'))) }}.
+              The node is running on {{ billet_endpoint_answer.to }}; no receipt was written. Converge again once it has registered: the refresh receipts a registered node.
+
+        - name: Keep the registration's confirmation for the receipt
+          ansible.builtin.tempfile:
+            state: file
+            prefix: billet-endpoint-confirmation-
+          register: billet_endpoint_confirmation_file
+          become: true
+
+        - name: Write the registration's confirmation
+          ansible.builtin.copy:
+            content: "{{ billet_registration_raw.stdout }}\n"
+            dest: "{{ billet_endpoint_confirmation_file.path }}"
+            owner: root
+            group: root
+            mode: "0600"
+          become: true
+          no_log: true
+
+        # THE RECEIPT, durably, bound to the running node's own record read
+        # again under the bracket; the command answers `current` when a valid
+        # receipt already says this.
+        - name: Write the migration's receipt
+          ansible.builtin.command:
+            argv: >-
+              {{ ['timeout', '-k', '10', ((billet_receipt_wait | int) + (billet_guard_timeout | int)) | string,
+                  billet_endpoint_action_executable, 'node', 'receipt',
+                  '--evidence', billet_endpoint_evidence_file.path, '--confirmation', billet_endpoint_confirmation_file.path,
+                  '--config', '/etc/billet/billet.yaml', '--run', billet_exclusion_holder, '--json'] }}
+            expand_argument_vars: false
+          register: billet_receipt_raw
+          changed_when: billet_receipt_raw.rc == 0
+          failed_when: false
+          become: true
+          no_log: true
+
+        - name: Judge the migration's receipt
+          ansible.builtin.import_tasks: receipt-answer.yml
+          vars:
+            billet_receipt_call: evidence
+            billet_receipt_dry: false
+            billet_receipt_answered_by: "{{ billet_endpoint_action_executable }}"
+            billet_receipt_run: "{{ billet_exclusion_holder }}"
+
+        - name: Refuse the migration's receipt
+          ansible.builtin.assert:
+            that:
+              - billet_receipt_answer.outcome in ['written', 'current']
+            fail_msg: >-
+              The migration's receipt through {{ billet_endpoint_action_executable }}
+              {{ 'was refused' if billet_receipt_answer.outcome == 'refused' else 'could not be written' }}
+              ({{ billet_receipt_answer.reason | default('no reason') }}):
+              {{ billet_receipt_answer.why | default('no reason') }}.
+              {{ ('Next: ' ~ billet_receipt_answer.next ~ '.') if (billet_receipt_answer.next | default('') | length > 0) else '' }}
+              The node is running on {{ billet_endpoint_answer.to }} and registered; converge again, the refresh writes the receipt.
+
+        - name: Note that the node was migrated
+          ansible.builtin.set_fact:
+            billet_endpoint_migrated: true
+
+        - name: Report the migration
+          ansible.builtin.debug:
+            msg: >-
+              The node {{ billet_endpoint_answer.node }} was migrated from {{ billet_endpoint_answer.from }}
+              to {{ billet_endpoint_answer.to }} (invocation {{ billet_endpoint_answer.invocation_id }},
+              incarnation {{ billet_endpoint_answer.incarnation }}), its registration confirmed by
+              {{ billet_migration_controller }} at epoch {{ billet_registration_answer.epoch }}, and its receipt
+              {{ billet_receipt_answer.outcome }}.
+      always:
+        - name: Remove the migration's temporary files
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: absent
+          loop: >-
+            {{ ([billet_endpoint_evidence_file.path] if billet_endpoint_evidence_file.path is defined else [])
+               + ([billet_endpoint_confirmation_file.path] if billet_endpoint_confirmation_file.path is defined else []) }}
+          become: true

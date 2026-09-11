@@ -143,6 +143,10 @@
 # THE CLAIM'S FACTS START AT NONE for a run that holds nothing yet, on every
 # path (a dry run's included, because the tasks after the preparation read
 # them); an answer below sets them, and a run that held keeps what it learned.
+- name: Start the executable that answers for this converge at none
+  ansible.builtin.set_fact:
+    billet_exclusion_answerer: ""
+
 - name: Start the claim's facts at none
   ansible.builtin.set_fact:
     billet_upgrade_claim_shape: "{{ billet_upgrade_claim_shape | default('none') if billet_exclusion_held | default(false) else 'none' }}"
@@ -1075,3 +1079,19 @@
                  else (('`' ~ (billet_exclusion_executable | default(billet_exclusion_binary)) ~ ' converge-guard recover --unpublished` removes it when it holds nothing but the publication\'s temporary; anything else is for the operator to inspect.')
                        if billet_exclusion_remainder_word == 'unpublished-guard'
                        else ('inspect the host by hand.' if billet_exclusion_remainder_word == 'unknown' else '')) }}
+
+# THE EXECUTABLE THAT ANSWERS FOR THIS CONVERGE, for the entries after the
+# preparation (the endpoint decision, the migration and the receipt): the one
+# that answered the preparation's calls (the managed binary, the verified
+# fallback or the candidate that answered the first call), in a dry run the
+# one that answered the report, and NONE under the legacy shape, a pre-R
+# managed binary with no candidate, or a host with no billet, where those
+# entries say what applies without asking.
+- name: Note the executable that answers for this converge
+  ansible.builtin.set_fact:
+    billet_exclusion_answerer: >-
+      {{ (billet_exclusion_executable | default(''))
+         if not ansible_check_mode
+         else (((billet_exclusion_fallback_executable | default('')) if billet_exclusion_dry_via_record | default(false) | bool
+                else billet_exclusion_binary)
+               if billet_exclusion_dry_answered | default(false) | bool else '') }}

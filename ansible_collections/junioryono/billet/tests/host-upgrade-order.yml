@@ -276,6 +276,14 @@
           - billet_handler_names.index('Inspect whether the manager reports a pending reload after unit-file changes') < billet_handler_names.index('Reload systemd after the role\'s own unit-file changes')
           - billet_account_names.index('Refuse an implicit installed service identity migration') < billet_account_names.index('Create the billet service group')
           - billet_account_names.index('Refuse an implicit installed service identity migration') < billet_account_names.index('Create billet directories')
+          # THE ENDPOINT DECISION precedes the staging and the render in account.yml, whose import precedes services.yml's transaction in main.yml (pinned below), so a planned change is refused before the first stop; the migration precedes the ordinary node restart and the receipt follows the node's start.
+          - billet_account_names.index('Decide the node\'s endpoint migration before the render') < billet_account_names.index('Stage candidate configuration for the upgrade transaction')
+          - billet_account_names.index('Decide the node\'s endpoint migration before the render') < billet_account_names.index('Render billet configuration')
+          - billet_account_names.index('Read the installed billet configuration') < billet_account_names.index('Decide the node\'s endpoint migration before the render')
+          - billet_top_level_names.index('Migrate the node\'s endpoint before the ordinary restart') < billet_top_level_names.index('Restart the billet node after non-binary inputs change')
+          - billet_top_level_names.index('Enable and start the billet node') < billet_top_level_names.index('Refresh the node\'s endpoint receipt after the start')
+          - billet_top_level_names.index('Refresh the node\'s endpoint receipt after the start') < billet_top_level_names.index('Stop and disable the billet node unless it may run here')
+          - "'not billet_endpoint_migrated | default(false) | bool' in (billet_host_service_tasks | selectattr('name', 'equalto', 'Restart the billet node after non-binary inputs change') | first).when"
           - billet_account_names.index('Refuse to move installed billet state implicitly') < billet_account_names.index('Render billet configuration')
           - billet_stage_inner_names.index("Allocate the transaction's recovery directory") < billet_stage_inner_names.index('Stage the immutable candidate binary inside its recovery journal')
           - billet_stage_inner_names.index('Stage the immutable candidate binary inside its recovery journal') < billet_stage_inner_names.index('Bind the host transaction to the inspected candidate digest')

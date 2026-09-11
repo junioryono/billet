@@ -311,6 +311,29 @@ billet_guard_timeout: 60
 # temporary tree with a fake billet; a deployment leaves them empty.
 billet_upgrade_root: ""
 billet_managed_binary: ""
+
+# THE NODE'S ENDPOINT MIGRATION, which an ordinary converge that changes
+# `node.server_addr` (or the TLS state that decides the scheme) performs through
+# `billet node migrate-endpoint`, confirms on the controller through `billet
+# rollout registration` and receipts through `billet node receipt` (the role's
+# endpoint-decision, endpoint-migration and endpoint-receipt entries). Seconds
+# throughout. The stop deadline is the migration's own, set from what the
+# fleet's jobs take: the node's drain continues past its DrainTimeout on
+# purpose, and systemd's TimeoutStopSec stays the unit's own bound; a stop the
+# deadline ends leaves the migration unproved and nothing installed or
+# started by it, the unit still stopping under systemd's bound.
+billet_migration_stop_timeout: 3600
+# How long the migration waits for the started node's own record under the
+# new invocation, and the receipt's refresh for a running node's current one.
+billet_migration_record_wait: 120
+billet_receipt_wait: 60
+# How long the controller polls its ledger for the node's registration under
+# the new incarnation.
+billet_registration_wait: 300
+# THE CONTROLLER THAT CONFIRMS: the inventory host the registration is asked
+# on, by default the first host of the fleet playbook's control_plane group.
+# A planned migration without one is refused before anything is stopped.
+billet_migration_controller: "{{ (groups['control_plane'] | default([]) | first) | default('') }}"
 # The platform the exclusion is prepared for: Linux, or Darwin for the fleet
 # playbook's macOS play. From the gathered facts, because the preparation runs
 # before the role's own platform assertion and on a Mac holds without

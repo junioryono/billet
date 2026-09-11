@@ -521,6 +521,12 @@
   loop_control:
     label: "{{ item.name }}"
 
+# THE ENDPOINT DECISION, before the configuration is staged or rendered and
+# before the transaction's first stop: what the running node dials against what
+# the render would install, judged by the command over the rendering on stdin.
+- name: Decide the node's endpoint migration before the render
+  ansible.builtin.import_tasks: endpoint-decision.yml
+
 - name: Stage candidate configuration for the upgrade transaction
   ansible.builtin.template:
     src: billet.yaml.j2
