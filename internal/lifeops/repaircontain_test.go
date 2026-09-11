@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -31,13 +32,45 @@ func TestRepairRootKeepsANestedTargetInsideTheDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	beforeStat, ok := before.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatal("no ownership in the stat")
+	}
+
 	h := newHost(t)
 	c, _ := h.converger(t, healthyHost(t, h))
 	c.repairRoot = openRepairRoot
 
-	if _, err := c.RepairPaths(dir, []RepairTarget{{Name: "ca/ca.key"}}, 990, 991); err == nil {
+	// THE REFUSAL IS THE OPEN'S, not the owner's: the vulnerable open reaches the
+	// outside file and repairOne then refuses its owner, which an assertion on
+	// "an error happened" would accept. The message must say the open was
+	// declined and must not be the ownership diagnostic.
+	_, err = c.RepairPaths(dir, []RepairTarget{{Name: "ca/ca.key"}}, 990, 991)
+	if err == nil {
 		t.Fatal("a nested target reached through a symlinked parent was opened; as root that would " +
 			"have chowned another directory's key")
+	}
+
+	if strings.Contains(err.Error(), "neither root nor the service account") {
+		t.Fatalf("the symlinked parent was FOLLOWED and the outside file refused for its owner instead: %v", err)
+	}
+
+	if !strings.Contains(err.Error(), "open") {
+		t.Errorf("the refusal does not say the open was declined: %v", err)
+	}
+
+	// The production root itself refuses the nested open, before any check.
+	root, err := openRepairRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer func() { _ = root.Close() }()
+
+	if f, err := root.OpenRegular("ca/ca.key"); err == nil {
+		_ = f.Close()
+
+		t.Fatal("OpenRegular followed the symlinked parent out of the directory")
 	}
 
 	after, err := os.Stat(victim)
@@ -45,8 +78,15 @@ func TestRepairRootKeepsANestedTargetInsideTheDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !os.SameFile(before, after) || after.Mode() != before.Mode() {
-		t.Errorf("the outside file changed: %v became %v", before.Mode(), after.Mode())
+	afterStat, ok := after.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatal("no ownership in the stat")
+	}
+
+	if !os.SameFile(before, after) || after.Mode() != before.Mode() ||
+		afterStat.Uid != beforeStat.Uid || afterStat.Gid != beforeStat.Gid {
+		t.Errorf("the outside file changed: %v %d:%d became %v %d:%d", before.Mode(), beforeStat.Uid,
+			beforeStat.Gid, after.Mode(), afterStat.Uid, afterStat.Gid)
 	}
 
 	// A NESTED TARGET UNDER A REAL DIRECTORY IS REACHED: the refusal above is the
