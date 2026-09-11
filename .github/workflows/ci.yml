@@ -242,6 +242,15 @@ jobs:
     # minutes after the two connector gates and the fleet gate joined it
     # (measured 2026-09-06, 15m03s with every gate green until the cap).
     timeout-minutes: 30
+    # THE COLLECTION'S GATES RUN WITH NO RUNNER_NAME, which every gate but the
+    # guard's own assumes (converge-guard-check.sh says so, and sets the name
+    # it tests itself): their plays converge the throwaway machine the job runs
+    # on, and the converge guard refuses a play driven from a runner named
+    # billet-*, which on the reference deployment's fleet every runner is.
+    # RUNNER_* variables cannot be overridden by env:, so the shell drops it.
+    defaults:
+      run:
+        shell: env -u RUNNER_NAME bash -e {0}
     steps:
       - uses: actions/checkout@v6
 
