@@ -190,7 +190,7 @@ if [ -z "${BILLET_GATE_LOG:-}" ] && [ -r /var/lib/billet-gate.env ]; then . /var
 log=${BILLET_GATE_LOG:-/dev/null}
 priv=${BILLET_GATE_PRIVATE:-/dev/null}
 cmd=${1:-}
-if [ "$cmd" = converge-guard ]; then cmd="${2:-}"; fi
+case "$cmd" in converge-guard|node|rollout) cmd="${2:-}" ;; esac
 n=1
 if [ -f "$priv" ]; then n=$(( $(grep -c "^call=$cmd\$" "$priv" || true) + 1 )); fi
 printf 'call=%s\n' "$cmd" >>"$priv"
@@ -265,7 +265,7 @@ WRAP
 log=${BILLET_GATE_LOG:-/dev/null}
 priv=${BILLET_GATE_PRIVATE:-/dev/null}
 cmd=${1:-}
-if [ "$cmd" = converge-guard ]; then cmd="${2:-}"; fi
+case "$cmd" in converge-guard|node|rollout) cmd="${2:-}" ;; esac
 n=1
 if [ -f "$priv" ]; then n=$(( $(grep -c "^call=$cmd\$" "$priv" || true) + 1 )); fi
 printf 'call=%s\n' "$cmd" >>"$priv"
@@ -282,19 +282,28 @@ case "$failspec" in
   "$cmd:$n:exit:"*) forced_exit="${failspec#"$cmd:$n:exit:"}" ;;
   "$cmd:crash:"*) export BILLET_GUARD_CRASH_AT="${failspec#"$cmd:crash:"}" ;;
 esac
-out=$(mktemp); err=$(mktemp)
-"$BACKING" "$@" >"$out" 2>"$err"
-status=$?
-printf 'backing=1 cmd=%s status=%s\n' "$cmd" "$status" >>"$priv"
-{ printf '=== %s:%s stdout\n' "$cmd" "$n"; cat "$out"; printf '=== %s:%s stderr\n' "$cmd" "$n"; cat "$err"; printf '=== end\n'; } >>"$priv"
-cat "$err" >&2
-drop=${BILLET_GATE_DROP_ANSWER:-}
-if [ "$drop" = "$cmd:$n" ]; then rm -f "$out" "$err"; exit "$status"; fi
 substituted=""
 IFS=';' read -r -a specs <<<"${BILLET_GATE_ANSWER:-}"
 for spec in "${specs[@]+"${specs[@]}"}"; do
   case "$spec" in "$cmd:$n:"*) substituted="${spec#"$cmd:$n:"}" ;; esac
 done
+out=$(mktemp); err=$(mktemp)
+endpoint_answer=0
+case "$cmd" in migrate-endpoint|receipt|registration) [ -n "$substituted" ] && endpoint_answer=1 ;; esac
+if [ "$endpoint_answer" = 1 ]; then
+  # AN ENDPOINT ANSWER STANDS IN FOR THE BACKING RUN: the fixture is the
+  # command's own, and its outcome decides the exit as the command does.
+  case "$(basename "$substituted")" in refused-*) status=2 ;; unknown*|timeout*) status=3 ;; *) status=0 ;; esac
+  printf 'backing=0 cmd=%s substituted=%s status=%s\n' "$cmd" "$(basename "$substituted")" "$status" >>"$priv"
+else
+  "$BACKING" "$@" >"$out" 2>"$err"
+  status=$?
+  printf 'backing=1 cmd=%s status=%s\n' "$cmd" "$status" >>"$priv"
+  { printf '=== %s:%s stdout\n' "$cmd" "$n"; cat "$out"; printf '=== %s:%s stderr\n' "$cmd" "$n"; cat "$err"; printf '=== end\n'; } >>"$priv"
+  cat "$err" >&2
+fi
+drop=${BILLET_GATE_DROP_ANSWER:-}
+if [ "$drop" = "$cmd:$n" ]; then rm -f "$out" "$err"; exit "$status"; fi
 if [ -n "$substituted" ]; then
   # THE REAL ANSWER'S ID, where the substitute asks for it: a second-call
   # corruption that carried another id would be refused for the id and
@@ -339,6 +348,7 @@ FAKE
   fi
   cat >"$fakes/$tool" <<FAKE
 #!/bin/sh
+if [ -z "\${BILLET_GATE_LOG:-}" ] && [ -r /var/lib/billet-gate.env ]; then . /var/lib/billet-gate.env; fi
 if [ "$tool" = systemctl ] && [ "\${1:-}" = --version ]; then exec "$real" "\$@"; fi
 printf 'role=$tool\nargv0=%s\nargv=%s\nuid=%s\n---\n' "\$0" "\$*" "\$(id -u)" >>"\${BILLET_GATE_LOG:-/dev/null}"
 FAKE
@@ -360,7 +370,8 @@ exec "$real" "\$@"
 FAKE
       ;;
     systemctl)
-      echo 'echo "systemctl was called by the preparation" >&2; exit 97' >>"$fakes/$tool" ;;
+      printf '%s\n' 'if [ "${1:-}" = show ] && [ -n "${BILLET_GATE_UNIT_SHOW:-}" ]; then cat "$BILLET_GATE_UNIT_SHOW"; exit 0; fi' \
+        'echo "systemctl was called by the preparation" >&2; exit 97' >>"$fakes/$tool" ;;
     *)
       echo "exec \"$real\" \"\$@\"" >>"$fakes/$tool" ;;
   esac
@@ -521,6 +532,97 @@ PLAY
 PLAY
   gate_play_body
 } >"$work/play2.yml"
+
+# THE ENDPOINT PLAY: the real preparation, the two reads of the installed
+# configuration the account file makes, the three entries, and between the
+# decision and the migration the render's effect (the rendering the decision
+# judged, installed with the render's mode). The account and service files'
+# own tasks are not run here: the order test pins the entries' positions
+# among them, and the preparation's cases above prove the exclusion the
+# entries run under.
+cat >"$work/play-endpoint.yml" <<'PLAY'
+---
+- name: Exercise the endpoint entries
+  hosts: billet_hosts
+  gather_facts: "{{ billet_gate_facts | default(false) | bool }}"
+  tasks:
+    - name: The case
+      block:
+        - name: Prepare the exclusion
+          ansible.builtin.include_role:
+            name: junioryono.billet.host
+            tasks_from: prepare-exclusion
+
+        - name: Inspect the installed billet configuration
+          ansible.builtin.stat:
+            path: /etc/billet/billet.yaml
+          register: billet_installed_config
+          check_mode: false
+          become: true
+
+        - name: Read the installed billet configuration
+          ansible.builtin.slurp:
+            src: /etc/billet/billet.yaml
+          register: billet_previous_config_file
+          become: true
+          when: billet_installed_config.stat.exists
+
+        - name: Decide the endpoint migration
+          ansible.builtin.include_role:
+            name: junioryono.billet.host
+            tasks_from: endpoint-decision
+
+        - name: Establish the configuration directory as the account file would
+          ansible.builtin.file:
+            path: /etc/billet
+            state: directory
+            owner: root
+            group: root
+            mode: "0750"
+          become: true
+          when:
+            - not ansible_check_mode
+            - billet_endpoint_rendering | default('') | length > 0
+
+        - name: Install the rendering as the render would
+          ansible.builtin.copy:
+            content: "{{ billet_endpoint_rendering }}"
+            dest: /etc/billet/billet.yaml
+            owner: root
+            group: root
+            mode: "0640"
+          become: true
+          when:
+            - not ansible_check_mode
+            - billet_endpoint_rendering | default('') | length > 0
+
+        - name: Migrate the endpoint
+          ansible.builtin.include_role:
+            name: junioryono.billet.host
+            tasks_from: endpoint-migration
+
+        - name: Refresh the receipt
+          ansible.builtin.include_role:
+            name: junioryono.billet.host
+            tasks_from: endpoint-receipt
+      always:
+        - name: Report the facts the gate reads
+          ansible.builtin.debug:
+            msg: >-
+              GATE shape={{ billet_upgrade_claim_shape | default('undef') }}
+              upgrade={{ billet_binary_upgrade | default('undef') }}
+              held={{ billet_exclusion_held | default('undef') }}
+              route={{ billet_exclusion_route | default('undef') }}
+              answerer={{ billet_exclusion_answerer | default('undef') }}
+              planned={{ billet_endpoint_planned | default('undef') }}
+              from={{ billet_endpoint_from | default('undef') }}
+              to={{ billet_endpoint_to | default('undef') }}
+              record={{ billet_endpoint_record | default('undef') }}
+              compat={{ billet_endpoint_compat | default('undef') }}
+              nobillet={{ billet_endpoint_no_billet | default('undef') }}
+              migrated={{ billet_endpoint_migrated | default('undef') }}
+              end=.
+PLAY
 
 cat >"$work/probe.yml" <<'PLAY'
 ---
@@ -902,9 +1004,11 @@ set -u
 case_dir=$1; mode=$2; play=$3
 export BINS PYTHON FAKES ROOT=/var/lib/billet/upgrades
 mount -t tmpfs tmpfs "$MNT" || exit 90
-mkdir -p "$MNT/ub-upper" "$MNT/ub-work" "$MNT/vl-upper" "$MNT/vl-work" "$MNT/bin"
+mkdir -p "$MNT/ub-upper" "$MNT/ub-work" "$MNT/vl-upper" "$MNT/vl-work" "$MNT/etc-upper" "$MNT/etc-work" "$MNT/bin"
 mount -t overlay overlay -o "lowerdir=/usr/bin,upperdir=$MNT/ub-upper,workdir=$MNT/ub-work" /usr/bin || exit 91
 mount -t overlay overlay -o "lowerdir=/var/lib,upperdir=$MNT/vl-upper,workdir=$MNT/vl-work" /var/lib || exit 92
+mount -t overlay overlay -o "lowerdir=/etc,upperdir=$MNT/etc-upper,workdir=$MNT/etc-work" /etc || exit 93
+rm -rf /etc/billet
 cp "$BINS"/billet-v* "$MNT/bin/" && chmod 0755 "$MNT/bin"/* && chown root:root "$MNT/bin"/*
 rm -f /usr/bin/billet
 rm -rf /var/lib/billet
@@ -984,7 +1088,10 @@ PY
     echo "recovery=$(basename "$d") $( [ -f "$d/billet.candidate" ] && sha256sum "$d/billet.candidate" | cut -d' ' -f1 )"
   done
   echo "status_json=$("$MNT/bin/billet-v0.10.0" converge-guard status --json 2>/dev/null | tr -d '\n ')"
+  echo "config=$(t /etc/billet/billet.yaml)"
+  echo "tempfiles=$(ls /tmp 2>/dev/null | grep -c '^billet-endpoint-' || true)"
 } >"$case_dir/state" 2>/dev/null
+[ -f /etc/billet/billet.yaml ] && cp /etc/billet/billet.yaml "$case_dir/installed.yaml"
 mkdir -p "$case_dir/upper" && cp -a "$MNT/ub-upper" "$case_dir/upper/usr-bin" 2>/dev/null; cp -a "$MNT/vl-upper" "$case_dir/upper/var-lib" 2>/dev/null
 chown -R "$INVOKER_UID:$INVOKER_GID" "$case_dir" 2>/dev/null || true
 exit 0
@@ -1045,6 +1152,10 @@ ROOT=/var/lib/billet/upgrades
 REC_A=recovery-20260909T120000-0badcafe
 REC_B=recovery-20260909T120000-1badcafe
 LEGACY_DIR=20260909T120000000000000
+
+# BILLET_GATE_ONLY=endpoint runs the endpoint section alone, for iterating on
+# it; CI and the pre-commit run everything.
+if [ "${BILLET_GATE_ONLY:-}" != endpoint ]; then
 
 # =============================================================================
 # B. The role's order and its routes.
@@ -2234,5 +2345,437 @@ expect_allowed s3-collision
 expect_fact s3-collision recovery "$ROOT/$REC_B"
 expect_calls s3-collision suffix "" 2
 echo "ok   S: a pinned release is fetched and staged into an exclusive journal under the guard, and a collision retries"
+fi
+
+# =============================================================================
+# E. THE ENDPOINT ENTRIES: the decision before the render, the migration in
+# place of the restart, the receipt after the start, through the real
+# preparation and the recording wrappers. Every answer is one of the commands'
+# own committed fixtures, re-addressed to this gate's holder and the migrated
+# incarnation where a parser holds it to them; the installed configuration is
+# planted under the namespace's /etc and the rendering is the play's
+# `billet_config`.
+# =============================================================================
+fixtures_ep="$here/fixtures"
+# ep_fixture CASE COMMAND FIXTURE [KEY=VALUE...]: a case-local copy of a
+# committed fixture under the fixture's own name (the wrapper reads the exit
+# from it), top-level or nested members re-addressed.
+ep_fixture() {
+  local name=$1 cmd=$2 fixture=$3; shift 3
+  local out=$work/cases/$name/answers/$cmd/$fixture
+  mkdir -p "$(dirname "$out")"
+  "$python" - "$fixtures_ep/$cmd/$fixture" "$out" "$@" <<'PY'
+import json, sys
+src, dst = sys.argv[1:3]
+d = json.load(open(src))
+for kv in sys.argv[3:]:
+    k, v = kv.split("=", 1)
+    parts = k.split(".")
+    node = d
+    for p in parts[:-1]:
+        node = node[p]
+    node[parts[-1]] = v
+with open(dst, "w") as f:
+    json.dump(d, f, indent=2)
+    f.write("\n")
+PY
+  printf '%s' "$out"
+}
+# ep_corrupt FILE MEMBER JSON: one top-level member replaced by a JSON value,
+# or removed when the value is `-`.
+ep_corrupt() {
+  "$python" - "$1" "$2" "$3" <<'PY'
+import json, sys
+p, m, v = sys.argv[1:4]
+d = json.load(open(p))
+if v == "-":
+    del d[m]
+else:
+    d[m] = json.loads(v)
+with open(p, "w") as f:
+    json.dump(d, f, indent=2)
+    f.write("\n")
+PY
+}
+# ep_config_yaml ADDR [node|server-only|derived]: a configuration whose node
+# names ADDR explicitly, one without a node section, or one whose node
+# omits server_addr and derives it from server.listen.
+ep_config_yaml() {
+  local addr=$1 shape=${2:-node}
+  printf 'server:\n  listen: 127.0.0.1:7717\n  state_dir: /var/lib/billet/server\n  max_vcpu: 8\n  max_memory: 32GiB\ngithub:\n  org: acme\n  app_id: 1\n  installation_id: 2\n  private_key_path: /etc/billet/app.pem\n'
+  case "$shape" in
+    node) printf 'node:\n  name: node-a\n  server_addr: %s\n  state_dir: /var/lib/billet/node\n' "$addr" ;;
+    derived) printf 'node:\n  name: node-a\n  state_dir: /var/lib/billet/node\n' ;;
+  esac
+  printf 'tiers:\n  - label: billet-2vcpu\n    provider: docker\n    vcpu: 2\n    memory: 8GiB\n    image: ubuntu:24.04\n'
+}
+ep_plant_config() { # case addr [shape]
+  local name=$1
+  ep_config_yaml "$2" "${3:-node}" >"$work/cases/$name/installed.yaml.plant"
+  p "$name" "mkdir -p /etc/billet; cp '$work/cases/$name/installed.yaml.plant' /etc/billet/billet.yaml; chmod 0640 /etc/billet/billet.yaml"
+}
+# ep_vars CASE ADDR [shape]: the rendering's inputs and the facts the role's
+# main file would have derived (the node policy, the controller).
+ep_vars() {
+  local name=$1 addr=$2 shape=${3:-node}
+  local cfg
+  cfg=$(ep_config_yaml "$addr" "$shape" | "$python" -c 'import json, sys, yaml; print(json.dumps({"billet_config": yaml.safe_load(sys.stdin)}))')
+  a "$name" -e "$cfg" -e billet_node_should_run=true -e billet_migration_controller=localhost
+}
+ep_case() { ns_case "$1" "${2:-escalated}" play-endpoint; }
+# expect_binary_calls CASE FRAGMENT COUNT: the invocations of the binaries
+# (the managed wrapper and a staged candidate alike), never the fakes around
+# them, whose argv repeats the binary's.
+expect_binary_calls() {
+  local n
+  n=$(( $(count_calls "$1" managed "$2") + $(count_calls "$1" candidate "$2") ))
+  [ "$n" -eq "$3" ] || fail "$1: the binaries ran '$2' $n times, want $3" "$work/cases/$1/log"
+}
+# The installed configuration after the play equals what was planted.
+expect_installed_unchanged() {
+  cmp -s "$work/cases/$1/installed.yaml.plant" "$work/cases/$1/installed.yaml" || fail "$1: the installed configuration changed" "$work/cases/$1/installed.yaml"
+}
+EP_A=127.0.0.1:7717
+EP_B=127.0.0.1:7719
+EP_INC=ffeeddccbbaa99887766554433221100
+ep_plant_ordinary() { # case installed-addr desired-addr [installed-shape] [desired-shape]
+  plant "$1"
+  p "$1" 'plant_root; plant_managed v0.10.0'
+  ep_plant_config "$1" "$2" "${4:-node}"
+  ep_vars "$1" "$3" "${5:-node}"
+}
+
+# E1. An unchanged endpoint: the decision unplanned, the action run all the
+# same and answering `unchanged`, the refresh `current` under the holder it
+# was written under; nothing stopped, no tempfile, the ordinary restart's
+# gate open.
+ep_plant_ordinary e1-unchanged $EP_A $EP_A
+e e1-unchanged "BILLET_GATE_ANSWER=migrate-endpoint:1:$(ep_fixture e1-unchanged node-migrate-endpoint reported-unplanned.json);migrate-endpoint:2:$(ep_fixture e1-unchanged node-migrate-endpoint unchanged.json);receipt:1:$(ep_fixture e1-unchanged node-receipt current.json)"
+ep_case e1-unchanged
+expect_allowed e1-unchanged
+expect_fact e1-unchanged planned False
+expect_fact e1-unchanged record current
+expect_fact e1-unchanged migrated False
+expect_fact e1-unchanged compat False
+expect_fact e1-unchanged answerer /usr/bin/billet
+expect_calls e1-unchanged managed "node migrate-endpoint --config /etc/billet/billet.yaml --desired - --wait 120s --dry-run --json" 1
+expect_calls e1-unchanged managed "node migrate-endpoint --config /etc/billet/billet.yaml --desired - --stop-timeout 3600s --wait 120s --json" 1
+expect_calls e1-unchanged managed "node receipt --refresh --config /etc/billet/billet.yaml --desired - --wait 60s --json --run h1" 1
+expect_calls e1-unchanged managed "rollout registration" 0
+expect_calls e1-unchanged managed "node receipt --evidence" 0
+expect_calls e1-unchanged systemctl "" 0
+expect_state e1-unchanged tempfiles 0
+expect_state e1-unchanged config file
+grep -q "The node's endpoint is unchanged (the record names the installed endpoint http://127.0.0.1:7717)" "$work/cases/e1-unchanged/out" || fail "e1: the unchanged report is missing" "$work/cases/e1-unchanged/out"
+echo "ok   E1: an unchanged endpoint runs the decision, the action and the refresh, stops nothing and leaves no tempfile"
+
+# E2. A migration: planned, the action `migrated`, the controller's
+# confirmation under the migrated incarnation, the receipt `written` under
+# this holder, the refresh `current`; the ordinary restart's gate closed; the
+# two tempfiles gone; the calls in order.
+ep_migrated_answers() { # case
+  printf 'migrate-endpoint:1:%s;migrate-endpoint:2:%s;registration:1:%s;receipt:1:%s;receipt:2:%s' \
+    "$(ep_fixture "$1" node-migrate-endpoint reported-planned.json)" "$(ep_fixture "$1" node-migrate-endpoint migrated.json)" \
+    "$(ep_fixture "$1" rollout-registration confirmed.json incarnation=$EP_INC)" \
+    "$(ep_fixture "$1" node-receipt written.json receipt.run=h1)" "$(ep_fixture "$1" node-receipt current.json receipt.run=h1)"
+}
+ep_plant_ordinary e2-migrated $EP_A $EP_B
+e e2-migrated "BILLET_GATE_ANSWER=$(ep_migrated_answers e2-migrated)"
+ep_case e2-migrated
+expect_allowed e2-migrated
+expect_fact e2-migrated planned True
+expect_fact e2-migrated from http://127.0.0.1:7717
+expect_fact e2-migrated to http://127.0.0.1:7719
+expect_fact e2-migrated migrated True
+expect_calls e2-migrated managed "node migrate-endpoint --config /etc/billet/billet.yaml --desired - --wait 120s --dry-run --json" 1
+expect_calls e2-migrated managed "node migrate-endpoint --config /etc/billet/billet.yaml --desired - --stop-timeout 3600s --wait 120s --json" 1
+expect_calls e2-migrated managed "rollout registration --config /etc/billet/billet.yaml --node node-a --incarnation $EP_INC --wait 300s --json" 1
+expect_calls e2-migrated managed "--environment-file" 0
+expect_calls e2-migrated managed "node receipt --evidence " 1
+expect_calls e2-migrated managed " --confirmation " 1
+expect_calls e2-migrated managed " --config /etc/billet/billet.yaml --wait 60s --run h1 --json" 1
+expect_calls e2-migrated managed "node receipt --refresh --config /etc/billet/billet.yaml --desired - --wait 60s --json --run h1" 1
+expect_calls e2-migrated systemctl "" 0
+expect_state e2-migrated tempfiles 0
+order=$(commands e2-migrated | grep -v " prepare$\| version$\| settle$" | tr '\n' ';')
+[ "$order" = "managed migrate-endpoint;managed migrate-endpoint;managed registration;managed receipt;managed receipt;" ] \
+  || fail "e2-migrated: the order is not decision, action, confirmation, receipt, refresh: $order" "$work/cases/e2-migrated/log"
+grep -q "was migrated from http://127.0.0.1:7717 to http://127.0.0.1:7719" "$work/cases/e2-migrated/out" || fail "e2: the migration report is missing" "$work/cases/e2-migrated/out"
+echo "ok   E2: a planned migration is decided, performed, confirmed on the controller, receipted and refreshed, in order"
+
+# E2b. The controller's environment file, exactly when its
+# billet_server_environment is non-empty.
+ep_plant_ordinary e2b-env $EP_A $EP_B
+a e2b-env -e '{"billet_server_environment": {"BILLET_DSN": "x"}}'
+e e2b-env "BILLET_GATE_ANSWER=$(ep_migrated_answers e2b-env)"
+ep_case e2b-env
+expect_allowed e2b-env
+expect_calls e2b-env managed "rollout registration --config /etc/billet/billet.yaml --node node-a --incarnation $EP_INC --wait 300s --json --environment-file /etc/billet/server.env" 1
+echo "ok   E2b: a PostgreSQL controller's confirmation reads its environment file"
+
+# E3. The decision's refusals: a refused or could-not-tell dry run ends the
+# converge before the render, nothing stopped.
+ep_refused_decision() { # name fixture fragment
+  local name=$1 fixture=$2 frag=$3
+  ep_plant_ordinary "$name" $EP_A $EP_B
+  e "$name" "BILLET_GATE_ANSWER=migrate-endpoint:1:$(ep_fixture "$name" node-migrate-endpoint "$fixture")"
+  ep_case "$name"
+  expect_refused "$name" "Refuse the migration's dry run" "$frag" "Nothing was stopped or installed"
+  expect_calls "$name" managed "node migrate-endpoint" 1
+  expect_calls "$name" managed "node receipt" 0
+  expect_calls "$name" systemctl "" 0
+  expect_no_task "$name" "Install the rendering as the render would"
+  expect_installed_unchanged "$name"
+}
+ep_refused_decision e3-stopping refused-stopping.json "was refused (stopping)"
+ep_refused_decision e3b-pre-r unknown-record-pre-r.json "could not examine the host (record)"
+ep_refused_decision e3c-process unknown-process.json "could not examine the host (process)"
+echo "ok   E3: a refused or could-not-tell dry run ends the converge before the render"
+
+# E4. A planned change this converge cannot perform, each reason by name,
+# before the render.
+ep_planned_refusal() { # name fragment extra...
+  local name=$1 frag=$2; shift 2
+  ep_plant_ordinary "$name" $EP_A $EP_B
+  a "$name" "$@"
+  e "$name" "BILLET_GATE_ANSWER=migrate-endpoint:1:$(ep_fixture "$name" node-migrate-endpoint reported-planned.json)"
+  ep_case "$name"
+  expect_refused "$name" "Refuse a planned endpoint migration this converge cannot perform" "$frag" "nothing was stopped or installed"
+  expect_binary_calls "$name" "node migrate-endpoint" 1
+  expect_no_task "$name" "Install the rendering as the render would"
+  expect_installed_unchanged "$name"
+}
+ep_planned_refusal e4-policy "the policy will not start the node" -e billet_node_should_run=false
+ep_planned_refusal e4b-controller "no controller is named" -e billet_migration_controller=
+ep_planned_refusal e4c-upgrade "inside a binary upgrade" -e "billet_binary_src=$bins/wrap-candidate-v0.10.1"
+expect_fact e4c-upgrade upgrade True
+# The unplanned decision under the same three conditions is not refused.
+ep_plant_ordinary e4d-unplanned-upgrade $EP_A $EP_A
+a e4d-unplanned-upgrade -e "billet_binary_src=$bins/wrap-candidate-v0.10.1" -e billet_node_should_run=false -e billet_migration_controller=
+e e4d-unplanned-upgrade "BILLET_GATE_ANSWER=migrate-endpoint:1:$(ep_fixture e4d-unplanned-upgrade node-migrate-endpoint reported-unplanned.json);migrate-endpoint:2:$(ep_fixture e4d-unplanned-upgrade node-migrate-endpoint unchanged.json)"
+ep_case e4d-unplanned-upgrade
+expect_allowed e4d-unplanned-upgrade
+expect_fact e4d-unplanned-upgrade planned False
+expect_no_task e4d-unplanned-upgrade "Refresh the endpoint receipt"
+echo "ok   E4: a planned migration under a policy, without a controller or inside a binary upgrade is refused by name, an unplanned one is not"
+
+# E5. Check mode: the decision's dry run through the executable that answered
+# the report, the action skipped, the refresh's dry run reported, nothing
+# installed.
+ep_plant_ordinary e5-check $EP_A $EP_B
+a e5-check --check
+e e5-check "BILLET_GATE_ANSWER=migrate-endpoint:1:$(ep_fixture e5-check node-migrate-endpoint reported-planned.json);receipt:1:$(ep_fixture e5-check node-receipt reported.json)"
+HOLDER=""; ep_case e5-check; HOLDER=h1
+expect_allowed e5-check
+expect_fact e5-check planned True
+expect_fact e5-check answerer /usr/bin/billet
+expect_calls e5-check managed "node migrate-endpoint --config /etc/billet/billet.yaml --desired - --wait 120s --dry-run --json" 1
+expect_calls e5-check managed "--stop-timeout" 0
+expect_calls e5-check managed "node receipt --refresh --config /etc/billet/billet.yaml --desired - --wait 60s --json --dry-run" 1
+expect_calls e5-check managed "rollout registration" 0
+expect_no_task e5-check "Run the endpoint migration"
+expect_installed_unchanged e5-check
+grep -q "A converge would write the receipt for node-a on http://127.0.0.1:7719" "$work/cases/e5-check/out" || fail "e5: the dry run's receipt report is missing" "$work/cases/e5-check/out"
+echo "ok   E5: a dry run decides through the reporting executable, skips the action and reports the receipt"
+
+# E6. The compatibility rule, with no executable to ask (a pre-R managed
+# binary, no candidate): an unchanged endpoint converges with the entries
+# skipped, a changed one is refused by the comparison before the render, and
+# a derived default compares as the loader derives it.
+ep_legacy() { # name installed-addr desired-addr [installed-shape]
+  plant "$1"
+  p "$1" 'plant_root; plant_pre_r'
+  ep_plant_config "$1" "$2" "${4:-node}"
+  ep_vars "$1" "$3"
+  ep_case "$1"
+}
+ep_legacy e6-legacy-unchanged $EP_A $EP_A
+expect_allowed e6-legacy-unchanged
+expect_fact e6-legacy-unchanged compat True
+expect_fact e6-legacy-unchanged answerer ""
+expect_calls e6-legacy-unchanged pre-r "node" 0
+expect_calls e6-legacy-unchanged pre-r "rollout" 0
+expect_no_task e6-legacy-unchanged "Ask for the endpoint migration's dry run"
+expect_no_task e6-legacy-unchanged "Run the endpoint migration"
+expect_no_task e6-legacy-unchanged "Refresh the endpoint receipt"
+grep -q "this release predates the converge guard" "$work/cases/e6-legacy-unchanged/out" || fail "e6: the compatibility report is missing" "$work/cases/e6-legacy-unchanged/out"
+ep_legacy e6b-legacy-changed $EP_A $EP_B
+expect_refused e6b-legacy-changed "Refuse an endpoint change a release before the converge guard cannot migrate" "pin a release that carries it" "http://127.0.0.1:7717" "http://127.0.0.1:7719"
+expect_no_task e6b-legacy-changed "Install the rendering as the render would"
+expect_installed_unchanged e6b-legacy-changed
+ep_legacy e6c-legacy-derived $EP_A $EP_A derived
+expect_allowed e6c-legacy-derived
+expect_fact e6c-legacy-derived compat True
+echo "ok   E6: without an executable to ask, an unchanged endpoint converges, a changed one is refused, and the default is derived as the loader derives it"
+
+# E7. No billet: a node found running is refused, a positively inactive or
+# absent unit takes the fresh path, an unobservable or incomplete answer
+# refuses.
+ep_no_billet() { # name show-body-or-empty
+  local name=$1 body=$2
+  plant "$name"
+  ep_vars "$name" $EP_A
+  if [ -n "$body" ]; then
+    printf '%b' "$body" >"$work/cases/$name/show.txt"
+    e "$name" "BILLET_GATE_UNIT_SHOW=$work/cases/$name/show.txt"
+  fi
+  ep_case "$name"
+}
+ep_no_billet e7-leftover 'LoadState=loaded\nActiveState=active\nMainPID=4242\n'
+expect_refused e7-leftover "Refuse a converge over a node running on a host with no billet" "a node runs on a host with no billet to ask" "loaded, active, pid 4242" "stop it or install the release first"
+expect_calls e7-leftover systemctl "show billet-node.service --property=LoadState,ActiveState,MainPID" 1
+expect_no_task e7-leftover "Install the rendering as the render would"
+ep_no_billet e7b-inactive 'LoadState=not-found\nActiveState=inactive\nMainPID=0\n'
+expect_allowed e7b-inactive
+expect_fact e7b-inactive nobillet True
+expect_fact e7b-inactive compat False
+expect_fact e7b-inactive answerer ""
+expect_no_task e7b-inactive "Ask for the endpoint migration's dry run"
+expect_no_task e7b-inactive "Run the endpoint migration"
+expect_no_task e7b-inactive "Refresh the endpoint receipt"
+ep_no_billet e7c-unobservable ''
+expect_refused e7c-unobservable "Refuse a converge over a node running on a host with no billet" "could not be observed" "systemctl show exited 97"
+ep_no_billet e7d-incomplete 'LoadState=loaded\nActiveState=inactive\n'
+expect_refused e7d-incomplete "Refuse a converge over a node running on a host with no billet" "loaded, inactive, pid unobserved"
+ep_no_billet e7e-warning 'Warning: something\nLoadState=not-found\nActiveState=inactive\nMainPID=0\n'
+expect_allowed e7e-warning
+expect_fact e7e-warning nobillet True
+echo "ok   E7: on a host with no billet a running node refuses, an inactive one takes the fresh path, and an unobservable or incomplete answer refuses"
+
+# E8. The migration's parser: one member corrupted at a time, each refused
+# by name and alone, the exit table, and a run the bound ended.
+ep_corrupt_decision() { # name member json check
+  local name=$1 member=$2 value=$3 check=$4 f items first
+  ep_plant_ordinary "$name" $EP_A $EP_B
+  f=$(ep_fixture "$name" node-migrate-endpoint reported-planned.json)
+  ep_corrupt "$f" "$member" "$value"
+  e "$name" "BILLET_GATE_ANSWER=migrate-endpoint:1:$f"
+  ep_case "$name"
+  expect_refused "$name" "Judge the migration's answer" "answered with a member this role cannot read: $check"
+  items=$(grep -c '^failed: \[localhost\] (item=' "$work/cases/$name/out" || true)
+  # ONE MEMBER, ONE FAILED CHECK, except the outcome: another outcome's
+  # member set and shape rules fail too, and the outcome check is the first.
+  if [ "$check" = outcome ]; then
+    first=$(grep -m1 '^failed: \[localhost\] (item=' "$work/cases/$name/out" | sed 's/.*(item=\([a-z_]*\)).*/\1/')
+    [ "$first" = outcome ] || fail "$name: the first failed item is $first, want outcome" "$work/cases/$name/out"
+  else
+    [ "$items" -eq 1 ] || fail "$name: $items failed items of the parser, want exactly one" "$work/cases/$name/out"
+    grep -q "^failed: \[localhost\] (item=$check)" "$work/cases/$name/out" || fail "$name: the failed item is not $check" "$work/cases/$name/out"
+  fi
+  expect_no_task "$name" "Install the rendering as the render would"
+}
+ep_corrupt_decision e8-planned planned '"yes"' planned
+ep_corrupt_decision e8-record record '"stale"' record
+ep_corrupt_decision e8-to to 'null' to
+ep_corrupt_decision e8-unit unit '{"load_state": "loaded"}' unit
+ep_corrupt_decision e8-schema schema '2' schema
+ep_corrupt_decision e8-members extra '1' members
+ep_corrupt_decision e8-from from 'null' from
+ep_corrupt_decision e8-outcome outcome '"migrated"' outcome
+# The exit table: a `reported` answer under exit 2 is refused at the exit member.
+ep_plant_ordinary e8-exit $EP_A $EP_B
+e e8-exit "BILLET_GATE_ANSWER=migrate-endpoint:1:$(ep_fixture e8-exit node-migrate-endpoint reported-planned.json)"
+e e8-exit "BILLET_GATE_FAIL=migrate-endpoint:1:exit:2"
+ep_case e8-exit
+expect_refused e8-exit "Judge the migration's answer" "answered with a member this role cannot read: exit"
+# A run the bound ended: refused as not having answered, never read as an outcome.
+ep_plant_ordinary e8-hang $EP_A $EP_B
+a e8-hang -e billet_migration_record_wait=1 -e billet_guard_timeout=2
+e e8-hang "BILLET_GATE_FAIL=migrate-endpoint:hang"
+ep_case e8-hang
+expect_refused e8-hang "Refuse a migration call that did not answer" "ended by the bound"
+expect_no_task e8-hang "Install the rendering as the render would"
+echo "ok   E8: the migration's parser refuses one corrupted member at a time, the exit table, and a run the bound ended"
+
+# E9. The protocol's later halves refused: an unconfirmed registration, a
+# refused receipt, an unproved stop; the tempfiles removed, the state named.
+ep_plant_ordinary e9-timeout $EP_A $EP_B
+e e9-timeout "BILLET_GATE_ANSWER=migrate-endpoint:1:$(ep_fixture e9-timeout node-migrate-endpoint reported-planned.json);migrate-endpoint:2:$(ep_fixture e9-timeout node-migrate-endpoint migrated.json);registration:1:$(ep_fixture e9-timeout rollout-registration timeout.json incarnation=$EP_INC)"
+ep_case e9-timeout
+expect_refused e9-timeout "Refuse an unconfirmed registration" "did not confirm" "under incarnation 0000000000000000000000000000aaaa (epoch 1, live)" "no receipt was written"
+expect_calls e9-timeout managed "node receipt" 0
+expect_state e9-timeout tempfiles 0
+ep_plant_ordinary e9b-receipt-refused $EP_A $EP_B
+e e9b-receipt-refused "BILLET_GATE_ANSWER=migrate-endpoint:1:$(ep_fixture e9b-receipt-refused node-migrate-endpoint reported-planned.json);migrate-endpoint:2:$(ep_fixture e9b-receipt-refused node-migrate-endpoint migrated.json);registration:1:$(ep_fixture e9b-receipt-refused rollout-registration confirmed.json incarnation=$EP_INC);receipt:1:$(ep_fixture e9b-receipt-refused node-receipt refused-record.json)"
+ep_case e9b-receipt-refused
+expect_refused e9b-receipt-refused "Refuse the migration's receipt" "was refused (record)" "the refresh writes the receipt"
+expect_calls e9b-receipt-refused managed "node receipt --evidence" 1
+expect_calls e9b-receipt-refused managed "node receipt --refresh" 0
+expect_state e9b-receipt-refused tempfiles 0
+ep_plant_ordinary e9c-unproved $EP_A $EP_B
+e e9c-unproved "BILLET_GATE_ANSWER=migrate-endpoint:1:$(ep_fixture e9c-unproved node-migrate-endpoint reported-planned.json);migrate-endpoint:2:$(ep_fixture e9c-unproved node-migrate-endpoint unknown-unproved-result.json)"
+ep_case e9c-unproved
+expect_refused e9c-unproved "Refuse the migration's answer" "could not be proved (unproved, the host left with stopped done)"
+expect_calls e9c-unproved managed "rollout registration" 0
+expect_state e9c-unproved tempfiles 0
+# A confirmation under another incarnation: the parser refuses at the
+# incarnation, and no receipt follows.
+ep_plant_ordinary e9d-other-incarnation $EP_A $EP_B
+e e9d-other-incarnation "BILLET_GATE_ANSWER=migrate-endpoint:1:$(ep_fixture e9d-other-incarnation node-migrate-endpoint reported-planned.json);migrate-endpoint:2:$(ep_fixture e9d-other-incarnation node-migrate-endpoint migrated.json);registration:1:$(ep_fixture e9d-other-incarnation rollout-registration confirmed.json)"
+ep_case e9d-other-incarnation
+expect_refused e9d-other-incarnation "Judge the confirmation's answer" "answered with a member this role cannot read: incarnation"
+expect_calls e9d-other-incarnation managed "node receipt" 0
+expect_state e9d-other-incarnation tempfiles 0
+# A timeout whose last registration carries the empty incarnation of a host
+# that presented none is a timeout, not a parser failure.
+ep_plant_ordinary e9e-timeout-empty-incarnation $EP_A $EP_B
+e e9e-timeout-empty-incarnation "BILLET_GATE_ANSWER=migrate-endpoint:1:$(ep_fixture e9e-timeout-empty-incarnation node-migrate-endpoint reported-planned.json);migrate-endpoint:2:$(ep_fixture e9e-timeout-empty-incarnation node-migrate-endpoint migrated.json);registration:1:$(ep_fixture e9e-timeout-empty-incarnation rollout-registration timeout.json incarnation=$EP_INC last.incarnation=)"
+ep_case e9e-timeout-empty-incarnation
+expect_refused e9e-timeout-empty-incarnation "Refuse an unconfirmed registration" "under incarnation  (epoch 1, live)"
+# An unproved answer without its state is not read as nothing done.
+ep_plant_ordinary e9f-state-missing $EP_A $EP_B
+f=$(ep_fixture e9f-state-missing node-migrate-endpoint unknown-unproved-result.json)
+ep_corrupt "$f" state -
+e e9f-state-missing "BILLET_GATE_ANSWER=migrate-endpoint:1:$(ep_fixture e9f-state-missing node-migrate-endpoint reported-planned.json);migrate-endpoint:2:$f"
+ep_case e9f-state-missing
+expect_refused e9f-state-missing "Judge the migration's answer" "answered with a member this role cannot read: members"
+if grep -q "the host left with" "$work/cases/e9f-state-missing/out"; then fail "e9f: a missing state was read as a host state" "$work/cases/e9f-state-missing/out"; fi
+echo "ok   E9: an unconfirmed registration, a refused receipt, an unproved stop and a confirmation of another incarnation end the converge with the tempfiles removed; an empty last incarnation is a timeout, a missing state is refused"
+
+# E10. A first start and a removed node are the command's to report: the
+# receipt follows the node.
+ep_plant_ordinary e10-first-start $EP_A $EP_B server-only node
+e e10-first-start "BILLET_GATE_ANSWER=migrate-endpoint:1:$(ep_fixture e10-first-start node-migrate-endpoint reported-first-start.json);migrate-endpoint:2:$(ep_fixture e10-first-start node-migrate-endpoint unchanged-none.json);receipt:1:$(ep_fixture e10-first-start node-receipt written.json receipt.run=h1)"
+ep_case e10-first-start
+expect_allowed e10-first-start
+expect_fact e10-first-start planned False
+expect_fact e10-first-start record none
+grep -q "is not planned (record none), a first start" "$work/cases/e10-first-start/out" || fail "e10: the decision did not report the first start" "$work/cases/e10-first-start/out"
+expect_calls e10-first-start managed "node receipt --refresh" 1
+grep -q "The receipt is written for node-a on http://127.0.0.1:7719" "$work/cases/e10-first-start/out" || fail "e10: the refresh's report is missing" "$work/cases/e10-first-start/out"
+ep_plant_ordinary e10b-node-removed $EP_A $EP_A node server-only
+e e10b-node-removed "BILLET_GATE_ANSWER=migrate-endpoint:1:$(ep_fixture e10b-node-removed node-migrate-endpoint reported-node-removed.json);migrate-endpoint:2:$(ep_fixture e10b-node-removed node-migrate-endpoint unchanged-node-removed.json)"
+ep_case e10b-node-removed
+expect_allowed e10b-node-removed
+grep -q "is not planned (record current), the node removed" "$work/cases/e10b-node-removed/out" || fail "e10b: the decision did not report the removal" "$work/cases/e10b-node-removed/out"
+expect_no_task e10b-node-removed "Refresh the endpoint receipt"
+expect_calls e10b-node-removed managed "node receipt" 0
+echo "ok   E10: a first start and a removed node are reported by the command and the receipt follows the node"
+
+# E11. The receipt parser's holder and the unchanged answer's identity: a
+# `current` receipt naming no holder, a `written` one naming another run's,
+# and an unchanged `current` answer naming no node are the producer's never,
+# and refuse by member; a `current` receipt under another holder is kept.
+ep_plant_ordinary e11-current-empty-run $EP_A $EP_A
+e e11-current-empty-run "BILLET_GATE_ANSWER=migrate-endpoint:1:$(ep_fixture e11-current-empty-run node-migrate-endpoint reported-unplanned.json);migrate-endpoint:2:$(ep_fixture e11-current-empty-run node-migrate-endpoint unchanged.json);receipt:1:$(ep_fixture e11-current-empty-run node-receipt current.json receipt.run=)"
+ep_case e11-current-empty-run
+expect_refused e11-current-empty-run "Judge the receipt's answer" "answered with a member this role cannot read: receipt_run"
+ep_plant_ordinary e11b-current-other-run $EP_A $EP_A
+e e11b-current-other-run "BILLET_GATE_ANSWER=migrate-endpoint:1:$(ep_fixture e11b-current-other-run node-migrate-endpoint reported-unplanned.json);migrate-endpoint:2:$(ep_fixture e11b-current-other-run node-migrate-endpoint unchanged.json);receipt:1:$(ep_fixture e11b-current-other-run node-receipt current.json receipt.run=ci-run-11)"
+ep_case e11b-current-other-run
+expect_allowed e11b-current-other-run
+ep_plant_ordinary e11c-written-other-run $EP_A $EP_B
+e e11c-written-other-run "BILLET_GATE_ANSWER=migrate-endpoint:1:$(ep_fixture e11c-written-other-run node-migrate-endpoint reported-planned.json);migrate-endpoint:2:$(ep_fixture e11c-written-other-run node-migrate-endpoint migrated.json);registration:1:$(ep_fixture e11c-written-other-run rollout-registration confirmed.json incarnation=$EP_INC);receipt:1:$(ep_fixture e11c-written-other-run node-receipt written.json receipt.run=h2)"
+ep_case e11c-written-other-run
+expect_refused e11c-written-other-run "Judge the receipt's answer" "answered with a member this role cannot read: receipt_run"
+expect_state e11c-written-other-run tempfiles 0
+ep_plant_ordinary e11d-current-null-node $EP_A $EP_A
+f=$(ep_fixture e11d-current-null-node node-migrate-endpoint unchanged.json)
+ep_corrupt "$f" node null
+ep_corrupt "$f" node_removed true
+e e11d-current-null-node "BILLET_GATE_ANSWER=migrate-endpoint:1:$(ep_fixture e11d-current-null-node node-migrate-endpoint reported-unplanned.json);migrate-endpoint:2:$f"
+ep_case e11d-current-null-node
+expect_refused e11d-current-null-node "Judge the migration's answer" "answered with a member this role cannot read: node"
+echo "ok   E11: a current receipt keeps a holder that is one, a written receipt carries this run's, and an unchanged current answer names its node"
 
 echo "converge guard: every case passed"

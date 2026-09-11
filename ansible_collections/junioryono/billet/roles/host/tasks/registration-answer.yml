@@ -74,8 +74,11 @@
         ok: "{{ billet_registration_outcome != 'confirmed' or ((billet_registration_a.epoch | default('x')) is integer and (billet_registration_a.epoch | default(0)) >= 1) }}"
       - name: live
         ok: "{{ billet_registration_outcome != 'confirmed' or (billet_registration_a.live | default('x') is sameas true) }}"
+      # THE LAST REGISTRATION SEEN: its incarnation is the one the registering
+      # process presented, which a host from before incarnations presented
+      # as nothing, so the ledger holds it empty and the answer copies it.
       - name: last
-        ok: "{{ billet_registration_outcome != 'timeout' or ('last' in billet_registration_a and ((billet_registration_a.last is none) or ((billet_registration_a.last is mapping) and (billet_registration_a.last.keys() | list | sort) == ['epoch', 'incarnation', 'live'] and (billet_registration_a.last.incarnation is string) and (billet_registration_a.last.incarnation is match(billet_registration_hex32)) and (billet_registration_a.last.epoch is integer) and (billet_registration_a.last.epoch >= 1) and ((billet_registration_a.last.live is sameas true) or (billet_registration_a.last.live is sameas false))))) }}"
+        ok: "{{ billet_registration_outcome != 'timeout' or ('last' in billet_registration_a and ((billet_registration_a.last is none) or ((billet_registration_a.last is mapping) and (billet_registration_a.last.keys() | list | sort) == ['epoch', 'incarnation', 'live'] and (billet_registration_a.last.incarnation is string) and (billet_registration_a.last.incarnation == '' or billet_registration_a.last.incarnation is match(billet_registration_hex32)) and (billet_registration_a.last.epoch is integer) and (billet_registration_a.last.epoch >= 1) and ((billet_registration_a.last.live is sameas true) or (billet_registration_a.last.live is sameas false))))) }}"
   ansible.builtin.assert:
     that:
       - item.ok | bool

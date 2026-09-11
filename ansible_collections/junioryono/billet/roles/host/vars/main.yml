@@ -19,6 +19,15 @@ billet_server_environment_marker_path: /etc/billet/server.env-managed
 # `sslrootcert` — one path, written down in the two places that have to agree.
 billet_state_ca_bundle_path: /etc/billet/rds-ca-bundle.pem
 
+# THE ENDPOINT COMMANDS' OWN PHASES, mirrored so the role's outer bound
+# (`timeout -k 10`) expires after the command's own deadlines and never ends a
+# migration inside a phase it was allowed: `billet node migrate-endpoint`
+# judges up to three times when the process moves under its bracket, each
+# judgement waiting the record wait, and its start runs under the unit's
+# start bound (deploy.UnitStartTimeout, 120s) plus the lifecycle margin (30s).
+billet_migration_judgement_attempts: 3
+billet_migration_start_bound: 150
+
 # billet_configured_server_state_dir is the directory THIS RUN'S billet_config
 # points the control plane's identity at.
 #

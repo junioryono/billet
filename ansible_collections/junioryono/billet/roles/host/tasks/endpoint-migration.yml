@@ -41,8 +41,13 @@
     # the executable that answered the preparation.
     billet_endpoint_action_executable: >-
       {{ billet_exclusion_binary if billet_finalization_commit | default('') == 'host upgrade committed' else billet_endpoint_answerer }}
+    # THE BOUND IS THE SUM OF EVERY PHASE the command may take, the guard's
+    # bound as the margin: a slow but permitted sequence must never lose its
+    # answer after the stop or the start.
     billet_endpoint_action_bound: >-
-      {{ (billet_migration_stop_timeout | int) + (billet_migration_record_wait | int) + (billet_guard_timeout | int) }}
+      {{ (billet_migration_judgement_attempts | int) * (billet_migration_record_wait | int)
+         + (billet_migration_stop_timeout | int) + (billet_migration_start_bound | int)
+         + (billet_migration_record_wait | int) + (billet_guard_timeout | int) }}
   block:
     - name: Run the endpoint migration
       ansible.builtin.command:
@@ -66,7 +71,9 @@
         billet_endpoint_call: action
         billet_endpoint_answered_by: "{{ billet_endpoint_action_executable }}"
 
-    # A refusal names the state the host was left in: `nothing` (nothing
+    # A refusal names the state the host was left in (the parser requires
+    # it; the default below is for Ansible's rendering of fail_msg before the
+    # assertion decides, on a successful answer that carries none): `nothing` (nothing
     # stopped), `started` (the node restarted and registered, the receipt
     # owed) or `started-no-record` (restarted, its record not seen within the
     # wait); an unproved stop leaves the unit stopping under systemd's bound.
@@ -78,7 +85,7 @@
           The endpoint migration through {{ billet_endpoint_action_executable }}
           {{ 'was refused' if billet_endpoint_answer.outcome == 'refused' else 'could not be proved' }}
           ({{ billet_endpoint_answer.reason | default('no reason') }}, the host left with
-          {{ billet_endpoint_answer.state | default('nothing') }} done):
+          {{ billet_endpoint_answer.state | default('unexamined') }} done):
           {{ billet_endpoint_answer.why | default('no reason') }}.
           {{ ('Next: ' ~ billet_endpoint_answer.next ~ '.') if (billet_endpoint_answer.next | default('') | length > 0) else '' }}
 
@@ -119,9 +126,25 @@
           become: true
           no_log: true
 
+        # A MIGRATED NODE WITH NO CONTROLLER NAMED cannot happen after the
+        # decision's refusal; this is the guard that holds if it ever does,
+        # before a delegation to nowhere.
+        - name: Refuse a migration with no controller to confirm it
+          ansible.builtin.assert:
+            that:
+              - billet_migration_controller | default('') | length > 0
+            fail_msg: >-
+              The node was migrated to {{ billet_endpoint_answer.to }} and no controller is named to confirm its
+              registration (billet_migration_controller); declare the control_plane group or set it, then converge
+              again: the refresh receipts a registered node.
+
         # THE CONTROLLER'S CONFIRMATION, on the controller: one snapshot at a
         # time through the read-only open, the binding judged at every poll,
         # until the node's current registration carries the new incarnation.
+        # Ansible resolves `delegate_to` before it evaluates `when`, so an
+        # empty controller must still template to a host while the block is
+        # skipped (an unplanned converge on an inventory without one);
+        # the assertion above is what keeps an empty one from running here.
         - name: Confirm the node's registration on the controller
           ansible.builtin.command:
             argv: >-
@@ -131,7 +154,7 @@
                   '--wait', (billet_registration_wait | string) ~ 's', '--json']
                  + (['--environment-file', billet_server_environment_path] if billet_registration_environment | bool else []) }}
             expand_argument_vars: false
-          delegate_to: "{{ billet_migration_controller }}"
+          delegate_to: "{{ billet_migration_controller | default(inventory_hostname, true) }}"
           register: billet_registration_raw
           changed_when: false
           failed_when: false
@@ -185,7 +208,8 @@
               {{ ['timeout', '-k', '10', ((billet_receipt_wait | int) + (billet_guard_timeout | int)) | string,
                   billet_endpoint_action_executable, 'node', 'receipt',
                   '--evidence', billet_endpoint_evidence_file.path, '--confirmation', billet_endpoint_confirmation_file.path,
-                  '--config', '/etc/billet/billet.yaml', '--run', billet_exclusion_holder, '--json'] }}
+                  '--config', '/etc/billet/billet.yaml', '--wait', (billet_receipt_wait | string) ~ 's',
+                  '--run', billet_exclusion_holder, '--json'] }}
             expand_argument_vars: false
           register: billet_receipt_raw
           changed_when: billet_receipt_raw.rc == 0

@@ -7,7 +7,10 @@
 # to the producer's shape, the nullability rules per branch included, and a
 # member outside the rules refuses naming it: `from_json` would coerce and
 # keep the last of a repeated member, and a role reading a null as an empty
-# string would plan a migration from nothing.
+# string would plan a migration from nothing. A refusal or a could-not-tell
+# always names the state the host was left in (`nothing`, `stopped`,
+# `started`, `started-no-record`): an answer without it is not read as
+# "nothing done".
 #
 # Inputs: billet_endpoint_raw (the registered command result),
 # billet_endpoint_call ('decision' or 'action'), billet_endpoint_answered_by
@@ -49,8 +52,8 @@
       reported: [schema, outcome, planned, first_start, node_removed, from, to, effective, record, config, unit]
       unchanged: [schema, outcome, node, deployment, endpoint, effective, record, node_removed, unit]
       migrated: [schema, outcome, node, deployment, from, to, config_path, installed_sha256, invocation_id, incarnation, registered_at, stopped]
-      refused: [schema, outcome, reason, why]
-      unknown: [schema, outcome, reason, why]
+      refused: [schema, outcome, reason, why, state]
+      unknown: [schema, outcome, reason, why, state]
     billet_endpoint_checks:
       - name: outcome
         ok: "{{ billet_endpoint_outcome in (['reported', 'refused', 'unknown'] if billet_endpoint_call == 'decision' else ['unchanged', 'migrated', 'refused', 'unknown']) }}"
@@ -68,7 +71,7 @@
       - name: next
         ok: "{{ ('next' not in billet_endpoint_a) or (billet_endpoint_a.next is string) }}"
       - name: state
-        ok: "{{ ('state' not in billet_endpoint_a) or (billet_endpoint_a.state in ['nothing', 'stopped', 'started', 'started-no-record']) }}"
+        ok: "{{ not billet_endpoint_failed or (billet_endpoint_a.state | default('') in ['nothing', 'stopped', 'started', 'started-no-record']) }}"
       # THE REPORT: the booleans by their type, the endpoints strings or null
       # under the rules (a null `to` only beside a removed node; a null `from`
       # only beside a null `effective` and a first start, an absent
@@ -94,16 +97,18 @@
         ok: "{{ billet_endpoint_outcome not in ['reported', 'unchanged'] or ((billet_endpoint_a.unit | default('x')) is mapping and (billet_endpoint_a.unit.keys() | list | sort) == ['active_state', 'kill_mode', 'load_state'] and (billet_endpoint_a.unit.load_state is string) and (billet_endpoint_a.unit.active_state is string) and (billet_endpoint_a.unit.kill_mode is string)) }}"
       # THE UNCHANGED ANSWER: a retained node always names itself and its
       # endpoint (the producer refuses a name it cannot resolve), so a null
-      # node or endpoint is admitted only beside `node_removed: true`; a null
-      # deployment is the positively unminted identity of a stopped certless
-      # host (`none`), the observation-only branch (`unread`) or a removed node;
-      # `current` requires every string.
+      # node or endpoint is admitted only in the observation-only branch, no
+      # node section on either side (`node_removed: true`) and the record
+      # `none` (not running) or `unread`, never beside a `current` record; a
+      # null deployment is the positively unminted identity of a stopped
+      # certless host (`none`), the observation-only branch (`unread`) or a
+      # removed node.
       - name: node
-        ok: "{{ billet_endpoint_outcome not in ['unchanged', 'migrated'] or ((billet_endpoint_a.node | default('x')) is string and (billet_endpoint_a.node | default('')) | length > 0) or (billet_endpoint_outcome == 'unchanged' and (billet_endpoint_a.node | default('x')) is none and (billet_endpoint_a.node_removed | default(false) is sameas true)) }}"
+        ok: "{{ billet_endpoint_outcome not in ['unchanged', 'migrated'] or ((billet_endpoint_a.node | default('x')) is string and (billet_endpoint_a.node | default('')) | length > 0) or (billet_endpoint_outcome == 'unchanged' and (billet_endpoint_a.node | default('x')) is none and (billet_endpoint_a.node_removed | default(false) is sameas true) and billet_endpoint_a.record | default('') in ['none', 'unread']) }}"
       - name: deployment
         ok: "{{ billet_endpoint_outcome not in ['unchanged', 'migrated'] or ((billet_endpoint_a.deployment | default('x')) is string and (billet_endpoint_a.deployment | default('')) is match(billet_endpoint_hex32)) or (billet_endpoint_outcome == 'unchanged' and (billet_endpoint_a.deployment | default('x')) is none and (billet_endpoint_a.record | default('') in ['none', 'unread'] or (billet_endpoint_a.node_removed | default(false) is sameas true))) }}"
       - name: endpoint
-        ok: "{{ billet_endpoint_outcome != 'unchanged' or ((billet_endpoint_a.endpoint | default('x')) is string and (billet_endpoint_a.endpoint | default('')) | length > 0) or ((billet_endpoint_a.endpoint | default('x')) is none and (billet_endpoint_a.node_removed | default(false) is sameas true)) }}"
+        ok: "{{ billet_endpoint_outcome != 'unchanged' or ((billet_endpoint_a.endpoint | default('x')) is string and (billet_endpoint_a.endpoint | default('')) | length > 0) or ((billet_endpoint_a.endpoint | default('x')) is none and (billet_endpoint_a.node_removed | default(false) is sameas true) and billet_endpoint_a.record | default('') in ['none', 'unread']) }}"
       # THE MIGRATED ANSWER: every member a string of its shape, the stopped
       # triple exactly inactive/dead/success, the configuration path the
       # installed one.

@@ -55,7 +55,11 @@
     # positively inactive or absent takes the fresh path.
     - name: Observe the node unit on a host with no billet
       ansible.builtin.command:
-        argv: [systemctl, show, billet-node.service, --property=LoadState,ActiveState,MainPID]
+        # QUOTED: in a YAML flow sequence a comma separates items, and the
+        # unquoted property list became three arguments, two of them unit
+        # names systemd answered with their own LoadState (measured 2026-09-11
+        # on the fleet's guest, where the fresh-machine dry run refused).
+        argv: [systemctl, show, billet-node.service, "--property=LoadState,ActiveState,MainPID"]
       register: billet_endpoint_unit_raw
       changed_when: false
       failed_when: false
@@ -131,12 +135,13 @@
 
     # THE DRY RUN, through the answerer, with or without an installed
     # configuration (the command reports `config: absent` and judges the unit
-    # and its process against the rendering). Bounded by the record wait plus
-    # the guard's bound, `-k 10` so a hang is killed after the grace period.
+    # and its process against the rendering). Bounded by the judgement's
+    # attempts, each waiting the record wait, plus the guard's bound as the
+    # margin, `-k 10` so a hang is killed after the grace period.
     - name: Ask for the endpoint migration's dry run
       ansible.builtin.command:
         argv: >-
-          {{ ['timeout', '-k', '10', ((billet_migration_record_wait | int) + (billet_guard_timeout | int)) | string,
+          {{ ['timeout', '-k', '10', ((billet_migration_judgement_attempts | int) * (billet_migration_record_wait | int) + (billet_guard_timeout | int)) | string,
               billet_endpoint_answerer, 'node', 'migrate-endpoint', '--config', '/etc/billet/billet.yaml',
               '--desired', '-', '--wait', (billet_migration_record_wait | string) ~ 's', '--dry-run', '--json'] }}
         stdin: "{{ billet_endpoint_rendering }}"
