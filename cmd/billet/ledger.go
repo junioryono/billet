@@ -107,8 +107,11 @@ func openStateForDecision(ctx context.Context, cfg *config.Config) (*state.DB, e
 		db, err = state.OpenAdmin(ctx, cfg.Server.IdentityDir)
 	}
 
-	if err != nil {
-		return nil, err
+	// THE HAND-BACK BELONGS TO THE ATTEMPT, not to the handle: the opener
+	// creates the directory lock before it connects, so a failed open leaves a
+	// root-owned file too.
+	if err := errors.Join(err, handBackLedger(cfg.Server.IdentityDir)); err != nil {
+		return nil, errors.Join(err, closeIfOpen(db))
 	}
 
 	if err := verifyLedgerIdentity(ctx, cfg, db); err != nil {
@@ -137,8 +140,10 @@ func openStateAdmin(ctx context.Context, cfg *config.Config) (*state.DB, error) 
 			state.WithRunningRelease(version.Version()))
 	}
 
-	if err != nil {
-		return nil, err
+	// The hand-back on the attempt, as in openStateForDecision: a root command
+	// that created the lock and then failed to connect still hands it back.
+	if err := errors.Join(err, handBackLedger(cfg.Server.IdentityDir)); err != nil {
+		return nil, errors.Join(err, closeIfOpen(db))
 	}
 
 	// AND IT IS THIS DEPLOYMENT'S LEDGER, ASKED ONCE FOR EVERY OPERATOR COMMAND.
@@ -253,4 +258,14 @@ func ledgerDSN(cfg *config.Config) (string, error) {
 	}
 
 	return dsn, nil
+}
+
+// closeIfOpen closes a handle an open may or may not have produced, so an error
+// joined onto a failed open can also carry a cleanup error rather than drop it.
+func closeIfOpen(db *state.DB) error {
+	if db == nil {
+		return nil
+	}
+
+	return db.Close()
 }

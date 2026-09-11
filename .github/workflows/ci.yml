@@ -36,31 +36,20 @@ jobs:
     # Raise it again when the suite grows; do not trim tests to fit it.
     timeout-minutes: 40
 
-    # THE POSTGRESQL BACKEND IS TESTED AGAINST A REAL SERVER OR NOT AT ALL.
-    # Every fact internal/state pins about it is a fact about the server rather
-    # than about billet's code -- what an advisory lock excludes, what a
-    # read-only transaction refuses, what the catalogue reports -- so a fake
-    # would assert billet's own assumptions back at itself. The tests SKIP
-    # without BILLET_TEST_POSTGRES_DSN and REFUSE to skip when CI is set, so a
-    # run that lost this service fails loudly instead of reporting success for a
-    # backend nothing exercised.
-    services:
-      postgres:
-        image: postgres:18-alpine
-        env:
-          POSTGRES_USER: billet
-          POSTGRES_PASSWORD: billet
-          POSTGRES_DB: billet
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U billet"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-
+    # NO DATABASE SERVICE HERE. The suites gated on BILLET_TEST_POSTGRES_DSN
+    # (internal/state's backend tests, the capacity suite's ledger conformance,
+    # one backup test) run in test-postgres below against a real PostgreSQL;
+    # this job runs every package on SQLite, so neither job waits on the
+    # other's slowest package. The split follows the consumer repository's
+    # workflow, which runs its database-backed suites as their own job.
+    #
+    # THOSE SUITES REFUSE TO SKIP UNDER CI unless the run names the job that
+    # runs them, which is what this variable does: a run that has lost the
+    # test-postgres job still fails in it rather than reporting success for a
+    # backend nothing exercised, and a run that also lost this variable fails
+    # here.
     env:
-      BILLET_TEST_POSTGRES_DSN: postgres://billet:billet@127.0.0.1:5432/billet?sslmode=disable
+      BILLET_TEST_POSTGRES_ELSEWHERE: test-postgres
 
     steps:
       - uses: actions/checkout@v6
@@ -68,7 +57,30 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-          cache: true
+          # setup-go's cache is one entry shared by every Go job in the run,
+          # written on a MISS only, so whichever job populated it decides what
+          # is warm and the `-race -covermode=atomic` object files this job
+          # compiles are never the ones it restores. The flavoured cache below
+          # replaces it; on the consumer repository's workflow the same change
+          # saved about two minutes of cold race+cover compilation per run.
+          cache: false
+
+      # ROLLING KEY: restore-keys falls back to the newest entry for this go.sum
+      # and the sha-suffixed key writes a fresh one each run, so a run inherits
+      # the previous run's warm race+cover objects and recompiles only what
+      # changed. The `race-cover` prefix keeps it apart from the plain build
+      # cache the other jobs share; mixing flavours is what made a shared entry
+      # useless. The fleet's guests start empty, so this download is what stands
+      # between a run and a cold compile of every package under -race.
+      - name: Cache the race+cover Go build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-race-cover-${{ hashFiles('go.sum') }}-${{ github.sha }}-${{ github.job }}
+          restore-keys: |
+            go-race-cover-${{ hashFiles('go.sum') }}-
 
       - name: Verify modules are tidy
         run: |
@@ -124,7 +136,7 @@ jobs:
         # than guessed at. `fromjson?` lets a build error's plain line through.
         run: |
           set -o pipefail
-          go test -race -count=1 -timeout 20m -coverprofile=coverage.out -covermode=atomic -json ./... \
+          go test -race -count=1 -timeout 20m -vet=off -coverprofile=coverage.out -covermode=atomic -json ./... \
             | tee test-output.json \
             | jq -R -j 'fromjson? | select(.Output != null) | .Output'
 
@@ -148,34 +160,6 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # THE CAPACITY SUITE AGAIN, AGAINST THE OTHER ENGINE.
-      #
-      # internal/alloc holds the rules a second backend could break without
-      # failing to compile: escrow before advertising, the fencing epoch,
-      # capacity charged on COALESCE(node, target_node), custody staying charged
-      # until evidence, and the quiescence answer `billet local down` stops
-      # services on. Every one is a property of a TRANSACTION, and the
-      # transaction is exactly what differs between a file with a write lock and
-      # a server with an advisory one.
-      #
-      # THE SAME TESTS, NOT A SECOND SUITE, so a rule added there is covered on
-      # both engines without anybody remembering to add it twice. The run above
-      # is SQLite; this one sets BILLET_TEST_LEDGER and fails rather than
-      # skipping if the server is missing.
-      #
-      # NOT -race HERE. The race detector's value is in the SQLite run above,
-      # which exercises the same Go with the same concurrency; this run is about
-      # what the SERVER does, and doubling a 50-second suite to re-answer a
-      # question already answered buys nothing.
-      #
-      # internal/state is NOT re-run: its PostgreSQL coverage is the dedicated
-      # backend tests, which the run above already executed against this service.
-      # Adding it here would re-run its SQLite suite and call it conformance.
-      - name: Test the capacity suite against PostgreSQL
-        run: go test -count=1 ./internal/alloc/
-        env:
-          BILLET_TEST_LEDGER: postgres
-
       - name: Coverage summary
         run: go tool cover -func=coverage.out | tail -1
 
@@ -185,6 +169,59 @@ jobs:
           fail_ci_if_error: false
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  # THE DATABASE-BACKED SUITES, AS THEIR OWN JOB. THE POSTGRESQL BACKEND IS
+  # TESTED AGAINST A REAL SERVER OR NOT AT ALL: every fact internal/state pins
+  # about it is a fact about the server rather than about billet's code -- what
+  # an advisory lock excludes, what a read-only transaction refuses, what the
+  # catalogue reports -- so a fake would assert billet's own assumptions back at
+  # itself. Here: internal/state's backend tests (gated on the DSN), the one
+  # backup test that needs a live database, and the capacity suite run once
+  # with the ledger switched (BILLET_TEST_LEDGER=postgres), which is the
+  # conformance run the single job made. internal/state's SQLite suite is NOT
+  # re-run here.
+  test-postgres:
+    runs-on: billet-8vcpu-ubuntu-2404
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: billet
+          POSTGRES_PASSWORD: billet
+          POSTGRES_DB: billet
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U billet"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      BILLET_TEST_POSTGRES_DSN: postgres://billet:billet@127.0.0.1:5432/billet?sslmode=disable
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Cache the race+cover Go build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-race-cover-${{ hashFiles('go.sum') }}-${{ github.sha }}-${{ github.job }}
+          restore-keys: |
+            go-race-cover-${{ hashFiles('go.sum') }}-
+      - name: Test the ledger backend and the one backup test against PostgreSQL
+        run: |
+          go test -race -count=1 -timeout 20m -vet=off ./internal/state/
+          go test -race -count=1 -timeout 20m -vet=off -run 'TestAPostgresBackupIsNotRefusedBeforeItStarts' ./cmd/billet/
+      - name: Test the capacity suite against PostgreSQL
+        run: go test -count=1 -timeout 20m ./internal/alloc/
+        env:
+          BILLET_TEST_LEDGER: postgres
 
   lint:
     runs-on: billet-8vcpu-ubuntu-2404
@@ -285,6 +322,20 @@ jobs:
 
   host-lifecycle:
     runs-on: billet-8vcpu-ubuntu-2404
+    # FOUR JOBS, NOT ONE. The twenty gates ran serially in one job at 18
+    # minutes on the last green main run (measured 2026-09-11: the dry-run
+    # policy gate 255 s, the pinned-release fetch 166 s, the key-policy gate
+    # 164 s, the emitted-block converge 107 s, the cloudflared gate 97 s, and
+    # 77 s installing Ansible), and the converge-guard gate on this branch runs
+    # two hundred cases. The groups below are sized from those measurements;
+    # the setup steps run in every group because each is a fresh guest.
+    # Batching compatible cases into one playbook launch inside the gates is
+    # the deeper follow-up, as the timeout's comment already says.
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [policy, roles, guard, shape]
+    name: host-lifecycle (${{ matrix.group }})
     # Sized from what the gates measurably take: the run was cancelled at 15
     # minutes after the two connector gates and the fleet gate joined it
     # (measured 2026-09-06, 15m03s with every gate green until the cap), and
@@ -343,21 +394,26 @@ jobs:
           cache: true
 
       - name: Exercise alert ownership migration and teardown
+        if: matrix.group == 'shape'
         run: make alert-lifecycle
 
       - name: Exercise development-host check mode
+        if: matrix.group == 'shape'
         run: make development-check-mode
 
       - name: Guard transactional host-upgrade ordering
+        if: matrix.group == 'shape'
         run: make host-upgrade-order
 
       - name: Pin the fail-closed ledger mount units
+        if: matrix.group == 'shape'
         run: make ledger-mount-render
 
       # billet ships its units twice — the package installs deploy/*.service,
       # the role renders its own templates — and nothing compared them until
       # this. Hardening one and forgetting the other is the failure it catches.
       - name: Prove the packaged units and the role's templates agree
+        if: matrix.group == 'shape'
         run: make unit-parity
 
       # The PostgreSQL ledger shipped and the role read
@@ -365,12 +421,14 @@ jobs:
       # them converged green against the DEFAULT directory, sandboxed and
       # mounted somewhere the control plane does not use.
       - name: Prove the host role converges a PostgreSQL deployment
+        if: matrix.group == 'shape'
         run: make postgres-profile
 
       # The runner itself is the fresh host: no billet account, binary or
       # units. The packaged postinstall pre-creates the account everywhere
       # else, so this is the one place CI sees an operator's first dry run.
       - name: Dry-run the host role against a fresh machine
+        if: matrix.group == 'shape'
         run: make host-fresh-check
 
       # The seam between the two suites: the Go tests prove the emission is a
@@ -378,6 +436,7 @@ jobs:
       # hand, so neither noticed that the default emission was one the role
       # REFUSES. This puts a generated block through the real role.
       - name: Converge the host role with a generated block
+        if: matrix.group == 'roles'
         run: make emitted-block-check
 
       # And the EXAMPLE a stranger copies, with a block generated the way its
@@ -385,6 +444,7 @@ jobs:
       # services disabled; this one enables them, so it covers the input path
       # that requires the App key.
       - name: Converge the shipped example with a generated block
+        if: matrix.group == 'shape'
         run: make example-check
 
       # The other example, as far as a runner without /dev/kvm or a Ceph cluster
@@ -392,6 +452,7 @@ jobs:
       # seam the docker emission broke — a block the role refused before
       # rendering anything, which neither test suite could see.
       - name: Accept a firecracker emission through the role
+        if: matrix.group == 'shape'
         run: make firecracker-example-check
 
       # Both gates above carry the key path the role owns, so neither reaches
@@ -399,6 +460,7 @@ jobs:
       # delete that branch and they stay green. This runs the policy's five
       # cases directly.
       - name: Prove the GitHub App key policy on both paths
+        if: matrix.group == 'roles'
         run: make key-policy-check
 
       # No other suite names a version, so none of them reaches binary.yml —
@@ -413,6 +475,7 @@ jobs:
       # the binaries. The preparation's cases run under sudo, and here that
       # launch is required rather than skipped.
       - name: Prove a converge cannot be driven from a billet runner and prepares its exclusion
+        if: matrix.group == 'guard'
         env:
           BILLET_GATE_REQUIRE_ROOT: "1"
         run: make converge-guard-check
@@ -421,6 +484,7 @@ jobs:
       # configures a key, so every other gate takes its "nothing configured"
       # branch. This runs the refusals and the install against a fake sshd.
       - name: Prove the ssh_access role refuses to lock a host out
+        if: matrix.group == 'roles'
         run: make ssh-access-check
 
       # The two connector roles are the host half of the documented reaching
@@ -428,24 +492,29 @@ jobs:
       # be deleted with everything green. These drive them against fakes that
       # record every call, including that a token reaches no argv.
       - name: Prove the cloudflared connector role
+        if: matrix.group == 'roles'
         run: make cloudflared-connector-check
 
       - name: Prove the WARP connector role
+        if: matrix.group == 'roles'
         run: make warp-connector-check
 
       # The fleet playbook runs ssh_access before the host role, so the role's
       # own converge guard would fire after a key was installed; the playbook
       # repeats the guard first in every play, and only this proves it.
       - name: Prove the fleet playbook's shape and its guard
+        if: matrix.group == 'roles'
         run: make fleet-playbook-check
 
       - name: Prove the pinned-release fetch path
+        if: matrix.group == 'policy'
         run: make release-fetch-check
 
       # Every fetch site was bounded and retried once, after one stalled
       # connection failed a converge behind an approval gate. This is what
       # keeps the next get_url or uri from shipping with the module defaults.
       - name: Prove every fetch is bounded and retried
+        if: matrix.group == 'policy'
         run: make fetch-retry-check
 
       # On systemd 255 the pending-reload flag is set for every unit by any
@@ -454,6 +523,7 @@ jobs:
       # aliases by unit name through a module of this collection, and the role
       # ends with the reload its own enables left pending.
       - name: Prove the dry run compares across a pending daemon-reload
+        if: matrix.group == 'policy'
         run: make dryrun-policy-check
 
       # The hybrid generator writes an inventory and a playbook that the Go
@@ -461,6 +531,7 @@ jobs:
       # the anchor carrying one tier catalogue to both hosts is the seam a
       # library and Ansible could disagree on.
       - name: Prove the generated hybrid shape is one Ansible reads
+        if: matrix.group == 'policy'
         run: make hybrid-emission-check
 
   # Both legs here need the real Debian package, so they share a job: `dist` is
@@ -709,6 +780,7 @@ jobs:
     needs:
       [
         test,
+        test-postgres,
         lint,
         release-config,
         host-lifecycle,

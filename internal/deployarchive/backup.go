@@ -64,6 +64,12 @@ type BackupRequest struct {
 	Now func() time.Time
 	// Hostname is recorded in the manifest as provenance.
 	Hostname string
+	// Authority is the inner authority lock when the COMMAND already holds it
+	// (it took it before its first identity access, as every privileged
+	// entrypoint does), borrowed here and released by the command; nil makes
+	// Write take and release the lock itself, which is what a caller with no
+	// command around it gets.
+	Authority *wirecert.AuthorityLock
 }
 
 // TargetKey is one further target's identity and its App private key.
@@ -193,7 +199,14 @@ func Write(ctx context.Context, req BackupRequest) (Manifest, error) {
 		return Manifest{}, err
 	}
 
-	lock, err := wirecert.LockAuthority(req.StateDir)
+	if req.Authority != nil {
+		// Borrowed: the command holds it from before its first identity access
+		// and releases it after this returns; a second take here would be denied
+		// on the same descriptor family and report another billet.
+		return writeLocked(ctx, req)
+	}
+
+	lock, err := wirecert.LockAuthority(ctx, req.StateDir)
 	if err != nil {
 		return Manifest{}, err
 	}

@@ -6,7 +6,19 @@
   vars:
     billet_host_main_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/main.yml') | from_yaml }}"
     billet_host_service_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/services.yml') | from_yaml }}"
-    billet_host_account_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/account.yml') | from_yaml }}"
+    # account.yml IMPORTS the installed-identity check (installed-identity.yml),
+    # and this gate pins the order of the five tasks that file holds against
+    # account.yml's own; so account.yml is read with that one import expanded in
+    # place, which is what Ansible executes. Any other import stays a task named
+    # by its import line, as before.
+    billet_host_installed_identity_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/installed-identity.yml') | from_yaml }}"
+    billet_host_account_tasks_raw: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/account.yml') | from_yaml }}"
+    billet_host_account_tasks: >-
+      {{ (billet_host_account_tasks_raw[:billet_host_account_import_index])
+         + billet_host_installed_identity_tasks
+         + (billet_host_account_tasks_raw[billet_host_account_import_index + 1:]) }}
+    billet_host_account_import_index: >-
+      {{ (billet_host_account_tasks_raw | map(attribute='name') | list).index('Validate the installed service identity before the account is touched') }}
     billet_host_dryrun_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/dryrun-policy.yml') | from_yaml }}"
     billet_host_handlers: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/handlers/main.yml') | from_yaml }}"
     billet_host_inspection_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/upgrade-inspect.yml') | from_yaml }}"

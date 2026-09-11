@@ -14,6 +14,14 @@
 - name: Prepare the exclusion before anything changes this host
   ansible.builtin.import_tasks: prepare-exclusion.yml
 
+# THE SERVICE-ACCOUNT RECORD, EARLY, on an existing installation: before any
+# retirement dispatch, so a host prepared by an older release is prepared for
+# the exclusion by the converge that first asks anything of it.
+- name: Record the service account and provision the authority locks on an existing installation
+  ansible.builtin.import_tasks: service-account.yml
+  vars:
+    billet_service_account_site: early
+
 - name: Inspect persisted billet installation inputs
   ansible.builtin.stat:
     path: "{{ item }}"
@@ -479,6 +487,12 @@
 # the network for a binary.
 - name: Configure billet account and files
   ansible.builtin.import_tasks: account.yml
+
+# THE SAME RECORD, LATE, on a fresh host: the account it records now exists.
+- name: Record the service account and provision the authority locks on a fresh host
+  ansible.builtin.import_tasks: service-account.yml
+  vars:
+    billet_service_account_site: late
 
 # AFTER account.yml (the state directory and service user exist) and BEFORE
 # services.yml (nothing may start against the root disk while the volume is

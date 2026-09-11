@@ -77,6 +77,31 @@ mkdir -p "${STATE_DIR}"
 chown root:root "${STATE_DIR}"
 chmod 0755 "${STATE_DIR}"
 
+# THE HOST IS PREPARED FOR THE AUTHORITY EXCLUSION HERE, AFTER ITS PARENT
+# EXISTS AND BEFORE ANY UNIT IS TOUCHED. `billet local prepare` records the
+# service account, creates the server's identity directory when it is absent
+# (so no metadata ever exists beside a missing directory), and provisions or
+# repairs both authority locks by descriptor. It authorises nothing: its answer
+# carries the published authority STATUS, and a closed one (a retired
+# controller) is what the unit decisions below refuse on. Run on install AND
+# on upgrade, because an installation prepared by an older package has neither
+# the record nor the global lock, and its first unprivileged restart would
+# otherwise meet a lock it cannot open. A binary that lacks the command is an
+# older billet being replaced; it says so and this script goes on.
+PREPARE_STATUS=absent
+if [ -x /usr/bin/billet ]; then
+    if prepared=$(/usr/bin/billet local prepare --json 2>&1); then
+        case "${prepared}" in
+            *'"closed":true'*) PREPARE_STATUS=closed ;;
+            *) PREPARE_STATUS=open ;;
+        esac
+    else
+        echo "billet: this host could not be prepared for the authority exclusion:" >&2
+        echo "        ${prepared}" >&2
+        echo "        Run \`billet local prepare\` as root once the cause is fixed." >&2
+    fi
+fi
+
 # CREATED RATHER THAN PACKAGED, so removing the package cannot erase a jail that
 # still holds guest state. The node unit makes this path writable through its
 # otherwise read-only filesystem view; a fresh Firecracker install therefore
@@ -95,40 +120,42 @@ chmod 0750 "${CONF_DIR}"
 # it, while the deployment identity and the App key survive separately. That
 # leaves a half-recoverable machine, which is the state all of this exists to
 # avoid. The template lives under /usr/share/billet and is copied here once.
-if [ ! -e "${CONF}" ]; then
-    if [ -e "${TEMPLATE}" ]; then
-        cp "${TEMPLATE}" "${CONF}"
-    else
-        # Loud, because the alternative is a machine with no config and nothing
-        # to say why.
-        echo "billet: ${TEMPLATE} is missing, so ${CONF} was not created." >&2
-        echo "        Copy billet.example.yaml there before starting billet." >&2
+# UNDER THE LIFECYCLE LOCK, WITH THE STATUS RE-READ THERE. Seeding a config and
+# enabling timers are decisions about the host's state, and a retirement running
+# on this host (or finishing between the prepare above and here) changes their
+# answer: an ABSENT config is a completed server-only retirement's postcondition,
+# not a gap to fill, and a retired controller's timers stay disabled. So every
+# such action runs inside the same flock `billet local up` and `local down`
+# hold, waits at most sixty seconds for it, and asks the status again inside.
+# On contention past the bound nothing is touched: a package install must not
+# fail a system upgrade for a lifecycle operation in flight, and the message
+# names what was left and the retry that performs it (the package's own
+# reconfiguration re-runs this script; `billet local up` needs a valid config
+# and an intended start, so it is not the retry for an unseeded host).
+LIFECYCLE_LOCK=/var/lock/billet-lifecycle.lock
+
+seed_config() {
+    if [ ! -e "${CONF}" ]; then
+        if [ -e "${TEMPLATE}" ]; then
+            cp "${TEMPLATE}" "${CONF}"
+        else
+            # Loud, because the alternative is a machine with no config and nothing
+            # to say why.
+            echo "billet: ${TEMPLATE} is missing, so ${CONF} was not created." >&2
+            echo "        Copy billet.example.yaml there before starting billet." >&2
+        fi
     fi
-fi
 
-if [ -e "${CONF}" ]; then
-    # root owns it so an unprivileged process cannot edit what billet trusts;
-    # the billet group can read it or the service cannot start at all.
-    chown root:billet "${CONF}"
-    chmod 0640 "${CONF}"
-fi
+    if [ -e "${CONF}" ]; then
+        # root owns it so an unprivileged process cannot edit what billet trusts;
+        # the billet group can read it or the service cannot start at all.
+        chown root:billet "${CONF}"
+        chmod 0640 "${CONF}"
+    fi
+}
 
-# THE APP KEY IS OWNED BY THE SERVICE USER AT 0600, and it is the one file here
-# that cannot be root-owned-and-group-readable.
-#
-# billet refuses any App key with group or other bits set (githubapp.go, the
-# perm&0o077 check) — a private key readable by a group is one that leaks through
-# a group. So 0640 root:billet, which is right for the config, makes the server
-# refuse to start; and 0600 root:root is unreadable by the service. The only
-# arrangement that satisfies both is the ordinary Unix one: the process that
-# needs the secret owns the secret.
-if [ -e "${KEY}" ]; then
-    chown billet:billet "${KEY}"
-    chmod 0600 "${KEY}"
-fi
-
-if [ -d /run/systemd/system ]; then
-    systemctl daemon-reload || true
+enable_timers() {
+    [ -d /run/systemd/system ] || return 0
 
     # THE ONE EXCEPTION TO "THE PACKAGE ENABLES NOTHING". That rule keeps an
     # install from connecting a machine to GitHub before billet.yaml says
@@ -147,6 +174,66 @@ if [ -d /run/systemd/system ]; then
             echo "        need \`systemctl enable --now ${timer}\` once systemd is running." >&2
         fi
     done
+}
+
+# unit_decisions runs under the lifecycle lock (or, when flock is missing,
+# with that stated). The status is asked again here, inside the exclusion.
+unit_decisions() {
+    status="${PREPARE_STATUS}"
+    if [ -x /usr/bin/billet ]; then
+        if again=$(/usr/bin/billet local prepare --json 2>/dev/null); then
+            case "${again}" in *'"closed":true'*) status=closed ;; *) status=open ;; esac
+        fi
+    fi
+
+    if [ "${status}" = closed ]; then
+        echo "billet: this controller retired; its configuration is left absent and no unit" >&2
+        echo "        is enabled or started. A retired controller stays retired." >&2
+        return 0
+    fi
+
+    seed_config
+    enable_timers
+}
+
+if command -v flock >/dev/null 2>&1; then
+    mkdir -p "$(dirname "${LIFECYCLE_LOCK}")"
+    # THE LOCK ON A DESCRIPTOR OF THIS SHELL, so the functions above run under it
+    # in this process; `flock <file> <command>` would need a second script.
+    exec 9>>"${LIFECYCLE_LOCK}"
+    if flock -w 60 9; then
+        unit_decisions
+        flock -u 9
+    else
+        echo "billet: a billet lifecycle operation holds ${LIFECYCLE_LOCK}, so this install" >&2
+        echo "        left ${CONF} unseeded (if it was absent) and billet-upgrade.timer and" >&2
+        echo "        billet-images-refresh.timer as they were. Automatic maintenance is" >&2
+        echo "        DEFERRED on this host until the deferred work runs: once the operation" >&2
+        echo "        has finished, \`dpkg-reconfigure billet\` (or a reinstall) re-runs these" >&2
+        echo "        decisions with the status re-read." >&2
+    fi
+else
+    echo "billet: flock(1) is missing, so the unit decisions cannot be excluded against a" >&2
+    echo "        lifecycle operation; ${CONF} was not seeded and no timer was enabled." >&2
+    echo "        Install util-linux and run \`dpkg-reconfigure billet\`." >&2
+fi
+
+# THE APP KEY IS OWNED BY THE SERVICE USER AT 0600, and it is the one file here
+# that cannot be root-owned-and-group-readable.
+#
+# billet refuses any App key with group or other bits set (githubapp.go, the
+# perm&0o077 check) — a private key readable by a group is one that leaks through
+# a group. So 0640 root:billet, which is right for the config, makes the server
+# refuse to start; and 0600 root:root is unreadable by the service. The only
+# arrangement that satisfies both is the ordinary Unix one: the process that
+# needs the secret owns the secret.
+if [ -e "${KEY}" ]; then
+    chown billet:billet "${KEY}"
+    chmod 0600 "${KEY}"
+fi
+
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
 
     # A DROP-IN CAN OUTLIVE THE ASSUMPTION IT WAS WRITTEN UNDER. These units
     # are Type=notify: the service is ready when billet's MAIN process sends

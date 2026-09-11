@@ -410,6 +410,30 @@ func markerPath(stateDir string) string {
 // CADir is where a deployment's authority lives inside its state directory.
 func CADir(stateDir string) string { return filepath.Join(stateDir, "ca") }
 
+// THE AUTHORITY'S FILES BY NAME, exported so the command that hands a
+// root-created authority back to the service account names exactly what this
+// package writes and nothing else; a second spelling of any of these in cmd/
+// is a file the hand-back misses or a file it should never have touched.
+
+// AuthorityMarkerPath is the marker that witnesses an authority was created.
+func AuthorityMarkerPath(stateDir string) string { return markerPath(stateDir) }
+
+// CACertPath is the current authority's certificate.
+func CACertPath(stateDir string) string { return filepath.Join(CADir(stateDir), "ca.crt") }
+
+// CAKeyPath is the current authority's private key.
+func CAKeyPath(stateDir string) string { return filepath.Join(CADir(stateDir), "ca.key") }
+
+// PreviousCACertPath is the retiring authority's certificate during a rotation.
+func PreviousCACertPath(stateDir string) string {
+	return filepath.Join(CADir(stateDir), previousCAFile)
+}
+
+// PreviousCAKeyPath is the retiring authority's key during a rotation.
+func PreviousCAKeyPath(stateDir string) string {
+	return filepath.Join(CADir(stateDir), previousCAKeyFile)
+}
+
 // noteAuthority records that an authority exists, idempotently.
 func noteAuthority(stateDir, deployment string) error {
 	path := markerPath(stateDir)

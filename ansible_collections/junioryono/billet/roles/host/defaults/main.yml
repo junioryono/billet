@@ -85,6 +85,10 @@ billet_service_user: billet
 billet_service_group: billet
 billet_service_home: /var/lib/billet
 billet_adopt_existing_service_account: false
+# billet_authority_closed is set by service-account.yml from `billet local
+# prepare`'s answer: true on a controller whose retirement has closed its
+# authority (status `stopped` or later). Nothing reads it before that file runs.
+billet_authority_closed: false
 billet_enable_server: true
 # Prepare a control-plane host WITHOUT commissioning it: the ledger volume is
 # formatted, mounted and proved, the units are installed with their mount fence,

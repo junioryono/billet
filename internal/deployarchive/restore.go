@@ -150,7 +150,11 @@ type journal struct {
 
 // RestoreRequest is what Execute acts on.
 type RestoreRequest struct {
-	Plan Plan
+	// Authority is the inner authority lock when the COMMAND already holds it,
+	// borrowed here and released by the command; nil makes Execute take and
+	// release it itself, after the directory lock.
+	Authority *wirecert.AuthorityLock
+	Plan      Plan
 
 	// InstallAppKey publishes the App private key at a path that must not
 	// already exist, creating it exactly once and never replacing anything.
@@ -261,7 +265,16 @@ func Execute(ctx context.Context, req RestoreRequest) (Result, error) {
 	// takes them in (its ledger handle may already hold the directory lock before
 	// Write asks for the authority), so the two cannot deadlock against each
 	// other.
-	authority, err := wirecert.LockAuthority(stateDir)
+	if req.Authority != nil {
+		// Borrowed from the command, which took it before its first identity
+		// access (authority before directory, the order every command now takes
+		// them in) and releases it after this returns.
+		res, runErr := executeLocked(ctx, req)
+
+		return res, errors.Join(runErr, lock.Release())
+	}
+
+	authority, err := wirecert.LockAuthority(ctx, stateDir)
 	if err != nil {
 		return Result{}, errors.Join(err, lock.Release())
 	}
@@ -1376,7 +1389,7 @@ func Abandon(ctx context.Context, a *Archive, t Target, intent Intent) (AbandonR
 	// The authority lock for the same reason Execute takes it, and in the same
 	// order: this REMOVES authority files, and a concurrent rotation reading them
 	// would see half a generation.
-	authority, err := wirecert.LockAuthority(t.StateDir)
+	authority, err := wirecert.LockAuthority(ctx, t.StateDir)
 	if err != nil {
 		return AbandonResult{}, errors.Join(err, lock.Release())
 	}

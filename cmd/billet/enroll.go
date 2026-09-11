@@ -267,13 +267,20 @@ func cmdNodesDecide(ctx context.Context, args []string, decision string) error {
 			return err
 		}
 
-		deployment, err := state.DeploymentID(cfg.Server.IdentityDir)
+		// THE EXCLUSION BEFORE THE FIRST IDENTITY ACCESS: both reads below create on
+		// first use, and a retirement renames what they would create into.
+		acc, err := openIdentityAccess(ctx, cfg.Server.IdentityDir, identityIntent{create: true, wait: identityAccessWait})
 		if err != nil {
 			return err
 		}
 
-		ca, err := wirecert.LoadOrCreateCA(cfg.Server.IdentityDir, deployment)
+		deployment, err := state.DeploymentID(cfg.Server.IdentityDir)
 		if err != nil {
+			return errors.Join(err, acc.Release())
+		}
+
+		ca, err := wirecert.LoadOrCreateCA(cfg.Server.IdentityDir, deployment)
+		if err := errors.Join(err, acc.Release()); err != nil {
 			return err
 		}
 
@@ -820,13 +827,20 @@ func cmdCARotate(ctx context.Context, args []string) error {
 		return errors.New("rotating is done on the control plane, and this config has no server section")
 	}
 
-	deployment, err := state.DeploymentID(cfg.Server.IdentityDir)
+	acc, err := openIdentityAccess(ctx, cfg.Server.IdentityDir, identityIntent{wait: identityAccessWait})
 	if err != nil {
 		return err
 	}
 
-	ca, err := wirecert.Rotate(cfg.Server.IdentityDir, deployment)
+	deployment, err := state.DeploymentID(cfg.Server.IdentityDir)
 	if err != nil {
+		return errors.Join(err, acc.Release())
+	}
+
+	// UNDER THE LOCK THE COMMAND ALREADY HOLDS, released before the publication
+	// below takes its own.
+	ca, err := wirecert.RotateWith(acc.Lock(), cfg.Server.IdentityDir, deployment)
+	if err := errors.Join(err, acc.Release()); err != nil {
 		return err
 	}
 
@@ -904,12 +918,17 @@ func cmdCARetire(ctx context.Context, args []string) error {
 	// THIS deployment's — a coherent authority belonging to somebody else is one
 	// LoadOrCreateCA will not start on, so the previous pair beside it is the
 	// only authority here that means anything.
-	deployment, err := state.DeploymentID(cfg.Server.IdentityDir)
+	acc, err := openIdentityAccess(ctx, cfg.Server.IdentityDir, identityIntent{wait: identityAccessWait})
 	if err != nil {
 		return err
 	}
 
-	if err := wirecert.Retire(cfg.Server.IdentityDir, deployment); err != nil {
+	deployment, err := state.DeploymentID(cfg.Server.IdentityDir)
+	if err != nil {
+		return errors.Join(err, acc.Release())
+	}
+
+	if err := errors.Join(wirecert.RetireWith(acc.Lock(), cfg.Server.IdentityDir, deployment), acc.Release()); err != nil {
 		return err
 	}
 

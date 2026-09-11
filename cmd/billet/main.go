@@ -532,9 +532,17 @@ func runServer(
 	//
 	// FOUNDED HERE IN THE ORDINARY CASE, before the database is opened. Whichever
 	// role starts first mints it; the other reads that same file.
-	deployment, err := state.DeploymentID(cfg.Server.IdentityDir)
+	// THE EXCLUSION AROUND THE IDENTITY READ AND THE OPEN, released before the
+	// claim's wait (a standby can wait for days, and a backup must not wait with
+	// it) and taken again after promotion around the authority load.
+	acc, err := serverIdentityAccess(ctx, cfg.Server.IdentityDir)
 	if err != nil {
 		return err
+	}
+
+	deployment, err := state.DeploymentID(cfg.Server.IdentityDir)
+	if err != nil {
+		return errors.Join(err, acc.Release())
 	}
 
 	// A STANDBY OPENS A HANDLE THAT CANNOT WRITE, which is what makes "does
@@ -553,7 +561,9 @@ func runServer(
 		db, err = openState(ctx, cfg)
 	}
 
-	if err != nil {
+	// THE ACCESS ENDS WITH THE OPEN, whatever the open said: what follows waits
+	// on the claim, and nothing waits on a lock while it does.
+	if err := errors.Join(err, acc.Release()); err != nil {
 		return fmt.Errorf("server state: %w", err)
 	}
 
@@ -1021,9 +1031,17 @@ func serveNodeWire(
 	addr := cfg.Server.Listen
 	loopback := nodeplane.LoopbackOnly(addr)
 
-	deployment, err := state.DeploymentID(cfg.Server.IdentityDir)
+	// THE ACCESS AGAIN, AFTER PROMOTION: the authority load below reads (and
+	// on first use creates) the CA, and a retirement of this host cannot be
+	// running while the server it stops first is here, but a rotation can.
+	acc, err := serverIdentityAccess(ctx, cfg.Server.IdentityDir)
 	if err != nil {
 		return nil, err
+	}
+
+	deployment, err := state.DeploymentID(cfg.Server.IdentityDir)
+	if err != nil {
+		return nil, errors.Join(err, acc.Release())
 	}
 
 	var (
@@ -1063,7 +1081,7 @@ func serveNodeWire(
 		Enrollments: enrollments,
 		CachePolicy: cachePolicy,
 	})
-	if err != nil {
+	if err := errors.Join(err, acc.Release()); err != nil {
 		return nil, err
 	}
 
@@ -2350,7 +2368,7 @@ func cmdCA(ctx context.Context, args []string) error {
 	case "retire":
 		return cmdCARetire(ctx, args[1:])
 	case "show":
-		return cmdCAShow(args[1:])
+		return cmdCAShow(ctx, args[1:])
 	case "sync":
 		return cmdCASync(ctx, args[1:])
 	}
@@ -2555,13 +2573,18 @@ func cmdCAIssue(ctx context.Context, args []string) error {
 			"authority; run this on the control plane", *cfgPath)
 	}
 
-	deployment, err := state.DeploymentID(cfg.Server.IdentityDir)
+	acc, err := openIdentityAccess(ctx, cfg.Server.IdentityDir, identityIntent{create: true, wait: identityAccessWait})
 	if err != nil {
 		return err
 	}
 
-	authority, err := wirecert.LoadServing(cfg.Server.IdentityDir, deployment)
+	deployment, err := state.DeploymentID(cfg.Server.IdentityDir)
 	if err != nil {
+		return errors.Join(err, acc.Release())
+	}
+
+	authority, err := wirecert.LoadServing(cfg.Server.IdentityDir, deployment)
+	if err := errors.Join(err, acc.Release()); err != nil {
 		return err
 	}
 
@@ -2708,7 +2731,7 @@ func recordIssued(ctx context.Context, cfgPath, name string, bundle wirecert.Bun
 	return nil
 }
 
-func cmdCAShow(args []string) error {
+func cmdCAShow(ctx context.Context, args []string) error {
 	fs := newFlagSet("billet ca show")
 	cfgPath := addConfigFlag(fs)
 
@@ -2726,13 +2749,18 @@ func cmdCAShow(args []string) error {
 			"authority", *cfgPath)
 	}
 
-	deployment, err := state.DeploymentID(cfg.Server.IdentityDir)
+	acc, err := openIdentityAccess(ctx, cfg.Server.IdentityDir, identityIntent{create: true, wait: identityAccessWait})
 	if err != nil {
 		return err
 	}
 
-	ca, err := wirecert.LoadOrCreateCA(cfg.Server.IdentityDir, deployment)
+	deployment, err := state.DeploymentID(cfg.Server.IdentityDir)
 	if err != nil {
+		return errors.Join(err, acc.Release())
+	}
+
+	ca, err := wirecert.LoadOrCreateCA(cfg.Server.IdentityDir, deployment)
+	if err := errors.Join(err, acc.Release()); err != nil {
 		return err
 	}
 

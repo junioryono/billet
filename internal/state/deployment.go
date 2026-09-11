@@ -25,6 +25,11 @@ const deploymentIDFile = "deployment-id"
 // file longer than this is not one billet wrote.
 const maxDeploymentIDBytes = 4096
 
+// DeploymentIDPath is where the identity lives for a state directory, exported
+// so the command that hands a root-created identity back to the service account
+// names the file this package writes.
+func DeploymentIDPath(stateDir string) string { return filepath.Join(stateDir, deploymentIDFile) }
+
 // recoverIdentityAdvice is what an operator is told when the identity is gone or
 // unusable. One string, used by every branch that can say it.
 //

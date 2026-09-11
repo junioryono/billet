@@ -31,12 +31,12 @@ func authorityDir(t *testing.T) (string, string) {
 func TestTheAuthorityLockExcludesASecondHolder(t *testing.T) {
 	dir, _ := authorityDir(t)
 
-	first, err := LockAuthority(dir)
+	first, err := LockAuthority(t.Context(), dir)
 	if err != nil {
 		t.Fatalf("LockAuthority: %v", err)
 	}
 
-	if _, err := LockAuthority(dir); err == nil {
+	if _, err := LockAuthority(t.Context(), dir); err == nil {
 		t.Fatal("a second holder took the authority lock")
 	} else if !strings.Contains(err.Error(), "ca rotate") {
 		t.Errorf("the refusal does not name the commands that share the lock: %v", err)
@@ -48,7 +48,7 @@ func TestTheAuthorityLockExcludesASecondHolder(t *testing.T) {
 
 	// AND IT LETS GO. A lock that never released would satisfy the assertion
 	// above and wedge every rotation and backup on the host.
-	second, err := LockAuthority(dir)
+	second, err := LockAuthority(t.Context(), dir)
 	if err != nil {
 		t.Fatalf("the lock was not released: %v", err)
 	}
@@ -66,16 +66,16 @@ func TestTheAuthorityLockExcludesASecondHolder(t *testing.T) {
 func TestRotateAndRetireTakeTheAuthorityLockThemselves(t *testing.T) {
 	dir, deployment := authorityDir(t)
 
-	held, err := LockAuthority(dir)
+	held, err := LockAuthority(t.Context(), dir)
 	if err != nil {
 		t.Fatalf("LockAuthority: %v", err)
 	}
 
-	if _, err := Rotate(dir, deployment); err == nil {
+	if _, err := Rotate(t.Context(), dir, deployment); err == nil {
 		t.Error("Rotate ran while the authority lock was held")
 	}
 
-	if err := Retire(dir, deployment); err == nil {
+	if err := Retire(t.Context(), dir, deployment); err == nil {
 		t.Error("Retire ran while the authority lock was held")
 	}
 
@@ -85,11 +85,11 @@ func TestRotateAndRetireTakeTheAuthorityLockThemselves(t *testing.T) {
 
 	// BOTH DIRECTIONS: with the lock free they work, or the assertions above
 	// would pass against a Rotate that had simply been broken.
-	if _, err := Rotate(dir, deployment); err != nil {
+	if _, err := Rotate(t.Context(), dir, deployment); err != nil {
 		t.Fatalf("Rotate with the lock free: %v", err)
 	}
 
-	if err := Retire(dir, deployment); err != nil {
+	if err := Retire(t.Context(), dir, deployment); err != nil {
 		t.Fatalf("Retire with the lock free: %v", err)
 	}
 }
@@ -114,7 +114,7 @@ func TestReadAuthorityCollectsTheWholeUnit(t *testing.T) {
 		t.Error("a deployment with no rotation reports one")
 	}
 
-	if _, err := Rotate(dir, deployment); err != nil {
+	if _, err := Rotate(t.Context(), dir, deployment); err != nil {
 		t.Fatalf("Rotate: %v", err)
 	}
 
@@ -189,7 +189,7 @@ func TestAnIncompleteAuthorityIsRefused(t *testing.T) {
 func TestHalfOfAPreviousAuthorityIsRefused(t *testing.T) {
 	dir, deployment := authorityDir(t)
 
-	if _, err := Rotate(dir, deployment); err != nil {
+	if _, err := Rotate(t.Context(), dir, deployment); err != nil {
 		t.Fatalf("Rotate: %v", err)
 	}
 
@@ -272,7 +272,7 @@ func TestUnexpectedFilesAreNamedRatherThanCaptured(t *testing.T) {
 
 	// THE LOCK FILE IS NOT UNEXPECTED. It is billet's own, and naming it every
 	// time would train an operator to ignore this list.
-	if _, err := LockAuthority(dir); err != nil {
+	if _, err := LockAuthority(t.Context(), dir); err != nil {
 		t.Fatalf("LockAuthority: %v", err)
 	}
 }

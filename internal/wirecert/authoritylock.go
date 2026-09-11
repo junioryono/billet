@@ -1,11 +1,16 @@
 package wirecert
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"syscall"
+	"time"
+
+	"github.com/junioryono/billet/internal/retirement"
 )
 
 // authorityLockFile is the lock's name inside the state directory.
@@ -27,6 +32,93 @@ func AuthorityLockPath(stateDir string) string {
 	return filepath.Join(stateDir, authorityLockFile)
 }
 
+// Exclusion is what a caller holds, or is entitled to, when it takes the inner
+// lock. It is resolved once per command from the host's metadata and handed to
+// every helper the command calls; nothing re-resolves it further down.
+type Exclusion struct {
+	// Hold is the global authority lock, held and admitted, on a host an
+	// installer has prepared. Borrowed by the inner lock, released by whoever
+	// resolved it.
+	Hold *retirement.Hold
+	// Legacy says the host has no service-account record and positively no
+	// global lock, so the inner lock is the whole exclusion, as it was before the
+	// global one existed, with one addition: after taking it the caller rechecks
+	// for the global lock and hands off to it when an installer has published one
+	// meanwhile.
+	Legacy bool
+	// Wait bounds a blocking acquisition. Zero is the operator command's
+	// non-blocking take, which reports what already holds the lock rather than
+	// queueing silently behind it.
+	Wait time.Duration
+	// Account is the recorded service account when the host is prepared; a
+	// privileged creator of the inner lock gives the file to it.
+	Account *retirement.ServiceAccount
+
+	ownsHold bool
+}
+
+// ResolveExclusion classifies the host for stateDir and takes what the
+// classification requires: the global lock, admitted, on a prepared host; the
+// legacy marker on a host with no metadata; a refusal on a damaged one.
+//
+// A FRESH host (no metadata, directory absent) resolves as legacy for the
+// lock's purposes: the caller that creates the directory does so under the
+// initialisation lock beside it, which is not this function's business, and the
+// inner lock is then taken inside what it created.
+func ResolveExclusion(ctx context.Context, stateDir string, wait time.Duration) (Exclusion, error) {
+	if !retirement.SupportedHere() {
+		return Exclusion{Legacy: true, Wait: wait}, nil
+	}
+
+	class, err := retirement.Classify(stateDir)
+	if err != nil {
+		return Exclusion{}, err
+	}
+
+	switch class.Mode {
+	case retirement.ModePrepared:
+		hold, err := acquireGlobal(ctx, wait, &class.Account)
+		if err != nil {
+			return Exclusion{}, err
+		}
+
+		if err := hold.Admit(); err != nil {
+			return Exclusion{}, errors.Join(err, hold.Release())
+		}
+
+		acct := class.Account
+
+		return Exclusion{Hold: hold, Wait: wait, Account: &acct, ownsHold: true}, nil
+	default:
+		return Exclusion{Legacy: true, Wait: wait}, nil
+	}
+}
+
+// acquireGlobal takes the global lock under wait (a zero wait is one attempt).
+func acquireGlobal(ctx context.Context, wait time.Duration, acct *retirement.ServiceAccount) (*retirement.Hold, error) {
+	if wait <= 0 {
+		wait = time.Millisecond
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, wait)
+	defer cancel()
+
+	return retirement.Acquire(ctx, retirement.AcquireOptions{Privileged: os.Geteuid() == 0, Account: acct})
+}
+
+// Release drops whatever the resolution took. A hold the caller supplied is
+// the caller's to release and is left alone.
+func (e *Exclusion) Release() error {
+	if e == nil || !e.ownsHold || e.Hold == nil {
+		return nil
+	}
+
+	err := e.Hold.Release()
+	e.Hold, e.ownsHold = nil, false
+
+	return err
+}
+
 // AuthorityLock is an exclusive hold on a deployment's certificate authority.
 //
 // WHAT IT PREVENTS is a reader capturing half a rotation. `billet ca rotate`
@@ -37,45 +129,157 @@ func AuthorityLockPath(stateDir string) string {
 // the previous pair. A backup is exactly such a reader, and the archive it
 // writes would load cleanly and verify nothing.
 //
-// WHAT IT DOES NOT COVER, AND WHY THAT IS NOW SAFE. `LoadServing` — which is
-// the whole of the control plane's read, and runs ONCE while it starts — does
-// not take it, and neither does `LoadOrCreateCA` behind it. The renewal signer
-// is not in the set at all: `SignNodeCSR` signs with the in-memory *CA and reads
-// nothing from disk.
+// AND, SINCE THE RETIREMENT, WHAT ELSE: a controller's retirement renames the
+// whole identity directory, and every writer of it now holds this lock (and,
+// on a prepared host, the global one) from before its first identity access,
+// so the rename waits for a writer inside the directory and a writer arriving
+// after it finds the directory gone and creates nothing.
 //
-// So the only thing a rotation can collide with is a control plane STARTING, and
-// that is closed by publication ORDER rather than by this lock. Rotate writes
-// ca-previous.crt before ca-previous.key and Retire removes them the other way
-// round, so a certificate with no key beside it always means "started, not
-// committed" and the reader presents with the current authority; and the one
-// torn read the two renames of the current pair can produce is repaired from
-// ca-previous.key, which is durable before the first rename. Every instant of a
-// rotation is therefore a state a reader answers correctly. See LoadServing.
-//
-// TAKING IT IN THE READER WAS THE OTHER CANDIDATE AND WAS REJECTED. It is
-// non-blocking on purpose — every holder is a command somebody is waiting on —
-// so a reader would need a waiting acquisition, and `billet local backup` holds
-// this across the whole ledger snapshot. A control plane that refuses to start
-// because a backup is running is a worse failure than the diagnostic being
-// fixed, and a startup path that took this lock could not call anything else
-// that takes it: a second flock on a separate descriptor in one process is
-// denied, so it would deadlock against itself and report another billet.
+// WHAT IT DOES NOT COVER, AND WHY THAT IS SAFE. `LoadServing` — the control
+// plane's read while it starts — takes it only through the server's own
+// resolution on a prepared host; on a host no installer has prepared it takes
+// nothing, as before, because no retirement can run there and a rotation's
+// publication ORDER already makes every instant a state a reader answers
+// correctly (see LoadServing).
 type AuthorityLock struct {
 	f    *os.File
 	path string
+	// hold is a global hold this lock took itself during a legacy handoff, and
+	// releases with itself; a hold the exclusion already carried is not this
+	// lock's to release.
+	hold *retirement.Hold
 }
 
-// LockAuthority takes the lock, or names what already holds it.
-//
-// NON-BLOCKING, on the same argument the lifecycle lock makes: the operator who
-// started a second command wants to be told what is already running, not queued
-// silently behind a rotation.
+// LockAuthority takes the inner lock with the exclusion resolved here: one
+// non-blocking attempt at both locks, as an operator command wants (it is told
+// what already holds the lock rather than queued behind a rotation).
 //
 // It is a real exclusion between PROCESSES and also within one — measured on
 // darwin, a second flock on a separate descriptor in the same process is denied
 // with EWOULDBLOCK — so a caller holding this must not call anything that takes
-// it again.
-func LockAuthority(stateDir string) (*AuthorityLock, error) {
+// it again. A command that has already resolved its exclusion passes it to
+// LockAuthorityWith instead.
+func LockAuthority(ctx context.Context, stateDir string) (*AuthorityLock, error) {
+	ex, err := ResolveExclusion(ctx, stateDir, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	lock, err := LockAuthorityWith(ctx, stateDir, ex)
+	if err != nil {
+		return nil, errors.Join(err, ex.Release())
+	}
+
+	// The resolution's hold travels with the lock, so one Release drops both.
+	if ex.ownsHold {
+		lock.hold, ex.ownsHold = ex.Hold, false
+	}
+
+	return lock, nil
+}
+
+// LockAuthorityWith takes the inner lock under an exclusion the caller resolved.
+//
+// A nil or released hold on a non-legacy exclusion refuses: nothing may reach
+// the identity directory on a prepared host without the global lock admitted.
+// On the legacy path the inner lock is taken and then the global lock is
+// RECHECKED under it: an installer that published one meanwhile is handed off
+// to in the one lock order (global, then inner), the configured pathname is
+// looked up afresh, and the status admits or refuses.
+func LockAuthorityWith(ctx context.Context, stateDir string, ex Exclusion) (*AuthorityLock, error) {
+	if !ex.Legacy && ex.Hold == nil {
+		return nil, errors.New("wirecert: the authority lock needs the global hold on a prepared host, and none was passed")
+	}
+
+	before, err := identityOf(stateDir)
+	if err != nil {
+		return nil, err
+	}
+
+	lock, err := lockInner(ctx, stateDir, ex)
+	if err != nil {
+		return nil, err
+	}
+
+	if !ex.Legacy || !retirement.SupportedHere() {
+		return lock, nil
+	}
+
+	present, err := retirement.GlobalLockPresent()
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("wirecert: recheck for the global authority lock: %w", err), lock.Release())
+	}
+
+	if !present {
+		return lock, nil
+	}
+
+	// THE HANDOFF: an installer published the global lock while this caller was
+	// on the legacy path. Release the inner lock (never wait on the global one
+	// while holding it: the installer waits on this one), take the global lock,
+	// take the inner lock again, and re-validate: the configured pathname must
+	// still be the directory seen before (a retirement in the gap moved it, and
+	// an absent or replaced pathname refuses), and the status must admit.
+	if err := lock.Release(); err != nil {
+		return nil, err
+	}
+
+	hold, err := acquireGlobal(ctx, ex.Wait, nil)
+	if err != nil {
+		return nil, fmt.Errorf("wirecert: hand off to the global authority lock an installer published: %w", err)
+	}
+
+	after, err := identityOf(stateDir)
+	if err != nil {
+		return nil, errors.Join(err, hold.Release())
+	}
+
+	if after.absent {
+		return nil, errors.Join(fmt.Errorf("wirecert: %s is gone since this command looked at it; a retirement moved it, "+
+			"and billet will not recreate it", stateDir), hold.Release())
+	}
+
+	if !before.absent && !os.SameFile(before.info, after.info) {
+		return nil, errors.Join(fmt.Errorf("wirecert: %s is not the directory this command first saw; "+
+			"billet will not act on a replacement", stateDir), hold.Release())
+	}
+
+	if err := hold.Admit(); err != nil {
+		return nil, errors.Join(err, hold.Release())
+	}
+
+	relocked, err := lockInner(ctx, stateDir, Exclusion{Hold: hold, Wait: ex.Wait})
+	if err != nil {
+		return nil, errors.Join(err, hold.Release())
+	}
+
+	relocked.hold = hold
+
+	return relocked, nil
+}
+
+// pathIdentity is what a fresh lookup of the configured pathname answers: the
+// directory's identity for os.SameFile, or its positive absence.
+type pathIdentity struct {
+	absent bool
+	info   os.FileInfo
+}
+
+func identityOf(path string) (pathIdentity, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return pathIdentity{absent: true}, nil
+		}
+
+		return pathIdentity{}, fmt.Errorf("wirecert: examine %s: %w", path, err)
+	}
+
+	return pathIdentity{info: info}, nil
+}
+
+// lockInner opens and flocks the inner lock, creating it when absent.
+func lockInner(ctx context.Context, stateDir string, ex Exclusion) (*AuthorityLock, error) {
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
 		return nil, fmt.Errorf("wirecert: create %s: %w", stateDir, err)
 	}
@@ -85,31 +289,77 @@ func LockAuthority(stateDir string) (*AuthorityLock, error) {
 	// O_NOFOLLOW: the lock is only worth anything if it is on the inode this
 	// path names, and a symlink here would silently move the exclusion somewhere
 	// else — after which two commands rewrite one authority believing they are
-	// alone.
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o600)
+	// alone. READ-ONLY when it exists, because flock(2) needs no write access and
+	// the service account has to be able to take a root-created one.
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
 	if err != nil {
-		return nil, fmt.Errorf("wirecert: open the authority lock %s: %w", path, err)
-	}
-
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		_ = f.Close()
-
-		if errors.Is(err, syscall.EWOULDBLOCK) {
-			return nil, fmt.Errorf(
-				"wirecert: another billet is working on this deployment's certificate authority "+
-					"(%s is held). `billet ca rotate`, `billet ca retire`, `billet local backup` "+
-					"and `billet local restore` take it in turn so none of them sees half a "+
-					"rotation — wait for the other one to finish", path)
+		if !errors.Is(err, fs.ErrNotExist) {
+			return nil, fmt.Errorf("wirecert: open the authority lock %s: %w", path, err)
 		}
 
-		return nil, fmt.Errorf("wirecert: lock %s: %w", path, err)
+		f, err = createInnerLock(path, ex.Account)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if ex.Wait <= 0 {
+		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+			if errors.Is(err, syscall.EWOULDBLOCK) {
+				return nil, errors.Join(fmt.Errorf(
+					"wirecert: another billet is working on this deployment's certificate authority "+
+						"(%s is held). `billet ca rotate`, `billet ca retire`, `billet local backup` "+
+						"and `billet local restore` take it in turn so none of them sees half a "+
+						"rotation — wait for the other one to finish", path), f.Close())
+			}
+
+			return nil, errors.Join(fmt.Errorf("wirecert: lock %s: %w", path, err), f.Close())
+		}
+
+		return &AuthorityLock{f: f, path: path}, nil
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, ex.Wait)
+	defer cancel()
+
+	if err := retirement.FlockUnder(waitCtx, f, 0); err != nil {
+		return nil, errors.Join(fmt.Errorf("wirecert: lock %s: %w", path, err), f.Close())
 	}
 
 	return &AuthorityLock{f: f, path: path}, nil
 }
 
-// Release drops the lock. Closing the descriptor releases it, so a process that
-// exits cannot leave one held.
+// createInnerLock creates the lock file, O_EXCL so two creators share one
+// inode, and gives it to the recorded service account when a privileged caller
+// creates it on a prepared host: a root-owned 0600 lock is one the server
+// cannot open at its next start.
+func createInnerLock(path string, acct *retirement.ServiceAccount) (*os.File, error) {
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0o600)
+	if err != nil {
+		if errors.Is(err, fs.ErrExist) {
+			f, err = os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+			if err != nil {
+				return nil, fmt.Errorf("wirecert: open the authority lock %s: %w", path, err)
+			}
+
+			return f, nil
+		}
+
+		return nil, fmt.Errorf("wirecert: create the authority lock %s: %w", path, err)
+	}
+
+	if acct != nil && os.Geteuid() == 0 {
+		if err := f.Chown(acct.UID, acct.GID); err != nil {
+			return nil, errors.Join(fmt.Errorf("wirecert: give %s to the service account: %w", path, err), f.Close())
+		}
+	}
+
+	return f, nil
+}
+
+// Release drops the lock, and the global hold it took itself in a handoff.
+// Closing the descriptor releases it, so a process that exits cannot leave one
+// held.
 func (l *AuthorityLock) Release() error {
 	if l == nil || l.f == nil {
 		return nil
@@ -119,13 +369,19 @@ func (l *AuthorityLock) Release() error {
 	closeErr := l.f.Close()
 	l.f = nil
 
+	var holdErr error
+	if l.hold != nil {
+		holdErr = l.hold.Release()
+		l.hold = nil
+	}
+
 	if unlockErr != nil {
-		return fmt.Errorf("wirecert: unlock %s: %w", l.path, unlockErr)
+		return errors.Join(fmt.Errorf("wirecert: unlock %s: %w", l.path, unlockErr), closeErr, holdErr)
 	}
 
 	if closeErr != nil {
-		return fmt.Errorf("wirecert: close %s: %w", l.path, closeErr)
+		return errors.Join(fmt.Errorf("wirecert: close %s: %w", l.path, closeErr), holdErr)
 	}
 
-	return nil
+	return holdErr
 }
