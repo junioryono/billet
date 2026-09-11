@@ -822,3 +822,26 @@ func TestReceiptClosesTheHostAfterTheFlushes(t *testing.T) {
 		}
 	}
 }
+
+// Every dry-run answer of the refresh closes the configuration: a
+// configuration replaced while the wait ran out is could-not-tell, never a
+// reported answer about a host that has moved.
+func TestReceiptDryRunClosesTheConfigurationOnEveryAnswer(t *testing.T) {
+	rewrite := func(t *testing.T, f *receiptCmdFixture) {
+		t.Helper()
+
+		body, err := os.ReadFile(f.configPath)
+		mustOK(t, err)
+		mustOK(t, os.WriteFile(f.configPath, append(body, "# rewritten under the wait\n"...), 0o640))
+	}
+
+	t.Run("no current record within the wait", func(t *testing.T) {
+		f := newReceiptCmdFixture(t)
+		f.migrated(t)
+		mustOK(t, os.Remove(f.recordPath))
+		f.onRecordRead(t, 1, func() { rewrite(t, f) })
+
+		o := f.refresh(t, "", "--dry-run", "--wait", "100ms")
+		mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonConfig)
+	})
+}

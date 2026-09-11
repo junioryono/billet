@@ -231,8 +231,16 @@ func migrateEndpoint(ctx context.Context, m migrateMode) (any, *endpointRefusal)
 		// A CONTRADICTION IN THE RENDERING ALONE: with no installed node to
 		// compare against, the rendering's own name and certificate are still
 		// held to the node's startup rule before a first start is reported.
-		if id := expectedRegistrationIdentity(rendering.cfg); id.contradiction != "" {
+		id := expectedRegistrationIdentity(rendering.cfg)
+		if id.contradiction != "" {
 			return nil, endpointRefuse(endpointReasonDesired, "the rendering configuration: "+id.contradiction, "", stateNothing)
+		}
+
+		// AND AN IDENTITY THAT FAILED TO READ IS COULD-NOT-TELL here as in the
+		// comparison: a first start is not planned over an unexamined one.
+		if id.why != "" && !id.absent {
+			return nil, endpointUnknown(endpointReasonConfig, "the rendering configuration's node identity: "+id.why, "",
+				stateNothing)
 		}
 	}
 
@@ -322,11 +330,11 @@ func migrateEndpoint(ctx context.Context, m migrateMode) (any, *endpointRefusal)
 			"stop", nodeUnit, orUnknownWord(pre.LoadState)), "", stateNothing)
 	}
 
-	// THE OBSERVATION IS COMPLETE: the post-stop judgement reads Result, and
-	// a unit that answers none now would answer none then.
-	if pre.Result == "" {
-		return nil, endpointUnknown(endpointReasonUnit, "systemd answered no Result for "+nodeUnit+", so the observation is "+
-			"incomplete and the stop cannot be judged", "check and approve afresh", stateNothing)
+	// THE OBSERVATION IS COMPLETE: the post-stop judgement reads SubState and
+	// Result, and a unit that answers neither now would answer neither then.
+	if pre.SubState == "" || pre.Result == "" {
+		return nil, endpointUnknown(endpointReasonUnit, "systemd answered no SubState or Result for "+nodeUnit+", so the "+
+			"observation is incomplete and the stop cannot be judged", "check and approve afresh", stateNothing)
 	}
 
 	// (12) THE STOP under the migration's own deadline: the context bounds

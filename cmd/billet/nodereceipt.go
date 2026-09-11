@@ -272,6 +272,10 @@ func refreshReceipt(ctx context.Context, m receiptMode) (any, *endpointRefusal) 
 
 	if !hasNode {
 		if m.dryRun {
+			if problem := closeInstalledConfig(installed); problem != "" {
+				return nil, endpointUnknown(endpointReasonConfig, problem, "", "")
+			}
+
 			return receiptAnswer{Schema: endpointSchema, Outcome: outcomeReported,
 				Why: "no node is installed; the receipt follows the first converge that installs one"}, nil
 		}
@@ -312,6 +316,12 @@ func refreshReceipt(ctx context.Context, m receiptMode) (any, *endpointRefusal) 
 		return nil, endpointUnknown(endpointReasonUnit, problem, "", "")
 	} else if !running {
 		if m.dryRun {
+			// EVERY DRY-RUN ANSWER CLOSES THE CONFIGURATION, a receipt in it or
+			// not: what it says about the host is about the host as it is now.
+			if problem := closeInstalledConfig(installed); problem != "" {
+				return nil, endpointUnknown(endpointReasonConfig, problem, "", "")
+			}
+
 			return receiptAnswer{Schema: endpointSchema, Outcome: outcomeReported,
 				Why: "a dry run writes no receipt: the node is not running (" + first.ActiveState + ")"}, nil
 		}
@@ -328,6 +338,10 @@ func refreshReceipt(ctx context.Context, m receiptMode) (any, *endpointRefusal) 
 	switch {
 	case !br.running:
 		if m.dryRun {
+			if problem := closeInstalledConfig(installed); problem != "" {
+				return nil, endpointUnknown(endpointReasonConfig, problem, "", "")
+			}
+
 			return receiptAnswer{Schema: endpointSchema, Outcome: outcomeReported,
 				Why: "a dry run writes no receipt: the node stopped running under the wait"}, nil
 		}
@@ -341,6 +355,14 @@ func refreshReceipt(ctx context.Context, m receiptMode) (any, *endpointRefusal) 
 		return nil, endpointRefuse(endpointReasonRecord, "the running node's record cannot be judged: "+br.why, "", "")
 	case elapsed || br.class != recordUsable:
 		if m.dryRun {
+			if problem := closeInstalledConfig(installed); problem != "" {
+				return nil, endpointUnknown(endpointReasonConfig, problem, "", "")
+			}
+
+			if r := closeProcess(ctx, insp, br.obs); r != nil {
+				return nil, r
+			}
+
 			return receiptAnswer{Schema: endpointSchema, Outcome: outcomeReported,
 				Why: "a dry run writes no receipt: the running node published no current record within " + m.wait.String() +
 					" (" + br.why + ")"}, nil

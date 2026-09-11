@@ -459,6 +459,7 @@ func TestMigratePreStopObservationMustBeComplete(t *testing.T) {
 		"no KillMode":  nodeUnitBody("active", "running", inspectPID, nodeInvocation, "", "success"),
 		"no LoadState": strings.Replace(nodeUnitBody("active", "running", inspectPID, nodeInvocation, "mixed", "success"), "LoadState=loaded\n", "LoadState=\n", 1),
 		"no Result":    strings.Replace(nodeUnitBody("active", "running", inspectPID, nodeInvocation, "mixed", "success"), "Result=success\n", "Result=\n", 1),
+		"no SubState":  strings.Replace(nodeUnitBody("active", "running", inspectPID, nodeInvocation, "mixed", "success"), "SubState=running\n", "SubState=\n", 1),
 	} {
 		t.Run(name, func(t *testing.T) {
 			f := newEndpointFixture(t)
@@ -537,5 +538,46 @@ func TestMigrateRefusesAContradictionBesideAnUnreadableInstalledIdentity(t *test
 
 	if !strings.Contains(o.str("why"), "rendering configuration") || !strings.Contains(o.str("why"), "was issued for") {
 		t.Errorf("why %q", o.str("why"))
+	}
+}
+
+// A first start over a rendering whose identity cannot be read (its
+// certificate does not read, with or without an explicit name) is
+// could-not-tell, never a reported plan.
+func TestMigrateFirstStartOverAnUnreadIdentityIsUnknown(t *testing.T) {
+	for _, withName := range []bool{true, false} {
+		t.Run(map[bool]string{true: "an explicit name", false: "no name"}[withName], func(t *testing.T) {
+			tls := nodeTLSFixture(t, withName)
+
+			body, err := os.ReadFile(tls.configPath)
+			mustOK(t, err)
+
+			cert := regexp.MustCompile(`cert: (\S+)`).FindStringSubmatch(string(body))
+			if cert == nil {
+				t.Fatalf("no cert path in\n%s", body)
+			}
+
+			f := newEndpointFixture(t)
+			f.writeConfig(t, f.serverOnly())
+			f.setNode(t, "inactive", "dead", 0, "", "mixed")
+
+			prev := readPublicFile
+			readPublicFile = func(path string) ([]byte, error) {
+				if path == cert[1] {
+					return nil, &os.PathError{Op: "open", Path: path, Err: syscall.EACCES}
+				}
+
+				return prev(path)
+			}
+
+			t.Cleanup(func() { readPublicFile = prev })
+
+			o := f.migrate(t, string(body), "--dry-run")
+			mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonConfig)
+
+			if !strings.Contains(o.str("why"), "node identity") {
+				t.Errorf("why %q", o.str("why"))
+			}
+		})
 	}
 }
