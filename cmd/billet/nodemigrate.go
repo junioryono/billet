@@ -415,9 +415,12 @@ func migrateEndpoint(ctx context.Context, m migrateMode) (any, *endpointRefusal)
 		return nil, endpointUnknown(endpointReasonProcess, "at the close: "+problem, "", stateStarted)
 	}
 
-	if processMoved(newBr.obs, closing) || closing.ActiveState == "deactivating" {
-		return nil, endpointUnknown(endpointReasonProcess, fmt.Sprintf("the started node moved before the answer: "+
-			"pid %s invocation %s (%s) at the close, %s %s at the record", closing.MainPID, closing.InvocationID,
+	// RUNNING, THE SAME, AND NOT STOPPING: a unit found inactive or failed
+	// with the sampled pid still on it is not the process the record named.
+	if _, running, problem := runningPID(closing); problem != "" || !running || processMoved(newBr.obs, closing) ||
+		closing.ActiveState == "deactivating" {
+		return nil, endpointUnknown(endpointReasonProcess, fmt.Sprintf("the started node moved or stopped before the "+
+			"answer: pid %s invocation %s (%s) at the close, %s %s at the record", closing.MainPID, closing.InvocationID,
 			closing.ActiveState, newBr.obs.MainPID, newBr.obs.InvocationID), "", stateStarted)
 	}
 
@@ -732,12 +735,15 @@ func sameNodeIdentity(installed *installedConfigObservation, rendering *configOb
 		}
 	}
 
-	if a.absent || b.absent {
-		return "", ""
+	// THE RESOLVED NAMES BEFORE THE ABSENCE SHORTCUT: a certificate's name and
+	// a configured one are compared whatever the deployment says, and only
+	// the deployment comparison is skipped for an unminted identity.
+	if a.node != "" && b.node != "" && a.node != b.node {
+		return fmt.Sprintf("the rendering names the node %q and the installed configuration %q", b.node, a.node), ""
 	}
 
-	if a.node != b.node {
-		return fmt.Sprintf("the rendering names the node %q and the installed configuration %q", b.node, a.node), ""
+	if a.absent || b.absent {
+		return "", ""
 	}
 
 	if a.deployment != b.deployment {

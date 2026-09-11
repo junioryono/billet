@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -122,10 +123,12 @@ func readRegistrationRecord(path string) registrationEvidence {
 	switch {
 	case errors.Is(err, os.ErrNotExist) && !errors.Is(err, regularfile.ErrReopen):
 		return registrationEvidence{why: "no registration record at " + path}
-	case errors.Is(err, regularfile.ErrNotRegular) || errors.Is(err, syscall.ELOOP):
-		// A link at the name is invalid on every platform: Linux admits its
-		// identity and the regular-file rule refuses it, a Mac's O_NOFOLLOW
-		// open answers ELOOP.
+	case errors.Is(err, regularfile.ErrNotRegular) || (errors.Is(err, syscall.ELOOP) && runtime.GOOS == "darwin"):
+		// A link at the name is invalid on every platform, and each platform
+		// says it its own way: Linux's O_PATH|O_NOFOLLOW open admits the link's
+		// identity and the regular-file rule refuses it, so an ELOOP there is a
+		// loop met on the WAY to the name (could-not-tell, below); a Mac's
+		// O_NOFOLLOW open answers ELOOP for the link itself.
 		return registrationEvidence{why: fmt.Sprintf("the registration record %s is not a regular file: %v", path, err),
 			invalid: true}
 	case err != nil:
@@ -347,8 +350,10 @@ func expectedRegistrationIdentity(cfg *config.Config) registrationIdentity {
 	case err != nil:
 		return registrationIdentity{why: fmt.Sprintf("read the deployment identity in %s: %v", dir, err)}
 	case !found:
-		return registrationIdentity{why: "no deployment identity is minted in " + dir + ", so the record's deployment cannot be judged",
-			absent: true}
+		// THE NAME IS KEPT: an unminted deployment says nothing about the node
+		// the configuration or its certificate names.
+		return registrationIdentity{node: id.node,
+			why: "no deployment identity is minted in " + dir + ", so the record's deployment cannot be judged", absent: true}
 	}
 
 	id.deployment = deployment

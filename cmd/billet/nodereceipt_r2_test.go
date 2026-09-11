@@ -760,3 +760,65 @@ func TestReceiptDryRunClosesTheProcess(t *testing.T) {
 		t.Errorf("why %q", o.str("why"))
 	}
 }
+
+// The configuration and the process are closed after the flushes, in both
+// answers: a flush can block, and what moved under it is not what the
+// answer may describe.
+func TestReceiptClosesTheHostAfterTheFlushes(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		reason string
+		move   func(t *testing.T, f *receiptCmdFixture)
+	}{
+		{"the configuration rewritten under the flush", endpointReasonConfig, func(t *testing.T, f *receiptCmdFixture) {
+			t.Helper()
+
+			body, err := os.ReadFile(f.configPath)
+			mustOK(t, err)
+			mustOK(t, os.WriteFile(f.configPath, append(body, "# rewritten under the flush\n"...), 0o640))
+		}},
+		{"the node restarted under the flush", endpointReasonProcess, func(t *testing.T, f *receiptCmdFixture) {
+			t.Helper()
+			f.afterShows(t, f.calls(t, "show"), nodeUnitBody("active", "running", 9999, newInvocation, "mixed", "success"))
+		}},
+	} {
+		for _, path := range []string{"written", "current"} {
+			t.Run(c.name+", answering "+path, func(t *testing.T) {
+				f := newReceiptCmdFixture(t)
+				f.migrated(t)
+
+				if path == "current" {
+					mustWritten(t, f.refresh(t, f.rendering(endpointB)))
+				}
+
+				// THE LAST FLUSH of either answer is a parent flush: the write's
+				// is the parent's second (the establishing one comes before
+				// anything is written), the shortcut's is its only one. A move
+				// at an earlier flush is caught by the checks before the write,
+				// which is not what this proves.
+				last := map[string]int{"written": 2, "current": 1}[path]
+				prev := receiptSyncDir
+				parents := 0
+				receiptSyncDir = func(p string) error {
+					if p == filepath.Dir(f.dir) {
+						parents++
+						if parents == last {
+							c.move(t, f)
+						}
+					}
+
+					return prev(p)
+				}
+
+				t.Cleanup(func() { receiptSyncDir = prev })
+
+				o := f.refresh(t, f.rendering(endpointB))
+				mustEndpointRefusal(t, o, outcomeUnknown, c.reason)
+
+				if parents != last {
+					t.Errorf("%d parent flushes, want %d", parents, last)
+				}
+			})
+		}
+	}
+}

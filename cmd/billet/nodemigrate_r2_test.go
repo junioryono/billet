@@ -374,3 +374,53 @@ func TestMigrateAnUnreadableRenderingIdentityIsUnknown(t *testing.T) {
 		t.Errorf("why %q", o.str("why"))
 	}
 }
+
+// A rendering that names another node is refused even when its deployment
+// is not minted yet: the resolved names are compared before the absence
+// shortcut, and only the deployment comparison is skipped.
+func TestMigrateRefusesARenameWhoseDeploymentIsUnminted(t *testing.T) {
+	tls := nodeTLSFixture(t, false)
+
+	body, err := os.ReadFile(tls.configPath)
+	mustOK(t, err)
+
+	f := newEndpointFixture(t)
+	f.writeConfig(t, string(body))
+	f.setNode(t, "inactive", "dead", 0, "", "mixed")
+
+	rendering := strings.Replace(f.rendering(endpointB), "  name: node-a\n", "  name: node-b\n", 1)
+	rendering = regexp.MustCompile(`state_dir: \S+`).ReplaceAllString(rendering, "state_dir: "+t.TempDir())
+
+	o := f.migrate(t, rendering, "--dry-run")
+	mustEndpointRefusal(t, o, outcomeRefused, endpointReasonDesired)
+
+	if !strings.Contains(o.str("why"), "names the node") {
+		t.Errorf("why %q", o.str("why"))
+	}
+}
+
+// The migration's close requires a running process: a started unit found
+// inactive with the sampled pid still on it is could-not-tell, never
+// migrated.
+func TestMigrateCloseRequiresARunningProcess(t *testing.T) {
+	f := newEndpointFixture(t)
+	f.installB(t)
+	f.afterStop(t, "inactive", "dead", "success")
+	f.afterStart(t)
+	f.recordAfterStart(t, canonicalB)
+
+	// The second record read is the first after the start; from the
+	// bracket's closing observation on every show answers inactive with the
+	// started pid, so the bracket agrees on the process and the migration's
+	// close finds it stopped.
+	f.onRecordRead(t, 2, func() {
+		f.afterShows(t, f.calls(t, "show")+1, nodeUnitBody("inactive", "dead", inspectPID+1, newInvocation, "mixed", "success"))
+	})
+
+	o := f.migrate(t, f.rendering(endpointB), "--wait", "3s")
+	mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonProcess)
+
+	if o.str("state") != stateStarted || !strings.Contains(o.str("why"), "moved or stopped") {
+		t.Errorf("state %q why %q", o.str("state"), o.str("why"))
+	}
+}

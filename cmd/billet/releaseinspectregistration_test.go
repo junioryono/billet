@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -680,6 +681,14 @@ func TestReleaseInspectRegistrationValidity(t *testing.T) {
 			"the descriptor's read": {func() {
 				registrationRead = func(*os.File, string, int64) ([]byte, error) { return nil, errors.New("injected: read failed") }
 			}, "read the registration record"},
+			// A Mac's O_NOFOLLOW open answers ELOOP for the link itself, which
+			// is invalid; Linux admits a link's identity, so an ELOOP there is a
+			// loop on the way and could-not-tell.
+			"an ELOOP at the open": {func() {
+				registrationOpen = func(string) (*os.File, os.FileInfo, error) {
+					return nil, nil, &fs.PathError{Op: "open", Err: syscall.ELOOP}
+				}
+			}, map[bool]string{true: "not a regular file", false: "open the registration record"}[runtime.GOOS == "darwin"]},
 			"a reopen failure": {func() {
 				registrationOpen = func(string) (*os.File, os.FileInfo, error) {
 					return nil, nil, fmt.Errorf("%w: %w", regularfile.ErrReopen, os.ErrNotExist)

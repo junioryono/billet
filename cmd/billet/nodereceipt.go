@@ -585,6 +585,16 @@ func publishReceipt(ctx context.Context, insp *lifeops.Inspector, installed *ins
 			return nil, r
 		}
 
+		// AND THE CONFIGURATION AND THE PROCESS TOO: a flush can block, and
+		// the answer describes the host as it is when the answer is given.
+		if problem := closeInstalledConfig(installed); problem != "" {
+			return nil, endpointUnknown(endpointReasonConfig, problem+" (after the flushes)", "", "")
+		}
+
+		if r := closeProcess(ctx, insp, br.obs); r != nil {
+			return nil, r
+		}
+
 		return receiptAnswer{Schema: endpointSchema, Outcome: outcomeCurrent, Receipt: existing.receipt}, nil
 	}
 
@@ -647,6 +657,16 @@ func publishReceipt(ctx context.Context, insp *lifeops.Inspector, installed *ins
 	}
 
 	if r := sameReceipt(back.info, "after it was written"); r != nil {
+		return nil, r
+	}
+
+	// THE CONFIGURATION AND THE PROCESS, ONCE MORE, after the write and its
+	// flushes, which can block: `written` describes the host as it is now.
+	if problem := closeInstalledConfig(installed); problem != "" {
+		return nil, endpointUnknown(endpointReasonConfig, problem+" (after the write)", "", "")
+	}
+
+	if r := closeProcess(ctx, insp, br.obs); r != nil {
 		return nil, r
 	}
 
