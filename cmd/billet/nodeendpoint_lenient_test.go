@@ -44,7 +44,7 @@ func TestADryRunParsesTheNodeSectionAloneAndTheActionTheWhole(t *testing.T) {
 		}
 	})
 
-	t.Run("the action refuses a rendering the loader refuses", func(t *testing.T) {
+	t.Run("the action refuses an installed configuration the loader refuses", func(t *testing.T) {
 		f := newEndpointFixture(t)
 		f.writeConfig(t, invalid(f, endpointB))
 
@@ -60,17 +60,43 @@ func TestADryRunParsesTheNodeSectionAloneAndTheActionTheWhole(t *testing.T) {
 		}
 	})
 
-	t.Run("an invalid node section refuses the dry run too", func(t *testing.T) {
+	t.Run("the action refuses a rendering the loader refuses", func(t *testing.T) {
+		// THE INSTALLED FILE IS VALID, so the rendering's reader is what
+		// refuses; a regression that read the rendering leniently in the
+		// action would pass the installed check and reach the stop.
 		f := newEndpointFixture(t)
-		bad := strings.Replace(f.rendering(endpointB), "provider: docker\n", "provider: teleporter\n", 1)
+		f.installB(t)
 
-		o := f.migrate(t, bad, "--dry-run")
+		o := f.migrate(t, invalid(f, endpointB))
 		mustEndpointRefusal(t, o, outcomeRefused, endpointReasonDesired)
 
-		if !strings.Contains(o.str("why"), "node.provider") {
+		if !strings.Contains(o.str("why"), "backup:") {
 			t.Errorf("why %q", o.str("why"))
 		}
+
+		if f.calls(t, "stop") != 0 {
+			t.Errorf("the action stopped the node over a rendering the loader refuses: %v", f.systemctlCalls(t))
+		}
 	})
+
+	// A NODE SECTION THAT IS ITSELF INVALID refuses the dry run too: a
+	// provider the loader does not know, and the test-only one the whole
+	// validation refuses elsewhere than validateNode (a node-only judgement
+	// that admitted `simulated` would report a plan over a node that starts
+	// no compute).
+	for _, provider := range []string{"teleporter", "simulated"} {
+		t.Run("an invalid node section refuses the dry run too: "+provider, func(t *testing.T) {
+			f := newEndpointFixture(t)
+			bad := strings.Replace(f.rendering(endpointB), "provider: docker\n", "provider: "+provider+"\n", 1)
+
+			o := f.migrate(t, bad, "--dry-run")
+			mustEndpointRefusal(t, o, outcomeRefused, endpointReasonDesired)
+
+			if !strings.Contains(o.str("why"), "node.provider") {
+				t.Errorf("why %q", o.str("why"))
+			}
+		})
+	}
 
 	t.Run("the refresh's dry run reports over a rendering the loader refuses", func(t *testing.T) {
 		f := newReceiptCmdFixture(t)
