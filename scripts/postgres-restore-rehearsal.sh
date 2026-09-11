@@ -120,7 +120,8 @@ APT="timeout -v -k 10 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeou
 sed -i -e 's,^URIs: http://archive[.]ubuntu[.]com/ubuntu/$,URIs: https://archive.ubuntu.com/ubuntu/ https://mirrors.edge.kernel.org/ubuntu/,' -e 's,^URIs: http://ports[.]ubuntu[.]com/ubuntu-ports/$,URIs: https://ports.ubuntu.com/ubuntu-ports/,' /etc/apt/sources.list.d/ubuntu.sources
 ${APT} update >/dev/null
 ls /var/lib/apt/lists/*InRelease >/dev/null
-${APT} install --yes /tmp/billet.deb openssl postgresql jq >/dev/null
+${APT} install --yes /tmp/billet.deb openssl postgresql jq >/tmp/apt-install.log 2>&1 ||
+    { cat /tmp/apt-install.log >&2; fail "apt-get install failed (its output above)"; }
 
 id billet >/dev/null 2>&1 || fail "the package did not create the service account"
 test -x /usr/bin/billet || fail "the package did not install the binary"
