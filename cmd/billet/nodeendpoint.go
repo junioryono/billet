@@ -471,6 +471,15 @@ func readRecordUnderBracket(ctx context.Context, insp *lifeops.Inspector, unit s
 			return bracketedRecord{}, problem
 		}
 
+		// THE CLOSING OBSERVATION IS READ AS THE OPENING ONE WAS: a state this
+		// does not judge is could-not-tell, a unit positively stopped under the
+		// read is not running, and only then is the process compared.
+		if _, stillRunning, problem := runningPID(after); problem != "" {
+			return bracketedRecord{}, "at the close of the read: " + problem
+		} else if !stillRunning {
+			return bracketedRecord{obs: after, running: false}, ""
+		}
+
 		if processMoved(before, after) {
 			continue
 		}

@@ -331,6 +331,10 @@ func expectedRegistrationIdentity(cfg *config.Config) registrationIdentity {
 		cn := leaves[0].Subject.CommonName
 
 		switch {
+		case id.node == "" && cn == "":
+			// THE NODE'S STARTUP REFUSES AN EMPTY NAME, so a certificate naming
+			// none names no node here either.
+			return registrationIdentity{why: cfg.Node.TLS.CertPath + " names no node in its CommonName, and node.name is not set"}
 		case id.node == "":
 			id.node = cn
 		case cn != id.node:

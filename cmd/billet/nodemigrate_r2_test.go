@@ -654,10 +654,18 @@ func TestMigrateReadsBothIdentitiesBeforeComparingConfiguredNames(t *testing.T) 
 func emptyDeploymentCertPEM(t *testing.T) string {
 	t.Helper()
 
+	return certPEM(t, "node-a", "")
+}
+
+// certPEM is a self-signed certificate with the given CommonName and one
+// Organization value.
+func certPEM(t *testing.T, cn, org string) string {
+	t.Helper()
+
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	mustOK(t, err)
 
-	tmpl := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "node-a", Organization: []string{""}},
+	tmpl := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: cn, Organization: []string{org}},
 		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour)}
 
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
@@ -690,6 +698,53 @@ func TestMigrateFirstStartOverAnEmptyDeploymentIsUnknown(t *testing.T) {
 	mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonConfig)
 
 	if !strings.Contains(o.str("why"), "Organization") {
+		t.Errorf("why %q", o.str("why"))
+	}
+}
+
+// A certificate with no CommonName beside an omitted node.name names no
+// node: the startup refuses that, and a first start over it is
+// could-not-tell.
+func TestMigrateFirstStartOverANamelessCertificateIsUnknown(t *testing.T) {
+	tls := nodeTLSFixture(t, false)
+
+	body, err := os.ReadFile(tls.configPath)
+	mustOK(t, err)
+
+	cert := regexp.MustCompile(`cert: (\S+)`).FindStringSubmatch(string(body))
+	if cert == nil {
+		t.Fatalf("no cert path in\n%s", body)
+	}
+
+	writeFile(t, cert[1], certPEM(t, "", "dep-1234"), 0o644)
+
+	f := newEndpointFixture(t)
+	f.writeConfig(t, f.serverOnly())
+	f.setNode(t, "inactive", "dead", 0, "", "mixed")
+
+	o := f.migrate(t, string(body), "--dry-run")
+	mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonConfig)
+
+	if !strings.Contains(o.str("why"), "CommonName") {
+		t.Errorf("why %q", o.str("why"))
+	}
+}
+
+// The bracket's closing observation is read as its opening one: a state
+// this does not judge at the close is could-not-tell, never a usable record
+// that a migration verdict is drawn from.
+func TestBracketCloseRefusesAStateItDoesNotJudge(t *testing.T) {
+	f := newEndpointFixture(t)
+	// Only the bracket's closing show (the third, after the judgement's own
+	// opening observation and the bracket's) answers the unknown state;
+	// every later observation is ordinary, so nothing but the bracket's own
+	// reading of its close can refuse.
+	f.showsBetween(t, 2, 3, nodeUnitBody("maintenance", "running", inspectPID, nodeInvocation, "mixed", "success"))
+
+	o := f.migrate(t, f.rendering(endpointB), "--dry-run")
+	mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonUnit)
+
+	if !strings.Contains(o.str("why"), "at the close of the read") {
 		t.Errorf("why %q", o.str("why"))
 	}
 }
