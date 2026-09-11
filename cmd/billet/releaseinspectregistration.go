@@ -121,6 +121,8 @@ func readRegistrationRecord(path string) registrationEvidence {
 	switch {
 	case errors.Is(err, os.ErrNotExist) && !errors.Is(err, regularfile.ErrReopen):
 		return registrationEvidence{why: "no registration record at " + path}
+	case errors.Is(err, regularfile.ErrNotRegular):
+		return registrationEvidence{why: fmt.Sprintf("the registration record %s: %v", path, err), invalid: true}
 	case err != nil:
 		return registrationEvidence{why: fmt.Sprintf("open the registration record %s: %v", path, err), unreadable: true}
 	}

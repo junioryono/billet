@@ -199,30 +199,6 @@ func (f *endpointFixture) showsBetween(t *testing.T, n, m int, body string) {
 	writeFile(t, f.unitFile("until.n"), strconv.Itoa(m)+"\n", 0o644)
 }
 
-// later runs fn in its own goroutine after d, unless the test ended first;
-// the goroutine is joined at cleanup, so nothing it does outlives the test.
-func (f *endpointFixture) later(t *testing.T, d time.Duration, fn func()) {
-	t.Helper()
-
-	stop := make(chan struct{})
-	done := make(chan struct{})
-
-	go func() {
-		defer close(done)
-
-		select {
-		case <-time.After(d):
-			fn()
-		case <-stop:
-		}
-	}()
-
-	t.Cleanup(func() {
-		close(stop)
-		<-done
-	})
-}
-
 // afterCall runs fn once, after the fake recorded its first call of verb
 // (a start, say), polling the log until the test ends; joined at cleanup.
 func (f *endpointFixture) afterCall(t *testing.T, verb string, d time.Duration, fn func()) {
@@ -913,7 +889,10 @@ func TestMigrateClosesEveryAnswerAgainstTheConfigurationAndTheProcess(t *testing
 		f := newEndpointFixture(t)
 		mustOK(t, os.Remove(f.recordPath))
 
-		f.later(t, 50*time.Millisecond, func() {
+		// After the first read finds no record, the configuration is replaced
+		// and the record published; the next bracket decides from the record
+		// and the closing check finds the configuration moved.
+		f.onRecordRead(t, 1, func() {
 			f.installB(t)
 			f.writeRecord(t, f.record(map[string]any{"deployment": f.deployment, "endpoint": canonicalB}))
 		})
@@ -1072,7 +1051,7 @@ func TestMigrateObservesTheUnitWithNoConfigurationInstalled(t *testing.T) {
 		mustOK(t, os.Remove(f.configPath))
 		mustOK(t, os.Remove(f.recordPath))
 
-		f.later(t, 50*time.Millisecond, func() {
+		f.onRecordRead(t, 1, func() {
 			f.writeConfig(t, rendering)
 			f.writeRecord(t, f.record(map[string]any{"deployment": f.deployment, "endpoint": canonicalB}))
 		})

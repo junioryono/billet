@@ -537,23 +537,51 @@ func TestRegistrationTimeoutSpeaksFromACompletedSnapshot(t *testing.T) {
 	t.Run("the identity removed during the last sleep", func(t *testing.T) {
 		l := newRegLedger(t, true)
 		l.register(t, "node-a", regIncarnationOld)
-		// One poll completes; the identity vanishes before the next, which
-		// the expired wait never makes.
-		l.polls(t, func(n int) {
-			if n == 1 {
-				mustOK(t, os.Remove(filepath.Join(l.stateDir, "deployment-id")))
-			}
-		})
 
-		// The wait is shorter than the sleep between polls, so the expiry
-		// lands in the sleep (or the first poll outlasts the wait; either
-		// way the timeout speaks from the completed poll).
-		o := l.run(t, "--wait", "15ms")
+		// THE FIRST POLL COMPLETES AT ONCE from a snapshot the seam answers,
+		// the sleep between polls outlasts the wait, and the identity vanishes
+		// during that sleep: the timeout speaks from the completed poll, and
+		// no second poll examines the missing identity.
+		prevPoll := endpointPoll
+		endpointPoll = time.Second
+
+		t.Cleanup(func() { endpointPoll = prevPoll })
+
+		polls := 0
+		prev := registrationPoll
+		registrationPoll = func(ctx context.Context, store *rollout.Store) (rollout.StatusSnapshot, error) {
+			polls++
+			snap, err := store.StatusSnapshot(ctx)
+			mustOK(t, os.Remove(filepath.Join(l.stateDir, "deployment-id")))
+
+			return snap, err
+		}
+
+		t.Cleanup(func() { registrationPoll = prev })
+
+		o := l.run(t, "--wait", "200ms")
 		mustTimeout(t, o)
+
+		if polls != 1 {
+			t.Errorf("%d polls, want exactly the one that completed", polls)
+		}
 
 		if last := asMap(o.doc["last"]); last["incarnation"] != regIncarnationOld {
 			t.Errorf("last %v", last)
 		}
+	})
+
+	t.Run("a special file at the record's name is refused", func(t *testing.T) {
+		f := newReceiptCmdFixture(t)
+		f.migrated(t)
+		mustOK(t, os.Remove(f.recordPath))
+		mustOK(t, syscall.Mkfifo(f.recordPath, 0o600))
+
+		o := f.refresh(t, f.rendering(endpointB))
+		mustEndpointRefusal(t, o, outcomeRefused, endpointReasonRecord)
+
+		o = f.evidence(t, f.evidenceObject(t, nil), f.confirmationObject(nil))
+		mustEndpointRefusal(t, o, outcomeRefused, endpointReasonRecord)
 	})
 }
 

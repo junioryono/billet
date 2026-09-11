@@ -148,10 +148,16 @@ func (f *registrationFixture) writeRecord(t *testing.T, rec map[string]any) {
 func (f *registrationFixture) writeRecordRaw(t *testing.T, body string) {
 	t.Helper()
 
-	_ = os.Remove(f.recordPath)
-	writeFile(t, f.recordPath, body, 0o600)
+	// PUBLISHED AS THE NODE PUBLISHES IT: written beside the name and renamed
+	// over it, so no reader ever sees an empty or partial file.
+	tmp := f.recordPath + ".tmp"
+	writeFile(t, tmp, body, 0o600)
 	// The umask may have narrowed nothing; the mode is what the reader judges.
-	if err := os.Chmod(f.recordPath, 0o600); err != nil {
+	if err := os.Chmod(tmp, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.Rename(tmp, f.recordPath); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -628,7 +634,7 @@ func TestReleaseInspectRegistrationValidity(t *testing.T) {
 
 		select {
 		case reg := <-done:
-			mustUnknown(t, "host.registration", reg, "open the registration record")
+			mustUnknown(t, "host.registration", reg, "not a regular file")
 		case <-time.After(10 * time.Second):
 			t.Fatal("the FIFO blocked the report")
 		}

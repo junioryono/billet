@@ -375,6 +375,13 @@ func classifyRecord(ev registrationEvidence, invocation string, identity registr
 		return registrationReport{}, recordAbsent, ev.why
 	}
 
+	// A RECORD BILLET COULD NOT HAVE WRITTEN is invalid whatever invocation
+	// it names: the endpoint is judged before the stale-invocation shortcut,
+	// so a malformed record never waits and never reaches the pre-R probe.
+	if _, err := endpoint.ParseCanonical(ev.record.Endpoint); err != nil {
+		return registrationReport{}, recordInvalid, "the record's endpoint is not a canonical spelling: " + err.Error()
+	}
+
 	if ev.record.InvocationID != invocation {
 		return registrationReport{}, recordAbsent, fmt.Sprintf("the record was written by invocation %s and the node is invocation %s",
 			ev.record.InvocationID, invocation)
@@ -470,11 +477,22 @@ func waitForRecord(ctx context.Context, insp *lifeops.Inspector, unit string, id
 	// (the inspector's property timeout), so its observation is whole.
 	deadline := time.Now().Add(wait)
 
-	for {
+	var last bracketedRecord
+
+	for attempt := 0; ; attempt++ {
+		// THE DEADLINE IS JUDGED BEFORE EVERY BRACKET BUT THE FIRST: a sleep
+		// that ended at the deadline starts nothing, and what was last
+		// observed is the answer.
+		if attempt > 0 && (time.Now().After(deadline) || ctx.Err() != nil) {
+			return last, true, ""
+		}
+
 		br, problem := readRecordUnderBracket(ctx, insp, unit, identity)
 		if problem != "" {
 			return bracketedRecord{}, false, problem
 		}
+
+		last = br
 
 		if !br.running || br.class != recordAbsent {
 			return br, false, ""

@@ -704,6 +704,13 @@ func cfgOf(r *configObservationLite) *config.Config {
 
 // sameNodeIdentity refuses a rendering whose node is not the installed one.
 func sameNodeIdentity(installed *installedConfigObservation, rendering *configObservationLite) string {
+	// THE CONFIGURED NAMES FIRST: two names both known and unequal disagree
+	// whatever the deployment says, and a deployment that cannot be derived
+	// (no identity minted on a stopped certless host) hides nothing.
+	if ia, ib := installed.cfg.Node.Name, rendering.cfg.Node.Name; ia != "" && ib != "" && ia != ib {
+		return fmt.Sprintf("the rendering names the node %q and the installed configuration %q", ib, ia)
+	}
+
 	a := expectedRegistrationIdentity(installed.cfg)
 	b := expectedRegistrationIdentity(rendering.cfg)
 

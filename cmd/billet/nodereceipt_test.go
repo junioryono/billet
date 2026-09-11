@@ -595,7 +595,7 @@ func TestReceiptRefreshKeepsTheReceiptCurrent(t *testing.T) {
 		f.migrated(t)
 		mustOK(t, os.Remove(f.recordPath))
 
-		f.later(t, 60*time.Millisecond, func() {
+		f.onRecordRead(t, 1, func() {
 			f.writeRecord(t, f.record(map[string]any{"deployment": f.deployment, "endpoint": canonicalB,
 				"invocation_id": newInvocation, "incarnation": newIncarnation}))
 		})

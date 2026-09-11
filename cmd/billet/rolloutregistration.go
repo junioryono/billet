@@ -178,6 +178,14 @@ func awaitRegistration(ctx context.Context, store *rollout.Store, cfg *config.Co
 	}
 
 	for {
+		// EXPIRY IS JUDGED BEFORE EVERY POLL: a sleep that ended at the
+		// deadline, or a scheduling delay past it, examines nothing more.
+		if ctx.Err() != nil || time.Now().After(deadline) {
+			out, r := timeout()
+
+			return nil, out, r
+		}
+
 		// PEEKED, NEVER MINTED, AT EVERY POLL: the identity file is what the
 		// snapshot's binding is compared with, and a host whose identity
 		// moved under the polls is refused at the poll that sees it. An

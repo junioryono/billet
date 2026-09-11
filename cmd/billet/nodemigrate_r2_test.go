@@ -233,19 +233,49 @@ func TestMigrateJudgesPreRWithoutARegistrationDirectory(t *testing.T) {
 		t.Errorf("record %q", o.str("record"))
 	}
 
-	t.Run("a record appearing after the wait is not judged", func(t *testing.T) {
+	t.Run("a record appearing during the sleep that ends at the deadline is not judged", func(t *testing.T) {
 		f := newEndpointFixture(t)
 		f.rBinary(t)
 		mustOK(t, os.Remove(f.recordPath))
-		// After the first read (absent) the wait elapses before the record
-		// appears; a wait that kept observing would read it.
+
+		// The sleep between brackets is longer than the wait, so the first
+		// absent bracket is followed by one sleep that ends at the deadline;
+		// the record published during it must not be read by a bracket
+		// started at the deadline.
+		prev := endpointPoll
+		endpointPoll = time.Second
+
+		t.Cleanup(func() { endpointPoll = prev })
+
 		f.onRecordRead(t, 1, func() {
-			time.Sleep(120 * time.Millisecond)
 			f.writeRecord(t, f.record(map[string]any{"deployment": f.deployment, "endpoint": canonicalA}))
 		})
 
-		o := f.migrate(t, f.rendering(endpointB), "--dry-run", "--wait", "50ms")
+		o := f.migrate(t, f.rendering(endpointB), "--dry-run", "--wait", "100ms")
 		mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonRecord)
+	})
+
+	t.Run("a record naming a malformed endpoint under an old invocation never reaches the probe", func(t *testing.T) {
+		f := newEndpointFixture(t)
+		f.preRBinary(t)
+		f.writeRecord(t, f.record(map[string]any{"deployment": f.deployment, "endpoint": "not-an-endpoint",
+			"invocation_id": newInvocation}))
+
+		o := f.migrate(t, f.rendering(endpointB), "--dry-run")
+		mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonRecord)
+
+		if !strings.Contains(o.str("why"), "canonical") {
+			t.Errorf("why %q", o.str("why"))
+		}
+	})
+
+	t.Run("two configured names that disagree on a host without an identity", func(t *testing.T) {
+		f := newEndpointFixture(t)
+		mustOK(t, os.Remove(filepath.Join(f.nodeState, "deployment-id")))
+		f.setNode(t, "inactive", "dead", 0, "", "mixed")
+
+		o := f.migrate(t, strings.Replace(f.rendering(endpointA), "name: node-a", "name: node-b", 1))
+		mustEndpointRefusal(t, o, outcomeRefused, endpointReasonDesired)
 	})
 }
 

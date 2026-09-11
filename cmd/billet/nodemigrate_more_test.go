@@ -301,7 +301,9 @@ func TestMigrateRecordWaitsBeforeAndAfterTheStart(t *testing.T) {
 		f.rBinary(t)
 		mustOK(t, os.Remove(f.recordPath))
 
-		f.later(t, 50*time.Millisecond, func() {
+		// The record is published after the first read found none, so the
+		// wait is exercised and the next bracket decides from it.
+		f.onRecordRead(t, 1, func() {
 			f.writeRecord(t, f.record(map[string]any{"deployment": f.deployment, "endpoint": canonicalA}))
 		})
 
