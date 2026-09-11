@@ -45,8 +45,8 @@
       written: [schema, outcome, receipt]
       current: [schema, outcome, receipt]
       reported: [schema, outcome, receipt, why]
-      refused: [schema, outcome, reason, why, next]
-      unknown: [schema, outcome, reason, why, next]
+      refused: [schema, outcome, reason, why, next, state]
+      unknown: [schema, outcome, reason, why, next, state]
     billet_receipt_required:
       written: [schema, outcome, receipt]
       current: [schema, outcome, receipt]
@@ -69,14 +69,20 @@
         ok: "{{ billet_receipt_outcome not in ['refused', 'unknown', 'reported'] or (billet_receipt_a.why | default('') is string and billet_receipt_a.why | default('') | length > 0) }}"
       - name: next
         ok: "{{ ('next' not in billet_receipt_a) or (billet_receipt_a.next is string) }}"
+      - name: state
+        ok: "{{ ('state' not in billet_receipt_a) or (billet_receipt_a.state in ['nothing', 'stopped', 'started', 'started-no-record']) }}"
       # THE RECEIPT: an object of exactly the ten members, each of its shape;
       # null only on a `reported` that names no receipt, with its reason.
       - name: receipt
         ok: "{{ billet_receipt_failed or (billet_receipt_r is none and billet_receipt_outcome == 'reported') or ((billet_receipt_r is mapping) and (billet_receipt_r.keys() | list | sort) == (billet_receipt_fields | sort)) }}"
       - name: receipt_schema
         ok: "{{ not billet_receipt_with_receipt or (billet_receipt_r.schema | default(0) is integer and billet_receipt_r.schema | default(0) == 1) }}"
+      # THE RUN: a `written` receipt carries this converge's holder; a `current`
+      # one keeps the holder it was written under (the shortcut compares the
+      # evidence, never the run), so an unchanged host converges under a new
+      # holder; a dry run reports whatever it would write.
       - name: receipt_run
-        ok: "{{ not billet_receipt_with_receipt or ((billet_receipt_r.run | default('x')) is string and (billet_receipt_dry | bool or billet_receipt_r.run | default('') == billet_receipt_run)) }}"
+        ok: "{{ not billet_receipt_with_receipt or ((billet_receipt_r.run | default('x')) is string and (billet_receipt_dry | bool or billet_receipt_outcome == 'current' or billet_receipt_r.run | default('') == billet_receipt_run)) }}"
       - name: receipt_node
         ok: "{{ not billet_receipt_with_receipt or ((billet_receipt_r.node | default('x')) is string and (billet_receipt_r.node | default('')) | length > 0) }}"
       - name: receipt_deployment

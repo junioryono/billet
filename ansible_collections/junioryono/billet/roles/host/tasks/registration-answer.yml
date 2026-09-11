@@ -69,13 +69,13 @@
       - name: incarnation
         ok: "{{ billet_registration_failed or billet_registration_a.incarnation | default('') == billet_registration_incarnation }}"
       - name: deployment
-        ok: "{{ billet_registration_failed or ((billet_registration_a.deployment | default('x')) is mapping and (billet_registration_a.deployment.bound | default('x') is sameas true) and (billet_registration_a.deployment.id | default('x')) is string and (billet_registration_a.deployment.id | default('')) is match(billet_registration_hex32)) }}"
+        ok: "{{ billet_registration_failed or ((billet_registration_a.deployment | default('x')) is mapping and (billet_registration_a.deployment.keys() | list | sort) == ['bound', 'id'] and (billet_registration_a.deployment.bound | default('x') is sameas true) and (billet_registration_a.deployment.id | default('x')) is string and (billet_registration_a.deployment.id | default('')) is match(billet_registration_hex32)) }}"
       - name: epoch
         ok: "{{ billet_registration_outcome != 'confirmed' or ((billet_registration_a.epoch | default('x')) is integer and (billet_registration_a.epoch | default(0)) >= 1) }}"
       - name: live
         ok: "{{ billet_registration_outcome != 'confirmed' or (billet_registration_a.live | default('x') is sameas true) }}"
       - name: last
-        ok: "{{ billet_registration_outcome != 'timeout' or ('last' in billet_registration_a and ((billet_registration_a.last is none) or ((billet_registration_a.last is mapping) and (billet_registration_a.last.keys() | list | sort) == ['epoch', 'incarnation', 'live']))) }}"
+        ok: "{{ billet_registration_outcome != 'timeout' or ('last' in billet_registration_a and ((billet_registration_a.last is none) or ((billet_registration_a.last is mapping) and (billet_registration_a.last.keys() | list | sort) == ['epoch', 'incarnation', 'live'] and (billet_registration_a.last.incarnation is string) and (billet_registration_a.last.incarnation is match(billet_registration_hex32)) and (billet_registration_a.last.epoch is integer) and (billet_registration_a.last.epoch >= 1) and ((billet_registration_a.last.live is sameas true) or (billet_registration_a.last.live is sameas false))))) }}"
   ansible.builtin.assert:
     that:
       - item.ok | bool

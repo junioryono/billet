@@ -36,8 +36,11 @@
     - not billet_endpoint_no_billet | default(false) | bool
     - billet_endpoint_answerer | default('') | length > 0
   vars:
+    # THE MANAGED BINARY ONLY ONCE THIS CONVERGE'S TRANSACTION COMMITTED the
+    # candidate (the finalization's own word); until then, and in a dry run,
+    # the executable that answered the preparation.
     billet_endpoint_action_executable: >-
-      {{ billet_exclusion_binary if billet_binary_upgrade | default(false) | bool else billet_endpoint_answerer }}
+      {{ billet_exclusion_binary if billet_finalization_commit | default('') == 'host upgrade committed' else billet_endpoint_answerer }}
     billet_endpoint_action_bound: >-
       {{ (billet_migration_stop_timeout | int) + (billet_migration_record_wait | int) + (billet_guard_timeout | int) }}
   block:

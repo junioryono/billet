@@ -13,8 +13,9 @@ refuses a difference before anything is stopped. Each side's endpoint is
 derived as billet's config loader derives it: `node.server_addr` when it is
 written, else the server section's `listen` (which itself defaults to
 127.0.0.1:7717) when a server section exists, else none; the scheme is
-`node.tls`'s. A configuration without a node section names no endpoint, and two
-such configurations are equal.
+`node.tls`'s. A CHANGE IS TWO ENDPOINTS THAT DIFFER: a side without a node
+section (no node installed yet, or the node removed) names none, and a node's
+first start or its removal is not a migration, so those compare as unchanged.
 
 Everything arrives parsed: the role reads the installed file and renders the
 desired one on the controller, so this module needs no YAML on the host and
@@ -104,7 +105,7 @@ def endpoint_of(cfg, where):
 def compare(installed, desired):
     a = endpoint_of(installed, "the installed configuration")
     b = endpoint_of(desired, "the rendering")
-    changed = (a is None) != (b is None) or (a is not None and a != b)
+    changed = a is not None and b is not None and a != b
     return changed, (a.canonical() if a is not None else None), (b.canonical() if b is not None else None)
 
 

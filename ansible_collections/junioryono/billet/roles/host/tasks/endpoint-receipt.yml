@@ -25,8 +25,11 @@
     - billet_config.node is not none
     - billet_node_should_run | default(false) | bool
   vars:
+    # THE MANAGED BINARY ONLY ONCE THIS CONVERGE'S TRANSACTION COMMITTED the
+    # candidate (the finalization's own word); until then, and in a dry run,
+    # the executable that answered the preparation.
     billet_endpoint_action_executable: >-
-      {{ billet_exclusion_binary if billet_binary_upgrade | default(false) | bool else billet_endpoint_answerer }}
+      {{ billet_exclusion_binary if billet_finalization_commit | default('') == 'host upgrade committed' else billet_endpoint_answerer }}
   block:
     # THE INSTALLED FILE, as it stands now: the render installed it (or, in a
     # dry run, would have), and the refresh reads it by name.

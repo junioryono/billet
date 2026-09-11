@@ -67,15 +67,25 @@
 
     - name: Refuse a converge over a node running on a host with no billet
       vars:
-        billet_endpoint_unit: "{{ dict(billet_endpoint_unit_raw.stdout_lines | default([]) | map('split', '=', 1) | list) }}"
+        # Only `Name=value` lines are read; anything else systemctl prints
+        # (a warning, an empty line) is not a property.
+        billet_endpoint_unit: "{{ dict(billet_endpoint_unit_raw.stdout_lines | default([]) | select('search', '=') | map('split', '=', 1) | list) }}"
+      # POSITIVE EVIDENCE ONLY: the three properties answered, the unit loaded
+      # or not found, a state that carries no process, and a pid of exactly
+      # zero; anything missing or unfamiliar is could-not-tell and refuses.
       ansible.builtin.assert:
         that:
           - billet_endpoint_unit_raw.rc == 0
-          - billet_endpoint_unit.ActiveState | default('') not in ['active', 'activating', 'deactivating', 'reloading']
-          - billet_endpoint_unit.MainPID | default('0') in ['0', '']
+          - "'LoadState' in billet_endpoint_unit"
+          - "'ActiveState' in billet_endpoint_unit"
+          - "'MainPID' in billet_endpoint_unit"
+          - billet_endpoint_unit.LoadState | default('') in ['loaded', 'not-found']
+          - billet_endpoint_unit.ActiveState | default('') in ['inactive', 'failed']
+          - billet_endpoint_unit.MainPID | default('') == '0'
         fail_msg: >-
-          {{ ('a node runs on a host with no billet to ask (billet-node.service is '
-              ~ (billet_endpoint_unit.ActiveState | default('unobserved')) ~ ', pid ' ~ (billet_endpoint_unit.MainPID | default('none')) ~ ')')
+          {{ ('a node runs on a host with no billet to ask, or cannot be judged (billet-node.service is '
+              ~ (billet_endpoint_unit.LoadState | default('unobserved')) ~ ', ' ~ (billet_endpoint_unit.ActiveState | default('unobserved'))
+              ~ ', pid ' ~ (billet_endpoint_unit.MainPID | default('unobserved')) ~ ')')
              if billet_endpoint_unit_raw.rc == 0
              else ('billet-node.service could not be observed on a host with no billet to ask (systemctl show exited '
                    ~ billet_endpoint_unit_raw.rc | string ~ ')') }};

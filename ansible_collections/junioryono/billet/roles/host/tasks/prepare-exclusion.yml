@@ -146,6 +146,7 @@
 - name: Start the executable that answers for this converge at none
   ansible.builtin.set_fact:
     billet_exclusion_answerer: ""
+    billet_exclusion_answered_now: false
 
 - name: Start the claim's facts at none
   ansible.builtin.set_fact:
@@ -1090,8 +1091,8 @@
 - name: Note the executable that answers for this converge
   ansible.builtin.set_fact:
     billet_exclusion_answerer: >-
-      {{ (billet_exclusion_executable | default(''))
+      {{ ((billet_exclusion_executable | default('')) if billet_exclusion_answered_now | default(false) | bool else '')
          if not ansible_check_mode
          else (((billet_exclusion_fallback_executable | default('')) if billet_exclusion_dry_via_record | default(false) | bool
                 else billet_exclusion_binary)
-               if billet_exclusion_dry_answered | default(false) | bool else '') }}
+               if (billet_exclusion_dry_answered | default(false) | bool and (billet_exclusion_dry_report | default({}) | length > 0)) else '') }}

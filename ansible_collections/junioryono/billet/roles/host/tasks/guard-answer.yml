@@ -188,6 +188,10 @@
          else billet_exclusion_cleanup_token | default('') }}
     billet_exclusion_held: true
     billet_exclusion_executable: "{{ billet_exclusion_answered_by }}"
+    # THIS INVOCATION'S OWN ANSWER: a fact an earlier inclusion left behind
+    # (a candidate that answered a preparation whose guard was then released)
+    # is never this converge's answerer; the preparation resets this at entry.
+    billet_exclusion_answered_now: true
     # THE INTERRUPTION IS THE FIRST ANSWER'S: the second call declared its
     # intent from these facts and its answer was held to agree above, so the
     # second answer neither clears nor sets them.

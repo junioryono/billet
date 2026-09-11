@@ -3,8 +3,9 @@
 loader does and compares through the endpoint representation: an explicit
 address equal to the derived default is no change, a changed `server.listen`
 under two omitted `server_addr`s is one, a TLS state that changes the scheme is
-one, two configurations without a node section are equal, and a side that
-names no endpoint at all is refused rather than read as none.
+one, a side without a node section (a first start, a removal, no installed
+configuration) is not a change, and a node section that names no endpoint at
+all is refused rather than read as none.
 """
 
 import importlib.util
@@ -80,12 +81,12 @@ def main():
          node(addr="10.0.0.5:7717"), node(addr="10.0.0.5:7717", tls=True), True),
         ("two configurations without a node section are equal",
          {"server": {}}, {"server": {}}, False),
-        ("a node added is a change",
-         {"server": {}}, node(addr="127.0.0.1:7717"), True),
-        ("a node removed is a change",
-         node(addr="127.0.0.1:7717"), {"server": {}}, True),
-        ("no installed configuration beside a rendering with a node is a change",
-         {}, node(addr="127.0.0.1:7717"), True),
+        ("a node added is a first start, not a change",
+         {"server": {}}, node(addr="127.0.0.1:7717"), False),
+        ("a node removed is a stop, not a change",
+         node(addr="127.0.0.1:7717"), {"server": {}}, False),
+        ("no installed configuration beside a rendering with a node is a first start",
+         {}, node(addr="127.0.0.1:7717"), False),
     ]
     for name, a, b, want in cases:
         try:
