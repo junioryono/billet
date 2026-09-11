@@ -50,16 +50,18 @@ fi
 # a black-holed proxy; so every update is followed by a check that at least one
 # InRelease landed in /var/lib/apt/lists, which is the failure it is, here rather
 # than two commands later as "openssl has no installation candidate". Not
-# Error-Mode=any: with TWO sources (archive.ubuntu.com, then a kernel.org mirror;
-# apt reads them as two repositories and takes a package from whichever lists it)
+# Error-Mode=any: with TWO sources on amd64 (archive.ubuntu.com, then a kernel.org
+# mirror; apt reads them as two repositories and takes a package from whichever
+# lists it; arm64's ports archive has no second mirror there and keeps one, HTTPS)
 # a strict update fails while EITHER is down, measured on a fleet guest 2026-09-11,
 # which is the outage this shape exists to survive.
 # APT OVER HTTPS, with the host's CA bundle (the image carries none): see
 # billet-shell-gates, the mirror outage of 2026-09-11.
 docker run --rm --platform "linux/${package_arch}" --volume "${deb_path}:/tmp/billet.deb:ro" -v /etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro ubuntu:24.04 sh -euxc '
-    sed -i "s,^URIs: .*,URIs: https://archive.ubuntu.com/ubuntu/ https://mirrors.edge.kernel.org/ubuntu/," /etc/apt/sources.list.d/ubuntu.sources
+    sed -i -e "s,^URIs: http://archive.ubuntu.com/ubuntu/,URIs: https://archive.ubuntu.com/ubuntu/ https://mirrors.edge.kernel.org/ubuntu/," -e "s,^URIs: http://ports.ubuntu.com/ubuntu-ports/,URIs: https://ports.ubuntu.com/ubuntu-ports/," /etc/apt/sources.list.d/ubuntu.sources
     APT="timeout -v -k 10 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30"
-    ${APT} update && ls /var/lib/apt/lists/*InRelease >/dev/null
+    ${APT} update
+    ls /var/lib/apt/lists/*InRelease >/dev/null
     ${APT} install --yes /tmp/billet.deb
     test -x /usr/bin/billet
     test -f /usr/lib/modules-load.d/billet-rbd.conf

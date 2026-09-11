@@ -39,5 +39,6 @@ fi
 
 docker run --rm --platform "linux/${package_arch}" \
     --volume "${deb_path}:/tmp/billet.deb:ro" \
+    --volume /etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro \
     --volume "$(pwd)/scripts/postgres-restore-rehearsal.sh:/tmp/postgres-restore-rehearsal.sh:ro" \
     ubuntu:24.04 sh /tmp/postgres-restore-rehearsal.sh
