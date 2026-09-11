@@ -7,7 +7,14 @@ billet_development_terraform_min_version: "1.12.0"
 billet_development_caddy_min_version: "2.7.0"
 
 # Repository signing keys are verified before either apt source is trusted.
-billet_development_hashicorp_signing_fingerprint: 798AEC654E5C15428C8E42EEAA16FCBCA621E701
+# HashiCorp rotated its package signing key on 2026-09-09 (measured 2026-09-11:
+# https://apt.releases.hashicorp.com/gpg publishes exactly one primary key,
+# D55C0D1AC78A8D8126CB631CFC9CA96ACA026560, expiring 2031-09-08, and the
+# repository's InRelease is signed by it alone, so a host holding the previous
+# key 798AEC654E5C15428C8E42EEAA16FCBCA621E701 fails every apt update with
+# NO_PUBKEY). A rotation shows up here as this refusal; confirm the new key
+# against HashiCorp's own publication before moving the pin.
+billet_development_hashicorp_signing_fingerprint: D55C0D1AC78A8D8126CB631CFC9CA96ACA026560
 billet_development_caddy_signing_fingerprint: 65760C51EDEA2017CEA2CA15155B6D79CA56EA34
 billet_development_apt_stage: /var/cache/billet-development-host
 
