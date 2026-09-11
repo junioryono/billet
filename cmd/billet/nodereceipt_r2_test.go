@@ -37,15 +37,24 @@ func TestReceiptRefusesMemberAliases(t *testing.T) {
 		f.noReceipt(t)
 	})
 
-	t.Run("a null epoch", func(t *testing.T) {
-		o := f.evidence(t, f.evidenceObject(t, nil), f.confirmationObject(map[string]any{"epoch": nil}))
-		mustEndpointRefusal(t, o, outcomeRefused, endpointReasonConfirm)
-	})
+	// A nil override deletes the member; the null is assigned afterwards so
+	// the member is present and null.
+	for _, c := range []struct {
+		name  string
+		epoch any
+	}{{"a null epoch", nil}, {"an epoch that is a string", "3"}, {"a fractional epoch", 1.5}} {
+		t.Run(c.name, func(t *testing.T) {
+			conf := f.confirmationObject(nil)
+			conf["epoch"] = c.epoch
 
-	t.Run("an epoch that is a string", func(t *testing.T) {
-		o := f.evidence(t, f.evidenceObject(t, nil), f.confirmationObject(map[string]any{"epoch": "3"}))
-		mustEndpointRefusal(t, o, outcomeRefused, endpointReasonConfirm)
-	})
+			o := f.evidence(t, f.evidenceObject(t, nil), conf)
+			mustEndpointRefusal(t, o, outcomeRefused, endpointReasonConfirm)
+
+			if !strings.Contains(o.str("why"), "epoch is not an integer") {
+				t.Errorf("why %q", o.str("why"))
+			}
+		})
+	}
 
 	t.Run("Node beside node in the evidence", func(t *testing.T) {
 		o := f.evidence(t, f.evidenceObject(t, map[string]any{"Node": "node-b"}), f.confirmationObject(nil))
@@ -204,13 +213,19 @@ func TestReceiptShortcutAndRemovalActOnTheFileJudged(t *testing.T) {
 			mustOK(t, os.Rename(tmp, f.path))
 		})
 
-		// The file judged moved: could-not-tell, and the next converge judges
-		// what the name holds then.
+		// Nothing is removed: the invalid file, or whatever replaced it, is
+		// replaced by this converge's durable rename after the closing
+		// checks, so the other publisher's receipt is never the one removed
+		// and the name holds a valid receipt throughout.
 		o := f.refresh(t, f.rendering(endpointB))
-		mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonTrust)
+		mustWritten(t, o)
 
-		if disk := f.receiptOnDisk(t); disk.Run != "ci-run-99" {
-			t.Errorf("the receipt installed after the read was removed: %+v", disk)
+		if disk := f.receiptOnDisk(t); disk.Run != receiptRun {
+			t.Errorf("on disk %+v", disk)
+		}
+
+		if contains(*f.events, "remove") {
+			t.Error("something was removed")
 		}
 	})
 
@@ -249,6 +264,7 @@ func TestReceiptDirectoryMustBeRootsAndPrivate(t *testing.T) {
 		{"a directory that is not private", func(t *testing.T, f *receiptCmdFixture) {
 			t.Helper()
 			mustOK(t, os.Mkdir(f.dir, 0o755))
+			mustOK(t, os.Chmod(f.dir, 0o755))
 		}},
 		{"a parent writable by others", func(t *testing.T, f *receiptCmdFixture) {
 			t.Helper()
@@ -295,5 +311,76 @@ func TestReceiptDirectoryMustBeRootsAndPrivate(t *testing.T) {
 				}
 			})
 		}
+
+		t.Run("a parent writable by others", func(t *testing.T) {
+			f := newReceiptFixture(t)
+			f.writeReceipt(t, validReceipt())
+			mustOK(t, os.Chmod(f.parent, 0o777))
+
+			if ev := readEndpointReceipt(f.path); ev.presence != receiptInvalid {
+				t.Errorf("presence %s why %q, want invalid", ev.presence, ev.why)
+			}
+		})
+
+		t.Run("a parent of another owner", func(t *testing.T) {
+			f := newReceiptFixture(t)
+			f.writeReceipt(t, validReceipt())
+			info, err := os.Lstat(f.parent)
+			mustOK(t, err)
+			f.owners[inodeOf(t, info)] = 1001
+
+			if ev := readEndpointReceipt(f.path); ev.presence != receiptInvalid {
+				t.Errorf("presence %s why %q, want invalid", ev.presence, ev.why)
+			}
+		})
+	})
+}
+
+// The closing checks judge metadata too: a directory or a receipt whose
+// owner or mode moved after it was judged is could-not-tell, whatever its
+// inode, size and modification time say.
+func TestReceiptClosingChecksJudgeOwnershipAndMode(t *testing.T) {
+	afterRead := func(t *testing.T, f *receiptCmdFixture, fn func()) {
+		t.Helper()
+
+		prev := receiptRead
+		ran := false
+		receiptRead = func(file *os.File, path string, limit int64) ([]byte, error) {
+			body, err := prev(file, path, limit)
+			if path == f.path && !ran {
+				ran = true
+				fn()
+			}
+
+			return body, err
+		}
+	}
+
+	t.Run("the directory's mode after the read-back", func(t *testing.T) {
+		f := newReceiptCmdFixture(t)
+		f.migrated(t)
+		afterRead(t, f, func() { mustOK(t, os.Chmod(f.dir, 0o755)) })
+
+		o := f.refresh(t, f.rendering(endpointB))
+		mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonTrust)
+	})
+
+	t.Run("the receipt's mode after the read-back", func(t *testing.T) {
+		f := newReceiptCmdFixture(t)
+		f.migrated(t)
+		afterRead(t, f, func() { mustOK(t, os.Chmod(f.path, 0o644)) })
+
+		o := f.refresh(t, f.rendering(endpointB))
+		mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonTrust)
+	})
+
+	t.Run("the receipt's owner before the shortcut", func(t *testing.T) {
+		f := newReceiptCmdFixture(t)
+		f.migrated(t)
+		mustWritten(t, f.refresh(t, f.rendering(endpointB)))
+		afterRead(t, f, func() { f.owners[f.inode(t)] = 1001 })
+
+		o := f.refresh(t, f.rendering(endpointB))
+		mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonTrust)
 	})
 }

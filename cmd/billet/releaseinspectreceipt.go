@@ -108,6 +108,53 @@ type receiptEvidence struct {
 	info os.FileInfo
 }
 
+// receiptParentProblem says why the examined name is not a parent that can
+// hold the receipt directory: a link, not a directory, not root's, or
+// writable by anyone but root (another writer could rename the receipt
+// directory away whatever its own mode). Empty when it can.
+func receiptParentProblem(parent string, info os.FileInfo) string {
+	switch {
+	case info.Mode()&os.ModeSymlink != 0:
+		return parent + " is a symlink"
+	case !info.IsDir():
+		return parent + " is not a directory"
+	}
+
+	uid, ok := receiptOwnerOf(info)
+	switch {
+	case !ok:
+		return parent + " carries no owner this platform reports"
+	case uid != 0:
+		return fmt.Sprintf("%s is owned by uid %d, want root", parent, uid)
+	case info.Mode().Perm()&0o022 != 0:
+		return fmt.Sprintf("%s is mode %04o, writable by others; a directory another writer can rename in cannot hold "+
+			"durable evidence", parent, info.Mode().Perm())
+	}
+
+	return ""
+}
+
+// receiptFileProblem says why the examined receipt's metadata is not what
+// billet writes: not a regular file, not root's, or not 0600. Empty when
+// it is.
+func receiptFileProblem(path string, info os.FileInfo) string {
+	if !info.Mode().IsRegular() {
+		return fmt.Sprintf("the receipt %s is %s, not a regular file", path, info.Mode().Type())
+	}
+
+	uid, ok := receiptOwnerOf(info)
+	switch {
+	case !ok:
+		return "the receipt carries no owner this platform reports"
+	case uid != 0:
+		return fmt.Sprintf("the receipt is owned by uid %d, want root", uid)
+	case info.Mode().Perm() != 0o600:
+		return fmt.Sprintf("the receipt is mode %04o, want 0600", info.Mode().Perm())
+	}
+
+	return ""
+}
+
 // receiptDirectoryProblem says why the examined name is not the receipt
 // directory billet writes: a link, not a directory, not root's, or not
 // 0700 (a directory another writer can rename in cannot hold durable
@@ -136,6 +183,19 @@ func receiptDirectoryProblem(dir string, info os.FileInfo) string {
 // readEndpointReceipt reads the receipt at path under the reader's rules.
 func readEndpointReceipt(path string) receiptEvidence {
 	dir := filepath.Dir(path)
+	parent := filepath.Dir(dir)
+
+	// THE PARENT FIRST, under the writer's rule: a receipt under a parent
+	// another writer can rename in is not the durable evidence its members
+	// claim, whatever the directory's own mode.
+	parentInfo, err := receiptLstat(parent)
+	if err != nil {
+		return receiptEvidence{presence: receiptUnreadable, why: fmt.Sprintf("examine %s: %v", parent, err)}
+	}
+
+	if why := receiptParentProblem(parent, parentInfo); why != "" {
+		return receiptEvidence{presence: receiptInvalid, why: why}
+	}
 
 	dirInfo, err := receiptLstat(dir)
 	switch {
