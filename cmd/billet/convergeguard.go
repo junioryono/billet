@@ -1368,6 +1368,15 @@ func admitRetirementTakeover(shape claimShape, old string) (*guardTransition, er
 	// marker is a state no step of the protocol produces.
 	switch {
 	case j.Phase == retirement.PhaseDone && !j.Settled:
+		// THE GRAMMAR THE RECORD'S READERS HOLD THE MARKER TO, before the
+		// record is rewritten: a restored marker no reader admits would be a
+		// guard nobody can release or take over.
+		if !guardHex32.MatchString(j.Provenance.TransitionID) {
+			return nil, fmt.Errorf("the guard held by %s carries no marker and the retirement journal's transition id %q "+
+				"is not 32 lowercase hex digits, so no marker can be restored from it; nothing was taken over", old,
+				j.Provenance.TransitionID)
+		}
+
 		return &guardTransition{Kind: transitionRetirement, ID: j.Provenance.TransitionID}, nil
 	case j.Settled:
 		return nil, fmt.Errorf("the guard held by %s carries no marker and the retirement journal is settled, so there "+

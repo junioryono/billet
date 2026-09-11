@@ -134,6 +134,8 @@ type installedConfigObservation struct {
 	info    os.FileInfo
 	sha256  string
 	cfg     *config.Config
+	// body is the bytes the digest is of.
+	body []byte
 }
 
 // observeConfig reads the configuration at path through the identity-first
@@ -177,7 +179,7 @@ func observeInstalledConfig(path string, strict bool) (*installedConfigObservati
 	}
 
 	sum := sha256.Sum256(body)
-	obs.present, obs.info, obs.sha256, obs.cfg = true, info, hex.EncodeToString(sum[:]), cfg
+	obs.present, obs.info, obs.sha256, obs.cfg, obs.body = true, info, hex.EncodeToString(sum[:]), cfg, body
 
 	return obs, nil
 }

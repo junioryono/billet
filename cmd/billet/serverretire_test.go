@@ -168,9 +168,27 @@ func (f *retireFixture) journalAt(t *testing.T, phase retirement.Phase, owner st
 
 	if phase == retirement.PhaseDone {
 		j.DoneAt = "2026-09-11T09:00:00Z"
+		f.archiveIdentity(t, j.Archive)
 	}
 
 	mustOK(t, j.Write(time.Date(2026, 9, 11, 8, 30, 0, 0, time.UTC)))
+}
+
+// archiveIdentity puts the deployment identity where a done journal says the
+// directory was archived, as the transition's rename does.
+func (f *retireFixture) archiveIdentity(t *testing.T, archive string) {
+	t.Helper()
+
+	if _, err := os.Lstat(archive); err == nil {
+		return
+	}
+
+	mustOK(t, retirement.EnsureRetiredDir())
+	mustOK(t, os.Mkdir(archive, 0o700))
+
+	body, err := os.ReadFile(state.DeploymentIDPath(f.stateDir))
+	mustOK(t, err)
+	mustOK(t, os.WriteFile(state.DeploymentIDPath(archive), body, 0o600))
 }
 
 // THE COMMITTED FIXTURES ARE EXACTLY WHAT THE PRODUCERS BELOW WRITE.
@@ -255,13 +273,13 @@ func TestServerRetireIsRefusedOffLinux(t *testing.T) {
 // configuration before any guard or ledger is examined.
 func TestServerRetireReserveNeedsAPostgresActivePassivePair(t *testing.T) {
 	f := newRetireFixture(t)
+	mustHold(t, "ci-1")
 
+	// THE GUARD COMES FIRST: the configuration is observed under it, so the
+	// eligibility a reservation rests on is the one no concurrent converge or
+	// transaction can have moved.
 	out, code := f.run(t, "", "--reserve", "--run", "ci-1", "--retiring-host", "control-a", "--survivor-host", "control-b")
 	expectRetire(t, out, code, "refused-backend", retireOutcomeRefused, retireReasonBackend)
-
-	if _, err := os.Lstat(f.guard.root); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("the backend refusal touched the upgrade root: %v", err)
-	}
 
 	// A PostgreSQL configuration for one controller: refused on the controllers
 	// before the connection string is ever needed.

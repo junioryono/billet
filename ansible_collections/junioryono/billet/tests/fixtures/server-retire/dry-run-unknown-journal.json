@@ -18,5 +18,6 @@
   },
   "row": null,
   "row_fact": "absent",
-  "dispatch": "unknown-reservation"
+  "dispatch": "unknown-reservation",
+  "state": "nothing"
 }

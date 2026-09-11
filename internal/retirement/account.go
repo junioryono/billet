@@ -197,7 +197,8 @@ func checkMembers(raw []byte, typ reflect.Type) error {
 		members   map[string]struct{}
 		expectKey bool
 		// held is the struct an object's members are looked up in; elem an
-		// array's element type; next the type of the value the last key opens.
+		// array's or a map's element type; next the type of the value the
+		// last key opens.
 		held, elem, next reflect.Type
 	}
 
@@ -244,6 +245,8 @@ func checkMembers(raw []byte, typ reflect.Type) error {
 				case valueType == nil:
 				case d == '{' && valueType.Kind() == reflect.Struct:
 					f.held = valueType
+				case d == '{' && valueType.Kind() == reflect.Map:
+					f.elem = derefType(valueType.Elem())
 				case d == '[' && (valueType.Kind() == reflect.Slice || valueType.Kind() == reflect.Array):
 					f.elem = derefType(valueType.Elem())
 				}
@@ -277,7 +280,7 @@ func checkMembers(raw []byte, typ reflect.Type) error {
 
 		top.members[key] = struct{}{}
 		top.expectKey = false
-		top.next = nil
+		top.next = top.elem
 
 		if top.held != nil {
 			field, found := jsonField(top.held, key)

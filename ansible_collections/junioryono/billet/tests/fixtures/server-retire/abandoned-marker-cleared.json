@@ -2,5 +2,6 @@
   "schema": 1,
   "outcome": "abandoned",
   "transition_id": "0123456789abcdef0123456789abcdef",
-  "marker": "cleared"
+  "marker": "cleared",
+  "state": "nothing"
 }

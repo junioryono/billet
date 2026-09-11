@@ -172,8 +172,10 @@ func TestTheJournalWriterIsHeldToTheReadersBound(t *testing.T) {
 	}
 }
 
-// A JOURNAL IS READ THROUGH EOF: a complete document with anything behind it
-// is malformed, whatever a stat said about its size.
+// A JOURNAL IS READ THROUGH EOF, NOT TO THE SIZE A STAT REPORTED: a file that
+// grows between the reader's stat and its read is refused (the size moved),
+// and a size-based read that found a complete document in the stat's prefix
+// would have admitted it with the growth unread.
 func TestAJournalIsReadThroughEOF(t *testing.T) {
 	useRoot(t)
 
@@ -182,21 +184,76 @@ func TestAJournalIsReadThroughEOF(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	f, err := os.OpenFile(JournalPath(), os.O_WRONLY|os.O_APPEND, 0)
-	if err != nil {
-		t.Fatal(err)
+	appendTrailer := func() {
+		f, err := os.OpenFile(JournalPath(), os.O_WRONLY|os.O_APPEND, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := f.WriteString(`{"schema":1}` + "\n"); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
 	}
 
-	if _, err := f.WriteString(`{"schema":1}` + "\n"); err != nil {
-		t.Fatal(err)
+	// Grown UNDER the read: the stat saw the whole document, the read finds
+	// more, and the closing stat finds a size that moved.
+	journalBetweenStatAndRead = appendTrailer
+
+	_, presence, err := ReadJournal()
+	journalBetweenStatAndRead = nil
+
+	if presence != JournalUnreadable || err == nil || !strings.Contains(err.Error(), "changed under the read") {
+		t.Fatalf("a journal grown under the read must be unreadable, got %d %v", presence, err)
 	}
 
-	if err := f.Close(); err != nil {
-		t.Fatal(err)
-	}
-
+	// Grown BEFORE the read: content behind the document is malformed.
 	if _, presence, err := ReadJournal(); presence != JournalMalformed || err == nil ||
 		!strings.Contains(err.Error(), "trailing content") {
 		t.Fatalf("a document with content behind it must be malformed, got %d %v", presence, err)
+	}
+
+	// Rewritten in place under the read with the same size: the time moved.
+	if err := j.Write(time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	journalBetweenStatAndRead = func() {
+		time.Sleep(20 * time.Millisecond)
+
+		body, err := os.ReadFile(JournalPath())
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := os.WriteFile(JournalPath(), body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	_, presence, err = ReadJournal()
+	journalBetweenStatAndRead = nil
+
+	if presence != JournalUnreadable || err == nil || !strings.Contains(err.Error(), "changed under the read") {
+		t.Fatalf("a journal rewritten under the read must be unreadable, got %d %v", presence, err)
+	}
+}
+
+// THE TRANSITION ID HAS THE MARKER'S GRAMMAR: a journal whose provenance names
+// an id no guard reader admits is malformed, so no marker is ever restored
+// from it.
+func TestTheJournalsTransitionIDHasTheMarkersGrammar(t *testing.T) {
+	useRoot(t)
+
+	for _, bad := range []string{"bad", strings.Repeat("D", 32), strings.Repeat("d", 31), strings.Repeat("d", 33)} {
+		j := sampleJournal()
+		j.Provenance.TransitionID = bad
+
+		if err := j.Write(time.Now()); err == nil || !strings.Contains(err.Error(), "32 lowercase hex digits") {
+			t.Errorf("%q: written, or refused for another reason: %v", bad, err)
+		}
 	}
 }

@@ -8,5 +8,6 @@
   "marker": null,
   "row": null,
   "row_fact": "absent",
-  "dispatch": "request"
+  "dispatch": "request",
+  "state": "nothing"
 }

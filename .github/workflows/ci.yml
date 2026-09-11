@@ -217,7 +217,7 @@ jobs:
       - name: Test the ledger backend and the one backup test against PostgreSQL
         run: |
           go test -race -count=1 -timeout 20m -vet=off ./internal/state/
-          go test -race -count=1 -timeout 20m -vet=off -run 'TestAPostgresBackupIsNotRefusedBeforeItStarts|TestServerRetireReservesOnAPostgresPair' ./cmd/billet/
+          go test -race -count=1 -timeout 20m -vet=off -run 'TestAPostgresBackupIsNotRefusedBeforeItStarts|TestServerRetireReservesOnAPostgresPair|TestServerRetireReserveIsHeldToAnExistingMarker' ./cmd/billet/
       - name: Test the capacity suite against PostgreSQL
         run: go test -count=1 -timeout 20m ./internal/alloc/
         env:

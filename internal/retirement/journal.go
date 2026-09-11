@@ -7,6 +7,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"regexp"
 	"slices"
 	"syscall"
 	"time"
@@ -21,6 +22,14 @@ const JournalSchema = 1
 // maxJournalBytes bounds a read of the journal: a few hundred bytes of fields
 // and a node list; a longer file is not one this binary wrote.
 const maxJournalBytes = 64 << 10
+
+// transitionIDPattern is the transition id's grammar, the guard marker's:
+// 32 lowercase hex digits, as `newGuardID` mints them.
+var transitionIDPattern = regexp.MustCompile(`^[0-9a-f]{32}$`)
+
+// journalBetweenStatAndRead runs between the reader's stat and its read; a
+// test grows the file there. Nil in production.
+var journalBetweenStatAndRead func()
 
 // Journal is a controller's retirement as the retiring host records it, at
 // the fixed path under the private retirement directory, one phase at a time.
@@ -161,6 +170,10 @@ func readJournalAt(path string) (Journal, JournalPresence, error) {
 		return Journal{}, JournalMalformed, fmt.Errorf("retirement: %s is %d bytes, longer than any journal billet writes", path, info.Size())
 	}
 
+	if journalBetweenStatAndRead != nil {
+		journalBetweenStatAndRead()
+	}
+
 	// THROUGH EOF, never to the size a stat reported: a file grown under the
 	// read can hold a complete document in that prefix with more behind it,
 	// and a prefix that decodes is not proof of a whole file.
@@ -228,6 +241,8 @@ func (j *Journal) wellFormed() error {
 		return errors.New("journal names no deployment, retiring host or survivor")
 	case j.Provenance.TransitionID == "" || j.Provenance.Reservation == "":
 		return errors.New("journal carries no provenance (transition id and reservation)")
+	case !transitionIDPattern.MatchString(j.Provenance.TransitionID):
+		return fmt.Errorf("journal's transition id %q is not 32 lowercase hex digits", j.Provenance.TransitionID)
 	case j.Ownership.Owner == "":
 		return errors.New("journal names no owner")
 	case j.Variant == VariantServerOnly && (j.StagedSHA256 != "" || j.Config != "absent"):
