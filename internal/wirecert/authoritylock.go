@@ -68,14 +68,15 @@ type Exclusion struct {
 // classification requires: the global lock, admitted, on a prepared host; the
 // legacy marker on a host with no metadata; a refusal on a damaged one.
 //
-// A FRESH host (no metadata, directory absent) resolves as legacy for the
-// lock's purposes and MAY CREATE: there is no record, no global lock and no
-// status, so nothing a retirement could have moved, and a library caller that
-// resolves it (a restore onto a bare target) initialises as before this package
-// existed; the command layer creates under the initialisation lock beside the
-// directory first and then finds it present. A LEGACY host (the directory
-// existed when it was classified) and a PREPARED one may not: a directory gone
-// since is a retirement's move or damage, and the inner lock refuses it.
+// NO RESOLUTION GRANTS CREATION ON LINUX. A FRESH host (no metadata, directory
+// absent) resolves as legacy for the lock's purposes and the directory is
+// created only by a caller holding the initialisation lock beside it, having
+// re-established the four absences under that lock: the command layer's fresh
+// branch, or LockAuthority below for a caller with no command around it. A
+// classification remembered from before the lock cannot authorise creation,
+// because an installer can prepare the host and a retirement archive its
+// directory in the gap, and the recreation would land beside the archive. Off
+// Linux there is no retirement and the inner lock creates as it always did.
 func ResolveExclusion(ctx context.Context, stateDir string, wait time.Duration) (Exclusion, error) {
 	if !retirement.SupportedHere() {
 		return Exclusion{Legacy: true, Create: true, Wait: wait}, nil
@@ -100,8 +101,6 @@ func ResolveExclusion(ctx context.Context, stateDir string, wait time.Duration) 
 		acct := class.Account
 
 		return Exclusion{Hold: hold, Wait: wait, Account: &acct, ownsHold: true}, nil
-	case retirement.ModeFresh:
-		return Exclusion{Legacy: true, Create: true, Wait: wait}, nil
 	default:
 		return Exclusion{Legacy: true, Wait: wait}, nil
 	}
@@ -161,6 +160,9 @@ type AuthorityLock struct {
 	// releases with itself; a hold the exclusion already carried is not this
 	// lock's to release.
 	hold *retirement.Hold
+	// init is the initialisation lock LockAuthority took itself to create a
+	// fresh host's directory, released with the lock.
+	init *retirement.InitHold
 }
 
 // LockAuthority takes the inner lock with the exclusion resolved here: one
@@ -173,22 +175,74 @@ type AuthorityLock struct {
 // it again. A command that has already resolved its exclusion passes it to
 // LockAuthorityWith instead.
 func LockAuthority(ctx context.Context, stateDir string) (*AuthorityLock, error) {
-	ex, err := ResolveExclusion(ctx, stateDir, 0)
+	ex, init, err := resolveForLibraryCaller(ctx, stateDir)
 	if err != nil {
 		return nil, err
 	}
 
 	lock, err := LockAuthorityWith(ctx, stateDir, ex)
 	if err != nil {
-		return nil, errors.Join(err, ex.Release())
+		return nil, errors.Join(err, ex.Release(), init.Release())
 	}
 
-	// The resolution's hold travels with the lock, so one Release drops both.
+	// The resolution's hold and init lock travel with the lock, so one Release
+	// drops all of them.
 	if ex.ownsHold {
 		lock.hold, ex.ownsHold = ex.Hold, false
 	}
 
+	lock.init = init
+
 	return lock, nil
+}
+
+// resolveForLibraryCaller is ResolveExclusion for a caller with no command
+// around it, with the one thing such a caller may need that a resolution never
+// grants: on a FRESH Linux host it takes the initialisation lock beside the
+// directory, re-establishes the four absences under it, and only then answers
+// an exclusion that may create. A host that stopped being fresh while the lock
+// was awaited is answered as what it is now.
+func resolveForLibraryCaller(ctx context.Context, stateDir string) (Exclusion, *retirement.InitHold, error) {
+	if !retirement.SupportedHere() {
+		return Exclusion{Legacy: true, Create: true}, nil, nil
+	}
+
+	class, err := retirement.Classify(stateDir)
+	if err != nil {
+		return Exclusion{}, nil, err
+	}
+
+	if class.Mode != retirement.ModeFresh {
+		ex, err := ResolveExclusion(ctx, stateDir, 0)
+
+		return ex, nil, err
+	}
+
+	initCtx, cancel := context.WithTimeout(ctx, time.Millisecond)
+	defer cancel()
+
+	init, err := retirement.AcquireInit(initCtx, stateDir, nil, 0)
+	if err != nil {
+		return Exclusion{}, nil, fmt.Errorf("wirecert: take the initialisation lock beside %s: %w", stateDir, err)
+	}
+
+	again, err := retirement.Classify(stateDir)
+	if err != nil {
+		return Exclusion{}, nil, errors.Join(err, init.Release())
+	}
+
+	if again.Mode == retirement.ModeFresh {
+		return Exclusion{Legacy: true, Create: true}, init, nil
+	}
+
+	// An installer or another initialisation got there first; proceed on what
+	// the host is now, still holding the init lock against a third party.
+	ex, err := ResolveExclusion(ctx, stateDir, 0)
+	if err != nil {
+		return Exclusion{}, nil, errors.Join(err, init.Release())
+	}
+
+	return ex, init, nil
 }
 
 // LockAuthorityWith takes the inner lock under an exclusion the caller resolved.
@@ -414,6 +468,11 @@ func (l *AuthorityLock) Release() error {
 	if l.hold != nil {
 		holdErr = l.hold.Release()
 		l.hold = nil
+	}
+
+	if l.init != nil {
+		holdErr = errors.Join(holdErr, l.init.Release())
+		l.init = nil
 	}
 
 	if unlockErr != nil {

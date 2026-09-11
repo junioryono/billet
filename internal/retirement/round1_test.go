@@ -111,6 +111,22 @@ func TestAnAbsentDirectoryBesideMetadataIsNotFresh(t *testing.T) {
 		t.Fatalf("no metadata at all is fresh, got fresh=%v err=%v", fresh, err)
 	}
 
+	// A RECORD ALONE IS NOT FRESH EITHER: a prepared host whose directory moved
+	// keeps its record, and a repair of its metadata must not recreate the
+	// directory.
+	acct := ServiceAccount{User: "billet", UID: 1000, Group: "billet", GID: 1000}
+	if err := WriteServiceAccount(acct); err != nil {
+		t.Fatal(err)
+	}
+
+	if fresh, err := metadataAbsent(); err != nil || fresh {
+		t.Fatalf("a record beside an absent directory is never fresh, got fresh=%v err=%v", fresh, err)
+	}
+
+	if err := os.Remove(ServiceAccountPath()); err != nil {
+		t.Fatal(err)
+	}
+
 	hold, err := Acquire(t.Context(), AcquireOptions{Privileged: true})
 	if err != nil {
 		t.Fatal(err)

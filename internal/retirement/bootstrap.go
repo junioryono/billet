@@ -134,11 +134,19 @@ func bootstrapUnderInit(ctx context.Context, req BootstrapRequest, res *Bootstra
 	return errors.Join(bootstrapUnderHold(req, res), hold.Release())
 }
 
-// metadataAbsent reports whether the global lock and the status are both
-// positively absent, the two observations that make an absent identity
-// directory a fresh host's rather than a retirement's remainder. A failed
-// observation is neither and refuses.
+// metadataAbsent reports whether the service-account record, the global lock
+// and the status are all positively absent, the three observations that make
+// an absent identity directory a fresh host's rather than a retirement's
+// remainder or damage (a record that survived beside a missing directory is a
+// prepared host whose directory moved, which a repair of its metadata must not
+// recreate). A failed observation is neither and refuses.
 func metadataAbsent() (bool, error) {
+	if _, err := ReadServiceAccount(); err == nil {
+		return false, nil
+	} else if !errors.Is(err, ErrNoServiceAccount) {
+		return false, err
+	}
+
 	lock, err := exists(GlobalLockPath())
 	if err != nil {
 		return false, fmt.Errorf("retirement: examine %s: %w", GlobalLockPath(), err)

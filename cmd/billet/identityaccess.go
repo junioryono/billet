@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -53,6 +54,42 @@ type identityIntent struct {
 // before it says who holds it.
 const identityAccessWait = 30 * time.Second
 
+// heldAccesses is every identity access this process holds, by cleaned
+// directory, so a ledger factory reached by a command that already holds the
+// exclusion borrows it rather than taking a second one (which one process is
+// denied), and a factory reached by a command that holds none takes its own.
+var heldAccesses sync.Map
+
+func accessKey(dir string) string { return filepath.Clean(dir) }
+
+// identityAccessHeld reports whether this process holds an identity access
+// for dir.
+func identityAccessHeld(dir string) bool {
+	_, held := heldAccesses.Load(accessKey(dir))
+
+	return held
+}
+
+// underIdentityExclusion runs fn with the identity exclusion for dir held:
+// borrowed when the command already holds it, taken (and released after fn)
+// when it does not. The take waits the operator bound and, on Linux, creates
+// nothing, so an absent directory refuses whatever the host's mode; off Linux
+// there is no retirement to have moved it and the opener creates as it always
+// did.
+func underIdentityExclusion(ctx context.Context, dir string, fn func() error) error {
+	if identityAccessHeld(dir) {
+		return fn()
+	}
+
+	acc, err := openIdentityAccess(ctx, dir,
+		identityIntent{create: !retirement.SupportedHere(), wait: identityAccessWait})
+	if err != nil {
+		return err
+	}
+
+	return errors.Join(fn(), acc.Release())
+}
+
 // openIdentityAccess resolves the host's mode for dir and takes what it
 // requires, in the one lock order: the initialisation lock beside the directory
 // (a fresh host only), the lifecycle lock (a root initialiser only), the global
@@ -71,7 +108,7 @@ func openIdentityAccess(ctx context.Context, dir string, intent identityIntent) 
 			return nil, err
 		}
 
-		return acc, nil
+		return acc.registered(), nil
 	}
 
 	class, err := retirement.Classify(dir)
@@ -85,7 +122,7 @@ func openIdentityAccess(ctx context.Context, dir string, intent identityIntent) 
 			return nil, err
 		}
 
-		return acc, nil
+		return acc.registered(), nil
 	case retirement.ModePrepared:
 		acct := class.Account
 		acc.account = &acct
@@ -102,7 +139,16 @@ func openIdentityAccess(ctx context.Context, dir string, intent identityIntent) 
 		return nil, errors.Join(err, acc.exclusion.Release())
 	}
 
-	return acc, nil
+	return acc.registered(), nil
+}
+
+// registered records this access as held for its directory.
+func (a *identityAccess) registered() *identityAccess {
+	if a.lock != nil {
+		heldAccesses.Store(accessKey(a.dir), a)
+	}
+
+	return a
 }
 
 // initialise is the fresh-initialisation branch: the lock beside the directory,
@@ -219,6 +265,7 @@ func (a *identityAccess) Release() error {
 	}
 
 	if a.lock != nil {
+		heldAccesses.CompareAndDelete(accessKey(a.dir), a)
 		errs = append(errs, a.lock.Release())
 		a.lock = nil
 	}
@@ -238,10 +285,15 @@ func (a *identityAccess) Release() error {
 	return errors.Join(errs...)
 }
 
-// handBack gives the identity artefacts to the recorded service account when
-// this process is root, holds the inner lock, and the host records one now.
-// A record that cannot be read is a hand-back that cannot be made, reported;
-// no record is nothing to give things to.
+// handBack gives the identity artefacts AND the ledger artefacts to the
+// recorded service account when this process is root, holds the inner lock,
+// and the host records one now. The ledger set is included because a ledger
+// open made under this access before an installer published the record found
+// no account to hand its files to at the time (the open attempt's hand-back
+// runs at once, from the record as it then stood), and a record published
+// while the command held the inner lock must reach those files too. A record
+// that cannot be read is a hand-back that cannot be made, reported; no record
+// is nothing to give things to.
 func (a *identityAccess) handBack() error {
 	if os.Geteuid() != 0 || a.lock == nil || !retirement.SupportedHere() {
 		return nil
@@ -259,7 +311,7 @@ func (a *identityAccess) handBack() error {
 
 	a.account = &acct
 
-	return handBackIdentity(a.dir, acct, identityArtefacts)
+	return errors.Join(handBackIdentity(a.dir, acct, identityArtefacts), handBackIdentity(a.dir, acct, ledgerArtefacts))
 }
 
 // serverIdentityAccess is the control plane's own take on the exclusion, with

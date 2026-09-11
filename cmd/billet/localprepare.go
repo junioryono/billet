@@ -20,13 +20,18 @@ import (
 // authority status the installer decides its starts and enables from, and what
 // the bootstrap did.
 type hostPrepareAnswer struct {
-	Schema   int      `json:"schema"`
-	Status   string   `json:"status"`
-	Closed   bool     `json:"closed"`
-	Variant  string   `json:"variant,omitempty"`
-	Created  bool     `json:"created_identity_dir"`
-	Repaired []string `json:"repaired"`
-	Account  string   `json:"account"`
+	Schema  int    `json:"schema"`
+	Status  string `json:"status"`
+	Closed  bool   `json:"closed"`
+	Variant string `json:"variant,omitempty"`
+	Created bool   `json:"created_identity_dir"`
+	// IdentityDirAbsent says the configured identity directory is absent and
+	// was LEFT absent, because a global lock or a status existed beside it: a
+	// retired or damaged host, never a fresh one, and nothing the installer
+	// runs afterwards may recreate it.
+	IdentityDirAbsent bool     `json:"identity_dir_absent"`
+	Repaired          []string `json:"repaired"`
+	Account           string   `json:"account"`
 }
 
 // cmdLocalPrepare moves a host onto the global authority exclusion, or repairs
@@ -83,8 +88,8 @@ func cmdLocalPrepare(ctx context.Context, args []string) error {
 	}
 
 	ans := hostPrepareAnswer{
-		Schema: 1, Status: "absent", Created: res.Created, Repaired: res.Repaired,
-		Account: fmt.Sprintf("%s:%s", acct.User, acct.Group),
+		Schema: 1, Status: "absent", Created: res.Created, IdentityDirAbsent: res.IdentityDirAbsent,
+		Repaired: res.Repaired, Account: fmt.Sprintf("%s:%s", acct.User, acct.Group),
 	}
 
 	if res.Presence == retirement.StatusPresent {
@@ -103,6 +108,11 @@ func cmdLocalPrepare(ctx context.Context, args []string) error {
 
 	if res.Created {
 		fmt.Printf("created  %s\n", identityDir)
+	}
+
+	if res.IdentityDirAbsent {
+		fmt.Printf("absent   %s is absent beside existing authority metadata and was left so; a retirement "+
+			"moved it or the host is damaged, and nothing here recreates it\n", identityDir)
 	}
 
 	for _, path := range res.Repaired {

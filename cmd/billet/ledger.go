@@ -7,7 +7,6 @@ import (
 	"os"
 
 	"github.com/junioryono/billet/internal/config"
-	"github.com/junioryono/billet/internal/retirement"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/version"
 )
@@ -65,35 +64,6 @@ func openStateStandby(ctx context.Context, cfg *config.Config) (*state.DB, error
 // from, which on a host the package just installed is the ordinary state.
 var errNoLedgerYet = errors.New("no ledger here yet")
 
-// refuseRecreatingIdentity refuses an operator open of a PREPARED host's
-// identity directory that is positively absent, before the opener creates it.
-//
-// THE STATE OPENER CREATES THE DIRECTORY AND ITS LOCK ON FIRST USE, which on a
-// fresh host is how `billet check` initialises it and on a prepared host is how
-// a `billet status` five minutes after a retirement would mint a second
-// identity beside the archived one. On a prepared host the directory exists
-// from the installer's bootstrap onwards and is moved only by a retirement, so
-// its absence is that move (or damage), never a gap to fill. A legacy or fresh
-// host is left to the opener as before; a damaged host refuses on its own.
-func refuseRecreatingIdentity(dir string) error {
-	if !retirement.SupportedHere() {
-		return nil
-	}
-
-	class, err := retirement.Classify(dir)
-	if err != nil {
-		return err
-	}
-
-	if class.Mode == retirement.ModePrepared && !class.Directory {
-		return fmt.Errorf("%s does not exist, and this command will not recreate it: a retirement "+
-			"moves a controller's identity directory to its archive, and an installer creates a "+
-			"fresh one", dir)
-	}
-
-	return nil
-}
-
 // openStateForDecision opens the ledger for the one read that must not be
 // refused by the release watermark: the host's own instruction.
 //
@@ -129,22 +99,26 @@ func openStateForDecision(ctx context.Context, cfg *config.Config) (*state.DB, e
 		}
 	}
 
-	if err := refuseRecreatingIdentity(cfg.Server.IdentityDir); err != nil {
-		return nil, err
-	}
-
 	var db *state.DB
 
-	if cfg.Server.LedgerBackend() == config.StatePostgres {
-		db, err = state.OpenPostgresAdmin(ctx, cfg.Server.IdentityDir, dsn)
-	} else {
-		db, err = state.OpenAdmin(ctx, cfg.Server.IdentityDir)
-	}
+	// UNDER THE IDENTITY EXCLUSION, borrowed from a command that holds it or
+	// taken for the open: the opener creates the directory and its lock on
+	// first use, and a retirement renames the directory under a global lock
+	// this open now waits for rather than racing. THE HAND-BACK BELONGS TO THE
+	// ATTEMPT, not to the handle: the opener creates the directory lock before
+	// it connects, so a failed open leaves a root-owned file too.
+	err = underIdentityExclusion(ctx, cfg.Server.IdentityDir, func() error {
+		var openErr error
 
-	// THE HAND-BACK BELONGS TO THE ATTEMPT, not to the handle: the opener
-	// creates the directory lock before it connects, so a failed open leaves a
-	// root-owned file too.
-	if err := errors.Join(err, handBackLedger(cfg.Server.IdentityDir)); err != nil {
+		if cfg.Server.LedgerBackend() == config.StatePostgres {
+			db, openErr = state.OpenPostgresAdmin(ctx, cfg.Server.IdentityDir, dsn)
+		} else {
+			db, openErr = state.OpenAdmin(ctx, cfg.Server.IdentityDir)
+		}
+
+		return errors.Join(openErr, handBackLedger(cfg.Server.IdentityDir))
+	})
+	if err != nil {
 		return nil, errors.Join(err, closeIfOpen(db))
 	}
 
@@ -164,23 +138,24 @@ func openStateAdmin(ctx context.Context, cfg *config.Config) (*state.DB, error) 
 		return nil, err
 	}
 
-	if err := refuseRecreatingIdentity(cfg.Server.IdentityDir); err != nil {
-		return nil, err
-	}
-
 	var db *state.DB
 
-	if cfg.Server.LedgerBackend() == config.StatePostgres {
-		db, err = state.OpenPostgresAdmin(ctx, cfg.Server.IdentityDir, dsn,
-			state.WithRunningRelease(version.Version()))
-	} else {
-		db, err = state.OpenAdmin(ctx, cfg.Server.IdentityDir,
-			state.WithRunningRelease(version.Version()))
-	}
+	// Under the identity exclusion and with the hand-back on the attempt, as in
+	// openStateForDecision.
+	err = underIdentityExclusion(ctx, cfg.Server.IdentityDir, func() error {
+		var openErr error
 
-	// The hand-back on the attempt, as in openStateForDecision: a root command
-	// that created the lock and then failed to connect still hands it back.
-	if err := errors.Join(err, handBackLedger(cfg.Server.IdentityDir)); err != nil {
+		if cfg.Server.LedgerBackend() == config.StatePostgres {
+			db, openErr = state.OpenPostgresAdmin(ctx, cfg.Server.IdentityDir, dsn,
+				state.WithRunningRelease(version.Version()))
+		} else {
+			db, openErr = state.OpenAdmin(ctx, cfg.Server.IdentityDir,
+				state.WithRunningRelease(version.Version()))
+		}
+
+		return errors.Join(openErr, handBackLedger(cfg.Server.IdentityDir))
+	})
+	if err != nil {
 		return nil, errors.Join(err, closeIfOpen(db))
 	}
 

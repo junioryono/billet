@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/retirement"
 	"github.com/junioryono/billet/internal/wirecert"
 )
@@ -72,18 +73,86 @@ func TestAPreparedHostsAbsentDirectoryIsNeverRecreated(t *testing.T) {
 		t.Fatal("the refusal must release the global lock")
 	}
 
-	// The ledger factories ask the same question before the opener creates the
-	// directory; a legacy host is left to the opener.
-	if err := refuseRecreatingIdentity(dir); err == nil || !strings.Contains(err.Error(), "will not recreate") {
-		t.Fatalf("the ledger open on a prepared host must refuse the absent directory, got %v", err)
-	}
-
-	if err := os.Mkdir(dir, 0o700); err != nil {
+	// THE LEDGER FACTORY TAKES THE SAME EXCLUSION when no command holds one, so
+	// its opener never reaches the absent directory: refused, nothing created,
+	// the locks released.
+	cfg, err := config.Load(writeCAConfig(t, dir))
+	if err != nil {
 		t.Fatal(err)
 	}
 
-	if err := refuseRecreatingIdentity(dir); err != nil {
-		t.Fatalf("a present directory is nothing to refuse, got %v", err)
+	db, err := openStateAdmin(t.Context(), cfg)
+	if err == nil {
+		t.Fatal(errors.Join(errors.New("the ledger open on a prepared host recreated the absent directory"), db.Close()))
+	}
+
+	if !strings.Contains(err.Error(), "will not recreate") {
+		t.Errorf("the factory's refusal must be the exclusion's, got %v", err)
+	}
+
+	if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("the factory's refusal must create nothing")
+	}
+
+	if locked(t, retirement.GlobalLockPath()) {
+		t.Fatal("the factory must release the global lock it took")
+	}
+}
+
+// THE LEDGER FACTORY BORROWS A HELD ACCESS AND TAKES ITS OWN OTHERWISE: with
+// the command's access open the factory opens under it (a second take in one
+// process would be denied), and without one it takes and releases the inner
+// lock around the open, so nothing is left held behind the handle.
+func TestTheLedgerFactoryBorrowsAHeldAccessAndTakesItsOwnOtherwise(t *testing.T) {
+	useRetirementRoot(t)
+
+	dir := t.TempDir()
+	cfg, err := config.Load(writeCAConfig(t, dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	acc, err := openIdentityAccess(t.Context(), dir, identityIntent{wait: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !identityAccessHeld(dir) || !identityAccessHeld(dir+"/") {
+		t.Fatal("an open access must be registered for its directory, however it is spelled")
+	}
+
+	db, err := openStateAdmin(t.Context(), cfg)
+	if err != nil {
+		t.Fatalf("the factory must borrow the held access, got %v", err)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if !locked(t, wirecert.AuthorityLockPath(dir)) {
+		t.Fatal("a borrowed access is not released by the factory")
+	}
+
+	if err := acc.Release(); err != nil {
+		t.Fatal(err)
+	}
+
+	if identityAccessHeld(dir) {
+		t.Fatal("a released access must be unregistered")
+	}
+
+	db, err = openStateAdmin(t.Context(), cfg)
+	if err != nil {
+		t.Fatalf("the factory must take its own access when none is held, got %v", err)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if locked(t, wirecert.AuthorityLockPath(dir)) {
+		t.Fatal("the factory's own access must be released once the handle exists")
 	}
 }
 
