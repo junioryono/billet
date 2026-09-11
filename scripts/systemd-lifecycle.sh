@@ -46,7 +46,7 @@ say "installing the package"
 # lists it; arm64's ports archive has no second mirror there and keeps one, HTTPS)
 # a strict update fails while EITHER is down, measured on a fleet guest 2026-09-11,
 # which is the outage this shape exists to survive.
-APT="timeout -v -k 10 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30"
+APT="timeout -v -k 10 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::CAInfo=/usr/local/share/billet-host-ca.crt"
 if ! ${APT} install -y -qq /tmp/billet.deb >/dev/null 2>&1; then
     ${APT} install -y /tmp/billet.deb 2>&1 | tail -20
     echo "the package would not install" >&2

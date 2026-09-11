@@ -55,11 +55,15 @@ fi
 # lists it; arm64's ports archive has no second mirror there and keeps one, HTTPS)
 # a strict update fails while EITHER is down, measured on a fleet guest 2026-09-11,
 # which is the outage this shape exists to survive.
-# APT OVER HTTPS, with the host's CA bundle (the image carries none): see
+# APT OVER HTTPS, with the host's CA bundle (the image carries none) mounted BESIDE
+# the container's own bundle path and named to apt (Acquire::https::CAInfo), never
+# OVER it: ca-certificates' postinst rewrites /etc/ssl/certs/ca-certificates.crt,
+# and a read-only mount there fails the install of every package that pulls it in
+# (measured 2026-09-11: dpkg error processing ca-certificates (--configure)). See
 # billet-shell-gates, the mirror outage of 2026-09-11.
-docker run --rm --platform "linux/${package_arch}" --volume "${deb_path}:/tmp/billet.deb:ro" -v /etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro ubuntu:24.04 sh -euxc '
+docker run --rm --platform "linux/${package_arch}" --volume "${deb_path}:/tmp/billet.deb:ro" -v /etc/ssl/certs/ca-certificates.crt:/usr/local/share/billet-host-ca.crt:ro ubuntu:24.04 sh -euxc '
     sed -i -e "s,^URIs: http://archive[.]ubuntu[.]com/ubuntu/$,URIs: https://archive.ubuntu.com/ubuntu/ https://mirrors.edge.kernel.org/ubuntu/," -e "s,^URIs: http://ports[.]ubuntu[.]com/ubuntu-ports/$,URIs: https://ports.ubuntu.com/ubuntu-ports/," /etc/apt/sources.list.d/ubuntu.sources
-    APT="timeout -v -k 10 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30"
+    APT="timeout -v -k 10 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::CAInfo=/usr/local/share/billet-host-ca.crt"
     ${APT} update
     ls /var/lib/apt/lists/*InRelease >/dev/null
     ${APT} install --yes /tmp/billet.deb
