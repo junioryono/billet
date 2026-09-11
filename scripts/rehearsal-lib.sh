@@ -323,7 +323,7 @@ rehearsal_start_host() {
         -e DEBIAN_FRONTEND=noninteractive \
         --platform "linux/${REHEARSAL_ARCH}" \
         ubuntu:24.04 sh -c \
-        "sed -i 's|http://|https://|' /etc/apt/sources.list.d/ubuntu.sources && timeout -v -k 10 300 apt-get -o APT::Update::Error-Mode=any -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update -qq && timeout -v -k 10 300 apt-get -o APT::Update::Error-Mode=any -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y -qq ${packages} >/dev/null && exec /lib/systemd/systemd" \
+        "sed -i s,http://,https://, /etc/apt/sources.list.d/ubuntu.sources && timeout -v -k 10 300 apt-get -o APT::Update::Error-Mode=any -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update -qq && timeout -v -k 10 300 apt-get -o APT::Update::Error-Mode=any -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y -qq ${packages} >/dev/null && exec /lib/systemd/systemd" \
         >/dev/null || rehearsal_fail "could not start the ${name} container"
 
     # LONGER THAN THE BOOTSTRAP IT WAITS FOR. The entrypoint may spend up to

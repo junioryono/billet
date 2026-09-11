@@ -52,7 +52,7 @@ fi
 # APT OVER HTTPS, with the host's CA bundle (the image carries none): see
 # billet-shell-gates, the mirror outage of 2026-09-11.
 docker run --rm --platform "linux/${package_arch}" --volume "${deb_path}:/tmp/billet.deb:ro" -v /etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro ubuntu:24.04 sh -euxc '
-    sed -i 's|http://|https://|' /etc/apt/sources.list.d/ubuntu.sources
+    sed -i s,http://,https://, /etc/apt/sources.list.d/ubuntu.sources
     APT="timeout -v -k 10 300 apt-get -o APT::Update::Error-Mode=any -o Acquire::Retries=3 -o Acquire::http::Timeout=30"
     ${APT} update
     ${APT} install --yes /tmp/billet.deb
