@@ -615,11 +615,20 @@ EOF
 	# TOOLSET_PACKAGES is what a WORKFLOW expects, taken from GitHub's own
 	# declaration and never edited here. Editing it is how the two images diverge
 	# silently, which is exactly the gap this work exists to close.
+	# apparmor and python3-apt are on the hosted image and were installed by every
+	# CI job on this fleet that needed them, which reached the archive from every
+	# guest: one more dependency on a mirror that was unreachable for hours on
+	# 2026-09-11, and one more set of sessions on an uplink the fleet shares with
+	# everything else at its site. apparmor is a BEHAVIOUR CHANGE, not only a
+	# file: the guest kernel boots with AppArmor as its LSM, and with the parser
+	# present dockerd confines every container under docker-default, as a hosted
+	# runner does; a job that mounts with added capabilities can now meet a denial
+	# it did not meet on the parser-less guest, and meets the same one hosted.
 	local billet_packages=(
 		ca-certificates curl iproute2 iptables jq git sudo dnsmasq-base
 		docker.io docker-buildx docker-compose-v2 e2fsprogs util-linux
 		systemd-resolved netplan.io libicu74 zstd rsync build-essential
-		python3-pip python3-venv python3-dev
+		python3-pip python3-venv python3-dev apparmor python3-apt
 	)
 
 	local github_packages=()
@@ -662,6 +671,33 @@ apt-get install -y --no-install-recommends "$@"
 apt-get clean
 rm -rf /var/lib/apt/lists/*
 APT
+
+	# THE SHIPPED IMAGE FETCHES OVER HTTPS FROM TWO SOURCES, EVERY FETCH BOUNDED BY
+	# AN INACTIVITY TIMEOUT. Two URIs in one deb822 stanza are TWO REPOSITORIES to
+	# apt: it fetches both index sets (twice the index traffic) and takes a package
+	# from whichever lists the version, so an install can succeed from the
+	# surviving repository when it indexes and serves the selected version, while
+	# `apt-get update` under Error-Mode=any still fails naming the dead one.
+	# Measured on a fleet guest 2026-09-11 with the first URI black-holed and a 5 s
+	# timeout: a strict update failed in 13 s naming the dead mirror, a lenient one
+	# passed in 13 s, and a package installed from the second mirror in 4 s. The
+	# `mirror+file:` method, which fetches one index set and offers alternate URLs
+	# per file, did NOT finish a strict update in nine minutes under the same
+	# black hole, so it is not the shape here. Acquire::Retries retries the failing
+	# URI; the timeout is per read, not per download. The build bootstraps over
+	# plain HTTP because minbase carries no CA bundle until the transaction above
+	# installs ca-certificates. Why two sources: the same day every
+	# archive.ubuntu.com address refused port 80 from the site and from AWS for
+	# hours, two answered nothing on 443 either, and a job's apt sat 30 s per attempt
+	# on one of those. A rewrite the grep does not confirm is a build that would
+	# ship the old source under a new comment.
+	sed -i 's,^URIs: .*$,URIs: https://archive.ubuntu.com/ubuntu/ https://mirrors.edge.kernel.org/ubuntu/,' "$rootfs/etc/apt/sources.list.d/ubuntu.sources"
+	grep -Fxq 'URIs: https://archive.ubuntu.com/ubuntu/ https://mirrors.edge.kernel.org/ubuntu/' "$rootfs/etc/apt/sources.list.d/ubuntu.sources"
+	install -m 0644 /dev/stdin "$rootfs/etc/apt/apt.conf.d/90billet-fetch" <<'APTCONF'
+Acquire::Retries "3";
+Acquire::http::Timeout "30";
+Acquire::https::Timeout "30";
+APTCONF
 
 	# break-system-packages, exactly as runner-images writes it on 24.04, so a
 	# workflow that `pip install`s against the system python succeeds here as it does

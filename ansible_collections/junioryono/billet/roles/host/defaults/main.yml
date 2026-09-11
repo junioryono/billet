@@ -237,6 +237,14 @@ billet_networks:
 billet_guest_dns_servers:
   - 1.1.1.1
   - 1.0.0.1
+# One dnsmasq per bridge answers every guest on it from one cache and forwards
+# the rest upstream. Its defaults, 150 names held and 150 queries in flight, were
+# sized for a home router; a fleet of guests running CI asks for the same few
+# hundred names thousands of times an hour, and every forwarded query is one
+# more session on the uplink and one more round trip before a connection can
+# start. 10000 is the largest cache dnsmasq holds without warning.
+billet_guest_dns_cache_size: 10000
+billet_guest_dns_forward_max: 1000
 billet_guest_denied_ipv4:
   - 10.0.0.0/8
   - 100.64.0.0/10
