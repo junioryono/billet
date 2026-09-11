@@ -218,6 +218,37 @@ func TestMigrateRefusesAnUnchangedAnswerWhoseNodeNameCannotBeResolved(t *testing
 	}
 }
 
+// A pre-R node without a registration directory at all (a release before
+// the record has none) is judged pre-R by its image and the managed binary,
+// and the record wait is bounded so nothing observed after it counts.
+func TestMigrateJudgesPreRWithoutARegistrationDirectory(t *testing.T) {
+	f := newEndpointFixture(t)
+	f.preRBinary(t)
+	mustOK(t, os.RemoveAll(f.recordDir))
+
+	o := f.migrate(t, f.rendering(endpointB), "--dry-run")
+	mustEndpointOutcome(t, o, outcomeReported)
+
+	if o.str("record") != recordAbsentPreR {
+		t.Errorf("record %q", o.str("record"))
+	}
+
+	t.Run("a record appearing after the wait is not judged", func(t *testing.T) {
+		f := newEndpointFixture(t)
+		f.rBinary(t)
+		mustOK(t, os.Remove(f.recordPath))
+		// After the first read (absent) the wait elapses before the record
+		// appears; a wait that kept observing would read it.
+		f.onRecordRead(t, 1, func() {
+			time.Sleep(120 * time.Millisecond)
+			f.writeRecord(t, f.record(map[string]any{"deployment": f.deployment, "endpoint": canonicalA}))
+		})
+
+		o := f.migrate(t, f.rendering(endpointB), "--dry-run", "--wait", "50ms")
+		mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonRecord)
+	})
+}
+
 // A configuration that is a symlink is closed through its target: unchanged
 // when the target is the file opened, could-not-tell when retargeted.
 func TestMigrateClosesASymlinkedConfigurationThroughItsTarget(t *testing.T) {

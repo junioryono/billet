@@ -230,6 +230,8 @@ func writeReceiptFromEvidence(ctx context.Context, m receiptMode) (any, *endpoin
 			"bound to a process", "start it and let the refresh write the receipt", "")
 	case br.class == recordUnreadable:
 		return nil, endpointUnknown(endpointReasonRecord, "the running node's record could not be read: "+br.why, "", "")
+	case br.class == recordInvalid:
+		return nil, endpointRefuse(endpointReasonRecord, "the running node's record is not one billet wrote: "+br.why, "", "")
 	case br.class != recordUsable:
 		return nil, endpointRefuse(endpointReasonRecord, "the running node's record is not current: "+br.why,
 			"a node restarted since the migration gets its receipt from the refresh", "")
@@ -333,6 +335,8 @@ func refreshReceipt(ctx context.Context, m receiptMode) (any, *endpointRefusal) 
 		return nil, endpointRefuse(endpointReasonNotRunning, "the node stopped running under the wait", "", "")
 	case br.class == recordUnreadable:
 		return nil, endpointUnknown(endpointReasonRecord, "the running node's record could not be read: "+br.why, "", "")
+	case br.class == recordInvalid:
+		return nil, endpointRefuse(endpointReasonRecord, "the running node's record is not one billet wrote: "+br.why, "", "")
 	case br.class == recordForeign:
 		return nil, endpointRefuse(endpointReasonRecord, "the running node's record cannot be judged: "+br.why, "", "")
 	case elapsed || br.class != recordUsable:
@@ -496,6 +500,15 @@ func publishReceipt(ctx context.Context, insp *lifeops.Inspector, installed *ins
 		if existing.info == nil {
 			if r := sameDirectory("under the existing file's read"); r != nil {
 				return nil, r
+			}
+
+			// The directories are still the ones examined, so the reader's
+			// judgement was the leaf's: a regular file at the examination
+			// that the open found to be something else. Examined again: a
+			// special file is a positive refusal, anything else could-not-tell.
+			if leaf, err := receiptLstat(receiptPath); err == nil && !leaf.Mode().IsRegular() {
+				return nil, endpointRefuse(endpointReasonTrust, "the receipt path "+receiptPath+" holds something billet did "+
+					"not write and cannot replace: "+existing.why, "remove it by hand", "")
 			}
 
 			return nil, endpointUnknown(endpointReasonTrust, existing.why, "converge again", "")

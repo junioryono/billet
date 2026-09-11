@@ -86,6 +86,11 @@ type registrationEvidence struct {
 	// unreadable says the read FAILED (an examination, an open, a reopen or
 	// a read that errored), which is never absence and never invalidity.
 	unreadable bool
+	// invalid says a record was found and is not one billet wrote (its
+	// directory a link, its owner, mode or size wrong, its bytes malformed),
+	// which is never absence: waiting for it to become valid is waiting for
+	// nothing.
+	invalid bool
 }
 
 // readRegistrationRecord reads the record at path under the reader's rules:
@@ -100,12 +105,16 @@ func readRegistrationRecord(path string) registrationEvidence {
 
 	dirInfo, err := registrationLstat(dir)
 	switch {
+	case errors.Is(err, os.ErrNotExist):
+		// A positive absence: a node that has not registered yet, or a
+		// release before the record, has no directory here.
+		return registrationEvidence{why: "no registration directory at " + dir}
 	case err != nil:
 		return registrationEvidence{why: fmt.Sprintf("examine the registration directory %s: %v", dir, err), unreadable: true}
 	case dirInfo.Mode()&os.ModeSymlink != 0:
-		return registrationEvidence{why: "the registration directory " + dir + " is a symlink"}
+		return registrationEvidence{why: "the registration directory " + dir + " is a symlink", invalid: true}
 	case !dirInfo.IsDir():
-		return registrationEvidence{why: "the registration directory " + dir + " is not a directory"}
+		return registrationEvidence{why: "the registration directory " + dir + " is not a directory", invalid: true}
 	}
 
 	f, info, err := registrationOpen(path)
@@ -123,28 +132,28 @@ func readRegistrationRecord(path string) registrationEvidence {
 	// guard uses.
 	uid, ok := ownerFromInfo(info)
 	if !ok {
-		return registrationEvidence{why: "the registration record carries no owner this platform reports"}
+		return registrationEvidence{why: "the registration record carries no owner this platform reports", invalid: true}
 	}
 
 	if uid != 0 {
-		return registrationEvidence{why: fmt.Sprintf("the registration record is owned by uid %d, want root", uid)}
+		return registrationEvidence{why: fmt.Sprintf("the registration record is owned by uid %d, want root", uid), invalid: true}
 	}
 
 	if perm := info.Mode().Perm(); perm != 0o600 {
-		return registrationEvidence{why: fmt.Sprintf("the registration record is mode %04o, want 0600", perm)}
+		return registrationEvidence{why: fmt.Sprintf("the registration record is mode %04o, want 0600", perm), invalid: true}
 	}
 
 	// THE ADMITTED INODE'S SIZE, from the same fstat: a record over the bound at
 	// admission is refused whatever it holds by the time it is read, and the
 	// bounded read below still refuses one that grows afterwards.
 	if info.Size() > maxRegistrationRecordBytes {
-		return registrationEvidence{why: fmt.Sprintf("the registration record is larger than %d bytes", maxRegistrationRecordBytes)}
+		return registrationEvidence{why: fmt.Sprintf("the registration record is larger than %d bytes", maxRegistrationRecordBytes), invalid: true}
 	}
 
 	body, err := registrationRead(f, path, maxRegistrationRecordBytes)
 	if err != nil {
 		if errors.Is(err, regularfile.ErrTooLarge) {
-			return registrationEvidence{why: fmt.Sprintf("the registration record is larger than %d bytes", maxRegistrationRecordBytes)}
+			return registrationEvidence{why: fmt.Sprintf("the registration record is larger than %d bytes", maxRegistrationRecordBytes), invalid: true}
 		}
 
 		return registrationEvidence{why: fmt.Sprintf("read the registration record %s: %v", path, err), unreadable: true}
@@ -152,7 +161,7 @@ func readRegistrationRecord(path string) registrationEvidence {
 
 	rec, err := decodeRegistrationRecord(body)
 	if err != nil {
-		return registrationEvidence{why: "the registration record is malformed: " + err.Error()}
+		return registrationEvidence{why: "the registration record is malformed: " + err.Error(), invalid: true}
 	}
 
 	return registrationEvidence{record: rec}

@@ -355,7 +355,8 @@ const (
 	recordUsable     recordClass = iota + 1 // a record naming this invocation, this node, this deployment, canonical
 	recordAbsent                            // no record, or one naming an earlier invocation: a node that has not registered yet
 	recordForeign                           // a record that is not this node's, or malformed: refused at once
-	recordUnreadable                        // the read failed: could-not-tell, never absence
+	recordUnreadable                        // the read failed, or the identity it is judged against could not be derived: could-not-tell
+	recordInvalid                           // a record billet did not write (owner, mode, size, bytes, its directory): refused at once, never waited for
 )
 
 // classifyRecord judges the evidence as the inspector judges it, typed rather
@@ -366,6 +367,10 @@ func classifyRecord(ev registrationEvidence, invocation string, identity registr
 		return registrationReport{}, recordUnreadable, ev.why
 	}
 
+	if ev.invalid {
+		return registrationReport{}, recordInvalid, ev.why
+	}
+
 	if ev.record == nil {
 		return registrationReport{}, recordAbsent, ev.why
 	}
@@ -373,6 +378,14 @@ func classifyRecord(ev registrationEvidence, invocation string, identity registr
 	if ev.record.InvocationID != invocation {
 		return registrationReport{}, recordAbsent, fmt.Sprintf("the record was written by invocation %s and the node is invocation %s",
 			ev.record.InvocationID, invocation)
+	}
+
+	// THE IDENTITY THE RECORD IS JUDGED AGAINST: one that could not be
+	// derived (a certificate or an identity file that could not be read, an
+	// identity not minted) makes the judgement could-not-tell, never a
+	// proved mismatch.
+	if identity.why != "" {
+		return registrationReport{}, recordUnreadable, "the record's identity cannot be judged: " + identity.why
 	}
 
 	judged := judgeRegistration(ev, known(invocation), identity)
@@ -451,6 +464,10 @@ func readRecordUnderBracket(ctx context.Context, insp *lifeops.Inspector, unit s
 // unit stops running, a foreign record refuses, or the wait elapses; the last
 // bracket is returned with elapsed=true on exhaustion.
 func waitForRecord(ctx context.Context, insp *lifeops.Inspector, unit string, identity registrationIdentity, wait time.Duration) (bracketedRecord, bool, string) {
+	// NO BRACKET STARTS AFTER THE WAIT, and the sleep between brackets never
+	// outlasts it: a record that appears after the deadline is the next
+	// converge's. A bracket already running finishes under its own bounds
+	// (the inspector's property timeout), so its observation is whole.
 	deadline := time.Now().Add(wait)
 
 	for {
@@ -463,14 +480,15 @@ func waitForRecord(ctx context.Context, insp *lifeops.Inspector, unit string, id
 			return br, false, ""
 		}
 
-		if time.Now().After(deadline) {
+		remaining := time.Until(deadline)
+		if remaining <= 0 || ctx.Err() != nil {
 			return br, true, ""
 		}
 
 		select {
 		case <-ctx.Done():
 			return br, true, ""
-		case <-time.After(endpointPoll):
+		case <-time.After(min(endpointPoll, remaining)):
 		}
 	}
 }

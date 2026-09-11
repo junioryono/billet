@@ -205,6 +205,26 @@ func TestReceiptShortcutAndRemovalActOnTheFileJudged(t *testing.T) {
 		mustOK(t, os.Mkdir(f.dir, 0o700))
 		f.write(t, "not json\n")
 
+		// THE DESTINATION IMMEDIATELY BEFORE THE RENAME still holds the
+		// competing receipt: nothing removed it.
+		occupiedBeforeRename := false
+		prevInstaller := receiptInstaller
+		receiptInstaller = func() durablefile.Installer {
+			inst := prevInstaller()
+			rename := inst.Rename
+			inst.Rename = func(from, to string) error {
+				if ev := readEndpointReceipt(to); ev.presence == receiptPresent && ev.receipt.Run == "ci-run-99" {
+					occupiedBeforeRename = true
+				}
+
+				return rename(from, to)
+			}
+
+			return inst
+		}
+
+		t.Cleanup(func() { receiptInstaller = prevInstaller })
+
 		valid := validReceipt()
 		valid.Deployment = f.deployment
 		valid.InstalledSHA256 = f.installedSHA(t)
@@ -229,8 +249,8 @@ func TestReceiptShortcutAndRemovalActOnTheFileJudged(t *testing.T) {
 			t.Errorf("on disk %+v", disk)
 		}
 
-		if contains(*f.events, "remove") {
-			t.Error("something was removed")
+		if !occupiedBeforeRename {
+			t.Error("the competing receipt was not at the destination immediately before the rename")
 		}
 	})
 
@@ -455,6 +475,86 @@ func TestReceiptNeverRenamesOverASpecialFileThatAppearedAfterTheRead(t *testing.
 	if info.Mode()&os.ModeNamedPipe == 0 {
 		t.Errorf("the FIFO was replaced: %v", info.Mode())
 	}
+}
+
+// A record billet did not write is refused at once, never waited for; a
+// record beside an identity that cannot be read is could-not-tell.
+func TestReceiptTypesAnInvalidRecordAndAnUnjudgeableOne(t *testing.T) {
+	t.Run("a malformed record", func(t *testing.T) {
+		f := newReceiptCmdFixture(t)
+		f.migrated(t)
+		writeFile(t, f.recordPath, "not json\n", 0o600)
+
+		started := time.Now()
+
+		o := f.refresh(t, f.rendering(endpointB), "--wait", "3s")
+		mustEndpointRefusal(t, o, outcomeRefused, endpointReasonRecord)
+
+		if time.Since(started) > 2*time.Second {
+			t.Error("a malformed record was waited for")
+		}
+
+		o = f.refresh(t, f.rendering(endpointB), "--dry-run", "--wait", "3s")
+		mustEndpointRefusal(t, o, outcomeRefused, endpointReasonRecord)
+	})
+
+	t.Run("an identity that cannot be read", func(t *testing.T) {
+		f := newReceiptCmdFixture(t)
+		f.migrated(t)
+		mustOK(t, os.Chmod(filepath.Join(f.nodeState, "deployment-id"), 0))
+		// Under root a chmod proves nothing; the identity read goes through
+		// the state package, so the file is made unreadable by shape instead.
+		mustOK(t, os.Remove(filepath.Join(f.nodeState, "deployment-id")))
+		mustOK(t, os.Mkdir(filepath.Join(f.nodeState, "deployment-id"), 0o700))
+
+		o := f.refresh(t, f.rendering(endpointB))
+		mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonRecord)
+
+		o = f.evidence(t, f.evidenceObject(t, nil), f.confirmationObject(nil))
+		mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonRecord)
+	})
+}
+
+// A timeout with no completed poll is could-not-tell, and an expiry during
+// the sleep answers the timeout from the last completed snapshot.
+func TestRegistrationTimeoutSpeaksFromACompletedSnapshot(t *testing.T) {
+	t.Run("no poll completed", func(t *testing.T) {
+		l := newRegLedger(t, true)
+
+		prev := registrationPoll
+		registrationPoll = func(ctx context.Context, _ *rollout.Store) (rollout.StatusSnapshot, error) {
+			<-ctx.Done()
+
+			return rollout.StatusSnapshot{}, ctx.Err()
+		}
+
+		t.Cleanup(func() { registrationPoll = prev })
+
+		o := l.run(t, "--wait", "200ms")
+		mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonUnexamined)
+	})
+
+	t.Run("the identity removed during the last sleep", func(t *testing.T) {
+		l := newRegLedger(t, true)
+		l.register(t, "node-a", regIncarnationOld)
+		// One poll completes; the identity vanishes before the next, which
+		// the expired wait never makes.
+		l.polls(t, func(n int) {
+			if n == 1 {
+				mustOK(t, os.Remove(filepath.Join(l.stateDir, "deployment-id")))
+			}
+		})
+
+		// The wait is shorter than the sleep between polls, so the expiry
+		// lands in the sleep (or the first poll outlasts the wait; either
+		// way the timeout speaks from the completed poll).
+		o := l.run(t, "--wait", "15ms")
+		mustTimeout(t, o)
+
+		if last := asMap(o.doc["last"]); last["incarnation"] != regIncarnationOld {
+			t.Errorf("last %v", last)
+		}
+	})
 }
 
 // The wait bounds every poll: a ledger that holds a query past --wait

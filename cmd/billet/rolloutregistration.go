@@ -159,11 +159,22 @@ func awaitRegistration(ctx context.Context, store *rollout.Store, cfg *config.Co
 
 	deadline := time.Now().Add(wait)
 
-	var last *registrationRow
+	var (
+		last    *registrationRow
+		lastDep *registrationDep
+	)
 
-	timeout := func(dep registrationDep) *registrationTimeout {
+	// THE TIMEOUT SPEAKS FROM A COMPLETED SNAPSHOT: its binding and its last
+	// row are the last poll's; with no poll completed the wait proved
+	// nothing, which is could-not-tell.
+	timeout := func() (*registrationTimeout, *endpointRefusal) {
+		if lastDep == nil {
+			return nil, endpointUnknown(endpointReasonUnexamined, "the wait ended before any poll of the ledger completed",
+				"", "")
+		}
+
 		return &registrationTimeout{Schema: endpointSchema, Outcome: outcomeTimeout, Node: node, Incarnation: incarnation,
-			Deployment: dep, Last: last}
+			Deployment: *lastDep, Last: last}, nil
 	}
 
 	for {
@@ -184,7 +195,9 @@ func awaitRegistration(ctx context.Context, store *rollout.Store, cfg *config.Co
 		snapshot, err := registrationPoll(ctx, store)
 		if err != nil {
 			if ctx.Err() != nil {
-				return nil, timeout(registrationDep{Bound: true, ID: identity}), nil
+				out, r := timeout()
+
+				return nil, out, r
 			}
 
 			return nil, nil, endpointUnknown(endpointReasonUnexamined, "read the ledger: "+err.Error(), "", "")
@@ -201,6 +214,7 @@ func awaitRegistration(ctx context.Context, store *rollout.Store, cfg *config.Co
 		}
 
 		dep := registrationDep{Bound: true, ID: snapshot.Binding}
+		lastDep = &dep
 		last = nil
 
 		for i := range snapshot.Registrations {
@@ -218,11 +232,16 @@ func awaitRegistration(ctx context.Context, store *rollout.Store, cfg *config.Co
 		}
 
 		if time.Now().After(deadline) || ctx.Err() != nil {
-			return nil, timeout(dep), nil
+			out, r := timeout()
+
+			return nil, out, r
 		}
 
 		select {
 		case <-ctx.Done():
+			out, r := timeout()
+
+			return nil, out, r
 		case <-time.After(2 * endpointPoll):
 		}
 	}
