@@ -47,7 +47,7 @@ description: "What `make check` runs and why each piece is inside or outside it;
 
 **`no-mutants` runs first and `tests-kept` runs outside.** `scripts/check-no-mutants.py` refuses to proceed while a `.bak` sits beside a tracked Go file, because an interrupted mutation run leaves the original holding a mutant that compiles and mostly passes; it is first because it cannot be a false alarm. `scripts/check-tests-kept.py` reports `Test` functions HEAD has and the tree does not; it is deliberately not in `check` because deleting a test is sometimes right, and it exists because a scripted edit once swallowed a neighbouring test with every gate green.
 
-**`sqlc` and `sqlc-check` are outside `check` for the opposite reason to the terraform gates.** The generated query code is committed precisely so an ordinary build never downloads sqlc; CI installs the pin (`SQLC_VERSION` in the Makefile, read by the workflow so the two cannot drift) and runs `sqlc diff` in its own job. Run `make sqlc` after editing `internal/state/queries` or adding a migration, because sqlc reads the migration history as its schema.
+**`sqlc` and `sqlc-check` are outside `check` for the opposite reason to the terraform gates.** The generated query code is committed precisely so an ordinary build never downloads sqlc; CI installs the pin (`SQLC_VERSION` in the Makefile, read by the workflow so the two cannot drift) and runs `sqlc diff` as a step of the lint job, beside `make cross` and govulncheck. Run `make sqlc` after editing `internal/state/queries` or adding a migration, because sqlc reads the migration history as its schema.
 
 **Go comments wrap at 88 columns; Markdown never wraps.** Go source follows the surrounding file. Every `.md` and `.txt` file is one paragraph per line.
 
