@@ -619,7 +619,11 @@ EOF
 	# CI job on this fleet that needed them, which reached the archive from every
 	# guest: one more dependency on a mirror that was unreachable for hours on
 	# 2026-09-11, and one more set of sessions on an uplink the fleet shares with
-	# everything else at its site.
+	# everything else at its site. apparmor is a BEHAVIOUR CHANGE, not only a
+	# file: the guest kernel boots with AppArmor as its LSM, and with the parser
+	# present dockerd confines every container under docker-default, as a hosted
+	# runner does; a job that mounts with added capabilities can now meet a denial
+	# it did not meet on the parser-less guest, and meets the same one hosted.
 	local billet_packages=(
 		ca-certificates curl iproute2 iptables jq git sudo dnsmasq-base
 		docker.io docker-buildx docker-compose-v2 e2fsprogs util-linux
@@ -668,20 +672,26 @@ apt-get clean
 rm -rf /var/lib/apt/lists/*
 APT
 
-	# THE SHIPPED IMAGE FETCHES OVER HTTPS FROM TWO MIRRORS, EVERY ATTEMPT BOUNDED.
-	# A deb822 source with two URIs fails over PER REQUEST: measured on a fleet
-	# guest 2026-09-11, with the first URI black-holed and a 5 s timeout, the index
-	# fetch moved to the second mirror after the timeout and a package install took
-	# 2 s from it (apt's mirror+file method, by contrast, moves only off a mirror
-	# that is wholly unreachable, and Acquire::Retries retries the same URI). The
-	# build bootstraps over plain HTTP because minbase carries no CA bundle until
-	# the transaction above installs ca-certificates. Why two: the same day, every
-	# archive.ubuntu.com address refused port 80 from three unrelated networks for
+	# THE SHIPPED IMAGE FETCHES OVER HTTPS FROM TWO SOURCES, EVERY FETCH BOUNDED BY
+	# AN INACTIVITY TIMEOUT. Two URIs in one deb822 stanza are TWO REPOSITORIES to
+	# apt: it fetches both index sets (twice the index traffic) and takes a package
+	# from whichever lists the version, so an install survives one mirror being
+	# down while `apt-get update` under Error-Mode=any still reports the dead one.
+	# Measured on a fleet guest 2026-09-11 with the first URI black-holed and a 5 s
+	# timeout: a strict update failed in 13 s naming the dead mirror, a lenient one
+	# passed in 13 s, and a package installed from the second mirror in 4 s. The
+	# `mirror+file:` method, which fetches one index set and offers alternate URLs
+	# per file, did NOT finish a strict update in nine minutes under the same
+	# black hole, so it is not the shape here. Acquire::Retries retries the failing
+	# URI; the timeout is per read, not per download. The build bootstraps over
+	# plain HTTP because minbase carries no CA bundle until the transaction above
+	# installs ca-certificates. Why two sources: the same day every
+	# archive.ubuntu.com address refused port 80 from the site and from AWS for
 	# hours, two answered nothing on 443 either, and a job's apt sat 30 s per attempt
 	# on one of those. A rewrite the grep does not confirm is a build that would
 	# ship the old source under a new comment.
 	sed -i 's,^URIs: .*$,URIs: https://archive.ubuntu.com/ubuntu/ https://mirrors.edge.kernel.org/ubuntu/,' "$rootfs/etc/apt/sources.list.d/ubuntu.sources"
-	grep -q '^URIs: https://archive.ubuntu.com/ubuntu/ https://mirrors.edge.kernel.org/ubuntu/$' "$rootfs/etc/apt/sources.list.d/ubuntu.sources"
+	grep -Fxq 'URIs: https://archive.ubuntu.com/ubuntu/ https://mirrors.edge.kernel.org/ubuntu/' "$rootfs/etc/apt/sources.list.d/ubuntu.sources"
 	install -m 0644 /dev/stdin "$rootfs/etc/apt/apt.conf.d/90billet-fetch" <<'APTCONF'
 Acquire::Retries "3";
 Acquire::http::Timeout "30";
