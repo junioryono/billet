@@ -7,6 +7,7 @@ import (
 	"os"
 
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/retirement"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/version"
 )
@@ -64,6 +65,35 @@ func openStateStandby(ctx context.Context, cfg *config.Config) (*state.DB, error
 // from, which on a host the package just installed is the ordinary state.
 var errNoLedgerYet = errors.New("no ledger here yet")
 
+// refuseRecreatingIdentity refuses an operator open of a PREPARED host's
+// identity directory that is positively absent, before the opener creates it.
+//
+// THE STATE OPENER CREATES THE DIRECTORY AND ITS LOCK ON FIRST USE, which on a
+// fresh host is how `billet check` initialises it and on a prepared host is how
+// a `billet status` five minutes after a retirement would mint a second
+// identity beside the archived one. On a prepared host the directory exists
+// from the installer's bootstrap onwards and is moved only by a retirement, so
+// its absence is that move (or damage), never a gap to fill. A legacy or fresh
+// host is left to the opener as before; a damaged host refuses on its own.
+func refuseRecreatingIdentity(dir string) error {
+	if !retirement.SupportedHere() {
+		return nil
+	}
+
+	class, err := retirement.Classify(dir)
+	if err != nil {
+		return err
+	}
+
+	if class.Mode == retirement.ModePrepared && !class.Directory {
+		return fmt.Errorf("%s does not exist, and this command will not recreate it: a retirement "+
+			"moves a controller's identity directory to its archive, and an installer creates a "+
+			"fresh one", dir)
+	}
+
+	return nil
+}
+
 // openStateForDecision opens the ledger for the one read that must not be
 // refused by the release watermark: the host's own instruction.
 //
@@ -99,6 +129,10 @@ func openStateForDecision(ctx context.Context, cfg *config.Config) (*state.DB, e
 		}
 	}
 
+	if err := refuseRecreatingIdentity(cfg.Server.IdentityDir); err != nil {
+		return nil, err
+	}
+
 	var db *state.DB
 
 	if cfg.Server.LedgerBackend() == config.StatePostgres {
@@ -127,6 +161,10 @@ func openStateForDecision(ctx context.Context, cfg *config.Config) (*state.DB, e
 func openStateAdmin(ctx context.Context, cfg *config.Config) (*state.DB, error) {
 	dsn, err := ledgerDSN(cfg)
 	if err != nil {
+		return nil, err
+	}
+
+	if err := refuseRecreatingIdentity(cfg.Server.IdentityDir); err != nil {
 		return nil, err
 	}
 

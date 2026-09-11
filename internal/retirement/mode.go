@@ -44,6 +44,11 @@ func (m HostMode) String() string {
 type Classification struct {
 	Mode    HostMode
 	Account ServiceAccount
+	// Directory says whether the configured identity directory is present, an
+	// observation made for every mode: on a prepared host its absence is a
+	// retirement's move or damage, and a caller about to open something inside
+	// it refuses rather than recreating it.
+	Directory bool
 }
 
 // DamagedError is a host whose metadata contradicts itself: a global lock or a
@@ -58,13 +63,19 @@ func (e DamagedError) Error() string {
 }
 
 // Classify observes the host for identityDir. A failed observation is never
-// read as absence: an unreadable record, lock or status is a DamagedError.
+// read as absence: an unreadable record, lock or status is a DamagedError, and
+// a directory that cannot be examined is an error of its own.
 func Classify(identityDir string) (Classification, error) {
+	directory, err := exists(identityDir)
+	if err != nil {
+		return Classification{}, fmt.Errorf("retirement: examine %s: %w", identityDir, err)
+	}
+
 	acct, err := ReadServiceAccount()
 
 	switch {
 	case err == nil:
-		return Classification{Mode: ModePrepared, Account: acct}, nil
+		return Classification{Mode: ModePrepared, Account: acct, Directory: directory}, nil
 	case !errors.Is(err, ErrNoServiceAccount):
 		return Classification{}, DamagedError{Why: err.Error()}
 	}
@@ -89,13 +100,8 @@ func Classify(identityDir string) (Classification, error) {
 		return Classification{}, DamagedError{Why: why}
 	}
 
-	present, err = exists(identityDir)
-	if err != nil {
-		return Classification{}, fmt.Errorf("retirement: examine %s: %w", identityDir, err)
-	}
-
-	if present {
-		return Classification{Mode: ModeLegacy}, nil
+	if directory {
+		return Classification{Mode: ModeLegacy, Directory: true}, nil
 	}
 
 	return Classification{Mode: ModeFresh}, nil

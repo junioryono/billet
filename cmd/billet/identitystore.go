@@ -194,11 +194,17 @@ func withAuthorityLock(ctx context.Context, cfg *config.Config, log *slog.Logger
 		return err
 	}
 
-	defer func() {
-		if err := acc.Release(); err != nil {
-			log.Warn("could not release the authority lock", "error", err)
-		}
-	}()
+	// THE RELEASE IS PART OF THE RESULT, not a warning: it hands an adopted
+	// authority back to the service account, and a `ca sync` that exited zero
+	// over a failed hand-back would leave the server unable to read the
+	// authority it just adopted.
+	err = fn(dir)
 
-	return fn(dir)
+	if rerr := acc.Release(); rerr != nil {
+		log.Warn("could not release the authority lock", "error", rerr)
+
+		err = errors.Join(err, rerr)
+	}
+
+	return err
 }

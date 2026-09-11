@@ -2524,7 +2524,7 @@ func serialFromCert(path string) (string, error) {
 	return wirecert.Serial(cert), nil
 }
 
-func cmdCAIssue(ctx context.Context, args []string) error {
+func cmdCAIssue(ctx context.Context, args []string) (err error) {
 	fs := newFlagSet("billet ca issue")
 	cfgPath := addConfigFlag(fs)
 	out := fs.String("out", "", "directory to write the bundle to (default ./<node>-billet-tls)")
@@ -2573,18 +2573,24 @@ func cmdCAIssue(ctx context.Context, args []string) error {
 			"authority; run this on the control plane", *cfgPath)
 	}
 
+	// HELD THROUGH THE LEDGER RECORD BELOW, not released after the authority
+	// load: `recordIssued` opens the ledger, which creates the directory and its
+	// lock on first use, and an issue interrupted by a closure between the load
+	// and the record would otherwise open a directory a retirement had moved.
 	acc, err := openIdentityAccess(ctx, cfg.Server.IdentityDir, identityIntent{create: true, wait: identityAccessWait})
 	if err != nil {
 		return err
 	}
 
+	defer func() { err = errors.Join(err, acc.Release()) }()
+
 	deployment, err := state.DeploymentID(cfg.Server.IdentityDir)
 	if err != nil {
-		return errors.Join(err, acc.Release())
+		return err
 	}
 
 	authority, err := wirecert.LoadServing(cfg.Server.IdentityDir, deployment)
-	if err := errors.Join(err, acc.Release()); err != nil {
+	if err != nil {
 		return err
 	}
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -149,9 +150,18 @@ func syncDir(dir string) error {
 	return nil
 }
 
-// strictDecode refuses unknown members and trailing content, so a record from
-// a later shape is a typed refusal rather than a partial read.
+// strictDecode refuses unknown members, repeated members and trailing content,
+// so a record from a later shape, or one that says two things about one field,
+// is a typed refusal rather than a partial read.
+//
+// END OF DOCUMENT IS PROVED BY READING PAST IT. Decoder.More answers false for
+// a trailing `]` or `}` as well as for EOF, so a valid record followed by a
+// stray bracket passed it; the next token has to be io.EOF and nothing else.
 func strictDecode(raw []byte, into any) error {
+	if err := refuseRepeatedMembers(raw); err != nil {
+		return err
+	}
+
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 
@@ -159,9 +169,85 @@ func strictDecode(raw []byte, into any) error {
 		return fmt.Errorf("decode: %w", err)
 	}
 
-	if dec.More() {
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
 		return errors.New("decode: trailing content after the document")
 	}
 
 	return nil
+}
+
+// refuseRepeatedMembers walks the document's tokens and refuses an object that
+// names one member twice: encoding/json keeps the last value silently, and a
+// record that says two things about one field is not a record billet wrote.
+//
+// The walk keeps one frame per open object or array, because a string inside
+// an array nested in an object is a value and never a key; the decoder's own
+// tokeniser has already refused malformed syntax by the time a token arrives.
+func refuseRepeatedMembers(raw []byte) error {
+	type frame struct {
+		object    bool
+		members   map[string]struct{}
+		expectKey bool
+	}
+
+	dec := json.NewDecoder(bytes.NewReader(raw))
+
+	var stack []*frame
+
+	for {
+		tok, err := dec.Token()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+
+		if err != nil {
+			return fmt.Errorf("decode: %w", err)
+		}
+
+		var top *frame
+		if len(stack) > 0 {
+			top = stack[len(stack)-1]
+		}
+
+		if d, ok := tok.(json.Delim); ok {
+			switch d {
+			case '{', '[':
+				// This delimiter is a VALUE of the enclosing object; once it
+				// closes, the enclosing object's next token is a key again.
+				if top != nil && top.object {
+					top.expectKey = true
+				}
+
+				stack = append(stack, &frame{
+					object: d == '{', members: map[string]struct{}{}, expectKey: d == '{',
+				})
+			default:
+				stack = stack[:len(stack)-1]
+			}
+
+			continue
+		}
+
+		if top == nil || !top.object {
+			continue
+		}
+
+		if !top.expectKey {
+			top.expectKey = true
+
+			continue
+		}
+
+		key, ok := tok.(string)
+		if !ok {
+			return fmt.Errorf("decode: a member name is not a string (%v)", tok)
+		}
+
+		if _, dup := top.members[key]; dup {
+			return fmt.Errorf("decode: the member %q appears twice", key)
+		}
+
+		top.members[key] = struct{}{}
+		top.expectKey = false
+	}
 }

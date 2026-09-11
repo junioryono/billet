@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/junioryono/billet/internal/regularfile"
 	"github.com/junioryono/billet/internal/retirement"
 )
 
@@ -53,6 +54,12 @@ type Exclusion struct {
 	// Account is the recorded service account when the host is prepared; a
 	// privileged creator of the inner lock gives the file to it.
 	Account *retirement.ServiceAccount
+	// Create says the caller may CREATE the identity directory when it is
+	// positively absent: a fresh host with no metadata at all (nothing a
+	// retirement could have moved), or a platform without the global
+	// exclusion. Every other caller refuses an absent directory and recreates
+	// nothing, because the retirement world is the one that moves it.
+	Create bool
 
 	ownsHold bool
 }
@@ -62,12 +69,16 @@ type Exclusion struct {
 // legacy marker on a host with no metadata; a refusal on a damaged one.
 //
 // A FRESH host (no metadata, directory absent) resolves as legacy for the
-// lock's purposes: the caller that creates the directory does so under the
-// initialisation lock beside it, which is not this function's business, and the
-// inner lock is then taken inside what it created.
+// lock's purposes and MAY CREATE: there is no record, no global lock and no
+// status, so nothing a retirement could have moved, and a library caller that
+// resolves it (a restore onto a bare target) initialises as before this package
+// existed; the command layer creates under the initialisation lock beside the
+// directory first and then finds it present. A LEGACY host (the directory
+// existed when it was classified) and a PREPARED one may not: a directory gone
+// since is a retirement's move or damage, and the inner lock refuses it.
 func ResolveExclusion(ctx context.Context, stateDir string, wait time.Duration) (Exclusion, error) {
 	if !retirement.SupportedHere() {
-		return Exclusion{Legacy: true, Wait: wait}, nil
+		return Exclusion{Legacy: true, Create: true, Wait: wait}, nil
 	}
 
 	class, err := retirement.Classify(stateDir)
@@ -89,6 +100,8 @@ func ResolveExclusion(ctx context.Context, stateDir string, wait time.Duration) 
 		acct := class.Account
 
 		return Exclusion{Hold: hold, Wait: wait, Account: &acct, ownsHold: true}, nil
+	case retirement.ModeFresh:
+		return Exclusion{Legacy: true, Create: true, Wait: wait}, nil
 	default:
 		return Exclusion{Legacy: true, Wait: wait}, nil
 	}
@@ -182,10 +195,15 @@ func LockAuthority(ctx context.Context, stateDir string) (*AuthorityLock, error)
 //
 // A nil or released hold on a non-legacy exclusion refuses: nothing may reach
 // the identity directory on a prepared host without the global lock admitted.
-// On the legacy path the inner lock is taken and then the global lock is
-// RECHECKED under it: an installer that published one meanwhile is handed off
-// to in the one lock order (global, then inner), the configured pathname is
-// looked up afresh, and the status admits or refuses.
+// AN ABSENT DIRECTORY REFUSES unless the exclusion says the caller may create
+// it (a fresh host, or a platform without the global exclusion): on a prepared
+// host, or on a legacy host whose directory has vanished since it was
+// classified, the directory was moved by a retirement or damaged by hand, and
+// an ordinary lock that recreated it would mint a second identity beside the
+// archived one. On the legacy path the inner lock is taken and then the global
+// lock is RECHECKED under it: an installer that published one meanwhile is
+// handed off to in the one lock order (global, then inner), the configured
+// pathname is looked up afresh, and the status admits or refuses.
 func LockAuthorityWith(ctx context.Context, stateDir string, ex Exclusion) (*AuthorityLock, error) {
 	if !ex.Legacy && ex.Hold == nil {
 		return nil, errors.New("wirecert: the authority lock needs the global hold on a prepared host, and none was passed")
@@ -194,6 +212,12 @@ func LockAuthorityWith(ctx context.Context, stateDir string, ex Exclusion) (*Aut
 	before, err := identityOf(stateDir)
 	if err != nil {
 		return nil, err
+	}
+
+	if before.absent && !ex.Create {
+		return nil, fmt.Errorf("wirecert: %s does not exist, and this command will not recreate it: a "+
+			"retirement moves a controller's identity directory to its archive, and a fresh host is "+
+			"initialised by `billet check`, `billet local up` or the host role", stateDir)
 	}
 
 	lock, err := lockInner(ctx, stateDir, ex)
@@ -278,20 +302,25 @@ func identityOf(path string) (pathIdentity, error) {
 	return pathIdentity{info: info}, nil
 }
 
-// lockInner opens and flocks the inner lock, creating it when absent.
+// lockInner opens and flocks the inner lock, creating it when absent, and the
+// directory too when the exclusion allows it.
 func lockInner(ctx context.Context, stateDir string, ex Exclusion) (*AuthorityLock, error) {
-	if err := os.MkdirAll(stateDir, 0o700); err != nil {
-		return nil, fmt.Errorf("wirecert: create %s: %w", stateDir, err)
+	if ex.Create {
+		if err := os.MkdirAll(stateDir, 0o700); err != nil {
+			return nil, fmt.Errorf("wirecert: create %s: %w", stateDir, err)
+		}
 	}
 
 	path := AuthorityLockPath(stateDir)
 
-	// O_NOFOLLOW: the lock is only worth anything if it is on the inode this
-	// path names, and a symlink here would silently move the exclusion somewhere
-	// else — after which two commands rewrite one authority believing they are
-	// alone. READ-ONLY when it exists, because flock(2) needs no write access and
-	// the service account has to be able to take a root-created one.
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	// NEVER FOLLOWING A LINK, AND ONLY A REGULAR FILE: the lock is only worth
+	// anything if it is on the inode this path names, and a symlink here would
+	// silently move the exclusion somewhere else — after which two commands
+	// rewrite one authority believing they are alone; a FIFO here would block
+	// the open itself, before any deadline could end the wait. READ-ONLY when
+	// it exists, because flock(2) needs no write access and the service account
+	// has to be able to take a root-created one.
+	f, err := openExistingLock(path)
 	if err != nil {
 		if !errors.Is(err, fs.ErrNotExist) {
 			return nil, fmt.Errorf("wirecert: open the authority lock %s: %w", path, err)
@@ -337,7 +366,7 @@ func createInnerLock(path string, acct *retirement.ServiceAccount) (*os.File, er
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0o600)
 	if err != nil {
 		if errors.Is(err, fs.ErrExist) {
-			f, err = os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+			f, err = openExistingLock(path)
 			if err != nil {
 				return nil, fmt.Errorf("wirecert: open the authority lock %s: %w", path, err)
 			}
@@ -352,6 +381,18 @@ func createInnerLock(path string, acct *retirement.ServiceAccount) (*os.File, er
 		if err := f.Chown(acct.UID, acct.GID); err != nil {
 			return nil, errors.Join(fmt.Errorf("wirecert: give %s to the service account: %w", path, err), f.Close())
 		}
+	}
+
+	return f, nil
+}
+
+// openExistingLock opens an existing lock file for flock(2) through the one
+// identity-first open: read-only, no link followed, a regular file or a refusal,
+// and never a wait inside the open. An absent file is fs.ErrNotExist.
+func openExistingLock(path string) (*os.File, error) {
+	f, _, err := regularfile.Open(path, regularfile.Options{NoFollow: true})
+	if err != nil {
+		return nil, err
 	}
 
 	return f, nil

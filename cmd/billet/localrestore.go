@@ -211,8 +211,10 @@ func runLocalRestore(ctx context.Context, o restoreOptions) error {
 	fmt.Println()
 
 	// AUTHORITY BEFORE DIRECTORY, the order every command takes them in now; a
-	// bare target is initialised under the lock beside it.
-	acc, err := openIdentityAccess(ctx, plan.Target.StateDir, identityIntent{create: true, wait: identityAccessWait})
+	// bare target is initialised under the lock beside it, borrowing the
+	// lifecycle lock this command already holds rather than refusing itself.
+	acc, err := openIdentityAccess(ctx, plan.Target.StateDir,
+		identityIntent{create: true, wait: identityAccessWait, lifecycleHeld: true})
 	if err != nil {
 		return err
 	}

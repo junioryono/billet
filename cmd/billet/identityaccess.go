@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -38,10 +39,14 @@ type identityAccess struct {
 }
 
 // identityIntent says whether the caller may CREATE the directory when it is
-// positively absent, and how long it waits for a held lock.
+// positively absent, how long it waits for a held lock, and whether it already
+// holds the lifecycle lock (a restore or a recovery, which take it before their
+// first identity access), so a fresh initialisation borrows that hold rather
+// than refusing itself as "another lifecycle command".
 type identityIntent struct {
-	create bool
-	wait   time.Duration
+	create        bool
+	wait          time.Duration
+	lifecycleHeld bool
 }
 
 // identityAccessWait is the bound an operator command waits for a held lock
@@ -60,7 +65,9 @@ func openIdentityAccess(ctx context.Context, dir string, intent identityIntent) 
 	acc := &identityAccess{dir: dir}
 
 	if !retirement.SupportedHere() {
-		if err := acc.lockInner(ctx, wirecert.Exclusion{Legacy: true, Wait: intent.wait}); err != nil {
+		// A platform without the global exclusion: the inner lock alone, the
+		// directory created when the caller may create, as before.
+		if err := acc.lockInner(ctx, wirecert.Exclusion{Legacy: true, Create: intent.create, Wait: intent.wait}); err != nil {
 			return nil, err
 		}
 
@@ -122,7 +129,7 @@ func (a *identityAccess) initialise(ctx context.Context, intent identityIntent) 
 
 	a.init = init
 
-	if os.Geteuid() == 0 {
+	if os.Geteuid() == 0 && !intent.lifecycleHeld {
 		lock, err := lifecycleLock()
 		if err != nil {
 			return errors.Join(err, a.Release())
@@ -192,6 +199,14 @@ func (a *identityAccess) Account() *retirement.ServiceAccount { return a.account
 // created them on a prepared host, then drops every lock in the reverse of
 // the order they were taken. Errors are joined, never dropped: a lock that did
 // not release is the next command's "held by another billet".
+//
+// THE ACCOUNT IS READ HERE, UNDER THE LOCKS STILL HELD, and not remembered from
+// the classification that opened the access: an installer may publish the
+// record between that classification and this release (a legacy root writer
+// holds the inner lock while `Bootstrap` publishes under the global one), and
+// what such a writer created is exactly what the newly recorded account must
+// be given, or the first server start after the preparation meets root-owned
+// CA files it cannot read.
 func (a *identityAccess) Release() error {
 	if a == nil {
 		return nil
@@ -199,10 +214,8 @@ func (a *identityAccess) Release() error {
 
 	var errs []error
 
-	if a.account != nil && os.Geteuid() == 0 && a.lock != nil {
-		if _, err := handBackIdentity(a.dir, *a.account, identityArtefacts); err != nil {
-			errs = append(errs, err)
-		}
+	if err := a.handBack(); err != nil {
+		errs = append(errs, err)
 	}
 
 	if a.lock != nil {
@@ -223,6 +236,30 @@ func (a *identityAccess) Release() error {
 	}
 
 	return errors.Join(errs...)
+}
+
+// handBack gives the identity artefacts to the recorded service account when
+// this process is root, holds the inner lock, and the host records one now.
+// A record that cannot be read is a hand-back that cannot be made, reported;
+// no record is nothing to give things to.
+func (a *identityAccess) handBack() error {
+	if os.Geteuid() != 0 || a.lock == nil || !retirement.SupportedHere() {
+		return nil
+	}
+
+	acct, err := retirement.ReadServiceAccount()
+
+	switch {
+	case errors.Is(err, retirement.ErrNoServiceAccount):
+		return nil
+	case err != nil:
+		return fmt.Errorf("billet: the identity artefacts under %s could not be handed back to the "+
+			"service account, because its record could not be read: %w", a.dir, err)
+	}
+
+	a.account = &acct
+
+	return handBackIdentity(a.dir, acct, identityArtefacts)
 }
 
 // serverIdentityAccess is the control plane's own take on the exclusion, with
@@ -307,9 +344,7 @@ func handBackLedger(dir string) error {
 		return nil //nolint:nilerr // the classification's refusal belongs to the open, not to the hand-back
 	}
 
-	_, err = handBackIdentity(dir, class.Account, ledgerArtefacts)
-
-	return err
+	return handBackIdentity(dir, class.Account, ledgerArtefacts)
 }
 
 // artefactSet names what a privileged command can create inside an identity
@@ -328,33 +363,70 @@ const (
 // regular files with one link on the directory's filesystem, the two
 // directories excepted, nothing walked. It is the one re-owning mechanism;
 // `local up`'s preflight repair is the same function over the ledger set.
-func handBackIdentity(dir string, acct retirement.ServiceAccount, set artefactSet) ([]string, error) {
-	return converge().RepairPaths(dir, artefactTargets(dir, set), acct.UID, acct.GID)
+func handBackIdentity(dir string, acct retirement.ServiceAccount, set artefactSet) error {
+	targets, err := artefactTargets(dir, set)
+	if err != nil {
+		return err
+	}
+
+	_, err = converge().RepairPaths(dir, targets, acct.UID, acct.GID)
+
+	return err
 }
 
-func artefactTargets(dir string, set artefactSet) []lifeops.RepairTarget {
-	rel := func(path string) string {
-		if len(path) > len(dir)+1 && path[:len(dir)+1] == dir+"/" {
-			return path[len(dir)+1:]
+// artefactTargets names the set relative to dir AS THE REPAIR WANTS IT: through
+// filepath.Rel against the cleaned directory, because the producers' helpers
+// clean their paths and a directory spelled with a trailing slash would
+// otherwise leave every target absolute, which the repair's root refuses. A
+// name that escapes the directory is a helper that changed and is refused.
+func artefactTargets(dir string, set artefactSet) ([]lifeops.RepairTarget, error) {
+	base := filepath.Clean(dir)
+
+	rel := func(path string) (string, error) {
+		name, err := filepath.Rel(base, path)
+		if err != nil {
+			return "", fmt.Errorf("billet: %s is not under %s: %w", path, base, err)
 		}
 
-		return path
+		if name == ".." || strings.HasPrefix(name, "../") || filepath.IsAbs(name) {
+			return "", fmt.Errorf("billet: %s is not under %s, so it is not an identity artefact", path, base)
+		}
+
+		return name, nil
+	}
+
+	var (
+		targets []lifeops.RepairTarget
+		errs    []error
+	)
+
+	add := func(path string, dirTarget bool) {
+		name, err := rel(path)
+		if err != nil {
+			errs = append(errs, err)
+
+			return
+		}
+
+		targets = append(targets, lifeops.RepairTarget{Name: name, Dir: dirTarget})
 	}
 
 	switch set {
 	case ledgerArtefacts:
-		return []lifeops.RepairTarget{
-			{Name: rel(state.LedgerPath(dir))}, {Name: rel(state.LedgerPath(dir)) + "-wal"},
-			{Name: rel(state.LedgerPath(dir)) + "-shm"}, {Name: rel(state.DirectoryLockPath(dir))},
-		}
+		add(state.LedgerPath(dir), false)
+		add(state.LedgerPath(dir)+"-wal", false)
+		add(state.LedgerPath(dir)+"-shm", false)
+		add(state.DirectoryLockPath(dir), false)
 	default:
-		return []lifeops.RepairTarget{
-			{Name: rel(state.DeploymentIDPath(dir))},
-			{Name: rel(wirecert.AuthorityMarkerPath(dir))},
-			{Name: rel(wirecert.AuthorityLockPath(dir))},
-			{Name: rel(wirecert.CADir(dir)), Dir: true},
-			{Name: rel(wirecert.CACertPath(dir))}, {Name: rel(wirecert.CAKeyPath(dir))},
-			{Name: rel(wirecert.PreviousCACertPath(dir))}, {Name: rel(wirecert.PreviousCAKeyPath(dir))},
-		}
+		add(state.DeploymentIDPath(dir), false)
+		add(wirecert.AuthorityMarkerPath(dir), false)
+		add(wirecert.AuthorityLockPath(dir), false)
+		add(wirecert.CADir(dir), true)
+		add(wirecert.CACertPath(dir), false)
+		add(wirecert.CAKeyPath(dir), false)
+		add(wirecert.PreviousCACertPath(dir), false)
+		add(wirecert.PreviousCAKeyPath(dir), false)
 	}
+
+	return targets, errors.Join(errs...)
 }

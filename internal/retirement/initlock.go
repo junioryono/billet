@@ -32,7 +32,7 @@ type InitHold struct {
 func AcquireInit(ctx context.Context, identityDir string, acct *ServiceAccount, poll time.Duration) (*InitHold, error) {
 	path := InitLockPath(identityDir)
 
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	f, err := openLockFile(path)
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
 			return nil, fmt.Errorf("retirement: open the initialisation lock %s: %w", path, err)

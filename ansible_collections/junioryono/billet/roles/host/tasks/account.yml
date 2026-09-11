@@ -8,21 +8,6 @@
 - name: Validate the installed service identity before the account is touched
   ansible.builtin.import_tasks: installed-identity.yml
 
-- name: Refuse to adopt an unrelated existing account
-  ansible.builtin.assert:
-    that:
-      - billet_adopt_existing_service_account or ansible_facts.getent_passwd[billet_service_user][4] == billet_service_home
-    fail_msg: >-
-      The account {{ billet_service_user }} already exists with home
-      {{ ansible_facts.getent_passwd[billet_service_user][4] }}, not
-      {{ billet_service_home }}. Refusing to hand an unrelated identity the
-      deployment credentials. Set billet_adopt_existing_service_account only
-      after verifying it is the old nologin billet account.
-  # fail_key: false answers a missing account as {name: None} — the KEY is
-  # present on a fresh host, so guard on the value, or the first converge of
-  # any new machine dies dereferencing None.
-  when: ansible_facts.getent_passwd.get(billet_service_user) is not none
-
 - name: Check for processes owned by an adopted account
   ansible.builtin.command: "pgrep -u {{ billet_service_user }}"
   register: billet_account_processes

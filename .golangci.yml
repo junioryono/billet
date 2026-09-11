@@ -515,6 +515,19 @@ linters:
           - gosec
         text: G703
 
+      # `configuredKeyPath` reads the file `--config` names, which is the
+      # operator's own pathname handed to the command they ran, and the same
+      # read every command makes through config.Load. gosec's taint analysis
+      # reports this one site only once the package's call graph grew past the
+      # point where its traversal reaches it (the identity exclusion's entry did
+      # that, 2026-09-11; reverting either of two unrelated files made the report
+      # vanish), so a nolint directive here would be reported unused on a
+      # smaller build. Excluded by file and rule, like the resolver above.
+      - path: (^|/)cmd/billet/githubapp\.go$
+        linters:
+          - gosec
+        text: G703
+
       # ----- tests: relax noise-heavy rules -----
       #
       # errcheck is deliberately NOT in this list. It was, on the assumption that

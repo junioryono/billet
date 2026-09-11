@@ -176,21 +176,37 @@ enable_timers() {
     done
 }
 
-# unit_decisions runs under the lifecycle lock (or, when flock is missing,
-# with that stated). The status is asked again here, inside the exclusion.
+# unit_decisions runs under the lifecycle lock. THE STATUS IS ASKED AGAIN HERE,
+# INSIDE THE EXCLUSION, AND ONLY A CURRENT ANSWER AUTHORISES ANYTHING: the
+# earlier answer was read before the lock and may be stale, and a preparation
+# that fails here (an unreadable status, a lock it could not take) proves
+# nothing about the host, so the decisions are deferred exactly as they are on
+# contention, with the same retry named. An install must not fail a system
+# upgrade for it, so this returns 0 either way.
 unit_decisions() {
-    status="${PREPARE_STATUS}"
-    if [ -x /usr/bin/billet ]; then
-        if again=$(/usr/bin/billet local prepare --json 2>/dev/null); then
-            case "${again}" in *'"closed":true'*) status=closed ;; *) status=open ;; esac
-        fi
-    fi
-
-    if [ "${status}" = closed ]; then
-        echo "billet: this controller retired; its configuration is left absent and no unit" >&2
-        echo "        is enabled or started. A retired controller stays retired." >&2
+    if [ ! -x /usr/bin/billet ]; then
+        echo "billet: /usr/bin/billet is not executable, so the unit decisions were not made;" >&2
+        echo "        ${CONF} was not seeded and no timer was enabled. Run \`dpkg-reconfigure billet\`." >&2
         return 0
     fi
+
+    if ! again=$(/usr/bin/billet local prepare --json 2>&1); then
+        echo "billet: the authority status could not be re-read under the lifecycle lock, so" >&2
+        echo "        this install left ${CONF} unseeded (if it was absent) and billet-upgrade.timer" >&2
+        echo "        and billet-images-refresh.timer as they were:" >&2
+        echo "        ${again}" >&2
+        echo "        Automatic maintenance is DEFERRED on this host; once the cause is fixed," >&2
+        echo "        \`dpkg-reconfigure billet\` (or a reinstall) re-runs these decisions." >&2
+        return 0
+    fi
+
+    case "${again}" in
+        *'"closed":true'*)
+            echo "billet: this controller retired; its configuration is left absent and no unit" >&2
+            echo "        is enabled or started. A retired controller stays retired." >&2
+            return 0
+            ;;
+    esac
 
     seed_config
     enable_timers

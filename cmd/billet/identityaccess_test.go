@@ -410,8 +410,13 @@ func TestTheArtefactSetsAreTheProducersOwnNames(t *testing.T) {
 	dir := "/var/lib/billet/server"
 
 	names := func(set artefactSet) map[string]bool {
+		targets, err := artefactTargets(dir, set)
+		if err != nil {
+			t.Fatal(err)
+		}
+
 		out := map[string]bool{}
-		for _, target := range artefactTargets(dir, set) {
+		for _, target := range targets {
 			out[target.Name] = target.Dir
 		}
 

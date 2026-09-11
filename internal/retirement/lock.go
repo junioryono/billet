@@ -8,6 +8,8 @@ import (
 	"os"
 	"syscall"
 	"time"
+
+	"github.com/junioryono/billet/internal/regularfile"
 )
 
 // ErrNoGlobalLock is the positive absence of the global lock file for a caller
@@ -41,9 +43,15 @@ func (e ErrStatusUnknown) Unwrap() error { return e.Cause }
 // separate descriptor in the same process is denied on darwin and would
 // deadlock on Linux), and released once.
 type Hold struct {
-	f    *os.File
-	path string
+	f       *os.File
+	path    string
+	created bool
 }
+
+// Created reports whether this acquisition created the lock file, which is
+// what tells a privileged bootstrap that the host had no global exclusion
+// before it.
+func (h *Hold) Created() bool { return h != nil && h.created }
 
 // AcquireOptions says who is asking and how long they will wait.
 type AcquireOptions struct {
@@ -70,7 +78,7 @@ type AcquireOptions struct {
 func Acquire(ctx context.Context, opts AcquireOptions) (*Hold, error) {
 	path := GlobalLockPath()
 
-	f, err := openGlobalLock(path, opts)
+	f, created, err := openGlobalLock(path, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -84,7 +92,7 @@ func Acquire(ctx context.Context, opts AcquireOptions) (*Hold, error) {
 		return nil, errors.Join(fmt.Errorf("retirement: lock %s: %w", path, err), f.Close())
 	}
 
-	return &Hold{f: f, path: path}, nil
+	return &Hold{f: f, path: path, created: created}, nil
 }
 
 // FlockUnder takes LOCK_EX on f, retrying LOCK_NB every poll until ctx ends,
@@ -120,19 +128,19 @@ func FlockUnder(ctx context.Context, f *os.File, poll time.Duration) error {
 // openGlobalLock opens the lock file READ-ONLY, since flock(2) needs no write
 // access and the backup service's sandbox can then open a root-owned file it
 // may read; a privileged caller creates it when absent with the owner and mode
-// the recorded account needs.
-func openGlobalLock(path string, opts AcquireOptions) (*os.File, error) {
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+// the recorded account needs. The boolean says whether this call created it.
+func openGlobalLock(path string, opts AcquireOptions) (*os.File, bool, error) {
+	f, err := openLockFile(path)
 	if err == nil {
-		return f, nil
+		return f, false, nil
 	}
 
 	if !errors.Is(err, fs.ErrNotExist) {
-		return nil, fmt.Errorf("retirement: open the global authority lock %s: %w", path, err)
+		return nil, false, fmt.Errorf("retirement: open the global authority lock %s: %w", path, err)
 	}
 
 	if !opts.Privileged {
-		return nil, ErrNoGlobalLock
+		return nil, false, ErrNoGlobalLock
 	}
 
 	// O_EXCL, so two privileged creators racing do not each own a different
@@ -143,22 +151,36 @@ func openGlobalLock(path string, opts AcquireOptions) (*os.File, error) {
 			return openGlobalLock(path, AcquireOptions{})
 		}
 
-		return nil, fmt.Errorf("retirement: create the global authority lock %s: %w", path, err)
+		return nil, false, fmt.Errorf("retirement: create the global authority lock %s: %w", path, err)
 	}
 
 	if err := ownLockFile(created, opts.Account); err != nil {
 		_ = created.Close()
 
-		return nil, err
+		return nil, false, err
 	}
 
 	if err := syncDir(Root); err != nil {
 		_ = created.Close()
 
+		return nil, false, err
+	}
+
+	return created, true, nil
+}
+
+// openLockFile opens an EXISTING lock file for flock(2): read-only, never
+// following a symlink at the name, and only when it is a regular file, through
+// the one identity-first open, so a FIFO or a device planted at a lock's name
+// is refused rather than waited on inside the open (a plain open of a FIFO
+// blocks before any deadline logic runs). An absent file is fs.ErrNotExist.
+func openLockFile(path string) (*os.File, error) {
+	f, _, err := regularfile.Open(path, regularfile.Options{NoFollow: true})
+	if err != nil {
 		return nil, err
 	}
 
-	return created, nil
+	return f, nil
 }
 
 // ownLockFile gives a lock file the owner and mode the recorded account needs,

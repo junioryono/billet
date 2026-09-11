@@ -7,7 +7,7 @@
     billet_host_main_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/main.yml') | from_yaml }}"
     billet_host_service_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/services.yml') | from_yaml }}"
     # account.yml IMPORTS the installed-identity check (installed-identity.yml),
-    # and this gate pins the order of the five tasks that file holds against
+    # and this gate pins the order of the six tasks that file holds against
     # account.yml's own; so account.yml is read with that one import expanded in
     # place, which is what Ansible executes. Any other import stays a task named
     # by its import line, as before.
@@ -288,6 +288,10 @@
           - billet_handler_names.index('Inspect whether the manager reports a pending reload after unit-file changes') < billet_handler_names.index('Reload systemd after the role\'s own unit-file changes')
           - billet_account_names.index('Refuse an implicit installed service identity migration') < billet_account_names.index('Create the billet service group')
           - billet_account_names.index('Refuse an implicit installed service identity migration') < billet_account_names.index('Create billet directories')
+          # THE UNRELATED-ACCOUNT REFUSAL IS THE SHARED FILE'S, so the record the service-account file writes is never written for an account this refusal rejects; it stays before the account's creation.
+          - "'Refuse to adopt an unrelated existing account' in (billet_host_installed_identity_tasks | map(attribute='name') | list)"
+          - billet_account_names.index('Refuse to adopt an unrelated existing account') < billet_account_names.index('Create the billet service group')
+          - billet_account_names.index('Inspect an existing billet account') < billet_account_names.index('Refuse to adopt an unrelated existing account')
           # THE ENDPOINT DECISION precedes the staging and the render in account.yml, whose import precedes services.yml's transaction in main.yml (pinned below), so a planned change is refused before the first stop; the migration precedes the ordinary node restart and the receipt follows the node's start.
           - billet_account_names.index('Decide the node\'s endpoint migration before the render') < billet_account_names.index('Stage candidate configuration for the upgrade transaction')
           - billet_account_names.index('Decide the node\'s endpoint migration before the render') < billet_account_names.index('Render billet configuration')

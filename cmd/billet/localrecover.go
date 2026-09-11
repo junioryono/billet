@@ -236,7 +236,8 @@ func runLocalRecover(ctx context.Context, o recoverOptions) error {
 	if stage != recoverPublished {
 		fmt.Println()
 
-		acc, aerr := openIdentityAccess(ctx, plan.Target.StateDir, identityIntent{wait: identityAccessWait})
+		acc, aerr := openIdentityAccess(ctx, plan.Target.StateDir,
+			identityIntent{wait: identityAccessWait, lifecycleHeld: true})
 		if aerr != nil {
 			return aerr
 		}
