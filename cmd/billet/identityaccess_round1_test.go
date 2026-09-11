@@ -154,6 +154,44 @@ func TestTheLedgerFactoryBorrowsAHeldAccessAndTakesItsOwnOtherwise(t *testing.T)
 	if locked(t, wirecert.AuthorityLockPath(dir)) {
 		t.Fatal("the factory's own access must be released once the handle exists")
 	}
+
+	// THE FACTORY'S OWN TAKE IS AN EXCLUSION, PROVED: with the inner lock held
+	// by a raw lock the registry knows nothing of, the factory cannot open
+	// until its bound, and opens once the lock is released. A presence check
+	// in place of the exclusion would open at once.
+	oldWait := identityAccessWait
+	identityAccessWait = 300 * time.Millisecond
+
+	t.Cleanup(func() { identityAccessWait = oldWait })
+
+	raw, err := wirecert.LockAuthority(t.Context(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	started := time.Now()
+
+	db, err = openStateAdmin(t.Context(), cfg)
+	if err == nil {
+		t.Fatal(errors.Join(errors.New("the factory opened the ledger while the inner lock was held elsewhere"), db.Close()))
+	}
+
+	if time.Since(started) < 250*time.Millisecond {
+		t.Fatalf("the factory refused at once (%v) rather than waiting for the held lock", time.Since(started))
+	}
+
+	if err := raw.Release(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err = openStateAdmin(t.Context(), cfg)
+	if err != nil {
+		t.Fatalf("the factory must open once the lock is released, got %v", err)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // A FIFO AT THE INNER LOCK'S NAME IS REFUSED PROMPTLY, not opened and waited on:

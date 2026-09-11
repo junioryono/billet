@@ -285,6 +285,10 @@ type fakeRoot struct{ ops *hostOps }
 
 func (r *fakeRoot) Close() error { return nil }
 
+// OpenRegular is OpenFile for the fake: its tree holds no special files, and
+// the real root's refusal of one is proved against a real directory.
+func (r *fakeRoot) OpenRegular(name string) (ownedFile, error) { return r.OpenFile(name, 0, 0) }
+
 func (r *fakeRoot) OpenFile(name string, _ int, _ fs.FileMode) (ownedFile, error) {
 	if err, ok := r.ops.openErr[name]; ok {
 		return nil, err

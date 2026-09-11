@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/deploy"
+	"github.com/junioryono/billet/internal/regularfile"
 )
 
 // DefaultStabilityWait is how long a service must keep the process it started
@@ -181,6 +182,13 @@ type rootFS interface {
 	// directory is writable by the service account: a name checked and then
 	// chowned is a name that can be replaced in between.
 	OpenFile(name string, flag int, perm fs.FileMode) (ownedFile, error)
+	// OpenRegular resolves a FILE inside the opened directory through the
+	// identity-first regular-file open: never following a link at the name,
+	// and answering a descriptor only for a regular file, so a FIFO or a device
+	// planted at one of the repaired names is refused rather than waited on
+	// inside the open (a plain open of a FIFO blocks until a writer appears,
+	// with the caller's locks held).
+	OpenRegular(name string) (ownedFile, error)
 	Close() error
 }
 
@@ -272,6 +280,22 @@ type osRoot struct{ *os.Root }
 
 func (r *osRoot) OpenFile(name string, flag int, perm fs.FileMode) (ownedFile, error) {
 	return r.Root.OpenFile(name, flag, perm)
+}
+
+func (r *osRoot) OpenRegular(name string) (ownedFile, error) {
+	dir, err := r.Root.OpenFile(".", os.O_RDONLY|syscall.O_DIRECTORY, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	defer func() { _ = dir.Close() }()
+
+	f, _, err := regularfile.OpenAt(dir, name)
+	if err != nil {
+		return nil, err
+	}
+
+	return f, nil
 }
 
 // Plan decides what `up` would do, and every reason it would not.
@@ -1098,8 +1122,21 @@ func (c *Converger) RepairPaths(
 		//
 		// MEASURED: os.Root.OpenFile opens a directory under O_RDONLY|O_NOFOLLOW
 		// and the descriptor stats and chowns like any other, so the authority's
-		// own directory needs no second mechanism.
-		f, err := root.OpenFile(target.Name, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+		// own directory needs no second mechanism. A FILE target goes through
+		// the root's regular-file open, which never blocks in the open: a plain
+		// open of a FIFO planted at one of these names would wait for a writer
+		// with the caller's authority locks held.
+		var (
+			f   ownedFile
+			err error
+		)
+
+		if target.Dir {
+			f, err = root.OpenFile(target.Name, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+		} else {
+			f, err = root.OpenRegular(target.Name)
+		}
+
 		if err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
 				continue

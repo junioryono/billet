@@ -253,6 +253,12 @@ linters:
             - github.com/junioryono/billet/deploy$
             - github.com/junioryono/billet/internal/config$
             - github.com/junioryono/billet/internal/lifeops$
+            # The one open that never blocks: the ownership repair opens the
+            # files a privileged billet may have left behind, and a plain open
+            # of a FIFO planted at one of their names would wait for a writer
+            # with both authority locks held. regularfile is a leaf that imports
+            # nothing of billet's above the standard library.
+            - github.com/junioryono/billet/internal/regularfile$
             # A service manager is asked about the host through syscalls the
             # standard library does not wrap: the launchd backend needs
             # unix.Access to answer "can this account write here" WITHOUT

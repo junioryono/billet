@@ -51,8 +51,9 @@ type identityIntent struct {
 }
 
 // identityAccessWait is the bound an operator command waits for a held lock
-// before it says who holds it.
-const identityAccessWait = 30 * time.Second
+// before it says who holds it. A variable so a test can shorten the wait it
+// proves; production reads the constant value.
+var identityAccessWait = 30 * time.Second
 
 // heldAccesses is every identity access this process holds, by cleaned
 // directory, so a ledger factory reached by a command that already holds the
