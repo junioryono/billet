@@ -615,11 +615,16 @@ EOF
 	# TOOLSET_PACKAGES is what a WORKFLOW expects, taken from GitHub's own
 	# declaration and never edited here. Editing it is how the two images diverge
 	# silently, which is exactly the gap this work exists to close.
+	# apparmor and python3-apt are on the hosted image and were installed by every
+	# CI job on this fleet that needed them, which reached the archive from every
+	# guest: one more dependency on a mirror that was unreachable for hours on
+	# 2026-09-11, and one more set of sessions on an uplink the fleet shares with
+	# everything else at its site.
 	local billet_packages=(
 		ca-certificates curl iproute2 iptables jq git sudo dnsmasq-base
 		docker.io docker-buildx docker-compose-v2 e2fsprogs util-linux
 		systemd-resolved netplan.io libicu74 zstd rsync build-essential
-		python3-pip python3-venv python3-dev
+		python3-pip python3-venv python3-dev apparmor python3-apt
 	)
 
 	local github_packages=()
@@ -662,6 +667,26 @@ apt-get install -y --no-install-recommends "$@"
 apt-get clean
 rm -rf /var/lib/apt/lists/*
 APT
+
+	# THE SHIPPED IMAGE FETCHES OVER HTTPS FROM TWO MIRRORS, EVERY ATTEMPT BOUNDED.
+	# A deb822 source with two URIs fails over PER REQUEST: measured on a fleet
+	# guest 2026-09-11, with the first URI black-holed and a 5 s timeout, the index
+	# fetch moved to the second mirror after the timeout and a package install took
+	# 2 s from it (apt's mirror+file method, by contrast, moves only off a mirror
+	# that is wholly unreachable, and Acquire::Retries retries the same URI). The
+	# build bootstraps over plain HTTP because minbase carries no CA bundle until
+	# the transaction above installs ca-certificates. Why two: the same day, every
+	# archive.ubuntu.com address refused port 80 from three unrelated networks for
+	# hours, two answered nothing on 443 either, and a job's apt sat 30 s per attempt
+	# on one of those. A rewrite the grep does not confirm is a build that would
+	# ship the old source under a new comment.
+	sed -i 's,^URIs: .*$,URIs: https://archive.ubuntu.com/ubuntu/ https://mirrors.edge.kernel.org/ubuntu/,' "$rootfs/etc/apt/sources.list.d/ubuntu.sources"
+	grep -q '^URIs: https://archive.ubuntu.com/ubuntu/ https://mirrors.edge.kernel.org/ubuntu/$' "$rootfs/etc/apt/sources.list.d/ubuntu.sources"
+	install -m 0644 /dev/stdin "$rootfs/etc/apt/apt.conf.d/90billet-fetch" <<'APTCONF'
+Acquire::Retries "3";
+Acquire::http::Timeout "30";
+Acquire::https::Timeout "30";
+APTCONF
 
 	# break-system-packages, exactly as runner-images writes it on 24.04, so a
 	# workflow that `pip install`s against the system python succeeds here as it does

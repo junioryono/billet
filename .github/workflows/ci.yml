@@ -82,7 +82,12 @@ jobs:
       # kernel it refuses a host without apparmor_parser. The hosted image has
       # it; the fleet's guest image does not yet.
       - name: Install the AppArmor tools the vendored kernel checker grades
+        # A guest image that already carries the package never reaches the archive:
+        # the fleet's uplink is shared with everything else at its site, and every
+        # apt call from a job is one more dependency on a mirror and one more
+        # session on that uplink.
         run: |
+          dpkg -s apparmor >/dev/null 2>&1 && { echo "apparmor already installed"; exit 0; }
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends apparmor
 
@@ -302,6 +307,7 @@ jobs:
       # The hosted image carries it; the fleet's guest image does not yet.
       - name: Install python3-apt for the apt module's check mode
         run: |
+          dpkg -s python3-apt >/dev/null 2>&1 && { echo "python3-apt already installed"; exit 0; }
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends python3-apt
 
