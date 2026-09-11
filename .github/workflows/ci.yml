@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: billet-ci-16vcpu-ubuntu-2404
     # THIS JOB RUNS THE SUITE TWICE AND TALKS TO TWO REAL SERVICES, so it is the
     # one job whose runtime is not mostly Go. `-race -covermode=atomic` over the
     # whole tree, against a real Docker daemon for internal/e2e and a real
@@ -77,6 +77,15 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      # moby's check-config.sh, which the kernel gate runs for real on Linux,
+      # grades the HOST as well as the config: with AppArmor enabled in the
+      # kernel it refuses a host without apparmor_parser. The hosted image has
+      # it; the fleet's guest image does not yet.
+      - name: Install the AppArmor tools the vendored kernel checker grades
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends apparmor
+
       # -race matters more than usual here: the control plane is a capacity
       # allocator with concurrent scale-set listeners, and a data race in that
       # code double-admits jobs onto a machine that cannot hold them.
@@ -87,7 +96,36 @@ jobs:
         # against go test's default of 600s. The job's own timeout-minutes still
         # bounds the whole run; this only stops one package that is legitimately
         # slow from being reported as hung.
-        run: go test -race -count=1 -timeout 20m -coverprofile=coverage.out -covermode=atomic ./...
+        #
+        # -json through jq so the log reads as it always did and the events
+        # are kept for the ranking below: the run's floor is one package's
+        # wall clock, and a per-test ranking is how it is shortened rather
+        # than guessed at. `fromjson?` lets a build error's plain line through.
+        run: |
+          set -o pipefail
+          go test -race -count=1 -timeout 20m -coverprofile=coverage.out -covermode=atomic -json ./... \
+            | tee test-output.json \
+            | jq -R -j 'fromjson? | select(.Output != null) | .Output'
+
+      - name: Report the slowest tests
+        if: always()
+        run: |
+          if [ ! -s test-output.json ]; then
+            echo "no test-output.json: the test step did not get far enough to produce one"
+            exit 0
+          fi
+          {
+            echo "### 25 slowest tests"
+            echo
+            echo '```'
+            jq -r 'select(.Action == "pass" or .Action == "fail")
+                   | select(.Test != null and .Elapsed != null)
+                   | [.Elapsed, .Package, .Test] | @tsv' test-output.json \
+              | sort -rn \
+              | head -25 \
+              | awk -F'\t' '{ sub("github.com/junioryono/billet/", "", $2); printf "%8.2fs  %s  %s\n", $1, $2, $3 }'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # THE CAPACITY SUITE AGAIN, AGAINST THE OTHER ENGINE.
       #
@@ -128,8 +166,8 @@ jobs:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
   lint:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    runs-on: billet-ci-8vcpu-ubuntu-2404
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v6
 
@@ -155,34 +193,31 @@ jobs:
       - name: Run billet's own analyzers
         run: make lint-custom
 
-  # The committed query code must be what sqlc produces from the query files AND
-  # the migrations, because sqlc reads the migration history rather than a
-  # flattened schema — so adding a migration can change generated code.
-  #
-  # ITS OWN JOB, AND HERE RATHER THAN IN `make check`: the generated code is
-  # committed precisely so an ordinary build never downloads sqlc, and CI runs
-  # build/vet/test/lint individually rather than the composite target, so a gate
-  # added to `check` alone runs on nobody's machine but the author's.
-  sqlc:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v6
+      # Every platform a node runs on, in one job rather than three: nodes are
+      # deployed by copying one static file, and a build-tag mistake shows up
+      # here before it does on a Mac mini. `make cross` is the loop a developer
+      # runs, so the two cannot disagree about the target list.
+      - name: Build every platform a node can run on
+        run: make cross
 
-      - uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          cache: true
-
-      # Version pinned exactly and read from the Makefile, the way golangci-lint
-      # and goreleaser are: this step compares committed output against what one
-      # specific sqlc generates, so `@latest` means a new sqlc release fails an
-      # unrelated PR that touched no SQL.
+      # The committed query code must be what sqlc produces from the query files
+      # AND the migrations, because sqlc reads the migration history rather than
+      # a flattened schema, so adding a migration can change generated code. The
+      # generated code is committed precisely so an ordinary build never
+      # downloads sqlc, which is why this is a CI step and not part of `make
+      # check`. The version is pinned exactly and read from the Makefile, the way
+      # golangci-lint and goreleaser are: `@latest` would mean a new sqlc release
+      # fails an unrelated PR that touched no SQL.
       - name: Prove the committed queries are what sqlc generates
         run: |
           version=$(make --no-print-directory print-sqlc-version)
           go install "github.com/sqlc-dev/sqlc/cmd/sqlc@$version"
           sqlc diff
+
+      # A control plane that holds a GitHub App key and terminates TLS should
+      # not ship with known-vulnerable dependencies.
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
   # A broken release config should fail on the PR that broke it, not at the
   # moment somebody presses the release button. `check` is cheap — it parses and
@@ -197,7 +232,7 @@ jobs:
   # it is actually about, and `go install` fetches through proxy.golang.org,
   # which is a cache rather than a redirect to the same CDN.
   release-config:
-    runs-on: ubuntu-latest
+    runs-on: billet-ci-2vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
@@ -228,11 +263,20 @@ jobs:
         run: make module-sources
 
   host-lifecycle:
-    runs-on: ubuntu-latest
+    runs-on: billet-ci-8vcpu-ubuntu-2404
     # Sized from what the gates measurably take: the run was cancelled at 15
     # minutes after the two connector gates and the fleet gate joined it
     # (measured 2026-09-06, 15m03s with every gate green until the cap).
     timeout-minutes: 30
+    # THE COLLECTION'S GATES RUN WITH NO RUNNER_NAME, which every gate but the
+    # guard's own assumes (converge-guard-check.sh says so, and sets the name
+    # it tests itself): their plays converge the throwaway machine the job runs
+    # on, and the converge guard refuses a play driven from a runner named
+    # billet-*, which on the reference deployment's fleet every runner is.
+    # RUNNER_* variables cannot be overridden by env:, so the shell drops it.
+    defaults:
+      run:
+        shell: env -u RUNNER_NAME bash -e {0}
     steps:
       - uses: actions/checkout@v6
 
@@ -252,6 +296,21 @@ jobs:
           # modules even for tasks a controller-only run skips), so bare
           # ansible-core is not enough.
           ansible-galaxy collection install "ansible.posix:$(cat ansible_collections/junioryono/billet/tests/ansible-posix-version)"
+
+      # The check-mode scenario pins /usr/bin/python3, and the apt module in
+      # check mode needs python3-apt there (a real run installs it itself).
+      # The hosted image carries it; the fleet's guest image does not yet.
+      - name: Install python3-apt for the apt module's check mode
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-apt
+
+      # The emitted-block and hybrid-emission gates build billet to render what
+      # they check; the hosted image had a Go on PATH, the guest has none.
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
 
       - name: Exercise alert ownership migration and teardown
         run: make alert-lifecycle
@@ -373,7 +432,7 @@ jobs:
   # phony and runs again for the second target, but the Go build cache is warm
   # by then and it costs about a minute.
   package-lifecycle:
-    runs-on: ubuntu-latest
+    runs-on: billet-ci-8vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
@@ -420,7 +479,7 @@ jobs:
     # configured against a name that embeds the pin would silently stop being
     # satisfied on the next version bump.
     name: terraform (${{ matrix.label }})
-    runs-on: ubuntu-latest
+    runs-on: billet-ci-2vcpu-ubuntu-2404
     timeout-minutes: 15
     strategy:
       fail-fast: false
@@ -451,6 +510,14 @@ jobs:
           # plain `make` invocations; these jobs only need the real binary.
           terraform_wrapper: false
 
+      # Before the classification gate below, which is a Go program: on the
+      # hosted image a Go happened to be on PATH already, and on the fleet's
+      # guest nothing is until this step runs.
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
       - name: Format, validate, and plan-test the module
         run: |
           make tf-fmt-check
@@ -480,11 +547,6 @@ jobs:
       # The root `billet init hybrid` writes is HCL rendered as text, and only
       # terraform can read it: a module input renamed on one side and not the
       # other passes every Go test and fails an operator's first init.
-      - uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          cache: true
-
       - name: Prove the generated hybrid root validates against the module
         run: make hybrid-root-check
 
@@ -494,7 +556,7 @@ jobs:
   # consumer floor would be an untested claim that rots. It validates exactly
   # what a consumer resolves: the module sources without tests.
   terraform-consumer-floor:
-    runs-on: ubuntu-latest
+    runs-on: billet-ci-2vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
@@ -527,7 +589,7 @@ jobs:
   # Versions are read from the Makefile, the way goreleaser's is, so the
   # workflow and `make tf-lint`/`make tf-scan` cannot drift apart.
   terraform-lint:
-    runs-on: ubuntu-latest
+    runs-on: billet-ci-2vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
@@ -559,19 +621,6 @@ jobs:
       - name: trivy config scan (ignores are justified in .trivyignore)
         run: make tf-scan
 
-  # A control plane that holds a GitHub App key and terminates TLS should not
-  # ship with known-vulnerable dependencies.
-  vuln:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          cache: true
-      - run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
-
   # THE ACCEPTANCE-SIZE REPLAY, IN A JOB OF ITS OWN. internal/replay drives a
   # trace of job arrivals through the real listener, allocator, placer and node
   # wire over the simulated backend; the suite in the test job replays three
@@ -581,7 +630,7 @@ jobs:
   # test job's cap on a runner (measured 2026-09-05), and the race detector's
   # value is already spent on the same code by the three-hundred-job run there.
   replay:
-    runs-on: ubuntu-latest
+    runs-on: billet-ci-8vcpu-ubuntu-2404
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
@@ -593,39 +642,11 @@ jobs:
         env:
           BILLET_REPLAY_JOBS: "2000"
 
-  # The binary must build for every platform a node can run on, since nodes are
-  # deployed by copying one static file. Cross-compilation is the cheapest way to
-  # catch a build-tag mistake before someone hits it on a Mac mini.
-  cross-build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { goos: linux, goarch: amd64 }
-          - { goos: linux, goarch: arm64 }
-          - { goos: darwin, goarch: arm64 }
-    steps:
-      - uses: actions/checkout@v6
-
-      - uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          cache: true
-
-      - name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: "0"
-        run: go build -o /dev/null ./cmd/billet
-
   # The Sphinx build that Read the Docs runs, with warnings as errors, so a
   # broken cross-reference or a page missing from the toctree fails here rather
   # than publishing.
   docs:
-    runs-on: ubuntu-latest
+    runs-on: billet-ci-2vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v6
         with:
@@ -649,21 +670,18 @@ jobs:
   # required check blocks the merge with nothing saying why.
   verify-all-checks:
     name: Verify All Checks Passed
-    runs-on: ubuntu-latest
+    runs-on: billet-ci-2vcpu-ubuntu-2404
     needs:
       [
         test,
         lint,
-        sqlc,
         release-config,
         host-lifecycle,
         package-lifecycle,
         terraform,
         terraform-consumer-floor,
         terraform-lint,
-        vuln,
         replay,
-        cross-build,
         docs,
       ]
     if: always()
