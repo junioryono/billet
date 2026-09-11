@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"syscall"
 	"time"
 
 	"github.com/junioryono/billet/internal/config"
@@ -121,8 +122,12 @@ func readRegistrationRecord(path string) registrationEvidence {
 	switch {
 	case errors.Is(err, os.ErrNotExist) && !errors.Is(err, regularfile.ErrReopen):
 		return registrationEvidence{why: "no registration record at " + path}
-	case errors.Is(err, regularfile.ErrNotRegular):
-		return registrationEvidence{why: fmt.Sprintf("the registration record %s: %v", path, err), invalid: true}
+	case errors.Is(err, regularfile.ErrNotRegular) || errors.Is(err, syscall.ELOOP):
+		// A link at the name is invalid on every platform: Linux admits its
+		// identity and the regular-file rule refuses it, a Mac's O_NOFOLLOW
+		// open answers ELOOP.
+		return registrationEvidence{why: fmt.Sprintf("the registration record %s is not a regular file: %v", path, err),
+			invalid: true}
 	case err != nil:
 		return registrationEvidence{why: fmt.Sprintf("open the registration record %s: %v", path, err), unreadable: true}
 	}
@@ -291,6 +296,7 @@ func decodeRegistrationRecord(body []byte) (*registrationRecord, error) {
 type registrationIdentity struct {
 	node, deployment string
 	why              string
+	absent           bool // the deployment is positively unminted, not unread
 }
 
 // expectedRegistrationIdentity derives the identity from the configuration
@@ -341,7 +347,8 @@ func expectedRegistrationIdentity(cfg *config.Config) registrationIdentity {
 	case err != nil:
 		return registrationIdentity{why: fmt.Sprintf("read the deployment identity in %s: %v", dir, err)}
 	case !found:
-		return registrationIdentity{why: "no deployment identity is minted in " + dir + ", so the record's deployment cannot be judged"}
+		return registrationIdentity{why: "no deployment identity is minted in " + dir + ", so the record's deployment cannot be judged",
+			absent: true}
 	}
 
 	id.deployment = deployment

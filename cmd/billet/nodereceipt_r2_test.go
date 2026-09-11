@@ -539,13 +539,14 @@ func TestRegistrationTimeoutSpeaksFromACompletedSnapshot(t *testing.T) {
 		l.register(t, "node-a", regIncarnationOld)
 
 		// THE FIRST POLL COMPLETES AT ONCE from a snapshot the seam answers,
-		// the sleep between polls outlasts the wait, and the identity vanishes
-		// during that sleep: the timeout speaks from the completed poll, and
-		// no second poll examines the missing identity.
-		prevPoll := endpointPoll
-		endpointPoll = time.Second
+		// the sleep between polls returns only once the wait has expired (a
+		// scheduling delay past the deadline), and the identity vanishes
+		// during that sleep: the loop's own expiry judgement answers from the
+		// completed poll, and no second poll examines the missing identity.
+		prevSleep := registrationSleep
+		registrationSleep = func(ctx context.Context, _ time.Duration) { <-ctx.Done() }
 
-		t.Cleanup(func() { endpointPoll = prevPoll })
+		t.Cleanup(func() { registrationSleep = prevSleep })
 
 		polls := 0
 		prev := registrationPoll
@@ -741,4 +742,21 @@ func TestReceiptClosingChecksJudgeOwnershipAndMode(t *testing.T) {
 		o := f.refresh(t, f.rendering(endpointB))
 		mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonTrust)
 	})
+}
+
+// The refresh's dry run closes the process as the write does: a node found
+// stopping at the close is could-not-tell, never a prospective receipt.
+func TestReceiptDryRunClosesTheProcess(t *testing.T) {
+	f := newReceiptCmdFixture(t)
+	f.onRecordRead(t, 1, func() {
+		f.afterShows(t, f.calls(t, "show")+1,
+			nodeUnitBody("deactivating", "stop-sigterm", inspectPID, nodeInvocation, "mixed", "success"))
+	})
+
+	o := f.refresh(t, "", "--dry-run")
+	mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonProcess)
+
+	if !strings.Contains(o.str("why"), "deactivating at the close") {
+		t.Errorf("why %q", o.str("why"))
+	}
 }

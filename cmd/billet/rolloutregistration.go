@@ -148,6 +148,15 @@ func cmdRolloutRegistration(ctx context.Context, args []string) error {
 
 // awaitRegistration polls until the node's row carries the incarnation and
 // is live, the ledger refuses, or the wait elapses.
+// registrationSleep is the pause between polls, ended early by the context;
+// the loop judges expiry when it returns, so the sleep decides nothing.
+var registrationSleep = func(ctx context.Context, d time.Duration) {
+	select {
+	case <-ctx.Done():
+	case <-time.After(d):
+	}
+}
+
 func awaitRegistration(ctx context.Context, store *rollout.Store, cfg *config.Config, node, incarnation string,
 	wait time.Duration,
 ) (*registrationAnswer, *registrationTimeout, *endpointRefusal) {
@@ -245,13 +254,7 @@ func awaitRegistration(ctx context.Context, store *rollout.Store, cfg *config.Co
 			return nil, out, r
 		}
 
-		select {
-		case <-ctx.Done():
-			out, r := timeout()
-
-			return nil, out, r
-		case <-time.After(2 * endpointPoll):
-		}
+		registrationSleep(ctx, 2*endpointPoll)
 	}
 }
 

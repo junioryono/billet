@@ -218,7 +218,12 @@ func migrateEndpoint(ctx context.Context, m migrateMode) (any, *endpointRefusal)
 	identity := identityFor(installed.cfg, cfgOf(renderingCfg))
 
 	if installedHasNode && renderedHasNode {
-		if problem := sameNodeIdentity(installed, rendering); problem != "" {
+		problem, unknown := sameNodeIdentity(installed, rendering)
+		if unknown != "" {
+			return nil, endpointUnknown(endpointReasonConfig, unknown, "", stateNothing)
+		}
+
+		if problem != "" {
 			return nil, endpointRefuse(endpointReasonDesired, problem, "", stateNothing)
 		}
 	}
@@ -702,32 +707,45 @@ func cfgOf(r *configObservationLite) *config.Config {
 	return r.cfg
 }
 
-// sameNodeIdentity refuses a rendering whose node is not the installed one.
-func sameNodeIdentity(installed *installedConfigObservation, rendering *configObservationLite) string {
+// sameNodeIdentity refuses a rendering whose node is not the installed one: the
+// refusal first, then the could-not-tell reason when an identity did not read.
+func sameNodeIdentity(installed *installedConfigObservation, rendering *configObservationLite) (string, string) {
 	// THE CONFIGURED NAMES FIRST: two names both known and unequal disagree
-	// whatever the deployment says, and a deployment that cannot be derived
-	// (no identity minted on a stopped certless host) hides nothing.
+	// whatever the deployment says.
 	if ia, ib := installed.cfg.Node.Name, rendering.cfg.Node.Name; ia != "" && ib != "" && ia != ib {
-		return fmt.Sprintf("the rendering names the node %q and the installed configuration %q", ib, ia)
+		return fmt.Sprintf("the rendering names the node %q and the installed configuration %q", ib, ia), ""
 	}
 
 	a := expectedRegistrationIdentity(installed.cfg)
 	b := expectedRegistrationIdentity(rendering.cfg)
 
-	if a.why != "" || b.why != "" {
-		return ""
+	// AN IDENTITY THAT COULD NOT BE READ IS COULD-NOT-TELL: a certificate or
+	// an identity file that failed to read establishes neither the node nor
+	// the deployment. A deployment positively unminted (a stopped certless
+	// host) hides nothing, and only that is admitted.
+	for _, side := range []struct {
+		which string
+		id    registrationIdentity
+	}{{"installed", a}, {"rendering", b}} {
+		if side.id.why != "" && !side.id.absent {
+			return "", "the " + side.which + " configuration's node identity: " + side.id.why
+		}
+	}
+
+	if a.absent || b.absent {
+		return "", ""
 	}
 
 	if a.node != b.node {
-		return fmt.Sprintf("the rendering names the node %q and the installed configuration %q", b.node, a.node)
+		return fmt.Sprintf("the rendering names the node %q and the installed configuration %q", b.node, a.node), ""
 	}
 
 	if a.deployment != b.deployment {
 		return fmt.Sprintf("the rendering names the deployment %s and the installed configuration %s", b.deployment,
-			a.deployment)
+			a.deployment), ""
 	}
 
-	return ""
+	return "", ""
 }
 
 func configWord(present bool) string {

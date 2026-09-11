@@ -417,15 +417,24 @@ type bracketedRecord struct {
 	running bool
 }
 
+// recordWaitEndedUnderMove is the problem a bracket answers when the unit
+// moved under its read and the wait ended before it could read again.
+const recordWaitEndedUnderMove = "the wait ended while the unit moved under the read of its record"
+
 // readRecordUnderBracket reads the running node's record inside a bracket of
 // unit observations: the unit observed, the record read, the unit observed
 // again, and the read kept only when the two observations agree on the
 // process; a unit that moved is retried, three attempts, then could-not-tell.
-// It answers running=false for a unit positively not running (no record
+// A retry is a bracket too, and none starts after a non-zero deadline. It
+// answers running=false for a unit positively not running (no record
 // consulted), a problem for an observation that could not decide, and the
 // record's class otherwise.
-func readRecordUnderBracket(ctx context.Context, insp *lifeops.Inspector, unit string, identity registrationIdentity) (bracketedRecord, string) {
-	for range bracketAttempts {
+func readRecordUnderBracket(ctx context.Context, insp *lifeops.Inspector, unit string, identity registrationIdentity, deadline time.Time) (bracketedRecord, string) {
+	for attempt := range bracketAttempts {
+		if attempt > 0 && !deadline.IsZero() && time.Now().After(deadline) {
+			return bracketedRecord{}, recordWaitEndedUnderMove
+		}
+
 		before, problem := observeUnit(ctx, insp, unit)
 		if problem != "" {
 			return bracketedRecord{}, problem
@@ -487,7 +496,11 @@ func waitForRecord(ctx context.Context, insp *lifeops.Inspector, unit string, id
 			return last, true, ""
 		}
 
-		br, problem := readRecordUnderBracket(ctx, insp, unit, identity)
+		br, problem := readRecordUnderBracket(ctx, insp, unit, identity, deadline)
+		if problem == recordWaitEndedUnderMove && last.obs.ActiveState != "" {
+			return last, true, ""
+		}
+
 		if problem != "" {
 			return bracketedRecord{}, false, problem
 		}

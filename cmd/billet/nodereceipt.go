@@ -219,7 +219,7 @@ func writeReceiptFromEvidence(ctx context.Context, m receiptMode) (any, *endpoin
 	insp := endpointInspector()
 	identity := expectedRegistrationIdentity(installed.cfg)
 
-	br, problem := readRecordUnderBracket(ctx, insp, nodeUnit, identity)
+	br, problem := readRecordUnderBracket(ctx, insp, nodeUnit, identity, time.Time{})
 	if problem != "" {
 		return nil, endpointUnknown(endpointReasonRecord, problem, "", "")
 	}
@@ -377,6 +377,10 @@ func refreshReceipt(ctx context.Context, m receiptMode) (any, *endpointRefusal) 
 			return nil, endpointUnknown(endpointReasonConfig, problem, "", "")
 		}
 
+		if r := closeProcess(ctx, insp, br.obs); r != nil {
+			return nil, r
+		}
+
 		rec.WrittenAt = receiptNow().UTC().Format(time.RFC3339Nano)
 
 		return receiptAnswer{Schema: endpointSchema, Outcome: outcomeReported, Receipt: &rec,
@@ -384,6 +388,26 @@ func refreshReceipt(ctx context.Context, m receiptMode) (any, *endpointRefusal) 
 	}
 
 	return publishReceipt(ctx, insp, installed, br, rec, true)
+}
+
+// closeProcess re-observes the node immediately before a receipt is written
+// or reported: the process must be the one the record was read from, running
+// and not stopping, in the dry run as in the write.
+func closeProcess(ctx context.Context, insp *lifeops.Inspector, read unitObservation) *endpointRefusal {
+	closing, problem := observeUnit(ctx, insp, nodeUnit)
+	if problem != "" {
+		return endpointUnknown(endpointReasonProcess, "at the close: "+problem, "", "")
+	}
+
+	if _, running, problem := runningPID(closing); problem != "" || !running || processMoved(read, closing) ||
+		closing.ActiveState == "deactivating" {
+		return endpointUnknown(endpointReasonProcess, fmt.Sprintf("the node moved before the receipt could be "+
+			"written (pid %s, invocation %s, %s at the close; pid %s, invocation %s when its record was read)",
+			closing.MainPID, closing.InvocationID, closing.ActiveState, read.MainPID, read.InvocationID),
+			"converge again", "")
+	}
+
+	return nil
 }
 
 // publishReceipt is the write both modes end in: the directory established
@@ -527,17 +551,8 @@ func publishReceipt(ctx context.Context, insp *lifeops.Inspector, installed *ins
 		return nil, endpointUnknown(endpointReasonConfig, problem, "", "")
 	}
 
-	closing, problem := observeUnit(ctx, insp, nodeUnit)
-	if problem != "" {
-		return nil, endpointUnknown(endpointReasonProcess, "at the close: "+problem, "", "")
-	}
-
-	if _, running, problem := runningPID(closing); problem != "" || !running || processMoved(br.obs, closing) ||
-		closing.ActiveState == "deactivating" {
-		return nil, endpointUnknown(endpointReasonProcess, fmt.Sprintf("the node moved before the receipt could be "+
-			"written (pid %s, invocation %s, %s at the close; pid %s, invocation %s when its record was read)",
-			closing.MainPID, closing.InvocationID, closing.ActiveState, br.obs.MainPID, br.obs.InvocationID),
-			"converge again", "")
+	if r := closeProcess(ctx, insp, br.obs); r != nil {
+		return nil, r
 	}
 
 	// THE SHORTCUT: a valid receipt already saying this is left alone, its

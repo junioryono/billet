@@ -645,7 +645,7 @@ func TestReleaseInspectRegistrationValidity(t *testing.T) {
 		other := filepath.Join(f.dir, "elsewhere.json")
 		writeFile(t, other, string(valid)+"\n", 0o600)
 		mustOK(t, os.Symlink(other, f.recordPath))
-		mustUnknown(t, "host.registration", f.report(t).Host.Registration, "open the registration record")
+		mustUnknown(t, "host.registration", f.report(t).Host.Registration, "not a regular file")
 	})
 
 	t.Run("a symlink at the directory", func(t *testing.T) {

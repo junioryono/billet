@@ -284,15 +284,27 @@ func TestMigrateRecordWaitsBeforeAndAfterTheStart(t *testing.T) {
 		f.afterStop(t, "inactive", "dead", "success")
 		f.afterStart(t)
 
-		// The fake's start publishes nothing; the record arrives a little
-		// after the start was recorded.
-		f.afterCall(t, "start", 40*time.Millisecond, func() {
-			f.writeRecord(t, f.record(map[string]any{"deployment": f.deployment, "endpoint": canonicalB,
-				"invocation_id": newInvocation, "incarnation": newIncarnation}))
-		})
+		// The fake's start publishes nothing; the record is published after
+		// the first post-start read found none (the judgement's read is the
+		// first), so the wait must read again to see it.
+		reads := 0
+		prev := inspectAfterRecordRead
+		inspectAfterRecordRead = func() {
+			reads++
+			if reads == 2 {
+				f.writeRecord(t, f.record(map[string]any{"deployment": f.deployment, "endpoint": canonicalB,
+					"invocation_id": newInvocation, "incarnation": newIncarnation}))
+			}
+		}
+
+		t.Cleanup(func() { inspectAfterRecordRead = prev })
 
 		o := f.migrate(t, f.rendering(endpointB), "--wait", "3s")
 		mustEndpointOutcome(t, o, outcomeMigrated)
+
+		if reads < 3 {
+			t.Errorf("%d record reads; the record published after the first post-start read must take another", reads)
+		}
 	})
 
 	t.Run("the record appearing before the decision", func(t *testing.T) {

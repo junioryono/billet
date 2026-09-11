@@ -213,8 +213,10 @@ func TestMigrateRefusesAnUnchangedAnswerWhoseNodeNameCannotBeResolved(t *testing
 	o := f.migrate(t, string(body))
 	mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonConfig)
 
-	if !strings.Contains(o.str("why"), "effective name") {
-		t.Errorf("why %q", o.str("why"))
+	// The identity comparison reads the certificate first and answers the
+	// same could-not-tell; either wording names the failed read.
+	if why := o.str("why"); !strings.Contains(why, "effective name") && !strings.Contains(why, "node identity") {
+		t.Errorf("why %q", why)
 	}
 }
 
@@ -322,6 +324,53 @@ func TestMigrateDoesNotReadAnIncompleteProbeAsPreR(t *testing.T) {
 	mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonRecord)
 
 	if !strings.Contains(o.str("why"), "within its bound") {
+		t.Errorf("why %q", o.str("why"))
+	}
+}
+
+// A retry of a bracket the unit moved under is a bracket too, and none
+// starts after the wait: a record published while the first bracket ran
+// past the deadline is not read by a second.
+func TestMigrateRetriesNoBracketAfterTheWait(t *testing.T) {
+	t.Helper()
+	f := newEndpointFixture(t)
+	f.rBinary(t)
+	mustOK(t, os.Remove(f.recordPath))
+
+	f.onRecordRead(t, 1, func() {
+		n := f.calls(t, "show")
+		f.showsBetween(t, n, n+1, nodeUnitBody("active", "running", 9999, newInvocation, "mixed", "success"))
+		time.Sleep(120 * time.Millisecond)
+		f.writeRecord(t, f.record(map[string]any{"deployment": f.deployment, "endpoint": canonicalA}))
+	})
+
+	o := f.migrate(t, f.rendering(endpointB), "--dry-run", "--wait", "50ms")
+	mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonUnit)
+
+	if !strings.Contains(o.str("why"), "the wait ended while the unit moved") {
+		t.Errorf("why %q", o.str("why"))
+	}
+}
+
+// A rendering whose identity cannot be read (no name, and a certificate
+// that does not read) establishes nothing, and the answer is could-not-tell
+// rather than a plan over an unexamined identity.
+func TestMigrateAnUnreadableRenderingIdentityIsUnknown(t *testing.T) {
+	t.Helper()
+	f := newEndpointFixture(t)
+
+	dir := t.TempDir()
+	tls := "  tls:\n    cert: " + dir + "\n    key: " + dir + "/node.key\n    ca: " + dir + "/ca.crt\n"
+	base := f.rendering("10.9.0.2:7719")
+
+	if strings.Count(base, "  name: node-a\n") != 1 {
+		t.Fatalf("the rendering does not name the node once:\n%s", base)
+	}
+
+	o := f.migrate(t, strings.Replace(base, "  name: node-a\n", tls, 1), "--dry-run")
+	mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonConfig)
+
+	if !strings.Contains(o.str("why"), "rendering configuration's node identity") {
 		t.Errorf("why %q", o.str("why"))
 	}
 }
