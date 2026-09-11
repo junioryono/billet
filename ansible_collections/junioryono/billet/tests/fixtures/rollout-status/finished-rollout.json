@@ -30,6 +30,7 @@
       "release": "v0.9.4"
     }
   ],
+  "retirement": null,
   "rollout": {
     "channel": "stable",
     "controller_phase": "committed",

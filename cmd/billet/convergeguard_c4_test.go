@@ -422,8 +422,9 @@ func TestATakeoverProvesTheRolesTransactionCompleteWithoutLoadingIt(t *testing.T
 
 		got := f.record(t)
 		rec.Holder = "ci-2"
+		rec.TakenOverFrom = []string{"ci-1"}
 
-		if got != rec {
+		if !reflect.DeepEqual(got, rec) {
 			t.Errorf("after the takeover the record is %+v, want %+v", got, rec)
 		}
 
@@ -598,7 +599,7 @@ func TestTheRolesManifestIsJudgedMemberByMember(t *testing.T) {
 				t.Fatalf("%s: err = %v, want %q", name, err, c.words)
 			}
 
-			if got := f.record(t); got != rec {
+			if got := f.record(t); !reflect.DeepEqual(got, rec) {
 				t.Errorf("%s: the record changed to %+v", name, got)
 			}
 		})
@@ -662,6 +663,12 @@ func TestTheGuardStatusFixturesAreTheCommandsOwn(t *testing.T) {
 			t.Helper()
 
 			mustOK(t, guardRun(t, "hold", "--holder", "ci-1", "--note", "kernel patch, back by 15:00"))
+		},
+		"retirement-marker": func(t *testing.T, f *guardFixture) {
+			t.Helper()
+
+			mustHold(t, "ci-2")
+			markGuard(t, f, &guardTransition{Kind: transitionRetirement, ID: markerID}, []string{"ci-1"})
 		},
 		"healthy-with-pointer": func(t *testing.T, f *guardFixture) {
 			t.Helper()

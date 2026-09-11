@@ -429,6 +429,10 @@ type StatusSnapshot struct {
 	Rollout       *Rollout
 	Nodes         []Node
 	Registrations []Registration
+	// Retirement is the bound deployment's controller-retirement row, nil when
+	// the ledger holds none (or is unbound, since the row is keyed by the
+	// deployment the binding names).
+	Retirement *state.Retirement
 }
 
 // snapshotReads is a seam a test uses to stand a failing read in for one of
@@ -498,6 +502,17 @@ func (s *Store) StatusSnapshot(ctx context.Context) (StatusSnapshot, error) {
 		}
 
 		out.Registrations = registrations
+
+		if out.Binding != "" {
+			row, present, err := state.ReadRetirementIn(ctx, reads, out.Binding)
+			if err != nil {
+				return fmt.Errorf("rollout: read the deployment's retirement row: %w", err)
+			}
+
+			if present {
+				out.Retirement = &row
+			}
+		}
 
 		return nil
 	})

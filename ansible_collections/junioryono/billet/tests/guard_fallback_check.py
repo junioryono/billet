@@ -238,6 +238,17 @@ def main():
     content_cases.append(("a digest with a trailing newline", dict(valid, release_executable_sha256="a" * 64 + "\n"), "not 64 lowercase hex"))
     content_cases.append(("a token without an id", dict(valid, token="0123456789abcdef0123456789abcdef", preparing=True), "without an id"))
     content_cases.append(("preparing without an id", dict(valid, preparing=False), "without an id"))
+    # THE RETIREMENT MARKER AND THE TAKEOVER CHAIN, typed when present.
+    good_id = "0123456789abcdef0123456789abcdef"
+    content_cases.append(("a transition of another kind", dict(valid, id=good_id, transition={"kind": "upgrade", "id": good_id}), "retirement marker"))
+    content_cases.append(("a transition without an id", dict(valid, id=good_id, transition={"kind": "retirement"}), "retirement marker"))
+    content_cases.append(("a transition with a short id", dict(valid, id=good_id, transition={"kind": "retirement", "id": "abc"}), "retirement marker"))
+    content_cases.append(("a transition with an extra member", dict(valid, id=good_id, transition={"kind": "retirement", "id": good_id, "phase": "done"}), "retirement marker"))
+    content_cases.append(("a transition that is a string", dict(valid, id=good_id, transition="retirement"), "retirement marker"))
+    content_cases.append(("an empty takeover chain", dict(valid, id=good_id, taken_over_from=[]), "non-empty list of holder names"))
+    content_cases.append(("a takeover chain with a blank", dict(valid, id=good_id, taken_over_from=["ci-1", ""]), "non-empty list of holder names"))
+    content_cases.append(("a takeover chain with a slash", dict(valid, id=good_id, taken_over_from=["ci/1"]), "non-empty list of holder names"))
+    content_cases.append(("a takeover chain that is a string", dict(valid, id=good_id, taken_over_from="ci-1"), "non-empty list of holder names"))
     for name, record, words in content_cases:
         with tempfile.TemporaryDirectory() as base:
             tree = Tree(base)

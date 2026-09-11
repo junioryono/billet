@@ -107,7 +107,13 @@ RECORD_MEMBERS = ("holder", "claimed_at", "hostname", "release_executable", "rel
 # judged as a string and never printed by this module.
 # `note` is the holder's one line, typed as the command types it: a non-empty
 # string of at most MAX_NOTE_BYTES with no control character.
-OPTIONAL_MEMBERS = {"id": "hex32", "token": "hex32", "preparing": "bool", "note": "note"}
+# `transition` is a retirement's marker (an object of exactly kind and id, the
+# kind "retirement", the id 32 hex), `taken_over_from` the non-empty list of
+# previous holders a takeover appends to; a record carrying either in another
+# shape is refused whole, as the command refuses it.
+OPTIONAL_MEMBERS = {"id": "hex32", "token": "hex32", "preparing": "bool", "note": "note",
+                    "transition": "transition", "taken_over_from": "holders"}
+_HOLDER_MAX_BYTES = 200
 MAX_NOTE_BYTES = 200
 # MATCHED WHOLE (fullmatch): `$` also matches before a final newline, so a
 # digest or an id followed by one passed here and was refused by the command.
@@ -303,6 +309,17 @@ def read_record(root, owner):
                     or "\ufffd" in value
                     or len(value.encode("utf-8", "surrogatepass")) > MAX_NOTE_BYTES):
                 raise Refusal("content", "%s: note is not one line of printable text" % record)
+        elif kind == "transition":
+            if (not isinstance(value, dict) or set(value) != {"kind", "id"}
+                    or value["kind"] != "retirement"
+                    or not isinstance(value["id"], str) or not _HEX32.fullmatch(value["id"])):
+                raise Refusal("content", "%s: transition is not a retirement marker with a 32-hex id" % record)
+        elif kind == "holders":
+            if (not isinstance(value, list) or not value
+                    or any(not isinstance(h, str) or h == "" or len(h.encode("utf-8", "surrogatepass")) > _HOLDER_MAX_BYTES
+                           or any(ch.isspace() or unicodedata.category(ch).startswith("C") or ch == "/" for ch in h)
+                           for h in value)):
+                raise Refusal("content", "%s: taken_over_from is not a non-empty list of holder names" % record)
         elif not isinstance(value, str) or not _HEX32.fullmatch(value):
             raise Refusal("content", "%s: %s is not 32 lowercase hex digits" % (record, name))
     # A RECORD FROM BEFORE THE PROTOCOL IS EXACTLY THE FIVE MEMBERS: a token or

@@ -239,13 +239,25 @@ func (t *timeline) refuseUnknownVersions(seen map[int]appliedMigration) error {
 	for v := range seen {
 		if _, ok := known[v]; !ok {
 			return fmt.Errorf(
-				"state database has migration %d, which this billet does not know about; "+
-					"it was written by a newer version", v)
+				"%w: state database has migration %d, which this billet does not know about",
+				ErrSchemaAhead, v)
 		}
 	}
 
 	return nil
 }
+
+// ErrSchemaAhead means the ledger carries a migration this binary does not have:
+// it was written by a newer billet, and the remedy is a newer binary.
+//
+// ITS OWN ERROR, DISTINCT FROM ErrSchemaBehind, because the two send an operator
+// in opposite directions: behind is a running plane holding a ledger that needs
+// migrating (restart it with this binary), ahead is this binary being the older
+// one. It is typed so a caller that must keep going on an older host, a retiring
+// controller completing its ledger row beside a survivor already upgraded, can
+// tell "wait for the newer controller to do this" from a fault it must refuse on.
+var ErrSchemaAhead = errors.New(
+	"state: the ledger was written by a newer billet than this one")
 
 // parseMigrations reads every migration out of fsys.
 //

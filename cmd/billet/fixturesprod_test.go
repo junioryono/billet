@@ -160,6 +160,24 @@ func TestTheRolloutStatusFixturesAreTheCommandsOwn(t *testing.T) {
 			t.Helper()
 			statusPlane(t, stateDir, func(*state.DB) {})
 		},
+		"retirement-reserved": func(t *testing.T, stateDir, deployment string) {
+			t.Helper()
+			statusPlane(t, stateDir, func(db *state.DB) {
+				if _, err := db.ClaimController(t.Context(), "billet-control-01", deployment); err != nil {
+					t.Fatal(err)
+				}
+
+				registerStatusNode(t, db, "node-a", "v0.9.4", statusDigestB, regIncarnationNew)
+
+				if _, _, err := db.ReserveRetirement(t.Context(), state.RetirementReservation{
+					Deployment: deployment, Retiring: "billet-control-01", Survivor: "billet-control-02",
+					Run: "ci-42", TransitionID: strings.Repeat("ab", 16),
+					At: time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC),
+				}); err != nil {
+					t.Fatal(err)
+				}
+			})
+		},
 	}
 
 	for name, plant := range shapes {

@@ -401,6 +401,10 @@ func cmdRolloutStatus(ctx context.Context, args []string) error {
 		return printRolloutStatusJSON(report)
 	}
 
+	if err := printRetirementRow(ctx, db); err != nil {
+		return err
+	}
+
 	current, err := store.Open(ctx)
 	if err != nil {
 		if !errors.Is(err, rollout.ErrNoRollout) {
@@ -504,6 +508,34 @@ func hostIsRegistered(ctx context.Context, a *alloc.Allocator, node string) (boo
 	}
 
 	return false, nil
+}
+
+// printRetirementRow says which controller of this deployment is retiring or
+// has retired, from the ledger's row, before the rollout is described: a
+// deployment with a `done` row has no survivor for a second retirement, and an
+// operator reading the rollout should see that first. Nothing is printed when
+// the ledger is unbound or holds no row; a read that fails is the command's
+// error, never a silent omission.
+func printRetirementRow(ctx context.Context, db *state.DB) error {
+	binding, err := db.DeploymentBinding(ctx)
+	if err != nil || binding == "" {
+		return err
+	}
+
+	row, present, err := db.ReadRetirement(ctx, binding)
+	if err != nil || !present {
+		return err
+	}
+
+	fmt.Printf("retirement %s -> %s is %s (transition %s, reserved %s by run %s)\n",
+		row.Retiring, row.Survivor, row.State, row.TransitionID, row.ReservedAt, row.Run)
+
+	if row.State == state.RetirementDone {
+		fmt.Printf("           completed by %s at %s; this deployment has no survivor for a second retirement\n",
+			row.CompletedBy, row.CompletedAt)
+	}
+
+	return nil
 }
 
 func printRolloutNodes(nodes []rollout.Node) {

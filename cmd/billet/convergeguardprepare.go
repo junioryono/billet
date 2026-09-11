@@ -178,6 +178,11 @@ type prepareAnswer struct {
 	// note on an acquisition, and the recorded one on every later answer,
 	// whatever note that call carried.
 	Note string `json:"note,omitempty"`
+	// Transition is the retirement marker the record carries, reported so the
+	// role dispatches to the retirement's own handling before anything
+	// ordinary; TakenOverFrom the chain of previous holders.
+	Transition    *guardTransition `json:"transition,omitempty"`
+	TakenOverFrom []string         `json:"taken_over_from,omitempty"`
 }
 
 // prepareRefusal is the answer of a refusal (exit 2) or of something that
@@ -200,18 +205,20 @@ type prepareReport struct {
 }
 
 type prepareDryGuard struct {
-	ID             *string       `json:"id"`
-	Holder         string        `json:"holder"`
-	ClaimedAt      string        `json:"claimed_at"`
-	Hostname       string        `json:"hostname"`
-	Preparing      bool          `json:"preparing"`
-	Record         prepareRecord `json:"record"`
-	RecordError    string        `json:"record_error,omitempty"`
-	Pointer        bool          `json:"pointer"`
-	PointerTarget  string        `json:"pointer_target,omitempty"`
-	PointerProblem string        `json:"pointer_problem,omitempty"`
-	StrayTemporary bool          `json:"stray_temporary"`
-	Note           string        `json:"note,omitempty"`
+	ID             *string          `json:"id"`
+	Holder         string           `json:"holder"`
+	ClaimedAt      string           `json:"claimed_at"`
+	Hostname       string           `json:"hostname"`
+	Preparing      bool             `json:"preparing"`
+	Record         prepareRecord    `json:"record"`
+	RecordError    string           `json:"record_error,omitempty"`
+	Pointer        bool             `json:"pointer"`
+	PointerTarget  string           `json:"pointer_target,omitempty"`
+	PointerProblem string           `json:"pointer_problem,omitempty"`
+	StrayTemporary bool             `json:"stray_temporary"`
+	Note           string           `json:"note,omitempty"`
+	Transition     *guardTransition `json:"transition,omitempty"`
+	TakenOverFrom  []string         `json:"taken_over_from,omitempty"`
 }
 
 // prepareMode is what the flag table admitted.
@@ -488,6 +495,7 @@ func prepareUnderLock(ctx context.Context, root *txLock, holder string, m prepar
 		Record: prepareRecord{ReleaseExecutable: shape.Guard.ReleaseExecutable,
 			ReleaseExecutableSHA256: shape.Guard.ReleaseExecutableSHA256, Verified: true},
 		Pointer: pointer, PointerTarget: target, StrayRemoved: strayRemoved, Managed: managed,
+		Transition: shape.Guard.Transition, TakenOverFrom: shape.Guard.TakenOverFrom,
 	}
 
 	switch {
@@ -1284,6 +1292,13 @@ func cleanupRelease(root *txLock, dir *os.File, shape claimShape, holder, token 
 
 	if err := requireNoPointerAt(dir); err != nil {
 		return err
+	}
+
+	// A RETIREMENT'S FIRST MUTATION CLOSES THE CLEANUP: the marker is written
+	// before it, so a rescue that still holds the acquirer's token cannot take
+	// the guard away from a retirement that has begun.
+	if err := requireNoTransition(shape); err != nil {
+		return fmt.Errorf("%w; nothing was released", err)
 	}
 
 	return removeGuardAt(root, dir)

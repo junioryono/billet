@@ -320,8 +320,8 @@ func TestUnknownFutureMigrationIsRejected(t *testing.T) {
 	if err == nil {
 		t.Fatal("Open accepted a database written by a newer billet")
 	}
-	if !strings.Contains(err.Error(), "newer version") {
-		t.Errorf("error should say the database is newer, got: %v", err)
+	if !errors.Is(err, ErrSchemaAhead) {
+		t.Errorf("error should be ErrSchemaAhead, the typed ahead refusal, got: %v", err)
 	}
 }
 

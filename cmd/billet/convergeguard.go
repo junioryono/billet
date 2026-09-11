@@ -18,6 +18,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/junioryono/billet/internal/regularfile"
+	"github.com/junioryono/billet/internal/retirement"
 )
 
 // `billet converge-guard` holds the upgrade root's ONE CLAIM for a converge.
@@ -92,6 +93,65 @@ type guardRecord struct {
 	// once, never rewritten by a later validation, a re-binding, a settlement
 	// or a takeover; absent on a record whose holder wrote none.
 	Note string `json:"note,omitempty"`
+	// Transition names the retirement this guard is held for, written before
+	// the retirement's first mutation and cleared at its settlement or its
+	// abandonment; while it is present the guard is released by nobody and
+	// taken over only when a journal exists for it.
+	Transition *guardTransition `json:"transition,omitempty"`
+	// TakenOverFrom lists every previous holder in order, appended at each
+	// takeover and never overwritten, so a journal owned by a holder two
+	// takeovers back is still this guard's.
+	TakenOverFrom []string `json:"taken_over_from,omitempty"`
+}
+
+// guardTransition is the marker: the kind of transition (only "retirement"
+// exists) and the transition id minted at its reservation, so every reader
+// compares the marker with the journal or the row it belongs to and a marker
+// from another retirement is refused rather than cleared.
+type guardTransition struct {
+	Kind string `json:"kind"`
+	ID   string `json:"id"`
+}
+
+// transitionRetirement is the one transition kind.
+const transitionRetirement = "retirement"
+
+// errGuardTransition means the guard carries a retirement's marker, and is
+// therefore neither released nor recovered by the guard's own commands.
+var errGuardTransition = errors.New("a retirement is in progress on this host")
+
+// requireNoTransition refuses a release or a recovery of a guard that carries
+// the retirement marker, or whose host holds a `done` journal that is not yet
+// settled (the tail clears the marker and then writes settled, so a crash
+// between leaves an unsettled journal without a marker). An unreadable or
+// malformed journal is could-not-tell and refuses too.
+func requireNoTransition(shape claimShape) error {
+	if shape.Guard.Transition != nil {
+		return fmt.Errorf("%w (transition %s %s): finish or repair the retirement before releasing the guard; "+
+			"`billet server retire --dry-run` says where it is", errGuardTransition,
+			shape.Guard.Transition.Kind, shape.Guard.Transition.ID)
+	}
+
+	j, presence, err := retirement.ReadJournal()
+
+	switch presence {
+	case retirement.JournalAbsent:
+		return nil
+	case retirement.JournalPresent:
+		if j.Phase == retirement.PhaseDone && !j.Settled {
+			return fmt.Errorf("%w: a retirement's tail is unfinished on this host (its journal is done and not "+
+				"settled); the next converge settles it, and the guard is kept until then", errGuardTransition)
+		}
+
+		if j.Phase != retirement.PhaseDone {
+			return fmt.Errorf("%w: its journal is at %s; finish or repair the retirement before releasing the guard",
+				errGuardTransition, j.Phase)
+		}
+
+		return nil
+	default:
+		return fmt.Errorf("%w: the retirement journal could not be judged (%w); the guard is kept", errGuardTransition, err)
+	}
 }
 
 // maxNoteBytes bounds a note: one line an operator reads on a held host.
@@ -1037,6 +1097,10 @@ func cmdGuardRelease(args []string) error {
 		return err
 	}
 
+	if err := requireNoTransition(shape); err != nil {
+		return fmt.Errorf("%w; nothing was released", err)
+	}
+
 	return removeGuardAt(root, dir)
 }
 
@@ -1237,6 +1301,12 @@ func recoverHolder(root *txLock, holder string) error {
 			"instead", err, holder)
 	}
 
+	if err := requireNoTransition(shape); err != nil {
+		return fmt.Errorf("%w; `hold --recover-from %s --old-driver-stopped` takes the retirement over instead, "+
+			"and `billet server retire --abandon-reservation` releases a reservation nothing has started",
+			err, holder)
+	}
+
 	if err := scanForDrivers(); err != nil {
 		return err
 	}
@@ -1244,8 +1314,35 @@ func recoverHolder(root *txLock, holder string) error {
 	return removeGuardAt(root, dir)
 }
 
+// admitRetirementTakeover admits a takeover of a guard with no transaction
+// pointer exactly when it carries the retirement marker and a journal exists
+// on the host: the retirement's tail is work a new holder may finish. A marker
+// beside no journal (an abandoned reservation) and a guard with neither refuse
+// naming the way out.
+func admitRetirementTakeover(shape claimShape, old string) error {
+	if shape.Guard.Transition == nil {
+		return fmt.Errorf("the guard held by %s carries no transaction pointer and no retirement marker, so "+
+			"there is nothing to take over; `recover --holder %s --old-driver-stopped` removes it", old, old)
+	}
+
+	_, presence, err := retirement.ReadJournal()
+
+	switch presence {
+	case retirement.JournalPresent:
+		return nil
+	case retirement.JournalAbsent:
+		return fmt.Errorf("the guard held by %s carries the retirement marker %s but no retirement journal exists, "+
+			"so it is a reservation nothing has started; `billet server retire --abandon-reservation --run %s` "+
+			"releases it", old, shape.Guard.Transition.ID, old)
+	default:
+		return fmt.Errorf("the guard held by %s carries the retirement marker %s and its journal could not be "+
+			"judged: %v; nothing was taken over", old, shape.Guard.Transition.ID, err)
+	}
+}
+
 // takeOverGuard re-labels a guard another holder left with its transaction
-// pointer, keeping the pointer and the recorded executable.
+// pointer or its retirement marker, keeping the pointer, the marker and the
+// recorded executable.
 func takeOverGuard(root *txLock, old, holder string) error {
 	dir, shape, err := openGuardForMutation(root)
 	if err != nil {
@@ -1274,36 +1371,43 @@ func takeOverGuard(root *txLock, old, holder string) error {
 
 	pointer := filepath.Join(dir.Name(), guardPointerName)
 
-	if _, err := statAt(dir, guardPointerName); err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("the guard held by %s carries no transaction pointer, so there is no "+
-				"transaction to take over; `recover --holder %s --old-driver-stopped` removes it", old, old)
+	_, err = statAt(dir, guardPointerName)
+
+	switch {
+	case err == nil:
+		if err := guardObserve("readlink", pointer, nil); err != nil {
+			return err
 		}
 
+		target, err := readlinkAt(dir, guardPointerName)
+		if err != nil {
+			return fmt.Errorf("read the transaction pointer %s: %w", pointer, err)
+		}
+
+		if err := underUpgradeRoot(target); err != nil {
+			return fmt.Errorf("the transaction pointer names %s: %w", target, err)
+		}
+
+		// THE JOURNAL IS JUDGED THROUGH THE ROOT THE LOCK VALIDATED, the pointer's
+		// target opened relative to it, so a root displaced at its name resolves
+		// nothing here. A takeover proves the transaction COMPLETE, whichever
+		// program journals it: a Go transaction's journal.json, or the role's
+		// manifest.yml; it loads neither, because it resumes nothing itself.
+		if _, err := validateRecoveryUnder(root.dir, target); err != nil {
+			return fmt.Errorf("the transaction pointer names %s, whose journal cannot be read: %w; nothing "+
+				"was taken over", target, err)
+		}
+	case !errors.Is(err, fs.ErrNotExist):
 		return fmt.Errorf("examine %s: %w", pointer, err)
-	}
-
-	if err := guardObserve("readlink", pointer, nil); err != nil {
-		return err
-	}
-
-	target, err := readlinkAt(dir, guardPointerName)
-	if err != nil {
-		return fmt.Errorf("read the transaction pointer %s: %w", pointer, err)
-	}
-
-	if err := underUpgradeRoot(target); err != nil {
-		return fmt.Errorf("the transaction pointer names %s: %w", target, err)
-	}
-
-	// THE JOURNAL IS JUDGED THROUGH THE ROOT THE LOCK VALIDATED, the pointer's
-	// target opened relative to it, so a root displaced at its name resolves
-	// nothing here. A takeover proves the transaction COMPLETE, whichever
-	// program journals it: a Go transaction's journal.json, or the role's
-	// manifest.yml; it loads neither, because it resumes nothing itself.
-	if _, err := validateRecoveryUnder(root.dir, target); err != nil {
-		return fmt.Errorf("the transaction pointer names %s, whose journal cannot be read: %w; nothing "+
-			"was taken over", target, err)
+	default:
+		// NO POINTER: a retirement's guard is taken over on its marker AND its
+		// journal (in any phase, the tail after done included); a marker with no
+		// journal is an abandoned reservation, which `billet server retire
+		// --abandon-reservation` clears, and a guard with neither is removed by
+		// `recover`, not taken over.
+		if err := admitRetirementTakeover(shape, old); err != nil {
+			return err
+		}
 	}
 
 	if err := scanForDrivers(); err != nil {
@@ -1314,11 +1418,13 @@ func takeOverGuard(root *txLock, old, holder string) error {
 	// preparing flag authorise a cleanup release by the invocation that
 	// acquired the guard, and the new holder never did; a takeover that kept
 	// them would let the old token release the guard once the recovery
-	// removed its pointer.
+	// removed its pointer. THE MARKER IS KEPT and the old holder APPENDED to
+	// the chain, so the journal it owns is still this guard's.
 	record := shape.Guard
 	record.Holder = holder
 	record.Token = ""
 	record.Preparing = false
+	record.TakenOverFrom = append(append([]string{}, record.TakenOverFrom...), old)
 
 	if err := writeGuardRecordAt(dir, record, true); err != nil {
 		return err
@@ -1512,6 +1618,29 @@ func checkGuardRecord(raw map[string]json.RawMessage, g guardRecord) string {
 		}
 	}
 
+	// THE MARKER IS TYPED WHEN PRESENT: one kind this binary knows and an id
+	// minted at the reservation. A marker without an id is an old shape, and a
+	// record carrying one is refused whole, so no reader ever takes it for an
+	// absent marker or a matching one.
+	if g.Transition != nil {
+		switch {
+		case g.Transition.Kind != transitionRetirement:
+			return "the record's transition names the kind " + g.Transition.Kind + ", which this billet does not know"
+		case !guardHex32.MatchString(g.Transition.ID):
+			return "the record's transition names no 32-hex id"
+		}
+	}
+
+	for _, previous := range g.TakenOverFrom {
+		if err := checkHolder(previous); err != nil {
+			return "the record's taken_over_from names a holder that is not a name: " + err.Error()
+		}
+	}
+
+	if _, ok := raw["taken_over_from"]; ok && len(g.TakenOverFrom) == 0 {
+		return "the record's taken_over_from is empty; a record with no takeover carries none"
+	}
+
 	switch {
 	case g.Holder == "":
 		return "the record names no holder"
@@ -1563,28 +1692,83 @@ func checkGuardRecord(raw map[string]json.RawMessage, g guardRecord) string {
 }
 
 // guardRecordTypes holds every present member to its type: `preparing` a
-// boolean, every other member a string.
+// boolean, `transition` an object of exactly `kind` and `id`, both strings,
+// `taken_over_from` an array of strings, every other member a string.
 func guardRecordTypes(raw map[string]json.RawMessage) string {
 	for k, v := range raw {
-		var (
-			s   string
-			b   bool
-			err error
-		)
-
-		if k == "preparing" {
-			err = json.Unmarshal(v, &b)
-		} else {
-			err = json.Unmarshal(v, &s)
-		}
-
-		if err != nil {
-			if k == "preparing" {
+		switch k {
+		case "preparing":
+			var b bool
+			if err := json.Unmarshal(v, &b); err != nil {
 				return "the record's preparing is not a boolean"
 			}
+		case "transition":
+			if problem := transitionType(v); problem != "" {
+				return problem
+			}
+		case "taken_over_from":
+			var holders []string
+			if err := json.Unmarshal(v, &holders); err != nil {
+				return "the record's taken_over_from is not an array of strings"
+			}
 
-			return "the record's " + k + " is not a string"
+			for _, h := range holders {
+				if h == "" {
+					return "the record's taken_over_from names an empty holder"
+				}
+			}
+		default:
+			var s string
+			if err := json.Unmarshal(v, &s); err != nil {
+				return "the record's " + k + " is not a string"
+			}
 		}
+	}
+
+	return ""
+}
+
+// transitionType is the marker's own strict reading: one object, the members
+// kind and id exactly, each once, each a string.
+func transitionType(v json.RawMessage) string {
+	dec := json.NewDecoder(bytes.NewReader(v))
+
+	tok, err := dec.Token()
+	if err != nil || tok != json.Delim('{') {
+		return "the record's transition is not an object"
+	}
+
+	seen := map[string]bool{}
+
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return "the record's transition is not an object"
+		}
+
+		key, ok := tok.(string)
+		if !ok || (key != "kind" && key != "id") {
+			return "the record's transition carries a member the command does not write"
+		}
+
+		if seen[key] {
+			return "the record's transition repeats " + key
+		}
+
+		seen[key] = true
+
+		var s string
+		if err := dec.Decode(&s); err != nil {
+			return "the record's transition's " + key + " is not a string"
+		}
+	}
+
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('}') {
+		return "the record's transition is not an object"
+	}
+
+	if !seen["kind"] || !seen["id"] {
+		return "the record's transition lacks kind or id"
 	}
 
 	return ""
@@ -1598,7 +1782,8 @@ func guardRecordTypes(raw map[string]json.RawMessage) string {
 // read the same way.
 func guardRecordMembers(body []byte) (map[string]json.RawMessage, string) {
 	known := map[string]bool{"holder": true, "claimed_at": true, "hostname": true, "release_executable": true,
-		"release_executable_sha256": true, "id": true, "token": true, "preparing": true, "note": true}
+		"release_executable_sha256": true, "id": true, "token": true, "preparing": true, "note": true,
+		"transition": true, "taken_over_from": true}
 
 	dec := json.NewDecoder(bytes.NewReader(body))
 
@@ -1789,6 +1974,10 @@ type guardStatusRec struct {
 	ReleaseExecutableVerified maybe  `json:"release_executable_verified"`
 	RecordError               string `json:"record_error,omitempty"`
 	Note                      string `json:"note,omitempty"`
+	// Transition is the retirement marker when the record carries one, and
+	// TakenOverFrom the chain of previous holders.
+	Transition    *guardTransition `json:"transition,omitempty"`
+	TakenOverFrom []string         `json:"taken_over_from,omitempty"`
 }
 
 func (s claimShape) report() guardStatusReport {
@@ -1803,7 +1992,7 @@ func (s claimShape) report() guardStatusReport {
 		ID: s.Guard.ID, Preparing: s.Guard.Preparing, StrayTemporary: s.StrayTemporary,
 		RecoveryPointer: s.Pointer, ReleaseExecutable: s.Guard.ReleaseExecutable,
 		ReleaseExecutableSHA256: s.Guard.ReleaseExecutableSHA256, RecordError: s.RecordErr,
-		Note: s.Guard.Note,
+		Note: s.Guard.Note, Transition: s.Guard.Transition, TakenOverFrom: s.Guard.TakenOverFrom,
 	}
 
 	// VERIFIED, NEVER RUN: the recorded executable's digest now against the

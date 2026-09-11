@@ -864,7 +864,7 @@ func TestEveryMutatorValidatesTheGuardDirectoryItActsOn(t *testing.T) {
 				t.Errorf("%s on %s: err = %v, want the trust boundary", name, what, err)
 			}
 
-			if got := f.record(t); got != rec {
+			if got := f.record(t); !reflect.DeepEqual(got, rec) {
 				t.Errorf("%s on %s changed the record to %+v", name, what, got)
 			}
 
@@ -1205,7 +1205,7 @@ func TestAJournalIsNeverReadThroughADisplacedRoot(t *testing.T) {
 
 		rec.Holder = "ci-2"
 
-		if got != rec {
+		if !reflect.DeepEqual(got, rec) {
 			t.Errorf("the takeover left the retained record as %+v, want %+v", got, rec)
 		}
 
@@ -1349,7 +1349,7 @@ func TestAClaimTargetIsExactlyOneChildOfTheRootByItsText(t *testing.T) {
 			t.Errorf("a takeover over a pointer spelled through ..: err = %v", err)
 		}
 
-		if got := f.record(t); got != rec {
+		if got := f.record(t); !reflect.DeepEqual(got, rec) {
 			t.Errorf("the refused takeover changed the record to %+v", got)
 		}
 	})
@@ -1474,7 +1474,7 @@ func TestARecoveryDirectoryAndItsJournalAreJudgedBeforeTheyAreBelieved(t *testin
 				t.Errorf("a takeover over %s: err = %v, want the trust boundary", name, err)
 			}
 
-			if got := f.record(t); got != rec {
+			if got := f.record(t); !reflect.DeepEqual(got, rec) {
 				t.Errorf("the refused takeover changed the record to %+v", got)
 			}
 		})

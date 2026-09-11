@@ -1836,7 +1836,7 @@ func TestATakeoverRelabelsAndKeepsEverythingElse(t *testing.T) {
 			t.Errorf("%s: the takeover succeeded", name)
 		}
 
-		if got := f.record(t); got != rec {
+		if got := f.record(t); !reflect.DeepEqual(got, rec) {
 			t.Errorf("%s: the record changed to %+v", name, got)
 		}
 	}
@@ -1883,7 +1883,7 @@ func TestATakeoverRelabelsAndKeepsEverythingElse(t *testing.T) {
 			t.Errorf("%s was touched by the refused takeover: %v -> %v", name, before.Mode(), after.Mode())
 		}
 
-		if got := f.record(t); got != rec {
+		if got := f.record(t); !reflect.DeepEqual(got, rec) {
 			t.Errorf("%s: the record changed to %+v", name, got)
 		}
 	}
@@ -1915,7 +1915,7 @@ func TestATakeoverRelabelsAndKeepsEverythingElse(t *testing.T) {
 			t.Errorf("a temporary hard-linked to %s: the other name's bytes are %q, %v", name, bytesAfter, err)
 		}
 
-		if got := f.record(t); got != rec {
+		if got := f.record(t); !reflect.DeepEqual(got, rec) {
 			t.Errorf("a temporary hard-linked to %s: the record changed to %+v", name, got)
 		}
 
@@ -1993,8 +1993,9 @@ func TestATakeoverRelabelsAndKeepsEverythingElse(t *testing.T) {
 
 	got := f.record(t)
 	rec.Holder = "ci-2"
+	rec.TakenOverFrom = []string{"ci-1"}
 
-	if got != rec {
+	if !reflect.DeepEqual(got, rec) {
 		t.Errorf("after the takeover the record is %+v, want %+v", got, rec)
 	}
 

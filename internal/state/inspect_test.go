@@ -391,7 +391,7 @@ func TestAnInspectionVerifiesTheSchemaAndNeverMigrates(t *testing.T) {
 			t.Fatalf("a ledger one migration behind: err = %v, want ErrSchemaBehind", err)
 		}
 
-		for _, want := range []string{"rollout_last_refusal", "restart the control plane"} {
+		for _, want := range []string{"controller_retirement", "restart the control plane"} {
 			if !strings.Contains(err.Error(), want) {
 				t.Errorf("the refusal does not say %q: %v", want, err)
 			}
@@ -436,8 +436,8 @@ func TestAnInspectionVerifiesTheSchemaAndNeverMigrates(t *testing.T) {
 			newer, latestVersion(t))
 
 		err := OpenInspectErr(t, dir)
-		if err == nil || !strings.Contains(err.Error(), "newer version") {
-			t.Fatalf("a ledger carrying version %d: err = %v, want the newer-version refusal", newer, err)
+		if !errors.Is(err, ErrSchemaAhead) {
+			t.Fatalf("a ledger carrying version %d: err = %v, want the typed ahead-schema refusal", newer, err)
 		}
 	})
 
@@ -871,8 +871,8 @@ func TestAnInspectionRevalidatesInsideEveryRead(t *testing.T) {
 	ran := false
 
 	err = db.View(t.Context(), func(Querier) error { ran = true; return nil })
-	if err == nil || !strings.Contains(err.Error(), "newer version") {
-		t.Errorf("a View after a newer version appeared: err = %v, want the newer-version refusal", err)
+	if !errors.Is(err, ErrSchemaAhead) {
+		t.Errorf("a View after a newer version appeared: err = %v, want the typed ahead-schema refusal", err)
 	}
 
 	if ran {
@@ -913,8 +913,8 @@ func TestAnInspectionsScaleSetsHonourTheFenceAndTheSchema(t *testing.T) {
 	plainExec(t, dir, `INSERT INTO schema_migrations (version, name, checksum, applied_at) `+
 		`VALUES (?, 'from_the_future', 'x', 't')`, latestVersion(t)+1)
 
-	if _, err := db.ScaleSets(t.Context(), "acme"); err == nil || !strings.Contains(err.Error(), "newer version") {
-		t.Errorf("ScaleSets against a newer version: err = %v, want the newer-version refusal", err)
+	if _, err := db.ScaleSets(t.Context(), "acme"); !errors.Is(err, ErrSchemaAhead) {
+		t.Errorf("ScaleSets against a newer version: err = %v, want the typed ahead-schema refusal", err)
 	}
 }
 

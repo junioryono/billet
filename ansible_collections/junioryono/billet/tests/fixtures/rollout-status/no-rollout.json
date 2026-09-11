@@ -15,6 +15,7 @@
       "release": "v0.9.3"
     }
   ],
+  "retirement": null,
   "rollout": null,
   "schema": 1
 }

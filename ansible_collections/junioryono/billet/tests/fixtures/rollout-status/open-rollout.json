@@ -53,6 +53,7 @@
       "release": "v0.9.3"
     }
   ],
+  "retirement": null,
   "rollout": {
     "channel": "stable",
     "controller_phase": "draining",

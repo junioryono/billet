@@ -331,7 +331,7 @@ func TestRolloutStatusJSONPinsTheReport(t *testing.T) {
 
 	// THE FIELD NAMES, by name.
 	wantKeys := map[string][]string{
-		"":           {"deployment", "nodes", "registrations", "rollout", "schema"},
+		"":           {"deployment", "nodes", "registrations", "retirement", "rollout", "schema"},
 		"deployment": {"bound", "id"},
 		"rollout": {"channel", "controller_phase", "created_at", "created_by", "finished_at", "generation",
 			"id", "policy", "prior_version", "state", "target_digest", "target_version", "terminal_reason"},
@@ -434,7 +434,68 @@ func TestRolloutStatusJSONReportsAnEmptyLedgerPositively(t *testing.T) {
 	if report.Deployment.Bound || report.Deployment.ID != "" {
 		t.Errorf("an unbound ledger reports %+v", report.Deployment)
 	}
+
+	if row, ok := raw["retirement"]; !ok || row != nil {
+		t.Errorf("retirement is %v (present %v), want an explicit null", row, ok)
+	}
 }
+
+// THE RETIREMENT ROW IS THE REPORT'S, from the same snapshot as the binding,
+// and the text says it before the rollout: a deployment that has reserved or
+// completed a controller's retirement has that fact ahead of every host's
+// phase. The times are the row's own strings.
+func TestRolloutStatusReportsTheRetirementRow(t *testing.T) {
+	stateDir := t.TempDir()
+	cfgPath := writeCAConfig(t, stateDir)
+
+	deployment, err := state.DeploymentID(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	statusPlane(t, stateDir, func(db *state.DB) {
+		if _, err := db.ClaimController(t.Context(), "billet-control-01", deployment); err != nil {
+			t.Fatalf("ClaimController: %v", err)
+		}
+
+		if _, _, err := db.ReserveRetirement(t.Context(), state.RetirementReservation{
+			Deployment: deployment, Retiring: "billet-control-01", Survivor: "billet-control-02",
+			Run: "ci-42", TransitionID: transitionForStatus,
+			At: time.Date(2026, 9, 11, 8, 0, 0, 0, time.UTC),
+		}); err != nil {
+			t.Fatalf("ReserveRetirement: %v", err)
+		}
+	})
+
+	report, _, out := statusJSON(t, cfgPath)
+
+	want := &rolloutStatusRetirement{
+		Retiring: "billet-control-01", Survivor: "billet-control-02", Run: "ci-42",
+		State: state.RetirementReserved, TransitionID: transitionForStatus,
+		ReservedAt: "2026-09-11T08:00:00Z", UpdatedAt: "2026-09-11T08:00:00Z",
+	}
+	if !reflect.DeepEqual(report.Retirement, want) {
+		t.Errorf("retirement %+v, want %+v\n%s", report.Retirement, want, out)
+	}
+
+	var runErr error
+
+	text := capture(t, func() {
+		runErr = cmdRolloutStatus(t.Context(), []string{"--config", cfgPath})
+	})
+	if runErr != nil {
+		t.Fatalf("rollout status: %v\n%s", runErr, text)
+	}
+
+	if !strings.Contains(text, "retirement billet-control-01 -> billet-control-02 is reserved") ||
+		!strings.Contains(text, transitionForStatus) {
+		t.Errorf("the text does not name the retirement row:\n%s", text)
+	}
+}
+
+// transitionForStatus is a transition id as `--reserve` mints them: 32 hex
+// characters, distinct from the deployment id so a fixture cannot confuse the two.
+const transitionForStatus = "fedcba9876543210fedcba9876543210"
 
 // THE BINDING IS THE LEDGER'S, NEVER THE HOST'S IDENTITY FILE: an identity
 // beside an unbound ledger is not reported as a binding and is not written into

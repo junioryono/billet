@@ -47,6 +47,25 @@ type rolloutStatusReport struct {
 	Rollout       *rolloutStatusRollout       `json:"rollout"`
 	Nodes         []rolloutStatusNode         `json:"nodes"`
 	Registrations []rolloutStatusRegistration `json:"registrations"`
+	// Retirement is the deployment's controller-retirement row, null when the
+	// ledger holds none: which controller is retiring or has retired, on whose
+	// reservation, and how far the row has got.
+	Retirement *rolloutStatusRetirement `json:"retirement"`
+}
+
+// rolloutStatusRetirement is the ledger's retirement row as the report carries
+// it. The times are the row's own strings, because a completion compares the
+// reservation time for equality with the one the journal copied.
+type rolloutStatusRetirement struct {
+	Retiring     string `json:"retiring"`
+	Survivor     string `json:"survivor"`
+	Run          string `json:"run"`
+	State        string `json:"state"`
+	TransitionID string `json:"transition_id"`
+	ReservedAt   string `json:"reserved_at"`
+	UpdatedAt    string `json:"updated_at"`
+	CompletedBy  string `json:"completed_by"`
+	CompletedAt  string `json:"completed_at"`
 }
 
 // rolloutStatusDeployment is the ledger's own binding, positively: Bound is
@@ -176,6 +195,14 @@ func buildRolloutStatusReport(ctx context.Context, store *rollout.Store, identit
 			Name: r.Name, Live: r.Live, Epoch: r.Epoch, Incarnation: r.Incarnation,
 			Release: r.Release, Digest: r.Digest, HighestRelease: r.HighestRelease,
 		})
+	}
+
+	if row := snapshot.Retirement; row != nil {
+		report.Retirement = &rolloutStatusRetirement{
+			Retiring: row.Retiring, Survivor: row.Survivor, Run: row.Run, State: row.State,
+			TransitionID: row.TransitionID, ReservedAt: row.ReservedAt, UpdatedAt: row.UpdatedAt,
+			CompletedBy: row.CompletedBy, CompletedAt: row.CompletedAt,
+		}
 	}
 
 	return report, nil

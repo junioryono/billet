@@ -14,6 +14,19 @@ type Admission struct {
 	ChangedAt  string
 }
 
+type ControllerRetirement struct {
+	Deployment   string
+	Retiring     string
+	Survivor     string
+	Run          string
+	State        string
+	TransitionID string
+	ReservedAt   string
+	UpdatedAt    string
+	CompletedBy  string
+	CompletedAt  string
+}
+
 type CredentialSweep struct {
 	Region       string
 	Path         string
