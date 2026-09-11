@@ -217,7 +217,8 @@ func migrateEndpoint(ctx context.Context, m migrateMode) (any, *endpointRefusal)
 
 	identity := identityFor(installed.cfg, cfgOf(renderingCfg))
 
-	if installedHasNode && renderedHasNode {
+	switch {
+	case installedHasNode && renderedHasNode:
 		problem, unknown := sameNodeIdentity(installed, rendering)
 		if unknown != "" {
 			return nil, endpointUnknown(endpointReasonConfig, unknown, "", stateNothing)
@@ -225,6 +226,13 @@ func migrateEndpoint(ctx context.Context, m migrateMode) (any, *endpointRefusal)
 
 		if problem != "" {
 			return nil, endpointRefuse(endpointReasonDesired, problem, "", stateNothing)
+		}
+	case renderedHasNode:
+		// A CONTRADICTION IN THE RENDERING ALONE: with no installed node to
+		// compare against, the rendering's own name and certificate are still
+		// held to the node's startup rule before a first start is reported.
+		if id := expectedRegistrationIdentity(rendering.cfg); id.contradiction != "" {
+			return nil, endpointRefuse(endpointReasonDesired, "the rendering configuration: "+id.contradiction, "", stateNothing)
 		}
 	}
 
@@ -312,6 +320,13 @@ func migrateEndpoint(ctx context.Context, m migrateMode) (any, *endpointRefusal)
 	if pre.LoadState != "loaded" {
 		return nil, endpointRefuse(endpointReasonUnit, fmt.Sprintf("%s has LoadState=%s, so it cannot be started after the "+
 			"stop", nodeUnit, orUnknownWord(pre.LoadState)), "", stateNothing)
+	}
+
+	// THE OBSERVATION IS COMPLETE: the post-stop judgement reads Result, and
+	// a unit that answers none now would answer none then.
+	if pre.Result == "" {
+		return nil, endpointUnknown(endpointReasonUnit, "systemd answered no Result for "+nodeUnit+", so the observation is "+
+			"incomplete and the stop cannot be judged", "check and approve afresh", stateNothing)
 	}
 
 	// (12) THE STOP under the migration's own deadline: the context bounds
@@ -738,16 +753,21 @@ func sameNodeIdentity(installed *installedConfigObservation, rendering *configOb
 	// an identity file that failed to read establishes neither the node nor
 	// the deployment. A deployment positively unminted (a stopped certless
 	// host) hides nothing, and only that is admitted.
-	for _, side := range []struct {
+	sides := []struct {
 		which string
 		id    registrationIdentity
-	}{{"installed", a}, {"rendering", b}} {
-		// A CONTRADICTION IS A REFUSAL: a configuration whose name and
-		// certificate disagree could never start as either.
+	}{{"installed", a}, {"rendering", b}}
+
+	// A CONTRADICTION IS A REFUSAL, on either side and before either side's
+	// could-not-tell: a configuration whose name and certificate disagree
+	// could never start as either, whatever the other side could not read.
+	for _, side := range sides {
 		if side.id.contradiction != "" {
 			return "the " + side.which + " configuration: " + side.id.contradiction, ""
 		}
+	}
 
+	for _, side := range sides {
 		if side.id.why != "" && !side.id.absent {
 			return "", "the " + side.which + " configuration's node identity: " + side.id.why
 		}

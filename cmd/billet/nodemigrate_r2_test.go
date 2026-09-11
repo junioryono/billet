@@ -458,6 +458,7 @@ func TestMigratePreStopObservationMustBeComplete(t *testing.T) {
 	for name, body := range map[string]string{
 		"no KillMode":  nodeUnitBody("active", "running", inspectPID, nodeInvocation, "", "success"),
 		"no LoadState": strings.Replace(nodeUnitBody("active", "running", inspectPID, nodeInvocation, "mixed", "success"), "LoadState=loaded\n", "LoadState=\n", 1),
+		"no Result":    strings.Replace(nodeUnitBody("active", "running", inspectPID, nodeInvocation, "mixed", "success"), "Result=success\n", "Result=\n", 1),
 	} {
 		t.Run(name, func(t *testing.T) {
 			f := newEndpointFixture(t)
@@ -474,5 +475,67 @@ func TestMigratePreStopObservationMustBeComplete(t *testing.T) {
 				t.Errorf("why %q stops %d", o.str("why"), f.calls(t, "stop"))
 			}
 		})
+	}
+}
+
+// A contradicted rendering is refused on a first start too, where no
+// installed node exists to compare it with.
+func TestMigrateRefusesAContradictedRenderingOnAFirstStart(t *testing.T) {
+	tls := nodeTLSFixture(t, true)
+
+	body, err := os.ReadFile(tls.configPath)
+	mustOK(t, err)
+
+	f := newEndpointFixture(t)
+	f.writeConfig(t, f.serverOnly())
+	f.setNode(t, "inactive", "dead", 0, "", "mixed")
+
+	o := f.migrate(t, strings.Replace(string(body), "  name: node-a\n", "  name: node-b\n", 1), "--dry-run")
+	mustEndpointRefusal(t, o, outcomeRefused, endpointReasonDesired)
+
+	if !strings.Contains(o.str("why"), "was issued for") {
+		t.Errorf("why %q", o.str("why"))
+	}
+}
+
+// A proven contradiction on the rendering's side is refused even when the
+// installed identity could not be read: both contradictions are judged
+// before either could-not-tell.
+func TestMigrateRefusesAContradictionBesideAnUnreadableInstalledIdentity(t *testing.T) {
+	installedTLS, renderedTLS := nodeTLSFixture(t, true), nodeTLSFixture(t, true)
+
+	installedBody, err := os.ReadFile(installedTLS.configPath)
+	mustOK(t, err)
+
+	renderedBody, err := os.ReadFile(renderedTLS.configPath)
+	mustOK(t, err)
+
+	cert := regexp.MustCompile(`cert: (\S+)`).FindStringSubmatch(string(installedBody))
+	if cert == nil {
+		t.Fatalf("no cert path in\n%s", installedBody)
+	}
+
+	// Both configurations name node-b; the installed certificate cannot be
+	// read, the rendering's was issued for node-a.
+	f := newEndpointFixture(t)
+	f.writeConfig(t, strings.Replace(string(installedBody), "  name: node-a\n", "  name: node-b\n", 1))
+	f.setNode(t, "inactive", "dead", 0, "", "mixed")
+
+	prev := readPublicFile
+	readPublicFile = func(path string) ([]byte, error) {
+		if path == cert[1] {
+			return nil, &os.PathError{Op: "open", Path: path, Err: syscall.EACCES}
+		}
+
+		return prev(path)
+	}
+
+	t.Cleanup(func() { readPublicFile = prev })
+
+	o := f.migrate(t, strings.Replace(string(renderedBody), "  name: node-a\n", "  name: node-b\n", 1), "--dry-run")
+	mustEndpointRefusal(t, o, outcomeRefused, endpointReasonDesired)
+
+	if !strings.Contains(o.str("why"), "rendering configuration") || !strings.Contains(o.str("why"), "was issued for") {
+		t.Errorf("why %q", o.str("why"))
 	}
 }
