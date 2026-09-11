@@ -279,6 +279,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends python3-apt
 
+      # The emitted-block and hybrid-emission gates build billet to render what
+      # they check; the hosted image had a Go on PATH, the guest has none.
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
       - name: Exercise alert ownership migration and teardown
         run: make alert-lifecycle
 
