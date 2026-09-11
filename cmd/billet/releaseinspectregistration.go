@@ -343,8 +343,8 @@ func expectedRegistrationIdentity(cfg *config.Config) registrationIdentity {
 			return registrationIdentity{node: id.node, why: why, contradiction: why}
 		}
 
-		if len(leaves[0].Subject.Organization) != 1 {
-			return registrationIdentity{why: cfg.Node.TLS.CertPath + " names no single deployment in its Organization"}
+		if len(leaves[0].Subject.Organization) != 1 || leaves[0].Subject.Organization[0] == "" {
+			return registrationIdentity{why: cfg.Node.TLS.CertPath + " names no single, non-empty deployment in its Organization"}
 		}
 
 		id.deployment = leaves[0].Subject.Organization[0]

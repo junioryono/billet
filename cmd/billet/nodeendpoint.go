@@ -317,13 +317,20 @@ func observeUnit(ctx context.Context, insp *lifeops.Inspector, unit string) (uni
 
 // runningPID reads the observation's process: the pid of a running main
 // process, or running=false for a unit positively not running (inactive or
-// failed), or a problem when the answer says neither (a MainPID that is
-// missing, empty or not a number; 0 beside a state that is not inactive or
-// failed), which is uncertainty and never "not running".
+// failed), or a problem when the answer says neither (a state this does not
+// know; a MainPID that is missing, empty or not a number; 0 beside a state
+// that is not inactive or failed), which is uncertainty and never "not
+// running".
 func runningPID(obs unitObservation) (int, bool, string) {
 	switch obs.ActiveState {
 	case "inactive", "failed":
 		return 0, false, ""
+	case "active", "reloading", "activating", "deactivating":
+	default:
+		// A STATE THIS DOES NOT KNOW is neither running nor not: systemd's
+		// vocabulary grows (maintenance, refreshing), and a guess either way
+		// would authorise a stop or a receipt over it.
+		return 0, false, "systemd answered ActiveState=" + strconv.Quote(obs.ActiveState) + ", which this does not judge"
 	}
 
 	if _, ok := obs.raw["MainPID"]; !ok || obs.MainPID == "" {

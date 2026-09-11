@@ -452,11 +452,16 @@ func migrateEndpoint(ctx context.Context, m migrateMode) (any, *endpointRefusal)
 
 	// RUNNING, THE SAME, AND NOT STOPPING: a unit found inactive or failed
 	// with the sampled pid still on it is not the process the record named.
-	if _, running, problem := runningPID(closing); problem != "" || !running || processMoved(newBr.obs, closing) ||
-		closing.ActiveState == "deactivating" {
-		return nil, endpointUnknown(endpointReasonProcess, fmt.Sprintf("the started node moved or stopped before the "+
-			"answer: pid %s invocation %s (%s) at the close, %s %s at the record", closing.MainPID, closing.InvocationID,
-			closing.ActiveState, newBr.obs.MainPID, newBr.obs.InvocationID), "", stateStarted)
+	_, running, problem := runningPID(closing)
+	if problem != "" || !running || processMoved(newBr.obs, closing) || closing.ActiveState == "deactivating" {
+		why := fmt.Sprintf("the started node moved or stopped before the answer: pid %s invocation %s (%s) at the close, "+
+			"%s %s at the record", closing.MainPID, closing.InvocationID, closing.ActiveState, newBr.obs.MainPID,
+			newBr.obs.InvocationID)
+		if problem != "" {
+			why += "; " + problem
+		}
+
+		return nil, endpointUnknown(endpointReasonProcess, why, "", stateStarted)
 	}
 
 	return migrateEvidence{
@@ -748,12 +753,6 @@ func cfgOf(r *configObservationLite) *config.Config {
 // sameNodeIdentity refuses a rendering whose node is not the installed one: the
 // refusal first, then the could-not-tell reason when an identity did not read.
 func sameNodeIdentity(installed *installedConfigObservation, rendering *configObservationLite) (string, string) {
-	// THE CONFIGURED NAMES FIRST: two names both known and unequal disagree
-	// whatever the deployment says.
-	if ia, ib := installed.cfg.Node.Name, rendering.cfg.Node.Name; ia != "" && ib != "" && ia != ib {
-		return fmt.Sprintf("the rendering names the node %q and the installed configuration %q", ib, ia), ""
-	}
-
 	a := expectedRegistrationIdentity(installed.cfg)
 	b := expectedRegistrationIdentity(rendering.cfg)
 
@@ -781,9 +780,11 @@ func sameNodeIdentity(installed *installedConfigObservation, rendering *configOb
 		}
 	}
 
-	// THE RESOLVED NAMES BEFORE THE ABSENCE SHORTCUT: a certificate's name and
-	// a configured one are compared whatever the deployment says, and only
-	// the deployment comparison is skipped for an unminted identity.
+	// THE RESOLVED NAMES BEFORE THE ABSENCE SHORTCUT AND AFTER THE READS: a
+	// certificate's name and a configured one are compared whatever the
+	// deployment says, once both sides are known to be neither contradicted
+	// nor unread, and only the deployment comparison is skipped for an
+	// unminted identity.
 	if a.node != "" && b.node != "" && a.node != b.node {
 		return fmt.Sprintf("the rendering names the node %q and the installed configuration %q", b.node, a.node), ""
 	}

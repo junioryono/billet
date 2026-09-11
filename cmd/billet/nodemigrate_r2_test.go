@@ -1,6 +1,13 @@
 package main
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"math/big"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -41,6 +48,8 @@ func TestMigrateObservesTheUnitAfreshBeforeTheStop(t *testing.T) {
 		{"the unit masked", strings.Replace(nodeUnitBody("active", "running", inspectPID, nodeInvocation, "mixed", "success"),
 			"LoadState=loaded", "LoadState=masked", 1), outcomeRefused, endpointReasonUnit},
 		{"the unit unobservable", "LoadState=loaded\n", outcomeUnknown, endpointReasonUnit},
+		{"a state this does not judge", nodeUnitBody("maintenance", "running", inspectPID, nodeInvocation, "mixed", "success"),
+			outcomeUnknown, endpointReasonProcess},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			f := newEndpointFixture(t)
@@ -579,5 +588,108 @@ func TestMigrateFirstStartOverAnUnreadIdentityIsUnknown(t *testing.T) {
 				t.Errorf("why %q", o.str("why"))
 			}
 		})
+	}
+}
+
+// The migration's close judges only the states it knows: a started unit in
+// a state this does not judge is could-not-tell, never migrated.
+func TestMigrateCloseRefusesAStateItDoesNotJudge(t *testing.T) {
+	f := newEndpointFixture(t)
+	f.installB(t)
+	f.afterStop(t, "inactive", "dead", "success")
+	f.afterStart(t)
+	f.recordAfterStart(t, canonicalB)
+
+	f.onRecordRead(t, 2, func() {
+		f.afterShows(t, f.calls(t, "show")+1, nodeUnitBody("maintenance", "running", inspectPID+1, newInvocation, "mixed", "success"))
+	})
+
+	o := f.migrate(t, f.rendering(endpointB), "--wait", "3s")
+	mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonProcess)
+
+	if o.str("state") != stateStarted || !strings.Contains(o.str("why"), "does not judge") {
+		t.Errorf("state %q why %q", o.str("state"), o.str("why"))
+	}
+}
+
+// Two configured names that differ are refused only once both identities
+// read: an installed certificate that cannot be read is could-not-tell
+// first, so a refusal never speaks over an unexamined identity.
+func TestMigrateReadsBothIdentitiesBeforeComparingConfiguredNames(t *testing.T) {
+	tls := nodeTLSFixture(t, true)
+
+	body, err := os.ReadFile(tls.configPath)
+	mustOK(t, err)
+
+	cert := regexp.MustCompile(`cert: (\S+)`).FindStringSubmatch(string(body))
+	if cert == nil {
+		t.Fatalf("no cert path in\n%s", body)
+	}
+
+	f := newEndpointFixture(t)
+	f.writeConfig(t, string(body))
+	f.setNode(t, "inactive", "dead", 0, "", "mixed")
+
+	prev := readPublicFile
+	readPublicFile = func(path string) ([]byte, error) {
+		if path == cert[1] {
+			return nil, &os.PathError{Op: "open", Path: path, Err: syscall.EACCES}
+		}
+
+		return prev(path)
+	}
+
+	t.Cleanup(func() { readPublicFile = prev })
+
+	o := f.migrate(t, strings.Replace(f.rendering(endpointB), "  name: node-a\n", "  name: node-b\n", 1), "--dry-run")
+	mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonConfig)
+
+	if !strings.Contains(o.str("why"), "installed configuration's node identity") {
+		t.Errorf("why %q", o.str("why"))
+	}
+}
+
+// emptyDeploymentCertPEM is a certificate for node-a whose one Organization
+// value is empty: a shape the node's startup refuses as no deployment.
+func emptyDeploymentCertPEM(t *testing.T) string {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	mustOK(t, err)
+
+	tmpl := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "node-a", Organization: []string{""}},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour)}
+
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	mustOK(t, err)
+
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+}
+
+// A first start over a certificate whose deployment is empty is could-not-
+// tell: the node's startup refuses that identity, and a plan over it would
+// stop nothing but start nothing either.
+func TestMigrateFirstStartOverAnEmptyDeploymentIsUnknown(t *testing.T) {
+	tls := nodeTLSFixture(t, false)
+
+	body, err := os.ReadFile(tls.configPath)
+	mustOK(t, err)
+
+	cert := regexp.MustCompile(`cert: (\S+)`).FindStringSubmatch(string(body))
+	if cert == nil {
+		t.Fatalf("no cert path in\n%s", body)
+	}
+
+	writeFile(t, cert[1], emptyDeploymentCertPEM(t), 0o644)
+
+	f := newEndpointFixture(t)
+	f.writeConfig(t, f.serverOnly())
+	f.setNode(t, "inactive", "dead", 0, "", "mixed")
+
+	o := f.migrate(t, string(body), "--dry-run")
+	mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonConfig)
+
+	if !strings.Contains(o.str("why"), "Organization") {
+		t.Errorf("why %q", o.str("why"))
 	}
 }
