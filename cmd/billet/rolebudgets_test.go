@@ -39,6 +39,7 @@ func TestTheRoleMirrorsTheEndpointCommandsPhaseBudgets(t *testing.T) {
 		"billet_migration_judgement_attempts": migrateJudgementAttempts,
 		"billet_migration_bracket_attempts":   bracketAttempts,
 		"billet_migration_observation_bound":  int(lifeops.DefaultTimeout.Seconds()),
+		"billet_migration_probe_bound":        int(guardCommandTimeout.Seconds()),
 		"billet_migration_start_bound":        int((deploy.UnitStartTimeout + lifecycleDeadlineMargin).Seconds()),
 	}
 

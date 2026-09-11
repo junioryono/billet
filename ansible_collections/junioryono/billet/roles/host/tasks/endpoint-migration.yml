@@ -42,15 +42,17 @@
     billet_endpoint_action_executable: >-
       {{ billet_exclusion_binary if billet_finalization_commit | default('') == 'host upgrade committed' else billet_endpoint_answerer }}
     # THE BOUND IS THE SUM OF EVERY PHASE the command may take, the guard's
-    # bound as the margin: the judgement's attempts (each the record wait and
-    # the three observations that may follow it), the pre-stop observation,
+    # bound as the margin: the judgement's attempts (each an opening
+    # observation, the record wait, the two observations of a bracket that
+    # outlives it, the closing observation and the pre-R probe a node without
+    # a record may need), the pre-stop observation,
     # the stop under its deadline and the post-stop observation, the start
     # under the unit's bound and the post-start observation, the record wait
     # under the new invocation with the two observations of a bracket that
     # outlives it, and the closing observation; a slow but permitted sequence
     # must never lose its answer after the stop or the start.
     billet_endpoint_action_bound: >-
-      {{ (billet_migration_judgement_attempts | int) * ((billet_migration_record_wait | int) + 3 * (billet_migration_observation_bound | int))
+      {{ (billet_migration_judgement_attempts | int) * ((billet_migration_record_wait | int) + 4 * (billet_migration_observation_bound | int) + (billet_migration_probe_bound | int))
          + (billet_migration_stop_timeout | int) + (billet_migration_start_bound | int)
          + (billet_migration_record_wait | int) + 6 * (billet_migration_observation_bound | int) + (billet_guard_timeout | int) }}
     # THE RECEIPT'S EVIDENCE CALL waits for no record: it reads the running

@@ -31,7 +31,13 @@ def valid_holder(value):
     """True when value is a holder the command would accept."""
     if not isinstance(value, str):
         return False
-    if value == "" or len(value.encode("utf-8")) > MAX_HOLDER_BYTES:
+    # A lone surrogate (which a JSON escape can produce) is text Go refuses
+    # as invalid UTF-8; here it has no encoding, and it is not a holder.
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    if value == "" or len(encoded) > MAX_HOLDER_BYTES:
         return False
     for ch in value:
         if ch == "/" or ch == "�" or ch in _LATIN1_SPACES:

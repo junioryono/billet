@@ -41,6 +41,19 @@ def main():
         if mod.valid_holder(bad):
             failures += 1
             print("FAIL %r: a non-string is not a holder" % (bad,))
+    # LONE SURROGATES are text a JSON escape can produce and Go's decoder
+    # never hands to checkHolder as valid UTF-8, so the table cannot carry
+    # them; the twin refuses them without raising.
+    for lone in ("\ud800", "a\udfffb", "\ud83d"):
+        try:
+            got = mod.valid_holder(lone)
+        except Exception as exc:  # noqa: BLE001
+            failures += 1
+            print("FAIL %r: raised %r instead of refusing" % (lone, exc))
+            continue
+        if got:
+            failures += 1
+            print("FAIL %r: a lone surrogate is not a holder" % (lone,))
     if failures:
         print("%d failures" % failures)
         sys.exit(1)

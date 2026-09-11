@@ -136,13 +136,15 @@
     # THE DRY RUN, through the answerer, with or without an installed
     # configuration (the command reports `config: absent` and judges the unit
     # and its process against the rendering). Bounded by the judgement's
-    # attempts, each the record wait plus the three observations that may
-    # follow it, plus the guard's bound as the margin, `-k 10` so a hang is
-    # killed after the grace period.
+    # attempts, each an opening observation, the record wait, the two
+    # observations of a bracket that outlives it, the closing observation
+    # and the pre-R probe a node without a record may need, plus the guard's
+    # bound as the margin, `-k 10` so a hang is killed after the grace
+    # period.
     - name: Ask for the endpoint migration's dry run
       ansible.builtin.command:
         argv: >-
-          {{ ['timeout', '-k', '10', ((billet_migration_judgement_attempts | int) * ((billet_migration_record_wait | int) + 3 * (billet_migration_observation_bound | int)) + (billet_guard_timeout | int)) | string,
+          {{ ['timeout', '-k', '10', ((billet_migration_judgement_attempts | int) * ((billet_migration_record_wait | int) + 4 * (billet_migration_observation_bound | int) + (billet_migration_probe_bound | int)) + (billet_guard_timeout | int)) | string,
               billet_endpoint_answerer, 'node', 'migrate-endpoint', '--config', '/etc/billet/billet.yaml',
               '--desired', '-', '--wait', (billet_migration_record_wait | string) ~ 's', '--dry-run', '--json'] }}
         stdin: "{{ billet_endpoint_rendering }}"

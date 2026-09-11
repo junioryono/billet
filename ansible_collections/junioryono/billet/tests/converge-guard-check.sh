@@ -732,24 +732,22 @@ expect_ran() { # case task
     seen && /^TASK \[/ { seen = 0 }' "$work/cases/$1/out")
   [ "$verdict" = ran ] || fail "$1: the task \"$2\" did not run" "$work/cases/$1/out"
 }
-# The play's own tasks (not the role's): the render's stand-in.
-expect_no_play_task() { # case task
-  local verdict
-  verdict=$(awk -v want="TASK [$2]" '
+# The play's own tasks (not the role's): the render's stand-in. ONE MATCHER
+# for both helpers, so the positive control proves the negative one's
+# reading: a pattern that matched nothing would make expect_no_play_task
+# vacuous, and expect_play_task_ran over the same matcher would fail loudly.
+play_task_verdict() { # case task -> ran | ""
+  awk -v want="TASK [$2]" '
     index($0, want) == 1 { seen = 1; next }
     seen && /^skipping: / { seen = 0; next }
     seen && /^(ok|changed|fatal|failed): / { print "ran"; exit }
-    seen && /^TASK \[/ { seen = 0 }' "$work/cases/$1/out")
-  [ "$verdict" != ran ] || fail "$1: the play task \"$2\" ran, and it must not" "$work/cases/$1/out"
+    seen && /^TASK \[/ { seen = 0 }' "$work/cases/$1/out"
+}
+expect_no_play_task() { # case task
+  [ "$(play_task_verdict "$1" "$2")" != ran ] || fail "$1: the play task \"$2\" ran, and it must not" "$work/cases/$1/out"
 }
 expect_play_task_ran() { # case task
-  local verdict
-  verdict=$(awk -v want="TASK [$2]" '
-    index($0, want) == 1 { seen = 1; next }
-    seen && /^skipping: / { seen = 0; next }
-    seen && /^(ok|changed): / { print "ran"; exit }
-    seen && /^TASK \[/ { seen = 0 }' "$work/cases/$1/out")
-  [ "$verdict" = ran ] || fail "$1: the play task \"$2\" did not run" "$work/cases/$1/out"
+  [ "$(play_task_verdict "$1" "$2")" = ran ] || fail "$1: the play task \"$2\" did not run" "$work/cases/$1/out"
 }
 log_empty() { [ ! -s "$work/cases/$1/log" ] || fail "$1: a fake was called, and none may be" "$work/cases/$1/log"; }
 # state CASE KEY: one line of the namespace's state dump.
@@ -2525,6 +2523,8 @@ expect_calls e2-migrated managed "node receipt --refresh --config /etc/billet/bi
 expect_calls e2-migrated systemctl "" 0
 expect_state e2-migrated tempfiles 0
 expect_play_task_ran e2-migrated "Install the rendering as the render would"
+# THE NEGATIVE HELPER, PROVED: over the migrated case's output it must object.
+( expect_no_play_task e2-migrated "Install the rendering as the render would" ) >/dev/null 2>&1 && fail "e2-migrated: expect_no_play_task did not see the render task that ran" "$work/cases/e2-migrated/out"
 order=$(commands e2-migrated | grep -v " prepare$\| version$\| settle$" | tr '\n' ';')
 [ "$order" = "managed migrate-endpoint;managed migrate-endpoint;managed registration;managed receipt;managed receipt;" ] \
   || fail "e2-migrated: the order is not decision, action, confirmation, receipt, refresh: $order" "$work/cases/e2-migrated/log"
