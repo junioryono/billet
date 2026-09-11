@@ -38,9 +38,14 @@ say "installing the package"
 # arrives with its reason while the job still has time to print it (-v names the
 # signal and the command it went to, -k kills a dpkg that shrugs off TERM). And an index
 # apt-get update could not fetch is only a WARNING to it, exit 0, measured against
-# a black-holed proxy; Error-Mode=any makes that the failure it is, here rather
-# than two commands later as "openssl has no installation candidate".
-APT="timeout -v -k 10 300 apt-get -o APT::Update::Error-Mode=any -o Acquire::Retries=3 -o Acquire::http::Timeout=30"
+# a black-holed proxy; so every update is followed by a check that at least one
+# InRelease landed in /var/lib/apt/lists, which is the failure it is, here rather
+# than two commands later as "openssl has no installation candidate". Not
+# Error-Mode=any: with TWO sources (archive.ubuntu.com, then a kernel.org mirror;
+# apt reads them as two repositories and takes a package from whichever lists it)
+# a strict update fails while EITHER is down, measured on a fleet guest 2026-09-11,
+# which is the outage this shape exists to survive.
+APT="timeout -v -k 10 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30"
 if ! ${APT} install -y -qq /tmp/billet.deb >/dev/null 2>&1; then
     ${APT} install -y /tmp/billet.deb 2>&1 | tail -20
     echo "the package would not install" >&2
