@@ -289,12 +289,24 @@ func migrateEndpoint(ctx context.Context, m migrateMode) (any, *endpointRefusal)
 			pre.ActiveState, br.obs.MainPID, br.obs.InvocationID), "check and approve afresh", stateNothing)
 	}
 
+	// AN INCOMPLETE OBSERVATION IS COULD-NOT-TELL: a property systemd did not
+	// answer is not a disallowed value.
+	if pre.KillMode == "" {
+		return nil, endpointUnknown(endpointReasonUnit, "systemd answered no KillMode for "+nodeUnit+", so the stop's "+
+			"premise cannot be judged", "check and approve afresh", stateNothing)
+	}
+
 	switch pre.KillMode {
 	case "mixed", "control-group":
 	default:
 		return nil, endpointRefuse(endpointReasonPolicy, fmt.Sprintf("%s has KillMode=%s, under which a stop proves nothing "+
 			"about the processes that remain; only mixed or control-group is migrated", nodeUnit, orUnknownWord(pre.KillMode)),
 			"", stateNothing)
+	}
+
+	if pre.LoadState == "" {
+		return nil, endpointUnknown(endpointReasonUnit, "systemd answered no LoadState for "+nodeUnit+", so whether it can be "+
+			"started after the stop cannot be judged", "check and approve afresh", stateNothing)
 	}
 
 	if pre.LoadState != "loaded" {
@@ -730,6 +742,12 @@ func sameNodeIdentity(installed *installedConfigObservation, rendering *configOb
 		which string
 		id    registrationIdentity
 	}{{"installed", a}, {"rendering", b}} {
+		// A CONTRADICTION IS A REFUSAL: a configuration whose name and
+		// certificate disagree could never start as either.
+		if side.id.contradiction != "" {
+			return "the " + side.which + " configuration: " + side.id.contradiction, ""
+		}
+
 		if side.id.why != "" && !side.id.absent {
 			return "", "the " + side.which + " configuration's node identity: " + side.id.why
 		}

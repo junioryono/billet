@@ -299,7 +299,8 @@ func decodeRegistrationRecord(body []byte) (*registrationRecord, error) {
 type registrationIdentity struct {
 	node, deployment string
 	why              string
-	absent           bool // the deployment is positively unminted, not unread
+	absent           bool   // the deployment is positively unminted, not unread
+	contradiction    string // the configured name and the certificate's disagree: a positive fact, also in why
 }
 
 // expectedRegistrationIdentity derives the identity from the configuration
@@ -327,8 +328,19 @@ func expectedRegistrationIdentity(cfg *config.Config) registrationIdentity {
 			return registrationIdentity{why: cfg.Node.TLS.CertPath + " does not hold exactly one certificate"}
 		}
 
-		if id.node == "" {
-			id.node = leaves[0].Subject.CommonName
+		cn := leaves[0].Subject.CommonName
+
+		switch {
+		case id.node == "":
+			id.node = cn
+		case cn != id.node:
+			// THE NODE'S OWN STARTUP RULE: an explicit name must be the
+			// certificate's, because the control plane authorises by the
+			// certificate; a configuration that disagrees never starts, so
+			// the identity it names is a contradiction and not a name.
+			why := fmt.Sprintf("node.name is %q but %s was issued for %q", id.node, cfg.Node.TLS.CertPath, cn)
+
+			return registrationIdentity{node: id.node, why: why, contradiction: why}
 		}
 
 		if len(leaves[0].Subject.Organization) != 1 {

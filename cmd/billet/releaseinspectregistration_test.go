@@ -1025,3 +1025,23 @@ func TestReleaseInspectRegistrationOnDarwin(t *testing.T) {
 		t.Errorf("the registration reader performed %v on darwin", f.ops)
 	}
 }
+
+// An ELOOP at the record's open is what the platform means by it: a Mac's
+// O_NOFOLLOW refuses the link itself (invalid), Linux admits a link's
+// identity so an ELOOP there is a loop on the way (unreadable).
+func TestARecordELOOPIsClassifiedByPlatform(t *testing.T) {
+	f := newRegistrationFixture(t, "node:\n  name: node-a\n")
+	f.writeRecord(t, f.record(nil))
+
+	saved := registrationOpen
+	registrationOpen = func(string) (*os.File, os.FileInfo, error) {
+		return nil, nil, &fs.PathError{Op: "open", Err: syscall.ELOOP}
+	}
+
+	t.Cleanup(func() { registrationOpen = saved })
+
+	ev := readRegistrationRecord(f.recordPath)
+	if darwin := runtime.GOOS == "darwin"; ev.invalid != darwin || ev.unreadable == darwin {
+		t.Errorf("invalid %v unreadable %v on %s (%s)", ev.invalid, ev.unreadable, runtime.GOOS, ev.why)
+	}
+}

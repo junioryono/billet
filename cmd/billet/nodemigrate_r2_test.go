@@ -424,3 +424,55 @@ func TestMigrateCloseRequiresARunningProcess(t *testing.T) {
 		t.Errorf("state %q why %q", o.str("state"), o.str("why"))
 	}
 }
+
+// A rendering whose explicit name the certificate contradicts is refused:
+// the node's own startup refuses such a configuration, so a migration that
+// installed it would stop a working node for one that never starts.
+func TestMigrateRefusesANameTheCertificateContradicts(t *testing.T) {
+	tls := nodeTLSFixture(t, true)
+
+	body, err := os.ReadFile(tls.configPath)
+	mustOK(t, err)
+
+	// The installed configuration names node-b too, so the configured names
+	// agree and only the certificate disagrees.
+	f := newEndpointFixture(t)
+	f.writeConfig(t, strings.Replace(f.nodeOnlyConfig(), "  name: node-a\n", "  name: node-b\n", 1))
+
+	rendering := strings.Replace(string(body), "  name: node-a\n", "  name: node-b\n", 1)
+	if rendering == string(body) {
+		t.Fatalf("the TLS configuration does not name node-a:\n%s", body)
+	}
+
+	o := f.migrate(t, rendering, "--dry-run")
+	mustEndpointRefusal(t, o, outcomeRefused, endpointReasonDesired)
+
+	if !strings.Contains(o.str("why"), "was issued for") {
+		t.Errorf("why %q", o.str("why"))
+	}
+}
+
+// A pre-stop observation that lacks a property is could-not-tell, never a
+// refusal: an unanswered KillMode or LoadState is not a disallowed value.
+func TestMigratePreStopObservationMustBeComplete(t *testing.T) {
+	for name, body := range map[string]string{
+		"no KillMode":  nodeUnitBody("active", "running", inspectPID, nodeInvocation, "", "success"),
+		"no LoadState": strings.Replace(nodeUnitBody("active", "running", inspectPID, nodeInvocation, "mixed", "success"), "LoadState=loaded\n", "LoadState=\n", 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newEndpointFixture(t)
+			f.installB(t)
+			f.afterStop(t, "inactive", "dead", "success")
+			f.afterStart(t)
+			f.recordAfterStart(t, canonicalB)
+			f.afterShows(t, showsBeforeTheStop, body)
+
+			o := f.migrate(t, f.rendering(endpointB))
+			mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonUnit)
+
+			if !strings.Contains(o.str("why"), "answered no") || f.calls(t, "stop") != 0 {
+				t.Errorf("why %q stops %d", o.str("why"), f.calls(t, "stop"))
+			}
+		})
+	}
+}
