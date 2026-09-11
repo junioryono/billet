@@ -716,7 +716,7 @@ func TestMigrateFirstStartOverANamelessCertificateIsUnknown(t *testing.T) {
 		t.Fatalf("no cert path in\n%s", body)
 	}
 
-	writeFile(t, cert[1], certPEM(t, "", "dep-1234"), 0o644)
+	writeFile(t, cert[1], certPEM(t, "", "1234567890abcdef1234567890abcdef"), 0o644)
 
 	f := newEndpointFixture(t)
 	f.writeConfig(t, f.serverOnly())
@@ -745,6 +745,34 @@ func TestBracketCloseRefusesAStateItDoesNotJudge(t *testing.T) {
 	mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonUnit)
 
 	if !strings.Contains(o.str("why"), "at the close of the read") {
+		t.Errorf("why %q", o.str("why"))
+	}
+}
+
+// A certificate whose one Organization value is not a deployment identity
+// (whitespace, here) names no deployment: the node's startup validates the
+// identity's grammar, and a first start over it is could-not-tell.
+func TestMigrateFirstStartOverAWhitespaceDeploymentIsUnknown(t *testing.T) {
+	tls := nodeTLSFixture(t, false)
+
+	body, err := os.ReadFile(tls.configPath)
+	mustOK(t, err)
+
+	cert := regexp.MustCompile(`cert: (\S+)`).FindStringSubmatch(string(body))
+	if cert == nil {
+		t.Fatalf("no cert path in\n%s", body)
+	}
+
+	writeFile(t, cert[1], certPEM(t, "node-a", " "), 0o644)
+
+	f := newEndpointFixture(t)
+	f.writeConfig(t, f.serverOnly())
+	f.setNode(t, "inactive", "dead", 0, "", "mixed")
+
+	o := f.migrate(t, string(body), "--dry-run")
+	mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonConfig)
+
+	if !strings.Contains(o.str("why"), "Organization") {
 		t.Errorf("why %q", o.str("why"))
 	}
 }

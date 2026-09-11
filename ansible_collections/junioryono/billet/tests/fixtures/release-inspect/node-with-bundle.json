@@ -41,19 +41,19 @@
           "der_sha256": "abababababababababababababababababababababababababababababababab",
           "not_after": "2026-09-10T12:00:00Z",
           "pem": "-----BEGIN CERTIFICATE-----\nMIIB...\n-----END CERTIFICATE-----\n",
-          "subject": "CN=billet node wire CA,O=dep-1234"
+          "subject": "CN=billet node wire CA,O=1234567890abcdef1234567890abcdef"
         }
       ],
       "leaf": {
         "der_sha256": "abababababababababababababababababababababababababababababababab",
         "not_after": "2026-09-10T12:00:00Z",
         "pem": "-----BEGIN CERTIFICATE-----\nMIIB...\n-----END CERTIFICATE-----\n",
-        "subject": "CN=node-a,O=dep-1234"
+        "subject": "CN=node-a,O=1234567890abcdef1234567890abcdef"
       }
     },
     "os": "linux",
     "registration": {
-      "deployment": "dep-1234",
+      "deployment": "1234567890abcdef1234567890abcdef",
       "endpoint": "https://10.0.0.5:7717",
       "incarnation": "00112233445566778899aabbccddeeff",
       "invocation_id": "0123456789abcdef0123456789abcdef",

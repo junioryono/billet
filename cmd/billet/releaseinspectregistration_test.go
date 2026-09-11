@@ -120,7 +120,7 @@ func (o ownedInfo) Sys() any { return o.sys }
 // record is a valid record for the fixture's node, with the given overrides.
 func (f *registrationFixture) record(overrides map[string]any) map[string]any {
 	rec := map[string]any{
-		"schema": 1, "node": "node-a", "deployment": "dep-1234", "incarnation": testIncarnation,
+		"schema": 1, "node": "node-a", "deployment": "1234567890abcdef1234567890abcdef", "incarnation": testIncarnation,
 		"invocation_id": nodeInvocation, "endpoint": "https://10.0.0.5:7717", "registered_at": "2026-09-09T12:00:00Z",
 	}
 
@@ -188,13 +188,13 @@ func (f *registrationFixture) nodeProperty(t *testing.T, name, value string) {
 }
 
 // nodeTLSFixture is a TLS node whose bundle names node-a in deployment
-// dep-1234, with or without a configured node.name.
+// 1234567890abcdef1234567890abcdef, with or without a configured node.name.
 func nodeTLSFixture(t *testing.T, withName bool) *registrationFixture {
 	t.Helper()
 
 	base := newInspectFixture(t)
 
-	ca, err := wirecert.LoadOrCreateCA(base.stateDir, "dep-1234")
+	ca, err := wirecert.LoadOrCreateCA(base.stateDir, "1234567890abcdef1234567890abcdef")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -244,7 +244,7 @@ func TestReleaseInspectRegistrationIsCurrentOnlyForTheNodesInvocation(t *testing
 	r := f.report(t)
 	rec := registrationOf(t, r)
 
-	if rec != (registrationReport{Node: "node-a", Deployment: "dep-1234", Incarnation: testIncarnation,
+	if rec != (registrationReport{Node: "node-a", Deployment: "1234567890abcdef1234567890abcdef", Incarnation: testIncarnation,
 		InvocationID: nodeInvocation, Endpoint: "https://10.0.0.5:7717", RegisteredAt: "2026-09-09T12:00:00Z"}) {
 		t.Errorf("host.registration = %+v", rec)
 	}
@@ -857,7 +857,7 @@ func TestReleaseInspectRegistrationIdentitySources(t *testing.T) {
 	t.Run("a TLS node's deployment is the bundle's Organization", func(t *testing.T) {
 		f := nodeTLSFixture(t, true)
 		f.writeRecord(t, f.record(map[string]any{"deployment": "dep-other"}))
-		mustUnknown(t, "host.registration", f.report(t).Host.Registration, "names the deployment dep-other and this node's deployment is dep-1234")
+		mustUnknown(t, "host.registration", f.report(t).Host.Registration, "names the deployment dep-other and this node's deployment is 1234567890abcdef1234567890abcdef")
 	})
 
 	t.Run("a configured bundle that cannot be read is never the certless fallback", func(t *testing.T) {
@@ -924,7 +924,7 @@ func TestReleaseInspectRegistrationIdentitySources(t *testing.T) {
 		mustOK(t, err)
 
 		f.writeRecord(t, f.record(map[string]any{"deployment": serverID}))
-		mustUnknown(t, "host.registration", f.report(t).Host.Registration, "this node's deployment is dep-1234")
+		mustUnknown(t, "host.registration", f.report(t).Host.Registration, "this node's deployment is 1234567890abcdef1234567890abcdef")
 	})
 
 	t.Run("a certless node-only host reads its own state directory without minting", func(t *testing.T) {

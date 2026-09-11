@@ -1674,7 +1674,7 @@ func TestReleaseInspectRefusesASpecialFileAtItsOwnInputs(t *testing.T) {
 	})
 	t.Run("a certificate bundle", func(t *testing.T) {
 		f := newInspectFixture(t)
-		ca, err := wirecert.LoadOrCreateCA(f.stateDir, "dep-1234")
+		ca, err := wirecert.LoadOrCreateCA(f.stateDir, "1234567890abcdef1234567890abcdef")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2082,7 +2082,7 @@ func TestReleaseInspectADormantUnitIsNotAController(t *testing.T) {
 
 func TestReleaseInspectReportsANodesTrustStoreWithoutItsKey(t *testing.T) {
 	f := newInspectFixture(t)
-	ca, err := wirecert.LoadOrCreateCA(f.stateDir, "dep-1234")
+	ca, err := wirecert.LoadOrCreateCA(f.stateDir, "1234567890abcdef1234567890abcdef")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2253,7 +2253,7 @@ func TestReleaseInspectJSONFieldSet(t *testing.T) {
 		if _, err := state.DeploymentID(f.stateDir); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := wirecert.LoadOrCreateCA(f.stateDir, "dep-1234"); err != nil {
+		if _, err := wirecert.LoadOrCreateCA(f.stateDir, "1234567890abcdef1234567890abcdef"); err != nil {
 			t.Fatal(err)
 		}
 		assertFieldSet(t, f.report(t), inspectFieldSet)
@@ -2277,7 +2277,7 @@ func TestReleaseInspectJSONFieldSet(t *testing.T) {
 	})
 	t.Run("node with a bundle and a journal", func(t *testing.T) {
 		f := newInspectFixture(t)
-		ca, err := wirecert.LoadOrCreateCA(f.stateDir, "dep-1234")
+		ca, err := wirecert.LoadOrCreateCA(f.stateDir, "1234567890abcdef1234567890abcdef")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2327,7 +2327,7 @@ func TestReleaseInspectJSONFieldSet(t *testing.T) {
 			asRoot.Uid = 0
 			return file, ownedInfo{FileInfo: info, sys: &asRoot}, nil
 		}
-		writeFile(t, registrationRecordPath, `{"schema":1,"node":"node-a","deployment":"dep-1234","incarnation":"00112233445566778899aabbccddeeff","invocation_id":"0123456789abcdef0123456789abcdef","endpoint":"https://10.0.0.5:7717","registered_at":"2026-09-09T12:00:00Z"}`+"\n", 0o600)
+		writeFile(t, registrationRecordPath, `{"schema":1,"node":"node-a","deployment":"1234567890abcdef1234567890abcdef","incarnation":"00112233445566778899aabbccddeeff","invocation_id":"0123456789abcdef0123456789abcdef","endpoint":"https://10.0.0.5:7717","registered_at":"2026-09-09T12:00:00Z"}`+"\n", 0o600)
 		if err := os.Chmod(registrationRecordPath, 0o600); err != nil {
 			t.Fatal(err)
 		}

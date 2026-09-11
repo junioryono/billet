@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/deploymentid"
 	"github.com/junioryono/billet/internal/endpoint"
 	"github.com/junioryono/billet/internal/regularfile"
 	"github.com/junioryono/billet/internal/state"
@@ -347,8 +348,15 @@ func expectedRegistrationIdentity(cfg *config.Config) registrationIdentity {
 			return registrationIdentity{node: id.node, why: why, contradiction: why}
 		}
 
-		if len(leaves[0].Subject.Organization) != 1 || leaves[0].Subject.Organization[0] == "" {
-			return registrationIdentity{why: cfg.Node.TLS.CertPath + " names no single, non-empty deployment in its Organization"}
+		if len(leaves[0].Subject.Organization) != 1 {
+			return registrationIdentity{why: cfg.Node.TLS.CertPath + " names no single deployment in its Organization"}
+		}
+
+		// THE DEPLOYMENT IDENTITY'S OWN GRAMMAR, which the node's startup holds
+		// the certificate to: a value that is not one (empty, whitespace, the
+		// wrong length or case) names no deployment, untrimmed and unsanitised.
+		if err := deploymentid.Validate(leaves[0].Subject.Organization[0]); err != nil {
+			return registrationIdentity{why: fmt.Sprintf("%s names no deployment in its Organization: %v", cfg.Node.TLS.CertPath, err)}
 		}
 
 		id.deployment = leaves[0].Subject.Organization[0]
