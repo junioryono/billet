@@ -20,12 +20,21 @@ billet_server_environment_marker_path: /etc/billet/server.env-managed
 billet_state_ca_bundle_path: /etc/billet/rds-ca-bundle.pem
 
 # THE ENDPOINT COMMANDS' OWN PHASES, mirrored so the role's outer bound
-# (`timeout -k 10`) expires after the command's own deadlines and never ends a
-# migration inside a phase it was allowed: `billet node migrate-endpoint`
+# (`timeout -k 10`) expires after the command's own deadlines and their
+# observations, and a slow but permitted sequence never loses its answer
+# after the node was stopped or started. `billet node migrate-endpoint`
 # judges up to three times when the process moves under its bracket, each
-# judgement waiting the record wait, and its start runs under the unit's
-# start bound (deploy.UnitStartTimeout, 120s) plus the lifecycle margin (30s).
+# judgement waiting the record wait (a bracket already running when the wait
+# ends finishes under its own observations, two of them, and the closing
+# check is a third); a record read is up to three brackets of two
+# observations each; every observation is one `systemctl show` under the
+# inspector's bound (lifeops.DefaultTimeout, 30s); the start runs under the
+# unit's start bound (deploy.UnitStartTimeout, 120s) plus the lifecycle
+# margin (30s). cmd/billet's TestTheRoleMirrorsTheEndpointCommandsPhaseBudgets
+# holds each value to the constant it mirrors.
 billet_migration_judgement_attempts: 3
+billet_migration_bracket_attempts: 3
+billet_migration_observation_bound: 30
 billet_migration_start_bound: 150
 
 # billet_configured_server_state_dir is the directory THIS RUN'S billet_config

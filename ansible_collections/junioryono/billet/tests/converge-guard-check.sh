@@ -87,6 +87,7 @@ fail() {
 # --- the module's own check -------------------------------------------------
 "$python" "$here/guard_fallback_check.py"
 "$python" "$here/strict_json_check.py"
+"$python" "$here/holder_check.py"
 
 # --- the guard runs first, the preparation second ---------------------------
 first_task=$(grep -n '^- name:' "$role_tasks/main.yml" | head -1 | cut -d: -f1)
@@ -731,6 +732,25 @@ expect_ran() { # case task
     seen && /^TASK \[/ { seen = 0 }' "$work/cases/$1/out")
   [ "$verdict" = ran ] || fail "$1: the task \"$2\" did not run" "$work/cases/$1/out"
 }
+# The play's own tasks (not the role's): the render's stand-in.
+expect_no_play_task() { # case task
+  local verdict
+  verdict=$(awk -v want="TASK [$2]" '
+    index($0, want) == 1 { seen = 1; next }
+    seen && /^skipping: / { seen = 0; next }
+    seen && /^(ok|changed|fatal|failed): / { print "ran"; exit }
+    seen && /^TASK \[/ { seen = 0 }' "$work/cases/$1/out")
+  [ "$verdict" != ran ] || fail "$1: the play task \"$2\" ran, and it must not" "$work/cases/$1/out"
+}
+expect_play_task_ran() { # case task
+  local verdict
+  verdict=$(awk -v want="TASK [$2]" '
+    index($0, want) == 1 { seen = 1; next }
+    seen && /^skipping: / { seen = 0; next }
+    seen && /^(ok|changed): / { print "ran"; exit }
+    seen && /^TASK \[/ { seen = 0 }' "$work/cases/$1/out")
+  [ "$verdict" = ran ] || fail "$1: the play task \"$2\" did not run" "$work/cases/$1/out"
+}
 log_empty() { [ ! -s "$work/cases/$1/log" ] || fail "$1: a fake was called, and none may be" "$work/cases/$1/log"; }
 # state CASE KEY: one line of the namespace's state dump.
 state() { sed -n "s/^$2=//p" "$work/cases/$1/state" | head -n1; }
@@ -1035,6 +1055,10 @@ mapfile -t args <"$case_dir/args"
 } >/var/lib/billet-gate.env
 chmod 0644 /var/lib/billet-gate.env
 mkdir -p "$case_dir/tmp"
+# THE TEMPORARY FILES ARE JUDGED AGAINST A SNAPSHOT: /tmp is the host's (the
+# work directory may live under it, so it cannot be overlaid), and what the
+# case is answerable for is what appeared during its play.
+ls /tmp 2>/dev/null | grep '^billet-endpoint-' | sort >"$case_dir/tmp-before" || true
 if [ "$mode" = escalated ]; then
   env "${envs[@]}" HOME="$HOME_DIR" "$ANSIBLE_PLAYBOOK" -i "$INVENTORY" "$play" -e ansible_become=false -e billet_gate_expect_uid=0 "${args[@]+"${args[@]}"}" >"$case_dir/out" 2>&1
 elif [ "$mode" = become ]; then
@@ -1089,8 +1113,10 @@ PY
   done
   echo "status_json=$("$MNT/bin/billet-v0.10.0" converge-guard status --json 2>/dev/null | tr -d '\n ')"
   echo "config=$(t /etc/billet/billet.yaml)"
-  echo "tempfiles=$(ls /tmp 2>/dev/null | grep -c '^billet-endpoint-' || true)"
+  ls /tmp 2>/dev/null | grep '^billet-endpoint-' | sort >"$case_dir/tmp-after" || true
+  echo "tempfiles=$(comm -13 "$case_dir/tmp-before" "$case_dir/tmp-after" | wc -l | tr -d ' ')"
 } >"$case_dir/state" 2>/dev/null
+comm -13 "$case_dir/tmp-before" "$case_dir/tmp-after" | while IFS= read -r f; do [ -n "$f" ] && rm -f "/tmp/$f"; done
 [ -f /etc/billet/billet.yaml ] && cp /etc/billet/billet.yaml "$case_dir/installed.yaml"
 mkdir -p "$case_dir/upper" && cp -a "$MNT/ub-upper" "$case_dir/upper/usr-bin" 2>/dev/null; cp -a "$MNT/vl-upper" "$case_dir/upper/var-lib" 2>/dev/null
 chown -R "$INVOKER_UID:$INVOKER_GID" "$case_dir" 2>/dev/null || true
@@ -2493,10 +2519,12 @@ expect_calls e2-migrated managed "rollout registration --config /etc/billet/bill
 expect_calls e2-migrated managed "--environment-file" 0
 expect_calls e2-migrated managed "node receipt --evidence " 1
 expect_calls e2-migrated managed " --confirmation " 1
-expect_calls e2-migrated managed " --config /etc/billet/billet.yaml --wait 60s --run h1 --json" 1
+expect_calls e2-migrated managed " --config /etc/billet/billet.yaml --run h1 --json" 1
+expect_calls e2-migrated managed "node receipt --evidence /tmp/billet-endpoint-evidence-" 1
 expect_calls e2-migrated managed "node receipt --refresh --config /etc/billet/billet.yaml --desired - --wait 60s --json --run h1" 1
 expect_calls e2-migrated systemctl "" 0
 expect_state e2-migrated tempfiles 0
+expect_play_task_ran e2-migrated "Install the rendering as the render would"
 order=$(commands e2-migrated | grep -v " prepare$\| version$\| settle$" | tr '\n' ';')
 [ "$order" = "managed migrate-endpoint;managed migrate-endpoint;managed registration;managed receipt;managed receipt;" ] \
   || fail "e2-migrated: the order is not decision, action, confirmation, receipt, refresh: $order" "$work/cases/e2-migrated/log"
@@ -2524,7 +2552,7 @@ ep_refused_decision() { # name fixture fragment
   expect_calls "$name" managed "node migrate-endpoint" 1
   expect_calls "$name" managed "node receipt" 0
   expect_calls "$name" systemctl "" 0
-  expect_no_task "$name" "Install the rendering as the render would"
+  expect_no_play_task "$name" "Install the rendering as the render would"
   expect_installed_unchanged "$name"
 }
 ep_refused_decision e3-stopping refused-stopping.json "was refused (stopping)"
@@ -2542,7 +2570,7 @@ ep_planned_refusal() { # name fragment extra...
   ep_case "$name"
   expect_refused "$name" "Refuse a planned endpoint migration this converge cannot perform" "$frag" "nothing was stopped or installed"
   expect_binary_calls "$name" "node migrate-endpoint" 1
-  expect_no_task "$name" "Install the rendering as the render would"
+  expect_no_play_task "$name" "Install the rendering as the render would"
   expect_installed_unchanged "$name"
 }
 ep_planned_refusal e4-policy "the policy will not start the node" -e billet_node_should_run=false
@@ -2601,7 +2629,7 @@ expect_no_task e6-legacy-unchanged "Refresh the endpoint receipt"
 grep -q "this release predates the converge guard" "$work/cases/e6-legacy-unchanged/out" || fail "e6: the compatibility report is missing" "$work/cases/e6-legacy-unchanged/out"
 ep_legacy e6b-legacy-changed $EP_A $EP_B
 expect_refused e6b-legacy-changed "Refuse an endpoint change a release before the converge guard cannot migrate" "pin a release that carries it" "http://127.0.0.1:7717" "http://127.0.0.1:7719"
-expect_no_task e6b-legacy-changed "Install the rendering as the render would"
+expect_no_play_task e6b-legacy-changed "Install the rendering as the render would"
 expect_installed_unchanged e6b-legacy-changed
 ep_legacy e6c-legacy-derived $EP_A $EP_A derived
 expect_allowed e6c-legacy-derived
@@ -2624,7 +2652,7 @@ ep_no_billet() { # name show-body-or-empty
 ep_no_billet e7-leftover 'LoadState=loaded\nActiveState=active\nMainPID=4242\n'
 expect_refused e7-leftover "Refuse a converge over a node running on a host with no billet" "a node runs on a host with no billet to ask" "loaded, active, pid 4242" "stop it or install the release first"
 expect_calls e7-leftover systemctl "show billet-node.service --property=LoadState,ActiveState,MainPID" 1
-expect_no_task e7-leftover "Install the rendering as the render would"
+expect_no_play_task e7-leftover "Install the rendering as the render would"
 ep_no_billet e7b-inactive 'LoadState=not-found\nActiveState=inactive\nMainPID=0\n'
 expect_allowed e7b-inactive
 expect_fact e7b-inactive nobillet True
@@ -2662,7 +2690,7 @@ ep_corrupt_decision() { # name member json check
     [ "$items" -eq 1 ] || fail "$name: $items failed items of the parser, want exactly one" "$work/cases/$name/out"
     grep -q "^failed: \[localhost\] (item=$check)" "$work/cases/$name/out" || fail "$name: the failed item is not $check" "$work/cases/$name/out"
   fi
-  expect_no_task "$name" "Install the rendering as the render would"
+  expect_no_play_task "$name" "Install the rendering as the render would"
 }
 ep_corrupt_decision e8-planned planned '"yes"' planned
 ep_corrupt_decision e8-record record '"stale"' record
@@ -2684,7 +2712,7 @@ a e8-hang -e billet_migration_record_wait=1 -e billet_guard_timeout=2
 e e8-hang "BILLET_GATE_FAIL=migrate-endpoint:hang"
 ep_case e8-hang
 expect_refused e8-hang "Refuse a migration call that did not answer" "ended by the bound"
-expect_no_task e8-hang "Install the rendering as the render would"
+expect_no_play_task e8-hang "Install the rendering as the render would"
 echo "ok   E8: the migration's parser refuses one corrupted member at a time, the exit table, and a run the bound ended"
 
 # E9. The protocol's later halves refused: an unconfirmed registration, a
@@ -2769,6 +2797,19 @@ e e11c-written-other-run "BILLET_GATE_ANSWER=migrate-endpoint:1:$(ep_fixture e11
 ep_case e11c-written-other-run
 expect_refused e11c-written-other-run "Judge the receipt's answer" "answered with a member this role cannot read: receipt_run"
 expect_state e11c-written-other-run tempfiles 0
+# Evidence mode writes or fails: a `current` answer there is one the
+# command never gives, refused at the outcome even under a valid holder.
+ep_plant_ordinary e11e-evidence-current $EP_A $EP_B
+e e11e-evidence-current "BILLET_GATE_ANSWER=migrate-endpoint:1:$(ep_fixture e11e-evidence-current node-migrate-endpoint reported-planned.json);migrate-endpoint:2:$(ep_fixture e11e-evidence-current node-migrate-endpoint migrated.json);registration:1:$(ep_fixture e11e-evidence-current rollout-registration confirmed.json incarnation=$EP_INC);receipt:1:$(ep_fixture e11e-evidence-current node-receipt current.json receipt.run=h1)"
+ep_case e11e-evidence-current
+expect_refused e11e-evidence-current "Judge the receipt's answer" "answered with a member this role cannot read: outcome"
+expect_fact e11e-evidence-current migrated False
+expect_state e11e-evidence-current tempfiles 0
+# The holder grammar is the command's: 101 two-byte characters are 202 bytes.
+ep_plant_ordinary e11f-current-long-run $EP_A $EP_A
+e e11f-current-long-run "BILLET_GATE_ANSWER=migrate-endpoint:1:$(ep_fixture e11f-current-long-run node-migrate-endpoint reported-unplanned.json);migrate-endpoint:2:$(ep_fixture e11f-current-long-run node-migrate-endpoint unchanged.json);receipt:1:$(ep_fixture e11f-current-long-run node-receipt current.json "receipt.run=$(printf 'é%.0s' $(seq 1 101))")"
+ep_case e11f-current-long-run
+expect_refused e11f-current-long-run "Judge the receipt's answer" "answered with a member this role cannot read: receipt_run"
 ep_plant_ordinary e11d-current-null-node $EP_A $EP_A
 f=$(ep_fixture e11d-current-null-node node-migrate-endpoint unchanged.json)
 ep_corrupt "$f" node null
@@ -2776,6 +2817,6 @@ ep_corrupt "$f" node_removed true
 e e11d-current-null-node "BILLET_GATE_ANSWER=migrate-endpoint:1:$(ep_fixture e11d-current-null-node node-migrate-endpoint reported-unplanned.json);migrate-endpoint:2:$f"
 ep_case e11d-current-null-node
 expect_refused e11d-current-null-node "Judge the migration's answer" "answered with a member this role cannot read: node"
-echo "ok   E11: a current receipt keeps a holder that is one, a written receipt carries this run's, and an unchanged current answer names its node"
+echo "ok   E11: a current receipt keeps a holder that is one (by the command's grammar), a written receipt carries this run's, evidence mode never answers current, and an unchanged current answer names its node"
 
 echo "converge guard: every case passed"

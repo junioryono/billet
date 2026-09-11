@@ -38,9 +38,6 @@
     billet_receipt_outcome: "{{ billet_receipt_a.outcome | default('') }}"
     billet_receipt_r: "{{ billet_receipt_a.receipt | default(none) }}"
     billet_receipt_hex32: '^[0-9a-f]{32}\Z'
-    # A holder as the guard checks it: 1 to 200 bytes, no whitespace, control
-    # character or slash.
-    billet_receipt_holder: '^[^\s/\x00-\x1f\x7f]{1,200}\Z'
     billet_receipt_sha: '^[0-9a-f]{64}\Z'
     billet_receipt_failed: "{{ billet_receipt_outcome in ['refused', 'unknown'] }}"
     billet_receipt_with_receipt: "{{ billet_receipt_outcome in ['written', 'current'] or (billet_receipt_outcome == 'reported' and billet_receipt_r is not none) }}"
@@ -58,8 +55,11 @@
       unknown: [schema, outcome, reason, why]
     billet_receipt_fields: [schema, run, node, deployment, installed_sha256, installed_endpoint, effective_endpoint, invocation_id, incarnation, written_at]
     billet_receipt_checks:
+      # THE OUTCOMES BY CALL: the refresh writes, finds a receipt current, or
+      # in a dry run reports; evidence mode writes or fails, since the
+      # `current` shortcut is the refresh's alone.
       - name: outcome
-        ok: "{{ billet_receipt_outcome in (['reported', 'refused', 'unknown'] if billet_receipt_dry | bool else ['written', 'current', 'refused', 'unknown']) }}"
+        ok: "{{ billet_receipt_outcome in (['reported', 'refused', 'unknown'] if billet_receipt_dry | bool else (['written', 'current', 'refused', 'unknown'] if billet_receipt_call == 'refresh' else ['written', 'refused', 'unknown'])) }}"
       - name: schema
         ok: "{{ billet_receipt_a.schema | default(0) is integer and billet_receipt_a.schema | default(0) == 1 }}"
       - name: exit
@@ -83,11 +83,12 @@
       # THE RUN: a `written` receipt carries this converge's holder; a `current`
       # one keeps the holder it was written under (the shortcut compares the
       # evidence, never the run), so an unchanged host converges under a new
-      # holder, and that holder is still one the guard would accept, since
-      # the producer's reader refuses a receipt naming none; a dry run
-      # reports whatever it would write, an empty run included.
+      # holder, and that holder is still one the guard would accept
+      # (`valid_holder`, the one grammar `checkHolder` is, held to its vector
+      # table), since the producer's reader refuses a receipt naming none; a
+      # dry run reports whatever it would write, an empty run included.
       - name: receipt_run
-        ok: "{{ not billet_receipt_with_receipt or ((billet_receipt_r.run | default('x')) is string and (billet_receipt_dry | bool or (billet_receipt_outcome == 'current' and (billet_receipt_r.run | default('')) is match(billet_receipt_holder)) or (billet_receipt_outcome == 'written' and billet_receipt_r.run | default('') == billet_receipt_run))) }}"
+        ok: "{{ not billet_receipt_with_receipt or ((billet_receipt_r.run | default('x')) is string and (billet_receipt_dry | bool or (billet_receipt_outcome == 'current' and (billet_receipt_r.run | default('') | junioryono.billet.valid_holder)) or (billet_receipt_outcome == 'written' and billet_receipt_r.run | default('') == billet_receipt_run))) }}"
       - name: receipt_node
         ok: "{{ not billet_receipt_with_receipt or ((billet_receipt_r.node | default('x')) is string and (billet_receipt_r.node | default('')) | length > 0) }}"
       - name: receipt_deployment

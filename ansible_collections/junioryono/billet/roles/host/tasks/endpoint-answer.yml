@@ -132,7 +132,9 @@
     fail_msg: >-
       The endpoint migration's {{ billet_endpoint_call }} through
       {{ billet_endpoint_answered_by }} answered with a member this role cannot
-      read: {{ item.name }}. Nothing was acted on.
+      read: {{ item.name }}.
+      {{ 'Nothing was stopped or installed.' if billet_endpoint_call == 'decision'
+         else 'The configuration is installed, and whether the node was stopped or restarted cannot be established from this answer; inspect billet-node.service and converge again.' }}
   loop: "{{ billet_endpoint_checks }}"
   loop_control:
     label: "{{ item.name }}"

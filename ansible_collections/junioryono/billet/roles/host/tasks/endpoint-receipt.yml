@@ -40,10 +40,12 @@
       check_mode: false
       become: true
 
+    # Bounded by the wait, the two observations of a bracket that outlives
+    # it, the publication's two closing observations, and the guard's bound.
     - name: Refresh the endpoint receipt
       ansible.builtin.command:
         argv: >-
-          {{ ['timeout', '-k', '10', ((billet_receipt_wait | int) + (billet_guard_timeout | int)) | string,
+          {{ ['timeout', '-k', '10', ((billet_receipt_wait | int) + 4 * (billet_migration_observation_bound | int) + (billet_guard_timeout | int)) | string,
               billet_endpoint_action_executable, 'node', 'receipt', '--refresh', '--config', '/etc/billet/billet.yaml',
               '--desired', '-', '--wait', (billet_receipt_wait | string) ~ 's', '--json']
              + (['--dry-run'] if ansible_check_mode else ['--run', billet_exclusion_holder]) }}
