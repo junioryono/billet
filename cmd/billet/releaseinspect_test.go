@@ -80,9 +80,12 @@ func newInspectFixture(t *testing.T) *inspectFixture {
 	provenance.Path = filepath.Join(dir, "installed.json")
 	// The receipt's path is this fixture's own on every platform, so the
 	// report's shape (an absent receipt) is the same wherever the tests run.
-	prevReceiptPath := receiptPath
+	prevReceiptPath, prevReceiptOwner := receiptPath, receiptOwnerOf
 	receiptPath = filepath.Join(dir, "node", "endpoint-migration.json")
-	t.Cleanup(func() { receiptPath = prevReceiptPath })
+	// The receipt's parent (this fixture's root) stands in for /var/lib/billet,
+	// root's and 0755: the reader judges the parent before the receipt.
+	receiptOwnerOf = func(os.FileInfo) (uint32, bool) { return 0, true }
+	t.Cleanup(func() { receiptPath, receiptOwnerOf = prevReceiptPath, prevReceiptOwner })
 	inspectAfterOpen = nil
 	inspectAfterConfig, inspectBeforeClose, inspectBetweenClosingChecks, inspectAfterViewOpen = nil, nil, nil, nil
 	t.Cleanup(func() {

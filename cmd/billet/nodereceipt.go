@@ -486,7 +486,18 @@ func publishReceipt(ctx context.Context, insp *lifeops.Inspector, installed *ins
 	case receiptUnreadable:
 		return nil, endpointUnknown(endpointReasonTrust, existing.why, "", "")
 	case receiptInvalid:
-		if existing.info == nil || !existing.info.Mode().IsRegular() {
+		// No file examined: the reader's judgement is about the parent or the
+		// directory, which moved between the writer's examination and the
+		// read; that is could-not-tell, and the closing check names it.
+		if existing.info == nil {
+			if r := sameDirectory("under the existing file's read"); r != nil {
+				return nil, r
+			}
+
+			return nil, endpointUnknown(endpointReasonTrust, existing.why, "converge again", "")
+		}
+
+		if !existing.info.Mode().IsRegular() {
 			return nil, endpointRefuse(endpointReasonTrust, "the receipt path "+receiptPath+" holds something billet did not "+
 				"write and cannot replace: "+existing.why, "remove it by hand", "")
 		}
@@ -530,6 +541,16 @@ func publishReceipt(ctx context.Context, insp *lifeops.Inspector, installed *ins
 			if err := receiptSyncDir(d); err != nil {
 				return nil, endpointUnknown(endpointReasonTrust, fmt.Sprintf("flush %s: %v", d, err), "converge again; the flush is retried", "")
 			}
+		}
+
+		// CLOSED AFTER THE FLUSHES, immediately before the answer: `current`
+		// is a claim about what the name holds when the answer is given.
+		if r := sameDirectory("after the flushes"); r != nil {
+			return nil, r
+		}
+
+		if r := sameReceipt(existing.info, "after the flushes"); r != nil {
+			return nil, r
 		}
 
 		return receiptAnswer{Schema: endpointSchema, Outcome: outcomeCurrent, Receipt: existing.receipt}, nil
@@ -593,6 +614,10 @@ func publishReceipt(ctx context.Context, insp *lifeops.Inspector, installed *ins
 func readMigrationEvidence(path string) (*migrateEvidence, *endpointRefusal) {
 	body, err := regularfile.ReadFile(path, maxEvidenceBytes, regularfile.Options{NoFollow: true})
 	if err != nil {
+		if inputReadUnknown(err) {
+			return nil, endpointUnknown(endpointReasonEvidence, fmt.Sprintf("read the evidence %s: %v", path, err), "", "")
+		}
+
 		return nil, endpointRefuse(endpointReasonEvidence, fmt.Sprintf("read the evidence %s: %v", path, err), "", "")
 	}
 
@@ -654,6 +679,10 @@ func readMigrationEvidence(path string) (*migrateEvidence, *endpointRefusal) {
 func readConfirmation(path string) (*receiptConfirmation, *endpointRefusal) {
 	body, err := regularfile.ReadFile(path, maxEvidenceBytes, regularfile.Options{NoFollow: true})
 	if err != nil {
+		if inputReadUnknown(err) {
+			return nil, endpointUnknown(endpointReasonConfirm, fmt.Sprintf("read the confirmation %s: %v", path, err), "", "")
+		}
+
 		return nil, endpointRefuse(endpointReasonConfirm, fmt.Sprintf("read the confirmation %s: %v", path, err), "", "")
 	}
 

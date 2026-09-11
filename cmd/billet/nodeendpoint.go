@@ -202,6 +202,19 @@ func closeInstalledConfig(obs *installedConfigObservation) string {
 	return ""
 }
 
+// inputReadUnknown says whether a failed read of an input file establishes
+// nothing about the file: a positive absence, a special file at the name
+// or a size over the bound are judgements (refused); anything else (EIO,
+// EACCES, a failed reopen) is could-not-tell.
+func inputReadUnknown(err error) bool {
+	if errors.Is(err, regularfile.ErrReopen) {
+		return true
+	}
+
+	return !errors.Is(err, os.ErrNotExist) && !errors.Is(err, regularfile.ErrNotRegular) &&
+		!errors.Is(err, regularfile.ErrTooLarge)
+}
+
 // readRendering reads the rendering the role passes: "-" is stdin, anything
 // else a file; bounded, and parsed under the configuration's own rules.
 func readRendering(source string) ([]byte, *config.Config, *endpointRefusal) {
@@ -220,6 +233,11 @@ func readRendering(source string) ([]byte, *config.Config, *endpointRefusal) {
 	}
 
 	if err != nil {
+		if inputReadUnknown(err) {
+			return nil, nil, endpointUnknown(endpointReasonDesired, fmt.Sprintf("read the rendering (%s): %v", source, err),
+				"", stateNothing)
+		}
+
 		return nil, nil, endpointRefuse(endpointReasonDesired, fmt.Sprintf("read the rendering (%s): %v", source, err),
 			"", stateNothing)
 	}

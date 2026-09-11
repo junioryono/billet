@@ -336,6 +336,119 @@ func TestReceiptDirectoryMustBeRootsAndPrivate(t *testing.T) {
 	})
 }
 
+// A failed read of an input establishes nothing: could-not-tell, never a
+// refusal.
+func TestReceiptInputsThatCannotBeReadAreCouldNotTell(t *testing.T) {
+	f := newReceiptCmdFixture(t)
+	f.migrated(t)
+
+	t.Run("the confirmation unreadable", func(t *testing.T) {
+		conf := f.file(t, "confirmation-unreadable.json", f.confirmationObject(nil))
+		mustOK(t, os.Chmod(conf, 0))
+
+		o := runEndpoint(t, cmdNodeReceipt, "", "--evidence", f.file(t, "evidence-a.json", f.evidenceObject(t, nil)),
+			"--confirmation", conf, "--config", f.configPath, "--run", receiptRun)
+		mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonConfirm)
+	})
+
+	t.Run("the evidence unreadable", func(t *testing.T) {
+		ev := f.file(t, "evidence-unreadable.json", f.evidenceObject(t, nil))
+		mustOK(t, os.Chmod(ev, 0))
+
+		o := runEndpoint(t, cmdNodeReceipt, "", "--evidence", ev, "--confirmation",
+			f.file(t, "confirmation-b.json", f.confirmationObject(nil)), "--config", f.configPath, "--run", receiptRun)
+		mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonEvidence)
+	})
+
+	t.Run("the evidence absent", func(t *testing.T) {
+		o := runEndpoint(t, cmdNodeReceipt, "", "--evidence", filepath.Join(f.scratch(), "missing.json"), "--confirmation",
+			f.file(t, "confirmation-c.json", f.confirmationObject(nil)), "--config", f.configPath, "--run", receiptRun)
+		mustEndpointRefusal(t, o, outcomeRefused, endpointReasonEvidence)
+	})
+
+	t.Run("the rendering unreadable", func(t *testing.T) {
+		rendering := f.file(t, "rendering.yaml", []byte(f.rendering(endpointB)))
+		mustOK(t, os.Chmod(rendering, 0))
+
+		o := runEndpoint(t, cmdNodeMigrate, "", "--config", f.configPath, "--desired", rendering, "--dry-run")
+		mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonDesired)
+	})
+}
+
+// A parent or a directory that moved between the writer's examination and
+// the existing file's read is closed as could-not-tell, never read as a
+// file billet cannot replace.
+func TestReceiptClosesADirectoryJudgementFromTheRead(t *testing.T) {
+	f := newReceiptCmdFixture(t)
+	f.migrated(t)
+	mustOK(t, os.Mkdir(f.dir, 0o700))
+
+	lstats := 0
+	prev := receiptLstat
+	receiptLstat = func(path string) (os.FileInfo, error) {
+		info, err := prev(path)
+		if path == f.parent {
+			lstats++
+			// The writer's examination is the first; the reader's is the
+			// second, and the parent is world-writable by then.
+			if lstats == 1 {
+				mustOK(t, os.Chmod(f.parent, 0o777))
+			}
+		}
+
+		return info, err
+	}
+
+	o := f.refresh(t, f.rendering(endpointB))
+	mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonTrust)
+
+	if strings.Contains(o.str("next"), "remove") {
+		t.Errorf("next %q advises a removal over a directory judgement", o.str("next"))
+	}
+}
+
+// The shortcut is closed after its flushes: a receipt or a directory that
+// moved under a flush is never answered `current`.
+func TestReceiptShortcutClosesAfterItsFlushes(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		move func(t *testing.T, f *receiptCmdFixture)
+	}{
+		{"the receipt removed under the flush", func(t *testing.T, f *receiptCmdFixture) {
+			t.Helper()
+			mustOK(t, os.Remove(f.path))
+		}},
+		{"the receipt's mode changed under the flush", func(t *testing.T, f *receiptCmdFixture) {
+			t.Helper()
+			mustOK(t, os.Chmod(f.path, 0o644))
+		}},
+		{"the directory's mode changed under the flush", func(t *testing.T, f *receiptCmdFixture) {
+			t.Helper()
+			mustOK(t, os.Chmod(f.dir, 0o755))
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newReceiptCmdFixture(t)
+			f.migrated(t)
+			mustWritten(t, f.refresh(t, f.rendering(endpointB)))
+
+			prev := receiptSyncDir
+			moved := false
+			receiptSyncDir = func(path string) error {
+				if !moved {
+					moved = true
+					c.move(t, f)
+				}
+
+				return prev(path)
+			}
+
+			o := f.refresh(t, f.rendering(endpointB))
+			mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonTrust)
+		})
+	}
+}
+
 // The closing checks judge metadata too: a directory or a receipt whose
 // owner or mode moved after it was judged is could-not-tell, whatever its
 // inode, size and modification time say.
