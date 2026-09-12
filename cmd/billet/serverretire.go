@@ -273,12 +273,12 @@ func cmdServerRetire(ctx context.Context, args []string) error {
 	}
 
 	if r := checkRetireCombination(m); r != nil {
-		return answerRetireRefusal(drainedBefore(m, r))
+		return answerRetireRefusal(retireUnexaminedFor(m, drainedBefore(m, r)))
 	}
 
 	if hostOS == "darwin" {
-		return answerRetireRefusal(drainedBefore(m, retireRefuse(retireReasonPlatform,
-			"a controller's retirement needs systemd and the global authority exclusion, and this platform has neither", "")))
+		return answerRetireRefusal(retireUnexaminedFor(m, drainedBefore(m, retireRefuse(retireReasonPlatform,
+			"a controller's retirement needs systemd and the global authority exclusion, and this platform has neither", ""))))
 	}
 
 	var (
@@ -306,6 +306,19 @@ func cmdServerRetire(ctx context.Context, args []string) error {
 	}
 
 	return answerJSON(answer, 0, "")
+}
+
+// retireUnexaminedFor marks a refusal made before the flags were even agreed
+// on, for the modes whose `state` describes the HOST: the request's. Nothing
+// has been read on such a run, so which retirement this host is in the middle
+// of, if any, is not something it can say. The record-only modes keep the
+// `state` their own change settled.
+func retireUnexaminedFor(m retireMode, r *retireRefusal) *retireRefusal {
+	if m.input == "" {
+		return r
+	}
+
+	return unexaminedRetireState(r)
 }
 
 // checkRetireCombination is the flag table, refused before anything is opened:

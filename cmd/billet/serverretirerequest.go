@@ -73,7 +73,26 @@ type retireIntentReport struct {
 }
 
 // retireRequest is `--input -`.
+// retireRequest is the request and, once its intent is recorded, the
+// transition; every answer it gives passes through ONE EXIT that says what the
+// host holds, so a path added later cannot forget to.
 func retireRequest(ctx context.Context, m retireMode) (any, *retireRefusal) {
+	answer, r := retireRequestUnder(ctx, m)
+	if r == nil {
+		return answer, nil
+	}
+
+	// WHAT AN ABSENCE MEANS HERE: no journal AND no published authority status
+	// is a host where no retirement is under way, which is what `nothing` says
+	// and what lets the role try again. The status is what rules out the other
+	// reading, a record that has gone from a host whose authority it closed;
+	// the residual, stated, is a journal and a status that BOTH vanish under
+	// one run, which no fixture stages because nothing in the command can
+	// observe the moment between them.
+	return nil, annotateRetireState(r, stateNothingRetire)
+}
+
+func retireRequestUnder(ctx context.Context, m retireMode) (any, *retireRefusal) {
 	// A REFUSAL BEFORE ANYTHING IS READ ESTABLISHES NOTHING ABOUT THE HOST, and
 	// `nothing` is a statement (no retirement is under way here) this run has
 	// no business making: the input never arrived, or the lock and the guard
@@ -134,31 +153,17 @@ func retireRequest(ctx context.Context, m retireMode) (any, *retireRefusal) {
 		return nil, r
 	}
 
-	// EVERY REFUSAL FROM HERE TO THE TRANSITION SAYS WHAT THE HOST HOLDS WHEN
-	// IT REFUSES. A retirement at `stopped` is not a host where nothing has
-	// happened, whatever then refuses — an unreachable ledger, a configuration
-	// that moved, an exclusion another writer holds — and `nothing` would send
-	// an operator looking for a state the host is not in. IT IS READ AND NOT
-	// REMEMBERED, because this run may have written the journal itself: a
-	// request that records its intent and then fails to advance the row, to
-	// publish the status or to release the exclusion has left `intent` behind,
-	// and the fact this run started with says absent. A journal that cannot be
-	// read then is could-not-tell, never `nothing`.
-	at := func(r *retireRefusal) *retireRefusal {
-		return annotateRetireState(r, stateNothingRetire)
-	}
-
 	// THE CONFIGURATION IS OBSERVED UNDER THE LOCK, because everything below
 	// rests on it: its digest is compared with the one the role read, its
 	// backend and controllers decide eligibility, and its identity directory
 	// is what the exclusion and the archive name.
 	obs, r := observeRetireConfig(m.configPath)
 	if r != nil {
-		return nil, at(r)
+		return nil, r
 	}
 
 	if r := requirePreparedHost(obs); r != nil {
-		return nil, at(r)
+		return nil, r
 	}
 
 	cfg := obs.cfg
@@ -244,7 +249,7 @@ func retireRequest(ctx context.Context, m retireMode) (any, *retireRefusal) {
 		return applyRetireIntent(ctx, m, root, dir, shape, db, plan)
 	})
 	if r != nil {
-		return nil, at(r)
+		return nil, r
 	}
 
 	// THE TRANSITION RUNS OUTSIDE EVERY IDENTITY HOLD: it waits for a backup
@@ -263,13 +268,12 @@ func retireRequest(ctx context.Context, m retireMode) (any, *retireRefusal) {
 // tail that completes the ledger row is the next change.
 func runRetireTransition(ctx context.Context, m retireMode, obs *installedConfigObservation, j retirement.Journal,
 ) *retireRefusal {
+	// EVERY ANSWER HERE IS A REFUSAL TODAY, and each takes the exit's
+	// annotation: the phase this run last knew is not what the host holds, and
+	// the terminal answer is no more exempt than the failed ones.
 	j, steps, r := retireTransition(ctx, m, obs, j)
 	if r != nil {
-		// THE SAME ANNOTATION THE REQUEST'S REFUSALS TAKE, for the same reason:
-		// the phase this run last knew is not what the host holds. A journal
-		// that has vanished under a transition is could-not-tell, never
-		// `nothing`, and a refusal that already said `unknown` keeps it.
-		return annotateRetireState(r, retireStateUnknown)
+		return r
 	}
 
 	return &retireRefusal{Schema: retireSchema, Outcome: retireOutcomeUnknown, Reason: retireReasonPhase,
@@ -449,6 +453,17 @@ func annotateRetireState(r *retireRefusal, absent string) *retireRefusal {
 
 	switch presence {
 	case retirement.JournalAbsent:
+		// A PUBLISHED AUTHORITY STATUS BESIDE NO JOURNAL is not a host where no
+		// retirement is under way: it is one whose record is gone while the
+		// authority it closed is still closed, which is the least `nothing`
+		// thing a host can be.
+		if _, statusPresence, statusErr := retirement.ReadStatus(); statusPresence != retirement.StatusAbsent ||
+			statusErr != nil {
+			r.State = retireStateUnknown
+
+			return r
+		}
+
 		r.State = absent
 	case retirement.JournalPresent:
 		r.State = string(now.Phase)

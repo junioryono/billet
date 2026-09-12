@@ -1715,3 +1715,115 @@ func TestATransitionRefusalOverAJournalItCannotReadSaysUnknown(t *testing.T) {
 		})
 	}
 }
+
+// EVERY ANSWER THE REQUEST GIVES PASSES THROUGH ONE EXIT that says what the
+// host holds, so no path can be added that forgets. The cases below are the
+// four corners of that exit: a refusal made before the flags were agreed on, a
+// resume whose journal goes under it, a preview whose host changes while it
+// reads, and a transition whose terminal answer is no more exempt than a
+// failed one.
+func TestTheRequestsAnswerAlwaysSaysWhatTheHostHolds(t *testing.T) {
+	t.Run("a flag refusal establishes nothing", func(t *testing.T) {
+		f := newRequestFixture(t)
+		f.reserve(t)
+
+		f.plantJournal(t, retirement.PhaseStopped, retirement.VariantServerOnly)
+
+		// `--input -` with an operand the flag table refuses, on a host whose
+		// retirement stands at `stopped`.
+		out, code := f.run(t, "", "--input", "-", "--run", requestRun, "--retiring-host", requestRetiring,
+			"--survivor-host", requestSurvivor, "--server-only", "--installed-sha256", "not-a-digest")
+
+		m := retireAnswer(t, out)
+		if code != exitRefused || m["reason"] != retireReasonCombination || m["state"] != "unknown" {
+			t.Fatalf("a flag refusal: %s", out)
+		}
+	})
+
+	t.Run("a resume whose journal goes under it", func(t *testing.T) {
+		f := newRequestFixture(t)
+		f.reserve(t)
+
+		f.plantJournal(t, retirement.PhaseStopped, retirement.VariantServerOnly)
+		markGuard(t, f.guard, &guardTransition{Kind: transitionRetirement, ID: retireTestID}, nil)
+		advanceRowToIntent(t, f)
+		mustOK(t, retirement.WriteStatus(retirement.PhaseStopped, retirement.VariantServerOnly, retireNow()))
+
+		in := f.input(t, nil)
+
+		// The journal is removed while the ledger the resume needs cannot be
+		// dialled: the answer must not say that no retirement is under way on
+		// a host whose server this transition has already stopped.
+		mustOK(t, os.Remove(retirement.JournalPath()))
+		t.Setenv("BILLET_STATE_DSN", "postgres://billet:billet@127.0.0.1:1/billet?sslmode=disable")
+
+		out, code := f.request(t, in)
+
+		m := retireAnswer(t, out)
+		if code != exitUnknown || m["state"] != "unknown" {
+			t.Fatalf("a resume whose journal has gone: %s", out)
+		}
+	})
+
+	t.Run("a preview whose host changes while it reads", func(t *testing.T) {
+		f := newRequestFixture(t)
+		f.retainANode(t)
+		f.reserve(t)
+
+		// A MUTATING RUN PUBLISHES `intent` WHILE THE PREVIEW IS READING: the
+		// preview found no journal when it looked, and the host holds one by
+		// the time it refuses. The address rule is where this run is when that
+		// happens, and the backup it reads afterwards is what refuses.
+		saved := hostInterfaceAddresses
+		hostInterfaceAddresses = func() ([]hostAddress, error) {
+			f.plantJournal(t, retirement.PhaseIntent, retirement.VariantRetainedNode)
+
+			return saved()
+		}
+
+		t.Cleanup(func() { hostInterfaceAddresses = saved })
+
+		// A backup whose state cannot be read: could-not-tell, which the host's
+		// own preconditions refuse.
+		writeFile(t, filepath.Join(f.unitsDir, backupServiceUnit), "LoadState=loaded\nMainPID=0\n", 0o644)
+
+		out, code := f.retainedRequest(t, f.input(t, f.retainedOverrides(t)), "--dry-run")
+
+		m := retireAnswer(t, out)
+		if code == 0 || m["state"] != string(retirement.PhaseIntent) {
+			t.Fatalf("a preview over a host that moved under it: %s", out)
+		}
+	})
+
+	t.Run("the transition's terminal answer", func(t *testing.T) {
+		f := newRequestFixture(t)
+		f.reserve(t)
+
+		// The journal goes as the LAST status is published, and that
+		// publication succeeds: the driver reaches its terminal answer with a
+		// phase nothing can read back.
+		retirement.Publishing = func(path string) error {
+			if path != retirement.StatusPath() {
+				return nil
+			}
+
+			j, presence, err := retirement.ReadJournal()
+			mustOK(t, err)
+
+			if presence == retirement.JournalPresent && j.Phase == retirement.PhaseDone {
+				mustOK(t, os.Remove(retirement.JournalPath()))
+			}
+
+			return nil
+		}
+
+		t.Cleanup(func() { retirement.Publishing = nil })
+
+		out, code := f.request(t, f.input(t, nil))
+
+		m := retireAnswer(t, out)
+		if code != exitUnknown || m["state"] != "unknown" {
+			t.Fatalf("the transition's terminal answer over a journal that has gone: %s", out)
+		}
+	})
+}

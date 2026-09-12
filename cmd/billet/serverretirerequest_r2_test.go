@@ -487,15 +487,17 @@ func TestServerRetireRequestObservesTheConfigurationUnderTheLock(t *testing.T) {
 
 	var body *ast.BlockStmt
 
+	// THE FUNCTION THAT DOES THE WORK, not the exit that annotates its answer:
+	// `retireRequest` is a thin wrapper whose body takes nothing at all.
 	for _, decl := range file.Decls {
 		fn, ok := decl.(*ast.FuncDecl)
-		if ok && fn.Name.Name == "retireRequest" {
+		if ok && fn.Name.Name == "retireRequestUnder" {
 			body = fn.Body
 		}
 	}
 
 	if body == nil {
-		t.Fatal("retireRequest is gone")
+		t.Fatal("retireRequestUnder is gone")
 	}
 
 	guard, observe := -1, -1
@@ -527,11 +529,11 @@ func TestServerRetireRequestObservesTheConfigurationUnderTheLock(t *testing.T) {
 
 	switch {
 	case guard < 0:
-		t.Fatal("retireRequest takes no guard")
+		t.Fatal("the request takes no guard")
 	case observe < 0:
-		t.Fatal("retireRequest never observes the configuration after taking the guard")
+		t.Fatal("the request never observes the configuration after taking the guard")
 	case observe < guard:
-		t.Fatal("retireRequest observes the configuration before it takes the transaction lock")
+		t.Fatal("the request observes the configuration before it takes the transaction lock")
 	}
 }
 
