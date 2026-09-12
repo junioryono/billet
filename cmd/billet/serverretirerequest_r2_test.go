@@ -62,14 +62,16 @@ func TestServerRetireRequestDryRunMutatesNothing(t *testing.T) {
 
 	writeGuardRecordForTest(t, f.guard, settled)
 
-	// AND THE GUARD DIRECTORY IS HELD TO ITS TRUST: a directory anyone else
-	// may write is one whose record anyone else may replace, and the preview
-	// refuses it as the mutating run's own open does.
+	// AND THE GUARD DIRECTORY IS HELD TO ITS TRUST: the mutating run's own
+	// open requires exactly 0700, because a directory anyone else may read or
+	// write is one whose record anyone else may replace, and the preview
+	// makes the same judgement.
 	mustOK(t, os.Chmod(f.guard.active(), 0o755))
 
 	out, code = f.request(t, f.input(t, nil), "--dry-run")
-	if m := retireAnswer(t, out); m["reason"] != retireReasonGuard || code != exitUnknown {
-		t.Fatalf("a preview over a world-writable guard directory: %s", out)
+	if m := retireAnswer(t, out); m["reason"] != retireReasonGuard || code != exitUnknown ||
+		!strings.Contains(whyOf(m), "0700") {
+		t.Fatalf("a preview over a guard directory whose mode is not 0700: %s", out)
 	}
 
 	mustOK(t, os.Chmod(f.guard.active(), 0o700))

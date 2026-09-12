@@ -416,8 +416,13 @@ func drainedBefore(m retireMode, r *retireRefusal) *retireRefusal {
 func drainStdin() string {
 	done := make(chan error, 1)
 
+	// EVALUATED HERE, not in the goroutine: a child the deadline leaves
+	// behind reads the input this call was given, whatever the process (or a
+	// test) puts in the seam afterwards.
+	from := retireStdin
+
 	go func() {
-		_, err := io.Copy(io.Discard, retireStdin)
+		_, err := io.Copy(io.Discard, from)
 		done <- err
 	}()
 

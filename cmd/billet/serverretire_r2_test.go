@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -501,9 +502,8 @@ func whyOf(m map[string]any) string {
 // cannot hold an answer this command has already decided, whether the flag
 // table refused it or the input's own bound did. THE BOUND IS ON THE WAIT and
 // not on the read, because a descriptor inherited from a shell or an SSH
-// session is not always one a read deadline can interrupt; the test's own
-// reader is an ORDINARY io.Reader that blocks forever, which no deadline
-// could interrupt at all.
+// session is not always one a read deadline can interrupt; the reader here is
+// an ordinary io.Reader that blocks, which no deadline could interrupt at all.
 func TestServerRetireDrainsUnderADeadline(t *testing.T) {
 	f := newRetireFixture(t)
 
@@ -512,56 +512,127 @@ func TestServerRetireDrainsUnderADeadline(t *testing.T) {
 
 	t.Cleanup(func() { drainDeadline = saved })
 
-	cases := map[string][]string{
-		"the flag table's refusal": {"--input", "-", "--run", "ci-1", "--retiring-host", "control-a"},
-		"the input's own bound": {"--input", "-", "--run", "ci-1", "--retiring-host", "control-a",
+	cases := map[string]struct {
+		args   []string
+		prefix int64
+		reason string
+	}{
+		// The flag table answers before anything is read, so the reader
+		// blocks from the first byte.
+		"the flag table's refusal": {[]string{"--input", "-", "--run", "ci-1", "--retiring-host", "control-a"}, 0,
+			retireReasonCombination},
+		// The input's own bound answers after the prefix, and the drain of
+		// the rest meets a reader that blocks.
+		"the input's own bound": {[]string{"--input", "-", "--run", "ci-1", "--retiring-host", "control-a",
 			"--survivor-host", "control-b", "--server-only", "--installed-sha256", strings.Repeat("a", 64)},
+			maxRetireInputBytes + 1, retireReasonInput},
 	}
 
-	for name, args := range cases {
+	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
-			release := make(chan struct{})
-
-			t.Cleanup(func() { close(release) })
+			reader := newBlockingReader(c.prefix)
 
 			savedStdin := retireStdin
-			retireStdin = &endlessReader{release: release}
+			retireStdin = reader
 
-			t.Cleanup(func() { retireStdin = savedStdin })
+			// RELEASED AND JOINED BEFORE THE SEAM IS RESTORED, so no child of
+			// this case is still reading when the next one installs its own.
+			t.Cleanup(func() {
+				reader.releaseOnce()
+				reader.wait(t)
 
-			answered := make(chan error, 1)
+				retireStdin = savedStdin
+			})
 
-			go func() {
-				answered <- cmdServer(t.Context(), nil, append([]string{"retire", "--json", "--config", f.cfg}, args...))
-			}()
+			var (
+				answered = make(chan error, 1)
+				out      string
+			)
 
-			select {
-			case err := <-answered:
-				if err == nil {
-					t.Fatal("the refusal was not answered")
+			out = capture(t, func() {
+				go func() {
+					answered <- cmdServer(t.Context(), nil, append([]string{"retire", "--json", "--config", f.cfg}, c.args...))
+				}()
+
+				select {
+				case err := <-answered:
+					if err == nil {
+						t.Error("the refusal was not answered")
+					}
+				case <-time.After(30 * time.Second):
+					t.Error("the drain never ended, so the answer never came")
 				}
-			case <-time.After(30 * time.Second):
-				t.Fatal("the drain never ended, so the answer never came")
+			})
+
+			m := retireAnswer(t, out)
+			if m["reason"] != c.reason || !strings.Contains(whyOf(m), "still being written after") {
+				t.Fatalf("%s: the answer does not say the drain was bounded: %s", name, out)
 			}
 		})
 	}
 }
 
-// endlessReader is a writer that never stops and never closes: every read
-// answers a block of bytes, and a read after the test releases it ends. No
-// deadline can interrupt it, which is the case the drain's own bound is for.
-type endlessReader struct{ release chan struct{} }
+// blockingReader answers `remaining` bytes and then BLOCKS until it is
+// released: a writer that never closes, which no read deadline can interrupt.
+// Its two channels are how a test joins it: `entered` says a read blocked,
+// `left` says that read returned.
+type blockingReader struct {
+	remaining int64
+	release   chan struct{}
+	entered   chan struct{}
+	left      chan struct{}
+	once      sync.Once
+	leftOnce  sync.Once
+}
 
-func (e *endlessReader) Read(p []byte) (int, error) {
+func newBlockingReader(prefix int64) *blockingReader {
+	return &blockingReader{remaining: prefix, release: make(chan struct{}), entered: make(chan struct{}, 1),
+		left: make(chan struct{})}
+}
+
+func (b *blockingReader) Read(p []byte) (int, error) {
+	if b.remaining > 0 {
+		n := int64(len(p))
+		if n > b.remaining {
+			n = b.remaining
+		}
+
+		for i := range p[:n] {
+			p[i] = '{'
+		}
+
+		b.remaining -= n
+
+		return int(n), nil
+	}
+
 	select {
-	case <-e.release:
-		return 0, io.EOF
+	case b.entered <- struct{}{}:
 	default:
 	}
 
-	for i := range p {
-		p[i] = '{'
+	<-b.release
+	b.leftOnce.Do(func() { close(b.left) })
+
+	return 0, io.EOF
+}
+
+func (b *blockingReader) releaseOnce() { b.once.Do(func() { close(b.release) }) }
+
+// wait joins the read this reader blocked, when one blocked at all, so
+// nothing of this case is still running when the seam is restored.
+func (b *blockingReader) wait(t *testing.T) {
+	t.Helper()
+
+	select {
+	case <-b.entered:
+	default:
+		return
 	}
 
-	return len(p), nil
+	select {
+	case <-b.left:
+	case <-time.After(10 * time.Second):
+		t.Error("a blocked read never ended")
+	}
 }
