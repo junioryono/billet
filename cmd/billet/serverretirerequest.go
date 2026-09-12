@@ -74,14 +74,18 @@ type retireIntentReport struct {
 
 // retireRequest is `--input -`.
 func retireRequest(ctx context.Context, m retireMode) (any, *retireRefusal) {
+	// A REFUSAL BEFORE ANYTHING IS READ ESTABLISHES NOTHING ABOUT THE HOST, and
+	// `nothing` is a statement (no retirement is under way here) this run has
+	// no business making: the input never arrived, or the lock and the guard
+	// are another run's, and the journal was never looked at.
 	raw, r := readRetireDocument(maxRetireInputBytes)
 	if r != nil {
-		return nil, r
+		return nil, unexaminedRetireState(r)
 	}
 
 	in, r := decodeRetireInput(raw)
 	if r != nil {
-		return nil, r
+		return nil, unexaminedRetireState(r)
 	}
 
 	// A DRY RUN TAKES NOTHING AT ALL: it reads the configuration, the journal,
@@ -110,7 +114,7 @@ func retireRequest(ctx context.Context, m retireMode) (any, *retireRefusal) {
 
 	root, dir, shape, r := retireGuard(m.run)
 	if r != nil {
-		return nil, r
+		return nil, unexaminedRetireState(r)
 	}
 
 	defer root.release()
@@ -141,27 +145,7 @@ func retireRequest(ctx context.Context, m retireMode) (any, *retireRefusal) {
 	// and the fact this run started with says absent. A journal that cannot be
 	// read then is could-not-tell, never `nothing`.
 	at := func(r *retireRefusal) *retireRefusal {
-		if r == nil {
-			return nil
-		}
-
-		// THE READ'S OWN ERROR IS NOT THIS ANSWER'S: what refused is already in
-		// the refusal, and all this adds is which phase the host stands at.
-		now, presence, err := retirement.ReadJournal()
-		if err != nil && presence == retirement.JournalPresent {
-			presence = retirement.JournalUnreadable
-		}
-
-		switch presence {
-		case retirement.JournalAbsent:
-			return r
-		case retirement.JournalPresent:
-			return atRetirePhase(now, r)
-		default:
-			r.State = retireStateUnknown
-
-			return r
-		}
+		return annotateRetireState(r, stateNothingRetire)
 	}
 
 	// THE CONFIGURATION IS OBSERVED UNDER THE LOCK, because everything below
@@ -281,14 +265,11 @@ func runRetireTransition(ctx context.Context, m retireMode, obs *installedConfig
 ) *retireRefusal {
 	j, steps, r := retireTransition(ctx, m, obs, j)
 	if r != nil {
-		// A REFUSAL THAT ALREADY SAID `unknown` KEEPS IT: the phase this run
-		// last knew is not what the host holds, and naming it would send the
-		// next converge to a state nothing is in.
-		if r.State != retireStateUnknown {
-			r.State = string(j.Phase)
-		}
-
-		return r
+		// THE SAME ANNOTATION THE REQUEST'S REFUSALS TAKE, for the same reason:
+		// the phase this run last knew is not what the host holds. A journal
+		// that has vanished under a transition is could-not-tell, never
+		// `nothing`, and a refusal that already said `unknown` keeps it.
+		return annotateRetireState(r, retireStateUnknown)
 	}
 
 	return &retireRefusal{Schema: retireSchema, Outcome: retireOutcomeUnknown, Reason: retireReasonPhase,
@@ -443,6 +424,48 @@ func refuseResumePastTheArchive(j retirement.Journal, fact retirement.JournalFac
 // happened here.
 func atRetirePhase(j retirement.Journal, r *retireRefusal) *retireRefusal {
 	r.State = string(j.Phase)
+
+	return r
+}
+
+// annotateRetireState puts the host's own phase on a refusal, READ WHEN THE
+// REFUSAL IS MADE rather than remembered: a run that wrote the journal itself
+// has moved the host since it started, and a run whose journal became
+// unreadable knows less than it did. `absent` is what the caller means by a
+// host with no journal — for a request that read one before it began, no
+// retirement is under way here; for a transition whose record has vanished
+// under it, that is not something to state. An explicit `unknown` survives.
+func annotateRetireState(r *retireRefusal, absent string) *retireRefusal {
+	if r == nil || r.State == retireStateUnknown {
+		return r
+	}
+
+	// THE READ'S OWN ERROR IS NOT THIS ANSWER'S: what refused is already in the
+	// refusal, and all this adds is where the host stands.
+	now, presence, err := retirement.ReadJournal()
+	if err != nil && presence == retirement.JournalPresent {
+		presence = retirement.JournalUnreadable
+	}
+
+	switch presence {
+	case retirement.JournalAbsent:
+		r.State = absent
+	case retirement.JournalPresent:
+		r.State = string(now.Phase)
+	default:
+		r.State = retireStateUnknown
+	}
+
+	return r
+}
+
+// unexaminedRetireState marks a refusal that looked at nothing: it took no
+// lock, read no journal and changed nothing, so which retirement this host is
+// in the middle of, if any, is not something it can say.
+func unexaminedRetireState(r *retireRefusal) *retireRefusal {
+	if r != nil {
+		r.State = retireStateUnknown
+	}
 
 	return r
 }

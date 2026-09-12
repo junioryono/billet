@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"syscall"
@@ -1563,6 +1564,7 @@ func TestADryRunJudgesTheJournalFirstAndNamesItsPhase(t *testing.T) {
 	advanceRowToIntent(t, f)
 
 	in, digest := f.input(t, nil), f.installedSHA(t)
+	before := f.guard.record(t)
 
 	// The configuration is gone, as a retiring host's eventually is: a preview
 	// that read it first would answer about a missing file.
@@ -1577,10 +1579,14 @@ func TestADryRunJudgesTheJournalFirstAndNamesItsPhase(t *testing.T) {
 		t.Fatalf("a preview over a transition under way: %s", out)
 	}
 
-	// AND IT TOOK NOTHING: the guard's record is untouched and no status was
-	// published by it.
-	if rec := f.guard.record(t); rec.Transition == nil || rec.Transition.ID != retireTestID {
-		t.Fatalf("the dry run changed the guard's marker: %+v", rec.Transition)
+	// AND IT TOOK NOTHING: the guard's record is the same record, field for
+	// field, and the authority status it might have published is still absent.
+	if after := f.guard.record(t); !reflect.DeepEqual(after, before) {
+		t.Fatalf("the dry run changed the guard's record:\n%+v\n%+v", before, after)
+	}
+
+	if _, presence, err := retirement.ReadStatus(); presence != retirement.StatusAbsent || err != nil {
+		t.Fatalf("the dry run published a status: %d %v", presence, err)
 	}
 }
 
@@ -1611,5 +1617,101 @@ func TestARefusalOverAnUnreadableJournalSaysUnknown(t *testing.T) {
 	m := retireAnswer(t, out)
 	if code != exitUnknown || m["state"] != "unknown" {
 		t.Fatalf("a refusal over a journal nothing could read: %s", out)
+	}
+}
+
+// A REFUSAL THAT LOOKED AT NOTHING SAYS SO. The lock, the guard and the input
+// are judged before any journal is read, so such a refusal cannot state that
+// no retirement is under way here — which is what `nothing` states, and which
+// on a host at `stopped` is false.
+func TestARefusalBeforeAnythingIsReadSaysUnknown(t *testing.T) {
+	t.Run("the transaction lock is another run's", func(t *testing.T) {
+		f := newRequestFixture(t)
+		f.reserve(t)
+
+		f.plantJournal(t, retirement.PhaseStopped, retirement.VariantServerOnly)
+
+		// Another process holds the host's transaction lock.
+		held, err := takeTxLock()
+		mustOK(t, err)
+
+		t.Cleanup(func() { held.release() })
+
+		out, code := f.request(t, f.input(t, nil))
+
+		// THE OUTCOME AND THE STATE ARE DIFFERENT AXES: this is a refusal an
+		// operator can act on (exit 2), and what the host holds is what it
+		// could not establish.
+		m := retireAnswer(t, out)
+		if code != exitRefused || m["reason"] != retireReasonLock || m["state"] != "unknown" {
+			t.Fatalf("a refusal that took nothing: %s", out)
+		}
+	})
+
+	t.Run("the input does not decode", func(t *testing.T) {
+		f := newRequestFixture(t)
+		f.reserve(t)
+
+		f.plantJournal(t, retirement.PhaseStopped, retirement.VariantServerOnly)
+
+		out, code := f.request(t, "{not json")
+
+		m := retireAnswer(t, out)
+		if code != exitRefused || m["reason"] != retireReasonInput || m["state"] != "unknown" {
+			t.Fatalf("a refusal that read no journal: %s", out)
+		}
+	})
+}
+
+// AND A TRANSITION'S OWN REFUSAL TAKES THE SAME ANNOTATION: the driver's
+// remembered phase is not what the host holds once its journal has gone or
+// become unreadable under it. A record that VANISHED mid-transition is not
+// `nothing` either — that word says no retirement is under way here, over a
+// host whose server this run has already stopped.
+func TestATransitionRefusalOverAJournalItCannotReadSaysUnknown(t *testing.T) {
+	for name, disturb := range map[string]func(t *testing.T){
+		"a journal a stranger's mode makes untrusted": func(t *testing.T) {
+			t.Helper()
+			mustOK(t, os.Chmod(retirement.JournalPath(), 0o644))
+		},
+		"a journal that has gone": func(t *testing.T) {
+			t.Helper()
+			mustOK(t, os.Remove(retirement.JournalPath()))
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newRequestFixture(t)
+			f.reserve(t)
+
+			statuses := 0
+
+			retirement.Publishing = func(path string) error {
+				if path != retirement.StatusPath() {
+					return nil
+				}
+
+				statuses++
+
+				// The SECOND status is the stop's: by then the intent's journal
+				// is on disk, and it is disturbed under the refusal about to be
+				// made.
+				if statuses < 2 {
+					return nil
+				}
+
+				disturb(t)
+
+				return errors.New("the status could not be published")
+			}
+
+			t.Cleanup(func() { retirement.Publishing = nil })
+
+			out, code := f.request(t, f.input(t, nil))
+
+			m := retireAnswer(t, out)
+			if code != exitUnknown || m["reason"] != retireReasonStatus || m["state"] != "unknown" {
+				t.Fatalf("a transition refusal over a journal it cannot read: %s", out)
+			}
+		})
 	}
 }
