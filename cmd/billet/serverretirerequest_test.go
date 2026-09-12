@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"gopkg.in/yaml.v3"
+
 	"github.com/junioryono/billet/internal/retirement"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/wirecert"
@@ -99,6 +101,10 @@ func newRequestFixture(t *testing.T) *requestFixture {
 	t.Cleanup(func() { mountinfoPath = savedMountinfo })
 
 	pinHostAddresses(t)
+
+	// AN INSTALLER HAS PREPARED THIS HOST: the record and the global lock are
+	// what a retirement closes the authority through.
+	preparedHost(t)
 	mustHold(t, requestRun)
 
 	// THE CLOCK IS THIS HOST'S: the reservation is made at it, and the
@@ -550,4 +556,264 @@ func mustEval(t *testing.T, path string) string {
 	mustOK(t, err)
 
 	return resolved
+}
+
+// A RETAINED-NODE REQUEST STAGES ITS RENDERING AND RECORDS ITS NODES: the
+// rendering is the installed configuration minus the four server keys, it
+// parses, its node keeps the state directory and the identity, and the node
+// this host keeps is reconciled against the ledger's registrations through
+// its receipt, its registration and its installed endpoint, whose address the
+// survivor holds.
+func TestServerRetireRequestStagesARetainedNodesRendering(t *testing.T) {
+	f := newRequestFixture(t)
+	f.retainANode(t)
+
+	row := f.reserve(t)
+
+	out, code := f.retainedRequest(t, f.input(t, f.retainedOverrides(t)))
+
+	m := retireAnswer(t, out)
+	if m["outcome"] != retireOutcomeUnknown || m["reason"] != retireReasonPhase || code != exitUnknown {
+		t.Fatalf("the request: %s", out)
+	}
+
+	j, presence, err := retirement.ReadJournal()
+	if err != nil || presence != retirement.JournalPresent {
+		t.Fatalf("the journal: %d %v", presence, err)
+	}
+
+	staged, stagePresence, err := retirement.ReadStage()
+	if err != nil || stagePresence != retirement.StageFilePresent {
+		t.Fatalf("the stage: %d %v", stagePresence, err)
+	}
+
+	switch {
+	case j.Variant != retirement.VariantRetainedNode || j.Config != "present":
+		t.Fatalf("the journal's variant: %+v", j)
+	case string(staged) != f.rendering(t):
+		t.Fatalf("the stage is not the rendering byte for byte:\n%s", staged)
+	case j.StagedSHA256 != retirement.Digest(staged):
+		t.Fatalf("the journal's staged digest: %+v", j)
+	case len(j.Nodes) != 1 || j.Nodes[0].Name != "node-a" || j.Nodes[0].Endpoint != retainedEndpoint:
+		t.Fatalf("the journal's nodes: %+v", j.Nodes)
+	case j.Nodes[0].Incarnation != retainedIncarnation:
+		t.Fatalf("the journal's node incarnation: %+v", j.Nodes)
+	case j.Provenance.TransitionID != row.TransitionID:
+		t.Fatalf("the journal's provenance: %+v", j.Provenance)
+	}
+}
+
+// THE NODE SET IS THE LEDGER'S: a registration with no report blocks the
+// request, a report naming a node the ledger does not register refuses, and
+// an endpoint the address rule does not admit refuses whatever the chain
+// says.
+func TestServerRetireRequestReconcilesTheNodeSetAndTheAddressRule(t *testing.T) {
+	f := newRequestFixture(t)
+	f.retainANode(t)
+	f.reserve(t)
+
+	// A registration with no report at all.
+	overrides := f.retainedOverrides(t)
+	overrides["nodes"] = map[string]any{}
+
+	out, code := f.retainedRequest(t, f.input(t, overrides))
+	if m := retireAnswer(t, out); m["reason"] != retireReasonNodeMissing || code != exitRefused {
+		t.Fatalf("a registration with no report: %s", out)
+	}
+
+	// A report naming a node the ledger does not register.
+	overrides = f.retainedOverrides(t)
+	setPath(t, asMap(asMap(asMap(overrides["nodes"])[requestRetiring])["inspect"]), "node-z", "host", "node_effective_name")
+
+	out, code = f.retainedRequest(t, f.input(t, overrides))
+	if m := retireAnswer(t, out); m["reason"] != retireReasonNodeUnknown || code != exitRefused {
+		t.Fatalf("a report of an unregistered node: %s", out)
+	}
+
+	// An endpoint neither controller holds needs the operator's assertion.
+	for _, addr := range []string{"https://10.9.9.9:7717", "https://127.0.0.1:7717", "https://10.0.0.1:7717"} {
+		overrides = f.retainedOverrides(t)
+		f.setNodeEndpoint(t, overrides, addr)
+
+		out, code = f.retainedRequest(t, f.input(t, overrides))
+		if m := retireAnswer(t, out); m["reason"] != retireReasonEndpoint || code != exitRefused {
+			t.Fatalf("%s: %s", addr, out)
+		}
+	}
+
+	// And the foreign address is admitted under it (loopback and this host's
+	// own address are refused whatever the operator asserts).
+	overrides = f.retainedOverrides(t)
+	f.setNodeEndpoint(t, overrides, "https://10.9.9.9:7717")
+
+	out, code = f.retainedRequest(t, f.input(t, overrides), "--endpoint-failover-verified")
+	if m := retireAnswer(t, out); m["reason"] != retireReasonPhase || code != exitUnknown {
+		t.Fatalf("a foreign address under the assertion: %s", out)
+	}
+
+	for _, addr := range []string{"https://127.0.0.1:7717", "https://10.0.0.1:7717"} {
+		f2 := newRequestFixture(t)
+		f2.retainANode(t)
+		f2.reserve(t)
+
+		overrides := f2.retainedOverrides(t)
+		f2.setNodeEndpoint(t, overrides, addr)
+
+		out, code := f2.retainedRequest(t, f2.input(t, overrides), "--endpoint-failover-verified")
+		if m := retireAnswer(t, out); m["reason"] != retireReasonEndpoint || code != exitRefused {
+			t.Fatalf("%s under the assertion: %s", addr, out)
+		}
+	}
+}
+
+// The retained node's endpoint, its incarnation, and the survivor's address.
+const (
+	retainedEndpoint    = "https://10.0.0.2:7717"
+	retainedIncarnation = "00112233445566778899aabbccddeeff"
+	survivorAddress     = "10.0.0.2"
+)
+
+// retainANode rewrites this host's configuration with a node beside the
+// server, registers that node in the ledger, and installs the node unit the
+// entry predicates read.
+func (f *requestFixture) retainANode(t *testing.T) {
+	t.Helper()
+
+	dir := t.TempDir()
+	nodeState := filepath.Join(dir, "node-state")
+
+	// A REMOTE SERVER ADDRESS NEEDS A BUNDLE, because the control plane
+	// identifies a node by the name in its certificate; the bundle is this
+	// deployment's own authority's, and lives outside the identity directory
+	// the archive moves.
+	ca, err := wirecert.LoadOrCreateCA(f.stateDir, f.identity)
+	mustOK(t, err)
+
+	bundle, err := ca.IssueNode("node-a")
+	mustOK(t, err)
+
+	cert, key, caFile := filepath.Join(dir, "node.crt"), filepath.Join(dir, "node.key"), filepath.Join(dir, "ca.crt")
+	writeFile(t, cert, string(bundle.CertPEM), 0o644)
+	writeFile(t, key, string(bundle.KeyPEM), 0o600)
+	writeFile(t, caFile, string(bundle.CAPEM), 0o644)
+
+	// A CONTROLLER THAT PUBLISHES A TLS ENDPOINT binds the address it
+	// publishes, never loopback.
+	body := strings.Replace(mustRead(t, f.cfg), "listen: 127.0.0.1:7717", "listen: 10.0.0.1:7717", 1) + "node:\n  name: node-a\n  server_addr: " + survivorAddress + ":7717\n" +
+		"  provider: docker\n  state_dir: " + nodeState + "\n  tls:\n    cert: " + cert + "\n    key: " + key +
+		"\n    ca: " + caFile + "\n"
+	writeFile(t, f.cfg, body, 0o600)
+
+	writeFile(t, filepath.Join(f.unitsDir, nodeUnit),
+		"LoadState=loaded\nActiveState=active\nSubState=running\nResult=success\nKillMode=mixed\nMainPID=4242\n"+
+			"InvocationID=0123456789abcdef0123456789abcdef\nStateChangeTimestamp=\n", 0o644)
+
+	f.pgLedger(t, func(db *state.DB) {
+		registerStatusNode(t, db, "node-a", "v0.10.0", strings.Repeat("a", 64), retainedIncarnation)
+	})
+}
+
+// rendering is the serverless rendering the role would hand the request: the
+// installed configuration's mapping minus the four server keys.
+func (f *requestFixture) rendering(t *testing.T) string {
+	t.Helper()
+
+	var doc map[string]any
+	mustOK(t, yaml.Unmarshal([]byte(mustRead(t, f.cfg)), &doc))
+
+	for _, key := range serverlessDroppedKeys {
+		delete(doc, key)
+	}
+
+	body, err := yaml.Marshal(doc)
+	mustOK(t, err)
+
+	return string(body)
+}
+
+// nodeReport is the retained node's own report: the committed node fixture
+// with this deployment's identity, this host's digest and the endpoint the
+// survivor holds.
+func (f *requestFixture) nodeReport(t *testing.T) map[string]any {
+	t.Helper()
+
+	inspect := fixtureDoc(t, "release-inspect", "node-with-bundle")
+	digest := f.installedSHA(t)
+
+	setPath(t, inspect, "node-a", "host", "node_effective_name")
+	setPath(t, inspect, true, "config_binding")
+	setPath(t, inspect, digest, "installed_config", "sha256")
+	setPath(t, inspect, retainedEndpoint, "host", "installed_endpoint")
+
+	for member, value := range map[string]any{
+		"node": "node-a", "deployment": f.identity, "incarnation": retainedIncarnation,
+		"invocation_id": "0123456789abcdef0123456789abcdef", "endpoint": retainedEndpoint,
+	} {
+		setPath(t, inspect, value, "host", "registration", member)
+	}
+
+	for member, value := range map[string]any{
+		"node": "node-a", "deployment": f.identity, "incarnation": retainedIncarnation,
+		"invocation_id": "0123456789abcdef0123456789abcdef", "installed_endpoint": retainedEndpoint,
+		"effective_endpoint": retainedEndpoint, "installed_sha256": digest,
+	} {
+		setPath(t, inspect, value, "host", "endpoint_receipt", "receipt", member)
+	}
+
+	setPath(t, inspect, "0123456789abcdef0123456789abcdef", "services", "node", "invocation_id")
+
+	return map[string]any{"host": requestRetiring, "collected_at": requestCollected, "inspect": inspect, "status": nil}
+}
+
+// retainedOverrides is the input a retained-node request carries: the
+// rendering, this host's node report and its desired configuration.
+func (f *requestFixture) retainedOverrides(t *testing.T) map[string]any {
+	t.Helper()
+
+	self := f.selfReport(t)
+	setPath(t, asMap(self["inspect"]), false, "services", "node", "config_changed_since_start")
+
+	survivor := f.survivorReport(t)
+	setPath(t, asMap(survivor["inspect"]), []any{map[string]any{"address": survivorAddress, "scope": "global",
+		"interface": "eth0", "index": 2}}, "host", "addresses")
+
+	return map[string]any{
+		"self": self, "survivor": survivor,
+		"desired":       f.rendering(t),
+		"nodes":         map[string]any{requestRetiring: f.nodeReport(t)},
+		"desired_nodes": map[string]any{requestRetiring: map[string]any{"sha256": f.installedSHA(t), "endpoint": retainedEndpoint}},
+	}
+}
+
+// setNodeEndpoint rewrites every member of the chain that carries the node's
+// endpoint, so only the address rule decides.
+func (f *requestFixture) setNodeEndpoint(t *testing.T, overrides map[string]any, addr string) {
+	t.Helper()
+
+	inspect := asMap(asMap(asMap(overrides["nodes"])[requestRetiring])["inspect"])
+	setPath(t, inspect, addr, "host", "installed_endpoint")
+	setPath(t, inspect, addr, "host", "registration", "endpoint")
+	setPath(t, inspect, addr, "host", "endpoint_receipt", "receipt", "installed_endpoint")
+	setPath(t, inspect, addr, "host", "endpoint_receipt", "receipt", "effective_endpoint")
+	setPath(t, asMap(asMap(overrides["desired_nodes"])[requestRetiring]), addr, "endpoint")
+}
+
+// retainedRequest runs a retained-node request (no --server-only).
+func (f *requestFixture) retainedRequest(t *testing.T, stdin string, extra ...string) (string, int) {
+	t.Helper()
+
+	args := []string{"--input", "-", "--run", requestRun, "--retiring-host", requestRetiring,
+		"--survivor-host", requestSurvivor, "--installed-sha256", f.installedSHA(t)}
+
+	return f.run(t, stdin, append(args, extra...)...)
+}
+
+// mustRead reads a file or fails the test.
+func mustRead(t *testing.T, path string) string {
+	t.Helper()
+
+	body, err := os.ReadFile(path)
+	mustOK(t, err)
+
+	return string(body)
 }

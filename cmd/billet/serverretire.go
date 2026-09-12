@@ -273,12 +273,12 @@ func cmdServerRetire(ctx context.Context, args []string) error {
 	}
 
 	if r := checkRetireCombination(m); r != nil {
-		return answerRetireRefusal(r)
+		return answerRetireRefusal(drainedBefore(m, r))
 	}
 
 	if hostOS == "darwin" {
-		return answerRetireRefusal(retireRefuse(retireReasonPlatform,
-			"a controller's retirement needs systemd and the global authority exclusion, and this platform has neither", ""))
+		return answerRetireRefusal(drainedBefore(m, retireRefuse(retireReasonPlatform,
+			"a controller's retirement needs systemd and the global authority exclusion, and this platform has neither", "")))
 	}
 
 	var (
@@ -379,6 +379,23 @@ func checkRetireCombination(m retireMode) *retireRefusal {
 	}
 
 	return nil
+}
+
+// drainedBefore consumes stdin before an answer made before any mode read it:
+// the collector writes stdin before it reads stdout, so a refusal that left a
+// large document unread would meet a writer on a closed pipe and be reported
+// as a broken pipe with no answer at all. A mode that takes nothing on stdin
+// drains nothing.
+func drainedBefore(m retireMode, r *retireRefusal) *retireRefusal {
+	if m.input != "-" && m.completion != "-" && m.answer != "-" {
+		return r
+	}
+
+	if _, err := io.Copy(io.Discard, io.LimitReader(retireStdin, maxRetireInputBytes+1)); err != nil {
+		r.Why += "; and draining stdin: " + err.Error()
+	}
+
+	return r
 }
 
 // readRetireDocument reads one JSON document from stdin, whole, bounded, before

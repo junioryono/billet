@@ -18,7 +18,7 @@ import (
 // preparedHost records a service account and creates the global lock under the
 // pinned root, the metadata an installer leaves; the account is this test's
 // own uid so an unprivileged run can open what it created.
-func preparedHost(t *testing.T) retirement.ServiceAccount {
+func preparedHost(t *testing.T) {
 	t.Helper()
 
 	acct := retirement.ServiceAccount{User: "billet", UID: os.Getuid(), Group: "billet", GID: os.Getgid()}
@@ -38,8 +38,6 @@ func preparedHost(t *testing.T) retirement.ServiceAccount {
 	if err := hold.Release(); err != nil {
 		t.Fatal(err)
 	}
-
-	return acct
 }
 
 // AN ABSENT DIRECTORY ON A PREPARED HOST IS NEVER RECREATED BY AN ORDINARY

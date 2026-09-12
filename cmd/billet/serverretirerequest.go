@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -20,6 +22,7 @@ import (
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/endpoint"
+	"github.com/junioryono/billet/internal/regularfile"
 	"github.com/junioryono/billet/internal/retirement"
 	"github.com/junioryono/billet/internal/rollout"
 	"github.com/junioryono/billet/internal/state"
@@ -93,6 +96,25 @@ func retireRequest(ctx context.Context, m retireMode) (any, *retireRefusal) {
 		return nil, r
 	}
 
+	// A RETIREMENT IS REQUESTED ONLY ON A HOST AN INSTALLER HAS PREPARED: the
+	// transition publishes an authority status and renames the identity
+	// directory, and both are meaningless where no global exclusion is in
+	// force, since every other writer there is excluded by the directory's own
+	// lock, which moves with it.
+	class, err := retirement.Classify(obs.cfg.Server.IdentityDir)
+
+	switch {
+	case err != nil:
+		return nil, retireUnknown(retireReasonIdentity, err.Error(), "")
+	case class.Mode != retirement.ModePrepared:
+		return nil, retireRefuse(retireReasonIdentity, fmt.Sprintf("this host is %s: no service account is recorded at %s, so "+
+			"no global authority exclusion is in force and a retirement has nothing to close", class.Mode,
+			retirement.ServiceAccountPath()), "`billet local up` or the host role prepares the host")
+	case !class.Directory:
+		return nil, retireRefuse(retireReasonIdentity, "the configured identity directory is absent, so there is nothing to "+
+			"retire", "the runbook in docs/operating/upgrades.md")
+	}
+
 	// THE JOURNAL, RE-READ UNDER THE LOCK: a journal dispatches to a resume
 	// or the done handling, which follow in the next change; a request is
 	// what an absent journal admits.
@@ -115,7 +137,7 @@ func retireRequest(ctx context.Context, m retireMode) (any, *retireRefusal) {
 			return nil, r
 		}
 
-		db, r := retireOpenLedger(ctx, cfg, m.environmentFile)
+		db, r := retireOpenLedgerFor(ctx, cfg, m.environmentFile, m.dryRun)
 		if r != nil {
 			return nil, r
 		}
@@ -137,12 +159,20 @@ func retireRequest(ctx context.Context, m retireMode) (any, *retireRefusal) {
 
 		plan, r := judgeRetireRequest(ctx, m, in, obs, identity, row, db)
 		if r != nil {
-			// A REFUSAL RELEASES ONLY A ROW THIS CONVERGE INSERTED: the role
-			// says so through --reservation-fresh, from its own --reserve
-			// answer; an adopted row is kept for the next request.
+			// A REFUSAL RELEASES ONLY A ROW THIS CONVERGE INSERTED, and only
+			// when there is no marker beside it: the role says which through
+			// --reservation-fresh, from its own --reserve answer; an adopted
+			// row is kept for the next request, a DRY RUN releases nothing at
+			// all, and a row beside a marker is the abandonment's to release,
+			// since deleting it here would leave the marker naming no row.
 			r.Reservation = "kept"
 
-			if m.reservationFresh {
+			switch {
+			case m.dryRun, !m.reservationFresh:
+			case shape.Guard.Transition != nil:
+				r.Why += "; the reservation is kept because the guard carries this transition's marker, which " +
+					"`billet server retire --abandon-reservation` releases"
+			default:
 				if err := db.ReleaseRetirement(ctx, identity, m.retiringHost, m.run); err != nil {
 					r.Why += "; and releasing the reservation: " + err.Error()
 				} else {
@@ -195,6 +225,14 @@ func dispatchRequest(row state.Retirement, present bool, m retireMode) *retireRe
 	if row.Run != m.run {
 		return retireRefuse(retireReasonReserved, fmt.Sprintf("the reservation is run %s's, and this converge is %s; the same "+
 			"host adopts it by reserving again", row.Run, m.run), "")
+	}
+
+	// THE SURVIVOR IS THE RESERVATION'S: the row is what the two controllers
+	// contended for, and a request naming another survivor would record a
+	// journal the row does not describe.
+	if row.Survivor != m.survivorHost {
+		return retireRefuse(retireReasonReserved, fmt.Sprintf("the reservation names %s as the survivor and this request names "+
+			"%s; reserve again to name another", row.Survivor, m.survivorHost), "")
 	}
 
 	return nil
@@ -257,11 +295,31 @@ func judgeRetireRequest(ctx context.Context, m retireMode, in *retireInput, obs 
 		return nil, r
 	}
 
-	if r := judgeHostPreconditions(ctx, cfg, plan, now); r != nil {
+	if r := judgeHostPreconditions(ctx, m, cfg, plan, now); r != nil {
 		return nil, r
 	}
 
 	return plan, nil
+}
+
+// retireOpenLedgerFor opens the ledger for a request: read-only for a dry run,
+// which writes nothing anywhere, and the operator's open otherwise.
+func retireOpenLedgerFor(ctx context.Context, cfg *config.Config, environmentFile string, dryRun bool) (*state.DB, *retireRefusal) {
+	if !dryRun {
+		return retireOpenLedger(ctx, cfg, environmentFile)
+	}
+
+	dsn, err := ledgerDSNFrom(cfg, environmentFile)
+	if err != nil {
+		return nil, retireUnknown(retireReasonLedger, err.Error(), "")
+	}
+
+	db, err := openStateInspect(ctx, cfg, dsn)
+	if err != nil {
+		return nil, retireUnknown(retireReasonLedger, "open the ledger for the report: "+err.Error(), "")
+	}
+
+	return db, nil
 }
 
 // judgeVariant decides server-only or retained-node and holds the rendering
@@ -327,8 +385,59 @@ func judgeVariant(m retireMode, in *retireInput, obs *installedConfigObservation
 		return retireRefuse(retireReasonDesired, problem, "")
 	}
 
+	return checkRenderingCredentials(rendered)
+}
+
+// checkRenderingCredentials reads the node credentials the rendering names and
+// proves they are the pair a start needs: the certificate and the key parse
+// and belong together, and the trust store holds at least one authority. The
+// node's own startup reads exactly these files, and a request that admitted a
+// rendering whose key had been removed would archive the identity and then
+// fail to restart the node.
+//
+// WHAT THIS IS NOT: the provider and storage checks `billet check` performs
+// (a reachable Docker daemon, a Ceph cluster) are not re-run here; they touch
+// the world and a request that refused on a transient one would be worse than
+// one that did not ask.
+func checkRenderingCredentials(rendered *config.Config) *retireRefusal {
+	if rendered.Node == nil || rendered.Node.TLS == nil {
+		return nil
+	}
+
+	tlsCfg := rendered.Node.TLS
+
+	certPEM, err := regularfile.ReadFile(tlsCfg.CertPath, maxNodeCredentialBytes, regularfile.Options{})
+	if err != nil {
+		return retireUnknown(retireReasonConfig, "read the node's certificate: "+err.Error(), "")
+	}
+
+	keyPEM, err := regularfile.ReadFile(tlsCfg.KeyPath, maxNodeCredentialBytes, regularfile.Options{})
+	if err != nil {
+		return retireUnknown(retireReasonConfig, "read the node's key: "+err.Error(), "")
+	}
+
+	if _, err := tls.X509KeyPair(certPEM, keyPEM); err != nil {
+		return retireRefuse(retireReasonConfig, fmt.Sprintf("the node's certificate %s and key %s are not a pair the node can "+
+			"start with: %v", tlsCfg.CertPath, tlsCfg.KeyPath, err), "")
+	}
+
+	caPEM, err := regularfile.ReadFile(tlsCfg.CAPath, maxNodeCredentialBytes, regularfile.Options{})
+	if err != nil {
+		return retireUnknown(retireReasonConfig, "read the node's trust store: "+err.Error(), "")
+	}
+
+	cas, err := wirecert.ParseCertificates(caPEM)
+	if err != nil || len(cas) == 0 {
+		return retireRefuse(retireReasonConfig, fmt.Sprintf("the node's trust store %s holds no authority the node could "+
+			"verify a control plane with: %v", tlsCfg.CAPath, err), "")
+	}
+
 	return nil
 }
+
+// maxNodeCredentialBytes bounds a read of a node's certificate, key or trust
+// store.
+const maxNodeCredentialBytes = 1 << 20
 
 // serverlessMappingDiff decodes both documents as YAML mappings, drops the
 // four server keys from the installed one and answers the first path at
@@ -965,17 +1074,28 @@ func judgeEntryPredicates(ctx context.Context, in *retireInput, cfg *config.Conf
 // rename on one mount, the retirement directory not inside the identity, no
 // stale stage, no node path through the identity directory, the backup
 // service quiescent.
-func judgeHostPreconditions(ctx context.Context, cfg *config.Config, plan *retirePlan, now time.Time) *retireRefusal {
+func judgeHostPreconditions(ctx context.Context, m retireMode, cfg *config.Config, plan *retirePlan, now time.Time) *retireRefusal {
 	identityDir, err := filepath.EvalSymlinks(cfg.Server.IdentityDir)
 	if err != nil {
 		return retireUnknown(retireReasonIdentity, "resolve the identity directory: "+err.Error(), "")
 	}
 
-	if err := retirement.EnsureRetiredDir(); err != nil {
-		return retireUnknown(retireReasonStage, err.Error(), "")
+	// A DRY RUN CREATES NOTHING: the retirement directory is created by the
+	// request that will write into it, and a dry run over a host that has
+	// none compares the mount of the parent the directory would be made in.
+	destination := retirement.RetiredDir()
+
+	if !m.dryRun {
+		if err := retirement.EnsureRetiredDir(); err != nil {
+			return retireUnknown(retireReasonStage, err.Error(), "")
+		}
+	} else if _, err := os.Lstat(destination); errors.Is(err, fs.ErrNotExist) {
+		destination = retirement.Root
+	} else if err != nil {
+		return retireUnknown(retireReasonStage, "examine "+destination+": "+err.Error(), "")
 	}
 
-	retired, err := filepath.EvalSymlinks(retirement.RetiredDir())
+	retired, err := filepath.EvalSymlinks(destination)
 	if err != nil {
 		return retireUnknown(retireReasonStage, "resolve the retirement directory: "+err.Error(), "")
 	}
@@ -1118,6 +1238,18 @@ func applyRetireIntent(ctx context.Context, m retireMode, root *txLock, dir *os.
 
 		if err := rewriteGuardRecord(root, dir, record); err != nil {
 			return retireUnknown(retireReasonMarker, "write the guard's marker: "+err.Error(), "")
+		}
+	} else {
+		// A MARKER THIS INVOCATION CAN SEE IS NOT YET A MARKER THAT SURVIVES A
+		// POWER LOSS: an earlier invocation may have renamed the record and
+		// died before its flushes, and everything below rests on the marker
+		// being there when the host comes back.
+		if err := syncDirFD(dir); err != nil {
+			return retireUnknown(retireReasonMarker, err.Error(), "")
+		}
+
+		if err := syncDirFD(root.dir); err != nil {
+			return retireUnknown(retireReasonMarker, err.Error(), "")
 		}
 	}
 

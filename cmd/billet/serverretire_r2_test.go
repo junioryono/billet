@@ -69,6 +69,57 @@ func TestServerRetireDrainsAnOversizedDocumentBeforeRefusing(t *testing.T) {
 	}
 }
 
+// AND AN EARLY REFUSAL DRAINS IT TOO: the flag table answers before any mode
+// reads stdin, and a collector already writing a large request would meet a
+// closed pipe instead of the typed answer.
+func TestServerRetireDrainsStdinBeforeAnEarlyRefusal(t *testing.T) {
+	f := newRetireFixture(t)
+
+	r, w, err := os.Pipe()
+	mustOK(t, err)
+
+	saved := retireStdin
+	retireStdin = r
+
+	t.Cleanup(func() { retireStdin = saved })
+
+	written := make(chan error, 1)
+
+	go func() {
+		defer func() { _ = w.Close() }()
+
+		mustOK(t, w.SetWriteDeadline(time.Now().Add(10*time.Second)))
+
+		chunk := []byte(strings.Repeat("{", 64<<10))
+		for range 32 {
+			if _, err := w.Write(chunk); err != nil {
+				written <- err
+
+				return
+			}
+		}
+
+		written <- nil
+	}()
+
+	// --input - with no --survivor-host: the flag table refuses before the
+	// request reads anything.
+	var runErr error
+
+	out := capture(t, func() {
+		runErr = cmdServer(t.Context(), nil, []string{"retire", "--json", "--config", f.cfg, "--input", "-", "--run", "ci-1",
+			"--retiring-host", "control-a"})
+	})
+
+	if err := <-written; err != nil {
+		t.Fatalf("the writer met a closed pipe: %v", err)
+	}
+
+	if m := retireAnswer(t, out); m["reason"] != retireReasonCombination || runErr == nil {
+		t.Fatalf("an early refusal: %s (%v)", out, runErr)
+	}
+}
+
 // EVERY HOST NAME IS A HOLDER BY THE GUARD'S GRAMMAR, --survivor-host
 // included: a reservation naming a survivor the completion helper's --as-host
 // could never spell is refused before anything is opened.

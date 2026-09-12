@@ -90,7 +90,19 @@ func WriteServiceAccount(acct ServiceAccount) error {
 
 // publish installs bytes at path by temp, fsync, rename and directory fsync,
 // so a crash leaves either the old file or the new one and never a torn one.
+// Publishing is the one hook a test injects a failure into: every durable
+// write this package makes (the journal, the stage, the status, the service
+// account) goes through `publish`, so a test that fails one path proves the
+// order of the writes around it. Nil in production.
+var Publishing func(path string) error
+
 func publish(path string, body []byte, mode os.FileMode) error {
+	if Publishing != nil {
+		if err := Publishing(path); err != nil {
+			return err
+		}
+	}
+
 	dir := filepath.Dir(path)
 
 	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".*")
