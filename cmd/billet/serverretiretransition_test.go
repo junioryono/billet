@@ -469,9 +469,13 @@ func TestABackupIsAwaitedAndOnlyItsOwnRefusalIsReconciled(t *testing.T) {
 
 			// A BACKUP THAT FINISHES ON ITS OWN does so WHILE THE WAIT RUNS.
 			// The fake records each question AFTER it has answered it, so a
-			// recorded question is an observation the transition COMPLETED:
-			// the resolution is written behind one, which stages a wait rather
-			// than a delay, and the case asserts the await was performed.
+			// recorded question is an observation the transition COMPLETED,
+			// and the resolution is written behind the SECOND of them: the
+			// first is the table's own observation, the second can only be one
+			// the wait itself made. The case then requires exactly ONE await
+			// in the steps, so an await that returned without waiting — which
+			// would meet a backup still running at the next decision — shows
+			// up as a second await and fails.
 			waited := make(chan struct{})
 			stop := make(chan struct{})
 
@@ -482,7 +486,7 @@ func TestABackupIsAwaitedAndOnlyItsOwnRefusalIsReconciled(t *testing.T) {
 					deadline := time.After(30 * time.Second)
 
 					for {
-						if strings.Contains(readIfAny(filepath.Join(f.unitsDir, ".asked")), backupServiceUnit) {
+						if strings.Count(readIfAny(filepath.Join(f.unitsDir, ".asked")), backupServiceUnit) >= 2 {
 							writeFile(t, unit, c.resolve, 0o644)
 
 							return
@@ -492,7 +496,7 @@ func TestABackupIsAwaitedAndOnlyItsOwnRefusalIsReconciled(t *testing.T) {
 						case <-stop:
 							return
 						case <-deadline:
-							t.Error("the transition never asked about the backup")
+							t.Error("the transition never waited on the backup")
 
 							return
 						case <-time.After(time.Millisecond):
@@ -514,8 +518,11 @@ func TestABackupIsAwaitedAndOnlyItsOwnRefusalIsReconciled(t *testing.T) {
 
 			_, steps, r := f.drive(t, j)
 
-			if c.resolve != "" && !c.reconcile && !strings.HasPrefix(actionsOf(steps), "intent:await-backup") {
-				t.Fatalf("a running backup was not awaited: %q", actionsOf(steps))
+			if c.resolve != "" && !c.reconcile {
+				want := "intent:await-backup intent:stop stopped:archive archived:rewrite config-rewritten:done"
+				if actionsOf(steps) != want {
+					t.Fatalf("a running backup was awaited %q, want exactly one await: %q", actionsOf(steps), want)
+				}
 			}
 
 			switch {
@@ -875,46 +882,84 @@ func TestAResumeRunsUnderTheStatusItPublished(t *testing.T) {
 // long before its parent's entry is durable, so the run that recognises the
 // move completes the flush that run owed before it records the phase.
 func TestAnAdvanceFlushesWhatTheInterruptedRunOwed(t *testing.T) {
-	f := newRequestFixture(t)
-	f.reserve(t)
-
-	j := f.plantJournal(t, retirement.PhaseStopped, retirement.VariantServerOnly)
-
-	// The move completed and its phase was never written: the remainder the
-	// table admits as `advance-archived`.
-	mustOK(t, os.Rename(f.stateDir, j.Archive))
-
-	var flushed []string
-
-	savedSync := retireSyncDir
-	retireSyncDir = func(dir string) error {
-		flushed = append(flushed, dir)
-
-		return errors.New("the directory could not be flushed")
+	cases := map[string]struct {
+		phase   retirement.Phase
+		variant retirement.Variant
+		// nth is which of the advance's flushes fails, and dirs what it owes
+		// in order.
+		nth      int
+		action   string
+		recorded string
+	}{
+		"the moved directory's parent": {
+			phase: retirement.PhaseStopped, variant: retirement.VariantServerOnly, nth: 1,
+			action: "stopped:advance-archived", recorded: "before recording archived",
+		},
+		"the archive's parent": {
+			phase: retirement.PhaseStopped, variant: retirement.VariantServerOnly, nth: 2,
+			action: "stopped:advance-archived", recorded: "before recording archived",
+		},
+		"the configuration's directory": {
+			phase: retirement.PhaseArchived, variant: retirement.VariantRetainedNode, nth: 1,
+			action: "archived:advance-config-rewritten", recorded: "before recording config-rewritten",
+		},
 	}
 
-	t.Cleanup(func() { retireSyncDir = savedSync })
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newRequestFixture(t)
 
-	_, steps, r := f.drive(t, j)
+			if c.variant == retirement.VariantRetainedNode {
+				f.retainANode(t)
+			}
 
-	if r == nil || r.Reason != retireReasonJournal || !strings.Contains(r.Why, "before recording archived") {
-		t.Fatalf("the advance over an unflushed move: %+v", r)
-	}
+			f.reserve(t)
 
-	if actionsOf(steps) != "stopped:advance-archived" {
-		t.Fatalf("the resume performed %q", actionsOf(steps))
-	}
+			j := f.plantJournal(t, c.phase, c.variant)
 
-	if len(flushed) == 0 || flushed[0] != filepath.Dir(f.stateDir) {
-		t.Fatalf("the advance flushed %v, want the moved directory's parent first", flushed)
-	}
+			// The act completed and its phase was never written: the remainder
+			// the table admits as an advance.
+			mustOK(t, os.Rename(f.stateDir, j.Archive))
 
-	// THE PHASE WAS NOT WRITTEN, because the flush it certifies did not happen.
-	after, _, err := retirement.ReadJournal()
-	mustOK(t, err)
+			if c.phase == retirement.PhaseArchived {
+				writeFile(t, f.cfg, f.rendering(t), 0o600)
+			}
 
-	if after.Phase != retirement.PhaseStopped {
-		t.Fatalf("the phase advanced over a failed flush: %s", after.Phase)
+			var flushed []string
+
+			savedSync := retireSyncDir
+			retireSyncDir = func(dir string) error {
+				flushed = append(flushed, dir)
+
+				if len(flushed) == c.nth {
+					return errors.New("the directory could not be flushed")
+				}
+
+				return savedSync(dir)
+			}
+
+			t.Cleanup(func() { retireSyncDir = savedSync })
+
+			_, steps, r := f.drive(t, j)
+
+			switch {
+			case r == nil || r.Reason != retireReasonJournal || !strings.Contains(r.Why, c.recorded):
+				t.Fatalf("the advance over an unflushed act: %+v", r)
+			case actionsOf(steps) != c.action:
+				t.Fatalf("the resume performed %q, want %q", actionsOf(steps), c.action)
+			case len(flushed) != c.nth:
+				t.Fatalf("the advance flushed %v, want %d flush(es) before it stopped", flushed, c.nth)
+			}
+
+			// THE PHASE WAS NOT WRITTEN, because a flush it certifies did not
+			// happen.
+			after, _, err := retirement.ReadJournal()
+			mustOK(t, err)
+
+			if after.Phase != c.phase {
+				t.Fatalf("the phase advanced over a failed flush: %s", after.Phase)
+			}
+		})
 	}
 }
 
@@ -1031,6 +1076,43 @@ func TestAConfigurationWrittenInsideTheStartsSecondIsCouldNotTell(t *testing.T) 
 	}
 }
 
+// AND EXACTLY ONE SECOND LATER IS AFTER EVERY START THE RENDERING ADMITS: the
+// true start lies inside the rendered second, so a modification at its end is
+// observably later and the transition goes on. Refusing there would leave a
+// retirement stuck on a fact that is known.
+func TestAConfigurationOneSecondAfterTheStartIsChanged(t *testing.T) {
+	f := newRequestFixture(t)
+	f.retainANode(t)
+	f.reserve(t)
+
+	record := useRegistrationRecord(t)
+	f.svc.onStart = func(unit string) {
+		if unit == nodeUnit {
+			writeRegistrationRecord(t, record, f.identity, retainedEndpoint)
+		}
+	}
+
+	j := f.plantJournal(t, retirement.PhaseArchived, retirement.VariantRetainedNode)
+	mustOK(t, os.Rename(f.stateDir, j.Archive))
+
+	// The rewrite completed before its phase could be written, and the file it
+	// installed is stamped at the very end of the node's rendered start second.
+	writeFile(t, f.cfg, f.rendering(t), 0o600)
+
+	started, err := time.Parse(time.RFC3339, "2026-09-11T09:00:00Z")
+	mustOK(t, err)
+	mustOK(t, os.Chtimes(f.cfg, started.Add(time.Second), started.Add(time.Second)))
+
+	after, steps, r := f.drive(t, j)
+	if r != nil {
+		t.Fatalf("a modification a whole second later was refused: %+v", r)
+	}
+
+	if after.Phase != retirement.PhaseDone {
+		t.Fatalf("the transition ended at %s (%s)", after.Phase, actionsOf(steps))
+	}
+}
+
 // A ZONE THIS HOST CANNOT RESOLVE IS NOT READ AS UTC: systemd renders the
 // host's own abbreviation, and reading a positive offset as UTC moves the
 // instant later, which is the ADMITTING direction for a backup that failed
@@ -1076,5 +1158,107 @@ func TestACommandResumeOverACompletedMoveIsRefusedByName(t *testing.T) {
 
 	if len(f.svc.trace) != 0 {
 		t.Fatalf("a refused resume touched the host: %v", f.svc.trace)
+	}
+}
+
+// THE TRANSITION'S EXCLUSION IS THIS TRANSITION'S ALONE. The exception exists
+// because a run cannot admit itself through the status it published; it is not
+// a licence to touch a closed authority on the strength of any journal being
+// present. A journal no marker on this guard claims meets the status like
+// every other writer, and one that does not describe this deployment is
+// refused BEFORE any ledger is opened, since an open migrates a schema,
+// repairs ownership and hands artefacts back.
+func TestTheTransitionsExclusionIsGrantedToThisTransitionAlone(t *testing.T) {
+	t.Run("a journal this guard's marker does not claim", func(t *testing.T) {
+		f := newRequestFixture(t)
+		f.reserve(t)
+
+		f.plantJournal(t, retirement.PhaseStopped, retirement.VariantServerOnly)
+		advanceRowToIntent(t, f)
+		mustOK(t, retirement.WriteStatus(retirement.PhaseStopped, retirement.VariantServerOnly, retireNow()))
+
+		// The guard carries ANOTHER transition's marker, so this journal is not
+		// the transition this converge is driving.
+		markGuard(t, f.guard, &guardTransition{Kind: transitionRetirement, ID: strings.Repeat("b", 32)}, nil)
+
+		out, code := f.request(t, f.input(t, nil))
+
+		m := retireAnswer(t, out)
+		if code != exitUnknown || m["reason"] != retireReasonIdentity ||
+			!strings.Contains(whyOf(m), "authority is closed") {
+			t.Fatalf("an unclaimed journal took the transition's exclusion: %s", out)
+		}
+
+		if len(f.svc.trace) != 0 {
+			t.Fatalf("a refused run touched the host: %v", f.svc.trace)
+		}
+	})
+
+	t.Run("a journal describing another deployment", func(t *testing.T) {
+		f := newRequestFixture(t)
+		f.reserve(t)
+
+		j := f.plantJournal(t, retirement.PhaseStopped, retirement.VariantServerOnly)
+		markGuard(t, f.guard, &guardTransition{Kind: transitionRetirement, ID: retireTestID}, nil)
+		advanceRowToIntent(t, f)
+		mustOK(t, retirement.WriteStatus(retirement.PhaseStopped, retirement.VariantServerOnly, retireNow()))
+
+		j.Deployment = strings.Repeat("e", 32)
+		j.Provenance.Deployment = j.Deployment
+		mustOK(t, j.Write(retireNow()))
+
+		// THE LEDGER IS UNREACHABLE, so an open is observable: a run that
+		// judged the journal first answers about the journal, and one that
+		// opened first answers about the ledger.
+		t.Setenv("BILLET_STATE_DSN", "postgres://billet:billet@127.0.0.1:1/billet?sslmode=disable")
+
+		out, code := f.request(t, f.input(t, nil))
+
+		m := retireAnswer(t, out)
+		if code != exitUnknown || m["reason"] != retireReasonJournal ||
+			!strings.Contains(whyOf(m), "names deployment") {
+			t.Fatalf("the journal's deployment was not judged before the ledger was opened: %s", out)
+		}
+	})
+}
+
+// A WRITE THAT FAILED AND A READ-BACK THAT FAILED LEAVE THE PHASE UNKNOWN, and
+// the answer says `unknown` rather than the phase this run last knew: the
+// rename may have installed the next phase, and nothing here can tell.
+func TestAJournalWriteWhoseReadBackAlsoFailsSaysThePhaseIsUnknown(t *testing.T) {
+	f := newRequestFixture(t)
+	f.reserve(t)
+
+	statuses := 0
+
+	retirement.Publishing = func(path string) error {
+		if path == retirement.StatusPath() {
+			statuses++
+		}
+
+		return nil
+	}
+
+	retirement.SyncingDir = func(dir string) error {
+		if statuses < 2 || dir != retirement.RetiredDir() {
+			return nil
+		}
+
+		// The flush after the journal's rename fails, and the journal's own
+		// mode moves under it, so the read that would say which phase is on
+		// disk refuses as could-not-tell.
+		mustOK(t, os.Chmod(retirement.JournalPath(), 0o644))
+
+		return errors.New("the directory could not be flushed")
+	}
+
+	t.Cleanup(func() { retirement.Publishing, retirement.SyncingDir = nil, nil })
+
+	out, code := f.request(t, f.input(t, nil))
+
+	m := retireAnswer(t, out)
+	if code != exitUnknown || m["reason"] != retireReasonJournal || m["state"] != "unknown" ||
+		!strings.Contains(whyOf(m), "reading the journal back") {
+		t.Fatalf("a phase nothing could read was named anyway: %s", out)
 	}
 }

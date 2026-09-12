@@ -137,11 +137,15 @@ func retireRequest(ctx context.Context, m retireMode) (any, *retireRefusal) {
 
 	cfg := obs.cfg
 
-	// THE EXCLUSION A RESUME TAKES IS THE TRANSITION'S, because a journal on
-	// this host means a status this host published, and from `stopped` on that
-	// status refuses every ordinary writer, this run included.
+	// THE EXCLUSION A RESUME TAKES IS THE TRANSITION'S, because from `stopped`
+	// on the status this host published refuses every ordinary writer, this run
+	// included. IT IS GRANTED TO THIS TRANSITION ALONE, and proved from what is
+	// readable without taking anything: the journal names this host, and this
+	// converge's guard carries the marker that names the journal's transition.
+	// A journal describing another retirement, or one no marker on this guard
+	// claims, takes the ordinary access and meets whatever the status says.
 	access := withIdentityAccess
-	if journalFact != retirement.JournalFactAbsent {
+	if retireDrivesThisJournal(m, shape, j, journalFact) {
 		access = withRetiringIdentityAccess
 	}
 
@@ -149,6 +153,15 @@ func retireRequest(ctx context.Context, m retireMode) (any, *retireRefusal) {
 		identity, r := retireIdentity(cfg.Server.IdentityDir)
 		if r != nil {
 			return nil, r
+		}
+
+		// THE JOURNAL'S ASSOCIATION FIRST, BEFORE ANY LEDGER IS OPENED: an open
+		// migrates a schema, repairs ownership and hands artefacts back, and a
+		// journal that does not describe this deployment's retirement is not a
+		// reason to do any of that.
+		if journalFact != retirement.JournalFactAbsent && j.Deployment != identity {
+			return nil, retireUnknown(retireReasonJournal, fmt.Sprintf("the journal at %s names deployment %s and this "+
+				"host's identity is %s", j.Phase, j.Deployment, identity), "the runbook in docs/operating/upgrades.md")
 		}
 
 		db, r := retireOpenLedgerFor(ctx, cfg, m.environmentFile, m.dryRun)
@@ -226,7 +239,12 @@ func runRetireTransition(ctx context.Context, m retireMode, obs *installedConfig
 ) *retireRefusal {
 	j, steps, r := retireTransition(ctx, m, obs, j)
 	if r != nil {
-		r.State = string(j.Phase)
+		// A REFUSAL THAT ALREADY SAID `unknown` KEEPS IT: the phase this run
+		// last knew is not what the host holds, and naming it would send the
+		// next converge to a state nothing is in.
+		if r.State != retireStateUnknown {
+			r.State = string(j.Phase)
+		}
 
 		return r
 	}
@@ -370,6 +388,22 @@ func refuseResumePastTheArchive(j retirement.Journal, fact retirement.JournalFac
 		"%s: the move completed before its phase could be written, and resuming from there reads the identity and the "+
 		"ledger from the journal's locator, which is not in this binary yet", j.Phase, j.Archive),
 		"the runbook in docs/operating/upgrades.md")
+}
+
+// retireDrivesThisJournal says whether the journal on this host is the
+// transition THIS converge is driving, from facts no lock is needed to read.
+func retireDrivesThisJournal(m retireMode, shape claimShape, j retirement.Journal, fact retirement.JournalFact) bool {
+	switch fact {
+	case retirement.JournalFactIntent, retirement.JournalFactIncomplete, retirement.JournalFactDone:
+	default:
+		return false
+	}
+
+	if j.Retiring != m.retiringHost || j.Provenance.TransitionID == "" {
+		return false
+	}
+
+	return shape.Guard.Transition != nil && shape.Guard.Transition.ID == j.Provenance.TransitionID
 }
 
 // readRetireJournal reads the journal and classifies it for the dispatch. A

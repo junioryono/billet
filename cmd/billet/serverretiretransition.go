@@ -47,6 +47,10 @@ var (
 // 2). The refusal this transition reconciles is an exit and nothing else.
 const cldExited = 1
 
+// retireStateUnknown is the `state` of an answer that cannot say which phase
+// the host holds, which is not the same as the phase this run last knew.
+const retireStateUnknown = "unknown"
+
 // retireStepLimit bounds the loop. Seven actions carry a retirement from
 // intent to done and each one moves the phase or the host, so a run that has
 // taken more than this is deciding from facts its own writes did not move.
@@ -464,7 +468,7 @@ func retireNodeChangedFact(ctx context.Context, insp *lifeops.Inspector, configP
 	// between is could-not-tell, which the table refuses by name rather than
 	// manufacturing an ordering out of a truncation.
 	switch mod := info.ModTime(); {
-	case mod.After(started.Add(time.Second)):
+	case !mod.Before(started.Add(time.Second)):
 		return retirement.VerdictTrue
 	case mod.Before(started):
 		return retirement.VerdictFalse
@@ -873,7 +877,13 @@ func retireAdvancePhase(j retirement.Journal, phase retirement.Phase) (retiremen
 	read, presence, readErr := retirement.ReadJournal()
 	switch {
 	case presence != retirement.JournalPresent:
-		return j, retireUnknown(retireReasonJournal, fmt.Sprintf("%s; and reading the journal back: %v", why, readErr), "")
+		// NEITHER PHASE IS KNOWN NOW: the write may have installed the new
+		// journal before it failed, and the read that would say so failed too.
+		r := retireUnknown(retireReasonJournal, fmt.Sprintf("%s; and reading the journal back: %v", why, readErr),
+			"the runbook in docs/operating/upgrades.md")
+		r.State = retireStateUnknown
+
+		return j, r
 	case read.Phase == phase:
 		return read, retireUnknown(retireReasonJournal, why+"; the journal reads "+string(phase)+
 			" on disk and whether that is durable cannot be told here", "")
