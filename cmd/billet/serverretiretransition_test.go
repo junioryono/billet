@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -885,22 +886,32 @@ func TestAnAdvanceFlushesWhatTheInterruptedRunOwed(t *testing.T) {
 	cases := map[string]struct {
 		phase   retirement.Phase
 		variant retirement.Variant
-		// nth is which of the advance's flushes fails, and dirs what it owes
-		// in order.
+		// nth is which of the advance's flushes fails, and want the
+		// directories it owes up to and including that one, in order.
 		nth      int
+		want     func(f *requestFixture, j retirement.Journal) []string
 		action   string
 		recorded string
 	}{
 		"the moved directory's parent": {
 			phase: retirement.PhaseStopped, variant: retirement.VariantServerOnly, nth: 1,
+			want: func(f *requestFixture, _ retirement.Journal) []string {
+				return []string{filepath.Dir(f.stateDir)}
+			},
 			action: "stopped:advance-archived", recorded: "before recording archived",
 		},
 		"the archive's parent": {
 			phase: retirement.PhaseStopped, variant: retirement.VariantServerOnly, nth: 2,
+			want: func(f *requestFixture, j retirement.Journal) []string {
+				return []string{filepath.Dir(f.stateDir), filepath.Dir(j.Archive)}
+			},
 			action: "stopped:advance-archived", recorded: "before recording archived",
 		},
 		"the configuration's directory": {
 			phase: retirement.PhaseArchived, variant: retirement.VariantRetainedNode, nth: 1,
+			want: func(f *requestFixture, _ retirement.Journal) []string {
+				return []string{filepath.Dir(f.cfg)}
+			},
 			action: "archived:advance-config-rewritten", recorded: "before recording config-rewritten",
 		},
 	}
@@ -947,8 +958,8 @@ func TestAnAdvanceFlushesWhatTheInterruptedRunOwed(t *testing.T) {
 				t.Fatalf("the advance over an unflushed act: %+v", r)
 			case actionsOf(steps) != c.action:
 				t.Fatalf("the resume performed %q, want %q", actionsOf(steps), c.action)
-			case len(flushed) != c.nth:
-				t.Fatalf("the advance flushed %v, want %d flush(es) before it stopped", flushed, c.nth)
+			case !slices.Equal(flushed, c.want(f, j)):
+				t.Fatalf("the advance flushed %v, want %v", flushed, c.want(f, j))
 			}
 
 			// THE PHASE WAS NOT WRITTEN, because a flush it certifies did not
@@ -1071,45 +1082,33 @@ func TestAConfigurationWrittenInsideTheStartsSecondIsCouldNotTell(t *testing.T) 
 
 	_, _, r := f.drive(t, j)
 
-	if r == nil || r.Reason != retireReasonPhase || !strings.Contains(r.Why, "node_changed") {
+	if r == nil || r.Reason != retireReasonPhase || !strings.Contains(r.Why, "node_changed: unknown") {
 		t.Fatalf("an ordering was manufactured out of a truncated timestamp: %+v", r)
 	}
 }
 
 // AND EXACTLY ONE SECOND LATER IS AFTER EVERY START THE RENDERING ADMITS: the
-// true start lies inside the rendered second, so a modification at its end is
-// observably later and the transition goes on. Refusing there would leave a
-// retirement stuck on a fact that is known.
+// true start lies inside the second systemd printed, so a modification at its
+// end is observably later. The verdict is read where it DECIDES — at `archived`
+// over the installed configuration, which the table admits only when the node's
+// file has NOT changed — and by value, because could-not-tell and `true` refuse
+// there for different reasons and only the value tells them apart.
 func TestAConfigurationOneSecondAfterTheStartIsChanged(t *testing.T) {
 	f := newRequestFixture(t)
 	f.retainANode(t)
 	f.reserve(t)
 
-	record := useRegistrationRecord(t)
-	f.svc.onStart = func(unit string) {
-		if unit == nodeUnit {
-			writeRegistrationRecord(t, record, f.identity, retainedEndpoint)
-		}
-	}
-
 	j := f.plantJournal(t, retirement.PhaseArchived, retirement.VariantRetainedNode)
 	mustOK(t, os.Rename(f.stateDir, j.Archive))
-
-	// The rewrite completed before its phase could be written, and the file it
-	// installed is stamped at the very end of the node's rendered start second.
-	writeFile(t, f.cfg, f.rendering(t), 0o600)
 
 	started, err := time.Parse(time.RFC3339, "2026-09-11T09:00:00Z")
 	mustOK(t, err)
 	mustOK(t, os.Chtimes(f.cfg, started.Add(time.Second), started.Add(time.Second)))
 
-	after, steps, r := f.drive(t, j)
-	if r != nil {
-		t.Fatalf("a modification a whole second later was refused: %+v", r)
-	}
+	_, _, r := f.drive(t, j)
 
-	if after.Phase != retirement.PhaseDone {
-		t.Fatalf("the transition ended at %s (%s)", after.Phase, actionsOf(steps))
+	if r == nil || !strings.Contains(r.Why, "node_changed: true") {
+		t.Fatalf("a modification a whole second after the start was not read as a change: %+v", r)
 	}
 }
 
@@ -1194,6 +1193,33 @@ func TestTheTransitionsExclusionIsGrantedToThisTransitionAlone(t *testing.T) {
 		}
 	})
 
+	t.Run("a journal this holder and its chain never owned", func(t *testing.T) {
+		f := newRequestFixture(t)
+		f.reserve(t)
+
+		j := f.plantJournal(t, retirement.PhaseStopped, retirement.VariantServerOnly)
+		markGuard(t, f.guard, &guardTransition{Kind: transitionRetirement, ID: retireTestID}, nil)
+		advanceRowToIntent(t, f)
+		mustOK(t, retirement.WriteStatus(retirement.PhaseStopped, retirement.VariantServerOnly, retireNow()))
+
+		// THE MARKER MATCHES AND THE OWNER DOES NOT: a guard that took over
+		// would list the journal's owner in its chain, and this one does not,
+		// so the transition this run drives is not the one the journal records.
+		j.Ownership.Owner = "ci-9"
+		mustOK(t, j.Write(retireNow()))
+
+		// The ledger is unreachable, so an administrative open is observable.
+		t.Setenv("BILLET_STATE_DSN", "postgres://billet:billet@127.0.0.1:1/billet?sslmode=disable")
+
+		out, code := f.request(t, f.input(t, nil))
+
+		m := retireAnswer(t, out)
+		if code != exitUnknown || m["reason"] != retireReasonIdentity ||
+			!strings.Contains(whyOf(m), "authority is closed") {
+			t.Fatalf("a journal nobody in this guard's chain owns took the transition's exclusion: %s", out)
+		}
+	})
+
 	t.Run("a journal describing another deployment", func(t *testing.T) {
 		f := newRequestFixture(t)
 		f.reserve(t)
@@ -1260,5 +1286,142 @@ func TestAJournalWriteWhoseReadBackAlsoFailsSaysThePhaseIsUnknown(t *testing.T) 
 	if code != exitUnknown || m["reason"] != retireReasonJournal || m["state"] != "unknown" ||
 		!strings.Contains(whyOf(m), "reading the journal back") {
 		t.Fatalf("a phase nothing could read was named anyway: %s", out)
+	}
+}
+
+// THE WAIT IS EXERCISED DIRECTLY, because the driver's own observations can
+// stand in for one: an await that looked once and returned success would be
+// supplying the observation the fixture resolves behind. Here nothing else
+// observes the unit, so the only way past the first answer is the wait's own
+// polling, and the wait must not answer until it has seen the backup finish.
+func TestTheBackupWaitDoesNotAnswerWhileTheBackupRuns(t *testing.T) {
+	f := newRequestFixture(t)
+
+	unit := filepath.Join(f.unitsDir, backupServiceUnit)
+	writeFile(t, unit, "LoadState=loaded\nActiveState=active\nSubState=running\nResult=success\nMainPID=99\n", 0o644)
+
+	savedWait, savedPoll := retireBackupWait, retireBackupPoll
+	retireBackupWait, retireBackupPoll = 30*time.Second, time.Millisecond
+
+	t.Cleanup(func() { retireBackupWait, retireBackupPoll = savedWait, savedPoll })
+
+	j := f.plantJournal(t, retirement.PhaseIntent, retirement.VariantServerOnly)
+
+	answered := make(chan *retireRefusal, 1)
+
+	go func() { answered <- awaitRetireBackup(t.Context(), j) }()
+
+	// THE WAIT POLLS: three completed observations of a unit that is still
+	// running are three answers only a wait makes, and it must not have
+	// answered at any of them.
+	asked := filepath.Join(f.unitsDir, ".asked")
+
+	for deadline := time.After(30 * time.Second); ; {
+		if strings.Count(readIfAny(asked), backupServiceUnit) >= 3 {
+			break
+		}
+
+		select {
+		case r := <-answered:
+			t.Fatalf("the wait answered while the backup was running: %+v", r)
+		case <-deadline:
+			t.Fatal("the wait never polled the backup")
+		case <-time.After(time.Millisecond):
+		}
+	}
+
+	select {
+	case r := <-answered:
+		t.Fatalf("the wait answered while the backup was running: %+v", r)
+	default:
+	}
+
+	writeFile(t, unit, "LoadState=loaded\nActiveState=inactive\nSubState=dead\nResult=success\nMainPID=0\n", 0o644)
+
+	select {
+	case r := <-answered:
+		if r != nil {
+			t.Fatalf("the wait refused a backup that finished: %+v", r)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the wait never noticed the backup had finished")
+	}
+}
+
+// AND A BACKUP THAT NEVER FINISHES ENDS THE WAIT AT ITS BOUND, leaving the
+// retirement where it stood: a backup is awaited and never killed.
+func TestTheBackupWaitEndsAtItsBound(t *testing.T) {
+	f := newRequestFixture(t)
+
+	writeFile(t, filepath.Join(f.unitsDir, backupServiceUnit),
+		"LoadState=loaded\nActiveState=active\nSubState=running\nResult=success\nMainPID=99\n", 0o644)
+
+	savedWait, savedPoll := retireBackupWait, retireBackupPoll
+	retireBackupWait, retireBackupPoll = 20*time.Millisecond, time.Millisecond
+
+	t.Cleanup(func() { retireBackupWait, retireBackupPoll = savedWait, savedPoll })
+
+	j := f.plantJournal(t, retirement.PhaseIntent, retirement.VariantServerOnly)
+
+	r := awaitRetireBackup(t.Context(), j)
+	if r == nil || r.Reason != retireReasonBackup || !strings.Contains(r.Why, "still running after") {
+		t.Fatalf("a backup that never finished: %+v", r)
+	}
+}
+
+// A JOURNAL WHOSE PHASE CANNOT BE ESTABLISHED SAYS SO EVERY TIME. The first
+// run's write may have installed a phase nobody can now read, and a retry over
+// the same unreadable journal that answered `nothing` would say this host is
+// one where no retirement has happened.
+func TestAnUnreadableJournalKeepsSayingThePhaseIsUnknown(t *testing.T) {
+	f := newRequestFixture(t)
+	f.reserve(t)
+
+	f.plantJournal(t, retirement.PhaseStopped, retirement.VariantServerOnly)
+	markGuard(t, f.guard, &guardTransition{Kind: transitionRetirement, ID: retireTestID}, nil)
+	advanceRowToIntent(t, f)
+
+	// A mode billet does not write: the reader refuses it as untrusted, which
+	// is could-not-tell and never an absence.
+	mustOK(t, os.Chmod(retirement.JournalPath(), 0o644))
+
+	for attempt := range 2 {
+		out, code := f.request(t, f.input(t, nil))
+
+		m := retireAnswer(t, out)
+		if code != exitUnknown || m["reason"] != retireReasonJournal || m["state"] != "unknown" {
+			t.Fatalf("attempt %d over an unreadable journal: %s", attempt+1, out)
+		}
+	}
+}
+
+// A `done` JOURNAL IS THE TAIL'S, AND IS SAID SO BEFORE ANY CONFIGURATION IS
+// READ: a server-only host at `done` has no configuration at all, and reading
+// one there answers about a missing file instead of the step that is missing.
+func TestADoneJournalIsTheTailsBeforeAnyConfigurationIsRead(t *testing.T) {
+	f := newRequestFixture(t)
+	f.reserve(t)
+
+	j := f.plantJournal(t, retirement.PhaseDone, retirement.VariantServerOnly)
+	markGuard(t, f.guard, &guardTransition{Kind: transitionRetirement, ID: retireTestID}, nil)
+	advanceRowToIntent(t, f)
+
+	// The request document and the digest operand are what the role would hand
+	// this run; both are built while the configuration is still there, because
+	// the role builds them on a host that has one.
+	in, digest := f.input(t, nil), f.installedSHA(t)
+
+	// The host as a completed transition leaves it: the identity archived, the
+	// configuration removed, the authority closed at done.
+	mustOK(t, os.Rename(f.stateDir, j.Archive))
+	mustOK(t, os.Remove(f.cfg))
+	mustOK(t, retirement.WriteStatus(retirement.PhaseDone, retirement.VariantServerOnly, retireNow()))
+
+	out, code := f.run(t, in, "--input", "-", "--run", requestRun, "--retiring-host", requestRetiring,
+		"--survivor-host", requestSurvivor, "--server-only", "--installed-sha256", digest)
+
+	m := retireAnswer(t, out)
+	if code != exitUnknown || m["reason"] != retireReasonPhase || !strings.Contains(whyOf(m), "the tail") {
+		t.Fatalf("a done journal: %s", out)
 	}
 }

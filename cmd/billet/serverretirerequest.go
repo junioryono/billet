@@ -359,6 +359,11 @@ func requirePreparedHost(obs *installedConfigObservation) *retireRefusal {
 // archive both are gone by design, and the reader that works from the
 // journal's locator alone is the tail's.
 func refuseResumePastTheArchive(j retirement.Journal, fact retirement.JournalFact) *retireRefusal {
+	if fact == retirement.JournalFactDone {
+		return retireUnknown(retireReasonPhase, "this host's retirement is at done; the tail that completes the ledger "+
+			"row, acknowledges it and clears the guard's marker is not in this binary yet", "")
+	}
+
 	if fact != retirement.JournalFactIncomplete {
 		return nil
 	}
@@ -399,11 +404,17 @@ func retireDrivesThisJournal(m retireMode, shape claimShape, j retirement.Journa
 		return false
 	}
 
-	if j.Retiring != m.retiringHost || j.Provenance.TransitionID == "" {
+	if shape.Guard.Transition == nil || shape.Guard.Transition.ID != j.Provenance.TransitionID {
 		return false
 	}
 
-	return shape.Guard.Transition != nil && shape.Guard.Transition.ID == j.Provenance.TransitionID
+	// THE JOURNAL'S OWN VALIDATION, minus what needs a ledger: this host, the
+	// provenance self-consistent, and the journal OWNED by this holder or by
+	// one its guard took over from. A marker matching a journal nobody in this
+	// guard's chain owns is not this converge's transition, and the exception
+	// is what lets a run past a closed authority.
+	return j.Validate(retirement.JournalExpectation{Retiring: m.retiringHost, Holder: m.run,
+		TakenOverFrom: shape.Guard.TakenOverFrom}) == nil
 }
 
 // readRetireJournal reads the journal and classifies it for the dispatch. A
@@ -417,7 +428,13 @@ func readRetireJournal() (retirement.Journal, retirement.JournalFact, *retireRef
 	case retirement.JournalPresent:
 		return j, retirement.JournalFactOf(true, j.Phase), nil
 	default:
-		return j, "", retireUnknown(retireReasonJournal, "the retirement journal could not be judged: "+errorText(err), "")
+		// THE PHASE CANNOT BE ESTABLISHED, which is not the same as a host
+		// nothing has happened on: a retry over the same unreadable journal
+		// must not answer `nothing` where the first run answered `unknown`.
+		r := retireUnknown(retireReasonJournal, "the retirement journal could not be judged: "+errorText(err), "")
+		r.State = retireStateUnknown
+
+		return j, "", r
 	}
 }
 
@@ -549,6 +566,8 @@ func dispatchRetire(row state.Retirement, present bool, journal retirement.Journ
 		return d, retireRefuse(retireReasonReservation, "this host holds no reservation; `billet server retire --reserve` writes "+
 			"one before any report is collected", "")
 	case retirement.DispatchCompleteRow, retirement.DispatchDone:
+		// The journal's own boundary refuses a `done` journal before any
+		// configuration is read; this keeps the dispatch total.
 		return d, retireUnknown(retireReasonPhase, "this host's retirement is at done; the tail that completes the ledger "+
 			"row, acknowledges it and clears the guard's marker is not in this binary yet", "")
 	case retirement.DispatchRefusedReserved:
