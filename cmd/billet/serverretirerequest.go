@@ -108,6 +108,20 @@ func retireRequest(ctx context.Context, m retireMode) (any, *retireRefusal) {
 	defer root.release()
 	defer func() { _ = dir.Close() }()
 
+	// THE JOURNAL IS READ BEFORE THE CONFIGURATION, because past the archive
+	// there may be no configuration to read and no identity at its configured
+	// path: such a resume reads both from the journal's locator, which is the
+	// tail's reader and not in this binary yet, and it is refused here rather
+	// than met below as a missing file.
+	j, journalFact, r := readRetireJournal()
+	if r != nil {
+		return nil, r
+	}
+
+	if r := refuseResumePastTheArchive(j, journalFact); r != nil {
+		return nil, r
+	}
+
 	// THE CONFIGURATION IS OBSERVED UNDER THE LOCK, because everything below
 	// rests on it: its digest is compared with the one the role read, its
 	// backend and controllers decide eligibility, and its identity directory
@@ -123,14 +137,7 @@ func retireRequest(ctx context.Context, m retireMode) (any, *retireRefusal) {
 
 	cfg := obs.cfg
 
-	// THE JOURNAL, RE-READ UNDER THE LOCK: a journal dispatches to a resume
-	// or the done handling, which follow in the next change; a request is
-	// what an absent journal admits.
-	if r := requireNoJournalForRequest(); r != nil {
-		return nil, r
-	}
-
-	return withIdentityAccess(ctx, cfg.Server.IdentityDir, func() (any, *retireRefusal) {
+	out, r := withIdentityAccess(ctx, cfg.Server.IdentityDir, func() (any, *retireRefusal) {
 		identity, r := retireIdentity(cfg.Server.IdentityDir)
 		if r != nil {
 			return nil, r
@@ -152,8 +159,13 @@ func retireRequest(ctx context.Context, m retireMode) (any, *retireRefusal) {
 			return nil, r
 		}
 
-		if r := dispatchRequest(row, present, m); r != nil {
+		d, r := dispatchRetire(row, present, journalFact, m)
+		if r != nil {
 			return nil, r
+		}
+
+		if d != retirement.DispatchAdopt {
+			return resumeRetirement(ctx, m, shape, db, d, j, identity, row)
 		}
 
 		plan, r := judgeRetireRequest(ctx, m, in, obs, identity, row, db)
@@ -182,14 +194,113 @@ func retireRequest(ctx context.Context, m retireMode) (any, *retireRefusal) {
 			return nil, r
 		}
 
-		if r := applyRetireIntent(ctx, m, root, dir, shape, db, plan); r != nil {
-			return nil, r
-		}
-
-		return nil, &retireRefusal{Schema: retireSchema, Outcome: retireOutcomeUnknown, Reason: retireReasonPhase,
-			Why: "the retirement's intent is recorded (journal, row and status at intent); the transition's phases after " +
-				"intent are not in this binary yet", State: "intent"}
+		return applyRetireIntent(ctx, m, root, dir, shape, db, plan)
 	})
+	if r != nil {
+		return nil, r
+	}
+
+	// THE TRANSITION RUNS OUTSIDE EVERY IDENTITY HOLD: it waits for a backup
+	// that is itself taking the authority lock, and it takes that lock for the
+	// archive alone. The transaction lock and the guard are still held.
+	recorded, ok := out.(retirement.Journal)
+	if !ok {
+		return nil, retireUnknown(retireReasonJournal, "the intent answered no journal to drive", "")
+	}
+
+	return nil, runRetireTransition(ctx, m, obs, recorded)
+}
+
+// runRetireTransition drives the phases and answers what the host reached.
+// Every outcome is a refusal today: the transition ends at `done`, and the
+// tail that completes the ledger row is the next change.
+func runRetireTransition(ctx context.Context, m retireMode, obs *installedConfigObservation, j retirement.Journal,
+) *retireRefusal {
+	j, steps, r := retireTransition(ctx, m, obs, j)
+	if r != nil {
+		r.State = string(j.Phase)
+
+		return r
+	}
+
+	return &retireRefusal{Schema: retireSchema, Outcome: retireOutcomeUnknown, Reason: retireReasonPhase,
+		Why: fmt.Sprintf("the transition is complete on this host (%s); the tail that completes the ledger row, "+
+			"acknowledges it and clears the guard's marker is not in this binary yet", describeRetireSteps(steps)),
+		State: string(j.Phase)}
+}
+
+// describeRetireSteps renders what this run did, for the answer.
+func describeRetireSteps(steps []retireStep) string {
+	if len(steps) == 0 {
+		return "this run performed no step"
+	}
+
+	words := make([]string, 0, len(steps))
+	for _, s := range steps {
+		words = append(words, s.Action)
+	}
+
+	return "this run performed " + strings.Join(words, ", ")
+}
+
+// resumeRetirement takes a transition already under way: the journal is held
+// to this retirement and to this guard, its ownership is rebound to the holder
+// driving it now, and a row still at `reserved` beside an `intent` journal (the
+// crash between the two intent writes) is advanced.
+func resumeRetirement(ctx context.Context, m retireMode, shape claimShape, db *state.DB, d retirement.Dispatch,
+	j retirement.Journal, identity string, row state.Retirement,
+) (any, *retireRefusal) {
+	if r := validateRetireJournal(&j, m, shape, identity, row); r != nil {
+		return nil, r
+	}
+
+	if j.Ownership.Owner != m.run {
+		j.Rebind(m.run)
+
+		if err := j.Write(retireNow()); err != nil {
+			return nil, retireUnknown(retireReasonJournal, "record this converge as the journal's owner: "+err.Error(), "")
+		}
+	}
+
+	if d == retirement.DispatchAdvanceRow {
+		if err := db.AdvanceRetirementToIntent(ctx, identity, m.retiringHost, j.Provenance.TransitionID, m.run,
+			retireNow()); err != nil {
+			return nil, retireUnknown(retireReasonLedger, "advance the row to intent: "+err.Error(), "")
+		}
+	}
+
+	return j, nil
+}
+
+// validateRetireJournal holds an incomplete journal to the retirement the row
+// describes, to this guard's holder or its chain, and to the marker the
+// transition wrote at intent.
+func validateRetireJournal(j *retirement.Journal, m retireMode, shape claimShape, identity string,
+	row state.Retirement,
+) *retireRefusal {
+	facts := retirement.RowFacts{State: row.State, Retiring: row.Retiring, Survivor: row.Survivor,
+		ReservedAt: row.ReservedAt, TransitionID: row.TransitionID}
+
+	if err := j.Validate(retirement.JournalExpectation{Retiring: m.retiringHost, Identity: identity, Holder: m.run,
+		TakenOverFrom: shape.Guard.TakenOverFrom, Row: &facts}); err != nil {
+		return retireUnknown(retireReasonJournal, err.Error(), "the runbook in docs/operating/upgrades.md")
+	}
+
+	// THE MARKER IS REQUIRED, not merely consistent: it is what keeps the
+	// guard from being released under a transition that has stopped a server
+	// and moved an identity, and a resume without one is a host whose guard
+	// somebody could take away mid-transition.
+	if shape.Guard.Transition == nil {
+		return retireUnknown(retireReasonMarker, fmt.Sprintf("the retirement at %s carries no marker on this converge's "+
+			"guard, so the guard could be released under it", j.Phase), "the runbook in docs/operating/upgrades.md")
+	}
+
+	if shape.Guard.Transition.ID != j.Provenance.TransitionID {
+		return retireUnknown(retireReasonMarker, fmt.Sprintf("the guard's marker names transition %s and the journal "+
+			"names %s; the marker is kept", shape.Guard.Transition.ID, j.Provenance.TransitionID), "")
+	}
+
+	return nil
 }
 
 // requirePreparedHost is the retirement's prerequisite: an installer has
@@ -215,21 +326,51 @@ func requirePreparedHost(obs *installedConfigObservation) *retireRefusal {
 	return nil
 }
 
-// requireNoJournalForRequest is the journal's own dispatch: a request is what
-// an absent journal admits, and a journal in any phase is a resume's, which
-// the next change adds.
-func requireNoJournalForRequest() *retireRefusal {
+// refuseResumePastTheArchive is this binary's boundary: a transition is driven
+// to done by the run that recorded its intent, and a resume is admitted while
+// the host still holds what the request read — the configured identity
+// directory and an installed configuration with a server section. Past the
+// archive both are gone by design, and the reader that works from the
+// journal's locator alone is the tail's.
+func refuseResumePastTheArchive(j retirement.Journal, fact retirement.JournalFact) *retireRefusal {
+	if fact != retirement.JournalFactIncomplete || j.Phase == retirement.PhaseStopped {
+		return nil
+	}
+
+	return retireUnknown(retireReasonPhase, fmt.Sprintf("this host's retirement is at %s, past the archive: resuming it "+
+		"reads the identity and the ledger from the journal's locator (%s), which is not in this binary yet", j.Phase,
+		j.Locator.Archive), "the runbook in docs/operating/upgrades.md")
+}
+
+// readRetireJournal reads the journal and classifies it for the dispatch. A
+// journal that cannot be judged is could-not-tell and never absence.
+func readRetireJournal() (retirement.Journal, retirement.JournalFact, *retireRefusal) {
 	j, presence, err := retirement.ReadJournal()
 
 	switch presence {
 	case retirement.JournalAbsent:
-		return nil
+		return j, retirement.JournalFactAbsent, nil
 	case retirement.JournalPresent:
-		return retireUnknown(retireReasonPhase, fmt.Sprintf("a retirement journal exists at %s (transition %s); the resume "+
-			"of a retirement in progress is not in this binary yet", j.Phase, j.Provenance.TransitionID), "")
+		return j, retirement.JournalFactOf(true, j.Phase), nil
 	default:
-		return retireUnknown(retireReasonJournal, "the retirement journal could not be judged: "+err.Error(), "")
+		return j, "", retireUnknown(retireReasonJournal, "the retirement journal could not be judged: "+errorText(err), "")
 	}
+}
+
+// requireNoJournalForRequest is the dry run's rule: a preview describes a
+// request, and a retirement already under way is the mutating run's to resume.
+func requireNoJournalForRequest() *retireRefusal {
+	j, fact, r := readRetireJournal()
+	if r != nil {
+		return r
+	}
+
+	if fact == retirement.JournalFactAbsent {
+		return nil
+	}
+
+	return retireUnknown(retireReasonPhase, fmt.Sprintf("a retirement journal exists at %s (transition %s); a dry run "+
+		"describes a request and does not judge a transition already under way", j.Phase, j.Provenance.TransitionID), "")
 }
 
 // retireRequestReport is the dry run over a request: nothing is taken and
@@ -281,7 +422,9 @@ func retireRequestReport(ctx context.Context, m retireMode, in *retireInput, obs
 		return nil, r
 	}
 
-	if r := dispatchRequest(row, present, m); r != nil {
+	// THE PREVIEW DISPATCHES OVER AN ABSENT JOURNAL, which is what it already
+	// required above: a transition under way is the mutating run's to resume.
+	if _, r := dispatchRetire(row, present, retirement.JournalFactAbsent, m); r != nil {
 		return nil, r
 	}
 
@@ -322,29 +465,41 @@ func judgeGuardDirTrust() *retireRefusal {
 
 // dispatchRequest holds the row to the one cell a request proceeds from: this
 // host's own reservation, under this run, beside no journal.
-func dispatchRequest(row state.Retirement, present bool, m retireMode) *retireRefusal {
+func dispatchRetire(row state.Retirement, present bool, journal retirement.JournalFact, m retireMode,
+) (retirement.Dispatch, *retireRefusal) {
 	fact := retirement.RowAbsent
 	if present {
 		fact = rowFactOf(row, m.retiringHost)
 	}
 
-	switch d := retirement.DispatchFor(fact, retirement.JournalFactAbsent); d {
+	d := retirement.DispatchFor(fact, journal)
+
+	switch d {
 	case retirement.DispatchAdopt:
+	case retirement.DispatchResume, retirement.DispatchAdvanceRow:
+		// A TRANSITION ALREADY UNDER WAY is resumed, and the request document
+		// this run carries is not judged again: what it would judge, the
+		// journal decided before anything stopped.
+		return d, nil
 	case retirement.DispatchRequest:
-		return retireRefuse(retireReasonReservation, "this host holds no reservation; `billet server retire --reserve` writes "+
+		return d, retireRefuse(retireReasonReservation, "this host holds no reservation; `billet server retire --reserve` writes "+
 			"one before any report is collected", "")
+	case retirement.DispatchCompleteRow, retirement.DispatchDone:
+		return d, retireUnknown(retireReasonPhase, "this host's retirement is at done; the tail that completes the ledger "+
+			"row, acknowledges it and clears the guard's marker is not in this binary yet", "")
 	case retirement.DispatchRefusedReserved:
-		return retireRefuse(retireReasonReserved, fmt.Sprintf("this deployment's retirement is reserved by %s (run %s, state %s, "+
+		return d, retireRefuse(retireReasonReserved, fmt.Sprintf("this deployment's retirement is reserved by %s (run %s, state %s, "+
 			"since %s); one controller retires at a time", row.Retiring, row.Run, row.State, row.ReservedAt), "")
 	case retirement.DispatchRefusedRetired:
-		return retireRefuse(retireReasonRetired, retiredSentence(row), "")
+		return d, retireRefuse(retireReasonRetired, retiredSentence(row), "")
 	default:
-		return retireUnknown(retireReasonReservation, fmt.Sprintf("the ledger's row is at %s for this host beside no journal, "+
-			"which no step of the protocol produces (%s)", row.State, d), "the runbook in docs/operating/upgrades.md")
+		return d, retireUnknown(retireReasonReservation, fmt.Sprintf("the ledger's row is at %s for this host beside a journal "+
+			"that is %s, which no step of the protocol produces (%s)", row.State, journal, d),
+			"the runbook in docs/operating/upgrades.md")
 	}
 
 	if row.Run != m.run {
-		return retireRefuse(retireReasonReserved, fmt.Sprintf("the reservation is run %s's, and this converge is %s; the same "+
+		return d, retireRefuse(retireReasonReserved, fmt.Sprintf("the reservation is run %s's, and this converge is %s; the same "+
 			"host adopts it by reserving again", row.Run, m.run), "")
 	}
 
@@ -352,11 +507,11 @@ func dispatchRequest(row state.Retirement, present bool, m retireMode) *retireRe
 	// contended for, and a request naming another survivor would record a
 	// journal the row does not describe.
 	if row.Survivor != m.survivorHost {
-		return retireRefuse(retireReasonReserved, fmt.Sprintf("the reservation names %s as the survivor and this request names "+
+		return d, retireRefuse(retireReasonReserved, fmt.Sprintf("the reservation names %s as the survivor and this request names "+
 			"%s; reserve again to name another", row.Survivor, m.survivorHost), "")
 	}
 
-	return nil
+	return d, nil
 }
 
 // judgeRetireRequest decides eligibility in the specified order, so the
@@ -1342,7 +1497,7 @@ func nodePathsOf(cfg *config.Config) []nodePath {
 // intent, the row's intent, the status.
 func applyRetireIntent(ctx context.Context, m retireMode, root *txLock, dir *os.File, shape claimShape, db *state.DB,
 	plan *retirePlan,
-) *retireRefusal {
+) (any, *retireRefusal) {
 	now := retireNow()
 
 	if shape.Guard.Transition == nil {
@@ -1350,7 +1505,7 @@ func applyRetireIntent(ctx context.Context, m retireMode, root *txLock, dir *os.
 		record.Transition = &guardTransition{Kind: transitionRetirement, ID: plan.row.TransitionID}
 
 		if err := rewriteGuardRecord(root, dir, record); err != nil {
-			return retireUnknown(retireReasonMarker, "write the guard's marker: "+err.Error(), "")
+			return nil, retireUnknown(retireReasonMarker, "write the guard's marker: "+err.Error(), "")
 		}
 	} else {
 		// A MARKER THIS INVOCATION CAN SEE IS NOT YET A MARKER THAT SURVIVES A
@@ -1358,11 +1513,11 @@ func applyRetireIntent(ctx context.Context, m retireMode, root *txLock, dir *os.
 		// died before its flushes, and everything below rests on the marker
 		// being there when the host comes back.
 		if err := syncDirFD(dir); err != nil {
-			return retireUnknown(retireReasonMarker, err.Error(), "")
+			return nil, retireUnknown(retireReasonMarker, err.Error(), "")
 		}
 
 		if err := syncDirFD(root.dir); err != nil {
-			return retireUnknown(retireReasonMarker, err.Error(), "")
+			return nil, retireUnknown(retireReasonMarker, err.Error(), "")
 		}
 	}
 
@@ -1382,23 +1537,23 @@ func applyRetireIntent(ctx context.Context, m retireMode, root *txLock, dir *os.
 
 	if plan.variant == retirement.VariantRetainedNode {
 		if err := retirement.WriteStage(plan.rendering); err != nil {
-			return retireUnknown(retireReasonStage, err.Error(), "")
+			return nil, retireUnknown(retireReasonStage, err.Error(), "")
 		}
 
 		j.StagedSHA256, j.Config = retirement.Digest(plan.rendering), "present"
 	}
 
 	if err := j.Write(now); err != nil {
-		return retireUnknown(retireReasonJournal, "write the journal's intent: "+err.Error(), "")
+		return nil, retireUnknown(retireReasonJournal, "write the journal's intent: "+err.Error(), "")
 	}
 
 	if err := db.AdvanceRetirementToIntent(ctx, plan.identity, m.retiringHost, plan.row.TransitionID, m.run, now); err != nil {
-		return retireUnknown(retireReasonLedger, "advance the row to intent: "+err.Error(), "")
+		return nil, retireUnknown(retireReasonLedger, "advance the row to intent: "+err.Error(), "")
 	}
 
 	if err := retirement.WriteStatus(retirement.PhaseIntent, plan.variant, now); err != nil {
-		return retireUnknown(retireReasonStatus, "publish the status: "+err.Error(), "")
+		return nil, retireUnknown(retireReasonStatus, "publish the status: "+err.Error(), "")
 	}
 
-	return nil
+	return j, nil
 }

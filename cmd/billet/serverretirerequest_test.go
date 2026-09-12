@@ -12,6 +12,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/junioryono/billet/internal/lifeops"
 	"github.com/junioryono/billet/internal/retirement"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/wirecert"
@@ -26,11 +27,18 @@ type requestFixture struct {
 	*retireFixture
 	unitsDir string
 	caPEM    string
+	// svc is the service manager the transition stops, disables, enables and
+	// restarts through, recording the order it did so in.
+	svc *fakeConverger
 	// now is this host's clock: the reservation is made at it, the round
 	// starts after it, and the request runs later still, as a converge's
 	// own order puts them.
 	now time.Time
 }
+
+// retainedNodeStarted is when the fake systemd says the retained node's
+// process started, in systemd's own rendering.
+const retainedNodeStarted = "Fri 2026-09-11 09:00:00 UTC"
 
 const (
 	requestRun       = "ci-1"
@@ -83,6 +91,7 @@ func newRequestFixture(t *testing.T) *requestFixture {
 	bin := filepath.Join(t.TempDir(), "systemctl")
 	writeFile(t, bin, "#!/bin/sh\nunit=\"\"\nnames=\"\"\nfor a in \"$@\"; do case \"$a\" in --property=*) "+
 		"names=\"$names ${a#--property=}\";; --|show) ;; *) unit=$a;; esac; done\n"+
+		"echo \"$unit\" >> \"$BILLET_FAKE_UNITS/.asked\"\n"+
 		"for n in $names; do grep \"^$n=\" \"$BILLET_FAKE_UNITS/$unit\" || true; done\nexit 0\n", 0o755)
 	t.Setenv("BILLET_FAKE_UNITS", f.unitsDir)
 
@@ -90,6 +99,22 @@ func newRequestFixture(t *testing.T) *requestFixture {
 	systemctlBinary = bin
 
 	t.Cleanup(func() { systemctlBinary = savedSystemctl })
+
+	// A FAKE SERVICE MANAGER and a lock this test may take: the transition
+	// after intent stops units and holds the lifecycle lock, and neither
+	// belongs to the machine running the suite.
+	f.svc = &fakeConverger{}
+
+	savedConverge := converge
+	converge = func(...lifeops.ConvergeOption) converger { return f.svc }
+
+	savedLockDir := hostLockDir
+	hostLockDir = t.TempDir()
+
+	t.Cleanup(func() {
+		converge = savedConverge
+		hostLockDir = savedLockDir
+	})
 
 	// ONE MOUNT holds everything, so the rename is one rename on one mount.
 	mountinfo := filepath.Join(t.TempDir(), "mountinfo")
@@ -299,12 +324,49 @@ func TestServerRetireRequestRecordsItsIntent(t *testing.T) {
 		t.Fatal("the dry run marked the guard")
 	}
 
+	// THE INTENT IS RECORDED BEFORE ANYTHING IS STOPPED, which is the one
+	// ordering this record exists for: the first unit the transition stops
+	// finds the journal, the row and the status already at intent.
+	installed := f.installedSHA(t)
+
+	var atFirstStop struct {
+		phase  retirement.Phase
+		status retirement.Phase
+		row    string
+	}
+
+	f.svc.onStop = func(string) {
+		if atFirstStop.phase != "" {
+			return
+		}
+
+		j, _, err := retirement.ReadJournal()
+		mustOK(t, err)
+
+		st, _, err := retirement.ReadStatus()
+		mustOK(t, err)
+
+		atFirstStop.phase, atFirstStop.status = j.Phase, st.Phase
+
+		f.pgLedger(t, func(db *state.DB) {
+			r, _, err := db.ReadRetirement(t.Context(), f.identity)
+			mustOK(t, err)
+
+			atFirstStop.row = r.State
+		})
+	}
+
 	out, code = f.request(t, f.input(t, nil))
 
 	m = retireAnswer(t, out)
 	if m["outcome"] != retireOutcomeUnknown || m["reason"] != retireReasonPhase || code != exitUnknown ||
-		m["state"] != "intent" {
+		m["state"] != string(retirement.PhaseDone) {
 		t.Fatalf("the request: %s", out)
+	}
+
+	if atFirstStop.phase != retirement.PhaseIntent || atFirstStop.status != retirement.PhaseIntent ||
+		atFirstStop.row != state.RetirementIntent {
+		t.Fatalf("the first stop ran with the intent unrecorded: %+v", atFirstStop)
 	}
 
 	// THE MARKER names the row's transition.
@@ -320,7 +382,7 @@ func TestServerRetireRequestRecordsItsIntent(t *testing.T) {
 	}
 
 	switch {
-	case j.Phase != retirement.PhaseIntent || j.Variant != retirement.VariantServerOnly:
+	case j.Phase != retirement.PhaseDone || j.Variant != retirement.VariantServerOnly:
 		t.Fatalf("the journal's phase or variant: %+v", j)
 	case j.Deployment != f.identity || j.Retiring != requestRetiring || j.Survivor.Host != requestSurvivor:
 		t.Fatalf("the journal's hosts: %+v", j)
@@ -330,7 +392,7 @@ func TestServerRetireRequestRecordsItsIntent(t *testing.T) {
 		t.Fatalf("the journal's owner: %+v", j.Ownership)
 	case j.Config != "absent" || j.StagedSHA256 != "":
 		t.Fatalf("a server-only journal stages nothing: %+v", j)
-	case j.InstalledSHA256 != f.installedSHA(t):
+	case j.InstalledSHA256 != installed:
 		t.Fatalf("the journal's installed digest: %+v", j)
 	case j.Survivor.CASHA256 == "" || j.Survivor.Deployment != f.identity:
 		t.Fatalf("the journal's survivor: %+v", j.Survivor)
@@ -352,9 +414,9 @@ func TestServerRetireRequestRecordsItsIntent(t *testing.T) {
 		}
 	})
 
-	// THE STATUS is published at intent.
+	// AND THE STATUS ENDS WHERE THE JOURNAL DOES.
 	st, statusPresence, err := retirement.ReadStatus()
-	if err != nil || statusPresence != retirement.StatusPresent || st.Phase != retirement.PhaseIntent {
+	if err != nil || statusPresence != retirement.StatusPresent || st.Phase != retirement.PhaseDone {
 		t.Fatalf("the status: %+v %d %v", st, statusPresence, err)
 	}
 
@@ -710,7 +772,15 @@ func (f *requestFixture) retainANode(t *testing.T) {
 
 	writeFile(t, filepath.Join(f.unitsDir, nodeUnit),
 		"LoadState=loaded\nActiveState=active\nSubState=running\nResult=success\nKillMode=mixed\nMainPID=4242\n"+
-			"InvocationID=0123456789abcdef0123456789abcdef\nStateChangeTimestamp=\n", 0o644)
+			"UnitFileState=enabled\nInvocationID=0123456789abcdef0123456789abcdef\nStateChangeTimestamp=\n"+
+			"ExecMainStartTimestamp="+retainedNodeStarted+"\n", 0o644)
+
+	// THE INSTALLED CONFIGURATION IS OLDER THAN THE RUNNING NODE, which is what
+	// an ordinary converge leaves behind and what the phases before the rewrite
+	// require; the rewrite is what makes it newer.
+	started, err := time.Parse(time.RFC3339, "2026-09-11T09:00:00Z")
+	mustOK(t, err)
+	mustOK(t, os.Chtimes(f.cfg, started.Add(-time.Hour), started.Add(-time.Hour)))
 
 	f.pgLedger(t, func(db *state.DB) {
 		registerStatusNode(t, db, "node-a", "v0.10.0", strings.Repeat("a", 64), retainedIncarnation)

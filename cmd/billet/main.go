@@ -77,9 +77,15 @@ var errNotImplemented = errors.New("not implemented yet")
 type exitError struct {
 	code int
 	msg  string
+	// err is the cause when a status is being given to one, so `errors.Is` and
+	// `errors.As` still reach it: a refusal that carries its own exit code is
+	// still the refusal it was, and callers match on its type.
+	err error
 }
 
 func (e *exitError) Error() string { return e.msg }
+
+func (e *exitError) Unwrap() error { return e.err }
 
 // exitStatus is what the process exits with for an error.
 //

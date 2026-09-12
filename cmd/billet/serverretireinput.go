@@ -439,4 +439,9 @@ const (
 	retireReasonNodePath         = "node-path"
 	retireReasonBackup           = "backup"
 	retireReasonPhase            = "phase"
+	retireReasonLifecycle        = "lifecycle"
+	retireReasonStop             = "stop"
+	retireReasonArchive          = "archive"
+	retireReasonRewrite          = "rewrite"
+	retireReasonRestart          = "restart"
 )

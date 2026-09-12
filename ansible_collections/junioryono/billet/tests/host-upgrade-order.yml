@@ -1176,13 +1176,18 @@
           - billet_fallback_names | last == 'Report the fallback'
           - "'ansible.builtin.command' not in billet_host_fallback_text"
           - "'ansible.builtin.shell' not in billet_host_fallback_text"
-          # THE RECORD'S SCHEMA: the five members required, the protocol's three admitted and typed.
-          - "'OPTIONAL_MEMBERS = {\"id\": \"hex32\", \"token\": \"hex32\", \"preparing\": \"bool\", \"note\": \"note\"}' in billet_fallback_module_text"
+          # THE RECORD'S SCHEMA: the five members required, and the protocol's
+          # optional ones admitted and typed — the retirement's marker and the
+          # takeover chain among them, which the reader must know about or a
+          # marked record reads as a stray member and refuses.
+          - "'OPTIONAL_MEMBERS = {\"id\": \"hex32\", \"token\": \"hex32\", \"preparing\": \"bool\", \"note\": \"note\",' in billet_fallback_module_text"
+          - "'\"transition\": \"transition\", \"taken_over_from\": \"holders\"}' in billet_fallback_module_text"
           - "'RECORD_MEMBERS = (\"holder\", \"claimed_at\", \"hostname\", \"release_executable\", \"release_executable_sha256\")' in billet_fallback_module_text"
         fail_msg: >-
           guard-fallback.yml must read the record through the module with its
           failure kept as an answer, judge the metadata and content phases before
-          the candidate's, admit the protocol's three members typed, name the
+          the candidate's, admit the protocol's optional members typed (the
+          retirement's marker and the takeover chain included), name the
           executable for the calls, and execute nothing itself.
 
     - name: The staging resets only the transaction facts and judges nothing about the guard

@@ -37,6 +37,9 @@ type identityAccess struct {
 	host      *hostLock
 	account   *retirement.ServiceAccount
 	created   bool
+	// dirMoved says this command renamed the directory under its own hold (a
+	// retirement's archive), so the release hands nothing back.
+	dirMoved bool
 }
 
 // identityIntent says whether the caller may CREATE the directory when it is
@@ -95,7 +98,26 @@ func underIdentityExclusion(ctx context.Context, dir string, fn func() error) er
 // requires, in the one lock order: the initialisation lock beside the directory
 // (a fresh host only), the lifecycle lock (a root initialiser only), the global
 // lock (a prepared host), the inner lock.
+// exitRetiring is the status a command exits with when this host's authority
+// is closed by a retirement. It is its own code because the retirement itself
+// reads it: a backup the timer started in the window between the timers' stop
+// and the status's closing fails with it, and the transition's reconciliation
+// admits that one failure and no other.
+const exitRetiring = 6
+
 func openIdentityAccess(ctx context.Context, dir string, intent identityIntent) (*identityAccess, error) {
+	acc, err := openIdentityAccessUnder(ctx, dir, intent)
+
+	var retiring retirement.ErrRetiring
+
+	if errors.As(err, &retiring) {
+		return nil, &exitError{code: exitRetiring, msg: err.Error(), err: err}
+	}
+
+	return acc, err
+}
+
+func openIdentityAccessUnder(ctx context.Context, dir string, intent identityIntent) (*identityAccess, error) {
 	if dir == "" {
 		return nil, errors.New("billet: an identity directory is needed and the configuration names none")
 	}
@@ -237,6 +259,18 @@ func (a *identityAccess) lockInner(ctx context.Context, ex wirecert.Exclusion) e
 }
 
 // Lock is the inner lock, for the wirecert entry points that require it held.
+// moved says the directory this access guards was renamed by the command that
+// holds it, so there is nothing at its name to hand back: the artefacts went
+// with the directory, and a repair rooted at a name that no longer exists
+// would report a failure about a move this command made on purpose.
+func (a *identityAccess) moved() {
+	if a == nil {
+		return
+	}
+
+	a.dirMoved = true
+}
+
 func (a *identityAccess) Lock() *wirecert.AuthorityLock { return a.lock }
 
 // Account is the recorded service account on a prepared host, nil otherwise.
@@ -296,7 +330,7 @@ func (a *identityAccess) Release() error {
 // that cannot be read is a hand-back that cannot be made, reported; no record
 // is nothing to give things to.
 func (a *identityAccess) handBack() error {
-	if os.Geteuid() != 0 || a.lock == nil || !retirement.SupportedHere() {
+	if os.Geteuid() != 0 || a.lock == nil || !retirement.SupportedHere() || a.dirMoved {
 		return nil
 	}
 
@@ -313,6 +347,30 @@ func (a *identityAccess) handBack() error {
 	a.account = &acct
 
 	return errors.Join(handBackIdentity(a.dir, acct, identityArtefacts), handBackIdentity(a.dir, acct, ledgerArtefacts))
+}
+
+// openRetiringIdentityAccess is the transition's take on the exclusion: the
+// global lock acquired without admission (the closed status is its own), then
+// the inner lock inside the directory, so a legacy writer that took only the
+// inner lock is excluded too. Everything else is the ordinary access's,
+// release and hand-back included.
+func openRetiringIdentityAccess(ctx context.Context, dir string, wait time.Duration) (*identityAccess, error) {
+	if dir == "" {
+		return nil, errors.New("billet: an identity directory is needed and the configuration names none")
+	}
+
+	ex, err := wirecert.ResolveRetiringExclusion(ctx, dir, wait)
+	if err != nil {
+		return nil, err
+	}
+
+	acc := &identityAccess{dir: dir, exclusion: ex, account: ex.Account}
+
+	if err := acc.lockInner(ctx, ex); err != nil {
+		return nil, errors.Join(err, acc.exclusion.Release())
+	}
+
+	return acc.registered(), nil
 }
 
 // serverIdentityAccess is the control plane's own take on the exclusion, with

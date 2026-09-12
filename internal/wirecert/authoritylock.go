@@ -106,6 +106,41 @@ func ResolveExclusion(ctx context.Context, stateDir string, wait time.Duration) 
 	}
 }
 
+// ResolveRetiringExclusion is THE RETIREMENT'S OWN resolution: the global lock
+// acquired and NEVER admitted.
+//
+// `Admit` is the ordinary writers' gate and refuses a closed status, which is
+// the status the transition itself published; the transition is the one writer
+// allowed under it, and it is allowed because it holds the host's transaction
+// lock and this converge's guard, which no ordinary writer does. It is defined
+// for a PREPARED host alone: a host with no record has no global exclusion to
+// close, so nothing on it could have reached a retirement.
+func ResolveRetiringExclusion(ctx context.Context, stateDir string, wait time.Duration) (Exclusion, error) {
+	if !retirement.SupportedHere() {
+		return Exclusion{}, errors.New("wirecert: a retirement's exclusion needs the global authority lock, which this " +
+			"platform does not have")
+	}
+
+	class, err := retirement.Classify(stateDir)
+	if err != nil {
+		return Exclusion{}, err
+	}
+
+	if class.Mode != retirement.ModePrepared {
+		return Exclusion{}, fmt.Errorf("wirecert: %s is %s, and a retirement's exclusion is a prepared host's: no service "+
+			"account is recorded, so no global exclusion is in force", stateDir, class.Mode)
+	}
+
+	hold, err := acquireGlobal(ctx, wait, &class.Account)
+	if err != nil {
+		return Exclusion{}, err
+	}
+
+	acct := class.Account
+
+	return Exclusion{Hold: hold, Wait: wait, Account: &acct, ownsHold: true}, nil
+}
+
 // acquireGlobal takes the global lock under wait (a zero wait is one attempt).
 func acquireGlobal(ctx context.Context, wait time.Duration, acct *retirement.ServiceAccount) (*retirement.Hold, error) {
 	if wait <= 0 {

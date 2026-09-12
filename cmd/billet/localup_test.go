@@ -492,8 +492,15 @@ func stageUp(t *testing.T, f *fakeConverger, verdict githubVerdict) *fakeConverg
 	}
 
 	converge = func(...lifeops.ConvergeOption) converger { return f }
-	check = func(context.Context, checkOptions) (checkReport, error) {
+	check = func(_ context.Context, opts checkOptions) (checkReport, error) {
 		f.record("check")
+
+		// THE REAL CHECK INITIALISES THE HOST: it creates the identity
+		// directory and mints what lives in it, and every later ledger open is
+		// an ordinary one that creates nothing. A fake that skipped the
+		// creation left these tests proving `up`'s order against a host no
+		// check had ever run on, which on Linux fails at the reopen.
+		stageIdentityDir(t, opts.configPath)
 
 		return checkReport{github: verdict}, nil
 	}
@@ -1725,4 +1732,23 @@ func (f *fakeConverger) recordDeadline(op string, ctx context.Context) {
 
 	d, _ := ctx.Deadline()
 	f.deadlines[op] = d
+}
+
+// stageIdentityDir creates the server state directory the configuration at
+// path names, the way `billet check` does on a host it initialises.
+func stageIdentityDir(t *testing.T, path string) {
+	t.Helper()
+
+	if path == "" {
+		return
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil || cfg.Server == nil || cfg.Server.IdentityDir == "" {
+		return
+	}
+
+	if err := os.MkdirAll(cfg.Server.IdentityDir, 0o700); err != nil {
+		t.Fatalf("stage the identity directory: %v", err)
+	}
 }

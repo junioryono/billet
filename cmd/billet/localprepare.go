@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/junioryono/billet/internal/config"
@@ -134,7 +135,14 @@ func serverIdentityDirForPrepare(cfgPath string) string {
 		return cfg.Server.IdentityDir
 	}
 
-	return config.DefaultServerStateDir()
+	// THE PACKAGED DIRECTORY, NOT THE CALLING ACCOUNT'S. This command is root's
+	// and Linux's, and what it prepares is the host the units run on, whose
+	// state lives beside the exclusion's own metadata under /var/lib/billet.
+	// `config.DefaultServerStateDir` answers the USER's config directory, which
+	// for root is /root/.config/billet: the package's postinstall, which runs
+	// before any configuration is seeded, prepared a directory no service would
+	// ever open and failed on its missing parent (found by CI, 2026-09-12).
+	return filepath.Join(retirement.Root, "server")
 }
 
 // lookupServiceAccount resolves the account the installer validated into the
