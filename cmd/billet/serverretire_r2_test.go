@@ -90,8 +90,10 @@ func TestServerRetireDrainsStdinBeforeAnEarlyRefusal(t *testing.T) {
 
 		mustOK(t, w.SetWriteDeadline(time.Now().Add(10*time.Second)))
 
-		chunk := []byte(strings.Repeat("{", 64<<10))
-		for range 32 {
+		// PAST THE INPUT'S OWN BOUND: what must not happen is a writer left on
+		// a closed pipe, and the bound says nothing about how much it writes.
+		chunk := []byte(strings.Repeat("{", 1<<20))
+		for range int(maxRetireInputBytes>>20) + 4 {
 			if _, err := w.Write(chunk); err != nil {
 				written <- err
 

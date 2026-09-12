@@ -391,7 +391,10 @@ func drainedBefore(m retireMode, r *retireRefusal) *retireRefusal {
 		return r
 	}
 
-	if _, err := io.Copy(io.Discard, io.LimitReader(retireStdin, maxRetireInputBytes+1)); err != nil {
+	// TO EOF, not to the input's bound: what must not happen is a writer left
+	// on a closed pipe, and the bound says nothing about how much it will
+	// write. Nothing is retained.
+	if _, err := io.Copy(io.Discard, retireStdin); err != nil {
 		r.Why += "; and draining stdin: " + err.Error()
 	}
 

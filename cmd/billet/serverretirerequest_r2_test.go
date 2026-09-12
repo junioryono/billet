@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -38,6 +39,18 @@ func TestServerRetireRequestDryRunMutatesNothing(t *testing.T) {
 
 	if _, err := os.Lstat(retirement.RetiredDir()); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("the dry run created the retirement directory: %v", err)
+	}
+
+	// AND IT TAKES NOTHING: with the transaction lock held by another process
+	// the dry run still answers, because a preview holds this host for nobody.
+	held, err := takeTxLock()
+	mustOK(t, err)
+
+	out, code = f.request(t, f.input(t, nil), "--dry-run")
+	held.release()
+
+	if m := retireAnswer(t, out); m["outcome"] != retireOutcomeReported || code != 0 {
+		t.Fatalf("a dry run under a held transaction lock: %s", out)
 	}
 
 	f.pgLedger(t, func(db *state.DB) {
@@ -157,13 +170,23 @@ func TestServerRetireRequestWritesItsIntentInOrder(t *testing.T) {
 	// the reservation put it.
 	injected := errors.New("staged failure")
 
-	retirement.Publishing = func(path string) error {
-		if path == retirement.JournalPath() {
-			return injected
+	failPublish := func(t *testing.T, at string) {
+		t.Helper()
+
+		retirement.Publishing = func(path string) error {
+			if path == at {
+				return injected
+			}
+
+			return nil
 		}
 
-		return nil
+		// CLEARED WHATEVER HAPPENS NEXT: a failed assertion between the set
+		// and the clear would leak the hook into every later test.
+		t.Cleanup(func() { retirement.Publishing = nil })
 	}
+
+	failPublish(t, retirement.JournalPath())
 
 	out, code := f.request(t, f.input(t, nil))
 	retirement.Publishing = nil
@@ -187,13 +210,7 @@ func TestServerRetireRequestWritesItsIntentInOrder(t *testing.T) {
 
 	// THE ROW PRECEDES THE STATUS: failing the status leaves the row at
 	// intent with the journal written.
-	retirement.Publishing = func(path string) error {
-		if path == retirement.StatusPath() {
-			return injected
-		}
-
-		return nil
-	}
+	failPublish(t, retirement.StatusPath())
 
 	out, code = f.request(t, f.input(t, nil))
 	retirement.Publishing = nil
@@ -264,20 +281,40 @@ func TestServerRetireRequestRefusesARenderingTheNodeCannotStart(t *testing.T) {
 		t.Fatalf("a removed key: %s", out)
 	}
 
-	// Another authority's key for the same name: a pair the node cannot
-	// start with.
+	// Another authority's bundle: every file parses and the pair matches, and
+	// the node still cannot start, because the trust store does not verify
+	// the leaf. THE NODE'S OWN LOADER AND ITS OWN TLS CONSTRUCTION decide.
 	ca, err := wirecert.LoadOrCreateCA(t.TempDir(), strings.Repeat("f", 32))
 	mustOK(t, err)
 
-	bundle, err := ca.IssueNode("node-a")
+	other, err := ca.IssueNode("node-a")
 	mustOK(t, err)
 
-	writeFile(t, keyPath, string(bundle.KeyPEM), 0o600)
+	writeFile(t, keyPath, string(other.KeyPEM), 0o600)
+
+	out, code = f.retainedRequest(t, f.input(t, f.retainedOverrides(t)))
+	if m := retireAnswer(t, out); m["reason"] != retireReasonConfig || code != exitRefused {
+		t.Fatalf("another authority's key: %s", out)
+	}
+
+	// The whole foreign pair, beside THIS deployment's trust store: the pair
+	// holds and the leaf does not verify.
+	writeFile(t, nodeTLSPathOf(t, f, "cert"), string(other.CertPEM), 0o644)
 
 	out, code = f.retainedRequest(t, f.input(t, f.retainedOverrides(t)))
 	if m := retireAnswer(t, out); m["reason"] != retireReasonConfig || code != exitRefused ||
-		!strings.Contains(whyOf(m), "not a pair") {
-		t.Fatalf("another node's key: %s", out)
+		!strings.Contains(whyOf(m), "not ones it can start with") {
+		t.Fatalf("a foreign pair against this trust store: %s", out)
+	}
+
+	// A KEY THE LOADER REFUSES: the node reads a private key only from the
+	// path it was given and only when nobody else can read it.
+	writeFile(t, nodeTLSPathOf(t, f, "cert"), mustRead(t, filepath.Join(filepath.Dir(keyPath), "node.crt.orig")), 0o644)
+	mustOK(t, os.Chmod(keyPath, 0o644))
+
+	out, code = f.retainedRequest(t, f.input(t, f.retainedOverrides(t)))
+	if m := retireAnswer(t, out); m["reason"] != retireReasonConfig || code != exitUnknown {
+		t.Fatalf("a group-readable key: %s", out)
 	}
 }
 

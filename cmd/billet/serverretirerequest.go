@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"crypto/sha256"
-	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/pem"
@@ -22,7 +21,6 @@ import (
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/endpoint"
-	"github.com/junioryono/billet/internal/regularfile"
 	"github.com/junioryono/billet/internal/retirement"
 	"github.com/junioryono/billet/internal/rollout"
 	"github.com/junioryono/billet/internal/state"
@@ -83,14 +81,6 @@ func retireRequest(ctx context.Context, m retireMode) (any, *retireRefusal) {
 		return nil, r
 	}
 
-	root, dir, shape, r := retireGuard(m.run)
-	if r != nil {
-		return nil, r
-	}
-
-	defer root.release()
-	defer func() { _ = dir.Close() }()
-
 	obs, r := observeRetireConfig(m.configPath)
 	if r != nil {
 		return nil, r
@@ -115,21 +105,29 @@ func retireRequest(ctx context.Context, m retireMode) (any, *retireRefusal) {
 			"retire", "the runbook in docs/operating/upgrades.md")
 	}
 
+	cfg := obs.cfg
+
+	// A DRY RUN TAKES NOTHING AT ALL: it reads the journal, the guard and the
+	// records where they lie, judges the same request and reports. The lock
+	// and the guard belong to a run that will write.
+	if m.dryRun {
+		return retireRequestReport(ctx, m, in, obs)
+	}
+
+	root, dir, shape, r := retireGuard(m.run)
+	if r != nil {
+		return nil, r
+	}
+
+	defer root.release()
+	defer func() { _ = dir.Close() }()
+
 	// THE JOURNAL, RE-READ UNDER THE LOCK: a journal dispatches to a resume
 	// or the done handling, which follow in the next change; a request is
 	// what an absent journal admits.
-	j, presence, err := retirement.ReadJournal()
-
-	switch presence {
-	case retirement.JournalAbsent:
-	case retirement.JournalPresent:
-		return nil, retireUnknown(retireReasonPhase, fmt.Sprintf("a retirement journal exists at %s (transition %s); the "+
-			"resume of a retirement in progress is not in this binary yet", j.Phase, j.Provenance.TransitionID), "")
-	default:
-		return nil, retireUnknown(retireReasonJournal, "the retirement journal could not be judged: "+err.Error(), "")
+	if r := requireNoJournalForRequest(); r != nil {
+		return nil, r
 	}
-
-	cfg := obs.cfg
 
 	return withIdentityAccess(ctx, cfg.Server.IdentityDir, func() (any, *retireRefusal) {
 		identity, r := retireIdentity(cfg.Server.IdentityDir)
@@ -183,12 +181,6 @@ func retireRequest(ctx context.Context, m retireMode) (any, *retireRefusal) {
 			return nil, r
 		}
 
-		if m.dryRun {
-			return &retireIntentReport{Schema: retireSchema, Outcome: retireOutcomeReported, Would: "request",
-				Variant: plan.variant, Survivor: plan.survivor, Nodes: plan.nodes, FailoverVerified: plan.failover,
-				TransitionID: row.TransitionID, State: stateNothingRetire}, nil
-		}
-
 		if r := applyRetireIntent(ctx, m, root, dir, shape, db, plan); r != nil {
 			return nil, r
 		}
@@ -197,6 +189,86 @@ func retireRequest(ctx context.Context, m retireMode) (any, *retireRefusal) {
 			Why: "the retirement's intent is recorded (journal, row and status at intent); the transition's phases after " +
 				"intent are not in this binary yet", State: "intent"}
 	})
+}
+
+// requireNoJournalForRequest is the journal's own dispatch: a request is what
+// an absent journal admits, and a journal in any phase is a resume's, which
+// the next change adds.
+func requireNoJournalForRequest() *retireRefusal {
+	j, presence, err := retirement.ReadJournal()
+
+	switch presence {
+	case retirement.JournalAbsent:
+		return nil
+	case retirement.JournalPresent:
+		return retireUnknown(retireReasonPhase, fmt.Sprintf("a retirement journal exists at %s (transition %s); the resume "+
+			"of a retirement in progress is not in this binary yet", j.Phase, j.Provenance.TransitionID), "")
+	default:
+		return retireUnknown(retireReasonJournal, "the retirement journal could not be judged: "+err.Error(), "")
+	}
+}
+
+// retireRequestReport is the dry run over a request: nothing is taken and
+// nothing is written. The guard is classified where it lies, the identity is
+// peeked, the ledger is opened read-only, and the same judgement runs.
+func retireRequestReport(ctx context.Context, m retireMode, in *retireInput, obs *installedConfigObservation,
+) (any, *retireRefusal) {
+	cfg := obs.cfg
+
+	if r := requireNoJournalForRequest(); r != nil {
+		return nil, r
+	}
+
+	shape, err := classifyClaim()
+	if err != nil {
+		return nil, retireUnknown(retireReasonGuard, err.Error(), "")
+	}
+
+	switch {
+	case shape.Kind != claimGuard:
+		return nil, retireRefuse(retireReasonGuard, fmt.Sprintf("this host is not held by a converge guard (%s); a retirement "+
+			"runs under this converge's guard", shape), "")
+	case shape.RecordErr != "":
+		return nil, retireUnknown(retireReasonGuard, "the guard's record cannot be read: "+shape.RecordErr, "")
+	case shape.Guard.Holder != m.run:
+		return nil, retireRefuse(retireReasonGuard, fmt.Sprintf("the guard names %s, not %s", shape.Guard.Holder, m.run), "")
+	}
+
+	identity, r := retireIdentity(cfg.Server.IdentityDir)
+	if r != nil {
+		return nil, r
+	}
+
+	db, r := retireOpenLedgerFor(ctx, cfg, m.environmentFile, true)
+	if r != nil {
+		return nil, r
+	}
+
+	defer func() { _ = db.Close() }()
+
+	row, present, err := db.ReadRetirement(ctx, identity)
+	if err != nil {
+		return nil, retireUnknown(retireReasonLedger, err.Error(), "")
+	}
+
+	if r := requireMarkerAssociation(shape.Guard.Transition, row, present); r != nil {
+		return nil, r
+	}
+
+	if r := dispatchRequest(row, present, m); r != nil {
+		return nil, r
+	}
+
+	plan, r := judgeRetireRequest(ctx, m, in, obs, identity, row, db)
+	if r != nil {
+		r.Reservation = "kept"
+
+		return nil, r
+	}
+
+	return &retireIntentReport{Schema: retireSchema, Outcome: retireOutcomeReported, Would: "request",
+		Variant: plan.variant, Survivor: plan.survivor, Nodes: plan.nodes, FailoverVerified: plan.failover,
+		TransitionID: row.TransitionID, State: stateNothingRetire}, nil
 }
 
 // dispatchRequest holds the row to the one cell a request proceeds from: this
@@ -388,12 +460,18 @@ func judgeVariant(m retireMode, in *retireInput, obs *installedConfigObservation
 	return checkRenderingCredentials(rendered)
 }
 
-// checkRenderingCredentials reads the node credentials the rendering names and
-// proves they are the pair a start needs: the certificate and the key parse
-// and belong together, and the trust store holds at least one authority. The
-// node's own startup reads exactly these files, and a request that admitted a
-// rendering whose key had been removed would archive the identity and then
-// fail to restart the node.
+// checkRenderingCredentials loads the node credentials the rendering names
+// THROUGH THE NODE'S OWN LOADER and builds the client TLS configuration the
+// node builds, so what is admitted here is what a start admits: the loader's
+// own rules about a key reached through a symlink or readable by the group,
+// and the construction's own verification of the leaf against the trust store
+// (its chain, its validity and its client-auth usage). A narrower pair of
+// checks admitted a certificate and key that matched beside an authority that
+// could not verify them, which is a start that fails after the archive.
+//
+// A FAILED READ IS COULD-NOT-TELL and a bundle that does not hold is a
+// refusal, because the first says nothing about the credentials and the
+// second says they are not ones a node starts with.
 //
 // WHAT THIS IS NOT: the provider and storage checks `billet check` performs
 // (a reachable Docker daemon, a Ceph cluster) are not re-run here; they touch
@@ -406,38 +484,18 @@ func checkRenderingCredentials(rendered *config.Config) *retireRefusal {
 
 	tlsCfg := rendered.Node.TLS
 
-	certPEM, err := regularfile.ReadFile(tlsCfg.CertPath, maxNodeCredentialBytes, regularfile.Options{})
+	bundle, err := wirecert.LoadBundle(tlsCfg.CertPath, tlsCfg.KeyPath, tlsCfg.CAPath)
 	if err != nil {
-		return retireUnknown(retireReasonConfig, "read the node's certificate: "+err.Error(), "")
+		return retireUnknown(retireReasonConfig, "read the node's credentials as the node reads them: "+err.Error(), "")
 	}
 
-	keyPEM, err := regularfile.ReadFile(tlsCfg.KeyPath, maxNodeCredentialBytes, regularfile.Options{})
-	if err != nil {
-		return retireUnknown(retireReasonConfig, "read the node's key: "+err.Error(), "")
-	}
-
-	if _, err := tls.X509KeyPair(certPEM, keyPEM); err != nil {
-		return retireRefuse(retireReasonConfig, fmt.Sprintf("the node's certificate %s and key %s are not a pair the node can "+
-			"start with: %v", tlsCfg.CertPath, tlsCfg.KeyPath, err), "")
-	}
-
-	caPEM, err := regularfile.ReadFile(tlsCfg.CAPath, maxNodeCredentialBytes, regularfile.Options{})
-	if err != nil {
-		return retireUnknown(retireReasonConfig, "read the node's trust store: "+err.Error(), "")
-	}
-
-	cas, err := wirecert.ParseCertificates(caPEM)
-	if err != nil || len(cas) == 0 {
-		return retireRefuse(retireReasonConfig, fmt.Sprintf("the node's trust store %s holds no authority the node could "+
-			"verify a control plane with: %v", tlsCfg.CAPath, err), "")
+	if _, err := wirecert.ClientTLS(bundle); err != nil {
+		return retireRefuse(retireReasonConfig, fmt.Sprintf("the node's credentials at %s, %s and %s are not ones it can start "+
+			"with: %v", tlsCfg.CertPath, tlsCfg.KeyPath, tlsCfg.CAPath, err), "")
 	}
 
 	return nil
 }
-
-// maxNodeCredentialBytes bounds a read of a node's certificate, key or trust
-// store.
-const maxNodeCredentialBytes = 1 << 20
 
 // serverlessMappingDiff decodes both documents as YAML mappings, drops the
 // four server keys from the installed one and answers the first path at
