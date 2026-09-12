@@ -122,17 +122,34 @@ func retireRequest(ctx context.Context, m retireMode) (any, *retireRefusal) {
 		return nil, r
 	}
 
+	// EVERY REFUSAL FROM HERE TO THE TRANSITION SAYS WHAT THE JOURNAL
+	// ESTABLISHED. A host with a retirement at `stopped` is not one where
+	// nothing has happened, whatever it is that then refuses — an unreachable
+	// ledger, a configuration that moved, an exclusion another writer holds —
+	// and `nothing` would send an operator looking for a host in a state it is
+	// not in. A run with no journal keeps `nothing`. Nothing between here and
+	// the transition can answer `unknown`: the two places that can are the
+	// journal's own read, which is above this, and the phase writer, whose
+	// answer the transition's caller carries.
+	at := func(r *retireRefusal) *retireRefusal {
+		if r == nil || journalFact == retirement.JournalFactAbsent {
+			return r
+		}
+
+		return atRetirePhase(j, r)
+	}
+
 	// THE CONFIGURATION IS OBSERVED UNDER THE LOCK, because everything below
 	// rests on it: its digest is compared with the one the role read, its
 	// backend and controllers decide eligibility, and its identity directory
 	// is what the exclusion and the archive name.
 	obs, r := observeRetireConfig(m.configPath)
 	if r != nil {
-		return nil, r
+		return nil, at(r)
 	}
 
 	if r := requirePreparedHost(obs); r != nil {
-		return nil, r
+		return nil, at(r)
 	}
 
 	cfg := obs.cfg
@@ -218,7 +235,7 @@ func retireRequest(ctx context.Context, m retireMode) (any, *retireRefusal) {
 		return applyRetireIntent(ctx, m, root, dir, shape, db, plan)
 	})
 	if r != nil {
-		return nil, r
+		return nil, at(r)
 	}
 
 	// THE TRANSITION RUNS OUTSIDE EVERY IDENTITY HOLD: it waits for a backup

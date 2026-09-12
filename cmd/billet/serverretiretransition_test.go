@@ -748,7 +748,8 @@ func TestACommandResumePastTheArchiveIsRefusedByName(t *testing.T) {
 	out, code := f.request(t, f.input(t, nil))
 
 	m := retireAnswer(t, out)
-	if code != exitUnknown || m["reason"] != retireReasonPhase || !strings.Contains(whyOf(m), "past the archive") {
+	if code != exitUnknown || m["reason"] != retireReasonPhase || !strings.Contains(whyOf(m), "past the archive") ||
+		m["state"] != string(retirement.PhaseArchived) {
 		t.Fatalf("the resume: %s", out)
 	}
 
@@ -1151,7 +1152,8 @@ func TestACommandResumeOverACompletedMoveIsRefusedByName(t *testing.T) {
 	out, code := f.request(t, f.input(t, nil))
 
 	m := retireAnswer(t, out)
-	if code != exitUnknown || m["reason"] != retireReasonPhase || !strings.Contains(whyOf(m), "already at") {
+	if code != exitUnknown || m["reason"] != retireReasonPhase || !strings.Contains(whyOf(m), "already at") ||
+		m["state"] != string(retirement.PhaseStopped) {
 		t.Fatalf("the resume over a completed move: %s", out)
 	}
 
@@ -1463,4 +1465,54 @@ func TestADoneJournalIsTheTailsBeforeAnyConfigurationIsRead(t *testing.T) {
 		m["state"] != string(retirement.PhaseDone) {
 		t.Fatalf("a done journal: %s", out)
 	}
+}
+
+// AND A REFUSAL PAST THE JOURNAL SAYS WHAT THE JOURNAL ESTABLISHED, whatever
+// it is that refuses: a host whose retirement stands at `stopped` is not one
+// where nothing has happened, and an operator sent looking for that host would
+// find a state it is not in. Two refusals with nothing to do with the journal
+// prove it: an archive that cannot be examined, and a ledger nothing can dial.
+func TestARefusalPastTheJournalNamesThePhaseTheHostReached(t *testing.T) {
+	t.Run("an archive that cannot be examined", func(t *testing.T) {
+		f := newRequestFixture(t)
+		f.reserve(t)
+
+		j := f.plantJournal(t, retirement.PhaseStopped, retirement.VariantServerOnly)
+		markGuard(t, f.guard, &guardTransition{Kind: transitionRetirement, ID: retireTestID}, nil)
+		advanceRowToIntent(t, f)
+
+		// A regular file where the archive would be: neither a directory that
+		// holds the identity nor an absence, so where the identity is cannot
+		// be told.
+		writeFile(t, j.Archive, "not a directory\n", 0o600)
+
+		out, code := f.request(t, f.input(t, nil))
+
+		m := retireAnswer(t, out)
+		if code != exitUnknown || m["reason"] != retireReasonIdentity ||
+			m["state"] != string(retirement.PhaseStopped) {
+			t.Fatalf("an unexaminable archive: %s", out)
+		}
+	})
+
+	t.Run("a ledger nothing can dial", func(t *testing.T) {
+		f := newRequestFixture(t)
+		f.reserve(t)
+
+		f.plantJournal(t, retirement.PhaseStopped, retirement.VariantServerOnly)
+		markGuard(t, f.guard, &guardTransition{Kind: transitionRetirement, ID: retireTestID}, nil)
+		advanceRowToIntent(t, f)
+		mustOK(t, retirement.WriteStatus(retirement.PhaseStopped, retirement.VariantServerOnly, retireNow()))
+
+		in := f.input(t, nil)
+
+		t.Setenv("BILLET_STATE_DSN", "postgres://billet:billet@127.0.0.1:1/billet?sslmode=disable")
+
+		out, code := f.request(t, in)
+
+		m := retireAnswer(t, out)
+		if code != exitUnknown || m["state"] != string(retirement.PhaseStopped) {
+			t.Fatalf("an unreachable ledger: %s", out)
+		}
+	})
 }
