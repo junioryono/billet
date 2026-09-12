@@ -488,7 +488,7 @@ func TestABackupIsAwaitedAndOnlyItsOwnRefusalIsReconciled(t *testing.T) {
 
 					for {
 						if strings.Count(readIfAny(filepath.Join(f.unitsDir, ".asked")), backupServiceUnit) >= 2 {
-							writeFile(t, unit, c.resolve, 0o644)
+							publishUnit(t, unit, c.resolve)
 
 							return
 						}
@@ -1298,7 +1298,7 @@ func TestTheBackupWaitDoesNotAnswerWhileTheBackupRuns(t *testing.T) {
 	f := newRequestFixture(t)
 
 	unit := filepath.Join(f.unitsDir, backupServiceUnit)
-	writeFile(t, unit, "LoadState=loaded\nActiveState=active\nSubState=running\nResult=success\nMainPID=99\n", 0o644)
+	publishUnit(t, unit, "LoadState=loaded\nActiveState=active\nSubState=running\nResult=success\nMainPID=99\n")
 
 	savedWait, savedPoll := retireBackupWait, retireBackupPoll
 	retireBackupWait, retireBackupPoll = 30*time.Second, time.Millisecond
@@ -1309,7 +1309,22 @@ func TestTheBackupWaitDoesNotAnswerWhileTheBackupRuns(t *testing.T) {
 
 	answered := make(chan *retireRefusal, 1)
 
-	go func() { answered <- awaitRetireBackup(t.Context(), j) }()
+	// THE WAIT IS ENDED AND JOINED BY THE CLEANUP whatever this case does, so
+	// no poll of it outlives the seams and the files it reads. The join is its
+	// own channel: the answer's is buffered and may already have been taken.
+	ctx, cancel := context.WithCancel(t.Context())
+	finished := make(chan struct{})
+
+	t.Cleanup(func() {
+		cancel()
+		<-finished
+	})
+
+	go func() {
+		defer close(finished)
+
+		answered <- awaitRetireBackup(ctx, j)
+	}()
 
 	// THE WAIT POLLS: three completed observations of a unit that is still
 	// running are three answers only a wait makes, and it must not have
@@ -1336,7 +1351,10 @@ func TestTheBackupWaitDoesNotAnswerWhileTheBackupRuns(t *testing.T) {
 	default:
 	}
 
-	writeFile(t, unit, "LoadState=loaded\nActiveState=inactive\nSubState=dead\nResult=success\nMainPID=0\n", 0o644)
+	// PUBLISHED BY RENAME: a truncate-then-write leaves a window in which a
+	// poll reads an empty file, which is could-not-tell and would refuse a
+	// wait that is behaving correctly.
+	publishUnit(t, unit, "LoadState=loaded\nActiveState=inactive\nSubState=dead\nResult=success\nMainPID=0\n")
 
 	select {
 	case r := <-answered:
@@ -1346,6 +1364,24 @@ func TestTheBackupWaitDoesNotAnswerWhileTheBackupRuns(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("the wait never noticed the backup had finished")
 	}
+
+	// AND IT ANSWERED FROM AN OBSERVATION THAT SAW THE BACKUP FINISH, not from
+	// one of the active answers it had already been given: the fake records
+	// what it answered, and an inactive answer is what only a later poll got.
+	if !strings.Contains(readIfAny(asked), backupServiceUnit+" ActiveState=inactive") {
+		t.Fatalf("the wait answered without observing the backup finish:\n%s", readIfAny(asked))
+	}
+}
+
+// publishUnit replaces a fake unit's properties ATOMICALLY, by rename: the
+// fake reads the file while the transition polls, and a truncate-then-write
+// would let a poll see an empty file, which is could-not-tell.
+func publishUnit(t *testing.T, path, body string) {
+	t.Helper()
+
+	tmp := path + ".next"
+	writeFile(t, tmp, body, 0o644)
+	mustOK(t, os.Rename(tmp, path))
 }
 
 // AND A BACKUP THAT NEVER FINISHES ENDS THE WAIT AT ITS BOUND, leaving the
@@ -1353,8 +1389,8 @@ func TestTheBackupWaitDoesNotAnswerWhileTheBackupRuns(t *testing.T) {
 func TestTheBackupWaitEndsAtItsBound(t *testing.T) {
 	f := newRequestFixture(t)
 
-	writeFile(t, filepath.Join(f.unitsDir, backupServiceUnit),
-		"LoadState=loaded\nActiveState=active\nSubState=running\nResult=success\nMainPID=99\n", 0o644)
+	publishUnit(t, filepath.Join(f.unitsDir, backupServiceUnit),
+		"LoadState=loaded\nActiveState=active\nSubState=running\nResult=success\nMainPID=99\n")
 
 	savedWait, savedPoll := retireBackupWait, retireBackupPoll
 	retireBackupWait, retireBackupPoll = 20*time.Millisecond, time.Millisecond
@@ -1420,8 +1456,11 @@ func TestADoneJournalIsTheTailsBeforeAnyConfigurationIsRead(t *testing.T) {
 	out, code := f.run(t, in, "--input", "-", "--run", requestRun, "--retiring-host", requestRetiring,
 		"--survivor-host", requestSurvivor, "--server-only", "--installed-sha256", digest)
 
+	// AND IT SAYS WHAT THE HOST HOLDS: a retirement that reached `done` is not
+	// a host where nothing has happened, which is what `nothing` would say.
 	m := retireAnswer(t, out)
-	if code != exitUnknown || m["reason"] != retireReasonPhase || !strings.Contains(whyOf(m), "the tail") {
+	if code != exitUnknown || m["reason"] != retireReasonPhase || !strings.Contains(whyOf(m), "the tail") ||
+		m["state"] != string(retirement.PhaseDone) {
 		t.Fatalf("a done journal: %s", out)
 	}
 }

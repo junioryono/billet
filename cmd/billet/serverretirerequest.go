@@ -360,8 +360,8 @@ func requirePreparedHost(obs *installedConfigObservation) *retireRefusal {
 // journal's locator alone is the tail's.
 func refuseResumePastTheArchive(j retirement.Journal, fact retirement.JournalFact) *retireRefusal {
 	if fact == retirement.JournalFactDone {
-		return retireUnknown(retireReasonPhase, "this host's retirement is at done; the tail that completes the ledger "+
-			"row, acknowledges it and clears the guard's marker is not in this binary yet", "")
+		return atRetirePhase(j, retireUnknown(retireReasonPhase, "this host's retirement is at done; the tail that "+
+			"completes the ledger row, acknowledges it and clears the guard's marker is not in this binary yet", ""))
 	}
 
 	if fact != retirement.JournalFactIncomplete {
@@ -369,9 +369,9 @@ func refuseResumePastTheArchive(j retirement.Journal, fact retirement.JournalFac
 	}
 
 	if j.Phase != retirement.PhaseStopped {
-		return retireUnknown(retireReasonPhase, fmt.Sprintf("this host's retirement is at %s, past the archive: resuming "+
-			"it reads the identity and the ledger from the journal's locator (%s), which is not in this binary yet",
-			j.Phase, j.Locator.Archive), "the runbook in docs/operating/upgrades.md")
+		return atRetirePhase(j, retireUnknown(retireReasonPhase, fmt.Sprintf("this host's retirement is at %s, past the "+
+			"archive: resuming it reads the identity and the ledger from the journal's locator (%s), which is not in "+
+			"this binary yet", j.Phase, j.Locator.Archive), "the runbook in docs/operating/upgrades.md"))
 	}
 
 	// A JOURNAL AT `stopped` WHOSE MOVE ALREADY COMPLETED is the same host: the
@@ -382,17 +382,27 @@ func refuseResumePastTheArchive(j retirement.Journal, fact retirement.JournalFac
 	// the directory that has moved.
 	moved, err := retireDirPresent(j.Archive)
 	if err != nil {
-		return retireUnknown(retireReasonIdentity, err.Error(), "")
+		return atRetirePhase(j, retireUnknown(retireReasonIdentity, err.Error(), ""))
 	}
 
 	if !moved {
 		return nil
 	}
 
-	return retireUnknown(retireReasonPhase, fmt.Sprintf("this host's retirement is at %s and its identity is already at "+
-		"%s: the move completed before its phase could be written, and resuming from there reads the identity and the "+
-		"ledger from the journal's locator, which is not in this binary yet", j.Phase, j.Archive),
-		"the runbook in docs/operating/upgrades.md")
+	return atRetirePhase(j, retireUnknown(retireReasonPhase, fmt.Sprintf("this host's retirement is at %s and its "+
+		"identity is already at %s: the move completed before its phase could be written, and resuming from there reads "+
+		"the identity and the ledger from the journal's locator, which is not in this binary yet", j.Phase, j.Archive),
+		"the runbook in docs/operating/upgrades.md"))
+}
+
+// atRetirePhase says what the host holds on a refusal that read a journal: the
+// phase it reached, never the `nothing` of a run that found none. A retry that
+// answered `nothing` over a host at `done` would say no retirement had ever
+// happened here.
+func atRetirePhase(j retirement.Journal, r *retireRefusal) *retireRefusal {
+	r.State = string(j.Phase)
+
+	return r
 }
 
 // retireDrivesThisJournal says whether the journal on this host is the

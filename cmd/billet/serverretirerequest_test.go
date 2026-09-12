@@ -89,10 +89,16 @@ func newRequestFixture(t *testing.T) *requestFixture {
 			"InvocationID=\nStateChangeTimestamp=\n", 0o644)
 
 	bin := filepath.Join(t.TempDir(), "systemctl")
+	// THE ANSWER IS READ ONCE AND RECORDED WITH WHAT IT SAID: a test that must
+	// know the transition saw a particular state needs the fake's own account
+	// of what it answered, and one that reads the unit file twice could answer
+	// from one revision and record another.
 	writeFile(t, bin, "#!/bin/sh\nunit=\"\"\nnames=\"\"\nfor a in \"$@\"; do case \"$a\" in --property=*) "+
 		"names=\"$names ${a#--property=}\";; --|show) ;; *) unit=$a;; esac; done\n"+
-		"for n in $names; do grep \"^$n=\" \"$BILLET_FAKE_UNITS/$unit\" || true; done\n"+
-		"echo \"$unit\" >> \"$BILLET_FAKE_UNITS/.asked\"\nexit 0\n", 0o755)
+		"out=$(for n in $names; do grep \"^$n=\" \"$BILLET_FAKE_UNITS/$unit\" || true; done)\n"+
+		"printf '%s\\n' \"$out\"\n"+
+		"state=$(printf '%s\\n' \"$out\" | grep '^ActiveState=' || true)\n"+
+		"echo \"$unit $state\" >> \"$BILLET_FAKE_UNITS/.asked\"\nexit 0\n", 0o755)
 	t.Setenv("BILLET_FAKE_UNITS", f.unitsDir)
 
 	savedSystemctl := systemctlBinary
