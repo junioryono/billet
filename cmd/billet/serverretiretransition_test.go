@@ -1740,7 +1740,7 @@ func TestTheRequestsAnswerAlwaysSaysWhatTheHostHolds(t *testing.T) {
 		}
 	})
 
-	t.Run("a resume whose journal goes under it", func(t *testing.T) {
+	t.Run("a status this host published beside no journal", func(t *testing.T) {
 		f := newRequestFixture(t)
 		f.reserve(t)
 
@@ -1751,17 +1751,17 @@ func TestTheRequestsAnswerAlwaysSaysWhatTheHostHolds(t *testing.T) {
 
 		in := f.input(t, nil)
 
-		// The journal is removed while the ledger the resume needs cannot be
-		// dialled: the answer must not say that no retirement is under way on
-		// a host whose server this transition has already stopped.
+		// THE RECORD IS GONE AND THE AUTHORITY IT CLOSED IS STILL CLOSED: the
+		// run meets the status like any other writer, and the answer must not
+		// say that no retirement is under way on a host whose server a
+		// transition has already stopped.
 		mustOK(t, os.Remove(retirement.JournalPath()))
-		t.Setenv("BILLET_STATE_DSN", "postgres://billet:billet@127.0.0.1:1/billet?sslmode=disable")
 
 		out, code := f.request(t, in)
 
 		m := retireAnswer(t, out)
-		if code != exitUnknown || m["state"] != "unknown" {
-			t.Fatalf("a resume whose journal has gone: %s", out)
+		if code != exitUnknown || m["reason"] != retireReasonIdentity || m["state"] != "unknown" {
+			t.Fatalf("an orphan status: %s", out)
 		}
 	})
 
@@ -1771,9 +1771,10 @@ func TestTheRequestsAnswerAlwaysSaysWhatTheHostHolds(t *testing.T) {
 		f.reserve(t)
 
 		// A MUTATING RUN PUBLISHES `intent` WHILE THE PREVIEW IS READING: the
-		// preview found no journal when it looked, and the host holds one by
-		// the time it refuses. The address rule is where this run is when that
-		// happens, and the backup it reads afterwards is what refuses.
+		// preview found neither journal nor status when it looked, and the host
+		// holds both by the time it refuses. The address rule is where this run
+		// is when that happens, and what refuses afterwards is the stage that
+		// intent staged, which no request of this preview's own put there.
 		saved := hostInterfaceAddresses
 		hostInterfaceAddresses = func() ([]hostAddress, error) {
 			f.plantJournal(t, retirement.PhaseIntent, retirement.VariantRetainedNode)
@@ -1783,14 +1784,12 @@ func TestTheRequestsAnswerAlwaysSaysWhatTheHostHolds(t *testing.T) {
 
 		t.Cleanup(func() { hostInterfaceAddresses = saved })
 
-		// A backup whose state cannot be read: could-not-tell, which the host's
-		// own preconditions refuse.
-		writeFile(t, filepath.Join(f.unitsDir, backupServiceUnit), "LoadState=loaded\nMainPID=0\n", 0o644)
-
 		out, code := f.retainedRequest(t, f.input(t, f.retainedOverrides(t)), "--dry-run")
 
+		// WHAT REFUSES IS NOT THE PROPERTY; the state it reports is.
 		m := retireAnswer(t, out)
-		if code == 0 || m["state"] != string(retirement.PhaseIntent) {
+		if code != exitRefused || m["reason"] != retireReasonStage ||
+			m["state"] != string(retirement.PhaseIntent) {
 			t.Fatalf("a preview over a host that moved under it: %s", out)
 		}
 	})
@@ -1826,4 +1825,36 @@ func TestTheRequestsAnswerAlwaysSaysWhatTheHostHolds(t *testing.T) {
 			t.Fatalf("the transition's terminal answer over a journal that has gone: %s", out)
 		}
 	})
+}
+
+// A PREVIEW REQUIRES BOTH ABSENCES, the journal's and the published authority
+// status's, because it exists to say what a REQUEST would do and a mutating
+// run meets the status before it reaches anything a preview describes. A
+// status beside no journal, and one that cannot be read, are each could-not-
+// tell — never a reported eligibility.
+func TestAPreviewRequiresTheStatusAbsentToo(t *testing.T) {
+	for name, stage := range map[string]func(t *testing.T){
+		"a status this host published": func(t *testing.T) {
+			t.Helper()
+			mustOK(t, retirement.WriteStatus(retirement.PhaseStopped, retirement.VariantServerOnly, retireNow()))
+		},
+		"a status nothing can parse": func(t *testing.T) {
+			t.Helper()
+			writeFile(t, retirement.StatusPath(), "{not json\n", 0o644)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newRequestFixture(t)
+			f.reserve(t)
+
+			stage(t)
+
+			out, code := f.request(t, f.input(t, nil), "--dry-run")
+
+			m := retireAnswer(t, out)
+			if code != exitUnknown || m["reason"] != retireReasonStatus || m["state"] != "unknown" {
+				t.Fatalf("a preview over an authority it cannot account for: %s", out)
+			}
+		})
+	}
 }

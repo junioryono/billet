@@ -115,7 +115,7 @@ func retireRequestUnder(ctx context.Context, m retireMode) (any, *retireRefusal)
 		// transition under way may have no configuration left to read at all,
 		// so judging the configuration before the journal answers about the
 		// wrong thing.
-		if r := requireNoJournalForRequest(); r != nil {
+		if r := requireNoRetirementForRequest(); r != nil {
 			return nil, r
 		}
 
@@ -528,8 +528,41 @@ func readRetireJournal() (retirement.Journal, retirement.JournalFact, *retireRef
 	}
 }
 
-// requireNoJournalForRequest is the dry run's rule: a preview describes a
-// request, and a retirement already under way is the mutating run's to resume.
+// requireNoRetirementForRequest is the dry run's rule: a preview describes a
+// REQUEST, and a retirement already under way is the mutating run's to resume.
+// BOTH ABSENCES ARE REQUIRED, the journal's and the published authority
+// status's, because a preview exists to say what a request would do and a
+// mutating run meets the status before it reaches anything this describes: a
+// status this host published beside no journal is a record that has gone, and
+// one that cannot be read is could-not-tell, and in neither case is "this
+// request would be admitted" an answer a preview may give.
+func requireNoRetirementForRequest() *retireRefusal {
+	if r := requireNoJournalForRequest(); r != nil {
+		return r
+	}
+
+	st, presence, err := retirement.ReadStatus()
+
+	switch presence {
+	case retirement.StatusAbsent:
+		return nil
+	case retirement.StatusPresent:
+		r := retireUnknown(retireReasonStatus, fmt.Sprintf("this host publishes the authority status %q beside no "+
+			"retirement journal: the record of the transition that published it has gone, and a preview cannot say "+
+			"what a request would do here", st.Phase), "the runbook in docs/operating/upgrades.md")
+		r.State = retireStateUnknown
+
+		return r
+	default:
+		r := retireUnknown(retireReasonStatus, "the published authority status could not be read: "+errorText(err),
+			"the runbook in docs/operating/upgrades.md")
+		r.State = retireStateUnknown
+
+		return r
+	}
+}
+
+// requireNoJournalForRequest is the journal's half of that rule.
 func requireNoJournalForRequest() *retireRefusal {
 	j, fact, r := readRetireJournal()
 	if r != nil {
