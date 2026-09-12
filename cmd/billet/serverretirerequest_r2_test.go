@@ -63,9 +63,7 @@ func TestServerRetireRequestDryRunMutatesNothing(t *testing.T) {
 	writeGuardRecordForTest(t, f.guard, settled)
 
 	// AND THE GUARD DIRECTORY IS HELD TO ITS TRUST: the mutating run's own
-	// open requires exactly 0700, because a directory anyone else may read or
-	// write is one whose record anyone else may replace, and the preview
-	// makes the same judgement.
+	// open requires exactly 0700, and the preview makes the same judgement.
 	mustOK(t, os.Chmod(f.guard.active(), 0o755))
 
 	out, code = f.request(t, f.input(t, nil), "--dry-run")

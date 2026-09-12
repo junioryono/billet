@@ -546,9 +546,13 @@ func TestServerRetireDrainsUnderADeadline(t *testing.T) {
 
 			var (
 				answered = make(chan error, 1)
+				held     bool
 				out      string
 			)
 
+			// THE COMMAND IS JOINED INSIDE THE CAPTURE, on both branches: a
+			// command still running when capture restores stdout would write
+			// its answer into another test's pipe.
 			out = capture(t, func() {
 				go func() {
 					answered <- cmdServer(t.Context(), nil, append([]string{"retire", "--json", "--config", f.cfg}, c.args...))
@@ -560,9 +564,25 @@ func TestServerRetireDrainsUnderADeadline(t *testing.T) {
 						t.Error("the refusal was not answered")
 					}
 				case <-time.After(30 * time.Second):
+					held = true
+
 					t.Error("the drain never ended, so the answer never came")
+
+					// Let it finish, so nothing of this case writes after the
+					// capture returns.
+					reader.releaseOnce()
+
+					select {
+					case <-answered:
+					case <-time.After(10 * time.Second):
+						t.Error("the command never returned even after its input ended")
+					}
 				}
 			})
+
+			if held {
+				return
+			}
 
 			m := retireAnswer(t, out)
 			if m["reason"] != c.reason || !strings.Contains(whyOf(m), "still being written after") {
