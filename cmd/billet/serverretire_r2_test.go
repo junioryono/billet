@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/junioryono/billet/internal/retirement"
 	"github.com/junioryono/billet/internal/state"
+	"github.com/junioryono/billet/internal/wirecert"
 )
 
 // A DOCUMENT PAST THE BOUND IS DRAINED, THEN REFUSED: the collector writes
@@ -274,24 +276,37 @@ func TestServerRetireAbandonFlushesTheGuardBeforeDeletingTheRow(t *testing.T) {
 	mustHold(t, "ci-1")
 	f.reserveRow(t, "ci-1")
 
-	var ops []string
+	// EACH FLUSH FAILED IN TURN: the row must survive, which is the order
+	// (the flush precedes the delete) and the presence of both flushes.
+	for _, stop := range []string{"fsync upgrades/active", "fsync upgrades"} {
+		injected := errors.New("staged failure at " + stop)
 
-	guardHook = func(op guardOp) error {
-		ops = append(ops, op.Kind+" "+strings.TrimPrefix(op.Path, f.guard.parent+"/"))
+		guardHook = func(op guardOp) error {
+			if op.Kind+" "+strings.TrimPrefix(op.Path, f.guard.parent+"/") == stop {
+				return injected
+			}
 
-		return nil
+			return nil
+		}
+
+		out, code := f.run(t, "", "--abandon-reservation", "--run", "ci-1", "--retiring-host", "control-a")
+		guardHook = nil
+
+		if m := retireAnswer(t, out); m["reason"] != retireReasonMarker || code != exitUnknown ||
+			!strings.Contains(whyOf(m), "staged failure") {
+			t.Fatalf("%s: a failed flush must be could-not-tell before the row goes: %s", stop, out)
+		}
+
+		f.ledger(t, func(db *state.DB) {
+			if _, present, err := db.ReadRetirement(t.Context(), f.identity); err != nil || !present {
+				t.Fatalf("%s: the row must survive a failed flush: %v %v", stop, present, err)
+			}
+		})
 	}
 
 	out, code := f.run(t, "", "--abandon-reservation", "--run", "ci-1", "--retiring-host", "control-a")
-	guardHook = nil
-
 	if m := retireAnswer(t, out); m["outcome"] != retireOutcomeAbandoned || code != 0 {
 		t.Fatalf("the abandonment: %s", out)
-	}
-
-	joined := strings.Join(ops, "\n")
-	if !strings.Contains(joined, "fsync upgrades/active") || !strings.Contains(joined, "fsync upgrades") {
-		t.Fatalf("the retry must flush the guard directory and the root before the row goes, got:\n%s", joined)
 	}
 
 	f.ledger(t, func(db *state.DB) {
@@ -299,6 +314,58 @@ func TestServerRetireAbandonFlushesTheGuardBeforeDeletingTheRow(t *testing.T) {
 			t.Fatalf("the row must be gone: %v %v", present, err)
 		}
 	})
+}
+
+// THE TRANSACTION LOCK COMES BEFORE THE IDENTITY EXCLUSION: a held lock
+// refuses before any identity acquisition, so the inner lock a first
+// acquisition would create is never created.
+func TestServerRetireTakesTheTransactionLockBeforeTheIdentityExclusion(t *testing.T) {
+	f := newRetireFixture(t)
+	mustHold(t, "ci-1")
+	mustOK(t, guardRun(t, "release", "--holder", "ci-1"))
+
+	held, err := takeTxLock()
+	mustOK(t, err)
+
+	defer held.release()
+
+	out, code := f.run(t, "", "--reserve", "--run", "ci-1", "--retiring-host", "control-a", "--survivor-host", "control-b")
+	if m := retireAnswer(t, out); m["reason"] != retireReasonLock || code != exitRefused {
+		t.Fatalf("a held transaction lock must refuse first: %s", out)
+	}
+
+	if _, err := os.Lstat(wirecert.AuthorityLockPath(f.stateDir)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the identity exclusion was taken under a held transaction lock: %v", err)
+	}
+}
+
+// AN UNBOUND LEDGER'S ROW CANNOT BE ASSOCIATED WITH THIS HOST, whoever reads
+// it: root through the owner's report and the owner in process answer alike.
+func TestServerRetireDryRunReadsAnUnboundLedgerAsUnreadable(t *testing.T) {
+	useRetirementRoot(t)
+
+	f := &retireFixture{guard: newGuardFixture(t), stateDir: t.TempDir()}
+	f.cfg = writeCAConfig(t, f.stateDir)
+
+	id, err := state.DeploymentID(f.stateDir)
+	mustOK(t, err)
+
+	f.identity = id
+
+	// Opened once so the ledger exists, never claimed: unbound.
+	statusPlane(t, f.stateDir, func(*state.DB) {})
+
+	savedNow, savedID, savedStdin := retireNow, retireTransitionID, retireStdin
+	retireNow = func() time.Time { return time.Date(2026, 9, 11, 10, 0, 0, 0, time.UTC) }
+	retireTransitionID = func() (string, error) { return retireTestID, nil }
+
+	t.Cleanup(func() { retireNow, retireTransitionID, retireStdin = savedNow, savedID, savedStdin })
+
+	out, _ := f.run(t, "", "--dry-run", "--retiring-host", "control-a")
+	if m := retireAnswer(t, out); m["row_fact"] != string(retirement.RowUnreadable) ||
+		!strings.Contains(whyOf(m), "bound to no deployment") {
+		t.Fatalf("an unbound ledger in process: %s", out)
+	}
 }
 
 // THE RESERVATION IS HELD TO AN EXISTING MARKER: a guard marked beside no row,

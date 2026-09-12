@@ -14,6 +14,7 @@ import (
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/retirement"
+	"github.com/junioryono/billet/internal/rollout"
 	"github.com/junioryono/billet/internal/state"
 )
 
@@ -26,10 +27,12 @@ import (
 // next change's.
 //
 // THE ORDER OF EVERY MUTATING MODE: the transaction lock and this converge's
-// guard first, then the identity exclusion (held through the identity read,
-// the ledger's open and the row's write), then the configuration observed
-// ONCE under both, so nothing a concurrent converge or transaction moved
-// between an early check and the write is what the write rests on.
+// guard first; the configuration observed ONCE under them, from one read (it
+// names the identity directory the next step is keyed by); then the identity
+// exclusion for that directory, held through the identity read, the ledger's
+// open and the row's write. Nothing a concurrent converge or transaction
+// moved between an early check and the write is what the write rests on,
+// because every check is made under the transaction lock.
 
 // retireSchema numbers every answer this command prints.
 const retireSchema = 1
@@ -416,10 +419,11 @@ func retireGuard(run string) (*txLock, *os.File, claimShape, *retireRefusal) {
 	return root, dir, shape, nil
 }
 
-// observeRetireConfig reads the installed configuration ONCE, under the locks
-// the caller holds: the bytes, their digest and the parsed document from one
-// read, the loader's whole judgement, and a server section required, since
-// every mode of this file reaches the ledger through it.
+// observeRetireConfig reads the installed configuration ONCE, under the
+// transaction lock and the guard the caller holds: the bytes, their digest
+// and the parsed document from one read, the loader's whole judgement, and a
+// server section required, since every mode of this file reaches the ledger
+// through it.
 func observeRetireConfig(path string) (*installedConfigObservation, *retireRefusal) {
 	obs, r := observeInstalledConfig(path, true)
 	if r != nil {
@@ -513,9 +517,9 @@ func requireMarkerAssociation(marker *guardTransition, row state.Retirement, pre
 	return nil
 }
 
-// retireReserve is `--reserve`: the guard, the identity exclusion, the
-// configuration observed under both, the local eligibility that needs no
-// report, the marker held to any row, then the row inside one transaction
+// retireReserve is `--reserve`: the guard, the configuration observed under
+// it, the local eligibility that needs no report, then under the identity
+// exclusion the marker held to any row and the row inside one transaction
 // the ledger's single writer decides.
 func retireReserve(ctx context.Context, m retireMode) (any, *retireRefusal) {
 	root, dir, shape, r := retireGuard(m.run)
@@ -1015,6 +1019,8 @@ func readRetireRow(ctx context.Context, cfg *config.Config, m retireMode) (*reti
 	}
 
 	if cfg.Server.LedgerBackend() != config.StatePostgres {
+		// A SQLite read-only open creates the -wal and -shm sidecars owned by
+		// whoever opened it; the row is read as the owner or not at all.
 		uid, gid, err := statusOwnerOf(cfg.Server.IdentityDir)
 		euid := statusEUID()
 
@@ -1037,16 +1043,33 @@ func readRetireRow(ctx context.Context, cfg *config.Config, m retireMode) (*reti
 
 	defer func() { _ = db.Close() }()
 
-	row, present, err := db.ReadRetirement(ctx, identity)
-
-	switch {
-	case err != nil:
+	// THE SAME READ THE OWNER'S REPORT MAKES: the status snapshot, whose row
+	// is read only under a binding, so root and the owner answer alike for
+	// an unbound ledger (could-not-tell: a row keyed by a deployment the
+	// ledger is not bound to cannot be associated with this host).
+	snapshot, err := rollout.New(db).StatusSnapshot(ctx)
+	if err != nil {
 		return nil, retirement.RowUnreadable, "the retirement row could not be read: " + err.Error()
-	case !present:
+	}
+
+	return rowFromSnapshot(snapshot.Binding, snapshot.Retirement, identity, m.retiringHost)
+}
+
+// rowFromSnapshot classifies a status snapshot's row for this host: an
+// unbound ledger or one bound elsewhere is unreadable, a bound one with no
+// row is absence.
+func rowFromSnapshot(binding string, row *state.Retirement, identity, host string) (*retireReportRow, retirement.RowFact, string) {
+	switch {
+	case binding == "":
+		return nil, retirement.RowUnreadable, "the ledger is bound to no deployment, so no row can be associated with this host"
+	case binding != identity:
+		return nil, retirement.RowUnreadable, fmt.Sprintf("the ledger is bound to deployment %s and this host's identity is %s",
+			binding, identity)
+	case row == nil:
 		return nil, retirement.RowAbsent, ""
 	}
 
-	return reportRow(row), rowFactOf(row, m.retiringHost), ""
+	return reportRow(*row), rowFactOf(*row, host), ""
 }
 
 // readRetireRowAsOwner reads the row through `billet rollout status --json`
@@ -1071,24 +1094,24 @@ func readRetireRowAsOwner(ctx context.Context, uid, gid uint32, identity string,
 		return nil, retirement.RowUnreadable, "the owner's status report does not decode: " + err.Error()
 	}
 
-	switch {
-	case report.Schema != rolloutStatusSchema:
+	if report.Schema != rolloutStatusSchema {
 		return nil, retirement.RowUnreadable, fmt.Sprintf("the owner's status report is schema %d, not %d", report.Schema,
 			rolloutStatusSchema)
-	case !report.Deployment.Bound:
-		return nil, retirement.RowUnreadable, "the ledger is bound to no deployment, so no row can be associated with this host"
-	case report.Deployment.ID != identity:
-		return nil, retirement.RowUnreadable, fmt.Sprintf("the ledger is bound to deployment %s and this host's identity is %s",
-			report.Deployment.ID, identity)
-	case report.Retirement == nil:
-		return nil, retirement.RowAbsent, ""
 	}
 
-	row := state.Retirement{Deployment: identity, Retiring: report.Retirement.Retiring, Survivor: report.Retirement.Survivor,
-		Run: report.Retirement.Run, State: report.Retirement.State, TransitionID: report.Retirement.TransitionID,
-		ReservedAt: report.Retirement.ReservedAt}
+	binding := ""
+	if report.Deployment.Bound {
+		binding = report.Deployment.ID
+	}
 
-	return reportRow(row), rowFactOf(row, m.retiringHost), ""
+	var row *state.Retirement
+
+	if rr := report.Retirement; rr != nil {
+		row = &state.Retirement{Deployment: identity, Retiring: rr.Retiring, Survivor: rr.Survivor, Run: rr.Run, State: rr.State,
+			TransitionID: rr.TransitionID, ReservedAt: rr.ReservedAt}
+	}
+
+	return rowFromSnapshot(binding, row, identity, m.retiringHost)
 }
 
 func reportRow(row state.Retirement) *retireReportRow {
@@ -1127,36 +1150,37 @@ func rowFactOf(row state.Retirement, host string) retirement.RowFact {
 const maxOwnerReportBytes = 4 << 20
 
 // reexecCapture runs this billet as uid:gid with args, its stdout captured
-// and bounded, its stderr passed through, and answers the output and the
-// exit status.
+// through a BOUNDED writer (the excess discarded as it arrives, so a report
+// past the bound costs no memory and is refused), its stderr passed through,
+// and answers the output and the exit status.
 func reexecCapture(ctx context.Context, uid, gid uint32, args []string) ([]byte, int, error) {
 	self, err := os.Executable()
 	if err != nil {
 		return nil, 0, fmt.Errorf("find this billet to read the row as the ledger's owner: %w", err)
 	}
 
-	var out bytes.Buffer
+	out := &limitedWriter{w: &bytes.Buffer{}, n: maxOwnerReportBytes}
 
 	cmd := exec.CommandContext(ctx, self, args...)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, &out, os.Stderr
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, out, os.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Credential: &syscall.Credential{Uid: uid, Gid: gid, Groups: []uint32{gid}},
 	}
 
 	err = cmd.Run()
 
-	if out.Len() > maxOwnerReportBytes {
+	if out.overflow {
 		return nil, 0, fmt.Errorf("the owner's report is longer than %d bytes", maxOwnerReportBytes)
 	}
 
 	var exit *exec.ExitError
 	if errors.As(err, &exit) {
-		return out.Bytes(), exit.ExitCode(), nil
+		return out.w.Bytes(), exit.ExitCode(), nil
 	}
 
 	if err != nil {
 		return nil, 0, fmt.Errorf("run the report as the ledger's owner: %w", err)
 	}
 
-	return out.Bytes(), 0, nil
+	return out.w.Bytes(), 0, nil
 }

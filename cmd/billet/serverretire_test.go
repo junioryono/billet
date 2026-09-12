@@ -35,12 +35,17 @@ func newRetireFixture(t *testing.T) *retireFixture {
 	f := &retireFixture{guard: newGuardFixture(t), stateDir: t.TempDir()}
 	f.cfg = writeCAConfig(t, f.stateDir)
 
-	statusPlane(t, f.stateDir, func(*state.DB) {})
-
 	id, err := state.DeploymentID(f.stateDir)
 	mustOK(t, err)
 
 	f.identity = id
+
+	// Bound, as a pair's ledger is once a controller has claimed it: the
+	// dry run associates a row with this host through the binding.
+	statusPlane(t, f.stateDir, func(db *state.DB) {
+		_, err := db.ClaimController(t.Context(), "billet-control-01", id)
+		mustOK(t, err)
+	})
 
 	savedNow, savedID, savedStdin := retireNow, retireTransitionID, retireStdin
 	retireNow = func() time.Time { return time.Date(2026, 9, 11, 10, 0, 0, 0, time.UTC) }

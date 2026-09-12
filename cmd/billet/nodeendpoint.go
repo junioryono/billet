@@ -148,7 +148,7 @@ type installedConfigObservation struct {
 // role's own `billet check` judges at converge and a dry run must describe,
 // not refuse.
 func observeInstalledConfig(path string, strict bool) (*installedConfigObservation, *endpointRefusal) {
-	abs, err := filepath.Abs(path)
+	abs, err := absoluteAsSpelled(path)
 	if err != nil {
 		return nil, endpointUnknown(endpointReasonConfig, fmt.Sprintf("resolve %s: %v", path, err), "", stateNothing)
 	}
@@ -189,6 +189,23 @@ func observeInstalledConfig(path string, strict bool) (*installedConfigObservati
 // target (the same file, or one retargeted since), never as the link's own
 // inode against the target's. A test fails it.
 var closingStat = os.Stat
+
+// absoluteAsSpelled makes a pathname absolute WITHOUT cleaning it: a `..`
+// after a symlinked component is resolved by the kernel through the link's
+// target, and a lexical clean would name another file than the one every
+// other opener of the same spelling (config.Load included) opens.
+func absoluteAsSpelled(path string) (string, error) {
+	if filepath.IsAbs(path) {
+		return path, nil
+	}
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+
+	return cwd + string(filepath.Separator) + path, nil
+}
 
 // closeConfigObservation re-examines the pathname: the file must still be the
 // one observed (identity, size, modification time), and an absence must still
