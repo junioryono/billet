@@ -1906,4 +1906,34 @@ func TestAPreviewDoesNotOfferToMoveALiveStage(t *testing.T) {
 	if strings.Contains(whyOf(m), "move it") || strings.Contains(next, "audit-move") {
 		t.Fatalf("a preview offered to move a stage a transition may own: %s", out)
 	}
+
+	// AND IT NAMES THE RUN THAT CAN TELL: the request itself, which judges the
+	// stage with the transaction lock and the guard held.
+	if !strings.Contains(next, "run the request itself") {
+		t.Fatalf("a preview left an operator with nowhere to go: %s", out)
+	}
+}
+
+// AND THE MUTATING RUN'S ADVICE STANDS, because there the judgement means what
+// it says: it holds the transaction lock and the guard, so a stage beside no
+// journal is an orphan, and moving it to an audit location is what clears it.
+func TestTheRequestOffersTheAuditMoveForAnOrphanStage(t *testing.T) {
+	f := newRequestFixture(t)
+	f.reserve(t)
+
+	// A stage with no journal anywhere: the remainder of an attempt that died
+	// between the stage and the journal it would have been recorded in.
+	mustOK(t, retirement.WriteStage([]byte("server: {}\n")))
+
+	out, code := f.request(t, f.input(t, nil))
+
+	m := retireAnswer(t, out)
+	if code != exitRefused || m["reason"] != retireReasonStage {
+		t.Fatalf("an orphan stage under the lock: %s", out)
+	}
+
+	next, ok := m["next"].(string)
+	if !ok || !strings.Contains(next, "audit-move") || !strings.Contains(whyOf(m), "beside no journal") {
+		t.Fatalf("the refusal does not name the audit move: %s", out)
+	}
 }
