@@ -1717,11 +1717,10 @@ func TestATransitionRefusalOverAJournalItCannotReadSaysUnknown(t *testing.T) {
 }
 
 // EVERY ANSWER THE REQUEST GIVES PASSES THROUGH ONE EXIT that says what the
-// host holds, so no path can be added that forgets. The cases below are the
-// four corners of that exit: a refusal made before the flags were agreed on, a
-// resume whose journal goes under it, a preview whose host changes while it
-// reads, and a transition whose terminal answer is no more exempt than a
-// failed one.
+// host holds, so no path can be added that forgets: a refusal made before the
+// flags were agreed on, a status left beside no journal, and a transition
+// whose terminal answer is no more exempt than a failed one. The preview's
+// corners are beside the preview's own rules, below.
 func TestTheRequestsAnswerAlwaysSaysWhatTheHostHolds(t *testing.T) {
 	t.Run("a flag refusal establishes nothing", func(t *testing.T) {
 		f := newRequestFixture(t)
@@ -1762,35 +1761,6 @@ func TestTheRequestsAnswerAlwaysSaysWhatTheHostHolds(t *testing.T) {
 		m := retireAnswer(t, out)
 		if code != exitUnknown || m["reason"] != retireReasonIdentity || m["state"] != "unknown" {
 			t.Fatalf("an orphan status: %s", out)
-		}
-	})
-
-	t.Run("a preview whose host changes while it reads", func(t *testing.T) {
-		f := newRequestFixture(t)
-		f.retainANode(t)
-		f.reserve(t)
-
-		// A MUTATING RUN PUBLISHES `intent` WHILE THE PREVIEW IS READING: the
-		// preview found neither journal nor status when it looked, and the host
-		// holds both by the time it refuses. The address rule is where this run
-		// is when that happens, and what refuses afterwards is the stage that
-		// intent staged, which no request of this preview's own put there.
-		saved := hostInterfaceAddresses
-		hostInterfaceAddresses = func() ([]hostAddress, error) {
-			f.plantJournal(t, retirement.PhaseIntent, retirement.VariantRetainedNode)
-
-			return saved()
-		}
-
-		t.Cleanup(func() { hostInterfaceAddresses = saved })
-
-		out, code := f.retainedRequest(t, f.input(t, f.retainedOverrides(t)), "--dry-run")
-
-		// WHAT REFUSES IS NOT THE PROPERTY; the state it reports is.
-		m := retireAnswer(t, out)
-		if code != exitRefused || m["reason"] != retireReasonStage ||
-			m["state"] != string(retirement.PhaseIntent) {
-			t.Fatalf("a preview over a host that moved under it: %s", out)
 		}
 	})
 
@@ -1856,5 +1826,84 @@ func TestAPreviewRequiresTheStatusAbsentToo(t *testing.T) {
 				t.Fatalf("a preview over an authority it cannot account for: %s", out)
 			}
 		})
+	}
+}
+
+// A PREVIEW THAT SUCCEEDS SAYS WHAT THE HOST HOLDS TOO. It takes no lock, so a
+// mutating run can publish `intent` while it reads, and a report carrying the
+// `nothing` it was built with would tell the role this host is free when a
+// transition owns it. A server-only request is the case that reaches success
+// there, because it stages nothing for a later check to refuse on.
+func TestAPreviewThatSucceedsSaysWhatTheHostHolds(t *testing.T) {
+	f := newRequestFixture(t)
+	f.retainANode(t)
+	f.reserve(t)
+
+	// The journal appears while the preview is judging the node's endpoint,
+	// which is the last thing it reads before it reports.
+	planted := false
+
+	saved := hostInterfaceAddresses
+	hostInterfaceAddresses = func() ([]hostAddress, error) {
+		if !planted {
+			planted = true
+
+			// A SERVER-ONLY JOURNAL, which stages nothing: no later check of
+			// this preview's own refuses on it, so the run reaches success.
+			f.plantJournal(t, retirement.PhaseIntent, retirement.VariantServerOnly)
+		}
+
+		return saved()
+	}
+
+	t.Cleanup(func() { hostInterfaceAddresses = saved })
+
+	out, code := f.retainedRequest(t, f.input(t, f.retainedOverrides(t)), "--dry-run")
+
+	m := retireAnswer(t, out)
+	if code != 0 || m["outcome"] != retireOutcomeReported {
+		t.Fatalf("the preview: %s", out)
+	}
+
+	if m["state"] != string(retirement.PhaseIntent) {
+		t.Fatalf("a preview reported a free host while a transition owned it: %s", out)
+	}
+}
+
+// AND A PREVIEW NEVER TELLS AN OPERATOR TO MOVE A STAGE IT CANNOT ESTABLISH IS
+// ORPHANED: it holds neither the transaction lock nor the guard, so a journal
+// and the stage it owns can appear between its own two reads, and the advice
+// that fits an orphan would take away the bytes a live transition installs.
+func TestAPreviewDoesNotOfferToMoveALiveStage(t *testing.T) {
+	f := newRequestFixture(t)
+	f.retainANode(t)
+	f.reserve(t)
+
+	// A retained-node journal owns a stage, and both appear while the preview
+	// is judging the node's endpoint.
+	saved := hostInterfaceAddresses
+	hostInterfaceAddresses = func() ([]hostAddress, error) {
+		f.plantJournal(t, retirement.PhaseIntent, retirement.VariantRetainedNode)
+
+		return saved()
+	}
+
+	t.Cleanup(func() { hostInterfaceAddresses = saved })
+
+	out, code := f.retainedRequest(t, f.input(t, f.retainedOverrides(t)), "--dry-run")
+
+	m := retireAnswer(t, out)
+	if code != exitUnknown || m["reason"] != retireReasonStage ||
+		m["state"] != string(retirement.PhaseIntent) {
+		t.Fatalf("a preview over a stage it cannot account for: %s", out)
+	}
+
+	next, ok := m["next"].(string)
+	if !ok {
+		t.Fatalf("the answer carries no next: %s", out)
+	}
+
+	if strings.Contains(whyOf(m), "move it") || strings.Contains(next, "audit-move") {
+		t.Fatalf("a preview offered to move a stage a transition may own: %s", out)
 	}
 }

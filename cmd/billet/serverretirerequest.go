@@ -79,6 +79,14 @@ type retireIntentReport struct {
 func retireRequest(ctx context.Context, m retireMode) (any, *retireRefusal) {
 	answer, r := retireRequestUnder(ctx, m)
 	if r == nil {
+		// A SUCCESS SAYS WHAT THE HOST HOLDS TOO. A preview takes no lock, so
+		// a mutating run can publish `intent` while it reads, and a report
+		// that carried the `nothing` it was built with would tell the role
+		// this host is free when it is not.
+		if report, ok := answer.(*retireIntentReport); ok {
+			report.State = retireHostState(stateNothingRetire)
+		}
+
 		return answer, nil
 	}
 
@@ -435,17 +443,25 @@ func atRetirePhase(j retirement.Journal, r *retireRefusal) *retireRefusal {
 // annotateRetireState puts the host's own phase on a refusal, READ WHEN THE
 // REFUSAL IS MADE rather than remembered: a run that wrote the journal itself
 // has moved the host since it started, and a run whose journal became
-// unreadable knows less than it did. `absent` is what the caller means by a
-// host with no journal — for a request that read one before it began, no
-// retirement is under way here; for a transition whose record has vanished
-// under it, that is not something to state. An explicit `unknown` survives.
+// unreadable knows less than it did. An explicit `unknown` survives.
 func annotateRetireState(r *retireRefusal, absent string) *retireRefusal {
 	if r == nil || r.State == retireStateUnknown {
 		return r
 	}
 
-	// THE READ'S OWN ERROR IS NOT THIS ANSWER'S: what refused is already in the
-	// refusal, and all this adds is where the host stands.
+	r.State = retireHostState(absent)
+
+	return r
+}
+
+// retireHostState reads what the host holds, for a refusal and for a report
+// alike. `absent` is what the caller means by a host with no journal — for a
+// request that read one before it began, no retirement is under way here; for
+// a transition whose record has vanished under it, that is not something to
+// state.
+func retireHostState(absent string) string {
+	// THE READ'S OWN ERROR IS NOT THE ANSWER'S: what refused, or what was
+	// reported, is already there, and all this adds is where the host stands.
 	now, presence, err := retirement.ReadJournal()
 	if err != nil && presence == retirement.JournalPresent {
 		presence = retirement.JournalUnreadable
@@ -459,19 +475,15 @@ func annotateRetireState(r *retireRefusal, absent string) *retireRefusal {
 		// thing a host can be.
 		if _, statusPresence, statusErr := retirement.ReadStatus(); statusPresence != retirement.StatusAbsent ||
 			statusErr != nil {
-			r.State = retireStateUnknown
-
-			return r
+			return retireStateUnknown
 		}
 
-		r.State = absent
+		return absent
 	case retirement.JournalPresent:
-		r.State = string(now.Phase)
+		return string(now.Phase)
 	default:
-		r.State = retireStateUnknown
+		return retireStateUnknown
 	}
-
-	return r
 }
 
 // unexaminedRetireState marks a refusal that looked at nothing: it took no
@@ -1607,12 +1619,24 @@ func judgeHostPreconditions(ctx context.Context, m retireMode, cfg *config.Confi
 	}
 
 	if _, presence, err := retirement.ReadStage(); presence != retirement.StageFileAbsent {
-		if presence == retirement.StageFilePresent {
-			return retireRefuse(retireReasonStage, fmt.Sprintf("a staged configuration exists at %s beside no journal; move it "+
-				"to an audit location by hand", retirement.StagePath()), "the audit-move runbook in docs/operating/upgrades.md")
+		if presence != retirement.StageFilePresent {
+			return retireUnknown(retireReasonStage, err.Error(), "")
 		}
 
-		return retireUnknown(retireReasonStage, err.Error(), "")
+		// A PREVIEW CANNOT ESTABLISH THAT A STAGE IS ORPHANED. It holds neither
+		// the transaction lock nor the guard, so a journal and the stage it
+		// owns can appear under it between its own two reads, and telling an
+		// operator to move a live transition's staged configuration by hand
+		// would take away the bytes that transition installs. The mutating
+		// run makes the same judgement with both held, and its advice stands.
+		if m.dryRun {
+			return retireUnknown(retireReasonStage, fmt.Sprintf("a staged configuration exists at %s and this preview "+
+				"holds nothing, so whether a retirement owns it cannot be told here", retirement.StagePath()),
+				"run the request itself, which judges this under the transaction lock and the guard")
+		}
+
+		return retireRefuse(retireReasonStage, fmt.Sprintf("a staged configuration exists at %s beside no journal; move it "+
+			"to an audit location by hand", retirement.StagePath()), "the audit-move runbook in docs/operating/upgrades.md")
 	}
 
 	for _, p := range nodePathsOf(cfg) {
