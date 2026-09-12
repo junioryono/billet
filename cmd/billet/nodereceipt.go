@@ -181,16 +181,6 @@ func writeReceiptFromEvidence(ctx context.Context, m receiptMode) (any, *endpoin
 			"confirmation %s", ev.Deployment, conf.Deployment.ID), "", "")
 	}
 
-	abs, err := filepath.Abs(m.configPath)
-	if err != nil {
-		return nil, endpointUnknown(endpointReasonConfig, err.Error(), "", "")
-	}
-
-	if abs != ev.ConfigPath {
-		return nil, endpointRefuse(endpointReasonConfig, fmt.Sprintf("--config names %s and the evidence was taken over %s",
-			abs, ev.ConfigPath), "", "")
-	}
-
 	installed, r := observeInstalledConfig(m.configPath, true)
 	if r != nil {
 		return nil, r
@@ -198,6 +188,16 @@ func writeReceiptFromEvidence(ctx context.Context, m receiptMode) (any, *endpoin
 
 	if !installed.present {
 		return nil, endpointRefuse(endpointReasonConfig, "no configuration is installed at "+installed.path, "", "")
+	}
+
+	// THE EVIDENCE'S CONFIGURATION IS THIS ONE, BY IDENTITY AND NOT BY
+	// SPELLING: the observer opens the pathname as given, so the evidence
+	// records whatever spelling the migration was handed, and a relative
+	// argument, a `..` or a symlinked component naming the same file is the
+	// same file. A comparison of texts would refuse the evidence of its own
+	// migration.
+	if r := sameConfigAsEvidence(installed, ev.ConfigPath); r != nil {
+		return nil, r
 	}
 
 	if installed.sha256 != ev.InstalledSHA256 {
@@ -698,6 +698,24 @@ func publishReceipt(ctx context.Context, insp *lifeops.Inspector, installed *ins
 // readMigrationEvidence reads a migration's answer strictly: one object,
 // one value per member, the outcome `migrated`, every member typed as the
 // producer writes it, and the stopped triple exactly inactive/dead/success.
+// sameConfigAsEvidence proves the configuration just observed is the file the
+// migration's evidence was taken over. A path that cannot be examined is
+// could-not-tell, never a mismatch.
+func sameConfigAsEvidence(installed *installedConfigObservation, evidence string) *endpointRefusal {
+	info, err := closingStat(evidence)
+	if err != nil {
+		return endpointUnknown(endpointReasonConfig, fmt.Sprintf("examine %s, the configuration the evidence was taken over: %v",
+			evidence, err), "", "")
+	}
+
+	if !os.SameFile(installed.info, info) {
+		return endpointRefuse(endpointReasonConfig, fmt.Sprintf("--config names %s and the evidence was taken over %s, which is "+
+			"another file", installed.path, evidence), "", "")
+	}
+
+	return nil
+}
+
 func readMigrationEvidence(path string) (*migrateEvidence, *endpointRefusal) {
 	body, err := answerReadFile(path, maxEvidenceBytes, regularfile.Options{NoFollow: true})
 	if err != nil {
