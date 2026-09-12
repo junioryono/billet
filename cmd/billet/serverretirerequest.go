@@ -67,6 +67,9 @@ type retireIntentReport struct {
 	FailoverVerified bool                       `json:"endpoint_failover_verified"`
 	TransitionID     string                     `json:"transition_id"`
 	State            string                     `json:"state"`
+	// Unlocked says what this report could not judge, because a preview holds
+	// nothing.
+	Unlocked string `json:"unlocked"`
 }
 
 // retireRequest is `--input -`.
@@ -247,8 +250,13 @@ func retireRequestReport(ctx context.Context, m retireMode, in *retireInput, obs
 
 	// THE SAME JUDGEMENT THE MUTATING RUN MAKES, over the shape read without
 	// the lock: a preview that reported a request the guard would refuse
-	// would be a lie the role acts on.
+	// would be a lie the role acts on. The guard DIRECTORY is held to the
+	// same trust too, which the mutating path gets from its own open.
 	if r := judgeGuardShape(shape, m.run); r != nil {
+		return nil, r
+	}
+
+	if r := judgeGuardDirTrust(); r != nil {
 		return nil, r
 	}
 
@@ -286,7 +294,30 @@ func retireRequestReport(ctx context.Context, m retireMode, in *retireInput, obs
 
 	return &retireIntentReport{Schema: retireSchema, Outcome: retireOutcomeReported, Would: "request",
 		Variant: plan.variant, Survivor: plan.survivor, Nodes: plan.nodes, FailoverVerified: plan.failover,
-		TransitionID: row.TransitionID, State: stateNothingRetire}, nil
+		TransitionID: row.TransitionID, State: stateNothingRetire, Unlocked: unlockedReport}, nil
+}
+
+// unlockedReport is what a preview cannot answer for, said in its own answer:
+// it takes no transaction lock and no identity exclusion, so every record it
+// read may move before a request takes them, and only the request's own
+// answer says what happened.
+const unlockedReport = "this report was made without the transaction lock and without the identity exclusion, so the guard, " +
+	"the configuration, the journal and the row it read may move before a request takes them"
+
+// judgeGuardDirTrust holds the guard directory to the ownership and mode the
+// mutating path requires of it, read-only: a directory anyone else may write
+// is one whose record anyone else may replace.
+func judgeGuardDirTrust() *retireRefusal {
+	info, err := os.Lstat(activePath())
+	if err != nil {
+		return retireUnknown(retireReasonGuard, fmt.Sprintf("examine %s: %v", activePath(), err), "")
+	}
+
+	if err := requireTrustedDir(activePath(), info, 0o700); err != nil {
+		return retireUnknown(retireReasonGuard, err.Error(), "")
+	}
+
+	return nil
 }
 
 // dispatchRequest holds the row to the one cell a request proceeds from: this

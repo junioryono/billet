@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"strings"
 	"testing"
@@ -496,9 +497,13 @@ func whyOf(m map[string]any) string {
 	return s
 }
 
-// AND THE DRAIN IS BOUNDED: a writer that never closes cannot hold an answer
-// this command has already decided. The deadline is shortened here; what it
-// proves is that there is one.
+// AND THE DRAIN IS BOUNDED ON BOTH REFUSAL PATHS: a writer that never closes
+// cannot hold an answer this command has already decided, whether the flag
+// table refused it or the input's own bound did. THE BOUND IS ON THE WAIT and
+// not on the read, because a descriptor inherited from a shell or an SSH
+// session is not always one a read deadline can interrupt; the test's own
+// reader is an ORDINARY io.Reader that blocks forever, which no deadline
+// could interrupt at all.
 func TestServerRetireDrainsUnderADeadline(t *testing.T) {
 	f := newRetireFixture(t)
 
@@ -507,54 +512,56 @@ func TestServerRetireDrainsUnderADeadline(t *testing.T) {
 
 	t.Cleanup(func() { drainDeadline = saved })
 
-	r, w, err := os.Pipe()
-	mustOK(t, err)
-
-	savedStdin := retireStdin
-	retireStdin = r
-
-	t.Cleanup(func() { retireStdin = savedStdin })
-
-	// A WRITER THAT NEVER STOPS: it ends when the test closes the read end.
-	stop := make(chan struct{})
-	writerDone := make(chan struct{})
-
-	go func() {
-		defer close(writerDone)
-		defer func() { _ = w.Close() }()
-
-		chunk := []byte(strings.Repeat("{", 64<<10))
-
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-			}
-
-			if _, err := w.Write(chunk); err != nil {
-				return
-			}
-		}
-	}()
-
-	answered := make(chan error, 1)
-
-	go func() {
-		answered <- cmdServer(t.Context(), nil, []string{"retire", "--json", "--config", f.cfg, "--input", "-",
-			"--run", "ci-1", "--retiring-host", "control-a"})
-	}()
-
-	select {
-	case err := <-answered:
-		if err == nil {
-			t.Fatal("the refusal was not answered")
-		}
-	case <-time.After(30 * time.Second):
-		t.Fatal("the drain never ended, so the answer never came")
+	cases := map[string][]string{
+		"the flag table's refusal": {"--input", "-", "--run", "ci-1", "--retiring-host", "control-a"},
+		"the input's own bound": {"--input", "-", "--run", "ci-1", "--retiring-host", "control-a",
+			"--survivor-host", "control-b", "--server-only", "--installed-sha256", strings.Repeat("a", 64)},
 	}
 
-	close(stop)
-	mustOK(t, r.Close())
-	<-writerDone
+	for name, args := range cases {
+		t.Run(name, func(t *testing.T) {
+			release := make(chan struct{})
+
+			t.Cleanup(func() { close(release) })
+
+			savedStdin := retireStdin
+			retireStdin = &endlessReader{release: release}
+
+			t.Cleanup(func() { retireStdin = savedStdin })
+
+			answered := make(chan error, 1)
+
+			go func() {
+				answered <- cmdServer(t.Context(), nil, append([]string{"retire", "--json", "--config", f.cfg}, args...))
+			}()
+
+			select {
+			case err := <-answered:
+				if err == nil {
+					t.Fatal("the refusal was not answered")
+				}
+			case <-time.After(30 * time.Second):
+				t.Fatal("the drain never ended, so the answer never came")
+			}
+		})
+	}
+}
+
+// endlessReader is a writer that never stops and never closes: every read
+// answers a block of bytes, and a read after the test releases it ends. No
+// deadline can interrupt it, which is the case the drain's own bound is for.
+type endlessReader struct{ release chan struct{} }
+
+func (e *endlessReader) Read(p []byte) (int, error) {
+	select {
+	case <-e.release:
+		return 0, io.EOF
+	default:
+	}
+
+	for i := range p {
+		p[i] = '{'
+	}
+
+	return len(p), nil
 }

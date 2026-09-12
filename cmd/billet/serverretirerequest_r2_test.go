@@ -62,6 +62,24 @@ func TestServerRetireRequestDryRunMutatesNothing(t *testing.T) {
 
 	writeGuardRecordForTest(t, f.guard, settled)
 
+	// AND THE GUARD DIRECTORY IS HELD TO ITS TRUST: a directory anyone else
+	// may write is one whose record anyone else may replace, and the preview
+	// refuses it as the mutating run's own open does.
+	mustOK(t, os.Chmod(f.guard.active(), 0o755))
+
+	out, code = f.request(t, f.input(t, nil), "--dry-run")
+	if m := retireAnswer(t, out); m["reason"] != retireReasonGuard || code != exitUnknown {
+		t.Fatalf("a preview over a world-writable guard directory: %s", out)
+	}
+
+	mustOK(t, os.Chmod(f.guard.active(), 0o700))
+
+	// AND THE REPORT SAYS WHAT IT COULD NOT JUDGE.
+	out, _ = f.request(t, f.input(t, nil), "--dry-run")
+	if m := retireAnswer(t, out); !strings.Contains(fmt.Sprint(m["unlocked"]), "without the transaction lock") {
+		t.Fatalf("the report does not say it is unlocked: %s", out)
+	}
+
 	// AND IT TAKES NOTHING: with the transaction lock held by another process
 	// the dry run still answers, because a preview holds this host for nobody.
 	held, err := takeTxLock()

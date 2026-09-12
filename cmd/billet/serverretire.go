@@ -391,40 +391,58 @@ func drainedBefore(m retireMode, r *retireRefusal) *retireRefusal {
 		return r
 	}
 
-	// TO EOF, not to the input's bound: what must not happen is a writer left
-	// on a closed pipe, and the bound says nothing about how much it will
-	// write. Nothing is retained.
-	//
-	// UNDER A DEADLINE OF ITS OWN, because the answer is already decided and a
-	// writer that never closes would hold it forever: an interruptible read is
-	// what a pipe gives (a regular file has an end of its own and refuses the
-	// deadline, which is not an error here).
-	if f, ok := retireStdin.(*os.File); ok {
-		// THE WALL CLOCK, never the record clock the tests pin: this is an I/O
-		// bound and not a fact about the retirement.
-		// A READER THAT REFUSES A DEADLINE is a regular file, which ends on its
-		// own; the drain then runs unbounded and correctly.
-		if err := f.SetReadDeadline(time.Now().Add(drainDeadline)); err == nil {
-			defer func() {
-				if err := f.SetReadDeadline(time.Time{}); err != nil {
-					r.Why += "; and clearing stdin's deadline: " + err.Error()
-				}
-			}()
-		}
-	}
-
-	if _, err := io.Copy(io.Discard, retireStdin); err != nil {
-		r.Why += "; and draining stdin: " + err.Error()
+	if why := drainStdin(); why != "" {
+		r.Why += "; " + why
 	}
 
 	return r
 }
 
+// drainStdin consumes the rest of stdin TO EOF and answers why it could not,
+// or nothing. It is the one drain both refusal paths make.
+//
+// WHY TO EOF: the collector writes the request before it reads the answer, so
+// a refusal that left the input unread would meet a writer on a closed pipe
+// and be reported as a broken pipe with no answer at all. The input's own
+// bound says nothing about how much a writer will write.
+//
+// WHY BESIDE THE ANSWER: the answer is already decided, and a writer that
+// never closes would hold it forever. The copy runs in a goroutine and the
+// deadline bounds THE WAIT, not the read: a descriptor inherited from a shell
+// or an SSH session is not always pollable, so a read deadline cannot be
+// relied on to interrupt the read itself. The goroutine may be left blocked;
+// the process is about to exit with its answer, and holding the answer is the
+// failure that matters.
+func drainStdin() string {
+	done := make(chan error, 1)
+
+	go func() {
+		_, err := io.Copy(io.Discard, retireStdin)
+		done <- err
+	}()
+
+	timer := time.NewTimer(drainDeadline)
+	defer timer.Stop()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			return "draining stdin: " + err.Error()
+		}
+
+		return ""
+	case <-timer.C:
+		return fmt.Sprintf("stdin was still being written after %s, and the answer was not held for it", drainDeadline)
+	}
+}
+
 // drainDeadline bounds the drain of an input this command has already
-// answered: a collector writes its request in seconds, and past this the
-// answer matters more than the courtesy. A variable so a test can shorten the
-// bound it proves; production reads the constant value.
-var drainDeadline = 30 * time.Second
+// answered. It is generous on purpose: the input may be twelve mebibytes over
+// a slow transport, and a drain that gave up early would leave the collector
+// on a closed pipe, which is the failure the drain exists to prevent; what it
+// bounds is a writer that never closes at all. A variable so a test can
+// shorten the bound it proves; production reads the constant value.
+var drainDeadline = 2 * time.Minute
 
 // readRetireDocument reads one JSON document from stdin, whole, bounded, before
 // anything is examined. A document past the bound is DRAINED to EOF and then
@@ -440,8 +458,8 @@ func readRetireDocument(limit int64) ([]byte, *retireRefusal) {
 	if int64(len(body)) > limit {
 		why := fmt.Sprintf("the document on stdin is longer than %d bytes", limit)
 
-		if _, err := io.Copy(io.Discard, retireStdin); err != nil {
-			why += "; and draining the rest of stdin: " + err.Error()
+		if drained := drainStdin(); drained != "" {
+			why += "; " + drained
 		}
 
 		return nil, retireRefuse(retireReasonInput, why, "")
