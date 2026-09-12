@@ -149,7 +149,19 @@ func publish(path string, body []byte, mode os.FileMode) error {
 	return syncDir(dir)
 }
 
+// SyncingDir runs before each directory flush this package makes, so a test
+// can fail the flush that FOLLOWS a rename and stage the one remainder a
+// publish can leave: the new file in place and its entry not yet durable. Nil
+// in production.
+var SyncingDir func(dir string) error
+
 func syncDir(dir string) error {
+	if SyncingDir != nil {
+		if err := SyncingDir(dir); err != nil {
+			return err
+		}
+	}
+
 	d, err := os.Open(dir)
 	if err != nil {
 		return fmt.Errorf("retirement: open %s to sync it: %w", dir, err)

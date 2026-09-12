@@ -37,6 +37,9 @@ var (
 	retireBeforeRename func()
 	// retireResetFailedFn clears the one failure this transition reconciles.
 	retireResetFailedFn = retireResetFailed
+	// retireSyncDir flushes a directory entry; a test fails it between a
+	// namespace change and the phase that would certify it.
+	retireSyncDir = syncDir
 )
 
 // cldExited is the si_code systemd reports in ExecMainCode for a process that
@@ -167,11 +170,11 @@ func performRetireAction(ctx context.Context, m retireMode, obs *installedConfig
 	case retirement.ActionArchive:
 		return retireArchive(ctx, j)
 	case retirement.ActionAdvanceArchived:
-		return retireAdvancePhase(j, retirement.PhaseArchived)
+		return retireAdvance(j, retirement.PhaseArchived, filepath.Dir(j.IdentityDir), filepath.Dir(j.Archive))
 	case retirement.ActionRewrite:
 		return retireRewrite(m, obs, j)
 	case retirement.ActionAdvanceRewritten:
-		return retireAdvancePhase(j, retirement.PhaseConfigRewritten)
+		return retireAdvance(j, retirement.PhaseConfigRewritten, filepath.Dir(m.configPath))
 	case retirement.ActionRestart:
 		return retireRestartNode(ctx, j)
 	case retirement.ActionDone:
@@ -395,21 +398,26 @@ func retireBackupRefusedHere(props map[string][]string, j retirement.Journal) bo
 }
 
 // retireSystemdTimestamp parses systemd's rendered timestamp
-// (`Fri 2026-09-11 14:02:03 UTC`). An empty or unparsable answer is not a time,
-// and a zone this host does not know is read as UTC, which only moves the
-// comparison in the refusing direction.
+// (`Fri 2026-09-11 14:02:03 UTC`), in UTC alone.
+//
+// A ZONE THIS CANNOT RESOLVE IS NOT READ AS UTC. systemd renders the host's own
+// zone abbreviation, and reading `11:30 CEST` as `11:30Z` moves the instant two
+// hours LATER than it was, which is the admitting direction for both callers: a
+// backup that failed before the timers stopped would be cleared as this
+// retirement's, and a configuration older than the running node would read as
+// newer. An abbreviation is refused as could-not-tell, and the refusal it
+// produces is the safe answer.
+//
+// The residual, stated: on a host whose systemd renders a local zone, the
+// backup reconciliation refuses and the retirement waits for an operator. The
+// units billet ships log and render in UTC.
 func retireSystemdTimestamp(rendered string) (time.Time, bool) {
 	fields := strings.Fields(rendered)
-	if len(fields) < 4 {
+	if len(fields) < 4 || (fields[3] != "UTC" && fields[3] != "GMT") {
 		return time.Time{}, false
 	}
 
-	loc, err := time.LoadLocation(fields[3])
-	if err != nil {
-		loc = time.UTC
-	}
-
-	t, err := time.ParseInLocation(time.DateTime, fields[1]+" "+fields[2], loc)
+	t, err := time.ParseInLocation(time.DateTime, fields[1]+" "+fields[2], time.UTC)
 	if err != nil {
 		return time.Time{}, false
 	}
@@ -449,11 +457,20 @@ func retireNodeChangedFact(ctx context.Context, insp *lifeops.Inspector, configP
 		return retirement.VerdictUnknown
 	}
 
-	if info.ModTime().After(started) {
+	// SYSTEMD RENDERS SECONDS AND THE FILESYSTEM KEEPS NANOSECONDS, so a start
+	// and a write inside one second have no observable order: the parsed start
+	// is the FLOOR of the true one, and only a modification a whole second
+	// later, or one before the floor, orders itself against it. Anything
+	// between is could-not-tell, which the table refuses by name rather than
+	// manufacturing an ordering out of a truncation.
+	switch mod := info.ModTime(); {
+	case mod.After(started.Add(time.Second)):
 		return retirement.VerdictTrue
+	case mod.Before(started):
+		return retirement.VerdictFalse
+	default:
+		return retirement.VerdictUnknown
 	}
-
-	return retirement.VerdictFalse
 }
 
 // retireNodeUnitFact judges the node at `node-restarted`: ready is active,
@@ -473,8 +490,17 @@ func retireNodeUnitFact(ctx context.Context, insp *lifeops.Inspector, configPath
 		return retirement.NodeUnknown
 	}
 
-	if firstProp(props, "UnitFileState") != "enabled" {
+	switch state := firstProp(props, "UnitFileState"); state {
+	case "enabled":
+	case "enabled-runtime", "disabled", "static", "masked", "masked-runtime", "indirect", "generated",
+		"transient", "linked", "linked-runtime", "alias", "bad":
+		// A RECOGNISED STATE THAT IS NOT PERSISTENT ENABLEMENT, which the
+		// restart the table then performs establishes.
 		return retirement.NodeUnenabled
+	default:
+		// An empty answer, or a word systemd has added since: not a state this
+		// knows, and never a reason to stop a running node.
+		return retirement.NodeUnknown
 	}
 
 	// THE INSTALLED CONFIGURATION AS IT NOW STANDS, which on a retiring host
@@ -495,10 +521,13 @@ func retireNodeUnitFact(ctx context.Context, insp *lifeops.Inspector, configPath
 		return retirement.NodeUnknown
 	}
 
-	// A RECORD FROM ANOTHER INVOCATION is the node before this restart, which
-	// is the inactive answer's remedy and not an unreadable fact.
+	// A RECORD FROM ANOTHER INVOCATION is not permission to restart a node that
+	// is positively ACTIVE: it is a node whose registration has not been
+	// published yet, or a process that moved under this observation, and
+	// stopping it would drain work to answer a question the next converge
+	// answers for nothing. Could-not-tell, which the table refuses by name.
 	if ev.record.InvocationID != firstProp(props, "InvocationID") {
-		return retirement.NodeInactive
+		return retirement.NodeUnknown
 	}
 
 	dialled, err := endpoint.ParseCanonical(ev.record.Endpoint)
@@ -637,7 +666,7 @@ func archiveUnderExclusion(j retirement.Journal) (retirement.Journal, bool, *ret
 	}
 
 	for _, dir := range []string{filepath.Dir(j.IdentityDir), filepath.Dir(j.Archive)} {
-		if err := syncDir(dir); err != nil {
+		if err := retireSyncDir(dir); err != nil {
 			return j, true, retireUnknown(retireReasonArchive, "flush "+dir+": "+err.Error(), "")
 		}
 	}
@@ -657,7 +686,7 @@ func retireRewrite(m retireMode, obs *installedConfigObservation, j retirement.J
 			return j, retireUnknown(retireReasonRewrite, "remove "+m.configPath+": "+err.Error(), "")
 		}
 
-		if err := syncDir(filepath.Dir(m.configPath)); err != nil {
+		if err := retireSyncDir(filepath.Dir(m.configPath)); err != nil {
 			return j, retireUnknown(retireReasonRewrite, err.Error(), "")
 		}
 
@@ -744,7 +773,7 @@ func installRetireConfig(path string, body []byte) error {
 
 	installed = true
 
-	return syncDir(dir)
+	return retireSyncDir(dir)
 }
 
 // retireRestartNode establishes the node's persistent enablement and restarts
@@ -803,6 +832,23 @@ func retireMarkDone(j retirement.Journal) (retirement.Journal, *retireRefusal) {
 	return next, nil
 }
 
+// retireAdvance publishes a phase whose act ANOTHER RUN performed and was
+// interrupted before it could flush: the directories that run owed are flushed
+// here, before the phase that certifies them is written. A rename or an unlink
+// is visible to the next observation long before its parent's entry is
+// durable, so a phase published over an unflushed change could survive a power
+// loss the change itself did not.
+func retireAdvance(j retirement.Journal, phase retirement.Phase, dirs ...string) (retirement.Journal, *retireRefusal) {
+	for _, dir := range dirs {
+		if err := retireSyncDir(dir); err != nil {
+			return j, retireUnknown(retireReasonJournal, fmt.Sprintf("flush %s before recording %s: %v", dir, phase,
+				err), "")
+		}
+	}
+
+	return retireAdvancePhase(j, phase)
+}
+
 // retireAdvancePhase writes the journal at its next phase and nothing else.
 //
 // A FAILED WRITE LEAVES THE PHASE WHERE IT WAS, and answers the journal the
@@ -812,11 +858,28 @@ func retireAdvancePhase(j retirement.Journal, phase retirement.Phase) (retiremen
 	next := j
 	next.Phase = phase
 
-	if err := next.Write(retireNow()); err != nil {
-		return j, retireUnknown(retireReasonJournal, fmt.Sprintf("record the phase %s: %v", phase, err), "")
+	err := next.Write(retireNow())
+	if err == nil {
+		return next, nil
 	}
 
-	return next, nil
+	// A PUBLISH CAN FAIL AFTER ITS RENAME, at the directory's flush, and the
+	// journal on disk is then the new phase while this call failed: the answer
+	// reads the journal back and says what the host HOLDS, with the durability
+	// of that phase unknown, rather than naming a phase a reader would not
+	// find.
+	why := fmt.Sprintf("record the phase %s: %v", phase, err)
+
+	read, presence, readErr := retirement.ReadJournal()
+	switch {
+	case presence != retirement.JournalPresent:
+		return j, retireUnknown(retireReasonJournal, fmt.Sprintf("%s; and reading the journal back: %v", why, readErr), "")
+	case read.Phase == phase:
+		return read, retireUnknown(retireReasonJournal, why+"; the journal reads "+string(phase)+
+			" on disk and whether that is durable cannot be told here", "")
+	default:
+		return j, retireUnknown(retireReasonJournal, why, "")
+	}
 }
 
 // retireResetFailed clears one failed unit, so the backup's proved refusal is

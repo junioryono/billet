@@ -137,7 +137,15 @@ func retireRequest(ctx context.Context, m retireMode) (any, *retireRefusal) {
 
 	cfg := obs.cfg
 
-	out, r := withIdentityAccess(ctx, cfg.Server.IdentityDir, func() (any, *retireRefusal) {
+	// THE EXCLUSION A RESUME TAKES IS THE TRANSITION'S, because a journal on
+	// this host means a status this host published, and from `stopped` on that
+	// status refuses every ordinary writer, this run included.
+	access := withIdentityAccess
+	if journalFact != retirement.JournalFactAbsent {
+		access = withRetiringIdentityAccess
+	}
+
+	out, r := access(ctx, cfg.Server.IdentityDir, func() (any, *retireRefusal) {
 		identity, r := retireIdentity(cfg.Server.IdentityDir)
 		if r != nil {
 			return nil, r
@@ -333,13 +341,35 @@ func requirePreparedHost(obs *installedConfigObservation) *retireRefusal {
 // archive both are gone by design, and the reader that works from the
 // journal's locator alone is the tail's.
 func refuseResumePastTheArchive(j retirement.Journal, fact retirement.JournalFact) *retireRefusal {
-	if fact != retirement.JournalFactIncomplete || j.Phase == retirement.PhaseStopped {
+	if fact != retirement.JournalFactIncomplete {
 		return nil
 	}
 
-	return retireUnknown(retireReasonPhase, fmt.Sprintf("this host's retirement is at %s, past the archive: resuming it "+
-		"reads the identity and the ledger from the journal's locator (%s), which is not in this binary yet", j.Phase,
-		j.Locator.Archive), "the runbook in docs/operating/upgrades.md")
+	if j.Phase != retirement.PhaseStopped {
+		return retireUnknown(retireReasonPhase, fmt.Sprintf("this host's retirement is at %s, past the archive: resuming "+
+			"it reads the identity and the ledger from the journal's locator (%s), which is not in this binary yet",
+			j.Phase, j.Locator.Archive), "the runbook in docs/operating/upgrades.md")
+	}
+
+	// A JOURNAL AT `stopped` WHOSE MOVE ALREADY COMPLETED is the same host: the
+	// phase says the identity is at its configured path and the filesystem says
+	// it is at the archive, which is the remainder of an interruption between
+	// the rename and the phase. The driver handles it; the command cannot reach
+	// it yet, because the exclusion and the identity it would read are inside
+	// the directory that has moved.
+	moved, err := retireDirPresent(j.Archive)
+	if err != nil {
+		return retireUnknown(retireReasonIdentity, err.Error(), "")
+	}
+
+	if !moved {
+		return nil
+	}
+
+	return retireUnknown(retireReasonPhase, fmt.Sprintf("this host's retirement is at %s and its identity is already at "+
+		"%s: the move completed before its phase could be written, and resuming from there reads the identity and the "+
+		"ledger from the journal's locator, which is not in this binary yet", j.Phase, j.Archive),
+		"the runbook in docs/operating/upgrades.md")
 }
 
 // readRetireJournal reads the journal and classifies it for the dispatch. A

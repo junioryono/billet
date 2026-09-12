@@ -91,8 +91,8 @@ func newRequestFixture(t *testing.T) *requestFixture {
 	bin := filepath.Join(t.TempDir(), "systemctl")
 	writeFile(t, bin, "#!/bin/sh\nunit=\"\"\nnames=\"\"\nfor a in \"$@\"; do case \"$a\" in --property=*) "+
 		"names=\"$names ${a#--property=}\";; --|show) ;; *) unit=$a;; esac; done\n"+
-		"echo \"$unit\" >> \"$BILLET_FAKE_UNITS/.asked\"\n"+
-		"for n in $names; do grep \"^$n=\" \"$BILLET_FAKE_UNITS/$unit\" || true; done\nexit 0\n", 0o755)
+		"for n in $names; do grep \"^$n=\" \"$BILLET_FAKE_UNITS/$unit\" || true; done\n"+
+		"echo \"$unit\" >> \"$BILLET_FAKE_UNITS/.asked\"\nexit 0\n", 0o755)
 	t.Setenv("BILLET_FAKE_UNITS", f.unitsDir)
 
 	savedSystemctl := systemctlBinary

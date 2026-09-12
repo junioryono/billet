@@ -596,6 +596,34 @@ func withIdentityAccess(ctx context.Context, dir string, fn func() (any, *retire
 	return answer, r
 }
 
+// withRetiringIdentityAccess is a RESUME's exclusion: the transition's own,
+// which acquires the global lock and never admits itself through the status it
+// published. An ordinary access is refused by that very status from `stopped`
+// on, so a run resuming its own interrupted transition could not reach its
+// journal, its row or the phase it left — the retirement would be stuck at the
+// first interruption past the stop.
+func withRetiringIdentityAccess(ctx context.Context, dir string, fn func() (any, *retireRefusal),
+) (any, *retireRefusal) {
+	acc, err := openRetiringIdentityAccess(ctx, dir, identityAccessWait)
+	if err != nil {
+		return nil, retireUnknown(retireReasonIdentity, err.Error(), "")
+	}
+
+	answer, r := fn()
+
+	if err := acc.Release(); err != nil {
+		if r != nil {
+			r.Why += "; and releasing the identity exclusion: " + err.Error()
+
+			return nil, r
+		}
+
+		return nil, retireUnknown(retireReasonIdentity, "release the identity exclusion: "+err.Error(), "")
+	}
+
+	return answer, r
+}
+
 // retireOpenLedger opens this host's ledger for a write; the identity
 // exclusion the caller holds is what the factory borrows.
 func retireOpenLedger(ctx context.Context, cfg *config.Config, environmentFile string) (*state.DB, *retireRefusal) {

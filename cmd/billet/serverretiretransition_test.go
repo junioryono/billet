@@ -244,21 +244,37 @@ func TestARetainedNodesTransitionInstallsTheStageAndRestartsTheNode(t *testing.T
 // node-restarted: the phase is written behind a restart that happened, and
 // `done` waits for the node's own account of itself.
 func TestARetainedNodeThatPublishesNoRecordIsNotDone(t *testing.T) {
-	f := newRequestFixture(t)
-	f.retainANode(t)
-	f.reserve(t)
+	for name, endpoint := range map[string]string{
+		"no record at all":                 "",
+		"a record naming another endpoint": "https://10.0.0.9:7717",
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newRequestFixture(t)
+			f.retainANode(t)
+			f.reserve(t)
 
-	useRegistrationRecord(t)
+			record := useRegistrationRecord(t)
 
-	out, code := f.retainedRequest(t, f.input(t, f.retainedOverrides(t)))
+			if endpoint != "" {
+				f.svc.onStart = func(unit string) {
+					if unit == nodeUnit {
+						writeRegistrationRecord(t, record, f.identity, endpoint)
+					}
+				}
+			}
 
-	m := retireAnswer(t, out)
-	if code != exitUnknown || m["reason"] != retireReasonPhase || m["state"] != string(retirement.PhaseNodeRestarted) {
-		t.Fatalf("a node with no record: %s", out)
-	}
+			out, code := f.retainedRequest(t, f.input(t, f.retainedOverrides(t)))
 
-	if !strings.Contains(whyOf(m), "node_unit") {
-		t.Fatalf("the refusal does not name the fact that refused: %s", out)
+			m := retireAnswer(t, out)
+			if code != exitUnknown || m["reason"] != retireReasonPhase ||
+				m["state"] != string(retirement.PhaseNodeRestarted) {
+				t.Fatalf("a node that did not come back on the configuration it was given: %s", out)
+			}
+
+			if !strings.Contains(whyOf(m), "node_unit") {
+				t.Fatalf("the refusal does not name the fact that refused: %s", out)
+			}
+		})
 	}
 }
 
@@ -451,14 +467,19 @@ func TestABackupIsAwaitedAndOnlyItsOwnRefusalIsReconciled(t *testing.T) {
 
 			t.Cleanup(func() { retireResetFailedFn = savedReset })
 
-			// A BACKUP THAT FINISHES ON ITS OWN does so WHILE THE WAIT RUNS:
-			// the resolution is written once the transition has actually asked
-			// about the unit, so the case stages a wait rather than a delay.
+			// A BACKUP THAT FINISHES ON ITS OWN does so WHILE THE WAIT RUNS.
+			// The fake records each question AFTER it has answered it, so a
+			// recorded question is an observation the transition COMPLETED:
+			// the resolution is written behind one, which stages a wait rather
+			// than a delay, and the case asserts the await was performed.
 			waited := make(chan struct{})
+			stop := make(chan struct{})
 
 			if c.resolve != "" && !c.reconcile {
 				go func() {
 					defer close(waited)
+
+					deadline := time.After(30 * time.Second)
 
 					for {
 						if strings.Contains(readIfAny(filepath.Join(f.unitsDir, ".asked")), backupServiceUnit) {
@@ -467,18 +488,35 @@ func TestABackupIsAwaitedAndOnlyItsOwnRefusalIsReconciled(t *testing.T) {
 							return
 						}
 
-						time.Sleep(time.Millisecond)
+						select {
+						case <-stop:
+							return
+						case <-deadline:
+							t.Error("the transition never asked about the backup")
+
+							return
+						case <-time.After(time.Millisecond):
+						}
 					}
 				}()
 			} else {
 				close(waited)
 			}
 
+			// THE GOROUTINE IS JOINED WHATEVER THE RUN DID, so a case that
+			// refuses before the first question does not leave it behind.
+			t.Cleanup(func() {
+				close(stop)
+				<-waited
+			})
+
 			j := f.plantJournal(t, retirement.PhaseIntent, retirement.VariantServerOnly)
 
-			_, _, r := f.drive(t, j)
+			_, steps, r := f.drive(t, j)
 
-			<-waited
+			if c.resolve != "" && !c.reconcile && !strings.HasPrefix(actionsOf(steps), "intent:await-backup") {
+				t.Fatalf("a running backup was not awaited: %q", actionsOf(steps))
+			}
 
 			switch {
 			case c.refuses && (r == nil || r.Reason != retireReasonPhase || !strings.Contains(r.Why, "backup")):
@@ -795,5 +833,248 @@ func TestTheStatusClosesBeforeTheJournalLeavesIntent(t *testing.T) {
 
 	if j.Phase != retirement.PhaseIntent || j.TimerStoppedAt == "" {
 		t.Fatalf("the journal: %+v", j)
+	}
+}
+
+// A RESUME TAKES THE TRANSITION'S OWN EXCLUSION: from `stopped` on, the status
+// this host published refuses every ordinary authority writer, and a run
+// resuming its own interrupted transition is refused with it unless it takes
+// the exclusion that acquires without admitting. Without this a retirement
+// interrupted after its stop could never be finished by a converge.
+func TestAResumeRunsUnderTheStatusItPublished(t *testing.T) {
+	f := newRequestFixture(t)
+	f.reserve(t)
+
+	// The host as an interrupted converge leaves it: the timers and the server
+	// stopped, the authority closed, the journal at `stopped`, the identity
+	// still where the configuration names it.
+	f.plantJournal(t, retirement.PhaseStopped, retirement.VariantServerOnly)
+	markGuard(t, f.guard, &guardTransition{Kind: transitionRetirement, ID: retireTestID}, nil)
+	advanceRowToIntent(t, f)
+	mustOK(t, retirement.WriteStatus(retirement.PhaseStopped, retirement.VariantServerOnly, retireNow()))
+
+	out, code := f.request(t, f.input(t, nil))
+
+	m := retireAnswer(t, out)
+	if code != exitUnknown || m["state"] != string(retirement.PhaseDone) {
+		t.Fatalf("the resume under a closed authority: %s", out)
+	}
+
+	// NOTHING WAS STOPPED AGAIN: the resume began at the archive.
+	if len(f.svc.trace) != 0 {
+		t.Fatalf("a resume past the stop stopped units again: %v", f.svc.trace)
+	}
+
+	if _, err := os.Stat(archivedIdentity(t)); err != nil {
+		t.Fatalf("the identity was not archived: %v", err)
+	}
+}
+
+// A PHASE IS NOT PUBLISHED OVER AN UNFLUSHED CHANGE, the recovery paths
+// included: an interrupted run's rename is visible to the next observation
+// long before its parent's entry is durable, so the run that recognises the
+// move completes the flush that run owed before it records the phase.
+func TestAnAdvanceFlushesWhatTheInterruptedRunOwed(t *testing.T) {
+	f := newRequestFixture(t)
+	f.reserve(t)
+
+	j := f.plantJournal(t, retirement.PhaseStopped, retirement.VariantServerOnly)
+
+	// The move completed and its phase was never written: the remainder the
+	// table admits as `advance-archived`.
+	mustOK(t, os.Rename(f.stateDir, j.Archive))
+
+	var flushed []string
+
+	savedSync := retireSyncDir
+	retireSyncDir = func(dir string) error {
+		flushed = append(flushed, dir)
+
+		return errors.New("the directory could not be flushed")
+	}
+
+	t.Cleanup(func() { retireSyncDir = savedSync })
+
+	_, steps, r := f.drive(t, j)
+
+	if r == nil || r.Reason != retireReasonJournal || !strings.Contains(r.Why, "before recording archived") {
+		t.Fatalf("the advance over an unflushed move: %+v", r)
+	}
+
+	if actionsOf(steps) != "stopped:advance-archived" {
+		t.Fatalf("the resume performed %q", actionsOf(steps))
+	}
+
+	if len(flushed) == 0 || flushed[0] != filepath.Dir(f.stateDir) {
+		t.Fatalf("the advance flushed %v, want the moved directory's parent first", flushed)
+	}
+
+	// THE PHASE WAS NOT WRITTEN, because the flush it certifies did not happen.
+	after, _, err := retirement.ReadJournal()
+	mustOK(t, err)
+
+	if after.Phase != retirement.PhaseStopped {
+		t.Fatalf("the phase advanced over a failed flush: %s", after.Phase)
+	}
+}
+
+// A JOURNAL WRITE THAT FAILS AFTER ITS RENAME leaves the next phase on disk,
+// and the answer says what the host HOLDS: a reader would find that phase, and
+// a refusal naming the previous one would send the next converge to a state
+// nothing is in.
+func TestAJournalWriteThatFailsAfterItsRenameAnswersWhatIsOnDisk(t *testing.T) {
+	f := newRequestFixture(t)
+	f.reserve(t)
+
+	statuses := 0
+
+	retirement.Publishing = func(path string) error {
+		if path == retirement.StatusPath() {
+			statuses++
+		}
+
+		return nil
+	}
+
+	retirement.SyncingDir = func(dir string) error {
+		// The flush that follows the journal's rename, once the stop's status
+		// has closed the authority: everything before it is left alone.
+		if statuses >= 2 && dir == retirement.RetiredDir() {
+			return errors.New("the directory could not be flushed")
+		}
+
+		return nil
+	}
+
+	t.Cleanup(func() { retirement.Publishing, retirement.SyncingDir = nil, nil })
+
+	out, code := f.request(t, f.input(t, nil))
+
+	m := retireAnswer(t, out)
+	if code != exitUnknown || m["reason"] != retireReasonJournal ||
+		m["state"] != string(retirement.PhaseStopped) || !strings.Contains(whyOf(m), "on disk") {
+		t.Fatalf("the interrupted publish: %s", out)
+	}
+
+	j, _, err := retirement.ReadJournal()
+	mustOK(t, err)
+
+	if j.Phase != retirement.PhaseStopped {
+		t.Fatalf("the journal on disk: %s", j.Phase)
+	}
+}
+
+// NEITHER AN UNKNOWN ENABLEMENT NOR A RECORD FROM ANOTHER INVOCATION IS
+// PERMISSION TO RESTART a node that is positively active: the first is a word
+// this billet does not know, the second a registration not published yet, and
+// a restart is a drain.
+func TestAnUncertainNodeIsNotRestarted(t *testing.T) {
+	for name, unit := range map[string]string{
+		"an enablement this billet does not know": "LoadState=loaded\nActiveState=active\nSubState=running\n" +
+			"Result=success\nKillMode=mixed\nMainPID=4242\nUnitFileState=refreshing\n" +
+			"InvocationID=0123456789abcdef0123456789abcdef\nExecMainStartTimestamp=" + retainedNodeStarted + "\n",
+		"a record from another invocation": "LoadState=loaded\nActiveState=active\nSubState=running\n" +
+			"Result=success\nKillMode=mixed\nMainPID=4242\nUnitFileState=enabled\n" +
+			"InvocationID=fedcba9876543210fedcba9876543210\nExecMainStartTimestamp=" + retainedNodeStarted + "\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newRequestFixture(t)
+			f.retainANode(t)
+			f.reserve(t)
+
+			record := useRegistrationRecord(t)
+			writeRegistrationRecord(t, record, f.identity, retainedEndpoint)
+
+			j := f.plantJournal(t, retirement.PhaseNodeRestarted, retirement.VariantRetainedNode)
+
+			mustOK(t, os.Rename(f.stateDir, j.Archive))
+			writeFile(t, f.cfg, f.rendering(t), 0o600)
+			writeFile(t, filepath.Join(f.unitsDir, nodeUnit), unit, 0o644)
+
+			_, _, r := f.drive(t, j)
+
+			if r == nil || r.Reason != retireReasonPhase || !strings.Contains(r.Why, "node_unit") {
+				t.Fatalf("an uncertain node was acted on: %+v", r)
+			}
+
+			if len(f.svc.trace) != 0 {
+				t.Fatalf("a positively active node was touched: %v", f.svc.trace)
+			}
+		})
+	}
+}
+
+// A CONFIGURATION WRITTEN INSIDE THE SECOND A NODE STARTED has no observable
+// order against it: systemd renders seconds and the filesystem keeps
+// nanoseconds, and a truncation is not an ordering.
+func TestAConfigurationWrittenInsideTheStartsSecondIsCouldNotTell(t *testing.T) {
+	f := newRequestFixture(t)
+	f.retainANode(t)
+	f.reserve(t)
+
+	j := f.plantJournal(t, retirement.PhaseArchived, retirement.VariantRetainedNode)
+	mustOK(t, os.Rename(f.stateDir, j.Archive))
+
+	// The node's rendered start is 09:00:00 and the file's modification time is
+	// that same instant: the process started somewhere in that whole second, so
+	// the file is not observably older than it. A comparison that answered
+	// `not after` here would call the configuration unchanged and let the
+	// transition go on.
+	started, err := time.Parse(time.RFC3339, "2026-09-11T09:00:00Z")
+	mustOK(t, err)
+	mustOK(t, os.Chtimes(f.cfg, started, started))
+
+	_, _, r := f.drive(t, j)
+
+	if r == nil || r.Reason != retireReasonPhase || !strings.Contains(r.Why, "node_changed") {
+		t.Fatalf("an ordering was manufactured out of a truncated timestamp: %+v", r)
+	}
+}
+
+// A ZONE THIS HOST CANNOT RESOLVE IS NOT READ AS UTC: systemd renders the
+// host's own abbreviation, and reading a positive offset as UTC moves the
+// instant later, which is the ADMITTING direction for a backup that failed
+// before the timers stopped.
+func TestARenderedTimestampIsUTCOrNothing(t *testing.T) {
+	for _, c := range []struct {
+		rendered string
+		want     bool
+	}{
+		{"Fri 2026-09-11 10:00:30 UTC", true},
+		{"Fri 2026-09-11 10:00:30 GMT", true},
+		{"Fri 2026-09-11 11:30:00 CEST", false},
+		{"Fri 2026-09-11 10:00:30", false},
+		{"", false},
+		{"Fri 2026-09-11 25:00:30 UTC", false},
+	} {
+		if _, ok := retireSystemdTimestamp(c.rendered); ok != c.want {
+			t.Errorf("%q was read as a time: %v, want %v", c.rendered, ok, c.want)
+		}
+	}
+}
+
+// AND THE COMMAND SAYS SO RATHER THAN MEETING IT AS A MISSING FILE: a journal
+// at `stopped` whose move already completed is refused by name, because the
+// exclusion and the identity such a resume would read are inside the directory
+// that has moved.
+func TestACommandResumeOverACompletedMoveIsRefusedByName(t *testing.T) {
+	f := newRequestFixture(t)
+	f.reserve(t)
+
+	j := f.plantJournal(t, retirement.PhaseStopped, retirement.VariantServerOnly)
+	markGuard(t, f.guard, &guardTransition{Kind: transitionRetirement, ID: retireTestID}, nil)
+	advanceRowToIntent(t, f)
+	mustOK(t, retirement.WriteStatus(retirement.PhaseStopped, retirement.VariantServerOnly, retireNow()))
+	mustOK(t, os.Rename(f.stateDir, j.Archive))
+
+	out, code := f.request(t, f.input(t, nil))
+
+	m := retireAnswer(t, out)
+	if code != exitUnknown || m["reason"] != retireReasonPhase || !strings.Contains(whyOf(m), "already at") {
+		t.Fatalf("the resume over a completed move: %s", out)
+	}
+
+	if len(f.svc.trace) != 0 {
+		t.Fatalf("a refused resume touched the host: %v", f.svc.trace)
 	}
 }
