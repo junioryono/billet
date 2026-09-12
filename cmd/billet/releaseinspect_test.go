@@ -2124,14 +2124,36 @@ func TestReleaseInspectReportsANodesTrustStoreWithoutItsKey(t *testing.T) {
 		t.Errorf("the report mentions the node's key, so something read it:\n%s", body)
 	}
 	// EXACTLY THE PUBLIC FILES, THROUGH THE SEAM: the journal (absent), the
-	// leaf and the CA file, and never the key.
+	// leaf and the CA file, and never the key. THE SET, not the count: the
+	// report reads the leaf once to resolve the node's effective name and
+	// once to report the trust store, and what this pins is which files are
+	// read at all.
 	want := []string{retiredJournalPath, cert, caFile}
 	sort.Strings(want)
-	got := append([]string(nil), f.read...)
+	got := distinctReads(f.read)
 	sort.Strings(got)
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Errorf("public reads = %q, want exactly %q", got, want)
 	}
+}
+
+// distinctReads is the set of paths a report read, in first-seen order.
+func distinctReads(paths []string) []string {
+	seen := map[string]struct{}{}
+
+	var out []string
+
+	for _, p := range paths {
+		if _, ok := seen[p]; ok {
+			continue
+		}
+
+		seen[p] = struct{}{}
+
+		out = append(out, p)
+	}
+
+	return out
 }
 
 // EVERY CLAIM SHAPE IS CLASSIFIED BY LSTAT, a dangling symlink included.
@@ -2386,6 +2408,7 @@ executable.is_release
 executable.process_bound
 executable.sha256
 executable.version
+host.addresses
 host.authority.created
 host.authority.current.der_sha256
 host.authority.current.not_after
@@ -2396,6 +2419,7 @@ host.authority.rotation_in_progress
 host.deployment_id
 host.endpoint_receipt.presence
 host.installed_endpoint
+host.node_effective_name
 host.node_name
 host.node_trust
 host.os
@@ -2658,10 +2682,12 @@ executable.is_release
 executable.process_bound
 executable.sha256
 executable.version
+host.addresses
 host.authority
 host.deployment_id.unknown
 host.endpoint_receipt.presence
 host.installed_endpoint
+host.node_effective_name
 host.node_name
 host.node_trust
 host.os
@@ -2769,10 +2795,12 @@ executable.is_release
 executable.process_bound
 executable.sha256
 executable.version
+host.addresses
 host.authority
 host.deployment_id
 host.endpoint_receipt.presence
 host.installed_endpoint
+host.node_effective_name
 host.node_name
 host.node_trust.cas
 host.node_trust.leaf.der_sha256

@@ -18,6 +18,9 @@
     "version": "(devel)"
   },
   "host": {
+    "addresses": {
+      "unknown": "addresses are not reported on darwin: no retirement compares them there"
+    },
     "authority": null,
     "deployment_id": {
       "unknown": "not minted"
@@ -26,6 +29,7 @@
       "unknown": "no endpoint receipt on this platform"
     },
     "installed_endpoint": null,
+    "node_effective_name": null,
     "node_name": null,
     "node_trust": null,
     "os": "darwin",

@@ -16,6 +16,32 @@
     "version": "(devel)"
   },
   "host": {
+    "addresses": [
+      {
+        "address": "127.0.0.1",
+        "index": 1,
+        "interface": "lo",
+        "scope": "host"
+      },
+      {
+        "address": "::1",
+        "index": 1,
+        "interface": "lo",
+        "scope": "host"
+      },
+      {
+        "address": "10.0.0.1",
+        "index": 2,
+        "interface": "eth0",
+        "scope": "global"
+      },
+      {
+        "address": "fe80::1",
+        "index": 2,
+        "interface": "eth0",
+        "scope": "link"
+      }
+    ],
     "authority": null,
     "deployment_id": null,
     "endpoint_receipt": {
@@ -34,6 +60,7 @@
       }
     },
     "installed_endpoint": "https://10.0.0.5:7717",
+    "node_effective_name": "node-a",
     "node_name": "node-a",
     "node_trust": {
       "cas": [

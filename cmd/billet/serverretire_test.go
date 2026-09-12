@@ -235,6 +235,18 @@ func TestServerRetireRefusesEachCombinationBeforeOpeningAnything(t *testing.T) {
 		"a run with a slash":         {"--dry-run", "--run", "ci/1", "--retiring-host", "control-a"},
 		"a bad installed digest": {"--reserve", "--run", "ci-1", "--retiring-host", "control-a", "--survivor-host",
 			"control-b", "--installed-sha256", "nope"},
+		"input from a file": {"--input", "/tmp/in.json", "--run", "ci-1", "--retiring-host", "control-a",
+			"--survivor-host", "control-b"},
+		"input without a survivor": {"--input", "-", "--run", "ci-1", "--retiring-host", "control-a"},
+		"input with the retiring host as survivor": {"--input", "-", "--run", "ci-1", "--retiring-host", "control-a",
+			"--survivor-host", "control-a"},
+		"input beside reserve": {"--input", "-", "--reserve", "--run", "ci-1", "--retiring-host", "control-a",
+			"--survivor-host", "control-b"},
+		"server-only outside a request": {"--reserve", "--server-only", "--run", "ci-1", "--retiring-host", "control-a",
+			"--survivor-host", "control-b"},
+		"a shared address outside a request": {"--dry-run", "--retiring-host", "control-a", "--shared-address", "10.0.0.9"},
+		"a non-positive report age": {"--input", "-", "--run", "ci-1", "--retiring-host", "control-a", "--survivor-host",
+			"control-b", "--report-max-age", "0"},
 	}
 
 	for name, args := range cases {

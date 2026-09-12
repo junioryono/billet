@@ -341,6 +341,14 @@ type inspectHost struct {
 	// EndpointReceipt is the durable migration receipt, typed by presence
 	// (releaseinspectreceipt.go), judged whether or not the node runs.
 	EndpointReceipt maybe `json:"endpoint_receipt"`
+	// Addresses is every unicast address this host holds, on Linux, as a
+	// retirement compares a node's endpoint against the survivor's; unknown
+	// on darwin, where no retirement runs.
+	Addresses maybe `json:"addresses"`
+	// NodeEffectiveName is the name the node registers under: the configured
+	// one, or the bundle leaf's CommonName when the configuration omits it;
+	// null without a node section, unknown when it cannot be resolved.
+	NodeEffectiveName maybe `json:"node_effective_name"`
 }
 
 type inspectCertificate struct {
@@ -483,8 +491,9 @@ func inspectHostRelease(ctx context.Context, configPath string) inspectReport {
 	}
 	report.ConfigBinding = binding
 	report.Installed = inspectInstalledSection(cfg, configPath, report.Config, digest)
-	report.Host = inspectHostSection(cfg)
-	report.Host.Registration = hostRegistration(report.Services["node"], cfg)
+	regID := expectedRegistrationIdentity(cfg)
+	report.Host = inspectHostSection(cfg, regID)
+	report.Host.Registration = hostRegistration(report.Services["node"], regID)
 	report.Host.EndpointReceipt = hostEndpointReceipt()
 	report.Host.InstalledEndpoint = installedEndpoint(cfg, report.Config.Readable)
 	report.Transaction = inspectTransactionSection()
@@ -1741,9 +1750,11 @@ func inspectInstalledSection(cfg *config.Config, configPath string, loaded inspe
 // says so: the deployment id is peeked and NEVER minted, the authority is a
 // confirming-read snapshot with no lock, and a node's bundle is read without
 // its key.
-func inspectHostSection(cfg *config.Config) inspectHost {
+func inspectHostSection(cfg *config.Config, regID registrationIdentity) inspectHost {
 	host := inspectHost{OS: hostOS}
 	host.Retirement = inspectRetirement()
+	host.Addresses = inspectAddresses()
+	host.NodeEffectiveName = inspectNodeEffectiveName(cfg, regID)
 	if cfg == nil {
 		why := "the configuration could not be read"
 		host.NodeName, host.DeploymentID = unknown(why), unknown(why)
@@ -1776,6 +1787,47 @@ func inspectHostSection(cfg *config.Config) inspectHost {
 		host.NodeTrust = inspectNodeTrustSection(cfg.Node.TLS.CertPath, cfg.Node.TLS.CAPath)
 	}
 	return host
+}
+
+// inspectAddresses is host.addresses: every unicast address this host holds,
+// from the kernel, on Linux.
+func inspectAddresses() maybe {
+	if hostOS == "darwin" {
+		return unknown("addresses are not reported on darwin: no retirement compares them there")
+	}
+
+	addrs, err := hostInterfaceAddresses()
+	if err != nil {
+		return unknown(err.Error())
+	}
+
+	if addrs == nil {
+		addrs = []hostAddress{}
+	}
+
+	return known(addrs)
+}
+
+// inspectNodeEffectiveName is host.node_effective_name, resolved as the
+// node's own startup resolves it and never minted, from the identity the
+// report derived once.
+func inspectNodeEffectiveName(cfg *config.Config, id registrationIdentity) maybe {
+	if cfg == nil {
+		return unknown("the configuration could not be read")
+	}
+
+	if cfg.Node == nil {
+		return known(nil)
+	}
+
+	switch {
+	case id.contradiction != "":
+		return unknown(id.contradiction)
+	case id.node != "":
+		return known(id.node)
+	default:
+		return unknown(id.why)
+	}
 }
 
 // inspectRetirement reads the retirement journal from its fixed path: the

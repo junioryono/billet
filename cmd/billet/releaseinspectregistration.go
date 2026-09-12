@@ -446,7 +446,7 @@ func judgeRegistration(ev registrationEvidence, unitInvocation maybe, identity r
 // there, and no unit sample to bind one to), unknown when the node is not
 // running (its sample is what reads the record), else the sample's evidence
 // judged for currency and identity.
-func hostRegistration(node inspectService, cfg *config.Config) maybe {
+func hostRegistration(node inspectService, id registrationIdentity) maybe {
 	if hostOS == "darwin" {
 		return unknown("no runtime record on this platform")
 	}
@@ -461,7 +461,7 @@ func hostRegistration(node inspectService, cfg *config.Config) maybe {
 		return unknown("the node is not running, so no registration record is bound to a process")
 	}
 
-	return judgeRegistration(node.registration, node.InvocationID, expectedRegistrationIdentity(cfg))
+	return judgeRegistration(node.registration, node.InvocationID, id)
 }
 
 // installedEndpoint is the installed configuration's node endpoint as the one

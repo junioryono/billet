@@ -2,6 +2,6 @@
   "schema": 1,
   "outcome": "refused",
   "reason": "combination",
-  "why": "exactly one of --reserve, --abandon-reservation, --complete-row, --acknowledge-row and --dry-run",
+  "why": "exactly one of --reserve, --input -, --abandon-reservation, --complete-row, --acknowledge-row and --dry-run",
   "state": "nothing"
 }

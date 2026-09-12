@@ -284,6 +284,8 @@ func TestTheReleaseInspectFixturesAreTheCommandsOwn(t *testing.T) {
 
 	for name, plant := range shapes {
 		t.Run(name, func(t *testing.T) {
+			pinHostAddresses(t)
+
 			p := plant(t)
 
 			var runErr error

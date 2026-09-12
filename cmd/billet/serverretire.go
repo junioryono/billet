@@ -87,6 +87,9 @@ type retireRefusal struct {
 	Why     string `json:"why"`
 	Next    string `json:"next,omitempty"`
 	State   string `json:"state"`
+	// Reservation says what a refused request did with the row: `released`
+	// (this converge inserted it), `kept` (adopted, or the release failed).
+	Reservation string `json:"reservation,omitempty"`
 }
 
 func retireRefuse(reason, why, next string) *retireRefusal {
@@ -206,6 +209,15 @@ type retireMode struct {
 	completeRow bool
 	acknowledge bool
 	dryRun      bool
+
+	// The request's operands.
+	input            string
+	serverOnly       bool
+	survivorFlagged  bool
+	sharedAddresses  []string
+	failoverVerified bool
+	reservationFresh bool
+	reportMaxAge     time.Duration
 }
 
 // The seams: the clock, stdin, the transition id's minting, and the re-exec
@@ -236,6 +248,20 @@ func cmdServerRetire(ctx context.Context, args []string) error {
 	flags.BoolVar(&m.completeRow, "complete-row", false, "on the survivor: complete the retiring host's ledger row from its completion document")
 	flags.BoolVar(&m.acknowledge, "acknowledge-row", false, "on the retiring host: acknowledge the survivor's completion in the journal")
 	flags.BoolVar(&m.dryRun, "dry-run", false, "classify the host and report; take nothing, write nothing")
+	flags.StringVar(&m.input, "input", "", "the request: - for the input document on stdin")
+	flags.BoolVar(&m.serverOnly, "server-only", false, "with --input: this host keeps no node, and the request carries no rendering")
+	flags.BoolVar(&m.survivorFlagged, "survivor-flagged", false, "with --input: the inventory flags the survivor for retirement too")
+	flags.Func("shared-address", "with --input: a virtual, anycast or translated address the deployment shares (repeatable)",
+		func(s string) error {
+			m.sharedAddresses = append(m.sharedAddresses, s)
+
+			return nil
+		})
+	flags.BoolVar(&m.failoverVerified, "endpoint-failover-verified", false, "with --input: the operator asserts every node "+
+		"endpoint survives this controller's removal by a failover outside billet")
+	flags.BoolVar(&m.reservationFresh, "reservation-fresh", false, "with --input: --reserve answered reserved, not adopted, so a "+
+		"refusal releases the row")
+	flags.DurationVar(&m.reportMaxAge, "report-max-age", 10*time.Minute, "with --input: how old the collection round may be")
 	asJSON := flags.Bool("json", false, "print the answer as JSON (the only form)")
 
 	if err := parse(flags, args); err != nil {
@@ -261,6 +287,8 @@ func cmdServerRetire(ctx context.Context, args []string) error {
 	)
 
 	switch {
+	case m.input != "":
+		answer, r = retireRequest(ctx, m)
 	case m.dryRun:
 		answer, r = retireDryRun(ctx, m)
 	case m.reserve:
@@ -286,7 +314,9 @@ func cmdServerRetire(ctx context.Context, args []string) error {
 func checkRetireCombination(m retireMode) *retireRefusal {
 	modes := 0
 
-	for _, on := range []bool{m.reserve, m.abandon, m.completeRow, m.acknowledge, m.dryRun} {
+	// A dry run over an input judges the request without writing, so the two
+	// are one mode there.
+	for _, on := range []bool{m.reserve, m.abandon, m.completeRow, m.acknowledge, m.dryRun && m.input == "", m.input != ""} {
 		if on {
 			modes++
 		}
@@ -298,7 +328,17 @@ func checkRetireCombination(m retireMode) *retireRefusal {
 
 	switch {
 	case modes != 1:
-		return refuse("exactly one of --reserve, --abandon-reservation, --complete-row, --acknowledge-row and --dry-run")
+		return refuse("exactly one of --reserve, --input -, --abandon-reservation, --complete-row, --acknowledge-row and --dry-run")
+	case m.input != "" && m.input != "-":
+		return refuse("--input takes - alone: the request document arrives on stdin")
+	case m.input != "" && m.survivorHost == "":
+		return refuse("--input needs --survivor-host, the designated survivor's inventory name")
+	case m.input == "" && (m.serverOnly || m.survivorFlagged || len(m.sharedAddresses) != 0 || m.failoverVerified || m.reservationFresh):
+		return refuse("--server-only, --survivor-flagged, --shared-address, --endpoint-failover-verified and --reservation-fresh belong to --input")
+	case m.input != "" && m.survivorHost == m.retiringHost:
+		return refuse("--survivor-host names the retiring host; a controller cannot survive its own retirement")
+	case m.reportMaxAge <= 0:
+		return refuse("--report-max-age must be positive")
 	case m.configPath == "":
 		return refuse("--config names the installed configuration and it is empty")
 	case m.retiringHost == "" && !m.completeRow:
@@ -324,9 +364,9 @@ func checkRetireCombination(m retireMode) *retireRefusal {
 		return refuse("--reserve needs --survivor-host")
 	case m.reserve && m.survivorHost == m.retiringHost:
 		return refuse("--survivor-host names the retiring host; a controller cannot survive its own retirement")
-	case !m.reserve && (m.survivorHost != "" || m.installedSHA != ""):
-		return refuse("--survivor-host and --installed-sha256 belong to --reserve")
-	case m.reserve && m.installedSHA != "" && !sha256Hex.MatchString(m.installedSHA):
+	case !m.reserve && m.input == "" && (m.survivorHost != "" || m.installedSHA != ""):
+		return refuse("--survivor-host and --installed-sha256 belong to --reserve and --input")
+	case m.installedSHA != "" && !sha256Hex.MatchString(m.installedSHA):
 		return refuse("--installed-sha256 is not a sha256")
 	case m.completeRow && (m.asHost == "" || m.completion != "-"):
 		return refuse("--complete-row needs --as-host and --completion -")

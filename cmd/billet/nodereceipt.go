@@ -695,9 +695,6 @@ func publishReceipt(ctx context.Context, insp *lifeops.Inspector, installed *ins
 	return receiptAnswer{Schema: endpointSchema, Outcome: outcomeWritten, Receipt: &rec}, nil
 }
 
-// readMigrationEvidence reads a migration's answer strictly: one object,
-// one value per member, the outcome `migrated`, every member typed as the
-// producer writes it, and the stopped triple exactly inactive/dead/success.
 // sameConfigAsEvidence proves the configuration just observed is the file the
 // migration's evidence was taken over. A path that cannot be examined is
 // could-not-tell, never a mismatch.
@@ -716,6 +713,9 @@ func sameConfigAsEvidence(installed *installedConfigObservation, evidence string
 	return nil
 }
 
+// readMigrationEvidence reads a migration's answer strictly: one object,
+// one value per member, the outcome `migrated`, every member typed as the
+// producer writes it, and the stopped triple exactly inactive/dead/success.
 func readMigrationEvidence(path string) (*migrateEvidence, *endpointRefusal) {
 	body, err := answerReadFile(path, maxEvidenceBytes, regularfile.Options{NoFollow: true})
 	if err != nil {
