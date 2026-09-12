@@ -697,8 +697,9 @@ func (f *requestFixture) retainANode(t *testing.T) {
 	writeFile(t, key, string(bundle.KeyPEM), 0o600)
 	writeFile(t, caFile, string(bundle.CAPEM), 0o644)
 
-	// A copy a case can put back after replacing the pair.
+	// Copies a case can put back after replacing the pair.
 	writeFile(t, cert+".orig", string(bundle.CertPEM), 0o644)
+	writeFile(t, key+".orig", string(bundle.KeyPEM), 0o600)
 
 	// A CONTROLLER THAT PUBLISHES A TLS ENDPOINT binds the address it
 	// publishes, never loopback.

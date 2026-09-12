@@ -81,36 +81,19 @@ func retireRequest(ctx context.Context, m retireMode) (any, *retireRefusal) {
 		return nil, r
 	}
 
-	obs, r := observeRetireConfig(m.configPath)
-	if r != nil {
-		return nil, r
-	}
-
-	// A RETIREMENT IS REQUESTED ONLY ON A HOST AN INSTALLER HAS PREPARED: the
-	// transition publishes an authority status and renames the identity
-	// directory, and both are meaningless where no global exclusion is in
-	// force, since every other writer there is excluded by the directory's own
-	// lock, which moves with it.
-	class, err := retirement.Classify(obs.cfg.Server.IdentityDir)
-
-	switch {
-	case err != nil:
-		return nil, retireUnknown(retireReasonIdentity, err.Error(), "")
-	case class.Mode != retirement.ModePrepared:
-		return nil, retireRefuse(retireReasonIdentity, fmt.Sprintf("this host is %s: no service account is recorded at %s, so "+
-			"no global authority exclusion is in force and a retirement has nothing to close", class.Mode,
-			retirement.ServiceAccountPath()), "`billet local up` or the host role prepares the host")
-	case !class.Directory:
-		return nil, retireRefuse(retireReasonIdentity, "the configured identity directory is absent, so there is nothing to "+
-			"retire", "the runbook in docs/operating/upgrades.md")
-	}
-
-	cfg := obs.cfg
-
-	// A DRY RUN TAKES NOTHING AT ALL: it reads the journal, the guard and the
-	// records where they lie, judges the same request and reports. The lock
-	// and the guard belong to a run that will write.
+	// A DRY RUN TAKES NOTHING AT ALL: it reads the configuration, the journal,
+	// the guard and the records where they lie, judges the same request and
+	// reports. The lock and the guard belong to a run that will write.
 	if m.dryRun {
+		obs, r := observeRetireConfig(m.configPath)
+		if r != nil {
+			return nil, r
+		}
+
+		if r := requirePreparedHost(obs); r != nil {
+			return nil, r
+		}
+
 		return retireRequestReport(ctx, m, in, obs)
 	}
 
@@ -121,6 +104,21 @@ func retireRequest(ctx context.Context, m retireMode) (any, *retireRefusal) {
 
 	defer root.release()
 	defer func() { _ = dir.Close() }()
+
+	// THE CONFIGURATION IS OBSERVED UNDER THE LOCK, because everything below
+	// rests on it: its digest is compared with the one the role read, its
+	// backend and controllers decide eligibility, and its identity directory
+	// is what the exclusion and the archive name.
+	obs, r := observeRetireConfig(m.configPath)
+	if r != nil {
+		return nil, r
+	}
+
+	if r := requirePreparedHost(obs); r != nil {
+		return nil, r
+	}
+
+	cfg := obs.cfg
 
 	// THE JOURNAL, RE-READ UNDER THE LOCK: a journal dispatches to a resume
 	// or the done handling, which follow in the next change; a request is
@@ -191,6 +189,29 @@ func retireRequest(ctx context.Context, m retireMode) (any, *retireRefusal) {
 	})
 }
 
+// requirePreparedHost is the retirement's prerequisite: an installer has
+// recorded the service account, so the global authority exclusion is in force
+// and the status a transition publishes means something to every other
+// writer. A legacy host is excluded by the identity directory's own lock,
+// which the archive moves, so there is nothing to close there.
+func requirePreparedHost(obs *installedConfigObservation) *retireRefusal {
+	class, err := retirement.Classify(obs.cfg.Server.IdentityDir)
+
+	switch {
+	case err != nil:
+		return retireUnknown(retireReasonIdentity, err.Error(), "")
+	case class.Mode != retirement.ModePrepared:
+		return retireRefuse(retireReasonIdentity, fmt.Sprintf("this host is %s: no service account is recorded at %s, so "+
+			"no global authority exclusion is in force and a retirement has nothing to close", class.Mode,
+			retirement.ServiceAccountPath()), "`billet local up` or the host role prepares the host")
+	case !class.Directory:
+		return retireRefuse(retireReasonIdentity, "the configured identity directory is absent, so there is nothing to "+
+			"retire", "the runbook in docs/operating/upgrades.md")
+	}
+
+	return nil
+}
+
 // requireNoJournalForRequest is the journal's own dispatch: a request is what
 // an absent journal admits, and a journal in any phase is a resume's, which
 // the next change adds.
@@ -224,14 +245,11 @@ func retireRequestReport(ctx context.Context, m retireMode, in *retireInput, obs
 		return nil, retireUnknown(retireReasonGuard, err.Error(), "")
 	}
 
-	switch {
-	case shape.Kind != claimGuard:
-		return nil, retireRefuse(retireReasonGuard, fmt.Sprintf("this host is not held by a converge guard (%s); a retirement "+
-			"runs under this converge's guard", shape), "")
-	case shape.RecordErr != "":
-		return nil, retireUnknown(retireReasonGuard, "the guard's record cannot be read: "+shape.RecordErr, "")
-	case shape.Guard.Holder != m.run:
-		return nil, retireRefuse(retireReasonGuard, fmt.Sprintf("the guard names %s, not %s", shape.Guard.Holder, m.run), "")
+	// THE SAME JUDGEMENT THE MUTATING RUN MAKES, over the shape read without
+	// the lock: a preview that reported a request the guard would refuse
+	// would be a lie the role acts on.
+	if r := judgeGuardShape(shape, m.run); r != nil {
+		return nil, r
 	}
 
 	identity, r := retireIdentity(cfg.Server.IdentityDir)
@@ -485,7 +503,13 @@ func checkRenderingCredentials(rendered *config.Config) *retireRefusal {
 	tlsCfg := rendered.Node.TLS
 
 	bundle, err := wirecert.LoadBundle(tlsCfg.CertPath, tlsCfg.KeyPath, tlsCfg.CAPath)
-	if err != nil {
+
+	switch {
+	case errors.Is(err, wirecert.ErrCredentialPolicy):
+		// A RULE REFUSED, not a read that failed: the node would refuse these
+		// credentials at its next start, and only an operator changes that.
+		return retireRefuse(retireReasonConfig, "the node's credentials are not ones it reads: "+err.Error(), "")
+	case err != nil:
 		return retireUnknown(retireReasonConfig, "read the node's credentials as the node reads them: "+err.Error(), "")
 	}
 

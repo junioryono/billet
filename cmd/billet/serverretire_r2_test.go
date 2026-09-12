@@ -495,3 +495,66 @@ func whyOf(m map[string]any) string {
 
 	return s
 }
+
+// AND THE DRAIN IS BOUNDED: a writer that never closes cannot hold an answer
+// this command has already decided. The deadline is shortened here; what it
+// proves is that there is one.
+func TestServerRetireDrainsUnderADeadline(t *testing.T) {
+	f := newRetireFixture(t)
+
+	saved := drainDeadline
+	drainDeadline = 200 * time.Millisecond
+
+	t.Cleanup(func() { drainDeadline = saved })
+
+	r, w, err := os.Pipe()
+	mustOK(t, err)
+
+	savedStdin := retireStdin
+	retireStdin = r
+
+	t.Cleanup(func() { retireStdin = savedStdin })
+
+	// A WRITER THAT NEVER STOPS: it ends when the test closes the read end.
+	stop := make(chan struct{})
+	writerDone := make(chan struct{})
+
+	go func() {
+		defer close(writerDone)
+		defer func() { _ = w.Close() }()
+
+		chunk := []byte(strings.Repeat("{", 64<<10))
+
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+
+			if _, err := w.Write(chunk); err != nil {
+				return
+			}
+		}
+	}()
+
+	answered := make(chan error, 1)
+
+	go func() {
+		answered <- cmdServer(t.Context(), nil, []string{"retire", "--json", "--config", f.cfg, "--input", "-",
+			"--run", "ci-1", "--retiring-host", "control-a"})
+	}()
+
+	select {
+	case err := <-answered:
+		if err == nil {
+			t.Fatal("the refusal was not answered")
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the drain never ended, so the answer never came")
+	}
+
+	close(stop)
+	mustOK(t, r.Close())
+	<-writerDone
+}

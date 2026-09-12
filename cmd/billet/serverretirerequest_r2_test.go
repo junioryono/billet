@@ -1,8 +1,12 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"strings"
@@ -40,6 +44,23 @@ func TestServerRetireRequestDryRunMutatesNothing(t *testing.T) {
 	if _, err := os.Lstat(retirement.RetiredDir()); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("the dry run created the retirement directory: %v", err)
 	}
+
+	// AND IT JUDGES THE GUARD AS THE REAL RUN DOES: a guard still in its
+	// acquirer's cleanup window is refused by the preview too, so a report
+	// never says a request would proceed where it would not.
+	settled := f.guard.record(t)
+	preparing := settled
+	preparing.Preparing = true
+	preparing.Token = strings.Repeat("a", 32)
+	writeGuardRecordForTest(t, f.guard, preparing)
+
+	out, code = f.request(t, f.input(t, nil), "--dry-run")
+	if m := retireAnswer(t, out); m["reason"] != retireReasonGuard || code != exitRefused ||
+		!strings.Contains(whyOf(m), "still preparing") {
+		t.Fatalf("a preview over a preparing guard: %s", out)
+	}
+
+	writeGuardRecordForTest(t, f.guard, settled)
 
 	// AND IT TAKES NOTHING: with the transaction lock held by another process
 	// the dry run still answers, because a preview holds this host for nobody.
@@ -307,14 +328,28 @@ func TestServerRetireRequestRefusesARenderingTheNodeCannotStart(t *testing.T) {
 		t.Fatalf("a foreign pair against this trust store: %s", out)
 	}
 
-	// A KEY THE LOADER REFUSES: the node reads a private key only from the
-	// path it was given and only when nobody else can read it.
-	writeFile(t, nodeTLSPathOf(t, f, "cert"), mustRead(t, filepath.Join(filepath.Dir(keyPath), "node.crt.orig")), 0o644)
+	// A KEY THE LOADER REFUSES, over a bundle that otherwise HOLDS: the node
+	// reads a private key only from the path it was given and only when
+	// nobody else can read it, so the mode is the one thing left to refuse.
+	writeFile(t, nodeTLSPathOf(t, f, "cert"), mustRead(t, nodeTLSPathOf(t, f, "cert")+".orig"), 0o644)
+	writeFile(t, keyPath, mustRead(t, keyPath+".orig"), 0o600)
 	mustOK(t, os.Chmod(keyPath, 0o644))
 
 	out, code = f.retainedRequest(t, f.input(t, f.retainedOverrides(t)))
+	if m := retireAnswer(t, out); m["reason"] != retireReasonConfig || code != exitRefused ||
+		!strings.Contains(whyOf(m), "not ones it reads") || !strings.Contains(whyOf(m), "chmod 600") {
+		t.Fatalf("a group-readable key is a rule refused, not a read that failed: %s", out)
+	}
+
+	mustOK(t, os.Chmod(keyPath, 0o600))
+
+	// AND A KEY THAT IS GONE is a read that failed: could-not-tell.
+	mustOK(t, os.Remove(keyPath))
+	mustOK(t, os.Remove(keyPath+".orig"))
+
+	out, code = f.retainedRequest(t, f.input(t, f.retainedOverrides(t)))
 	if m := retireAnswer(t, out); m["reason"] != retireReasonConfig || code != exitUnknown {
-		t.Fatalf("a group-readable key: %s", out)
+		t.Fatalf("a removed key is could-not-tell: %s", out)
 	}
 }
 
@@ -407,5 +442,98 @@ func TestServerRetireRequestHoldsTheRoundsBoundaries(t *testing.T) {
 	out, code = f4.request(t, f4.input(t, map[string]any{"self": self}))
 	if m := retireAnswer(t, out); m["reason"] != retireReasonReportStale || code != exitRefused {
 		t.Fatalf("a report collected before the round: %s", out)
+	}
+}
+
+// writeGuardRecordForTest writes a guard record as the command writes it, for
+// a case that needs a shape the command does not produce.
+func writeGuardRecordForTest(t *testing.T, f *guardFixture, rec guardRecord) {
+	t.Helper()
+
+	body, err := json.Marshal(rec)
+	mustOK(t, err)
+	mustOK(t, os.WriteFile(filepath.Join(f.active(), guardRecordName), body, 0o600))
+}
+
+// THE MUTATING REQUEST OBSERVES THE CONFIGURATION UNDER THE TRANSACTION LOCK,
+// and this is a STRUCTURAL witness because no schedule can show it: the lock
+// is taken non-blocking, so a contender never waits inside the window an
+// observation made before it would open. What the window costs is a request
+// that judges bytes another converge has already replaced, and the only proof
+// available is the order of the calls themselves.
+func TestServerRetireRequestObservesTheConfigurationUnderTheLock(t *testing.T) {
+	fset := token.NewFileSet()
+
+	file, err := parser.ParseFile(fset, "serverretirerequest.go", nil, 0)
+	mustOK(t, err)
+
+	var body *ast.BlockStmt
+
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if ok && fn.Name.Name == "retireRequest" {
+			body = fn.Body
+		}
+	}
+
+	if body == nil {
+		t.Fatal("retireRequest is gone")
+	}
+
+	guard, observe := -1, -1
+
+	ast.Inspect(body, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+
+		name, ok := call.Fun.(*ast.Ident)
+		if !ok {
+			return true
+		}
+
+		// The LAST occurrence of each in the function body: the preview's own
+		// observation comes first and is the one that takes nothing.
+		switch name.Name {
+		case "retireGuard":
+			guard = int(call.Pos())
+		case "observeRetireConfig":
+			if int(call.Pos()) > guard {
+				observe = int(call.Pos())
+			}
+		}
+
+		return true
+	})
+
+	switch {
+	case guard < 0:
+		t.Fatal("retireRequest takes no guard")
+	case observe < 0:
+		t.Fatal("retireRequest never observes the configuration after taking the guard")
+	case observe < guard:
+		t.Fatal("retireRequest observes the configuration before it takes the transaction lock")
+	}
+}
+
+// AND THE DIGEST THE ROLE READ IS COMPARED WITH THE BYTES THE REQUEST JUDGES:
+// a configuration replaced between the role's read and the request refuses
+// rather than recording a decision about bytes that are gone.
+func TestServerRetireRequestRefusesAConfigurationThatMoved(t *testing.T) {
+	f := newRequestFixture(t)
+	f.reserve(t)
+
+	installed := mustRead(t, f.cfg)
+	digest := f.installedSHA(t)
+
+	writeFile(t, f.cfg, strings.Replace(installed, "max_vcpu: 8", "max_vcpu: 16", 1), 0o600)
+
+	out, code := f.run(t, f.input(t, nil), "--input", "-", "--run", requestRun, "--retiring-host", requestRetiring,
+		"--survivor-host", requestSurvivor, "--server-only", "--installed-sha256", digest)
+
+	if m := retireAnswer(t, out); m["reason"] != retireReasonConfig || code != exitRefused ||
+		!strings.Contains(whyOf(m), "moved since the role read it") {
+		t.Fatalf("a configuration that moved: %s", out)
 	}
 }

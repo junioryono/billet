@@ -394,12 +394,37 @@ func drainedBefore(m retireMode, r *retireRefusal) *retireRefusal {
 	// TO EOF, not to the input's bound: what must not happen is a writer left
 	// on a closed pipe, and the bound says nothing about how much it will
 	// write. Nothing is retained.
+	//
+	// UNDER A DEADLINE OF ITS OWN, because the answer is already decided and a
+	// writer that never closes would hold it forever: an interruptible read is
+	// what a pipe gives (a regular file has an end of its own and refuses the
+	// deadline, which is not an error here).
+	if f, ok := retireStdin.(*os.File); ok {
+		// THE WALL CLOCK, never the record clock the tests pin: this is an I/O
+		// bound and not a fact about the retirement.
+		// A READER THAT REFUSES A DEADLINE is a regular file, which ends on its
+		// own; the drain then runs unbounded and correctly.
+		if err := f.SetReadDeadline(time.Now().Add(drainDeadline)); err == nil {
+			defer func() {
+				if err := f.SetReadDeadline(time.Time{}); err != nil {
+					r.Why += "; and clearing stdin's deadline: " + err.Error()
+				}
+			}()
+		}
+	}
+
 	if _, err := io.Copy(io.Discard, retireStdin); err != nil {
 		r.Why += "; and draining stdin: " + err.Error()
 	}
 
 	return r
 }
+
+// drainDeadline bounds the drain of an input this command has already
+// answered: a collector writes its request in seconds, and past this the
+// answer matters more than the courtesy. A variable so a test can shorten the
+// bound it proves; production reads the constant value.
+var drainDeadline = 30 * time.Second
 
 // readRetireDocument reads one JSON document from stdin, whole, bounded, before
 // anything is examined. A document past the bound is DRAINED to EOF and then
@@ -443,29 +468,7 @@ func retireGuard(run string) (*txLock, *os.File, claimShape, *retireRefusal) {
 		return nil, nil, claimShape{}, retireUnknown(retireReasonGuard, err.Error(), "")
 	}
 
-	var r *retireRefusal
-
-	switch {
-	case shape.Kind != claimGuard:
-		r = retireRefuse(retireReasonGuard, fmt.Sprintf("this host is not held by a converge guard (%s); a retirement runs "+
-			"under this converge's guard", shape), "")
-	case shape.RecordErr != "":
-		r = retireUnknown(retireReasonGuard, "the guard's record cannot be read: "+shape.RecordErr, "")
-	case shape.Guard.Holder != run:
-		r = retireRefuse(retireReasonGuard, fmt.Sprintf("the guard names %s, not %s", shape.Guard.Holder, run), "")
-	case shape.Pointer:
-		r = retireRefuse(retireReasonGuard, "the guard carries a binary transaction's pointer; a retirement never "+
-			"runs inside a binary transaction", "")
-	case shape.Guard.Preparing:
-		// The acquirer's cleanup window is still open: a cleanup release could
-		// take the guard away under the retirement's first mutation.
-		r = retireRefuse(retireReasonGuard, "the guard is still preparing; settle it (`converge-guard settle`) before "+
-			"a retirement mutates anything under it", "")
-	case shape.StrayTemporary:
-		r = retireUnknown(retireReasonGuard, "the guard carries an interrupted rewrite (guard.json.tmp); recover it "+
-			"before a retirement runs under it", "")
-	}
-
+	r := judgeGuardShape(shape, run)
 	if r != nil {
 		if dir != nil {
 			_ = dir.Close()
@@ -477,6 +480,35 @@ func retireGuard(run string) (*txLock, *os.File, claimShape, *retireRefusal) {
 	}
 
 	return root, dir, shape, nil
+}
+
+// judgeGuardShape is what a retirement requires of a guard, whether the
+// caller holds the transaction lock or is only reporting: this converge's
+// guard, its record readable, no binary transaction's pointer, its acquirer's
+// cleanup window closed and no interrupted rewrite beside it.
+func judgeGuardShape(shape claimShape, run string) *retireRefusal {
+	switch {
+	case shape.Kind != claimGuard:
+		return retireRefuse(retireReasonGuard, fmt.Sprintf("this host is not held by a converge guard (%s); a retirement runs "+
+			"under this converge's guard", shape), "")
+	case shape.RecordErr != "":
+		return retireUnknown(retireReasonGuard, "the guard's record cannot be read: "+shape.RecordErr, "")
+	case shape.Guard.Holder != run:
+		return retireRefuse(retireReasonGuard, fmt.Sprintf("the guard names %s, not %s", shape.Guard.Holder, run), "")
+	case shape.Pointer:
+		return retireRefuse(retireReasonGuard, "the guard carries a binary transaction's pointer; a retirement never "+
+			"runs inside a binary transaction", "")
+	case shape.Guard.Preparing:
+		// The acquirer's cleanup window is still open: a cleanup release could
+		// take the guard away under the retirement's first mutation.
+		return retireRefuse(retireReasonGuard, "the guard is still preparing; settle it (`converge-guard settle`) before "+
+			"a retirement mutates anything under it", "")
+	case shape.StrayTemporary:
+		return retireUnknown(retireReasonGuard, "the guard carries an interrupted rewrite (guard.json.tmp); recover it "+
+			"before a retirement runs under it", "")
+	}
+
+	return nil
 }
 
 // observeRetireConfig reads the installed configuration ONCE, under the
