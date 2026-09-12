@@ -88,6 +88,14 @@ func retireRequest(ctx context.Context, m retireMode) (any, *retireRefusal) {
 	// the guard and the records where they lie, judges the same request and
 	// reports. The lock and the guard belong to a run that will write.
 	if m.dryRun {
+		// THE JOURNAL FIRST: a preview describes a REQUEST, and a host with a
+		// transition under way may have no configuration left to read at all,
+		// so judging the configuration before the journal answers about the
+		// wrong thing.
+		if r := requireNoJournalForRequest(); r != nil {
+			return nil, r
+		}
+
 		obs, r := observeRetireConfig(m.configPath)
 		if r != nil {
 			return nil, r
@@ -122,21 +130,38 @@ func retireRequest(ctx context.Context, m retireMode) (any, *retireRefusal) {
 		return nil, r
 	}
 
-	// EVERY REFUSAL FROM HERE TO THE TRANSITION SAYS WHAT THE JOURNAL
-	// ESTABLISHED. A host with a retirement at `stopped` is not one where
-	// nothing has happened, whatever it is that then refuses — an unreachable
-	// ledger, a configuration that moved, an exclusion another writer holds —
-	// and `nothing` would send an operator looking for a host in a state it is
-	// not in. A run with no journal keeps `nothing`. Nothing between here and
-	// the transition can answer `unknown`: the two places that can are the
-	// journal's own read, which is above this, and the phase writer, whose
-	// answer the transition's caller carries.
+	// EVERY REFUSAL FROM HERE TO THE TRANSITION SAYS WHAT THE HOST HOLDS WHEN
+	// IT REFUSES. A retirement at `stopped` is not a host where nothing has
+	// happened, whatever then refuses — an unreachable ledger, a configuration
+	// that moved, an exclusion another writer holds — and `nothing` would send
+	// an operator looking for a state the host is not in. IT IS READ AND NOT
+	// REMEMBERED, because this run may have written the journal itself: a
+	// request that records its intent and then fails to advance the row, to
+	// publish the status or to release the exclusion has left `intent` behind,
+	// and the fact this run started with says absent. A journal that cannot be
+	// read then is could-not-tell, never `nothing`.
 	at := func(r *retireRefusal) *retireRefusal {
-		if r == nil || journalFact == retirement.JournalFactAbsent {
-			return r
+		if r == nil {
+			return nil
 		}
 
-		return atRetirePhase(j, r)
+		// THE READ'S OWN ERROR IS NOT THIS ANSWER'S: what refused is already in
+		// the refusal, and all this adds is which phase the host stands at.
+		now, presence, err := retirement.ReadJournal()
+		if err != nil && presence == retirement.JournalPresent {
+			presence = retirement.JournalUnreadable
+		}
+
+		switch presence {
+		case retirement.JournalAbsent:
+			return r
+		case retirement.JournalPresent:
+			return atRetirePhase(now, r)
+		default:
+			r.State = retireStateUnknown
+
+			return r
+		}
 	}
 
 	// THE CONFIGURATION IS OBSERVED UNDER THE LOCK, because everything below
@@ -477,8 +502,9 @@ func requireNoJournalForRequest() *retireRefusal {
 		return nil
 	}
 
-	return retireUnknown(retireReasonPhase, fmt.Sprintf("a retirement journal exists at %s (transition %s); a dry run "+
-		"describes a request and does not judge a transition already under way", j.Phase, j.Provenance.TransitionID), "")
+	return atRetirePhase(j, retireUnknown(retireReasonPhase, fmt.Sprintf("a retirement journal exists at %s (transition "+
+		"%s); a dry run describes a request and does not judge a transition already under way", j.Phase,
+		j.Provenance.TransitionID), ""))
 }
 
 // retireRequestReport is the dry run over a request: nothing is taken and
@@ -487,10 +513,6 @@ func requireNoJournalForRequest() *retireRefusal {
 func retireRequestReport(ctx context.Context, m retireMode, in *retireInput, obs *installedConfigObservation,
 ) (any, *retireRefusal) {
 	cfg := obs.cfg
-
-	if r := requireNoJournalForRequest(); r != nil {
-		return nil, r
-	}
 
 	shape, err := classifyClaim()
 	if err != nil {

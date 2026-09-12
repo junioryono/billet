@@ -1516,3 +1516,100 @@ func TestARefusalPastTheJournalNamesThePhaseTheHostReached(t *testing.T) {
 		}
 	})
 }
+
+// A REQUEST THAT RECORDED ITS INTENT AND THEN FAILED SAYS `intent`, not
+// `nothing`. The fact the run started with — no journal on this host — is not
+// what the host holds once the run has written one, and a refusal that said
+// `nothing` would send an operator to a host in another state entirely.
+func TestARequestThatRecordedItsIntentAndFailedSaysIntent(t *testing.T) {
+	f := newRequestFixture(t)
+	f.reserve(t)
+
+	// The status is the intent's last write: the journal and the row are
+	// already at `intent` when it fails.
+	retirement.Publishing = func(path string) error {
+		if path == retirement.StatusPath() {
+			return errors.New("the status could not be published")
+		}
+
+		return nil
+	}
+
+	t.Cleanup(func() { retirement.Publishing = nil })
+
+	out, code := f.request(t, f.input(t, nil))
+
+	m := retireAnswer(t, out)
+	if code != exitUnknown || m["reason"] != retireReasonStatus || m["state"] != string(retirement.PhaseIntent) {
+		t.Fatalf("a request that recorded its intent and then failed: %s", out)
+	}
+
+	j, presence, err := retirement.ReadJournal()
+	if err != nil || presence != retirement.JournalPresent || j.Phase != retirement.PhaseIntent {
+		t.Fatalf("the journal: %+v %d %v", j, presence, err)
+	}
+}
+
+// AND A DRY RUN READS THE JOURNAL BEFORE THE CONFIGURATION, saying what it
+// found: a preview describes a REQUEST, and a host with a transition under way
+// may have no configuration left to read, so judging that first answers about
+// the wrong thing.
+func TestADryRunJudgesTheJournalFirstAndNamesItsPhase(t *testing.T) {
+	f := newRequestFixture(t)
+	f.reserve(t)
+
+	f.plantJournal(t, retirement.PhaseStopped, retirement.VariantServerOnly)
+	markGuard(t, f.guard, &guardTransition{Kind: transitionRetirement, ID: retireTestID}, nil)
+	advanceRowToIntent(t, f)
+
+	in, digest := f.input(t, nil), f.installedSHA(t)
+
+	// The configuration is gone, as a retiring host's eventually is: a preview
+	// that read it first would answer about a missing file.
+	mustOK(t, os.Remove(f.cfg))
+
+	out, code := f.run(t, in, "--input", "-", "--run", requestRun, "--retiring-host", requestRetiring,
+		"--survivor-host", requestSurvivor, "--server-only", "--installed-sha256", digest, "--dry-run")
+
+	m := retireAnswer(t, out)
+	if code != exitUnknown || m["reason"] != retireReasonPhase || m["state"] != string(retirement.PhaseStopped) ||
+		!strings.Contains(whyOf(m), "a dry run describes a request") {
+		t.Fatalf("a preview over a transition under way: %s", out)
+	}
+
+	// AND IT TOOK NOTHING: the guard's record is untouched and no status was
+	// published by it.
+	if rec := f.guard.record(t); rec.Transition == nil || rec.Transition.ID != retireTestID {
+		t.Fatalf("the dry run changed the guard's marker: %+v", rec.Transition)
+	}
+}
+
+// AND A JOURNAL THAT CANNOT BE READ WHEN THE REFUSAL IS MADE IS `unknown`: the
+// run wrote one, so `nothing` is false, and what phase it now holds is exactly
+// what could not be established.
+func TestARefusalOverAnUnreadableJournalSaysUnknown(t *testing.T) {
+	f := newRequestFixture(t)
+	f.reserve(t)
+
+	retirement.Publishing = func(path string) error {
+		if path != retirement.StatusPath() {
+			return nil
+		}
+
+		// The journal is written by now, and its mode moves under the refusal
+		// that is about to be made: a mode billet does not write is untrusted,
+		// which is could-not-tell and never an absence.
+		mustOK(t, os.Chmod(retirement.JournalPath(), 0o644))
+
+		return errors.New("the status could not be published")
+	}
+
+	t.Cleanup(func() { retirement.Publishing = nil })
+
+	out, code := f.request(t, f.input(t, nil))
+
+	m := retireAnswer(t, out)
+	if code != exitUnknown || m["state"] != "unknown" {
+		t.Fatalf("a refusal over a journal nothing could read: %s", out)
+	}
+}
