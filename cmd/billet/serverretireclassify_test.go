@@ -1,8 +1,11 @@
 package main
 
 import (
+	"context"
 	"os"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/retirement"
 	"github.com/junioryono/billet/internal/state"
@@ -34,6 +37,10 @@ func TestTheDryRunClassifiesARetiredHostRatherThanRefusingIt(t *testing.T) {
 
 	if m["config"] != "absent" {
 		t.Fatalf("the configuration was not reported as absent: %s", out)
+	}
+
+	if m["status_presence"] != "present" || asMap(m["status"])["phase"] != string(retirement.PhaseDone) {
+		t.Fatalf("the published status was not reported as present at done: %s", out)
 	}
 
 	// THE STATE IS THE HOST'S, read when the report is made. Pinned to
@@ -191,5 +198,196 @@ func TestTheDryRunStillCreatesNothing(t *testing.T) {
 		if _, err := os.Lstat(path); !os.IsNotExist(err) {
 			t.Fatalf("the dry run created %s: %v", path, err)
 		}
+	}
+}
+
+// THE STATUS IS A PUBLICATION THE JOURNAL CAN REPAIR. Refusing its damaged
+// bytes would keep the caller from reaching the settled journal that tells
+// the next run what to publish; the classifier reports the damage and leaves
+// the bytes alone.
+func TestTheDryRunReportsAMalformedStatusBesideASettledJournal(t *testing.T) {
+	f := newRequestFixture(t)
+	f.reserve(t)
+
+	settleRetirement(t, f)
+
+	body := `{"phase":"damaged","variant":"server-only","updated_at":"2026-09-11T10:00:00Z"}` + "\n"
+	writeFile(t, retirement.StatusPath(), body, 0o644)
+
+	out, code := f.run(t, "", "--dry-run", "--retiring-host", requestRetiring)
+
+	m := retireAnswer(t, out)
+	if code != 0 || m["outcome"] != retireOutcomeReported {
+		t.Fatalf("a repairable publication refused the classifier: %s", out)
+	}
+
+	if m["status_presence"] != "malformed" || m["status"] != nil {
+		t.Fatalf("the damaged status was not reported as malformed: %s", out)
+	}
+
+	why, ok := m["status_why"].(string)
+	if !ok || !strings.Contains(why, `names the phase "damaged", which this billet does not know`) {
+		t.Fatalf("the status reader's diagnostic was lost: %s", out)
+	}
+
+	journal := asMap(m["journal"])
+	if journal["phase"] != string(retirement.PhaseDone) || journal["settled"] != true ||
+		journal["transition_id"] != retireTestID {
+		t.Fatalf("the publication hid the settled journal: %s", out)
+	}
+
+	if m["row_fact"] != string(retirement.RowDoneMine) {
+		t.Fatalf("the publication stopped the row observation: %s", out)
+	}
+
+	after, err := os.ReadFile(retirement.StatusPath())
+	mustOK(t, err)
+
+	if string(after) != body {
+		t.Fatalf("the classifier repaired the status: %s", after)
+	}
+}
+
+// A READ THAT FAILED IS NOT BYTES THAT DID NOT PARSE. A directory at the
+// status path is refused by the regular-file reader on both platforms, even
+// as root; chmod would not establish an unreadable file for that account.
+func TestTheDryRunStillRefusesAnUnreadableStatus(t *testing.T) {
+	f := newRetireFixture(t)
+	f.journalAt(t, retirement.PhaseIntent, "ci-1")
+
+	mustOK(t, os.Mkdir(retirement.StatusPath(), 0o700))
+
+	_, presence, err := retirement.ReadStatus()
+	if presence != retirement.StatusUnreadable || err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("the status was not unreadable, so this case proves nothing: %d %v", presence, err)
+	}
+
+	out, code := f.run(t, "", "--dry-run", "--retiring-host", "control-a")
+
+	m := retireAnswer(t, out)
+	if code != exitUnknown || m["outcome"] != retireOutcomeUnknown || m["reason"] != retireReasonStatus {
+		t.Fatalf("an unreadable status did not refuse: %s", out)
+	}
+
+	why, ok := m["why"].(string)
+	if !ok || !strings.Contains(why, "the authority status could not be judged:") ||
+		!strings.Contains(why, "not a regular file") {
+		t.Fatalf("the failed read's diagnostic was lost: %s", out)
+	}
+}
+
+// THE JOURNAL NAMES THE PARTICIPANTS, even when today's inventory names
+// someone else. A standalone dry run admits no --survivor-host, so this calls
+// the classifier with both operands set to prove neither supplies the record.
+func TestTheDryRunReportsTheJournalsHostsRatherThanTheInvocations(t *testing.T) {
+	f := newRetireFixture(t)
+	f.journalAt(t, retirement.PhaseIntent, "ci-1")
+
+	answer, refusal := retireDryRun(t.Context(), retireMode{configPath: f.cfg,
+		retiringHost: "inventory-retiring", survivorHost: "inventory-survivor"})
+	if refusal != nil {
+		t.Fatalf("the classifier refused the journal: %+v", refusal)
+	}
+
+	report, ok := answer.(*retireReport)
+	if !ok || report.Outcome != retireOutcomeReported || report.Journal == nil {
+		t.Fatalf("the classifier did not report the journal: %+v", answer)
+	}
+
+	if report.Journal.Retiring != "control-a" || report.Journal.Survivor != "control-b" {
+		t.Fatalf("the reported hosts are not the journal's: %+v", report.Journal)
+	}
+
+	// THE JSON IS WHAT THE ROLE READS; the typed answer alone cannot prove
+	// the member names it needs are published.
+	out, code := f.run(t, "", "--dry-run", "--retiring-host", "inventory-retiring")
+	m := retireAnswer(t, out)
+	journal := asMap(m["journal"])
+
+	if code != 0 || m["outcome"] != retireOutcomeReported || journal["retiring"] != "control-a" ||
+		journal["survivor"] != "control-b" {
+		t.Fatalf("the journal's hosts did not reach the command's answer: %s", out)
+	}
+
+	if m["status_presence"] != "absent" || m["status"] != nil {
+		t.Fatalf("an absent status was not reported as absent: %s", out)
+	}
+}
+
+// ONE BOUND COVERS EITHER ROUTE TO THE ROW. Its expiry leaves a local journal
+// visible and the command successful, because a caller can recover from that
+// record without the ledger; a deadline is never evidence of an absent row.
+func TestTheDryRunReportsTheJournalWhenTheRowObservationBoundEnds(t *testing.T) {
+	for _, locator := range []bool{false, true} {
+		name := "through the configuration"
+		if locator {
+			name = "through the settled journal's locator"
+		}
+
+		t.Run(name, func(t *testing.T) {
+			var f *retireFixture
+
+			phase := retirement.PhaseIntent
+			if locator {
+				request := newRequestFixture(t)
+				request.reserve(t)
+				settleRetirement(t, request)
+				f, phase = request.retireFixture, retirement.PhaseDone
+			} else {
+				f = newRetireFixture(t)
+				f.journalAt(t, phase, "ci-1")
+			}
+
+			saved := retireReportLedgerBound
+			retireReportLedgerBound = -time.Nanosecond
+
+			t.Cleanup(func() { retireReportLedgerBound = saved })
+
+			out, code := f.run(t, "", "--dry-run", "--retiring-host", "control-a")
+
+			m := retireAnswer(t, out)
+			if code != 0 || m["outcome"] != retireOutcomeReported || m["row_fact"] != string(retirement.RowUnreadable) ||
+				m["row"] != nil {
+				t.Fatalf("an expired row observation stopped the report or answered a row: %s", out)
+			}
+
+			why, ok := m["why"].(string)
+			if !ok || !strings.Contains(why, "the retirement row observation exceeded retireReportLedgerBound (-1ns)") {
+				t.Fatalf("the row's unreadability did not name its bound: %s", out)
+			}
+
+			journal := asMap(m["journal"])
+			if journal["phase"] != string(phase) || journal["settled"] != locator || journal["transition_id"] != retireTestID {
+				t.Fatalf("the row's deadline hid the local journal: %s", out)
+			}
+		})
+	}
+}
+
+// THE CALLER'S ENDING IS ITS OWN FACT. A cancelled caller must not be told
+// the ledger spent the report's budget when that budget is still available.
+func TestTheDryRunDistinguishesTheCallersCancellationFromItsRowBound(t *testing.T) {
+	f := newRetireFixture(t)
+	f.journalAt(t, retirement.PhaseIntent, "ci-1")
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	answer, refusal := retireDryRun(ctx, retireMode{configPath: f.cfg, retiringHost: "control-a"})
+	if refusal != nil {
+		t.Fatalf("the row's cancellation refused the local report: %+v", refusal)
+	}
+
+	report, ok := answer.(*retireReport)
+	if !ok || report.Outcome != retireOutcomeReported || report.RowFact != retirement.RowUnreadable || report.Row != nil {
+		t.Fatalf("a cancelled row observation answered a row: %+v", answer)
+	}
+
+	if !strings.Contains(report.Why, "the caller's context ended") || strings.Contains(report.Why, "retireReportLedgerBound") {
+		t.Fatalf("the caller's cancellation was called the report's bound: %s", report.Why)
+	}
+
+	if report.Journal == nil || report.Journal.Phase != retirement.PhaseIntent {
+		t.Fatalf("the caller's cancellation hid the local journal: %+v", report.Journal)
 	}
 }
