@@ -174,8 +174,17 @@ func retireRequestUnder(ctx context.Context, m retireMode) (any, *retireRefusal)
 		return retireDone(ctx, m, root, dir, shape, j)
 	}
 
-	if r := refuseResumePastTheArchive(j, journalFact); r != nil {
+	// AND A TRANSITION PAST THE ARCHIVE IS RESUMED FROM THE JOURNAL TOO. The
+	// identity directory has moved and a server-only host's configuration is
+	// gone or about to be, so the ordinary path below — which reads both from
+	// the installed configuration — has nothing to read.
+	past, r := retireResumeIsPastTheArchive(j, journalFact)
+	if r != nil {
 		return nil, r
+	}
+
+	if past {
+		return retireResumeArchived(ctx, m, root, dir, shape, j)
 	}
 
 	// THE CONFIGURATION IS OBSERVED UNDER THE LOCK, because everything below
@@ -366,21 +375,7 @@ func validateRetireJournal(j *retirement.Journal, m retireMode, shape claimShape
 		return retireUnknown(retireReasonJournal, err.Error(), "the runbook in docs/operating/upgrades.md")
 	}
 
-	// THE MARKER IS REQUIRED, not merely consistent: it is what keeps the
-	// guard from being released under a transition that has stopped a server
-	// and moved an identity, and a resume without one is a host whose guard
-	// somebody could take away mid-transition.
-	if shape.Guard.Transition == nil {
-		return retireUnknown(retireReasonMarker, fmt.Sprintf("the retirement at %s carries no marker on this converge's "+
-			"guard, so the guard could be released under it", j.Phase), "the runbook in docs/operating/upgrades.md")
-	}
-
-	if shape.Guard.Transition.ID != j.Provenance.TransitionID {
-		return retireUnknown(retireReasonMarker, fmt.Sprintf("the guard's marker names transition %s and the journal "+
-			"names %s; the marker is kept", shape.Guard.Transition.ID, j.Provenance.TransitionID), "")
-	}
-
-	return nil
+	return requireRetireMarker(shape, *j)
 }
 
 // requirePreparedHost is the retirement's prerequisite: an installer has
@@ -404,46 +399,6 @@ func requirePreparedHost(obs *installedConfigObservation) *retireRefusal {
 	}
 
 	return nil
-}
-
-// refuseResumePastTheArchive is this binary's boundary for an INCOMPLETE
-// transition: a resume is admitted while the host still holds what the request
-// read — the configured identity directory and an installed configuration with
-// a server section. Past the archive both are gone by design, and the reader
-// that drives the remaining phases from the journal's locator alone is the
-// next change; such a host is refused by name, with nothing touched, until
-// then. A journal at `done` is past this boundary: it is answered from the
-// journal itself, above.
-func refuseResumePastTheArchive(j retirement.Journal, fact retirement.JournalFact) *retireRefusal {
-	if fact != retirement.JournalFactIncomplete {
-		return nil
-	}
-
-	if j.Phase != retirement.PhaseStopped {
-		return atRetirePhase(j, retireUnknown(retireReasonPhase, fmt.Sprintf("this host's retirement is at %s, past the "+
-			"archive: resuming it reads the identity and the ledger from the journal's locator (%s), which is not in "+
-			"this binary yet", j.Phase, j.Locator.Archive), "the runbook in docs/operating/upgrades.md"))
-	}
-
-	// A JOURNAL AT `stopped` WHOSE MOVE ALREADY COMPLETED is the same host: the
-	// phase says the identity is at its configured path and the filesystem says
-	// it is at the archive, which is the remainder of an interruption between
-	// the rename and the phase. The driver handles it; the command cannot reach
-	// it yet, because the exclusion and the identity it would read are inside
-	// the directory that has moved.
-	moved, err := retireDirPresent(j.Archive)
-	if err != nil {
-		return atRetirePhase(j, retireUnknown(retireReasonIdentity, err.Error(), ""))
-	}
-
-	if !moved {
-		return nil
-	}
-
-	return atRetirePhase(j, retireUnknown(retireReasonPhase, fmt.Sprintf("this host's retirement is at %s and its "+
-		"identity is already at %s: the move completed before its phase could be written, and resuming from there reads "+
-		"the identity and the ledger from the journal's locator, which is not in this binary yet", j.Phase, j.Archive),
-		"the runbook in docs/operating/upgrades.md"))
 }
 
 // atRetirePhase says what the host holds on a refusal that read a journal: the
