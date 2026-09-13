@@ -243,20 +243,27 @@ func (l *Listener) rememberAvailable(ctx context.Context, msg *Message) error {
 	if l.arbiter == nil {
 		return nil
 	}
-	if msg.Statistics != nil && msg.Statistics.TotalAvailableJobs == 0 {
-		clear(l.waitingOffers)
-	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	for _, job := range msg.Available {
-		identified, err := l.identifyAssigned(ctx, job)
+	// Identity resolution can write the ledger; heartbeatPass must remain able
+	// to take l.mu while a batch waits for those transactions.
+	identified := make([]Job, len(msg.Available))
+	for i, job := range msg.Available {
+		var err error
+		identified[i], err = l.identifyAssigned(ctx, job)
 		if err != nil {
 			return err
 		}
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if msg.Statistics != nil && msg.Statistics.TotalAvailableJobs == 0 {
+		clear(l.waitingOffers)
+	}
+	for i, job := range msg.Available {
 		// A REPEATED OFFER DOES NOT CREATE A SECOND BACKLOG ENTRY. reserve
 		// uses durable identities even when the wire request id is zero. Resolve
 		// before publishing demand, which could revoke a peer's discovery turn.
-		if l.acquiring[identified.RequestID] != nil || l.running[identified.RequestID] != nil {
+		if l.acquiring[identified[i].RequestID] != nil || l.running[identified[i].RequestID] != nil {
 			continue
 		}
 		l.waitingOffers[identityOfOffer(job)] = true

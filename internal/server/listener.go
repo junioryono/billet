@@ -3075,8 +3075,7 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 	for i := range msg.Completed {
 		job := msg.Completed[i]
 		job.CompletionID = msg.MessageID
-		var err error
-		job, err = l.identifyCompletion(ctx, job)
+		job, actual, err := l.identifyCompletion(ctx, job)
 		if err != nil {
 			if errors.Is(err, errQuarantinableCompletion) {
 				poisoned = append(poisoned, err)
@@ -3088,12 +3087,7 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 		}
 		// Offers name the actual job; cleanup names the runner's launch request.
 		// Only a validated completion with a job identity can suppress an offer.
-		actual := msg.Completed[i]
-		if actual.RequestID != 0 || actual.JobID != "" {
-			actual, err = l.identifyAssigned(ctx, actual)
-			if err != nil {
-				return err
-			}
+		if actual.RequestID != 0 {
 			finishedOffers[actual.RequestID] = struct{}{}
 		}
 		completed = append(completed, job)
@@ -3609,15 +3603,27 @@ func (l *Listener) identifyStarted(ctx context.Context, job Job) (Job, error) {
 	return identified, nil
 }
 
-// identifyCompletion resolves a zero wire id through the runner's lease, or
-// through job id when there is no durable lease identity to recover.
-func (l *Listener) identifyCompletion(ctx context.Context, job Job) (Job, error) {
+// identifyCompletion returns the cleanup identity and an optional actual job
+// identity. A zero actual request id means no offer can be suppressed.
+func (l *Listener) identifyCompletion(ctx context.Context, job Job) (Job, Job, error) {
+	actual := job
 	if job.RunnerName == "" && job.RequestID != 0 {
-		return job, nil
+		return job, actual, nil
 	}
 	if l.alloc == nil {
-		return Job{}, fmt.Errorf("%w: %s completed runner %q without a request id, and no ledger is available to resolve it",
+		return Job{}, Job{}, fmt.Errorf("%w: %s completed runner %q without a request id, and no ledger is available to resolve it",
 			ErrUntrustworthySession, l.tier, job.RunnerName)
+	}
+
+	if actual.RequestID == 0 && actual.JobID != "" {
+		requestID, exists, err := l.alloc.DirectJobIdentity(ctx, actual.JobID)
+		if err != nil {
+			return Job{}, Job{}, fmt.Errorf("%w: %s cannot resolve completed job %q: %w",
+				ErrUntrustworthySession, l.tier, actual.JobID, err)
+		}
+		if exists {
+			actual.RequestID = requestID
+		}
 	}
 
 	// THE RUNNER, NOT runnerRequestId, IS THE COMPUTE IDENTITY. The request id
@@ -3627,33 +3633,38 @@ func (l *Listener) identifyCompletion(ctx context.Context, job Job) (Job, error)
 		switch {
 		case err == nil:
 			if binding.Tier != l.tier || binding.LaunchRequestID == 0 {
-				return Job{}, fmt.Errorf("%w: completed runner %q belongs to tier %q",
+				return Job{}, Job{}, fmt.Errorf("%w: completed runner %q belongs to tier %q",
 					ErrUntrustworthySession, job.RunnerName, binding.Tier)
 			}
 			if err := l.restorePoolLease(ctx, binding); err != nil {
-				return Job{}, err
+				return Job{}, Job{}, err
 			}
-			if binding.Status == alloc.PoolRunnerBusy {
+			if binding.ActualRequestID != 0 || binding.JobID != "" {
 				if job.JobID != "" && binding.JobID != "" && job.JobID != binding.JobID {
-					return Job{}, fmt.Errorf("%w: completed runner %q names job %q after starting %q",
+					return Job{}, Job{}, fmt.Errorf("%w: completed runner %q names job %q after starting %q",
 						ErrUntrustworthySession, job.RunnerName, job.JobID, binding.JobID)
 				}
 				if job.RequestID != 0 && binding.ActualRequestID != 0 &&
 					job.RequestID != binding.ActualRequestID {
-					return Job{}, fmt.Errorf("%w: completed runner %q names request %d after starting %d",
+					return Job{}, Job{}, fmt.Errorf("%w: completed runner %q names request %d after starting %d",
 						ErrUntrustworthySession, job.RunnerName, job.RequestID, binding.ActualRequestID)
 				}
 			}
+			if binding.ActualRequestID != 0 {
+				actual.RequestID = binding.ActualRequestID
+				actual.JobID = binding.JobID
+				actual.RunID = binding.RunID
+			}
 			job.RequestID = binding.LaunchRequestID
-			return job, nil
+			return job, actual, nil
 		case !errors.Is(err, alloc.ErrLeaseNotFound):
-			return Job{}, fmt.Errorf("%w: cannot resolve completed runner %q: %w",
+			return Job{}, Job{}, fmt.Errorf("%w: cannot resolve completed runner %q: %w",
 				ErrUntrustworthySession, job.RunnerName, err)
 		}
 	}
 
 	if job.RequestID != 0 {
-		return job, nil
+		return job, actual, nil
 	}
 
 	leaseID, ok := provider.LeaseOf(job.RunnerName)
@@ -3662,7 +3673,7 @@ func (l *Listener) identifyCompletion(ctx context.Context, job Job) (Job, error)
 		switch {
 		case err == nil:
 			if identity.Tier != l.tier || identity.RequestID == 0 {
-				return Job{}, fmt.Errorf("%w: completed runner %q resolves to tier %q request %d, not tier %q",
+				return Job{}, Job{}, fmt.Errorf("%w: completed runner %q resolves to tier %q request %d, not tier %q",
 					ErrUntrustworthySession, job.RunnerName, identity.Tier, identity.RequestID, l.tier)
 			}
 			// A RUNNER AND ITS INTENDED JOB ARE A POOL, NOT A PAIR, and treating a
@@ -3687,20 +3698,13 @@ func (l *Listener) identifyCompletion(ctx context.Context, job Job) (Job, error)
 					"tier", l.tier, "runner", job.RunnerName,
 					"ran", job.RunID, "launched_for", identity.RunID)
 			}
-			if job.JobID != "" {
-				mapped, exists, err := l.alloc.DirectJobIdentity(ctx, job.JobID)
-				if err != nil {
-					return Job{}, fmt.Errorf("%w: %s cannot cross-check completed job %q: %w",
-						ErrUntrustworthySession, l.tier, job.JobID, err)
-				}
-				if exists && mapped != identity.RequestID {
-					l.log.Warn("a completed runner ran a different assigned job than the one "+
-						"it was launched for; github pools assigned jobs across a scale set's "+
-						"runners, so this runner's lease settles with the result while idle "+
-						"surplus is retired from the authoritative assigned-job count",
-						"tier", l.tier, "runner", job.RunnerName,
-						"launched_for", identity.RequestID, "job", job.JobID, "ran", mapped)
-				}
+			if actual.RequestID != 0 && actual.RequestID != identity.RequestID {
+				l.log.Warn("a completed runner ran a different assigned job than the one "+
+					"it was launched for; github pools assigned jobs across a scale set's "+
+					"runners, so this runner's lease settles with the result while idle "+
+					"surplus is retired from the authoritative assigned-job count",
+					"tier", l.tier, "runner", job.RunnerName,
+					"launched_for", identity.RequestID, "job", job.JobID, "ran", actual.RequestID)
 			}
 
 			job.RequestID = identity.RequestID
@@ -3708,18 +3712,19 @@ func (l *Listener) identifyCompletion(ctx context.Context, job Job) (Job, error)
 				job.RunID = identity.RunID
 			}
 
-			return job, nil
+			return job, actual, nil
 		case !errors.Is(err, alloc.ErrLeaseNotFound):
-			return Job{}, fmt.Errorf("%w: %s cannot resolve completed runner %q: %w",
+			return Job{}, Job{}, fmt.Errorf("%w: %s cannot resolve completed runner %q: %w",
 				ErrUntrustworthySession, l.tier, job.RunnerName, err)
 		}
 	}
 
-	if job.JobID != "" {
-		return l.identifyAssigned(ctx, job)
+	if actual.RequestID != 0 {
+		job.RequestID = actual.RequestID
+		return job, actual, nil
 	}
 
-	return Job{}, fmt.Errorf("%w: %s completed runner %q without a request id, job id, or resolvable billet lease",
+	return Job{}, Job{}, fmt.Errorf("%w: %s completed runner %q without a request id or resolvable job or billet lease identity",
 		errQuarantinableCompletion, l.tier, job.RunnerName)
 }
 

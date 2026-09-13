@@ -1458,7 +1458,7 @@ func TestCompletionSettlesTheRunnersLeaseWhenGitHubPairedItWithAnotherJob(t *tes
 		t.Fatalf("IdentifyDirectJob: %v", err)
 	}
 
-	resolved, err := l.identifyCompletion(t.Context(), Job{RunID: 102, JobID: "different-job-guid",
+	resolved, _, err := l.identifyCompletion(t.Context(), Job{RunID: 102, JobID: "different-job-guid",
 		RunnerName: provider.InstanceName(lease.ID)})
 	if err != nil {
 		t.Fatalf("a pooled completion was refused rather than settled: %v", err)

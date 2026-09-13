@@ -637,6 +637,62 @@ func TestCancelledOfferDoesNotCreateAPromise(t *testing.T) {
 			}
 		})
 	}
+
+	for _, keepJobID := range []bool{false, true} {
+		t.Run(map[bool]string{false: "runner name only", true: "job id without request id"}[keepJobID], func(t *testing.T) {
+			tiers := []config.Tier{tier("a-work")}
+			a := newAllocator(t, alloc.Limits{MaxVCPU: tierVCPU, MaxMemory: 64 * config.GiB}, tiers)
+			session := &fakeSession{}
+			var destroyed []int64
+			work := NewListener(a, tiers[0].Label, session, WithRunner(&fakeRunner{
+				onDestroy: func(requestID int64) error {
+					destroyed = append(destroyed, requestID)
+					return nil
+				},
+			}), WithRunnerRegistry(&fakeRunnerRegistry{}))
+			if err := work.refillEscrow(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			actual := Job{RequestID: 11, RunID: 101, JobID: "completed-job"}
+			if err := work.handle(t.Context(), &Message{MessageID: 1, Assigned: []Job{actual}}); err != nil {
+				t.Fatal(err)
+			}
+			members, err := a.PoolRunners(t.Context(), work.tier)
+			if err != nil || len(members) != 1 || members[0].LaunchRequestID != 11 {
+				t.Fatalf("launched runner = %+v, err %v; want request 11", members, err)
+			}
+			actual.RunnerID, actual.RunnerName = 77, members[0].RunnerName
+			if err := work.handle(t.Context(), &Message{MessageID: 2, Started: []Job{actual}}); err != nil {
+				t.Fatal(err)
+			}
+			binding, err := a.PoolRunnerByName(t.Context(), actual.RunnerName)
+			if err != nil || binding.Status != alloc.PoolRunnerBusy || binding.ActualRequestID != 11 || binding.JobID != actual.JobID {
+				t.Fatalf("busy binding = %+v, err %v; want actual request 11", binding, err)
+			}
+			completion := Job{RunnerName: actual.RunnerName, Result: "Cancelled"}
+			if keepJobID {
+				completion.JobID = actual.JobID
+			}
+			if err := work.handle(t.Context(), &Message{
+				MessageID: 3, Completed: []Job{completion},
+				Available: []Job{{RequestID: actual.RequestID, RunID: actual.RunID, JobID: actual.JobID}},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if ids := session.acquiredIDs(); len(ids) != 0 {
+				t.Errorf("acquired completed request %v after its wire identity was omitted", ids)
+			}
+			if !slices.Equal(destroyed, []int64{11}) || work.Running() != 0 || work.Acquiring() != 0 {
+				t.Errorf("destroyed %v, running %d, promises %d; want [11], 0, 0",
+					destroyed, work.Running(), work.Acquiring())
+			}
+			if _, exists, err := a.DirectJobIdentity(t.Context(), actual.JobID); err != nil {
+				t.Fatal(err)
+			} else if exists {
+				t.Error("completion minted a direct identity for a job already bound to request 11")
+			}
+		})
+	}
 }
 
 // AN UNUSED LABEL MUST NOT TRIGGER CLOUD FALLBACK. Even with deployment room
