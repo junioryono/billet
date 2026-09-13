@@ -43,20 +43,37 @@ var ErrNoLedger = errors.New("state: no ledger to inspect")
 // reason OpenAdmin gives: a whole-file read in front of a report is a cost
 // with no decision behind it.
 func OpenInspect(ctx context.Context, stateDir string, opts ...OpenOption) (*DB, error) {
-	be := newSQLiteBackend(stateDir)
-
-	// THE MIGRATION SET FIRST, before the pathname is looked at, as openDir
-	// orders it: a binary that cannot read its own migrations must say so, not
-	// answer "no ledger" for a directory it never got to judge.
-	if err := be.timeline().require(); err != nil {
+	if err := InspectPreflight(stateDir); err != nil {
 		return nil, err
+	}
+
+	return openDir(ctx, stateDir, newSQLiteBackend(stateDir), openMode{inspect: true}.with(opts))
+}
+
+// InspectPreflight is everything OpenInspect judges BEFORE it opens a pool, in
+// the order it judges it: the migration set, then the directory and the ledger
+// file, then the maintenance fence. openDir repeats the first and the last, so
+// the open's own ordering is unchanged; what this adds is a name for it.
+//
+// THE MIGRATION SET FIRST, before any pathname is looked at, as openDir orders
+// it: a binary that cannot read its own migrations must say so, not answer "no
+// ledger" for a directory it never got to judge. THE LEDGER BEFORE THE FENCE,
+// because a caller that cannot open the pool at all — root over a directory
+// another account owns, whose open would leave root-owned sidecars — still has
+// to answer with the SAME refusal the owner's open would have given, and a
+// fence beside a missing ledger is a missing ledger. A second copy of these
+// checks answered "fenced" there and granted a recovery the ledger's absence
+// should have refused.
+func InspectPreflight(stateDir string) error {
+	if err := newSQLiteBackend(stateDir).timeline().require(); err != nil {
+		return err
 	}
 
 	if err := requireLedgerFile(stateDir, LedgerPath(stateDir)); err != nil {
-		return nil, err
+		return err
 	}
 
-	return openDir(ctx, stateDir, be, openMode{inspect: true}.with(opts))
+	return refuseMaintenance(stateDir)
 }
 
 // OpenPostgresInspect is OpenInspect for a ledger in PostgreSQL: the state

@@ -558,6 +558,8 @@ func TestTheRolesManifestIsJudgedMemberByMember(t *testing.T) {
 		words string
 	}{
 		"not YAML":                             {"not: [yaml", "not YAML"},
+		"a second document":                    {valid + "\n---\n{}\n", "contains more than one YAML document"},
+		"a malformed second document":          {valid + "\n---\n[\n", "did not find expected node content"},
 		"empty":                                {"", "empty"},
 		"version 1":                            {replace("version: 2", "version: 1"), "version is 1"},
 		"version as a string":                  {replace("version: 2", "version: '2'"), "version is not a number"},

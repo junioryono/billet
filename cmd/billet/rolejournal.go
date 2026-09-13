@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -214,6 +215,16 @@ func parseRoleJournal(body []byte, path string) (*roleJournal, error) {
 	dec.KnownFields(true)
 
 	if err := dec.Decode(&j); err != nil {
+		return nil, fmt.Errorf("the role's journal %s: %w", path, err)
+	}
+
+	// ONLY EOF ENDS THE MANIFEST. The role reads one YAML document; accepting
+	// a second or a malformed suffix would admit a manifest it cannot consume.
+	var extra yaml.Node
+	switch err := dec.Decode(&extra); {
+	case err == nil:
+		return nil, fmt.Errorf("the role's journal %s contains more than one YAML document", path)
+	case !errors.Is(err, io.EOF):
 		return nil, fmt.Errorf("the role's journal %s: %w", path, err)
 	}
 

@@ -10,10 +10,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
+	"gopkg.in/yaml.v3"
+
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/regularfile"
 	"github.com/junioryono/billet/internal/retirement"
 	"github.com/junioryono/billet/internal/rollout"
 	"github.com/junioryono/billet/internal/state"
@@ -185,8 +189,9 @@ type retireReport struct {
 	StatusWhy      string `json:"status_why,omitempty"`
 	// Config is the installed configuration's typed presence, in the words
 	// the inspector uses: `present`, `absent`, `malformed`, `unreadable`.
-	Config         string `json:"config"`
-	InstalledRoles string `json:"installed_roles"`
+	// InstalledRoles is null exactly when Config is not present.
+	Config         string  `json:"config"`
+	InstalledRoles *string `json:"installed_roles"`
 	// Identity and Authority describe the configured path, or preparation's
 	// path on a bootstrap host; a path not observed remains unreadable.
 	Identity  string `json:"identity"`
@@ -1262,33 +1267,38 @@ func retireDryRun(ctx context.Context, m retireMode) (any, *retireRefusal) {
 	report.Config = configPresence
 	identity, identityWhy := "", ""
 
-	if cfg != nil {
+	if configPresence == "present" {
+		roles := ""
 		switch {
 		case cfg.Server != nil && cfg.Node != nil:
-			report.InstalledRoles = "both"
+			roles = "both"
 		case cfg.Server != nil:
-			report.InstalledRoles = "server"
+			roles = "server"
 		case cfg.Node != nil:
-			report.InstalledRoles = "node"
+			roles = "node"
 		}
+		report.InstalledRoles = &roles
 	}
 
-	if cfg != nil && cfg.Server != nil {
+	if cfg != nil && cfg.Server != nil && cfg.Server.IdentityDir != "" &&
+		strings.TrimSpace(cfg.Server.IdentityDir) == cfg.Server.IdentityDir {
 		identity, report.Identity, identityWhy = observeRetireIdentity(cfg.Server.IdentityDir)
 		report.Authority = observeRetireAuthority(cfg.Server.IdentityDir)
-	} else if presence == retirement.JournalAbsent && (configPresence == "absent" || configPresence == "malformed") {
+	} else if cfg == nil && presence == retirement.JournalAbsent &&
+		(configPresence == "absent" || configPresence == "malformed") {
 		// BOOTSTRAP OBSERVES THE FILES WHERE PREPARATION PUTS THEM. A
 		// directory created by the package is not a minted identity, and
-		// configuration that is not yet valid cannot name its installed path.
+		// absent or undecodable configuration cannot name its installed path.
 		// Use preparation's packaged layout without calling its resolver:
 		// that reloads configuration, which this report observed once above.
 		//
-		// THE PACKAGED PATH CANNOT RULE OUT A CUSTOM IDENTITY. Lost or invalid
-		// configuration can hide an intact identity and CA at a custom path,
-		// beside a live reservation, while preparation's path is clean. Closing
-		// this residual needs an authoritative record of the location outside
+		// THE PACKAGED PATH CANNOT RULE OUT A CUSTOM IDENTITY. Absent or
+		// undecodable configuration can hide an intact identity and CA at a
+		// custom path beside a live reservation, while preparation's path is
+		// clean. Closing this residual needs durable location provenance outside
 		// replaceable configuration, consulted before bootstrap admission; an
-		// established but unresolvable location must hold.
+		// established but unresolvable location must hold. Inspecting ledger
+		// contents cannot recover a directory whose location is unknown.
 		dir := filepath.Join(retirement.Root, "server")
 		identity, report.Identity, identityWhy = observeRetireIdentity(dir)
 		report.Authority = observeRetireAuthority(dir)
@@ -1312,11 +1322,12 @@ func retireDryRun(ctx context.Context, m retireMode) (any, *retireRefusal) {
 		}
 	}
 
+	maintenance := false
 	switch {
-	case cfg != nil && cfg.Server != nil && report.Identity != "minted":
+	case configPresence == "present" && cfg.Server != nil && report.Identity != "minted":
 		report.RowFact, report.Why = retirement.RowUnreadable, identityWhy
-	case cfg != nil && cfg.Server != nil:
-		report.Row, report.RowFact, report.Why = readRetireRow(ctx, cfg, identity, m)
+	case configPresence == "present" && cfg.Server != nil:
+		report.Row, report.RowFact, report.Why, maintenance = readRetireRow(ctx, cfg, identity, m)
 	case presence == retirement.JournalPresent:
 		// THE LOCATOR IS HOW A HOST PAST THE ARCHIVE NAMES ITS LEDGER: the
 		// installed configuration has no `server:` any more, or none at all,
@@ -1331,19 +1342,28 @@ func retireDryRun(ctx context.Context, m retireMode) (any, *retireRefusal) {
 
 	report.Dispatch = retirement.DispatchFor(report.RowFact, retirement.JournalFactOf(presence == retirement.JournalPresent, j.Phase))
 
-	// WHAT THE HOST HOLDS, READ WHEN THE REPORT IS MADE, like every other
-	// answer this command gives. Pinned to `nothing` it said the opposite of
-	// the truth on every host with a retirement under way.
-	report.State = retireHostState(stateNothingRetire)
-
 	if report.RouteWhy == "" {
 		report.Route, report.RouteWhy = retireRoute(report, cfg, m.requested)
-		// AN OBSERVED POINTER EXCLUDES EVERY ROUTE BUT ORDINARY, regardless
-		// of continuity flags. Preparation accepts it under recovery, which
-		// must still reach the ordinary tasks that own the binary transaction.
-		if shape.Pointer && report.Route != "ordinary" {
+		// RECOVERY ADMITS ONLY THE TRANSACTION THAT EXPLAINS THE FENCE. No
+		// retirement artefact may be crossed, and an arbitrary unreadable row
+		// supplies no permission. The role must recover, then classify again.
+		if maintenance && report.Journal == nil && report.StatusPresence == "absent" &&
+			report.Stage == "absent" && report.Marker == nil &&
+			(shape.Pointer || shape.Kind == claimLegacyRole) {
+			if err := validateRetireBinaryRecovery(shape, cfg.Server.IdentityDir); err != nil {
+				report.Route, report.RouteWhy = "hold", "the binary recovery could not be validated: "+err.Error()
+			} else {
+				report.Route, report.RouteWhy = "recovery", "a validated binary transaction names this maintenance-fenced ledger; "+
+					"recover that transaction alone, then retry the classifier"
+			}
+		}
+		// AN OBSERVED POINTER EXCLUDES RETIREMENT ROUTES, regardless of
+		// continuity flags. An unfenced ordinary admission still reaches the
+		// tasks that own the transaction; a fenced one admits recovery alone.
+		if (shape.Pointer || shape.Kind == claimLegacyRole) && report.Route != "ordinary" &&
+			report.Route != "recovery" && report.Route != "hold" {
 			report.Route = "hold"
-			report.RouteWhy = "the guard carries a binary transaction's pointer; retirement cannot run inside it"
+			report.RouteWhy = "the claim carries a binary transaction's pointer; retirement cannot run inside it"
 		}
 
 		// AN OBSERVED GUARD MUST BE SETTLED AND INTACT BEFORE MUTATION. Its
@@ -1357,6 +1377,11 @@ func retireDryRun(ctx context.Context, m retireMode) (any, *retireRefusal) {
 		}
 	}
 
+	// WHAT THE HOST HOLDS, READ WHEN THE REPORT IS MADE, like every other
+	// answer this command gives. No earlier absence can stand in for this read.
+	closingJournal, closingPresence, closingState := retireHostObservation(stateNothingRetire)
+	report.State = closingState
+
 	// THE LAST FAILED OBSERVATION REACHES THE ROUTE. A caller must not need
 	// a second routing rule to reconcile an earlier admission with a host
 	// whose own state could not be established when the report was made.
@@ -1365,7 +1390,188 @@ func retireDryRun(ctx context.Context, m retireMode) (any, *retireRefusal) {
 		report.RouteWhy = "the host's own state could not be established when the report was made"
 	}
 
+	// THE CLOSING JOURNAL MUST STILL SELECT THE SAME ROUTE. A phase advance
+	// in this retirement is consistent; disappearance or another transition
+	// or variant cannot inherit admission from the journal read before it.
+	if report.State != retireStateUnknown && report.Route != "hold" {
+		switch {
+		case report.Journal == nil && closingPresence == retirement.JournalPresent:
+			report.Route = "hold"
+			report.RouteWhy = "a retirement appeared after the routing observations; retry the classifier"
+		case report.Journal != nil && closingPresence == retirement.JournalAbsent:
+			report.Route = "hold"
+			report.RouteWhy = "the retirement journal disappeared after the routing observations; retry the classifier"
+		case report.Journal != nil && (closingJournal.Provenance != j.Provenance || closingJournal.Variant != j.Variant):
+			report.Route = "hold"
+			report.RouteWhy = "the retirement journal changed transition or variant after the routing observations; retry the classifier"
+		}
+	}
+
 	return report, nil
+}
+
+// validateRetireBinaryRecovery admits RUNNING the role's recovery. The caller
+// proves that maintenance alone refused the ledger read; this check proves a
+// guard pointer or legacy-role claim names a role-created recovery directory
+// under the trusted root, its readable manifest names this host's identity
+// directory as server_state_dir, and no retirement journal, status, stage or
+// marker exists. The closing bracket must preserve those structural facts.
+//
+// RECOVERY'S PREREQUISITES BELONG TO THE ROLE'S TASKS, which refuse by name
+// before they stop anything. A copy of another component's refusals cannot be
+// complete, and each one here would be a second owner of a rule the role has;
+// what the role refuses is a failed converge naming its fix, where a hold here
+// would make the only tasks that can recover the fenced transaction unreachable.
+func validateRetireBinaryRecovery(shape claimShape, identityDir string) error {
+	root, err := openTrustedDir(upgradeRoot)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = root.Close() }()
+
+	info, err := root.Stat()
+	if err != nil {
+		return err
+	}
+	if err := requireTrustedDir(upgradeRoot, info, 0); err != nil {
+		return err
+	}
+	named, err := os.Lstat(upgradeRoot)
+	if err != nil {
+		return err
+	}
+	if !named.IsDir() || !os.SameFile(info, named) {
+		return errors.New("the upgrade root moved or is a link; retry the classifier")
+	}
+
+	claimInfo, err := os.Lstat(activePath())
+	if err != nil {
+		return err
+	}
+	target, err := retireBinaryRecoveryTarget(root, shape)
+	if err != nil {
+		return err
+	}
+	if !recoveryNameGrammar.MatchString(filepath.Base(target)) {
+		return errors.New("the binary transaction names no role-created recovery directory")
+	}
+	recovery, err := openRecoveryUnder(root, target)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = recovery.Close() }()
+	recoveryInfo, err := recovery.Stat()
+	if err != nil {
+		return err
+	}
+
+	manifestPath := filepath.Join(target, roleJournalName)
+	manifestInfo, err := os.Lstat(manifestPath)
+	if err != nil {
+		return err
+	}
+	manifest, err := readRoleJournalAt(recovery, target)
+	if err != nil {
+		return err
+	}
+	if manifest.ServerStateDir != identityDir {
+		return errors.New("the binary transaction's server directory differs from the fenced identity directory")
+	}
+
+	// THE CLOSE BELONGS AFTER THE MANIFEST. Its identity and metadata belong
+	// beside the claim and directory: a replaced manifest cannot supply the
+	// server directory that admitted recovery under the earlier observation.
+	closingTarget, err := retireBinaryRecoveryTarget(root, shape)
+	if err != nil {
+		return err
+	}
+	if closingTarget != target {
+		return errors.New("the binary transaction's pointer changed during observation; retry the classifier")
+	}
+	for _, observed := range []struct {
+		path string
+		info os.FileInfo
+	}{
+		{upgradeRoot, info}, {activePath(), claimInfo}, {target, recoveryInfo}, {manifestPath, manifestInfo},
+	} {
+		after, err := os.Lstat(observed.path)
+		if err != nil {
+			return fmt.Errorf("re-examine %s after the recovery observation: %w", observed.path, err)
+		}
+		if !os.SameFile(after, observed.info) || after.Mode() != observed.info.Mode() ||
+			(observed.info.Mode().IsRegular() && !sameMetadata(after, observed.info)) {
+			return fmt.Errorf("%s changed during the recovery observation; retry the classifier", observed.path)
+		}
+	}
+	for _, path := range []string{retirement.JournalPath(), retirement.StatusPath(), retirement.StagePath()} {
+		switch _, err := os.Lstat(path); {
+		case errors.Is(err, fs.ErrNotExist):
+		case err != nil:
+			return fmt.Errorf("re-examine the retirement artefact %s after the recovery observation: %w", path, err)
+		default:
+			return fmt.Errorf("a retirement artefact appeared at %s during the recovery observation; retry the classifier", path)
+		}
+	}
+
+	return nil
+}
+
+// retireBinaryRecoveryTarget reads the claim through the trusted root without
+// taking its lock. A GUARD REPLACED SINCE CLASSIFICATION SUPPLIES NO POINTER
+// for the earlier holder's admission; the next invocation can judge it afresh.
+func retireBinaryRecoveryTarget(root *os.File, shape claimShape) (string, error) {
+	if shape.Kind == claimGuard {
+		dir, err := openActiveOf(root)
+		if err != nil {
+			return "", err
+		}
+		defer func() { _ = dir.Close() }()
+
+		info, err := dir.Stat()
+		if err != nil {
+			return "", err
+		}
+		if err := requireTrustedDir(activePath(), info, 0o700); err != nil {
+			return "", err
+		}
+		current, err := classifyGuardDirFrom(dir)
+		if err != nil {
+			return "", err
+		}
+		if current.Kind != claimGuard || current.RecordErr != "" || !current.Pointer ||
+			current.Guard.ID != shape.Guard.ID || current.Guard.Holder != shape.Guard.Holder ||
+			current.Guard.Preparing || current.StrayTemporary {
+			return "", errors.New("the converge guard is not intact or changed during observation; retry the classifier")
+		}
+		if current.Guard.Transition != nil {
+			return "", errors.New("the converge guard carries a retirement marker; binary recovery cannot cross it")
+		}
+		_, target, refusal := validatePointer(root, dir)
+		if refusal != nil {
+			return "", errors.New(refusal.Why)
+		}
+
+		return target, nil
+	}
+
+	if shape.Kind != claimLegacyRole {
+		return "", errors.New("the claim is not a role transaction")
+	}
+	f, info, err := regularfile.OpenAt(root, activePointer)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = f.Close() }()
+
+	if err := requireTrustedFile(activePath(), info); err != nil {
+		return "", err
+	}
+	body, err := regularfile.ReadAllLimited(f, activePath(), maxRoleJournalBytes)
+	if err != nil {
+		return "", err
+	}
+
+	return strings.TrimSpace(string(body)), nil
 }
 
 // retireRoute partitions readable observations. THE JOURNAL SELECTS ITS OWN
@@ -1426,7 +1632,7 @@ func retireRoute(report *retireReport, cfg *config.Config, requested bool) (stri
 
 		return "ordinary", ""
 	case retirement.RowUnreadable:
-		nodeOnly := report.Config == "present" && report.InstalledRoles == "node"
+		nodeOnly := report.Config == "present" && retireRolesWord(report.InstalledRoles) == "node"
 
 		switch {
 		case nodeOnly && !requested:
@@ -1444,7 +1650,7 @@ func retireRoute(report *retireReport, cfg *config.Config, requested bool) (stri
 			//
 			// THE RESIDUAL IS ACCEPTED: a host beside no authority that lost its
 			// deployment-id can still hold a live reservation. A commissioned
-			// custom identity_dir hidden by lost or invalid configuration also
+			// custom identity_dir hidden by absent or undecodable configuration
 			// has these facts at the packaged path, with its identity and CA
 			// intact elsewhere and nothing deleted. Both converge ordinarily
 			// with the reservation unexamined. Holding every such observation
@@ -1452,9 +1658,10 @@ func retireRoute(report *retireReport, cfg *config.Config, requested bool) (stri
 			// Closing the hidden-location residual needs an authoritative record
 			// of the identity's location outside replaceable configuration,
 			// consulted before this admission; an established but unresolvable
-			// location must hold. A known path whose identity was lost still
-			// needs a bounded read-only inspection of the ledger's contents for
-			// any retirement row: SQLite has state.PeekLedger; PostgreSQL has
+			// location must hold. Ledger contents cannot locate an unknown path.
+			// A known path whose identity was lost still needs a bounded
+			// read-only inspection of the ledger's contents for any retirement
+			// row: SQLite has state.PeekLedger; PostgreSQL has
 			// no equivalent.
 			if requested {
 				return "hold", "this host has no deployment identity or authority, so there is no controller to retire"
@@ -1482,11 +1689,11 @@ func retireNewRequestRoute(report *retireReport, cfg *config.Config) (string, st
 		return "hold", "a new retirement needs an installed configuration and this host has none to read"
 	}
 
-	if report.InstalledRoles == "both" {
+	if retireRolesWord(report.InstalledRoles) == "both" {
 		return "unsupported-variant", "this converge does not support retiring a host that keeps a node"
 	}
 
-	if report.InstalledRoles != "server" || cfg.Server == nil {
+	if retireRolesWord(report.InstalledRoles) != "server" || cfg.Server == nil {
 		return "hold", fmt.Sprintf("a new retirement needs an installed configuration with a server and no node, and "+
 			"this host's installed roles are %s", retireRolesWord(report.InstalledRoles))
 	}
@@ -1500,12 +1707,12 @@ func retireNewRequestRoute(report *retireReport, cfg *config.Config) (string, st
 
 // retireRolesWord renders the installed roles for a reason, saying when the
 // configuration answered none rather than printing nothing.
-func retireRolesWord(roles string) string {
-	if roles == "" {
+func retireRolesWord(roles *string) string {
+	if roles == nil || *roles == "" {
 		return "not established"
 	}
 
-	return roles
+	return *roles
 }
 
 // observeRetireIdentity peeks ONCE, independently of whether a row can be
@@ -1544,8 +1751,9 @@ func observeRetireAuthority(dir string) string {
 
 // observeRetireDryRunConfig types the installed configuration for the report:
 // a positive ENOENT is `absent`, bytes that do not parse are `malformed`, a
-// failed read is `unreadable`, and only a configuration that parsed comes back
-// beside its value.
+// failed read is `unreadable`. VALIDATION DOES NOT ERASE A LOCATOR: decoded
+// configuration still names the identity and authority when another section
+// is invalid; only a present configuration may supply roles or a ledger open.
 func observeRetireDryRunConfig(path string) (*config.Config, string) {
 	obs, err := observeConfig(path)
 
@@ -1558,12 +1766,60 @@ func observeRetireDryRunConfig(path string) (*config.Config, string) {
 
 	defer func() { _ = obs.file.Close() }()
 
-	cfg, err := config.Parse(path, obs.body)
+	cfg, err := config.ParseUnvalidated(path, obs.body)
 	if err != nil {
-		return nil, "malformed"
+		return retireConfigLocator(obs.body), "malformed"
+	}
+	if err := cfg.Validate(); err != nil {
+		return cfg, "malformed"
 	}
 
 	return cfg, "present"
+}
+
+// retireConfigLocator keeps a decodable locator when expansion or another
+// field's decoding failed before ParseUnvalidated could return a value. ONLY
+// UNDECODABLE YAML permits the packaged fallback; an unreadable locator in a
+// decoded document leaves a non-nil configuration naming no usable directory.
+func retireConfigLocator(body []byte) *config.Config {
+	var document map[string]yaml.Node
+	dec := yaml.NewDecoder(bytes.NewReader(body))
+	if err := dec.Decode(&document); err != nil {
+		return nil
+	}
+	var extra yaml.Node
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		return nil
+	}
+
+	cfg := &config.Config{}
+	server, present := document["server"]
+	if !present {
+		return cfg
+	}
+	var fields map[string]yaml.Node
+	if err := server.Decode(&fields); err != nil || fields == nil {
+		return cfg
+	}
+
+	// DEFAULTS STILL BELONG TO CONFIG. Decode just the location's section
+	// through its parser, with no tiers to expand or unrelated fields to fail.
+	locator := make(map[string]yaml.Node)
+	for _, key := range []string{"identity_dir", "state_dir", "state"} {
+		if value, present := fields[key]; present {
+			locator[key] = value
+		}
+	}
+	encoded, err := yaml.Marshal(map[string]any{"server": locator})
+	if err != nil {
+		return cfg
+	}
+	located, err := config.ParseUnvalidated("the installed identity locator", encoded)
+	if err != nil {
+		return cfg
+	}
+
+	return located
 }
 
 // readRetireRowByLocator reads the row the way a host past the archive must:
@@ -1608,7 +1864,9 @@ func readRetireRowByLocator(ctx context.Context, j retirement.Journal) (*retireR
 			"the ledger could not be opened through the journal's locator")
 	}
 
-	return readRetireReportSnapshot(ctx, bounded, db, j.Deployment, j.Retiring)
+	row, fact, why, _ := readRetireReportSnapshot(ctx, bounded, db, j.Deployment, j.Retiring)
+
+	return row, fact, why
 }
 
 // readRetireRow reads the row for the dry run and classifies it for THIS
@@ -1617,18 +1875,20 @@ func readRetireRowByLocator(ctx context.Context, j retirement.Journal) (*retireR
 // by another account is read AS THAT ACCOUNT through `rollout status --json`,
 // because a read-only open of a stopped SQLite ledger creates the -wal and -shm
 // sidecars owned by whoever opened it, and root-owned sidecars keep the service
-// from reopening it.
-func readRetireRow(ctx context.Context, cfg *config.Config, identity string, m retireMode) (*retireReportRow, retirement.RowFact, string) {
+// from reopening it. The last result proves that maintenance alone refused
+// this read; a false value grants no recovery admission.
+func readRetireRow(ctx context.Context, cfg *config.Config, identity string, m retireMode,
+) (*retireReportRow, retirement.RowFact, string, bool) {
 	bounded, cancel := retireReportTimeout(ctx, retireReportLedgerBound)
 	defer cancel()
 
 	if err := bounded.Err(); err != nil {
-		return nil, retirement.RowUnreadable, retireReportLedgerWhy(ctx, bounded, err, "read the retirement row")
+		return nil, retirement.RowUnreadable, retireReportLedgerWhy(ctx, bounded, err, "read the retirement row"), false
 	}
 
 	dsn, err := ledgerDSNFrom(cfg, m.environmentFile)
 	if err != nil {
-		return nil, retirement.RowUnreadable, err.Error()
+		return nil, retirement.RowUnreadable, err.Error(), false
 	}
 
 	if cfg.Server.LedgerBackend() != config.StatePostgres {
@@ -1639,20 +1899,31 @@ func readRetireRow(ctx context.Context, cfg *config.Config, identity string, m r
 
 		switch {
 		case err != nil:
-			return nil, retirement.RowUnreadable, fmt.Sprintf("read who owns %s: %v", cfg.Server.IdentityDir, err)
+			return nil, retirement.RowUnreadable, fmt.Sprintf("read who owns %s: %v", cfg.Server.IdentityDir, err), false
 		case int(uid) != euid && euid != 0:
 			return nil, retirement.RowUnreadable, fmt.Sprintf("%s is owned by uid %d and this process runs as uid %d; a read "+
 				"of a SQLite ledger leaves files owned by whoever read it, so the row is read as the owner or as root",
-				cfg.Server.IdentityDir, uid, euid)
+				cfg.Server.IdentityDir, uid, euid), false
 		case int(uid) != euid:
-			return readRetireRowAsOwner(ctx, bounded, uid, gid, identity, m)
+			// THE OWNER'S EXIT STATUS CARRIES NO TYPED CAUSE. Judge what the
+			// owner's open would judge first, through the open's own preflight,
+			// without opening the pool as root: a fence beside no ledger is the
+			// ledger's absence, not maintenance's refusal.
+			if err := state.InspectPreflight(cfg.Server.IdentityDir); err != nil {
+				return nil, retirement.RowUnreadable, retireReportLedgerWhy(ctx, bounded, err,
+					"the ledger read is refused before running the owner's report"),
+					bounded.Err() == nil && state.OnlyCause(err, state.ErrMaintenance)
+			}
+			row, fact, why := readRetireRowAsOwner(ctx, bounded, uid, gid, identity, m)
+
+			return row, fact, why, false
 		}
 	}
 
 	db, err := retireReportOpen(bounded, cfg, dsn)
 	if err != nil {
 		return nil, retirement.RowUnreadable, retireReportLedgerWhy(ctx, bounded, err,
-			"the ledger could not be opened for the report")
+			"the ledger could not be opened for the report"), bounded.Err() == nil && state.OnlyCause(err, state.ErrMaintenance)
 	}
 
 	// THE SAME READ THE OWNER'S REPORT MAKES: the status snapshot, whose row
@@ -1666,7 +1937,7 @@ func readRetireRow(ctx context.Context, cfg *config.Config, identity string, m r
 // never discarded or mistaken for that read's cause. Even a successful read
 // cannot establish absence after its budget ended in rollback or cleanup.
 func readRetireReportSnapshot(outer, bounded context.Context, db *state.DB, identity, host string,
-) (*retireReportRow, retirement.RowFact, string) {
+) (*retireReportRow, retirement.RowFact, string, bool) {
 	snapshot, err := retireReportSnapshot(bounded, db)
 	closed := retireReportClose(db)
 	if closed != nil {
@@ -1678,10 +1949,13 @@ func readRetireReportSnapshot(outer, bounded context.Context, db *state.DB, iden
 	}
 
 	if err != nil {
-		return nil, retirement.RowUnreadable, retireReportLedgerWhy(outer, bounded, err, "the retirement row could not be read")
+		return nil, retirement.RowUnreadable, retireReportLedgerWhy(outer, bounded, err, "the retirement row could not be read"),
+			bounded.Err() == nil && state.OnlyCause(err, state.ErrMaintenance)
 	}
 
-	return rowFromSnapshot(snapshot.Binding, snapshot.Retirement, identity, host)
+	row, fact, why := rowFromSnapshot(snapshot.Binding, snapshot.Retirement, identity, host)
+
+	return row, fact, why, false
 }
 
 // retireReportLedgerWhy keeps the failure AND whose budget has ended. An

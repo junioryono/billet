@@ -431,6 +431,16 @@ func annotateRetireState(r *retireRefusal, absent string) *retireRefusal {
 // a transition whose record has vanished under it, that is not something to
 // state.
 func retireHostState(absent string) string {
+	_, _, state := retireHostObservation(absent)
+
+	return state
+}
+
+// retireHostObservation is retireHostState with the journal it read kept, for
+// the classifier, which must hold its route to the journal that was there when
+// the report was made. ONE RULE FOR WHAT A HOST HOLDS: a second reading of it
+// beside this one answered `nothing` over a published status once already.
+func retireHostObservation(absent string) (retirement.Journal, retirement.JournalPresence, string) {
 	// THE READ'S OWN ERROR IS NOT THE ANSWER'S: what refused, or what was
 	// reported, is already there, and all this adds is where the host stands.
 	now, presence, err := retirement.ReadJournal()
@@ -446,14 +456,14 @@ func retireHostState(absent string) string {
 		// thing a host can be.
 		if _, statusPresence, statusErr := retirement.ReadStatus(); statusPresence != retirement.StatusAbsent ||
 			statusErr != nil {
-			return retireStateUnknown
+			return now, presence, retireStateUnknown
 		}
 
-		return absent
+		return now, presence, absent
 	case retirement.JournalPresent:
-		return string(now.Phase)
+		return now, presence, string(now.Phase)
 	default:
-		return retireStateUnknown
+		return now, presence, retireStateUnknown
 	}
 }
 

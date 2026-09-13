@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -44,7 +45,7 @@ func TestTheDryRunClassifiesARetiredHostRatherThanRefusingIt(t *testing.T) {
 
 	assertRetireRoute(t, out, code, "continue", "readable journal")
 
-	if m["identity"] != "unreadable" || m["authority"] != "unreadable" || m["installed_roles"] != "" {
+	if m["identity"] != "unreadable" || m["authority"] != "unreadable" || m["installed_roles"] != nil {
 		t.Fatalf("a retired host invented an installed identity path or roles: %s", out)
 	}
 
@@ -131,7 +132,7 @@ func TestTheDryRunTypesTheConfigurationRatherThanRefusingOnIt(t *testing.T) {
 			wantRoute := "hold"
 			if c.want == "present" {
 				wantRoute = "ordinary"
-			} else if m["installed_roles"] != "" || m["identity"] != "minted" || m["authority"] != "absent" {
+			} else if m["installed_roles"] != nil || m["identity"] != "minted" || m["authority"] != "absent" {
 				t.Fatalf("an unknown configuration hid the prepared path's identity or invented roles: %s", out)
 			}
 			assertRetireRoute(t, out, code, wantRoute, "row is unreadable")
@@ -263,6 +264,141 @@ func TestTheDryRunCarriesAFailedFinalStateObservationIntoTheRoute(t *testing.T) 
 				}
 			})
 		}
+	}
+}
+
+// A READABLE LATER JOURNAL WITHDRAWS AN EARLIER ADMISSION. Publishing intent
+// at the row's close gives the final read positive evidence of retirement,
+// while the routing snapshot still holds a positive absence of its journal.
+func TestTheDryRunHoldsWhenAValidJournalAppearsDuringTheObservation(t *testing.T) {
+	for _, earlier := range []string{"ordinary", "new-request", "cancel", "hold"} {
+		t.Run(earlier, func(t *testing.T) {
+			var f *retireFixture
+			args := []string{"--dry-run", "--retiring-host", "control-a"}
+			rowFact, why := retirement.RowAbsent, ""
+			if earlier == "new-request" || earlier == "cancel" {
+				request := newRequestFixture(t)
+				f = request.retireFixture
+				if earlier == "cancel" {
+					request.reserve(t)
+					rowFact, why = retirement.RowReservedMine, "inventory no longer requests"
+				} else {
+					args = append(args, "--requested")
+					why = "eligible"
+				}
+			} else {
+				f = newRetireFixture(t)
+				if earlier == "hold" {
+					args = append(args, "--requested")
+					why = "PostgreSQL active-passive"
+				}
+			}
+			out, code := f.run(t, "", args...)
+			before := assertRetireRoute(t, out, code, earlier, why)
+			if before["journal"] != nil || before["state"] != stateNothingRetire ||
+				before["row_fact"] != string(rowFact) {
+				t.Fatalf("the earlier snapshot did not establish the case: %s", out)
+			}
+
+			saved := retireReportClose
+			t.Cleanup(func() { retireReportClose = saved })
+			closes := 0
+			retireReportClose = func(db *state.DB) error {
+				closes++
+				mustOK(t, saved(db))
+				f.journalAt(t, retirement.PhaseIntent, "ci-1")
+
+				return nil
+			}
+
+			out, code = f.run(t, "", args...)
+			if earlier != "hold" {
+				why = "a retirement appeared after the routing observations; retry the classifier"
+			}
+			m := assertRetireRoute(t, out, code, "hold", why)
+			if closes != 1 || m["journal"] != nil || m["row_fact"] != string(rowFact) ||
+				m["state"] != string(retirement.PhaseIntent) {
+				t.Fatalf("the successful final read did not contradict the earlier snapshot (%d closes): %s", closes, out)
+			}
+			j, presence, err := retirement.ReadJournal()
+			mustOK(t, err)
+			if presence != retirement.JournalPresent || j.Phase != retirement.PhaseIntent ||
+				j.Provenance.TransitionID != retireTestID {
+				t.Fatalf("the final journal was not valid intent: presence %d, journal %+v", presence, j)
+			}
+			if earlier == "hold" && m["route_why"] != before["route_why"] {
+				t.Fatalf("the final read replaced the first hold's reason: %s", out)
+			}
+		})
+	}
+}
+
+// THE CLOSING JOURNAL CANNOT BORROW ANOTHER JOURNAL'S ROUTE. Disappearance,
+// a new transition and a changed variant each contradict the routing snapshot;
+// an advance within the same server-only retirement must still continue.
+func TestTheDryRunReconcilesAJournalSelectedRouteAtTheClose(t *testing.T) {
+	for _, change := range []string{"disappearance", "transition", "variant", "advance"} {
+		t.Run(change, func(t *testing.T) {
+			f := newRetireFixture(t)
+			f.journalAt(t, retirement.PhaseIntent, "ci-1")
+			out, code := f.run(t, "", "--dry-run", "--retiring-host", "control-a")
+			before := assertRetireRoute(t, out, code, "continue", "readable journal")
+			if before["state"] != string(retirement.PhaseIntent) || before["status_presence"] != "absent" {
+				t.Fatalf("the initial journal did not establish intent without status: %s", out)
+			}
+			j, presence, err := retirement.ReadJournal()
+			mustOK(t, err)
+			if presence != retirement.JournalPresent {
+				t.Fatal("the fixture did not publish its journal")
+			}
+
+			saved := retireReportClose
+			t.Cleanup(func() { retireReportClose = saved })
+			closes := 0
+			retireReportClose = func(db *state.DB) error {
+				closes++
+				mustOK(t, saved(db))
+				switch change {
+				case "disappearance":
+					mustOK(t, os.Remove(retirement.JournalPath()))
+					return nil
+				case "transition":
+					j.Provenance.TransitionID = strings.Repeat("b", 32)
+				case "variant":
+					j.Variant, j.Config = retirement.VariantRetainedNode, "present"
+					j.StagedSHA256 = strings.Repeat("a", 64)
+				case "advance":
+					j.Phase = retirement.PhaseStopped
+				}
+				mustOK(t, j.Write(retireNow()))
+				return nil
+			}
+
+			out, code = f.run(t, "", "--dry-run", "--retiring-host", "control-a")
+			want, why, finalState := "hold", "changed transition or variant", string(retirement.PhaseIntent)
+			if change == "disappearance" {
+				why, finalState = "journal disappeared", stateNothingRetire
+			} else if change == "advance" {
+				want, why, finalState = "continue", "readable journal", string(retirement.PhaseStopped)
+			}
+			m := assertRetireRoute(t, out, code, want, why)
+			earlier := asMap(m["journal"])
+			if closes != 1 || m["state"] != finalState || m["row_fact"] != string(retirement.RowAbsent) ||
+				earlier["phase"] != string(retirement.PhaseIntent) || earlier["transition_id"] != retireTestID ||
+				earlier["variant"] != string(retirement.VariantServerOnly) {
+				t.Fatalf("the final read did not reconcile the earlier journal (%d closes): %s", closes, out)
+			}
+			closing, presence, err := retirement.ReadJournal()
+			mustOK(t, err)
+			if change == "disappearance" {
+				if presence != retirement.JournalAbsent {
+					t.Fatal("the journal did not disappear")
+				}
+			} else if presence != retirement.JournalPresent || closing.Phase != j.Phase ||
+				closing.Provenance != j.Provenance || closing.Variant != j.Variant {
+				t.Fatalf("the closing journal did not establish the change: presence %d, journal %+v", presence, closing)
+			}
+		})
 	}
 }
 
@@ -1411,7 +1547,500 @@ func TestTheDryRunRequiresAMutationReadyGuardOnlyForRetirement(t *testing.T) {
 	}
 }
 
-// AN OBSERVED BINARY POINTER EXCLUDES EVERY ROUTE BUT ORDINARY. Recovery
+// A VALIDATED BINARY TRANSACTION CAN REACH ITS OWN RECOVERY ACROSS ITS FENCE.
+// Identity and authority survive the interruption; neither bootstrap exception
+// applies, and repeating the observation changes none of the recovery records.
+func TestTheDryRunAdmitsFencedBinaryRecoveryForGuardedAndLegacyClaims(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		name := "guarded"
+		if legacy {
+			name = "legacy"
+		}
+		t.Run(name, func(t *testing.T) {
+			f, recovery := retireBinaryRecoveryFixture(t, legacy)
+			created, err := state.WriteMaintenanceFence(f.stateDir, "ansible host upgrade")
+			mustOK(t, err)
+			if !created {
+				t.Fatal("the fixture did not create its maintenance fence")
+			}
+			manifest := mustRead(t, filepath.Join(recovery, roleJournalName))
+			identity := mustRead(t, state.DeploymentIDPath(f.stateDir))
+			fence := mustRead(t, state.MaintenanceFencePath(f.stateDir))
+			root, err := takeTxLock()
+			mustOK(t, err)
+			t.Cleanup(root.release)
+
+			for _, requested := range []bool{false, true} {
+				args := []string{"--dry-run", "--retiring-host", "control-a"}
+				if !legacy {
+					args = append(args, "--expected-holder", "ci-1", "--expected-guard", f.guard.record(t).ID)
+				}
+				if requested {
+					args = append(args, "--requested")
+				}
+				out, code := f.run(t, "", args...)
+				m := assertRetireRoute(t, out, code, "recovery", "recover that transaction alone, then retry the classifier")
+				wantGuard := string(claimGuard)
+				if legacy {
+					wantGuard = string(claimLegacyRole)
+				}
+				why, ok := m["why"].(string)
+				if m["guard"] != wantGuard || m["config"] != "present" || m["installed_roles"] != "server" ||
+					m["identity"] != "minted" || m["authority"] != "present" ||
+					m["row_fact"] != string(retirement.RowUnreadable) || m["row"] != nil || m["journal"] != nil ||
+					m["state"] != stateNothingRetire || !ok || !strings.Contains(why, "fenced for host maintenance") {
+					t.Fatalf("the report did not establish recovery across the real fence: %s", out)
+				}
+			}
+			if mustRead(t, filepath.Join(recovery, roleJournalName)) != manifest ||
+				mustRead(t, state.DeploymentIDPath(f.stateDir)) != identity ||
+				mustRead(t, state.MaintenanceFencePath(f.stateDir)) != fence {
+				t.Fatal("the classifier changed a recovery record or the preserved identity")
+			}
+			if legacy {
+				if mustRead(t, f.guard.active()) != recovery+"\n" {
+					t.Fatal("the classifier changed the legacy claim")
+				}
+			} else {
+				target, err := os.Readlink(filepath.Join(f.guard.active(), guardPointerName))
+				mustOK(t, err)
+				if target != recovery {
+					t.Fatalf("the classifier moved the binary pointer to %s", target)
+				}
+			}
+		})
+	}
+}
+
+// A POINTER AND A FENCE ARE NOT A VALIDATED TRANSACTION. Missing, unreadable,
+// foreign and malformed metadata each hold, as do retirement evidence and
+// failed continuity; none may be hidden behind binary recovery admission.
+func TestTheDryRunRequiresTheFencedRecoveryToBeValidated(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		for _, damage := range []string{"missing manifest", "malformed manifest", "unreadable manifest", "foreign directory",
+			"retirement journal", "retirement status", "retirement stage", "continuity"} {
+			name := "guarded/" + damage
+			if legacy {
+				name = "legacy/" + damage
+			}
+			t.Run(name, func(t *testing.T) {
+				f, recovery := retireBinaryRecoveryFixture(t, legacy)
+				_, err := state.WriteMaintenanceFence(f.stateDir, "ansible host upgrade")
+				mustOK(t, err)
+				args := []string{"--dry-run", "--retiring-host", "control-a"}
+				why := "the binary recovery could not be validated"
+				manifest := filepath.Join(recovery, roleJournalName)
+				switch damage {
+				case "missing manifest":
+					mustOK(t, os.Remove(manifest))
+				case "malformed manifest":
+					writeFile(t, manifest, "version: 2\n", 0o600)
+				case "unreadable manifest":
+					mustOK(t, os.Remove(manifest))
+					mustOK(t, os.Mkdir(manifest, 0o700))
+				case "foreign directory":
+					body := strings.ReplaceAll(mustRead(t, manifest), f.stateDir, f.stateDir+"-other")
+					writeFile(t, manifest, body, 0o600)
+					why = "server directory differs from the fenced identity directory"
+				case "retirement journal":
+					f.journalAt(t, retirement.PhaseIntent, "ci-1")
+					why = "binary transaction's pointer"
+				case "retirement status":
+					mustOK(t, retirement.WriteStatus(retirement.PhaseIntent, retirement.VariantServerOnly, retireNow()))
+					why = "no journal to explain it"
+				case "retirement stage":
+					mustOK(t, retirement.WriteStage([]byte("staged configuration")))
+					why = "no journal to explain it"
+				case "continuity":
+					args = append(args, "--expected-holder", "ci-other")
+					why = "holder ci-other"
+					if legacy {
+						why = "expected converge guard is gone"
+					}
+				}
+				out, code := f.run(t, "", args...)
+				m := assertRetireRoute(t, out, code, "hold", why)
+				if m["row_fact"] != string(retirement.RowUnreadable) || m["identity"] != "minted" {
+					t.Fatalf("the damaged recovery did not remain fenced with its identity: %s", out)
+				}
+			})
+		}
+	}
+}
+
+// RECOVERY IS PERMISSION TO RUN, NOT A PREDICTION OF SUCCESS.
+// The role's refusal is the one owner of the recovery-prerequisite judgement;
+// a missing recorded copy must not make those tasks unreachable at the gate.
+func TestTheDryRunLeavesRecoveryPrerequisitesToTheRole(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		name := "guarded"
+		if legacy {
+			name = "legacy"
+		}
+		t.Run(name, func(t *testing.T) {
+			f, recovery := retireBinaryRecoveryFixture(t, legacy)
+			_, err := state.WriteMaintenanceFence(f.stateDir, "ansible host upgrade")
+			mustOK(t, err)
+			path := filepath.Join(recovery, roleJournalName)
+			body := mustRead(t, path)
+			manifest, err := parseRoleJournal([]byte(body), path)
+			mustOK(t, err)
+			input := manifest.Inputs[0]
+			if !input.Existed {
+				t.Fatal("the manifest does not record the input as existing")
+			}
+			copyPath := filepath.Join(recovery, input.Backup)
+			mustOK(t, os.Remove(copyPath))
+
+			out, code := f.run(t, "", "--dry-run", "--retiring-host", "control-a")
+			m := assertRetireRoute(t, out, code, "recovery", "validated binary transaction")
+			if m["row_fact"] != string(retirement.RowUnreadable) || m["state"] != stateNothingRetire ||
+				mustRead(t, path) != body {
+				t.Fatalf("recovery did not preserve the fenced transaction: %s", out)
+			}
+			if _, err := os.Lstat(copyPath); !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("the recorded input's copy is not absent after classification: %v", err)
+			}
+		})
+	}
+}
+
+// RECOVERY'S GUARD CONTINUITY INCLUDES THE MANIFEST READ. The seam moves the
+// facts only once the earlier guard was admitted; the closing observation must
+// withdraw recovery without an expected holder authorizing its replacement.
+func TestTheDryRunClosesRecoveryObservationAfterTheManifestRead(t *testing.T) {
+	for _, change := range []string{"takeover", "marker", "id", "pointer", "guard directory", "manifest replacement",
+		"manifest metadata", "journal", "status", "stage"} {
+		t.Run(change, func(t *testing.T) {
+			f, recovery := retireBinaryRecoveryFixture(t, false)
+			_, err := state.WriteMaintenanceFence(f.stateDir, "ansible host upgrade")
+			mustOK(t, err)
+			record := f.guard.record(t)
+			args := []string{"--dry-run", "--retiring-host", "control-a", "--expected-holder", "ci-1", "--expected-guard", record.ID}
+			out, code := f.run(t, "", args...)
+			assertRetireRoute(t, out, code, "recovery", "validated binary transaction")
+
+			saved := guardHook
+			t.Cleanup(func() { guardHook = saved })
+			reads := 0
+			guardHook = func(op guardOp) error {
+				if op.Kind != "open" || op.Path != filepath.Join(recovery, roleJournalName) {
+					return nil
+				}
+				reads++
+				if reads != 1 {
+					t.Fatal("the classifier read the manifest more than once")
+				}
+				switch change {
+				case "takeover":
+					record.Holder = "ci-2"
+					record.TakenOverFrom = []string{"ci-1"}
+					writeGuardRecordForTest(t, f.guard, record)
+				case "marker":
+					record.Transition = &guardTransition{Kind: transitionRetirement, ID: retireTestID}
+					writeGuardRecordForTest(t, f.guard, record)
+				case "id":
+					record.ID = strings.Repeat("b", 32)
+					writeGuardRecordForTest(t, f.guard, record)
+				case "pointer":
+					other := filepath.Join(f.guard.root, "recovery-20260911T110000-feedface")
+					mustOK(t, os.Mkdir(other, 0o700))
+					mustOK(t, os.Remove(filepath.Join(f.guard.active(), guardPointerName)))
+					mustOK(t, os.Symlink(other, filepath.Join(f.guard.active(), guardPointerName)))
+				case "guard directory":
+					mustOK(t, os.Rename(f.guard.active(), filepath.Join(f.guard.root, "old-guard")))
+					mustOK(t, os.Mkdir(f.guard.active(), 0o700))
+					writeGuardRecordForTest(t, f.guard, record)
+					mustOK(t, os.Symlink(recovery, filepath.Join(f.guard.active(), guardPointerName)))
+				case "manifest replacement":
+					body := mustRead(t, op.Path)
+					before, err := os.Lstat(op.Path)
+					mustOK(t, err)
+					mustOK(t, os.Rename(op.Path, filepath.Join(recovery, "old-manifest.yml")))
+					writeFile(t, op.Path, body, 0o600)
+					// EQUAL METADATA MUST NOT HIDE A DIFFERENT FILE.
+					mustOK(t, os.Chtimes(op.Path, before.ModTime(), before.ModTime()))
+				case "manifest metadata":
+					writeFile(t, op.Path, mustRead(t, op.Path)+"\n# changed during observation\n", 0o600)
+				case "journal":
+					f.journalAt(t, retirement.PhaseIntent, "ci-1")
+				case "status":
+					mustOK(t, retirement.WriteStatus(retirement.PhaseIntent, retirement.VariantServerOnly, retireNow()))
+				case "stage":
+					mustOK(t, retirement.WriteStage([]byte("staged configuration")))
+				}
+				return nil
+			}
+			out, code = f.run(t, "", args...)
+			why := "changed during observation"
+			switch change {
+			case "marker":
+				why = "retirement marker"
+			case "guard directory", "manifest replacement", "manifest metadata":
+				why = "changed during the recovery observation"
+			case "journal", "status", "stage":
+				why = "a retirement artefact appeared"
+			}
+			m := assertRetireRoute(t, out, code, "hold", why)
+			if reads != 1 || m["journal"] != nil || m["marker"] != nil || m["stage"] != "absent" ||
+				m["status_presence"] != "absent" || m["row_fact"] != string(retirement.RowUnreadable) {
+				t.Fatalf("the change did not fall inside the recovery observation (%d reads): %s", reads, out)
+			}
+			if actual := f.guard.record(t); actual.ID != record.ID || actual.Holder != record.Holder ||
+				(actual.Transition == nil) != (record.Transition == nil) {
+				t.Fatalf("the closing observation changed the guard: %+v", actual)
+			}
+		})
+	}
+}
+
+// ONLY THE FENCE'S REFUSAL ADMITS RECOVERY. A broken ledger without a fence,
+// another error joined to that refusal, or an ended observation budget must
+// hold even beside complete binary recovery metadata and a preserved identity.
+func TestTheDryRunDoesNotCallEveryUnreadableLedgerBinaryRecovery(t *testing.T) {
+	for _, failure := range []string{"corrupt ledger", "joined error", "deadline", "missing transaction"} {
+		t.Run(failure, func(t *testing.T) {
+			f, _ := retireBinaryRecoveryFixture(t, false)
+			why := "row is unreadable"
+			if failure == "corrupt ledger" {
+				writeFile(t, state.LedgerPath(f.stateDir), "not a database", 0o600)
+			} else {
+				_, err := state.WriteMaintenanceFence(f.stateDir, "ansible host upgrade")
+				mustOK(t, err)
+			}
+			switch failure {
+			case "joined error", "deadline":
+				saved := retireReportOpen
+				t.Cleanup(func() { retireReportOpen = saved })
+				var entered func(context.Context)
+				var expire func()
+				if failure == "deadline" {
+					entered, expire = pinRetireObservationDeadline(t)
+					why = "exceeded retireReportLedgerBound"
+				} else {
+					why = "independent open failure"
+				}
+				retireReportOpen = func(ctx context.Context, cfg *config.Config, dsn string) (*state.DB, error) {
+					db, err := saved(ctx, cfg, dsn)
+					if db != nil || !state.OnlyCause(err, state.ErrMaintenance) {
+						t.Fatalf("the real open did not refuse solely on the fence: %v", err)
+					}
+					if failure == "deadline" {
+						entered(ctx)
+						expire()
+					} else {
+						err = errors.Join(err, errors.New("independent open failure"))
+					}
+
+					return nil, err
+				}
+			case "missing transaction":
+				mustOK(t, os.Remove(filepath.Join(f.guard.active(), guardPointerName)))
+			}
+			out, code := f.run(t, "", "--dry-run", "--retiring-host", "control-a")
+			m := assertRetireRoute(t, out, code, "hold", why)
+			if m["row_fact"] != string(retirement.RowUnreadable) || m["identity"] != "minted" ||
+				m["authority"] != "present" || m["journal"] != nil || m["state"] != stateNothingRetire {
+				t.Fatalf("the unreadable ledger did not establish the countercase: %s", out)
+			}
+		})
+	}
+}
+
+// A FENCE RAISED AFTER OPEN STILL REFUSES THE READ. Recovery requires the
+// snapshot's sole cause to be maintenance and its cleanup to finish cleanly;
+// a close failure beside that refusal is independent evidence that holds.
+func TestTheDryRunJudgesAFenceRaisedBeforeTheSnapshot(t *testing.T) {
+	for _, closeFails := range []bool{false, true} {
+		name := "clean close"
+		if closeFails {
+			name = "failed close"
+		}
+		t.Run(name, func(t *testing.T) {
+			f, _ := retireBinaryRecoveryFixture(t, false)
+			savedSnapshot, savedClose := retireReportSnapshot, retireReportClose
+			t.Cleanup(func() { retireReportSnapshot, retireReportClose = savedSnapshot, savedClose })
+			reads, closes := 0, 0
+			retireReportSnapshot = func(ctx context.Context, db *state.DB) (rollout.StatusSnapshot, error) {
+				reads++
+				_, err := state.WriteMaintenanceFence(f.stateDir, "ansible host upgrade")
+				mustOK(t, err)
+				snapshot, err := savedSnapshot(ctx, db)
+				if !state.OnlyCause(err, state.ErrMaintenance) {
+					t.Fatalf("the snapshot did not refuse on the new fence: %v", err)
+				}
+
+				return snapshot, err
+			}
+			retireReportClose = func(db *state.DB) error {
+				closes++
+				mustOK(t, savedClose(db))
+				if closeFails {
+					return errors.New("independent close failure")
+				}
+
+				return nil
+			}
+			out, code := f.run(t, "", "--dry-run", "--retiring-host", "control-a")
+			want, why := "recovery", "validated binary transaction"
+			if closeFails {
+				want, why = "hold", "independent close failure"
+			}
+			m := assertRetireRoute(t, out, code, want, why)
+			if reads != 1 || closes != 1 || m["row_fact"] != string(retirement.RowUnreadable) {
+				t.Fatalf("the fence did not refuse the snapshot (%d reads, %d closes): %s", reads, closes, out)
+			}
+		})
+	}
+}
+
+// A FENCE BESIDE NO REGULAR LEDGER IS NOT MAINTENANCE'S REFUSAL. Root's
+// owner path and the direct inspection must agree on that earlier failure,
+// including a symlink to an otherwise usable ledger, and grant no recovery.
+func TestTheDryRunKeepsOwnerAndDirectLedgerPreconditionsInOrder(t *testing.T) {
+	for _, owner := range []bool{false, true} {
+		for _, damage := range []string{"missing", "directory", "symlink"} {
+			name := "direct/" + damage
+			if owner {
+				name = "owner/" + damage
+			}
+			t.Run(name, func(t *testing.T) {
+				f, _ := retireBinaryRecoveryFixture(t, false)
+				_, err := state.WriteMaintenanceFence(f.stateDir, "ansible host upgrade")
+				mustOK(t, err)
+				savedEUID, savedOwner, savedReexec := statusEUID, statusOwnerOf, retireReexecCapture
+				savedOpen := retireReportOpen
+				t.Cleanup(func() {
+					statusEUID, statusOwnerOf, retireReexecCapture = savedEUID, savedOwner, savedReexec
+					retireReportOpen = savedOpen
+				})
+				statusEUID = func() int { return 0 }
+				statusOwnerOf = func(string) (uint32, uint32, error) {
+					if owner {
+						return 990, 991, nil
+					}
+					return 0, 0, nil
+				}
+				retireReexecCapture = func(context.Context, uint32, uint32, []string) ([]byte, int, error) {
+					t.Fatal("the ledger precondition or fence did not refuse before re-execution")
+					return nil, 0, errors.New("unexpected re-execution")
+				}
+				out, code := f.run(t, "", "--dry-run", "--retiring-host", "control-a")
+				assertRetireRoute(t, out, code, "recovery", "validated binary transaction")
+
+				ledger := state.LedgerPath(f.stateDir)
+				kept := filepath.Join(t.TempDir(), "billet.db")
+				mustOK(t, os.Rename(ledger, kept))
+				switch damage {
+				case "directory":
+					mustOK(t, os.Mkdir(ledger, 0o700))
+				case "symlink":
+					mustOK(t, os.Symlink(kept, ledger))
+				}
+				opens := 0
+				retireReportOpen = func(ctx context.Context, cfg *config.Config, dsn string) (*state.DB, error) {
+					opens++
+					if owner {
+						t.Fatal("root attempted to open another account's SQLite ledger")
+					}
+					db, err := savedOpen(ctx, cfg, dsn)
+					if db != nil || !state.OnlyCause(err, state.ErrNoLedger) {
+						t.Fatalf("the direct inspection did not fail on its ledger precondition: %v", err)
+					}
+					return db, err
+				}
+				out, code = f.run(t, "", "--dry-run", "--retiring-host", "control-a")
+				m := assertRetireRoute(t, out, code, "hold", "no ledger to inspect")
+				why, ok := m["why"].(string)
+				wantOpens, clause := 1, "is not a regular file"
+				if owner {
+					wantOpens = 0
+				}
+				if damage == "missing" {
+					clause = "does not exist"
+				}
+				if opens != wantOpens || !ok || !strings.Contains(why, "billet.db "+clause) ||
+					strings.Contains(why, "fenced for host maintenance") || m["row_fact"] != string(retirement.RowUnreadable) ||
+					m["identity"] != "minted" || m["state"] != stateNothingRetire {
+					t.Fatalf("the owner and direct paths disagreed on the ledger prerequisite (%d opens): %s", opens, out)
+				}
+			})
+		}
+	}
+}
+
+// ROOT MUST HONOUR THE FENCE BEFORE RE-EXECUTING AS THE SQLITE OWNER. A
+// child's failed exit carries no cause, and opening the ledger as root to
+// recover that cause could leave sidecars the service account cannot reopen.
+func TestTheDryRunAdmitsBinaryRecoveryBeforeTheOwnersReport(t *testing.T) {
+	f, _ := retireBinaryRecoveryFixture(t, false)
+	_, err := state.WriteMaintenanceFence(f.stateDir, "ansible host upgrade")
+	mustOK(t, err)
+	savedEUID, savedOwner, savedReexec := statusEUID, statusOwnerOf, retireReexecCapture
+	savedOpen := retireReportOpen
+	t.Cleanup(func() {
+		statusEUID, statusOwnerOf, retireReexecCapture = savedEUID, savedOwner, savedReexec
+		retireReportOpen = savedOpen
+	})
+	statusEUID = func() int { return 0 }
+	statusOwnerOf = func(string) (uint32, uint32, error) { return 990, 991, nil }
+	retireReexecCapture = func(context.Context, uint32, uint32, []string) ([]byte, int, error) {
+		t.Fatal("the maintenance fence did not refuse the owner's report before re-execution")
+		return nil, 0, errors.New("unexpected re-execution")
+	}
+	retireReportOpen = func(context.Context, *config.Config, string) (*state.DB, error) {
+		t.Fatal("root attempted to open another account's SQLite ledger")
+		return nil, errors.New("unexpected ledger open")
+	}
+	out, code := f.run(t, "", "--dry-run", "--retiring-host", "control-a")
+	m := assertRetireRoute(t, out, code, "recovery", "validated binary transaction")
+	why, ok := m["why"].(string)
+	if m["row_fact"] != string(retirement.RowUnreadable) || !ok ||
+		!strings.Contains(why, "refused before running the owner's report") {
+		t.Fatalf("the owner's observation did not stop at the fence: %s", out)
+	}
+}
+
+// retireBinaryRecoveryFixture publishes the role's real manifest shape beside
+// an established SQLite controller. Only the state paths are relocated into
+// the test's tree; the manifest validator still judges every recorded member.
+func retireBinaryRecoveryFixture(t *testing.T, legacy bool) (*retireFixture, string) {
+	t.Helper()
+
+	f := newRetireFixture(t)
+	_, err := wirecert.LoadOrCreateCA(f.stateDir, f.identity)
+	mustOK(t, err)
+	name := "recovery-20260911T100000-0badcafe"
+	if legacy {
+		name = "20260911T100000000000000"
+		mustOK(t, os.MkdirAll(f.guard.root, 0o700))
+	} else {
+		mustHold(t, "ci-1")
+	}
+	recovery := filepath.Join(f.guard.root, name)
+	mustOK(t, os.Mkdir(recovery, 0o700))
+
+	saved := roleStateRoot
+	t.Cleanup(func() { roleStateRoot = saved })
+	roleStateRoot = filepath.Dir(f.stateDir) + string(filepath.Separator)
+	body := strings.ReplaceAll(string(roleManifestFixture(t)), "/var/lib/billet/server", f.stateDir)
+	body = strings.ReplaceAll(body, "/var/lib/billet/node", filepath.Join(filepath.Dir(f.stateDir), "recovery-node"))
+	plantRoleJournal(t, recovery, []byte(body))
+	writeFile(t, filepath.Join(recovery, "billet.previous"), mustRead(t, f.guard.binary), 0o755)
+	writeFile(t, filepath.Join(recovery, "billet.yaml.previous"), mustRead(t, f.cfg), 0o600)
+	for _, unit := range []string{"billet-server.service", "billet-node.service"} {
+		writeFile(t, filepath.Join(recovery, unit+".previous"), mustRead(t, filepath.Join("../../deploy", unit)), 0o600)
+	}
+	if legacy {
+		writeFile(t, f.guard.active(), recovery+"\n", 0o600)
+	} else {
+		mustOK(t, os.Symlink(recovery, filepath.Join(f.guard.active(), guardPointerName)))
+	}
+
+	return f, recovery
+}
+
+// AN OBSERVED BINARY POINTER EXCLUDES RETIREMENT ROUTES. Recovery
 // still reaches the tasks that own that pointer, with or without continuity
 // flags; omitting an expectation cannot hide the pointer in front of us.
 func TestTheDryRunKeepsBinaryRecoveryOnTheOrdinaryRoute(t *testing.T) {
@@ -1664,6 +2293,76 @@ func TestTheDryRunAcceptsAReservationWhoseOnlyIdentityFileWasLost(t *testing.T) 
 	}
 }
 
+// AN UNRELATED VALIDATION FAILURE DOES NOT ERASE THE IDENTITY LOCATOR. The
+// custom directory still holds this controller's identity and CA beside a live
+// reservation; observing the empty packaged path would falsely admit bootstrap.
+func TestTheDryRunKeepsACustomLocatorWhenConfigurationValidationFails(t *testing.T) {
+	f := newRequestFixture(t)
+	row := f.reserve(t)
+	packaged := filepath.Join(retirement.Root, "server")
+	if _, err := os.Lstat(packaged); !os.IsNotExist(err) {
+		t.Fatalf("the packaged path was not absent: %v", err)
+	}
+	installed := mustRead(t, f.cfg)
+	valid, err := config.Parse(f.cfg, []byte(installed))
+	mustOK(t, err)
+	if valid.Server.IdentityDir != f.stateDir || valid.Server.MaxVCPU <= 0 {
+		t.Fatal("the fixture does not name the established custom identity directory")
+	}
+
+	for _, failure := range []string{"validation", "field decoding", "tier expansion"} {
+		t.Run(failure, func(t *testing.T) {
+			body := installed
+			switch failure {
+			case "validation":
+				body = strings.Replace(body, "  max_vcpu: 8", "  max_vcpu: 0", 1)
+			case "field decoding":
+				body = strings.Replace(body, "  max_vcpu: 8", "  max_vcpu: invalid", 1)
+			case "tier expansion":
+				body = strings.Replace(body, "    vcpu: 2", "    vcpu: 2\n    sizes: [2]", 1)
+			}
+			if body == installed {
+				t.Fatal("the fixture did not introduce its configuration error")
+			}
+			if _, err := config.Parse(f.cfg, []byte(body)); err == nil {
+				t.Fatal("the configuration error did not make validation fail")
+			}
+			writeFile(t, f.cfg, body, 0o600)
+			for _, requested := range []bool{false, true} {
+				args := []string{"--dry-run", "--retiring-host", requestRetiring}
+				if requested {
+					args = append(args, "--requested")
+				}
+				out, code := f.run(t, "", args...)
+				m := assertRetireRoute(t, out, code, "hold", "row is unreadable")
+				if m["config"] != "malformed" || m["installed_roles"] != nil || m["identity"] != "minted" ||
+					m["authority"] != "present" || m["row_fact"] != string(retirement.RowUnreadable) ||
+					m["row"] != nil || m["journal"] != nil || m["state"] != stateNothingRetire {
+					t.Fatalf("invalid configuration concealed the custom identity and authority: %s", out)
+				}
+			}
+			if mustRead(t, f.cfg) != body {
+				t.Fatal("the classifier repaired the invalid configuration")
+			}
+		})
+	}
+
+	// THE RESERVATION SURVIVES INDEPENDENTLY OF THE MALFORMED CONFIGURATION.
+	// Reading it by the known deployment proves the admission would cross work
+	// already reserved, rather than merely observing an unused custom directory.
+	db, err := state.OpenPostgresInspect(t.Context(), f.stateDir, f.dsn)
+	mustOK(t, err)
+	kept, present, readErr := db.ReadRetirement(t.Context(), f.identity)
+	mustOK(t, db.Close())
+	mustOK(t, readErr)
+	if !present || kept.State != state.RetirementReserved || kept.TransitionID != row.TransitionID || kept.Run != requestRun {
+		t.Fatalf("the live reservation did not survive: present %t, row %+v", present, kept)
+	}
+	if _, err := os.Lstat(packaged); !os.IsNotExist(err) {
+		t.Fatalf("the classifier created the packaged identity directory: %v", err)
+	}
+}
+
 // PACKAGE PREPARATION CREATES A DIRECTORY BEFORE THE CONFIGURATION IS VALID.
 // Admission rests on identity and authority observations, not that directory's
 // existence; a minted identity may still name an unreadable reservation.
@@ -1687,7 +2386,9 @@ func TestTheDryRunJudgesPackagePreparationByIdentityAndAuthority(t *testing.T) {
 				case "malformed":
 					// THE ACTUAL PACKAGE SEED IS VALID YAML BUT INVALID CONFIG:
 					// zero capacity and placeholder App facts await a converge.
-					writeFile(t, f.cfg, mustRead(t, "../../deploy/billet.yaml"), 0o600)
+					// Relocate its identity path into the fixture's packaged tree.
+					seed := strings.ReplaceAll(mustRead(t, "../../deploy/billet.yaml"), "/var/lib/billet/server", dir)
+					writeFile(t, f.cfg, seed, 0o600)
 				case "present":
 					f.cfg = writeRetirePostgresConfig(t, dir)
 				}
@@ -1738,7 +2439,7 @@ func TestTheDryRunJudgesPackagePreparationByIdentityAndAuthority(t *testing.T) {
 					}
 					out, code := f.run(t, "", args...)
 					m := assertRetireRoute(t, out, code, want, why)
-					roles := ""
+					var roles any
 					if configuration == "present" {
 						roles = "server"
 					}
@@ -1818,6 +2519,12 @@ func assertRetireRoute(t *testing.T, out string, code int, route, clause string)
 	t.Helper()
 
 	m := retireAnswer(t, out)
+	// ROLES ARE NULL EXACTLY WHEN CONFIGURATION IS NOT PRESENT. Check the
+	// member's presence too: omitting it is not publishing JSON null.
+	roles, present := m["installed_roles"]
+	if !present || (m["config"] != "present") != (roles == nil) {
+		t.Fatalf("installed roles do not follow configuration presence: %s", out)
+	}
 	if code != 0 || m["outcome"] != retireOutcomeReported || m["route"] != route {
 		t.Fatalf("the classifier answered route %v at exit %d, want %s: %s", m["route"], code, route, out)
 	}
