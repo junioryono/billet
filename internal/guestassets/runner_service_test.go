@@ -21,13 +21,8 @@ func TestRunnerServicePreservesHostedJobResultCodes(t *testing.T) {
 			t.Parallel()
 
 			root := t.TempDir()
-			if err := os.MkdirAll(filepath.Join(root, "bin"), 0o755); err != nil {
-				t.Fatalf("make runner bin: %v", err)
-			}
-			listener := filepath.Join(root, "bin", "Runner.Listener")
-			if err := os.WriteFile(listener, []byte("#!/bin/sh\nexit \"$BILLET_TEST_RESULT\"\n"), 0o755); err != nil {
-				t.Fatalf("write fake listener: %v", err)
-			}
+			linkListener(t, root)
+
 			wrapper := filepath.Join(root, "runner-service")
 			if err := os.WriteFile(wrapper, source, 0o755); err != nil {
 				t.Fatalf("write runner wrapper: %v", err)
@@ -48,12 +43,10 @@ func TestRunnerServiceMatchesTheStockDeprecatedVersionExitContract(t *testing.T)
 	t.Parallel()
 
 	root := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(root, "bin"), 0o755); err != nil {
-		t.Fatalf("make runner bin: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(root, "bin", "Runner.Listener"), []byte("#!/bin/sh\nexit 7\n"), 0o755); err != nil {
-		t.Fatalf("write fake listener: %v", err)
-	}
+	linkListener(t, root)
+
+	// The shared listener answers 7 when no result is named, which is this
+	// case's whole subject.
 	source, err := os.ReadFile("runner-service.sh")
 	if err != nil {
 		t.Fatalf("read runner wrapper: %v", err)

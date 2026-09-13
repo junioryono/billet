@@ -2,7 +2,10 @@ package guestassets
 
 import (
 	"errors"
+	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"syscall"
 	"testing"
 	"time"
@@ -24,7 +27,14 @@ const (
 
 // retryETXTBSY runs attempt(), which must build a FRESH command each call — an
 // exec.Cmd cannot be reused after Start — and retries only the text-file-busy
-// start failure, in either shape it reaches this process.
+// start failure.
+//
+// ONLY THE SYSCALL, NEVER A STATUS. A shell that could not exec its child
+// answers 126, and CI has produced exactly that (`hosted result 103 became
+// exit status 126`, 2026-09-12) — but an exit status means the process RAN,
+// and retrying it would re-run whatever it did before it failed, which is the
+// one thing this retry may not do. The nested race is removed at its source
+// instead: see sharedListener.
 func retryETXTBSY[T any](attempt func() (T, error)) (T, error) {
 	var (
 		out T
@@ -33,7 +43,7 @@ func retryETXTBSY[T any](attempt func() (T, error)) (T, error) {
 
 	for range etxtbsyAttempts {
 		out, err = attempt()
-		if !errors.Is(err, syscall.ETXTBSY) && !shellCouldNotExec(err) {
+		if !errors.Is(err, syscall.ETXTBSY) {
 			return out, err
 		}
 
@@ -43,26 +53,53 @@ func retryETXTBSY[T any](attempt func() (T, error)) (T, error) {
 	return out, err
 }
 
-// shellCouldNotExec says whether an error is a SHELL reporting that it could
-// not execute a child.
+// sharedListener is the fake `Runner.Listener` every runner-service fixture
+// runs, written ONCE by TestMain and reached by SYMLINK from each fixture's
+// tree.
 //
-// THE SAME RACE, ONE LEVEL DOWN. The wrappers these tests exec are /bin/sh
-// scripts that run a script the same subtest has just written, and when THAT
-// exec meets the window above, the shell reports it as exit status 126 rather
-// than passing ETXTBSY up: a fresh Fedora or Ubuntu `sh` answers 126 for
-// "found, could not execute". So the start-only retry has to recognise both
-// spellings, and it is safe to retry here because no fixture in this package
-// expects 126 from anything — every case asserts a status its own fake chose
-// (measured on CI's Linux runner, 2026-09-12, where `hosted result 103 became
-// exit status 126`).
-func shellCouldNotExec(err error) bool {
-	exit, ok := errors.AsType[*exec.ExitError](err)
+// WHY ONCE, AND WHY A LINK. The ETXTBSY window above is opened by WRITING an
+// executable while other tests fork; a wrapper that then execs such a file
+// meets the same race one level down, where the shell reports it as exit
+// status 126 and the start-only retry cannot see it (CI, 2026-09-12). Writing
+// the listener before any test has started leaves no concurrent fork to
+// capture its descriptor, and a symlink creates no descriptor at all, so the
+// race is gone rather than retried. The exit code comes from the environment,
+// which is what makes one file serve every case.
+var sharedListener string
 
-	return ok && exit.ExitCode() == shellExecFailed
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "billet-guestassets-")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "make the shared listener's directory:", err)
+		os.Exit(1)
+	}
+
+	sharedListener = filepath.Join(dir, "Runner.Listener")
+
+	if err := os.WriteFile(sharedListener, []byte("#!/bin/sh\nexit \"${BILLET_TEST_RESULT:-7}\"\n"), 0o755); err != nil {
+		fmt.Fprintln(os.Stderr, "write the shared listener:", err)
+		os.Exit(1)
+	}
+
+	code := m.Run()
+
+	_ = os.RemoveAll(dir)
+
+	os.Exit(code)
 }
 
-// shellExecFailed is POSIX's "command found but could not be executed".
-const shellExecFailed = 126
+// linkListener puts the shared listener where a runner tree expects it.
+func linkListener(t *testing.T, root string) {
+	t.Helper()
+
+	if err := os.MkdirAll(filepath.Join(root, "bin"), 0o755); err != nil {
+		t.Fatalf("make runner bin: %v", err)
+	}
+
+	if err := os.Symlink(sharedListener, filepath.Join(root, "bin", "Runner.Listener")); err != nil {
+		t.Fatalf("link the shared listener: %v", err)
+	}
+}
 
 // cloneCmd rebuilds a command for a retry attempt.
 func cloneCmd(t *testing.T, cmd *exec.Cmd) *exec.Cmd {

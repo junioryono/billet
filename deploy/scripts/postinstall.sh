@@ -27,8 +27,15 @@ JAILER_DIR=/srv/jailer
 # is allowed here because an EC2 or Docker-only node does not use Ceph; `billet
 # check` remains the place that rejects an enabled Ceph configuration whose host
 # cannot satisfy it.
+# THE LOAD ITSELF IS OPTIONAL TOO. `modprobe -n` says the module resolves, not
+# that this kernel will load it: a locked-down or container host can refuse the
+# real load, and under `set -e` that would end an install for a host that may
+# not use Ceph at all.
 if command -v modprobe >/dev/null 2>&1 && modprobe -n rbd >/dev/null 2>&1; then
-    modprobe rbd
+    if ! modprobe rbd; then
+        echo "billet: the rbd module resolves but this kernel would not load it; a Ceph" >&2
+        echo "        configuration will be refused by \`billet check\` until it can." >&2
+    fi
 fi
 
 if ! getent group billet >/dev/null 2>&1; then
@@ -234,7 +241,17 @@ lock_dir_ready() {
     [ -d "${dir}" ]
 }
 
-if command -v flock >/dev/null 2>&1 && lock_dir_ready; then
+# lock_openable says whether the lock file can be opened for append.
+#
+# IN A SUBSHELL, BECAUSE A FAILED REDIRECTION ON `exec` ENDS THE SHELL. A
+# readable directory proves nothing about the file: the lock's name can be a
+# directory itself, or its filesystem read-only, and the `exec 9>>` below would
+# then take the whole scriptlet down instead of deferring the work it guards.
+lock_openable() {
+    ( : >>"${LIFECYCLE_LOCK}" ) 2>/dev/null
+}
+
+if command -v flock >/dev/null 2>&1 && lock_dir_ready && lock_openable; then
     # THE LOCK ON A DESCRIPTOR OF THIS SHELL, so the functions above run under it
     # in this process; `flock <file> <command>` would need a second script.
     exec 9>>"${LIFECYCLE_LOCK}"
@@ -251,9 +268,18 @@ if command -v flock >/dev/null 2>&1 && lock_dir_ready; then
     fi
 else
     echo "billet: the unit decisions cannot be excluded against a lifecycle operation, so" >&2
-    echo "        ${CONF} was not seeded and no timer was enabled: flock(1) is missing, or" >&2
-    echo "        $(dirname "${LIFECYCLE_LOCK}") is not a directory this host can make." >&2
-    echo "        Install util-linux, make that directory, and run \`dpkg-reconfigure billet\`." >&2
+    echo "        ${CONF} was not seeded and no timer was enabled." >&2
+
+    if ! command -v flock >/dev/null 2>&1; then
+        echo "        flock(1) is missing; install util-linux." >&2
+    else
+        echo "        ${LIFECYCLE_LOCK} could not be opened: its directory is" >&2
+        echo "        $(readlink -f "$(dirname "${LIFECYCLE_LOCK}")" 2>/dev/null || dirname "${LIFECYCLE_LOCK}")," >&2
+        echo "        which must exist and be writable by root." >&2
+    fi
+
+    echo "        Once it can, re-run these decisions: \`dpkg-reconfigure billet\` on a deb" >&2
+    echo "        host, or reinstalling the package on an rpm one." >&2
 fi
 
 # THE APP KEY IS OWNED BY THE SERVICE USER AT 0600, and it is the one file here
