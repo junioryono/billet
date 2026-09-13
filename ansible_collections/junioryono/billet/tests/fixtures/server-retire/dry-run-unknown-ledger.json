@@ -19,6 +19,7 @@
   "row": null,
   "row_fact": "unreadable",
   "dispatch": "unknown-ledger",
+  "config": "present",
   "why": "the ledger could not be opened for the report: ping state db: file is not a database (26)",
-  "state": "nothing"
+  "state": "intent"
 }

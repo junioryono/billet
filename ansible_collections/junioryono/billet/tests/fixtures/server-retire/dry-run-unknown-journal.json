@@ -19,5 +19,6 @@
   "row": null,
   "row_fact": "absent",
   "dispatch": "unknown-reservation",
-  "state": "nothing"
+  "config": "present",
+  "state": "intent"
 }

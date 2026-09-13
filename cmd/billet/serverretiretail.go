@@ -327,20 +327,6 @@ func retireOpenLedgerByLocator(ctx context.Context, j retirement.Journal) (*stat
 	})
 }
 
-// retireInspectLedgerByLocator is the same open for a run that only LOOKS.
-//
-// THE COMPLETION OPEN TAKES THE DIRECTORY LOCK AND MAY CREATE THE DIRECTORY,
-// which is right for the tail — it is about to write the deployment's row under
-// this converge's guard — and wrong for the dry run, whose whole contract is
-// that it takes nothing. `OpenPostgresInspect` creates nothing, locks nothing
-// and refuses every write, which is what a classifier may do to a ledger it
-// does not hold.
-func retireInspectLedgerByLocator(ctx context.Context, j retirement.Journal) (*state.DB, ledgerProblem) {
-	return retireOpenByLocator(ctx, j, func(ctx context.Context, dir, dsn string) (*state.DB, error) {
-		return state.OpenPostgresInspect(ctx, dir, dsn, state.WithRunningRelease(version.Version()))
-	})
-}
-
 func retireOpenByLocator(ctx context.Context, j retirement.Journal,
 	open func(ctx context.Context, dir, dsn string) (*state.DB, error),
 ) (*state.DB, ledgerProblem) {

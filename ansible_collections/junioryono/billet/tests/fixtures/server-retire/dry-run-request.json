@@ -9,5 +9,6 @@
   "row": null,
   "row_fact": "absent",
   "dispatch": "request",
+  "config": "present",
   "state": "nothing"
 }

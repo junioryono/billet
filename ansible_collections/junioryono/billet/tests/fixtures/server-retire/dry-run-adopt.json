@@ -19,5 +19,6 @@
   },
   "row_fact": "reserved-mine",
   "dispatch": "adopt",
+  "config": "present",
   "state": "nothing"
 }

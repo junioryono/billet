@@ -16,6 +16,7 @@ import (
 	"github.com/junioryono/billet/internal/retirement"
 	"github.com/junioryono/billet/internal/rollout"
 	"github.com/junioryono/billet/internal/state"
+	"github.com/junioryono/billet/internal/version"
 )
 
 // `billet server retire` is a controller's retirement as a command, the role
@@ -1205,6 +1206,22 @@ func observeRetireDryRunConfig(path string) (*config.Config, string) {
 // through the journal's locator, against the identity the journal recorded.
 // Everything the open cannot establish is `unreadable` with its reason, never
 // an absence.
+// retireInspectLedgerByLocator is the tail's locator open for a run that only
+// LOOKS, and it lives here rather than beside the tail's because the tail's own
+// file is held to naming ONE construction path.
+//
+// THE COMPLETION OPEN TAKES THE DIRECTORY LOCK AND MAY CREATE THE DIRECTORY,
+// which is right for the tail — it is about to write the deployment's row under
+// this converge's guard — and wrong for the dry run, whose whole contract is
+// that it takes nothing. `OpenPostgresInspect` creates nothing, locks nothing
+// and refuses every write, which is what a classifier may do to a ledger it
+// does not hold.
+func retireInspectLedgerByLocator(ctx context.Context, j retirement.Journal) (*state.DB, ledgerProblem) {
+	return retireOpenByLocator(ctx, j, func(ctx context.Context, dir, dsn string) (*state.DB, error) {
+		return state.OpenPostgresInspect(ctx, dir, dsn, state.WithRunningRelease(version.Version()))
+	})
+}
+
 func readRetireRowByLocator(ctx context.Context, j retirement.Journal) (*retireReportRow, retirement.RowFact, string) {
 	// THE OPEN THAT TAKES NOTHING. A dry run creates no directory, takes no
 	// lock and writes nothing, and the tail's own open does all three.
