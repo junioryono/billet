@@ -752,8 +752,13 @@ func TestServerRetireRequestReconcilesTheNodeSetAndTheAddressRule(t *testing.T) 
 const (
 	retainedEndpoint    = "https://10.0.0.2:7717"
 	retainedIncarnation = "00112233445566778899aabbccddeeff"
-	retainedInvocation  = "0123456789abcdef0123456789abcdef"
 	survivorAddress     = "10.0.0.2"
+
+	// The invocation the node runs under BEFORE the retirement, which every
+	// report and the receipt of the time name, and the one systemd mints for
+	// the restart the transition performs.
+	retainedInvocation        = "0123456789abcdef0123456789abcdef"
+	retainedRestartInvocation = "fedcba9876543210fedcba9876543210"
 )
 
 // retainANode rewrites this host's configuration with a node beside the
@@ -847,20 +852,20 @@ func (f *requestFixture) nodeReport(t *testing.T) map[string]any {
 
 	for member, value := range map[string]any{
 		"node": "node-a", "deployment": f.identity, "incarnation": retainedIncarnation,
-		"invocation_id": "0123456789abcdef0123456789abcdef", "endpoint": retainedEndpoint,
+		"invocation_id": retainedInvocation, "endpoint": retainedEndpoint,
 	} {
 		setPath(t, inspect, value, "host", "registration", member)
 	}
 
 	for member, value := range map[string]any{
 		"node": "node-a", "deployment": f.identity, "incarnation": retainedIncarnation,
-		"invocation_id": "0123456789abcdef0123456789abcdef", "installed_endpoint": retainedEndpoint,
+		"invocation_id": retainedInvocation, "installed_endpoint": retainedEndpoint,
 		"effective_endpoint": retainedEndpoint, "installed_sha256": digest,
 	} {
 		setPath(t, inspect, value, "host", "endpoint_receipt", "receipt", member)
 	}
 
-	setPath(t, inspect, "0123456789abcdef0123456789abcdef", "services", "node", "invocation_id")
+	setPath(t, inspect, retainedInvocation, "services", "node", "invocation_id")
 
 	return map[string]any{"host": requestRetiring, "collected_at": requestCollected, "inspect": inspect, "status": nil}
 }

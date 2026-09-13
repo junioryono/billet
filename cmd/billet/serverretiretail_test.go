@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/retirement"
 	"github.com/junioryono/billet/internal/state"
@@ -316,7 +317,7 @@ func TestTheTailRewritesTheRetainedNodesReceipt(t *testing.T) {
 
 	f.svc.onStart = func(unit string) {
 		if unit == nodeUnit {
-			writeRegistrationRecord(t, record, f.identity, retainedEndpoint)
+			restartedNode(t, f, record, retainedEndpoint)
 		}
 	}
 
@@ -325,10 +326,13 @@ func TestTheTailRewritesTheRetainedNodesReceipt(t *testing.T) {
 	// the configuration it loaded, and both are about to change. A test that
 	// started from nothing would prove the tail can CREATE a receipt and say
 	// nothing about the one it must replace.
+	// THE RECEIPT OF THE TIME, coherent with every report the request carries:
+	// the configuration this host had before the rewrite, and the invocation
+	// it was running under before the restart.
 	before := endpointReceipt{
 		Schema: 1, Run: "ci-0", Node: "node-a", Deployment: f.identity,
-		InstalledSHA256: strings.Repeat("a", 64), InstalledEndpoint: retainedEndpoint,
-		EffectiveEndpoint: retainedEndpoint, InvocationID: strings.Repeat("b", 32),
+		InstalledSHA256: f.installedSHA(t), InstalledEndpoint: retainedEndpoint,
+		EffectiveEndpoint: retainedEndpoint, InvocationID: retainedInvocation,
 		Incarnation: retainedIncarnation, WrittenAt: "2026-09-10T10:00:00Z",
 	}
 
@@ -354,7 +358,9 @@ func TestTheTailRewritesTheRetainedNodesReceipt(t *testing.T) {
 		t.Fatalf("the receipt names another configuration: %+v", receipt)
 	}
 
-	if receipt.InvocationID != retainedInvocation || receipt.InvocationID == before.InvocationID {
+	// THE INVOCATION THE RESTART PRODUCED, which is not the one the receipt
+	// carried and not the one every report names.
+	if receipt.InvocationID != retainedRestartInvocation {
 		t.Fatalf("the receipt names another invocation: %+v", receipt)
 	}
 
@@ -447,4 +453,48 @@ func TestTheTailOpensTheLedgerAsACompletionAndNothingElse(t *testing.T) {
 	if len(opens) != 1 || opens[0] != "OpenPostgresCompletion" {
 		t.Fatalf("the tail's opens of the ledger: %v", opens)
 	}
+}
+
+// THE LEDGER ATTEMPT HAS ITS OWN DEADLINE, and its expiry is a pending row
+// rather than a failed converge. The open bounds itself and that bound ends
+// when it returns, so a connection that goes unresponsive afterwards would
+// leave the command waiting on the transport's own timeouts while it holds the
+// converge's guard.
+func TestTheTailBoundsTheWholeLedgerAttempt(t *testing.T) {
+	f := newRequestFixture(t)
+	f.reserve(t)
+
+	// A bound already spent when the attempt begins: what it proves is that
+	// the attempt is under one at all, and what its expiry answers.
+	saved := retireLedgerBound
+	retireLedgerBound = time.Nanosecond
+
+	t.Cleanup(func() { retireLedgerBound = saved })
+
+	out, code := f.request(t, f.input(t, nil))
+
+	m := retireAnswer(t, out)
+	if code != 0 || m["outcome"] != retireOutcomeRetired || m["row"] != retireRowPending {
+		t.Fatalf("a ledger attempt past its bound: %s", out)
+	}
+
+	why, ok := m["row_why"].(string)
+	if !ok || !strings.Contains(why, "did not answer within") {
+		t.Fatalf("the pending row does not name the bound: %s", out)
+	}
+
+	// AND THE RETIREMENT STILL OWES THE ROW: the marker is kept and nothing is
+	// settled, which is what sends the role to the survivor.
+	if m["marker"] != retireMarkerKept || m["settled"] != false {
+		t.Fatalf("a bounded attempt settled the retirement: %s", out)
+	}
+
+	f.pgLedger(t, func(db *state.DB) {
+		r, present, err := db.ReadRetirement(t.Context(), f.identity)
+		mustOK(t, err)
+
+		if !present || r.State != state.RetirementIntent {
+			t.Fatalf("the row moved under an attempt that never reached the ledger: %+v (present %v)", r, present)
+		}
+	})
 }

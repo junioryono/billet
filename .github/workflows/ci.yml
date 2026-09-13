@@ -175,14 +175,18 @@ jobs:
   # about it is a fact about the server rather than about billet's code -- what
   # an advisory lock excludes, what a read-only transaction refuses, what the
   # catalogue reports -- so a fake would assert billet's own assumptions back at
-  # itself. Here: internal/state's backend tests (gated on the DSN), the one
-  # backup test that needs a live database, and the capacity suite run once
-  # with the ledger switched (BILLET_TEST_LEDGER=postgres), which is the
-  # conformance run the single job made. internal/state's SQLite suite is NOT
-  # re-run here.
+  # itself. Here: internal/state's backend tests (gated on the DSN), the whole
+  # command suite (whose PostgreSQL-only tests -- the backup's end-to-end gate
+  # and every test of a controller's retirement -- skip in the SQLite job), and
+  # the capacity suite run once with the ledger switched
+  # (BILLET_TEST_LEDGER=postgres), which is the conformance run the single job
+  # made. internal/state's SQLite suite is NOT re-run here.
   test-postgres:
     runs-on: billet-8vcpu-ubuntu-2404
-    timeout-minutes: 30
+    # 50 because this job now compiles and runs cmd/billet under -race as well
+    # as internal/state and the capacity suite; the sibling job's note applies
+    # here too -- raise it when the suite grows, do not trim tests to fit it.
+    timeout-minutes: 50
     services:
       postgres:
         image: postgres:18-alpine
@@ -223,11 +227,12 @@ jobs:
       # runs whatever somebody remembered to add to it, and leaves everything
       # else unrun in both jobs while the run reports success.
       #
-      # WITHOUT -race, deliberately: the race detector's value over this
-      # package is bought by the SQLite job, and buying it twice would make
-      # this job the run's critical path.
+      # UNDER -race, because the SQLite job cannot buy it for the tests it
+      # skips: these are the only run those tests get, and a data race in one
+      # of them would otherwise be detected nowhere. The cost is this package
+      # compiled and run twice, which is what the split buys back.
       - name: Test the command suite against PostgreSQL
-        run: go test -count=1 -timeout 20m -vet=off ./cmd/billet/
+        run: go test -race -count=1 -timeout 30m -vet=off ./cmd/billet/
       - name: Test the capacity suite against PostgreSQL
         run: go test -count=1 -timeout 20m ./internal/alloc/
         env:

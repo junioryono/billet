@@ -86,6 +86,18 @@ const (
 // record appears at its first registration.
 var retireReceiptWait = time.Minute
 
+// retireLedgerBound is the whole ledger attempt's own deadline: the open, the
+// binding and the row's completion.
+//
+// THE OPEN'S BOUND IS NOT THE ATTEMPT'S. `openDir` gives itself thirty seconds
+// and that context ends when it returns, so a connection that goes
+// unresponsive after it would leave this command waiting on the transport's
+// own timeouts — holding the converge's guard, with no answer for the role. A
+// retirement that has reached `done` is in no hurry: the row is the survivor's
+// to write if this host cannot, so the expiry is a PENDING row and not a
+// failure of the converge.
+var retireLedgerBound = 2 * time.Minute
+
 // retireTail finishes everything the retirement owes after `done` and answers
 // what it left. The journal it is given has already been validated as this
 // host's, this guard's and this transition's.
@@ -222,10 +234,22 @@ func retireTailRow(ctx context.Context, j retirement.Journal, answer *retireTail
 		return j, nil
 	}
 
-	db, why, r := retireOpenLedgerByLocator(ctx, j)
+	bounded, cancel := context.WithTimeout(ctx, retireLedgerBound)
+	defer cancel()
+
+	db, why, r := retireOpenLedgerByLocator(bounded, j)
 
 	switch {
 	case r != nil:
+		// A REFUSAL THE BOUND PRODUCED IS THE SAME PENDING ROW: where the
+		// attempt expired does not change what it means.
+		if expired := retireLedgerExpired(ctx, bounded); expired != "" {
+			answer.Row = retireRowPending
+			answer.RowWhy = expired
+
+			return j, nil
+		}
+
 		return j, r
 	case db == nil:
 		answer.Row = retireRowPending
@@ -236,7 +260,7 @@ func retireTailRow(ctx context.Context, j retirement.Journal, answer *retireTail
 
 	defer func() { _ = db.Close() }()
 
-	row, outcome, err := db.CompleteRetirement(ctx, state.RetirementCompletion{
+	row, outcome, err := db.CompleteRetirement(bounded, state.RetirementCompletion{
 		Deployment: j.Deployment, Retiring: j.Retiring, Survivor: j.Survivor.Host,
 		TransitionID: j.Provenance.TransitionID, ReservedAt: j.Provenance.Reservation,
 		CompletedBy: j.Retiring, At: retireNow(),
@@ -257,6 +281,17 @@ func retireTailRow(ctx context.Context, j retirement.Journal, answer *retireTail
 		if pending := retirePendingReason(err); pending != "" {
 			answer.Row = retireRowPending
 			answer.RowWhy = pending
+
+			return j, nil
+		}
+
+		if expired := retireLedgerExpired(ctx, bounded); expired != "" {
+			// THE ROW MAY HAVE BEEN WRITTEN and the answer lost with the
+			// deadline; pending is right either way, because the survivor's
+			// completion and the next tail both answer `already` over a row
+			// that is already done.
+			answer.Row = retireRowPending
+			answer.RowWhy = expired
 
 			return j, nil
 		}
@@ -406,14 +441,27 @@ func retirePendingReason(err error) string {
 	case state.Unreachable(err):
 		return "the ledger's database could not be reached (" + err.Error() + ")"
 	case errors.Is(err, state.ErrSchemaAhead):
-		return "the ledger's schema is newer than this binary's, so this host may not write it"
+		return "the ledger's schema is newer than this binary's, so this host may not write it (" + err.Error() + ")"
 	case errors.Is(err, state.ErrSchemaBehind):
-		return "the ledger's schema is older than this binary's and no control plane has migrated it here"
+		return "the ledger's schema is older than this binary's and no control plane has migrated it here (" +
+			err.Error() + ")"
 	case errors.Is(err, state.ErrReleaseBehind):
-		return "a newer billet has served this ledger, so this host may not write it"
+		return "a newer billet has served this ledger, so this host may not write it (" + err.Error() + ")"
 	default:
 		return ""
 	}
+}
+
+// retireLedgerExpired says whether THIS COMMAND'S OWN BOUND ended the ledger
+// attempt, which is a pending row, rather than the caller's context ending,
+// which is the operator stopping the converge. A deadline is deliberately not
+// in `Unreachable`: whose deadline it was is not a property of the error.
+func retireLedgerExpired(outer, bounded context.Context) string {
+	if outer.Err() != nil || bounded.Err() == nil {
+		return ""
+	}
+
+	return "the ledger did not answer within " + retireLedgerBound.String()
 }
 
 // retireClearMarker takes the retirement's marker off the guard's record. The

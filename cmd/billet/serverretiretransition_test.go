@@ -239,7 +239,7 @@ func TestARetainedNodesTransitionInstallsTheStageAndRestartsTheNode(t *testing.T
 	record := useRegistrationRecord(t)
 	f.svc.onStart = func(unit string) {
 		if unit == nodeUnit {
-			writeRegistrationRecord(t, record, f.identity, retainedEndpoint)
+			restartedNode(t, f, record, retainedEndpoint)
 		}
 	}
 
@@ -290,7 +290,7 @@ func TestARetainedNodeThatPublishesNoRecordIsNotDone(t *testing.T) {
 			if endpoint != "" {
 				f.svc.onStart = func(unit string) {
 					if unit == nodeUnit {
-						writeRegistrationRecord(t, record, f.identity, endpoint)
+						restartedNode(t, f, record, endpoint)
 					}
 				}
 			}
@@ -376,7 +376,7 @@ func TestATransitionResumesFromWhereItWasInterrupted(t *testing.T) {
 				record := useRegistrationRecord(t)
 				f.svc.onStart = func(unit string) {
 					if unit == nodeUnit {
-						writeRegistrationRecord(t, record, f.identity, retainedEndpoint)
+						restartedNode(t, f, record, retainedEndpoint)
 					}
 				}
 			},
@@ -605,7 +605,7 @@ func TestTheLifecycleLockCoversTheStopToArchiveWindow(t *testing.T) {
 	f.svc.onStart = func(unit string) {
 		if unit == nodeUnit {
 			note("restart")
-			writeRegistrationRecord(t, record, f.identity, retainedEndpoint)
+			restartedNode(t, f, record, retainedEndpoint)
 		}
 	}
 
@@ -725,18 +725,35 @@ func (r rootOwned) Sys() any {
 }
 
 // writeRegistrationRecord publishes the record a node writes after it
-// registers, for this deployment and the endpoint its configuration names.
-func writeRegistrationRecord(t *testing.T, path, deployment, endpoint string) {
+// registers, for this deployment, the endpoint its configuration names and the
+// invocation it is running under.
+func writeRegistrationRecord(t *testing.T, path, deployment, endpoint, invocation string) {
 	t.Helper()
 
 	body, err := json.Marshal(map[string]any{
 		"schema": 1, "node": "node-a", "deployment": deployment, "incarnation": retainedIncarnation,
-		"invocation_id": retainedInvocation, "endpoint": endpoint,
+		"invocation_id": invocation, "endpoint": endpoint,
 		"registered_at": "2026-09-11T10:00:00Z",
 	})
 	mustOK(t, err)
 
 	writeFile(t, path, string(body), 0o600)
+}
+
+// restartedNode is what the fake converger's start of the node unit leaves
+// behind: SYSTEMD MINTS A NEW INVOCATION for every start, so the unit's
+// property moves with it, and the node publishes its record under that new
+// invocation when it registers. A fixture whose restart kept the invocation
+// could not tell a receipt written for the restart from the one that was
+// already there.
+func restartedNode(t *testing.T, f *requestFixture, record, endpoint string) {
+	t.Helper()
+
+	unit := filepath.Join(f.unitsDir, nodeUnit)
+	writeFile(t, unit, strings.Replace(mustRead(t, unit), "InvocationID="+retainedInvocation,
+		"InvocationID="+retainedRestartInvocation, 1), 0o644)
+
+	writeRegistrationRecord(t, record, f.identity, endpoint, retainedRestartInvocation)
 }
 
 // advanceRowToIntent moves the reserved row to intent, as the intent does.
@@ -1066,7 +1083,7 @@ func TestAnUncertainNodeIsNotRestarted(t *testing.T) {
 			f.reserve(t)
 
 			record := useRegistrationRecord(t)
-			writeRegistrationRecord(t, record, f.identity, retainedEndpoint)
+			restartedNode(t, f, record, retainedEndpoint)
 
 			j := f.plantJournal(t, retirement.PhaseNodeRestarted, retirement.VariantRetainedNode)
 

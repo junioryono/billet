@@ -37,6 +37,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -609,29 +610,59 @@ func (db *DB) PingContext(ctx context.Context) error {
 }
 
 // Unreachable reports whether err is a failure to REACH the database rather
-// than an answer from it: a connection that could not be established, or one
-// that went away under a request.
+// than an answer from it.
 //
 // IT IS ASKED OF AN ERROR, NEVER INFERRED FROM WHERE THE ERROR CAME FROM. A
-// failed ping is the obvious candidate and is not proof of anything by itself:
-// `file is not a database` is positive evidence the ledger answered and is
-// broken, and reading it as unreachability would let a caller that waits out
-// an outage wait out a corrupt ledger instead.
+// failed ping is the obvious candidate and proves nothing by itself: `file is
+// not a database` is positive evidence the ledger answered and is broken, and
+// reading that as unreachability would let a caller that waits out an outage
+// wait out a corrupt ledger instead.
 //
-// WHAT IT RECOGNISES, and nothing else: pgx's ConnectError, which wraps every
-// failure to establish a session, and any net.Error in the chain, which is how
-// a session that dies under a query surfaces. A timeout that is not a network
-// error is NOT unreachability — a slow query is a database answering — and
-// neither is any error the server itself composed. The residual, stated: a
-// driver that reports a dropped connection as neither of those reads as an
-// answer, which is the refusing direction.
+// THE ORDER BELOW IS WHAT THE MEASUREMENT REQUIRES, not a preference (pgx
+// v5.10.0 against PostgreSQL 18, 2026-09-13, every case run through
+// database/sql as billet runs it):
+//
+//	refused port         ConnectError  net.Error  —                —
+//	wrong password       ConnectError  —          PgError 28P01    —
+//	missing database     ConnectError  —          PgError 3D000    —
+//	missing relation     —             —          PgError 42P01    —
+//	deadline under query —             net.Error  —                DeadlineExceeded
+//	terminated mid-query —             —          PgError 57P01    —
+//	connection cut       ConnectError  net.Error  —                —
+//
+// So A SERVER ERROR IS CHECKED FIRST: a wrong password and a database that
+// does not exist arrive INSIDE a ConnectError, and a caller that read the
+// outer shape would wait for ever on a credential it must be told about. The
+// two SQLSTATE classes that are themselves availability answers are the
+// exception, and they are named: 08, connection exception, and 57, operator
+// intervention, which is what a server shutting down or terminating a backend
+// says. THEN THE CALLER'S OWN BOUND: context.DeadlineExceeded satisfies
+// net.Error (pgx wraps it in errTimeout), so a slow query would otherwise read
+// as an unreachable database. Only then the transport shapes.
+//
+// The residual, stated: a mid-query drop that database/sql retries onto a
+// working connection is not an error at all and never reaches here, and one it
+// retries onto a connection it cannot re-establish arrives as a ConnectError,
+// which is the measurement's last row.
 func Unreachable(err error) bool {
 	if err == nil {
 		return false
 	}
 
-	//nolint:errcheck // the discarded value is the typed error itself, not a failure; the bool is the answer. errcheck cannot exclude a generic function.
+	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok {
+		return unreachableSQLState(pgErr.Code)
+	}
+
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return false
+	}
+
+	//nolint:errcheck // as above.
 	if _, ok := errors.AsType[*pgconn.ConnectError](err); ok {
+		return true
+	}
+
+	if errors.Is(err, driver.ErrBadConn) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return true
 	}
 
@@ -639,6 +670,15 @@ func Unreachable(err error) bool {
 	_, ok := errors.AsType[net.Error](err)
 
 	return ok
+}
+
+// unreachableSQLState names the two SQLSTATE classes that are an availability
+// answer rather than a refusal: 08, connection exception, and 57, operator
+// intervention (57P01 is what a terminated backend and a shutting-down server
+// both say). Every other class is the server telling this caller something it
+// must act on.
+func unreachableSQLState(code string) bool {
+	return strings.HasPrefix(code, "08") || strings.HasPrefix(code, "57")
 }
 
 // IntegrityCheck refuses to serve from a corrupt ledger.
