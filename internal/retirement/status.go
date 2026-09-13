@@ -67,9 +67,10 @@ const (
 // maxStatusBytes bounds a read of the status file.
 const maxStatusBytes = 4096
 
-// ReadStatus reads the published status, typed.
+// ReadStatus reads the published status, typed. A LINK IS NOT ABSENCE, even
+// when its target is gone; only the file at the publication's own name counts.
 func ReadStatus() (Status, StatusPresence, error) {
-	raw, err := regularfile.ReadFile(StatusPath(), maxStatusBytes, regularfile.Options{})
+	raw, err := regularfile.ReadFile(StatusPath(), maxStatusBytes, regularfile.Options{NoFollow: true})
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return Status{}, StatusAbsent, nil

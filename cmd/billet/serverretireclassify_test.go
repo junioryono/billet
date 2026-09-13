@@ -174,21 +174,43 @@ func TestTheDryRunsStateIsTheHostsAndNotAConstant(t *testing.T) {
 // after the first local observations and before the final state observation,
 // so replacing a record there exercises the second read, not the first.
 func TestTheDryRunCarriesAFailedFinalStateObservationIntoTheRoute(t *testing.T) {
-	for _, earlier := range []string{"ordinary", "continue", "hold"} {
+	for _, earlier := range []string{"ordinary", "continue", "new-request", "cancel", "unsupported-variant", "hold"} {
 		for _, failed := range []string{"journal", "status"} {
 			if earlier == "continue" && failed == "status" {
 				// A READABLE JOURNAL SUPPLIES THE STATE without a status read.
 				continue
 			}
 			t.Run(earlier+"/"+failed, func(t *testing.T) {
-				f := newRetireFixture(t)
+				var f *retireFixture
+				rowFact := retirement.RowAbsent
 				args := []string{"--dry-run", "--retiring-host", "control-a"}
 				why := ""
-				if earlier == "continue" {
+				if earlier == "new-request" || earlier == "cancel" {
+					request := newRequestFixture(t)
+					f = request.retireFixture
+					if earlier == "cancel" {
+						request.reserve(t)
+						rowFact, why = retirement.RowReservedMine, "inventory no longer requests"
+					} else {
+						args = append(args, "--requested")
+						why = "eligible"
+					}
+				} else {
+					f = newRetireFixture(t)
+				}
+				switch earlier {
+				case "continue":
 					f.journalAt(t, retirement.PhaseIntent, "ci-1")
 					why = "readable journal"
-				}
-				if earlier == "hold" {
+				case "unsupported-variant":
+					// INSTALLED NODE CUSTODY SELECTS WITHOUT A JOURNAL, so the
+					// final observation must judge the status as well as the journal.
+					body := mustRead(t, f.cfg) + "\nnode:\n  name: node-a\n  server_addr: 127.0.0.1:7717\n" +
+						"  provider: docker\n  state_dir: " + filepath.Join(t.TempDir(), "node") + "\n"
+					writeFile(t, f.cfg, body, 0o600)
+					args = append(args, "--requested")
+					why = "keeps a node"
+				case "hold":
 					args = append(args, "--requested")
 					why = "PostgreSQL active-passive"
 				}
@@ -198,7 +220,7 @@ func TestTheDryRunCarriesAFailedFinalStateObservationIntoTheRoute(t *testing.T) 
 				if earlier == "continue" {
 					wantState = string(retirement.PhaseIntent)
 				}
-				if before["state"] != wantState || before["row_fact"] != string(retirement.RowAbsent) {
+				if before["state"] != wantState || before["row_fact"] != string(rowFact) {
 					t.Fatalf("the earlier observations did not establish the admission: %s", out)
 				}
 
@@ -225,7 +247,7 @@ func TestTheDryRunCarriesAFailedFinalStateObservationIntoTheRoute(t *testing.T) 
 					why = "the host's own state could not be established when the report was made"
 				}
 				m := assertRetireRoute(t, out, code, "hold", why)
-				if closes != 1 || m["state"] != retireStateUnknown || m["row_fact"] != string(retirement.RowAbsent) ||
+				if closes != 1 || m["state"] != retireStateUnknown || m["row_fact"] != string(rowFact) ||
 					m["status_presence"] != "absent" || m["stage"] != "absent" {
 					t.Fatalf("the failure did not follow successful observations (%d closes): %s", closes, out)
 				}
@@ -300,14 +322,12 @@ func TestTheDryRunHoldsAnUnrecognisedRowState(t *testing.T) {
 	}
 }
 
-// A DRY RUN STILL TAKES NOTHING, AND THE LOCATOR READ IS WHERE THAT IS EASIEST
-// TO LOSE. The tail's own opener takes the directory lock at the archive and
-// creates the directory if it is not there, which is right for a run about to
-// write the deployment's row and wrong for one whose whole contract is that it
-// looks. The damaging case is this one: a retirement at `intent` whose archive
-// does not exist yet, classified by a converge that would then have CREATED THE
-// DESTINATION the transition is about to rename onto.
-func TestTheDryRunTakesNothingThroughTheLocator(t *testing.T) {
+// A LOCATOR READ MUST NOT CREATE ITS ARCHIVE. The tail's own opener takes
+// the directory lock at the archive and creates it if it is not there, which
+// belongs to a run about to write the deployment's row. At intent the archive
+// does not exist yet; a classifier using that open would create the destination
+// the transition is about to rename onto.
+func TestTheDryRunCreatesNoArchiveThroughTheLocator(t *testing.T) {
 	f := newRequestFixture(t)
 	f.reserve(t)
 
@@ -339,9 +359,10 @@ func TestTheDryRunTakesNothingThroughTheLocator(t *testing.T) {
 	}
 }
 
-// AND IT CREATES NOTHING ON THE ORDINARY PATH EITHER: no upgrade root by
-// classifying a guard, no configuration by finding none.
-func TestTheDryRunStillCreatesNothing(t *testing.T) {
+// THE ORDINARY PATH CREATES NO UPGRADE ROOT OR CONFIGURATION. A SQLite read
+// may leave driver sidecars beside an existing ledger; this case names only
+// the paths the classifier itself must leave absent.
+func TestTheDryRunCreatesNoUpgradeRootOrConfiguration(t *testing.T) {
 	f := newRetireFixture(t)
 
 	mustOK(t, os.Remove(f.cfg))
@@ -432,6 +453,64 @@ func TestTheDryRunHoldsOnAnUnreadableStatus(t *testing.T) {
 	why, ok := m["status_why"].(string)
 	if !ok || !strings.Contains(why, "not a regular file") {
 		t.Fatalf("the failed read's diagnostic was lost: %s", out)
+	}
+}
+
+// A STATUS LINK IS AN UNREADABLE ARTEFACT, whether its target is absent or
+// a valid publication. Neither target grants ordinary converge, a new request
+// or cancellation over the unexplained name.
+func TestTheDryRunHoldsOnStatusLinksWithNoJournal(t *testing.T) {
+	for _, target := range []string{"dangling", "live"} {
+		for _, row := range []string{"absent", "reserved"} {
+			t.Run(target+"/"+row, func(t *testing.T) {
+				f := newRequestFixture(t)
+				rowFact := retirement.RowAbsent
+				if row == "reserved" {
+					f.reserve(t)
+					rowFact = retirement.RowReservedMine
+				}
+				for _, extra := range [][]string{nil, {"--requested"}} {
+					args := append([]string{"--dry-run", "--retiring-host", requestRetiring}, extra...)
+					want, why := "ordinary", ""
+					if row == "reserved" {
+						want, why = "cancel", "inventory no longer requests"
+					}
+					if len(extra) != 0 {
+						want, why = "new-request", "eligible"
+					}
+					out, code := f.run(t, "", args...)
+					assertRetireRoute(t, out, code, want, why)
+				}
+
+				path := filepath.Join(retirement.Root, "status-target")
+				if target == "live" {
+					mustOK(t, retirement.WriteStatus(retirement.PhaseDone, retirement.VariantServerOnly, retireNow()))
+					st, presence, err := retirement.ReadStatus()
+					mustOK(t, err)
+					if presence != retirement.StatusPresent || st.Phase != retirement.PhaseDone {
+						t.Fatalf("the link's target was not a valid status: %+v, presence %d", st, presence)
+					}
+					mustOK(t, os.Rename(retirement.StatusPath(), path))
+				} else if _, err := os.Lstat(path); !os.IsNotExist(err) {
+					t.Fatalf("the dangling link's target was not absent: %v", err)
+				}
+				mustOK(t, os.Symlink(path, retirement.StatusPath()))
+				_, presence, err := retirement.ReadStatus()
+				if presence != retirement.StatusUnreadable || err == nil || os.IsNotExist(err) {
+					t.Fatalf("a status link was followed or called absent: presence %d, error %v", presence, err)
+				}
+
+				for _, extra := range [][]string{nil, {"--requested"}} {
+					args := append([]string{"--dry-run", "--retiring-host", requestRetiring}, extra...)
+					out, code := f.run(t, "", args...)
+					m := assertRetireRoute(t, out, code, "hold", "the authority status could not be judged:")
+					if m["status_presence"] != "unreadable" || m["status"] != nil || m["journal"] != nil ||
+						m["row_fact"] != string(rowFact) || m["state"] != retireStateUnknown {
+						t.Fatalf("the status link did not establish an unexplained artefact: %s", out)
+					}
+				}
+			})
+		}
 	}
 }
 
@@ -840,7 +919,7 @@ func pinRetireObservationDeadline(t *testing.T) (entered func(context.Context), 
 			t.Fatal("the running operation did not receive the deadline's Done signal")
 		}
 
-		if bounded.Err() != context.DeadlineExceeded {
+		if !errors.Is(bounded.Err(), context.DeadlineExceeded) {
 			t.Fatalf("the running operation received %v, want deadline exceeded", bounded.Err())
 		}
 	}
@@ -1197,8 +1276,8 @@ func TestTheDryRunRequiresTheBindingBeforeAssociatingEitherHost(t *testing.T) {
 }
 
 // CONTINUITY IS THIS CONVERGE'S EVIDENCE, not a standalone preview's
-// prerequisite. Losing either the holder or the prepared id holds even an
-// ordinary host; omitting the expected holder applies neither comparison.
+// prerequisite. Each supplied holder or prepared id is compared independently;
+// omitting both expectations permits a preview with no guard.
 func TestTheDryRunHoldsOnlyTheGuardContinuityItWasGiven(t *testing.T) {
 	for _, guard := range []string{"gone", "other holder", "other id", "same"} {
 		t.Run(guard, func(t *testing.T) {
@@ -1221,22 +1300,27 @@ func TestTheDryRunHoldsOnlyTheGuardContinuityItWasGiven(t *testing.T) {
 				if journal {
 					f.journalAt(t, retirement.PhaseIntent, "ci-1")
 				}
-				for _, expected := range []bool{false, true} {
-					args := []string{"--dry-run", "--retiring-host", "control-a", "--expected-guard", retireTestID}
+				for _, expected := range []string{"neither", "holder", "id", "both"} {
+					args := []string{"--dry-run", "--retiring-host", "control-a"}
 					want, why := "ordinary", ""
 					if journal {
 						want, why = "continue", "readable journal"
 					}
-					if expected {
+					holderExpected := expected == "holder" || expected == "both"
+					idExpected := expected == "id" || expected == "both"
+					if holderExpected {
 						args = append(args, "--expected-holder", "ci-1")
-						switch guard {
-						case "gone":
-							want, why = "hold", "guard is gone"
-						case "other holder":
-							want, why = "hold", "holder ci-other"
-						case "other id":
-							want, why = "hold", "guard id differs"
-						}
+					}
+					if idExpected {
+						args = append(args, "--expected-guard", retireTestID)
+					}
+					switch {
+					case guard == "gone" && expected != "neither":
+						want, why = "hold", "guard is gone"
+					case guard == "other holder" && holderExpected:
+						want, why = "hold", "holder ci-other"
+					case guard == "other id" && idExpected:
+						want, why = "hold", "guard id differs"
 					}
 					out, code := f.run(t, "", args...)
 					assertRetireRoute(t, out, code, want, why)
@@ -1246,12 +1330,12 @@ func TestTheDryRunHoldsOnlyTheGuardContinuityItWasGiven(t *testing.T) {
 	}
 }
 
-// A MUTATING ROUTE NEEDS A GUARD ITS FIRST CALL CAN USE. The acquirer's
-// cleanup window and an interrupted rewrite each hold a retirement under
-// this converge's guard, while ordinary tasks and standalone previews remain
-// reachable. The observation must neither settle nor repair the record.
+// AN OBSERVED GUARD MUST BE READY FOR A MUTATING ROUTE. The acquirer's cleanup
+// window and an interrupted rewrite each hold a retirement whenever observed,
+// while ordinary tasks remain reachable. The observation must neither settle
+// nor repair the record, with or without continuity flags.
 func TestTheDryRunRequiresAMutationReadyGuardOnlyForRetirement(t *testing.T) {
-	for _, route := range []string{"ordinary", "new-request", "continue", "cancel"} {
+	for _, route := range []string{"ordinary", "new-request", "continue", "cancel", "unsupported-variant"} {
 		for _, damage := range []string{"preparing", "interrupted rewrite"} {
 			t.Run(route+"/"+damage, func(t *testing.T) {
 				var f *retireFixture
@@ -1273,6 +1357,13 @@ func TestTheDryRunRequiresAMutationReadyGuardOnlyForRetirement(t *testing.T) {
 					if route == "continue" {
 						f.journalAt(t, retirement.PhaseIntent, "ci-1")
 						why = "readable journal"
+					}
+					if route == "unsupported-variant" {
+						body := mustRead(t, f.cfg) + "\nnode:\n  name: node-a\n  server_addr: 127.0.0.1:7717\n" +
+							"  provider: docker\n  state_dir: " + filepath.Join(t.TempDir(), "node") + "\n"
+						writeFile(t, f.cfg, body, 0o600)
+						args = append(args, "--requested")
+						why = "keeps a node"
 					}
 				}
 				rec := f.guard.record(t)
@@ -1301,14 +1392,14 @@ func TestTheDryRunRequiresAMutationReadyGuardOnlyForRetirement(t *testing.T) {
 					t.Fatalf("the record did not establish the preparing fact: %t", planted.Preparing)
 				}
 
-				out, code = f.run(t, "", args...)
-				assertRetireRoute(t, out, code, route, why)
-				out, code = f.run(t, "", heldArgs...)
 				want, clause := "hold", damage
-				if route == "ordinary" {
-					want, clause = "ordinary", ""
+				if route == "ordinary" || route == "unsupported-variant" {
+					want, clause = route, why
 				}
-				assertRetireRoute(t, out, code, want, clause)
+				for _, operands := range [][]string{args, heldArgs} {
+					out, code = f.run(t, "", operands...)
+					assertRetireRoute(t, out, code, want, clause)
+				}
 				if after := mustRead(t, recordPath); after != before {
 					t.Fatalf("the classifier settled or rewrote the guard: %s", after)
 				}
@@ -1320,9 +1411,9 @@ func TestTheDryRunRequiresAMutationReadyGuardOnlyForRetirement(t *testing.T) {
 	}
 }
 
-// A BINARY POINTER EXCLUDES EVERY RETIREMENT ROUTE UNDER THE CONVERGE'S
-// GUARD. Ordinary recovery still reaches the tasks that own that pointer,
-// and a standalone preview does not claim continuity it never established.
+// AN OBSERVED BINARY POINTER EXCLUDES EVERY ROUTE BUT ORDINARY. Recovery
+// still reaches the tasks that own that pointer, with or without continuity
+// flags; omitting an expectation cannot hide the pointer in front of us.
 func TestTheDryRunKeepsBinaryRecoveryOnTheOrdinaryRoute(t *testing.T) {
 	for _, route := range []string{"ordinary", "cancel", "continue", "unsupported-variant"} {
 		t.Run(route, func(t *testing.T) {
@@ -1335,7 +1426,6 @@ func TestTheDryRunKeepsBinaryRecoveryOnTheOrdinaryRoute(t *testing.T) {
 				f = newRetireFixture(t)
 				mustHold(t, "ci-1")
 			}
-			extra := []string{}
 			switch route {
 			case "continue", "unsupported-variant":
 				f.journalAt(t, retirement.PhaseIntent, "ci-1")
@@ -1350,19 +1440,21 @@ func TestTheDryRunKeepsBinaryRecoveryOnTheOrdinaryRoute(t *testing.T) {
 					mustOK(t, j.Write(retireNow()))
 				}
 			}
+			out, code := f.run(t, "", "--dry-run", "--retiring-host", "control-a")
+			assertRetireRoute(t, out, code, route, "")
 
 			pointer := filepath.Join(f.guard.active(), guardPointerName)
 			recovery := filepath.Join(f.guard.root, "recovery-20260911T100000-0badcafe")
 			mustOK(t, os.Mkdir(recovery, 0o700))
 			mustOK(t, os.Symlink(recovery, pointer))
 			for _, expected := range []bool{false, true} {
-				args := append([]string{"--dry-run", "--retiring-host", "control-a"}, extra...)
+				args := []string{"--dry-run", "--retiring-host", "control-a"}
 				want, why := route, ""
+				if route != "ordinary" {
+					want, why = "hold", "binary transaction's pointer"
+				}
 				if expected {
 					args = append(args, "--expected-holder", "ci-1")
-					if route != "ordinary" {
-						want, why = "hold", "binary transaction's pointer"
-					}
 				}
 				out, code := f.run(t, "", args...)
 				assertRetireRoute(t, out, code, want, why)
@@ -1376,14 +1468,17 @@ func TestTheDryRunKeepsBinaryRecoveryOnTheOrdinaryRoute(t *testing.T) {
 func TestTheDryRunKeepsABinaryPointerOffANewRequest(t *testing.T) {
 	f := newRequestFixture(t)
 
+	out, code := f.run(t, "", "--dry-run", "--retiring-host", requestRetiring, "--requested")
+	assertRetireRoute(t, out, code, "new-request", "eligible")
+
 	pointer := filepath.Join(f.guard.active(), guardPointerName)
 	recovery := filepath.Join(f.guard.root, "recovery-20260911T100000-0badcafe")
 
 	mustOK(t, os.Mkdir(recovery, 0o700))
 	mustOK(t, os.Symlink(recovery, pointer))
 
-	out, code := f.run(t, "", "--dry-run", "--retiring-host", requestRetiring, "--requested")
-	assertRetireRoute(t, out, code, "new-request", "eligible")
+	out, code = f.run(t, "", "--dry-run", "--retiring-host", requestRetiring, "--requested")
+	assertRetireRoute(t, out, code, "hold", "binary transaction's pointer")
 
 	out, code = f.run(t, "", "--dry-run", "--retiring-host", requestRetiring, "--requested",
 		"--expected-holder", requestRun)
@@ -1480,10 +1575,11 @@ func TestTheRetireClassifierFlagsAreRefusedOutsideDryRun(t *testing.T) {
 	}
 }
 
-// A FRESH HOST IS OBSERVED, NEVER COMMISSIONED BY THE OBSERVATION. No open
-// may create its identity, authority, ledger or locks; no service is asked
-// to change the facts that the classifier is meant to report.
-func TestTheNewRetireObservationsCreateAndAcquireNothing(t *testing.T) {
+// A FRESH HOST IS OBSERVED, NEVER COMMISSIONED BY THE OBSERVATION. It creates
+// no directory, identity, authority or guard, takes no billet lock, claims
+// nothing and migrates nothing. This host needs no ledger read; an existing
+// SQLite ledger's read may leave the driver's own sidecars beside it.
+func TestTheNewRetireObservationsLeaveBootstrapPathsAbsent(t *testing.T) {
 	f := newRetireFixture(t)
 	missing := filepath.Join(t.TempDir(), "not-created")
 	f.cfg = writeRetirePostgresConfig(t, missing)

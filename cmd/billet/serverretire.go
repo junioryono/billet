@@ -165,8 +165,8 @@ type retireAcknowledgedAnswer struct {
 	State        string `json:"state"`
 }
 
-// retireReport is the dry run's answer: every record as it stands, read
-// without a lock, the dispatch the table decides and the route the caller takes.
+// retireReport is the dry run's answer: every record as it stands, read without
+// a billet lock, the dispatch the table decides and the route the caller takes.
 type retireReport struct {
 	Schema   int                  `json:"schema"`
 	Outcome  string               `json:"outcome"`
@@ -302,7 +302,8 @@ func cmdServerRetire(ctx context.Context, args []string) error {
 	flags.BoolVar(&m.abandon, "abandon-reservation", false, "release a reservation nothing has started")
 	flags.BoolVar(&m.completeRow, "complete-row", false, "on the survivor: complete the retiring host's ledger row from its completion document")
 	flags.BoolVar(&m.acknowledge, "acknowledge-row", false, "on the retiring host: acknowledge the survivor's completion in the journal")
-	flags.BoolVar(&m.dryRun, "dry-run", false, "classify the host and report; take nothing, write nothing")
+	flags.BoolVar(&m.dryRun, "dry-run", false, "classify the host and report; take no billet lock, claim or migrate nothing; "+
+		"create no directory, identity, authority or guard; a SQLite read may leave driver sidecars")
 	flags.BoolVar(&m.requested, "requested", false, "with --dry-run: the inventory asks for a retirement")
 	flags.StringVar(&m.expectedHolder, "expected-holder", "", "with --dry-run: the converge holder whose guard must remain")
 	flags.StringVar(&m.expectedGuard, "expected-guard", "", "with --dry-run: the guard id established by preparation")
@@ -1156,9 +1157,20 @@ func retireAcknowledge(_ context.Context, m retireMode) (any, *retireRefusal) {
 		TransitionID: j.Provenance.TransitionID, CompletedBy: j.CompletedBy, State: stateNothingRetire}, nil
 }
 
-// retireDryRun classifies the host without a lock and writes nothing: the
-// journal, the status, the stage, the guard and its marker as they stand, the
-// row through the read-only open, the dispatch and the caller's route.
+// retireDryRun classifies the host from its records and a read-only ledger open.
+// NO BILLET LOCK, CLAIM OR MIGRATION belongs to this observation, and it creates
+// no directory, identity, authority or guard. A SQLite read can leave the driver's
+// own -wal and -shm sidecars beside the ledger; its owner makes that safe to reopen,
+// not free of filesystem writes.
+// THE SECOND RESULT IS ALWAYS NIL, AND THE SIGNATURE KEEPS IT. Every mode of
+// this command answers `(any, *retireRefusal)` and one switch dispatches them
+// all; a classifier with a different shape would be a special case in that
+// switch for no gain. It is always nil because the classifier REPORTS rather
+// than refuses — an observation it could not make is `route: hold` with its
+// reason, so the role always gets a route to act on and never an exit status
+// it has to translate back into one.
+//
+//nolint:unparam // the shape is the dispatch's; see above
 func retireDryRun(ctx context.Context, m retireMode) (any, *retireRefusal) {
 	report := &retireReport{Schema: retireSchema, Outcome: retireOutcomeReported, State: stateNothingRetire,
 		Identity: "unreadable", Authority: "unreadable", Route: "hold"}
@@ -1271,11 +1283,12 @@ func retireDryRun(ctx context.Context, m retireMode) (any, *retireRefusal) {
 		// Use preparation's packaged layout without calling its resolver:
 		// that reloads configuration, which this report observed once above.
 		//
-		// WHAT THIS CANNOT SEE, and it is accepted: a host commissioned with a
-		// custom `identity_dir` whose configuration was then lost names its
-		// state nowhere, so these two facts cover preparation's path alone.
-		// That residual is the same one the admission below states, and closing
-		// either needs the ledger's own contents rather than another pathname.
+		// THE PACKAGED PATH CANNOT RULE OUT A CUSTOM IDENTITY. Lost or invalid
+		// configuration can hide an intact identity and CA at a custom path,
+		// beside a live reservation, while preparation's path is clean. Closing
+		// this residual needs an authoritative record of the location outside
+		// replaceable configuration, consulted before bootstrap admission; an
+		// established but unresolvable location must hold.
 		dir := filepath.Join(retirement.Root, "server")
 		identity, report.Identity, identityWhy = observeRetireIdentity(dir)
 		report.Authority = observeRetireAuthority(dir)
@@ -1285,11 +1298,14 @@ func retireDryRun(ctx context.Context, m retireMode) (any, *retireRefusal) {
 		hold("the installed configuration could not be read")
 	}
 
-	if m.expectedHolder != "" {
+	// EACH CONTINUITY EXPECTATION STANDS ALONE. An id supplied without a
+	// holder still names the guard preparation established; ignoring it would
+	// admit a replacement guard merely because no holder comparison was asked.
+	if m.expectedHolder != "" || m.expectedGuard != "" {
 		switch {
 		case shape.Kind != claimGuard:
 			hold("the expected converge guard is gone")
-		case shape.Guard.Holder != m.expectedHolder:
+		case m.expectedHolder != "" && shape.Guard.Holder != m.expectedHolder:
 			hold(fmt.Sprintf("the guard names holder %s, not the expected holder %s", shape.Guard.Holder, m.expectedHolder))
 		case m.expectedGuard != "" && shape.Guard.ID != m.expectedGuard:
 			hold("the guard id differs from the id established by preparation")
@@ -1322,18 +1338,20 @@ func retireDryRun(ctx context.Context, m retireMode) (any, *retireRefusal) {
 
 	if report.RouteWhy == "" {
 		report.Route, report.RouteWhy = retireRoute(report, cfg, m.requested)
-		// RECOVERY MUST STILL REACH ORDINARY TASKS. A binary pointer is a
-		// retirement exclusion only, and a preview acquired no guard at all.
-		if m.expectedHolder != "" && shape.Pointer && report.Route != "ordinary" {
+		// AN OBSERVED POINTER EXCLUDES EVERY ROUTE BUT ORDINARY, regardless
+		// of continuity flags. Preparation accepts it under recovery, which
+		// must still reach the ordinary tasks that own the binary transaction.
+		if shape.Pointer && report.Route != "ordinary" {
 			report.Route = "hold"
 			report.RouteWhy = "the guard carries a binary transaction's pointer; retirement cannot run inside it"
 		}
 
-		// THE FIRST MUTATION REQUIRES A SETTLED, INTACT GUARD. A reused
-		// preparation may leave the acquirer's cleanup window open; an
-		// interrupted rewrite is no permission to import an account either.
-		if m.expectedHolder != "" && (report.Route == "new-request" || report.Route == "continue" || report.Route == "cancel") {
-			if r := judgeGuardShape(shape, m.expectedHolder); r != nil {
+		// AN OBSERVED GUARD MUST BE SETTLED AND INTACT BEFORE MUTATION. Its
+		// cleanup window and interrupted rewrites hold without continuity flags;
+		// the observed holder supplies no expectation. A preview with no guard
+		// has neither fact to exclude it from a mutating route.
+		if shape.Kind == claimGuard && (report.Route == "new-request" || report.Route == "continue" || report.Route == "cancel") {
+			if r := judgeGuardShape(shape, shape.Guard.Holder); r != nil {
 				report.Route, report.RouteWhy = "hold", r.Why
 			}
 		}
@@ -1419,19 +1437,25 @@ func retireRoute(report *retireReport, cfg *config.Config, requested bool) (stri
 		case report.Identity == "absent" && report.Authority == "absent" &&
 			(report.Config == "absent" || report.Config == "malformed" ||
 				(report.Config == "present" && cfg != nil && cfg.Server != nil)):
-			// A RESERVATION NEEDS A MINTED IDENTITY, which this host lacks;
+			// BOOTSTRAP ADMITS TWO ABSENCES AT THE OBSERVED LOCATION;
 			// the partition above has already ruled out local artefacts.
 			// A directory alone establishes nothing: package preparation
 			// creates it before seeding a configuration that is not yet valid.
 			//
-			// THE RESIDUAL IS ACCEPTED: a host that reserved a retirement and
-			// then lost ONLY deployment-id has these same facts beside a live
-			// row, and converges ordinarily with that reservation unexamined.
-			// Holding instead blocks the whole bootstrap path: package-prepared
-			// hosts, configurations not yet valid and ledgers merely unreachable
-			// need a converge to get out. Closing this needs a bounded read-only
-			// inspection of the LEDGER'S CONTENTS for any retirement row at all:
-			// SQLite has state.PeekLedger; PostgreSQL has no equivalent.
+			// THE RESIDUAL IS ACCEPTED: a host beside no authority that lost its
+			// deployment-id can still hold a live reservation. A commissioned
+			// custom identity_dir hidden by lost or invalid configuration also
+			// has these facts at the packaged path, with its identity and CA
+			// intact elsewhere and nothing deleted. Both converge ordinarily
+			// with the reservation unexamined. Holding every such observation
+			// would block package-prepared hosts from their first converge.
+			// Closing the hidden-location residual needs an authoritative record
+			// of the identity's location outside replaceable configuration,
+			// consulted before this admission; an established but unresolvable
+			// location must hold. A known path whose identity was lost still
+			// needs a bounded read-only inspection of the ledger's contents for
+			// any retirement row: SQLite has state.PeekLedger; PostgreSQL has
+			// no equivalent.
 			if requested {
 				return "hold", "this host has no deployment identity or authority, so there is no controller to retire"
 			}
@@ -1552,10 +1576,10 @@ func observeRetireDryRunConfig(path string) (*config.Config, string) {
 //
 // THE COMPLETION OPEN TAKES THE DIRECTORY LOCK AND MAY CREATE THE DIRECTORY,
 // which is right for the tail — it is about to write the deployment's row under
-// this converge's guard — and wrong for the dry run, whose whole contract is
-// that it takes nothing. `OpenPostgresInspect` creates nothing, locks nothing
-// and refuses every write, which is what a classifier may do to a ledger it
-// does not hold.
+// this converge's guard — and wrong for the dry run. `OpenPostgresInspect`
+// creates no directory, takes no billet lock, claims nothing, migrates nothing
+// and refuses every write. SQLite's driver sidecars belong to the configured
+// ledger's read, not this PostgreSQL locator.
 func retireInspectLedgerByLocator(ctx context.Context, j retirement.Journal) (*state.DB, ledgerProblem) {
 	return retireOpenByLocator(ctx, j, func(ctx context.Context, dir, dsn string) (*state.DB, error) {
 		return state.OpenPostgresInspect(ctx, dir, dsn, state.WithRunningRelease(version.Version()))
@@ -1570,8 +1594,8 @@ func readRetireRowByLocator(ctx context.Context, j retirement.Journal) (*retireR
 		return nil, retirement.RowUnreadable, retireReportLedgerWhy(ctx, bounded, err, "read the retirement row")
 	}
 
-	// THE OPEN THAT TAKES NOTHING. A dry run creates no directory, takes no
-	// lock and writes nothing, and the tail's own open does all three.
+	// THE LOCATOR READ CREATES NO ARCHIVE AND TAKES NO BILLET LOCK. The
+	// tail's own open may do both before writing, so it cannot serve a report.
 	db, problem := retireReportOpenByLocator(bounded, j)
 
 	switch {
