@@ -171,30 +171,74 @@ seed_config() {
         # ever removes a path it did not itself create, and a destination that
         # appeared meanwhile is never overwritten: `ln` refuses an existing
         # name, which is the whole point of seeding only what is absent.
-        staged=$(mktemp "${CONF}.XXXXXX" 2>/dev/null) || staged=
-        if [ -z "${staged}" ]; then
+        seed_temp=$(mktemp "${CONF}.XXXXXX" 2>/dev/null) || seed_temp=
+
+        if [ -z "${seed_temp}" ]; then
             echo "billet: no temporary file could be made beside ${CONF}, so it was not" >&2
             echo "        created." >&2
 
             return 1
         fi
 
-        if ! cp "${TEMPLATE}" "${staged}" || ! chown root:billet "${staged}" ||
-            ! chmod 0640 "${staged}" || ! ln "${staged}" "${CONF}"; then
-            echo "billet: ${TEMPLATE} could not be installed at ${CONF}, which is left as it" >&2
-            echo "        was; nothing of this attempt remains." >&2
+        # AN INTERRUPTION LEAVES NOTHING BEHIND EITHER. This runs inside the
+        # lock's own subshell, so the traps are scoped to it; the INT and TERM
+        # handlers END that shell, because a handler that returned would have
+        # the seeding carry on as though the signal had not arrived. Every way
+        # out below clears them, so nothing of this is left installed.
+        trap 'rm -f "${seed_temp}" 2>/dev/null; exit 130' INT
+        trap 'rm -f "${seed_temp}" 2>/dev/null; exit 143' TERM
+        trap 'rm -f "${seed_temp}" 2>/dev/null' EXIT
 
-            rm -f "${staged}"
+        # -T SO AN EXISTING NAME IS ALWAYS REFUSED: without it, a destination
+        # that became a directory under this run would have the temporary file
+        # published INSIDE it, and `ln` would report success.
+        if ! cp "${TEMPLATE}" "${seed_temp}" || ! chown root:billet "${seed_temp}" ||
+            ! chmod 0640 "${seed_temp}" || ! ln -T -- "${seed_temp}" "${CONF}"; then
+            echo "billet: ${TEMPLATE} could not be installed at ${CONF}, which is left as it" >&2
+            echo "        was." >&2
+
+            if ! rm -f "${seed_temp}"; then
+                echo "        ${seed_temp} could not be removed and is still there; delete it." >&2
+            fi
+
+            trap - EXIT INT TERM
 
             return 1
         fi
 
-        rm -f "${staged}"
+        # THE SECOND LINK IS THIS SCRIPT'S OWN, and a removal that fails leaves
+        # the configuration published under two names, which is said rather
+        # than reported as a clean seeding.
+        if ! rm -f "${seed_temp}"; then
+            echo "billet: ${CONF} was seeded, and the temporary ${seed_temp} it was published" >&2
+            echo "        from could not be removed; delete it." >&2
+
+            trap - EXIT INT TERM
+
+            return 1
+        fi
+
+        trap - EXIT INT TERM
 
         return 0
     fi
 
     if [ -e "${CONF}" ]; then
+        # A NAME THAT IS NOT A CONFIGURATION IS NOT GIVEN A CONFIGURATION'S
+        # OWNER AND MODE. `-e` is true for a directory, a fifo and a device, and
+        # the ownership below would succeed on each: 0640 on a directory makes
+        # it untraversable, and the install would report a clean seeding for a
+        # host whose configuration is not a file. A symlink to a regular file
+        # passes, since `-f` follows and pointing this name at a configuration
+        # is what the dangling-symlink refusal above tells an operator to do.
+        if [ ! -f "${CONF}" ]; then
+            echo "billet: ${CONF} exists and is not a regular file, so it was left alone and" >&2
+            echo "        given no owner or mode: billet reads its configuration from a file." >&2
+            echo "        Move whatever is there aside and reinstall." >&2
+
+            return 1
+        fi
+
         # root owns it so an unprivileged process cannot edit what billet trusts;
         # the billet group can read it or the service cannot start at all.
         if ! chown root:billet "${CONF}" || ! chmod 0640 "${CONF}"; then
@@ -309,7 +353,8 @@ lock_dir_ready() {
     [ -d "${dir}" ]
 }
 
-# lock_name_ordinary says the lock's name is one this script may open.
+# lock_name_ordinary claims the lock's name and says whether it is one this
+# script may open.
 #
 # A FIFO AT THAT NAME WOULD HANG THE INSTALL. `>>` on a fifo with no reader
 # BLOCKS, and nothing after it — not `flock -w`, not any bound here — ever
@@ -319,36 +364,42 @@ lock_dir_ready() {
 #
 # THE NAME IS CLAIMED BEFORE IT IS JUDGED, because the lock's directory is
 # world-writable on an ordinary host: /run/lock is 1777 (measured, ubuntu
-# 24.04), so any account can create this name first. Creating it EXCLUSIVELY
-# (noclobber, so the open carries O_EXCL) either makes it root's or leaves
-# whatever is there, and a name root owns cannot be unlinked by another account
-# in a sticky directory — which is what closes the window between this check
-# and the open below.
+# 24.04), so any account can create this name first, and a name root owns
+# cannot be unlinked by another account in a sticky directory.
 #
-# A FIFO AT THAT NAME WOULD HANG THE INSTALL: `>>` on a fifo with no reader
-# BLOCKS, and nothing after it — not `flock -w`, not any bound here — ever
-# runs; a device would be opened for what its driver does. What billet writes
-# there is a regular file, so anything else, a symlink included, or a file
-# another account owns, is one this script declines to open.
+# THE CLAIM NEVER OPENS THE DESTINATION, and that is what makes it one step
+# rather than two. Any redirection opens: `> fifo` on a fifo that is already
+# there BLOCKS before noclobber's O_EXCL can refuse it (measured, ubuntu
+# 24.04), and an lstat placed in front of it to rule that out is a second
+# lookup another account can win between. `ln` links a NAME: it never opens
+# what is at the destination, so a fifo there cannot block it and an existing
+# name of any shape simply fails with EEXIST.
 #
 # THE RESIDUAL, STATED: a name that already exists and is root-owned is
 # trusted from its metadata, and shell cannot open it with O_NOFOLLOW and judge
 # the descriptor instead. Replacing such a file needs root.
 lock_name_ordinary() {
-    # THE SHAPE IS JUDGED BY lstat BEFORE ANYTHING OPENS. A create with
-    # noclobber carries O_EXCL, which refuses an existing name rather than
-    # opening it — but `> fifo` on a fifo that is already there still BLOCKS
-    # in the shell before that (measured, ubuntu 24.04), so the claim below
-    # runs only over a name nothing holds.
-    if [ -e "${LIFECYCLE_LOCK}" ] || [ -L "${LIFECYCLE_LOCK}" ]; then
-        [ -f "${LIFECYCLE_LOCK}" ] || return 1
-        [ ! -L "${LIFECYCLE_LOCK}" ] || return 1
-    else
-        ( umask 077; set -C; : > "${LIFECYCLE_LOCK}" ) 2>/dev/null || true
+    # THE CLAIM RUNS IN ITS OWN SUBSHELL so the cleanup it needs is a trap
+    # scoped to that shell and never left installed in the install's. The
+    # temporary file is root's, 0600, and made in the lock's own directory, so
+    # the link never crosses a filesystem; the EXIT trap removes it whether the
+    # link was taken or refused, and an interruption leaves nothing behind.
+    (
+        lock_temp=$(mktemp "${LIFECYCLE_LOCK}.XXXXXX" 2>/dev/null) || exit 0
 
-        [ -f "${LIFECYCLE_LOCK}" ] || return 1
-        [ ! -L "${LIFECYCLE_LOCK}" ] || return 1
-    fi
+        trap 'rm -f "${lock_temp}" 2>/dev/null; exit 130' INT
+        trap 'rm -f "${lock_temp}" 2>/dev/null; exit 143' TERM
+        trap 'rm -f "${lock_temp}" 2>/dev/null' EXIT
+
+        chmod 0600 "${lock_temp}" 2>/dev/null || true
+        ln -T -- "${lock_temp}" "${LIFECYCLE_LOCK}" 2>/dev/null || true
+    )
+
+    # WHAT IS THERE NOW, whether this claimed it or found it: a regular file,
+    # not a link to one, owned by root — which in a sticky directory no other
+    # account can unlink and replace.
+    [ -f "${LIFECYCLE_LOCK}" ] || return 1
+    [ ! -L "${LIFECYCLE_LOCK}" ] || return 1
 
     owner=$(stat -c '%u' "${LIFECYCLE_LOCK}" 2>/dev/null) || return 1
 
