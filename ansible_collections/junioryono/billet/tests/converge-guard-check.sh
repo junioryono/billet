@@ -2708,7 +2708,16 @@ ep_case e8-exit
 expect_refused e8-exit "Judge the migration's answer" "answered with a member this role cannot read: exit"
 # A run the bound ended: refused as not having answered, never read as an outcome.
 ep_plant_ordinary e8-hang $EP_A $EP_B
-a e8-hang -e billet_migration_record_wait=1 -e billet_guard_timeout=2
+# EVERY TERM OF THE BOUND IS SHRUNK, not only the record wait. The fake hangs
+# the FIRST migrate-endpoint call, the dry-run decision, whose bound is
+# attempts * (record wait + 4 observations + probe) + guard timeout; with the
+# wait alone shrunk that was 3 * (1 + 4 * 30 + 60) + 2 = 545s, nine minutes,
+# and after thirty-five minutes of earlier cases it fell forty seconds past
+# the job's 45-minute budget on three CI runs, taking every case after it
+# down unrun. With the observation and probe bounds at 1 it is 20s.
+a e8-hang -e billet_migration_record_wait=1 -e billet_guard_timeout=2 \
+  -e billet_migration_stop_timeout=1 -e billet_migration_start_bound=1 \
+  -e billet_migration_observation_bound=1 -e billet_migration_probe_bound=1
 e e8-hang "BILLET_GATE_FAIL=migrate-endpoint:hang"
 ep_case e8-hang
 expect_refused e8-hang "Refuse a migration call that did not answer" "ended by the bound"
