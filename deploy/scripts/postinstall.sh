@@ -141,28 +141,58 @@ chmod 0750 "${CONF_DIR}"
 # and an intended start, so it is not the retry for an unseeded host).
 LIFECYCLE_LOCK=/var/lock/billet-lifecycle.lock
 
+# EVERY MUTATION HERE CHECKS ITSELF, because nothing in this function is
+# covered by `set -e`: it runs inside a subshell that is an `if` condition, and
+# POSIX suspends errexit for a condition AND everything it calls. A copy onto a
+# full filesystem would otherwise leave a partial config and go on to enable
+# timers over it, with the install reporting success.
 seed_config() {
     if [ ! -e "${CONF}" ]; then
-        if [ -e "${TEMPLATE}" ]; then
-            cp "${TEMPLATE}" "${CONF}"
-        else
+        if [ ! -e "${TEMPLATE}" ]; then
             # Loud, because the alternative is a machine with no config and nothing
             # to say why.
             echo "billet: ${TEMPLATE} is missing, so ${CONF} was not created." >&2
             echo "        Copy billet.example.yaml there before starting billet." >&2
+
+            return 1
+        fi
+
+        if ! cp "${TEMPLATE}" "${CONF}"; then
+            echo "billet: ${TEMPLATE} could not be copied to ${CONF}, which is left as it was" >&2
+            echo "        (absent, or partly written and removed below)." >&2
+
+            rm -f "${CONF}"
+
+            return 1
         fi
     fi
 
     if [ -e "${CONF}" ]; then
         # root owns it so an unprivileged process cannot edit what billet trusts;
         # the billet group can read it or the service cannot start at all.
-        chown root:billet "${CONF}"
-        chmod 0640 "${CONF}"
+        if ! chown root:billet "${CONF}" || ! chmod 0640 "${CONF}"; then
+            echo "billet: ${CONF} could not be given root:billet 0640; billet-server will not" >&2
+            echo "        read a configuration it cannot trust, so fix its owner and mode." >&2
+
+            return 1
+        fi
     fi
+
+    return 0
 }
 
 enable_timers() {
-    [ -d /run/systemd/system ] || return 0
+    # AN IMAGE BUILD OR A CHROOT HAS NO RUNNING SYSTEMD, and booting it does not
+    # re-run this scriptlet, so work skipped here is work nobody will do unless
+    # this says so.
+    if [ ! -d /run/systemd/system ]; then
+        echo "billet: systemd is not running (this looks like an image build or a chroot), so" >&2
+        echo "        billet-upgrade.timer and billet-images-refresh.timer were not enabled." >&2
+        echo "        Run \`systemctl enable --now billet-upgrade.timer billet-images-refresh.timer\`" >&2
+        echo "        on the booted host, or reinstall the package there." >&2
+
+        return 0
+    fi
 
     # THE ONE EXCEPTION TO "THE PACKAGE ENABLES NOTHING". That rule keeps an
     # install from connecting a machine to GitHub before billet.yaml says
@@ -193,7 +223,10 @@ enable_timers() {
 unit_decisions() {
     if [ ! -x /usr/bin/billet ]; then
         echo "billet: /usr/bin/billet is not executable, so the unit decisions were not made;" >&2
-        echo "        ${CONF} was not seeded and no timer was enabled. Run \`dpkg-reconfigure billet\`." >&2
+        echo "        ${CONF} was not seeded and no timer was enabled. Re-run these decisions" >&2
+        echo "        with \`dpkg-reconfigure billet\` on a deb host, or by reinstalling the" >&2
+        echo "        package on an rpm one." >&2
+
         return 0
     fi
 
@@ -215,8 +248,16 @@ unit_decisions() {
             ;;
     esac
 
-    seed_config
+    # THE SEEDING'S FAILURE IS CARRIED OUT, so the caller says what was left
+    # half-done rather than reporting a clean install; the timers are still
+    # attempted, because they are independent of the configuration and their
+    # own failures are already reported one by one.
+    seeded=0
+    seed_config || seeded=$?
+
     enable_timers
+
+    return "${seeded}"
 }
 
 # lock_dir_ready prepares the lock's directory, or says it could not.
@@ -248,6 +289,13 @@ lock_dir_ready() {
 # runs; a device would be opened for what its driver does. What billet writes
 # there is a regular file, so an existing name that is anything else is one
 # this script declines to open at all.
+#
+# THE RESIDUAL, STATED: this is a check of the NAME, and the open that follows
+# is a second lookup, so a writer that replaced the file between them would not
+# be caught. Shell cannot open a path with O_NOFOLLOW|O_NONBLOCK and judge the
+# descriptor, which is what would close it. The directory is root-owned, so
+# that writer is already root; what this refuses is the shape a host can
+# honestly be in, not an adversary who has the machine.
 lock_name_ordinary() {
     if [ -e "${LIFECYCLE_LOCK}" ] || [ -L "${LIFECYCLE_LOCK}" ]; then
         [ -f "${LIFECYCLE_LOCK}" ] && [ ! -L "${LIFECYCLE_LOCK}" ]
@@ -257,6 +305,9 @@ lock_name_ordinary() {
 # The statuses lock_and_decide answers with, beside 0 for work performed.
 LOCK_HELD=66
 LOCK_UNUSABLE=67
+# DECISIONS_INCOMPLETE is not a deferral: the lock was taken and the work ran,
+# and something in it failed with its own diagnostic already printed.
+DECISIONS_INCOMPLETE=68
 
 # lock_and_decide runs the unit decisions under the lifecycle lock, IN A
 # SUBSHELL that holds the descriptor for its whole life.
@@ -281,7 +332,12 @@ lock_and_decide() (
     flock -w 60 -E "${LOCK_HELD}" 9 || status=$?
 
     if [ "${status}" -eq 0 ]; then
-        unit_decisions
+        decided=0
+        unit_decisions || decided=$?
+
+        if [ "${decided}" -ne 0 ]; then
+            exit "${DECISIONS_INCOMPLETE}"
+        fi
 
         exit 0
     fi
@@ -306,11 +362,13 @@ else
 fi
 
 if [ "${deferred}" -ne 0 ]; then
-    echo "billet: the unit decisions were DEFERRED, so ${CONF} was not seeded (if it was" >&2
-    echo "        absent) and billet-upgrade.timer and billet-images-refresh.timer were" >&2
-    echo "        left as they were." >&2
+    echo "billet: the unit decisions did not complete, so ${CONF} may not be seeded and" >&2
+    echo "        billet-upgrade.timer and billet-images-refresh.timer may be as they were." >&2
 
-    if [ "${deferred}" -eq "${LOCK_HELD}" ]; then
+    if [ "${deferred}" -eq "${DECISIONS_INCOMPLETE}" ]; then
+        echo "        Part of that work FAILED rather than being deferred; its own message is" >&2
+        echo "        above, and this host is left needing it done by hand." >&2
+    elif [ "${deferred}" -eq "${LOCK_HELD}" ]; then
         echo "        A billet lifecycle operation holds ${LIFECYCLE_LOCK}; it may be a drain," >&2
         echo "        which takes as long as the work already on this host." >&2
     elif ! command -v flock >/dev/null 2>&1; then
