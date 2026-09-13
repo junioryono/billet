@@ -852,7 +852,8 @@ func matchesHere(err, target error) bool {
 		return true
 	}
 
-	if is, ok := err.(interface{ Is(target error) bool }); ok { //nolint:errorlint // asking THIS node, not its causes
+	// The assertion is on the node itself, not a search of what it wraps.
+	if is, ok := err.(interface{ Is(target error) bool }); ok {
 		return is.Is(target)
 	}
 
