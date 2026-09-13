@@ -781,9 +781,10 @@ func readIfAny(path string) string {
 // one. The status is what closes the authority to every ordinary writer, and a
 // host that lost it between the stop and the interruption is the LEAST closed a
 // retired host can be; the resume takes no identity exclusion, so nothing about
-// it depends on the status being there, and the tail republishes it at `done`
-// rather than refusing a host it can finish.
-func TestAResumePastTheArchiveWithNoPublishedStatusFinishesAndRepublishesIt(t *testing.T) {
+// it depends on the status being there, and the host is finished rather than
+// refused. What publishes `done` here is the TRANSITION, at its last phase —
+// the tail's repair of a status that went missing AFTER that is its own test.
+func TestAResumePastTheArchiveWithNoPublishedStatusFinishes(t *testing.T) {
 	f := newRequestFixture(t)
 	f.reserve(t)
 
@@ -1199,30 +1200,38 @@ func TestARenderedTimestampIsUTCOrNothing(t *testing.T) {
 	}
 }
 
-// AND THE COMMAND SAYS SO RATHER THAN MEETING IT AS A MISSING FILE: a journal
-// at `stopped` whose move already completed is refused by name, because the
-// exclusion and the identity such a resume would read are inside the directory
-// that has moved.
-func TestACommandResumeOverACompletedMoveIsRefusedByName(t *testing.T) {
+// WHICH RESUME A `stopped` JOURNAL TAKES IS DECIDED BY THE FILESYSTEM AND NOT
+// BY ITS PHASE. A move that completed before its phase could be written leaves
+// a journal saying `stopped` on a host whose identity is already at the
+// archive, and the ordinary path — whose exclusion and identity are inside the
+// directory that has moved — has nothing to read there. The same journal before
+// the move takes that ordinary path, and the completion of both is the resume
+// table's. This is the decision itself, because a run that took the wrong path
+// would fail on a missing file rather than say which it chose.
+func TestAStoppedJournalsResumeIsChosenByWhereTheIdentityIs(t *testing.T) {
 	f := newRequestFixture(t)
 	f.reserve(t)
 
 	j := f.plantJournal(t, retirement.PhaseStopped, retirement.VariantServerOnly)
-	markGuard(t, f.guard, &guardTransition{Kind: transitionRetirement, ID: retireTestID}, nil)
-	advanceRowToIntent(t, f)
-	mustOK(t, retirement.WriteStatus(retirement.PhaseStopped, retirement.VariantServerOnly, retireNow()))
-	mustOK(t, os.Rename(f.stateDir, j.Archive))
 
-	out, code := f.request(t, f.input(t, nil))
-
-	m := retireAnswer(t, out)
-	if code != exitUnknown || m["reason"] != retireReasonPhase || !strings.Contains(whyOf(m), "already at") ||
-		m["state"] != string(retirement.PhaseStopped) {
-		t.Fatalf("the resume over a completed move: %s", out)
+	if past, r := retireResumeIsPastTheArchive(j, retirement.JournalFactIncomplete); past || r != nil {
+		t.Fatalf("a journal whose identity has not moved was routed past the archive: %v %+v", past, r)
 	}
 
-	if len(f.svc.trace) != 0 {
-		t.Fatalf("a refused resume touched the host: %v", f.svc.trace)
+	mustOK(t, os.Rename(f.stateDir, j.Archive))
+
+	if past, r := retireResumeIsPastTheArchive(j, retirement.JournalFactIncomplete); !past || r != nil {
+		t.Fatalf("a journal whose move completed was not routed past the archive: %v %+v", past, r)
+	}
+
+	// AND A JOURNAL THAT IS NOT INCOMPLETE TAKES NEITHER RESUME, whatever the
+	// filesystem says: `done` is answered from the journal itself before this
+	// decision is reached, and an absent one is a request rather than a resume.
+	for _, fact := range []retirement.JournalFact{retirement.JournalFactDone, retirement.JournalFactIntent,
+		retirement.JournalFactAbsent} {
+		if past, r := retireResumeIsPastTheArchive(j, fact); past || r != nil {
+			t.Fatalf("a %v journal was routed past the archive: %v %+v", fact, past, r)
+		}
 	}
 }
 
