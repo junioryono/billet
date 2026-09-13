@@ -45,8 +45,6 @@ func TestRunnerServiceMatchesTheStockDeprecatedVersionExitContract(t *testing.T)
 	root := t.TempDir()
 	linkListener(t, root)
 
-	// The shared listener answers 7 when no result is named, which is this
-	// case's whole subject.
 	source, err := os.ReadFile("runner-service.sh")
 	if err != nil {
 		t.Fatalf("read runner wrapper: %v", err)
@@ -56,11 +54,21 @@ func TestRunnerServiceMatchesTheStockDeprecatedVersionExitContract(t *testing.T)
 		t.Fatalf("write runner wrapper: %v", err)
 	}
 
-	if err := runRetry(t, exec.CommandContext(t.Context(), wrapper)); err != nil {
+	// THE RESULT IS NAMED ON EVERY RUN, never inherited: the shared listener
+	// answers what the environment says, and an ambient value would make this
+	// case assert a status nothing here chose. The opt-in is named on both
+	// runs too, for the same reason.
+	without := exec.CommandContext(t.Context(), wrapper)
+	without.Env = append(os.Environ(), "BILLET_TEST_RESULT=7",
+		"ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE=")
+
+	if err := runRetry(t, without); err != nil {
 		t.Fatalf("status 7 without opt-in became a service failure: %v", err)
 	}
+
 	run := exec.CommandContext(t.Context(), wrapper)
-	run.Env = append(os.Environ(), "ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE=1")
+	run.Env = append(os.Environ(), "BILLET_TEST_RESULT=7",
+		"ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE=1")
 	err = runRetry(t, run)
 	exit, ok := errors.AsType[*exec.ExitError](err)
 	if !ok || exit.ExitCode() != 7 {

@@ -241,45 +241,89 @@ lock_dir_ready() {
     [ -d "${dir}" ]
 }
 
-# lock_openable says whether the lock file can be opened for append.
+# lock_name_ordinary says the lock's name is one this script may open.
 #
-# IN A SUBSHELL, BECAUSE A FAILED REDIRECTION ON `exec` ENDS THE SHELL. A
-# readable directory proves nothing about the file: the lock's name can be a
-# directory itself, or its filesystem read-only, and the `exec 9>>` below would
-# then take the whole scriptlet down instead of deferring the work it guards.
-lock_openable() {
-    ( : >>"${LIFECYCLE_LOCK}" ) 2>/dev/null
+# A FIFO AT THAT NAME WOULD HANG THE INSTALL. `>>` on a fifo with no reader
+# BLOCKS, and nothing after it — not `flock -w`, not any bound here — ever
+# runs; a device would be opened for what its driver does. What billet writes
+# there is a regular file, so an existing name that is anything else is one
+# this script declines to open at all.
+lock_name_ordinary() {
+    if [ -e "${LIFECYCLE_LOCK}" ] || [ -L "${LIFECYCLE_LOCK}" ]; then
+        [ -f "${LIFECYCLE_LOCK}" ] && [ ! -L "${LIFECYCLE_LOCK}" ]
+    fi
 }
 
-if command -v flock >/dev/null 2>&1 && lock_dir_ready && lock_openable; then
-    # THE LOCK ON A DESCRIPTOR OF THIS SHELL, so the functions above run under it
-    # in this process; `flock <file> <command>` would need a second script.
-    exec 9>>"${LIFECYCLE_LOCK}"
-    if flock -w 60 9; then
+# The statuses lock_and_decide answers with, beside 0 for work performed.
+LOCK_HELD=66
+LOCK_UNUSABLE=67
+
+# lock_and_decide runs the unit decisions under the lifecycle lock, IN A
+# SUBSHELL that holds the descriptor for its whole life.
+#
+# THE OPEN IS INSIDE IT BECAUSE A FAILED REDIRECTION ON `exec` ENDS THE SHELL
+# IT RUNS IN, and that shell must not be the install's: a filesystem that went
+# read-only between a probe and the open would otherwise take the scriptlet
+# down instead of deferring. One descriptor, opened once, used by the flock and
+# by nothing else, so there is no window between a check and its use.
+lock_and_decide() (
+    exec 9>>"${LIFECYCLE_LOCK}" || exit "${LOCK_UNUSABLE}"
+
+    # -E SEPARATES CONTENTION FROM FAILURE: with it, 66 means the wait ended
+    # with somebody else holding the lock, and any other non-zero status is
+    # flock saying it could not lock at all — a filesystem that does not
+    # support it, say — which waiting cannot fix.
+    # THE VERDICT IS CAPTURED FROM THE COMMAND, not from the `if` around it:
+    # `$?` after an `if` whose condition FAILED is the if statement's own
+    # status, which POSIX makes zero, so contention read as a failure to lock
+    # at all (probed in fedora:42, 2026-09-12).
+    status=0
+    flock -w 60 -E "${LOCK_HELD}" 9 || status=$?
+
+    if [ "${status}" -eq 0 ]; then
         unit_decisions
-        flock -u 9
+
+        exit 0
+    fi
+
+    if [ "${status}" -eq "${LOCK_HELD}" ]; then
+        exit "${LOCK_HELD}"
+    fi
+
+    exit "${LOCK_UNUSABLE}"
+)
+
+deferred=0
+
+if command -v flock >/dev/null 2>&1 && lock_dir_ready && lock_name_ordinary; then
+    if lock_and_decide; then
+        deferred=0
     else
-        echo "billet: a billet lifecycle operation holds ${LIFECYCLE_LOCK}, so this install" >&2
-        echo "        left ${CONF} unseeded (if it was absent) and billet-upgrade.timer and" >&2
-        echo "        billet-images-refresh.timer as they were. Automatic maintenance is" >&2
-        echo "        DEFERRED on this host until the deferred work runs: once the operation" >&2
-        echo "        has finished, \`dpkg-reconfigure billet\` (or a reinstall) re-runs these" >&2
-        echo "        decisions with the status re-read." >&2
+        deferred=$?
     fi
 else
-    echo "billet: the unit decisions cannot be excluded against a lifecycle operation, so" >&2
-    echo "        ${CONF} was not seeded and no timer was enabled." >&2
+    deferred="${LOCK_UNUSABLE}"
+fi
 
-    if ! command -v flock >/dev/null 2>&1; then
+if [ "${deferred}" -ne 0 ]; then
+    echo "billet: the unit decisions were DEFERRED, so ${CONF} was not seeded (if it was" >&2
+    echo "        absent) and billet-upgrade.timer and billet-images-refresh.timer were" >&2
+    echo "        left as they were." >&2
+
+    if [ "${deferred}" -eq "${LOCK_HELD}" ]; then
+        echo "        A billet lifecycle operation holds ${LIFECYCLE_LOCK}; it may be a drain," >&2
+        echo "        which takes as long as the work already on this host." >&2
+    elif ! command -v flock >/dev/null 2>&1; then
         echo "        flock(1) is missing; install util-linux." >&2
     else
-        echo "        ${LIFECYCLE_LOCK} could not be opened: its directory is" >&2
+        echo "        ${LIFECYCLE_LOCK} could not be locked. Its directory is" >&2
         echo "        $(readlink -f "$(dirname "${LIFECYCLE_LOCK}")" 2>/dev/null || dirname "${LIFECYCLE_LOCK}")," >&2
-        echo "        which must exist and be writable by root." >&2
+        echo "        which must exist and be writable by root, and the lock itself must be a" >&2
+        echo "        regular file on a filesystem that supports locking." >&2
     fi
 
-    echo "        Once it can, re-run these decisions: \`dpkg-reconfigure billet\` on a deb" >&2
-    echo "        host, or reinstalling the package on an rpm one." >&2
+    echo "        Once that is so, re-run these decisions: \`dpkg-reconfigure billet\` on a" >&2
+    echo "        deb host, or reinstalling the package on an rpm one." >&2
 fi
 
 # THE APP KEY IS OWNED BY THE SERVICE USER AT 0600, and it is the one file here
