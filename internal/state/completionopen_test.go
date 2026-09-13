@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -763,10 +764,57 @@ func TestTheReachVerdictIsTakenFromTheWholeTree(t *testing.T) {
 			err: errors.Join(cancelled, transport), unreachable: false,
 		},
 
-		// A startup that failed on the connection, joined with a cleanup that
-		// also failed, is still the connection.
+		// AND A CLEANUP FAILURE IS ITS OWN BRANCH, whichever sentinel stands
+		// beside it. `errors.Join` puts unrelated failures next to each other
+		// and billet's own opens join a startup failure with their close, so a
+		// tree holding an outage AND this host's pools failing to close is not
+		// an outage a caller may wait out: it carries something that host must
+		// fix, and the fault is not a survivor's to finish. Asking the whole
+		// tree at once answered otherwise, because a sibling that established
+		// nothing set no flag — and the identical cleanup beside a schema
+		// refusal refused, which is the asymmetry this closes.
 		"a transport failure joined with a cleanup failure": {
-			err: errors.Join(transport, cleanup), unreachable: true,
+			err: errors.Join(transport, cleanup), unreachable: false,
+		},
+		"a transport sentinel joined with a cleanup failure": {
+			err: errors.Join(driver.ErrBadConn, cleanup), unreachable: false,
+		},
+
+		// The cleanup's own branch is what refuses, so the same cleanup under
+		// a wrapper answers the same way, and the transport branch alone is
+		// still an outage.
+		"a transport sentinel joined with a wrapped cleanup failure": {
+			err:         errors.Join(driver.ErrBadConn, fmt.Errorf("close the pools: %w", cleanup)),
+			unreachable: false,
+		},
+		"a transport sentinel under a wrapper": {
+			err: fmt.Errorf("open the ledger: %w", driver.ErrBadConn), unreachable: true,
+		},
+
+		// A JOIN OF TWO OUTAGES IS STILL AN OUTAGE: the rule is that every
+		// branch must establish one, not that there may be only one.
+		//
+		// AND EACH BRANCH IS JUDGED WITH THE EVIDENCE ABOVE IT. `net.OpError`
+		// unwraps to a bare cause and so does pgx's `ConnectError`, so a rule
+		// that split the tree at its join and then looked only at what it
+		// found underneath would discard the very shapes the measurement reads
+		// and answer false for both of these.
+		"two transport failures joined": {
+			err: errors.Join(transport, driver.ErrBadConn), unreachable: true,
+		},
+		"a join under a transport failure": {
+			err: &net.OpError{Op: "dial", Err: errors.Join(errors.New("one address"),
+				errors.New("another address"))},
+			unreachable: true,
+		},
+
+		// AND A JOIN UNDER A WRAPPER IS FOUND, because the wrapper is not the
+		// branch: a classifier that stopped at the first single-cause node
+		// would read the whole join as one branch and answer from the flags
+		// its two halves set together.
+		"a join under a wrapper": {
+			err:         fmt.Errorf("open the ledger: %w", errors.Join(transport, cleanup)),
+			unreachable: false,
 		},
 
 		// AND A DEADLINE DOES NOT SURVIVE AN INDEPENDENT CAUSE: this is the

@@ -351,10 +351,10 @@ func retireUnitPostcondition(ctx context.Context, insp *lifeops.Inspector, unit 
 		// EXITED as active (SERVICE_EXITED maps to UNIT_ACTIVE), so the state
 		// alone is not evidence that the node this host kept is running.
 		switch running, err := strconv.Atoi(main); {
-		case main == "" || err != nil:
+		case main == "" || err != nil || running < 0:
 			return "", retireUnknown(retireReasonPostcondition, fmt.Sprintf("systemd did not answer %s's main process "+
-				"as a number (%s), so whether the node is running cannot be established", unit, activeWord(main)), "")
-		case running <= 0:
+				"as a process id (%s), so whether the node is running cannot be established", unit, activeWord(main)), "")
+		case running == 0:
 			return "", retireRefuse(retireReasonPostcondition, fmt.Sprintf("%s is active with no main process on a host "+
 				"that kept its node", unit), "")
 		}
@@ -374,10 +374,14 @@ func retireUnitPostcondition(ctx context.Context, insp *lifeops.Inspector, unit 
 	// clause the archive's safety rests on. Only a service is asked: a timer
 	// has no main process and answers nothing for it.
 	if pid {
+		// EXACTLY ZERO SATISFIES IT. A negative answer is not evidence of no
+		// process: it is an answer no systemd gives for a main pid, and
+		// reading it as one would let a malformed property satisfy the clause
+		// the archive's safety rests on.
 		switch running, err := strconv.Atoi(main); {
-		case main == "" || err != nil:
+		case main == "" || err != nil || running < 0:
 			return "", retireUnknown(retireReasonPostcondition, fmt.Sprintf("systemd did not answer %s's main process as "+
-				"a number (%s), so whether it still has one cannot be established", unit, activeWord(main)), "")
+				"a process id (%s), so whether it still has one cannot be established", unit, activeWord(main)), "")
 		case running > 0:
 			return "", retireRefuse(retireReasonPostcondition, fmt.Sprintf("%s is inactive and still has the main process "+
 				"%d", unit, running), "")

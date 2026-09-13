@@ -498,7 +498,7 @@ func TestARetirementInterruptedBetweenTheMarkerAndSettledIsFinished(t *testing.T
 		return os.ErrPermission
 	}
 
-	t.Cleanup(func() { retirement.Publishing = nil })
+	t.Cleanup(func() { retirement.Publishing = saved })
 
 	out, code := f.request(t, f.input(t, nil))
 	if m := retireAnswer(t, out); code != exitUnknown || m["reason"] != retireReasonJournal {

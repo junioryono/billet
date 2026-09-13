@@ -620,6 +620,13 @@ func (db *DB) PingContext(ctx context.Context) error {
 // reading that as unreachability would let a caller that waits out an outage
 // wait out a corrupt ledger instead.
 //
+// AND IT IS ASKED OF EVERY INDEPENDENT BRANCH, because `errors.Join` puts
+// unrelated failures beside each other: the answer is yes only when each
+// subtree the join holds establishes an availability failure of its own. A
+// verdict taken from the flags the whole tree set together would read an
+// outage joined with this host's pools failing to close as something a caller
+// may wait out, and that tree carries a fault the caller must fix.
+//
 // THE ORDER BELOW IS WHAT THE MEASUREMENT REQUIRES, not a preference (pgx
 // v5.10.0 against PostgreSQL 18, 2026-09-13, every case run through
 // database/sql as billet runs it):
@@ -651,18 +658,70 @@ func Unreachable(err error) bool {
 		return false
 	}
 
-	found, whole := reachEvidenceOf(err)
-	if !whole {
-		return false
+	budget := maxErrorCauses
+
+	out, whole := unreachableBranch(err, reachEvidence{}, &budget)
+
+	return whole && out
+}
+
+// unreachableBranch reports whether EVERY INDEPENDENT BRANCH under err
+// establishes an availability failure, and whether it saw the whole of the
+// tree. `above` is the evidence the nodes between the root and err
+// contributed, which belongs to each branch below them: a `ConnectError` and a
+// `net.OpError` both unwrap, so a rule that split at a join and then looked
+// only at what it found underneath would discard the very shapes the
+// measurement reads.
+//
+// `errors.Join` puts unrelated failures beside each other — billet's own opens
+// join a startup failure with their close — and a tree where one branch is an
+// outage and another is this host's pools failing to close is NOT an outage a
+// caller may wait out: it holds something that caller must fix, and that fault
+// is not a survivor's to finish. Asking the whole tree at once said otherwise,
+// because a sibling that established nothing set no flag of its own.
+func unreachableBranch(err error, above reachEvidence, budget *int) (bool, bool) {
+	for err != nil {
+		if *budget <= 0 {
+			return false, false
+		}
+
+		*budget--
+
+		above = above.with(reachEvidenceHere(err))
+
+		switch unwrapped := err.(type) { //nolint:errorlint // this asks what an error IS; the walk reaches the causes itself
+		case interface{ Unwrap() []error }:
+			causes := unwrapped.Unwrap()
+			if len(causes) == 0 {
+				break
+			}
+
+			every, whole := true, true
+
+			for _, cause := range causes {
+				branch, seen := unreachableBranch(cause, above, budget)
+				if !seen {
+					whole = false
+				}
+
+				if !branch {
+					every = false
+				}
+			}
+
+			return every, whole
+		case interface{ Unwrap() error }:
+			if under := unwrapped.Unwrap(); under != nil {
+				err = under
+
+				continue
+			}
+		}
+
+		break
 	}
 
-	// A CANCELLATION DOMINATES THE TRANSPORT EVIDENCE, because an attempt that
-	// was cut short did not establish anything: pgx reports a connect that ran
-	// out of time as a ConnectError, and reading that as "the database could
-	// not be reached" would turn an operator's own interruption into a fact
-	// about the deployment. Whose clock it was is the caller's to know, and
-	// the caller decides from that; here it is could-not-tell.
-	return found.out && !found.refused && !found.cancelled
+	return above.unreachable(), true
 }
 
 // Describe renders err for a diagnostic, or says it could not be rendered.
@@ -816,62 +875,71 @@ func hasCauses(err error) bool {
 	return false
 }
 
-// reachEvidence is what the whole error tree says about reaching the ledger:
-// positive evidence it could not be reached, an answer the caller must act on,
-// and a context that ended under the attempt.
+// reachEvidence is what one branch of an error tree says about reaching the
+// ledger: positive evidence it could not be reached, an answer the caller must
+// act on, and a context that ended under the attempt.
 type reachEvidence struct {
 	out       bool
 	refused   bool
 	cancelled bool
 }
 
-func reachEvidenceOf(err error) (reachEvidence, bool) {
-	var found reachEvidence
+// with merges what one node said into what its ancestors did.
+func (e reachEvidence) with(other reachEvidence) reachEvidence {
+	return reachEvidence{
+		out:       e.out || other.out,
+		refused:   e.refused || other.refused,
+		cancelled: e.cancelled || other.cancelled,
+	}
+}
 
-	whole := walkCauses(err, func(cause error) {
-		//nolint:errorlint // each cause is asked what it IS; the walk reaches what it wraps on its own
-		switch typed := cause.(type) {
-		case *pgconn.PgError:
-			if unreachableSQLState(typed.Code) {
-				found.out = true
-			} else {
-				found.refused = true
-			}
+// unreachable is the verdict a branch's own evidence carries.
+//
+// A CANCELLATION DOMINATES THE TRANSPORT EVIDENCE, because an attempt cut
+// short established nothing: pgx reports a connect that ran out of time as a
+// ConnectError, and reading that as "the database could not be reached" would
+// turn an operator's own interruption into a fact about the deployment. Whose
+// clock it was is the caller's to know, and the caller decides from that; here
+// it is could-not-tell.
+func (e reachEvidence) unreachable() bool {
+	return e.out && !e.refused && !e.cancelled
+}
 
-			return
-		case *pgconn.ConnectError:
-			found.out = true
-
-			return
+// reachEvidenceHere is what THIS node says, asked of what it is rather than of
+// what it wraps; the recursion above reaches its causes itself.
+func reachEvidenceHere(err error) reachEvidence {
+	//nolint:errorlint // each node is asked what it IS; the recursion reaches what it wraps
+	switch typed := err.(type) {
+	case *pgconn.PgError:
+		if unreachableSQLState(typed.Code) {
+			return reachEvidence{out: true}
 		}
 
-		if certificateRejectedHere(cause) {
-			found.refused = true
+		return reachEvidence{refused: true}
+	case *pgconn.ConnectError:
+		return reachEvidence{out: true}
+	}
 
-			return
-		}
+	if certificateRejectedHere(err) {
+		return reachEvidence{refused: true}
+	}
 
-		// A CANCELLATION IS ITS OWN EVIDENCE, and it is taken before the
-		// transport shapes below because pgx's errTimeout wraps one while
-		// satisfying net.Error.
-		if isCancellation(cause) {
-			found.cancelled = true
+	// A CANCELLATION IS ITS OWN EVIDENCE, and it is taken before the transport
+	// shapes below because pgx's errTimeout wraps one while satisfying
+	// net.Error.
+	if isCancellation(err) {
+		return reachEvidence{cancelled: true}
+	}
 
-			return
-		}
+	if matchesHere(err, driver.ErrBadConn) || matchesHere(err, io.ErrUnexpectedEOF) {
+		return reachEvidence{out: true}
+	}
 
-		if matchesHere(cause, driver.ErrBadConn) || matchesHere(cause, io.ErrUnexpectedEOF) {
-			found.out = true
+	if _, ok := err.(net.Error); ok { //nolint:errorlint // as above
+		return reachEvidence{out: true}
+	}
 
-			return
-		}
-
-		if _, ok := cause.(net.Error); ok { //nolint:errorlint // as above
-			found.out = true
-		}
-	})
-
-	return found, whole
+	return reachEvidence{}
 }
 
 // maxErrorCauses bounds a walk of an error tree. Nothing in billet builds a

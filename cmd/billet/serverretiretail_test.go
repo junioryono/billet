@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -660,5 +661,20 @@ func TestThePendingListAsksForTheWholeError(t *testing.T) {
 	r := retireLedgerProblem(t.Context(), t.Context(), joined, "open the ledger", answer)
 	if r == nil || !strings.Contains(r.Why, "still in use") {
 		t.Fatalf("the refusal does not carry the cleanup failure: %+v", r)
+	}
+
+	// THE SAME CLEANUP BESIDE AN OUTAGE ANSWERS THE SAME WAY. Every entry of
+	// the list is asked of the whole error, and a rule that asked the outage
+	// loosely would let exactly this tree through: a database this host cannot
+	// reach is something the survivor finishes, and pools that would not close
+	// are not, so the pair together is not a row to hand away.
+	outage := fmt.Errorf("open the ledger: %w", driver.ErrBadConn)
+	if why := retirePendingReason(outage); why == "" {
+		t.Fatal("an outage alone was not pending")
+	}
+
+	both := errors.Join(outage, errors.New("close the pools: still in use"))
+	if why := retirePendingReason(both); why != "" {
+		t.Fatalf("an outage joined with a cleanup failure was pending: %q", why)
 	}
 }
