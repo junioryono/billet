@@ -777,12 +777,13 @@ func readIfAny(path string) string {
 	return string(body)
 }
 
-// THE COMMAND'S RESUME ENDS WHERE THE HOST STOPS HOLDING WHAT THE REQUEST
-// READ: past the archive there is no configured identity directory and, on a
-// server-only host, no configuration at all, and the reader that works from
-// the journal's locator alone is the tail's. The driver itself goes on working
-// there, which is what the resume table above proves.
-func TestACommandResumePastTheArchiveIsRefusedByName(t *testing.T) {
+// A RESUME PAST THE ARCHIVE NEEDS NO PUBLISHED STATUS, and finishing leaves
+// one. The status is what closes the authority to every ordinary writer, and a
+// host that lost it between the stop and the interruption is the LEAST closed a
+// retired host can be; the resume takes no identity exclusion, so nothing about
+// it depends on the status being there, and the tail republishes it at `done`
+// rather than refusing a host it can finish.
+func TestAResumePastTheArchiveWithNoPublishedStatusFinishesAndRepublishesIt(t *testing.T) {
 	f := newRequestFixture(t)
 	f.reserve(t)
 
@@ -792,24 +793,28 @@ func TestACommandResumePastTheArchiveIsRefusedByName(t *testing.T) {
 
 	mustOK(t, os.Rename(f.stateDir, j.Archive))
 
+	// THE STATUS IS NOT THERE, which is the whole case: every other resume
+	// fixture publishes the one the stop wrote.
+	if _, presence, err := retirement.ReadStatus(); presence != retirement.StatusAbsent || err != nil {
+		t.Fatalf("this host already publishes a status: %d %v", presence, err)
+	}
+
 	out, code := f.request(t, f.input(t, nil))
 
-	m := retireAnswer(t, out)
-	if code != exitUnknown || m["reason"] != retireReasonPhase || !strings.Contains(whyOf(m), "past the archive") ||
-		m["state"] != string(retirement.PhaseArchived) {
-		t.Fatalf("the resume: %s", out)
+	retiredAnswer(t, out, code)
+
+	st, presence, err := retirement.ReadStatus()
+	mustOK(t, err)
+
+	if presence != retirement.StatusPresent || st.Phase != retirement.PhaseDone {
+		t.Fatalf("the status the tail left: %+v (presence %d)", st, presence)
 	}
 
-	if len(f.svc.trace) != 0 {
-		t.Fatalf("a refused resume touched the host: %v", f.svc.trace)
-	}
-
-	// AND THE JOURNAL IS LEFT WHERE IT STANDS.
 	after, _, err := retirement.ReadJournal()
 	mustOK(t, err)
 
-	if after.Phase != retirement.PhaseArchived {
-		t.Fatalf("the refused resume moved the journal to %s", after.Phase)
+	if after.Phase != retirement.PhaseDone || !after.Settled {
+		t.Fatalf("the resume left the journal at %s (settled %v)", after.Phase, after.Settled)
 	}
 }
 
