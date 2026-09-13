@@ -359,31 +359,35 @@ func retireOpenByLocator(ctx context.Context, j retirement.Journal,
 	}
 
 	// NEITHER OPEN CLAIMS ANYTHING OR MIGRATES ANYTHING: this host's controller
-	// is retired, its binary may be frozen at the release it retired on, and an
-	// admin open would take the deployment's controller exclusion and migrate
-	// the shared schema whenever the survivor happened to be down.
+	// is being or has been retired, its binary may be frozen at the release it
+	// retired on, and an admin open would take the deployment's controller
+	// exclusion and migrate the shared schema whenever the survivor happened to
+	// be down. What they DO differ in is what they take locally, which is why
+	// there are two: the tail is about to write and takes the archive's
+	// directory lock, the classifier takes nothing at all.
 	db, err := open(ctx, j.Locator.Archive, dsn)
 	if err != nil {
 		return nil, ledgerProblem{cause: err}
 	}
 
 	// AND IT IS THIS DEPLOYMENT'S LEDGER. The locator names the archive the
-	// identity moved to, so the binding is asked of the identity this
-	// retirement recorded, never of a directory at the configured path that
-	// something else may have created since. A binding that says another
-	// deployment is a refusal; a binding this host could not READ because the
-	// connection went away under it is the same outage as any other and leaves
-	// the row pending.
+	// identity moved to, or is to move to — a caller may ask this before the
+	// rename — so the binding is asked of the identity this retirement
+	// recorded, never of a directory at the configured path that something else
+	// may have created since. A binding that says another deployment is a
+	// refusal; one this host could not READ because the connection went away
+	// under it is the same outage as any other, which the TAIL reads as a
+	// pending row and the classifier reports as a row it could not read.
 	err = db.VerifyDeploymentBinding(ctx, j.Deployment)
 	if err == nil {
 		return db, ledgerProblem{}
 	}
 
-	// THE HANDLE GOES WITH THE ANSWER. Nothing below returns it, so its pools
-	// and the directory lock at the archive would otherwise be held until this
-	// process exits. A CLOSE THAT FAILED IS ITS OWN REFUSAL and never a
-	// pending row: this host has left something open on a ledger it is
-	// retiring from, which is not a thing to wait out.
+	// THE HANDLE GOES WITH THE ANSWER. Nothing below returns it, so its pools,
+	// and whatever directory lock the open took, would otherwise be held until
+	// this process exits. A CLOSE THAT FAILED IS ITS OWN REFUSAL and never a
+	// pending row: this host has left something open on a ledger it is retiring
+	// from, which is not a thing to wait out.
 	if closed := db.Close(); closed != nil {
 		return nil, ledgerProblem{refusal: retireUnknown(retireReasonLedger,
 			state.Describe(err)+"; and closing the ledger: "+state.Describe(closed), "")}
@@ -392,9 +396,10 @@ func retireOpenByLocator(ctx context.Context, j retirement.Journal,
 	return nil, ledgerProblem{cause: err}
 }
 
-// ledgerProblem is why the tail has no handle: a row the survivor can still
-// write (pending, with its reason), a refusal this host stops on, or an error
-// for the one classifier to judge.
+// ledgerProblem is why a caller has no handle: something the survivor could
+// still finish (with its reason, which the TAIL answers as a pending row and
+// the dry run as a row it could not read), a refusal this host stops on, or an
+// error for the one classifier to judge.
 type ledgerProblem struct {
 	pending string
 	refusal *retireRefusal
