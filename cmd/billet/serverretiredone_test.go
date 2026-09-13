@@ -585,11 +585,35 @@ func TestARetainedNodesMainProcessIsJudgedAsAProcessId(t *testing.T) {
 			out, code := f.retainedRequest(t, f.input(t, f.retainedOverrides(t)))
 			retiredAnswer(t, out, code)
 
+			// THE STOPPED UNITS ARE WHAT THE FAKE SERVICE MANAGER DOES NOT
+			// WRITE: it moves its own maps and leaves the property files a
+			// fixture put there, so the server and the timers must be given
+			// the answers a completed retirement leaves. The node keeps the
+			// one the restart left it, which `retiredUnits` would flatten.
+			node := mustRead(t, filepath.Join(f.unitsDir, nodeUnit))
+
+			retiredUnits(t, f)
+			writeFile(t, filepath.Join(f.unitsDir, nodeUnit), node, 0o644)
+
+			// AND THE WHOLE HOST PASSES BEFORE THE DRIFT, with the node
+			// reported running: without this the cases below could be refused
+			// by some other unit and prove nothing about the pid.
+			out, code = f.retainedRequest(t, f.input(t, f.retainedOverrides(t)))
+
+			m := retireAnswer(t, out)
+			if code != 0 || m["outcome"] != retireOutcomeUnchanged {
+				t.Fatalf("the settled retirement did not pass before the drift: %s", out)
+			}
+
+			if asMap(m["postconditions"])["node"] != retireUnitRunning {
+				t.Fatalf("the node was not reported running: %s", out)
+			}
+
 			setMainPID(t, filepath.Join(f.unitsDir, nodeUnit), c.pid)
 
 			out, code = f.retainedRequest(t, f.input(t, f.retainedOverrides(t)))
 
-			m := retireAnswer(t, out)
+			m = retireAnswer(t, out)
 			if m["reason"] != retireReasonPostcondition || code != c.code {
 				t.Fatalf("a retained node whose main pid is %q: %s", c.pid, out)
 			}
