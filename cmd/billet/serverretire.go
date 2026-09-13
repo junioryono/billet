@@ -1206,7 +1206,9 @@ func observeRetireDryRunConfig(path string) (*config.Config, string) {
 // Everything the open cannot establish is `unreadable` with its reason, never
 // an absence.
 func readRetireRowByLocator(ctx context.Context, j retirement.Journal) (*retireReportRow, retirement.RowFact, string) {
-	db, problem := retireOpenLedgerByLocator(ctx, j)
+	// THE OPEN THAT TAKES NOTHING. A dry run creates no directory, takes no
+	// lock and writes nothing, and the tail's own open does all three.
+	db, problem := retireInspectLedgerByLocator(ctx, j)
 
 	switch {
 	case problem.refusal != nil:

@@ -322,6 +322,28 @@ func retireTailRow(ctx context.Context, j retirement.Journal, answer *retireTail
 // and not a failure of this converge; or a refusal, which is everything this
 // command cannot classify.
 func retireOpenLedgerByLocator(ctx context.Context, j retirement.Journal) (*state.DB, ledgerProblem) {
+	return retireOpenByLocator(ctx, j, func(ctx context.Context, dir, dsn string) (*state.DB, error) {
+		return state.OpenPostgresCompletion(ctx, dir, dsn, state.WithRunningRelease(version.Version()))
+	})
+}
+
+// retireInspectLedgerByLocator is the same open for a run that only LOOKS.
+//
+// THE COMPLETION OPEN TAKES THE DIRECTORY LOCK AND MAY CREATE THE DIRECTORY,
+// which is right for the tail — it is about to write the deployment's row under
+// this converge's guard — and wrong for the dry run, whose whole contract is
+// that it takes nothing. `OpenPostgresInspect` creates nothing, locks nothing
+// and refuses every write, which is what a classifier may do to a ledger it
+// does not hold.
+func retireInspectLedgerByLocator(ctx context.Context, j retirement.Journal) (*state.DB, ledgerProblem) {
+	return retireOpenByLocator(ctx, j, func(ctx context.Context, dir, dsn string) (*state.DB, error) {
+		return state.OpenPostgresInspect(ctx, dir, dsn, state.WithRunningRelease(version.Version()))
+	})
+}
+
+func retireOpenByLocator(ctx context.Context, j retirement.Journal,
+	open func(ctx context.Context, dir, dsn string) (*state.DB, error),
+) (*state.DB, ledgerProblem) {
 	if j.Locator.Backend != string(config.StatePostgres) {
 		return nil, ledgerProblem{refusal: retireUnknown(retireReasonLedger, fmt.Sprintf("the journal's locator names "+
 			"the backend %q, and a retirement is defined for PostgreSQL", j.Locator.Backend), "")}
@@ -336,11 +358,11 @@ func retireOpenLedgerByLocator(ctx context.Context, j retirement.Journal) (*stat
 		return nil, ledgerProblem{pending: why}
 	}
 
-	// THE OPEN CLAIMS NOTHING AND MIGRATES NOTHING: this host's controller is
-	// retired, its binary may be frozen at the release it retired on, and an
+	// NEITHER OPEN CLAIMS ANYTHING OR MIGRATES ANYTHING: this host's controller
+	// is retired, its binary may be frozen at the release it retired on, and an
 	// admin open would take the deployment's controller exclusion and migrate
 	// the shared schema whenever the survivor happened to be down.
-	db, err := state.OpenPostgresCompletion(ctx, j.Locator.Archive, dsn, state.WithRunningRelease(version.Version()))
+	db, err := open(ctx, j.Locator.Archive, dsn)
 	if err != nil {
 		return nil, ledgerProblem{cause: err}
 	}
