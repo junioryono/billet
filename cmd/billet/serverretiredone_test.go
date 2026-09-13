@@ -699,10 +699,12 @@ func TestAnUnparseableConfigurationIsJudgedByWhatItsVariantAsks(t *testing.T) {
 		retiredUnits(t, f)
 		writeFile(t, filepath.Join(f.unitsDir, nodeUnit), node, 0o644)
 
-		// THE DOCUMENT AND THE DIGEST ARE TAKEN FIRST, the way the role takes
-		// them: it builds both on a host whose configuration still reads, and
-		// building them here would answer about the file rather than the
-		// clause.
+		// THE DOCUMENT AND THE DIGEST ARE TAKEN FIRST because that is the
+		// request the role makes: it collects both from a host whose
+		// configuration still reads, and the drift happens after. Neither
+		// helper would have failed on these bytes — they are valid YAML and
+		// the digest is a hash — so this is the shape of the request and not
+		// something the test needs to work.
 		in, digest := f.input(t, f.retainedOverrides(t)), f.installedSHA(t)
 
 		writeFile(t, f.cfg, malformed, 0o600)
