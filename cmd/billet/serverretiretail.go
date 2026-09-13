@@ -468,7 +468,12 @@ func retireLedgerProblem(outer, bounded context.Context, err error, doing string
 // unresponsive connection during the open produces — the reason a bound on the
 // attempt alone is not enough.
 func retireDeadlinePending(outer, bounded context.Context, err error) string {
-	if !errors.Is(err, context.DeadlineExceeded) {
+	// A DEADLINE MUST BE THE WHOLE OF THE ERROR, not merely somewhere in it.
+	// `errors.Is` is true of a tree that also holds a server's refusal or a
+	// cleanup that failed — and billet's own opens join their startup failure
+	// with their close — so reporting such a tree as an expiry would throw the
+	// rest of the evidence away.
+	if !errors.Is(err, context.DeadlineExceeded) || !state.OnlyCancellation(err) {
 		return ""
 	}
 

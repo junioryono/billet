@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -536,6 +537,22 @@ func TestTheTailTellsTheThreeDeadlinesApart(t *testing.T) {
 		"an error that is not the deadline's": {
 			outer: live, bounded: expired, err: state.ErrForeignLedger,
 			want: "",
+		},
+		// AND A DEADLINE BESIDE ANYTHING ELSE IS STILL NOT A DEADLINE'S
+		// ANSWER: an open joins its startup failure with a cleanup that also
+		// failed, so a tree holding both is the shape this has to get right.
+		// What each kind of cause means is internal/state's to say; what this
+		// says is that a tree holding more than the cancellation is not an
+		// expiry.
+		"a deadline joined with another failure": {
+			outer: live, bounded: expired,
+			err:  errors.Join(context.DeadlineExceeded, errors.New("close the pools: still in use")),
+			want: "",
+		},
+		"a deadline joined with nothing else": {
+			outer: live, bounded: expired,
+			err:  errors.Join(context.DeadlineExceeded, nil),
+			want: "the ledger did not answer within " + retireLedgerBound.String(),
 		},
 	}
 

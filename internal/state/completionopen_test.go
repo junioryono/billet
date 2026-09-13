@@ -9,7 +9,9 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"database/sql"
+	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"math/big"
 	"net"
@@ -114,7 +116,10 @@ func TestUnreachableIsMeasuredAgainstPgxsOwnShapes(t *testing.T) {
 		name  string
 		want  bool
 		shape errorShape
-		run   func(t *testing.T) error
+		// certificate says the case must have produced a TLS verification
+		// failure, which no shape of pgx's own records.
+		certificate bool
+		run         func(t *testing.T) error
 	}{{
 		name: "a port nothing listens on", want: true,
 		shape: errorShape{connect: true, network: true},
@@ -254,7 +259,7 @@ func TestUnreachableIsMeasuredAgainstPgxsOwnShapes(t *testing.T) {
 		// the server's own vocabulary, so there is no SQLSTATE, and the
 		// ConnectError around it must not be read as an outage.
 		name: "a certificate the client refuses", want: false,
-		shape: errorShape{connect: true},
+		shape: errorShape{connect: true}, certificate: true,
 		run: func(t *testing.T) error {
 			t.Helper()
 
@@ -299,6 +304,17 @@ func TestUnreachableIsMeasuredAgainstPgxsOwnShapes(t *testing.T) {
 			err := c.run(t)
 			if err == nil {
 				t.Fatal("the case produced no error, so it measured nothing")
+			}
+
+			// THE SHAPE FIRST: a case that produced another error entirely
+			// can classify the same way and prove nothing about the rule the
+			// classifier is written from.
+			if got := shapeOf(err); got != c.shape {
+				t.Fatalf("the shape is %+v, want %+v, for: %v", got, c.shape, err)
+			}
+
+			if c.certificate && !certificateRejected(err) {
+				t.Fatalf("the case did not produce a certificate rejection: %v", err)
 			}
 
 			if got := Unreachable(err); got != c.want {
@@ -403,9 +419,19 @@ func selfSignedTLSDSN(t *testing.T, base string) string {
 			go func() {
 				defer func() { _ = conn.Close() }()
 
-				// The SSLRequest packet is eight bytes; the answer is one.
+				// The SSLRequest packet is eight bytes: its own length, then
+				// the code 80877103. A negotiation that ever stops starting
+				// this way must fail the case rather than quietly become some
+				// other kind of failure.
 				request := make([]byte, 8)
 				if _, err := io.ReadFull(conn, request); err != nil {
+					return
+				}
+
+				if binary.BigEndian.Uint32(request[0:4]) != 8 ||
+					binary.BigEndian.Uint32(request[4:8]) != 80877103 {
+					t.Errorf("the client did not open with an SSLRequest: %v", request)
+
 					return
 				}
 
@@ -647,9 +673,18 @@ func TestAnOpenThatTimesOutOnItsOwnBudgetSaysSo(t *testing.T) {
 	}
 
 	// AND NOT AS UNREACHABILITY, which is the whole reason the tail decides
-	// that from its contexts rather than from the error.
+	// that from its contexts rather than from the error: the attempt was cut
+	// short, so nothing about the database was established, even though pgx
+	// reports it as a ConnectError.
 	if Unreachable(err) {
 		t.Fatalf("a deadline reads as unreachable: %v", err)
+	}
+
+	// AND THE CANCELLATION IS THE WHOLE OF IT, which is what lets the caller
+	// read a deadline neither of its own contexts set as the ledger being out
+	// of reach rather than as a refusal.
+	if !OnlyCancellation(err) {
+		t.Fatalf("the open's own budget left something else in the error: %v", err)
 	}
 }
 
@@ -685,5 +720,92 @@ func TestUnreachableSQLStatesAreAnAllowlist(t *testing.T) {
 		if got := unreachableSQLState(code); got != want {
 			t.Errorf("SQLSTATE %q reads as unreachable=%v, want %v", code, got, want)
 		}
+	}
+}
+
+// AN ERROR TREE IS NOT ORDERED EVIDENCE. `errors.Join` puts several causes
+// beside each other with no precedence of its own, and billet's own opens join
+// a startup failure with a cleanup failure; a classifier that answered from
+// the FIRST match it found would say one thing for a tree and the opposite for
+// its mirror image. A refusal dominates wherever it sits.
+func TestTheReachVerdictIsTakenFromTheWholeTree(t *testing.T) {
+	var (
+		available = &pgconn.PgError{Code: "57P03", Message: "the database system is starting up"}
+		rejected  = &pgconn.PgError{Code: "28P01", Message: "password authentication failed"}
+		cancelled = &pgconn.PgError{Code: "57014", Message: "canceling statement due to statement timeout"}
+		transport = &net.OpError{Op: "dial", Err: errors.New("connection refused")}
+		cleanup   = errors.New("close the pools: still in use")
+	)
+
+	cases := map[string]struct {
+		err         error
+		unreachable bool
+		// cancellation is what OnlyCancellation must answer: a caller that
+		// waits out an expiry asks it, and a tree holding anything else is not
+		// one.
+		cancellation bool
+	}{
+		"an availability state alone": {err: available, unreachable: true},
+		"a refusal alone":             {err: rejected, unreachable: false},
+
+		// BOTH ORDERS, because the answer must not depend on which cause a
+		// walk reaches first.
+		"a refusal joined after an availability state": {
+			err: errors.Join(available, rejected), unreachable: false,
+		},
+		"a refusal joined before an availability state": {
+			err: errors.Join(rejected, available), unreachable: false,
+		},
+
+		// A cancelled statement is in class 57 and is not an outage; a
+		// transport failure beside it does not make it one.
+		"a cancelled statement beside a transport failure": {
+			err: errors.Join(cancelled, transport), unreachable: false,
+		},
+
+		// A startup that failed on the connection, joined with a cleanup that
+		// also failed, is still the connection.
+		"a transport failure joined with a cleanup failure": {
+			err: errors.Join(transport, cleanup), unreachable: true,
+		},
+
+		// AND A DEADLINE DOES NOT SURVIVE AN INDEPENDENT CAUSE: this is the
+		// tree the retirement's tail must not read as its own bound expiring.
+		"a deadline joined with a refusal": {
+			err: errors.Join(context.DeadlineExceeded, rejected), unreachable: false,
+		},
+		"a deadline joined with a cleanup failure": {
+			err: errors.Join(context.DeadlineExceeded, cleanup), unreachable: false,
+		},
+		"a deadline alone":            {err: context.DeadlineExceeded, cancellation: true},
+		"a deadline under a wrapper":  {err: fmt.Errorf("ping: %w", context.DeadlineExceeded), cancellation: true},
+		"a cancellation under a join": {err: errors.Join(context.Canceled, nil), cancellation: true},
+
+		// AN ATTEMPT CUT SHORT ESTABLISHES NOTHING, so a transport failure
+		// beside a cancellation is could-not-tell rather than an outage: pgx
+		// reports a connect that ran out of time as a ConnectError, and
+		// reading that as an outage would turn an operator's interruption into
+		// a fact about the deployment. The real shape of it is measured by the
+		// startup-budget test below.
+		"a transport failure beside a cancellation": {
+			err: errors.Join(transport, context.Canceled),
+		},
+
+		// A wrapper carries whatever it wraps.
+		"a refusal under two wrappers": {
+			err: fmt.Errorf("open: %w", fmt.Errorf("connect: %w", rejected)),
+		},
+	}
+
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := Unreachable(c.err); got != c.unreachable {
+				t.Errorf("Unreachable is %v, want %v", got, c.unreachable)
+			}
+
+			if got := OnlyCancellation(c.err); got != c.cancellation {
+				t.Errorf("OnlyCancellation is %v, want %v", got, c.cancellation)
+			}
+		})
 	}
 }

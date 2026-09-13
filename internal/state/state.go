@@ -651,36 +651,137 @@ func Unreachable(err error) bool {
 		return false
 	}
 
-	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok {
-		return unreachableSQLState(pgErr.Code)
-	}
+	found := reachEvidenceOf(err)
 
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+	// A CANCELLATION DOMINATES THE TRANSPORT EVIDENCE, because an attempt that
+	// was cut short did not establish anything: pgx reports a connect that ran
+	// out of time as a ConnectError, and reading that as "the database could
+	// not be reached" would turn an operator's own interruption into a fact
+	// about the deployment. Whose clock it was is the caller's to know, and
+	// the caller decides from that; here it is could-not-tell.
+	return found.out && !found.refused && !found.cancelled
+}
+
+// OnlyCancellation reports whether a context ending is THE WHOLE of err: every
+// cause at the bottom of the tree is a deadline or a cancellation.
+//
+// `errors.Is(err, context.DeadlineExceeded)` is not that question. It is true
+// of a tree that also holds a wrong password or a cleanup that failed — a
+// shape billet's own opens produce, since one joins its startup failure with
+// its close — and a caller that waits out an expiry on that evidence would
+// throw the rest away.
+func OnlyCancellation(err error) bool {
+	if err == nil {
 		return false
 	}
 
-	// A CERTIFICATE THE CLIENT WOULD NOT ACCEPT is the same shape of mistake as
-	// a password the server would not accept: it arrives inside a ConnectError
-	// with no PgError under it, because the session never got far enough for
-	// the server to say anything, and it is something an operator must fix
-	// rather than wait out.
-	if certificateRejected(err) {
-		return false
+	only := true
+
+	walkCauses(err, func(cause error) {
+		// ONLY THE LEAVES ARE ASKED. Every wrapper and every `errors.Join`
+		// above a cancellation matches `errors.Is` for it, so judging nodes
+		// would read a join of a deadline and a refusal as a deadline.
+		if hasCauses(cause) {
+			return
+		}
+
+		if !errors.Is(cause, context.DeadlineExceeded) && !errors.Is(cause, context.Canceled) {
+			only = false
+		}
+	})
+
+	return only
+}
+
+func hasCauses(err error) bool {
+	switch unwrapped := err.(type) { //nolint:errorlint // this asks what an error IS, not what it wraps: the walk reaches the causes itself
+	case interface{ Unwrap() error }:
+		return unwrapped.Unwrap() != nil
+	case interface{ Unwrap() []error }:
+		return len(unwrapped.Unwrap()) > 0
 	}
 
-	//nolint:errcheck // as above.
-	if _, ok := errors.AsType[*pgconn.ConnectError](err); ok {
-		return true
+	return false
+}
+
+// reachEvidence is what the whole error tree says about reaching the ledger:
+// positive evidence it could not be reached, an answer the caller must act on,
+// and a context that ended under the attempt.
+type reachEvidence struct {
+	out       bool
+	refused   bool
+	cancelled bool
+}
+
+func reachEvidenceOf(err error) reachEvidence {
+	var found reachEvidence
+
+	walkCauses(err, func(cause error) {
+		//nolint:errorlint // each cause is asked what it IS; the walk reaches what it wraps on its own
+		switch typed := cause.(type) {
+		case *pgconn.PgError:
+			if unreachableSQLState(typed.Code) {
+				found.out = true
+			} else {
+				found.refused = true
+			}
+
+			return
+		case *pgconn.ConnectError:
+			found.out = true
+
+			return
+		}
+
+		if certificateRejectedHere(cause) {
+			found.refused = true
+
+			return
+		}
+
+		// A CANCELLATION IS ITS OWN EVIDENCE, and it is taken before the
+		// transport shapes below because pgx's errTimeout wraps one while
+		// satisfying net.Error.
+		if errors.Is(cause, context.DeadlineExceeded) || errors.Is(cause, context.Canceled) {
+			found.cancelled = true
+
+			return
+		}
+
+		if errors.Is(cause, driver.ErrBadConn) || errors.Is(cause, io.ErrUnexpectedEOF) {
+			found.out = true
+
+			return
+		}
+
+		if _, ok := cause.(net.Error); ok { //nolint:errorlint // as above
+			found.out = true
+		}
+	})
+
+	return found
+}
+
+// walkCauses visits err and every cause under it, through both shapes of
+// unwrapping: the single cause `%w` produces and the several `errors.Join`
+// does.
+func walkCauses(err error, visit func(error)) {
+	for err != nil {
+		visit(err)
+
+		switch unwrapped := err.(type) { //nolint:errorlint // this IS the unwrapper: it visits every cause rather than searching for one
+		case interface{ Unwrap() error }:
+			err = unwrapped.Unwrap()
+		case interface{ Unwrap() []error }:
+			for _, cause := range unwrapped.Unwrap() {
+				walkCauses(cause, visit)
+			}
+
+			return
+		default:
+			return
+		}
 	}
-
-	if errors.Is(err, driver.ErrBadConn) || errors.Is(err, io.ErrUnexpectedEOF) {
-		return true
-	}
-
-	//nolint:errcheck // as above.
-	_, ok := errors.AsType[net.Error](err)
-
-	return ok
 }
 
 // unreachableSQLStates is the CLOSED LIST of conditions the server itself
@@ -706,6 +807,21 @@ var unreachableSQLStates = map[string]bool{
 }
 
 func unreachableSQLState(code string) bool { return unreachableSQLStates[code] }
+
+// certificateRejectedHere reports whether THIS cause is a TLS verification
+// failure — the client refusing the server's certificate, by authority, by
+// validity or by name — without looking under it, because the walk that calls
+// it reaches every cause itself.
+func certificateRejectedHere(err error) bool {
+	//nolint:errorlint // each cause is asked what it is; see the walk above
+	switch err.(type) {
+	case *tls.CertificateVerificationError, x509.UnknownAuthorityError,
+		x509.CertificateInvalidError, x509.HostnameError:
+		return true
+	}
+
+	return false
+}
 
 // certificateRejected reports whether the chain holds a TLS verification
 // failure: the client refusing the server's certificate, by authority, by
