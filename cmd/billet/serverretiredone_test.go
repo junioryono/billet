@@ -465,3 +465,77 @@ func TestAnUnsettledRetirementIsNotFinishedOverADriftedHost(t *testing.T) {
 		})
 	}
 }
+
+// THE TAIL CLEARS THE MARKER AND THEN WRITES `settled`, so a crash between the
+// two leaves an acknowledged row, an unsettled journal and NO marker — which
+// is the one window that ordering was chosen for, and the one a marker
+// requirement would make unrecoverable. What still ties it to this converge is
+// the journal's own ownership.
+func TestARetirementInterruptedBetweenTheMarkerAndSettledIsFinished(t *testing.T) {
+	f := newRequestFixture(t)
+	f.reserve(t)
+
+	// THE JOURNAL'S LAST WRITE FAILS, after the marker has gone: `settled` is
+	// the write the tail makes last, and this is the host it leaves.
+	saved := retirement.Publishing
+	failed := false
+
+	retirement.Publishing = func(path string) error {
+		if failed || filepath.Base(path) != "journal.json" {
+			return nil
+		}
+
+		j, presence, err := retirement.ReadJournal()
+		mustOK(t, err)
+
+		// The settled write is the one made over an acknowledged row.
+		if presence != retirement.JournalPresent || !j.RowDone || j.Settled {
+			return nil
+		}
+
+		failed = true
+
+		return os.ErrPermission
+	}
+
+	t.Cleanup(func() { retirement.Publishing = nil })
+
+	out, code := f.request(t, f.input(t, nil))
+	if m := retireAnswer(t, out); code != exitUnknown || m["reason"] != retireReasonJournal {
+		t.Fatalf("the run that could not write `settled`: %s", out)
+	}
+
+	if !failed {
+		t.Fatal("the settled write was never attempted, so this case proved nothing")
+	}
+
+	// THE HOST IS IN THE WINDOW: the row is acknowledged, the journal is not
+	// settled, and the marker is gone.
+	j, _, err := retirement.ReadJournal()
+	mustOK(t, err)
+
+	if !j.RowDone || j.Settled {
+		t.Fatalf("the journal is not in the window: %+v", j)
+	}
+
+	if f.guard.record(t).Transition != nil {
+		t.Fatal("the marker was not cleared, so this is not the window")
+	}
+
+	retiredUnits(t, f)
+
+	// AND THE NEXT CONVERGE FINISHES IT.
+	out, code = retiredRequest(t, f, requestRun)
+
+	m := retireAnswer(t, out)
+	if code != 0 || m["outcome"] != retireOutcomeRetired || m["settled"] != true {
+		t.Fatalf("the converge that found the window: %s", out)
+	}
+
+	j, _, err = retirement.ReadJournal()
+	mustOK(t, err)
+
+	if !j.Settled {
+		t.Fatalf("the journal was not settled: %+v", j)
+	}
+}

@@ -420,15 +420,24 @@ func retireLocatorDSN(loc retirement.JournalLocator) (string, string, *retireRef
 // the tail's ledger work produces, not only of the open's, because an outage
 // that begins after the connection is established is the same outage.
 func retirePendingReason(err error) string {
+	// THE SENTINELS ARE ASKED AS THE WHOLE OF THE ERROR. An open that refuses
+	// on the schema joins that refusal with its own cleanup, so a tree can
+	// carry both the ledger's answer and a failure of this host's; the first
+	// is the survivor's to finish and the second is not, and a pending row
+	// would hide it.
 	switch {
 	case state.Unreachable(err):
+		// NOT ASKED THE SAME WAY, and deliberately: an unreachable ledger's
+		// tree holds every transport cause the attempt produced, and a close
+		// that failed under the same outage is that outage's consequence
+		// rather than a second fault.
 		return "the ledger's database could not be reached (" + state.Describe(err) + ")"
-	case state.Matches(err, state.ErrSchemaAhead):
+	case state.OnlyCause(err, state.ErrSchemaAhead):
 		return "the ledger's schema is newer than this binary's, so this host may not write it (" + state.Describe(err) + ")"
-	case state.Matches(err, state.ErrSchemaBehind):
+	case state.OnlyCause(err, state.ErrSchemaBehind):
 		return "the ledger's schema is older than this binary's and no control plane has migrated it here (" +
 			state.Describe(err) + ")"
-	case state.Matches(err, state.ErrReleaseBehind):
+	case state.OnlyCause(err, state.ErrReleaseBehind):
 		return "a newer billet has served this ledger, so this host may not write it (" + state.Describe(err) + ")"
 	default:
 		return ""

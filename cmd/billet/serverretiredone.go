@@ -92,13 +92,30 @@ func retireDone(ctx context.Context, m retireMode, root *txLock, dir *os.File, s
 	// holder — the marker is gone and there is nothing left to take away — so
 	// it is validated by its provenance alone, which is what lets any later
 	// converge, under any holder, read it.
-	if !j.Settled && !retireDrivesThisJournal(m, shape, j, retirement.JournalFactDone) {
+	//
+	// AN ACKNOWLEDGED ROW WITH NO MARKER IS THE TAIL'S OWN CRASH WINDOW, not a
+	// stranger's journal. The tail clears the marker and THEN writes
+	// `settled`, deliberately, so that a crash between the two leaves exactly
+	// this: `row_done` true, `settled` false, no marker. Requiring the marker
+	// here would make the one window the ordering was chosen for the one
+	// nothing can finish. What still has to hold is ownership — this holder,
+	// or one this guard's takeover chain reached — which `Validate` below
+	// asks, and which is the same tie a marker would have provided.
+	if !j.Settled && !j.RowDone && !retireDrivesThisJournal(m, shape, j, retirement.JournalFactDone) {
 		return nil, atRetirePhase(j, retireUnknown(retireReasonJournal, "this host's retirement is not finished and this "+
 			"converge's guard does not carry its marker, so the tail it still owes is not this run's to finish",
 			"the runbook in docs/operating/upgrades.md"))
 	}
 
-	if err := j.Validate(retirement.JournalExpectation{Retiring: m.retiringHost, Identity: identity}); err != nil {
+	// A SETTLED JOURNAL IS ASKED FOR ITS PROVENANCE ALONE; anything still
+	// owing something is asked who owns it, because that is what says this
+	// converge may finish it.
+	expectation := retirement.JournalExpectation{Retiring: m.retiringHost, Identity: identity}
+	if !j.Settled {
+		expectation.Holder, expectation.TakenOverFrom = m.run, shape.Guard.TakenOverFrom
+	}
+
+	if err := j.Validate(expectation); err != nil {
 		return nil, atRetirePhase(j, retireUnknown(retireReasonJournal, err.Error(),
 			"the runbook in docs/operating/upgrades.md"))
 	}
@@ -357,14 +374,13 @@ func retireUnitPostcondition(ctx context.Context, insp *lifeops.Inspector, unit 
 	// clause the archive's safety rests on. Only a service is asked: a timer
 	// has no main process and answers nothing for it.
 	if pid {
-		switch main {
-		case "0":
-		case "":
-			return "", retireUnknown(retireReasonPostcondition, fmt.Sprintf("systemd did not answer %s's main process, "+
-				"so whether it still has one cannot be established", unit), "")
-		default:
+		switch running, err := strconv.Atoi(main); {
+		case main == "" || err != nil:
+			return "", retireUnknown(retireReasonPostcondition, fmt.Sprintf("systemd did not answer %s's main process as "+
+				"a number (%s), so whether it still has one cannot be established", unit, activeWord(main)), "")
+		case running > 0:
 			return "", retireRefuse(retireReasonPostcondition, fmt.Sprintf("%s is inactive and still has the main process "+
-				"%s", unit, main), "")
+				"%d", unit, running), "")
 		}
 	}
 

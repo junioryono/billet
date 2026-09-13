@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -635,3 +636,29 @@ type cyclicError struct{ cause error }
 func (*cyclicError) Error() string { return "a cause that is its own cause" }
 
 func (e *cyclicError) Unwrap() error { return e.cause }
+
+// A CLEANUP FAILURE JOINED TO THE LEDGER'S ANSWER IS NOT A PENDING ROW. An
+// open that refuses on the schema returns that refusal joined with its own
+// close, so a tree can carry both what the survivor could finish and what this
+// host must fix; reading the first and dropping the second would hand away a
+// row while leaving a fault behind.
+func TestThePendingListAsksForTheWholeError(t *testing.T) {
+	alone := fmt.Errorf("open the ledger: %w", state.ErrSchemaAhead)
+	if why := retirePendingReason(alone); why == "" {
+		t.Fatal("a schema refusal alone was not pending")
+	}
+
+	joined := errors.Join(alone, errors.New("close the pools: still in use"))
+	if why := retirePendingReason(joined); why != "" {
+		t.Fatalf("a schema refusal joined with a cleanup failure was pending: %q", why)
+	}
+
+	// AND THE REFUSAL STILL CARRIES BOTH, so the operator sees the fault the
+	// pending answer would have hidden.
+	answer := &retireTailAnswer{}
+
+	r := retireLedgerProblem(t.Context(), t.Context(), joined, "open the ledger", answer)
+	if r == nil || !strings.Contains(r.Why, "still in use") {
+		t.Fatalf("the refusal does not carry the cleanup failure: %+v", r)
+	}
+}

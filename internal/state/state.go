@@ -714,6 +714,35 @@ func Matches(err, target error) bool {
 	return found && whole
 }
 
+// OnlyCause reports whether target is THE WHOLE of err: every cause at the
+// bottom of the tree matches it.
+//
+// `Matches` is not that question, and the difference decides whether a caller
+// waits or refuses. An open that fails on the schema returns its refusal
+// JOINED WITH ITS OWN CLEANUP — `errors.Join(err, db.Close())` — so a tree can
+// carry both "this ledger's schema is not yours to write" and "and the pools
+// did not close". The first is something to hand to another host; the second
+// is this host's own fault and is not.
+func OnlyCause(err, target error) bool {
+	if err == nil || target == nil {
+		return false
+	}
+
+	only := true
+
+	whole := walkCauses(err, func(cause error) {
+		if hasCauses(cause) {
+			return
+		}
+
+		if !matchesHere(cause, target) {
+			only = false
+		}
+	})
+
+	return only && whole
+}
+
 // OnlyCancellation reports whether a context ending is THE WHOLE of err: every
 // cause at the bottom of the tree is a deadline or a cancellation.
 //
