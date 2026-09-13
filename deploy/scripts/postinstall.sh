@@ -147,6 +147,16 @@ LIFECYCLE_LOCK=/var/lock/billet-lifecycle.lock
 # full filesystem would otherwise leave a partial config and go on to enable
 # timers over it, with the install reporting success.
 seed_config() {
+    # A DANGLING SYMLINK IS NOT AN ABSENT CONFIGURATION. `-e` is false for one,
+    # and a copy onto it would write through to wherever it points, or fail and
+    # leave this script deleting a link somebody made on purpose.
+    if [ -L "${CONF}" ] && [ ! -e "${CONF}" ]; then
+        echo "billet: ${CONF} is a symlink to something that does not exist, so it was left" >&2
+        echo "        alone: point it at a configuration, or remove it and reinstall." >&2
+
+        return 1
+    fi
+
     if [ ! -e "${CONF}" ]; then
         if [ ! -e "${TEMPLATE}" ]; then
             # Loud, because the alternative is a machine with no config and nothing
@@ -157,14 +167,31 @@ seed_config() {
             return 1
         fi
 
-        if ! cp "${TEMPLATE}" "${CONF}"; then
-            echo "billet: ${TEMPLATE} could not be copied to ${CONF}, which is left as it was" >&2
-            echo "        (absent, or partly written and removed below)." >&2
-
-            rm -f "${CONF}"
+        # THE COPY LANDS BESIDE THE NAME AND IS LINKED INTO IT, so nothing here
+        # ever removes a path it did not itself create, and a destination that
+        # appeared meanwhile is never overwritten: `ln` refuses an existing
+        # name, which is the whole point of seeding only what is absent.
+        staged=$(mktemp "${CONF}.XXXXXX" 2>/dev/null) || staged=
+        if [ -z "${staged}" ]; then
+            echo "billet: no temporary file could be made beside ${CONF}, so it was not" >&2
+            echo "        created." >&2
 
             return 1
         fi
+
+        if ! cp "${TEMPLATE}" "${staged}" || ! chown root:billet "${staged}" ||
+            ! chmod 0640 "${staged}" || ! ln "${staged}" "${CONF}"; then
+            echo "billet: ${TEMPLATE} could not be installed at ${CONF}, which is left as it" >&2
+            echo "        was; nothing of this attempt remains." >&2
+
+            rm -f "${staged}"
+
+            return 1
+        fi
+
+        rm -f "${staged}"
+
+        return 0
     fi
 
     if [ -e "${CONF}" ]; then
@@ -290,16 +317,42 @@ lock_dir_ready() {
 # there is a regular file, so an existing name that is anything else is one
 # this script declines to open at all.
 #
-# THE RESIDUAL, STATED: this is a check of the NAME, and the open that follows
-# is a second lookup, so a writer that replaced the file between them would not
-# be caught. Shell cannot open a path with O_NOFOLLOW|O_NONBLOCK and judge the
-# descriptor, which is what would close it. The directory is root-owned, so
-# that writer is already root; what this refuses is the shape a host can
-# honestly be in, not an adversary who has the machine.
+# THE NAME IS CLAIMED BEFORE IT IS JUDGED, because the lock's directory is
+# world-writable on an ordinary host: /run/lock is 1777 (measured, ubuntu
+# 24.04), so any account can create this name first. Creating it EXCLUSIVELY
+# (noclobber, so the open carries O_EXCL) either makes it root's or leaves
+# whatever is there, and a name root owns cannot be unlinked by another account
+# in a sticky directory — which is what closes the window between this check
+# and the open below.
+#
+# A FIFO AT THAT NAME WOULD HANG THE INSTALL: `>>` on a fifo with no reader
+# BLOCKS, and nothing after it — not `flock -w`, not any bound here — ever
+# runs; a device would be opened for what its driver does. What billet writes
+# there is a regular file, so anything else, a symlink included, or a file
+# another account owns, is one this script declines to open.
+#
+# THE RESIDUAL, STATED: a name that already exists and is root-owned is
+# trusted from its metadata, and shell cannot open it with O_NOFOLLOW and judge
+# the descriptor instead. Replacing such a file needs root.
 lock_name_ordinary() {
+    # THE SHAPE IS JUDGED BY lstat BEFORE ANYTHING OPENS. A create with
+    # noclobber carries O_EXCL, which refuses an existing name rather than
+    # opening it — but `> fifo` on a fifo that is already there still BLOCKS
+    # in the shell before that (measured, ubuntu 24.04), so the claim below
+    # runs only over a name nothing holds.
     if [ -e "${LIFECYCLE_LOCK}" ] || [ -L "${LIFECYCLE_LOCK}" ]; then
-        [ -f "${LIFECYCLE_LOCK}" ] && [ ! -L "${LIFECYCLE_LOCK}" ]
+        [ -f "${LIFECYCLE_LOCK}" ] || return 1
+        [ ! -L "${LIFECYCLE_LOCK}" ] || return 1
+    else
+        ( umask 077; set -C; : > "${LIFECYCLE_LOCK}" ) 2>/dev/null || true
+
+        [ -f "${LIFECYCLE_LOCK}" ] || return 1
+        [ ! -L "${LIFECYCLE_LOCK}" ] || return 1
     fi
+
+    owner=$(stat -c '%u' "${LIFECYCLE_LOCK}" 2>/dev/null) || return 1
+
+    [ "${owner}" = "0" ]
 }
 
 # The statuses lock_and_decide answers with, beside 0 for work performed.
@@ -410,7 +463,17 @@ if [ -d /run/systemd/system ]; then
     # which is a long way from the change that caused it. Say so at install
     # time, where the operator is already looking.
     for unit in billet-server.service billet-node.service; do
-        dropins=$(systemctl show --property=DropInPaths --value "${unit}" 2>/dev/null || true)
+        # A FAILED ASK IS NOT "NO OVERRIDES": the status and the diagnostic both
+        # go to /dev/null, so a systemd that could not answer would look exactly
+        # like a clean unit and this warning would never be printed.
+        if ! dropins=$(systemctl show --property=DropInPaths --value "${unit}" 2>/dev/null); then
+            echo "billet: systemd could not be asked whether ${unit} has drop-in overrides," >&2
+            echo "        so this install did not check for one that breaks readiness. Run" >&2
+            echo "        \`systemctl show --property=DropInPaths ${unit}\` once it answers." >&2
+
+            continue
+        fi
+
         if [ -n "${dropins}" ]; then
             echo "billet: ${unit} has drop-in overrides: ${dropins}" >&2
             echo "        This unit reports readiness through sd_notify from its main" >&2
