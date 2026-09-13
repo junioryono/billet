@@ -731,7 +731,7 @@ func writeRegistrationRecord(t *testing.T, path, deployment, endpoint string) {
 
 	body, err := json.Marshal(map[string]any{
 		"schema": 1, "node": "node-a", "deployment": deployment, "incarnation": retainedIncarnation,
-		"invocation_id": "0123456789abcdef0123456789abcdef", "endpoint": endpoint,
+		"invocation_id": retainedInvocation, "endpoint": endpoint,
 		"registered_at": "2026-09-11T10:00:00Z",
 	})
 	mustOK(t, err)

@@ -38,6 +38,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -45,6 +46,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/junioryono/billet/internal/state/ledgerdb"
 )
@@ -229,6 +232,12 @@ type openMode struct {
 	// OpenInspect.
 	inspect bool
 
+	// completion marks a handle that WRITES ONE ROW AND CHANGES NOTHING ELSE
+	// about the ledger: no controller claim and no migration, the schema
+	// verified as exactly this binary's and the watermark checked, never
+	// raised. See OpenPostgresCompletion.
+	completion bool
+
 	// release is the billet opening the ledger, for the release watermark, or
 	// empty for a caller that named none and gets neither the check nor the
 	// record. See WithRunningRelease.
@@ -244,7 +253,7 @@ type openMode struct {
 // service that then serves it, so a rollback that never reaches that service has
 // nothing to undo.
 func (m openMode) records() bool {
-	return !m.admin && !m.maintenanceProbe && !m.standby && !m.inspect
+	return !m.admin && !m.maintenanceProbe && !m.standby && !m.inspect && !m.completion
 }
 
 // with applies the caller's options to a mode.
@@ -370,7 +379,7 @@ func openDir(
 		r:                 r,
 		lock:              lock,
 		backend:           be,
-		admin:             admin || mode.inspect,
+		admin:             admin || mode.inspect || mode.completion,
 		unlocked:          lock == nil,
 		inspect:           mode.inspect,
 		stateDir:          stateDir,
@@ -484,6 +493,28 @@ func openDir(
 		return db, nil
 	}
 
+	// A COMPLETION WRITES ONE ROW AND CLAIMS NOTHING. The caller is a host whose
+	// controller has been retired: it is not this deployment's control plane and
+	// must never become it by opening a ledger, and it must never migrate a
+	// schema either — the survivor's binary owns that, and this host's may be
+	// frozen at whatever release it retired on. So the schema must be exactly
+	// this binary's (ahead or behind is refused, which is what lets the caller
+	// hand the write to the survivor instead) and the watermark is checked and
+	// never raised.
+	if mode.completion {
+		db.revalidate.Store(true)
+
+		if err := db.verifySchema(startupCtx); err != nil {
+			return nil, errors.Join(err, db.Close())
+		}
+
+		if err := db.enforceReleaseWatermark(startupCtx, mode.release); err != nil {
+			return nil, errors.Join(err, db.Close())
+		}
+
+		return db, nil
+	}
+
 	if lock != nil {
 		noteOpenSideEffect("claim")
 
@@ -564,29 +595,50 @@ func openDir(
 // on PostgreSQL, another session holding a lock the migration is waiting for.
 const startupTimeout = 30 * time.Second
 
-// ErrUnreachable is a ledger whose database did not answer at all: a DSN that
-// resolves to nothing, a server that is down, a socket that is gone. It says
-// nothing about the ledger's contents, which is why it is separate from the
-// schema and release refusals.
-var ErrUnreachable = errors.New("state: the ledger's database did not answer")
-
 // PingContext proves the database is reachable AND configured as promised.
 //
 // The integrity SCAN is deliberately not part of this. It is a whole-file read
 // whose cost grows with job_history, and it answers a question only a control
 // plane about to schedule against the ledger has to ask. See IntegrityCheck.
-//
-// A FAILED PING IS TYPED with ErrUnreachable, because "the database did not
-// answer" is a different fact from every other reason an open fails, and a
-// caller that must wait rather than refuse has no other way to tell them
-// apart. What the durability check below refuses is NOT unreachability: it
-// answered, and said something this billet will not serve from.
 func (db *DB) PingContext(ctx context.Context) error {
 	if err := db.w.PingContext(ctx); err != nil {
-		return fmt.Errorf("%w: %w", ErrUnreachable, err)
+		return fmt.Errorf("ping state db: %w", err)
 	}
 
 	return db.backend.verifyDurability(ctx, db.w, db.inspect)
+}
+
+// Unreachable reports whether err is a failure to REACH the database rather
+// than an answer from it: a connection that could not be established, or one
+// that went away under a request.
+//
+// IT IS ASKED OF AN ERROR, NEVER INFERRED FROM WHERE THE ERROR CAME FROM. A
+// failed ping is the obvious candidate and is not proof of anything by itself:
+// `file is not a database` is positive evidence the ledger answered and is
+// broken, and reading it as unreachability would let a caller that waits out
+// an outage wait out a corrupt ledger instead.
+//
+// WHAT IT RECOGNISES, and nothing else: pgx's ConnectError, which wraps every
+// failure to establish a session, and any net.Error in the chain, which is how
+// a session that dies under a query surfaces. A timeout that is not a network
+// error is NOT unreachability — a slow query is a database answering — and
+// neither is any error the server itself composed. The residual, stated: a
+// driver that reports a dropped connection as neither of those reads as an
+// answer, which is the refusing direction.
+func Unreachable(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	//nolint:errcheck // the discarded value is the typed error itself, not a failure; the bool is the answer. errcheck cannot exclude a generic function.
+	if _, ok := errors.AsType[*pgconn.ConnectError](err); ok {
+		return true
+	}
+
+	//nolint:errcheck // as above.
+	_, ok := errors.AsType[net.Error](err)
+
+	return ok
 }
 
 // IntegrityCheck refuses to serve from a corrupt ledger.

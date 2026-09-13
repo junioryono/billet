@@ -315,7 +315,11 @@ func retireOpenLedgerByLocator(ctx context.Context, j retirement.Journal) (*stat
 		return nil, why, nil
 	}
 
-	db, err := state.OpenPostgresAdmin(ctx, j.Locator.Archive, dsn, state.WithRunningRelease(version.Version()))
+	// THE OPEN CLAIMS NOTHING AND MIGRATES NOTHING: this host's controller is
+	// retired, its binary may be frozen at the release it retired on, and an
+	// admin open would take the deployment's controller exclusion and migrate
+	// the shared schema whenever the survivor happened to be down.
+	db, err := state.OpenPostgresCompletion(ctx, j.Locator.Archive, dsn, state.WithRunningRelease(version.Version()))
 	if err != nil {
 		if pending := retirePendingReason(err); pending != "" {
 			return nil, pending, nil
@@ -327,12 +331,34 @@ func retireOpenLedgerByLocator(ctx context.Context, j retirement.Journal) (*stat
 	// AND IT IS THIS DEPLOYMENT'S LEDGER. The locator names the archive the
 	// identity moved to, so the binding is asked of the identity this
 	// retirement recorded, never of a directory at the configured path that
-	// something else may have created since.
-	if err := db.VerifyDeploymentBinding(ctx, j.Deployment); err != nil {
-		return nil, "", retireUnknown(retireReasonLedger, err.Error(), "")
+	// something else may have created since. A binding that says another
+	// deployment is a refusal; a binding this host could not READ because the
+	// connection went away under it is the same outage as any other and leaves
+	// the row pending.
+	err = db.VerifyDeploymentBinding(ctx, j.Deployment)
+	if err == nil {
+		return db, "", nil
 	}
 
-	return db, "", nil
+	// THE HANDLE GOES WITH THE ANSWER. Nothing below returns it, so its pools
+	// and the directory lock at the archive would otherwise be held until this
+	// process exits.
+	closed := db.Close()
+
+	// A binding that says another deployment is a refusal (ErrForeignLedger is
+	// not in the pending list); a binding this host could not READ because the
+	// connection went away under it is the same outage as any other.
+	if pending := retirePendingReason(err); pending != "" && closed == nil {
+		return nil, pending, nil
+	}
+
+	refusal := retireUnknown(retireReasonLedger, err.Error(), "")
+
+	if closed != nil {
+		refusal.Why += "; and closing the ledger: " + closed.Error()
+	}
+
+	return nil, "", refusal
 }
 
 // retireLocatorDSN reads the connection string the locator names, from the
@@ -367,15 +393,18 @@ func retireLocatorDSN(loc retirement.JournalLocator) (string, string, *retireRef
 }
 
 // retirePendingReason is the CLOSED LIST of ways the ledger can be out of this
-// host's reach without anything being wrong: the database did not answer, or
-// it holds a schema or a release this binary may not write. Everything else —
-// a checksum that does not match, a bookkeeping table that is not what it
-// should be — is could-not-tell and refuses, because those say something about
-// the ledger rather than about this host's distance from it.
+// host's reach without anything being wrong: the database could not be reached
+// at all, or it holds a schema or a release this binary may not write.
+// Everything else — a ledger bound to another deployment, a checksum that does
+// not match, a bookkeeping table that is not what it should be — is
+// could-not-tell and refuses, because those say something about the ledger
+// rather than about this host's distance from it. It is asked of EVERY error
+// the tail's ledger work produces, not only of the open's, because an outage
+// that begins after the connection is established is the same outage.
 func retirePendingReason(err error) string {
 	switch {
-	case errors.Is(err, state.ErrUnreachable):
-		return "the ledger's database did not answer (" + err.Error() + ")"
+	case state.Unreachable(err):
+		return "the ledger's database could not be reached (" + err.Error() + ")"
 	case errors.Is(err, state.ErrSchemaAhead):
 		return "the ledger's schema is newer than this binary's, so this host may not write it"
 	case errors.Is(err, state.ErrSchemaBehind):

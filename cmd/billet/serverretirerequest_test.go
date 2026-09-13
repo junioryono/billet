@@ -142,6 +142,15 @@ func newRequestFixture(t *testing.T) *requestFixture {
 	f.now = time.Date(2026, 9, 11, 10, 0, 0, 0, time.UTC)
 	retireNow = func() time.Time { return f.now }
 
+	// AND THE TAIL'S WAIT FOR THE NODE'S RECORD IS THIS SUITE'S, not a
+	// minute: a fixture's node either publishes its record when the fake
+	// converger starts it or never will, so a production bound here buys
+	// nothing and costs a minute per case.
+	savedReceiptWait := retireReceiptWait
+	retireReceiptWait = 200 * time.Millisecond
+
+	t.Cleanup(func() { retireReceiptWait = savedReceiptWait })
+
 	return f
 }
 
@@ -743,6 +752,7 @@ func TestServerRetireRequestReconcilesTheNodeSetAndTheAddressRule(t *testing.T) 
 const (
 	retainedEndpoint    = "https://10.0.0.2:7717"
 	retainedIncarnation = "00112233445566778899aabbccddeeff"
+	retainedInvocation  = "0123456789abcdef0123456789abcdef"
 	survivorAddress     = "10.0.0.2"
 )
 
@@ -788,7 +798,7 @@ func (f *requestFixture) retainANode(t *testing.T) {
 
 	writeFile(t, filepath.Join(f.unitsDir, nodeUnit),
 		"LoadState=loaded\nActiveState=active\nSubState=running\nResult=success\nKillMode=mixed\nMainPID=4242\n"+
-			"UnitFileState=enabled\nInvocationID=0123456789abcdef0123456789abcdef\nStateChangeTimestamp=\n"+
+			"UnitFileState=enabled\nInvocationID="+retainedInvocation+"\nStateChangeTimestamp=\n"+
 			"ExecMainStartTimestamp="+retainedNodeStarted+"\n", 0o644)
 
 	// THE INSTALLED CONFIGURATION IS OLDER THAN THE RUNNING NODE, which is what

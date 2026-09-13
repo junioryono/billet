@@ -2,6 +2,9 @@ package main
 
 import (
 	"encoding/json"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"strings"
@@ -39,6 +42,7 @@ type tailWrite struct {
 	file    string
 	rowDone bool
 	marker  bool
+	status  retirement.Phase
 }
 
 func recordTailWrites(t *testing.T, f *requestFixture) *[]tailWrite {
@@ -58,6 +62,14 @@ func recordTailWrites(t *testing.T, f *requestFixture) *[]tailWrite {
 		}
 
 		w.marker = f.guard.record(t).Transition != nil
+
+		st, statusPresence, err := retirement.ReadStatus()
+		mustOK(t, err)
+
+		if statusPresence == retirement.StatusPresent {
+			w.status = st.Phase
+		}
+
 		*seen = append(*seen, w)
 
 		return nil
@@ -117,18 +129,26 @@ func TestTheTailClearsTheMarkerAfterTheRowAndSettlesAfterTheMarker(t *testing.T)
 		t.Fatalf("`settled` was written while the marker was still there: %+v", journals)
 	}
 
-	// AND THE STATUS SAID `done` BEFORE EITHER, so a reader that sees the
-	// journal settled never sees a status below it.
-	status := -1
+	// AND THE PUBLISHED STATUS ALREADY SAID `done` AT BOTH, so no reader sees a
+	// journal past a status that is behind it.
+	if acknowledgement.status != retirement.PhaseDone || settled.status != retirement.PhaseDone {
+		t.Fatalf("the tail's journal writes ran under a status that was not done: %+v", journals)
+	}
 
-	for i, w := range *writes {
+	// The status is PUBLISHED before either of them, and the phases before it
+	// were published under the status of their own time: `intent` opens the
+	// sequence and `stopped` closes the authority.
+	statuses := make([]retirement.Phase, 0, len(*writes))
+
+	for _, w := range *writes {
 		if w.file == filepath.Base(retirement.StatusPath()) {
-			status = i
+			statuses = append(statuses, w.status)
 		}
 	}
 
-	if status == -1 {
-		t.Fatalf("the tail published no status: %+v", *writes)
+	if len(statuses) != 3 || statuses[0] != "" || statuses[1] != retirement.PhaseIntent ||
+		statuses[2] != retirement.PhaseStopped {
+		t.Fatalf("the statuses this retirement published were written over: %v", statuses)
 	}
 }
 
@@ -229,7 +249,7 @@ func TestTheTailLeavesThePendingRowToTheSurvivor(t *testing.T) {
 	}
 
 	why, ok := m["row_why"].(string)
-	if !ok || !strings.Contains(why, "did not answer") {
+	if !ok || !strings.Contains(why, "could not be reached") {
 		t.Fatalf("the pending row does not say why: %s", out)
 	}
 
@@ -300,6 +320,22 @@ func TestTheTailRewritesTheRetainedNodesReceipt(t *testing.T) {
 		}
 	}
 
+	// THE HOST ALREADY HAS A RECEIPT, written before the retirement by the
+	// ordinary converge: it names the invocation the node ran under then and
+	// the configuration it loaded, and both are about to change. A test that
+	// started from nothing would prove the tail can CREATE a receipt and say
+	// nothing about the one it must replace.
+	before := endpointReceipt{
+		Schema: 1, Run: "ci-0", Node: "node-a", Deployment: f.identity,
+		InstalledSHA256: strings.Repeat("a", 64), InstalledEndpoint: retainedEndpoint,
+		EffectiveEndpoint: retainedEndpoint, InvocationID: strings.Repeat("b", 32),
+		Incarnation: retainedIncarnation, WrittenAt: "2026-09-10T10:00:00Z",
+	}
+
+	body, err := json.Marshal(before)
+	mustOK(t, err)
+	writeFile(t, receiptPath, string(body)+"\n", 0o600)
+
 	out, code := f.retainedRequest(t, f.input(t, f.retainedOverrides(t)))
 
 	m := retiredAnswer(t, out, code)
@@ -308,12 +344,18 @@ func TestTheTailRewritesTheRetainedNodesReceipt(t *testing.T) {
 	}
 
 	// AND IT NAMES WHAT THE HOST NOW RUNS: the configuration the rewrite
-	// installed, and the invocation the restart produced.
+	// installed and the invocation the restart produced, neither of them the
+	// ones the receipt carried before.
 	var receipt endpointReceipt
 	mustOK(t, json.Unmarshal([]byte(mustRead(t, receiptPath)), &receipt))
 
-	if receipt.InstalledSHA256 != retirement.Digest([]byte(f.rendering(t))) {
+	if receipt.InstalledSHA256 != retirement.Digest([]byte(f.rendering(t))) ||
+		receipt.InstalledSHA256 == before.InstalledSHA256 {
 		t.Fatalf("the receipt names another configuration: %+v", receipt)
+	}
+
+	if receipt.InvocationID != retainedInvocation || receipt.InvocationID == before.InvocationID {
+		t.Fatalf("the receipt names another invocation: %+v", receipt)
 	}
 
 	if receipt.Run != requestRun || receipt.EffectiveEndpoint != retainedEndpoint {
@@ -363,5 +405,46 @@ func TestTheTailRepublishesAStatusThatWentMissing(t *testing.T) {
 	st, presence, err := retirement.ReadStatus()
 	if err != nil || presence != retirement.StatusPresent || st.Phase != retirement.PhaseDone {
 		t.Fatalf("the tail left the status: %+v %d %v", st, presence, err)
+	}
+}
+
+// THE TAIL OPENS THE LEDGER THE ONE WAY A RETIRED HOST MAY. No schedule can
+// witness the difference from the outside — an admin open behaves exactly like
+// a completion whenever the survivor happens to be holding the controller
+// exclusion, which is every ordinary run — so the witness is structural: this
+// file names `OpenPostgresCompletion` and no other of the package's opens.
+// What the completion itself does (claims nothing, migrates nothing, refuses a
+// schema it would have to move) is proved in internal/state.
+func TestTheTailOpensTheLedgerAsACompletionAndNothingElse(t *testing.T) {
+	fset := token.NewFileSet()
+
+	file, err := parser.ParseFile(fset, "serverretiretail.go", nil, 0)
+	mustOK(t, err)
+
+	var opens []string
+
+	ast.Inspect(file, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+
+		pkg, ok := sel.X.(*ast.Ident)
+		if !ok || pkg.Name != "state" || !strings.HasPrefix(sel.Sel.Name, "Open") {
+			return true
+		}
+
+		opens = append(opens, sel.Sel.Name)
+
+		return true
+	})
+
+	if len(opens) != 1 || opens[0] != "OpenPostgresCompletion" {
+		t.Fatalf("the tail's opens of the ledger: %v", opens)
 	}
 }

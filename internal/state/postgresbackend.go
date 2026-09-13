@@ -633,6 +633,22 @@ func OpenPostgresAdmin(ctx context.Context, stateDir, dsn string, opts ...OpenOp
 	return openDir(ctx, stateDir, newPostgresBackend(dsn), openMode{admin: true}.with(opts))
 }
 
+// OpenPostgresCompletion opens the shared ledger for a host that must write ONE
+// row and has no business being its controller: the retiring host's tail,
+// completing the retirement row it recorded before it stopped.
+//
+// IT CLAIMS NOTHING AND MIGRATES NOTHING. An admin open would do both whenever
+// the controller exclusion happened to be free — a survivor that is down at
+// that moment is exactly when it would be — and a retired host taking the
+// deployment's claim, or migrating a shared schema with a binary frozen at the
+// release it retired on, is the opposite of what a retirement is for. The
+// schema must be EXACTLY this binary's, so a ledger the survivor has already
+// migrated past is refused with ErrSchemaAhead rather than written to, and the
+// caller hands the row to the survivor instead.
+func OpenPostgresCompletion(ctx context.Context, stateDir, dsn string, opts ...OpenOption) (*DB, error) {
+	return openDir(ctx, stateDir, newPostgresBackend(dsn), openMode{admin: true, completion: true}.with(opts))
+}
+
 // OpenPostgresStandby opens the ledger for a control plane that is WAITING to
 // become this deployment's controller.
 //

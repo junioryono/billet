@@ -214,10 +214,20 @@ jobs:
           key: go-race-cover-${{ hashFiles('go.sum') }}-${{ github.sha }}-${{ github.job }}
           restore-keys: |
             go-race-cover-${{ hashFiles('go.sum') }}-
-      - name: Test the ledger backend and the one backup test against PostgreSQL
-        run: |
-          go test -race -count=1 -timeout 20m -vet=off ./internal/state/
-          go test -race -count=1 -timeout 20m -vet=off -run 'TestAPostgresBackupIsNotRefusedBeforeItStarts|TestServerRetireReservesOnAPostgresPair|TestServerRetireReserveIsHeldToAnExistingMarker' ./cmd/billet/
+      - name: Test the ledger backend against PostgreSQL
+        run: go test -race -count=1 -timeout 20m -vet=off ./internal/state/
+      # THE WHOLE COMMAND SUITE, NOT A LIST OF NAMES. Everything in cmd/billet
+      # that needs a real PostgreSQL — the backup's end-to-end gate, and every
+      # test of a controller's retirement, which is defined for a PostgreSQL
+      # pair and has no SQLite form — SKIPS in the SQLite job. A named list
+      # runs whatever somebody remembered to add to it, and leaves everything
+      # else unrun in both jobs while the run reports success.
+      #
+      # WITHOUT -race, deliberately: the race detector's value over this
+      # package is bought by the SQLite job, and buying it twice would make
+      # this job the run's critical path.
+      - name: Test the command suite against PostgreSQL
+        run: go test -count=1 -timeout 20m -vet=off ./cmd/billet/
       - name: Test the capacity suite against PostgreSQL
         run: go test -count=1 -timeout 20m ./internal/alloc/
         env:
