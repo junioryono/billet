@@ -564,14 +564,26 @@ func openDir(
 // on PostgreSQL, another session holding a lock the migration is waiting for.
 const startupTimeout = 30 * time.Second
 
+// ErrUnreachable is a ledger whose database did not answer at all: a DSN that
+// resolves to nothing, a server that is down, a socket that is gone. It says
+// nothing about the ledger's contents, which is why it is separate from the
+// schema and release refusals.
+var ErrUnreachable = errors.New("state: the ledger's database did not answer")
+
 // PingContext proves the database is reachable AND configured as promised.
 //
 // The integrity SCAN is deliberately not part of this. It is a whole-file read
 // whose cost grows with job_history, and it answers a question only a control
 // plane about to schedule against the ledger has to ask. See IntegrityCheck.
+//
+// A FAILED PING IS TYPED with ErrUnreachable, because "the database did not
+// answer" is a different fact from every other reason an open fails, and a
+// caller that must wait rather than refuse has no other way to tell them
+// apart. What the durability check below refuses is NOT unreachability: it
+// answered, and said something this billet will not serve from.
 func (db *DB) PingContext(ctx context.Context) error {
 	if err := db.w.PingContext(ctx); err != nil {
-		return fmt.Errorf("ping state db: %w", err)
+		return fmt.Errorf("%w: %w", ErrUnreachable, err)
 	}
 
 	return db.backend.verifyDurability(ctx, db.w, db.inspect)

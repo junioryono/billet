@@ -79,11 +79,17 @@ type retireIntentReport struct {
 func retireRequest(ctx context.Context, m retireMode) (any, *retireRefusal) {
 	answer, r := retireRequestUnder(ctx, m)
 	if r == nil {
-		// A SUCCESS SAYS WHAT THE HOST HOLDS TOO. A preview takes no lock, so
-		// a mutating run can publish `intent` while it reads, and a report
-		// that carried the `nothing` it was built with would tell the role
-		// this host is free when it is not.
-		if report, ok := answer.(*retireIntentReport); ok {
+		// A SUCCESS SAYS WHAT THE HOST HOLDS TOO, READ WHEN IT ANSWERS. A
+		// preview takes no lock, so a mutating run can publish `intent` while
+		// it reads, and a report that carried the `nothing` it was built with
+		// would tell the role this host is free when it is not; a transition
+		// that reached `done` is the same rule facing the other way, since the
+		// phase it holds in memory is not evidence that the host still holds
+		// the journal that says so.
+		switch report := answer.(type) {
+		case *retireIntentReport:
+			report.State = retireHostState(stateNothingRetire)
+		case *retireTailAnswer:
 			report.State = retireHostState(stateNothingRetire)
 		}
 
@@ -268,26 +274,28 @@ func retireRequestUnder(ctx context.Context, m retireMode) (any, *retireRefusal)
 		return nil, retireUnknown(retireReasonJournal, "the intent answered no journal to drive", "")
 	}
 
-	return nil, runRetireTransition(ctx, m, obs, recorded)
+	return runRetireTransition(ctx, m, root, dir, obs, recorded)
 }
 
-// runRetireTransition drives the phases and answers what the host reached.
-// Every outcome is a refusal today: the transition ends at `done`, and the
-// tail that completes the ledger row is the next change.
-func runRetireTransition(ctx context.Context, m retireMode, obs *installedConfigObservation, j retirement.Journal,
-) *retireRefusal {
-	// EVERY ANSWER HERE IS A REFUSAL TODAY, and each takes the exit's
-	// annotation: the phase this run last knew is not what the host holds, and
-	// the terminal answer is no more exempt than the failed ones.
+// runRetireTransition drives the phases and, at `done`, finishes the tail.
+//
+// A FAILURE INSIDE THE TRANSITION IS A REFUSAL whose `state` the exit reads
+// from the host: the phase this run last knew is not what the host holds. The
+// tail's own refusals are the same, and its success is the request's answer.
+func runRetireTransition(ctx context.Context, m retireMode, root *txLock, dir *os.File,
+	obs *installedConfigObservation, j retirement.Journal,
+) (any, *retireRefusal) {
 	j, steps, r := retireTransition(ctx, m, obs, j)
 	if r != nil {
-		return r
+		return nil, r
 	}
 
-	return &retireRefusal{Schema: retireSchema, Outcome: retireOutcomeUnknown, Reason: retireReasonPhase,
-		Why: fmt.Sprintf("the transition is complete on this host (%s); the tail that completes the ledger row, "+
-			"acknowledges it and clears the guard's marker is not in this binary yet", describeRetireSteps(steps)),
-		State: string(j.Phase)}
+	if j.Phase != retirement.PhaseDone {
+		return nil, retireUnknown(retireReasonPhase, fmt.Sprintf("the transition stopped at %s (%s) without saying why",
+			j.Phase, describeRetireSteps(steps)), "the runbook in docs/operating/upgrades.md")
+	}
+
+	return retireTail(ctx, m, root, dir, j, steps)
 }
 
 // describeRetireSteps renders what this run did, for the answer.

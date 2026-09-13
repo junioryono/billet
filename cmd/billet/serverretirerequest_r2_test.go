@@ -426,7 +426,7 @@ func TestServerRetireRequestHoldsTheRoundsBoundaries(t *testing.T) {
 	// The fixture's clock is 10:00:30 and the round starts at 10:00:05, so
 	// twenty-five seconds is the exact age.
 	out, code := f.request(t, f.input(t, nil), "--report-max-age", "25s")
-	if m := retireAnswer(t, out); m["reason"] != retireReasonPhase || code != exitUnknown {
+	if m := retireAnswer(t, out); m["outcome"] != retireOutcomeRetired || code != 0 {
 		t.Fatalf("a round exactly as old as the bound: %s", out)
 	}
 
@@ -446,7 +446,7 @@ func TestServerRetireRequestHoldsTheRoundsBoundaries(t *testing.T) {
 	self["collected_at"] = requestStarted
 
 	out, code = f3.request(t, f3.input(t, map[string]any{"self": self}))
-	if m := retireAnswer(t, out); m["reason"] != retireReasonPhase || code != exitUnknown {
+	if m := retireAnswer(t, out); m["outcome"] != retireOutcomeRetired || code != 0 {
 		t.Fatalf("a report collected at the round's start: %s", out)
 	}
 

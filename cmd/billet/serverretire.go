@@ -105,11 +105,17 @@ func retireUnknown(reason, why, next string) *retireRefusal {
 // retireFromEndpoint carries a configuration observation's refusal, made by
 // the endpoint commands' observer, into this command's vocabulary.
 func retireFromEndpoint(r *endpointRefusal) *retireRefusal {
+	return retireFromEndpointFor(retireReasonConfig, r)
+}
+
+// retireFromEndpointFor is the same carry under the reason that asked for it,
+// so a receipt's refusal is not reported as a configuration's.
+func retireFromEndpointFor(reason string, r *endpointRefusal) *retireRefusal {
 	if r.Outcome == outcomeUnknown {
-		return retireUnknown(retireReasonConfig, r.Why, r.Next)
+		return retireUnknown(reason, r.Why, r.Next)
 	}
 
-	return retireRefuse(retireReasonConfig, r.Why, r.Next)
+	return retireRefuse(reason, r.Why, r.Next)
 }
 
 func answerRetireRefusal(r *retireRefusal) error {

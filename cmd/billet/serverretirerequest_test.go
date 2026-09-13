@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -339,6 +338,7 @@ func TestServerRetireRequestRecordsItsIntent(t *testing.T) {
 		phase  retirement.Phase
 		status retirement.Phase
 		row    string
+		marker *guardTransition
 	}
 
 	f.svc.onStop = func(string) {
@@ -353,6 +353,7 @@ func TestServerRetireRequestRecordsItsIntent(t *testing.T) {
 		mustOK(t, err)
 
 		atFirstStop.phase, atFirstStop.status = j.Phase, st.Phase
+		atFirstStop.marker = f.guard.record(t).Transition
 
 		f.pgLedger(t, func(db *state.DB) {
 			r, _, err := db.ReadRetirement(t.Context(), f.identity)
@@ -365,8 +366,7 @@ func TestServerRetireRequestRecordsItsIntent(t *testing.T) {
 	out, code = f.request(t, f.input(t, nil))
 
 	m = retireAnswer(t, out)
-	if m["outcome"] != retireOutcomeUnknown || m["reason"] != retireReasonPhase || code != exitUnknown ||
-		m["state"] != string(retirement.PhaseDone) {
+	if m["outcome"] != retireOutcomeRetired || code != 0 || m["state"] != string(retirement.PhaseDone) {
 		t.Fatalf("the request: %s", out)
 	}
 
@@ -375,10 +375,11 @@ func TestServerRetireRequestRecordsItsIntent(t *testing.T) {
 		t.Fatalf("the first stop ran with the intent unrecorded: %+v", atFirstStop)
 	}
 
-	// THE MARKER names the row's transition.
-	rec := f.guard.record(t)
-	if rec.Transition == nil || rec.Transition.ID != row.TransitionID || rec.Transition.Kind != transitionRetirement {
-		t.Fatalf("the guard's marker: %+v", rec.Transition)
+	// THE MARKER NAMED THE ROW'S TRANSITION WHILE THE TRANSITION RAN, which is
+	// the whole life of the marker: the tail clears it once the row is done,
+	// so it is read where it is load-bearing rather than at the end.
+	if mk := atFirstStop.marker; mk == nil || mk.ID != row.TransitionID || mk.Kind != transitionRetirement {
+		t.Fatalf("the guard's marker at the first stop: %+v", mk)
 	}
 
 	// THE JOURNAL carries the decision, and no stage on a server-only host.
@@ -410,12 +411,13 @@ func TestServerRetireRequestRecordsItsIntent(t *testing.T) {
 		t.Fatalf("a server-only request staged a configuration: %d %v", presence, err)
 	}
 
-	// THE ROW is at intent under this run, its id kept.
+	// THE ROW is done under this run, its id kept: the tail completed it from
+	// this host, which could still reach the ledger.
 	f.pgLedger(t, func(db *state.DB) {
 		r, present, err := db.ReadRetirement(t.Context(), f.identity)
 		mustOK(t, err)
 
-		if !present || r.State != state.RetirementIntent || r.TransitionID != row.TransitionID || r.Run != requestRun {
+		if !present || r.State != state.RetirementDone || r.TransitionID != row.TransitionID || r.Run != requestRun {
 			t.Fatalf("the row: %+v (present %v)", r, present)
 		}
 	})
@@ -426,9 +428,12 @@ func TestServerRetireRequestRecordsItsIntent(t *testing.T) {
 		t.Fatalf("the status: %+v %d %v", st, statusPresence, err)
 	}
 
-	// AND THE GUARD IS RELEASED BY NOBODY from here on.
-	if err := guardRun(t, "release", "--holder", requestRun); !errors.Is(err, errGuardTransition) {
-		t.Fatalf("a marked guard was released: %v", err)
+	// AND THE GUARD CAN BE RELEASED, which is what the tail's last two writes
+	// exist for: the marker is gone and the journal is settled, so this
+	// converge owes the retirement nothing and releases its guard the way
+	// every other converge does.
+	if err := guardRun(t, "release", "--holder", requestRun); err != nil {
+		t.Fatalf("the guard of a settled retirement could not be released: %v", err)
 	}
 }
 
@@ -746,6 +751,11 @@ const (
 // entry predicates read.
 func (f *requestFixture) retainANode(t *testing.T) {
 	t.Helper()
+
+	// A HOST THAT KEEPS A NODE KEEPS AN ENDPOINT RECEIPT, which the tail
+	// rewrites once the node has been restarted under the serverless
+	// configuration.
+	useEndpointReceipt(t)
 
 	dir := t.TempDir()
 	nodeState := filepath.Join(dir, "node-state")

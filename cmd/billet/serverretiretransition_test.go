@@ -55,6 +55,8 @@ func (f *requestFixture) plantJournal(t *testing.T, phase retirement.Phase, vari
 		Controllers: "active-passive",
 		IdentityDir: f.stateDir, Archive: transitionArchive(t),
 		InstalledSHA256: f.installedSHA(t), Config: "absent",
+		Locator: retirement.JournalLocator{Backend: "postgres", DSNEnv: "BILLET_STATE_DSN",
+			IdentityDir: f.stateDir, Archive: transitionArchive(t)},
 		Provenance: retirement.Provenance{ReservingHolder: requestRun, TransitionID: retireTestID,
 			Reservation: retireNow().UTC().Format(time.RFC3339Nano), Deployment: f.identity, Retiring: requestRetiring,
 			Survivor: requestSurvivor},
@@ -105,6 +107,25 @@ func (f *requestFixture) drive(t *testing.T, j retirement.Journal) (retirement.J
 		retiringHost: requestRetiring}, obs, j)
 }
 
+// retiredAnswer asserts the answer of a run that carried a retirement to
+// `done` AND finished its tail: the row completed from this host, the marker
+// gone, the journal settled. Every test that drives a whole transition ends
+// here, so a tail that stopped owing something cannot pass as a completed one.
+func retiredAnswer(t *testing.T, out string, code int) map[string]any {
+	t.Helper()
+
+	m := retireAnswer(t, out)
+	if code != 0 || m["outcome"] != retireOutcomeRetired || m["state"] != string(retirement.PhaseDone) {
+		t.Fatalf("the transition did not end retired: %s", out)
+	}
+
+	if m["row"] != retireRowDone || m["settled"] != true {
+		t.Fatalf("the tail left the retirement owing something: %s", out)
+	}
+
+	return m
+}
+
 // actionsOf renders the steps a run performed, for one assertion per case.
 func actionsOf(steps []retireStep) string {
 	words := make([]string, 0, len(steps))
@@ -143,10 +164,7 @@ func TestARetirementRunsItsPhasesInOrder(t *testing.T) {
 
 	out, code := f.request(t, f.input(t, nil))
 
-	m := retireAnswer(t, out)
-	if code != exitUnknown || m["state"] != string(retirement.PhaseDone) {
-		t.Fatalf("the transition: %s", out)
-	}
+	retiredAnswer(t, out, code)
 
 	want := "stop billet-upgrade.timer,disable billet-upgrade.timer,stop billet-backup.timer," +
 		"disable billet-backup.timer,stop billet-server.service,disable billet-server.service"
@@ -178,16 +196,31 @@ func TestARetirementRunsItsPhasesInOrder(t *testing.T) {
 		t.Fatalf("the journal: %+v %d %v", j, presence, err)
 	}
 
-	// THE ROW IS STILL AT INTENT: the tail is what completes it, and nothing
-	// here pretends the survivor has been told.
+	// AND THE TAIL RAN: the journal acknowledges the row it wrote and is
+	// settled, which is the state the guard's release requires.
+	if !j.RowDone || j.CompletedBy != requestRetiring || !j.Settled {
+		t.Fatalf("the tail did not finish in the journal: %+v", j)
+	}
+
+	// THE ROW THE SURVIVOR READS IS DONE, completed by this host, because this
+	// host could still reach the ledger it retired from.
 	f.pgLedger(t, func(db *state.DB) {
 		r, present, err := db.ReadRetirement(t.Context(), f.identity)
 		mustOK(t, err)
 
-		if !present || r.State != state.RetirementIntent {
+		if !present || r.State != state.RetirementDone || r.CompletedBy != requestRetiring {
 			t.Fatalf("the row: %+v (present %v)", r, present)
 		}
 	})
+
+	// AND THE GUARD'S MARKER IS GONE, so the converge that holds it can
+	// release it.
+	shape, err := classifyClaim()
+	mustOK(t, err)
+
+	if shape.Guard.Transition != nil {
+		t.Fatalf("the guard still carries the retirement's marker: %+v", shape.Guard.Transition)
+	}
 }
 
 // A RETAINED NODE KEEPS ITS CONFIGURATION, which is the staged rendering byte
@@ -212,10 +245,7 @@ func TestARetainedNodesTransitionInstallsTheStageAndRestartsTheNode(t *testing.T
 
 	out, code := f.retainedRequest(t, f.input(t, f.retainedOverrides(t)))
 
-	m := retireAnswer(t, out)
-	if code != exitUnknown || m["state"] != string(retirement.PhaseDone) {
-		t.Fatalf("the transition: %s", out)
-	}
+	retiredAnswer(t, out, code)
 
 	if body := mustRead(t, f.cfg); body != f.rendering(t) {
 		t.Fatalf("the installed configuration is not the stage byte for byte:\n%s", body)
@@ -580,9 +610,7 @@ func TestTheLifecycleLockCoversTheStopToArchiveWindow(t *testing.T) {
 	}
 
 	out, code := f.retainedRequest(t, f.input(t, f.retainedOverrides(t)))
-	if m := retireAnswer(t, out); code != exitUnknown || m["state"] != string(retirement.PhaseDone) {
-		t.Fatalf("the transition: %s", out)
-	}
+	retiredAnswer(t, out, code)
 
 	if !held["stop"] || !held["archive"] || held["restart"] {
 		t.Fatalf("the lifecycle lock was held at: %+v", held)
@@ -865,10 +893,7 @@ func TestAResumeRunsUnderTheStatusItPublished(t *testing.T) {
 
 	out, code := f.request(t, f.input(t, nil))
 
-	m := retireAnswer(t, out)
-	if code != exitUnknown || m["state"] != string(retirement.PhaseDone) {
-		t.Fatalf("the resume under a closed authority: %s", out)
-	}
+	retiredAnswer(t, out, code)
 
 	// NOTHING WAS STOPPED AGAIN: the resume began at the archive.
 	if len(f.svc.trace) != 0 {
@@ -1768,30 +1793,31 @@ func TestTheRequestsAnswerAlwaysSaysWhatTheHostHolds(t *testing.T) {
 		f := newRequestFixture(t)
 		f.reserve(t)
 
-		// The journal goes as the LAST status is published, and that
-		// publication succeeds: the driver reaches its terminal answer with a
-		// phase nothing can read back.
-		retirement.Publishing = func(path string) error {
-			if path != retirement.StatusPath() {
-				return nil
-			}
-
+		// The journal goes at the flush that FOLLOWS the tail's last write,
+		// which is the one moment nothing writes it again: the run answers a
+		// retirement it carried to done and settled, over a host that holds no
+		// record of it.
+		retirement.SyncingDir = func(string) error {
 			j, presence, err := retirement.ReadJournal()
 			mustOK(t, err)
 
-			if presence == retirement.JournalPresent && j.Phase == retirement.PhaseDone {
+			if presence == retirement.JournalPresent && j.Settled {
 				mustOK(t, os.Remove(retirement.JournalPath()))
 			}
 
 			return nil
 		}
 
-		t.Cleanup(func() { retirement.Publishing = nil })
+		t.Cleanup(func() { retirement.SyncingDir = nil })
 
 		out, code := f.request(t, f.input(t, nil))
 
+		// THE SUCCESS IS AS BOUND BY THE RULE AS THE FAILURES: the run
+		// carried the retirement to done and settled it, and what it says the
+		// host holds is read when it answers, so a journal that has gone is
+		// `unknown` and not the phase this run remembers.
 		m := retireAnswer(t, out)
-		if code != exitUnknown || m["state"] != "unknown" {
+		if code != 0 || m["outcome"] != retireOutcomeRetired || m["state"] != "unknown" {
 			t.Fatalf("the transition's terminal answer over a journal that has gone: %s", out)
 		}
 	})
