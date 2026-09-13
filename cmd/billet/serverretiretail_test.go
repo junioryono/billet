@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"go/ast"
 	"go/parser"
@@ -497,4 +498,52 @@ func TestTheTailBoundsTheWholeLedgerAttempt(t *testing.T) {
 			t.Fatalf("the row moved under an attempt that never reached the ledger: %+v (present %v)", r, present)
 		}
 	})
+}
+
+// WHOSE DEADLINE IT WAS decides what the expiry means, and the error decides
+// whether a deadline ended the attempt at all. The bound's own case is driven
+// end to end above; the other three are reached only by a connection that
+// hangs for longer than the ledger open's own startup budget, or by an
+// operator stopping the converge, so they are taken here.
+func TestTheTailTellsTheThreeDeadlinesApart(t *testing.T) {
+	live := t.Context()
+
+	expired, cancelExpired := context.WithDeadline(live, time.Now().Add(-time.Second))
+	defer cancelExpired()
+
+	stopped, cancelStopped := context.WithCancel(live)
+	cancelStopped()
+
+	cases := map[string]struct {
+		outer, bounded context.Context
+		err            error
+		want           string
+	}{
+		"this command's own bound": {
+			outer: live, bounded: expired, err: context.DeadlineExceeded,
+			want: "the ledger did not answer within " + retireLedgerBound.String(),
+		},
+		"a deadline neither of them set": {
+			outer: live, bounded: live, err: context.DeadlineExceeded,
+			want: "the ledger did not answer within the open's own startup budget",
+		},
+		"the operator stopping the converge": {
+			outer: stopped, bounded: stopped, err: context.DeadlineExceeded,
+			want: "",
+		},
+		// THE EVIDENCE SURVIVES THE EXPIRY: an error that establishes another
+		// deployment's ledger is that, whatever the clock did afterwards.
+		"an error that is not the deadline's": {
+			outer: live, bounded: expired, err: state.ErrForeignLedger,
+			want: "",
+		},
+	}
+
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := retireDeadlinePending(c.outer, c.bounded, c.err); got != c.want {
+				t.Fatalf("the deadline reads %q, want %q", got, c.want)
+			}
+		})
+	}
 }

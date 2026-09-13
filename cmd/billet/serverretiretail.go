@@ -237,25 +237,18 @@ func retireTailRow(ctx context.Context, j retirement.Journal, answer *retireTail
 	bounded, cancel := context.WithTimeout(ctx, retireLedgerBound)
 	defer cancel()
 
-	db, why, r := retireOpenLedgerByLocator(bounded, j)
+	db, problem := retireOpenLedgerByLocator(bounded, j)
 
 	switch {
-	case r != nil:
-		// A REFUSAL THE BOUND PRODUCED IS THE SAME PENDING ROW: where the
-		// attempt expired does not change what it means.
-		if expired := retireLedgerExpired(ctx, bounded); expired != "" {
-			answer.Row = retireRowPending
-			answer.RowWhy = expired
-
-			return j, nil
-		}
-
-		return j, r
-	case db == nil:
+	case problem.refusal != nil:
+		return j, problem.refusal
+	case problem.pending != "":
 		answer.Row = retireRowPending
-		answer.RowWhy = why
+		answer.RowWhy = problem.pending
 
 		return j, nil
+	case problem.cause != nil:
+		return j, retireLedgerProblem(ctx, bounded, problem.cause, "open the ledger from the journal's locator", answer)
 	}
 
 	defer func() { _ = db.Close() }()
@@ -278,25 +271,10 @@ func retireTailRow(ctx context.Context, j retirement.Journal, answer *retireTail
 	case errors.Is(err, state.ErrRetirementMismatch), errors.Is(err, state.ErrRetirementMoved):
 		return j, retireUnknown(retireReasonMismatch, err.Error(), "the runbook in docs/operating/upgrades.md")
 	case err != nil:
-		if pending := retirePendingReason(err); pending != "" {
-			answer.Row = retireRowPending
-			answer.RowWhy = pending
-
-			return j, nil
-		}
-
-		if expired := retireLedgerExpired(ctx, bounded); expired != "" {
-			// THE ROW MAY HAVE BEEN WRITTEN and the answer lost with the
-			// deadline; pending is right either way, because the survivor's
-			// completion and the next tail both answer `already` over a row
-			// that is already done.
-			answer.Row = retireRowPending
-			answer.RowWhy = expired
-
-			return j, nil
-		}
-
-		return j, retireUnknown(retireReasonLedger, "complete the retirement row: "+err.Error(), "")
+		// THE ROW MAY HAVE BEEN WRITTEN and the answer lost; pending is right
+		// either way, because the survivor's completion and the next tail both
+		// answer `already` over a row that is already done.
+		return j, retireLedgerProblem(ctx, bounded, err, "complete the retirement row", answer)
 	}
 
 	j.RowDone = true
@@ -335,19 +313,19 @@ func retireTailRow(ctx context.Context, j retirement.Journal, answer *retireTail
 // IT ANSWERS THREE WAYS. A handle; nil with a reason, which is a PENDING row
 // and not a failure of this converge; or a refusal, which is everything this
 // command cannot classify.
-func retireOpenLedgerByLocator(ctx context.Context, j retirement.Journal) (*state.DB, string, *retireRefusal) {
+func retireOpenLedgerByLocator(ctx context.Context, j retirement.Journal) (*state.DB, ledgerProblem) {
 	if j.Locator.Backend != string(config.StatePostgres) {
-		return nil, "", retireUnknown(retireReasonLedger, fmt.Sprintf("the journal's locator names the backend %q, and a "+
-			"retirement is defined for PostgreSQL", j.Locator.Backend), "")
+		return nil, ledgerProblem{refusal: retireUnknown(retireReasonLedger, fmt.Sprintf("the journal's locator names "+
+			"the backend %q, and a retirement is defined for PostgreSQL", j.Locator.Backend), "")}
 	}
 
 	dsn, why, r := retireLocatorDSN(j.Locator)
 
 	switch {
 	case r != nil:
-		return nil, "", r
+		return nil, ledgerProblem{refusal: r}
 	case why != "":
-		return nil, why, nil
+		return nil, ledgerProblem{pending: why}
 	}
 
 	// THE OPEN CLAIMS NOTHING AND MIGRATES NOTHING: this host's controller is
@@ -356,11 +334,7 @@ func retireOpenLedgerByLocator(ctx context.Context, j retirement.Journal) (*stat
 	// the shared schema whenever the survivor happened to be down.
 	db, err := state.OpenPostgresCompletion(ctx, j.Locator.Archive, dsn, state.WithRunningRelease(version.Version()))
 	if err != nil {
-		if pending := retirePendingReason(err); pending != "" {
-			return nil, pending, nil
-		}
-
-		return nil, "", retireUnknown(retireReasonLedger, "open the ledger from the journal's locator: "+err.Error(), "")
+		return nil, ledgerProblem{cause: err}
 	}
 
 	// AND IT IS THIS DEPLOYMENT'S LEDGER. The locator names the archive the
@@ -372,28 +346,29 @@ func retireOpenLedgerByLocator(ctx context.Context, j retirement.Journal) (*stat
 	// the row pending.
 	err = db.VerifyDeploymentBinding(ctx, j.Deployment)
 	if err == nil {
-		return db, "", nil
+		return db, ledgerProblem{}
 	}
 
 	// THE HANDLE GOES WITH THE ANSWER. Nothing below returns it, so its pools
 	// and the directory lock at the archive would otherwise be held until this
-	// process exits.
-	closed := db.Close()
-
-	// A binding that says another deployment is a refusal (ErrForeignLedger is
-	// not in the pending list); a binding this host could not READ because the
-	// connection went away under it is the same outage as any other.
-	if pending := retirePendingReason(err); pending != "" && closed == nil {
-		return nil, pending, nil
+	// process exits. A CLOSE THAT FAILED IS ITS OWN REFUSAL and never a
+	// pending row: this host has left something open on a ledger it is
+	// retiring from, which is not a thing to wait out.
+	if closed := db.Close(); closed != nil {
+		return nil, ledgerProblem{refusal: retireUnknown(retireReasonLedger,
+			err.Error()+"; and closing the ledger: "+closed.Error(), "")}
 	}
 
-	refusal := retireUnknown(retireReasonLedger, err.Error(), "")
+	return nil, ledgerProblem{cause: err}
+}
 
-	if closed != nil {
-		refusal.Why += "; and closing the ledger: " + closed.Error()
-	}
-
-	return nil, "", refusal
+// ledgerProblem is why the tail has no handle: a row the survivor can still
+// write (pending, with its reason), a refusal this host stops on, or an error
+// for the one classifier to judge.
+type ledgerProblem struct {
+	pending string
+	refusal *retireRefusal
+	cause   error
 }
 
 // retireLocatorDSN reads the connection string the locator names, from the
@@ -452,16 +427,59 @@ func retirePendingReason(err error) string {
 	}
 }
 
-// retireLedgerExpired says whether THIS COMMAND'S OWN BOUND ended the ledger
-// attempt, which is a pending row, rather than the caller's context ending,
-// which is the operator stopping the converge. A deadline is deliberately not
-// in `Unreachable`: whose deadline it was is not a property of the error.
-func retireLedgerExpired(outer, bounded context.Context) string {
-	if outer.Err() != nil || bounded.Err() == nil {
+// retireLedgerProblem is the ONE place an error from the tail's ledger work
+// becomes an answer: a pending row the survivor can finish, or a refusal this
+// host stops on. Both the open and the row's completion go through it, so an
+// outage does not mean one thing before the connection is established and
+// another after.
+func retireLedgerProblem(outer, bounded context.Context, err error, doing string, answer *retireTailAnswer,
+) *retireRefusal {
+	if pending := retirePendingReason(err); pending != "" {
+		answer.Row = retireRowPending
+		answer.RowWhy = pending
+
+		return nil
+	}
+
+	if why := retireDeadlinePending(outer, bounded, err); why != "" {
+		answer.Row = retireRowPending
+		answer.RowWhy = why
+
+		return nil
+	}
+
+	return retireUnknown(retireReasonLedger, doing+": "+err.Error(), "")
+}
+
+// retireDeadlinePending says whether a DEADLINE ended this attempt, and whose
+// it was.
+//
+// THE ERROR MUST BE THE DEADLINE'S. A context that has expired by the time it
+// is examined proves nothing about what produced an error that arrived before
+// it: a binding that established another deployment's ledger is still that,
+// and reporting it as "the ledger did not answer" would throw the one piece of
+// evidence away. So the error is asked first and the contexts only say whose
+// deadline it was.
+//
+// THREE ANSWERS. The caller's own context ending is the operator stopping this
+// converge, and its refusal is not a pending row. This command's bound is the
+// ledger taking longer than the whole attempt may. And a deadline NEITHER of
+// them set is the ledger open's own startup budget, which is the case an
+// unresponsive connection during the open produces — the reason a bound on the
+// attempt alone is not enough.
+func retireDeadlinePending(outer, bounded context.Context, err error) string {
+	if !errors.Is(err, context.DeadlineExceeded) {
 		return ""
 	}
 
-	return "the ledger did not answer within " + retireLedgerBound.String()
+	switch {
+	case outer.Err() != nil:
+		return ""
+	case bounded.Err() != nil:
+		return "the ledger did not answer within " + retireLedgerBound.String()
+	default:
+		return "the ledger did not answer within the open's own startup budget"
+	}
 }
 
 // retireClearMarker takes the retirement's marker off the guard's record. The

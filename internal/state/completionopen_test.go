@@ -2,14 +2,26 @@ package state
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"database/sql"
 	"errors"
+	"io"
+	"math/big"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
-	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // UNREACHABILITY IS A PROPERTY OF THE ERROR, NOT OF THE STEP THAT PRODUCED IT.
@@ -57,21 +69,55 @@ func TestUnreachableIsAskedOfTheErrorAndNotOfTheStep(t *testing.T) {
 }
 
 // EVERY ROW OF THE CLASSIFIER IS A MEASUREMENT, and this is where it is taken:
-// pgx's shapes are not documented as a contract, and the two that matter most
-// are the ones reading alone would get wrong — a wrong password and a database
-// that does not exist arrive INSIDE a ConnectError, and a context deadline
-// satisfies net.Error. A pgx upgrade that changes any of it fails here rather
-// than silently turning a credential an operator must fix into a retirement
-// that waits for ever.
+// pgx's shapes are not a documented contract, and the ones that matter most are
+// the ones reading alone gets wrong — a wrong password and a database that does
+// not exist arrive INSIDE a ConnectError, a context deadline satisfies
+// net.Error, and a certificate the client refuses looks from the outside like a
+// server that is not there. EACH CASE ASSERTS THE SHAPE IT PRODUCED as well as
+// the verdict, so a pgx change that moves an error from one shape to another
+// fails here rather than silently turning a credential an operator must fix
+// into a retirement that waits for ever.
+type errorShape struct {
+	connect  bool
+	network  bool
+	deadline bool
+	// sqlstate is the server's own code, empty when it said nothing.
+	sqlstate string
+}
+
+func shapeOf(err error) errorShape {
+	var shape errorShape
+
+	//nolint:errcheck // the discarded value is the typed error itself; the bool is the answer.
+	if _, ok := errors.AsType[*pgconn.ConnectError](err); ok {
+		shape.connect = true
+	}
+
+	//nolint:errcheck // as above.
+	if _, ok := errors.AsType[net.Error](err); ok {
+		shape.network = true
+	}
+
+	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok {
+		shape.sqlstate = pgErr.Code
+	}
+
+	shape.deadline = errors.Is(err, context.DeadlineExceeded)
+
+	return shape
+}
+
 func TestUnreachableIsMeasuredAgainstPgxsOwnShapes(t *testing.T) {
 	base := requirePostgresSchema(t, "unreachable_shapes")
 
 	cases := []struct {
-		name string
-		want bool
-		run  func(t *testing.T) error
+		name  string
+		want  bool
+		shape errorShape
+		run   func(t *testing.T) error
 	}{{
 		name: "a port nothing listens on", want: true,
+		shape: errorShape{connect: true, network: true},
 		run: func(t *testing.T) error {
 			t.Helper()
 
@@ -82,27 +128,29 @@ func TestUnreachableIsMeasuredAgainstPgxsOwnShapes(t *testing.T) {
 		},
 	}, {
 		// INSIDE a ConnectError, which is why the server's own error is asked
-		// about first.
+		// about first: 28P01 is the server refusing this client.
 		name: "a password the server rejects", want: false,
+		shape: errorShape{connect: true, sqlstate: "28P01"},
 		run: func(t *testing.T) error {
 			t.Helper()
 
-			_, err := OpenPostgresCompletion(t.Context(), t.TempDir(), strings.Replace(base, ":billet@", ":wrong@", 1))
+			_, err := OpenPostgresCompletion(t.Context(), t.TempDir(), replaceDSNPassword(t, base, "wrong"))
 
 			return err
 		},
 	}, {
 		name: "a database that does not exist", want: false,
+		shape: errorShape{connect: true, sqlstate: "3D000"},
 		run: func(t *testing.T) error {
 			t.Helper()
 
-			_, err := OpenPostgresCompletion(t.Context(), t.TempDir(),
-				strings.Replace(base, "/billet?", "/nosuchdb?", 1))
+			_, err := OpenPostgresCompletion(t.Context(), t.TempDir(), replaceDSNDatabase(t, base, "nosuchdb"))
 
 			return err
 		},
 	}, {
 		name: "a relation that does not exist", want: false,
+		shape: errorShape{sqlstate: "42P01"},
 		run: func(t *testing.T) error {
 			t.Helper()
 
@@ -116,17 +164,24 @@ func TestUnreachableIsMeasuredAgainstPgxsOwnShapes(t *testing.T) {
 	}, {
 		// A SLOW QUERY IS A DATABASE ANSWERING, and the deadline is the
 		// caller's own bound: pgx wraps it in errTimeout, which satisfies
-		// net.Error.
+		// net.Error. The connection is established FIRST, so what the deadline
+		// cuts off is the statement and not the session's setup.
 		name: "a statement the caller's deadline cut off", want: false,
+		shape: errorShape{network: true, deadline: true},
 		run: func(t *testing.T) error {
 			t.Helper()
 
 			conn := openProbeConn(t, base)
 
+			//billet:ignore rawsql // the measurement needs an established session before its deadline
+			if err := conn.PingContext(t.Context()); err != nil {
+				t.Fatalf("establish the session: %v", err)
+			}
+
 			ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
 			defer cancel()
 
-			//billet:ignore rawsql // the measurement needs a statement that outlasts a deadline
+			//billet:ignore rawsql // the statement the deadline cuts off
 			_, err := conn.ExecContext(ctx, `SELECT pg_sleep(3)`)
 
 			return err
@@ -135,6 +190,7 @@ func TestUnreachableIsMeasuredAgainstPgxsOwnShapes(t *testing.T) {
 		// SQLSTATE 57P01: the server saying it is going away, which is an
 		// availability answer and not a refusal to act on.
 		name: "a backend the server terminated", want: true,
+		shape: errorShape{sqlstate: "57P01"},
 		run: func(t *testing.T) error {
 			t.Helper()
 
@@ -148,16 +204,91 @@ func TestUnreachableIsMeasuredAgainstPgxsOwnShapes(t *testing.T) {
 				t.Fatalf("read the session's pid: %v", err)
 			}
 
+			terminated := make(chan error, 1)
+
 			go func() {
 				time.Sleep(300 * time.Millisecond)
 
 				//billet:ignore rawsql // the measurement terminates the session under its query
-				//nolint:errcheck // the termination is best-effort: what is measured is what the victim's query answers.
-				_, _ = other.ExecContext(context.WithoutCancel(t.Context()), `SELECT pg_terminate_backend($1)`, pid)
+				_, err := other.ExecContext(context.WithoutCancel(t.Context()), `SELECT pg_terminate_backend($1)`, pid)
+				terminated <- err
 			}()
 
 			//billet:ignore rawsql // the statement the termination lands under
 			_, err := victim.ExecContext(t.Context(), `SELECT pg_sleep(3)`)
+
+			// THE TERMINATION IS PART OF THE MEASUREMENT: a case whose setup
+			// failed would otherwise be measuring the sleep's own end.
+			if failed := <-terminated; failed != nil {
+				t.Fatalf("terminate the session: %v", failed)
+			}
+
+			return err
+		},
+	}, {
+		// SQLSTATE 57014, IN THE SAME CLASS AS A SHUTDOWN AND NOT THE SAME
+		// THING: the server cancelled this statement because the deployment's
+		// own statement_timeout said to, which is a limit to fix and not an
+		// outage to wait out. It is why the availability states are a list and
+		// not a class prefix.
+		name: "a statement the server's own timeout cancelled", want: false,
+		shape: errorShape{sqlstate: "57014"},
+		run: func(t *testing.T) error {
+			t.Helper()
+
+			conn := openProbeConn(t, base)
+			conn.SetMaxOpenConns(1)
+
+			//billet:ignore rawsql // the measurement sets the server's own bound
+			if _, err := conn.ExecContext(t.Context(), `SET statement_timeout = '100ms'`); err != nil {
+				t.Fatalf("set the server's statement timeout: %v", err)
+			}
+
+			//billet:ignore rawsql // the statement that bound cancels
+			_, err := conn.ExecContext(t.Context(), `SELECT pg_sleep(3)`)
+
+			return err
+		},
+	}, {
+		// A CERTIFICATE THE CLIENT WILL NOT ACCEPT: the session never reaches
+		// the server's own vocabulary, so there is no SQLSTATE, and the
+		// ConnectError around it must not be read as an outage.
+		name: "a certificate the client refuses", want: false,
+		shape: errorShape{connect: true},
+		run: func(t *testing.T) error {
+			t.Helper()
+
+			_, err := OpenPostgresCompletion(t.Context(), t.TempDir(), selfSignedTLSDSN(t, base))
+
+			return err
+		},
+	}, {
+		// THE CONNECTION GOES AWAY WITHOUT THE SERVER SAYING SO, which is the
+		// shape a host that lost its network produces: database/sql discards
+		// the dead connection and opens another, and the proxy is gone by
+		// then, so what comes back is a connection that could not be made.
+		name: "a connection cut under a statement", want: true,
+		shape: errorShape{connect: true, network: true},
+		run: func(t *testing.T) error {
+			t.Helper()
+
+			proxied, cut := proxiedDSN(t, base)
+
+			conn := openProbeConn(t, proxied)
+			conn.SetMaxOpenConns(1)
+
+			//billet:ignore rawsql // the session the cut lands on
+			if err := conn.PingContext(t.Context()); err != nil {
+				t.Fatalf("establish the session through the proxy: %v", err)
+			}
+
+			go func() {
+				time.Sleep(300 * time.Millisecond)
+				cut()
+			}()
+
+			//billet:ignore rawsql // the statement the cut lands under
+			_, err := conn.ExecContext(t.Context(), `SELECT pg_sleep(3)`)
 
 			return err
 		},
@@ -190,6 +321,191 @@ func openProbeConn(t *testing.T, dsn string) *sql.DB {
 	t.Cleanup(func() { _ = conn.Close() })
 
 	return conn
+}
+
+// replaceDSNPassword and replaceDSNDatabase change one field of the DSN
+// through the parser, so a case cannot silently measure nothing because a
+// literal it replaced was spelled another way.
+func replaceDSNPassword(t *testing.T, dsn, password string) string {
+	t.Helper()
+
+	u := parseDSN(t, dsn)
+	u.User = url.UserPassword(u.User.Username(), password)
+
+	return u.String()
+}
+
+func replaceDSNDatabase(t *testing.T, dsn, database string) string {
+	t.Helper()
+
+	u := parseDSN(t, dsn)
+	u.Path = "/" + database
+
+	return u.String()
+}
+
+func parseDSN(t *testing.T, dsn string) *url.URL {
+	t.Helper()
+
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatalf("parse the DSN: %v", err)
+	}
+
+	if u.User == nil || u.User.Username() == "" || u.Path == "" || u.Path == "/" {
+		t.Fatalf("the DSN carries no user or database to replace: %s", dsn)
+	}
+
+	return u
+}
+
+// selfSignedTLSDSN answers a DSN pointing at a listener that speaks
+// PostgreSQL's TLS negotiation and then presents a certificate no root this
+// client trusts has signed. The session never reaches the server's own
+// vocabulary, which is the point.
+func selfSignedTLSDSN(t *testing.T, base string) string {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate a key: %v", err)
+	}
+
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "127.0.0.1"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+	}
+
+	der, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create a certificate: %v", err)
+	}
+
+	var listener net.ListenConfig
+
+	ln, err := listener.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	t.Cleanup(func() { _ = ln.Close() })
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+
+			go func() {
+				defer func() { _ = conn.Close() }()
+
+				// The SSLRequest packet is eight bytes; the answer is one.
+				request := make([]byte, 8)
+				if _, err := io.ReadFull(conn, request); err != nil {
+					return
+				}
+
+				if _, err := conn.Write([]byte("S")); err != nil {
+					return
+				}
+
+				server := tls.Server(conn, &tls.Config{
+					Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}},
+					MinVersion:   tls.VersionTLS12,
+				})
+
+				// THE HANDSHAKE IS EXPECTED TO FAIL: the client is the one
+				// that refuses, and what this listener exists to produce is
+				// that refusal on the client's side.
+				_ = server.HandshakeContext(context.WithoutCancel(t.Context())) //nolint:errcheck // the client's refusal is the measurement
+			}()
+		}
+	}()
+
+	u := parseDSN(t, base)
+	u.Host = ln.Addr().String()
+
+	query := u.Query()
+	query.Set("sslmode", "verify-full")
+	u.RawQuery = query.Encode()
+
+	return u.String()
+}
+
+// proxiedDSN forwards to the real server until cut is called, which closes
+// every connection it holds AND the listener, so the retry database/sql makes
+// has nowhere to go.
+func proxiedDSN(t *testing.T, base string) (string, func()) {
+	t.Helper()
+
+	u := parseDSN(t, base)
+
+	var listener net.ListenConfig
+
+	ln, err := listener.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	var (
+		mu    sync.Mutex
+		held  []net.Conn
+		gone  bool
+		onion = u.Host
+	)
+
+	cut := func() {
+		mu.Lock()
+		defer mu.Unlock()
+
+		if gone {
+			return
+		}
+
+		gone = true
+		_ = ln.Close()
+
+		for _, c := range held {
+			_ = c.Close()
+		}
+	}
+
+	t.Cleanup(cut)
+
+	go func() {
+		for {
+			in, err := ln.Accept()
+			if err != nil {
+				return
+			}
+
+			var dialer net.Dialer
+
+			out, err := dialer.DialContext(context.WithoutCancel(t.Context()), "tcp", onion)
+			if err != nil {
+				_ = in.Close()
+
+				return
+			}
+
+			mu.Lock()
+			held = append(held, in, out)
+			mu.Unlock()
+
+			//nolint:errcheck // a proxy that is about to be cut: what each copy ends with is the cut itself
+			go func() { _, _ = io.Copy(out, in) }()
+			//nolint:errcheck // as above
+			go func() { _, _ = io.Copy(in, out) }()
+		}
+	}()
+
+	u.Host = ln.Addr().String()
+
+	return u.String(), cut
 }
 
 // A COMPLETION WRITES ONE ROW AND CLAIMS NOTHING. Its caller is a host whose
@@ -278,5 +594,96 @@ func TestOpenPostgresCompletionRefusesASchemaItWouldHaveToMove(t *testing.T) {
 	_, err = OpenPostgresCompletion(t.Context(), t.TempDir(), dsn)
 	if !errors.Is(err, ErrSchemaBehind) {
 		t.Fatalf("a completion over a ledger behind this binary: %v", err)
+	}
+}
+
+// THE OPEN'S OWN BUDGET IS A DEADLINE, and a caller that must tell an outage
+// from a refusal depends on it looking like one: the open gives itself
+// `startupTimeout` for the ping, the backend's preparation and the schema, and
+// a connection that accepts and then says nothing ends there rather than
+// waiting on whatever the caller's context allows. The retirement's tail reads
+// exactly this shape — a deadline neither of ITS contexts set — as the ledger
+// being out of reach.
+func TestAnOpenThatTimesOutOnItsOwnBudgetSaysSo(t *testing.T) {
+	base := requirePostgresSchema(t, "startup_budget")
+
+	// A listener that completes the TCP connection and answers nothing, which
+	// is what an unresponsive server looks like from here.
+	var listener net.ListenConfig
+
+	ln, err := listener.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	t.Cleanup(func() { _ = ln.Close() })
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+
+			t.Cleanup(func() { _ = conn.Close() })
+		}
+	}()
+
+	saved := startupTimeout
+	startupTimeout = 300 * time.Millisecond
+
+	t.Cleanup(func() { startupTimeout = saved })
+
+	u := parseDSN(t, base)
+	u.Host = ln.Addr().String()
+
+	_, err = OpenPostgresCompletion(t.Context(), t.TempDir(), u.String())
+	if err == nil {
+		t.Fatal("an open against a listener that says nothing succeeded")
+	}
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("the open's own budget did not end it as a deadline: %v", err)
+	}
+
+	// AND NOT AS UNREACHABILITY, which is the whole reason the tail decides
+	// that from its contexts rather than from the error.
+	if Unreachable(err) {
+		t.Fatalf("a deadline reads as unreachable: %v", err)
+	}
+}
+
+// THE ALLOWLIST'S MEMBERSHIP, code by code. The measurement above pins what
+// pgx produces for the situations billet actually meets; this pins which of
+// the server's own answers mean "not now" rather than "not like this", which
+// is a judgement about PostgreSQL's vocabulary and not about pgx's shapes.
+func TestUnreachableSQLStatesAreAnAllowlist(t *testing.T) {
+	for code, want := range map[string]bool{
+		// Availability: the connection, or the server's readiness.
+		"08001": true, // the client could not establish the connection
+		"08003": true, // the connection does not exist
+		"08006": true, // the connection failed
+		"08007": true, // the transaction's resolution is unknown
+		"53300": true, // too many connections
+		"57P01": true, // the administrator ended this backend
+		"57P02": true, // a crash ended it
+		"57P03": true, // the server cannot accept connections yet
+
+		// The same two CLASSES, and none of these is an outage.
+		"08004": false, // the server rejected this client (pg_hba)
+		"08P01": false, // a protocol violation
+		"57014": false, // the server cancelled the statement (statement_timeout)
+		"57P04": false, // the database was dropped
+
+		// And the ordinary refusals.
+		"28P01": false, // the password was rejected
+		"3D000": false, // the database does not exist
+		"42P01": false, // the relation does not exist
+		"53400": false, // a configuration limit was exceeded
+		"":      false,
+	} {
+		if got := unreachableSQLState(code); got != want {
+			t.Errorf("SQLSTATE %q reads as unreachable=%v, want %v", code, got, want)
+		}
 	}
 }

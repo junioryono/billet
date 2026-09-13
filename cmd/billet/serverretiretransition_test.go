@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -1068,14 +1069,29 @@ func TestAJournalWriteThatFailsAfterItsRenameAnswersWhatIsOnDisk(t *testing.T) {
 // PERMISSION TO RESTART a node that is positively active: the first is a word
 // this billet does not know, the second a registration not published yet, and
 // a restart is a drain.
+//
+// EACH CASE STAGES EXACTLY ONE DEFECT, which is why the record's invocation is
+// the case's to choose: a case that left both the enablement and the record
+// wrong would pass for whichever the fact happened to judge first.
 func TestAnUncertainNodeIsNotRestarted(t *testing.T) {
-	for name, unit := range map[string]string{
-		"an enablement this billet does not know": "LoadState=loaded\nActiveState=active\nSubState=running\n" +
-			"Result=success\nKillMode=mixed\nMainPID=4242\nUnitFileState=refreshing\n" +
-			"InvocationID=0123456789abcdef0123456789abcdef\nExecMainStartTimestamp=" + retainedNodeStarted + "\n",
-		"a record from another invocation": "LoadState=loaded\nActiveState=active\nSubState=running\n" +
-			"Result=success\nKillMode=mixed\nMainPID=4242\nUnitFileState=enabled\n" +
-			"InvocationID=fedcba9876543210fedcba9876543210\nExecMainStartTimestamp=" + retainedNodeStarted + "\n",
+	// The unit as the node runs after its restart, which is what both cases
+	// vary from.
+	running := "LoadState=loaded\nActiveState=active\nSubState=running\nResult=success\nKillMode=mixed\n" +
+		"MainPID=4242\nUnitFileState=%s\nInvocationID=%s\nExecMainStartTimestamp=" + retainedNodeStarted + "\n"
+
+	for name, c := range map[string]struct {
+		unit string
+		// record is the invocation the node's published record names.
+		record string
+	}{
+		"an enablement this billet does not know": {
+			unit:   fmt.Sprintf(running, "refreshing", retainedRestartInvocation),
+			record: retainedRestartInvocation,
+		},
+		"a record from another invocation": {
+			unit:   fmt.Sprintf(running, "enabled", retainedRestartInvocation),
+			record: retainedInvocation,
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			f := newRequestFixture(t)
@@ -1083,13 +1099,13 @@ func TestAnUncertainNodeIsNotRestarted(t *testing.T) {
 			f.reserve(t)
 
 			record := useRegistrationRecord(t)
-			restartedNode(t, f, record, retainedEndpoint)
+			writeRegistrationRecord(t, record, f.identity, retainedEndpoint, c.record)
 
 			j := f.plantJournal(t, retirement.PhaseNodeRestarted, retirement.VariantRetainedNode)
 
 			mustOK(t, os.Rename(f.stateDir, j.Archive))
 			writeFile(t, f.cfg, f.rendering(t), 0o600)
-			writeFile(t, filepath.Join(f.unitsDir, nodeUnit), unit, 0o644)
+			writeFile(t, filepath.Join(f.unitsDir, nodeUnit), c.unit, 0o644)
 
 			_, _, r := f.drive(t, j)
 

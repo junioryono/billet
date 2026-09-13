@@ -33,6 +33,8 @@ package state
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"database/sql"
 	"database/sql/driver"
 	"errors"
@@ -594,7 +596,7 @@ func openDir(
 // migrate). Generous, because a first run creates the database and an integrity
 // check scans it; anything slower than this is a sick disk, not a slow one — or,
 // on PostgreSQL, another session holding a lock the migration is waiting for.
-const startupTimeout = 30 * time.Second
+var startupTimeout = 30 * time.Second
 
 // PingContext proves the database is reachable AND configured as promised.
 //
@@ -657,6 +659,15 @@ func Unreachable(err error) bool {
 		return false
 	}
 
+	// A CERTIFICATE THE CLIENT WOULD NOT ACCEPT is the same shape of mistake as
+	// a password the server would not accept: it arrives inside a ConnectError
+	// with no PgError under it, because the session never got far enough for
+	// the server to say anything, and it is something an operator must fix
+	// rather than wait out.
+	if certificateRejected(err) {
+		return false
+	}
+
 	//nolint:errcheck // as above.
 	if _, ok := errors.AsType[*pgconn.ConnectError](err); ok {
 		return true
@@ -672,13 +683,53 @@ func Unreachable(err error) bool {
 	return ok
 }
 
-// unreachableSQLState names the two SQLSTATE classes that are an availability
-// answer rather than a refusal: 08, connection exception, and 57, operator
-// intervention (57P01 is what a terminated backend and a shutting-down server
-// both say). Every other class is the server telling this caller something it
-// must act on.
-func unreachableSQLState(code string) bool {
-	return strings.HasPrefix(code, "08") || strings.HasPrefix(code, "57")
+// unreachableSQLStates is the CLOSED LIST of conditions the server itself
+// reports that mean "not now" rather than "not like this". A class prefix is
+// not that list: 08 holds 08004, the server refusing this client (pg_hba), and
+// 08P01, a protocol violation, which are the client's to fix; 57 holds 57014,
+// a statement the server cancelled (a statement_timeout is one), and 57P04, a
+// database that was dropped.
+//
+//	08001 the client could not establish the connection
+//	08003 the connection does not exist
+//	08006 the connection failed
+//	08007 the transaction's resolution is unknown — the commit may have landed,
+//	      which for a caller that retries idempotently is the same as not now
+//	53300 too many connections, a limit that clears on its own
+//	57P01 the administrator ended this backend
+//	57P02 a crash ended it
+//	57P03 the server cannot accept connections yet (starting, or in recovery)
+var unreachableSQLStates = map[string]bool{
+	"08001": true, "08003": true, "08006": true, "08007": true,
+	"53300": true,
+	"57P01": true, "57P02": true, "57P03": true,
+}
+
+func unreachableSQLState(code string) bool { return unreachableSQLStates[code] }
+
+// certificateRejected reports whether the chain holds a TLS verification
+// failure: the client refusing the server's certificate, by authority, by
+// validity or by name.
+func certificateRejected(err error) bool {
+	//nolint:errcheck // the discarded value is the typed error itself; the bool is the answer.
+	if _, ok := errors.AsType[*tls.CertificateVerificationError](err); ok {
+		return true
+	}
+
+	//nolint:errcheck // as above.
+	if _, ok := errors.AsType[x509.UnknownAuthorityError](err); ok {
+		return true
+	}
+
+	//nolint:errcheck // as above.
+	if _, ok := errors.AsType[x509.CertificateInvalidError](err); ok {
+		return true
+	}
+
+	//nolint:errcheck // as above.
+	_, ok := errors.AsType[x509.HostnameError](err)
+
+	return ok
 }
 
 // IntegrityCheck refuses to serve from a corrupt ledger.
