@@ -24,7 +24,7 @@ const (
 
 // retryETXTBSY runs attempt(), which must build a FRESH command each call — an
 // exec.Cmd cannot be reused after Start — and retries only the text-file-busy
-// start failure.
+// start failure, in either shape it reaches this process.
 func retryETXTBSY[T any](attempt func() (T, error)) (T, error) {
 	var (
 		out T
@@ -33,7 +33,7 @@ func retryETXTBSY[T any](attempt func() (T, error)) (T, error) {
 
 	for range etxtbsyAttempts {
 		out, err = attempt()
-		if !errors.Is(err, syscall.ETXTBSY) {
+		if !errors.Is(err, syscall.ETXTBSY) && !shellCouldNotExec(err) {
 			return out, err
 		}
 
@@ -42,6 +42,27 @@ func retryETXTBSY[T any](attempt func() (T, error)) (T, error) {
 
 	return out, err
 }
+
+// shellCouldNotExec says whether an error is a SHELL reporting that it could
+// not execute a child.
+//
+// THE SAME RACE, ONE LEVEL DOWN. The wrappers these tests exec are /bin/sh
+// scripts that run a script the same subtest has just written, and when THAT
+// exec meets the window above, the shell reports it as exit status 126 rather
+// than passing ETXTBSY up: a fresh Fedora or Ubuntu `sh` answers 126 for
+// "found, could not execute". So the start-only retry has to recognise both
+// spellings, and it is safe to retry here because no fixture in this package
+// expects 126 from anything — every case asserts a status its own fake chose
+// (measured on CI's Linux runner, 2026-09-12, where `hosted result 103 became
+// exit status 126`).
+func shellCouldNotExec(err error) bool {
+	exit, ok := errors.AsType[*exec.ExitError](err)
+
+	return ok && exit.ExitCode() == shellExecFailed
+}
+
+// shellExecFailed is POSIX's "command found but could not be executed".
+const shellExecFailed = 126
 
 // cloneCmd rebuilds a command for a retry attempt.
 func cloneCmd(t *testing.T, cmd *exec.Cmd) *exec.Cmd {

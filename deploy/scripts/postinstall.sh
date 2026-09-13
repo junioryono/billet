@@ -212,8 +212,29 @@ unit_decisions() {
     enable_timers
 }
 
-if command -v flock >/dev/null 2>&1; then
-    mkdir -p "$(dirname "${LIFECYCLE_LOCK}")"
+# lock_dir_ready prepares the lock's directory, or says it could not.
+#
+# `mkdir -p` FAILS ON A DANGLING SYMLINK, which is what /var/lock is on a
+# Fedora image with no tmpfs at /run/lock: the link exists, so mkdir answers
+# EEXIST and, under `set -e`, an ordinary package install dies in its %post
+# scriptlet (measured on fedora:42, 2026-09-12). What the link POINTS AT is
+# what has to be created, and a path that is still not a directory afterwards
+# is one this script declines to lock on rather than fail the install over.
+lock_dir_ready() {
+    dir=$(dirname "${LIFECYCLE_LOCK}")
+
+    if [ -d "${dir}" ]; then
+        return 0
+    fi
+
+    target=$(readlink -f "${dir}" 2>/dev/null || printf '%s' "${dir}")
+
+    mkdir -p "${target}" 2>/dev/null || true
+
+    [ -d "${dir}" ]
+}
+
+if command -v flock >/dev/null 2>&1 && lock_dir_ready; then
     # THE LOCK ON A DESCRIPTOR OF THIS SHELL, so the functions above run under it
     # in this process; `flock <file> <command>` would need a second script.
     exec 9>>"${LIFECYCLE_LOCK}"
@@ -229,9 +250,10 @@ if command -v flock >/dev/null 2>&1; then
         echo "        decisions with the status re-read." >&2
     fi
 else
-    echo "billet: flock(1) is missing, so the unit decisions cannot be excluded against a" >&2
-    echo "        lifecycle operation; ${CONF} was not seeded and no timer was enabled." >&2
-    echo "        Install util-linux and run \`dpkg-reconfigure billet\`." >&2
+    echo "billet: the unit decisions cannot be excluded against a lifecycle operation, so" >&2
+    echo "        ${CONF} was not seeded and no timer was enabled: flock(1) is missing, or" >&2
+    echo "        $(dirname "${LIFECYCLE_LOCK}") is not a directory this host can make." >&2
+    echo "        Install util-linux, make that directory, and run \`dpkg-reconfigure billet\`." >&2
 fi
 
 # THE APP KEY IS OWNED BY THE SERVICE USER AT 0600, and it is the one file here
