@@ -175,8 +175,11 @@ type retireReport struct {
 	Row      *retireReportRow     `json:"row"`
 	RowFact  retirement.RowFact   `json:"row_fact"`
 	Dispatch retirement.Dispatch  `json:"dispatch"`
-	Why      string               `json:"why,omitempty"`
-	State    string               `json:"state"`
+	// Config is the installed configuration's typed presence, in the words
+	// the inspector uses: `present`, `absent`, `malformed`, `unreadable`.
+	Config string `json:"config"`
+	Why    string `json:"why,omitempty"`
+	State  string `json:"state"`
 }
 
 type retireReportJournal struct {
@@ -1138,23 +1141,91 @@ func retireDryRun(ctx context.Context, m retireMode) (any, *retireRefusal) {
 		report.Marker = shape.Guard.Transition
 	}
 
-	cfg, err := config.Load(m.configPath)
+	// THE CONFIGURATION IS A FACT THIS REPORT CARRIES, NEVER A REFUSAL. A
+	// classifier's whole job is to say what the host holds, and the host this
+	// command exists for — a completed server-only retirement — has NO
+	// configuration by design: refusing there would make the one state the
+	// caller most needs classified the one it cannot ask about. The presence is
+	// typed in the inspector's own words, and a file that does not parse is
+	// `malformed` rather than an absence, because a caller that read it as one
+	// would converge a host as fresh.
+	cfg, configPresence := observeRetireDryRunConfig(m.configPath)
+	report.Config = configPresence
 
 	switch {
-	case err != nil:
-		return nil, retireRefuse(retireReasonConfig, err.Error(), "")
-	case cfg.Server == nil:
-		// A host whose server section is gone is read through its journal's
-		// locator, which the next change adds; until then the row is unread.
-		report.RowFact = retirement.RowUnreadable
-		report.Why = "the configuration has no server section, so the row was not read"
-	default:
+	case cfg != nil && cfg.Server != nil:
 		report.Row, report.RowFact, report.Why = readRetireRow(ctx, cfg, m)
+	case presence == retirement.JournalPresent:
+		// THE LOCATOR IS HOW A HOST PAST THE ARCHIVE NAMES ITS LEDGER: the
+		// installed configuration has no `server:` any more, or none at all,
+		// and the journal recorded the backend, the variable and the archive
+		// before the transition took them away.
+		report.Row, report.RowFact, report.Why = readRetireRowByLocator(ctx, j)
+	default:
+		report.RowFact = retirement.RowUnreadable
+		report.Why = "the configuration names no ledger (" + configPresence + ") and no journal names one, so the row " +
+			"was not read"
 	}
 
 	report.Dispatch = retirement.DispatchFor(report.RowFact, retirement.JournalFactOf(presence == retirement.JournalPresent, j.Phase))
 
+	// WHAT THE HOST HOLDS, READ WHEN THE REPORT IS MADE, like every other
+	// answer this command gives. Pinned to `nothing` it said the opposite of
+	// the truth on every host with a retirement under way.
+	report.State = retireHostState(stateNothingRetire)
+
 	return report, nil
+}
+
+// observeRetireDryRunConfig types the installed configuration for the report:
+// a positive ENOENT is `absent`, bytes that do not parse are `malformed`, a
+// failed read is `unreadable`, and only a configuration that parsed comes back
+// beside its value.
+func observeRetireDryRunConfig(path string) (*config.Config, string) {
+	obs, err := observeConfig(path)
+
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return nil, "absent"
+	case err != nil:
+		return nil, "unreadable"
+	}
+
+	defer func() { _ = obs.file.Close() }()
+
+	cfg, err := config.Parse(path, obs.body)
+	if err != nil {
+		return nil, "malformed"
+	}
+
+	return cfg, "present"
+}
+
+// readRetireRowByLocator reads the row the way a host past the archive must:
+// through the journal's locator, against the identity the journal recorded.
+// Everything the open cannot establish is `unreadable` with its reason, never
+// an absence.
+func readRetireRowByLocator(ctx context.Context, j retirement.Journal) (*retireReportRow, retirement.RowFact, string) {
+	db, problem := retireOpenLedgerByLocator(ctx, j)
+
+	switch {
+	case problem.refusal != nil:
+		return nil, retirement.RowUnreadable, problem.refusal.Why
+	case problem.pending != "":
+		return nil, retirement.RowUnreadable, problem.pending
+	case problem.cause != nil:
+		return nil, retirement.RowUnreadable, "the ledger could not be opened through the journal's locator: " +
+			state.Describe(problem.cause)
+	}
+
+	defer func() { _ = db.Close() }()
+
+	snapshot, err := rollout.New(db).StatusSnapshot(ctx)
+	if err != nil {
+		return nil, retirement.RowUnreadable, "the retirement row could not be read: " + err.Error()
+	}
+
+	return rowFromSnapshot(snapshot.Binding, snapshot.Retirement, j.Deployment, j.Retiring)
 }
 
 // readRetireRow reads the row for the dry run and classifies it for THIS
