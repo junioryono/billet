@@ -102,8 +102,10 @@ func TestTheDryRunTypesTheConfigurationRatherThanRefusingOnIt(t *testing.T) {
 				t.Fatalf("the configuration was reported as %v, want %s: %s", m["config"], c.want, out)
 			}
 
-			// A configuration that names no ledger leaves the row unread with
-			// its reason, never an absence a caller could act on.
+			// A configuration that names no ledger, on a host whose journal
+			// names none either, leaves the row unread WITH ITS REASON, never
+			// an absence a caller could act on. With a journal the locator is
+			// tried instead, which the locator test covers.
 			if c.want != "present" && m["row_fact"] != string(retirement.RowUnreadable) {
 				t.Fatalf("a configuration that names no ledger left the row: %s", out)
 			}
@@ -134,9 +136,47 @@ func TestTheDryRunsStateIsTheHostsAndNotAConstant(t *testing.T) {
 	}
 }
 
-// A DRY RUN STILL TAKES NOTHING. The locator read is a read-only open of
-// another host's ledger, and nothing about typing the configuration or
-// reporting the phase may create a file, a lock or an upgrade root.
+// A DRY RUN STILL TAKES NOTHING, AND THE LOCATOR READ IS WHERE THAT IS EASIEST
+// TO LOSE. The tail's own opener takes the directory lock at the archive and
+// creates the directory if it is not there, which is right for a run about to
+// write the deployment's row and wrong for one whose whole contract is that it
+// looks. The damaging case is this one: a retirement at `intent` whose archive
+// does not exist yet, classified by a converge that would then have CREATED THE
+// DESTINATION the transition is about to rename onto.
+func TestTheDryRunTakesNothingThroughTheLocator(t *testing.T) {
+	f := newRequestFixture(t)
+	f.reserve(t)
+
+	j := f.plantJournal(t, retirement.PhaseIntent, retirement.VariantServerOnly)
+
+	// The configuration names no ledger, so the row is read through the
+	// locator; the archive the locator names is not there yet.
+	mustOK(t, os.Remove(f.cfg))
+
+	if _, err := os.Lstat(j.Locator.Archive); !os.IsNotExist(err) {
+		t.Fatalf("the archive already exists, so this case proves nothing: %v", err)
+	}
+
+	out, code := f.run(t, "", "--dry-run", "--retiring-host", requestRetiring)
+
+	m := retireAnswer(t, out)
+	if code != 0 || m["outcome"] != retireOutcomeReported {
+		t.Fatalf("the dry run: %s", out)
+	}
+
+	// THE ROW WAS NOT READ — there is no directory to read it through — and
+	// nothing was created to make one.
+	if m["row_fact"] != string(retirement.RowUnreadable) {
+		t.Fatalf("a locator naming an absent archive answered a row: %s", out)
+	}
+
+	if _, err := os.Lstat(j.Locator.Archive); !os.IsNotExist(err) {
+		t.Fatalf("the dry run created the archive the transition is about to rename onto: %v", err)
+	}
+}
+
+// AND IT CREATES NOTHING ON THE ORDINARY PATH EITHER: no upgrade root by
+// classifying a guard, no configuration by finding none.
 func TestTheDryRunStillCreatesNothing(t *testing.T) {
 	f := newRetireFixture(t)
 
