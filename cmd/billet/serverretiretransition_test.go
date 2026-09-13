@@ -1535,9 +1535,10 @@ func TestADoneJournalIsAnsweredBeforeAnyConfigurationIsRead(t *testing.T) {
 
 	retiredAnswer(t, out, code)
 
-	// AND THE CONFIGURATION WAS NEVER THE THING IT READ: the answer names the
-	// retirement, and the operand this run was handed is a digest of a file
-	// that is not there.
+	// WHAT THIS PROVES is that no configuration was NEEDED: moving the
+	// ordinary observation ahead of the journal's dispatch fails this test on
+	// the missing file. It does not prove that no read of it happened at all,
+	// and does not claim to.
 	done, _, err := retirement.ReadJournal()
 	mustOK(t, err)
 

@@ -297,11 +297,16 @@ func retireConfigPostcondition(configPath string, j retirement.Journal) (string,
 	}
 
 	// ONLY A HOST THAT KEPT A NODE NEEDS THE FILE READ, and there a
-	// configuration that does not parse is could-not-tell and nothing else:
-	// what the clause asks about is the sections inside it.
+	// configuration that cannot be read or does not parse is COULD-NOT-TELL and
+	// nothing else. What the clause asks is which sections are inside it, and
+	// that question has no answer over bytes nothing could parse; the observer
+	// refuses such a file because its own callers are deciding whether to act
+	// on it, and this one is deciding what a finished retirement left. What is
+	// NOT could-not-tell is a file that parsed and says the wrong thing, which
+	// is the drift below.
 	obs, endpointRefusal := observeInstalledConfig(configPath, true)
 	if endpointRefusal != nil {
-		return "", atRetirePhase(j, retireFromEndpointFor(retireReasonPostcondition, endpointRefusal))
+		return "", atRetirePhase(j, retireUnknown(retireReasonPostcondition, endpointRefusal.Why, endpointRefusal.Next))
 	}
 
 	// A FILE IS NOT THE CONFIGURATION A RETIREMENT LEAVES. What the rewrite
@@ -320,13 +325,16 @@ func retireConfigPostcondition(configPath string, j retirement.Journal) (string,
 	// after `done` the ordinary render owns this file, and a later legitimate
 	// change to the node's configuration is rendered the ordinary way.
 	//
-	// A NAME THAT WAS THERE AND IS GONE BY THE READ is could-not-tell, not the
-	// absence the clause above would have refused: the two reads are not one
-	// observation and this one establishes nothing about what stands now.
+	// A NAME THAT STANDS AND AN OPEN THAT SAYS NOT-FOUND is could-not-tell,
+	// never the absence the clause above would have refused. Two things reach
+	// it and neither is an absent configuration: a symlink whose target is not
+	// there, which `Lstat` answers for the link and the open answers for the
+	// target, and a file removed between the two reads, which are not one
+	// observation.
 	switch {
 	case !obs.present:
-		return "", atRetirePhase(j, retireUnknown(retireReasonPostcondition, fmt.Sprintf("the configuration at %s was "+
-			"there when this host was examined and gone when it was read", obs.path), ""))
+		return "", atRetirePhase(j, retireUnknown(retireReasonPostcondition, fmt.Sprintf("something stands at %s and "+
+			"opening the configuration there answered not-found", obs.path), ""))
 	case obs.cfg.Server != nil:
 		return "", atRetirePhase(j, retireRefuse(retireReasonPostcondition, fmt.Sprintf("the configuration at %s has "+
 			"a server section again, and this host retired its server", obs.path),

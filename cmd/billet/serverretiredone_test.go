@@ -646,3 +646,73 @@ func setMainPID(t *testing.T, path, pid string) {
 
 	writeFile(t, path, strings.Join(lines, "\n"), 0o644)
 }
+
+// THE TWO VARIANTS ASK DIFFERENT QUESTIONS OF THE SAME FILE, and a
+// configuration that does not parse answers one of them and not the other. On
+// a host that kept NO node the clause is that there is none, and a file that
+// does not parse is still a file: the clause fails and the answer says so. On a
+// host that KEPT one the clause is about the sections inside it, and over bytes
+// nothing could parse that question has no answer at all.
+func TestAnUnparseableConfigurationIsJudgedByWhatItsVariantAsks(t *testing.T) {
+	// A configuration that is present and does not validate: a node section
+	// with neither a provider nor a server address.
+	const malformed = "node:\n  name: node-a\n"
+
+	t.Run("a host that kept no node", func(t *testing.T) {
+		f := newRequestFixture(t)
+		f.reserve(t)
+
+		settleRetirement(t, f)
+		retiredUnits(t, f)
+		writeFile(t, f.cfg, malformed, 0o600)
+
+		out, code := retiredRequest(t, f, requestRun)
+
+		m := retireAnswer(t, out)
+		if code != exitRefused || m["reason"] != retireReasonPostcondition {
+			t.Fatalf("a configuration installed on a host that kept no node: %s", out)
+		}
+
+		if !strings.Contains(whyOf(m), "configuration is installed") {
+			t.Fatalf("the refusal names the parse instead of the clause: %s", out)
+		}
+	})
+
+	t.Run("a host that kept a node", func(t *testing.T) {
+		f := newRequestFixture(t)
+		f.retainANode(t)
+		f.reserve(t)
+
+		record := useRegistrationRecord(t)
+
+		f.svc.onStart = func(unit string) {
+			if unit == nodeUnit {
+				restartedNode(t, f, record, retainedEndpoint)
+			}
+		}
+
+		out, code := f.retainedRequest(t, f.input(t, f.retainedOverrides(t)))
+		retiredAnswer(t, out, code)
+
+		node := mustRead(t, filepath.Join(f.unitsDir, nodeUnit))
+
+		retiredUnits(t, f)
+		writeFile(t, filepath.Join(f.unitsDir, nodeUnit), node, 0o644)
+
+		// THE DOCUMENT AND THE DIGEST ARE TAKEN FIRST, the way the role takes
+		// them: it builds both on a host whose configuration still reads, and
+		// building them here would answer about the file rather than the
+		// clause.
+		in, digest := f.input(t, f.retainedOverrides(t)), f.installedSHA(t)
+
+		writeFile(t, f.cfg, malformed, 0o600)
+
+		out, code = f.run(t, in, "--input", "-", "--run", requestRun, "--retiring-host", requestRetiring,
+			"--survivor-host", requestSurvivor, "--installed-sha256", digest)
+
+		m := retireAnswer(t, out)
+		if code != exitUnknown || m["reason"] != retireReasonPostcondition {
+			t.Fatalf("a configuration a retained node's clause cannot be asked of: %s", out)
+		}
+	})
+}
