@@ -19,6 +19,12 @@
   },
   "row_fact": "reserved-mine",
   "dispatch": "adopt",
+  "status_presence": "absent",
   "config": "present",
+  "installed_roles": "server",
+  "identity": "minted",
+  "authority": "absent",
+  "route": "hold",
+  "route_why": "this guard carries a retirement marker with no journal to explain it",
   "state": "nothing"
 }

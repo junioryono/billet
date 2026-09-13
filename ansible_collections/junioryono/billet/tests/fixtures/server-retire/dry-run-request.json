@@ -9,6 +9,11 @@
   "row": null,
   "row_fact": "absent",
   "dispatch": "request",
+  "status_presence": "absent",
   "config": "present",
+  "installed_roles": "server",
+  "identity": "minted",
+  "authority": "absent",
+  "route": "ordinary",
   "state": "nothing"
 }

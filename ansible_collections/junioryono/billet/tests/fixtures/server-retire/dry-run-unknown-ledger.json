@@ -7,7 +7,9 @@
     "row_done": false,
     "settled": false,
     "owner": "ci-1",
-    "transition_id": "0123456789abcdef0123456789abcdef"
+    "transition_id": "0123456789abcdef0123456789abcdef",
+    "retiring": "control-a",
+    "survivor": "control-b"
   },
   "status": null,
   "stage": "absent",
@@ -19,7 +21,13 @@
   "row": null,
   "row_fact": "unreadable",
   "dispatch": "unknown-ledger",
+  "status_presence": "absent",
   "config": "present",
+  "installed_roles": "server",
+  "identity": "minted",
+  "authority": "absent",
+  "route": "continue",
+  "route_why": "this host has a readable journal, so the retirement it records is what this converge continues",
   "why": "the ledger could not be opened for the report: ping state db: file is not a database (26)",
   "state": "intent"
 }
