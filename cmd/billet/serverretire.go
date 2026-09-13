@@ -246,14 +246,30 @@ var (
 	retireReexecCapture           = reexecCapture
 )
 
-// retireReportLedgerBound covers the open, the deployment binding and the
-// status snapshot, including a read re-executed as the ledger's owner.
+// retireReportLedgerBound supplies the context for the open, the deployment
+// binding and the status snapshot, including a read re-executed as the owner.
 //
 // THE OPEN'S BUDGET ENDS AT STARTUP, not at the end of the observation. A
-// connection stalled after startup must not hold a classifier forever: the
-// row is unreadable when this bound ends, and the local journal still answers
-// for a caller that can recover without the ledger.
+// connection stalled after startup must still receive the observation's
+// deadline. Cleanup has no context: DB.Close and the driver's rollback may
+// outlast this bound. They finish before the row is classified, and expiry
+// during either leaves it unreadable, with the local journal still visible.
+// This is not a wall-clock bound on the command's return.
 var retireReportLedgerBound = 2 * time.Minute
+
+// The observation's seams let a deadline end INSIDE the read or its cleanup,
+// after entry has been established, rather than before anything was asked.
+var retireReportTimeout = context.WithTimeout
+
+var retireReportOpen = openStateInspect
+
+var retireReportOpenByLocator = retireInspectLedgerByLocator
+
+var retireReportSnapshot = func(ctx context.Context, db *state.DB) (rollout.StatusSnapshot, error) {
+	return rollout.New(db).StatusSnapshot(ctx)
+}
+
+var retireReportClose = (*state.DB).Close
 
 func cmdServerRetire(ctx context.Context, args []string) error {
 	flags := newFlagSet("billet server retire")
@@ -1255,7 +1271,7 @@ func retireInspectLedgerByLocator(ctx context.Context, j retirement.Journal) (*s
 }
 
 func readRetireRowByLocator(ctx context.Context, j retirement.Journal) (*retireReportRow, retirement.RowFact, string) {
-	bounded, cancel := context.WithTimeout(ctx, retireReportLedgerBound)
+	bounded, cancel := retireReportTimeout(ctx, retireReportLedgerBound)
 	defer cancel()
 
 	if err := bounded.Err(); err != nil {
@@ -1264,26 +1280,19 @@ func readRetireRowByLocator(ctx context.Context, j retirement.Journal) (*retireR
 
 	// THE OPEN THAT TAKES NOTHING. A dry run creates no directory, takes no
 	// lock and writes nothing, and the tail's own open does all three.
-	db, problem := retireInspectLedgerByLocator(bounded, j)
+	db, problem := retireReportOpenByLocator(bounded, j)
 
 	switch {
 	case problem.refusal != nil:
-		return nil, retirement.RowUnreadable, problem.refusal.Why
+		return nil, retirement.RowUnreadable, retireReportWhose(ctx, bounded, problem.refusal.Why)
 	case problem.pending != "":
-		return nil, retirement.RowUnreadable, problem.pending
+		return nil, retirement.RowUnreadable, retireReportWhose(ctx, bounded, problem.pending)
 	case problem.cause != nil:
 		return nil, retirement.RowUnreadable, retireReportLedgerWhy(ctx, bounded, problem.cause,
 			"the ledger could not be opened through the journal's locator")
 	}
 
-	defer func() { _ = db.Close() }()
-
-	snapshot, err := rollout.New(db).StatusSnapshot(bounded)
-	if err != nil {
-		return nil, retirement.RowUnreadable, retireReportLedgerWhy(ctx, bounded, err, "the retirement row could not be read")
-	}
-
-	return rowFromSnapshot(snapshot.Binding, snapshot.Retirement, j.Deployment, j.Retiring)
+	return readRetireReportSnapshot(ctx, bounded, db, j.Deployment, j.Retiring)
 }
 
 // readRetireRow reads the row for the dry run and classifies it for THIS
@@ -1294,7 +1303,7 @@ func readRetireRowByLocator(ctx context.Context, j retirement.Journal) (*retireR
 // stopped SQLite ledger creates the -wal and -shm sidecars owned by whoever
 // opened it, and root-owned sidecars keep the service from reopening it.
 func readRetireRow(ctx context.Context, cfg *config.Config, m retireMode) (*retireReportRow, retirement.RowFact, string) {
-	bounded, cancel := context.WithTimeout(ctx, retireReportLedgerBound)
+	bounded, cancel := retireReportTimeout(ctx, retireReportLedgerBound)
 	defer cancel()
 
 	if err := bounded.Err(); err != nil {
@@ -1334,36 +1343,52 @@ func readRetireRow(ctx context.Context, cfg *config.Config, m retireMode) (*reti
 		}
 	}
 
-	db, err := openStateInspect(bounded, cfg, dsn)
+	db, err := retireReportOpen(bounded, cfg, dsn)
 	if err != nil {
 		return nil, retirement.RowUnreadable, retireReportLedgerWhy(ctx, bounded, err,
 			"the ledger could not be opened for the report")
 	}
 
-	defer func() { _ = db.Close() }()
-
 	// THE SAME READ THE OWNER'S REPORT MAKES: the status snapshot, whose row
 	// is read only under a binding, so root and the owner answer alike for
 	// an unbound ledger (could-not-tell: a row keyed by a deployment the
 	// ledger is not bound to cannot be associated with this host).
-	snapshot, err := rollout.New(db).StatusSnapshot(bounded)
-	if err != nil {
-		return nil, retirement.RowUnreadable, retireReportLedgerWhy(ctx, bounded, err, "the retirement row could not be read")
-	}
-
-	return rowFromSnapshot(snapshot.Binding, snapshot.Retirement, identity, m.retiringHost)
+	return readRetireReportSnapshot(ctx, bounded, db, identity, m.retiringHost)
 }
 
-// retireReportLedgerWhy keeps a failed read's evidence and names whose budget
-// ended it. Cancellation must be the whole error: an expired context beside
-// a binding mismatch or a failed close cannot erase that fault. The caller's
-// ending takes precedence when both contexts have ended, as in the tail.
-func retireReportLedgerWhy(outer, bounded context.Context, err error, doing string) string {
-	why := doing + ": " + state.Describe(err)
-	if !state.OnlyCancellation(err) {
-		return why
+// THE CLOSE IS PART OF THE ANSWER. Its failure is kept beside a failed read,
+// never discarded or mistaken for that read's cause. Even a successful read
+// cannot establish absence after its budget ended in rollback or cleanup.
+func readRetireReportSnapshot(outer, bounded context.Context, db *state.DB, identity, host string,
+) (*retireReportRow, retirement.RowFact, string) {
+	snapshot, err := retireReportSnapshot(bounded, db)
+	closed := retireReportClose(db)
+	if closed != nil {
+		err = errors.Join(err, fmt.Errorf("close the ledger after the row observation: %w", closed))
 	}
 
+	if err == nil {
+		err = bounded.Err()
+	}
+
+	if err != nil {
+		return nil, retirement.RowUnreadable, retireReportLedgerWhy(outer, bounded, err, "the retirement row could not be read")
+	}
+
+	return rowFromSnapshot(snapshot.Binding, snapshot.Retirement, identity, host)
+}
+
+// retireReportLedgerWhy keeps the failure AND whose budget has ended. An
+// expired context beside a binding mismatch or a failed close does not prove
+// it caused that fault, and neither fact erases the other. The caller's ending
+// takes precedence when both contexts have ended, as in the tail.
+func retireReportLedgerWhy(outer, bounded context.Context, err error, doing string) string {
+	return retireReportWhose(outer, bounded, doing+": "+state.Describe(err))
+}
+
+// retireReportWhose appends whose budget has ended to a reason that is already
+// a sentence, so an answer the open composed itself is not said twice.
+func retireReportWhose(outer, bounded context.Context, why string) string {
 	switch {
 	case outer.Err() != nil:
 		return why + "; the caller's context ended"
@@ -1413,6 +1438,9 @@ func readRetireRowAsOwner(outer, bounded context.Context, uid, gid uint32, ident
 			fmt.Sprintf("the owner's report exited %d while its context ended", code))
 	case code != 0:
 		return nil, retirement.RowUnreadable, fmt.Sprintf("`billet rollout status --json` as the ledger's owner exited %d", code)
+	case bounded.Err() != nil:
+		return nil, retirement.RowUnreadable, retireReportLedgerWhy(outer, bounded, bounded.Err(),
+			"the owner's report returned after its context ended")
 	}
 
 	var report rolloutStatusReport
@@ -1435,6 +1463,10 @@ func readRetireRowAsOwner(outer, bounded context.Context, uid, gid uint32, ident
 	if rr := report.Retirement; rr != nil {
 		row = &state.Retirement{Deployment: identity, Retiring: rr.Retiring, Survivor: rr.Survivor, Run: rr.Run, State: rr.State,
 			TransitionID: rr.TransitionID, ReservedAt: rr.ReservedAt}
+	}
+
+	if err := bounded.Err(); err != nil {
+		return nil, retirement.RowUnreadable, retireReportLedgerWhy(outer, bounded, err, "classify the owner's report")
 	}
 
 	return rowFromSnapshot(binding, row, identity, m.retiringHost)

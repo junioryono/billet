@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/retirement"
+	"github.com/junioryono/billet/internal/rollout"
 	"github.com/junioryono/billet/internal/state"
 )
 
@@ -314,10 +317,9 @@ func TestTheDryRunReportsTheJournalsHostsRatherThanTheInvocations(t *testing.T) 
 	}
 }
 
-// ONE BOUND COVERS EITHER ROUTE TO THE ROW. Its expiry leaves a local journal
-// visible and the command successful, because a caller can recover from that
-// record without the ledger; a deadline is never evidence of an absent row.
-func TestTheDryRunReportsTheJournalWhenTheRowObservationBoundEnds(t *testing.T) {
+// AN OBSERVATION WHOSE BUDGET ENDED BEFORE ENTRY ASKS NOTHING. Its journal
+// still answers locally; this case alone proves nothing about a running read.
+func TestTheDryRunReportsTheJournalWhenTheRowBoundEndedBeforeEntry(t *testing.T) {
 	for _, locator := range []bool{false, true} {
 		name := "through the configuration"
 		if locator {
@@ -362,6 +364,319 @@ func TestTheDryRunReportsTheJournalWhenTheRowObservationBoundEnds(t *testing.T) 
 			}
 		})
 	}
+}
+
+// ONE BOUND REACHES THE WORK ON EITHER ROUTE. The real open and its binding
+// verification, and then the snapshot, receive that context, never the
+// caller's still-live one. A SUCCESS RETURNED LATE IS NOT EVIDENCE: on the
+// ordinary route the successful snapshot holds no row, and must not publish
+// absence. Each seam ends the budget only after that operation was entered.
+func TestTheDryRunReportsTheJournalWhenTheRowObservationBoundEnds(t *testing.T) {
+	for _, locator := range []bool{false, true} {
+		for _, step := range []string{"open and binding", "snapshot", "successful snapshot", "successful close"} {
+			name := "configuration/" + step
+			if locator {
+				name = "locator/" + step
+			}
+
+			t.Run(name, func(t *testing.T) {
+				f, phase := retireObservationFixture(t, locator)
+				expire := pinRetireObservationDeadline(t)
+				savedOpen, savedLocator := retireReportOpen, retireReportOpenByLocator
+				savedSnapshot, savedClose := retireReportSnapshot, retireReportClose
+				t.Cleanup(func() {
+					retireReportOpen, retireReportOpenByLocator = savedOpen, savedLocator
+					retireReportSnapshot, retireReportClose = savedSnapshot, savedClose
+				})
+
+				opens, reads, closes := 0, 0, 0
+				var observed context.Context
+
+				retireReportOpen = func(ctx context.Context, cfg *config.Config, dsn string) (*state.DB, error) {
+					opens++
+					db, err := savedOpen(ctx, cfg, dsn)
+					mustOK(t, err)
+					// THE HANDLE STILL BELONGS TO THE READER. Returning it late
+					// cannot evade the close or turn the next read into absence.
+					if step == "open and binding" {
+						expire(ctx)
+					}
+
+					return db, nil
+				}
+				retireReportOpenByLocator = func(ctx context.Context, j retirement.Journal) (*state.DB, ledgerProblem) {
+					opens++
+					db, problem := savedLocator(ctx, j)
+					if problem.refusal != nil || problem.pending != "" || problem.cause != nil || db == nil {
+						t.Fatalf("the locator did not open and verify the ledger: %+v", problem)
+					}
+					if step == "open and binding" {
+						expire(ctx)
+					}
+
+					return db, problem
+				}
+				retireReportSnapshot = func(ctx context.Context, db *state.DB) (rollout.StatusSnapshot, error) {
+					reads++
+					observed = ctx
+					if err := ctx.Err(); err != nil && step != "open and binding" {
+						t.Fatalf("the budget ended before the snapshot was entered: %v", err)
+					}
+
+					if step == "snapshot" {
+						expire(ctx)
+					}
+
+					if step == "open and binding" || step == "snapshot" {
+						snapshot, err := savedSnapshot(ctx, db)
+						if !errors.Is(err, context.DeadlineExceeded) {
+							t.Fatalf("the snapshot did not receive the deadline: %v", err)
+						}
+
+						return snapshot, err
+					}
+
+					snapshot, err := savedSnapshot(ctx, db)
+					mustOK(t, err)
+					if snapshot.Binding != f.identity || (!locator && snapshot.Retirement != nil) ||
+						(locator && (snapshot.Retirement == nil || snapshot.Retirement.State != state.RetirementDone)) {
+						t.Fatalf("the successful observation did not establish the case: %+v", snapshot)
+					}
+
+					if step == "successful snapshot" {
+						expire(ctx)
+					}
+
+					return snapshot, nil
+				}
+				retireReportClose = func(db *state.DB) error {
+					closes++
+					mustOK(t, savedClose(db))
+					if step == "successful close" {
+						expire(observed)
+					}
+
+					return nil
+				}
+
+				out, code := f.run(t, "", "--dry-run", "--retiring-host", "control-a")
+				assertRetireObservationUnreadable(t, out, code, phase, locator, true)
+				if opens != 1 || reads != 1 || closes != 1 {
+					t.Fatalf("the observation made %d opens, %d snapshots and %d closes, want one of each", opens, reads, closes)
+				}
+			})
+		}
+	}
+}
+
+// A FAILED CLOSE IS ITS OWN FACT, beside a failed read or an ended budget.
+// Neither the snapshot's success nor another failure can discard it, and the
+// local journal remains usable even when all three facts arrive together.
+func TestTheDryRunKeepsTheCloseFailureBesideTheReadAndItsDeadline(t *testing.T) {
+	for _, locator := range []bool{false, true} {
+		for _, failedRead := range []bool{false, true} {
+			for _, expired := range []bool{false, true} {
+				name := "configuration"
+				if locator {
+					name = "locator"
+				}
+				if failedRead {
+					name += "/failed read"
+				}
+				if expired {
+					name += "/expired"
+				}
+
+				t.Run(name, func(t *testing.T) {
+					f, phase := retireObservationFixture(t, locator)
+					expire := pinRetireObservationDeadline(t)
+					savedSnapshot, savedClose := retireReportSnapshot, retireReportClose
+					t.Cleanup(func() { retireReportSnapshot, retireReportClose = savedSnapshot, savedClose })
+
+					var observed context.Context
+					closes := 0
+
+					retireReportSnapshot = func(ctx context.Context, db *state.DB) (rollout.StatusSnapshot, error) {
+						observed = ctx
+						snapshot, err := savedSnapshot(ctx, db)
+						mustOK(t, err)
+						if failedRead {
+							return rollout.StatusSnapshot{}, errors.New("the snapshot's connection failed")
+						}
+
+						return snapshot, nil
+					}
+					retireReportClose = func(db *state.DB) error {
+						closes++
+						mustOK(t, savedClose(db))
+						if expired {
+							expire(observed)
+						}
+
+						return errors.New("the ledger's pools did not close")
+					}
+
+					out, code := f.run(t, "", "--dry-run", "--retiring-host", "control-a")
+					why := assertRetireObservationUnreadable(t, out, code, phase, locator, expired)
+					if closes != 1 || !strings.Contains(why,
+						"close the ledger after the row observation: the ledger's pools did not close") {
+						t.Fatalf("the close failure was discarded (%d closes): %s", closes, out)
+					}
+					if strings.Contains(why, "the snapshot's connection failed") != failedRead {
+						t.Fatalf("the read's own answer was lost or invented: %s", out)
+					}
+				})
+			}
+		}
+	}
+}
+
+// THE OWNER GETS THE OBSERVATION'S REMAINING BUDGET. Entry is established
+// before it ends; an error, a killed child's exit code and a successful empty
+// report all leave the row unreadable and the journal available locally.
+func TestTheDryRunBoundsTheOwnersRunningReport(t *testing.T) {
+	for _, result := range []string{"error", "exit", "success"} {
+		t.Run(result, func(t *testing.T) {
+			f, phase := retireObservationFixture(t, false)
+			expire := pinRetireObservationDeadline(t)
+			savedEUID, savedOwner, savedReexec := statusEUID, statusOwnerOf, retireReexecCapture
+			t.Cleanup(func() { statusEUID, statusOwnerOf, retireReexecCapture = savedEUID, savedOwner, savedReexec })
+
+			statusEUID = func() int { return 0 }
+			statusOwnerOf = func(string) (uint32, uint32, error) { return 990, 991, nil }
+			calls := 0
+
+			retireReexecCapture = func(ctx context.Context, uid, gid uint32, args []string) ([]byte, int, error) {
+				calls++
+				if uid != 990 || gid != 991 || strings.Join(args, " ") != "rollout status --json --config "+f.cfg {
+					t.Fatalf("the owner's invocation was %d:%d %v", uid, gid, args)
+				}
+
+				expire(ctx)
+
+				switch result {
+				case "error":
+					return nil, 0, ctx.Err()
+				case "exit":
+					return nil, 137, nil
+				default:
+					return mustMarshal(t, rolloutStatusReport{Schema: rolloutStatusSchema,
+						Deployment: rolloutStatusDeployment{Bound: true, ID: f.identity}}), 0, nil
+				}
+			}
+
+			out, code := f.run(t, "", "--dry-run", "--retiring-host", "control-a")
+			why := assertRetireObservationUnreadable(t, out, code, phase, false, true)
+			if calls != 1 {
+				t.Fatalf("the report ran as the owner %d times, want once", calls)
+			}
+			if result == "exit" && !strings.Contains(why, "the owner's report exited 137 while its context ended") {
+				t.Fatalf("the child's exit code was lost: %s", out)
+			}
+		})
+	}
+}
+
+// retireObservationFixture leaves the journal visible on both routes; the
+// locator's ledger is real PostgreSQL, as it is for the completed retirement.
+func retireObservationFixture(t *testing.T, locator bool) (*retireFixture, retirement.Phase) {
+	t.Helper()
+
+	if locator {
+		f := newRequestFixture(t)
+		f.reserve(t)
+		settleRetirement(t, f)
+
+		return f.retireFixture, retirement.PhaseDone
+	}
+
+	f := newRetireFixture(t)
+	f.journalAt(t, retirement.PhaseIntent, "ci-1")
+
+	return f, retirement.PhaseIntent
+}
+
+// retireObservationDeadline ends on demand, with the deadline error and Done
+// signal a real timeout supplies. The seam avoids a race between fixture I/O
+// and a short timer: the budget ends only once the operation has entered.
+type retireObservationDeadline struct {
+	context.Context
+	at time.Time
+}
+
+func (c *retireObservationDeadline) Deadline() (time.Time, bool) { return c.at, true }
+
+func (c *retireObservationDeadline) Err() error {
+	if errors.Is(context.Cause(c.Context), context.DeadlineExceeded) {
+		return context.DeadlineExceeded
+	}
+
+	return c.Context.Err()
+}
+
+func pinRetireObservationDeadline(t *testing.T) func(context.Context) {
+	t.Helper()
+
+	saved := retireReportTimeout
+	t.Cleanup(func() { retireReportTimeout = saved })
+
+	var bounded *retireObservationDeadline
+	var end context.CancelCauseFunc
+
+	retireReportTimeout = func(parent context.Context, within time.Duration) (context.Context, context.CancelFunc) {
+		if bounded != nil || within != retireReportLedgerBound {
+			t.Fatalf("the observation replaced or changed its one budget: %s", within)
+		}
+
+		ctx, cancel := context.WithCancelCause(parent)
+		bounded = &retireObservationDeadline{Context: ctx, at: time.Now().Add(within)}
+		end = cancel
+
+		return bounded, func() { cancel(context.Canceled) }
+	}
+
+	return func(ctx context.Context) {
+		t.Helper()
+
+		if bounded == nil || ctx != bounded || ctx.Err() != nil {
+			t.Fatalf("the operation did not enter with the observation's live context: %v", ctx)
+		}
+
+		end(context.DeadlineExceeded)
+		select {
+		case <-ctx.Done():
+		default:
+			t.Fatal("the running operation did not receive the deadline's Done signal")
+		}
+		if ctx.Err() != context.DeadlineExceeded {
+			t.Fatalf("the running operation received %v, want deadline exceeded", ctx.Err())
+		}
+	}
+}
+
+func assertRetireObservationUnreadable(t *testing.T, out string, code int, phase retirement.Phase,
+	settled, expired bool,
+) string {
+	t.Helper()
+
+	m := retireAnswer(t, out)
+	if code != 0 || m["outcome"] != retireOutcomeReported || m["row_fact"] != string(retirement.RowUnreadable) || m["row"] != nil {
+		t.Fatalf("the failed observation stopped the report or answered a row: %s", out)
+	}
+
+	why, ok := m["why"].(string)
+	want := "the retirement row observation exceeded retireReportLedgerBound (" + retireReportLedgerBound.String() + ")"
+	if !ok || why == "" || strings.Contains(why, want) != expired || strings.Contains(why, "the caller's context ended") {
+		t.Fatalf("the observation's diagnostic did not account for its budget (expired %t): %s", expired, out)
+	}
+
+	journal := asMap(m["journal"])
+	if journal["phase"] != string(phase) || journal["settled"] != settled || journal["transition_id"] != retireTestID ||
+		m["state"] != string(phase) {
+		t.Fatalf("the failed observation hid the local journal: %s", out)
+	}
+
+	return why
 }
 
 // THE CALLER'S ENDING IS ITS OWN FACT. A cancelled caller must not be told
