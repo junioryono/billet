@@ -91,6 +91,8 @@ func retireRequest(ctx context.Context, m retireMode) (any, *retireRefusal) {
 			report.State = retireHostState(stateNothingRetire)
 		case *retireTailAnswer:
 			report.State = retireHostState(stateNothingRetire)
+		case *retireDoneAnswer:
+			report.State = retireHostState(stateNothingRetire)
 		}
 
 		return answer, nil
@@ -155,12 +157,21 @@ func retireRequestUnder(ctx context.Context, m retireMode) (any, *retireRefusal)
 
 	// THE JOURNAL IS READ BEFORE THE CONFIGURATION, because past the archive
 	// there may be no configuration to read and no identity at its configured
-	// path: such a resume reads both from the journal's locator, which is the
-	// tail's reader and not in this binary yet, and it is refused here rather
-	// than met below as a missing file.
+	// path: such a run reads both from what the journal recorded, and one this
+	// binary cannot yet drive from there is refused here rather than met below
+	// as a missing file.
 	j, journalFact, r := readRetireJournal()
 	if r != nil {
 		return nil, r
+	}
+
+	// A `done` JOURNAL IS ANSWERED FROM THE JOURNAL ITSELF, before any
+	// configuration is read and before any ledger is opened: the host it
+	// describes has no identity at its configured path and, when it kept no
+	// node, no configuration at all. This is every later converge of a retired
+	// host, and the run that finishes a tail another holder left.
+	if journalFact == retirement.JournalFactDone {
+		return retireDone(ctx, m, root, dir, shape, j)
 	}
 
 	if r := refuseResumePastTheArchive(j, journalFact); r != nil {
@@ -395,18 +406,15 @@ func requirePreparedHost(obs *installedConfigObservation) *retireRefusal {
 	return nil
 }
 
-// refuseResumePastTheArchive is this binary's boundary: a transition is driven
-// to done by the run that recorded its intent, and a resume is admitted while
-// the host still holds what the request read — the configured identity
-// directory and an installed configuration with a server section. Past the
-// archive both are gone by design, and the reader that works from the
-// journal's locator alone is the tail's.
+// refuseResumePastTheArchive is this binary's boundary for an INCOMPLETE
+// transition: a resume is admitted while the host still holds what the request
+// read — the configured identity directory and an installed configuration with
+// a server section. Past the archive both are gone by design, and the reader
+// that drives the remaining phases from the journal's locator alone is the
+// next change; such a host is refused by name, with nothing touched, until
+// then. A journal at `done` is past this boundary: it is answered from the
+// journal itself, above.
 func refuseResumePastTheArchive(j retirement.Journal, fact retirement.JournalFact) *retireRefusal {
-	if fact == retirement.JournalFactDone {
-		return atRetirePhase(j, retireUnknown(retireReasonPhase, "this host's retirement is at done; the tail that "+
-			"completes the ledger row, acknowledges it and clears the guard's marker is not in this binary yet", ""))
-	}
-
 	if fact != retirement.JournalFactIncomplete {
 		return nil
 	}
@@ -706,10 +714,12 @@ func dispatchRetire(row state.Retirement, present bool, journal retirement.Journ
 		return d, retireRefuse(retireReasonReservation, "this host holds no reservation; `billet server retire --reserve` writes "+
 			"one before any report is collected", "")
 	case retirement.DispatchCompleteRow, retirement.DispatchDone:
-		// The journal's own boundary refuses a `done` journal before any
-		// configuration is read; this keeps the dispatch total.
-		return d, retireUnknown(retireReasonPhase, "this host's retirement is at done; the tail that completes the ledger "+
-			"row, acknowledges it and clears the guard's marker is not in this binary yet", "")
+		// UNREACHABLE BY CONSTRUCTION: a `done` journal is answered before any
+		// ledger is opened, so the row is never read beside one. The cell is
+		// kept because the dispatch is total, and it says what would have had
+		// to go wrong rather than pretending to act.
+		return d, retireUnknown(retireReasonPhase, "this host's retirement is at done and the ledger's row was read "+
+			"anyway, which no step of the protocol does", "the runbook in docs/operating/upgrades.md")
 	case retirement.DispatchRefusedReserved:
 		return d, retireRefuse(retireReasonReserved, fmt.Sprintf("this deployment's retirement is reserved by %s (run %s, state %s, "+
 			"since %s); one controller retires at a time", row.Retiring, row.Run, row.State, row.ReservedAt), "")

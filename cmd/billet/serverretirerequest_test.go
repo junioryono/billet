@@ -26,6 +26,9 @@ type requestFixture struct {
 	*retireFixture
 	unitsDir string
 	caPEM    string
+	// dsn is the ledger this fixture's host reaches, kept so a case can take
+	// it away and give it back.
+	dsn string
 	// svc is the service manager the transition stops, disables, enables and
 	// restarts through, recording the order it did so in.
 	svc *fakeConverger
@@ -51,7 +54,7 @@ func newRequestFixture(t *testing.T) *requestFixture {
 	t.Helper()
 
 	dsn := requireBackupPostgres(t)
-	f := &requestFixture{retireFixture: newRetireFixture(t)}
+	f := &requestFixture{retireFixture: newRetireFixture(t), dsn: dsn}
 
 	// The identity directory is this host's own, on PostgreSQL and
 	// active-passive, with an authority the survivor must share.

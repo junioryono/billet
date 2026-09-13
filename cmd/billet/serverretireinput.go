@@ -444,4 +444,5 @@ const (
 	retireReasonArchive          = "archive"
 	retireReasonRewrite          = "rewrite"
 	retireReasonRestart          = "restart"
+	retireReasonPostcondition    = "postcondition"
 )

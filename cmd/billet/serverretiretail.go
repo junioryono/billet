@@ -67,6 +67,9 @@ type retireTailAnswer struct {
 // The words the tail answers with.
 const (
 	retireOutcomeRetired = "retired"
+	// retireOutcomeUnchanged is a converge over a host whose retirement is
+	// finished and settled: nothing was taken and nothing was written.
+	retireOutcomeUnchanged = "unchanged"
 
 	retireRowDone    = "done"
 	retireRowAlready = "already"
@@ -473,7 +476,12 @@ func retireDeadlinePending(outer, bounded context.Context, err error) string {
 	// cleanup that failed — and billet's own opens join their startup failure
 	// with their close — so reporting such a tree as an expiry would throw the
 	// rest of the evidence away.
-	if !errors.Is(err, context.DeadlineExceeded) || !state.OnlyCancellation(err) {
+	//
+	// THE BOUNDED QUESTION IS ASKED FIRST, and the order is the point:
+	// `OnlyCancellation` walks the tree under a budget, so an error whose
+	// causes form a cycle ends there; `errors.Is` recurses without one and
+	// would not return on such a tree. Past that answer the tree is finite.
+	if !state.OnlyCancellation(err) || !errors.Is(err, context.DeadlineExceeded) {
 		return ""
 	}
 

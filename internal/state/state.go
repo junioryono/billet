@@ -651,7 +651,10 @@ func Unreachable(err error) bool {
 		return false
 	}
 
-	found := reachEvidenceOf(err)
+	found, whole := reachEvidenceOf(err)
+	if !whole {
+		return false
+	}
 
 	// A CANCELLATION DOMINATES THE TRANSPORT EVIDENCE, because an attempt that
 	// was cut short did not establish anything: pgx reports a connect that ran
@@ -677,7 +680,7 @@ func OnlyCancellation(err error) bool {
 
 	only := true
 
-	walkCauses(err, func(cause error) {
+	whole := walkCauses(err, func(cause error) {
 		// ONLY THE LEAVES ARE ASKED. Every wrapper and every `errors.Join`
 		// above a cancellation matches `errors.Is` for it, so judging nodes
 		// would read a join of a deadline and a refusal as a deadline.
@@ -685,12 +688,24 @@ func OnlyCancellation(err error) bool {
 			return
 		}
 
-		if !errors.Is(cause, context.DeadlineExceeded) && !errors.Is(cause, context.Canceled) {
+		if !isCancellation(cause) {
 			only = false
 		}
 	})
 
-	return only
+	return only && whole
+}
+
+// isCancellation asks whether THIS cause is a context ending, by identity
+// rather than by `errors.Is`.
+//
+// EVERY TEST IN THE WALK IS NODE-LOCAL, and this is the one that has to be
+// said out loud: `errors.Is` searches the subtree recursively, so on an error
+// whose causes form a cycle it does not return — and it would do that INSIDE
+// the walk, before the walk's own budget could stop anything. The walk reaches
+// every wrapped cause itself, so asking each node what it IS loses nothing.
+func isCancellation(err error) bool {
+	return err == context.DeadlineExceeded || err == context.Canceled //nolint:errorlint,err113 // node-local by design; see above
 }
 
 func hasCauses(err error) bool {
@@ -713,10 +728,10 @@ type reachEvidence struct {
 	cancelled bool
 }
 
-func reachEvidenceOf(err error) reachEvidence {
+func reachEvidenceOf(err error) (reachEvidence, bool) {
 	var found reachEvidence
 
-	walkCauses(err, func(cause error) {
+	whole := walkCauses(err, func(cause error) {
 		//nolint:errorlint // each cause is asked what it IS; the walk reaches what it wraps on its own
 		switch typed := cause.(type) {
 		case *pgconn.PgError:
@@ -742,13 +757,13 @@ func reachEvidenceOf(err error) reachEvidence {
 		// A CANCELLATION IS ITS OWN EVIDENCE, and it is taken before the
 		// transport shapes below because pgx's errTimeout wraps one while
 		// satisfying net.Error.
-		if errors.Is(cause, context.DeadlineExceeded) || errors.Is(cause, context.Canceled) {
+		if isCancellation(cause) {
 			found.cancelled = true
 
 			return
 		}
 
-		if errors.Is(cause, driver.ErrBadConn) || errors.Is(cause, io.ErrUnexpectedEOF) {
+		if cause == driver.ErrBadConn || cause == io.ErrUnexpectedEOF { //nolint:errorlint,err113 // node-local by design; the walk reaches what this wraps
 			found.out = true
 
 			return
@@ -759,29 +774,56 @@ func reachEvidenceOf(err error) reachEvidence {
 		}
 	})
 
-	return found
+	return found, whole
 }
+
+// maxErrorCauses bounds a walk of an error tree. Nothing in billet builds a
+// tree anywhere near this deep, and a cycle — an error whose `Unwrap` returns
+// something above it — is the shape a bound exists for: without one the walk
+// does not end, and a classifier that hangs is worse than one that says it
+// could not tell.
+const maxErrorCauses = 256
 
 // walkCauses visits err and every cause under it, through both shapes of
 // unwrapping: the single cause `%w` produces and the several `errors.Join`
-// does.
-func walkCauses(err error, visit func(error)) {
+// does. It reports whether it saw the WHOLE tree; a walk that ran out of
+// budget has seen part of one, and a verdict from part of a tree is not one
+// its callers may act on.
+func walkCauses(err error, visit func(error)) bool {
+	budget := maxErrorCauses
+
+	return walkCausesWithin(err, visit, &budget)
+}
+
+func walkCausesWithin(err error, visit func(error), budget *int) bool {
 	for err != nil {
+		if *budget <= 0 {
+			return false
+		}
+
+		*budget--
+
 		visit(err)
 
 		switch unwrapped := err.(type) { //nolint:errorlint // this IS the unwrapper: it visits every cause rather than searching for one
 		case interface{ Unwrap() error }:
 			err = unwrapped.Unwrap()
 		case interface{ Unwrap() []error }:
+			whole := true
+
 			for _, cause := range unwrapped.Unwrap() {
-				walkCauses(cause, visit)
+				if !walkCausesWithin(cause, visit, budget) {
+					whole = false
+				}
 			}
 
-			return
+			return whole
 		default:
-			return
+			return true
 		}
 	}
+
+	return true
 }
 
 // unreachableSQLStates is the CLOSED LIST of conditions the server itself

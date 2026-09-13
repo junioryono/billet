@@ -809,3 +809,32 @@ func TestTheReachVerdictIsTakenFromTheWholeTree(t *testing.T) {
 		})
 	}
 }
+
+// A CYCLE IN AN ERROR TREE IS A WALK THAT DOES NOT END, and a classifier that
+// hangs is worse than one that says it could not tell. Nothing in billet
+// builds one; a driver or a library can.
+func TestTheReachVerdictSurvivesACycle(t *testing.T) {
+	loop := &loopingError{}
+	loop.cause = loop
+
+	// Both answers are the conservative one: nothing is claimed about reaching
+	// a ledger, and a cancellation is not claimed to be the whole of it.
+	if Unreachable(loop) {
+		t.Fatal("a cyclic error reads as unreachable")
+	}
+
+	if OnlyCancellation(loop) {
+		t.Fatal("a cyclic error reads as a cancellation")
+	}
+
+	// AND A CYCLE UNDER A REAL CAUSE does not make its evidence usable either.
+	if Unreachable(errors.Join(&pgconn.PgError{Code: "57P01"}, loop)) {
+		t.Fatal("a tree whose walk could not finish answered from the part it saw")
+	}
+}
+
+type loopingError struct{ cause error }
+
+func (*loopingError) Error() string { return "a cause that is its own cause" }
+
+func (e *loopingError) Unwrap() error { return e.cause }
