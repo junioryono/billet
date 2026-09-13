@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -1182,7 +1183,7 @@ func retireDryRun(ctx context.Context, m retireMode) (any, *retireRefusal) {
 			Retiring: j.Provenance.Retiring, Survivor: j.Provenance.Survivor}
 	case retirement.JournalAbsent:
 	default:
-		hold("The retirement journal could not be judged: " + err.Error() + ".")
+		hold("the retirement journal could not be judged: " + err.Error())
 	}
 
 	st, statusPresence, err := retirement.ReadStatus()
@@ -1204,7 +1205,7 @@ func retireDryRun(ctx context.Context, m retireMode) (any, *retireRefusal) {
 		// latter may route into the journal's repair of its publication.
 		report.StatusPresence = "unreadable"
 		report.StatusWhy = err.Error()
-		hold("The authority status could not be judged: " + err.Error() + ".")
+		hold("the authority status could not be judged: " + err.Error())
 	}
 
 	switch _, err := os.Lstat(retirement.StagePath()); {
@@ -1214,22 +1215,22 @@ func retireDryRun(ctx context.Context, m retireMode) (any, *retireRefusal) {
 		report.Stage = "absent"
 	default:
 		report.Stage = "unreadable"
-		hold("The stage could not be examined: " + err.Error() + ".")
+		hold("the stage could not be examined: " + err.Error())
 	}
 
 	shape, err := classifyClaim()
 	if err != nil {
 		shape.Kind = claimUnknown
-		hold("The guard could not be examined: " + err.Error() + ".")
+		hold("the guard could not be examined: " + err.Error())
 	}
 
 	report.Guard = string(shape.Kind)
 
 	switch {
 	case shape.Kind == claimUnknown || shape.Kind == claimUnpublished:
-		hold(fmt.Sprintf("The guard's claim is %s; its ownership could not be established.", shape.Kind))
+		hold(fmt.Sprintf("the guard's claim is %s; its ownership could not be established", shape.Kind))
 	case shape.RecordErr != "":
-		hold("The guard's record could not be read: " + shape.RecordErr + ".")
+		hold("the guard's record could not be read: " + shape.RecordErr)
 	}
 
 	if shape.Kind == claimGuard && shape.RecordErr == "" {
@@ -1265,17 +1266,17 @@ func retireDryRun(ctx context.Context, m retireMode) (any, *retireRefusal) {
 	}
 
 	if configPresence == "unreadable" {
-		hold("The installed configuration could not be read.")
+		hold("the installed configuration could not be read")
 	}
 
 	if m.expectedHolder != "" {
 		switch {
 		case shape.Kind != claimGuard:
-			hold("The expected converge guard is gone.")
+			hold("the expected converge guard is gone")
 		case shape.Guard.Holder != m.expectedHolder:
-			hold(fmt.Sprintf("The guard names holder %s, not the expected holder %s.", shape.Guard.Holder, m.expectedHolder))
+			hold(fmt.Sprintf("the guard names holder %s, not the expected holder %s", shape.Guard.Holder, m.expectedHolder))
 		case m.expectedGuard != "" && shape.Guard.ID != m.expectedGuard:
-			hold("The guard id differs from the id established by preparation.")
+			hold("the guard id differs from the id established by preparation")
 		}
 	}
 
@@ -1309,7 +1310,16 @@ func retireDryRun(ctx context.Context, m retireMode) (any, *retireRefusal) {
 		// retirement exclusion only, and a preview acquired no guard at all.
 		if m.expectedHolder != "" && shape.Pointer && report.Route != "ordinary" {
 			report.Route = "hold"
-			report.RouteWhy = "The guard carries a binary transaction's pointer; retirement cannot run inside it."
+			report.RouteWhy = "the guard carries a binary transaction's pointer; retirement cannot run inside it"
+		}
+
+		// THE FIRST MUTATION REQUIRES A SETTLED, INTACT GUARD. A reused
+		// preparation may leave the acquirer's cleanup window open; an
+		// interrupted rewrite is no permission to import an account either.
+		if m.expectedHolder != "" && (report.Route == "new-request" || report.Route == "continue" || report.Route == "cancel") {
+			if r := judgeGuardShape(shape, m.expectedHolder); r != nil {
+				report.Route, report.RouteWhy = "hold", r.Why
+			}
 		}
 	}
 
@@ -1352,6 +1362,15 @@ func retireRoute(report *retireReport, cfg *config.Config, requested bool) (stri
 			return retireNewRequestRoute(report, cfg)
 		}
 
+		// CANCELLATION ADOPTS BEFORE IT ABANDONS. The reservation must be
+		// adoptable under the installed pair before the role changes anything.
+		if report.Config != "present" || cfg == nil || cfg.Server == nil {
+			return "hold", "the reservation cannot be adopted under this configuration: no installed server configuration is readable"
+		}
+		if r := retirePairEligibility(cfg); r != nil {
+			return "hold", "the reservation cannot be adopted under this configuration: " + r.Why
+		}
+
 		return "cancel", "this host holds a reservation nothing has started and the inventory no longer requests a retirement"
 	case retirement.RowIntentMine, retirement.RowDoneMine:
 		return "hold", "this host's retirement row is past its reservation and no journal records the transition"
@@ -1363,37 +1382,56 @@ func retireRoute(report *retireReport, cfg *config.Config, requested bool) (stri
 
 		return "ordinary", ""
 	case retirement.RowUnreadable:
-		// A SKIPPED READ WITHHOLDS NOTHING ONLY ON POSITIVE LOCAL EVIDENCE.
-		// Without both absences, a lost identity may hide a commissioned
-		// controller and a reservation whose owner cannot be recovered here.
+		// A LOST IDENTITY DOES NOT ERASE A SHARED RESERVATION. A reservation
+		// needs no authority and publishes no local retirement artefact, so
+		// absence beside an installed server cannot prove that no row exists.
 		nodeOnly := report.Config == "present" && report.InstalledRoles == "node"
-		uncommissioned := report.Config == "present" &&
-			(report.InstalledRoles == "server" || report.InstalledRoles == "both") &&
-			report.Identity == "absent" && report.Authority == "absent"
 
-		// NEITHER EXCEPTION IS A HOST THERE IS ANYTHING TO RETIRE ON, and that
-		// is why each of them may converge past an unreadable ledger at all: a
-		// node-only installation has no controller, and an uncommissioned one
-		// has no deployment — no identity, so no row keyed to this host, and
-		// nothing a reservation could name. A request over either is refused by
-		// name rather than routed to a reservation that would fail for a reason
-		// the operator would have to work backwards from.
 		switch {
-		case (nodeOnly || uncommissioned) && !requested:
+		case nodeOnly && !requested:
 			return "ordinary", ""
 		case nodeOnly:
 			return "hold", "this host's installed configuration has a node and no server, and a controller's " +
 				"retirement is not defined for it"
-		case uncommissioned:
-			return "hold", "this host holds a server configuration and no deployment identity, so it has not been " +
-				"commissioned and there is no controller to retire"
+		case report.Config == "absent":
+			// THE PACKAGED LOCATION, NOT THE INVOKING USER'S. `config`'s own
+			// default state directory is under `os.UserConfigDir()`, which is
+			// root's on a converge and nobody's installation; the packaged
+			// layout fixes the server's state under the retirement root, and
+			// that is the one place a host could have been commissioned
+			// without a configuration to name another.
+			//
+			// THE DIRECTORY'S ABSENCE IS THE PROOF, not missing files inside
+			// it: `Lstat` sees a dangling link as something still standing and
+			// reads no identity or authority contents.
+			//
+			// The residual, stated: a host commissioned with a NON-DEFAULT
+			// identity directory whose configuration was then removed by hand
+			// is indistinguishable from a fresh one here, because the only
+			// record of where its state lived was in the file that is gone.
+			// Nothing in a supported flow produces it.
+			dir := retirementServerStateDir()
+			switch _, err := os.Lstat(dir); {
+			case errors.Is(err, fs.ErrNotExist):
+				if requested {
+					return "hold", "this host holds no configuration and nothing at " + dir + ", so there is no " +
+						"controller to retire"
+				}
+
+				return "ordinary", ""
+			case err != nil:
+				return "hold", "the retirement row is unreadable and " + dir + " could not be examined: " + err.Error()
+			default:
+				return "hold", "the retirement row is unreadable and something stands at " + dir + ", so this host may " +
+					"hold a reservation nothing local can rule out"
+			}
 		}
 
 		if report.Identity == "absent" && report.Authority == "present" {
 			return "hold", "the deployment identity is absent beside authority remnants, so this controller is damaged rather than fresh"
 		}
 
-		return "hold", fmt.Sprintf("the retirement row is unreadable and this host is neither node-only nor uncommissioned "+
+		return "hold", fmt.Sprintf("the retirement row is unreadable and this host may hold a reservation nothing local can rule out "+
 			"(identity %s, authority %s): %s", report.Identity, report.Authority, report.Why)
 	default:
 		return "hold", "this combination of records is one this billet does not recognise, and an unrecognised host " +
@@ -1408,6 +1446,10 @@ func retireNewRequestRoute(report *retireReport, cfg *config.Config) (string, st
 		return "hold", "a new retirement needs an installed configuration and this host has none to read"
 	}
 
+	if report.InstalledRoles == "both" {
+		return "unsupported-variant", "this converge does not support retiring a host that keeps a node"
+	}
+
 	if report.InstalledRoles != "server" || cfg.Server == nil {
 		return "hold", fmt.Sprintf("a new retirement needs an installed configuration with a server and no node, and "+
 			"this host's installed roles are %s", retireRolesWord(report.InstalledRoles))
@@ -1419,6 +1461,13 @@ func retireNewRequestRoute(report *retireReport, cfg *config.Config) (string, st
 
 	return "new-request", "the inventory requests a retirement and this installed server-only active-passive PostgreSQL host is eligible"
 }
+
+// retirementServerStateDir is where a packaged installation keeps the server's
+// state, and the one place a host with no configuration could have been
+// commissioned. It is NOT `config.DefaultServerStateDir()`, which resolves
+// under the invoking account's config directory — root's, on a converge — and
+// names no installation at all.
+func retirementServerStateDir() string { return filepath.Join(retirement.Root, "server") }
 
 // retireRolesWord renders the installed roles for a reason, saying when the
 // configuration answered none rather than printing nothing.
@@ -1446,8 +1495,8 @@ func observeRetireIdentity(dir string) (string, string, string) {
 }
 
 // observeRetireAuthority asks only whether remnants exist. A LINK IS STILL
-// A REMNANT, even when its target is gone; only two positive absences admit an
-// uncommissioned host. Neither path is opened for its contents.
+// A REMNANT, even when its target is gone. Absence cannot rule out a shared
+// reservation; neither path is opened for its contents.
 func observeRetireAuthority(dir string) string {
 	fact := "absent"
 

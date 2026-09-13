@@ -109,6 +109,14 @@ func TestTheDryRunTypesTheConfigurationRatherThanRefusingOnIt(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			f := newRetireFixture(t)
 
+			// A CONFIGURATION THAT IS ABSENT MUST NOT BE READ AS A FRESH HOST
+			// HERE: this case is about the configuration's own typed presence,
+			// so the packaged location stands and the route holds for that
+			// reason rather than admitting an install.
+			if c.want == "absent" {
+				mustOK(t, os.MkdirAll(retirementServerStateDir(), 0o700))
+			}
+
 			c.stage(t, f.cfg)
 
 			out, code := f.run(t, "", "--dry-run", "--retiring-host", "control-a")
@@ -287,7 +295,7 @@ func TestTheDryRunHoldsOnAnUnreadableStatus(t *testing.T) {
 	out, code := f.run(t, "", "--dry-run", "--retiring-host", "control-a")
 
 	m := retireAnswer(t, out)
-	assertRetireRoute(t, out, code, "hold", "The authority status could not be judged:")
+	assertRetireRoute(t, out, code, "hold", "the authority status could not be judged:")
 	if m["status_presence"] != "unreadable" {
 		t.Fatalf("an unreadable status was not reported: %s", out)
 	}
@@ -569,7 +577,7 @@ func TestTheDryRunBoundsTheOwnersRunningReport(t *testing.T) {
 	for _, result := range []string{"error", "exit", "success"} {
 		t.Run(result, func(t *testing.T) {
 			f, phase := retireObservationFixture(t, false)
-			expire := pinRetireObservationDeadline(t)
+			entered, expire := pinRetireObservationDeadline(t)
 			savedEUID, savedOwner, savedReexec := statusEUID, statusOwnerOf, retireReexecCapture
 			t.Cleanup(func() { statusEUID, statusOwnerOf, retireReexecCapture = savedEUID, savedOwner, savedReexec })
 
@@ -579,6 +587,7 @@ func TestTheDryRunBoundsTheOwnersRunningReport(t *testing.T) {
 
 			retireReexecCapture = func(ctx context.Context, uid, gid uint32, args []string) ([]byte, int, error) {
 				calls++
+				entered(ctx)
 				if uid != 990 || gid != 991 || strings.Join(args, " ") != "rollout status --json --config "+f.cfg {
 					t.Fatalf("the owner's invocation was %d:%d %v", uid, gid, args)
 				}
@@ -776,9 +785,9 @@ func TestTheDryRunRoutesTheWholeRowAndJournalPartition(t *testing.T) {
 		why       string
 	}{
 		{"absent", "control-a", retirement.RowAbsent, "ordinary", "hold", "PostgreSQL active-passive"},
-		{"reserved", "control-a", retirement.RowReservedMine, "cancel", "hold", "PostgreSQL active-passive"},
-		{"intent", "control-a", retirement.RowIntentMine, "hold", "hold", "past reservation"},
-		{"done", "control-a", retirement.RowDoneMine, "hold", "hold", "past reservation"},
+		{"reserved", "control-a", retirement.RowReservedMine, "hold", "hold", "PostgreSQL active-passive"},
+		{"intent", "control-a", retirement.RowIntentMine, "hold", "hold", "past its reservation"},
+		{"done", "control-a", retirement.RowDoneMine, "hold", "hold", "past its reservation"},
 		{"reserved", "control-b", retirement.RowOtherReserved, "ordinary", "hold", "another host (control-a)"},
 		{"intent", "control-b", retirement.RowOtherIntent, "ordinary", "hold", "another host (control-a)"},
 		{"done", "control-b", retirement.RowDoneOther, "ordinary", "hold", "another host (control-a)"},
@@ -818,8 +827,6 @@ func TestTheDryRunRoutesTheWholeRowAndJournalPartition(t *testing.T) {
 					if requested {
 						args = append(args, "--requested")
 						want = row.requested
-					} else if want == "cancel" {
-						why = "inventory no longer requests"
 					}
 					if phase != "" {
 						want, why = "continue", "readable journal"
@@ -839,7 +846,7 @@ func TestTheDryRunRoutesTheWholeRowAndJournalPartition(t *testing.T) {
 
 // REQUESTED QUALIFIES A NEW REQUEST; it never chooses a journal's route.
 // The same eligible host is ordinary without it and adopts its reservation
-// with it. Installed node custody remains ineligible after either observation.
+// with it. Installed node custody selects the unsupported request variant.
 func TestTheDryRunQualifiesRequestsFromTheInstalledPair(t *testing.T) {
 	f := newRequestFixture(t)
 
@@ -878,7 +885,7 @@ func TestTheDryRunQualifiesRequestsFromTheInstalledPair(t *testing.T) {
 		want, why := "cancel", "inventory no longer requests"
 		if requested {
 			args = append(args, "--requested")
-			want, why = "hold", "installed_roles both"
+			want, why = "unsupported-variant", "keeps a node"
 		}
 		out, code := f.run(t, "", args...)
 		m := assertRetireRoute(t, out, code, want, why)
@@ -892,6 +899,49 @@ func TestTheDryRunQualifiesRequestsFromTheInstalledPair(t *testing.T) {
 		args := append([]string{"--dry-run", "--retiring-host", requestRetiring}, extra...)
 		out, code := f.run(t, "", args...)
 		assertRetireRoute(t, out, code, "unsupported-variant", "retained-node")
+	}
+}
+
+// NODE CUSTODY NAMES THE UNSUPPORTED VARIANT BEFORE PAIR ELIGIBILITY. A
+// fresh request on either backend must not disguise a retained node as a
+// backend or controller-mode refusal.
+func TestTheDryRunNamesAFreshRetainedNodeRequestBeforePairEligibility(t *testing.T) {
+	for _, pair := range []string{"sqlite", "postgres single", "postgres active-passive"} {
+		t.Run(pair, func(t *testing.T) {
+			var f *retireFixture
+			if pair == "sqlite" {
+				f = newRetireFixture(t)
+			} else {
+				f = newRequestFixture(t).retireFixture
+				if pair == "postgres single" {
+					f.cfg = writePostgresConfig(t, f.stateDir)
+				}
+			}
+			body := mustRead(t, f.cfg) + "\nnode:\n  name: node-a\n  server_addr: 127.0.0.1:7717\n" +
+				"  provider: docker\n  state_dir: " + filepath.Join(t.TempDir(), "node") + "\n"
+			writeFile(t, f.cfg, body, 0o600)
+
+			out, code := f.run(t, "", "--dry-run", "--retiring-host", "control-a", "--requested")
+			m := assertRetireRoute(t, out, code, "unsupported-variant", "does not support retiring a host that keeps a node")
+			if m["config"] != "present" || m["installed_roles"] != "both" || m["row_fact"] != string(retirement.RowAbsent) {
+				t.Fatalf("the installed host did not establish a fresh retained-node request: %s", out)
+			}
+		})
+	}
+}
+
+// CANCELLATION MUST ADOPT THE RESERVATION FIRST. A single controller's
+// readable reservation is no permission to send the role to that refusal.
+func TestTheDryRunHoldsCancellationUnderASingleControllerConfiguration(t *testing.T) {
+	f := newRequestFixture(t)
+	f.reserve(t)
+	f.cfg = writePostgresConfig(t, f.stateDir)
+
+	out, code := f.run(t, "", "--dry-run", "--retiring-host", requestRetiring)
+	m := assertRetireRoute(t, out, code, "hold", "reservation cannot be adopted under this configuration")
+	assertRetireRoute(t, out, code, "hold", "controllers are single")
+	if m["config"] != "present" || m["installed_roles"] != "server" || m["row_fact"] != string(retirement.RowReservedMine) {
+		t.Fatalf("the configuration hid the readable reservation: %s", out)
 	}
 }
 
@@ -915,7 +965,7 @@ func TestTheDryRunRecognisesANodeWithoutAttemptingALedgerRead(t *testing.T) {
 		want, why := "ordinary", ""
 		if requested {
 			args = append(args, "--requested")
-			want, why = "hold", "installed_roles node"
+			want, why = "hold", "has a node and no server"
 		}
 		out, code := f.run(t, "", args...)
 		m := assertRetireRoute(t, out, code, want, why)
@@ -930,10 +980,10 @@ func TestTheDryRunRecognisesANodeWithoutAttemptingALedgerRead(t *testing.T) {
 	}
 }
 
-// AN UNMINTED IDENTITY ADMITS ONLY BESIDE TWO POSITIVE AUTHORITY ABSENCES.
-// Each remnant alone, including a dangling link, disproves a fresh host;
+// AN ABSENT IDENTITY DOES NOT RULE OUT A RESERVATION. Authority remnants
+// establish damage, but their absence cannot establish a fresh controller;
 // unreadable identity metadata supplies no absence either.
-func TestTheDryRunSeparatesUncommissionedAndDamagedControllers(t *testing.T) {
+func TestTheDryRunHoldsControllersWhoseIdentityCannotNameTheRow(t *testing.T) {
 	for _, evidence := range []string{"absent", "ca", "marker", "dangling", "fifo", "unreadable identity", "unreadable authority"} {
 		t.Run(evidence, func(t *testing.T) {
 			f := newRetireFixture(t)
@@ -971,10 +1021,7 @@ func TestTheDryRunSeparatesUncommissionedAndDamagedControllers(t *testing.T) {
 					args = append(args, "--requested")
 				}
 				if evidence == "absent" {
-					want, why = "ordinary", ""
-					if requested {
-						want, why = "new-request", "eligible"
-					}
+					why = "may hold a reservation nothing local can rule out"
 				}
 				out, code := f.run(t, "", args...)
 				m := assertRetireRoute(t, out, code, want, why)
@@ -1068,18 +1115,97 @@ func TestTheDryRunHoldsOnlyTheGuardContinuityItWasGiven(t *testing.T) {
 	}
 }
 
+// A MUTATING ROUTE NEEDS A GUARD ITS FIRST CALL CAN USE. The acquirer's
+// cleanup window and an interrupted rewrite each hold a retirement under
+// this converge's guard, while ordinary tasks and standalone previews remain
+// reachable. The observation must neither settle nor repair the record.
+func TestTheDryRunRequiresAMutationReadyGuardOnlyForRetirement(t *testing.T) {
+	for _, route := range []string{"ordinary", "new-request", "continue", "cancel"} {
+		for _, damage := range []string{"preparing", "interrupted rewrite"} {
+			t.Run(route+"/"+damage, func(t *testing.T) {
+				var f *retireFixture
+				rowFact, why := retirement.RowAbsent, ""
+				args := []string{"--dry-run", "--retiring-host", "control-a"}
+				if route == "new-request" || route == "cancel" {
+					request := newRequestFixture(t)
+					f = request.retireFixture
+					if route == "cancel" {
+						request.reserve(t)
+						rowFact, why = retirement.RowReservedMine, "inventory no longer requests"
+					} else {
+						args = append(args, "--requested")
+						why = "eligible"
+					}
+				} else {
+					f = newRetireFixture(t)
+					mustHold(t, "ci-1")
+					if route == "continue" {
+						f.journalAt(t, retirement.PhaseIntent, "ci-1")
+						why = "readable journal"
+					}
+				}
+				rec := f.guard.record(t)
+				rec.ID = retireTestID
+				writeGuardRecordForTest(t, f.guard, rec)
+				heldArgs := append(append([]string{}, args...), "--expected-holder", "ci-1", "--expected-guard", retireTestID)
+				out, code := f.run(t, "", heldArgs...)
+				m := assertRetireRoute(t, out, code, route, why)
+				if m["row_fact"] != string(rowFact) || rec.Preparing {
+					t.Fatalf("the undamaged guard's host did not establish the route: %s", out)
+				}
+
+				temporary := filepath.Join(f.guard.active(), guardTmpName)
+				if _, err := os.Lstat(temporary); !os.IsNotExist(err) {
+					t.Fatalf("the undamaged guard already carries a temporary: %v", err)
+				}
+				if damage == "preparing" {
+					rec.Preparing, rec.Token = true, strings.Repeat("a", 32)
+					writeGuardRecordForTest(t, f.guard, rec)
+				} else {
+					writeFile(t, temporary, "interrupted guard record", 0o600)
+				}
+				recordPath := filepath.Join(f.guard.active(), guardRecordName)
+				before := mustRead(t, recordPath)
+				if planted := f.guard.record(t); planted.Preparing != (damage == "preparing") {
+					t.Fatalf("the record did not establish the preparing fact: %t", planted.Preparing)
+				}
+
+				out, code = f.run(t, "", args...)
+				assertRetireRoute(t, out, code, route, why)
+				out, code = f.run(t, "", heldArgs...)
+				want, clause := "hold", damage
+				if route == "ordinary" {
+					want, clause = "ordinary", ""
+				}
+				assertRetireRoute(t, out, code, want, clause)
+				if after := mustRead(t, recordPath); after != before {
+					t.Fatalf("the classifier settled or rewrote the guard: %s", after)
+				}
+				if damage == "interrupted rewrite" && mustRead(t, temporary) != "interrupted guard record" {
+					t.Fatal("the classifier changed the interrupted rewrite")
+				}
+			})
+		}
+	}
+}
+
 // A BINARY POINTER EXCLUDES EVERY RETIREMENT ROUTE UNDER THE CONVERGE'S
 // GUARD. Ordinary recovery still reaches the tasks that own that pointer,
 // and a standalone preview does not claim continuity it never established.
 func TestTheDryRunKeepsBinaryRecoveryOnTheOrdinaryRoute(t *testing.T) {
 	for _, route := range []string{"ordinary", "cancel", "continue", "unsupported-variant"} {
 		t.Run(route, func(t *testing.T) {
-			f := newRetireFixture(t)
-			mustHold(t, "ci-1")
+			var f *retireFixture
+			if route == "cancel" {
+				request := newRequestFixture(t)
+				request.reserve(t)
+				f = request.retireFixture
+			} else {
+				f = newRetireFixture(t)
+				mustHold(t, "ci-1")
+			}
 			extra := []string{}
 			switch route {
-			case "cancel":
-				f.reserveRow(t, "ci-1")
 			case "continue", "unsupported-variant":
 				f.journalAt(t, retirement.PhaseIntent, "ci-1")
 				if route == "unsupported-variant" {
@@ -1114,9 +1240,8 @@ func TestTheDryRunKeepsBinaryRecoveryOnTheOrdinaryRoute(t *testing.T) {
 	}
 }
 
-// AND THE SAME RULE ON A NEW REQUEST, which needs a COMMISSIONED pair and so
-// cannot be staged beside the routes above: an uncommissioned host is refused
-// by name now, and a host with no ledger to read holds for that instead.
+// AND THE SAME RULE ON A NEW REQUEST: a readable row and an eligible pair
+// cannot admit retirement under a binary transaction's pointer.
 func TestTheDryRunKeepsABinaryPointerOffANewRequest(t *testing.T) {
 	f := newRequestFixture(t)
 
@@ -1242,22 +1367,16 @@ func TestTheNewRetireObservationsCreateAndAcquireNothing(t *testing.T) {
 		return &fakeConverger{}
 	}
 
-	// AND AN UNCOMMISSIONED HOST IS NOT A HOST TO RETIRE. Without a request
-	// it converges ordinarily; with one it is refused by name, because there
-	// is no deployment here — no identity, so no row a reservation could
-	// name — and routing it to one would fail for a reason the operator would
-	// have to work backwards from.
+	// AN INSTALLED CONFIGURATION CANNOT PROVE A NEGATIVE ABOUT THE LEDGER.
+	// Missing identity and authority files leave a reservation possible,
+	// whether or not the inventory still requests its retirement.
 	for _, extra := range [][]string{nil, {"--requested"}} {
 		args := append([]string{"--dry-run", "--retiring-host", "control-a"}, extra...)
-		want, why := "ordinary", ""
-
-		if len(extra) != 0 {
-			want, why = "hold", "has not been commissioned"
-		}
 
 		out, code := f.run(t, "", args...)
-		m := assertRetireRoute(t, out, code, want, why)
-		if m["identity"] != "absent" || m["authority"] != "absent" || m["row_fact"] != string(retirement.RowUnreadable) {
+		m := assertRetireRoute(t, out, code, "hold", "may hold a reservation nothing local can rule out")
+		if m["config"] != "present" || m["installed_roles"] != "server" || m["identity"] != "absent" ||
+			m["authority"] != "absent" || m["row_fact"] != string(retirement.RowUnreadable) {
 			t.Fatalf("the missing directory did not establish the case: %s", out)
 		}
 	}
@@ -1269,35 +1388,117 @@ func TestTheNewRetireObservationsCreateAndAcquireNothing(t *testing.T) {
 	}
 }
 
-// UNCOMMISSIONED DOES NOT MEAN ELIGIBLE FOR RETIREMENT. The installed
-// backend, controller mode and node custody each still qualify the request.
-func TestTheDryRunQualifiesAnUncommissionedRequest(t *testing.T) {
-	for _, clause := range []string{"ledger is sqlite", "controllers are single", "installed_roles both"} {
-		t.Run(clause, func(t *testing.T) {
+// A RESERVATION NEEDS NO CA AND LEAVES NO LOCAL RETIREMENT ARTEFACT. Losing
+// only the identity file cannot erase the row the host already reserved.
+func TestTheDryRunHoldsAReservationWhoseIdentityFileWasLost(t *testing.T) {
+	f := newRequestFixture(t)
+	mustOK(t, os.RemoveAll(wirecert.CADir(f.stateDir)))
+	mustOK(t, os.RemoveAll(wirecert.AuthorityMarkerPath(f.stateDir)))
+	row := f.reserve(t)
+
+	for _, path := range []string{wirecert.CADir(f.stateDir), wirecert.AuthorityMarkerPath(f.stateDir),
+		retirement.JournalPath(), retirement.StatusPath(), retirement.StagePath()} {
+		if _, err := os.Lstat(path); !os.IsNotExist(err) {
+			t.Fatalf("the reservation left a local artefact at %s: %v", path, err)
+		}
+	}
+	if rec := f.guard.record(t); rec.Transition != nil {
+		t.Fatalf("the reservation published a guard marker: %+v", rec.Transition)
+	}
+	mustOK(t, os.Remove(state.DeploymentIDPath(f.stateDir)))
+
+	for _, extra := range [][]string{nil, {"--requested"}} {
+		args := append([]string{"--dry-run", "--retiring-host", requestRetiring}, extra...)
+		out, code := f.run(t, "", args...)
+		m := assertRetireRoute(t, out, code, "hold", "may hold a reservation nothing local can rule out")
+		if m["config"] != "present" || m["installed_roles"] != "server" || m["identity"] != "absent" ||
+			m["authority"] != "absent" || m["row_fact"] != string(retirement.RowUnreadable) {
+			t.Fatalf("the lost identity did not establish the case: %s", out)
+		}
+	}
+
+	// THE LEDGER STILL HOLDS IT. This independent read uses the recorded
+	// deployment, not the lost file the classifier would need to name it.
+	db, err := state.OpenPostgresInspect(t.Context(), f.stateDir, f.dsn)
+	mustOK(t, err)
+	kept, present, readErr := db.ReadRetirement(t.Context(), f.identity)
+	mustOK(t, db.Close())
+	mustOK(t, readErr)
+	if !present || kept.State != state.RetirementReserved || kept.TransitionID != row.TransitionID || kept.Run != requestRun {
+		t.Fatalf("the reservation did not survive the lost identity: present %t, row %+v", present, kept)
+	}
+}
+
+// A FRESH HOST HAS NO CONFIGURATION AND NO DEFAULT IDENTITY DIRECTORY.
+// A directory left after configuration removal is enough to withhold that
+// proof; a failed lookup and a dangling link are never positive absences.
+func TestTheDryRunRequiresTheDefaultIdentityLocationToBeAbsent(t *testing.T) {
+	for _, evidence := range []string{"absent", "directory", "identity", "ca", "marker", "dangling", "fifo", "unreadable"} {
+		t.Run(evidence, func(t *testing.T) {
 			f := newRetireFixture(t)
-			mustOK(t, os.Remove(state.DeploymentIDPath(f.stateDir)))
-			roles := "server"
-			switch clause {
-			case "controllers are single":
-				f.cfg = writePostgresConfig(t, f.stateDir)
-			case "installed_roles both":
-				f.cfg = writeRetirePostgresConfig(t, f.stateDir)
-				body := mustRead(t, f.cfg) + "node:\n  name: node-a\n  server_addr: 127.0.0.1:7717\n" +
-					"  provider: docker\n  state_dir: " + filepath.Join(t.TempDir(), "node") + "\n"
-				writeFile(t, f.cfg, body, 0o600)
-				roles = "both"
+			mustOK(t, os.Remove(f.cfg))
+
+			// THE RETIREMENT ROOT IS THE SEAM, which the fixture already pins,
+			// so no case writes to the machine's actual state directory. The
+			// location is the PACKAGED one and not `config`'s own default,
+			// which resolves under the invoking account's config directory and
+			// names no installation at all.
+			dir := filepath.Join(retirement.Root, "server")
+			if retirementServerStateDir() != dir {
+				t.Fatalf("the packaged location is %s, want %s", retirementServerStateDir(), dir)
 			}
-			for _, requested := range []bool{false, true} {
-				args := []string{"--dry-run", "--retiring-host", "control-a"}
-				want := "ordinary"
-				if requested {
-					args = append(args, "--requested")
-					want = "hold"
+			if _, err := os.Lstat(dir); !os.IsNotExist(err) {
+				t.Fatalf("the default location is not initially absent: %v", err)
+			}
+
+			switch evidence {
+			case "directory", "identity", "ca", "marker":
+				mustOK(t, os.MkdirAll(dir, 0o700))
+				switch evidence {
+				case "identity":
+					writeFile(t, state.DeploymentIDPath(dir), retireTestIdentity+"\n", 0o600)
+				case "ca":
+					mustOK(t, os.Mkdir(wirecert.CADir(dir), 0o700))
+				case "marker":
+					writeFile(t, wirecert.AuthorityMarkerPath(dir), "authority existed", 0o600)
 				}
-				out, code := f.run(t, "", args...)
-				m := assertRetireRoute(t, out, code, want, clause)
-				if m["identity"] != "absent" || m["authority"] != "absent" || m["installed_roles"] != roles {
-					t.Fatalf("the uncommissioned host did not establish the clause: %s", out)
+			case "dangling", "fifo":
+				mustOK(t, os.MkdirAll(filepath.Dir(dir), 0o700))
+				if evidence == "dangling" {
+					mustOK(t, os.Symlink(filepath.Join(t.TempDir(), "missing"), dir))
+				} else {
+					mustOK(t, syscall.Mkfifo(dir, 0o600))
+				}
+			case "unreadable":
+				mustOK(t, os.MkdirAll(base, 0o700))
+				parent := filepath.Dir(dir)
+				mustOK(t, os.Symlink(parent, parent))
+				if _, err := os.Lstat(dir); !errors.Is(err, syscall.ELOOP) {
+					t.Fatalf("the lookup did not fail on the parent loop: %v", err)
+				}
+			}
+
+			out, code := f.run(t, "", "--dry-run", "--retiring-host", "control-a")
+			want, why := "hold", "something stands at the default identity directory"
+			if evidence == "absent" {
+				want, why = "ordinary", ""
+			} else if evidence == "unreadable" {
+				why = "default identity directory could not be examined"
+			}
+			m := assertRetireRoute(t, out, code, want, why)
+			if m["config"] != "absent" || m["installed_roles"] != "" || m["row_fact"] != string(retirement.RowUnreadable) ||
+				m["journal"] != nil || m["status_presence"] != "absent" || m["stage"] != "absent" || m["marker"] != nil {
+				t.Fatalf("the default location's evidence did not establish the case: %s", out)
+			}
+			paths := []string{f.cfg, f.guard.root, retirement.GlobalLockPath(), retirement.RetiredDir()}
+			if evidence == "absent" {
+				paths = append(paths, dir)
+				out, code = f.run(t, "", "--dry-run", "--retiring-host", "control-a", "--requested")
+				assertRetireRoute(t, out, code, "hold", "no controller to retire")
+			}
+			for _, path := range paths {
+				if _, err := os.Lstat(path); !os.IsNotExist(err) {
+					t.Fatalf("the classifier created %s: %v", path, err)
 				}
 			}
 		})
