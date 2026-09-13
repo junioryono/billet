@@ -387,3 +387,81 @@ func TestASettledRetirementCannotTellFromAnAnswerSystemdDidNotGive(t *testing.T)
 		})
 	}
 }
+
+// AN UNFINISHED TAIL IS NOT AN EXEMPTION FROM THE POSTCONDITIONS. Every phase
+// of the transition has run by the time a journal reads `done`, so a host that
+// has drifted from what the retirement left — a server started again, a timer
+// re-enabled, a systemd that cannot be asked — is one an operator must look
+// at, and settling the retirement over it would record as finished a
+// retirement whose host no longer holds what it promised.
+func TestAnUnsettledRetirementIsNotFinishedOverADriftedHost(t *testing.T) {
+	cases := map[string]struct {
+		unit string
+		code int
+	}{
+		"the server is running again": {
+			unit: "LoadState=loaded\nActiveState=active\nSubState=running\nResult=success\nKillMode=mixed\n" +
+				"MainPID=4242\nUnitFileState=disabled\nInvocationID=\nExecMainStartTimestamp=\n",
+			code: exitRefused,
+		},
+		"systemd answered nothing for its state": {
+			unit: "LoadState=loaded\nActiveState=\nSubState=dead\nResult=success\nKillMode=mixed\n" +
+				"MainPID=0\nUnitFileState=disabled\nInvocationID=\nExecMainStartTimestamp=\n",
+			code: exitUnknown,
+		},
+	}
+
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newRequestFixture(t)
+			f.reserve(t)
+
+			// The first run reaches `done` owing the ledger a row.
+			saved := retireBeforeRename
+			retireBeforeRename = func() { t.Setenv("BILLET_STATE_DSN", "") }
+
+			t.Cleanup(func() { retireBeforeRename = saved })
+
+			out, code := f.request(t, f.input(t, nil))
+			if m := retireAnswer(t, out); code != 0 || m["settled"] != false {
+				t.Fatalf("the first run: %s", out)
+			}
+
+			retiredUnits(t, f)
+			writeFile(t, filepath.Join(f.unitsDir, serverUnit), c.unit, 0o644)
+
+			// The ledger is reachable again, so nothing but the host's own
+			// state stands in the way of settling.
+			t.Setenv("BILLET_STATE_DSN", f.dsn)
+
+			out, code = retiredRequest(t, f, requestRun)
+
+			m := retireAnswer(t, out)
+			if m["reason"] != retireReasonPostcondition || code != c.code {
+				t.Fatalf("a drifted host with an unfinished tail: %s", out)
+			}
+
+			// AND THE TAIL WAS NOT FINISHED: the marker is kept, the journal
+			// is not settled, and the ledger's row still waits.
+			j, _, err := retirement.ReadJournal()
+			mustOK(t, err)
+
+			if j.Settled || j.RowDone {
+				t.Fatalf("the tail was finished over a drifted host: %+v", j)
+			}
+
+			if f.guard.record(t).Transition == nil {
+				t.Fatal("the marker was cleared over a drifted host")
+			}
+
+			f.pgLedger(t, func(db *state.DB) {
+				r, present, err := db.ReadRetirement(t.Context(), f.identity)
+				mustOK(t, err)
+
+				if !present || r.State != state.RetirementIntent {
+					t.Fatalf("the row moved: %+v (present %v)", r, present)
+				}
+			})
+		})
+	}
+}

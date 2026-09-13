@@ -34,6 +34,12 @@ import (
 // ZERO LEDGER OPENS ONCE THE ROW IS ACKNOWLEDGED. A `done` journal carrying
 // `row_done` needs nothing from the database again, and every later converge
 // of a retired host must be able to run with the ledger unreachable.
+//
+// THE ONE WRITE A LATER CONVERGE STILL MAKES is the published status, when it
+// has gone missing or says less than the journal: that file is what closes the
+// authority to every ordinary writer, so leaving it wrong would leave the host
+// open. The answer says so (`status: republished`) rather than calling such a
+// run unchanged in the ordinary sense.
 
 // retireTailAnswer is the answer of a run that reached `done`: what the
 // transition did, what the tail finished, and what it left for the role.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strconv"
 
 	"github.com/junioryono/billet/internal/lifeops"
 	"github.com/junioryono/billet/internal/retirement"
@@ -102,16 +103,23 @@ func retireDone(ctx context.Context, m retireMode, root *txLock, dir *os.File, s
 			"the runbook in docs/operating/upgrades.md"))
 	}
 
+	// THE HOST IS JUDGED BEFORE EITHER BRANCH, and an unfinished tail is not
+	// an exemption: every phase of the transition has run by the time a
+	// journal reads `done`, so the units, the archive and the configuration
+	// are what the retirement promised — and finishing a tail over a host that
+	// has drifted from them would settle a retirement whose host no longer
+	// holds what it recorded. The published status is the one thing left to
+	// the tail, which repairs it.
+	held, r := observeRetirePostconditions(ctx, m, j)
+	if r != nil {
+		return nil, r
+	}
+
 	if !j.Settled {
 		// THE TAIL, FINISHED BY WHOEVER HOLDS THE GUARD NOW. Everything it
 		// needs is in the journal, and the run that recorded the intent may be
 		// long gone.
 		return retireTail(ctx, m, root, dir, j, nil)
-	}
-
-	held, r := observeRetirePostconditions(ctx, m, j)
-	if r != nil {
-		return nil, r
 	}
 
 	// THE PUBLISHED STATUS IS THE ONE POSTCONDITION THAT IS NOT A RECORD: it
@@ -251,9 +259,29 @@ func retireConfigPostcondition(configPath string, j retirement.Journal) (string,
 
 	want := j.Variant == retirement.VariantRetainedNode
 
-	switch {
-	case obs.present && want:
+	// A FILE IS NOT THE CONFIGURATION A RETIREMENT LEAVES. What the rewrite
+	// installed has the node and NO server section, and the two ways a host
+	// drifts back are both admitted by presence alone: the original
+	// configuration restored, and a server-only one installed under a node
+	// that is still running and could not restart with it. What is NOT
+	// required is the staged digest: after `done` the ordinary render owns
+	// this file, and a later legitimate change to the node's configuration is
+	// rendered the ordinary way.
+	if obs.present && want {
+		switch {
+		case obs.cfg.Server != nil:
+			return "", atRetirePhase(j, retireRefuse(retireReasonPostcondition, fmt.Sprintf("the configuration at %s has "+
+				"a server section again, and this host retired its server", obs.path),
+				"the runbook in docs/operating/upgrades.md"))
+		case obs.cfg.Node == nil:
+			return "", atRetirePhase(j, retireRefuse(retireReasonPostcondition, fmt.Sprintf("the configuration at %s has "+
+				"no node section, and this host kept its node", obs.path), "the runbook in docs/operating/upgrades.md"))
+		}
+
 		return retireConfigPresent, nil
+	}
+
+	switch {
 	case !obs.present && !want:
 		return retireConfigAbsent, nil
 	case obs.present:
@@ -300,6 +328,18 @@ func retireUnitPostcondition(ctx context.Context, insp *lifeops.Inspector, unit 
 		if enablement != "enabled" {
 			return "", retireRefuse(retireReasonPostcondition, fmt.Sprintf("%s is %s, not persistently enabled, on a "+
 				"host that kept its node", unit, enablement), "")
+		}
+
+		// AND IT HAS A PROCESS. systemd reports a service whose process has
+		// EXITED as active (SERVICE_EXITED maps to UNIT_ACTIVE), so the state
+		// alone is not evidence that the node this host kept is running.
+		switch running, err := strconv.Atoi(main); {
+		case main == "" || err != nil:
+			return "", retireUnknown(retireReasonPostcondition, fmt.Sprintf("systemd did not answer %s's main process "+
+				"as a number (%s), so whether the node is running cannot be established", unit, activeWord(main)), "")
+		case running <= 0:
+			return "", retireRefuse(retireReasonPostcondition, fmt.Sprintf("%s is active with no main process on a host "+
+				"that kept its node", unit), "")
 		}
 
 		return retireUnitRunning, nil

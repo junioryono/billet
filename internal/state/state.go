@@ -694,9 +694,10 @@ func Describe(err error) string {
 // afterwards. A walk that could not finish answers false, which is the same
 // could-not-tell the other classifiers give.
 //
-// IT MATCHES BY IDENTITY. Every sentinel billet asks about here is a package
-// variable compared by identity, and no custom `Is` method is consulted; a
-// target that needed one would not be answered by this.
+// IT MATCHES EACH CAUSE LOCALLY, by identity and by that cause's OWN `Is`
+// method — which is how Go's net errors answer for the context sentinels —
+// and never by recursing into what a cause wraps, because the walk does that
+// itself under its budget.
 func Matches(err, target error) bool {
 	if err == nil || target == nil {
 		return false

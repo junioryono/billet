@@ -7,6 +7,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -597,6 +598,33 @@ func TestTheTailsClassifierSurvivesACyclicError(t *testing.T) {
 
 	if answer.Row != "" {
 		t.Fatalf("a cyclic error left the row saying %q", answer.Row)
+	}
+
+	// AND THE REFUSAL IS RENDERED WITHOUT FOLLOWING THE CAUSE. `net.OpError`'s
+	// own formatter prints what it wraps, with no bound, so an error whose
+	// cause is itself exhausts the stack in the refusal written ABOUT not
+	// being able to classify it — which a fixture with a constant `Error()`
+	// cannot catch, and this one is the shape that can.
+	looping := &net.OpError{Op: "read", Net: "tcp"}
+	looping.Err = looping
+
+	answer = &retireTailAnswer{}
+
+	r = retireLedgerProblem(live, expired, looping, "complete the retirement row", answer)
+	if r == nil || r.Reason != retireReasonLedger {
+		t.Fatalf("an error whose formatter loops did not refuse: %+v", r)
+	}
+
+	if !strings.Contains(r.Why, "causes do not end") {
+		t.Fatalf("the refusal rendered an error it could not walk: %s", r.Why)
+	}
+
+	// AND AN ORDINARY ERROR IS STILL RENDERED, so the bound is not a blanket.
+	answer = &retireTailAnswer{}
+
+	r = retireLedgerProblem(live, expired, errors.New("the ledger said no"), "complete the retirement row", answer)
+	if r == nil || !strings.Contains(r.Why, "the ledger said no") {
+		t.Fatalf("an ordinary error was not rendered: %+v", r)
 	}
 }
 
