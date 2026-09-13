@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"time"
@@ -263,15 +262,15 @@ func retireTailRow(ctx context.Context, j retirement.Journal, answer *retireTail
 	})
 
 	switch {
-	case errors.Is(err, state.ErrRetirementDone):
+	case state.Matches(err, state.ErrRetirementDone):
 		return j, retireUnknown(retireReasonRetired, fmt.Sprintf("this deployment's retirement row is %s's and this host "+
 			"is %s, so the row this transition would complete is not there", row.Retiring, j.Retiring),
 			"the runbook in docs/operating/upgrades.md")
-	case errors.Is(err, state.ErrRetirementReserved):
+	case state.Matches(err, state.ErrRetirementReserved):
 		return j, retireUnknown(retireReasonConflict, fmt.Sprintf("this deployment's retirement row is %s's (run %s, "+
 			"state %s), and this host's transition is complete", row.Retiring, row.Run, row.State),
 			"the runbook in docs/operating/upgrades.md")
-	case errors.Is(err, state.ErrRetirementMismatch), errors.Is(err, state.ErrRetirementMoved):
+	case state.Matches(err, state.ErrRetirementMismatch), state.Matches(err, state.ErrRetirementMoved):
 		return j, retireUnknown(retireReasonMismatch, err.Error(), "the runbook in docs/operating/upgrades.md")
 	case err != nil:
 		// THE ROW MAY HAVE BEEN WRITTEN and the answer lost; pending is right
@@ -418,12 +417,12 @@ func retirePendingReason(err error) string {
 	switch {
 	case state.Unreachable(err):
 		return "the ledger's database could not be reached (" + err.Error() + ")"
-	case errors.Is(err, state.ErrSchemaAhead):
+	case state.Matches(err, state.ErrSchemaAhead):
 		return "the ledger's schema is newer than this binary's, so this host may not write it (" + err.Error() + ")"
-	case errors.Is(err, state.ErrSchemaBehind):
+	case state.Matches(err, state.ErrSchemaBehind):
 		return "the ledger's schema is older than this binary's and no control plane has migrated it here (" +
 			err.Error() + ")"
-	case errors.Is(err, state.ErrReleaseBehind):
+	case state.Matches(err, state.ErrReleaseBehind):
 		return "a newer billet has served this ledger, so this host may not write it (" + err.Error() + ")"
 	default:
 		return ""
@@ -471,17 +470,17 @@ func retireLedgerProblem(outer, bounded context.Context, err error, doing string
 // unresponsive connection during the open produces — the reason a bound on the
 // attempt alone is not enough.
 func retireDeadlinePending(outer, bounded context.Context, err error) string {
-	// A DEADLINE MUST BE THE WHOLE OF THE ERROR, not merely somewhere in it.
-	// `errors.Is` is true of a tree that also holds a server's refusal or a
-	// cleanup that failed — and billet's own opens join their startup failure
-	// with their close — so reporting such a tree as an expiry would throw the
-	// rest of the evidence away.
+	// A DEADLINE MUST BE THE WHOLE OF THE ERROR, not merely somewhere in it: a
+	// tree that also holds a server's refusal or a cleanup that failed — and
+	// billet's own opens join their startup failure with their close — is not
+	// an expiry, and reporting it as one would throw the rest of the evidence
+	// away.
 	//
-	// THE BOUNDED QUESTION IS ASKED FIRST, and the order is the point:
-	// `OnlyCancellation` walks the tree under a budget, so an error whose
-	// causes form a cycle ends there; `errors.Is` recurses without one and
-	// would not return on such a tree. Past that answer the tree is finite.
-	if !state.OnlyCancellation(err) || !errors.Is(err, context.DeadlineExceeded) {
+	// EVERY QUESTION THE TAIL ASKS OF AN ERROR IS BOUNDED (`OnlyCancellation`,
+	// `Matches`, `Unreachable`), because an error whose causes form a cycle
+	// does not end `errors.Is`, and a classifier that hangs is worse than one
+	// that says it could not tell.
+	if !state.OnlyCancellation(err) || !state.Matches(err, context.DeadlineExceeded) {
 		return ""
 	}
 

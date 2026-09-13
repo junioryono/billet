@@ -564,3 +564,46 @@ func TestTheTailTellsTheThreeDeadlinesApart(t *testing.T) {
 		})
 	}
 }
+
+// THE TAIL'S OWN CLASSIFIER IS BOUNDED TOO, and this is the case that proves
+// it rather than the package below: an error whose cause is itself does not
+// end `errors.Is`, so a classifier that asked that way would hang here instead
+// of answering. Every question the tail asks of an error goes through the
+// bounded walk, and a walk that could not finish is could-not-tell — which for
+// a ledger error is a refusal, never a pending row.
+func TestTheTailsClassifierSurvivesACyclicError(t *testing.T) {
+	loop := &cyclicError{}
+	loop.cause = loop
+
+	if why := retirePendingReason(loop); why != "" {
+		t.Fatalf("a cyclic error was classified as pending: %q", why)
+	}
+
+	live := t.Context()
+
+	expired, cancel := context.WithDeadline(live, time.Now().Add(-time.Second))
+	defer cancel()
+
+	if why := retireDeadlinePending(live, expired, loop); why != "" {
+		t.Fatalf("a cyclic error was read as this command's bound expiring: %q", why)
+	}
+
+	answer := &retireTailAnswer{}
+
+	r := retireLedgerProblem(live, expired, loop, "complete the retirement row", answer)
+	if r == nil || r.Reason != retireReasonLedger {
+		t.Fatalf("a cyclic error did not refuse: %+v", r)
+	}
+
+	if answer.Row != "" {
+		t.Fatalf("a cyclic error left the row saying %q", answer.Row)
+	}
+}
+
+// cyclicError is an error whose cause is itself, which nothing in billet
+// builds and a driver or a library can.
+type cyclicError struct{ cause error }
+
+func (*cyclicError) Error() string { return "a cause that is its own cause" }
+
+func (e *cyclicError) Unwrap() error { return e.cause }

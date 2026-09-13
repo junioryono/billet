@@ -665,6 +665,35 @@ func Unreachable(err error) bool {
 	return found.out && !found.refused && !found.cancelled
 }
 
+// Matches reports whether target is one of err's causes, over the SAME BOUNDED
+// WALK the classifiers use.
+//
+// `errors.Is` is the ordinary way to ask, and it is the wrong one for a caller
+// that has to survive a tree it did not build: it recurses without a bound, so
+// an error whose causes form a cycle never returns from it — and a caller that
+// bounded its own traversal would still hang on the first `errors.Is` it made
+// afterwards. A walk that could not finish answers false, which is the same
+// could-not-tell the other classifiers give.
+//
+// IT MATCHES BY IDENTITY. Every sentinel billet asks about here is a package
+// variable compared by identity, and no custom `Is` method is consulted; a
+// target that needed one would not be answered by this.
+func Matches(err, target error) bool {
+	if err == nil || target == nil {
+		return false
+	}
+
+	found := false
+
+	whole := walkCauses(err, func(cause error) {
+		if cause == target { //nolint:errorlint,err113 // node-local by design: the walk reaches what each cause wraps
+			found = true
+		}
+	})
+
+	return found && whole
+}
+
 // OnlyCancellation reports whether a context ending is THE WHOLE of err: every
 // cause at the bottom of the tree is a deadline or a cancellation.
 //

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -27,6 +28,32 @@ func settleRetirement(t *testing.T, f *requestFixture) retirement.Journal {
 	}
 
 	return j
+}
+
+// retiredRequest is a converge over a host whose retirement is already
+// recorded. It cannot use the fixture's ordinary request, which digests the
+// installed configuration: a server-only retirement has removed that file, and
+// the digest is not something this path reads anyway.
+func retiredRequest(t *testing.T, f *requestFixture, run string) (string, int) {
+	t.Helper()
+
+	return f.run(t, f.input(t, nil), "--input", "-", "--run", run, "--retiring-host", requestRetiring,
+		"--survivor-host", requestSurvivor, "--server-only", "--installed-sha256", strings.Repeat("0", 64))
+}
+
+// takeOverTheGuard re-labels this converge's guard for a new holder, keeping
+// the marker and recording the holder it took it from, which is what the
+// guard's own takeover writes.
+func takeOverTheGuard(t *testing.T, f *requestFixture, holder, from string) {
+	t.Helper()
+
+	rec := f.guard.record(t)
+	rec.Holder = holder
+	rec.TakenOverFrom = append(append([]string{}, rec.TakenOverFrom...), from)
+
+	body, err := json.Marshal(rec)
+	mustOK(t, err)
+	mustOK(t, os.WriteFile(filepath.Join(f.guard.active(), guardRecordName), body, 0o600))
 }
 
 // retiredUnits is what a completed server-only retirement leaves systemd
@@ -67,8 +94,7 @@ func TestASettledRetirementIsUnchangedAndTakesNothing(t *testing.T) {
 	// needs nothing from the database again.
 	t.Setenv("BILLET_STATE_DSN", "postgres://billet:billet@127.0.0.1:1/billet?sslmode=disable")
 
-	out, code := f.run(t, f.input(t, nil), "--input", "-", "--run", "ci-2", "--retiring-host", requestRetiring,
-		"--survivor-host", requestSurvivor, "--server-only", "--installed-sha256", strings.Repeat("0", 64))
+	out, code := retiredRequest(t, f, "ci-2")
 
 	m := retireAnswer(t, out)
 	if code != 0 || m["outcome"] != retireOutcomeUnchanged || m["settled"] != true {
@@ -158,7 +184,7 @@ func TestASettledRetirementRefusesEachPostconditionThatFails(t *testing.T) {
 			retiredUnits(t, f)
 			c.stage(t, f)
 
-			out, code := f.request(t, f.input(t, nil))
+			out, code := retiredRequest(t, f, requestRun)
 
 			m := retireAnswer(t, out)
 			if m["reason"] != retireReasonPostcondition || code != exitRefused {
@@ -200,10 +226,13 @@ func TestAnUnsettledRetirementIsFinishedByTheNextConverge(t *testing.T) {
 
 	retiredUnits(t, f)
 
-	// The ledger is reachable again, and the guard is this converge's.
+	// The ledger is reachable again, and the guard has been TAKEN OVER: the
+	// run that left the tail unfinished is gone, and its journal is still this
+	// guard's through the chain.
 	t.Setenv("BILLET_STATE_DSN", f.dsn)
+	takeOverTheGuard(t, f, "ci-2", requestRun)
 
-	out, code = f.request(t, f.input(t, nil))
+	out, code = retiredRequest(t, f, "ci-2")
 
 	m = retireAnswer(t, out)
 	if code != 0 || m["outcome"] != retireOutcomeRetired || m["row"] != retireRowDone {
@@ -249,7 +278,7 @@ func TestAnUnsettledRetirementRefusesAHolderThatIsNotItsOwn(t *testing.T) {
 	// converge's guard.
 	markGuard(t, f.guard, nil, nil)
 
-	out, code := f.request(t, f.input(t, nil))
+	out, code := retiredRequest(t, f, requestRun)
 
 	m := retireAnswer(t, out)
 	if m["reason"] != retireReasonJournal || code != exitUnknown {
@@ -281,7 +310,7 @@ func TestARetirementWhoseArchiveIsGoneIsUnknown(t *testing.T) {
 
 	mustOK(t, os.RemoveAll(j.Archive))
 
-	out, code := f.request(t, f.input(t, nil))
+	out, code := retiredRequest(t, f, requestRun)
 
 	m := retireAnswer(t, out)
 	if m["reason"] != retireReasonIdentity || code != exitUnknown {

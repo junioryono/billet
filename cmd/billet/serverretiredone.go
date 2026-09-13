@@ -65,7 +65,8 @@ const (
 )
 
 // retireDoneProperties is what every postcondition asks systemd for. A timer
-// has no main process, and an absent answer for it is not a failure.
+// has no main process, and an absent answer for it is not a failure; for a
+// service an absent answer is could-not-tell.
 var retireDoneProperties = []string{"LoadState", "ActiveState", "UnitFileState", "MainPID"}
 
 // retireDone answers a converge that found a `done` journal on this host.
@@ -253,9 +254,22 @@ func retireUnitPostcondition(ctx context.Context, insp *lifeops.Inspector, unit 
 			"inactive", unit, activeWord(active)), "")
 	}
 
-	if pid && main != "0" && main != "" {
-		return "", retireRefuse(retireReasonPostcondition, fmt.Sprintf("%s is inactive and still has the main process "+
-			"%s", unit, main), "")
+	// A UNIT THAT NAMES NO PROCESS IS NOT A UNIT WITH NO PROCESS. systemd
+	// answers `MainPID=0` for a service that has none, including one it does
+	// not know; an EMPTY answer is one it did not give, and reading that as
+	// "no process" would let a systemd that cannot be asked satisfy the one
+	// clause the archive's safety rests on. Only a service is asked: a timer
+	// has no main process and answers nothing for it.
+	if pid {
+		switch main {
+		case "0":
+		case "":
+			return "", retireUnknown(retireReasonPostcondition, fmt.Sprintf("systemd did not answer %s's main process, "+
+				"so whether it still has one cannot be established", unit), "")
+		default:
+			return "", retireRefuse(retireReasonPostcondition, fmt.Sprintf("%s is inactive and still has the main process "+
+				"%s", unit, main), "")
+		}
 	}
 
 	// A UNIT SYSTEMD DOES NOT KNOW is quiescent only as a positive answer: the
