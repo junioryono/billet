@@ -274,6 +274,26 @@ func retireDirPresent(path string) (bool, error) {
 	}
 }
 
+// retireNamePresent says whether anything at all stands at a pathname.
+//
+// ANYTHING IS A CONFIGURATION for the clause that asks whether one is
+// installed: a symlink, a directory or a device at that name is not the absence
+// a retired server-only host must hold, and the name is what the role and
+// systemd both point at. Only a positive ENOENT is absence; every other failure
+// to look is could-not-tell.
+func retireNamePresent(path string) (bool, error) {
+	_, err := os.Lstat(path)
+
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return false, nil
+	case err != nil:
+		return false, fmt.Errorf("examine %s: %w", path, err)
+	default:
+		return true, nil
+	}
+}
+
 // retireConfigFact reads the installed configuration's digest and says which
 // of the two recorded digests it is. An absent file is a positive ENOENT and
 // never a failed read.

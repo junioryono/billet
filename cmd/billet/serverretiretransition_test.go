@@ -1506,10 +1506,11 @@ func TestAnUnreadableJournalKeepsSayingThePhaseIsUnknown(t *testing.T) {
 	}
 }
 
-// A `done` JOURNAL IS THE TAIL'S, AND IS SAID SO BEFORE ANY CONFIGURATION IS
-// READ: a server-only host at `done` has no configuration at all, and reading
-// one there answers about a missing file instead of the step that is missing.
-func TestADoneJournalIsTheTailsBeforeAnyConfigurationIsRead(t *testing.T) {
+// A `done` JOURNAL IS ANSWERED BEFORE ANY CONFIGURATION IS READ: a server-only
+// host at `done` has no configuration at all, and reading one there would
+// answer about a missing file instead of the tail that is still owed. This host
+// has none, and the tail finishes anyway.
+func TestADoneJournalIsAnsweredBeforeAnyConfigurationIsRead(t *testing.T) {
 	f := newRequestFixture(t)
 	f.reserve(t)
 
@@ -1523,20 +1524,25 @@ func TestADoneJournalIsTheTailsBeforeAnyConfigurationIsRead(t *testing.T) {
 	in, digest := f.input(t, nil), f.installedSHA(t)
 
 	// The host as a completed transition leaves it: the identity archived, the
-	// configuration removed, the authority closed at done.
+	// configuration removed, the units quiescent, the authority closed at done.
 	mustOK(t, os.Rename(f.stateDir, j.Archive))
 	mustOK(t, os.Remove(f.cfg))
 	mustOK(t, retirement.WriteStatus(retirement.PhaseDone, retirement.VariantServerOnly, retireNow()))
+	retiredUnits(t, f)
 
 	out, code := f.run(t, in, "--input", "-", "--run", requestRun, "--retiring-host", requestRetiring,
 		"--survivor-host", requestSurvivor, "--server-only", "--installed-sha256", digest)
 
-	// AND IT SAYS WHAT THE HOST HOLDS: a retirement that reached `done` is not
-	// a host where nothing has happened, which is what `nothing` would say.
-	m := retireAnswer(t, out)
-	if code != exitUnknown || m["reason"] != retireReasonPhase || !strings.Contains(whyOf(m), "the tail") ||
-		m["state"] != string(retirement.PhaseDone) {
-		t.Fatalf("a done journal: %s", out)
+	retiredAnswer(t, out, code)
+
+	// AND THE CONFIGURATION WAS NEVER THE THING IT READ: the answer names the
+	// retirement, and the operand this run was handed is a digest of a file
+	// that is not there.
+	done, _, err := retirement.ReadJournal()
+	mustOK(t, err)
+
+	if !done.Settled {
+		t.Fatalf("the tail did not finish over a host with no configuration: %+v", done)
 	}
 }
 

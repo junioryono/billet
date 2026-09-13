@@ -269,12 +269,40 @@ func observeRetirePostconditions(ctx context.Context, m retireMode, j retirement
 // host that kept a node keeps one, and a server-only host has none, because a
 // configuration with neither role is one `config.Load` refuses.
 func retireConfigPostcondition(configPath string, j retirement.Journal) (string, *retireRefusal) {
+	want := j.Variant == retirement.VariantRetainedNode
+
+	// PRESENCE IS ASKED BEFORE THE PARSE, because on a host that kept no node
+	// the clause is that there is NO configuration, and a file that does not
+	// parse is still a file. Parsing first made a malformed configuration
+	// there could-not-tell about the reader, when what it is is this clause
+	// failing — and it is the same file however it is spelled inside.
+	present, err := retireNamePresent(configPath)
+	if err != nil {
+		return "", atRetirePhase(j, retireUnknown(retireReasonPostcondition, err.Error(), ""))
+	}
+
+	if !want {
+		if present {
+			return "", atRetirePhase(j, retireRefuse(retireReasonPostcondition, fmt.Sprintf("this host retired its server "+
+				"and kept no node, and a configuration is installed at %s", configPath),
+				"the runbook in docs/operating/upgrades.md"))
+		}
+
+		return retireConfigAbsent, nil
+	}
+
+	if !present {
+		return "", atRetirePhase(j, retireRefuse(retireReasonPostcondition, fmt.Sprintf("this host kept a node and no "+
+			"configuration is installed at %s", configPath), "the runbook in docs/operating/upgrades.md"))
+	}
+
+	// ONLY A HOST THAT KEPT A NODE NEEDS THE FILE READ, and there a
+	// configuration that does not parse is could-not-tell and nothing else:
+	// what the clause asks about is the sections inside it.
 	obs, endpointRefusal := observeInstalledConfig(configPath, true)
 	if endpointRefusal != nil {
 		return "", atRetirePhase(j, retireFromEndpointFor(retireReasonPostcondition, endpointRefusal))
 	}
-
-	want := j.Variant == retirement.VariantRetainedNode
 
 	// A FILE IS NOT THE CONFIGURATION A RETIREMENT LEAVES. What the rewrite
 	// installed has the node and NO server section, and the two ways a host
@@ -284,30 +312,31 @@ func retireConfigPostcondition(configPath string, j retirement.Journal) (string,
 	// required is the staged digest: after `done` the ordinary render owns
 	// this file, and a later legitimate change to the node's configuration is
 	// rendered the ordinary way.
-	if obs.present && want {
-		switch {
-		case obs.cfg.Server != nil:
-			return "", atRetirePhase(j, retireRefuse(retireReasonPostcondition, fmt.Sprintf("the configuration at %s has "+
-				"a server section again, and this host retired its server", obs.path),
-				"the runbook in docs/operating/upgrades.md"))
-		case obs.cfg.Node == nil:
-			return "", atRetirePhase(j, retireRefuse(retireReasonPostcondition, fmt.Sprintf("the configuration at %s has "+
-				"no node section, and this host kept its node", obs.path), "the runbook in docs/operating/upgrades.md"))
-		}
-
-		return retireConfigPresent, nil
-	}
-
+	// A FILE IS NOT THE CONFIGURATION A RETIREMENT LEAVES. What the rewrite
+	// installed has the node and NO server section, and the two ways a host
+	// drifts back are both caught here: the original configuration restored,
+	// and a server-only one installed under a node that is still running and
+	// could not restart with it. What is NOT required is the staged digest:
+	// after `done` the ordinary render owns this file, and a later legitimate
+	// change to the node's configuration is rendered the ordinary way.
+	//
+	// A NAME THAT WAS THERE AND IS GONE BY THE READ is could-not-tell, not the
+	// absence the clause above would have refused: the two reads are not one
+	// observation and this one establishes nothing about what stands now.
 	switch {
-	case !obs.present && !want:
-		return retireConfigAbsent, nil
-	case obs.present:
-		return "", atRetirePhase(j, retireRefuse(retireReasonPostcondition, fmt.Sprintf("this host retired its server and "+
-			"kept no node, and a configuration is installed at %s", obs.path), "the runbook in docs/operating/upgrades.md"))
-	default:
-		return "", atRetirePhase(j, retireRefuse(retireReasonPostcondition, fmt.Sprintf("this host kept a node and no "+
-			"configuration is installed at %s", obs.path), "the runbook in docs/operating/upgrades.md"))
+	case !obs.present:
+		return "", atRetirePhase(j, retireUnknown(retireReasonPostcondition, fmt.Sprintf("the configuration at %s was "+
+			"there when this host was examined and gone when it was read", obs.path), ""))
+	case obs.cfg.Server != nil:
+		return "", atRetirePhase(j, retireRefuse(retireReasonPostcondition, fmt.Sprintf("the configuration at %s has "+
+			"a server section again, and this host retired its server", obs.path),
+			"the runbook in docs/operating/upgrades.md"))
+	case obs.cfg.Node == nil:
+		return "", atRetirePhase(j, retireRefuse(retireReasonPostcondition, fmt.Sprintf("the configuration at %s has "+
+			"no node section, and this host kept its node", obs.path), "the runbook in docs/operating/upgrades.md"))
 	}
+
+	return retireConfigPresent, nil
 }
 
 // retireUnitPostcondition judges one unit. `alive` names the one unit a
@@ -414,8 +443,8 @@ func retireUnitPostcondition(ctx context.Context, insp *lifeops.Inspector, unit 
 // knownActiveState and knownUnitFileState are systemd's own vocabularies. A
 // word outside them is one systemd has added since, and no reason to say
 // anything definite about this host.
-func knownActiveState(state string) bool {
-	switch state {
+func knownActiveState(word string) bool {
+	switch word {
 	case "active", "reloading", "inactive", "failed", "activating", "deactivating", "maintenance", "refreshing":
 		return true
 	}
@@ -423,8 +452,8 @@ func knownActiveState(state string) bool {
 	return false
 }
 
-func knownUnitFileState(state string) bool {
-	switch state {
+func knownUnitFileState(word string) bool {
+	switch word {
 	case "enabled", "enabled-runtime", "linked", "linked-runtime", "alias", "masked", "masked-runtime", "static",
 		"indirect", "disabled", "generated", "transient", "bad":
 		return true
