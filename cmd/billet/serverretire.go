@@ -17,6 +17,7 @@ import (
 	"github.com/junioryono/billet/internal/rollout"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/version"
+	"github.com/junioryono/billet/internal/wirecert"
 )
 
 // `billet server retire` is a controller's retirement as a command, the role
@@ -164,7 +165,7 @@ type retireAcknowledgedAnswer struct {
 }
 
 // retireReport is the dry run's answer: every record as it stands, read
-// without a lock, and the dispatch the table decides from them.
+// without a lock, the dispatch the table decides and the route the caller takes.
 type retireReport struct {
 	Schema   int                  `json:"schema"`
 	Outcome  string               `json:"outcome"`
@@ -183,9 +184,15 @@ type retireReport struct {
 	StatusWhy      string `json:"status_why,omitempty"`
 	// Config is the installed configuration's typed presence, in the words
 	// the inspector uses: `present`, `absent`, `malformed`, `unreadable`.
-	Config string `json:"config"`
-	Why    string `json:"why,omitempty"`
-	State  string `json:"state"`
+	Config         string `json:"config"`
+	InstalledRoles string `json:"installed_roles"`
+	// Unknown paths are unreadable, never an absence inferred from a default.
+	Identity  string `json:"identity"`
+	Authority string `json:"authority"`
+	Route     string `json:"route"`
+	RouteWhy  string `json:"route_why,omitempty"`
+	Why       string `json:"why,omitempty"`
+	State     string `json:"state"`
 }
 
 type retireReportJournal struct {
@@ -226,6 +233,10 @@ type retireMode struct {
 	completeRow bool
 	acknowledge bool
 	dryRun      bool
+	requested   bool
+
+	expectedHolder string
+	expectedGuard  string
 
 	// The request's operands.
 	input            string
@@ -290,6 +301,9 @@ func cmdServerRetire(ctx context.Context, args []string) error {
 	flags.BoolVar(&m.completeRow, "complete-row", false, "on the survivor: complete the retiring host's ledger row from its completion document")
 	flags.BoolVar(&m.acknowledge, "acknowledge-row", false, "on the retiring host: acknowledge the survivor's completion in the journal")
 	flags.BoolVar(&m.dryRun, "dry-run", false, "classify the host and report; take nothing, write nothing")
+	flags.BoolVar(&m.requested, "requested", false, "with --dry-run: the inventory asks for a retirement")
+	flags.StringVar(&m.expectedHolder, "expected-holder", "", "with --dry-run: the converge holder whose guard must remain")
+	flags.StringVar(&m.expectedGuard, "expected-guard", "", "with --dry-run: the guard id established by preparation")
 	flags.StringVar(&m.input, "input", "", "the request: - for the input document on stdin")
 	flags.BoolVar(&m.serverOnly, "server-only", false, "with --input: this host keeps no node, and the request carries no rendering")
 	flags.BoolVar(&m.survivorFlagged, "survivor-flagged", false, "with --input: the inventory flags the survivor for retirement too")
@@ -384,6 +398,8 @@ func checkRetireCombination(m retireMode) *retireRefusal {
 	switch {
 	case modes != 1:
 		return refuse("exactly one of --reserve, --input -, --abandon-reservation, --complete-row, --acknowledge-row and --dry-run")
+	case !m.dryRun && (m.requested || m.expectedHolder != "" || m.expectedGuard != ""):
+		return refuse("--requested, --expected-holder and --expected-guard belong to --dry-run")
 	case m.input != "" && m.input != "-":
 		return refuse("--input takes - alone: the request document arrives on stdin")
 	case m.input != "" && m.survivorHost == "":
@@ -404,6 +420,7 @@ func checkRetireCombination(m retireMode) *retireRefusal {
 
 	for _, operand := range []struct{ flag, value string }{
 		{"--run", m.run}, {"--retiring-host", m.retiringHost}, {"--survivor-host", m.survivorHost}, {"--as-host", m.asHost},
+		{"--expected-holder", m.expectedHolder},
 	} {
 		if operand.value == "" {
 			continue
@@ -740,14 +757,8 @@ func retireReserve(ctx context.Context, m retireMode) (any, *retireRefusal) {
 			"(its digest is not --installed-sha256)", "converge again")
 	}
 
-	if cfg.Server.LedgerBackend() != config.StatePostgres {
-		return nil, retireRefuse(retireReasonBackend, "a retirement is defined for a PostgreSQL active-passive pair, and this "+
-			"deployment's ledger is "+string(cfg.Server.LedgerBackend()), "")
-	}
-
-	if cfg.Server.Controllers != config.ControllersActivePassive {
-		return nil, retireRefuse(retireReasonControllers, "a retirement is defined for an active-passive pair, and this "+
-			"deployment's controllers are "+string(cfg.Server.Controllers), "")
+	if r := retirePairEligibility(cfg); r != nil {
+		return nil, r
 	}
 
 	if r := requireNoJournal("a reservation"); r != nil {
@@ -812,6 +823,22 @@ func retireReserve(ctx context.Context, m retireMode) (any, *retireRefusal) {
 			State: stateNothingRetire,
 		}, nil
 	})
+}
+
+// retirePairEligibility is the installed pair a reservation requires, shared
+// with the classifier so a preview cannot promise a different eligibility.
+func retirePairEligibility(cfg *config.Config) *retireRefusal {
+	if cfg.Server.LedgerBackend() != config.StatePostgres {
+		return retireRefuse(retireReasonBackend, "a retirement is defined for a PostgreSQL active-passive pair, and this "+
+			"deployment's ledger is "+string(cfg.Server.LedgerBackend()), "")
+	}
+
+	if cfg.Server.Controllers != config.ControllersActivePassive {
+		return retireRefuse(retireReasonControllers, "a retirement is defined for an active-passive pair, and this "+
+			"deployment's controllers are "+string(cfg.Server.Controllers), "")
+	}
+
+	return nil
 }
 
 // retiredSentence is the one sentence a `done` row refuses with.
@@ -1129,9 +1156,18 @@ func retireAcknowledge(_ context.Context, m retireMode) (any, *retireRefusal) {
 
 // retireDryRun classifies the host without a lock and writes nothing: the
 // journal, the status, the stage, the guard and its marker as they stand, the
-// row through the read-only open, and the dispatch the table decides.
+// row through the read-only open, the dispatch and the caller's route.
 func retireDryRun(ctx context.Context, m retireMode) (any, *retireRefusal) {
-	report := &retireReport{Schema: retireSchema, Outcome: retireOutcomeReported, State: stateNothingRetire}
+	report := &retireReport{Schema: retireSchema, Outcome: retireOutcomeReported, State: stateNothingRetire,
+		Identity: "unreadable", Authority: "unreadable", Route: "hold"}
+
+	// THE FIRST FAILED OBSERVATION HOLDS, but does not hide the other facts.
+	// A caller always receives the route, including on a host it cannot read.
+	hold := func(why string) {
+		if report.RouteWhy == "" {
+			report.RouteWhy = why
+		}
+	}
 
 	j, presence, err := retirement.ReadJournal()
 
@@ -1146,7 +1182,7 @@ func retireDryRun(ctx context.Context, m retireMode) (any, *retireRefusal) {
 			Retiring: j.Provenance.Retiring, Survivor: j.Provenance.Survivor}
 	case retirement.JournalAbsent:
 	default:
-		return nil, retireUnknown(retireReasonJournal, "the retirement journal could not be judged: "+err.Error(), "")
+		hold("The retirement journal could not be judged: " + err.Error() + ".")
 	}
 
 	st, statusPresence, err := retirement.ReadStatus()
@@ -1164,10 +1200,11 @@ func retireDryRun(ctx context.Context, m retireMode) (any, *retireRefusal) {
 		report.StatusPresence = "malformed"
 		report.StatusWhy = err.Error()
 	default:
-		// A READ THAT FAILED IS NOT BYTES THAT DID NOT PARSE, and nothing
-		// downstream repairs what it could not read: this one refuses, and the
-		// report is never answered, so it carries no presence for it.
-		return nil, retireUnknown(retireReasonStatus, "the authority status could not be judged: "+err.Error(), "")
+		// A READ THAT FAILED IS NOT BYTES THAT DID NOT PARSE. Only the
+		// latter may route into the journal's repair of its publication.
+		report.StatusPresence = "unreadable"
+		report.StatusWhy = err.Error()
+		hold("The authority status could not be judged: " + err.Error() + ".")
 	}
 
 	switch _, err := os.Lstat(retirement.StagePath()); {
@@ -1176,15 +1213,24 @@ func retireDryRun(ctx context.Context, m retireMode) (any, *retireRefusal) {
 	case errors.Is(err, fs.ErrNotExist):
 		report.Stage = "absent"
 	default:
-		return nil, retireUnknown(retireReasonStage, "examine the stage: "+err.Error(), "")
+		report.Stage = "unreadable"
+		hold("The stage could not be examined: " + err.Error() + ".")
 	}
 
 	shape, err := classifyClaim()
 	if err != nil {
-		return nil, retireUnknown(retireReasonGuard, err.Error(), "")
+		shape.Kind = claimUnknown
+		hold("The guard could not be examined: " + err.Error() + ".")
 	}
 
 	report.Guard = string(shape.Kind)
+
+	switch {
+	case shape.Kind == claimUnknown || shape.Kind == claimUnpublished:
+		hold(fmt.Sprintf("The guard's claim is %s; its ownership could not be established.", shape.Kind))
+	case shape.RecordErr != "":
+		hold("The guard's record could not be read: " + shape.RecordErr + ".")
+	}
 
 	if shape.Kind == claimGuard && shape.RecordErr == "" {
 		report.Marker = shape.Guard.Transition
@@ -1200,10 +1246,44 @@ func retireDryRun(ctx context.Context, m retireMode) (any, *retireRefusal) {
 	// would converge a host as fresh.
 	cfg, configPresence := observeRetireDryRunConfig(m.configPath)
 	report.Config = configPresence
+	identity, identityWhy := "", ""
+
+	if cfg != nil {
+		switch {
+		case cfg.Server != nil && cfg.Node != nil:
+			report.InstalledRoles = "both"
+		case cfg.Server != nil:
+			report.InstalledRoles = "server"
+		case cfg.Node != nil:
+			report.InstalledRoles = "node"
+		}
+	}
+
+	if cfg != nil && cfg.Server != nil {
+		identity, report.Identity, identityWhy = observeRetireIdentity(cfg.Server.IdentityDir)
+		report.Authority = observeRetireAuthority(cfg.Server.IdentityDir)
+	}
+
+	if configPresence == "unreadable" {
+		hold("The installed configuration could not be read.")
+	}
+
+	if m.expectedHolder != "" {
+		switch {
+		case shape.Kind != claimGuard:
+			hold("The expected converge guard is gone.")
+		case shape.Guard.Holder != m.expectedHolder:
+			hold(fmt.Sprintf("The guard names holder %s, not the expected holder %s.", shape.Guard.Holder, m.expectedHolder))
+		case m.expectedGuard != "" && shape.Guard.ID != m.expectedGuard:
+			hold("The guard id differs from the id established by preparation.")
+		}
+	}
 
 	switch {
+	case cfg != nil && cfg.Server != nil && report.Identity != "minted":
+		report.RowFact, report.Why = retirement.RowUnreadable, identityWhy
 	case cfg != nil && cfg.Server != nil:
-		report.Row, report.RowFact, report.Why = readRetireRow(ctx, cfg, m)
+		report.Row, report.RowFact, report.Why = readRetireRow(ctx, cfg, identity, m)
 	case presence == retirement.JournalPresent:
 		// THE LOCATOR IS HOW A HOST PAST THE ARCHIVE NAMES ITS LEDGER: the
 		// installed configuration has no `server:` any more, or none at all,
@@ -1223,7 +1303,165 @@ func retireDryRun(ctx context.Context, m retireMode) (any, *retireRefusal) {
 	// the truth on every host with a retirement under way.
 	report.State = retireHostState(stateNothingRetire)
 
+	if report.RouteWhy == "" {
+		report.Route, report.RouteWhy = retireRoute(report, cfg, m.requested)
+		// RECOVERY MUST STILL REACH ORDINARY TASKS. A binary pointer is a
+		// retirement exclusion only, and a preview acquired no guard at all.
+		if m.expectedHolder != "" && shape.Pointer && report.Route != "ordinary" {
+			report.Route = "hold"
+			report.RouteWhy = "The guard carries a binary transaction's pointer; retirement cannot run inside it."
+		}
+	}
+
 	return report, nil
+}
+
+// retireRoute partitions readable observations. THE JOURNAL SELECTS ITS OWN
+// CONTINUATION, independently of the ledger and its dispatch; the mutating
+// path validates that journal's ownership, phase and postconditions.
+func retireRoute(report *retireReport, cfg *config.Config, requested bool) (string, string) {
+	if report.Journal != nil {
+		if report.Journal.Variant == retirement.VariantRetainedNode {
+			return "unsupported-variant", "the journal records a retained-node retirement, which this converge does not support"
+		}
+
+		return "continue", "this host has a readable journal, so the retirement it records is what this converge continues"
+	}
+
+	switch {
+	case report.StatusPresence == "present" || report.StatusPresence == "malformed":
+		return "hold", "a retirement status is published with no journal to explain it"
+	case report.Stage == "present":
+		return "hold", "a retirement stage stands with no journal to explain it"
+	case report.Marker != nil:
+		return "hold", "this guard carries a retirement marker with no journal to explain it"
+	case report.StatusPresence != "absent" || report.Stage != "absent":
+		return "hold", "this combination of records is one this billet does not recognise, and an unrecognised host " +
+			"is not one to converge over"
+	}
+
+	switch report.RowFact {
+	case retirement.RowAbsent:
+		if requested {
+			return retireNewRequestRoute(report, cfg)
+		}
+
+		return "ordinary", ""
+	case retirement.RowReservedMine:
+		if requested {
+			return retireNewRequestRoute(report, cfg)
+		}
+
+		return "cancel", "this host holds a reservation nothing has started and the inventory no longer requests a retirement"
+	case retirement.RowIntentMine, retirement.RowDoneMine:
+		return "hold", "this host's retirement row is past its reservation and no journal records the transition"
+	case retirement.RowOtherReserved, retirement.RowOtherIntent, retirement.RowDoneOther:
+		if requested {
+			return "hold", fmt.Sprintf("this deployment's retirement row belongs to another host (%s), so this one has no retirement to "+
+				"request", report.Row.Retiring)
+		}
+
+		return "ordinary", ""
+	case retirement.RowUnreadable:
+		// A SKIPPED READ WITHHOLDS NOTHING ONLY ON POSITIVE LOCAL EVIDENCE.
+		// Without both absences, a lost identity may hide a commissioned
+		// controller and a reservation whose owner cannot be recovered here.
+		nodeOnly := report.Config == "present" && report.InstalledRoles == "node"
+		uncommissioned := report.Config == "present" &&
+			(report.InstalledRoles == "server" || report.InstalledRoles == "both") &&
+			report.Identity == "absent" && report.Authority == "absent"
+
+		// NEITHER EXCEPTION IS A HOST THERE IS ANYTHING TO RETIRE ON, and that
+		// is why each of them may converge past an unreadable ledger at all: a
+		// node-only installation has no controller, and an uncommissioned one
+		// has no deployment — no identity, so no row keyed to this host, and
+		// nothing a reservation could name. A request over either is refused by
+		// name rather than routed to a reservation that would fail for a reason
+		// the operator would have to work backwards from.
+		switch {
+		case (nodeOnly || uncommissioned) && !requested:
+			return "ordinary", ""
+		case nodeOnly:
+			return "hold", "this host's installed configuration has a node and no server, and a controller's " +
+				"retirement is not defined for it"
+		case uncommissioned:
+			return "hold", "this host holds a server configuration and no deployment identity, so it has not been " +
+				"commissioned and there is no controller to retire"
+		}
+
+		if report.Identity == "absent" && report.Authority == "present" {
+			return "hold", "the deployment identity is absent beside authority remnants, so this controller is damaged rather than fresh"
+		}
+
+		return "hold", fmt.Sprintf("the retirement row is unreadable and this host is neither node-only nor uncommissioned "+
+			"(identity %s, authority %s): %s", report.Identity, report.Authority, report.Why)
+	default:
+		return "hold", "this combination of records is one this billet does not recognise, and an unrecognised host " +
+			"is not one to converge over"
+	}
+}
+
+// retireNewRequestRoute judges INSTALLED roles, never a desired rendering;
+// removing a node in inventory cannot authorise its controller's retirement.
+func retireNewRequestRoute(report *retireReport, cfg *config.Config) (string, string) {
+	if report.Config != "present" || cfg == nil {
+		return "hold", "a new retirement needs an installed configuration and this host has none to read"
+	}
+
+	if report.InstalledRoles != "server" || cfg.Server == nil {
+		return "hold", fmt.Sprintf("a new retirement needs an installed configuration with a server and no node, and "+
+			"this host's installed roles are %s", retireRolesWord(report.InstalledRoles))
+	}
+
+	if r := retirePairEligibility(cfg); r != nil {
+		return "hold", r.Why
+	}
+
+	return "new-request", "the inventory requests a retirement and this installed server-only active-passive PostgreSQL host is eligible"
+}
+
+// retireRolesWord renders the installed roles for a reason, saying when the
+// configuration answered none rather than printing nothing.
+func retireRolesWord(roles string) string {
+	if roles == "" {
+		return "not established"
+	}
+
+	return roles
+}
+
+// observeRetireIdentity peeks ONCE, independently of whether a row can be
+// read, so a skipped ledger read cannot conceal a missing deployment key.
+func observeRetireIdentity(dir string) (string, string, string) {
+	identity, present, err := state.PeekDeploymentID(dir)
+
+	switch {
+	case err != nil:
+		return "", "unreadable", "read the deployment identity: " + err.Error()
+	case !present:
+		return "", "absent", "no deployment identity is minted in " + dir + ", so no row can be associated with this host"
+	default:
+		return identity, "minted", ""
+	}
+}
+
+// observeRetireAuthority asks only whether remnants exist. A LINK IS STILL
+// A REMNANT, even when its target is gone; only two positive absences admit an
+// uncommissioned host. Neither path is opened for its contents.
+func observeRetireAuthority(dir string) string {
+	fact := "absent"
+
+	for _, path := range []string{wirecert.CADir(dir), wirecert.AuthorityMarkerPath(dir)} {
+		switch _, err := os.Lstat(path); {
+		case err == nil:
+			return "present"
+		case errors.Is(err, fs.ErrNotExist):
+		default:
+			fact = "unreadable"
+		}
+	}
+
+	return fact
 }
 
 // observeRetireDryRunConfig types the installed configuration for the report:
@@ -1297,27 +1535,17 @@ func readRetireRowByLocator(ctx context.Context, j retirement.Journal) (*retireR
 
 // readRetireRow reads the row for the dry run and classifies it for THIS
 // host: `unreadable` with its reason on anything but a positive read, never
-// absence. An unminted identity cannot be associated with any row, so it is
-// unreadable too. A SQLite ledger owned by another account is read AS THAT
-// ACCOUNT through `rollout status --json`, because a read-only open of a
-// stopped SQLite ledger creates the -wal and -shm sidecars owned by whoever
-// opened it, and root-owned sidecars keep the service from reopening it.
-func readRetireRow(ctx context.Context, cfg *config.Config, m retireMode) (*retireReportRow, retirement.RowFact, string) {
+// absence. The caller supplies the identity it observed. A SQLite ledger owned
+// by another account is read AS THAT ACCOUNT through `rollout status --json`,
+// because a read-only open of a stopped SQLite ledger creates the -wal and -shm
+// sidecars owned by whoever opened it, and root-owned sidecars keep the service
+// from reopening it.
+func readRetireRow(ctx context.Context, cfg *config.Config, identity string, m retireMode) (*retireReportRow, retirement.RowFact, string) {
 	bounded, cancel := retireReportTimeout(ctx, retireReportLedgerBound)
 	defer cancel()
 
 	if err := bounded.Err(); err != nil {
 		return nil, retirement.RowUnreadable, retireReportLedgerWhy(ctx, bounded, err, "read the retirement row")
-	}
-
-	identity, ok, err := state.PeekDeploymentID(cfg.Server.IdentityDir)
-
-	switch {
-	case err != nil:
-		return nil, retirement.RowUnreadable, "read the deployment identity: " + err.Error()
-	case !ok:
-		return nil, retirement.RowUnreadable, "no deployment identity is minted in " + cfg.Server.IdentityDir +
-			", so no row can be associated with this host"
 	}
 
 	dsn, err := ledgerDSNFrom(cfg, m.environmentFile)
