@@ -367,6 +367,18 @@ func TestASettledRetirementCannotTellFromAnAnswerSystemdDidNotGive(t *testing.T)
 			"ExecMainStartTimestamp=\n",
 		"no main process answered": "LoadState=loaded\nActiveState=inactive\nSubState=dead\nResult=success\n" +
 			"KillMode=mixed\nMainPID=\nUnitFileState=disabled\nInvocationID=\nExecMainStartTimestamp=\n",
+
+		// A NEGATIVE MAIN PID IS MALFORMED EVIDENCE, NOT PROOF OF NO PROCESS.
+		// `strconv.Atoi` reads `-1` happily, so a rule that refused only a
+		// POSITIVE answer would read this inactive, disabled unit as quiesced
+		// — and quiescence is the clause the archive's safety rests on.
+		// systemd answers no unit's main pid that way.
+		"a main process that is a negative number": "LoadState=loaded\nActiveState=inactive\nSubState=dead\n" +
+			"Result=success\nKillMode=mixed\nMainPID=-1\nUnitFileState=disabled\nInvocationID=\n" +
+			"ExecMainStartTimestamp=\n",
+		"a main process that is not a number": "LoadState=loaded\nActiveState=inactive\nSubState=dead\n" +
+			"Result=success\nKillMode=mixed\nMainPID=none\nUnitFileState=disabled\nInvocationID=\n" +
+			"ExecMainStartTimestamp=\n",
 	}
 
 	for name, unit := range cases {
@@ -538,4 +550,75 @@ func TestARetirementInterruptedBetweenTheMarkerAndSettledIsFinished(t *testing.T
 	if !j.Settled {
 		t.Fatalf("the journal was not settled: %+v", j)
 	}
+}
+
+// THE OTHER HALF OF THE SAME RULE, on the node a retirement KEPT: there the
+// postcondition requires a process, so a negative pid read as a number would
+// say the node is running when nothing established that. Zero is the one
+// answer that means no process, and on this host it is a refusal rather than
+// could-not-tell: the unit is active and systemd told us it has none.
+func TestARetainedNodesMainProcessIsJudgedAsAProcessId(t *testing.T) {
+	for name, c := range map[string]struct {
+		pid  string
+		code int
+	}{
+		"a negative number":   {pid: "-1", code: exitUnknown},
+		"not a number at all": {pid: "none", code: exitUnknown},
+		"no process":          {pid: "0", code: exitRefused},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newRequestFixture(t)
+			f.retainANode(t)
+			f.reserve(t)
+
+			record := useRegistrationRecord(t)
+
+			f.svc.onStart = func(unit string) {
+				if unit == nodeUnit {
+					restartedNode(t, f, record, retainedEndpoint)
+				}
+			}
+
+			// THE RETIREMENT COMPLETES FIRST, with the node running under a
+			// real pid: that is the baseline each case below is a drift FROM,
+			// and a case that could not reach it would prove nothing.
+			out, code := f.retainedRequest(t, f.input(t, f.retainedOverrides(t)))
+			retiredAnswer(t, out, code)
+
+			setMainPID(t, filepath.Join(f.unitsDir, nodeUnit), c.pid)
+
+			out, code = f.retainedRequest(t, f.input(t, f.retainedOverrides(t)))
+
+			m := retireAnswer(t, out)
+			if m["reason"] != retireReasonPostcondition || code != c.code {
+				t.Fatalf("a retained node whose main pid is %q: %s", c.pid, out)
+			}
+
+			if !strings.Contains(whyOf(m), nodeUnit) {
+				t.Fatalf("the answer does not name the unit: %s", out)
+			}
+		})
+	}
+}
+
+// setMainPID rewrites a unit's answer for its main process, whatever it says
+// now: the value a fixture left there is the fake service manager's business,
+// and a case that matched a literal would pass vacuously the day it changed.
+func setMainPID(t *testing.T, path, pid string) {
+	t.Helper()
+
+	lines := strings.Split(mustRead(t, path), "\n")
+	found := false
+
+	for i, line := range lines {
+		if strings.HasPrefix(line, "MainPID=") {
+			lines[i], found = "MainPID="+pid, true
+		}
+	}
+
+	if !found {
+		t.Fatalf("%s answers no main process to rewrite", path)
+	}
+
+	writeFile(t, path, strings.Join(lines, "\n"), 0o644)
 }
