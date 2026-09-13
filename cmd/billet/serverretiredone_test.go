@@ -115,6 +115,10 @@ func TestASettledRetirementIsUnchangedAndTakesNothing(t *testing.T) {
 		t.Fatalf("the postconditions: %v", held)
 	}
 
+	if held["status"] != retireStatusDone {
+		t.Fatalf("the status the retirement published: %v", held)
+	}
+
 	// THE COMMITTED FIXTURE FOR THIS ANSWER ARRIVES WITH THE ROLE that reads
 	// it: a producer's fixture is written by running its producer, and the
 	// role's parser is what gives it a reader.
@@ -315,5 +319,71 @@ func TestARetirementWhoseArchiveIsGoneIsUnknown(t *testing.T) {
 	m := retireAnswer(t, out)
 	if m["reason"] != retireReasonIdentity || code != exitUnknown {
 		t.Fatalf("a retirement whose archive is gone: %s", out)
+	}
+}
+
+// THE PUBLISHED STATUS IS WHAT CLOSES THE AUTHORITY TO EVERY ORDINARY WRITER,
+// so a retired host whose status went missing is one the next `ca rotate`
+// would be admitted on. A converge republishes it from the journal — which is
+// the record — and says that it did.
+func TestASettledRetirementRepublishesAStatusThatWentMissing(t *testing.T) {
+	f := newRequestFixture(t)
+	f.reserve(t)
+
+	settleRetirement(t, f)
+	retiredUnits(t, f)
+
+	mustOK(t, os.Remove(retirement.StatusPath()))
+
+	out, code := retiredRequest(t, f, requestRun)
+
+	m := retireAnswer(t, out)
+	if code != 0 || m["outcome"] != retireOutcomeUnchanged {
+		t.Fatalf("a converge over a retired host whose status went missing: %s", out)
+	}
+
+	held, ok := m["postconditions"].(map[string]any)
+	if !ok || held["status"] != retireStatusRepublished {
+		t.Fatalf("the status was not republished: %s", out)
+	}
+
+	st, presence, err := retirement.ReadStatus()
+	if err != nil || presence != retirement.StatusPresent || st.Phase != retirement.PhaseDone {
+		t.Fatalf("the status on disk: %+v %d %v", st, presence, err)
+	}
+}
+
+// A PROPERTY SYSTEMD DID NOT ANSWER IS COULD-NOT-TELL, never a refusal: a
+// refusal is a claim about what this host holds, and an empty answer
+// establishes nothing. The two are different exit statuses to the role.
+func TestASettledRetirementCannotTellFromAnAnswerSystemdDidNotGive(t *testing.T) {
+	cases := map[string]string{
+		"no active state": "LoadState=loaded\nActiveState=\nSubState=dead\nResult=success\nKillMode=mixed\n" +
+			"MainPID=0\nUnitFileState=disabled\nInvocationID=\nExecMainStartTimestamp=\n",
+		"no enablement": "LoadState=loaded\nActiveState=inactive\nSubState=dead\nResult=success\nKillMode=mixed\n" +
+			"MainPID=0\nUnitFileState=\nInvocationID=\nExecMainStartTimestamp=\n",
+		"a state this billet does not know": "LoadState=loaded\nActiveState=refurbishing\nSubState=dead\n" +
+			"Result=success\nKillMode=mixed\nMainPID=0\nUnitFileState=disabled\nInvocationID=\n" +
+			"ExecMainStartTimestamp=\n",
+		"no main process answered": "LoadState=loaded\nActiveState=inactive\nSubState=dead\nResult=success\n" +
+			"KillMode=mixed\nMainPID=\nUnitFileState=disabled\nInvocationID=\nExecMainStartTimestamp=\n",
+	}
+
+	for name, unit := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newRequestFixture(t)
+			f.reserve(t)
+
+			settleRetirement(t, f)
+			retiredUnits(t, f)
+			writeFile(t, filepath.Join(f.unitsDir, serverUnit), unit, 0o644)
+
+			out, code := retiredRequest(t, f, requestRun)
+
+			m := retireAnswer(t, out)
+			if m["reason"] != retireReasonPostcondition || code != exitUnknown {
+				t.Fatalf("an answer systemd did not give: %s", out)
+			}
+		})
 	}
 }

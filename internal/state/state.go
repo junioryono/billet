@@ -665,6 +665,25 @@ func Unreachable(err error) bool {
 	return found.out && !found.refused && !found.cancelled
 }
 
+// Describe renders err for a diagnostic, or says it could not be rendered.
+//
+// `Error()` FOLLOWS THE SAME CAUSES THE WALK DOES, and with no bound of its
+// own: `net.OpError`'s formatter prints its cause, so an error whose cause is
+// itself exhausts the stack in the very refusal a caller writes ABOUT not
+// being able to classify it. A caller that bounded its classification and then
+// formatted the error would still die.
+func Describe(err error) string {
+	if err == nil {
+		return ""
+	}
+
+	if !walkCauses(err, func(error) {}) {
+		return "an error whose causes do not end, which this billet will not render"
+	}
+
+	return err.Error()
+}
+
 // Matches reports whether target is one of err's causes, over the SAME BOUNDED
 // WALK the classifiers use.
 //
@@ -686,7 +705,7 @@ func Matches(err, target error) bool {
 	found := false
 
 	whole := walkCauses(err, func(cause error) {
-		if cause == target { //nolint:errorlint,err113 // node-local by design: the walk reaches what each cause wraps
+		if matchesHere(cause, target) {
 			found = true
 		}
 	})
@@ -725,16 +744,35 @@ func OnlyCancellation(err error) bool {
 	return only && whole
 }
 
-// isCancellation asks whether THIS cause is a context ending, by identity
-// rather than by `errors.Is`.
+// matchesHere asks whether THIS cause is target, without looking under it:
+// identity, then the node's OWN `Is` method if it has one.
 //
-// EVERY TEST IN THE WALK IS NODE-LOCAL, and this is the one that has to be
-// said out loud: `errors.Is` searches the subtree recursively, so on an error
-// whose causes form a cycle it does not return — and it would do that INSIDE
-// the walk, before the walk's own budget could stop anything. The walk reaches
-// every wrapped cause itself, so asking each node what it IS loses nothing.
+// THE `Is` METHOD IS NOT OPTIONAL. Go's net package answers a cancelled or
+// timed-out operation with an error that matches `context.Canceled` and
+// `context.DeadlineExceeded` THROUGH `Is` and never unwraps to them, so
+// identity alone would read an operator's cancelled dial as an outage.
+//
+// AND IT IS SHALLOW, which is the whole point: `errors.Is` searches the
+// subtree recursively, so on an error whose causes form a cycle it does not
+// return — and it would do that INSIDE the walk, before the walk's own budget
+// could stop anything. The walk reaches every wrapped cause itself. The
+// residual, stated: a node whose own `Is` recurses into its causes is outside
+// this bound, because that method is the node's own code.
+func matchesHere(err, target error) bool {
+	if err == target { //nolint:errorlint,err113 // node-local by design; see above
+		return true
+	}
+
+	if is, ok := err.(interface{ Is(error) bool }); ok { //nolint:errorlint // asking THIS node, not its causes
+		return is.Is(target)
+	}
+
+	return false
+}
+
+// isCancellation asks whether THIS cause is a context ending.
 func isCancellation(err error) bool {
-	return err == context.DeadlineExceeded || err == context.Canceled //nolint:errorlint,err113 // node-local by design; see above
+	return matchesHere(err, context.DeadlineExceeded) || matchesHere(err, context.Canceled)
 }
 
 func hasCauses(err error) bool {
@@ -792,7 +830,7 @@ func reachEvidenceOf(err error) (reachEvidence, bool) {
 			return
 		}
 
-		if cause == driver.ErrBadConn || cause == io.ErrUnexpectedEOF { //nolint:errorlint,err113 // node-local by design; the walk reaches what this wraps
+		if matchesHere(cause, driver.ErrBadConn) || matchesHere(cause, io.ErrUnexpectedEOF) {
 			found.out = true
 
 			return

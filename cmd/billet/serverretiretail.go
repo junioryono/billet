@@ -271,7 +271,7 @@ func retireTailRow(ctx context.Context, j retirement.Journal, answer *retireTail
 			"state %s), and this host's transition is complete", row.Retiring, row.Run, row.State),
 			"the runbook in docs/operating/upgrades.md")
 	case state.Matches(err, state.ErrRetirementMismatch), state.Matches(err, state.ErrRetirementMoved):
-		return j, retireUnknown(retireReasonMismatch, err.Error(), "the runbook in docs/operating/upgrades.md")
+		return j, retireUnknown(retireReasonMismatch, state.Describe(err), "the runbook in docs/operating/upgrades.md")
 	case err != nil:
 		// THE ROW MAY HAVE BEEN WRITTEN and the answer lost; pending is right
 		// either way, because the survivor's completion and the next tail both
@@ -358,7 +358,7 @@ func retireOpenLedgerByLocator(ctx context.Context, j retirement.Journal) (*stat
 	// retiring from, which is not a thing to wait out.
 	if closed := db.Close(); closed != nil {
 		return nil, ledgerProblem{refusal: retireUnknown(retireReasonLedger,
-			err.Error()+"; and closing the ledger: "+closed.Error(), "")}
+			state.Describe(err)+"; and closing the ledger: "+state.Describe(closed), "")}
 	}
 
 	return nil, ledgerProblem{cause: err}
@@ -416,14 +416,14 @@ func retireLocatorDSN(loc retirement.JournalLocator) (string, string, *retireRef
 func retirePendingReason(err error) string {
 	switch {
 	case state.Unreachable(err):
-		return "the ledger's database could not be reached (" + err.Error() + ")"
+		return "the ledger's database could not be reached (" + state.Describe(err) + ")"
 	case state.Matches(err, state.ErrSchemaAhead):
-		return "the ledger's schema is newer than this binary's, so this host may not write it (" + err.Error() + ")"
+		return "the ledger's schema is newer than this binary's, so this host may not write it (" + state.Describe(err) + ")"
 	case state.Matches(err, state.ErrSchemaBehind):
 		return "the ledger's schema is older than this binary's and no control plane has migrated it here (" +
-			err.Error() + ")"
+			state.Describe(err) + ")"
 	case state.Matches(err, state.ErrReleaseBehind):
-		return "a newer billet has served this ledger, so this host may not write it (" + err.Error() + ")"
+		return "a newer billet has served this ledger, so this host may not write it (" + state.Describe(err) + ")"
 	default:
 		return ""
 	}
@@ -450,7 +450,7 @@ func retireLedgerProblem(outer, bounded context.Context, err error, doing string
 		return nil
 	}
 
-	return retireUnknown(retireReasonLedger, doing+": "+err.Error(), "")
+	return retireUnknown(retireReasonLedger, doing+": "+state.Describe(err), "")
 }
 
 // retireDeadlinePending says whether a DEADLINE ended this attempt, and whose

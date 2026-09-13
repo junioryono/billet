@@ -43,6 +43,7 @@ type retireDoneAnswer struct {
 
 // retirePostconditions is the completed retirement's contract, as observed.
 type retirePostconditions struct {
+	Status        string `json:"status"`
 	Config        string `json:"config"`
 	Server        string `json:"server"`
 	Node          string `json:"node"`
@@ -62,6 +63,10 @@ const (
 	retireConfigAbsent  = "absent"
 
 	retireArchivePresent = "present"
+
+	// The published status either already said `done`, or this run said it.
+	retireStatusDone        = "done"
+	retireStatusRepublished = "republished"
 )
 
 // retireDoneProperties is what every postcondition asks systemd for. A timer
@@ -109,9 +114,46 @@ func retireDone(ctx context.Context, m retireMode, root *txLock, dir *os.File, s
 		return nil, r
 	}
 
+	// THE PUBLISHED STATUS IS THE ONE POSTCONDITION THAT IS NOT A RECORD: it
+	// is the file every ordinary authority writer reads to learn this host is
+	// closed, so a retired host whose status went missing is one the next
+	// `ca rotate` would be admitted on. It is repaired here rather than
+	// refused — the journal is the record and this run knows what the status
+	// should say — and the answer says which happened.
+	status, r := retireStatusPostcondition(j)
+	if r != nil {
+		return nil, r
+	}
+
+	held.Status = status
+
 	return &retireDoneAnswer{Schema: retireSchema, Outcome: retireOutcomeUnchanged, Phase: j.Phase,
 		Variant: j.Variant, TransitionID: j.Provenance.TransitionID, Settled: true, RowDone: j.RowDone,
 		CompletedBy: j.CompletedBy, Postconditions: held}, nil
+}
+
+// retireStatusPostcondition holds the published status to the journal, and
+// republishes one that went missing, was damaged, or says something below what
+// the journal reached.
+func retireStatusPostcondition(j retirement.Journal) (string, *retireRefusal) {
+	st, presence, err := retirement.ReadStatus()
+
+	switch presence {
+	case retirement.StatusPresent:
+		if st.Phase == retirement.PhaseDone && st.Variant == j.Variant {
+			return retireStatusDone, nil
+		}
+	case retirement.StatusAbsent, retirement.StatusMalformed:
+	default:
+		return "", atRetirePhase(j, retireUnknown(retireReasonStatus,
+			"the published status could not be read: "+errorText(err), ""))
+	}
+
+	if err := retirement.WriteStatus(retirement.PhaseDone, j.Variant, retireNow()); err != nil {
+		return "", atRetirePhase(j, retireUnknown(retireReasonStatus, "publish the status: "+errorText(err), ""))
+	}
+
+	return retireStatusRepublished, nil
 }
 
 // retireArchivedIdentity reads the deployment identity where a completed
@@ -235,15 +277,29 @@ func retireUnitPostcondition(ctx context.Context, insp *lifeops.Inspector, unit 
 	load, active := firstProp(props, "LoadState"), firstProp(props, "ActiveState")
 	enablement, main := firstProp(props, "UnitFileState"), firstProp(props, "MainPID")
 
+	// A PROPERTY SYSTEMD DID NOT ANSWER, OR ANSWERED WITH A WORD THIS BILLET
+	// DOES NOT KNOW, IS COULD-NOT-TELL. A refusal is a claim about what this
+	// host holds, and an empty answer establishes nothing; the two are
+	// different exit statuses to the role for that reason.
+	if !knownActiveState(active) {
+		return "", retireUnknown(retireReasonPostcondition, fmt.Sprintf("systemd answered %s's state as %s, which this "+
+			"billet does not know", unit, activeWord(active)), "")
+	}
+
 	if alive {
 		if active != "active" {
 			return "", retireRefuse(retireReasonPostcondition, fmt.Sprintf("%s is %s on a host that kept its node",
-				unit, activeWord(active)), "")
+				unit, active), "")
+		}
+
+		if !knownUnitFileState(enablement) {
+			return "", retireUnknown(retireReasonPostcondition, fmt.Sprintf("systemd answered %s's enablement as %s, "+
+				"which this billet does not know", unit, activeWord(enablement)), "")
 		}
 
 		if enablement != "enabled" {
 			return "", retireRefuse(retireReasonPostcondition, fmt.Sprintf("%s is %s, not persistently enabled, on a "+
-				"host that kept its node", unit, activeWord(enablement)), "")
+				"host that kept its node", unit, enablement), "")
 		}
 
 		return retireUnitRunning, nil
@@ -251,7 +307,7 @@ func retireUnitPostcondition(ctx context.Context, insp *lifeops.Inspector, unit 
 
 	if active != "inactive" {
 		return "", retireRefuse(retireReasonPostcondition, fmt.Sprintf("%s is %s and a completed retirement leaves it "+
-			"inactive", unit, activeWord(active)), "")
+			"inactive", unit, active), "")
 	}
 
 	// A UNIT THAT NAMES NO PROCESS IS NOT A UNIT WITH NO PROCESS. systemd
@@ -279,13 +335,42 @@ func retireUnitPostcondition(ctx context.Context, insp *lifeops.Inspector, unit 
 		return retireUnitNotFound, nil
 	}
 
+	if !knownUnitFileState(enablement) {
+		return "", retireUnknown(retireReasonPostcondition, fmt.Sprintf("systemd answered %s's enablement as %s, which "+
+			"this billet does not know", unit, activeWord(enablement)), "")
+	}
+
 	switch enablement {
 	case "disabled", "masked":
 		return retireUnitQuiet, nil
 	default:
+		// `masked-runtime` is among these deliberately: it hides persistent
+		// enablement and is gone at the next boot.
 		return "", retireRefuse(retireReasonPostcondition, fmt.Sprintf("%s is %s, and a completed retirement leaves it "+
-			"disabled or masked", unit, activeWord(enablement)), "")
+			"disabled or masked", unit, enablement), "")
 	}
+}
+
+// knownActiveState and knownUnitFileState are systemd's own vocabularies. A
+// word outside them is one systemd has added since, and no reason to say
+// anything definite about this host.
+func knownActiveState(state string) bool {
+	switch state {
+	case "active", "reloading", "inactive", "failed", "activating", "deactivating", "maintenance", "refreshing":
+		return true
+	}
+
+	return false
+}
+
+func knownUnitFileState(state string) bool {
+	switch state {
+	case "enabled", "enabled-runtime", "linked", "linked-runtime", "alias", "masked", "masked-runtime", "static",
+		"indirect", "disabled", "generated", "transient", "bad":
+		return true
+	}
+
+	return false
 }
 
 // activeWord renders a property systemd answered with, or says it answered
