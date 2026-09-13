@@ -436,27 +436,52 @@ func TestKnownDemandOrderDoesNotFollowObservationArrival(t *testing.T) {
 // REDELIVERY CANNOT TURN AN EXISTING PROMISE INTO UNMET DEMAND. The spare slot
 // must go to the idle peer even if GitHub repeats the already-acquired offer.
 func TestARepeatedOfferDoesNotPreemptDiscovery(t *testing.T) {
-	_, listeners := arbitrationListeners(t, []config.Tier{tier("a-work"), tier("b-idle")}, 2*tierVCPU)
-	work, idle := listeners[0], listeners[1]
-	work.observed = &Statistics{TotalAvailableJobs: 1}
-	if err := work.prepareEscrow(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-	_, turn := work.admissionPoll()
-	offer := &Message{MessageID: 1, Available: []Job{{RequestID: 11, RunID: 101}}}
-	if err := work.handle(t.Context(), offer); err != nil {
-		t.Fatal(err)
-	}
-	work.finishAdmissionTurn(turn)
-	if err := work.handle(t.Context(), offer); err != nil {
-		t.Fatal(err)
-	}
-	if err := idle.prepareEscrow(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-	if idle.capacity() != 1 || work.capacity() != 1 || len(work.waitingOffers) != 0 {
-		t.Fatalf("repeated offer left idle %d, work %d, waiting %d; want 1, 1, 0",
-			idle.capacity(), work.capacity(), len(work.waitingOffers))
+	for _, tc := range []struct {
+		name      string
+		requestID int64
+	}{
+		{name: "request id", requestID: 11},
+		{name: "zero request id", requestID: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, listeners := arbitrationListeners(t, []config.Tier{tier("a-work"), tier("b-idle")}, 2*tierVCPU)
+			work, idle := listeners[0], listeners[1]
+			session := &fakeSession{}
+			work.session = session
+			work.observed = &Statistics{TotalAvailableJobs: 1}
+			if err := work.prepareEscrow(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			_, turn := work.admissionPoll()
+			offer := &Message{MessageID: 1, Available: []Job{{RequestID: tc.requestID, RunID: 101, JobID: "job-a"}}}
+			if err := work.handle(t.Context(), offer); err != nil {
+				t.Fatal(err)
+			}
+			if ids := session.acquiredIDs(); !slices.Equal(ids, []int64{tc.requestID}) || work.Acquiring() != 1 {
+				t.Fatalf("initial acquisition = %v, promises %d; want [%d], 1", ids, work.Acquiring(), tc.requestID)
+			}
+			work.finishAdmissionTurn(turn)
+			if err := idle.prepareEscrow(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			sent, idleTurn := idle.admissionPoll()
+			if sent != 1 || idleTurn == 0 {
+				t.Fatalf("peer discovery sent %d with turn %d; want one backed turn", sent, idleTurn)
+			}
+			if err := work.handle(t.Context(), offer); err != nil {
+				t.Fatal(err)
+			}
+			if sent, turn := idle.admissionPoll(); sent != 1 || turn != idleTurn {
+				t.Fatalf("redelivery revoked peer discovery: sent %d, turn %d; want 1, %d", sent, turn, idleTurn)
+			}
+			if ids := session.acquiredIDs(); !slices.Equal(ids, []int64{tc.requestID}) {
+				t.Fatalf("redelivery acquired the same job again: %v", ids)
+			}
+			if idle.capacity() != 1 || work.capacity() != 1 || len(work.waitingOffers) != 0 {
+				t.Fatalf("repeated offer left idle %d, work %d, waiting %d; want 1, 1, 0",
+					idle.capacity(), work.capacity(), len(work.waitingOffers))
+			}
+		})
 	}
 }
 
@@ -516,8 +541,12 @@ func TestDirectOfferDemandKeepsSeparateJobIdentities(t *testing.T) {
 	if err := first.prepareEscrow(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	second.rememberAvailable(&Message{Available: []Job{{JobID: "job-a"}, {JobID: "job-b"}}})
-	second.rememberAvailable(&Message{Completed: []Job{{JobID: "job-a"}}})
+	if err := second.rememberAvailable(t.Context(), &Message{Available: []Job{{JobID: "job-a"}, {JobID: "job-b"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.rememberAvailable(t.Context(), &Message{Completed: []Job{{JobID: "job-a"}}}); err != nil {
+		t.Fatal(err)
+	}
 	second.observeDemand(nil)
 	_, turn := first.admissionPoll()
 	first.finishAdmissionTurn(turn)
@@ -556,6 +585,57 @@ func TestCancelledOfferDoesNotCreateAPromise(t *testing.T) {
 	if work.committedCapacity() != 0 || idle.capacity() != 1 {
 		t.Fatalf("cancelled offer kept capacity: work %d, idle %d",
 			work.committedCapacity(), idle.capacity())
+	}
+
+	for _, unrelated := range []bool{false, true} {
+		t.Run(map[bool]string{false: "pooled completion", true: "unrelated offer shares launch id"}[unrelated], func(t *testing.T) {
+			tiers := []config.Tier{tier("a-work")}
+			a := newAllocator(t, alloc.Limits{MaxVCPU: tierVCPU, MaxMemory: 64 * config.GiB}, tiers)
+			session := &fakeSession{}
+			var destroyed []int64
+			work := NewListener(a, tiers[0].Label, session, WithRunner(&fakeRunner{
+				onDestroy: func(requestID int64) error {
+					destroyed = append(destroyed, requestID)
+					return nil
+				},
+			}), WithRunnerRegistry(&fakeRunnerRegistry{}))
+			if err := work.refillEscrow(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if err := work.handle(t.Context(), &Message{
+				MessageID: 1, Statistics: &Statistics{TotalAssignedJobs: 1},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			members, err := a.PoolRunners(t.Context(), work.tier)
+			if err != nil || len(members) != 1 || members[0].LaunchRequestID >= 0 {
+				t.Fatalf("anonymous pool runner = %+v, err %v", members, err)
+			}
+			member := members[0]
+			actual := Job{RequestID: 12, RunID: 101, JobID: "completed-job",
+				RunnerID: 77, RunnerName: member.RunnerName, Result: "Succeeded"}
+			available := []Job{{RequestID: actual.RequestID, RunID: actual.RunID, JobID: actual.JobID}}
+			var want []int64
+			if unrelated {
+				available = append(available, Job{RequestID: member.LaunchRequestID, RunID: 102, JobID: "unfinished-job"})
+				want = []int64{member.LaunchRequestID}
+			}
+			if err := work.handle(t.Context(), &Message{
+				MessageID: 2, Started: []Job{actual}, Completed: []Job{actual}, Available: available,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if ids := session.acquiredIDs(); !slices.Equal(ids, want) {
+				t.Errorf("acquired %v, want %v; completion must filter actual request 12 only", ids, want)
+			}
+			if !slices.Equal(destroyed, []int64{member.LaunchRequestID}) {
+				t.Errorf("destroyed %v, want launch request %d", destroyed, member.LaunchRequestID)
+			}
+			if work.Running() != 0 || work.Acquiring() != len(want) {
+				t.Errorf("after completion: running %d, promises %d; want 0, %d",
+					work.Running(), work.Acquiring(), len(want))
+			}
+		})
 	}
 }
 

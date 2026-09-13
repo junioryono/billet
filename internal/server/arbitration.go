@@ -239,9 +239,9 @@ func (l *Listener) finishAdmissionTurn(turn uint64) {
 // rememberAvailable retains a refused offer as known demand until it is accepted,
 // assigned, completed, or replaced by a source snapshot reporting no available
 // work. A timer never turns silence into proof that the queue is empty.
-func (l *Listener) rememberAvailable(msg *Message) {
+func (l *Listener) rememberAvailable(ctx context.Context, msg *Message) error {
 	if l.arbiter == nil {
-		return
+		return nil
 	}
 	if msg.Statistics != nil && msg.Statistics.TotalAvailableJobs == 0 {
 		clear(l.waitingOffers)
@@ -249,9 +249,14 @@ func (l *Listener) rememberAvailable(msg *Message) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	for _, job := range msg.Available {
+		identified, err := l.identifyAssigned(ctx, job)
+		if err != nil {
+			return err
+		}
 		// A REPEATED OFFER DOES NOT CREATE A SECOND BACKLOG ENTRY. reserve
-		// skips existing commitments, so nobody would remove this hint later.
-		if l.acquiring[job.RequestID] != nil || l.running[job.RequestID] != nil {
+		// uses durable identities even when the wire request id is zero. Resolve
+		// before publishing demand, which could revoke a peer's discovery turn.
+		if l.acquiring[identified.RequestID] != nil || l.running[identified.RequestID] != nil {
 			continue
 		}
 		l.waitingOffers[identityOfOffer(job)] = true
@@ -262,6 +267,7 @@ func (l *Listener) rememberAvailable(msg *Message) {
 	for _, job := range msg.Completed {
 		delete(l.waitingOffers, identityOfOffer(job))
 	}
+	return nil
 }
 
 // admissionPoll fixes the advertisement and its turn as one decision. Demand

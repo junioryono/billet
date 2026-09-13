@@ -3036,7 +3036,9 @@ func (l *Listener) refillEscrowUngated(ctx context.Context, target int) error {
 // about error severity, so the first non-fatal error path anyone adds inherits
 // the question.
 func (l *Listener) handle(ctx context.Context, msg *Message) error {
-	l.rememberAvailable(msg)
+	if err := l.rememberAvailable(ctx, msg); err != nil {
+		return err
+	}
 	// STARTS PRECEDE COMPLETIONS EVEN WHEN GITHUB BATCHES THEM TOGETHER. The
 	// start is the authoritative runner-to-job binding; resolving the completion
 	// first would either settle the request that caused launch or mistake a busy
@@ -3066,6 +3068,7 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 	// redelivery rebuilds it before the assignments are read. A longer-lived map would
 	// silently skip a request id GitHub requeued after cancelling it.
 	finished := make(map[int64]struct{}, len(msg.Completed))
+	finishedOffers := make(map[int64]struct{}, len(msg.Completed))
 	completed := make([]Job, 0, len(msg.Completed))
 	poisoned := make([]error, 0, len(msg.Completed))
 
@@ -3082,6 +3085,16 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 			}
 
 			return err
+		}
+		// Offers name the actual job; cleanup names the runner's launch request.
+		// Only a validated completion with a job identity can suppress an offer.
+		actual := msg.Completed[i]
+		if actual.RequestID != 0 || actual.JobID != "" {
+			actual, err = l.identifyAssigned(ctx, actual)
+			if err != nil {
+				return err
+			}
+			finishedOffers[actual.RequestID] = struct{}{}
 		}
 		completed = append(completed, job)
 	}
@@ -3202,7 +3215,7 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 		// AVAILABLE is what gets acquired. Available is the offer; Assigned is the
 		// confirmation that an offer was claimed. Acquiring from Assigned asks
 		// GitHub to claim work it has already handed over, and drops every offer.
-		if err := l.acquireUnfinished(ctx, msg.Available, finished); err != nil {
+		if err := l.acquireUnfinished(ctx, msg.Available, finishedOffers); err != nil {
 			return err
 		}
 	}
