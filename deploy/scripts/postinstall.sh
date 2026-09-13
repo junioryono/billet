@@ -141,6 +141,21 @@ chmod 0750 "${CONF_DIR}"
 # and an intended start, so it is not the retry for an unseeded host).
 LIFECYCLE_LOCK=/var/lock/billet-lifecycle.lock
 
+# remove_or_name removes a temporary file this script made, or says which one
+# it left. A filesystem that went read-only after the file was created is the
+# case: the removal fails, and a handler that discarded the status would leave
+# a stray beside a configuration or a lock with nothing said about it. It never
+# fails an install by itself; the caller decides what its answer means.
+remove_or_name() {
+    if rm -f "$1" 2>/dev/null; then
+        return 0
+    fi
+
+    echo "billet: ${1} could not be removed and is still there; delete it." >&2
+
+    return 1
+}
+
 # EVERY MUTATION HERE CHECKS ITSELF, because nothing in this function is
 # covered by `set -e`: it runs inside a subshell that is an `if` condition, and
 # POSIX suspends errexit for a condition AND everything it calls. A copy onto a
@@ -185,9 +200,9 @@ seed_config() {
         # handlers END that shell, because a handler that returned would have
         # the seeding carry on as though the signal had not arrived. Every way
         # out below clears them, so nothing of this is left installed.
-        trap 'rm -f "${seed_temp}" 2>/dev/null; exit 130' INT
-        trap 'rm -f "${seed_temp}" 2>/dev/null; exit 143' TERM
-        trap 'rm -f "${seed_temp}" 2>/dev/null' EXIT
+        trap 'remove_or_name "${seed_temp}"; exit 130' INT
+        trap 'remove_or_name "${seed_temp}"; exit 143' TERM
+        trap 'remove_or_name "${seed_temp}"' EXIT
 
         # -T SO AN EXISTING NAME IS ALWAYS REFUSED: without it, a destination
         # that became a directory under this run would have the temporary file
@@ -197,9 +212,7 @@ seed_config() {
             echo "billet: ${TEMPLATE} could not be installed at ${CONF}, which is left as it" >&2
             echo "        was." >&2
 
-            if ! rm -f "${seed_temp}"; then
-                echo "        ${seed_temp} could not be removed and is still there; delete it." >&2
-            fi
+            remove_or_name "${seed_temp}" || true
 
             trap - EXIT INT TERM
 
@@ -209,9 +222,9 @@ seed_config() {
         # THE SECOND LINK IS THIS SCRIPT'S OWN, and a removal that fails leaves
         # the configuration published under two names, which is said rather
         # than reported as a clean seeding.
-        if ! rm -f "${seed_temp}"; then
-            echo "billet: ${CONF} was seeded, and the temporary ${seed_temp} it was published" >&2
-            echo "        from could not be removed; delete it." >&2
+        if ! remove_or_name "${seed_temp}"; then
+            echo "        ${CONF} WAS seeded from it, so the configuration is published under" >&2
+            echo "        two names until that one is gone." >&2
 
             trap - EXIT INT TERM
 
@@ -387,9 +400,9 @@ lock_name_ordinary() {
     (
         lock_temp=$(mktemp "${LIFECYCLE_LOCK}.XXXXXX" 2>/dev/null) || exit 0
 
-        trap 'rm -f "${lock_temp}" 2>/dev/null; exit 130' INT
-        trap 'rm -f "${lock_temp}" 2>/dev/null; exit 143' TERM
-        trap 'rm -f "${lock_temp}" 2>/dev/null' EXIT
+        trap 'remove_or_name "${lock_temp}"; exit 130' INT
+        trap 'remove_or_name "${lock_temp}"; exit 143' TERM
+        trap 'remove_or_name "${lock_temp}"' EXIT
 
         chmod 0600 "${lock_temp}" 2>/dev/null || true
         ln -T -- "${lock_temp}" "${LIFECYCLE_LOCK}" 2>/dev/null || true
