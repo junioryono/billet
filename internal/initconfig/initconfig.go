@@ -811,10 +811,8 @@ func roundDownGiB(b config.ByteSize) config.ByteSize {
 
 // tierMemoryPerVCPU is the proportion every generated ladder is shaped to.
 //
-// ONE NAME rather than the literal repeated per backend, because the tart
-// catalogue has to RESERVE a rung it has not built yet — a reservation computed
-// from a second copy of this number is a reservation that stops matching the
-// ladder the moment either moves.
+// ONE PROPORTION FOR EVERY BACKEND keeps the same size label comparable across
+// local and remote catalogues.
 const tierMemoryPerVCPU = 4 * config.GiB
 
 // tierLadder is the vCPU ladder a measured host's catalogue is drawn from,
@@ -828,46 +826,18 @@ type tier struct {
 	memory config.ByteSize
 }
 
-// tiers is a catalogue that FITS UNDER THE CEILING it is generated with — every
-// tier at once, not each one on its own.
+// tiers keeps every shape that could run on its own under the ceiling.
 //
-// A tier larger than server.max_vcpu or server.max_memory is refused by
-// validation — a job on it could never be placed — so a fixed catalogue makes a
-// generated config load on some machines and not others. Shapes are 4GiB per
-// vCPU; a machine too small for any of them still gets ONE tier sized to the
-// ceiling, because a config with no tiers loads and then schedules nothing.
-//
-// THE BUDGET IS SHARED, AND EACH TIER SPENDS FROM IT BEFORE ANY JOB EXISTS.
-// Every tier is its own scale set, and a listener escrows capacity BEFORE it
-// advertises — one backed discovery slot per tier, because a scale set
-// advertising zero receives no work and no statistics and so can never be
-// discovered at all. So the catalogue's floor is one job of every tier
-// simultaneously, and a candidate that fits the ceiling ALONE can still not fit
-// beside the tiers already chosen.
-//
-// Checking each candidate against the bare ceiling generated exactly that: on a
-// host measured at 10 vCPU and 19GiB, an 8GiB and a 16GiB tier were both
-// individually legal and together needed 24GiB. The larger one's discovery slot
-// took the memory, both tiers then advertised zero, and every job queued forever
-// against a control plane reporting itself healthy. Nothing refused, because
-// nothing compares a catalogue to its own budget.
-//
-// So the running total is what a candidate is tested against. Dropping a tier is
-// the right loss: a label that can never be discovered is worse than an absent
-// one, because it is in the config and in the operator's workflow.
+// CATALOGUE ENTRIES SHARE CAPACITY AT ADMISSION. Summing their sizes here would
+// delete a runnable label merely because another label could use the same room.
+// A host below the ladder still gets one tier sized to its usable ceiling.
 func tiers(ceilVCPU int, ceilMemory config.ByteSize) []tier {
-	var (
-		fit        []tier
-		usedVCPU   int
-		usedMemory config.ByteSize
-	)
+	var fit []tier
 
 	for _, vcpu := range tierLadder {
 		memory := config.ByteSize(vcpu) * tierMemoryPerVCPU
-		if usedVCPU+vcpu <= ceilVCPU && usedMemory+memory <= ceilMemory {
+		if vcpu <= ceilVCPU && memory <= ceilMemory {
 			fit = append(fit, tier{label: fmt.Sprintf("billet-%dvcpu", vcpu), vcpu: vcpu, memory: memory})
-			usedVCPU += vcpu
-			usedMemory += memory
 		}
 	}
 
@@ -1301,38 +1271,16 @@ func ec2Tiers(shapes []config.EC2InstanceType, ceilVCPU int, ceilMemory config.B
 	})
 }
 
-// remoteTiers derives one tier per declared shape that the deployment can
-// actually afford to advertise, for any backend whose catalogue is an ordered,
-// priced list.
+// remoteTiers keeps every individually affordable shape in an ordered catalogue.
 //
-// TWO RULES, AND BOTH WERE MISSING FROM ec2Tiers. Neither is a tidiness matter:
-// each produces a catalogue that loads, starts, and then advertises zero.
-//
-// THE BUDGET IS SHARED. Every tier is its own scale set and every listener
-// escrows one backed discovery slot BEFORE it advertises — a scale set
-// advertising zero receives no work and no statistics, so it can never be
-// discovered at all. The catalogue's floor is therefore one instance of every
-// tier simultaneously, and a candidate that fits the ceiling ALONE can still not
-// fit beside the tiers already chosen. Checking each shape against the bare
-// ceiling produced exactly that on a measured host, and the same arithmetic was
-// still here for the declared budget: shapes of 8 and 16 vCPU against a 20 vCPU
-// budget both pass individually and together need 24.
-//
-// AND THE CHARGE IS THE FIRST FITTING SHAPE, NOT THE TIER'S OWN. Placement walks
-// the operator's ordered catalogue and charges the first entry that fits the
-// tier, which is the point of the order — so a tier derived from a small shape
-// listed AFTER a large one is charged the large one. A floor summed from the tier
-// requests therefore understates what the deployment will actually hold, and the
-// tier it lets through has no node that can afford it.
+// THE CHARGE IS THE FIRST FITTING SHAPE, NOT THE TIER REQUEST. A small shape
+// listed after a large one buys the large one, so feasibility must use that
+// charge even though sibling definitions spend nothing merely by existing.
 func remoteTiers(
 	shapes []config.RemoteShape, ceilVCPU int, ceilMemory config.ByteSize,
 	label func(config.RemoteShape) string,
 ) []tier {
-	var (
-		fit        []tier
-		usedVCPU   int
-		usedMemory config.ByteSize
-	)
+	var fit []tier
 
 	seen := make(map[string]bool, len(shapes))
 
@@ -1348,14 +1296,12 @@ func remoteTiers(
 		// the budget has to be tested against.
 		charged := firstFittingShape(shapes, s)
 
-		if usedVCPU+charged.VCPU > ceilVCPU || usedMemory+charged.Memory > ceilMemory {
+		if charged.VCPU > ceilVCPU || charged.Memory > ceilMemory {
 			continue
 		}
 
 		seen[name] = true
 		fit = append(fit, tier{label: name, vcpu: s.VCPU, memory: s.Memory})
-		usedVCPU += charged.VCPU
-		usedMemory += charged.Memory
 	}
 
 	return fit

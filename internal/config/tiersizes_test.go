@@ -194,15 +194,9 @@ func TestALadderRefusesEverySpellingThatMeansTwoThings(t *testing.T) {
 	}
 }
 
-// A macOS LADDER IS REFUSED, AND THE REFUSAL NAMES THE SHORTHAND.
-//
-// A macOS tier with no explicit max_concurrent inherits its HOST's whole guest
-// allowance, so three expansions each inherit the whole of it and validation
-// refuses the file for exceeding it — with a diagnostic about Apple's licence
-// rather than about the shorthand that caused it. Dividing the shares is a
-// decision rather than boilerplate, which is the one thing this shorthand is not
-// for.
-func TestALadderCannotExpandAMacOSTier(t *testing.T) {
+// A MACOS LADDER SHARES THE HOST LIMIT AT RUNTIME. Each entry inherits the
+// same per-entry ceiling, so expansion cannot partition the catalogue's slots.
+func TestALadderCanExpandAMacOSTier(t *testing.T) {
 	t.Parallel()
 
 	body := `
@@ -228,14 +222,18 @@ tiers:
     sizes: [4, 8]
 `
 
-	_, err := parseSizes(t, body)
-	if err == nil {
-		t.Fatal("a macOS ladder was expanded, and each tier would have inherited the host's " +
-			"whole guest allowance")
+	cfg, err := parseSizes(t, body)
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	if !strings.Contains(err.Error(), "max_concurrent") {
-		t.Errorf("the refusal does not name what the operator has to divide: %v", err)
+	if len(cfg.Tiers) != 2 {
+		t.Fatalf("expanded %d tiers, want 2", len(cfg.Tiers))
+	}
+	for i, size := range []int{4, 8} {
+		if cfg.Tiers[i].VCPU != size || cfg.Tiers[i].MaxConcurrent != DefaultMacOSVMLimit {
+			t.Errorf("tier %d: vcpu %d, max_concurrent %d", i,
+				cfg.Tiers[i].VCPU, cfg.Tiers[i].MaxConcurrent)
+		}
 	}
 }
 

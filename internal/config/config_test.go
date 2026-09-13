@@ -537,23 +537,27 @@ func TestLinuxTierWithMacOSInLabelIsNotCapped(t *testing.T) {
 	}
 }
 
-// Two individually-legal macOS tiers on one Mac still share one physical host.
+// CATALOGUE CEILINGS MAY OVERLAP. Three one-job definitions on a two-slot Mac
+// are legal alternatives; placement must count the leases that actually exist.
 func TestMacOSTiersShareTheHostLimit(t *testing.T) {
-	body := validConfig + macOSTier + `
-  - label: billet-12vcpu-macos-26
-    provider: tart
-    guest_os: macos
-    node: mac-mini-1
-    vcpu: 12
-    memory: 48GiB
-    image: macos-26
-`
-	_, err := Load(writeConfig(t, body))
-	if err == nil {
-		t.Fatal("two macOS tiers on one node totalling 4 guests were accepted")
+	body := validConfig
+	for _, label := range []string{"mac-a", "mac-b", "mac-c"} {
+		entry := strings.Replace(macOSTier, "billet-6vcpu-macos-26", label, 1)
+		body += strings.Replace(entry, "    image: macos-26\n",
+			"    image: macos-26\n    max_concurrent: 1\n", 1)
 	}
-	if !strings.Contains(err.Error(), "per Apple-branded host") {
-		t.Errorf("error should cite the per-host limit, got: %v", err)
+	cfg, err := Load(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("overlapping macOS catalogue: %v", err)
+	}
+	for _, label := range []string{"mac-a", "mac-b", "mac-c"} {
+		tr, ok := cfg.TierByLabel(label)
+		if !ok {
+			t.Fatalf("tier %s disappeared from the catalogue", label)
+		}
+		if tr.MaxConcurrent != 1 {
+			t.Errorf("tier %s has max_concurrent %d, want 1", label, tr.MaxConcurrent)
+		}
 	}
 }
 

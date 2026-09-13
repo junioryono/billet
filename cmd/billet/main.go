@@ -2846,11 +2846,11 @@ func cmdStatus(ctx context.Context, args []string) error {
 				continue
 			}
 
-			headroom, err := a.Headroom(ctx, t.Label)
+			report, err := a.CapacityReport(ctx, t.Label)
 			if err != nil {
 				return err
 			}
-			fmt.Printf("tier      %-24s %d available\n", t.Label, headroom)
+			printTierCapacity(os.Stdout, t.Label, report)
 		}
 	}
 

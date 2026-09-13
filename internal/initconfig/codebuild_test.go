@@ -156,39 +156,21 @@ func TestEveryGeneratedCodeBuildTierIsTrustedAndBound(t *testing.T) {
 	}
 }
 
-// THE CATALOGUE FITS THE BUDGET ALL AT ONCE, NOT EACH TIER ON ITS OWN.
-//
-// Every tier is its own scale set and every listener escrows one discovery slot
-// BEFORE it advertises, so a catalogue whose floor exceeds the ceiling advertises
-// zero everywhere and every job queues forever against a control plane reporting
-// itself healthy. Checking each candidate against the bare ceiling is what
-// produced that, and it passed every test at the time.
-func TestTheGeneratedCodeBuildCatalogueFitsItsBudgetTogether(t *testing.T) {
+// BOTH SHAPES FIT ALONE AND BOTH SURVIVE. Their combined six vCPU exceed the
+// four-vCPU budget, which is enforced when jobs are admitted rather than defined.
+func TestTheGeneratedCodeBuildCatalogueFitsEachEntry(t *testing.T) {
 	t.Parallel()
 
 	p := codeBuildParams()
-	// Room for the small shape and not for both.
-	p.VCPU, p.Memory = 3, 6*config.GiB
-
+	p.VCPU, p.Memory = 4, 7*config.GiB
 	cfg := parseGenerated(t, generate(t, p))
-
-	var vcpu int
-
-	var memory config.ByteSize
-
-	for i := range cfg.Tiers {
-		vcpu += cfg.Tiers[i].VCPU
-		memory += cfg.Tiers[i].Memory
+	if len(cfg.Tiers) != 2 {
+		t.Fatalf("wrote %d tiers, want both individually fitting entries", len(cfg.Tiers))
 	}
-
-	if vcpu > p.VCPU || memory > p.Memory {
-		t.Fatalf("the catalogue needs %d vCPU and %s against a budget of %d and %s; every "+
-			"tier escrows a discovery slot before it advertises, so this deployment would "+
-			"advertise zero on all of them", vcpu, memory, p.VCPU, p.Memory)
-	}
-
-	if len(cfg.Tiers) != 1 {
-		t.Fatalf("wrote %d tiers, want only the one that fits", len(cfg.Tiers))
+	for i, want := range []int{2, 4} {
+		if cfg.Tiers[i].VCPU != want {
+			t.Errorf("tier %d has %d vcpu, want %d", i, cfg.Tiers[i].VCPU, want)
+		}
 	}
 }
 

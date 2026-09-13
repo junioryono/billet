@@ -106,8 +106,8 @@ func Run(t *testing.T, fleet Fleet, trace Trace, opts Options) *Report {
 		}
 	}
 
-	// Every session open and every discovery slot escrowed before the first job
-	// arrives, in tier order.
+	// EVERY SESSION IS OPEN BEFORE ARRIVALS. Discovery may already have yielded;
+	// catalogue entries need no permanent lease to participate in the replay.
 	settle("startup")
 
 	for i := range trace.Arrivals {
@@ -125,13 +125,11 @@ func Run(t *testing.T, fleet Fleet, trace Trace, opts Options) *Report {
 		actions.deliver(ev)
 		settle(describe(ev))
 
-		// THE CONTEST FOR ROOM, IN ONE ORDER. A tier with jobs waiting, or with no
-		// capacity advertised at all, is given one poll to re-escrow and be offered
-		// what waits, tier by tier, each to quiescence before the next. What a
-		// tier does on its OWN poll after its own event is billet's: the listener
-		// whose job finished tops its discovery slot back up before anything is
-		// offered to anyone, exactly as it would in production. What the harness
-		// decides is only who is offered the rest, and that is this order.
+		// DONORS MUST POLL TOO WHEN ANY WORK WAITS. A positive advertisement may
+		// back idle discovery that arbitration has asked to withdraw. Waking only
+		// starved tiers would park the donor forever while its peer waits for the
+		// lower exchange to release that backing. Poll order stays deterministic;
+		// the real arbiter decides who may buy the returning capacity.
 		//
 		// UNTIL A PASS CHANGES NOTHING. A tier nudged while it advertised nothing
 		// uses that poll to escrow the room it can now see and advertise it; the
@@ -145,7 +143,7 @@ func Run(t *testing.T, fleet Fleet, trace Trace, opts Options) *Report {
 			changed = false
 
 			for _, label := range actions.order {
-				if !actions.starved(label) {
+				if !actions.needsPoll(label) {
 					continue
 				}
 

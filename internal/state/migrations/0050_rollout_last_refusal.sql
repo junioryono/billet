@@ -1,0 +1,25 @@
+-- migration 50: rollout_last_refusal
+--
+-- WHY THE LAST DISPATCH OF A HOST WAS REFUSED, kept on the rollout's row for it.
+--
+-- A dispatch that fails is recorded as `pending` with a backoff and an attempt
+-- count, and nothing else: the coordinator retries every few minutes and the
+-- reason the updater gave went to the control plane's log and nowhere durable.
+-- Under a converge guard a host refuses every dispatch for as long as the guard
+-- is held, and an operator reading `billet rollout status` saw a host that kept
+-- trying with no word of why. The reason the refused acknowledgement carried is
+-- what this column keeps.
+--
+-- WRITTEN BY THE FAILED-DISPATCH PATH ONLY. An ordinary transition leaves it as
+-- it is, so the reason survives the neutral update that records a host's prior
+-- release before the next attempt; a dispatch that succeeds clears it, because
+-- the refusal it described is over. EMPTY MEANS NO DISPATCH HAS BEEN REFUSED
+-- SINCE THE LAST SUCCESSFUL ONE, which every row written before this column
+-- existed reads as.
+--
+-- Everything between the markers below is PUBLISHED BYTES; the prose is not.
+-- Reformat one tab and every ledger that applied this migration refuses to open.
+
+-- +billet:statement
+ALTER TABLE rollout_nodes ADD COLUMN last_refusal TEXT NOT NULL DEFAULT ''
+-- +billet:end

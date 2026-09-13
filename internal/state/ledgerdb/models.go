@@ -44,6 +44,12 @@ type IssuedCert struct {
 	IssuedAt string
 }
 
+type ListenerCapacity struct {
+	Tier       string
+	ObservedAt string
+	Snapshot   string
+}
+
 type NodeEnrollment struct {
 	Name        string
 	Fingerprint string

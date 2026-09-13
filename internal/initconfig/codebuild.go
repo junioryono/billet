@@ -308,11 +308,8 @@ func defaultCodeBuildImage(env config.CodeBuildEnvironment) (string, error) {
 // never sees in the file. Ordered as the operator ordered them, because that
 // order is what decides which one a job is bought on.
 //
-// AND THE BUDGET IS SHARED, so the running total is what a candidate is tested
-// against rather than the bare ceiling. Every tier is its own scale set and
-// every listener escrows one discovery slot BEFORE it advertises, so a
-// catalogue whose floor exceeds the ceiling advertises zero everywhere and
-// every job queues forever against a control plane reporting itself healthy.
+// EACH ENTRY IS JUDGED ALONE AT ITS CHARGED SHAPE. The catalogue describes
+// alternatives; only admission spends the shared budget.
 func codeBuildTiers(shapes []config.RemoteShape, ceilVCPU int, ceilMemory config.ByteSize) []tier {
 	return remoteTiers(shapes, ceilVCPU, ceilMemory, func(s config.RemoteShape) string {
 		return codeBuildTierLabel(s.Type, s.VCPU)
@@ -563,14 +560,8 @@ func minutesText(minutes int) string {
 // codeBuildNodeBlocks renders `node.name` and the `nodes:` policy a macOS
 // generation needs, and nothing at all otherwise.
 //
-// THE POLICY IS NOT DECORATION: without it the host's macOS limit defaults to
-// APPLE's two-guests-per-machine allowance, and validateMacOSHostLimits sums
-// every pinned tier's max_concurrent against that — so a fleet of four would be
-// refused at load, with a diagnostic about a licence that has nothing to do with
-// a managed fleet. Setting the limit to the fleet's own capacity is what
-// docs/deploying/aws-codebuild.md tells an operator to do; the generation does it
-// for them,
-// because it is the same number they just supplied.
+// THE FLEET LIMIT IS REQUIRED POLICY. Each macOS entry may use up to that
+// ceiling; actual leases share it at runtime rather than dividing it at load.
 func codeBuildNodeBlocks(c *CodeBuildParams) (string, string) {
 	if c.Environment != config.CodeBuildMacARM {
 		// A NAME SUPPLIED HERE IS STILL WRITTEN, and an earlier version dropped
