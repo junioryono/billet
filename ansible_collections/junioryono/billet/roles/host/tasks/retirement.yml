@@ -102,6 +102,7 @@
          + (['--environment-file', billet_retirement_environment_file] if billet_retirement_environment_file | length > 0 else []) }}
     expand_argument_vars: false
   register: billet_retirement_classify_raw
+  ignore_unreachable: true
   changed_when: false
   failed_when: false
   check_mode: false
@@ -155,11 +156,9 @@
   ansible.builtin.fail:
     msg: >-
       Retirement holds this host ({{ billet_retirement_route }}): {{ billet_retirement_why }}
-      {{ 'Reservation cancellation requires the next caller revision.'
-         if billet_retirement_route == 'cancel' else '' }}
   when:
     - not ansible_check_mode
-    - billet_retirement_route not in ['ordinary', 'continue', 'recovery', 'new-request']
+    - billet_retirement_route not in ['ordinary', 'continue', 'recovery', 'new-request', 'cancel']
 
 - name: Recover only the transaction the classifier admitted
   when:
@@ -184,3 +183,7 @@
 - name: Request a new server-only retirement
   ansible.builtin.include_tasks: retirement-request.yml
   when: billet_retirement_route == 'new-request'
+
+- name: Cancel the unstarted reservation recorded by the classifier
+  ansible.builtin.include_tasks: retirement-cancel.yml
+  when: billet_retirement_route == 'cancel'
