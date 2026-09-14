@@ -1960,10 +1960,10 @@ func TestATakeoverRelabelsAndKeepsEverythingElse(t *testing.T) {
 	mustOK(t, os.Remove(tmp))
 
 	// A marker in the scan refuses.
-	markedScan(t, 4242, "python3 /home/ci/.ansible/tmp/ansible-tmp-1/AnsiballZ_command.py")
+	markedScan(t, 5004242, "python3 /home/ci/.ansible/tmp/ansible-tmp-1/AnsiballZ_command.py")
 
 	if err := guardRun(t, "hold", "--holder", "ci-2", "--recover-from", "ci-1", "--old-driver-stopped"); !errors.Is(err, errScanRefused) ||
-		!strings.Contains(err.Error(), "4242") {
+		!strings.Contains(err.Error(), "5004242") {
 		t.Errorf("a takeover beside a driver: err = %v", err)
 	}
 
@@ -2036,8 +2036,17 @@ func cleanScan(t *testing.T) {
 	t.Cleanup(func() { guardProcesses = saved })
 }
 
+// markedScan stands a marked driver beside this process. THE DRIVER'S PID MUST
+// NEVER BE THIS PROCESS'S: the table is keyed by pid, so the two entries would
+// collapse into one, the scan would skip the driver as itself, and a refusal case
+// would pass. Callers use a pid above Linux's largest (4194304), and a collision
+// is refused here rather than passing silently.
 func markedScan(t *testing.T, pid int, cmdline string) {
 	t.Helper()
+
+	if pid == os.Getpid() {
+		t.Fatalf("markedScan: the driver's pid %d is this test process's own pid", pid)
+	}
 
 	saved := guardProcesses
 	guardProcesses = func() (processTable, error) {

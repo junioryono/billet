@@ -58,7 +58,7 @@ func TestRecoverHolderRemovesOnlyAnAssertedCleanGuard(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	markedScan(t, 4242, "python3 /home/ci/.ansible/tmp/ansible-tmp-1/AnsiballZ_command.py")
+	markedScan(t, 5004242, "python3 /home/ci/.ansible/tmp/ansible-tmp-1/AnsiballZ_command.py")
 
 	if err := guardRun(t, "recover", "--holder", "ci-1", "--old-driver-stopped"); !errors.Is(err, errScanRefused) {
 		t.Errorf("recover beside a driver: err = %v", err)
@@ -100,6 +100,12 @@ func unreadableScan(t *testing.T) {
 func TestTheProcessScanRefusesADriverAndCouldNotTell(t *testing.T) {
 	self := os.Getpid()
 
+	// A FIXTURE PID MUST NEVER BE ONE A REAL PROCESS CAN HOLD. The table is keyed
+	// by pid, so a fixture entry sharing the test process's own pid collapses into
+	// `self` in the map literal: the scan then skips it as itself and a refusal case
+	// passes. CI once ran the test binary as pid 4242 and every 4242 case failed.
+	// Every fixture pid is above Linux's largest possible pid (4194304), so no test
+	// process can collide with one.
 	table := func(entries map[int]processEntry) func() (processTable, error) {
 		entries[1] = processEntry{PID: 1, PPID: 0, Cmdline: "/sbin/init"}
 
@@ -112,37 +118,37 @@ func TestTheProcessScanRefusesADriverAndCouldNotTell(t *testing.T) {
 		want  string
 	}{
 		{"a marked grandparent", table(map[int]processEntry{
-			self: {PID: self, PPID: 900, Cmdline: "billet converge-guard"},
-			900:  {PID: 900, PPID: 800, Cmdline: "/bin/sh -c ..."},
-			800:  {PID: 800, PPID: 1, Cmdline: "python3 /root/.ansible/tmp/ansible-tmp-9/AnsiballZ_command.py"},
+			self:    {PID: self, PPID: 5000900, Cmdline: "billet converge-guard"},
+			5000900: {PID: 5000900, PPID: 5000800, Cmdline: "/bin/sh -c ..."},
+			5000800: {PID: 5000800, PPID: 1, Cmdline: "python3 /root/.ansible/tmp/ansible-tmp-9/AnsiballZ_command.py"},
 		}), "direct SSH shell"},
 		{"a marked parent by the other marker", table(map[int]processEntry{
-			self: {PID: self, PPID: 900, Cmdline: "billet converge-guard"},
-			900:  {PID: 900, PPID: 1, Cmdline: "sh -c /root/.ansible/tmp/ansible-tmp-9/run"},
+			self:    {PID: self, PPID: 5000900, Cmdline: "billet converge-guard"},
+			5000900: {PID: 5000900, PPID: 1, Cmdline: "sh -c /root/.ansible/tmp/ansible-tmp-9/run"},
 		}), "direct SSH shell"},
 		{"a marked sibling", table(map[int]processEntry{
-			self: {PID: self, PPID: 1, Cmdline: "billet converge-guard"},
-			4242: {PID: 4242, PPID: 1, Cmdline: "python3 AnsiballZ_setup.py"},
-		}), "pid 4242"},
+			self:    {PID: self, PPID: 1, Cmdline: "billet converge-guard"},
+			5004242: {PID: 5004242, PPID: 1, Cmdline: "python3 AnsiballZ_setup.py"},
+		}), "pid 5004242"},
 		{"a marked sibling by the other marker", table(map[int]processEntry{
-			self: {PID: self, PPID: 1, Cmdline: "billet converge-guard"},
-			4243: {PID: 4243, PPID: 1, Cmdline: "sh /home/ci/.ansible/tmp/ansible-tmp-3/x"},
-		}), "pid 4243"},
+			self:    {PID: self, PPID: 1, Cmdline: "billet converge-guard"},
+			5004243: {PID: 5004243, PPID: 1, Cmdline: "sh /home/ci/.ansible/tmp/ansible-tmp-3/x"},
+		}), "pid 5004243"},
 		{"a vanished ancestor", table(map[int]processEntry{
-			self: {PID: self, PPID: 777, Cmdline: "billet converge-guard"},
-		}), "ancestor pid 777 vanished"},
+			self: {PID: self, PPID: 5000777, Cmdline: "billet converge-guard"},
+		}), "ancestor pid 5000777 vanished"},
 		{"an unreadable ancestor", table(map[int]processEntry{
-			self: {PID: self, PPID: 777, Cmdline: "billet converge-guard"},
-			777:  {PID: 777, Err: errors.New("read status: permission denied")},
-		}), "ancestor pid 777 could not be read"},
+			self:    {PID: self, PPID: 5000777, Cmdline: "billet converge-guard"},
+			5000777: {PID: 5000777, Err: errors.New("read status: permission denied")},
+		}), "ancestor pid 5000777 could not be read"},
 		{"an unreadable sibling", table(map[int]processEntry{
-			self: {PID: self, PPID: 1, Cmdline: "billet converge-guard"},
-			555:  {PID: 555, Err: errors.New("read cmdline: permission denied")},
-		}), "pid 555 could not be read"},
+			self:    {PID: self, PPID: 1, Cmdline: "billet converge-guard"},
+			5000555: {PID: 5000555, Err: errors.New("read cmdline: permission denied")},
+		}), "pid 5000555 could not be read"},
 		{"a malformed parent", table(map[int]processEntry{
-			self: {PID: self, PPID: 1, Cmdline: "billet converge-guard"},
-			556:  {PID: 556, Err: errors.New("status has a PPid line that is not a number")},
-		}), "pid 556 could not be read"},
+			self:    {PID: self, PPID: 1, Cmdline: "billet converge-guard"},
+			5000556: {PID: 5000556, Err: errors.New("status has a PPid line that is not a number")},
+		}), "pid 5000556 could not be read"},
 		{"an unreadable table", func() (processTable, error) { return processTable{}, errors.New("proc: staged EACCES") }, "could not be read"},
 	}
 
