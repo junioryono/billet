@@ -1,0 +1,31 @@
+---
+# Ask the LOADED unit, not this run's inventory. Removing an environment
+# rendering does not remove the DSN the installed controller still uses.
+- name: Read the executing server unit's environment-file names
+  ansible.builtin.command:
+    argv: [timeout, -k, '10', '60', systemctl, show, billet-server.service, --property=EnvironmentFiles, --value]
+    expand_argument_vars: false
+  register: billet_retirement_environment_raw
+  changed_when: false
+  failed_when: false
+  ignore_unreachable: true
+  check_mode: false
+  delegate_to: "{{ billet_retirement_environment_host | default(inventory_hostname, true) }}"
+  become: true
+
+- name: Require a readable single environment-file observation
+  ansible.builtin.assert:
+    that:
+      - billet_retirement_environment_raw.rc | default(-1) == 0
+      - not billet_retirement_environment_raw.unreachable | default(false)
+      - billet_retirement_environment_raw.stdout is defined
+      - billet_retirement_environment_raw.stdout | regex_findall(' \(ignore_errors=(?:yes|no)\)') | length <= 1
+      - >-
+        billet_retirement_environment_raw.stdout | trim == '' or
+        billet_retirement_environment_raw.stdout is match('^/[^\n]+ \(ignore_errors=(yes|no)\)\n?\Z')
+    fail_msg: The installed server unit's environment file could not be established; retirement holds.
+
+- name: Keep the executing host's environment-file operand
+  ansible.builtin.set_fact:
+    billet_retirement_environment_file: >-
+      {{ billet_retirement_environment_raw.stdout | trim | regex_replace(' \(ignore_errors=(yes|no)\)\Z', '') }}

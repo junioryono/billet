@@ -1,0 +1,101 @@
+---
+# This converge may use a survivor it prepared, never take over another guard.
+# The helper still proves the live guard under its own lock.
+- name: Keep the pending completion and its recorded survivor
+  ansible.builtin.set_fact:
+    billet_retirement_completion: "{{ billet_retirement_result.completion }}"
+    billet_retirement_survivor: "{{ billet_retirement_classification.journal.survivor }}"
+
+- name: Observe whether this converge prepared the survivor
+  vars:
+    billet_retirement_peer: "{{ hostvars[billet_retirement_survivor] | default({}) }}"
+  ansible.builtin.set_fact:
+    billet_retirement_peer_ready: >-
+      {{ billet_retirement_peer.billet_exclusion_settled | default(none) is sameas true
+         and billet_retirement_peer.billet_exclusion_held | default(none) is sameas true
+         and billet_retirement_peer.billet_exclusion_holder | default('') == billet_exclusion_holder
+         and billet_retirement_peer.billet_upgrade_claim_shape | default('') == 'guard'
+         and billet_retirement_peer.billet_exclusion_answerer | default('') | length > 0 }}
+
+- name: Report a row obligation whose survivor this converge did not prepare
+  ansible.builtin.debug:
+    msg: >-
+      Retirement is locally done with a pending row. Survivor {{ billet_retirement_survivor }}
+      has no settled, pointer-free guard held by this converge; no handoff was attempted.
+      Prepare that survivor in this converge and rerun the retirement to complete and acknowledge the row.
+  when: not billet_retirement_peer_ready | bool
+
+- name: Finish the pending row under both hosts' own guards
+  when: billet_retirement_peer_ready | bool
+  block:
+    - name: Read the survivor's installed server environment
+      ansible.builtin.include_tasks: retirement-environment.yml
+      vars:
+        billet_retirement_environment_host: "{{ billet_retirement_survivor }}"
+
+    - name: Complete the row on the recorded survivor
+      ansible.builtin.command:
+        argv: >-
+          {{ ['timeout', '-k', '10', '180',
+              hostvars[billet_retirement_survivor].billet_exclusion_answerer,
+              'server', 'retire', '--complete-row', '--json',
+              '--run', hostvars[billet_retirement_survivor].billet_exclusion_holder,
+              '--as-host', billet_retirement_survivor, '--completion', '-',
+              '--config', '/etc/billet/billet.yaml']
+             + (['--environment-file', billet_retirement_environment_file]
+                if billet_retirement_environment_file | length > 0 else []) }}
+        expand_argument_vars: false
+        stdin: "{{ billet_retirement_completion | to_json }}"
+        stdin_add_newline: false
+      register: billet_retirement_complete_raw
+      changed_when: false
+      failed_when: false
+      ignore_unreachable: true
+      delegate_to: "{{ billet_retirement_survivor | default(inventory_hostname, true) }}"
+      become: true
+
+    - name: Parse the survivor's row completion
+      ansible.builtin.include_tasks: retire-answer.yml
+      vars:
+        billet_retire_raw: "{{ billet_retirement_complete_raw }}"
+        billet_retire_call: complete
+        billet_retire_answered_by: "{{ hostvars[billet_retirement_survivor].billet_exclusion_answerer }}"
+
+    - name: Bind the survivor's answer to the pending completion
+      ansible.builtin.assert:
+        that:
+          - billet_retire_answer[item] == billet_retirement_completion[item]
+        fail_msg: "The survivor's completion disagrees on {{ item }}; the row remains unacknowledged here."
+      loop: [deployment, retiring, survivor, transition_id, reservation]
+
+    - name: Acknowledge the survivor's row completion here
+      ansible.builtin.command:
+        argv: >-
+          {{ [billet_retirement_answerer, 'server', 'retire', '--acknowledge-row', '--json',
+              '--run', billet_exclusion_holder, '--retiring-host', inventory_hostname,
+              '--answer', '-', '--config', '/etc/billet/billet.yaml'] }}
+        expand_argument_vars: false
+        stdin: "{{ billet_retire_answer | to_json }}"
+        stdin_add_newline: false
+      register: billet_retirement_acknowledge_raw
+      changed_when: false
+      failed_when: false
+      become: true
+
+    - name: Parse this host's acknowledgement
+      ansible.builtin.include_tasks: retire-answer.yml
+      vars:
+        billet_retire_raw: "{{ billet_retirement_acknowledge_raw }}"
+        billet_retire_call: acknowledge
+        billet_retire_answered_by: "{{ billet_retirement_answerer }}"
+
+    - name: Bind the acknowledgement to this retirement
+      ansible.builtin.assert:
+        that:
+          - billet_retire_answer.transition_id == billet_retirement_completion.transition_id
+        fail_msg: The acknowledgement names another retirement; settlement remains outstanding.
+
+    # Acknowledgement deliberately does not settle. This last continuation
+    # clears the marker and writes settled, or reports what remains.
+    - name: Settle locally after acknowledging the row
+      ansible.builtin.include_tasks: retirement-continue-call.yml

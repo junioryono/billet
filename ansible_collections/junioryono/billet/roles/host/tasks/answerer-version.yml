@@ -1,0 +1,21 @@
+---
+# The INSTALLATION pin is not the version of the executable that replied.
+- name: Observe the selected answerer's version
+  ansible.builtin.command:
+    argv: >-
+      {{ ([] if billet_exclusion_darwin | bool else ['timeout', '-k', '10', '60'])
+         + [billet_version_answerer, 'version'] }}
+    expand_argument_vars: false
+  async: "{{ 70 if billet_exclusion_darwin | bool else 0 }}"
+  poll: 5
+  register: billet_answerer_version_raw
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  become: "{{ billet_exclusion_become }}"
+  when: billet_version_answerer | length > 0
+
+- name: Publish the selected answerer's typed version
+  ansible.builtin.set_fact:
+    billet_exclusion_answerer_version: "{{ billet_answerer_version_raw | junioryono.billet.executable_version }}"
+  when: billet_version_answerer | length > 0

@@ -1,0 +1,45 @@
+---
+# No installed digest and no fleet collection: past the archive there may be
+# neither a configuration nor a reachable survivor. The journal owns both.
+- name: Continue through the journal's recorded survivor
+  ansible.builtin.command:
+    argv: >-
+      {{ [billet_retirement_answerer, 'server', 'retire', '--input', '-', '--json',
+          '--run', billet_exclusion_holder, '--retiring-host', inventory_hostname,
+          '--survivor-host', billet_retirement_classification.journal.survivor,
+          '--config', '/etc/billet/billet.yaml']
+         + (['--environment-file', billet_retirement_local_environment_file] if billet_retirement_local_environment_file | length > 0 else []) }}
+    expand_argument_vars: false
+    stdin: "{{ billet_retirement_document | to_json }}"
+    stdin_add_newline: false
+  register: billet_retirement_continue_raw
+  changed_when: false
+  failed_when: false
+  become: true
+
+- name: Parse the retirement continuation
+  ansible.builtin.include_tasks: retire-answer.yml
+  vars:
+    billet_retire_raw: "{{ billet_retirement_continue_raw }}"
+    billet_retire_call: request
+    billet_retire_answered_by: "{{ billet_retirement_answerer }}"
+
+- name: Require a known completed server-only retirement
+  ansible.builtin.assert:
+    that:
+      - billet_retire_state_known | bool
+      - billet_retire_answer.outcome in ['retired', 'unchanged']
+      - billet_retire_answer.variant | default('') == 'server-only'
+      - billet_retire_answer.state == 'done'
+      - billet_retire_answer.transition_id == billet_retirement_classification.journal.transition_id
+    fail_msg: >-
+      The continuation did not confirm a known server-only done state;
+      ordinary convergence remains bypassed.
+
+- name: Record the continuation's result and changes
+  ansible.builtin.set_fact:
+    billet_retirement_result: "{{ billet_retire_answer }}"
+    billet_retirement_bypass: true
+  changed_when: >-
+    billet_retire_answer.outcome == 'retired' or
+    billet_retire_answer.postconditions.status | default('') == 'republished'

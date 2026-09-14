@@ -448,7 +448,7 @@ for spec in "${specs[@]+"${specs[@]}"}"; do
 done
 out=$(mktemp); err=$(mktemp)
 endpoint_answer=0
-case "$cmd" in migrate-endpoint|receipt|registration) [ -n "$substituted" ] && endpoint_answer=1 ;; esac
+case "$cmd" in migrate-endpoint|receipt|registration|release) [ -n "$substituted" ] && endpoint_answer=1 ;; esac
 if [ "$endpoint_answer" = 1 ]; then
   # AN ENDPOINT ANSWER STANDS IN FOR THE BACKING RUN: the fixture is the
   # command's own, and its outcome decides the exit as the command does.
@@ -537,6 +537,10 @@ FAKE
       ;;
     systemctl)
       cat >>"$fakes/$tool" <<FAKE
+if [ "\${1:-}" = show ] && [ "\${3:-}" = --property=EnvironmentFiles ] && [ -n "\${BILLET_GATE_RETIRE_ENV_SET:-}" ]; then
+  printf '%s\n' "\${BILLET_GATE_RETIRE_ENV:-}"
+  exit 0
+fi
 if [ -n "\${BILLET_GATE_SERVICES:-}" ]; then
   export BILLET_GATE_SERVICES BILLET_GATE_SERVICE_PID
   exec '$python' '$work/service-state.py' systemctl "\$@"
@@ -1030,7 +1034,7 @@ import json, sys
 properties = dict(LoadState="loaded", ActiveState="inactive", SubState="dead", MainPID="0",
                   ControlPID="0", Result="success", NRestarts="0", UnitFileState="disabled",
                   ActiveEnterTimestampMonotonic="100", ExecMainStartTimestampMonotonic="100",
-                  CanStart="yes", CanStop="yes", CanReload="no", NeedDaemonReload="no")
+                  CanStart="yes", CanStop="yes", CanReload="no", NeedDaemonReload="no", EnvironmentFiles="")
 with open(sys.argv[1], "w") as stream:
     json.dump({unit: properties for unit in ["billet-server.service", "billet-node.service"]}, stream)
 PY
@@ -1382,6 +1386,12 @@ else
   setpriv --reuid="$INVOKER_UID" --regid="$INVOKER_GID" --init-groups env "${envs[@]}" HOME="$HOME_DIR" USER="$INVOKER_NAME" LOGNAME="$INVOKER_NAME" "$ANSIBLE_PLAYBOOK" -i "$INVENTORY" "$play" -e ansible_become=false -e "billet_gate_expect_uid=$INVOKER_UID" "${args[@]+"${args[@]}"}" >"$case_dir/out" 2>&1
 fi
 echo "$?" >"$case_dir/status"
+if [ -s "$case_dir/second-play" ]; then
+  cp "$case_dir/calls/index.jsonl" "$case_dir/calls-first.jsonl" || exit 96
+  second_play=$(cat "$case_dir/second-play")
+  env "${envs[@]}" HOME="$HOME_DIR" "$ANSIBLE_PLAYBOOK" -i "$INVENTORY" "$second_play" -e ansible_become=false "${args[@]+"${args[@]}"}" >"$case_dir/out-second" 2>&1
+  echo "$?" >"$case_dir/status-second"
+fi
 if [ -s "$case_dir/post.sh" ]; then
   (. "$case_dir/post.sh") >"$case_dir/post" 2>&1
   echo "post=$?" >>"$case_dir/post"
@@ -1537,12 +1547,12 @@ expect_no_task b1-first "Hold this host for the converge"
 # THE ORDER of the binaries' invocations, as role and command: the first
 # call (which reads the managed binary's version to record it), the second
 # call (which reads the managed version and probes the candidate under the
-# lock, before any re-binding), the settlement.
+# lock, before any re-binding), the settlement and selected-answerer version.
 order=$(commands b1-first | tr '\n' ';')
 # THE CANDIDATE'S DRY RUN DESCRIBES THE MANAGED BINARY, its version included,
 # so one `managed version` sits inside the candidate's probe.
-[ "$order" = "managed prepare;managed version;managed prepare;managed version;candidate prepare;managed version;candidate version;managed settle;" ] \
-  || fail "b1-first: the order of the calls is not validate, the second call with the candidate's probes under the lock, settle: $order" "$work/cases/b1-first/log"
+[ "$order" = "managed prepare;managed version;managed prepare;managed version;candidate prepare;managed version;candidate version;managed settle;managed version;" ] \
+  || fail "b1-first: the order of the calls is not validate, the second call with the candidate's probes under the lock, settle and selected-answerer version: $order" "$work/cases/b1-first/log"
 expect_state b1-first record_release_executable "$(fact b1-first recovery)/billet.candidate"
 expect_state b1-first record_preparing False
 expect_state b1-first record_holder h1
@@ -3161,8 +3171,8 @@ echo "ok   E11: a current receipt keeps a holder that is one (by the command's g
 fi
 
 # =============================================================================
-# R. RETIREMENT: the parser alone now; the caller's route cases follow in 5c.c
-# and 5c.d. A corruption starts from HEAD's committed producer bytes, never a
+# R. RETIREMENT: the parser and the caller's existing-transition routes.
+# New requests and cancellation follow in 5c.d. A corruption starts from HEAD's committed producer bytes, never a
 # harvested worktree fixture and never an answer assembled by the gate.
 # =============================================================================
 if [ "${BILLET_GATE_ONLY:-}" != endpoint ]; then
@@ -3283,6 +3293,9 @@ retire_unanswered() { # case task
 # adopt is hold, and unknown-ledger with a readable journal is continue.
 # Completion has no state member, so it must publish state_known false.
 for spec in classify:dry-run-request classify:dry-run-adopt classify:dry-run-unknown-ledger \
+  classify:dry-run-ordinary classify:dry-run-continue classify:dry-run-hold-unreadable-row \
+  classify:dry-run-hold-damaged-identity classify:dry-run-recovery-guard classify:dry-run-recovery-legacy \
+  classify:dry-run-new-request classify:dry-run-cancel classify:dry-run-unsupported-variant request:done-unchanged \
   reserve:reserved reserve:adopted request:retired-settled request:retired-pending \
   abandon:abandoned abandon:abandoned-marker-cleared complete:completed complete:completed-already \
   acknowledge:acknowledged acknowledge:acknowledged-already; do
@@ -3403,12 +3416,10 @@ done
 expect_path_absent r-machinery /var/lib/billet/server
 expect_unit_absent r-machinery billet-server.service
 expect_no_ordinary r-machinery
-# No committed request-preview or unchanged/done fixture exists at this
-# commit. Their member tables are implemented but lack passing controls here.
-# The new route fixtures (new-request, cancel, recovery, unsupported-variant,
-# and config absent/malformed/unreadable) are 5c.a's later harvested bytes.
-# Version type is a capability input in 5c.c, not a retirement answer member;
-# its missing/unknown cases belong beside that caller, never in this parser.
+# Route coverage uses only the producer corpus above. Cases whose distinct
+# classifier shape has no producer fixture are listed in retirement-cases.md.
+. "$here/retirement-cases.sh"
+
 fi
 
 

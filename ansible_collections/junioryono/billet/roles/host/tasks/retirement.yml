@@ -1,0 +1,167 @@
+---
+# Only the classifier's route selects work. Its other members are operands;
+# route_why is printed whole for a person and is never parsed.
+- name: Reset retirement's entry facts to a hold
+  ansible.builtin.set_fact:
+    billet_retirement_bypass: true
+    billet_retirement_route: hold
+    billet_retirement_why: No retirement route was established.
+    billet_retirement_answerer: "{{ billet_exclusion_answerer }}"
+    billet_retirement_legacy: "{{ billet_upgrade_claim_shape == 'legacy-file' }}"
+    billet_retirement_classification: {}
+    billet_retirement_environment_ready: false
+
+# Preparation cannot acquire a legacy claim. A verified managed executable
+# may classify it read-only; only ordinary or recovery may leave this path.
+- name: Examine a legacy claim's read-only answerer
+  ansible.builtin.stat:
+    path: "{{ billet_exclusion_binary }}"
+    follow: false
+    get_checksum: false
+    get_mime: false
+  register: billet_retirement_legacy_binary
+  failed_when: false
+  check_mode: false
+  become: "{{ billet_exclusion_become }}"
+  when: billet_retirement_legacy | bool
+
+- name: Select a verified legacy answerer
+  ansible.builtin.set_fact:
+    billet_retirement_answerer: "{{ billet_exclusion_binary }}"
+  when:
+    - billet_retirement_legacy | bool
+    - billet_retirement_legacy_binary.stat is defined
+    - billet_retirement_legacy_binary.stat.isreg | default(false)
+    - not billet_retirement_legacy_binary.stat.islnk | default(false)
+    - billet_retirement_legacy_binary.stat.uid | default(-1) == (billet_exclusion_owner_uid | int)
+    - not billet_retirement_legacy_binary.stat.wgrp | default(true)
+    - not billet_retirement_legacy_binary.stat.woth | default(true)
+    - billet_retirement_legacy_binary.stat.xusr | default(false)
+
+- name: Observe the legacy claim's read-only answerer
+  ansible.builtin.include_tasks: answerer-version.yml
+  vars:
+    billet_version_answerer: "{{ billet_retirement_answerer }}"
+  when: billet_retirement_legacy | bool
+
+- name: Judge the answerer's capability observation
+  ansible.builtin.set_fact:
+    billet_retirement_capable: >-
+      {{ billet_retirement_answerer | length > 0
+         and (billet_exclusion_answerer_version.type | default('') == 'development'
+              or (billet_exclusion_answerer_version.type | default('') == 'release'
+                  and billet_exclusion_answerer_version.value | default('') is match('^v[0-9]+\.[0-9]+\.[0-9]+\Z')
+                  and (billet_exclusion_answerer_version.value is version(billet_retire_capability_floor, '>=')))) }}
+    billet_retirement_why: >-
+      Retirement capability cannot be established: answerer {{ billet_retirement_answerer | default('none', true) }},
+      version type {{ billet_exclusion_answerer_version.type | default('missing') }}.
+      Install a classifier at or after {{ billet_retire_capability_floor }} and converge again.
+
+- name: Screen compatibility without a capable classifier
+  ansible.builtin.include_tasks: retirement-compatibility.yml
+  when: not billet_retirement_capable | bool
+
+- name: Observe the classifier's installed environment
+  when: billet_retirement_capable | bool
+  block:
+    - name: Read this host's server environment operand
+      ansible.builtin.include_tasks: retirement-environment.yml
+    - name: Confirm the environment observation completed
+      ansible.builtin.set_fact:
+        billet_retirement_environment_ready: true
+  rescue:
+    - name: Hold an unreadable server environment
+      ansible.builtin.set_fact:
+        billet_retirement_why: "{{ ansible_failed_result.msg }}"
+
+- name: Ask the retirement classifier
+  ansible.builtin.command:
+    argv: >-
+      {{ ['timeout', '-k', '10', billet_retire_classify_bound | string,
+          billet_retirement_answerer, 'server', 'retire', '--dry-run', '--json',
+          '--retiring-host', inventory_hostname, '--config', '/etc/billet/billet.yaml']
+         + (['--requested'] if billet_server_retire | bool else [])
+         + (['--expected-holder', billet_exclusion_holder] if not ansible_check_mode and billet_exclusion_held | default(false) | bool else [])
+         + (['--expected-guard', billet_exclusion_id] if not ansible_check_mode and billet_exclusion_held | default(false) | bool and billet_exclusion_id | default('') | length > 0 else [])
+         + (['--environment-file', billet_retirement_environment_file] if billet_retirement_environment_file | length > 0 else []) }}
+    expand_argument_vars: false
+  register: billet_retirement_classify_raw
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  become: true
+  when: billet_retirement_capable | bool and billet_retirement_environment_ready | bool
+
+- name: Judge classification before choosing any host work
+  when: billet_retirement_capable | bool and billet_retirement_environment_ready | bool
+  block:
+    - name: Parse retirement's classification
+      ansible.builtin.include_tasks: retire-answer.yml
+      vars:
+        billet_retire_raw: "{{ billet_retirement_classify_raw }}"
+        billet_retire_call: classify
+        billet_retire_answered_by: "{{ billet_retirement_answerer }}"
+
+    - name: Keep the classifier's route and operands
+      ansible.builtin.set_fact:
+        billet_retirement_classification: "{{ billet_retire_answer }}"
+        billet_retirement_route: >-
+          {{ billet_retire_route if billet_retire_state_known | bool
+             and (not billet_retirement_legacy | bool or billet_retire_route in ['ordinary', 'recovery']) else 'hold' }}
+        billet_retirement_why: >-
+          {{ 'The retirement state is unknown.' if not billet_retire_state_known | bool
+             else ('A legacy claim must finish binary recovery before any retirement mutation.'
+                   if billet_retirement_legacy | bool and billet_retire_route not in ['ordinary', 'recovery']
+                   else billet_retire_answer.route_why | default('')) }}
+  rescue:
+    - name: Keep an unanswered classification held
+      ansible.builtin.set_fact:
+        billet_retirement_bypass: true
+        billet_retirement_route: hold
+        billet_retirement_why: "{{ ansible_failed_result.msg | default('The retirement classifier did not answer.') }}"
+
+- name: Admit the ordinary route
+  ansible.builtin.set_fact:
+    billet_retirement_bypass: false
+  when: billet_retirement_route == 'ordinary'
+
+- name: Close the ordinary boundary on every other route
+  ansible.builtin.set_fact:
+    billet_retirement_bypass: true
+  when: billet_retirement_route != 'ordinary'
+
+- name: Report the retirement route
+  ansible.builtin.debug:
+    msg: >-
+      Retirement route {{ billet_retirement_route }}: {{ billet_retirement_why }}
+      {{ 'Check mode reports this route without retirement mutations or recovery.' if ansible_check_mode else '' }}
+
+- name: Refuse a held or unavailable retirement route
+  ansible.builtin.fail:
+    msg: >-
+      Retirement holds this host ({{ billet_retirement_route }}): {{ billet_retirement_why }}
+      {{ 'New requests and reservation cancellation require the next caller revision.'
+         if billet_retirement_route in ['new-request', 'cancel'] else '' }}
+  when:
+    - not ansible_check_mode
+    - billet_retirement_route not in ['ordinary', 'continue', 'recovery']
+
+- name: Recover only the transaction the classifier admitted
+  when:
+    - billet_retirement_route == 'recovery'
+    - not ansible_check_mode
+  block:
+    - name: Read the admitted binary recovery's own inputs
+      ansible.builtin.include_tasks: upgrade-inspect.yml
+    - name: Compute the ledger mount name before recovery bypasses ordinary work
+      ansible.builtin.include_tasks: ledger-mount-name.yml
+    - name: Run the existing binary recovery alone
+      ansible.builtin.include_tasks: upgrade-recover.yml
+    - name: End this invocation after the admitted recovery
+      ansible.builtin.include_tasks: upgrade-fresh-converge.yml
+
+- name: Continue the retirement recorded on this host
+  ansible.builtin.include_tasks: retirement-continue.yml
+  when:
+    - billet_retirement_route == 'continue'
+    - not ansible_check_mode

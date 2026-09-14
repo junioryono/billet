@@ -1,0 +1,135 @@
+---
+# These are retirement.Root's paths, not children of billet_upgrade_root.
+# Absence is a veto lifted, never proof that a shared reservation is absent.
+- name: Screen the three fixed retirement artefacts
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+    get_checksum: false
+    get_mime: false
+  loop:
+    - /var/lib/billet/retired/journal.json
+    - /var/lib/billet/authority-status
+    - /var/lib/billet/retired/config-serverless.yaml
+  register: billet_retirement_artefacts
+  failed_when: false
+  check_mode: false
+  become: true
+
+- name: Start the compatibility observation at unknown
+  ansible.builtin.set_fact:
+    billet_retirement_screen_clear: true
+    billet_retirement_installed: {config: unreadable, roles: unknown, identity_dir: ''}
+    billet_retirement_identity_clear: false
+
+- name: Keep every present or unexamined artefact as a veto
+  ansible.builtin.set_fact:
+    billet_retirement_screen_clear: false
+    billet_retirement_why: >-
+      Retirement capability is unavailable and {{ item.item }} is present or could not be examined.
+      An empty artefact screen would still not exclude a shared reservation.
+  loop: "{{ billet_retirement_artefacts.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: item.stat is not defined or item.stat.exists | default(true)
+
+- name: Examine the installed configuration for compatibility
+  ansible.builtin.stat:
+    path: /etc/billet/billet.yaml
+    follow: false
+    get_checksum: false
+    get_mime: false
+  register: billet_retirement_config_stat
+  failed_when: false
+  check_mode: false
+  become: true
+
+- name: Note a positively absent installed configuration
+  ansible.builtin.set_fact:
+    billet_retirement_installed: {config: absent, roles: unknown, identity_dir: /var/lib/billet/server}
+  when:
+    - billet_retirement_config_stat.stat is defined
+    - not billet_retirement_config_stat.stat.exists
+
+- name: Read the installed configuration for compatibility
+  ansible.builtin.slurp:
+    src: /etc/billet/billet.yaml
+  register: billet_retirement_config_raw
+  failed_when: false
+  check_mode: false
+  no_log: true
+  become: true
+  when:
+    - billet_retirement_config_stat.stat.isreg | default(false)
+    - not billet_retirement_config_stat.stat.islnk | default(false)
+
+- name: Locate the installed identity without the desired policy
+  ansible.builtin.set_fact:
+    billet_retirement_installed: "{{ billet_retirement_config_raw.content | b64decode | junioryono.billet.retirement_config }}"
+  no_log: true
+  when:
+    - billet_retirement_config_raw is not skipped
+    - billet_retirement_config_raw.content is defined
+
+- name: Examine identity and authority remnants at the installed locator
+  ansible.builtin.stat:
+    path: "{{ billet_retirement_installed.identity_dir }}/{{ item }}"
+    follow: false
+    get_checksum: false
+    get_mime: false
+  loop: [deployment-id, ca, authority-created]
+  register: billet_retirement_identity_paths
+  failed_when: false
+  check_mode: false
+  become: true
+  when: billet_retirement_installed.identity_dir | length > 0
+
+- name: Require three successful absent identity observations
+  ansible.builtin.set_fact:
+    billet_retirement_identity_clear: >-
+      {{ billet_retirement_identity_paths.results | selectattr('stat', 'defined') | list | length == 3
+         and billet_retirement_identity_paths.results | selectattr('stat', 'defined')
+             | selectattr('stat.exists', 'equalto', false) | list | length == 3 }}
+  when: billet_retirement_installed.identity_dir | length > 0
+
+- name: Name the installed-controller capability refusal
+  ansible.builtin.set_fact:
+    billet_retirement_why: >-
+      Retirement capability is unavailable through {{ billet_retirement_answerer | default('an absent answerer', true) }}
+      (version type {{ billet_exclusion_answerer_version.type | default('missing') }}), and installed-controller
+      status is {{ 'present' if billet_retirement_installed.roles == 'server' else 'unknown' }}.
+      The empty artefact screen grants no permission over a shared reservation.
+      Install a classifier at or after {{ billet_retire_capability_floor }} and converge again.
+  when: billet_retirement_screen_clear | bool
+
+- name: Admit only a positively node-only or never-commissioned host
+  ansible.builtin.set_fact:
+    billet_retirement_route: ordinary
+    billet_retirement_bypass: false
+    billet_retirement_why: >-
+      The incapable-answerer compatibility screen proved this host
+      {{ 'node-only' if billet_retirement_installed.roles == 'node' else 'never commissioned' }}.
+  when:
+    - not billet_server_retire | bool
+    - not billet_retirement_legacy | bool
+    - billet_retirement_screen_clear | bool
+    - >-
+      billet_retirement_answerer | length == 0 or
+      (billet_exclusion_answerer_version.type | default('') == 'release' and
+       billet_exclusion_answerer_version.value | default('') is match('^v[0-9]+\.[0-9]+\.[0-9]+\Z') and
+       billet_exclusion_answerer_version.value | default('') is version(billet_retire_capability_floor, '<'))
+    - >-
+      billet_retirement_installed.roles == 'node' or
+      (billet_retirement_identity_clear | bool and
+       (billet_retirement_installed.config in ['absent', 'malformed'] or
+        (billet_retirement_installed.config == 'present' and billet_retirement_installed.roles == 'server')))
+
+- name: Refuse a requested retirement without a capable answerer by name
+  ansible.builtin.set_fact:
+    billet_retirement_route: hold
+    billet_retirement_bypass: true
+    billet_retirement_why: >-
+      --requested retirement requires a capable answerer at or after {{ billet_retire_capability_floor }};
+      the selected answerer is {{ billet_retirement_answerer | default('absent', true) }}
+      (version type {{ billet_exclusion_answerer_version.type | default('missing') }}).
+  when: billet_server_retire | bool

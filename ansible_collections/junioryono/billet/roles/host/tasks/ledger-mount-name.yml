@@ -1,0 +1,15 @@
+---
+# The escaped mount unit name is computed HERE — before account.yml renders the
+# server unit, which must name the exact .mount unit in Requires= — and before
+# the recovery guard below, which needs it to prove the ledger is mounted. The
+# escape mirrors `systemd-escape --path` for ordinary paths (dashes become
+# \x2d, slashes become dashes); a path exotic enough to diverge fails CLOSED —
+# systemd refuses a mount unit whose name does not match its Where=, so the
+# mount never starts and the converge stops, rather than the server starting
+# unfenced.
+- name: Compute the ledger mount unit name
+  ansible.builtin.set_fact:
+    billet_ledger_mount_unit_name: >-
+      {{ (billet_candidate_server_state_dir | trim('/')
+          | replace('-', '\x2d') | replace('/', '-')) ~ '.mount' }}
+

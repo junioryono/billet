@@ -435,3 +435,7 @@ billet_service_policy_known_directives:
     - ReadWritePaths
   '[Install]':
     - WantedBy
+
+# Retirement is an explicit inventory request; a recorded journal resumes even
+# after this flag is removed. New requests and cancellation land in 5c.d.
+billet_server_retire: false

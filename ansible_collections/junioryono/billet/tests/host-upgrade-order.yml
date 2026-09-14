@@ -4,7 +4,11 @@
   connection: local
   gather_facts: false
   vars:
-    billet_host_main_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/main.yml') | from_yaml }}"
+    billet_host_main_tasks_raw: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/main.yml') | from_yaml }}"
+    # Expand only the ordinary boundary, whose condition is proved separately.
+    # The existing order assertions still judge the tasks Ansible executes.
+    billet_host_ordinary_boundary: "{{ billet_host_main_tasks_raw | selectattr('name', 'equalto', 'Converge the ordinary host only after retirement admits it') | first }}"
+    billet_host_main_tasks: "{{ billet_host_main_tasks_raw[:-1] + billet_host_ordinary_boundary.block }}"
     billet_host_service_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/services.yml') | from_yaml }}"
     # account.yml IMPORTS the installed-identity check (installed-identity.yml),
     # and this gate pins the order of the six tasks that file holds against
@@ -47,6 +51,19 @@
     billet_host_defaults: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/defaults/main.yml') | from_yaml }}"
     billet_service_policy_unit_path_allowlist: "{{ billet_host_defaults.billet_service_policy_unit_path_allowlist }}"
   tasks:
+    - name: Prove retirement gates both service-account imports
+      ansible.builtin.assert:
+        that:
+          - billet_host_main_tasks_raw[-1].name == 'Converge the ordinary host only after retirement admits it'
+          - billet_host_ordinary_boundary.when == 'not billet_retirement_bypass | bool'
+          - billet_host_main_tasks_raw[-2]['ansible.builtin.import_tasks'] == 'retirement.yml'
+          - billet_host_ordinary_boundary.block[0]['ansible.builtin.import_tasks'] == 'service-account.yml'
+          - >-
+            (billet_host_ordinary_boundary.block | selectattr('name', 'equalto',
+             'Record the service account and provision the authority locks on a fresh host') | first)
+            ['ansible.builtin.import_tasks'] == 'service-account.yml'
+        fail_msg: Retirement must precede and gate both ordinary service-account imports.
+
     - name: Locate the upgrade transaction and recovery path
       ansible.builtin.set_fact:
         billet_upgrade_task: "{{ billet_host_service_tasks | selectattr('name', 'equalto', 'Upgrade billet as one recoverable host transaction') | first }}"

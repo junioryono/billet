@@ -147,6 +147,8 @@
   ansible.builtin.set_fact:
     billet_exclusion_answerer: ""
     billet_exclusion_answered_now: false
+    billet_exclusion_answerer_version: {type: unreadable}
+    billet_exclusion_settled: false
 
 - name: Start the claim's facts at none
   ansible.builtin.set_fact:
@@ -974,6 +976,13 @@
           become: "{{ billet_exclusion_become }}"
           when: billet_exclusion_acquired | default(false) | bool
 
+        - name: Record only a settlement this inclusion proved
+          ansible.builtin.set_fact:
+            billet_exclusion_settled: >-
+              {{ (billet_exclusion_settle is not skipped and billet_exclusion_settle.rc | default(-1) == 0)
+                 or (billet_exclusion_route in ['managed', 'fallback', 'candidate']
+                     and billet_exclusion_answer.preparing | default(none) is sameas false) }}
+
         - name: Close the preparation window
           ansible.builtin.set_fact:
             billet_exclusion_cleanup_token: ""
@@ -1096,3 +1105,8 @@
          else (((billet_exclusion_fallback_executable | default('')) if billet_exclusion_dry_via_record | default(false) | bool
                 else billet_exclusion_binary)
                if (billet_exclusion_dry_answered | default(false) | bool and (billet_exclusion_dry_report | default({}) | length > 0)) else '') }}
+
+- name: Observe the executable that answered preparation
+  ansible.builtin.include_tasks: answerer-version.yml
+  vars:
+    billet_version_answerer: "{{ billet_exclusion_answerer }}"
