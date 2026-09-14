@@ -247,7 +247,7 @@ func TestDiscoveryWithdrawalDoesNotReleaseAnAcquiringCapacityLease(t *testing.T)
 	if err := donor.refillEscrowUngated(t.Context(), 2, 2); err != nil {
 		t.Fatal(err)
 	}
-	if got := donor.reserve([]Job{{RequestID: 11}}); !slices.Equal(got, []int64{11}) {
+	if got := donor.reserve([]resolvedJob{{job: Job{RequestID: 11}}}); !slices.Equal(got, []int64{11}) {
 		t.Fatalf("reserved %v, want request 11", got)
 	}
 	promised := donor.acquiring[11].lease
@@ -314,7 +314,7 @@ func TestCappedDemandAdvancesTheWholeRoundRobin(t *testing.T) {
 			t.Fatalf("tier %s has advertisement %d, turn %d; want one backed turn", l.tier, advertised, turn)
 		}
 		id := int64(i + 1)
-		if got := l.reserve([]Job{{RequestID: id}}); !slices.Equal(got, []int64{id}) {
+		if got := l.reserve([]resolvedJob{{job: Job{RequestID: id}}}); !slices.Equal(got, []int64{id}) {
 			t.Fatalf("tier %s reserved %v, want %d", l.tier, got, id)
 		}
 		l.observeDemand(l.observed)
@@ -1090,7 +1090,7 @@ func TestArbitratedRefillBuysOneLeaseAfterCommittedCapacityDisappears(t *testing
 		t.Fatal(err)
 	}
 	_, spent := l.admissionPoll()
-	if got := l.reserve([]Job{{RequestID: 11}}); !slices.Equal(got, []int64{11}) {
+	if got := l.reserve([]resolvedJob{{job: Job{RequestID: 11}}}); !slices.Equal(got, []int64{11}) {
 		t.Fatalf("reserved %v, want request 11", got)
 	}
 	promised := l.acquiring[11].lease

@@ -159,6 +159,11 @@ func actualJobCandidates(actual actualJobIdentity, requestID int64, known []actu
 // The runner's launch request is returned separately for cleanup and contributes
 // no actual-job alias. Resolution runs outside l.mu, before message decisions;
 // consumers use sameActualJob and never reconstruct aliases from cleanup IDs.
+// Measured on v0.10.0, 2026-08-31 through 2026-09-14 (entire controller journal):
+// all 860 pooled starts and every logged assignment had request 0, using a direct
+// ID from JobID. 114/860 runners (13%) completed another job than their launch;
+// no JobID started twice, no runner started two jobs, and every completion named
+// its runner. Cross-run JobID ambiguity and request-only assignments were unseen.
 func (l *Listener) resolveActualJob(ctx context.Context, job Job, mode jobResolution,
 	known []actualJobIdentity,
 ) (resolvedJob, error) {
@@ -299,7 +304,12 @@ func (l *Listener) resolveActualJob(ctx context.Context, job Job, mode jobResolu
 // resolveMessage applies resolveActualJob once to each entry before any consumer.
 func (l *Listener) resolveMessage(ctx context.Context, msg *Message) (resolvedMessage, error) {
 	var out resolvedMessage
-	var known []actualJobIdentity
+	var err error
+	out.committed, err = l.resolveCommitments(ctx)
+	if err != nil {
+		return out, err
+	}
+	known := l.currentCommitments(out.committed)
 	for _, jobs := range []struct {
 		wire []Job
 		dest *[]resolvedJob
@@ -329,9 +339,7 @@ func (l *Listener) resolveMessage(ctx context.Context, msg *Message) (resolvedMe
 		out.completed = append(out.completed, resolved)
 	}
 
-	var err error
-	out.committed, err = l.resolveCommitments(ctx)
-	return out, err
+	return out, nil
 }
 
 // resolveCommitments snapshots ownership under l.mu and resolves outside it.
@@ -343,7 +351,7 @@ func (l *Listener) resolveCommitments(ctx context.Context) ([]jobCommitment, err
 		job := p.job
 		job.RequestID = id
 		jobs = append(jobs, job)
-		commitments = append(commitments, jobCommitment{key: id, lease: p.lease, promise: p})
+		commitments = append(commitments, jobCommitment{actual: p.actual, key: id, lease: p.lease, promise: p})
 	}
 	for id, lease := range l.running {
 		actual := l.runningJobs[id]

@@ -505,9 +505,10 @@ func withCompletionStore(store completionStore) Option {
 // `at` IS DIAGNOSTIC ONLY — it drives one stale-promise warning and must not time
 // the promise out; see defaultStalePromise.
 type promise struct {
-	job   Job
-	lease *alloc.Lease
-	at    time.Time
+	job    Job
+	actual actualJobIdentity
+	lease  *alloc.Lease
+	at     time.Time
 	// reported keeps a stale promise from logging on every heartbeat.
 	reported bool
 }
@@ -1129,6 +1130,8 @@ func (l *Listener) Run(ctx context.Context) error {
 		endDrain        context.CancelFunc
 		poisonMessageID int64
 		poisonRefusals  int
+		// Previous statistics cannot authorize reconciliation during a held retry.
+		poisonHeld bool
 	)
 
 	defer func() {
@@ -1264,7 +1267,7 @@ func (l *Listener) Run(ctx context.Context) error {
 			// un-quiet and a drain keeps waiting and keeps reporting what it is
 			// waiting for. The seal under-delivers visibly rather than reporting a
 			// deployment quiesced that is not.
-			if l.observed != nil {
+			if l.observed != nil && !poisonHeld {
 				if err := l.reconcileAdmissionPool(pollCtx, l.observed.TotalAssignedJobs); err != nil {
 					// reconcilePool launches runners, which can take minutes; a
 					// cancellation landing mid-launch must enter the drain so the
@@ -1334,7 +1337,7 @@ func (l *Listener) Run(ctx context.Context) error {
 			// proves it.
 			l.handBackIdleEscrow(pollCtx, draining || (quiesced && admissionKnown))
 
-			if l.observed != nil {
+			if l.observed != nil && !poisonHeld {
 				if _, err := l.reconcilePool(pollCtx, l.observed.TotalAssignedJobs); err != nil {
 					// reconcilePool launches runners, which can take minutes; a
 					// cancellation landing mid-launch must enter the drain so the
@@ -1415,6 +1418,7 @@ func (l *Listener) Run(ctx context.Context) error {
 					poisonRefusals = 0
 				}
 				poisonRefusals++
+				poisonHeld = poison.held
 
 				if poisonRefusals < poisonQuarantineAfter {
 					l.log.Error("a completion message has a deterministic identity refusal; keeping it unacknowledged for another delivery before quarantine",
@@ -1444,6 +1448,7 @@ func (l *Listener) Run(ctx context.Context) error {
 					"error", poison)
 				poisonMessageID = 0
 				poisonRefusals = 0
+				poisonHeld = false
 				// A QUARANTINED MESSAGE IS A HANDLED EXCHANGE, and ends its turn as
 				// every other handled exchange does. Skipping this let a stream of
 				// poisoned messages hold the shared admission turn indefinitely,
@@ -1466,6 +1471,7 @@ func (l *Listener) Run(ctx context.Context) error {
 
 		poisonMessageID = 0
 		poisonRefusals = 0
+		poisonHeld = false
 		l.finishAdmissionTurn(admissionTurn)
 		if !draining {
 			l.releaseIdleEscrowAbove(pollCtx, max(advertised, l.targetCapacity()))
@@ -3276,13 +3282,10 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 		}
 	}
 
-	if msg.Statistics != nil {
+	if msg.Statistics != nil && len(resolved.held) == 0 {
 		l.observed = msg.Statistics
-		// Aggregate demand cannot launch a pool runner for a held candidate.
-		if len(resolved.held) == 0 {
-			if _, err := l.reconcilePool(ctx, msg.Statistics.TotalAssignedJobs); err != nil {
-				return err
-			}
+		if _, err := l.reconcilePool(ctx, msg.Statistics.TotalAssignedJobs); err != nil {
+			return err
 		}
 	}
 
@@ -3708,13 +3711,8 @@ func (l *Listener) acquireUnfinished(ctx context.Context, available []resolvedJo
 	}
 
 	committed := l.currentCommitments(commitments)
-	identified := make([]Job, 0, len(available))
-	protocolFor := make(map[int64]int64, len(available))
-	internalFor := make(map[int64]int64, len(available))
-	offerFor := make(map[int64]actualJobIdentity, len(available))
+	identified := make([]resolvedJob, 0, len(available))
 	for _, entry := range available {
-		protocolID := entry.protocolID
-		job := entry.job
 		if containsActual(held, entry.actual) {
 			continue
 		}
@@ -3722,7 +3720,20 @@ func (l *Listener) acquireUnfinished(ctx context.Context, available []resolvedJo
 			l.forgetAvailable(entry.actual)
 			continue
 		}
-		identified = append(identified, job)
+		if i := slices.IndexFunc(identified, func(prior resolvedJob) bool {
+			return sameActualJob(prior.actual, entry.actual)
+		}); i >= 0 {
+			identified[i].actual = mergeActual(identified[i].actual, entry.actual)
+			continue
+		}
+		identified = append(identified, entry)
+	}
+	protocolFor := make(map[int64]int64, len(available))
+	internalFor := make(map[int64]int64, len(available))
+	offerFor := make(map[int64]actualJobIdentity, len(available))
+	for _, entry := range identified {
+		protocolID := entry.protocolID
+		job := entry.job
 		protocolFor[job.RequestID] = protocolID
 		if prior, duplicate := internalFor[protocolID]; duplicate && prior != job.RequestID {
 			return fmt.Errorf("%w: %s offered distinct jobs %d and %d under the same runner request id %d; the acquisition response cannot distinguish them",
@@ -3806,14 +3817,14 @@ func (l *Listener) acquireUnfinished(ctx context.Context, available []resolvedJo
 
 // reserve moves escrow from held into acquiring, one lease per offer, and
 // returns the request ids it could back.
-func (l *Listener) reserve(available []Job) []int64 {
+func (l *Listener) reserve(available []resolvedJob) []int64 {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
 	ids := make([]int64, 0, len(available))
 
 	for i := range available {
-		job := &available[i]
+		job := &available[i].job
 		// Already promised, and therefore NOT returned to the caller.
 		//
 		// Returning it looked harmless and was not: the caller unreserves whatever
@@ -3860,7 +3871,7 @@ func (l *Listener) reserve(available []Job) []int64 {
 			continue
 		}
 
-		l.acquiring[job.RequestID] = &promise{lease: l.held[0], at: time.Now(), job: *job}
+		l.acquiring[job.RequestID] = &promise{lease: l.held[0], at: time.Now(), job: *job, actual: available[i].actual}
 		l.held = l.held[1:]
 
 		ids = append(ids, job.RequestID)
@@ -4034,14 +4045,14 @@ func (l *Listener) assignResolved(ctx context.Context, entry resolvedJob) (*allo
 	// names the promise to consume, not the request to bind on the lease.
 	var lease *alloc.Lease
 	var promiseKey int64
+	var promiseKeys []int64
 	promised := false
 	for _, c := range commitments {
 		if c.promise != nil && c.heldBy(l) && sameActualJob(actual, c.actual) {
-			if promised {
-				return nil, false, fmt.Errorf("%w: assignment %d matches several promises",
-					ErrUntrustworthySession, job.RequestID)
+			promiseKeys = append(promiseKeys, c.key)
+			if !promised || c.key < promiseKey {
+				lease, promiseKey, promised = c.lease, c.key, true
 			}
-			lease, promiseKey, promised = c.lease, c.key, true
 			actual = mergeActual(actual, c.actual)
 		}
 	}
@@ -4080,7 +4091,14 @@ func (l *Listener) assignResolved(ctx context.Context, entry resolvedJob) (*allo
 	// the release path — capacity that nothing hands back and nothing reports,
 	// until the reaper's TTL expires it.
 	if promised {
-		delete(l.acquiring, promiseKey)
+		// One resolver-coalesced job owns these promises; only one needs a runner.
+		for _, key := range promiseKeys {
+			if key != promiseKey {
+				l.held = append(l.held, l.acquiring[key].lease)
+			}
+			delete(l.acquiring, key)
+		}
+		l.sortHeld()
 	} else {
 		l.held = l.held[1:]
 	}
