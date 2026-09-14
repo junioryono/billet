@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/junioryono/billet/internal/guestassets"
 )
 
 // shimHarness stands the shim in front of a fake docker client on PATH, exactly
@@ -35,13 +37,13 @@ func shimHarness(t *testing.T) func(env []string, args ...string) (string, error
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := writeExecutable(filepath.Join(front, "docker"), body, 0o755); err != nil {
+	if err := guestassets.WriteExecutable(filepath.Join(front, "docker"), body, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	fake := "#!/bin/sh\nprintf 'argv=%s\\n' \"$*\"\n" +
 		"printf 'results=%s\\n' \"${ACTIONS_RESULTS_URL:-unset}\"\n" +
 		"printf 'v2=%s\\n' \"${ACTIONS_CACHE_SERVICE_V2:-unset}\"\n"
-	if err := writeExecutable(filepath.Join(behind, "docker"), []byte(fake), 0o755); err != nil {
+	if err := guestassets.WriteExecutable(filepath.Join(behind, "docker"), []byte(fake), 0o755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -144,7 +146,7 @@ func TestTheDockerShimRefusesToExecItself(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := writeExecutable(filepath.Join(front, "docker"), body, 0o755); err != nil {
+	if err := guestassets.WriteExecutable(filepath.Join(front, "docker"), body, 0o755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -182,11 +184,11 @@ func TestTheDockerShimSkipsEverySiblingShimOnPath(t *testing.T) {
 		}
 	}
 	for _, copy := range []string{optBin, usrLocal} {
-		if err := writeExecutable(filepath.Join(copy, "docker"), body, 0o755); err != nil {
+		if err := guestassets.WriteExecutable(filepath.Join(copy, "docker"), body, 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := writeExecutable(filepath.Join(behind, "docker"),
+	if err := guestassets.WriteExecutable(filepath.Join(behind, "docker"),
 		[]byte("#!/bin/sh\nprintf 'real=%s\\n' \"$0\"\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}

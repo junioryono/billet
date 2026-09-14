@@ -31,10 +31,10 @@ const (
 // THE RETRY BELOW COVERS ONLY A START GO MAKES. A script that execs another
 // file this package wrote (the docker shim execs the fake docker behind it)
 // fails inside the shell, where nothing can retry it: CI run 34831856345
-// (2026-09-14) failed `exec: .../behind/docker: Text file busy`. Every fork in
-// this process takes ForkLock, so no child can be created while a write
-// descriptor is open, and no child can hold a copy of one when the file is
-// later executed.
+// (2026-09-14) failed `exec: .../behind/docker: Text file busy`. syscall's
+// forkExec, which every os/exec start in these tests goes through, holds
+// ForkLock across creating the child, so no such child can be created while a
+// write descriptor is open or hold a copy of one when the file is executed.
 func writeExecutable(name string, data []byte, perm os.FileMode) error {
 	syscall.ForkLock.Lock()
 	defer syscall.ForkLock.Unlock()
