@@ -1673,7 +1673,9 @@ expect_allowed r6-request-handoff
 r_no_ordinary_after_request r6-request-handoff
 expect_host_commands r6-request-handoff 'control-a retire-classify 1;control-a retire-reserve 1;control-a retire-request 1;control-b retire-complete 1;control-a retire-acknowledge 1;control-a retire-request 2;'
 expect_no_task r6-request-handoff 'Report a row obligation whose survivor this converge did not prepare'
-expect_ran r6-request-handoff 'Settle locally after acknowledging the row'
+# expect_ran reads ok/changed results; include_tasks reports included instead.
+# Assert the settlement command inside the include, after the exact call order.
+expect_ran r6-request-handoff "Continue through the journal's recorded survivor"
 PYTHONPATH="$here" "$python" -B - "$work/cases/r6-request-handoff" "$work/retire-fixtures" <<'PYTAIL'
 import json, pathlib, sys
 from callback_result import callback_message
