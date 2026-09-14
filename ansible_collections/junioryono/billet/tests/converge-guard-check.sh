@@ -941,10 +941,13 @@ failed_at() {
   awk '/^TASK \[/ { t=$0; sub(/^TASK \[/, "", t); sub(/\] \*+$/, "", t); sub(/^junioryono\.billet\.host : /, "", t) }
        /^(fatal|failed): / { print t; exit }' "$work/cases/$1/out"
 }
-# The last fatal result with the lines that belong to it (under -vvv the
-# message follows the fatal line rather than sitting on it).
+# Keep the whole final fatal task, including every host's result, so the
+# decoder can refuse duplicates instead of silently choosing the last host.
 final_fatal() {
-  awk '/^(fatal|failed): / { buf = ""; on = 1 } on { buf = buf $0 "\n" } /^(PLAY RECAP|TASK \[)/ { on = 0 } END { printf "%s", buf }' "$work/cases/$1/out"
+  awk '/^(TASK \[|PLAY \[|PLAY RECAP)/ { if (fatal) final = buf; buf = ""; fatal = 0 }
+       { buf = buf $0 "\n" }
+       /^(fatal|failed): / { fatal = 1 }
+       END { if (fatal) final = buf; printf "%s", final }' "$work/cases/$1/out"
 }
 expect_refused() { # case task fragment...
   local name=$1 task=$2; shift 2
@@ -967,13 +970,13 @@ expect_refused_member() {
   [ "$items" -eq 1 ] || fail "$name: $items failed items of the parser, want exactly one" "$work/cases/$name/out"
   grep -q "^failed: \[localhost\] (item=$member)" "$work/cases/$name/out" || fail "$name: the failed item is not $member" "$work/cases/$name/out"
 }
-# expect_final CASE FRAGMENT...: the rescue's re-failure, the last fatal line.
+# expect_final CASE FRAGMENT...: the rescue's decoded re-failure message.
 expect_final() {
   local name=$1; shift
-  local line
-  line=$(final_fatal "$name")
+  local message
+  message=$(final_fatal "$name" | "$python" "$here/callback_result.py" "$name: final fatal task")
   for frag in "$@"; do
-    printf '%s' "$line" | grep -qF -- "$frag" || fail "$name: the final refusal does not say: $frag" "$work/cases/$name/out"
+    grep -qF -- "$frag" <<<"$message" || fail "$name: the final refusal does not say: $frag" "$work/cases/$name/out"
   done
 }
 expect_allowed() {

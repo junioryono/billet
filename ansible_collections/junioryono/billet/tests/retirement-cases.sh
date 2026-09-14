@@ -185,20 +185,20 @@ r_held() { # case route [first-failure-task [host]]
 }
 r_reported() { # case route [reason [output-file]]
   expect_ran "$1" 'Report the retirement route'
-  "$python" - "$work/cases/$1/${4:-out}" "$2" "${3:-}" <<'PYREPORT'
-import json, pathlib, sys
+  PYTHONPATH="$here" "$python" -B - "$work/cases/$1/${4:-out}" "$2" "${3:-}" <<'PYREPORT'
+import pathlib, sys
+from callback_result import callback_message
 text = pathlib.Path(sys.argv[1]).read_text()
 header = 'TASK [junioryono.billet.host : Report the retirement route]'
 blocks = text.split(header)
 if len(blocks) != 2:
     sys.exit('the retirement route was not reported exactly once')
 block = blocks[1].split('TASK [', 1)[0]
-messages = [json.loads(line.strip().removeprefix('"msg": ').removesuffix(','))
-            for line in block.splitlines() if line.strip().startswith('"msg": ')]
-if len(messages) != 1 or not messages[0].startswith('Retirement route ' + sys.argv[2] + ': '):
-    sys.exit('the reported retirement route differs: ' + repr(messages))
-if sys.argv[3] and sys.argv[3] not in messages[0]:
-    sys.exit('the reported retirement reason differs: ' + repr(messages))
+message = callback_message(block, pathlib.Path(sys.argv[1]).parent.name + ': retirement route')
+if not message.startswith('Retirement route ' + sys.argv[2] + ': '):
+    sys.exit('the reported retirement route differs: ' + repr(message))
+if sys.argv[3] and sys.argv[3] not in message:
+    sys.exit('the reported retirement reason differs: ' + repr(message))
 PYREPORT
 }
 r_continuation() { # case request-count [environment-file [handoff]]
@@ -312,8 +312,9 @@ done
 # controls must report ok; a republished status must report changed even when
 # the outcome word is unchanged. Also require the final settlement message.
 r_done_report() { # case True|False ok|changed
-  "$python" - "$work/cases/$1/out" "$2" "$3" <<'PYDONE'
-import json, pathlib, sys
+  PYTHONPATH="$here" "$python" -B - "$work/cases/$1/out" "$2" "$3" <<'PYDONE'
+import pathlib, sys
+from callback_result import callback_message
 text = pathlib.Path(sys.argv[1]).read_text()
 def block(task):
     parts = text.split('TASK [junioryono.billet.host : ' + task + ']')
@@ -326,10 +327,9 @@ verdicts = [line.split(':', 1)[0] for line in result.splitlines()
 if verdicts != [sys.argv[3]]:
     sys.exit('the done change report differs: ' + repr(verdicts))
 report = block("Report the retirement's settlement or remaining obligation")
-messages = [json.loads(line.strip().removeprefix('"msg": ').removesuffix(','))
-            for line in report.splitlines() if line.strip().startswith('"msg": ')]
-if len(messages) != 1 or not messages[0].startswith('Retirement is locally done; settled=' + sys.argv[2] + '.'):
-    sys.exit('the done settlement report differs: ' + repr(messages))
+message = callback_message(report, pathlib.Path(sys.argv[1]).parent.name + ': retirement settlement')
+if not message.startswith('Retirement is locally done; settled=' + sys.argv[2] + '.'):
+    sys.exit('the done settlement report differs: ' + repr(message))
 PYDONE
 }
 
@@ -1551,14 +1551,11 @@ PYMARKER
   # Compare the decoded final diagnostic with the producer's whole reason;
   # a common word such as journal could come from cleanup alone.
   final_fatal "$name" >"$work/cases/$name/final-failure"
-  "$python" - "$work/cases/$name/final-failure" "$work/retire-fixtures/$request_fixture.json" "$cleanup" "$work/retire-fixtures/$abandon_fixture.json" "$work/cases/$name/out" <<'PYWHY'
+  PYTHONPATH="$here" "$python" -B - "$work/cases/$name/final-failure" "$work/retire-fixtures/$request_fixture.json" "$cleanup" "$work/retire-fixtures/$abandon_fixture.json" "$work/cases/$name/out" <<'PYWHY'
 import json, pathlib, sys
+from callback_result import callback_message
 text = pathlib.Path(sys.argv[1]).read_text()
-messages = [json.loads(line.strip().removeprefix('"msg": ').removesuffix(','))
-            for line in text.splitlines() if line.strip().startswith('"msg": ')]
-if len(messages) != 1:
-    sys.exit('R17 final failure did not contain one decoded diagnostic')
-message = messages[0]
+message = callback_message(text, pathlib.Path(sys.argv[1]).parent.name + ': final fatal task', failed=True)
 original = json.loads(pathlib.Path(sys.argv[2]).read_text())['why']
 if original not in message:
     sys.exit('R17 lost the original request reason during cleanup')
