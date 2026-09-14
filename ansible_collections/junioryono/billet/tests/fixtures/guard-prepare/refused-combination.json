@@ -1,0 +1,6 @@
+{
+  "outcome": "refused",
+  "reason": "combination",
+  "why": "prepare takes one mode",
+  "next": "one of --validate, --validate --candidate C, --candidate C, --no-change, --recovery, --dry-run"
+}

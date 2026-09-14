@@ -2,6 +2,7 @@ package wirecert
 
 import (
 	"bytes"
+	"context"
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
@@ -39,12 +40,12 @@ const previousCAKeyFile = "ca-previous.key"
 // A node that misses the whole overlap has to be re-enrolled, which is why
 // retiring is a separate command an operator runs when they can see the fleet
 // has moved rather than something that happens on a timer.
-func Rotate(stateDir, deployment string) (*CA, error) {
+func Rotate(ctx context.Context, stateDir, deployment string) (*CA, error) {
 	// THE LOCK IS TAKEN HERE RATHER THAN BY THE COMMAND, because this is an
 	// exported entry point and a rule enforced only at the CLI has a second way
 	// in that does not enforce it — the same argument alloc.New makes about
 	// re-applying its own safety rules.
-	lock, err := LockAuthority(stateDir)
+	lock, err := LockAuthority(ctx, stateDir)
 	if err != nil {
 		return nil, err
 	}
@@ -52,6 +53,35 @@ func Rotate(stateDir, deployment string) (*CA, error) {
 	ca, rotateErr := rotateLocked(stateDir, deployment)
 
 	return ca, errors.Join(rotateErr, lock.Release())
+}
+
+// RotateWith rotates under a lock the command already holds, for the command
+// that took it before its first identity access (a second flock on another
+// descriptor in one process is denied, so Rotate's own take would refuse it).
+// A nil or released lock refuses: the lock is the rule, not a courtesy.
+func RotateWith(lock *AuthorityLock, stateDir, deployment string) (*CA, error) {
+	if lock == nil || lock.f == nil {
+		return nil, errors.New("wirecert: rotate without the authority lock held")
+	}
+
+	if lock.path != AuthorityLockPath(stateDir) {
+		return nil, fmt.Errorf("wirecert: the lock held is %s, not this state directory's", lock.path)
+	}
+
+	return rotateLocked(stateDir, deployment)
+}
+
+// RetireWith is Retire under a lock the command already holds; see RotateWith.
+func RetireWith(lock *AuthorityLock, stateDir, deployment string) error {
+	if lock == nil || lock.f == nil {
+		return errors.New("wirecert: retire without the authority lock held")
+	}
+
+	if lock.path != AuthorityLockPath(stateDir) {
+		return fmt.Errorf("wirecert: the lock held is %s, not this state directory's", lock.path)
+	}
+
+	return retireLocked(stateDir, deployment)
 }
 
 func rotateLocked(stateDir, deployment string) (*CA, error) {
@@ -239,8 +269,8 @@ func leftoverKeyAdvice(prevKeyPath, keyPath string) string {
 // not renewed still trusts only the old authority, and retiring it makes that
 // node unable to verify the control plane. `billet ca show` reports how many
 // nodes are still on the old one.
-func Retire(stateDir, deployment string) error {
-	lock, err := LockAuthority(stateDir)
+func Retire(ctx context.Context, stateDir, deployment string) error {
+	lock, err := LockAuthority(ctx, stateDir)
 	if err != nil {
 		return err
 	}

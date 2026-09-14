@@ -150,7 +150,11 @@ type journal struct {
 
 // RestoreRequest is what Execute acts on.
 type RestoreRequest struct {
-	Plan Plan
+	// Authority is the inner authority lock when the COMMAND already holds it,
+	// borrowed here and released by the command; nil makes Execute take and
+	// release it itself, after the directory lock.
+	Authority *wirecert.AuthorityLock
+	Plan      Plan
 
 	// InstallAppKey publishes the App private key at a path that must not
 	// already exist, creating it exactly once and never replacing anything.
@@ -235,19 +239,35 @@ func Execute(ctx context.Context, req RestoreRequest) (Result, error) {
 
 	stateDir := req.Plan.Target.StateDir
 
+	// THE AUTHORITY EXCLUSION FIRST, before the directory is created or its lock
+	// taken, on the unborrowed path as on the command's: a plan accepted before a
+	// retirement moved the target would otherwise recreate the directory and its
+	// lock here, and only then be refused. A borrowed Authority was taken by the
+	// command before its first identity access, which is this one.
+	var authority *AuthorityHold
+
+	if req.Authority == nil {
+		taken, err := wirecert.LockAuthority(ctx, stateDir)
+		if err != nil {
+			return Result{}, err
+		}
+
+		authority = &AuthorityHold{lock: taken}
+	}
+
 	// The directory has to exist before it can be locked, and 0700 because it is
 	// about to hold a CA private key.
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
-		return Result{}, fmt.Errorf("deployarchive: create %s: %w", stateDir, err)
+		return Result{}, errors.Join(fmt.Errorf("deployarchive: create %s: %w", stateDir, err), authority.release())
 	}
 
 	if err := os.Chmod(stateDir, 0o700); err != nil {
-		return Result{}, fmt.Errorf("deployarchive: tighten %s: %w", stateDir, err)
+		return Result{}, errors.Join(fmt.Errorf("deployarchive: tighten %s: %w", stateDir, err), authority.release())
 	}
 
 	lock, err := state.LockStateDir(stateDir)
 	if err != nil {
-		return Result{}, err
+		return Result{}, errors.Join(err, authority.release())
 	}
 
 	// THE AUTHORITY LOCK TOO, because this WRITES the same five files `billet ca
@@ -261,14 +281,27 @@ func Execute(ctx context.Context, req RestoreRequest) (Result, error) {
 	// takes them in (its ledger handle may already hold the directory lock before
 	// Write asks for the authority), so the two cannot deadlock against each
 	// other.
-	authority, err := wirecert.LockAuthority(stateDir)
-	if err != nil {
-		return Result{}, errors.Join(err, lock.Release())
-	}
-
+	// Borrowed or taken above, the authority is held through the publication
+	// (authority before directory, the order every command takes them in) and
+	// released after the directory lock, in reverse.
 	res, runErr := executeLocked(ctx, req)
 
-	return res, errors.Join(runErr, authority.Release(), lock.Release())
+	return res, errors.Join(runErr, lock.Release(), authority.release())
+}
+
+// AuthorityHold is an authority lock Execute or Abandon took for itself; a nil
+// one is a borrowed lock, released by the command that lent it.
+type AuthorityHold struct{ lock *wirecert.AuthorityLock }
+
+func (h *AuthorityHold) release() error {
+	if h == nil || h.lock == nil {
+		return nil
+	}
+
+	err := h.lock.Release()
+	h.lock = nil
+
+	return err
 }
 
 func executeLocked(ctx context.Context, req RestoreRequest) (Result, error) {
@@ -1368,22 +1401,23 @@ func Abandon(ctx context.Context, a *Archive, t Target, intent Intent) (AbandonR
 				"prove each file it removes is a copy of one the backup still holds")
 	}
 
-	lock, err := state.LockStateDir(t.StateDir)
+	// The authority lock for the same reason Execute takes it, and in the same
+	// order, AUTHORITY FIRST: this REMOVES authority files, a concurrent rotation
+	// reading them would see half a generation, and a target a retirement moved
+	// is refused before its directory lock could be created.
+	authority, err := wirecert.LockAuthority(ctx, t.StateDir)
 	if err != nil {
 		return AbandonResult{}, err
 	}
 
-	// The authority lock for the same reason Execute takes it, and in the same
-	// order: this REMOVES authority files, and a concurrent rotation reading them
-	// would see half a generation.
-	authority, err := wirecert.LockAuthority(t.StateDir)
+	lock, err := state.LockStateDir(t.StateDir)
 	if err != nil {
-		return AbandonResult{}, errors.Join(err, lock.Release())
+		return AbandonResult{}, errors.Join(err, authority.Release())
 	}
 
 	res, runErr := abandonLocked(ctx, a, t, intent)
 
-	return res, errors.Join(runErr, authority.Release(), lock.Release())
+	return res, errors.Join(runErr, lock.Release(), authority.Release())
 }
 
 func abandonLocked(ctx context.Context, a *Archive, t Target,

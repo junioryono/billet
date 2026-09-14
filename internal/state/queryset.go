@@ -100,6 +100,7 @@ type ReadOps interface {
 	ListJoinTokens(ctx context.Context) ([]ledgerdb.ListJoinTokensRow, error)
 	ListLeaseIDsOnNode(ctx context.Context, arg ledgerdb.ListLeaseIDsOnNodeParams) ([]string, error)
 	ListNodeInventories(ctx context.Context) ([]ledgerdb.ListNodeInventoriesRow, error)
+	ListNodeRegistrations(ctx context.Context) ([]ledgerdb.ListNodeRegistrationsRow, error)
 	ListNodeWireVersions(ctx context.Context) ([]ledgerdb.ListNodeWireVersionsRow, error)
 	ListOutstandingLeases(ctx context.Context) ([]ledgerdb.ListOutstandingLeasesRow, error)
 	ListOutstandingRemoteShapes(ctx context.Context) ([]ledgerdb.ListOutstandingRemoteShapesRow, error)
@@ -130,6 +131,7 @@ type ReadOps interface {
 	ReadDeploymentBinding(ctx context.Context) (ledgerdb.ReadDeploymentBindingRow, error)
 	ReadNodeHighestRelease(ctx context.Context, name string) (string, error)
 	ReadReleaseWatermark(ctx context.Context) (ledgerdb.ReadReleaseWatermarkRow, error)
+	ReadRetirement(ctx context.Context, deployment string) (ledgerdb.ControllerRetirement, error)
 	ReadEnrollment(ctx context.Context, name string) (ledgerdb.NodeEnrollment, error)
 	ReadEnrollmentFingerprint(ctx context.Context, name string) (string, error)
 	ReadJobConclusion(ctx context.Context, leaseID string) (sql.NullString, error)
@@ -179,6 +181,8 @@ type WriteOps interface {
 
 	AcknowledgePendingCompletion(ctx context.Context, arg ledgerdb.AcknowledgePendingCompletionParams) error
 	AcknowledgePoolRunnerSource(ctx context.Context, arg ledgerdb.AcknowledgePoolRunnerSourceParams) error
+	AdoptRetirement(ctx context.Context, arg ledgerdb.AdoptRetirementParams) (sql.Result, error)
+	AdvanceRetirementToIntent(ctx context.Context, arg ledgerdb.AdvanceRetirementToIntentParams) (sql.Result, error)
 	AdvanceRolloutController(ctx context.Context, arg ledgerdb.AdvanceRolloutControllerParams) error
 	AdvanceRolloutNode(ctx context.Context, arg ledgerdb.AdvanceRolloutNodeParams) error
 	ArchiveJobHistory(ctx context.Context, arg ledgerdb.ArchiveJobHistoryParams) error
@@ -190,6 +194,7 @@ type WriteOps interface {
 	ClaimController(ctx context.Context, arg ledgerdb.ClaimControllerParams) (int64, error)
 	ClaimPoolRunnerForRetirement(ctx context.Context, arg ledgerdb.ClaimPoolRunnerForRetirementParams) (sql.Result, error)
 	CompleteForceDestroy(ctx context.Context, arg ledgerdb.CompleteForceDestroyParams) error
+	CompleteRetirement(ctx context.Context, arg ledgerdb.CompleteRetirementParams) (sql.Result, error)
 	CorrectProvisionalHistory(ctx context.Context, arg ledgerdb.CorrectProvisionalHistoryParams) error
 	CorrectProvisionalLease(ctx context.Context, arg ledgerdb.CorrectProvisionalLeaseParams) error
 	DecideEnrollment(ctx context.Context, arg ledgerdb.DecideEnrollmentParams) error
@@ -202,6 +207,7 @@ type WriteOps interface {
 	DeleteEveryNodeInventory(ctx context.Context) error
 	DeleteMovedScaleSet(ctx context.Context, arg ledgerdb.DeleteMovedScaleSetParams) error
 	DeletePoolRunner(ctx context.Context, leaseID string) error
+	DeleteReservedRetirement(ctx context.Context, arg ledgerdb.DeleteReservedRetirementParams) (sql.Result, error)
 	DeleteRetiredCompletion(ctx context.Context, arg ledgerdb.DeleteRetiredCompletionParams) error
 	DeleteScaleSet(ctx context.Context, arg ledgerdb.DeleteScaleSetParams) error
 	ExpireLease(ctx context.Context, arg ledgerdb.ExpireLeaseParams) error
@@ -218,6 +224,7 @@ type WriteOps interface {
 	InsertLease(ctx context.Context, arg ledgerdb.InsertLeaseParams) error
 	InsertPoolRunner(ctx context.Context, arg ledgerdb.InsertPoolRunnerParams) error
 	InsertPoolSlotIdentity(ctx context.Context, leaseID string) error
+	InsertRetirement(ctx context.Context, arg ledgerdb.InsertRetirementParams) error
 	InsertRollout(ctx context.Context, arg ledgerdb.InsertRolloutParams) error
 	InsertRolloutNode(ctx context.Context, arg ledgerdb.InsertRolloutNodeParams) error
 	MarkLeaseDeregistered(ctx context.Context, id string) error

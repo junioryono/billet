@@ -320,8 +320,8 @@ func TestUnknownFutureMigrationIsRejected(t *testing.T) {
 	if err == nil {
 		t.Fatal("Open accepted a database written by a newer billet")
 	}
-	if !strings.Contains(err.Error(), "newer version") {
-		t.Errorf("error should say the database is newer, got: %v", err)
+	if !errors.Is(err, ErrSchemaAhead) {
+		t.Errorf("error should be ErrSchemaAhead, the typed ahead refusal, got: %v", err)
 	}
 }
 
@@ -353,7 +353,7 @@ func TestWriterDurabilityPragmas(t *testing.T) {
 
 	// The backend's durability readback is what runs at startup; exercise it
 	// directly too.
-	if err := db.backend.verifyDurability(ctx, db.w); err != nil {
+	if err := db.backend.verifyDurability(ctx, db.w, false); err != nil {
 		t.Errorf("verifyDurability: %v", err)
 	}
 }
@@ -1145,6 +1145,8 @@ func TestADatabaseWrittenByAnEarlierBilletUpgrades(t *testing.T) {
 			`ALTER TABLE job_history DROP COLUMN image_cache`,
 			`ALTER TABLE job_history DROP COLUMN cache_generation`,
 			`ALTER TABLE job_history DROP COLUMN actions_cache`,
+			`DROP TABLE listener_capacity`,
+			`DROP TABLE controller_retirement`,
 			`DROP TABLE release_watermark`,
 			`ALTER TABLE nodes DROP COLUMN highest_release`,
 			`DROP TABLE issued_certs`,

@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "outcome": "refused",
+  "reason": "input",
+  "why": "retirement: the document does not hold: decode: invalid character 'o' in literal null (expecting 'u')",
+  "state": "nothing"
+}

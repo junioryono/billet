@@ -72,7 +72,7 @@ func TestAResumedTransactionRecordsTheDecisionItWasActingOn(t *testing.T) {
 	// real transaction against a machine that has no billet units — so the
 	// assertion would be riding on how a systemctl call fails, which is neither the
 	// property nor a thing this test should be pinned to.
-	abandoned, err := settleResumedDecision(journal)
+	abandoned, err := settleResumedDecision(openRootForTest(t), journal)
 	if err != nil {
 		t.Fatalf("settling the fence for a resumed transaction: %v", err)
 	}
@@ -151,7 +151,7 @@ func TestASupersededTransactionThatStoppedServicesIsNotAbandoned(t *testing.T) {
 		Step: hostupgrade.StepStopped,
 	})
 
-	abandoned, err := settleResumedDecision(journal)
+	abandoned, err := settleResumedDecision(openRootForTest(t), journal)
 	if err != nil {
 		t.Fatalf("settling the fence for a half-applied transaction: %v", err)
 	}
@@ -181,7 +181,7 @@ func stageJournal(t *testing.T, journal *hostupgrade.Journal) *hostupgrade.Journ
 		t.Fatalf("write the journal: %v", err)
 	}
 
-	if err := publishClaim(dir); err != nil {
+	if err := publishClaim(openRootForTest(t), dir); err != nil {
 		t.Fatalf("publishClaim: %v", err)
 	}
 
@@ -214,7 +214,7 @@ func TestASupersededTransactionThatHadStagedIsNotAbandoned(t *testing.T) {
 		Step: hostupgrade.StepStaged,
 	})
 
-	abandoned, err := settleResumedDecision(journal)
+	abandoned, err := settleResumedDecision(openRootForTest(t), journal)
 	if err != nil {
 		t.Fatalf("settling the fence for a staged transaction: %v", err)
 	}
@@ -285,7 +285,7 @@ func TestAbandoningRefusesAPathThatIsNotARecoveryDirectory(t *testing.T) {
 	}
 
 	for _, dir := range []string{"", outside, filepath.Join(upgradeRoot, "..")} {
-		if err := abandonClaim(dir); err == nil {
+		if err := abandonClaim(openRootForTest(t), dir); err == nil {
 			t.Errorf("abandoning %q was allowed", dir)
 		}
 	}
@@ -352,11 +352,13 @@ func TestReleasingAClaimWithoutANameIsRefused(t *testing.T) {
 		t.Fatalf("stageClaim: %v", err)
 	}
 
-	if err := publishClaim(dir); err != nil {
+	root := openRootForTest(t)
+
+	if err := publishClaim(root, dir); err != nil {
 		t.Fatalf("publishClaim: %v", err)
 	}
 
-	if err := releaseClaim(""); err == nil {
+	if err := releaseClaim(root, ""); err == nil {
 		t.Error("releasing a claim with no name was allowed")
 	}
 

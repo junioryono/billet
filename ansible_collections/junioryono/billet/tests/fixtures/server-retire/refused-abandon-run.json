@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "outcome": "refused",
+  "reason": "reserved",
+  "why": "the reservation is run ci-0's, and this converge is ci-1; the same host adopts it by reserving again",
+  "state": "nothing"
+}

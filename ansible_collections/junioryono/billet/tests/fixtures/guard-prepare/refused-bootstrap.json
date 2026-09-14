@@ -1,0 +1,7 @@
+{
+  "outcome": "refused",
+  "reason": "bootstrap",
+  "shape": "none",
+  "why": "/usr/bin/billet exists, so this host is not being bootstrapped; an updater may have installed it",
+  "next": "rerun the converge"
+}

@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "outcome": "unchanged",
+  "node": "node-a",
+  "deployment": null,
+  "endpoint": "http://127.0.0.1:7717",
+  "effective": null,
+  "record": "none",
+  "node_removed": false,
+  "unit": {
+    "load_state": "loaded",
+    "active_state": "inactive",
+    "kill_mode": "mixed"
+  }
+}

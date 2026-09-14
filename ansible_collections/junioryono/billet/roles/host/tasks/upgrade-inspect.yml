@@ -1,68 +1,30 @@
 ---
-- name: Inspect the durable host-upgrade pointer
-  ansible.builtin.stat:
-    path: /var/lib/billet/upgrades/active
-    follow: false
-  register: billet_active_upgrade_pointer
-  check_mode: false
-  become: true
-
-# A SYMLINK CLAIM IS `billet host-upgrade`'s, NOT THIS ROLE'S. The Go transaction
-# publishes its claim as a symlink to its recovery directory (upgrade-*), and
-# this role publishes its own as a hard link to a journal file; the two share
-# the path precisely so that neither can start over the other. A converge that
-# finds the Go transaction's claim is a converge against a host whose node may
-# be draining for a rollout right now, and the right answer is to stop and name
-# the command that says where that transaction has got to — not "not a real
-# regular file", which sends an operator to look for corruption.
-- name: Refuse to converge over a host upgrade billet itself is running
-  ansible.builtin.assert:
-    that:
-      - not (billet_active_upgrade_pointer.stat.islnk | default(false))
-    fail_msg: >-
-      /var/lib/billet/upgrades/active is a symlink, which is how
-      `billet host-upgrade` claims a host: a rollout, or an operator, has a
-      transaction on this machine that this role must not converge over. Run
-      `billet host-upgrade --status` there to see which decision it belongs to
-      and how far it has got, let it finish or resume it with
-      `billet host-upgrade --resume`, and converge again once
-      /var/lib/billet/upgrades/active is gone.
-  when: billet_active_upgrade_pointer.stat.exists
-
-- name: Refuse a redirected or non-file host-upgrade pointer
-  ansible.builtin.assert:
-    that:
-      - billet_active_upgrade_pointer.stat.isreg
-      - not billet_active_upgrade_pointer.stat.islnk | default(false)
-    fail_msg: >-
-      /var/lib/billet/upgrades/active is not a real regular file. Refusing to
-      read it or follow it into an untrusted recovery path.
-  when: billet_active_upgrade_pointer.stat.exists
-
+# THE CLAIM WAS CLASSIFIED BY THE PREPARATION (prepare-exclusion.yml): a
+# symlink refused, a regular file the pre-R role's claim (`legacy-file`), a
+# directory the converge guard, asked through `status`, whose transaction
+# pointer (`guard-pointer`) is this role's interrupted transaction. This file
+# reads what that classification says and never `active`'s existence: a guard
+# without a pointer is a held host, not an interrupted one.
 - name: Read the durable host-upgrade pointer
   ansible.builtin.slurp:
-    src: /var/lib/billet/upgrades/active
+    src: "{{ billet_exclusion_root }}/active"
   register: billet_active_upgrade_file
-  when: billet_active_upgrade_pointer.stat.exists
+  when: billet_upgrade_claim_shape == 'legacy-file'
   become: true
 
-- name: Resolve an interrupted host upgrade
+- name: Resolve a legacy pointer's recovery directory
   ansible.builtin.set_fact:
-    billet_interrupted_upgrade: "{{ billet_active_upgrade_pointer.stat.exists }}"
-    billet_upgrade_recovery_dir: >-
-      {{
-        (billet_active_upgrade_file.content | b64decode | trim)
-        if billet_active_upgrade_file.content is defined
-        else ''
-      }}
+    billet_upgrade_recovery_dir: "{{ billet_active_upgrade_file.content | b64decode | trim }}"
+  when: billet_upgrade_claim_shape == 'legacy-file'
 
 - name: Refuse an unsafe or malformed host-upgrade pointer
   ansible.builtin.assert:
     that:
-      - not billet_active_upgrade_pointer.stat.islnk | default(false)
-      - billet_upgrade_recovery_dir is match('^/var/lib/billet/upgrades/[0-9]{8}T[0-9]{15}$')
+      - billet_upgrade_claim_shape in ['legacy-file', 'guard-pointer']
+      - >-
+        billet_upgrade_recovery_dir is match('^' ~ (billet_exclusion_root | regex_escape) ~ '/(recovery-[0-9]{8}T[0-9]{6}-[0-9a-f]{8}|[0-9]{8}T[0-9]{15})\Z')
     fail_msg: >-
-      /var/lib/billet/upgrades/active does not name a role-created recovery
+      {{ billet_exclusion_root }}/active does not name a role-created recovery
       directory. Refusing to use an untrusted path for ledger restoration.
   when: billet_interrupted_upgrade | bool
 

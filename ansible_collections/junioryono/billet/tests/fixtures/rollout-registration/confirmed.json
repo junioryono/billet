@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "outcome": "confirmed",
+  "node": "node-a",
+  "incarnation": "0000000000000000000000000000bbbb",
+  "epoch": 1,
+  "live": true,
+  "deployment": {
+    "bound": true,
+    "id": "dddddddddddddddddddddddddddddddd"
+  }
+}

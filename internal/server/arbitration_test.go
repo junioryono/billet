@@ -20,8 +20,8 @@ func arbitrationListeners(t *testing.T, tiers []config.Tier, vcpu int) (*alloc.A
 	registerHost(t, a)
 	s := New(a, nil, tiers, "arbitration-test", nil)
 	listeners := make([]*Listener, 0, len(tiers))
-	for _, tr := range tiers {
-		listeners = append(listeners, NewListener(a, tr.Label, &fakeSession{}, s.listenerOpts(nil)...))
+	for i := range tiers {
+		listeners = append(listeners, NewListener(a, tiers[i].Label, &fakeSession{}, s.listenerOpts(nil)...))
 	}
 
 	return a, listeners
@@ -244,7 +244,7 @@ func TestLargeDemandKeepsItsTurnWhileSmallJobsFinish(t *testing.T) {
 func TestDiscoveryWithdrawalDoesNotReleaseAnAcquiringCapacityLease(t *testing.T) {
 	a, listeners := arbitrationListeners(t, []config.Tier{tier("a-donor"), tier("b-work")}, 3*tierVCPU)
 	donor, recipient := listeners[0], listeners[1]
-	if err := donor.refillEscrowUngated(t.Context(), 2); err != nil {
+	if err := donor.refillEscrowUngated(t.Context(), 2, 2); err != nil {
 		t.Fatal(err)
 	}
 	if got := donor.reserve([]Job{{RequestID: 11}}); !slices.Equal(got, []int64{11}) {
@@ -798,5 +798,335 @@ func TestDiscoveryWithdrawalPrecedesCloudFallback(t *testing.T) {
 	}
 	if polls != 3 {
 		t.Fatalf("observed %d polls, want the outstanding, lower and post-withdrawal polls", polls)
+	}
+}
+
+// A REFUSED POOL LAUNCH SPENDS ITS TURN BEFORE THE NEXT OFFER ARRIVES. The
+// last assigned count may still request that runner, but each failed attempt
+// must leave the next exchange able to acquire from its own backed turn.
+func TestARefusedPoolLaunchReturnsItsTurnBeforeTheNextOffer(t *testing.T) {
+	_, listeners := arbitrationListeners(t, []config.Tier{tier("work")}, tierVCPU)
+	l := listeners[0]
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+	launches, polls := 0, 0
+	var spent uint64
+	l.runner = &fakeRunner{onLaunch: func(int64) error {
+		launches++
+		_, spent = l.admissionPoll()
+		return errors.New("pool trust refused before launch")
+	}}
+	session := &fakeSession{stats: &Statistics{TotalAssignedJobs: 1}}
+	l.session = session
+	session.onPoll = func(sent int) {
+		polls++
+		if polls == 1 {
+			_, next := l.admissionPoll()
+			if spent == 0 || next == 0 || next == spent {
+				t.Errorf("refused turn %d left next poll on turn %d", spent, next)
+			}
+			l.finishAdmissionTurn(spent)
+			_, afterDuplicate := l.admissionPoll()
+			if afterDuplicate != next {
+				t.Errorf("duplicate return changed this tier's next turn %d to %d", next, afterDuplicate)
+			}
+			if launches != 1 || sent != 1 || l.idleEscrow() != 1 {
+				t.Errorf("after refusal: launches %d, sent %d, held %d; want 1, 1, 1",
+					launches, sent, l.idleEscrow())
+			}
+		} else {
+			cancel()
+		}
+	}
+	session.onGet = func() (*Message, error) {
+		return &Message{MessageID: 1, Available: []Job{{RequestID: 11, RunID: 101}},
+			Statistics: &Statistics{TotalAvailableJobs: 1}}, nil
+	}
+	if err := l.Run(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run = %v, want cancellation after the offer", err)
+	}
+	if got := session.acquiredIDs(); !slices.Equal(got, []int64{11}) {
+		t.Fatalf("acquired %v after a refused pool launch, want request 11", got)
+	}
+	if polls != 2 || launches != 1 {
+		t.Fatalf("polls %d, launches %d; want 2, 1", polls, launches)
+	}
+}
+
+// QUARANTINING A POISONED COMPLETION RETURNS ITS GRANTED WORK TURN. Otherwise
+// repeated poison keeps the grant forever and starves every waiting tier.
+func TestQuarantiningAPoisonedCompletionReturnsItsGrantedWorkTurn(t *testing.T) {
+	_, listeners := arbitrationListeners(t, []config.Tier{tier("a"), tier("b")}, tierVCPU)
+	first, second := listeners[0], listeners[1]
+	for _, l := range listeners {
+		l.observed = &Statistics{TotalAvailableJobs: 1}
+		l.observeDemand(l.observed)
+	}
+	for _, l := range listeners {
+		if err := l.prepareEscrow(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	advertised, turn := first.admissionPoll()
+	arbiter := first.arbiter
+	arbiter.mu.Lock()
+	work := arbiter.work
+	arbiter.mu.Unlock()
+	if advertised != 1 || turn == 0 || !work || second.capacity() != 0 {
+		t.Fatalf("fixture has advertisement %d, turn %d, work %t, peer capacity %d; want A's granted work turn with B waiting",
+			advertised, turn, work, second.capacity())
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+	deliveries := 0
+	var acked []int64
+	checked := false
+	session := &fakeSession{stats: first.observed}
+	first.session = session
+	session.onPoll = func(int) {
+		if deliveries < poisonQuarantineAfter {
+			_, current := first.admissionPoll()
+			if current != turn {
+				t.Errorf("before poison delivery %d, granted turn %d became %d",
+					deliveries+1, turn, current)
+			}
+			return
+		}
+		// Observe before cancellation or an empty exchange can return the turn.
+		arbiter.mu.Lock()
+		owner, generation, granted := arbiter.owner, arbiter.generation, arbiter.granted
+		arbiter.mu.Unlock()
+		if owner != second.tier || generation <= turn || granted {
+			t.Errorf("quarantine left owner %q, generation %d, granted %t; want B's ungranted turn after A's generation %d",
+				owner, generation, granted, turn)
+		}
+		checked = true
+		cancel()
+	}
+	session.onGet = func() (*Message, error) {
+		deliveries++
+		return &Message{MessageID: 42, Completed: []Job{{
+			RunnerName: "not-a-billet-runner", Result: "succeeded",
+		}}}, nil
+	}
+	session.onDelete = func(id int64) error {
+		acked = append(acked, id)
+		if deliveries != poisonQuarantineAfter {
+			t.Errorf("acknowledged message %d after %d deliveries, want %d",
+				id, deliveries, poisonQuarantineAfter)
+		}
+		return nil
+	}
+	if err := first.Run(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run = %v, want cancellation after quarantine", err)
+	}
+	if !checked || deliveries != poisonQuarantineAfter || !slices.Equal(acked, []int64{42}) || first.lastMessageID != 42 {
+		t.Fatalf("checked %t, deliveries %d, acknowledgements %v, cursor %d; want one quarantine after %d deliveries",
+			checked, deliveries, acked, first.lastMessageID, poisonQuarantineAfter)
+	}
+}
+
+// RETURNING A CONSUMED TURN DOES NOT RELEASE ITS LEASE OR SPEND ITS SUCCESSOR.
+// Running compute and custody remain charged; only a conclusive refusal frees
+// the old placement. Every outcome gives the next known contender its turn.
+func TestConsumedPoolTurnsAdvanceOnceAndKeepTheirComputeCharged(t *testing.T) {
+	for _, outcome := range []struct {
+		name string
+		err  error
+		kept bool
+	}{
+		{name: "launched", kept: true},
+		{name: "refused", err: errors.New("refused before launch")},
+		{name: "custody", err: ErrCustody, kept: true},
+	} {
+		t.Run(outcome.name, func(t *testing.T) {
+			a, listeners := arbitrationListeners(t, []config.Tier{tier("a"), tier("b")}, 2*tierVCPU)
+			first, second := listeners[0], listeners[1]
+			for _, l := range listeners {
+				l.observed = &Statistics{TotalAssignedJobs: 1}
+				l.observeDemand(l.observed)
+			}
+			first.runner = &fakeRunner{onLaunch: func(int64) error { return outcome.err }}
+			if err := first.prepareEscrow(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			held := first.Held()
+			if len(held) != 1 {
+				t.Fatalf("first turn has %d held leases, want 1", len(held))
+			}
+			lease := held[0]
+			_, spent := first.admissionPoll()
+			if err := first.reconcileAdmissionPool(t.Context(), 1); err != nil {
+				t.Fatal(err)
+			}
+			if first.idleEscrow() != 0 || !second.arbiter.permits(second.tier) {
+				t.Fatal("consumed turn did not yield to the next known contender")
+			}
+			if err := second.prepareEscrow(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			_, next := second.admissionPoll()
+			if next == 0 || next == spent || second.idleEscrow() != 1 {
+				t.Fatalf("successor has turn %d, held %d; spent turn was %d",
+					next, second.idleEscrow(), spent)
+			}
+			first.finishAdmissionTurn(spent)
+			_, afterDuplicate := second.admissionPoll()
+			if afterDuplicate != next {
+				t.Fatalf("duplicate return changed successor turn %d to %d", next, afterDuplicate)
+			}
+			_, err := a.Lease(t.Context(), lease.ID)
+			if outcome.kept && err != nil {
+				t.Fatalf("returning the turn lost the compute's lease: %v", err)
+			}
+			if !outcome.kept && !errors.Is(err, alloc.ErrLeaseNotFound) {
+				t.Fatalf("refused lease read = %v, want lease not found", err)
+			}
+		})
+	}
+}
+
+// RECONCILIATION MUST FINISH AND CONSUME THE BACKING BEFORE IT ENDS A TURN.
+// An unused grant still needs its poll, and a failed read proves no progress.
+func TestPoolReconciliationKeepsUnusedOrUnconfirmedTurns(t *testing.T) {
+	for _, cancelled := range []bool{false, true} {
+		t.Run(map[bool]string{false: "unused backing", true: "failed reconciliation"}[cancelled], func(t *testing.T) {
+			_, listeners := arbitrationListeners(t, []config.Tier{tier("a"), tier("b")}, tierVCPU)
+			l := listeners[0]
+			l.observed = &Statistics{TotalAssignedJobs: 1}
+			if err := l.prepareEscrow(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			_, before := l.admissionPoll()
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if cancelled {
+				cancel()
+			}
+			err := l.reconcileAdmissionPool(ctx, 0)
+			if cancelled && !errors.Is(err, context.Canceled) {
+				t.Fatalf("reconciliation = %v, want context canceled", err)
+			}
+			if !cancelled && err != nil {
+				t.Fatal(err)
+			}
+			_, after := l.admissionPoll()
+			if before == 0 || after != before || l.idleEscrow() != 1 {
+				t.Fatalf("turn %d became %d with %d held, want unchanged backing",
+					before, after, l.idleEscrow())
+			}
+		})
+	}
+}
+
+// LOSING HELD BACKING TO A HEARTBEAT DOES NOT SERVE THE WAITING JOB. The same
+// owner must replace that backing without giving its unused turn to its peer.
+// A RECONCILIATION THAT TOOK NO HELD BACKING KEEPS ITS TURN AND BUYS NO SECOND
+// LEASE under it. Zero idle escrow cannot distinguish backing the heartbeat lost
+// from backing that moved into a live promise, so the grant is never cleared on
+// that reading; the next handled exchange ends the turn instead.
+func TestPoolReconciliationKeepsATurnWhoseBackingTheHeartbeatLost(t *testing.T) {
+	a, listeners := arbitrationListeners(t, []config.Tier{tier("a"), tier("b")}, tierVCPU)
+	first, second := listeners[0], listeners[1]
+	for _, l := range listeners {
+		l.observed = &Statistics{TotalAssignedJobs: 1}
+		l.observeDemand(l.observed)
+	}
+	if err := first.prepareEscrow(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	held := first.Held()
+	if len(held) != 1 {
+		t.Fatalf("fixture has %d held leases, want 1", len(held))
+	}
+	_, before := first.admissionPoll()
+	launches, losses := 0, 0
+	first.runner = &fakeRunner{onLaunch: func(int64) error {
+		launches++
+		return nil
+	}}
+	first.beforePoolReconcile = func() {
+		losses++
+		if err := a.Release(t.Context(), held[0].ID, held[0].Epoch, alloc.PhaseDone); err != nil {
+			t.Fatal(err)
+		}
+		first.heartbeatPass(t.Context())
+		if first.idleEscrow() != 0 {
+			t.Fatal("heartbeat did not drop the lost backing before reconciliation")
+		}
+	}
+	if err := first.reconcileAdmissionPool(t.Context(), 1); err != nil {
+		t.Fatal(err)
+	}
+	_, after := first.admissionPoll()
+	if losses != 1 || launches != 0 || before == 0 || after != before {
+		t.Fatalf("losses %d, launches %d, turn %d became %d; want one loss and the unused turn",
+			losses, launches, before, after)
+	}
+	if err := first.prepareEscrow(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.prepareEscrow(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if bought := first.Held(); len(bought) != 0 || second.capacity() != 0 {
+		t.Fatalf("held %+v, peer capacity %d; want no second purchase under a grant already spent",
+			bought, second.capacity())
+	}
+	_, still := first.admissionPoll()
+	if still != before {
+		t.Fatalf("the refill changed turn %d to %d", before, still)
+	}
+}
+
+// A STALE TARGET CANNOT BUY TWO LEASES IN ONE TURN. The heartbeat removes a
+// promise after its capacity contributed to the target but before the purchase.
+func TestArbitratedRefillBuysOneLeaseAfterCommittedCapacityDisappears(t *testing.T) {
+	a, listeners := arbitrationListeners(t, []config.Tier{tier("work")}, 2*tierVCPU)
+	l := listeners[0]
+	l.observed = &Statistics{TotalAssignedJobs: 2}
+	if err := l.prepareEscrow(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	_, spent := l.admissionPoll()
+	if got := l.reserve([]Job{{RequestID: 11}}); !slices.Equal(got, []int64{11}) {
+		t.Fatalf("reserved %v, want request 11", got)
+	}
+	promised := l.acquiring[11].lease
+	l.finishAdmissionTurn(spent)
+	if target := l.targetCapacity(); target != 2 {
+		t.Fatalf("fixture target = %d, want 2", target)
+	}
+	losses := 0
+	l.beforeEscrowRefill = func() {
+		losses++
+		if l.committedCapacity() != 1 {
+			t.Fatal("promise disappeared before the refill captured its target")
+		}
+		if err := a.Release(t.Context(), promised.ID, promised.Epoch, alloc.PhaseDone); err != nil {
+			t.Fatal(err)
+		}
+		l.heartbeatPass(t.Context())
+		if l.capacity() != 0 {
+			t.Fatal("heartbeat did not remove committed capacity before the purchase")
+		}
+	}
+	if err := l.prepareEscrow(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	usage, err := a.Usage(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if losses != 1 || l.idleEscrow() != 1 || usage.Leases != 1 || usage.VCPU != tierVCPU {
+		t.Fatalf("losses %d, held %d, usage %+v; want one purchase despite the stale target",
+			losses, l.idleEscrow(), usage)
+	}
+	if err := l.prepareEscrow(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if losses != 1 || l.idleEscrow() != 1 {
+		t.Fatalf("same grant refilled again: losses %d, held %d", losses, l.idleEscrow())
 	}
 }

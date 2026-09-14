@@ -1,0 +1,7 @@
+{
+  "outcome": "refused",
+  "reason": "gone",
+  "shape": "none",
+  "why": "the guard this run held is gone; nothing was acquired",
+  "next": "inspect the host; `billet converge-guard status`"
+}

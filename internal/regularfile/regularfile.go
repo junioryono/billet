@@ -39,6 +39,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path/filepath"
 )
 
 // ErrNotRegular is the refusal of anything but a regular file. It is wrapped in
@@ -99,6 +100,40 @@ func Open(path string, opts Options) (*os.File, os.FileInfo, error) {
 func Reopen(f *os.File) (*os.File, error) {
 	r, _, err := reopen(f)
 	return r, err
+}
+
+// OpenAt is Open for one entry of a directory the caller holds, RELATIVE TO ITS
+// DESCRIPTOR and never following a link at the name: the entry is opened for
+// its identity alone (OpenIdentityAt), and the readable descriptor is of that
+// inode only when it is a regular file on an ordinary filesystem. A symlink at
+// the name is the link's own inode and refused as not regular, on every
+// platform alike. The errors are Open's.
+func OpenAt(dir *os.File, name string) (*os.File, os.FileInfo, error) {
+	id, err := OpenIdentityAt(dir, name)
+	if err != nil {
+		return nil, nil, &os.PathError{Op: "open", Path: filepath.Join(dir.Name(), name), Err: err}
+	}
+	f, info, err := reopen(id)
+	_ = id.Close()
+	if err != nil {
+		return nil, nil, err
+	}
+	return f, info, nil
+}
+
+// OpenIdentityAt names one entry of a directory without reading it, relative to
+// the directory's descriptor, never following a link at the name: the
+// descriptor answers Stat (a symlink reports itself, with ModeSymlink) and
+// nothing else, and Reopen turns it into a readable one under the rules. On
+// Linux it is an O_PATH descriptor, which invokes no driver whatever the entry
+// is; elsewhere it is a non-blocking read-only open of the entry itself, which
+// opens a device before anything refuses it, as the package comment says.
+func OpenIdentityAt(dir *os.File, name string) (*os.File, error) {
+	fd, err := openIdentityAt(int(dir.Fd()), name)
+	if err != nil {
+		return nil, err
+	}
+	return os.NewFile(uintptr(fd), filepath.Join(dir.Name(), name)), nil
 }
 
 // ReadFile reads the whole of a regular file of at most limit bytes through

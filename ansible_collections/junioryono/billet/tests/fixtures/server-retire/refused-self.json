@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "outcome": "refused",
+  "reason": "self",
+  "why": "this host is control-b and the completion names control-c as the survivor; only the survivor completes the row",
+  "state": "nothing"
+}

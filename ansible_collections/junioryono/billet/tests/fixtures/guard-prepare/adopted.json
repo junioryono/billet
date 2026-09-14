@@ -1,0 +1,23 @@
+{
+  "outcome": "validated",
+  "id": "202122232425262728292a2b2c2d2e2f",
+  "adopted": true,
+  "holder": "ci-1",
+  "claimed_at": "2026-09-09T11:00:00Z",
+  "hostname": "billet-control-01",
+  "preparing": false,
+  "record": {
+    "release_executable": "/usr/bin/billet",
+    "release_executable_sha256": "abababababababababababababababababababababababababababababababab",
+    "verified": true
+  },
+  "pointer": false,
+  "stray_removed": false,
+  "managed": {
+    "path": "/usr/bin/billet",
+    "present": true,
+    "sha256": "abababababababababababababababababababababababababababababababab",
+    "version": "v0.10.0"
+  },
+  "downgrade": false
+}

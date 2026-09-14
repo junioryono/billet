@@ -205,7 +205,7 @@ func TestCompletedRunnerDropsOnlyItsDischargedCommitment(t *testing.T) {
 			if err := l.prepareEscrow(t.Context()); err != nil {
 				t.Fatal(err)
 			}
-			if err := l.refillEscrowUngated(t.Context(), 2); err != nil {
+			if err := l.refillEscrowUngated(t.Context(), 2, 2); err != nil {
 				t.Fatal(err)
 			}
 			job := Job{RequestID: 11, JobID: "J", RunID: 101}

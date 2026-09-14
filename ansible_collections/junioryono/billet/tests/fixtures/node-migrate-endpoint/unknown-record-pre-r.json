@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "outcome": "unknown",
+  "reason": "record",
+  "why": "a release before the guard runs here and its configured endpoint cannot be read (the installed configuration has no node section); stop it, or restore its configuration, before this converge",
+  "state": "nothing"
+}

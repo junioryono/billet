@@ -564,12 +564,14 @@ func TestInitLocalServiceWritesAGroupReadableConfig(t *testing.T) {
 // asLinux pins the generation to the systemd shape — /etc/billet, /var/lib, the
 // billet group, mode 0640 — on the darwin machines billet is developed on. Not
 // parallel-safe; none of these tests are parallel.
+// asLinux says this host is Linux to EVERY seam that asks, not only to the
+// command layer's own: the retirement's platform decides whether the global
+// authority exclusion exists at all, and a test that pinned one and not the
+// other proved its ordering against a host no fleet runs (found by CI, which
+// runs where both are Linux for real, 2026-09-12).
 func asLinux(t *testing.T) {
 	t.Helper()
-
-	prev := hostOS
-	hostOS = "linux"
-	t.Cleanup(func() { hostOS = prev })
+	useRetirementRoot(t)
 }
 
 // THE MODE IS ENFORCED, NOT REQUESTED: a --force over a 0600 file must come out

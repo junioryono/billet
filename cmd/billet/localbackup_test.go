@@ -322,6 +322,13 @@ func requireBackupPostgres(t *testing.T) string {
 
 	dsn := os.Getenv("BILLET_TEST_POSTGRES_DSN")
 	if dsn == "" {
+		// The split test workflow's SQLite job names the job that runs this
+		// test; see internal/state's gate for the rule.
+		if elsewhere := os.Getenv("BILLET_TEST_POSTGRES_ELSEWHERE"); elsewhere != "" {
+			t.Skipf("BILLET_TEST_POSTGRES_DSN is unset here; this run's %q job exercises the "+
+				"PostgreSQL backup", elsewhere)
+		}
+
 		if os.Getenv("CI") != "" {
 			t.Fatal("BILLET_TEST_POSTGRES_DSN is unset under CI, so the one gate that proves " +
 				"`billet local backup` reaches the end on a PostgreSQL deployment would go " +

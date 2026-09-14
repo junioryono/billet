@@ -1,6 +1,6 @@
--- migration 50: listener_capacity, for PostgreSQL
+-- migration 52: listener_capacity, for PostgreSQL
 --
--- The twin of migrations/0050_listener_capacity.sql.
+-- The twin of migrations/0052_listener_capacity.sql.
 
 -- +billet:statement
 CREATE TABLE listener_capacity (

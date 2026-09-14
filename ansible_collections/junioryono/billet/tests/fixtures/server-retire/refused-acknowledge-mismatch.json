@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "outcome": "refused",
+  "reason": "mismatch",
+  "why": "retirement: the document does not hold: the answer's transition_id is \"99999999999999999999999999999999\", the journal's \"0123456789abcdef0123456789abcdef\"",
+  "state": "nothing"
+}

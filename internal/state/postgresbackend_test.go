@@ -50,6 +50,16 @@ func requirePostgresSchema(t *testing.T, suffix string) string {
 
 	dsn := os.Getenv(postgresDSNEnv)
 	if dsn == "" {
+		// A CI RUN MAY NAME THE JOB THAT RUNS THIS SUITE INSTEAD, and nothing
+		// else lets it skip: the SQLite job of a split test workflow sets
+		// BILLET_TEST_POSTGRES_ELSEWHERE to the database job's id, and a run that
+		// has lost that job still fails here rather than reporting success for
+		// a backend nothing exercised.
+		if elsewhere := os.Getenv("BILLET_TEST_POSTGRES_ELSEWHERE"); elsewhere != "" {
+			t.Skipf("%s is unset here; this run's %q job exercises the PostgreSQL backend",
+				postgresDSNEnv, elsewhere)
+		}
+
 		if os.Getenv("CI") != "" {
 			t.Fatalf("%s is unset under CI, so the PostgreSQL backend would go untested "+
 				"while the run reported success", postgresDSNEnv)

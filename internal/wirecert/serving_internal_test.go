@@ -44,13 +44,13 @@ func TestAStartThatMissesAWholeRotationAndRetirementStartsOver(t *testing.T) {
 		fired = true
 
 		var err error
-		if fresh, err = Rotate(dir, servingDeployment); err != nil {
+		if fresh, err = Rotate(t.Context(), dir, servingDeployment); err != nil {
 			t.Errorf("rotate: %v", err)
 
 			return
 		}
 
-		if err := Retire(dir, servingDeployment); err != nil {
+		if err := Retire(t.Context(), dir, servingDeployment); err != nil {
 			t.Errorf("retire: %v", err)
 		}
 	}
@@ -123,7 +123,7 @@ func TestAStartThatMissesARetirementAloneStartsOver(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 
-	fresh, err := Rotate(dir, servingDeployment)
+	fresh, err := Rotate(t.Context(), dir, servingDeployment)
 	if err != nil {
 		t.Fatalf("rotate: %v", err)
 	}
@@ -137,7 +137,7 @@ func TestAStartThatMissesARetirementAloneStartsOver(t *testing.T) {
 
 		fired = true
 
-		if err := Retire(dir, servingDeployment); err != nil {
+		if err := Retire(t.Context(), dir, servingDeployment); err != nil {
 			t.Errorf("retire: %v", err)
 		}
 	}

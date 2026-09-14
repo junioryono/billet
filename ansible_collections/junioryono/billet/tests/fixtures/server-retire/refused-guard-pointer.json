@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "outcome": "refused",
+  "reason": "guard",
+  "why": "the guard carries a binary transaction's pointer; a retirement never runs inside a binary transaction",
+  "state": "nothing"
+}
