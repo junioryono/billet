@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "outcome": "reported",
+  "journal": null,
+  "status": null,
+  "stage": "absent",
+  "guard": "legacy-role",
+  "marker": null,
+  "row": null,
+  "row_fact": "unreadable",
+  "dispatch": "unknown-ledger",
+  "status_presence": "absent",
+  "config": "present",
+  "installed_roles": "server",
+  "identity": "minted",
+  "authority": "present",
+  "route": "recovery",
+  "route_why": "a validated binary transaction names this maintenance-fenced ledger; recover that transaction alone, then retry the classifier",
+  "why": "the ledger could not be opened for the report: state: the ledger is fenced for host maintenance in /var/lib/billet/server; wait for the transactional host upgrade to finish before running an operator command",
+  "state": "nothing"
+}
