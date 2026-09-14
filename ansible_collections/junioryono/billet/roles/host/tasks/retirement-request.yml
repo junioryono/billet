@@ -23,12 +23,29 @@
       - billet_retirement_survivor_host | junioryono.billet.valid_holder
     fail_msg: 'Retirement precondition: no distinct inventory survivor is named by billet_retirement_survivor_host.'
 
+- name: Require the survivor in the retiring host's play
+  ansible.builtin.assert:
+    that: billet_retirement_survivor_host in ansible_play_hosts_all
+    fail_msg: >-
+      Retirement precondition: survivor {{ billet_retirement_survivor_host }} is outside
+      this play. Preparation in an earlier play cannot prove the survivor stayed healthy;
+      converge the survivor in the same play as the retiring host.
+  when: not ansible_check_mode
+
+- name: Require the survivor still active in this play
+  ansible.builtin.assert:
+    that: billet_retirement_survivor_host in ansible_play_hosts
+    fail_msg: >-
+      Retirement precondition: survivor {{ billet_retirement_survivor_host }} was removed
+      from this play by failure or unreachability. Resolve that failure, then converge
+      the survivor in the same play as the retiring host.
+  when: not ansible_check_mode
+
 - name: Require this converge's settled survivor guard
   vars:
     billet_retirement_peer: "{{ hostvars[billet_retirement_survivor_host] }}"
   ansible.builtin.assert:
     that:
-      - billet_retirement_survivor_host in ansible_play_hosts
       - billet_retirement_peer.billet_exclusion_settled | default(none) is sameas true
       - billet_retirement_peer.billet_exclusion_held | default(none) is sameas true
       - billet_retirement_peer.billet_exclusion_holder | default('') == billet_exclusion_holder
@@ -36,8 +53,7 @@
     fail_msg: >-
       Retirement precondition: survivor {{ billet_retirement_survivor_host }} needs a
       settled, held, pointer-free guard published by its own preparation under
-      holder {{ billet_exclusion_holder }} and must remain active in this play.
-      A skipped settlement or a failed or unreachable survivor is not success.
+      holder {{ billet_exclusion_holder }}. A skipped settlement is not success.
   when: not ansible_check_mode
 
 - name: Require the retiring host's preparation window closed

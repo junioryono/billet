@@ -1158,6 +1158,7 @@ cat >"$work/play-retirement-survivor.yml" <<'PLAY'
       ansible.builtin.assert:
         that:
           - "'control-b' not in ansible_play_hosts"
+          - "'control-b' in ansible_play_hosts_all"
           - peer.billet_exclusion_settled is sameas (billet_gate_survivor_failure == 'inactive')
           - billet_gate_survivor_failure == 'inactive' or peer.billet_exclusion_answerer == ''
           - billet_gate_survivor_failure == 'inactive' or peer.billet_exclusion_answered_now is sameas false
@@ -1196,10 +1197,64 @@ for task, host in [("Prove the survivor completed its first preparation", 'contr
     if len(parts) != 2 or ('ok: [' + host + ']') not in parts[1].split('TASK [', 1)[0]:
         sys.exit('R16 did not prove preparation/publication on ' + host + ': ' + task)
 PYPREPARED
-  expect_final "$name" 'Retirement precondition: survivor control-b needs a settled, held, pointer-free guard'
+  expect_final "$name" 'Retirement precondition: survivor control-b was removed from this play by failure or unreachability.' 'Resolve that failure, then converge the survivor in the same play as the retiring host.'
   r_no_collection "$name"
   expect_host_commands "$name" 'control-a retire-classify 1;'
 done
+
+# R16: successful preparation in an earlier play leaves settled hostvars but
+# supplies no evidence that the survivor stayed healthy outside this play.
+cat >"$work/play-retirement-earlier-survivor.yml" <<'PLAY'
+---
+- name: Prepare the survivor in an earlier play
+  hosts: control-b
+  gather_facts: false
+  vars:
+    billet_exclusion_platform: Linux
+    billet_binary_src: ''
+  tasks:
+    - name: Prepare the survivor transport
+      ansible.builtin.include_role:
+        name: junioryono.billet.host
+        tasks_from: prepare-exclusion
+- name: Attempt retirement in a separate play
+  hosts: control-a
+  gather_facts: false
+  vars:
+    billet_exclusion_platform: Linux
+    billet_binary_src: ''
+    billet_server_should_run: false
+  tasks:
+    - name: Prepare the retiring transport
+      ansible.builtin.include_role:
+        name: junioryono.billet.host
+        tasks_from: prepare-exclusion
+    - name: Prove the earlier survivor's settled facts remain outside this play
+      vars:
+        peer: "{{ hostvars['control-b'] }}"
+      ansible.builtin.assert:
+        that:
+          - "'control-b' not in ansible_play_hosts_all"
+          - "'control-b' not in ansible_play_hosts"
+          - peer.billet_exclusion_settled is sameas true
+          - peer.billet_exclusion_held is sameas true
+          - peer.billet_exclusion_holder == billet_exclusion_holder
+          - peer.billet_upgrade_claim_shape == 'guard'
+          - peer.billet_exclusion_answerer == '/usr/bin/billet'
+          - peer.billet_exclusion_id | length > 0
+    - name: Route retirement with only earlier-play survivor evidence
+      ansible.builtin.include_role:
+        name: junioryono.billet.host
+        tasks_from: retirement
+PLAY
+r_new r16-earlier-play
+r_run r16-earlier-play play-retirement-earlier-survivor
+expect_refused r16-earlier-play "Require the survivor in the retiring host's play" \
+  'Retirement precondition: survivor control-b is outside this play.' \
+  'Preparation in an earlier play cannot prove the survivor stayed healthy; converge the survivor in the same play as the retiring host.'
+expect_play_task_ran r16-earlier-play "Prove the earlier survivor's settled facts remain outside this play"
+r_no_collection r16-earlier-play
+expect_host_commands r16-earlier-play 'control-a retire-classify 1;'
 
 # R16: the other clauses remain true, so settled alone, a skipped settlement,
 # another holder and a binary pointer each have an independent witness.

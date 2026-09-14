@@ -121,15 +121,22 @@ prepare_task=$(grep -n '^- name: Prepare the exclusion before anything changes t
 if [ -z "$prepare_task" ] || [ "$second_task" != "$prepare_task" ]; then
   fail "the exclusion's preparation is not the second task in main.yml (second at line ${second_task:-none}, preparation at line ${prepare_task:-none})"
 fi
-first_prep=$(grep '^- name:' "$role_tasks/prepare-exclusion.yml" | head -1)
-case "$first_prep" in
-  *"Refuse a converge that would destroy the job running it") ;;
-  *) fail "prepare-exclusion.yml's first task is not the converge guard's import: $first_prep" ;;
-esac
+"$python" - "$role_tasks/prepare-exclusion.yml" <<'PYPREPORDER'
+import pathlib, sys, yaml
+tasks = yaml.safe_load(pathlib.Path(sys.argv[1]).read_text())
+reset, guard = tasks[:2]
+if (reset.get('name') != "Reset this inclusion's exclusion permission"
+        or 'ansible.builtin.set_fact' not in reset
+        or any(key in reset for key in ['when', 'delegate_to', 'delegate_facts'])):
+    sys.exit('prepare-exclusion.yml must reset permission without a connection before every fallible preparation task')
+if (guard.get('name') != 'Refuse a converge that would destroy the job running it'
+        or guard.get('ansible.builtin.import_tasks') != 'converge-guard.yml'):
+    sys.exit('prepare-exclusion.yml must import the runner refusal immediately after the permission reset')
+PYPREPORDER
 if [ -e "$here/../plugins/modules/guard_status.py" ] || [ -e "$here/guard_status_check.py" ]; then
   fail "the status module is gone from the role; its files must be gone from the collection"
 fi
-echo "ok   the guard is the first task in the role, the preparation the second, and the guard the preparation's first import"
+echo "ok   the guard is first in the role, preparation second; preparation resets permission first and imports the runner refusal second"
 
 # --- the fakes ---------------------------------------------------------------
 fakes="$work/fakes"
@@ -1217,7 +1224,7 @@ rm -rf "$work/cases/p15-a/lib" "$work/cases/p15-a/bin/billet"
 run_plain p15-a -- -e billet_exclusion_platform=Darwin
 expect_allowed p15-a
 expect_fact p15-a route unheld
-expect_fact p15-a held undef
+expect_fact p15-a held False
 expect_ran p15-a "Inspect the managed binary and the claim again before an unheld converge"
 log_empty p15-a
 [ ! -e "$work/cases/p15-a/lib" ] || fail "p15-a: a Mac with no billet had a root made for it"

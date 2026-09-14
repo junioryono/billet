@@ -790,12 +790,19 @@
           - billet_main_names[0] == 'Refuse a converge that would destroy the job running it'
           - billet_main_names[1] == 'Prepare the exclusion before anything changes this host'
           - billet_host_main_tasks[1]['ansible.builtin.import_tasks'] == 'prepare-exclusion.yml'
-          - billet_prepare_names[0] == 'Refuse a converge that would destroy the job running it'
-          - billet_host_prepare_tasks[0]['ansible.builtin.import_tasks'] == 'converge-guard.yml'
+          # THE CONNECTION-FREE RESET precedes every fallible task, including the runner refusal.
+          - billet_prepare_names[0] == "Reset this inclusion's exclusion permission"
+          - "'ansible.builtin.set_fact' in billet_host_prepare_tasks[0]"
+          - billet_host_prepare_tasks[0].when is not defined
+          - billet_host_prepare_tasks[0].delegate_to is not defined
+          - billet_host_prepare_tasks[0].delegate_facts is not defined
+          - billet_host_prepare_tasks[0]['ansible.builtin.set_fact'].billet_exclusion_settled is sameas false
+          - billet_prepare_names[1] == 'Refuse a converge that would destroy the job running it'
+          - billet_host_prepare_tasks[1]['ansible.builtin.import_tasks'] == 'converge-guard.yml'
           - billet_prepare_names.index('Refuse a converge without a holder') < billet_prepare_names.index('Inspect the managed binary and the upgrade root')
           # THE CLAIM'S FACTS are defined on every path before the block, and a dry run takes its shape from the report.
-          - billet_prepare_names.index('Note what the managed binary and the root are') < billet_prepare_names.index("Start the claim's facts at none")
-          - billet_prepare_names.index("Start the claim's facts at none") < billet_prepare_names.index('Prepare the exclusion')
+          - billet_prepare_names.index("Reset this inclusion's exclusion permission") < billet_prepare_names.index('Note what the managed binary and the root are')
+          - billet_prepare_names.index('Note what the managed binary and the root are') < billet_prepare_names.index('Prepare the exclusion')
           - billet_prepare_block_names.index('Report what a dry run found') < billet_prepare_block_names.index("Take the dry run's shape as this run's facts")
           - billet_prepare_block_names.index("Take the dry run's shape as this run's facts") < billet_prepare_block_names.index('Decide the binary change in a dry run')
           - "'ansible_check_mode' in ((billet_prepare_block | selectattr('name', 'equalto', \"Take the dry run's shape as this run's facts\") | first).when | string)"
@@ -1015,7 +1022,8 @@
           # statement that was never fetched.
           - ((billet_host_binary_tasks | selectattr('name', 'equalto', 'Resolve the release channel') | first).block | selectattr('name', 'equalto', 'Read the signed channel statement') | first).check_mode == false
         fail_msg: >-
-          prepare-exclusion.yml must run the guard first, refuse an absent holder
+          prepare-exclusion.yml must reset permission without a connection first,
+          import the runner refusal second, refuse an absent holder
           before any stat, establish the root only under ENOENT, run the dry run's
           report before the memory check and the shape dispatch, classify a
           legacy file by its own stat, make the two calls in order through the one
