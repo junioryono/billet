@@ -17,6 +17,39 @@ cat >"$work/play-retirement.yml" <<'PLAY'
       ansible.builtin.include_role:
         name: junioryono.billet.host
         tasks_from: prepare-exclusion
+    - name: Prove legacy preparation published a dry-run answerer
+      ansible.builtin.assert:
+        that:
+          - ansible_check_mode
+          - billet_upgrade_claim_shape == 'legacy-file'
+          - billet_exclusion_answerer == '/usr/bin/billet'
+      when: billet_gate_legacy_answerer is defined
+    # Damage the executable only after real preparation published its path.
+    # A non-executable file planted earlier cannot answer preparation at all.
+    - name: Invalidate the legacy executable after preparation
+      ansible.builtin.command:
+        argv:
+          - /bin/sh
+          - -ec
+          - |
+            case "$1" in
+              symlink)
+                mv /usr/bin/billet /usr/bin/billet.legacy-target
+                ln -s /usr/bin/billet.legacy-target /usr/bin/billet
+                ;;
+              other-owner) chown 65534 /usr/bin/billet ;;
+              group-writable) chmod 0775 /usr/bin/billet ;;
+              not-executable) chmod 0644 /usr/bin/billet ;;
+              *) exit 1 ;;
+            esac
+          - legacy-answerer
+          - "{{ billet_gate_legacy_answerer }}"
+      changed_when: true
+      check_mode: false
+      become: true
+      when:
+        - billet_gate_legacy_answerer is defined
+        - billet_gate_legacy_answerer != 'verified'
     - name: Inject a claim change after preparation
       ansible.builtin.command:
         argv: [/bin/sh, -c, 'rm -f /var/lib/billet/upgrades/active/guard.json']
@@ -360,6 +393,37 @@ for spec in ordinary:dry-run-ordinary hold:dry-run-hold-unreadable-row continue:
   expect_host_commands "$name" 'control-a retire-classify 1;'
   r_reported "$name" "$route"
   if [ "$route" = ordinary ]; then expect_play_task_ran "$name" 'Ordinary convergence sentinel'; else expect_no_play_task "$name" 'Ordinary convergence sentinel'; fi
+  expect_no_ordinary "$name"
+  expect_no_task "$name" 'Inspect the transaction claim before recovery'
+done
+
+# Legacy verification must discard preparation's non-empty dry-run answerer.
+# The ordinary answer would open the sentinel if an unverified path survived.
+for kind in symlink other-owner group-writable not-executable verified; do
+  name=r9-legacy-$kind
+  r_plant "$name"
+  p "$name" 'printf "%s\n" "$ROOT/recovery-20260909T120000-12345678" >"$ROOT/active"'
+  a "$name" --check -e "billet_gate_legacy_answerer=$kind"
+  r_answers "$name" 'control-a:classify:1:dry-run-ordinary.json:0'
+  r_run "$name"
+  expect_allowed "$name"
+  expect_play_task_ran "$name" 'Prove legacy preparation published a dry-run answerer'
+  expect_ran "$name" "Examine a legacy claim's read-only answerer"
+  if [ "$kind" = verified ]; then
+    expect_no_play_task "$name" 'Invalidate the legacy executable after preparation'
+    expect_ran "$name" 'Select a verified legacy answerer'
+    r_reported "$name" ordinary
+    expect_host_commands "$name" 'control-a retire-classify 1;'
+    expect_play_task_ran "$name" 'Ordinary convergence sentinel'
+  else
+    expect_play_task_ran "$name" 'Invalidate the legacy executable after preparation'
+    expect_no_task "$name" 'Select a verified legacy answerer'
+    r_reported "$name" hold 'This collection needs billet at or above v0.11.0 on the host'
+    r_reported "$name" hold 'upgrade the managed binary or converge with an older collection'
+    expect_host_commands "$name" ''
+    expect_no_task "$name" 'Ask the retirement classifier'
+    expect_no_play_task "$name" 'Ordinary convergence sentinel'
+  fi
   expect_no_ordinary "$name"
   expect_no_task "$name" 'Inspect the transaction claim before recovery'
 done
