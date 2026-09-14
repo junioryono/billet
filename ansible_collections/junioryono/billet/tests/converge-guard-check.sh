@@ -943,9 +943,12 @@ failed_at() {
 }
 # Only a terminal failure retains a task window. Progress in a later task
 # cannot replace it; keep item details for the decoder to judge an aggregate.
+# ansible-core 2.21.2 default.py (2026-09-14): _task_start caches TASK and
+# RUNNING HANDLER for _print_task_banner; no cleanup callback exists. Play
+# boundaries come from v2_playbook_on_play_start / v2_playbook_on_stats.
 final_fatal() {
   awk -v name="$1" '
-       /^(TASK \[|PLAY \[|PLAY RECAP)/ { if (fatal) final = buf; buf = ""; fatal = 0 }
+       /^(TASK \[|RUNNING HANDLER \[|PLAY( \[| RECAP| \*|$))/ { if (fatal) final = buf; buf = ""; fatal = 0 }
        { buf = buf $0 "\n" }
        /^(fatal:|failed:)/ {
          if ($0 !~ /^(fatal: \[.+\]: (FAILED|UNREACHABLE)! =>|failed: \[.+\] \(item=.*\) =>)/) {
@@ -955,7 +958,7 @@ final_fatal() {
          }
          fatal = 1
        }
-       /^(FAILED - RETRYING:|ASYNC FAILED on )/ { notice = 1 }
+       /^(FAILED - RETRYING:|ASYNC (POLL|OK|FAILED) on )/ { notice = 1 }
        END {
          if (invalid) exit 1
          if (fatal) final = buf
