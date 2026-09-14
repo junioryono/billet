@@ -216,7 +216,7 @@ func (l *Listener) arbitrateEscrow(ctx context.Context, target int) error {
 	// ONE NEW LEASE PER TURN bounds a small tier's burst ahead of a large one.
 	// Existing held backing can serve the turn without a second purchase.
 	before := l.capacity()
-	if err := l.refillEscrowUngated(ctx, min(target, l.committedCapacity()+1)); err != nil {
+	if err := l.refillEscrowUngated(ctx, min(target, l.committedCapacity()+1), 1); err != nil {
 		return err
 	}
 	e := a.entries[l.tier]
@@ -234,16 +234,31 @@ func (l *Listener) arbitrateEscrow(ctx context.Context, target int) error {
 // until returned. The next poll needs backing from its own admission turn.
 func (l *Listener) reconcileAdmissionPool(ctx context.Context, desired int) error {
 	_, turn := l.admissionPoll()
-	if err := l.reconcilePool(ctx, desired); err != nil {
+	consumed, err := l.reconcilePool(ctx, desired)
+	if err != nil {
 		return err
 	}
-	if turn == 0 || l.idleEscrow() != 0 {
+	if turn == 0 {
 		return nil
 	}
 
-	// RETURN ONLY THE CAPTURED TURN. Demand can change the owner during a
-	// launch; its completion must never spend the successor's grant.
-	l.finishAdmissionTurn(turn)
+	if consumed {
+		// RETURN ONLY THE CAPTURED TURN. Demand can change the owner during a
+		// launch; its completion must never spend the successor's grant.
+		l.finishAdmissionTurn(turn)
+	} else {
+		if l.idleEscrow() != 0 {
+			return nil
+		}
+		// LOST BACKING DID NOT SPEND THE TURN. Permit a replacement purchase
+		// under the same generation without advancing either fairness cursor.
+		a := l.arbiter
+		a.mu.Lock()
+		if a.owner == l.tier && a.generation == turn {
+			a.granted = false
+		}
+		a.mu.Unlock()
+	}
 	if l.isQuiesced() {
 		return nil
 	}

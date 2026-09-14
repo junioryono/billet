@@ -244,7 +244,7 @@ func TestLargeDemandKeepsItsTurnWhileSmallJobsFinish(t *testing.T) {
 func TestDiscoveryWithdrawalDoesNotReleaseAnAcquiringCapacityLease(t *testing.T) {
 	a, listeners := arbitrationListeners(t, []config.Tier{tier("a-donor"), tier("b-work")}, 3*tierVCPU)
 	donor, recipient := listeners[0], listeners[1]
-	if err := donor.refillEscrowUngated(t.Context(), 2); err != nil {
+	if err := donor.refillEscrowUngated(t.Context(), 2, 2); err != nil {
 		t.Fatal(err)
 	}
 	if got := donor.reserve([]Job{{RequestID: 11}}); !slices.Equal(got, []int64{11}) {
@@ -754,5 +754,113 @@ func TestPoolReconciliationKeepsUnusedOrUnconfirmedTurns(t *testing.T) {
 					before, after, l.idleEscrow())
 			}
 		})
+	}
+}
+
+// LOSING HELD BACKING TO A HEARTBEAT DOES NOT SERVE THE WAITING JOB. The same
+// owner must replace that backing without giving its unused turn to its peer.
+func TestPoolReconciliationKeepsATurnWhoseBackingTheHeartbeatLost(t *testing.T) {
+	a, listeners := arbitrationListeners(t, []config.Tier{tier("a"), tier("b")}, tierVCPU)
+	first, second := listeners[0], listeners[1]
+	for _, l := range listeners {
+		l.observed = &Statistics{TotalAssignedJobs: 1}
+		l.observeDemand(l.observed)
+	}
+	if err := first.prepareEscrow(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	held := first.Held()
+	if len(held) != 1 {
+		t.Fatalf("fixture has %d held leases, want 1", len(held))
+	}
+	_, before := first.admissionPoll()
+	launches, losses := 0, 0
+	first.runner = &fakeRunner{onLaunch: func(int64) error {
+		launches++
+		return nil
+	}}
+	first.beforePoolReconcile = func() {
+		losses++
+		if err := a.Release(t.Context(), held[0].ID, held[0].Epoch, alloc.PhaseDone); err != nil {
+			t.Fatal(err)
+		}
+		first.heartbeatPass(t.Context())
+		if first.idleEscrow() != 0 {
+			t.Fatal("heartbeat did not drop the lost backing before reconciliation")
+		}
+	}
+	if err := first.reconcileAdmissionPool(t.Context(), 1); err != nil {
+		t.Fatal(err)
+	}
+	_, after := first.admissionPoll()
+	if losses != 1 || launches != 0 || before == 0 || after != before {
+		t.Fatalf("losses %d, launches %d, turn %d became %d; want one loss and the unused turn",
+			losses, launches, before, after)
+	}
+	if err := first.prepareEscrow(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.prepareEscrow(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	replacement := first.Held()
+	if len(replacement) != 1 || replacement[0].ID == held[0].ID || second.capacity() != 0 {
+		t.Fatalf("replacement %+v, peer capacity %d; want new backing under the original owner",
+			replacement, second.capacity())
+	}
+	_, refilled := first.admissionPoll()
+	if refilled != before {
+		t.Fatalf("replacement changed turn %d to %d", before, refilled)
+	}
+}
+
+// A STALE TARGET CANNOT BUY TWO LEASES IN ONE TURN. The heartbeat removes a
+// promise after its capacity contributed to the target but before the purchase.
+func TestArbitratedRefillBuysOneLeaseAfterCommittedCapacityDisappears(t *testing.T) {
+	a, listeners := arbitrationListeners(t, []config.Tier{tier("work")}, 2*tierVCPU)
+	l := listeners[0]
+	l.observed = &Statistics{TotalAssignedJobs: 2}
+	if err := l.prepareEscrow(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	_, spent := l.admissionPoll()
+	if got := l.reserve([]Job{{RequestID: 11}}); !slices.Equal(got, []int64{11}) {
+		t.Fatalf("reserved %v, want request 11", got)
+	}
+	promised := l.acquiring[11].lease
+	l.finishAdmissionTurn(spent)
+	if target := l.targetCapacity(); target != 2 {
+		t.Fatalf("fixture target = %d, want 2", target)
+	}
+	losses := 0
+	l.beforeEscrowRefill = func() {
+		losses++
+		if l.committedCapacity() != 1 {
+			t.Fatal("promise disappeared before the refill captured its target")
+		}
+		if err := a.Release(t.Context(), promised.ID, promised.Epoch, alloc.PhaseDone); err != nil {
+			t.Fatal(err)
+		}
+		l.heartbeatPass(t.Context())
+		if l.capacity() != 0 {
+			t.Fatal("heartbeat did not remove committed capacity before the purchase")
+		}
+	}
+	if err := l.prepareEscrow(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	usage, err := a.Usage(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if losses != 1 || l.idleEscrow() != 1 || usage.Leases != 1 || usage.VCPU != tierVCPU {
+		t.Fatalf("losses %d, held %d, usage %+v; want one purchase despite the stale target",
+			losses, l.idleEscrow(), usage)
+	}
+	if err := l.prepareEscrow(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if losses != 1 || l.idleEscrow() != 1 {
+		t.Fatalf("same grant refilled again: losses %d, held %d", losses, l.idleEscrow())
 	}
 }

@@ -285,6 +285,11 @@ type Listener struct {
 	heartbeatTicks  <-chan time.Time
 	heartbeatPassed func()
 
+	// TEST-ONLY boundaries for losing backing after admission captures its turn
+	// or refill target. Nil in every deployment; neither replaces the operation.
+	beforePoolReconcile func()
+	beforeEscrowRefill  func()
+
 	// Guards the escrow below: renewal and the poll loop touch held and running
 	// concurrently.
 	mu sync.Mutex
@@ -1101,7 +1106,7 @@ func (l *Listener) Run(ctx context.Context) error {
 	l.observed = l.session.Statistics()
 	l.reportOrphanedBacklog()
 	if l.observed != nil {
-		if err := l.reconcilePool(ctx, l.observed.TotalAssignedJobs); err != nil {
+		if _, err := l.reconcilePool(ctx, l.observed.TotalAssignedJobs); err != nil {
 			return err
 		}
 	}
@@ -1324,7 +1329,7 @@ func (l *Listener) Run(ctx context.Context) error {
 			l.handBackIdleEscrow(pollCtx, draining || (quiesced && admissionKnown))
 
 			if l.observed != nil {
-				if err := l.reconcilePool(pollCtx, l.observed.TotalAssignedJobs); err != nil {
+				if _, err := l.reconcilePool(pollCtx, l.observed.TotalAssignedJobs); err != nil {
 					// reconcilePool launches runners, which can take minutes; a
 					// cancellation landing mid-launch must enter the drain so the
 					// jobs already running finish, not stop the listener and have
@@ -2929,10 +2934,13 @@ func (l *Listener) refillEscrowTo(ctx context.Context, target int) error {
 		return l.arbitrateEscrow(ctx, target)
 	}
 
-	return l.refillEscrowUngated(ctx, target)
+	return l.refillEscrowUngated(ctx, target, math.MaxInt)
 }
 
-func (l *Listener) refillEscrowUngated(ctx context.Context, target int) error {
+func (l *Listener) refillEscrowUngated(ctx context.Context, target, maxNew int) error {
+	if l.beforeEscrowRefill != nil {
+		l.beforeEscrowRefill()
+	}
 	room, err := l.alloc.Headroom(ctx, l.tier)
 	if err != nil {
 		return fmt.Errorf("server: headroom for %s: %w", l.tier, err)
@@ -2955,6 +2963,9 @@ func (l *Listener) refillEscrowUngated(ctx context.Context, target int) error {
 		}
 	}
 
+	// ONE NEW LEASE PER ARBITRATED GRANT, even if a heartbeat removed committed
+	// capacity after the target was computed. Standalone refills have no cap.
+	room = min(room, maxNew)
 	if room <= 0 {
 		return nil
 	}
@@ -3264,7 +3275,7 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 
 	if msg.Statistics != nil {
 		l.observed = msg.Statistics
-		if err := l.reconcilePool(ctx, msg.Statistics.TotalAssignedJobs); err != nil {
+		if _, err := l.reconcilePool(ctx, msg.Statistics.TotalAssignedJobs); err != nil {
 			return err
 		}
 	}
@@ -3356,14 +3367,17 @@ func (l *Listener) quarantineStarted(ctx context.Context, job Job, cause error) 
 // Growth creates anonymous physical members because individual job entries are
 // lifecycle data and may be truncated. Only idle members are selected for
 // shrinkage; a busy member belongs to a job regardless of what any aggregate
-// says while messages are in flight.
-func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
+// says while messages are in flight. Reports whether growth took held backing.
+func (l *Listener) reconcilePool(ctx context.Context, desired int) (bool, error) {
+	if l.beforePoolReconcile != nil {
+		l.beforePoolReconcile()
+	}
 	if l.alloc == nil || desired < 0 {
-		return nil
+		return false, nil
 	}
 	runners, err := l.alloc.PoolRunners(ctx, l.tier)
 	if err != nil {
-		return fmt.Errorf("server: read runner pool for %s reconciliation: %w", l.tier, err)
+		return false, fmt.Errorf("server: read runner pool for %s reconciliation: %w", l.tier, err)
 	}
 
 	for i := range runners {
@@ -3374,28 +3388,30 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 
 	runners, err = l.alloc.PoolRunners(ctx, l.tier)
 	if err != nil {
-		return fmt.Errorf("server: refresh runner pool for %s reconciliation: %w", l.tier, err)
+		return false, fmt.Errorf("server: refresh runner pool for %s reconciliation: %w", l.tier, err)
 	}
 	active, err := l.alloc.ActiveRunnerLeases(ctx, l.tier)
 	if err != nil {
-		return fmt.Errorf("server: count active runner leases for %s reconciliation: %w", l.tier, err)
+		return false, fmt.Errorf("server: count active runner leases for %s reconciliation: %w", l.tier, err)
 	}
+	consumed := false
 	for active < desired {
-		lease, job, ok, err := l.assignPoolSlot(ctx)
+		lease, job, held, err := l.assignPoolSlot(ctx)
 		if err != nil {
-			return err
+			return consumed, err
 		}
-		if !ok {
+		if lease == nil {
 			break
 		}
+		consumed = consumed || held
 		if err := l.launch(ctx, lease, job); err != nil {
-			return err
+			return consumed, err
 		}
 		active++
 	}
 	surplus := active - desired
 	if surplus <= 0 {
-		return nil
+		return consumed, nil
 	}
 	for i := range runners {
 		if surplus == 0 {
@@ -3414,7 +3430,7 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 		surplus--
 	}
 
-	return nil
+	return consumed, nil
 }
 
 func (l *Listener) activePoolMembers(ctx context.Context) (int, error) {
@@ -3428,6 +3444,7 @@ func (l *Listener) activePoolMembers(ctx context.Context) (int, error) {
 
 // assignPoolSlot turns one escrowed lease into a physical runner whose durable
 // identity is the lease rather than one entry from GitHub's truncated message.
+// Reports whether it took held backing rather than an existing promise.
 func (l *Listener) assignPoolSlot(ctx context.Context) (*alloc.Lease, Job, bool, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -3467,7 +3484,7 @@ func (l *Listener) assignPoolSlot(ctx context.Context) (*alloc.Lease, Job, bool,
 	delete(l.heldOrder, lease.ID)
 	l.running[requestID] = lease
 
-	return lease, Job{RequestID: requestID}, true, nil
+	return lease, Job{RequestID: requestID}, !fromPromise, nil
 }
 
 // retirePoolMember removes routing before compute, then returns its capacity.
