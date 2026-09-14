@@ -87,22 +87,44 @@ fail() {
 }
 
 case "${BILLET_GATE_ONLY:-}" in
-  ""|endpoint|retirement) ;;
-  *) fail "unknown BILLET_GATE_ONLY=${BILLET_GATE_ONLY}; expected endpoint or retirement" ;;
+  ""|endpoint|retirement|retirement-request) ;;
+  *) fail "unknown BILLET_GATE_ONLY=${BILLET_GATE_ONLY}; expected endpoint, retirement or retirement-request" ;;
 esac
 skip_endpoint=0
 skip_retirement=0
+skip_retirement_request=0
 case "${BILLET_GATE_SKIP:-}" in
-  "") ;;
-  endpoint) skip_endpoint=1 ;;
-  retirement) skip_retirement=1 ;;
-  endpoint,retirement|retirement,endpoint) skip_endpoint=1; skip_retirement=1 ;;
-  *) fail "invalid BILLET_GATE_SKIP=${BILLET_GATE_SKIP}; expected endpoint and/or retirement, comma-separated with no empty or repeated member" ;;
+  ,*|*,|*,,*) fail "invalid BILLET_GATE_SKIP=${BILLET_GATE_SKIP}; empty list member" ;;
 esac
+skip_rest=${BILLET_GATE_SKIP:-}
+while [ -n "$skip_rest" ]; do
+  skip_member=${skip_rest%%,*}
+  case "$skip_member" in
+    endpoint)
+      [ "$skip_endpoint" = 0 ] || fail "invalid BILLET_GATE_SKIP=${BILLET_GATE_SKIP}; repeated member $skip_member"
+      skip_endpoint=1 ;;
+    retirement)
+      [ "$skip_retirement" = 0 ] || fail "invalid BILLET_GATE_SKIP=${BILLET_GATE_SKIP}; repeated member $skip_member"
+      skip_retirement=1 ;;
+    retirement-request)
+      [ "$skip_retirement_request" = 0 ] || fail "invalid BILLET_GATE_SKIP=${BILLET_GATE_SKIP}; repeated member $skip_member"
+      skip_retirement_request=1 ;;
+    *) fail "invalid BILLET_GATE_SKIP=${BILLET_GATE_SKIP}; expected endpoint, retirement or retirement-request, comma-separated" ;;
+  esac
+  case "$skip_rest" in
+    *,*) skip_rest=${skip_rest#*,} ;;
+    *) skip_rest="" ;;
+  esac
+done
 if { [ "${BILLET_GATE_ONLY:-}" = endpoint ] && [ "$skip_endpoint" = 1 ]; } ||
-   { [ "${BILLET_GATE_ONLY:-}" = retirement ] && [ "$skip_retirement" = 1 ]; }; then
+   { [ "${BILLET_GATE_ONLY:-}" = retirement ] && [ "$skip_retirement" = 1 ]; } ||
+   { [ "${BILLET_GATE_ONLY:-}" = retirement-request ] && { [ "$skip_retirement" = 1 ] || [ "$skip_retirement_request" = 1 ]; }; }; then
   fail "BILLET_GATE_ONLY=${BILLET_GATE_ONLY} contradicts BILLET_GATE_SKIP=${BILLET_GATE_SKIP}"
 fi
+retirement_only=0
+case "${BILLET_GATE_ONLY:-}" in
+  retirement|retirement-request) retirement_only=1 ;;
+esac
 sections_ran="shared checks"
 
 # --- the module's own check -------------------------------------------------
@@ -1186,7 +1208,7 @@ mark_id "$work/corpus/no-change.json" "$work/corpus/no-change-second.json"
 mark_id "$work/corpus/no-change-outcome.json" "$work/corpus/no-change-outcome-second.json"
 mark_id "$work/corpus/acquired.json" "$work/corpus/acquired-second.json"
 
-if [ "${BILLET_GATE_ONLY:-}" != retirement ]; then
+if [ "$retirement_only" = 0 ]; then
 plant_plain guard-refused
 RUNNER="billet-lease-abc123"; run_plain guard-refused -- -e billet_gate_entry=converge-guard; RUNNER=""
 expect_refused guard-refused "Refuse a converge driven from a billet-managed runner" "runner billet itself manages"
@@ -1270,7 +1292,7 @@ sections_ran="$sections_ran, guard, simulated-darwin"
 fi
 
 if [ "$have_root" = 0 ]; then
-  [ "${BILLET_GATE_ONLY:-}" != retirement ] || fail "the retirement section needs sudo -n for its namespace machinery"
+  [ "$retirement_only" = 0 ] || fail "the retirement section needs sudo -n for its namespace machinery"
   if [ "${BILLET_GATE_REQUIRE_ROOT:-0}" = 1 ]; then
     fail "BILLET_GATE_REQUIRE_ROOT=1 and sudo -n is not available; the namespace cases cannot run"
   fi
@@ -1278,7 +1300,7 @@ if [ "$have_root" = 0 ]; then
   exit 0
 fi
 if [ "$(uname -s)" != Linux ]; then
-  [ "${BILLET_GATE_ONLY:-}" != retirement ] || fail "the retirement section needs Linux for its namespace machinery"
+  [ "$retirement_only" = 0 ] || fail "the retirement section needs Linux for its namespace machinery"
   if [ "${BILLET_GATE_REQUIRE_ROOT:-0}" = 1 ]; then
     fail "BILLET_GATE_REQUIRE_ROOT=1 on $(uname -s); the namespace cases need Linux"
   fi
@@ -1286,7 +1308,7 @@ if [ "$(uname -s)" != Linux ]; then
   exit 0
 fi
 if ! command -v go >/dev/null 2>&1; then
-  [ "${BILLET_GATE_ONLY:-}" != retirement ] || fail "the retirement section needs go for the shared namespace launch probe"
+  [ "$retirement_only" = 0 ] || fail "the retirement section needs go for the shared namespace launch probe"
   if [ "${BILLET_GATE_REQUIRE_ROOT:-0}" = 1 ]; then fail "no go on PATH; the backing binaries cannot be built"; fi
   echo "converge guard: no go on PATH; the namespace cases were skipped"
   exit 0
@@ -1584,15 +1606,18 @@ REC_A=recovery-20260909T120000-0badcafe
 REC_B=recovery-20260909T120000-1badcafe
 LEGACY_DIR=20260909T120000000000000
 
-# BILLET_GATE_ONLY=endpoint or retirement selects that section after shared
-# setup and the namespace launch probe (endpoint also runs the plain guard
-# and simulated-darwin cases). BILLET_GATE_SKIP is a comma-separated list of
-# endpoint and/or retirement, omitting E and/or R. CI's guard group skips
-# endpoint,retirement; each has its own group with BILLET_GATE_ONLY set.
+# BILLET_GATE_ONLY selects endpoint, retirement or retirement-request after
+# shared setup and the namespace launch probe (endpoint also runs the plain
+# guard and simulated-darwin cases). Retirement includes routes and requests;
+# retirement-request selects only 5c.d1, with R's shared machinery and helpers.
+# BILLET_GATE_SKIP accepts endpoint, retirement and retirement-request in any
+# order. Skipping retirement omits all of R, including requests. CI's guard
+# group skips endpoint,retirement; its retirement group skips retirement-request.
 # Neither set runs every section, as make converge-guard-check does locally.
 # Unknown values, empty or repeated list members, and selecting and skipping
-# the same section together are refused. An unset or empty SKIP omits nothing.
-if [ "${BILLET_GATE_ONLY:-}" != endpoint ] && [ "${BILLET_GATE_ONLY:-}" != retirement ]; then
+# the same section together are refused, including ONLY=retirement-request
+# with SKIP=retirement. An unset or empty SKIP omits nothing.
+if [ -z "${BILLET_GATE_ONLY:-}" ]; then
 
 # =============================================================================
 # B. The role's order and its routes.
@@ -2887,7 +2912,7 @@ ep_plant_ordinary() { # case installed-addr desired-addr [installed-shape] [desi
 # same and answering `unchanged`, the refresh `current` under the holder it
 # was written under; nothing stopped, no tempfile, the ordinary restart's
 # gate open.
-if [ "${BILLET_GATE_ONLY:-}" != retirement ] && [ "$skip_endpoint" = 0 ]; then
+if [ "$retirement_only" = 0 ] && [ "$skip_endpoint" = 0 ]; then
 ep_plant_ordinary e1-unchanged $EP_A $EP_A
 e e1-unchanged "BILLET_GATE_ANSWER=migrate-endpoint:1:$(ep_fixture e1-unchanged node-migrate-endpoint reported-unplanned.json);migrate-endpoint:2:$(ep_fixture e1-unchanged node-migrate-endpoint unchanged.json);receipt:1:$(ep_fixture e1-unchanged node-receipt current.json)"
 ep_case e1-unchanged
@@ -3249,9 +3274,10 @@ else
 fi
 
 # =============================================================================
-# R. RETIREMENT: the parser and the caller's existing-transition routes.
-# New requests and cancellation follow in 5c.d. A corruption starts from HEAD's committed producer bytes, never a
-# harvested worktree fixture and never an answer assembled by the gate.
+# R. RETIREMENT: the parser, caller routes and 5c.d1 new requests.
+# Both groups need HEAD's committed producer bytes and the machinery control.
+# A corruption starts from those bytes, never a harvested worktree fixture
+# and never an answer assembled by the gate.
 # =============================================================================
 if [ "${BILLET_GATE_ONLY:-}" != endpoint ] && [ "$skip_retirement" = 0 ]; then
 mkdir -p "$work/retire-fixtures"
@@ -3261,6 +3287,7 @@ while IFS= read -r fixture; do
   git -C "$repo_root" show "HEAD:$fixture" >"$work/retire-fixtures/${fixture##*/}"
 done <"$work/retire-fixture-list"
 
+if [ "${BILLET_GATE_ONLY:-}" != retirement-request ]; then
 cat >"$work/play-retire-parser.yml" <<'PLAY'
 ---
 - name: Exercise the retirement parser alone
@@ -3449,6 +3476,7 @@ expect_refused r7-refused "Refuse the retirement's answer" 'was refused' '(backe
 retire_parser_case r7-unknown request unknown-marker 3
 expect_refused r7-unknown "Refuse the retirement's answer" 'was unknown' '(marker, state'
 echo "ok   R7: all six calls, the route and member rules, every exit mismatch, and unanswered invocations"
+fi
 
 # THE MACHINERY'S POSITIVE CONTROL: the same wrapper on two delegated
 # inventory transports, mode and host counters independent, exact stdin kept,
@@ -3494,10 +3522,10 @@ done
 expect_path_absent r-machinery /var/lib/billet/server
 expect_unit_absent r-machinery billet-server.service
 expect_no_ordinary r-machinery
+sections_ran="$sections_ran, retirement machinery (R)"
 # Route coverage uses only the producer corpus above. Cases whose distinct
 # classifier shape has no producer fixture are listed in retirement-cases.md.
 . "$here/retirement-cases.sh"
-sections_ran="$sections_ran, retirement (R)"
 
 else
   echo "converge guard: retirement (R) skipped"

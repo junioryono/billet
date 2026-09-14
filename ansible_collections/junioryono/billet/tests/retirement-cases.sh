@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # Sourced by section R after its namespace runner and committed corpus exist.
 # The isolated entry proves routing; the boundary invokes the real main.yml.
-"$python" "$here/executable_version_check.py"
 
 cat >"$work/play-retirement.yml" <<'PLAY'
 ---
@@ -281,6 +280,8 @@ PY
 }
 
 # R1: one classifier, ordinary admitted, no retirement mutation or recovery.
+if [ "${BILLET_GATE_ONLY:-}" != retirement-request ]; then
+"$python" "$here/executable_version_check.py"
 r_plant r1-ordinary
 r_answers r1-ordinary 'control-a:classify:1:dry-run-ordinary.json:0'
 r_run r1-ordinary
@@ -885,7 +886,13 @@ if any(counts.get(key) != '0' for key in ['changed', 'failed', 'unreachable', 'r
     sys.exit('the second converge changed or failed: ' + rows[0])
 PY
 
+sections_ran="$sections_ran, retirement routes (R)"
+else
+  echo "converge guard: retirement routes (R) skipped"
+fi
+
 # 5c.d1: new requests, with two node-bearing transports (including the survivor).
+if [ "$skip_retirement_request" = 0 ]; then
 # Only the ordinary account/file/service block is forbidden: the explicit early
 # service-account import is required on this route.
 r_no_ordinary_after_request() {
@@ -1074,7 +1081,7 @@ for clause in upgrade policy survivor; do
     r_new "$name"
     case "$clause" in
       upgrade) a "$name" -e billet_gate_binary_upgrade=true; task='Require retirement outside a binary upgrade'; why='inside a binary upgrade' ;;
-      policy) a "$name" -e '{"billet_server_should_run":true}'; task='Require a policy that leaves the retiring server stopped'; why='policy will start the server' ;;
+      policy) a "$name" -e '{"billet_server_should_run":true}'; task='Require a policy that leaves the retiring server stopped'; why='the policy will start the server' ;;
       survivor) a "$name" -e billet_retirement_survivor_host=; task='Require a named survivor in this inventory'; why='no distinct inventory survivor' ;;
     esac
     if [ "$mode" = check ]; then a "$name" --check; fi
@@ -1588,3 +1595,7 @@ PYWHY
     expect_final "$name" 'journal'
   fi
 done
+sections_ran="$sections_ran, retirement requests (R)"
+else
+  echo "converge guard: retirement requests (R) skipped"
+fi
