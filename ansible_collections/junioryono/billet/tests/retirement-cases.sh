@@ -1725,7 +1725,7 @@ PYTAIL
 
 # R12: cancellation uses the observed survivor even when inventory names an
 # unreachable alternative. The row starts under ci-0; this converge is ci-1.
-for scenario in success check adopt-refused adopt-unanswered adopt-unreachable adopt-fresh adopt-run adopt-retiring adopt-survivor adopt-transition abandon-refused abandon-unanswered abandon-transition abandon-unreachable; do
+for scenario in success check adopt-refused adopt-unanswered adopt-unreachable adopt-fresh adopt-fresh-refused adopt-fresh-unanswered adopt-fresh-transition adopt-run adopt-retiring adopt-survivor adopt-transition abandon-refused abandon-unanswered abandon-transition abandon-unreachable; do
   name=r12-$scenario
   r_plant "$name"
   ep_plant_config "$name" 127.0.0.1:7717 server-only
@@ -1758,7 +1758,24 @@ INV
       a "$name" -i "$work/cases/$name/inventory.yml"
       task='Adopt the cancellation reservation under this holder'; why='UNREACHABLE!'
       ;;
-    adopt-fresh) adopted=reserved ;;
+    adopt-fresh*)
+      adopted=reserved
+      task='Require cancellation to adopt an existing reservation'; why='unexpectedly answered reserved instead of adopted'
+      # A fresh row has its own transition, not the classifier's old one.
+      "$python" - "$work/cases/$name/answers" "$scenario" <<'PYFRESH'
+import json, pathlib, sys
+root, scenario = pathlib.Path(sys.argv[1]), sys.argv[2]
+for name in ['reserved', 'abandoned']:
+    if name == 'abandoned' and scenario == 'adopt-fresh-transition':
+        continue
+    path = root / (name + '.json')
+    answer = json.loads(path.read_text())
+    answer['transition_id'] = 'fedcba9876543210fedcba9876543210'
+    path.write_text(json.dumps(answer))
+PYFRESH
+      if [ "$scenario" = adopt-fresh-refused ]; then abandoned=refused-abandon-journal; abandon_exit=2; fi
+      if [ "$scenario" = adopt-fresh-unanswered ]; then e "$name" BILLET_GATE_DROP_ANSWER=retire-abandon:1; fi
+      ;;
     adopt-run|adopt-retiring|adopt-survivor|adopt-transition|abandon-transition)
       "$python" - "$work/cases/$name/answers" "$scenario" <<'PYBIND'
 import json, pathlib, sys
@@ -1830,7 +1847,28 @@ INV
     fi
   fi
   case "$scenario" in
+    adopt-fresh*)
+      expect_final "$name" 'unexpectedly answered reserved instead of adopted'
+      expect_ran "$name" 'Ask abandonment to discharge the fresh cancellation reservation'
+      expect_no_task "$name" 'Abandon the adopted cancellation reservation'
+      if [ "$scenario" = adopt-fresh ]; then
+        expect_ran "$name" 'Bind cancellation cleanup to the fresh transition'
+        expect_final "$name" 'Afterwards: The fresh reservation was abandoned.'
+        expect_path_absent "$name" /var/lib/billet/gate-cancel-reservation
+      else
+        expect_ran "$name" 'Keep the fresh cancellation cleanup refusal'
+        expect_final "$name" 'Cleanup remains outstanding: reservation for retiring host control-a,' 'survivor control-b, run ci-1,' 'transition fedcba9876543210fedcba9876543210 is not proved released.'
+        case "$scenario" in
+          adopt-fresh-refused) expect_final "$name" "Retirement's abandon" 'was refused' ;;
+          adopt-fresh-unanswered) expect_final "$name" "did not answer retirement's abandon call" ;;
+          adopt-fresh-transition) expect_final "$name" 'The abandonment answered for another transition; cleanup is unproved.' ;;
+        esac
+      fi
+      ;;
+  esac
+  case "$scenario" in
     check|adopt-unreachable) calls='control-a retire-classify 1;' ;;
+    adopt-fresh*) calls='control-a retire-classify 1;control-a retire-reserve 1;control-a retire-abandon 1;' ;;
     adopt-*|abandon-unreachable) calls='control-a retire-classify 1;control-a retire-reserve 1;' ;;
     *) calls='control-a retire-classify 1;control-a retire-reserve 1;control-a retire-abandon 1;' ;;
   esac
@@ -1879,7 +1917,7 @@ if scenario == 'check':
 if scenario in ['check', 'adopt-refused', 'adopt-unreachable']:
     if (case / 'reservation-after').read_text() != 'ci-0\n':
         sys.exit('cancellation changed an unadopted reservation')
-elif scenario.startswith('adopt-') or scenario in ['abandon-refused', 'abandon-unreachable']:
+elif (scenario.startswith('adopt-') and scenario not in ['adopt-fresh', 'adopt-fresh-unanswered', 'adopt-fresh-transition']) or scenario in ['abandon-refused', 'abandon-unreachable']:
     if (case / 'reservation-after').read_text() != 'reserved\n':
         sys.exit('unconfirmed cancellation lost the reserved obligation')
 else:

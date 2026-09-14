@@ -16,6 +16,7 @@
     - name: Name cancellation's preparation step
       ansible.builtin.set_fact:
         billet_retirement_cancel_step: preparation
+        billet_retirement_cancel_fresh: {}
 
     - name: Require cancellation's recorded row operands
       ansible.builtin.assert:
@@ -73,10 +74,18 @@
         billet_retire_call: reserve
         billet_retire_answered_by: "{{ billet_retirement_answerer }}"
 
+    - name: Keep an unexpected fresh reservation for cleanup
+      ansible.builtin.set_fact:
+        billet_retirement_cancel_fresh: "{{ billet_retire_answer if billet_retire_answer.outcome == 'reserved' else {} }}"
+
+    - name: Require cancellation to adopt an existing reservation
+      ansible.builtin.assert:
+        that: billet_retire_answer.outcome == 'adopted'
+        fail_msg: Cancellation reserve unexpectedly answered reserved instead of adopted.
+
     - name: Bind cancellation adoption to the classified reservation
       ansible.builtin.assert:
         that:
-          - billet_retire_answer.outcome == 'adopted'
           - billet_retire_answer.run == billet_exclusion_holder
           - billet_retire_answer.retiring == inventory_hostname
           - billet_retire_answer.retiring == billet_retirement_classification.row.retiring
@@ -120,11 +129,62 @@
         billet_retirement_bypass: false
       changed_when: true
   rescue:
-    - name: Fail the cancellation with its outstanding step
-      ansible.builtin.fail:
-        msg: >-
+    - name: Preserve the cancellation failure before cleanup
+      ansible.builtin.set_fact:
+        billet_retirement_cancel_failure: >-
           Reservation cancellation failed at {{ billet_retirement_cancel_step }}
           ({{ ansible_failed_task.name }}):
           {{ ansible_failed_result.msg | default('The call did not answer.') }}
+        billet_retirement_cancel_cleanup: No fresh reservation cleanup was required.
+
+    # Only a validated fresh answer enters this rescue. Abandonment enforces
+    # row.Run == --run; a mismatched adopted binding gives no cleanup permission.
+    - name: Discharge the unexpected fresh cancellation reservation
+      when: billet_retirement_cancel_fresh | length > 0
+      block:
+        - name: Ask abandonment to discharge the fresh cancellation reservation
+          ansible.builtin.command:
+            argv: >-
+              {{ [billet_retirement_answerer, 'server', 'retire', '--abandon-reservation', '--json',
+                  '--run', billet_exclusion_holder, '--retiring-host', inventory_hostname,
+                  '--config', '/etc/billet/billet.yaml']
+                 + (['--environment-file', billet_retirement_environment_file]
+                    if billet_retirement_environment_file | length > 0 else []) }}
+            expand_argument_vars: false
+          register: billet_retirement_cancel_cleanup_raw
+          ignore_unreachable: true
+          changed_when: false
+          failed_when: false
+          become: true
+
+        - name: Parse the fresh cancellation cleanup
+          ansible.builtin.include_tasks: retire-answer.yml
+          vars:
+            billet_retire_raw: "{{ billet_retirement_cancel_cleanup_raw }}"
+            billet_retire_call: abandon
+            billet_retire_answered_by: "{{ billet_retirement_answerer }}"
+
+        - name: Bind cancellation cleanup to the fresh transition
+          ansible.builtin.assert:
+            that: billet_retire_answer.transition_id == billet_retirement_cancel_fresh.transition_id
+            fail_msg: The abandonment answered for another transition; cleanup is unproved.
+
+        - name: Record confirmed fresh cancellation cleanup
+          ansible.builtin.set_fact:
+            billet_retirement_cancel_cleanup: The fresh reservation was abandoned.
+          changed_when: true
+      rescue:
+        - name: Keep the fresh cancellation cleanup refusal
+          ansible.builtin.set_fact:
+            billet_retirement_cancel_cleanup: >-
+              Cleanup remains outstanding: reservation for retiring host {{ inventory_hostname }},
+              survivor {{ billet_retirement_cancel_fresh.survivor }}, run {{ billet_exclusion_holder }},
+              transition {{ billet_retirement_cancel_fresh.transition_id }}
+              is not proved released. {{ ansible_failed_result.msg | default('abandonment did not answer') }}
+
+    - name: Fail the cancellation with its outstanding step
+      ansible.builtin.fail:
+        msg: >-
+          {{ billet_retirement_cancel_failure }} Afterwards: {{ billet_retirement_cancel_cleanup }}
           Cancellation is unconfirmed for retiring host {{ inventory_hostname }},
           run {{ billet_exclusion_holder }}. Ordinary host tasks remain bypassed.

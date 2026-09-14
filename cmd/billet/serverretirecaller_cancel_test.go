@@ -95,10 +95,14 @@ func TestTheRetireCallerFixtureSettlesAfterSurvivorAcknowledgement(t *testing.T)
 		t.Fatalf("the request did not leave a pending row and marker: %s", out)
 	}
 	completion := strings.ReplaceAll(string(mustMarshal(t, m["completion"])), retireTestIdentity, f.identity)
+	retiringRoot := retirement.Root
+	closedStatus := mustRead(t, retirement.StatusPath())
 
 	var answer string
 	if !t.Run("survivor", func(t *testing.T) {
+		useRetirementRoot(t)
 		newGuardFixture(t)
+		preparedHost(t)
 		mustHold(t, requestRun)
 		t.Setenv("BILLET_STATE_DSN", f.dsn)
 		var exit int
@@ -109,6 +113,9 @@ func TestTheRetireCallerFixtureSettlesAfterSurvivorAcknowledgement(t *testing.T)
 		}
 	}) {
 		t.Fatal("the survivor could not produce its completion answer")
+	}
+	if retirement.Root != retiringRoot || mustRead(t, retirement.StatusPath()) != closedStatus {
+		t.Fatal("the survivor did not preserve the retiring host's closed authority")
 	}
 
 	answer = strings.ReplaceAll(answer, retireTestIdentity, f.identity)
