@@ -893,6 +893,10 @@ fi
 
 # 5c.d1: new requests, with two node-bearing transports (including the survivor).
 if [ "$skip_retirement_request" = 0 ]; then
+# The namespace retains the invoker's account; use its non-root primary group
+# too, because local prepare refuses either numeric identity resolving to zero.
+[ "$invoker_gid" != 0 ] || fail 'retirement requests need a non-root invoker primary group'
+r_service_group=$(id -gn "$invoker_name")
 # Only the ordinary account/file/service block is forbidden: the explicit early
 # service-account import is required on this route.
 r_no_ordinary_after_request() {
@@ -919,21 +923,21 @@ r_new() { # case [reserved|adopted]
   local name=$1 outcome=${2:-reserved}
   r_plant "$name"
   r_services "$name" control-a
-  # Service identity validation and local prepare really run, under root in
-  # this namespace; the retirement and collected reports remain fixture fakes.
-  "$python" - "$work/cases/$name/services/control-a.json" <<'PY'
+  # Root runs the real local prepare inside the namespace, recording the
+  # invoker as the unprivileged service account without changing host accounts.
+  "$python" - "$work/cases/$name/services/control-a.json" "$invoker_name" "$r_service_group" <<'PY'
 import json, sys
 p = sys.argv[1]
 d = json.load(open(p))
 for unit in d.values():
-    unit.update(User='root', Group='root')
+    unit.update(User=sys.argv[2], Group=sys.argv[3])
 with open(p, 'w') as stream:
     json.dump(d, stream)
 PY
   ep_plant_config "$name" 127.0.0.1:7717 server-only
   a "$name" -e billet_converge_guard_holder=ci-1 -e billet_gate_new=true -e billet_gate_peer=true \
     -e billet_retirement_survivor_host=control-b \
-    -e billet_service_user=root -e billet_service_group=root -e '{"billet_adopt_existing_service_account": true}'
+    -e "billet_service_user=$invoker_name" -e "billet_service_group=$r_service_group" -e '{"billet_adopt_existing_service_account": true}'
   cat >"$work/cases/$name/inventory.yml" <<'INV'
 all:
   hosts:
