@@ -26,7 +26,7 @@ func TestDNSUpstreamsKeepsOnlyRealGlobalUpstreams(t *testing.T) {
 	}
 
 	path := filepath.Join(t.TempDir(), "dns-upstreams.py")
-	if err := os.WriteFile(path, []byte(DNSUpstreamsScript), 0o700); err != nil {
+	if err := writeExecutable(path, []byte(DNSUpstreamsScript), 0o700); err != nil {
 		t.Fatalf("write filter: %v", err)
 	}
 

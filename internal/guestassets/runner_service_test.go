@@ -24,7 +24,7 @@ func TestRunnerServicePreservesHostedJobResultCodes(t *testing.T) {
 			linkListener(t, root)
 
 			wrapper := filepath.Join(root, "runner-service")
-			if err := os.WriteFile(wrapper, source, 0o755); err != nil {
+			if err := writeExecutable(wrapper, source, 0o755); err != nil {
 				t.Fatalf("write runner wrapper: %v", err)
 			}
 
@@ -50,7 +50,7 @@ func TestRunnerServiceMatchesTheStockDeprecatedVersionExitContract(t *testing.T)
 		t.Fatalf("read runner wrapper: %v", err)
 	}
 	wrapper := filepath.Join(root, "runner-service")
-	if err := os.WriteFile(wrapper, source, 0o755); err != nil {
+	if err := writeExecutable(wrapper, source, 0o755); err != nil {
 		t.Fatalf("write runner wrapper: %v", err)
 	}
 

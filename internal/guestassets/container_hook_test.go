@@ -80,7 +80,7 @@ func TestTheContainerHookMountsTheShimIntoTheJobContainer(t *testing.T) {
 	node := nodeOrSkip(t)
 	index, record := hookHarness(t, "0")
 	shim := filepath.Join(t.TempDir(), "docker")
-	if err := os.WriteFile(shim, []byte("#!/bin/sh\n# billet-docker-shim\n"), 0o755); err != nil {
+	if err := writeExecutable(shim, []byte("#!/bin/sh\n# billet-docker-shim\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	// The shim's production path is fixed in the wrapper; a test points it at a
@@ -159,7 +159,7 @@ func TestTheContainerHookLeavesOtherRequestsAlone(t *testing.T) {
 			index, record := hookHarness(t, "0")
 			shim := filepath.Join(t.TempDir(), "docker")
 			if tc.shim {
-				if err := os.WriteFile(shim, []byte("#!/bin/sh\n"), 0o755); err != nil {
+				if err := writeExecutable(shim, []byte("#!/bin/sh\n"), 0o755); err != nil {
 					t.Fatal(err)
 				}
 			}

@@ -71,7 +71,7 @@ printf '{"ready":true}\n'
 `)
 
 			script := filepath.Join(shadow, "docker-cache.sh")
-			if err := os.WriteFile(script, []byte(DockerCacheScript), 0o755); err != nil {
+			if err := writeExecutable(script, []byte(DockerCacheScript), 0o755); err != nil {
 				t.Fatalf("write Docker cache script: %v", err)
 			}
 			run := exec.CommandContext(t.Context(), script, "complete", tc.status)
@@ -111,7 +111,7 @@ func TestDockerCachePreservesTheRunnerServiceExitContract(t *testing.T) {
 
 	shadow := t.TempDir()
 	script := filepath.Join(shadow, "docker-cache.sh")
-	if err := os.WriteFile(script, []byte(DockerCacheScript), 0o755); err != nil {
+	if err := writeExecutable(script, []byte(DockerCacheScript), 0o755); err != nil {
 		t.Fatalf("write Docker cache script: %v", err)
 	}
 	for status, want := range map[string]string{
@@ -137,7 +137,7 @@ func TestDockerCacheDoesNotFormatAfterABlkidError(t *testing.T) {
 	writeStub(t, shadow, "blkid", "exit 1\n")
 	writeStub(t, shadow, "mkfs.ext4", "printf called > \"$BILLET_TEST_MKFS_LOG\"\n")
 	script := filepath.Join(shadow, "docker-cache.sh")
-	if err := os.WriteFile(script, []byte(DockerCacheScript), 0o755); err != nil {
+	if err := writeExecutable(script, []byte(DockerCacheScript), 0o755); err != nil {
 		t.Fatalf("write Docker cache script: %v", err)
 	}
 	run := exec.CommandContext(t.Context(), script, "prepare-filesystem", "/dev/test-cache")
@@ -200,7 +200,7 @@ test "$(wc -l < "$BILLET_TEST_SYSTEMCTL_LOG")" -ge 2
 	writeStub(t, shadow, "umount", "exit 1\n")
 	writeStub(t, shadow, "curl", "printf called > \"$BILLET_TEST_CURL_LOG\"\n")
 	script := filepath.Join(shadow, "docker-cache.sh")
-	if err := os.WriteFile(script, []byte(DockerCacheScript), 0o755); err != nil {
+	if err := writeExecutable(script, []byte(DockerCacheScript), 0o755); err != nil {
 		t.Fatalf("write Docker cache script: %v", err)
 	}
 	curlLog := filepath.Join(shadow, "curl.log")
@@ -228,7 +228,7 @@ test "$(wc -l < "$BILLET_TEST_SYSTEMCTL_LOG")" -ge 2
 func writeStub(t *testing.T, dir, name, body string) {
 	t.Helper()
 
-	if err := os.WriteFile(filepath.Join(dir, name), []byte("#!/bin/sh\n"+body), 0o755); err != nil {
+	if err := writeExecutable(filepath.Join(dir, name), []byte("#!/bin/sh\n"+body), 0o755); err != nil {
 		t.Fatalf("write %s stub: %v", name, err)
 	}
 }
