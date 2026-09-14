@@ -3184,6 +3184,7 @@ cat >"$work/play-retire-parser.yml" <<'PLAY'
         billet_retire_raw: "{{ billet_gate_retire_raw }}"
         # A refused second inclusion must not retain a preceding answer.
         billet_retire_route: ordinary
+        billet_retire_state_known: true
         billet_retire_valid: true
         billet_retire_reservation: released
     - name: Parse the retirement answer
@@ -3196,6 +3197,7 @@ cat >"$work/play-retire-parser.yml" <<'PLAY'
           - billet_retire_valid is sameas true
           - billet_retire_answer == (billet_gate_retire_raw.stdout | junioryono.billet.from_json_strict)
           - billet_retire_route == (billet_retire_answer.route if billet_retire_call == 'classify' else '')
+          - billet_retire_state_known is sameas (billet_retire_answer.state | default('') != 'unknown')
           - billet_retire_reservation == ''
         fail_msg: The retirement parser did not publish this call's own answer.
 PLAY
@@ -3295,11 +3297,21 @@ for spec in classify:dry-run-request reserve:reserved request:retired-settled \
   call=${spec%%:*}; fixture=${spec#*:}
   retire_parser_case "r7-no-rc-$call" "$call" "$fixture" 0 raw rc -
   retire_unanswered "r7-no-rc-$call" "Refuse a retirement call that did not answer"
-  if [ "$call" != complete ]; then
+  if [ "$call" = reserve ] || [ "$call" = abandon ] || [ "$call" = acknowledge ]; then
     retire_parser_case "r7-state-$call" "$call" "$fixture" 0 answer state '"unknown"'
     retire_member_refused "r7-state-$call" state
   fi
 done
+# The closing observation may be unknown even on success. The classifier
+# guarantees hold; a terminal request still leaves its caller holding too.
+retire_parser_case r7-state-classify classify dry-run-adopt 0 answer state '"unknown"'
+expect_allowed r7-state-classify
+expect_play_task_ran r7-state-classify "Prove the parser published this invocation's typed operands"
+retire_parser_case r7-state-classify-non-hold classify dry-run-request 0 answer state '"unknown"'
+retire_member_refused r7-state-classify-non-hold state
+retire_parser_case r7-state-request request retired-settled 0 answer state '"unknown"'
+expect_allowed r7-state-request
+expect_play_task_ran r7-state-request "Prove the parser published this invocation's typed operands"
 for rc in -9 1 124 137; do
   retire_parser_case "r7-unanswered-$rc" classify dry-run-request "$rc"
   retire_unanswered "r7-unanswered-$rc" "Refuse a retirement call that did not answer"

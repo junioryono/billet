@@ -8,14 +8,16 @@
 # (classify, reserve, request, abandon, complete, acknowledge), and
 # billet_retire_answered_by (the executable, for diagnostics).
 # Outputs: billet_retire_answer (the operands), billet_retire_route (only
-# classify), billet_retire_valid, billet_retire_reservation (only a validated
-# refusal's cleanup word). Each is reset before the read, including on rescue.
+# classify), billet_retire_state_known, billet_retire_valid,
+# billet_retire_reservation (only a validated refusal's cleanup word).
+# Each is reset before the read, including on rescue.
 # A route's reason is text for a person, never a decision this parser makes.
 
 - name: Forget the preceding retirement answer
   ansible.builtin.set_fact:
     billet_retire_answer: {}
     billet_retire_route: ""
+    billet_retire_state_known: false
     billet_retire_valid: false
     billet_retire_reservation: ""
   no_log: true
@@ -145,8 +147,13 @@
         ok: "{{ (billet_retire_call == 'complete' and not billet_retire_failed and 'outcome' not in billet_retire_a) or (billet_retire_outcome is string and billet_retire_outcome in billet_retire_outcomes.get(billet_retire_call, [])) }}"
       - name: schema
         ok: "{{ billet_retire_a.schema | default(none) is integer and billet_retire_a.schema | default(0) == 1 }}"
+      # retireDryRun's closing observation and retireRequest's success wrapper
+      # can report unknown for classify, preview, tail and done alike.
       - name: state
-        ok: "{{ billet_retire_shape not in ['refusal', 'classify', 'reserve', 'abandon', 'acknowledge', 'preview', 'tail', 'done'] or ((billet_retire_a.state | default('') in (['nothing'] if billet_retire_shape in ['reserve', 'abandon', 'acknowledge'] else ['nothing'] + billet_retire_phases + (['unknown'] if billet_retire_failed else [])))) }}"
+        ok: "{{ billet_retire_shape not in ['refusal', 'classify', 'reserve', 'abandon', 'acknowledge', 'preview', 'tail', 'done'] or ((billet_retire_a.state | default('') in (['nothing'] if billet_retire_shape in ['reserve', 'abandon', 'acknowledge'] else ['nothing', 'unknown'] + billet_retire_phases))) }}"
+      # retireDryRun forces its route to hold when the closing state is unknown.
+      - name: state
+        ok: "{{ billet_retire_shape != 'classify' or billet_retire_a.state | default('') != 'unknown' or billet_retire_a.route | default('') == 'hold' }}"
       - name: reason
         ok: "{{ billet_retire_shape not in ['refusal'] or ((billet_retire_a.reason | default(none)) is string and (billet_retire_a.reason | default(none)) in billet_retire_reasons) }}"
       - name: why
@@ -523,6 +530,9 @@
 - name: Keep the validated retirement answer for this call
   ansible.builtin.set_fact:
     billet_retire_valid: true
+    # An answer whose state is not known is a hold: ordinary tasks stay
+    # bypassed and nothing is treated as a confirmed terminal state.
+    billet_retire_state_known: "{{ billet_retire_answer.state | default('') != 'unknown' }}"
     billet_retire_reservation: >-
       {{ billet_retire_answer.reservation | default('')
          if billet_retire_answer.outcome | default('') in ['refused', 'unknown'] else '' }}
