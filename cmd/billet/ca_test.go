@@ -141,7 +141,7 @@ func TestCAIssueDuringARotationWritesABundleThatCanVerifyTheServer(t *testing.T)
 		t.Fatalf("create the authority: %v", err)
 	}
 
-	if _, err := wirecert.Rotate(serverState, deployment); err != nil {
+	if _, err := wirecert.Rotate(t.Context(), serverState, deployment); err != nil {
 		t.Fatalf("rotate: %v", err)
 	}
 

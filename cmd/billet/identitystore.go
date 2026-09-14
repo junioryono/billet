@@ -10,7 +10,6 @@ import (
 	"github.com/junioryono/billet/internal/awscreds"
 	"github.com/junioryono/billet/internal/awsssm"
 	"github.com/junioryono/billet/internal/config"
-	"github.com/junioryono/billet/internal/wirecert"
 	"github.com/junioryono/billet/internal/wireshare"
 )
 
@@ -99,7 +98,7 @@ func adoptSharedAuthority(
 		return nil
 	}
 
-	return withAuthorityLock(cfg, log, func(dir string) error {
+	return withAuthorityLock(ctx, cfg, log, func(dir string) error {
 		adopted, err := wireshare.Adopt(ctx, store, dir, deployment, false)
 		if err != nil {
 			return err
@@ -132,7 +131,7 @@ func publishSharedAuthority(
 		return
 	}
 
-	err := withAuthorityLock(cfg, log, func(dir string) error {
+	err := withAuthorityLock(ctx, cfg, log, func(dir string) error {
 		return wireshare.Publish(ctx, store, dir, deployment)
 	})
 	if err != nil {
@@ -164,7 +163,7 @@ func publishRotatedAuthority(ctx context.Context, cfg *config.Config, deployment
 
 	log := slog.Default()
 
-	err := withAuthorityLock(cfg, log, func(dir string) error {
+	err := withAuthorityLock(ctx, cfg, log, func(dir string) error {
 		return wireshare.Publish(ctx, store, dir, deployment)
 	})
 	if err == nil {
@@ -184,19 +183,28 @@ func publishRotatedAuthority(ctx context.Context, cfg *config.Config, deployment
 // ONE PLACE THAT TAKES IT, so the two callers cannot disagree about whether they
 // hold it — and neither of them may call the other, because a second flock on a
 // separate descriptor in the SAME process is denied.
-func withAuthorityLock(cfg *config.Config, log *slog.Logger, fn func(dir string) error) error {
+func withAuthorityLock(ctx context.Context, cfg *config.Config, log *slog.Logger, fn func(dir string) error) error {
 	dir := cfg.Server.IdentityDir
 
-	lock, err := wirecert.LockAuthority(dir)
+	// THE WHOLE EXCLUSION, not the inner lock alone: on a prepared host the
+	// global lock admitted first, on a legacy host the inner lock with its
+	// recheck. Non-blocking, as an operator command wants.
+	acc, err := openIdentityAccess(ctx, dir, identityIntent{})
 	if err != nil {
 		return err
 	}
 
-	defer func() {
-		if err := lock.Release(); err != nil {
-			log.Warn("could not release the authority lock", "error", err)
-		}
-	}()
+	// THE RELEASE IS PART OF THE RESULT, not a warning: it hands an adopted
+	// authority back to the service account, and a `ca sync` that exited zero
+	// over a failed hand-back would leave the server unable to read the
+	// authority it just adopted.
+	err = fn(dir)
 
-	return fn(dir)
+	if rerr := acc.Release(); rerr != nil {
+		log.Warn("could not release the authority lock", "error", rerr)
+
+		err = errors.Join(err, rerr)
+	}
+
+	return err
 }

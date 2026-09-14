@@ -42,7 +42,13 @@ StateDirectoryMode=0700
 # /run/billet/locks is the host-wide collision domain for node invocations that
 # carry one deployment identity. The server no longer takes this lock; its
 # authoritative state store serializes the control plane instead.
-RuntimeDirectory=billet/locks
+# billet/registration holds the node's registration record (root-owned, written
+# after every accepted registration); a RuntimeDirectory is the one place under
+# /run that ProtectSystem=strict leaves writable, and it is the NODE'S ALONE: a
+# unit that declares a directory re-owns it recursively at a start where its
+# owner differs and removes it at its stop, so a server declaring the same name
+# would take the record with it (measured on systemd 255, 2026-09-09).
+RuntimeDirectory=billet/locks billet/registration
 RuntimeDirectoryMode=0750
 
 # Sized for billet's maximum configurable drain (24h) + teardown (~25m) + margin.

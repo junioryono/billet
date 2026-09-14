@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "outcome": "refused",
+  "reason": "reserved",
+  "why": "this deployment's retirement is reserved by control-a (run ci-1, state reserved, since 2026-09-11T10:00:00Z); one controller retires at a time",
+  "state": "nothing"
+}

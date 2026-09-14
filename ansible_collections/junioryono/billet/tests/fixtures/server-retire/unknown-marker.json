@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "outcome": "unknown",
+  "reason": "marker",
+  "why": "the guard's marker names transition fedcba9876543210fedcba9876543210 and the row transition 0123456789abcdef0123456789abcdef; the marker is kept",
+  "state": "nothing"
+}

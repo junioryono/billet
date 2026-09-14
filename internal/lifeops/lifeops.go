@@ -285,9 +285,16 @@ type Report struct {
 // thing is testable without root, without systemd and without a real account
 // database — none of which a unit test can supply.
 type Inspector struct {
-	run       runner
+	run runner
+	// waitDelay is the grace execRunner gives a cancelled run; see
+	// WithWaitDelay.
+	waitDelay time.Duration
 	systemctl string
 	timeout   time.Duration
+	// observe, when set, sees every systemctl invocation with the context it
+	// runs under, before it runs. A caller's test observes the deadline a stop
+	// or a start was given through it.
+	observe func(ctx context.Context, args []string)
 
 	// selfPath names the running executable, for display only.
 	selfPath func() (string, error)
@@ -313,12 +320,36 @@ func WithSystemctl(path string) Option {
 	}
 }
 
-// WithTimeout bounds each systemctl call.
+// WithTimeout bounds each property read and each enablement change. A stop
+// and a start are not bounded by it: they run under the caller's context, and
+// the caller passes a deadline from the unit's own bound.
 func WithTimeout(d time.Duration) Option {
 	return func(i *Inspector) {
 		if d > 0 {
 			i.timeout = d
 		}
+	}
+}
+
+// WithWaitDelay sets the grace a cancelled stop or start gets between the
+// TERM the cancel sends and the KILL that follows, and the wait for a
+// descendant that keeps the output open after the process exited. The
+// default is ten seconds; a caller that runs its own bounded commands under
+// a shorter or longer grace passes the same one here so the two agree.
+func WithWaitDelay(d time.Duration) Option {
+	return func(i *Inspector) {
+		if d > 0 {
+			i.waitDelay = d
+		}
+	}
+}
+
+// WithObserver reports every systemctl invocation, with the context it runs
+// under, before it runs. For a caller's test that pins the deadline a stop or
+// a start was given; nothing in production sets it.
+func WithObserver(fn func(ctx context.Context, args []string)) Option {
+	return func(i *Inspector) {
+		i.observe = fn
 	}
 }
 
@@ -365,7 +396,7 @@ func withIdentityLookup(uid, gid func(string) (string, error)) Option {
 // NewInspector builds an Inspector.
 func NewInspector(opts ...Option) *Inspector {
 	i := &Inspector{
-		run:        execRunner,
+		waitDelay:  runnerWaitDelay,
 		systemctl:  "systemctl",
 		timeout:    DefaultTimeout,
 		selfPath:   os.Executable,
@@ -391,6 +422,10 @@ func NewInspector(opts ...Option) *Inspector {
 
 	for _, opt := range opts {
 		opt(i)
+	}
+
+	if i.run == nil {
+		i.run = execRunnerWith(i.waitDelay)
 	}
 
 	return i

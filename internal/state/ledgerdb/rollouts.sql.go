@@ -41,8 +41,10 @@ UPDATE rollout_nodes
                             THEN dispatch_epoch ELSE CAST($8 AS BIGINT) END,
        converged_digest = CASE WHEN CAST($9 AS TEXT) = ''
                               THEN converged_digest ELSE CAST($9 AS TEXT) END,
-       updated_at = $10
- WHERE rollout_id = $11 AND node = $12 AND phase = $13
+       last_refusal = CASE WHEN CAST($10 AS BIGINT) = 1
+                           THEN CAST($11 AS TEXT) ELSE last_refusal END,
+       updated_at = $12
+ WHERE rollout_id = $13 AND node = $14 AND phase = $15
 `
 
 type AdvanceRolloutNodeParams struct {
@@ -55,6 +57,8 @@ type AdvanceRolloutNodeParams struct {
 	PriorRelease    string
 	DispatchEpoch   int64
 	ConvergedDigest string
+	SetLastRefusal  int64
+	LastRefusal     string
 	UpdatedAt       string
 	RolloutID       string
 	Node            string
@@ -69,6 +73,12 @@ type AdvanceRolloutNodeParams struct {
 // not erase what is there. Expressed in SQL rather than by building the
 // statement two ways, because a branch applied in one path and forgotten in
 // another is how a rollback loses the release it was meant to return to.
+//
+// last_refusal IS WRITTEN ONLY WHEN THE CALLER SAYS SO (set_last_refusal = 1):
+// the failed-dispatch path writes the reason, the successful dispatch writes an
+// empty one, and every other transition passes 0 and keeps what is there. An
+// empty parameter cannot stand for "keep it", because clearing is a write of
+// exactly that empty value.
 func (q *Queries) AdvanceRolloutNode(ctx context.Context, arg AdvanceRolloutNodeParams) error {
 	_, err := q.db.ExecContext(ctx, advanceRolloutNode,
 		arg.Phase,
@@ -80,6 +90,8 @@ func (q *Queries) AdvanceRolloutNode(ctx context.Context, arg AdvanceRolloutNode
 		arg.PriorRelease,
 		arg.DispatchEpoch,
 		arg.ConvergedDigest,
+		arg.SetLastRefusal,
+		arg.LastRefusal,
 		arg.UpdatedAt,
 		arg.RolloutID,
 		arg.Node,
@@ -190,8 +202,8 @@ const insertRolloutNode = `-- name: InsertRolloutNode :exec
 INSERT INTO rollout_nodes
      (rollout_id, node, phase, attempts, next_attempt_at, blocker,
       prior_release, rollback_result, exempt_reason, updated_at,
-      dispatch_epoch, converged_digest)
-VALUES ($1, $2, $3, 0, '', '', '', '', '', $4, 0, '')
+      dispatch_epoch, converged_digest, last_refusal)
+VALUES ($1, $2, $3, 0, '', '', '', '', '', $4, 0, '', '')
 `
 
 type InsertRolloutNodeParams struct {
@@ -302,7 +314,7 @@ func (q *Queries) ListRolloutNodePhases(ctx context.Context, rolloutID string) (
 const listRolloutNodes = `-- name: ListRolloutNodes :many
 SELECT node, phase, attempts, next_attempt_at, blocker, prior_release,
        rollback_result, exempt_reason, updated_at, dispatch_epoch,
-       converged_digest
+       converged_digest, last_refusal
   FROM rollout_nodes WHERE rollout_id = $1 ORDER BY node
 `
 
@@ -318,6 +330,7 @@ type ListRolloutNodesRow struct {
 	UpdatedAt       string
 	DispatchEpoch   int64
 	ConvergedDigest string
+	LastRefusal     string
 }
 
 // Where every host in one rollout has got to, in a stable order.
@@ -342,6 +355,7 @@ func (q *Queries) ListRolloutNodes(ctx context.Context, rolloutID string) ([]Lis
 			&i.UpdatedAt,
 			&i.DispatchEpoch,
 			&i.ConvergedDigest,
+			&i.LastRefusal,
 		); err != nil {
 			return nil, err
 		}

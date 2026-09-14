@@ -1,0 +1,229 @@
+---
+# THE ENDPOINT DECISION, before the render and before the transaction's first
+# stop. A node dials the control plane it was configured with for the life of
+# its process, so a converge that changes `node.server_addr` (or the TLS state
+# that decides the scheme) is a migration, decided here by `billet node
+# migrate-endpoint --dry-run` over the RUNNING node's effective endpoint (its
+# own registration record) and the pre-render configuration's, against the
+# rendering on stdin; `planned` is true when either differs. The role infers
+# nothing of its own from the configurations: a first start, a removed node, an
+# absent installed configuration and a leftover node beside a server-only
+# installation are the command's to report, since node presence is the unit's
+# and its process's and never the configuration's.
+#
+# WHAT ANSWERS: the executable the preparation recorded for this converge
+# (billet_exclusion_answerer: the managed binary, the verified fallback, or the
+# candidate that answered the first call; in a dry run the one that answered
+# the report), and NOTHING under the legacy shape, a pre-R managed binary with
+# no candidate, or a host with no billet. Without an answerer the role can
+# still say two things: on a host with no billet, whether a node runs there
+# (which it refuses, because nothing can judge what that node dials); and
+# under a release before the guard, whether the endpoint changes at all
+# (compared through the one endpoint representation), which it refuses,
+# because such a release cannot migrate it.
+#
+# THE FOUR REFUSALS over `planned` are the role's, before anything is stopped:
+# a planned change inside a binary upgrade (the transaction restarts the node
+# onto the new endpoint without the protocol), under the legacy protocol, under
+# a policy that will not start the node in this converge, or without a
+# controller to confirm the registration with.
+
+- name: Reset the endpoint migration's facts
+  ansible.builtin.set_fact:
+    billet_endpoint_planned: false
+    billet_endpoint_from: ""
+    billet_endpoint_to: ""
+    billet_endpoint_record: ""
+    billet_endpoint_compat: false
+    billet_endpoint_no_billet: false
+    billet_endpoint_migrated: false
+    billet_endpoint_rendering: ""
+    billet_endpoint_answerer: "{{ billet_exclusion_answerer | default('') }}"
+
+- name: Decide the node's endpoint migration
+  when: not billet_exclusion_darwin | default(false) | bool
+  block:
+    # THE RENDERING, once, the same template the render installs: what the
+    # decision judges is what the render will write.
+    - name: Render the desired configuration for the endpoint decision
+      ansible.builtin.set_fact:
+        billet_endpoint_rendering: "{{ lookup('ansible.builtin.template', 'billet.yaml.j2') }}"
+      no_log: true
+
+    # NO BILLET TO ASK: a node running on a host with no billet cannot be
+    # judged (nothing can say what it dials), so it is refused; a unit
+    # positively inactive or absent takes the fresh path.
+    - name: Observe the node unit on a host with no billet
+      ansible.builtin.command:
+        # QUOTED: in a YAML flow sequence a comma separates items, and the
+        # unquoted property list became three arguments, two of them unit
+        # names systemd answered with their own LoadState (measured 2026-09-11
+        # on the fleet's guest, where the fresh-machine dry run refused).
+        argv: [systemctl, show, billet-node.service, "--property=LoadState,ActiveState,MainPID"]
+      register: billet_endpoint_unit_raw
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      become: true
+      when:
+        - billet_endpoint_answerer | length == 0
+        - not billet_exclusion_binary_present | default(false) | bool
+
+    - name: Refuse a converge over a node running on a host with no billet
+      vars:
+        # Only `Name=value` lines are read; anything else systemctl prints
+        # (a warning, an empty line) is not a property.
+        billet_endpoint_unit: "{{ dict(billet_endpoint_unit_raw.stdout_lines | default([]) | select('search', '=') | map('split', '=', 1) | list) }}"
+      # POSITIVE EVIDENCE ONLY: the three properties answered, the unit loaded
+      # or not found, a state that carries no process, and a pid of exactly
+      # zero; anything missing or unfamiliar is could-not-tell and refuses.
+      ansible.builtin.assert:
+        that:
+          - billet_endpoint_unit_raw.rc == 0
+          - "'LoadState' in billet_endpoint_unit"
+          - "'ActiveState' in billet_endpoint_unit"
+          - "'MainPID' in billet_endpoint_unit"
+          - billet_endpoint_unit.LoadState | default('') in ['loaded', 'not-found']
+          - billet_endpoint_unit.ActiveState | default('') in ['inactive', 'failed']
+          - billet_endpoint_unit.MainPID | default('') == '0'
+        fail_msg: >-
+          {{ ('a node runs on a host with no billet to ask, or cannot be judged (billet-node.service is '
+              ~ (billet_endpoint_unit.LoadState | default('unobserved')) ~ ', ' ~ (billet_endpoint_unit.ActiveState | default('unobserved'))
+              ~ ', pid ' ~ (billet_endpoint_unit.MainPID | default('unobserved')) ~ ')')
+             if billet_endpoint_unit_raw.rc == 0
+             else ('billet-node.service could not be observed on a host with no billet to ask (systemctl show exited '
+                   ~ billet_endpoint_unit_raw.rc | string ~ ')') }};
+          stop it or install the release first.
+      when: billet_endpoint_unit_raw is not skipped
+
+    - name: Note that this host has no billet and no node running
+      ansible.builtin.set_fact:
+        billet_endpoint_no_billet: true
+      when: billet_endpoint_unit_raw is not skipped
+
+    # THE COMPATIBILITY RULE: a release before the converge guard cannot
+    # migrate an endpoint, so the pre-render configuration's endpoint and the
+    # rendering's are compared through the one endpoint representation, and a
+    # difference is refused; an unchanged endpoint converges as it always did,
+    # the two later entries skipping with a report.
+    - name: Compare the endpoints without an executable to ask
+      junioryono.billet.endpoint_change:
+        installed: "{{ (billet_previous_config_file.content | b64decode | from_yaml) if billet_installed_config.stat.exists else {} }}"
+        desired: "{{ billet_endpoint_rendering | from_yaml }}"
+      register: billet_endpoint_compat_change
+      check_mode: false
+      no_log: true
+      when:
+        - billet_endpoint_answerer | length == 0
+        - billet_exclusion_binary_present | default(false) | bool
+
+    - name: Refuse an endpoint change a release before the converge guard cannot migrate
+      ansible.builtin.assert:
+        that:
+          - not (billet_endpoint_compat_change.changed_endpoint | default(false) | bool)
+        fail_msg: >-
+          a release before the converge guard cannot migrate an endpoint
+          (the installed configuration names {{ billet_endpoint_compat_change.installed_endpoint | default('none', true) }}
+          and the rendering {{ billet_endpoint_compat_change.desired_endpoint | default('none', true) }});
+          pin a release that carries it.
+      when: billet_endpoint_compat_change is not skipped
+
+    - name: Note that this converge runs under the compatibility rule
+      ansible.builtin.set_fact:
+        billet_endpoint_compat: true
+      when: billet_endpoint_compat_change is not skipped
+
+    # THE DRY RUN, through the answerer, with or without an installed
+    # configuration (the command reports `config: absent` and judges the unit
+    # and its process against the rendering). Bounded by the judgement's
+    # attempts, each an opening observation, the record wait, the two
+    # observations of a bracket that outlives it, the closing observation
+    # and the pre-R probe a node without a record may need, plus the guard's
+    # bound as the margin, `-k 10` so a hang is killed after the grace
+    # period.
+    - name: Ask for the endpoint migration's dry run
+      ansible.builtin.command:
+        argv: >-
+          {{ ['timeout', '-k', '10', ((billet_migration_judgement_attempts | int) * ((billet_migration_record_wait | int) + 4 * (billet_migration_observation_bound | int) + (billet_migration_probe_bound | int)) + (billet_guard_timeout | int)) | string,
+              billet_endpoint_answerer, 'node', 'migrate-endpoint', '--config', '/etc/billet/billet.yaml',
+              '--desired', '-', '--wait', (billet_migration_record_wait | string) ~ 's', '--dry-run', '--json'] }}
+        stdin: "{{ billet_endpoint_rendering }}"
+        expand_argument_vars: false
+      register: billet_endpoint_dry
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      become: true
+      no_log: true
+      when: billet_endpoint_answerer | length > 0
+
+    - name: Judge the endpoint migration's dry run
+      ansible.builtin.import_tasks: endpoint-answer.yml
+      vars:
+        billet_endpoint_raw: "{{ billet_endpoint_dry }}"
+        billet_endpoint_call: decision
+        billet_endpoint_answered_by: "{{ billet_endpoint_answerer }}"
+      when: billet_endpoint_answerer | length > 0
+
+    # A refusal or a could-not-tell ends the converge here, before the
+    # transaction's first stop and before the render: a node found stopping,
+    # a pre-R process whose endpoint cannot be read, a moved process.
+    - name: Refuse the migration's dry run
+      ansible.builtin.assert:
+        that:
+          - billet_endpoint_answer.outcome == 'reported'
+        fail_msg: >-
+          The endpoint migration's dry run through {{ billet_endpoint_answerer }}
+          {{ 'was refused' if billet_endpoint_answer.outcome == 'refused' else 'could not examine the host' }}
+          ({{ billet_endpoint_answer.reason | default('no reason') }}):
+          {{ billet_endpoint_answer.why | default('no reason') }}.
+          {{ ('Next: ' ~ billet_endpoint_answer.next ~ '.') if (billet_endpoint_answer.next | default('') | length > 0) else '' }}
+          Nothing was stopped or installed.
+      when: billet_endpoint_answerer | length > 0
+
+    - name: Refuse a planned endpoint migration this converge cannot perform
+      vars:
+        billet_endpoint_planned_now: "{{ billet_endpoint_answer.planned | default(false) | bool }}"
+      ansible.builtin.assert:
+        that:
+          - not billet_endpoint_planned_now or not (billet_binary_upgrade | default(false) | bool)
+          - not billet_endpoint_planned_now or (billet_upgrade_claim_shape | default('') not in ['legacy', 'legacy-file'])
+          - not billet_endpoint_planned_now or (billet_node_should_run | default(false) | bool)
+          - not billet_endpoint_planned_now or (billet_migration_controller | default('') | length > 0)
+        fail_msg: >-
+          This converge would move the node's endpoint from
+          {{ billet_endpoint_answer.from | default('none', true) }} to
+          {{ billet_endpoint_answer.to | default('none', true) }}, and cannot:
+          {{ 'it is inside a binary upgrade, whose transaction restarts the node without the migration protocol; converge the binary first, then the endpoint;'
+             if billet_binary_upgrade | default(false) | bool else '' }}
+          {{ 'it runs the legacy upgrade protocol, which cannot migrate an endpoint; pin a release that carries the converge guard;'
+             if billet_upgrade_claim_shape | default('') in ['legacy', 'legacy-file'] else '' }}
+          {{ 'the policy will not start the node in this converge (billet_enable_node or billet_server_prepare_only), so the migrated node could not register;'
+             if not (billet_node_should_run | default(false) | bool) else '' }}
+          {{ 'no controller is named to confirm the registration with (billet_migration_controller); declare the control_plane group or set it;'
+             if billet_migration_controller | default('') | length == 0 else '' }}
+          nothing was stopped or installed.
+      when: billet_endpoint_answerer | length > 0
+
+    - name: Take the endpoint decision as this run's facts
+      ansible.builtin.set_fact:
+        billet_endpoint_planned: "{{ billet_endpoint_answer.planned | bool }}"
+        billet_endpoint_from: "{{ billet_endpoint_answer.from | default('', true) }}"
+        billet_endpoint_to: "{{ billet_endpoint_answer.to | default('', true) }}"
+        billet_endpoint_record: "{{ billet_endpoint_answer.record }}"
+      when: billet_endpoint_answerer | length > 0
+
+    - name: Report the endpoint decision
+      ansible.builtin.debug:
+        msg: >-
+          {{ ('The node is on a host with no billet and no node runs there; the endpoint follows the first start.')
+             if billet_endpoint_no_billet | bool
+             else (('The endpoint is unchanged and this release predates the converge guard; the receipt follows the first converge with a release that carries it.')
+                   if billet_endpoint_compat | bool
+                   else ('The endpoint migration '
+                         ~ ('is planned, from ' ~ (billet_endpoint_from | default('none', true)) ~ ' to ' ~ (billet_endpoint_to | default('none', true))
+                            if billet_endpoint_planned | bool else 'is not planned')
+                         ~ ' (record ' ~ billet_endpoint_record ~ ')'
+                         ~ (', a first start' if billet_endpoint_answer.first_start | default(false) | bool else '')
+                         ~ (', the node removed' if billet_endpoint_answer.node_removed | default(false) | bool else '')
+                         ~ ', through ' ~ billet_endpoint_answerer ~ '.')) }}

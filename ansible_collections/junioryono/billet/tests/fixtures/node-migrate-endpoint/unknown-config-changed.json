@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "outcome": "unknown",
+  "reason": "config",
+  "why": "the installed configuration /etc/billet/billet.yaml was replaced after it was observed",
+  "state": "nothing"
+}

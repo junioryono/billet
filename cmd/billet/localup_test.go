@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/deploy"
 	"github.com/junioryono/billet/internal/config"
@@ -25,6 +26,10 @@ type fakeConverger struct {
 	plan lifeops.UpPlan
 
 	trace []string
+	// deadlines records the context deadline each stop and start ran under,
+	// keyed as the trace names them, so a test can pin that the command gave
+	// the operation the unit's own bound and nothing shorter.
+	deadlines map[string]time.Time
 
 	// serverName and nodeName are what THIS backend calls its two services.
 	// Empty means the packaged systemd units, which is what almost every test
@@ -274,6 +279,8 @@ func (f *fakeConverger) StartAndProve(ctx context.Context, unit string) (string,
 		f.onStart(unit)
 	}
 
+	f.recordDeadline("start "+unit, ctx)
+
 	f.record("start " + unit)
 	f.started = true
 
@@ -386,8 +393,9 @@ func (f *fakeConverger) Enable(_ context.Context, unit string) error {
 	return err
 }
 
-func (f *fakeConverger) StopAndProve(_ context.Context, unit string) (lifeops.StopResult, error) {
+func (f *fakeConverger) StopAndProve(ctx context.Context, unit string) (lifeops.StopResult, error) {
 	f.record("stop " + unit)
+	f.recordDeadline("stop "+unit, ctx)
 
 	if f.onStop != nil {
 		f.onStop(unit)
@@ -484,8 +492,15 @@ func stageUp(t *testing.T, f *fakeConverger, verdict githubVerdict) *fakeConverg
 	}
 
 	converge = func(...lifeops.ConvergeOption) converger { return f }
-	check = func(context.Context, checkOptions) (checkReport, error) {
+	check = func(_ context.Context, opts checkOptions) (checkReport, error) {
 		f.record("check")
+
+		// THE REAL CHECK INITIALISES THE HOST: it creates the identity
+		// directory and mints what lives in it, and every later ledger open is
+		// an ordinary one that creates nothing. A fake that skipped the
+		// creation left these tests proving `up`'s order against a host no
+		// check had ever run on, which on Linux fails at the reopen.
+		stageIdentityDir(t, opts.configPath)
 
 		return checkReport{github: verdict}, nil
 	}
@@ -1705,5 +1720,35 @@ func TestUpArmsTheTimersEachHostNeeds(t *testing.T) {
 	enableTimers(t.Context(), other, loaded, lifeops.UpRequest{WantServer: true})
 	if len(other.trace) != 0 {
 		t.Errorf("a manager with no timers was asked to %v", other.trace)
+	}
+}
+
+// recordDeadline keeps the deadline an operation ran under, or the zero time
+// for a context that carried none.
+func (f *fakeConverger) recordDeadline(op string, ctx context.Context) {
+	if f.deadlines == nil {
+		f.deadlines = map[string]time.Time{}
+	}
+
+	d, _ := ctx.Deadline()
+	f.deadlines[op] = d
+}
+
+// stageIdentityDir creates the server state directory the configuration at
+// path names, the way `billet check` does on a host it initialises.
+func stageIdentityDir(t *testing.T, path string) {
+	t.Helper()
+
+	if path == "" {
+		return
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil || cfg.Server == nil || cfg.Server.IdentityDir == "" {
+		return
+	}
+
+	if err := os.MkdirAll(cfg.Server.IdentityDir, 0o700); err != nil {
+		t.Fatalf("stage the identity directory: %v", err)
 	}
 }

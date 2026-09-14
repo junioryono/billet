@@ -113,6 +113,24 @@ func (b *sqliteBackend) dataSources() (ledgerPools, error) {
 	return ledgerPools{writer: writer, reader: reader}, nil
 }
 
+// inspectDataSources is both pools read-only: mode=ro at the VFS, which refuses
+// every write however it arrives, and query_only in the connection. mode=ro on
+// a WAL database still takes the shared-memory locks and reads only committed
+// pages, so it is correct against a live control plane; what it needs is a
+// -shm file it can map or a directory it can create one in, which a stopped
+// controller's root-owned inspection has and a live one already holds.
+// immutable=1 is never used: it skips the locks and reads a WAL database as if
+// nothing were writing it.
+func (b *sqliteBackend) inspectDataSources() (ledgerPools, error) {
+	inspect := dsnWith(b.path, map[string]string{"mode": "ro"},
+		"busy_timeout(5000)",
+		"foreign_keys(ON)",
+		"query_only(ON)",
+	)
+
+	return ledgerPools{writer: inspect, reader: inspect}, nil
+}
+
 // dsn builds a file: URI with the given pragmas, escaping the path so a state
 // directory containing spaces, '?' or '#' does not silently truncate the DSN.
 func dsn(path string, pragmas ...string) string {
@@ -143,7 +161,7 @@ func dsnWith(path string, extra map[string]string, pragmas ...string) string {
 // shared-memory index assumes one host — the request silently degrades to
 // DELETE. Failing closed here turns "your ledger was never durable" into a
 // startup error.
-func (*sqliteBackend) verifyDurability(ctx context.Context, w *sql.DB) error {
+func (*sqliteBackend) verifyDurability(ctx context.Context, w *sql.DB, _ bool) error {
 	var errs []error
 
 	var journal string

@@ -116,7 +116,12 @@ func TestFromRolloutHasNothingToDoWithoutADecisionToAct(t *testing.T) {
 
 			// THE PACKAGE ENABLES THE TIMER BEFORE THE SERVER HAS EVER RUN, and a
 			// read that created a ledger here would leave a root-owned one the
-			// service account cannot open.
+			// service account cannot open. The timer takes the transaction lock
+			// before it reads, so the upgrade root is this test's own.
+			original := upgradeRoot
+			upgradeRoot = filepath.Join(t.TempDir(), "upgrades")
+			t.Cleanup(func() { upgradeRoot = original })
+
 			dir := t.TempDir()
 
 			t.Cleanup(func() {

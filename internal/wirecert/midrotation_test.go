@@ -101,7 +101,7 @@ func rotated(t *testing.T) (dir string, old, fresh *wirecert.CA) {
 		t.Fatalf("create: %v", err)
 	}
 
-	fresh, err = wirecert.Rotate(dir, rotDeployment)
+	fresh, err = wirecert.Rotate(t.Context(), dir, rotDeployment)
 	if err != nil {
 		t.Fatalf("rotate: %v", err)
 	}
@@ -322,7 +322,7 @@ func TestADamagedCurrentPairIsStillRefused(t *testing.T) {
 			}
 
 			if tc.rotate {
-				if _, err := wirecert.Rotate(dir, rotDeployment); err != nil {
+				if _, err := wirecert.Rotate(t.Context(), dir, rotDeployment); err != nil {
 					t.Fatalf("rotate: %v", err)
 				}
 			}
@@ -357,7 +357,7 @@ func TestRetireRefusesWhileThePreviousKeyIsHoldingTheAuthorityUp(t *testing.T) {
 	stageMinted(t, dir, false)
 	putFile(t, caFile(t, dir, "ca.crt"), readFile(t, caFile(t, dir, "ca-previous.crt")), 0o644)
 
-	err := wirecert.Retire(dir, rotDeployment)
+	err := wirecert.Retire(t.Context(), dir, rotDeployment)
 	if err == nil {
 		t.Fatal("retiring removed the only key that matches the certificate on disk")
 	}
@@ -402,7 +402,7 @@ func TestRetireRefusesWhenItCannotTellWhetherThePreviousKeyIsLoadBearing(t *test
 		t.Fatalf("chmod: %v", err)
 	}
 
-	err := wirecert.Retire(dir, rotDeployment)
+	err := wirecert.Retire(t.Context(), dir, rotDeployment)
 	if err == nil {
 		t.Fatal("retiring removed a key billet could not read well enough to judge")
 	}
@@ -470,7 +470,7 @@ func TestRetireRefusesWheneverTheCurrentPairIsNotConclusivelyWhole(t *testing.T)
 			dir, _, _ := rotated(t)
 			tc.wreck(t, dir)
 
-			err := wirecert.Retire(dir, rotDeployment)
+			err := wirecert.Retire(t.Context(), dir, rotDeployment)
 			if err == nil {
 				t.Fatal("retiring removed the previous pair while the current one was not whole")
 			}
@@ -522,7 +522,7 @@ func TestRetireRefusesWhenTheCurrentAuthorityBELONGSToSomebodyElse(t *testing.T)
 			"staging what it claims")
 	}
 
-	if err := wirecert.Retire(dir, rotDeployment); err == nil {
+	if err := wirecert.Retire(t.Context(), dir, rotDeployment); err == nil {
 		t.Error("retiring deleted this deployment's only authority because a stranger's " +
 			"parsed cleanly")
 	}
@@ -555,7 +555,7 @@ func TestRotateRefusesRatherThanOverwritingALeftOverPreviousKey(t *testing.T) {
 	leftover := []byte("-----BEGIN EC PRIVATE KEY-----\nsomebody's only copy\n")
 	putFile(t, caFile(t, dir, "ca-previous.key"), leftover, 0o600)
 
-	_, err := wirecert.Rotate(dir, rotDeployment)
+	_, err := wirecert.Rotate(t.Context(), dir, rotDeployment)
 	if err == nil {
 		t.Fatal("rotating wrote over a previous key that was already there")
 	}
@@ -614,7 +614,7 @@ func TestRotateSaysWhetherALeftoverKeyIsACopyOfTheOneStillInstalled(t *testing.T
 
 			putFile(t, caFile(t, dir, "ca-previous.key"), body, 0o600)
 
-			if _, err := wirecert.Rotate(dir, rotDeployment); err == nil {
+			if _, err := wirecert.Rotate(t.Context(), dir, rotDeployment); err == nil {
 				t.Fatal("rotating wrote over the leftover key")
 			} else if !strings.Contains(err.Error(), tc.expected) {
 				t.Errorf("the refusal does not answer whether the leftover matters: %v", err)
@@ -664,7 +664,7 @@ func TestRotateRefusesWhenItCannotTellWhetherAPreviousHalfIsThere(t *testing.T) 
 		}
 	})
 
-	if _, err := wirecert.Rotate(dir, rotDeployment); err == nil {
+	if _, err := wirecert.Rotate(t.Context(), dir, rotDeployment); err == nil {
 		t.Fatal("rotating proceeded past a previous half it could not look at")
 	} else if !strings.Contains(err.Error(), "check") {
 		t.Errorf("the error does not say it could not tell: %v", err)
@@ -759,7 +759,7 @@ func TestRetireOnlyEverRemovesAPreviousPairItCanPROVEIsOurs(t *testing.T) {
 			dir, _, _ := rotated(t)
 			tc.wreck(t, dir)
 
-			if err := wirecert.Retire(dir, rotDeployment); err == nil {
+			if err := wirecert.Retire(t.Context(), dir, rotDeployment); err == nil {
 				t.Fatal("retiring unlinked a previous key billet cannot account for")
 			} else if !strings.Contains(err.Error(), tc.expect) {
 				t.Errorf("the refusal does not say why: %v", err)
@@ -827,7 +827,7 @@ func TestRetireStillClearsACertificateWithNoKeyBesideIt(t *testing.T) {
 			dir, old, fresh := rotated(t)
 			inForce := tc.stage(t, dir, old, fresh)
 
-			if err := wirecert.Retire(dir, rotDeployment); err != nil {
+			if err := wirecert.Retire(t.Context(), dir, rotDeployment); err != nil {
 				t.Fatalf("retiring a leftover certificate was refused: %v", err)
 			}
 
@@ -930,7 +930,7 @@ func TestRetireRefusesAPreviousFileCarryingMoreThanItAccountsFor(t *testing.T) {
 				t.Fatalf("the staged file no longer loads, so this stages nothing: %v", err)
 			}
 
-			if err := wirecert.Retire(dir, rotDeployment); err == nil {
+			if err := wirecert.Retire(t.Context(), dir, rotDeployment); err == nil {
 				t.Fatal("retiring unlinked a file carrying a second, unaccounted private key")
 			} else if !strings.Contains(err.Error(), "more than the one") {
 				t.Errorf("the refusal does not say what it found: %v", err)
@@ -1045,7 +1045,7 @@ func TestRetireRefusesASecondAuthorityMintedForTHISDeployment(t *testing.T) {
 		t.Fatalf("the twin pair does not load, so this stages something else: %v", err)
 	}
 
-	err = wirecert.Retire(dir, rotDeployment)
+	err = wirecert.Retire(t.Context(), dir, rotDeployment)
 	if err == nil {
 		t.Fatal("retiring unlinked an authority that is not the generation this rotation " +
 			"replaced")
@@ -1104,7 +1104,7 @@ func TestTheGenerationClaimIsMatchedExactlyAndNotApproximately(t *testing.T) {
 				t.Fatalf("the re-signed authority does not load, so this stages nothing: %v", err)
 			}
 
-			if err := wirecert.Retire(dir, rotDeployment); err == nil {
+			if err := wirecert.Retire(t.Context(), dir, rotDeployment); err == nil {
 				t.Error("a claim that only resembles the previous authority's fingerprint " +
 					"authorised unlinking its key")
 			}
@@ -1197,7 +1197,7 @@ func TestRetireStillFinishesARotationThatPredatesTheGenerationClaim(t *testing.T
 	putFile(t, caFile(t, dir, "ca-previous.crt"), readFile(t, caFile(t, older, "ca.crt")), 0o644)
 	putFile(t, caFile(t, dir, "ca-previous.key"), readFile(t, caFile(t, older, "ca.key")), 0o600)
 
-	if err := wirecert.Retire(dir, rotDeployment); err != nil {
+	if err := wirecert.Retire(t.Context(), dir, rotDeployment); err != nil {
 		t.Fatalf("an overlap left by an older billet cannot be finished: %v", err)
 	}
 
@@ -1280,7 +1280,7 @@ func TestRetiringACompleteRotationIsNotRefused(t *testing.T) {
 
 	dir, _, fresh := rotated(t)
 
-	if err := wirecert.Retire(dir, rotDeployment); err != nil {
+	if err := wirecert.Retire(t.Context(), dir, rotDeployment); err != nil {
 		t.Fatalf("retiring a completed rotation was refused: %v", err)
 	}
 

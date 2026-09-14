@@ -159,7 +159,7 @@ func TestRestoringTwiceChangesNothing(t *testing.T) {
 func TestABackupDuringARotationCarriesBothAuthorities(t *testing.T) {
 	src := newDeployment(t)
 
-	if _, err := wirecert.Rotate(src.stateDir, src.id); err != nil {
+	if _, err := wirecert.Rotate(t.Context(), src.stateDir, src.id); err != nil {
 		t.Fatalf("Rotate: %v", err)
 	}
 

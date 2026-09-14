@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "outcome": "refused",
+  "reason": "guard",
+  "why": "this host is not held by a converge guard (none: nothing claims this host); a retirement runs under this converge's guard",
+  "state": "nothing"
+}

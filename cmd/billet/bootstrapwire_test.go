@@ -482,7 +482,7 @@ func TestTheServedWireCarriesTheFleetOntoTheNewAuthority(t *testing.T) {
 		t.Fatalf("issue: %v", err)
 	}
 
-	fresh, err := wirecert.Rotate(stateDir, deploymentID)
+	fresh, err := wirecert.Rotate(t.Context(), stateDir, deploymentID)
 	if err != nil {
 		t.Fatalf("rotate: %v", err)
 	}

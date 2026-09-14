@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "outcome": "refused",
+  "reason": "journal",
+  "why": "no retirement journal exists on this host; an acknowledgement follows a journal at done",
+  "state": "nothing"
+}

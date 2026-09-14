@@ -18,13 +18,17 @@
 # development switch converge exactly the host role alone, so an inventory that
 # says nothing about them changes nothing by moving to this playbook.
 #
-# THE CONVERGE GUARD FIRST, IN EVERY PLAY. A converge restarts billet's services
-# and drains the node, which destroys the jobs on that host, including a deploy
-# job running the playbook from a runner billet manages. The host role refuses
-# that shape as its first task; the refusal is repeated here as the first task
-# of every play so that ssh_access, which runs before the host role, cannot
-# change a host before it fires. Tagged `always`, and applied `always` to the
-# included tasks, so a run under --tags cannot skip it.
+# THE EXCLUSION FIRST, IN EVERY PLAY. A converge restarts billet's services and
+# drains the node, which destroys the jobs on that host, including a deploy job
+# running the playbook from a runner billet manages; and a converge that
+# changes a host must not race a rollout's `billet host-upgrade` for the same
+# binaries. The host role's preparation refuses the first shape as its first
+# task and then HOLDS the host under the converge guard; it is repeated here as
+# the first task of every play so that ssh_access, which runs before the host
+# role, the connectors and the development role are all under it. The hold is
+# taken once per host and a later inclusion only re-classifies the claim.
+# Tagged `always`, and applied `always` to the included tasks, so a run under
+# --tags cannot skip it.
 #
 # THE INVENTORY DECLARES ALL THREE GROUPS, empty ones allowed (`macos: {hosts:
 # {}}`), which is what `billet init hybrid` and the examples write: a group a
@@ -36,10 +40,10 @@
   hosts: control_plane
   gather_facts: true
   pre_tasks:
-    - name: Refuse a converge that would destroy the job running it
+    - name: Prepare the exclusion before anything changes this host
       ansible.builtin.include_role:
         name: junioryono.billet.host
-        tasks_from: converge-guard
+        tasks_from: prepare-exclusion
         apply:
           tags: [always]
       tags: [always]
@@ -52,10 +56,10 @@
   hosts: linux
   gather_facts: true
   pre_tasks:
-    - name: Refuse a converge that would destroy the job running it
+    - name: Prepare the exclusion before anything changes this host
       ansible.builtin.include_role:
         name: junioryono.billet.host
-        tasks_from: converge-guard
+        tasks_from: prepare-exclusion
         apply:
           tags: [always]
       tags: [always]
@@ -71,10 +75,10 @@
   hosts: macos
   gather_facts: true
   pre_tasks:
-    - name: Refuse a converge that would destroy the job running it
+    - name: Prepare the exclusion before anything changes this host
       ansible.builtin.include_role:
         name: junioryono.billet.host
-        tasks_from: converge-guard
+        tasks_from: prepare-exclusion
         apply:
           tags: [always]
       tags: [always]

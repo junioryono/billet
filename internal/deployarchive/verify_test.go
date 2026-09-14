@@ -116,7 +116,7 @@ func TestARestoreHoldsTheAuthorityLock(t *testing.T) {
 		t.Fatalf("create the state dir: %v", err)
 	}
 
-	held, err := wirecert.LockAuthority(tgt.StateDir)
+	held, err := wirecert.LockAuthority(t.Context(), tgt.StateDir)
 	if err != nil {
 		t.Fatalf("LockAuthority: %v", err)
 	}
@@ -181,7 +181,7 @@ func TestAnAbandonHoldsTheAuthorityLock(t *testing.T) {
 
 	onPublish = nil
 
-	held, err := wirecert.LockAuthority(tgt.StateDir)
+	held, err := wirecert.LockAuthority(t.Context(), tgt.StateDir)
 	if err != nil {
 		t.Fatalf("LockAuthority: %v", err)
 	}

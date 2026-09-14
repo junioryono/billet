@@ -210,12 +210,25 @@ func runLocalRestore(ctx context.Context, o restoreOptions) error {
 
 	fmt.Println()
 
+	// AUTHORITY BEFORE DIRECTORY, the order every command takes them in now; a
+	// bare target is initialised under the lock beside it, borrowing the
+	// lifecycle lock this command already holds rather than refusing itself.
+	acc, err := openIdentityAccess(ctx, plan.Target.StateDir,
+		identityIntent{create: true, wait: identityAccessWait, lifecycleHeld: true})
+	if err != nil {
+		return err
+	}
+
 	res, err := deployarchive.Execute(ctx, deployarchive.RestoreRequest{
+		Authority:     acc.Lock(),
 		Plan:          plan,
 		InstallAppKey: installAppKey,
 		Now:           time.Now,
 		Actor:         actor(),
 	})
+	if rerr := acc.Release(); rerr != nil {
+		err = errors.Join(err, rerr)
+	}
 
 	printRestoreResult(res)
 

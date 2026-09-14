@@ -27,8 +27,15 @@ JAILER_DIR=/srv/jailer
 # is allowed here because an EC2 or Docker-only node does not use Ceph; `billet
 # check` remains the place that rejects an enabled Ceph configuration whose host
 # cannot satisfy it.
+# THE LOAD ITSELF IS OPTIONAL TOO. `modprobe -n` says the module resolves, not
+# that this kernel will load it: a locked-down or container host can refuse the
+# real load, and under `set -e` that would end an install for a host that may
+# not use Ceph at all.
 if command -v modprobe >/dev/null 2>&1 && modprobe -n rbd >/dev/null 2>&1; then
-    modprobe rbd
+    if ! modprobe rbd; then
+        echo "billet: the rbd module resolves but this kernel would not load it; a Ceph" >&2
+        echo "        configuration will be refused by \`billet check\` until it can." >&2
+    fi
 fi
 
 if ! getent group billet >/dev/null 2>&1; then
@@ -77,6 +84,31 @@ mkdir -p "${STATE_DIR}"
 chown root:root "${STATE_DIR}"
 chmod 0755 "${STATE_DIR}"
 
+# THE HOST IS PREPARED FOR THE AUTHORITY EXCLUSION HERE, AFTER ITS PARENT
+# EXISTS AND BEFORE ANY UNIT IS TOUCHED. `billet local prepare` records the
+# service account, creates the server's identity directory when it is absent
+# (so no metadata ever exists beside a missing directory), and provisions or
+# repairs both authority locks by descriptor. It authorises nothing: its answer
+# carries the published authority STATUS, and a closed one (a retired
+# controller) is what the unit decisions below refuse on. Run on install AND
+# on upgrade, because an installation prepared by an older package has neither
+# the record nor the global lock, and its first unprivileged restart would
+# otherwise meet a lock it cannot open. A binary that lacks the command is an
+# older billet being replaced; it says so and this script goes on.
+PREPARE_STATUS=absent
+if [ -x /usr/bin/billet ]; then
+    if prepared=$(/usr/bin/billet local prepare --json 2>&1); then
+        case "${prepared}" in
+            *'"closed":true'*) PREPARE_STATUS=closed ;;
+            *) PREPARE_STATUS=open ;;
+        esac
+    else
+        echo "billet: this host could not be prepared for the authority exclusion:" >&2
+        echo "        ${prepared}" >&2
+        echo "        Run \`billet local prepare\` as root once the cause is fixed." >&2
+    fi
+fi
+
 # CREATED RATHER THAN PACKAGED, so removing the package cannot erase a jail that
 # still holds guest state. The node unit makes this path writable through its
 # otherwise read-only filesystem view; a fresh Firecracker install therefore
@@ -95,22 +127,378 @@ chmod 0750 "${CONF_DIR}"
 # it, while the deployment identity and the App key survive separately. That
 # leaves a half-recoverable machine, which is the state all of this exists to
 # avoid. The template lives under /usr/share/billet and is copied here once.
-if [ ! -e "${CONF}" ]; then
-    if [ -e "${TEMPLATE}" ]; then
-        cp "${TEMPLATE}" "${CONF}"
-    else
-        # Loud, because the alternative is a machine with no config and nothing
-        # to say why.
-        echo "billet: ${TEMPLATE} is missing, so ${CONF} was not created." >&2
-        echo "        Copy billet.example.yaml there before starting billet." >&2
+# UNDER THE LIFECYCLE LOCK, WITH THE STATUS RE-READ THERE. Seeding a config and
+# enabling timers are decisions about the host's state, and a retirement running
+# on this host (or finishing between the prepare above and here) changes their
+# answer: an ABSENT config is a completed server-only retirement's postcondition,
+# not a gap to fill, and a retired controller's timers stay disabled. So every
+# such action runs inside the same flock `billet local up` and `local down`
+# hold, waits at most sixty seconds for it, and asks the status again inside.
+# On contention past the bound nothing is touched: a package install must not
+# fail a system upgrade for a lifecycle operation in flight, and the message
+# names what was left and the retry that performs it (the package's own
+# reconfiguration re-runs this script; `billet local up` needs a valid config
+# and an intended start, so it is not the retry for an unseeded host).
+LIFECYCLE_LOCK=/var/lock/billet-lifecycle.lock
+
+# remove_or_name removes a temporary file this script made, or says which one
+# it left. A filesystem that went read-only after the file was created is the
+# case: the removal fails, and a handler that discarded the status would leave
+# a stray beside a configuration or a lock with nothing said about it. It never
+# fails an install by itself; the caller decides what its answer means.
+remove_or_name() {
+    if rm -f "$1" 2>/dev/null; then
+        return 0
     fi
+
+    echo "billet: ${1} could not be removed and is still there; delete it." >&2
+
+    return 1
+}
+
+# EVERY MUTATION HERE CHECKS ITSELF, because nothing in this function is
+# covered by `set -e`: it runs inside a subshell that is an `if` condition, and
+# POSIX suspends errexit for a condition AND everything it calls. A copy onto a
+# full filesystem would otherwise leave a partial config and go on to enable
+# timers over it, with the install reporting success.
+seed_config() {
+    # A DANGLING SYMLINK IS NOT AN ABSENT CONFIGURATION. `-e` is false for one,
+    # and a copy onto it would write through to wherever it points, or fail and
+    # leave this script deleting a link somebody made on purpose.
+    if [ -L "${CONF}" ] && [ ! -e "${CONF}" ]; then
+        echo "billet: ${CONF} is a symlink to something that does not exist, so it was left" >&2
+        echo "        alone: point it at a configuration, or remove it and reinstall." >&2
+
+        return 1
+    fi
+
+    if [ ! -e "${CONF}" ]; then
+        if [ ! -e "${TEMPLATE}" ]; then
+            # Loud, because the alternative is a machine with no config and nothing
+            # to say why.
+            echo "billet: ${TEMPLATE} is missing, so ${CONF} was not created." >&2
+            echo "        Copy billet.example.yaml there before starting billet." >&2
+
+            return 1
+        fi
+
+        # THE COPY LANDS BESIDE THE NAME AND IS LINKED INTO IT, so nothing here
+        # ever removes a path it did not itself create, and a destination that
+        # appeared meanwhile is never overwritten: `ln` refuses an existing
+        # name, which is the whole point of seeding only what is absent.
+        seed_temp=$(mktemp "${CONF}.XXXXXX" 2>/dev/null) || seed_temp=
+
+        if [ -z "${seed_temp}" ]; then
+            echo "billet: no temporary file could be made beside ${CONF}, so it was not" >&2
+            echo "        created." >&2
+
+            return 1
+        fi
+
+        # AN INTERRUPTION LEAVES NOTHING BEHIND EITHER. This runs inside the
+        # lock's own subshell, so the traps are scoped to it; the INT and TERM
+        # handlers END that shell, because a handler that returned would have
+        # the seeding carry on as though the signal had not arrived. Every way
+        # out below clears them, so nothing of this is left installed.
+        trap 'remove_or_name "${seed_temp}"; exit 130' INT
+        trap 'remove_or_name "${seed_temp}"; exit 143' TERM
+        trap 'remove_or_name "${seed_temp}"' EXIT
+
+        # -T SO AN EXISTING NAME IS ALWAYS REFUSED: without it, a destination
+        # that became a directory under this run would have the temporary file
+        # published INSIDE it, and `ln` would report success.
+        if ! cp "${TEMPLATE}" "${seed_temp}" || ! chown root:billet "${seed_temp}" ||
+            ! chmod 0640 "${seed_temp}" || ! ln -T -- "${seed_temp}" "${CONF}"; then
+            echo "billet: ${TEMPLATE} could not be installed at ${CONF}, which is left as it" >&2
+            echo "        was." >&2
+
+            remove_or_name "${seed_temp}" || true
+
+            trap - EXIT INT TERM
+
+            return 1
+        fi
+
+        # THE SECOND LINK IS THIS SCRIPT'S OWN, and a removal that fails leaves
+        # the configuration published under two names, which is said rather
+        # than reported as a clean seeding.
+        if ! remove_or_name "${seed_temp}"; then
+            echo "        ${CONF} WAS seeded from it, so the configuration is published under" >&2
+            echo "        two names until that one is gone." >&2
+
+            trap - EXIT INT TERM
+
+            return 1
+        fi
+
+        trap - EXIT INT TERM
+
+        return 0
+    fi
+
+    if [ -e "${CONF}" ]; then
+        # A NAME THAT IS NOT A CONFIGURATION IS NOT GIVEN A CONFIGURATION'S
+        # OWNER AND MODE. `-e` is true for a directory, a fifo and a device, and
+        # the ownership below would succeed on each: 0640 on a directory makes
+        # it untraversable, and the install would report a clean seeding for a
+        # host whose configuration is not a file. A symlink to a regular file
+        # passes, since `-f` follows and pointing this name at a configuration
+        # is what the dangling-symlink refusal above tells an operator to do.
+        if [ ! -f "${CONF}" ]; then
+            echo "billet: ${CONF} exists and is not a regular file, so it was left alone and" >&2
+            echo "        given no owner or mode: billet reads its configuration from a file." >&2
+            echo "        Move whatever is there aside and reinstall." >&2
+
+            return 1
+        fi
+
+        # root owns it so an unprivileged process cannot edit what billet trusts;
+        # the billet group can read it or the service cannot start at all.
+        if ! chown root:billet "${CONF}" || ! chmod 0640 "${CONF}"; then
+            echo "billet: ${CONF} could not be given root:billet 0640; billet-server will not" >&2
+            echo "        read a configuration it cannot trust, so fix its owner and mode." >&2
+
+            return 1
+        fi
+    fi
+
+    return 0
+}
+
+enable_timers() {
+    # AN IMAGE BUILD OR A CHROOT HAS NO RUNNING SYSTEMD, and booting it does not
+    # re-run this scriptlet, so work skipped here is work nobody will do unless
+    # this says so.
+    if [ ! -d /run/systemd/system ]; then
+        echo "billet: systemd is not running (this looks like an image build or a chroot), so" >&2
+        echo "        billet-upgrade.timer and billet-images-refresh.timer were not enabled." >&2
+        echo "        Run \`systemctl enable --now billet-upgrade.timer billet-images-refresh.timer\`" >&2
+        echo "        on the booted host, or reinstall the package there." >&2
+
+        return 0
+    fi
+
+    # THE ONE EXCEPTION TO "THE PACKAGE ENABLES NOTHING". That rule keeps an
+    # install from connecting a machine to GitHub before billet.yaml says
+    # something true, and these two timers connect nothing: the upgrade timer
+    # acts only on a rollout the ledger already records, the images timer only
+    # on a node whose config names guest images, and both exit doing nothing
+    # under `release: {automatic: false}`. What they buy is a deployment that
+    # takes the update it decided on with nobody at a keyboard, which is the
+    # promise `release.automatic` makes by default. `systemctl disable --now`
+    # either one to opt this host out. NOT `|| exit`: a host whose systemd
+    # refuses the enable (a container image being built, say) must still finish
+    # installing.
+    for timer in billet-upgrade.timer billet-images-refresh.timer; do
+        if ! systemctl enable --now "${timer}" >/dev/null 2>&1; then
+            echo "billet: ${timer} could not be enabled; automatic updates on this host" >&2
+            echo "        need \`systemctl enable --now ${timer}\` once systemd is running." >&2
+        fi
+    done
+}
+
+# unit_decisions runs under the lifecycle lock. THE STATUS IS ASKED AGAIN HERE,
+# INSIDE THE EXCLUSION, AND ONLY A CURRENT ANSWER AUTHORISES ANYTHING: the
+# earlier answer was read before the lock and may be stale, and a preparation
+# that fails here (an unreadable status, a lock it could not take) proves
+# nothing about the host, so the decisions are deferred exactly as they are on
+# contention, with the same retry named. An install must not fail a system
+# upgrade for it, so this returns 0 either way.
+unit_decisions() {
+    if [ ! -x /usr/bin/billet ]; then
+        echo "billet: /usr/bin/billet is not executable, so the unit decisions were not made;" >&2
+        echo "        ${CONF} was not seeded and no timer was enabled. Re-run these decisions" >&2
+        echo "        with \`dpkg-reconfigure billet\` on a deb host, or by reinstalling the" >&2
+        echo "        package on an rpm one." >&2
+
+        return 0
+    fi
+
+    if ! again=$(/usr/bin/billet local prepare --json 2>&1); then
+        echo "billet: the authority status could not be re-read under the lifecycle lock, so" >&2
+        echo "        this install left ${CONF} unseeded (if it was absent) and billet-upgrade.timer" >&2
+        echo "        and billet-images-refresh.timer as they were:" >&2
+        echo "        ${again}" >&2
+        echo "        Automatic maintenance is DEFERRED on this host; once the cause is fixed," >&2
+        echo "        \`dpkg-reconfigure billet\` (or a reinstall) re-runs these decisions." >&2
+        return 0
+    fi
+
+    case "${again}" in
+        *'"closed":true'*)
+            echo "billet: this controller retired; its configuration is left absent and no unit" >&2
+            echo "        is enabled or started. A retired controller stays retired." >&2
+            return 0
+            ;;
+    esac
+
+    # THE SEEDING'S FAILURE IS CARRIED OUT, so the caller says what was left
+    # half-done rather than reporting a clean install; the timers are still
+    # attempted, because they are independent of the configuration and their
+    # own failures are already reported one by one.
+    seeded=0
+    seed_config || seeded=$?
+
+    enable_timers
+
+    return "${seeded}"
+}
+
+# lock_dir_ready prepares the lock's directory, or says it could not.
+#
+# `mkdir -p` FAILS ON A DANGLING SYMLINK, which is what /var/lock is on a
+# Fedora image with no tmpfs at /run/lock: the link exists, so mkdir answers
+# EEXIST and, under `set -e`, an ordinary package install dies in its %post
+# scriptlet (measured on fedora:42, 2026-09-12). What the link POINTS AT is
+# what has to be created, and a path that is still not a directory afterwards
+# is one this script declines to lock on rather than fail the install over.
+lock_dir_ready() {
+    dir=$(dirname "${LIFECYCLE_LOCK}")
+
+    if [ -d "${dir}" ]; then
+        return 0
+    fi
+
+    target=$(readlink -f "${dir}" 2>/dev/null || printf '%s' "${dir}")
+
+    mkdir -p "${target}" 2>/dev/null || true
+
+    [ -d "${dir}" ]
+}
+
+# lock_name_ordinary claims the lock's name and says whether it is one this
+# script may open.
+#
+# A FIFO AT THAT NAME WOULD HANG THE INSTALL. `>>` on a fifo with no reader
+# BLOCKS, and nothing after it — not `flock -w`, not any bound here — ever
+# runs; a device would be opened for what its driver does. What billet writes
+# there is a regular file, so an existing name that is anything else is one
+# this script declines to open at all.
+#
+# THE NAME IS CLAIMED BEFORE IT IS JUDGED, because the lock's directory is
+# world-writable on an ordinary host: /run/lock is 1777 (measured, ubuntu
+# 24.04), so any account can create this name first, and a name root owns
+# cannot be unlinked by another account in a sticky directory.
+#
+# THE CLAIM NEVER OPENS THE DESTINATION, and that is what makes it one step
+# rather than two. Any redirection opens: `> fifo` on a fifo that is already
+# there BLOCKS before noclobber's O_EXCL can refuse it (measured, ubuntu
+# 24.04), and an lstat placed in front of it to rule that out is a second
+# lookup another account can win between. `ln` links a NAME: it never opens
+# what is at the destination, so a fifo there cannot block it and an existing
+# name of any shape simply fails with EEXIST.
+#
+# THE RESIDUAL, STATED: a name that already exists and is root-owned is
+# trusted from its metadata, and shell cannot open it with O_NOFOLLOW and judge
+# the descriptor instead. Replacing such a file needs root.
+lock_name_ordinary() {
+    # THE CLAIM RUNS IN ITS OWN SUBSHELL so the cleanup it needs is a trap
+    # scoped to that shell and never left installed in the install's. The
+    # temporary file is root's, 0600, and made in the lock's own directory, so
+    # the link never crosses a filesystem; the EXIT trap removes it whether the
+    # link was taken or refused, and an interruption leaves nothing behind.
+    (
+        lock_temp=$(mktemp "${LIFECYCLE_LOCK}.XXXXXX" 2>/dev/null) || exit 0
+
+        trap 'remove_or_name "${lock_temp}"; exit 130' INT
+        trap 'remove_or_name "${lock_temp}"; exit 143' TERM
+        trap 'remove_or_name "${lock_temp}"' EXIT
+
+        chmod 0600 "${lock_temp}" 2>/dev/null || true
+        ln -T -- "${lock_temp}" "${LIFECYCLE_LOCK}" 2>/dev/null || true
+    )
+
+    # WHAT IS THERE NOW, whether this claimed it or found it: a regular file,
+    # not a link to one, owned by root — which in a sticky directory no other
+    # account can unlink and replace.
+    [ -f "${LIFECYCLE_LOCK}" ] || return 1
+    [ ! -L "${LIFECYCLE_LOCK}" ] || return 1
+
+    owner=$(stat -c '%u' "${LIFECYCLE_LOCK}" 2>/dev/null) || return 1
+
+    [ "${owner}" = "0" ]
+}
+
+# The statuses lock_and_decide answers with, beside 0 for work performed.
+LOCK_HELD=66
+LOCK_UNUSABLE=67
+# DECISIONS_INCOMPLETE is not a deferral: the lock was taken and the work ran,
+# and something in it failed with its own diagnostic already printed.
+DECISIONS_INCOMPLETE=68
+
+# lock_and_decide runs the unit decisions under the lifecycle lock, IN A
+# SUBSHELL that holds the descriptor for its whole life.
+#
+# THE OPEN IS INSIDE IT BECAUSE A FAILED REDIRECTION ON `exec` ENDS THE SHELL
+# IT RUNS IN, and that shell must not be the install's: a filesystem that went
+# read-only between a probe and the open would otherwise take the scriptlet
+# down instead of deferring. One descriptor, opened once, used by the flock and
+# by nothing else, so there is no window between a check and its use.
+lock_and_decide() (
+    exec 9>>"${LIFECYCLE_LOCK}" || exit "${LOCK_UNUSABLE}"
+
+    # -E SEPARATES CONTENTION FROM FAILURE: with it, 66 means the wait ended
+    # with somebody else holding the lock, and any other non-zero status is
+    # flock saying it could not lock at all — a filesystem that does not
+    # support it, say — which waiting cannot fix.
+    # THE VERDICT IS CAPTURED FROM THE COMMAND, not from the `if` around it:
+    # `$?` after an `if` whose condition FAILED is the if statement's own
+    # status, which POSIX makes zero, so contention read as a failure to lock
+    # at all (probed in fedora:42, 2026-09-12).
+    status=0
+    flock -w 60 -E "${LOCK_HELD}" 9 || status=$?
+
+    if [ "${status}" -eq 0 ]; then
+        decided=0
+        unit_decisions || decided=$?
+
+        if [ "${decided}" -ne 0 ]; then
+            exit "${DECISIONS_INCOMPLETE}"
+        fi
+
+        exit 0
+    fi
+
+    if [ "${status}" -eq "${LOCK_HELD}" ]; then
+        exit "${LOCK_HELD}"
+    fi
+
+    exit "${LOCK_UNUSABLE}"
+)
+
+deferred=0
+
+if command -v flock >/dev/null 2>&1 && lock_dir_ready && lock_name_ordinary; then
+    if lock_and_decide; then
+        deferred=0
+    else
+        deferred=$?
+    fi
+else
+    deferred="${LOCK_UNUSABLE}"
 fi
 
-if [ -e "${CONF}" ]; then
-    # root owns it so an unprivileged process cannot edit what billet trusts;
-    # the billet group can read it or the service cannot start at all.
-    chown root:billet "${CONF}"
-    chmod 0640 "${CONF}"
+if [ "${deferred}" -ne 0 ]; then
+    echo "billet: the unit decisions did not complete, so ${CONF} may not be seeded and" >&2
+    echo "        billet-upgrade.timer and billet-images-refresh.timer may be as they were." >&2
+
+    if [ "${deferred}" -eq "${DECISIONS_INCOMPLETE}" ]; then
+        echo "        Part of that work FAILED rather than being deferred; its own message is" >&2
+        echo "        above, and this host is left needing it done by hand." >&2
+    elif [ "${deferred}" -eq "${LOCK_HELD}" ]; then
+        echo "        A billet lifecycle operation holds ${LIFECYCLE_LOCK}; it may be a drain," >&2
+        echo "        which takes as long as the work already on this host." >&2
+    elif ! command -v flock >/dev/null 2>&1; then
+        echo "        flock(1) is missing; install util-linux." >&2
+    else
+        echo "        ${LIFECYCLE_LOCK} could not be locked. Its directory is" >&2
+        echo "        $(readlink -f "$(dirname "${LIFECYCLE_LOCK}")" 2>/dev/null || dirname "${LIFECYCLE_LOCK}")," >&2
+        echo "        which must exist and be writable by root, and the lock itself must be a" >&2
+        echo "        regular file on a filesystem that supports locking." >&2
+    fi
+
+    echo "        Once that is so, re-run these decisions: \`dpkg-reconfigure billet\` on a" >&2
+    echo "        deb host, or reinstalling the package on an rpm one." >&2
 fi
 
 # THE APP KEY IS OWNED BY THE SERVICE USER AT 0600, and it is the one file here
@@ -130,24 +518,6 @@ fi
 if [ -d /run/systemd/system ]; then
     systemctl daemon-reload || true
 
-    # THE ONE EXCEPTION TO "THE PACKAGE ENABLES NOTHING". That rule keeps an
-    # install from connecting a machine to GitHub before billet.yaml says
-    # something true, and these two timers connect nothing: the upgrade timer
-    # acts only on a rollout the ledger already records, the images timer only
-    # on a node whose config names guest images, and both exit doing nothing
-    # under `release: {automatic: false}`. What they buy is a deployment that
-    # takes the update it decided on with nobody at a keyboard, which is the
-    # promise `release.automatic` makes by default. `systemctl disable --now`
-    # either one to opt this host out. NOT `|| exit`: a host whose systemd
-    # refuses the enable (a container image being built, say) must still finish
-    # installing.
-    for timer in billet-upgrade.timer billet-images-refresh.timer; do
-        if ! systemctl enable --now "${timer}" >/dev/null 2>&1; then
-            echo "billet: ${timer} could not be enabled; automatic updates on this host" >&2
-            echo "        need \`systemctl enable --now ${timer}\` once systemd is running." >&2
-        fi
-    done
-
     # A DROP-IN CAN OUTLIVE THE ASSUMPTION IT WAS WRITTEN UNDER. These units
     # are Type=notify: the service is ready when billet's MAIN process sends
     # READY=1, so an override whose ExecStart wraps billet in something that
@@ -157,7 +527,17 @@ if [ -d /run/systemd/system ]; then
     # which is a long way from the change that caused it. Say so at install
     # time, where the operator is already looking.
     for unit in billet-server.service billet-node.service; do
-        dropins=$(systemctl show --property=DropInPaths --value "${unit}" 2>/dev/null || true)
+        # A FAILED ASK IS NOT "NO OVERRIDES": the status and the diagnostic both
+        # go to /dev/null, so a systemd that could not answer would look exactly
+        # like a clean unit and this warning would never be printed.
+        if ! dropins=$(systemctl show --property=DropInPaths --value "${unit}" 2>/dev/null); then
+            echo "billet: systemd could not be asked whether ${unit} has drop-in overrides," >&2
+            echo "        so this install did not check for one that breaks readiness. Run" >&2
+            echo "        \`systemctl show --property=DropInPaths ${unit}\` once it answers." >&2
+
+            continue
+        fi
+
         if [ -n "${dropins}" ]; then
             echo "billet: ${unit} has drop-in overrides: ${dropins}" >&2
             echo "        This unit reports readiness through sd_notify from its main" >&2

@@ -236,7 +236,7 @@ func cmdNodesPending(ctx context.Context, args []string) error {
 // THE FINGERPRINT IS REQUIRED, and that is the whole security of this command.
 // Approving by name alone approves whatever currently holds the name; approving
 // by fingerprint approves the machine whose key an operator actually compared.
-func cmdNodesDecide(ctx context.Context, args []string, decision string) error {
+func cmdNodesDecide(ctx context.Context, args []string, decision string) (err error) {
 	fs := newFlagSet("billet nodes " + decision)
 	cfgPath := addConfigFlag(fs)
 	fingerprint := fs.String("fingerprint", "",
@@ -252,6 +252,28 @@ func cmdNodesDecide(ctx context.Context, args []string, decision string) error {
 			"about, and without it you would be deciding about whatever currently holds the name")
 	}
 
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		return err
+	}
+
+	if cfg.Server == nil {
+		return errors.New("this command runs on the control plane, and this config has no server section")
+	}
+
+	// THE EXCLUSION BEFORE THE FIRST IDENTITY ACCESS, WHICH IS THE LEDGER OPEN:
+	// the state opener creates the identity directory and its lock on first use,
+	// as do the identity and authority reads below, and a retirement renames
+	// what they would create into. Held for the whole decision, so nothing here
+	// opens or writes after a closure that arrived mid-way, and released last,
+	// handing back what root created.
+	acc, err := openIdentityAccess(ctx, cfg.Server.IdentityDir, identityIntent{create: true, wait: identityAccessWait})
+	if err != nil {
+		return err
+	}
+
+	defer func() { err = errors.Join(err, acc.Release()) }()
+
 	a, closeDB, err := controlPlaneAllocator(ctx, *cfgPath)
 	if err != nil {
 		return err
@@ -262,11 +284,6 @@ func cmdNodesDecide(ctx context.Context, args []string, decision string) error {
 	certPEM := ""
 
 	if decision == alloc.EnrollApproved {
-		cfg, err := config.Load(*cfgPath)
-		if err != nil {
-			return err
-		}
-
 		deployment, err := state.DeploymentID(cfg.Server.IdentityDir)
 		if err != nil {
 			return err
@@ -820,13 +837,20 @@ func cmdCARotate(ctx context.Context, args []string) error {
 		return errors.New("rotating is done on the control plane, and this config has no server section")
 	}
 
-	deployment, err := state.DeploymentID(cfg.Server.IdentityDir)
+	acc, err := openIdentityAccess(ctx, cfg.Server.IdentityDir, identityIntent{wait: identityAccessWait})
 	if err != nil {
 		return err
 	}
 
-	ca, err := wirecert.Rotate(cfg.Server.IdentityDir, deployment)
+	deployment, err := state.DeploymentID(cfg.Server.IdentityDir)
 	if err != nil {
+		return errors.Join(err, acc.Release())
+	}
+
+	// UNDER THE LOCK THE COMMAND ALREADY HOLDS, released before the publication
+	// below takes its own.
+	ca, err := wirecert.RotateWith(acc.Lock(), cfg.Server.IdentityDir, deployment)
+	if err := errors.Join(err, acc.Release()); err != nil {
 		return err
 	}
 
@@ -904,12 +928,17 @@ func cmdCARetire(ctx context.Context, args []string) error {
 	// THIS deployment's — a coherent authority belonging to somebody else is one
 	// LoadOrCreateCA will not start on, so the previous pair beside it is the
 	// only authority here that means anything.
-	deployment, err := state.DeploymentID(cfg.Server.IdentityDir)
+	acc, err := openIdentityAccess(ctx, cfg.Server.IdentityDir, identityIntent{wait: identityAccessWait})
 	if err != nil {
 		return err
 	}
 
-	if err := wirecert.Retire(cfg.Server.IdentityDir, deployment); err != nil {
+	deployment, err := state.DeploymentID(cfg.Server.IdentityDir)
+	if err != nil {
+		return errors.Join(err, acc.Release())
+	}
+
+	if err := errors.Join(wirecert.RetireWith(acc.Lock(), cfg.Server.IdentityDir, deployment), acc.Release()); err != nil {
 		return err
 	}
 

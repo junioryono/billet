@@ -77,9 +77,15 @@ var errNotImplemented = errors.New("not implemented yet")
 type exitError struct {
 	code int
 	msg  string
+	// err is the cause when a status is being given to one, so `errors.Is` and
+	// `errors.As` still reach it: a refusal that carries its own exit code is
+	// still the refusal it was, and callers match on its type.
+	err error
 }
 
 func (e *exitError) Error() string { return e.msg }
+
+func (e *exitError) Unwrap() error { return e.err }
 
 // exitStatus is what the process exits with for an error.
 //
@@ -109,6 +115,12 @@ func main() {
 		if errors.Is(err, flag.ErrHelp) {
 			// Explicit -h is a successful request for help, not a usage error.
 			os.Exit(0)
+		}
+
+		// A QUIET EXIT carries a child's status whose output was already
+		// passed through: nothing more is printed.
+		if coded, ok := errors.AsType[*exitError](err); ok && coded.msg == "" {
+			os.Exit(coded.code)
 		}
 
 		fmt.Fprintf(os.Stderr, "billet: %v\n", err)
@@ -156,6 +168,8 @@ func commands(lc *lifecycle) []command {
 			cmdRollout},
 		{"host-upgrade", "replace billet on THIS machine transactionally, with rollback",
 			cmdHostUpgrade},
+		{"converge-guard", "hold the upgrade root's one claim for a converge, so no transaction " +
+			"moves this host under it", cmdConvergeGuard},
 		{"release", "record which signed manifest produced the billet installed here",
 			cmdRelease},
 		{"acceptance", "stand an ISOLATED deployment up beside this one, run a real job on " +
@@ -298,6 +312,12 @@ func addConfigFlag(fs *flag.FlagSet) *string {
 }
 
 func cmdServer(ctx context.Context, lc *lifecycle, args []string) error {
+	// `billet server retire` is a controller's retirement, an operator command
+	// that runs under a converge guard; it never starts the plane.
+	if len(args) > 0 && args[0] == "retire" {
+		return cmdServerRetire(ctx, args[1:])
+	}
+
 	fs := newFlagSet("billet server")
 	cfgPath := addConfigFlag(fs)
 	dryRun := fs.Bool("dry-run", false,
@@ -524,9 +544,17 @@ func runServer(
 	//
 	// FOUNDED HERE IN THE ORDINARY CASE, before the database is opened. Whichever
 	// role starts first mints it; the other reads that same file.
-	deployment, err := state.DeploymentID(cfg.Server.IdentityDir)
+	// THE EXCLUSION AROUND THE IDENTITY READ AND THE OPEN, released before the
+	// claim's wait (a standby can wait for days, and a backup must not wait with
+	// it) and taken again after promotion around the authority load.
+	acc, err := serverIdentityAccess(ctx, cfg.Server.IdentityDir)
 	if err != nil {
 		return err
+	}
+
+	deployment, err := state.DeploymentID(cfg.Server.IdentityDir)
+	if err != nil {
+		return errors.Join(err, acc.Release())
 	}
 
 	// A STANDBY OPENS A HANDLE THAT CANNOT WRITE, which is what makes "does
@@ -545,7 +573,9 @@ func runServer(
 		db, err = openState(ctx, cfg)
 	}
 
-	if err != nil {
+	// THE ACCESS ENDS WITH THE OPEN, whatever the open said: what follows waits
+	// on the claim, and nothing waits on a lock while it does.
+	if err := errors.Join(err, acc.Release()); err != nil {
 		return fmt.Errorf("server state: %w", err)
 	}
 
@@ -1013,9 +1043,17 @@ func serveNodeWire(
 	addr := cfg.Server.Listen
 	loopback := nodeplane.LoopbackOnly(addr)
 
-	deployment, err := state.DeploymentID(cfg.Server.IdentityDir)
+	// THE ACCESS AGAIN, AFTER PROMOTION: the authority load below reads (and
+	// on first use creates) the CA, and a retirement of this host cannot be
+	// running while the server it stops first is here, but a rotation can.
+	acc, err := serverIdentityAccess(ctx, cfg.Server.IdentityDir)
 	if err != nil {
 		return nil, err
+	}
+
+	deployment, err := state.DeploymentID(cfg.Server.IdentityDir)
+	if err != nil {
+		return nil, errors.Join(err, acc.Release())
 	}
 
 	var (
@@ -1055,7 +1093,7 @@ func serveNodeWire(
 		Enrollments: enrollments,
 		CachePolicy: cachePolicy,
 	})
-	if err != nil {
+	if err := errors.Join(err, acc.Release()); err != nil {
 		return nil, err
 	}
 
@@ -1489,6 +1527,18 @@ func nodeBundle(cfg *config.Config) (*wirecert.Bundle, error) {
 }
 
 func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
+	// THE NODE'S OWN SUBCOMMANDS, before the role's flags: the endpoint
+	// migration and the receipt are commands about the node this host runs,
+	// invoked by the role and never by the service.
+	if len(args) > 0 {
+		switch args[0] {
+		case "migrate-endpoint":
+			return cmdNodeMigrate(ctx, args[1:])
+		case "receipt":
+			return cmdNodeReceipt(ctx, args[1:])
+		}
+	}
+
 	fs := newFlagSet("billet node")
 	cfgPath := addConfigFlag(fs)
 	enroll := fs.Bool("enroll", false,
@@ -1607,11 +1657,7 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 		tlsConf = identity.ClientTLS(host)
 	}
 
-	client, err := nodeclient.New(nodeclient.Options{
-		Base: cfg.Node.ServerAddr,
-		Node: cfg.Node.Name,
-		TLS:  tlsConf,
-	})
+	client, err := newNodeClientFor(cfg, tlsConf)
 	if err != nil {
 		return err
 	}
@@ -1711,6 +1757,22 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 		DrainTimeout:              drainTimeout,
 		// The second signal, reaching the wait that honours it.
 		Hurry: lc.hurry,
+		// Where the node publishes its registration record after every accepted
+		// registration, for the inspector to read: the one spelling, empty on a
+		// Mac.
+		RegistrationRecordPath: nodeRegistrationRecordPath(hostOS),
+	})
+}
+
+// newNodeClientFor is THE ONE CONSTRUCTION of the node's client from its
+// configuration: the address, the name and the TLS state as the command
+// resolves them, so a fixture that builds the client the way the command does
+// and the command itself cannot disagree about the request base.
+func newNodeClientFor(cfg *config.Config, tlsConf *tls.Config) (*nodeclient.Client, error) {
+	return nodeclient.New(nodeclient.Options{
+		Base: cfg.Node.ServerAddr,
+		Node: cfg.Node.Name,
+		TLS:  tlsConf,
 	})
 }
 
@@ -2318,7 +2380,7 @@ func cmdCA(ctx context.Context, args []string) error {
 	case "retire":
 		return cmdCARetire(ctx, args[1:])
 	case "show":
-		return cmdCAShow(args[1:])
+		return cmdCAShow(ctx, args[1:])
 	case "sync":
 		return cmdCASync(ctx, args[1:])
 	}
@@ -2474,7 +2536,7 @@ func serialFromCert(path string) (string, error) {
 	return wirecert.Serial(cert), nil
 }
 
-func cmdCAIssue(ctx context.Context, args []string) error {
+func cmdCAIssue(ctx context.Context, args []string) (err error) {
 	fs := newFlagSet("billet ca issue")
 	cfgPath := addConfigFlag(fs)
 	out := fs.String("out", "", "directory to write the bundle to (default ./<node>-billet-tls)")
@@ -2522,6 +2584,17 @@ func cmdCAIssue(ctx context.Context, args []string) error {
 		return fmt.Errorf("%s has no server section, so it does not hold a certificate "+
 			"authority; run this on the control plane", *cfgPath)
 	}
+
+	// HELD THROUGH THE LEDGER RECORD BELOW, not released after the authority
+	// load: `recordIssued` opens the ledger, which creates the directory and its
+	// lock on first use, and an issue interrupted by a closure between the load
+	// and the record would otherwise open a directory a retirement had moved.
+	acc, err := openIdentityAccess(ctx, cfg.Server.IdentityDir, identityIntent{create: true, wait: identityAccessWait})
+	if err != nil {
+		return err
+	}
+
+	defer func() { err = errors.Join(err, acc.Release()) }()
 
 	deployment, err := state.DeploymentID(cfg.Server.IdentityDir)
 	if err != nil {
@@ -2676,7 +2749,7 @@ func recordIssued(ctx context.Context, cfgPath, name string, bundle wirecert.Bun
 	return nil
 }
 
-func cmdCAShow(args []string) error {
+func cmdCAShow(ctx context.Context, args []string) error {
 	fs := newFlagSet("billet ca show")
 	cfgPath := addConfigFlag(fs)
 
@@ -2694,13 +2767,18 @@ func cmdCAShow(args []string) error {
 			"authority", *cfgPath)
 	}
 
-	deployment, err := state.DeploymentID(cfg.Server.IdentityDir)
+	acc, err := openIdentityAccess(ctx, cfg.Server.IdentityDir, identityIntent{create: true, wait: identityAccessWait})
 	if err != nil {
 		return err
 	}
 
-	ca, err := wirecert.LoadOrCreateCA(cfg.Server.IdentityDir, deployment)
+	deployment, err := state.DeploymentID(cfg.Server.IdentityDir)
 	if err != nil {
+		return errors.Join(err, acc.Release())
+	}
+
+	ca, err := wirecert.LoadOrCreateCA(cfg.Server.IdentityDir, deployment)
+	if err := errors.Join(err, acc.Release()); err != nil {
 		return err
 	}
 
@@ -2815,6 +2893,11 @@ func cmdStatus(ctx context.Context, args []string) error {
 	// a node reporting nothing. `billet rollout status` is the full picture; this
 	// is what says to go and look at it.
 	printRollout(ctx, db)
+
+	// AND THE HOST'S OWN GUARD, read from this host's upgrade root and never
+	// from the ledger: a converge holding this host is why a rollout is refusing
+	// to move it.
+	printGuard()
 
 	// AND WHO THE DEPLOYMENT'S CONTROLLER IS, because the epoch beside it is a
 	// fence rather than a note. Every write is refused once that number moves, so

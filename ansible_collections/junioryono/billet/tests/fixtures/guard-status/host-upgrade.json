@@ -1,0 +1,5 @@
+{
+  "active": "host-upgrade",
+  "target": "/var/lib/billet/upgrades/recovery-x",
+  "dangling": true
+}

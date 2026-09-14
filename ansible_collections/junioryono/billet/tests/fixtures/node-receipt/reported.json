@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "outcome": "reported",
+  "receipt": {
+    "schema": 1,
+    "run": "",
+    "node": "node-a",
+    "deployment": "dddddddddddddddddddddddddddddddd",
+    "installed_sha256": "abababababababababababababababababababababababababababababababab",
+    "installed_endpoint": "http://127.0.0.1:7719",
+    "effective_endpoint": "http://127.0.0.1:7719",
+    "invocation_id": "abcdefabcdefabcdefabcdefabcdefab",
+    "incarnation": "ffeeddccbbaa99887766554433221100",
+    "written_at": "2026-09-10T12:00:00.5Z"
+  },
+  "why": "a dry run writes no receipt; this is what a converge would write"
+}

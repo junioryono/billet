@@ -52,10 +52,12 @@ for play in plays:
     pre = play.get("pre_tasks") or []
     first = pre[0] if pre else {}
     guard = first.get("ansible.builtin.include_role") or first.get("include_role") or {}
-    if guard.get("name") != "junioryono.billet.host" or guard.get("tasks_from") != "converge-guard":
-        sys.exit(f"fleet-playbook-check: the {play['hosts']} play's first pre_task is not the converge guard")
+    # THE EXCLUSION'S PREPARATION, whose own first task is the converge guard's
+    # import: the guard fires first, and the host is held before ssh_access.
+    if guard.get("name") != "junioryono.billet.host" or guard.get("tasks_from") != "prepare-exclusion":
+        sys.exit(f"fleet-playbook-check: the {play['hosts']} play's first pre_task is not the exclusion's preparation (tasks_from: prepare-exclusion)")
     if first.get("tags") != ["always"] or (guard.get("apply") or {}).get("tags") != ["always"]:
-        sys.exit(f"fleet-playbook-check: the {play['hosts']} play's guard is not tagged always on the include and on what it includes; a run under --tags could skip it")
+        sys.exit(f"fleet-playbook-check: the {play['hosts']} play's preparation is not tagged always on the include and on what it includes; a run under --tags could skip it")
     roles = [r["role"] if isinstance(r, dict) else r for r in play.get("roles", [])]
     if roles != want[play["hosts"]]:
         sys.exit(f"fleet-playbook-check: the {play['hosts']} play runs {roles}, want {want[play['hosts']]}")
@@ -133,10 +135,14 @@ for host in cp-1 node-1; do
     if grep -q '^TASK \[junioryono.billet.ssh_access' "$work/out.log"; then
         echo "FAIL: $host: an ssh_access task ran before the guard" >&2; exit 1
     fi
-    # The guard itself did run: its own header is what proves the refusal came
-    # from the play's pre_task and not from a missing role or a parse error.
-    if ! grep -q '^TASK \[Refuse a converge that would destroy the job running it\]' "$work/out.log"; then
-        echo "FAIL: $host: the pre_task guard header is missing; the refusal came from somewhere else" >&2; exit 1
+    # The preparation itself did run, and the guard inside it: their headers
+    # are what prove the refusal came from the play's pre_task and not from a
+    # missing role or a parse error.
+    if ! grep -q '^TASK \[Prepare the exclusion before anything changes this host\]' "$work/out.log"; then
+        echo "FAIL: $host: the pre_task preparation header is missing; the refusal came from somewhere else" >&2; exit 1
+    fi
+    if ! grep -q '^TASK \[junioryono.billet.host : Refuse a converge driven from a billet-managed runner\]' "$work/out.log"; then
+        echo "FAIL: $host: the guard's own header is missing from the preparation" >&2; exit 1
     fi
     echo "ok   $host: the guard refuses before ssh_access changes anything"
 done

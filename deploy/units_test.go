@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/deploy"
 )
@@ -452,6 +453,77 @@ func TestTheImageRefreshUnitIsAPersistentDailyTimerRunAsRoot(t *testing.T) {
 	} {
 		if !strings.Contains(deploy.ImagesRefreshTimer, want) {
 			t.Errorf("%s does not carry %q", deploy.ImagesRefreshTimerName, want)
+		}
+	}
+}
+
+// THE NODE DECLARES ITS TWO RUNTIME DIRECTORIES ONCE, IN [Service], AND THE
+// SERVER DECLARES NONE. The registration record lives under
+// billet/registration; a second assignment or a later empty one would reset
+// the list, a placement under [Unit] would be ignored, a RuntimeDirectoryPreserve
+// other than no would keep a record across a restart (the empty directory at a
+// start is what the inspector's currency rule rests on), and a server unit
+// declaring the same directory would re-own and remove the node's record.
+func TestTheNodeUnitDeclaresItsRuntimeDirectoriesAndTheServerDeclaresNone(t *testing.T) {
+	const want = "RuntimeDirectory=billet/locks billet/registration"
+
+	lines := strings.Split(deploy.NodeUnit, "\n")
+	section := ""
+
+	var declared []string
+	var preserve []string
+
+	for _, line := range lines {
+		switch {
+		case strings.HasPrefix(line, "["):
+			section = line
+		case strings.HasPrefix(line, "RuntimeDirectory="):
+			declared = append(declared, section+" "+line)
+		case strings.HasPrefix(line, "RuntimeDirectoryPreserve="):
+			preserve = append(preserve, strings.TrimPrefix(line, "RuntimeDirectoryPreserve="))
+		}
+	}
+
+	if len(declared) != 1 || declared[0] != "[Service] "+want {
+		t.Errorf("%s declares %q, want exactly one %q in [Service]", deploy.NodeUnitName, declared, want)
+	}
+
+	if len(preserve) > 1 || (len(preserve) == 1 && preserve[0] != "no") {
+		t.Errorf("%s sets RuntimeDirectoryPreserve=%v; only an absent or a `no` keeps the directory empty at a start", deploy.NodeUnitName, preserve)
+	}
+
+	if strings.Contains(deploy.ServerUnit, "RuntimeDirectory") {
+		t.Errorf("%s declares a RuntimeDirectory; a server declaring the node's would re-own and remove its record", deploy.ServerUnitName)
+	}
+}
+
+// THE CONSTANTS ARE THE UNITS' OWN BOUNDS: a caller that starts or stops a
+// unit under deploy.UnitStartTimeout or deploy.UnitStopTimeout waits exactly
+// as long as systemd would, plus its own margin, and a unit edited without
+// the constant following it fails here.
+func TestTheUnitBoundConstantsAreTheUnitsOwn(t *testing.T) {
+	for _, pair := range []struct{ what, unit string }{
+		{"node", deploy.NodeUnit},
+		{"server", deploy.ServerUnit},
+	} {
+		if got := time.Duration(timeoutStopSec(t, pair.what, pair.unit)) * time.Second; got != deploy.UnitStopTimeout {
+			t.Errorf("the %s unit's TimeoutStopSec is %s and deploy.UnitStopTimeout is %s", pair.what, got,
+				deploy.UnitStopTimeout)
+		}
+
+		m := regexp.MustCompile(`(?m)^TimeoutStartSec=(\d+)$`).FindStringSubmatch(pair.unit)
+		if m == nil {
+			t.Fatalf("the %s unit has no TimeoutStartSec", pair.what)
+		}
+
+		n, err := strconv.Atoi(m[1])
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if got := time.Duration(n) * time.Second; got != deploy.UnitStartTimeout {
+			t.Errorf("the %s unit's TimeoutStartSec is %s and deploy.UnitStartTimeout is %s", pair.what, got,
+				deploy.UnitStartTimeout)
 		}
 	}
 }

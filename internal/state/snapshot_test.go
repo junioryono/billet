@@ -314,7 +314,10 @@ func TestRefuseUnknownVersionsIsTheSameRuleTheMigratorApplies(t *testing.T) {
 		t.Fatal("a migration from a newer billet was accepted")
 	}
 
-	if !strings.Contains(err.Error(), "newer version") {
+	// THE TYPE, NOT THE WORDS: a caller that must keep going on an older host
+	// tells this from a fault by the sentinel, and the sentence it carries says
+	// the same thing to a person.
+	if !errors.Is(err, ErrSchemaAhead) || !strings.Contains(err.Error(), "newer billet") {
 		t.Errorf("the refusal does not say a newer billet wrote it: %v", err)
 	}
 

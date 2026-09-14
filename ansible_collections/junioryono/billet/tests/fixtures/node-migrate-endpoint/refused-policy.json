@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "outcome": "refused",
+  "reason": "policy",
+  "why": "billet-node.service has KillMode=process, under which a stop proves nothing about the processes that remain; only mixed or control-group is migrated",
+  "state": "nothing"
+}

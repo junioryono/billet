@@ -78,7 +78,7 @@ func cmdCASync(ctx context.Context, args []string) error {
 					"replaces the store's copy either way")
 		}
 
-		if err := withAuthorityLock(cfg, log, func(dir string) error {
+		if err := withAuthorityLock(ctx, cfg, log, func(dir string) error {
 			return wireshare.Publish(ctx, store, dir, deployment)
 		}); err != nil {
 			return err
@@ -93,7 +93,7 @@ func cmdCASync(ctx context.Context, args []string) error {
 
 	var adopted wireshare.Adopted
 
-	if err := withAuthorityLock(cfg, log, func(dir string) error {
+	if err := withAuthorityLock(ctx, cfg, log, func(dir string) error {
 		var err error
 		adopted, err = wireshare.Adopt(ctx, store, dir, deployment, *force)
 

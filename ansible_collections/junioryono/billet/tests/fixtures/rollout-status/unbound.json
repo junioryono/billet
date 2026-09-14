@@ -1,0 +1,11 @@
+{
+  "deployment": {
+    "bound": false,
+    "id": ""
+  },
+  "nodes": [],
+  "registrations": [],
+  "retirement": null,
+  "rollout": null,
+  "schema": 1
+}
