@@ -342,7 +342,8 @@ func TestASettledRetirementRepublishesAStatusThatWentMissing(t *testing.T) {
 	out, code := retiredRequest(t, f, requestRun)
 
 	m := retireAnswer(t, out)
-	if code != 0 || m["outcome"] != retireOutcomeUnchanged {
+	if code != 0 || m["outcome"] != retireOutcomeUnchanged || m["settled"] != true ||
+		m["state"] != string(retirement.PhaseDone) || m["row_done"] != true {
 		t.Fatalf("a converge over a retired host whose status went missing: %s", out)
 	}
 
@@ -355,6 +356,8 @@ func TestASettledRetirementRepublishesAStatusThatWentMissing(t *testing.T) {
 	if err != nil || presence != retirement.StatusPresent || st.Phase != retirement.PhaseDone {
 		t.Fatalf("the status on disk: %+v %d %v", st, presence, err)
 	}
+
+	expectRetire(t, out, code, "done-unchanged-republished", retireOutcomeUnchanged, "")
 }
 
 // A PROPERTY SYSTEMD DID NOT ANSWER IS COULD-NOT-TELL, never a refusal: a

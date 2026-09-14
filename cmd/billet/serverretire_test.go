@@ -210,6 +210,13 @@ func TestTheServerRetireFixturesAreTheCommandsOwn(t *testing.T) {
 		"dry-run-ordinary", "dry-run-hold-unreadable-row", "dry-run-hold-damaged-identity",
 		"dry-run-new-request", "dry-run-cancel", "dry-run-continue", "dry-run-unsupported-variant",
 		"dry-run-recovery-guard", "dry-run-recovery-legacy", "done-unchanged",
+		"dry-run-continue-stopped", "dry-run-continue-archived", "dry-run-continue-done-settled",
+		"dry-run-continue-done-unsettled", "dry-run-unsupported-variant-intent",
+		"dry-run-unsupported-variant-archived", "dry-run-unsupported-variant-done",
+		"dry-run-hold-status-only", "dry-run-hold-stage-only", "dry-run-other-host-row",
+		"dry-run-other-host-row-requested", "dry-run-ordinary-node-only-unreadable-row",
+		"dry-run-ordinary-never-commissioned", "dry-run-hold-abnormal-claim",
+		"dry-run-settled-closed-status", "done-unchanged-republished",
 		"retired-settled", "retired-pending",
 	})
 }
