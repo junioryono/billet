@@ -17,7 +17,18 @@
     expand_argument_vars: false
   register: billet_retirement_started
   changed_when: false
+  failed_when: false
+  ignore_unreachable: true
   become: true
+
+- name: Require an answered collection start clock
+  ansible.builtin.assert:
+    that:
+      - not billet_retirement_started.unreachable | default(false) | bool
+      - not billet_retirement_started.failed | default(false) | bool
+      - billet_retirement_started.rc | default(-1) == 0
+      - billet_retirement_started.stdout | default('') | trim | length > 0
+    fail_msg: "Retirement collection: retiring host {{ inventory_hostname }} start clock was unsuccessful or unreachable."
 
 - name: Collect each participant through its own prepared answerer
   ansible.builtin.include_tasks: retirement-collect-host.yml

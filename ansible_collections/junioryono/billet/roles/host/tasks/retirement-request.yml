@@ -28,6 +28,7 @@
     billet_retirement_peer: "{{ hostvars[billet_retirement_survivor_host] }}"
   ansible.builtin.assert:
     that:
+      - billet_retirement_survivor_host in ansible_play_hosts
       - billet_retirement_peer.billet_exclusion_settled | default(none) is sameas true
       - billet_retirement_peer.billet_exclusion_held | default(none) is sameas true
       - billet_retirement_peer.billet_exclusion_holder | default('') == billet_exclusion_holder
@@ -35,7 +36,8 @@
     fail_msg: >-
       Retirement precondition: survivor {{ billet_retirement_survivor_host }} needs a
       settled, held, pointer-free guard published by its own preparation under
-      holder {{ billet_exclusion_holder }}. A skipped settlement is not success.
+      holder {{ billet_exclusion_holder }} and must remain active in this play.
+      A skipped settlement or a failed or unreachable survivor is not success.
   when: not ansible_check_mode
 
 - name: Require the retiring host's preparation window closed
@@ -108,6 +110,7 @@
                     if billet_retirement_local_environment_file | length > 0 else []) }}
             expand_argument_vars: false
           register: billet_retirement_reserve_raw
+          ignore_unreachable: true
           changed_when: false
           failed_when: false
           become: true
@@ -165,6 +168,7 @@
             stdin: "{{ billet_retirement_document | to_json }}"
             stdin_add_newline: false
           register: billet_retirement_request_raw
+          ignore_unreachable: true
           changed_when: false
           failed_when: false
           become: true
@@ -226,6 +230,7 @@
                         if billet_retirement_local_environment_file | length > 0 else []) }}
                 expand_argument_vars: false
               register: billet_retirement_abandon_raw
+              ignore_unreachable: true
               changed_when: false
               failed_when: false
               become: true
@@ -249,7 +254,11 @@
           rescue:
             - name: Keep the cleanup refusal beside the original failure
               ansible.builtin.set_fact:
-                billet_retirement_cleanup: "Cleanup remains outstanding: {{ ansible_failed_result.msg | default('abandonment did not answer') }}"
+                billet_retirement_cleanup: >-
+                  Cleanup remains outstanding: reservation for retiring host {{ inventory_hostname }},
+                  survivor {{ billet_retirement_survivor }}, run {{ billet_exclusion_holder }},
+                  transition {{ billet_retirement_transition_id if billet_retirement_transition_id | length > 0 else 'unknown (no validated reservation binding)' }}
+                  is not proved released. {{ ansible_failed_result.msg | default('abandonment did not answer') }}
 
         - name: Fail with the original request and its cleanup result
           ansible.builtin.fail:

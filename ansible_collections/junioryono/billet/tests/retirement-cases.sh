@@ -5,14 +5,33 @@
 
 cat >"$work/play-retirement.yml" <<'PLAY'
 ---
+- name: Capture the ordinary template in each node's context
+  hosts: control-b:node-a
+  gather_facts: false
+  tasks:
+    - name: Capture the complete ordinary role rendering
+      ansible.builtin.template:
+        src: "{{ billet_gate_ordinary_template }}"
+        dest: "{{ billet_gate_render_dir }}/{{ inventory_hostname }}.yaml"
+        mode: "0600"
+      when: billet_gate_capture_rendering | default(false) | bool
+      no_log: true
 - name: Exercise the retirement entry after real preparation
-  hosts: "{{ billet_gate_retirement_host | default('control-a') }}"
+  hosts: "{{ [billet_gate_retirement_host | default('control-a'), 'control-b'] if billet_gate_new | default(false) | bool else billet_gate_retirement_host | default('control-a') }}"
   gather_facts: "{{ billet_gate_new | default(false) | bool }}"
   vars:
     billet_exclusion_platform: Linux
     billet_binary_src: ''
     billet_server_should_run: false
   tasks:
+    - name: Exercise only the selected retiring host
+      ansible.builtin.include_tasks: retirement-entry-tasks.yml
+      when: inventory_hostname == billet_gate_retirement_host | default('control-a')
+PLAY
+cat >"$work/retirement-entry-tasks.yml" <<'PLAY'
+---
+- name: Drive the selected retirement entry
+  block:
     - name: Prepare this host
       ansible.builtin.include_role:
         name: junioryono.billet.host
@@ -1018,11 +1037,12 @@ for host, envelope, inspect_name, status_name in [
         address = '127.0.0.1:7717' if host == 'control-b' else '127.0.0.1:7719'
         if parsed['node'] != dict(name=host, server_addr=address, provider='docker'):
             sys.exit('configuration was not rendered in its own host context')
-        if ('server' in parsed) != (host == 'control-b'):
-            sys.exit('complete node configuration was not rendered')
+        ordinary = (case / 'ordinary-render' / (host + '.yaml')).read_bytes()
+        if rendering != ordinary:
+            sys.exit('collected rendering differs from ordinary role template bytes for ' + host)
         endpoint_name = 'reported-unplanned' if host == 'control-b' else 'reported-planned'
         desired = doc['desired_nodes'][host]
-        if desired != {'sha256': hashlib.sha256(rendering).hexdigest(), 'endpoint': fixture('node-migrate-endpoint', endpoint_name)['to']}:
+        if desired != {'sha256': hashlib.sha256(ordinary).hexdigest(), 'endpoint': fixture('node-migrate-endpoint', endpoint_name)['to']}:
             sys.exit('desired node evidence was not computed from exact stdin and its own answer')
         if not inspection['sequence'] < migration['sequence'] < request['sequence']:
             sys.exit('endpoint collected out of order')
@@ -1065,6 +1085,122 @@ for clause in upgrade policy survivor; do
   done
 done
 
+# R16: both hosts prepare successfully in this play, then the survivor fails
+# before the old reset position or loses its real SSH connection there. A third
+# case removes it before reinclusion, leaving settled facts to test active-host
+# membership independently of the reset. Shared namespace preparation is serial.
+cat >"$work/play-retirement-survivor.yml" <<'PLAY'
+---
+- name: Refuse a survivor removed after its first successful preparation
+  hosts: control-a:control-b
+  gather_facts: false
+  vars:
+    billet_exclusion_platform: Linux
+    billet_binary_src: ''
+    billet_server_should_run: false
+  tasks:
+    - name: Prepare the retiring transport first
+      ansible.builtin.include_role:
+        name: junioryono.billet.host
+        tasks_from: prepare-exclusion
+      vars:
+        billet_allow_converge_from_billet_runner: true
+      when: inventory_hostname == 'control-a'
+    - name: Prepare the survivor transport first
+      ansible.builtin.include_role:
+        name: junioryono.billet.host
+        tasks_from: prepare-exclusion
+      vars:
+        billet_allow_converge_from_billet_runner: true
+      when: inventory_hostname == 'control-b'
+    - name: Prove the survivor completed its first preparation
+      ansible.builtin.assert:
+        that:
+          - billet_exclusion_settled is sameas true
+          - billet_exclusion_held is sameas true
+          - billet_exclusion_holder == 'ci-1'
+          - billet_upgrade_claim_shape == 'guard'
+          - billet_exclusion_answerer == '/usr/bin/billet'
+          - billet_exclusion_id | length > 0
+      when: inventory_hostname == 'control-b'
+    - name: Save the held survivor's run facts
+      ansible.builtin.set_fact:
+        billet_gate_first_guard:
+          held: "{{ billet_exclusion_held }}"
+          holder: "{{ billet_exclusion_holder }}"
+          id: "{{ billet_exclusion_id }}"
+          shape: "{{ billet_upgrade_claim_shape }}"
+          interrupted: "{{ billet_interrupted_upgrade }}"
+          recovery: "{{ billet_upgrade_recovery_dir }}"
+      when: inventory_hostname == 'control-b'
+    - name: Remove the survivor before a second inclusion
+      ansible.builtin.fail:
+        msg: The survivor failed after preparation and before reinclusion.
+      when: inventory_hostname == 'control-b' and billet_gate_survivor_failure == 'inactive'
+    - name: Lose the survivor's connection before its second preparation
+      ansible.builtin.set_fact:
+        ansible_connection: ssh
+        ansible_host: 127.0.0.1
+        ansible_port: 0
+        ansible_connect_timeout: 1
+        ansible_ssh_common_args: '-o BatchMode=yes -o ConnectionAttempts=1'
+      when: inventory_hostname == 'control-b' and billet_gate_survivor_failure == 'unreachable'
+    - name: Prepare the survivor a second time
+      ansible.builtin.include_role:
+        name: junioryono.billet.host
+        tasks_from: prepare-exclusion
+      vars:
+        billet_allow_converge_from_billet_runner: "{{ billet_gate_survivor_failure != 'failed' }}"
+      when: inventory_hostname == 'control-b'
+    - name: Prove the removed survivor's publication and held identity
+      vars:
+        peer: "{{ hostvars['control-b'] }}"
+      ansible.builtin.assert:
+        that:
+          - "'control-b' not in ansible_play_hosts"
+          - peer.billet_exclusion_settled is sameas (billet_gate_survivor_failure == 'inactive')
+          - billet_gate_survivor_failure == 'inactive' or peer.billet_exclusion_answerer == ''
+          - billet_gate_survivor_failure == 'inactive' or peer.billet_exclusion_answered_now is sameas false
+          - billet_gate_survivor_failure == 'inactive' or peer.billet_exclusion_answerer_version == {'type':'unreadable'}
+          - peer.billet_exclusion_held == peer.billet_gate_first_guard.held
+          - peer.billet_exclusion_holder == peer.billet_gate_first_guard.holder
+          - peer.billet_exclusion_id == peer.billet_gate_first_guard.id
+          - peer.billet_upgrade_claim_shape == peer.billet_gate_first_guard.shape
+          - peer.billet_interrupted_upgrade == peer.billet_gate_first_guard.interrupted
+          - peer.billet_upgrade_recovery_dir == peer.billet_gate_first_guard.recovery
+      when: inventory_hostname == 'control-a'
+    - name: Route the retiring host with the failed survivor still in hostvars
+      ansible.builtin.include_role:
+        name: junioryono.billet.host
+        tasks_from: retirement
+      when: inventory_hostname == 'control-a'
+PLAY
+for failure in failed unreachable inactive; do
+  name=r16-second-$failure
+  r_new "$name"
+  e "$name" RUNNER_NAME=billet-survivor-failure
+  a "$name" -e "billet_gate_survivor_failure=$failure"
+  r_run "$name" play-retirement-survivor
+  case "$failure" in
+    failed) task='Refuse a converge driven from a billet-managed runner'; why='runner billet itself manages' ;;
+    unreachable) task='Inspect the managed binary and the upgrade root'; why='UNREACHABLE!' ;;
+    inactive) task='Remove the survivor before a second inclusion'; why='before reinclusion' ;;
+  esac
+  expect_refused "$name" "$task" "$why"
+  "$python" - "$work/cases/$name/out" <<'PYPREPARED'
+import pathlib, sys
+text = pathlib.Path(sys.argv[1]).read_text()
+for task, host in [("Prove the survivor completed its first preparation", 'control-b'),
+                   ("Prove the removed survivor's publication and held identity", 'control-a')]:
+    parts = text.split('TASK [' + task + ']')
+    if len(parts) != 2 or ('ok: [' + host + ']') not in parts[1].split('TASK [', 1)[0]:
+        sys.exit('R16 did not prove preparation/publication on ' + host + ': ' + task)
+PYPREPARED
+  expect_final "$name" 'Retirement precondition: survivor control-b needs a settled, held, pointer-free guard'
+  r_no_collection "$name"
+  expect_host_commands "$name" 'control-a retire-classify 1;'
+done
+
 # R16: the other clauses remain true, so settled alone, a skipped settlement,
 # another holder and a binary pointer each have an independent witness.
 for clause in unsettled holder pointer unheld; do
@@ -1097,6 +1233,8 @@ grep -qF 'A real run needs that survivor prepared' "$work/cases/r2-preview/out" 
 for outcome in reserved adopted; do
   name=r19-$outcome
   r_new "$name" "$outcome"
+  mkdir -p "$work/cases/$name/ordinary-render"
+  a "$name" -e billet_gate_capture_rendering=true -e "billet_gate_ordinary_template=$role_tasks/../templates/billet.yaml.j2" -e "billet_gate_render_dir=$work/cases/$name/ordinary-render"
   # Per-host retirement policy must remain distinct in hostvars.
   a "$name" -e '{"billet_retirement_shared_addresses":["192.0.2.10","192.0.2.11"],"billet_retirement_endpoint_failover_verified":true}'
   r_run "$name"
@@ -1107,6 +1245,31 @@ for outcome in reserved adopted; do
   r_no_ordinary_after_request "$name"
   r_new_document "$name" "$outcome"
 done
+
+# R19 mutation: override only collection's rendering, retaining a server map
+# but dropping one member. The ordinary Ansible render remains independent.
+r_new r19-dropped-server-member
+mkdir -p "$work/cases/r19-dropped-server-member/ordinary-render"
+a r19-dropped-server-member -e billet_gate_capture_rendering=true -e "billet_gate_ordinary_template=$role_tasks/../templates/billet.yaml.j2" -e "billet_gate_render_dir=$work/cases/r19-dropped-server-member/ordinary-render"
+cat >"$work/cases/r19-dropped-server-member/mutation.yml" <<'VARS'
+billet_retirement_shared_addresses: [192.0.2.10, 192.0.2.11]
+billet_retirement_endpoint_failover_verified: true
+billet_retirement_collect_rendering: >-
+  {{ lookup('ansible.builtin.template', 'billet.yaml.j2',
+            template_vars={'billet_config':
+              (billet_retirement_collect_vars.billet_config | combine({'server':
+                billet_retirement_collect_vars.billet_config.server | dict2items |
+                rejectattr('key', 'equalto', 'max_vcpu') | items2dict}))
+              if billet_retirement_collect_host == 'control-b'
+              else billet_retirement_collect_vars.billet_config}) }}
+VARS
+a r19-dropped-server-member -e "@$work/cases/r19-dropped-server-member/mutation.yml"
+r_run r19-dropped-server-member
+expect_allowed r19-dropped-server-member
+if r_new_document r19-dropped-server-member reserved >"$work/cases/r19-dropped-server-member/mutation-out" 2>&1; then
+  fail 'R19 accepted a collected rendering missing a server member'
+fi
+grep -qFx 'collected rendering differs from ordinary role template bytes for control-b' "$work/cases/r19-dropped-server-member/mutation-out" || fail 'R19 mutation failed for a reason other than ordinary-render byte equality' "$work/cases/r19-dropped-server-member/mutation-out"
 
 # R13: node-a's connection plugin really cannot connect, after the row was
 # reserved and the survivor was collected. No module exit stands for this.
@@ -1269,14 +1432,16 @@ cat >"$work/retirement-window-wrapper" <<WRAP
 #!/bin/bash
 set -eu
 case "\$*" in
-  'server retire --input '*) '$python' '$work/retirement-window.py' mark ;;
+  'server retire --input '*)
+    '$python' '$work/retirement-window.py' mark
+    if [ "\${BILLET_GATE_WINDOW_CLEANUP:-}" = unreachable ]; then touch /var/lib/billet/gate-disconnect; fi ;;
   'server retire --abandon-reservation '*)
     if [ "\${BILLET_GATE_WINDOW_CLEANUP:-}" = success ]; then '$python' '$work/retirement-window.py' abandon; fi ;;
 esac
 exec /usr/bin/billet.window-backing "\$@"
 WRAP
 chmod 0755 "$work/retirement-window-wrapper"
-for cleanup in success refused unanswered released; do
+for cleanup in success refused unanswered unreachable released; do
   name=r17-$cleanup
   r_new "$name"
   request_fixture=unknown-intent-journal
@@ -1292,13 +1457,25 @@ for cleanup in success refused unanswered released; do
   if [ "$cleanup" = refused ]; then abandon_fixture=refused-abandon-journal; abandon_exit=2; fi
   r_answers "$name" "control-a:classify:1:dry-run-new-request.json:0;control-a:reserve:1:reserved.json:0;control-a:request:1:$request_fixture.json:$request_exit;control-a:abandon:1:$abandon_fixture.json:$abandon_exit"
   e "$name" "BILLET_GATE_WINDOW_CLEANUP=$cleanup"
+  if [ "$cleanup" = unreachable ]; then
+    "$python" - "$work/cases/$name/inventory.yml" <<'PYCONNECTION'
+import pathlib, sys, yaml
+p = pathlib.Path(sys.argv[1])
+d = yaml.safe_load(p.read_text())
+d['all']['hosts']['control-a'].update(
+    ansible_connection="{{ 'ssh' if lookup('ansible.builtin.fileglob', '/var/lib/billet/gate-disconnect') | length > 0 else 'local' }}",
+    ansible_host='127.0.0.1', ansible_port=0, ansible_connect_timeout=1,
+    ansible_ssh_common_args='-o BatchMode=yes -o ConnectionAttempts=1')
+p.write_text(yaml.safe_dump(d))
+PYCONNECTION
+  fi
   if [ "$cleanup" = unanswered ]; then e "$name" 'BILLET_GATE_DROP_ANSWER=retire-abandon:1'; fi
   post "$name" "cp /var/lib/billet/upgrades/active/guard.json '$work/cases/$name/guard-after.json'"
   r_run "$name"
   "$python" - "$work/cases/$name/guard-after.json" "$cleanup" <<'PYMARKER'
 import json, sys
 d = json.load(open(sys.argv[1]))
-kept = sys.argv[2] in ['refused', 'unanswered']
+kept = sys.argv[2] in ['refused', 'unanswered', 'unreachable']
 if ('transition' in d) != kept:
     sys.exit('R17 left the wrong marker state after cleanup')
 if kept and d['transition'] != {'kind': 'retirement', 'id': '0123456789abcdef0123456789abcdef'}:
@@ -1308,7 +1485,7 @@ PYMARKER
   # Compare the decoded final diagnostic with the producer's whole reason;
   # a common word such as journal could come from cleanup alone.
   final_fatal "$name" >"$work/cases/$name/final-failure"
-  "$python" - "$work/cases/$name/final-failure" "$work/retire-fixtures/$request_fixture.json" "$cleanup" "$work/retire-fixtures/$abandon_fixture.json" <<'PYWHY'
+  "$python" - "$work/cases/$name/final-failure" "$work/retire-fixtures/$request_fixture.json" "$cleanup" "$work/retire-fixtures/$abandon_fixture.json" "$work/cases/$name/out" <<'PYWHY'
 import json, pathlib, sys
 text = pathlib.Path(sys.argv[1]).read_text()
 messages = [json.loads(line.strip().removeprefix('"msg": ').removesuffix(','))
@@ -1323,8 +1500,17 @@ if sys.argv[3] == 'refused':
     cleanup = json.loads(pathlib.Path(sys.argv[4]).read_text())['why']
     if cleanup not in message or message.index(original) >= message.index(cleanup):
         sys.exit('R17 did not report cleanup refusal after the original reason')
-if sys.argv[3] == 'unanswered' and "did not answer retirement's abandon call" not in message:
+if sys.argv[3] in ['unanswered', 'unreachable'] and "did not answer retirement's abandon call" not in message:
     sys.exit('R17 did not report unanswered cleanup beside the original reason')
+if sys.argv[3] == 'unreachable':
+    output = pathlib.Path(sys.argv[5]).read_text()
+    parts = output.split('TASK [junioryono.billet.host : Ask abandonment to discharge the reservation]')
+    if len(parts) != 2 or 'fatal: [control-a]: UNREACHABLE!' not in parts[1].split('TASK [', 1)[0]:
+        sys.exit('R17 did not lose the connection specifically at abandonment')
+    for clause in ['reservation for retiring host control-a', 'survivor control-b', 'run ci-1',
+                   'transition 0123456789abcdef0123456789abcdef', 'is not proved released']:
+        if clause not in message:
+            sys.exit('R17 did not name its outstanding reservation: ' + clause)
 PYWHY
   r_no_ordinary_after_request "$name"
   expect_path_absent "$name" /var/lib/billet/retired/journal.json
@@ -1332,7 +1518,13 @@ PYWHY
     expect_host_commands "$name" 'control-a retire-classify 1;control-a retire-reserve 1;control-a retire-request 1;'
     expect_final "$name" 'reservation released; abandonment was skipped'
   else
-    expect_host_commands "$name" 'control-a retire-classify 1;control-a retire-reserve 1;control-a retire-request 1;control-a retire-abandon 1;'
+    if [ "$cleanup" = unreachable ]; then
+      expect_host_commands "$name" 'control-a retire-classify 1;control-a retire-reserve 1;control-a retire-request 1;'
+      grep -qF 'UNREACHABLE!' "$work/cases/$name/out" || fail "$name: abandonment did not lose its connection"
+      expect_ran "$name" 'Keep the cleanup refusal beside the original failure'
+    else
+      expect_host_commands "$name" 'control-a retire-classify 1;control-a retire-reserve 1;control-a retire-request 1;control-a retire-abandon 1;'
+    fi
     if [ "$cleanup" = success ]; then
       expect_final "$name" 'The reservation was abandoned.'
     else

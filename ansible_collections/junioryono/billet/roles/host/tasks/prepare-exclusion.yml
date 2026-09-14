@@ -49,6 +49,22 @@
 # closing checks. The root's owner is the one rule for every proof: root on
 # Linux, the launch agent's account (the account converging) on a Mac.
 
+# Clear per-inclusion permission before any task can fail or lose its connection.
+# A held run keeps its holder, public id and learned claim/recovery facts: it
+# must validate that same guard, never acquire a replacement.
+- name: Reset this inclusion's exclusion permission
+  ansible.builtin.set_fact:
+    billet_exclusion_settled: false
+    billet_exclusion_answerer: ""
+    billet_exclusion_answered_now: false
+    billet_exclusion_answerer_version: {type: unreadable}
+    billet_exclusion_held: "{{ billet_exclusion_held | default(false) }}"
+    billet_exclusion_holder: "{{ billet_exclusion_holder | default('') if billet_exclusion_held | default(false) else '' }}"
+    billet_exclusion_id: "{{ billet_exclusion_id | default('') if billet_exclusion_held | default(false) else '' }}"
+    billet_upgrade_claim_shape: "{{ billet_upgrade_claim_shape | default('none') if billet_exclusion_held | default(false) else 'none' }}"
+    billet_interrupted_upgrade: "{{ billet_interrupted_upgrade | default(false) if billet_exclusion_held | default(false) else false }}"
+    billet_upgrade_recovery_dir: "{{ billet_upgrade_recovery_dir | default('') if billet_exclusion_held | default(false) else '' }}"
+
 - name: Refuse a converge that would destroy the job running it
   ansible.builtin.import_tasks: converge-guard.yml
 
@@ -139,22 +155,6 @@
     billet_exclusion_binary_present: "{{ billet_exclusion_paths.results[0].stat.exists }}"
     billet_exclusion_parent_stat: "{{ billet_exclusion_paths.results[1].stat }}"
     billet_exclusion_root_stat: "{{ billet_exclusion_paths.results[2].stat }}"
-
-# THE CLAIM'S FACTS START AT NONE for a run that holds nothing yet, on every
-# path (a dry run's included, because the tasks after the preparation read
-# them); an answer below sets them, and a run that held keeps what it learned.
-- name: Start the executable that answers for this converge at none
-  ansible.builtin.set_fact:
-    billet_exclusion_answerer: ""
-    billet_exclusion_answered_now: false
-    billet_exclusion_answerer_version: {type: unreadable}
-    billet_exclusion_settled: false
-
-- name: Start the claim's facts at none
-  ansible.builtin.set_fact:
-    billet_upgrade_claim_shape: "{{ billet_upgrade_claim_shape | default('none') if billet_exclusion_held | default(false) else 'none' }}"
-    billet_interrupted_upgrade: "{{ billet_interrupted_upgrade | default(false) if billet_exclusion_held | default(false) else false }}"
-    billet_upgrade_recovery_dir: "{{ billet_upgrade_recovery_dir | default('') if billet_exclusion_held | default(false) else '' }}"
 
 - name: Prepare the exclusion
   block:

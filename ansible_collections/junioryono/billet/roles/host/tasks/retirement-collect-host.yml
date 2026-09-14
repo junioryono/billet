@@ -179,7 +179,18 @@
     expand_argument_vars: false
   register: billet_retirement_collected
   changed_when: false
+  failed_when: false
+  ignore_unreachable: true
   become: true
+
+- name: Require an answered envelope clock
+  ansible.builtin.assert:
+    that:
+      - not billet_retirement_collected.unreachable | default(false) | bool
+      - not billet_retirement_collected.failed | default(false) | bool
+      - billet_retirement_collected.rc | default(-1) == 0
+      - billet_retirement_collected.stdout | default('') | trim | length > 0
+    fail_msg: "Retirement collection: retiring host {{ inventory_hostname }} envelope clock was unsuccessful or unreachable."
 
 - name: Bind the collected envelope to its authenticated inventory host
   ansible.builtin.set_fact:
