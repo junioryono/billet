@@ -1254,7 +1254,7 @@ func (l *Listener) Run(ctx context.Context) error {
 			// waiting for. The seal under-delivers visibly rather than reporting a
 			// deployment quiesced that is not.
 			if l.observed != nil {
-				if err := l.reconcilePool(pollCtx, l.observed.TotalAssignedJobs); err != nil {
+				if err := l.reconcileAdmissionPool(pollCtx, l.observed.TotalAssignedJobs); err != nil {
 					// reconcilePool launches runners, which can take minutes; a
 					// cancellation landing mid-launch must enter the drain so the
 					// jobs already running finish, not stop the listener and have
@@ -1542,13 +1542,20 @@ func (l *Listener) beginDrain(ctx context.Context) (context.Context, context.Can
 	// A SECOND SIGNAL ENDS THE WAIT, not the teardown. The goroutine also selects
 	// on drainCtx so it cannot outlive the drain.
 	if l.hurry != nil {
-		go func() {
-			select {
-			case <-l.hurry:
-				endDrain()
-			case <-drainCtx.Done():
-			}
-		}()
+		select {
+		case <-l.hurry:
+			// AN ALREADY RECEIVED SIGNAL ENDS THE WAIT BEFORE ANOTHER POLL.
+			// Scheduling its observation would let the drain enter another poll.
+			endDrain()
+		default:
+			go func() {
+				select {
+				case <-l.hurry:
+					endDrain()
+				case <-drainCtx.Done():
+				}
+			}()
+		}
 	}
 
 	// NOT l.seal(), which stops the cleanup loop starting new destroys and belongs

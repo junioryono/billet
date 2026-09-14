@@ -10,9 +10,9 @@ import (
 
 // discoveryArbiter gives the whole catalogue one admission turn at a time.
 //
-// KNOWN UNMET WORK PRECEDES DISCOVERY. Each successful backed exchange advances
-// a sorted round robin by one lease, not by a tier's backlog. A blocked winner
-// keeps its turn: letting smaller contenders bypass it would spend the returning
+// KNOWN UNMET WORK PRECEDES DISCOVERY. Each handled exchange or pre-poll pool
+// attempt advances a sorted round robin by one lease, not by a tier's backlog.
+// A blocked winner keeps its turn: smaller contenders would spend the returning
 // fragments forever before a large shape could fit. The allocator still decides
 // whether a lease fits and protects every explicit floor.
 //
@@ -77,8 +77,8 @@ func (a *discoveryArbiter) choose() {
 	for _, e := range a.entries {
 		work = work || (e.eligible() && e.demand)
 	}
-	// A BACKED WORK TURN ENDS AT ITS HANDLED EXCHANGE. Consuming its lease
-	// can reach max_concurrent during handle; rotating here would lose the
+	// A BACKED WORK TURN ENDS AFTER ITS EXCHANGE OR POOL ATTEMPT IS HANDLED.
+	// Consuming its lease can reach max_concurrent; rotating here would lose the
 	// cursor update and let two fast capped tiers repeatedly bypass a third.
 	if a.owner != "" && a.granted && a.work {
 		return
@@ -144,7 +144,7 @@ func (a *discoveryArbiter) permits(label string) bool {
 	return a.owner == label
 }
 
-// exchanged spends a turn only after its backed poll has been handled.
+// exchanged spends a turn after its poll or pre-poll pool attempt is handled.
 func (a *discoveryArbiter) exchanged(label string, generation uint64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -227,6 +227,28 @@ func (l *Listener) arbitrateEscrow(ctx context.Context, target int) error {
 	}
 
 	return nil
+}
+
+// reconcileAdmissionPool spends a turn consumed before the next poll. A refused
+// launch can leave no lease behind, but its grant still forbids a second purchase
+// until returned. The next poll needs backing from its own admission turn.
+func (l *Listener) reconcileAdmissionPool(ctx context.Context, desired int) error {
+	_, turn := l.admissionPoll()
+	if err := l.reconcilePool(ctx, desired); err != nil {
+		return err
+	}
+	if turn == 0 || l.idleEscrow() != 0 {
+		return nil
+	}
+
+	// RETURN ONLY THE CAPTURED TURN. Demand can change the owner during a
+	// launch; its completion must never spend the successor's grant.
+	l.finishAdmissionTurn(turn)
+	if l.isQuiesced() {
+		return nil
+	}
+
+	return l.prepareEscrow(ctx)
 }
 
 func (l *Listener) finishAdmissionTurn(turn uint64) {

@@ -611,3 +611,148 @@ func TestDiscoveryWithdrawalPrecedesCloudFallback(t *testing.T) {
 		t.Fatalf("observed %d polls, want the outstanding, lower and post-withdrawal polls", polls)
 	}
 }
+
+// A REFUSED POOL LAUNCH SPENDS ITS TURN BEFORE THE NEXT OFFER ARRIVES. The
+// last assigned count may still request that runner, but each failed attempt
+// must leave the next exchange able to acquire from its own backed turn.
+func TestARefusedPoolLaunchReturnsItsTurnBeforeTheNextOffer(t *testing.T) {
+	_, listeners := arbitrationListeners(t, []config.Tier{tier("work")}, tierVCPU)
+	l := listeners[0]
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+	launches, polls := 0, 0
+	var spent uint64
+	l.runner = &fakeRunner{onLaunch: func(int64) error {
+		launches++
+		_, spent = l.admissionPoll()
+		return errors.New("pool trust refused before launch")
+	}}
+	session := &fakeSession{stats: &Statistics{TotalAssignedJobs: 1}}
+	l.session = session
+	session.onPoll = func(sent int) {
+		polls++
+		if polls == 1 {
+			_, next := l.admissionPoll()
+			if spent == 0 || next == 0 || next == spent {
+				t.Errorf("refused turn %d left next poll on turn %d", spent, next)
+			}
+			l.finishAdmissionTurn(spent)
+			_, afterDuplicate := l.admissionPoll()
+			if afterDuplicate != next {
+				t.Errorf("duplicate return changed this tier's next turn %d to %d", next, afterDuplicate)
+			}
+			if launches != 1 || sent != 1 || l.idleEscrow() != 1 {
+				t.Errorf("after refusal: launches %d, sent %d, held %d; want 1, 1, 1",
+					launches, sent, l.idleEscrow())
+			}
+		} else {
+			cancel()
+		}
+	}
+	session.onGet = func() (*Message, error) {
+		return &Message{MessageID: 1, Available: []Job{{RequestID: 11, RunID: 101}},
+			Statistics: &Statistics{TotalAvailableJobs: 1}}, nil
+	}
+	if err := l.Run(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run = %v, want cancellation after the offer", err)
+	}
+	if got := session.acquiredIDs(); !slices.Equal(got, []int64{11}) {
+		t.Fatalf("acquired %v after a refused pool launch, want request 11", got)
+	}
+	if polls != 2 || launches != 1 {
+		t.Fatalf("polls %d, launches %d; want 2, 1", polls, launches)
+	}
+}
+
+// RETURNING A CONSUMED TURN DOES NOT RELEASE ITS LEASE OR SPEND ITS SUCCESSOR.
+// Running compute and custody remain charged; only a conclusive refusal frees
+// the old placement. Every outcome gives the next known contender its turn.
+func TestConsumedPoolTurnsAdvanceOnceAndKeepTheirComputeCharged(t *testing.T) {
+	for _, outcome := range []struct {
+		name string
+		err  error
+		kept bool
+	}{
+		{name: "launched", kept: true},
+		{name: "refused", err: errors.New("refused before launch")},
+		{name: "custody", err: ErrCustody, kept: true},
+	} {
+		t.Run(outcome.name, func(t *testing.T) {
+			a, listeners := arbitrationListeners(t, []config.Tier{tier("a"), tier("b")}, 2*tierVCPU)
+			first, second := listeners[0], listeners[1]
+			for _, l := range listeners {
+				l.observed = &Statistics{TotalAssignedJobs: 1}
+				l.observeDemand(l.observed)
+			}
+			first.runner = &fakeRunner{onLaunch: func(int64) error { return outcome.err }}
+			if err := first.prepareEscrow(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			held := first.Held()
+			if len(held) != 1 {
+				t.Fatalf("first turn has %d held leases, want 1", len(held))
+			}
+			lease := held[0]
+			_, spent := first.admissionPoll()
+			if err := first.reconcileAdmissionPool(t.Context(), 1); err != nil {
+				t.Fatal(err)
+			}
+			if first.idleEscrow() != 0 || !second.arbiter.permits(second.tier) {
+				t.Fatal("consumed turn did not yield to the next known contender")
+			}
+			if err := second.prepareEscrow(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			_, next := second.admissionPoll()
+			if next == 0 || next == spent || second.idleEscrow() != 1 {
+				t.Fatalf("successor has turn %d, held %d; spent turn was %d",
+					next, second.idleEscrow(), spent)
+			}
+			first.finishAdmissionTurn(spent)
+			_, afterDuplicate := second.admissionPoll()
+			if afterDuplicate != next {
+				t.Fatalf("duplicate return changed successor turn %d to %d", next, afterDuplicate)
+			}
+			_, err := a.Lease(t.Context(), lease.ID)
+			if outcome.kept && err != nil {
+				t.Fatalf("returning the turn lost the compute's lease: %v", err)
+			}
+			if !outcome.kept && !errors.Is(err, alloc.ErrLeaseNotFound) {
+				t.Fatalf("refused lease read = %v, want lease not found", err)
+			}
+		})
+	}
+}
+
+// RECONCILIATION MUST FINISH AND CONSUME THE BACKING BEFORE IT ENDS A TURN.
+// An unused grant still needs its poll, and a failed read proves no progress.
+func TestPoolReconciliationKeepsUnusedOrUnconfirmedTurns(t *testing.T) {
+	for _, cancelled := range []bool{false, true} {
+		t.Run(map[bool]string{false: "unused backing", true: "failed reconciliation"}[cancelled], func(t *testing.T) {
+			_, listeners := arbitrationListeners(t, []config.Tier{tier("a"), tier("b")}, tierVCPU)
+			l := listeners[0]
+			l.observed = &Statistics{TotalAssignedJobs: 1}
+			if err := l.prepareEscrow(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			_, before := l.admissionPoll()
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if cancelled {
+				cancel()
+			}
+			err := l.reconcileAdmissionPool(ctx, 0)
+			if cancelled && !errors.Is(err, context.Canceled) {
+				t.Fatalf("reconciliation = %v, want context canceled", err)
+			}
+			if !cancelled && err != nil {
+				t.Fatal(err)
+			}
+			_, after := l.admissionPoll()
+			if before == 0 || after != before || l.idleEscrow() != 1 {
+				t.Fatalf("turn %d became %d with %d held, want unchanged backing",
+					before, after, l.idleEscrow())
+			}
+		})
+	}
+}
