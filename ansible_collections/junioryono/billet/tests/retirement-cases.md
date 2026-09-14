@@ -1,5 +1,7 @@
 # Retirement caller coverage
 
+CI runs section R in `host-lifecycle (retirement)` with `BILLET_GATE_ONLY=retirement` and `BILLET_GATE_REQUIRE_ROOT=1`; `host-lifecycle (guard)` sets `BILLET_GATE_SKIP=retirement`. Both use the shared setup and namespace launch probe. With neither selector set, `make converge-guard-check` runs every section. Unknown selector values and selecting and skipping retirement together are refused, and the final success line names the sections that ran.
+
 Section R (`BILLET_GATE_ONLY=retirement`) sources `retirement-cases.sh`. Command answers come from the committed producer corpus; the route harness runs real preparation and retirement tasks, with an ordinary-boundary sentinel. The separate boundary case runs the real `main.yml` twice in separate processes in one namespace. These cases and this fix pass were reviewed by reading only; no build, test, lint or formatter was run.
 
 | Contract | Case and assertion |

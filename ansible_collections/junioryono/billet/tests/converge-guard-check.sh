@@ -86,6 +86,19 @@ fail() {
   exit 1
 }
 
+case "${BILLET_GATE_ONLY:-}" in
+  ""|endpoint|retirement) ;;
+  *) fail "unknown BILLET_GATE_ONLY=${BILLET_GATE_ONLY}; expected endpoint or retirement" ;;
+esac
+case "${BILLET_GATE_SKIP:-}" in
+  ""|retirement) ;;
+  *) fail "unknown BILLET_GATE_SKIP=${BILLET_GATE_SKIP}; expected retirement" ;;
+esac
+if [ "${BILLET_GATE_ONLY:-}" = retirement ] && [ "${BILLET_GATE_SKIP:-}" = retirement ]; then
+  fail "BILLET_GATE_ONLY=retirement contradicts BILLET_GATE_SKIP=retirement"
+fi
+sections_ran="shared checks"
+
 # --- the module's own check -------------------------------------------------
 "$python" "$here/guard_fallback_check.py"
 "$python" "$here/strict_json_check.py"
@@ -1209,6 +1222,7 @@ expect_refused_member p15-h2 "outcome"
 expect_final p15-h2 "ended by its bound"
 expect_fact p15-h2 released False
 echo "ok   P15: a Mac calls prepare as the agent's account under the async bound, stages nothing, takes the no-billet path, and cleans up without timeout"
+sections_ran="$sections_ran, guard, simulated-darwin"
 
 fi
 
@@ -1511,6 +1525,7 @@ expect_state launch managed file
 [ ! -e /usr/bin/billet ] || fail "M8: /usr/bin/billet leaked outside the namespace"
 [ ! -e /var/lib/billet ] || fail "M8: /var/lib/billet leaked outside the namespace"
 echo "ok   M8: the namespace launch runs the managed wrapper as root at its real path, resolves the holder from the environment, and leaks nothing"
+sections_ran="$sections_ran, namespace launch probe (M8)"
 
 ROOT=/var/lib/billet/upgrades
 REC_A=recovery-20260909T120000-0badcafe
@@ -1518,7 +1533,11 @@ REC_B=recovery-20260909T120000-1badcafe
 LEGACY_DIR=20260909T120000000000000
 
 # BILLET_GATE_ONLY=endpoint or retirement selects that section after shared
-# setup and the namespace launch probe; CI runs every section by default.
+# setup and the namespace launch probe (endpoint also runs the plain guard
+# and simulated-darwin cases). BILLET_GATE_SKIP=retirement omits section R;
+# CI uses it for guard and BILLET_GATE_ONLY=retirement for its separate group.
+# Neither set runs every section, as make converge-guard-check does locally.
+# Unknown values and selecting and skipping retirement together are refused.
 if [ "${BILLET_GATE_ONLY:-}" != endpoint ] && [ "${BILLET_GATE_ONLY:-}" != retirement ]; then
 
 # =============================================================================
@@ -2709,6 +2728,7 @@ expect_allowed s3-collision
 expect_fact s3-collision recovery "$ROOT/$REC_B"
 expect_calls s3-collision suffix "" 2
 echo "ok   S: a pinned release is fetched and staged into an exclusive journal under the guard, and a collision retries"
+sections_ran="$sections_ran, preparation"
 fi
 
 # =============================================================================
@@ -3168,6 +3188,7 @@ e e11d-current-null-node "BILLET_GATE_ANSWER=migrate-endpoint:1:$(ep_fixture e11
 ep_case e11d-current-null-node
 expect_refused e11d-current-null-node "Judge the migration's answer" "answered with a member this role cannot read: node"
 echo "ok   E11: a current receipt keeps a holder that is one (by the command's grammar), a written receipt carries this run's, evidence mode never answers current, and an unchanged current answer names its node"
+sections_ran="$sections_ran, endpoint (E)"
 
 fi
 
@@ -3176,7 +3197,7 @@ fi
 # New requests and cancellation follow in 5c.d. A corruption starts from HEAD's committed producer bytes, never a
 # harvested worktree fixture and never an answer assembled by the gate.
 # =============================================================================
-if [ "${BILLET_GATE_ONLY:-}" != endpoint ]; then
+if [ "${BILLET_GATE_ONLY:-}" != endpoint ] && [ "${BILLET_GATE_SKIP:-}" != retirement ]; then
 mkdir -p "$work/retire-fixtures"
 git -C "$repo_root" ls-tree -r --name-only HEAD -- ansible_collections/junioryono/billet/tests/fixtures/server-retire/ >"$work/retire-fixture-list"
 [ -s "$work/retire-fixture-list" ] || fail "HEAD carries no retirement fixtures"
@@ -3420,8 +3441,11 @@ expect_no_ordinary r-machinery
 # Route coverage uses only the producer corpus above. Cases whose distinct
 # classifier shape has no producer fixture are listed in retirement-cases.md.
 . "$here/retirement-cases.sh"
+sections_ran="$sections_ran, retirement (R)"
 
+else
+  echo "converge guard: retirement (R) skipped"
 fi
 
 
-echo "converge guard: every case passed"
+echo "converge guard: every case passed (sections run: $sections_ran)"
