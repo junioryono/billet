@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "outcome": "reported",
+  "journal": null,
+  "status": null,
+  "stage": "absent",
+  "guard": "none",
+  "marker": null,
+  "row": null,
+  "row_fact": "unreadable",
+  "dispatch": "unknown-ledger",
+  "status_presence": "absent",
+  "config": "present",
+  "installed_roles": "server",
+  "identity": "absent",
+  "authority": "absent",
+  "route": "ordinary",
+  "why": "no deployment identity is minted in /var/lib/billet/server, so no row can be associated with this host",
+  "state": "nothing"
+}

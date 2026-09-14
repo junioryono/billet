@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "outcome": "unchanged",
+  "phase": "done",
+  "variant": "server-only",
+  "transition_id": "0123456789abcdef0123456789abcdef",
+  "settled": true,
+  "row_done": true,
+  "completed_by": "control-a",
+  "postconditions": {
+    "status": "republished",
+    "config": "absent",
+    "server": "quiesced",
+    "node": "quiesced",
+    "upgrade_timer": "quiesced",
+    "backup_timer": "quiesced",
+    "backup_service": "not-found",
+    "archive": "present"
+  },
+  "state": "done"
+}

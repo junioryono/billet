@@ -1,0 +1,40 @@
+{
+  "schema": 1,
+  "outcome": "reported",
+  "journal": {
+    "phase": "done",
+    "variant": "server-only",
+    "row_done": true,
+    "settled": true,
+    "owner": "ci-1",
+    "transition_id": "0123456789abcdef0123456789abcdef",
+    "retiring": "control-a",
+    "survivor": "control-b"
+  },
+  "status": {
+    "phase": "done",
+    "variant": "server-only",
+    "updated_at": "2026-09-11T10:00:30Z"
+  },
+  "stage": "absent",
+  "guard": "converge-guard",
+  "marker": null,
+  "row": {
+    "retiring": "control-a",
+    "survivor": "control-b",
+    "run": "ci-1",
+    "state": "done",
+    "transition_id": "0123456789abcdef0123456789abcdef",
+    "reserved_at": "2026-09-11T10:00:00Z"
+  },
+  "row_fact": "done-mine",
+  "dispatch": "done",
+  "status_presence": "present",
+  "config": "absent",
+  "installed_roles": null,
+  "identity": "unreadable",
+  "authority": "unreadable",
+  "route": "continue",
+  "route_why": "this host has a readable journal, so the retirement it records is what this converge continues",
+  "state": "done"
+}
