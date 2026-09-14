@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "outcome": "reported",
+  "receipt": null,
+  "why": "a dry run writes no receipt: the node is not running (inactive)"
+}

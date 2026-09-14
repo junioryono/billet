@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "deployment": "dddddddddddddddddddddddddddddddd",
+  "retiring": "control-a",
+  "survivor": "control-b",
+  "transition_id": "0123456789abcdef0123456789abcdef",
+  "reservation": "2026-09-11T10:00:00Z",
+  "row": "already",
+  "completed_by": "control-b",
+  "completed_at": "2026-09-11T10:00:00Z"
+}

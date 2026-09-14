@@ -1,0 +1,7 @@
+{
+  "outcome": "refused",
+  "reason": "managed",
+  "shape": "none",
+  "why": "/usr/bin/billet is absent: nothing to hold through; a bootstrap holds through its staged candidate",
+  "next": "`prepare --validate --candidate C --expect-bootstrap`"
+}

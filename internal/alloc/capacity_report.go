@@ -44,10 +44,10 @@ func (a *Allocator) RecordListenerCapacity(ctx context.Context, tier string, rep
 // not a claim that another process can infer GitHub's present advertisement.
 type TierCapacity struct {
 	Discovery, Pending, Launching, Running, Cleanup, Unknown int
-	Floor, Headroom                                         int
-	ObservedAt                                             string
-	ObservationError                                       string
-	Listener                                               ListenerCapacity
+	Floor, Headroom                                          int
+	ObservedAt                                               string
+	ObservationError                                         string
+	Listener                                                 ListenerCapacity
 }
 
 // CapacityReport reads ownership and charged phases in one ledger snapshot.

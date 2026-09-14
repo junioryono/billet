@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "outcome": "reported",
+  "receipt": null,
+  "why": "no node is installed; the receipt follows the first converge that installs one"
+}

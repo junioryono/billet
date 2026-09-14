@@ -97,6 +97,24 @@ func (b *postgresBackend) dataSources() (ledgerPools, error) {
 	return ledgerPools{writer: writer, reader: reader}, nil
 }
 
+// inspectDataSources is both pools under a read-only default transaction, the
+// reader's own refusal applied to the writer's slot as well, so an inspection
+// cannot write through either.
+func (b *postgresBackend) inspectDataSources() (ledgerPools, error) {
+	if strings.TrimSpace(b.dsn) == "" {
+		return ledgerPools{}, errors.New(
+			"state: the PostgreSQL data source is empty; it is read from the environment " +
+				"variable named by server.state.postgres.dsn_env")
+	}
+
+	inspect, err := registerConn(b.dsn, map[string]string{"default_transaction_read_only": "on"})
+	if err != nil {
+		return ledgerPools{}, err
+	}
+
+	return ledgerPools{writer: inspect, reader: inspect}, nil
+}
+
 // registerConn parses the operator's DSN, adds billet's own startup parameters
 // and hands back the opaque name database/sql should open.
 //
@@ -133,7 +151,7 @@ func registerConn(dsn string, params map[string]string) (string, error) {
 // THE READ-ONLY DEFAULT IS CHECKED ON THE WRITER for the opposite reason: a
 // deployment whose role or database has been set read-only would fail every
 // scheduling write later, one lease at a time, rather than at startup.
-func (*postgresBackend) verifyDurability(ctx context.Context, w *sql.DB) error {
+func (*postgresBackend) verifyDurability(ctx context.Context, w *sql.DB, inspect bool) error {
 	var errs []error
 
 	var synchronous string
@@ -155,7 +173,12 @@ func (*postgresBackend) verifyDurability(ctx context.Context, w *sql.DB) error {
 		return fmt.Errorf("read default_transaction_read_only: %w", err)
 	}
 
-	if strings.EqualFold(readOnly, "on") {
+	// AN INSPECTION'S WRITER IS READ-ONLY BY DESIGN (inspectDataSources), so
+	// the refusal below, which is about a deployment whose role or database has
+	// been set read-only under a control plane, would refuse every healthy
+	// inspection; the setting is still read, so a server answering something
+	// else is noticed.
+	if strings.EqualFold(readOnly, "on") && !inspect {
 		errs = append(errs, errors.New(
 			"default_transaction_read_only is on for the writer, so every scheduling write "+
 				"would be refused; check the role and database settings"))
@@ -608,6 +631,22 @@ func OpenPostgres(ctx context.Context, stateDir, dsn string, opts ...OpenOption)
 // plane holds it, and then VERIFIES the schema rather than migrating it.
 func OpenPostgresAdmin(ctx context.Context, stateDir, dsn string, opts ...OpenOption) (*DB, error) {
 	return openDir(ctx, stateDir, newPostgresBackend(dsn), openMode{admin: true}.with(opts))
+}
+
+// OpenPostgresCompletion opens the shared ledger for a host that must write ONE
+// row and has no business being its controller: the retiring host's tail,
+// completing the retirement row it recorded before it stopped.
+//
+// IT CLAIMS NOTHING AND MIGRATES NOTHING. An admin open would do both whenever
+// the controller exclusion happened to be free — a survivor that is down at
+// that moment is exactly when it would be — and a retired host taking the
+// deployment's claim, or migrating a shared schema with a binary frozen at the
+// release it retired on, is the opposite of what a retirement is for. The
+// schema must be EXACTLY this binary's, so a ledger the survivor has already
+// migrated past is refused with ErrSchemaAhead rather than written to, and the
+// caller hands the row to the survivor instead.
+func OpenPostgresCompletion(ctx context.Context, stateDir, dsn string, opts ...OpenOption) (*DB, error) {
+	return openDir(ctx, stateDir, newPostgresBackend(dsn), openMode{admin: true, completion: true}.with(opts))
 }
 
 // OpenPostgresStandby opens the ledger for a control plane that is WAITING to

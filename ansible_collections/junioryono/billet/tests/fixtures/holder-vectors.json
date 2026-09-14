@@ -1,0 +1,160 @@
+{
+  "vectors": [
+    {
+      "holder": "h1",
+      "valid": true
+    },
+    {
+      "holder": "ci-run-12",
+      "valid": true
+    },
+    {
+      "holder": "ci-${USER}",
+      "valid": true
+    },
+    {
+      "holder": "naïve",
+      "valid": true
+    },
+    {
+      "holder": "a.b_c-d:e@f",
+      "valid": true
+    },
+    {
+      "holder": "日本語",
+      "valid": true
+    },
+    {
+      "holder": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "valid": true
+    },
+    {
+      "holder": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "valid": false
+    },
+    {
+      "holder": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé",
+      "valid": true
+    },
+    {
+      "holder": "ééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé",
+      "valid": false
+    },
+    {
+      "holder": "",
+      "valid": false
+    },
+    {
+      "holder": "a b",
+      "valid": false
+    },
+    {
+      "holder": "a\tb",
+      "valid": false
+    },
+    {
+      "holder": "a\nb",
+      "valid": false
+    },
+    {
+      "holder": "a\rb",
+      "valid": false
+    },
+    {
+      "holder": "a\u000bb",
+      "valid": false
+    },
+    {
+      "holder": "a\fb",
+      "valid": false
+    },
+    {
+      "holder": "a/b",
+      "valid": false
+    },
+    {
+      "holder": "/",
+      "valid": false
+    },
+    {
+      "holder": "ab",
+      "valid": false
+    },
+    {
+      "holder": "a b",
+      "valid": false
+    },
+    {
+      "holder": "a b",
+      "valid": false
+    },
+    {
+      "holder": "a b",
+      "valid": false
+    },
+    {
+      "holder": "a b",
+      "valid": false
+    },
+    {
+      "holder": "a\u2028b",
+      "valid": false
+    },
+    {
+      "holder": "a\u2029b",
+      "valid": false
+    },
+    {
+      "holder": "a b",
+      "valid": false
+    },
+    {
+      "holder": "a b",
+      "valid": false
+    },
+    {
+      "holder": "a　b",
+      "valid": false
+    },
+    {
+      "holder": "a\u0000b",
+      "valid": false
+    },
+    {
+      "holder": "a\u001fb",
+      "valid": false
+    },
+    {
+      "holder": "ab",
+      "valid": false
+    },
+    {
+      "holder": "ab",
+      "valid": false
+    },
+    {
+      "holder": "ab",
+      "valid": false
+    },
+    {
+      "holder": "a�b",
+      "valid": false
+    },
+    {
+      "holder": "a​b",
+      "valid": true
+    },
+    {
+      "holder": "a‍b",
+      "valid": true
+    },
+    {
+      "holder": "a⁠b",
+      "valid": true
+    },
+    {
+      "holder": "a﻿b",
+      "valid": true
+    }
+  ]
+}

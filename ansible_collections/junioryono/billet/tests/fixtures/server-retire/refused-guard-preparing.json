@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "outcome": "refused",
+  "reason": "guard",
+  "why": "the guard is still preparing; settle it (`converge-guard settle`) before a retirement mutates anything under it",
+  "state": "nothing"
+}

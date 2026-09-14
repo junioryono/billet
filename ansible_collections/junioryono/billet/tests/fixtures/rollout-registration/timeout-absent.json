@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "outcome": "timeout",
+  "node": "node-a",
+  "incarnation": "0000000000000000000000000000bbbb",
+  "deployment": {
+    "bound": true,
+    "id": "dddddddddddddddddddddddddddddddd"
+  },
+  "last": null
+}

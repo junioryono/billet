@@ -99,6 +99,14 @@ var ErrAuthorityLost = errors.New("wirecert: this deployment had a certificate a
 // ErrForeignAuthority means the CA on disk belongs to a different deployment.
 var ErrForeignAuthority = errors.New("wirecert: this authority was issued for another deployment")
 
+// ErrCredentialPolicy is a credential billet refuses on ITS OWN RULE rather
+// than one it could not read: a symlink at a name it reads, a file that is not
+// a regular one, a private key anyone else can read, or bytes past the cap. A
+// caller tells the two apart because they need different things of an
+// operator: a rule refused needs a change on the host, and a read that failed
+// may be asked again.
+var ErrCredentialPolicy = errors.New("wirecert: the credential does not meet billet's rule")
+
 // CA is a deployment's certificate authority.
 type CA struct {
 	deployment string
@@ -409,6 +417,30 @@ func markerPath(stateDir string) string {
 
 // CADir is where a deployment's authority lives inside its state directory.
 func CADir(stateDir string) string { return filepath.Join(stateDir, "ca") }
+
+// THE AUTHORITY'S FILES BY NAME, exported so the command that hands a
+// root-created authority back to the service account names exactly what this
+// package writes and nothing else; a second spelling of any of these in cmd/
+// is a file the hand-back misses or a file it should never have touched.
+
+// AuthorityMarkerPath is the marker that witnesses an authority was created.
+func AuthorityMarkerPath(stateDir string) string { return markerPath(stateDir) }
+
+// CACertPath is the current authority's certificate.
+func CACertPath(stateDir string) string { return filepath.Join(CADir(stateDir), "ca.crt") }
+
+// CAKeyPath is the current authority's private key.
+func CAKeyPath(stateDir string) string { return filepath.Join(CADir(stateDir), "ca.key") }
+
+// PreviousCACertPath is the retiring authority's certificate during a rotation.
+func PreviousCACertPath(stateDir string) string {
+	return filepath.Join(CADir(stateDir), previousCAFile)
+}
+
+// PreviousCAKeyPath is the retiring authority's key during a rotation.
+func PreviousCAKeyPath(stateDir string) string {
+	return filepath.Join(CADir(stateDir), previousCAKeyFile)
+}
 
 // noteAuthority records that an authority exists, idempotently.
 func noteAuthority(stateDir, deployment string) error {
@@ -893,12 +925,12 @@ func readSecret(path string) ([]byte, error) {
 
 	if info.Mode()&os.ModeSymlink != 0 {
 		return nil, fmt.Errorf(
-			"wirecert: %s is a symlink; billet reads a private key only from the path it was "+
-				"given, so that what it loads is what an operator secured", path)
+			"%w: %s is a symlink; billet reads a private key only from the path it was "+
+				"given, so that what it loads is what an operator secured", ErrCredentialPolicy, path)
 	}
 
 	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("wirecert: %s is not a regular file", path)
+		return nil, fmt.Errorf("%w: %s is not a regular file", ErrCredentialPolicy, path)
 	}
 
 	if err := secretMode(path, info); err != nil {
@@ -917,8 +949,8 @@ func readSecret(path string) ([]byte, error) {
 func secretMode(path string, info os.FileInfo) error {
 	if perm := info.Mode().Perm(); perm&0o077 != 0 {
 		return fmt.Errorf(
-			"wirecert: %s is mode %04o and must not be readable by anyone else; it signs every "+
-				"node identity in this deployment. Run: chmod 600 %s", path, perm, path)
+			"%w: %s is mode %04o and must not be readable by anyone else; it signs every "+
+				"node identity in this deployment. Run: chmod 600 %s", ErrCredentialPolicy, path, perm, path)
 	}
 	return nil
 }
@@ -932,11 +964,11 @@ func readPublic(path string) ([]byte, error) {
 	}
 
 	if info.Mode()&os.ModeSymlink != 0 {
-		return nil, fmt.Errorf("wirecert: %s is a symlink", path)
+		return nil, fmt.Errorf("%w: %s is a symlink", ErrCredentialPolicy, path)
 	}
 
 	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("wirecert: %s is not a regular file", path)
+		return nil, fmt.Errorf("%w: %s is not a regular file", ErrCredentialPolicy, path)
 	}
 
 	return readCapped(path)
@@ -963,7 +995,7 @@ func readCappedChecked(path string, check func(os.FileInfo) error) ([]byte, erro
 	f, info, err := regularfile.Open(path, regularfile.Options{NoFollow: true})
 	if err != nil {
 		if errors.Is(err, regularfile.ErrNotRegular) {
-			return nil, fmt.Errorf("wirecert: %s is not a regular file: %w", path, err)
+			return nil, fmt.Errorf("%w: %s is not a regular file: %w", ErrCredentialPolicy, path, err)
 		}
 
 		return nil, err
@@ -979,8 +1011,8 @@ func readCappedChecked(path string, check func(os.FileInfo) error) ([]byte, erro
 	body, err := regularfile.ReadAllLimited(f, path, maxPEM)
 	if err != nil {
 		if errors.Is(err, regularfile.ErrTooLarge) {
-			return nil, fmt.Errorf("wirecert: %s is larger than %d bytes, which no key or "+
-				"certificate is", path, maxPEM)
+			return nil, fmt.Errorf("%w: %s is larger than %d bytes, which no key or "+
+				"certificate is", ErrCredentialPolicy, path, maxPEM)
 		}
 
 		return nil, err

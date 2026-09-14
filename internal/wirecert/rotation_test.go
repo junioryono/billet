@@ -42,7 +42,7 @@ func TestARotationKeepsBothGenerationsWorking(t *testing.T) {
 		t.Fatalf("issue: %v", err)
 	}
 
-	fresh, err := wirecert.Rotate(dir, rotDeployment)
+	fresh, err := wirecert.Rotate(t.Context(), dir, rotDeployment)
 	if err != nil {
 		t.Fatalf("rotate: %v", err)
 	}
@@ -135,12 +135,12 @@ func TestRetiringDropsTheOldAuthority(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 
-	fresh, err := wirecert.Rotate(dir, rotDeployment)
+	fresh, err := wirecert.Rotate(t.Context(), dir, rotDeployment)
 	if err != nil {
 		t.Fatalf("rotate: %v", err)
 	}
 
-	if err := wirecert.Retire(dir, rotDeployment); err != nil {
+	if err := wirecert.Retire(t.Context(), dir, rotDeployment); err != nil {
 		t.Fatalf("retire: %v", err)
 	}
 
@@ -193,11 +193,11 @@ func TestASecondRotationIsRefused(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 
-	if _, err := wirecert.Rotate(dir, rotDeployment); err != nil {
+	if _, err := wirecert.Rotate(t.Context(), dir, rotDeployment); err != nil {
 		t.Fatalf("rotate: %v", err)
 	}
 
-	if _, err := wirecert.Rotate(dir, rotDeployment); err == nil {
+	if _, err := wirecert.Rotate(t.Context(), dir, rotDeployment); err == nil {
 		t.Fatal("a second rotation started while the first was still running")
 	}
 }

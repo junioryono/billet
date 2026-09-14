@@ -46,6 +46,17 @@ type backend interface {
 	// that is query_only; on PostgreSQL it is a read-only default transaction.
 	dataSources() (ledgerPools, error)
 
+	// inspectDataSources builds the connection strings for a handle that may
+	// only read, on the engine's own terms: the pools an OpenInspect opens.
+	//
+	// SEPARATE FROM dataSources BECAUSE READ-ONLY IS AN ENGINE PROPERTY. On
+	// SQLite it is mode=ro plus query_only on both pools, and never immutable=1,
+	// which reads a live WAL without its locks and answers with rows that were
+	// never committed; on PostgreSQL it is a read-only default transaction on
+	// both. A DSN that reused the writer's ordinary settings would be a handle
+	// whose refusal to write rested on Tx's check alone.
+	inspectDataSources() (ledgerPools, error)
+
 	// prepare learns whatever the backend needs from the open connection, once,
 	// before anything else uses it.
 	//
@@ -59,7 +70,11 @@ type backend interface {
 	// verifyDurability proves the settings that were asked for actually took
 	// effect. On SQLite that is the WAL/synchronous/foreign-keys readback that
 	// catches a state directory on a network filesystem.
-	verifyDurability(ctx context.Context, w *sql.DB) error
+	//
+	// inspect says the handle is a read-only inspection, whose writer pool is
+	// deliberately read-only: the PostgreSQL check that refuses a read-only
+	// writer as a misconfigured deployment does not apply to it.
+	verifyDurability(ctx context.Context, w *sql.DB, inspect bool) error
 
 	// integrityCheck refuses to serve from a corrupt ledger.
 	integrityCheck(ctx context.Context, w *sql.DB) error

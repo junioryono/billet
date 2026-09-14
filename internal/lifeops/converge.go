@@ -10,6 +10,7 @@ import (
 	"os/user"
 	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/deploy"
+	"github.com/junioryono/billet/internal/regularfile"
 )
 
 // DefaultStabilityWait is how long a service must keep the process it started
@@ -180,6 +182,13 @@ type rootFS interface {
 	// directory is writable by the service account: a name checked and then
 	// chowned is a name that can be replaced in between.
 	OpenFile(name string, flag int, perm fs.FileMode) (ownedFile, error)
+	// OpenRegular resolves a FILE inside the opened directory through the
+	// identity-first regular-file open: never following a link at the name,
+	// and answering a descriptor only for a regular file, so a FIFO or a device
+	// planted at one of the repaired names is refused rather than waited on
+	// inside the open (a plain open of a FIFO blocks until a writer appears,
+	// with the caller's locks held).
+	OpenRegular(name string) (ownedFile, error)
 	Close() error
 }
 
@@ -273,6 +282,32 @@ func (r *osRoot) OpenFile(name string, flag int, perm fs.FileMode) (ownedFile, e
 	return r.Root.OpenFile(name, flag, perm)
 }
 
+// OpenRegular keeps the root's containment for a nested name: the PARENT is
+// resolved by os.Root, which refuses a component that escapes the directory
+// (a symlink planted at `ca` after its own check would otherwise carry the
+// walk to another directory's `ca.key`), and only the final component is
+// opened by the regular-file rule relative to that held parent descriptor.
+func (r *osRoot) OpenRegular(name string) (ownedFile, error) {
+	parent := filepath.Dir(name)
+	if parent == "" {
+		parent = "."
+	}
+
+	dir, err := r.Root.OpenFile(parent, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	defer func() { _ = dir.Close() }()
+
+	f, _, err := regularfile.OpenAt(dir, filepath.Base(name))
+	if err != nil {
+		return nil, err
+	}
+
+	return f, nil
+}
+
 // Plan decides what `up` would do, and every reason it would not.
 //
 // IT COLLECTS REFUSALS RATHER THAN RETURNING THE FIRST. An operator who has to
@@ -346,8 +381,11 @@ func (c *Converger) Plan(ctx context.Context, req UpRequest) (UpPlan, error) {
 		}
 	}
 
-	if req.WantServer && report.Server.StateDirectory != "" {
-		plan.ServerState = filepath.Join(stateRoot, report.Server.StateDirectory)
+	// THE CONFIGURED DIRECTORY, which directoryRefusals admitted as one entry
+	// of the unit's list; the directive's rendered text can name several and
+	// is not a path.
+	if req.WantServer && req.ServerStateDir != "" {
+		plan.ServerState = filepath.Clean(req.ServerStateDir)
 	}
 
 	if len(accountRefusals) == 0 {
@@ -735,8 +773,16 @@ func directoryRefusals(s ServiceFacts, spec unitSpec) []Refusal {
 			continue
 		}
 
-		want := filepath.Join(d.root, d.declared)
-		if filepath.Clean(d.configured) != want {
+		// systemd renders a directory directive as its entries separated by
+		// spaces (the node unit declares its locks and its registration
+		// record); the configured directory must be one of them, whole.
+		var wants []string
+		for _, entry := range strings.Fields(d.declared) {
+			wants = append(wants, filepath.Join(d.root, entry))
+		}
+
+		if !slices.Contains(wants, filepath.Clean(d.configured)) {
+			want := strings.Join(wants, " or ")
 			refusals = append(refusals, Refusal{
 				What: fmt.Sprintf("%s is %s, but %s can only write %s",
 					d.what, d.configured, s.Name, want),
@@ -1086,8 +1132,21 @@ func (c *Converger) RepairPaths(
 		//
 		// MEASURED: os.Root.OpenFile opens a directory under O_RDONLY|O_NOFOLLOW
 		// and the descriptor stats and chowns like any other, so the authority's
-		// own directory needs no second mechanism.
-		f, err := root.OpenFile(target.Name, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+		// own directory needs no second mechanism. A FILE target goes through
+		// the root's regular-file open, which never blocks in the open: a plain
+		// open of a FIFO planted at one of these names would wait for a writer
+		// with the caller's authority locks held.
+		var (
+			f   ownedFile
+			err error
+		)
+
+		if target.Dir {
+			f, err = root.OpenFile(target.Name, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+		} else {
+			f, err = root.OpenRegular(target.Name)
+		}
+
 		if err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
 				continue
@@ -1264,8 +1323,14 @@ func (c *Converger) Identity(req UpRequest) (int, int, error) {
 // IS the readiness signal. The window that follows exists for what readiness
 // cannot cover — a service that reaches ready and then dies, which
 // Restart=on-failure turns into a crash loop reading "active" at any instant.
+//
+// THE START RUNS UNDER THE CALLER'S CONTEXT AND NO DEADLINE OF ITS OWN: the
+// caller derives one from the unit's own bound (deploy.UnitStartTimeout plus
+// a margin), because a unit's start takes as long as its readiness takes and
+// the inspector's timeout is a property read's. The stability samples that
+// follow are property reads, bounded as every property read is.
 func (c *Converger) StartAndProve(ctx context.Context, unit string) (string, error) {
-	if _, err := c.inspector.run(ctx, c.inspector.systemctl, []string{"start", "--", unit}); err != nil {
+	if _, err := c.inspector.exec(ctx, []string{"start", "--", unit}); err != nil {
 		// A FAILED START IS NOT ALWAYS A BROKEN ONE. The host role can render the
 		// server unit with an assertion that holds it deliberately: a host whose
 		// ledger volume is mounted and proved but which has not been given a
@@ -1469,7 +1534,10 @@ const unitDisabled = "disabled"
 
 // Enable commits a unit to future boots.
 func (c *Converger) Enable(ctx context.Context, unit string) error {
-	if _, err := c.inspector.run(ctx, c.inspector.systemctl, []string{"enable", "--", unit}); err != nil {
+	ctx, cancel := c.inspector.bounded(ctx)
+	defer cancel()
+
+	if _, err := c.inspector.exec(ctx, []string{"enable", "--", unit}); err != nil {
 		return fmt.Errorf("enable %s: %w", unit, err)
 	}
 
@@ -1484,12 +1552,16 @@ func (c *Converger) Enable(ctx context.Context, unit string) error {
 // calls because `enable --now` commits a unit to every future boot before
 // anything proved it can run, the rule every other unit here follows.
 func (c *Converger) StartTimer(ctx context.Context, unit string) error {
-	if _, err := c.inspector.run(ctx, c.inspector.systemctl, []string{"start", "--", unit}); err != nil {
+	// A TIMER'S START IS IMMEDIATE, a property read's kind of operation, so it
+	// runs under the inspector's timeout as the read after it does.
+	ctx, cancel := c.inspector.bounded(ctx)
+	defer cancel()
+
+	if _, err := c.inspector.exec(ctx, []string{"start", "--", unit}); err != nil {
 		return fmt.Errorf("start %s: %w", unit, err)
 	}
 
-	out, err := c.inspector.run(ctx, c.inspector.systemctl,
-		[]string{"show", "--property=ActiveState", "--value", "--", unit})
+	out, err := c.inspector.exec(ctx, []string{"show", "--property=ActiveState", "--value", "--", unit})
 	if err != nil {
 		return fmt.Errorf("prove %s is armed: %w", unit, err)
 	}
@@ -1559,8 +1631,15 @@ type StopResult struct {
 // whose main process ignored SIGTERM is killed at TimeoutStopSec — after which
 // the unit is inactive and `failed`. A caller about to report "this host is
 // down" needs the state the manager holds now, not the return code of a command.
+//
+// THE STOP RUNS UNDER THE CALLER'S CONTEXT AND NO DEADLINE OF ITS OWN: a
+// node's stop is a drain that takes as long as the compute it waits for, and
+// the caller decides the bound (deploy.UnitStopTimeout plus a margin for the
+// lifecycle commands, the migration's own deadline for an endpoint migration,
+// none at all for the host transaction). The observation that follows is a
+// property read, bounded as every property read is.
 func (c *Converger) StopAndProve(ctx context.Context, unit string) (StopResult, error) {
-	if _, err := c.inspector.run(ctx, c.inspector.systemctl, []string{"stop", "--", unit}); err != nil {
+	if _, err := c.inspector.exec(ctx, []string{"stop", "--", unit}); err != nil {
 		return StopResult{}, fmt.Errorf("stop %s: %w", unit, err)
 	}
 
@@ -1700,7 +1779,10 @@ func (c *Converger) CollateralNote() string {
 // boot that nothing established can run — and must equally not disable one an
 // operator had enabled before it arrived.
 func (c *Converger) Disable(ctx context.Context, unit string) error {
-	if _, err := c.inspector.run(ctx, c.inspector.systemctl, []string{"disable", "--", unit}); err != nil {
+	ctx, cancel := c.inspector.bounded(ctx)
+	defer cancel()
+
+	if _, err := c.inspector.exec(ctx, []string{"disable", "--", unit}); err != nil {
 		return fmt.Errorf("disable %s: %w", unit, err)
 	}
 

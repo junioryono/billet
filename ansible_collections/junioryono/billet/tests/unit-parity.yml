@@ -217,6 +217,49 @@
         - ReadOnlyPaths
         - WantedBy
 
+    # THE NODE'S RUNTIME DIRECTORIES ARE THE NODE'S ALONE, ON EVERY VARIANT. The
+    # registration record lives under billet/registration; a directive conditional
+    # on one variant, a later reset, a placement outside [Service], or a
+    # RuntimeDirectoryPreserve other than `no` would each pass the steady-state
+    # comparison above, and a server render declaring the same directory would
+    # re-own and remove the node's record at its own start and stop (measured on
+    # systemd 255, 2026-09-09).
+    - name: The node declares its runtime directories once, in [Service], on every variant
+      ansible.builtin.assert:
+        that:
+          - item.text | regex_findall('(?m)^RuntimeDirectory=(.*)$') | map('trim') | list
+            == ['billet/locks billet/registration']
+          - (item.text.split('[Service]') | last).split('[Install]') | first
+            is search('(?m)^RuntimeDirectory=billet/locks billet/registration$')
+          - (item.text | regex_findall('(?m)^RuntimeDirectoryPreserve=(.*)$') | map('trim') | list) in [[], ['no']]
+        fail_msg: >-
+          {{ item.name }} declares RuntimeDirectory as
+          {{ item.text | regex_findall('(?m)^RuntimeDirectory=(.*)$') | map('trim') | list }}
+          and RuntimeDirectoryPreserve as
+          {{ item.text | regex_findall('(?m)^RuntimeDirectoryPreserve=(.*)$') | map('trim') | list }};
+          want exactly one `billet/locks billet/registration` in [Service] and no preservation.
+      loop:
+        - { name: packaged node, text: "{{ packaged_node }}" }
+        - { name: role node steady, text: "{{ role_node_steady }}" }
+        - { name: role node with environment, text: "{{ role_node_with_environment }}" }
+        - { name: role node firecracker, text: "{{ role_node_firecracker }}" }
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: No server render declares a runtime directory
+      ansible.builtin.assert:
+        that:
+          - item.text is not search('(?m)^RuntimeDirectory')
+        fail_msg: "{{ item.name }} declares a RuntimeDirectory; the node's registration directory is the node's alone."
+      loop:
+        - { name: packaged server, text: "{{ packaged_server }}" }
+        - { name: role server steady, text: "{{ role_server_steady }}" }
+        - { name: role server legacy, text: "{{ role_server_legacy }}" }
+        - { name: role server probe, text: "{{ role_server_probe }}" }
+        - { name: role server ledger, text: "{{ role_server_ledger }}" }
+      loop_control:
+        label: "{{ item.name }}"
+
     # THE SCHEDULED UPDATERS AGREE ON EVERYTHING THAT DECIDES WHAT THEY DO: who
     # runs them, what they run, when, and for how long. A timer the package
     # fires every five minutes and the role fires hourly is two products.

@@ -342,7 +342,7 @@ func TestARotatedAuthorityIsCarriedWhenItIsPublished(t *testing.T) {
 		t.Fatalf("Adopt: %v", err)
 	}
 
-	if _, err := wirecert.Rotate(leader, deploymentA); err != nil {
+	if _, err := wirecert.Rotate(t.Context(), leader, deploymentA); err != nil {
 		t.Fatalf("Rotate: %v", err)
 	}
 

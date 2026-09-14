@@ -1,0 +1,695 @@
+{
+  "description": "The vector table of billet's endpoint representation (internal/endpoint in Go, plugins/module_utils/endpoint.py in Python): both are held to every row. An accepted row names the typed fields Parse yields and the canonical text; a refused row names the one kind it is refused for and the words the diagnostic must carry. A pair of input and tls appears once.",
+  "vectors": [
+    {
+      "input": "control.example:8443",
+      "tls": true,
+      "scheme": "https",
+      "kind": "dns",
+      "host": "control.example",
+      "rooted": false,
+      "port": 8443,
+      "canonical": "https://control.example:8443"
+    },
+    {
+      "input": "control.example.:8443",
+      "tls": true,
+      "scheme": "https",
+      "kind": "dns",
+      "host": "control.example",
+      "rooted": true,
+      "port": 8443,
+      "canonical": "https://control.example.:8443"
+    },
+    {
+      "input": "CONTROL.Example:8443",
+      "tls": true,
+      "scheme": "https",
+      "kind": "dns",
+      "host": "control.example",
+      "rooted": false,
+      "port": 8443,
+      "canonical": "https://control.example:8443"
+    },
+    {
+      "input": "control.example",
+      "tls": true,
+      "scheme": "https",
+      "kind": "dns",
+      "host": "control.example",
+      "rooted": false,
+      "port": 443,
+      "canonical": "https://control.example:443"
+    },
+    {
+      "input": "control.example",
+      "tls": false,
+      "scheme": "http",
+      "kind": "dns",
+      "host": "control.example",
+      "rooted": false,
+      "port": 80,
+      "canonical": "http://control.example:80"
+    },
+    {
+      "input": "control.example:08443",
+      "tls": true,
+      "scheme": "https",
+      "kind": "dns",
+      "host": "control.example",
+      "rooted": false,
+      "port": 8443,
+      "canonical": "https://control.example:8443"
+    },
+    {
+      "input": "http://control.example:443",
+      "tls": false,
+      "scheme": "http",
+      "kind": "dns",
+      "host": "control.example",
+      "rooted": false,
+      "port": 443,
+      "canonical": "http://control.example:443"
+    },
+    {
+      "input": "https://control.example",
+      "tls": true,
+      "scheme": "https",
+      "kind": "dns",
+      "host": "control.example",
+      "rooted": false,
+      "port": 443,
+      "canonical": "https://control.example:443"
+    },
+    {
+      "input": "HTTPS://control.example:8443",
+      "tls": true,
+      "scheme": "https",
+      "kind": "dns",
+      "host": "control.example",
+      "rooted": false,
+      "port": 8443,
+      "canonical": "https://control.example:8443"
+    },
+    {
+      "input": "127.0.0.1:8080",
+      "tls": false,
+      "scheme": "http",
+      "kind": "literal",
+      "host": "127.0.0.1",
+      "rooted": false,
+      "port": 8080,
+      "canonical": "http://127.0.0.1:8080"
+    },
+    {
+      "input": "127.0.0.1:8443",
+      "tls": true,
+      "scheme": "https",
+      "kind": "literal",
+      "host": "127.0.0.1",
+      "rooted": false,
+      "port": 8443,
+      "canonical": "https://127.0.0.1:8443"
+    },
+    {
+      "input": "203.0.113.7:8443",
+      "tls": false,
+      "scheme": "http",
+      "kind": "literal",
+      "host": "203.0.113.7",
+      "rooted": false,
+      "port": 8443,
+      "canonical": "http://203.0.113.7:8443"
+    },
+    {
+      "input": "localhost:8080",
+      "tls": false,
+      "scheme": "http",
+      "kind": "dns",
+      "host": "localhost",
+      "rooted": false,
+      "port": 8080,
+      "canonical": "http://localhost:8080"
+    },
+    {
+      "input": "[2001:DB8::1]:8443",
+      "tls": true,
+      "scheme": "https",
+      "kind": "literal",
+      "host": "2001:db8::1",
+      "rooted": false,
+      "port": 8443,
+      "canonical": "https://[2001:db8::1]:8443"
+    },
+    {
+      "input": "[2001:db8:0:0:0:0:0:1]:8443",
+      "tls": true,
+      "scheme": "https",
+      "kind": "literal",
+      "host": "2001:db8::1",
+      "rooted": false,
+      "port": 8443,
+      "canonical": "https://[2001:db8::1]:8443"
+    },
+    {
+      "input": "[2001:db8::1:0:0:1]:8443",
+      "tls": true,
+      "scheme": "https",
+      "kind": "literal",
+      "host": "2001:db8::1:0:0:1",
+      "rooted": false,
+      "port": 8443,
+      "canonical": "https://[2001:db8::1:0:0:1]:8443"
+    },
+    {
+      "input": "[2001:db8:0:0:1::1]:8443",
+      "tls": true,
+      "scheme": "https",
+      "kind": "literal",
+      "host": "2001:db8::1:0:0:1",
+      "rooted": false,
+      "port": 8443,
+      "canonical": "https://[2001:db8::1:0:0:1]:8443"
+    },
+    {
+      "input": "[::ffff:192.0.2.1]:8443",
+      "tls": true,
+      "scheme": "https",
+      "kind": "literal",
+      "host": "192.0.2.1",
+      "rooted": false,
+      "port": 8443,
+      "canonical": "https://192.0.2.1:8443"
+    },
+    {
+      "input": "[::1]:8443",
+      "tls": true,
+      "scheme": "https",
+      "kind": "literal",
+      "host": "::1",
+      "rooted": false,
+      "port": 8443,
+      "canonical": "https://[::1]:8443"
+    },
+    {
+      "input": "192.0.2.1.:8443",
+      "tls": true,
+      "scheme": "https",
+      "kind": "dns",
+      "host": "192.0.2.1",
+      "rooted": true,
+      "port": 8443,
+      "canonical": "https://192.0.2.1.:8443"
+    },
+    {
+      "input": "0.0.0.0:8443",
+      "tls": true,
+      "scheme": "https",
+      "kind": "literal",
+      "host": "0.0.0.0",
+      "rooted": false,
+      "port": 8443,
+      "canonical": "https://0.0.0.0:8443"
+    },
+    {
+      "input": "[::]:8443",
+      "tls": true,
+      "scheme": "https",
+      "kind": "literal",
+      "host": "::",
+      "rooted": false,
+      "port": 8443,
+      "canonical": "https://[::]:8443"
+    },
+    {
+      "input": "xn--bcher-kva.example:8443",
+      "tls": true,
+      "scheme": "https",
+      "kind": "dns",
+      "host": "xn--bcher-kva.example",
+      "rooted": false,
+      "port": 8443,
+      "canonical": "https://xn--bcher-kva.example:8443"
+    },
+    {
+      "input": "control.example:1",
+      "tls": true,
+      "scheme": "https",
+      "kind": "dns",
+      "host": "control.example",
+      "rooted": false,
+      "port": 1,
+      "canonical": "https://control.example:1"
+    },
+    {
+      "input": "control.example:65535",
+      "tls": true,
+      "scheme": "https",
+      "kind": "dns",
+      "host": "control.example",
+      "rooted": false,
+      "port": 65535,
+      "canonical": "https://control.example:65535"
+    },
+    {
+      "input": "[fe80::1%25eth0]:8443",
+      "tls": true,
+      "refused": "zone",
+      "words": [
+        "zone"
+      ]
+    },
+    {
+      "input": "[::ffff:192.0.2.1%25eth0]:8443",
+      "tls": true,
+      "refused": "zone",
+      "words": [
+        "zone"
+      ]
+    },
+    {
+      "input": "[2001:db8::1%25eth0]:8443",
+      "tls": true,
+      "refused": "zone",
+      "words": [
+        "zone"
+      ]
+    },
+    {
+      "input": "[fe80::1%eth0]:8443",
+      "tls": true,
+      "refused": "syntax",
+      "words": [
+        "escape"
+      ]
+    },
+    {
+      "input": "[fe80::1%25]:8443",
+      "tls": true,
+      "refused": "syntax",
+      "words": [
+        "zone"
+      ]
+    },
+    {
+      "input": "https://control.example:8443?",
+      "tls": true,
+      "refused": "route",
+      "words": [
+        "query"
+      ]
+    },
+    {
+      "input": "https://control.example:8443#",
+      "tls": true,
+      "refused": "route",
+      "words": [
+        "fragment"
+      ]
+    },
+    {
+      "input": "https://control.example:8443/%2F",
+      "tls": true,
+      "refused": "route",
+      "words": [
+        "path"
+      ]
+    },
+    {
+      "input": "https://control.example:8443/v1",
+      "tls": true,
+      "refused": "route",
+      "words": [
+        "path"
+      ]
+    },
+    {
+      "input": "https://control.example:8443/",
+      "tls": true,
+      "refused": "route",
+      "words": [
+        "path"
+      ]
+    },
+    {
+      "input": "https://u:p@control.example:8443",
+      "tls": true,
+      "refused": "route",
+      "words": [
+        "userinfo"
+      ]
+    },
+    {
+      "input": "https://u%41:p%41@control.example:8443",
+      "tls": true,
+      "refused": "route",
+      "words": [
+        "userinfo"
+      ]
+    },
+    {
+      "input": "https://u%ZZ:p@control.example:8443",
+      "tls": true,
+      "refused": "syntax",
+      "words": [
+        "escape"
+      ]
+    },
+    {
+      "input": "https://u:p%ZZ@control.example:8443",
+      "tls": true,
+      "refused": "syntax",
+      "words": [
+        "escape"
+      ]
+    },
+    {
+      "input": "https://control.example:8443?x",
+      "tls": true,
+      "refused": "route",
+      "words": [
+        "query"
+      ]
+    },
+    {
+      "input": "https://control.example:8443?%ZZ",
+      "tls": true,
+      "refused": "route",
+      "words": [
+        "query"
+      ]
+    },
+    {
+      "input": "https://control.example:8443#f",
+      "tls": true,
+      "refused": "route",
+      "words": [
+        "fragment"
+      ]
+    },
+    {
+      "input": "https://control.example:8443/%ZZ",
+      "tls": true,
+      "refused": "syntax",
+      "words": [
+        "escape"
+      ]
+    },
+    {
+      "input": "https://control.example:8443#%ZZ",
+      "tls": true,
+      "refused": "syntax",
+      "words": [
+        "escape"
+      ]
+    },
+    {
+      "input": "https://%ZZ.example:8443",
+      "tls": true,
+      "refused": "syntax",
+      "words": [
+        "escape"
+      ]
+    },
+    {
+      "input": "con%41trol.example:8443",
+      "tls": true,
+      "refused": "syntax",
+      "words": [
+        "escape"
+      ]
+    },
+    {
+      "input": "%41:8443",
+      "tls": true,
+      "refused": "syntax",
+      "words": [
+        "escape"
+      ]
+    },
+    {
+      "input": "https://con%41trol.example:",
+      "tls": true,
+      "refused": "syntax",
+      "words": [
+        "escape"
+      ]
+    },
+    {
+      "input": "con%25trol.example:8443",
+      "tls": true,
+      "refused": "grammar",
+      "words": [
+        "not a hostname character"
+      ]
+    },
+    {
+      "input": "https://b%C3%BCcher.example:8443",
+      "tls": true,
+      "refused": "grammar",
+      "words": [
+        "ASCII"
+      ]
+    },
+    {
+      "input": "2001:db8::1:8443",
+      "tls": true,
+      "refused": "syntax",
+      "words": [
+        "port"
+      ]
+    },
+    {
+      "input": "control.example:+8443",
+      "tls": true,
+      "refused": "syntax",
+      "words": [
+        "port"
+      ]
+    },
+    {
+      "input": "https://control.example:８４４３",
+      "tls": true,
+      "refused": "syntax",
+      "words": [
+        "port"
+      ]
+    },
+    {
+      "input": "control.example:²",
+      "tls": true,
+      "refused": "syntax",
+      "words": [
+        "port"
+      ]
+    },
+    {
+      "input": "control.example:0",
+      "tls": true,
+      "refused": "port",
+      "words": [
+        "1 to 65535"
+      ]
+    },
+    {
+      "input": "control.example:65536",
+      "tls": true,
+      "refused": "port",
+      "words": [
+        "1 to 65535"
+      ]
+    },
+    {
+      "input": "control.example:",
+      "tls": true,
+      "refused": "port",
+      "words": [
+        "empty"
+      ]
+    },
+    {
+      "input": "https://:",
+      "tls": true,
+      "refused": "port",
+      "words": [
+        "empty"
+      ]
+    },
+    {
+      "input": "https://:8443",
+      "tls": true,
+      "refused": "host",
+      "words": [
+        "no host"
+      ]
+    },
+    {
+      "input": "https://:8443/v1",
+      "tls": true,
+      "refused": "route",
+      "words": [
+        "path"
+      ]
+    },
+    {
+      "input": "https://control.example:/v1",
+      "tls": true,
+      "refused": "route",
+      "words": [
+        "path"
+      ]
+    },
+    {
+      "input": "control.example:?",
+      "tls": true,
+      "refused": "route",
+      "words": [
+        "query"
+      ]
+    },
+    {
+      "input": "http://control.example:8443?",
+      "tls": true,
+      "refused": "scheme",
+      "words": [
+        "contradicts"
+      ]
+    },
+    {
+      "input": "//control.example:8443",
+      "tls": true,
+      "refused": "host",
+      "words": [
+        "no host"
+      ]
+    },
+    {
+      "input": "",
+      "tls": true,
+      "refused": "host",
+      "words": [
+        "no host"
+      ]
+    },
+    {
+      "input": "https://[control.example]:8443",
+      "tls": true,
+      "refused": "syntax",
+      "words": [
+        "invalid"
+      ]
+    },
+    {
+      "input": "https://[192.0.2.1]:8443",
+      "tls": true,
+      "refused": "syntax",
+      "words": [
+        "invalid"
+      ]
+    },
+    {
+      "input": "https://[]:8443",
+      "tls": true,
+      "refused": "syntax",
+      "words": [
+        "invalid"
+      ]
+    },
+    {
+      "input": "control.example:8443\u0001",
+      "tls": true,
+      "refused": "syntax",
+      "words": [
+        "control character"
+      ]
+    },
+    {
+      "input": "con\ttrol.example:8443",
+      "tls": true,
+      "refused": "syntax",
+      "words": [
+        "control character"
+      ]
+    },
+    {
+      "input": "bücher.example:8443",
+      "tls": true,
+      "refused": "grammar",
+      "words": [
+        "ASCII"
+      ]
+    },
+    {
+      "input": "under_score.example:8443",
+      "tls": true,
+      "refused": "grammar",
+      "words": [
+        "underscore"
+      ]
+    },
+    {
+      "input": "control_example:8443",
+      "tls": true,
+      "refused": "grammar",
+      "words": [
+        "underscore"
+      ]
+    },
+    {
+      "input": "a..b:8443",
+      "tls": true,
+      "refused": "grammar",
+      "words": [
+        "empty label"
+      ]
+    },
+    {
+      "input": ".a:8443",
+      "tls": true,
+      "refused": "grammar",
+      "words": [
+        "empty label"
+      ]
+    },
+    {
+      "input": "-a.example:8443",
+      "tls": true,
+      "refused": "grammar",
+      "words": [
+        "begins with a hyphen"
+      ]
+    },
+    {
+      "input": "a-.example:8443",
+      "tls": true,
+      "refused": "grammar",
+      "words": [
+        "ends with a hyphen"
+      ]
+    },
+    {
+      "input": "http://x:1",
+      "tls": true,
+      "refused": "scheme",
+      "words": [
+        "contradicts"
+      ]
+    },
+    {
+      "input": "https://x:1",
+      "tls": false,
+      "refused": "scheme",
+      "words": [
+        "contradicts"
+      ]
+    },
+    {
+      "input": "ftp://x:1",
+      "tls": false,
+      "refused": "scheme",
+      "words": [
+        "http or https"
+      ]
+    }
+  ]
+}

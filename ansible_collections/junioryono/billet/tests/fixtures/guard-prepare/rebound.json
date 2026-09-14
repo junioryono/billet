@@ -1,0 +1,30 @@
+{
+  "outcome": "rebound",
+  "id": "101112131415161718191a1b1c1d1e1f",
+  "adopted": false,
+  "holder": "ci-1",
+  "claimed_at": "2026-09-09T12:00:00Z",
+  "hostname": "billet-control-01",
+  "preparing": true,
+  "record": {
+    "release_executable": "/var/lib/billet/upgrades/recovery-20260909T120000-0badcafe/billet.candidate",
+    "release_executable_sha256": "abababababababababababababababababababababababababababababababab",
+    "verified": true
+  },
+  "pointer": false,
+  "stray_removed": false,
+  "managed": {
+    "path": "/usr/bin/billet",
+    "present": true,
+    "sha256": "abababababababababababababababababababababababababababababababab",
+    "version": "v0.10.0"
+  },
+  "candidate": {
+    "path": "/var/lib/billet/upgrades/recovery-20260909T120000-0badcafe/billet.candidate",
+    "present": true,
+    "sha256": "abababababababababababababababababababababababababababababababab",
+    "version": "v0.10.1",
+    "capable": true
+  },
+  "downgrade": false
+}

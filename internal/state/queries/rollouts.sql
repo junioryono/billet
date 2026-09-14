@@ -39,8 +39,8 @@ VALUES (@id, @generation, @channel, @target_version, @target_digest, @policy,
 INSERT INTO rollout_nodes
      (rollout_id, node, phase, attempts, next_attempt_at, blocker,
       prior_release, rollback_result, exempt_reason, updated_at,
-      dispatch_epoch, converged_digest)
-VALUES (@rollout_id, @node, @phase, 0, '', '', '', '', '', @updated_at, 0, '');
+      dispatch_epoch, converged_digest, last_refusal)
+VALUES (@rollout_id, @node, @phase, 0, '', '', '', '', '', @updated_at, 0, '', '');
 
 -- name: ReadRolloutInState :one
 -- The rollout in one state.
@@ -103,6 +103,12 @@ SELECT phase, attempts FROM rollout_nodes
 -- not erase what is there. Expressed in SQL rather than by building the
 -- statement two ways, because a branch applied in one path and forgotten in
 -- another is how a rollback loses the release it was meant to return to.
+--
+-- last_refusal IS WRITTEN ONLY WHEN THE CALLER SAYS SO (set_last_refusal = 1):
+-- the failed-dispatch path writes the reason, the successful dispatch writes an
+-- empty one, and every other transition passes 0 and keeps what is there. An
+-- empty parameter cannot stand for "keep it", because clearing is a write of
+-- exactly that empty value.
 UPDATE rollout_nodes
    SET phase = @phase, attempts = @attempts, next_attempt_at = @next_attempt_at,
        blocker = @blocker, rollback_result = @rollback_result,
@@ -113,6 +119,8 @@ UPDATE rollout_nodes
                             THEN dispatch_epoch ELSE CAST(@dispatch_epoch AS BIGINT) END,
        converged_digest = CASE WHEN CAST(@converged_digest AS TEXT) = ''
                               THEN converged_digest ELSE CAST(@converged_digest AS TEXT) END,
+       last_refusal = CASE WHEN CAST(@set_last_refusal AS BIGINT) = 1
+                           THEN CAST(@last_refusal AS TEXT) ELSE last_refusal END,
        updated_at = @updated_at
  WHERE rollout_id = @rollout_id AND node = @node AND phase = @expect_phase;
 
@@ -120,7 +128,7 @@ UPDATE rollout_nodes
 -- Where every host in one rollout has got to, in a stable order.
 SELECT node, phase, attempts, next_attempt_at, blocker, prior_release,
        rollback_result, exempt_reason, updated_at, dispatch_epoch,
-       converged_digest
+       converged_digest, last_refusal
   FROM rollout_nodes WHERE rollout_id = @rollout_id ORDER BY node;
 
 -- name: ListRolloutNodePhases :many

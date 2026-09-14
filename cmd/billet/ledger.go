@@ -101,14 +101,25 @@ func openStateForDecision(ctx context.Context, cfg *config.Config) (*state.DB, e
 
 	var db *state.DB
 
-	if cfg.Server.LedgerBackend() == config.StatePostgres {
-		db, err = state.OpenPostgresAdmin(ctx, cfg.Server.IdentityDir, dsn)
-	} else {
-		db, err = state.OpenAdmin(ctx, cfg.Server.IdentityDir)
-	}
+	// UNDER THE IDENTITY EXCLUSION, borrowed from a command that holds it or
+	// taken for the open: the opener creates the directory and its lock on
+	// first use, and a retirement renames the directory under a global lock
+	// this open now waits for rather than racing. THE HAND-BACK BELONGS TO THE
+	// ATTEMPT, not to the handle: the opener creates the directory lock before
+	// it connects, so a failed open leaves a root-owned file too.
+	err = underIdentityExclusion(ctx, cfg.Server.IdentityDir, func() error {
+		var openErr error
 
+		if cfg.Server.LedgerBackend() == config.StatePostgres {
+			db, openErr = state.OpenPostgresAdmin(ctx, cfg.Server.IdentityDir, dsn)
+		} else {
+			db, openErr = state.OpenAdmin(ctx, cfg.Server.IdentityDir)
+		}
+
+		return errors.Join(openErr, handBackLedger(cfg.Server.IdentityDir))
+	})
 	if err != nil {
-		return nil, err
+		return nil, errors.Join(err, closeIfOpen(db))
 	}
 
 	if err := verifyLedgerIdentity(ctx, cfg, db); err != nil {
@@ -127,18 +138,35 @@ func openStateAdmin(ctx context.Context, cfg *config.Config) (*state.DB, error) 
 		return nil, err
 	}
 
-	var db *state.DB
+	return openStateAdminWith(ctx, cfg, dsn)
+}
 
-	if cfg.Server.LedgerBackend() == config.StatePostgres {
-		db, err = state.OpenPostgresAdmin(ctx, cfg.Server.IdentityDir, dsn,
-			state.WithRunningRelease(version.Version()))
-	} else {
-		db, err = state.OpenAdmin(ctx, cfg.Server.IdentityDir,
-			state.WithRunningRelease(version.Version()))
-	}
+// openStateAdminWith is openStateAdmin with the caller's connection string,
+// for a command handed the environment file the unit names rather than the
+// process environment.
+func openStateAdminWith(ctx context.Context, cfg *config.Config, dsn string) (*state.DB, error) {
+	var (
+		db  *state.DB
+		err error
+	)
 
+	// Under the identity exclusion and with the hand-back on the attempt, as in
+	// openStateForDecision.
+	err = underIdentityExclusion(ctx, cfg.Server.IdentityDir, func() error {
+		var openErr error
+
+		if cfg.Server.LedgerBackend() == config.StatePostgres {
+			db, openErr = state.OpenPostgresAdmin(ctx, cfg.Server.IdentityDir, dsn,
+				state.WithRunningRelease(version.Version()))
+		} else {
+			db, openErr = state.OpenAdmin(ctx, cfg.Server.IdentityDir,
+				state.WithRunningRelease(version.Version()))
+		}
+
+		return errors.Join(openErr, handBackLedger(cfg.Server.IdentityDir))
+	})
 	if err != nil {
-		return nil, err
+		return nil, errors.Join(err, closeIfOpen(db))
 	}
 
 	// AND IT IS THIS DEPLOYMENT'S LEDGER, ASKED ONCE FOR EVERY OPERATOR COMMAND.
@@ -172,6 +200,36 @@ func verifyLedgerIdentity(ctx context.Context, cfg *config.Config, db *state.DB)
 	}
 
 	return db.VerifyDeploymentBinding(ctx, deployment)
+}
+
+// openStateInspect opens the ledger for a REPORT, through state.OpenInspect: an
+// existing ledger only, nothing created, locked, claimed, migrated or recorded,
+// the schema exactly this binary's and the identity verified. The DSN is the
+// caller's, because a report may be handed the environment file the unit
+// names rather than the process environment.
+func openStateInspect(ctx context.Context, cfg *config.Config, dsn string) (*state.DB, error) {
+	var (
+		db  *state.DB
+		err error
+	)
+
+	if cfg.Server.LedgerBackend() == config.StatePostgres {
+		db, err = state.OpenPostgresInspect(ctx, cfg.Server.IdentityDir, dsn,
+			state.WithRunningRelease(version.Version()))
+	} else {
+		db, err = state.OpenInspect(ctx, cfg.Server.IdentityDir,
+			state.WithRunningRelease(version.Version()))
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	if err := verifyLedgerIdentity(ctx, cfg, db); err != nil {
+		return nil, errors.Join(err, db.Close())
+	}
+
+	return db, nil
 }
 
 // openStateMaintenance opens the ledger for the quiescent upgrade probe, which
@@ -223,4 +281,14 @@ func ledgerDSN(cfg *config.Config) (string, error) {
 	}
 
 	return dsn, nil
+}
+
+// closeIfOpen closes a handle an open may or may not have produced, so an error
+// joined onto a failed open can also carry a cleanup error rather than drop it.
+func closeIfOpen(db *state.DB) error {
+	if db == nil {
+		return nil
+	}
+
+	return db.Close()
 }

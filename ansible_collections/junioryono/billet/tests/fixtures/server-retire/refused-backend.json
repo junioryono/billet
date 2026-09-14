@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "outcome": "refused",
+  "reason": "backend",
+  "why": "a retirement is defined for a PostgreSQL active-passive pair, and this deployment's ledger is sqlite",
+  "state": "nothing"
+}

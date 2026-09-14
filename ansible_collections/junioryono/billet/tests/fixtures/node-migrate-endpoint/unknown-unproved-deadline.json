@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "outcome": "unknown",
+  "reason": "unproved",
+  "why": "the stop of billet-node.service did not complete within the migration's deadline of 200ms (the unit is active); the stop continues under systemd's own bound, and nothing else was signalled",
+  "next": "wait for the stop to complete, then check and approve afresh",
+  "state": "nothing"
+}

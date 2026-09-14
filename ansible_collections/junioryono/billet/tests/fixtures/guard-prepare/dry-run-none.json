@@ -1,0 +1,11 @@
+{
+  "outcome": "reported",
+  "shape": "none",
+  "guard": null,
+  "managed": {
+    "path": "/usr/bin/billet",
+    "present": true,
+    "sha256": "abababababababababababababababababababababababababababababababab",
+    "version": "v0.10.0"
+  }
+}

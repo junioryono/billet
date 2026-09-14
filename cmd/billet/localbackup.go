@@ -142,6 +142,19 @@ func runLocalBackup(ctx context.Context, o backupOptions) error {
 		return fmt.Errorf("read %s: %w", o.configPath, err)
 	}
 
+	// THE EXCLUSION BEFORE THE LEDGER OPEN, which creates on a fresh directory,
+	// and lent to the archive's write below so it does not take it again.
+	acc, err := openIdentityAccess(ctx, cfg.Server.IdentityDir, identityIntent{wait: identityAccessWait})
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		if err := acc.Release(); err != nil {
+			fmt.Printf("warn     could not release the authority exclusion: %v\n", err)
+		}
+	}()
+
 	db, err := openStateAdmin(ctx, cfg)
 	if err != nil {
 		return fmt.Errorf("server state: %w", err)
@@ -197,6 +210,7 @@ func runLocalBackup(ctx context.Context, o backupOptions) error {
 		ExternalLedger: external,
 		Now:            time.Now,
 		Hostname:       host,
+		Authority:      acc.Lock(),
 	})
 	if err != nil {
 		return err

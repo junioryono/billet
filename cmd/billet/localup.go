@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -13,7 +14,9 @@ import (
 	"github.com/junioryono/billet/internal/initconfig"
 	"github.com/junioryono/billet/internal/lifeops"
 	"github.com/junioryono/billet/internal/lifeops/launchd"
+	"github.com/junioryono/billet/internal/retirement"
 	"github.com/junioryono/billet/internal/state"
+	"github.com/junioryono/billet/internal/wirecert"
 )
 
 // rollbackGrace bounds the unwinding of a failed run. It is deliberately short:
@@ -218,6 +221,18 @@ func runLocalUp(ctx context.Context, o upOptions) error {
 
 	uid, gid, err := c.Identity(req)
 	if err != nil {
+		return err
+	}
+
+	// THE HOST IS PREPARED BEFORE ITS FIRST IDENTITY ACCESS, under the lifecycle
+	// lock this command already holds: the service account is recorded from the
+	// account just validated, both authority locks are provisioned or repaired
+	// by descriptor, and a bare identity directory is created before any of that
+	// metadata exists beside it. The status the bootstrap reads is then judged
+	// HERE, under the same lock, before anything is owned, checked or started: a
+	// closed authority is a retired controller, and nothing in this command
+	// starts one; restoring its record is all the bootstrap did.
+	if err := prepareHostForUp(ctx, req, cfg, uid, gid); err != nil {
 		return err
 	}
 
@@ -537,7 +552,13 @@ func startUnits(ctx context.Context, c converger, req lifeops.UpRequest,
 			// established there is that one process survived the window — and
 			// printing "ready" for both would tell a Mac operator something
 			// nothing checked.
-			proof, err := c.StartAndProve(ctx, unit.Name)
+			// UNDER THE UNIT'S OWN START BOUND: the start runs under the
+			// caller's context and the unit's TimeoutStartSec is what
+			// systemd gives it, so that plus a margin is the deadline.
+			startCtx, cancelStart := context.WithTimeout(ctx, deploy.UnitStartTimeout+lifecycleDeadlineMargin)
+			proof, err := c.StartAndProve(startCtx, unit.Name)
+			cancelStart()
+
 			if err != nil {
 				return rollback(err)
 			}
@@ -705,6 +726,11 @@ func orDefaultDetail(unit lifeops.UnitPlan) string {
 // disable — or the query that decides whether to issue one — inherits that
 // cancellation and fails, leaving the host committed to booting a service
 // nothing proved.
+// lifecycleDeadlineMargin is what a stop's or a start's deadline carries
+// beyond the unit's own bound, so systemd's own timeout is what ends a slow
+// operation and the deadline here catches only a manager that never answered.
+const lifecycleDeadlineMargin = 30 * time.Second
+
 func liveFor(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(ctx), rollbackGrace)
 }
@@ -961,4 +987,36 @@ func printPlan(plan lifeops.UpPlan) {
 			fmt.Printf("plan     %s is already running and enabled\n", unit.Name)
 		}
 	}
+}
+
+// prepareHostForUp runs the privileged bootstrap for a Linux controller host
+// and refuses a closed authority. A node-only host, a darwin host or an
+// unprivileged run has nothing to prepare and nothing to refuse.
+func prepareHostForUp(ctx context.Context, req lifeops.UpRequest, cfg *config.Config, uid, gid int) error {
+	if !req.WantServer || !retirement.Supported(hostOS) || os.Geteuid() != 0 || cfg.Server == nil {
+		return nil
+	}
+
+	res, err := retirement.Bootstrap(ctx, retirement.BootstrapRequest{
+		Account:     retirement.ServiceAccount{User: req.ServiceUser, UID: uid, Group: req.ServiceGroup, GID: gid},
+		IdentityDir: cfg.Server.IdentityDir,
+		InnerLock:   wirecert.AuthorityLockPath(cfg.Server.IdentityDir),
+		Wait:        identityAccessWait,
+	})
+	if err != nil {
+		return fmt.Errorf("prepare this host's authority exclusion: %w", err)
+	}
+
+	for _, path := range res.Repaired {
+		fmt.Printf("own      %s given back to %s (a privileged billet created it)\n", path, req.ServiceUser)
+	}
+
+	if res.Presence == retirement.StatusPresent && res.Status.Phase.Closed() {
+		return fmt.Errorf("this controller retired (its authority status is %q since %s); `billet local up` "+
+			"restored its metadata and starts nothing. A retired controller stays retired; the runbook in "+
+			"docs/operating/upgrades.md says how a host that must serve again is commissioned afresh",
+			res.Status.Phase, res.Status.UpdatedAt)
+	}
+
+	return nil
 }

@@ -9,7 +9,20 @@
 // file on disk and the reference billet reports divergence from.
 package deploy
 
-import _ "embed"
+import (
+	_ "embed"
+	"time"
+)
+
+// UnitStartTimeout and UnitStopTimeout are the bounds the shipped service
+// units declare (TimeoutStartSec and TimeoutStopSec, pinned to the unit text
+// by units_test.go), for a caller that starts or stops one and has to wait as
+// long as systemd would. A stop's bound is a drain's: a node stops when the
+// compute it holds has finished.
+const (
+	UnitStartTimeout = 120 * time.Second
+	UnitStopTimeout  = 88200 * time.Second
+)
 
 // Unit file names, as systemd knows them. Exported so a caller naming a unit
 // and the file it compares against cannot disagree by a typo.

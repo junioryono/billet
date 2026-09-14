@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "outcome": "refused",
+  "reason": "guard",
+  "why": "the guard names ci-other, not ci-1",
+  "state": "nothing"
+}

@@ -33,15 +33,24 @@ package state
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/junioryono/billet/internal/state/ledgerdb"
 )
@@ -115,6 +124,10 @@ type DB struct {
 	// ATOMIC because a standby clears it at PROMOTION rather than at open, which
 	// is after the handle has been read from — see ClaimController.
 	revalidate atomic.Bool
+
+	// inspect marks a handle opened for a report, whose every write transaction
+	// is refused with ErrInspect. See OpenInspect.
+	inspect bool
 
 	// standby marks a control plane that is waiting to become the controller, and
 	// while it is set every write transaction is refused.
@@ -216,6 +229,18 @@ type openMode struct {
 	// not a NEVER-leader. A standby's only protection is that Tx refuses it.
 	standby bool
 
+	// inspect marks a handle opened for a REPORT, which may validate everything
+	// an open validates and mutate nothing: no directory created or tightened,
+	// no lock, no claim, no migration, no watermark write, and no Tx. See
+	// OpenInspect.
+	inspect bool
+
+	// completion marks a handle that WRITES ONE ROW AND CHANGES NOTHING ELSE
+	// about the ledger: no controller claim and no migration, the schema
+	// verified as exactly this binary's and the watermark checked, never
+	// raised. See OpenPostgresCompletion.
+	completion bool
+
 	// release is the billet opening the ledger, for the release watermark, or
 	// empty for a caller that named none and gets neither the check nor the
 	// record. See WithRunningRelease.
@@ -231,7 +256,7 @@ type openMode struct {
 // service that then serves it, so a rollback that never reaches that service has
 // nothing to undo.
 func (m openMode) records() bool {
-	return !m.admin && !m.maintenanceProbe && !m.standby
+	return !m.admin && !m.maintenanceProbe && !m.standby && !m.inspect && !m.completion
 }
 
 // with applies the caller's options to a mode.
@@ -241,6 +266,19 @@ func (m openMode) with(opts []OpenOption) openMode {
 	}
 
 	return m
+}
+
+// onOpenSideEffect observes every mutation an open can make on the host or the
+// ledger, named by operation: "mkdir", "chmod", "lock", "integrity", "claim",
+// "migrate" and "watermark". Nil in production; a test sets it to prove an
+// inspection makes none of them, which no assertion on the state afterwards
+// can, since an implementation that mutated and restored would pass that.
+var onOpenSideEffect func(op string)
+
+func noteOpenSideEffect(op string) {
+	if onOpenSideEffect != nil {
+		onOpenSideEffect(op)
+	}
 }
 
 // openDir is the shared body of every entry point.
@@ -256,13 +294,23 @@ func openDir(
 		return nil, err
 	}
 
-	if err := os.MkdirAll(stateDir, 0o700); err != nil {
-		return nil, fmt.Errorf("create state dir %s: %w", stateDir, err)
-	}
-	// MkdirAll leaves an existing directory's mode alone, and this directory will
-	// hold the mTLS CA key. Tighten it rather than inheriting whatever was there.
-	if err := os.Chmod(stateDir, 0o700); err != nil {
-		return nil, fmt.Errorf("tighten state dir %s: %w", stateDir, err)
+	// AN INSPECTION CREATES AND TIGHTENS NOTHING: its caller has already proved
+	// the directory and the ledger exist (requireLedgerFile), and a report that
+	// repaired the directory's mode on its way past would be a report with a
+	// side effect on the host it describes.
+	if !mode.inspect {
+		noteOpenSideEffect("mkdir")
+
+		if err := os.MkdirAll(stateDir, 0o700); err != nil {
+			return nil, fmt.Errorf("create state dir %s: %w", stateDir, err)
+		}
+
+		noteOpenSideEffect("chmod")
+		// MkdirAll leaves an existing directory's mode alone, and this directory will
+		// hold the mTLS CA key. Tighten it rather than inheriting whatever was there.
+		if err := os.Chmod(stateDir, 0o700); err != nil {
+			return nil, fmt.Errorf("tighten state dir %s: %w", stateDir, err)
+		}
 	}
 
 	// ONLY THE TYPED ENTRY crosses the fence. This used to also honor
@@ -282,18 +330,31 @@ func openDir(
 
 	// A NIL LOCK MEANS "SOMEBODY ELSE IS THE CONTROL PLANE HERE", and it is
 	// reachable only for an admin caller. Everything downstream branches on this
-	// one value rather than re-deriving the situation.
-	lock, err := lockDir(stateDir)
+	// one value rather than re-deriving the situation. AN INSPECTION TAKES NO
+	// LOCK AT ALL: it is not a control plane and holds nothing open, so it is
+	// the unlocked, revalidating handle whether or not a control plane is here.
+	var lock *dirLock
 
-	switch {
-	case err == nil:
-	case admin && errors.Is(err, ErrLocked):
-		lock = nil
-	default:
-		return nil, err
+	if !mode.inspect {
+		noteOpenSideEffect("lock")
+
+		held, err := lockDir(stateDir)
+
+		switch {
+		case err == nil:
+			lock = held
+		case admin && errors.Is(err, ErrLocked):
+			lock = nil
+		default:
+			return nil, err
+		}
 	}
 
 	pools, err := be.dataSources()
+	if mode.inspect {
+		pools, err = be.inspectDataSources()
+	}
+
 	if err != nil {
 		return nil, errors.Join(err, lock.release())
 	}
@@ -321,8 +382,9 @@ func openDir(
 		r:                 r,
 		lock:              lock,
 		backend:           be,
-		admin:             admin,
+		admin:             admin || mode.inspect || mode.completion,
 		unlocked:          lock == nil,
+		inspect:           mode.inspect,
 		stateDir:          stateDir,
 		maintenanceBypass: maintenanceBypass,
 		runningRelease:    mode.release,
@@ -360,8 +422,11 @@ func openDir(
 	// `check` — under the shared thirty-second startup budget, so a large or
 	// loaded deployment could lose EVERY live administration command, including
 	// the emergency one. A control plane opens the ledger once and is about to
-	// make scheduling decisions against it; a command is neither.
-	if !admin {
+	// make scheduling decisions against it; a command is neither, and an
+	// inspection is not even that.
+	if !admin && !mode.inspect {
+		noteOpenSideEffect("integrity")
+
 		if err := db.backend.integrityCheck(startupCtx, db.w); err != nil {
 			return nil, errors.Join(err, db.Close())
 		}
@@ -399,7 +464,7 @@ func openDir(
 	// refusing it would make staging one impossible; the migration is the claim's
 	// right, and it happens at promotion.
 	if mode.standby {
-		if err := verifySchemaNotAhead(startupCtx, be, db.Reader()); err != nil {
+		if err := verifySchemaNotAhead(startupCtx, be, db.bareReader()); err != nil {
 			return nil, errors.Join(err, db.Close())
 		}
 
@@ -408,7 +473,45 @@ func openDir(
 		// A STANDBY IS REFUSED AS A DOWNGRADE TOO, and records nothing. What it
 		// would be promoted into is a ledger a newer release has served; that it
 		// waits rather than serves changes nothing about which binary is older.
-		if err := db.enforceReleaseWatermark(startupCtx, mode.release, false); err != nil {
+		if err := db.enforceReleaseWatermark(startupCtx, mode.release); err != nil {
+			return nil, errors.Join(err, db.Close())
+		}
+
+		return db, nil
+	}
+
+	// AN INSPECTION VERIFIES AND NEVER MIGRATES, whatever it finds: no claim is
+	// taken, the schema must be exactly this binary's (a ledger behind it is
+	// ErrSchemaBehind naming the control plane's restart, never a migration the
+	// report performed), and the watermark is checked and never raised.
+	if mode.inspect {
+		if err := db.verifySchema(startupCtx); err != nil {
+			return nil, errors.Join(err, db.Close())
+		}
+
+		if err := db.enforceReleaseWatermark(startupCtx, mode.release); err != nil {
+			return nil, errors.Join(err, db.Close())
+		}
+
+		return db, nil
+	}
+
+	// A COMPLETION WRITES ONE ROW AND CLAIMS NOTHING. The caller is a host whose
+	// controller has been retired: it is not this deployment's control plane and
+	// must never become it by opening a ledger, and it must never migrate a
+	// schema either — the survivor's binary owns that, and this host's may be
+	// frozen at whatever release it retired on. So the schema must be exactly
+	// this binary's (ahead or behind is refused, which is what lets the caller
+	// hand the write to the survivor instead) and the watermark is checked and
+	// never raised.
+	if mode.completion {
+		db.revalidate.Store(true)
+
+		if err := db.verifySchema(startupCtx); err != nil {
+			return nil, errors.Join(err, db.Close())
+		}
+
+		if err := db.enforceReleaseWatermark(startupCtx, mode.release); err != nil {
 			return nil, errors.Join(err, db.Close())
 		}
 
@@ -416,6 +519,8 @@ func openDir(
 	}
 
 	if lock != nil {
+		noteOpenSideEffect("claim")
+
 		if err := be.claimController(startupCtx, db); err != nil {
 			// AN OPERATOR COMMAND IS NOT A SECOND CONTROLLER, so a held exclusion
 			// puts it on the same footing as one that could not take the directory
@@ -434,12 +539,14 @@ func openDir(
 			return nil, errors.Join(err, db.Close())
 		}
 
-		if err := db.enforceReleaseWatermark(startupCtx, mode.release, false); err != nil {
+		if err := db.enforceReleaseWatermark(startupCtx, mode.release); err != nil {
 			return nil, errors.Join(err, db.Close())
 		}
 
 		return db, nil
 	}
+
+	noteOpenSideEffect("migrate")
 
 	if err := db.migrate(startupCtx); err != nil {
 		return nil, errors.Join(fmt.Errorf("migrate state db: %w", err), db.Close())
@@ -452,7 +559,7 @@ func openDir(
 	// its own. Recorded here, a newer binary pointed at another deployment's
 	// ledger would raise that ledger's mark on the way to being refused, and
 	// fence its real controller out of its own restart. See openMode.records.
-	if err := db.enforceReleaseWatermark(startupCtx, mode.release, false); err != nil {
+	if err := db.enforceReleaseWatermark(startupCtx, mode.release); err != nil {
 		return nil, errors.Join(err, db.Close())
 	}
 
@@ -489,7 +596,7 @@ func openDir(
 // migrate). Generous, because a first run creates the database and an integrity
 // check scans it; anything slower than this is a sick disk, not a slow one — or,
 // on PostgreSQL, another session holding a lock the migration is waiting for.
-const startupTimeout = 30 * time.Second
+var startupTimeout = 30 * time.Second
 
 // PingContext proves the database is reachable AND configured as promised.
 //
@@ -501,7 +608,452 @@ func (db *DB) PingContext(ctx context.Context) error {
 		return fmt.Errorf("ping state db: %w", err)
 	}
 
-	return db.backend.verifyDurability(ctx, db.w)
+	return db.backend.verifyDurability(ctx, db.w, db.inspect)
+}
+
+// Unreachable reports whether err is a failure to REACH the database rather
+// than an answer from it.
+//
+// IT IS ASKED OF AN ERROR, NEVER INFERRED FROM WHERE THE ERROR CAME FROM. A
+// failed ping is the obvious candidate and proves nothing by itself: `file is
+// not a database` is positive evidence the ledger answered and is broken, and
+// reading that as unreachability would let a caller that waits out an outage
+// wait out a corrupt ledger instead.
+//
+// AND IT IS ASKED OF EVERY INDEPENDENT BRANCH, because `errors.Join` puts
+// unrelated failures beside each other: the answer is yes only when each
+// subtree the join holds establishes an availability failure of its own. A
+// verdict taken from the flags the whole tree set together would read an
+// outage joined with this host's pools failing to close as something a caller
+// may wait out, and that tree carries a fault the caller must fix.
+//
+// THE ORDER BELOW IS WHAT THE MEASUREMENT REQUIRES, not a preference (pgx
+// v5.10.0 against PostgreSQL 18, 2026-09-13, every case run through
+// database/sql as billet runs it):
+//
+//	refused port         ConnectError  net.Error  —                —
+//	wrong password       ConnectError  —          PgError 28P01    —
+//	missing database     ConnectError  —          PgError 3D000    —
+//	missing relation     —             —          PgError 42P01    —
+//	deadline under query —             net.Error  —                DeadlineExceeded
+//	terminated mid-query —             —          PgError 57P01    —
+//	connection cut       ConnectError  net.Error  —                —
+//
+// So A SERVER ERROR IS CHECKED FIRST: a wrong password and a database that
+// does not exist arrive INSIDE a ConnectError, and a caller that read the
+// outer shape would wait for ever on a credential it must be told about. The
+// two SQLSTATE classes that are themselves availability answers are the
+// exception, and they are named: 08, connection exception, and 57, operator
+// intervention, which is what a server shutting down or terminating a backend
+// says. THEN THE CALLER'S OWN BOUND: context.DeadlineExceeded satisfies
+// net.Error (pgx wraps it in errTimeout), so a slow query would otherwise read
+// as an unreachable database. Only then the transport shapes.
+//
+// The residual, stated: a mid-query drop that database/sql retries onto a
+// working connection is not an error at all and never reaches here, and one it
+// retries onto a connection it cannot re-establish arrives as a ConnectError,
+// which is the measurement's last row.
+func Unreachable(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	budget := maxErrorCauses
+
+	out, whole := unreachableBranch(err, reachEvidence{}, &budget)
+
+	return whole && out
+}
+
+// unreachableBranch reports whether EVERY INDEPENDENT BRANCH under err
+// establishes an availability failure, and whether it saw the whole of the
+// tree. `above` is the evidence the nodes between the root and err
+// contributed, which belongs to each branch below them: a `ConnectError` and a
+// `net.OpError` both unwrap, so a rule that split at a join and then looked
+// only at what it found underneath would discard the very shapes the
+// measurement reads.
+//
+// `errors.Join` puts unrelated failures beside each other — billet's own opens
+// join a startup failure with their close — and a tree where one branch is an
+// outage and another is this host's pools failing to close is NOT an outage a
+// caller may wait out: it holds something that caller must fix, and that fault
+// is not a survivor's to finish. Asking the whole tree at once said otherwise,
+// because a sibling that established nothing set no flag of its own.
+func unreachableBranch(err error, above reachEvidence, budget *int) (bool, bool) {
+	for err != nil {
+		if *budget <= 0 {
+			return false, false
+		}
+
+		*budget--
+
+		above = above.with(reachEvidenceHere(err))
+
+		switch unwrapped := err.(type) { //nolint:errorlint // this asks what an error IS; the walk reaches the causes itself
+		case interface{ Unwrap() []error }:
+			causes := unwrapped.Unwrap()
+			if len(causes) == 0 {
+				break
+			}
+
+			every, whole := true, true
+
+			for _, cause := range causes {
+				branch, seen := unreachableBranch(cause, above, budget)
+				if !seen {
+					whole = false
+				}
+
+				if !branch {
+					every = false
+				}
+			}
+
+			return every, whole
+		case interface{ Unwrap() error }:
+			if under := unwrapped.Unwrap(); under != nil {
+				err = under
+
+				continue
+			}
+		}
+
+		break
+	}
+
+	return above.unreachable(), true
+}
+
+// Describe renders err for a diagnostic, or says it could not be rendered.
+//
+// `Error()` FOLLOWS THE SAME CAUSES THE WALK DOES, and with no bound of its
+// own: `net.OpError`'s formatter prints its cause, so an error whose cause is
+// itself exhausts the stack in the very refusal a caller writes ABOUT not
+// being able to classify it. A caller that bounded its classification and then
+// formatted the error would still die.
+func Describe(err error) string {
+	if err == nil {
+		return ""
+	}
+
+	if !walkCauses(err, func(error) {}) {
+		return "an error whose causes do not end, which this billet will not render"
+	}
+
+	return err.Error()
+}
+
+// Matches reports whether target is one of err's causes, over the SAME BOUNDED
+// WALK the classifiers use.
+//
+// `errors.Is` is the ordinary way to ask, and it is the wrong one for a caller
+// that has to survive a tree it did not build: it recurses without a bound, so
+// an error whose causes form a cycle never returns from it — and a caller that
+// bounded its own traversal would still hang on the first `errors.Is` it made
+// afterwards. A walk that could not finish answers false, which is the same
+// could-not-tell the other classifiers give.
+//
+// IT MATCHES EACH CAUSE LOCALLY, by identity and by that cause's OWN `Is`
+// method — which is how Go's net errors answer for the context sentinels —
+// and never by recursing into what a cause wraps, because the walk does that
+// itself under its budget.
+func Matches(err, target error) bool {
+	if err == nil || target == nil {
+		return false
+	}
+
+	found := false
+
+	whole := walkCauses(err, func(cause error) {
+		if matchesHere(cause, target) {
+			found = true
+		}
+	})
+
+	return found && whole
+}
+
+// OnlyCause reports whether target is THE WHOLE of err: every cause at the
+// bottom of the tree matches it.
+//
+// `Matches` is not that question, and the difference decides whether a caller
+// waits or refuses. An open that fails on the schema returns its refusal
+// JOINED WITH ITS OWN CLEANUP — `errors.Join(err, db.Close())` — so a tree can
+// carry both "this ledger's schema is not yours to write" and "and the pools
+// did not close". The first is something to hand to another host; the second
+// is this host's own fault and is not.
+func OnlyCause(err, target error) bool {
+	if err == nil || target == nil {
+		return false
+	}
+
+	only := true
+
+	whole := walkCauses(err, func(cause error) {
+		if hasCauses(cause) {
+			return
+		}
+
+		if !matchesHere(cause, target) {
+			only = false
+		}
+	})
+
+	return only && whole
+}
+
+// OnlyCancellation reports whether a context ending is THE WHOLE of err: every
+// cause at the bottom of the tree is a deadline or a cancellation.
+//
+// `errors.Is(err, context.DeadlineExceeded)` is not that question. It is true
+// of a tree that also holds a wrong password or a cleanup that failed — a
+// shape billet's own opens produce, since one joins its startup failure with
+// its close — and a caller that waits out an expiry on that evidence would
+// throw the rest away.
+func OnlyCancellation(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	only := true
+
+	whole := walkCauses(err, func(cause error) {
+		// ONLY THE LEAVES ARE ASKED. Every wrapper and every `errors.Join`
+		// above a cancellation matches `errors.Is` for it, so judging nodes
+		// would read a join of a deadline and a refusal as a deadline.
+		if hasCauses(cause) {
+			return
+		}
+
+		if !isCancellation(cause) {
+			only = false
+		}
+	})
+
+	return only && whole
+}
+
+// matchesHere asks whether THIS cause is target, without looking under it:
+// identity, then the node's OWN `Is` method if it has one.
+//
+// THE `Is` METHOD IS NOT OPTIONAL. Go's net package answers a cancelled or
+// timed-out operation with an error that matches `context.Canceled` and
+// `context.DeadlineExceeded` THROUGH `Is` and never unwraps to them, so
+// identity alone would read an operator's cancelled dial as an outage.
+//
+// AND IT IS SHALLOW, which is the whole point: `errors.Is` searches the
+// subtree recursively, so on an error whose causes form a cycle it does not
+// return — and it would do that INSIDE the walk, before the walk's own budget
+// could stop anything. The walk reaches every wrapped cause itself. The
+// residual, stated: a node whose own `Is` recurses into its causes is outside
+// this bound, because that method is the node's own code.
+func matchesHere(err, target error) bool {
+	if err == target { //nolint:errorlint,err113 // node-local by design; see above
+		return true
+	}
+
+	// The assertion is on the node itself, not a search of what it wraps.
+	if is, ok := err.(interface{ Is(target error) bool }); ok {
+		return is.Is(target)
+	}
+
+	return false
+}
+
+// isCancellation asks whether THIS cause is a context ending.
+func isCancellation(err error) bool {
+	return matchesHere(err, context.DeadlineExceeded) || matchesHere(err, context.Canceled)
+}
+
+func hasCauses(err error) bool {
+	switch unwrapped := err.(type) { //nolint:errorlint // this asks what an error IS, not what it wraps: the walk reaches the causes itself
+	case interface{ Unwrap() error }:
+		return unwrapped.Unwrap() != nil
+	case interface{ Unwrap() []error }:
+		return len(unwrapped.Unwrap()) > 0
+	}
+
+	return false
+}
+
+// reachEvidence is what one branch of an error tree says about reaching the
+// ledger: positive evidence it could not be reached, an answer the caller must
+// act on, and a context that ended under the attempt.
+type reachEvidence struct {
+	out       bool
+	refused   bool
+	cancelled bool
+}
+
+// with merges what one node said into what its ancestors did.
+func (e reachEvidence) with(other reachEvidence) reachEvidence {
+	return reachEvidence{
+		out:       e.out || other.out,
+		refused:   e.refused || other.refused,
+		cancelled: e.cancelled || other.cancelled,
+	}
+}
+
+// unreachable is the verdict a branch's own evidence carries.
+//
+// A CANCELLATION DOMINATES THE TRANSPORT EVIDENCE, because an attempt cut
+// short established nothing: pgx reports a connect that ran out of time as a
+// ConnectError, and reading that as "the database could not be reached" would
+// turn an operator's own interruption into a fact about the deployment. Whose
+// clock it was is the caller's to know, and the caller decides from that; here
+// it is could-not-tell.
+func (e reachEvidence) unreachable() bool {
+	return e.out && !e.refused && !e.cancelled
+}
+
+// reachEvidenceHere is what THIS node says, asked of what it is rather than of
+// what it wraps; the recursion above reaches its causes itself.
+func reachEvidenceHere(err error) reachEvidence {
+	//nolint:errorlint // each node is asked what it IS; the recursion reaches what it wraps
+	switch typed := err.(type) {
+	case *pgconn.PgError:
+		if unreachableSQLState(typed.Code) {
+			return reachEvidence{out: true}
+		}
+
+		return reachEvidence{refused: true}
+	case *pgconn.ConnectError:
+		return reachEvidence{out: true}
+	}
+
+	if certificateRejectedHere(err) {
+		return reachEvidence{refused: true}
+	}
+
+	// A CANCELLATION IS ITS OWN EVIDENCE, and it is taken before the transport
+	// shapes below because pgx's errTimeout wraps one while satisfying
+	// net.Error.
+	if isCancellation(err) {
+		return reachEvidence{cancelled: true}
+	}
+
+	if matchesHere(err, driver.ErrBadConn) || matchesHere(err, io.ErrUnexpectedEOF) {
+		return reachEvidence{out: true}
+	}
+
+	if _, ok := err.(net.Error); ok { //nolint:errorlint // as above
+		return reachEvidence{out: true}
+	}
+
+	return reachEvidence{}
+}
+
+// maxErrorCauses bounds a walk of an error tree. Nothing in billet builds a
+// tree anywhere near this deep, and a cycle — an error whose `Unwrap` returns
+// something above it — is the shape a bound exists for: without one the walk
+// does not end, and a classifier that hangs is worse than one that says it
+// could not tell.
+const maxErrorCauses = 256
+
+// walkCauses visits err and every cause under it, through both shapes of
+// unwrapping: the single cause `%w` produces and the several `errors.Join`
+// does. It reports whether it saw the WHOLE tree; a walk that ran out of
+// budget has seen part of one, and a verdict from part of a tree is not one
+// its callers may act on.
+func walkCauses(err error, visit func(error)) bool {
+	budget := maxErrorCauses
+
+	return walkCausesWithin(err, visit, &budget)
+}
+
+func walkCausesWithin(err error, visit func(error), budget *int) bool {
+	for err != nil {
+		if *budget <= 0 {
+			return false
+		}
+
+		*budget--
+
+		visit(err)
+
+		switch unwrapped := err.(type) { //nolint:errorlint // this IS the unwrapper: it visits every cause rather than searching for one
+		case interface{ Unwrap() error }:
+			err = unwrapped.Unwrap()
+		case interface{ Unwrap() []error }:
+			whole := true
+
+			for _, cause := range unwrapped.Unwrap() {
+				if !walkCausesWithin(cause, visit, budget) {
+					whole = false
+				}
+			}
+
+			return whole
+		default:
+			return true
+		}
+	}
+
+	return true
+}
+
+// unreachableSQLStates is the CLOSED LIST of conditions the server itself
+// reports that mean "not now" rather than "not like this". A class prefix is
+// not that list: 08 holds 08004, the server refusing this client (pg_hba), and
+// 08P01, a protocol violation, which are the client's to fix; 57 holds 57014,
+// a statement the server cancelled (a statement_timeout is one), and 57P04, a
+// database that was dropped.
+//
+//	08001 the client could not establish the connection
+//	08003 the connection does not exist
+//	08006 the connection failed
+//	08007 the transaction's resolution is unknown — the commit may have landed,
+//	      which for a caller that retries idempotently is the same as not now
+//	53300 too many connections, a limit that clears on its own
+//	57P01 the administrator ended this backend
+//	57P02 a crash ended it
+//	57P03 the server cannot accept connections yet (starting, or in recovery)
+var unreachableSQLStates = map[string]bool{
+	"08001": true, "08003": true, "08006": true, "08007": true,
+	"53300": true,
+	"57P01": true, "57P02": true, "57P03": true,
+}
+
+func unreachableSQLState(code string) bool { return unreachableSQLStates[code] }
+
+// certificateRejectedHere reports whether THIS cause is a TLS verification
+// failure — the client refusing the server's certificate, by authority, by
+// validity or by name — without looking under it, because the walk that calls
+// it reaches every cause itself.
+func certificateRejectedHere(err error) bool {
+	//nolint:errorlint // each cause is asked what it is; see the walk above
+	switch err.(type) {
+	case *tls.CertificateVerificationError, x509.UnknownAuthorityError,
+		x509.CertificateInvalidError, x509.HostnameError:
+		return true
+	}
+
+	return false
+}
+
+// certificateRejected reports whether the chain holds a TLS verification
+// failure: the client refusing the server's certificate, by authority, by
+// validity or by name.
+func certificateRejected(err error) bool {
+	//nolint:errcheck // the discarded value is the typed error itself; the bool is the answer.
+	if _, ok := errors.AsType[*tls.CertificateVerificationError](err); ok {
+		return true
+	}
+
+	//nolint:errcheck // as above.
+	if _, ok := errors.AsType[x509.UnknownAuthorityError](err); ok {
+		return true
+	}
+
+	//nolint:errcheck // as above.
+	if _, ok := errors.AsType[x509.CertificateInvalidError](err); ok {
+		return true
+	}
+
+	//nolint:errcheck // as above.
+	_, ok := errors.AsType[x509.HostnameError](err)
+
+	return ok
 }
 
 // IntegrityCheck refuses to serve from a corrupt ledger.
@@ -543,7 +1095,70 @@ func (db *DB) closeDBs() error {
 }
 
 // Reader returns the query-only pool.
-func (db *DB) Reader() Querier { return db.r }
+//
+// AN INSPECTION HAS NO BARE READER. Its reads are refused here and answered
+// only through View, because on PostgreSQL the pool's read-only default is a
+// session setting a statement can undo (`set_config('default_transaction_read_only',
+// 'off', false)` followed by an UPDATE on the same pooled connection wrote a
+// row, measured 2026-09-09), and only a transaction begun READ ONLY refuses a
+// write whatever the session says. View begins exactly that for an inspection.
+func (db *DB) Reader() Querier {
+	if db.inspect {
+		return inspectReader{r: db.r}
+	}
+
+	return db.bareReader()
+}
+
+// bareReader is the read pool with no transaction around it, for the package's
+// own reads on the open path and the two accounted readers; every call site is
+// listed in TestEveryUntransactedReadIsAccountedFor, because a read outside Tx
+// and View owes the cancellation translation nothing makes for it. An
+// inspection's open path reads through it too: what Reader refuses is the
+// handle's caller, not the open that proves the handle.
+func (db *DB) bareReader() Querier { return db.r }
+
+// inspectReader is the querier an inspection's Reader hands out: every call is
+// refused with ErrInspect. QueryRowContext cannot return an error directly, so
+// the Row it answers with comes from refusalRows, a source that never connects.
+type inspectReader struct{ r *sql.DB }
+
+func (inspectReader) QueryContext(context.Context, string, ...any) (*sql.Rows, error) {
+	return nil, fmt.Errorf("%w: read through View, whose transaction is read-only on every engine",
+		ErrInspect)
+}
+
+func (inspectReader) QueryRowContext(ctx context.Context, _ string, _ ...any) *sql.Row {
+	return refusedRow(ctx)
+}
+
+// errInspectRefusedRow is what a refused QueryRowContext's Scan returns.
+var errInspectRefusedRow = fmt.Errorf("%w: an inspection admits only the named reads sqlc generated, through "+
+	"View; its bare reader is refused", ErrInspect)
+
+// refusalRows is a database that never connects, so a Row carrying the refusal
+// costs no ledger connection: a refused QueryRowContext on a pooled connection
+// would wait for a second connection of the same pool while its View held one,
+// and four Views refusing at once would wait on each other forever.
+var refusalRows = sql.OpenDB(refusingConnector{})
+
+// refusedRow is the Row a refused QueryRowContext answers with; its Scan
+// returns errInspectRefusedRow.
+func refusedRow(ctx context.Context) *sql.Row {
+	//billet:ignore rawsql // not a query: a source that never connects, so the Row the signature demands carries the refusal
+	return refusalRows.QueryRowContext(ctx, "")
+}
+
+type refusingConnector struct{}
+
+func (refusingConnector) Connect(context.Context) (driver.Conn, error) {
+	return nil, errInspectRefusedRow
+}
+func (refusingConnector) Driver() driver.Driver { return refusingDriver{} }
+
+type refusingDriver struct{}
+
+func (refusingDriver) Open(string) (driver.Conn, error) { return nil, errInspectRefusedRow }
 
 // Tx runs fn inside a single write transaction. Every mutation goes through here
 // so that an allocation decision — read current usage, decide, record it — is one
@@ -560,6 +1175,13 @@ func (db *DB) Tx(ctx context.Context, fn func(*sql.Tx) error) error {
 	// nothing takes the writer slot on the way to being told no.
 	if db.standby.Load() {
 		return ErrStandby
+	}
+
+	// A REPORT WRITES NOTHING, and the refusal is here for the reason the
+	// standby's is: this is the one choke point every write crosses, and the
+	// read-only connection underneath is the second line rather than the first.
+	if db.inspect {
+		return ErrInspect
 	}
 
 	tx, err := db.beginWrite(ctx)
@@ -640,7 +1262,7 @@ func (db *DB) View(ctx context.Context, fn func(Querier) error) error {
 
 	// Deferred, deliberately: the reader takes no write lock, which is the whole
 	// point, and nothing here can be promoted.
-	tx, err := db.r.BeginTx(ctx, nil)
+	tx, err := db.r.BeginTx(ctx, db.readTxOptions())
 	if err != nil {
 		return fmt.Errorf("begin read tx: %w", db.asCancellation(ctx, err))
 	}
@@ -653,16 +1275,230 @@ func (db *DB) View(ctx context.Context, fn func(Querier) error) error {
 	// Re-checked for the same reason Tx does it, and it matters here too: a read
 	// against a schema a newer billet has since rebuilt would report rows that no
 	// longer mean what this binary thinks they mean.
+	//
+	// UNDER THE POLICY THE HANDLE WAS ADMITTED WITH. A standby (and the upgrade
+	// probe, which is one) was admitted by verifySchemaNotAhead: a ledger behind
+	// its binary is the follower-first shape it exists for, and the exact check
+	// here refused every read of a stamped candidate over a ledger one migration
+	// behind, at the watermark check inside the open, before the candidate could
+	// claim and migrate. Every other revalidating handle keeps the exact check.
 	if db.revalidate.Load() {
 		if err := db.checkMaintenance(); err != nil {
 			return err
 		}
-		if err := verifySchemaIn(ctx, db.backend, tx); err != nil {
+
+		if db.standby.Load() {
+			if err := verifySchemaNotAhead(ctx, db.backend, tx); err != nil {
+				return db.asCancellation(ctx, err)
+			}
+		} else if err := verifySchemaIn(ctx, db.backend, tx); err != nil {
 			return db.asCancellation(ctx, err)
+		}
+
+		// AN INSPECTION RE-READS THE WATERMARK TOO, as a write transaction does:
+		// a newer release that claimed the same-schema ledger after the report's
+		// open would otherwise be read past, and the report would describe a
+		// ledger a fresh inspection is refused.
+		if db.inspect {
+			if err := db.checkReleaseWatermarkIn(ctx, tx); err != nil {
+				return db.asCancellation(ctx, err)
+			}
 		}
 	}
 
-	return db.asCancellation(ctx, fn(tx))
+	var q Querier = tx
+	if db.inspect {
+		q = inspectQuerier{tx: tx}
+	}
+
+	return db.asCancellation(ctx, fn(q))
+}
+
+// inspectQuerier is what an inspection's View hands its callback: the
+// transaction, admitting ONLY THE NAMED READS sqlc generated.
+//
+// A READ ONLY transaction refuses a write and refuses nothing else: a callback
+// handed the bare transaction could COMMIT it (database/sql would not notice,
+// and the deferred rollback would undo nothing after it), turn the session's
+// read-only default off, and write in autocommit; or take a session advisory
+// lock inside the read-only transaction, which rollback does not release, and
+// so exclude the real controller. So a statement reaches the transaction only
+// when it is EXACTLY one of the statements sqlc generated for ReadOps
+// (generatedReads, learned from the generated code itself), and then, as the
+// shape that set is held to: sqlc's `-- name: X :one|:many` header with X a
+// method of ReadOps (whose every member is classified from its first keyword
+// by TestReadOpsHoldsExactlyTheQueriesThatOnlyRead), a body beginning with
+// SELECT or WITH, and no function that acts on the session rather than the
+// rows. The exact text is the rule; the shape is what the text is held to. A
+// grammar of the text on its own is not enough, because an engine decodes
+// spellings a scanner does not (`U&"pg\005ftry_advisory_lock"` is
+// pg_try_advisory_lock to PostgreSQL). billet's own code cannot issue anything
+// else through this handle without also failing the rawsql gate; this is what
+// makes that a guarantee rather than a convention.
+//
+// A refused QueryRowContext answers with a Row from refusalRows, a source that
+// never connects, so the refusal costs no ledger connection and runs no
+// statement in the transaction (on PostgreSQL a failed statement aborts the
+// transaction it ran in).
+type inspectQuerier struct {
+	tx *sql.Tx
+}
+
+func (q inspectQuerier) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	if err := admitInspectRead(ctx, query); err != nil {
+		return nil, err
+	}
+
+	//billet:ignore rawsql // forwards a statement sqlc generated, after admitInspectRead proved it is one
+	return q.tx.QueryContext(ctx, query, args...)
+}
+
+func (q inspectQuerier) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	if err := admitInspectRead(ctx, query); err != nil {
+		return refusedRow(ctx)
+	}
+
+	//billet:ignore rawsql // forwards a statement sqlc generated, after admitInspectRead proved it is one
+	return q.tx.QueryRowContext(ctx, query, args...)
+}
+
+// sessionEffectFunctions are what a SELECT can do to a PostgreSQL session
+// besides read rows; no generated read names one, which a test in
+// queryset_test.go holds.
+var sessionEffectFunctions = []string{
+	"set_config", "pg_advisory", "pg_try_advisory", "pg_terminate_backend", "pg_cancel_backend",
+	"pg_reload_conf", "pg_sleep", "dblink", "lo_import", "lo_export", "pg_rotate_logfile",
+}
+
+var readOpsType = reflect.TypeOf((*ReadOps)(nil)).Elem()
+
+// generatedReads is the exact text of every statement a ReadOps method runs,
+// learned once by calling each method against a recording adapter: the
+// generated code hands its constant to QueryContext or QueryRowContext, the
+// adapter keeps the text and answers with an error, and the method returns.
+// The context reaches only the adapter's answer, never the recording, so the
+// first caller's context decides nothing about the set.
+var (
+	generatedReadsOnce sync.Once
+	generatedReadSet   map[string]bool
+)
+
+func generatedReads(ctx context.Context) map[string]bool {
+	generatedReadsOnce.Do(func() {
+		seen := map[string]bool{}
+		q := reflect.ValueOf(ledgerdb.New(recordingDBTX{seen: seen}))
+
+		for i := range readOpsType.NumMethod() {
+			fn := q.MethodByName(readOpsType.Method(i).Name)
+			args := make([]reflect.Value, fn.Type().NumIn())
+
+			for j := range args {
+				args[j] = reflect.Zero(fn.Type().In(j))
+			}
+
+			args[0] = reflect.ValueOf(ctx)
+			fn.Call(args)
+		}
+
+		generatedReadSet = seen
+	})
+
+	return generatedReadSet
+}
+
+// recordingDBTX keeps every statement text it is handed and answers nothing.
+type recordingDBTX struct{ seen map[string]bool }
+
+var errRecording = errors.New("state: recording the generated reads")
+
+func (recordingDBTX) ExecContext(context.Context, string, ...any) (sql.Result, error) {
+	return nil, errRecording
+}
+
+func (recordingDBTX) PrepareContext(context.Context, string) (*sql.Stmt, error) {
+	return nil, errRecording
+}
+
+func (r recordingDBTX) QueryContext(_ context.Context, query string, _ ...any) (*sql.Rows, error) {
+	r.seen[query] = true
+
+	return nil, errRecording
+}
+
+func (r recordingDBTX) QueryRowContext(ctx context.Context, query string, _ ...any) *sql.Row {
+	r.seen[query] = true
+
+	return refusedRow(ctx)
+}
+
+// admitInspectRead is the rule above, stated on one statement: the exact
+// generated text first, then the shape that text is held to.
+func admitInspectRead(ctx context.Context, query string) error {
+	if !generatedReads(ctx)[query] {
+		return fmt.Errorf("%w: only the named reads sqlc generated are admitted through an inspection's View, "+
+			"and this statement is not one of them", ErrInspect)
+	}
+
+	first, rest, ok := strings.Cut(query, "\n")
+	if !ok || !strings.HasPrefix(first, "-- name: ") {
+		return fmt.Errorf("%w: only the named reads sqlc generated are admitted, and this statement carries "+
+			"no `-- name:` header", ErrInspect)
+	}
+
+	fields := strings.Fields(strings.TrimPrefix(first, "-- name: "))
+	if len(fields) != 2 || (fields[1] != ":one" && fields[1] != ":many") {
+		return fmt.Errorf("%w: %q is not a `-- name: X :one|:many` header", ErrInspect, first)
+	}
+
+	if _, isRead := readOpsType.MethodByName(fields[0]); !isRead {
+		return fmt.Errorf("%w: %s is not one of the reads ReadOps holds", ErrInspect, fields[0])
+	}
+
+	body := rest
+	for strings.HasPrefix(strings.TrimSpace(body), "--") {
+		_, body, _ = strings.Cut(body, "\n")
+	}
+
+	words := strings.Fields(body)
+	if len(words) == 0 {
+		return fmt.Errorf("%w: %s has no statement after its header", ErrInspect, fields[0])
+	}
+
+	keyword := strings.ToUpper(words[0])
+	if keyword != "SELECT" && keyword != "WITH" {
+		return fmt.Errorf("%w: %s begins with %s, which is not a read", ErrInspect, fields[0], keyword)
+	}
+
+	lowered := strings.ToLower(query)
+	for _, fn := range sessionEffectFunctions {
+		if strings.Contains(lowered, fn) {
+			return fmt.Errorf("%w: %s names %s, which acts on the session rather than the rows", ErrInspect,
+				fields[0], fn)
+		}
+	}
+
+	return nil
+}
+
+// readTxOptions is how a read transaction begins: the engine's default for an
+// ordinary handle, and for an inspection an EXPLICIT READ ONLY transaction at
+// REPEATABLE READ.
+//
+// READ ONLY BECAUSE THE SESSION DEFAULT CAN BE UNDONE: PostgreSQL's
+// default_transaction_read_only is a setting any statement on the connection
+// can turn off, and a transaction begun READ ONLY refuses a write whatever the
+// session says (measured 2026-09-09: an UPDATE after set_config succeeded on a
+// bare connection and was refused with SQLSTATE 25006 inside such a
+// transaction). REPEATABLE READ so the several reads of one report are one
+// snapshot on PostgreSQL, where READ COMMITTED would let a rollout started
+// between two of them appear in one and not the other; SQLite's transaction is
+// a snapshot already and accepts both options (measured on the bundled driver).
+func (db *DB) readTxOptions() *sql.TxOptions {
+	if !db.inspect {
+		return nil
+	}
+
+	return &sql.TxOptions{ReadOnly: true, Isolation: sql.LevelRepeatableRead}
 }
 
 // asCancellation substitutes the caller's context error for a driver's own

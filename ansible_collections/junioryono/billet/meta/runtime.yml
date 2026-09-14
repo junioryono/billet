@@ -1,2 +1,7 @@
 ---
-requires_ansible: ">=2.15.0,<2.22.0"
+# 2.16 IS THE FLOOR: every guard command of the host role passes
+# `expand_argument_vars: false` to ansible.builtin.command, which 2.16 added,
+# so that a holder spelled `ci-${USER}` is published as spelled; a 2.15
+# controller refuses the parameter before billet runs. The pinned runtime the
+# action and CI install is one exact 2.21.x (tests/ansible-core-version).
+requires_ansible: ">=2.16.0,<2.22.0"

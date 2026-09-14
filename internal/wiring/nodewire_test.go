@@ -44,7 +44,7 @@ func rotatedDeployment(t *testing.T) (dir string, old, fresh *wirecert.CA) {
 		t.Fatalf("create: %v", err)
 	}
 
-	fresh, err = wirecert.Rotate(dir, wireDeployment)
+	fresh, err = wirecert.Rotate(t.Context(), dir, wireDeployment)
 	if err != nil {
 		t.Fatalf("rotate: %v", err)
 	}

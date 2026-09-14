@@ -1,0 +1,31 @@
+{
+  "deployment": {
+    "bound": true,
+    "id": "dddddddddddddddddddddddddddddddd"
+  },
+  "nodes": [],
+  "registrations": [
+    {
+      "digest": "abababababababababababababababababababababababababababababababab",
+      "epoch": 1,
+      "highest_release": "v0.9.4",
+      "incarnation": "0000000000000000000000000000bbbb",
+      "live": true,
+      "name": "node-a",
+      "release": "v0.9.4"
+    }
+  ],
+  "retirement": {
+    "completed_at": "",
+    "completed_by": "",
+    "reserved_at": "2026-09-10T12:00:00Z",
+    "retiring": "billet-control-01",
+    "run": "ci-42",
+    "state": "reserved",
+    "survivor": "billet-control-02",
+    "transition_id": "abababababababababababababababab",
+    "updated_at": "2026-09-10T12:00:00Z"
+  },
+  "rollout": null,
+  "schema": 1
+}

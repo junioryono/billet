@@ -3,9 +3,12 @@ package lifeops
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
+	"syscall"
+	"time"
 )
 
 // runner executes one systemctl invocation. A seam, so a test can assert the
@@ -13,27 +16,112 @@ import (
 // manager, and can answer as a host with a masked unit or no unit at all.
 type runner func(ctx context.Context, bin string, args []string) ([]byte, error)
 
-// execRunner runs systemctl for real.
+// runnerWaitDelay is the grace a cancelled run gets between the TERM the
+// cancel sends and the KILL that follows, and the wait for a descendant that
+// keeps the output open after the process itself exited. A variable so a
+// test can shorten it.
+var runnerWaitDelay = 10 * time.Second
+
+// runnerOutputLimit bounds each stream a run keeps. A run that writes more is
+// an error, never a truncated value read as the whole answer.
+const runnerOutputLimit = 1 << 20
+
+// execRunnerWith runs systemctl for real, UNDER THE CALLER'S CONTEXT: the deadline
+// is the caller's to set (a property read runs under the inspector's timeout,
+// a stop or a start under the bound the caller derives from the unit's own),
+// and this runner supplies what a deadline needs to mean anything: the cancel
+// sends TERM rather than the immediate KILL exec would send, KILL follows
+// after the wait delay, a descendant holding the pipes ends the wait at the
+// same delay with the answer refused as not read whole, and each stream is
+// bounded.
 //
 // STDOUT AND STDERR ARE SEPARATE, never combined: systemctl writes values to
 // stdout and narration to stderr, so a combined buffer silently corrupts the
 // value being read back. Stderr is folded into the error instead, where it is
 // the explanation rather than the data.
-func execRunner(ctx context.Context, bin string, args []string) ([]byte, error) {
-	var stdout, stderr bytes.Buffer
+func execRunnerWith(waitDelay time.Duration) runner {
+	return func(ctx context.Context, bin string, args []string) ([]byte, error) {
+		return execRun(ctx, bin, args, waitDelay)
+	}
+}
+
+func execRun(ctx context.Context, bin string, args []string, waitDelay time.Duration) ([]byte, error) {
+	stdout := &boundedBuffer{limit: runnerOutputLimit}
+	stderr := &boundedBuffer{limit: runnerOutputLimit}
+	joined := strings.Join(args, " ")
 
 	// #nosec G204 -- bin is the configured systemctl path and every argument is
 	// built here; nothing from a config file reaches argv.
 	cmd := exec.CommandContext(ctx, bin, args...)
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
+	cmd.WaitDelay = waitDelay
 
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("%s %s: %w: %s", bin, strings.Join(args, " "), err,
+	err := cmd.Run()
+
+	switch {
+	case stdout.overflow || stderr.overflow:
+		return nil, fmt.Errorf("%s %s: wrote more than %d bytes, so its answer was not read whole", bin,
+			joined, runnerOutputLimit)
+	case err != nil && ctx.Err() != nil:
+		return nil, fmt.Errorf("%s %s: %w, the deadline ended it: %s", bin, joined, ctx.Err(),
 			strings.TrimSpace(stderr.String()))
+	case errors.Is(err, exec.ErrWaitDelay):
+		return nil, fmt.Errorf("%s %s: exited, but something kept its output open past the wait delay, so its "+
+			"answer was not read whole", bin, joined)
+	case err != nil:
+		return nil, fmt.Errorf("%s %s: %w: %s", bin, joined, err, strings.TrimSpace(stderr.String()))
 	}
 
 	return stdout.Bytes(), nil
+}
+
+// boundedBuffer keeps the first limit bytes written to it and remembers that
+// more arrived; it never fails the writer, because a write error would close
+// the child's pipe under it and turn an overflow into a broken child.
+type boundedBuffer struct {
+	buf      bytes.Buffer
+	limit    int
+	overflow bool
+}
+
+func (b *boundedBuffer) Write(p []byte) (int, error) {
+	room := b.limit - b.buf.Len()
+	if room < len(p) {
+		b.overflow = true
+
+		if room > 0 {
+			b.buf.Write(p[:room])
+		}
+
+		return len(p), nil
+	}
+
+	b.buf.Write(p)
+
+	return len(p), nil
+}
+
+func (b *boundedBuffer) Bytes() []byte  { return b.buf.Bytes() }
+func (b *boundedBuffer) String() string { return b.buf.String() }
+
+// exec runs one systemctl invocation under the context given, reporting it to
+// the observer first. Every systemctl the package runs goes through here.
+func (i *Inspector) exec(ctx context.Context, args []string) ([]byte, error) {
+	if i.observe != nil {
+		i.observe(ctx, args)
+	}
+
+	return i.run(ctx, i.systemctl, args)
+}
+
+// bounded derives the context a property read or an enablement change runs
+// under: the caller's, bounded by the inspector's timeout. A stop or a start
+// is NOT bounded here; it runs under the caller's own deadline, which the
+// caller derives from the unit's own bound.
+func (i *Inspector) bounded(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, i.timeout)
 }
 
 // properties asks systemd about one unit.
@@ -62,7 +150,10 @@ func (i *Inspector) properties(ctx context.Context, unit string, names ...string
 	// measured, on a machine the package had just prepared.
 	args = append(args, "--", unit)
 
-	out, err := i.run(ctx, i.systemctl, args)
+	ctx, cancel := i.bounded(ctx)
+	defer cancel()
+
+	out, err := i.exec(ctx, args)
 	if err != nil {
 		return nil, err
 	}
@@ -267,4 +358,12 @@ func execStartFlags(rendered string) (string, bool) {
 	}
 
 	return "", false
+}
+
+// UnitProperties asks systemd about one unit, for a caller outside this
+// package that must read a unit under the same runner, bound and parse every
+// other read goes through: the values of the named properties, absence a
+// value and never an error (see properties).
+func (i *Inspector) UnitProperties(ctx context.Context, unit string, names ...string) (map[string][]string, error) {
+	return i.properties(ctx, unit, names...)
 }

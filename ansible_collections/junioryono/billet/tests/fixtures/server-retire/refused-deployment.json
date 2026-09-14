@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "outcome": "refused",
+  "reason": "deployment",
+  "why": "the completion names deployment eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee and this host's identity is dddddddddddddddddddddddddddddddd",
+  "state": "nothing"
+}

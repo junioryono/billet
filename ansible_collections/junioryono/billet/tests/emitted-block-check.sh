@@ -105,11 +105,15 @@ if [ -e "$work/billet-postgres.yaml" ]; then
     exit 1
 fi
 
+# THE BINARY THIS PLAY INSTALLS AT /usr/bin/billet IS THE REAL ONE, built
+# above: the role's preparation asks the installed binary for the converge
+# guard's status before anything else, and a no-op that answers nothing is
+# refused as could-not-tell, which is right of the role and wrong of a fixture.
 ANSIBLE_COLLECTIONS_PATH="$collections_root:$HOME/.ansible/collections:/usr/share/ansible/collections" ansible-playbook \
     --check \
     -i "$inventory" \
     $connection \
     -e "@$work/postgres-block.yml" \
-    -e "billet_postgres_block_binary_src=$noop" \
+    -e "billet_postgres_block_binary_src=$billet" \
     -e "billet_postgres_block_key_src=$key" \
     "$here/postgres-block-check.yml"

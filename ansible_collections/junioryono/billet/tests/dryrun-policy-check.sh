@@ -33,6 +33,9 @@ fi
 
 # --- the module's own resolver, and the notify rule, each self-tested first ---
 "$python" "$here/unit_names_check.py"
+# The endpoint representation, held to the vector table the Go one reads.
+"$python" "$here/endpoint_check.py"
+"$python" "$here/endpoint_change_check.py"
 "$python" "$here/unit_file_notify_check.py" --self-test
 "$python" "$here/unit_file_notify_check.py" "$collection/roles/host"
 

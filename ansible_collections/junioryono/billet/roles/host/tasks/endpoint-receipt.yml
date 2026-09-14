@@ -1,0 +1,94 @@
+---
+# THE RECEIPT'S REFRESH, at the end of every ordinary converge, after the last
+# task that can start the node. A receipt binds the node's registration
+# incarnation and invocation to the endpoint it dials, and an operator restart
+# or an unrelated configuration change invalidates it without moving the
+# endpoint; so `billet node receipt --refresh` rewrites it for the current
+# invocation, digest and registration exactly when the running node's own
+# record names the installed and the desired endpoint (no stop, no restart),
+# answers `current` when a valid receipt already says so, and refuses a
+# configuration installed without the restart it owes. In a dry run it
+# reports what a converge would write. Skipped on a Mac, under the
+# compatibility rule and on a host with no billet (the decision reported
+# which), when the rendering has no node section, when the policy will not
+# start the node in this converge (a receipt needs a running node), and when
+# no configuration is installed (a dry run over a fresh host).
+
+- name: Refresh the node's endpoint receipt
+  when:
+    - not billet_exclusion_darwin | default(false) | bool
+    - not billet_endpoint_compat | default(false) | bool
+    - not billet_endpoint_no_billet | default(false) | bool
+    - billet_endpoint_answerer | default('') | length > 0
+    - billet_config is mapping
+    - billet_config.node is defined
+    - billet_config.node is not none
+    - billet_node_should_run | default(false) | bool
+  vars:
+    # THE MANAGED BINARY ONLY ONCE THIS CONVERGE'S TRANSACTION COMMITTED the
+    # candidate (the finalization's own word); until then, and in a dry run,
+    # the executable that answered the preparation.
+    billet_endpoint_action_executable: >-
+      {{ billet_exclusion_binary if billet_finalization_commit | default('') == 'host upgrade committed' else billet_endpoint_answerer }}
+  block:
+    # THE INSTALLED FILE, as it stands now: the render installed it (or, in a
+    # dry run, would have), and the refresh reads it by name.
+    - name: Inspect the installed configuration before the receipt's refresh
+      ansible.builtin.stat:
+        path: /etc/billet/billet.yaml
+      register: billet_endpoint_installed_now
+      check_mode: false
+      become: true
+
+    # Bounded by the opening observation, the wait, the two observations of
+    # a bracket that outlives it, the publication's two closing observations,
+    # and the guard's bound.
+    - name: Refresh the endpoint receipt
+      ansible.builtin.command:
+        argv: >-
+          {{ ['timeout', '-k', '10', ((billet_receipt_wait | int) + 5 * (billet_migration_observation_bound | int) + (billet_guard_timeout | int)) | string,
+              billet_endpoint_action_executable, 'node', 'receipt', '--refresh', '--config', '/etc/billet/billet.yaml',
+              '--desired', '-', '--wait', (billet_receipt_wait | string) ~ 's', '--json']
+             + (['--dry-run'] if ansible_check_mode else ['--run', billet_exclusion_holder]) }}
+        stdin: "{{ billet_endpoint_rendering }}"
+        expand_argument_vars: false
+      register: billet_receipt_raw
+      changed_when: (billet_receipt_raw.stdout | default('')) is search('"outcome":\s*"written"')
+      failed_when: false
+      check_mode: false
+      become: true
+      no_log: true
+      when: billet_endpoint_installed_now.stat.exists
+
+    - name: Judge the receipt's refresh
+      ansible.builtin.import_tasks: receipt-answer.yml
+      vars:
+        billet_receipt_call: refresh
+        billet_receipt_dry: "{{ ansible_check_mode }}"
+        billet_receipt_answered_by: "{{ billet_endpoint_action_executable }}"
+        billet_receipt_run: "{{ billet_exclusion_holder }}"
+      when: billet_endpoint_installed_now.stat.exists
+
+    - name: Refuse the receipt's refresh
+      ansible.builtin.assert:
+        that:
+          - billet_receipt_answer.outcome in (['reported'] if ansible_check_mode else ['written', 'current'])
+        fail_msg: >-
+          The receipt's refresh through {{ billet_endpoint_action_executable }}
+          {{ 'was refused' if billet_receipt_answer.outcome == 'refused' else 'could not examine the host' }}
+          ({{ billet_receipt_answer.reason | default('no reason') }}):
+          {{ billet_receipt_answer.why | default('no reason') }}.
+          {{ ('Next: ' ~ billet_receipt_answer.next ~ '.') if (billet_receipt_answer.next | default('') | length > 0) else '' }}
+      when: billet_endpoint_installed_now.stat.exists
+
+    - name: Report the receipt's refresh
+      ansible.builtin.debug:
+        msg: >-
+          {{ ('No configuration is installed yet; the receipt follows the converge that installs one.')
+             if not billet_endpoint_installed_now.stat.exists
+             else (('A converge would ' ~ ('write the receipt for ' ~ billet_receipt_answer.receipt.node ~ ' on ' ~ billet_receipt_answer.receipt.effective_endpoint
+                                          if billet_receipt_answer.receipt | default(none) is not none else 'write no receipt: ' ~ billet_receipt_answer.why) ~ '.')
+                   if ansible_check_mode
+                   else ('The receipt is ' ~ billet_receipt_answer.outcome ~ ' for ' ~ billet_receipt_answer.receipt.node ~ ' on '
+                         ~ billet_receipt_answer.receipt.effective_endpoint ~ ' (invocation ' ~ billet_receipt_answer.receipt.invocation_id
+                         ~ ', incarnation ' ~ billet_receipt_answer.receipt.incarnation ~ ').')) }}

@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "outcome": "refused",
+  "reason": "reservation",
+  "why": "this deployment holds no retirement reservation to abandon",
+  "state": "nothing"
+}

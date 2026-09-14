@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "outcome": "unchanged",
+  "node": null,
+  "deployment": null,
+  "endpoint": null,
+  "effective": null,
+  "record": "none",
+  "node_removed": true,
+  "unit": {
+    "load_state": "loaded",
+    "active_state": "inactive",
+    "kill_mode": "mixed"
+  }
+}

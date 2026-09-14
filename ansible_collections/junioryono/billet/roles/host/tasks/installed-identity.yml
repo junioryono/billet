@@ -1,0 +1,91 @@
+---
+# THE INSTALLED ACCOUNT, VALIDATED IN ONE PLACE. account.yml runs this before it
+# creates or adopts the service account, and service-account.yml runs it before
+# it records that account for the authority exclusion; the refusal of an implicit
+# identity migration is therefore made by one file, and a record is never
+# written for a credential that refusal would reject. host-upgrade-order.yml
+# loads this file where account.yml imports it, so its ordering pins still see
+# these five tasks in account.yml's sequence.
+- name: Reload systemd before inspecting installed service policy
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  changed_when: false
+  when: not ansible_check_mode
+  become: true
+
+- name: Inspect an existing billet account
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ billet_service_user }}"
+    fail_key: false
+
+- name: Inspect the installed billet server unit before account mutation
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - show
+      - --property=LoadState
+      - --value
+      - billet-server.service
+  register: billet_installed_server_unit_load_state
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  become: true
+
+- name: Inspect the installed billet server identity before account mutation
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - show
+      - "--property={{ item }}"
+      - --value
+      - billet-server.service
+  loop:
+    - User
+    - Group
+  register: billet_installed_server_identity
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  become: true
+
+- name: Refuse an implicit installed service identity migration
+  ansible.builtin.assert:
+    that:
+      - billet_installed_server_unit_load_state.rc == 0
+      - >-
+        billet_installed_server_unit_load_state.stdout | trim == 'not-found' or
+        (
+          billet_installed_server_identity.results[0].rc == 0 and
+          billet_installed_server_identity.results[1].rc == 0 and
+          billet_installed_server_identity.results[0].stdout | trim == billet_service_user and
+          billet_installed_server_identity.results[1].stdout | trim == billet_service_group
+        )
+    fail_msg: >-
+      The installed billet server runs as
+      {{ billet_installed_server_identity.results[0].stdout | trim }}:{{
+      billet_installed_server_identity.results[1].stdout | trim }}, not the
+      requested {{ billet_service_user }}:{{ billet_service_group }}. Move the
+      ledger and credentials during an explicit offline identity migration;
+      the host role will not change ownership before a recoverable transaction.
+
+# AN EXISTING ACCOUNT IS NOT AUTOMATICALLY OURS. What follows in account.yml
+# hands this identity the deployment's private CA key, and what follows in
+# service-account.yml records it as the owner every root command gives the
+# identity artefacts to, so a login account or a directory-service account that
+# happens to carry the name must be refused HERE, before either.
+- name: Refuse to adopt an unrelated existing account
+  ansible.builtin.assert:
+    that:
+      - billet_adopt_existing_service_account or ansible_facts.getent_passwd[billet_service_user][4] == billet_service_home
+    fail_msg: >-
+      The account {{ billet_service_user }} already exists with home
+      {{ ansible_facts.getent_passwd[billet_service_user][4] }}, not
+      {{ billet_service_home }}. Refusing to hand an unrelated identity the
+      deployment credentials. Set billet_adopt_existing_service_account only
+      after verifying it is the old nologin billet account.
+  # fail_key: false answers a missing account as {name: None} — the KEY is
+  # present on a fresh host, so guard on the value, or the first converge of
+  # any new machine dies dereferencing None.
+  when: ansible_facts.getent_passwd.get(billet_service_user) is not none

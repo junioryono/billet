@@ -28,6 +28,14 @@ func downConfig(t *testing.T, withServer bool) (cfgPath, stateDir string) {
 	var body strings.Builder
 
 	if withServer {
+		// THE IDENTITY DIRECTORY EXISTS on any host `billet check` or
+		// `billet local up` has run on, and every ordinary open of the ledger
+		// creates nothing: a fixture that left it absent staged a host these
+		// commands are right to refuse.
+		if err := os.MkdirAll(stateDir, 0o700); err != nil {
+			t.Fatalf("stage the identity directory: %v", err)
+		}
+
 		body.WriteString(`server:
   listen: 127.0.0.1:7717
   state_dir: ` + stateDir + `

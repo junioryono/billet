@@ -166,6 +166,30 @@
     - not ansible_check_mode
   become: true
 
+# THE CLAIM, BY SHAPE, OUTSIDE THE TRANSACTION BLOCK so its rescue can never
+# see a failed claim: a failed claim ends the play with nothing stopped, hidden,
+# restored or finalized, and the guard stands. Under `guard` (this converge
+# holds the host) the transaction publishes its pointer INSIDE the guard
+# directory, `<root>/active/recovery -> <recovery dir>`, a symlink `ln -sT`
+# refuses to replace or to nest, flushed and read back by readlink; `release`
+# refuses while it exists, and the finalizer removes it alone. Under `legacy`
+# (a managed binary that predates the guard, no candidate) the pre-R claim
+# stands: the regular file `<root>/active` hard-linked from the journal, whose
+# text is the recovery directory. No other shape may transact.
+- name: Refuse a transaction outside the exclusion
+  ansible.builtin.assert:
+    that:
+      - billet_upgrade_claim_shape | default('none') in ['guard', 'legacy']
+    fail_msg: >-
+      This converge would change the binary, but the host is
+      {{ 'not held' if billet_upgrade_claim_shape | default('none') == 'none'
+         else 'in the ' ~ (billet_upgrade_claim_shape | default('none')) ~ ' shape' }},
+      so its transaction has no exclusion to run under. Nothing was claimed,
+      stopped or changed.
+  when:
+    - billet_binary_upgrade | default(false)
+    - not ansible_check_mode
+
 - name: Stage this transaction's atomic host-upgrade claim
   ansible.builtin.copy:
     content: "{{ billet_upgrade_recovery_dir }}\n"
@@ -176,6 +200,7 @@
   when:
     - billet_binary_upgrade | default(false)
     - not ansible_check_mode
+    - billet_upgrade_claim_shape == 'legacy'
   become: true
 
 - name: Durably stage the atomic host-upgrade claim
@@ -188,6 +213,7 @@
   when:
     - billet_binary_upgrade | default(false)
     - not ansible_check_mode
+    - billet_upgrade_claim_shape == 'legacy'
   become: true
 
 - name: Claim the host upgrade without replacing another transaction
@@ -195,13 +221,46 @@
     argv:
       - ln
       - "{{ billet_upgrade_recovery_dir }}/active.claim"
-      - /var/lib/billet/upgrades/active
+      - "{{ billet_exclusion_root }}/active"
   register: billet_upgrade_claim
   changed_when: billet_upgrade_claim.rc == 0
   failed_when: billet_upgrade_claim.rc != 0
   when:
     - billet_binary_upgrade | default(false)
     - not ansible_check_mode
+    - billet_upgrade_claim_shape == 'legacy'
+  become: true
+
+- name: Claim the host upgrade inside the converge guard
+  ansible.builtin.command:
+    argv:
+      - ln
+      - -sT
+      - "{{ billet_upgrade_recovery_dir }}"
+      - "{{ billet_exclusion_root }}/active/recovery"
+  register: billet_upgrade_pointer_claim
+  changed_when: billet_upgrade_pointer_claim.rc == 0
+  failed_when: billet_upgrade_pointer_claim.rc != 0
+  when:
+    - billet_binary_upgrade | default(false)
+    - not ansible_check_mode
+    - billet_upgrade_claim_shape == 'guard'
+  become: true
+
+- name: Durably publish the transaction pointer inside the guard
+  ansible.builtin.command:
+    argv:
+      - sync
+      - -f
+      - "{{ item }}"
+  loop:
+    - "{{ billet_exclusion_root }}/active"
+    - "{{ billet_exclusion_root }}"
+  changed_when: false
+  when:
+    - billet_binary_upgrade | default(false)
+    - not ansible_check_mode
+    - billet_upgrade_claim_shape == 'guard'
   become: true
 
 - name: Durably publish the active host-upgrade pointer before live mutation
@@ -209,32 +268,60 @@
     argv:
       - sync
       - -f
-      - /var/lib/billet/upgrades
+      - "{{ billet_exclusion_root }}"
   changed_when: false
   when:
     - billet_binary_upgrade | default(false)
     - not ansible_check_mode
+    - billet_upgrade_claim_shape == 'legacy'
   become: true
 
 - name: Read back the exclusive host-upgrade claim before live mutation
   ansible.builtin.slurp:
-    src: /var/lib/billet/upgrades/active
+    src: "{{ billet_exclusion_root }}/active"
   register: billet_published_upgrade_claim
   when:
     - billet_binary_upgrade | default(false)
     - not ansible_check_mode
+    - billet_upgrade_claim_shape == 'legacy'
+  become: true
+
+- name: Read back the transaction pointer before live mutation
+  ansible.builtin.command:
+    argv:
+      - readlink
+      - "{{ billet_exclusion_root }}/active/recovery"
+  register: billet_published_upgrade_pointer
+  changed_when: false
+  when:
+    - billet_binary_upgrade | default(false)
+    - not ansible_check_mode
+    - billet_upgrade_claim_shape == 'guard'
   become: true
 
 - name: Prove this transaction owns the host before live mutation
   ansible.builtin.assert:
     that:
-      - billet_published_upgrade_claim.content | b64decode | trim == billet_upgrade_recovery_dir
+      - >-
+        (billet_upgrade_claim_shape == 'guard'
+         and billet_published_upgrade_pointer.stdout | trim == billet_upgrade_recovery_dir)
+        or
+        (billet_upgrade_claim_shape == 'legacy'
+         and billet_published_upgrade_claim.content | b64decode | trim == billet_upgrade_recovery_dir)
     fail_msg: >-
-      Another controller owns the billet host-upgrade claim. This transaction
+      Another transaction owns the billet host-upgrade claim. This transaction
       will not stop services or modify the live ledger.
   when:
     - billet_binary_upgrade | default(false)
     - not ansible_check_mode
+
+- name: Record that the transaction is claimed inside the guard
+  ansible.builtin.set_fact:
+    billet_upgrade_claim_shape: guard-pointer
+  when:
+    - billet_binary_upgrade | default(false)
+    - not ansible_check_mode
+    - billet_upgrade_claim_shape == 'guard'
 
 - name: Upgrade billet as one recoverable host transaction
   when:
@@ -696,6 +783,13 @@
       billet_systemd_units.changed | default(false)
   become: true
 
+# THE ENDPOINT MIGRATION, in place of the ordinary restart: the command judges
+# afresh whether the running node dials the installed endpoint and, when it
+# does not, stops and starts it under the migration protocol; a migrated node
+# is not restarted again below.
+- name: Migrate the node's endpoint before the ordinary restart
+  ansible.builtin.import_tasks: endpoint-migration.yml
+
 - name: Restart the billet node after non-binary inputs change
   ansible.builtin.systemd_service:
     name: billet-node.service
@@ -704,6 +798,7 @@
     - billet_node_should_run
     - not ansible_check_mode
     - not billet_binary_upgrade | default(false)
+    - not billet_endpoint_migrated | default(false) | bool
     - >-
       billet_config_install.changed | default(false) or
       billet_firecracker_install.changed | default(false) or
@@ -734,6 +829,11 @@
     - not ansible_check_mode
   become: true
   notify: billet unit files changed
+
+# THE RECEIPT'S REFRESH, after the last task that can start the node: every
+# ordinary converge keeps the receipt current for the running invocation.
+- name: Refresh the node's endpoint receipt after the start
+  ansible.builtin.import_tasks: endpoint-receipt.yml
 
 # Covers BOTH "this host is no longer the control plane" and "it is, but is not
 # commissioned yet". Disabling is what keeps a prepared host from starting the

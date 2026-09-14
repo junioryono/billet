@@ -1,0 +1,18 @@
+{
+  "active": "converge-guard",
+  "guard": {
+    "holder": "",
+    "claimed_at": "",
+    "hostname": "",
+    "id": "",
+    "preparing": false,
+    "stray_temporary": false,
+    "recovery_pointer": false,
+    "release_executable": "",
+    "release_executable_sha256": "",
+    "release_executable_verified": {
+      "unknown": "the record is not JSON: not one object"
+    },
+    "record_error": "the record is not JSON: not one object"
+  }
+}
