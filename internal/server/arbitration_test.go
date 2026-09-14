@@ -759,6 +759,10 @@ func TestPoolReconciliationKeepsUnusedOrUnconfirmedTurns(t *testing.T) {
 
 // LOSING HELD BACKING TO A HEARTBEAT DOES NOT SERVE THE WAITING JOB. The same
 // owner must replace that backing without giving its unused turn to its peer.
+// A RECONCILIATION THAT TOOK NO HELD BACKING KEEPS ITS TURN AND BUYS NO SECOND
+// LEASE under it. Zero idle escrow cannot distinguish backing the heartbeat lost
+// from backing that moved into a live promise, so the grant is never cleared on
+// that reading; the next handled exchange ends the turn instead.
 func TestPoolReconciliationKeepsATurnWhoseBackingTheHeartbeatLost(t *testing.T) {
 	a, listeners := arbitrationListeners(t, []config.Tier{tier("a"), tier("b")}, tierVCPU)
 	first, second := listeners[0], listeners[1]
@@ -803,14 +807,13 @@ func TestPoolReconciliationKeepsATurnWhoseBackingTheHeartbeatLost(t *testing.T) 
 	if err := second.prepareEscrow(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	replacement := first.Held()
-	if len(replacement) != 1 || replacement[0].ID == held[0].ID || second.capacity() != 0 {
-		t.Fatalf("replacement %+v, peer capacity %d; want new backing under the original owner",
-			replacement, second.capacity())
+	if bought := first.Held(); len(bought) != 0 || second.capacity() != 0 {
+		t.Fatalf("held %+v, peer capacity %d; want no second purchase under a grant already spent",
+			bought, second.capacity())
 	}
-	_, refilled := first.admissionPoll()
-	if refilled != before {
-		t.Fatalf("replacement changed turn %d to %d", before, refilled)
+	_, still := first.admissionPoll()
+	if still != before {
+		t.Fatalf("the refill changed turn %d to %d", before, still)
 	}
 }
 

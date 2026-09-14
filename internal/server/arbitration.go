@@ -242,23 +242,21 @@ func (l *Listener) reconcileAdmissionPool(ctx context.Context, desired int) erro
 		return nil
 	}
 
-	if consumed {
-		// RETURN ONLY THE CAPTURED TURN. Demand can change the owner during a
-		// launch; its completion must never spend the successor's grant.
-		l.finishAdmissionTurn(turn)
-	} else {
-		if l.idleEscrow() != 0 {
-			return nil
-		}
-		// LOST BACKING DID NOT SPEND THE TURN. Permit a replacement purchase
-		// under the same generation without advancing either fairness cursor.
-		a := l.arbiter
-		a.mu.Lock()
-		if a.owner == l.tier && a.generation == turn {
-			a.granted = false
-		}
-		a.mu.Unlock()
+	// A RECONCILIATION THAT TOOK NO HELD BACKING KEEPS ITS TURN AND ITS GRANT.
+	// Zero idle escrow cannot say where the grant's backing went: the heartbeat
+	// may have dropped it, or a partly handled message may have moved it into an
+	// acquisition promise that is still live. Clearing the grant on that reading
+	// bought a second live lease in one turn past waiting peers. So nothing is
+	// returned or cleared here; if the backing really was lost, the next handled
+	// exchange ends the turn, which costs this tier one turn in a rare race and
+	// never stalls it.
+	if !consumed {
+		return nil
 	}
+
+	// RETURN ONLY THE CAPTURED TURN. Demand can change the owner during a launch;
+	// its completion must never spend the successor's grant.
+	l.finishAdmissionTurn(turn)
 	if l.isQuiesced() {
 		return nil
 	}
