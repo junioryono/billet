@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -454,9 +455,17 @@ func TestConsumedPromiseRetainsItsRunAndRequestAliases(t *testing.T) {
 }
 
 func TestAmbiguousCompletionNeverAcknowledgesHeldAssignmentsAfterRetries(t *testing.T) {
-	for _, shared := range []bool{false, true} {
-		name := map[bool]string{false: "standalone", true: "shared admission"}[shared]
-		t.Run(name, func(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		shared      bool
+		nextMessage bool
+	}{
+		{name: "standalone retries"},
+		{name: "shared admission retries", shared: true},
+		{name: "standalone different message", nextMessage: true},
+		{name: "shared admission different message", shared: true, nextMessage: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			tiers := []config.Tier{tier("work")}
 			a := newAllocator(t, alloc.Limits{MaxVCPU: 3 * tierVCPU, MaxMemory: 64 * config.GiB}, tiers)
 			var deliveries, deletes, launches, reconciliations atomic.Int32
@@ -479,7 +488,7 @@ func TestAmbiguousCompletionNeverAcknowledgesHeldAssignmentsAfterRetries(t *test
 				t.Fatal("fixture needs two candidate promises and spare escrow")
 			}
 			spare := l.Held()[0]
-			if shared {
+			if tc.shared {
 				l.arbiter = newDiscoveryArbiter(tiers)
 			}
 			checkHeld := func() {
@@ -508,6 +517,9 @@ func TestAmbiguousCompletionNeverAcknowledgesHeldAssignmentsAfterRetries(t *test
 				if deliveries.Add(1) > poisonQuarantineAfter {
 					return nil, errors.New("ambiguous completion exceeded its retry budget")
 				}
+				if tc.nextMessage && deliveries.Load() == 2 {
+					return &Message{MessageID: 43, Statistics: &Statistics{TotalAssignedJobs: 2}}, nil
+				}
 				return &Message{MessageID: 42, Statistics: &Statistics{TotalAssignedJobs: 2},
 					Assigned: []Job{{RequestID: 11, JobID: "J", RunID: 101},
 						{RequestID: 12, JobID: "J", RunID: 102}},
@@ -523,13 +535,148 @@ func TestAmbiguousCompletionNeverAcknowledgesHeldAssignmentsAfterRetries(t *test
 					reconciliations.Add(1)
 				}
 			}
-			if err := l.Run(t.Context()); !errors.Is(err, errQuarantinableCompletion) {
-				t.Fatalf("Run = %v, want unresolved completion", err)
+			wantErr := errQuarantinableCompletion
+			wantDeliveries := int32(poisonQuarantineAfter)
+			if tc.nextMessage {
+				wantErr = ErrUntrustworthySession
+				wantDeliveries = 2
 			}
-			if deliveries.Load() != poisonQuarantineAfter || deletes.Load() != 0 || launches.Load() != 0 ||
-				reconciliations.Load() != 0 || l.lastMessageID != 0 || session.closes() != 1 {
+			if err := l.Run(t.Context()); !errors.Is(err, wantErr) ||
+				tc.nextMessage && errors.Is(err, errQuarantinableCompletion) {
+				t.Fatalf("Run = %v, want %v", err, wantErr)
+			}
+			if deliveries.Load() != wantDeliveries || deletes.Load() != 0 || launches.Load() != 0 ||
+				reconciliations.Load() != 0 || l.lastMessageID != 0 || session.closes() != 1 ||
+				!slices.Equal(session.acquiredIDs(), []int64{11, 12}) {
 				t.Fatalf("held message escaped retry hold: deliveries %d, deletes %d, launches %d, reconciliations %d, cursor %d, closes %d",
 					deliveries.Load(), deletes.Load(), launches.Load(), reconciliations.Load(), l.lastMessageID, session.closes())
+			}
+		})
+	}
+}
+
+func TestCancellationAfterAHoldDoesNotReconcileDuringDrain(t *testing.T) {
+	tiers := []config.Tier{tier("work")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 5 * tierVCPU, MaxMemory: 64 * config.GiB}, tiers)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	var launches, deletes, reconciliations atomic.Int32
+	var destroyed []int64
+	session := &fakeSession{stats: &Statistics{TotalAssignedJobs: 2}}
+	l := NewListener(a, tiers[0].Label, session, WithDrainGrace(notDrainingHere),
+		WithRunner(&fakeRunner{
+			onLaunch: func(int64) error { launches.Add(1); return nil },
+			onDestroy: func(id int64) error {
+				destroyed = append(destroyed, id)
+				return nil
+			},
+		}))
+	if err := l.refillEscrowTo(t.Context(), 5); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.handle(t.Context(), &Message{MessageID: 1,
+		Assigned: []Job{{RequestID: 21}, {RequestID: 22}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.acquire(t.Context(), []Job{
+		{RequestID: 11, JobID: "J", RunID: 101}, {RequestID: 12, JobID: "J", RunID: 102},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	first, second := l.acquiring[11], l.acquiring[12]
+	if first == nil || second == nil || l.Running() != 2 || l.idleEscrow() != 1 || launches.Load() != 2 {
+		t.Fatal("fixture needs two running jobs, two candidate promises and spare escrow")
+	}
+	checkHeld := func() {
+		t.Helper()
+		l.mu.Lock()
+		intact := l.acquiring[11] == first && l.acquiring[12] == second &&
+			len(l.running) == 1 && l.running[21] != nil
+		l.mu.Unlock()
+		if !intact || launches.Load() != 2 || deletes.Load() != 0 || reconciliations.Load() != 0 ||
+			!slices.Equal(destroyed, []int64{22}) || l.lastMessageID != 1 {
+			t.Errorf("drain escaped hold: intact %v, launches %d, deletes %d, reconciliations %d, destroyed %v, cursor %d",
+				intact, launches.Load(), deletes.Load(), reconciliations.Load(), destroyed, l.lastMessageID)
+		}
+		for _, p := range []*promise{first, second} {
+			lease, err := a.Lease(t.Context(), p.lease.ID)
+			if err != nil || lease.Phase != alloc.PhaseCapacity || lease.RequestID != 0 {
+				t.Errorf("held promise changed during drain: %+v, %v", lease, err)
+			}
+		}
+	}
+	polls, cancellations := 0, 0
+	l.beforeEscrowRefill = func() {
+		if polls == 1 {
+			cancellations++
+			cancel()
+		}
+	}
+	l.beforePoolReconcile = func() {
+		if polls > 0 {
+			reconciliations.Add(1)
+		}
+	}
+	session.onDelete = func(int64) error { deletes.Add(1); return nil }
+	session.onGet = func() (*Message, error) {
+		polls++
+		if polls == 1 {
+			return &Message{MessageID: 42,
+				Available: []Job{{RequestID: 31, JobID: "J", RunID: 101}},
+				Completed: []Job{{JobID: "J", Result: "Cancelled"}, {RequestID: 22, Result: "Succeeded"}},
+			}, nil
+		}
+		if !l.isDraining() || ctx.Err() == nil {
+			t.Error("poll did not enter the drain after the cancelled refill")
+		}
+		checkHeld()
+		if polls == 2 {
+			return nil, ErrNoMessage
+		}
+		return nil, errors.New("end drain after the empty poll")
+	}
+	session.onClose = func(context.Context) error {
+		checkHeld()
+		return nil
+	}
+	if err := l.Run(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run = %v, want cancellation", err)
+	}
+	if polls != 3 || cancellations != 1 || session.closes() != 1 {
+		t.Fatalf("drain path: polls %d, cancellations %d, closes %d",
+			polls, cancellations, session.closes())
+	}
+}
+
+func TestEquivalentOffersCannotHideAnAmbiguousProtocolID(t *testing.T) {
+	for _, reverse := range []bool{false, true} {
+		name := map[bool]string{false: "positive alias first", true: "positive alias last"}[reverse]
+		t.Run(name, func(t *testing.T) {
+			tiers := []config.Tier{tier("work")}
+			a := newAllocator(t, alloc.Limits{MaxVCPU: 3 * tierVCPU, MaxMemory: 64 * config.GiB}, tiers)
+			var acknowledged bool
+			session := &fakeSession{
+				onAcquire: func([]int64) ([]int64, error) { return []int64{0}, nil },
+				onDelete:  func(int64) error { acknowledged = true; return nil },
+			}
+			l := NewListener(a, tiers[0].Label, session)
+			if err := l.refillEscrowTo(t.Context(), 3); err != nil {
+				t.Fatal(err)
+			}
+			offers := []Job{{RequestID: 11, JobID: "J"}, {JobID: "J"}, {JobID: "K"}}
+			if reverse {
+				slices.Reverse(offers)
+			}
+			err := l.handle(t.Context(), &Message{MessageID: 42, Available: offers})
+			if !errors.Is(err, ErrUntrustworthySession) ||
+				!strings.Contains(err.Error(), "under the same runner request id 0; the acquisition response cannot distinguish them") {
+				t.Fatalf("handle = %v, want ambiguous wire request 0", err)
+			}
+			if len(session.acquiredIDs()) != 0 || acknowledged || l.Acquiring() != 0 ||
+				l.Running() != 0 || l.idleEscrow() != 3 || l.lastMessageID != 0 {
+				t.Fatalf("ambiguous offers acted: acquired %v, ack %v, promises %d, running %d, escrow %d, cursor %d",
+					session.acquiredIDs(), acknowledged, l.Acquiring(), l.Running(), l.idleEscrow(), l.lastMessageID)
 			}
 		})
 	}

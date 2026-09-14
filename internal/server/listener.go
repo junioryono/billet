@@ -348,6 +348,9 @@ type Listener struct {
 	capacityExchange  string
 
 	lastMessageID int64
+	// Guarded by mu. A hold blocks reconciliation until its message is settled
+	// or the session closes; an operational error must not discard it.
+	heldMessageID *int64
 
 	// maxCapacity caps what this listener advertises. nil lets the escrow decide.
 	maxCapacity *int
@@ -1097,6 +1100,9 @@ func (l *Listener) Run(ctx context.Context) error {
 			// reaper expiring the lease is the safe way out.
 			return
 		}
+		l.mu.Lock()
+		l.heldMessageID = nil
+		l.mu.Unlock()
 
 		releaseCtx, endRelease := context.WithTimeout(overall, l.releaseGrace)
 		defer endRelease()
@@ -1130,8 +1136,6 @@ func (l *Listener) Run(ctx context.Context) error {
 		endDrain        context.CancelFunc
 		poisonMessageID int64
 		poisonRefusals  int
-		// Previous statistics cannot authorize reconciliation during a held retry.
-		poisonHeld bool
 	)
 
 	defer func() {
@@ -1267,7 +1271,7 @@ func (l *Listener) Run(ctx context.Context) error {
 			// un-quiet and a drain keeps waiting and keeps reporting what it is
 			// waiting for. The seal under-delivers visibly rather than reporting a
 			// deployment quiesced that is not.
-			if l.observed != nil && !poisonHeld {
+			if l.observed != nil && !l.messageHeld() {
 				if err := l.reconcileAdmissionPool(pollCtx, l.observed.TotalAssignedJobs); err != nil {
 					// reconcilePool launches runners, which can take minutes; a
 					// cancellation landing mid-launch must enter the drain so the
@@ -1337,7 +1341,7 @@ func (l *Listener) Run(ctx context.Context) error {
 			// proves it.
 			l.handBackIdleEscrow(pollCtx, draining || (quiesced && admissionKnown))
 
-			if l.observed != nil && !poisonHeld {
+			if l.observed != nil && !l.messageHeld() {
 				if _, err := l.reconcilePool(pollCtx, l.observed.TotalAssignedJobs); err != nil {
 					// reconcilePool launches runners, which can take minutes; a
 					// cancellation landing mid-launch must enter the drain so the
@@ -1418,7 +1422,6 @@ func (l *Listener) Run(ctx context.Context) error {
 					poisonRefusals = 0
 				}
 				poisonRefusals++
-				poisonHeld = poison.held
 
 				if poisonRefusals < poisonQuarantineAfter {
 					l.log.Error("a completion message has a deterministic identity refusal; keeping it unacknowledged for another delivery before quarantine",
@@ -1448,7 +1451,6 @@ func (l *Listener) Run(ctx context.Context) error {
 					"error", poison)
 				poisonMessageID = 0
 				poisonRefusals = 0
-				poisonHeld = false
 				// A QUARANTINED MESSAGE IS A HANDLED EXCHANGE, and ends its turn as
 				// every other handled exchange does. Skipping this let a stream of
 				// poisoned messages hold the shared admission turn indefinitely,
@@ -1471,7 +1473,6 @@ func (l *Listener) Run(ctx context.Context) error {
 
 		poisonMessageID = 0
 		poisonRefusals = 0
-		poisonHeld = false
 		l.finishAdmissionTurn(admissionTurn)
 		if !draining {
 			l.releaseIdleEscrowAbove(pollCtx, max(advertised, l.targetCapacity()))
@@ -3077,6 +3078,15 @@ func (l *Listener) refillEscrowUngated(ctx context.Context, target, maxNew int) 
 // about error severity, so the first non-fatal error path anyone adds inherits
 // the question.
 func (l *Listener) handle(ctx context.Context, msg *Message) error {
+	l.mu.Lock()
+	if l.heldMessageID != nil && *l.heldMessageID != msg.MessageID {
+		heldID := *l.heldMessageID
+		l.mu.Unlock()
+		return fmt.Errorf("%w: message %d arrived while message %d holds candidate jobs",
+			ErrUntrustworthySession, msg.MessageID, heldID)
+	}
+	l.mu.Unlock()
+
 	// STARTS PRECEDE COMPLETIONS EVEN WHEN GITHUB BATCHES THEM TOGETHER. The
 	// start is the authoritative runner-to-job binding; resolving the completion
 	// first would either settle the request that caused launch or mistake a busy
@@ -3096,6 +3106,13 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 	}
 
 	resolved, err := l.resolveMessage(ctx, msg)
+	// Persist the hold before any later error can send Run into its drain.
+	if len(resolved.held) > 0 {
+		l.mu.Lock()
+		id := msg.MessageID
+		l.heldMessageID = &id
+		l.mu.Unlock()
+	}
 	if err != nil {
 		return err
 	}
@@ -3282,7 +3299,7 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 		}
 	}
 
-	if msg.Statistics != nil && len(resolved.held) == 0 {
+	if msg.Statistics != nil && !l.messageHeld() {
 		l.observed = msg.Statistics
 		if _, err := l.reconcilePool(ctx, msg.Statistics.TotalAssignedJobs); err != nil {
 			return err
@@ -3378,6 +3395,9 @@ func (l *Listener) quarantineStarted(ctx context.Context, job Job, cause error) 
 // shrinkage; a busy member belongs to a job regardless of what any aggregate
 // says while messages are in flight. Reports whether growth took held backing.
 func (l *Listener) reconcilePool(ctx context.Context, desired int) (bool, error) {
+	if l.messageHeld() {
+		return false, nil
+	}
 	if l.beforePoolReconcile != nil {
 		l.beforePoolReconcile()
 	}
@@ -3653,8 +3673,21 @@ func (l *Listener) acknowledge(ctx context.Context, msg *Message) error {
 	if err := l.session.DeleteMessage(ctx, msg.MessageID); err != nil {
 		return fmt.Errorf("server: acknowledge message %d: %w", msg.MessageID, err)
 	}
+	l.mu.Lock()
+	if l.heldMessageID != nil && *l.heldMessageID == msg.MessageID {
+		l.heldMessageID = nil
+	}
+	l.mu.Unlock()
 
 	return nil
+}
+
+// messageHeld also covers holds discovered before an operational failure.
+func (l *Listener) messageHeld() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	return l.heldMessageID != nil
 }
 
 // acknowledgeCompletions records that GitHub will not redeliver the
@@ -3711,7 +3744,7 @@ func (l *Listener) acquireUnfinished(ctx context.Context, available []resolvedJo
 	}
 
 	committed := l.currentCommitments(commitments)
-	identified := make([]resolvedJob, 0, len(available))
+	eligible := make([]resolvedJob, 0, len(available))
 	for _, entry := range available {
 		if containsActual(held, entry.actual) {
 			continue
@@ -3720,18 +3753,12 @@ func (l *Listener) acquireUnfinished(ctx context.Context, available []resolvedJo
 			l.forgetAvailable(entry.actual)
 			continue
 		}
-		if i := slices.IndexFunc(identified, func(prior resolvedJob) bool {
-			return sameActualJob(prior.actual, entry.actual)
-		}); i >= 0 {
-			identified[i].actual = mergeActual(identified[i].actual, entry.actual)
-			continue
-		}
-		identified = append(identified, entry)
+		eligible = append(eligible, entry)
 	}
 	protocolFor := make(map[int64]int64, len(available))
 	internalFor := make(map[int64]int64, len(available))
 	offerFor := make(map[int64]actualJobIdentity, len(available))
-	for _, entry := range identified {
+	for _, entry := range eligible {
 		protocolID := entry.protocolID
 		job := entry.job
 		protocolFor[job.RequestID] = protocolID
@@ -3741,6 +3768,21 @@ func (l *Listener) acquireUnfinished(ctx context.Context, available []resolvedJo
 		}
 		internalFor[protocolID] = job.RequestID
 		offerFor[protocolID] = entry.actual
+	}
+	// Validate every wire offer before coalescing acquisition representatives.
+	identified := make([]resolvedJob, 0, len(eligible))
+	for _, entry := range eligible {
+		if i := slices.IndexFunc(identified, func(prior resolvedJob) bool {
+			return sameActualJob(prior.actual, entry.actual)
+		}); i >= 0 {
+			identified[i].actual = mergeActual(identified[i].actual, entry.actual)
+			continue
+		}
+		identified = append(identified, entry)
+	}
+	for _, entry := range identified {
+		protocolFor[entry.job.RequestID] = entry.protocolID
+		offerFor[entry.protocolID] = entry.actual
 	}
 
 	// THE TURN MUST STILL BELONG TO THIS TIER WHEN ESCROW BECOMES A PROMISE.
