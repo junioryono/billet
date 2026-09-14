@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "outcome": "refused",
+  "reason": "survivor",
+  "why": "the input carries no survivor report",
+  "state": "nothing",
+  "reservation": "released"
+}
