@@ -247,7 +247,7 @@ func TestDiscoveryWithdrawalDoesNotReleaseAnAcquiringCapacityLease(t *testing.T)
 	if err := donor.refillEscrowUngated(t.Context(), 2, 2); err != nil {
 		t.Fatal(err)
 	}
-	if got := donor.reserve([]Job{{RequestID: 11}}); !slices.Equal(got, []int64{11}) {
+	if got := donor.reserve([]resolvedJob{{job: Job{RequestID: 11}}}); !slices.Equal(got, []int64{11}) {
 		t.Fatalf("reserved %v, want request 11", got)
 	}
 	promised := donor.acquiring[11].lease
@@ -314,7 +314,7 @@ func TestCappedDemandAdvancesTheWholeRoundRobin(t *testing.T) {
 			t.Fatalf("tier %s has advertisement %d, turn %d; want one backed turn", l.tier, advertised, turn)
 		}
 		id := int64(i + 1)
-		if got := l.reserve([]Job{{RequestID: id}}); !slices.Equal(got, []int64{id}) {
+		if got := l.reserve([]resolvedJob{{job: Job{RequestID: id}}}); !slices.Equal(got, []int64{id}) {
 			t.Fatalf("tier %s reserved %v, want %d", l.tier, got, id)
 		}
 		l.observeDemand(l.observed)
@@ -436,27 +436,56 @@ func TestKnownDemandOrderDoesNotFollowObservationArrival(t *testing.T) {
 // REDELIVERY CANNOT TURN AN EXISTING PROMISE INTO UNMET DEMAND. The spare slot
 // must go to the idle peer even if GitHub repeats the already-acquired offer.
 func TestARepeatedOfferDoesNotPreemptDiscovery(t *testing.T) {
-	_, listeners := arbitrationListeners(t, []config.Tier{tier("a-work"), tier("b-idle")}, 2*tierVCPU)
-	work, idle := listeners[0], listeners[1]
-	work.observed = &Statistics{TotalAvailableJobs: 1}
-	if err := work.prepareEscrow(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-	_, turn := work.admissionPoll()
-	offer := &Message{MessageID: 1, Available: []Job{{RequestID: 11, RunID: 101}}}
-	if err := work.handle(t.Context(), offer); err != nil {
-		t.Fatal(err)
-	}
-	work.finishAdmissionTurn(turn)
-	if err := work.handle(t.Context(), offer); err != nil {
-		t.Fatal(err)
-	}
-	if err := idle.prepareEscrow(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-	if idle.capacity() != 1 || work.capacity() != 1 || len(work.waitingOffers) != 0 {
-		t.Fatalf("repeated offer left idle %d, work %d, waiting %d; want 1, 1, 0",
-			idle.capacity(), work.capacity(), len(work.waitingOffers))
+	for _, tc := range []struct {
+		name       string
+		requestID  int64
+		repeatedID int64
+	}{
+		{name: "request id", requestID: 11, repeatedID: 11},
+		{name: "zero request id", requestID: 0},
+		{name: "direct promise with positive offer", requestID: 0, repeatedID: 11},
+		{name: "positive promise with zero offer", requestID: 11},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, listeners := arbitrationListeners(t, []config.Tier{tier("a-work"), tier("b-idle")}, 2*tierVCPU)
+			work, idle := listeners[0], listeners[1]
+			session := &fakeSession{}
+			work.session = session
+			work.observed = &Statistics{TotalAvailableJobs: 1}
+			if err := work.prepareEscrow(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			_, turn := work.admissionPoll()
+			offer := &Message{MessageID: 1, Available: []Job{{RequestID: tc.requestID, RunID: 101, JobID: "job-a"}}}
+			if err := work.handle(t.Context(), offer); err != nil {
+				t.Fatal(err)
+			}
+			if ids := session.acquiredIDs(); !slices.Equal(ids, []int64{tc.requestID}) || work.Acquiring() != 1 {
+				t.Fatalf("initial acquisition = %v, promises %d; want [%d], 1", ids, work.Acquiring(), tc.requestID)
+			}
+			work.finishAdmissionTurn(turn)
+			if err := idle.prepareEscrow(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			sent, idleTurn := idle.admissionPoll()
+			if sent != 1 || idleTurn == 0 {
+				t.Fatalf("peer discovery sent %d with turn %d; want one backed turn", sent, idleTurn)
+			}
+			offer.Available[0].RequestID = tc.repeatedID
+			if err := work.handle(t.Context(), offer); err != nil {
+				t.Fatal(err)
+			}
+			if sent, turn := idle.admissionPoll(); sent != 1 || turn != idleTurn {
+				t.Fatalf("redelivery revoked peer discovery: sent %d, turn %d; want 1, %d", sent, turn, idleTurn)
+			}
+			if ids := session.acquiredIDs(); !slices.Equal(ids, []int64{tc.requestID}) {
+				t.Fatalf("redelivery acquired the same job again: %v", ids)
+			}
+			if idle.capacity() != 1 || work.capacity() != 1 || len(work.waitingOffers) != 0 {
+				t.Fatalf("repeated offer left idle %d, work %d, waiting %d; want 1, 1, 0",
+					idle.capacity(), work.capacity(), len(work.waitingOffers))
+			}
+		})
 	}
 }
 
@@ -516,12 +545,16 @@ func TestDirectOfferDemandKeepsSeparateJobIdentities(t *testing.T) {
 	if err := first.prepareEscrow(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	second.rememberAvailable(&Message{Available: []Job{{JobID: "job-a"}, {JobID: "job-b"}}})
-	second.rememberAvailable(&Message{Completed: []Job{{JobID: "job-a"}}})
+	if err := second.handle(t.Context(), &Message{MessageID: 1, Available: []Job{{JobID: "job-a"}, {JobID: "job-b"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.handle(t.Context(), &Message{MessageID: 2, Completed: []Job{{JobID: "job-a"}}}); err != nil {
+		t.Fatal(err)
+	}
 	second.observeDemand(nil)
 	_, turn := first.admissionPoll()
 	first.finishAdmissionTurn(turn)
-	if len(second.waitingOffers) != 1 || !second.waitingOffers[offerIdentity{job: "job-b"}] ||
+	if len(second.waitingOffers) != 1 || !containsActual(second.waitingOffers, actualJobIdentity{job: "job-b"}) ||
 		!second.arbiter.permits(second.tier) {
 		t.Fatalf("completion erased unrelated demand: %+v", second.waitingOffers)
 	}
@@ -556,6 +589,162 @@ func TestCancelledOfferDoesNotCreateAPromise(t *testing.T) {
 	if work.committedCapacity() != 0 || idle.capacity() != 1 {
 		t.Fatalf("cancelled offer kept capacity: work %d, idle %d",
 			work.committedCapacity(), idle.capacity())
+	}
+
+	for _, unrelated := range []bool{false, true} {
+		t.Run(map[bool]string{false: "pooled completion", true: "unrelated offer shares launch id"}[unrelated], func(t *testing.T) {
+			tiers := []config.Tier{tier("a-work")}
+			a := newAllocator(t, alloc.Limits{MaxVCPU: tierVCPU, MaxMemory: 64 * config.GiB}, tiers)
+			session := &fakeSession{}
+			var destroyed []int64
+			work := NewListener(a, tiers[0].Label, session, WithRunner(&fakeRunner{
+				onDestroy: func(requestID int64) error {
+					destroyed = append(destroyed, requestID)
+					return nil
+				},
+			}), WithRunnerRegistry(&fakeRunnerRegistry{}))
+			if err := work.refillEscrow(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if err := work.handle(t.Context(), &Message{
+				MessageID: 1, Statistics: &Statistics{TotalAssignedJobs: 1},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			members, err := a.PoolRunners(t.Context(), work.tier)
+			if err != nil || len(members) != 1 || members[0].LaunchRequestID >= 0 {
+				t.Fatalf("anonymous pool runner = %+v, err %v", members, err)
+			}
+			member := members[0]
+			actual := Job{RequestID: 12, RunID: 101, JobID: "completed-job",
+				RunnerID: 77, RunnerName: member.RunnerName, Result: "Succeeded"}
+			available := []Job{{RequestID: actual.RequestID, RunID: actual.RunID, JobID: actual.JobID}}
+			var want []int64
+			if unrelated {
+				available = append(available, Job{RequestID: member.LaunchRequestID, RunID: 102, JobID: "unfinished-job"})
+				want = []int64{member.LaunchRequestID}
+			}
+			if err := work.handle(t.Context(), &Message{
+				MessageID: 2, Started: []Job{actual}, Completed: []Job{actual}, Available: available,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if ids := session.acquiredIDs(); !slices.Equal(ids, want) {
+				t.Errorf("acquired %v, want %v; completion must filter actual request 12 only", ids, want)
+			}
+			if !slices.Equal(destroyed, []int64{member.LaunchRequestID}) {
+				t.Errorf("destroyed %v, want launch request %d", destroyed, member.LaunchRequestID)
+			}
+			if work.Running() != 0 || work.Acquiring() != len(want) {
+				t.Errorf("after completion: running %d, promises %d; want 0, %d",
+					work.Running(), work.Acquiring(), len(want))
+			}
+		})
+	}
+
+	for _, tc := range []struct {
+		name           string
+		keepJobID      bool
+		offerRequestID int64
+	}{
+		{name: "runner name only", offerRequestID: 11},
+		{name: "job id without request id", keepJobID: true, offerRequestID: 11},
+		{name: "runner name only with zero-request offer"},
+		{name: "job id without request id with zero-request offer", keepJobID: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tiers := []config.Tier{tier("a-work")}
+			a := newAllocator(t, alloc.Limits{MaxVCPU: tierVCPU, MaxMemory: 64 * config.GiB}, tiers)
+			session := &fakeSession{}
+			var destroyed []int64
+			work := NewListener(a, tiers[0].Label, session, WithRunner(&fakeRunner{
+				onDestroy: func(requestID int64) error {
+					destroyed = append(destroyed, requestID)
+					return nil
+				},
+			}), WithRunnerRegistry(&fakeRunnerRegistry{}))
+			if err := work.refillEscrow(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			actual := Job{RequestID: 11, RunID: 101, JobID: "completed-job"}
+			if err := work.handle(t.Context(), &Message{MessageID: 1, Assigned: []Job{actual}}); err != nil {
+				t.Fatal(err)
+			}
+			members, err := a.PoolRunners(t.Context(), work.tier)
+			if err != nil || len(members) != 1 || members[0].LaunchRequestID != 11 {
+				t.Fatalf("launched runner = %+v, err %v; want request 11", members, err)
+			}
+			actual.RunnerID, actual.RunnerName = 77, members[0].RunnerName
+			if err := work.handle(t.Context(), &Message{MessageID: 2, Started: []Job{actual}}); err != nil {
+				t.Fatal(err)
+			}
+			binding, err := a.PoolRunnerByName(t.Context(), actual.RunnerName)
+			if err != nil || binding.Status != alloc.PoolRunnerBusy || binding.ActualRequestID != 11 || binding.JobID != actual.JobID {
+				t.Fatalf("busy binding = %+v, err %v; want actual request 11", binding, err)
+			}
+			completion := Job{RunnerName: actual.RunnerName, Result: "Cancelled"}
+			if tc.keepJobID {
+				completion.JobID = actual.JobID
+			}
+			if err := work.handle(t.Context(), &Message{
+				MessageID: 3, Completed: []Job{completion},
+				Available: []Job{{RequestID: tc.offerRequestID, RunID: actual.RunID, JobID: actual.JobID}},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if ids := session.acquiredIDs(); len(ids) != 0 {
+				t.Errorf("acquired completed request %v after its wire identity was omitted", ids)
+			}
+			if !slices.Equal(destroyed, []int64{11}) || work.Running() != 0 || work.Acquiring() != 0 {
+				t.Errorf("destroyed %v, running %d, promises %d; want [11], 0, 0",
+					destroyed, work.Running(), work.Acquiring())
+			}
+			if _, exists, err := a.DirectJobIdentity(t.Context(), actual.JobID); err != nil {
+				t.Fatal(err)
+			} else if exists != (tc.offerRequestID == 0) {
+				t.Errorf("direct identity exists = %t; only a zero-request offer may mint it", exists)
+			}
+		})
+	}
+}
+
+// A DIRECT ASSIGNMENT ESTABLISHES IDENTITY BEFORE ITS SAME-BATCH CANCELLATION.
+// Held escrow and absent statistics leave the completion as the only launch guard.
+func TestAssignedAndCancelledDirectJobNeverLaunches(t *testing.T) {
+	tiers := []config.Tier{tier("a-work")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: tierVCPU, MaxMemory: 64 * config.GiB}, tiers)
+	var launched []int64
+	work := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(&fakeRunner{
+		onLaunch: func(requestID int64) error {
+			launched = append(launched, requestID)
+			return nil
+		},
+	}))
+	if err := work.refillEscrow(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if work.idleEscrow() != 1 {
+		t.Fatalf("held escrow = %d, want 1", work.idleEscrow())
+	}
+	if _, exists, err := a.DirectJobIdentity(t.Context(), "J"); err != nil {
+		t.Fatal(err)
+	} else if exists {
+		t.Fatal("fixture already has a direct identity for J")
+	}
+	err := work.handle(t.Context(), &Message{
+		MessageID: 1,
+		Assigned:  []Job{{JobID: "J"}},
+		Completed: []Job{{JobID: "J", Result: "Cancelled"}},
+	})
+	if len(launched) != 0 || work.Running() != 0 || work.Acquiring() != 0 {
+		t.Errorf("cancelled direct job launched %v, running %d, promises %d; want none",
+			launched, work.Running(), work.Acquiring())
+	}
+	if err != nil {
+		t.Fatalf("handle assigned-and-cancelled direct job: %v", err)
+	}
+	if work.idleEscrow() != 1 {
+		t.Errorf("cancelled direct job consumed held escrow: %d remain, want 1", work.idleEscrow())
 	}
 }
 
@@ -901,7 +1090,7 @@ func TestArbitratedRefillBuysOneLeaseAfterCommittedCapacityDisappears(t *testing
 		t.Fatal(err)
 	}
 	_, spent := l.admissionPoll()
-	if got := l.reserve([]Job{{RequestID: 11}}); !slices.Equal(got, []int64{11}) {
+	if got := l.reserve([]resolvedJob{{job: Job{RequestID: 11}}}); !slices.Equal(got, []int64{11}) {
 		t.Fatalf("reserved %v, want request 11", got)
 	}
 	promised := l.acquiring[11].lease

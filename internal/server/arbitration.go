@@ -45,20 +45,6 @@ type discoveryEntry struct {
 	ceiling  int
 }
 
-// offerIdentity keeps zero-request direct jobs separate until they are assigned.
-type offerIdentity struct {
-	request int64
-	job     string
-}
-
-func identityOfOffer(job Job) offerIdentity {
-	if job.RequestID != 0 {
-		return offerIdentity{request: job.RequestID}
-	}
-
-	return offerIdentity{job: job.JobID}
-}
-
 func newDiscoveryArbiter(tiers []config.Tier) *discoveryArbiter {
 	a := &discoveryArbiter{entries: make(map[string]discoveryEntry, len(tiers))}
 	for i := range tiers {
@@ -271,32 +257,45 @@ func (l *Listener) finishAdmissionTurn(turn uint64) {
 	}
 }
 
-// rememberAvailable retains a refused offer as known demand until it is accepted,
-// assigned, completed, or replaced by a source snapshot reporting no available
-// work. A timer never turns silence into proof that the queue is empty.
-func (l *Listener) rememberAvailable(msg *Message) {
+// rememberAvailable retains priority hints under resolveActualJob's rule until
+// acceptance, assignment, completion, or a source snapshot reports no work.
+// A timer never turns silence into proof that the queue is empty.
+func (l *Listener) rememberAvailable(msg *Message, resolved resolvedMessage) {
 	if l.arbiter == nil {
 		return
 	}
 	if msg.Statistics != nil && msg.Statistics.TotalAvailableJobs == 0 {
-		clear(l.waitingOffers)
+		l.waitingOffers = nil
 	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	for i := range msg.Available {
-		// A REPEATED OFFER DOES NOT CREATE A SECOND BACKLOG ENTRY. reserve
-		// skips existing commitments, so nobody would remove this hint later.
-		if l.acquiring[msg.Available[i].RequestID] != nil || l.running[msg.Available[i].RequestID] != nil {
+	committed := l.currentCommitments(resolved.committed)
+	for i := range resolved.available {
+		entry := &resolved.available[i]
+		// Commitment comparisons use resolveActualJob's canonical aliases.
+		if containsActual(committed, entry.actual) {
 			continue
 		}
-		l.waitingOffers[identityOfOffer(msg.Available[i])] = true
+		actual := entry.actual
+		for _, prior := range l.waitingOffers {
+			if sameActualJob(actual, prior) {
+				actual = mergeActual(actual, prior)
+			}
+		}
+		l.forgetAvailable(actual)
+		l.waitingOffers = append(l.waitingOffers, actual)
 	}
-	for i := range msg.Assigned {
-		delete(l.waitingOffers, identityOfOffer(msg.Assigned[i]))
+	for i := range resolved.assigned {
+		l.forgetAvailable(resolved.assigned[i].actual)
 	}
-	for i := range msg.Completed {
-		delete(l.waitingOffers, identityOfOffer(msg.Completed[i]))
+	for i := range resolved.completed {
+		l.forgetAvailable(resolved.completed[i].actual)
 	}
+}
+
+// forgetAvailable removes priority hints using resolveActualJob's rule.
+func (l *Listener) forgetAvailable(actual actualJobIdentity) {
+	l.waitingOffers = slices.DeleteFunc(l.waitingOffers, func(prior actualJobIdentity) bool {
+		return sameActualJob(prior, actual)
+	})
 }
 
 // admissionPoll fixes the advertisement and its turn as one decision. Demand

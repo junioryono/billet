@@ -139,6 +139,7 @@ type ReadOps interface {
 	ReadJobNode(ctx context.Context, leaseID string) (sql.NullString, error)
 	ReadJobPlacement(ctx context.Context, leaseID string) (ledgerdb.ReadJobPlacementRow, error)
 	ReadJobIdentity(ctx context.Context, jobID string) (int64, error)
+	ReadJobIdentityByInternalID(ctx context.Context, internalID int64) (string, error)
 	ReadJobResult(ctx context.Context, leaseID string) (string, error)
 	ReadJobStarted(ctx context.Context, leaseID string) (bool, error)
 	ReadLease(ctx context.Context, id string) (ledgerdb.ReadLeaseRow, error)
