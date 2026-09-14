@@ -3183,21 +3183,45 @@ cat >"$work/play-retire-parser.yml" <<'PLAY'
       ansible.builtin.set_fact:
         billet_retire_raw: "{{ billet_gate_retire_raw }}"
         # A refused second inclusion must not retain a preceding answer.
+        billet_retire_answer: {stale: true}
         billet_retire_route: ordinary
         billet_retire_state_known: true
         billet_retire_valid: true
         billet_retire_reservation: released
-    - name: Parse the retirement answer
-      ansible.builtin.include_role:
-        name: junioryono.billet.host
-        tasks_from: retire-answer
+    - name: Parse the retirement answer and prove its failure facts
+      block:
+        - name: Parse the retirement answer
+          ansible.builtin.include_role:
+            name: junioryono.billet.host
+            tasks_from: retire-answer
+      rescue:
+        - name: Prove a failed parse discarded the preceding facts
+          vars:
+            # A validated refusal republishes its own state and cleanup word;
+            # unreadable and unanswered calls keep those permissions reset.
+            billet_gate_typed_refusal: "{{ ansible_failed_task.name == \"Refuse the retirement's answer\" }}"
+          ansible.builtin.assert:
+            that:
+              - billet_retire_route == ''
+              - billet_retire_valid is sameas billet_gate_typed_refusal
+              - billet_retire_state_known is sameas (billet_retire_answer.state != 'unknown' if billet_gate_typed_refusal else false)
+              - billet_retire_reservation == (billet_retire_answer.reservation | default('') if billet_gate_typed_refusal else '')
+              - >-
+                billet_retire_answer ==
+                ({} if ansible_failed_task.name in ['Refuse a retirement call that did not answer', 'Refuse unreadable retirement JSON']
+                 else billet_gate_retire_raw.stdout | junioryono.billet.from_json_strict)
+            fail_msg: The retirement parser retained stale facts after failure.
+            success_msg: Retirement failure facts verified.
+        - name: Preserve the retirement parser's refusal
+          ansible.builtin.fail:
+            msg: "{{ ansible_failed_result.msg | default('The retirement parser refused this invocation.') }}"
     - name: Prove the parser published this invocation's typed operands
       ansible.builtin.assert:
         that:
           - billet_retire_valid is sameas true
           - billet_retire_answer == (billet_gate_retire_raw.stdout | junioryono.billet.from_json_strict)
           - billet_retire_route == (billet_retire_answer.route if billet_retire_call == 'classify' else '')
-          - billet_retire_state_known is sameas (billet_retire_answer.state | default('') != 'unknown')
+          - billet_retire_state_known is sameas (false if billet_retire_call == 'complete' else billet_retire_answer.state != 'unknown')
           - billet_retire_reservation == ''
         fail_msg: The retirement parser did not publish this call's own answer.
 PLAY
@@ -3234,6 +3258,11 @@ PY
     -e "@$work/cases/$name/raw.json" -e ansible_become=false >"$work/cases/$name/out" 2>&1
   status=$?
   set -e
+  # The first failure still supplies the refusal verdict. A second failure
+  # in rescue must not pass merely because that first refusal was expected.
+  if [ "$status" -ne 0 ]; then
+    grep -qF '"msg": "Retirement failure facts verified."' "$work/cases/$name/out" || fail "$name: the failure facts were not verified" "$work/cases/$name/out"
+  fi
   expect_no_ordinary "$name"
 }
 retire_member_refused() { # case member [task]
@@ -3252,6 +3281,7 @@ retire_unanswered() { # case task
 # R7's positive controls: every call and every committed success shape. A
 # dry-run fixture's filename says dispatch, not route: request is ordinary,
 # adopt is hold, and unknown-ledger with a readable journal is continue.
+# Completion has no state member, so it must publish state_known false.
 for spec in classify:dry-run-request classify:dry-run-adopt classify:dry-run-unknown-ledger \
   reserve:reserved reserve:adopted request:retired-settled request:retired-pending \
   abandon:abandoned abandon:abandoned-marker-cleared complete:completed complete:completed-already \
