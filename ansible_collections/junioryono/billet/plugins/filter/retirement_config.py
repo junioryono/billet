@@ -6,24 +6,60 @@
 import yaml
 
 
-class _UniqueLoader(yaml.SafeLoader):
-    def __init__(self, stream):
-        super().__init__(stream)
-        self._checked_mappings = set()
+_PACKAGED_IDENTITY_DIR = "/var/lib/billet/server"
+_STRING_TAG = "tag:yaml.org,2002:str"
+_NULL_TAG = "tag:yaml.org,2002:null"
 
-    def flatten_mapping(self, node):
-        # Check explicit keys BEFORE flattening: an explicit value may override
-        # a merged value, and earlier maps in a merge sequence win, as in yaml.v3.
-        # flatten_mapping also visits merge sources that have no constructor call.
-        if node not in self._checked_mappings:
+
+class _OutsideSubset(ValueError):
+    """A named reason the compatibility reader cannot establish a locator."""
+
+
+def _read_subset(text):
+    # This pre-release compatibility path accepts one UTF-8 mapping document,
+    # string mapping keys, no duplicates, anchors, aliases, merge keys or
+    # explicit tags anywhere. It does not implement yaml.v3 in Python. A capable
+    # answerer uses the Go classifier instead.
+    # The reference controller's read-only inspection on 2026-09-14 found none
+    # of those YAML features and state_dir: /var/lib/billet/server. The role's
+    # to_nice_yaml emits aliases only for repeated object identity; a rendering
+    # that does so holds on this compatibility path only, naming the alias.
+    forbidden = []
+    documents = 0
+    for event in yaml.parse(text, Loader=yaml.SafeLoader):
+        if isinstance(event, yaml.events.DocumentStartEvent):
+            documents += 1
+        if isinstance(event, yaml.events.AliasEvent):
+            forbidden.append("alias *%s" % event.anchor)
+        elif getattr(event, "anchor", None) is not None:
+            forbidden.append("anchor &%s" % event.anchor)
+        if getattr(event, "tag", None) is not None:
+            forbidden.append("explicit tag %s" % event.tag)
+    if forbidden:
+        raise _OutsideSubset("The installed configuration contains forbidden YAML: %s." % ", ".join(forbidden))
+    if documents != 1:
+        raise _OutsideSubset("The installed configuration must contain a single YAML document.")
+
+    root = yaml.compose(text, Loader=yaml.SafeLoader)
+    if not isinstance(root, yaml.nodes.MappingNode):
+        raise _OutsideSubset("The installed configuration root is not a mapping.")
+    pending = [root]
+    while pending:
+        node = pending.pop()
+        if isinstance(node, yaml.nodes.MappingNode):
             keys = set()
-            for key_node, _ in node.value:
-                key = ("merge",) if key_node.tag == "tag:yaml.org,2002:merge" else self.construct_object(key_node)
-                if key in keys:
-                    raise ValueError("repeated configuration member")
-                keys.add(key)
-            self._checked_mappings.add(node)
-        super().flatten_mapping(node)
+            for key, value in node.value:
+                if isinstance(key, yaml.nodes.ScalarNode) and key.value == "<<":
+                    raise _OutsideSubset("The installed configuration contains a forbidden merge key <<.")
+                if not isinstance(key, yaml.nodes.ScalarNode) or key.tag != _STRING_TAG:
+                    raise _OutsideSubset("The installed configuration contains a non-string mapping key.")
+                if key.value in keys:
+                    raise _OutsideSubset("The installed configuration contains duplicate key %r." % key.value)
+                keys.add(key.value)
+                pending.append(value)
+        elif isinstance(node, yaml.nodes.SequenceNode):
+            pending.extend(node.value)
+    return {key.value: value for key, value in root.value}
 
 
 def _unknown(kind, why):
@@ -34,24 +70,54 @@ def retirement_config(text):
     # None is supplied only after a successful stat proves the file absent;
     # empty bytes or YAML null are installed content, not that observation.
     if text is None:
-        return {"config": "absent", "roles": "unknown", "identity_dir": "/var/lib/billet/server"}
+        return {"config": "absent", "roles": "unknown", "identity_dir": _PACKAGED_IDENTITY_DIR}
     try:
-        cfg = yaml.load(text, Loader=_UniqueLoader)
+        if isinstance(text, bytes):
+            text = text.decode("utf-8")
+        elif isinstance(text, str):
+            text.encode("utf-8")
+        else:
+            return _unknown("malformed", "The installed configuration is not UTF-8 text.")
+    except UnicodeError:
+        return _unknown("malformed", "The installed configuration is not valid UTF-8.")
+    try:
+        cfg = _read_subset(text)
+    except _OutsideSubset as exc:
+        return _unknown("malformed", str(exc))
     except (yaml.YAMLError, ValueError, TypeError, RecursionError):
-        return _unknown("malformed", "The installed configuration cannot be decoded uniquely.")
-    if not isinstance(cfg, dict):
-        return _unknown("malformed", "The installed configuration is not a mapping.")
-    server, node = cfg.get("server"), cfg.get("node")
-    if server is None and isinstance(node, dict):
+        return _unknown("malformed", "The installed configuration cannot be decoded as the supported YAML subset.")
+    if "server" not in cfg:
         return {"config": "present", "roles": "node", "identity_dir": ""}
-    if not isinstance(server, dict):
-        return _unknown("unreadable", "The installed configuration establishes neither a server locator nor a node-only installation.")
-    # An omitted locator on a decoded server is not the packaged default:
-    # Go derives its default from the invoking account. Do not guess it.
-    identity = server.get("identity_dir") or server.get("state_dir")
-    if (not isinstance(identity, str) or not identity.startswith("/") or identity.strip() != identity
-            or (server.get("identity_dir") and server.get("state_dir"))):
-        return _unknown("unreadable", "The installed server identity locator is missing, ambiguous or invalid.")
+    if not isinstance(cfg["server"], yaml.nodes.MappingNode):
+        return _unknown("unreadable", "The installed server must be a mapping.")
+    server = {key.value: value for key, value in cfg["server"].value}
+    for key in ("identity_dir", "state_dir"):
+        if key not in server:
+            continue
+        value = server[key]
+        if not isinstance(value, yaml.nodes.ScalarNode) or value.tag != _STRING_TAG or not value.value:
+            return _unknown("unreadable", "The installed server.%s must be a non-empty string scalar." % key)
+        if not value.value.startswith("/") or value.value.strip() != value.value:
+            return _unknown("unreadable", "The installed server.%s must be absolute with no leading or trailing whitespace." % key)
+
+    state = server.get("state")
+    state_absent = state is None or (isinstance(state, yaml.nodes.ScalarNode) and state.tag == _NULL_TAG)
+    if not state_absent and not isinstance(state, yaml.nodes.MappingNode):
+        return _unknown("unreadable", "The installed server.state must be a mapping or null.")
+    # Match internal/config/config.go applyStateDefaults: preserve identity_dir,
+    # else inherit state_dir, including beside a non-null state block (semantic
+    # validation later refuses that pairing). A state block invents no locator.
+    # Only without one do we use this caller's requested packaged fallback.
+    # Go's general defaultStateDir instead depends on os.UserConfigDir; the
+    # packaged path here is compatibility policy, not that account's default.
+    if "identity_dir" in server:
+        identity = server["identity_dir"].value
+    elif "state_dir" in server:
+        identity = server["state_dir"].value
+    elif state_absent:
+        identity = _PACKAGED_IDENTITY_DIR
+    else:
+        return _unknown("unreadable", "The installed server.state supplies no default server.identity_dir or server.state_dir.")
     return {"config": "present", "roles": "server", "identity_dir": identity}
 
 

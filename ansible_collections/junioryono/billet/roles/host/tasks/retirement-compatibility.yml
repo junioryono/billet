@@ -110,7 +110,7 @@
   ansible.builtin.set_fact:
     billet_retirement_why: >-
       Retirement compatibility holds: {{ billet_retirement_installed.why }}
-      The packaged identity path is used only when the installed configuration is positively absent.
+      No identity path can be inferred from an installed configuration outside the supported subset.
   when:
     - billet_retirement_screen_clear | bool
     - billet_retirement_installed.config in ['malformed', 'unreadable']

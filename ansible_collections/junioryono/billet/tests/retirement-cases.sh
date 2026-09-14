@@ -302,29 +302,38 @@ r_held r7-caller-unknown-state hold
 reason=$("$python" -c 'import json, sys; print(json.load(open(sys.argv[1]))["route_why"])' "$work/cases/r7-caller-unknown-state/unknown-state.json")
 r_reported r7-caller-unknown-state hold "$reason"
 
-# YAML-decodable package seeds may locate before semantic validation; broken
-# bytes and missing locators may never substitute the clean packaged path.
-for shape in merged malformed duplicate missing-locator seeded; do
+# Package seeds locate before semantic validation. Outside-subset content
+# holds even beside a clean path; a state block never supplies a default.
+for shape in merged cyclic false sequence null integer malformed duplicate state-no-locator default seeded; do
   name=r8-config-$shape
   r_plant "$name" v0.10.1
   p "$name" 'mkdir -p /etc/billet'
   case "$shape" in
     merged) p "$name" 'mkdir -p /var/lib/billet/custom; printf minted >/var/lib/billet/custom/deployment-id; printf "server: {<<: {}, identity_dir: /var/lib/billet/custom}\n" >/etc/billet/billet.yaml' ;;
+    cyclic) p "$name" 'printf "server: &s {<<: *s, identity_dir: /srv/clean}\n" >/etc/billet/billet.yaml' ;;
+    false) p "$name" 'printf "server: {identity_dir: false, state_dir: /srv/clean}\n" >/etc/billet/billet.yaml' ;;
+    sequence) p "$name" 'printf "server: {identity_dir: [], state_dir: /srv/clean}\n" >/etc/billet/billet.yaml' ;;
+    null) p "$name" 'printf "server: {identity_dir: ~, state_dir: /srv/clean}\n" >/etc/billet/billet.yaml' ;;
+    integer) p "$name" 'printf "server: {identity_dir: 5, state_dir: /srv/clean}\n" >/etc/billet/billet.yaml' ;;
     malformed) p "$name" 'printf "server: [\n" >/etc/billet/billet.yaml' ;;
     duplicate) p "$name" 'printf "server: {identity_dir: /var/lib/billet/first, identity_dir: /var/lib/billet/second}\n" >/etc/billet/billet.yaml' ;;
-    missing-locator) p "$name" 'printf "server: {}\n" >/etc/billet/billet.yaml' ;;
+    state-no-locator) p "$name" 'printf "server: {state: {}}\n" >/etc/billet/billet.yaml' ;;
+    default) p "$name" 'mkdir -p /var/lib/billet/server; printf "server: {}\n" >/etc/billet/billet.yaml' ;;
     seeded) p "$name" 'mkdir -p /var/lib/billet/server; printf "server: {state_dir: /var/lib/billet/server, max_vcpu: 0}\n" >/etc/billet/billet.yaml' ;;
   esac
   r_run "$name"
-  if [ "$shape" = seeded ]; then
+  if [ "$shape" = seeded ] || [ "$shape" = default ]; then
     expect_allowed "$name"
     expect_play_task_ran "$name" 'Ordinary convergence sentinel'
   else
     expect_refused "$name" 'Refuse a held or unavailable retirement route' 'Retirement holds this host (hold)'
     case "$shape" in
-      merged) expect_final "$name" 'status is present' ;;
-      missing-locator) expect_final "$name" 'installed server identity locator is missing, ambiguous or invalid' ;;
-      *) expect_final "$name" 'installed configuration cannot be decoded uniquely' ;;
+      merged) expect_final "$name" 'forbidden merge key <<' ;;
+      cyclic) expect_final "$name" 'alias *s' ;;
+      false|sequence|null|integer) expect_final "$name" 'server.identity_dir must be a non-empty string scalar' ;;
+      duplicate) expect_final "$name" "duplicate key 'identity_dir'" ;;
+      state-no-locator) expect_final "$name" 'server.state supplies no default' ;;
+      malformed) expect_final "$name" 'installed configuration cannot be decoded as the supported YAML subset' ;;
     esac
     expect_no_ordinary "$name"
     expect_no_play_task "$name" 'Ordinary convergence sentinel'
