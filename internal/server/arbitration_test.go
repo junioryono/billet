@@ -638,8 +638,17 @@ func TestCancelledOfferDoesNotCreateAPromise(t *testing.T) {
 		})
 	}
 
-	for _, keepJobID := range []bool{false, true} {
-		t.Run(map[bool]string{false: "runner name only", true: "job id without request id"}[keepJobID], func(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		keepJobID      bool
+		offerRequestID int64
+	}{
+		{name: "runner name only", offerRequestID: 11},
+		{name: "job id without request id", keepJobID: true, offerRequestID: 11},
+		{name: "runner name only with zero-request offer"},
+		{name: "job id without request id with zero-request offer", keepJobID: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			tiers := []config.Tier{tier("a-work")}
 			a := newAllocator(t, alloc.Limits{MaxVCPU: tierVCPU, MaxMemory: 64 * config.GiB}, tiers)
 			session := &fakeSession{}
@@ -670,12 +679,12 @@ func TestCancelledOfferDoesNotCreateAPromise(t *testing.T) {
 				t.Fatalf("busy binding = %+v, err %v; want actual request 11", binding, err)
 			}
 			completion := Job{RunnerName: actual.RunnerName, Result: "Cancelled"}
-			if keepJobID {
+			if tc.keepJobID {
 				completion.JobID = actual.JobID
 			}
 			if err := work.handle(t.Context(), &Message{
 				MessageID: 3, Completed: []Job{completion},
-				Available: []Job{{RequestID: actual.RequestID, RunID: actual.RunID, JobID: actual.JobID}},
+				Available: []Job{{RequestID: tc.offerRequestID, RunID: actual.RunID, JobID: actual.JobID}},
 			}); err != nil {
 				t.Fatal(err)
 			}
@@ -688,10 +697,50 @@ func TestCancelledOfferDoesNotCreateAPromise(t *testing.T) {
 			}
 			if _, exists, err := a.DirectJobIdentity(t.Context(), actual.JobID); err != nil {
 				t.Fatal(err)
-			} else if exists {
-				t.Error("completion minted a direct identity for a job already bound to request 11")
+			} else if exists != (tc.offerRequestID == 0) {
+				t.Errorf("direct identity exists = %t; only a zero-request offer may mint it", exists)
 			}
 		})
+	}
+}
+
+// A DIRECT ASSIGNMENT ESTABLISHES IDENTITY BEFORE ITS SAME-BATCH CANCELLATION.
+// Held escrow and absent statistics leave the completion as the only launch guard.
+func TestAssignedAndCancelledDirectJobNeverLaunches(t *testing.T) {
+	tiers := []config.Tier{tier("a-work")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: tierVCPU, MaxMemory: 64 * config.GiB}, tiers)
+	var launched []int64
+	work := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(&fakeRunner{
+		onLaunch: func(requestID int64) error {
+			launched = append(launched, requestID)
+			return nil
+		},
+	}))
+	if err := work.refillEscrow(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if work.idleEscrow() != 1 {
+		t.Fatalf("held escrow = %d, want 1", work.idleEscrow())
+	}
+	if _, exists, err := a.DirectJobIdentity(t.Context(), "J"); err != nil {
+		t.Fatal(err)
+	} else if exists {
+		t.Fatal("fixture already has a direct identity for J")
+	}
+	err := work.handle(t.Context(), &Message{
+		MessageID: 1,
+		Assigned:  []Job{{JobID: "J"}},
+		Completed: []Job{{JobID: "J", Result: "Cancelled"}},
+	})
+	if len(launched) != 0 || work.Running() != 0 || work.Acquiring() != 0 {
+		t.Errorf("cancelled direct job launched %v, running %d, promises %d; want none",
+			launched, work.Running(), work.Acquiring())
+	}
+	if err != nil {
+		t.Fatalf("handle assigned-and-cancelled direct job: %v", err)
+	}
+	if work.idleEscrow() != 1 {
+		t.Errorf("cancelled direct job consumed held escrow: %d remain, want 1", work.idleEscrow())
 	}
 }
 

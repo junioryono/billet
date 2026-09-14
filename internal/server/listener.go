@@ -3057,6 +3057,18 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 			"runner", job.RunnerName, "request", job.RequestID, "job", job.JobID)
 	}
 
+	// Assignments may establish a direct identity; completions may only look one
+	// up. Resolve this batch's assignments before that lookup, outside l.mu so
+	// ledger transactions cannot stall heartbeats behind the escrow mutex.
+	assigned := make([]Job, len(msg.Assigned))
+	for i, job := range msg.Assigned {
+		var err error
+		assigned[i], err = l.identifyAssigned(ctx, job)
+		if err != nil {
+			return err
+		}
+	}
+
 	// COMPLETED IS PROCESSED FIRST. Otherwise the cycle never closes — the lease stays
 	// open until the reaper expires it — and it must come first because GitHub batches
 	// the completion of one job with the offer of its replacement: acquiring before
@@ -3068,7 +3080,7 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 	// redelivery rebuilds it before the assignments are read. A longer-lived map would
 	// silently skip a request id GitHub requeued after cancelling it.
 	finished := make(map[int64]struct{}, len(msg.Completed))
-	finishedOffers := make(map[int64]struct{}, len(msg.Completed))
+	finishedOffers := make(map[offerIdentity]struct{}, len(msg.Completed))
 	completed := make([]Job, 0, len(msg.Completed))
 	poisoned := make([]error, 0, len(msg.Completed))
 
@@ -3087,8 +3099,8 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 		}
 		// Offers name the actual job; cleanup names the runner's launch request.
 		// Only a validated completion with a job identity can suppress an offer.
-		if actual.RequestID != 0 {
-			finishedOffers[actual.RequestID] = struct{}{}
+		for _, identity := range actualJobIdentities(actual) {
+			finishedOffers[identity] = struct{}{}
 		}
 		completed = append(completed, job)
 	}
@@ -3229,11 +3241,7 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 		}
 		assignmentDeficit = max(msg.Statistics.TotalAssignedJobs-active, 0)
 	}
-	for i := range msg.Assigned {
-		job, err := l.identifyAssigned(ctx, msg.Assigned[i])
-		if err != nil {
-			return err
-		}
+	for _, job := range assigned {
 		if _, over := finished[job.RequestID]; over {
 			continue
 		}
@@ -3604,7 +3612,7 @@ func (l *Listener) identifyStarted(ctx context.Context, job Job) (Job, error) {
 }
 
 // identifyCompletion returns the cleanup identity and an optional actual job
-// identity. A zero actual request id means no offer can be suppressed.
+// identity. Only actual-job aliases may suppress offers; cleanup supplies none.
 func (l *Listener) identifyCompletion(ctx context.Context, job Job) (Job, Job, error) {
 	actual := job
 	if job.RunnerName == "" && job.RequestID != 0 {
@@ -3812,10 +3820,28 @@ func (l *Listener) acquire(ctx context.Context, available []Job) error {
 	return l.acquireUnfinished(ctx, available, nil)
 }
 
+// actualJobIdentities excludes missing aliases so unrelated zero-request jobs
+// never compare equal merely because a field was omitted.
+func actualJobIdentities(job Job) []offerIdentity {
+	identities := make([]offerIdentity, 0, 2)
+	if job.RequestID != 0 {
+		identities = append(identities, offerIdentity{request: job.RequestID})
+	}
+	if job.JobID != "" {
+		identities = append(identities, offerIdentity{job: job.JobID})
+	}
+
+	return identities
+}
+
 // acquireUnfinished excludes jobs whose completion arrived in the same batch.
+// Completion and offer share one identity: the validated actual job, whose
+// nonzero request id and nonempty JobID are aliases; a match on either is enough.
+// Both sides derive these aliases with actualJobIdentities. The runner's launch
+// request identifies cleanup only and never supplies an actual-job alias.
 // COMPLETION BEATS AN OFFER TOO. Reacquiring a cancelled job leaves a promise
 // waiting for an assignment that can never arrive.
-func (l *Listener) acquireUnfinished(ctx context.Context, available []Job, finished map[int64]struct{}) error {
+func (l *Listener) acquireUnfinished(ctx context.Context, available []Job, finished map[offerIdentity]struct{}) error {
 	if len(available) == 0 {
 		return nil
 	}
@@ -3830,7 +3856,10 @@ func (l *Listener) acquireUnfinished(ctx context.Context, available []Job, finis
 		if err != nil {
 			return err
 		}
-		if _, over := finished[job.RequestID]; over {
+		if slices.ContainsFunc(actualJobIdentities(job), func(identity offerIdentity) bool {
+			_, over := finished[identity]
+			return over
+		}) {
 			delete(l.waitingOffers, identityOfOffer(available[i]))
 			continue
 		}
