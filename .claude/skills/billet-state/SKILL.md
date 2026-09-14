@@ -7,7 +7,7 @@ description: "The control-plane ledger in internal/state: SQLite and PostgreSQL 
 
 ## What this area is
 
-`internal/state` owns the durable control-plane store: `DB`, the open modes, transactions, the migrator, the locks and fences, the controller claim, admission, pending completions, force-destroy records and the cache kill switch. SQL lives only in `internal/state/queries/*.sql` (including `internal/alloc`'s and `internal/rollout`'s), compiled by sqlc (pinned, `SQLC_VERSION`) into `internal/state/ledgerdb` and bound by `internal/state/queryset.go`. Migrations are files in `internal/state/migrations` (SQLite) and `internal/state/pgmigrations` (PostgreSQL), 50 of each, discovered by `go:embed`. `docs/reference/decisions/adr-008-state-backends.md` and `adr-009-controller-election.md` record the decisions.
+`internal/state` owns the durable control-plane store: `DB`, the open modes, transactions, the migrator, the locks and fences, the controller claim, admission, pending completions, force-destroy records and the cache kill switch. SQL lives only in `internal/state/queries/*.sql` (including `internal/alloc`'s and `internal/rollout`'s), compiled by sqlc (pinned, `SQLC_VERSION`) into `internal/state/ledgerdb` and bound by `internal/state/queryset.go`. Migrations are files in `internal/state/migrations` (SQLite) and `internal/state/pgmigrations` (PostgreSQL), 52 of each, discovered by `go:embed`. `docs/reference/decisions/adr-008-state-backends.md` and `adr-009-controller-election.md` record the decisions.
 
 ## Rules
 
@@ -67,7 +67,7 @@ description: "The control-plane ledger in internal/state: SQLite and PostgreSQL 
 - sqlc's two engines: byte-identical Go with `BIGINT` casts; modernc.org/sqlite binds `$N` positionally, a repeated `$1` once, and a `$2` appearing before `$1` correctly.
 - A single em dash in a query comment shifted every parameter offset after it.
 - Splitting the deployment bind from the epoch: the incumbent's next write came back "host-b now holds it at epoch 2".
-- The lease deregistration column (migration 30), compute barrier (37), rollout (39-42), controller claim (44), deployment binding (45), CodeBuild sweep (46), holder incarnation (47), release watermark and highest node release (48), the charged shape, its price, the site and the cache outcome on `leases` and `job_history` (49), the reason a host's last dispatch was refused on `rollout_nodes` (50), the controller-retirement row (51).
+- The lease deregistration column (migration 30), compute barrier (37), rollout (39-42), controller claim (44), deployment binding (45), CodeBuild sweep (46), holder incarnation (47), release watermark and highest node release (48), the charged shape, its price, the site and the cache outcome on `leases` and `job_history` (49), the reason a host's last dispatch was refused on `rollout_nodes` (50), the controller-retirement row (51), and dated listener ownership and advertisement observations in `listener_capacity` (52; reporting only, never admission or release authority).
 
 ## Where the tests are
 

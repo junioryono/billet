@@ -42,9 +42,9 @@ func TestShutdownReleasesEveryEscrowedLease(t *testing.T) {
 		advertised = map[string]bool{}
 	)
 
-	// Every tier gets one backed discovery slot while capacity permits. The
-	// allocator remains first-come, but listener policy no longer lets an idle
-	// scale set renew the whole deployment forever.
+	// EVERY TIER MUST HAVE HELD REAL BACKING BEFORE SHUTDOWN. Discovery rotates,
+	// so the observations need not be simultaneous; zero-capacity polls alone
+	// cannot prove that teardown returned anything.
 	sawCapacity := func(label string, capacity int) bool {
 		mu.Lock()
 		defer mu.Unlock()

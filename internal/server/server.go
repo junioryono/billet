@@ -47,10 +47,11 @@ type Server struct {
 	// on every tick, which would bury it.
 	warnNoSweeper sync.Once
 
-	alloc *alloc.Allocator
-	prov  Provisioner
-	tiers []config.Tier
-	log   *slog.Logger
+	alloc   *alloc.Allocator
+	arbiter *discoveryArbiter
+	prov    Provisioner
+	tiers   []config.Tier
+	log     *slog.Logger
 	// owner identifies this process to GitHub's message queue, so a session left
 	// by a crashed run can be told apart from a live one.
 	owner string
@@ -304,6 +305,7 @@ func New(
 	s := &Server{
 		alloc: a, prov: prov, tiers: tiers, log: log, owner: owner,
 		reapEvery: defaultReapInterval,
+		arbiter:   newDiscoveryArbiter(tiers),
 	}
 
 	for _, opt := range opts {
@@ -625,7 +627,7 @@ func (s *Server) openSession(ctx context.Context, t *config.Tier, set *ScaleSet,
 // value never leaves the config file, which is the whole failure worth catching
 // here.
 func (s *Server) listenerOpts(prov Provisioner) []Option {
-	opts := []Option{WithLogger(s.log)}
+	opts := []Option{WithLogger(s.log), func(l *Listener) { l.arbiter = s.arbiter }}
 	if s.maxCapacity != nil {
 		opts = append(opts, WithMaxCapacity(*s.maxCapacity))
 	}

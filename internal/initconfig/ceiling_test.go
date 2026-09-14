@@ -320,62 +320,30 @@ func TestTheReservationDoesNotDipWhereTheTermsSwap(t *testing.T) {
 	}
 }
 
-// A CATALOGUE MUST FIT ITS OWN BUDGET, ALL OF IT AT ONCE.
-//
-// Every tier is its own scale set, and a listener escrows capacity before it
-// advertises — one backed discovery slot per tier, because a scale set
-// advertising zero is never discovered. So the floor is one job of every
-// generated tier simultaneously, and testing each candidate against the bare
-// ceiling is not the same question.
-//
-// The case that shipped: a host measured at 10 vCPU / 19GiB generated an 8GiB
-// and a 16GiB tier. Both were individually legal; together they needed 24GiB.
-// The larger tier's discovery slot took the memory, both tiers advertised zero,
-// and jobs queued forever against a control plane that reported itself healthy.
+// EACH INDIVIDUALLY FITTING RUNG SURVIVES. The sum deliberately exceeds the
+// ceiling in several cases; shared admission, not pruning, bounds execution.
 func TestTheGeneratedCatalogueFitsItsOwnCeiling(t *testing.T) {
 	for name, tc := range map[string]struct {
 		vcpu   int
 		memory config.ByteSize
 		want   []string
 	}{
-		// The host from the walk. 8+16 = 24GiB against 19GiB, so the 4vcpu
-		// tier is dropped rather than generated and left undiscoverable.
-		"the host this was found on": {10, 19 * config.GiB, []string{"billet-2vcpu"}},
-		// Exactly enough for both: 8+16 = 24GiB.
-		"exactly enough for two": {6, 24 * config.GiB, []string{"billet-2vcpu", "billet-4vcpu"}},
-		// One GiB short of both.
-		"one GiB short of two": {6, 23 * config.GiB, []string{"billet-2vcpu"}},
-		// A real server: 8+16+32 = 56GiB, well inside.
-		"a server": {120, 468 * config.GiB,
-			[]string{"billet-2vcpu", "billet-4vcpu", "billet-8vcpu"}},
-		// vCPU binds before memory: 2+4=6 fits, +8 would be 14 > 12.
-		"vcpu binds first": {12, 512 * config.GiB, []string{"billet-2vcpu", "billet-4vcpu"}},
+		"memory ceiling":  {10, 19 * config.GiB, []string{"billet-2vcpu", "billet-4vcpu"}},
+		"overlapping cpu": {8, 32 * config.GiB, []string{"billet-2vcpu", "billet-4vcpu", "billet-8vcpu"}},
+		"smaller cpu":     {6, 23 * config.GiB, []string{"billet-2vcpu", "billet-4vcpu"}},
+		"one fits":        {3, 512 * config.GiB, []string{"billet-2vcpu"}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			got := tiers(tc.vcpu, tc.memory)
-
-			var (
-				labels     []string
-				usedVCPU   int
-				usedMemory config.ByteSize
-			)
-
+			var labels []string
 			for _, tr := range got {
 				labels = append(labels, tr.label)
-				usedVCPU += tr.vcpu
-				usedMemory += tr.memory
+				if tr.vcpu > tc.vcpu || tr.memory > tc.memory {
+					t.Errorf("tier %+v cannot run under %d vcpu and %s", tr, tc.vcpu, tc.memory)
+				}
 			}
-
 			if strings.Join(labels, ",") != strings.Join(tc.want, ",") {
 				t.Errorf("tiers(%d, %s) = %v, want %v", tc.vcpu, tc.memory, labels, tc.want)
-			}
-
-			// The property, independent of the exact ladder: one job of every
-			// tier at once must fit, or some tier can never be discovered.
-			if usedVCPU > tc.vcpu || usedMemory > tc.memory {
-				t.Errorf("the catalogue needs %d vCPU and %s to make every tier "+
-					"discoverable, but the ceiling is %d vCPU and %s",
-					usedVCPU, usedMemory, tc.vcpu, tc.memory)
 			}
 		})
 	}

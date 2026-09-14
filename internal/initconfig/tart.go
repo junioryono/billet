@@ -51,11 +51,6 @@ type TartParams struct {
 	// same request generate identical bytes — `billet init` re-run against its own
 	// output converges on a byte comparison, and an order-sensitive catalogue
 	// would make that depend on how the flags were typed.
-	//
-	// macOS first is also the allocation order, and that is not arbitrary: a macOS
-	// guest has a hard floor Apple's hypervisor enforces and a per-machine licence
-	// cap, so it is the constrained one. Fitting it first means the flag order
-	// selects what is generated without also deciding what fits.
 	GuestOS []config.GuestOS
 
 	// NodeName is what this Mac calls itself in the deployment.
@@ -77,7 +72,7 @@ type TartParams struct {
 	MacOSImage, LinuxImage string
 }
 
-// tartGuestOrder is the canonical rendering and allocation order. See GuestOS.
+// tartGuestOrder is the canonical rendering order. See GuestOS.
 var tartGuestOrder = []config.GuestOS{config.GuestMacOS, config.GuestLinux}
 
 // errTartNoGuest is what a tart generation naming no guest kind gets.
@@ -310,69 +305,28 @@ type tartTier struct {
 	node string
 }
 
-// tartTiers derives the catalogue, fitting every requested guest kind under ONE
-// shared ceiling.
+// tartTiers fits each requested guest kind against the same usable ceiling.
 //
-// The running-total discipline is tiers()' and for the same reason: every tier
-// is its own scale set and escrows one discovery slot BEFORE it advertises, so
-// the catalogue's floor is one job of every tier simultaneously and a candidate
-// that fits the bare ceiling can still not fit beside the tiers already chosen.
-//
-// WHAT DIFFERS FROM tiers() IS THAT A DROP IS A REFUSAL. There, a candidate that
-// does not fit is silently skipped, because the ladder was billet's idea and a
-// shorter one still serves. Here each guest kind was ASKED FOR by name, so
-// generating a macOS config with no macOS tier answers a different question than
-// the one put to it.
+// GUEST KINDS ARE ALTERNATIVES, so choosing a macOS shape cannot delete a Linux
+// shape. A requested kind that cannot run even alone is still refused by name.
 func tartTiers(p Params, ceilVCPU int, ceilMemory config.ByteSize) ([]tartTier, error) {
-	var (
-		out        []tartTier
-		usedVCPU   int
-		usedMemory config.ByteSize
-	)
+	var out []tartTier
 
-	take := func(t tartTier) {
-		out = append(out, t)
-		usedVCPU += t.vcpu
-		usedMemory += t.memory
-	}
-
-	for i, guest := range p.Tart.GuestOS {
+	for _, guest := range p.Tart.GuestOS {
 		switch guest {
 		case config.GuestMacOS:
-			// WHAT THE GUEST KINDS AFTER THIS ONE NEED AT MINIMUM. A greedy macOS
-			// tier used to consume a budget that had room for both: at a ceiling of
-			// exactly 4 vCPU and 16GiB it took the larger shape, left nothing, and
-			// the command then REFUSED the Linux tier it had itself been asked for
-			// — a refusal produced by the order of the fit rather than by the
-			// machine. Reserving the smallest remaining rung makes the greedy
-			// choice safe; where nothing fits WITH the reservation it is dropped,
-			// and the guest kind that then has no room says so itself.
-			reserveVCPU, reserveMemory := tartReserve(p.Tart.GuestOS[i+1:])
-
-			t, err := tartMacOSTier(p, ceilVCPU-usedVCPU, ceilMemory-usedMemory,
-				reserveVCPU, reserveMemory)
+			t, err := tartMacOSTier(p, ceilVCPU, ceilMemory)
 			if err != nil {
 				return nil, err
 			}
-
-			take(t)
-
+			out = append(out, t)
 		case config.GuestLinux:
-			fitted := tartLinuxTiers(p, ceilVCPU-usedVCPU, ceilMemory-usedMemory)
+			fitted := tartLinuxTiers(p, ceilVCPU, ceilMemory)
 			if len(fitted) == 0 {
-				return nil, tartNoRoomForLinux(len(out) > 0,
-					ceilVCPU-usedVCPU, ceilMemory-usedMemory)
+				return nil, tartNoRoomForLinux(ceilVCPU, ceilMemory)
 			}
-
-			for _, t := range fitted {
-				take(t)
-			}
-
+			out = append(out, fitted...)
 		default:
-			// normalizeTart admits exactly two, so this is unreachable through
-			// Generate. It is here because the switch decides what a host runs,
-			// and a silently-skipped guest kind would be a config that answers a
-			// different question than the one it was asked.
 			return nil, fmt.Errorf("initconfig: guest_os %q is not rendered for tart", guest)
 		}
 	}
@@ -380,43 +334,19 @@ func tartTiers(p Params, ceilVCPU int, ceilMemory config.ByteSize) ([]tartTier, 
 	return out, nil
 }
 
-// tartNoRoomForLinux says why, in terms of what actually happened.
-//
-// TWO SENTENCES, BECAUSE ONE IS UNTRUE OF ONE OF THE TWO CASES. With a macOS
-// tier already fitted, what is left is what that tier did not take and dropping
-// it is a real remedy. With nothing above it there are no "tiers above" to speak
-// of, and telling that operator to generate a macOS config instead — a guest
-// with a 4GiB floor, on a machine too small for a 1GiB one — sends them further
-// from a config that runs.
-func tartNoRoomForLinux(afterOthers bool, vcpu int, memory config.ByteSize) error {
-	if afterOthers {
-		return fmt.Errorf("after the tiers above there is %d vCPU and %s left of billet's "+
-			"ceiling, which is not enough for an arm64 Linux tier. Generate a macOS-only "+
-			"config (--guest-os macos), or raise server.max_vcpu and server.max_memory by "+
-			"hand once you know what else this machine is doing", vcpu, memory)
-	}
-
+// tartNoRoomForLinux names the ceiling that cannot hold even the smallest guest.
+func tartNoRoomForLinux(vcpu int, memory config.ByteSize) error {
 	return fmt.Errorf("billet's ceiling on this machine is %d vCPU and %s, which is not enough "+
 		"for a guest of any size — this host has nothing to contribute. Raise "+
 		"server.max_vcpu and server.max_memory by hand once you know what else it is doing",
 		vcpu, memory)
 }
 
-// tartMacOSTier is the ONE macOS tier a generation writes.
+// tartMacOSTier keeps the generator's preferred Xcode shape when it fits alone.
 //
-// ONE, not a ladder, and that is a load-time rule rather than a preference: a
-// macOS tier with no explicit max_concurrent inherits its HOST's limit, so two
-// generated macOS tiers would each claim 2 and validateMacOSHostLimits would
-// refuse their sum of 4 against a limit of 2. One tier at the host's own limit
-// is what Apple's two-guests-per-machine licence actually is.
-//
-// max_concurrent is left ABSENT for the same reason: an absent one tracks a Mac
-// whose limit an operator later lowers, where a written 2 would silently stop
-// meaning what the host permits.
-func tartMacOSTier(
-	p Params, vcpuBudget int, memoryBudget config.ByteSize,
-	reserveVCPU int, reserveMemory config.ByteSize,
-) (tartTier, error) {
+// ONE DEFAULT SHAPE IS A GENERATOR CHOICE, not a partition of the host's slots.
+// Leaving max_concurrent absent lets each entry follow the host's own limit.
+func tartMacOSTier(p Params, vcpuBudget int, memoryBudget config.ByteSize) (tartTier, error) {
 	build := func(vcpu int, memory config.ByteSize) tartTier {
 		return tartTier{
 			tier:  tier{label: fmt.Sprintf("billet-macos-%dvcpu", vcpu), vcpu: vcpu, memory: memory},
@@ -426,42 +356,18 @@ func tartMacOSTier(
 		}
 	}
 
-	// Xcode was measured working at 4 vCPU and 8GiB; the shapes below keep the
-	// catalogue's proportion, so the preferred one is roomier than the measurement
-	// rather than tighter.
-	//
-	// TWO PASSES, largest shape first within each: the first leaves room for the
-	// guest kinds still to be fitted, and the second is what happens when no shape
-	// can. Dropping the reservation there rather than refusing keeps the macOS-only
-	// case unaffected by a reservation it never had, and hands the refusal to
-	// whichever guest kind actually has no room.
-	for _, reserve := range []bool{true, false} {
-		heldVCPU, heldMemory := reserveVCPU, reserveMemory
-		if !reserve {
-			heldVCPU, heldMemory = 0, 0
-		}
-
-		for _, vcpu := range []int{4, 2} {
-			memory := config.ByteSize(vcpu) * tierMemoryPerVCPU
-			if vcpu+heldVCPU <= vcpuBudget && memory+heldMemory <= memoryBudget {
-				return build(vcpu, memory), nil
-			}
+	for _, vcpu := range []int{4, 2} {
+		memory := config.ByteSize(vcpu) * tierMemoryPerVCPU
+		if vcpu <= vcpuBudget && memory <= memoryBudget {
+			return build(vcpu, memory), nil
 		}
 	}
 
-	// THE FLOOR IS THE HYPERVISOR'S, so below it there is no smaller guest to
-	// fall back to — Virtualization.framework refuses to start one at all. A
-	// generated tier under it would load, advertise capacity, and fail every job
-	// with LessThanMinimalResourcesError.
+	// THE FLOOR IS THE HYPERVISOR'S; below it even a single guest cannot boot.
 	if vcpuBudget < 1 || memoryBudget < config.MinMacOSGuestMemory {
 		return tartTier{}, tartNoRoomForMacOS(vcpuBudget, memoryBudget)
 	}
 
-	// THE LAST RESORT TAKES THE WHOLE BUDGET AND IGNORES THE RESERVATION, which
-	// is reached only when neither shape fits even without it — a machine where
-	// something has to give. Shrinking this to leave a rung would generate two
-	// tiers so small that neither is worth having; the Linux side refuses instead,
-	// naming what took the room.
 	vcpu := min(vcpuBudget, 4)
 
 	return build(vcpu, min(memoryBudget, config.ByteSize(vcpu)*tierMemoryPerVCPU)), nil
@@ -491,23 +397,7 @@ func tartNoRoomForMacOS(vcpuBudget int, memoryBudget config.ByteSize) error {
 		vcpuBudget, memoryBudget, config.MinMacOSGuestMemory)
 }
 
-// tartReserve is what the guest kinds still to be fitted need at minimum.
-//
-// Read off the SAME ladder the Linux tiers are drawn from, so a reservation
-// cannot stop matching the rung it is holding room for. macOS never appears here
-// because it is fitted first and there is only ever one of it.
-func tartReserve(remaining []config.GuestOS) (int, config.ByteSize) {
-	if !slices.Contains(remaining, config.GuestLinux) {
-		return 0, 0
-	}
-
-	smallest := tierLadder[0]
-
-	return smallest, config.ByteSize(smallest) * tierMemoryPerVCPU
-}
-
-// tartLinuxTiers is the ordinary ladder, fitted against whatever the macOS tier
-// left. An empty result is the caller's refusal, not a shorter catalogue.
+// tartLinuxTiers keeps every Linux rung that fits the usable host ceiling.
 func tartLinuxTiers(p Params, vcpuBudget int, memoryBudget config.ByteSize) []tartTier {
 	build := func(vcpu int, memory config.ByteSize) tartTier {
 		return tartTier{
@@ -521,18 +411,12 @@ func tartLinuxTiers(p Params, vcpuBudget int, memoryBudget config.ByteSize) []ta
 		}
 	}
 
-	var (
-		fit        []tartTier
-		usedVCPU   int
-		usedMemory config.ByteSize
-	)
+	var fit []tartTier
 
 	for _, vcpu := range tierLadder {
 		memory := config.ByteSize(vcpu) * tierMemoryPerVCPU
-		if usedVCPU+vcpu <= vcpuBudget && usedMemory+memory <= memoryBudget {
+		if vcpu <= vcpuBudget && memory <= memoryBudget {
 			fit = append(fit, build(vcpu, memory))
-			usedVCPU += vcpu
-			usedMemory += memory
 		}
 	}
 
@@ -540,9 +424,8 @@ func tartLinuxTiers(p Params, vcpuBudget int, memoryBudget config.ByteSize) []ta
 		return fit
 	}
 
-	// A machine too small for the smallest rung still gets ONE tier, sized to what
-	// is left — the same fallback tiers() makes, because a config with no tier for
-	// a requested guest kind schedules nothing on it.
+	// A SMALL HOST STILL GETS ONE FITTING TIER. A config with no entry for a
+	// requested guest kind schedules nothing on it, even when a smaller guest fits.
 	if vcpuBudget < 1 || memoryBudget < config.GiB {
 		return nil
 	}

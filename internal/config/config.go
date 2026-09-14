@@ -3403,7 +3403,6 @@ func (c *Config) Validate() error {
 	errs = append(errs, c.validateCodeBuildTrust()...)
 	errs = append(errs, c.validateTiers()...)
 	errs = append(errs, c.validateCapacity()...)
-	errs = append(errs, c.validateMacOSHostLimits()...)
 	errs = append(errs, ValidateRelease(c.Release)...)
 	errs = append(errs, c.validateBackup()...)
 
@@ -6296,53 +6295,6 @@ func (c *Config) validateNodes() []error {
 			errs = append(errs, fmt.Errorf(
 				"%s: provider %s contradicts node.provider %s for the same host",
 				where, p.Provider, c.Node.Provider))
-		}
-	}
-	return errs
-}
-
-// validateMacOSHostLimits catches the case two individually-valid macOS tiers
-// pinned to the same Mac collectively exceed its per-host limit. The allocator
-// still has to count at runtime; this only stops the obvious mistake at load
-// time.
-func (c *Config) validateMacOSHostLimits() []error {
-	perNode := make(map[string]int)
-
-	// Node order follows the tier catalog rather than map iteration, so a config
-	// with two bad hosts reports them the same way every run.
-	var order []string
-
-	for i := range c.Tiers {
-		t := &c.Tiers[i]
-		if t.GuestOS != GuestMacOS || t.Node == "" {
-			continue
-		}
-
-		if _, seen := perNode[t.Node]; !seen {
-			order = append(order, t.Node)
-		}
-
-		perNode[t.Node] += t.MaxConcurrent
-	}
-	var errs []error
-	for _, node := range order {
-		p, declared := c.NodePolicyFor(node)
-		limit := p.MacOSLimit()
-
-		// Both of these are already reported — against the node policy itself,
-		// or against each offending tier. Repeating them as an aggregate
-		// describes one mistake twice, and does it with false arithmetic: a host
-		// whose allowlist excludes macOS has an effective limit of zero, so
-		// rendering it through macOSLimitReason claims "1 guest exceeds Apple's
-		// limit of 2", which is both wrong and points at the wrong field.
-		if limit < 0 || (declared && !p.AllowsGuestOS(GuestMacOS)) {
-			continue
-		}
-
-		if total := perNode[node]; total > limit {
-			errs = append(errs, fmt.Errorf(
-				"node %q: macOS tiers allow %d concurrent guests in total, exceeding %s",
-				node, total, c.macOSLimitReason(node)))
 		}
 	}
 	return errs

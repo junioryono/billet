@@ -1458,8 +1458,9 @@ func TestCompletionSettlesTheRunnersLeaseWhenGitHubPairedItWithAnotherJob(t *tes
 		t.Fatalf("IdentifyDirectJob: %v", err)
 	}
 
-	resolved, err := l.identifyCompletion(t.Context(), Job{RunID: 102, JobID: "different-job-guid",
-		RunnerName: provider.InstanceName(lease.ID)})
+	entry, err := l.resolveActualJob(t.Context(), Job{RunID: 102, JobID: "different-job-guid",
+		RunnerName: provider.InstanceName(lease.ID)}, resolveCompletion, nil)
+	resolved := entry.cleanup
 	if err != nil {
 		t.Fatalf("a pooled completion was refused rather than settled: %v", err)
 	}
@@ -1808,7 +1809,7 @@ func TestRecoveryRetirementFenceSurvivesNodeCustodyAndRefusesLateStart(t *testin
 	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(&fakeRunner{
 		onDestroy: func(int64) error { return ErrCustody },
 	}), WithRunnerRegistry(&fakeRunnerRegistry{}))
-	if err := l.reconcilePool(t.Context(), 0); err != nil {
+	if _, err := l.reconcilePool(t.Context(), 0); err != nil {
 		t.Fatalf("reconcile pool: %v", err)
 	}
 	member, err := a.PoolRunnerByLease(t.Context(), lease.ID)
@@ -2010,7 +2011,7 @@ func TestDirectAssignmentWithoutJobIDFailsClosed(t *testing.T) {
 	a := newAllocator(t, alloc.Limits{MaxVCPU: tierVCPU, MaxMemory: 64 * config.GiB}, tiers)
 	l := NewListener(a, tiers[0].Label, &fakeSession{})
 
-	_, err := l.identifyAssigned(t.Context(), Job{})
+	err := l.handle(t.Context(), &Message{MessageID: 1, Assigned: []Job{{}}})
 	if !errors.Is(err, ErrUntrustworthySession) {
 		t.Fatalf("identify zero-id assignment without job id = %v, want ErrUntrustworthySession", err)
 	}
@@ -5712,7 +5713,7 @@ func TestABlockedRequestIsReportedOnce(t *testing.T) {
 	owe()
 
 	for range 5 {
-		if got := l.reserve([]Job{{RequestID: 7}}); len(got) != 0 {
+		if got := l.reserve([]resolvedJob{{job: Job{RequestID: 7}}}); len(got) != 0 {
 			t.Fatalf("reserved %v for a request whose container is still owed", got)
 		}
 	}
@@ -5730,7 +5731,7 @@ func TestABlockedRequestIsReportedOnce(t *testing.T) {
 	l.cleanup[9] = &pendingCleanup{job: Job{RequestID: 9}}
 	l.mu.Unlock()
 
-	if got := l.reserve([]Job{{RequestID: 9}}); len(got) != 0 {
+	if got := l.reserve([]resolvedJob{{job: Job{RequestID: 9}}}); len(got) != 0 {
 		t.Fatalf("reserved %v for a second blocked request", got)
 	}
 
@@ -5748,7 +5749,7 @@ func TestABlockedRequestIsReportedOnce(t *testing.T) {
 
 	owe()
 
-	if got := l.reserve([]Job{{RequestID: 7}}); len(got) != 0 {
+	if got := l.reserve([]resolvedJob{{job: Job{RequestID: 7}}}); len(got) != 0 {
 		t.Fatalf("reserved %v for a freshly owed request", got)
 	}
 
@@ -6605,7 +6606,7 @@ func TestARequestWithComputeStillOwedIsNotTakenAgain(t *testing.T) {
 	l.cleanup = map[int64]*pendingCleanup{7: {job: Job{RequestID: 7}}}
 	l.mu.Unlock()
 
-	if got := l.reserve([]Job{{RequestID: 7}}); len(got) != 0 {
+	if got := l.reserve([]resolvedJob{{job: Job{RequestID: 7}}}); len(got) != 0 {
 		t.Errorf("reserved %v for a request whose previous container is still owed; the "+
 			"pending retry would destroy the new job's compute and release its lease", got)
 	}
@@ -6626,7 +6627,7 @@ func TestARequestWithComputeStillOwedIsNotTakenAgain(t *testing.T) {
 	delete(l.cleanup, 7)
 	l.mu.Unlock()
 
-	if got := l.reserve([]Job{{RequestID: 7}}); len(got) != 1 {
+	if got := l.reserve([]resolvedJob{{job: Job{RequestID: 7}}}); len(got) != 1 {
 		t.Errorf("reserved %v after the obligation was discharged, want one id; the "+
 			"request would never be runnable again", got)
 	}

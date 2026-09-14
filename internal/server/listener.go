@@ -164,8 +164,8 @@ var ErrUntrustworthySession = errors.New("server: the scale set returned somethi
 
 // errQuarantinableCompletion is an untrustworthy completion that creates no
 // unknown remote commitment. Its payload cannot change on redelivery, but the
-// local ledger may still converge, so Run retries it before acknowledging it
-// away. Other untrustworthy responses remain immediately fatal.
+// local ledger may still converge, so Run retries it. Quarantine may acknowledge
+// it only when no candidate work is held. Other refusals remain immediately fatal.
 var errQuarantinableCompletion = fmt.Errorf("%w: the completion has no safe identity",
 	ErrUntrustworthySession)
 
@@ -176,10 +176,12 @@ var errQuarantinableStarted = fmt.Errorf("%w: the started identity contradicts i
 	ErrUntrustworthySession)
 
 // poisonedMessageError carries the valid completions beside a poison so they can
-// be made durable after the whole message is finally acknowledged.
+// be made durable after the whole message is finally acknowledged. A candidate
+// hold forbids that acknowledgement even after the quarantine retry budget.
 type poisonedMessageError struct {
 	cause       error
 	completions []Job
+	held        bool
 }
 
 func (e *poisonedMessageError) Error() string { return e.cause.Error() }
@@ -256,6 +258,7 @@ type Statistics struct {
 // Listener runs one tier's scale set.
 type Listener struct {
 	alloc   *alloc.Allocator
+	arbiter *discoveryArbiter
 	tier    string
 	session Session
 	log     *slog.Logger
@@ -284,6 +287,11 @@ type Listener struct {
 	heartbeatTicks  <-chan time.Time
 	heartbeatPassed func()
 
+	// TEST-ONLY boundaries for losing backing after admission captures its turn
+	// or refill target. Nil in every deployment; neither replaces the operation.
+	beforePoolReconcile func()
+	beforeEscrowRefill  func()
+
 	// Guards the escrow below: renewal and the poll loop touch held and running
 	// concurrently.
 	mu sync.Mutex
@@ -309,6 +317,9 @@ type Listener struct {
 	// number sent to GitHub is only ever capacity this listener took from the
 	// allocator, never one computed from headroom.
 	running map[int64]*alloc.Lease
+	// Resolved aliases retain consumed offer facts while the lease is running.
+	// A durable busy pool binding supersedes these intended-job facts.
+	runningJobs map[int64]actualJobIdentity
 	// Restart-surviving runner leases held by the node rather than this
 	// listener. They count in GitHub's total pool capacity but do not enter the
 	// listener's heartbeat or teardown ownership.
@@ -331,7 +342,15 @@ type Listener struct {
 	// also closes the race with the heartbeat.
 	acquiring map[int64]*promise
 
+	// Guarded by mu; a failed exchange never becomes a confirmed advertisement.
+	capacitySent      *int
+	capacityConfirmed *int
+	capacityExchange  string
+
 	lastMessageID int64
+	// Guarded by mu. A hold blocks reconciliation until its message is settled
+	// or the session closes; an operational error must not discard it.
+	heldMessageID *int64
 
 	// maxCapacity caps what this listener advertises. nil lets the escrow decide.
 	maxCapacity *int
@@ -376,10 +395,18 @@ type Listener struct {
 	// completionStore keeps authoritative job results across an ACK followed by a
 	// process stop, until the node accepts result-dependent teardown.
 	completionStore completionStore
+	// writeJobResult isolates diagnostic write failures in tests. Nil uses the
+	// allocator directly; identity reads and completion settlement are unaffected.
+	writeJobResult func(context.Context, string, string, int64) error
 
 	// TotalAssignedJobs is the documented scaling signal; counting messages is
 	// not, because a response carries at most 50 and a large backlog is truncated.
 	observed *Statistics
+	// Poll-loop-owned demand hints. A source snapshot replaces the aggregate;
+	// accepted offers spend it so stale available statistics cannot pin a turn.
+	demandObservation *Statistics
+	claimedSinceStats int
+	waitingOffers     []actualJobIdentity
 
 	// Bounds somebody else's JOB rather than billet's own teardown, so it has its
 	// own ceiling. See maxDrainGrace.
@@ -421,6 +448,7 @@ func NewListener(a *alloc.Allocator, tier string, session Session, opts ...Optio
 		tier:          tier,
 		session:       session,
 		log:           slog.Default(),
+		runningJobs:   make(map[int64]actualJobIdentity),
 		running:       make(map[int64]*alloc.Lease),
 		adopted:       make(map[string]bool),
 		acquiring:     make(map[int64]*promise),
@@ -483,8 +511,10 @@ func withCompletionStore(store completionStore) Option {
 // `at` IS DIAGNOSTIC ONLY — it drives one stale-promise warning and must not time
 // the promise out; see defaultStalePromise.
 type promise struct {
-	lease *alloc.Lease
-	at    time.Time
+	job    Job
+	actual actualJobIdentity
+	lease  *alloc.Lease
+	at     time.Time
 	// reported keeps a stale promise from logging on every heartbeat.
 	reported bool
 }
@@ -1073,6 +1103,9 @@ func (l *Listener) Run(ctx context.Context) error {
 			// reaper expiring the lease is the safe way out.
 			return
 		}
+		l.mu.Lock()
+		l.heldMessageID = nil
+		l.mu.Unlock()
 
 		releaseCtx, endRelease := context.WithTimeout(overall, l.releaseGrace)
 		defer endRelease()
@@ -1089,7 +1122,7 @@ func (l *Listener) Run(ctx context.Context) error {
 	l.observed = l.session.Statistics()
 	l.reportOrphanedBacklog()
 	if l.observed != nil {
-		if err := l.reconcilePool(ctx, l.observed.TotalAssignedJobs); err != nil {
+		if _, err := l.reconcilePool(ctx, l.observed.TotalAssignedJobs); err != nil {
 			return err
 		}
 	}
@@ -1241,8 +1274,8 @@ func (l *Listener) Run(ctx context.Context) error {
 			// un-quiet and a drain keeps waiting and keeps reporting what it is
 			// waiting for. The seal under-delivers visibly rather than reporting a
 			// deployment quiesced that is not.
-			if l.observed != nil {
-				if err := l.reconcilePool(pollCtx, l.observed.TotalAssignedJobs); err != nil {
+			if l.observed != nil && !l.messageHeld() {
+				if err := l.reconcileAdmissionPool(pollCtx, l.observed.TotalAssignedJobs); err != nil {
 					// reconcilePool launches runners, which can take minutes; a
 					// cancellation landing mid-launch must enter the drain so the
 					// jobs already running finish, not stop the listener and have
@@ -1268,17 +1301,24 @@ func (l *Listener) Run(ctx context.Context) error {
 		advertised := l.committedCapacity()
 		withdrawnWhenSent := true
 
+		var admissionTurn uint64
 		if !draining && !quiesced {
-			advertised = l.advertisedCapacity()
+			advertised, admissionTurn = l.admissionPoll()
 			withdrawnWhenSent = false
 		}
+		l.reportCapacity(pollCtx, &advertised, "in flight")
 		msg, err := l.session.GetMessage(pollCtx, l.lastMessageID, advertised)
+		if err == nil || errors.Is(err, ErrNoMessage) {
+			l.reportCapacity(pollCtx, &advertised, "confirmed")
+		} else {
+			l.reportCapacity(context.WithoutCancel(pollCtx), nil, "ambiguous")
+		}
 
-		// A timed-out long poll is the ordinary case. Poll again immediately —
-		// the escrow is KEPT, because releasing and retaking it every poll
-		// would hand the gap to another tier and produce exactly the flapping the
-		// escrow exists to avoid.
+		// AN EMPTY EXCHANGE CAN COMPLETE A DISCOVERY TURN. Its old backing stays
+		// until a subsequent exchange has carried the smaller advertisement;
+		// finishing the turn itself releases nothing.
 		if errors.Is(err, ErrNoMessage) {
+			l.finishAdmissionTurn(admissionTurn)
 			// BEFORE reconcilePool, and that ordering is load-bearing rather than
 			// tidy. This branch's reconcile is NOT guarded by `!draining` — unlike
 			// the pre-poll one — and it launches out of `held`: `assignPoolSlot`
@@ -1304,8 +1344,8 @@ func (l *Listener) Run(ctx context.Context) error {
 			// proves it.
 			l.handBackIdleEscrow(pollCtx, draining || (quiesced && admissionKnown))
 
-			if l.observed != nil {
-				if err := l.reconcilePool(pollCtx, l.observed.TotalAssignedJobs); err != nil {
+			if l.observed != nil && !l.messageHeld() {
+				if _, err := l.reconcilePool(pollCtx, l.observed.TotalAssignedJobs); err != nil {
 					// reconcilePool launches runners, which can take minutes; a
 					// cancellation landing mid-launch must enter the drain so the
 					// jobs already running finish, not stop the listener and have
@@ -1324,6 +1364,7 @@ func (l *Listener) Run(ctx context.Context) error {
 			if !draining && !quiesced {
 				l.releaseIdleEscrowAbove(pollCtx, max(advertised, l.targetCapacity()))
 			}
+			l.reportCapacity(pollCtx, nil, "")
 
 			continue
 		}
@@ -1351,7 +1392,7 @@ func (l *Listener) Run(ctx context.Context) error {
 		// message.
 		quiesced, admissionKnown = l.markAdmission(pollCtx)
 
-		if !draining && !quiesced {
+		if !draining && !quiesced && l.arbiter == nil {
 			l.releaseIdleEscrowAbove(pollCtx,
 				max(advertised, l.messageCapacityTarget(msg)))
 		}
@@ -1393,6 +1434,10 @@ func (l *Listener) Run(ctx context.Context) error {
 					continue
 				}
 
+				if poison.held {
+					// Ending the session preserves redelivery of held assignments.
+					return stopping(ctx, poison)
+				}
 				handled := *msg
 				handled.Completed = poison.completions
 				if err := l.acknowledge(pollCtx, &handled); err != nil {
@@ -1409,6 +1454,11 @@ func (l *Listener) Run(ctx context.Context) error {
 					"error", poison)
 				poisonMessageID = 0
 				poisonRefusals = 0
+				// A QUARANTINED MESSAGE IS A HANDLED EXCHANGE, and ends its turn as
+				// every other handled exchange does. Skipping this let a stream of
+				// poisoned messages hold the shared admission turn indefinitely,
+				// refusing every waiting tier's purchase.
+				l.finishAdmissionTurn(admissionTurn)
 
 				continue
 			}
@@ -1426,9 +1476,11 @@ func (l *Listener) Run(ctx context.Context) error {
 
 		poisonMessageID = 0
 		poisonRefusals = 0
+		l.finishAdmissionTurn(admissionTurn)
 		if !draining {
 			l.releaseIdleEscrowAbove(pollCtx, max(advertised, l.targetCapacity()))
 		}
+		l.reportCapacity(pollCtx, nil, "")
 	}
 }
 
@@ -1520,13 +1572,20 @@ func (l *Listener) beginDrain(ctx context.Context) (context.Context, context.Can
 	// A SECOND SIGNAL ENDS THE WAIT, not the teardown. The goroutine also selects
 	// on drainCtx so it cannot outlive the drain.
 	if l.hurry != nil {
-		go func() {
-			select {
-			case <-l.hurry:
-				endDrain()
-			case <-drainCtx.Done():
-			}
-		}()
+		select {
+		case <-l.hurry:
+			// AN ALREADY RECEIVED SIGNAL ENDS THE WAIT BEFORE ANOTHER POLL.
+			// Scheduling its observation would let the drain enter another poll.
+			endDrain()
+		default:
+			go func() {
+				select {
+				case <-l.hurry:
+					endDrain()
+				case <-drainCtx.Done():
+				}
+			}()
+		}
 	}
 
 	// NOT l.seal(), which stops the cleanup loop starting new destroys and belongs
@@ -1742,6 +1801,7 @@ func (l *Listener) releaseIdleEscrowAbove(ctx context.Context, target int) {
 		l.log.Info("released idle escrow above this tier's assigned demand",
 			"tier", l.tier, "released", released, "target_capacity", target)
 	}
+	l.observeDemand(l.observed)
 }
 
 // isDraining reports whether this listener has been asked to stop and is
@@ -1866,14 +1926,26 @@ func (l *Listener) advertisedCapacity() int {
 	return min(l.capacity(), l.targetCapacity())
 }
 
-// targetCapacity keeps one backed discovery slot beyond GitHub's current
-// assigned count. A zero-capacity scale set receives no work or statistics, but
-// an idle listener holding every free lease starves every peer indefinitely.
+// targetCapacity includes a backed discovery turn when arbitration permits it.
+//
+// ZERO-CAPACITY DISCOVERY IS UNMEASURED. Keep the slot, but share its turn rather
+// than granting every catalogue entry a permanent claim on execution capacity.
 func (l *Listener) targetCapacity() int {
 	return l.targetCapacityFor(l.observed, 0)
 }
 
 func (l *Listener) targetCapacityFor(observed *Statistics, offered int) int {
+	if l.arbiter != nil {
+		target := l.committedCapacity()
+		if l.arbiter.permits(l.tier) && target < math.MaxInt {
+			target++
+		}
+		if l.maxCapacity != nil {
+			target = min(target, *l.maxCapacity)
+		}
+
+		return max(target, 0)
+	}
 	desired := 0
 	if observed != nil && observed.TotalAssignedJobs > 0 {
 		desired = observed.TotalAssignedJobs
@@ -2515,6 +2587,7 @@ func (l *Listener) destroyAll(
 
 				l.mu.Lock()
 				delete(l.running, requestID)
+				delete(l.runningJobs, requestID)
 				if retired {
 					if entry := l.cleanup[requestID]; entry == nil ||
 						entry.job.CompletionID == 0 || entry.job.CompletionID == job.CompletionID {
@@ -2718,6 +2791,7 @@ func (l *Listener) heartbeatHeld(ctx context.Context) {
 		// destroy discharges it — deleting it leaves the container reachable by nothing but
 		// an optional Sweeper.
 		delete(l.running, id)
+		delete(l.runningJobs, id)
 		delete(l.confirmed, lease.ID)
 
 		if _, pending := l.cleanup[id]; !pending {
@@ -2873,15 +2947,27 @@ func (l *Listener) refillEscrow(ctx context.Context) error {
 	return l.refillEscrowTo(ctx, math.MaxInt)
 }
 
-// prepareEscrow fills ordinary polling to assigned demand plus one discovery
-// slot. Surplus is not released until GetMessage has returned after sending the
-// lower advertisement; releasing first would let another tier claim capacity
-// GitHub could still assign against here.
+// prepareEscrow fills ordinary polling only as far as its admission turn allows.
+// A standalone listener retains the single-tier demand-plus-discovery policy.
+// SURPLUS STAYS BACKED UNTIL THE LOWER EXCHANGE IS HANDLED. Releasing first would
+// let another tier claim capacity GitHub could still assign against here.
 func (l *Listener) prepareEscrow(ctx context.Context) error {
+	l.observeDemand(l.observed)
 	return l.refillEscrowTo(ctx, l.targetCapacity())
 }
 
 func (l *Listener) refillEscrowTo(ctx context.Context, target int) error {
+	if l.arbiter != nil {
+		return l.arbitrateEscrow(ctx, target)
+	}
+
+	return l.refillEscrowUngated(ctx, target, math.MaxInt)
+}
+
+func (l *Listener) refillEscrowUngated(ctx context.Context, target, maxNew int) error {
+	if l.beforeEscrowRefill != nil {
+		l.beforeEscrowRefill()
+	}
 	room, err := l.alloc.Headroom(ctx, l.tier)
 	if err != nil {
 		return fmt.Errorf("server: headroom for %s: %w", l.tier, err)
@@ -2904,6 +2990,9 @@ func (l *Listener) refillEscrowTo(ctx context.Context, target int) error {
 		}
 	}
 
+	// ONE NEW LEASE PER ARBITRATED GRANT, even if a heartbeat removed committed
+	// capacity after the target was computed. Standalone refills have no cap.
+	room = min(room, maxNew)
 	if room <= 0 {
 		return nil
 	}
@@ -2992,6 +3081,15 @@ func (l *Listener) refillEscrowTo(ctx context.Context, target int) error {
 // about error severity, so the first non-fatal error path anyone adds inherits
 // the question.
 func (l *Listener) handle(ctx context.Context, msg *Message) error {
+	l.mu.Lock()
+	if l.heldMessageID != nil && *l.heldMessageID != msg.MessageID {
+		heldID := *l.heldMessageID
+		l.mu.Unlock()
+		return fmt.Errorf("%w: message %d arrived while message %d holds candidate jobs",
+			ErrUntrustworthySession, msg.MessageID, heldID)
+	}
+	l.mu.Unlock()
+
 	// STARTS PRECEDE COMPLETIONS EVEN WHEN GITHUB BATCHES THEM TOGETHER. The
 	// start is the authoritative runner-to-job binding; resolving the completion
 	// first would either settle the request that caused launch or mistake a busy
@@ -3010,45 +3108,46 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 			"runner", job.RunnerName, "request", job.RequestID, "job", job.JobID)
 	}
 
-	// COMPLETED IS PROCESSED FIRST. Otherwise the cycle never closes — the lease stays
-	// open until the reaper expires it — and it must come first because GitHub batches
-	// the completion of one job with the offer of its replacement: acquiring before
-	// releasing claims the replacement while still holding the finished job's lease.
-	//
-	// `finished` is scoped to THIS MESSAGE, which is the whole lifetime the problem
-	// has. A batch can carry Assigned and Completed for the same request — an
-	// assigned-then-cancelled job — and it does not need to survive the call, because a
-	// redelivery rebuilds it before the assignments are read. A longer-lived map would
-	// silently skip a request id GitHub requeued after cancelling it.
-	finished := make(map[int64]struct{}, len(msg.Completed))
-	completed := make([]Job, 0, len(msg.Completed))
-	poisoned := make([]error, 0, len(msg.Completed))
+	resolved, err := l.resolveMessage(ctx, msg)
+	// Persist the hold before any later error can send Run into its drain.
+	if len(resolved.held) > 0 {
+		l.mu.Lock()
+		id := msg.MessageID
+		l.heldMessageID = &id
+		l.mu.Unlock()
+	}
+	if err != nil {
+		return err
+	}
 
-	for i := range msg.Completed {
-		job := msg.Completed[i]
-		job.CompletionID = msg.MessageID
-		var err error
-		job, err = l.identifyCompletion(ctx, job)
-		if err != nil {
-			if errors.Is(err, errQuarantinableCompletion) {
-				poisoned = append(poisoned, err)
-
-				continue
-			}
-
-			return err
+	// Completion precedes acquisition so its replacement can use released escrow.
+	// Both acquisition filters use resolveActualJob's rule, including redelivery
+	// after a completion has retired or been superseded by a newer delivery.
+	finished := make([]actualJobIdentity, 0, len(resolved.completed))
+	completed := make([]Job, 0, len(resolved.completed))
+	for i := range resolved.completed {
+		entry := &resolved.completed[i]
+		if containsActual(resolved.held, entry.actual) {
+			continue
 		}
-		completed = append(completed, job)
+		if entry.binding != nil {
+			if err := l.restorePoolLease(ctx, *entry.binding); err != nil {
+				return err
+			}
+		}
+		finished = append(finished, entry.actual)
+		completed = append(completed, entry.cleanup)
 	}
 
 	handled := *msg
 	handled.Completed = completed
 
 	var poison error
-	if len(poisoned) > 0 {
+	if len(resolved.poisoned) > 0 {
 		poison = &poisonedMessageError{
-			cause:       errors.Join(poisoned...),
+			cause:       errors.Join(resolved.poisoned...),
 			completions: slices.Clone(completed),
+			held:        len(resolved.held) > 0,
 		}
 	}
 
@@ -3056,12 +3155,6 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 		job := completed[i]
 		l.log.Info("received a completed job", "tier", l.tier, "request", job.RequestID,
 			"runner", job.RunnerName, "result", job.Result)
-		// THE DELIVERY IS TERMINAL EVEN WHEN ITS TEARDOWN ALREADY SETTLED. A
-		// failed acknowledgement redelivers the whole batch, including an Assigned
-		// entry for an assigned-then-cancelled job. Retired means "do not destroy
-		// again", not "the assignment is live again". Stale means a newer delivery
-		// already decided this request, so the older assignment is no more runnable.
-		finished[job.RequestID] = struct{}{}
 
 		disposition, err := l.recordCompletion(ctx, job)
 		if err != nil {
@@ -3072,6 +3165,8 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 		}
 		l.complete(ctx, job)
 	}
+
+	l.rememberAvailable(msg, resolved)
 
 	// A zero advertisement is not the same as refusing work, and this is where
 	// the difference is enforced.
@@ -3123,19 +3218,27 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 	// stop a queued message arriving or an unacknowledged one being redelivered,
 	// and either would otherwise be acquired against escrow the refill takes
 	// straight back.
-	if l.isDraining() || l.isQuiesced() {
+	observedDemand := l.observed
+	if msg.Statistics != nil {
+		observedDemand = msg.Statistics
+	}
+	l.observeDemand(observedDemand)
+	switch {
+	case l.isDraining() || l.isQuiesced():
 		if len(msg.Available) > 0 {
 			l.log.Info("declining an offer: this deployment is not taking new work",
 				"tier", l.tier, "available", len(msg.Available),
 				"reason", refusalReason(l.isDraining()))
 		}
-	} else {
-		// Topped up between the release and the acquisition, so the slot just freed
-		// is available to back the offer that arrived with it. It may lose the race
-		// to another tier — escrow is first-come — but idle listeners ordinarily
-		// keep only a discovery slot, and configured floors protect guarantees under
-		// real contention. What matters here is that billet never claims work it
-		// cannot back.
+	case l.arbiter != nil && !l.arbiter.permits(l.tier):
+		if len(msg.Available) > 0 {
+			l.log.Info("deferring an offer to another tier's admission turn",
+				"tier", l.tier, "available", len(msg.Available))
+		}
+	default:
+		// THE SAME ARBITRATION GATES OFFERS AND POLLS. A refill here cannot
+		// bypass the tier waiting for returning headroom, and only real escrow
+		// can back an acquisition.
 		if len(msg.Available) > 0 {
 			observed := l.observed
 			if msg.Statistics != nil {
@@ -3150,7 +3253,7 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 		// AVAILABLE is what gets acquired. Available is the offer; Assigned is the
 		// confirmation that an offer was claimed. Acquiring from Assigned asks
 		// GitHub to claim work it has already handed over, and drops every offer.
-		if err := l.acquire(ctx, msg.Available); err != nil {
+		if err := l.acquireUnfinished(ctx, resolved.available, finished, resolved.held, resolved.committed); err != nil {
 			return err
 		}
 	}
@@ -3170,12 +3273,11 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 		}
 		assignmentDeficit = max(msg.Statistics.TotalAssignedJobs-active, 0)
 	}
-	for i := range msg.Assigned {
-		job, err := l.identifyAssigned(ctx, msg.Assigned[i])
-		if err != nil {
-			return err
-		}
-		if _, over := finished[job.RequestID]; over {
+	// Assignment filtering follows resolveActualJob, never the cleanup request.
+	for i := range resolved.assigned {
+		entry := &resolved.assigned[i]
+		job := entry.job
+		if containsActual(finished, entry.actual) || containsActual(resolved.held, entry.actual) {
 			continue
 		}
 		if assignmentDeficit == 0 {
@@ -3183,7 +3285,7 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 			continue
 		}
 
-		lease, needsCompute, err := l.assign(ctx, job)
+		lease, needsCompute, err := l.assignResolved(ctx, *entry)
 		if err != nil {
 			return err
 		}
@@ -3202,9 +3304,11 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 		}
 	}
 
-	if msg.Statistics != nil {
+	// A delivery that no longer holds carries current statistics even while the
+	// earlier hold blocks reconciliation until this message is acknowledged.
+	if msg.Statistics != nil && len(resolved.held) == 0 {
 		l.observed = msg.Statistics
-		if err := l.reconcilePool(ctx, msg.Statistics.TotalAssignedJobs); err != nil {
+		if _, err := l.reconcilePool(ctx, msg.Statistics.TotalAssignedJobs); err != nil {
 			return err
 		}
 	}
@@ -3224,13 +3328,9 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 	// assignments are idempotent by request id. Skipping a message is not
 	// recoverable, so late beats early.
 	//
-	// That safety does NOT extend to an ambiguous acquisition. If AcquireJobs
-	// commits at GitHub and the response is lost, billet sees an error, unreserves
-	// every id, and has no way to learn it now owes runners for them — AcquireJobs
-	// being one-way means there is nothing to ask. Today that cannot bite, because
-	// an acquisition error ends the session and the whole control plane; anyone
-	// making it non-fatal has to solve the unknown-outcome case first, and the
-	// answer is not "retry".
+	// AN AMBIGUOUS ACQUISITION KEEPS ITS PROMISES. A lost response says nothing
+	// about which jobs GitHub acquired. Cancellation can continue into the drain,
+	// so those leases must stay out of held until assignment or session closure.
 	l.lastMessageID = msg.MessageID
 
 	return nil
@@ -3300,14 +3400,20 @@ func (l *Listener) quarantineStarted(ctx context.Context, job Job, cause error) 
 // Growth creates anonymous physical members because individual job entries are
 // lifecycle data and may be truncated. Only idle members are selected for
 // shrinkage; a busy member belongs to a job regardless of what any aggregate
-// says while messages are in flight.
-func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
+// says while messages are in flight. Reports whether growth took held backing.
+func (l *Listener) reconcilePool(ctx context.Context, desired int) (bool, error) {
+	if l.messageHeld() {
+		return false, nil
+	}
+	if l.beforePoolReconcile != nil {
+		l.beforePoolReconcile()
+	}
 	if l.alloc == nil || desired < 0 {
-		return nil
+		return false, nil
 	}
 	runners, err := l.alloc.PoolRunners(ctx, l.tier)
 	if err != nil {
-		return fmt.Errorf("server: read runner pool for %s reconciliation: %w", l.tier, err)
+		return false, fmt.Errorf("server: read runner pool for %s reconciliation: %w", l.tier, err)
 	}
 
 	for i := range runners {
@@ -3318,28 +3424,30 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 
 	runners, err = l.alloc.PoolRunners(ctx, l.tier)
 	if err != nil {
-		return fmt.Errorf("server: refresh runner pool for %s reconciliation: %w", l.tier, err)
+		return false, fmt.Errorf("server: refresh runner pool for %s reconciliation: %w", l.tier, err)
 	}
 	active, err := l.alloc.ActiveRunnerLeases(ctx, l.tier)
 	if err != nil {
-		return fmt.Errorf("server: count active runner leases for %s reconciliation: %w", l.tier, err)
+		return false, fmt.Errorf("server: count active runner leases for %s reconciliation: %w", l.tier, err)
 	}
+	consumed := false
 	for active < desired {
-		lease, job, ok, err := l.assignPoolSlot(ctx)
+		lease, job, held, err := l.assignPoolSlot(ctx)
 		if err != nil {
-			return err
+			return consumed, err
 		}
-		if !ok {
+		if lease == nil {
 			break
 		}
+		consumed = consumed || held
 		if err := l.launch(ctx, lease, job); err != nil {
-			return err
+			return consumed, err
 		}
 		active++
 	}
 	surplus := active - desired
 	if surplus <= 0 {
-		return nil
+		return consumed, nil
 	}
 	for i := range runners {
 		if surplus == 0 {
@@ -3358,7 +3466,7 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 		surplus--
 	}
 
-	return nil
+	return consumed, nil
 }
 
 func (l *Listener) activePoolMembers(ctx context.Context) (int, error) {
@@ -3372,6 +3480,7 @@ func (l *Listener) activePoolMembers(ctx context.Context) (int, error) {
 
 // assignPoolSlot turns one escrowed lease into a physical runner whose durable
 // identity is the lease rather than one entry from GitHub's truncated message.
+// Reports whether it took held backing rather than an existing promise.
 func (l *Listener) assignPoolSlot(ctx context.Context) (*alloc.Lease, Job, bool, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -3411,7 +3520,7 @@ func (l *Listener) assignPoolSlot(ctx context.Context) (*alloc.Lease, Job, bool,
 	delete(l.heldOrder, lease.ID)
 	l.running[requestID] = lease
 
-	return lease, Job{RequestID: requestID}, true, nil
+	return lease, Job{RequestID: requestID}, !fromPromise, nil
 }
 
 // retirePoolMember removes routing before compute, then returns its capacity.
@@ -3460,32 +3569,14 @@ func (l *Listener) retirePoolMember(ctx context.Context, member alloc.PoolRunner
 func (l *Listener) dropPoolMember(member alloc.PoolRunner) {
 	l.mu.Lock()
 	delete(l.running, member.LaunchRequestID)
+	delete(l.runningJobs, member.LaunchRequestID)
 	delete(l.acquiring, member.LaunchRequestID)
 	delete(l.confirmed, member.LeaseID)
 	l.mu.Unlock()
 }
 
-// identifyAssigned gives a direct assignment its durable scheduler identity.
-func (l *Listener) identifyAssigned(ctx context.Context, job Job) (Job, error) {
-	if job.RequestID != 0 {
-		return job, nil
-	}
-	if l.alloc == nil {
-		return Job{}, fmt.Errorf("%w: %s assigned job %q without a request id, and no ledger is available to identify it",
-			ErrUntrustworthySession, l.tier, job.JobID)
-	}
-
-	requestID, err := l.alloc.IdentifyDirectJob(ctx, job.JobID)
-	if err != nil {
-		return Job{}, fmt.Errorf("%w: %s cannot identify directly assigned job %q: %w",
-			ErrUntrustworthySession, l.tier, job.JobID, err)
-	}
-	job.RequestID = requestID
-
-	return job, nil
-}
-
-// identifyStarted records which job a registered pool member actually consumed.
+// identifyStarted records which job a registered pool member actually consumed,
+// using resolveActualJob for its scheduler aliases.
 func (l *Listener) identifyStarted(ctx context.Context, job Job) (Job, error) {
 	if l.alloc == nil {
 		return Job{}, fmt.Errorf("%w: %s started runner %q without a ledger",
@@ -3495,10 +3586,11 @@ func (l *Listener) identifyStarted(ctx context.Context, job Job) (Job, error) {
 		return Job{}, fmt.Errorf("%w: %s received an incomplete started identity for runner %q",
 			errQuarantinableStarted, l.tier, job.RunnerName)
 	}
-	identified, err := l.identifyAssigned(ctx, job)
+	resolved, err := l.resolveActualJob(ctx, job, resolveAcquisition, nil)
 	if err != nil {
 		return Job{}, err
 	}
+	identified := resolved.job
 	member, err := l.alloc.PoolRunnerByName(ctx, job.RunnerName)
 	leaseID := member.LeaseID
 	switch {
@@ -3548,120 +3640,6 @@ func (l *Listener) identifyStarted(ctx context.Context, job Job) (Job, error) {
 	return identified, nil
 }
 
-// identifyCompletion resolves a zero wire id through the runner's lease, or
-// through job id when there is no durable lease identity to recover.
-func (l *Listener) identifyCompletion(ctx context.Context, job Job) (Job, error) {
-	if job.RunnerName == "" && job.RequestID != 0 {
-		return job, nil
-	}
-	if l.alloc == nil {
-		return Job{}, fmt.Errorf("%w: %s completed runner %q without a request id, and no ledger is available to resolve it",
-			ErrUntrustworthySession, l.tier, job.RunnerName)
-	}
-
-	// THE RUNNER, NOT runnerRequestId, IS THE COMPUTE IDENTITY. The request id
-	// describes the job that completed and may belong to a different pool member.
-	if job.RunnerName != "" {
-		binding, err := l.alloc.PoolRunnerByName(ctx, job.RunnerName)
-		switch {
-		case err == nil:
-			if binding.Tier != l.tier || binding.LaunchRequestID == 0 {
-				return Job{}, fmt.Errorf("%w: completed runner %q belongs to tier %q",
-					ErrUntrustworthySession, job.RunnerName, binding.Tier)
-			}
-			if err := l.restorePoolLease(ctx, binding); err != nil {
-				return Job{}, err
-			}
-			if binding.Status == alloc.PoolRunnerBusy {
-				if job.JobID != "" && binding.JobID != "" && job.JobID != binding.JobID {
-					return Job{}, fmt.Errorf("%w: completed runner %q names job %q after starting %q",
-						ErrUntrustworthySession, job.RunnerName, job.JobID, binding.JobID)
-				}
-				if job.RequestID != 0 && binding.ActualRequestID != 0 &&
-					job.RequestID != binding.ActualRequestID {
-					return Job{}, fmt.Errorf("%w: completed runner %q names request %d after starting %d",
-						ErrUntrustworthySession, job.RunnerName, job.RequestID, binding.ActualRequestID)
-				}
-			}
-			job.RequestID = binding.LaunchRequestID
-			return job, nil
-		case !errors.Is(err, alloc.ErrLeaseNotFound):
-			return Job{}, fmt.Errorf("%w: cannot resolve completed runner %q: %w",
-				ErrUntrustworthySession, job.RunnerName, err)
-		}
-	}
-
-	if job.RequestID != 0 {
-		return job, nil
-	}
-
-	leaseID, ok := provider.LeaseOf(job.RunnerName)
-	if ok {
-		identity, err := l.alloc.JobForLease(ctx, leaseID)
-		switch {
-		case err == nil:
-			if identity.Tier != l.tier || identity.RequestID == 0 {
-				return Job{}, fmt.Errorf("%w: completed runner %q resolves to tier %q request %d, not tier %q",
-					ErrUntrustworthySession, job.RunnerName, identity.Tier, identity.RequestID, l.tier)
-			}
-			// A RUNNER AND ITS INTENDED JOB ARE A POOL, NOT A PAIR, and treating a
-			// disagreement as a broken contract took the control plane down. Within
-			// one scale set GitHub hands an assigned job to whichever registered
-			// runner is free, so two jobs launched seconds apart can swap runners —
-			// measured live, the first time a full suite ran concurrently: the
-			// runner billet started for request -49 completed the job mapped to
-			// -52, honestly. The old fatal made GitHub redeliver the same message
-			// to every fresh session, which is a restart loop with no exit.
-			//
-			// THE RUNNER'S LEASE IS THE IDENTITY THAT SETTLES. The completion says
-			// THIS guest finished with THIS result, which is exactly what its
-			// capacity release and cache settlement need. The job-side facts (run
-			// id, job id) stay from the message because they describe the job that
-			// really ran here. Pool reconciliation separately scales down any idle
-			// registration that was reserved for this job but never consumed it.
-			if job.RunID != 0 && identity.RunID != 0 && job.RunID != identity.RunID {
-				l.log.Warn("a completed runner ran a job from a different run than the one "+
-					"it was launched for; github pools assigned jobs across a scale set's "+
-					"runners, so its lease settles under the run it actually executed",
-					"tier", l.tier, "runner", job.RunnerName,
-					"ran", job.RunID, "launched_for", identity.RunID)
-			}
-			if job.JobID != "" {
-				mapped, exists, err := l.alloc.DirectJobIdentity(ctx, job.JobID)
-				if err != nil {
-					return Job{}, fmt.Errorf("%w: %s cannot cross-check completed job %q: %w",
-						ErrUntrustworthySession, l.tier, job.JobID, err)
-				}
-				if exists && mapped != identity.RequestID {
-					l.log.Warn("a completed runner ran a different assigned job than the one "+
-						"it was launched for; github pools assigned jobs across a scale set's "+
-						"runners, so this runner's lease settles with the result while idle "+
-						"surplus is retired from the authoritative assigned-job count",
-						"tier", l.tier, "runner", job.RunnerName,
-						"launched_for", identity.RequestID, "job", job.JobID, "ran", mapped)
-				}
-			}
-
-			job.RequestID = identity.RequestID
-			if job.RunID == 0 {
-				job.RunID = identity.RunID
-			}
-
-			return job, nil
-		case !errors.Is(err, alloc.ErrLeaseNotFound):
-			return Job{}, fmt.Errorf("%w: %s cannot resolve completed runner %q: %w",
-				ErrUntrustworthySession, l.tier, job.RunnerName, err)
-		}
-	}
-
-	if job.JobID != "" {
-		return l.identifyAssigned(ctx, job)
-	}
-
-	return Job{}, fmt.Errorf("%w: %s completed runner %q without a request id, job id, or resolvable billet lease",
-		errQuarantinableCompletion, l.tier, job.RunnerName)
-}
-
 // restorePoolLease reconnects restart-safe pool identity to the completion
 // machinery, whose durable result record must carry the exact lease and epoch.
 // Without this handoff a post-restart completion could destroy compute and then
@@ -3702,8 +3680,21 @@ func (l *Listener) acknowledge(ctx context.Context, msg *Message) error {
 	if err := l.session.DeleteMessage(ctx, msg.MessageID); err != nil {
 		return fmt.Errorf("server: acknowledge message %d: %w", msg.MessageID, err)
 	}
+	l.mu.Lock()
+	if l.heldMessageID != nil && *l.heldMessageID == msg.MessageID {
+		l.heldMessageID = nil
+	}
+	l.mu.Unlock()
 
 	return nil
+}
+
+// messageHeld also covers holds discovered before an operational failure.
+func (l *Listener) messageHeld() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	return l.heldMessageID != nil
 }
 
 // acknowledgeCompletions records that GitHub will not redeliver the
@@ -3743,29 +3734,81 @@ func (l *Listener) acknowledgeCompletions(ctx context.Context, msg *Message) {
 // offer goes to another scale set or is re-offered, whereas an acquisition
 // billet cannot back is a job that goes nowhere at all.
 func (l *Listener) acquire(ctx context.Context, available []Job) error {
+	resolved, err := l.resolveMessage(ctx, &Message{Available: available})
+	if err != nil {
+		return err
+	}
+	return l.acquireUnfinished(ctx, resolved.available, nil, nil, resolved.committed)
+}
+
+// acquireUnfinished uses resolveActualJob's rule for completion and commitment
+// filtering. Wire request IDs are retained only for the AcquireJobs protocol.
+func (l *Listener) acquireUnfinished(ctx context.Context, available []resolvedJob,
+	finished, held []actualJobIdentity, commitments []jobCommitment,
+) error {
 	if len(available) == 0 {
 		return nil
 	}
 
-	identified := make([]Job, 0, len(available))
+	committed := l.currentCommitments(commitments)
+	eligible := make([]resolvedJob, 0, len(available))
+	for i := range available {
+		entry := &available[i]
+		if containsActual(held, entry.actual) {
+			continue
+		}
+		if containsActual(finished, entry.actual) || containsActual(committed, entry.actual) {
+			l.forgetAvailable(entry.actual)
+			continue
+		}
+		eligible = append(eligible, *entry)
+	}
 	protocolFor := make(map[int64]int64, len(available))
 	internalFor := make(map[int64]int64, len(available))
-	for i := range available {
-		protocolID := available[i].RequestID
-		job, err := l.identifyAssigned(ctx, available[i])
-		if err != nil {
-			return err
-		}
-		identified = append(identified, job)
+	offerFor := make(map[int64]actualJobIdentity, len(available))
+	for i := range eligible {
+		entry := &eligible[i]
+		protocolID := entry.protocolID
+		job := entry.job
 		protocolFor[job.RequestID] = protocolID
 		if prior, duplicate := internalFor[protocolID]; duplicate && prior != job.RequestID {
 			return fmt.Errorf("%w: %s offered distinct jobs %d and %d under the same runner request id %d; the acquisition response cannot distinguish them",
 				ErrUntrustworthySession, l.tier, prior, job.RequestID, protocolID)
 		}
 		internalFor[protocolID] = job.RequestID
+		offerFor[protocolID] = entry.actual
+	}
+	// Validate every wire offer before coalescing acquisition representatives.
+	identified := make([]resolvedJob, 0, len(eligible))
+	for e := range eligible {
+		entry := &eligible[e]
+		if i := slices.IndexFunc(identified, func(prior resolvedJob) bool {
+			return sameActualJob(prior.actual, entry.actual)
+		}); i >= 0 {
+			identified[i].actual = mergeActual(identified[i].actual, entry.actual)
+			continue
+		}
+		identified = append(identified, *entry)
+	}
+	for i := range identified {
+		protocolFor[identified[i].job.RequestID] = identified[i].protocolID
+		offerFor[identified[i].protocolID] = identified[i].actual
 	}
 
-	reservedInternal := l.reserve(identified)
+	// THE TURN MUST STILL BELONG TO THIS TIER WHEN ESCROW BECOMES A PROMISE.
+	// Another listener can establish demand after the handler's offer guard;
+	// a stale permission must not spend the backing it is waiting to receive.
+	var reservedInternal []int64
+	if l.arbiter == nil {
+		reservedInternal = l.reserve(identified)
+	} else {
+		l.arbiter.mu.Lock()
+		if l.arbiter.owner == l.tier {
+			reservedInternal = l.reserve(identified)
+		}
+		l.arbiter.mu.Unlock()
+	}
+	l.reportCapacity(ctx, nil, "")
 	if len(reservedInternal) == 0 {
 		return nil
 	}
@@ -3777,8 +3820,8 @@ func (l *Listener) acquire(ctx context.Context, available []Job) error {
 
 	acquiredProtocol, err := l.session.AcquireJobs(ctx, reservedProtocol)
 	if err != nil {
-		// Nothing was promised, so nothing stays reserved.
-		l.unreserve(reservedInternal)
+		// A FAILED RESPONSE IS NOT A REFUSED ACQUISITION. The request may have
+		// committed remotely; withdrawal must not donate its backing to a peer.
 
 		return fmt.Errorf("server: acquire jobs for %s: %w", l.tier, err)
 	}
@@ -3798,9 +3841,8 @@ func (l *Listener) acquire(ctx context.Context, available []Job) error {
 	// reachable by any race, and stopping is also the remedy: the session is recreated
 	// and GitHub redelivers whatever was unacknowledged.
 	if extra := missing(acquiredProtocol, reservedProtocol); len(extra) > 0 {
-		// Everything, not just the unmatched ids. Which commitments are real is
-		// exactly what is no longer known.
-		l.unreserve(reservedInternal)
+		// KEEP EVERY PROMISE until the session closes. Which commitments are
+		// real is exactly what this response failed to establish.
 
 		return fmt.Errorf("%w: %s acquired job requests it did not offer for "+
 			"(unrequested %v, requested %v); refusing to continue against a scale-set "+
@@ -3817,20 +3859,24 @@ func (l *Listener) acquire(ctx context.Context, available []Job) error {
 		acquiredInternal = append(acquiredInternal, internalFor[protocolID])
 	}
 	l.unreserve(missing(reservedInternal, acquiredInternal))
+	for _, id := range acquiredProtocol {
+		l.forgetAvailable(offerFor[id])
+	}
+	l.claimedSinceStats += len(acquiredProtocol)
 
 	return nil
 }
 
 // reserve moves escrow from held into acquiring, one lease per offer, and
 // returns the request ids it could back.
-func (l *Listener) reserve(available []Job) []int64 {
+func (l *Listener) reserve(available []resolvedJob) []int64 {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
 	ids := make([]int64, 0, len(available))
 
 	for i := range available {
-		job := &available[i]
+		job := &available[i].job
 		// Already promised, and therefore NOT returned to the caller.
 		//
 		// Returning it looked harmless and was not: the caller unreserves whatever
@@ -3877,7 +3923,7 @@ func (l *Listener) reserve(available []Job) []int64 {
 			continue
 		}
 
-		l.acquiring[job.RequestID] = &promise{lease: l.held[0], at: time.Now()}
+		l.acquiring[job.RequestID] = &promise{lease: l.held[0], at: time.Now(), job: *job, actual: available[i].actual}
 		l.held = l.held[1:]
 
 		ids = append(ids, job.RequestID)
@@ -3970,6 +4016,21 @@ func missing(asked, granted []int64) []int64 {
 // Explicit rather than a nil lease, because "no value and no error" is exactly
 // the shape a caller mishandles without noticing.
 func (l *Listener) assign(ctx context.Context, job Job) (*alloc.Lease, bool, error) {
+	entry, err := l.resolveActualJob(ctx, job, resolveAcquisition, nil)
+	if err != nil {
+		return nil, false, err
+	}
+	return l.assignResolved(ctx, entry)
+}
+
+// assignResolved consumes the resolved assignment without losing its aliases.
+func (l *Listener) assignResolved(ctx context.Context, entry resolvedJob) (*alloc.Lease, bool, error) {
+	commitments, err := l.resolveCommitments(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	job := entry.job
+
 	// Held for the whole function, INCLUDING the allocator write.
 	//
 	// Releasing it around the write to keep heartbeats snappy looks obviously
@@ -3982,9 +4043,30 @@ func (l *Listener) assign(ctx context.Context, job Job) (*alloc.Lease, bool, err
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	// Already ours. An unacknowledged message is redelivered, so this is an
-	// ordinary event rather than a fault — and consuming a second lease for one
-	// job would leak capacity that nothing ever gives back.
+	var known []actualJobIdentity
+	for _, c := range commitments {
+		if c.heldBy(l) {
+			known = append(known, c.actual)
+		}
+	}
+	candidates := actualJobCandidates(entry.actual, entry.protocolID, known)
+	if len(candidates) > 1 {
+		return nil, false, fmt.Errorf("%w: assignment %d matches several commitments",
+			ErrUntrustworthySession, job.RequestID)
+	}
+	actual := entry.actual
+	if len(candidates) == 1 {
+		actual = mergeActual(actual, candidates[0])
+	}
+	// Already ours. Retain any newly resolved aliases on redelivery as well.
+	for _, c := range commitments {
+		if c.promise == nil && c.heldBy(l) && sameActualJob(actual, c.actual) {
+			l.runningJobs[c.key] = mergeActual(c.actual, actual)
+			return nil, false, nil
+		}
+	}
+	// The ownership key remains reserved even if its runner consumed another
+	// actual job. Never overwrite the lease that must still be renewed.
 	if _, ok := l.running[job.RequestID]; ok {
 		return nil, false, nil
 	}
@@ -4011,14 +4093,20 @@ func (l *Listener) assign(ctx context.Context, job Job) (*alloc.Lease, bool, err
 		return nil, false, nil
 	}
 
-	// The lease this assignment was PROMISED, if billet acquired the offer. This
-	// is the ordinary path: acquire reserved a lease against this exact request id
-	// and nothing else can have spent it in the meantime.
+	// The offer may have used a different request alias. Its ownership key
+	// names the promise to consume, not the request to bind on the lease.
 	var lease *alloc.Lease
-
-	p, promised := l.acquiring[job.RequestID]
-	if promised {
-		lease = p.lease
+	var promiseKey int64
+	var promiseKeys []int64
+	promised := false
+	for _, c := range commitments {
+		if c.promise != nil && c.heldBy(l) && sameActualJob(actual, c.actual) {
+			promiseKeys = append(promiseKeys, c.key)
+			if !promised || c.key < promiseKey {
+				lease, promiseKey, promised = c.lease, c.key, true
+			}
+			actual = mergeActual(actual, c.actual)
+		}
 	}
 
 	if !promised {
@@ -4055,13 +4143,21 @@ func (l *Listener) assign(ctx context.Context, job Job) (*alloc.Lease, bool, err
 	// the release path — capacity that nothing hands back and nothing reports,
 	// until the reaper's TTL expires it.
 	if promised {
-		delete(l.acquiring, job.RequestID)
+		// One resolver-coalesced job owns these promises; only one needs a runner.
+		for _, key := range promiseKeys {
+			if key != promiseKey {
+				l.held = append(l.held, l.acquiring[key].lease)
+			}
+			delete(l.acquiring, key)
+		}
+		l.sortHeld()
 	} else {
 		l.held = l.held[1:]
 	}
 	delete(l.heldOrder, lease.ID)
 
 	l.running[job.RequestID] = lease
+	l.runningJobs[job.RequestID] = actual
 
 	return lease, true, nil
 }
@@ -4137,6 +4233,7 @@ func (l *Listener) launch(ctx context.Context, lease *alloc.Lease, job Job) erro
 
 		l.mu.Lock()
 		delete(l.running, job.RequestID)
+		delete(l.runningJobs, job.RequestID)
 		l.mu.Unlock()
 
 		return nil
@@ -4198,6 +4295,7 @@ func (l *Listener) launch(ctx context.Context, lease *alloc.Lease, job Job) erro
 	l.mu.Lock()
 
 	delete(l.running, job.RequestID)
+	delete(l.runningJobs, job.RequestID)
 
 	if !releaseSettled(relErr) {
 		if l.cleanup == nil {
@@ -4363,6 +4461,7 @@ func (l *Listener) releaseParked(ctx context.Context, requestID int64) (bool, bo
 
 	delete(l.cleanup, requestID)
 	delete(l.running, requestID)
+	delete(l.runningJobs, requestID)
 	delete(l.acquiring, requestID)
 
 	return true, true
@@ -4474,7 +4573,11 @@ func (l *Listener) recordJobResult(ctx context.Context, job Job, leaseID string)
 		return
 	}
 
-	if err := l.alloc.RecordJobResult(ctx, leaseID, job.Result, job.RunID); err != nil {
+	write := l.writeJobResult
+	if write == nil {
+		write = l.alloc.RecordJobResult
+	}
+	if err := write(ctx, leaseID, job.Result, job.RunID); err != nil {
 		l.log.Warn("could not record what github concluded about a finished job; "+
 			"`billet leases failures` may not be able to show whether billet's own "+
 			"infrastructure was disrupted while its lease could still have been "+
@@ -4589,6 +4692,7 @@ func (l *Listener) parkUnreachable(job Job, lease *alloc.Lease, outcome alloc.Ph
 	}
 
 	delete(l.running, job.RequestID)
+	delete(l.runningJobs, job.RequestID)
 	delete(l.confirmed, lease.ID)
 
 	if entry == nil {
@@ -4893,6 +4997,7 @@ func (l *Listener) complete(ctx context.Context, job Job) {
 
 			l.mu.Lock()
 			delete(l.running, job.RequestID)
+			delete(l.runningJobs, job.RequestID)
 			if retired {
 				if entry := l.cleanup[job.RequestID]; entry == nil ||
 					entry.job.CompletionID == 0 || entry.job.CompletionID == job.CompletionID {
@@ -5139,6 +5244,7 @@ func (l *Listener) complete(ctx context.Context, job Job) {
 			"tier", l.tier, "request", job.RequestID, "lease", lease.ID, "error", err)
 
 		delete(l.running, job.RequestID)
+		delete(l.runningJobs, job.RequestID)
 		delete(l.acquiring, job.RequestID)
 		l.mu.Unlock()
 
@@ -5147,6 +5253,7 @@ func (l *Listener) complete(ctx context.Context, job Job) {
 
 	// RELEASED, so the job is finally over and there is nothing to retry.
 	delete(l.running, job.RequestID)
+	delete(l.runningJobs, job.RequestID)
 	delete(l.acquiring, job.RequestID)
 	l.mu.Unlock()
 	if l.forgetCompletion(ctx, job) {
@@ -5689,6 +5796,7 @@ func (l *Listener) forceDestroy(ctx context.Context) {
 			// nobody removed a map entry.
 			l.mu.Lock()
 			delete(l.running, t.SchedulerRequest)
+			delete(l.runningJobs, t.SchedulerRequest)
 			delete(l.cleanup, t.SchedulerRequest)
 			l.mu.Unlock()
 

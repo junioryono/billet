@@ -139,6 +139,7 @@ type ReadOps interface {
 	ReadJobNode(ctx context.Context, leaseID string) (sql.NullString, error)
 	ReadJobPlacement(ctx context.Context, leaseID string) (ledgerdb.ReadJobPlacementRow, error)
 	ReadJobIdentity(ctx context.Context, jobID string) (int64, error)
+	ReadJobIdentityByInternalID(ctx context.Context, internalID int64) (string, error)
 	ReadJobResult(ctx context.Context, leaseID string) (string, error)
 	ReadJobStarted(ctx context.Context, leaseID string) (bool, error)
 	ReadLease(ctx context.Context, id string) (ledgerdb.ReadLeaseRow, error)
@@ -148,6 +149,7 @@ type ReadOps interface {
 	ReadLeaseJob(ctx context.Context, id string) (ledgerdb.ReadLeaseJobRow, error)
 	ReadLeaseSettlement(ctx context.Context, id string) (ledgerdb.ReadLeaseSettlementRow, error)
 	ReadLeaseTargetSize(ctx context.Context, id string) (ledgerdb.ReadLeaseTargetSizeRow, error)
+	ReadListenerCapacity(ctx context.Context, tier string) (ledgerdb.ListenerCapacity, error)
 	ReadNodeBarrierFence(ctx context.Context, name string) (ledgerdb.ReadNodeBarrierFenceRow, error)
 	ReadNodeCapacity(ctx context.Context, name string) (ledgerdb.ReadNodeCapacityRow, error)
 	ReadNodeEpoch(ctx context.Context, name string) (int64, error)
@@ -233,6 +235,7 @@ type WriteOps interface {
 	MarkPoolRunnerRetiring(ctx context.Context, arg ledgerdb.MarkPoolRunnerRetiringParams) error
 	ReclaimLease(ctx context.Context, arg ledgerdb.ReclaimLeaseParams) error
 	RecordCredentialSweep(ctx context.Context, arg ledgerdb.RecordCredentialSweepParams) error
+	RecordListenerCapacity(ctx context.Context, arg ledgerdb.RecordListenerCapacityParams) error
 	RefreshLeaseHolder(ctx context.Context, arg ledgerdb.RefreshLeaseHolderParams) error
 	RecordBarrierRun(ctx context.Context, arg ledgerdb.RecordBarrierRunParams) error
 	RecordHistoryCacheObservation(ctx context.Context, arg ledgerdb.RecordHistoryCacheObservationParams) error

@@ -98,3 +98,22 @@ func (a *Allocator) DirectJobIdentity(ctx context.Context, jobID string) (int64,
 		return internalID, true, nil
 	}
 }
+
+// DirectJobID recovers the job alias of an existing negative direct identity.
+// A pool slot has no job alias and returns exists false.
+func (a *Allocator) DirectJobID(ctx context.Context, requestID int64) (string, bool, error) {
+	var jobID string
+	err := a.db.View(ctx, func(tx querier) error {
+		var err error
+		jobID, err = state.ReadQueries(tx).ReadJobIdentityByInternalID(ctx, requestID)
+		return err
+	})
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return "", false, nil
+	case err != nil:
+		return "", false, fmt.Errorf("alloc: read direct job alias: %w", err)
+	default:
+		return jobID, true, nil
+	}
+}

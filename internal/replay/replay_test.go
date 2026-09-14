@@ -85,12 +85,11 @@ func TestEveryTraceJobHasALedgerRow(t *testing.T) {
 		t.Fatalf("recorded %d jobs for a trace of %d", len(report.Records), len(trace.Arrivals))
 	}
 
-	// THE DISCOVERY SLOTS ARE IN THE PROOF. Each tier holds one escrowed lease
-	// nobody is given until shutdown releases it; the ledger charged it, so the
-	// capacity sweep must count it, or an overcommit made of escrow alone would
-	// read as none.
-	if report.EscrowRows != len(twoHosts(config.PlacementPack).Tiers) || len(report.escrows) != report.EscrowRows {
-		t.Errorf("counted %d escrow rows and swept %d; want one discovery slot per tier (%d)",
+	// EVERY DISCOVERY CHARGE IS IN THE PROOF, including turns withdrawn without
+	// a job. Rotation can create many such rows per tier; counting only permanent
+	// slots would omit real charges from the overcommit sweep.
+	if report.EscrowRows < len(twoHosts(config.PlacementPack).Tiers) || len(report.escrows) != report.EscrowRows {
+		t.Errorf("counted %d escrow rows and swept %d; want at least one discovery turn per tier (%d)",
 			report.EscrowRows, len(report.escrows), len(twoHosts(config.PlacementPack).Tiers))
 	}
 

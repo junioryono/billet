@@ -10,7 +10,7 @@ billet init \
   --config ~/billet.yaml
 ```
 
-It measures the machine and writes a capacity ceiling below what it found, leaving room for the kernel, Docker and your shell. It then generates tiers that fit **together** under that ceiling, because each tier reserves one slot before it advertises, and a catalogue whose tiers cannot all be served at once would leave some of them undiscoverable. It picks a runner image that is actually pullable, points the state directories somewhere writable, and describes both roles in one file.
+It measures the machine and writes a capacity ceiling below what it found, leaving room for the kernel, Docker and your shell. It then keeps every generated tier that fits **individually** under that ceiling. The definitions are alternatives: admitted jobs share the bounded capacity, and discovery turns rotate across the catalogue. It picks a runner image that is actually pullable, points the state directories somewhere writable, and describes both roles in one file.
 
 The App ids are `0` because the App does not exist yet; [creating the App](github-side.md) fills them in.
 

@@ -537,23 +537,27 @@ func TestLinuxTierWithMacOSInLabelIsNotCapped(t *testing.T) {
 	}
 }
 
-// Two individually-legal macOS tiers on one Mac still share one physical host.
+// CATALOGUE CEILINGS MAY OVERLAP. Three one-job definitions on a two-slot Mac
+// are legal alternatives; placement must count the leases that actually exist.
 func TestMacOSTiersShareTheHostLimit(t *testing.T) {
-	body := validConfig + macOSTier + `
-  - label: billet-12vcpu-macos-26
-    provider: tart
-    guest_os: macos
-    node: mac-mini-1
-    vcpu: 12
-    memory: 48GiB
-    image: macos-26
-`
-	_, err := Load(writeConfig(t, body))
-	if err == nil {
-		t.Fatal("two macOS tiers on one node totalling 4 guests were accepted")
+	body := validConfig
+	for _, label := range []string{"mac-a", "mac-b", "mac-c"} {
+		entry := strings.Replace(macOSTier, "billet-6vcpu-macos-26", label, 1)
+		body += strings.Replace(entry, "    image: macos-26\n",
+			"    image: macos-26\n    max_concurrent: 1\n", 1)
 	}
-	if !strings.Contains(err.Error(), "per Apple-branded host") {
-		t.Errorf("error should cite the per-host limit, got: %v", err)
+	cfg, err := Load(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("overlapping macOS catalogue: %v", err)
+	}
+	for _, label := range []string{"mac-a", "mac-b", "mac-c"} {
+		tr, ok := cfg.TierByLabel(label)
+		if !ok {
+			t.Fatalf("tier %s disappeared from the catalogue", label)
+		}
+		if tr.MaxConcurrent != 1 {
+			t.Errorf("tier %s has max_concurrent %d, want 1", label, tr.MaxConcurrent)
+		}
 	}
 }
 
@@ -963,9 +967,9 @@ func TestMacOSLimitContradictingAllowlistIsRejected(t *testing.T) {
 	}
 }
 
-// The per-host sum is what catches two individually-legal tiers overrunning one
-// Mac, and it must use that Mac's limit rather than the package default.
-func TestPerHostSumUsesTheNodeLimit(t *testing.T) {
+// Catalogue ceilings may overlap; placement counts actual guests on the host.
+// Each entry must still fit the host's own limit rather than the package default.
+func TestMacOSTiersMayShareAHostButEachMustRespectItsLimit(t *testing.T) {
 	second := `
   - label: billet-12vcpu-macos-26
     provider: tart
@@ -979,12 +983,21 @@ func TestPerHostSumUsesTheNodeLimit(t *testing.T) {
 	body := validConfig +
 		strings.Replace(macOSTier, "    image: macos-26\n", "    image: macos-26\n    max_concurrent: 1\n", 1) +
 		second + nodesSection("    macos_vm_limit: 1\n")
+	if _, err := Load(writeConfig(t, body)); err != nil {
+		t.Fatalf("two individually fitting tiers on one host were refused: %v", err)
+	}
+
+	body = validConfig +
+		strings.Replace(macOSTier, "    image: macos-26\n", "    image: macos-26\n    max_concurrent: 2\n", 1) +
+		nodesSection("    macos_vm_limit: 1\n")
 	_, err := Load(writeConfig(t, body))
 	if err == nil {
-		t.Fatal("two tiers of 1 guest each were accepted on a host limited to 1")
+		t.Fatal("one tier of 2 guests was accepted on a host limited to 1")
 	}
-	if !strings.Contains(err.Error(), "macos_vm_limit") {
-		t.Errorf("error should point at the operator's own field, got: %v", err)
+	for _, want := range []string{"max_concurrent must be between 1 and 1", `node "mac-mini-1"`, "macos_vm_limit"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error should contain %q, got: %v", want, err)
+		}
 	}
 }
 

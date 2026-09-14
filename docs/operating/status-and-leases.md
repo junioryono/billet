@@ -5,21 +5,26 @@ Every operator command reaches the ledger without taking the exclusive lock the 
 ## `billet status`
 
 ```text
-admission:  open
-controller: host-a (epoch 3)
-capacity:   12 of 64 vCPU, 48GiB of 256GiB, 3 open leases
-tiers:
-  billet-8vcpu-ubuntu-2404   firecracker,ec2   6 available   2 running
-  billet-macos-arm64         tart              1 available   1 running
-nodes:
-  epyc-1    firecracker   home        live   protocol 19   v0.5.2
-  mac-1     tart          (no site)   live   protocol 19   v0.5.2
-  ec2-usw2  ec2           us-west-2   live   protocol 19   v0.5.2   peak $2.14/h
+admission open
+capacity  2 of 8 vCPU, 8GiB of 32GiB, 1 open leases
+tier      billet-2vcpu
+          discovery 1, pending 0, launching 0, running 0, cleanup 0, unknown 0
+          reserved floor 0, additional headroom 0
+          advertisement last confirmed 1, sent 1, exchange confirmed (observed 2026-09-13T12:00:00.000000000Z)
+held      none
 ```
 
-In order: whether admission is open or sealed, and by whom; any force-destroy in progress; the rollout line, if one is running; which controller holds the deployment and its fencing epoch; capacity used against the deployment ceiling and the open leases; each tier's providers, what it advertises and what it is running; each node's provider, site, liveness, negotiated protocol version and release; the deployment-wide cost peak across cloud nodes; and any host whose compute proof is unproven or whose CodeBuild registration path was never swept.
+In order: whether admission is open or sealed, and by whom; any force-destroy in progress; the rollout line, if one is running; which controller holds the deployment and its fencing epoch; capacity used against the deployment ceiling and the open leases; each tier's capacity breakdown, grouped by GitHub target; the deployment-wide cost peak across cloud nodes; and the node inventory, protocol and compute-proof reports.
 
-`0 available` on a tier means billet is advertising nothing for it and GitHub has nothing to assign, usually because another tier's reservation holds the capacity. A host that is not live is one the control plane has not heard from within its silence window; its compute may still be running and its capacity stays charged.
+The tier counts are leases: **discovery** is escrow the listener still holds, including backing awaiting withdrawal; **pending** is an acquisition commitment or an assigned lease that has not entered launch; **launching** is compute being started; **running** is online or busy compute; **cleanup** is custody, teardown or quarantine; **unknown** is a capacity-phase lease absent from the listener's last ownership observation. The phase alone cannot separate discovery from pending, because acquiring a job does not change a capacity lease's ledger phase. Counts use only leases still open in the ledger, so an old listener observation cannot resurrect a released lease.
+
+**Reserved floor** is the configured operator guarantee, not an extra set of leases to add to those counts. **Additional headroom** is what the allocator could grant beyond every existing charge and protected floor; arbitration can still withhold that grant for another tier's turn. In the example, the node contributes only 2 vCPU and 8GiB, so the discovery hold leaves zero additional headroom even though the deployment ceiling is larger. `0 additional headroom` does not mean zero advertised capacity, and `held none` means no compute-cleanup holds, not no discovery holds.
+
+The advertisement is the listener's **last confirmed** completed exchange and its latest **sent** value, with the exchange state and observation time. During a lower-capacity poll, the sent value can be below the last confirmed value while backing remains charged. A failed exchange is **ambiguous** and retains the last confirmed value; the report cannot tell whether GitHub received the attempted value. A missing observation is **unknown**, never zero. These are dated observations, not a live read from GitHub; a stopped controller leaves its last observation behind. A host that is not live is one the control plane has not heard from within its silence window; its compute may still be running and its capacity stays charged.
+
+Discovery turns share one sorted round robin across every tier and GitHub target. Known unmet work has priority; equal-priority contenders take one new lease per completed backed exchange. A large contender keeps its turn while running work and outgoing discovery holds release enough room, so smaller jobs cannot continually consume the fragments. A yielded donor rejoins the end of discovery order. Explicit `reserved` floors still protect their configured room. A definition with no individually feasible placement under the current hosts and floors does not block the queue. This fleet-wide queue can leave unrelated hosts idle while the selected tier waits for its own placement or for an outgoing discovery hold to finish withdrawal.
+
+Withdrawal stops new escrow, finishes the outstanding poll and handles its assignments, sends the lower advertisement, then releases only genuinely held leases after that exchange and its message handling succeed. Acquiring and running leases are never donation candidates. The next turn waits for outgoing idle backing to be released before buying a placement, so an unused label cannot force queued work onto cloud fallback. Discovery at zero advertised capacity remains unmeasured, so the discovery slot is retained and rotated. Queued work always beats speculative discovery. Under perpetual saturation there is no capacity for undiscovered work either; idle discovery resumes when eligible known demand no longer needs the returning capacity.
 
 ## `billet leases`
 
