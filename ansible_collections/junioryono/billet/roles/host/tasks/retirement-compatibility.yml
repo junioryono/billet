@@ -110,7 +110,7 @@
   ansible.builtin.set_fact:
     billet_retirement_why: >-
       Retirement compatibility holds: {{ billet_retirement_installed.why }}
-      No identity path can be inferred from an installed configuration outside the supported subset.
+      The installed configuration establishes neither a controller identity path nor a node-only host.
   when:
     - billet_retirement_screen_clear | bool
     - billet_retirement_installed.config in ['malformed', 'unreadable']

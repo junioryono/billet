@@ -87,6 +87,10 @@ def retirement_config(text):
     except (yaml.YAMLError, ValueError, TypeError, RecursionError):
         return _unknown("malformed", "The installed configuration cannot be decoded as the supported YAML subset.")
     if "server" not in cfg:
+        if "node" not in cfg:
+            return _unknown("unreadable", "The installed configuration defines neither a server nor a node section.")
+        if not isinstance(cfg["node"], yaml.nodes.MappingNode):
+            return _unknown("unreadable", "The installed node must be a mapping.")
         return {"config": "present", "roles": "node", "identity_dir": ""}
     if not isinstance(cfg["server"], yaml.nodes.MappingNode):
         return _unknown("unreadable", "The installed server must be a mapping.")
@@ -107,15 +111,15 @@ def retirement_config(text):
     # Match internal/config/config.go applyStateDefaults: preserve identity_dir,
     # else inherit state_dir, including beside a non-null state block (semantic
     # validation later refuses that pairing). A state block invents no locator.
-    # Only without one do we use this caller's requested packaged fallback.
-    # Go's general defaultStateDir instead depends on os.UserConfigDir; the
-    # packaged path here is compatibility policy, not that account's default.
+    # Without either locator, Go's default depends on the running account,
+    # which this reader cannot know. Only a positively absent configuration
+    # uses the packaged path.
     if "identity_dir" in server:
         identity = server["identity_dir"].value
     elif "state_dir" in server:
         identity = server["state_dir"].value
     elif state_absent:
-        identity = _PACKAGED_IDENTITY_DIR
+        return _unknown("unreadable", "The installed server has no identity_dir or state_dir; Go's default depends on the running account (os.UserConfigDir(), falling back to .billet/server), so its locator is unknown.")
     else:
         return _unknown("unreadable", "The installed server.state supplies no default server.identity_dir or server.state_dir.")
     return {"config": "present", "roles": "server", "identity_dir": identity}

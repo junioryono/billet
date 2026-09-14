@@ -303,8 +303,9 @@ reason=$("$python" -c 'import json, sys; print(json.load(open(sys.argv[1]))["rou
 r_reported r7-caller-unknown-state hold "$reason"
 
 # Package seeds locate before semantic validation. Outside-subset content
-# holds even beside a clean path; a state block never supplies a default.
-for shape in merged cyclic false sequence null integer malformed duplicate state-no-locator default seeded; do
+# holds even beside a clean path; an account-dependent default is unknown.
+# A missing server establishes node-only only beside a node mapping.
+for shape in merged cyclic false sequence null integer malformed duplicate state-no-locator default null-state-default empty-mapping null-node node-only seeded; do
   name=r8-config-$shape
   r_plant "$name" v0.10.1
   p "$name" 'mkdir -p /etc/billet'
@@ -319,10 +320,14 @@ for shape in merged cyclic false sequence null integer malformed duplicate state
     duplicate) p "$name" 'printf "server: {identity_dir: /var/lib/billet/first, identity_dir: /var/lib/billet/second}\n" >/etc/billet/billet.yaml' ;;
     state-no-locator) p "$name" 'printf "server: {state: {}}\n" >/etc/billet/billet.yaml' ;;
     default) p "$name" 'mkdir -p /var/lib/billet/server; printf "server: {}\n" >/etc/billet/billet.yaml' ;;
+    null-state-default) p "$name" 'printf "server: {state: ~}\n" >/etc/billet/billet.yaml' ;;
+    empty-mapping) p "$name" 'printf "{}\n" >/etc/billet/billet.yaml' ;;
+    null-node) p "$name" 'printf "node: ~\n" >/etc/billet/billet.yaml' ;;
+    node-only) p "$name" 'printf "node: {name: x}\n" >/etc/billet/billet.yaml' ;;
     seeded) p "$name" 'mkdir -p /var/lib/billet/server; printf "server: {state_dir: /var/lib/billet/server, max_vcpu: 0}\n" >/etc/billet/billet.yaml' ;;
   esac
   r_run "$name"
-  if [ "$shape" = seeded ] || [ "$shape" = default ]; then
+  if [ "$shape" = seeded ] || [ "$shape" = node-only ]; then
     expect_allowed "$name"
     expect_play_task_ran "$name" 'Ordinary convergence sentinel'
   else
@@ -333,6 +338,9 @@ for shape in merged cyclic false sequence null integer malformed duplicate state
       false|sequence|null|integer) expect_final "$name" 'server.identity_dir must be a non-empty string scalar' ;;
       duplicate) expect_final "$name" "duplicate key 'identity_dir'" ;;
       state-no-locator) expect_final "$name" 'server.state supplies no default' ;;
+      default|null-state-default) expect_final "$name" "Go's default depends on the running account" ;;
+      empty-mapping) expect_final "$name" 'defines neither a server nor a node section' ;;
+      null-node) expect_final "$name" 'node must be a mapping' ;;
       malformed) expect_final "$name" 'installed configuration cannot be decoded as the supported YAML subset' ;;
     esac
     expect_no_ordinary "$name"
