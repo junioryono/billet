@@ -414,7 +414,7 @@ for kind in below-floor unreadable absent; do
         for shape in node fresh; do
           name=r8-$kind-$policy-$requested-$mode-$shape
           if [ "$kind" = below-floor ]; then r_plant "$name" v0.10.1; else r_plant "$name"; fi
-          a "$name" -e "billet_enable_server=$policy" -e "billet_server_retire=$requested"
+          a "$name" -e "{\"billet_enable_server\": $policy}" -e "billet_server_retire=$requested"
           case "$kind" in
             unreadable) a "$name" -e '{"billet_gate_version":{"type":"unreadable"}}' ;;
             absent) p "$name" 'rm /usr/bin/billet' ;;
@@ -933,7 +933,7 @@ PY
   ep_plant_config "$name" 127.0.0.1:7717 server-only
   a "$name" -e billet_converge_guard_holder=ci-1 -e billet_gate_new=true -e billet_gate_peer=true \
     -e billet_retirement_survivor_host=control-b \
-    -e billet_service_user=root -e billet_service_group=root -e billet_adopt_existing_service_account=true
+    -e billet_service_user=root -e billet_service_group=root -e '{"billet_adopt_existing_service_account": true}'
   cat >"$work/cases/$name/inventory.yml" <<'INV'
 all:
   hosts:
