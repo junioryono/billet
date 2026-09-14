@@ -1434,6 +1434,11 @@ func (l *Listener) Run(ctx context.Context) error {
 					"error", poison)
 				poisonMessageID = 0
 				poisonRefusals = 0
+				// A QUARANTINED MESSAGE IS A HANDLED EXCHANGE, and ends its turn as
+				// every other handled exchange does. Skipping this let a stream of
+				// poisoned messages hold the shared admission turn indefinitely,
+				// refusing every waiting tier's purchase.
+				l.finishAdmissionTurn(admissionTurn)
 
 				continue
 			}

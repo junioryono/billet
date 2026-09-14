@@ -664,6 +664,80 @@ func TestARefusedPoolLaunchReturnsItsTurnBeforeTheNextOffer(t *testing.T) {
 	}
 }
 
+// QUARANTINING A POISONED COMPLETION RETURNS ITS GRANTED WORK TURN. Otherwise
+// repeated poison keeps the grant forever and starves every waiting tier.
+func TestQuarantiningAPoisonedCompletionReturnsItsGrantedWorkTurn(t *testing.T) {
+	_, listeners := arbitrationListeners(t, []config.Tier{tier("a"), tier("b")}, tierVCPU)
+	first, second := listeners[0], listeners[1]
+	for _, l := range listeners {
+		l.observed = &Statistics{TotalAvailableJobs: 1}
+		l.observeDemand(l.observed)
+	}
+	for _, l := range listeners {
+		if err := l.prepareEscrow(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	advertised, turn := first.admissionPoll()
+	arbiter := first.arbiter
+	arbiter.mu.Lock()
+	work := arbiter.work
+	arbiter.mu.Unlock()
+	if advertised != 1 || turn == 0 || !work || second.capacity() != 0 {
+		t.Fatalf("fixture has advertisement %d, turn %d, work %t, peer capacity %d; want A's granted work turn with B waiting",
+			advertised, turn, work, second.capacity())
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+	deliveries := 0
+	var acked []int64
+	checked := false
+	session := &fakeSession{stats: first.observed}
+	first.session = session
+	session.onPoll = func(int) {
+		if deliveries < poisonQuarantineAfter {
+			_, current := first.admissionPoll()
+			if current != turn {
+				t.Errorf("before poison delivery %d, granted turn %d became %d",
+					deliveries+1, turn, current)
+			}
+			return
+		}
+		// Observe before cancellation or an empty exchange can return the turn.
+		arbiter.mu.Lock()
+		owner, generation, granted := arbiter.owner, arbiter.generation, arbiter.granted
+		arbiter.mu.Unlock()
+		if owner != second.tier || generation <= turn || granted {
+			t.Errorf("quarantine left owner %q, generation %d, granted %t; want B's ungranted turn after A's generation %d",
+				owner, generation, granted, turn)
+		}
+		checked = true
+		cancel()
+	}
+	session.onGet = func() (*Message, error) {
+		deliveries++
+		return &Message{MessageID: 42, Completed: []Job{{
+			RunnerName: "not-a-billet-runner", Result: "succeeded",
+		}}}, nil
+	}
+	session.onDelete = func(id int64) error {
+		acked = append(acked, id)
+		if deliveries != poisonQuarantineAfter {
+			t.Errorf("acknowledged message %d after %d deliveries, want %d",
+				id, deliveries, poisonQuarantineAfter)
+		}
+		return nil
+	}
+	if err := first.Run(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run = %v, want cancellation after quarantine", err)
+	}
+	if !checked || deliveries != poisonQuarantineAfter || !slices.Equal(acked, []int64{42}) || first.lastMessageID != 42 {
+		t.Fatalf("checked %t, deliveries %d, acknowledgements %v, cursor %d; want one quarantine after %d deliveries",
+			checked, deliveries, acked, first.lastMessageID, poisonQuarantineAfter)
+	}
+}
+
 // RETURNING A CONSUMED TURN DOES NOT RELEASE ITS LEASE OR SPEND ITS SUCCESSOR.
 // Running compute and custody remain charged; only a conclusive refusal frees
 // the old placement. Every outcome gives the next known contender its turn.
