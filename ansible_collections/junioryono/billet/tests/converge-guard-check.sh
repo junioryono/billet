@@ -941,12 +941,12 @@ failed_at() {
   awk '/^TASK \[/ { t=$0; sub(/^TASK \[/, "", t); sub(/\] \*+$/, "", t); sub(/^junioryono\.billet\.host : /, "", t) }
        /^(fatal|failed): / { print t; exit }' "$work/cases/$1/out"
 }
-# Keep the whole final fatal task, including every host's result, so the
-# decoder can refuse duplicates instead of silently choosing the last host.
+# Keep the whole final failure task, including item/unreachable records and
+# retry/async notices, so the decoder can refuse duplicates or unknown forms.
 final_fatal() {
   awk '/^(TASK \[|PLAY \[|PLAY RECAP)/ { if (fatal) final = buf; buf = ""; fatal = 0 }
        { buf = buf $0 "\n" }
-       /^(fatal|failed): / { fatal = 1 }
+       /^(fatal:|failed:|FAILED - RETRYING:|ASYNC FAILED on )/ { fatal = 1 }
        END { if (fatal) final = buf; printf "%s", final }' "$work/cases/$1/out"
 }
 expect_refused() { # case task fragment...
