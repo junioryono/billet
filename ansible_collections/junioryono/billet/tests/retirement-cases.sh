@@ -6,7 +6,7 @@
 cat >"$work/play-retirement.yml" <<'PLAY'
 ---
 - name: Exercise the retirement entry after real preparation
-  hosts: control-a
+  hosts: "{{ billet_gate_retirement_host | default('control-a') }}"
   gather_facts: false
   vars:
     billet_exclusion_platform: Linux
@@ -52,7 +52,7 @@ cat >"$work/play-retirement.yml" <<'PLAY'
         - billet_gate_legacy_answerer != 'verified'
     - name: Inject a claim change after preparation
       ansible.builtin.command:
-        argv: [/bin/sh, -c, 'rm -f /var/lib/billet/upgrades/active/guard.json']
+        argv: [/bin/sh, -ec, 'test -f /var/lib/billet/upgrades/active/guard.json && rm /var/lib/billet/upgrades/active/guard.json']
       when: billet_gate_abnormal | default(false) | bool
       changed_when: true
     - name: Inject an invalid typed version after preparation
@@ -111,7 +111,7 @@ r_plant() { # case [version]
 r_answers() { e "$1" "BILLET_GATE_RETIRE_ANSWERS=$2"; }
 r_run() {
   ns_case "$1" escalated "${2:-play-retirement}"
-  "$python" - "$work/cases/$1/calls/index.jsonl" "$work/cases/$1/args" <<'PYARGS'
+  "$python" - "$work/cases/$1/calls/index.jsonl" "$work/cases/$1/args" "${3:-control-a}" <<'PYARGS'
 import json, pathlib, sys
 check = '--check' in pathlib.Path(sys.argv[2]).read_text().splitlines()
 for line in open(sys.argv[1]):
@@ -121,17 +121,17 @@ for line in open(sys.argv[1]):
     args = call['argv']
     if args[:2] != ['server', 'retire'] or '--dry-run' not in args or '--json' not in args:
         sys.exit('the classifier was not called in dry-run JSON mode')
-    if args[args.index('--retiring-host') + 1] != 'control-a' or args[args.index('--config') + 1] != '/etc/billet/billet.yaml':
+    if args[args.index('--retiring-host') + 1] != sys.argv[3] or args[args.index('--config') + 1] != '/etc/billet/billet.yaml':
         sys.exit('the classifier did not bind its executing host and configuration')
     if check and ('--expected-holder' in args or '--expected-guard' in args):
         sys.exit('a check-mode classifier was given an invented held guard')
 PYARGS
 }
-r_held() { # case route [first-failure-task]
+r_held() { # case route [first-failure-task [host]]
   expect_refused "$1" "${3:-Refuse a held or unavailable retirement route}" "Retirement holds this host ($2)"
   expect_no_ordinary "$1"
   expect_no_play_task "$1" 'Ordinary convergence sentinel'
-  expect_host_commands "$1" 'control-a retire-classify 1;'
+  expect_host_commands "$1" "${4:-control-a} retire-classify 1;"
   expect_no_task "$1" 'Inspect the transaction claim before recovery'
 }
 r_reported() { # case route [reason]
@@ -195,8 +195,8 @@ expect_host_commands r1-ordinary 'control-a retire-classify 1;'
 expect_no_task r1-ordinary 'Inspect the transaction claim before recovery'
 
 # R3: the existing journal wins even beside unreadable or disagreeing rows.
-# Only intent-phase classifiers exist in the corpus; later phases are a gap.
-for fixture in dry-run-continue dry-run-unknown-ledger dry-run-unknown-journal; do
+# Later phases still collect only this host, including past the archive.
+for fixture in dry-run-continue dry-run-unknown-ledger dry-run-unknown-journal dry-run-continue-stopped dry-run-continue-archived; do
   name=r3-$fixture
   r_plant "$name"
   r_answers "$name" "control-a:classify:1:$fixture.json:0;control-a:request:1:retired-settled.json:0"
@@ -211,19 +211,56 @@ for fixture in dry-run-continue dry-run-unknown-ledger dry-run-unknown-journal; 
   expect_no_task "$name" 'Inspect the transaction claim before recovery'
 done
 
-# R4/R5: the command's settled shortcut and a locally done pending obligation.
-for spec in r4-settled:done-unchanged r5-pending:retired-pending; do
-  name=${spec%%:*}; answer=${spec#*:}
+# Judge the task's own changed result, not preparation's recap. The settled
+# controls must report ok; a republished status must report changed even when
+# the outcome word is unchanged. Also require the final settlement message.
+r_done_report() { # case True|False ok|changed
+  "$python" - "$work/cases/$1/out" "$2" "$3" <<'PYDONE'
+import json, pathlib, sys
+text = pathlib.Path(sys.argv[1]).read_text()
+def block(task):
+    parts = text.split('TASK [junioryono.billet.host : ' + task + ']')
+    if len(parts) != 2:
+        sys.exit('the done task did not appear exactly once: ' + task)
+    return parts[1].split('TASK [', 1)[0]
+result = block("Record the continuation's result and changes")
+verdicts = [line.split(':', 1)[0] for line in result.splitlines()
+            if line.startswith(('ok:', 'changed:', 'fatal:', 'failed:', 'skipping:'))]
+if verdicts != [sys.argv[3]]:
+    sys.exit('the done change report differs: ' + repr(verdicts))
+report = block("Report the retirement's settlement or remaining obligation")
+messages = [json.loads(line.strip().removeprefix('"msg": ').removesuffix(','))
+            for line in report.splitlines() if line.strip().startswith('"msg": ')]
+if len(messages) != 1 or not messages[0].startswith('Retirement is locally done; settled=' + sys.argv[2] + '.'):
+    sys.exit('the done settlement report differs: ' + repr(messages))
+PYDONE
+}
+
+# R4/R5: done observations reach both settlement paths. An absent status on
+# the settled journal is repaired; an already closed status stays unchanged.
+for spec in r4-settled:dry-run-continue:done-unchanged r5-pending:dry-run-continue:retired-pending r4-done-settled:dry-run-continue-done-settled:done-unchanged-republished r4-closed-status:dry-run-settled-closed-status:done-unchanged r5-done-unsettled:dry-run-continue-done-unsettled:retired-pending; do
+  name=${spec%%:*}; rest=${spec#*:}; fixture=${rest%%:*}; answer=${rest#*:}
   r_plant "$name"
-  r_answers "$name" "control-a:classify:1:dry-run-continue.json:0;control-a:request:1:$answer.json:0"
+  r_answers "$name" "control-a:classify:1:$fixture.json:0;control-a:request:1:$answer.json:0"
   r_run "$name"
   expect_allowed "$name"
   expect_no_ordinary "$name"
   expect_no_play_task "$name" 'Ordinary convergence sentinel'
   expect_host_commands "$name" 'control-a retire-classify 1;control-a retire-request 1;'
   r_continuation "$name" 1
-  if [ "$name" = r5-pending ]; then
+  r_reported "$name" continue
+  expect_no_task "$name" 'Inspect the transaction claim before recovery'
+  if [ "$answer" = retired-pending ]; then
+    r_done_report "$name" False changed
     expect_ran "$name" "Report a row obligation whose survivor this converge did not prepare"
+    expect_no_task "$name" 'Complete the row on the recorded survivor'
+  else
+    if [ "$answer" = done-unchanged-republished ]; then
+      r_done_report "$name" True changed
+    else
+      r_done_report "$name" True ok
+    fi
+    expect_no_task "$name" "Report a row obligation whose survivor this converge did not prepare"
     expect_no_task "$name" 'Complete the row on the recorded survivor'
   fi
 done
@@ -448,6 +485,56 @@ r_answers r10-installed-both 'control-a:classify:1:dry-run-unsupported-variant.j
 r_run r10-installed-both
 r_held r10-installed-both unsupported-variant
 
+# R10: a retained node in the journal refuses at every supported phase.
+for phase in intent archived done; do
+  name=r10-journal-$phase
+  r_plant "$name"
+  r_answers "$name" "control-a:classify:1:dry-run-unsupported-variant-$phase.json:0"
+  r_run "$name"
+  r_held "$name" unsupported-variant
+  r_reported "$name" unsupported-variant 'the journal records a retained-node retirement'
+done
+
+# R11: each unexplained artefact keeps ordinary work and mutations closed.
+for kind in status stage; do
+  name=r11-$kind-only
+  r_plant "$name"
+  r_answers "$name" "control-a:classify:1:dry-run-hold-$kind-only.json:0"
+  r_run "$name"
+  r_held "$name" hold
+  reason=$("$python" -c 'import json, sys; print(json.load(open(sys.argv[1]))["route_why"])' "$work/retire-fixtures/dry-run-hold-$kind-only.json")
+  r_reported "$name" hold "$reason"
+done
+
+# R14: control-b sees control-a's row; dispatch still says refused.
+for requested in false true; do
+  name=r14-other-host-row-$requested
+  fixture=dry-run-other-host-row
+  if [ "$requested" = true ]; then fixture=$fixture-requested; fi
+  r_plant "$name"
+  a "$name" -e "billet_server_retire=$requested" -e billet_gate_retirement_host=control-b
+  r_answers "$name" "control-b:classify:1:$fixture.json:0"
+  r_run "$name" play-retirement control-b
+  if [ "$requested" = true ]; then
+    r_held "$name" hold 'Refuse a held or unavailable retirement route' control-b
+    r_reported "$name" hold "this deployment's retirement row belongs to another host (control-a)"
+  else
+    expect_allowed "$name"
+    r_reported "$name" ordinary
+    expect_play_task_ran "$name" 'Ordinary convergence sentinel'
+    expect_host_commands "$name" 'control-b retire-classify 1;'
+    expect_no_ordinary "$name"
+    expect_no_task "$name" 'Inspect the transaction claim before recovery'
+  fi
+  "$python" - "$work/cases/$name/calls/index.jsonl" "$requested" <<'PYREQUESTED'
+import json, sys
+calls = [json.loads(line) for line in open(sys.argv[1])]
+classifiers = [call for call in calls if call['command'] == 'retire-classify']
+if len(classifiers) != 1 or ('--requested' in classifiers[0]['argv']) != (sys.argv[2] == 'true'):
+    sys.exit('the classifier did not receive the inventory request flag exactly')
+PYREQUESTED
+done
+
 # R11's unexplained marker and R15's two unreadable-row holds, requested or not.
 for fixture in dry-run-adopt dry-run-hold-unreadable-row dry-run-hold-damaged-identity; do
   for requested in false true; do
@@ -460,8 +547,35 @@ for fixture in dry-run-adopt dry-run-hold-unreadable-row dry-run-hold-damaged-id
   done
 done
 
-# R18 needs a producer fixture over an abnormal claim. dry-run-adopt is an
-# unexplained marker, not that observation, so it is not substituted for one.
+# R15: both unreadable-row exceptions admit the ordinary boundary. Neither
+# exception has a requested classifier fixture; keep that gap in the notes.
+for kind in node-only-unreadable-row never-commissioned; do
+  name=r15-ordinary-$kind
+  r_plant "$name"
+  a "$name" -e billet_server_retire=false
+  r_answers "$name" "control-a:classify:1:dry-run-ordinary-$kind.json:0"
+  r_run "$name"
+  expect_allowed "$name"
+  r_reported "$name" ordinary
+  expect_play_task_ran "$name" 'Ordinary convergence sentinel'
+  expect_host_commands "$name" 'control-a retire-classify 1;'
+  expect_no_ordinary "$name"
+  expect_no_task "$name" 'Inspect the transaction claim before recovery'
+done
+
+# R18: the existing post-preparation injection removes the published record.
+# Reaching the classifier and preserving its reason excludes a preparation
+# refusal or a parser failure masquerading as the expected hold.
+r_plant r18-abnormal-claim
+a r18-abnormal-claim -e billet_gate_abnormal=true
+r_answers r18-abnormal-claim 'control-a:classify:1:dry-run-hold-abnormal-claim.json:0'
+r_run r18-abnormal-claim
+expect_play_task_ran r18-abnormal-claim 'Inject a claim change after preparation'
+expect_state r18-abnormal-claim active dir
+expect_state r18-abnormal-claim record absent
+expect_ran r18-abnormal-claim 'Ask the retirement classifier'
+r_held r18-abnormal-claim hold
+r_reported r18-abnormal-claim hold "the guard's claim is unpublished-guard; its ownership could not be established"
 
 # R21: the real recovery tasks own every prerequisite refusal. The fake
 # classifier admits only the route; the durable manifest drives the recovery.
