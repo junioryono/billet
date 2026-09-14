@@ -2,7 +2,6 @@
 # Sourced by section R after its namespace runner and committed corpus exist.
 # The isolated entry proves routing; the boundary invokes the real main.yml.
 "$python" "$here/executable_version_check.py"
-"$python" "$here/retirement_config_check.py"
 
 cat >"$work/play-retirement.yml" <<'PLAY'
 ---
@@ -27,10 +26,6 @@ cat >"$work/play-retirement.yml" <<'PLAY'
       ansible.builtin.set_fact:
         billet_exclusion_answerer_version: "{{ billet_gate_version }}"
       when: billet_gate_version is defined
-    - name: Select the retirement compatibility platform after preparation
-      ansible.builtin.set_fact:
-        billet_exclusion_platform: "{{ billet_gate_retirement_platform }}"
-      when: billet_gate_retirement_platform is defined
     # The two inventory transports share this namespace's real prepared guard.
     # Publish that observation on the survivor for the fake row helper; fleet
     # preparation across separate hosts is the fleet playbook's gate.
@@ -73,40 +68,8 @@ cat >"$work/play-retirement-main.yml" <<'PLAY'
     - junioryono.billet.host
 PLAY
 
-# The existing service fake returns only requested properties, without judging
-# admission. This map adds no installed unit files to the namespace.
-r_compat_unit() { # case state
-  mkdir -p "$work/cases/$1/services"
-  "$python" - "$work/cases/$1/services/control-a.json" "$2" <<'PYUNIT'
-import json, sys
-unit = dict(LoadState='loaded', UnitFileState='disabled', ActiveState='inactive', MainPID='0')
-state = sys.argv[2]
-if state == 'not-found':
-    unit.update(LoadState='not-found', UnitFileState='')
-elif state == 'masked':
-    unit.update(LoadState='masked', UnitFileState='masked')
-elif state == 'enabled':
-    unit['UnitFileState'] = 'enabled'
-elif state == 'active':
-    unit['ActiveState'] = 'active'
-elif state == 'live':
-    unit.update(UnitFileState='enabled', ActiveState='active', MainPID='42')
-elif state == 'pid':
-    unit['MainPID'] = '42'
-elif state == 'unreadable':
-    del unit['MainPID']  # The fake exits nonzero after returning partial output.
-elif state.startswith('unknown-'):
-    unit[state.removeprefix('unknown-')] = 'invented'
-elif state != 'disabled':
-    sys.exit('unknown compatibility service case: ' + state)
-with open(sys.argv[1], 'w') as stream:
-    json.dump({'billet-server.service': unit}, stream)
-PYUNIT
-  e "$1" "BILLET_GATE_SERVICES=$work/cases/$1/services"
-}
 r_plant() { # case [version]
   plant "$1"
-  r_compat_unit "$1" not-found
   p "$1" "plant_root; plant_managed ${2:-v0.11.0}"
   a "$1" -e billet_binary_src=
   e "$1" BILLET_GATE_RETIRE_ENV_SET=1
@@ -271,128 +234,47 @@ if any(r['host'] != 'control-a' and r['command'] != 'retire-complete' for r in r
     sys.exit('a pending continuation collected the survivor fleet')
 PYTAIL
 
-# R8: v0.10.1 is a maintenance release WITHOUT the classifier. Both desired
-# policies beside controller, unknown, node-only and never-commissioned evidence.
-# A skipped classifier is asserted as skipped, even though the backing build
-# has the current code and could answer if the floor incorrectly admitted it.
-for policy in true false; do
-  for shape in controller unknown node fresh; do
+# R8: all incapable or absent answerers hold, independent of desired policy,
+# requested retirement, installed node-only bytes or a fresh-host shape.
+# v0.10.1 is explicitly below the complete-classifier floor, v0.11.0.
+# Check mode reports the same hold and succeeds, without ordinary work.
+for kind in below-floor unreadable absent; do
+  for policy in true false; do
     for requested in false true; do
-      name=r8-$shape-$policy-$requested
-      r_plant "$name" v0.10.1
-      a "$name" -e "billet_enable_server=$policy" -e "billet_server_retire=$requested"
-      case "$shape" in
-        controller) p "$name" 'mkdir -p /etc/billet /var/lib/billet/server; printf "server:\n  state_dir: /var/lib/billet/server\n" >/etc/billet/billet.yaml; printf minted >/var/lib/billet/server/deployment-id' ;;
-        unknown) p "$name" 'mkdir -p /etc/billet; ln -s /missing/config /etc/billet/billet.yaml' ;;
-        node) p "$name" 'mkdir -p /etc/billet; printf "node:\n  server_addr: control-b:7717\n" >/etc/billet/billet.yaml' ;;
-        fresh) p "$name" 'mkdir -p /var/lib/billet/server' ;;
-      esac
-      r_run "$name"
-      if [ "$requested" = false ] && { [ "$shape" = node ] || [ "$shape" = fresh ]; }; then
-        expect_allowed "$name"
-        expect_play_task_ran "$name" 'Ordinary convergence sentinel'
-      else
-        expect_refused "$name" 'Refuse a held or unavailable retirement route' 'Retirement holds this host (hold)'
-        if [ "$requested" = true ]; then expect_final "$name" '--requested retirement requires a capable answerer'; fi
-        expect_no_ordinary "$name"
-        expect_no_play_task "$name" 'Ordinary convergence sentinel'
-      fi
-      expect_host_commands "$name" ''
-      expect_no_task "$name" 'Ask the retirement classifier'
+      for mode in normal check; do
+        for shape in node fresh; do
+          name=r8-$kind-$policy-$requested-$mode-$shape
+          if [ "$kind" = below-floor ]; then r_plant "$name" v0.10.1; else r_plant "$name"; fi
+          a "$name" -e "billet_enable_server=$policy" -e "billet_server_retire=$requested"
+          case "$kind" in
+            unreadable) a "$name" -e '{"billet_gate_version":{"type":"unreadable"}}' ;;
+            absent) p "$name" 'rm /usr/bin/billet' ;;
+          esac
+          case "$shape" in
+            node) p "$name" 'mkdir -p /etc/billet; printf "node: {name: x}\n" >/etc/billet/billet.yaml' ;;
+            fresh) p "$name" 'mkdir -p /var/lib/billet/server' ;;
+          esac
+          if [ "$mode" = check ]; then a "$name" --check; fi
+          r_run "$name"
+          if [ "$mode" = check ]; then
+            expect_allowed "$name"
+          else
+            expect_refused "$name" 'Refuse a held or unavailable retirement route' 'Retirement holds this host (hold)'
+          fi
+          r_reported "$name" hold 'This collection needs billet at or above v0.11.0 on the host'
+          r_reported "$name" hold 'upgrade the managed binary or converge with an older collection'
+          if [ "$requested" = true ]; then
+            r_reported "$name" hold '--requested retirement is refused without a capable answerer'
+          fi
+          expect_no_ordinary "$name"
+          expect_no_play_task "$name" 'Ordinary convergence sentinel'
+          expect_host_commands "$name" ''
+          expect_no_task "$name" 'Ask the retirement classifier'
+          expect_no_task "$name" 'Inspect the transaction claim before recovery'
+        done
+      done
     done
   done
-done
-
-# Neither a clean node configuration nor a never-commissioned observation
-# grants permission while the manager cannot positively exclude a controller.
-# The unknown note field is rejected by Go's KnownFields decoder; Python is
-# deliberately allowed to extract its locator as a hint only.
-for shape in node fresh seeded unknown-field; do
-  for unit in not-found disabled enabled active unreadable; do
-    name=r8-unit-$shape-$unit
-    r_plant "$name" v0.10.1
-    r_compat_unit "$name" "$unit"
-    p "$name" 'mkdir -p /etc/billet /var/lib/billet/server'
-    case "$shape" in
-      node) p "$name" 'printf "node: {name: x}\n" >/etc/billet/billet.yaml' ;;
-      seeded) p "$name" 'printf "server: {state_dir: /var/lib/billet/server, max_vcpu: 0}\n" >/etc/billet/billet.yaml' ;;
-      unknown-field) p "$name" 'printf "note: \"&anchor *alias << !tag\"\nserver: {identity_dir: /var/lib/billet/server}\n" >/etc/billet/billet.yaml' ;;
-    esac
-    r_run "$name"
-    expect_calls "$name" systemctl 'show billet-server.service --property=LoadState,UnitFileState,ActiveState,MainPID' 1
-    expect_host_commands "$name" ''
-    expect_no_task "$name" 'Ask the retirement classifier'
-    case "$unit" in
-      not-found|disabled)
-        expect_allowed "$name"
-        expect_play_task_ran "$name" 'Ordinary convergence sentinel'
-        r_reported "$name" ordinary 'the service manager proved no controller runs here' ;;
-      *)
-        expect_refused "$name" 'Refuse a held or unavailable retirement route' 'Retirement holds this host (hold)'
-        if [ "$unit" = unreadable ]; then
-          expect_final "$name" 'systemctl show read failed or was unreadable'
-        else
-          expect_final "$name" 'billet-server.service does not prove no controller'
-        fi
-        expect_no_ordinary "$name"
-        expect_no_play_task "$name" 'Ordinary convergence sentinel' ;;
-    esac
-  done
-done
-
-# Isolate each property, and include a live enabled controller beside clean
-# node-only bytes. Its service state vetoes any installed-byte interpretation.
-for unit in masked pid live unknown-LoadState unknown-UnitFileState unknown-ActiveState unknown-MainPID; do
-  name=r8-unit-node-$unit
-  r_plant "$name" v0.10.1
-  r_compat_unit "$name" "$unit"
-  p "$name" 'mkdir -p /etc/billet; printf "node: {name: x}\n" >/etc/billet/billet.yaml'
-  r_run "$name"
-  expect_calls "$name" systemctl 'show billet-server.service --property=LoadState,UnitFileState,ActiveState,MainPID' 1
-  expect_host_commands "$name" ''
-  if [ "$unit" = masked ]; then
-    expect_allowed "$name"
-    expect_play_task_ran "$name" 'Ordinary convergence sentinel'
-  else
-    expect_refused "$name" 'Refuse a held or unavailable retirement route' 'billet-server.service does not prove no controller'
-    expect_no_ordinary "$name"
-    expect_no_play_task "$name" 'Ordinary convergence sentinel'
-  fi
-done
-
-for shape in node fresh; do
-  name=r8-unit-$shape-darwin
-  r_plant "$name" v0.10.1
-  a "$name" -e billet_gate_retirement_platform=Darwin
-  if [ "$shape" = node ]; then
-    p "$name" 'mkdir -p /etc/billet; printf "node: {name: x}\n" >/etc/billet/billet.yaml'
-  fi
-  r_run "$name"
-  expect_refused "$name" 'Refuse a held or unavailable retirement route' 'retirement is Linux-only'
-  expect_calls "$name" systemctl 'show billet-server.service --property=LoadState,UnitFileState,ActiveState,MainPID' 0
-  expect_host_commands "$name" ''
-  expect_no_ordinary "$name"
-  expect_no_play_task "$name" 'Ordinary convergence sentinel'
-done
-
-for unit in disabled active; do
-  name=r9-unit-node-$unit
-  r_plant "$name" v0.10.1
-  r_compat_unit "$name" "$unit"
-  a "$name" --check
-  p "$name" 'mkdir -p /etc/billet; printf "node: {name: x}\n" >/etc/billet/billet.yaml'
-  r_run "$name"
-  expect_allowed "$name"
-  expect_calls "$name" systemctl 'show billet-server.service --property=LoadState,UnitFileState,ActiveState,MainPID' 1
-  expect_host_commands "$name" ''
-  if [ "$unit" = disabled ]; then
-    r_reported "$name" ordinary
-    expect_play_task_ran "$name" 'Ordinary convergence sentinel'
-  else
-    r_reported "$name" hold 'billet-server.service does not prove no controller'
-    expect_no_ordinary "$name"
-    expect_no_play_task "$name" 'Ordinary convergence sentinel'
-  fi
 done
 
 # An unknown route must traverse the caller's rescue and ordinary boundary,
@@ -430,115 +312,8 @@ r_held r7-caller-unknown-state hold
 reason=$("$python" -c 'import json, sys; print(json.load(open(sys.argv[1]))["route_why"])' "$work/cases/r7-caller-unknown-state/unknown-state.json")
 r_reported r7-caller-unknown-state hold "$reason"
 
-# Package seeds locate before semantic validation. Outside-subset content
-# holds even beside a clean path; an account-dependent default is unknown.
-# A missing server gives a node-only hint only beside a node mapping.
-for shape in merged cyclic false sequence null integer malformed duplicate state-no-locator default null-state-default empty-mapping null-node node-only seeded; do
-  name=r8-config-$shape
-  r_plant "$name" v0.10.1
-  p "$name" 'mkdir -p /etc/billet'
-  case "$shape" in
-    merged) p "$name" 'mkdir -p /var/lib/billet/custom; printf minted >/var/lib/billet/custom/deployment-id; printf "server: {<<: {}, identity_dir: /var/lib/billet/custom}\n" >/etc/billet/billet.yaml' ;;
-    cyclic) p "$name" 'printf "server: &s {<<: *s, identity_dir: /srv/clean}\n" >/etc/billet/billet.yaml' ;;
-    false) p "$name" 'printf "server: {identity_dir: false, state_dir: /srv/clean}\n" >/etc/billet/billet.yaml' ;;
-    sequence) p "$name" 'printf "server: {identity_dir: [], state_dir: /srv/clean}\n" >/etc/billet/billet.yaml' ;;
-    null) p "$name" 'printf "server: {identity_dir: ~, state_dir: /srv/clean}\n" >/etc/billet/billet.yaml' ;;
-    integer) p "$name" 'printf "server: {identity_dir: 5, state_dir: /srv/clean}\n" >/etc/billet/billet.yaml' ;;
-    malformed) p "$name" 'printf "server: [\n" >/etc/billet/billet.yaml' ;;
-    duplicate) p "$name" 'printf "server: {identity_dir: /var/lib/billet/first, identity_dir: /var/lib/billet/second}\n" >/etc/billet/billet.yaml' ;;
-    state-no-locator) p "$name" 'printf "server: {state: {}}\n" >/etc/billet/billet.yaml' ;;
-    default) p "$name" 'mkdir -p /var/lib/billet/server; printf "server: {}\n" >/etc/billet/billet.yaml' ;;
-    null-state-default) p "$name" 'printf "server: {state: ~}\n" >/etc/billet/billet.yaml' ;;
-    empty-mapping) p "$name" 'printf "{}\n" >/etc/billet/billet.yaml' ;;
-    null-node) p "$name" 'printf "node: ~\n" >/etc/billet/billet.yaml' ;;
-    node-only) p "$name" 'printf "node: {name: x}\n" >/etc/billet/billet.yaml' ;;
-    seeded) p "$name" 'mkdir -p /var/lib/billet/server; printf "server: {state_dir: /var/lib/billet/server, max_vcpu: 0}\n" >/etc/billet/billet.yaml' ;;
-  esac
-  r_run "$name"
-  if [ "$shape" = seeded ] || [ "$shape" = node-only ]; then
-    expect_allowed "$name"
-    expect_play_task_ran "$name" 'Ordinary convergence sentinel'
-  else
-    expect_refused "$name" 'Refuse a held or unavailable retirement route' 'Retirement holds this host (hold)'
-    case "$shape" in
-      merged) expect_final "$name" 'forbidden merge key <<' ;;
-      cyclic) expect_final "$name" 'alias *s' ;;
-      false|sequence|null|integer) expect_final "$name" 'server.identity_dir must be a non-empty string scalar' ;;
-      duplicate) expect_final "$name" "duplicate key 'identity_dir'" ;;
-      state-no-locator) expect_final "$name" 'server.state supplies no default' ;;
-      default|null-state-default) expect_final "$name" "Go's default depends on the running account" ;;
-      empty-mapping) expect_final "$name" 'defines neither a server nor a node section' ;;
-      null-node) expect_final "$name" 'node must be a mapping' ;;
-      malformed) expect_final "$name" 'installed configuration cannot be decoded as the supported YAML subset' ;;
-    esac
-    expect_no_ordinary "$name"
-    expect_no_play_task "$name" 'Ordinary convergence sentinel'
-  fi
-  expect_host_commands "$name" ''
-  expect_no_task "$name" 'Ask the retirement classifier'
-done
-
-# A journal remains a veto even when the remaining local evidence is fresh.
-for artefact in journal.json config-serverless.yaml authority-status; do
-  name=r8-artefact-$artefact
-  r_plant "$name" v0.10.0
-  p "$name" 'mkdir -p /var/lib/billet/retired'
-  case "$artefact" in authority-status) path=/var/lib/billet/authority-status ;; *) path=/var/lib/billet/retired/$artefact ;; esac
-  p "$name" "printf present >'$path'"
-  r_run "$name"
-  expect_refused "$name" 'Refuse a held or unavailable retirement route' "$path is present or could not be examined"
-  expect_host_commands "$name" ''
-  expect_no_ordinary "$name"
-  expect_no_play_task "$name" 'Ordinary convergence sentinel'
-done
-
-# Empty answerers are skipped calls, not attempted-and-unanswered ones.
-for artefact in absent present; do
-  name=r8-empty-$artefact
-  r_plant "$name"
-  p "$name" 'rm /usr/bin/billet'
-  if [ "$artefact" = present ]; then p "$name" 'mkdir -p /var/lib/billet/retired; printf present >/var/lib/billet/retired/journal.json'; fi
-  r_run "$name"
-  if [ "$artefact" = absent ]; then
-    expect_allowed "$name"
-    expect_play_task_ran "$name" 'Ordinary convergence sentinel'
-  else
-    expect_refused "$name" 'Refuse a held or unavailable retirement route' 'journal.json is present'
-    expect_no_play_task "$name" 'Ordinary convergence sentinel'
-  fi
-  expect_host_commands "$name" ''
-  expect_no_task "$name" 'Ask the retirement classifier'
-done
-
-# An absent answerer cannot establish the absence of a shared reservation,
-# under either desired server policy, even with all fixed artefacts absent.
-for policy in true false; do
-  for shape in controller unknown; do
-    name=r8-empty-$shape-$policy
-    r_plant "$name"
-    p "$name" 'rm /usr/bin/billet; mkdir -p /etc/billet'
-    a "$name" -e "billet_enable_server=$policy"
-    if [ "$shape" = controller ]; then
-      p "$name" 'mkdir -p /var/lib/billet/server; printf "server: {state_dir: /var/lib/billet/server}\n" >/etc/billet/billet.yaml; printf minted >/var/lib/billet/server/deployment-id'
-    else
-      p "$name" 'ln -s /missing/config /etc/billet/billet.yaml'
-    fi
-    r_run "$name"
-    expect_refused "$name" 'Refuse a held or unavailable retirement route' 'Retirement holds this host (hold)'
-    if [ "$shape" = controller ]; then
-      expect_final "$name" 'status is present'
-    else
-      expect_final "$name" 'installed configuration could not be examined or read as a regular file'
-    fi
-    expect_no_ordinary "$name"
-    expect_no_play_task "$name" 'Ordinary convergence sentinel'
-    expect_host_commands "$name" ''
-    expect_no_task "$name" 'Ask the retirement classifier'
-  done
-done
-
 # The missing/unknown version type cases enter the caller, not the JSON parser.
-for spec in 'missing:{}' 'unknown:{"type":"invented"}' 'unreadable:{"type":"unreadable"}' 'development:{"type":"development"}'; do
+for spec in 'missing:{}' 'unknown:{"type":"invented"}' 'development:{"type":"development"}'; do
   name=r8-version-${spec%%:*}; value=${spec#*:}
   r_plant "$name"
   a "$name" -e "{\"billet_gate_version\":$value}"
@@ -549,7 +324,7 @@ for spec in 'missing:{}' 'unknown:{"type":"invented"}' 'unreadable:{"type":"unre
     expect_play_task_ran "$name" 'Ordinary convergence sentinel'
     expect_host_commands "$name" 'control-a retire-classify 1;'
   else
-    expect_refused "$name" 'Refuse a held or unavailable retirement route' 'version type'
+    expect_refused "$name" 'Refuse a held or unavailable retirement route' 'This collection needs billet at or above v0.11.0 on the host'
     expect_no_ordinary "$name"
     expect_no_play_task "$name" 'Ordinary convergence sentinel'
     expect_host_commands "$name" ''
@@ -565,28 +340,14 @@ expect_host_commands r8-unanswered 'control-a retire-classify 1;'
 expect_no_ordinary r8-unanswered
 expect_no_play_task r8-unanswered 'Ordinary convergence sentinel'
 
-for kind in empty unreadable development; do
-  name=r8-requested-$kind
-  r_plant "$name"
-  a "$name" -e billet_server_retire=true
-  if [ "$kind" = empty ]; then
-    p "$name" 'rm /usr/bin/billet'
-  else
-    printf 'billet %s linux/amd64\n' "$([ "$kind" = development ] && printf '(devel)' || printf broken)" >"$work/cases/$name/version-line"
-    e "$name" "BILLET_GATE_ANSWER=version:3:$work/cases/$name/version-line"
-    r_answers "$name" 'control-a:classify:1:dry-run-hold-unreadable-row.json:0'
-  fi
-  r_run "$name"
-  expect_refused "$name" 'Refuse a held or unavailable retirement route' 'Retirement holds this host (hold)'
-  expect_no_ordinary "$name"
-  expect_no_play_task "$name" 'Ordinary convergence sentinel'
-  if [ "$kind" = development ]; then
-    expect_host_commands "$name" 'control-a retire-classify 1;'
-  else
-    expect_final "$name" '--requested retirement requires a capable answerer'
-    expect_host_commands "$name" ''
-  fi
-done
+# A development answerer attempts classification, including with --requested.
+r_plant r8-requested-development
+a r8-requested-development -e billet_server_retire=true
+printf 'billet (devel) linux/amd64\n' >"$work/cases/r8-requested-development/version-line"
+e r8-requested-development "BILLET_GATE_ANSWER=version:3:$work/cases/r8-requested-development/version-line"
+r_answers r8-requested-development 'control-a:classify:1:dry-run-hold-unreadable-row.json:0'
+r_run r8-requested-development
+r_held r8-requested-development hold
 
 # R9: every route in check mode, ordinary alone reaches its ordinary boundary.
 for spec in ordinary:dry-run-ordinary hold:dry-run-hold-unreadable-row continue:dry-run-continue recovery:dry-run-recovery-guard new-request:dry-run-new-request cancel:dry-run-cancel unsupported-variant:dry-run-unsupported-variant; do
@@ -603,38 +364,18 @@ for spec in ordinary:dry-run-ordinary hold:dry-run-hold-unreadable-row continue:
   expect_no_task "$name" 'Inspect the transaction claim before recovery'
 done
 
-# Check mode reports holds successfully even when capability or an attempted
-# answer is unavailable; none may fall through to ordinary work or recovery.
-for kind in incapable empty unreadable unanswered; do
-  name=r9-$kind
-  if [ "$kind" = incapable ]; then r_plant "$name" v0.10.1; else r_plant "$name"; fi
-  a "$name" --check
-  case "$kind" in
-    incapable|empty)
-      p "$name" 'mkdir -p /etc/billet /var/lib/billet/server; printf "server: {state_dir: /var/lib/billet/server}\n" >/etc/billet/billet.yaml; printf minted >/var/lib/billet/server/deployment-id'
-      if [ "$kind" = empty ]; then p "$name" 'rm /usr/bin/billet'; fi ;;
-    unreadable) a "$name" -e '{"billet_gate_version":{"type":"unreadable"}}' ;;
-    unanswered)
-      r_answers "$name" 'control-a:classify:1:dry-run-ordinary.json:0'
-      e "$name" 'BILLET_GATE_DROP_ANSWER=retire-classify:1' ;;
-  esac
-  r_run "$name"
-  expect_allowed "$name"
-  case "$kind" in
-    incapable|empty) r_reported "$name" hold 'status is present' ;;
-    unreadable) r_reported "$name" hold 'version type unreadable' ;;
-    unanswered) r_reported "$name" hold 'did not answer retirement' ;;
-  esac
-  expect_no_ordinary "$name"
-  expect_no_play_task "$name" 'Ordinary convergence sentinel'
-  expect_no_task "$name" 'Inspect the transaction claim before recovery'
-  if [ "$kind" = unanswered ]; then
-    expect_host_commands "$name" 'control-a retire-classify 1;'
-  else
-    expect_host_commands "$name" ''
-    expect_no_task "$name" 'Ask the retirement classifier'
-  fi
-done
+# An attempted but unanswered classification also reports hold in check mode.
+r_plant r9-unanswered
+a r9-unanswered --check
+r_answers r9-unanswered 'control-a:classify:1:dry-run-ordinary.json:0'
+e r9-unanswered 'BILLET_GATE_DROP_ANSWER=retire-classify:1'
+r_run r9-unanswered
+expect_allowed r9-unanswered
+r_reported r9-unanswered hold 'did not answer retirement'
+expect_no_ordinary r9-unanswered
+expect_no_play_task r9-unanswered 'Ordinary convergence sentinel'
+expect_no_task r9-unanswered 'Inspect the transaction claim before recovery'
+expect_host_commands r9-unanswered 'control-a retire-classify 1;'
 
 # R10's installed-both request fixture; the desired configuration has no node.
 r_plant r10-installed-both

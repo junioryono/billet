@@ -52,12 +52,8 @@
               or (billet_exclusion_answerer_version.type | default('') == 'release'
                   and billet_exclusion_answerer_version.value | default('') is match('^v[0-9]+\.[0-9]+\.[0-9]+\Z')
                   and (billet_exclusion_answerer_version.value is version(billet_retire_capability_floor, '>=')))) }}
-    billet_retirement_why: >-
-      Retirement capability cannot be established: answerer {{ billet_retirement_answerer | default('none', true) }},
-      version type {{ billet_exclusion_answerer_version.type | default('missing') }}.
-      Install a classifier at or after {{ billet_retire_capability_floor }} and converge again.
 
-- name: Screen compatibility without a capable classifier
+- name: Hold compatibility without a capable classifier
   ansible.builtin.include_tasks: retirement-compatibility.yml
   when: not billet_retirement_capable | bool
 
