@@ -62,15 +62,10 @@ func TestHandlingASucceededCompletionRecordsThat(t *testing.T) {
 
 // A DIAGNOSTIC MUST NOT BE ABLE TO STOP THE CONTROL PLANE.
 //
-// recordCompletion's error is fatal to the listener, and a listener error
-// cancels every other listener, whose shutdowns tear down what they owe. A busy
-// database while GitHub happened to report a completion must not cost the fleet
-// its bookkeeping for the sake of a report — the same disproportion `complete`
-// already refuses for an unbacked assignment.
-//
-// The failure is staged by closing the ledger under the listener, which is the
-// most honest version of "the database will not answer": every allocator call
-// fails, including this one.
+// A listener error cancels every other listener, whose shutdowns tear down what
+// they owe, so a failed report must not cost the fleet its bookkeeping.
+// Identity resolution needs a working ledger. Only the diagnostic result write
+// fails here; losing that report must not stop an otherwise resolvable completion.
 func TestAFailureToRecordTheResultDoesNotStopTheListener(t *testing.T) {
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
 	db := openState(t)
@@ -91,25 +86,48 @@ func TestAFailureToRecordTheResultDoesNotStopTheListener(t *testing.T) {
 
 	l := NewListener(a, tiers[0].Label, &fakeSession{},
 		WithLogger(slog.New(slog.NewTextHandler(&logged, nil))),
+		WithCompletionStore(db),
 		WithRunner(&fakeRunner{}))
 
 	job := Job{RequestID: 23, RunID: 230, Result: "failed"}
-	holdRunning(t, l, a, tiers[0].Label, job.RequestID)
+	lease := holdRunning(t, l, a, tiers[0].Label, job.RequestID)
 
-	if err := db.Close(); err != nil {
-		t.Fatalf("closing the ledger: %v", err)
+	commitments, err := l.resolveCommitments(t.Context())
+	if err != nil {
+		t.Fatalf("resolve commitments against the working ledger: %v", err)
+	}
+	if len(commitments) != 1 || commitments[0].lease != lease ||
+		len(commitments[0].actual.requests) != 1 || commitments[0].actual.requests[0] != job.RequestID {
+		t.Fatalf("resolved commitments = %+v, want the running job", commitments)
 	}
 
-	// A closed ledger fails everything downstream too, so `complete` records its
-	// own obligations and logs — what is asserted is only that handle did not
-	// return, which is the thing that would cancel every listener.
+	writeErr := errors.New("injected job-result write failure")
+	writes := 0
+	l.writeJobResult = func(ctx context.Context, leaseID, result string, runID int64) error {
+		writes++
+		if leaseID != lease.ID || result != job.Result || runID != job.RunID {
+			t.Errorf("record result = (%q, %q, %d), want (%q, %q, %d)",
+				leaseID, result, runID, lease.ID, job.Result, job.RunID)
+		}
+		identity, err := a.JobForLease(ctx, leaseID)
+		if err != nil || identity.RequestID != job.RequestID || identity.Tier != l.tier {
+			t.Fatalf("identity ledger unavailable at the diagnostic write: %+v, %v", identity, err)
+		}
+		return writeErr
+	}
+
 	if err := l.handle(t.Context(), &Message{MessageID: 1, Completed: []Job{job}}); err != nil {
 		t.Fatalf("a ledger that could not record a diagnostic stopped the listener: %v", err)
 	}
 
-	if !strings.Contains(logged.String(), "could not record what github concluded") {
+	if writes != 1 || l.lastMessageID != 1 {
+		t.Errorf("diagnostic writes = %d, acknowledged message = %d; want 1, 1", writes, l.lastMessageID)
+	}
+	if !strings.Contains(logged.String(), "could not record what github concluded") ||
+		!strings.Contains(logged.String(), writeErr.Error()) {
 		t.Errorf("nothing said the result had been lost: %s", logged.String())
 	}
+	assertRecordedResult(t, a, lease.ID, "")
 }
 
 // THE TWO FACTS MEET IN THE REPORT AND NOWHERE ELSE. This is the end-to-end

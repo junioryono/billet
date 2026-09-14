@@ -174,7 +174,7 @@ func (l *Listener) resolveActualJob(ctx context.Context, job Job, mode jobResolu
 		switch {
 		case err == nil:
 			if binding.Tier != l.tier || binding.LaunchRequestID == 0 {
-				return out, fmt.Errorf("%w: completed runner %q belongs to tier %q",
+				return out, fmt.Errorf("%w: runner %q belongs to tier %q",
 					ErrUntrustworthySession, job.RunnerName, binding.Tier)
 			}
 			if mode == resolveCommitment && binding.ActualRequestID != 0 {
@@ -205,7 +205,7 @@ func (l *Listener) resolveActualJob(ctx context.Context, job Job, mode jobResolu
 			out.cleanup.RequestID = binding.LaunchRequestID
 			out.binding = &binding
 		case !errors.Is(err, alloc.ErrLeaseNotFound):
-			return out, fmt.Errorf("%w: cannot resolve completed runner %q: %w",
+			return out, fmt.Errorf("%w: cannot resolve runner %q: %w",
 				ErrUntrustworthySession, job.RunnerName, err)
 		default:
 			if leaseID, ok := provider.LeaseOf(job.RunnerName); ok {
@@ -213,7 +213,7 @@ func (l *Listener) resolveActualJob(ctx context.Context, job Job, mode jobResolu
 				switch {
 				case err == nil:
 					if identity.Tier != l.tier || identity.RequestID == 0 {
-						return out, fmt.Errorf("%w: completed runner %q resolves outside tier %q",
+						return out, fmt.Errorf("%w: runner %q resolves outside tier %q",
 							ErrUntrustworthySession, job.RunnerName, l.tier)
 					}
 					out.cleanup.RequestID = identity.RequestID
@@ -221,7 +221,7 @@ func (l *Listener) resolveActualJob(ctx context.Context, job Job, mode jobResolu
 						out.cleanup.RunID = identity.RunID
 					}
 				case !errors.Is(err, alloc.ErrLeaseNotFound):
-					return out, fmt.Errorf("%w: cannot resolve completed runner %q: %w",
+					return out, fmt.Errorf("%w: cannot resolve runner %q: %w",
 						ErrUntrustworthySession, job.RunnerName, err)
 				}
 			}
@@ -278,7 +278,7 @@ func (l *Listener) resolveActualJob(ctx context.Context, job Job, mode jobResolu
 		bound := actualJobIdentity{requests: []int64{out.binding.ActualRequestID},
 			job: out.binding.JobID, run: out.binding.RunID}
 		if !sameActualJob(out.actual, bound) {
-			return out, fmt.Errorf("%w: completed runner %q contradicts its actual request",
+			return out, fmt.Errorf("%w: runner %q contradicts its actual request",
 				ErrUntrustworthySession, job.RunnerName)
 		}
 		out.actual = mergeActual(out.actual, bound)
@@ -368,7 +368,12 @@ func (l *Listener) resolveCommitments(ctx context.Context) ([]jobCommitment, err
 	for i := range jobs {
 		resolved, err := l.resolveActualJob(ctx, jobs[i], resolveCommitment, nil)
 		if err != nil {
-			return nil, err
+			kind := "running"
+			if commitments[i].promise != nil {
+				kind = "promised"
+			}
+			return nil, fmt.Errorf("server: cannot resolve listener's %s commitment for request %d: %w",
+				kind, commitments[i].key, err)
 		}
 		// A busy pool binding names the actual job and supersedes launch intent.
 		if resolved.binding == nil || resolved.binding.ActualRequestID == 0 {

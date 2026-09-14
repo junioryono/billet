@@ -13,6 +13,71 @@ import (
 	"github.com/junioryono/billet/internal/provider"
 )
 
+func TestCommitmentReadFailuresNameTheListenerObligationAndPreserveTheCause(t *testing.T) {
+	for _, kind := range []string{"running", "promised"} {
+		for _, caller := range []string{"handle", "assign"} {
+			t.Run(kind+"/"+caller, func(t *testing.T) {
+				tiers := []config.Tier{tier("work")}
+				a := newAllocator(t, alloc.Limits{MaxVCPU: 2 * tierVCPU, MaxMemory: 64 * config.GiB}, tiers)
+				var acknowledged bool
+				var launched, destroyed []int64
+				session := &fakeSession{onDelete: func(int64) error { acknowledged = true; return nil }}
+				l := NewListener(a, tiers[0].Label, session, WithRunner(&fakeRunner{
+					onLaunch:  func(id int64) error { launched = append(launched, id); return nil },
+					onDestroy: func(id int64) error { destroyed = append(destroyed, id); return nil },
+				}))
+				if err := l.refillEscrowTo(t.Context(), 1); err != nil {
+					t.Fatal(err)
+				}
+				if kind == "promised" {
+					if err := l.acquire(t.Context(), []Job{{RequestID: 23, JobID: "J"}}); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					holdRunning(t, l, a, l.tier, 23)
+				}
+				commitments, err := l.resolveCommitments(t.Context())
+				if err != nil || len(commitments) != 1 || commitments[0].key != 23 {
+					t.Fatalf("fixture commitments = %+v, %v; want request 23", commitments, err)
+				}
+				acquired := session.acquiredIDs()
+				held := l.idleEscrow()
+				ctx, cancel := context.WithCancel(t.Context())
+				cancel()
+				if caller == "handle" {
+					err = l.handle(ctx, &Message{MessageID: 1,
+						Available: []Job{{RequestID: 24}}, Assigned: []Job{{RequestID: 24}},
+						Completed: []Job{{RequestID: 23, Result: "failed"}},
+					})
+				} else {
+					var lease *alloc.Lease
+					var needsCompute bool
+					lease, needsCompute, err = l.assign(ctx, Job{RequestID: 24})
+					if lease != nil || needsCompute {
+						t.Fatalf("unresolved commitment allowed assignment: %+v, %v", lease, needsCompute)
+					}
+				}
+				if !errors.Is(err, context.Canceled) ||
+					!strings.Contains(err.Error(), "listener's "+kind+" commitment for request 23") ||
+					strings.Contains(err.Error(), "completed runner") {
+					t.Fatalf("%s = %v, want the listener's %s commitment and wrapped read failure", caller, err, kind)
+				}
+				if kind == "running" && !errors.Is(err, ErrUntrustworthySession) {
+					t.Fatalf("runner binding read lost its untrustworthy-session classification: %v", err)
+				}
+				l.mu.Lock()
+				intact := commitments[0].heldBy(l)
+				l.mu.Unlock()
+				if !intact || acknowledged || len(launched) != 0 || len(destroyed) != 0 ||
+					!slices.Equal(session.acquiredIDs(), acquired) || l.idleEscrow() != held || l.lastMessageID != 0 {
+					t.Fatalf("unresolved commitment acted: intact %v, ack %v, launches %v, destroys %v, escrow %d, cursor %d",
+						intact, acknowledged, launched, destroyed, l.idleEscrow(), l.lastMessageID)
+				}
+			})
+		}
+	}
+}
+
 // Every representation reaches handle with real escrow and an observable launcher.
 func TestBatchCompletionUsesEveryActualAlias(t *testing.T) {
 	for _, tc := range []struct {

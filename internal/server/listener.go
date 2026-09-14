@@ -395,6 +395,9 @@ type Listener struct {
 	// completionStore keeps authoritative job results across an ACK followed by a
 	// process stop, until the node accepts result-dependent teardown.
 	completionStore completionStore
+	// writeJobResult isolates diagnostic write failures in tests. Nil uses the
+	// allocator directly; identity reads and completion settlement are unaffected.
+	writeJobResult func(context.Context, string, string, int64) error
 
 	// TotalAssignedJobs is the documented scaling signal; counting messages is
 	// not, because a response carries at most 50 and a large backlog is truncated.
@@ -4570,7 +4573,11 @@ func (l *Listener) recordJobResult(ctx context.Context, job Job, leaseID string)
 		return
 	}
 
-	if err := l.alloc.RecordJobResult(ctx, leaseID, job.Result, job.RunID); err != nil {
+	write := l.writeJobResult
+	if write == nil {
+		write = l.alloc.RecordJobResult
+	}
+	if err := write(ctx, leaseID, job.Result, job.RunID); err != nil {
 		l.log.Warn("could not record what github concluded about a finished job; "+
 			"`billet leases failures` may not be able to show whether billet's own "+
 			"infrastructure was disrupted while its lease could still have been "+
