@@ -1,0 +1,190 @@
+---
+- name: Require a prepared answerer for every collected host
+  ansible.builtin.assert:
+    that:
+      - billet_retirement_collect_answerer is string
+      - billet_retirement_collect_answerer | length > 0
+      - billet_retirement_collect_path is string
+      - billet_retirement_collect_path is match('^/')
+    fail_msg: >-
+      Retirement collection: {{ billet_retirement_collect_host }} has no prepared
+      answerer or absolute configuration path. Prepare every deployment node before
+      the retiring control-plane play; no host may be omitted.
+
+- name: Collect the host's release inspection
+  ansible.builtin.command:
+    argv: >-
+      {{ ([] if billet_retirement_collect_darwin | bool else ['timeout', '-k', '10', '180'])
+         + [billet_retirement_collect_answerer, 'release', 'inspect', '--json', '--config', billet_retirement_collect_path] }}
+    expand_argument_vars: false
+  async: "{{ 190 if billet_retirement_collect_darwin | bool else 0 }}"
+  poll: 5
+  register: billet_retirement_collect_inspect_raw
+  changed_when: false
+  failed_when: false
+  ignore_unreachable: true
+  delegate_to: "{{ billet_retirement_collect_host }}"
+  become: "{{ not billet_retirement_collect_darwin | bool }}"
+
+# assert is a controller action on the retiring inventory host. UNREACHABLE
+# itself bypasses rescue; this ordinary failure is what reaches abandonment.
+- name: Require a successful delegated release inspection
+  ansible.builtin.assert:
+    that:
+      - not billet_retirement_collect_inspect_raw.unreachable | default(false) | bool
+      - not billet_retirement_collect_inspect_raw.failed | default(false) | bool
+      - billet_retirement_collect_inspect_raw.rc | default(-1) == 0
+      - billet_retirement_collect_inspect_raw.stdout | default('') | trim | length > 0
+    fail_msg: "Retirement collection: {{ billet_retirement_collect_host }} release inspection was unsuccessful or unreachable."
+
+- name: Decode the collected inspection
+  ansible.builtin.set_fact:
+    billet_retirement_collect_inspect: "{{ billet_retirement_collect_inspect_raw.stdout | junioryono.billet.from_json_strict }}"
+    billet_retirement_collect_status: null
+  no_log: true
+
+- name: Require a positive ledger-presence observation
+  ansible.builtin.assert:
+    that:
+      - billet_retirement_collect_inspect is mapping
+      - billet_retirement_collect_inspect.installed_config.has_server | default(none) is boolean
+      - billet_retirement_collect_host != billet_retirement_survivor or billet_retirement_collect_inspect.installed_config.has_server
+    fail_msg: "Retirement collection: {{ billet_retirement_collect_host }} could not establish ledger presence; the survivor requires status."
+
+- name: Collect status wherever the installed host has a ledger
+  when: billet_retirement_collect_inspect.installed_config.has_server
+  block:
+    # release inspect observes the loaded unit's environment internally; it
+    # has no --environment-file flag. Status needs that observed operand.
+    - name: Require the inspected server's environment-file shape
+      ansible.builtin.assert:
+        that:
+          - billet_retirement_collect_inspect.services.server.environment_files is sequence
+          - billet_retirement_collect_inspect.services.server.environment_files is not string
+          - billet_retirement_collect_inspect.services.server.environment_files is not mapping
+          - billet_retirement_collect_inspect.services.server.environment_files | length <= 1
+        fail_msg: "Retirement collection: {{ billet_retirement_collect_host }} could not establish the installed server environment."
+
+    - name: Collect the host's ledger status
+      ansible.builtin.command:
+        argv: >-
+          {{ ([] if billet_retirement_collect_darwin | bool else ['timeout', '-k', '10', '180'])
+             + [billet_retirement_collect_answerer, 'rollout', 'status', '--json', '--config', billet_retirement_collect_path]
+             + (['--environment-file', billet_retirement_collect_inspect.services.server.environment_files[0]]
+                if billet_retirement_collect_inspect.services.server.environment_files | length > 0 else []) }}
+        expand_argument_vars: false
+      async: "{{ 190 if billet_retirement_collect_darwin | bool else 0 }}"
+      poll: 5
+      register: billet_retirement_collect_status_raw
+      changed_when: false
+      failed_when: false
+      ignore_unreachable: true
+      delegate_to: "{{ billet_retirement_collect_host }}"
+      become: "{{ not billet_retirement_collect_darwin | bool }}"
+
+    - name: Require a successful delegated ledger status
+      ansible.builtin.assert:
+        that:
+          - not billet_retirement_collect_status_raw.unreachable | default(false) | bool
+          - not billet_retirement_collect_status_raw.failed | default(false) | bool
+          - billet_retirement_collect_status_raw.rc | default(-1) == 0
+          - billet_retirement_collect_status_raw.stdout | default('') | trim | length > 0
+        fail_msg: "Retirement collection: {{ billet_retirement_collect_host }} ledger status was unsuccessful or unreachable."
+
+    - name: Decode the collected ledger status
+      ansible.builtin.set_fact:
+        billet_retirement_collect_status: "{{ billet_retirement_collect_status_raw.stdout | junioryono.billet.from_json_strict }}"
+      no_log: true
+
+    - name: Require the collected ledger document
+      ansible.builtin.assert:
+        that: billet_retirement_collect_status is mapping
+        fail_msg: "Retirement collection: {{ billet_retirement_collect_host }} answered no ledger document."
+
+- name: Collect the node's desired configuration and endpoint
+  when: billet_retirement_collect_host in billet_retirement_node_hosts
+  block:
+    - name: Require this node's complete desired configuration
+      ansible.builtin.assert:
+        that:
+          - billet_retirement_collect_vars.billet_config | default(none) is mapping
+          - billet_retirement_collect_vars.billet_config.node | default(none) is mapping
+        fail_msg: "Retirement collection: node {{ billet_retirement_collect_host }} has no complete desired rendering."
+
+    - name: Render this node in its own inventory context
+      ansible.builtin.set_fact:
+        billet_retirement_collect_rendering: >-
+          {{ lookup('ansible.builtin.template', 'billet.yaml.j2',
+                    template_vars={'billet_config': billet_retirement_collect_vars.billet_config}) }}
+      no_log: true
+
+    - name: Ask this node for its desired endpoint
+      ansible.builtin.command:
+        argv: >-
+          {{ ([] if billet_retirement_collect_darwin | bool else
+              ['timeout', '-k', '10', ((billet_migration_judgement_attempts | int) *
+               ((billet_migration_record_wait | int) + 4 * (billet_migration_observation_bound | int)
+                + (billet_migration_probe_bound | int)) + (billet_guard_timeout | int)) | string])
+             + [billet_retirement_collect_answerer, 'node', 'migrate-endpoint', '--config', billet_retirement_collect_path,
+                '--desired', '-', '--wait', (billet_migration_record_wait | string) ~ 's', '--dry-run', '--json'] }}
+        expand_argument_vars: false
+        stdin: "{{ billet_retirement_collect_rendering }}"
+        stdin_add_newline: false
+      async: "{{ 190 if billet_retirement_collect_darwin | bool else 0 }}"
+      poll: 5
+      register: billet_retirement_collect_endpoint_raw
+      changed_when: false
+      failed_when: false
+      ignore_unreachable: true
+      delegate_to: "{{ billet_retirement_collect_host }}"
+      become: "{{ not billet_retirement_collect_darwin | bool }}"
+      no_log: true
+
+    - name: Require an answered delegated endpoint observation
+      ansible.builtin.assert:
+        that:
+          - not billet_retirement_collect_endpoint_raw.unreachable | default(false) | bool
+          - not billet_retirement_collect_endpoint_raw.failed | default(false) | bool
+          - billet_retirement_collect_endpoint_raw.rc | default(-1) in [0, 2, 3]
+        fail_msg: "Retirement collection: {{ billet_retirement_collect_host }} endpoint observation was unsuccessful or unreachable."
+
+    - name: Parse this node's endpoint observation
+      ansible.builtin.include_tasks: endpoint-answer.yml
+      vars:
+        billet_endpoint_raw: "{{ billet_retirement_collect_endpoint_raw }}"
+        billet_endpoint_call: decision
+        billet_endpoint_answered_by: "{{ billet_retirement_collect_answerer }}"
+
+    - name: Require this node's canonical desired endpoint
+      ansible.builtin.assert:
+        that:
+          - billet_endpoint_answer.outcome == 'reported'
+          - billet_endpoint_answer.node_removed is sameas false
+          - billet_endpoint_answer.to is string
+          - billet_endpoint_answer.to | length > 0
+        fail_msg: >-
+          Retirement collection: {{ billet_retirement_collect_host }} did not report a desired node endpoint.
+          {{ billet_endpoint_answer.why | default('') }}
+
+    - name: Carry this node's exact rendering digest and answered endpoint
+      ansible.builtin.set_fact:
+        billet_retirement_desired_nodes: >-
+          {{ billet_retirement_desired_nodes | combine({billet_retirement_collect_host:
+               {'sha256': billet_retirement_collect_rendering | hash('sha256'), 'endpoint': billet_endpoint_answer.to}}) }}
+      no_log: true
+
+- name: Date this envelope with the retiring host's clock after collection
+  ansible.builtin.command:
+    argv: [date, -u, '+%Y-%m-%dT%H:%M:%S.%NZ']
+    expand_argument_vars: false
+  register: billet_retirement_collected
+  changed_when: false
+  become: true
+
+- name: Bind the collected envelope to its authenticated inventory host
+  ansible.builtin.set_fact:
+    billet_retirement_reports: >-
+      {{ billet_retirement_reports | combine({billet_retirement_collect_host:
+           {'host': billet_retirement_collect_host, 'collected_at': billet_retirement_collected.stdout | trim,
+            'inspect': billet_retirement_collect_inspect, 'status': billet_retirement_collect_status}}) }}
+  no_log: true

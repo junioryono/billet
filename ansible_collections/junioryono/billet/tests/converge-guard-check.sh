@@ -440,6 +440,12 @@ if [ -n "$retire_mode" ] || [ "$cmd" = retire-invalid ]; then
         case "$fixture" in */*|''|.*) echo 'invalid retirement fixture name' >&2; exit 98 ;; esac
         case "$status" in ''|*[!0-9]*) echo 'invalid retirement fixture exit' >&2; exit 98 ;; esac
         printf 'backing=0 cmd=%s host=%s fixture=%s status=%s\n' "$cmd" "$host" "$fixture" "$status" >>"$priv"
+        if [ -n "${BILLET_GATE_RETIRE_OBLIGATION:-}" ] && [ "$status" = 0 ]; then
+          case "$retire_mode" in
+            reserve) printf 'reserved\n' >"$BILLET_GATE_RETIRE_OBLIGATION" || exit 98 ;;
+            abandon) rm "$BILLET_GATE_RETIRE_OBLIGATION" || exit 98 ;;
+          esac
+        fi
         case "${BILLET_GATE_DROP_ANSWER:-}" in
           "$cmd:$n"|"$host:$cmd:$host_n") exit "$status" ;;
         esac
@@ -450,6 +456,27 @@ if [ -n "$retire_mode" ] || [ "$cmd" = retire-invalid ]; then
   printf 'backing=0 cmd=%s host=%s missing-fixture\n' "$cmd" "$host" >>"$priv"
   echo "no committed retirement answer for $host:$retire_mode:$host_n" >&2
   exit 98
+fi
+# Host-scoped collected reports bypass the backing binary just like retirement.
+# Each substitution still records exact argv/stdin before it answers.
+if [ -n "${BILLET_GATE_REPORT_ANSWERS:-}" ]; then
+  case "$cmd" in
+    release|status|migrate-endpoint)
+      IFS=';' read -r -a report_specs <<<"$BILLET_GATE_REPORT_ANSWERS"
+      for spec in "${report_specs[@]+"${report_specs[@]}"}"; do
+        case "$spec" in
+          "$host:$cmd:$host_n:"*)
+            answer=${spec#"$host:$cmd:$host_n:"}
+            fixture=${answer%:*}; status=${answer##*:}
+            case "$status" in ''|*[!0-9]*) echo 'invalid report fixture exit' >&2; exit 98 ;; esac
+            printf 'backing=0 cmd=%s host=%s fixture=%s status=%s\n' "$cmd" "$host" "$fixture" "$status" >>"$priv"
+            cat "$fixture" || exit 98
+            exit "$status" ;;
+        esac
+      done
+      echo "no committed report answer for $host:$cmd:$host_n" >&2
+      exit 98 ;;
+  esac
 fi
 failspec=${BILLET_GATE_FAIL:-}
 forced_exit=""
@@ -540,6 +567,9 @@ FAKE
   case $tool in
     date)
       cat >>"$fakes/$tool" <<FAKE
+if [ -n "\${BILLET_GATE_RETIRE_CLOCK:-}" ] && [ "\${2:-}" = '+%Y-%m-%dT%H:%M:%S.%NZ' ]; then
+  '$python' '$work/record-call.py' "\$BILLET_GATE_CALLS" "\${BILLET_GATE_HOST:-localhost}" collection-clock '' "\$@" >/dev/null || exit 98
+fi
 case "\${BILLET_FAKE_DATE_MODE:-}" in
   fail) exit 1 ;;
   short) echo 2026-09-09; exit 0 ;;

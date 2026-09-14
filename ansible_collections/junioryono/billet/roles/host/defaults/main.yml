@@ -437,5 +437,12 @@ billet_service_policy_known_directives:
     - WantedBy
 
 # Retirement is an explicit inventory request; a recorded journal resumes even
-# after this flag is removed. New requests and cancellation land in 5c.d.
+# after this flag is removed. Cancellation remains a named refusal.
 billet_server_retire: false
+
+# Explicit inventory name of the survivor, prepared under this converge's holder.
+billet_retirement_survivor_host: ""
+# Inventory declarations passed to the command's endpoint eligibility judgement.
+billet_retirement_shared_addresses: []
+billet_retirement_endpoint_failover_verified: false
+billet_retirement_report_max_age: 10m

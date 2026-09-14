@@ -6,7 +6,7 @@
     argv: >-
       {{ [billet_retirement_answerer, 'server', 'retire', '--input', '-', '--json',
           '--run', billet_exclusion_holder, '--retiring-host', inventory_hostname,
-          '--survivor-host', billet_retirement_classification.journal.survivor,
+          '--survivor-host', billet_retirement_survivor,
           '--config', '/etc/billet/billet.yaml']
          + (['--environment-file', billet_retirement_local_environment_file] if billet_retirement_local_environment_file | length > 0 else []) }}
     expand_argument_vars: false
@@ -31,7 +31,7 @@
       - billet_retire_answer.outcome in ['retired', 'unchanged']
       - billet_retire_answer.variant | default('') == 'server-only'
       - billet_retire_answer.state == 'done'
-      - billet_retire_answer.transition_id == billet_retirement_classification.journal.transition_id
+      - billet_retire_answer.transition_id == billet_retirement_transition_id
     fail_msg: >-
       The continuation did not confirm a known server-only done state;
       ordinary convergence remains bypassed.

@@ -7,7 +7,7 @@ cat >"$work/play-retirement.yml" <<'PLAY'
 ---
 - name: Exercise the retirement entry after real preparation
   hosts: "{{ billet_gate_retirement_host | default('control-a') }}"
-  gather_facts: false
+  gather_facts: "{{ billet_gate_new | default(false) | bool }}"
   vars:
     billet_exclusion_platform: Linux
     billet_binary_src: ''
@@ -72,6 +72,34 @@ cat >"$work/play-retirement.yml" <<'PLAY'
       delegate_to: control-b
       delegate_facts: true
       when: billet_gate_peer | default(false) | bool
+    - name: Publish new-request collection answerers on the node transports
+      ansible.builtin.set_fact:
+        billet_exclusion_answerer: "{{ billet_exclusion_answerer }}"
+        billet_exclusion_darwin: false
+      delegate_to: "{{ item }}"
+      delegate_facts: true
+      loop: [control-b, node-a]
+      when:
+        - billet_gate_new | default(false) | bool
+        - item != 'node-a' or not billet_gate_no_answerer | default(false) | bool
+    - name: Vary only the named survivor guard clause
+      ansible.builtin.set_fact:
+        billet_exclusion_settled: "{{ false if billet_gate_peer_clause == 'unsettled' else true }}"
+        billet_exclusion_held: "{{ false if billet_gate_peer_clause == 'unheld' else true }}"
+        billet_exclusion_holder: "{{ 'someone-else' if billet_gate_peer_clause == 'holder' else billet_exclusion_holder }}"
+        billet_upgrade_claim_shape: "{{ 'guard-pointer' if billet_gate_peer_clause == 'pointer' else 'guard' }}"
+      delegate_to: control-b
+      delegate_facts: true
+      when: billet_gate_peer_clause is defined
+    - name: Vary the binary-upgrade precondition after preparation
+      ansible.builtin.set_fact:
+        billet_binary_upgrade: true
+      when: billet_gate_binary_upgrade | default(false) | bool
+    - name: Inject an unfinished own guard after preparation
+      ansible.builtin.command:
+        argv: ["{{ ansible_playbook_python }}", "{{ billet_gate_own_guard_script }}", "{{ billet_gate_own_guard }}"]
+      changed_when: true
+      when: billet_gate_own_guard is defined
     - name: Route this host before ordinary work
       ansible.builtin.include_role:
         name: junioryono.billet.host
@@ -474,6 +502,7 @@ r_held r8-requested-development hold
 for spec in ordinary:dry-run-ordinary hold:dry-run-hold-unreadable-row continue:dry-run-continue recovery:dry-run-recovery-guard new-request:dry-run-new-request cancel:dry-run-cancel unsupported-variant:dry-run-unsupported-variant; do
   route=${spec%%:*}; fixture=${spec#*:}; name=r9-$route
   r_plant "$name"
+  if [ "$route" = new-request ]; then a "$name" -e billet_retirement_survivor_host=control-b; fi
   a "$name" --check
   r_answers "$name" "control-a:classify:1:$fixture.json:0"
   r_run "$name"
@@ -836,3 +865,479 @@ counts = dict(re.findall(r'(\w+)=(\d+)', rows[0]))
 if any(counts.get(key) != '0' for key in ['changed', 'failed', 'unreachable', 'rescued', 'ignored']):
     sys.exit('the second converge changed or failed: ' + rows[0])
 PY
+
+# 5c.d1: new requests, with two node-bearing transports (including the survivor).
+# Only the ordinary account/file/service block is forbidden: the explicit early
+# service-account import is required on this route.
+r_no_ordinary_after_request() {
+  local task
+  while IFS= read -r task; do
+    expect_no_task "$1" "$task"
+  done < <(sed -n 's/^[[:space:]]*- name: //p' "$role_tasks/account.yml" "$role_tasks/services.yml")
+  expect_no_play_task "$1" 'Ordinary convergence sentinel'
+  expect_no_task "$1" 'Inspect the transaction claim before recovery'
+}
+r_no_collection() {
+  "$python" - "$work/cases/$1/calls/index.jsonl" <<'PY'
+import json, sys
+calls = [json.loads(line) for line in open(sys.argv[1])]
+if any(c['command'] in ['release', 'status', 'migrate-endpoint', 'retire-reserve', 'retire-request', 'retire-abandon'] for c in calls):
+    sys.exit('a precondition failure collected evidence or touched a reservation')
+PY
+  expect_no_task "$1" "Read the installed configuration's reservation digest"
+  expect_no_task "$1" "Read the retiring host's clock before the first collection delegation"
+  expect_no_ordinary "$1"
+  expect_no_play_task "$1" 'Ordinary convergence sentinel'
+}
+r_new() { # case [reserved|adopted]
+  local name=$1 outcome=${2:-reserved}
+  r_plant "$name"
+  r_services "$name" control-a
+  # Service identity validation and local prepare really run, under root in
+  # this namespace; the retirement and collected reports remain fixture fakes.
+  "$python" - "$work/cases/$name/services/control-a.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+for unit in d.values():
+    unit.update(User='root', Group='root')
+with open(p, 'w') as stream:
+    json.dump(d, stream)
+PY
+  ep_plant_config "$name" 127.0.0.1:7717 server-only
+  a "$name" -e billet_converge_guard_holder=ci-1 -e billet_gate_new=true -e billet_gate_peer=true \
+    -e billet_retirement_survivor_host=control-b \
+    -e billet_service_user=root -e billet_service_group=root -e billet_adopt_existing_service_account=true
+  cat >"$work/cases/$name/inventory.yml" <<'INV'
+all:
+  hosts:
+    control-a:
+      billet_server_retire: true
+    control-b:
+      billet_server_retire: false
+      node_wire_address: 127.0.0.1:7717
+      billet_config:
+        server: {listen: '127.0.0.1:7717', state_dir: /var/lib/billet/server, max_vcpu: 8, max_memory: 32GiB}
+        node: {name: '{{ inventory_hostname }}', server_addr: '{{ node_wire_address }}', provider: docker}
+    node-a:
+      billet_server_retire: false
+      billet_config_path: /etc/billet/node-a.yaml
+      node_wire_address: 127.0.0.1:7719
+      billet_config:
+        node: {name: '{{ inventory_hostname }}', server_addr: '{{ node_wire_address }}', provider: docker}
+INV
+  a "$name" -i "$work/cases/$name/inventory.yml"
+  e "$name" BILLET_GATE_RETIRE_CLOCK=1
+  e "$name" 'BILLET_GATE_RETIRE_ENV=/etc/billet/server.env (ignore_errors=yes)'
+  e "$name" "BILLET_GATE_REPORT_ANSWERS=control-a:release:1:$here/fixtures/release-inspect/postgres-controller-guarded.json:0;control-a:status:1:$here/fixtures/rollout-status/retirement-reserved.json:0;control-b:release:1:$here/fixtures/release-inspect/postgres-controller-guarded.json:0;control-b:status:1:$here/fixtures/rollout-status/no-rollout.json:0;control-b:migrate-endpoint:1:$here/fixtures/node-migrate-endpoint/reported-unplanned.json:0;node-a:release:1:$here/fixtures/release-inspect/node-with-bundle.json:0;node-a:migrate-endpoint:1:$here/fixtures/node-migrate-endpoint/reported-planned.json:0"
+  r_answers "$name" "control-a:classify:1:dry-run-new-request.json:0;control-a:reserve:1:$outcome.json:0;control-a:request:1:retired-settled.json:0;control-a:abandon:1:abandoned.json:0"
+}
+
+# Assert the entire reservation/request argv, all delegated argv, the exact
+# document member sets, raw rendering hashes (including the final newline),
+# host-specific variable expansion and both positive and forbidden effects.
+r_new_document() { # case reserved|adopted
+  "$python" - "$work/cases/$1" "$here/fixtures" "$2" <<'PY'
+import datetime, hashlib, json, pathlib, re, sys, yaml
+case, fixtures = map(pathlib.Path, sys.argv[1:3])
+outcome = sys.argv[3]
+root = case / 'calls'
+calls = [json.loads(line) for line in (root / 'index.jsonl').read_text().splitlines()]
+def one(host, command):
+    found = [c for c in calls if c['host'] == host and c['command'] == command]
+    if len(found) != 1:
+        sys.exit(f'{host} {command}: expected one call, got {len(found)}')
+    return found[0]
+def fixture(command, name):
+    return json.loads((fixtures / command / (name + '.json')).read_text())
+reserve, request = one('control-a', 'retire-reserve'), one('control-a', 'retire-request')
+digest = hashlib.sha256((case / 'installed.yaml.plant').read_bytes()).hexdigest()
+common = ['--json', '--run', 'ci-1', '--retiring-host', 'control-a', '--survivor-host', 'control-b', '--installed-sha256', digest]
+if reserve['argv'] != ['server', 'retire', '--reserve'] + common + ['--config', '/etc/billet/billet.yaml', '--environment-file', '/etc/billet/server.env']:
+    sys.exit('reserve argv differs: ' + repr(reserve['argv']))
+expected = ['server', 'retire', '--input', '-'] + common + ['--server-only', '--config', '/etc/billet/billet.yaml']
+if outcome == 'reserved':
+    expected += ['--reservation-fresh']
+expected += ['--shared-address', '192.0.2.10', '--shared-address', '192.0.2.11', '--endpoint-failover-verified', '--report-max-age', '10m', '--environment-file', '/etc/billet/server.env']
+# The retiring request flag is host-local inventory; it must not flag its peer.
+if request['argv'] != expected:
+    sys.exit('request argv differs: ' + repr(request['argv']))
+if not request['has_stdin']:
+    sys.exit('request has no stdin')
+doc = json.loads((root / request['stdin']).read_text())
+if set(doc) != {'schema', 'round', 'self', 'survivor', 'nodes', 'desired', 'desired_nodes'} or type(doc['schema']) is not int or doc['schema'] != 1 or doc['desired'] is not None:
+    sys.exit('new-request document shape differs')
+if set(doc['round']) != {'id', 'started_at'} or doc['round']['id'] != 'ci-1-' + doc['round']['started_at']:
+    sys.exit('round binding differs')
+def timestamp(s):
+    if not isinstance(s, str) or not re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{9}Z', s):
+        sys.exit('collection time is not the retiring clock\'s nanosecond RFC 3339 answer')
+    return datetime.datetime.fromisoformat(s.replace('Z', '+00:00'))
+started = timestamp(doc['round']['started_at'])
+reserved_at = datetime.datetime.fromisoformat(fixture('server-retire', outcome)['reserved_at'].replace('Z', '+00:00'))
+if started < reserved_at:
+    sys.exit('round precedes reservation')
+if set(doc['nodes']) != {'control-b', 'node-a'} or set(doc['desired_nodes']) != set(doc['nodes']):
+    sys.exit('collection omitted a deployment node or collected another host')
+if doc['nodes']['control-b'] != doc['survivor']:
+    sys.exit('the node-bearing survivor needs its own nodes entry')
+for host, envelope, inspect_name, status_name in [
+    ('control-a', doc['self'], 'postgres-controller-guarded', 'retirement-reserved'),
+    ('control-b', doc['survivor'], 'postgres-controller-guarded', 'no-rollout'),
+    ('node-a', doc['nodes']['node-a'], 'node-with-bundle', None),
+]:
+    if set(envelope) != {'host', 'collected_at', 'inspect', 'status'} or envelope['host'] != host:
+        sys.exit('envelope binding differs for ' + host)
+    if timestamp(envelope['collected_at']) < started:
+        sys.exit('envelope precedes round for ' + host)
+    if envelope['inspect'] != fixture('release-inspect', inspect_name):
+        sys.exit('inspection came from another host or was rewritten')
+    expected_status = fixture('rollout-status', status_name) if status_name else None
+    if envelope['status'] != expected_status:
+        sys.exit('ledger document differs for ' + host)
+    path = '/etc/billet/node-a.yaml' if host == 'node-a' else '/etc/billet/billet.yaml'
+    inspection = one(host, 'release')
+    if inspection['argv'] != ['release', 'inspect', '--json', '--config', path]:
+        sys.exit('inspect argv differs for ' + host)
+    if not reserve['sequence'] < inspection['sequence'] < request['sequence']:
+        sys.exit('collection is outside the reserved request window')
+    if status_name:
+        status = one(host, 'status')
+        if status['argv'] != ['rollout', 'status', '--json', '--config', path, '--environment-file', '/var/lib/billet-fixture/server.env']:
+            sys.exit('status did not use its executing host\'s observed environment')
+        if not inspection['sequence'] < status['sequence'] < request['sequence']:
+            sys.exit('status collected out of order')
+    if host != 'control-a':
+        migration = one(host, 'migrate-endpoint')
+        if migration['argv'] != ['node', 'migrate-endpoint', '--config', path, '--desired', '-', '--wait', '120s', '--dry-run', '--json']:
+            sys.exit('endpoint dry-run argv differs for ' + host)
+        rendering = (root / migration['stdin']).read_bytes()
+        if not migration['has_stdin'] or not rendering.endswith(b'\n'):
+            sys.exit('node did not receive exact configuration bytes')
+        parsed = yaml.safe_load(rendering)
+        address = '127.0.0.1:7717' if host == 'control-b' else '127.0.0.1:7719'
+        if parsed['node'] != dict(name=host, server_addr=address, provider='docker'):
+            sys.exit('configuration was not rendered in its own host context')
+        if ('server' in parsed) != (host == 'control-b'):
+            sys.exit('complete node configuration was not rendered')
+        endpoint_name = 'reported-unplanned' if host == 'control-b' else 'reported-planned'
+        desired = doc['desired_nodes'][host]
+        if desired != {'sha256': hashlib.sha256(rendering).hexdigest(), 'endpoint': fixture('node-migrate-endpoint', endpoint_name)['to']}:
+            sys.exit('desired node evidence was not computed from exact stdin and its own answer')
+        if not inspection['sequence'] < migration['sequence'] < request['sequence']:
+            sys.exit('endpoint collected out of order')
+if any(c['host'] == 'node-a' and c['command'] == 'status' for c in calls):
+    sys.exit('node with no ledger was asked for status')
+if any(c['command'] in ['retire-abandon', 'retire-complete', 'retire-acknowledge'] for c in calls):
+    sys.exit('a settled success ran cleanup or a pending-row helper')
+clocks = [c for c in calls if c['command'] == 'collection-clock']
+if len(clocks) != 4 or any(c['host'] != 'control-a' or c['argv'] != ['-u', '+%Y-%m-%dT%H:%M:%S.%NZ'] for c in clocks):
+    sys.exit('collection did not read the retiring host clock once per round/envelope')
+if not reserve['sequence'] < clocks[0]['sequence'] < one('control-a', 'release')['sequence']:
+    sys.exit('round clock was not read freshly after reserve and before delegation')
+for clock, host in zip(clocks[1:], ['control-a', 'control-b', 'node-a']):
+    last_report = one(host, 'status' if host == 'control-a' else 'migrate-endpoint')
+    if not last_report['sequence'] < clock['sequence'] < request['sequence']:
+        sys.exit('envelope clock was not read after its reports')
+# local prepare is a real early import effect, before the reservation.
+prepared = [c for c in calls if c['argv'][:2] == ['local', 'prepare']]
+if len(prepared) != 1 or prepared[0]['host'] != 'control-a' or prepared[0]['sequence'] >= reserve['sequence']:
+    sys.exit('early service-account preparation did not precede reservation')
+PY
+}
+
+# R2: each static clause fails alone, in both modes. Missing preparation is
+# a real-run precondition, separately exercised by R16 below.
+for clause in upgrade policy survivor; do
+  for mode in normal check; do
+    name=r2-$clause-$mode
+    r_new "$name"
+    case "$clause" in
+      upgrade) a "$name" -e billet_gate_binary_upgrade=true; task='Require retirement outside a binary upgrade'; why='inside a binary upgrade' ;;
+      policy) a "$name" -e '{"billet_server_should_run":true}'; task='Require a policy that leaves the retiring server stopped'; why='policy will start the server' ;;
+      survivor) a "$name" -e billet_retirement_survivor_host=; task='Require a named survivor in this inventory'; why='no distinct inventory survivor' ;;
+    esac
+    if [ "$mode" = check ]; then a "$name" --check; fi
+    r_run "$name"
+    expect_refused "$name" "$task" "Retirement precondition: $why"
+    r_no_collection "$name"
+    expect_host_commands "$name" 'control-a retire-classify 1;'
+  done
+done
+
+# R16: the other clauses remain true, so settled alone, a skipped settlement,
+# another holder and a binary pointer each have an independent witness.
+for clause in unsettled holder pointer unheld; do
+  name=r16-$clause
+  r_new "$name"
+  a "$name" -e "billet_gate_peer_clause=$clause"
+  r_run "$name"
+  expect_refused "$name" "Require this converge's settled survivor guard" 'needs a settled, held, pointer-free guard'
+  r_no_collection "$name"
+  expect_host_commands "$name" 'control-a retire-classify 1;'
+done
+r_new r2-unprepared
+# A real run has no published survivor guard at all; setting an answerer is
+# insufficient. The check-mode partner reports the prerequisite and succeeds.
+a r2-unprepared -e billet_gate_peer=false
+r_run r2-unprepared
+expect_refused r2-unprepared "Require this converge's settled survivor guard" 'needs a settled, held, pointer-free guard'
+r_no_collection r2-unprepared
+r_new r2-preview
+a r2-preview --check -e billet_gate_peer=false
+r_run r2-preview
+expect_allowed r2-preview
+expect_ran r2-preview 'Report the prospective new retirement'
+expect_host_commands r2-preview 'control-a retire-classify 1;'
+r_no_collection r2-preview
+grep -qF 'A real run needs that survivor prepared' "$work/cases/r2-preview/out" || fail 'r2-preview: missing survivor preparation report'
+
+# R19 and the end-to-end success: the fake answers without judging the flag,
+# and exact argv assertions kill passing it after adoption or omitting it fresh.
+for outcome in reserved adopted; do
+  name=r19-$outcome
+  r_new "$name" "$outcome"
+  # Per-host retirement policy must remain distinct in hostvars.
+  a "$name" -e '{"billet_retirement_shared_addresses":["192.0.2.10","192.0.2.11"],"billet_retirement_endpoint_failover_verified":true}'
+  r_run "$name"
+  expect_allowed "$name"
+  expect_host_commands "$name" 'control-a retire-classify 1;control-a retire-reserve 1;control-a retire-request 1;'
+  expect_ran "$name" "Prepare this host's authority exclusion"
+  expect_ran "$name" "Keep the new retirement's result"
+  r_no_ordinary_after_request "$name"
+  r_new_document "$name" "$outcome"
+done
+
+# R13: node-a's connection plugin really cannot connect, after the row was
+# reserved and the survivor was collected. No module exit stands for this.
+r_new r13-unreachable
+e r13-unreachable BILLET_GATE_RETIRE_OBLIGATION=/var/lib/billet/gate-reservation
+cat >>"$work/cases/r13-unreachable/inventory.yml" <<'INV'
+      ansible_connection: ssh
+      ansible_host: 127.0.0.1
+      ansible_port: 0
+      ansible_connect_timeout: 1
+      ansible_ssh_common_args: '-o BatchMode=yes -o ConnectionAttempts=1'
+INV
+r_run r13-unreachable
+expect_refused r13-unreachable "Collect the host's release inspection" 'node-a release inspection was unsuccessful or unreachable'
+expect_final r13-unreachable 'The reservation was abandoned.'
+expect_host_commands r13-unreachable 'control-a retire-classify 1;control-a retire-reserve 1;control-a retire-abandon 1;'
+r_no_ordinary_after_request r13-unreachable
+expect_path_absent r13-unreachable /var/lib/billet/gate-reservation
+"$python" - "$work/cases/r13-unreachable" <<'PY'
+import json, pathlib, sys
+case = pathlib.Path(sys.argv[1])
+text = (case / 'out').read_text()
+if 'UNREACHABLE!' not in text or 'node-a' not in text:
+    sys.exit('R13 did not establish connection-layer UNREACHABLE')
+header = 'TASK [junioryono.billet.host : Require a successful delegated release inspection]'
+blocks = text.split(header)[1:]
+failures = [b.split('TASK [', 1)[0] for b in blocks if 'fatal: [control-a]:' in b.split('TASK [', 1)[0]]
+if len(failures) != 1 or 'node-a release inspection was unsuccessful or unreachable' not in failures[0] or 'UNREACHABLE!' in failures[0]:
+    sys.exit('R13 did not convert unreachable into an ordinary retiring-host assertion failure')
+calls = [json.loads(line) for line in (case / 'calls/index.jsonl').read_text().splitlines()]
+if any(c['host'] == 'node-a' for c in calls):
+    sys.exit('an unreachable transport ran a module')
+if sum(c['host'] == 'control-b' and c['command'] == 'release' for c in calls) != 1:
+    sys.exit('R13 failed before reaching delegated collection')
+abandon = [c for c in calls if c['command'] == 'retire-abandon']
+if len(abandon) != 1 or abandon[0]['argv'] != ['server', 'retire', '--abandon-reservation', '--json', '--run', 'ci-1', '--retiring-host', 'control-a', '--config', '/etc/billet/billet.yaml', '--environment-file', '/etc/billet/server.env']:
+    sys.exit('R13 cleanup did not carry exact local abandonment argv')
+PY
+
+# Missing desired rendering, missing prepared answerer and failed status may
+# not silently remove a node or survivor from the collected document.
+for clause in rendering answerer status; do
+  name=r-collection-$clause
+  r_new "$name"
+  case "$clause" in
+    rendering)
+      "$python" - "$work/cases/$name/inventory.yml" <<'PYRENDER'
+import pathlib, sys, yaml
+p = pathlib.Path(sys.argv[1])
+d = yaml.safe_load(p.read_text())
+d['all']['hosts']['node-a'].update(billet_config={}, billet_enable_node=True)
+p.write_text(yaml.safe_dump(d))
+PYRENDER
+      task="Require this node's complete desired configuration"; why='node node-a has no complete desired rendering' ;;
+    answerer)
+      a "$name" -e billet_gate_no_answerer=true
+      task='Require a prepared answerer for every collected host'; why='node-a has no prepared answerer' ;;
+    status)
+      e "$name" "BILLET_GATE_REPORT_ANSWERS=control-a:release:1:$here/fixtures/release-inspect/postgres-controller-guarded.json:0;control-a:status:1:$here/fixtures/rollout-status/retirement-reserved.json:0;control-b:release:1:$here/fixtures/release-inspect/postgres-controller-guarded.json:0;control-b:status:1:$here/fixtures/rollout-status/no-rollout.json:3"
+      task='Require a successful delegated ledger status'; why='control-b ledger status was unsuccessful or unreachable' ;;
+  esac
+  r_run "$name"
+  expect_refused "$name" "$task" "$why"
+  expect_final "$name" 'The reservation was abandoned.'
+  expect_host_commands "$name" 'control-a retire-classify 1;control-a retire-reserve 1;control-a retire-abandon 1;'
+  r_no_ordinary_after_request "$name"
+done
+
+# Binding corruption stays case-local; the corpus always comes from Go.
+for member in run retiring survivor transition_id; do
+  name=r-reservation-binding-$member
+  r_new "$name" adopted
+  mkdir -p "$work/cases/$name/answers"
+  cp "$work/retire-fixtures/"*.json "$work/cases/$name/answers/"
+  "$python" - "$work/cases/$name/answers" "$member" <<'PY'
+import json, pathlib, sys
+root, member = pathlib.Path(sys.argv[1]), sys.argv[2]
+p = root / 'adopted.json'
+d = json.loads(p.read_text())
+d[member] = 'fedcba9876543210fedcba9876543210' if member == 'transition_id' else 'another'
+p.write_text(json.dumps(d))
+# The classifier's reservation observation supplies the old transition id.
+p = root / 'dry-run-new-request.json'
+d = json.loads(p.read_text())
+a = json.loads((root / 'reserved.json').read_text())
+d.update(row={k: a[k] for k in ['retiring', 'survivor', 'run', 'transition_id', 'reserved_at']}, row_fact='reserved-mine', dispatch='adopt')
+d['row']['state'] = 'reserved'
+p.write_text(json.dumps(d))
+PY
+  e "$name" "BILLET_GATE_RETIRE_FIXTURES=$work/cases/$name/answers"
+  r_run "$name"
+  expect_refused "$name" 'Bind the reservation before collecting anything' 'reservation binding disagrees'
+  expect_host_commands "$name" 'control-a retire-classify 1;control-a retire-reserve 1;control-a retire-abandon 1;'
+  expect_no_task "$name" "Read the retiring host's clock before the first collection delegation"
+  r_no_ordinary_after_request "$name"
+done
+
+# R20: the classifier sees the actual damage AFTER preparation; it may not
+# enter the early account import, settle it, or remove the interrupted rewrite.
+cat >"$work/retirement-own-guard.py" <<'PY'
+import json, pathlib, sys
+p = pathlib.Path('/var/lib/billet/upgrades/active/guard.json')
+d = json.loads(p.read_text())
+if d.get('preparing', False) or d['holder'] != 'ci-1':
+    sys.exit('R20 must start with this converge\'s settled guard')
+if sys.argv[1] == 'preparing':
+    d['preparing'] = True
+    d['token'] = 'a' * 32
+    p.write_text(json.dumps(d))
+elif sys.argv[1] == 'interrupted-rewrite':
+    p.with_name('guard.json.tmp').write_text('interrupted guard record')
+else:
+    sys.exit('unknown own guard damage')
+PY
+for damage in preparing interrupted-rewrite; do
+  name=r20-$damage
+  r_new "$name"
+  a "$name" -e "billet_gate_own_guard=$damage" -e "billet_gate_own_guard_script=$work/retirement-own-guard.py"
+  r_answers "$name" "control-a:classify:1:dry-run-hold-$damage.json:0"
+  r_run "$name"
+  r_held "$name" hold
+  r_reported "$name" hold "${damage//-/ }"
+  r_no_collection "$name"
+  expect_play_task_ran "$name" 'Inject an unfinished own guard after preparation'
+  if [ "$damage" = preparing ]; then
+    expect_state "$name" record_preparing True
+  else
+    expect_state "$name" record_preparing False
+    expect_state "$name" record_tmp file
+  fi
+done
+
+# R17: the fake establishes the marker-before-journal window at the request;
+# its cleanup effect is gated on an actual abandon invocation, never on failure
+# alone. The unknown-intent-journal answer must be produced/harvested by Go.
+cat >"$work/retirement-window.py" <<'PY'
+import json, pathlib, sys
+root = pathlib.Path('/var/lib/billet')
+record = root / 'upgrades/active/guard.json'
+d = json.loads(record.read_text())
+if (root / 'retired/journal.json').exists():
+    sys.exit('R17 requires the journal still absent')
+marker = {'kind': 'retirement', 'id': '0123456789abcdef0123456789abcdef'}
+if sys.argv[1] == 'mark':
+    if 'transition' in d:
+        sys.exit('R17 started with a marker')
+    d['transition'] = marker
+elif sys.argv[1] == 'abandon':
+    if d.get('transition') != marker:
+        sys.exit('R17 abandonment did not see the request\'s marker')
+    del d['transition']
+else:
+    sys.exit('unknown retirement window action')
+record.write_text(json.dumps(d))
+PY
+# A per-case executable wrapper around the already-recording managed wrapper
+# plants the marker and observes cleanup; preparation still runs the real Go
+# guard. It has no retirement answer of its own.
+cat >"$work/retirement-window-wrapper" <<WRAP
+#!/bin/bash
+set -eu
+case "\$*" in
+  'server retire --input '*) '$python' '$work/retirement-window.py' mark ;;
+  'server retire --abandon-reservation '*)
+    if [ "\${BILLET_GATE_WINDOW_CLEANUP:-}" = success ]; then '$python' '$work/retirement-window.py' abandon; fi ;;
+esac
+exec /usr/bin/billet.window-backing "\$@"
+WRAP
+chmod 0755 "$work/retirement-window-wrapper"
+for cleanup in success refused unanswered released; do
+  name=r17-$cleanup
+  r_new "$name"
+  request_fixture=unknown-intent-journal
+  request_exit=3
+  abandon_fixture=abandoned-marker-cleared
+  abandon_exit=0
+  if [ "$cleanup" = released ]; then
+    request_fixture=refused-request-released
+    request_exit=2
+  else
+    p "$name" "mv /usr/bin/billet /usr/bin/billet.window-backing; cp '$work/retirement-window-wrapper' /usr/bin/billet"
+  fi
+  if [ "$cleanup" = refused ]; then abandon_fixture=refused-abandon-journal; abandon_exit=2; fi
+  r_answers "$name" "control-a:classify:1:dry-run-new-request.json:0;control-a:reserve:1:reserved.json:0;control-a:request:1:$request_fixture.json:$request_exit;control-a:abandon:1:$abandon_fixture.json:$abandon_exit"
+  e "$name" "BILLET_GATE_WINDOW_CLEANUP=$cleanup"
+  if [ "$cleanup" = unanswered ]; then e "$name" 'BILLET_GATE_DROP_ANSWER=retire-abandon:1'; fi
+  post "$name" "cp /var/lib/billet/upgrades/active/guard.json '$work/cases/$name/guard-after.json'"
+  r_run "$name"
+  "$python" - "$work/cases/$name/guard-after.json" "$cleanup" <<'PYMARKER'
+import json, sys
+d = json.load(open(sys.argv[1]))
+kept = sys.argv[2] in ['refused', 'unanswered']
+if ('transition' in d) != kept:
+    sys.exit('R17 left the wrong marker state after cleanup')
+if kept and d['transition'] != {'kind': 'retirement', 'id': '0123456789abcdef0123456789abcdef'}:
+    sys.exit('R17 changed an unproved marker')
+PYMARKER
+  expect_refused "$name" "Refuse the retirement's answer" "was $([ "$request_exit" = 3 ] && echo unknown || echo refused)"
+  # Compare the decoded final diagnostic with the producer's whole reason;
+  # a common word such as journal could come from cleanup alone.
+  final_fatal "$name" >"$work/cases/$name/final-failure"
+  "$python" - "$work/cases/$name/final-failure" "$work/retire-fixtures/$request_fixture.json" "$cleanup" "$work/retire-fixtures/$abandon_fixture.json" <<'PYWHY'
+import json, pathlib, sys
+text = pathlib.Path(sys.argv[1]).read_text()
+messages = [json.loads(line.strip().removeprefix('"msg": ').removesuffix(','))
+            for line in text.splitlines() if line.strip().startswith('"msg": ')]
+if len(messages) != 1:
+    sys.exit('R17 final failure did not contain one decoded diagnostic')
+message = messages[0]
+original = json.loads(pathlib.Path(sys.argv[2]).read_text())['why']
+if original not in message:
+    sys.exit('R17 lost the original request reason during cleanup')
+if sys.argv[3] == 'refused':
+    cleanup = json.loads(pathlib.Path(sys.argv[4]).read_text())['why']
+    if cleanup not in message or message.index(original) >= message.index(cleanup):
+        sys.exit('R17 did not report cleanup refusal after the original reason')
+if sys.argv[3] == 'unanswered' and "did not answer retirement's abandon call" not in message:
+    sys.exit('R17 did not report unanswered cleanup beside the original reason')
+PYWHY
+  r_no_ordinary_after_request "$name"
+  expect_path_absent "$name" /var/lib/billet/retired/journal.json
+  if [ "$cleanup" = released ]; then
+    expect_host_commands "$name" 'control-a retire-classify 1;control-a retire-reserve 1;control-a retire-request 1;'
+    expect_final "$name" 'reservation released; abandonment was skipped'
+  else
+    expect_host_commands "$name" 'control-a retire-classify 1;control-a retire-reserve 1;control-a retire-request 1;control-a retire-abandon 1;'
+    if [ "$cleanup" = success ]; then
+      expect_final "$name" 'The reservation was abandoned.'
+    else
+      expect_final "$name" 'Cleanup remains outstanding:'
+    fi
+    expect_final "$name" 'journal'
+  fi
+done

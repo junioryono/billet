@@ -4,7 +4,6 @@
 - name: Keep the pending completion and its recorded survivor
   ansible.builtin.set_fact:
     billet_retirement_completion: "{{ billet_retirement_result.completion }}"
-    billet_retirement_survivor: "{{ billet_retirement_classification.journal.survivor }}"
 
 - name: Observe whether this converge prepared the survivor
   vars:

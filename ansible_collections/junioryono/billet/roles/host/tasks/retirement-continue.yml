@@ -9,6 +9,8 @@
 
 - name: Keep this host's environment operand across the survivor handoff
   ansible.builtin.set_fact:
+    billet_retirement_survivor: "{{ billet_retirement_classification.journal.survivor }}"
+    billet_retirement_transition_id: "{{ billet_retirement_classification.journal.transition_id }}"
     billet_retirement_local_environment_file: "{{ billet_retirement_environment_file }}"
 
 - name: Read this host's clock for the continuation envelope

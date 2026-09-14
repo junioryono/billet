@@ -155,11 +155,11 @@
   ansible.builtin.fail:
     msg: >-
       Retirement holds this host ({{ billet_retirement_route }}): {{ billet_retirement_why }}
-      {{ 'New requests and reservation cancellation require the next caller revision.'
-         if billet_retirement_route in ['new-request', 'cancel'] else '' }}
+      {{ 'Reservation cancellation requires the next caller revision.'
+         if billet_retirement_route == 'cancel' else '' }}
   when:
     - not ansible_check_mode
-    - billet_retirement_route not in ['ordinary', 'continue', 'recovery']
+    - billet_retirement_route not in ['ordinary', 'continue', 'recovery', 'new-request']
 
 - name: Recover only the transaction the classifier admitted
   when:
@@ -180,3 +180,7 @@
   when:
     - billet_retirement_route == 'continue'
     - not ansible_check_mode
+
+- name: Request a new server-only retirement
+  ansible.builtin.include_tasks: retirement-request.yml
+  when: billet_retirement_route == 'new-request'
