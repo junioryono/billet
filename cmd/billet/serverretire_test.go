@@ -207,6 +207,9 @@ func TestTheServerRetireFixturesAreTheCommandsOwn(t *testing.T) {
 		"completed", "completed-already", "refused-self", "refused-deployment", "refused-conflict", "refused-input",
 		"acknowledged", "acknowledged-already", "refused-acknowledge-journal", "refused-acknowledge-mismatch",
 		"dry-run-request", "dry-run-unknown-journal", "dry-run-adopt", "dry-run-unknown-ledger",
+		"dry-run-ordinary", "dry-run-hold-unreadable-row", "dry-run-hold-damaged-identity",
+		"dry-run-new-request", "dry-run-cancel", "dry-run-continue", "dry-run-unsupported-variant",
+		"dry-run-recovery-guard", "dry-run-recovery-legacy", "done-unchanged",
 		"retired-settled", "retired-pending",
 	})
 }
