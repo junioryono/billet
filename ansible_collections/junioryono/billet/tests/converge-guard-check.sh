@@ -19,7 +19,7 @@
 # 2026-09-10 in the gate container, kernel 6.12.76-linuxkit, util-linux 2.39.3;
 # an upper directory on the container's own overlay root is refused, hence the
 # tmpfs). The managed binary and every staged candidate are RECORDING WRAPPERS
-# around immutable backing binaries built once from this checkout with three
+# around immutable backing binaries built once from this checkout with release
 # version stamps and `-tags billetgatecrash` (the crash seam, compiled into the
 # gate's binaries and no shipped one): a wrapper logs its argv and its
 # invocation number, fires the case's hook for exactly its own invocation,
@@ -1241,10 +1241,10 @@ invoker_uid=$(id -u); invoker_gid=$(id -g); invoker_name=$(id -un)
 # THE BACKING BINARIES, built once from this checkout, and their wrappers.
 # =============================================================================
 echo "building the backing binaries ..."
-for v in v0.10.0 v0.10.1 v0.9.0; do
+for v in v0.10.0 v0.10.1 v0.11.0 v0.9.0; do
   (cd "$repo_root" && go build -tags billetgatecrash -ldflags "-X github.com/junioryono/billet/internal/version.version=$v" -o "$bins/billet-$v" ./cmd/billet)
 done
-for v in v0.10.0 v0.10.1 v0.9.0; do
+for v in v0.10.0 v0.10.1 v0.11.0 v0.9.0; do
   write_wrapper "$bins/wrap-managed-$v" "$mnt/bin/billet-$v" managed
   write_wrapper "$bins/wrap-candidate-$v" "$mnt/bin/billet-$v" candidate
 done
@@ -1336,7 +1336,8 @@ if [ -s "$case_dir/plant.sh" ]; then
 fi
 : >"$case_dir/log"; : >"$case_dir/private"; : >"$case_dir/out"
 mkdir -p "$case_dir/calls"
-chown "$INVOKER_UID:$INVOKER_GID" "$case_dir/calls"
+: >"$case_dir/calls/index.jsonl"
+chown "$INVOKER_UID:$INVOKER_GID" "$case_dir/calls" "$case_dir/calls/index.jsonl"
 # A live, harmless process gives the service fake a pid whose cmdline the
 # finalizer can inspect. It is reaped before this namespace exits.
 sleep 3600 &

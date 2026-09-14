@@ -530,9 +530,10 @@
 - name: Keep the validated retirement answer for this call
   ansible.builtin.set_fact:
     billet_retire_valid: true
-    # Meaningful only for state-bearing classify, preview, tail and done calls:
-    # an unknown state holds ordinary tasks and confirms no terminal state.
-    # Callers must not consult this for complete, reserve, abandon or acknowledge.
+    # Request callers use this for preview, tail and done: an unknown state
+    # confirms no terminal state. Classify callers use the validated route;
+    # its unknown-state consistency check above already requires hold.
+    # Do not consult this for complete, reserve, abandon or acknowledge.
     billet_retire_state_known: "{{ 'state' in billet_retire_answer and billet_retire_answer.state != 'unknown' }}"
     billet_retire_reservation: >-
       {{ billet_retire_answer.reservation | default('')

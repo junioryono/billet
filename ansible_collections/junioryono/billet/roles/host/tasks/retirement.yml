@@ -106,13 +106,12 @@
       ansible.builtin.set_fact:
         billet_retirement_classification: "{{ billet_retire_answer }}"
         billet_retirement_route: >-
-          {{ billet_retire_route if billet_retire_state_known | bool
-             and (not billet_retirement_legacy | bool or billet_retire_route in ['ordinary', 'recovery']) else 'hold' }}
+          {{ billet_retire_route if not billet_retirement_legacy | bool
+             or billet_retire_route in ['ordinary', 'recovery'] else 'hold' }}
         billet_retirement_why: >-
-          {{ 'The retirement state is unknown.' if not billet_retire_state_known | bool
-             else ('A legacy claim must finish binary recovery before any retirement mutation.'
-                   if billet_retirement_legacy | bool and billet_retire_route not in ['ordinary', 'recovery']
-                   else billet_retire_answer.route_why | default('')) }}
+          {{ 'A legacy claim must finish binary recovery before any retirement mutation.'
+             if billet_retirement_legacy | bool and billet_retire_route not in ['ordinary', 'recovery']
+             else billet_retire_answer.route_why | default('') }}
   rescue:
     - name: Keep an unanswered classification held
       ansible.builtin.set_fact:

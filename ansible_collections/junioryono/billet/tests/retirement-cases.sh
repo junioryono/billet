@@ -2,6 +2,7 @@
 # Sourced by section R after its namespace runner and committed corpus exist.
 # The isolated entry proves routing; the boundary invokes the real main.yml.
 "$python" "$here/executable_version_check.py"
+"$python" "$here/retirement_config_check.py"
 
 cat >"$work/play-retirement.yml" <<'PLAY'
 ---
@@ -70,7 +71,7 @@ PLAY
 
 r_plant() { # case [version]
   plant "$1"
-  p "$1" "plant_root; plant_managed ${2:-v0.10.1}"
+  p "$1" "plant_root; plant_managed ${2:-v0.11.0}"
   a "$1" -e billet_exclusion_platform=Linux -e billet_binary_src=
   e "$1" BILLET_GATE_RETIRE_ENV_SET=1
   e "$1" "BILLET_GATE_ANSWER=release:1:$here/fixtures/release-inspect/postgres-controller-guarded.json;release:2:$here/fixtures/release-inspect/postgres-controller-guarded.json"
@@ -94,12 +95,30 @@ for line in open(sys.argv[1]):
         sys.exit('a check-mode classifier was given an invented held guard')
 PYARGS
 }
-r_held() { # case route
-  expect_refused "$1" 'Refuse a held or unavailable retirement route' "Retirement holds this host ($2)"
+r_held() { # case route [first-failure-task]
+  expect_refused "$1" "${3:-Refuse a held or unavailable retirement route}" "Retirement holds this host ($2)"
   expect_no_ordinary "$1"
   expect_no_play_task "$1" 'Ordinary convergence sentinel'
   expect_host_commands "$1" 'control-a retire-classify 1;'
   expect_no_task "$1" 'Inspect the transaction claim before recovery'
+}
+r_reported() { # case route [reason]
+  expect_ran "$1" 'Report the retirement route'
+  "$python" - "$work/cases/$1/out" "$2" "${3:-}" <<'PYREPORT'
+import json, pathlib, sys
+text = pathlib.Path(sys.argv[1]).read_text()
+header = 'TASK [junioryono.billet.host : Report the retirement route]'
+blocks = text.split(header)
+if len(blocks) != 2:
+    sys.exit('the retirement route was not reported exactly once')
+block = blocks[1].split('TASK [', 1)[0]
+messages = [json.loads(line.strip().removeprefix('"msg": ').removesuffix(','))
+            for line in block.splitlines() if line.strip().startswith('"msg": ')]
+if len(messages) != 1 or not messages[0].startswith('Retirement route ' + sys.argv[2] + ': '):
+    sys.exit('the reported retirement route differs: ' + repr(messages))
+if sys.argv[3] and sys.argv[3] not in messages[0]:
+    sys.exit('the reported retirement reason differs: ' + repr(messages))
+PYREPORT
 }
 r_continuation() { # case request-count
   "$python" - "$work/cases/$1/calls" "$2" <<'PY'
@@ -112,7 +131,7 @@ if len(requests) != count:
 for r in requests:
     args = r['argv']
     if r['host'] != 'control-a' or '--installed-sha256' in args or '--server-only' in args:
-        sys.exit('the continuation obtained a digest or fresh-request operand')
+        sys.exit('the continuation passed an installed digest or fresh-request operand')
     if args[args.index('--survivor-host') + 1] != 'control-b':
         sys.exit('the continuation did not use the recorded survivor')
     if args[args.index('--retiring-host') + 1] != 'control-a':
@@ -130,7 +149,7 @@ for r in requests:
 if any(r['host'] != 'control-a' for r in records):
     sys.exit('the continuation contacted another host')
 if any(r['command'] in ['status', 'migrate-endpoint', 'registration'] for r in records):
-    sys.exit('the continuation collected fleet or installed configuration evidence')
+    sys.exit('the continuation called a fleet-evidence command')
 PY
 }
 
@@ -187,7 +206,7 @@ expect_allowed r5-handoff
 expect_host_commands r5-handoff 'control-a retire-classify 1;control-a retire-request 1;control-b retire-complete 1;control-a retire-acknowledge 1;control-a retire-request 2;'
 expect_no_ordinary r5-handoff
 expect_no_play_task r5-handoff 'Ordinary convergence sentinel'
-expect_ran r5-handoff 'Settle locally after acknowledging the row'
+expect_ran r5-handoff 'Require a known completed server-only retirement'
 
 "$python" - "$work/cases/r5-handoff/calls" "$work/retire-fixtures" <<'PYTAIL'
 import json, pathlib, sys
@@ -197,7 +216,7 @@ retire = [r for r in records if r['command'].startswith('retire-')]
 for call in retire:
     args = call['argv']
     if '--installed-sha256' in args:
-        sys.exit('the pending-row tail obtained an installed digest')
+        sys.exit('the pending-row tail passed an installed digest')
     if call['command'] == 'retire-acknowledge':
         if '--environment-file' in args or '--survivor-host' in args:
             sys.exit('acknowledgement was given ledger operands')
@@ -216,13 +235,15 @@ if any(r['host'] != 'control-a' and r['command'] != 'retire-complete' for r in r
     sys.exit('a pending continuation collected the survivor fleet')
 PYTAIL
 
-# R8: both desired policies beside installed controller, unknown, node-only
-# and never-commissioned evidence. A skipped classifier is asserted as skipped.
+# R8: v0.10.1 is a maintenance release WITHOUT the classifier. Both desired
+# policies beside controller, unknown, node-only and never-commissioned evidence.
+# A skipped classifier is asserted as skipped, even though the backing build
+# has the current code and could answer if the floor incorrectly admitted it.
 for policy in true false; do
   for shape in controller unknown node fresh; do
     for requested in false true; do
       name=r8-$shape-$policy-$requested
-      r_plant "$name" v0.10.0
+      r_plant "$name" v0.10.1
       a "$name" -e "billet_enable_server=$policy" -e "billet_server_retire=$requested"
       case "$shape" in
         controller) p "$name" 'mkdir -p /etc/billet /var/lib/billet/server; printf "server:\n  state_dir: /var/lib/billet/server\n" >/etc/billet/billet.yaml; printf minted >/var/lib/billet/server/deployment-id' ;;
@@ -244,6 +265,72 @@ for policy in true false; do
       expect_no_task "$name" 'Ask the retirement classifier'
     done
   done
+done
+
+# An unknown route must traverse the caller's rescue and ordinary boundary,
+# not only R7's parser harness. Corrupt a case-local copy, never the corpus.
+r_plant r7-caller-unknown-route
+"$python" - "$work/retire-fixtures/dry-run-ordinary.json" "$work/cases/r7-caller-unknown-route/unknown-route.json" <<'PYROUTE'
+import json, sys
+answer = json.load(open(sys.argv[1]))
+answer['route'] = 'invented'
+with open(sys.argv[2], 'w') as stream:
+    json.dump(answer, stream)
+PYROUTE
+e r7-caller-unknown-route "BILLET_GATE_RETIRE_FIXTURES=$work/cases/r7-caller-unknown-route"
+r_answers r7-caller-unknown-route 'control-a:classify:1:unknown-route.json:0'
+r_run r7-caller-unknown-route
+r_held r7-caller-unknown-route hold 'Judge each retirement member'
+expect_final r7-caller-unknown-route 'Retirement holds this host (hold)'
+grep -qF 'answered with a member this role cannot read: route' "$work/cases/r7-caller-unknown-route/out" || fail 'r7-caller-unknown-route: the parser did not name the unknown route'
+r_reported r7-caller-unknown-route hold
+
+# The classifier already normalizes an unknown state into hold. Its reason
+# must survive intact; the caller may not replace it with a state judgement.
+r_plant r7-caller-unknown-state
+"$python" - "$work/retire-fixtures/dry-run-hold-unreadable-row.json" "$work/cases/r7-caller-unknown-state/unknown-state.json" <<'PYSTATE'
+import json, sys
+answer = json.load(open(sys.argv[1]))
+answer['state'] = 'unknown'
+with open(sys.argv[2], 'w') as stream:
+    json.dump(answer, stream)
+PYSTATE
+e r7-caller-unknown-state "BILLET_GATE_RETIRE_FIXTURES=$work/cases/r7-caller-unknown-state"
+r_answers r7-caller-unknown-state 'control-a:classify:1:unknown-state.json:0'
+r_run r7-caller-unknown-state
+r_held r7-caller-unknown-state hold
+reason=$("$python" -c 'import json, sys; print(json.load(open(sys.argv[1]))["route_why"])' "$work/cases/r7-caller-unknown-state/unknown-state.json")
+r_reported r7-caller-unknown-state hold "$reason"
+
+# YAML-decodable package seeds may locate before semantic validation; broken
+# bytes and missing locators may never substitute the clean packaged path.
+for shape in merged malformed duplicate missing-locator seeded; do
+  name=r8-config-$shape
+  r_plant "$name" v0.10.1
+  p "$name" 'mkdir -p /etc/billet'
+  case "$shape" in
+    merged) p "$name" 'mkdir -p /var/lib/billet/custom; printf minted >/var/lib/billet/custom/deployment-id; printf "server: {<<: {}, identity_dir: /var/lib/billet/custom}\n" >/etc/billet/billet.yaml' ;;
+    malformed) p "$name" 'printf "server: [\n" >/etc/billet/billet.yaml' ;;
+    duplicate) p "$name" 'printf "server: {identity_dir: /var/lib/billet/first, identity_dir: /var/lib/billet/second}\n" >/etc/billet/billet.yaml' ;;
+    missing-locator) p "$name" 'printf "server: {}\n" >/etc/billet/billet.yaml' ;;
+    seeded) p "$name" 'mkdir -p /var/lib/billet/server; printf "server: {state_dir: /var/lib/billet/server, max_vcpu: 0}\n" >/etc/billet/billet.yaml' ;;
+  esac
+  r_run "$name"
+  if [ "$shape" = seeded ]; then
+    expect_allowed "$name"
+    expect_play_task_ran "$name" 'Ordinary convergence sentinel'
+  else
+    expect_refused "$name" 'Refuse a held or unavailable retirement route' 'Retirement holds this host (hold)'
+    case "$shape" in
+      merged) expect_final "$name" 'status is present' ;;
+      missing-locator) expect_final "$name" 'installed server identity locator is missing, ambiguous or invalid' ;;
+      *) expect_final "$name" 'installed configuration cannot be decoded uniquely' ;;
+    esac
+    expect_no_ordinary "$name"
+    expect_no_play_task "$name" 'Ordinary convergence sentinel'
+  fi
+  expect_host_commands "$name" ''
+  expect_no_task "$name" 'Ask the retirement classifier'
 done
 
 # A journal remains a veto even when the remaining local evidence is fresh.
@@ -276,6 +363,33 @@ for artefact in absent present; do
   fi
   expect_host_commands "$name" ''
   expect_no_task "$name" 'Ask the retirement classifier'
+done
+
+# An absent answerer cannot establish the absence of a shared reservation,
+# under either desired server policy, even with all fixed artefacts absent.
+for policy in true false; do
+  for shape in controller unknown; do
+    name=r8-empty-$shape-$policy
+    r_plant "$name"
+    p "$name" 'rm /usr/bin/billet; mkdir -p /etc/billet'
+    a "$name" -e "billet_enable_server=$policy"
+    if [ "$shape" = controller ]; then
+      p "$name" 'mkdir -p /var/lib/billet/server; printf "server: {state_dir: /var/lib/billet/server}\n" >/etc/billet/billet.yaml; printf minted >/var/lib/billet/server/deployment-id'
+    else
+      p "$name" 'ln -s /missing/config /etc/billet/billet.yaml'
+    fi
+    r_run "$name"
+    expect_refused "$name" 'Refuse a held or unavailable retirement route' 'Retirement holds this host (hold)'
+    if [ "$shape" = controller ]; then
+      expect_final "$name" 'status is present'
+    else
+      expect_final "$name" 'installed configuration could not be examined or read as a regular file'
+    fi
+    expect_no_ordinary "$name"
+    expect_no_play_task "$name" 'Ordinary convergence sentinel'
+    expect_host_commands "$name" ''
+    expect_no_task "$name" 'Ask the retirement classifier'
+  done
 done
 
 # The missing/unknown version type cases enter the caller, not the JSON parser.
@@ -338,10 +452,43 @@ for spec in ordinary:dry-run-ordinary hold:dry-run-hold-unreadable-row continue:
   r_run "$name"
   expect_allowed "$name"
   expect_host_commands "$name" 'control-a retire-classify 1;'
-  expect_ran "$name" 'Report the retirement route'
+  r_reported "$name" "$route"
   if [ "$route" = ordinary ]; then expect_play_task_ran "$name" 'Ordinary convergence sentinel'; else expect_no_play_task "$name" 'Ordinary convergence sentinel'; fi
   expect_no_ordinary "$name"
   expect_no_task "$name" 'Inspect the transaction claim before recovery'
+done
+
+# Check mode reports holds successfully even when capability or an attempted
+# answer is unavailable; none may fall through to ordinary work or recovery.
+for kind in incapable empty unreadable unanswered; do
+  name=r9-$kind
+  if [ "$kind" = incapable ]; then r_plant "$name" v0.10.1; else r_plant "$name"; fi
+  a "$name" --check
+  case "$kind" in
+    incapable|empty)
+      p "$name" 'mkdir -p /etc/billet /var/lib/billet/server; printf "server: {state_dir: /var/lib/billet/server}\n" >/etc/billet/billet.yaml; printf minted >/var/lib/billet/server/deployment-id'
+      if [ "$kind" = empty ]; then p "$name" 'rm /usr/bin/billet'; fi ;;
+    unreadable) a "$name" -e '{"billet_gate_version":{"type":"unreadable"}}' ;;
+    unanswered)
+      r_answers "$name" 'control-a:classify:1:dry-run-ordinary.json:0'
+      e "$name" 'BILLET_GATE_DROP_ANSWER=retire-classify:1' ;;
+  esac
+  r_run "$name"
+  expect_allowed "$name"
+  case "$kind" in
+    incapable|empty) r_reported "$name" hold 'status is present' ;;
+    unreadable) r_reported "$name" hold 'version type unreadable' ;;
+    unanswered) r_reported "$name" hold 'did not answer retirement' ;;
+  esac
+  expect_no_ordinary "$name"
+  expect_no_play_task "$name" 'Ordinary convergence sentinel'
+  expect_no_task "$name" 'Inspect the transaction claim before recovery'
+  if [ "$kind" = unanswered ]; then
+    expect_host_commands "$name" 'control-a retire-classify 1;'
+  else
+    expect_host_commands "$name" ''
+    expect_no_task "$name" 'Ask the retirement classifier'
+  fi
 done
 
 # R10's installed-both request fixture; the desired configuration has no node.
@@ -372,7 +519,7 @@ r_recovery() { # case guard|legacy committed|missing
   local name=$1 shape=$2 decision=$3
   r_plant "$name"
   r_services "$name" control-a
-  p "$name" 'plant_recovery recovery-20260909T120000-12345678 v0.10.1
+  p "$name" 'plant_recovery recovery-20260909T120000-12345678 v0.11.0
 mkdir -p /var/lib/billet/server
 printf fenced >/var/lib/billet/server/billet.maintenance'
   "$python" - "$work/cases/$name/manifest.yml" <<'PY'
@@ -422,7 +569,7 @@ expect_state r21-check pointer symlink
 expect_no_ordinary r21-check
 expect_no_task r21-check 'Inspect the transaction claim before recovery'
 expect_no_play_task r21-check 'Ordinary convergence sentinel'
-expect_ran r21-check 'Report the retirement route'
+r_reported r21-check recovery
 
 # A legacy claim is not an automatic hold: ordinary is admitted, while a
 # retirement continuation must wait for a later guard preparation.

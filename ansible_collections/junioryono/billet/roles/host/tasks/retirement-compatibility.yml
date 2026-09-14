@@ -19,7 +19,11 @@
 - name: Start the compatibility observation at unknown
   ansible.builtin.set_fact:
     billet_retirement_screen_clear: true
-    billet_retirement_installed: {config: unreadable, roles: unknown, identity_dir: ''}
+    billet_retirement_installed:
+      config: unreadable
+      roles: unknown
+      identity_dir: ''
+      why: The installed configuration could not be examined or read as a regular file.
     billet_retirement_identity_clear: false
 
 - name: Keep every present or unexamined artefact as a veto
@@ -46,10 +50,10 @@
 
 - name: Note a positively absent installed configuration
   ansible.builtin.set_fact:
-    billet_retirement_installed: {config: absent, roles: unknown, identity_dir: /var/lib/billet/server}
+    billet_retirement_installed: "{{ none | junioryono.billet.retirement_config }}"
   when:
     - billet_retirement_config_stat.stat is defined
-    - not billet_retirement_config_stat.stat.exists
+    - billet_retirement_config_stat.stat.exists | default(none) is sameas false
 
 - name: Read the installed configuration for compatibility
   ansible.builtin.slurp:
@@ -102,6 +106,15 @@
       Install a classifier at or after {{ billet_retire_capability_floor }} and converge again.
   when: billet_retirement_screen_clear | bool
 
+- name: Hold an installed configuration whose locator cannot be established
+  ansible.builtin.set_fact:
+    billet_retirement_why: >-
+      Retirement compatibility holds: {{ billet_retirement_installed.why }}
+      The packaged identity path is used only when the installed configuration is positively absent.
+  when:
+    - billet_retirement_screen_clear | bool
+    - billet_retirement_installed.config in ['malformed', 'unreadable']
+
 - name: Admit only a positively node-only or never-commissioned host
   ansible.builtin.set_fact:
     billet_retirement_route: ordinary
@@ -121,7 +134,7 @@
     - >-
       billet_retirement_installed.roles == 'node' or
       (billet_retirement_identity_clear | bool and
-       (billet_retirement_installed.config in ['absent', 'malformed'] or
+       (billet_retirement_installed.config == 'absent' or
         (billet_retirement_installed.config == 'present' and billet_retirement_installed.roles == 'server')))
 
 - name: Refuse a requested retirement without a capable answerer by name
