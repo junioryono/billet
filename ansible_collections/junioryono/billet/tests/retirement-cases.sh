@@ -137,9 +137,9 @@ r_held() { # case route [first-failure-task [host]]
   expect_host_commands "$1" "${4:-control-a} retire-classify 1;"
   expect_no_task "$1" 'Inspect the transaction claim before recovery'
 }
-r_reported() { # case route [reason]
+r_reported() { # case route [reason [output-file]]
   expect_ran "$1" 'Report the retirement route'
-  "$python" - "$work/cases/$1/out" "$2" "${3:-}" <<'PYREPORT'
+  "$python" - "$work/cases/$1/${4:-out}" "$2" "${3:-}" <<'PYREPORT'
 import json, pathlib, sys
 text = pathlib.Path(sys.argv[1]).read_text()
 header = 'TASK [junioryono.billet.host : Report the retirement route]'
@@ -155,33 +155,78 @@ if sys.argv[3] and sys.argv[3] not in messages[0]:
     sys.exit('the reported retirement reason differs: ' + repr(messages))
 PYREPORT
 }
-r_continuation() { # case request-count
-  "$python" - "$work/cases/$1/calls" "$2" <<'PY'
-import json, pathlib, sys
+r_continuation() { # case request-count [environment-file [handoff]]
+  "$python" - "$work/cases/$1/calls" "$2" "$HOLDER" "$here/fixtures/release-inspect/postgres-controller-guarded.json" "${3:-}" "${4:-}" <<'PY'
+import datetime, decimal, json, pathlib, re, sys
 root, count = pathlib.Path(sys.argv[1]), int(sys.argv[2])
+holder, inspect_fixture, environment_file, handoff = sys.argv[3:]
+expected_inspect = json.loads(pathlib.Path(inspect_fixture).read_text())
 records = [json.loads(line) for line in (root / 'index.jsonl').read_text().splitlines()]
 requests = [r for r in records if r['command'] == 'retire-request']
 if len(requests) != count:
     sys.exit('the continuation count differs')
+# All continuation fixtures record control-b; inventory independently names control-a.
+expected_args = ['server', 'retire', '--input', '-', '--json', '--run', holder,
+                 '--retiring-host', 'control-a', '--survivor-host', 'control-b',
+                 '--config', '/etc/billet/billet.yaml']
+if environment_file:
+    expected_args += ['--environment-file', environment_file]
+# The handoff reuses its envelope; a second converge must collect its own.
+converges = [records]
+first_index = root.parent / 'calls-first.jsonl'
+if first_index.exists():
+    first = [json.loads(line) for line in first_index.read_text().splitlines()]
+    if records[:len(first)] != first:
+        sys.exit('the first converge call snapshot differs')
+    converges = [first, records[len(first):]]
+for calls in converges:
+    inspections = [r for r in calls if r['argv'][:1] == ['release']]
+    if len(inspections) != 1:
+        sys.exit('each continuation converge must inspect locally exactly once')
+    inspection = inspections[0]
+    if inspection['host'] != 'control-a' or inspection['argv'] != ['release', 'inspect', '--json', '--config', '/etc/billet/billet.yaml']:
+        sys.exit('the local continuation inspection argv differs')
+    local_requests = [r for r in calls if r['command'] == 'retire-request']
+    if not local_requests or any(r['sequence'] <= inspection['sequence'] for r in local_requests):
+        sys.exit('the continuation did not collect its inspection before requesting')
+
+def timestamp(value, member):
+    # Require RFC 3339 syntax before parsing the calendar and timezone; retain
+    # fractional precision when comparing, beyond datetime's microseconds.
+    match = re.fullmatch(r'([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(\.[0-9]+)?(Z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])', value) if isinstance(value, str) else None
+    if match is None:
+        sys.exit(member + ' is not an RFC 3339 timestamp')
+    seconds, fraction, zone = match.groups()
+    try:
+        parsed = datetime.datetime.fromisoformat(seconds + zone.replace('Z', '+00:00'))
+    except ValueError:
+        sys.exit(member + ' is not an RFC 3339 timestamp')
+    return parsed, decimal.Decimal('0' + (fraction or ''))
+
 for r in requests:
-    args = r['argv']
-    if r['host'] != 'control-a' or '--installed-sha256' in args or '--server-only' in args:
-        sys.exit('the continuation passed an installed digest or fresh-request operand')
-    if args[args.index('--survivor-host') + 1] != 'control-b':
-        sys.exit('the continuation did not use the recorded survivor')
-    if args[args.index('--retiring-host') + 1] != 'control-a':
-        sys.exit('the retiring host was not independently bound')
+    if r['host'] != 'control-a' or r['argv'] != expected_args:
+        sys.exit('the complete continuation argv differs: ' + repr(r['argv']))
     doc = json.loads((root / r['stdin']).read_text())
     if set(doc) != {'schema', 'round', 'self', 'survivor', 'nodes', 'desired'}:
         sys.exit('the continuation document has the wrong member set')
-    if doc['schema'] != 1 or doc['survivor'] is not None or doc['nodes'] != {} or doc['desired'] is not None:
+    if type(doc['schema']) is not int or doc['schema'] != 1 or doc['survivor'] is not None or doc['nodes'] != {} or doc['desired'] is not None:
         sys.exit('the continuation collected fleet evidence')
-    if doc['self']['host'] != 'control-a' or not isinstance(doc['self']['inspect'], dict):
-        sys.exit('the continuation lacks this host report')
-    if not doc['round']['id'] or doc['round']['started_at'] != doc['self']['collected_at']:
-        sys.exit('the continuation lacks its round')
+    if set(doc['self']) != {'host', 'collected_at', 'inspect', 'status'} or set(doc['round']) != {'id', 'started_at'}:
+        sys.exit('the continuation envelope or round has the wrong member set')
+    if doc['self']['host'] != 'control-a' or doc['self']['inspect'] != expected_inspect:
+        sys.exit('the continuation did not carry the local producer inspection')
+    if doc['self']['status'] is not None:
+        sys.exit('the continuation must carry a null self status')
+    started = timestamp(doc['round']['started_at'], 'round.started_at')
+    collected = timestamp(doc['self']['collected_at'], 'self.collected_at')
+    if started > collected:
+        sys.exit('the continuation inspection predates its round')
+    if doc['round']['id'] != holder + '-' + doc['round']['started_at']:
+        sys.exit('the continuation round does not bind this holder and start')
 # A fleet collection may run a command other than retirement; see ALL calls.
-if any(r['host'] != 'control-a' for r in records):
+if any(arg == '--installed-sha256' or arg.startswith('--installed-sha256=') for r in records for arg in r['argv']):
+    sys.exit('a continuation case passed an installed digest')
+if any(r['host'] != 'control-a' and not (handoff == 'handoff' and r['host'] == 'control-b' and r['command'] == 'retire-complete') for r in records):
     sys.exit('the continuation contacted another host')
 if any(r['command'] in ['status', 'migrate-endpoint', 'registration'] for r in records):
     sys.exit('the continuation called a fleet-evidence command')
@@ -211,6 +256,7 @@ for fixture in dry-run-continue dry-run-unknown-ledger dry-run-unknown-journal d
   expect_no_play_task "$name" 'Ordinary convergence sentinel'
   expect_host_commands "$name" 'control-a retire-classify 1;control-a retire-request 1;'
   r_continuation "$name" 1
+  r_reported "$name" continue
   expect_no_task "$name" 'Inspect the transaction claim before recovery'
 done
 
@@ -279,6 +325,8 @@ expect_host_commands r5-handoff 'control-a retire-classify 1;control-a retire-re
 expect_no_ordinary r5-handoff
 expect_no_play_task r5-handoff 'Ordinary convergence sentinel'
 expect_ran r5-handoff 'Require a known completed server-only retirement'
+r_continuation r5-handoff 2 /etc/billet/server.env handoff
+r_reported r5-handoff continue
 
 "$python" - "$work/cases/r5-handoff/calls" "$work/retire-fixtures" <<'PYTAIL'
 import json, pathlib, sys
@@ -726,6 +774,7 @@ for route in ordinary continue; do
     expect_host_commands "$name" 'control-a retire-classify 1;'
   else
     r_held "$name" hold
+    r_reported "$name" hold
     expect_final "$name" 'A legacy claim must finish binary recovery'
   fi
   expect_no_task "$name" 'Inspect the transaction claim before recovery'
@@ -768,6 +817,8 @@ expect_allowed r-boundary
 expect_no_ordinary r-boundary
 expect_host_commands r-boundary 'control-a retire-classify 1;control-a retire-request 1;control-a retire-classify 2;control-a retire-request 2;'
 r_continuation r-boundary 2
+r_reported r-boundary continue
+r_reported r-boundary continue '' out-second
 expect_path_absent r-boundary /var/lib/billet/server
 expect_path_absent r-boundary /etc/billet/billet.yaml
 for unit in billet-server.service billet-node.service billet-upgrade.timer billet-backup.timer billet-backup.service var-lib-billet-server.mount; do
