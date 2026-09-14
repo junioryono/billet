@@ -164,8 +164,8 @@ var ErrUntrustworthySession = errors.New("server: the scale set returned somethi
 
 // errQuarantinableCompletion is an untrustworthy completion that creates no
 // unknown remote commitment. Its payload cannot change on redelivery, but the
-// local ledger may still converge, so Run retries it before acknowledging it
-// away. Other untrustworthy responses remain immediately fatal.
+// local ledger may still converge, so Run retries it. Quarantine may acknowledge
+// it only when no candidate work is held. Other refusals remain immediately fatal.
 var errQuarantinableCompletion = fmt.Errorf("%w: the completion has no safe identity",
 	ErrUntrustworthySession)
 
@@ -176,10 +176,12 @@ var errQuarantinableStarted = fmt.Errorf("%w: the started identity contradicts i
 	ErrUntrustworthySession)
 
 // poisonedMessageError carries the valid completions beside a poison so they can
-// be made durable after the whole message is finally acknowledged.
+// be made durable after the whole message is finally acknowledged. A candidate
+// hold forbids that acknowledgement even after the quarantine retry budget.
 type poisonedMessageError struct {
 	cause       error
 	completions []Job
+	held        bool
 }
 
 func (e *poisonedMessageError) Error() string { return e.cause.Error() }
@@ -310,9 +312,9 @@ type Listener struct {
 	// number sent to GitHub is only ever capacity this listener took from the
 	// allocator, never one computed from headroom.
 	running map[int64]*alloc.Lease
-	// Assignment facts retained for resolveActualJob while the lease is running.
+	// Resolved aliases retain consumed offer facts while the lease is running.
 	// A durable busy pool binding supersedes these intended-job facts.
-	runningJobs map[int64]Job
+	runningJobs map[int64]actualJobIdentity
 	// Restart-surviving runner leases held by the node rather than this
 	// listener. They count in GitHub's total pool capacity but do not enter the
 	// listener's heartbeat or teardown ownership.
@@ -435,7 +437,7 @@ func NewListener(a *alloc.Allocator, tier string, session Session, opts ...Optio
 		tier:          tier,
 		session:       session,
 		log:           slog.Default(),
-		runningJobs:   make(map[int64]Job),
+		runningJobs:   make(map[int64]actualJobIdentity),
 		running:       make(map[int64]*alloc.Lease),
 		adopted:       make(map[string]bool),
 		acquiring:     make(map[int64]*promise),
@@ -1417,6 +1419,10 @@ func (l *Listener) Run(ctx context.Context) error {
 					continue
 				}
 
+				if poison.held {
+					// Ending the session preserves redelivery of held assignments.
+					return stopping(ctx, poison)
+				}
 				handled := *msg
 				handled.Completed = poison.completions
 				if err := l.acknowledge(pollCtx, &handled); err != nil {
@@ -3071,6 +3077,9 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 	finished := make([]actualJobIdentity, 0, len(resolved.completed))
 	completed := make([]Job, 0, len(resolved.completed))
 	for _, entry := range resolved.completed {
+		if containsActual(resolved.held, entry.actual) {
+			continue
+		}
 		if entry.binding != nil {
 			if err := l.restorePoolLease(ctx, *entry.binding); err != nil {
 				return err
@@ -3088,6 +3097,7 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 		poison = &poisonedMessageError{
 			cause:       errors.Join(resolved.poisoned...),
 			completions: slices.Clone(completed),
+			held:        len(resolved.held) > 0,
 		}
 	}
 
@@ -3192,7 +3202,7 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 		// AVAILABLE is what gets acquired. Available is the offer; Assigned is the
 		// confirmation that an offer was claimed. Acquiring from Assigned asks
 		// GitHub to claim work it has already handed over, and drops every offer.
-		if err := l.acquireUnfinished(ctx, resolved.available, finished, resolved.committed); err != nil {
+		if err := l.acquireUnfinished(ctx, resolved.available, finished, resolved.held, resolved.committed); err != nil {
 			return err
 		}
 	}
@@ -3215,7 +3225,7 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 	// Assignment filtering follows resolveActualJob, never the cleanup request.
 	for _, entry := range resolved.assigned {
 		job := entry.job
-		if containsActual(finished, entry.actual) {
+		if containsActual(finished, entry.actual) || containsActual(resolved.held, entry.actual) {
 			continue
 		}
 		if assignmentDeficit == 0 {
@@ -3244,8 +3254,11 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 
 	if msg.Statistics != nil {
 		l.observed = msg.Statistics
-		if err := l.reconcilePool(ctx, msg.Statistics.TotalAssignedJobs); err != nil {
-			return err
+		// Aggregate demand cannot launch a pool runner for a held candidate.
+		if len(resolved.held) == 0 {
+			if err := l.reconcilePool(ctx, msg.Statistics.TotalAssignedJobs); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -3652,13 +3665,13 @@ func (l *Listener) acquire(ctx context.Context, available []Job) error {
 	if err != nil {
 		return err
 	}
-	return l.acquireUnfinished(ctx, resolved.available, nil, resolved.committed)
+	return l.acquireUnfinished(ctx, resolved.available, nil, nil, resolved.committed)
 }
 
 // acquireUnfinished uses resolveActualJob's rule for completion and commitment
 // filtering. Wire request IDs are retained only for the AcquireJobs protocol.
 func (l *Listener) acquireUnfinished(ctx context.Context, available []resolvedJob,
-	finished []actualJobIdentity, commitments []jobCommitment,
+	finished, held []actualJobIdentity, commitments []jobCommitment,
 ) error {
 	if len(available) == 0 {
 		return nil
@@ -3672,6 +3685,9 @@ func (l *Listener) acquireUnfinished(ctx context.Context, available []resolvedJo
 	for _, entry := range available {
 		protocolID := entry.protocolID
 		job := entry.job
+		if containsActual(held, entry.actual) {
+			continue
+		}
 		if containsActual(finished, entry.actual) || containsActual(committed, entry.actual) {
 			l.forgetAvailable(entry.actual)
 			continue
@@ -3934,11 +3950,25 @@ func (l *Listener) assignResolved(ctx context.Context, entry resolvedJob) (*allo
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	// Already ours. An unacknowledged message is redelivered, so this is an
-	// ordinary event rather than a fault — and consuming a second lease for one
-	// job would leak capacity that nothing ever gives back.
+	var known []actualJobIdentity
 	for _, c := range commitments {
-		if c.promise == nil && c.heldBy(l) && sameActualJob(entry.actual, c.actual) {
+		if c.heldBy(l) {
+			known = append(known, c.actual)
+		}
+	}
+	candidates := actualJobCandidates(entry.actual, entry.protocolID, known)
+	if len(candidates) > 1 {
+		return nil, false, fmt.Errorf("%w: assignment %d matches several commitments",
+			ErrUntrustworthySession, job.RequestID)
+	}
+	actual := entry.actual
+	if len(candidates) == 1 {
+		actual = mergeActual(actual, candidates[0])
+	}
+	// Already ours. Retain any newly resolved aliases on redelivery as well.
+	for _, c := range commitments {
+		if c.promise == nil && c.heldBy(l) && sameActualJob(actual, c.actual) {
+			l.runningJobs[c.key] = mergeActual(c.actual, actual)
 			return nil, false, nil
 		}
 	}
@@ -3976,12 +4006,13 @@ func (l *Listener) assignResolved(ctx context.Context, entry resolvedJob) (*allo
 	var promiseKey int64
 	promised := false
 	for _, c := range commitments {
-		if c.promise != nil && c.heldBy(l) && sameActualJob(entry.actual, c.actual) {
+		if c.promise != nil && c.heldBy(l) && sameActualJob(actual, c.actual) {
 			if promised {
 				return nil, false, fmt.Errorf("%w: assignment %d matches several promises",
 					ErrUntrustworthySession, job.RequestID)
 			}
 			lease, promiseKey, promised = c.lease, c.key, true
+			actual = mergeActual(actual, c.actual)
 		}
 	}
 
@@ -4026,7 +4057,7 @@ func (l *Listener) assignResolved(ctx context.Context, entry resolvedJob) (*allo
 	delete(l.heldOrder, lease.ID)
 
 	l.running[job.RequestID] = lease
-	l.runningJobs[job.RequestID] = job
+	l.runningJobs[job.RequestID] = actual
 
 	return lease, true, nil
 }

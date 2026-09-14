@@ -23,6 +23,7 @@ type resolvedJob struct {
 	actual     actualJobIdentity
 	cleanup    Job
 	binding    *alloc.PoolRunner
+	held       []actualJobIdentity
 }
 
 type jobResolution int
@@ -39,6 +40,7 @@ type resolvedMessage struct {
 	completed []resolvedJob
 	committed []jobCommitment
 	poisoned  []error
+	held      []actualJobIdentity
 }
 
 // jobCommitment keeps scheduler aliases separate from their renewal ownership.
@@ -98,6 +100,51 @@ func mergeActual(a, b actualJobIdentity) actualJobIdentity {
 		a.run = b.run
 	}
 	return a
+}
+
+// actualJobCandidates coalesces consistent aliases before using a unique wire
+// request to distinguish conflicting jobs. A wildcard shared by contradictory
+// candidates must not be assigned to whichever candidate happens to come first.
+func actualJobCandidates(actual actualJobIdentity, requestID int64, known []actualJobIdentity) []actualJobIdentity {
+	var candidates []actualJobIdentity
+	for _, prior := range known {
+		if sameActualJob(actual, prior) {
+			candidates = append(candidates, prior)
+		}
+	}
+	for i := 0; i < len(candidates); i++ {
+		for j := i + 1; j < len(candidates); {
+			a, b := candidates[i], candidates[j]
+			consistent := sameActualJob(a, b)
+			for _, other := range candidates {
+				if sameActualJob(a, other) != sameActualJob(b, other) {
+					consistent = false
+					break
+				}
+			}
+			if consistent {
+				candidates[i] = mergeActual(a, b)
+				candidates = slices.Delete(candidates, j, j+1)
+			} else {
+				j++
+			}
+		}
+	}
+	if len(candidates) > 1 && requestID != 0 {
+		var named []actualJobIdentity
+		for _, candidate := range candidates {
+			if slices.Contains(candidate.requests, requestID) {
+				named = append(named, candidate)
+			}
+		}
+		if len(named) == 1 && !slices.ContainsFunc(candidates, func(candidate actualJobIdentity) bool {
+			return sameActualJob(named[0], candidate) &&
+				(named[0].run == 0 && candidate.run != 0 || named[0].job == "" && candidate.job != "")
+		}) {
+			return named
+		}
+	}
+	return candidates
 }
 
 // resolveActualJob is the sole actual-job identity rule: wire fields, an actual
@@ -208,34 +255,12 @@ func (l *Listener) resolveActualJob(ctx context.Context, job Job, mode jobResolu
 			out.actual = mergeActual(out.actual, actualJobIdentity{requests: []int64{id}})
 		}
 	}
-	// Wildcards must not be enriched before all candidates are compared: the
-	// first run encountered would otherwise exclude a later, explicitly named run.
-	var candidates []actualJobIdentity
-	for _, prior := range known {
-		if sameActualJob(out.actual, prior) && !slices.ContainsFunc(candidates, func(candidate actualJobIdentity) bool {
-			return candidate.job == prior.job && candidate.run == prior.run &&
-				len(candidate.requests) == len(prior.requests) &&
-				!slices.ContainsFunc(candidate.requests, func(id int64) bool { return !slices.Contains(prior.requests, id) })
-		}) {
-			candidates = append(candidates, prior)
-		}
-	}
-	if len(candidates) > 1 && job.RequestID != 0 {
-		var named []actualJobIdentity
-		for _, candidate := range candidates {
-			if slices.Contains(candidate.requests, job.RequestID) {
-				named = append(named, candidate)
-			}
-		}
-		if len(named) == 1 {
-			candidates = named
-		}
-	}
+	candidates := actualJobCandidates(out.actual, job.RequestID, known)
 	if len(candidates) > 1 {
 		cause := ErrUntrustworthySession
 		if mode == resolveCompletion {
-			// No new remote promise was made. Use the existing poison recovery
-			// path instead of choosing which otherwise valid job to complete.
+			// Every candidate stays held until the completion can be settled.
+			out.held = candidates
 			cause = errQuarantinableCompletion
 		}
 		return out, fmt.Errorf("%w: %s request %d job %q matches several actual jobs",
@@ -296,6 +321,7 @@ func (l *Listener) resolveMessage(ctx context.Context, msg *Message) (resolvedMe
 		if err != nil {
 			if errors.Is(err, errQuarantinableCompletion) {
 				out.poisoned = append(out.poisoned, err)
+				out.held = append(out.held, resolved.held...)
 				continue
 			}
 			return out, err
@@ -320,20 +346,26 @@ func (l *Listener) resolveCommitments(ctx context.Context) ([]jobCommitment, err
 		commitments = append(commitments, jobCommitment{key: id, lease: p.lease, promise: p})
 	}
 	for id, lease := range l.running {
-		job := l.runningJobs[id]
-		job.RequestID = id
+		actual := l.runningJobs[id]
+		job := Job{RequestID: id, JobID: actual.job, RunID: actual.run}
 		if job.RunID == 0 {
 			job.RunID = lease.RunID
 		}
 		job.RunnerName = provider.InstanceName(lease.ID)
 		jobs = append(jobs, job)
-		commitments = append(commitments, jobCommitment{key: id, lease: lease})
+		commitments = append(commitments, jobCommitment{actual: actual, key: id, lease: lease})
 	}
 	l.mu.Unlock()
 	for i, job := range jobs {
 		resolved, err := l.resolveActualJob(ctx, job, resolveCommitment, nil)
 		if err != nil {
 			return nil, err
+		}
+		// A busy pool binding names the actual job and supersedes launch intent.
+		if resolved.binding == nil || resolved.binding.ActualRequestID == 0 {
+			if sameActualJob(resolved.actual, commitments[i].actual) {
+				resolved.actual = mergeActual(resolved.actual, commitments[i].actual)
+			}
 		}
 		commitments[i].actual = resolved.actual
 	}

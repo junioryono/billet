@@ -3,6 +3,7 @@ package server
 import (
 	"errors"
 	"slices"
+	"sync/atomic"
 	"testing"
 
 	"github.com/junioryono/billet/internal/alloc"
@@ -19,6 +20,7 @@ func TestBatchCompletionUsesEveryActualAlias(t *testing.T) {
 		completed Job
 		direct    bool
 	}{
+		{name: "translated offer coalesces assignment aliases", assigned: Job{RequestID: 11, JobID: "J", RunID: 101}, offer: Job{RequestID: 12, JobID: "J", RunID: 101}, completed: Job{RequestID: 11, JobID: "J", RunID: 101}},
 		{name: "positive request", assigned: Job{RequestID: 11}, offer: Job{RequestID: 11}, completed: Job{RequestID: 11}},
 		{name: "positive assignment establishes job alias", assigned: Job{RequestID: 11, JobID: "J"}, offer: Job{RequestID: 11, JobID: "J"}, completed: Job{JobID: "J"}},
 		{name: "zero assignment establishes direct alias", assigned: Job{JobID: "J"}, offer: Job{JobID: "J"}, completed: Job{JobID: "J"}},
@@ -185,7 +187,7 @@ func TestCompletionPreservesDemandForAnotherKnownRun(t *testing.T) {
 func TestCompletedRunnerDropsOnlyItsDischargedCommitment(t *testing.T) {
 	for _, outcome := range []string{"acquired", "offer refused", "destroy failed"} {
 		t.Run(outcome, func(t *testing.T) {
-			a, listeners := arbitrationListeners(t, []config.Tier{tier("work")}, tierVCPU)
+			a, listeners := arbitrationListeners(t, []config.Tier{tier("work")}, 2*tierVCPU)
 			l := listeners[0]
 			session := &fakeSession{}
 			if outcome == "offer refused" {
@@ -203,6 +205,9 @@ func TestCompletedRunnerDropsOnlyItsDischargedCommitment(t *testing.T) {
 			if err := l.prepareEscrow(t.Context()); err != nil {
 				t.Fatal(err)
 			}
+			if err := l.refillEscrowUngated(t.Context(), 2); err != nil {
+				t.Fatal(err)
+			}
 			job := Job{RequestID: 11, JobID: "J", RunID: 101}
 			if err := l.handle(t.Context(), &Message{MessageID: 1, Assigned: []Job{job}}); err != nil {
 				t.Fatal(err)
@@ -211,7 +216,11 @@ func TestCompletedRunnerDropsOnlyItsDischargedCommitment(t *testing.T) {
 			if lease == nil {
 				t.Fatal("fixture did not launch request 11")
 			}
-			if err := l.handle(t.Context(), &Message{MessageID: 2, Available: []Job{job},
+			if l.idleEscrow() != 1 {
+				t.Fatalf("fixture has %d spare leases, want 1", l.idleEscrow())
+			}
+			offer := Job{RequestID: 13, JobID: "J", RunID: 101}
+			if err := l.handle(t.Context(), &Message{MessageID: 2, Available: []Job{offer},
 				Completed: []Job{{RequestID: 12, JobID: "K", RunID: 102,
 					RunnerName: provider.InstanceName(lease.ID), Result: "Succeeded"}},
 			}); err != nil {
@@ -227,7 +236,7 @@ func TestCompletedRunnerDropsOnlyItsDischargedCommitment(t *testing.T) {
 				}
 				return
 			}
-			if !slices.Equal(session.acquiredIDs(), []int64{11}) || l.Running() != 0 {
+			if !slices.Equal(session.acquiredIDs(), []int64{13}) || l.Running() != 0 {
 				t.Fatalf("unfinished J: acquired %v, running %d", session.acquiredIDs(), l.Running())
 			}
 			if _, err := a.Lease(t.Context(), lease.ID); !errors.Is(err, alloc.ErrLeaseNotFound) {
@@ -237,7 +246,7 @@ func TestCompletedRunnerDropsOnlyItsDischargedCommitment(t *testing.T) {
 				if l.Acquiring() != 0 || len(l.waitingOffers) != 1 || l.waitingOffers[0].job != "J" || l.waitingOffers[0].run != 101 {
 					t.Fatalf("refused J lost demand: promises %d, waiting %+v", l.Acquiring(), l.waitingOffers)
 				}
-			} else if p := l.acquiring[11]; p == nil || p.lease.ID == lease.ID || len(l.waitingOffers) != 0 {
+			} else if p := l.acquiring[13]; p == nil || p.lease.ID == lease.ID || len(l.waitingOffers) != 0 {
 				t.Fatalf("J was not backed by fresh escrow: promise %+v, waiting %+v", p, l.waitingOffers)
 			}
 		})
@@ -287,30 +296,40 @@ func TestAmbiguousCompletionQuarantinesWithoutSelectingARun(t *testing.T) {
 	for _, requestID := range []int64{0, 99} {
 		for _, first := range []int64{11, 12} {
 			tiers := []config.Tier{tier("work")}
-			a := newAllocator(t, alloc.Limits{MaxVCPU: 2 * tierVCPU, MaxMemory: 64 * config.GiB}, tiers)
+			a := newAllocator(t, alloc.Limits{MaxVCPU: 4 * tierVCPU, MaxMemory: 64 * config.GiB}, tiers)
 			var launched, destroyed []int64
 			var acknowledged bool
-			l := NewListener(a, tiers[0].Label, &fakeSession{onDelete: func(int64) error {
+			session := &fakeSession{onDelete: func(int64) error {
 				acknowledged = true
 				return nil
-			}}, WithRunner(&fakeRunner{
+			}}
+			l := NewListener(a, tiers[0].Label, session, WithRunner(&fakeRunner{
 				onLaunch:  func(id int64) error { launched = append(launched, id); return nil },
 				onDestroy: func(id int64) error { destroyed = append(destroyed, id); return nil },
 			}))
-			if err := l.refillEscrowTo(t.Context(), 2); err != nil {
+			if err := l.refillEscrowTo(t.Context(), 4); err != nil {
 				t.Fatal(err)
 			}
 			second := 23 - first
-			err := l.handle(t.Context(), &Message{MessageID: 1,
+			err := l.handle(t.Context(), &Message{MessageID: 1, Statistics: &Statistics{TotalAssignedJobs: 3},
 				Assigned: []Job{{RequestID: first, JobID: "J", RunID: first + 90},
-					{RequestID: second, JobID: "J", RunID: second + 90}},
-				Completed: []Job{{RequestID: requestID, JobID: "J", Result: "Cancelled"}},
+					{RequestID: second, JobID: "J", RunID: second + 90},
+					{RequestID: 21, JobID: "K", RunID: 201}},
+				Available: []Job{{RequestID: first + 20, JobID: "J", RunID: first + 90},
+					{RequestID: second + 20, JobID: "J", RunID: second + 90},
+					{RequestID: 22, JobID: "L", RunID: 202}},
+				Completed: []Job{{RequestID: requestID, JobID: "J", Result: "Cancelled"},
+					{RequestID: first, JobID: "J", RunID: first + 90, Result: "Cancelled"}},
 			})
 			if _, ok := errors.AsType[*poisonedMessageError](err); !ok || !errors.Is(err, errQuarantinableCompletion) {
 				t.Fatalf("request %d, first %d: handle = %v, want quarantinable poison", requestID, first, err)
 			}
-			if len(destroyed) != 0 || acknowledged || !slices.Equal(launched, []int64{first, second}) {
+			if len(destroyed) != 0 || acknowledged || !slices.Equal(launched, []int64{21}) {
 				t.Fatalf("ambiguous completion acted: destroys %v, ack %v, launches %v", destroyed, acknowledged, launched)
+			}
+			if !slices.Equal(session.acquiredIDs(), []int64{22}) || l.Running() != 1 || l.Acquiring() != 1 || l.idleEscrow() != 2 {
+				t.Fatalf("candidate work escaped hold: acquired %v, running %d, promises %d, held %d",
+					session.acquiredIDs(), l.Running(), l.Acquiring(), l.idleEscrow())
 			}
 			if _, exists, err := a.DirectJobIdentity(t.Context(), "J"); err != nil || exists {
 				t.Fatalf("completion minted identity: exists %v, err %v", exists, err)
@@ -360,5 +379,106 @@ func TestAssignmentConsumesItsDirectPromiseAcrossRequestAliases(t *testing.T) {
 				t.Fatalf("redelivery spent another lease: launches %v, running %d, held %d", launched, l.Running(), l.idleEscrow())
 			}
 		})
+	}
+}
+
+func TestAssignmentRequestSelectsItsPromiseAmongKnownRuns(t *testing.T) {
+	for _, requestID := range []int64{11, 12} {
+		tiers := []config.Tier{tier("work")}
+		a := newAllocator(t, alloc.Limits{MaxVCPU: 2 * tierVCPU, MaxMemory: 64 * config.GiB}, tiers)
+		session := &fakeSession{}
+		var launched []int64
+		l := NewListener(a, tiers[0].Label, session, WithRunner(&fakeRunner{
+			onLaunch: func(id int64) error { launched = append(launched, id); return nil },
+		}))
+		if err := l.refillEscrowTo(t.Context(), 2); err != nil {
+			t.Fatal(err)
+		}
+		if err := l.handle(t.Context(), &Message{MessageID: 1, Available: []Job{
+			{RequestID: 11, JobID: "J", RunID: 101}, {RequestID: 12, JobID: "J", RunID: 102},
+		}}); err != nil {
+			t.Fatal(err)
+		}
+		p, other := l.acquiring[requestID], l.acquiring[23-requestID]
+		if p == nil || other == nil || !slices.Equal(session.acquiredIDs(), []int64{11, 12}) {
+			t.Fatalf("fixture promises: selected %+v, other %+v, acquired %v", p, other, session.acquiredIDs())
+		}
+		if err := l.handle(t.Context(), &Message{MessageID: 2, Assigned: []Job{{RequestID: requestID, JobID: "J"}}}); err != nil {
+			t.Fatal(err)
+		}
+		if l.running[requestID] != p.lease || l.acquiring[23-requestID] != other || l.Acquiring() != 1 || !slices.Equal(launched, []int64{requestID}) {
+			t.Fatalf("request %d consumed the wrong promise: running %+v, promises %+v, launches %v",
+				requestID, l.running, l.acquiring, launched)
+		}
+	}
+}
+
+func TestConsumedPromiseRetainsItsRunAndRequestAliases(t *testing.T) {
+	tiers := []config.Tier{tier("work")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 2 * tierVCPU, MaxMemory: 64 * config.GiB}, tiers)
+	var launched []int64
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(&fakeRunner{
+		onLaunch: func(id int64) error { launched = append(launched, id); return nil },
+	}))
+	if err := l.refillEscrowTo(t.Context(), 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.handle(t.Context(), &Message{MessageID: 1, Available: []Job{{RequestID: 11, JobID: "J", RunID: 101}}}); err != nil {
+		t.Fatal(err)
+	}
+	p := l.acquiring[11]
+	if p == nil || l.idleEscrow() != 1 {
+		t.Fatalf("fixture promise %+v, spare escrow %d", p, l.idleEscrow())
+	}
+	if err := l.handle(t.Context(), &Message{MessageID: 2, Assigned: []Job{{RequestID: 12, JobID: "J"}}}); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := a.Lease(t.Context(), p.lease.ID)
+	if err != nil || lease.RequestID != 12 || lease.RunID != 0 {
+		t.Fatalf("ledger assignment changed its authoritative fields: %+v, %v", lease, err)
+	}
+	// Without JobID, this redelivery can match only the consumed offer's alias.
+	if err := l.handle(t.Context(), &Message{MessageID: 3, Assigned: []Job{{RequestID: 11, RunID: 101}}}); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(launched, []int64{12}) || l.idleEscrow() != 1 {
+		t.Fatalf("offer alias lost: launches %v, spare escrow %d", launched, l.idleEscrow())
+	}
+	if err := l.handle(t.Context(), &Message{MessageID: 4, Assigned: []Job{{RequestID: 13, JobID: "J", RunID: 102}}}); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(launched, []int64{12, 13}) || l.Running() != 2 || l.Acquiring() != 0 || l.running[12] != p.lease {
+		t.Fatalf("distinct run suppressed: launches %v, running %d, promises %d", launched, l.Running(), l.Acquiring())
+	}
+}
+
+func TestAmbiguousCompletionNeverAcknowledgesHeldAssignmentsAfterRetries(t *testing.T) {
+	tiers := []config.Tier{tier("work")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 2 * tierVCPU, MaxMemory: 64 * config.GiB}, tiers)
+	var deliveries, deletes, launches atomic.Int32
+	session := &fakeSession{
+		onGet: func() (*Message, error) {
+			if deliveries.Add(1) > poisonQuarantineAfter {
+				return nil, errors.New("ambiguous completion exceeded its retry budget")
+			}
+			return &Message{MessageID: 42,
+				Assigned: []Job{{RequestID: 11, JobID: "J", RunID: 101},
+					{RequestID: 12, JobID: "J", RunID: 102}},
+				Completed: []Job{{JobID: "J", Result: "Cancelled"}},
+			}, nil
+		},
+		onDelete: func(int64) error { deletes.Add(1); return nil },
+	}
+	l := NewListener(a, tiers[0].Label, session, WithDrainGrace(notDrainingHere), stopsWithoutWaiting(),
+		WithRunner(&fakeRunner{onLaunch: func(int64) error { launches.Add(1); return nil }}))
+	if err := l.refillEscrowTo(t.Context(), 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Run(t.Context()); !errors.Is(err, errQuarantinableCompletion) {
+		t.Fatalf("Run = %v, want unresolved completion", err)
+	}
+	if deliveries.Load() != poisonQuarantineAfter || deletes.Load() != 0 || launches.Load() != 0 || l.lastMessageID != 0 {
+		t.Fatalf("held message escaped retry hold: deliveries %d, deletes %d, launches %d, cursor %d",
+			deliveries.Load(), deletes.Load(), launches.Load(), l.lastMessageID)
 	}
 }
