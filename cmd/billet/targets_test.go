@@ -440,16 +440,43 @@ targets:
 
 	defaultAt := position("target    default (org acme)")
 	personalAt := position("target    personal (repository someone/widgets)")
-	firstTier := position("tier      billet-4vcpu ")
-	secondTier := position("tier      billet-4vcpu-personal ")
+	// A TIER LINE ENDS AT ITS NAME: the status layout puts the tier's counts on
+	// the lines below it, so a label is matched whole and never by prefix, or
+	// billet-4vcpu would also match billet-4vcpu-personal.
+	tierAt := func(label string) int {
+		want := "tier      " + label
+		for i, line := range lines {
+			if strings.TrimRight(line, " ") == want || strings.HasPrefix(line, want+" ") {
+				return i
+			}
+		}
+
+		t.Fatalf("no line for tier %q in:\n%s", label, out)
+
+		return -1
+	}
+
+	firstTier := tierAt("billet-4vcpu")
+	secondTier := tierAt("billet-4vcpu-personal")
 
 	if defaultAt >= firstTier || firstTier >= personalAt || personalAt >= secondTier {
 		t.Errorf("tiers are not grouped under their targets (default@%d, its tier@%d, "+
 			"personal@%d, its tier@%d):\n%s", defaultAt, firstTier, personalAt, secondTier, out)
 	}
 
-	if strings.Count(out, "tier      billet-4vcpu ") != 1 ||
-		strings.Count(out, "tier      billet-4vcpu-personal ") != 1 {
+	listed := func(label string) int {
+		want := "tier      " + label
+		n := 0
+		for _, line := range lines {
+			if strings.TrimRight(line, " ") == want || strings.HasPrefix(line, want+" ") {
+				n++
+			}
+		}
+
+		return n
+	}
+
+	if listed("billet-4vcpu") != 1 || listed("billet-4vcpu-personal") != 1 {
 		t.Errorf("a tier is listed under more than one target:\n%s", out)
 	}
 }

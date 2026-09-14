@@ -815,8 +815,8 @@ func (p *plane) reofferLocked(s *scaleSet, capacity int) {
 //
 // HOW FREED ROOM IS CONTESTED. When a job finishes, every tier with jobs waiting
 // would in production notice the room on its next poll, in an order the clocks
-// decide. The harness nudges the starved tiers one at a time in the fleet's
-// order after every event, so the contest has one outcome per trace.
+// decide. The harness nudges contenders and donors in the fleet's order after
+// every event, so the contest has one outcome per trace.
 func (p *plane) nudge(label string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -832,15 +832,25 @@ func (p *plane) nudge(label string) {
 	p.wakeLocked(s)
 }
 
-// starved reports whether a tier has offers it has not been able to take, or
-// advertises nothing at all and so could not take one.
-func (p *plane) starved(label string) bool {
+// needsPoll includes donors whenever any tier has an outstanding offer.
+func (p *plane) needsPoll(label string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	s := p.byName[label]
+	if s == nil {
+		return false
+	}
+	if s.lastCap == 0 {
+		return true
+	}
+	for _, peer := range p.byName {
+		if len(peer.available) > 0 {
+			return true
+		}
+	}
 
-	return s != nil && (len(s.available) > 0 || s.lastCap == 0)
+	return false
 }
 
 // standing is what a tier advertises and holds, so a caller can tell whether

@@ -849,3 +849,18 @@ func TestGenerateRefusesARepositoryWithAPoolOrOnDocker(t *testing.T) {
 		}
 	})
 }
+
+// BOTH REMOTE SHAPES FIT INDIVIDUALLY. A shared eight-vCPU budget must retain
+// the four- and eight-vCPU definitions even though their sum is twelve.
+func TestGenerateEC2KeepsOverlappingShapes(t *testing.T) {
+	p := ec2Params()
+	p.VCPU, p.Memory = 8, 16*config.GiB
+	body, _, err := Generate(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := loadGenerated(t, body)
+	if len(cfg.Tiers) != 2 || cfg.Tiers[0].VCPU != 4 || cfg.Tiers[1].VCPU != 8 {
+		t.Fatalf("want both 4- and 8-vcpu entries, got %+v", cfg.Tiers)
+	}
+}

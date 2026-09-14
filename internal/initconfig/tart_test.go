@@ -228,14 +228,10 @@ func TestGenerateTartPinsTheMacOSTierToThisNode(t *testing.T) {
 		}
 	}
 
-	// EXACTLY ONE, and this is a load-time rule rather than taste: an unset
-	// max_concurrent on a macOS tier inherits the HOST's limit, so two generated
-	// macOS tiers would sum to 4 against a limit of 2 and validateMacOSHostLimits
-	// would refuse the file. Generate's own config.Parse round trip would catch
-	// that, but the diagnostic would blame the config rather than the ladder.
+	// ONE PREFERRED XCODE SHAPE keeps the generated default predictable; the
+	// operator may define further macOS entries under the same host ceiling.
 	if macOS != 1 {
-		t.Errorf("the generation wrote %d macOS tiers; more than one cannot fit Apple's "+
-			"per-machine limit once each inherits it", macOS)
+		t.Errorf("the generation wrote %d macOS tiers, want one default", macOS)
 	}
 }
 
@@ -320,142 +316,53 @@ func nodeBlockOf(t *testing.T, body string) string {
 	return rest[:end]
 }
 
-// THE CATALOGUE FITS ITS OWN CEILING, ONE JOB OF EVERY TIER AT ONCE.
-//
-// Every tier is a scale set and escrows one discovery slot BEFORE it advertises,
-// so a catalogue whose tiers individually fit but collectively do not leaves
-// every one of them advertising zero and every job queued forever against a
-// control plane reporting itself healthy. The macOS tier is fitted first and the
-// Linux ladder takes what is left, so this is the assertion that the second half
-// consults the first.
-func TestGenerateTartCatalogueFitsTheCeilingAllAtOnce(t *testing.T) {
-	t.Parallel()
-
-	_, cfg := generateTart(t, tartParams(config.GuestMacOS, config.GuestLinux))
-
-	var (
-		vcpu   int
-		memory config.ByteSize
-	)
-
-	for i := range cfg.Tiers {
-		vcpu += cfg.Tiers[i].VCPU
-		memory += cfg.Tiers[i].Memory
-	}
-
-	if vcpu > cfg.Server.MaxVCPU || memory > cfg.Server.MaxMemory {
-		t.Errorf("one job of every tier needs %d vCPU and %s, over a ceiling of %d and %s",
-			vcpu, memory, cfg.Server.MaxVCPU, cfg.Server.MaxMemory)
-	}
-
-	if len(cfg.Tiers) < 2 {
-		t.Fatalf("asking for both guest kinds produced %d tier(s); each was named explicitly",
-			len(cfg.Tiers))
-	}
-}
-
-// THE macOS TIER DOES NOT EAT A BUDGET THAT HAD ROOM FOR BOTH.
-//
-// It is fitted first, and greedily: the larger shape when it fits. At a ceiling
-// of exactly 4 vCPU and 16GiB that took everything, left nothing for the Linux
-// tier the same command had asked for, and produced a refusal caused by the ORDER
-// of the fit rather than by the machine. Reserving the smallest remaining rung is
-// what makes the greedy choice safe.
-//
-// 6 vCPU and 20GiB is the machine whose ceiling is exactly that pair.
-func TestGenerateTartLeavesRoomForTheGuestKindItHasNotFittedYet(t *testing.T) {
+// BOTH GUEST KINDS USE THE SAME CEILING. Keeping the 4-vCPU macOS entry must
+// not delete either individually fitting Linux entry on a 4-vCPU host.
+func TestGenerateTartCatalogueFitsEachEntry(t *testing.T) {
 	t.Parallel()
 
 	p := tartParams(config.GuestMacOS, config.GuestLinux)
 	p.VCPU, p.Memory = 6, 20*config.GiB
-
-	body, cfg := generateTart(t, p)
-
+	_, cfg := generateTart(t, p)
 	if cfg.Server.MaxVCPU != 4 || cfg.Server.MaxMemory != 16*config.GiB {
-		t.Fatalf("this test is written against a ceiling of 4 vCPU and 16GiB; the headroom "+
-			"rule now produces %d and %s", cfg.Server.MaxVCPU, cfg.Server.MaxMemory)
+		t.Fatalf("ceiling = %d / %s, want 4 / 16GiB", cfg.Server.MaxVCPU, cfg.Server.MaxMemory)
 	}
-
-	seen := map[config.GuestOS]bool{}
-	for i := range cfg.Tiers {
-		seen[cfg.Tiers[i].GuestOS] = true
+	if len(cfg.Tiers) != 3 {
+		t.Fatalf("generated %d entries, want macOS 4 plus Linux 2 and 4", len(cfg.Tiers))
 	}
-
-	if !seen[config.GuestMacOS] || !seen[config.GuestLinux] {
-		t.Errorf("both guest kinds fit and only %v were written\n\n%s", seen, body)
+	guests := []config.GuestOS{config.GuestMacOS, config.GuestLinux, config.GuestLinux}
+	for i, want := range []int{4, 2, 4} {
+		if cfg.Tiers[i].GuestOS != guests[i] {
+			t.Errorf("tier %d has guest_os %s, want %s", i, cfg.Tiers[i].GuestOS, guests[i])
+		}
+		if cfg.Tiers[i].VCPU != want || cfg.Tiers[i].Memory != config.ByteSize(want)*4*config.GiB {
+			t.Errorf("tier %d = %d / %s, want %d / %s", i, cfg.Tiers[i].VCPU,
+				cfg.Tiers[i].Memory, want, config.ByteSize(want)*4*config.GiB)
+		}
 	}
 }
 
-// AND A RESERVATION IT CANNOT MEET IS DROPPED, NOT ESCALATED INTO A REFUSAL.
-//
-// Where no macOS shape leaves the smallest Linux rung standing, the fit falls
-// back to the largest shape that merely fits — and the smaller a macOS tier is,
-// the more the Linux side has to work with. At a ceiling of 3 vCPU and 20GiB
-// that is the difference between two tiers and none: holding the reservation
-// refuses, dropping it and taking the 2-vCPU shape leaves 1 vCPU the Linux
-// fallback can still build a tier out of.
-//
-// 5 vCPU and 24GiB is the machine whose ceiling is that pair.
+// A SMALL MAC KEEPS BOTH KINDS WHEN EACH CAN BOOT ALONE. The macOS fallback
+// cannot spend the Linux fallback's catalogue allowance.
 func TestGenerateTartFallsBackToASmallerMacOSShapeRatherThanRefusing(t *testing.T) {
 	t.Parallel()
 
 	p := tartParams(config.GuestMacOS, config.GuestLinux)
 	p.VCPU, p.Memory = 5, 24*config.GiB
-
-	body, cfg := generateTart(t, p)
-
-	if cfg.Server.MaxVCPU != 3 || cfg.Server.MaxMemory != 20*config.GiB {
-		t.Fatalf("this test is written against a ceiling of 3 vCPU and 20GiB; the headroom "+
-			"rule now produces %d and %s", cfg.Server.MaxVCPU, cfg.Server.MaxMemory)
-	}
-
-	seen := map[config.GuestOS]bool{}
-	for i := range cfg.Tiers {
-		seen[cfg.Tiers[i].GuestOS] = true
-
-		// The larger shape cannot fit here at all, so a macOS tier of 3 vCPU is
-		// the fit having given up on the Linux tier rather than having taken the
-		// next shape down.
-		if cfg.Tiers[i].GuestOS == config.GuestMacOS && cfg.Tiers[i].VCPU != 2 {
-			t.Errorf("the macOS tier is %d vCPU; the 2-vCPU shape is what leaves the Linux "+
-				"tier anything\n\n%s", cfg.Tiers[i].VCPU, body)
-		}
-	}
-
-	if !seen[config.GuestMacOS] || !seen[config.GuestLinux] {
-		t.Errorf("both guest kinds fit and only %v were written\n\n%s", seen, body)
+	_, cfg := generateTart(t, p)
+	if len(cfg.Tiers) != 2 || cfg.Tiers[0].VCPU != 2 || cfg.Tiers[1].VCPU != 2 ||
+		cfg.Tiers[0].GuestOS != config.GuestMacOS || cfg.Tiers[1].GuestOS != config.GuestLinux {
+		t.Fatalf("want two 2-vcpu alternatives, got %+v", cfg.Tiers)
 	}
 }
 
-// AND THE RESERVATION CHANGES NOTHING WHERE THERE IS ROOM.
-//
-// The other half: on a machine that can afford the larger macOS shape beside a
-// Linux rung, holding room back must not shrink the macOS tier. A reservation
-// that always applied would quietly halve every Xcode guest on a big Mac.
+// A LARGER HOST KEEPS THE PREFERRED XCODE SHAPE IN A MIXED CATALOGUE.
 func TestGenerateTartStillTakesTheLargerMacOSShapeWhenBothFit(t *testing.T) {
 	t.Parallel()
 
 	_, cfg := generateTart(t, tartParams(config.GuestMacOS, config.GuestLinux))
-
-	// FOUND, not merely not-wrong: a loop that skips every tier passes an
-	// assertion about the one it was looking for.
-	found := false
-
-	for i := range cfg.Tiers {
-		if cfg.Tiers[i].GuestOS != config.GuestMacOS {
-			continue
-		}
-
-		found = true
-
-		if cfg.Tiers[i].VCPU != 4 {
-			t.Errorf("the macOS tier is %d vCPU on a 10 vCPU / 28GiB ceiling, where the "+
-				"larger shape fits beside a Linux rung", cfg.Tiers[i].VCPU)
-		}
-	}
-
-	if !found {
-		t.Error("no macOS tier was generated, so nothing above was checked")
+	if len(cfg.Tiers) == 0 || cfg.Tiers[0].GuestOS != config.GuestMacOS || cfg.Tiers[0].VCPU != 4 {
+		t.Fatalf("want the preferred 4-vcpu macOS shape, got %+v", cfg.Tiers)
 	}
 }
 
@@ -506,26 +413,16 @@ func TestGenerateTartRefusesAMacTooSmallForAMacOSGuest(t *testing.T) {
 	}
 }
 
-// AND A REQUESTED GUEST KIND IS NEVER SILENTLY DROPPED.
-//
-// tiers() skips a candidate that does not fit, because the ladder was billet's
-// idea and a shorter one still serves. Here each guest kind was asked for BY
-// NAME, so a config with no tier for one of them answers a different question
-// than the one it was put.
+// A REQUESTED KIND IS REFUSED ONLY WHEN IT CANNOT BOOT ALONE. Linux fits this
+// host, but macOS is below its minimum memory and must be named in the refusal.
 func TestGenerateTartRefusesRatherThanDroppingARequestedGuest(t *testing.T) {
 	t.Parallel()
 
-	// Enough for the macOS tier and nothing after it.
 	p := tartParams(config.GuestMacOS, config.GuestLinux)
-	p.VCPU, p.Memory = 4, 12*config.GiB
-
-	body, _, err := Generate(p)
-	if err == nil {
-		t.Fatalf("the Linux tier was dropped instead of refused\n\n%s", body)
-	}
-
-	if !strings.Contains(err.Error(), "arm64 Linux tier") {
-		t.Errorf("Generate = %v, want the refusal to name the guest kind that did not fit", err)
+	p.VCPU, p.Memory = 2, 6*config.GiB
+	_, _, err := Generate(p)
+	if err == nil || !strings.Contains(err.Error(), "macOS guest") {
+		t.Fatalf("Generate = %v, want the unplaceable macOS kind named", err)
 	}
 }
 

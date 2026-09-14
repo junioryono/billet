@@ -391,7 +391,9 @@ func TestAnInspectionVerifiesTheSchemaAndNeverMigrates(t *testing.T) {
 			t.Fatalf("a ledger one migration behind: err = %v, want ErrSchemaBehind", err)
 		}
 
-		for _, want := range []string{"controller_retirement", "restart the control plane"} {
+		// The missing migration is the newest one, named from the published table
+		// rather than written here, so a later migration does not break this case.
+		for _, want := range []string{migrationsAreFrozen[behind+1].Name, "restart the control plane"} {
 			if !strings.Contains(err.Error(), want) {
 				t.Errorf("the refusal does not say %q: %v", want, err)
 			}

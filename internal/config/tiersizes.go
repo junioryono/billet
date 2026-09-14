@@ -87,21 +87,8 @@ func expandOne(t Tier) ([]Tier, error) {
 			"Remove vcpu and memory, or remove `sizes` and write the tiers out", where)
 	}
 
-	// A macOS TIER'S CONCURRENCY IS PER HOST, AND A LADDER CANNOT DIVIDE IT.
-	//
-	// A macOS tier with no explicit max_concurrent inherits its HOST's limit, so
-	// three expanded tiers each inherit the whole allowance and validation refuses
-	// the file for exceeding it — with a diagnostic about a licence rather than
-	// about the shorthand that caused it. Writing the tiers out by hand is how an
-	// operator decides which of them gets which share, and that is a decision, not
-	// boilerplate.
-	if t.GuestOS == GuestMacOS {
-		return nil, fmt.Errorf("%s: `sizes` cannot expand a macOS tier. Each expansion "+
-			"would inherit its host's whole macOS guest allowance and together they would "+
-			"exceed it, so the shares are yours to divide: write the tiers out with an "+
-			"explicit max_concurrent each", where)
-	}
-
+	// EACH EXPANSION KEEPS ITS OWN CEILING. Runtime placement counts actual
+	// macOS leases across labels; catalogue maxima may overlap on the same host.
 	perVCPU := t.MemoryPerVCPU
 	if perVCPU == 0 {
 		perVCPU = DefaultMemoryPerVCPU

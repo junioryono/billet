@@ -65,7 +65,7 @@ func (a *Allocator) reserveFloors(
 			continue
 		}
 
-		_, cost, err := a.holdFloor(ctx, tx, t, missing, free)
+		cost, err := a.holdFloor(ctx, tx, t, missing, free)
 		if err != nil {
 			return 0, 0, err
 		}
@@ -92,7 +92,7 @@ func (a *Allocator) reserveFloors(
 // exactly the contention a floor is meant to survive.
 func (a *Allocator) holdFloor(
 	ctx context.Context, tx querier, t config.Tier, missing int, free *fleet,
-) (int, placementCost, error) {
+) (placementCost, error) {
 	// ITS OWN CANDIDATES, SPENDING THE SHARED FLEET. A floor on a macOS tier is
 	// kept on the Mac; holding it against whichever machines the ASKING tier
 	// happens to use is wrong twice — it denies them room to protect a
@@ -100,13 +100,10 @@ func (a *Allocator) holdFloor(
 	// matters untouched.
 	held, err := free.forTier(ctx, tx, a, t)
 	if err != nil {
-		return 0, placementCost{}, err
+		return placementCost{}, err
 	}
 
-	var (
-		kept int
-		cost placementCost
-	)
+	var cost placementCost
 
 	for range missing {
 		_, one, ok := held.next(t)
@@ -116,10 +113,9 @@ func (a *Allocator) holdFloor(
 			break
 		}
 
-		kept++
 		cost.vcpu += one.vcpu
 		cost.memory += one.memory
 	}
 
-	return kept, cost, nil
+	return cost, nil
 }

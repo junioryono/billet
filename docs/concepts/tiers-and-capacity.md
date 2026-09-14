@@ -28,7 +28,7 @@ Each tier becomes one GitHub runner scale set whose name is the label, so `runs-
 
 The deployment has a ceiling (`server.max_vcpu`, `server.max_memory`) and every node contributes a budget (`node.max_vcpu`, `node.max_memory`; detected on a host that runs work, required on a cloud orchestrator). Capacity is counted in vCPU, memory, per-tier concurrency and macOS licence slots at once, never as one number.
 
-Each tier's listener reserves capacity in the ledger first and advertises to GitHub second. If listeners advertised independently, GitHub could fill all of them at once and the host would be overcommitted with nothing to stop it. A tier advertises the smaller of the deployment ceiling and what its eligible machines can hold, and it keeps exactly one discovery slot beyond the work GitHub reports assigned, climbing with demand, so an idle tier does not hold capacity its peers could use.
+Each tier's listener reserves capacity in the ledger first and advertises to GitHub second. If listeners advertised independently, GitHub could fill all of them at once and the host would be overcommitted with nothing to stop it. A shared admission turn rotates discovery across every tier and GitHub target, with known unmet work taking priority. A large contender keeps its turn while headroom accumulates. A donor lowers its advertisement and handles the returned assignments before releasing unused backing; acquiring and running capacity stay charged. The catalogue can contain overlapping shapes because each definition needs to fit individually, while actual leases share the bounded pool. [Status and leases](../operating/status-and-leases.md) explains the ordering and the limits of strict demand priority.
 
 ## Every runner is preceded by a lease
 

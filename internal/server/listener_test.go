@@ -1808,7 +1808,7 @@ func TestRecoveryRetirementFenceSurvivesNodeCustodyAndRefusesLateStart(t *testin
 	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(&fakeRunner{
 		onDestroy: func(int64) error { return ErrCustody },
 	}), WithRunnerRegistry(&fakeRunnerRegistry{}))
-	if err := l.reconcilePool(t.Context(), 0); err != nil {
+	if _, err := l.reconcilePool(t.Context(), 0); err != nil {
 		t.Fatalf("reconcile pool: %v", err)
 	}
 	member, err := a.PoolRunnerByLease(t.Context(), lease.ID)

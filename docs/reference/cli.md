@@ -31,7 +31,7 @@ Run a compute host that dials a control plane. One per machine, including the ma
 
 ### `billet init`
 
-Generate a `billet.yaml` that runs. It measures the host, writes a ceiling below what it found, and generates tiers that fit together under it. A fresh generation lands at `<path>.new` unless it can prove the existing file is its own output; `--force` overwrites.
+Generate a `billet.yaml` that runs. It measures the host, writes a ceiling below what it found, and keeps every generated tier that fits individually under it. A fresh generation lands at `<path>.new` unless it can prove the existing file is its own output; `--force` overwrites.
 
 | Flag | Meaning |
 |---|---|
