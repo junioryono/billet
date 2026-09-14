@@ -49,3 +49,6 @@ ON CONFLICT(lease_id) DO NOTHING;
 -- name: ReadPoolSlotIdentity :one
 -- The identity one lease's pool slot holds.
 SELECT internal_id FROM pool_slot_identities WHERE lease_id = @lease_id;
+
+-- name: ReadJobIdentityByInternalID :one
+SELECT job_id FROM job_identities WHERE internal_id = @internal_id;

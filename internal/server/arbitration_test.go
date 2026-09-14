@@ -437,11 +437,14 @@ func TestKnownDemandOrderDoesNotFollowObservationArrival(t *testing.T) {
 // must go to the idle peer even if GitHub repeats the already-acquired offer.
 func TestARepeatedOfferDoesNotPreemptDiscovery(t *testing.T) {
 	for _, tc := range []struct {
-		name      string
-		requestID int64
+		name       string
+		requestID  int64
+		repeatedID int64
 	}{
-		{name: "request id", requestID: 11},
+		{name: "request id", requestID: 11, repeatedID: 11},
 		{name: "zero request id", requestID: 0},
+		{name: "direct promise with positive offer", requestID: 0, repeatedID: 11},
+		{name: "positive promise with zero offer", requestID: 11},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, listeners := arbitrationListeners(t, []config.Tier{tier("a-work"), tier("b-idle")}, 2*tierVCPU)
@@ -468,6 +471,7 @@ func TestARepeatedOfferDoesNotPreemptDiscovery(t *testing.T) {
 			if sent != 1 || idleTurn == 0 {
 				t.Fatalf("peer discovery sent %d with turn %d; want one backed turn", sent, idleTurn)
 			}
+			offer.Available[0].RequestID = tc.repeatedID
 			if err := work.handle(t.Context(), offer); err != nil {
 				t.Fatal(err)
 			}
@@ -541,16 +545,16 @@ func TestDirectOfferDemandKeepsSeparateJobIdentities(t *testing.T) {
 	if err := first.prepareEscrow(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if err := second.rememberAvailable(t.Context(), &Message{Available: []Job{{JobID: "job-a"}, {JobID: "job-b"}}}); err != nil {
+	if err := second.handle(t.Context(), &Message{MessageID: 1, Available: []Job{{JobID: "job-a"}, {JobID: "job-b"}}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := second.rememberAvailable(t.Context(), &Message{Completed: []Job{{JobID: "job-a"}}}); err != nil {
+	if err := second.handle(t.Context(), &Message{MessageID: 2, Completed: []Job{{JobID: "job-a"}}}); err != nil {
 		t.Fatal(err)
 	}
 	second.observeDemand(nil)
 	_, turn := first.admissionPoll()
 	first.finishAdmissionTurn(turn)
-	if len(second.waitingOffers) != 1 || !second.waitingOffers[offerIdentity{job: "job-b"}] ||
+	if len(second.waitingOffers) != 1 || !containsActual(second.waitingOffers, actualJobIdentity{job: "job-b"}) ||
 		!second.arbiter.permits(second.tier) {
 		t.Fatalf("completion erased unrelated demand: %+v", second.waitingOffers)
 	}

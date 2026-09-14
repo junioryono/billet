@@ -310,6 +310,9 @@ type Listener struct {
 	// number sent to GitHub is only ever capacity this listener took from the
 	// allocator, never one computed from headroom.
 	running map[int64]*alloc.Lease
+	// Assignment facts retained for resolveActualJob while the lease is running.
+	// A durable busy pool binding supersedes these intended-job facts.
+	runningJobs map[int64]Job
 	// Restart-surviving runner leases held by the node rather than this
 	// listener. They count in GitHub's total pool capacity but do not enter the
 	// listener's heartbeat or teardown ownership.
@@ -390,7 +393,7 @@ type Listener struct {
 	// accepted offers spend it so stale available statistics cannot pin a turn.
 	demandObservation *Statistics
 	claimedSinceStats int
-	waitingOffers     map[offerIdentity]bool
+	waitingOffers     []actualJobIdentity
 
 	// Bounds somebody else's JOB rather than billet's own teardown, so it has its
 	// own ceiling. See maxDrainGrace.
@@ -432,10 +435,10 @@ func NewListener(a *alloc.Allocator, tier string, session Session, opts ...Optio
 		tier:          tier,
 		session:       session,
 		log:           slog.Default(),
+		runningJobs:   make(map[int64]Job),
 		running:       make(map[int64]*alloc.Lease),
 		adopted:       make(map[string]bool),
 		acquiring:     make(map[int64]*promise),
-		waitingOffers: make(map[offerIdentity]bool),
 		cleanup:       make(map[int64]*pendingCleanup),
 		destroying:    make(map[int64]bool),
 		configErrs:    make(map[string]error),
@@ -495,6 +498,7 @@ func withCompletionStore(store completionStore) Option {
 // `at` IS DIAGNOSTIC ONLY — it drives one stale-promise warning and must not time
 // the promise out; see defaultStalePromise.
 type promise struct {
+	job   Job
 	lease *alloc.Lease
 	at    time.Time
 	// reported keeps a stale promise from logging on every heartbeat.
@@ -2550,6 +2554,7 @@ func (l *Listener) destroyAll(
 
 				l.mu.Lock()
 				delete(l.running, requestID)
+				delete(l.runningJobs, requestID)
 				if retired {
 					if entry := l.cleanup[requestID]; entry == nil ||
 						entry.job.CompletionID == 0 || entry.job.CompletionID == job.CompletionID {
@@ -2753,6 +2758,7 @@ func (l *Listener) heartbeatHeld(ctx context.Context) {
 		// destroy discharges it — deleting it leaves the container reachable by nothing but
 		// an optional Sweeper.
 		delete(l.running, id)
+		delete(l.runningJobs, id)
 		delete(l.confirmed, lease.ID)
 
 		if _, pending := l.cleanup[id]; !pending {
@@ -3036,9 +3042,6 @@ func (l *Listener) refillEscrowUngated(ctx context.Context, target int) error {
 // about error severity, so the first non-fatal error path anyone adds inherits
 // the question.
 func (l *Listener) handle(ctx context.Context, msg *Message) error {
-	if err := l.rememberAvailable(ctx, msg); err != nil {
-		return err
-	}
 	// STARTS PRECEDE COMPLETIONS EVEN WHEN GITHUB BATCHES THEM TOGETHER. The
 	// start is the authoritative runner-to-job binding; resolving the completion
 	// first would either settle the request that caused launch or mistake a busy
@@ -3057,61 +3060,34 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 			"runner", job.RunnerName, "request", job.RequestID, "job", job.JobID)
 	}
 
-	// Assignments may establish a direct identity; completions may only look one
-	// up. Resolve this batch's assignments before that lookup, outside l.mu so
-	// ledger transactions cannot stall heartbeats behind the escrow mutex.
-	assigned := make([]Job, len(msg.Assigned))
-	for i, job := range msg.Assigned {
-		var err error
-		assigned[i], err = l.identifyAssigned(ctx, job)
-		if err != nil {
-			return err
-		}
+	resolved, err := l.resolveMessage(ctx, msg)
+	if err != nil {
+		return err
 	}
+	l.rememberAvailable(msg, resolved)
 
-	// COMPLETED IS PROCESSED FIRST. Otherwise the cycle never closes — the lease stays
-	// open until the reaper expires it — and it must come first because GitHub batches
-	// the completion of one job with the offer of its replacement: acquiring before
-	// releasing claims the replacement while still holding the finished job's lease.
-	//
-	// `finished` is scoped to THIS MESSAGE, which is the whole lifetime the problem
-	// has. A batch can carry Assigned and Completed for the same request — an
-	// assigned-then-cancelled job — and it does not need to survive the call, because a
-	// redelivery rebuilds it before the assignments are read. A longer-lived map would
-	// silently skip a request id GitHub requeued after cancelling it.
-	finished := make(map[int64]struct{}, len(msg.Completed))
-	finishedOffers := make(map[offerIdentity]struct{}, len(msg.Completed))
-	completed := make([]Job, 0, len(msg.Completed))
-	poisoned := make([]error, 0, len(msg.Completed))
-
-	for i := range msg.Completed {
-		job := msg.Completed[i]
-		job.CompletionID = msg.MessageID
-		job, actual, err := l.identifyCompletion(ctx, job)
-		if err != nil {
-			if errors.Is(err, errQuarantinableCompletion) {
-				poisoned = append(poisoned, err)
-
-				continue
+	// Completion precedes acquisition so its replacement can use released escrow.
+	// Both acquisition filters use resolveActualJob's rule, including redelivery
+	// after a completion has retired or been superseded by a newer delivery.
+	finished := make([]actualJobIdentity, 0, len(resolved.completed))
+	completed := make([]Job, 0, len(resolved.completed))
+	for _, entry := range resolved.completed {
+		if entry.binding != nil {
+			if err := l.restorePoolLease(ctx, *entry.binding); err != nil {
+				return err
 			}
-
-			return err
 		}
-		// Offers name the actual job; cleanup names the runner's launch request.
-		// Only a validated completion with a job identity can suppress an offer.
-		for _, identity := range actualJobIdentities(actual) {
-			finishedOffers[identity] = struct{}{}
-		}
-		completed = append(completed, job)
+		finished = append(finished, entry.actual)
+		completed = append(completed, entry.cleanup)
 	}
 
 	handled := *msg
 	handled.Completed = completed
 
 	var poison error
-	if len(poisoned) > 0 {
+	if len(resolved.poisoned) > 0 {
 		poison = &poisonedMessageError{
-			cause:       errors.Join(poisoned...),
+			cause:       errors.Join(resolved.poisoned...),
 			completions: slices.Clone(completed),
 		}
 	}
@@ -3120,12 +3096,6 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 		job := completed[i]
 		l.log.Info("received a completed job", "tier", l.tier, "request", job.RequestID,
 			"runner", job.RunnerName, "result", job.Result)
-		// THE DELIVERY IS TERMINAL EVEN WHEN ITS TEARDOWN ALREADY SETTLED. A
-		// failed acknowledgement redelivers the whole batch, including an Assigned
-		// entry for an assigned-then-cancelled job. Retired means "do not destroy
-		// again", not "the assignment is live again". Stale means a newer delivery
-		// already decided this request, so the older assignment is no more runnable.
-		finished[job.RequestID] = struct{}{}
 
 		disposition, err := l.recordCompletion(ctx, job)
 		if err != nil {
@@ -3221,7 +3191,7 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 		// AVAILABLE is what gets acquired. Available is the offer; Assigned is the
 		// confirmation that an offer was claimed. Acquiring from Assigned asks
 		// GitHub to claim work it has already handed over, and drops every offer.
-		if err := l.acquireUnfinished(ctx, msg.Available, finishedOffers); err != nil {
+		if err := l.acquireUnfinished(ctx, resolved.available, finished, resolved.committed); err != nil {
 			return err
 		}
 	}
@@ -3241,8 +3211,10 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 		}
 		assignmentDeficit = max(msg.Statistics.TotalAssignedJobs-active, 0)
 	}
-	for _, job := range assigned {
-		if _, over := finished[job.RequestID]; over {
+	// Assignment filtering follows resolveActualJob, never the cleanup request.
+	for _, entry := range resolved.assigned {
+		job := entry.job
+		if containsActual(finished, entry.actual) {
 			continue
 		}
 		if assignmentDeficit == 0 {
@@ -3523,32 +3495,14 @@ func (l *Listener) retirePoolMember(ctx context.Context, member alloc.PoolRunner
 func (l *Listener) dropPoolMember(member alloc.PoolRunner) {
 	l.mu.Lock()
 	delete(l.running, member.LaunchRequestID)
+	delete(l.runningJobs, member.LaunchRequestID)
 	delete(l.acquiring, member.LaunchRequestID)
 	delete(l.confirmed, member.LeaseID)
 	l.mu.Unlock()
 }
 
-// identifyAssigned gives a direct assignment its durable scheduler identity.
-func (l *Listener) identifyAssigned(ctx context.Context, job Job) (Job, error) {
-	if job.RequestID != 0 {
-		return job, nil
-	}
-	if l.alloc == nil {
-		return Job{}, fmt.Errorf("%w: %s assigned job %q without a request id, and no ledger is available to identify it",
-			ErrUntrustworthySession, l.tier, job.JobID)
-	}
-
-	requestID, err := l.alloc.IdentifyDirectJob(ctx, job.JobID)
-	if err != nil {
-		return Job{}, fmt.Errorf("%w: %s cannot identify directly assigned job %q: %w",
-			ErrUntrustworthySession, l.tier, job.JobID, err)
-	}
-	job.RequestID = requestID
-
-	return job, nil
-}
-
-// identifyStarted records which job a registered pool member actually consumed.
+// identifyStarted records which job a registered pool member actually consumed,
+// using resolveActualJob for its scheduler aliases.
 func (l *Listener) identifyStarted(ctx context.Context, job Job) (Job, error) {
 	if l.alloc == nil {
 		return Job{}, fmt.Errorf("%w: %s started runner %q without a ledger",
@@ -3558,10 +3512,11 @@ func (l *Listener) identifyStarted(ctx context.Context, job Job) (Job, error) {
 		return Job{}, fmt.Errorf("%w: %s received an incomplete started identity for runner %q",
 			errQuarantinableStarted, l.tier, job.RunnerName)
 	}
-	identified, err := l.identifyAssigned(ctx, job)
+	resolved, err := l.resolveActualJob(ctx, job, resolveAcquisition, nil)
 	if err != nil {
 		return Job{}, err
 	}
+	identified := resolved.job
 	member, err := l.alloc.PoolRunnerByName(ctx, job.RunnerName)
 	leaseID := member.LeaseID
 	switch {
@@ -3609,131 +3564,6 @@ func (l *Listener) identifyStarted(ctx context.Context, job Job) (Job, error) {
 		return Job{}, fmt.Errorf("server: bind started runner %q: %w", job.RunnerName, err)
 	}
 	return identified, nil
-}
-
-// identifyCompletion returns the cleanup identity and an optional actual job
-// identity. Only actual-job aliases may suppress offers; cleanup supplies none.
-func (l *Listener) identifyCompletion(ctx context.Context, job Job) (Job, Job, error) {
-	actual := job
-	if job.RunnerName == "" && job.RequestID != 0 {
-		return job, actual, nil
-	}
-	if l.alloc == nil {
-		return Job{}, Job{}, fmt.Errorf("%w: %s completed runner %q without a request id, and no ledger is available to resolve it",
-			ErrUntrustworthySession, l.tier, job.RunnerName)
-	}
-
-	if actual.RequestID == 0 && actual.JobID != "" {
-		requestID, exists, err := l.alloc.DirectJobIdentity(ctx, actual.JobID)
-		if err != nil {
-			return Job{}, Job{}, fmt.Errorf("%w: %s cannot resolve completed job %q: %w",
-				ErrUntrustworthySession, l.tier, actual.JobID, err)
-		}
-		if exists {
-			actual.RequestID = requestID
-		}
-	}
-
-	// THE RUNNER, NOT runnerRequestId, IS THE COMPUTE IDENTITY. The request id
-	// describes the job that completed and may belong to a different pool member.
-	if job.RunnerName != "" {
-		binding, err := l.alloc.PoolRunnerByName(ctx, job.RunnerName)
-		switch {
-		case err == nil:
-			if binding.Tier != l.tier || binding.LaunchRequestID == 0 {
-				return Job{}, Job{}, fmt.Errorf("%w: completed runner %q belongs to tier %q",
-					ErrUntrustworthySession, job.RunnerName, binding.Tier)
-			}
-			if err := l.restorePoolLease(ctx, binding); err != nil {
-				return Job{}, Job{}, err
-			}
-			if binding.ActualRequestID != 0 || binding.JobID != "" {
-				if job.JobID != "" && binding.JobID != "" && job.JobID != binding.JobID {
-					return Job{}, Job{}, fmt.Errorf("%w: completed runner %q names job %q after starting %q",
-						ErrUntrustworthySession, job.RunnerName, job.JobID, binding.JobID)
-				}
-				if job.RequestID != 0 && binding.ActualRequestID != 0 &&
-					job.RequestID != binding.ActualRequestID {
-					return Job{}, Job{}, fmt.Errorf("%w: completed runner %q names request %d after starting %d",
-						ErrUntrustworthySession, job.RunnerName, job.RequestID, binding.ActualRequestID)
-				}
-			}
-			if binding.ActualRequestID != 0 {
-				actual.RequestID = binding.ActualRequestID
-				actual.JobID = binding.JobID
-				actual.RunID = binding.RunID
-			}
-			job.RequestID = binding.LaunchRequestID
-			return job, actual, nil
-		case !errors.Is(err, alloc.ErrLeaseNotFound):
-			return Job{}, Job{}, fmt.Errorf("%w: cannot resolve completed runner %q: %w",
-				ErrUntrustworthySession, job.RunnerName, err)
-		}
-	}
-
-	if job.RequestID != 0 {
-		return job, actual, nil
-	}
-
-	leaseID, ok := provider.LeaseOf(job.RunnerName)
-	if ok {
-		identity, err := l.alloc.JobForLease(ctx, leaseID)
-		switch {
-		case err == nil:
-			if identity.Tier != l.tier || identity.RequestID == 0 {
-				return Job{}, Job{}, fmt.Errorf("%w: completed runner %q resolves to tier %q request %d, not tier %q",
-					ErrUntrustworthySession, job.RunnerName, identity.Tier, identity.RequestID, l.tier)
-			}
-			// A RUNNER AND ITS INTENDED JOB ARE A POOL, NOT A PAIR, and treating a
-			// disagreement as a broken contract took the control plane down. Within
-			// one scale set GitHub hands an assigned job to whichever registered
-			// runner is free, so two jobs launched seconds apart can swap runners —
-			// measured live, the first time a full suite ran concurrently: the
-			// runner billet started for request -49 completed the job mapped to
-			// -52, honestly. The old fatal made GitHub redeliver the same message
-			// to every fresh session, which is a restart loop with no exit.
-			//
-			// THE RUNNER'S LEASE IS THE IDENTITY THAT SETTLES. The completion says
-			// THIS guest finished with THIS result, which is exactly what its
-			// capacity release and cache settlement need. The job-side facts (run
-			// id, job id) stay from the message because they describe the job that
-			// really ran here. Pool reconciliation separately scales down any idle
-			// registration that was reserved for this job but never consumed it.
-			if job.RunID != 0 && identity.RunID != 0 && job.RunID != identity.RunID {
-				l.log.Warn("a completed runner ran a job from a different run than the one "+
-					"it was launched for; github pools assigned jobs across a scale set's "+
-					"runners, so its lease settles under the run it actually executed",
-					"tier", l.tier, "runner", job.RunnerName,
-					"ran", job.RunID, "launched_for", identity.RunID)
-			}
-			if actual.RequestID != 0 && actual.RequestID != identity.RequestID {
-				l.log.Warn("a completed runner ran a different assigned job than the one "+
-					"it was launched for; github pools assigned jobs across a scale set's "+
-					"runners, so this runner's lease settles with the result while idle "+
-					"surplus is retired from the authoritative assigned-job count",
-					"tier", l.tier, "runner", job.RunnerName,
-					"launched_for", identity.RequestID, "job", job.JobID, "ran", actual.RequestID)
-			}
-
-			job.RequestID = identity.RequestID
-			if job.RunID == 0 {
-				job.RunID = identity.RunID
-			}
-
-			return job, actual, nil
-		case !errors.Is(err, alloc.ErrLeaseNotFound):
-			return Job{}, Job{}, fmt.Errorf("%w: %s cannot resolve completed runner %q: %w",
-				ErrUntrustworthySession, l.tier, job.RunnerName, err)
-		}
-	}
-
-	if actual.RequestID != 0 {
-		job.RequestID = actual.RequestID
-		return job, actual, nil
-	}
-
-	return Job{}, Job{}, fmt.Errorf("%w: %s completed runner %q without a request id or resolvable job or billet lease identity",
-		errQuarantinableCompletion, l.tier, job.RunnerName)
 }
 
 // restorePoolLease reconnects restart-safe pool identity to the completion
@@ -3817,31 +3647,18 @@ func (l *Listener) acknowledgeCompletions(ctx context.Context, msg *Message) {
 // offer goes to another scale set or is re-offered, whereas an acquisition
 // billet cannot back is a job that goes nowhere at all.
 func (l *Listener) acquire(ctx context.Context, available []Job) error {
-	return l.acquireUnfinished(ctx, available, nil)
+	resolved, err := l.resolveMessage(ctx, &Message{Available: available})
+	if err != nil {
+		return err
+	}
+	return l.acquireUnfinished(ctx, resolved.available, nil, resolved.committed)
 }
 
-// actualJobIdentities excludes missing aliases so unrelated zero-request jobs
-// never compare equal merely because a field was omitted.
-func actualJobIdentities(job Job) []offerIdentity {
-	identities := make([]offerIdentity, 0, 2)
-	if job.RequestID != 0 {
-		identities = append(identities, offerIdentity{request: job.RequestID})
-	}
-	if job.JobID != "" {
-		identities = append(identities, offerIdentity{job: job.JobID})
-	}
-
-	return identities
-}
-
-// acquireUnfinished excludes jobs whose completion arrived in the same batch.
-// Completion and offer share one identity: the validated actual job, whose
-// nonzero request id and nonempty JobID are aliases; a match on either is enough.
-// Both sides derive these aliases with actualJobIdentities. The runner's launch
-// request identifies cleanup only and never supplies an actual-job alias.
-// COMPLETION BEATS AN OFFER TOO. Reacquiring a cancelled job leaves a promise
-// waiting for an assignment that can never arrive.
-func (l *Listener) acquireUnfinished(ctx context.Context, available []Job, finished map[offerIdentity]struct{}) error {
+// acquireUnfinished uses resolveActualJob's rule for completion and commitment
+// filtering. Wire request IDs are retained only for the AcquireJobs protocol.
+func (l *Listener) acquireUnfinished(ctx context.Context, available []resolvedJob,
+	finished, committed []actualJobIdentity,
+) error {
 	if len(available) == 0 {
 		return nil
 	}
@@ -3849,18 +3666,12 @@ func (l *Listener) acquireUnfinished(ctx context.Context, available []Job, finis
 	identified := make([]Job, 0, len(available))
 	protocolFor := make(map[int64]int64, len(available))
 	internalFor := make(map[int64]int64, len(available))
-	offerFor := make(map[int64]offerIdentity, len(available))
-	for i := range available {
-		protocolID := available[i].RequestID
-		job, err := l.identifyAssigned(ctx, available[i])
-		if err != nil {
-			return err
-		}
-		if slices.ContainsFunc(actualJobIdentities(job), func(identity offerIdentity) bool {
-			_, over := finished[identity]
-			return over
-		}) {
-			delete(l.waitingOffers, identityOfOffer(available[i]))
+	offerFor := make(map[int64]actualJobIdentity, len(available))
+	for _, entry := range available {
+		protocolID := entry.protocolID
+		job := entry.job
+		if containsActual(finished, entry.actual) || containsActual(committed, entry.actual) {
+			l.forgetAvailable(entry.actual)
 			continue
 		}
 		identified = append(identified, job)
@@ -3870,12 +3681,7 @@ func (l *Listener) acquireUnfinished(ctx context.Context, available []Job, finis
 				ErrUntrustworthySession, l.tier, prior, job.RequestID, protocolID)
 		}
 		internalFor[protocolID] = job.RequestID
-		offerFor[protocolID] = identityOfOffer(available[i])
-		l.mu.Lock()
-		if l.acquiring[job.RequestID] != nil || l.running[job.RequestID] != nil {
-			delete(l.waitingOffers, offerFor[protocolID])
-		}
-		l.mu.Unlock()
+		offerFor[protocolID] = entry.actual
 	}
 
 	// THE TURN MUST STILL BELONG TO THIS TIER WHEN ESCROW BECOMES A PROMISE.
@@ -3943,7 +3749,7 @@ func (l *Listener) acquireUnfinished(ctx context.Context, available []Job, finis
 	}
 	l.unreserve(missing(reservedInternal, acquiredInternal))
 	for _, id := range acquiredProtocol {
-		delete(l.waitingOffers, offerFor[id])
+		l.forgetAvailable(offerFor[id])
 	}
 	l.claimedSinceStats += len(acquiredProtocol)
 
@@ -4006,7 +3812,7 @@ func (l *Listener) reserve(available []Job) []int64 {
 			continue
 		}
 
-		l.acquiring[job.RequestID] = &promise{lease: l.held[0], at: time.Now()}
+		l.acquiring[job.RequestID] = &promise{lease: l.held[0], at: time.Now(), job: *job}
 		l.held = l.held[1:]
 
 		ids = append(ids, job.RequestID)
@@ -4191,6 +3997,7 @@ func (l *Listener) assign(ctx context.Context, job Job) (*alloc.Lease, bool, err
 	delete(l.heldOrder, lease.ID)
 
 	l.running[job.RequestID] = lease
+	l.runningJobs[job.RequestID] = job
 
 	return lease, true, nil
 }
@@ -4266,6 +4073,7 @@ func (l *Listener) launch(ctx context.Context, lease *alloc.Lease, job Job) erro
 
 		l.mu.Lock()
 		delete(l.running, job.RequestID)
+		delete(l.runningJobs, job.RequestID)
 		l.mu.Unlock()
 
 		return nil
@@ -4327,6 +4135,7 @@ func (l *Listener) launch(ctx context.Context, lease *alloc.Lease, job Job) erro
 	l.mu.Lock()
 
 	delete(l.running, job.RequestID)
+	delete(l.runningJobs, job.RequestID)
 
 	if !releaseSettled(relErr) {
 		if l.cleanup == nil {
@@ -4492,6 +4301,7 @@ func (l *Listener) releaseParked(ctx context.Context, requestID int64) (bool, bo
 
 	delete(l.cleanup, requestID)
 	delete(l.running, requestID)
+	delete(l.runningJobs, requestID)
 	delete(l.acquiring, requestID)
 
 	return true, true
@@ -4718,6 +4528,7 @@ func (l *Listener) parkUnreachable(job Job, lease *alloc.Lease, outcome alloc.Ph
 	}
 
 	delete(l.running, job.RequestID)
+	delete(l.runningJobs, job.RequestID)
 	delete(l.confirmed, lease.ID)
 
 	if entry == nil {
@@ -5022,6 +4833,7 @@ func (l *Listener) complete(ctx context.Context, job Job) {
 
 			l.mu.Lock()
 			delete(l.running, job.RequestID)
+			delete(l.runningJobs, job.RequestID)
 			if retired {
 				if entry := l.cleanup[job.RequestID]; entry == nil ||
 					entry.job.CompletionID == 0 || entry.job.CompletionID == job.CompletionID {
@@ -5268,6 +5080,7 @@ func (l *Listener) complete(ctx context.Context, job Job) {
 			"tier", l.tier, "request", job.RequestID, "lease", lease.ID, "error", err)
 
 		delete(l.running, job.RequestID)
+		delete(l.runningJobs, job.RequestID)
 		delete(l.acquiring, job.RequestID)
 		l.mu.Unlock()
 
@@ -5276,6 +5089,7 @@ func (l *Listener) complete(ctx context.Context, job Job) {
 
 	// RELEASED, so the job is finally over and there is nothing to retry.
 	delete(l.running, job.RequestID)
+	delete(l.runningJobs, job.RequestID)
 	delete(l.acquiring, job.RequestID)
 	l.mu.Unlock()
 	if l.forgetCompletion(ctx, job) {
@@ -5818,6 +5632,7 @@ func (l *Listener) forceDestroy(ctx context.Context) {
 			// nobody removed a map entry.
 			l.mu.Lock()
 			delete(l.running, t.SchedulerRequest)
+			delete(l.runningJobs, t.SchedulerRequest)
 			delete(l.cleanup, t.SchedulerRequest)
 			l.mu.Unlock()
 

@@ -1458,8 +1458,9 @@ func TestCompletionSettlesTheRunnersLeaseWhenGitHubPairedItWithAnotherJob(t *tes
 		t.Fatalf("IdentifyDirectJob: %v", err)
 	}
 
-	resolved, _, err := l.identifyCompletion(t.Context(), Job{RunID: 102, JobID: "different-job-guid",
-		RunnerName: provider.InstanceName(lease.ID)})
+	entry, err := l.resolveActualJob(t.Context(), Job{RunID: 102, JobID: "different-job-guid",
+		RunnerName: provider.InstanceName(lease.ID)}, resolveCompletion, nil)
+	resolved := entry.cleanup
 	if err != nil {
 		t.Fatalf("a pooled completion was refused rather than settled: %v", err)
 	}
@@ -2010,7 +2011,7 @@ func TestDirectAssignmentWithoutJobIDFailsClosed(t *testing.T) {
 	a := newAllocator(t, alloc.Limits{MaxVCPU: tierVCPU, MaxMemory: 64 * config.GiB}, tiers)
 	l := NewListener(a, tiers[0].Label, &fakeSession{})
 
-	_, err := l.identifyAssigned(t.Context(), Job{})
+	err := l.handle(t.Context(), &Message{MessageID: 1, Assigned: []Job{{}}})
 	if !errors.Is(err, ErrUntrustworthySession) {
 		t.Fatalf("identify zero-id assignment without job id = %v, want ErrUntrustworthySession", err)
 	}

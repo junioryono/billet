@@ -45,20 +45,6 @@ type discoveryEntry struct {
 	ceiling  int
 }
 
-// offerIdentity keeps zero-request direct jobs separate until they are assigned.
-type offerIdentity struct {
-	request int64
-	job     string
-}
-
-func identityOfOffer(job Job) offerIdentity {
-	if job.RequestID != 0 {
-		return offerIdentity{request: job.RequestID}
-	}
-
-	return offerIdentity{job: job.JobID}
-}
-
 func newDiscoveryArbiter(tiers []config.Tier) *discoveryArbiter {
 	a := &discoveryArbiter{entries: make(map[string]discoveryEntry, len(tiers))}
 	for _, t := range tiers {
@@ -236,45 +222,43 @@ func (l *Listener) finishAdmissionTurn(turn uint64) {
 	}
 }
 
-// rememberAvailable retains a refused offer as known demand until it is accepted,
-// assigned, completed, or replaced by a source snapshot reporting no available
-// work. A timer never turns silence into proof that the queue is empty.
-func (l *Listener) rememberAvailable(ctx context.Context, msg *Message) error {
+// rememberAvailable retains priority hints under resolveActualJob's rule until
+// acceptance, assignment, completion, or a source snapshot reports no work.
+// A timer never turns silence into proof that the queue is empty.
+func (l *Listener) rememberAvailable(msg *Message, resolved resolvedMessage) {
 	if l.arbiter == nil {
-		return nil
+		return
 	}
-	// Identity resolution can write the ledger; heartbeatPass must remain able
-	// to take l.mu while a batch waits for those transactions.
-	identified := make([]Job, len(msg.Available))
-	for i, job := range msg.Available {
-		var err error
-		identified[i], err = l.identifyAssigned(ctx, job)
-		if err != nil {
-			return err
-		}
-	}
-
-	l.mu.Lock()
-	defer l.mu.Unlock()
 	if msg.Statistics != nil && msg.Statistics.TotalAvailableJobs == 0 {
-		clear(l.waitingOffers)
+		l.waitingOffers = nil
 	}
-	for i, job := range msg.Available {
-		// A REPEATED OFFER DOES NOT CREATE A SECOND BACKLOG ENTRY. reserve
-		// uses durable identities even when the wire request id is zero. Resolve
-		// before publishing demand, which could revoke a peer's discovery turn.
-		if l.acquiring[identified[i].RequestID] != nil || l.running[identified[i].RequestID] != nil {
+	for _, entry := range resolved.available {
+		// Commitment comparisons use resolveActualJob's canonical aliases.
+		if containsActual(resolved.committed, entry.actual) {
 			continue
 		}
-		l.waitingOffers[identityOfOffer(job)] = true
+		actual := entry.actual
+		for _, prior := range l.waitingOffers {
+			if sameActualJob(actual, prior) {
+				actual = mergeActual(actual, prior)
+			}
+		}
+		l.forgetAvailable(actual)
+		l.waitingOffers = append(l.waitingOffers, actual)
 	}
-	for _, job := range msg.Assigned {
-		delete(l.waitingOffers, identityOfOffer(job))
+	for _, entry := range resolved.assigned {
+		l.forgetAvailable(entry.actual)
 	}
-	for _, job := range msg.Completed {
-		delete(l.waitingOffers, identityOfOffer(job))
+	for _, entry := range resolved.completed {
+		l.forgetAvailable(entry.actual)
 	}
-	return nil
+}
+
+// forgetAvailable removes priority hints using resolveActualJob's rule.
+func (l *Listener) forgetAvailable(actual actualJobIdentity) {
+	l.waitingOffers = slices.DeleteFunc(l.waitingOffers, func(prior actualJobIdentity) bool {
+		return sameActualJob(prior, actual)
+	})
 }
 
 // admissionPoll fixes the advertisement and its turn as one decision. Demand

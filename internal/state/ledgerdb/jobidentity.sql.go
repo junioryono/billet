@@ -77,6 +77,17 @@ func (q *Queries) ReadJobIdentity(ctx context.Context, jobID string) (int64, err
 	return internal_id, err
 }
 
+const readJobIdentityByInternalID = `-- name: ReadJobIdentityByInternalID :one
+SELECT job_id FROM job_identities WHERE internal_id = $1
+`
+
+func (q *Queries) ReadJobIdentityByInternalID(ctx context.Context, internalID int64) (string, error) {
+	row := q.db.QueryRowContext(ctx, readJobIdentityByInternalID, internalID)
+	var job_id string
+	err := row.Scan(&job_id)
+	return job_id, err
+}
+
 const readPoolSlotIdentity = `-- name: ReadPoolSlotIdentity :one
 SELECT internal_id FROM pool_slot_identities WHERE lease_id = $1
 `
