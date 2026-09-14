@@ -51,9 +51,15 @@ func TestTheFreeSpaceGuardRefusesWhatItCannotRead(t *testing.T) {
 			// parallel test's fork can inherit the descriptor that wrote it, exec then
 			// fails with ETXTBSY, and /bin/sh carries on down PATH to the real df, whose
 			// ample free space made "not-a-number" pass (CI run 34827346038).
+			// An empty value prints the header alone, so awk finds no second line;
+			// written into the row, awk's field splitting would read the next column.
+			row := "  printf '/dev/root 1 1 " + tc.df + " 1%%%% /\\n'\n"
+			if tc.df == "" {
+				row = ""
+			}
 			fake := "df() {\n" +
 				"  printf 'Filesystem 1K-blocks Used Available Use%% Mounted on\\n'\n" +
-				"  printf '/dev/root 1 1 " + tc.df + " 1%%%% /\\n'\n" +
+				row +
 				"}\n"
 
 			cmd := exec.CommandContext(t.Context(), "/bin/sh", "-c", "set -eu\n"+fake+block)
@@ -82,16 +88,20 @@ func freeSpaceBlock(t *testing.T, script string) string {
 	lines := strings.Split(script, "\n")
 	start := firstLineOf(t, lines, "billet_free_kib=$(df -Pk /")
 
-	seen := 0
-
+	// Bounded at the FIRST fi: a guard whose case was deleted must fail here, not
+	// extend the block to a later esac and run unrelated provisioning commands.
 	for i := start; i < len(lines); i++ {
-		if lines[i] == "esac" {
-			seen++
+		if lines[i] != "fi" {
+			continue
 		}
 
-		if lines[i] == "fi" && seen > 0 {
-			return strings.Join(lines[start:i+1], "\n") + "\n"
+		for _, line := range lines[start:i] {
+			if line == "esac" {
+				return strings.Join(lines[start:i+1], "\n") + "\n"
+			}
 		}
+
+		break
 	}
 
 	t.Fatal("the free-space guard has no case guard before its comparison, so a df that " +
