@@ -1,0 +1,14 @@
+---
+- name: Require a fresh converge after interrupted-upgrade recovery
+  ansible.builtin.fail:
+    msg: >-
+      The interrupted billet upgrade was {{
+        'finished from its durable commit'
+        if billet_upgrade_commit_state.stat.exists
+        else 'rolled back from ' ~ billet_upgrade_recovery_dir
+      }}. Rerun the playbook to start a fresh transaction for the requested
+      binary.
+  when:
+    - billet_interrupted_upgrade | bool
+    - not ansible_check_mode
+

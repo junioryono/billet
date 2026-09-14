@@ -83,3 +83,9 @@ billet_configured_state_backend: >-
     billet_config.get('server', {}).get('state', {}).get('backend')
     or 'sqlite'
   }}
+
+# The first release carrying the complete seven-route classifier. Development
+# builds must answer the same strict shape. This is not the installation pin.
+billet_retire_capability_floor: v0.11.0
+# retireReportLedgerBound (two minutes), plus observation/cleanup margin.
+billet_retire_classify_bound: 180

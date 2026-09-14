@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "outcome": "reported",
+  "journal": null,
+  "status": {
+    "phase": "stopped",
+    "variant": "server-only",
+    "updated_at": "2026-09-11T10:00:00Z"
+  },
+  "stage": "absent",
+  "guard": "none",
+  "marker": null,
+  "row": null,
+  "row_fact": "absent",
+  "dispatch": "request",
+  "status_presence": "present",
+  "config": "present",
+  "installed_roles": "server",
+  "identity": "minted",
+  "authority": "absent",
+  "route": "hold",
+  "route_why": "a retirement status is published with no journal to explain it",
+  "state": "unknown"
+}

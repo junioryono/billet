@@ -1,0 +1,27 @@
+{
+  "schema": 1,
+  "outcome": "reported",
+  "journal": null,
+  "status": null,
+  "stage": "absent",
+  "guard": "converge-guard",
+  "marker": null,
+  "row": {
+    "retiring": "control-a",
+    "survivor": "control-b",
+    "run": "ci-1",
+    "state": "reserved",
+    "transition_id": "0123456789abcdef0123456789abcdef",
+    "reserved_at": "2026-09-11T10:00:00Z"
+  },
+  "row_fact": "reserved-mine",
+  "dispatch": "adopt",
+  "status_presence": "absent",
+  "config": "present",
+  "installed_roles": "server",
+  "identity": "minted",
+  "authority": "present",
+  "route": "cancel",
+  "route_why": "this host holds a reservation nothing has started and the inventory no longer requests a retirement",
+  "state": "nothing"
+}

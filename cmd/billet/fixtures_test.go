@@ -47,6 +47,12 @@ func compareFixture(t *testing.T, command, name, out string) {
 	}
 
 	want, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		t.Errorf("%s/%s: the fixture is missing:\n--- command\n%s", command, name, out)
+
+		return
+	}
+
 	if err != nil {
 		t.Fatalf("%s/%s: %v (run with BILLET_UPDATE_FIXTURES=1 to write the fixtures)", command, name, err)
 	}

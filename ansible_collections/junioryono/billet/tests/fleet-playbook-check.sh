@@ -52,8 +52,8 @@ for play in plays:
     pre = play.get("pre_tasks") or []
     first = pre[0] if pre else {}
     guard = first.get("ansible.builtin.include_role") or first.get("include_role") or {}
-    # THE EXCLUSION'S PREPARATION, whose own first task is the converge guard's
-    # import: the guard fires first, and the host is held before ssh_access.
+    # THE EXCLUSION'S PREPARATION resets permission without a connection first,
+    # imports the runner refusal second, and holds the host before ssh_access.
     if guard.get("name") != "junioryono.billet.host" or guard.get("tasks_from") != "prepare-exclusion":
         sys.exit(f"fleet-playbook-check: the {play['hosts']} play's first pre_task is not the exclusion's preparation (tasks_from: prepare-exclusion)")
     if first.get("tags") != ["always"] or (guard.get("apply") or {}).get("tags") != ["always"]:

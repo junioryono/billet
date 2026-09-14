@@ -96,8 +96,8 @@ func TestASettledRetirementIsUnchangedAndTakesNothing(t *testing.T) {
 
 	out, code := retiredRequest(t, f, "ci-2")
 
-	m := retireAnswer(t, out)
-	if code != 0 || m["outcome"] != retireOutcomeUnchanged || m["settled"] != true {
+	m := expectRetire(t, out, code, "done-unchanged", retireOutcomeUnchanged, "")
+	if m["settled"] != true {
 		t.Fatalf("a converge over a settled retirement: %s", out)
 	}
 
@@ -106,12 +106,14 @@ func TestASettledRetirementIsUnchangedAndTakesNothing(t *testing.T) {
 	}
 
 	held, ok := m["postconditions"].(map[string]any)
-	if !ok {
-		t.Fatalf("the answer carries no postconditions: %s", out)
+	if !ok || len(held) != 8 {
+		t.Fatalf("the answer does not carry all eight postconditions: %s", out)
 	}
 
 	if held["config"] != retireConfigAbsent || held["archive"] != retireArchivePresent ||
-		held["server"] != retireUnitQuiet || held["backup_service"] != retireUnitNotFound {
+		held["server"] != retireUnitQuiet || held["node"] != retireUnitQuiet ||
+		held["upgrade_timer"] != retireUnitQuiet || held["backup_timer"] != retireUnitQuiet ||
+		held["backup_service"] != retireUnitNotFound {
 		t.Fatalf("the postconditions: %v", held)
 	}
 
@@ -119,9 +121,11 @@ func TestASettledRetirementIsUnchangedAndTakesNothing(t *testing.T) {
 		t.Fatalf("the status the retirement published: %v", held)
 	}
 
-	// THE COMMITTED FIXTURE FOR THIS ANSWER ARRIVES WITH THE ROLE that reads
-	// it: a producer's fixture is written by running its producer, and the
-	// role's parser is what gives it a reader.
+	for _, member := range []string{"row", "completion"} {
+		if _, present := m[member]; present {
+			t.Fatalf("the settled answer carried the tail's %s: %s", member, out)
+		}
+	}
 }
 
 // A POSTCONDITION THAT DOES NOT HOLD IS NAMED, and the converge stops there:
@@ -338,7 +342,8 @@ func TestASettledRetirementRepublishesAStatusThatWentMissing(t *testing.T) {
 	out, code := retiredRequest(t, f, requestRun)
 
 	m := retireAnswer(t, out)
-	if code != 0 || m["outcome"] != retireOutcomeUnchanged {
+	if code != 0 || m["outcome"] != retireOutcomeUnchanged || m["settled"] != true ||
+		m["state"] != string(retirement.PhaseDone) || m["row_done"] != true {
 		t.Fatalf("a converge over a retired host whose status went missing: %s", out)
 	}
 
@@ -351,6 +356,8 @@ func TestASettledRetirementRepublishesAStatusThatWentMissing(t *testing.T) {
 	if err != nil || presence != retirement.StatusPresent || st.Phase != retirement.PhaseDone {
 		t.Fatalf("the status on disk: %+v %d %v", st, presence, err)
 	}
+
+	expectRetire(t, out, code, "done-unchanged-republished", retireOutcomeUnchanged, "")
 }
 
 // A PROPERTY SYSTEMD DID NOT ANSWER IS COULD-NOT-TELL, never a refusal: a

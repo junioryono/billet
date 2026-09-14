@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "outcome": "reported",
+  "journal": null,
+  "status": null,
+  "stage": "present",
+  "guard": "none",
+  "marker": null,
+  "row": null,
+  "row_fact": "absent",
+  "dispatch": "request",
+  "status_presence": "absent",
+  "config": "present",
+  "installed_roles": "server",
+  "identity": "minted",
+  "authority": "absent",
+  "route": "hold",
+  "route_why": "a retirement stage stands with no journal to explain it",
+  "state": "nothing"
+}

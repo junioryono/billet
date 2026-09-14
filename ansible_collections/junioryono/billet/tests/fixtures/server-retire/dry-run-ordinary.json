@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "outcome": "reported",
+  "journal": null,
+  "status": null,
+  "stage": "absent",
+  "guard": "none",
+  "marker": null,
+  "row": null,
+  "row_fact": "absent",
+  "dispatch": "request",
+  "status_presence": "absent",
+  "config": "present",
+  "installed_roles": "server",
+  "identity": "minted",
+  "authority": "absent",
+  "route": "ordinary",
+  "state": "nothing"
+}

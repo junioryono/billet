@@ -1,0 +1,557 @@
+---
+# THE ONE PARSER OF A `server retire` ANSWER. Each inclusion judges one call,
+# including its exit: success is 0, refused is 2, unknown is 3. A missing or
+# disagreeing exit is an unanswered call, even when stdout holds JSON.
+# Completion has no outcome; its row is not an outcome discriminator.
+#
+# Inputs: billet_retire_raw (the registered result), billet_retire_call
+# (classify, reserve, request, abandon, complete, acknowledge), and
+# billet_retire_answered_by (the executable, for diagnostics).
+# Outputs: billet_retire_answer (the operands), billet_retire_route (only
+# classify), billet_retire_state_known, billet_retire_valid,
+# billet_retire_reservation (only a validated refusal's cleanup word).
+# Each is reset before the read, including on rescue.
+# A route's reason is text for a person, never a decision this parser makes.
+
+- name: Forget the preceding retirement answer
+  ansible.builtin.set_fact:
+    billet_retire_answer: {}
+    billet_retire_route: ""
+    billet_retire_state_known: false
+    billet_retire_valid: false
+    billet_retire_reservation: ""
+  no_log: true
+
+- name: Refuse a retirement call that did not answer
+  ansible.builtin.assert:
+    that:
+      - billet_retire_raw.rc is defined
+      - billet_retire_raw.rc is integer
+      - billet_retire_raw.rc in [0, 2, 3]
+      - billet_retire_raw.rc != 0 or not (billet_retire_raw.failed | default(false) | bool)
+      - not (billet_retire_raw.unreachable | default(false) | bool)
+      - not (billet_retire_raw.skipped | default(false) | bool)
+      - billet_retire_raw.stdout | default(none) is string
+      - billet_retire_raw.stdout | default('') | trim | length > 0
+      - (billet_retire_raw.stdout | default('') | trim) is match('^\{')
+    fail_msg: >-
+      {{ billet_retire_answered_by }} did not answer retirement's
+      {{ billet_retire_call }} call (exit {{ billet_retire_raw.rc | default('none') }}).
+      No completed JSON answer was received; the host's retirement state is unknown.
+
+- name: Read the retirement's answer
+  block:
+    - name: Decode the retirement's one JSON object
+      ansible.builtin.set_fact:
+        billet_retire_answer: "{{ billet_retire_raw.stdout | junioryono.billet.from_json_strict }}"
+      no_log: true
+  rescue:
+    - name: Refuse unreadable retirement JSON
+      ansible.builtin.fail:
+        msg: >-
+          Retirement's {{ billet_retire_call }} through {{ billet_retire_answered_by }}
+          answered with a member this role cannot read: JSON (malformed or repeated).
+
+- name: Require a retirement answer object
+  ansible.builtin.assert:
+    that: billet_retire_answer is mapping
+    fail_msg: >-
+      Retirement's {{ billet_retire_call }} answered with a member this role cannot read: object.
+
+- name: Refuse a retirement exit that disagrees with its answer
+  ansible.builtin.assert:
+    that:
+      - >-
+        billet_retire_raw.rc ==
+        (2 if billet_retire_answer.outcome | default('') == 'refused' else
+         3 if billet_retire_answer.outcome | default('') == 'unknown' else 0)
+    fail_msg: >-
+      {{ billet_retire_answered_by }} did not answer retirement's
+      {{ billet_retire_call }} call: exit disagrees with outcome.
+      The host's retirement state is unknown.
+
+- name: Judge the retirement's answer
+  vars:
+    billet_retire_a: "{{ billet_retire_answer }}"
+    billet_retire_outcome: "{{ billet_retire_a.outcome | default('') }}"
+    billet_retire_failed: "{{ billet_retire_outcome in ['refused', 'unknown'] }}"
+    # The call disambiguates the two reported structs and the outcome-less
+    # completion. Unknown outcome types never become dictionary keys.
+    billet_retire_shape: >-
+      {{ 'refusal' if billet_retire_failed else
+         'complete' if billet_retire_call == 'complete' else
+         'classify' if billet_retire_call == 'classify' else
+         'preview' if billet_retire_call == 'request' and billet_retire_outcome == 'reported' else
+         'tail' if billet_retire_call == 'request' and billet_retire_outcome == 'retired' else
+         'done' if billet_retire_call == 'request' and billet_retire_outcome == 'unchanged' else
+         billet_retire_call if billet_retire_call in ['reserve', 'abandon', 'acknowledge'] else 'invalid' }}
+    billet_retire_outcomes:
+      classify: [reported, refused, unknown]
+      reserve: [reserved, adopted, refused, unknown]
+      request: [reported, retired, unchanged, refused, unknown]
+      abandon: [abandoned, refused, unknown]
+      complete: [refused, unknown]
+      acknowledge: [acknowledged, already, refused, unknown]
+    billet_retire_hex32: '^[0-9a-f]{32}\Z'
+    billet_retire_sha: '^[0-9a-f]{64}\Z'
+    billet_retire_phases: [intent, stopped, archived, config-rewritten, node-restarted, done]
+    billet_retire_variants: [server-only, retained-node]
+    # retireReason* in cmd/billet/serverretire.go and serverretireinput.go.
+    billet_retire_reasons: [combination, platform, config, backend, controllers, identity, lock, guard, journal, reserved, retired, ledger, input, self, deployment, mismatch, conflict, stage-stale, status, marker, reservation, report-host, report-stale, survivor, survivor-binding, survivor-flagged, survivor-retiring, authority, variant, desired, state-dir, unbound, trust, node-missing, node-duplicate, node-unknown, node, receipt, endpoint, node-changed, policy, unit, mount, nested, node-path, backup, phase, lifecycle, stop, archive, rewrite, restart, postcondition]
+    # Required and permitted are separate: omitempty never means nullable.
+    # Each member's type and vocabulary are judged below, without coercion.
+    # Host names, timestamps and diagnostics are strings, not route words;
+    # identifiers and digests keep their hexadecimal grammar. Only the
+    # report's pointer fields/installed_roles and the two slices may be null.
+    billet_retire_tables:
+      # cmd/billet/serverretire.go: retireRefusal.
+      refusal:
+        required: [schema, outcome, reason, why, state]
+        permitted: [schema, outcome, reason, why, state, next, reservation]
+      # cmd/billet/serverretire.go: retireReport.
+      classify:
+        required: [schema, outcome, journal, status, stage, guard, marker, row, row_fact, dispatch, status_presence, config, installed_roles, identity, authority, route, state]
+        permitted: [schema, outcome, journal, status, stage, guard, marker, row, row_fact, dispatch, status_presence, config, installed_roles, identity, authority, route, state, status_why, route_why, why]
+      # cmd/billet/serverretire.go: retireReservationAnswer.
+      reserve:
+        required: [schema, outcome, deployment, retiring, survivor, run, transition_id, reserved_at, state]
+        permitted: [schema, outcome, deployment, retiring, survivor, run, transition_id, reserved_at, state]
+      # cmd/billet/serverretire.go: retireAbandonedAnswer.
+      abandon:
+        required: [schema, outcome, transition_id, marker, state]
+        permitted: [schema, outcome, transition_id, marker, state]
+      # cmd/billet/serverretire.go: retireAcknowledgedAnswer.
+      acknowledge:
+        required: [schema, outcome, transition_id, completed_by, state]
+        permitted: [schema, outcome, transition_id, completed_by, state]
+      # cmd/billet/serverretirerequest.go: retireIntentReport.
+      preview:
+        required: [schema, outcome, would, variant, survivor, nodes, endpoint_failover_verified, transition_id, state, unlocked]
+        permitted: [schema, outcome, would, variant, survivor, nodes, endpoint_failover_verified, transition_id, state, unlocked]
+      # cmd/billet/serverretiretail.go: retireTailAnswer.
+      tail:
+        required: [schema, outcome, phase, variant, transition_id, steps, status, receipt, row, completed_by, completion, marker, settled, state]
+        permitted: [schema, outcome, phase, variant, transition_id, steps, status, receipt, row, completed_by, completion, marker, settled, state, row_why]
+      # cmd/billet/serverretiredone.go: retireDoneAnswer.
+      done:
+        required: [schema, outcome, phase, variant, transition_id, settled, row_done, completed_by, postconditions, state]
+        permitted: [schema, outcome, phase, variant, transition_id, settled, row_done, completed_by, postconditions, state]
+      # internal/retirement/completion.go: Answer (NO outcome).
+      complete:
+        required: [schema, deployment, retiring, survivor, transition_id, reservation, row, completed_by, completed_at]
+        permitted: [schema, deployment, retiring, survivor, transition_id, reservation, row, completed_by, completed_at]
+    billet_retire_checks:
+      - name: call
+        ok: "{{ billet_retire_call in billet_retire_outcomes }}"
+      - name: outcome
+        ok: "{{ (billet_retire_call == 'complete' and not billet_retire_failed and 'outcome' not in billet_retire_a) or (billet_retire_outcome is string and billet_retire_outcome in billet_retire_outcomes.get(billet_retire_call, [])) }}"
+      - name: schema
+        ok: "{{ billet_retire_a.schema | default(none) is integer and billet_retire_a.schema | default(0) == 1 }}"
+      # retireDryRun's closing observation and retireRequest's success wrapper
+      # can report unknown for classify, preview, tail and done alike.
+      - name: state
+        ok: "{{ billet_retire_shape not in ['refusal', 'classify', 'reserve', 'abandon', 'acknowledge', 'preview', 'tail', 'done'] or ((billet_retire_a.state | default('') in (['nothing'] if billet_retire_shape in ['reserve', 'abandon', 'acknowledge'] else ['nothing', 'unknown'] + billet_retire_phases))) }}"
+      # retireDryRun forces its route to hold when the closing state is unknown.
+      - name: state
+        ok: "{{ billet_retire_shape != 'classify' or billet_retire_a.state | default('') != 'unknown' or billet_retire_a.route | default('') == 'hold' }}"
+      - name: reason
+        ok: "{{ billet_retire_shape not in ['refusal'] or ((billet_retire_a.reason | default(none)) is string and (billet_retire_a.reason | default(none)) in billet_retire_reasons) }}"
+      - name: why
+        ok: "{{ billet_retire_shape not in ['refusal'] or ((billet_retire_a.why | default(none)) is string and (billet_retire_a.why | default(none)) | length > 0) }}"
+      - name: next
+        ok: "{{ 'next' not in billet_retire_a or ((billet_retire_a.next | default(none)) is string) }}"
+      - name: status_why
+        ok: "{{ 'status_why' not in billet_retire_a or ((billet_retire_a.status_why | default(none)) is string) }}"
+      - name: route_why
+        ok: "{{ 'route_why' not in billet_retire_a or ((billet_retire_a.route_why | default(none)) is string) }}"
+      - name: why
+        ok: "{{ 'why' not in billet_retire_a or ((billet_retire_a.why | default(none)) is string) }}"
+      - name: reservation
+        ok: "{{ billet_retire_shape not in ['refusal'] or ('reservation' not in billet_retire_a or billet_retire_a.reservation in ['released', 'kept']) }}"
+      - name: route
+        ok: "{{ billet_retire_shape not in ['classify'] or ((billet_retire_a.route | default(none)) in ['ordinary', 'hold', 'recovery', 'new-request', 'continue', 'cancel', 'unsupported-variant']) }}"
+      - name: route_why
+        ok: "{{ billet_retire_shape not in ['classify'] or (billet_retire_a.route | default('ordinary') not in ['hold', 'recovery', 'new-request', 'continue', 'cancel', 'unsupported-variant'] or ((billet_retire_a.route_why | default(none)) is string and (billet_retire_a.route_why | default(none)) | length > 0)) }}"
+      - name: config
+        ok: "{{ billet_retire_shape not in ['classify'] or ((billet_retire_a.config | default(none)) in ['present', 'absent', 'malformed', 'unreadable']) }}"
+      - name: status_presence
+        ok: "{{ billet_retire_shape not in ['classify'] or ((billet_retire_a.status_presence | default(none)) in ['present', 'absent', 'malformed', 'unreadable']) }}"
+      - name: stage
+        ok: "{{ billet_retire_shape not in ['classify'] or ((billet_retire_a.stage | default(none)) in ['present', 'absent', 'unreadable']) }}"
+      - name: guard
+        ok: "{{ billet_retire_shape not in ['classify'] or ((billet_retire_a.guard | default(none)) in ['none', 'host-upgrade', 'legacy-role', 'converge-guard', 'unpublished-guard', 'unknown']) }}"
+      - name: identity
+        ok: "{{ billet_retire_shape not in ['classify'] or ((billet_retire_a.identity | default(none)) in ['minted', 'absent', 'unreadable']) }}"
+      - name: authority
+        ok: "{{ billet_retire_shape not in ['classify'] or ((billet_retire_a.authority | default(none)) in ['present', 'absent', 'unreadable']) }}"
+      - name: row_fact
+        ok: "{{ billet_retire_shape not in ['classify'] or ((billet_retire_a.row_fact | default(none)) in ['absent', 'unreadable', 'reserved-mine', 'intent-mine', 'done-mine', 'other-reserved', 'other-intent', 'done-other']) }}"
+      - name: dispatch
+        ok: "{{ billet_retire_shape not in ['classify'] or ((billet_retire_a.dispatch | default(none)) in ['request', 'adopt', 'advance-row', 'resume', 'complete-row', 'done', 'refused-reserved', 'refused-retired', 'unknown-ledger', 'unknown-reservation', 'unknown-journal']) }}"
+      - name: installed_roles
+        ok: "{{ billet_retire_shape not in ['classify'] or ('installed_roles' in billet_retire_a and ((billet_retire_a.config | default('') == 'present' and billet_retire_a.installed_roles in ['server', 'node', 'both']) or (billet_retire_a.config | default('') != 'present' and billet_retire_a.installed_roles is none))) }}"
+      - name: journal
+        ok: "{{ billet_retire_shape not in ['classify'] or ('journal' in billet_retire_a and (billet_retire_a.journal is none or billet_retire_a.journal is mapping)) }}"
+      - name: status
+        ok: "{{ billet_retire_shape not in ['classify'] or ('status' in billet_retire_a and (billet_retire_a.status is none or billet_retire_a.status is mapping)) }}"
+      - name: marker
+        ok: "{{ billet_retire_shape not in ['classify'] or ('marker' in billet_retire_a and (billet_retire_a.marker is none or billet_retire_a.marker is mapping)) }}"
+      - name: row
+        ok: "{{ billet_retire_shape not in ['classify'] or ('row' in billet_retire_a and (billet_retire_a.row is none or billet_retire_a.row is mapping)) }}"
+      - name: transition_id
+        ok: "{{ billet_retire_shape not in ['reserve', 'abandon', 'acknowledge', 'preview', 'tail', 'done', 'complete'] or ((billet_retire_a.transition_id | default(none)) is string and (billet_retire_a.transition_id | default(none)) is match(billet_retire_hex32)) }}"
+      - name: deployment
+        ok: "{{ billet_retire_shape not in ['reserve', 'complete'] or ((billet_retire_a.deployment | default(none)) is string and (billet_retire_a.deployment | default(none)) is match(billet_retire_hex32)) }}"
+      - name: retiring
+        ok: "{{ billet_retire_shape not in ['reserve', 'complete'] or ((billet_retire_a.retiring | default(none)) is string and (billet_retire_a.retiring | default(none)) | length > 0) }}"
+      - name: survivor
+        ok: "{{ billet_retire_shape not in ['reserve', 'complete'] or ((billet_retire_a.survivor | default(none)) is string and (billet_retire_a.survivor | default(none)) | length > 0) }}"
+      - name: reserved_at
+        ok: "{{ billet_retire_shape not in ['reserve'] or ((billet_retire_a.reserved_at | default(none)) is string and (billet_retire_a.reserved_at | default(none)) | length > 0) }}"
+      - name: completed_at
+        ok: "{{ billet_retire_shape not in ['complete'] or ((billet_retire_a.completed_at | default(none)) is string and (billet_retire_a.completed_at | default(none)) | length > 0) }}"
+      - name: reservation
+        ok: "{{ billet_retire_shape not in ['complete'] or ((billet_retire_a.reservation | default(none)) is string and (billet_retire_a.reservation | default(none)) | length > 0) }}"
+      - name: run
+        ok: "{{ billet_retire_shape not in ['reserve'] or ((billet_retire_a.run | default(none)) is string and (billet_retire_a.run | default(none)) | length > 0) }}"
+      - name: completed_by
+        ok: "{{ billet_retire_shape not in ['acknowledge', 'done', 'complete'] or ((billet_retire_a.completed_by | default(none)) is string and (billet_retire_a.completed_by | default(none)) | length > 0) }}"
+      - name: unlocked
+        ok: "{{ billet_retire_shape not in ['preview'] or ((billet_retire_a.unlocked | default(none)) is string and (billet_retire_a.unlocked | default(none)) | length > 0) }}"
+      - name: marker
+        ok: "{{ billet_retire_shape not in ['abandon'] or ((billet_retire_a.marker | default(none)) in ['cleared', 'absent']) }}"
+      - name: would
+        ok: "{{ billet_retire_shape not in ['preview'] or ((billet_retire_a.would | default(none)) in ['request']) }}"
+      - name: endpoint_failover_verified
+        ok: "{{ billet_retire_shape not in ['preview'] or (((billet_retire_a.endpoint_failover_verified | default(none)) is sameas true or (billet_retire_a.endpoint_failover_verified | default(none)) is sameas false)) }}"
+      - name: nodes
+        ok: "{{ billet_retire_shape not in ['preview'] or ('nodes' in billet_retire_a and (billet_retire_a.nodes is none or (billet_retire_a.nodes is sequence and billet_retire_a.nodes is not string and billet_retire_a.nodes is not mapping))) }}"
+      - name: steps
+        ok: "{{ billet_retire_shape not in ['tail'] or ('steps' in billet_retire_a and (billet_retire_a.steps is none or (billet_retire_a.steps is sequence and billet_retire_a.steps is not string and billet_retire_a.steps is not mapping))) }}"
+      - name: variant
+        ok: "{{ billet_retire_shape not in ['preview', 'tail', 'done'] or (billet_retire_a.variant | default('') in billet_retire_variants) }}"
+      - name: phase
+        ok: "{{ billet_retire_shape not in ['tail', 'done'] or ((billet_retire_a.phase | default(none)) in ['done']) }}"
+      - name: settled
+        ok: "{{ billet_retire_shape not in ['tail', 'done'] or (((billet_retire_a.settled | default(none)) is sameas true or (billet_retire_a.settled | default(none)) is sameas false)) }}"
+      - name: row_done
+        ok: "{{ billet_retire_shape not in ['done'] or (((billet_retire_a.row_done | default(none)) is sameas true or (billet_retire_a.row_done | default(none)) is sameas false) and billet_retire_a.row_done and billet_retire_a.settled) }}"
+      - name: status
+        ok: "{{ billet_retire_shape not in ['tail'] or ((billet_retire_a.status | default(none)) in ['done']) }}"
+      - name: receipt
+        ok: "{{ billet_retire_shape not in ['tail'] or ((billet_retire_a.receipt | default(none)) in ['written', 'current', 'none']) }}"
+      - name: row
+        ok: "{{ billet_retire_shape not in ['tail'] or ((billet_retire_a.row | default(none)) in ['done', 'already', 'pending']) }}"
+      - name: row
+        ok: "{{ billet_retire_shape not in ['complete'] or ((billet_retire_a.row | default(none)) in ['done', 'already']) }}"
+      - name: row_why
+        ok: "{{ billet_retire_shape not in ['tail'] or (((billet_retire_a.row | default('') == 'pending' and (billet_retire_a.row_why | default(none)) is string and (billet_retire_a.row_why | default(none)) | length > 0) or (billet_retire_a.row | default('') != 'pending' and 'row_why' not in billet_retire_a))) }}"
+      - name: completed_by
+        ok: "{{ billet_retire_shape not in ['tail'] or ((billet_retire_a.completed_by | default(none)) is string and ((billet_retire_a.row | default('') == 'pending' and billet_retire_a.completed_by == '') or (billet_retire_a.row | default('') != 'pending' and billet_retire_a.completed_by | length > 0))) }}"
+      - name: marker
+        ok: "{{ billet_retire_shape not in ['tail'] or ((billet_retire_a.marker | default(none)) in ['cleared', 'kept', 'absent'] and ((billet_retire_a.row | default('') == 'pending' and billet_retire_a.marker == 'kept' and billet_retire_a.settled | default(none) is sameas false) or (billet_retire_a.row | default('') != 'pending' and billet_retire_a.marker in ['cleared', 'absent'] and billet_retire_a.settled | default(none) is sameas true))) }}"
+  block:
+    - name: Judge each retirement member
+      ansible.builtin.assert:
+        that: item.ok | bool
+        fail_msg: >-
+          Retirement's {{ billet_retire_call }} through {{ billet_retire_answered_by }}
+          answered with a member this role cannot read: {{ item.name }}.
+          The host's retirement state cannot be acted on from this answer.
+      loop: "{{ billet_retire_checks }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Require every retirement member the producer writes
+      ansible.builtin.assert:
+        that: item in billet_retire_a
+        fail_msg: >-
+          Retirement's {{ billet_retire_call }} answered with a member this role cannot read: {{ item }} (missing).
+      loop: "{{ billet_retire_tables[billet_retire_shape].required }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Refuse a retirement member the producer does not write
+      ansible.builtin.assert:
+        that: item in billet_retire_tables[billet_retire_shape].permitted
+        fail_msg: >-
+          Retirement's {{ billet_retire_call }} answered with a member this role cannot read: {{ item }} (unknown).
+      loop: "{{ billet_retire_a.keys() | list }}"
+      loop_control:
+        label: "{{ item }}"
+
+    # cmd/billet/serverretire.go: retireReportJournal.
+    # Every listed member is required and permitted; the object may be null.
+    - name: Judge the retirement's journal object
+      vars:
+        billet_retire_object: "{{ billet_retire_a.journal | default(none) }}"
+        billet_retire_object_members: [phase, variant, row_done, settled, owner, transition_id, retiring, survivor]
+        billet_retire_object_checks:
+          - name: journal
+            ok: "{{ billet_retire_object is mapping and (billet_retire_object.keys() | list | sort) == (billet_retire_object_members | sort) }}"
+          - name: journal.phase
+            ok: "{{ (billet_retire_object.phase | default(none)) in billet_retire_phases }}"
+          - name: journal.variant
+            ok: "{{ (billet_retire_object.variant | default(none)) in billet_retire_variants }}"
+          - name: journal.row_done
+            ok: "{{ ((billet_retire_object.row_done | default(none)) is sameas true or (billet_retire_object.row_done | default(none)) is sameas false) }}"
+          - name: journal.settled
+            ok: "{{ ((billet_retire_object.settled | default(none)) is sameas true or (billet_retire_object.settled | default(none)) is sameas false) }}"
+          - name: journal.owner
+            ok: "{{ (billet_retire_object.owner | default(none)) is string and (billet_retire_object.owner | default(none)) | length > 0 }}"
+          - name: journal.transition_id
+            ok: "{{ (billet_retire_object.transition_id | default(none)) is string and (billet_retire_object.transition_id | default(none)) is match(billet_retire_hex32) }}"
+          - name: journal.retiring
+            ok: "{{ (billet_retire_object.retiring | default(none)) is string and (billet_retire_object.retiring | default(none)) | length > 0 }}"
+          - name: journal.survivor
+            ok: "{{ (billet_retire_object.survivor | default(none)) is string and (billet_retire_object.survivor | default(none)) | length > 0 }}"
+      ansible.builtin.assert:
+        that: item.ok | bool
+        fail_msg: >-
+          Retirement's {{ billet_retire_call }} answered with a member this role cannot read: {{ item.name }}.
+      loop: "{{ billet_retire_object_checks }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when:
+        - billet_retire_shape in ['classify']
+        - billet_retire_a.journal is not none
+
+    # internal/retirement/status.go: Status.
+    # Every listed member is required and permitted; the object may be null.
+    - name: Judge the retirement's status object
+      vars:
+        billet_retire_object: "{{ billet_retire_a.status | default(none) }}"
+        billet_retire_object_members: [phase, variant, updated_at]
+        billet_retire_object_checks:
+          - name: status
+            ok: "{{ billet_retire_object is mapping and (billet_retire_object.keys() | list | sort) == (billet_retire_object_members | sort) }}"
+          - name: status.phase
+            ok: "{{ (billet_retire_object.phase | default(none)) in billet_retire_phases }}"
+          - name: status.variant
+            ok: "{{ (billet_retire_object.variant | default(none)) in billet_retire_variants }}"
+          - name: status.updated_at
+            ok: "{{ (billet_retire_object.updated_at | default(none)) is string and (billet_retire_object.updated_at | default(none)) | length > 0 }}"
+      ansible.builtin.assert:
+        that: item.ok | bool
+        fail_msg: >-
+          Retirement's {{ billet_retire_call }} answered with a member this role cannot read: {{ item.name }}.
+      loop: "{{ billet_retire_object_checks }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when:
+        - billet_retire_shape in ['classify']
+        - billet_retire_a.status is not none
+
+    # cmd/billet/convergeguard.go: guardTransition.
+    # Every listed member is required and permitted; the object may be null.
+    - name: Judge the retirement's marker object
+      vars:
+        billet_retire_object: "{{ billet_retire_a.marker | default(none) }}"
+        billet_retire_object_members: [kind, id]
+        billet_retire_object_checks:
+          - name: marker
+            ok: "{{ billet_retire_object is mapping and (billet_retire_object.keys() | list | sort) == (billet_retire_object_members | sort) }}"
+          - name: marker.kind
+            ok: "{{ (billet_retire_object.kind | default(none)) in ['retirement'] }}"
+          - name: marker.id
+            ok: "{{ (billet_retire_object.id | default(none)) is string and (billet_retire_object.id | default(none)) is match(billet_retire_hex32) }}"
+      ansible.builtin.assert:
+        that: item.ok | bool
+        fail_msg: >-
+          Retirement's {{ billet_retire_call }} answered with a member this role cannot read: {{ item.name }}.
+      loop: "{{ billet_retire_object_checks }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when:
+        - billet_retire_shape in ['classify']
+        - billet_retire_a.marker is not none
+
+    # cmd/billet/serverretire.go: retireReportRow.
+    # Every listed member is required and permitted; the object may be null.
+    - name: Judge the retirement's row object
+      vars:
+        billet_retire_object: "{{ billet_retire_a.row | default(none) }}"
+        billet_retire_object_members: [retiring, survivor, run, state, transition_id, reserved_at]
+        billet_retire_object_checks:
+          - name: row
+            ok: "{{ billet_retire_object is mapping and (billet_retire_object.keys() | list | sort) == (billet_retire_object_members | sort) }}"
+          - name: row.retiring
+            ok: "{{ (billet_retire_object.retiring | default(none)) is string and (billet_retire_object.retiring | default(none)) | length > 0 }}"
+          - name: row.survivor
+            ok: "{{ (billet_retire_object.survivor | default(none)) is string and (billet_retire_object.survivor | default(none)) | length > 0 }}"
+          - name: row.run
+            ok: "{{ (billet_retire_object.run | default(none)) is string and (billet_retire_object.run | default(none)) | length > 0 }}"
+          - name: row.state
+            ok: "{{ (billet_retire_object.state | default(none)) in ['reserved', 'intent', 'done'] }}"
+          - name: row.transition_id
+            ok: "{{ (billet_retire_object.transition_id | default(none)) is string and (billet_retire_object.transition_id | default(none)) is match(billet_retire_hex32) }}"
+          - name: row.reserved_at
+            ok: "{{ (billet_retire_object.reserved_at | default(none)) is string and (billet_retire_object.reserved_at | default(none)) | length > 0 }}"
+      ansible.builtin.assert:
+        that: item.ok | bool
+        fail_msg: >-
+          Retirement's {{ billet_retire_call }} answered with a member this role cannot read: {{ item.name }}.
+      loop: "{{ billet_retire_object_checks }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when:
+        - billet_retire_shape in ['classify']
+        - billet_retire_a.row is not none
+
+    # internal/retirement/journal.go: JournalSurvivor (retireIntentReport.Survivor).
+    # Every listed member is required and permitted; no member and no object may be null.
+    - name: Judge the retirement's survivor object
+      vars:
+        billet_retire_object: "{{ billet_retire_a.survivor | default(none) }}"
+        billet_retire_object_members: [host, deployment, ca_sha256]
+        billet_retire_object_checks:
+          - name: survivor
+            ok: "{{ billet_retire_object is mapping and (billet_retire_object.keys() | list | sort) == (billet_retire_object_members | sort) }}"
+          - name: survivor.host
+            ok: "{{ (billet_retire_object.host | default(none)) is string and (billet_retire_object.host | default(none)) | length > 0 }}"
+          - name: survivor.deployment
+            ok: "{{ (billet_retire_object.deployment | default(none)) is string and (billet_retire_object.deployment | default(none)) is match(billet_retire_hex32) }}"
+          - name: survivor.ca_sha256
+            ok: "{{ (billet_retire_object.ca_sha256 | default(none)) is string and (billet_retire_object.ca_sha256 | default(none)) is match(billet_retire_sha) }}"
+      ansible.builtin.assert:
+        that: item.ok | bool
+        fail_msg: >-
+          Retirement's {{ billet_retire_call }} answered with a member this role cannot read: {{ item.name }}.
+      loop: "{{ billet_retire_object_checks }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when:
+        - billet_retire_shape in ['preview']
+
+    # internal/retirement/completion.go: Completion (retireTailAnswer.Completion).
+    # Every listed member is required and permitted; no member and no object may be null.
+    - name: Judge the retirement's completion object
+      vars:
+        billet_retire_object: "{{ billet_retire_a.completion | default(none) }}"
+        billet_retire_object_members: [schema, deployment, retiring, survivor, transition_id, reservation, done_at]
+        billet_retire_object_checks:
+          - name: completion
+            ok: "{{ billet_retire_object is mapping and (billet_retire_object.keys() | list | sort) == (billet_retire_object_members | sort) }}"
+          - name: completion.schema
+            ok: "{{ (billet_retire_object.schema | default(none)) is integer and (billet_retire_object.schema | default(none)) == 1 }}"
+          - name: completion.deployment
+            ok: "{{ (billet_retire_object.deployment | default(none)) is string and (billet_retire_object.deployment | default(none)) is match(billet_retire_hex32) }}"
+          - name: completion.retiring
+            ok: "{{ (billet_retire_object.retiring | default(none)) is string and (billet_retire_object.retiring | default(none)) | length > 0 }}"
+          - name: completion.survivor
+            ok: "{{ (billet_retire_object.survivor | default(none)) is string and (billet_retire_object.survivor | default(none)) | length > 0 }}"
+          - name: completion.transition_id
+            ok: "{{ (billet_retire_object.transition_id | default(none)) is string and (billet_retire_object.transition_id | default(none)) is match(billet_retire_hex32) }}"
+          - name: completion.reservation
+            ok: "{{ (billet_retire_object.reservation | default(none)) is string and (billet_retire_object.reservation | default(none)) | length > 0 }}"
+          - name: completion.done_at
+            ok: "{{ (billet_retire_object.done_at | default(none)) is string and (billet_retire_object.done_at | default(none)) | length > 0 }}"
+      ansible.builtin.assert:
+        that: item.ok | bool
+        fail_msg: >-
+          Retirement's {{ billet_retire_call }} answered with a member this role cannot read: {{ item.name }}.
+      loop: "{{ billet_retire_object_checks }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when:
+        - billet_retire_shape in ['tail']
+
+    # cmd/billet/serverretiredone.go: retirePostconditions.
+    # Every listed member is required and permitted; no member and no object may be null.
+    - name: Judge the retirement's postconditions object
+      vars:
+        billet_retire_object: "{{ billet_retire_a.postconditions | default(none) }}"
+        billet_retire_object_members: [status, config, server, node, upgrade_timer, backup_timer, backup_service, archive]
+        billet_retire_object_checks:
+          - name: postconditions
+            ok: "{{ billet_retire_object is mapping and (billet_retire_object.keys() | list | sort) == (billet_retire_object_members | sort) }}"
+          - name: postconditions.status
+            ok: "{{ (billet_retire_object.status | default(none)) in ['done', 'republished'] }}"
+          - name: postconditions.config
+            ok: "{{ (billet_retire_object.config | default(none)) in ['present', 'absent'] }}"
+          - name: postconditions.server
+            ok: "{{ (billet_retire_object.server | default(none)) in ['quiesced', 'not-found'] }}"
+          - name: postconditions.node
+            ok: "{{ (billet_retire_object.node | default(none)) in ['quiesced', 'not-found', 'running'] }}"
+          - name: postconditions.upgrade_timer
+            ok: "{{ (billet_retire_object.upgrade_timer | default(none)) in ['quiesced', 'not-found'] }}"
+          - name: postconditions.backup_timer
+            ok: "{{ (billet_retire_object.backup_timer | default(none)) in ['quiesced', 'not-found'] }}"
+          - name: postconditions.backup_service
+            ok: "{{ (billet_retire_object.backup_service | default(none)) in ['quiesced', 'not-found'] }}"
+          - name: postconditions.archive
+            ok: "{{ (billet_retire_object.archive | default(none)) in ['present'] }}"
+          - name: postconditions.variant
+            ok: "{{ (billet_retire_a.variant == 'retained-node' and billet_retire_object.config | default('') == 'present' and billet_retire_object.node | default('') == 'running') or (billet_retire_a.variant == 'server-only' and billet_retire_object.config | default('') == 'absent' and billet_retire_object.node | default('') in ['quiesced', 'not-found']) }}"
+      ansible.builtin.assert:
+        that: item.ok | bool
+        fail_msg: >-
+          Retirement's {{ billet_retire_call }} answered with a member this role cannot read: {{ item.name }}.
+      loop: "{{ billet_retire_object_checks }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when:
+        - billet_retire_shape in ['done']
+
+    # internal/retirement/journal.go: JournalNode.
+    # The slice may be null; each element has exactly these non-null members.
+    - name: Judge the retirement's nodes elements
+      ansible.builtin.assert:
+        that:
+          - item is mapping
+          - (item.keys() | list | sort) == ['endpoint', 'incarnation', 'name']
+          - (item.name | default(none)) is string and (item.name | default(none)) | length > 0
+          - (item.incarnation | default(none)) is string and (item.incarnation | default(none)) is match(billet_retire_hex32)
+          - (item.endpoint | default(none)) is string and (item.endpoint | default(none)) | length > 0
+        fail_msg: >-
+          Retirement's {{ billet_retire_call }} answered with a member this role cannot read: nodes.
+      loop: "{{ billet_retire_a.nodes | default([], true) if billet_retire_shape == 'preview' else [] }}"
+      loop_control:
+        index_var: billet_retire_element_index
+        label: "nodes[{{ billet_retire_element_index }}]"
+
+    # cmd/billet/serverretiretransition.go: retireStep, appended by retireTransition.
+    # Postconditions and refusal return before a step is recorded.
+    # The slice may be null; each element has exactly these non-null members.
+    - name: Judge the retirement's steps elements
+      ansible.builtin.assert:
+        that:
+          - item is mapping
+          - (item.keys() | list | sort) == ['action', 'phase']
+          - (item.action | default(none)) in ['await-backup', 'stop', 'archive', 'advance-archived', 'rewrite', 'advance-config-rewritten', 'restart', 'done']
+          - (item.phase | default(none)) in billet_retire_phases
+        fail_msg: >-
+          Retirement's {{ billet_retire_call }} answered with a member this role cannot read: steps.
+      loop: "{{ billet_retire_a.steps | default([], true) if billet_retire_shape == 'tail' else [] }}"
+      loop_control:
+        index_var: billet_retire_element_index
+        label: "steps[{{ billet_retire_element_index }}]"
+
+- name: Keep the validated retirement answer for this call
+  ansible.builtin.set_fact:
+    billet_retire_valid: true
+    # Request callers use this for preview, tail and done: an unknown state
+    # confirms no terminal state. Classify callers use the validated route;
+    # its unknown-state consistency check above already requires hold.
+    # Do not consult this for complete, reserve, abandon or acknowledge.
+    billet_retire_state_known: "{{ 'state' in billet_retire_answer and billet_retire_answer.state != 'unknown' }}"
+    billet_retire_reservation: >-
+      {{ billet_retire_answer.reservation | default('')
+         if billet_retire_answer.outcome | default('') in ['refused', 'unknown'] else '' }}
+  no_log: true
+
+- name: Refuse the retirement's answer
+  ansible.builtin.assert:
+    that: billet_retire_answer.outcome | default('') not in ['refused', 'unknown']
+    fail_msg: >-
+      Retirement's {{ billet_retire_call }} through {{ billet_retire_answered_by }}
+      was {{ billet_retire_answer.outcome | default('') }}
+      ({{ billet_retire_answer.reason | default('') }}, state {{ billet_retire_answer.state | default('') }}):
+      {{ billet_retire_answer.why | default('') }}
+      {{ billet_retire_answer.next | default('') }}
+      {{ ('Reservation: ' ~ billet_retire_reservation ~ '.') if billet_retire_reservation | length > 0 else '' }}
+
+- name: Take the retirement's route from this answer
+  ansible.builtin.set_fact:
+    billet_retire_route: "{{ billet_retire_answer.route if billet_retire_call == 'classify' else '' }}"
+  no_log: true

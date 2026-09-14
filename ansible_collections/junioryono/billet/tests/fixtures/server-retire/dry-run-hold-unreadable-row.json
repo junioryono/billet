@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "outcome": "reported",
+  "journal": null,
+  "status": null,
+  "stage": "absent",
+  "guard": "none",
+  "marker": null,
+  "row": null,
+  "row_fact": "unreadable",
+  "dispatch": "unknown-ledger",
+  "status_presence": "absent",
+  "config": "present",
+  "installed_roles": "server",
+  "identity": "minted",
+  "authority": "absent",
+  "route": "hold",
+  "route_why": "the retirement row is unreadable and this host may hold a reservation nothing local can rule out (identity minted, authority absent): the ledger could not be opened for the report: ping state db: file is not a database (26)",
+  "why": "the ledger could not be opened for the report: ping state db: file is not a database (26)",
+  "state": "nothing"
+}

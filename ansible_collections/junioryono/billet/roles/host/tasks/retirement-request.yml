@@ -1,0 +1,303 @@
+---
+# Static policy is checked in both modes. The classifier has already held an
+# observed preparing guard or interrupted record rewrite before this entry.
+- name: Require retirement outside a binary upgrade
+  ansible.builtin.assert:
+    that:
+      - not billet_binary_upgrade | default(false) | bool
+      - not billet_interrupted_upgrade | default(false) | bool
+    fail_msg: 'Retirement precondition: inside a binary upgrade; converge the binary first.'
+
+- name: Require a policy that leaves the retiring server stopped
+  ansible.builtin.assert:
+    that: billet_server_should_run | default(none) is sameas false
+    fail_msg: 'Retirement precondition: the policy will start the server in this converge; disable its start policy first.'
+
+- name: Require a named survivor in this inventory
+  ansible.builtin.assert:
+    that:
+      - billet_retirement_survivor_host is string
+      - billet_retirement_survivor_host | length > 0
+      - billet_retirement_survivor_host != inventory_hostname
+      - billet_retirement_survivor_host in hostvars
+      - billet_retirement_survivor_host | junioryono.billet.valid_holder
+    fail_msg: 'Retirement precondition: no distinct inventory survivor is named by billet_retirement_survivor_host.'
+
+- name: Require the survivor in the retiring host's play
+  ansible.builtin.assert:
+    that: billet_retirement_survivor_host in ansible_play_hosts_all
+    fail_msg: >-
+      Retirement precondition: survivor {{ billet_retirement_survivor_host }} is outside
+      this play. Preparation in an earlier play cannot prove the survivor stayed healthy;
+      converge the survivor in the same play as the retiring host.
+  when: not ansible_check_mode
+
+- name: Require the survivor still active in this play
+  ansible.builtin.assert:
+    that: billet_retirement_survivor_host in ansible_play_hosts
+    fail_msg: >-
+      Retirement precondition: survivor {{ billet_retirement_survivor_host }} is no longer active
+      in this play (failure, unreachability, or an intentional end of that host).
+      Resolve the cause, then converge the survivor in the same play as the retiring host.
+  when: not ansible_check_mode
+
+- name: Require this converge's settled survivor guard
+  vars:
+    billet_retirement_peer: "{{ hostvars[billet_retirement_survivor_host] }}"
+  ansible.builtin.assert:
+    that:
+      - billet_retirement_peer.billet_exclusion_settled | default(none) is sameas true
+      - billet_retirement_peer.billet_exclusion_held | default(none) is sameas true
+      - billet_retirement_peer.billet_exclusion_holder | default('') == billet_exclusion_holder
+      - billet_retirement_peer.billet_upgrade_claim_shape | default('') == 'guard'
+    fail_msg: >-
+      Retirement precondition: survivor {{ billet_retirement_survivor_host }} needs a
+      settled, held, pointer-free guard published by its own preparation under
+      holder {{ billet_exclusion_holder }}. A skipped settlement is not success.
+  when: not ansible_check_mode
+
+- name: Require the retiring host's preparation window closed
+  ansible.builtin.assert:
+    that:
+      - billet_exclusion_settled | default(none) is sameas true
+      - billet_exclusion_held | default(none) is sameas true
+      - billet_upgrade_claim_shape == 'guard'
+    fail_msg: 'Retirement precondition: this host is still preparing or has no settled pointer-free guard.'
+  when: not ansible_check_mode
+
+- name: Report the prospective new retirement
+  ansible.builtin.debug:
+    msg: >-
+      Would request a server-only retirement through survivor {{ billet_retirement_survivor_host }}.
+      A real run needs that survivor prepared with a settled, held, pointer-free guard
+      under this converge's holder; check mode reserves and collects nothing.
+  when: ansible_check_mode
+
+- name: Reserve and request the new retirement in a real converge
+  when: not ansible_check_mode
+  block:
+    - name: Record the existing service account before reserving retirement
+      ansible.builtin.import_tasks: service-account.yml
+      vars:
+        billet_service_account_site: early
+
+    - name: Read the installed configuration's reservation digest
+      ansible.builtin.stat:
+        path: /etc/billet/billet.yaml
+        follow: true
+        checksum_algorithm: sha256
+        get_mime: false
+      register: billet_retirement_installed
+      become: true
+
+    - name: Require the installed configuration's digest
+      ansible.builtin.assert:
+        that:
+          - billet_retirement_installed.stat.isreg | default(false)
+          - billet_retirement_installed.stat.checksum | default('') is match('^[0-9a-f]{64}\Z')
+        fail_msg: The installed configuration could not supply retirement's reservation digest.
+
+    - name: Reset the new request's reservation and collection
+      ansible.builtin.set_fact:
+        billet_retirement_survivor: "{{ billet_retirement_survivor_host }}"
+        billet_retirement_local_environment_file: "{{ billet_retirement_environment_file }}"
+        billet_retirement_reservation: {}
+        billet_retirement_transition_id: ""
+        billet_retirement_reports: {}
+        billet_retirement_node_hosts: []
+        billet_retirement_desired_nodes: {}
+        billet_retire_valid: false
+        billet_retire_reservation: ""
+        billet_retirement_shared_argv: []
+
+    # Include the answer validation in the window: an unanswered reserve may
+    # already have written its row. Abandonment proves whether it can clean up.
+    - name: Keep every reserved request failure inside the abandonment window
+      block:
+        - name: Reserve this deployment's retirement
+          ansible.builtin.command:
+            argv: >-
+              {{ [billet_retirement_answerer, 'server', 'retire', '--reserve', '--json',
+                  '--run', billet_exclusion_holder, '--retiring-host', inventory_hostname,
+                  '--survivor-host', billet_retirement_survivor,
+                  '--installed-sha256', billet_retirement_installed.stat.checksum,
+                  '--config', '/etc/billet/billet.yaml']
+                 + (['--environment-file', billet_retirement_local_environment_file]
+                    if billet_retirement_local_environment_file | length > 0 else []) }}
+            expand_argument_vars: false
+          register: billet_retirement_reserve_raw
+          ignore_unreachable: true
+          changed_when: false
+          failed_when: false
+          become: true
+
+        - name: Parse the reservation answer
+          ansible.builtin.include_tasks: retire-answer.yml
+          vars:
+            billet_retire_raw: "{{ billet_retirement_reserve_raw }}"
+            billet_retire_call: reserve
+            billet_retire_answered_by: "{{ billet_retirement_answerer }}"
+
+        - name: Bind the reservation before collecting anything
+          ansible.builtin.assert:
+            that:
+              - billet_retire_answer.run == billet_exclusion_holder
+              - billet_retire_answer.retiring == inventory_hostname
+              - billet_retire_answer.survivor == billet_retirement_survivor
+              # A fresh transition is minted by reserve. An observed row's id
+              # must survive adoption; every later answer must name this id.
+              - >-
+                billet_retirement_classification.row is none or
+                billet_retire_answer.transition_id == billet_retirement_classification.row.transition_id
+            fail_msg: The reservation binding disagrees on run, retiring host, survivor or transition id; nothing was collected.
+
+        - name: Keep the validated reservation binding
+          ansible.builtin.set_fact:
+            billet_retirement_reservation: "{{ billet_retire_answer }}"
+            billet_retirement_transition_id: "{{ billet_retire_answer.transition_id }}"
+          changed_when: true
+
+        - name: Collect the deployment after reserving it
+          ansible.builtin.include_tasks: retirement-collect.yml
+
+        - name: Carry the declared shared addresses as separate operands
+          ansible.builtin.set_fact:
+            billet_retirement_shared_argv: "{{ billet_retirement_shared_argv + ['--shared-address', item] }}"
+          loop: "{{ billet_retirement_shared_addresses }}"
+
+        - name: Request the server-only retirement with this collection
+          ansible.builtin.command:
+            argv: >-
+              {{ [billet_retirement_answerer, 'server', 'retire', '--input', '-', '--json',
+                  '--run', billet_exclusion_holder, '--retiring-host', inventory_hostname,
+                  '--survivor-host', billet_retirement_survivor,
+                  '--installed-sha256', billet_retirement_installed.stat.checksum,
+                  '--server-only', '--config', '/etc/billet/billet.yaml']
+                 + (['--reservation-fresh'] if billet_retirement_reservation.outcome == 'reserved' else [])
+                 + (['--survivor-flagged'] if hostvars[billet_retirement_survivor].billet_server_retire | default(false) | bool else [])
+                 + billet_retirement_shared_argv
+                 + (['--endpoint-failover-verified'] if billet_retirement_endpoint_failover_verified | bool else [])
+                 + ['--report-max-age', billet_retirement_report_max_age]
+                 + (['--environment-file', billet_retirement_local_environment_file]
+                    if billet_retirement_local_environment_file | length > 0 else []) }}
+            expand_argument_vars: false
+            stdin: "{{ billet_retirement_document | to_json }}"
+            stdin_add_newline: false
+          register: billet_retirement_request_raw
+          ignore_unreachable: true
+          changed_when: false
+          failed_when: false
+          become: true
+          no_log: true
+
+        - name: Parse the new retirement request
+          ansible.builtin.include_tasks: retire-answer.yml
+          vars:
+            billet_retire_raw: "{{ billet_retirement_request_raw }}"
+            billet_retire_call: request
+            billet_retire_answered_by: "{{ billet_retirement_answerer }}"
+
+        - name: Require the request to confirm this server-only retirement
+          ansible.builtin.assert:
+            that:
+              - billet_retire_state_known | bool
+              - billet_retire_answer.outcome in ['retired', 'unchanged']
+              - billet_retire_answer.variant | default('') == 'server-only'
+              - billet_retire_answer.state == 'done'
+              - billet_retire_answer.transition_id == billet_retirement_transition_id
+            fail_msg: The new request did not confirm this server-only retirement at a known done state.
+
+        - name: Bind the returned completion to the reservation
+          ansible.builtin.assert:
+            that: billet_retire_answer.completion[item.key] == billet_retirement_reservation[item.value]
+            fail_msg: "The request's completion disagrees with the reservation on {{ item.key }}."
+          loop:
+            - {key: deployment, value: deployment}
+            - {key: retiring, value: retiring}
+            - {key: survivor, value: survivor}
+            - {key: transition_id, value: transition_id}
+            - {key: reservation, value: reserved_at}
+          when: billet_retire_answer.outcome == 'retired'
+
+        - name: Keep the new retirement's result
+          ansible.builtin.set_fact:
+            billet_retirement_result: "{{ billet_retire_answer }}"
+            billet_retirement_bypass: true
+          changed_when: true
+      rescue:
+        - name: Preserve the original request failure before cleanup
+          ansible.builtin.set_fact:
+            billet_retirement_failure: "{{ ansible_failed_task.name }}: {{ ansible_failed_result.msg | default('The call did not answer.') }}"
+            billet_retirement_cleanup_released: "{{ billet_retire_valid | default(false) | bool and billet_retire_reservation | default('') == 'released' }}"
+            billet_retirement_cleanup: The request already reported reservation released; abandonment was skipped.
+
+        # No marker test: marker-before-journal is precisely the abandonment
+        # window. The command holds the live association and refuses started work.
+        - name: Abandon the reservation when the request did not release it
+          when: not billet_retirement_cleanup_released | bool
+          block:
+            - name: Ask abandonment to discharge the reservation
+              ansible.builtin.command:
+                argv: >-
+                  {{ [billet_retirement_answerer, 'server', 'retire', '--abandon-reservation', '--json',
+                      '--run', billet_exclusion_holder, '--retiring-host', inventory_hostname,
+                      '--config', '/etc/billet/billet.yaml']
+                     + (['--environment-file', billet_retirement_local_environment_file]
+                        if billet_retirement_local_environment_file | length > 0 else []) }}
+                expand_argument_vars: false
+              register: billet_retirement_abandon_raw
+              ignore_unreachable: true
+              changed_when: false
+              failed_when: false
+              become: true
+
+            - name: Parse the cleanup abandonment
+              ansible.builtin.include_tasks: retire-answer.yml
+              vars:
+                billet_retire_raw: "{{ billet_retirement_abandon_raw }}"
+                billet_retire_call: abandon
+                billet_retire_answered_by: "{{ billet_retirement_answerer }}"
+
+            - name: Bind cleanup to the known transition
+              ansible.builtin.assert:
+                that: billet_retirement_transition_id | length == 0 or billet_retire_answer.transition_id == billet_retirement_transition_id
+                fail_msg: The abandonment answered for another transition; cleanup is unproved.
+
+            - name: Record confirmed abandonment
+              ansible.builtin.set_fact:
+                billet_retirement_cleanup: The reservation was abandoned.
+              changed_when: true
+          rescue:
+            - name: Keep the cleanup refusal beside the original failure
+              ansible.builtin.set_fact:
+                billet_retirement_cleanup: >-
+                  Cleanup remains outstanding: reservation for retiring host {{ inventory_hostname }},
+                  survivor {{ billet_retirement_survivor }}, run {{ billet_exclusion_holder }},
+                  transition {{ billet_retirement_transition_id if billet_retirement_transition_id | length > 0 else 'unknown (no validated reservation binding)' }}
+                  is not proved released. {{ ansible_failed_result.msg | default('abandonment did not answer') }}
+
+        - name: Fail with the original request and its cleanup result
+          ansible.builtin.fail:
+            msg: "{{ billet_retirement_failure }} Afterwards: {{ billet_retirement_cleanup }} Ordinary host tasks remain bypassed."
+
+    - name: Keep only local evidence for a post-acknowledgement continuation
+      ansible.builtin.set_fact:
+        billet_retirement_document:
+          schema: 1
+          round: "{{ billet_retirement_document.round }}"
+          self: "{{ billet_retirement_document.self | combine({'status': none}) }}"
+          survivor: null
+          nodes: {}
+          desired: null
+      no_log: true
+      when: billet_retirement_result.row | default('') == 'pending'
+
+    - name: Carry the new request's pending row through the existing tail
+      ansible.builtin.include_tasks: retirement-tail.yml
+      when: billet_retirement_result.row | default('') == 'pending'
+
+    - name: Report the new retirement's settlement or obligation
+      ansible.builtin.debug:
+        msg: >-
+          Retirement is locally done; settled={{ billet_retirement_result.settled }}.
+          {{ billet_retirement_result.row_why | default('') }} Ordinary host tasks remain bypassed.

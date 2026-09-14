@@ -1,0 +1,43 @@
+{
+  "schema": 1,
+  "outcome": "reported",
+  "journal": {
+    "phase": "intent",
+    "variant": "retained-node",
+    "row_done": false,
+    "settled": false,
+    "owner": "ci-1",
+    "transition_id": "0123456789abcdef0123456789abcdef",
+    "retiring": "control-a",
+    "survivor": "control-b"
+  },
+  "status": {
+    "phase": "intent",
+    "variant": "retained-node",
+    "updated_at": "2026-09-11T10:00:30Z"
+  },
+  "stage": "present",
+  "guard": "converge-guard",
+  "marker": {
+    "kind": "retirement",
+    "id": "0123456789abcdef0123456789abcdef"
+  },
+  "row": {
+    "retiring": "control-a",
+    "survivor": "control-b",
+    "run": "ci-1",
+    "state": "intent",
+    "transition_id": "0123456789abcdef0123456789abcdef",
+    "reserved_at": "2026-09-11T10:00:00Z"
+  },
+  "row_fact": "intent-mine",
+  "dispatch": "resume",
+  "status_presence": "present",
+  "config": "present",
+  "installed_roles": "both",
+  "identity": "minted",
+  "authority": "present",
+  "route": "unsupported-variant",
+  "route_why": "the journal records a retained-node retirement, which this converge does not support",
+  "state": "intent"
+}

@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "outcome": "reported",
+  "journal": null,
+  "status": null,
+  "stage": "absent",
+  "guard": "converge-guard",
+  "marker": null,
+  "row": null,
+  "row_fact": "absent",
+  "dispatch": "request",
+  "status_presence": "absent",
+  "config": "present",
+  "installed_roles": "both",
+  "identity": "minted",
+  "authority": "present",
+  "route": "unsupported-variant",
+  "route_why": "this converge does not support retiring a host that keeps a node",
+  "state": "nothing"
+}

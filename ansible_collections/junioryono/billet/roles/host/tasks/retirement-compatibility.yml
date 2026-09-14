@@ -1,0 +1,11 @@
+---
+# Local configuration, service state and absent artefacts cannot prove that
+# no controller or shared reservation exists. Only a capable answerer routes.
+- name: Hold without a capable retirement answerer
+  ansible.builtin.set_fact:
+    billet_retirement_route: hold
+    billet_retirement_bypass: true
+    billet_retirement_why: >-
+      This collection needs billet at or above {{ billet_retire_capability_floor }} on the host;
+      upgrade the managed binary or converge with an older collection.
+      {{ '--requested retirement is refused without a capable answerer.' if billet_server_retire | bool else '' }}

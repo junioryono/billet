@@ -19,12 +19,14 @@
 # 2026-09-10 in the gate container, kernel 6.12.76-linuxkit, util-linux 2.39.3;
 # an upper directory on the container's own overlay root is refused, hence the
 # tmpfs). The managed binary and every staged candidate are RECORDING WRAPPERS
-# around immutable backing binaries built once from this checkout with three
+# around immutable backing binaries built once from this checkout with release
 # version stamps and `-tags billetgatecrash` (the crash seam, compiled into the
 # gate's binaries and no shipped one): a wrapper logs its argv and its
 # invocation number, fires the case's hook for exactly its own invocation,
 # runs its backing binary EXACTLY ONCE, keeps the real answer in a private
 # capture, and hands the real answer, a substituted one or none to the caller.
+# Endpoint substitutions and every retirement mode answer BEFORE the backing
+# binary; their private record proves it did not run.
 # The guard's record names the wrapper's path and digest, as the contract
 # requires; the backing binary's identity is in the private capture only. A
 # script that answers "unknown command" stands in for a managed binary from
@@ -84,6 +86,47 @@ fail() {
   exit 1
 }
 
+case "${BILLET_GATE_ONLY:-}" in
+  ""|endpoint|retirement|retirement-request) ;;
+  *) fail "unknown BILLET_GATE_ONLY=${BILLET_GATE_ONLY}; expected endpoint, retirement or retirement-request" ;;
+esac
+skip_endpoint=0
+skip_retirement=0
+skip_retirement_request=0
+case "${BILLET_GATE_SKIP:-}" in
+  ,*|*,|*,,*) fail "invalid BILLET_GATE_SKIP=${BILLET_GATE_SKIP}; empty list member" ;;
+esac
+skip_rest=${BILLET_GATE_SKIP:-}
+while [ -n "$skip_rest" ]; do
+  skip_member=${skip_rest%%,*}
+  case "$skip_member" in
+    endpoint)
+      [ "$skip_endpoint" = 0 ] || fail "invalid BILLET_GATE_SKIP=${BILLET_GATE_SKIP}; repeated member $skip_member"
+      skip_endpoint=1 ;;
+    retirement)
+      [ "$skip_retirement" = 0 ] || fail "invalid BILLET_GATE_SKIP=${BILLET_GATE_SKIP}; repeated member $skip_member"
+      skip_retirement=1 ;;
+    retirement-request)
+      [ "$skip_retirement_request" = 0 ] || fail "invalid BILLET_GATE_SKIP=${BILLET_GATE_SKIP}; repeated member $skip_member"
+      skip_retirement_request=1 ;;
+    *) fail "invalid BILLET_GATE_SKIP=${BILLET_GATE_SKIP}; expected endpoint, retirement or retirement-request, comma-separated" ;;
+  esac
+  case "$skip_rest" in
+    *,*) skip_rest=${skip_rest#*,} ;;
+    *) skip_rest="" ;;
+  esac
+done
+if { [ "${BILLET_GATE_ONLY:-}" = endpoint ] && [ "$skip_endpoint" = 1 ]; } ||
+   { [ "${BILLET_GATE_ONLY:-}" = retirement ] && [ "$skip_retirement" = 1 ]; } ||
+   { [ "${BILLET_GATE_ONLY:-}" = retirement-request ] && { [ "$skip_retirement" = 1 ] || [ "$skip_retirement_request" = 1 ]; }; }; then
+  fail "BILLET_GATE_ONLY=${BILLET_GATE_ONLY} contradicts BILLET_GATE_SKIP=${BILLET_GATE_SKIP}"
+fi
+retirement_only=0
+case "${BILLET_GATE_ONLY:-}" in
+  retirement|retirement-request) retirement_only=1 ;;
+esac
+sections_ran="shared checks"
+
 # --- the module's own check -------------------------------------------------
 "$python" "$here/guard_fallback_check.py"
 "$python" "$here/strict_json_check.py"
@@ -100,15 +143,22 @@ prepare_task=$(grep -n '^- name: Prepare the exclusion before anything changes t
 if [ -z "$prepare_task" ] || [ "$second_task" != "$prepare_task" ]; then
   fail "the exclusion's preparation is not the second task in main.yml (second at line ${second_task:-none}, preparation at line ${prepare_task:-none})"
 fi
-first_prep=$(grep '^- name:' "$role_tasks/prepare-exclusion.yml" | head -1)
-case "$first_prep" in
-  *"Refuse a converge that would destroy the job running it") ;;
-  *) fail "prepare-exclusion.yml's first task is not the converge guard's import: $first_prep" ;;
-esac
+"$python" - "$role_tasks/prepare-exclusion.yml" <<'PYPREPORDER'
+import pathlib, sys, yaml
+tasks = yaml.safe_load(pathlib.Path(sys.argv[1]).read_text())
+reset, guard = tasks[:2]
+if (reset.get('name') != "Reset this inclusion's exclusion permission"
+        or 'ansible.builtin.set_fact' not in reset
+        or any(key in reset for key in ['when', 'delegate_to', 'delegate_facts'])):
+    sys.exit('prepare-exclusion.yml must reset permission without a connection before every fallible preparation task')
+if (guard.get('name') != 'Refuse a converge that would destroy the job running it'
+        or guard.get('ansible.builtin.import_tasks') != 'converge-guard.yml'):
+    sys.exit('prepare-exclusion.yml must import the runner refusal immediately after the permission reset')
+PYPREPORDER
 if [ -e "$here/../plugins/modules/guard_status.py" ] || [ -e "$here/guard_status_check.py" ]; then
   fail "the status module is gone from the role; its files must be gone from the collection"
 fi
-echo "ok   the guard is the first task in the role, the preparation the second, and the guard the preparation's first import"
+echo "ok   the guard is first in the role, preparation second; preparation resets permission first and imports the runner refusal second"
 
 # --- the fakes ---------------------------------------------------------------
 fakes="$work/fakes"
@@ -241,6 +291,104 @@ sleep 3600
 FAKE
 chmod 0755 "$fakes/billet-hang"
 
+# THE EXECUTING HOST AND THE INPUT BYTES, independent of the old per-command
+# counters. A lock covers allocation and publication so parallel delegations
+# cannot claim the same sequence. Stdin lives in a separate file, never argv.
+cat >"$work/record-call.py" <<'PYREC'
+import fcntl, json, os, pathlib, sys
+root, host, command, source, *argv = sys.argv[1:]
+root = pathlib.Path(root)
+with (root / "lock").open("a") as lock:
+    owner = root.stat()
+    if os.geteuid() == 0:
+        os.fchown(lock.fileno(), owner.st_uid, owner.st_gid)
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    index = root / "index.jsonl"
+    records = [json.loads(line) for line in index.read_text().splitlines()] if index.exists() else []
+    sequence = len(records) + 1
+    invocation = 1 + sum(r["host"] == host and r["command"] == command for r in records)
+    stdin = root / (str(sequence) + ".stdin")
+    stdin.write_bytes(pathlib.Path(source).read_bytes() if source else b"")
+    with index.open("a") as stream:
+        if os.geteuid() == 0:
+            os.fchown(stream.fileno(), owner.st_uid, owner.st_gid)
+        stream.write(json.dumps({"sequence": sequence, "host": host, "command": command,
+                                "invocation": invocation, "argv": argv,
+                                "stdin": stdin.name, "has_stdin": bool(source)}) + "\n")
+    print(sequence, invocation)
+PYREC
+
+# RECOVERY'S SERVICE MANAGER, enabled only by BILLET_GATE_SERVICES. A case
+# seeds one JSON map per inventory host, keyed by unit. Reads return only the
+# requested properties; stops, starts and enablement change the same state
+# later reads observe. Unknown operations refuse. No service is really run.
+cat >"$work/service-state.py" <<'PYSERVICE'
+import json, os, pathlib, sys
+root = pathlib.Path(os.environ["BILLET_GATE_SERVICES"])
+path = root / (os.environ.get("BILLET_GATE_HOST", "localhost") + ".json")
+units = json.loads(path.read_text())
+tool, *args = sys.argv[1:]
+if tool == "pgrep":
+    if args != ["-x", "billet"]:
+        sys.exit("the recovery pgrep fake does not answer " + repr(args))
+    sys.exit(1)
+if tool == "systemd-cgls":
+    if len(args) != 3 or args[:2] != ["--no-pager", "--unit"]:
+        sys.exit("the recovery cgroup fake does not answer " + repr(args))
+    unit = units[args[2]]
+    if unit["LoadState"] == "not-found":
+        print("Unit " + args[2] + " not found.", file=sys.stderr)
+        sys.exit(1)
+    if unit["MainPID"] != "0":
+        print(unit["MainPID"] + " fake-service")
+    sys.exit(0)
+operation = next((a for a in args if not a.startswith("-")), "")
+if operation == "daemon-reload":
+    for name, unit in units.items():
+        present = any((pathlib.Path(root) / name).exists() for root in
+                      ["/etc/systemd/system", "/run/systemd/system", "/usr/lib/systemd/system"])
+        unit["LoadState"] = "loaded" if present else "not-found"
+        if not present:
+            unit["UnitFileState"] = "not-found"
+        unit["NeedDaemonReload"] = "no"
+    path.write_text(json.dumps(units))
+    sys.exit(0)
+names = [a for a in args if a.endswith((".service", ".timer", ".mount"))]
+if len(names) != 1 or names[0] not in units:
+    sys.exit("the recovery systemctl fake does not know the unit: " + repr(args))
+unit = units[names[0]]
+if operation == "show":
+    properties = []
+    for arg in args:
+        if arg.startswith("--property="):
+            properties.extend(arg.split("=", 1)[1].split(","))
+    for key in properties or list(unit):
+        if key not in unit:
+            sys.exit("the recovery systemctl fake does not know property " + key)
+        print(unit[key] if "--value" in args else key + "=" + unit[key])
+    sys.exit(0)
+if operation == "is-active":
+    print(unit["ActiveState"])
+    sys.exit(0 if unit["ActiveState"] == "active" else 3)
+if operation == "is-enabled":
+    print(unit["UnitFileState"])
+    sys.exit(4 if unit["LoadState"] == "not-found" else
+             1 if unit["UnitFileState"] in ["disabled", "masked", "masked-runtime"] else 0)
+if operation in ["start", "restart", "stop"]:
+    if unit["LoadState"] != "loaded":
+        sys.exit("the recovery systemctl fake cannot start or stop an absent unit")
+    active = operation != "stop"
+    unit.update(ActiveState="active" if active else "inactive", SubState="running" if active else "dead",
+                MainPID=os.environ["BILLET_GATE_SERVICE_PID"] if active else "0", ControlPID="0", Result="success")
+elif operation in ["enable", "disable"]:
+    if unit["LoadState"] == "not-found":
+        sys.exit(1)
+    unit["UnitFileState"] = ("enabled-runtime" if "--runtime" in args else "enabled") if operation == "enable" else "disabled"
+else:
+    sys.exit("the recovery systemctl fake does not answer " + repr(args))
+path.write_text(json.dumps(units))
+PYSERVICE
+
 # THE RECORDING WRAPPER, one per backing binary and role. Its answer can be
 # substituted (BILLET_GATE_ANSWER=<cmd>:<n>:<file>, several separated by `;`),
 # dropped (BILLET_GATE_DROP_ANSWER=<cmd>:<n>), or the invocation refused in the
@@ -267,13 +415,98 @@ log=${BILLET_GATE_LOG:-/dev/null}
 priv=${BILLET_GATE_PRIVATE:-/dev/null}
 cmd=${1:-}
 case "$cmd" in converge-guard|node|rollout) cmd="${2:-}" ;; esac
+retire_mode=""
+if [ "${1:-} ${2:-}" = 'server retire' ]; then
+  for arg in "$@"; do
+    case "$arg" in
+      --dry-run) [ -n "$retire_mode" ] || retire_mode=classify ;;
+      --reserve) retire_mode=reserve ;;
+      --input) retire_mode=request ;;
+      --abandon-reservation) retire_mode=abandon ;;
+      --complete-row) retire_mode=complete ;;
+      --acknowledge-row) retire_mode=acknowledge ;;
+    esac
+  done
+  cmd="retire-${retire_mode:-invalid}"
+fi
+# Capture only operands declared to come from stdin. Replaying these bytes
+# to a backing call preserves existing endpoint behaviour.
+input=""
+previous=""
+for arg in "$@"; do
+  if [ "$arg" = - ]; then
+    case "$previous" in --input|--completion|--answer|--desired) input=$(mktemp); cat >"$input" ;; esac
+  fi
+  previous=$arg
+done
+trap '[ -z "$input" ] || rm -f "$input"' EXIT
+host=${BILLET_GATE_HOST:-localhost}
+host_n=0
+sequence=0
+if [ -n "${BILLET_GATE_CALLS:-}" ]; then
+  event=$("${PYTHON:-python3}" "${BILLET_GATE_RECORDER:?}" "$BILLET_GATE_CALLS" "$host" "$cmd" "$input" "$@") || exit 98
+  read -r sequence host_n <<<"$event"
+fi
 n=1
 if [ -f "$priv" ]; then n=$(( $(grep -c "^call=$cmd\$" "$priv" || true) + 1 )); fi
 printf 'call=%s\n' "$cmd" >>"$priv"
-printf 'role=%s\ninvocation=%s\ncmd=%s\nargv0=%s\nargv=%s\nuid=%s\n---\n' "$ROLE" "$n" "$cmd" "$0" "$*" "$(id -u)" >>"$log"
+printf 'role=%s\ninvocation=%s\ncmd=%s\nhost=%s\nhost_invocation=%s\nsequence=%s\nargv0=%s\nargv=%s\nuid=%s\n---\n' "$ROLE" "$n" "$cmd" "$host" "$host_n" "$sequence" "$0" "$*" "$(id -u)" >>"$log"
 WRAP
     printf '%s' "$hook_lines"
     cat <<'WRAP'
+# A RETIREMENT SUBSTITUTION IS THE WHOLE CALL, BEFORE ANY BACKING RUN.
+# BILLET_GATE_RETIRE_ANSWERS=host:mode:host-invocation:fixture.json:exit,
+# several separated by semicolons. Fixtures are snapshots of HEAD, never
+# files harvested into the checkout while this gate is running. Missing
+# substitutions refuse too: no retirement command falls into the real host.
+if [ -n "$retire_mode" ] || [ "$cmd" = retire-invalid ]; then
+  IFS=';' read -r -a retire_specs <<<"${BILLET_GATE_RETIRE_ANSWERS:-}"
+  for spec in "${retire_specs[@]+"${retire_specs[@]}"}"; do
+    case "$spec" in
+      "$host:$retire_mode:$host_n:"*)
+        answer=${spec#"$host:$retire_mode:$host_n:"}
+        fixture=${answer%:*}; status=${answer##*:}
+        case "$fixture" in */*|''|.*) echo 'invalid retirement fixture name' >&2; exit 98 ;; esac
+        case "$status" in ''|*[!0-9]*) echo 'invalid retirement fixture exit' >&2; exit 98 ;; esac
+        printf 'backing=0 cmd=%s host=%s fixture=%s status=%s\n' "$cmd" "$host" "$fixture" "$status" >>"$priv"
+        if [ -n "${BILLET_GATE_RETIRE_OBLIGATION:-}" ] && [ "$status" = 0 ]; then
+          case "$retire_mode" in
+            reserve) printf 'reserved\n' >"$BILLET_GATE_RETIRE_OBLIGATION" || exit 98 ;;
+            abandon) rm "$BILLET_GATE_RETIRE_OBLIGATION" || exit 98 ;;
+          esac
+        fi
+        case "${BILLET_GATE_DROP_ANSWER:-}" in
+          "$cmd:$n"|"$host:$cmd:$host_n") exit "$status" ;;
+        esac
+        cat "${BILLET_GATE_RETIRE_FIXTURES:?}/$fixture" || exit 98
+        exit "$status" ;;
+    esac
+  done
+  printf 'backing=0 cmd=%s host=%s missing-fixture\n' "$cmd" "$host" >>"$priv"
+  echo "no committed retirement answer for $host:$retire_mode:$host_n" >&2
+  exit 98
+fi
+# Host-scoped collected reports bypass the backing binary just like retirement.
+# Each substitution still records exact argv/stdin before it answers.
+if [ -n "${BILLET_GATE_REPORT_ANSWERS:-}" ]; then
+  case "$cmd" in
+    release|status|migrate-endpoint)
+      IFS=';' read -r -a report_specs <<<"$BILLET_GATE_REPORT_ANSWERS"
+      for spec in "${report_specs[@]+"${report_specs[@]}"}"; do
+        case "$spec" in
+          "$host:$cmd:$host_n:"*)
+            answer=${spec#"$host:$cmd:$host_n:"}
+            fixture=${answer%:*}; status=${answer##*:}
+            case "$status" in ''|*[!0-9]*) echo 'invalid report fixture exit' >&2; exit 98 ;; esac
+            printf 'backing=0 cmd=%s host=%s fixture=%s status=%s\n' "$cmd" "$host" "$fixture" "$status" >>"$priv"
+            cat "$fixture" || exit 98
+            exit "$status" ;;
+        esac
+      done
+      echo "no committed report answer for $host:$cmd:$host_n" >&2
+      exit 98 ;;
+  esac
+fi
 failspec=${BILLET_GATE_FAIL:-}
 forced_exit=""
 case "$failspec" in
@@ -290,14 +523,18 @@ for spec in "${specs[@]+"${specs[@]}"}"; do
 done
 out=$(mktemp); err=$(mktemp)
 endpoint_answer=0
-case "$cmd" in migrate-endpoint|receipt|registration) [ -n "$substituted" ] && endpoint_answer=1 ;; esac
+case "$cmd" in migrate-endpoint|receipt|registration|release) [ -n "$substituted" ] && endpoint_answer=1 ;; esac
 if [ "$endpoint_answer" = 1 ]; then
   # AN ENDPOINT ANSWER STANDS IN FOR THE BACKING RUN: the fixture is the
   # command's own, and its outcome decides the exit as the command does.
   case "$(basename "$substituted")" in refused-*) status=2 ;; unknown*|timeout*) status=3 ;; *) status=0 ;; esac
   printf 'backing=0 cmd=%s substituted=%s status=%s\n' "$cmd" "$(basename "$substituted")" "$status" >>"$priv"
 else
-  "$BACKING" "$@" >"$out" 2>"$err"
+  if [ -n "$input" ]; then
+    "$BACKING" "$@" <"$input" >"$out" 2>"$err"
+  else
+    "$BACKING" "$@" >"$out" 2>"$err"
+  fi
   status=$?
   printf 'backing=1 cmd=%s status=%s\n' "$cmd" "$status" >>"$priv"
   { printf '=== %s:%s stdout\n' "$cmd" "$n"; cat "$out"; printf '=== %s:%s stderr\n' "$cmd" "$n"; cat "$err"; printf '=== end\n'; } >>"$priv"
@@ -350,12 +587,18 @@ FAKE
   cat >"$fakes/$tool" <<FAKE
 #!/bin/sh
 if [ -z "\${BILLET_GATE_LOG:-}" ] && [ -r /var/lib/billet-gate.env ]; then . /var/lib/billet-gate.env; fi
-if [ "$tool" = systemctl ] && [ "\${1:-}" = --version ]; then exec "$real" "\$@"; fi
+if [ "$tool" = systemctl ] && [ "\${1:-}" = --version ]; then
+  if [ -x '$mnt/bin/systemctl' ]; then exec '$mnt/bin/systemctl' "\$@"; fi
+  exec "$real" "\$@"
+fi
 printf 'role=$tool\nargv0=%s\nargv=%s\nuid=%s\n---\n' "\$0" "\$*" "\$(id -u)" >>"\${BILLET_GATE_LOG:-/dev/null}"
 FAKE
   case $tool in
     date)
       cat >>"$fakes/$tool" <<FAKE
+if [ -n "\${BILLET_GATE_RETIRE_CLOCK:-}" ] && [ "\${2:-}" = '+%Y-%m-%dT%H:%M:%S.%NZ' ]; then
+  '$python' '$work/record-call.py' "\$BILLET_GATE_CALLS" "\${BILLET_GATE_HOST:-localhost}" collection-clock '' "\$@" >/dev/null || exit 98
+fi
 case "\${BILLET_FAKE_DATE_MODE:-}" in
   fail) exit 1 ;;
   short) echo 2026-09-09; exit 0 ;;
@@ -371,11 +614,38 @@ exec "$real" "\$@"
 FAKE
       ;;
     systemctl)
+      cat >>"$fakes/$tool" <<FAKE
+if [ "\${1:-}" = show ] && [ "\${3:-}" = --property=EnvironmentFiles ] && [ -n "\${BILLET_GATE_RETIRE_ENV_SET:-}" ]; then
+  printf '%s\n' "\${BILLET_GATE_RETIRE_ENV:-}"
+  exit 0
+fi
+if [ -n "\${BILLET_GATE_SERVICES:-}" ]; then
+  export BILLET_GATE_SERVICES BILLET_GATE_SERVICE_PID
+  exec '$python' '$work/service-state.py' systemctl "\$@"
+fi
+FAKE
       printf '%s\n' 'if [ "${1:-}" = show ] && [ -n "${BILLET_GATE_UNIT_SHOW:-}" ]; then cat "$BILLET_GATE_UNIT_SHOW"; exit 0; fi' \
         'echo "systemctl was called by the preparation" >&2; exit 97' >>"$fakes/$tool" ;;
     *)
       echo "exec \"$real\" \"\$@\"" >>"$fakes/$tool" ;;
   esac
+  chmod 0755 "$fakes/$tool"
+done
+
+for tool in pgrep systemd-cgls; do
+  real=$(command -v "$tool" || true)
+  cat >"$fakes/$tool" <<FAKE
+#!/bin/sh
+if [ -z "\${BILLET_GATE_LOG:-}" ] && [ -r /var/lib/billet-gate.env ]; then . /var/lib/billet-gate.env; fi
+if [ -n "\${BILLET_GATE_SERVICES:-}" ]; then
+  printf 'role=$tool\nargv=%s\n---\n' "\$*" >>"\${BILLET_GATE_LOG:-/dev/null}"
+  export BILLET_GATE_SERVICES BILLET_GATE_SERVICE_PID
+  exec '$python' '$work/service-state.py' '$tool' "\$@"
+fi
+if [ -x '$mnt/bin/$tool' ]; then exec '$mnt/bin/$tool' "\$@"; fi
+if [ -z '$real' ]; then echo '$tool is unavailable outside the recovery fake' >&2; exit 97; fi
+exec '$real' "\$@"
+FAKE
   chmod 0755 "$fakes/$tool"
 done
 
@@ -419,9 +689,27 @@ PY
 }
 
 # --- the plays ---------------------------------------------------------------
-cat >"$work/inventory.ini" <<'INV'
+for host in localhost control-a control-b node-a; do
+  cat >"$work/python-$host" <<INTERPRETER
+#!/bin/sh
+export BILLET_GATE_HOST='$host'
+exec '$python' "\$@"
+INTERPRETER
+  chmod 0755 "$work/python-$host"
+done
+cat >"$work/inventory.ini" <<INV
 [billet_hosts]
-localhost ansible_connection=local
+localhost ansible_connection=local ansible_python_interpreter=$work/python-localhost
+
+[retirement_hosts]
+control-a ansible_connection=local ansible_python_interpreter=$work/python-control-a
+control-b ansible_connection=local ansible_python_interpreter=$work/python-control-b
+node-a ansible_connection=local ansible_python_interpreter=$work/python-node-a
+
+# Port zero cannot be an SSH listener. This fails in the connection plugin,
+# before a module runs; a failed command is not UNREACHABLE.
+[retirement_unreachable]
+unreachable ansible_connection=ssh ansible_host=127.0.0.1 ansible_port=0 ansible_connect_timeout=1 ansible_ssh_common_args='-o BatchMode=yes -o ConnectionAttempts=1'
 INV
 
 # ONE PLAY FOR EVERY CASE: the entry point the case names, an optional second
@@ -653,10 +941,33 @@ failed_at() {
   awk '/^TASK \[/ { t=$0; sub(/^TASK \[/, "", t); sub(/\] \*+$/, "", t); sub(/^junioryono\.billet\.host : /, "", t) }
        /^(fatal|failed): / { print t; exit }' "$work/cases/$1/out"
 }
-# The last fatal result with the lines that belong to it (under -vvv the
-# message follows the fatal line rather than sitting on it).
+# Only a terminal failure retains a task window. Progress in a later task
+# cannot replace it; keep item details for the decoder to judge an aggregate.
+# ansible-core 2.21.2 default.py (2026-09-14): _task_start caches TASK and
+# RUNNING HANDLER for _print_task_banner; no cleanup callback exists. Play
+# boundaries come from v2_playbook_on_play_start / v2_playbook_on_stats.
 final_fatal() {
-  awk '/^(fatal|failed): / { buf = ""; on = 1 } on { buf = buf $0 "\n" } /^(PLAY RECAP|TASK \[)/ { on = 0 } END { printf "%s", buf }' "$work/cases/$1/out"
+  awk -v name="$1" '
+       /^(TASK \[|RUNNING HANDLER \[|PLAY( \[| RECAP| \*|$))/ { if (fatal) final = buf; buf = ""; fatal = 0 }
+       { buf = buf $0 "\n" }
+       /^(fatal:|failed:)/ {
+         if ($0 !~ /^(fatal: \[.+\]: (FAILED|UNREACHABLE)! =>|failed: \[.+\] \(item=.*\) =>)/) {
+           print name ": cannot classify final fatal result: " $0 > "/dev/stderr"
+           invalid = 1
+           exit 1
+         }
+         fatal = 1
+       }
+       /^(FAILED - RETRYING:|ASYNC (POLL|OK|FAILED) on )/ { notice = 1 }
+       END {
+         if (invalid) exit 1
+         if (fatal) final = buf
+         if (final == "" && notice) {
+           print name ": no terminal result" > "/dev/stderr"
+           exit 1
+         }
+         printf "%s", final
+       }' "$work/cases/$1/out"
 }
 expect_refused() { # case task fragment...
   local name=$1 task=$2; shift 2
@@ -679,13 +990,13 @@ expect_refused_member() {
   [ "$items" -eq 1 ] || fail "$name: $items failed items of the parser, want exactly one" "$work/cases/$name/out"
   grep -q "^failed: \[localhost\] (item=$member)" "$work/cases/$name/out" || fail "$name: the failed item is not $member" "$work/cases/$name/out"
 }
-# expect_final CASE FRAGMENT...: the rescue's re-failure, the last fatal line.
+# expect_final CASE FRAGMENT...: the rescue's decoded re-failure message.
 expect_final() {
   local name=$1; shift
-  local line
-  line=$(final_fatal "$name")
+  local message
+  message=$(final_fatal "$name" | "$python" "$here/callback_result.py" "$name: final fatal task")
   for frag in "$@"; do
-    printf '%s' "$line" | grep -qF -- "$frag" || fail "$name: the final refusal does not say: $frag" "$work/cases/$name/out"
+    grep -qF -- "$frag" <<<"$message" || fail "$name: the final refusal does not say: $frag" "$work/cases/$name/out"
   done
 }
 expect_allowed() {
@@ -757,6 +1068,84 @@ expect_state() { # case key value
   got=$(state "$1" "$2")
   [ "$got" = "$3" ] || fail "$1: state $2=$got, want $3" "$work/cases/$1/state"
 }
+# The namespace dumped these names with lstat: a dangling link is present,
+# and a failed read prevents the dump rather than manufacturing absence.
+expect_path_absent() { # case absolute-path
+  "$python" - "$work/cases/$1/files.json" "$2" <<'PY'
+import json, sys
+snapshot = json.load(open(sys.argv[1]))
+path = sys.argv[2]
+if not any(path == root or path.startswith(root + "/") for root in snapshot["roots"]):
+    sys.exit("the filesystem snapshot did not examine " + path)
+# A link in the prefix means the walk did not examine this path's parent.
+for name, entry in snapshot["paths"].items():
+    if path.startswith(name + "/") and entry["link"] is not None:
+        sys.exit("the filesystem snapshot did not follow " + name)
+if path in snapshot["paths"]:
+    sys.exit("a path that must stay absent appeared: " + path)
+PY
+}
+expect_unit_absent() { # case unit
+  expect_path_absent "$1" "/etc/systemd/system/$2"
+  expect_path_absent "$1" "/run/systemd/system/$2"
+  expect_path_absent "$1" "/usr/lib/systemd/system/$2"
+  expect_path_absent "$1" "/lib/systemd/system/$2"
+}
+expect_no_ordinary() { # case
+  local task
+  # The account file owns the rendering too. Read the task names from their
+  # sources so a newly added ordinary task joins this assertion automatically.
+  while IFS= read -r task; do
+    expect_no_task "$1" "$task"
+  done < <(sed -n 's/^[[:space:]]*- name: //p' "$role_tasks/account.yml" "$role_tasks/services.yml" "$role_tasks/service-account.yml")
+  expect_no_task "$1" "Configure billet account and files"
+  expect_no_task "$1" "Configure billet services"
+}
+expect_host_commands() { # case semicolon-separated 'host command invocation'
+  local got
+  got=$("$python" - "$work/cases/$1/calls/index.jsonl" <<'PY'
+import json, sys
+for line in open(sys.argv[1]):
+    call = json.loads(line)
+    if call["command"].startswith("retire-"):
+        print("%s %s %s;" % (call["host"], call["command"], call["invocation"]), end="")
+PY
+  )
+  [ "$got" = "$2" ] || fail "$1: host call order is $got, want $2" "$work/cases/$1/log"
+}
+expect_stdin() { # case host command invocation file
+  "$python" - "$work/cases/$1/calls" "$2" "$3" "$4" "$5" <<'PY'
+import json, pathlib, sys
+root, host, command, invocation, expected = sys.argv[1:]
+root = pathlib.Path(root)
+records = [json.loads(line) for line in (root / "index.jsonl").read_text().splitlines()]
+matching = [r for r in records if r["host"] == host and r["command"] == command and r["invocation"] == int(invocation)]
+if len(matching) != 1 or not matching[0]["has_stdin"]:
+    sys.exit("the named host's invocation did not capture stdin exactly once")
+if (root / matching[0]["stdin"]).read_bytes() != pathlib.Path(expected).read_bytes():
+    sys.exit("the named host's invocation read another stdin document")
+PY
+}
+# r_services CASE HOST: seed the two ordinary units as inactive and disabled.
+# A later case may edit this case-local map to the recovery manifest's states.
+r_services() {
+  mkdir -p "$work/cases/$1/services"
+  "$python" - "$work/cases/$1/services/$2.json" <<'PY'
+import json, sys
+properties = dict(LoadState="loaded", ActiveState="inactive", SubState="dead", MainPID="0",
+                  ControlPID="0", Result="success", NRestarts="0", UnitFileState="disabled",
+                  ActiveEnterTimestampMonotonic="100", ExecMainStartTimestampMonotonic="100",
+                  CanStart="yes", CanStop="yes", CanReload="no", NeedDaemonReload="no", EnvironmentFiles="")
+with open(sys.argv[1], "w") as stream:
+    json.dump({unit: properties for unit in ["billet-server.service", "billet-node.service"]}, stream)
+PY
+  e "$1" "BILLET_GATE_SERVICES=$work/cases/$1/services"
+  p "$1" 'mkdir -p /etc/systemd/system
+for unit in billet-server.service billet-node.service; do
+  printf "[Service]\nType=simple\nExecStart=/bin/true\n" >"/etc/systemd/system/$unit"
+done'
+}
+
 # The tokens and ids the case's private capture carries.
 tokens_of() { sed -n 's/^ *"token": "\([0-9a-f]\{32\}\)".*/\1/p' "$work/cases/$1/private" 2>/dev/null | sort -u; }
 id_of() { sed -n 's/^ *"id": "\([0-9a-f]\{32\}\)".*/\1/p' "$work/cases/$1/private" | head -n1; }
@@ -842,6 +1231,7 @@ mark_id "$work/corpus/no-change.json" "$work/corpus/no-change-second.json"
 mark_id "$work/corpus/no-change-outcome.json" "$work/corpus/no-change-outcome-second.json"
 mark_id "$work/corpus/acquired.json" "$work/corpus/acquired-second.json"
 
+if [ "$retirement_only" = 0 ]; then
 plant_plain guard-refused
 RUNNER="billet-lease-abc123"; run_plain guard-refused -- -e billet_gate_entry=converge-guard; RUNNER=""
 expect_refused guard-refused "Refuse a converge driven from a billet-managed runner" "runner billet itself manages"
@@ -879,7 +1269,7 @@ rm -rf "$work/cases/p15-a/lib" "$work/cases/p15-a/bin/billet"
 run_plain p15-a -- -e billet_exclusion_platform=Darwin
 expect_allowed p15-a
 expect_fact p15-a route unheld
-expect_fact p15-a held undef
+expect_fact p15-a held False
 expect_ran p15-a "Inspect the managed binary and the claim again before an unheld converge"
 log_empty p15-a
 [ ! -e "$work/cases/p15-a/lib" ] || fail "p15-a: a Mac with no billet had a root made for it"
@@ -920,8 +1310,12 @@ expect_refused_member p15-h2 "outcome"
 expect_final p15-h2 "ended by its bound"
 expect_fact p15-h2 released False
 echo "ok   P15: a Mac calls prepare as the agent's account under the async bound, stages nothing, takes the no-billet path, and cleans up without timeout"
+sections_ran="$sections_ran, guard, simulated-darwin"
+
+fi
 
 if [ "$have_root" = 0 ]; then
+  [ "$retirement_only" = 0 ] || fail "the retirement section needs sudo -n for its namespace machinery"
   if [ "${BILLET_GATE_REQUIRE_ROOT:-0}" = 1 ]; then
     fail "BILLET_GATE_REQUIRE_ROOT=1 and sudo -n is not available; the namespace cases cannot run"
   fi
@@ -929,6 +1323,7 @@ if [ "$have_root" = 0 ]; then
   exit 0
 fi
 if [ "$(uname -s)" != Linux ]; then
+  [ "$retirement_only" = 0 ] || fail "the retirement section needs Linux for its namespace machinery"
   if [ "${BILLET_GATE_REQUIRE_ROOT:-0}" = 1 ]; then
     fail "BILLET_GATE_REQUIRE_ROOT=1 on $(uname -s); the namespace cases need Linux"
   fi
@@ -936,6 +1331,7 @@ if [ "$(uname -s)" != Linux ]; then
   exit 0
 fi
 if ! command -v go >/dev/null 2>&1; then
+  [ "$retirement_only" = 0 ] || fail "the retirement section needs go for the shared namespace launch probe"
   if [ "${BILLET_GATE_REQUIRE_ROOT:-0}" = 1 ]; then fail "no go on PATH; the backing binaries cannot be built"; fi
   echo "converge guard: no go on PATH; the namespace cases were skipped"
   exit 0
@@ -947,10 +1343,10 @@ invoker_uid=$(id -u); invoker_gid=$(id -g); invoker_name=$(id -un)
 # THE BACKING BINARIES, built once from this checkout, and their wrappers.
 # =============================================================================
 echo "building the backing binaries ..."
-for v in v0.10.0 v0.10.1 v0.9.0; do
+for v in v0.10.0 v0.10.1 v0.11.0 v0.9.0; do
   (cd "$repo_root" && go build -tags billetgatecrash -ldflags "-X github.com/junioryono/billet/internal/version.version=$v" -o "$bins/billet-$v" ./cmd/billet)
 done
-for v in v0.10.0 v0.10.1 v0.9.0; do
+for v in v0.10.0 v0.10.1 v0.11.0 v0.9.0; do
   write_wrapper "$bins/wrap-managed-$v" "$mnt/bin/billet-$v" managed
   write_wrapper "$bins/wrap-candidate-$v" "$mnt/bin/billet-$v" candidate
 done
@@ -987,7 +1383,19 @@ origin_url="http://127.0.0.1:$port"
 cat >"$work/ns-lib.sh" <<'LIB'
 # Sourced inside the namespace by plant and post scripts: the tree at its real paths.
 ROOT=/var/lib/billet/upgrades
-plant_root() { mkdir -p /var/lib/billet; chmod 0755 /var/lib/billet; chown root:root /var/lib/billet; mkdir -p "$ROOT"; chmod 0700 "$ROOT"; chown root:root "$ROOT"; }
+plant_root() {
+  # The /var/lib overlay has a host lower and a tmpfs upper. Without xino,
+  # directories report the overlay's device and files the upper's, so real
+  # local prepare refuses even its own authority.lock before repairing it.
+  # Bind a whole tmpfs directory before planting anything. Cases that start
+  # without a root must still exercise the role's creation of its parent.
+  if [ ! -d "$MNT/billet" ]; then
+    mkdir -p "$MNT/billet" /var/lib/billet || return 1
+    mount --bind "$MNT/billet" /var/lib/billet || return 1
+  fi
+  chmod 0755 /var/lib/billet; chown root:root /var/lib/billet
+  mkdir -p "$ROOT"; chmod 0700 "$ROOT"; chown root:root "$ROOT"
+}
 plant_managed() { cp "$BINS/wrap-managed-${1:-v0.10.0}" /usr/bin/billet; chmod 0755 /usr/bin/billet; chown root:root /usr/bin/billet; }
 plant_managed_file() { cp "$1" /usr/bin/billet; chmod 0755 /usr/bin/billet; chown root:root /usr/bin/billet; }
 plant_pre_r() { plant_managed_file "$FAKES/billet-pre-r"; }
@@ -1022,27 +1430,53 @@ set -u
 case_dir=$1; mode=$2; play=$3
 export BINS PYTHON FAKES ROOT=/var/lib/billet/upgrades
 mount -t tmpfs tmpfs "$MNT" || exit 90
-mkdir -p "$MNT/ub-upper" "$MNT/ub-work" "$MNT/vl-upper" "$MNT/vl-work" "$MNT/etc-upper" "$MNT/etc-work" "$MNT/bin"
+mkdir -p "$MNT/ub-upper" "$MNT/ub-work" "$MNT/vl-upper" "$MNT/vl-work" "$MNT/etc-upper" "$MNT/etc-work" "$MNT/run-upper" "$MNT/run-work" "$MNT/bin"
 mount -t overlay overlay -o "lowerdir=/usr/bin,upperdir=$MNT/ub-upper,workdir=$MNT/ub-work" /usr/bin || exit 91
 mount -t overlay overlay -o "lowerdir=/var/lib,upperdir=$MNT/vl-upper,workdir=$MNT/vl-work" /var/lib || exit 92
 mount -t overlay overlay -o "lowerdir=/etc,upperdir=$MNT/etc-upper,workdir=$MNT/etc-work" /etc || exit 93
+mount -t overlay overlay -o "lowerdir=/run,upperdir=$MNT/run-upper,workdir=$MNT/run-work" /run || exit 95
 rm -rf /etc/billet
 cp "$BINS"/billet-v* "$MNT/bin/" && chmod 0755 "$MNT/bin"/* && chown root:root "$MNT/bin"/*
 rm -f /usr/bin/billet
+# sudo's secure_path must see the same service fakes as the play's PATH.
+for tool in systemctl systemd-cgls pgrep; do
+  if [ -x "/usr/bin/$tool" ]; then cp "/usr/bin/$tool" "$MNT/bin/$tool" || exit 96; fi
+  cp "$FAKES/$tool" "/usr/bin/$tool" || exit 96
+done
 rm -rf /var/lib/billet
 . "$NSLIB"
 if [ -s "$case_dir/plant.sh" ]; then
-  if ! (set -e; . "$case_dir/plant.sh"); then echo "plant failed" >"$case_dir/state"; exit 94; fi
+  # A conditional subshell suppresses errexit even after set -e. A new bash
+  # keeps it active; source the helpers there and pass the runner's locals.
+  if ! /bin/bash -eu -c '
+    case_dir=$1; mode=$2; play=$3
+    . "$NSLIB"
+    . "$case_dir/plant.sh"
+  ' billet-gate-plant "$case_dir" "$mode" "$play"; then
+    echo "plant failed" >"$case_dir/state"
+    exit 94
+  fi
 fi
 : >"$case_dir/log"; : >"$case_dir/private"; : >"$case_dir/out"
+mkdir -p "$case_dir/calls"
+: >"$case_dir/calls/index.jsonl"
+chown "$INVOKER_UID:$INVOKER_GID" "$case_dir/calls" "$case_dir/calls/index.jsonl"
+# A live, harmless process gives the service fake a pid whose cmdline the
+# finalizer can inspect. It is reaped before this namespace exits.
+sleep 3600 &
+service_pid=$!
+trap 'kill "$service_pid" 2>/dev/null || true; wait "$service_pid" 2>/dev/null || true' EXIT
 chown "$INVOKER_UID:$INVOKER_GID" "$case_dir/log" "$case_dir/private" "$case_dir/out"
 envs=(PATH="$FAKES:$PATH" ANSIBLE_COLLECTIONS_PATH="$COLLECTIONS" \
   ANSIBLE_STDOUT_CALLBACK=default ANSIBLE_NOCOLOR=1 ANSIBLE_FORCE_COLOR=0 \
   ANSIBLE_LOCAL_TEMP="$case_dir/tmp" ANSIBLE_REMOTE_TEMP="$case_dir/tmp" \
   RUNNER_NAME="$RUNNER" BILLET_CONVERGE_GUARD_HOLDER="$HOLDER" \
-  BILLET_GATE_LOG="$case_dir/log" BILLET_GATE_PRIVATE="$case_dir/private")
+  BILLET_GATE_LOG="$case_dir/log" BILLET_GATE_PRIVATE="$case_dir/private" \
+  BILLET_GATE_CALLS="$case_dir/calls" BILLET_GATE_RECORDER="$RECORDER" \
+  BILLET_GATE_SERVICE_PID="$service_pid" BILLET_GATE_RETIRE_FIXTURES="$RETIRE_FIXTURES")
 while IFS= read -r line; do [ -n "$line" ] && envs+=("$line"); done <"$case_dir/env"
 mapfile -t args <"$case_dir/args"
+if [ -d "$case_dir/services" ]; then mkdir -p /run/systemd/system || exit 96; fi
 # THE GATE'S VARIABLES, FOR A WRAPPER RUN UNDER SUDO: written into this case's
 # overlay of /var/lib (never the host's), shell-quoted, sourced by a wrapper
 # or fake whose environment carries none of them (the become mode).
@@ -1076,6 +1510,12 @@ else
   setpriv --reuid="$INVOKER_UID" --regid="$INVOKER_GID" --init-groups env "${envs[@]}" HOME="$HOME_DIR" USER="$INVOKER_NAME" LOGNAME="$INVOKER_NAME" "$ANSIBLE_PLAYBOOK" -i "$INVENTORY" "$play" -e ansible_become=false -e "billet_gate_expect_uid=$INVOKER_UID" "${args[@]+"${args[@]}"}" >"$case_dir/out" 2>&1
 fi
 echo "$?" >"$case_dir/status"
+if [ -s "$case_dir/second-play" ]; then
+  cp "$case_dir/calls/index.jsonl" "$case_dir/calls-first.jsonl" || exit 96
+  second_play=$(cat "$case_dir/second-play")
+  env "${envs[@]}" HOME="$HOME_DIR" "$ANSIBLE_PLAYBOOK" -i "$INVENTORY" "$second_play" -e ansible_become=false "${args[@]+"${args[@]}"}" >"$case_dir/out-second" 2>&1
+  echo "$?" >"$case_dir/status-second"
+fi
 if [ -s "$case_dir/post.sh" ]; then
   (. "$case_dir/post.sh") >"$case_dir/post" 2>&1
   echo "post=$?" >>"$case_dir/post"
@@ -1115,8 +1555,35 @@ PY
   echo "tempfiles=$(comm -13 "$case_dir/tmp-before" "$case_dir/tmp-after" | wc -l | tr -d ' ')"
 } >"$case_dir/state" 2>/dev/null
 comm -13 "$case_dir/tmp-before" "$case_dir/tmp-after" | while IFS= read -r f; do [ -n "$f" ] && rm -f "/tmp/$f"; done
+"$PYTHON" - "$case_dir/files.json" <<'PYFILES'
+import json, os, stat, sys
+found = {}
+roots = ["/etc/billet", "/var/lib/billet", "/etc/systemd/system", "/run/systemd/system",
+         "/usr/lib/systemd/system", "/lib/systemd/system", "/usr/bin/billet"]
+for root in roots:
+    def record(path):
+        try:
+            info = os.lstat(path)
+        except FileNotFoundError:
+            return
+        found[path] = {"mode": info.st_mode, "size": info.st_size,
+                       "link": os.readlink(path) if stat.S_ISLNK(info.st_mode) else None}
+    record(root)
+    if os.path.isdir(root) and not os.path.islink(root):
+        for directory, dirs, files in os.walk(root, onerror=lambda err: (_ for _ in ()).throw(err)):
+            for name in dirs + files:
+                record(os.path.join(directory, name))
+with open(sys.argv[1], "w") as stream:
+    json.dump({"roots": roots, "paths": found}, stream)
+PYFILES
+[ "$?" -eq 0 ] || exit 96
 [ -f /etc/billet/billet.yaml ] && cp /etc/billet/billet.yaml "$case_dir/installed.yaml"
 mkdir -p "$case_dir/upper" && cp -a "$MNT/ub-upper" "$case_dir/upper/usr-bin" 2>/dev/null; cp -a "$MNT/vl-upper" "$case_dir/upper/var-lib" 2>/dev/null
+# A planted root's contents live on the tmpfs bind, outside the overlay upper.
+if [ -d "$MNT/billet" ]; then
+  mkdir -p "$case_dir/upper/var-lib/billet" || exit 96
+  cp -a "$MNT/billet/." "$case_dir/upper/var-lib/billet/" || exit 96
+fi
 chown -R "$INVOKER_UID:$INVOKER_GID" "$case_dir" 2>/dev/null || true
 exit 0
 NSRUN
@@ -1147,6 +1614,7 @@ ns_case() {
   sudo -n env BINS="$bins" FAKES="$fakes" PYTHON="$python" NSLIB="$work/ns-lib.sh" HOME_DIR="$HOME" MNT="$mnt" \
     COLLECTIONS="$collections_path" RUNNER="$RUNNER" HOLDER="$HOLDER" INVOKER_UID="$invoker_uid" INVOKER_GID="$invoker_gid" INVOKER_NAME="$invoker_name" \
     ANSIBLE_PLAYBOOK="$ansible_playbook" INVENTORY="$work/inventory.ini" \
+    RECORDER="$work/record-call.py" RETIRE_FIXTURES="$work/retire-fixtures" \
     unshare -m --propagation private /bin/bash "$work/ns-run.sh" "$case_dir" "$mode" "$work/$play.yml"
   local rc=$?
   [ "$rc" -eq 0 ] || fail "$name: the namespace runner failed ($rc): $(cat "$case_dir/state" 2>/dev/null)"
@@ -1171,15 +1639,25 @@ expect_state launch managed file
 [ ! -e /usr/bin/billet ] || fail "M8: /usr/bin/billet leaked outside the namespace"
 [ ! -e /var/lib/billet ] || fail "M8: /var/lib/billet leaked outside the namespace"
 echo "ok   M8: the namespace launch runs the managed wrapper as root at its real path, resolves the holder from the environment, and leaks nothing"
+sections_ran="$sections_ran, namespace launch probe (M8)"
 
 ROOT=/var/lib/billet/upgrades
 REC_A=recovery-20260909T120000-0badcafe
 REC_B=recovery-20260909T120000-1badcafe
 LEGACY_DIR=20260909T120000000000000
 
-# BILLET_GATE_ONLY=endpoint runs the endpoint section alone, for iterating on
-# it; CI and the pre-commit run everything.
-if [ "${BILLET_GATE_ONLY:-}" != endpoint ]; then
+# BILLET_GATE_ONLY selects endpoint, retirement or retirement-request after
+# shared setup and the namespace launch probe (endpoint also runs the plain
+# guard and simulated-darwin cases). Retirement includes routes and requests;
+# retirement-request selects only 5c.d1, with R's shared machinery and helpers.
+# BILLET_GATE_SKIP accepts endpoint, retirement and retirement-request in any
+# order. Skipping retirement omits all of R, including requests. CI's guard
+# group skips endpoint,retirement; its retirement group skips retirement-request.
+# Neither set runs every section, as make converge-guard-check does locally.
+# Unknown values, empty or repeated list members, and selecting and skipping
+# the same section together are refused, including ONLY=retirement-request
+# with SKIP=retirement. An unset or empty SKIP omits nothing.
+if [ -z "${BILLET_GATE_ONLY:-}" ]; then
 
 # =============================================================================
 # B. The role's order and its routes.
@@ -1208,12 +1686,12 @@ expect_no_task b1-first "Hold this host for the converge"
 # THE ORDER of the binaries' invocations, as role and command: the first
 # call (which reads the managed binary's version to record it), the second
 # call (which reads the managed version and probes the candidate under the
-# lock, before any re-binding), the settlement.
+# lock, before any re-binding), the settlement and selected-answerer version.
 order=$(commands b1-first | tr '\n' ';')
 # THE CANDIDATE'S DRY RUN DESCRIBES THE MANAGED BINARY, its version included,
 # so one `managed version` sits inside the candidate's probe.
-[ "$order" = "managed prepare;managed version;managed prepare;managed version;candidate prepare;managed version;candidate version;managed settle;" ] \
-  || fail "b1-first: the order of the calls is not validate, the second call with the candidate's probes under the lock, settle: $order" "$work/cases/b1-first/log"
+[ "$order" = "managed prepare;managed version;managed prepare;managed version;candidate prepare;managed version;candidate version;managed settle;managed version;" ] \
+  || fail "b1-first: the order of the calls is not validate, the second call with the candidate's probes under the lock, settle and selected-answerer version: $order" "$work/cases/b1-first/log"
 expect_state b1-first record_release_executable "$(fact b1-first recovery)/billet.candidate"
 expect_state b1-first record_preparing False
 expect_state b1-first record_holder h1
@@ -2369,6 +2847,7 @@ expect_allowed s3-collision
 expect_fact s3-collision recovery "$ROOT/$REC_B"
 expect_calls s3-collision suffix "" 2
 echo "ok   S: a pinned release is fetched and staged into an exclusive journal under the guard, and a collision retries"
+sections_ran="$sections_ran, preparation"
 fi
 
 # =============================================================================
@@ -2473,6 +2952,7 @@ ep_plant_ordinary() { # case installed-addr desired-addr [installed-shape] [desi
 # same and answering `unchanged`, the refresh `current` under the holder it
 # was written under; nothing stopped, no tempfile, the ordinary restart's
 # gate open.
+if [ "$retirement_only" = 0 ] && [ "$skip_endpoint" = 0 ]; then
 ep_plant_ordinary e1-unchanged $EP_A $EP_A
 e e1-unchanged "BILLET_GATE_ANSWER=migrate-endpoint:1:$(ep_fixture e1-unchanged node-migrate-endpoint reported-unplanned.json);migrate-endpoint:2:$(ep_fixture e1-unchanged node-migrate-endpoint unchanged.json);receipt:1:$(ep_fixture e1-unchanged node-receipt current.json)"
 ep_case e1-unchanged
@@ -2827,5 +3307,269 @@ e e11d-current-null-node "BILLET_GATE_ANSWER=migrate-endpoint:1:$(ep_fixture e11
 ep_case e11d-current-null-node
 expect_refused e11d-current-null-node "Judge the migration's answer" "answered with a member this role cannot read: node"
 echo "ok   E11: a current receipt keeps a holder that is one (by the command's grammar), a written receipt carries this run's, evidence mode never answers current, and an unchanged current answer names its node"
+sections_ran="$sections_ran, endpoint (E)"
 
-echo "converge guard: every case passed"
+else
+  echo "converge guard: endpoint (E) skipped"
+fi
+
+# =============================================================================
+# R. RETIREMENT: the parser, caller routes and 5c.d1 new requests.
+# Both groups need HEAD's committed producer bytes and the machinery control.
+# A corruption starts from those bytes, never a harvested worktree fixture
+# and never an answer assembled by the gate.
+# =============================================================================
+if [ "${BILLET_GATE_ONLY:-}" != endpoint ] && [ "$skip_retirement" = 0 ]; then
+mkdir -p "$work/retire-fixtures"
+git -C "$repo_root" ls-tree -r --name-only HEAD -- ansible_collections/junioryono/billet/tests/fixtures/server-retire/ >"$work/retire-fixture-list"
+[ -s "$work/retire-fixture-list" ] || fail "HEAD carries no retirement fixtures"
+while IFS= read -r fixture; do
+  git -C "$repo_root" show "HEAD:$fixture" >"$work/retire-fixtures/${fixture##*/}"
+done <"$work/retire-fixture-list"
+
+if [ "${BILLET_GATE_ONLY:-}" != retirement-request ]; then
+cat >"$work/play-retire-parser.yml" <<'PLAY'
+---
+- name: Exercise the retirement parser alone
+  hosts: billet_hosts
+  gather_facts: false
+  tasks:
+    - name: Read the invocation the case supplied
+      ansible.builtin.set_fact:
+        billet_retire_raw: "{{ billet_gate_retire_raw }}"
+        # A refused second inclusion must not retain a preceding answer.
+        billet_retire_answer: {stale: true}
+        billet_retire_route: ordinary
+        billet_retire_state_known: true
+        billet_retire_valid: true
+        billet_retire_reservation: released
+    - name: Parse the retirement answer and prove its failure facts
+      block:
+        - name: Parse the retirement answer
+          ansible.builtin.include_role:
+            name: junioryono.billet.host
+            tasks_from: retire-answer
+      rescue:
+        - name: Prove a failed parse discarded the preceding facts
+          vars:
+            # A validated refusal republishes its own state and cleanup word;
+            # unreadable and unanswered calls keep those permissions reset.
+            billet_gate_typed_refusal: "{{ ansible_failed_task.name == \"Refuse the retirement's answer\" }}"
+          ansible.builtin.assert:
+            that:
+              - billet_retire_route == ''
+              - billet_retire_valid is sameas billet_gate_typed_refusal
+              - billet_retire_state_known is sameas (billet_retire_answer.state != 'unknown' if billet_gate_typed_refusal else false)
+              - billet_retire_reservation == (billet_retire_answer.reservation | default('') if billet_gate_typed_refusal else '')
+              - >-
+                billet_retire_answer ==
+                ({} if ansible_failed_task.name in ['Refuse a retirement call that did not answer', 'Refuse unreadable retirement JSON']
+                 else billet_gate_retire_raw.stdout | junioryono.billet.from_json_strict)
+            fail_msg: The retirement parser retained stale facts after failure.
+            success_msg: Retirement failure facts verified.
+        - name: Preserve the retirement parser's refusal
+          ansible.builtin.fail:
+            msg: "{{ ansible_failed_result.msg | default('The retirement parser refused this invocation.') }}"
+    - name: Prove the parser published this invocation's typed operands
+      ansible.builtin.assert:
+        that:
+          - billet_retire_valid is sameas true
+          - billet_retire_answer == (billet_gate_retire_raw.stdout | junioryono.billet.from_json_strict)
+          - billet_retire_route == (billet_retire_answer.route if billet_retire_call == 'classify' else '')
+          - billet_retire_state_known is sameas (false if billet_retire_call == 'complete' else billet_retire_answer.state != 'unknown')
+          - billet_retire_reservation == ''
+        fail_msg: The retirement parser did not publish this call's own answer.
+PLAY
+
+# The result is built from a fixture, then ONE member of the answer or the
+# invocation is corrupted. '-' removes it; JSON values preserve their types.
+retire_parser_case() { # case call fixture rc [answer|raw member json]
+  local name=$1 call=$2 fixture=$3 rc=$4; shift 4
+  plant "$name"
+  "$python" - "$work/retire-fixtures/$fixture.json" "$work/cases/$name/raw.json" "$call" "$rc" "$@" <<'PY'
+import json, sys
+source, dest, call, rc, *mutation = sys.argv[1:]
+answer = json.load(open(source))
+raw = {"rc": int(rc), "stdout": json.dumps(answer), "stderr": ""}
+if mutation:
+    target, member, value = mutation
+    obj = answer if target == "answer" else raw
+    if value == "-":
+        del obj[member]
+    else:
+        obj[member] = json.loads(value)
+    if target == "answer":
+        raw["stdout"] = json.dumps(answer)
+with open(dest, "w") as stream:
+    json.dump({"billet_gate_retire_raw": raw, "billet_retire_call": call,
+               "billet_retire_answered_by": "/usr/bin/billet"}, stream)
+PY
+  : >"$work/cases/$name/log"
+  set +e
+  env ANSIBLE_COLLECTIONS_PATH="$collections_path" ANSIBLE_STDOUT_CALLBACK=default \
+    ANSIBLE_NOCOLOR=1 ANSIBLE_FORCE_COLOR=0 \
+    ANSIBLE_LOCAL_TEMP="$work/cases/$name/tmp" ANSIBLE_REMOTE_TEMP="$work/cases/$name/tmp" \
+    "$ansible_playbook" -i "$work/inventory.ini" "$work/play-retire-parser.yml" \
+    -e "@$work/cases/$name/raw.json" -e ansible_become=false >"$work/cases/$name/out" 2>&1
+  status=$?
+  set -e
+  # The first failure still supplies the refusal verdict. A second failure
+  # in rescue must not pass merely because that first refusal was expected.
+  if [ "$status" -ne 0 ]; then
+    grep -qF '"msg": "Retirement failure facts verified."' "$work/cases/$name/out" || fail "$name: the failure facts were not verified" "$work/cases/$name/out"
+  fi
+  expect_no_ordinary "$name"
+}
+retire_member_refused() { # case member [task]
+  local name=$1 member=$2 task=${3:-Judge each retirement member} count
+  expect_refused "$name" "$task" "answered with a member this role cannot read: $member"
+  count=$(grep -c '^failed: \[localhost\] (item=' "$work/cases/$name/out" || true)
+  [ "$count" -eq 1 ] || fail "$name: $count failed parser items, want exactly one" "$work/cases/$name/out"
+  grep -qF "failed: [localhost] (item=$member)" "$work/cases/$name/out" || fail "$name: the failed member is not $member" "$work/cases/$name/out"
+  expect_no_play_task "$name" "Prove the parser published this invocation's typed operands"
+}
+retire_unanswered() { # case task
+  expect_refused "$1" "$2" "did not answer retirement's" "state is unknown"
+  expect_no_play_task "$1" "Prove the parser published this invocation's typed operands"
+}
+
+# R7's positive controls: every call and every committed success shape. A
+# dry-run fixture's filename says dispatch, not route: request is ordinary,
+# adopt is hold, and unknown-ledger with a readable journal is continue.
+# Completion has no state member, so it must publish state_known false.
+for spec in classify:dry-run-request classify:dry-run-adopt classify:dry-run-unknown-ledger \
+  classify:dry-run-ordinary classify:dry-run-continue classify:dry-run-hold-unreadable-row \
+  classify:dry-run-hold-damaged-identity classify:dry-run-recovery-guard classify:dry-run-recovery-legacy \
+  classify:dry-run-new-request classify:dry-run-cancel classify:dry-run-unsupported-variant request:done-unchanged \
+  reserve:reserved reserve:adopted request:retired-settled request:retired-pending \
+  abandon:abandoned abandon:abandoned-marker-cleared complete:completed complete:completed-already \
+  acknowledge:acknowledged acknowledge:acknowledged-already; do
+  call=${spec%%:*}; fixture=${spec#*:}
+  retire_parser_case "r7-pass-$fixture" "$call" "$fixture" 0
+  expect_allowed "r7-pass-$fixture"
+  expect_play_task_ran "r7-pass-$fixture" "Prove the parser published this invocation's typed operands"
+done
+
+for spec in missing:- null:null unknown:'"invented"'; do
+  kind=${spec%%:*}; value=${spec#*:}
+  retire_parser_case "r7-route-$kind" classify dry-run-request 0 answer route "$value"
+  retire_member_refused "r7-route-$kind" route
+done
+retire_parser_case r7-route-why classify dry-run-adopt 0 answer route_why -
+retire_member_refused r7-route-why route_why
+retire_parser_case r7-roles-null classify dry-run-request 0 answer installed_roles null
+retire_member_refused r7-roles-null installed_roles
+# Changing config alone puts the fixture's non-null roles beside absence.
+retire_parser_case r7-roles-absent classify dry-run-request 0 answer config '"absent"'
+retire_member_refused r7-roles-absent installed_roles
+retire_parser_case r7-extra classify dry-run-request 0 answer extra true
+retire_member_refused r7-extra extra "Refuse a retirement member the producer does not write"
+retire_parser_case r7-completion-outcome complete completed 0 answer outcome '"completed"'
+retire_member_refused r7-completion-outcome outcome
+retire_parser_case r7-reservation request refused-reservation 2 answer reservation '"lost"'
+retire_member_refused r7-reservation reservation
+
+# Every mismatch among the three protocol statuses: an otherwise well-formed
+# success/refusal/unknown is unanswered, not an outcome under another exit.
+for spec in dry-run-request:2 dry-run-request:3 refused-backend:0 refused-backend:3 unknown-marker:0 unknown-marker:2; do
+  fixture=${spec%%:*}; rc=${spec#*:}
+  retire_parser_case "r7-exit-$fixture-$rc" classify "$fixture" "$rc"
+  retire_unanswered "r7-exit-$fixture-$rc" "Refuse a retirement exit that disagrees with its answer"
+done
+# The outcome-less success has the same exit contract.
+retire_parser_case r7-exit-complete complete completed 2
+retire_unanswered r7-exit-complete "Refuse a retirement exit that disagrees with its answer"
+
+for spec in classify:dry-run-request reserve:reserved request:retired-settled \
+  abandon:abandoned complete:completed acknowledge:acknowledged; do
+  call=${spec%%:*}; fixture=${spec#*:}
+  retire_parser_case "r7-no-rc-$call" "$call" "$fixture" 0 raw rc -
+  retire_unanswered "r7-no-rc-$call" "Refuse a retirement call that did not answer"
+  if [ "$call" = reserve ] || [ "$call" = abandon ] || [ "$call" = acknowledge ]; then
+    retire_parser_case "r7-state-$call" "$call" "$fixture" 0 answer state '"unknown"'
+    retire_member_refused "r7-state-$call" state
+  fi
+done
+# The closing observation may be unknown even on success. The classifier
+# guarantees hold; a terminal request still leaves its caller holding too.
+retire_parser_case r7-state-classify classify dry-run-adopt 0 answer state '"unknown"'
+expect_allowed r7-state-classify
+expect_play_task_ran r7-state-classify "Prove the parser published this invocation's typed operands"
+retire_parser_case r7-state-classify-non-hold classify dry-run-request 0 answer state '"unknown"'
+retire_member_refused r7-state-classify-non-hold state
+retire_parser_case r7-state-request request retired-settled 0 answer state '"unknown"'
+expect_allowed r7-state-request
+expect_play_task_ran r7-state-request "Prove the parser published this invocation's typed operands"
+for rc in -9 1 124 137; do
+  retire_parser_case "r7-unanswered-$rc" classify dry-run-request "$rc"
+  retire_unanswered "r7-unanswered-$rc" "Refuse a retirement call that did not answer"
+done
+retire_parser_case r7-empty classify dry-run-request 0 raw stdout '""'
+retire_unanswered r7-empty "Refuse a retirement call that did not answer"
+retire_parser_case r7-escalation classify dry-run-request 0 raw failed true
+retire_unanswered r7-escalation "Refuse a retirement call that did not answer"
+retire_parser_case r7-schema classify dry-run-request 0 answer schema '"1"'
+retire_member_refused r7-schema schema
+# An optional next really is optional; the committed refusal omits it.
+retire_parser_case r7-refused reserve refused-backend 2
+expect_refused r7-refused "Refuse the retirement's answer" 'was refused' '(backend, state'
+retire_parser_case r7-unknown request unknown-marker 3
+expect_refused r7-unknown "Refuse the retirement's answer" 'was unknown' '(marker, state'
+echo "ok   R7: all six calls, the route and member rules, every exit mismatch, and unanswered invocations"
+fi
+
+# THE MACHINERY'S POSITIVE CONTROL: the same wrapper on two delegated
+# inventory transports, mode and host counters independent, exact stdin kept,
+# and no retirement backing invocation. This is not a role retirement call.
+cat >"$work/play-retire-machinery.yml" <<'PLAY'
+---
+- name: Prove retirement interception and transport attribution
+  hosts: billet_hosts
+  gather_facts: false
+  tasks:
+    - name: Call the retirement fake on the named host
+      ansible.builtin.command:
+        argv: "{{ ['/usr/bin/billet', 'server', 'retire', '--json'] + item.args }}"
+        expand_argument_vars: false
+        stdin: "{{ lookup('ansible.builtin.file', billet_gate_input, rstrip=false) if item.input else omit }}"
+        stdin_add_newline: false
+      changed_when: false
+      delegate_to: "{{ item.host }}"
+      become: true
+      loop:
+        - {host: control-a, args: [--reserve], input: false}
+        - {host: control-b, args: [--complete-row, --completion, '-'], input: true}
+        - {host: control-a, args: [--input, '-'], input: true}
+        - {host: control-a, args: [--acknowledge-row, --answer, '-'], input: true}
+        - {host: control-a, args: [--abandon-reservation], input: false}
+        - {host: control-a, args: [--dry-run], input: false}
+        - {host: control-b, args: [--dry-run], input: false}
+        - {host: control-a, args: [--dry-run], input: false}
+PLAY
+plant r-machinery
+p r-machinery 'plant_managed v0.10.0'
+a r-machinery -e "billet_gate_input=$work/retire-fixtures/completed.json"
+e r-machinery 'BILLET_GATE_RETIRE_ANSWERS=control-a:reserve:1:reserved.json:0;control-b:complete:1:completed.json:0;control-a:request:1:retired-settled.json:0;control-a:acknowledge:1:acknowledged.json:0;control-a:abandon:1:abandoned.json:0;control-a:classify:1:dry-run-request.json:0;control-b:classify:1:dry-run-adopt.json:0;control-a:classify:2:dry-run-unknown-ledger.json:0'
+ns_case r-machinery become play-retire-machinery
+expect_allowed r-machinery
+expect_host_commands r-machinery 'control-a retire-reserve 1;control-b retire-complete 1;control-a retire-request 1;control-a retire-acknowledge 1;control-a retire-abandon 1;control-a retire-classify 1;control-b retire-classify 1;control-a retire-classify 2;'
+for spec in control-b:retire-complete control-a:retire-request control-a:retire-acknowledge; do
+  expect_stdin r-machinery "${spec%%:*}" "${spec#*:}" 1 "$work/retire-fixtures/completed.json"
+done
+for call in classify reserve request abandon complete acknowledge; do
+  [ "$(backing_runs r-machinery "retire-$call")" -eq 0 ] || fail "r-machinery: retirement's $call reached the backing binary"
+done
+expect_path_absent r-machinery /var/lib/billet/server
+expect_unit_absent r-machinery billet-server.service
+expect_no_ordinary r-machinery
+sections_ran="$sections_ran, retirement machinery (R)"
+# Route coverage uses only the producer corpus above. Cases whose distinct
+# classifier shape has no producer fixture are listed in retirement-cases.md.
+. "$here/retirement-cases.sh"
+
+else
+  echo "converge guard: retirement (R) skipped"
+fi
+
+
+echo "converge guard: every case passed (sections run: $sections_ran)"

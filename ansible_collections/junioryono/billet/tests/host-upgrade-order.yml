@@ -4,7 +4,11 @@
   connection: local
   gather_facts: false
   vars:
-    billet_host_main_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/main.yml') | from_yaml }}"
+    billet_host_main_tasks_raw: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/main.yml') | from_yaml }}"
+    # Expand only the ordinary boundary, whose condition is proved separately.
+    # The existing order assertions still judge the tasks Ansible executes.
+    billet_host_ordinary_boundary: "{{ billet_host_main_tasks_raw | selectattr('name', 'equalto', 'Converge the ordinary host only after retirement admits it') | first }}"
+    billet_host_main_tasks: "{{ billet_host_main_tasks_raw[:-1] + billet_host_ordinary_boundary.block }}"
     billet_host_service_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/services.yml') | from_yaml }}"
     # account.yml IMPORTS the installed-identity check (installed-identity.yml),
     # and this gate pins the order of the six tasks that file holds against
@@ -47,6 +51,19 @@
     billet_host_defaults: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/defaults/main.yml') | from_yaml }}"
     billet_service_policy_unit_path_allowlist: "{{ billet_host_defaults.billet_service_policy_unit_path_allowlist }}"
   tasks:
+    - name: Prove retirement gates both service-account imports
+      ansible.builtin.assert:
+        that:
+          - billet_host_main_tasks_raw[-1].name == 'Converge the ordinary host only after retirement admits it'
+          - billet_host_ordinary_boundary.when == 'not billet_retirement_bypass | bool'
+          - billet_host_main_tasks_raw[-2]['ansible.builtin.import_tasks'] == 'retirement.yml'
+          - billet_host_ordinary_boundary.block[0]['ansible.builtin.import_tasks'] == 'service-account.yml'
+          - >-
+            (billet_host_ordinary_boundary.block | selectattr('name', 'equalto',
+             'Record the service account and provision the authority locks on a fresh host') | first)
+            ['ansible.builtin.import_tasks'] == 'service-account.yml'
+        fail_msg: Retirement must precede and gate both ordinary service-account imports.
+
     - name: Locate the upgrade transaction and recovery path
       ansible.builtin.set_fact:
         billet_upgrade_task: "{{ billet_host_service_tasks | selectattr('name', 'equalto', 'Upgrade billet as one recoverable host transaction') | first }}"
@@ -773,12 +790,19 @@
           - billet_main_names[0] == 'Refuse a converge that would destroy the job running it'
           - billet_main_names[1] == 'Prepare the exclusion before anything changes this host'
           - billet_host_main_tasks[1]['ansible.builtin.import_tasks'] == 'prepare-exclusion.yml'
-          - billet_prepare_names[0] == 'Refuse a converge that would destroy the job running it'
-          - billet_host_prepare_tasks[0]['ansible.builtin.import_tasks'] == 'converge-guard.yml'
+          # THE CONNECTION-FREE RESET precedes every fallible task, including the runner refusal.
+          - billet_prepare_names[0] == "Reset this inclusion's exclusion permission"
+          - "'ansible.builtin.set_fact' in billet_host_prepare_tasks[0]"
+          - billet_host_prepare_tasks[0].when is not defined
+          - billet_host_prepare_tasks[0].delegate_to is not defined
+          - billet_host_prepare_tasks[0].delegate_facts is not defined
+          - billet_host_prepare_tasks[0]['ansible.builtin.set_fact'].billet_exclusion_settled is sameas false
+          - billet_prepare_names[1] == 'Refuse a converge that would destroy the job running it'
+          - billet_host_prepare_tasks[1]['ansible.builtin.import_tasks'] == 'converge-guard.yml'
           - billet_prepare_names.index('Refuse a converge without a holder') < billet_prepare_names.index('Inspect the managed binary and the upgrade root')
           # THE CLAIM'S FACTS are defined on every path before the block, and a dry run takes its shape from the report.
-          - billet_prepare_names.index('Note what the managed binary and the root are') < billet_prepare_names.index("Start the claim's facts at none")
-          - billet_prepare_names.index("Start the claim's facts at none") < billet_prepare_names.index('Prepare the exclusion')
+          - billet_prepare_names.index("Reset this inclusion's exclusion permission") < billet_prepare_names.index('Note what the managed binary and the root are')
+          - billet_prepare_names.index('Note what the managed binary and the root are') < billet_prepare_names.index('Prepare the exclusion')
           - billet_prepare_block_names.index('Report what a dry run found') < billet_prepare_block_names.index("Take the dry run's shape as this run's facts")
           - billet_prepare_block_names.index("Take the dry run's shape as this run's facts") < billet_prepare_block_names.index('Decide the binary change in a dry run')
           - "'ansible_check_mode' in ((billet_prepare_block | selectattr('name', 'equalto', \"Take the dry run's shape as this run's facts\") | first).when | string)"
@@ -998,7 +1022,8 @@
           # statement that was never fetched.
           - ((billet_host_binary_tasks | selectattr('name', 'equalto', 'Resolve the release channel') | first).block | selectattr('name', 'equalto', 'Read the signed channel statement') | first).check_mode == false
         fail_msg: >-
-          prepare-exclusion.yml must run the guard first, refuse an absent holder
+          prepare-exclusion.yml must reset permission without a connection first,
+          import the runner refusal second, refuse an absent holder
           before any stat, establish the root only under ENOENT, run the dry run's
           report before the memory check and the shape dispatch, classify a
           legacy file by its own stat, make the two calls in order through the one
