@@ -36,9 +36,9 @@
   ansible.builtin.assert:
     that: billet_retirement_survivor_host in ansible_play_hosts
     fail_msg: >-
-      Retirement precondition: survivor {{ billet_retirement_survivor_host }} was removed
-      from this play by failure or unreachability. Resolve that failure, then converge
-      the survivor in the same play as the retiring host.
+      Retirement precondition: survivor {{ billet_retirement_survivor_host }} is no longer active
+      in this play (failure, unreachability, or an intentional end of that host).
+      Resolve the cause, then converge the survivor in the same play as the retiring host.
   when: not ansible_check_mode
 
 - name: Require this converge's settled survivor guard

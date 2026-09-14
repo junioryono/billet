@@ -1197,7 +1197,7 @@ for task, host in [("Prove the survivor completed its first preparation", 'contr
     if len(parts) != 2 or ('ok: [' + host + ']') not in parts[1].split('TASK [', 1)[0]:
         sys.exit('R16 did not prove preparation/publication on ' + host + ': ' + task)
 PYPREPARED
-  expect_final "$name" 'Retirement precondition: survivor control-b was removed from this play by failure or unreachability.' 'Resolve that failure, then converge the survivor in the same play as the retiring host.'
+  expect_final "$name" 'Retirement precondition: survivor control-b is no longer active in this play (failure, unreachability, or an intentional end of that host).' 'Resolve the cause, then converge the survivor in the same play as the retiring host.'
   r_no_collection "$name"
   expect_host_commands "$name" 'control-a retire-classify 1;'
 done
