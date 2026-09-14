@@ -517,6 +517,80 @@ func TestServerRetireRequestIsHeldToItsReservationAndRound(t *testing.T) {
 	})
 }
 
+// THE CALLER MAY ABANDON THE MARKER-BEFORE-JOURNAL WINDOW ONLY THROUGH THE
+// COMMAND: failure to publish intent leaves the marker and reservation intact.
+func TestTheRetireCallerFixtureReportsAnUnpublishedIntentJournal(t *testing.T) {
+	f := newRequestFixture(t)
+	row := f.reserve(t)
+	if f.guard.record(t).Transition != nil {
+		t.Fatal("the fresh reservation already has a marker")
+	}
+
+	saved := retirement.Publishing
+	attempted := false
+	retirement.Publishing = func(path string) error {
+		if path == retirement.JournalPath() {
+			attempted = true
+			return os.ErrPermission
+		}
+		return nil
+	}
+	t.Cleanup(func() { retirement.Publishing = saved })
+
+	out, code := f.request(t, f.input(t, nil), "--reservation-fresh")
+	m := retireAnswer(t, out)
+	if !attempted || code != exitUnknown || m["outcome"] != retireOutcomeUnknown ||
+		m["reason"] != retireReasonJournal || m["state"] != stateNothingRetire ||
+		m["reservation"] == "released" || !strings.Contains(whyOf(m), "write the journal's intent: permission denied") {
+		t.Fatalf("the request did not fail in the marker-before-journal window: %s", out)
+	}
+	if _, presence, err := retirement.ReadJournal(); err != nil || presence != retirement.JournalAbsent {
+		t.Fatalf("the failed publication left a journal: %d %v", presence, err)
+	}
+	if _, presence, err := retirement.ReadStatus(); err != nil || presence != retirement.StatusAbsent {
+		t.Fatalf("the failed publication left an authority status: %d %v", presence, err)
+	}
+	if marker := f.guard.record(t).Transition; marker == nil || marker.Kind != transitionRetirement ||
+		marker.ID != row.TransitionID {
+		t.Fatalf("the request did not keep its reservation's marker: %+v", marker)
+	}
+	f.pgLedger(t, func(db *state.DB) {
+		r, present, err := db.ReadRetirement(t.Context(), f.identity)
+		mustOK(t, err)
+		if !present || r.State != state.RetirementReserved || r.TransitionID != row.TransitionID || r.Run != requestRun {
+			t.Fatalf("the failed publication changed the reservation: %+v (present %v)", r, present)
+		}
+	})
+	expectRetire(t, out, code, "unknown-intent-journal", retireOutcomeUnknown, retireReasonJournal)
+}
+
+// A FRESH REQUEST'S ELIGIBILITY REFUSAL CAN DISCHARGE ITS OWN RESERVATION,
+// so the caller must not try to abandon a row the command already released.
+func TestTheRetireCallerFixtureReportsAReleasedRequestReservation(t *testing.T) {
+	f := newRequestFixture(t)
+	f.reserve(t)
+
+	out, code := f.request(t, f.input(t, map[string]any{"survivor": nil}), "--reservation-fresh")
+	m := retireAnswer(t, out)
+	if code != exitRefused || m["outcome"] != retireOutcomeRefused || m["reason"] != retireReasonSurvivor ||
+		m["reservation"] != "released" || m["state"] != stateNothingRetire ||
+		!strings.Contains(whyOf(m), "the input carries no survivor report") {
+		t.Fatalf("the eligibility refusal did not release its fresh reservation: %s", out)
+	}
+	f.pgLedger(t, func(db *state.DB) {
+		if _, present, err := db.ReadRetirement(t.Context(), f.identity); err != nil || present {
+			t.Fatalf("the released reservation is not absent: %v %v", present, err)
+		}
+	})
+	if f.guard.record(t).Transition != nil {
+		t.Fatal("the refused request left a marker")
+	}
+	if _, presence, err := retirement.ReadJournal(); err != nil || presence != retirement.JournalAbsent {
+		t.Fatalf("the refused request left a journal: %d %v", presence, err)
+	}
+	expectRetire(t, out, code, "refused-request-released", retireOutcomeRefused, retireReasonSurvivor)
+}
+
 // THE SURVIVOR MUST BE ONE: another deployment's, a flagged one, one whose
 // server is not running its executable, one mid-rotation, one carrying a
 // retirement of its own, and one serving another authority.

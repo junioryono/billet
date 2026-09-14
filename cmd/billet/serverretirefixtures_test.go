@@ -171,6 +171,63 @@ func TestTheRetireCallerFixtureClassifiesAnAbnormalClaim(t *testing.T) {
 	expectRetire(t, out, code, "dry-run-hold-abnormal-claim", retireOutcomeReported, "")
 }
 
+// A NEW REQUEST WAITS FOR ITS OWN GUARD'S CLEANUP WINDOW TO CLOSE.
+func TestTheRetireCallerFixtureClassifiesAPreparingGuard(t *testing.T) {
+	f := newRequestFixture(t)
+	rec := f.guard.record(t)
+	args := []string{"--dry-run", "--retiring-host", requestRetiring, "--requested",
+		"--expected-holder", requestRun, "--expected-guard", rec.ID}
+
+	out, code := f.run(t, "", args...)
+	assertRetireRoute(t, out, code, "new-request", "eligible")
+
+	rec.Preparing, rec.Token = true, strings.Repeat("a", 32)
+	writeGuardRecordForTest(t, f.guard, rec)
+	recordPath := filepath.Join(f.guard.active(), guardRecordName)
+	before := mustRead(t, recordPath)
+
+	out, code = f.run(t, "", args...)
+	m := assertRetireRoute(t, out, code, "hold", "the guard is still preparing; settle it")
+	if m["guard"] != string(claimGuard) || m["installed_roles"] != "server" ||
+		m["row_fact"] != string(retirement.RowAbsent) || m["journal"] != nil || m["marker"] != nil ||
+		m["status_presence"] != "absent" || m["stage"] != "absent" {
+		t.Fatalf("the preparing guard did not hold an otherwise fresh request: %s", out)
+	}
+	if mustRead(t, recordPath) != before || !f.guard.record(t).Preparing {
+		t.Fatal("the classifier settled or rewrote the preparing guard")
+	}
+	expectRetire(t, out, code, "dry-run-hold-preparing", retireOutcomeReported, "")
+}
+
+// A NEW REQUEST CANNOT REPAIR AN INTERRUPTED REWRITE OF ITS OWN GUARD.
+func TestTheRetireCallerFixtureClassifiesAnInterruptedGuardRewrite(t *testing.T) {
+	f := newRequestFixture(t)
+	rec := f.guard.record(t)
+	args := []string{"--dry-run", "--retiring-host", requestRetiring, "--requested",
+		"--expected-holder", requestRun, "--expected-guard", rec.ID}
+
+	out, code := f.run(t, "", args...)
+	assertRetireRoute(t, out, code, "new-request", "eligible")
+
+	temporary := filepath.Join(f.guard.active(), guardTmpName)
+	writeFile(t, temporary, "interrupted guard record", 0o600)
+	recordPath := filepath.Join(f.guard.active(), guardRecordName)
+	before := mustRead(t, recordPath)
+
+	out, code = f.run(t, "", args...)
+	m := assertRetireRoute(t, out, code, "hold", "the guard carries an interrupted rewrite (guard.json.tmp)")
+	if m["guard"] != string(claimGuard) || m["installed_roles"] != "server" ||
+		m["row_fact"] != string(retirement.RowAbsent) || m["journal"] != nil || m["marker"] != nil ||
+		m["status_presence"] != "absent" || m["stage"] != "absent" {
+		t.Fatalf("the interrupted guard rewrite did not hold an otherwise fresh request: %s", out)
+	}
+	if mustRead(t, recordPath) != before || f.guard.record(t).Preparing ||
+		mustRead(t, temporary) != "interrupted guard record" {
+		t.Fatal("the classifier changed the guard or its interrupted rewrite")
+	}
+	expectRetire(t, out, code, "dry-run-hold-interrupted-rewrite", retireOutcomeReported, "")
+}
+
 // LATER PHASES ARE INDEPENDENT INTERRUPTIONS, with the row, marker and status
 // the resume helpers establish. The archived host has actually moved its
 // identity; the classifier reads that state through the command's own entry.
