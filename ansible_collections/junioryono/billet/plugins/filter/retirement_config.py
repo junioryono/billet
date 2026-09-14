@@ -1,7 +1,7 @@
 # Copyright (c) 2026 junioryono
 # Apache-2.0
 
-"""Locate an identity for the incapable-answerer screen, granting no route."""
+"""Read role and locator hints; only the caller's combined evidence admits work."""
 
 import yaml
 
@@ -19,7 +19,8 @@ def _read_subset(text):
     # This pre-release compatibility path accepts one UTF-8 mapping document,
     # string mapping keys, no duplicates, anchors, aliases, merge keys or
     # explicit tags anywhere. It does not implement yaml.v3 in Python. A capable
-    # answerer uses the Go classifier instead.
+    # answerer uses the Go classifier instead. Unknown fields and Go's typed
+    # decoding can reject this subset; roles and locators remain hints only.
     # The reference controller's read-only inspection on 2026-09-14 found none
     # of those YAML features and state_dir: /var/lib/billet/server. The role's
     # to_nice_yaml emits aliases only for repeated object identity; a rendering
@@ -29,6 +30,8 @@ def _read_subset(text):
     for event in yaml.parse(text, Loader=yaml.SafeLoader):
         if isinstance(event, yaml.events.DocumentStartEvent):
             documents += 1
+            if event.version is not None and event.version != (1, 1):
+                raise _OutsideSubset("The installed configuration has an unsupported YAML version; only 1.1 is accepted.")
         if isinstance(event, yaml.events.AliasEvent):
             forbidden.append("alias *%s" % event.anchor)
         elif getattr(event, "anchor", None) is not None:
@@ -56,9 +59,13 @@ def _read_subset(text):
                 if key.value in keys:
                     raise _OutsideSubset("The installed configuration contains duplicate key %r." % key.value)
                 keys.add(key.value)
+                pending.append(key)
                 pending.append(value)
         elif isinstance(node, yaml.nodes.SequenceNode):
             pending.extend(node.value)
+        elif isinstance(node, yaml.nodes.ScalarNode):
+            if any(0xD800 <= ord(char) <= 0xDFFF for char in node.value):
+                raise _OutsideSubset("The installed configuration contains a decoded surrogate code point.")
     return {key.value: value for key, value in root.value}
 
 
@@ -67,6 +74,15 @@ def _unknown(kind, why):
 
 
 def retirement_config(text):
+    # The entire filter is the boundary: scanner overflow and future failures
+    # must return a named hold, including failures after composing the YAML.
+    try:
+        return _retirement_config(text)
+    except Exception:
+        return _unknown("malformed", "The installed configuration cannot be decoded as the supported YAML subset.")
+
+
+def _retirement_config(text):
     # None is supplied only after a successful stat proves the file absent;
     # empty bytes or YAML null are installed content, not that observation.
     if text is None:
@@ -84,8 +100,6 @@ def retirement_config(text):
         cfg = _read_subset(text)
     except _OutsideSubset as exc:
         return _unknown("malformed", str(exc))
-    except (yaml.YAMLError, ValueError, TypeError, RecursionError):
-        return _unknown("malformed", "The installed configuration cannot be decoded as the supported YAML subset.")
     if "server" not in cfg:
         if "node" not in cfg:
             return _unknown("unreadable", "The installed configuration defines neither a server nor a node section.")

@@ -27,10 +27,13 @@ for name, text, kind, roles, locator in [
     ('package-seed', seed.read_bytes(), 'present', 'server', '/var/lib/billet/server'),
     ('node-only', 'node: {server_addr: control-b:7717}', 'present', 'node', ''),
     ('named-node-only', 'node: {name: x}', 'present', 'node', ''),
-    ('yaml-looking-text', 'note: "&anchor *alias << !tag"\nserver: {identity_dir: /srv/controller}', 'present', 'server', '/srv/controller'),
+    # KnownFields rejects note in Go. This is only a locator hint; section R
+    # requires independent service-manager proof before admitting this host.
+    ('unknown-field-locator-hint', 'note: "&anchor *alias << !tag"\nserver: {identity_dir: /srv/controller}', 'present', 'server', '/srv/controller'),
     ('yaml-looking-comment', '# &anchor *alias << !tag\nserver: {identity_dir: /srv/controller}', 'present', 'server', '/srv/controller'),
     ('quoted-locator', 'server: {identity_dir: "/srv/controller"}', 'present', 'server', '/srv/controller'),
     ('utf8', 'server: {identity_dir: /srv/contrôleur}'.encode('utf-8'), 'present', 'server', '/srv/contrôleur'),
+    ('yaml-1.1', b'%YAML 1.1\n---\nnode: {}\n', 'present', 'node', ''),
 ]:
     result = module.retirement_config(text)
     expected = dict(config=kind, roles=roles, identity_dir=locator)
@@ -64,6 +67,14 @@ holds = [
     ('undecodable', 'server: [', 'malformed', 'cannot be decoded'),
     ('invalid-utf8', b'server: {identity_dir: /srv/\xff}', 'malformed', 'UTF-8'),
     ('surrogate-text', 'server: {identity_dir: /srv/\udcff}', 'malformed', 'UTF-8'),
+    ('oversized-escape', b'node: {name: "\\UFFFFFFFF"}\n', 'malformed', 'cannot be decoded'),
+    ('yaml-1.0', b'%YAML 1.0\n---\nnode: {}\n', 'malformed', 'unsupported YAML version'),
+    ('yaml-1.2', b'%YAML 1.2\n---\nnode: {}\n', 'malformed', 'unsupported YAML version'),
+    ('yaml-1.2-locator', b'%YAML 1.2\n---\nserver: {identity_dir: /srv/clean}\n', 'malformed', 'unsupported YAML version'),
+    ('escaped-high-surrogate', b'node: {name: "\\uD800"}\n', 'malformed', 'decoded surrogate code point'),
+    ('escaped-low-surrogate', b'node: {name: "\\uDFFF"}\n', 'malformed', 'decoded surrogate code point'),
+    ('escaped-surrogate-key', b'node: {"\\uD800": value}\n', 'malformed', 'decoded surrogate code point'),
+    ('escaped-surrogate-sequence', b'node: {extra: ["\\uD800"]}\n', 'malformed', 'decoded surrogate code point'),
     ('utf16', 'server: {identity_dir: /srv/clean}'.encode('utf-16'), 'malformed', 'UTF-8'),
     ('empty', '', 'malformed', 'single YAML document'),
     ('null', 'null', 'malformed', 'root is not a mapping'),
@@ -91,4 +102,16 @@ for name, text, kind, reason in holds:
         sys.exit('%s: %r, want %r' % (name, result, expected))
     if reason not in result.get('why', ''):
         sys.exit('%s: %r does not name %r' % (name, result, reason))
+
+# Future exceptions after parsing must cross the same boundary as scanner
+# overflow. A broken helper must never turn into an Ansible templating error.
+original_reader = module._read_subset
+try:
+    module._read_subset = lambda text: None
+    result = module.retirement_config('node: {}')
+finally:
+    module._read_subset = original_reader
+if result != dict(config='malformed', roles='unknown', identity_dir='',
+                  why='The installed configuration cannot be decoded as the supported YAML subset.'):
+    sys.exit('unexpected post-parse failure did not return the named hold: %r' % result)
 print('ok   retirement locator: restricted YAML, named holds and locator precedence')

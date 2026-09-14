@@ -27,6 +27,10 @@ cat >"$work/play-retirement.yml" <<'PLAY'
       ansible.builtin.set_fact:
         billet_exclusion_answerer_version: "{{ billet_gate_version }}"
       when: billet_gate_version is defined
+    - name: Select the retirement compatibility platform after preparation
+      ansible.builtin.set_fact:
+        billet_exclusion_platform: "{{ billet_gate_retirement_platform }}"
+      when: billet_gate_retirement_platform is defined
     # The two inventory transports share this namespace's real prepared guard.
     # Publish that observation on the survivor for the fake row helper; fleet
     # preparation across separate hosts is the fleet playbook's gate.
@@ -69,10 +73,42 @@ cat >"$work/play-retirement-main.yml" <<'PLAY'
     - junioryono.billet.host
 PLAY
 
+# The existing service fake returns only requested properties, without judging
+# admission. This map adds no installed unit files to the namespace.
+r_compat_unit() { # case state
+  mkdir -p "$work/cases/$1/services"
+  "$python" - "$work/cases/$1/services/control-a.json" "$2" <<'PYUNIT'
+import json, sys
+unit = dict(LoadState='loaded', UnitFileState='disabled', ActiveState='inactive', MainPID='0')
+state = sys.argv[2]
+if state == 'not-found':
+    unit.update(LoadState='not-found', UnitFileState='')
+elif state == 'masked':
+    unit.update(LoadState='masked', UnitFileState='masked')
+elif state == 'enabled':
+    unit['UnitFileState'] = 'enabled'
+elif state == 'active':
+    unit['ActiveState'] = 'active'
+elif state == 'live':
+    unit.update(UnitFileState='enabled', ActiveState='active', MainPID='42')
+elif state == 'pid':
+    unit['MainPID'] = '42'
+elif state == 'unreadable':
+    del unit['MainPID']  # The fake exits nonzero after returning partial output.
+elif state.startswith('unknown-'):
+    unit[state.removeprefix('unknown-')] = 'invented'
+elif state != 'disabled':
+    sys.exit('unknown compatibility service case: ' + state)
+with open(sys.argv[1], 'w') as stream:
+    json.dump({'billet-server.service': unit}, stream)
+PYUNIT
+  e "$1" "BILLET_GATE_SERVICES=$work/cases/$1/services"
+}
 r_plant() { # case [version]
   plant "$1"
+  r_compat_unit "$1" not-found
   p "$1" "plant_root; plant_managed ${2:-v0.11.0}"
-  a "$1" -e billet_exclusion_platform=Linux -e billet_binary_src=
+  a "$1" -e billet_binary_src=
   e "$1" BILLET_GATE_RETIRE_ENV_SET=1
   e "$1" "BILLET_GATE_ANSWER=release:1:$here/fixtures/release-inspect/postgres-controller-guarded.json;release:2:$here/fixtures/release-inspect/postgres-controller-guarded.json"
 }
@@ -267,6 +303,98 @@ for policy in true false; do
   done
 done
 
+# Neither a clean node configuration nor a never-commissioned observation
+# grants permission while the manager cannot positively exclude a controller.
+# The unknown note field is rejected by Go's KnownFields decoder; Python is
+# deliberately allowed to extract its locator as a hint only.
+for shape in node fresh seeded unknown-field; do
+  for unit in not-found disabled enabled active unreadable; do
+    name=r8-unit-$shape-$unit
+    r_plant "$name" v0.10.1
+    r_compat_unit "$name" "$unit"
+    p "$name" 'mkdir -p /etc/billet /var/lib/billet/server'
+    case "$shape" in
+      node) p "$name" 'printf "node: {name: x}\n" >/etc/billet/billet.yaml' ;;
+      seeded) p "$name" 'printf "server: {state_dir: /var/lib/billet/server, max_vcpu: 0}\n" >/etc/billet/billet.yaml' ;;
+      unknown-field) p "$name" 'printf "note: \"&anchor *alias << !tag\"\nserver: {identity_dir: /var/lib/billet/server}\n" >/etc/billet/billet.yaml' ;;
+    esac
+    r_run "$name"
+    expect_calls "$name" systemctl 'show billet-server.service --property=LoadState,UnitFileState,ActiveState,MainPID' 1
+    expect_host_commands "$name" ''
+    expect_no_task "$name" 'Ask the retirement classifier'
+    case "$unit" in
+      not-found|disabled)
+        expect_allowed "$name"
+        expect_play_task_ran "$name" 'Ordinary convergence sentinel'
+        r_reported "$name" ordinary 'the service manager proved no controller runs here' ;;
+      *)
+        expect_refused "$name" 'Refuse a held or unavailable retirement route' 'Retirement holds this host (hold)'
+        if [ "$unit" = unreadable ]; then
+          expect_final "$name" 'systemctl show read failed or was unreadable'
+        else
+          expect_final "$name" 'billet-server.service does not prove no controller'
+        fi
+        expect_no_ordinary "$name"
+        expect_no_play_task "$name" 'Ordinary convergence sentinel' ;;
+    esac
+  done
+done
+
+# Isolate each property, and include a live enabled controller beside clean
+# node-only bytes. Its service state vetoes any installed-byte interpretation.
+for unit in masked pid live unknown-LoadState unknown-UnitFileState unknown-ActiveState unknown-MainPID; do
+  name=r8-unit-node-$unit
+  r_plant "$name" v0.10.1
+  r_compat_unit "$name" "$unit"
+  p "$name" 'mkdir -p /etc/billet; printf "node: {name: x}\n" >/etc/billet/billet.yaml'
+  r_run "$name"
+  expect_calls "$name" systemctl 'show billet-server.service --property=LoadState,UnitFileState,ActiveState,MainPID' 1
+  expect_host_commands "$name" ''
+  if [ "$unit" = masked ]; then
+    expect_allowed "$name"
+    expect_play_task_ran "$name" 'Ordinary convergence sentinel'
+  else
+    expect_refused "$name" 'Refuse a held or unavailable retirement route' 'billet-server.service does not prove no controller'
+    expect_no_ordinary "$name"
+    expect_no_play_task "$name" 'Ordinary convergence sentinel'
+  fi
+done
+
+for shape in node fresh; do
+  name=r8-unit-$shape-darwin
+  r_plant "$name" v0.10.1
+  a "$name" -e billet_gate_retirement_platform=Darwin
+  if [ "$shape" = node ]; then
+    p "$name" 'mkdir -p /etc/billet; printf "node: {name: x}\n" >/etc/billet/billet.yaml'
+  fi
+  r_run "$name"
+  expect_refused "$name" 'Refuse a held or unavailable retirement route' 'retirement is Linux-only'
+  expect_calls "$name" systemctl 'show billet-server.service --property=LoadState,UnitFileState,ActiveState,MainPID' 0
+  expect_host_commands "$name" ''
+  expect_no_ordinary "$name"
+  expect_no_play_task "$name" 'Ordinary convergence sentinel'
+done
+
+for unit in disabled active; do
+  name=r9-unit-node-$unit
+  r_plant "$name" v0.10.1
+  r_compat_unit "$name" "$unit"
+  a "$name" --check
+  p "$name" 'mkdir -p /etc/billet; printf "node: {name: x}\n" >/etc/billet/billet.yaml'
+  r_run "$name"
+  expect_allowed "$name"
+  expect_calls "$name" systemctl 'show billet-server.service --property=LoadState,UnitFileState,ActiveState,MainPID' 1
+  expect_host_commands "$name" ''
+  if [ "$unit" = disabled ]; then
+    r_reported "$name" ordinary
+    expect_play_task_ran "$name" 'Ordinary convergence sentinel'
+  else
+    r_reported "$name" hold 'billet-server.service does not prove no controller'
+    expect_no_ordinary "$name"
+    expect_no_play_task "$name" 'Ordinary convergence sentinel'
+  fi
+done
+
 # An unknown route must traverse the caller's rescue and ordinary boundary,
 # not only R7's parser harness. Corrupt a case-local copy, never the corpus.
 r_plant r7-caller-unknown-route
@@ -304,7 +432,7 @@ r_reported r7-caller-unknown-state hold "$reason"
 
 # Package seeds locate before semantic validation. Outside-subset content
 # holds even beside a clean path; an account-dependent default is unknown.
-# A missing server establishes node-only only beside a node mapping.
+# A missing server gives a node-only hint only beside a node mapping.
 for shape in merged cyclic false sequence null integer malformed duplicate state-no-locator default null-state-default empty-mapping null-node node-only seeded; do
   name=r8-config-$shape
   r_plant "$name" v0.10.1

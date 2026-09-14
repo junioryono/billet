@@ -1,6 +1,13 @@
 ---
 # These are retirement.Root's paths, not children of billet_upgrade_root.
 # Absence is a veto lifted, never proof that a shared reservation is absent.
+# Python's roles and locator are hints: KnownFields and typed Go decoding can
+# reject configurations this reader accepts. Both admissions also require the
+# service manager's positive evidence that no controller runs here.
+# Accepted pre-release residual: a controller whose server unit is disabled and
+# stopped, whose installed configuration Go cannot decode, and whose identity
+# lives at a custom location can still be admitted. This is the same shape as
+# the Go classifier's accepted residual for an undecodable configuration.
 - name: Screen the three fixed retirement artefacts
   ansible.builtin.stat:
     path: "{{ item }}"
@@ -25,6 +32,38 @@
       identity_dir: ''
       why: The installed configuration could not be examined or read as a regular file.
     billet_retirement_identity_clear: false
+    billet_retirement_server_clear: false
+
+- name: Read the server unit for retirement compatibility
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - show
+      - billet-server.service
+      - --property=LoadState,UnitFileState,ActiveState,MainPID
+    expand_argument_vars: false
+  register: billet_retirement_server_unit
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  become: true
+  when: billet_exclusion_platform == 'Linux'
+
+# Compare complete property lines without trimming, coercing or collapsing
+# duplicate properties. A missing property or an unknown word is not proof.
+- name: Require positive service-manager evidence of no controller
+  ansible.builtin.set_fact:
+    billet_retirement_server_clear: >-
+      {{ billet_retirement_server_unit.stdout_lines | sort in
+         [(['LoadState=not-found', 'UnitFileState=', 'ActiveState=inactive', 'MainPID=0'] | sort),
+          (['LoadState=loaded', 'UnitFileState=disabled', 'ActiveState=inactive', 'MainPID=0'] | sort),
+          (['LoadState=loaded', 'UnitFileState=masked', 'ActiveState=inactive', 'MainPID=0'] | sort),
+          (['LoadState=masked', 'UnitFileState=disabled', 'ActiveState=inactive', 'MainPID=0'] | sort),
+          (['LoadState=masked', 'UnitFileState=masked', 'ActiveState=inactive', 'MainPID=0'] | sort)] }}
+  when:
+    - billet_exclusion_platform == 'Linux'
+    - billet_retirement_server_unit.rc | default(-1) == 0
+    - billet_retirement_server_unit.stdout_lines is defined
 
 - name: Keep every present or unexamined artefact as a veto
   ansible.builtin.set_fact:
@@ -110,22 +149,40 @@
   ansible.builtin.set_fact:
     billet_retirement_why: >-
       Retirement compatibility holds: {{ billet_retirement_installed.why }}
-      The installed configuration establishes neither a controller identity path nor a node-only host.
+      The installed configuration provides neither a usable controller identity hint nor a node-only hint.
   when:
     - billet_retirement_screen_clear | bool
     - billet_retirement_installed.config in ['malformed', 'unreadable']
 
-- name: Admit only a positively node-only or never-commissioned host
+- name: Hold compatibility without service-manager proof
+  ansible.builtin.set_fact:
+    billet_retirement_why: >-
+      Retirement compatibility holds:
+      {% if billet_exclusion_platform != 'Linux' %}
+      retirement is Linux-only; no systemd controller-absence proof is available on {{ billet_exclusion_platform }}.
+      {% elif billet_retirement_server_unit.rc | default(-1) != 0 or billet_retirement_server_unit.stdout_lines is not defined %}
+      the billet-server.service systemctl show read failed or was unreadable (rc {{ billet_retirement_server_unit.rc | default('missing') }}).
+      {% else %}
+      billet-server.service does not prove no controller: {{ billet_retirement_server_unit.stdout_lines | join(', ') }}.
+      Require LoadState=not-found, or a loaded/masked unit with UnitFileState=disabled or masked, ActiveState=inactive and MainPID=0; missing, duplicate or unknown properties hold.
+      {% endif %}
+  when:
+    - billet_retirement_screen_clear | bool
+    - not billet_retirement_server_clear | bool
+
+- name: Admit compatibility only with configuration hints and service-manager proof
   ansible.builtin.set_fact:
     billet_retirement_route: ordinary
     billet_retirement_bypass: false
     billet_retirement_why: >-
-      The incapable-answerer compatibility screen proved this host
-      {{ 'node-only' if billet_retirement_installed.roles == 'node' else 'never commissioned' }}.
+      The incapable-answerer compatibility screen found
+      {{ 'node-only hints' if billet_retirement_installed.roles == 'node' else 'never-commissioned evidence at the hinted locator' }}
+      and the service manager proved no controller runs here.
   when:
     - not billet_server_retire | bool
     - not billet_retirement_legacy | bool
     - billet_retirement_screen_clear | bool
+    - billet_retirement_server_clear | bool
     - >-
       billet_retirement_answerer | length == 0 or
       (billet_exclusion_answerer_version.type | default('') == 'release' and
