@@ -807,3 +807,40 @@ func TestEquivalentOffersReserveAndConsumeOnePromise(t *testing.T) {
 		})
 	}
 }
+
+func TestAResolvedRedeliveryKeepsItsStatisticsForTheNextReconciliation(t *testing.T) {
+	tiers := []config.Tier{tier("work")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 3 * tierVCPU, MaxMemory: 64 * config.GiB}, tiers)
+	var acknowledged []int64
+	session := &fakeSession{onDelete: func(id int64) error { acknowledged = append(acknowledged, id); return nil }}
+	l := NewListener(a, tiers[0].Label, session, WithRunner(&fakeRunner{}))
+	if err := l.refillEscrowTo(t.Context(), 3); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.acquire(t.Context(), []Job{
+		{RequestID: 11, JobID: "J", RunID: 101}, {RequestID: 12, JobID: "J", RunID: 102},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stale := &Statistics{}
+	l.observed = stale
+	err := l.handle(t.Context(), &Message{MessageID: 42, Statistics: &Statistics{TotalAssignedJobs: 1},
+		Completed: []Job{{JobID: "J", Result: "Cancelled"}}})
+	if poison, ok := errors.AsType[*poisonedMessageError](err); !ok || !poison.held {
+		t.Fatalf("first delivery = %v, want a hold", err)
+	}
+	if l.observed != stale || !l.messageHeld() {
+		t.Fatalf("held delivery: observed %+v, held %v", l.observed, l.messageHeld())
+	}
+
+	l.unreserve([]int64{12})
+	current := &Statistics{TotalAssignedJobs: 1}
+	if err := l.handle(t.Context(), &Message{MessageID: 42, Statistics: current,
+		Completed: []Job{{JobID: "J", Result: "Cancelled"}}}); err != nil {
+		t.Fatalf("redelivery that no longer holds: %v", err)
+	}
+	if l.observed != current || l.messageHeld() || !slices.Equal(acknowledged, []int64{42}) || l.lastMessageID != 42 {
+		t.Fatalf("resolved redelivery: observed %+v, held %v, acknowledged %v, cursor %d",
+			l.observed, l.messageHeld(), acknowledged, l.lastMessageID)
+	}
+}
