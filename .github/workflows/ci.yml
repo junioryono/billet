@@ -337,7 +337,7 @@ jobs:
 
   host-lifecycle:
     runs-on: billet-8vcpu-ubuntu-2404
-    # FIVE GROUPS. The twenty gates ran serially in one job at 18
+    # SIX GROUPS. The twenty gates ran serially in one job at 18
     # minutes on the last green main run (measured 2026-09-11: the dry-run
     # policy gate 255 s, the pinned-release fetch 166 s, the key-policy gate
     # 164 s, the emitted-block converge 107 s, the cloudflared gate 97 s, and
@@ -346,14 +346,16 @@ jobs:
     # run 34819012996 on 6e7869b (2026-09-14) started guard at 08:16:14Z,
     # reached endpoint at 08:48:41Z and retirement at 09:01:13Z, then was
     # cancelled at 09:01:31Z by the 45-minute cap after four R7 cases. Every
-    # guard and endpoint case passed. Retirement therefore has its own group;
-    # setup runs in all five groups because each is a fresh guest.
+    # guard and endpoint case passed, but removing retirement alone leaves
+    # guard within seconds of the cap. Endpoint took 12m32s, so endpoint and
+    # retirement each have their own group; guard skips both. Setup runs in
+    # all six groups because each is a fresh guest.
     # Batching compatible cases into one playbook launch inside the gates is
     # the deeper follow-up, as the timeout's comment already says.
     strategy:
       fail-fast: false
       matrix:
-        group: [policy, roles, guard, shape, retirement]
+        group: [policy, roles, guard, shape, retirement, endpoint]
     name: host-lifecycle (${{ matrix.group }})
     # Sized from what the gates measurably take: the run was cancelled at 15
     # minutes after the two connector gates and the fleet gate joined it
@@ -497,7 +499,14 @@ jobs:
         if: matrix.group == 'guard'
         env:
           BILLET_GATE_REQUIRE_ROOT: "1"
-          BILLET_GATE_SKIP: retirement
+          BILLET_GATE_SKIP: endpoint,retirement
+        run: make converge-guard-check
+
+      - name: Prove the endpoint decision, migration and receipt entries
+        if: matrix.group == 'endpoint'
+        env:
+          BILLET_GATE_REQUIRE_ROOT: "1"
+          BILLET_GATE_ONLY: endpoint
         run: make converge-guard-check
 
       - name: Prove the retirement parser and caller routes

@@ -90,12 +90,18 @@ case "${BILLET_GATE_ONLY:-}" in
   ""|endpoint|retirement) ;;
   *) fail "unknown BILLET_GATE_ONLY=${BILLET_GATE_ONLY}; expected endpoint or retirement" ;;
 esac
+skip_endpoint=0
+skip_retirement=0
 case "${BILLET_GATE_SKIP:-}" in
-  ""|retirement) ;;
-  *) fail "unknown BILLET_GATE_SKIP=${BILLET_GATE_SKIP}; expected retirement" ;;
+  "") ;;
+  endpoint) skip_endpoint=1 ;;
+  retirement) skip_retirement=1 ;;
+  endpoint,retirement|retirement,endpoint) skip_endpoint=1; skip_retirement=1 ;;
+  *) fail "invalid BILLET_GATE_SKIP=${BILLET_GATE_SKIP}; expected endpoint and/or retirement, comma-separated with no empty or repeated member" ;;
 esac
-if [ "${BILLET_GATE_ONLY:-}" = retirement ] && [ "${BILLET_GATE_SKIP:-}" = retirement ]; then
-  fail "BILLET_GATE_ONLY=retirement contradicts BILLET_GATE_SKIP=retirement"
+if { [ "${BILLET_GATE_ONLY:-}" = endpoint ] && [ "$skip_endpoint" = 1 ]; } ||
+   { [ "${BILLET_GATE_ONLY:-}" = retirement ] && [ "$skip_retirement" = 1 ]; }; then
+  fail "BILLET_GATE_ONLY=${BILLET_GATE_ONLY} contradicts BILLET_GATE_SKIP=${BILLET_GATE_SKIP}"
 fi
 sections_ran="shared checks"
 
@@ -1346,7 +1352,16 @@ done
 rm -rf /var/lib/billet
 . "$NSLIB"
 if [ -s "$case_dir/plant.sh" ]; then
-  if ! (set -e; . "$case_dir/plant.sh"); then echo "plant failed" >"$case_dir/state"; exit 94; fi
+  # A conditional subshell suppresses errexit even after set -e. A new bash
+  # keeps it active; source the helpers there and pass the runner's locals.
+  if ! /bin/bash -eu -c '
+    case_dir=$1; mode=$2; play=$3
+    . "$NSLIB"
+    . "$case_dir/plant.sh"
+  ' billet-gate-plant "$case_dir" "$mode" "$play"; then
+    echo "plant failed" >"$case_dir/state"
+    exit 94
+  fi
 fi
 : >"$case_dir/log"; : >"$case_dir/private"; : >"$case_dir/out"
 mkdir -p "$case_dir/calls"
@@ -1534,10 +1549,12 @@ LEGACY_DIR=20260909T120000000000000
 
 # BILLET_GATE_ONLY=endpoint or retirement selects that section after shared
 # setup and the namespace launch probe (endpoint also runs the plain guard
-# and simulated-darwin cases). BILLET_GATE_SKIP=retirement omits section R;
-# CI uses it for guard and BILLET_GATE_ONLY=retirement for its separate group.
+# and simulated-darwin cases). BILLET_GATE_SKIP is a comma-separated list of
+# endpoint and/or retirement, omitting E and/or R. CI's guard group skips
+# endpoint,retirement; each has its own group with BILLET_GATE_ONLY set.
 # Neither set runs every section, as make converge-guard-check does locally.
-# Unknown values and selecting and skipping retirement together are refused.
+# Unknown values, empty or repeated list members, and selecting and skipping
+# the same section together are refused. An unset or empty SKIP omits nothing.
 if [ "${BILLET_GATE_ONLY:-}" != endpoint ] && [ "${BILLET_GATE_ONLY:-}" != retirement ]; then
 
 # =============================================================================
@@ -2833,7 +2850,7 @@ ep_plant_ordinary() { # case installed-addr desired-addr [installed-shape] [desi
 # same and answering `unchanged`, the refresh `current` under the holder it
 # was written under; nothing stopped, no tempfile, the ordinary restart's
 # gate open.
-if [ "${BILLET_GATE_ONLY:-}" != retirement ]; then
+if [ "${BILLET_GATE_ONLY:-}" != retirement ] && [ "$skip_endpoint" = 0 ]; then
 ep_plant_ordinary e1-unchanged $EP_A $EP_A
 e e1-unchanged "BILLET_GATE_ANSWER=migrate-endpoint:1:$(ep_fixture e1-unchanged node-migrate-endpoint reported-unplanned.json);migrate-endpoint:2:$(ep_fixture e1-unchanged node-migrate-endpoint unchanged.json);receipt:1:$(ep_fixture e1-unchanged node-receipt current.json)"
 ep_case e1-unchanged
@@ -3190,6 +3207,8 @@ expect_refused e11d-current-null-node "Judge the migration's answer" "answered w
 echo "ok   E11: a current receipt keeps a holder that is one (by the command's grammar), a written receipt carries this run's, evidence mode never answers current, and an unchanged current answer names its node"
 sections_ran="$sections_ran, endpoint (E)"
 
+else
+  echo "converge guard: endpoint (E) skipped"
 fi
 
 # =============================================================================
@@ -3197,7 +3216,7 @@ fi
 # New requests and cancellation follow in 5c.d. A corruption starts from HEAD's committed producer bytes, never a
 # harvested worktree fixture and never an answer assembled by the gate.
 # =============================================================================
-if [ "${BILLET_GATE_ONLY:-}" != endpoint ] && [ "${BILLET_GATE_SKIP:-}" != retirement ]; then
+if [ "${BILLET_GATE_ONLY:-}" != endpoint ] && [ "$skip_retirement" = 0 ]; then
 mkdir -p "$work/retire-fixtures"
 git -C "$repo_root" ls-tree -r --name-only HEAD -- ansible_collections/junioryono/billet/tests/fixtures/server-retire/ >"$work/retire-fixture-list"
 [ -s "$work/retire-fixture-list" ] || fail "HEAD carries no retirement fixtures"
