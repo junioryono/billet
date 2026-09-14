@@ -3122,7 +3122,8 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 	// after a completion has retired or been superseded by a newer delivery.
 	finished := make([]actualJobIdentity, 0, len(resolved.completed))
 	completed := make([]Job, 0, len(resolved.completed))
-	for _, entry := range resolved.completed {
+	for i := range resolved.completed {
+		entry := &resolved.completed[i]
 		if containsActual(resolved.held, entry.actual) {
 			continue
 		}
@@ -3270,7 +3271,8 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 		assignmentDeficit = max(msg.Statistics.TotalAssignedJobs-active, 0)
 	}
 	// Assignment filtering follows resolveActualJob, never the cleanup request.
-	for _, entry := range resolved.assigned {
+	for i := range resolved.assigned {
+		entry := &resolved.assigned[i]
 		job := entry.job
 		if containsActual(finished, entry.actual) || containsActual(resolved.held, entry.actual) {
 			continue
@@ -3280,7 +3282,7 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 			continue
 		}
 
-		lease, needsCompute, err := l.assignResolved(ctx, entry)
+		lease, needsCompute, err := l.assignResolved(ctx, *entry)
 		if err != nil {
 			return err
 		}
@@ -3747,7 +3749,8 @@ func (l *Listener) acquireUnfinished(ctx context.Context, available []resolvedJo
 
 	committed := l.currentCommitments(commitments)
 	eligible := make([]resolvedJob, 0, len(available))
-	for _, entry := range available {
+	for i := range available {
+		entry := &available[i]
 		if containsActual(held, entry.actual) {
 			continue
 		}
@@ -3755,12 +3758,13 @@ func (l *Listener) acquireUnfinished(ctx context.Context, available []resolvedJo
 			l.forgetAvailable(entry.actual)
 			continue
 		}
-		eligible = append(eligible, entry)
+		eligible = append(eligible, *entry)
 	}
 	protocolFor := make(map[int64]int64, len(available))
 	internalFor := make(map[int64]int64, len(available))
 	offerFor := make(map[int64]actualJobIdentity, len(available))
-	for _, entry := range eligible {
+	for i := range eligible {
+		entry := &eligible[i]
 		protocolID := entry.protocolID
 		job := entry.job
 		protocolFor[job.RequestID] = protocolID
@@ -3773,18 +3777,19 @@ func (l *Listener) acquireUnfinished(ctx context.Context, available []resolvedJo
 	}
 	// Validate every wire offer before coalescing acquisition representatives.
 	identified := make([]resolvedJob, 0, len(eligible))
-	for _, entry := range eligible {
+	for e := range eligible {
+		entry := &eligible[e]
 		if i := slices.IndexFunc(identified, func(prior resolvedJob) bool {
 			return sameActualJob(prior.actual, entry.actual)
 		}); i >= 0 {
 			identified[i].actual = mergeActual(identified[i].actual, entry.actual)
 			continue
 		}
-		identified = append(identified, entry)
+		identified = append(identified, *entry)
 	}
-	for _, entry := range identified {
-		protocolFor[entry.job.RequestID] = entry.protocolID
-		offerFor[entry.protocolID] = entry.actual
+	for i := range identified {
+		protocolFor[identified[i].job.RequestID] = identified[i].protocolID
+		offerFor[identified[i].protocolID] = identified[i].actual
 	}
 
 	// THE TURN MUST STILL BELONG TO THIS TIER WHEN ESCROW BECOMES A PROMISE.

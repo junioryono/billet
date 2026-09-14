@@ -268,7 +268,8 @@ func (l *Listener) rememberAvailable(msg *Message, resolved resolvedMessage) {
 		l.waitingOffers = nil
 	}
 	committed := l.currentCommitments(resolved.committed)
-	for _, entry := range resolved.available {
+	for i := range resolved.available {
+		entry := &resolved.available[i]
 		// Commitment comparisons use resolveActualJob's canonical aliases.
 		if containsActual(committed, entry.actual) {
 			continue
@@ -282,11 +283,11 @@ func (l *Listener) rememberAvailable(msg *Message, resolved resolvedMessage) {
 		l.forgetAvailable(actual)
 		l.waitingOffers = append(l.waitingOffers, actual)
 	}
-	for _, entry := range resolved.assigned {
-		l.forgetAvailable(entry.actual)
+	for i := range resolved.assigned {
+		l.forgetAvailable(resolved.assigned[i].actual)
 	}
-	for _, entry := range resolved.completed {
-		l.forgetAvailable(entry.actual)
+	for i := range resolved.completed {
+		l.forgetAvailable(resolved.completed[i].actual)
 	}
 }
 

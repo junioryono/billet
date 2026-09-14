@@ -323,7 +323,7 @@ func TestAmbiguousCompletionQuarantinesWithoutSelectingARun(t *testing.T) {
 				Completed: []Job{{RequestID: requestID, JobID: "J", Result: "Cancelled"},
 					{RequestID: first, JobID: "J", RunID: first + 90, Result: "Cancelled"}},
 			})
-			if _, ok := errors.AsType[*poisonedMessageError](err); !ok || !errors.Is(err, errQuarantinableCompletion) {
+			if poison, ok := errors.AsType[*poisonedMessageError](err); !ok || poison == nil || !errors.Is(err, errQuarantinableCompletion) {
 				t.Fatalf("request %d, first %d: handle = %v, want quarantinable poison", requestID, first, err)
 			}
 			if len(destroyed) != 0 || acknowledged || !slices.Equal(launched, []int64{21}) {

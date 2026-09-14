@@ -316,8 +316,8 @@ func (l *Listener) resolveMessage(ctx context.Context, msg *Message) (resolvedMe
 	}{
 		{msg.Assigned, &out.assigned}, {msg.Available, &out.available},
 	} {
-		for _, job := range jobs.wire {
-			resolved, err := l.resolveActualJob(ctx, job, resolveAcquisition, known)
+		for i := range jobs.wire {
+			resolved, err := l.resolveActualJob(ctx, jobs.wire[i], resolveAcquisition, known)
 			if err != nil {
 				return out, err
 			}
@@ -325,7 +325,8 @@ func (l *Listener) resolveMessage(ctx context.Context, msg *Message) (resolvedMe
 			known = append(known, resolved.actual)
 		}
 	}
-	for _, job := range msg.Completed {
+	for i := range msg.Completed {
+		job := msg.Completed[i]
 		job.CompletionID = msg.MessageID
 		resolved, err := l.resolveActualJob(ctx, job, resolveCompletion, known)
 		if err != nil {
@@ -345,8 +346,8 @@ func (l *Listener) resolveMessage(ctx context.Context, msg *Message) (resolvedMe
 // resolveCommitments snapshots ownership under l.mu and resolves outside it.
 func (l *Listener) resolveCommitments(ctx context.Context) ([]jobCommitment, error) {
 	l.mu.Lock()
-	var commitments []jobCommitment
-	var jobs []Job
+	commitments := make([]jobCommitment, 0, len(l.acquiring)+len(l.running))
+	jobs := make([]Job, 0, len(l.acquiring)+len(l.running))
 	for id, p := range l.acquiring {
 		job := p.job
 		job.RequestID = id
@@ -364,8 +365,8 @@ func (l *Listener) resolveCommitments(ctx context.Context) ([]jobCommitment, err
 		commitments = append(commitments, jobCommitment{actual: actual, key: id, lease: lease})
 	}
 	l.mu.Unlock()
-	for i, job := range jobs {
-		resolved, err := l.resolveActualJob(ctx, job, resolveCommitment, nil)
+	for i := range jobs {
+		resolved, err := l.resolveActualJob(ctx, jobs[i], resolveCommitment, nil)
 		if err != nil {
 			return nil, err
 		}
