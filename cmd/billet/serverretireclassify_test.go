@@ -376,9 +376,10 @@ func TestTheDryRunReconcilesAJournalSelectedRouteAtTheClose(t *testing.T) {
 
 			out, code = f.run(t, "", "--dry-run", "--retiring-host", "control-a")
 			want, why, finalState := "hold", "changed transition or variant", string(retirement.PhaseIntent)
-			if change == "disappearance" {
+			switch change {
+			case "disappearance":
 				why, finalState = "journal disappeared", stateNothingRetire
-			} else if change == "advance" {
+			case "advance":
 				want, why, finalState = "continue", "readable journal", string(retirement.PhaseStopped)
 			}
 			m := assertRetireRoute(t, out, code, want, why)
@@ -2029,7 +2030,7 @@ func retireBinaryRecoveryFixture(t *testing.T, legacy bool) (*retireFixture, str
 	writeFile(t, filepath.Join(recovery, "billet.previous"), mustRead(t, f.guard.binary), 0o755)
 	writeFile(t, filepath.Join(recovery, "billet.yaml.previous"), mustRead(t, f.cfg), 0o600)
 	for _, unit := range []string{"billet-server.service", "billet-node.service"} {
-		writeFile(t, filepath.Join(recovery, unit+".previous"), mustRead(t, filepath.Join("../../deploy", unit)), 0o600)
+		writeFile(t, filepath.Join(recovery, unit+".previous"), mustRead(t, filepath.Join("..", "..", "deploy", unit)), 0o600)
 	}
 	if legacy {
 		writeFile(t, f.guard.active(), recovery+"\n", 0o600)

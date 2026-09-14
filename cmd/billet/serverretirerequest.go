@@ -431,9 +431,9 @@ func annotateRetireState(r *retireRefusal, absent string) *retireRefusal {
 // a transition whose record has vanished under it, that is not something to
 // state.
 func retireHostState(absent string) string {
-	_, _, state := retireHostObservation(absent)
+	_, _, held := retireHostObservation(absent)
 
-	return state
+	return held
 }
 
 // retireHostObservation is retireHostState with the journal it read kept, for
