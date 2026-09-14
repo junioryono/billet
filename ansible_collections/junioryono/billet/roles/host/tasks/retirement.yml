@@ -1,6 +1,7 @@
 ---
 # Only the classifier's route selects work. Its other members are operands;
-# route_why is printed whole for a person and is never parsed.
+# route_why is printed whole for a person and is never parsed. The unverified
+# check-mode preview below carries no classifier answer or mutation permission.
 - name: Reset retirement's entry facts to a hold
   ansible.builtin.set_fact:
     billet_retirement_bypass: true
@@ -53,9 +54,28 @@
                   and billet_exclusion_answerer_version.value | default('') is match('^v[0-9]+\.[0-9]+\.[0-9]+\Z')
                   and (billet_exclusion_answerer_version.value is version(billet_retire_capability_floor, '>=')))) }}
 
+- name: Identify the ordinary preview whose candidate check mode did not stage
+  ansible.builtin.set_fact:
+    billet_retirement_check_preview: >-
+      {{ ansible_check_mode
+         and not billet_retirement_capable | bool
+         and not billet_retirement_legacy | bool
+         and billet_retirement_answerer | length == 0
+         and billet_exclusion_candidate_unstaged | default(false) | bool }}
+
+- name: Mark the retirement route unverified for the ordinary preview
+  ansible.builtin.set_fact:
+    billet_retirement_route: unverified-check-mode
+    billet_retirement_why: >-
+      The retirement route is unverified in check mode because preparation does
+      not stage the candidate answerer. A real run classifies with the staged
+      candidate before choosing host work. Previewing ordinary tasks may differ
+      from that classified route.
+  when: billet_retirement_check_preview | bool
+
 - name: Hold compatibility without a capable classifier
   ansible.builtin.include_tasks: retirement-compatibility.yml
-  when: not billet_retirement_capable | bool
+  when: not billet_retirement_capable | bool and not billet_retirement_check_preview | bool
 
 - name: Observe the classifier's installed environment
   when: billet_retirement_capable | bool
@@ -115,15 +135,15 @@
         billet_retirement_route: hold
         billet_retirement_why: "{{ ansible_failed_result.msg | default('The retirement classifier did not answer.') }}"
 
-- name: Admit the ordinary route
+- name: Admit the ordinary route or its unverified check-mode preview
   ansible.builtin.set_fact:
     billet_retirement_bypass: false
-  when: billet_retirement_route == 'ordinary'
+  when: billet_retirement_route == 'ordinary' or billet_retirement_check_preview | bool
 
 - name: Close the ordinary boundary on every other route
   ansible.builtin.set_fact:
     billet_retirement_bypass: true
-  when: billet_retirement_route != 'ordinary'
+  when: billet_retirement_route != 'ordinary' and not billet_retirement_check_preview | bool
 
 - name: Report the retirement route
   ansible.builtin.debug:

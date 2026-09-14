@@ -41,6 +41,29 @@
     billet_node_should_run: >-
       {{ billet_enable_node and not (billet_server_prepare_only | default(false)) }}
 
+# Missing installation input must refuse before an absent classifier can hold.
+# Config shape and key presence remain behind retirement's ordinary boundary.
+- name: Inspect persisted billet installation inputs
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  register: billet_persisted_inputs
+  loop:
+    - /usr/bin/billet
+    - /etc/billet/app-private-key.pem
+    - /var/lib/billet/upgrades/active
+  check_mode: false
+  become: true
+
+- name: Validate the billet binary source before retirement routing
+  ansible.builtin.assert:
+    that:
+      - billet_binary_src | length > 0 or billet_version | length > 0 or billet_release_channel | length > 0 or billet_persisted_inputs.results[0].stat.exists
+    fail_msg: >-
+      A billet host needs a Linux billet binary.
+      Name the binary with billet_binary_src, or a release to fetch with
+      billet_version; an already-installed binary is enough on an ordinary
+      converging run, which therefore needs no secret input.
+
 - name: Route retirement before any ordinary host task
   ansible.builtin.import_tasks: retirement.yml
 
@@ -55,17 +78,6 @@
       ansible.builtin.import_tasks: service-account.yml
       vars:
         billet_service_account_site: early
-
-    - name: Inspect persisted billet installation inputs
-      ansible.builtin.stat:
-        path: "{{ item }}"
-      register: billet_persisted_inputs
-      loop:
-        - /usr/bin/billet
-        - /etc/billet/app-private-key.pem
-        - /var/lib/billet/upgrades/active
-      check_mode: false
-      become: true
 
     - name: Validate the billet host platform before journal inspection
       ansible.builtin.assert:
@@ -239,7 +251,6 @@
     - name: Validate billet host inputs
       ansible.builtin.assert:
         that:
-          - billet_binary_src | length > 0 or billet_version | length > 0 or billet_release_channel | length > 0 or billet_persisted_inputs.results[0].stat.exists
           - billet_config is mapping
           - billet_config | length > 0
           - not billet_ceph_bootstrap or billet_ceph_mon_ip | length > 0
@@ -249,10 +260,7 @@
           - "'.' not in (billet_networks | map(attribute='name') | list)"
           - "'..' not in (billet_networks | map(attribute='name') | list)"
         fail_msg: >-
-          A billet host needs a Linux billet binary and a complete billet_config.
-          Name the binary with billet_binary_src, or a release to fetch with
-          billet_version; an already-installed binary is enough on an ordinary
-          converging run, which therefore needs no secret input. Ceph bootstrap additionally
+          A billet host needs a complete billet_config. Ceph bootstrap additionally
           requires an explicit monitor address and device list; disks are never
           inferred. Guest bridge names must be unique Linux interface names of at
           most 15 characters and cannot contain path or control characters.

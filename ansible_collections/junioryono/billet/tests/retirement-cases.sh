@@ -83,7 +83,10 @@ cat >"$work/play-retirement.yml" <<'PLAY'
     - name: Prove the route left the bypass in its terminal state
       ansible.builtin.assert:
         that:
-          - billet_retirement_bypass is sameas (billet_retirement_route != 'ordinary')
+          - >-
+            billet_retirement_bypass is sameas
+            (billet_retirement_route != 'ordinary'
+             and not (ansible_check_mode and billet_retirement_route == 'unverified-check-mode'))
         fail_msg: The route left the ordinary boundary open.
 PLAY
 cat >"$work/play-retirement-main.yml" <<'PLAY'
@@ -304,7 +307,7 @@ if any(r['host'] != 'control-a' and r['command'] != 'retire-complete' for r in r
     sys.exit('a pending continuation collected the survivor fleet')
 PYTAIL
 
-# R8: all incapable or absent answerers hold, independent of desired policy,
+# R8: incapable or absent answerers without a candidate hold, independent of policy,
 # requested retirement, installed node-only bytes or a fresh-host shape.
 # v0.10.1 is explicitly below the complete-classifier floor, v0.11.0.
 # Check mode reports the same hold and succeeds, without ordinary work.
@@ -434,13 +437,87 @@ for spec in ordinary:dry-run-ordinary hold:dry-run-hold-unreadable-row continue:
   expect_no_task "$name" 'Inspect the transaction claim before recovery'
 done
 
+# R9: the same fresh host previews without a classifier in check mode, and
+# classifies through the candidate that real preparation stages in a real run.
+for mode in check normal; do
+  name=r9-fresh-candidate-$mode
+  r_plant "$name"
+  p "$name" 'rm /usr/bin/billet'
+  a "$name" -e "billet_binary_src=$bins/wrap-candidate-v0.11.0"
+  if [ "$mode" = check ]; then a "$name" --check; fi
+  r_answers "$name" 'control-a:classify:1:dry-run-ordinary-never-commissioned.json:0'
+  r_run "$name"
+  expect_allowed "$name"
+  expect_play_task_ran "$name" 'Ordinary convergence sentinel'
+  expect_state "$name" managed absent
+  expect_no_ordinary "$name"
+  expect_no_task "$name" 'Inspect the transaction claim before recovery'
+  if [ "$mode" = check ]; then
+    r_reported "$name" unverified-check-mode 'The retirement route is unverified in check mode'
+    r_reported "$name" unverified-check-mode 'A real run classifies with the staged candidate'
+    r_reported "$name" unverified-check-mode 'Previewing ordinary tasks may differ from that classified route.'
+    expect_host_commands "$name" ''
+    expect_no_task "$name" 'Ask the retirement classifier'
+    expect_no_task "$name" 'Stage the immutable candidate binary inside its recovery journal'
+    expect_calls "$name" candidate '' 0
+    expect_state "$name" active absent
+  else
+    r_reported "$name" ordinary
+    expect_ran "$name" 'Stage the immutable candidate binary inside its recovery journal'
+    expect_ran "$name" 'Ask the staged candidate to prepare'
+    expect_host_commands "$name" 'control-a retire-classify 1;'
+    expect_calls "$name" candidate 'server retire --dry-run' 1
+    expect_state "$name" record_preparing False
+  fi
+done
+
+# A newer candidate does not replace a managed answerer that carries the
+# guard. The managed version remains below the retirement floor in both modes.
+for mode in check normal; do
+  name=r8-managed-with-candidate-$mode
+  r_plant "$name" v0.10.1
+  a "$name" -e "billet_binary_src=$bins/wrap-candidate-v0.11.0"
+  if [ "$mode" = check ]; then a "$name" --check; fi
+  r_run "$name"
+  if [ "$mode" = check ]; then
+    expect_allowed "$name"
+    expect_no_task "$name" 'Stage the immutable candidate binary inside its recovery journal'
+  else
+    expect_refused "$name" 'Refuse a held or unavailable retirement route' 'Retirement holds this host (hold)'
+    expect_ran "$name" 'Stage the immutable candidate binary inside its recovery journal'
+  fi
+  r_reported "$name" hold 'This collection needs billet at or above v0.11.0 on the host'
+  expect_no_play_task "$name" 'Ordinary convergence sentinel'
+  expect_host_commands "$name" ''
+  expect_no_task "$name" 'Ask the retirement classifier'
+  expect_no_task "$name" 'Inspect the transaction claim before recovery'
+  expect_no_ordinary "$name"
+done
+
+# R8: the real entry refuses missing installation input BEFORE reporting any
+# retirement route. Its empty config must not become the first refusal either.
+for mode in check normal; do
+  name=r8-missing-source-$mode
+  r_plant "$name"
+  p "$name" 'rm /usr/bin/billet'
+  a "$name" -e billet_version= -e billet_release_channel=
+  if [ "$mode" = check ]; then a "$name" --check; fi
+  r_run "$name" play-retirement-main
+  expect_refused "$name" 'Validate the billet binary source before retirement routing' 'Name the binary with billet_binary_src'
+  expect_no_task "$name" 'Report the retirement route'
+  expect_no_task "$name" 'Ask the retirement classifier'
+  expect_no_task "$name" 'Inspect the transaction claim before recovery'
+  expect_host_commands "$name" ''
+  expect_no_ordinary "$name"
+done
+
 # Legacy verification must discard preparation's non-empty dry-run answerer.
 # The ordinary answer would open the sentinel if an unverified path survived.
 for kind in symlink other-owner group-writable not-executable verified; do
   name=r9-legacy-$kind
   r_plant "$name"
   p "$name" 'printf "%s\n" "$ROOT/recovery-20260909T120000-12345678" >"$ROOT/active"'
-  a "$name" --check -e "billet_gate_legacy_answerer=$kind"
+  a "$name" --check -e "billet_gate_legacy_answerer=$kind" -e "billet_binary_src=$bins/wrap-candidate-v0.11.0"
   r_answers "$name" 'control-a:classify:1:dry-run-ordinary.json:0'
   r_run "$name"
   expect_allowed "$name"
