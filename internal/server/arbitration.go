@@ -61,9 +61,9 @@ func identityOfOffer(job Job) offerIdentity {
 
 func newDiscoveryArbiter(tiers []config.Tier) *discoveryArbiter {
 	a := &discoveryArbiter{entries: make(map[string]discoveryEntry, len(tiers))}
-	for _, t := range tiers {
-		a.labels = append(a.labels, t.Label)
-		a.entries[t.Label] = discoveryEntry{possible: true, ceiling: t.MaxConcurrent}
+	for i := range tiers {
+		a.labels = append(a.labels, tiers[i].Label)
+		a.entries[tiers[i].Label] = discoveryEntry{possible: true, ceiling: tiers[i].MaxConcurrent}
 	}
 	slices.Sort(a.labels)
 	a.choose()
@@ -248,19 +248,19 @@ func (l *Listener) rememberAvailable(msg *Message) {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	for _, job := range msg.Available {
+	for i := range msg.Available {
 		// A REPEATED OFFER DOES NOT CREATE A SECOND BACKLOG ENTRY. reserve
 		// skips existing commitments, so nobody would remove this hint later.
-		if l.acquiring[job.RequestID] != nil || l.running[job.RequestID] != nil {
+		if l.acquiring[msg.Available[i].RequestID] != nil || l.running[msg.Available[i].RequestID] != nil {
 			continue
 		}
-		l.waitingOffers[identityOfOffer(job)] = true
+		l.waitingOffers[identityOfOffer(msg.Available[i])] = true
 	}
-	for _, job := range msg.Assigned {
-		delete(l.waitingOffers, identityOfOffer(job))
+	for i := range msg.Assigned {
+		delete(l.waitingOffers, identityOfOffer(msg.Assigned[i]))
 	}
-	for _, job := range msg.Completed {
-		delete(l.waitingOffers, identityOfOffer(job))
+	for i := range msg.Completed {
+		delete(l.waitingOffers, identityOfOffer(msg.Completed[i]))
 	}
 }
 

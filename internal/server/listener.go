@@ -3173,18 +3173,19 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 		observedDemand = msg.Statistics
 	}
 	l.observeDemand(observedDemand)
-	if l.isDraining() || l.isQuiesced() {
+	switch {
+	case l.isDraining() || l.isQuiesced():
 		if len(msg.Available) > 0 {
 			l.log.Info("declining an offer: this deployment is not taking new work",
 				"tier", l.tier, "available", len(msg.Available),
 				"reason", refusalReason(l.isDraining()))
 		}
-	} else if l.arbiter != nil && !l.arbiter.permits(l.tier) {
+	case l.arbiter != nil && !l.arbiter.permits(l.tier):
 		if len(msg.Available) > 0 {
 			l.log.Info("deferring an offer to another tier's admission turn",
 				"tier", l.tier, "available", len(msg.Available))
 		}
-	} else {
+	default:
 		// THE SAME ARBITRATION GATES OFFERS AND POLLS. A refill here cannot
 		// bypass the tier waiting for returning headroom, and only real escrow
 		// can back an acquisition.

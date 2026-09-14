@@ -41,7 +41,7 @@ func (a *Allocator) PotentialCapacity(ctx context.Context) (map[string]int, erro
 				if other == label || floor.Reserved == 0 {
 					continue
 				}
-				_, cost, err := a.holdFloor(ctx, tx, floor, floor.Reserved, free)
+				cost, err := a.holdFloor(ctx, tx, floor, floor.Reserved, free)
 				if err != nil {
 					return err
 				}

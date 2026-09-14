@@ -20,8 +20,8 @@ func arbitrationListeners(t *testing.T, tiers []config.Tier, vcpu int) (*alloc.A
 	registerHost(t, a)
 	s := New(a, nil, tiers, "arbitration-test", nil)
 	listeners := make([]*Listener, 0, len(tiers))
-	for _, tr := range tiers {
-		listeners = append(listeners, NewListener(a, tr.Label, &fakeSession{}, s.listenerOpts(nil)...))
+	for i := range tiers {
+		listeners = append(listeners, NewListener(a, tiers[i].Label, &fakeSession{}, s.listenerOpts(nil)...))
 	}
 
 	return a, listeners
