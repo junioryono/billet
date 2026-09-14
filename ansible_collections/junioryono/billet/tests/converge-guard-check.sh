@@ -941,13 +941,30 @@ failed_at() {
   awk '/^TASK \[/ { t=$0; sub(/^TASK \[/, "", t); sub(/\] \*+$/, "", t); sub(/^junioryono\.billet\.host : /, "", t) }
        /^(fatal|failed): / { print t; exit }' "$work/cases/$1/out"
 }
-# Keep the whole final failure task, including item/unreachable records and
-# retry/async notices, so the decoder can refuse duplicates or unknown forms.
+# Only a terminal failure retains a task window. Progress in a later task
+# cannot replace it; keep item details for the decoder to judge an aggregate.
 final_fatal() {
-  awk '/^(TASK \[|PLAY \[|PLAY RECAP)/ { if (fatal) final = buf; buf = ""; fatal = 0 }
+  awk -v name="$1" '
+       /^(TASK \[|PLAY \[|PLAY RECAP)/ { if (fatal) final = buf; buf = ""; fatal = 0 }
        { buf = buf $0 "\n" }
-       /^(fatal:|failed:|FAILED - RETRYING:|ASYNC FAILED on )/ { fatal = 1 }
-       END { if (fatal) final = buf; printf "%s", final }' "$work/cases/$1/out"
+       /^(fatal:|failed:)/ {
+         if ($0 !~ /^(fatal: \[.+\]: (FAILED|UNREACHABLE)! =>|failed: \[.+\] \(item=.*\) =>)/) {
+           print name ": cannot classify final fatal result: " $0 > "/dev/stderr"
+           invalid = 1
+           exit 1
+         }
+         fatal = 1
+       }
+       /^(FAILED - RETRYING:|ASYNC FAILED on )/ { notice = 1 }
+       END {
+         if (invalid) exit 1
+         if (fatal) final = buf
+         if (final == "" && notice) {
+           print name ": no terminal result" > "/dev/stderr"
+           exit 1
+         }
+         printf "%s", final
+       }' "$work/cases/$1/out"
 }
 expect_refused() { # case task fragment...
   local name=$1 task=$2; shift 2
