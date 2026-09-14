@@ -1,9 +1,7 @@
 package ec2
 
 import (
-	"os"
 	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -48,26 +46,17 @@ func TestTheFreeSpaceGuardRefusesWhatItCannotRead(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			// A fake df on PATH, so what runs is the script's own command line
-			// rather than a value this test assigned past it.
-			bin := t.TempDir()
-			if err := os.WriteFile(filepath.Join(bin, "df"),
-				[]byte("#!/bin/sh\nprintf 'Filesystem 1K-blocks Used Available Use%% Mounted\\n'\n"+
-					"printf '/dev/root 100 100 %s 1%%%% /\\n'\n"), 0o755); err != nil {
-				t.Fatalf("write the fake df: %v", err)
-			}
+			// A df FUNCTION, so what runs is the script's own command line rather
+			// than a value this test assigned past it. Not an executable on PATH: a
+			// parallel test's fork can inherit the descriptor that wrote it, exec then
+			// fails with ETXTBSY, and /bin/sh carries on down PATH to the real df, whose
+			// ample free space made "not-a-number" pass (CI run 34827346038).
+			fake := "df() {\n" +
+				"  printf 'Filesystem 1K-blocks Used Available Use%% Mounted on\\n'\n" +
+				"  printf '/dev/root 1 1 " + tc.df + " 1%%%% /\\n'\n" +
+				"}\n"
 
-			// The fake prints the case's value in the Available column.
-			body := "#!/bin/sh\n" +
-				"printf 'Filesystem 1K-blocks Used Available Use%% Mounted on\\n'\n" +
-				"printf '/dev/root 1 1 " + tc.df + " 1%%%% /\\n'\n"
-
-			if err := os.WriteFile(filepath.Join(bin, "df"), []byte(body), 0o755); err != nil {
-				t.Fatalf("write the fake df: %v", err)
-			}
-
-			cmd := exec.CommandContext(t.Context(), "/bin/sh", "-c", "set -eu\n"+block)
-			cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"))
+			cmd := exec.CommandContext(t.Context(), "/bin/sh", "-c", "set -eu\n"+fake+block)
 
 			out, err := cmd.CombinedOutput()
 
