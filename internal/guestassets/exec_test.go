@@ -25,6 +25,23 @@ const (
 	etxtbsyBackoff  = 10 * time.Millisecond
 )
 
+// writeExecutable is os.WriteFile for a file some test will exec, with the
+// write held under syscall.ForkLock.
+//
+// THE RETRY BELOW COVERS ONLY A START GO MAKES. A script that execs another
+// file this package wrote (the docker shim execs the fake docker behind it)
+// fails inside the shell, where nothing can retry it: CI run 34831856345
+// (2026-09-14) failed `exec: .../behind/docker: Text file busy`. syscall's
+// forkExec, which every os/exec start in these tests goes through, holds
+// ForkLock across creating the child, so no such child can be created while a
+// write descriptor is open or hold a copy of one when the file is executed.
+func writeExecutable(name string, data []byte, perm os.FileMode) error {
+	syscall.ForkLock.Lock()
+	defer syscall.ForkLock.Unlock()
+
+	return os.WriteFile(name, data, perm)
+}
+
 // retryETXTBSY runs attempt(), which must build a FRESH command each call — an
 // exec.Cmd cannot be reused after Start — and retries only the text-file-busy
 // start failure.
@@ -76,7 +93,7 @@ func TestMain(m *testing.M) {
 
 	sharedListener = filepath.Join(dir, "Runner.Listener")
 
-	if err := os.WriteFile(sharedListener, []byte("#!/bin/sh\nexit \"${BILLET_TEST_RESULT:-7}\"\n"), 0o755); err != nil {
+	if err := writeExecutable(sharedListener, []byte("#!/bin/sh\nexit \"${BILLET_TEST_RESULT:-7}\"\n"), 0o755); err != nil {
 		fmt.Fprintln(os.Stderr, "write the shared listener:", err)
 		os.Exit(1)
 	}
