@@ -3064,7 +3064,6 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 	if err != nil {
 		return err
 	}
-	l.rememberAvailable(msg, resolved)
 
 	// Completion precedes acquisition so its replacement can use released escrow.
 	// Both acquisition filters use resolveActualJob's rule, including redelivery
@@ -3106,6 +3105,8 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 		}
 		l.complete(ctx, job)
 	}
+
+	l.rememberAvailable(msg, resolved)
 
 	// A zero advertisement is not the same as refusing work, and this is where
 	// the difference is enforced.
@@ -3222,7 +3223,7 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 			continue
 		}
 
-		lease, needsCompute, err := l.assign(ctx, job)
+		lease, needsCompute, err := l.assignResolved(ctx, entry)
 		if err != nil {
 			return err
 		}
@@ -3657,12 +3658,13 @@ func (l *Listener) acquire(ctx context.Context, available []Job) error {
 // acquireUnfinished uses resolveActualJob's rule for completion and commitment
 // filtering. Wire request IDs are retained only for the AcquireJobs protocol.
 func (l *Listener) acquireUnfinished(ctx context.Context, available []resolvedJob,
-	finished, committed []actualJobIdentity,
+	finished []actualJobIdentity, commitments []jobCommitment,
 ) error {
 	if len(available) == 0 {
 		return nil
 	}
 
+	committed := l.currentCommitments(commitments)
 	identified := make([]Job, 0, len(available))
 	protocolFor := make(map[int64]int64, len(available))
 	internalFor := make(map[int64]int64, len(available))
@@ -3905,6 +3907,21 @@ func missing(asked, granted []int64) []int64 {
 // Explicit rather than a nil lease, because "no value and no error" is exactly
 // the shape a caller mishandles without noticing.
 func (l *Listener) assign(ctx context.Context, job Job) (*alloc.Lease, bool, error) {
+	entry, err := l.resolveActualJob(ctx, job, resolveAcquisition, nil)
+	if err != nil {
+		return nil, false, err
+	}
+	return l.assignResolved(ctx, entry)
+}
+
+// assignResolved consumes the resolved assignment without losing its aliases.
+func (l *Listener) assignResolved(ctx context.Context, entry resolvedJob) (*alloc.Lease, bool, error) {
+	commitments, err := l.resolveCommitments(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	job := entry.job
+
 	// Held for the whole function, INCLUDING the allocator write.
 	//
 	// Releasing it around the write to keep heartbeats snappy looks obviously
@@ -3920,6 +3937,13 @@ func (l *Listener) assign(ctx context.Context, job Job) (*alloc.Lease, bool, err
 	// Already ours. An unacknowledged message is redelivered, so this is an
 	// ordinary event rather than a fault — and consuming a second lease for one
 	// job would leak capacity that nothing ever gives back.
+	for _, c := range commitments {
+		if c.promise == nil && c.heldBy(l) && sameActualJob(entry.actual, c.actual) {
+			return nil, false, nil
+		}
+	}
+	// The ownership key remains reserved even if its runner consumed another
+	// actual job. Never overwrite the lease that must still be renewed.
 	if _, ok := l.running[job.RequestID]; ok {
 		return nil, false, nil
 	}
@@ -3946,14 +3970,19 @@ func (l *Listener) assign(ctx context.Context, job Job) (*alloc.Lease, bool, err
 		return nil, false, nil
 	}
 
-	// The lease this assignment was PROMISED, if billet acquired the offer. This
-	// is the ordinary path: acquire reserved a lease against this exact request id
-	// and nothing else can have spent it in the meantime.
+	// The offer may have used a different request alias. Its ownership key
+	// names the promise to consume, not the request to bind on the lease.
 	var lease *alloc.Lease
-
-	p, promised := l.acquiring[job.RequestID]
-	if promised {
-		lease = p.lease
+	var promiseKey int64
+	promised := false
+	for _, c := range commitments {
+		if c.promise != nil && c.heldBy(l) && sameActualJob(entry.actual, c.actual) {
+			if promised {
+				return nil, false, fmt.Errorf("%w: assignment %d matches several promises",
+					ErrUntrustworthySession, job.RequestID)
+			}
+			lease, promiseKey, promised = c.lease, c.key, true
+		}
 	}
 
 	if !promised {
@@ -3990,7 +4019,7 @@ func (l *Listener) assign(ctx context.Context, job Job) (*alloc.Lease, bool, err
 	// the release path — capacity that nothing hands back and nothing reports,
 	// until the reaper's TTL expires it.
 	if promised {
-		delete(l.acquiring, job.RequestID)
+		delete(l.acquiring, promiseKey)
 	} else {
 		l.held = l.held[1:]
 	}

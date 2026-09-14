@@ -232,9 +232,10 @@ func (l *Listener) rememberAvailable(msg *Message, resolved resolvedMessage) {
 	if msg.Statistics != nil && msg.Statistics.TotalAvailableJobs == 0 {
 		l.waitingOffers = nil
 	}
+	committed := l.currentCommitments(resolved.committed)
 	for _, entry := range resolved.available {
 		// Commitment comparisons use resolveActualJob's canonical aliases.
-		if containsActual(resolved.committed, entry.actual) {
+		if containsActual(committed, entry.actual) {
 			continue
 		}
 		actual := entry.actual

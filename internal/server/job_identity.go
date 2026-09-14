@@ -37,8 +37,39 @@ type resolvedMessage struct {
 	available []resolvedJob
 	assigned  []resolvedJob
 	completed []resolvedJob
-	committed []actualJobIdentity
+	committed []jobCommitment
 	poisoned  []error
+}
+
+// jobCommitment keeps scheduler aliases separate from their renewal ownership.
+type jobCommitment struct {
+	actual  actualJobIdentity
+	key     int64
+	lease   *alloc.Lease
+	promise *promise
+}
+
+// heldBy requires l.mu. A reused ownership key cannot revive an old commitment.
+func (c jobCommitment) heldBy(l *Listener) bool {
+	if c.promise != nil {
+		return l.acquiring[c.key] == c.promise
+	}
+	lease := l.running[c.key]
+	return lease != nil && lease.ID == c.lease.ID && lease.Epoch == c.lease.Epoch
+}
+
+// currentCommitments drops discharged ownership without re-deriving aliases.
+func (l *Listener) currentCommitments(commitments []jobCommitment) []actualJobIdentity {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	var actual []actualJobIdentity
+	for _, c := range commitments {
+		if c.heldBy(l) {
+			actual = append(actual, c.actual)
+		}
+	}
+	return actual
 }
 
 // sameActualJob implements the comparison rule documented at resolveActualJob.
@@ -75,6 +106,8 @@ func mergeActual(a, b actualJobIdentity) actualJobIdentity {
 // match only if a nonzero request alias or nonempty JobID matches and neither
 // known JobID nor known RunID contradicts. RunID alone never identifies a job.
 // Assignments establish aliases before offers, and both precede completions.
+// Distinct compatible candidates require one unique match to the wire request;
+// otherwise resolution refuses the ambiguity instead of depending on order.
 // Offers and assignments may mint direct identities; completions only read them.
 // The runner's launch request is returned separately for cleanup and contributes
 // no actual-job alias. Resolution runs outside l.mu, before message decisions;
@@ -175,10 +208,41 @@ func (l *Listener) resolveActualJob(ctx context.Context, job Job, mode jobResolu
 			out.actual = mergeActual(out.actual, actualJobIdentity{requests: []int64{id}})
 		}
 	}
+	// Wildcards must not be enriched before all candidates are compared: the
+	// first run encountered would otherwise exclude a later, explicitly named run.
+	var candidates []actualJobIdentity
 	for _, prior := range known {
-		if sameActualJob(out.actual, prior) {
-			out.actual = mergeActual(out.actual, prior)
+		if sameActualJob(out.actual, prior) && !slices.ContainsFunc(candidates, func(candidate actualJobIdentity) bool {
+			return candidate.job == prior.job && candidate.run == prior.run &&
+				len(candidate.requests) == len(prior.requests) &&
+				!slices.ContainsFunc(candidate.requests, func(id int64) bool { return !slices.Contains(prior.requests, id) })
+		}) {
+			candidates = append(candidates, prior)
 		}
+	}
+	if len(candidates) > 1 && job.RequestID != 0 {
+		var named []actualJobIdentity
+		for _, candidate := range candidates {
+			if slices.Contains(candidate.requests, job.RequestID) {
+				named = append(named, candidate)
+			}
+		}
+		if len(named) == 1 {
+			candidates = named
+		}
+	}
+	if len(candidates) > 1 {
+		cause := ErrUntrustworthySession
+		if mode == resolveCompletion {
+			// No new remote promise was made. Use the existing poison recovery
+			// path instead of choosing which otherwise valid job to complete.
+			cause = errQuarantinableCompletion
+		}
+		return out, fmt.Errorf("%w: %s request %d job %q matches several actual jobs",
+			cause, l.tier, job.RequestID, job.JobID)
+	}
+	if len(candidates) == 1 {
+		out.actual = mergeActual(out.actual, candidates[0])
 	}
 	if out.binding != nil && out.binding.ActualRequestID != 0 {
 		bound := actualJobIdentity{requests: []int64{out.binding.ActualRequestID},
@@ -239,12 +303,21 @@ func (l *Listener) resolveMessage(ctx context.Context, msg *Message) (resolvedMe
 		out.completed = append(out.completed, resolved)
 	}
 
-	// Snapshot ownership only; resolve its aliases after releasing the mutex.
+	var err error
+	out.committed, err = l.resolveCommitments(ctx)
+	return out, err
+}
+
+// resolveCommitments snapshots ownership under l.mu and resolves outside it.
+func (l *Listener) resolveCommitments(ctx context.Context) ([]jobCommitment, error) {
 	l.mu.Lock()
-	var commitments []Job
+	var commitments []jobCommitment
+	var jobs []Job
 	for id, p := range l.acquiring {
-		commitments = append(commitments, p.job)
-		commitments[len(commitments)-1].RequestID = id
+		job := p.job
+		job.RequestID = id
+		jobs = append(jobs, job)
+		commitments = append(commitments, jobCommitment{key: id, lease: p.lease, promise: p})
 	}
 	for id, lease := range l.running {
 		job := l.runningJobs[id]
@@ -253,17 +326,18 @@ func (l *Listener) resolveMessage(ctx context.Context, msg *Message) (resolvedMe
 			job.RunID = lease.RunID
 		}
 		job.RunnerName = provider.InstanceName(lease.ID)
-		commitments = append(commitments, job)
+		jobs = append(jobs, job)
+		commitments = append(commitments, jobCommitment{key: id, lease: lease})
 	}
 	l.mu.Unlock()
-	for _, job := range commitments {
+	for i, job := range jobs {
 		resolved, err := l.resolveActualJob(ctx, job, resolveCommitment, nil)
 		if err != nil {
-			return out, err
+			return nil, err
 		}
-		out.committed = append(out.committed, resolved.actual)
+		commitments[i].actual = resolved.actual
 	}
-	return out, nil
+	return commitments, nil
 }
 
 // containsActual uses resolveActualJob's rule for every acquisition consumer.
