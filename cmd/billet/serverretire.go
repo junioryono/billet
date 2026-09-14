@@ -1911,7 +1911,7 @@ func readRetireRow(ctx context.Context, cfg *config.Config, identity string, m r
 			// ledger's absence, not maintenance's refusal.
 			if err := state.InspectPreflight(cfg.Server.IdentityDir); err != nil {
 				return nil, retirement.RowUnreadable, retireReportLedgerWhy(ctx, bounded, err,
-					"the ledger read is refused before running the owner's report"),
+						"the ledger read is refused before running the owner's report"),
 					bounded.Err() == nil && state.OnlyCause(err, state.ErrMaintenance)
 			}
 			row, fact, why := readRetireRowAsOwner(ctx, bounded, uid, gid, identity, m)
