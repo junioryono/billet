@@ -34,8 +34,22 @@ func TestRetirementReceiptAdmitsAfterRegistrationWait(t *testing.T) {
 				mustOK(t, os.Remove(dir))
 			}
 			savedOpen, savedPoll := registrationOpen, endpointPoll
+			savedEvent := retireMutationEvent
+			waitingForReceipt := false
+			retireMutationEvent = func(event, path string) {
+				if savedEvent != nil {
+					savedEvent(event, path)
+				}
+				if event == "wait" && path == "receipt registration" {
+					waitingForReceipt = true
+				}
+			}
 			reads := 0
 			registrationOpen = func(path string) (*os.File, os.FileInfo, error) {
+				// Done postconditions need the real record before receipt waiting starts.
+				if !waitingForReceipt {
+					return savedOpen(path)
+				}
 				reads++
 				if reads == 1 {
 					return nil, nil, os.ErrNotExist
@@ -46,7 +60,10 @@ func TestRetirementReceiptAdmitsAfterRegistrationWait(t *testing.T) {
 				return savedOpen(path)
 			}
 			endpointPoll = time.Millisecond
-			t.Cleanup(func() { registrationOpen, endpointPoll = savedOpen, savedPoll })
+			t.Cleanup(func() {
+				registrationOpen, endpointPoll = savedOpen, savedPoll
+				retireMutationEvent = savedEvent
+			})
 			out, code := retiredRequest(t, f, requestRun)
 			if reads < 2 || code != exitUnknown || !strings.Contains(out, "TriggeredBy") {
 				t.Fatalf("watcher introduced during registration waiting was not refused: reads=%d %s", reads, out)
