@@ -220,6 +220,7 @@ func TestTheServerRetireFixturesAreTheCommandsOwn(t *testing.T) {
 		"dry-run-settled-closed-status", "done-unchanged-republished",
 		"unknown-intent-journal", "refused-request-released",
 		"retired-settled", "retired-pending",
+		"dry-run-cancel-previous-run", "retired-after-survivor-ack",
 	})
 }
 
