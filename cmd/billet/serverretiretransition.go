@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -1163,8 +1164,9 @@ func retireResetFailed(ctx context.Context, unit string) error {
 	ctx, cancel := context.WithTimeout(ctx, systemctlTimeout)
 	defer cancel()
 
-	if _, err := runManagerCommand(ctx, systemctlBinary, []string{"reset-failed", "--", unit}); err != nil {
-		return fmt.Errorf("systemctl reset-failed %s: %w", unit, err)
+	var output bytes.Buffer
+	if err := runManagerOutput(ctx, systemctlBinary, []string{"reset-failed", "--", unit}, &output, &output); err != nil {
+		return fmt.Errorf("systemctl reset-failed %s: %w: %s", unit, err, strings.TrimSpace(output.String()))
 	}
 
 	return nil

@@ -111,27 +111,34 @@ func readRetireManagerProperties(root, unit string) (map[string][]string, error)
 	return props, nil
 }
 
-// Manager callers refuse any error; none inspect *exec.ExitError. Keep the
-// numeric status and stderr available for the subprocess equivalence witness.
-type retireManagerExitError struct {
-	stderr string
-}
+// Manager callers refuse any error; none inspect *exec.ExitError.
+type retireManagerExitError struct{}
 
 func (e *retireManagerExitError) Error() string {
-	return "exit status 2: " + strings.TrimSpace(e.stderr)
+	return "exit status 2"
 }
 
 func (e *retireManagerExitError) ExitCode() int { return 2 }
 
 func retireManagerCommand(ctx context.Context, bin string, args []string) ([]byte, error) {
-	var stdout bytes.Buffer
-	if err := runRetireManagerFake(ctx, filepath.Base(bin), args, &stdout); err != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		return stdout.Bytes(), &retireManagerExitError{stderr: fmt.Sprintln(err)}
+	var stdout, stderr bytes.Buffer
+	if err := retireManagerProcess(ctx, bin, args, &stdout, &stderr); err != nil {
+		return nil, fmt.Errorf("%s %s: %w: %s", bin, strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
 	}
 	return stdout.Bytes(), nil
+}
+
+func retireManagerProcess(ctx context.Context, bin string, args []string, stdout, stderr io.Writer) error {
+	if err := runRetireManagerFake(ctx, filepath.Base(bin), args, stdout); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if _, writeErr := fmt.Fprintln(stderr, err); writeErr != nil {
+			return writeErr
+		}
+		return &retireManagerExitError{}
+	}
+	return nil
 }
 
 func runRetireManagerFake(ctx context.Context, name string, args []string, stdout io.Writer) error {
@@ -410,19 +417,22 @@ func TestRetireManagerFakeOmitsOnlySystemd255EmptyStructuredArrays(t *testing.T)
 
 // Keep one subprocess witness for the protocol; admissions use no child process.
 func TestRetireManagerInProcessMatchesSubprocess(t *testing.T) {
+	saved := managerCommandRunner
+	managerCommandRunner = nil
+	t.Cleanup(func() { managerCommandRunner = saved })
 	for _, c := range []struct {
-		name string
-		bin  string
-		args []string
-		code int
+		name   string
+		bin    string
+		args   []string
+		stderr string
 	}{
-		{"show", "systemctl", []string{"show", "--all", "--", nodeUnit}, 0},
-		{"typed", "busctl", []string{"get-property", "org.freedesktop.systemd1", "/org/freedesktop/systemd1/unit/billet_2dnode_2eservice", "org.freedesktop.systemd1.Service", "EnvironmentFiles"}, 0},
-		{"typed inventory", "busctl", []string{"--json=short", "call", "org.freedesktop.systemd1", "/org/freedesktop/systemd1/unit/billet_2dnode_2eservice", "org.freedesktop.DBus.Properties", "GetAll", "s", ""}, 0},
-		{"execution", "busctl-execution", []string{"--json=short", "get-property", "org.freedesktop.systemd1", "/org/freedesktop/systemd1/unit/billet_2dnode_2eservice", "org.freedesktop.systemd1.Service", "ExecStart"}, 0},
-		{"reset", "systemctl", []string{"reset-failed", "--", nodeUnit}, 0},
-		{"failure", "systemctl", []string{"unsupported", "--", nodeUnit}, 2},
-		{"output then failure", "systemctl", []string{"show", "--all", "--", nodeUnit}, 2},
+		{"show", "systemctl", []string{"show", "--all", "--", nodeUnit}, ""},
+		{"typed", "busctl", []string{"get-property", "org.freedesktop.systemd1", "/org/freedesktop/systemd1/unit/billet_2dnode_2eservice", "org.freedesktop.systemd1.Service", "EnvironmentFiles"}, ""},
+		{"typed inventory", "busctl", []string{"--json=short", "call", "org.freedesktop.systemd1", "/org/freedesktop/systemd1/unit/billet_2dnode_2eservice", "org.freedesktop.DBus.Properties", "GetAll", "s", ""}, ""},
+		{"execution", "busctl-execution", []string{"--json=short", "get-property", "org.freedesktop.systemd1", "/org/freedesktop/systemd1/unit/billet_2dnode_2eservice", "org.freedesktop.systemd1.Service", "ExecStart"}, ""},
+		{"reset", "systemctl", []string{"reset-failed", "--", nodeUnit}, ""},
+		{"failure", "systemctl", []string{"unsupported", "--", nodeUnit}, "unsupported systemctl command: [unsupported -- billet-node.service]"},
+		{"output then failure", "busctl", []string{"get-property", "org.freedesktop.systemd1", "/org/freedesktop/systemd1/unit/billet_2dnode_2eservice", "org.freedesktop.systemd1.Service", "EnvironmentFiles", "ExecStop"}, "missing typed property billet-node.service ExecStop"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			root := t.TempDir()
@@ -430,33 +440,79 @@ func TestRetireManagerInProcessMatchesSubprocess(t *testing.T) {
 			writeFile(t, filepath.Join(root, nodeUnit), "Id="+nodeUnit+"\nActiveState=failed\nResult=exit-code\n", 0o600)
 			writeFile(t, filepath.Join(root, nodeUnit+".effects"), "EnvironmentFiles=\n", 0o600)
 			writeFile(t, filepath.Join(root, "node-exec.json"), `{"type":"a(sasbttttuii)","data":[["/usr/bin/billet",["/usr/bin/billet","node","--config","/etc/billet.yaml"],false,0,0,0,0,0,0,0]]}`, 0o600)
-			if c.name == "output then failure" {
-				mustOK(t, os.Mkdir(filepath.Join(root, ".asked"), 0o700))
-			}
 			binary := retireManagerExecutable(t, c.bin)
-			wantOut, wantErr := retireManagerCommand(t.Context(), binary, c.args)
-			wantCode, wantStderr := 0, ""
-			if wantErr != nil {
-				var failure *retireManagerExitError
-				if !errors.As(wantErr, &failure) {
-					t.Fatal(wantErr)
-				}
-				wantCode, wantStderr = failure.ExitCode(), failure.stderr
+			execOut, execErr := runManagerCommand(t.Context(), binary, c.args)
+			fakeOut, fakeErr := retireManagerCommand(t.Context(), binary, c.args)
+			managerCommandRunner = retireManagerProcess
+			injectedOut, injectedErr := runManagerCommand(t.Context(), binary, c.args)
+			managerCommandRunner = nil
+			wantError := ""
+			if c.stderr != "" {
+				wantError = binary + " " + strings.Join(c.args, " ") + ": exit status 2: " + c.stderr
 			}
-			var stdout, stderr bytes.Buffer
-			cmd := exec.CommandContext(t.Context(), binary, c.args...)
-			cmd.Stdout, cmd.Stderr = &stdout, &stderr
-			err := cmd.Run()
-			code := 0
-			if err != nil {
-				var failure *exec.ExitError
-				if !errors.As(err, &failure) {
-					t.Fatal(err)
+			for _, result := range []struct {
+				name string
+				out  []byte
+				err  error
+			}{
+				{"subprocess", execOut, execErr},
+				{"in-process", fakeOut, fakeErr},
+				{"injected", injectedOut, injectedErr},
+			} {
+				if !bytes.Equal(result.out, execOut) || (result.out == nil) != (execOut == nil) {
+					t.Fatalf("%s stdout=%q (nil=%v), subprocess stdout=%q (nil=%v)", result.name, result.out, result.out == nil, execOut, execOut == nil)
 				}
-				code = failure.ExitCode()
+				if (result.err != nil) != (wantError != "") {
+					t.Fatalf("%s error=%v, want %q", result.name, result.err, wantError)
+				}
+				if result.err != nil {
+					if result.err.Error() != wantError || result.out != nil {
+						t.Fatalf("%s=(%q, %q), want (nil, %q)", result.name, result.out, result.err.Error(), wantError)
+					}
+					var failure interface{ ExitCode() int }
+					if !errors.As(result.err, &failure) || failure.ExitCode() != 2 {
+						t.Fatalf("%s exit status: %v", result.name, result.err)
+					}
+				}
 			}
-			if !bytes.Equal(stdout.Bytes(), wantOut) || stderr.String() != wantStderr || code != wantCode || code != c.code {
-				t.Fatalf("subprocess=(%q, %q, %d), in-process=(%q, %q, %d)", stdout.Bytes(), stderr.String(), code, wantOut, wantStderr, wantCode)
+		})
+	}
+}
+
+func TestRetireManagerPreservesCallerDiagnostics(t *testing.T) {
+	saved := managerCommandRunner
+	t.Cleanup(func() { managerCommandRunner = saved })
+	for _, c := range []struct {
+		name   string
+		stdout string
+		stderr string
+	}{
+		{"stderr", "", "manager refused\n"},
+		{"partial stdout", "partial answer\n", "manager refused\n"},
+		{"stdout only", "partial answer\n", ""},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			managerCommandRunner = func(_ context.Context, _ string, _ []string, stdout, stderr io.Writer) error {
+				_, err := io.WriteString(stdout, c.stdout)
+				mustOK(t, err)
+				_, err = io.WriteString(stderr, c.stderr)
+				mustOK(t, err)
+				return &retireManagerExitError{}
+			}
+			_, propertiesErr := unitProperties(t.Context(), nodeUnit)
+			_, executionErr := unitExecStart(t.Context(), nodeUnit)
+			resetErr := retireResetFailed(t.Context(), backupServiceUnit)
+			for _, result := range []struct {
+				err  error
+				want string
+			}{
+				{propertiesErr, "systemctl show " + nodeUnit + ": exit status 2: " + strings.TrimSpace(c.stderr)},
+				{executionErr, "busctl get-property ExecStart of " + nodeUnit + ": exit status 2: " + strings.TrimSpace(c.stderr)},
+				{resetErr, "systemctl reset-failed " + backupServiceUnit + ": exit status 2: " + strings.TrimSpace(c.stdout+c.stderr)},
+			} {
+				if result.err == nil || result.err.Error() != result.want {
+					t.Fatalf("diagnostic=%v, want %q", result.err, result.want)
+				}
 			}
 		})
 	}

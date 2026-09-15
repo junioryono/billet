@@ -84,7 +84,7 @@ func installRetireOperationEvidence(t *testing.T, f *requestFixture) {
 	mustOK(t, os.MkdirAll(varTmp, 0o700))
 	saved := retireOperationInspector
 	retireOperationInspector = func() *lifeops.Inspector {
-		return lifeops.NewInspector(lifeops.WithSystemctl(systemctlBinary), lifeops.WithCommandRunner(managerCommandRunner), lifeops.WithOperationUnitDirectories(root), lifeops.WithOperationBusctl(busctl), lifeops.WithOperationCgroupRoot(root),
+		return lifeops.NewInspector(lifeops.WithSystemctl(systemctlBinary), managerRunnerOption(), lifeops.WithOperationUnitDirectories(root), lifeops.WithOperationBusctl(busctl), lifeops.WithOperationCgroupRoot(root),
 			lifeops.WithOperationTemporaryDirectories(boot, tmp, varTmp),
 			// Fixture inputs live in t.TempDir; these paths model its volatile storage.
 			lifeops.WithRetainedInputRoots("/run", "/var/run", filepath.Join(f.unitsDir, "volatile")))
