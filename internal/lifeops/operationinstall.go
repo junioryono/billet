@@ -116,37 +116,20 @@ func (w *operationWalk) admitInstallation(ctx context.Context, op Operation) err
 		if op.Verb == "enable" {
 			return fmt.Errorf("operation-source-unavailable: enable %s", op.Unit)
 		}
-		return w.inspector.admitInstallationLinks(op, w.protection, "", nil)
+		return w.admitInstallationLinks(op, "", nil)
 	}
 	entries, err := operationInstallEntries(ev.sources)
 	if err != nil {
 		return err
 	}
-	for _, key := range []string{"Also", "DefaultInstance"} {
-		if len(entries[key]) != 0 {
-			return fmt.Errorf("operation-install-collateral: %s %s=%s grants more than its target effect", op.Unit,
-				key, strings.Join(entries[key], " "))
-		}
+	if len(entries["DefaultInstance"]) != 0 {
+		return fmt.Errorf("operation-install-collateral: %s DefaultInstance grants more than its target effect", op.Unit)
 	}
-	for _, alias := range entries["Alias"] {
-		other, ok := w.units[alias]
-		if !ok || first(other.props, "Id") != first(ev.props, "Id") {
-			return fmt.Errorf("operation-install-alias: %s unproved alias %s", op.Unit, alias)
-		}
-	}
-	for _, key := range []string{"WantedBy", "RequiredBy", "UpheldBy"} {
-		for _, unit := range entries[key] {
-			if !operationUnitName(unit) || protectedOperationUnit(unit, w.protection.Units) ||
-				!strings.HasSuffix(unit, ".target") {
-				return fmt.Errorf("operation-install-link: %s %s=%s", op.Unit, key, unit)
-			}
-		}
-	}
-	return w.inspector.admitInstallationLinks(op, w.protection, first(ev.props, "FragmentPath"), strings.Fields(first(ev.props, "Names")))
+	return w.admitInstallationLinks(op, first(ev.props, "FragmentPath"), strings.Fields(first(ev.props, "Names")))
 }
 
-func (i *Inspector) admitInstallationLinks(op Operation, protection OperationProtection, fragment string, aliases []string) error {
-	roots := i.operationUnitDirs
+func (w *operationWalk) admitInstallationLinks(op Operation, fragment string, aliases []string) error {
+	roots := w.inspector.operationUnitDirs
 	if roots == nil {
 		roots = []string{"/etc/systemd/system", "/run/systemd/system"}
 	}
@@ -207,11 +190,9 @@ func (i *Inspector) admitInstallationLinks(op Operation, protection OperationPro
 			parent := filepath.Base(filepath.Dir(path))
 			for _, suffix := range []string{".wants", ".requires", ".upholds"} {
 				if unit, ok := strings.CutSuffix(parent, suffix); ok {
-					if protectedOperationUnit(unit, protection.Units) {
-						return fmt.Errorf("operation-install-protected-link: %s", path)
-					}
-					if !slices.Contains(operationStandardUnits, unit) {
-						return fmt.Errorf("operation-unit-outside-set: %s installation link from %s", op.Unit, unit)
+					property := map[string]string{".wants": "WantedBy", ".requires": "RequiredBy", ".upholds": "UpheldBy"}[suffix]
+					if !w.edgeAllowed(op.Unit, "Install."+property, unit) {
+						return fmt.Errorf("operation-edge-outside-set: %s %s=%s at %s", op.Unit, property, unit, path)
 					}
 				}
 			}

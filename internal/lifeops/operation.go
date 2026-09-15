@@ -54,8 +54,8 @@ var operationRelations = []string{
 
 var operationUnitProperties = []string{
 	"Id", "Names", "LoadState", "FragmentPath", "SourcePath", "DropInPaths", "NeedDaemonReload",
-	"OnSuccessJobMode", "OnFailureJobMode", "FailureAction", "SuccessAction", "StartLimitAction",
-	"JobTimeoutAction", "RequiresMountsFor", "ActiveState", "UnitFileState", "StopWhenUnneeded",
+	"FailureAction", "SuccessAction", "StartLimitAction",
+	"JobTimeoutAction", "RequiresMountsFor", "ActiveState", "UnitFileState", "StopWhenUnneeded", "Job",
 }
 
 var operationDirectoryRoots = map[string]string{
@@ -90,16 +90,18 @@ type operationWalk struct {
 	standard   map[string]bool
 }
 
-// AdmitOperations admits a closed unit set: billet's protected units, aliases
-// and configured instances, plus fixed standard dependencies accepted only as
-// no-ops. Every forward, inverse and installation relationship leaving that set
-// refuses by name. Standard units end traversal; their arbitrary host graph is
-// outside this boundary. Billet units retain directory, termination, manager
-// action, stdio and setup checks, and callers recheck node/server execution shape.
-// A filesystem watcher with no relationship to a protected unit is outside the
-// manager-effects boundary, like cron or an inotify daemon. Direct path, socket,
-// timer and automount triggers of protected services still refuse. Programs are
-// not interpreted. Evidence is reread, and admission grants no future authority.
+// AdmitOperations checks a closed edge list, not merely a set of unit names.
+// Every relationship property in either direction must match its fixed source
+// and destination classes. Completion handlers and arbitrary billet-to-billet
+// edges refuse too, including effects of a backup allowed to remain in flight.
+// Stop propagation admits only the ledger's What-derived device stopping that
+// mount (and its inverse); retirement never stops a device.
+// Standard dependencies end traversal and admit only no-op effects. Billet
+// units retain directory (including implicit credential teardown), termination,
+// manager-action, stdio and setup checks; callers check node/server execution.
+// An unrelated filesystem watcher is outside the manager-effects boundary,
+// like cron or inotify. Direct triggers of protected services are checked.
+// Evidence is reread, and admission grants no future authority.
 func (i *Inspector) AdmitOperations(ctx context.Context, sequence []Operation, protection OperationProtection) error {
 	w := operationWalk{inspector: i, protection: protection, units: make(map[string]operationEvidence), targets: make(map[string]bool), paths: make(map[string]operationPathBinding), stopped: make(map[string]bool), standard: make(map[string]bool)}
 	for _, op := range sequence {
@@ -217,14 +219,16 @@ func (w *operationWalk) read(ctx context.Context, unit string) (operationEvidenc
 		return operationEvidence{}, fmt.Errorf("operation-unneeded-unknown: %s", unit)
 	}
 	if strings.HasSuffix(unit, ".mount") || strings.HasSuffix(unit, ".automount") {
-		mount, err := w.inspector.properties(ctx, unit, "Where")
+		mount, err := w.inspector.properties(ctx, unit, "Where", "What", "Type")
 		if err != nil {
 			return operationEvidence{}, fmt.Errorf("operation-mount-unknown: %s: %w", unit, err)
 		}
-		if err := requireOperationProperties(unit, mount, []string{"Where"}); err != nil {
+		if err := requireOperationProperties(unit, mount, []string{"Where", "What", "Type"}); err != nil {
 			return operationEvidence{}, err
 		}
-		props["Where"] = mount["Where"]
+		for key, value := range mount {
+			props[key] = value
+		}
 	}
 	if operationExecutionInterface(unit) != "" {
 		execution, err := w.inspector.operationExecution(ctx, unit, scoped && strings.HasSuffix(unit, ".service"))
@@ -354,18 +358,12 @@ func (w *operationWalk) admit(ctx context.Context, op Operation) error {
 			if effect == op && effect.Verb == "start" {
 				return fmt.Errorf("operation-source-unavailable: start %s", effect.Unit)
 			}
-			// A positively absent or masked dependency cannot execute. Wants
-			// may ignore it; Requires may fail the target, whose failure effects
-			// are still traversed. This is different from an unreadable unit.
+			// A positively absent or masked dependency cannot execute. Requires
+			// may fail the target, whose completion handlers already refused.
 			continue
 		}
 		if effect.Verb == "stop" && !w.stopped[effect.Unit] {
 			w.stopped[effect.Unit] = true
-			start := Operation{Verb: "start", Unit: effect.Unit}
-			if seen[start] {
-				delete(seen, start)
-				queue = append(queue, start)
-			}
 		}
 		// An active start is idempotent, but its dependencies still join the
 		// transaction. Earlier stops in this sequence invalidate that premise.
@@ -398,22 +396,15 @@ func (w *operationWalk) admit(ctx context.Context, op Operation) error {
 				queue = append(queue, Operation{Verb: verb, Unit: target})
 			}
 		}
-		if !activeNoop {
-			add("start", "OnSuccess")
-			add("start", "OnFailure")
-		}
 		if effect.Verb == "start" {
-			for _, prop := range pullers {
-				if prop != "PartOf" && prop != "Requisite" {
-					add("start", prop)
-				}
+			for _, prop := range []string{"Requires", "Wants", "BindsTo"} {
+				add("start", prop)
 			}
 			add("start", "Triggers")
-			add("start", "JoinsNamespaceOf")
 			add("stop", "Conflicts")
 			add("stop", "ConflictedBy")
 		} else {
-			for _, prop := range pullers {
+			for _, prop := range []string{"Requires", "Wants", "BindsTo"} {
 				for _, dependency := range strings.Fields(first(ev.props, prop)) {
 					dep, err := w.get(ctx, dependency)
 					if err != nil {
@@ -428,12 +419,12 @@ func (w *operationWalk) admit(ctx context.Context, op Operation) error {
 					}
 				}
 			}
-			for _, prop := range []string{"RequiredBy", "RequisiteOf", "BoundBy", "ConsistsOf", "PropagatesStopTo"} {
+			for _, prop := range []string{"RequiredBy", "BoundBy"} {
 				add("stop", prop)
 			}
-			// An active upholder or activation source can restart the target
+			// An active timer can restart the target
 			// after a successful stop. Stopping it is not an authorized repair.
-			for _, prop := range []string{"UpheldBy", "TriggeredBy"} {
+			for _, prop := range []string{"TriggeredBy"} {
 				for _, source := range strings.Fields(first(ev.props, prop)) {
 					from, err := w.get(ctx, source)
 					if err != nil {
@@ -451,12 +442,7 @@ func (w *operationWalk) admit(ctx context.Context, op Operation) error {
 			if w.standard[unit] {
 				continue
 			}
-			for _, prop := range []string{"OnSuccessOf", "OnFailureOf"} {
-				if !activeNoop && slices.Contains(strings.Fields(first(other.props, prop)), effect.Unit) {
-					queue = append(queue, Operation{Verb: "start", Unit: unit})
-				}
-			}
-			for _, prop := range []string{"PartOf", "BindsTo", "Requires", "StopPropagatedFrom", "JoinsNamespaceOf"} {
+			for _, prop := range []string{"BindsTo", "Requires"} {
 				if effect.Verb == "stop" && slices.Contains(strings.Fields(first(other.props, prop)), effect.Unit) {
 					queue = append(queue, Operation{Verb: "stop", Unit: unit})
 				}
@@ -467,16 +453,6 @@ func (w *operationWalk) admit(ctx context.Context, op Operation) error {
 }
 
 func admitOperationManagerEffects(unit string, ev operationEvidence) error {
-	// v255 unit_new defaults success to fail and failure to replace. Both
-	// enqueue the same dependency transaction; fail may refuse a conflict.
-	// Other modes can discard jobs or isolate the host, outside this closure.
-	// https://github.com/systemd/systemd/blob/v255/src/core/unit.c#L102-L103
-	for _, relation := range []string{"OnSuccess", "OnFailure"} {
-		prop := relation + "JobMode"
-		if first(ev.props, relation) != "" && !slices.Contains([]string{"fail", "replace"}, first(ev.props, prop)) {
-			return fmt.Errorf("operation-job-mode: %s %s=%s", unit, prop, first(ev.props, prop))
-		}
-	}
 	// These are all four emergency-action properties of the v255 Unit vtable;
 	// *ExitStatus and *RebootArgument configure an action but do not initiate it.
 	// https://github.com/systemd/systemd/blob/v255/src/core/dbus-unit.c#L857-L875
@@ -545,43 +521,54 @@ func (w *operationWalk) admitDirectories(effect Operation, ev operationEvidence)
 			}
 		}
 	}
+	protected := slices.Clone(w.protection.Paths)
+	for unit, paths := range w.protection.UnitPaths {
+		if w.canonicalUnit(unit) != w.canonicalUnit(effect.Unit) {
+			protected = append(protected, paths...)
+		}
+	}
+	for unit, other := range w.units {
+		if w.standard[unit] || w.canonicalUnit(unit) == w.canonicalUnit(effect.Unit) {
+			continue
+		}
+		for directive, root := range operationDirectoryRoots {
+			for _, entry := range strings.Fields(first(other.props, directive)) {
+				protected = append(protected, filepath.Join(root, entry))
+			}
+		}
+	}
+	check := func(path, directive string) error {
+		for _, keep := range protected {
+			overlap, err := w.pathsOverlap(path, keep)
+			if err != nil {
+				return err
+			}
+			if overlap {
+				return fmt.Errorf("operation-directory-overlap: %s %s=%s affects %s", effect.Unit, directive, path, keep)
+			}
+		}
+		if _, err := w.bindPath(path); err != nil {
+			return fmt.Errorf("operation-directory-evidence: %s %s: %w", effect.Unit, directive, err)
+		}
+		return nil
+	}
+	// service_enter_dead destroys /run/credentials/<Id> unconditionally, even
+	// without LoadCredential. Aliases cannot change this canonical teardown:
+	// https://github.com/systemd/systemd/blob/v255/src/core/service.c#L1845
+	// https://github.com/systemd/systemd/blob/v255/src/core/exec-credential.c#L132
+	if effect.Verb == "stop" && strings.HasSuffix(effect.Unit, ".service") {
+		if err := check(filepath.Join("/run/credentials", first(ev.props, "Id")), "CredentialDirectory"); err != nil {
+			return err
+		}
+	}
 	for directive, root := range operationDirectoryRoots {
 		for _, entry := range strings.Fields(first(ev.props, directive)) {
 			if entry == "." || strings.HasPrefix(entry, "../") || filepath.IsAbs(entry) ||
 				filepath.Clean(entry) != entry || strings.ContainsAny(entry, ":\\%\"'") {
 				return fmt.Errorf("operation-directory-unsupported: %s %s=%s", effect.Unit, directive, entry)
 			}
-			path := filepath.Join(root, entry)
-			// Stop removes runtime directories; the other four survive a stop.
-			// Still refuse shared ownership across protected units: a later
-			// activation can recursively reown their contents.
-			protected := slices.Clone(w.protection.Paths)
-			for unit, paths := range w.protection.UnitPaths {
-				if unit != effect.Unit {
-					protected = append(protected, paths...)
-				}
-			}
-			for unit, other := range w.units {
-				if unit == effect.Unit || first(other.props, "Id") == first(ev.props, "Id") || !protectedOperationUnit(unit, w.protection.Units) {
-					continue
-				}
-				for otherDirective, otherRoot := range operationDirectoryRoots {
-					for _, otherEntry := range strings.Fields(first(other.props, otherDirective)) {
-						protected = append(protected, filepath.Join(otherRoot, otherEntry))
-					}
-				}
-			}
-			for _, keep := range protected {
-				overlap, err := w.pathsOverlap(path, keep)
-				if err != nil {
-					return err
-				}
-				if overlap {
-					return fmt.Errorf("operation-directory-overlap: %s %s=%s affects %s", effect.Unit, directive, entry, keep)
-				}
-			}
-			if _, err := w.bindPath(path); err != nil {
-				return fmt.Errorf("operation-directory-evidence: %s %s: %w", effect.Unit, directive, err)
+			if err := check(filepath.Join(root, entry), directive); err != nil {
+				return err
 			}
 		}
 	}

@@ -22,7 +22,7 @@ func TestOperationAdmissionChecksEveryQuietServiceActivationSource(t *testing.T)
 						relation = "UpheldBy"
 					}
 					quiet[relation] = source
-					if err := f.inspector.AdmitQuietActivation(t.Context(), []string{unit}, nil); err == nil || !strings.Contains(err.Error(), "operation-unit-outside-set") {
+					if err := f.inspector.AdmitQuietActivation(t.Context(), []string{unit}, nil); err == nil || !strings.Contains(err.Error(), "operation-edge-outside-set") {
 						t.Fatalf("external trigger admitted: %v", err)
 					}
 				})

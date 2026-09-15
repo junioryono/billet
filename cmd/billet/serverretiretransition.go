@@ -35,7 +35,7 @@ var (
 	// retireBeforeRename runs immediately before the archive's rename, under
 	// every lock it holds; a test observes the host there. Nil in production.
 	retireBeforeRename func()
-	// retireBeforeStoppedProof observes the archive boundary after operation admission.
+	// retireBeforeStoppedProof observes status after backup waiting, or archive after admission.
 	retireBeforeStoppedProof func()
 	// retireBeforeConfigRename observes the boundary after the staged file flush.
 	retireBeforeConfigRename func()
@@ -674,6 +674,10 @@ func retireStop(ctx context.Context, j retirement.Journal) (retirement.Journal, 
 
 	if r := awaitRetireBackup(ctx, j); r != nil {
 		return j, r
+	}
+
+	if retireBeforeStoppedProof != nil {
+		retireBeforeStoppedProof()
 	}
 
 	if r := proveRetireStopped(ctx, j); r != nil {

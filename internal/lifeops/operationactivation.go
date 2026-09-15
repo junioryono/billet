@@ -36,12 +36,6 @@ func (i *Inspector) AdmitQuietActivation(ctx context.Context, units, exceptions 
 		observations[unit] = props
 		return props, nil
 	}
-	var timers []string
-	for _, unit := range units {
-		if strings.HasSuffix(unit, "-backup.service") || strings.HasSuffix(unit, "-upgrade.service") {
-			timers = append(timers, strings.TrimSuffix(unit, ".service")+".timer")
-		}
-	}
 	for _, unit := range units {
 		props, err := read(unit)
 		if err != nil {
@@ -56,8 +50,8 @@ func (i *Inspector) AdmitQuietActivation(ctx context.Context, units, exceptions 
 		}
 		for _, relation := range []string{"TriggeredBy", "UpheldBy"} {
 			for _, source := range strings.Fields(first(props, relation)) {
-				if !slices.Contains(timers, source) {
-					return fmt.Errorf("operation-unit-outside-set: %s %s=%s is not a retirement timer", unit, relation, source)
+				if relation != "TriggeredBy" || !operationTimerPair(source, unit) {
+					return fmt.Errorf("operation-edge-outside-set: %s %s=%s is not its own retirement timer", unit, relation, source)
 				}
 				from, err := read(source)
 				if err != nil {

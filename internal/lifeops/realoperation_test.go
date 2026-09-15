@@ -43,7 +43,7 @@ func TestRealSystemdRetirementOperationEffects(t *testing.T) {
 		})
 	}
 	t.Run("outside helper", realRetirementOutsideHelper)
-	for _, hazard := range []string{"success timer", "stop propagation", "shared runtime", "dns stop", "socket runtime", "billet truncation"} {
+	for _, hazard := range []string{"success timer", "standard completion anchor", "credential teardown", "stop propagation", "shared runtime", "dns stop", "socket runtime", "billet truncation"} {
 		for _, bypass := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/counterfactual=%v", hazard, bypass), func(t *testing.T) {
 				realRetirementHazard(t, hazard, bypass)
@@ -58,6 +58,7 @@ type realOperationHost struct {
 	installed []string
 	dropins   []string
 	masks     []string
+	loops     []string
 }
 
 func newRealOperationHost(t *testing.T) *realOperationHost {
@@ -66,6 +67,14 @@ func newRealOperationHost(t *testing.T) *realOperationHost {
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 45*time.Second)
 		defer cancel()
+		for _, name := range h.installed {
+			if strings.Contains(name, "@.") {
+				continue
+			}
+			if err := h.ctl(ctx, "disable", "--", name); err != nil {
+				t.Error(err)
+			}
+		}
 		// Stop activation sources first, then all services together: an
 		// OnSuccess job cannot escape cleanup by rearming a stopped timer.
 		for _, name := range h.installed {
@@ -86,14 +95,7 @@ func newRealOperationHost(t *testing.T) *realOperationHost {
 				t.Error(err)
 			}
 		}
-		for _, name := range h.installed {
-			if strings.Contains(name, "@.") {
-				continue
-			}
-			if err := h.ctl(ctx, "disable", "--", name); err != nil {
-				t.Error(err)
-			}
-		}
+
 		for _, path := range h.dropins {
 			if err := os.RemoveAll(path); err != nil {
 				t.Error(err)
@@ -111,6 +113,12 @@ func newRealOperationHost(t *testing.T) *realOperationHost {
 		}
 		if err := h.ctl(ctx, "daemon-reload"); err != nil {
 			t.Error(err)
+		}
+		for _, device := range h.loops {
+			out, err := exec.CommandContext(ctx, "losetup", "--detach", device).CombinedOutput()
+			if err != nil {
+				t.Errorf("detach %s: %v: %s", device, err, out)
+			}
 		}
 		for _, root := range []string{"/run", "/var/lib", "/var/cache", "/var/log", "/etc"} {
 			if err := os.RemoveAll(filepath.Join(root, h.prefix)); err != nil {
@@ -258,7 +266,7 @@ print(template.render(
 		h.write(strings.Replace(name, "billet-", h.prefix+"-", 1), strings.Join(lines, "\n"))
 	}
 	if role {
-		h.write(ledgerUnit, "[Mount]\nWhat=tmpfs\nType=tmpfs\nWhere="+ledgerPath+"\n")
+		realRetirementLedger(t, h, ledgerUnit, ledgerPath)
 	}
 	h.run("daemon-reload")
 	if role && retained {
@@ -268,6 +276,18 @@ print(template.render(
 	}
 	h.run("enable", "--", server)
 	h.run("start", "--", server)
+	ledgerInvocation := ""
+	if role {
+		ledgerInvocation = h.property(ledgerUnit, "InvocationID")
+		if h.property(ledgerUnit, "Type") != "ext4" || !strings.HasPrefix(h.property(ledgerUnit, "What"), "/dev/loop") {
+			t.Fatal("real ledger template is not mounted from the loop block device")
+		}
+		device := strings.TrimSuffix(operationPathUnit(h.property(ledgerUnit, "What")), ".mount") + ".device"
+		if !slices.Equal(strings.Fields(h.property(ledgerUnit, "StopPropagatedFrom")), []string{device}) ||
+			!slices.Contains(strings.Fields(h.property(device, "PropagatesStopTo")), ledgerUnit) {
+			t.Fatal("real ledger template lacks its exact implicit device stop-propagation pair")
+		}
+	}
 	if retained {
 		h.run("enable", "--", backupTimer, upgradeTimer)
 		h.run("start", "--", node, backupTimer, upgradeTimer)
@@ -387,6 +407,9 @@ print(template.render(
 	} else if h.property(node, "LoadState") != "not-found" {
 		t.Fatal("server-only retirement created a node")
 	}
+	if role && (h.property(ledgerUnit, "ActiveState") != "active" || h.property(ledgerUnit, "InvocationID") != ledgerInvocation) {
+		t.Fatal("dedicated ledger mount changed across retirement")
+	}
 	for n, unit := range protection.RequiredActive {
 		if h.property(unit, "ActiveState") != "active" || h.property(unit, "InvocationID") != networkInvocations[n] {
 			t.Fatalf("guest network changed across the handoff: %s", unit)
@@ -409,6 +432,8 @@ func realRetirementHazard(t *testing.T, hazard string, bypass bool) {
 	switch hazard {
 	case "success timer":
 		unitExtra = "OnSuccess=" + timer + "\n"
+	case "standard completion anchor":
+		unitExtra = "OnSuccess=multi-user.target\nOnSuccessJobMode=replace\n"
 	case "stop propagation":
 		unitExtra = "PropagatesStopTo=" + node + "\n"
 	case "shared runtime":
@@ -418,7 +443,11 @@ func realRetirementHazard(t *testing.T, hazard string, bypass bool) {
 	case "socket runtime":
 		unitExtra = "PropagatesStopTo=" + socket + "\n"
 	}
-	h.write(server, "[Unit]\nDefaultDependencies=no\n"+unitExtra+"[Service]\nType=exec\nExecStart=/bin/sleep infinity\n"+serviceExtra)
+	install := ""
+	if hazard == "standard completion anchor" {
+		install = "[Install]\nWantedBy=multi-user.target\n"
+	}
+	h.write(server, "[Unit]\nDefaultDependencies=no\n"+unitExtra+"[Service]\nType=exec\nExecStart=/bin/sleep infinity\n"+serviceExtra+install)
 	h.write(node, "[Unit]\nDefaultDependencies=no\n[Service]\nType=exec\nExecStart=/bin/sleep infinity\nRuntimeDirectory="+runtimeName+"\n")
 	h.write(timer, "[Unit]\nDefaultDependencies=no\n[Timer]\nOnActiveSec=1ms\nUnit="+backup+"\n")
 	h.write(backup, "[Unit]\nDefaultDependencies=no\n[Service]\nType=oneshot\nExecStart=/usr/bin/touch "+backupEffect+"\n")
@@ -427,6 +456,25 @@ func realRetirementHazard(t *testing.T, hazard string, bypass bool) {
 	h.write(h.prefix+"-socket-destination.service", "[Service]\nType=oneshot\nExecStart=/usr/bin/true\n")
 	h.run("daemon-reload")
 	h.run("start", "--", node, server, dns, socket)
+	if hazard == "standard completion anchor" {
+		h.run("enable", "--", server)
+		if h.property("multi-user.target", "ActiveState") != "active" || h.property(server, "UnitFileState") != "enabled" ||
+			!slices.Contains(strings.Fields(h.property("multi-user.target", "Wants")), server) {
+			t.Fatal("completion counterfactual lacks active anchor and enabled controller dependency")
+		}
+	}
+	if hazard == "credential teardown" {
+		dir := filepath.Join("/run/credentials", server)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := os.RemoveAll(dir); err != nil {
+				t.Error(err)
+			}
+		})
+		record = filepath.Join(dir, "node.crt")
+	}
 	for _, path := range []string{record, socketRecord} {
 		if err := os.WriteFile(path, []byte("original registration\n"), 0o600); err != nil {
 			t.Fatal(err)
@@ -444,6 +492,7 @@ func realRetirementHazard(t *testing.T, hazard string, bypass bool) {
 		h.run("daemon-reload")
 	}
 	nodeInvocation, dnsInvocation := h.property(node, "InvocationID"), h.property(dns, "InvocationID")
+	serverInvocation := h.property(server, "InvocationID")
 	protection := OperationProtection{
 		Units:     []string{server, node, timer, backup, dns},
 		UnitPaths: map[string][]string{node: {filepath.Dir(record), filepath.Dir(socketRecord)}},
@@ -452,6 +501,12 @@ func realRetirementHazard(t *testing.T, hazard string, bypass bool) {
 		err := h.admit([]Operation{{Verb: "stop", Unit: server}}, protection)
 		if err == nil || !strings.Contains(err.Error(), "operation-") {
 			t.Fatalf("preventive %s refusal missing: %v", hazard, err)
+		}
+		if hazard == "standard completion anchor" && !strings.Contains(err.Error(), "operation-edge-outside-set: "+server+" OnSuccess=multi-user.target") {
+			t.Fatalf("completion anchor refused for unrelated reason: %v", err)
+		}
+		if hazard == "credential teardown" && (!strings.Contains(err.Error(), "operation-directory-overlap") || !strings.Contains(err.Error(), "CredentialDirectory=/run/credentials/"+server)) {
+			t.Fatalf("credential teardown refused for unrelated reason: %v", err)
 		}
 		if hazard == "billet truncation" && !strings.Contains(err.Error(), "operation-setup-unsupported: "+server+" StandardOutput") {
 			t.Fatalf("truncation was refused for an unrelated reason: %v", err)
@@ -479,6 +534,11 @@ func realRetirementHazard(t *testing.T, hazard string, bypass bool) {
 		case "billet truncation":
 			body, err := os.ReadFile(record)
 			occurred = err == nil && len(body) == 0 && h.property(node, "ActiveState") == "active"
+		case "standard completion anchor":
+			occurred = h.property(server, "ActiveState") == "active" && h.property(server, "InvocationID") != serverInvocation
+		case "credential teardown":
+			_, err := os.Lstat(record)
+			occurred = os.IsNotExist(err) && h.property(node, "ActiveState") == "active"
 		case "success timer":
 			_, err := os.Stat(backupEffect)
 			occurred = err == nil
@@ -537,7 +597,7 @@ func realRetirementArchivePath(t *testing.T, bypass bool) {
 	}
 	if !bypass {
 		err := NewInspector().AdmitQuietActivation(t.Context(), []string{backup}, nil)
-		if err == nil || !strings.Contains(err.Error(), "operation-unit-outside-set") {
+		if err == nil || !strings.Contains(err.Error(), "operation-edge-outside-set") {
 			t.Fatalf("active path source admitted: %v", err)
 		}
 		after, err := os.Stat(identity)
@@ -576,10 +636,58 @@ func realRetirementOutsideHelper(t *testing.T) {
 	h.write(helper, "[Service]\nType=oneshot\nExecStart=/usr/bin/true\nExecStop=/usr/bin/true\nRemainAfterExit=yes\n")
 	h.run("daemon-reload")
 	h.run("start", "--", server, helper)
-	if err := h.admit([]Operation{{Verb: "stop", Unit: server}}, OperationProtection{Units: []string{server}}); err == nil || !strings.Contains(err.Error(), "operation-unit-outside-set: "+server+" PropagatesStopTo="+helper) {
+	if err := h.admit([]Operation{{Verb: "stop", Unit: server}}, OperationProtection{Units: []string{server}}); err == nil || !strings.Contains(err.Error(), "operation-edge-outside-set: "+server+" PropagatesStopTo="+helper) {
 		t.Fatalf("outside helper admitted: %v", err)
 	}
 	if h.property(server, "ActiveState") != "active" || h.property(helper, "ActiveState") != "active" {
 		t.Fatal("refusal performed a stop")
 	}
+}
+
+// The template and its real block-device graph are the control. A tmpfs stand-in
+// misses device binding and blockdev ordering. No workload runs on the device.
+func realRetirementLedger(t *testing.T, h *realOperationHost, unit, where string) {
+	t.Helper()
+	imagePath := filepath.Join(t.TempDir(), "ledger.ext4")
+	file, err := os.Create(imagePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resizeErr := file.Truncate(64 << 20)
+	closeErr := file.Close()
+	if resizeErr != nil || closeErr != nil {
+		t.Fatalf("allocate ledger image: %v %v", resizeErr, closeErr)
+	}
+	out, err := exec.CommandContext(t.Context(), "losetup", "--find", "--show", imagePath).CombinedOutput()
+	if err != nil {
+		t.Fatalf("attach ledger loop: %v: %s", err, out)
+	}
+	device := strings.TrimSpace(string(out))
+	if !strings.HasPrefix(device, "/dev/loop") || strings.ContainsAny(device, " \t\n") {
+		t.Fatalf("unexpected loop device: %q", device)
+	}
+	h.loops = append(h.loops, device)
+	out, err = exec.CommandContext(t.Context(), "mkfs.ext4", "-F", device).CombinedOutput()
+	if err != nil {
+		t.Fatalf("format ledger loop: %v: %s", err, out)
+	}
+	path := filepath.Join("..", "..", "ansible_collections", "junioryono", "billet", "roles", "host", "templates", "billet-ledger.mount.j2")
+	body, err := exec.CommandContext(t.Context(), "python3", "-c", `
+import sys
+from jinja2 import Environment, StrictUndefined
+env = Environment(undefined=StrictUndefined)
+env.filters["comment"] = lambda text: "# " + text
+with open(sys.argv[1], encoding="utf-8") as source:
+    template = env.from_string(source.read())
+print(template.render(
+    ansible_managed="disposable systemd retirement witness",
+    billet_ledger_volume_id="fixture-volume",
+    billet_ledger_device_path=sys.argv[2],
+    billet_candidate_server_state_dir=sys.argv[3],
+))
+`, path, device, where).CombinedOutput()
+	if err != nil {
+		t.Fatalf("render real ledger template: %v: %s", err, body)
+	}
+	h.write(unit, string(body))
 }

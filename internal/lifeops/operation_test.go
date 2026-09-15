@@ -102,14 +102,20 @@ func fixtureOperationSignature(name string) string {
 func (f *operationFixture) unit(t *testing.T, name string) map[string]string {
 	t.Helper()
 	path := filepath.Join(f.root, name)
-	if err := os.WriteFile(path, []byte("[Unit]\nDescription=operation fixture\n[Install]\nWantedBy=multi-user.target\n"), 0o644); err != nil {
+	body := "[Unit]\nDescription=operation fixture\n"
+	if strings.HasSuffix(name, ".timer") {
+		body += "[Install]\nWantedBy=timers.target\n"
+	} else if !strings.HasSuffix(name, "-backup.service") && !strings.HasSuffix(name, "-upgrade.service") {
+		body += "[Install]\nWantedBy=multi-user.target\n"
+	}
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	p := map[string]string{
 		"Id": name, "Names": name, "LoadState": "loaded", "ActiveState": "inactive", "UnitFileState": "disabled",
 		"FragmentPath": path, "SourcePath": "", "DropInPaths": "", "NeedDaemonReload": "no",
 		"OnSuccessJobMode": "fail", "OnFailureJobMode": "replace", "FailureAction": "none", "SuccessAction": "none",
-		"StartLimitAction": "none", "JobTimeoutAction": "none", "RequiresMountsFor": "", "Where": "/ledger",
+		"StartLimitAction": "none", "JobTimeoutAction": "none", "RequiresMountsFor": "", "Where": "/ledger", "What": "/dev/vdb1", "Type": "ext4",
 		"StandardInput": "null", "StandardOutput": "journal", "StandardError": "inherit",
 		"Transient": "no", "Job": "", "KillMode": "control-group", "DynamicUser": "no", "RuntimeDirectoryPreserve": "no", "StopWhenUnneeded": "no",
 	}
@@ -165,9 +171,9 @@ func TestOperationAdmissionClosesForwardReverseAndTransitiveEffects(t *testing.T
 				helper[c.property] = "billet-node.service"
 			}
 			err := f.inspector.AdmitOperations(t.Context(), []Operation{op}, protection)
-			want, name := "operation-protected-effect", "billet-node.service"
+			want, name := "operation-edge-outside-set", "billet-node.service"
 			if c.placement == "transitive" {
-				want, name = "operation-unit-outside-set", "helper.service"
+				want, name = "operation-edge-outside-set", "helper.service"
 			}
 			if err == nil || !strings.Contains(err.Error(), want) || !strings.Contains(err.Error(), name) {
 				t.Fatalf("unsafe %s path admitted: %v", c.property, err)
@@ -220,7 +226,7 @@ func TestOperationAdmissionSeparatesInstallationFromRuntimeProperties(t *testing
 					t.Fatal(err)
 				}
 				err := f.inspector.AdmitOperations(t.Context(), []Operation{op}, protection)
-				if err == nil || !(strings.Contains(err.Error(), "operation-install-") || strings.Contains(err.Error(), "operation-unit-outside-set")) {
+				if err == nil || !(strings.Contains(err.Error(), "operation-install-") || strings.Contains(err.Error(), "operation-edge-outside-set")) {
 					t.Fatalf("installation effect admitted: %v", err)
 				}
 				for _, call := range f.calls {
@@ -249,7 +255,7 @@ func TestOperationAdmissionRefusesAliasesInstancesAndMountStops(t *testing.T) {
 			p["PropagatesStopTo"] = c.helper
 			err := f.inspector.AdmitOperations(t.Context(), []Operation{{Verb: "stop", Unit: "billet-server.service"}},
 				OperationProtection{Units: []string{"billet-server.service", "billet-node.service"}, Paths: []string{"/ledger/identity"}})
-			if err == nil || !strings.Contains(err.Error(), "operation-unit-outside-set") {
+			if err == nil || !strings.Contains(err.Error(), "operation-edge-outside-set") {
 				t.Fatalf("protected %s admitted: %v", c.name, err)
 			}
 		})
@@ -288,10 +294,10 @@ func TestOperationAdmissionRefusesUnreadableDriftingAndOutsideEvidence(t *testin
 				want = "operation-source-unsupported"
 			case "job mode":
 				p["OnSuccessJobMode"], p["OnSuccess"] = "isolate", "helper.service"
-				want = "operation-unit-outside-set"
+				want = "operation-edge-outside-set"
 			case "outside set":
 				p["PropagatesStopTo"] = "helper.service"
-				want = "operation-unit-outside-set"
+				want = "operation-edge-outside-set"
 			}
 			err := f.inspector.AdmitOperations(t.Context(), []Operation{{Verb: "stop", Unit: "billet-server.service"}}, OperationProtection{})
 			if err == nil || !strings.Contains(err.Error(), want) {
@@ -352,6 +358,7 @@ func TestOperationAdmissionKeepsSupportedInfrastructureAndDirectoryLists(t *test
 	localFS["OnFailure"], localFS["OnFailureJobMode"] = "emergency.target", "replace-irreversibly"
 	localFS["Conflicts"] = "shutdown.target"
 	node["RuntimeDirectory"] = "billet/locks billet/registration"
+	node["RequiresMountsFor"] = "/run/billet/locks /run/billet/registration"
 	network["ActiveState"], root["ActiveState"], shutdown["ActiveState"] = "active", "active", "inactive"
 	root["FragmentPath"], root["Where"] = "", "/"
 	protection := OperationProtection{Units: []string{"billet-node.service", "billet-server.service"},
@@ -378,12 +385,13 @@ func TestOperationAdmissionRejectsActivationAndUnneededStopSources(t *testing.T)
 			trigger := f.unit(t, "activation.timer")
 			trigger["ActiveState"] = "active"
 			op := Operation{Verb: "stop", Unit: "billet-server.service"}
-			want := "operation-unit-outside-set"
+			want := "operation-edge-outside-set"
 			switch relation {
 			case "StopWhenUnneeded":
-				server["Requires"] = "billet-node.service"
-				node["StopWhenUnneeded"] = "yes"
-				want = "operation-protected-effect"
+				network := f.unit(t, "network-online.target")
+				network["ActiveState"], network["StopWhenUnneeded"] = "active", "yes"
+				server["Wants"] = "network-online.target"
+				want = "operation-standard-effect"
 			case "RequiresMountsFor":
 				op = Operation{Verb: "start", Unit: "billet-node.service"}
 				node[relation] = "/var/lib/billet/server"
@@ -457,7 +465,7 @@ func TestOperationAdmissionBindsInstallationToCurrentSources(t *testing.T) {
 		t.Fatal(err)
 	}
 	p["DropInPaths"] = dropin
-	if err := f.inspector.AdmitOperations(t.Context(), sequence, OperationProtection{}); err == nil || !strings.Contains(err.Error(), "operation-unit-outside-set") {
+	if err := f.inspector.AdmitOperations(t.Context(), sequence, OperationProtection{}); err == nil || !strings.Contains(err.Error(), "operation-edge-outside-set") {
 		t.Fatalf("effective installation drop-in was ignored: %v", err)
 	}
 	p["DropInPaths"] = ""
@@ -471,29 +479,24 @@ func TestOperationAdmissionBindsInstallationToCurrentSources(t *testing.T) {
 	}
 }
 
-func TestOperationAdmissionJobModeOnlyAppliesToNonemptyHandlers(t *testing.T) {
+// The same destination is safe as a boot dependency and unsafe as a new
+// completion transaction, regardless of the handler's job mode.
+func TestOperationAdmissionRejectsCompletionAnchorsInEveryJobMode(t *testing.T) {
 	for _, relation := range []string{"OnSuccess", "OnFailure"} {
 		for _, mode := range []string{"fail", "replace", "isolate", "flush", "ignore-dependencies"} {
 			t.Run(relation+"/"+mode, func(t *testing.T) {
 				f := newOperationFixture(t)
 				server := f.unit(t, "billet-server.service")
-				f.unit(t, "billet-node.service")
+				f.unit(t, "multi-user.target")["ActiveState"] = "active"
+				server["UnitFileState"], server["WantedBy"] = "enabled", "multi-user.target"
 				server[relation+"JobMode"] = mode
 				sequence := []Operation{{Verb: "stop", Unit: "billet-server.service"}}
-				protection := OperationProtection{Units: []string{"billet-node.service"}}
-				if err := f.inspector.AdmitOperations(t.Context(), sequence, protection); err != nil {
-					t.Fatalf("empty handler has no job-mode effect: %v", err)
+				if err := f.inspector.AdmitOperations(t.Context(), sequence, OperationProtection{}); err != nil {
+					t.Fatalf("enabled clean controller: %v", err)
 				}
-				server[relation] = "billet-node.service"
-				err := f.inspector.AdmitOperations(t.Context(), sequence, protection)
-				if mode != "fail" && mode != "replace" {
-					if err == nil || !strings.Contains(err.Error(), "operation-job-mode") {
-						t.Fatalf("unsupported transaction mode admitted: %v", err)
-					}
-					return
-				}
-				if err == nil || !strings.Contains(err.Error(), "operation-protected-effect") {
-					t.Fatalf("handler escaped its target: %v", err)
+				server[relation] = "multi-user.target"
+				if err := f.inspector.AdmitOperations(t.Context(), sequence, OperationProtection{}); err == nil || !strings.Contains(err.Error(), "operation-edge-outside-set: billet-server.service "+relation+"=multi-user.target") {
+					t.Fatalf("completion anchor admitted: %v", err)
 				}
 			})
 		}
@@ -606,7 +609,7 @@ func TestOperationAdmissionKeepsRequiredNetworkActive(t *testing.T) {
 	network["ActiveState"] = "active"
 	for _, unit := range []string{"billet-network.service", "billet-dnsmasq@br0.service"} {
 		server["PropagatesStopTo"] = unit
-		if err := f.inspector.AdmitOperations(t.Context(), []Operation{{Verb: "stop", Unit: "billet-server.service"}}, protection); err == nil || !strings.Contains(err.Error(), "operation-protected-effect") {
+		if err := f.inspector.AdmitOperations(t.Context(), []Operation{{Verb: "stop", Unit: "billet-server.service"}}, protection); err == nil || !strings.Contains(err.Error(), "operation-edge-outside-set") {
 			t.Fatalf("guest network stop admitted: %s %v", unit, err)
 		}
 	}
@@ -625,7 +628,7 @@ func TestOperationAdmissionClosesEveryRelationship(t *testing.T) {
 				}
 				server[relation] = "external.service"
 				// No evidence exists for the helper: refusal must precede a read.
-				if err := f.inspector.AdmitOperations(t.Context(), sequence, OperationProtection{}); err == nil || !strings.Contains(err.Error(), "operation-unit-outside-set: billet-server.service "+relation+"=external.service") {
+				if err := f.inspector.AdmitOperations(t.Context(), sequence, OperationProtection{}); err == nil || !strings.Contains(err.Error(), "operation-edge-outside-set: billet-server.service "+relation+"=external.service") {
 					t.Fatalf("outside unit admitted: %v", err)
 				}
 			})
@@ -635,25 +638,30 @@ func TestOperationAdmissionClosesEveryRelationship(t *testing.T) {
 
 func TestOperationAdmissionStandardUnitsAreOnlyNoops(t *testing.T) {
 	for _, c := range []struct {
-		relation, state, verb string
-		allowed               bool
+		relation, target, state, verb, refusal string
 	}{
-		{"Requires", "active", "start", true}, {"Requires", "inactive", "start", false},
-		{"After", "inactive", "start", true}, {"Before", "failed", "stop", true},
-		{"Conflicts", "inactive", "stop", true}, {"Conflicts", "inactive", "start", true},
-		{"PropagatesStopTo", "active", "stop", false}, {"PropagatesStopTo", "inactive", "stop", true},
+		{"Requires", "sysinit.target", "active", "start", ""},
+		{"Requires", "sysinit.target", "inactive", "start", "operation-standard-effect"},
+		{"After", "sysinit.target", "inactive", "start", ""},
+		{"Before", "shutdown.target", "failed", "stop", ""},
+		{"Conflicts", "shutdown.target", "inactive", "stop", ""},
+		{"Conflicts", "shutdown.target", "inactive", "start", ""},
+		{"Conflicts", "shutdown.target", "active", "start", "operation-standard-effect"},
+		{"Requires", "shutdown.target", "active", "start", "operation-edge-outside-set"},
+		{"PropagatesStopTo", "shutdown.target", "inactive", "stop", "operation-edge-outside-set"},
+		{"PropagatesStopTo", "shutdown.target", "active", "stop", "operation-edge-outside-set"},
 	} {
-		t.Run(c.relation+"/"+c.state+"/"+c.verb, func(t *testing.T) {
+		t.Run(c.relation+"/"+c.target+"/"+c.state+"/"+c.verb, func(t *testing.T) {
 			f := newOperationFixture(t)
 			server := f.unit(t, "billet-server.service")
-			standard := f.unit(t, "shutdown.target")
+			standard := f.unit(t, c.target)
 			standard["ActiveState"] = c.state
-			server[c.relation] = "shutdown.target"
+			server[c.relation] = c.target
 			err := f.inspector.AdmitOperations(t.Context(), []Operation{{Verb: c.verb, Unit: "billet-server.service"}}, OperationProtection{})
-			if c.allowed && err != nil {
+			if c.refusal == "" && err != nil {
 				t.Fatalf("no-op refused: %v", err)
 			}
-			if !c.allowed && (err == nil || !strings.Contains(err.Error(), "operation-standard-effect")) {
+			if c.refusal != "" && (err == nil || !strings.Contains(err.Error(), c.refusal)) {
 				t.Fatalf("standard transition admitted: %v", err)
 			}
 		})
@@ -705,7 +713,7 @@ func TestOperationAdmissionJudgesLoadedAliasesAsOneUnit(t *testing.T) {
 		}
 	}
 	server["After"] = "outside.service"
-	if err := f.inspector.AdmitOperations(t.Context(), []Operation{{Verb: "stop", Unit: "controller.service"}}, OperationProtection{Units: []string{"billet-server.service"}}); err == nil || !strings.Contains(err.Error(), "operation-unit-outside-set") {
+	if err := f.inspector.AdmitOperations(t.Context(), []Operation{{Verb: "stop", Unit: "controller.service"}}, OperationProtection{Units: []string{"billet-server.service"}}); err == nil || !strings.Contains(err.Error(), "operation-edge-outside-set") {
 		t.Fatalf("alias bypassed relationship judgment: %v", err)
 	}
 }
@@ -714,7 +722,15 @@ func TestOperationAdmissionProtectsDedicatedLedgerMount(t *testing.T) {
 	f := newOperationFixture(t)
 	server := f.unit(t, "billet-server.service")
 	mount := f.unit(t, "ledger.mount")
-	mount["Where"], mount["ActiveState"] = "/ledger", "active"
+	mount["Where"], mount["What"], mount["ActiveState"] = "/ledger", "/dev/vdb1", "active"
+	mount["Requires"] = "dev-vdb1.device -.mount"
+	mount["StopPropagatedFrom"] = "dev-vdb1.device"
+	mount["After"] = "dev-vdb1.device blockdev@dev-vdb1.target local-fs-pre.target -.mount dev.mount system.slice systemd-journald.socket"
+	mount["Before"], mount["Conflicts"] = "local-fs.target umount.target", "umount.target"
+	mount["RequiresMountsFor"] = "/ /dev/vdb1"
+	for _, name := range []string{"dev-vdb1.device", "-.mount", "dev.mount"} {
+		f.unit(t, name)["ActiveState"] = "active"
+	}
 	server["RequiresMountsFor"], server["Requires"] = "/ledger", "ledger.mount"
 	protection := OperationProtection{Units: []string{"billet-server.service"}, UnitPaths: map[string][]string{"billet-server.service": {"/ledger"}}}
 	sequence := []Operation{{Verb: "stop", Unit: "billet-server.service"}}
@@ -722,7 +738,7 @@ func TestOperationAdmissionProtectsDedicatedLedgerMount(t *testing.T) {
 		t.Fatalf("clean dedicated mount: %v", err)
 	}
 	mount["After"] = "outside.service"
-	if err := f.inspector.AdmitOperations(t.Context(), sequence, protection); err == nil || !strings.Contains(err.Error(), "operation-unit-outside-set: ledger.mount After=outside.service") {
+	if err := f.inspector.AdmitOperations(t.Context(), sequence, protection); err == nil || !strings.Contains(err.Error(), "operation-edge-outside-set: ledger.mount After=outside.service") {
 		t.Fatalf("ledger mount was treated as a standard leaf: %v", err)
 	}
 }
@@ -739,7 +755,7 @@ func TestOperationAdmissionRechecksOwnUnitsWithoutServiceOperations(t *testing.T
 		t.Fatalf("backup completion could remove registration: %v", err)
 	}
 	backup["RuntimeDirectory"], backup["OnSuccessOf"] = "", "outside.service"
-	if err := f.inspector.AdmitOperations(t.Context(), nil, protection); err == nil || !strings.Contains(err.Error(), "operation-unit-outside-set") {
+	if err := f.inspector.AdmitOperations(t.Context(), nil, protection); err == nil || !strings.Contains(err.Error(), "operation-edge-outside-set") {
 		t.Fatalf("empty operation sequence skipped closed set: %v", err)
 	}
 }
@@ -754,5 +770,165 @@ func TestOperationAdmissionRefusesExcessiveOwnUnitEvidence(t *testing.T) {
 	}
 	if err := f.inspector.AdmitOperations(t.Context(), nil, protection); err == nil || !strings.Contains(err.Error(), "operation-traversal-bound") {
 		t.Fatalf("unit evidence bound ignored: %v", err)
+	}
+}
+
+// Each row must fail on its edge, even when both endpoint names are protected.
+func TestOperationAdmissionClosesEdgesBetweenOwnUnits(t *testing.T) {
+	for _, relation := range strings.Fields("OnSuccess OnFailure Upholds PropagatesStopTo StopPropagatedFrom JoinsNamespaceOf Triggers OnSuccessOf OnFailureOf UpheldBy PartOf ConsistsOf Requisite RequisiteOf PropagatesReloadTo ReloadPropagatedFrom SliceOf Following") {
+		t.Run(relation, func(t *testing.T) {
+			f := newOperationFixture(t)
+			backup := f.unit(t, "billet-backup.service")
+			f.unit(t, "billet-server.service")
+			protection := OperationProtection{Units: []string{"billet-server.service", "billet-backup.service"}, WaitingUnits: []string{"billet-backup.service"}}
+			backup["ActiveState"], backup["Job"] = "activating", "42"
+			sequence := []Operation{{Verb: "stop", Unit: "billet-server.service"}}
+			if err := f.inspector.AdmitOperations(t.Context(), sequence, protection); err != nil {
+				t.Fatalf("in-flight backup control: %v", err)
+			}
+			backup[relation] = "billet-server.service"
+			if err := f.inspector.AdmitOperations(t.Context(), sequence, protection); err == nil || !strings.Contains(err.Error(), "operation-edge-outside-set: billet-backup.service "+relation+"=billet-server.service") {
+				t.Fatalf("in-flight backup edge admitted: %v", err)
+			}
+		})
+	}
+}
+
+func TestOperationAdmissionPairsEachTimerWithItsOwnService(t *testing.T) {
+	for _, timerName := range []string{"billet-backup.timer", "billet-upgrade.timer"} {
+		for _, inverse := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/inverse=%v", timerName, inverse), func(t *testing.T) {
+				f := newOperationFixture(t)
+				timer := f.unit(t, timerName)
+				serviceName := strings.TrimSuffix(timerName, ".timer") + ".service"
+				service := f.unit(t, serviceName)
+				otherName := "billet-server.service"
+				other := f.unit(t, otherName)
+				protection := OperationProtection{Units: []string{timerName, serviceName, otherName}}
+				sequence := []Operation{{Verb: "stop", Unit: timerName}}
+				if inverse {
+					service["TriggeredBy"] = timerName
+				} else {
+					timer["Triggers"] = serviceName
+				}
+				if err := f.inspector.AdmitOperations(t.Context(), sequence, protection); err != nil {
+					t.Fatalf("own timer control: %v", err)
+				}
+				if inverse {
+					other["TriggeredBy"] = timerName
+				} else {
+					timer["Triggers"] = otherName
+				}
+				if err := f.inspector.AdmitOperations(t.Context(), sequence, protection); err == nil || !strings.Contains(err.Error(), "operation-edge-outside-set") {
+					t.Fatalf("crossed timer pair admitted: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestOperationAdmissionProtectsImplicitCredentialTeardown(t *testing.T) {
+	for _, canonical := range []string{"billet-server.service", "billet-node.service", "billet-backup.service", "billet-upgrade.service"} {
+		for _, alias := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/alias=%v", canonical, alias), func(t *testing.T) {
+				f := newOperationFixture(t)
+				unit := f.unit(t, canonical)
+				target := canonical
+				if alias {
+					target = "alias.service"
+					unit["Names"] += " " + target
+					f.units[target] = unit
+				}
+				sequence := []Operation{{Verb: "stop", Unit: target}}
+				protection := OperationProtection{Units: []string{canonical}, Paths: []string{"/run/credentials/unrelated.service/node.crt"}}
+				if err := f.inspector.AdmitOperations(t.Context(), sequence, protection); err != nil {
+					t.Fatalf("unrelated credential path: %v", err)
+				}
+				protection.Paths = []string{filepath.Join("/run/credentials", canonical, "node.crt")}
+				if err := f.inspector.AdmitOperations(t.Context(), sequence, protection); err == nil || !strings.Contains(err.Error(), "operation-directory-overlap") || !strings.Contains(err.Error(), "CredentialDirectory=/run/credentials/"+canonical) {
+					t.Fatalf("implicit canonical credential teardown admitted: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestOperationAdmissionKeepsSeparateVarAnActiveLeaf(t *testing.T) {
+	for _, verb := range []string{"stop", "start", "disable"} {
+		t.Run(verb, func(t *testing.T) {
+			f := newOperationFixture(t)
+			server := f.unit(t, "billet-server.service")
+			server["RequiresMountsFor"] = "/var/lib/billet/server"
+			server["Requires"], server["After"] = "var.mount -.mount", "var.mount -.mount"
+			root := f.unit(t, "-.mount")
+			root["ActiveState"] = "active"
+			mount := f.unit(t, "var.mount")
+			mount["Where"], mount["What"], mount["ActiveState"] = "/var", "/dev/vdb1", "active"
+			mount["Requires"] = "dev-vdb1.device systemd-fsck@dev-vdb1.service -.mount"
+			mount["After"] = "dev-vdb1.device blockdev@dev-vdb1.target systemd-fsck@dev-vdb1.service local-fs-pre.target systemd-remount-fs.service -.mount"
+			mount["Before"], mount["Conflicts"] = "local-fs.target umount.target", "umount.target"
+			mount["StopPropagatedFrom"] = "dev-vdb1.device"
+			protection := OperationProtection{UnitPaths: map[string][]string{"billet-server.service": {"/var/lib/billet/server"}}}
+			sequence := []Operation{{Verb: verb, Unit: "billet-server.service"}}
+			if err := f.inspector.AdmitOperations(t.Context(), sequence, protection); err != nil {
+				t.Fatalf("separate /var on /dev/vdb1: %v", err)
+			}
+			for _, call := range f.calls {
+				if strings.HasSuffix(call, " var.mount") && strings.Contains(call, "--property=Requires") {
+					t.Fatalf("traversed ancestor mount graph: %s", call)
+				}
+			}
+			mount["ActiveState"] = "inactive"
+			if err := f.inspector.AdmitOperations(t.Context(), sequence, protection); err == nil || !strings.Contains(err.Error(), "operation-standard-effect: ancestor var.mount") {
+				t.Fatalf("inactive ancestor admitted: %v", err)
+			}
+			mount["ActiveState"] = "active"
+			server["Requires"] += " dev-vdc1.device"
+			if err := f.inspector.AdmitOperations(t.Context(), sequence, protection); err == nil || !strings.Contains(err.Error(), "operation-edge-outside-set: billet-server.service Requires=dev-vdc1.device") {
+				t.Fatalf("unrelated device admitted: %v", err)
+			}
+		})
+	}
+}
+
+func TestOperationAdmissionBindsMountEdgesToTheirSource(t *testing.T) {
+	for _, c := range []struct{ property, destination string }{
+		{"Requires", "dev-vdc1.device"},
+		{"After", "blockdev@dev-vdc1.target"},
+		{"After", "unrelated.mount"},
+		{"OnSuccess", "multi-user.target"},
+		{"Triggers", "billet-server.service"},
+	} {
+		t.Run(c.property+"/"+c.destination, func(t *testing.T) {
+			f := newOperationFixture(t)
+			server := f.unit(t, "billet-server.service")
+			server["Requires"], server["RequiresMountsFor"] = "ledger.mount", "/ledger"
+			mount := f.unit(t, "ledger.mount")
+			mount["ActiveState"], mount["What"] = "active", "/dev/vdb1"
+			mount["Requires"], mount["After"] = "dev-vdb1.device", "dev-vdb1.device blockdev@dev-vdb1.target"
+			mount["StopPropagatedFrom"] = "dev-vdb1.device"
+			protection := OperationProtection{UnitPaths: map[string][]string{"billet-server.service": {"/ledger"}}}
+			sequence := []Operation{{Verb: "disable", Unit: "billet-server.service"}}
+			if err := f.inspector.AdmitOperations(t.Context(), sequence, protection); err != nil {
+				t.Fatalf("block-backed mount control: %v", err)
+			}
+			mount[c.property] = c.destination
+			if err := f.inspector.AdmitOperations(t.Context(), sequence, protection); err == nil || !strings.Contains(err.Error(), "operation-edge-outside-set: ledger.mount "+c.property+"="+c.destination) {
+				t.Fatalf("unrelated mount edge admitted: %v", err)
+			}
+		})
+	}
+	f := newOperationFixture(t)
+	server := f.unit(t, "billet-server.service")
+	server["Requires"], server["RequiresMountsFor"] = "ledger.mount", "/ledger"
+	mount := f.unit(t, "ledger.mount")
+	mount["ActiveState"], mount["Type"], mount["What"], mount["After"] = "active", "tmpfs", "tmpfs", "swap.target"
+	protection := OperationProtection{UnitPaths: map[string][]string{"billet-server.service": {"/ledger"}}}
+	if err := f.inspector.AdmitOperations(t.Context(), []Operation{{Verb: "disable", Unit: "billet-server.service"}}, protection); err != nil {
+		t.Fatalf("tmpfs swap ordering: %v", err)
+	}
+	mount["Type"], mount["What"] = "ext4", "/dev/vdb1"
+	if err := f.inspector.AdmitOperations(t.Context(), []Operation{{Verb: "disable", Unit: "billet-server.service"}}, protection); err == nil || !strings.Contains(err.Error(), "operation-edge-outside-set: ledger.mount After=swap.target") {
+		t.Fatalf("tmpfs rule applied to block mount: %v", err)
 	}
 }

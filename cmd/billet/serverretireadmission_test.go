@@ -20,7 +20,7 @@ func installRetireOperationEvidence(t *testing.T, f *requestFixture) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(f.unitsDir, "billet-upgrade.service"),
 		"LoadState=loaded\nActiveState=inactive\nUnitFileState=static\n", 0o644)
-	for _, unit := range []string{serverUnit, nodeUnit, backupServiceUnit, "billet-upgrade.service", upgradeTimerUnit, backupTimerUnit, "billet-network.service", "billet-dnsmasq@br0.service", "billet-dnsmasq@br1.service", "sysinit.target", "local-fs.target", "systemd-firstboot.service", "helper.service"} {
+	for _, unit := range []string{serverUnit, nodeUnit, backupServiceUnit, "billet-upgrade.service", upgradeTimerUnit, backupTimerUnit, "billet-network.service", "billet-dnsmasq@br0.service", "billet-dnsmasq@br1.service", "sysinit.target", "local-fs.target", "multi-user.target", "systemd-firstboot.service", "helper.service"} {
 		if unit == "helper.service" || unit == "systemd-firstboot.service" {
 			writeFile(t, filepath.Join(f.unitsDir, unit), "LoadState=loaded\nActiveState=inactive\nUnitFileState=static\n", 0o644)
 		}
@@ -36,7 +36,9 @@ func installRetireOperationEvidence(t *testing.T, f *requestFixture) {
 		}
 		source := filepath.Join(root, unit)
 		body := "[Unit]\nDescription=fixture\n"
-		if unit != backupServiceUnit && unit != "billet-upgrade.service" {
+		if strings.HasSuffix(unit, ".timer") {
+			body += "[Install]\nWantedBy=timers.target\n"
+		} else if unit != backupServiceUnit && unit != "billet-upgrade.service" {
 			body += "[Install]\nWantedBy=multi-user.target\n"
 		}
 		writeFile(t, source, body, 0o644)
@@ -274,6 +276,9 @@ func TestRetirementReprovesEachStoppedBoundary(t *testing.T) {
 					}
 				}
 				retireBeforeStoppedProof = func() {
+					if boundary == "status" && drift == "backup process" {
+						move()
+					}
 					if boundary == "archive" && drift == "controller job" && requireRetireJournal(t).Phase == retirement.PhaseStopped {
 						move()
 					}
@@ -283,7 +288,7 @@ func TestRetirementReprovesEachStoppedBoundary(t *testing.T) {
 				})
 				if boundary == "status" {
 					f.manager.onDisable = func(unit string) {
-						if unit == serverUnit {
+						if unit == serverUnit && drift != "backup process" {
 							move()
 						}
 					}
@@ -689,7 +694,7 @@ func TestRetirementRefusesPathActivationBeforeArchiveRename(t *testing.T) {
 				retireBeforeRename = func() { installRetirePathWatcher(t, f, destination) }
 				t.Cleanup(func() { retireBeforeRename = saved })
 				next, r := retireArchive(t.Context(), j)
-				if r == nil || !strings.Contains(r.Why, "operation-unit-outside-set") || next.Phase != retirement.PhaseStopped {
+				if r == nil || !strings.Contains(r.Why, "operation-edge-outside-set") || next.Phase != retirement.PhaseStopped {
 					t.Fatalf("archive admitted an active path watcher: phase=%s refusal=%+v", next.Phase, r)
 				}
 				after, err := os.Stat(j.IdentityDir)
@@ -736,7 +741,7 @@ func TestRetirementReprovesActivationAtStoppedPublications(t *testing.T) {
 				t.Cleanup(func() { retirement.SyncingDir = saved })
 			}
 			next, r := retireStop(t.Context(), j)
-			if r == nil || !strings.Contains(r.Why, "operation-unit-outside-set") || next.Phase != j.Phase || requireRetireJournal(t).Phase != j.Phase {
+			if r == nil || !strings.Contains(r.Why, "operation-edge-outside-set") || next.Phase != j.Phase || requireRetireJournal(t).Phase != j.Phase {
 				t.Fatalf("publication crossed active source: next=%s refusal=%+v", next.Phase, r)
 			}
 			status, _, err := retirement.ReadStatus()
@@ -771,7 +776,7 @@ func TestRetirementRechecksActivationBeforeConfigMutation(t *testing.T) {
 				installRetirePathWatcher(t, f, "billet-upgrade.service")
 			}
 			next, r := retireRewrite(t.Context(), retireProofMode(f), nil, j)
-			if r == nil || !strings.Contains(r.Why, "operation-unit-outside-set") || next.Phase != j.Phase || mustRead(t, f.cfg) != before {
+			if r == nil || !strings.Contains(r.Why, "operation-edge-outside-set") || next.Phase != j.Phase || mustRead(t, f.cfg) != before {
 				t.Fatalf("config mutation crossed active source: next=%s refusal=%+v", next.Phase, r)
 			}
 			if requireRetireJournal(t).Phase != j.Phase || len(f.manager.operations) != 0 {
@@ -867,7 +872,7 @@ func TestRetirementChecksActivationBeforePreparingManagedDirectory(t *testing.T)
 	before, err := os.Stat(f.stateDir)
 	mustOK(t, err)
 	r = judgeHostPreconditions(t.Context(), retireProofMode(f), installed.cfg, &retirePlan{}, retireNow())
-	if r == nil || !strings.Contains(r.Why, "operation-unit-outside-set") {
+	if r == nil || !strings.Contains(r.Why, "operation-edge-outside-set") {
 		t.Fatalf("managed directory preparation admitted active source: %+v", r)
 	}
 	if _, err := os.Lstat(retirement.RetiredDir()); !os.IsNotExist(err) {
@@ -894,7 +899,7 @@ func TestRetirementRefusesStopOnlyHelperBeforeControllerStop(t *testing.T) {
 	setRetireEffect(t, f, "helper.service", "StandardOutput", "truncate")
 	before := mustRead(t, retirement.JournalPath())
 	r := stopAndDisableForRetirement(t.Context(), f.manager, j, serverUnit)
-	if r == nil || !strings.Contains(r.Why, "operation-unit-outside-set: billet-server.service PropagatesStopTo=helper.service") {
+	if r == nil || !strings.Contains(r.Why, "operation-edge-outside-set: billet-server.service PropagatesStopTo=helper.service") {
 		t.Fatalf("stop-only helper admitted: %+v", r)
 	}
 	if len(f.manager.operations) != 0 || mustRead(t, retirement.JournalPath()) != before {
@@ -908,7 +913,7 @@ func TestRetirementTimerExceptionsExpireBeforeDisable(t *testing.T) {
 			f := newRequestFixture(t)
 			f.reserve(t)
 			j := f.plantJournal(t, retirement.PhaseIntent, retirement.VariantServerOnly)
-			setRetireEffect(t, f, backupServiceUnit, "TriggeredBy", timer)
+			setRetireEffect(t, f, strings.TrimSuffix(timer, ".timer")+".service", "TriggeredBy", timer)
 			f.manager.set(timer, "ActiveState", "active")
 			if r := admitRetireOperation(t.Context(), j, "stop", timer); r != nil {
 				t.Fatalf("timer before its stop refused: %+v", r)
@@ -940,5 +945,96 @@ func TestRetirementAllowsBackupHandlingButNotStoppedProofOnResume(t *testing.T) 
 	}
 	if len(f.manager.operations) != 0 {
 		t.Fatalf("admission submitted operations: %v", f.manager.operations)
+	}
+}
+
+func TestRetirementRefusesEnabledControllerCompletionAnchorBeforeStop(t *testing.T) {
+	f := newRequestFixture(t)
+	f.retainANode(t)
+	f.reserve(t)
+	j := f.plantJournal(t, retirement.PhaseIntent, retirement.VariantRetainedNode)
+	f.manager.set(serverUnit, "UnitFileState", "enabled")
+	setRetireEffect(t, f, serverUnit, "WantedBy", "multi-user.target")
+	if r := admitRetireOperation(t.Context(), j, "stop", serverUnit); r != nil {
+		t.Fatalf("enabled controller control: %+v", r)
+	}
+	setRetireEffect(t, f, serverUnit, "OnSuccess", "multi-user.target")
+	setRetireEffect(t, f, serverUnit, "OnSuccessJobMode", "replace")
+	before := mustRead(t, retirement.JournalPath())
+	r := stopAndDisableForRetirement(t.Context(), f.manager, j, serverUnit)
+	if r == nil || r.Reason != retireReasonEffects || !strings.Contains(r.Why, "operation-edge-outside-set: billet-server.service OnSuccess=multi-user.target") {
+		t.Fatalf("standard completion anchor admitted: %+v", r)
+	}
+	if len(f.manager.operations) != 0 || mustRead(t, retirement.JournalPath()) != before {
+		t.Fatalf("completion refusal submitted a stop or changed phase: %v", f.manager.operations)
+	}
+}
+
+func TestRetirementRefusesControllerCredentialTeardownBeforeStop(t *testing.T) {
+	f := newRequestFixture(t)
+	f.retainANode(t)
+	f.reserve(t)
+	j := f.plantJournal(t, retirement.PhaseIntent, retirement.VariantRetainedNode)
+	if r := admitRetireOperation(t.Context(), j, "stop", serverUnit); r != nil {
+		t.Fatalf("clean controller: %+v", r)
+	}
+	// Path admission also protects resources whose current evidence is absence;
+	// the real-systemd witness places an existing node file beneath this path.
+	resource, err := observeRetireResource("/run/credentials/billet-server.service/node.crt")
+	mustOK(t, err)
+	j.RetainedInvocation.Resources = append(j.RetainedInvocation.Resources, resource)
+	before := mustRead(t, retirement.JournalPath())
+	r := stopAndDisableForRetirement(t.Context(), f.manager, j, serverUnit)
+	if r == nil || r.Reason != retireReasonEffects || !strings.Contains(r.Why, "operation-directory-overlap") || !strings.Contains(r.Why, "CredentialDirectory=/run/credentials/billet-server.service") {
+		t.Fatalf("implicit credential teardown admitted: %+v", r)
+	}
+	if len(f.manager.operations) != 0 || mustRead(t, retirement.JournalPath()) != before {
+		t.Fatalf("credential refusal stopped controller or changed phase: %v", f.manager.operations)
+	}
+}
+
+func TestRetirementRefusesCompletionOfBackupStartedAfterFactSnapshot(t *testing.T) {
+	f := newRequestFixture(t)
+	f.retainANode(t)
+	f.reserve(t)
+	j := f.plantJournal(t, retirement.PhaseIntent, retirement.VariantRetainedNode)
+	f.manager.set(backupServiceUnit, "LoadState", "loaded")
+	f.manager.set(backupServiceUnit, "ActiveState", "inactive")
+	f.manager.set(backupServiceUnit, "MainPID", "0")
+	setRetireEffect(t, f, backupServiceUnit, "OnSuccess", serverUnit)
+	facts, r := observeRetireFacts(t.Context(), retireProofMode(f), j)
+	if r != nil {
+		t.Fatal(r)
+	}
+	d := retirement.Decide(j.Variant, j.Phase, facts)
+	if facts.Backup != retirement.BackupInactive || d.Action != retirement.ActionStop {
+		t.Fatalf("inactive-backup snapshot did not select shutdown: %+v", d)
+	}
+	// Timer fires after the driver's snapshot. It remains in flight until
+	// controller shutdown; the fake returns observations and judges no policy.
+	f.manager.set(backupServiceUnit, "ActiveState", "activating")
+	f.manager.set(backupServiceUnit, "SubState", "start")
+	f.manager.set(backupServiceUnit, "MainPID", "99")
+	setRetireEffect(t, f, backupServiceUnit, "Job", "42")
+	completed := false
+	f.manager.onDisable = func(unit string) {
+		if unit != serverUnit {
+			return
+		}
+		completed = true
+		f.manager.set(backupServiceUnit, "ActiveState", "inactive")
+		f.manager.set(backupServiceUnit, "SubState", "dead")
+		f.manager.set(backupServiceUnit, "MainPID", "0")
+		setRetireEffect(t, f, backupServiceUnit, "Job", "")
+		f.manager.set(serverUnit, "ActiveState", "active")
+		f.manager.set(serverUnit, "MainPID", "100")
+	}
+	before := mustRead(t, retirement.JournalPath())
+	next, r := retireStop(t.Context(), j)
+	if r == nil || r.Reason != retireReasonEffects || !strings.Contains(r.Why, "operation-edge-outside-set: billet-backup.service OnSuccess=billet-server.service") {
+		t.Fatalf("in-flight backup completion was not admitted before shutdown: %+v", r)
+	}
+	if completed || len(f.manager.operations) != 0 || next.Phase != j.Phase || mustRead(t, retirement.JournalPath()) != before {
+		t.Fatalf("backup completion refusal came after controller shutdown: completed=%v phase=%s operations=%v", completed, next.Phase, f.manager.operations)
 	}
 }
