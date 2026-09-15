@@ -171,9 +171,10 @@ func runRetireManagerFake(ctx context.Context, name string, args []string, stdou
 			return err
 		}
 		changes := map[string]string{"UnitFileState": "disabled"}
-		if args[0] == "stop" {
+		switch args[0] {
+		case "stop":
 			changes = map[string]string{"ActiveState": "inactive", "SubState": "dead", "Result": "success", "MainPID": "0"}
-		} else if args[0] == "reset-failed" {
+		case "reset-failed":
 			changes = map[string]string{"ActiveState": "inactive", "SubState": "dead", "Result": "success", "ExecMainStatus": "0"}
 		}
 		lines := strings.Split(strings.TrimSuffix(string(body), "\n"), "\n")
