@@ -216,7 +216,13 @@ func performRetireAction(ctx context.Context, m retireMode, obs *installedConfig
 		}
 		return retireRewrite(ctx, m, obs, j)
 	case retirement.ActionAdvanceRewritten:
-		return retireAdvance(j, retirement.PhaseConfigRewritten, filepath.Dir(m.configPath))
+		if err := retireSyncDir(filepath.Dir(m.configPath)); err != nil {
+			return j, retireUnknown(retireReasonJournal, "flush configuration before recording its rewrite: "+err.Error(), "")
+		}
+		if r := proveRetireRequiredResources(ctx, j); r != nil {
+			return j, r
+		}
+		return retireAdvancePhase(j, retirement.PhaseConfigRewritten)
 	case retirement.ActionRestart:
 		return retireRestartNode(ctx, m.configPath, j)
 	case retirement.ActionDone:
@@ -816,10 +822,32 @@ func retireRewrite(ctx context.Context, m retireMode, obs *installedConfigObserv
 		return j, r
 	}
 	var boundaryRefusal *retireRefusal
-	if err := installRetireConfig(m.configPath, body, func() error {
+	if err := installRetireConfig(m.configPath, body, func(staged string) error {
+		if staged != "" {
+			replacement, err := observeRetireResource(staged)
+			if err != nil {
+				return err
+			}
+			replacement.Path = m.configPath
+			replacement.ResolvedPath, err = lifeops.ResolveOperationPath(m.configPath)
+			if err != nil {
+				return err
+			}
+			// Persist the staged inode before renaming it, so a crash can prove
+			// that this retirement installed the replacement it is resuming.
+			original := *j.RetainedInvocation
+			original.ConfigReplacement = &replacement
+			j.RetainedInvocation = &original
+			if err := j.Write(retireNow()); err != nil {
+				return err
+			}
+		}
 		boundaryRefusal = admitRetireRemaining(ctx, m, j)
 		if boundaryRefusal == nil {
 			boundaryRefusal = proveRetireActivation(ctx, false)
+		}
+		if boundaryRefusal == nil {
+			boundaryRefusal = proveRetireRequiredResources(ctx, j)
 		}
 		if boundaryRefusal != nil {
 			return errors.New(boundaryRefusal.Why)
@@ -832,6 +860,9 @@ func retireRewrite(ctx context.Context, m retireMode, obs *installedConfigObserv
 		return j, retireUnknown(retireReasonRewrite, err.Error(), "")
 	}
 
+	if r := proveRetireRequiredResources(ctx, j); r != nil {
+		return j, r
+	}
 	if obs != nil {
 		obs.sha256 = retirement.Digest(body)
 	}
@@ -843,7 +874,7 @@ func retireRewrite(ctx context.Context, m retireMode, obs *installedConfigObserv
 // owner and mode: a temporary file beside it, its bytes flushed, renamed over
 // the name, and the directory flushed, so a power loss leaves either
 // configuration whole and never half of one.
-func installRetireConfig(path string, body []byte, beforeMutation func() error) error {
+func installRetireConfig(path string, body []byte, beforeMutation func(string) error) error {
 	dir := filepath.Dir(path)
 
 	info, err := os.Stat(path)
@@ -851,7 +882,7 @@ func installRetireConfig(path string, body []byte, beforeMutation func() error) 
 		return fmt.Errorf("examine the installed configuration %s: %w", path, err)
 	}
 
-	if err := beforeMutation(); err != nil {
+	if err := beforeMutation(""); err != nil {
 		return err
 	}
 
@@ -898,7 +929,7 @@ func installRetireConfig(path string, body []byte, beforeMutation func() error) 
 		retireBeforeConfigRename()
 	}
 	// The temporary-file flush may block beyond the caller's admission.
-	if err := beforeMutation(); err != nil {
+	if err := beforeMutation(tmp.Name()); err != nil {
 		return err
 	}
 	if err := os.Rename(tmp.Name(), path); err != nil {

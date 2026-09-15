@@ -18,21 +18,23 @@ type Operation struct {
 // OperationProtection describes resources which must survive the operation.
 // Paths remain protected even against the target. Owned paths may be managed
 // by their own unit's directory directives. RequiredInputs must first pass the
-// volatile-input rule even for their own stop.
+// volatile-input rule even for their own stop, and may not traverse any
+// ArchivedInputRoots directory the caller will rename.
 // UnitPaths holds recreatable records and other operation-owned directories.
 // RequiredActive permits an idempotent dependency start while active, never
 // a stop. QuietUnits require
 // inactive activation sources; QuietExceptions are sources this sequence stops.
 // WaitingUnits defer backup activity to the caller's wait/reconciliation proof.
 type OperationProtection struct {
-	Units           []string
-	QuietUnits      []string
-	WaitingUnits    []string
-	QuietExceptions []string
-	RequiredActive  []string
-	Paths           []string
-	UnitPaths       map[string][]string
-	RequiredInputs  map[string][]string
+	Units              []string
+	QuietUnits         []string
+	WaitingUnits       []string
+	QuietExceptions    []string
+	RequiredActive     []string
+	Paths              []string
+	UnitPaths          map[string][]string
+	RequiredInputs     map[string][]string
+	ArchivedInputRoots []string
 }
 
 // WithOperationUnitDirectories selects the system manager's installation roots.
@@ -114,11 +116,14 @@ type operationWalk struct {
 // Protected roles have distinct canonical Ids; no role's Names may include
 // another role. Benign extra aliases of one role remain supported.
 // Required retained inputs (configuration, identity, credentials and other startup
-// files) never lie under /run, /tmp or /var/tmp: lexical and resolved paths and
+// files, including every mandatory loaded EnvironmentFiles entry) never lie
+// under /run, /tmp or /var/tmp: lexical and resolved paths and
 // every traversed prefix and symlink are checked against both forms of those
 // roots, independently of loaded settings or reload-preserved teardown state.
 // A violation refuses with retained-input-volatile, including the node's own
-// handoff. Only recreatable registration and lock records are disposable;
+// handoff. ArchivedInputRoots applies the same traversal proof to directories
+// the caller will rename, refusing with retained-input-archived. Only recreatable
+// registration and lock records are disposable;
 // cross-unit runtime, credential and private-tmp cleanup still protects them.
 // Direct triggers of protected services are checked.
 // Evidence is reread, and admission grants no future authority.

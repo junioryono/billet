@@ -117,3 +117,69 @@ func TestRequiredRetainedInputsRefuseUnknownTraversal(t *testing.T) {
 		t.Fatalf("unresolved required input admitted: %v", err)
 	}
 }
+
+func TestRequiredRetainedInputsRejectEveryArchiveTraversal(t *testing.T) {
+	root := t.TempDir()
+	identity, persistent := filepath.Join(root, "server"), filepath.Join(root, "etc")
+	for _, dir := range []string{identity, persistent} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	key := filepath.Join(persistent, "node.env")
+	if err := os.WriteFile(key, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	bridge, entry, parent := filepath.Join(identity, "bridge"), filepath.Join(root, "entry"), filepath.Join(root, "parent")
+	for link, target := range map[string]string{bridge: persistent, entry: bridge, parent: identity} {
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+	}
+	i := NewInspector(WithRetainedInputRoots(filepath.Join(root, "volatile")))
+	if err := i.AdmitRetainedInputs([]string{key}, identity); err != nil {
+		t.Fatalf("persistent archive-independent control refused: %v", err)
+	}
+	for _, path := range []string{filepath.Join(identity, "billet.yaml"), filepath.Join(parent, "billet.yaml"), filepath.Join(entry, "node.env")} {
+		if err := i.AdmitRetainedInputs([]string{path}, identity); err == nil || !strings.Contains(err.Error(), "retained-input-archived") {
+			t.Fatalf("archive-dependent input admitted: %s: %v", path, err)
+		}
+	}
+	cycle, outsideCycle := filepath.Join(identity, "cycle"), filepath.Join(root, "cycle-entry")
+	if err := os.Symlink(cycle, cycle); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(cycle, outsideCycle); err != nil {
+		t.Fatal(err)
+	}
+	if err := i.AdmitRetainedInputs([]string{outsideCycle}, identity); err == nil || !strings.Contains(err.Error(), "retained-input-archived") {
+		t.Fatalf("incomplete walk discarded a proved archive dependency: %v", err)
+	}
+	// Compare both forms of the archive root, even if the caller names its alias.
+	if err := i.AdmitRetainedInputs([]string{filepath.Join(identity, "billet.yaml")}, parent); err == nil || !strings.Contains(err.Error(), "retained-input-archived") {
+		t.Fatalf("resolved archive root ignored: %v", err)
+	}
+}
+
+func TestRequiredRetainedInputsRejectArchiveDependenceAtEveryAdmission(t *testing.T) {
+	for _, verb := range []string{"", "enable", "disable", "stop", "start"} {
+		t.Run(verb, func(t *testing.T) {
+			f := newOperationFixture(t)
+			f.unit(t, "billet-node.service")
+			p := OperationProtection{Units: []string{"billet-node.service"},
+				RequiredInputs:     map[string][]string{"billet-node.service": {"/etc/billet/node.env"}},
+				ArchivedInputRoots: []string{"/var/lib/billet/server"}}
+			var sequence []Operation
+			if verb != "" {
+				sequence = []Operation{{Verb: verb, Unit: "billet-node.service"}}
+			}
+			if err := f.inspector.AdmitOperations(t.Context(), sequence, p); err != nil {
+				t.Fatalf("persistent control refused: %v", err)
+			}
+			p.RequiredInputs["billet-node.service"] = []string{"/var/lib/billet/server/billet.yaml"}
+			if err := f.inspector.AdmitOperations(t.Context(), sequence, p); err == nil || !strings.Contains(err.Error(), "retained-input-archived") {
+				t.Fatalf("archived input admitted for %s: %v", verb, err)
+			}
+		})
+	}
+}

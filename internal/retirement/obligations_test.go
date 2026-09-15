@@ -35,12 +35,28 @@ func TestRemainingServiceActionsFollowTheExecutableDecision(t *testing.T) {
 }
 
 func TestRetainedInvocationEvidenceCannotNameAnUnprovedResource(t *testing.T) {
-	for _, problem := range []string{"healthy", "zero pid", "bad invocation", "no resources", "relative", "duplicate", "absent with inode", "no inode", "relative config", "disposable guest network"} {
+	for _, problem := range []string{"healthy", "zero pid", "bad invocation", "no resources", "relative", "duplicate", "absent with inode", "no inode", "relative config", "disposable guest network", "foreign identity directory", "replacement path", "replacement absent", "replacement disposable", "replacement unresolved", "replacement no inode"} {
 		t.Run(problem, func(t *testing.T) {
 			j := Journal{Variant: VariantRetainedNode, Deployment: "deployment", RetainedInvocation: &RetainedInvocation{
 				InvocationID: strings.Repeat("a", 32), MainPID: "42", Deployment: "deployment", Node: "node", Incarnation: "incarnation", Endpoint: "https://example.test:7717", Resources: []RetainedResource{{Path: "/run/billet/registration", Inode: 1}},
 			}}
+			if strings.HasPrefix(problem, "replacement") {
+				j.RetainedInvocation.ConfigPath = "/etc/billet/billet.yaml"
+				j.RetainedInvocation.ConfigReplacement = &RetainedResource{Path: "/etc/billet/billet.yaml", ResolvedPath: "/etc/billet/billet.yaml", Inode: 2}
+			}
 			switch problem {
+			case "foreign identity directory":
+				j.RetainedInvocation.IdentityDir = "/var/lib/other"
+			case "replacement path":
+				j.RetainedInvocation.ConfigReplacement.Path = "/etc/other.yaml"
+			case "replacement absent":
+				j.RetainedInvocation.ConfigReplacement.Absent = true
+			case "replacement disposable":
+				j.RetainedInvocation.ConfigReplacement.Runtime = true
+			case "replacement unresolved":
+				j.RetainedInvocation.ConfigReplacement.ResolvedPath = ""
+			case "replacement no inode":
+				j.RetainedInvocation.ConfigReplacement.Inode = 0
 			case "zero pid":
 				j.RetainedInvocation.MainPID = "0"
 			case "bad invocation":

@@ -7,7 +7,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/retirement"
+	"github.com/junioryono/billet/internal/state"
 )
 
 func TestRetirementKeepsRequiredTLSOutOfDisposableRuntimeRecords(t *testing.T) {
@@ -167,6 +169,11 @@ func TestRetirementCapturesOnlyRecreatedRecordsAsDisposable(t *testing.T) {
 	if want.ConfigPath != f.cfg || !slices.Contains(p.RequiredInputs[nodeUnit], f.cfg) {
 		t.Fatal("captured configuration is not a required input")
 	}
+	configResource, err := observeRetireResource(f.cfg)
+	mustOK(t, err)
+	if !slices.Contains(want.Resources, configResource) {
+		t.Fatal("configuration has no captured resource identity")
+	}
 	for _, path := range []string{installed.cfg.Node.TLS.CertPath, installed.cfg.Node.TLS.KeyPath, installed.cfg.Node.TLS.CAPath, installed.cfg.Node.StateDir} {
 		if !slices.Contains(p.RequiredInputs[nodeUnit], path) || slices.Contains(p.UnitPaths[nodeUnit], path) {
 			t.Fatalf("required input classified as disposable: %s", path)
@@ -179,6 +186,47 @@ func TestRetirementCapturesOnlyRecreatedRecordsAsDisposable(t *testing.T) {
 		}
 		if disposable && !slices.Contains(p.UnitPaths[nodeUnit], resource.Path) {
 			t.Fatalf("recreated record lost its ownership: %s", resource.Path)
+		}
+	}
+}
+
+func TestRetirementCapturesEveryConfiguredStartupPath(t *testing.T) {
+	f := newRequestFixture(t)
+	f.retainANode(t)
+	installed, r := observeRetireConfig(f.cfg)
+	if r != nil {
+		t.Fatal(r)
+	}
+	root := t.TempDir()
+	n := installed.cfg.Node
+	n.Provider = config.ProviderFirecracker
+	n.Ceph = &config.CephConfig{ConfPath: filepath.Join(root, "ceph.conf"), KeyringPath: filepath.Join(root, "ceph.keyring")}
+	n.Firecracker = &config.FirecrackerConfig{Bridge: "br0", BinaryPath: filepath.Join(root, "firecracker"),
+		JailerPath: filepath.Join(root, "jailer"), KernelImage: filepath.Join(root, "kernel"),
+		KernelDir: filepath.Join(root, "kernels"), ChrootBase: filepath.Join(root, "jails")}
+	n.Cache = &config.NodeCacheConfig{TLSCert: filepath.Join(root, "cache.crt"), TLSKey: filepath.Join(root, "cache.key")}
+	for _, dir := range []string{n.StateDir, n.Firecracker.KernelDir, n.Firecracker.ChrootBase} {
+		mustOK(t, os.MkdirAll(dir, 0o700))
+	}
+	files := []string{state.DeploymentIDPath(n.StateDir), n.Ceph.ConfPath, n.Ceph.KeyringPath,
+		n.Firecracker.BinaryPath, n.Firecracker.JailerPath, n.Firecracker.KernelImage, n.Cache.TLSCert, n.Cache.TLSKey}
+	for _, path := range files {
+		writeFile(t, path, "fixture input", 0o600)
+	}
+	want, r := captureRetireInvocation(t.Context(), installed.cfg, f.cfg)
+	if r != nil {
+		t.Fatal(r)
+	}
+	// Enumerate the reader's paths independently of nodePathsOf, so deleting an
+	// entry from the production enumeration cannot also delete the expectation.
+	paths := append(files, f.cfg, n.StateDir, n.TLS.CertPath, n.TLS.KeyPath, n.TLS.CAPath,
+		n.Firecracker.KernelDir, n.Firecracker.ChrootBase)
+	protection := retireOperationProtection(retirement.Journal{RetainedInvocation: want})
+	for _, path := range paths {
+		resource, err := observeRetireResource(path)
+		mustOK(t, err)
+		if resource.Absent || !slices.Contains(want.Resources, resource) || !slices.Contains(protection.RequiredInputs[nodeUnit], path) {
+			t.Fatalf("startup input lacks required resource identity: %s", path)
 		}
 	}
 }

@@ -36,9 +36,11 @@ func (w *operationWalk) otherUnitPaths(effect string) []string {
 
 // AdmitRetainedInputs supplies the same current path proof at stopped and
 // archive boundaries, without querying units or assuming their teardown state.
-func (i *Inspector) AdmitRetainedInputs(paths []string) error {
+// Required inputs may traverse neither volatile roots nor directories the caller
+// will archive, including an intermediate symlink that leads back outside.
+func (i *Inspector) AdmitRetainedInputs(paths []string, archivedRoots ...string) error {
 	w := operationWalk{inspector: i, paths: make(map[string]operationPathBinding),
-		protection: OperationProtection{RequiredInputs: map[string][]string{"": paths}}}
+		protection: OperationProtection{RequiredInputs: map[string][]string{"": paths}, ArchivedInputRoots: archivedRoots}}
 	if err := w.admitRetainedInputs(); err != nil {
 		return err
 	}
@@ -60,20 +62,31 @@ func (w *operationWalk) admitRetainedInputs() error {
 	return nil
 }
 
-func (w *operationWalk) admitRetainedInput(path string, roots []string) error {
+func (w *operationWalk) admitRetainedInput(path string, volatileRoots []string) error {
+	type boundary struct {
+		root   string
+		reason string
+	}
+	var boundaries []boundary
+	for _, root := range volatileRoots {
+		boundaries = append(boundaries, boundary{root, "retained-input-volatile"})
+	}
+	for _, root := range w.protection.ArchivedInputRoots {
+		boundaries = append(boundaries, boundary{root, "retained-input-archived"})
+	}
 	// A known lexical violation needs no successful traversal of the input.
-	for _, root := range roots {
-		if Contained(root, path) {
-			return fmt.Errorf("retained-input-volatile: %s traverses %s", path, root)
+	for _, bound := range boundaries {
+		if Contained(bound.root, path) {
+			return fmt.Errorf("%s: %s traverses %s", bound.reason, path, bound.root)
 		}
 	}
-	forms := slices.Clone(roots)
-	for _, root := range roots {
-		resolved, err := w.bindPath(root)
+	forms := slices.Clone(boundaries)
+	for _, bound := range boundaries {
+		resolved, err := w.bindPath(bound.root)
 		if err != nil {
 			return err
 		}
-		forms = append(forms, resolved)
+		forms = append(forms, boundary{resolved, bound.reason})
 	}
 	binding, bound := w.paths[path]
 	var pathErr error
@@ -84,11 +97,12 @@ func (w *operationWalk) admitRetainedInput(path string, roots []string) error {
 	for _, object := range binding.Objects {
 		entries = append(entries, object.Path)
 	}
-	// Even an incomplete walk may prove it traversed volatile storage.
+	// An incomplete walk can still prove either forbidden dependency. Check
+	// both classes before reporting the unresolved suffix as unknown.
 	for _, entry := range entries {
-		for _, root := range forms {
-			if Contained(root, entry) {
-				return fmt.Errorf("retained-input-volatile: %s traverses %s", path, root)
+		for _, form := range forms {
+			if Contained(form.root, entry) {
+				return fmt.Errorf("%s: %s traverses %s", form.reason, path, form.root)
 			}
 		}
 	}

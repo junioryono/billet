@@ -9,16 +9,18 @@ import (
 // RetainedInvocation is the pre-handoff node evidence recorded before intent.
 // An old journal without it cannot prove that shutdown left this node intact.
 type RetainedInvocation struct {
-	InvocationID string             `json:"invocation_id"`
-	MainPID      string             `json:"main_pid"`
-	Deployment   string             `json:"deployment"`
-	Node         string             `json:"node"`
-	Incarnation  string             `json:"incarnation"`
-	Endpoint     string             `json:"endpoint"`
-	Resources    []RetainedResource `json:"resources"`
-	ConfigPath   string             `json:"config_path,omitempty"`
-	Provider     string             `json:"provider,omitempty"`
-	Services     []RetainedService  `json:"services,omitempty"`
+	InvocationID      string             `json:"invocation_id"`
+	MainPID           string             `json:"main_pid"`
+	Deployment        string             `json:"deployment"`
+	Node              string             `json:"node"`
+	Incarnation       string             `json:"incarnation"`
+	Endpoint          string             `json:"endpoint"`
+	Resources         []RetainedResource `json:"resources"`
+	ConfigPath        string             `json:"config_path,omitempty"`
+	Provider          string             `json:"provider,omitempty"`
+	Services          []RetainedService  `json:"services,omitempty"`
+	IdentityDir       string             `json:"identity_dir,omitempty"`
+	ConfigReplacement *RetainedResource  `json:"config_replacement,omitempty"`
 }
 
 // RetainedService binds the guest network to its original active invocation.
@@ -77,6 +79,15 @@ func (j *Journal) retainedInvocationWellFormed() error {
 	}
 	if original.ConfigPath != "" && (!filepath.IsAbs(original.ConfigPath) || filepath.Clean(original.ConfigPath) != original.ConfigPath) {
 		return errors.New("journal carries an invalid retained configuration path")
+	}
+	if original.IdentityDir != "" && original.IdentityDir != j.IdentityDir {
+		return errors.New("journal carries a different retained identity directory")
+	}
+	if replacement := original.ConfigReplacement; replacement != nil {
+		if replacement.Path != original.ConfigPath || replacement.Absent || replacement.Runtime || replacement.GuestNetwork ||
+			replacement.Inode == 0 || !filepath.IsAbs(replacement.ResolvedPath) || filepath.Clean(replacement.ResolvedPath) != replacement.ResolvedPath {
+			return errors.New("journal carries invalid retained configuration replacement evidence")
+		}
 	}
 	seen := make(map[string]bool)
 	for _, resource := range original.Resources {
