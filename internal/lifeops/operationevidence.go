@@ -3,6 +3,8 @@ package lifeops
 import (
 	"crypto/sha256"
 	"fmt"
+	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
@@ -57,16 +59,38 @@ func operationRuntimeChanges(unit string, before, after map[string][]string) []s
 	return changes
 }
 
-// All five values are required: a mask pathname alone proves no quiet state.
-func operationQuietMask(props map[string][]string) bool {
+// Ubuntu 24.04/systemd 255.4 CI (2026-09-15) reports the mask's own
+// FragmentPath. All five values and the actual /dev/null link prove quietness.
+func operationQuietMask(props map[string][]string) (bool, error) {
 	for _, property := range []string{"LoadState", "FragmentPath", "UnitFileState", "ActiveState", "Job"} {
 		if len(props[property]) != 1 {
-			return false
+			return false, nil
 		}
 	}
-	return first(props, "LoadState") == "masked" && first(props, "FragmentPath") == "/dev/null" &&
-		slices.Contains([]string{"masked", "masked-runtime"}, first(props, "UnitFileState")) &&
-		first(props, "ActiveState") == "inactive" && first(props, "Job") == ""
+	if first(props, "LoadState") != "masked" ||
+		!slices.Contains([]string{"masked", "masked-runtime"}, first(props, "UnitFileState")) ||
+		first(props, "ActiveState") != "inactive" || first(props, "Job") != "" {
+		return false, nil
+	}
+	path := first(props, "FragmentPath")
+	if path == "/dev/null" {
+		return true, nil
+	}
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return false, nil
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return false, fmt.Errorf("operation-mask-unreadable: lstat %s: %w", path, err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		return false, nil
+	}
+	target, err := os.Readlink(path)
+	if err != nil {
+		return false, fmt.Errorf("operation-mask-unreadable: readlink %s: %w", path, err)
+	}
+	return target == "/dev/null", nil
 }
 
 // Source bodies can contain environment credentials; identify byte changes by

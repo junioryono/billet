@@ -8,6 +8,26 @@ import (
 	"strings"
 )
 
+// CI on systemd 255.4 (2026-09-15) reports escaped mount and slice names as
+// double-quoted array entries with doubled backslashes. Decode that display
+// layer only; the remaining unit-name escapes are part of the unit's identity.
+// v255 src/shared/bus-print-properties.c:225-237 uses shell_maybe_quote for
+// string arrays. Scalar Id and FragmentPath are not rendered this way.
+func operationUnitList(value string) (string, error) {
+	entries := strings.Fields(value)
+	for n, entry := range entries {
+		if !strings.HasPrefix(entry, "\"") {
+			continue
+		}
+		decoded, err := strconv.Unquote(entry)
+		if err != nil || !operationUnitName(decoded) {
+			return "", fmt.Errorf("unsupported quoted unit name %q", entry)
+		}
+		entries[n] = decoded
+	}
+	return strings.Join(entries, " "), nil
+}
+
 // Empty arrays of structs are omitted by systemctl show, even with --all:
 // https://github.com/systemd/systemd/blob/v255/src/systemctl/systemctl-show.c.
 // A typed busctl response proves an empty array; missing show output cannot.

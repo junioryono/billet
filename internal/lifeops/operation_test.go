@@ -764,7 +764,7 @@ func TestOperationAdmissionProtectsDedicatedLedgerMount(t *testing.T) {
 	mount["After"] = "dev-vdb1.device blockdev@dev-vdb1.target local-fs-pre.target -.mount dev.mount system.slice systemd-journald.socket"
 	mount["Before"], mount["Conflicts"] = "local-fs.target umount.target", "umount.target"
 	mount["RequiresMountsFor"] = "/ /dev/vdb1"
-	for _, name := range []string{"dev-vdb1.device", "-.mount", "dev.mount"} {
+	for _, name := range []string{"dev-vdb1.device", "-.mount", "dev.mount", "system.slice"} {
 		f.unit(t, name)["ActiveState"] = "active"
 	}
 	server["RequiresMountsFor"], server["Requires"] = "/ledger", "ledger.mount"

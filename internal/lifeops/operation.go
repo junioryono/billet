@@ -282,7 +282,11 @@ func (w *operationWalk) read(ctx context.Context, unit string) (operationEvidenc
 	if !operationUnitName(first(props, "Id")) || !slices.Contains(strings.Fields(first(props, "Names")), first(props, "Id")) {
 		return operationEvidence{}, fmt.Errorf("operation-names-unknown: %s has no complete canonical names", unit)
 	}
-	if operationQuietMask(props) && (strings.HasSuffix(unit, ".timer") || first(props, "UnitFileState") == "masked") {
+	masked, err := operationQuietMask(props)
+	if err != nil {
+		return operationEvidence{}, fmt.Errorf("%s: %w", unit, err)
+	}
+	if masked && (strings.HasSuffix(unit, ".timer") || first(props, "UnitFileState") == "masked") {
 		return operationEvidence{props: props}, nil
 	}
 	if first(props, "LoadState") != "loaded" || first(props, "NeedDaemonReload") != "no" {

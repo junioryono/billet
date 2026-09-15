@@ -71,7 +71,7 @@ func TestOperationRereadRejudgesStateAndUnorderedEdges(t *testing.T) {
 
 func TestOperationAdmissionQuietMaskRequiresPositiveEvidence(t *testing.T) {
 	for _, state := range []string{"masked", "masked-runtime"} {
-		for _, problem := range []string{"", "activity", "job", "fragment", "enablement", "load"} {
+		for _, problem := range []string{"", "dev-null", "activity", "job", "fragment", "missing", "wrong target", "enablement", "load"} {
 			t.Run(state+"/"+problem, func(t *testing.T) {
 				f := newOperationFixture(t)
 				timer := f.unit(t, "billet-backup.timer")
@@ -82,14 +82,30 @@ func TestOperationAdmissionQuietMaskRequiresPositiveEvidence(t *testing.T) {
 				if err := os.Symlink("/dev/null", path); err != nil {
 					t.Fatal(err)
 				}
-				timer["LoadState"], timer["FragmentPath"], timer["UnitFileState"] = "masked", "/dev/null", state
+				timer["LoadState"], timer["UnitFileState"] = "masked", state
 				switch problem {
+				case "dev-null":
+					timer["FragmentPath"] = "/dev/null"
 				case "activity":
 					timer["ActiveState"] = "active"
 				case "job":
 					timer["Job"] = "42"
 				case "fragment":
-					timer["FragmentPath"] = path
+					if err := os.Remove(path); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(path, nil, 0o644); err != nil {
+						t.Fatal(err)
+					}
+				case "missing", "wrong target":
+					if err := os.Remove(path); err != nil {
+						t.Fatal(err)
+					}
+					if problem == "wrong target" {
+						if err := os.Symlink("/dev/zero", path); err != nil {
+							t.Fatal(err)
+						}
+					}
 				case "enablement":
 					timer["UnitFileState"] = "enabled"
 				case "load":
@@ -97,9 +113,15 @@ func TestOperationAdmissionQuietMaskRequiresPositiveEvidence(t *testing.T) {
 				}
 				p := OperationProtection{Units: []string{"billet-backup.timer"}}
 				err := f.inspector.AdmitOperations(t.Context(), []Operation{{Verb: "stop", Unit: "billet-backup.timer"}, {Verb: "disable", Unit: "billet-backup.timer"}}, p)
-				if problem == "" {
+				if problem == "" || problem == "dev-null" {
 					if err != nil {
 						t.Fatalf("quiet mask refused: %v", err)
+					}
+					return
+				}
+				if problem == "missing" {
+					if err == nil || !strings.Contains(err.Error(), "operation-mask-unreadable: lstat "+path) {
+						t.Fatalf("missing mask became positive absence: %v", err)
 					}
 					return
 				}

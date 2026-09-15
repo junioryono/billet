@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -169,6 +170,12 @@ func (i *Inspector) properties(ctx context.Context, unit string, names ...string
 				return nil, fmt.Errorf("operation-property-unknown: malformed complete property set for %s", unit)
 			}
 			continue
+		}
+		if key == "Names" || slices.Contains(operationRelations, key) {
+			value, err = operationUnitList(value)
+			if err != nil {
+				return nil, fmt.Errorf("operation-property-unknown: %s %s: %w", unit, key, err)
+			}
 		}
 		props[key] = append(props[key], value)
 	}

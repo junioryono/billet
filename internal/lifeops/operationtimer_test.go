@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -11,14 +13,27 @@ import (
 
 func TestRetirementTimerHelpersRequirePositiveAbsence(t *testing.T) {
 	for _, verb := range []string{"stop", "disable"} {
-		for _, problem := range []string{"absent", "loaded", "masked", "masked-runtime", "masked active", "masked job", "masked fragment", "masked enablement", "read error", "missing state", "active", "job", "fragment", "enablement", "command error"} {
+		for _, problem := range []string{"absent", "loaded", "masked", "masked-runtime", "masked dev-null", "masked active", "masked job", "masked fragment", "masked missing", "masked target", "masked enablement", "read error", "missing state", "active", "job", "fragment", "enablement", "command error"} {
 			t.Run(verb+"/"+problem, func(t *testing.T) {
 				props := map[string]string{"LoadState": "not-found", "ActiveState": "inactive", "UnitFileState": "", "FragmentPath": "", "Job": ""}
 				switch problem {
 				case "loaded", "command error":
 					props["LoadState"], props["FragmentPath"], props["UnitFileState"] = "loaded", "/run/systemd/system/retirement.timer", "disabled"
-				case "masked", "masked-runtime", "masked active", "masked job", "masked fragment", "masked enablement":
+				case "masked", "masked-runtime", "masked dev-null", "masked active", "masked job", "masked fragment", "masked missing", "masked target", "masked enablement":
 					props["LoadState"], props["FragmentPath"], props["UnitFileState"] = "masked", "/dev/null", "masked"
+					if problem != "masked dev-null" {
+						path := filepath.Join(t.TempDir(), "retirement.timer")
+						props["FragmentPath"] = path
+						if problem != "masked missing" {
+							target := "/dev/null"
+							if problem == "masked target" {
+								target = "/dev/zero"
+							}
+							if err := os.Symlink(target, path); err != nil {
+								t.Fatal(err)
+							}
+						}
+					}
 				case "missing state":
 					delete(props, "ActiveState")
 				case "active":
@@ -39,7 +54,12 @@ func TestRetirementTimerHelpersRequirePositiveAbsence(t *testing.T) {
 				case "masked job":
 					props["Job"] = "42"
 				case "masked fragment":
-					props["FragmentPath"] = "/run/systemd/system/retirement.timer"
+					if err := os.Remove(props["FragmentPath"]); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(props["FragmentPath"], nil, 0o644); err != nil {
+						t.Fatal(err)
+					}
 				case "masked enablement":
 					props["UnitFileState"] = "enabled"
 				}
@@ -75,7 +95,7 @@ func TestRetirementTimerHelpersRequirePositiveAbsence(t *testing.T) {
 				} else {
 					err = c.Disable(t.Context(), "retirement.timer")
 				}
-				if slices.Contains([]string{"absent", "loaded", "masked", "masked-runtime"}, problem) {
+				if slices.Contains([]string{"absent", "loaded", "masked", "masked-runtime", "masked dev-null"}, problem) {
 					if err != nil || (verb == "stop" && result.Gone != Yes) {
 						t.Fatalf("supported timer: result=%+v error=%v", result, err)
 					}
@@ -85,6 +105,8 @@ func TestRetirementTimerHelpersRequirePositiveAbsence(t *testing.T) {
 						how := problem
 						if problem == "absent" {
 							how = "not-found"
+						} else if problem == "masked dev-null" {
+							how = "masked"
 						}
 						if verb == "stop" && result.How != how {
 							t.Fatalf("absence was not reported: %+v", result)
@@ -97,6 +119,9 @@ func TestRetirementTimerHelpersRequirePositiveAbsence(t *testing.T) {
 				}
 				if err == nil || (verb == "stop" && result.Gone == Yes) {
 					t.Fatalf("uncertainty became absence: result=%+v error=%v", result, err)
+				}
+				if problem == "masked missing" && !strings.Contains(err.Error(), "operation-mask-unreadable: lstat ") {
+					t.Fatalf("mask read failure was not could-not-tell: %v", err)
 				}
 				if problem == "command error" {
 					if !errors.Is(err, failure) || len(commands) != 1 {

@@ -27,26 +27,48 @@ import (
 // https://github.com/systemd/systemd/blob/v255/src/fstab-generator/fstab-generator.c
 // Each row is (property, source class, destination class). Inverse properties
 // are checked against the reversed row, never against an endpoint name alone.
+// Template citations below are under
+// ansible_collections/junioryono/billet/roles/host/templates/.
+// images-refresh and ceph-health templates have no relationships to these
+// protected roles and are not in retirement's protected unit set.
 var operationEdges = []struct{ property, source, destination string }{
 	{"Requires", "service|timer", "sysinit.target"},
 	{"After", "service|timer", "sysinit.target"},
 	{"After", "service", "basic.target"},
 	{"Before", "service|timer", "shutdown.target"},
 	{"Conflicts", "service|timer", "shutdown.target"},
+	// billet-server.service.j2:4, billet-node.service.j2:8,11,
+	// billet-backup.service.j2:17, billet-upgrade.service.j2:14,
+	// billet-dnsmasq@.service.j2:3; deploy/billet-{server,node,backup,upgrade}
+	// .service:12,14,20,31 respectively.
 	{"After", "server|node|backup|upgrade|dns", "network-online.target"},
+	// The same templates:5,13,18,15,4; deploy units:13,15,21,32.
 	{"Wants", "server|node|backup|upgrade|dns", "network-online.target"},
+	// deploy/billet-node.service:14.
 	{"After", "node", "docker.service"},
+	// billet-network.service.j2:3.
 	{"After", "network", "network-pre.target"},
+	// billet-network.service.j2:3; billet-dnsmasq@.service.j2:3.
 	{"After", "network|dns", "systemd-networkd.service"},
+	// billet-upgrade.service.j2:14; deploy/billet-upgrade.service:31.
 	{"After", "upgrade", "server"},
+	// billet-node.service.j2:8; billet-network.service.j2:4 (inverse).
 	{"After", "node", "network"},
+	// billet-node.service.j2:9.
 	{"Requires", "node", "network"},
 	{"Before", "timer", "timers.target"},
+	// billet-{backup,upgrade}.timer.j2:28,16; deploy timers:32,30.
 	{"WantedBy", "timer", "timers.target"},
 	{"After", "timer", "time-set.target"},
 	{"After", "timer", "time-sync.target"},
 	{"Before", "timer", "paired-service"},
+	// Unit= in billet-{backup,upgrade}.timer.j2:25,13; deploy timers:29,27.
+	// timer_add_trigger_dependencies also adds the preceding Before row.
 	{"Triggers", "timer", "paired-service"},
+	// billet-{server,node,network}.service.j2:110,75,13,
+	// billet-dnsmasq@.service.j2:19, billet-ledger.mount.j2:22;
+	// deploy/billet-{server,node}.service:104,84. The next Before row is
+	// unit_add_default_target_dependency's ordering for these install links.
 	{"WantedBy", "server|node|network|dns|ledger", "multi-user.target"},
 	{"Before", "server|node|network|dns|ledger", "multi-user.target"},
 	{"Requires", "service|ledger", "own-slice"},
@@ -58,7 +80,11 @@ var operationEdges = []struct{ property, source, destination string }{
 	{"After", "server|node|backup|dns", "tmp.mount"},
 	{"Requires", "service|timer|ledger", "path-mount"},
 	{"After", "service|timer|ledger", "path-mount"},
+	// billet-server.service.j2:19; billet-backup.service.j2:27.
 	{"Requires", "server|backup", "ledger"},
+	// billet-server.service.j2:20; billet-backup.service.j2:28.
+	// RequiresMountsFor= also derives these and ancestor mount pairs:
+	// server template:21, backup template:33; deploy/billet-backup.service:31.
 	{"After", "server|backup", "ledger"},
 	{"After", "ledger", "local-fs-pre.target"},
 	{"Before", "ledger", "local-fs.target"},
@@ -67,9 +93,9 @@ var operationEdges = []struct{ property, source, destination string }{
 	{"After", "tmpfs-ledger", "swap.target"},
 	{"Requires", "ledger", "backing-device"},
 	{"BindsTo", "ledger", "backing-device"},
-	// Optional: Ubuntu 24.04/systemd 255.4 CI (2026-09-15) reported no
-	// such edge for the loop-backed ext4 ledger. Admit the exact pair when
-	// present; retirement never stops a device (v255 mount.c#L367).
+	// Optional: Ubuntu 24.04/systemd 255.4 CI (2026-09-15) first reported
+	// no such edge, then the exact pair at 55cdd81. Admit it when present;
+	// retirement never stops a device (v255 mount.c#L367).
 	{"StopPropagatedFrom", "ledger", "backing-device"},
 	{"After", "ledger", "backing-device"},
 	{"After", "ledger", "backing-blockdev"},
@@ -232,13 +258,15 @@ func (w *operationWalk) closedRelation(ctx context.Context, unit, relation, targ
 	// Ancestor mounts are always active no-ops. Read no relationships from
 	// them: device/blockdev, fsck (fstab passno), swap, local-fs and root-mount
 	// dependencies belong to their graph, never to a protected service's graph.
-	if strings.HasSuffix(target, ".mount") && target != "tmp.mount" {
+	// The exact default slice is likewise an active no-op, never permission
+	// to create a new slice for a protected template instance.
+	if (strings.HasSuffix(target, ".mount") && target != "tmp.mount") || strings.HasSuffix(target, ".slice") {
 		ev, err := w.get(ctx, target)
 		if err != nil {
 			return err
 		}
 		if first(ev.props, "LoadState") != "loaded" || first(ev.props, "ActiveState") != "active" {
-			return fmt.Errorf("operation-standard-effect: ancestor %s is not an active no-op", target)
+			return fmt.Errorf("operation-standard-effect: dependency %s is not an active no-op", target)
 		}
 		if err := admitStandardEffect(Operation{Verb: "start", Unit: target}, ev); err != nil {
 			return err
@@ -314,6 +342,10 @@ func (w *operationWalk) matchesEdgeClass(unit, other, class string) bool {
 	case "tmpfs-ledger":
 		return w.matchesEdgeClass(unit, other, "ledger") && first(ev.props, "Type") == "tmpfs"
 	case "own-slice":
+		// unit_set_default_slice, systemd v255 src/core/unit.c:3254-3299:
+		// escape the already escaped TEMPLATE PREFIX again, including its
+		// hyphens; the instance is not part of the slice name. Measured for
+		// dnsmasq@br0 on Ubuntu 24.04/systemd 255.4, 2026-09-15.
 		if prefix, _, ok := strings.Cut(other, "@"); ok && strings.HasSuffix(other, ".service") {
 			return unit == "system-"+strings.TrimSuffix(operationPathUnit("/"+prefix), ".mount")+".slice"
 		}

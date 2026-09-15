@@ -27,7 +27,11 @@ func (c *Converger) quietTimer(ctx context.Context, unit string) (string, error)
 		}
 		return "not-found", nil
 	}
-	if operationQuietMask(props) {
+	masked, err := operationQuietMask(props)
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", unit, err)
+	}
+	if masked {
 		return first(props, "UnitFileState"), nil
 	}
 	if first(props, "LoadState") != "loaded" {
