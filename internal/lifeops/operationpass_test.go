@@ -62,8 +62,13 @@ func TestOperationAdmissionBatchesRetainedShippedSequence(t *testing.T) {
 		for _, call := range f.calls {
 			args := strings.Fields(call)
 			if args[0] == "show" {
-				shows[args[len(args)-1]]++
-				if len(args) != 4 || !strings.HasPrefix(args[1], "--property=") {
+				unit := args[len(args)-1]
+				shows[unit]++
+				if unit == "billet-node.service" {
+					if !slices.Equal(args, []string{"show", "--all", "--", unit}) {
+						t.Fatalf("retained inventory was filtered: %s", call)
+					}
+				} else if len(args) != 4 || !strings.HasPrefix(args[1], "--property=") || strings.Contains(args[1], "*") {
 					t.Fatalf("properties were split across requests: %s", call)
 				}
 			} else if args[0] == "get-property" {

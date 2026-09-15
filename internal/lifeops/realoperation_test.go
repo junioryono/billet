@@ -31,7 +31,7 @@ func TestRealSystemdRetirementOperationEffects(t *testing.T) {
 	}
 	t.Logf("systemd measurement %s: %s", time.Now().UTC().Format(time.RFC3339), strings.TrimSpace(string(version)))
 	for _, role := range []bool{false, true} {
-		for _, host := range []string{"retained", "server-only masked", "server-only absent"} {
+		for _, host := range []string{"retained", "retained condition", "server-only masked", "server-only absent"} {
 			t.Run(fmt.Sprintf("sequence/role=%v/%s", role, host), func(t *testing.T) {
 				realRetirementSequence(t, role, host)
 			})
@@ -278,7 +278,7 @@ func realRetirementSequence(t *testing.T, role bool, host string) {
 	network, dns := h.prefix+"-network.service", h.prefix+"-dnsmasq@br0.service"
 	ledgerPath := "/run/" + h.prefix + "/ledger"
 	ledgerUnit := "run-" + strings.ReplaceAll(h.prefix, "-", `\x2d`) + "-ledger.mount"
-	retained := host == "retained"
+	retained := strings.HasPrefix(host, "retained")
 	for _, root := range []string{"/etc/", "/var/lib/", "/run/"} {
 		for _, suffix := range []string{"", "/node", "/server", "/ledger"} {
 			if err := os.MkdirAll(root+h.prefix+suffix, 0o755); err != nil {
@@ -378,6 +378,23 @@ print(template.render(
 		}
 		h.run("daemon-reload")
 	}
+	conditionPath := "/var/lib/" + h.prefix + "/server/required"
+	if host == "retained condition" {
+		// Install before startup: this is a stable dependency on the identity
+		// being archived, with the node's other inputs still outside it.
+		if err := os.WriteFile(conditionPath, []byte("node start condition\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		dir := filepath.Join("/", "run", "systemd", "system", node+".d")
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		h.dropins = append(h.dropins, dir)
+		if err := os.WriteFile(filepath.Join(dir, "condition.conf"), []byte("[Unit]\nConditionPathExists="+conditionPath+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		h.run("daemon-reload")
+	}
 	if role && retained {
 		h.run("start", "--", network, dns)
 		// The instance is loaded from the rendered template, not a second file.
@@ -432,6 +449,7 @@ print(template.render(
 	if retained {
 		original = h.property(node, "InvocationID")
 	}
+	serverOriginal := h.property(server, "InvocationID")
 	h.logGraph("initial sequence", protection, ledgerUnit, role)
 	if retained {
 		// Keep the real implicit chain: neither rendered nor packaged controls
@@ -456,8 +474,32 @@ print(template.render(
 	var performed []Operation
 	for n, op := range sequence {
 		h.logGraph(fmt.Sprintf("before %s %s", op.Verb, op.Unit), protection, ledgerUnit, role)
-		if err := h.admit(sequence[n:], protection); err != nil {
-			t.Fatalf("remaining sequence after %v: %v", performed, err)
+		admissionErr := h.admit(sequence[n:], protection)
+		if host == "retained condition" {
+			// Removing the complete inventory/path proof would admit this first
+			// step and eventually leave the node unable to start after archive.
+			if admissionErr == nil || !strings.Contains(admissionErr.Error(), node+" Conditions: retained-node-path-archived") {
+				t.Fatalf("stable node condition did not refuse the real sequence: %v", admissionErr)
+			}
+			if n != 0 || len(submitted) != 0 || len(performed) != 0 ||
+				h.property(node, "ActiveState") != "active" || h.property(node, "InvocationID") != original ||
+				h.property(node, "ConditionResult") != "yes" || h.property(server, "InvocationID") != serverOriginal ||
+				h.property(server, "ActiveState") != "active" || h.property(server, "UnitFileState") != "enabled" {
+				t.Fatal("condition refusal followed a retirement operation or lacked an active node")
+			}
+			for _, timer := range []string{backupTimer, upgradeTimer} {
+				if h.property(timer, "ActiveState") != "active" || h.property(timer, "UnitFileState") != "enabled" {
+					t.Fatalf("condition refusal changed timer %s", timer)
+				}
+			}
+			if body, err := os.ReadFile(conditionPath); err != nil || string(body) != "node start condition\n" {
+				t.Fatalf("condition refusal changed identity input: %q %v", body, err)
+			}
+			t.Logf("stable ConditionPathExists refused before the real sequence: %v", admissionErr)
+			return
+		}
+		if admissionErr != nil {
+			t.Fatalf("remaining sequence after %v: %v", performed, admissionErr)
 		}
 		if err := h.admit([]Operation{op}, protection); err != nil {
 			t.Fatalf("immediate admission %v: %v", op, err)

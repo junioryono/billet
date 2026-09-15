@@ -136,7 +136,7 @@ func newOperationFixture(t *testing.T) *operationFixture {
 			}
 		}
 		for name, value := range props {
-			if slices.Contains(args, "--all") || slices.Contains(requested, "*") || slices.Contains(requested, name) {
+			if len(requested) == 0 || slices.Contains(requested, name) {
 				fmt.Fprintf(&out, "%s=%s\n", name, value)
 			}
 		}
@@ -144,6 +144,36 @@ func newOperationFixture(t *testing.T) *operationFixture {
 	}))
 	operationTemporaryFixture(t, f.inspector)
 	return f
+}
+
+// --all keeps empty values; it does not cancel a literal property filter.
+func TestOperationFakeShowFiltersLiteralPropertyNames(t *testing.T) {
+	f := newOperationFixture(t)
+	f.unit(t, "billet-node.service")["Conditions"] = "[unprintable]"
+	for _, c := range []struct {
+		name string
+		args []string
+		full bool
+	}{
+		{"unfiltered", nil, true},
+		{"all", []string{"--all"}, true},
+		{"literal star", []string{"--property=Id,*"}, false},
+		{"all with literal star", []string{"--all", "--property=Id,*"}, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			args := append([]string{"show"}, c.args...)
+			args = append(args, "--", "billet-node.service")
+			out, err := f.inspector.run(t.Context(), "systemctl", args)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(out), "Id=billet-node.service\n") ||
+				strings.Contains(string(out), "Conditions=[unprintable]\n") != c.full ||
+				(!c.full && string(out) != "Id=billet-node.service\n") {
+				t.Fatalf("fake invented property expansion: %s", out)
+			}
+		})
+	}
 }
 
 // Independent of the production vtable: omitting or mistyping a query must

@@ -1,6 +1,7 @@
 package lifeops
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -108,7 +109,7 @@ func TestRetainedNodePathsReadUnprintedPropertiesAndRereadTheSet(t *testing.T) {
 	delete(node, "Conditions")
 	reads := 0
 	f.before = func(unit string) {
-		if unit == "billet-node.service" && operationCallRequests(f.calls[len(f.calls)-1], "*") {
+		if unit == "billet-node.service" && f.calls[len(f.calls)-1] == "show --all -- billet-node.service" {
 			reads++
 			if reads == 2 {
 				node["FutureSystemdPath"] = "/var/lib/billet/server"
@@ -117,6 +118,46 @@ func TestRetainedNodePathsReadUnprintedPropertiesAndRereadTheSet(t *testing.T) {
 	}
 	if err := f.inspector.AdmitOperations(t.Context(), nil, p); err == nil || !strings.Contains(err.Error(), "retained-node-path-archived") || reads != 2 {
 		t.Fatalf("property set not reread after admission: reads=%d err=%v", reads, err)
+	}
+}
+
+// Omitting typed-only keys from extraction would admit the archived condition.
+func TestRetainedNodePathsIncludePropertiesMissingFromShow(t *testing.T) {
+	for _, boundary := range []string{"operation", "stopped"} {
+		t.Run(boundary, func(t *testing.T) {
+			f := newOperationFixture(t)
+			node := f.unit(t, "billet-node.service")
+			node["Conditions"] = "[unprintable]"
+			value := "/etc/billet"
+			f.pathReply = func(string, string) ([]byte, error) {
+				return json.Marshal(map[string]any{"type": "a(sbbsi)", "data": []any{[]any{"ConditionPathExists", false, false, value, 0}}})
+			}
+			run := f.inspector.run
+			f.inspector.run = func(ctx context.Context, bin string, args []string) ([]byte, error) {
+				out, err := run(ctx, bin, args)
+				if args[0] == "show" {
+					out = []byte(strings.ReplaceAll(string(out), "Conditions=[unprintable]\n", ""))
+				}
+				return out, err
+			}
+			admit := func() error {
+				if boundary == "stopped" {
+					return f.inspector.AdmitRetainedUnitPaths(t.Context(), "billet-node.service", "/var/lib/billet/server")
+				}
+				return f.inspector.AdmitOperations(t.Context(), nil, OperationProtection{
+					Units:              []string{"billet-node.service"},
+					RetainedPathUnits:  []string{"billet-node.service"},
+					ArchivedInputRoots: []string{"/var/lib/billet/server"},
+				})
+			}
+			if err := admit(); err != nil {
+				t.Fatalf("typed-only persistent condition refused: %v", err)
+			}
+			value = "/var/lib/billet/server"
+			if err := admit(); err == nil || !strings.Contains(err.Error(), "billet-node.service Conditions: retained-node-path-archived") {
+				t.Fatalf("typed-only archived condition admitted: %v", err)
+			}
+		})
 	}
 }
 

@@ -75,33 +75,50 @@ func (w *operationWalk) admitRetainedUnitPaths(ctx context.Context) error {
 // Keep extraction shared with the real-host diagnostics: CI logs the exact
 // path operands the admission judges, including directory-derived paths.
 func (i *Inspector) retainedUnitPaths(ctx context.Context, unit string, props map[string][]string) (map[string][]string, error) {
+	if i.operationPass == nil {
+		reader := *i
+		reader.operationPass = newOperationPass([]string{unit})
+		i = &reader
+	}
+	typedValues, err := i.operationPass.typedProperties(ctx, i, unit)
+	if err != nil {
+		return nil, err
+	}
+	// systemctl omits some properties entirely. Its keys cannot bound the
+	// typed inventory; both reads contribute properties to the path proof.
+	inventory := cloneOperationProperties(props)
+	for property := range typedValues {
+		if _, shown := inventory[property]; !shown {
+			inventory[property] = nil
+		}
+	}
 	found := make(map[string][]string)
-	for _, property := range sortedRetainedPathProperties(props) {
-		values := props[property]
+	for _, property := range sortedRetainedPathProperties(inventory) {
+		values := inventory[property]
 		switch property {
 		case "FragmentPath", "SourcePath", "DropInPaths", "ControlGroup", "ControlGroupId":
 			continue
 		}
+		_, typed := typedValues[property]
+		if !typed {
+			typed = slices.ContainsFunc(values, func(value string) bool {
+				return value == "[unprintable]" || strings.Contains(value, "\\") || len(operationAbsolutePaths(value)) != 0
+			})
+		}
+		if typed {
+			// Typed strings preserve escaped pathnames and array boundaries.
+			values, err = i.operationPropertyStrings(ctx, unit, property)
+			if err != nil {
+				return found, err
+			}
+		}
 		for _, value := range values {
-			inputs := []string{value}
-			// systemd 255 bus-print-properties.c omits some structured values;
-			// typed strings also preserve escaped pathnames and array boundaries.
-			typed := value == "[unprintable]" || strings.Contains(value, "\\") || len(operationAbsolutePaths(value)) != 0
-			if typed {
-				var err error
-				inputs, err = i.operationPropertyStrings(ctx, unit, property)
-				if err != nil {
-					return found, err
-				}
+			paths := operationAbsolutePaths(value)
+			exact := strings.TrimLeft(value, "-+@|!")
+			if typed && filepath.IsAbs(exact) {
+				paths = append(paths, "/"+strings.Trim(exact, "/"))
 			}
-			for _, input := range inputs {
-				paths := operationAbsolutePaths(input)
-				exact := strings.TrimLeft(input, "-+@|!")
-				if typed && filepath.IsAbs(exact) {
-					paths = append(paths, "/"+strings.Trim(exact, "/"))
-				}
-				found[property] = append(found[property], paths...)
-			}
+			found[property] = append(found[property], paths...)
 			if root, directory := operationDirectoryRoots[property]; directory {
 				for _, entry := range strings.Fields(value) {
 					if entry == "." || strings.HasPrefix(entry, "../") || filepath.IsAbs(entry) ||

@@ -165,9 +165,7 @@ func (i *Inspector) properties(ctx context.Context, unit string, names ...string
 		return nil, err
 	}
 
-	complete := len(names) == 0 || slices.ContainsFunc(names, func(name string) bool {
-		return slices.Contains(strings.Split(name, ","), "*")
-	})
+	complete := len(names) == 0
 	props := make(map[string][]string, len(names))
 	for _, line := range strings.Split(string(out), "\n") {
 		key, value, ok := strings.Cut(line, "=")

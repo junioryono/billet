@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -36,6 +37,39 @@ func retireManagerExecutable(t *testing.T, name string) string {
 	// The parent test still runs with the race detector and its original options.
 	t.Setenv("GORACE", os.Getenv("GORACE")+" atexit_sleep_ms=0")
 	return path
+}
+
+// A wildcard-aware fake would conceal the retained inventory regression.
+func TestRetireManagerFakeShowFiltersLiteralPropertyNames(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("BILLET_FAKE_UNITS", root)
+	binary := retireManagerExecutable(t, "systemctl")
+	writeFile(t, filepath.Join(root, nodeUnit), "Id="+nodeUnit+"\n", 0o600)
+	writeFile(t, filepath.Join(root, nodeUnit+".effects"), "Conditions=[unprintable]\n", 0o600)
+	for _, c := range []struct {
+		name string
+		args []string
+		full bool
+	}{
+		{"unfiltered", nil, true},
+		{"all", []string{"--all"}, true},
+		{"literal star", []string{"--property=Id,*"}, false},
+		{"all with literal star", []string{"--all", "--property=Id,*"}, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			args := append([]string{"show"}, c.args...)
+			args = append(args, "--", nodeUnit)
+			out, err := exec.CommandContext(t.Context(), binary, args...).Output()
+			mustOK(t, err)
+			want := "Id=" + nodeUnit + "\n"
+			if c.full {
+				want = "Conditions=[unprintable]\n" + want
+			}
+			if string(out) != want {
+				t.Fatalf("fake invented property expansion: got %q want %q", out, want)
+			}
+		})
+	}
 }
 
 func appendRetireManagerRecord(root, name, value string) error {
@@ -114,13 +148,11 @@ func runRetireManagerFake(name string, args []string) error {
 	for _, arg := range args[1 : len(args)-1] {
 		if value, ok := strings.CutPrefix(arg, "--property="); ok {
 			requested = append(requested, strings.Split(value, ",")...)
-		} else if arg == "--all" {
-			requested = append(requested, "*")
 		}
 	}
 	var names []string
 	for property := range props {
-		if slices.Contains(requested, "*") || slices.Contains(requested, property) {
+		if len(requested) == 0 || slices.Contains(requested, property) {
 			names = append(names, property)
 		}
 	}

@@ -44,17 +44,18 @@ func (p *operationPass) properties(ctx context.Context, i *Inspector, unit strin
 		if slices.Equal(names, []string{"Id", "Names", "LoadState", "ActiveState", "Job", "StopWhenUnneeded"}) {
 			all = slices.Clone(names)
 		}
-		if slices.Contains(p.retained, unit) {
-			// Retain the complete property inventory, including future path
-			// carriers. A closed name list would weaken retained-path proof.
-			all = append(all, "*")
-		}
 		slices.Sort(all)
 		all = slices.Compact(all)
 		reader := *i
 		reader.operationPass = nil
 		var err error
-		props, err = reader.properties(ctx, unit, strings.Join(all, ","))
+		if slices.Contains(p.retained, unit) {
+			// Property filters are literal in systemd 255. Only an unfiltered
+			// show --all retains the inventory, including future path carriers.
+			props, err = reader.properties(ctx, unit)
+		} else {
+			props, err = reader.properties(ctx, unit, strings.Join(all, ","))
+		}
 		if err != nil {
 			return nil, err
 		}

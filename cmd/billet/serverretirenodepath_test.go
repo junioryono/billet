@@ -60,6 +60,38 @@ func TestRetirementRefusesNodeUnitPathDependenciesBeforeIntent(t *testing.T) {
 	}
 }
 
+// A filtered inventory loses Conditions on systemd 255. This witness also
+// requires an unfiltered show, even if the typed inventory rescues the refusal.
+func TestRetirementRefusesNodeConditionWithLiteralFiltersBeforeIntent(t *testing.T) {
+	f := newRequestFixture(t)
+	retainAndRestartANode(t, f)
+	f.reserve(t)
+	// The disposable fixture maps /var/lib/billet/server to f.stateDir.
+	setRetireNodePathDropIn(t, f, "ConditionPathExists", f.stateDir)
+	props, err := retireOperationInspector().UnitProperties(t.Context(), nodeUnit, "Id,*")
+	mustOK(t, err)
+	if len(props) != 1 || firstProp(props, "Id") != nodeUnit {
+		t.Fatalf("literal-filter witness answered a wildcard: %v", props)
+	}
+	before := mustRead(t, f.cfg)
+	out, code := f.retainedRequest(t, f.input(t, f.retainedOverrides(t)))
+	if code != exitUnknown || !strings.Contains(out, "Conditions: retained-node-path-archived") {
+		t.Fatalf("node condition admitted or refused for another reason: %s", out)
+	}
+	if !strings.Contains(mustRead(t, filepath.Join(f.unitsDir, ".manager-calls")), "systemctl show --all -- "+nodeUnit+"\n") {
+		t.Fatal("retained inventory never used unfiltered show --all")
+	}
+	if len(f.manager.operations) != 0 || mustRead(t, f.cfg) != before {
+		t.Fatalf("condition refusal followed mutation: %v", f.manager.operations)
+	}
+	if _, presence, err := retirement.ReadJournal(); err != nil || presence != retirement.JournalAbsent {
+		t.Fatalf("condition refusal published intent: %v %v", presence, err)
+	}
+	if _, err := os.Stat(f.stateDir); err != nil {
+		t.Fatalf("condition refusal followed archive: %v", err)
+	}
+}
+
 func TestRetirementRechecksNodeUnitPathsAtStoppedBoundaries(t *testing.T) {
 	for _, boundary := range []string{"status", "journal", "archive"} {
 		t.Run(boundary, func(t *testing.T) {
