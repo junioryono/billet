@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -1164,9 +1163,8 @@ func retireResetFailed(ctx context.Context, unit string) error {
 	ctx, cancel := context.WithTimeout(ctx, systemctlTimeout)
 	defer cancel()
 
-	out, err := exec.CommandContext(ctx, systemctlBinary, "reset-failed", "--", unit).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("systemctl reset-failed %s: %w: %s", unit, err, strings.TrimSpace(string(out)))
+	if _, err := runManagerCommand(ctx, systemctlBinary, []string{"reset-failed", "--", unit}); err != nil {
+		return fmt.Errorf("systemctl reset-failed %s: %w", unit, err)
 	}
 
 	return nil

@@ -986,13 +986,12 @@ func installRetireHostManager(t *testing.T, f *requestFixture) {
 		"LoadState=not-found\nActiveState=inactive\nSubState=dead\nResult=success\nKillMode=control-group\nMainPID=0\n"+
 			"InvocationID=\nStateChangeTimestamp=\n", 0o644)
 
-	bin := retireManagerExecutable(t, "systemctl")
 	t.Setenv("BILLET_FAKE_UNITS", f.unitsDir)
 
-	savedSystemctl := systemctlBinary
-	systemctlBinary = bin
+	savedSystemctl, savedRunner := systemctlBinary, managerCommandRunner
+	systemctlBinary, managerCommandRunner = filepath.Join(f.unitsDir, "systemctl"), retireManagerCommand
 
-	t.Cleanup(func() { systemctlBinary = savedSystemctl })
+	t.Cleanup(func() { systemctlBinary, managerCommandRunner = savedSystemctl, savedRunner })
 
 	installRetireOperationEvidence(t, f)
 

@@ -603,7 +603,7 @@ func identityFor(installed, rendering *config.Config) registrationIdentity {
 // endpointInspector is the lifeops inspector the endpoint commands run
 // systemctl through, on the binary the inspector uses (a test's fake).
 func endpointInspector() *lifeops.Inspector {
-	return lifeops.NewInspector(lifeops.WithSystemctl(systemctlBinary), lifeops.WithWaitDelay(guardWaitDelay))
+	return lifeops.NewInspector(lifeops.WithSystemctl(systemctlBinary), lifeops.WithWaitDelay(guardWaitDelay), lifeops.WithCommandRunner(managerCommandRunner))
 }
 
 // preRProcess says whether a running process is positively a release before

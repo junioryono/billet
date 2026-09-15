@@ -19,13 +19,17 @@ func TestRemainingServiceActionsFollowTheExecutableDecision(t *testing.T) {
 		{VariantServerOnly, PhaseIntent, Facts{Identity: IdentityConfigured, Config: ConfigInstalled, Stage: StageAbsent, Backup: BackupInactive}, []Action{ActionStop}},
 		{VariantRetainedNode, PhaseIntent, Facts{Identity: IdentityConfigured, Config: ConfigInstalled, Stage: StageRecorded, Backup: BackupInactive}, []Action{ActionStop, ActionRestart}},
 		{VariantRetainedNode, PhaseStopped, Facts{Identity: IdentityArchive, Config: ConfigInstalled, Stage: StageRecorded, Backup: BackupInactive}, []Action{ActionRestart}},
+		{VariantRetainedNode, PhaseArchived, Facts{Identity: IdentityArchive, Config: ConfigInstalled, Stage: StageRecorded, NodeChanged: VerdictFalse}, []Action{ActionRestart}},
+		{VariantRetainedNode, PhaseArchived, Facts{Identity: IdentityArchive, Config: ConfigInstalled, Stage: StageRecorded, NodeChanged: VerdictTrue}, nil},
+		{VariantRetainedNode, PhaseArchived, Facts{Identity: IdentityArchive, Config: ConfigStaged, Stage: StageRecorded, NodeChanged: VerdictTrue}, []Action{ActionRestart}},
 		{VariantRetainedNode, PhaseConfigRewritten, Facts{Identity: IdentityArchive, Config: ConfigStaged, Stage: StageRecorded, NodeChanged: VerdictFalse}, []Action{ActionRestart}},
+		{VariantRetainedNode, PhaseConfigRewritten, Facts{Identity: IdentityArchive, Config: ConfigStaged, Stage: StageRecorded, NodeChanged: VerdictTrue}, []Action{ActionRestart}},
 		{VariantRetainedNode, PhaseNodeRestarted, Facts{Identity: IdentityArchive, Config: ConfigStaged, Stage: StageRecorded, NodeUnit: NodeInactive}, []Action{ActionRestart}},
 		{VariantRetainedNode, PhaseNodeRestarted, Facts{Identity: IdentityArchive, Config: ConfigStaged, Stage: StageRecorded, NodeUnit: NodeReady}, nil},
 		{VariantRetainedNode, PhaseDone, Facts{}, nil},
 		{VariantRetainedNode, PhaseIntent, Facts{}, nil},
 	} {
-		t.Run(string(c.variant)+"/"+string(c.phase)+"/"+string(c.facts.NodeUnit), func(t *testing.T) {
+		t.Run(string(c.variant)+"/"+string(c.phase)+"/"+string(c.facts.Config)+"/"+string(c.facts.NodeChanged)+"/"+string(c.facts.NodeUnit), func(t *testing.T) {
 			d := Decide(c.variant, c.phase, c.facts)
 			if got := RemainingServiceActions(c.variant, c.phase, d); !slices.Equal(got, c.want) {
 				t.Fatalf("decision %+v: remaining %v, want %v", d, got, c.want)

@@ -14,7 +14,7 @@ import (
 )
 
 // The fixture keeps loaded runtime properties separate from installation
-// sources. Its executable returns only the properties requested by production.
+// sources. Its runner returns only the properties requested by production.
 func installRetireOperationEvidence(t *testing.T, f *requestFixture) {
 	t.Helper()
 	root := t.TempDir()
@@ -76,7 +76,7 @@ func installRetireOperationEvidence(t *testing.T, f *requestFixture) {
 	setRetireEffect(t, f, "systemd-firstboot.service", "ImportCredential", "firstboot.*")
 	setRetireEffect(t, f, "local-fs.target", "OnFailure", "emergency.target")
 	setRetireEffect(t, f, "local-fs.target", "OnFailureJobMode", "replace-irreversibly")
-	busctl := retireManagerExecutable(t, "busctl")
+	busctl := filepath.Join(f.unitsDir, "busctl")
 	boot := filepath.Join(root, "boot_id")
 	writeFile(t, boot, "01234567-89ab-cdef-0123-456789abcdef\n", 0o644)
 	tmp, varTmp := filepath.Join(root, "tmp"), filepath.Join(root, "var", "tmp")
@@ -84,7 +84,7 @@ func installRetireOperationEvidence(t *testing.T, f *requestFixture) {
 	mustOK(t, os.MkdirAll(varTmp, 0o700))
 	saved := retireOperationInspector
 	retireOperationInspector = func() *lifeops.Inspector {
-		return lifeops.NewInspector(lifeops.WithSystemctl(systemctlBinary), lifeops.WithOperationUnitDirectories(root), lifeops.WithOperationBusctl(busctl), lifeops.WithOperationCgroupRoot(root),
+		return lifeops.NewInspector(lifeops.WithSystemctl(systemctlBinary), lifeops.WithCommandRunner(managerCommandRunner), lifeops.WithOperationUnitDirectories(root), lifeops.WithOperationBusctl(busctl), lifeops.WithOperationCgroupRoot(root),
 			lifeops.WithOperationTemporaryDirectories(boot, tmp, varTmp),
 			// Fixture inputs live in t.TempDir; these paths model its volatile storage.
 			lifeops.WithRetainedInputRoots("/run", "/var/run", filepath.Join(f.unitsDir, "volatile")))
@@ -650,7 +650,7 @@ func installRetireNodeExecution(t *testing.T, f *requestFixture) {
 	mustOK(t, err)
 	savedBinary, savedBus := installedBinary, busctlBinary
 	installedBinary = binary
-	busctlBinary = retireManagerExecutable(t, "busctl-execution")
+	busctlBinary = filepath.Join(f.unitsDir, "busctl-execution")
 	t.Cleanup(func() { installedBinary, busctlBinary = savedBinary, savedBus })
 	setRetireNodeCommand(t, f, []string{binary, "node", "--config", f.cfg}, "")
 	setRetireEffect(t, f, nodeUnit, "Requires", "sysinit.target")
@@ -885,7 +885,8 @@ func TestRetirementRechecksNodeExecutionImmediatelyBeforeStart(t *testing.T) {
 		}
 	}
 	next, r := retireRestartNode(t.Context(), f.cfg, j)
-	if r == nil || r.Reason != "retained-config-path-changed" || next.Phase != j.Phase ||
+	if r == nil || r.Reason != retireReasonUnit || !strings.Contains(r.Why, "ExecStart is not") ||
+		!strings.Contains(r.Why, "/bin/sh -c exit 0") || next.Phase != j.Phase ||
 		!slices.Contains(f.manager.operations, "stop "+nodeUnit) || slices.Contains(f.manager.operations, "start "+nodeUnit) {
 		t.Fatalf("start used pre-drain execution shape: next=%s refusal=%+v operations=%v", next.Phase, r, f.manager.operations)
 	}

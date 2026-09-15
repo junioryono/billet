@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,7 +21,7 @@ func TestMain(m *testing.M) {
 	if os.Getenv("BILLET_RETIRE_MANAGER_FAKE") == "1" {
 		name := filepath.Base(os.Args[0])
 		if name == "systemctl" || name == "busctl" || name == "busctl-execution" {
-			if err := runRetireManagerFake(name, os.Args[1:]); err != nil {
+			if err := runRetireManagerFake(context.Background(), name, os.Args[1:], os.Stdout); err != nil {
 				fmt.Fprintln(os.Stderr, err)
 				os.Exit(2)
 			}
@@ -45,7 +48,7 @@ func retireManagerExecutable(t *testing.T, name string) string {
 func TestRetireManagerFakeShowFiltersLiteralPropertyNames(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("BILLET_FAKE_UNITS", root)
-	binary := retireManagerExecutable(t, "systemctl")
+	binary := "systemctl"
 	writeFile(t, filepath.Join(root, nodeUnit), "Id="+nodeUnit+"\n", 0o600)
 	writeFile(t, filepath.Join(root, nodeUnit+".effects"), "Conditions=[unprintable]\n", 0o600)
 	for _, c := range []struct {
@@ -61,7 +64,7 @@ func TestRetireManagerFakeShowFiltersLiteralPropertyNames(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			args := append([]string{"show"}, c.args...)
 			args = append(args, "--", nodeUnit)
-			out, err := exec.CommandContext(t.Context(), binary, args...).Output()
+			out, err := retireManagerCommand(t.Context(), binary, args)
 			mustOK(t, err)
 			want := "Id=" + nodeUnit + "\n"
 			if c.full {
@@ -108,20 +111,49 @@ func readRetireManagerProperties(root, unit string) (map[string][]string, error)
 	return props, nil
 }
 
-func runRetireManagerFake(name string, args []string) error {
+// Manager callers refuse any error; none inspect *exec.ExitError. Keep the
+// numeric status and stderr available for the subprocess equivalence witness.
+type retireManagerExitError struct {
+	stderr string
+}
+
+func (e *retireManagerExitError) Error() string {
+	return "exit status 2: " + strings.TrimSpace(e.stderr)
+}
+
+func (e *retireManagerExitError) ExitCode() int { return 2 }
+
+func retireManagerCommand(ctx context.Context, bin string, args []string) ([]byte, error) {
+	var stdout bytes.Buffer
+	if err := runRetireManagerFake(ctx, filepath.Base(bin), args, &stdout); err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return stdout.Bytes(), &retireManagerExitError{stderr: fmt.Sprintln(err)}
+	}
+	return stdout.Bytes(), nil
+}
+
+func runRetireManagerFake(ctx context.Context, name string, args []string, stdout io.Writer) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if name != "systemctl" && name != "busctl" && name != "busctl-execution" {
+		return fmt.Errorf("unknown fake manager %s", name)
+	}
 	root := os.Getenv("BILLET_FAKE_UNITS")
 	if err := appendRetireManagerRecord(root, ".manager-calls", name+" "+strings.Join(args, " ")); err != nil {
 		return err
 	}
 	if name != "systemctl" {
-		return runRetireBusFake(root, name, args)
+		return runRetireBusFake(ctx, root, name, args, stdout)
 	}
 	if len(args) < 3 {
 		return fmt.Errorf("incomplete systemctl request: %v", args)
 	}
 	unit := args[len(args)-1]
 	if args[0] != "show" {
-		if args[0] != "stop" && args[0] != "disable" {
+		if args[0] != "stop" && args[0] != "disable" && args[0] != "reset-failed" {
 			return fmt.Errorf("unsupported systemctl command: %v", args)
 		}
 		if err := appendRetireManagerRecord(root, ".submitted", args[0]+" "+unit); err != nil {
@@ -134,6 +166,8 @@ func runRetireManagerFake(name string, args []string) error {
 		changes := map[string]string{"UnitFileState": "disabled"}
 		if args[0] == "stop" {
 			changes = map[string]string{"ActiveState": "inactive", "SubState": "dead", "Result": "success", "MainPID": "0"}
+		} else if args[0] == "reset-failed" {
+			changes = map[string]string{"ActiveState": "inactive", "SubState": "dead", "Result": "success", "ExecMainStatus": "0"}
 		}
 		lines := strings.Split(strings.TrimSuffix(string(body), "\n"), "\n")
 		for key, value := range changes {
@@ -168,7 +202,7 @@ func runRetireManagerFake(name string, args []string) error {
 			fmt.Fprintf(&out, "%s=%s\n", property, value)
 		}
 	}
-	if _, err := fmt.Fprint(os.Stdout, out.String()); err != nil {
+	if _, err := fmt.Fprint(stdout, out.String()); err != nil {
 		return err
 	}
 	state := ""
@@ -237,7 +271,7 @@ func retireFakeOmitsEmptyArray(property string) bool {
 		slices.Contains([]string{"Paths", "Listen", "TimersMonotonic", "TimersCalendar", "LogFilterPatterns", "BPFProgram", "SocketBindAllow", "SocketBindDeny", "OpenFile"}, property)
 }
 
-func runRetireBusFake(root, name string, args []string) error {
+func runRetireBusFake(ctx context.Context, root, name string, args []string, stdout io.Writer) error {
 	if len(args) < 5 {
 		return fmt.Errorf("incomplete bus request: %v", args)
 	}
@@ -259,13 +293,13 @@ func runRetireBusFake(root, name string, args []string) error {
 			if err := appendRetireManagerRecord(root, ".real-environment-calls", strings.Join(forwarded, " ")); err != nil {
 				return err
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 			defer cancel()
 			out, err := exec.CommandContext(ctx, "/usr/bin/busctl", forwarded...).Output()
 			if err != nil {
 				return err
 			}
-			_, err = os.Stdout.Write(out)
+			_, err = stdout.Write(out)
 			return err
 		}
 		file := unit + "." + args[4] + ".json"
@@ -276,7 +310,7 @@ func runRetireBusFake(root, name string, args []string) error {
 		if err != nil {
 			return err
 		}
-		_, err = os.Stdout.Write(body)
+		_, err = stdout.Write(body)
 		return err
 	}
 	props, err := readRetireManagerProperties(root, unit)
@@ -322,7 +356,7 @@ func runRetireBusFake(root, name string, args []string) error {
 				values[property] = map[string]any{"type": "as", "data": entries}
 			}
 		}
-		return json.NewEncoder(os.Stdout).Encode(map[string]any{"type": "a{sv}", "data": []any{values}})
+		return json.NewEncoder(stdout).Encode(map[string]any{"type": "a{sv}", "data": []any{values}})
 	}
 	if jsonMode || args[0] != "get-property" || args[3] != "org.freedesktop.systemd1.Service" {
 		return fmt.Errorf("unsupported typed request: %v", args)
@@ -337,7 +371,7 @@ func runRetireBusFake(root, name string, args []string) error {
 		if values[0] != "" {
 			line = signature + " 1 " + values[0]
 		}
-		if _, err := fmt.Fprintln(os.Stdout, line); err != nil {
+		if _, err := fmt.Fprintln(stdout, line); err != nil {
 			return err
 		}
 	}
@@ -347,7 +381,7 @@ func runRetireBusFake(root, name string, args []string) error {
 func TestRetireManagerFakeOmitsOnlySystemd255EmptyStructuredArrays(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("BILLET_FAKE_UNITS", root)
-	binary := retireManagerExecutable(t, "systemctl")
+	binary := "systemctl"
 	properties := []string{"EnvironmentFiles", "ExecStart", "ExecStartEx", "ExecCondition", "ExecStartPre", "ExecStartPost", "ExecStop", "ExecStopPost", "ExecReload", "StateDirectorySymlink", "RuntimeDirectorySymlink", "CacheDirectorySymlink", "LogsDirectorySymlink", "BindPaths", "BindReadOnlyPaths", "MountImages", "ExtensionImages", "TemporaryFileSystem"}
 	writeFile(t, filepath.Join(root, nodeUnit), "LoadState=loaded\n", 0o600)
 	writeFile(t, filepath.Join(root, nodeUnit+".effects"), strings.Join(properties, "=\n")+"=\n", 0o600)
@@ -357,7 +391,7 @@ func TestRetireManagerFakeOmitsOnlySystemd255EmptyStructuredArrays(t *testing.T)
 			args = append(args, "--property="+strings.Join(properties, ","))
 		}
 		args = append(args, "--", nodeUnit)
-		out, err := exec.CommandContext(t.Context(), binary, args...).Output()
+		out, err := retireManagerCommand(t.Context(), binary, args)
 		mustOK(t, err)
 		for _, property := range properties {
 			printsEmpty := slices.Contains([]string{"BindPaths", "BindReadOnlyPaths", "MountImages", "ExtensionImages", "TemporaryFileSystem"}, property)
@@ -366,10 +400,64 @@ func TestRetireManagerFakeOmitsOnlySystemd255EmptyStructuredArrays(t *testing.T)
 			}
 		}
 	}
-	bus := retireManagerExecutable(t, "busctl")
-	out, err := exec.CommandContext(t.Context(), bus, "get-property", "org.freedesktop.systemd1", "/org/freedesktop/systemd1/unit/billet_2dnode_2eservice", "org.freedesktop.systemd1.Service", "EnvironmentFiles", "ExecStopPost", "StateDirectorySymlink").Output()
+	bus := "busctl"
+	out, err := retireManagerCommand(t.Context(), bus, []string{"get-property", "org.freedesktop.systemd1", "/org/freedesktop/systemd1/unit/billet_2dnode_2eservice", "org.freedesktop.systemd1.Service", "EnvironmentFiles", "ExecStopPost", "StateDirectorySymlink"})
 	mustOK(t, err)
 	if string(out) != "a(sb) 0\na(sasbttttuii) 0\na(sst) 0\n" {
 		t.Fatalf("empty typed arrays: %q", out)
+	}
+}
+
+// Keep one subprocess witness for the protocol; admissions use no child process.
+func TestRetireManagerInProcessMatchesSubprocess(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		bin  string
+		args []string
+		code int
+	}{
+		{"show", "systemctl", []string{"show", "--all", "--", nodeUnit}, 0},
+		{"typed", "busctl", []string{"get-property", "org.freedesktop.systemd1", "/org/freedesktop/systemd1/unit/billet_2dnode_2eservice", "org.freedesktop.systemd1.Service", "EnvironmentFiles"}, 0},
+		{"typed inventory", "busctl", []string{"--json=short", "call", "org.freedesktop.systemd1", "/org/freedesktop/systemd1/unit/billet_2dnode_2eservice", "org.freedesktop.DBus.Properties", "GetAll", "s", ""}, 0},
+		{"execution", "busctl-execution", []string{"--json=short", "get-property", "org.freedesktop.systemd1", "/org/freedesktop/systemd1/unit/billet_2dnode_2eservice", "org.freedesktop.systemd1.Service", "ExecStart"}, 0},
+		{"reset", "systemctl", []string{"reset-failed", "--", nodeUnit}, 0},
+		{"failure", "systemctl", []string{"unsupported", "--", nodeUnit}, 2},
+		{"output then failure", "systemctl", []string{"show", "--all", "--", nodeUnit}, 2},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			root := t.TempDir()
+			t.Setenv("BILLET_FAKE_UNITS", root)
+			writeFile(t, filepath.Join(root, nodeUnit), "Id="+nodeUnit+"\nActiveState=failed\nResult=exit-code\n", 0o600)
+			writeFile(t, filepath.Join(root, nodeUnit+".effects"), "EnvironmentFiles=\n", 0o600)
+			writeFile(t, filepath.Join(root, "node-exec.json"), `{"type":"a(sasbttttuii)","data":[["/usr/bin/billet",["/usr/bin/billet","node","--config","/etc/billet.yaml"],false,0,0,0,0,0,0,0]]}`, 0o600)
+			if c.name == "output then failure" {
+				mustOK(t, os.Mkdir(filepath.Join(root, ".asked"), 0o700))
+			}
+			binary := retireManagerExecutable(t, c.bin)
+			wantOut, wantErr := retireManagerCommand(t.Context(), binary, c.args)
+			wantCode, wantStderr := 0, ""
+			if wantErr != nil {
+				var failure *retireManagerExitError
+				if !errors.As(wantErr, &failure) {
+					t.Fatal(wantErr)
+				}
+				wantCode, wantStderr = failure.ExitCode(), failure.stderr
+			}
+			var stdout, stderr bytes.Buffer
+			cmd := exec.CommandContext(t.Context(), binary, c.args...)
+			cmd.Stdout, cmd.Stderr = &stdout, &stderr
+			err := cmd.Run()
+			code := 0
+			if err != nil {
+				var failure *exec.ExitError
+				if !errors.As(err, &failure) {
+					t.Fatal(err)
+				}
+				code = failure.ExitCode()
+			}
+			if !bytes.Equal(stdout.Bytes(), wantOut) || stderr.String() != wantStderr || code != wantCode || code != c.code {
+				t.Fatalf("subprocess=(%q, %q, %d), in-process=(%q, %q, %d)", stdout.Bytes(), stderr.String(), code, wantOut, wantStderr, wantCode)
+			}
+		})
 	}
 }

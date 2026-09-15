@@ -95,7 +95,7 @@ func (s *retireServiceManager) Disable(ctx context.Context, unit string) error {
 // command submission. Only the manager's returned state and completion hooks
 // are faked, so a query hidden inside a helper remains observable.
 func (s *retireServiceManager) admittedConverger() *lifeops.Converger {
-	return lifeops.NewConverger(lifeops.NewInspector(lifeops.WithSystemctl(systemctlBinary),
+	return lifeops.NewConverger(lifeops.NewInspector(lifeops.WithSystemctl(systemctlBinary), lifeops.WithCommandRunner(managerCommandRunner),
 		lifeops.WithObserver(func(_ context.Context, args []string) {
 			if args[0] == "show" {
 				noteRetireMutation("wait", "manager observation")
@@ -431,7 +431,7 @@ func observeRetireProofReads(t *testing.T, fn func(pass int, unit string)) {
 	retirePostconditionInspector = func() *lifeops.Inspector {
 		pass++
 		current := pass
-		return lifeops.NewInspector(lifeops.WithSystemctl(systemctlBinary), lifeops.WithWaitDelay(guardWaitDelay),
+		return lifeops.NewInspector(lifeops.WithSystemctl(systemctlBinary), lifeops.WithCommandRunner(managerCommandRunner), lifeops.WithWaitDelay(guardWaitDelay),
 			lifeops.WithObserver(func(_ context.Context, args []string) {
 				fn(current, args[len(args)-1])
 			}))

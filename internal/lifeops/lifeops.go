@@ -360,15 +360,19 @@ func WithObserver(fn func(ctx context.Context, args []string)) Option {
 	}
 }
 
-// withRunner replaces process execution. Unexported because its parameter is:
-// an exported option nothing outside this package can construct is a worse API
-// than one that is honestly package-private.
-func withRunner(r runner) Option {
+// WithCommandRunner replaces systemctl and busctl execution. The runner must
+// honor ctx, return stdout separately, and include stderr in any failure. Nil
+// keeps the production runner and its cancellation and output bounds.
+func WithCommandRunner(r func(context.Context, string, []string) ([]byte, error)) Option {
 	return func(i *Inspector) {
 		if r != nil {
 			i.run = r
 		}
 	}
+}
+
+func withRunner(r runner) Option {
+	return WithCommandRunner(r)
 }
 
 // withExecutables replaces the identity seams.

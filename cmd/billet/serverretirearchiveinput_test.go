@@ -200,7 +200,12 @@ func TestRetirementComparesConfigurationIdentityAfterArchiveAndBeforeRewrite(t *
 					return
 				}
 				changed = true
+				info, err := os.Stat(f.cfg)
+				mustOK(t, err)
 				writeFile(t, f.cfg+".replacement", mustRead(t, f.cfg), 0o600)
+				// Keep the phase table's unchanged-config fact; only inode identity
+				// distinguishes this unapproved replacement from the original.
+				mustOK(t, os.Chtimes(f.cfg+".replacement", info.ModTime(), info.ModTime()))
 				mustOK(t, os.Rename(f.cfg+".replacement", f.cfg))
 			}
 			savedSync, savedConfig := retireSyncDir, retireBeforeConfigRename

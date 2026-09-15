@@ -794,6 +794,23 @@ func inspectProvenanceSection(report *inspectReport, exeSHA string) {
 	}
 }
 
+// managerCommandRunner is nil outside fixtures; inspectors and direct manager
+// reads share it so a fixture never needs to launch a manager process.
+var managerCommandRunner func(context.Context, string, []string) ([]byte, error)
+
+func runManagerCommand(ctx context.Context, bin string, args []string) ([]byte, error) {
+	if managerCommandRunner != nil {
+		return managerCommandRunner(ctx, bin, args)
+	}
+	var stdout, stderr bytes.Buffer
+	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("%s %s: %w: %s", bin, strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+	}
+	return stdout.Bytes(), nil
+}
+
 // unitProperties is one `systemctl show` for the properties the report needs,
 // parsed into key -> values (a key can repeat, ExecStart among them).
 func unitProperties(ctx context.Context, unit string) (map[string][]string, error) {
@@ -809,14 +826,12 @@ func unitProperties(ctx context.Context, unit string) (map[string][]string, erro
 		args = append(args, "--property="+n)
 	}
 	args = append(args, "--", unit)
-	var stdout, stderr bytes.Buffer
-	cmd := exec.CommandContext(ctx, systemctlBinary, args...)
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("systemctl show %s: %w: %s", unit, err, strings.TrimSpace(stderr.String()))
+	out, err := runManagerCommand(ctx, systemctlBinary, args)
+	if err != nil {
+		return nil, fmt.Errorf("systemctl show %s: %w", unit, err)
 	}
 	props := map[string][]string{}
-	for _, line := range strings.Split(stdout.String(), "\n") {
+	for _, line := range strings.Split(string(out), "\n") {
 		key, value, ok := strings.Cut(line, "=")
 		if !ok {
 			continue
@@ -909,18 +924,16 @@ func unitExecStart(ctx context.Context, unit string) ([]execRecord, error) {
 	ctx, cancel := context.WithTimeout(ctx, systemctlTimeout)
 	defer cancel()
 	object := "/org/freedesktop/systemd1/unit/" + busLabel(unit)
-	var stdout, stderr bytes.Buffer
-	cmd := exec.CommandContext(ctx, busctlBinary, "--json=short", "get-property",
-		"org.freedesktop.systemd1", object, "org.freedesktop.systemd1.Service", "ExecStart")
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("busctl get-property ExecStart of %s: %w: %s", unit, err, strings.TrimSpace(stderr.String()))
+	stdout, err := runManagerCommand(ctx, busctlBinary, []string{"--json=short", "get-property",
+		"org.freedesktop.systemd1", object, "org.freedesktop.systemd1.Service", "ExecStart"})
+	if err != nil {
+		return nil, fmt.Errorf("busctl get-property ExecStart of %s: %w", unit, err)
 	}
 	var reply struct {
 		Type string            `json:"type"`
 		Data []json.RawMessage `json:"data"`
 	}
-	if err := json.Unmarshal(stdout.Bytes(), &reply); err != nil {
+	if err := json.Unmarshal(stdout, &reply); err != nil {
 		return nil, fmt.Errorf("busctl answered for %s in a form the inspector does not read: %w", unit, err)
 	}
 	if reply.Type != "a(sasbttttuii)" {
@@ -986,7 +999,7 @@ func busLabel(name string) string {
 
 // Keep optionality in the sample identity although the report exposes only paths.
 func unitEnvironmentFiles(ctx context.Context, unit string) ([]lifeops.EnvironmentFile, error) {
-	return lifeops.NewInspector(lifeops.WithOperationBusctl(busctlBinary), lifeops.WithTimeout(systemctlTimeout)).EnvironmentFiles(ctx, unit)
+	return lifeops.NewInspector(lifeops.WithOperationBusctl(busctlBinary), lifeops.WithTimeout(systemctlTimeout), lifeops.WithCommandRunner(managerCommandRunner)).EnvironmentFiles(ctx, unit)
 }
 
 // inspectServiceSection reports one unit and says whether it is bound to the
