@@ -1565,7 +1565,7 @@ func judgeHostPreconditions(ctx context.Context, m retireMode, cfg *config.Confi
 	destination := retirement.RetiredDir()
 
 	if !m.dryRun {
-		if r := admitRetirePreparation(ctx, cfg, plan.archive); r != nil {
+		if r := admitRetirePreparation(ctx, cfg, m.configPath, plan.archive); r != nil {
 			return r
 		}
 		if err := retirement.EnsureRetiredDir(); err != nil {
@@ -1688,6 +1688,7 @@ func nodePathsOf(cfg *config.Config) []nodePath {
 	}
 
 	add("node.state_dir", n.StateDir)
+	add("node.deployment_id", state.DeploymentIDPath(n.StateDir))
 	add("node.lock_dir", n.LockDir)
 
 	if n.TLS != nil {
@@ -1741,7 +1742,7 @@ func applyRetireIntent(ctx context.Context, m retireMode, root *txLock, dir *os.
 	}
 
 	if plan.variant == retirement.VariantRetainedNode {
-		original, r := captureRetireInvocation(ctx, plan.cfg)
+		original, r := captureRetireInvocation(ctx, plan.cfg, m.configPath)
 		if r != nil {
 			return nil, r
 		}

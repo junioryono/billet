@@ -16,9 +16,12 @@ type Operation struct {
 }
 
 // OperationProtection describes resources which must survive the operation.
-// Paths owned by the target remain protected; only UnitPaths of the target
-// may be managed by its own directory directives. RequiredActive permits an
-// idempotent dependency start while active, never a stop. QuietUnits require
+// Paths remain protected even against the target. Owned paths may be managed
+// by their own unit's directory directives. RequiredInputs must first pass the
+// volatile-input rule even for their own stop.
+// UnitPaths holds recreatable records and other operation-owned directories.
+// RequiredActive permits an idempotent dependency start while active, never
+// a stop. QuietUnits require
 // inactive activation sources; QuietExceptions are sources this sequence stops.
 // WaitingUnits defer backup activity to the caller's wait/reconciliation proof.
 type OperationProtection struct {
@@ -29,6 +32,7 @@ type OperationProtection struct {
 	RequiredActive  []string
 	Paths           []string
 	UnitPaths       map[string][]string
+	RequiredInputs  map[string][]string
 }
 
 // WithOperationUnitDirectories selects the system manager's installation roots.
@@ -98,8 +102,8 @@ type operationWalk struct {
 // Stop propagation admits only the ledger's What-derived device stopping that
 // mount (and its inverse); retirement never stops a device.
 // Standard dependencies end traversal and admit only no-op effects. Billet
-// units retain directory (including credential and private-tmp teardown), termination,
-// manager-action, stdio and setup checks; callers check node/server execution.
+// units retain directory, termination, manager-action, stdio and setup checks;
+// callers check node/server execution.
 // An unrelated filesystem watcher is outside the manager-effects boundary,
 // like cron or inotify. Standard units are trusted as the operating system
 // ships them: their own relationships, drop-ins and .wants/ links are its init
@@ -109,10 +113,20 @@ type operationWalk struct {
 // standard unit which an operation would start must already be active.
 // Protected roles have distinct canonical Ids; no role's Names may include
 // another role. Benign extra aliases of one role remain supported.
+// Required retained inputs (configuration, identity, credentials and other startup
+// files) never lie under /run, /tmp or /var/tmp: lexical and resolved paths and
+// every traversed prefix and symlink are checked against both forms of those
+// roots, independently of loaded settings or reload-preserved teardown state.
+// A violation refuses with retained-input-volatile, including the node's own
+// handoff. Only recreatable registration and lock records are disposable;
+// cross-unit runtime, credential and private-tmp cleanup still protects them.
 // Direct triggers of protected services are checked.
 // Evidence is reread, and admission grants no future authority.
 func (i *Inspector) AdmitOperations(ctx context.Context, sequence []Operation, protection OperationProtection) error {
 	w := operationWalk{inspector: i, protection: protection, units: make(map[string]operationEvidence), targets: make(map[string]bool), paths: make(map[string]operationPathBinding), stopped: make(map[string]bool), standard: make(map[string]bool)}
+	if err := w.admitRetainedInputs(); err != nil {
+		return err
+	}
 	for _, op := range sequence {
 		w.targets[op.Unit] = true
 	}
@@ -120,7 +134,7 @@ func (i *Inspector) AdmitOperations(ctx context.Context, sequence []Operation, p
 		return err
 	}
 	paths := slices.Clone(protection.Paths)
-	for _, owned := range protection.UnitPaths {
+	for _, owned := range protection.ownedPaths() {
 		paths = append(paths, owned...)
 	}
 	for _, path := range paths {
@@ -256,7 +270,11 @@ func (w *operationWalk) read(ctx context.Context, unit string) (operationEvidenc
 		}
 	}
 	var privateTrees []string
-	if strings.HasSuffix(unit, ".service") {
+	otherRecords := false
+	for owner, paths := range w.protection.UnitPaths {
+		otherRecords = otherRecords || (len(paths) != 0 && !slices.Contains(strings.Fields(first(props, "Names")), owner))
+	}
+	if strings.HasSuffix(unit, ".service") && otherRecords {
 		privateTrees, err = w.inspector.operationPrivateTmp(first(props, "Id"), first(props, "PrivateTmp"))
 		if err != nil {
 			return operationEvidence{}, err
@@ -501,7 +519,7 @@ func (w *operationWalk) admitPassiveEffect(effect Operation, ev operationEvidenc
 		return fmt.Errorf("operation-mount-unknown: %s has no canonical mount point", effect.Unit)
 	}
 	paths := slices.Clone(w.protection.Paths)
-	for _, owned := range w.protection.UnitPaths {
+	for _, owned := range w.protection.ownedPaths() {
 		paths = append(paths, owned...)
 	}
 	for _, path := range paths {
@@ -538,7 +556,7 @@ func (w *operationWalk) admitDirectories(effect Operation, ev operationEvidence)
 		}
 	}
 	protected := slices.Clone(w.protection.Paths)
-	for unit, paths := range w.protection.UnitPaths {
+	for unit, paths := range w.protection.ownedPaths() {
 		if w.canonicalUnit(unit) != w.canonicalUnit(effect.Unit) {
 			protected = append(protected, paths...)
 		}
@@ -555,23 +573,20 @@ func (w *operationWalk) admitDirectories(effect Operation, ev operationEvidence)
 	}
 	check := func(path, directive string) error {
 		keepPaths := protected
-		if directive == "PrivateTmp" {
-			keepPaths = slices.Clone(protected)
-			for _, paths := range w.protection.UnitPaths {
-				keepPaths = append(keepPaths, paths...)
-			}
+		if directive == "PrivateTmp" || directive == "CredentialDirectory" {
+			// Required inputs already passed the closed volatile rule. These
+			// teardown checks retain only other units' disposable records.
+			keepPaths = w.otherUnitPaths(effect.Unit)
 		}
 		for _, keep := range keepPaths {
 			overlap, err := w.pathsOverlap(path, keep)
 			if err != nil {
 				return err
 			}
-			if directive == "PrivateTmp" {
-				// Removing a link inside the tree also breaks a retained path
-				// whose final target resolves outside that tree.
-				for _, object := range w.paths[keep].Objects {
-					overlap = overlap || Contained(w.paths[path].Resolved, object.Path)
-				}
+			// Recursive cleanup removes traversed links even when the leaf
+			// resolves outside the directory being removed.
+			for _, object := range w.paths[keep].Objects {
+				overlap = overlap || Contained(path, object.Path) || Contained(w.paths[path].Resolved, object.Path)
 			}
 			if overlap {
 				return fmt.Errorf("operation-directory-overlap: %s %s=%s affects %s", effect.Unit, directive, path, keep)
@@ -612,7 +627,7 @@ func (w *operationWalk) admitDirectories(effect Operation, ev operationEvidence)
 
 func (w *operationWalk) admitMountRequirements(effect Operation, ev operationEvidence) error {
 	protected := slices.Clone(w.protection.Paths)
-	for unit, paths := range w.protection.UnitPaths {
+	for unit, paths := range w.protection.ownedPaths() {
 		if unit != effect.Unit {
 			protected = append(protected, paths...)
 		}

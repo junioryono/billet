@@ -35,7 +35,7 @@ func TestRemainingServiceActionsFollowTheExecutableDecision(t *testing.T) {
 }
 
 func TestRetainedInvocationEvidenceCannotNameAnUnprovedResource(t *testing.T) {
-	for _, problem := range []string{"healthy", "zero pid", "bad invocation", "no resources", "relative", "duplicate", "absent with inode", "no inode"} {
+	for _, problem := range []string{"healthy", "zero pid", "bad invocation", "no resources", "relative", "duplicate", "absent with inode", "no inode", "relative config", "disposable guest network"} {
 		t.Run(problem, func(t *testing.T) {
 			j := Journal{Variant: VariantRetainedNode, Deployment: "deployment", RetainedInvocation: &RetainedInvocation{
 				InvocationID: strings.Repeat("a", 32), MainPID: "42", Deployment: "deployment", Node: "node", Incarnation: "incarnation", Endpoint: "https://example.test:7717", Resources: []RetainedResource{{Path: "/run/billet/registration", Inode: 1}},
@@ -55,6 +55,11 @@ func TestRetainedInvocationEvidenceCannotNameAnUnprovedResource(t *testing.T) {
 				j.RetainedInvocation.Resources[0].Absent = true
 			case "no inode":
 				j.RetainedInvocation.Resources[0].Inode = 0
+			case "relative config":
+				j.RetainedInvocation.ConfigPath = "billet.yaml"
+			case "disposable guest network":
+				j.RetainedInvocation.Resources[0].Runtime = true
+				j.RetainedInvocation.Resources[0].GuestNetwork = true
 			}
 			err := j.retainedInvocationWellFormed()
 			if problem == "healthy" {

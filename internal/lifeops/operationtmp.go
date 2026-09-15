@@ -19,14 +19,14 @@ func WithOperationTemporaryDirectories(bootIDPath string, roots ...string) Optio
 }
 
 // exec_runtime_destroy removes both private trees on completion, including an
-// awaited oneshot. setup_tmp_dirs uses the boot id without UUID separators:
+// awaited oneshot. Reload can change PrivateTmp to no while retaining the
+// running invocation's trees, so the current setting cannot skip the scan.
+// setup_tmp_dirs uses the boot id without UUID separators:
 // https://github.com/systemd/systemd/blob/v255/src/core/execute.c
 // https://github.com/systemd/systemd/blob/v255/src/core/namespace.c
 func (i *Inspector) operationPrivateTmp(unit, privateTmp string) ([]string, error) {
 	switch privateTmp {
-	case "no":
-		return nil, nil
-	case "yes":
+	case "no", "yes":
 	default:
 		return nil, fmt.Errorf("operation-private-tmp-unknown: %s PrivateTmp", unit)
 	}

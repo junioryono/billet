@@ -35,7 +35,7 @@ func TestRetirementRefusesControllerAliasOfNodeOnIntentResume(t *testing.T) {
 	}
 }
 
-func TestRetirementRefusesPrivateTmpTeardownBeforeControllerStop(t *testing.T) {
+func TestRetirementRefusesReloadPreservedPrivateTmpBeforeControllerStop(t *testing.T) {
 	for _, owner := range []string{serverUnit, backupServiceUnit} {
 		t.Run(owner, func(t *testing.T) {
 			f := newRequestFixture(t)
@@ -45,9 +45,10 @@ func TestRetirementRefusesPrivateTmpTeardownBeforeControllerStop(t *testing.T) {
 			if r := admitRetireRemaining(t.Context(), retireProofMode(f), j); r != nil {
 				t.Fatalf("healthy teardown control: %+v", r)
 			}
-			root := t.TempDir()
+			root := filepath.Join(f.unitsDir, "volatile")
 			bootID := "01234567-89ab-cdef-0123-456789abcdef"
 			bootPath := filepath.Join(root, "boot_id")
+			mustOK(t, os.MkdirAll(root, 0o700))
 			writeFile(t, bootPath, bootID+"\n", 0o644)
 			tmp, varTmp := filepath.Join(root, "tmp"), filepath.Join(root, "var", "tmp")
 			mustOK(t, os.MkdirAll(tmp, 0o700))
@@ -74,7 +75,8 @@ func TestRetirementRefusesPrivateTmpTeardownBeforeControllerStop(t *testing.T) {
 				j.RetainedInvocation.Resources = append(j.RetainedInvocation.Resources, resource)
 			}
 			writeFile(t, f.cfg, configBody, 0o600)
-			setRetireEffect(t, f, owner, "PrivateTmp", "yes")
+			// Loaded settings after yes -> daemon-reload -> no retain the old tree.
+			setRetireEffect(t, f, owner, "PrivateTmp", "no")
 			if owner == backupServiceUnit {
 				f.manager.set(owner, "LoadState", "loaded")
 				f.manager.set(owner, "UnitFileState", "static")
@@ -85,14 +87,24 @@ func TestRetirementRefusesPrivateTmpTeardownBeforeControllerStop(t *testing.T) {
 			}
 			before := mustRead(t, retirement.JournalPath())
 			next, r := retireStop(t.Context(), j)
-			if r == nil || r.Reason != retireReasonEffects || !strings.Contains(r.Why, "operation-directory-overlap: "+owner+" PrivateTmp=") {
+			if r == nil || r.Reason != retireReasonEffects || !strings.Contains(r.Why, "retained-input-volatile") {
 				t.Fatalf("private temporary TLS teardown admitted: %+v", r)
 			}
 			if next.Phase != j.Phase || len(f.manager.operations) != 0 || mustRead(t, retirement.JournalPath()) != before {
 				t.Fatalf("teardown refusal followed a stop or phase change: %v", f.manager.operations)
 			}
-			if r := proveRetireInvocation(t.Context(), j.RetainedInvocation); r != nil {
-				t.Fatalf("private temporary refusal lost retained resources: %+v", r)
+			for _, resource := range j.RetainedInvocation.Resources {
+				if resource.Absent {
+					continue
+				}
+				if _, err := os.Stat(resource.Path); err != nil {
+					t.Fatalf("private temporary refusal lost %s: %v", resource.Path, err)
+				}
+			}
+			props, err := retireOperationInspector().UnitProperties(t.Context(), nodeUnit, "InvocationID")
+			mustOK(t, err)
+			if firstProp(props, "InvocationID") != retainedInvocation {
+				t.Fatal("private temporary refusal changed the node invocation")
 			}
 		})
 	}

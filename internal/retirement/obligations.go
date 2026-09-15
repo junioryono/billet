@@ -16,6 +16,7 @@ type RetainedInvocation struct {
 	Incarnation  string             `json:"incarnation"`
 	Endpoint     string             `json:"endpoint"`
 	Resources    []RetainedResource `json:"resources"`
+	ConfigPath   string             `json:"config_path,omitempty"`
 	Provider     string             `json:"provider,omitempty"`
 	Services     []RetainedService  `json:"services,omitempty"`
 }
@@ -28,10 +29,12 @@ type RetainedService struct {
 }
 
 // RetainedResource records object identity and ownership, not mutable directory
-// contents. Runtime registration is separately read through its trusted reader.
+// contents. Runtime marks only recreatable registration/lock records; its zero
+// value requires persistence. Registration also has its separate trusted reader.
 type RetainedResource struct {
 	Path         string `json:"path"`
 	ResolvedPath string `json:"resolved_path,omitempty"`
+	Runtime      bool   `json:"runtime,omitempty"`
 	GuestNetwork bool   `json:"guest_network,omitempty"`
 	Absent       bool   `json:"absent,omitempty"`
 	Device       uint64 `json:"device,omitempty"`
@@ -72,10 +75,16 @@ func (j *Journal) retainedInvocationWellFormed() error {
 	if err != nil || pid == 0 || len(original.Resources) == 0 {
 		return errors.New("journal's retained invocation has no process or resources")
 	}
+	if original.ConfigPath != "" && (!filepath.IsAbs(original.ConfigPath) || filepath.Clean(original.ConfigPath) != original.ConfigPath) {
+		return errors.New("journal carries an invalid retained configuration path")
+	}
 	seen := make(map[string]bool)
 	for _, resource := range original.Resources {
 		if !filepath.IsAbs(resource.Path) || filepath.Clean(resource.Path) != resource.Path || seen[resource.Path] {
 			return errors.New("journal carries an invalid or repeated retained resource path")
+		}
+		if resource.Runtime && resource.GuestNetwork {
+			return errors.New("journal marks a required guest-network resource disposable")
 		}
 		seen[resource.Path] = true
 		if resource.Absent && (resource.Device != 0 || resource.Inode != 0 || resource.Mode != 0 || resource.UID != 0 || resource.GID != 0) {

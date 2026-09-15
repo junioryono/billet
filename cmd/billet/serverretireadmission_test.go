@@ -113,9 +113,17 @@ for property do
   fi
 done
 `, 0o755)
+	boot := filepath.Join(root, "boot_id")
+	writeFile(t, boot, "01234567-89ab-cdef-0123-456789abcdef\n", 0o644)
+	tmp, varTmp := filepath.Join(root, "tmp"), filepath.Join(root, "var", "tmp")
+	mustOK(t, os.MkdirAll(tmp, 0o700))
+	mustOK(t, os.MkdirAll(varTmp, 0o700))
 	saved := retireOperationInspector
 	retireOperationInspector = func() *lifeops.Inspector {
-		return lifeops.NewInspector(lifeops.WithSystemctl(systemctlBinary), lifeops.WithOperationUnitDirectories(root), lifeops.WithOperationBusctl(busctl), lifeops.WithOperationCgroupRoot(root))
+		return lifeops.NewInspector(lifeops.WithSystemctl(systemctlBinary), lifeops.WithOperationUnitDirectories(root), lifeops.WithOperationBusctl(busctl), lifeops.WithOperationCgroupRoot(root),
+			lifeops.WithOperationTemporaryDirectories(boot, tmp, varTmp),
+			// Fixture inputs live in t.TempDir; these paths model its volatile storage.
+			lifeops.WithRetainedInputRoots("/run", "/var/run", filepath.Join(f.unitsDir, "volatile")))
 	}
 	t.Cleanup(func() { retireOperationInspector = saved })
 }
@@ -550,7 +558,7 @@ func TestRetirementCapturesAndProtectsRequiredGuestNetwork(t *testing.T) {
 	}
 	installed.cfg.Node.Provider = config.ProviderFirecracker
 	installed.cfg.Node.Firecracker = &config.FirecrackerConfig{Bridge: "br0", UntrustedBridge: "br1"}
-	original, r := captureRetireInvocation(t.Context(), installed.cfg)
+	original, r := captureRetireInvocation(t.Context(), installed.cfg, f.cfg)
 	if r != nil {
 		t.Fatalf("clean guest network: %+v", r)
 	}
@@ -579,7 +587,7 @@ func TestRetirementCapturesAndProtectsRequiredGuestNetwork(t *testing.T) {
 		f.manager.set(service.Unit, "InvocationID", service.InvocationID)
 	}
 	installed.cfg.Node.Firecracker.Bridge = ""
-	if _, r := captureRetireInvocation(t.Context(), installed.cfg); r == nil {
+	if _, r := captureRetireInvocation(t.Context(), installed.cfg, f.cfg); r == nil {
 		t.Fatal("unknown configured guest bridges admitted")
 	}
 }
@@ -593,24 +601,24 @@ func TestRetirementBindsNodeStateAliasBeforeEachOperation(t *testing.T) {
 		t.Fatal(r)
 	}
 	alias := filepath.Join(t.TempDir(), "node-state")
-	mustOK(t, os.Symlink("/run/shared", alias))
+	mustOK(t, os.Symlink("/var/lib/shared", alias))
 	installed.cfg.Node.StateDir = alias
-	original, r := captureRetireInvocation(t.Context(), installed.cfg)
+	original, r := captureRetireInvocation(t.Context(), installed.cfg, f.cfg)
 	if r != nil {
 		t.Fatalf("capture state alias: %+v", r)
 	}
 	j := f.plantJournal(t, retirement.PhaseIntent, retirement.VariantRetainedNode)
 	j.RetainedInvocation = original
-	setRetireEffect(t, f, serverUnit, "RuntimeDirectory", "shared")
+	setRetireEffect(t, f, serverUnit, "StateDirectory", "shared")
 	if r := stopAndDisableForRetirement(t.Context(), f.manager, j, serverUnit); r == nil || r.Reason != retireReasonEffects || !strings.Contains(r.Why, "operation-directory-overlap") {
 		t.Fatalf("controller could remove aliased node.state_dir: %+v", r)
 	}
-	setRetireEffect(t, f, serverUnit, "RuntimeDirectory", "unrelated")
+	setRetireEffect(t, f, serverUnit, "StateDirectory", "unrelated")
 	if r := admitRetireOperation(t.Context(), j, "stop", serverUnit); r != nil {
 		t.Fatalf("clean bound state alias: %+v", r)
 	}
 	mustOK(t, os.Remove(alias))
-	mustOK(t, os.Symlink("/run/another-state", alias))
+	mustOK(t, os.Symlink("/var/lib/another-state", alias))
 	if r := stopAndDisableForRetirement(t.Context(), f.manager, j, serverUnit); r == nil || r.Reason != retireReasonEffects || !strings.Contains(r.Why, "resolution changed") {
 		t.Fatalf("retargeted historical binding accepted: %+v", r)
 	}
@@ -986,7 +994,7 @@ func TestRetirementRefusesControllerCredentialTeardownBeforeStop(t *testing.T) {
 	j.RetainedInvocation.Resources = append(j.RetainedInvocation.Resources, resource)
 	before := mustRead(t, retirement.JournalPath())
 	r := stopAndDisableForRetirement(t.Context(), f.manager, j, serverUnit)
-	if r == nil || r.Reason != retireReasonEffects || !strings.Contains(r.Why, "operation-directory-overlap") || !strings.Contains(r.Why, "CredentialDirectory=/run/credentials/billet-server.service") {
+	if r == nil || r.Reason != retireReasonEffects || !strings.Contains(r.Why, "retained-input-volatile") {
 		t.Fatalf("implicit credential teardown admitted: %+v", r)
 	}
 	if len(f.manager.operations) != 0 || mustRead(t, retirement.JournalPath()) != before {

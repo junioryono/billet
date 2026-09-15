@@ -41,13 +41,17 @@ func TestOperationAdmissionProtectsPrivateTemporaryTrees(t *testing.T) {
 				if err := os.WriteFile(key, []byte("retained"), 0o600); err != nil {
 					t.Fatal(err)
 				}
-				p.UnitPaths = map[string][]string{unit: {key}}
+				p.UnitPaths = map[string][]string{"retained.service": {key}}
 				if err := f.inspector.AdmitOperations(t.Context(), sequence, p); err == nil || !strings.Contains(err.Error(), "operation-directory-overlap") || !strings.Contains(err.Error(), "PrivateTmp=") {
 					t.Fatalf("canonical private tree admitted: %v", err)
 				}
 				props["PrivateTmp"] = "no"
+				if err := f.inspector.AdmitOperations(t.Context(), sequence, p); err == nil || !strings.Contains(err.Error(), "operation-directory-overlap") {
+					t.Fatalf("reload-preserved private tree admitted: %v", err)
+				}
+				p.UnitPaths = map[string][]string{unit: {key}}
 				if err := f.inspector.AdmitOperations(t.Context(), sequence, p); err != nil {
-					t.Fatalf("PrivateTmp=no control refused: %v", err)
+					t.Fatalf("own disposable runtime record refused: %v", err)
 				}
 			})
 		}
@@ -93,7 +97,7 @@ func TestOperationAdmissionRefusesUnknownPrivateTemporaryEvidence(t *testing.T) 
 			case "root unreadable":
 				f.inspector.operationTempRoots = []string{f.inspector.operationBootIDPath}
 			}
-			if err := f.inspector.AdmitOperations(t.Context(), []Operation{{Verb: "stop", Unit: "billet-server.service"}}, OperationProtection{}); err == nil || !strings.Contains(err.Error(), "operation-private-tmp-unknown") {
+			if err := f.inspector.AdmitOperations(t.Context(), []Operation{{Verb: "stop", Unit: "billet-server.service"}}, OperationProtection{UnitPaths: map[string][]string{"retained.service": {"/run/retained/current"}}}); err == nil || !strings.Contains(err.Error(), "operation-private-tmp-unknown") {
 				t.Fatalf("unknown private temporary evidence admitted: %v", err)
 			}
 		})
@@ -118,10 +122,10 @@ func TestOperationAdmissionProtectsPrivateTmpPathTraversal(t *testing.T) {
 		t.Fatal(err)
 	}
 	sequence := []Operation{{Verb: "stop", Unit: "billet-server.service"}}
-	if err := f.inspector.AdmitOperations(t.Context(), sequence, OperationProtection{Paths: []string{outside}}); err != nil {
+	if err := f.inspector.AdmitOperations(t.Context(), sequence, OperationProtection{UnitPaths: map[string][]string{"retained.service": {outside}}}); err != nil {
 		t.Fatalf("outside target control refused: %v", err)
 	}
-	if err := f.inspector.AdmitOperations(t.Context(), sequence, OperationProtection{Paths: []string{link}}); err == nil || !strings.Contains(err.Error(), "operation-directory-overlap") || !strings.Contains(err.Error(), "PrivateTmp=") {
+	if err := f.inspector.AdmitOperations(t.Context(), sequence, OperationProtection{UnitPaths: map[string][]string{"retained.service": {link}}}); err == nil || !strings.Contains(err.Error(), "operation-directory-overlap") || !strings.Contains(err.Error(), "PrivateTmp=") {
 		t.Fatalf("private-tree link to outside retained file admitted: %v", err)
 	}
 }

@@ -109,7 +109,7 @@ func (w *operationWalk) admitClosedSet(ctx context.Context) error {
 					continue
 				}
 				ledgerPath := false
-				for owner, paths := range w.protection.UnitPaths {
+				for owner, paths := range w.protection.ownedPaths() {
 					if strings.HasSuffix(owner, "-server.service") && slices.Contains(paths, path) {
 						ledgerPath = true
 					}
@@ -352,7 +352,7 @@ func (w *operationWalk) pathMount(unit, mount string) bool {
 	}
 	ev := w.units[unit]
 	paths := append(slices.Clone(w.protection.Paths), "/var/tmp", "/var/lib/systemd/timers")
-	for _, owned := range w.protection.UnitPaths {
+	for _, owned := range w.protection.ownedPaths() {
 		paths = append(paths, owned...)
 	}
 	for directive, root := range operationDirectoryRoots {

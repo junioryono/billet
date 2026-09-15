@@ -75,6 +75,7 @@ func newOperationFixture(t *testing.T) *operationFixture {
 		}
 		return []byte(out.String()), nil
 	}))
+	operationTemporaryFixture(t, f.inspector)
 	return f
 }
 
@@ -840,11 +841,11 @@ func TestOperationAdmissionProtectsImplicitCredentialTeardown(t *testing.T) {
 					f.units[target] = unit
 				}
 				sequence := []Operation{{Verb: "stop", Unit: target}}
-				protection := OperationProtection{Units: []string{canonical}, Paths: []string{"/run/credentials/unrelated.service/node.crt"}}
+				protection := OperationProtection{Units: []string{canonical}, UnitPaths: map[string][]string{"retained.service": {"/run/credentials/unrelated.service/current"}}}
 				if err := f.inspector.AdmitOperations(t.Context(), sequence, protection); err != nil {
 					t.Fatalf("unrelated credential path: %v", err)
 				}
-				protection.Paths = []string{filepath.Join("/run/credentials", canonical, "node.crt")}
+				protection.UnitPaths["retained.service"] = []string{filepath.Join("/run/credentials", canonical, "current")}
 				if err := f.inspector.AdmitOperations(t.Context(), sequence, protection); err == nil || !strings.Contains(err.Error(), "operation-directory-overlap") || !strings.Contains(err.Error(), "CredentialDirectory=/run/credentials/"+canonical) {
 					t.Fatalf("implicit canonical credential teardown admitted: %v", err)
 				}

@@ -26,7 +26,7 @@ var retireOperationInspector = endpointInspector
 
 // Preparation has no journal yet. Derive the same protected paths and roles
 // from the installed request configuration without creating invocation evidence.
-func admitRetirePreparation(ctx context.Context, cfg *config.Config, archive string) *retireRefusal {
+func admitRetirePreparation(ctx context.Context, cfg *config.Config, configPath, archive string) *retireRefusal {
 	if archive == "" {
 		archive = retirement.RetiredDir()
 	}
@@ -39,11 +39,16 @@ func admitRetirePreparation(ctx context.Context, cfg *config.Config, archive str
 	}
 	p.Units = append(p.Units, services...)
 	p.RequiredActive = append(p.RequiredActive, services...)
-	p.Paths = append(p.Paths, paths...)
+	p.RequiredInputs[""] = append(p.RequiredInputs[""], paths...)
 	if cfg.Node != nil {
+		p.RequiredInputs[nodeUnit] = append(p.RequiredInputs[nodeUnit], configPath)
 		p.UnitPaths[nodeUnit] = []string{filepath.Dir(registrationRecordPath)}
 		for _, path := range nodePathsOf(cfg) {
-			p.UnitPaths[nodeUnit] = append(p.UnitPaths[nodeUnit], path.path)
+			if path.name == "node.lock_dir" {
+				p.UnitPaths[nodeUnit] = append(p.UnitPaths[nodeUnit], path.path)
+			} else {
+				p.RequiredInputs[nodeUnit] = append(p.RequiredInputs[nodeUnit], path.path)
+			}
 		}
 	}
 	if err := retireOperationInspector().AdmitOperations(ctx, nil, p); err != nil {
@@ -74,7 +79,7 @@ func admitRetireRequestPreparation(ctx context.Context, m retireMode) *retireRef
 	if r != nil {
 		return r
 	}
-	return admitRetirePreparation(ctx, obs.cfg, "")
+	return admitRetirePreparation(ctx, obs.cfg, m.configPath, "")
 }
 
 func retireServiceSequence(j retirement.Journal, d retirement.Decision) []lifeops.Operation {
@@ -101,7 +106,8 @@ func retireOperationProtection(j retirement.Journal) lifeops.OperationProtection
 		QuietUnits: retireQuietServices,
 		Paths: []string{j.Archive, retirement.RetiredDir(), retirement.GlobalLockPath(), retirement.StatusPath(),
 			retirement.ServiceAccountPath(), retirement.InitLockPath(j.IdentityDir), filepath.Join(hostLockDir, "billet-lifecycle.lock"), upgradeRoot},
-		UnitPaths: map[string][]string{serverUnit: {j.IdentityDir}},
+		UnitPaths:      map[string][]string{serverUnit: {j.IdentityDir}},
+		RequiredInputs: make(map[string][]string),
 	}
 	if j.Phase == retirement.PhaseIntent {
 		p.QuietExceptions = []string{upgradeTimerUnit, backupTimerUnit}
@@ -114,22 +120,41 @@ func retireOperationProtection(j retirement.Journal) lifeops.OperationProtection
 			p.Units = append(p.Units, service.Unit)
 			p.RequiredActive = append(p.RequiredActive, service.Unit)
 		}
+		p.RequiredInputs[nodeUnit] = []string{j.RetainedInvocation.ConfigPath}
 		for _, resource := range j.RetainedInvocation.Resources {
-			if resource.GuestNetwork {
-				p.Paths = append(p.Paths, resource.Path, resource.ResolvedPath)
-			} else {
+			switch {
+			case resource.GuestNetwork:
+				p.RequiredInputs[""] = append(p.RequiredInputs[""], resource.Path, resource.ResolvedPath)
+			case resource.Runtime:
 				p.UnitPaths[nodeUnit] = append(p.UnitPaths[nodeUnit], resource.Path, resource.ResolvedPath)
+			default:
+				p.RequiredInputs[nodeUnit] = append(p.RequiredInputs[nodeUnit], resource.Path, resource.ResolvedPath)
 			}
 		}
 	}
 	return p
 }
 
+// Runtime is recorded by the capture's exact registration/lock classification;
+// every other resource is required, including guest-network configuration.
+func retainedRequiredInputs(want *retirement.RetainedInvocation) []string {
+	paths := []string{want.ConfigPath}
+	for _, resource := range want.Resources {
+		if resource.GuestNetwork || !resource.Runtime {
+			paths = append(paths, resource.Path, resource.ResolvedPath)
+		}
+	}
+	return paths
+}
+
 func admitRetireOperations(ctx context.Context, j retirement.Journal, operations []lifeops.Operation) *retireRefusal {
-	if j.Variant == retirement.VariantRetainedNode && (j.RetainedInvocation == nil || j.RetainedInvocation.Provider == "") {
-		return retireUnknown(retireReasonStopped, "the journal has no original retained-node provider and invocation evidence", "")
+	if j.Variant == retirement.VariantRetainedNode && (j.RetainedInvocation == nil || j.RetainedInvocation.Provider == "" || j.RetainedInvocation.ConfigPath == "") {
+		return retireUnknown(retireReasonStopped, "the journal has no original retained-node configuration path, provider and invocation evidence", "")
 	}
 	if j.RetainedInvocation != nil {
+		if err := retireOperationInspector().AdmitRetainedInputs(retainedRequiredInputs(j.RetainedInvocation)); err != nil {
+			return retireUnknown(retireReasonEffects, err.Error(), "")
+		}
 		for _, resource := range j.RetainedInvocation.Resources {
 			resolved, err := lifeops.ResolveOperationPath(resource.Path)
 			if err != nil || resource.ResolvedPath == "" || resolved != resource.ResolvedPath {
@@ -191,7 +216,7 @@ func admitRetireRemaining(ctx context.Context, m retireMode, j retirement.Journa
 
 // captureRetireInvocation runs before intent. A resumed journal never invents
 // this evidence from the invocation which happens to be running at resume.
-func captureRetireInvocation(ctx context.Context, cfg *config.Config) (*retirement.RetainedInvocation, *retireRefusal) {
+func captureRetireInvocation(ctx context.Context, cfg *config.Config, configPath string) (*retirement.RetainedInvocation, *retireRefusal) {
 	if cfg.Node == nil {
 		return nil, nil
 	}
@@ -215,7 +240,7 @@ func captureRetireInvocation(ctx context.Context, cfg *config.Config) (*retireme
 	record := registration.record
 	evidence := &retirement.RetainedInvocation{InvocationID: invocation, MainPID: pid,
 		Deployment: record.Deployment, Node: record.Node, Incarnation: record.Incarnation, Endpoint: record.Endpoint,
-		Provider: string(cfg.Node.Provider)}
+		Provider: string(cfg.Node.Provider), ConfigPath: configPath}
 	for _, unit := range services {
 		service, err := observeRetireService(ctx, unit)
 		if err != nil {
@@ -224,8 +249,12 @@ func captureRetireInvocation(ctx context.Context, cfg *config.Config) (*retireme
 		evidence.Services = append(evidence.Services, service)
 	}
 	paths := append(slices.Clone(servicePaths), filepath.Dir(registrationRecordPath))
+	required := append(slices.Clone(servicePaths), configPath)
 	for _, path := range nodePathsOf(cfg) {
 		paths = append(paths, path.path)
+		if path.name != "node.lock_dir" {
+			required = append(required, path.path)
+		}
 	}
 	slices.Sort(paths)
 	paths = slices.Compact(paths)
@@ -235,6 +264,7 @@ func captureRetireInvocation(ctx context.Context, cfg *config.Config) (*retireme
 			return nil, retireUnknown(retireReasonStopped, err.Error(), "")
 		}
 		resource.GuestNetwork = slices.Contains(servicePaths, path)
+		resource.Runtime = !slices.Contains(required, path) && (path == filepath.Dir(registrationRecordPath) || path == cfg.Node.LockDir)
 		evidence.Resources = append(evidence.Resources, resource)
 	}
 	if r := proveRetireInvocation(ctx, evidence); r != nil {
@@ -267,8 +297,11 @@ func observeRetireResource(path string) (retirement.RetainedResource, error) {
 
 func proveRetireInvocation(ctx context.Context, want *retirement.RetainedInvocation) *retireRefusal {
 	refuse := func(why string) *retireRefusal { return retireUnknown(retireReasonStopped, why, "") }
-	if want == nil || want.Provider == "" || want.InvocationID == "" || want.MainPID == "" || len(want.Resources) == 0 {
-		return refuse("the journal has no original retained-node invocation and resource evidence")
+	if want == nil || want.Provider == "" || want.ConfigPath == "" || want.InvocationID == "" || want.MainPID == "" || len(want.Resources) == 0 {
+		return refuse("the journal has no original retained-node configuration path, invocation and resource evidence")
+	}
+	if err := retireOperationInspector().AdmitRetainedInputs(retainedRequiredInputs(want)); err != nil {
+		return refuse(err.Error())
 	}
 	if r := proveRetireServices(ctx, want); r != nil {
 		return r
@@ -300,7 +333,7 @@ func proveRetireInvocation(ctx context.Context, want *retirement.RetainedInvocat
 		if err != nil {
 			return refuse(err.Error())
 		}
-		now.GuestNetwork = expected.GuestNetwork
+		now.GuestNetwork, now.Runtime = expected.GuestNetwork, expected.Runtime
 		if !reflect.DeepEqual(expected, now) {
 			return refuse("retained node resource changed: " + expected.Path)
 		}
@@ -313,7 +346,14 @@ func proveRetireInvocation(ctx context.Context, want *retirement.RetainedInvocat
 	if r := proveRetireServices(ctx, want); r != nil {
 		return r
 	}
-	return retireQuietJob(ctx, insp, nodeUnit, true)
+	if r := retireQuietJob(ctx, insp, nodeUnit, true); r != nil {
+		return r
+	}
+	// Recheck traversal after the registration, resource and service reads.
+	if err := insp.AdmitRetainedInputs(retainedRequiredInputs(want)); err != nil {
+		return refuse(err.Error())
+	}
+	return nil
 }
 
 // proveRetireStopped is shared by stopped status, stopped journal and archive.

@@ -910,7 +910,7 @@ func (f *requestFixture) retainANode(t *testing.T) {
 	if refusal != nil {
 		t.Fatalf("fixture installed configuration: %+v", refusal)
 	}
-	f.originalNode, refusal = captureRetireInvocation(t.Context(), installed.cfg)
+	f.originalNode, refusal = captureRetireInvocation(t.Context(), installed.cfg, f.cfg)
 	if refusal != nil {
 		t.Fatalf("fixture original node: %+v", refusal)
 	}

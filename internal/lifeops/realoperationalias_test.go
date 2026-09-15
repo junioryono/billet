@@ -55,7 +55,7 @@ func realRetirementRoleAlias(t *testing.T, bypass bool) {
 	t.Log("counterfactual controller alias stopped the retained node")
 }
 
-func realRetirementPrivateTmp(t *testing.T, role string, bypass bool) {
+func realRetirementPrivateTmp(t *testing.T, role string, reload, bypass bool) {
 	t.Helper()
 	h := newRealOperationHost(t)
 	server, node, backup := h.prefix+"-server.service", h.prefix+"-node.service", h.prefix+"-backup.service"
@@ -125,10 +125,28 @@ func realRetirementPrivateTmp(t *testing.T, role string, bypass bool) {
 	if err := os.WriteFile(key, []byte("retained node TLS key\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	p.UnitPaths = map[string][]string{node: {key}}
+	p.RequiredInputs = map[string][]string{node: {key}}
+	if reload {
+		invocation := h.property(owner, "InvocationID")
+		path := filepath.Join("/run/systemd/system", owner)
+		body, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(strings.Replace(string(body), "PrivateTmp=yes", "PrivateTmp=no", 1)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		h.run("daemon-reload")
+		if h.property(owner, "PrivateTmp") != "no" || h.property(owner, "InvocationID") != invocation {
+			t.Fatal("reload did not change the setting while preserving the invocation")
+		}
+		if _, err := os.Stat(key); err != nil {
+			t.Fatalf("reload did not retain the private tree: %v", err)
+		}
+	}
 	original := h.property(node, "InvocationID")
 	if !bypass {
-		if err := h.admit(sequence, p); err == nil || !strings.Contains(err.Error(), "operation-directory-overlap: "+owner+" PrivateTmp=") {
+		if err := h.admit(sequence, p); err == nil || !strings.Contains(err.Error(), "retained-input-volatile") {
 			t.Fatalf("real private-tmp teardown admitted: %v", err)
 		}
 		body, err := os.ReadFile(key)
@@ -162,5 +180,56 @@ func realRetirementPrivateTmp(t *testing.T, role string, bypass bool) {
 			t.Fatal("counterfactual teardown did not remove the retained private-tmp key")
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func realRetirementRuntimeTraversal(t *testing.T, bypass bool) {
+	t.Helper()
+	h := newRealOperationHost(t)
+	server, node := h.prefix+"-server.service", h.prefix+"-node.service"
+	runtimeDir := h.prefix + "/controller-runtime"
+	persistent := filepath.Join("/etc", h.prefix, "tls")
+	if err := os.MkdirAll(persistent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	key := filepath.Join(persistent, "node.key")
+	if err := os.WriteFile(key, []byte("retained key\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h.write(server, "[Unit]\nDefaultDependencies=no\n[Service]\nType=exec\nExecStart=/bin/sleep infinity\nRuntimeDirectory="+runtimeDir+"\n")
+	h.write(node, "[Unit]\nDefaultDependencies=no\n[Service]\nType=exec\nExecStart=/bin/sleep infinity\n")
+	h.run("daemon-reload")
+	h.run("start", "--", server, node)
+	link := filepath.Join("/run", runtimeDir, "tls")
+	if err := os.Symlink(persistent, link); err != nil {
+		t.Fatal(err)
+	}
+	p := OperationProtection{Units: []string{server, node}, RequiredInputs: map[string][]string{node: {key}}}
+	sequence := []Operation{{Verb: "stop", Unit: server}}
+	if err := h.admit(sequence, p); err != nil {
+		t.Fatalf("persistent TLS control refused: %v", err)
+	}
+	path := filepath.Join(link, "node.key")
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil || resolved != key {
+		t.Fatalf("runtime link does not reach persistent key: %s %v", resolved, err)
+	}
+	p.RequiredInputs[node] = []string{path}
+	original := h.property(node, "InvocationID")
+	if !bypass {
+		if err := h.admit(sequence, p); err == nil || !strings.Contains(err.Error(), "retained-input-volatile") {
+			t.Fatalf("runtime traversal admitted: %v", err)
+		}
+		if _, err := os.Stat(path); err != nil || h.property(server, "ActiveState") != "active" || h.property(node, "InvocationID") != original {
+			t.Fatalf("refusal changed services or retained traversal: %v", err)
+		}
+		return
+	}
+	h.run("stop", "--", server)
+	if _, err := os.Lstat(link); !os.IsNotExist(err) {
+		t.Fatalf("counterfactual did not remove the traversal link: %v", err)
+	}
+	if body, err := os.ReadFile(key); err != nil || string(body) != "retained key\n" || h.property(node, "InvocationID") != original {
+		t.Fatalf("counterfactual changed the target or node invocation: %v", err)
 	}
 }

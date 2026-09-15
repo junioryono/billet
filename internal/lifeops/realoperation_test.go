@@ -48,10 +48,15 @@ func TestRealSystemdRetirementOperationEffects(t *testing.T) {
 			realRetirementRoleAlias(t, bypass)
 		})
 		for _, owner := range []string{"server", "backup"} {
-			t.Run(fmt.Sprintf("private tmp/%s/counterfactual=%v", owner, bypass), func(t *testing.T) {
-				realRetirementPrivateTmp(t, owner, bypass)
-			})
+			for _, reload := range []bool{false, true} {
+				t.Run(fmt.Sprintf("private tmp/%s/reload=%v/counterfactual=%v", owner, reload, bypass), func(t *testing.T) {
+					realRetirementPrivateTmp(t, owner, reload, bypass)
+				})
+			}
 		}
+		t.Run(fmt.Sprintf("runtime traversal/counterfactual=%v", bypass), func(t *testing.T) {
+			realRetirementRuntimeTraversal(t, bypass)
+		})
 	}
 	for _, hazard := range []string{"success timer", "standard completion anchor", "credential teardown", "stop propagation", "shared runtime", "dns stop", "socket runtime", "billet truncation"} {
 		for _, bypass := range []bool{false, true} {
