@@ -8,82 +8,64 @@ import (
 	"strings"
 )
 
-// The manager publishes inverse edges, including instantiated unit names. Walk
-// these rather than guessing a trigger's destination from its filename. PartOf
-// and Requisite do not themselves pull in a start in v255; their inverses are
-// included conservatively so sources behind them must also be quiet.
-var operationActivationReverse = []string{
-	"TriggeredBy", "UpheldBy", "OnSuccessOf", "OnFailureOf", "WantedBy",
-	"RequiredBy", "BoundBy", "RequisiteOf", "ConsistsOf",
-}
-
-// AdmitQuietActivation closes the reverse activation graph of each quiet unit,
-// including aliases and instances. Armed sources, active completion handlers,
-// queued jobs, unreadable evidence and an exceeded bound refuse. Exceptions
-// name retirement timers before their stop; filesystem proofs pass none.
-func (i *Inspector) AdmitQuietActivation(ctx context.Context, units, exceptions []string) error {
-	names := append([]string{"Id", "Names", "LoadState", "ActiveState", "Job"}, operationActivationReverse...)
+// AdmitQuietActivation checks only direct triggers and upholders. Every source
+// must be one of the quiet backup/updater services' own retirement timers, quiet
+// after its stop. Waiting units defer activity/job judgment to backup handling;
+// stopped and filesystem proofs pass no waiting units or timer exceptions.
+func (i *Inspector) AdmitQuietActivation(ctx context.Context, units, exceptions []string, waiting ...string) error {
+	names := []string{"Id", "Names", "LoadState", "ActiveState", "Job", "TriggeredBy", "UpheldBy"}
 	observations := make(map[string]map[string][]string)
-	// A unit reached later by a completion/upholder edge must be judged again
-	// even if it was already visited through an ordinary dependency or alias.
-	type visit struct {
-		unit   string
-		source bool
-	}
-	var queue []visit
-	for _, unit := range units {
-		queue = append(queue, visit{unit: unit})
-	}
-	seen := make(map[visit]bool)
-	for len(queue) != 0 {
-		v := queue[0]
-		queue = queue[1:]
-		if seen[v] {
-			continue
+	read := func(unit string) (map[string][]string, error) {
+		props, err := i.properties(ctx, unit, names...)
+		if err != nil {
+			return nil, fmt.Errorf("operation-activation-unknown: %s: %w", unit, err)
 		}
-		seen[v] = true
-		props, ok := observations[v.unit]
-		if !ok {
-			if !operationUnitName(v.unit) || len(observations) >= operationUnitLimit {
-				return fmt.Errorf("operation-activation-unknown: invalid unit or traversal bound: %s", v.unit)
-			}
-			var err error
-			props, err = i.properties(ctx, v.unit, names...)
-			if err != nil {
-				return fmt.Errorf("operation-activation-unknown: %s: %w", v.unit, err)
-			}
-			if err := requireOperationProperties(v.unit, props, names); err != nil {
-				return err
-			}
-			observations[v.unit] = props
+		if err := requireOperationProperties(unit, props, names); err != nil {
+			return nil, err
 		}
-		if !slices.Contains([]string{"loaded", "masked", "not-found"}, first(props, "LoadState")) ||
-			!slices.Contains([]string{"active", "inactive"}, first(props, "ActiveState")) {
-			return fmt.Errorf("operation-activation-unknown: %s has no settled activity evidence", v.unit)
+		if !slices.Contains([]string{"loaded", "masked", "not-found"}, first(props, "LoadState")) {
+			return nil, fmt.Errorf("operation-activation-unknown: %s load state", unit)
 		}
-		aliases := strings.Fields(first(props, "Names"))
 		if first(props, "LoadState") == "not-found" {
 			if first(props, "ActiveState") != "inactive" || first(props, "Job") != "" {
-				return fmt.Errorf("operation-activation-unknown: absent %s has activity", v.unit)
+				return nil, fmt.Errorf("operation-activation-unknown: absent %s has activity", unit)
 			}
-		} else if !operationUnitName(first(props, "Id")) || !slices.Contains(aliases, v.unit) || !slices.Contains(aliases, first(props, "Id")) {
-			return fmt.Errorf("operation-activation-unknown: %s has incomplete names", v.unit)
+		} else if !slices.Contains(strings.Fields(first(props, "Names")), unit) || !operationUnitName(first(props, "Id")) {
+			return nil, fmt.Errorf("operation-activation-unknown: %s names", unit)
 		}
-		armed := v.source
-		for _, suffix := range []string{".path", ".socket", ".timer", ".automount"} {
-			armed = armed || strings.HasSuffix(v.unit, suffix)
+		observations[unit] = props
+		return props, nil
+	}
+	var timers []string
+	for _, unit := range units {
+		if strings.HasSuffix(unit, "-backup.service") || strings.HasSuffix(unit, "-upgrade.service") {
+			timers = append(timers, strings.TrimSuffix(unit, ".service")+".timer")
 		}
-		excepted := strings.HasSuffix(v.unit, ".timer") && slices.Contains(exceptions, v.unit)
-		if !excepted && (first(props, "Job") != "" || (armed && first(props, "ActiveState") != "inactive")) {
-			return fmt.Errorf("operation-reactivation: %s in the reverse activation closure is not quiet", v.unit)
+	}
+	for _, unit := range units {
+		props, err := read(unit)
+		if err != nil {
+			return err
 		}
-		for _, alias := range aliases {
-			queue = append(queue, visit{unit: alias, source: v.source})
+		state := first(props, "ActiveState")
+		if slices.Contains(waiting, unit) && !slices.Contains([]string{"active", "inactive", "activating", "failed"}, state) {
+			return fmt.Errorf("operation-activation-unknown: %s backup activity", unit)
 		}
-		for _, relation := range operationActivationReverse {
-			source := relation == "TriggeredBy" || relation == "UpheldBy" || relation == "OnSuccessOf" || relation == "OnFailureOf"
-			for _, unit := range strings.Fields(first(props, relation)) {
-				queue = append(queue, visit{unit: unit, source: source})
+		if !slices.Contains(waiting, unit) && (!slices.Contains([]string{"active", "inactive"}, state) || first(props, "Job") != "") {
+			return fmt.Errorf("operation-reactivation: %s has unsettled activity or a job", unit)
+		}
+		for _, relation := range []string{"TriggeredBy", "UpheldBy"} {
+			for _, source := range strings.Fields(first(props, relation)) {
+				if !slices.Contains(timers, source) {
+					return fmt.Errorf("operation-unit-outside-set: %s %s=%s is not a retirement timer", unit, relation, source)
+				}
+				from, err := read(source)
+				if err != nil {
+					return err
+				}
+				if !slices.Contains(exceptions, source) && (first(from, "ActiveState") != "inactive" || first(from, "Job") != "") {
+					return fmt.Errorf("operation-reactivation: %s is not quiet", source)
+				}
 			}
 		}
 	}

@@ -116,21 +116,22 @@ func (w *operationWalk) admitInstallation(ctx context.Context, op Operation) err
 		if op.Verb == "enable" {
 			return fmt.Errorf("operation-source-unavailable: enable %s", op.Unit)
 		}
-		return w.inspector.admitInstallationLinks(op, w.protection, "")
+		return w.inspector.admitInstallationLinks(op, w.protection, "", nil)
 	}
 	entries, err := operationInstallEntries(ev.sources)
 	if err != nil {
 		return err
 	}
-	for _, key := range []string{"Also", "Alias", "DefaultInstance"} {
+	for _, key := range []string{"Also", "DefaultInstance"} {
 		if len(entries[key]) != 0 {
 			return fmt.Errorf("operation-install-collateral: %s %s=%s grants more than its target effect", op.Unit,
 				key, strings.Join(entries[key], " "))
 		}
 	}
-	for _, name := range strings.Fields(first(ev.props, "Names")) {
-		if name != op.Unit {
-			return fmt.Errorf("operation-install-alias: %s also names %s", op.Unit, name)
+	for _, alias := range entries["Alias"] {
+		other, ok := w.units[alias]
+		if !ok || first(other.props, "Id") != first(ev.props, "Id") {
+			return fmt.Errorf("operation-install-alias: %s unproved alias %s", op.Unit, alias)
 		}
 	}
 	for _, key := range []string{"WantedBy", "RequiredBy", "UpheldBy"} {
@@ -141,10 +142,10 @@ func (w *operationWalk) admitInstallation(ctx context.Context, op Operation) err
 			}
 		}
 	}
-	return w.inspector.admitInstallationLinks(op, w.protection, first(ev.props, "FragmentPath"))
+	return w.inspector.admitInstallationLinks(op, w.protection, first(ev.props, "FragmentPath"), strings.Fields(first(ev.props, "Names")))
 }
 
-func (i *Inspector) admitInstallationLinks(op Operation, protection OperationProtection, fragment string) error {
+func (i *Inspector) admitInstallationLinks(op Operation, protection OperationProtection, fragment string, aliases []string) error {
 	roots := i.operationUnitDirs
 	if roots == nil {
 		roots = []string{"/etc/systemd/system", "/run/systemd/system"}
@@ -189,7 +190,7 @@ func (i *Inspector) admitInstallationLinks(op Operation, protection OperationPro
 			if filepath.Base(target) != op.Unit && name != op.Unit {
 				return nil
 			}
-			if name != op.Unit {
+			if name != op.Unit && !slices.Contains(aliases, name) {
 				return fmt.Errorf("operation-install-alias: %s link %s", op.Unit, path)
 			}
 			if target == "/dev/null" && op.Verb == "disable" {
@@ -205,8 +206,13 @@ func (i *Inspector) admitInstallationLinks(op Operation, protection OperationPro
 			}
 			parent := filepath.Base(filepath.Dir(path))
 			for _, suffix := range []string{".wants", ".requires", ".upholds"} {
-				if unit, ok := strings.CutSuffix(parent, suffix); ok && protectedOperationUnit(unit, protection.Units) {
-					return fmt.Errorf("operation-install-protected-link: %s", path)
+				if unit, ok := strings.CutSuffix(parent, suffix); ok {
+					if protectedOperationUnit(unit, protection.Units) {
+						return fmt.Errorf("operation-install-protected-link: %s", path)
+					}
+					if !slices.Contains(operationStandardUnits, unit) {
+						return fmt.Errorf("operation-unit-outside-set: %s installation link from %s", op.Unit, unit)
+					}
 				}
 			}
 			return nil

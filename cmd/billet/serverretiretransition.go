@@ -35,6 +35,8 @@ var (
 	// retireBeforeRename runs immediately before the archive's rename, under
 	// every lock it holds; a test observes the host there. Nil in production.
 	retireBeforeRename func()
+	// retireBeforeStoppedProof observes the archive boundary after operation admission.
+	retireBeforeStoppedProof func()
 	// retireBeforeConfigRename observes the boundary after the staged file flush.
 	retireBeforeConfigRename func()
 	// retireResetFailedFn clears the one failure this transition reconciles.
@@ -747,6 +749,9 @@ func archiveUnderExclusion(ctx context.Context, j retirement.Journal) (retiremen
 
 	if r := admitRetireOperations(ctx, j, retireServiceSequence(j, retirement.Decision{Action: retirement.ActionArchive})); r != nil {
 		return j, false, r
+	}
+	if retireBeforeStoppedProof != nil {
+		retireBeforeStoppedProof()
 	}
 	if r := proveRetireStopped(ctx, j); r != nil {
 		return j, false, r

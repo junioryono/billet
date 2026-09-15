@@ -20,9 +20,11 @@ type Operation struct {
 // may be managed by its own directory directives. RequiredActive permits an
 // idempotent dependency start while active, never a stop. QuietUnits require
 // inactive activation sources; QuietExceptions are sources this sequence stops.
+// WaitingUnits defer backup activity to the caller's wait/reconciliation proof.
 type OperationProtection struct {
 	Units           []string
 	QuietUnits      []string
+	WaitingUnits    []string
 	QuietExceptions []string
 	RequiredActive  []string
 	Paths           []string
@@ -46,6 +48,8 @@ var operationRelations = []string{
 	"RequiredBy", "RequisiteOf", "WantedBy", "BoundBy", "UpheldBy", "ConsistsOf",
 	"Conflicts", "ConflictedBy", "OnSuccess", "OnFailure", "OnSuccessOf", "OnFailureOf",
 	"Triggers", "TriggeredBy", "PropagatesStopTo", "StopPropagatedFrom", "JoinsNamespaceOf",
+	"Before", "After", "PropagatesReloadTo", "ReloadPropagatedFrom", "SliceOf",
+	"Following",
 }
 
 var operationUnitProperties = []string{
@@ -66,6 +70,8 @@ var operationExecutionProperties = []string{
 	"StateDirectorySymlink", "RuntimeDirectorySymlink", "CacheDirectorySymlink", "LogsDirectorySymlink",
 	"RuntimeDirectoryPreserve", "RootDirectory", "RootImage", "BindPaths", "BindReadOnlyPaths",
 	"TemporaryFileSystem", "MountImages", "ExtensionImages", "ExtensionDirectories", "DynamicUser",
+	"StandardInput", "StandardOutput", "StandardError", "PAMName", "LogNamespace",
+	"NetworkNamespacePath", "IPCNamespacePath", "UtmpIdentifier",
 	"ExecCondition", "ExecStartPre", "ExecStartPost", "ExecStop", "ExecStopPost",
 }
 
@@ -81,27 +87,26 @@ type operationWalk struct {
 	targets    map[string]bool
 	paths      map[string]operationPathBinding
 	stopped    map[string]bool
-	setups     map[string]map[string]operationSetupValue
+	standard   map[string]bool
 }
 
-// AdmitOperations is read-only and valid only at this boundary. It checks the
-// whole sequence, then rereads the evidence so a changed definition refuses.
-// Admission judges service-manager effects: relationships in both directions,
-// completion handlers and job modes, manager actions, installation links,
-// directory directives, termination policy and every systemd 255 activation
-// source (including timers, paths, sockets and Upholds). It does not interpret
-// unit programs: a root-authored command can do anything, which no static check
-// proves otherwise. Helpers remain permitted where their manager-effect graph
-// cannot reach protected resources. Callers must repeat the existing node
-// execution-shape inspection wherever they authorize a node start. Newly started
-// helpers require every property of their complete execution/type interface to
-// match the closed setup allowlist; unknown properties or values refuse. Quiet
-// services require a bounded reverse activation closure free of armed sources
-// and active completion handlers, including through aliases and instances.
+// AdmitOperations admits a closed unit set: billet's protected units, aliases
+// and configured instances, plus fixed standard dependencies accepted only as
+// no-ops. Every forward, inverse and installation relationship leaving that set
+// refuses by name. Standard units end traversal; their arbitrary host graph is
+// outside this boundary. Billet units retain directory, termination, manager
+// action, stdio and setup checks, and callers recheck node/server execution shape.
+// A filesystem watcher with no relationship to a protected unit is outside the
+// manager-effects boundary, like cron or an inotify daemon. Direct path, socket,
+// timer and automount triggers of protected services still refuse. Programs are
+// not interpreted. Evidence is reread, and admission grants no future authority.
 func (i *Inspector) AdmitOperations(ctx context.Context, sequence []Operation, protection OperationProtection) error {
-	w := operationWalk{inspector: i, protection: protection, units: make(map[string]operationEvidence), targets: make(map[string]bool), paths: make(map[string]operationPathBinding), stopped: make(map[string]bool), setups: make(map[string]map[string]operationSetupValue)}
+	w := operationWalk{inspector: i, protection: protection, units: make(map[string]operationEvidence), targets: make(map[string]bool), paths: make(map[string]operationPathBinding), stopped: make(map[string]bool), standard: make(map[string]bool)}
 	for _, op := range sequence {
 		w.targets[op.Unit] = true
+	}
+	if err := w.admitClosedSet(ctx); err != nil {
+		return err
 	}
 	paths := slices.Clone(protection.Paths)
 	for _, owned := range protection.UnitPaths {
@@ -133,12 +138,6 @@ func (i *Inspector) AdmitOperations(ctx context.Context, sequence []Operation, p
 			return fmt.Errorf("operation-evidence-changed: %s changed during admission", unit)
 		}
 	}
-	for unit, before := range w.setups {
-		after, err := i.operationSetup(ctx, unit)
-		if err != nil || !reflect.DeepEqual(before, after) {
-			return fmt.Errorf("operation-setup-changed: %s changed or could not be read", unit)
-		}
-	}
 	for _, op := range sequence {
 		if op.Verb == "enable" || op.Verb == "disable" {
 			if err := w.admitInstallation(ctx, op); err != nil {
@@ -146,7 +145,7 @@ func (i *Inspector) AdmitOperations(ctx context.Context, sequence []Operation, p
 			}
 		}
 	}
-	if err := i.AdmitQuietActivation(ctx, protection.QuietUnits, protection.QuietExceptions); err != nil {
+	if err := i.AdmitQuietActivation(ctx, protection.QuietUnits, protection.QuietExceptions, protection.WaitingUnits...); err != nil {
 		return err
 	}
 	if err := w.revalidatePaths(); err != nil {
@@ -173,6 +172,16 @@ func sortedOperationUnits(units map[string]operationEvidence) []string {
 }
 
 func (w *operationWalk) read(ctx context.Context, unit string) (operationEvidence, error) {
+	if w.standard[unit] {
+		props, err := w.inspector.properties(ctx, unit, "Id", "Names", "LoadState", "ActiveState", "Job", "StopWhenUnneeded")
+		if err != nil {
+			return operationEvidence{}, fmt.Errorf("operation-standard-unknown: %s: %w", unit, err)
+		}
+		if err := requireOperationProperties(unit, props, []string{"Id", "Names", "LoadState", "ActiveState", "Job", "StopWhenUnneeded"}); err != nil {
+			return operationEvidence{}, err
+		}
+		return operationEvidence{props: props}, nil
+	}
 	names := append(slices.Clone(operationUnitProperties), operationRelations...)
 	props, err := w.inspector.properties(ctx, unit, names...)
 	if err != nil {
@@ -188,7 +197,7 @@ func (w *operationWalk) read(ctx context.Context, unit string) (operationEvidenc
 		}
 		return operationEvidence{props: props}, nil
 	}
-	if first(props, "Id") != unit && (scoped || !slices.Contains(strings.Fields(first(props, "Names")), unit)) {
+	if first(props, "Id") != unit && !slices.Contains(strings.Fields(first(props, "Names")), unit) {
 		return operationEvidence{}, fmt.Errorf("operation-source-unsupported: %s is not the canonical unit", unit)
 	}
 	if !operationUnitName(first(props, "Id")) || !slices.Contains(strings.Fields(first(props, "Names")), first(props, "Id")) {
@@ -233,7 +242,7 @@ func (w *operationWalk) read(ctx context.Context, unit string) (operationEvidenc
 			props[key] = value
 		}
 	}
-	if !scoped || operationPassiveUnit(unit) {
+	if !scoped || first(props, "FragmentPath") == "" {
 		return operationEvidence{props: props}, nil
 	}
 	sources, err := readOperationSources(props)
@@ -324,14 +333,22 @@ func (w *operationWalk) admit(ctx context.Context, op Operation) error {
 		if err != nil {
 			return err
 		}
+		if w.standard[effect.Unit] {
+			if err := admitStandardEffect(effect, ev); err != nil {
+				return err
+			}
+			continue
+		}
+		// Relationships may use a loaded alias; it is the same target effect.
+		if canonical := first(ev.props, "Id"); canonical != "" {
+			effect.Unit = canonical
+		}
+		if canonical := first(w.units[op.Unit].props, "Id"); canonical != "" {
+			op.Unit = canonical
+		}
 		if effect != op && protectedOperationUnit(effect.Unit, w.protection.Units) &&
 			!(effect.Verb == "start" && slices.Contains(w.protection.RequiredActive, effect.Unit) && first(ev.props, "ActiveState") == "active") {
 			return fmt.Errorf("operation-protected-effect: %s %s reaches %s %s", op.Verb, op.Unit, effect.Verb, effect.Unit)
-		}
-		for _, name := range strings.Fields(first(ev.props, "Names")) {
-			if name != effect.Unit && protectedOperationUnit(name, w.protection.Units) {
-				return fmt.Errorf("operation-protected-alias: %s names %s", effect.Unit, name)
-			}
 		}
 		if first(ev.props, "LoadState") == "not-found" || first(ev.props, "LoadState") == "masked" {
 			if effect == op && effect.Verb == "start" {
@@ -368,11 +385,6 @@ func (w *operationWalk) admit(ctx context.Context, op Operation) error {
 		}
 		if effect == op && effect.Verb == "start" {
 			if err := w.admitMountRequirements(effect, ev); err != nil {
-				return err
-			}
-		}
-		if !activeNoop && effect.Verb == "start" {
-			if err := w.admitSetup(ctx, effect, ev); err != nil {
 				return err
 			}
 		}
@@ -427,7 +439,7 @@ func (w *operationWalk) admit(ctx context.Context, op Operation) error {
 					if err != nil {
 						return err
 					}
-					if first(from.props, "ActiveState") != "inactive" {
+					if first(from.props, "ActiveState") != "inactive" && !w.stopped[source] && !slices.Contains(w.protection.QuietExceptions, source) {
 						return fmt.Errorf("operation-reactivation: %s %s=%s is not quiet", effect.Unit, prop, source)
 					}
 				}
@@ -436,6 +448,9 @@ func (w *operationWalk) admit(ctx context.Context, op Operation) error {
 		// Match inverse declarations too, rather than assuming fake or partial
 		// evidence supplied both halves consistently.
 		for unit, other := range w.units {
+			if w.standard[unit] {
+				continue
+			}
 			for _, prop := range []string{"OnSuccessOf", "OnFailureOf"} {
 				if !activeNoop && slices.Contains(strings.Fields(first(other.props, prop)), effect.Unit) {
 					queue = append(queue, Operation{Verb: "start", Unit: unit})
@@ -515,7 +530,7 @@ func (w *operationWalk) admitDirectories(effect Operation, ev operationEvidence)
 		hasDirectories = hasDirectories || first(ev.props, directive) != ""
 	}
 	if hasDirectories && operationExecutionInterface(effect.Unit) != "" {
-		for _, prop := range operationExecutionProperties[5 : len(operationExecutionProperties)-5] {
+		for _, prop := range operationExecutionProperties[5:19] {
 			want := ""
 			switch prop {
 			case "DynamicUser":
@@ -547,7 +562,7 @@ func (w *operationWalk) admitDirectories(effect Operation, ev operationEvidence)
 				}
 			}
 			for unit, other := range w.units {
-				if unit == effect.Unit || !protectedOperationUnit(unit, w.protection.Units) {
+				if unit == effect.Unit || first(other.props, "Id") == first(ev.props, "Id") || !protectedOperationUnit(unit, w.protection.Units) {
 					continue
 				}
 				for otherDirective, otherRoot := range operationDirectoryRoots {

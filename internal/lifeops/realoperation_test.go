@@ -37,15 +37,13 @@ func TestRealSystemdRetirementOperationEffects(t *testing.T) {
 			})
 		}
 	}
-	for _, chain := range []string{"direct", "completion", "two dependencies"} {
-		for _, bypass := range []bool{false, true} {
-			t.Run(fmt.Sprintf("archive path/%s/counterfactual=%v", chain, bypass), func(t *testing.T) {
-				realRetirementArchivePath(t, chain, bypass)
-			})
-		}
+	for _, bypass := range []bool{false, true} {
+		t.Run(fmt.Sprintf("archive path/direct/counterfactual=%v", bypass), func(t *testing.T) {
+			realRetirementArchivePath(t, bypass)
+		})
 	}
-	t.Run("clean helper setup", realRetirementCleanHelper)
-	for _, hazard := range []string{"success timer", "stop propagation", "shared runtime", "dns stop", "socket runtime", "helper truncation"} {
+	t.Run("outside helper", realRetirementOutsideHelper)
+	for _, hazard := range []string{"success timer", "stop propagation", "shared runtime", "dns stop", "socket runtime", "billet truncation"} {
 		for _, bypass := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/counterfactual=%v", hazard, bypass), func(t *testing.T) {
 				realRetirementHazard(t, hazard, bypass)
@@ -58,6 +56,7 @@ type realOperationHost struct {
 	t         *testing.T
 	prefix    string
 	installed []string
+	dropins   []string
 	masks     []string
 }
 
@@ -92,6 +91,11 @@ func newRealOperationHost(t *testing.T) *realOperationHost {
 				continue
 			}
 			if err := h.ctl(ctx, "disable", "--", name); err != nil {
+				t.Error(err)
+			}
+		}
+		for _, path := range h.dropins {
+			if err := os.RemoveAll(path); err != nil {
 				t.Error(err)
 			}
 		}
@@ -160,7 +164,7 @@ func (h *realOperationHost) property(unit, property string) string {
 func (h *realOperationHost) admit(sequence []Operation, protection OperationProtection) error {
 	h.t.Helper()
 	i := NewInspector(WithObserver(func(_ context.Context, args []string) {
-		if args[0] != "show" && args[0] != "get-property" && args[0] != "--xml-interface" && args[0] != "--json=short" {
+		if args[0] != "show" && args[0] != "get-property" {
 			h.t.Errorf("admission submitted a job: %v", args)
 		}
 	}))
@@ -403,9 +407,6 @@ func realRetirementHazard(t *testing.T, hazard string, bypass bool) {
 	backupEffect := filepath.Join(t.TempDir(), "backup-started")
 	unitExtra, serviceExtra := "", ""
 	switch hazard {
-	case "helper truncation":
-		unitExtra = "OnSuccess=" + h.prefix + "-helper.service\n"
-		h.write(h.prefix+"-helper.service", "[Unit]\nDefaultDependencies=no\n[Service]\nType=oneshot\nExecStart=/usr/bin/true\nStandardOutput=truncate:"+record+"\n")
 	case "success timer":
 		unitExtra = "OnSuccess=" + timer + "\n"
 	case "stop propagation":
@@ -422,13 +423,25 @@ func realRetirementHazard(t *testing.T, hazard string, bypass bool) {
 	h.write(timer, "[Unit]\nDefaultDependencies=no\n[Timer]\nOnActiveSec=1ms\nUnit="+backup+"\n")
 	h.write(backup, "[Unit]\nDefaultDependencies=no\n[Service]\nType=oneshot\nExecStart=/usr/bin/touch "+backupEffect+"\n")
 	h.write(dns, "[Unit]\nDefaultDependencies=no\n[Service]\nType=exec\nExecStart=/bin/sleep infinity\n")
-	h.write(socket, "[Unit]\nDefaultDependencies=no\n[Socket]\nListenStream=/run/"+h.prefix+"/test.sock\nService="+backup+"\nRuntimeDirectory="+socketRuntime+"\n")
+	h.write(socket, "[Unit]\nDefaultDependencies=no\n[Socket]\nListenStream=/run/"+h.prefix+"/test.sock\nService="+h.prefix+"-socket-destination.service\nRuntimeDirectory="+socketRuntime+"\n")
+	h.write(h.prefix+"-socket-destination.service", "[Service]\nType=oneshot\nExecStart=/usr/bin/true\n")
 	h.run("daemon-reload")
 	h.run("start", "--", node, server, dns, socket)
 	for _, path := range []string{record, socketRecord} {
 		if err := os.WriteFile(path, []byte("original registration\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if hazard == "billet truncation" {
+		dir := filepath.Join("/run/systemd/system", server+".d")
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		h.dropins = append(h.dropins, dir)
+		if err := os.WriteFile(filepath.Join(dir, "stdio.conf"), []byte("[Service]\nExecStop=/usr/bin/true\nStandardOutput=truncate:"+record+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		h.run("daemon-reload")
 	}
 	nodeInvocation, dnsInvocation := h.property(node, "InvocationID"), h.property(dns, "InvocationID")
 	protection := OperationProtection{
@@ -440,7 +453,7 @@ func realRetirementHazard(t *testing.T, hazard string, bypass bool) {
 		if err == nil || !strings.Contains(err.Error(), "operation-") {
 			t.Fatalf("preventive %s refusal missing: %v", hazard, err)
 		}
-		if hazard == "helper truncation" && !strings.Contains(err.Error(), "operation-setup-unsupported: "+h.prefix+"-helper.service StandardOutput") {
+		if hazard == "billet truncation" && !strings.Contains(err.Error(), "operation-setup-unsupported: "+server+" StandardOutput") {
 			t.Fatalf("truncation was refused for an unrelated reason: %v", err)
 		}
 		if h.property(server, "ActiveState") != "active" || h.property(node, "InvocationID") != nodeInvocation ||
@@ -463,7 +476,7 @@ func realRetirementHazard(t *testing.T, hazard string, bypass bool) {
 	for {
 		occurred := false
 		switch hazard {
-		case "helper truncation":
+		case "billet truncation":
 			body, err := os.ReadFile(record)
 			occurred = err == nil && len(body) == 0 && h.property(node, "ActiveState") == "active"
 		case "success timer":
@@ -493,7 +506,7 @@ func realRetirementHazard(t *testing.T, hazard string, bypass bool) {
 
 // PathChanged watches IN_MOVE_SELF in v255 src/core/path.c. The fixture maps
 // /var/lib/billet/server and billet-backup.service into its disposable namespace.
-func realRetirementArchivePath(t *testing.T, chain string, bypass bool) {
+func realRetirementArchivePath(t *testing.T, bypass bool) {
 	t.Helper()
 	h := newRealOperationHost(t)
 	identity := filepath.Join("/var/lib", h.prefix, "server")
@@ -512,16 +525,6 @@ func realRetirementArchivePath(t *testing.T, chain string, bypass bool) {
 	marker := filepath.Join("/var/lib", h.prefix, "backup-started")
 	h.write(backup, "[Service]\nType=oneshot\nExecStart=/usr/bin/touch "+marker+"\nRemainAfterExit=yes\n")
 	destination := backup
-	switch chain {
-	case "completion":
-		destination = h.prefix + "-helper.service"
-		h.write(destination, "[Unit]\nOnSuccess="+backup+"\n[Service]\nType=oneshot\nExecStart=/usr/bin/true\n")
-	case "two dependencies":
-		destination = h.prefix + "-middle.service"
-		helper := h.prefix + "-helper.service"
-		h.write(destination, "[Unit]\nWants="+helper+"\n[Service]\nType=oneshot\nExecStart=/usr/bin/true\n")
-		h.write(helper, "[Unit]\nRequires="+backup+"\n[Service]\nType=oneshot\nExecStart=/usr/bin/true\n")
-	}
 	h.write(watcher, "[Path]\nPathChanged="+identity+"\nUnit="+destination+"\n")
 	h.run("daemon-reload")
 	h.run("start", "--", watcher)
@@ -534,7 +537,7 @@ func realRetirementArchivePath(t *testing.T, chain string, bypass bool) {
 	}
 	if !bypass {
 		err := NewInspector().AdmitQuietActivation(t.Context(), []string{backup}, nil)
-		if err == nil || !strings.Contains(err.Error(), "operation-reactivation") {
+		if err == nil || !strings.Contains(err.Error(), "operation-unit-outside-set") {
 			t.Fatalf("active path source admitted: %v", err)
 		}
 		after, err := os.Stat(identity)
@@ -564,28 +567,19 @@ func realRetirementArchivePath(t *testing.T, chain string, bypass bool) {
 	}
 }
 
-// A real newly started helper exercises the entire manager inventory. The
-// shipped/rendered chains alone have their execution-bearing dependencies active.
-func realRetirementCleanHelper(t *testing.T) {
+// Removing closed-set admission would submit the controller stop here.
+func realRetirementOutsideHelper(t *testing.T) {
 	t.Helper()
 	h := newRealOperationHost(t)
-	server, helper := h.prefix+"-server.service", h.prefix+"-helper.service"
-	h.write(server, "[Unit]\nOnSuccess="+helper+"\n[Service]\nType=exec\nExecStart=/bin/sleep infinity\n")
-	h.write(helper, "[Service]\nType=oneshot\nExecStart=/usr/bin/true\nRemainAfterExit=yes\n")
+	server, helper := h.prefix+"-server.service", h.prefix+"-external.service"
+	h.write(server, "[Unit]\nPropagatesStopTo="+helper+"\n[Service]\nType=exec\nExecStart=/bin/sleep infinity\n")
+	h.write(helper, "[Service]\nType=oneshot\nExecStart=/usr/bin/true\nExecStop=/usr/bin/true\nRemainAfterExit=yes\n")
 	h.run("daemon-reload")
-	h.run("start", "--", server)
-	if h.property(helper, "ActiveState") != "inactive" {
-		t.Fatal("clean setup helper is already active")
+	h.run("start", "--", server, helper)
+	if err := h.admit([]Operation{{Verb: "stop", Unit: server}}, OperationProtection{Units: []string{server}}); err == nil || !strings.Contains(err.Error(), "operation-unit-outside-set: "+server+" PropagatesStopTo="+helper) {
+		t.Fatalf("outside helper admitted: %v", err)
 	}
-	if err := h.admit([]Operation{{Verb: "stop", Unit: server}}, OperationProtection{Units: []string{server}}); err != nil {
-		t.Fatalf("real default helper setup refused: %v", err)
-	}
-	h.run("stop", "--", server)
-	deadline := time.Now().Add(5 * time.Second)
-	for h.property(helper, "ActiveState") != "active" {
-		if time.Now().After(deadline) {
-			t.Fatal("admitted helper did not start")
-		}
-		time.Sleep(20 * time.Millisecond)
+	if h.property(server, "ActiveState") != "active" || h.property(helper, "ActiveState") != "active" {
+		t.Fatal("refusal performed a stop")
 	}
 }

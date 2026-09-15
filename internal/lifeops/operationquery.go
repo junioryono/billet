@@ -35,6 +35,9 @@ func (i *Inspector) operationExecution(ctx context.Context, unit string, command
 			names = append(names, property)
 		}
 	}
+	if strings.HasSuffix(unit, ".service") {
+		names = append(names, "PIDFile")
+	}
 	props, err := i.properties(ctx, unit, names...)
 	if err != nil {
 		return nil, err
@@ -76,8 +79,7 @@ func (i *Inspector) operationExecution(ctx context.Context, unit string, command
 			return nil, fmt.Errorf("operation-array-unknown: %s %s has an invalid array", unit, property.name)
 		}
 		if count != 0 {
-			// Retain configured evidence for the effect walk to judge. An
-			// unrelated dependency's command is not a protected effect.
+			// Retain configured evidence for billet's setup and command checks.
 			props[property.name] = []string{lines[n]}
 			continue
 		}

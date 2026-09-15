@@ -449,7 +449,7 @@ func TestABackupIsAwaitedAndOnlyItsOwnRefusalIsReconciled(t *testing.T) {
 		reconcile bool
 	}{
 		"a backup that finishes is waited for": {
-			unit: "LoadState=loaded\nActiveState=active\nSubState=running\nResult=success\nMainPID=99\n",
+			unit: "LoadState=loaded\nActiveState=activating\nSubState=start\nJob=42\nResult=success\nMainPID=99\n",
 			resolve: "LoadState=loaded\nActiveState=inactive\nSubState=dead\nResult=success\nMainPID=0\n" +
 				"UnitFileState=static\nExecMainCode=1\nExecMainStatus=0\n",
 		},
@@ -480,6 +480,14 @@ func TestABackupIsAwaitedAndOnlyItsOwnRefusalIsReconciled(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			f := newRequestFixture(t)
 			unit := filepath.Join(f.unitsDir, backupServiceUnit)
+			effects := filepath.Join(f.unitsDir, backupServiceUnit+".effects")
+			writeFile(t, effects, strings.ReplaceAll(mustRead(t, effects), "Job=\n", ""), 0o644)
+			if !strings.Contains(c.unit, "Job=") {
+				c.unit += "Job=\n"
+			}
+			if c.resolve != "" {
+				c.resolve += "Job=\n"
+			}
 			writeFile(t, unit, c.unit+"UnitFileState=static\n", 0o644)
 
 			// The wait is a test's: a poll and a bound this case can reach.

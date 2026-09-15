@@ -53,6 +53,9 @@ func retireOperationProtection(j retirement.Journal) lifeops.OperationProtection
 	if j.Phase == retirement.PhaseIntent {
 		p.QuietExceptions = []string{upgradeTimerUnit, backupTimerUnit}
 	}
+	if j.Phase == retirement.PhaseIntent || j.Phase == retirement.PhaseStopped {
+		p.WaitingUnits = []string{backupServiceUnit}
+	}
 	if j.RetainedInvocation != nil {
 		for _, service := range j.RetainedInvocation.Services {
 			p.Units = append(p.Units, service.Unit)
@@ -70,9 +73,6 @@ func retireOperationProtection(j retirement.Journal) lifeops.OperationProtection
 }
 
 func admitRetireOperations(ctx context.Context, j retirement.Journal, operations []lifeops.Operation) *retireRefusal {
-	if len(operations) == 0 {
-		return proveRetireActivation(ctx, false)
-	}
 	if j.Variant == retirement.VariantRetainedNode && (j.RetainedInvocation == nil || j.RetainedInvocation.Provider == "") {
 		return retireUnknown(retireReasonStopped, "the journal has no original retained-node provider and invocation evidence", "")
 	}
@@ -87,7 +87,10 @@ func admitRetireOperations(ctx context.Context, j retirement.Journal, operations
 	protection := retireOperationProtection(j)
 	// Individual operations use the same fixed shutdown order as the driver.
 	// A timer's exception expires before its disable, even while phase=intent.
-	first := operations[0]
+	first := lifeops.Operation{}
+	if len(operations) != 0 {
+		first = operations[0]
+	}
 	if first.Unit == backupTimerUnit {
 		protection.QuietExceptions = slices.DeleteFunc(protection.QuietExceptions, func(unit string) bool {
 			return unit == upgradeTimerUnit || first.Verb != "stop"
@@ -130,7 +133,7 @@ func admitRetireRemaining(ctx context.Context, m retireMode, j retirement.Journa
 			return r
 		}
 	}
-	return proveRetireActivation(ctx, j.Phase == retirement.PhaseIntent)
+	return proveRetireActivation(ctx, j.Phase == retirement.PhaseIntent, j.Phase == retirement.PhaseStopped)
 }
 
 // captureRetireInvocation runs before intent. A resumed journal never invents
@@ -295,12 +298,15 @@ func proveRetireStopped(ctx context.Context, j retirement.Journal) *retireRefusa
 
 var retireQuietServices = []string{serverUnit, backupServiceUnit, "billet-upgrade.service"}
 
-func proveRetireActivation(ctx context.Context, stoppingTimers bool) *retireRefusal {
-	var exceptions []string
+func proveRetireActivation(ctx context.Context, stoppingTimers bool, waitingBackup ...bool) *retireRefusal {
+	var exceptions, waiting []string
 	if stoppingTimers {
 		exceptions = []string{upgradeTimerUnit, backupTimerUnit}
 	}
-	if err := retireOperationInspector().AdmitQuietActivation(ctx, retireQuietServices, exceptions); err != nil {
+	if stoppingTimers || (len(waitingBackup) != 0 && waitingBackup[0]) {
+		waiting = []string{backupServiceUnit}
+	}
+	if err := retireOperationInspector().AdmitQuietActivation(ctx, retireQuietServices, exceptions, waiting...); err != nil {
 		return retireUnknown(retireReasonStopped, err.Error(), "")
 	}
 	return nil
