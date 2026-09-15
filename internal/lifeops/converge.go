@@ -39,6 +39,8 @@ const DefaultStabilityWait = 6 * time.Second
 const (
 	stateRoot   = "/var/lib"
 	runtimeRoot = "/run"
+	configRoot  = "/etc"
+	varTmpRoot  = "/var/tmp"
 )
 
 // Refusal is a reason `up` will not proceed, and what to do about it. Both

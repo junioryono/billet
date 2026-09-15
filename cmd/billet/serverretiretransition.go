@@ -729,8 +729,8 @@ func retireStop(ctx context.Context, j retirement.Journal) (retirement.Journal, 
 // knows about starts it again on this host or at the next boot.
 func stopAndDisableForRetirement(ctx context.Context, c converger, j retirement.Journal, unit string) *retireRefusal {
 	manager, ok := c.(interface {
-		StopAndProveAdmitted(context.Context, string, func() error) (lifeops.StopResult, error)
-		DisableAdmitted(context.Context, string, func() error) error
+		StopAndProveAdmitted(ctx context.Context, unit string, admit func() error) (lifeops.StopResult, error)
+		DisableAdmitted(ctx context.Context, unit string, admit func() error) error
 	})
 	if !ok {
 		return retireUnknown(retireReasonStop, "service manager has no operation submission admission", "")

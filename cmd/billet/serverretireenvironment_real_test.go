@@ -14,6 +14,9 @@ import (
 	"github.com/junioryono/billet/internal/retirement"
 )
 
+// runtimeUnitDirectory is where the witness installs its disposable unit.
+const runtimeUnitDirectory = "/run/systemd/system"
+
 // The command and its production readers run the whole retained handoff. Only
 // EnvironmentFiles comes from the disposable host's loaded shipped unit; the
 // other observations and operations use the request fixture's manager.
@@ -33,7 +36,7 @@ func TestRealSystemdRetirementWithoutEnvironmentFiles(t *testing.T) {
 		t.Fatalf("this witness requires systemd 255: %s", version)
 	}
 	unit := fmt.Sprintf("billet-retire-environment-%d-%d.service", os.Getpid(), time.Now().UnixNano())
-	path := filepath.Join("/", "run", "systemd", "system", unit)
+	path := filepath.Join(runtimeUnitDirectory, unit)
 	body, err := os.ReadFile(filepath.Join("..", "..", "deploy", nodeUnit))
 	mustOK(t, err)
 	if strings.Contains(string(body), "EnvironmentFile=") {

@@ -997,7 +997,7 @@ func TestOperationAdmissionProtectsImplicitCredentialTeardown(t *testing.T) {
 				if err := f.inspector.AdmitOperations(t.Context(), sequence, protection); err != nil {
 					t.Fatalf("unrelated credential path: %v", err)
 				}
-				protection.UnitPaths["retained.service"] = []string{filepath.Join("/", "run", "credentials", canonical, "current")}
+				protection.UnitPaths["retained.service"] = []string{filepath.Join(runtimeRoot, "credentials", canonical, "current")}
 				if err := f.inspector.AdmitOperations(t.Context(), sequence, protection); err == nil || !strings.Contains(err.Error(), "operation-directory-overlap") || !strings.Contains(err.Error(), "CredentialDirectory=/run/credentials/"+canonical) {
 					t.Fatalf("implicit canonical credential teardown admitted: %v", err)
 				}

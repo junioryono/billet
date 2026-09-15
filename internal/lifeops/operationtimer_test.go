@@ -103,9 +103,10 @@ func TestRetirementTimerHelpersRequirePositiveAbsence(t *testing.T) {
 					if problem != "loaded" {
 						want = nil
 						how := problem
-						if problem == "absent" {
+						switch problem {
+						case "absent":
 							how = "not-found"
-						} else if problem == "masked dev-null" {
+						case "masked dev-null":
 							how = "masked"
 						}
 						if verb == "stop" && result.How != how {

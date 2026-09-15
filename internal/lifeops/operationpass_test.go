@@ -53,7 +53,7 @@ func TestOperationAdmissionBatchesRetainedShippedSequence(t *testing.T) {
 		QuietUnits: []string{"billet-server.service", "billet-backup.service", "billet-upgrade.service"},
 		UnitPaths: map[string][]string{"billet-server.service": {"/var/lib/billet/server"},
 			"billet-node.service": {"/var/lib/billet/node", "/run/billet/locks", "/run/billet/registration"}}}
-	for round := 0; round < 2; round++ {
+	for range 2 {
 		f.calls = nil
 		if err := f.inspector.AdmitOperations(t.Context(), sequence, protection); err != nil {
 			t.Fatalf("full retained sequence: %v", err)
@@ -64,11 +64,12 @@ func TestOperationAdmissionBatchesRetainedShippedSequence(t *testing.T) {
 			if args[0] == "show" {
 				unit := args[len(args)-1]
 				shows[unit]++
-				if unit == "billet-node.service" {
+				switch {
+				case unit == "billet-node.service":
 					if !slices.Equal(args, []string{"show", "--all", "--", unit}) {
 						t.Fatalf("retained inventory was filtered: %s", call)
 					}
-				} else if len(args) != 4 || !strings.HasPrefix(args[1], "--property=") || strings.Contains(args[1], "*") {
+				case len(args) != 4 || !strings.HasPrefix(args[1], "--property=") || strings.Contains(args[1], "*"):
 					t.Fatalf("properties were split across requests: %s", call)
 				}
 			} else if args[0] == "get-property" {

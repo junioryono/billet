@@ -675,7 +675,7 @@ func (w *operationWalk) admitDirectories(effect Operation, ev operationEvidence)
 				return err
 			}
 		}
-		if err := check(filepath.Join("/", "run", "credentials", first(ev.props, "Id")), "CredentialDirectory"); err != nil {
+		if err := check(filepath.Join(runtimeRoot, "credentials", first(ev.props, "Id")), "CredentialDirectory"); err != nil {
 			return err
 		}
 	}
