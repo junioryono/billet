@@ -71,6 +71,10 @@ func (s *retireServiceManager) StartAndProve(ctx context.Context, unit string) (
 	s.set(unit, "ActiveState", "active")
 	s.set(unit, "SubState", "running")
 	s.set(unit, "MainPID", "4242")
+	if unit == nodeUnit {
+		// The manager starts a new invocation even if the node never registers.
+		s.set(unit, "InvocationID", retainedRestartInvocation)
+	}
 
 	return s.fakeConverger.StartAndProve(ctx, unit)
 }

@@ -280,6 +280,7 @@ func TestARetainedNodesTransitionInstallsTheStageAndRestartsTheNode(t *testing.T
 func TestARetainedNodeThatPublishesNoRecordIsNotDone(t *testing.T) {
 	for name, endpoint := range map[string]string{
 		"no record at all":                 "",
+		"only the pre-restart record":      "",
 		"a record naming another endpoint": "https://10.0.0.9:7717",
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -289,11 +290,14 @@ func TestARetainedNodeThatPublishesNoRecordIsNotDone(t *testing.T) {
 
 			record := useRegistrationRecord(t)
 
-			if endpoint != "" {
-				f.svc.onStart = func(unit string) {
-					if unit == nodeUnit {
-						restartedNode(t, f, record, endpoint)
-					}
+			f.svc.onStart = func(unit string) {
+				if unit != nodeUnit {
+					return
+				}
+				if name == "no record at all" {
+					mustOK(t, os.Remove(record))
+				} else if endpoint != "" {
+					restartedNode(t, f, record, endpoint)
 				}
 			}
 
@@ -307,6 +311,30 @@ func TestARetainedNodeThatPublishesNoRecordIsNotDone(t *testing.T) {
 
 			if !strings.Contains(whyOf(m), "node_unit") {
 				t.Fatalf("the refusal does not name the fact that refused: %s", out)
+			}
+
+			props, err := endpointInspector().UnitProperties(t.Context(), nodeUnit, "InvocationID")
+			mustOK(t, err)
+			if firstProp(props, "InvocationID") != retainedRestartInvocation {
+				t.Fatal("the fake restart did not change the manager's invocation")
+			}
+			if name == "no record at all" {
+				if _, err := os.Lstat(record); !os.IsNotExist(err) {
+					t.Fatalf("the absent-record case kept a record: %v", err)
+				}
+			} else {
+				ev := readRegistrationRecord(record)
+				invocation := retainedInvocation
+				if endpoint != "" {
+					invocation = retainedRestartInvocation
+				}
+				if ev.record == nil || ev.record.InvocationID != invocation {
+					t.Fatalf("the record case did not establish invocation %s: %+v", invocation, ev)
+				}
+			}
+			j := requireRetireJournal(t)
+			if j.Phase != retirement.PhaseNodeRestarted || j.DoneAt != "" || j.RowDone || j.Settled {
+				t.Fatalf("an unproved registration completed retirement: %+v", j)
 			}
 		})
 	}

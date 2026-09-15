@@ -657,7 +657,7 @@ func TestServerRetireRequestProvesTheRenameAndTheBackup(t *testing.T) {
 	// A backup that is still running.
 	writeFile(t, filepath.Join(f.unitsDir, backupServiceUnit),
 		"LoadState=loaded\nActiveState=active\nSubState=running\nResult=success\nKillMode=control-group\nMainPID=4242\n"+
-			"InvocationID=\nStateChangeTimestamp=\n", 0o644)
+			"UnitFileState=static\nInvocationID=\nStateChangeTimestamp=\n", 0o644)
 
 	out, code = f.request(t, f.input(t, nil))
 	if m := retireAnswer(t, out); m["reason"] != retireReasonBackup || code != exitRefused {

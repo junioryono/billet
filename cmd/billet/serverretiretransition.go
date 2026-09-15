@@ -231,7 +231,7 @@ func performRetireAction(ctx context.Context, m retireMode, obs *installedConfig
 		}
 		noteRetireMutation("directory-flush", "")
 		if err := retireSyncDir(filepath.Dir(m.configPath)); err != nil {
-			return j, retireUnknown(retireReasonJournal, "flush configuration before recording its rewrite: "+err.Error(), "")
+			return j, retireUnknown(retireReasonJournal, "flush configuration before recording config-rewritten: "+err.Error(), "")
 		}
 		if r := proveRetireRequiredResources(ctx, j); r != nil {
 			return j, r

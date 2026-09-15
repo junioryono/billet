@@ -96,6 +96,10 @@ func admitRetireRequestPreparation(ctx context.Context, m retireMode) *retireRef
 		return r
 	}
 	if fact == retirement.JournalFactDone {
+		// The archived identity binds the journal before its host postconditions.
+		if _, r := retireArchivedIdentity(j); r != nil {
+			return r
+		}
 		if _, r := observeRetirePostconditions(ctx, m, j); r != nil {
 			return r
 		}
