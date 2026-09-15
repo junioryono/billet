@@ -793,9 +793,9 @@ const (
 	retainedIncarnation = "00112233445566778899aabbccddeeff"
 	survivorAddress     = "10.0.0.2"
 
-	// The invocation the node runs under BEFORE the retirement, which every
-	// report and the receipt of the time name, and the one systemd mints for
-	// the restart the transition performs.
+	// The original invocation shared by reports and the pre-retirement receipt,
+	// and another invocation used by explicit unit/record fixtures. The fake
+	// manager generates its own fresh invocation on each start.
 	retainedInvocation        = "0123456789abcdef0123456789abcdef"
 	retainedRestartInvocation = "fedcba9876543210fedcba9876543210"
 )

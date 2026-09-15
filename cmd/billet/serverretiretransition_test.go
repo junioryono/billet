@@ -315,7 +315,7 @@ func TestARetainedNodeThatPublishesNoRecordIsNotDone(t *testing.T) {
 
 			props, err := endpointInspector().UnitProperties(t.Context(), nodeUnit, "InvocationID")
 			mustOK(t, err)
-			if firstProp(props, "InvocationID") != retainedRestartInvocation {
+			if firstProp(props, "InvocationID") == "" || firstProp(props, "InvocationID") == retainedInvocation {
 				t.Fatal("the fake restart did not change the manager's invocation")
 			}
 			if name == "no record at all" {
@@ -326,7 +326,7 @@ func TestARetainedNodeThatPublishesNoRecordIsNotDone(t *testing.T) {
 				ev := readRegistrationRecord(record)
 				invocation := retainedInvocation
 				if endpoint != "" {
-					invocation = retainedRestartInvocation
+					invocation = firstProp(props, "InvocationID")
 				}
 				if ev.record == nil || ev.record.InvocationID != invocation {
 					t.Fatalf("the record case did not establish invocation %s: %+v", invocation, ev)
@@ -782,20 +782,18 @@ func writeRegistrationRecord(t *testing.T, path, deployment, endpoint, invocatio
 	writeFile(t, path, string(body), 0o600)
 }
 
-// restartedNode is what the fake converger's start of the node unit leaves
-// behind: SYSTEMD MINTS A NEW INVOCATION for every start, so the unit's
-// property moves with it, and the node publishes its record under that new
-// invocation when it registers. A fixture whose restart kept the invocation
-// could not tell a receipt written for the restart from the one that was
-// already there.
+// restartedNode publishes registration for the manager's current invocation.
+// Starting the unit and publishing its registration are separate events.
 func restartedNode(t *testing.T, f *requestFixture, record, endpoint string) {
 	t.Helper()
 
-	unit := filepath.Join(f.unitsDir, nodeUnit)
-	writeFile(t, unit, strings.Replace(mustRead(t, unit), "InvocationID="+retainedInvocation,
-		"InvocationID="+retainedRestartInvocation, 1), 0o644)
-
-	writeRegistrationRecord(t, record, f.identity, endpoint, retainedRestartInvocation)
+	props, err := endpointInspector().UnitProperties(t.Context(), nodeUnit, "InvocationID")
+	mustOK(t, err)
+	invocation := firstProp(props, "InvocationID")
+	if invocation == "" {
+		t.Fatal("the manager has no current node invocation to register")
+	}
+	writeRegistrationRecord(t, record, f.identity, endpoint, invocation)
 }
 
 // advanceRowToIntent moves the reserved row to intent, as the intent does.

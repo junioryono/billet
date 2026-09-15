@@ -273,6 +273,14 @@ func observeRetirePostconditions(ctx context.Context, m retireMode, j retirement
 			return held, atRetirePhase(j, r)
 		}
 
+		// A restart can invalidate registration after the phase table's proof.
+		// Every done boundary uses the restart gate's current-invocation rule.
+		if unit.alive && retireNodeUnitFact(ctx, insp, m.configPath) != retirement.NodeReady {
+			return held, atRetirePhase(j, retireUnknown(retireReasonPostcondition,
+				"retained-node-registration-unproved: "+nodeUnit+" has not proved registration under its current "+
+					"invocation at the installed endpoint", ""))
+		}
+
 		*unit.into = word
 	}
 

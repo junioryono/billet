@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -20,6 +21,7 @@ type retireServiceManager struct {
 	t          *testing.T
 	unitsDir   string
 	operations []string
+	starts     uint64
 	onEnable   func(string)
 	onDisable  func(string)
 	onSubmit   func(string)
@@ -71,10 +73,9 @@ func (s *retireServiceManager) StartAndProve(ctx context.Context, unit string) (
 	s.set(unit, "ActiveState", "active")
 	s.set(unit, "SubState", "running")
 	s.set(unit, "MainPID", "4242")
-	if unit == nodeUnit {
-		// The manager starts a new invocation even if the node never registers.
-		s.set(unit, "InvocationID", retainedRestartInvocation)
-	}
+	// The manager starts a new invocation even if the node never registers.
+	s.starts++
+	s.set(unit, "InvocationID", fmt.Sprintf("%032x", s.starts))
 
 	return s.fakeConverger.StartAndProve(ctx, unit)
 }
@@ -295,6 +296,8 @@ func retireProofHost(t *testing.T, variant retirement.Variant, phase retirement.
 	mustOK(t, os.Rename(f.stateDir, j.Archive))
 	if variant == retirement.VariantRetainedNode {
 		writeFile(t, f.cfg, f.rendering(t), 0o600)
+		_, err := f.manager.StartAndProve(t.Context(), nodeUnit)
+		mustOK(t, err)
 		restartedNode(t, f, useRegistrationRecord(t), retainedEndpoint)
 	} else {
 		mustOK(t, os.Remove(f.cfg))
