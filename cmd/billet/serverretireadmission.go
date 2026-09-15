@@ -84,6 +84,7 @@ func admitRetireConfiguredProtection(ctx context.Context, cfg *config.Config, co
 	if err := retireOperationInspector().AdmitOperations(ctx, nil, p); err != nil {
 		return retireUnknown(retireReasonEffects, err.Error(), "")
 	}
+	noteRetireMutation("admission", "")
 	return nil
 }
 
@@ -113,6 +114,7 @@ func admitRetireRequestPreparation(ctx context.Context, m retireMode) *retireRef
 		if r := proveRetireRequiredResources(ctx, j); r != nil {
 			return retireUnknown(retireReasonEffects, r.Why, "")
 		}
+		noteRetireMutation("admission", "")
 		return nil
 	}
 	obs, r := observeRetireConfig(m.configPath)
@@ -120,6 +122,33 @@ func admitRetireRequestPreparation(ctx context.Context, m retireMode) *retireRef
 		return r
 	}
 	return admitRetirePreparation(ctx, obs.cfg, m.configPath, "")
+}
+
+// Acknowledgement takes its lock under effects admission without requiring the
+// current node to be healthy; its document and journal still prove the history.
+func admitRetireHistoricalPreparation(ctx context.Context, m retireMode) *retireRefusal {
+	j, fact, r := readRetireJournal()
+	if r != nil {
+		return r
+	}
+	if fact == retirement.JournalFactAbsent {
+		return retireRefuse(retireReasonJournal, "no retirement journal exists on this host; an acknowledgement "+
+			"follows a journal at done", "")
+	}
+	if j.Phase != retirement.PhaseDone {
+		return retireRefuse(retireReasonJournal, fmt.Sprintf("the journal is at %s; the row is acknowledged at done", j.Phase), "")
+	}
+	return admitRetireHistoricalProtection(ctx, m, j)
+}
+
+// Historical row work still admits local effects, without a server-only
+// configuration postcondition that belongs to settlement.
+func admitRetireHistoricalProtection(ctx context.Context, m retireMode, j retirement.Journal) *retireRefusal {
+	if j.Variant == retirement.VariantServerOnly {
+		j.RetainedInvocation = nil
+		return admitRetireConfiguredProtection(ctx, &config.Config{}, m.configPath, j)
+	}
+	return admitRetireDoneProtection(ctx, m, j)
 }
 
 // Completed work uses today's serverless inputs, never handoff identities.
@@ -252,6 +281,7 @@ func admitRetireOperations(ctx context.Context, j retirement.Journal, operations
 	if r := proveRetireRequiredResources(ctx, j); r != nil {
 		return retireUnknown(retireReasonEffects, r.Why, "")
 	}
+	noteRetireMutation("admission", "")
 	return nil
 }
 

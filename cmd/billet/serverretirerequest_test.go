@@ -84,59 +84,7 @@ func newRequestFixture(t *testing.T) *requestFixture {
 	mustOK(t, err)
 	mustOK(t, db.Close())
 
-	// A fake systemd: the backup service is not installed, which is a
-	// positive answer and not an unread one.
-	f.unitsDir = filepath.Join(t.TempDir(), "units")
-	mustOK(t, os.MkdirAll(f.unitsDir, 0o755))
-	retiredUnits(t, f)
-	writeFile(t, filepath.Join(f.unitsDir, backupServiceUnit),
-		"LoadState=not-found\nActiveState=inactive\nSubState=dead\nResult=success\nKillMode=control-group\nMainPID=0\n"+
-			"InvocationID=\nStateChangeTimestamp=\n", 0o644)
-
-	bin := filepath.Join(t.TempDir(), "systemctl")
-	// THE ANSWER IS READ ONCE AND RECORDED WITH WHAT IT SAID: a test that must
-	// know the transition saw a particular state needs the fake's own account
-	// of what it answered, and one that reads the unit file twice could answer
-	// from one revision and record another.
-	writeFile(t, bin, "#!/bin/sh\nunit=\"\"\nnames=\"\"\nfor a in \"$@\"; do case \"$a\" in --property=*) "+
-		"names=\"$names ${a#--property=}\";; --all) names=ALL;; --|show) ;; *) unit=$a;; esac; done\n"+
-		"body=$(cat \"$BILLET_FAKE_UNITS/$unit\") || exit $?\n"+
-		"effects=$(cat \"$BILLET_FAKE_UNITS/$unit.effects\") || exit $?\n"+
-		"if [ \"$names\" = ALL ]; then printf '%s\\n%s\\n' \"$body\" \"$effects\"; exit 0; fi\n"+
-		"absent=$(printf '%s\\n' \"$body\" | grep '^LoadState=not-found$' || true)\n"+
-		"out=$(for n in $names; do if [ -n \"$absent\" ]; then case \"$n\" in FragmentPath|SourcePath|DropInPaths|UnitFileState) "+
-		"printf '%s=\\n' \"$n\"; continue;; esac; fi; "+
-		"printf '%s\\n%s\\n' \"$body\" \"$effects\" | grep \"^$n=\"; rc=$?; "+
-		"if [ \"$rc\" -gt 1 ]; then exit \"$rc\"; fi; done; exit 0) || exit $?\n"+
-		"printf '%s\\n' \"$out\"\n"+
-		"state=$(printf '%s\\n' \"$out\" | grep '^ActiveState=' || true)\n"+
-		"echo \"$unit $state\" >> \"$BILLET_FAKE_UNITS/.asked\"\n"+
-		"case \" $names \" in *' ExecMainStatus '*) echo \"$unit\" >> \"$BILLET_FAKE_UNITS/.backup-observed\";; esac\nexit 0\n", 0o755)
-	t.Setenv("BILLET_FAKE_UNITS", f.unitsDir)
-
-	savedSystemctl := systemctlBinary
-	systemctlBinary = bin
-
-	t.Cleanup(func() { systemctlBinary = savedSystemctl })
-
-	installRetireOperationEvidence(t, f)
-
-	// A FAKE SERVICE MANAGER and a lock this test may take: the transition
-	// after intent stops units and holds the lifecycle lock, and neither
-	// belongs to the machine running the suite.
-	f.svc = &fakeConverger{}
-	f.manager = &retireServiceManager{fakeConverger: f.svc, t: t, unitsDir: f.unitsDir}
-
-	savedConverge := converge
-	converge = func(...lifeops.ConvergeOption) converger { return f.manager }
-
-	savedLockDir := hostLockDir
-	hostLockDir = t.TempDir()
-
-	t.Cleanup(func() {
-		converge = savedConverge
-		hostLockDir = savedLockDir
-	})
+	installRetireHostManager(t, f)
 
 	// ONE MOUNT holds everything, so the rename is one rename on one mount.
 	mountinfo := filepath.Join(t.TempDir(), "mountinfo")
@@ -1024,4 +972,63 @@ func mustRead(t *testing.T, path string) string {
 	mustOK(t, err)
 
 	return string(body)
+}
+
+// Row-only commands judge host effects too, using the same observational fake.
+func installRetireHostManager(t *testing.T, f *requestFixture) {
+	t.Helper()
+	// A fake systemd: the backup service is not installed, which is a
+	// positive answer and not an unread one.
+	f.unitsDir = filepath.Join(t.TempDir(), "units")
+	mustOK(t, os.MkdirAll(f.unitsDir, 0o755))
+	retiredUnits(t, f)
+	writeFile(t, filepath.Join(f.unitsDir, backupServiceUnit),
+		"LoadState=not-found\nActiveState=inactive\nSubState=dead\nResult=success\nKillMode=control-group\nMainPID=0\n"+
+			"InvocationID=\nStateChangeTimestamp=\n", 0o644)
+
+	bin := filepath.Join(t.TempDir(), "systemctl")
+	// THE ANSWER IS READ ONCE AND RECORDED WITH WHAT IT SAID: a test that must
+	// know the transition saw a particular state needs the fake's own account
+	// of what it answered, and one that reads the unit file twice could answer
+	// from one revision and record another.
+	writeFile(t, bin, "#!/bin/sh\nunit=\"\"\nnames=\"\"\nfor a in \"$@\"; do case \"$a\" in --property=*) "+
+		"names=\"$names ${a#--property=}\";; --all) names=ALL;; --|show) ;; *) unit=$a;; esac; done\n"+
+		"body=$(cat \"$BILLET_FAKE_UNITS/$unit\") || exit $?\n"+
+		"effects=$(cat \"$BILLET_FAKE_UNITS/$unit.effects\") || exit $?\n"+
+		"if [ \"$names\" = ALL ]; then printf '%s\\n%s\\n' \"$body\" \"$effects\"; exit 0; fi\n"+
+		"absent=$(printf '%s\\n' \"$body\" | grep '^LoadState=not-found$' || true)\n"+
+		"out=$(for n in $names; do if [ -n \"$absent\" ]; then case \"$n\" in FragmentPath|SourcePath|DropInPaths|UnitFileState) "+
+		"printf '%s=\\n' \"$n\"; continue;; esac; fi; "+
+		"printf '%s\\n%s\\n' \"$body\" \"$effects\" | grep \"^$n=\"; rc=$?; "+
+		"if [ \"$rc\" -gt 1 ]; then exit \"$rc\"; fi; done; exit 0) || exit $?\n"+
+		"printf '%s\\n' \"$out\"\n"+
+		"state=$(printf '%s\\n' \"$out\" | grep '^ActiveState=' || true)\n"+
+		"echo \"$unit $state\" >> \"$BILLET_FAKE_UNITS/.asked\"\n"+
+		"case \" $names \" in *' ExecMainStatus '*) echo \"$unit\" >> \"$BILLET_FAKE_UNITS/.backup-observed\";; esac\nexit 0\n", 0o755)
+	t.Setenv("BILLET_FAKE_UNITS", f.unitsDir)
+
+	savedSystemctl := systemctlBinary
+	systemctlBinary = bin
+
+	t.Cleanup(func() { systemctlBinary = savedSystemctl })
+
+	installRetireOperationEvidence(t, f)
+
+	// A FAKE SERVICE MANAGER and a lock this test may take: the transition
+	// after intent stops units and holds the lifecycle lock, and neither
+	// belongs to the machine running the suite.
+	f.svc = &fakeConverger{}
+	f.manager = &retireServiceManager{fakeConverger: f.svc, t: t, unitsDir: f.unitsDir}
+
+	savedConverge := converge
+	converge = func(...lifeops.ConvergeOption) converger { return f.manager }
+
+	savedLockDir := hostLockDir
+	hostLockDir = t.TempDir()
+
+	t.Cleanup(func() {
+		converge = savedConverge
+		hostLockDir = savedLockDir
+	})
+
 }

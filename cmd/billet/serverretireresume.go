@@ -58,9 +58,9 @@ func retireResumeArchived(ctx context.Context, m retireMode, root *txLock, dir *
 	if j.Ownership.Owner != m.run {
 		j.Rebind(m.run)
 
+		noteRetireMutation("journal", retirement.JournalPath())
 		if err := j.Write(retireNow()); err != nil {
-			return nil, atRetirePhase(j, retireUnknown(retireReasonJournal,
-				"record this converge as the journal's owner: "+err.Error(), ""))
+			return nil, atRetirePhase(j, retirePersistenceError(retireReasonJournal, "record this converge as the journal's owner: ", err))
 		}
 	}
 

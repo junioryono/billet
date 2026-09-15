@@ -186,8 +186,9 @@ func retireStatusPostcondition(ctx context.Context, m retireMode, j retirement.J
 	if r := admitRetireDoneProtection(ctx, m, j); r != nil {
 		return "", r
 	}
+	noteRetireMutation("status", retirement.StatusPath())
 	if err := retirement.WriteStatus(retirement.PhaseDone, j.Variant, retireNow()); err != nil {
-		return "", atRetirePhase(j, retireUnknown(retireReasonStatus, "publish the status: "+errorText(err), ""))
+		return "", atRetirePhase(j, retirePersistenceError(retireReasonStatus, "publish the status: ", err))
 	}
 
 	return retireStatusRepublished, nil

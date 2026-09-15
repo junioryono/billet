@@ -220,6 +220,7 @@ func retireRequestUnder(ctx context.Context, m retireMode) (any, *retireRefusal)
 	if r := admitRetireRequestPreparation(ctx, m); r != nil {
 		return nil, r
 	}
+	admit := func() *retireRefusal { return admitRetireRequestPreparation(ctx, m) }
 	out, r := access(ctx, cfg.Server.IdentityDir, func() (any, *retireRefusal) {
 		identity, r := retireIdentity(cfg.Server.IdentityDir)
 		if r != nil {
@@ -238,7 +239,7 @@ func retireRequestUnder(ctx context.Context, m retireMode) (any, *retireRefusal)
 		if r := admitRetireRequestPreparation(ctx, m); r != nil {
 			return nil, r
 		}
-		db, r := retireOpenLedgerFor(ctx, cfg, m.environmentFile, m.dryRun)
+		db, r := retireOpenLedger(ctx, cfg, m.environmentFile, admit)
 		if r != nil {
 			return nil, r
 		}
@@ -279,6 +280,11 @@ func retireRequestUnder(ctx context.Context, m retireMode) (any, *retireRefusal)
 				r.Why += "; the reservation is kept because the guard carries this transition's marker, which " +
 					"`billet server retire --abandon-reservation` releases"
 			default:
+				if refused := admit(); refused != nil {
+					r.Why += "; reservation kept: " + refused.Why
+					return nil, r
+				}
+				noteRetireMutation("row-release", "")
 				if err := db.ReleaseRetirement(ctx, identity, m.retiringHost, m.run); err != nil {
 					r.Why += "; and releasing the reservation: " + err.Error()
 				} else {
@@ -290,7 +296,7 @@ func retireRequestUnder(ctx context.Context, m retireMode) (any, *retireRefusal)
 		}
 
 		return applyRetireIntent(ctx, m, root, dir, shape, db, plan)
-	})
+	}, admit)
 	if r != nil {
 		return nil, r
 	}
@@ -359,8 +365,9 @@ func resumeRetirement(ctx context.Context, m retireMode, shape claimShape, db *s
 	if j.Ownership.Owner != m.run {
 		j.Rebind(m.run)
 
+		noteRetireMutation("journal", retirement.JournalPath())
 		if err := j.Write(retireNow()); err != nil {
-			return nil, retireUnknown(retireReasonJournal, "record this converge as the journal's owner: "+err.Error(), "")
+			return nil, retirePersistenceError(retireReasonJournal, "record this converge as the journal's owner: ", err)
 		}
 	}
 
@@ -368,6 +375,7 @@ func resumeRetirement(ctx context.Context, m retireMode, shape claimShape, db *s
 		if r := admitRetireRemaining(ctx, m, j); r != nil {
 			return nil, r
 		}
+		noteRetireMutation("row-intent", "")
 		if err := db.AdvanceRetirementToIntent(ctx, identity, m.retiringHost, j.Provenance.TransitionID, m.run,
 			retireNow()); err != nil {
 			return nil, retireUnknown(retireReasonLedger, "advance the row to intent: "+err.Error(), "")
@@ -616,7 +624,7 @@ func retireRequestReport(ctx context.Context, m retireMode, in *retireInput, obs
 		return nil, r
 	}
 
-	db, r := retireOpenLedgerFor(ctx, cfg, m.environmentFile, true)
+	db, r := retireOpenReportLedger(ctx, cfg, m.environmentFile)
 	if r != nil {
 		return nil, r
 	}
@@ -792,13 +800,8 @@ func judgeRetireRequest(ctx context.Context, m retireMode, in *retireInput, obs 
 	return plan, nil
 }
 
-// retireOpenLedgerFor opens the ledger for a request: read-only for a dry run,
-// which writes nothing anywhere, and the operator's open otherwise.
-func retireOpenLedgerFor(ctx context.Context, cfg *config.Config, environmentFile string, dryRun bool) (*state.DB, *retireRefusal) {
-	if !dryRun {
-		return retireOpenLedger(ctx, cfg, environmentFile)
-	}
-
+// retireOpenReportLedger observes the request without taking an operator hold.
+func retireOpenReportLedger(ctx context.Context, cfg *config.Config, environmentFile string) (*state.DB, *retireRefusal) {
 	dsn, err := ledgerDSNFrom(cfg, environmentFile)
 	if err != nil {
 		return nil, retireUnknown(retireReasonLedger, err.Error(), "")
@@ -1571,8 +1574,9 @@ func judgeHostPreconditions(ctx context.Context, m retireMode, cfg *config.Confi
 		if r := admitRetirePreparation(ctx, cfg, m.configPath, plan.archive); r != nil {
 			return r
 		}
+		noteRetireMutation("retired-directory", retirement.RetiredDir())
 		if err := retirement.EnsureRetiredDir(); err != nil {
-			return retireUnknown(retireReasonStage, err.Error(), "")
+			return retirePersistenceError(retireReasonStage, "", err)
 		}
 	} else if _, err := os.Lstat(destination); errors.Is(err, fs.ErrNotExist) {
 		destination = retirement.Root
@@ -1622,7 +1626,7 @@ func judgeHostPreconditions(ctx context.Context, m retireMode, cfg *config.Confi
 
 	if _, presence, err := retirement.ReadStage(); presence != retirement.StageFileAbsent {
 		if presence != retirement.StageFilePresent {
-			return retireUnknown(retireReasonStage, err.Error(), "")
+			return retirePersistenceError(retireReasonStage, "", err)
 		}
 
 		// A PREVIEW CANNOT ESTABLISH THAT A STAGE IS ORPHANED. It holds neither
@@ -1759,6 +1763,7 @@ func applyRetireIntent(ctx context.Context, m retireMode, root *txLock, dir *os.
 		record := shape.Guard
 		record.Transition = &guardTransition{Kind: transitionRetirement, ID: plan.row.TransitionID}
 
+		noteRetireMutation("marker", "")
 		if err := rewriteGuardRecord(root, dir, record); err != nil {
 			return nil, retireUnknown(retireReasonMarker, "write the guard's marker: "+err.Error(), "")
 		}
@@ -1767,6 +1772,7 @@ func applyRetireIntent(ctx context.Context, m retireMode, root *txLock, dir *os.
 		// POWER LOSS: an earlier invocation may have renamed the record and
 		// died before its flushes, and everything below rests on the marker
 		// being there when the host comes back.
+		noteRetireMutation("directory-flush", "")
 		if err := syncDirFD(dir); err != nil {
 			return nil, retireUnknown(retireReasonMarker, err.Error(), "")
 		}
@@ -1774,6 +1780,7 @@ func applyRetireIntent(ctx context.Context, m retireMode, root *txLock, dir *os.
 		if r := admitRetireOperations(ctx, j, retireServiceSequence(j, retirement.Decision{Action: retirement.ActionStop})); r != nil {
 			return nil, r
 		}
+		noteRetireMutation("directory-flush", "")
 		if err := syncDirFD(root.dir); err != nil {
 			return nil, retireUnknown(retireReasonMarker, err.Error(), "")
 		}
@@ -1783,8 +1790,9 @@ func applyRetireIntent(ctx context.Context, m retireMode, root *txLock, dir *os.
 		if r := admitRetireOperations(ctx, j, retireServiceSequence(j, retirement.Decision{Action: retirement.ActionStop})); r != nil {
 			return nil, r
 		}
+		noteRetireMutation("stage", retirement.StagePath())
 		if err := retirement.WriteStage(plan.rendering); err != nil {
-			return nil, retireUnknown(retireReasonStage, err.Error(), "")
+			return nil, retirePersistenceError(retireReasonStage, "", err)
 		}
 
 		j.StagedSHA256, j.Config = retirement.Digest(plan.rendering), "present"
@@ -1796,13 +1804,15 @@ func applyRetireIntent(ctx context.Context, m retireMode, root *txLock, dir *os.
 		return nil, r
 	}
 
+	noteRetireMutation("journal", retirement.JournalPath())
 	if err := j.Write(now); err != nil {
-		return nil, retireUnknown(retireReasonJournal, "write the journal's intent: "+err.Error(), "")
+		return nil, retirePersistenceError(retireReasonJournal, "write the journal's intent: ", err)
 	}
 
 	if r := admitRetireOperations(ctx, j, retireServiceSequence(j, retirement.Decision{Action: retirement.ActionStop})); r != nil {
 		return nil, r
 	}
+	noteRetireMutation("row-intent", "")
 	if err := db.AdvanceRetirementToIntent(ctx, plan.identity, m.retiringHost, plan.row.TransitionID, m.run, now); err != nil {
 		return nil, retireUnknown(retireReasonLedger, "advance the row to intent: "+err.Error(), "")
 	}
@@ -1810,8 +1820,9 @@ func applyRetireIntent(ctx context.Context, m retireMode, root *txLock, dir *os.
 	if r := admitRetireOperations(ctx, j, retireServiceSequence(j, retirement.Decision{Action: retirement.ActionStop})); r != nil {
 		return nil, r
 	}
+	noteRetireMutation("status", retirement.StatusPath())
 	if err := retirement.WriteStatus(retirement.PhaseIntent, plan.variant, now); err != nil {
-		return nil, retireUnknown(retireReasonStatus, "publish the status: "+err.Error(), "")
+		return nil, retirePersistenceError(retireReasonStatus, "publish the status: ", err)
 	}
 
 	return j, nil

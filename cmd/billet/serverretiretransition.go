@@ -160,7 +160,9 @@ func retireHoldLifecycle(host **hostLock, action retirement.Action) *retireRefus
 			return nil
 		}
 
+		noteRetireMutation("lifecycle-lock", "")
 		l, err := lifecycleLock()
+		noteRetireMutation("wait", "lifecycle lock")
 		if err != nil {
 			return retireUnknown(retireReasonLifecycle, err.Error(), "")
 		}
@@ -204,6 +206,7 @@ func performRetireAction(ctx context.Context, m retireMode, obs *installedConfig
 			if r := admitRetireOperations(ctx, j, nil); r != nil {
 				return j, r
 			}
+			noteRetireMutation("directory-flush", "")
 			if err := retireSyncDir(dir); err != nil {
 				return j, retireUnknown(retireReasonJournal, "flush "+dir+" before recording archived: "+err.Error(), "")
 			}
@@ -226,6 +229,7 @@ func performRetireAction(ctx context.Context, m retireMode, obs *installedConfig
 		if r := admitRetireOperations(ctx, j, nil); r != nil {
 			return j, r
 		}
+		noteRetireMutation("directory-flush", "")
 		if err := retireSyncDir(filepath.Dir(m.configPath)); err != nil {
 			return j, retireUnknown(retireReasonJournal, "flush configuration before recording its rewrite: "+err.Error(), "")
 		}
@@ -418,6 +422,10 @@ func retireBackupFact(ctx context.Context, insp *lifeops.Inspector, j retirement
 		return retirement.BackupUnknown
 	}
 
+	if r := admitRetireOperations(ctx, j, nil); r != nil {
+		return retirement.BackupUnknown
+	}
+	noteRetireMutation("service-operation", backupServiceUnit)
 	if err := retireResetFailedFn(ctx, backupServiceUnit); err != nil {
 		return retirement.BackupUnknown
 	}
@@ -629,6 +637,7 @@ func retireNodeUnitFact(ctx context.Context, insp *lifeops.Inspector, configPath
 // authority lock: the backup is taking one, and waiting under it would be a
 // deadlock this transition made itself.
 func awaitRetireBackup(ctx context.Context, j retirement.Journal) *retireRefusal {
+	noteRetireMutation("wait", "backup")
 	insp := endpointInspector()
 
 	// THE BOUND IS A TIMER AND NOT THE RECORD'S CLOCK: every time this command
@@ -682,8 +691,9 @@ func retireStop(ctx context.Context, j retirement.Journal) (retirement.Journal, 
 		if r := admitRetireOperations(ctx, j, nil); r != nil {
 			return j, r
 		}
+		noteRetireMutation("journal", retirement.JournalPath())
 		if err := j.Write(retireNow()); err != nil {
-			return j, retireUnknown(retireReasonJournal, "record the timers' stop: "+err.Error(), "")
+			return j, retirePersistenceError(retireReasonJournal, "record the timers' stop: ", err)
 		}
 	}
 
@@ -703,8 +713,9 @@ func retireStop(ctx context.Context, j retirement.Journal) (retirement.Journal, 
 		return j, r
 	}
 
+	noteRetireMutation("status", retirement.StatusPath())
 	if err := retirement.WriteStatus(retirement.PhaseStopped, j.Variant, retireNow()); err != nil {
-		return j, retireUnknown(retireReasonStatus, "publish the status: "+err.Error(), "")
+		return j, retirePersistenceError(retireReasonStatus, "publish the status: ", err)
 	}
 
 	if r := proveRetireStopped(ctx, j); r != nil {
@@ -721,6 +732,7 @@ func stopAndDisableForRetirement(ctx context.Context, c converger, j retirement.
 		return r
 	}
 
+	noteRetireMutation("service-operation", "")
 	if _, err := c.StopAndProve(ctx, unit); err != nil {
 		return retireUnknown(retireReasonStop, fmt.Sprintf("stop %s: %v", unit, err), "")
 	}
@@ -729,6 +741,7 @@ func stopAndDisableForRetirement(ctx context.Context, c converger, j retirement.
 		return r
 	}
 
+	noteRetireMutation("service-operation", "")
 	if err := c.Disable(ctx, unit); err != nil {
 		return retireUnknown(retireReasonStop, fmt.Sprintf("disable %s: %v", unit, err), "")
 	}
@@ -744,9 +757,10 @@ func retireArchive(ctx context.Context, j retirement.Journal) (retirement.Journa
 	// THE TRANSITION'S OWN EXCLUSION: it acquires the global lock and does not
 	// admit itself through the status it published, because that status is what
 	// it is publishing and it is the one writer the status allows.
-	acc, err := openRetiringIdentityAccess(ctx, j.IdentityDir, identityAccessWait)
-	if err != nil {
-		return j, retireUnknown(retireReasonIdentity, "take the identity exclusion for the archive: "+err.Error(), "")
+	admit := func() *retireRefusal { return admitRetireOperations(ctx, j, nil) }
+	acc, r := openRetireIdentity(ctx, j.IdentityDir, true, admit)
+	if r != nil {
+		return j, r
 	}
 
 	j, moved, r := archiveUnderExclusion(ctx, j)
@@ -755,8 +769,12 @@ func retireArchive(ctx context.Context, j retirement.Journal) (retirement.Journa
 		acc.moved()
 	}
 
-	if err := acc.Release(); err != nil && r == nil {
-		r = retireUnknown(retireReasonIdentity, "release the identity exclusion after the archive: "+err.Error(), "")
+	if released := releaseRetireIdentity(acc, admit); released != nil {
+		if r == nil {
+			r = released
+		} else {
+			r.Why += "; " + released.Why
+		}
 	}
 
 	return j, r
@@ -780,6 +798,7 @@ func archiveUnderExclusion(ctx context.Context, j retirement.Journal) (retiremen
 		return j, false, r
 	}
 
+	noteRetireMutation("archive", j.Archive)
 	if err := os.Rename(j.IdentityDir, j.Archive); err != nil {
 		return j, false, retireUnknown(retireReasonArchive, fmt.Sprintf("move %s to %s: %v", j.IdentityDir, j.Archive,
 			err), "")
@@ -789,6 +808,7 @@ func archiveUnderExclusion(ctx context.Context, j retirement.Journal) (retiremen
 		if r := admitRetireOperations(ctx, j, nil); r != nil {
 			return j, true, r
 		}
+		noteRetireMutation("directory-flush", "")
 		if err := retireSyncDir(dir); err != nil {
 			return j, true, retireUnknown(retireReasonArchive, "flush "+dir+": "+err.Error(), "")
 		}
@@ -811,6 +831,7 @@ func retireRewrite(ctx context.Context, m retireMode, obs *installedConfigObserv
 		if r := admitRetireOperations(ctx, j, nil); r != nil {
 			return j, r
 		}
+		noteRetireMutation("rewrite", m.configPath)
 		if err := os.Remove(m.configPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return j, retireUnknown(retireReasonRewrite, "remove "+m.configPath+": "+err.Error(), "")
 		}
@@ -818,8 +839,9 @@ func retireRewrite(ctx context.Context, m retireMode, obs *installedConfigObserv
 		if r := admitRetireOperations(ctx, j, nil); r != nil {
 			return j, r
 		}
+		noteRetireMutation("directory-flush", "")
 		if err := retireSyncDir(filepath.Dir(m.configPath)); err != nil {
-			return j, retireUnknown(retireReasonRewrite, err.Error(), "")
+			return j, retirePersistenceError(retireReasonRewrite, "", err)
 		}
 
 		return retireAdvancePhase(ctx, j, retirement.PhaseConfigRewritten)
@@ -866,6 +888,7 @@ func retireRewrite(ctx context.Context, m retireMode, obs *installedConfigObserv
 			if boundaryRefusal != nil {
 				return errors.New(boundaryRefusal.Why)
 			}
+			noteRetireMutation("journal", retirement.JournalPath())
 			if err := j.Write(retireNow()); err != nil {
 				return err
 			}
@@ -879,7 +902,7 @@ func retireRewrite(ctx context.Context, m retireMode, obs *installedConfigObserv
 		if boundaryRefusal != nil {
 			return j, boundaryRefusal
 		}
-		return j, retireUnknown(retireReasonRewrite, err.Error(), "")
+		return j, retirePersistenceError(retireReasonRewrite, "", err)
 	}
 
 	if r := proveRetireRequiredResources(ctx, j); r != nil {
@@ -896,7 +919,7 @@ func retireRewrite(ctx context.Context, m retireMode, obs *installedConfigObserv
 // owner and mode: a temporary file beside it, its bytes flushed, renamed over
 // the name, and the directory flushed, so a power loss leaves either
 // configuration whole and never half of one.
-func installRetireConfig(path string, body []byte, beforeMutation func(string) error) error {
+func installRetireConfig(path string, body []byte, beforeStep func(string) error) error {
 	dir := filepath.Dir(path)
 
 	info, err := os.Stat(path)
@@ -904,28 +927,26 @@ func installRetireConfig(path string, body []byte, beforeMutation func(string) e
 		return fmt.Errorf("examine the installed configuration %s: %w", path, err)
 	}
 
-	if err := beforeMutation(""); err != nil {
+	if err := beforeStep(""); err != nil {
 		return err
 	}
 
+	noteRetireMutation("rewrite", path)
 	tmp, err := os.CreateTemp(dir, ".billet-serverless-*")
 	if err != nil {
 		return fmt.Errorf("stage the serverless configuration beside %s: %w", path, err)
 	}
 
 	installed := false
+	cleanupAllowed := true
 
 	defer func() {
 		_ = tmp.Close()
 
-		if !installed && beforeMutation("") == nil {
+		if !installed && cleanupAllowed {
 			_ = os.Remove(tmp.Name())
 		}
 	}()
-
-	if err := beforeMutation(""); err != nil {
-		return err
-	}
 
 	if _, err := tmp.Write(body); err != nil {
 		return fmt.Errorf("write the serverless configuration: %w", err)
@@ -933,27 +954,17 @@ func installRetireConfig(path string, body []byte, beforeMutation func(string) e
 
 	// THE MODE AND THE OWNER BEFORE THE FLUSH, because a metadata change made
 	// after it is not something the flush committed.
-	if err := beforeMutation(""); err != nil {
-		return err
-	}
-
 	if err := tmp.Chmod(info.Mode().Perm()); err != nil {
 		return fmt.Errorf("set the mode of the serverless configuration: %w", err)
 	}
 
 	if st, ok := info.Sys().(*syscall.Stat_t); ok {
-		if err := beforeMutation(""); err != nil {
-			return err
-		}
 		if err := tmp.Chown(int(st.Uid), int(st.Gid)); err != nil {
 			return fmt.Errorf("own the serverless configuration: %w", err)
 		}
 	}
 
-	if err := beforeMutation(""); err != nil {
-		return err
-	}
-
+	noteRetireMutation("wait", "configuration flush")
 	if err := tmp.Sync(); err != nil {
 		return fmt.Errorf("flush the serverless configuration: %w", err)
 	}
@@ -965,19 +976,20 @@ func installRetireConfig(path string, body []byte, beforeMutation func(string) e
 	if retireBeforeConfigRename != nil {
 		retireBeforeConfigRename()
 	}
+	// A refused next step leaves its temporary for inspection.
+	cleanupAllowed = false
 	// The temporary-file flush may block beyond the caller's admission.
-	if err := beforeMutation(tmp.Name()); err != nil {
+	if err := beforeStep(tmp.Name()); err != nil {
 		return err
 	}
+	cleanupAllowed = true
+	noteRetireMutation("rewrite-rename", path)
 	if err := os.Rename(tmp.Name(), path); err != nil {
 		return fmt.Errorf("install the serverless configuration at %s: %w", path, err)
 	}
 
 	installed = true
 
-	if err := beforeMutation(""); err != nil {
-		return err
-	}
 	return retireSyncDir(dir)
 }
 
@@ -997,6 +1009,7 @@ func retireRestartNode(ctx context.Context, configPath string, j retirement.Jour
 		return j, r
 	}
 
+	noteRetireMutation("service-operation", "")
 	if err := c.Enable(ctx, nodeUnit); err != nil {
 		return j, retireUnknown(retireReasonRestart, "enable "+nodeUnit+": "+err.Error(), "")
 	}
@@ -1032,6 +1045,7 @@ func retireRestartNode(ctx context.Context, configPath string, j retirement.Jour
 		return j, r
 	}
 
+	noteRetireMutation("service-operation", "")
 	if _, err := c.StopAndProve(ctx, nodeUnit); err != nil {
 		return j, retireUnknown(retireReasonRestart, "stop "+nodeUnit+": "+err.Error(), "")
 	}
@@ -1058,6 +1072,7 @@ func retireRestartNode(ctx context.Context, configPath string, j retirement.Jour
 		return j, r
 	}
 
+	noteRetireMutation("service-operation", "")
 	if _, err := c.StartAndProve(ctx, nodeUnit); err != nil {
 		return j, retireUnknown(retireReasonRestart, "start "+nodeUnit+": "+err.Error(), "")
 	}
@@ -1099,6 +1114,7 @@ func retireAdvancePhase(ctx context.Context, j retirement.Journal, phase retirem
 	if r := admitRetireOperations(ctx, j, nil); r != nil {
 		return j, r
 	}
+	noteRetireMutation("journal", retirement.JournalPath())
 	err := next.Write(retireNow())
 	if err == nil {
 		return next, nil

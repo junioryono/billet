@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"time"
@@ -196,8 +197,15 @@ func retireTailReceipt(ctx context.Context, m retireMode, j retirement.Journal) 
 		return retireReceiptNone, nil
 	}
 
+	noteRetireMutation("wait", "receipt registration")
 	answer, r := refreshReceipt(ctx, receiptMode{configPath: m.configPath, run: m.run, refresh: true,
-		wait: retireReceiptWait})
+		wait: retireReceiptWait, beforeMutation: func() *endpointRefusal {
+			if r := admitRetireDoneProtection(ctx, m, j); r != nil {
+				return endpointUnknown(retireReasonEffects, r.Why, r.Next, "")
+			}
+			noteRetireMutation("receipt", receiptPath)
+			return nil
+		}})
 	if r != nil {
 		return "", retireFromEndpointFor(retireReasonReceipt, r)
 	}
@@ -239,7 +247,18 @@ func retireTailRow(ctx context.Context, m retireMode, j retirement.Journal, answ
 	bounded, cancel := context.WithTimeout(ctx, retireLedgerBound)
 	defer cancel()
 
-	db, problem := retireOpenLedgerByLocator(bounded, j)
+	db, problem := retireOpenByLocator(bounded, j, func(openCtx context.Context, dir, dsn string) (*state.DB, error) {
+		if err := openCtx.Err(); err != nil {
+			return nil, err
+		}
+		if r := admitRetireHistoricalProtection(ctx, m, j); r != nil {
+			return nil, &retireStepError{refusal: r}
+		}
+		noteRetireMutation("completion-preparation", dir)
+		db, err := state.OpenPostgresCompletion(openCtx, dir, dsn, state.WithRunningRelease(version.Version()), state.WithExistingLocalState())
+		noteRetireMutation("wait", "completion ledger open")
+		return db, err
+	})
 
 	switch {
 	case problem.refusal != nil:
@@ -255,6 +274,10 @@ func retireTailRow(ctx context.Context, m retireMode, j retirement.Journal, answ
 
 	defer func() { _ = db.Close() }()
 
+	if r := admitRetireHistoricalProtection(ctx, m, j); r != nil {
+		return j, r
+	}
+	noteRetireMutation("row-completion", "")
 	row, outcome, err := db.CompleteRetirement(bounded, state.RetirementCompletion{
 		Deployment: j.Deployment, Retiring: j.Retiring, Survivor: j.Survivor.Host,
 		TransitionID: j.Provenance.TransitionID, ReservedAt: j.Provenance.Reservation,
@@ -282,15 +305,16 @@ func retireTailRow(ctx context.Context, m retireMode, j retirement.Journal, answ
 	j.RowDone = true
 	j.CompletedBy = row.CompletedBy
 
-	if r := admitRetireDoneProtection(ctx, m, j); r != nil {
+	if r := admitRetireHistoricalProtection(ctx, m, j); r != nil {
 		return j, r
 	}
+	noteRetireMutation("acknowledgement", retirement.JournalPath())
 	if err := j.Write(retireNow()); err != nil {
 		// THE ROW IS WRITTEN AND THE JOURNAL DOES NOT SAY SO. The next
 		// converge's tail reaches the same call, which answers `already` from
 		// the row itself, so nothing is lost; what must not happen is the
 		// marker being cleared over a journal that has not recorded it.
-		return j, retireUnknown(retireReasonJournal, "record the completed row in the journal: "+err.Error(), "")
+		return j, retirePersistenceError(retireReasonJournal, "record the completed row in the journal: ", err)
 	}
 
 	// THE LEDGER'S WORD IS TRANSLATED, not passed through: this answer's
@@ -311,19 +335,13 @@ func retireTailRow(ctx context.Context, m retireMode, j retirement.Journal, answ
 	return j, nil
 }
 
-// retireOpenLedgerByLocator opens the ledger the way a host past the archive
+// retireOpenByLocator opens the ledger the way a host past the archive
 // must: from the journal's locator, because the installed configuration has no
 // `server:` any more and the identity is at the archive.
 //
 // IT ANSWERS THREE WAYS. A handle; nil with a reason, which is a PENDING row
 // and not a failure of this converge; or a refusal, which is everything this
 // command cannot classify.
-func retireOpenLedgerByLocator(ctx context.Context, j retirement.Journal) (*state.DB, ledgerProblem) {
-	return retireOpenByLocator(ctx, j, func(ctx context.Context, dir, dsn string) (*state.DB, error) {
-		return state.OpenPostgresCompletion(ctx, dir, dsn, state.WithRunningRelease(version.Version()))
-	})
-}
-
 func retireOpenByLocator(ctx context.Context, j retirement.Journal,
 	open func(ctx context.Context, dir, dsn string) (*state.DB, error),
 ) (*state.DB, ledgerProblem) {
@@ -350,6 +368,10 @@ func retireOpenByLocator(ctx context.Context, j retirement.Journal,
 	// directory lock, the classifier takes nothing at all.
 	db, err := open(ctx, j.Locator.Archive, dsn)
 	if err != nil {
+		var step *retireStepError
+		if errors.As(err, &step) {
+			return nil, ledgerProblem{refusal: step.refusal}
+		}
 		return nil, ledgerProblem{cause: err}
 	}
 
@@ -553,6 +575,7 @@ func retireClearMarker(ctx context.Context, m retireMode, root *txLock, dir *os.
 	if r := admitRetireDoneProtection(ctx, m, j); r != nil {
 		return "", r
 	}
+	noteRetireMutation("marker", "")
 	if err := writeGuardRecordAt(dir, record, true); err != nil {
 		return "", retireUnknown(retireReasonMarker, "clear the retirement's marker from the guard: "+err.Error(), "")
 	}
@@ -560,6 +583,7 @@ func retireClearMarker(ctx context.Context, m retireMode, root *txLock, dir *os.
 	if r := admitRetireDoneProtection(ctx, m, j); r != nil {
 		return "", r
 	}
+	noteRetireMutation("directory-flush", "")
 	if err := syncDirFD(dir); err != nil {
 		return "", retireUnknown(retireReasonMarker, "flush the guard directory: "+err.Error(), "")
 	}
@@ -567,6 +591,7 @@ func retireClearMarker(ctx context.Context, m retireMode, root *txLock, dir *os.
 	if r := admitRetireDoneProtection(ctx, m, j); r != nil {
 		return "", r
 	}
+	noteRetireMutation("directory-flush", "")
 	if err := syncDirFD(root.dir); err != nil {
 		return "", retireUnknown(retireReasonMarker, "flush the upgrade root: "+err.Error(), "")
 	}
@@ -585,8 +610,9 @@ func retireMarkSettled(ctx context.Context, m retireMode, j *retirement.Journal)
 	}
 	j.Settled = true
 
+	noteRetireMutation("settlement", retirement.JournalPath())
 	if err := j.Write(retireNow()); err != nil {
-		return retireUnknown(retireReasonJournal, "record the retirement as settled: "+err.Error(), "")
+		return retirePersistenceError(retireReasonJournal, "record the retirement as settled: ", err)
 	}
 
 	return nil

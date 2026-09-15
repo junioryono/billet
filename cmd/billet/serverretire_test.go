@@ -53,6 +53,7 @@ func newRetireFixture(t *testing.T) *retireFixture {
 
 	t.Cleanup(func() { retireNow, retireTransitionID, retireStdin = savedNow, savedID, savedStdin })
 
+	installRetireHostManager(t, &requestFixture{retireFixture: f})
 	return f
 }
 

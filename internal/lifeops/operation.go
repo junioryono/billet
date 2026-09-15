@@ -142,6 +142,20 @@ type operationWalk struct {
 // Manager timestamps, invocation counters and next-elapse times grant no
 // authority. A policy mismatch names its property and both observed values.
 // Admission grants no future authority.
+//
+// Admission granularity. Admission cannot close a race against a concurrent root
+// writer: however close an admission is to a mutation, a unit armed between them fires.
+// What admission guarantees is that the host's unit configuration is judged at each
+// distinct retirement step: before each service operation, and before each persistence
+// step (a journal write, a status publication, the stage write, the archive rename, the
+// configuration rewrite, the receipt publication, the completion-ledger preparation and
+// row completion, the acknowledgement, marker clearing, settlement). Within a step, the
+// syscalls a shared primitive performs (temporary files, chmod, sync, lock-file
+// creation) are covered by the step's admission; a unit a root user arms concurrently,
+// while a step runs, is outside the boundary and is detected by the next step's
+// admission. A step never waits (registration wait, lock wait, network call, backup
+// wait) between its admission and its first mutation: a wait ends a step, and admission
+// runs again after it.
 func (i *Inspector) AdmitOperations(ctx context.Context, sequence []Operation, protection OperationProtection) error {
 	w := operationWalk{inspector: i, protection: protection, declared: protection, units: make(map[string]operationEvidence), targets: make(map[string]bool), paths: make(map[string]operationPathBinding), stopped: make(map[string]bool), standard: make(map[string]bool)}
 	if err := w.admitRetainedInputs(); err != nil {

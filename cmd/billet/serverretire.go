@@ -559,7 +559,9 @@ func readRetireDocument(limit int64) ([]byte, *retireRefusal) {
 // rewrite beside it. The lock and the guard directory are the caller's to
 // release.
 func retireGuard(run string) (*txLock, *os.File, claimShape, *retireRefusal) {
+	noteRetireMutation("transaction-lock", "")
 	root, err := takeTxLock()
+	noteRetireMutation("wait", "transaction lock")
 	if err != nil {
 		return nil, nil, claimShape{}, retireRefuse(retireReasonLock, err.Error(), "")
 	}
@@ -655,22 +657,22 @@ func retireIdentity(dir string) (string, *retireRefusal) {
 // after the transaction lock and released after fn (the ledger factory
 // borrows it from the registry); a release that fails is the answer, because
 // the hand-back it performs is part of what the command promised.
-func withIdentityAccess(ctx context.Context, dir string, fn func() (any, *retireRefusal)) (any, *retireRefusal) {
-	acc, err := openIdentityAccess(ctx, dir, identityIntent{wait: identityAccessWait})
-	if err != nil {
-		return nil, retireUnknown(retireReasonIdentity, err.Error(), "")
+func withIdentityAccess(ctx context.Context, dir string, fn func() (any, *retireRefusal), admit func() *retireRefusal) (any, *retireRefusal) {
+	acc, r := openRetireIdentity(ctx, dir, false, admit)
+	if r != nil {
+		return nil, r
 	}
 
 	answer, r := fn()
 
-	if err := acc.Release(); err != nil {
+	if released := releaseRetireIdentity(acc, admit); released != nil {
 		if r != nil {
-			r.Why += "; and releasing the identity exclusion: " + err.Error()
+			r.Why += "; and releasing the identity exclusion: " + released.Why
 
 			return nil, r
 		}
 
-		return nil, retireUnknown(retireReasonIdentity, "release the identity exclusion: "+err.Error(), "")
+		return nil, released
 	}
 
 	return answer, r
@@ -682,23 +684,23 @@ func withIdentityAccess(ctx context.Context, dir string, fn func() (any, *retire
 // on, so a run resuming its own interrupted transition could not reach its
 // journal, its row or the phase it left — the retirement would be stuck at the
 // first interruption past the stop.
-func withRetiringIdentityAccess(ctx context.Context, dir string, fn func() (any, *retireRefusal),
+func withRetiringIdentityAccess(ctx context.Context, dir string, fn func() (any, *retireRefusal), admit func() *retireRefusal,
 ) (any, *retireRefusal) {
-	acc, err := openRetiringIdentityAccess(ctx, dir, identityAccessWait)
-	if err != nil {
-		return nil, retireUnknown(retireReasonIdentity, err.Error(), "")
+	acc, r := openRetireIdentity(ctx, dir, true, admit)
+	if r != nil {
+		return nil, r
 	}
 
 	answer, r := fn()
 
-	if err := acc.Release(); err != nil {
+	if released := releaseRetireIdentity(acc, admit); released != nil {
 		if r != nil {
-			r.Why += "; and releasing the identity exclusion: " + err.Error()
+			r.Why += "; and releasing the identity exclusion: " + released.Why
 
 			return nil, r
 		}
 
-		return nil, retireUnknown(retireReasonIdentity, "release the identity exclusion: "+err.Error(), "")
+		return nil, released
 	}
 
 	return answer, r
@@ -706,17 +708,35 @@ func withRetiringIdentityAccess(ctx context.Context, dir string, fn func() (any,
 
 // retireOpenLedger opens this host's ledger for a write; the identity
 // exclusion the caller holds is what the factory borrows.
-func retireOpenLedger(ctx context.Context, cfg *config.Config, environmentFile string) (*state.DB, *retireRefusal) {
+func retireOpenLedger(ctx context.Context, cfg *config.Config, environmentFile string, admit func() *retireRefusal) (*state.DB, *retireRefusal) {
 	dsn, err := ledgerDSNFrom(cfg, environmentFile)
 	if err != nil {
 		return nil, retireUnknown(retireReasonLedger, err.Error(), "")
 	}
 
-	db, err := openStateAdminWith(ctx, cfg, dsn)
-	if err != nil {
-		return nil, retireUnknown(retireReasonLedger, "open the ledger: "+err.Error(), "")
+	if r := admit(); r != nil {
+		return nil, r
 	}
-
+	noteRetireMutation("ledger-preparation", cfg.Server.IdentityDir)
+	var db *state.DB
+	if cfg.Server.LedgerBackend() == config.StatePostgres {
+		db, err = state.OpenPostgresAdmin(ctx, cfg.Server.IdentityDir, dsn, state.WithRunningRelease(version.Version()))
+	} else {
+		db, err = state.OpenAdmin(ctx, cfg.Server.IdentityDir, state.WithRunningRelease(version.Version()))
+	}
+	noteRetireMutation("wait", "ledger open")
+	if r := admit(); r != nil {
+		_ = closeIfOpen(db)
+		return nil, r
+	}
+	noteRetireMutation("ledger-handback", cfg.Server.IdentityDir)
+	err = errors.Join(err, handBackLedger(cfg.Server.IdentityDir))
+	if err != nil {
+		return nil, retireUnknown(retireReasonLedger, "open the ledger: "+errors.Join(err, closeIfOpen(db)).Error(), "")
+	}
+	if err := verifyLedgerIdentity(ctx, cfg, db); err != nil {
+		return nil, retireUnknown(retireReasonLedger, errors.Join(err, db.Close()).Error(), "")
+	}
 	return db, nil
 }
 
@@ -745,6 +765,13 @@ func requireMarkerAssociation(marker *guardTransition, row state.Retirement, pre
 // exclusion the marker held to any row and the row inside one transaction
 // the ledger's single writer decides.
 func retireReserve(ctx context.Context, m retireMode) (any, *retireRefusal) {
+	if r := requireNoJournal("a reservation"); r != nil {
+		return nil, r
+	}
+	admit := func() *retireRefusal { return admitRetireRequestPreparation(ctx, m) }
+	if r := admit(); r != nil {
+		return nil, r
+	}
 	root, dir, shape, r := retireGuard(m.run)
 	if r != nil {
 		return nil, r
@@ -779,7 +806,7 @@ func retireReserve(ctx context.Context, m retireMode) (any, *retireRefusal) {
 			return nil, r
 		}
 
-		db, r := retireOpenLedger(ctx, cfg, m.environmentFile)
+		db, r := retireOpenLedger(ctx, cfg, m.environmentFile, admit)
 		if r != nil {
 			return nil, r
 		}
@@ -804,6 +831,10 @@ func retireReserve(ctx context.Context, m retireMode) (any, *retireRefusal) {
 			return nil, retireUnknown(retireReasonLedger, "mint the transition id: "+err.Error(), "")
 		}
 
+		if r := admit(); r != nil {
+			return nil, r
+		}
+		noteRetireMutation("row-reservation", "")
 		row, outcome, err := db.ReserveRetirement(ctx, state.RetirementReservation{
 			Deployment: identity, Retiring: m.retiringHost, Survivor: m.survivorHost, Run: m.run,
 			TransitionID: id, At: retireNow(),
@@ -830,7 +861,7 @@ func retireReserve(ctx context.Context, m retireMode) (any, *retireRefusal) {
 			Survivor: row.Survivor, Run: row.Run, TransitionID: row.TransitionID, ReservedAt: row.ReservedAt,
 			State: stateNothingRetire,
 		}, nil
-	})
+	}, admit)
 }
 
 // retirePairEligibility is the installed pair a reservation requires, shared
@@ -878,6 +909,13 @@ func requireNoJournal(what string) *retireRefusal {
 // durable before the row goes, and deletes it) and a marker beside no row,
 // which this order never produces and which refuses with the marker kept.
 func retireAbandon(ctx context.Context, m retireMode) (any, *retireRefusal) {
+	if r := requireNoJournal("an abandonment"); r != nil {
+		return nil, r
+	}
+	admit := func() *retireRefusal { return admitRetireRequestPreparation(ctx, m) }
+	if r := admit(); r != nil {
+		return nil, r
+	}
 	root, dir, shape, r := retireGuard(m.run)
 	if r != nil {
 		return nil, r
@@ -920,7 +958,7 @@ func retireAbandon(ctx context.Context, m retireMode) (any, *retireRefusal) {
 			return nil, r
 		}
 
-		db, r := retireOpenLedger(ctx, cfg, m.environmentFile)
+		db, r := retireOpenLedger(ctx, cfg, m.environmentFile, admit)
 		if r != nil {
 			return nil, r
 		}
@@ -957,6 +995,10 @@ func retireAbandon(ctx context.Context, m retireMode) (any, *retireRefusal) {
 			record := shape.Guard
 			record.Transition = nil
 
+			if r := admit(); r != nil {
+				return nil, r
+			}
+			noteRetireMutation("marker", "")
 			if err := rewriteGuardRecord(root, dir, record); err != nil {
 				return nil, retireUnknown(retireReasonMarker, "clear the guard's marker: "+err.Error(), "")
 			}
@@ -967,22 +1009,34 @@ func retireAbandon(ctx context.Context, m retireMode) (any, *retireRefusal) {
 			// may have renamed the marker-free record and died before its
 			// flushes, and a row deleted over an unflushed clearing is the
 			// marker-beside-no-row remainder a power loss would restore.
+			if r := admit(); r != nil {
+				return nil, r
+			}
+			noteRetireMutation("directory-flush", "")
 			if err := syncDirFD(dir); err != nil {
 				return nil, retireUnknown(retireReasonMarker, err.Error(), "")
 			}
 
+			if r := admit(); r != nil {
+				return nil, r
+			}
+			noteRetireMutation("directory-flush", "")
 			if err := syncDirFD(root.dir); err != nil {
 				return nil, retireUnknown(retireReasonMarker, err.Error(), "")
 			}
 		}
 
+		if r := admit(); r != nil {
+			return nil, r
+		}
+		noteRetireMutation("row-release", "")
 		if err := db.ReleaseRetirement(ctx, identity, m.retiringHost, m.run); err != nil {
 			return nil, retireUnknown(retireReasonLedger, "release the reservation: "+err.Error(), "")
 		}
 
 		return &retireAbandonedAnswer{Schema: retireSchema, Outcome: retireOutcomeAbandoned, TransitionID: row.TransitionID,
 			Marker: markerWord, State: stateNothingRetire}, nil
-	})
+	}, admit)
 }
 
 // retireCompleteRow is the survivor's helper: it proves its host from
@@ -1009,6 +1063,10 @@ func retireCompleteRow(ctx context.Context, m retireMode) (any, *retireRefusal) 
 			"survivor; only the survivor completes the row", m.asHost, completion.Survivor), "")
 	}
 
+	admit := func() *retireRefusal { return admitRetireRequestPreparation(ctx, m) }
+	if r := admit(); r != nil {
+		return nil, r
+	}
 	root, dir, _, r := retireGuard(m.run)
 	if r != nil {
 		return nil, r
@@ -1035,13 +1093,17 @@ func retireCompleteRow(ctx context.Context, m retireMode) (any, *retireRefusal) 
 				"identity is %s", completion.Deployment, identity), "")
 		}
 
-		db, r := retireOpenLedger(ctx, cfg, m.environmentFile)
+		db, r := retireOpenLedger(ctx, cfg, m.environmentFile, admit)
 		if r != nil {
 			return nil, r
 		}
 
 		defer func() { _ = db.Close() }()
 
+		if r := admit(); r != nil {
+			return nil, r
+		}
+		noteRetireMutation("row-completion", "")
 		row, outcome, err := db.CompleteRetirement(ctx, state.RetirementCompletion{
 			Deployment: completion.Deployment, Retiring: completion.Retiring, Survivor: completion.Survivor,
 			TransitionID: completion.TransitionID, ReservedAt: completion.Reservation, CompletedBy: m.asHost,
@@ -1065,7 +1127,7 @@ func retireCompleteRow(ctx context.Context, m retireMode) (any, *retireRefusal) 
 			TransitionID: row.TransitionID, Reservation: row.ReservedAt, Row: string(outcome),
 			CompletedBy: row.CompletedBy, CompletedAt: row.CompletedAt,
 		}, nil
-	})
+	}, admit)
 }
 
 // retireAcknowledge is the retiring host's acknowledgement of the survivor's
@@ -1077,7 +1139,7 @@ func retireCompleteRow(ctx context.Context, m retireMode) (any, *retireRefusal) 
 // `server retire` run on this host.
 // Acknowledgement records the historical row even if the retained node has since
 // failed. That failure prevents settlement, not acknowledgement of valid history.
-func retireAcknowledge(_ context.Context, m retireMode) (any, *retireRefusal) {
+func retireAcknowledge(ctx context.Context, m retireMode) (any, *retireRefusal) {
 	raw, r := readRetireDocument(retirement.MaxDocumentBytes)
 	if r != nil {
 		return nil, r
@@ -1088,6 +1150,9 @@ func retireAcknowledge(_ context.Context, m retireMode) (any, *retireRefusal) {
 		return nil, retireRefuse(retireReasonInput, err.Error(), "")
 	}
 
+	if r := admitRetireHistoricalPreparation(ctx, m); r != nil {
+		return nil, r
+	}
 	root, dir, shape, r := retireGuard(m.run)
 	if r != nil {
 		return nil, r
@@ -1159,6 +1224,10 @@ func retireAcknowledge(_ context.Context, m retireMode) (any, *retireRefusal) {
 	j.RowDone = true
 	j.CompletedBy = answer.CompletedBy
 
+	if r := admitRetireHistoricalProtection(ctx, m, j); r != nil {
+		return nil, r
+	}
+	noteRetireMutation("acknowledgement", retirement.JournalPath())
 	if err := j.Write(retireNow()); err != nil {
 		return nil, retireUnknown(retireReasonJournal, "acknowledge the row in the journal: "+err.Error(), "")
 	}
