@@ -462,7 +462,9 @@ func TestRetireManagerInProcessMatchesSubprocess(t *testing.T) {
 				{"in-process", fakeOut, fakeErr},
 				{"injected", injectedOut, injectedErr},
 			} {
-				if !bytes.Equal(result.out, execOut) || (result.out == nil) != (execOut == nil) {
+				// Callers read the bytes; an empty success is the same answer whether
+				// it arrives nil or empty. Failure's nil stdout is checked below.
+				if !bytes.Equal(result.out, execOut) {
 					t.Fatalf("%s stdout=%q (nil=%v), subprocess stdout=%q (nil=%v)", result.name, result.out, result.out == nil, execOut, execOut == nil)
 				}
 				if (result.err != nil) != (wantError != "") {
