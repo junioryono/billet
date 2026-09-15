@@ -19,6 +19,9 @@ const MaxDocumentBytes = 16 << 10
 // Completion is what the retiring host emits at its journal's `done`: the
 // binding fields of its retirement, for the survivor to complete the ledger
 // row against when the retiring host cannot write it itself.
+// It records a historically proved retirement bound to DoneAt and these fields,
+// not fresh retiring-host health. Local done publication and settlement require
+// fresh local proof; survivor completion and acknowledgement preserve history.
 type Completion struct {
 	Schema       int    `json:"schema"`
 	Deployment   string `json:"deployment"`

@@ -990,6 +990,9 @@ func retireAbandon(ctx context.Context, m retireMode) (any, *retireRefusal) {
 // held unequal to its retiring host), its identity from its own directory,
 // and completes the row through its own ledger. The collector that carried
 // the document is the trust boundary.
+// The row records historically proved retirement bound to the completion
+// document. The survivor cannot prove current health in the retiring host's
+// namespace; that host freshly proves its own done publication and settlement.
 func retireCompleteRow(ctx context.Context, m retireMode) (any, *retireRefusal) {
 	raw, r := readRetireDocument(retirement.MaxDocumentBytes)
 	if r != nil {
@@ -1072,6 +1075,8 @@ func retireCompleteRow(ctx context.Context, m retireMode) (any, *retireRefusal) 
 // validated field by field against it before `row_done` is written. The
 // marker's clearing and `settled` are the tail's, finished by the next
 // `server retire` run on this host.
+// Acknowledgement records the historical row even if the retained node has since
+// failed. That failure prevents settlement, not acknowledgement of valid history.
 func retireAcknowledge(_ context.Context, m retireMode) (any, *retireRefusal) {
 	raw, r := readRetireDocument(retirement.MaxDocumentBytes)
 	if r != nil {

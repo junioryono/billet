@@ -116,7 +116,7 @@ func retireTail(ctx context.Context, m retireMode, root *txLock, dir *os.File, j
 		Variant: j.Variant, TransitionID: j.Provenance.TransitionID, Steps: steps,
 		Status: retirement.PhaseDone, Marker: retireMarkerKept}
 
-	if r := retireTailStatus(j); r != nil {
+	if r := retireTailStatus(ctx, m, j); r != nil {
 		return nil, r
 	}
 
@@ -145,12 +145,24 @@ func retireTail(ctx context.Context, m retireMode, root *txLock, dir *os.File, j
 		return answer, nil
 	}
 
+	// Receipt and ledger work can block after entry proof. A completed row is
+	// historical evidence; fresh local proof alone permits settlement.
+	if _, r := observeRetirePostconditions(ctx, m, j); r != nil {
+		return nil, r
+	}
+
 	cleared, r := retireClearMarker(root, dir, m.run, j)
 	if r != nil {
 		return nil, r
 	}
 
 	answer.Marker = cleared
+
+	// Marker persistence can block too. On refusal, keep the acknowledged,
+	// marker-absent, unsettled state; restoring the marker would invent history.
+	if _, r := observeRetirePostconditions(ctx, m, j); r != nil {
+		return nil, r
+	}
 
 	if r := retireMarkSettled(&j); r != nil {
 		return nil, r
@@ -165,30 +177,10 @@ func retireTail(ctx context.Context, m retireMode, root *txLock, dir *os.File, j
 // read as a phase at all. A status that already reads `done` is left alone,
 // because rewriting it would move its `updated_at` on every converge of a
 // retired host for no fact anyone reads.
-func retireTailStatus(j retirement.Journal) *retireRefusal {
-	st, presence, err := retirement.ReadStatus()
+func retireTailStatus(ctx context.Context, m retireMode, j retirement.Journal) *retireRefusal {
+	_, r := retireStatusPostcondition(ctx, m, j)
 
-	switch presence {
-	case retirement.StatusPresent:
-		if st.Phase == retirement.PhaseDone && st.Variant == j.Variant {
-			return nil
-		}
-	case retirement.StatusAbsent, retirement.StatusMalformed:
-		// A MALFORMED STATUS IS REPAIRED RATHER THAN REFUSED: the journal is
-		// the record, the status is its publication, and this run knows what
-		// it should say. An ABSENT one is the same repair — the file is what
-		// closes the authority to ordinary writers, and a retired host whose
-		// status vanished is a host an ordinary `ca rotate` would be admitted
-		// on.
-	default:
-		return retireUnknown(retireReasonStatus, "the published status could not be read: "+err.Error(), "")
-	}
-
-	if err := retirement.WriteStatus(retirement.PhaseDone, j.Variant, retireNow()); err != nil {
-		return retireUnknown(retireReasonStatus, "publish the status: "+err.Error(), "")
-	}
-
-	return nil
+	return r
 }
 
 // retireTailReceipt keeps the retained node's endpoint receipt current.
@@ -224,6 +216,8 @@ func retireTailReceipt(ctx context.Context, m retireMode, j retirement.Journal) 
 
 // retireTailRow completes this retirement's ledger row from this host, and
 // records the acknowledgement in the journal when the write lands.
+// Like survivor completion, this records the historical retirement bound to
+// the done journal. Current health is proved separately before local settlement.
 //
 // THE HOST WRITES ITS OWN ROW WHEN IT CAN. It is the party that knows the
 // transition finished, and the survivor's helper exists for the case this call

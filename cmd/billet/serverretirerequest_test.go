@@ -31,7 +31,8 @@ type requestFixture struct {
 	dsn string
 	// svc is the service manager the transition stops, disables, enables and
 	// restarts through, recording the order it did so in.
-	svc *fakeConverger
+	svc     *fakeConverger
+	manager *retireServiceManager
 	// now is this host's clock: the reservation is made at it, the round
 	// starts after it, and the request runs later still, as a converge's
 	// own order puts them.
@@ -86,6 +87,7 @@ func newRequestFixture(t *testing.T) *requestFixture {
 	// positive answer and not an unread one.
 	f.unitsDir = filepath.Join(t.TempDir(), "units")
 	mustOK(t, os.MkdirAll(f.unitsDir, 0o755))
+	retiredUnits(t, f)
 	writeFile(t, filepath.Join(f.unitsDir, backupServiceUnit),
 		"LoadState=not-found\nActiveState=inactive\nSubState=dead\nResult=success\nKillMode=control-group\nMainPID=0\n"+
 			"InvocationID=\nStateChangeTimestamp=\n", 0o644)
@@ -112,9 +114,10 @@ func newRequestFixture(t *testing.T) *requestFixture {
 	// after intent stops units and holds the lifecycle lock, and neither
 	// belongs to the machine running the suite.
 	f.svc = &fakeConverger{}
+	f.manager = &retireServiceManager{fakeConverger: f.svc, t: t, unitsDir: f.unitsDir}
 
 	savedConverge := converge
-	converge = func(...lifeops.ConvergeOption) converger { return f.svc }
+	converge = func(...lifeops.ConvergeOption) converger { return f.manager }
 
 	savedLockDir := hostLockDir
 	hostLockDir = t.TempDir()

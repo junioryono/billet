@@ -75,6 +75,9 @@ const (
 // service an absent answer is could-not-tell.
 var retireDoneProperties = []string{"LoadState", "ActiveState", "UnitFileState", "MainPID"}
 
+// retirePostconditionInspector lets tests observe the real property reads.
+var retirePostconditionInspector = endpointInspector
+
 // retireDone answers a converge that found a `done` journal on this host.
 func retireDone(ctx context.Context, m retireMode, root *txLock, dir *os.File, shape claimShape,
 	j retirement.Journal,
@@ -145,7 +148,7 @@ func retireDone(ctx context.Context, m retireMode, root *txLock, dir *os.File, s
 	// `ca rotate` would be admitted on. It is repaired here rather than
 	// refused — the journal is the record and this run knows what the status
 	// should say — and the answer says which happened.
-	status, r := retireStatusPostcondition(j)
+	status, r := retireStatusPostcondition(ctx, m, j)
 	if r != nil {
 		return nil, r
 	}
@@ -160,7 +163,7 @@ func retireDone(ctx context.Context, m retireMode, root *txLock, dir *os.File, s
 // retireStatusPostcondition holds the published status to the journal, and
 // republishes one that went missing, was damaged, or says something below what
 // the journal reached.
-func retireStatusPostcondition(j retirement.Journal) (string, *retireRefusal) {
+func retireStatusPostcondition(ctx context.Context, m retireMode, j retirement.Journal) (string, *retireRefusal) {
 	st, presence, err := retirement.ReadStatus()
 
 	switch presence {
@@ -172,6 +175,12 @@ func retireStatusPostcondition(j retirement.Journal) (string, *retireRefusal) {
 	default:
 		return "", atRetirePhase(j, retireUnknown(retireReasonStatus,
 			"the published status could not be read: "+errorText(err), ""))
+	}
+
+	// Earlier proof can predate blocking work. Publication needs its own proof,
+	// and the observer must never publish the status it is being asked to admit.
+	if _, r := observeRetirePostconditions(ctx, m, j); r != nil {
+		return "", r
 	}
 
 	if err := retirement.WriteStatus(retirement.PhaseDone, j.Variant, retireNow()); err != nil {
@@ -240,7 +249,7 @@ func observeRetirePostconditions(ctx context.Context, m retireMode, j retirement
 
 	held.Config = config
 
-	insp := endpointInspector()
+	insp := retirePostconditionInspector()
 
 	for _, unit := range []struct {
 		name  string
