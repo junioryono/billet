@@ -222,7 +222,7 @@ func TestOperationAdmissionQueriesEveryDirectoryAndRejectsSharedOwnership(t *tes
 			p := f.unit(t, "billet-server.service")
 			f.unit(t, "billet-node.service")
 			protection := OperationProtection{Units: []string{"billet-server.service", "billet-node.service"},
-				UnitPaths: map[string][]string{"billet-node.service": {filepath.Join(c.root, "billet/shared/registration")}}}
+				UnitPaths: map[string][]string{"billet-node.service": {filepath.Join(c.root, "billet", "shared", "registration")}}}
 			op := Operation{Verb: "stop", Unit: "billet-server.service"}
 			if err := f.inspector.AdmitOperations(t.Context(), []Operation{op}, protection); err != nil {
 				t.Fatalf("clean control: %v", err)
@@ -256,7 +256,7 @@ func TestOperationAdmissionSeparatesInstallationFromRuntimeProperties(t *testing
 					t.Fatal(err)
 				}
 				err := f.inspector.AdmitOperations(t.Context(), []Operation{op}, protection)
-				if err == nil || !(strings.Contains(err.Error(), "operation-install-") || strings.Contains(err.Error(), "operation-edge-outside-set")) {
+				if err == nil || (!strings.Contains(err.Error(), "operation-install-") && !strings.Contains(err.Error(), "operation-edge-outside-set")) {
 					t.Fatalf("installation effect admitted: %v", err)
 				}
 				for _, call := range f.calls {
@@ -880,7 +880,7 @@ func TestOperationAdmissionProtectsImplicitCredentialTeardown(t *testing.T) {
 				if err := f.inspector.AdmitOperations(t.Context(), sequence, protection); err != nil {
 					t.Fatalf("unrelated credential path: %v", err)
 				}
-				protection.UnitPaths["retained.service"] = []string{filepath.Join("/run/credentials", canonical, "current")}
+				protection.UnitPaths["retained.service"] = []string{filepath.Join("/", "run", "credentials", canonical, "current")}
 				if err := f.inspector.AdmitOperations(t.Context(), sequence, protection); err == nil || !strings.Contains(err.Error(), "operation-directory-overlap") || !strings.Contains(err.Error(), "CredentialDirectory=/run/credentials/"+canonical) {
 					t.Fatalf("implicit canonical credential teardown admitted: %v", err)
 				}
@@ -915,7 +915,7 @@ func TestOperationAdmissionKeepsSeparateVarAnActiveLeaf(t *testing.T) {
 				}
 			}
 			mount["ActiveState"] = "inactive"
-			if err := f.inspector.AdmitOperations(t.Context(), sequence, protection); err == nil || !strings.Contains(err.Error(), "operation-standard-effect: ancestor var.mount") {
+			if err := f.inspector.AdmitOperations(t.Context(), sequence, protection); err == nil || !strings.Contains(err.Error(), "operation-standard-effect: dependency var.mount") {
 				t.Fatalf("inactive ancestor admitted: %v", err)
 			}
 			mount["ActiveState"] = "active"

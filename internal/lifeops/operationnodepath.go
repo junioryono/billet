@@ -39,11 +39,11 @@ func (w *operationWalk) admitRetainedUnitPaths(ctx context.Context) error {
 				filepath.Clean(entry) != entry || strings.ContainsAny(entry, ":\\%\"'") {
 				return fmt.Errorf("retained-node-path-unknown: %s RuntimeDirectory", unit)
 			}
-			path, err := w.bindPath(filepath.Join("/run", entry))
+			path, err := w.bindPath(filepath.Join("/", "run", entry))
 			if err != nil {
 				return err
 			}
-			disposable = append(disposable, filepath.Join("/run", entry), path)
+			disposable = append(disposable, filepath.Join("/", "run", entry), path)
 		}
 		paths, err := w.inspector.retainedUnitPaths(ctx, unit, props)
 		if err != nil {

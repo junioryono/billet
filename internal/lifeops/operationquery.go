@@ -49,7 +49,7 @@ func WithOperationBusctl(path string) Option {
 }
 
 func (i *Inspector) operationExecution(ctx context.Context, unit string, commands bool) (map[string][]string, error) {
-	var names []string
+	names := make([]string, 0, len(operationExecutionProperties)+1)
 	for _, property := range operationExecutionProperties {
 		if !slices.ContainsFunc(operationArrayProperties, func(p struct{ name, signature string }) bool { return p.name == property }) {
 			names = append(names, property)

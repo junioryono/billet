@@ -59,12 +59,14 @@ func retireStatementCall(statement ast.Stmt) *ast.CallExpr {
 		}
 	case *ast.AssignStmt:
 		if len(statement.Rhs) == 1 {
-			call, _ := statement.Rhs[0].(*ast.CallExpr)
-			return call
+			if call, ok := statement.Rhs[0].(*ast.CallExpr); ok {
+				return call
+			}
 		}
 	case *ast.ExprStmt:
-		call, _ := statement.X.(*ast.CallExpr)
-		return call
+		if call, ok := statement.X.(*ast.CallExpr); ok {
+			return call
+		}
 	}
 	return nil
 }

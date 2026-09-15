@@ -1578,10 +1578,13 @@ func judgeHostPreconditions(ctx context.Context, m retireMode, cfg *config.Confi
 		if err := retirement.EnsureRetiredDir(); err != nil {
 			return retirePersistenceError(retireReasonStage, "", err)
 		}
-	} else if _, err := os.Lstat(destination); errors.Is(err, fs.ErrNotExist) {
-		destination = retirement.Root
-	} else if err != nil {
-		return retireUnknown(retireReasonStage, "examine "+destination+": "+err.Error(), "")
+	} else {
+		switch _, err := os.Lstat(destination); {
+		case errors.Is(err, fs.ErrNotExist):
+			destination = retirement.Root
+		case err != nil:
+			return retireUnknown(retireReasonStage, "examine "+destination+": "+err.Error(), "")
+		}
 	}
 
 	retired, err := filepath.EvalSymlinks(destination)

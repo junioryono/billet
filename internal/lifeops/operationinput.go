@@ -67,7 +67,7 @@ func (w *operationWalk) admitRetainedInput(path string, volatileRoots []string, 
 		root   string
 		reason string
 	}
-	var boundaries []boundary
+	boundaries := make([]boundary, 0, len(volatileRoots)+len(w.protection.ArchivedInputRoots))
 	for _, root := range volatileRoots {
 		boundaries = append(boundaries, boundary{root, "retained-input-volatile"})
 	}

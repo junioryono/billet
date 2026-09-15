@@ -1030,5 +1030,4 @@ func installRetireHostManager(t *testing.T, f *requestFixture) {
 		converge = savedConverge
 		hostLockDir = savedLockDir
 	})
-
 }

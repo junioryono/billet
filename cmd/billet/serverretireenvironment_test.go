@@ -105,9 +105,10 @@ func TestRetirementProtectsMandatoryEnvironmentFilesThroughTheHandoff(t *testing
 				return
 			}
 			reason := "retained-input-environment-unknown"
-			if scenario == "mandatory runtime" {
+			switch scenario {
+			case "mandatory runtime":
 				reason = "retained-input-volatile"
-			} else if scenario == "mandatory absent" {
+			case "mandatory absent":
 				reason = "retained-input-unreadable"
 			}
 			if scenario == "property query failure" && !queryFailed {

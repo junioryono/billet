@@ -219,7 +219,7 @@ func TestRetirementCapturesEveryConfiguredStartupPath(t *testing.T) {
 	}
 	// Enumerate the reader's paths independently of nodePathsOf, so deleting an
 	// entry from the production enumeration cannot also delete the expectation.
-	paths := append(files, f.cfg, n.StateDir, n.TLS.CertPath, n.TLS.KeyPath, n.TLS.CAPath,
+	paths := append(slices.Clone(files), f.cfg, n.StateDir, n.TLS.CertPath, n.TLS.KeyPath, n.TLS.CAPath,
 		n.Firecracker.KernelDir, n.Firecracker.ChrootBase)
 	protection := retireOperationProtection(retirement.Journal{RetainedInvocation: want})
 	for _, path := range paths {

@@ -47,7 +47,7 @@ func requiredRetireEnvironmentFiles(ctx context.Context) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	var paths []string
+	paths := make([]string, 0, len(specs))
 	for _, spec := range specs {
 		if !spec.IgnoreErrors {
 			paths = append(paths, spec.Path)

@@ -114,7 +114,7 @@ func newRealOperationHost(t *testing.T) *realOperationHost {
 		}
 		args := []string{"stop", "--"}
 		for _, name := range h.installed {
-			if !strings.Contains(name, "@.") && !slices.Contains(h.masks, filepath.Join("/etc/systemd/system", name)) {
+			if !strings.Contains(name, "@.") && !slices.Contains(h.masks, filepath.Join("/", "etc", "systemd", "system", name)) {
 				args = append(args, name)
 			}
 		}
@@ -135,7 +135,7 @@ func newRealOperationHost(t *testing.T) *realOperationHost {
 			}
 		}
 		for _, name := range h.installed {
-			if err := os.Remove(filepath.Join("/run/systemd/system", name)); err != nil && !os.IsNotExist(err) {
+			if err := os.Remove(filepath.Join("/", "run", "systemd", "system", name)); err != nil && !os.IsNotExist(err) {
 				t.Error(err)
 			}
 		}
@@ -176,7 +176,7 @@ func (h *realOperationHost) run(args ...string) {
 
 func (h *realOperationHost) write(name, body string) {
 	h.t.Helper()
-	file, err := os.OpenFile(filepath.Join("/run/systemd/system", name), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	file, err := os.OpenFile(filepath.Join("/", "run", "systemd", "system", name), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 	if err != nil {
 		h.t.Fatal(err)
 	}
@@ -200,7 +200,7 @@ func (h *realOperationHost) property(unit, property string) string {
 func (h *realOperationHost) admit(sequence []Operation, protection OperationProtection) error {
 	h.t.Helper()
 	i := NewInspector(WithObserver(func(_ context.Context, args []string) {
-		if args[0] != "show" && args[0] != "get-property" && !(args[0] == "--json=short" && args[1] == "get-property") {
+		if args[0] != "show" && args[0] != "get-property" && (args[0] != "--json=short" || args[1] != "get-property") {
 			h.t.Errorf("admission submitted a job: %v", args)
 		}
 	}))
@@ -284,7 +284,7 @@ func realRetirementSequence(t *testing.T, role bool, host string) {
 		if !retained && (name == "billet-node.service" || strings.HasSuffix(name, ".timer")) {
 			if strings.HasSuffix(name, ".timer") && host == "server-only masked" {
 				mapped := strings.Replace(name, "billet-", h.prefix+"-", 1)
-				mask := filepath.Join("/etc/systemd/system", mapped)
+				mask := filepath.Join("/", "etc", "systemd", "system", mapped)
 				if err := os.Symlink("/dev/null", mask); err != nil {
 					t.Fatal(err)
 				}
@@ -362,7 +362,7 @@ print(template.render(
 		if err := NewInspector().AdmitRetainedUnitPaths(t.Context(), node, "/var/lib/"+h.prefix+"/server"); err != nil {
 			t.Fatalf("original node command path admission: %v", err)
 		}
-		if err := os.WriteFile(filepath.Join("/run/systemd/system", node), []byte(nodeWorkload), 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join("/", "run", "systemd", "system", node), []byte(nodeWorkload), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		h.run("daemon-reload")
@@ -495,8 +495,12 @@ print(template.render(
 			t.Logf("masked command measurement: %s %s error=%v LoadState=%q FragmentPath=%q UnitFileState=%q ActiveState=%q Job=%q", op.Verb, op.Unit, commandErr,
 				h.property(op.Unit, "LoadState"), h.property(op.Unit, "FragmentPath"), h.property(op.Unit, "UnitFileState"), h.property(op.Unit, "ActiveState"), h.property(op.Unit, "Job"))
 			props, readErr := NewInspector().UnitProperties(t.Context(), op.Unit, "LoadState", "FragmentPath", "UnitFileState", "ActiveState", "Job")
-			if readErr != nil || !operationQuietMask(props) {
+			if readErr != nil {
 				t.Fatalf("masked command did not preserve the positive quiet mask: command=%v properties=%v read=%v", commandErr, props, readErr)
+			}
+			masked, maskErr := operationQuietMask(props)
+			if maskErr != nil || !masked {
+				t.Fatalf("masked command did not preserve the positive quiet mask: command=%v properties=%v mask=%v", commandErr, props, maskErr)
 			}
 		}
 		if op.Verb == "stop" && op.Unit == server {
@@ -543,9 +547,9 @@ func realRetirementHazard(t *testing.T, hazard string, bypass bool) {
 	timer, backup := h.prefix+"-backup.timer", h.prefix+"-backup.service"
 	dns, socket := h.prefix+"-dnsmasq@br0.service", h.prefix+"-helper.socket"
 	runtimeName := h.prefix + "/registration"
-	record := filepath.Join("/run", runtimeName, "current")
+	record := filepath.Join("/", "run", runtimeName, "current")
 	socketRuntime := h.prefix + "/socket-record"
-	socketRecord := filepath.Join("/run", socketRuntime, "current")
+	socketRecord := filepath.Join("/", "run", socketRuntime, "current")
 	backupEffect := filepath.Join(t.TempDir(), "backup-started")
 	unitExtra, serviceExtra := "", ""
 	switch hazard {
@@ -593,7 +597,7 @@ func realRetirementHazard(t *testing.T, hazard string, bypass bool) {
 		}
 	}
 	if hazard == "credential teardown" {
-		dir := filepath.Join("/run/credentials", server)
+		dir := filepath.Join("/", "run", "credentials", server)
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			t.Fatal(err)
 		}
@@ -614,7 +618,7 @@ func realRetirementHazard(t *testing.T, hazard string, bypass bool) {
 		}
 	}
 	if hazard == "billet truncation" {
-		dir := filepath.Join("/run/systemd/system", server+".d")
+		dir := filepath.Join("/", "run", "systemd", "system", server+".d")
 		if err := os.Mkdir(dir, 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -645,9 +649,10 @@ func realRetirementHazard(t *testing.T, hazard string, bypass bool) {
 		}
 		if hazard == "stop propagation" || hazard == "dns stop" || hazard == "socket runtime" {
 			target := node
-			if hazard == "dns stop" {
+			switch hazard {
+			case "dns stop":
 				target = dns
-			} else if hazard == "socket runtime" {
+			case "socket runtime":
 				target = socket
 			}
 			if !strings.Contains(err.Error(), "operation-edge-outside-set") || !strings.Contains(err.Error(), target) ||
@@ -725,8 +730,8 @@ func realRetirementHazard(t *testing.T, hazard string, bypass bool) {
 func realRetirementArchivePath(t *testing.T, bypass bool) {
 	t.Helper()
 	h := newRealOperationHost(t)
-	identity := filepath.Join("/var/lib", h.prefix, "server")
-	archive := filepath.Join("/var/lib", h.prefix, "archived-server")
+	identity := filepath.Join("/", "var", "lib", h.prefix, "server")
+	archive := filepath.Join("/", "var", "lib", h.prefix, "archived-server")
 	mustCreate := func(path string) {
 		if err := os.MkdirAll(path, 0o755); err != nil {
 			t.Fatal(err)
@@ -738,7 +743,7 @@ func realRetirementArchivePath(t *testing.T, bypass bool) {
 		t.Fatal(err)
 	}
 	backup, watcher := h.prefix+"-backup.service", h.prefix+"-backup.path"
-	marker := filepath.Join("/var/lib", h.prefix, "backup-started")
+	marker := filepath.Join("/", "var", "lib", h.prefix, "backup-started")
 	h.write(backup, "[Service]\nType=oneshot\nExecStart=/usr/bin/touch "+marker+"\nRemainAfterExit=yes\n")
 	destination := backup
 	h.write(watcher, "[Path]\nPathChanged="+identity+"\nUnit="+destination+"\n")

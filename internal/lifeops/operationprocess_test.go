@@ -40,7 +40,7 @@ func TestOperationProcessProofRequiresPositiveCgroupDisappearance(t *testing.T) 
 			p["MainPID"], p["ControlPID"], p["ControlGroup"], p["Slice"] = "0", "0", "/system.slice/billet-server.service", "system.slice"
 			root := t.TempDir()
 			f.inspector.operationCgroupRoot = root
-			group := filepath.Join(root, "system.slice/billet-server.service")
+			group := filepath.Join(root, "system.slice", "billet-server.service")
 			if state != "absent" {
 				if err := os.MkdirAll(group, 0o755); err != nil {
 					t.Fatal(err)

@@ -24,6 +24,11 @@ type operationPathBinding struct {
 	Objects  []operationPathObject
 }
 
+// Stat_t.Dev is signed on Darwin and unsigned on Linux.
+func operationDeviceID[T ~int32 | ~uint64](device T) uint64 {
+	return uint64(device)
+}
+
 // ResolveOperationPath follows existing symlinks and joins absent descendants
 // to the resolved prefix. A dangling symlink is resolved by the same walk.
 func ResolveOperationPath(path string) (string, error) {
@@ -67,7 +72,7 @@ func resolveOperationPath(path string) (operationPathBinding, error) {
 		if !ok {
 			return binding, fmt.Errorf("operation-path-unknown: identity of %s", next)
 		}
-		object := operationPathObject{Path: next, Device: uint64(st.Dev), Inode: st.Ino, Mode: info.Mode()}
+		object := operationPathObject{Path: next, Device: operationDeviceID(st.Dev), Inode: st.Ino, Mode: info.Mode()}
 		if info.Mode()&os.ModeSymlink != 0 {
 			links++
 			if links > 40 {

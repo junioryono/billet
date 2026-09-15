@@ -16,7 +16,7 @@ func (i *Inspector) AdmitExecution(ctx context.Context, unit, role, binary, conf
 		return err
 	}
 	refusals := execRefusals(facts, unitSpec{role: role, configPath: configPath})
-	var reasons []string
+	reasons := make([]string, 0, len(refusals))
 	for _, refusal := range refusals {
 		reasons = append(reasons, refusal.What)
 	}

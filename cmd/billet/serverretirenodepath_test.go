@@ -35,9 +35,10 @@ func TestRetirementRefusesNodeUnitPathDependenciesBeforeIntent(t *testing.T) {
 			retainAndRestartANode(t, f)
 			f.reserve(t)
 			path, directive, reason := f.stateDir, scenario, "retained-node-path-archived"
-			if scenario == "volatile" {
+			switch scenario {
+			case "volatile":
 				path, directive, reason = "/run/billet/somewhere-else", "ReadWritePaths", "retained-input-volatile"
-			} else if scenario == "optional archived" {
+			case "optional archived":
 				path, directive = "-"+path, "ReadWritePaths"
 			}
 			setRetireNodePathDropIn(t, f, directive, path)

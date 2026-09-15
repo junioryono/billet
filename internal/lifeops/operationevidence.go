@@ -41,7 +41,7 @@ func compareOperationEvidence(unit string, before, after operationEvidence) erro
 }
 
 func operationPropertySet(values []string) []string {
-	var entries []string
+	entries := make([]string, 0, len(values))
 	for _, value := range values {
 		entries = append(entries, strings.Fields(value)...)
 	}

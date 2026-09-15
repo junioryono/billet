@@ -443,7 +443,7 @@ func (w *operationWalk) admit(ctx context.Context, op Operation) error {
 			op.Unit = canonical
 		}
 		if effect != op && protectedOperationUnit(effect.Unit, w.protection.Units) &&
-			!(effect.Verb == "start" && slices.Contains(w.protection.RequiredActive, effect.Unit) && first(ev.props, "ActiveState") == "active") {
+			(effect.Verb != "start" || !slices.Contains(w.protection.RequiredActive, effect.Unit) || first(ev.props, "ActiveState") != "active") {
 			return fmt.Errorf("operation-protected-effect: %s %s reaches %s %s", op.Verb, op.Unit, effect.Verb, effect.Unit)
 		}
 		if first(ev.props, "LoadState") == "not-found" || first(ev.props, "LoadState") == "masked" {
@@ -665,7 +665,7 @@ func (w *operationWalk) admitDirectories(effect Operation, ev operationEvidence)
 				return err
 			}
 		}
-		if err := check(filepath.Join("/run/credentials", first(ev.props, "Id")), "CredentialDirectory"); err != nil {
+		if err := check(filepath.Join("/", "run", "credentials", first(ev.props, "Id")), "CredentialDirectory"); err != nil {
 			return err
 		}
 	}

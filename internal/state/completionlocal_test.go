@@ -38,13 +38,14 @@ func TestCompletionExistingLocalStateNeverPreparesTheArchive(t *testing.T) {
 				t.Fatalf("completion created a lock: %v", err)
 			}
 			info, err := os.Lstat(dir)
-			if shape == "missing directory" {
+			switch {
+			case shape == "missing directory":
 				if !errors.Is(err, os.ErrNotExist) {
 					t.Fatalf("completion created the archive: %v", err)
 				}
-			} else if err != nil {
+			case err != nil:
 				t.Fatal(err)
-			} else if shape == "loose directory" && info.Mode().Perm() != 0o750 {
+			case shape == "loose directory" && info.Mode().Perm() != 0o750:
 				t.Fatal("completion repaired the archive's mode")
 			}
 		})
@@ -59,7 +60,9 @@ func TestCompletionExistingLocalStateStillCompletesHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := plane.ClaimController(t.Context(), "control-a", "dddddddddddddddddddddddddddddddd"); err != nil {
-		_ = plane.Close()
+		if closeErr := plane.Close(); closeErr != nil {
+			t.Error(closeErr)
+		}
 		t.Fatal(err)
 	}
 	if err := plane.Close(); err != nil {

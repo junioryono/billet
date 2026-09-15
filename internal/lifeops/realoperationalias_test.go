@@ -24,7 +24,7 @@ func realRetirementRoleAlias(t *testing.T, bypass bool) {
 		t.Fatalf("distinct real roles refused: %v", err)
 	}
 	h.run("stop", "--", server)
-	alias := filepath.Join("/run/systemd/system", server)
+	alias := filepath.Join("/", "run", "systemd", "system", server)
 	if err := os.Remove(alias); err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +60,7 @@ func realRetirementPrivateTmp(t *testing.T, role string, reload, bypass bool) {
 	h := newRealOperationHost(t)
 	server, node, backup := h.prefix+"-server.service", h.prefix+"-node.service", h.prefix+"-backup.service"
 	owner := h.prefix + "-" + role + ".service"
-	finish := filepath.Join("/run", h.prefix, "finish-backup")
+	finish := filepath.Join("/", "run", h.prefix, "finish-backup")
 	if err := os.MkdirAll(filepath.Dir(finish), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +96,7 @@ func realRetirementPrivateTmp(t *testing.T, role string, reload, bypass bool) {
 		}
 		for _, entry := range entries {
 			if entry.IsDir() && strings.HasPrefix(entry.Name(), prefix) {
-				candidate := filepath.Join("/var/tmp", entry.Name(), "tmp")
+				candidate := filepath.Join("/", "var", "tmp", entry.Name(), "tmp")
 				info, err := os.Stat(candidate)
 				if err != nil && !os.IsNotExist(err) {
 					t.Fatal(err)
@@ -128,7 +128,7 @@ func realRetirementPrivateTmp(t *testing.T, role string, reload, bypass bool) {
 	p.RequiredInputs = map[string][]string{node: {key}}
 	if reload {
 		invocation := h.property(owner, "InvocationID")
-		path := filepath.Join("/run/systemd/system", owner)
+		path := filepath.Join("/", "run", "systemd", "system", owner)
 		body, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatal(err)
@@ -188,7 +188,7 @@ func realRetirementRuntimeTraversal(t *testing.T, bypass bool) {
 	h := newRealOperationHost(t)
 	server, node := h.prefix+"-server.service", h.prefix+"-node.service"
 	runtimeDir := h.prefix + "/controller-runtime"
-	persistent := filepath.Join("/etc", h.prefix, "tls")
+	persistent := filepath.Join("/", "etc", h.prefix, "tls")
 	if err := os.MkdirAll(persistent, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -200,7 +200,7 @@ func realRetirementRuntimeTraversal(t *testing.T, bypass bool) {
 	h.write(node, "[Unit]\nDefaultDependencies=no\n[Service]\nType=exec\nExecStart=/bin/sleep infinity\n")
 	h.run("daemon-reload")
 	h.run("start", "--", server, node)
-	link := filepath.Join("/run", runtimeDir, "tls")
+	link := filepath.Join("/", "run", runtimeDir, "tls")
 	if err := os.Symlink(persistent, link); err != nil {
 		t.Fatal(err)
 	}

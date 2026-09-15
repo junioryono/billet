@@ -266,13 +266,14 @@ func admitRetireOperations(ctx context.Context, j retirement.Journal, operations
 	if len(operations) != 0 {
 		first = operations[0]
 	}
-	if first.Unit == backupTimerUnit {
+	switch {
+	case first.Unit == backupTimerUnit:
 		protection.QuietExceptions = slices.DeleteFunc(protection.QuietExceptions, func(unit string) bool {
 			return unit == upgradeTimerUnit || first.Verb != "stop"
 		})
-	} else if first.Unit == upgradeTimerUnit && first.Verb != "stop" {
+	case first.Unit == upgradeTimerUnit && first.Verb != "stop":
 		protection.QuietExceptions = slices.DeleteFunc(protection.QuietExceptions, func(unit string) bool { return unit == upgradeTimerUnit })
-	} else if first.Unit != upgradeTimerUnit {
+	case first.Unit != upgradeTimerUnit:
 		protection.QuietExceptions = nil
 	}
 	if err := retireOperationInspector().AdmitOperations(ctx, operations, protection); err != nil {
@@ -412,7 +413,7 @@ func observeRetireResource(path string) (retirement.RetainedResource, error) {
 	if !ok {
 		return r, fmt.Errorf("read retained resource identity %s", path)
 	}
-	r.Device, r.Inode, r.Mode, r.UID, r.GID = uint64(st.Dev), st.Ino, uint32(info.Mode()), st.Uid, st.Gid
+	r.Device, r.Inode, r.Mode, r.UID, r.GID = devOf(st), st.Ino, uint32(info.Mode()), st.Uid, st.Gid
 	return r, nil
 }
 

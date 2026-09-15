@@ -726,7 +726,9 @@ func retireOpenLedger(ctx context.Context, cfg *config.Config, environmentFile s
 	}
 	noteRetireMutation("wait", "ledger open")
 	if r := admit(); r != nil {
-		_ = closeIfOpen(db)
+		if err := closeIfOpen(db); err != nil {
+			r.Why += "; close the ledger after refused admission: " + err.Error()
+		}
 		return nil, r
 	}
 	noteRetireMutation("ledger-handback", cfg.Server.IdentityDir)

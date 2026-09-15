@@ -51,7 +51,7 @@ func readOperationSources(props map[string][]string) ([]operationSource, error) 
 			after.Size() != info.Size() || !after.ModTime().Equal(info.ModTime()) {
 			return nil, fmt.Errorf("source changed or exceeded read bound: %s", path)
 		}
-		sources = append(sources, operationSource{Path: path, Body: string(body), Device: uint64(st.Dev),
+		sources = append(sources, operationSource{Path: path, Body: string(body), Device: operationDeviceID(st.Dev),
 			Inode: st.Ino, Mode: info.Mode(), UID: st.Uid, GID: st.Gid})
 	}
 	return sources, nil
