@@ -416,6 +416,9 @@ func TestRetireManagerFakeOmitsOnlySystemd255EmptyStructuredArrays(t *testing.T)
 }
 
 // Keep one subprocess witness for the protocol; admissions use no child process.
+// It proves stdout and error text for completed commands. The in-process fake
+// does not model lifeops's exec runner's cancellation wording or its output
+// bound, and no retirement test depends on either.
 func TestRetireManagerInProcessMatchesSubprocess(t *testing.T) {
 	saved := managerCommandRunner
 	managerCommandRunner = nil
