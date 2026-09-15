@@ -575,6 +575,9 @@ func retireClearMarker(ctx context.Context, m retireMode, root *txLock, dir *os.
 	if r := admitRetireDoneProtection(ctx, m, j); r != nil {
 		return "", r
 	}
+	if r := proveRetireDoneRegistration(ctx, endpointInspector(), m.configPath, j); r != nil {
+		return "", r
+	}
 	noteRetireMutation("marker", "")
 	if err := writeGuardRecordAt(dir, record, true); err != nil {
 		return "", retireUnknown(retireReasonMarker, "clear the retirement's marker from the guard: "+err.Error(), "")
@@ -606,6 +609,9 @@ func retireClearMarker(ctx context.Context, m retireMode, root *txLock, dir *os.
 // clears.
 func retireMarkSettled(ctx context.Context, m retireMode, j *retirement.Journal) *retireRefusal {
 	if r := admitRetireDoneProtection(ctx, m, *j); r != nil {
+		return r
+	}
+	if r := proveRetireDoneRegistration(ctx, endpointInspector(), m.configPath, *j); r != nil {
 		return r
 	}
 	j.Settled = true

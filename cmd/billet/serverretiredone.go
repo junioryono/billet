@@ -186,6 +186,9 @@ func retireStatusPostcondition(ctx context.Context, m retireMode, j retirement.J
 	if r := admitRetireDoneProtection(ctx, m, j); r != nil {
 		return "", r
 	}
+	if r := proveRetireDoneRegistration(ctx, endpointInspector(), m.configPath, j); r != nil {
+		return "", r
+	}
 	noteRetireMutation("status", retirement.StatusPath())
 	if err := retirement.WriteStatus(retirement.PhaseDone, j.Variant, retireNow()); err != nil {
 		return "", atRetirePhase(j, retirePersistenceError(retireReasonStatus, "publish the status: ", err))
@@ -275,16 +278,30 @@ func observeRetirePostconditions(ctx context.Context, m retireMode, j retirement
 
 		// A restart can invalidate registration after the phase table's proof.
 		// Every done boundary uses the restart gate's current-invocation rule.
-		if unit.alive && retireNodeUnitFact(ctx, insp, m.configPath) != retirement.NodeReady {
-			return held, atRetirePhase(j, retireUnknown(retireReasonPostcondition,
-				"retained-node-registration-unproved: "+nodeUnit+" has not proved registration under its current "+
-					"invocation at the installed endpoint", ""))
+		if unit.alive {
+			if r := proveRetireDoneRegistration(ctx, insp, m.configPath, j); r != nil {
+				return held, r
+			}
 		}
 
 		*unit.into = word
 	}
 
 	return held, nil
+}
+
+// proveRetireDoneRegistration must follow all admission and other observations
+// at a done write boundary. Keep this activity proof separate from protection
+// and configuration predicates that a quiet settled entry can share.
+func proveRetireDoneRegistration(ctx context.Context, insp *lifeops.Inspector, configPath string,
+	j retirement.Journal,
+) *retireRefusal {
+	if j.Variant == retirement.VariantRetainedNode && retireNodeUnitFact(ctx, insp, configPath) != retirement.NodeReady {
+		return atRetirePhase(j, retireUnknown(retireReasonPostcondition,
+			"retained-node-registration-unproved: "+nodeUnit+" has not proved registration under its current "+
+				"invocation at the installed endpoint", ""))
+	}
+	return nil
 }
 
 // retireConfigPostcondition says what the installed configuration must be: a

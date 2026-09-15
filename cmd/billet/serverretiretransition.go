@@ -39,6 +39,9 @@ var (
 	retireBeforeStoppedProof func()
 	// retireBeforeConfigRename observes the boundary after the staged file flush.
 	retireBeforeConfigRename func()
+	// retireAfterRegistrationRead runs after the record is closed and before
+	// the closing unit sample. Nil in production.
+	retireAfterRegistrationRead func()
 	// retireResetFailedFn clears the one failure this transition reconciles.
 	retireResetFailedFn = retireResetFailed
 	// retireSyncDir flushes a directory entry; a test fails it between a
@@ -612,6 +615,24 @@ func retireNodeUnitFact(ctx context.Context, insp *lifeops.Inspector, configPath
 	}
 
 	ev := readRegistrationRecord(registrationRecordPath)
+	if retireAfterRegistrationRead != nil {
+		retireAfterRegistrationRead()
+	}
+	// The reader closes its descriptor before this sample. Bytes from an
+	// unlinked record cannot prove the invocation that replaced its writer.
+	after, err := insp.UnitProperties(ctx, nodeUnit, retireNodeProperties...)
+	if err != nil {
+		return retirement.NodeUnknown
+	}
+	for _, name := range []string{"InvocationID", "ActiveState", "MainPID", "UnitFileState"} {
+		if len(props[name]) != 1 || len(after[name]) != 1 || firstProp(props, name) != firstProp(after, name) {
+			return retirement.NodeUnknown
+		}
+	}
+	pid, err := strconv.ParseUint(firstProp(after, "MainPID"), 10, 32)
+	if err != nil || pid == 0 {
+		return retirement.NodeUnknown
+	}
 	if ev.record == nil {
 		return retirement.NodeUnknown
 	}
@@ -1100,9 +1121,6 @@ func retireMarkDone(ctx context.Context, m retireMode, j retirement.Journal) (re
 		return j, r
 	}
 
-	now := retireNow()
-	j.DoneAt = now.UTC().Format(time.RFC3339Nano)
-
 	next, r := retireAdvancePhase(ctx, j, retirement.PhaseDone)
 	if r != nil {
 		return next, r
@@ -1126,6 +1144,16 @@ func retireAdvancePhase(ctx context.Context, j retirement.Journal, phase retirem
 
 	if r := admitRetireOperations(ctx, j, nil); r != nil {
 		return j, r
+	}
+	if phase == retirement.PhaseDone {
+		configPath := ""
+		if j.RetainedInvocation != nil {
+			configPath = j.RetainedInvocation.ConfigPath
+		}
+		if r := proveRetireDoneRegistration(ctx, endpointInspector(), configPath, j); r != nil {
+			return j, r
+		}
+		next.DoneAt = retireNow().UTC().Format(time.RFC3339Nano)
 	}
 	noteRetireMutation("journal", retirement.JournalPath())
 	err := next.Write(retireNow())

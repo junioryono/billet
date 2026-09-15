@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/junioryono/billet/internal/lifeops"
 	"github.com/junioryono/billet/internal/retirement"
 )
 
@@ -202,5 +205,184 @@ func TestRetirementReprovesRegistrationAtBothSettlementBoundaries(t *testing.T) 
 				}
 			})
 		}
+	}
+}
+
+// Each changed member independently kills omission of its closing comparison.
+// The restart removes the pathname after the reader obtained the old bytes.
+func TestRetirementRegistrationReadRequiresAStableUnit(t *testing.T) {
+	for _, change := range []string{"restart", "active state", "main pid", "healthy"} {
+		t.Run(change, func(t *testing.T) {
+			f := newRequestFixture(t)
+			f.retainANode(t)
+			requireRetireRegistrationReady(t, f)
+			sampled := false
+			saved := retireAfterRegistrationRead
+			retireAfterRegistrationRead = func() {
+				sampled = true
+				switch change {
+				case "restart":
+					restartRetireProofNode(t, f, "missing")
+				case "active state":
+					f.manager.set(nodeUnit, "ActiveState", "deactivating")
+				case "main pid":
+					f.manager.set(nodeUnit, "MainPID", "4243")
+				}
+			}
+			t.Cleanup(func() { retireAfterRegistrationRead = saved })
+			fact := retireNodeUnitFact(t.Context(), endpointInspector(), f.cfg)
+			want := retirement.NodeUnknown
+			if change == "healthy" {
+				want = retirement.NodeReady
+			}
+			if !sampled || fact != want {
+				t.Fatalf("record read with %s: sampled=%v, got %s, want %s", change, sampled, fact, want)
+			}
+		})
+	}
+}
+
+// Removing the closing sample accepts bytes from the old invocation and
+// permits the protected write before a later boundary can reject the restart.
+func TestRetirementBracketsRegistrationAtEveryDoneWrite(t *testing.T) {
+	retireRegistrationWriteBoundaries(t, "record read")
+}
+
+// Moving a boundary's registration proof ahead of admission (or deleting it)
+// permits that write after the admission observer restarts the node.
+func TestRetirementReprovesRegistrationAfterAdmissionAtEveryDoneWrite(t *testing.T) {
+	retireRegistrationWriteBoundaries(t, "admission")
+}
+
+func TestRetirementHealthyRegistrationPermitsEveryDoneWrite(t *testing.T) {
+	retireRegistrationWriteBoundaries(t, "healthy")
+}
+
+// Call each write boundary directly, after proving the healthy entry state,
+// so another boundary cannot mask a missing proof at the one under test.
+func retireRegistrationWriteBoundaries(t *testing.T, injection string) {
+	t.Helper()
+	for _, boundary := range []string{"mark done", "advance done", "status", "marker", "settlement"} {
+		t.Run(boundary, func(t *testing.T) {
+			phase := retirement.PhaseDone
+			if boundary == "mark done" || boundary == "advance done" {
+				phase = retirement.PhaseNodeRestarted
+			}
+			f, j := retireProofHost(t, retirement.VariantRetainedNode, phase)
+			m := retireProofMode(f)
+			if _, r := observeRetirePostconditions(t.Context(), m, j); r != nil {
+				t.Fatalf("healthy entry proof: %+v", r)
+			}
+			if boundary == "status" {
+				writeFile(t, retirement.StatusPath(), "damaged\n", 0o600)
+			}
+			var root *txLock
+			var dir *os.File
+			if boundary == "marker" || boundary == "settlement" {
+				j.RowDone, j.CompletedBy = true, requestRetiring
+				mustOK(t, j.Write(retireNow()))
+				var r *retireRefusal
+				root, dir, _, r = retireGuard(m.run)
+				if r != nil {
+					t.Fatal(r)
+				}
+				defer root.release()
+				defer func() { _ = dir.Close() }()
+				if boundary == "settlement" {
+					if _, r := retireClearMarker(t.Context(), m, root, dir, j); r != nil {
+						t.Fatalf("healthy marker setup: %+v", r)
+					}
+				}
+			}
+			beforeJournal := mustRead(t, retirement.JournalPath())
+			beforeStatus := mustRead(t, retirement.StatusPath())
+			guardPath := filepath.Join(f.guard.active(), guardRecordName)
+			beforeGuard := mustRead(t, guardPath)
+			beforeDoneAt := j.DoneAt
+			admitted, injected, attemptedWrite := false, false, false
+			savedEvent, savedRead, savedInspector := retireMutationEvent, retireAfterRegistrationRead, retireOperationInspector
+			retireMutationEvent = func(event, _ string) {
+				if event == "admission" {
+					admitted = true
+				}
+				if event == "journal" || event == "status" || event == "marker" || event == "settlement" {
+					attemptedWrite = true
+				}
+			}
+			retireAfterRegistrationRead = func() {
+				if injection == "record read" && admitted && !injected {
+					injected = true
+					restartRetireProofNode(t, f, "missing")
+				}
+			}
+			retireOperationInspector = func() *lifeops.Inspector {
+				insp := savedInspector()
+				lifeops.WithObserver(func(_ context.Context, _ []string) {
+					if injection == "admission" && !injected {
+						injected = true
+						restartRetireProofNode(t, f, "missing")
+					}
+				})(insp)
+				return insp
+			}
+			t.Cleanup(func() {
+				retireMutationEvent, retireAfterRegistrationRead, retireOperationInspector = savedEvent, savedRead, savedInspector
+			})
+
+			next := j
+			var r *retireRefusal
+			switch boundary {
+			case "mark done":
+				next, r = retireMarkDone(t.Context(), m, j)
+			case "advance done":
+				next, r = retireAdvancePhase(t.Context(), j, retirement.PhaseDone)
+			case "status":
+				_, r = retireStatusPostcondition(t.Context(), m, j)
+			case "marker":
+				_, r = retireClearMarker(t.Context(), m, root, dir, j)
+			case "settlement":
+				r = retireMarkSettled(t.Context(), m, &next)
+			}
+			after := requireRetireJournal(t)
+			if !admitted {
+				t.Fatal("boundary did not finish admission")
+			}
+			if injection == "healthy" {
+				if r != nil || !attemptedWrite {
+					t.Fatalf("healthy boundary did not write: %+v", r)
+				}
+				switch boundary {
+				case "mark done", "advance done":
+					if next.Phase != retirement.PhaseDone || next.DoneAt == "" || after.Phase != next.Phase || after.DoneAt != next.DoneAt {
+						t.Fatalf("healthy done write: returned %+v, persisted %+v", next, after)
+					}
+				case "status":
+					st, presence, err := retirement.ReadStatus()
+					mustOK(t, err)
+					if presence != retirement.StatusPresent || st.Phase != retirement.PhaseDone {
+						t.Fatalf("healthy status write: %+v %v", st, presence)
+					}
+				case "marker":
+					if f.guard.record(t).Transition != nil {
+						t.Fatal("healthy marker was not cleared")
+					}
+				case "settlement":
+					if !next.Settled || !after.Settled {
+						t.Fatalf("healthy settlement was not recorded: %+v", after)
+					}
+				}
+				return
+			}
+			requireRetireProofRefusal(t, r, "retained-node-registration-unproved")
+			if !injected || r.Outcome != retireOutcomeUnknown || attemptedWrite {
+				t.Fatalf("restart boundary: injected=%v, attempted write=%v, refusal=%+v", injected, attemptedWrite, r)
+			}
+			if next.Phase != phase || next.DoneAt != beforeDoneAt || next.Settled ||
+				after.Phase != phase || after.DoneAt != beforeDoneAt || after.Settled ||
+				mustRead(t, retirement.JournalPath()) != beforeJournal || mustRead(t, retirement.StatusPath()) != beforeStatus ||
+				mustRead(t, guardPath) != beforeGuard {
+				t.Fatalf("restart changed phase, completion, status, marker or settlement: returned %+v, persisted %+v", next, after)
+			}
+		})
 	}
 }
