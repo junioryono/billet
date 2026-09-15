@@ -55,7 +55,7 @@ func TestRetainedNodePathsAdmitPackagedAndRoleDirectoryValues(t *testing.T) {
 					continue
 				}
 				switch key {
-				case "ReadOnlyPaths", "ReadWritePaths", "RuntimeDirectory", "StateDirectory":
+				case "ReadOnlyPaths", "ReadWritePaths", "RuntimeDirectory", "StateDirectory", "LogsDirectory":
 					value = strings.ReplaceAll(value, "{{ billet_config.get('node', {}).get('state_dir', '/var/lib/billet/node') }}", "/var/lib/billet/node")
 					node[key] = strings.ReplaceAll(value, "\"", "")
 				}
@@ -63,6 +63,10 @@ func TestRetainedNodePathsAdmitPackagedAndRoleDirectoryValues(t *testing.T) {
 			if node["ReadWritePaths"] == "" || node["RuntimeDirectory"] != "billet/locks billet/registration" || (!role && node["StateDirectory"] != "billet/node") {
 				t.Fatal("control lost the source's real directory values")
 			}
+			node["PrivateTmp"] = "yes"
+			node["RequiresMountsFor"] = "/var/tmp"
+			node["ExecStart"] = "{ path=/usr/bin/billet ; argv[]=/usr/bin/billet node --config /etc/billet/billet.yaml ; }"
+			node["DeviceAllow"] = "/dev/null rw"
 			p := OperationProtection{Units: []string{"billet-node.service"}, RetainedPathUnits: []string{"billet-node.service"}, ArchivedInputRoots: []string{"/var/lib/billet/server"}}
 			for _, path := range []string{"/run/billet/locks", "/run/billet/locks/record", "/run/billet/registration/current"} {
 				node["ReadWritePaths"] += " " + path
@@ -153,5 +157,55 @@ func TestRetainedNodePathsProtectTraversedEntries(t *testing.T) {
 	}
 	if err := f.inspector.AdmitRetainedUnitPaths(t.Context(), "billet-node.service", archive); err == nil || !strings.Contains(err.Error(), "retained-node-path-archived") {
 		t.Fatalf("splitting a typed pathname hid its traversed symlink: %v", err)
+	}
+}
+
+func TestRetainedNodePathsKeepPrivateTmpExceptionExact(t *testing.T) {
+	for _, c := range []struct{ property, path, private string }{
+		{"RequiresMountsFor", "/var/tmp/retained", "yes"},
+		{"RequiresMountsFor", "/var/tmp", "no"},
+		{"ReadWritePaths", "/var/tmp", "yes"},
+		{"ExecStart", "/var/tmp/runner", "yes"},
+		{"ReadWritePaths", "/run/systemd/journal/stdout", "yes"},
+	} {
+		t.Run(c.property+"/"+c.path+"/"+c.private, func(t *testing.T) {
+			f := newOperationFixture(t)
+			node := f.unit(t, "billet-node.service")
+			node["PrivateTmp"], node["RequiresMountsFor"] = "yes", "/var/tmp"
+			if err := f.inspector.AdmitRetainedUnitPaths(t.Context(), "billet-node.service"); err != nil {
+				t.Fatalf("private-tmp mount prerequisite refused: %v", err)
+			}
+			node["PrivateTmp"], node[c.property] = c.private, c.path
+			if err := f.inspector.AdmitRetainedUnitPaths(t.Context(), "billet-node.service"); err == nil || !strings.Contains(err.Error(), "retained-input-volatile") {
+				t.Fatalf("private-tmp exception escaped its property/path pair: %v", err)
+			}
+		})
+	}
+	f := newOperationFixture(t)
+	node := f.unit(t, "billet-node.service")
+	node["PrivateTmp"], node["RequiresMountsFor"] = "yes", "/var/tmp"
+	if err := f.inspector.AdmitRetainedUnitPaths(t.Context(), "billet-node.service", "/var/tmp"); err == nil || !strings.Contains(err.Error(), "retained-node-path-archived") {
+		t.Fatalf("private-tmp exception bypassed the archive boundary: %v", err)
+	}
+}
+
+func TestRetainedNodePathsExpandPersistentDirectoryProperties(t *testing.T) {
+	for _, property := range []string{"StateDirectory", "LogsDirectory"} {
+		t.Run(property, func(t *testing.T) {
+			f := newOperationFixture(t)
+			node := f.unit(t, "billet-node.service")
+			root := "/var/lib"
+			if property == "LogsDirectory" {
+				root = "/var/log"
+			}
+			node[property] = "billet/node"
+			if err := f.inspector.AdmitRetainedUnitPaths(t.Context(), "billet-node.service", root+"/billet/server"); err != nil {
+				t.Fatalf("persistent directory refused: %v", err)
+			}
+			node[property] = "billet/server"
+			if err := f.inspector.AdmitRetainedUnitPaths(t.Context(), "billet-node.service", root+"/billet/server"); err == nil || !strings.Contains(err.Error(), "retained-node-path-archived") {
+				t.Fatalf("relative directory hid archive dependence: %v", err)
+			}
+		})
 	}
 }

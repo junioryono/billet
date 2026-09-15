@@ -21,14 +21,17 @@ func TestOperationAdmissionLimitsDeviceStopPropagationToLedger(t *testing.T) {
 			server["Requires"], server["RequiresMountsFor"] = "ledger.mount", "/ledger"
 			mount := f.unit(t, "ledger.mount")
 			mount["ActiveState"], mount["What"] = "active", "/dev/vdb1"
-			mount["StopPropagatedFrom"] = "dev-vdb1.device"
 			protection := OperationProtection{
 				Units:     []string{"billet-server.service", "billet-node.service"},
 				UnitPaths: map[string][]string{"billet-server.service": {"/ledger"}},
 			}
 			sequence := []Operation{{Verb: "stop", Unit: "billet-server.service"}}
 			if err := f.inspector.AdmitOperations(t.Context(), sequence, protection); err != nil {
-				t.Fatalf("exact What-derived device edge refused: %v", err)
+				t.Fatalf("ledger without optional device stop edge refused: %v", err)
+			}
+			mount["StopPropagatedFrom"] = "dev-vdb1.device"
+			if err := f.inspector.AdmitOperations(t.Context(), sequence, protection); err != nil {
+				t.Fatalf("optional exact What-derived edge refused: %v", err)
 			}
 			f.units[c.unit][c.property] = c.destination
 			want := "operation-edge-outside-set: " + c.unit + " " + c.property + "=" + c.destination

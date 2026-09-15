@@ -45,42 +45,86 @@ func (w *operationWalk) admitRetainedUnitPaths(ctx context.Context) error {
 			}
 			disposable = append(disposable, filepath.Join("/run", entry), path)
 		}
-		for property, values := range props {
-			switch property {
-			case "FragmentPath", "SourcePath", "DropInPaths", "ControlGroup", "ControlGroupId":
-				continue
-			}
-			for _, value := range values {
-				inputs := []string{value}
-				// v255 prints unknown types and newline-bearing strings this way:
-				// https://github.com/systemd/systemd/blob/v255/src/shared/bus-print-properties.c
-				// Read their typed values, including Conditions/Asserts, rather than
-				// treating an unrendered array as empty or enumerating path carriers.
-				typed := value == "[unprintable]" || strings.Contains(value, "\\") || len(operationAbsolutePaths(value)) != 0
-				if typed {
-					inputs, err = w.inspector.operationPropertyStrings(ctx, unit, property)
-					if err != nil {
-						return err
+		paths, err := w.inspector.retainedUnitPaths(ctx, unit, props)
+		if err != nil {
+			return err
+		}
+		for _, property := range sortedRetainedPathProperties(paths) {
+			for _, path := range paths[property] {
+				// PrivateTmp's exact mount prerequisite is manager setup, not
+				// a retained input. Never exempt descendants or other carriers.
+				// v255 unit_add_exec_dependencies: unit.c#L1227-L1241.
+				if property == "RequiresMountsFor" && path == "/var/tmp" && first(props, "PrivateTmp") == "yes" {
+					if err := w.admitRetainedInput(path, nil, "retained-node-path-archived"); err != nil {
+						return fmt.Errorf("%s %s: %w", unit, property, err)
 					}
+					continue
 				}
-				for _, input := range inputs {
-					paths := operationAbsolutePaths(input)
-					// Typed strings retain spaces and punctuation in a single path;
-					// show's joined arrays and command arguments do not.
-					exact := strings.TrimLeft(input, "-+@|!")
-					if typed && filepath.IsAbs(exact) {
-						paths = append(paths, "/"+strings.Trim(exact, "/"))
-					}
-					for _, path := range paths {
-						if err := w.admitRetainedNodePath(path, disposable); err != nil {
-							return fmt.Errorf("%s %s: %w", unit, property, err)
-						}
-					}
+				if err := w.admitRetainedNodePath(path, disposable); err != nil {
+					return fmt.Errorf("%s %s: %w", unit, property, err)
 				}
 			}
 		}
 	}
 	return nil
+}
+
+// Keep extraction shared with the real-host diagnostics: CI logs the exact
+// path operands the admission judges, including directory-derived paths.
+func (i *Inspector) retainedUnitPaths(ctx context.Context, unit string, props map[string][]string) (map[string][]string, error) {
+	found := make(map[string][]string)
+	for _, property := range sortedRetainedPathProperties(props) {
+		values := props[property]
+		switch property {
+		case "FragmentPath", "SourcePath", "DropInPaths", "ControlGroup", "ControlGroupId":
+			continue
+		}
+		for _, value := range values {
+			inputs := []string{value}
+			// systemd 255 bus-print-properties.c omits some structured values;
+			// typed strings also preserve escaped pathnames and array boundaries.
+			typed := value == "[unprintable]" || strings.Contains(value, "\\") || len(operationAbsolutePaths(value)) != 0
+			if typed {
+				var err error
+				inputs, err = i.operationPropertyStrings(ctx, unit, property)
+				if err != nil {
+					return found, err
+				}
+			}
+			for _, input := range inputs {
+				paths := operationAbsolutePaths(input)
+				exact := strings.TrimLeft(input, "-+@|!")
+				if typed && filepath.IsAbs(exact) {
+					paths = append(paths, "/"+strings.Trim(exact, "/"))
+				}
+				found[property] = append(found[property], paths...)
+			}
+			if root, directory := operationDirectoryRoots[property]; directory {
+				for _, entry := range strings.Fields(value) {
+					if entry == "." || strings.HasPrefix(entry, "../") || filepath.IsAbs(entry) ||
+						filepath.Clean(entry) != entry || strings.ContainsAny(entry, ":\\%\"'") {
+						return nil, fmt.Errorf("retained-node-path-unknown: %s %s=%q", unit, property, entry)
+					}
+					found[property] = append(found[property], filepath.Join(root, entry))
+				}
+			}
+		}
+		slices.Sort(found[property])
+		found[property] = slices.Compact(found[property])
+		if len(found[property]) == 0 {
+			delete(found, property)
+		}
+	}
+	return found, nil
+}
+
+func sortedRetainedPathProperties(paths map[string][]string) []string {
+	properties := make([]string, 0, len(paths))
+	for property := range paths {
+		properties = append(properties, property)
+	}
+	slices.Sort(properties)
+	return properties
 }
 
 // Values can contain command records, colon-separated mappings, optional

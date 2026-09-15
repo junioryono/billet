@@ -82,7 +82,14 @@ func newRealOperationHost(t *testing.T) *realOperationHost {
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 45*time.Second)
 		defer cancel()
+		c := NewConverger(NewInspector())
 		for _, name := range h.installed {
+			if strings.HasSuffix(name, ".timer") {
+				if err := c.Disable(ctx, name); err != nil {
+					t.Error(err)
+				}
+				continue
+			}
 			if strings.Contains(name, "@.") {
 				continue
 			}
@@ -93,7 +100,13 @@ func newRealOperationHost(t *testing.T) *realOperationHost {
 		// Stop activation sources first, then all services together: an
 		// OnSuccess job cannot escape cleanup by rearming a stopped timer.
 		for _, name := range h.installed {
-			if strings.HasSuffix(name, ".timer") || strings.HasSuffix(name, ".path") || strings.HasSuffix(name, ".socket") {
+			if strings.HasSuffix(name, ".timer") {
+				if _, err := c.StopAndProve(ctx, name); err != nil {
+					t.Error(err)
+				}
+				continue
+			}
+			if strings.HasSuffix(name, ".path") || strings.HasSuffix(name, ".socket") {
 				if err := h.ctl(ctx, "stop", "--", name); err != nil {
 					t.Error(err)
 				}
@@ -101,7 +114,7 @@ func newRealOperationHost(t *testing.T) *realOperationHost {
 		}
 		args := []string{"stop", "--"}
 		for _, name := range h.installed {
-			if !strings.Contains(name, "@.") {
+			if !strings.Contains(name, "@.") && !slices.Contains(h.masks, filepath.Join("/etc/systemd/system", name)) {
 				args = append(args, name)
 			}
 		}
@@ -194,6 +207,55 @@ func (h *realOperationHost) admit(sequence []Operation, protection OperationProt
 	return i.AdmitOperations(h.t.Context(), sequence, protection)
 }
 
+func (h *realOperationHost) logGraph(stage string, protection OperationProtection, ledger string, hasLedger bool) {
+	h.t.Helper()
+	i := NewInspector()
+	units := slices.Clone(protection.Units)
+	if hasLedger {
+		units = append(units, ledger)
+	}
+	slices.Sort(units)
+	units = slices.Compact(units)
+	for _, unit := range units {
+		props, err := i.properties(h.t.Context(), unit)
+		if err != nil {
+			h.t.Logf("graph %s unit=%s read error=%v", stage, unit, err)
+			continue
+		}
+		var edges, standards, paths []string
+		for _, relation := range operationRelations {
+			targets := operationPropertySet(props[relation])
+			if len(targets) != 0 {
+				edges = append(edges, fmt.Sprintf("%s=%q", relation, targets))
+			}
+			for _, target := range targets {
+				if !slices.Contains(units, target) {
+					standards = append(standards, target)
+				}
+			}
+		}
+		slices.Sort(standards)
+		standards = slices.Compact(standards)
+		var standardValues []string
+		for _, standard := range standards {
+			observed, readErr := i.properties(h.t.Context(), standard, "LoadState", "ActiveState", "Job", "Listen")
+			standardValues = append(standardValues, fmt.Sprintf("%s LoadState=%q ActiveState=%q Job=%q Listen=%q error=%v", standard,
+				first(observed, "LoadState"), first(observed, "ActiveState"), first(observed, "Job"), observed["Listen"], readErr))
+		}
+		var scanErr error
+		if slices.Contains(protection.RetainedPathUnits, unit) {
+			var scanned map[string][]string
+			scanned, scanErr = i.retainedUnitPaths(h.t.Context(), unit, props)
+			for _, property := range sortedRetainedPathProperties(scanned) {
+				paths = append(paths, fmt.Sprintf("%s=%q", property, scanned[property]))
+			}
+		}
+		h.t.Logf("graph %s unit=%s LoadState=%q FragmentPath=%q UnitFileState=%q ActiveState=%q SubState=%q Job=%q edges=[%s] standard=[%s] scanned-paths=[%s] scan-error=%v", stage, unit,
+			first(props, "LoadState"), first(props, "FragmentPath"), first(props, "UnitFileState"), first(props, "ActiveState"), first(props, "SubState"), first(props, "Job"),
+			strings.Join(edges, "; "), strings.Join(standardValues, "; "), strings.Join(paths, "; "), scanErr)
+	}
+}
+
 // All role infrastructure is rendered from its real template. Only workload
 // executables/readiness and fixture paths are adapted; relationship, directory,
 // install, kill, sandbox and manager-action settings remain the source's own.
@@ -217,6 +279,7 @@ func realRetirementSequence(t *testing.T, role bool, host string) {
 	if role && retained {
 		names = append(names, "billet-network.service", "billet-dnsmasq@.service")
 	}
+	nodeWorkload := ""
 	for _, name := range names {
 		if !retained && (name == "billet-node.service" || strings.HasSuffix(name, ".timer")) {
 			if strings.HasSuffix(name, ".timer") && host == "server-only masked" {
@@ -260,7 +323,11 @@ print(template.render(
 		text := strings.NewReplacer("billet-dnsmasq/", h.prefix+"/dnsmasq/", "billet-", h.prefix+"-", "billet/", h.prefix+"/", "/etc/billet", "/etc/"+h.prefix).Replace(string(body))
 		text = strings.NewReplacer("FIXTURE_LEDGER_UNIT", ledgerUnit, "FIXTURE_LEDGER_PATH", ledgerPath).Replace(text)
 		var lines []string
+		nodeCommand := ""
 		for _, line := range strings.Split(text, "\n") {
+			if name == "billet-node.service" && strings.HasPrefix(line, "ExecStart=") {
+				nodeCommand = line
+			}
 			switch {
 			case strings.HasPrefix(line, "ExecStart="):
 				line = "ExecStart=/usr/bin/true"
@@ -278,12 +345,28 @@ print(template.render(
 			}
 			lines = append(lines, line)
 		}
-		h.write(strings.Replace(name, "billet-", h.prefix+"-", 1), strings.Join(lines, "\n"))
+		bodyText := strings.Join(lines, "\n")
+		if name == "billet-node.service" {
+			nodeWorkload = bodyText
+			bodyText = strings.Replace(bodyText, "ExecStart=/bin/sleep infinity", nodeCommand, 1)
+		}
+		h.write(strings.Replace(name, "billet-", h.prefix+"-", 1), bodyText)
 	}
 	if role {
 		realRetirementLedger(t, h, ledgerUnit, ledgerPath)
 	}
 	h.run("daemon-reload")
+	if retained {
+		p := OperationProtection{Units: []string{node}, RetainedPathUnits: []string{node}}
+		h.logGraph("original node command (loaded, never executed)", p, "", false)
+		if err := NewInspector().AdmitRetainedUnitPaths(t.Context(), node, "/var/lib/"+h.prefix+"/server"); err != nil {
+			t.Fatalf("original node command path admission: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join("/run/systemd/system", node), []byte(nodeWorkload), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		h.run("daemon-reload")
+	}
 	if role && retained {
 		h.run("start", "--", network, dns)
 		// The instance is loaded from the rendered template, not a second file.
@@ -298,10 +381,8 @@ print(template.render(
 			t.Fatal("real ledger template is not mounted from the loop block device")
 		}
 		device := strings.TrimSuffix(operationPathUnit(h.property(ledgerUnit, "What")), ".mount") + ".device"
-		if !slices.Equal(strings.Fields(h.property(ledgerUnit, "StopPropagatedFrom")), []string{device}) ||
-			!slices.Contains(strings.Fields(h.property(device, "PropagatesStopTo")), ledgerUnit) {
-			t.Fatal("real ledger template lacks its exact implicit device stop-propagation pair")
-		}
+		t.Logf("ledger device edges: %s What=%q StopPropagatedFrom=%q; %s PropagatesStopTo=%q", ledgerUnit,
+			h.property(ledgerUnit, "What"), h.property(ledgerUnit, "StopPropagatedFrom"), device, h.property(device, "PropagatesStopTo"))
 	}
 	if retained {
 		h.run("enable", "--", backupTimer, upgradeTimer)
@@ -340,6 +421,7 @@ print(template.render(
 	if retained {
 		original = h.property(node, "InvocationID")
 	}
+	h.logGraph("initial sequence", protection, ledgerUnit, role)
 	if retained {
 		// Keep the real implicit chain: neither rendered nor packaged controls
 		// disable DefaultDependencies to evade the distribution's handlers.
@@ -362,6 +444,7 @@ print(template.render(
 	})))
 	var performed []Operation
 	for n, op := range sequence {
+		h.logGraph(fmt.Sprintf("before %s %s", op.Verb, op.Unit), protection, ledgerUnit, role)
 		if err := h.admit(sequence[n:], protection); err != nil {
 			t.Fatalf("remaining sequence after %v: %v", performed, err)
 		}
@@ -379,8 +462,14 @@ print(template.render(
 			if err == nil && result.Gone != Yes {
 				t.Fatalf("stop did not prove disappearance: %+v", result)
 			}
-			if host == "server-only absent" && strings.HasSuffix(op.Unit, ".timer") && result.How != "not-found" {
-				t.Fatalf("absent timer did not return positive absence: %+v", result)
+			if !retained && strings.HasSuffix(op.Unit, ".timer") {
+				want := "not-found"
+				if host == "server-only masked" {
+					want = "masked"
+				}
+				if err == nil && result.How != want {
+					t.Fatalf("quiet timer did not report %s: %+v", want, result)
+				}
 			}
 		case "disable":
 			err = c.Disable(t.Context(), op.Unit)
@@ -392,13 +481,24 @@ print(template.render(
 		if err != nil {
 			t.Fatal(err)
 		}
-		if host == "server-only absent" && strings.HasSuffix(op.Unit, ".timer") && len(submitted) != before {
+		if !retained && strings.HasSuffix(op.Unit, ".timer") && len(submitted) != before {
 			t.Fatalf("positive absence submitted a command: %v", submitted[before:])
 		}
 		if op.Verb == "stop" {
 			protection.QuietExceptions = slices.DeleteFunc(protection.QuietExceptions, func(unit string) bool { return unit == op.Unit })
 		}
 		performed = append(performed, op)
+		if host == "server-only masked" && strings.HasSuffix(op.Unit, ".timer") {
+			// Only this disposable witness bypasses admission to measure the
+			// manager command's result, after the production no-op was proved.
+			commandErr := h.ctl(t.Context(), op.Verb, "--", op.Unit)
+			t.Logf("masked command measurement: %s %s error=%v LoadState=%q FragmentPath=%q UnitFileState=%q ActiveState=%q Job=%q", op.Verb, op.Unit, commandErr,
+				h.property(op.Unit, "LoadState"), h.property(op.Unit, "FragmentPath"), h.property(op.Unit, "UnitFileState"), h.property(op.Unit, "ActiveState"), h.property(op.Unit, "Job"))
+			props, readErr := NewInspector().UnitProperties(t.Context(), op.Unit, "LoadState", "FragmentPath", "UnitFileState", "ActiveState", "Job")
+			if readErr != nil || !operationQuietMask(props) {
+				t.Fatalf("masked command did not preserve the positive quiet mask: command=%v properties=%v read=%v", commandErr, props, readErr)
+			}
+		}
 		if op.Verb == "stop" && op.Unit == server {
 			if err := NewInspector().ProveUnitProcessesGone(t.Context(), server); err != nil {
 				t.Fatal(err)
@@ -471,10 +571,20 @@ func realRetirementHazard(t *testing.T, hazard string, bypass bool) {
 	h.write(timer, "[Unit]\nDefaultDependencies=no\n[Timer]\nOnActiveSec=1ms\nUnit="+backup+"\n")
 	h.write(backup, "[Unit]\nDefaultDependencies=no\n[Service]\nType=oneshot\nExecStart=/usr/bin/touch "+backupEffect+"\n")
 	h.write(dns, "[Unit]\nDefaultDependencies=no\n[Service]\nType=exec\nExecStart=/bin/sleep infinity\n")
-	h.write(socket, "[Unit]\nDefaultDependencies=no\n[Socket]\nListenStream=/run/"+h.prefix+"/test.sock\nService="+h.prefix+"-socket-destination.service\nRuntimeDirectory="+socketRuntime+"\n")
-	h.write(h.prefix+"-socket-destination.service", "[Service]\nType=oneshot\nExecStart=/usr/bin/true\n")
+	if hazard == "socket runtime" {
+		// Binding the socket creates its parent. RuntimeDirectory alone need
+		// not create it when the socket has no setup command to execute.
+		h.write(socket, "[Unit]\nDefaultDependencies=no\n[Socket]\nListenStream=/run/"+socketRuntime+"/test.sock\nService="+h.prefix+"-socket-destination.service\nRuntimeDirectory="+socketRuntime+"\n")
+		h.write(h.prefix+"-socket-destination.service", "[Service]\nType=oneshot\nExecStart=/usr/bin/true\n")
+	}
 	h.run("daemon-reload")
-	h.run("start", "--", node, server, dns, socket)
+	h.run("start", "--", node, server, dns)
+	if hazard == "socket runtime" {
+		h.run("start", "--", socket)
+		if h.property(socket, "ActiveState") != "active" || h.property(socket, "RuntimeDirectory") != socketRuntime {
+			t.Fatal("socket teardown witness lacks its active runtime owner")
+		}
+	}
 	if hazard == "standard completion anchor" {
 		h.run("enable", "--", server)
 		if h.property("multi-user.target", "ActiveState") != "active" || h.property(server, "UnitFileState") != "enabled" ||
@@ -494,7 +604,11 @@ func realRetirementHazard(t *testing.T, hazard string, bypass bool) {
 		})
 		record = filepath.Join(dir, "node.crt")
 	}
-	for _, path := range []string{record, socketRecord} {
+	records := []string{record}
+	if hazard == "socket runtime" {
+		records = append(records, socketRecord)
+	}
+	for _, path := range records {
 		if err := os.WriteFile(path, []byte("original registration\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -514,12 +628,35 @@ func realRetirementHazard(t *testing.T, hazard string, bypass bool) {
 	serverInvocation := h.property(server, "InvocationID")
 	protection := OperationProtection{
 		Units:     []string{server, node, timer, backup, dns},
-		UnitPaths: map[string][]string{node: {filepath.Dir(record), filepath.Dir(socketRecord)}},
+		UnitPaths: map[string][]string{node: {filepath.Dir(record)}},
+	}
+	if hazard == "socket runtime" {
+		protection.UnitPaths[node] = append(protection.UnitPaths[node], filepath.Dir(socketRecord))
 	}
 	if !bypass {
 		err := h.admit([]Operation{{Verb: "stop", Unit: server}}, protection)
 		if err == nil || !strings.Contains(err.Error(), "operation-") {
 			t.Fatalf("preventive %s refusal missing: %v", hazard, err)
+		}
+		t.Logf("preventive %s refusal: %v", hazard, err)
+		if hazard == "success timer" && (!strings.Contains(err.Error(), "operation-edge-outside-set") ||
+			!strings.Contains(err.Error(), server) || !strings.Contains(err.Error(), timer) || !strings.Contains(err.Error(), "OnSuccess")) {
+			t.Fatalf("timer completion refused for unrelated reason: %v", err)
+		}
+		if hazard == "stop propagation" || hazard == "dns stop" || hazard == "socket runtime" {
+			target := node
+			if hazard == "dns stop" {
+				target = dns
+			} else if hazard == "socket runtime" {
+				target = socket
+			}
+			if !strings.Contains(err.Error(), "operation-edge-outside-set") || !strings.Contains(err.Error(), target) ||
+				!strings.Contains(err.Error(), server) || (!strings.Contains(err.Error(), "PropagatesStopTo") && !strings.Contains(err.Error(), "StopPropagatedFrom")) {
+				t.Fatalf("stop propagation refused for unrelated reason: %v", err)
+			}
+		}
+		if hazard == "shared runtime" && (!strings.Contains(err.Error(), "operation-directory-overlap") || !strings.Contains(err.Error(), "RuntimeDirectory=/run/"+runtimeName)) {
+			t.Fatalf("shared runtime refused for unrelated reason: %v", err)
 		}
 		if hazard == "standard completion anchor" && !strings.Contains(err.Error(), "operation-edge-outside-set: "+server+" OnSuccess=multi-user.target") {
 			t.Fatalf("completion anchor refused for unrelated reason: %v", err)
@@ -531,10 +668,10 @@ func realRetirementHazard(t *testing.T, hazard string, bypass bool) {
 			t.Fatalf("truncation was refused for an unrelated reason: %v", err)
 		}
 		if h.property(server, "ActiveState") != "active" || h.property(node, "InvocationID") != nodeInvocation ||
-			h.property(dns, "InvocationID") != dnsInvocation || h.property(socket, "ActiveState") != "active" {
+			h.property(dns, "InvocationID") != dnsInvocation || (hazard == "socket runtime" && h.property(socket, "ActiveState") != "active") {
 			t.Fatal("preventive admission changed a protected service")
 		}
-		for _, path := range []string{record, socketRecord} {
+		for _, path := range records {
 			if body, err := os.ReadFile(path); err != nil || string(body) != "original registration\n" {
 				t.Fatalf("preventive admission changed %s: %q %v", path, body, err)
 			}

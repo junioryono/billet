@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
-	"reflect"
 	"slices"
 	"strings"
 )
@@ -103,7 +102,7 @@ type operationWalk struct {
 // and destination classes. Completion handlers and arbitrary billet-to-billet
 // edges refuse too, including effects of a backup allowed to remain in flight.
 // Stop propagation admits only the ledger's What-derived device stopping that
-// mount (and its inverse); retirement never stops a device.
+// mount (and its inverse), when reported; retirement never stops a device.
 // Standard dependencies end traversal and admit only no-op effects. Billet
 // units retain directory, termination, manager-action, stdio and setup checks;
 // callers check node/server execution.
@@ -130,11 +129,17 @@ type operationWalk struct {
 // only unit-file locations and cgroup identifiers. Archive dependencies refuse
 // with retained-node-path-archived, even in optional or negated forms. Volatile
 // paths refuse except beneath that unit's own resolved RuntimeDirectory entries.
+// PrivateTmp=yes also permits its exact RequiresMountsFor=/var/tmp setup
+// prerequisite; descendants and other properties receive no such exception.
 // Callers bind the CLI and loaded configuration pathname to the journal in both
 // lexical and resolved form, and refuse a leaf symlink before intent; persistent
 // parent-directory symlinks remain supported through rewrite and crash resume.
 // Direct triggers of protected services are checked.
-// Evidence is reread, and admission grants no future authority.
+// Evidence is reread: policy and unordered edge sets must agree, while activity,
+// jobs, enablement and inverse timer triggers are judged from the fresh graph.
+// Manager timestamps, invocation counters and next-elapse times grant no
+// authority. A policy mismatch names its property and both observed values.
+// Admission grants no future authority.
 func (i *Inspector) AdmitOperations(ctx context.Context, sequence []Operation, protection OperationProtection) error {
 	w := operationWalk{inspector: i, protection: protection, units: make(map[string]operationEvidence), targets: make(map[string]bool), paths: make(map[string]operationPathBinding), stopped: make(map[string]bool), standard: make(map[string]bool)}
 	if err := w.admitRetainedInputs(); err != nil {
@@ -169,21 +174,32 @@ func (i *Inspector) AdmitOperations(ctx context.Context, sequence []Operation, p
 			w.stopped[op.Unit] = op.Verb == "stop"
 		}
 	}
+	fresh := make(map[string]operationEvidence, len(w.units))
+	var changes []string
 	for _, unit := range sortedOperationUnits(w.units) {
 		before := w.units[unit]
 		after, err := w.read(ctx, unit)
 		if err != nil {
 			return err
 		}
-		if !reflect.DeepEqual(before, after) {
-			return fmt.Errorf("operation-evidence-changed: %s changed during admission", unit)
+		if err := compareOperationEvidence(unit, before, after); err != nil {
+			return err
 		}
+		changes = append(changes, operationRuntimeChanges(unit, before.props, after.props)...)
+		fresh[unit] = after
+	}
+	// Runtime state is judged again, never frozen to a preceding read or
+	// operation. Reload can also unload a quiet timer's inverse trigger edge.
+	w.units, w.stopped = fresh, make(map[string]bool)
+	if err := w.admitClosedSet(ctx); err != nil {
+		return fmt.Errorf("operation-evidence-reread: changes=[%s]: %w", strings.Join(changes, "; "), err)
 	}
 	for _, op := range sequence {
-		if op.Verb == "enable" || op.Verb == "disable" {
-			if err := w.admitInstallation(ctx, op); err != nil {
-				return err
-			}
+		if err := w.admit(ctx, op); err != nil {
+			return fmt.Errorf("operation-effects: fresh %s %s changes=[%s]: %w", op.Verb, op.Unit, strings.Join(changes, "; "), err)
+		}
+		if op.Verb == "stop" || op.Verb == "start" {
+			w.stopped[op.Unit] = op.Verb == "stop"
 		}
 	}
 	if err := i.AdmitQuietActivation(ctx, protection.QuietUnits, protection.QuietExceptions, protection.WaitingUnits...); err != nil {
@@ -250,12 +266,12 @@ func (w *operationWalk) read(ctx context.Context, unit string) (operationEvidenc
 	if !operationUnitName(first(props, "Id")) || !slices.Contains(strings.Fields(first(props, "Names")), first(props, "Id")) {
 		return operationEvidence{}, fmt.Errorf("operation-names-unknown: %s has no complete canonical names", unit)
 	}
-	if first(props, "LoadState") == "masked" && first(props, "ActiveState") == "inactive" &&
-		first(props, "UnitFileState") == "masked" && first(props, "FragmentPath") == "/dev/null" {
+	if operationQuietMask(props) && (strings.HasSuffix(unit, ".timer") || first(props, "UnitFileState") == "masked") {
 		return operationEvidence{props: props}, nil
 	}
 	if first(props, "LoadState") != "loaded" || first(props, "NeedDaemonReload") != "no" {
-		return operationEvidence{}, fmt.Errorf("operation-source-unsupported: %s is not a current loaded unit", unit)
+		return operationEvidence{}, fmt.Errorf("operation-source-unsupported: %s LoadState=%q FragmentPath=%q UnitFileState=%q ActiveState=%q Job=%q NeedDaemonReload=%q", unit,
+			first(props, "LoadState"), first(props, "FragmentPath"), first(props, "UnitFileState"), first(props, "ActiveState"), first(props, "Job"), first(props, "NeedDaemonReload"))
 	}
 	if scoped && !operationPassiveUnit(unit) && (first(props, "SourcePath") != "" || first(props, "FragmentPath") == "") {
 		return operationEvidence{}, fmt.Errorf("operation-source-unsupported: %s has no supported effective source", unit)

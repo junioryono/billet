@@ -67,7 +67,9 @@ var operationEdges = []struct{ property, source, destination string }{
 	{"After", "tmpfs-ledger", "swap.target"},
 	{"Requires", "ledger", "backing-device"},
 	{"BindsTo", "ledger", "backing-device"},
-	// Retirement never stops a device: this edge is a no-op; https://github.com/systemd/systemd/blob/v255/src/core/mount.c#L367.
+	// Optional: Ubuntu 24.04/systemd 255.4 CI (2026-09-15) reported no
+	// such edge for the loop-backed ext4 ledger. Admit the exact pair when
+	// present; retirement never stops a device (v255 mount.c#L367).
 	{"StopPropagatedFrom", "ledger", "backing-device"},
 	{"After", "ledger", "backing-device"},
 	{"After", "ledger", "backing-blockdev"},

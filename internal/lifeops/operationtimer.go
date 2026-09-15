@@ -6,29 +6,33 @@ import (
 	"strings"
 )
 
-// absentTimer establishes absence before an operation, never by suppressing a
-// failed command. Role-managed server-only hosts may lack retirement timers.
-func (c *Converger) absentTimer(ctx context.Context, unit string) (bool, error) {
+// quietTimer proves an absent or masked timer before submitting any command.
+// A failed command never grants permission; role-managed hosts may lack timers.
+func (c *Converger) quietTimer(ctx context.Context, unit string) (string, error) {
 	if !strings.HasSuffix(unit, ".timer") {
-		return false, nil
+		return "", nil
 	}
 	names := []string{"LoadState", "ActiveState", "UnitFileState", "FragmentPath", "Job"}
 	props, err := c.inspector.properties(ctx, unit, names...)
 	if err != nil {
-		return false, err
+		return "", err
 	}
 	if err := requireOperationProperties(unit, props, names); err != nil {
-		return false, err
+		return "", err
 	}
 	if first(props, "LoadState") == "not-found" {
 		if first(props, "ActiveState") != "inactive" || first(props, "UnitFileState") != "" ||
 			first(props, "FragmentPath") != "" || first(props, "Job") != "" {
-			return false, fmt.Errorf("operation-timer-absence-inconsistent: %s", unit)
+			return "", fmt.Errorf("operation-timer-absence-inconsistent: %s", unit)
 		}
-		return true, nil
+		return "not-found", nil
 	}
-	if first(props, "LoadState") != "loaded" && first(props, "LoadState") != "masked" {
-		return false, fmt.Errorf("operation-timer-load-unknown: %s", unit)
+	if operationQuietMask(props) {
+		return first(props, "UnitFileState"), nil
 	}
-	return false, nil
+	if first(props, "LoadState") != "loaded" {
+		return "", fmt.Errorf("operation-timer-load-unknown: %s LoadState=%q FragmentPath=%q UnitFileState=%q ActiveState=%q Job=%q", unit,
+			first(props, "LoadState"), first(props, "FragmentPath"), first(props, "UnitFileState"), first(props, "ActiveState"), first(props, "Job"))
+	}
+	return "", nil
 }

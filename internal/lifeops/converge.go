@@ -1639,10 +1639,10 @@ type StopResult struct {
 // none at all for the host transaction). The observation that follows is a
 // property read, bounded as every property read is.
 func (c *Converger) StopAndProve(ctx context.Context, unit string) (StopResult, error) {
-	if absent, err := c.absentTimer(ctx, unit); err != nil {
+	if quiet, err := c.quietTimer(ctx, unit); err != nil {
 		return StopResult{}, err
-	} else if absent {
-		return StopResult{Gone: Yes, How: "not-found"}, nil
+	} else if quiet != "" {
+		return StopResult{Gone: Yes, How: quiet}, nil
 	}
 	if _, err := c.inspector.exec(ctx, []string{"stop", "--", unit}); err != nil {
 		return StopResult{}, fmt.Errorf("stop %s: %w", unit, err)
@@ -1784,9 +1784,9 @@ func (c *Converger) CollateralNote() string {
 // boot that nothing established can run — and must equally not disable one an
 // operator had enabled before it arrived.
 func (c *Converger) Disable(ctx context.Context, unit string) error {
-	if absent, err := c.absentTimer(ctx, unit); err != nil {
+	if quiet, err := c.quietTimer(ctx, unit); err != nil {
 		return err
-	} else if absent {
+	} else if quiet != "" {
 		return nil
 	}
 	ctx, cancel := c.inspector.bounded(ctx)
