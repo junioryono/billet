@@ -192,3 +192,120 @@ func TestRetirementRechecksClosedEdgesBeforeStaging(t *testing.T) {
 		t.Fatalf("staging refusal published intent or submitted operations: %v %v %v", presence, err, f.manager.operations)
 	}
 }
+
+func TestRetirementRechecksEffectsBeforeRecordingTimerStop(t *testing.T) {
+	f := newRequestFixture(t)
+	f.reserve(t)
+	j := f.plantJournal(t, retirement.PhaseIntent, retirement.VariantServerOnly)
+	j.TimerStoppedAt = ""
+	mustOK(t, j.Write(retireNow()))
+	before := mustRead(t, retirement.JournalPath())
+	introduced := false
+	f.manager.onDisable = func(unit string) {
+		if unit == backupTimerUnit {
+			introduced = true
+			installRetirePreparationHelper(t, f)
+		}
+	}
+	next, r := retireStop(t.Context(), j)
+	if !introduced || r == nil || r.Reason != retireReasonEffects || !strings.Contains(r.Why, "OnSuccessOf=helper.service") {
+		t.Fatalf("timer metadata crossed changed closed edges: %+v", r)
+	}
+	if next.Phase != j.Phase || mustRead(t, retirement.JournalPath()) != before {
+		t.Fatal("timer stop was journaled before fresh effect admission")
+	}
+	for _, operation := range f.manager.operations {
+		if operation == "stop "+serverUnit {
+			t.Fatal("controller stopped after timer metadata refusal")
+		}
+	}
+}
+
+func TestRetirementRechecksEffectsAfterConfigurationFlush(t *testing.T) {
+	for _, variant := range []retirement.Variant{retirement.VariantServerOnly, retirement.VariantRetainedNode} {
+		t.Run(string(variant), func(t *testing.T) {
+			f, j := retireProofHost(t, variant, retirement.PhaseArchived)
+			before := mustRead(t, retirement.JournalPath())
+			introduced := false
+			saved := retireSyncDir
+			retireSyncDir = func(dir string) error {
+				if dir == filepath.Dir(f.cfg) {
+					introduced = true
+					installRetirePreparationHelper(t, f)
+				}
+				return nil
+			}
+			t.Cleanup(func() { retireSyncDir = saved })
+			next, r := performRetireAction(t.Context(), retireProofMode(f), nil, j, retirement.ActionAdvanceRewritten)
+			if !introduced || r == nil || r.Reason != retireReasonEffects || !strings.Contains(r.Why, "OnSuccessOf=helper.service") {
+				t.Fatalf("rewrite phase crossed changed closed edges: %+v", r)
+			}
+			if next.Phase != j.Phase || mustRead(t, retirement.JournalPath()) != before {
+				t.Fatal("configuration flush authorized a later phase write")
+			}
+		})
+	}
+}
+
+func TestRetirementRechecksEffectsAfterReplacementJournal(t *testing.T) {
+	f := newRequestFixture(t)
+	f.retainANode(t)
+	f.reserve(t)
+	j := f.plantJournal(t, retirement.PhaseArchived, retirement.VariantRetainedNode)
+	mustOK(t, os.Rename(j.IdentityDir, j.Archive))
+	before := mustRead(t, f.cfg)
+	introduced := false
+	saved := retirement.SyncingDir
+	retirement.SyncingDir = func(dir string) error {
+		if dir == retirement.RetiredDir() && requireRetireJournal(t).RetainedInvocation.ConfigReplacement != nil {
+			introduced = true
+			installRetirePreparationHelper(t, f)
+		}
+		return nil
+	}
+	t.Cleanup(func() { retirement.SyncingDir = saved })
+	next, r := retireRewrite(t.Context(), retireProofMode(f), nil, j)
+	if !introduced || r == nil || r.Reason != retireReasonEffects || !strings.Contains(r.Why, "OnSuccessOf=helper.service") {
+		t.Fatalf("configuration rename crossed replacement-journal drift: %+v", r)
+	}
+	if next.Phase != j.Phase || requireRetireJournal(t).Phase != j.Phase || mustRead(t, f.cfg) != before {
+		t.Fatal("replacement journal persistence authorized configuration rename")
+	}
+}
+
+func TestDoneRetirementRechecksEffectsBeforeSettlementWrites(t *testing.T) {
+	for _, boundary := range []string{"marker", "settled journal"} {
+		t.Run(boundary, func(t *testing.T) {
+			f, j := retireProofHost(t, retirement.VariantRetainedNode, retirement.PhaseDone)
+			j.RowDone, j.CompletedBy = true, requestRetiring
+			mustOK(t, j.Write(retireNow()))
+			m := retireProofMode(f)
+			root, dir, _, r := retireGuard(m.run)
+			if r != nil {
+				t.Fatal(r)
+			}
+			defer root.release()
+			defer func() { _ = dir.Close() }()
+			if boundary == "settled journal" {
+				if _, r := retireClearMarker(t.Context(), m, root, dir, j); r != nil {
+					t.Fatalf("healthy marker control: %+v", r)
+				}
+			}
+			beforeJournal := mustRead(t, retirement.JournalPath())
+			beforeGuard := mustRead(t, filepath.Join(f.guard.active(), guardRecordName))
+			installRetirePreparationHelper(t, f)
+			if boundary == "marker" {
+				_, r = retireClearMarker(t.Context(), m, root, dir, j)
+			} else {
+				r = retireMarkSettled(t.Context(), m, &j)
+			}
+			if r == nil || r.Reason != retireReasonEffects || !strings.Contains(r.Why, "OnSuccessOf=helper.service") {
+				t.Fatalf("settlement crossed changed closed edges: %+v", r)
+			}
+			if mustRead(t, retirement.JournalPath()) != beforeJournal ||
+				mustRead(t, filepath.Join(f.guard.active(), guardRecordName)) != beforeGuard {
+				t.Fatal("settlement published before full effect admission")
+			}
+		})
+	}
+}

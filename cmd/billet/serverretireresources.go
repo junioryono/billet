@@ -11,10 +11,13 @@ import (
 // retireInvocationForConfig permits only the exact replacement recorded at the
 // rewrite boundary. The original resource remains authoritative through archive.
 func retireInvocationForConfig(j retirement.Journal) (*retirement.RetainedInvocation, *retireRefusal) {
+	if j.Phase == retirement.PhaseDone {
+		return nil, nil
+	}
 	want := j.RetainedInvocation
 	if want == nil || want.ConfigReplacement == nil ||
 		(j.Phase != retirement.PhaseArchived && j.Phase != retirement.PhaseConfigRewritten &&
-			j.Phase != retirement.PhaseNodeRestarted && j.Phase != retirement.PhaseDone) {
+			j.Phase != retirement.PhaseNodeRestarted) {
 		return want, nil
 	}
 	fact, r := retireConfigFact(want.ConfigPath, j)

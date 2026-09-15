@@ -30,7 +30,7 @@ func proveRetireConfigLeaf(path string) *retireRefusal {
 // A matching digest cannot authorize moving the configuration into a directory
 // retirement renames. Both request operands remain bound to the recorded name.
 func proveRetireConfigPath(ctx context.Context, path string, j retirement.Journal) *retireRefusal {
-	if j.Variant != retirement.VariantRetainedNode {
+	if j.Phase == retirement.PhaseDone || j.Variant != retirement.VariantRetainedNode {
 		return nil
 	}
 	refuse := func() *retireRefusal {

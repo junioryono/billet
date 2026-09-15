@@ -82,6 +82,10 @@ var operationInverseRelations = map[string]string{
 }
 
 func (w *operationWalk) admitClosedSet(ctx context.Context) error {
+	// Each pass starts from declarations; discovered aliases are not roles.
+	w.protection = w.declared
+	w.protection.Units = slices.Clone(w.declared.Units)
+	w.protection.RequiredActive = slices.Clone(w.declared.RequiredActive)
 	own := slices.Clone(w.protection.Units)
 	own = append(own, w.protection.QuietUnits...)
 	own = append(own, w.protection.WaitingUnits...)
@@ -126,7 +130,7 @@ func (w *operationWalk) admitClosedSet(ctx context.Context) error {
 	}
 	// Resolve every role before populating aliases: a Names entry must never
 	// replace another role's evidence before its identity has been compared.
-	if err := w.admitRoleIdentities(roles, own); err != nil {
+	if err := w.admitRoleIdentities(roles); err != nil {
 		return err
 	}
 	for _, unit := range own {
@@ -194,18 +198,7 @@ func (w *operationWalk) admitClosedSet(ctx context.Context) error {
 	return nil
 }
 
-func (w *operationWalk) admitRoleIdentities(roles, own []string) error {
-	for _, unit := range own {
-		// An operation may use an extra alias of a declared role. A protected
-		// role name itself is never such an extra alias.
-		role := strings.HasSuffix(unit, ".mount") || strings.Contains(unit, "-dnsmasq@")
-		for _, suffix := range []string{"-server.service", "-node.service", "-backup.service", "-upgrade.service", "-network.service", "-backup.timer", "-upgrade.timer"} {
-			role = role || strings.HasSuffix(unit, suffix)
-		}
-		if role {
-			roles = append(roles, unit)
-		}
-	}
+func (w *operationWalk) admitRoleIdentities(roles []string) error {
 	slices.Sort(roles)
 	roles = slices.Compact(roles)
 	owners := make(map[string]string)

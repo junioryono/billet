@@ -50,7 +50,7 @@ func TestOperationAdmissionLimitsInverseDeviceStopPropagationToLedger(t *testing
 	mount["ActiveState"], mount["What"] = "active", "/dev/vdb1"
 	w := operationWalk{
 		inspector: f.inspector,
-		protection: OperationProtection{
+		declared: OperationProtection{
 			Units:          []string{"ledger.mount", "billet-server.service", "billet-node.service"},
 			RequiredActive: []string{"ledger.mount"},
 		},

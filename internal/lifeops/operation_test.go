@@ -737,9 +737,15 @@ func TestOperationAdmissionJudgesLoadedAliasesAsOneUnit(t *testing.T) {
 	if err := os.WriteFile(server["FragmentPath"], []byte("[Install]\nAlias=controller.service\nWantedBy=multi-user.target\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	for _, verb := range []string{"stop", "start", "enable", "disable"} {
-		if err := f.inspector.AdmitOperations(t.Context(), []Operation{{Verb: verb, Unit: "billet-server.service"}}, OperationProtection{}); err != nil {
-			t.Fatalf("loaded alias refused: %v", err)
+	for _, target := range []string{"billet-server.service", "controller.service"} {
+		for _, verb := range []string{"stop", "start", "enable", "disable"} {
+			protection := OperationProtection{Units: []string{"billet-server.service"}}
+			if err := f.inspector.AdmitOperations(t.Context(), []Operation{{Verb: verb, Unit: target}}, protection); err != nil {
+				t.Fatalf("loaded alias refused for %s %s: %v", verb, target, err)
+			}
+			if len(protection.Units) != 1 || protection.Units[0] != "billet-server.service" {
+				t.Fatalf("alias discovery changed declared roles: %v", protection.Units)
+			}
 		}
 	}
 	server["After"] = "outside.service"

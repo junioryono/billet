@@ -90,6 +90,7 @@ type operationEvidence struct {
 type operationWalk struct {
 	inspector  *Inspector
 	protection OperationProtection
+	declared   OperationProtection
 	units      map[string]operationEvidence
 	targets    map[string]bool
 	paths      map[string]operationPathBinding
@@ -113,8 +114,9 @@ type operationWalk struct {
 // sysinit.target) have the same status as an unrelated watcher. Every edge
 // between a protected role and a standard unit must still be listed, and a
 // standard unit which an operation would start must already be active.
-// Protected roles have distinct canonical Ids; no role's Names may include
-// another role. Benign extra aliases of one role remain supported.
+// Declared roles have distinct canonical Ids; no role's Names may include
+// another declared role. Each pass rebuilds from those declarations, keeping
+// discovered aliases separate. Benign extra aliases of one role remain supported.
 // Required retained inputs (configuration, identity, credentials and other startup
 // files, including every mandatory loaded EnvironmentFiles entry) never lie
 // under /run, /tmp or /var/tmp: lexical and resolved paths and
@@ -141,7 +143,7 @@ type operationWalk struct {
 // authority. A policy mismatch names its property and both observed values.
 // Admission grants no future authority.
 func (i *Inspector) AdmitOperations(ctx context.Context, sequence []Operation, protection OperationProtection) error {
-	w := operationWalk{inspector: i, protection: protection, units: make(map[string]operationEvidence), targets: make(map[string]bool), paths: make(map[string]operationPathBinding), stopped: make(map[string]bool), standard: make(map[string]bool)}
+	w := operationWalk{inspector: i, protection: protection, declared: protection, units: make(map[string]operationEvidence), targets: make(map[string]bool), paths: make(map[string]operationPathBinding), stopped: make(map[string]bool), standard: make(map[string]bool)}
 	if err := w.admitRetainedInputs(); err != nil {
 		return err
 	}

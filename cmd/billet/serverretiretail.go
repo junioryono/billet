@@ -133,7 +133,7 @@ func retireTail(ctx context.Context, m retireMode, root *txLock, dir *os.File, j
 	completion := retirement.CompletionOf(j)
 	answer.Completion = &completion
 
-	j, r = retireTailRow(ctx, j, answer)
+	j, r = retireTailRow(ctx, m, j, answer)
 	if r != nil {
 		return nil, r
 	}
@@ -151,7 +151,7 @@ func retireTail(ctx context.Context, m retireMode, root *txLock, dir *os.File, j
 		return nil, r
 	}
 
-	cleared, r := retireClearMarker(root, dir, m.run, j)
+	cleared, r := retireClearMarker(ctx, m, root, dir, j)
 	if r != nil {
 		return nil, r
 	}
@@ -164,7 +164,7 @@ func retireTail(ctx context.Context, m retireMode, root *txLock, dir *os.File, j
 		return nil, r
 	}
 
-	if r := retireMarkSettled(&j); r != nil {
+	if r := retireMarkSettled(ctx, m, &j); r != nil {
 		return nil, r
 	}
 
@@ -227,7 +227,7 @@ func retireTailReceipt(ctx context.Context, m retireMode, j retirement.Journal) 
 // this host and the ledger has not heard yet — and everything else is a
 // refusal, because a ledger that disagrees with this journal is not a thing to
 // wait out.
-func retireTailRow(ctx context.Context, j retirement.Journal, answer *retireTailAnswer,
+func retireTailRow(ctx context.Context, m retireMode, j retirement.Journal, answer *retireTailAnswer,
 ) (retirement.Journal, *retireRefusal) {
 	if j.RowDone {
 		answer.Row = retireRowAlready
@@ -282,6 +282,9 @@ func retireTailRow(ctx context.Context, j retirement.Journal, answer *retireTail
 	j.RowDone = true
 	j.CompletedBy = row.CompletedBy
 
+	if r := admitRetireDoneProtection(ctx, m, j); r != nil {
+		return j, r
+	}
 	if err := j.Write(retireNow()); err != nil {
 		// THE ROW IS WRITTEN AND THE JOURNAL DOES NOT SAY SO. The next
 		// converge's tail reaches the same call, which answers `already` from
@@ -524,13 +527,13 @@ func retireDeadlinePending(outer, bounded context.Context, err error) string {
 // rewrites the whole record, so the copy taken at the start is behind by at
 // least one of this run's own writes. Reading it again is also what re-checks
 // that the guard is still this converge's before anything is written to it.
-func retireClearMarker(root *txLock, dir *os.File, run string, j retirement.Journal) (string, *retireRefusal) {
+func retireClearMarker(ctx context.Context, m retireMode, root *txLock, dir *os.File, j retirement.Journal) (string, *retireRefusal) {
 	shape, err := classifyGuardDirFrom(dir)
 	if err != nil {
 		return "", retireUnknown(retireReasonGuard, "read the guard's record before clearing the marker: "+err.Error(), "")
 	}
 
-	if r := judgeGuardShape(shape, run); r != nil {
+	if r := judgeGuardShape(shape, m.run); r != nil {
 		return "", r
 	}
 
@@ -547,14 +550,23 @@ func retireClearMarker(root *txLock, dir *os.File, run string, j retirement.Jour
 	record := shape.Guard
 	record.Transition = nil
 
+	if r := admitRetireDoneProtection(ctx, m, j); r != nil {
+		return "", r
+	}
 	if err := writeGuardRecordAt(dir, record, true); err != nil {
 		return "", retireUnknown(retireReasonMarker, "clear the retirement's marker from the guard: "+err.Error(), "")
 	}
 
+	if r := admitRetireDoneProtection(ctx, m, j); r != nil {
+		return "", r
+	}
 	if err := syncDirFD(dir); err != nil {
 		return "", retireUnknown(retireReasonMarker, "flush the guard directory: "+err.Error(), "")
 	}
 
+	if r := admitRetireDoneProtection(ctx, m, j); r != nil {
+		return "", r
+	}
 	if err := syncDirFD(root.dir); err != nil {
 		return "", retireUnknown(retireReasonMarker, "flush the upgrade root: "+err.Error(), "")
 	}
@@ -567,7 +579,10 @@ func retireClearMarker(root *txLock, dir *os.File, run string, j retirement.Jour
 // marker, which is the state the takeover rule reads as an unfinished tail.
 // The reverse order would leave a settled journal beside a marker nothing
 // clears.
-func retireMarkSettled(j *retirement.Journal) *retireRefusal {
+func retireMarkSettled(ctx context.Context, m retireMode, j *retirement.Journal) *retireRefusal {
+	if r := admitRetireDoneProtection(ctx, m, *j); r != nil {
+		return r
+	}
 	j.Settled = true
 
 	if err := j.Write(retireNow()); err != nil {

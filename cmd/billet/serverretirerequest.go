@@ -365,6 +365,9 @@ func resumeRetirement(ctx context.Context, m retireMode, shape claimShape, db *s
 	}
 
 	if d == retirement.DispatchAdvanceRow {
+		if r := admitRetireRemaining(ctx, m, j); r != nil {
+			return nil, r
+		}
 		if err := db.AdvanceRetirementToIntent(ctx, identity, m.retiringHost, j.Provenance.TransitionID, m.run,
 			retireNow()); err != nil {
 			return nil, retireUnknown(retireReasonLedger, "advance the row to intent: "+err.Error(), "")
@@ -1768,6 +1771,9 @@ func applyRetireIntent(ctx context.Context, m retireMode, root *txLock, dir *os.
 			return nil, retireUnknown(retireReasonMarker, err.Error(), "")
 		}
 
+		if r := admitRetireOperations(ctx, j, retireServiceSequence(j, retirement.Decision{Action: retirement.ActionStop})); r != nil {
+			return nil, r
+		}
 		if err := syncDirFD(root.dir); err != nil {
 			return nil, retireUnknown(retireReasonMarker, err.Error(), "")
 		}
@@ -1794,6 +1800,9 @@ func applyRetireIntent(ctx context.Context, m retireMode, root *txLock, dir *os.
 		return nil, retireUnknown(retireReasonJournal, "write the journal's intent: "+err.Error(), "")
 	}
 
+	if r := admitRetireOperations(ctx, j, retireServiceSequence(j, retirement.Decision{Action: retirement.ActionStop})); r != nil {
+		return nil, r
+	}
 	if err := db.AdvanceRetirementToIntent(ctx, plan.identity, m.retiringHost, plan.row.TransitionID, m.run, now); err != nil {
 		return nil, retireUnknown(retireReasonLedger, "advance the row to intent: "+err.Error(), "")
 	}

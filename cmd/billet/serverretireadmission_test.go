@@ -791,9 +791,24 @@ func TestRetirementRechecksActivationBeforeConfigMutation(t *testing.T) {
 			j := f.plantJournal(t, retirement.PhaseArchived, variant)
 			mustOK(t, os.Rename(j.IdentityDir, j.Archive))
 			before := mustRead(t, f.cfg)
+			journalBefore := mustRead(t, retirement.JournalPath())
+			publications := 0
+			savedPublish := retirement.Publishing
+			retirement.Publishing = func(path string) error {
+				if path == retirement.JournalPath() {
+					publications++
+				}
+				return nil
+			}
+			t.Cleanup(func() { retirement.Publishing = savedPublish })
 			if variant == retirement.VariantRetainedNode {
 				saved := retireBeforeConfigRename
-				retireBeforeConfigRename = func() { installRetirePathWatcher(t, f, "billet-upgrade.service") }
+				retireBeforeConfigRename = func() {
+					installRetirePathWatcher(t, f, backupServiceUnit)
+					f.manager.set("billet-backup.path", "ActiveState", "active")
+					writeFile(t, filepath.Join(f.unitsDir, "watcher-source"),
+						"[Path]\nPathChanged="+retirement.RetiredDir()+"\nUnit="+backupServiceUnit+"\n", 0o644)
+				}
 				t.Cleanup(func() { retireBeforeConfigRename = saved })
 			} else {
 				installRetirePathWatcher(t, f, "billet-upgrade.service")
@@ -802,8 +817,9 @@ func TestRetirementRechecksActivationBeforeConfigMutation(t *testing.T) {
 			if r == nil || !strings.Contains(r.Why, "operation-edge-outside-set") || next.Phase != j.Phase || mustRead(t, f.cfg) != before {
 				t.Fatalf("config mutation crossed active source: next=%s refusal=%+v", next.Phase, r)
 			}
-			if requireRetireJournal(t).Phase != j.Phase || len(f.manager.operations) != 0 {
-				t.Fatalf("config refusal advanced transition: %v", f.manager.operations)
+			if publications != 0 || mustRead(t, retirement.JournalPath()) != journalBefore ||
+				requireRetireJournal(t).Phase != j.Phase || len(f.manager.operations) != 0 {
+				t.Fatalf("config refusal published %d journals or advanced transition: %v", publications, f.manager.operations)
 			}
 		})
 	}

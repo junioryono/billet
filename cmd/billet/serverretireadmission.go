@@ -32,7 +32,14 @@ func admitRetirePreparation(ctx context.Context, cfg *config.Config, configPath,
 	}
 	j := retirement.Journal{Phase: retirement.PhaseIntent, Variant: retirement.VariantServerOnly,
 		IdentityDir: cfg.Server.IdentityDir, Archive: archive}
+	return admitRetireConfiguredProtection(ctx, cfg, configPath, j)
+}
+
+func admitRetireConfiguredProtection(ctx context.Context, cfg *config.Config, configPath string, j retirement.Journal) *retireRefusal {
 	p := retireOperationProtection(j)
+	if j.Phase == retirement.PhaseDone {
+		p.ArchivedInputRoots = nil
+	}
 	services, paths, err := retireRequiredServices(cfg)
 	if err != nil {
 		return retireUnknown(retireReasonEffects, err.Error(), "")
@@ -60,9 +67,6 @@ func admitRetirePreparation(ctx context.Context, cfg *config.Config, configPath,
 			}
 		}
 	}
-	if err := retireOperationInspector().AdmitOperations(ctx, nil, p); err != nil {
-		return retireUnknown(retireReasonEffects, err.Error(), "")
-	}
 	if cfg.Node != nil {
 		environment, err := requiredRetireEnvironmentFiles(ctx)
 		if err != nil {
@@ -77,6 +81,9 @@ func admitRetirePreparation(ctx context.Context, cfg *config.Config, configPath,
 			}
 		}
 	}
+	if err := retireOperationInspector().AdmitOperations(ctx, nil, p); err != nil {
+		return retireUnknown(retireReasonEffects, err.Error(), "")
+	}
 	return nil
 }
 
@@ -87,14 +94,15 @@ func admitRetireRequestPreparation(ctx context.Context, m retireMode) *retireRef
 	if r != nil {
 		return r
 	}
+	if fact == retirement.JournalFactDone {
+		if _, r := observeRetirePostconditions(ctx, m, j); r != nil {
+			return r
+		}
+		return admitRetireDoneProtection(ctx, m, j)
+	}
 	if fact != retirement.JournalFactAbsent {
 		if r := proveRetireConfigPath(ctx, m.configPath, j); r != nil {
 			return r
-		}
-		if j.Phase == retirement.PhaseDone {
-			if _, r := observeRetirePostconditions(ctx, m, j); r != nil {
-				return r
-			}
 		}
 		if r := proveRetireRequiredResources(ctx, j); r != nil {
 			return retireUnknown(retireReasonEffects, r.Why, "")
@@ -112,6 +120,27 @@ func admitRetireRequestPreparation(ctx context.Context, m retireMode) *retireRef
 		return r
 	}
 	return admitRetirePreparation(ctx, obs.cfg, m.configPath, "")
+}
+
+// Completed work uses today's serverless inputs, never handoff identities.
+// Row acknowledgement still records history independently of node health.
+func admitRetireDoneProtection(ctx context.Context, m retireMode, j retirement.Journal) *retireRefusal {
+	if _, r := retireConfigPostcondition(m.configPath, j); r != nil {
+		return r
+	}
+	cfg := &config.Config{}
+	if j.Variant == retirement.VariantRetainedNode {
+		obs, r := observeInstalledConfig(m.configPath, true)
+		if r != nil {
+			return retireUnknown(retireReasonEffects, r.Why, "")
+		}
+		if !obs.present || obs.cfg.Server != nil || obs.cfg.Node == nil {
+			return retireUnknown(retireReasonPostcondition, "the current configuration is not serverless with a retained node", "")
+		}
+		cfg = obs.cfg
+	}
+	j.RetainedInvocation = nil
+	return admitRetireConfiguredProtection(ctx, cfg, m.configPath, j)
 }
 
 func retireServiceSequence(j retirement.Journal, d retirement.Decision) []lifeops.Operation {
@@ -260,7 +289,11 @@ func admitRetireRemaining(ctx context.Context, m retireMode, j retirement.Journa
 			return r
 		}
 	}
-	return proveRetireActivation(ctx, j.Phase == retirement.PhaseIntent, j.Phase == retirement.PhaseStopped)
+	if r := proveRetireActivation(ctx, j.Phase == retirement.PhaseIntent, j.Phase == retirement.PhaseStopped); r != nil {
+		return r
+	}
+	// Invocation and execution reads may block after the first admission.
+	return admitRetireOperations(ctx, j, retireServiceSequence(j, d))
 }
 
 // captureRetireInvocation runs before intent. A resumed journal never invents
@@ -447,7 +480,7 @@ func proveRetireStopped(ctx context.Context, j retirement.Journal) *retireRefusa
 	if r := proveRetireActivation(ctx, false); r != nil {
 		return r
 	}
-	return proveRetireRequiredResources(ctx, j)
+	return admitRetireOperations(ctx, j, nil)
 }
 
 var retireQuietServices = []string{serverUnit, backupServiceUnit, "billet-upgrade.service"}
