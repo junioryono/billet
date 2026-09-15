@@ -186,7 +186,8 @@ jobs:
     # 50 because this job now compiles and runs cmd/billet under -race as well
     # as internal/state and the capacity suite; the sibling job's note applies
     # here too -- raise it when the suite grows, do not trim tests to fit it.
-    timeout-minutes: 50
+    # 70 since the command step's own bound became 45 (below).
+    timeout-minutes: 70
     services:
       postgres:
         image: postgres:18-alpine
@@ -236,8 +237,12 @@ jobs:
       # EXCEPT THE RETIREMENT ADMISSION TESTS, which test-postgres-retirement
       # runs beside this job with the same pattern as -run, so each test is in
       # exactly one of the two.
+      #
+      # 45m: main took 1683.9s of the old 30m bound on d4d4e2e (2026-09-15), and
+      # with the retirement admission run before every step the rest of the
+      # suite timed out at 30m on 4ba24f7 the same day even without those tests.
       - name: Test the command suite against PostgreSQL
-        run: go test -race -count=1 -timeout 30m -vet=off -skip '^TestRetirement' ./cmd/billet/
+        run: go test -race -count=1 -timeout 45m -vet=off -skip '^TestRetirement' ./cmd/billet/
       - name: Test the capacity suite against PostgreSQL
         run: go test -count=1 -timeout 20m ./internal/alloc/
         env:
