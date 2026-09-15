@@ -186,7 +186,8 @@ jobs:
     # 50 because this job now compiles and runs cmd/billet under -race as well
     # as internal/state and the capacity suite; the sibling job's note applies
     # here too -- raise it when the suite grows, do not trim tests to fit it.
-    timeout-minutes: 50
+    # 75 since the command step's own bound became 50 (below).
+    timeout-minutes: 75
     services:
       postgres:
         image: postgres:18-alpine
@@ -231,8 +232,13 @@ jobs:
       # skips: these are the only run those tests get, and a data race in one
       # of them would otherwise be detected nowhere. The cost is this package
       # compiled and run twice, which is what the split buys back.
+      #
+      # 50m: a retirement now admits its service operations before every step,
+      # and TestRetirementReprovesEachStoppedBoundary drives 39 retirements to a
+      # stopped, journal or archive boundary; on e8af8be (2026-09-15) it had run
+      # 11m58s, at about 20s a case, when the 30m package bound fired.
       - name: Test the command suite against PostgreSQL
-        run: go test -race -count=1 -timeout 30m -vet=off ./cmd/billet/
+        run: go test -race -count=1 -timeout 50m -vet=off ./cmd/billet/
       - name: Test the capacity suite against PostgreSQL
         run: go test -count=1 -timeout 20m ./internal/alloc/
         env:
