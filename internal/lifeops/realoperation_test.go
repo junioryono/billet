@@ -199,12 +199,23 @@ func (h *realOperationHost) property(unit, property string) string {
 
 func (h *realOperationHost) admit(sequence []Operation, protection OperationProtection) error {
 	h.t.Helper()
+	shows, typed := 0, 0
 	i := NewInspector(WithObserver(func(_ context.Context, args []string) {
-		if args[0] != "show" && args[0] != "get-property" && (args[0] != "--json=short" || args[1] != "get-property") {
+		switch {
+		case args[0] == "show":
+			shows++
+		case args[0] == "get-property":
+			typed++
+		case len(args) == 8 && slices.Equal(args[:3], []string{"--json=short", "call", "org.freedesktop.systemd1"}) &&
+			slices.Equal(args[4:], []string{"org.freedesktop.DBus.Properties", "GetAll", "s", ""}):
+			typed++
+		default:
 			h.t.Errorf("admission submitted a job: %v", args)
 		}
 	}))
-	return i.AdmitOperations(h.t.Context(), sequence, protection)
+	err := i.AdmitOperations(h.t.Context(), sequence, protection)
+	h.t.Logf("admission manager invocations: systemctl=%d busctl=%d total=%d", shows, typed, shows+typed)
+	return err
 }
 
 func (h *realOperationHost) logGraph(stage string, protection OperationProtection, ledger string, hasLedger bool) {

@@ -157,6 +157,11 @@ type operationWalk struct {
 // wait) between its admission and its first mutation: a wait ends a step, and admission
 // runs again after it.
 func (i *Inspector) AdmitOperations(ctx context.Context, sequence []Operation, protection OperationProtection) error {
+	// Evidence belongs to this invocation only; concurrent admissions and later
+	// retirement steps never inherit a preceding pass's observations.
+	pass := *i
+	pass.operationPass = newOperationPass(protection.RetainedPathUnits)
+	i = &pass
 	w := operationWalk{inspector: i, protection: protection, declared: protection, units: make(map[string]operationEvidence), targets: make(map[string]bool), paths: make(map[string]operationPathBinding), stopped: make(map[string]bool), standard: make(map[string]bool)}
 	if err := w.admitRetainedInputs(); err != nil {
 		return err
@@ -190,6 +195,10 @@ func (i *Inspector) AdmitOperations(ctx context.Context, sequence []Operation, p
 			w.stopped[op.Unit] = op.Verb == "stop"
 		}
 	}
+	if err := w.revalidatePaths(); err != nil {
+		return err
+	}
+	i.operationPass = newOperationPass(protection.RetainedPathUnits)
 	fresh := make(map[string]operationEvidence, len(w.units))
 	var changes []string
 	for _, unit := range sortedOperationUnits(w.units) {
@@ -230,7 +239,8 @@ func (i *Inspector) AdmitOperations(ctx context.Context, sequence []Operation, p
 	if err := w.revalidatePaths(); err != nil {
 		return err
 	}
-	// This read follows all source/path observations, including ones that wait.
+	// The refreshed per-unit snapshot supplies termination policy too; no
+	// evidence is reused across admission calls.
 	for _, op := range sequence {
 		if op.Verb == "stop" && strings.HasSuffix(op.Unit, ".service") && first(w.units[op.Unit].props, "LoadState") == "loaded" {
 			if err := i.AdmitUnitTermination(ctx, op.Unit); err != nil {

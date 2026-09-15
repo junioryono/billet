@@ -2,6 +2,7 @@ package lifeops
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"slices"
 	"strconv"
@@ -49,6 +50,11 @@ func WithOperationBusctl(path string) Option {
 }
 
 func (i *Inspector) operationExecution(ctx context.Context, unit string, commands bool) (map[string][]string, error) {
+	if i.operationPass != nil {
+		if props, ok := i.operationPass.execution[unit]; ok {
+			return cloneOperationProperties(props), nil
+		}
+	}
 	names := make([]string, 0, len(operationExecutionProperties)+1)
 	for _, property := range operationExecutionProperties {
 		if !slices.ContainsFunc(operationArrayProperties, func(p struct{ name, signature string }) bool { return p.name == property }) {
@@ -68,6 +74,25 @@ func (i *Inspector) operationExecution(ctx context.Context, unit string, command
 	arrays := slices.DeleteFunc(slices.Clone(operationArrayProperties), func(p struct{ name, signature string }) bool {
 		return !commands && strings.HasPrefix(p.name, "Exec")
 	})
+	if i.operationPass != nil && slices.Contains(i.operationPass.retained, unit) {
+		values, err := i.operationPass.typedProperties(ctx, i, unit)
+		if err != nil {
+			return nil, err
+		}
+		for _, property := range arrays {
+			value, ok := values[property.name]
+			var entries []json.RawMessage
+			if !ok || value.Type != property.signature || json.Unmarshal(value.Data, &entries) != nil || string(value.Data) == "null" {
+				return nil, fmt.Errorf("operation-array-unknown: %s %s has no typed array", unit, property.name)
+			}
+			props[property.name] = []string{""}
+			if len(entries) != 0 {
+				props[property.name] = []string{string(value.Data)}
+			}
+		}
+		i.operationPass.execution[unit] = cloneOperationProperties(props)
+		return props, nil
+	}
 	args := []string{"get-property", "org.freedesktop.systemd1", operationObjectPath(unit), operationExecutionInterface(unit)}
 	for _, property := range arrays {
 		args = append(args, property.name)
@@ -104,6 +129,9 @@ func (i *Inspector) operationExecution(ctx context.Context, unit string, command
 			continue
 		}
 		props[property.name] = []string{""}
+	}
+	if i.operationPass != nil {
+		i.operationPass.execution[unit] = cloneOperationProperties(props)
 	}
 	return props, nil
 }

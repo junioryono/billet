@@ -76,48 +76,7 @@ func installRetireOperationEvidence(t *testing.T, f *requestFixture) {
 	setRetireEffect(t, f, "systemd-firstboot.service", "ImportCredential", "firstboot.*")
 	setRetireEffect(t, f, "local-fs.target", "OnFailure", "emergency.target")
 	setRetireEffect(t, f, "local-fs.target", "OnFailureJobMode", "replace-irreversibly")
-	busctl := filepath.Join(root, "busctl")
-	writeFile(t, busctl, `#!/bin/sh
-set -eu
-if [ "$1" = --json=short ]; then
-  [ "$2" = get-property ] || exit 2
-  [ "$4" = /org/freedesktop/systemd1/unit/billet_2dnode_2eservice ] || exit 2
-  exec cat "$BILLET_FAKE_UNITS/billet-node.service.$6.json"
-fi
-[ "$1" = get-property ] || exit 2
-[ "$2" = org.freedesktop.systemd1 ] || exit 2
-[ "$4" = org.freedesktop.systemd1.Service ] || exit 2
-case "$3" in
-  /org/freedesktop/systemd1/unit/helper_2eservice) unit=helper.service ;;
-  /org/freedesktop/systemd1/unit/billet_2dserver_2eservice) unit=billet-server.service ;;
-  /org/freedesktop/systemd1/unit/billet_2dnode_2eservice) unit=billet-node.service ;;
-  /org/freedesktop/systemd1/unit/billet_2dbackup_2eservice) unit=billet-backup.service ;;
-  /org/freedesktop/systemd1/unit/billet_2dupgrade_2eservice) unit=billet-upgrade.service ;;
-  /org/freedesktop/systemd1/unit/billet_2dnetwork_2eservice) unit=billet-network.service ;;
-  /org/freedesktop/systemd1/unit/billet_2ddnsmasq_40br0_2eservice) unit=billet-dnsmasq@br0.service ;;
-  /org/freedesktop/systemd1/unit/billet_2ddnsmasq_40br1_2eservice) unit=billet-dnsmasq@br1.service ;;
-  *) exit 2 ;;
-esac
-shift 4
-for property do
-  case "$property" in
-    StateDirectorySymlink|RuntimeDirectorySymlink|CacheDirectorySymlink|LogsDirectorySymlink) signature='a(sst)' ;;
-    BindPaths|BindReadOnlyPaths) signature='a(ssbt)' ;;
-    MountImages) signature='a(ssba(ss))' ;;
-    ExtensionImages) signature='a(sba(ss))' ;;
-    TemporaryFileSystem) signature='a(ss)' ;;
-    ExecCondition|ExecStartPre|ExecStartPost|ExecStop|ExecStopPost) signature='a(sasbttttuii)' ;;
-    *) exit 2 ;;
-  esac
-  record=$(grep "^$property=" "$BILLET_FAKE_UNITS/$unit.effects") || exit $?
-  value=${record#*=}
-  if [ -z "$value" ]; then
-    printf '%s 0\n' "$signature"
-  else
-    printf '%s 1 %s\n' "$signature" "$value"
-  fi
-done
-`, 0o755)
+	busctl := retireManagerExecutable(t, "busctl")
 	boot := filepath.Join(root, "boot_id")
 	writeFile(t, boot, "01234567-89ab-cdef-0123-456789abcdef\n", 0o644)
 	tmp, varTmp := filepath.Join(root, "tmp"), filepath.Join(root, "var", "tmp")
@@ -144,9 +103,17 @@ func setRetireEffect(t *testing.T, f *requestFixture, unit, key, value string) {
 		data := []string{value}
 		switch key {
 		case "ReadWritePaths", "ReadOnlyPaths", "InaccessiblePaths":
-			data = strings.Fields(value)
+			data = append([]string{}, strings.Fields(value)...)
 		}
-		body, err := json.Marshal(map[string]any{"type": "as", "data": data})
+		typed := map[string]any{"type": "as", "data": data}
+		if signature := retireFakeArraySignature(key); signature != "" {
+			entries := []any{}
+			if len(data) != 0 && data[0] != "" {
+				entries = append(entries, data)
+			}
+			typed = map[string]any{"type": signature, "data": entries}
+		}
+		body, err := json.Marshal(typed)
 		mustOK(t, err)
 		writeFile(t, filepath.Join(f.unitsDir, unit+"."+key+".json"), string(body), 0o600)
 	}
@@ -216,10 +183,16 @@ func TestRetirementReadmitsAfterEachStopWait(t *testing.T) {
 // Each boundary is entered after successful preventive admission. The hooks
 // move observations only; production chooses whether publication may proceed.
 func TestRetirementReprovesEachStoppedBoundary(t *testing.T) {
+	managerCalls := 0
+	t.Cleanup(func() { t.Logf("total fake manager invocations: %d", managerCalls) })
 	for _, boundary := range []string{"status", "journal", "archive"} {
 		for _, drift := range []string{"timer", "controller process", "controller cgroup", "network activity", "network invocation", "network resource", "node invocation", "registration", "registration endpoint", "resource", "timer enablement", "controller job", "backup process"} {
 			t.Run(boundary+"/"+drift, func(t *testing.T) {
 				f := newRequestFixture(t)
+				t.Cleanup(func() {
+					body := mustRead(t, filepath.Join(f.unitsDir, ".manager-calls"))
+					managerCalls += strings.Count(body, "\n")
+				})
 				f.retainANode(t)
 				networkResource := ""
 				if strings.HasPrefix(drift, "network ") {
@@ -230,8 +203,12 @@ func TestRetirementReprovesEachStoppedBoundary(t *testing.T) {
 						f.originalNode.Services = append(f.originalNode.Services, service)
 					}
 					networkResource = t.TempDir()
+					mustOK(t, os.Chmod(networkResource, 0o700))
 					resource, err := observeRetireResource(networkResource)
 					mustOK(t, err)
+					if os.FileMode(resource.Mode).Perm() != 0o700 {
+						t.Fatalf("network resource initial mode: %o", resource.Mode)
+					}
 					resource.GuestNetwork = true
 					f.originalNode.Resources = append(f.originalNode.Resources, resource)
 				}
@@ -367,6 +344,8 @@ func TestRetirementReadmitsChangedDefinitionsOnResume(t *testing.T) {
 }
 
 func TestRetirementRefusesEachOperationAtItsOwnBoundary(t *testing.T) {
+	managerCalls := 0
+	t.Cleanup(func() { t.Logf("total fake manager invocations: %d", managerCalls) })
 	operations := []lifeops.Operation{
 		{Verb: "stop", Unit: upgradeTimerUnit}, {Verb: "disable", Unit: upgradeTimerUnit},
 		{Verb: "stop", Unit: backupTimerUnit}, {Verb: "disable", Unit: backupTimerUnit},
@@ -381,6 +360,10 @@ func TestRetirementRefusesEachOperationAtItsOwnBoundary(t *testing.T) {
 			}
 			t.Run(name, func(t *testing.T) {
 				f := newRequestFixture(t)
+				t.Cleanup(func() {
+					body := mustRead(t, filepath.Join(f.unitsDir, ".manager-calls"))
+					managerCalls += strings.Count(body, "\n")
+				})
 				f.retainANode(t)
 				f.reserve(t)
 				phase := retirement.PhaseIntent
@@ -649,17 +632,7 @@ func installRetireNodeExecution(t *testing.T, f *requestFixture) {
 	mustOK(t, err)
 	savedBinary, savedBus := installedBinary, busctlBinary
 	installedBinary = binary
-	busctlBinary = filepath.Join(t.TempDir(), "busctl")
-	writeFile(t, busctlBinary, `#!/bin/sh
-set -eu
-[ "$1" = --json=short ] || exit 2
-[ "$2" = get-property ] || exit 2
-[ "$3" = org.freedesktop.systemd1 ] || exit 2
-[ "$4" = /org/freedesktop/systemd1/unit/billet_2dnode_2eservice ] || exit 2
-[ "$5" = org.freedesktop.systemd1.Service ] || exit 2
-[ "$6" = ExecStart ] || exit 2
-cat "$BILLET_FAKE_UNITS/node-exec.json"
-`, 0o755)
+	busctlBinary = retireManagerExecutable(t, "busctl-execution")
 	t.Cleanup(func() { installedBinary, busctlBinary = savedBinary, savedBus })
 	setRetireNodeCommand(t, f, []string{binary, "node", "--config", f.cfg}, "")
 	setRetireEffect(t, f, nodeUnit, "Requires", "sysinit.target")

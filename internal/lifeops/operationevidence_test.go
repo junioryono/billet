@@ -24,7 +24,7 @@ func TestOperationRereadRejudgesStateAndUnorderedEdges(t *testing.T) {
 			}
 			reads := 0
 			f.before = func(unit string) {
-				if unit != "billet-backup.service" || !strings.Contains(f.calls[len(f.calls)-1], "--property=FragmentPath") {
+				if unit != "billet-backup.service" || !operationCallRequests(f.calls[len(f.calls)-1], "FragmentPath") {
 					return
 				}
 				reads++

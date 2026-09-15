@@ -108,7 +108,7 @@ func TestRetainedNodePathsReadUnprintedPropertiesAndRereadTheSet(t *testing.T) {
 	delete(node, "Conditions")
 	reads := 0
 	f.before = func(unit string) {
-		if unit == "billet-node.service" && strings.Contains(f.calls[len(f.calls)-1], "show --all ") {
+		if unit == "billet-node.service" && operationCallRequests(f.calls[len(f.calls)-1], "*") {
 			reads++
 			if reads == 2 {
 				node["FutureSystemdPath"] = "/var/lib/billet/server"

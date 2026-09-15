@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-func TestOperationAdmissionReadsCurrentTerminationPolicyLast(t *testing.T) {
+func TestOperationAdmissionRereadsTerminationPolicy(t *testing.T) {
 	for _, mode := range []string{"control-group", "mixed", "process", "none", ""} {
 		t.Run(mode, func(t *testing.T) {
 			f := newOperationFixture(t)
@@ -18,8 +18,25 @@ func TestOperationAdmissionReadsCurrentTerminationPolicyLast(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if !strings.Contains(f.calls[len(f.calls)-1], "--property=KillMode") {
-					t.Fatal("termination policy was read before blocking evidence")
+				reads := 0
+				for _, call := range f.calls {
+					if operationCallRequests(call, "KillMode") {
+						reads++
+					}
+				}
+				if reads != 2 {
+					t.Fatalf("termination policy observations=%d want=2", reads)
+				}
+				f.before = func(unit string) {
+					if unit == "billet-server.service" {
+						reads++
+						if reads == 4 {
+							p["KillMode"] = "process"
+						}
+					}
+				}
+				if err := f.inspector.AdmitOperations(t.Context(), []Operation{{Verb: "stop", Unit: "billet-server.service"}}, OperationProtection{}); err == nil || !strings.Contains(err.Error(), "operation-termination-") {
+					t.Fatalf("changed termination policy admitted: %v", err)
 				}
 			} else if err == nil || !strings.Contains(err.Error(), "operation-termination-") {
 				t.Fatalf("unsupported termination admitted: %v", err)

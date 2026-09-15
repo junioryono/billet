@@ -13,6 +13,9 @@ import (
 // AdmitRetainedUnitPaths rereads the complete loaded property set at stopped
 // and archive boundaries, using the same traversal proof as operation admission.
 func (i *Inspector) AdmitRetainedUnitPaths(ctx context.Context, unit string, archivedRoots ...string) error {
+	pass := *i
+	pass.operationPass = newOperationPass([]string{unit})
+	i = &pass
 	w := operationWalk{inspector: i, paths: make(map[string]operationPathBinding),
 		protection: OperationProtection{RetainedPathUnits: []string{unit}, ArchivedInputRoots: archivedRoots}}
 	if err := w.admitRetainedUnitPaths(ctx); err != nil {
@@ -200,6 +203,18 @@ func (w *operationWalk) admitRetainedNodePath(path string, disposable []string) 
 }
 
 func (i *Inspector) operationPropertyStrings(ctx context.Context, unit, property string) ([]string, error) {
+	if i.operationPass != nil {
+		values, err := i.operationPass.typedProperties(ctx, i, unit)
+		if err != nil {
+			return nil, err
+		}
+		reply, ok := values[property]
+		var value any
+		if !ok || reply.Type == "" || len(reply.Data) == 0 || string(reply.Data) == "null" || json.Unmarshal(reply.Data, &value) != nil {
+			return nil, fmt.Errorf("retained-node-path-unknown: %s %s has no typed value", unit, property)
+		}
+		return operationValueStrings(value), nil
+	}
 	bin := i.operationBusctl
 	if bin == "" {
 		bin = "busctl"

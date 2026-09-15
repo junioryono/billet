@@ -121,6 +121,15 @@ func TestRetirementCommandRecordsAdmissionForEveryStep(t *testing.T) {
 			steps := make(map[string]int)
 			waits := make(map[string]int)
 			publications := make(map[string]int)
+			submitted := 0
+			f.manager.onSubmit = func(command string) {
+				if last != "service-operation" || lastPath != command {
+					t.Fatalf("command submission %s followed %s %s", command, last, lastPath)
+				}
+				submitted++
+				// Consume the boundary: a second command needs its own admission.
+				last, lastPath = "submitted", command
+			}
 			retireMutationEvent = func(event, path string) {
 				switch event {
 				case "admission":
@@ -156,6 +165,13 @@ func TestRetirementCommandRecordsAdmissionForEveryStep(t *testing.T) {
 				out, code = f.request(t, f.input(t, nil))
 			}
 			retiredAnswer(t, out, code)
+			wantSubmitted := 6
+			if retained {
+				wantSubmitted = 9
+			}
+			if submitted != wantSubmitted || steps["service-operation"] != submitted {
+				t.Fatalf("service boundaries=%d submissions=%d want=%d", steps["service-operation"], submitted, wantSubmitted)
+			}
 			for _, event := range []string{"transaction-lock", "global-lock", "identity-lock", "ledger-preparation",
 				"ledger-handback", "identity-handback", "retired-directory", "marker", "journal", "status",
 				"row-intent", "lifecycle-lock", "service-operation", "archive", "directory-flush", "rewrite",

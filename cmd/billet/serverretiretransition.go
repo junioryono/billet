@@ -728,21 +728,34 @@ func retireStop(ctx context.Context, j retirement.Journal) (retirement.Journal, 
 // stopAndDisableForRetirement stops a unit and disables it, so nothing systemd
 // knows about starts it again on this host or at the next boot.
 func stopAndDisableForRetirement(ctx context.Context, c converger, j retirement.Journal, unit string) *retireRefusal {
-	if r := admitRetireOperation(ctx, j, "stop", unit); r != nil {
-		return r
+	manager, ok := c.(interface {
+		StopAndProveAdmitted(context.Context, string, func() error) (lifeops.StopResult, error)
+		DisableAdmitted(context.Context, string, func() error) error
+	})
+	if !ok {
+		return retireUnknown(retireReasonStop, "service manager has no operation submission admission", "")
 	}
-
-	noteRetireMutation("service-operation", "")
-	if _, err := c.StopAndProve(ctx, unit); err != nil {
+	var refusal *retireRefusal
+	admit := func(verb string) func() error {
+		return func() error {
+			refusal = admitRetireOperation(ctx, j, verb, unit)
+			if refusal != nil {
+				return errors.New(refusal.Why)
+			}
+			noteRetireMutation("service-operation", verb+" "+unit)
+			return nil
+		}
+	}
+	if _, err := manager.StopAndProveAdmitted(ctx, unit, admit("stop")); err != nil {
+		if refusal != nil {
+			return refusal
+		}
 		return retireUnknown(retireReasonStop, fmt.Sprintf("stop %s: %v", unit, err), "")
 	}
-
-	if r := admitRetireOperation(ctx, j, "disable", unit); r != nil {
-		return r
-	}
-
-	noteRetireMutation("service-operation", "")
-	if err := c.Disable(ctx, unit); err != nil {
+	if err := manager.DisableAdmitted(ctx, unit, admit("disable")); err != nil {
+		if refusal != nil {
+			return refusal
+		}
 		return retireUnknown(retireReasonStop, fmt.Sprintf("disable %s: %v", unit, err), "")
 	}
 
@@ -1009,7 +1022,7 @@ func retireRestartNode(ctx context.Context, configPath string, j retirement.Jour
 		return j, r
 	}
 
-	noteRetireMutation("service-operation", "")
+	noteRetireMutation("service-operation", "enable "+nodeUnit)
 	if err := c.Enable(ctx, nodeUnit); err != nil {
 		return j, retireUnknown(retireReasonRestart, "enable "+nodeUnit+": "+err.Error(), "")
 	}
@@ -1045,7 +1058,7 @@ func retireRestartNode(ctx context.Context, configPath string, j retirement.Jour
 		return j, r
 	}
 
-	noteRetireMutation("service-operation", "")
+	noteRetireMutation("service-operation", "stop "+nodeUnit)
 	if _, err := c.StopAndProve(ctx, nodeUnit); err != nil {
 		return j, retireUnknown(retireReasonRestart, "stop "+nodeUnit+": "+err.Error(), "")
 	}
@@ -1072,7 +1085,7 @@ func retireRestartNode(ctx context.Context, configPath string, j retirement.Jour
 		return j, r
 	}
 
-	noteRetireMutation("service-operation", "")
+	noteRetireMutation("service-operation", "start "+nodeUnit)
 	if _, err := c.StartAndProve(ctx, nodeUnit); err != nil {
 		return j, retireUnknown(retireReasonRestart, "start "+nodeUnit+": "+err.Error(), "")
 	}

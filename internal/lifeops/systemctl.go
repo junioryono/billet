@@ -137,6 +137,9 @@ func (i *Inspector) bounded(ctx context.Context) (context.Context, context.Cance
 // appear more than once (a unit may carry several ExecStart= lines), and a
 // caller that silently kept the last one would act on half the truth.
 func (i *Inspector) properties(ctx context.Context, unit string, names ...string) (map[string][]string, error) {
+	if i.operationPass != nil {
+		return i.operationPass.properties(ctx, i, unit, names)
+	}
 	args := make([]string, 0, len(names)+3)
 	args = append(args, "show")
 	if len(names) == 0 {
@@ -162,11 +165,14 @@ func (i *Inspector) properties(ctx context.Context, unit string, names ...string
 		return nil, err
 	}
 
+	complete := len(names) == 0 || slices.ContainsFunc(names, func(name string) bool {
+		return slices.Contains(strings.Split(name, ","), "*")
+	})
 	props := make(map[string][]string, len(names))
 	for _, line := range strings.Split(string(out), "\n") {
 		key, value, ok := strings.Cut(line, "=")
 		if !ok {
-			if len(names) == 0 && line != "" {
+			if complete && line != "" {
 				return nil, fmt.Errorf("operation-property-unknown: malformed complete property set for %s", unit)
 			}
 			continue

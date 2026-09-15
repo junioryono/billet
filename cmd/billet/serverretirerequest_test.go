@@ -986,25 +986,7 @@ func installRetireHostManager(t *testing.T, f *requestFixture) {
 		"LoadState=not-found\nActiveState=inactive\nSubState=dead\nResult=success\nKillMode=control-group\nMainPID=0\n"+
 			"InvocationID=\nStateChangeTimestamp=\n", 0o644)
 
-	bin := filepath.Join(t.TempDir(), "systemctl")
-	// THE ANSWER IS READ ONCE AND RECORDED WITH WHAT IT SAID: a test that must
-	// know the transition saw a particular state needs the fake's own account
-	// of what it answered, and one that reads the unit file twice could answer
-	// from one revision and record another.
-	writeFile(t, bin, "#!/bin/sh\nunit=\"\"\nnames=\"\"\nfor a in \"$@\"; do case \"$a\" in --property=*) "+
-		"names=\"$names ${a#--property=}\";; --all) names=ALL;; --|show) ;; *) unit=$a;; esac; done\n"+
-		"body=$(cat \"$BILLET_FAKE_UNITS/$unit\") || exit $?\n"+
-		"effects=$(cat \"$BILLET_FAKE_UNITS/$unit.effects\") || exit $?\n"+
-		"if [ \"$names\" = ALL ]; then printf '%s\\n%s\\n' \"$body\" \"$effects\"; exit 0; fi\n"+
-		"absent=$(printf '%s\\n' \"$body\" | grep '^LoadState=not-found$' || true)\n"+
-		"out=$(for n in $names; do if [ -n \"$absent\" ]; then case \"$n\" in FragmentPath|SourcePath|DropInPaths|UnitFileState) "+
-		"printf '%s=\\n' \"$n\"; continue;; esac; fi; "+
-		"printf '%s\\n%s\\n' \"$body\" \"$effects\" | grep \"^$n=\"; rc=$?; "+
-		"if [ \"$rc\" -gt 1 ]; then exit \"$rc\"; fi; done; exit 0) || exit $?\n"+
-		"printf '%s\\n' \"$out\"\n"+
-		"state=$(printf '%s\\n' \"$out\" | grep '^ActiveState=' || true)\n"+
-		"echo \"$unit $state\" >> \"$BILLET_FAKE_UNITS/.asked\"\n"+
-		"case \" $names \" in *' ExecMainStatus '*) echo \"$unit\" >> \"$BILLET_FAKE_UNITS/.backup-observed\";; esac\nexit 0\n", 0o755)
+	bin := retireManagerExecutable(t, "systemctl")
 	t.Setenv("BILLET_FAKE_UNITS", f.unitsDir)
 
 	savedSystemctl := systemctlBinary

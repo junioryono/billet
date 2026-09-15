@@ -22,9 +22,13 @@ type retireServiceManager struct {
 	operations []string
 	onEnable   func(string)
 	onDisable  func(string)
+	onSubmit   func(string)
 }
 
 func (s *retireServiceManager) Enable(ctx context.Context, unit string) error {
+	if s.onSubmit != nil {
+		s.onSubmit("enable " + unit)
+	}
 	s.operations = append(s.operations, "enable "+unit)
 	err := s.fakeConverger.Enable(ctx, unit)
 	if err == nil {
@@ -47,6 +51,9 @@ func (s *retireServiceManager) EnabledNow(ctx context.Context, unit string) (lif
 }
 
 func (s *retireServiceManager) StopAndProve(ctx context.Context, unit string) (lifeops.StopResult, error) {
+	if s.onSubmit != nil {
+		s.onSubmit("stop " + unit)
+	}
 	s.operations = append(s.operations, "stop "+unit)
 	s.set(unit, "ActiveState", "inactive")
 	s.set(unit, "SubState", "dead")
@@ -57,6 +64,9 @@ func (s *retireServiceManager) StopAndProve(ctx context.Context, unit string) (l
 }
 
 func (s *retireServiceManager) StartAndProve(ctx context.Context, unit string) (string, error) {
+	if s.onSubmit != nil {
+		s.onSubmit("start " + unit)
+	}
 	s.operations = append(s.operations, "start "+unit)
 	s.set(unit, "ActiveState", "active")
 	s.set(unit, "SubState", "running")
@@ -66,6 +76,9 @@ func (s *retireServiceManager) StartAndProve(ctx context.Context, unit string) (
 }
 
 func (s *retireServiceManager) Disable(ctx context.Context, unit string) error {
+	if s.onSubmit != nil {
+		s.onSubmit("disable " + unit)
+	}
 	s.operations = append(s.operations, "disable "+unit)
 	err := s.fakeConverger.Disable(ctx, unit)
 	if err == nil {
@@ -76,6 +89,45 @@ func (s *retireServiceManager) Disable(ctx context.Context, unit string) error {
 	}
 
 	return err
+}
+
+// The retirement helper tests use the production timer observation and actual
+// command submission. Only the manager's returned state and completion hooks
+// are faked, so a query hidden inside a helper remains observable.
+func (s *retireServiceManager) admittedConverger() *lifeops.Converger {
+	return lifeops.NewConverger(lifeops.NewInspector(lifeops.WithSystemctl(systemctlBinary),
+		lifeops.WithObserver(func(_ context.Context, args []string) {
+			if args[0] == "show" {
+				noteRetireMutation("wait", "manager observation")
+				return
+			}
+			command := args[0] + " " + args[len(args)-1]
+			if s.onSubmit != nil {
+				s.onSubmit(command)
+			}
+			s.operations = append(s.operations, command)
+		})))
+}
+
+func (s *retireServiceManager) StopAndProveAdmitted(ctx context.Context, unit string, admit func() error) (lifeops.StopResult, error) {
+	result, err := s.admittedConverger().StopAndProveAdmitted(ctx, unit, admit)
+	if err != nil {
+		return result, err
+	}
+	return s.fakeConverger.StopAndProve(ctx, unit)
+}
+
+func (s *retireServiceManager) DisableAdmitted(ctx context.Context, unit string, admit func() error) error {
+	if err := s.admittedConverger().DisableAdmitted(ctx, unit, admit); err != nil {
+		return err
+	}
+	if err := s.fakeConverger.Disable(ctx, unit); err != nil {
+		return err
+	}
+	if s.onDisable != nil {
+		s.onDisable(unit)
+	}
+	return nil
 }
 
 func (s *retireServiceManager) set(unit, key, value string) {

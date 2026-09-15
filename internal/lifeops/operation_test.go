@@ -27,6 +27,46 @@ func newOperationFixture(t *testing.T) *operationFixture {
 	f := &operationFixture{units: make(map[string]map[string]string), root: t.TempDir()}
 	f.inspector = NewInspector(WithOperationUnitDirectories(f.root), withRunner(func(_ context.Context, _ string, args []string) ([]byte, error) {
 		f.calls = append(f.calls, strings.Join(args, " "))
+		if args[0] == "--json=short" && args[1] == "call" {
+			if len(args) != 8 || args[4] != "org.freedesktop.DBus.Properties" || args[5] != "GetAll" || args[6] != "s" || args[7] != "" {
+				return nil, fmt.Errorf("unsupported typed inventory request: %v", args)
+			}
+			for unit, props := range f.units {
+				if operationObjectPath(unit) != args[3] {
+					continue
+				}
+				values := make(map[string]any)
+				for name, value := range props {
+					if name == "Conditions" && f.pathReply != nil {
+						body, err := f.pathReply(args[3], name)
+						if err != nil {
+							return nil, err
+						}
+						var reply any
+						if err := json.Unmarshal(body, &reply); err != nil {
+							return nil, err
+						}
+						values[name] = reply
+						continue
+					}
+					if signature := fixtureOperationSignature(name); signature != "" {
+						data := []any{}
+						if value != "" {
+							data = append(data, []string{value})
+						}
+						values[name] = map[string]any{"type": signature, "data": data}
+						continue
+					}
+					data := []string{value}
+					if slices.Contains([]string{"ReadWritePaths", "ReadOnlyPaths", "InaccessiblePaths"}, name) {
+						data = strings.Fields(value)
+					}
+					values[name] = map[string]any{"type": "as", "data": data}
+				}
+				return json.Marshal(map[string]any{"type": "a{sv}", "data": []any{values}})
+			}
+			return nil, fmt.Errorf("fixture has no object %s", args[3])
+		}
 		if args[0] == "--json=short" && args[1] == "get-property" {
 			if f.pathReply != nil && args[5] == "Conditions" {
 				return f.pathReply(args[3], args[5])
@@ -89,17 +129,15 @@ func newOperationFixture(t *testing.T) *operationFixture {
 			return nil, fmt.Errorf("fixture has no evidence for %s", unit)
 		}
 		var out strings.Builder
-		if slices.Contains(args, "--all") {
-			for name, value := range props {
-				fmt.Fprintf(&out, "%s=%s\n", name, value)
-			}
-			return []byte(out.String()), nil
-		}
+		var requested []string
 		for _, arg := range args {
-			if name, ok := strings.CutPrefix(arg, "--property="); ok {
-				if value, present := props[name]; present {
-					fmt.Fprintf(&out, "%s=%s\n", name, value)
-				}
+			if names, ok := strings.CutPrefix(arg, "--property="); ok {
+				requested = append(requested, strings.Split(names, ",")...)
+			}
+		}
+		for name, value := range props {
+			if slices.Contains(args, "--all") || slices.Contains(requested, "*") || slices.Contains(requested, name) {
+				fmt.Fprintf(&out, "%s=%s\n", name, value)
 			}
 		}
 		return []byte(out.String()), nil
@@ -260,7 +298,7 @@ func TestOperationAdmissionSeparatesInstallationFromRuntimeProperties(t *testing
 					t.Fatalf("installation effect admitted: %v", err)
 				}
 				for _, call := range f.calls {
-					if strings.Contains(call, "--property=Also") {
+					if operationCallRequests(call, "Also") {
 						t.Fatal("asked for a property systemd 255 does not expose")
 					}
 				}
@@ -312,7 +350,7 @@ func TestOperationAdmissionRefusesUnreadableDriftingAndOutsideEvidence(t *testin
 				reads := 0
 				f.before = func(_ string) {
 					reads++
-					if reads == 3 {
+					if reads == 2 {
 						if err := os.WriteFile(p["FragmentPath"], []byte("[Unit]\nDescription=changed\n"), 0o644); err != nil {
 							t.Fatal(err)
 						}
@@ -358,7 +396,7 @@ func TestOperationAdmissionRefusesInstallationLinks(t *testing.T) {
 			t.Fatalf("clean installation rejected: %v", err)
 		}
 	}
-	if !slices.ContainsFunc(f.calls, func(call string) bool { return strings.Contains(call, "--property=FragmentPath") }) {
+	if !slices.ContainsFunc(f.calls, func(call string) bool { return operationCallRequests(call, "FragmentPath") }) {
 		t.Fatal("installation never queried the effective source")
 	}
 }
@@ -558,7 +596,7 @@ func TestOperationAdmissionResolvesProtectedAliasesAndRevalidates(t *testing.T) 
 	reads := 0
 	f.before = func(_ string) {
 		reads++
-		if reads == 3 {
+		if reads == 2 {
 			if err := os.Remove(alias); err != nil {
 				t.Fatal(err)
 			}
@@ -910,7 +948,7 @@ func TestOperationAdmissionKeepsSeparateVarAnActiveLeaf(t *testing.T) {
 				t.Fatalf("separate /var on /dev/vdb1: %v", err)
 			}
 			for _, call := range f.calls {
-				if strings.HasSuffix(call, " var.mount") && strings.Contains(call, "--property=Requires") {
+				if strings.HasSuffix(call, " var.mount") && operationCallRequests(call, "Requires") {
 					t.Fatalf("traversed ancestor mount graph: %s", call)
 				}
 			}
@@ -967,4 +1005,13 @@ func TestOperationAdmissionBindsMountEdgesToTheirSource(t *testing.T) {
 	if err := f.inspector.AdmitOperations(t.Context(), []Operation{{Verb: "disable", Unit: "billet-server.service"}}, protection); err == nil || !strings.Contains(err.Error(), "operation-edge-outside-set: ledger.mount After=swap.target") {
 		t.Fatalf("tmpfs rule applied to block mount: %v", err)
 	}
+}
+
+func operationCallRequests(call, property string) bool {
+	for _, arg := range strings.Fields(call) {
+		if names, ok := strings.CutPrefix(arg, "--property="); ok && slices.Contains(strings.Split(names, ","), property) {
+			return true
+		}
+	}
+	return false
 }
