@@ -24,6 +24,59 @@ const retireReasonStopped = "stopped-obligations"
 // The inspector seam supplies observations, never an admission verdict.
 var retireOperationInspector = endpointInspector
 
+// Preparation has no journal yet. Derive the same protected paths and roles
+// from the installed request configuration without creating invocation evidence.
+func admitRetirePreparation(ctx context.Context, cfg *config.Config, archive string) *retireRefusal {
+	if archive == "" {
+		archive = retirement.RetiredDir()
+	}
+	j := retirement.Journal{Phase: retirement.PhaseIntent, Variant: retirement.VariantServerOnly,
+		IdentityDir: cfg.Server.IdentityDir, Archive: archive}
+	p := retireOperationProtection(j)
+	services, paths, err := retireRequiredServices(cfg)
+	if err != nil {
+		return retireUnknown(retireReasonEffects, err.Error(), "")
+	}
+	p.Units = append(p.Units, services...)
+	p.RequiredActive = append(p.RequiredActive, services...)
+	p.Paths = append(p.Paths, paths...)
+	if cfg.Node != nil {
+		p.UnitPaths[nodeUnit] = []string{filepath.Dir(registrationRecordPath)}
+		for _, path := range nodePathsOf(cfg) {
+			p.UnitPaths[nodeUnit] = append(p.UnitPaths[nodeUnit], path.path)
+		}
+	}
+	if err := retireOperationInspector().AdmitOperations(ctx, nil, p); err != nil {
+		return retireUnknown(retireReasonEffects, err.Error(), "")
+	}
+	return nil
+}
+
+// Taking the request's locks may create files. A journal past the archive must
+// supply protection before that acquisition, without requiring the old config.
+func admitRetireRequestPreparation(ctx context.Context, m retireMode) *retireRefusal {
+	j, fact, r := readRetireJournal()
+	if r != nil {
+		return r
+	}
+	if fact != retirement.JournalFactAbsent {
+		if j.Phase == retirement.PhaseDone {
+			if _, r := observeRetirePostconditions(ctx, m, j); r != nil {
+				return r
+			}
+		}
+		if err := retireOperationInspector().AdmitOperations(ctx, nil, retireOperationProtection(j)); err != nil {
+			return retireUnknown(retireReasonEffects, err.Error(), "")
+		}
+		return nil
+	}
+	obs, r := observeRetireConfig(m.configPath)
+	if r != nil {
+		return r
+	}
+	return admitRetirePreparation(ctx, obs.cfg, "")
+}
+
 func retireServiceSequence(j retirement.Journal, d retirement.Decision) []lifeops.Operation {
 	var sequence []lifeops.Operation
 	for _, action := range retirement.RemainingServiceActions(j.Variant, j.Phase, d) {

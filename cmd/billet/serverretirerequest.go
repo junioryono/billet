@@ -147,6 +147,9 @@ func retireRequestUnder(ctx context.Context, m retireMode) (any, *retireRefusal)
 		return retireRequestReport(ctx, m, in, obs)
 	}
 
+	if r := admitRetireRequestPreparation(ctx, m); r != nil {
+		return nil, r
+	}
 	root, dir, shape, r := retireGuard(m.run)
 	if r != nil {
 		return nil, unexaminedRetireState(r)
@@ -214,6 +217,9 @@ func retireRequestUnder(ctx context.Context, m retireMode) (any, *retireRefusal)
 		access = withRetiringIdentityAccess
 	}
 
+	if r := admitRetireRequestPreparation(ctx, m); r != nil {
+		return nil, r
+	}
 	out, r := access(ctx, cfg.Server.IdentityDir, func() (any, *retireRefusal) {
 		identity, r := retireIdentity(cfg.Server.IdentityDir)
 		if r != nil {
@@ -229,6 +235,9 @@ func retireRequestUnder(ctx context.Context, m retireMode) (any, *retireRefusal)
 				"host's identity is %s", j.Phase, j.Deployment, identity), "the runbook in docs/operating/upgrades.md")
 		}
 
+		if r := admitRetireRequestPreparation(ctx, m); r != nil {
+			return nil, r
+		}
 		db, r := retireOpenLedgerFor(ctx, cfg, m.environmentFile, m.dryRun)
 		if r != nil {
 			return nil, r
@@ -1556,7 +1565,7 @@ func judgeHostPreconditions(ctx context.Context, m retireMode, cfg *config.Confi
 	destination := retirement.RetiredDir()
 
 	if !m.dryRun {
-		if r := proveRetireActivation(ctx, true); r != nil {
+		if r := admitRetirePreparation(ctx, cfg, plan.archive); r != nil {
 			return r
 		}
 		if err := retirement.EnsureRetiredDir(); err != nil {
@@ -1764,7 +1773,7 @@ func applyRetireIntent(ctx context.Context, m retireMode, root *txLock, dir *os.
 	}
 
 	if plan.variant == retirement.VariantRetainedNode {
-		if r := proveRetireActivation(ctx, true); r != nil {
+		if r := admitRetireOperations(ctx, j, retireServiceSequence(j, retirement.Decision{Action: retirement.ActionStop})); r != nil {
 			return nil, r
 		}
 		if err := retirement.WriteStage(plan.rendering); err != nil {
@@ -1788,6 +1797,9 @@ func applyRetireIntent(ctx context.Context, m retireMode, root *txLock, dir *os.
 		return nil, retireUnknown(retireReasonLedger, "advance the row to intent: "+err.Error(), "")
 	}
 
+	if r := admitRetireOperations(ctx, j, retireServiceSequence(j, retirement.Decision{Action: retirement.ActionStop})); r != nil {
+		return nil, r
+	}
 	if err := retirement.WriteStatus(retirement.PhaseIntent, plan.variant, now); err != nil {
 		return nil, retireUnknown(retireReasonStatus, "publish the status: "+err.Error(), "")
 	}

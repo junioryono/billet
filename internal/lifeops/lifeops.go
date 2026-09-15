@@ -289,6 +289,8 @@ type Inspector struct {
 	operationUnitDirs   []string
 	operationBusctl     string
 	operationCgroupRoot string
+	operationBootIDPath string
+	operationTempRoots  []string
 	// waitDelay is the grace execRunner gives a cancelled run; see
 	// WithWaitDelay.
 	waitDelay time.Duration

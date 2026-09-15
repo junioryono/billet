@@ -71,13 +71,14 @@ var operationExecutionProperties = []string{
 	"RuntimeDirectoryPreserve", "RootDirectory", "RootImage", "BindPaths", "BindReadOnlyPaths",
 	"TemporaryFileSystem", "MountImages", "ExtensionImages", "ExtensionDirectories", "DynamicUser",
 	"StandardInput", "StandardOutput", "StandardError", "PAMName", "LogNamespace",
-	"NetworkNamespacePath", "IPCNamespacePath", "UtmpIdentifier",
+	"NetworkNamespacePath", "IPCNamespacePath", "UtmpIdentifier", "PrivateTmp",
 	"ExecCondition", "ExecStartPre", "ExecStartPost", "ExecStop", "ExecStopPost",
 }
 
 type operationEvidence struct {
-	props   map[string][]string
-	sources []operationSource
+	props        map[string][]string
+	sources      []operationSource
+	privateTrees []string
 }
 
 type operationWalk struct {
@@ -97,10 +98,18 @@ type operationWalk struct {
 // Stop propagation admits only the ledger's What-derived device stopping that
 // mount (and its inverse); retirement never stops a device.
 // Standard dependencies end traversal and admit only no-op effects. Billet
-// units retain directory (including implicit credential teardown), termination,
+// units retain directory (including credential and private-tmp teardown), termination,
 // manager-action, stdio and setup checks; callers check node/server execution.
 // An unrelated filesystem watcher is outside the manager-effects boundary,
-// like cron or inotify. Direct triggers of protected services are checked.
+// like cron or inotify. Standard units are trusted as the operating system
+// ships them: their own relationships, drop-ins and .wants/ links are its init
+// graph, outside admission. Root additions there (including cycles beneath
+// sysinit.target) have the same status as an unrelated watcher. Every edge
+// between a protected role and a standard unit must still be listed, and a
+// standard unit which an operation would start must already be active.
+// Protected roles have distinct canonical Ids; no role's Names may include
+// another role. Benign extra aliases of one role remain supported.
+// Direct triggers of protected services are checked.
 // Evidence is reread, and admission grants no future authority.
 func (i *Inspector) AdmitOperations(ctx context.Context, sequence []Operation, protection OperationProtection) error {
 	w := operationWalk{inspector: i, protection: protection, units: make(map[string]operationEvidence), targets: make(map[string]bool), paths: make(map[string]operationPathBinding), stopped: make(map[string]bool), standard: make(map[string]bool)}
@@ -246,14 +255,21 @@ func (w *operationWalk) read(ctx context.Context, unit string) (operationEvidenc
 			props[key] = value
 		}
 	}
+	var privateTrees []string
+	if strings.HasSuffix(unit, ".service") {
+		privateTrees, err = w.inspector.operationPrivateTmp(first(props, "Id"), first(props, "PrivateTmp"))
+		if err != nil {
+			return operationEvidence{}, err
+		}
+	}
 	if !scoped || first(props, "FragmentPath") == "" {
-		return operationEvidence{props: props}, nil
+		return operationEvidence{props: props, privateTrees: privateTrees}, nil
 	}
 	sources, err := readOperationSources(props)
 	if err != nil {
 		return operationEvidence{}, fmt.Errorf("operation-source-unreadable: %s: %w", unit, err)
 	}
-	return operationEvidence{props: props, sources: sources}, nil
+	return operationEvidence{props: props, sources: sources, privateTrees: privateTrees}, nil
 }
 
 func requireOperationProperties(unit string, props map[string][]string, names []string) error {
@@ -538,10 +554,24 @@ func (w *operationWalk) admitDirectories(effect Operation, ev operationEvidence)
 		}
 	}
 	check := func(path, directive string) error {
-		for _, keep := range protected {
+		keepPaths := protected
+		if directive == "PrivateTmp" {
+			keepPaths = slices.Clone(protected)
+			for _, paths := range w.protection.UnitPaths {
+				keepPaths = append(keepPaths, paths...)
+			}
+		}
+		for _, keep := range keepPaths {
 			overlap, err := w.pathsOverlap(path, keep)
 			if err != nil {
 				return err
+			}
+			if directive == "PrivateTmp" {
+				// Removing a link inside the tree also breaks a retained path
+				// whose final target resolves outside that tree.
+				for _, object := range w.paths[keep].Objects {
+					overlap = overlap || Contained(w.paths[path].Resolved, object.Path)
+				}
 			}
 			if overlap {
 				return fmt.Errorf("operation-directory-overlap: %s %s=%s affects %s", effect.Unit, directive, path, keep)
@@ -557,6 +587,11 @@ func (w *operationWalk) admitDirectories(effect Operation, ev operationEvidence)
 	// https://github.com/systemd/systemd/blob/v255/src/core/service.c#L1845
 	// https://github.com/systemd/systemd/blob/v255/src/core/exec-credential.c#L132
 	if effect.Verb == "stop" && strings.HasSuffix(effect.Unit, ".service") {
+		for _, tree := range ev.privateTrees {
+			if err := check(tree, "PrivateTmp"); err != nil {
+				return err
+			}
+		}
 		if err := check(filepath.Join("/run/credentials", first(ev.props, "Id")), "CredentialDirectory"); err != nil {
 			return err
 		}

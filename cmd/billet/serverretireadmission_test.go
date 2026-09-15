@@ -45,7 +45,7 @@ func installRetireOperationEvidence(t *testing.T, f *requestFixture) {
 		properties := map[string]string{
 			"Id": unit, "Names": unit, "FragmentPath": source, "SourcePath": "", "DropInPaths": "",
 			"StandardInput": "null", "StandardOutput": "journal", "StandardError": "inherit",
-			"Transient": "no", "NeedDaemonReload": "no", "OnSuccessJobMode": "fail", "OnFailureJobMode": "replace",
+			"PrivateTmp": "no", "Transient": "no", "NeedDaemonReload": "no", "OnSuccessJobMode": "fail", "OnFailureJobMode": "replace",
 			"FailureAction": "none", "SuccessAction": "none", "StartLimitAction": "none", "JobTimeoutAction": "none",
 			"RequiresMountsFor": "", "Job": "", "ControlPID": "0", "ControlGroup": "", "Slice": "system.slice", "StopWhenUnneeded": "no",
 		}
@@ -933,6 +933,7 @@ func TestRetirementAllowsBackupHandlingButNotStoppedProofOnResume(t *testing.T) 
 	f.reserve(t)
 	j := f.plantJournal(t, retirement.PhaseStopped, retirement.VariantServerOnly)
 	f.manager.set(backupServiceUnit, "LoadState", "loaded")
+	f.manager.set(backupServiceUnit, "UnitFileState", "static")
 	f.manager.set(backupServiceUnit, "ActiveState", "activating")
 	f.manager.set(backupServiceUnit, "SubState", "start")
 	f.manager.set(backupServiceUnit, "MainPID", "99")
@@ -999,6 +1000,7 @@ func TestRetirementRefusesCompletionOfBackupStartedAfterFactSnapshot(t *testing.
 	f.reserve(t)
 	j := f.plantJournal(t, retirement.PhaseIntent, retirement.VariantRetainedNode)
 	f.manager.set(backupServiceUnit, "LoadState", "loaded")
+	f.manager.set(backupServiceUnit, "UnitFileState", "static")
 	f.manager.set(backupServiceUnit, "ActiveState", "inactive")
 	f.manager.set(backupServiceUnit, "MainPID", "0")
 	setRetireEffect(t, f, backupServiceUnit, "OnSuccess", serverUnit)

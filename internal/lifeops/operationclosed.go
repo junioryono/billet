@@ -82,6 +82,9 @@ var operationInverseRelations = map[string]string{
 func (w *operationWalk) admitClosedSet(ctx context.Context) error {
 	own := slices.Clone(w.protection.Units)
 	own = append(own, w.protection.QuietUnits...)
+	own = append(own, w.protection.WaitingUnits...)
+	own = append(own, w.protection.RequiredActive...)
+	roles := slices.Clone(own)
 	for unit := range w.targets {
 		own = append(own, unit)
 	}
@@ -118,6 +121,14 @@ func (w *operationWalk) admitClosedSet(ctx context.Context) error {
 				}
 			}
 		}
+	}
+	// Resolve every role before populating aliases: a Names entry must never
+	// replace another role's evidence before its identity has been compared.
+	if err := w.admitRoleIdentities(roles, own); err != nil {
+		return err
+	}
+	for _, unit := range own {
+		ev := w.units[unit]
 		for _, alias := range strings.Fields(first(ev.props, "Names")) {
 			if !operationUnitName(alias) {
 				return fmt.Errorf("operation-names-unknown: %s", unit)
@@ -175,6 +186,40 @@ func (w *operationWalk) admitClosedSet(ctx context.Context) error {
 				if err := w.admitDirectories(Operation{Verb: "stop", Unit: unit}, ev); err != nil {
 					return err
 				}
+			}
+		}
+	}
+	return nil
+}
+
+func (w *operationWalk) admitRoleIdentities(roles, own []string) error {
+	for _, unit := range own {
+		// An operation may use an extra alias of a declared role. A protected
+		// role name itself is never such an extra alias.
+		role := strings.HasSuffix(unit, ".mount") || strings.Contains(unit, "-dnsmasq@")
+		for _, suffix := range []string{"-server.service", "-node.service", "-backup.service", "-upgrade.service", "-network.service", "-backup.timer", "-upgrade.timer"} {
+			role = role || strings.HasSuffix(unit, suffix)
+		}
+		if role {
+			roles = append(roles, unit)
+		}
+	}
+	slices.Sort(roles)
+	roles = slices.Compact(roles)
+	owners := make(map[string]string)
+	for _, unit := range roles {
+		ev := w.units[unit]
+		canonical := first(ev.props, "Id")
+		if !operationUnitName(canonical) {
+			return fmt.Errorf("operation-names-unknown: %s has no canonical identity", unit)
+		}
+		if owner, exists := owners[canonical]; exists && owner != unit {
+			return fmt.Errorf("operation-role-collision: %s and %s resolve to %s", owner, unit, canonical)
+		}
+		owners[canonical] = unit
+		for _, alias := range strings.Fields(first(ev.props, "Names")) {
+			if alias != unit && slices.Contains(roles, alias) {
+				return fmt.Errorf("operation-role-collision: %s Names includes protected role %s", unit, alias)
 			}
 		}
 	}

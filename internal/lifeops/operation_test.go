@@ -117,7 +117,7 @@ func (f *operationFixture) unit(t *testing.T, name string) map[string]string {
 		"OnSuccessJobMode": "fail", "OnFailureJobMode": "replace", "FailureAction": "none", "SuccessAction": "none",
 		"StartLimitAction": "none", "JobTimeoutAction": "none", "RequiresMountsFor": "", "Where": "/ledger", "What": "/dev/vdb1", "Type": "ext4",
 		"StandardInput": "null", "StandardOutput": "journal", "StandardError": "inherit",
-		"Transient": "no", "Job": "", "KillMode": "control-group", "DynamicUser": "no", "RuntimeDirectoryPreserve": "no", "StopWhenUnneeded": "no",
+		"PrivateTmp": "no", "Transient": "no", "Job": "", "KillMode": "control-group", "DynamicUser": "no", "RuntimeDirectoryPreserve": "no", "StopWhenUnneeded": "no",
 	}
 	// Independent of the production query lists, so deleting a queried property
 	// cannot delete that evidence from the fixture at the same time.
