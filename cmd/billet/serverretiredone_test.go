@@ -58,7 +58,7 @@ func takeOverTheGuard(t *testing.T, f *requestFixture, holder, from string) {
 
 // retiredUnits is what a completed server-only retirement leaves systemd
 // holding: both services and both timers stopped and disabled, the backup
-// service with no process.
+// service static with no process, as measured on the reference controller.
 func retiredUnits(t *testing.T, f *requestFixture) {
 	t.Helper()
 
@@ -68,8 +68,8 @@ func retiredUnits(t *testing.T, f *requestFixture) {
 			"ExecMainStartTimestamp=\n", 0o644)
 	}
 
-	writeFile(t, filepath.Join(f.unitsDir, backupServiceUnit), "LoadState=not-found\nActiveState=inactive\n"+
-		"SubState=dead\nResult=success\nKillMode=control-group\nMainPID=0\nUnitFileState=\nInvocationID=\n"+
+	writeFile(t, filepath.Join(f.unitsDir, backupServiceUnit), "LoadState=loaded\nActiveState=inactive\n"+
+		"SubState=dead\nResult=success\nKillMode=control-group\nMainPID=0\nUnitFileState=static\nInvocationID=\n"+
 		"StateChangeTimestamp=\n", 0o644)
 }
 
@@ -83,6 +83,10 @@ func TestASettledRetirementIsUnchangedAndTakesNothing(t *testing.T) {
 
 	settleRetirement(t, f)
 	retiredUnits(t, f)
+
+	// The committed caller fixture describes a host without the backup unit.
+	writeFile(t, filepath.Join(f.unitsDir, backupServiceUnit),
+		"LoadState=not-found\nActiveState=inactive\nMainPID=0\nUnitFileState=\n", 0o644)
 
 	// A FRESH CONVERGE UNDER A NEW HOLDER: the marker is gone, so nothing ties
 	// this journal to the run that wrote it, and a settled journal is read by
@@ -125,6 +129,139 @@ func TestASettledRetirementIsUnchangedAndTakesNothing(t *testing.T) {
 		if _, present := m[member]; present {
 			t.Fatalf("the settled answer carried the tail's %s: %s", member, out)
 		}
+	}
+}
+
+// The full done pass must admit the measured backup state and still name
+// each unsafe change, including one to the timer the exception depends on.
+func TestAStaticBackupIsQuietOnlyBehindAQuietTimer(t *testing.T) {
+	cases := map[string]struct {
+		unit       string
+		enablement string
+		active     string
+		pid        string
+		why        string
+	}{
+		"backup static with disabled timer": {unit: backupServiceUnit, enablement: "static"},
+		"backup static with masked timer":   {unit: backupTimerUnit, enablement: "masked"},
+		"backup static with enabled timer": {
+			unit: backupTimerUnit, enablement: "enabled",
+			why: backupTimerUnit + " is enabled, and a completed retirement leaves it disabled or masked",
+		},
+		"server static": {
+			unit: serverUnit, enablement: "static",
+			why: serverUnit + " is static, and a completed retirement leaves it disabled or masked",
+		},
+		"node static": {
+			unit: nodeUnit, enablement: "static",
+			why: nodeUnit + " is static, and a completed retirement leaves it disabled or masked",
+		},
+		"upgrade timer static": {
+			unit: upgradeTimerUnit, enablement: "static",
+			why: upgradeTimerUnit + " is static, and a completed retirement leaves it disabled or masked",
+		},
+		"backup timer static": {
+			unit: backupTimerUnit, enablement: "static",
+			why: backupTimerUnit + " is static, and a completed retirement leaves it disabled or masked",
+		},
+		"backup static but active": {
+			unit: backupServiceUnit, enablement: "static", active: "active",
+			why: backupServiceUnit + " is active and a completed retirement leaves it inactive",
+		},
+		"backup static with a main process": {
+			unit: backupServiceUnit, enablement: "static", pid: "91",
+			why: backupServiceUnit + " is inactive and still has the main process 91",
+		},
+		"backup masked only at runtime": {
+			unit: backupServiceUnit, enablement: "masked-runtime",
+			why: backupServiceUnit + " is masked-runtime, and a completed retirement leaves it disabled or masked",
+		},
+		"backup timer masked only at runtime": {
+			unit: backupTimerUnit, enablement: "masked-runtime",
+			why: backupTimerUnit + " is masked-runtime, and a completed retirement leaves it disabled or masked",
+		},
+	}
+
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newRequestFixture(t)
+			f.reserve(t)
+			settleRetirement(t, f)
+			retiredUnits(t, f)
+
+			// Every refusal starts from a proved static backup, so reverting
+			// the exception fails the baseline rather than passing by refusing
+			// an unrelated unit before reaching the case's own observation.
+			out, code := retiredRequest(t, f, requestRun)
+			m := retireAnswer(t, out)
+			if code != 0 || m["outcome"] != retireOutcomeUnchanged ||
+				asMap(m["postconditions"])["backup_service"] != retireUnitQuiet {
+				t.Fatalf("the static backup did not pass before the drift: %s", out)
+			}
+
+			active, pid := c.active, c.pid
+			if active == "" {
+				active = "inactive"
+			}
+
+			if pid == "" {
+				pid = "0"
+			}
+
+			writeFile(t, filepath.Join(f.unitsDir, c.unit), "LoadState=loaded\nActiveState="+active+
+				"\nMainPID="+pid+"\nUnitFileState="+c.enablement+"\n", 0o644)
+
+			out, code = retiredRequest(t, f, requestRun)
+			m = retireAnswer(t, out)
+			if c.why == "" {
+				held := asMap(m["postconditions"])
+				if code != 0 || m["outcome"] != retireOutcomeUnchanged ||
+					held["backup_service"] != retireUnitQuiet || held["backup_timer"] != retireUnitQuiet {
+					t.Fatalf("the static backup behind a quiet timer: %s", out)
+				}
+
+				return
+			}
+
+			if code != exitRefused || m["reason"] != retireReasonPostcondition || whyOf(m) != c.why ||
+				m["state"] != string(retirement.PhaseDone) {
+				t.Fatalf("the drift did not produce its own refusal: %s", out)
+			}
+
+			// These units currently precede the backup timer in the pass.
+			// Even after its proof, static must remain the backup's exception.
+			if c.enablement == "static" && c.unit != backupServiceUnit {
+				word, r := retireUnitPostcondition(t.Context(), endpointInspector(), c.unit,
+					strings.HasSuffix(c.unit, ".service"), false, true)
+				if word != "" || r == nil || r.Outcome != retireOutcomeRefused ||
+					r.Reason != retireReasonPostcondition || r.Why != c.why {
+					t.Fatalf("static was admitted for another unit after timer proof: %q %+v", word, r)
+				}
+			}
+		})
+	}
+}
+
+// An installed disabled timer is insufficient unless this pass judged it.
+func TestAStaticBackupWithoutATimerPostconditionIsRefused(t *testing.T) {
+	f := newRequestFixture(t)
+	retiredUnits(t, f)
+	insp := endpointInspector()
+
+	timer, r := retireUnitPostcondition(t.Context(), insp, backupTimerUnit, false, false, false)
+	if r != nil || timer != retireUnitQuiet {
+		t.Fatalf("the timer was not proved quiet: %q %+v", timer, r)
+	}
+
+	word, r := retireUnitPostcondition(t.Context(), insp, backupServiceUnit, true, false, timer == retireUnitQuiet)
+	if r != nil || word != retireUnitQuiet {
+		t.Fatalf("the static backup with timer proof: %q %+v", word, r)
+	}
+
+	word, r = retireUnitPostcondition(t.Context(), insp, backupServiceUnit, true, false, false)
+	if word != "" || r == nil || r.Outcome != retireOutcomeRefused || r.Reason != retireReasonPostcondition ||
+		r.Why != backupServiceUnit+" is static, and a completed retirement leaves it disabled or masked" {
+		t.Fatalf("the static backup without timer proof: %q %+v", word, r)
 	}
 }
 
@@ -336,6 +473,10 @@ func TestASettledRetirementRepublishesAStatusThatWentMissing(t *testing.T) {
 
 	settleRetirement(t, f)
 	retiredUnits(t, f)
+
+	// The committed caller fixture describes a host without the backup unit.
+	writeFile(t, filepath.Join(f.unitsDir, backupServiceUnit),
+		"LoadState=not-found\nActiveState=inactive\nMainPID=0\nUnitFileState=\n", 0o644)
 
 	mustOK(t, os.Remove(retirement.StatusPath()))
 

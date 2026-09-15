@@ -254,7 +254,8 @@ func observeRetirePostconditions(ctx context.Context, m retireMode, j retirement
 		{name: backupTimerUnit, into: &held.BackupTimer},
 		{name: backupServiceUnit, into: &held.BackupService, pid: true},
 	} {
-		word, r := retireUnitPostcondition(ctx, insp, unit.name, unit.pid, unit.alive)
+		backupTimerQuiet := held.BackupTimer == retireUnitQuiet || held.BackupTimer == retireUnitNotFound
+		word, r := retireUnitPostcondition(ctx, insp, unit.name, unit.pid, unit.alive, backupTimerQuiet)
 		if r != nil {
 			return held, atRetirePhase(j, r)
 		}
@@ -348,8 +349,9 @@ func retireConfigPostcondition(configPath string, j retirement.Journal) (string,
 }
 
 // retireUnitPostcondition judges one unit. `alive` names the one unit a
-// retained-node host must still be running.
-func retireUnitPostcondition(ctx context.Context, insp *lifeops.Inspector, unit string, pid, alive bool,
+// retained-node host must still be running. `backupTimerQuiet` is proof from
+// the backup timer's successful postcondition in this same observation pass.
+func retireUnitPostcondition(ctx context.Context, insp *lifeops.Inspector, unit string, pid, alive, backupTimerQuiet bool,
 ) (string, *retireRefusal) {
 	props, err := insp.UnitProperties(ctx, unit, retireDoneProperties...)
 	if err != nil {
@@ -435,6 +437,16 @@ func retireUnitPostcondition(ctx context.Context, insp *lifeops.Inspector, unit 
 	if !knownUnitFileState(enablement) {
 		return "", retireUnknown(retireReasonPostcondition, fmt.Sprintf("systemd answered %s's enablement as %s, which "+
 			"this billet does not know", unit, activeWord(enablement)), "")
+	}
+
+	// Measured on the reference controller, 2026-09-15, systemd 255
+	// (255.4-1ubuntu8.17): the backup service was loaded/inactive/static,
+	// while its timer was loaded/active/enabled. The service has no [Install]
+	// section and is started by that timer, so static is quiet ONLY for this
+	// service, after proving inactivity and no process above AND judging its
+	// timer quiet in this pass. A missing or later timer check grants nothing.
+	if unit == backupServiceUnit && enablement == "static" && pid && backupTimerQuiet {
+		return retireUnitQuiet, nil
 	}
 
 	switch enablement {
