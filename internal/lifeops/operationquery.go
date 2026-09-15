@@ -139,7 +139,8 @@ func (i *Inspector) ProveServiceArrayEmptiness(ctx context.Context, unit string,
 
 func (i *Inspector) operationArrays(ctx context.Context, unit string, arrays []struct{ name, signature string }) (map[string][]string, error) {
 	props := make(map[string][]string, len(arrays))
-	args := []string{"get-property", "org.freedesktop.systemd1", operationObjectPath(unit), operationExecutionInterface(unit)}
+	args := make([]string, 0, 4+len(arrays))
+	args = append(args, "get-property", "org.freedesktop.systemd1", operationObjectPath(unit), operationExecutionInterface(unit))
 	for _, property := range arrays {
 		args = append(args, property.name)
 	}

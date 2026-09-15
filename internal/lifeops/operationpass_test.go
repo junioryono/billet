@@ -61,7 +61,8 @@ func TestOperationAdmissionBatchesRetainedShippedSequence(t *testing.T) {
 		shows, typed := make(map[string]int), make(map[string]int)
 		for _, call := range f.calls {
 			args := strings.Fields(call)
-			if args[0] == "show" {
+			switch {
+			case args[0] == "show":
 				unit := args[len(args)-1]
 				shows[unit]++
 				switch {
@@ -72,11 +73,11 @@ func TestOperationAdmissionBatchesRetainedShippedSequence(t *testing.T) {
 				case len(args) != 4 || !strings.HasPrefix(args[1], "--property=") || strings.Contains(args[1], "*"):
 					t.Fatalf("properties were split across requests: %s", call)
 				}
-			} else if args[0] == "get-property" {
+			case args[0] == "get-property":
 				typed[args[2]]++
-			} else if slices.Equal(args[:2], []string{"--json=short", "call"}) {
+			case slices.Equal(args[:2], []string{"--json=short", "call"}):
 				typed[args[3]]++
-			} else {
+			default:
 				t.Fatalf("unexpected admission invocation: %s", call)
 			}
 		}

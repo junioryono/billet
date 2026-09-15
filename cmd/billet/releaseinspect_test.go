@@ -930,14 +930,15 @@ func TestReleaseInspectRemappingOmissionMatchesEmpty(t *testing.T) {
 		for _, mode := range []string{"empty", "omitted", "configured"} {
 			t.Run(property+"/"+mode, func(t *testing.T) {
 				f := newInspectFixture(t)
-				if mode == "omitted" {
+				switch mode {
+				case "omitted":
 					path := filepath.Join(f.unitsDir, "billet-server.service")
 					body := mustRead(t, path)
 					if !strings.Contains(body, property+"=\n") {
 						t.Fatal("fixture lacks the property to omit")
 					}
 					writeFile(t, path, strings.Replace(body, property+"=\n", "", 1), 0o644)
-				} else if mode == "configured" {
+				case "configured":
 					f.unitProperty(t, property, "/srv/other:/etc/billet")
 				}
 				r := f.report(t)
