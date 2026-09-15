@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"slices"
 	"strconv"
+	"strings"
 	"syscall"
 
 	"github.com/junioryono/billet/internal/config"
@@ -49,8 +50,16 @@ func retireOperationProtection(j retirement.Journal) lifeops.OperationProtection
 		UnitPaths: map[string][]string{serverUnit: {j.IdentityDir}},
 	}
 	if j.RetainedInvocation != nil {
+		for _, service := range j.RetainedInvocation.Services {
+			p.Units = append(p.Units, service.Unit)
+			p.RequiredActive = append(p.RequiredActive, service.Unit)
+		}
 		for _, resource := range j.RetainedInvocation.Resources {
-			p.UnitPaths[nodeUnit] = append(p.UnitPaths[nodeUnit], resource.Path)
+			if resource.GuestNetwork {
+				p.Paths = append(p.Paths, resource.Path, resource.ResolvedPath)
+			} else {
+				p.UnitPaths[nodeUnit] = append(p.UnitPaths[nodeUnit], resource.Path, resource.ResolvedPath)
+			}
 		}
 	}
 	return p
@@ -59,6 +68,17 @@ func retireOperationProtection(j retirement.Journal) lifeops.OperationProtection
 func admitRetireOperations(ctx context.Context, j retirement.Journal, operations []lifeops.Operation) *retireRefusal {
 	if len(operations) == 0 {
 		return nil
+	}
+	if j.Variant == retirement.VariantRetainedNode && (j.RetainedInvocation == nil || j.RetainedInvocation.Provider == "") {
+		return retireUnknown(retireReasonStopped, "the journal has no original retained-node provider and invocation evidence", "")
+	}
+	if j.RetainedInvocation != nil {
+		for _, resource := range j.RetainedInvocation.Resources {
+			resolved, err := lifeops.ResolveOperationPath(resource.Path)
+			if err != nil || resource.ResolvedPath == "" || resolved != resource.ResolvedPath {
+				return retireUnknown(retireReasonEffects, "retained path resolution changed or could not be read: "+resource.Path, "")
+			}
+		}
 	}
 	if err := retireOperationInspector().AdmitOperations(ctx, operations, retireOperationProtection(j)); err != nil {
 		return retireUnknown(retireReasonEffects, err.Error(), "inspect the named unit and its effective sources; retry with current evidence")
@@ -108,10 +128,22 @@ func captureRetireInvocation(ctx context.Context, cfg *config.Config) (*retireme
 	if registration.record == nil || registration.record.InvocationID != invocation {
 		return nil, retireUnknown(retireReasonStopped, "the original node has no matching trusted runtime registration", "")
 	}
+	services, servicePaths, err := retireRequiredServices(cfg)
+	if err != nil {
+		return nil, retireUnknown(retireReasonStopped, err.Error(), "")
+	}
 	record := registration.record
 	evidence := &retirement.RetainedInvocation{InvocationID: invocation, MainPID: pid,
-		Deployment: record.Deployment, Node: record.Node, Incarnation: record.Incarnation, Endpoint: record.Endpoint}
-	paths := []string{filepath.Dir(registrationRecordPath)}
+		Deployment: record.Deployment, Node: record.Node, Incarnation: record.Incarnation, Endpoint: record.Endpoint,
+		Provider: string(cfg.Node.Provider)}
+	for _, unit := range services {
+		service, err := observeRetireService(ctx, unit)
+		if err != nil {
+			return nil, retireUnknown(retireReasonStopped, err.Error(), "")
+		}
+		evidence.Services = append(evidence.Services, service)
+	}
+	paths := append(slices.Clone(servicePaths), filepath.Dir(registrationRecordPath))
 	for _, path := range nodePathsOf(cfg) {
 		paths = append(paths, path.path)
 	}
@@ -122,6 +154,7 @@ func captureRetireInvocation(ctx context.Context, cfg *config.Config) (*retireme
 		if err != nil {
 			return nil, retireUnknown(retireReasonStopped, err.Error(), "")
 		}
+		resource.GuestNetwork = slices.Contains(servicePaths, path)
 		evidence.Resources = append(evidence.Resources, resource)
 	}
 	if r := proveRetireInvocation(ctx, evidence); r != nil {
@@ -131,8 +164,12 @@ func captureRetireInvocation(ctx context.Context, cfg *config.Config) (*retireme
 }
 
 func observeRetireResource(path string) (retirement.RetainedResource, error) {
-	r := retirement.RetainedResource{Path: path}
-	info, err := os.Stat(path)
+	resolved, err := lifeops.ResolveOperationPath(path)
+	r := retirement.RetainedResource{Path: path, ResolvedPath: resolved}
+	if err != nil {
+		return r, err
+	}
+	info, err := os.Stat(resolved)
 	if errors.Is(err, fs.ErrNotExist) {
 		r.Absent = true
 		return r, nil
@@ -150,8 +187,11 @@ func observeRetireResource(path string) (retirement.RetainedResource, error) {
 
 func proveRetireInvocation(ctx context.Context, want *retirement.RetainedInvocation) *retireRefusal {
 	refuse := func(why string) *retireRefusal { return retireUnknown(retireReasonStopped, why, "") }
-	if want == nil || want.InvocationID == "" || want.MainPID == "" || len(want.Resources) == 0 {
+	if want == nil || want.Provider == "" || want.InvocationID == "" || want.MainPID == "" || len(want.Resources) == 0 {
 		return refuse("the journal has no original retained-node invocation and resource evidence")
+	}
+	if r := proveRetireServices(ctx, want); r != nil {
+		return r
 	}
 	insp := retireOperationInspector()
 	if r := retireQuietJob(ctx, insp, nodeUnit, true); r != nil {
@@ -180,6 +220,7 @@ func proveRetireInvocation(ctx context.Context, want *retirement.RetainedInvocat
 		if err != nil {
 			return refuse(err.Error())
 		}
+		now.GuestNetwork = expected.GuestNetwork
 		if !reflect.DeepEqual(expected, now) {
 			return refuse("retained node resource changed: " + expected.Path)
 		}
@@ -188,6 +229,9 @@ func proveRetireInvocation(ctx context.Context, want *retirement.RetainedInvocat
 	after, err := insp.UnitProperties(ctx, nodeUnit, retireNodeProperties...)
 	if err != nil || !reflect.DeepEqual(props, after) {
 		return refuse("the retained node changed while its resources were observed")
+	}
+	if r := proveRetireServices(ctx, want); r != nil {
+		return r
 	}
 	return retireQuietJob(ctx, insp, nodeUnit, true)
 }
@@ -219,6 +263,9 @@ func proveRetireStopped(ctx context.Context, j retirement.Journal) *retireRefusa
 			return r
 		}
 	}
+	if err := insp.ProveUnitProcessesGone(ctx, serverUnit); err != nil {
+		return retireUnknown(retireReasonStopped, err.Error(), "")
+	}
 	return nil
 }
 
@@ -240,6 +287,72 @@ func retireQuietJob(ctx context.Context, insp *lifeops.Inspector, unit string, s
 	// https://github.com/systemd/systemd/blob/v255/src/core/dbus-service.c.
 	if service && (len(props["ControlPID"]) != 1 || firstProp(props, "ControlPID") != "0") {
 		return retireUnknown(retireReasonStopped, unit+" has a control process or unknown control-process evidence", "")
+	}
+	return nil
+}
+
+// Bridge names come from the installed config, not currently loaded services.
+func retireRequiredServices(cfg *config.Config) ([]string, []string, error) {
+	if cfg.Node == nil {
+		return nil, nil, nil
+	}
+	switch cfg.Node.Provider {
+	case config.ProviderDocker, config.ProviderEC2, config.ProviderCodeBuild, config.ProviderTart:
+		return nil, nil, nil
+	case config.ProviderFirecracker:
+		if cfg.Node.Firecracker == nil || cfg.Node.Firecracker.Bridge == "" {
+			return nil, nil, errors.New("could not derive the retained provider's guest bridges")
+		}
+	default:
+		return nil, nil, fmt.Errorf("unknown retained provider %q", cfg.Node.Provider)
+	}
+	units := []string{"billet-network.service"}
+	paths := []string{"/etc/billet/network.nft"}
+	bridges := []string{cfg.Node.Firecracker.Bridge, cfg.Node.Firecracker.UntrustedBridge}
+	for _, bridge := range bridges {
+		if bridge == "" {
+			continue
+		}
+		if len(bridge) > 15 || strings.ContainsAny(bridge, "/\\@% \t\n\r") || bridge == "." || bridge == ".." {
+			return nil, nil, fmt.Errorf("could not derive a DNS instance for bridge %q", bridge)
+		}
+		units = append(units, "billet-dnsmasq@"+bridge+".service")
+		paths = append(paths, "/etc/billet/network/"+bridge+".conf", "/var/lib/billet-dnsmasq/"+bridge)
+	}
+	return units, paths, nil
+}
+
+func observeRetireService(ctx context.Context, unit string) (retirement.RetainedService, error) {
+	service := retirement.RetainedService{Unit: unit}
+	props, err := retireOperationInspector().UnitProperties(ctx, unit,
+		"LoadState", "ActiveState", "InvocationID", "MainPID", "ControlPID", "Job")
+	if err != nil {
+		return service, err
+	}
+	for _, name := range []string{"LoadState", "ActiveState", "InvocationID", "MainPID", "ControlPID", "Job"} {
+		if len(props[name]) != 1 {
+			return service, fmt.Errorf("unknown retained service %s %s", unit, name)
+		}
+	}
+	service.InvocationID, service.MainPID = firstProp(props, "InvocationID"), firstProp(props, "MainPID")
+	pid, err := strconv.ParseUint(service.MainPID, 10, 32)
+	if err != nil || (pid == 0 && unit != "billet-network.service") || service.InvocationID == "" ||
+		firstProp(props, "LoadState") != "loaded" || firstProp(props, "ActiveState") != "active" ||
+		firstProp(props, "ControlPID") != "0" || firstProp(props, "Job") != "" {
+		return service, fmt.Errorf("retained guest-network service %s is not in a quiet active invocation", unit)
+	}
+	return service, nil
+}
+
+func proveRetireServices(ctx context.Context, want *retirement.RetainedInvocation) *retireRefusal {
+	if want.Provider == string(config.ProviderFirecracker) && len(want.Services) < 2 {
+		return retireUnknown(retireReasonStopped, "the journal has no original guest-network service evidence", "")
+	}
+	for _, expected := range want.Services {
+		now, err := observeRetireService(ctx, expected.Unit)
+		if err != nil || now != expected {
+			return retireUnknown(retireReasonStopped, fmt.Sprintf("retained guest-network service %s changed or could not be read: %v", expected.Unit, err), "")
+		}
 	}
 	return nil
 }

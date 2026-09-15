@@ -2,10 +2,7 @@ package lifeops
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"io/fs"
-	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -20,11 +17,13 @@ type Operation struct {
 
 // OperationProtection describes resources which must survive the operation.
 // Paths owned by the target remain protected; only UnitPaths of the target
-// may be managed by its own directory directives.
+// may be managed by its own directory directives. RequiredActive permits an
+// idempotent dependency start while active, never a stop.
 type OperationProtection struct {
-	Units     []string
-	Paths     []string
-	UnitPaths map[string][]string
+	Units          []string
+	RequiredActive []string
+	Paths          []string
+	UnitPaths      map[string][]string
 }
 
 // WithOperationUnitDirectories selects the system manager's installation roots.
@@ -77,14 +76,24 @@ type operationWalk struct {
 	protection OperationProtection
 	units      map[string]operationEvidence
 	targets    map[string]bool
+	paths      map[string]operationPathBinding
 }
 
 // AdmitOperations is read-only and valid only at this boundary. It checks the
 // whole sequence, then rereads the evidence so a changed definition refuses.
 func (i *Inspector) AdmitOperations(ctx context.Context, sequence []Operation, protection OperationProtection) error {
-	w := operationWalk{inspector: i, protection: protection, units: make(map[string]operationEvidence), targets: make(map[string]bool)}
+	w := operationWalk{inspector: i, protection: protection, units: make(map[string]operationEvidence), targets: make(map[string]bool), paths: make(map[string]operationPathBinding)}
 	for _, op := range sequence {
 		w.targets[op.Unit] = true
+	}
+	paths := slices.Clone(protection.Paths)
+	for _, owned := range protection.UnitPaths {
+		paths = append(paths, owned...)
+	}
+	for _, path := range paths {
+		if _, err := w.bindPath(path); err != nil {
+			return err
+		}
 	}
 	for _, op := range sequence {
 		if op.Unit == "" || !slices.Contains([]string{"stop", "start", "enable", "disable"}, op.Verb) {
@@ -111,6 +120,17 @@ func (i *Inspector) AdmitOperations(ctx context.Context, sequence []Operation, p
 			}
 		}
 	}
+	if err := w.revalidatePaths(); err != nil {
+		return err
+	}
+	// This read follows all source/path observations, including ones that wait.
+	for _, op := range sequence {
+		if op.Verb == "stop" && strings.HasSuffix(op.Unit, ".service") && first(w.units[op.Unit].props, "LoadState") == "loaded" {
+			if err := i.AdmitUnitTermination(ctx, op.Unit); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
@@ -130,13 +150,7 @@ func (w *operationWalk) read(ctx context.Context, unit string) (operationEvidenc
 		return operationEvidence{}, fmt.Errorf("operation-evidence-unreadable: %s: %w", unit, err)
 	}
 	scoped := w.targets[unit] || protectedOperationUnit(unit, w.protection.Units)
-	required := slices.Clone(names)
-	if !scoped {
-		required = slices.DeleteFunc(required, func(name string) bool {
-			return slices.Contains([]string{"OnSuccessJobMode", "OnFailureJobMode", "FailureAction", "SuccessAction", "StartLimitAction", "JobTimeoutAction"}, name)
-		})
-	}
-	if err := requireOperationProperties(unit, props, required); err != nil {
+	if err := requireOperationProperties(unit, props, names); err != nil {
 		return operationEvidence{}, err
 	}
 	if first(props, "LoadState") == "not-found" {
@@ -174,13 +188,13 @@ func (w *operationWalk) read(ctx context.Context, unit string) (operationEvidenc
 		}
 		props["Where"] = mount["Where"]
 	}
-	if strings.HasSuffix(unit, ".service") {
-		execution, err := w.inspector.operationExecution(ctx, unit, scoped)
+	if operationExecutionInterface(unit) != "" {
+		execution, err := w.inspector.operationExecution(ctx, unit, scoped && strings.HasSuffix(unit, ".service"))
 		if err != nil {
 			return operationEvidence{}, fmt.Errorf("operation-evidence-unreadable: %s directories: %w", unit, err)
 		}
 		required := operationExecutionProperties
-		if !scoped {
+		if !scoped || !strings.HasSuffix(unit, ".service") {
 			required = required[:len(required)-5]
 		}
 		if err := requireOperationProperties(unit, execution, required); err != nil {
@@ -277,12 +291,13 @@ func (w *operationWalk) admit(ctx context.Context, op Operation) error {
 			continue
 		}
 		seen[effect] = true
-		if effect != op && protectedOperationUnit(effect.Unit, w.protection.Units) {
-			return fmt.Errorf("operation-protected-effect: %s %s reaches %s %s", op.Verb, op.Unit, effect.Verb, effect.Unit)
-		}
 		ev, err := w.get(ctx, effect.Unit)
 		if err != nil {
 			return err
+		}
+		if effect != op && protectedOperationUnit(effect.Unit, w.protection.Units) &&
+			!(effect.Verb == "start" && slices.Contains(w.protection.RequiredActive, effect.Unit) && first(ev.props, "ActiveState") == "active") {
+			return fmt.Errorf("operation-protected-effect: %s %s reaches %s %s", op.Verb, op.Unit, effect.Verb, effect.Unit)
 		}
 		for _, name := range strings.Fields(first(ev.props, "Names")) {
 			if name != effect.Unit && protectedOperationUnit(name, w.protection.Units) {
@@ -298,10 +313,12 @@ func (w *operationWalk) admit(ctx context.Context, op Operation) error {
 			// are still traversed. This is different from an unreadable unit.
 			continue
 		}
-		// Relationship closure is always inspected, including active dependencies.
-		// Commands and manager actions are refused on the target. A helper path
-		// reaching a protected unit or directory refuses at that resource below,
-		// independently of whether the helper has commands of its own.
+		// Manager actions bypass the dependency graph and affect the whole host.
+		// Helpers may carry commands only when their graph and directories cannot
+		// reach protected resources.
+		if err := admitOperationManagerEffects(effect.Unit, ev); err != nil {
+			return err
+		}
 		if effect == op {
 			if err := admitOperationCommands(effect.Unit, ev); err != nil {
 				return err
@@ -390,17 +407,29 @@ func (w *operationWalk) admit(ctx context.Context, op Operation) error {
 	return nil
 }
 
-func admitOperationCommands(unit string, ev operationEvidence) error {
-	for _, prop := range []string{"OnSuccessJobMode", "OnFailureJobMode"} {
-		if first(ev.props, prop) != "replace" {
+func admitOperationManagerEffects(unit string, ev operationEvidence) error {
+	// v255 unit_new defaults success to fail and failure to replace. Both
+	// enqueue the same dependency transaction; fail may refuse a conflict.
+	// Other modes can discard jobs or isolate the host, outside this closure.
+	// https://github.com/systemd/systemd/blob/v255/src/core/unit.c#L102-L103
+	for _, relation := range []string{"OnSuccess", "OnFailure"} {
+		prop := relation + "JobMode"
+		if first(ev.props, relation) != "" && !slices.Contains([]string{"fail", "replace"}, first(ev.props, prop)) {
 			return fmt.Errorf("operation-job-mode: %s %s=%s", unit, prop, first(ev.props, prop))
 		}
 	}
+	// These are all four emergency-action properties of the v255 Unit vtable;
+	// *ExitStatus and *RebootArgument configure an action but do not initiate it.
+	// https://github.com/systemd/systemd/blob/v255/src/core/dbus-unit.c#L857-L875
 	for _, prop := range []string{"FailureAction", "SuccessAction", "StartLimitAction", "JobTimeoutAction"} {
 		if first(ev.props, prop) != "none" {
 			return fmt.Errorf("operation-manager-action: %s %s=%s", unit, prop, first(ev.props, prop))
 		}
 	}
+	return nil
+}
+
+func admitOperationCommands(unit string, ev operationEvidence) error {
 	for _, prop := range []string{"ExecCondition", "ExecStartPre", "ExecStartPost", "ExecStop", "ExecStopPost"} {
 		if first(ev.props, prop) != "" {
 			return fmt.Errorf("operation-command-effects-unsupported: %s %s", unit, prop)
@@ -425,7 +454,11 @@ func (w *operationWalk) admitPassiveEffect(effect Operation, ev operationEvidenc
 		paths = append(paths, owned...)
 	}
 	for _, path := range paths {
-		if where == "/" || Contained(where, path) || Contained(path, where) {
+		overlap, err := w.pathsOverlap(where, path)
+		if err != nil {
+			return err
+		}
+		if overlap {
 			return fmt.Errorf("operation-protected-mount: %s %s covers %s", effect.Verb, effect.Unit, path)
 		}
 	}
@@ -437,7 +470,7 @@ func (w *operationWalk) admitDirectories(effect Operation, ev operationEvidence)
 	for directive := range operationDirectoryRoots {
 		hasDirectories = hasDirectories || first(ev.props, directive) != ""
 	}
-	if hasDirectories && strings.HasSuffix(effect.Unit, ".service") {
+	if hasDirectories && operationExecutionInterface(effect.Unit) != "" {
 		for _, prop := range operationExecutionProperties[5 : len(operationExecutionProperties)-5] {
 			want := ""
 			switch prop {
@@ -480,33 +513,17 @@ func (w *operationWalk) admitDirectories(effect Operation, ev operationEvidence)
 				}
 			}
 			for _, keep := range protected {
-				if Contained(path, keep) || Contained(keep, path) {
+				overlap, err := w.pathsOverlap(path, keep)
+				if err != nil {
+					return err
+				}
+				if overlap {
 					return fmt.Errorf("operation-directory-overlap: %s %s=%s affects %s", effect.Unit, directive, entry, keep)
 				}
 			}
-			if err := operationDirectoryPath(path); err != nil {
+			if _, err := w.bindPath(path); err != nil {
 				return fmt.Errorf("operation-directory-evidence: %s %s: %w", effect.Unit, directive, err)
 			}
-		}
-	}
-	return nil
-}
-
-// Directory mappings with links require namespace analysis outside the supported
-// subset. Inspect every existing prefix without following one or creating any.
-func operationDirectoryPath(path string) error {
-	current := string(filepath.Separator)
-	for _, component := range strings.Split(strings.TrimPrefix(path, current), string(filepath.Separator)) {
-		current = filepath.Join(current, component)
-		info, err := os.Lstat(current)
-		if errors.Is(err, fs.ErrNotExist) {
-			continue
-		}
-		if err != nil {
-			return err
-		}
-		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("%s is not a direct directory", current)
 		}
 	}
 	return nil
@@ -524,7 +541,11 @@ func (w *operationWalk) admitMountRequirements(effect Operation, ev operationEvi
 			return fmt.Errorf("operation-mount-requirement-unknown: %s %s", effect.Unit, path)
 		}
 		for _, keep := range protected {
-			if Contained(keep, path) || Contained(path, keep) {
+			overlap, err := w.pathsOverlap(path, keep)
+			if err != nil {
+				return err
+			}
+			if overlap {
 				return fmt.Errorf("operation-protected-mount-requirement: %s requires %s for %s", effect.Unit, path, keep)
 			}
 		}

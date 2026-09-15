@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/lifeops"
 	"github.com/junioryono/billet/internal/retirement"
 )
@@ -18,7 +19,14 @@ func installRetireOperationEvidence(t *testing.T, f *requestFixture) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(f.unitsDir, "billet-upgrade.service"),
 		"LoadState=loaded\nActiveState=inactive\nUnitFileState=static\n", 0o644)
-	for _, unit := range []string{serverUnit, nodeUnit, backupServiceUnit, "billet-upgrade.service", upgradeTimerUnit, backupTimerUnit} {
+	for _, unit := range []string{serverUnit, nodeUnit, backupServiceUnit, "billet-upgrade.service", upgradeTimerUnit, backupTimerUnit, "billet-network.service", "billet-dnsmasq@br0.service", "billet-dnsmasq@br1.service"} {
+		if strings.HasPrefix(unit, "billet-dnsmasq@") || unit == "billet-network.service" {
+			pid := "4250"
+			if unit == "billet-network.service" {
+				pid = "0"
+			}
+			writeFile(t, filepath.Join(f.unitsDir, unit), "LoadState=loaded\nActiveState=active\nUnitFileState=enabled\nMainPID="+pid+"\nInvocationID="+retainedInvocation+"\nKillMode=control-group\n", 0o644)
+		}
 		source := filepath.Join(root, unit)
 		body := "[Unit]\nDescription=fixture\n"
 		if unit != backupServiceUnit && unit != "billet-upgrade.service" {
@@ -27,9 +35,9 @@ func installRetireOperationEvidence(t *testing.T, f *requestFixture) {
 		writeFile(t, source, body, 0o644)
 		properties := map[string]string{
 			"Id": unit, "Names": unit, "FragmentPath": source, "SourcePath": "", "DropInPaths": "",
-			"NeedDaemonReload": "no", "OnSuccessJobMode": "replace", "OnFailureJobMode": "replace",
+			"NeedDaemonReload": "no", "OnSuccessJobMode": "fail", "OnFailureJobMode": "replace",
 			"FailureAction": "none", "SuccessAction": "none", "StartLimitAction": "none", "JobTimeoutAction": "none",
-			"RequiresMountsFor": "", "Job": "", "ControlPID": "0", "StopWhenUnneeded": "no",
+			"RequiresMountsFor": "", "Job": "", "ControlPID": "0", "ControlGroup": "", "Slice": "system.slice", "StopWhenUnneeded": "no",
 		}
 		for _, key := range []string{
 			"Requires", "Requisite", "Wants", "BindsTo", "Upholds", "PartOf", "RequiredBy", "RequisiteOf", "WantedBy",
@@ -61,6 +69,9 @@ case "$3" in
   /org/freedesktop/systemd1/unit/billet_2dnode_2eservice) unit=billet-node.service ;;
   /org/freedesktop/systemd1/unit/billet_2dbackup_2eservice) unit=billet-backup.service ;;
   /org/freedesktop/systemd1/unit/billet_2dupgrade_2eservice) unit=billet-upgrade.service ;;
+  /org/freedesktop/systemd1/unit/billet_2dnetwork_2eservice) unit=billet-network.service ;;
+  /org/freedesktop/systemd1/unit/billet_2ddnsmasq_40br0_2eservice) unit=billet-dnsmasq@br0.service ;;
+  /org/freedesktop/systemd1/unit/billet_2ddnsmasq_40br1_2eservice) unit=billet-dnsmasq@br1.service ;;
   *) exit 2 ;;
 esac
 shift 4
@@ -85,7 +96,7 @@ done
 `, 0o755)
 	saved := retireOperationInspector
 	retireOperationInspector = func() *lifeops.Inspector {
-		return lifeops.NewInspector(lifeops.WithSystemctl(systemctlBinary), lifeops.WithOperationUnitDirectories(root), lifeops.WithOperationBusctl(busctl))
+		return lifeops.NewInspector(lifeops.WithSystemctl(systemctlBinary), lifeops.WithOperationUnitDirectories(root), lifeops.WithOperationBusctl(busctl), lifeops.WithOperationCgroupRoot(root))
 	}
 	t.Cleanup(func() { retireOperationInspector = saved })
 }
@@ -164,10 +175,24 @@ func TestRetirementReadmitsAfterEachStopWait(t *testing.T) {
 // move observations only; production chooses whether publication may proceed.
 func TestRetirementReprovesEachStoppedBoundary(t *testing.T) {
 	for _, boundary := range []string{"status", "journal", "archive"} {
-		for _, drift := range []string{"timer", "controller process", "node invocation", "registration", "registration endpoint", "resource", "timer enablement", "controller job", "backup process"} {
+		for _, drift := range []string{"timer", "controller process", "controller cgroup", "network activity", "network invocation", "network resource", "node invocation", "registration", "registration endpoint", "resource", "timer enablement", "controller job", "backup process"} {
 			t.Run(boundary+"/"+drift, func(t *testing.T) {
 				f := newRequestFixture(t)
 				f.retainANode(t)
+				networkResource := ""
+				if strings.HasPrefix(drift, "network ") {
+					f.originalNode.Provider = string(config.ProviderFirecracker)
+					for _, unit := range []string{"billet-network.service", "billet-dnsmasq@br0.service"} {
+						service, err := observeRetireService(t.Context(), unit)
+						mustOK(t, err)
+						f.originalNode.Services = append(f.originalNode.Services, service)
+					}
+					networkResource = t.TempDir()
+					resource, err := observeRetireResource(networkResource)
+					mustOK(t, err)
+					resource.GuestNetwork = true
+					f.originalNode.Resources = append(f.originalNode.Resources, resource)
+				}
 				f.reserve(t)
 				j := f.plantJournal(t, retirement.PhaseIntent, retirement.VariantRetainedNode)
 				mustOK(t, retirement.WriteStatus(retirement.PhaseIntent, j.Variant, retireNow()))
@@ -191,6 +216,18 @@ func TestRetirementReprovesEachStoppedBoundary(t *testing.T) {
 						f.manager.set(backupServiceUnit, "LoadState", "loaded")
 						f.manager.set(backupServiceUnit, "UnitFileState", "static")
 						f.manager.set(backupServiceUnit, "MainPID", "42")
+					case "network activity":
+						f.manager.set("billet-dnsmasq@br0.service", "ActiveState", "inactive")
+					case "network invocation":
+						f.manager.set("billet-network.service", "InvocationID", strings.Repeat("f", 32))
+					case "network resource":
+						mustOK(t, os.Chmod(networkResource, 0o755))
+					case "controller cgroup":
+						props, err := retireOperationInspector().UnitProperties(t.Context(), serverUnit, "FragmentPath")
+						mustOK(t, err)
+						group := filepath.Join(filepath.Dir(firstProp(props, "FragmentPath")), "system.slice", serverUnit)
+						mustOK(t, os.MkdirAll(group, 0o755))
+						writeFile(t, filepath.Join(group, "cgroup.procs"), "4243\n", 0o644)
 					case "controller process":
 						f.manager.set(serverUnit, "MainPID", "42")
 					case "node invocation":
@@ -438,5 +475,117 @@ func TestRetirementReadmitsAfterConfigFileFlush(t *testing.T) {
 				t.Fatalf("failed rewrite advanced or enabled the node: %v", f.manager.operations)
 			}
 		})
+	}
+}
+
+func TestRetirementRechecksTerminationAtControllerAndNodeStops(t *testing.T) {
+	for _, unit := range []string{serverUnit, nodeUnit} {
+		for _, mode := range []string{"process", "none", ""} {
+			t.Run(unit+"/"+mode, func(t *testing.T) {
+				f := newRequestFixture(t)
+				f.retainANode(t)
+				f.reserve(t)
+				phase := retirement.PhaseIntent
+				if unit == nodeUnit {
+					phase = retirement.PhaseConfigRewritten
+				}
+				j := f.plantJournal(t, phase, retirement.VariantRetainedNode)
+				if r := admitRetireOperation(t.Context(), j, "stop", unit); r != nil {
+					t.Fatalf("clean current policy: %+v", r)
+				}
+				poison := func() { f.manager.set(unit, "KillMode", mode) }
+				var r *retireRefusal
+				next := j
+				if unit == nodeUnit {
+					f.manager.onEnable = func(_ string) { poison() }
+					next, r = retireRestartNode(t.Context(), j)
+				} else {
+					poison()
+					r = stopAndDisableForRetirement(t.Context(), f.manager, j, unit)
+				}
+				if r == nil || r.Reason != retireReasonEffects || next.Phase != j.Phase || slices.Contains(f.manager.operations, "stop "+unit) {
+					t.Fatalf("stale termination policy authorized stop: refusal=%+v phase=%s operations=%v", r, next.Phase, f.manager.operations)
+				}
+			})
+		}
+	}
+}
+
+func TestRetirementCapturesAndProtectsRequiredGuestNetwork(t *testing.T) {
+	f := newRequestFixture(t)
+	f.retainANode(t)
+	f.reserve(t)
+	installed, r := observeRetireConfig(f.cfg)
+	if r != nil {
+		t.Fatal(r)
+	}
+	installed.cfg.Node.Provider = config.ProviderFirecracker
+	installed.cfg.Node.Firecracker = &config.FirecrackerConfig{Bridge: "br0", UntrustedBridge: "br1"}
+	original, r := captureRetireInvocation(t.Context(), installed.cfg)
+	if r != nil {
+		t.Fatalf("clean guest network: %+v", r)
+	}
+	if len(original.Services) != 3 || original.Services[0].Unit != "billet-network.service" ||
+		original.Services[1].Unit != "billet-dnsmasq@br0.service" || original.Services[2].Unit != "billet-dnsmasq@br1.service" {
+		t.Fatalf("installed bridges did not determine required services: %+v", original.Services)
+	}
+	j := f.plantJournal(t, retirement.PhaseIntent, retirement.VariantRetainedNode)
+	j.RetainedInvocation = original
+	if r := admitRetireOperation(t.Context(), j, "stop", serverUnit); r != nil {
+		t.Fatalf("clean controller stop: %+v", r)
+	}
+	setRetireEffect(t, f, serverUnit, "PropagatesStopTo", "billet-dnsmasq@br0.service")
+	if r := stopAndDisableForRetirement(t.Context(), f.manager, j, serverUnit); r == nil || r.Reason != retireReasonEffects {
+		t.Fatalf("DNS collateral not refused: %+v", r)
+	}
+	if slices.Contains(f.manager.operations, "stop "+serverUnit) {
+		t.Fatalf("controller stopped before DNS refusal: %v", f.manager.operations)
+	}
+	setRetireEffect(t, f, serverUnit, "PropagatesStopTo", "")
+	for _, service := range original.Services {
+		f.manager.set(service.Unit, "InvocationID", strings.Repeat("f", 32))
+		if r := proveRetireInvocation(t.Context(), original); r == nil || r.Reason != retireReasonStopped {
+			t.Fatalf("changed network invocation admitted: %s %+v", service.Unit, r)
+		}
+		f.manager.set(service.Unit, "InvocationID", service.InvocationID)
+	}
+	installed.cfg.Node.Firecracker.Bridge = ""
+	if _, r := captureRetireInvocation(t.Context(), installed.cfg); r == nil {
+		t.Fatal("unknown configured guest bridges admitted")
+	}
+}
+
+func TestRetirementBindsNodeStateAliasBeforeEachOperation(t *testing.T) {
+	f := newRequestFixture(t)
+	f.retainANode(t)
+	f.reserve(t)
+	installed, r := observeRetireConfig(f.cfg)
+	if r != nil {
+		t.Fatal(r)
+	}
+	alias := filepath.Join(t.TempDir(), "node-state")
+	mustOK(t, os.Symlink("/run/shared", alias))
+	installed.cfg.Node.StateDir = alias
+	original, r := captureRetireInvocation(t.Context(), installed.cfg)
+	if r != nil {
+		t.Fatalf("capture state alias: %+v", r)
+	}
+	j := f.plantJournal(t, retirement.PhaseIntent, retirement.VariantRetainedNode)
+	j.RetainedInvocation = original
+	setRetireEffect(t, f, serverUnit, "RuntimeDirectory", "shared")
+	if r := stopAndDisableForRetirement(t.Context(), f.manager, j, serverUnit); r == nil || r.Reason != retireReasonEffects || !strings.Contains(r.Why, "operation-directory-overlap") {
+		t.Fatalf("controller could remove aliased node.state_dir: %+v", r)
+	}
+	setRetireEffect(t, f, serverUnit, "RuntimeDirectory", "unrelated")
+	if r := admitRetireOperation(t.Context(), j, "stop", serverUnit); r != nil {
+		t.Fatalf("clean bound state alias: %+v", r)
+	}
+	mustOK(t, os.Remove(alias))
+	mustOK(t, os.Symlink("/run/another-state", alias))
+	if r := stopAndDisableForRetirement(t.Context(), f.manager, j, serverUnit); r == nil || r.Reason != retireReasonEffects || !strings.Contains(r.Why, "resolution changed") {
+		t.Fatalf("retargeted historical binding accepted: %+v", r)
+	}
+	if slices.Contains(f.manager.operations, "stop "+serverUnit) {
+		t.Fatalf("path refusal submitted controller stop: %v", f.manager.operations)
 	}
 }

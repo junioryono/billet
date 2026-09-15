@@ -94,7 +94,11 @@ func operationInstallEntries(sources []operationSource) (map[string][]string, er
 				return nil, fmt.Errorf("operation-install-unsupported: %s in %s", key, source.Path)
 			}
 			if value == "" {
-				entries[key] = nil
+				// Also queues auxiliary units immediately; an empty assignment
+				// cannot cancel earlier work, including work from a drop-in.
+				if key != "Also" {
+					entries[key] = nil
+				}
 			} else {
 				entries[key] = append(entries[key], strings.Fields(value)...)
 			}

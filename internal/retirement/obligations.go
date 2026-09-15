@@ -16,18 +16,29 @@ type RetainedInvocation struct {
 	Incarnation  string             `json:"incarnation"`
 	Endpoint     string             `json:"endpoint"`
 	Resources    []RetainedResource `json:"resources"`
+	Provider     string             `json:"provider,omitempty"`
+	Services     []RetainedService  `json:"services,omitempty"`
+}
+
+// RetainedService binds the guest network to its original active invocation.
+type RetainedService struct {
+	Unit         string `json:"unit"`
+	InvocationID string `json:"invocation_id"`
+	MainPID      string `json:"main_pid"`
 }
 
 // RetainedResource records object identity and ownership, not mutable directory
 // contents. Runtime registration is separately read through its trusted reader.
 type RetainedResource struct {
-	Path   string `json:"path"`
-	Absent bool   `json:"absent,omitempty"`
-	Device uint64 `json:"device,omitempty"`
-	Inode  uint64 `json:"inode,omitempty"`
-	Mode   uint32 `json:"mode,omitempty"`
-	UID    uint32 `json:"uid,omitempty"`
-	GID    uint32 `json:"gid,omitempty"`
+	Path         string `json:"path"`
+	ResolvedPath string `json:"resolved_path,omitempty"`
+	GuestNetwork bool   `json:"guest_network,omitempty"`
+	Absent       bool   `json:"absent,omitempty"`
+	Device       uint64 `json:"device,omitempty"`
+	Inode        uint64 `json:"inode,omitempty"`
+	Mode         uint32 `json:"mode,omitempty"`
+	UID          uint32 `json:"uid,omitempty"`
+	GID          uint32 `json:"gid,omitempty"`
 }
 
 // RemainingServiceActions is the service work left by the executable decision.

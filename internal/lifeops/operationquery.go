@@ -11,7 +11,7 @@ import (
 // Empty arrays of structs are omitted by systemctl show, even with --all:
 // https://github.com/systemd/systemd/blob/v255/src/systemctl/systemctl-show.c.
 // A typed busctl response proves an empty array; missing show output cannot.
-// Signatures are the Service/ExecContext vtables in v255 dbus-service.c and
+// Signatures are the type-specific/ExecContext vtables in v255 dbus-*.c and
 // dbus-execute.c. ConfigurationDirectory has no Symlink property in v255.
 var operationArrayProperties = []struct{ name, signature string }{
 	{"StateDirectorySymlink", "a(sst)"}, {"RuntimeDirectorySymlink", "a(sst)"},
@@ -45,7 +45,7 @@ func (i *Inspector) operationExecution(ctx context.Context, unit string, command
 	arrays := slices.DeleteFunc(slices.Clone(operationArrayProperties), func(p struct{ name, signature string }) bool {
 		return !commands && strings.HasPrefix(p.name, "Exec")
 	})
-	args := []string{"get-property", "org.freedesktop.systemd1", operationObjectPath(unit), "org.freedesktop.systemd1.Service"}
+	args := []string{"get-property", "org.freedesktop.systemd1", operationObjectPath(unit), operationExecutionInterface(unit)}
 	for _, property := range arrays {
 		args = append(args, property.name)
 	}
@@ -97,4 +97,17 @@ func operationObjectPath(unit string) string {
 		}
 	}
 	return escaped.String()
+}
+
+// These four unit vtables embed bus_exec_vtable in systemd 255:
+// https://github.com/systemd/systemd/tree/v255/src/core (dbus-*.c).
+func operationExecutionInterface(unit string) string {
+	for suffix, kind := range map[string]string{
+		".service": "Service", ".socket": "Socket", ".mount": "Mount", ".swap": "Swap",
+	} {
+		if strings.HasSuffix(unit, suffix) {
+			return "org.freedesktop.systemd1." + kind
+		}
+	}
+	return ""
 }

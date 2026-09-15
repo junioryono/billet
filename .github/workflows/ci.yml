@@ -593,9 +593,15 @@ jobs:
       - name: Measure retirement operation effects on real systemd
         if: matrix.group == 'policy'
         run: |
+          if [ "$(dpkg-query -W -f '${db:Status-Status}' python3-jinja2 2>/dev/null)" != installed ]; then
+            sudo sed -i -e 's,^URIs: http://archive[.]ubuntu[.]com/ubuntu/$,URIs: https://archive.ubuntu.com/ubuntu/ https://mirrors.edge.kernel.org/ubuntu/,' -e 's,^URIs: http://ports[.]ubuntu[.]com/ubuntu-ports/$,URIs: https://ports.ubuntu.com/ubuntu-ports/,' /etc/apt/sources.list.d/ubuntu.sources
+            sudo timeout -v -k 10 300 apt-get -o APT::Update::Error-Mode=any -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
+            sudo timeout -v -k 10 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y --no-install-recommends python3-jinja2
+          fi
+          sudo /usr/bin/python3 -c 'import jinja2'
           go test -c -o "$RUNNER_TEMP/lifeops.test" ./internal/lifeops
           cd internal/lifeops
-          sudo env "PATH=$PATH" BILLET_TEST_SYSTEMD_OPERATION_EFFECTS=1 "$RUNNER_TEMP/lifeops.test" -test.count=1 -test.v -test.run '^TestRealSystemdRetirementOperationEffects$'
+          sudo env "PATH=/usr/bin:/bin:$PATH" BILLET_TEST_SYSTEMD_OPERATION_EFFECTS=1 "$RUNNER_TEMP/lifeops.test" -test.count=1 -test.v -test.run '^TestRealSystemdRetirementOperationEffects$'
 
   # Both legs here need the real Debian package, so they share a job: `dist` is
   # phony and runs again for the second target, but the Go build cache is warm
