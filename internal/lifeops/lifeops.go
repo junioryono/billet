@@ -507,6 +507,14 @@ func (i *Inspector) service(ctx context.Context, unit, packaged string,
 		return ServiceFacts{Name: unit}, fmt.Errorf("ask systemd about %s: %w", unit, err)
 	}
 
+	if first(props, "LoadState") == "loaded" {
+		if err := i.ProveServiceArrayEmptiness(ctx, unit, props,
+			"ExecStartPre", "ExecStartPost", "ExecCondition", "ExecStopPost", "ExecReload",
+			"BindPaths", "BindReadOnlyPaths", "MountImages"); err != nil {
+			return ServiceFacts{Name: unit}, err
+		}
+	}
+
 	facts := ServiceFacts{
 		Name:          unit,
 		LoadState:     first(props, "LoadState"),

@@ -58,7 +58,7 @@ func installRetireOperationEvidence(t *testing.T, f *requestFixture) {
 			"StateDirectory", "RuntimeDirectory", "CacheDirectory", "LogsDirectory", "ConfigurationDirectory",
 			"StateDirectorySymlink", "RuntimeDirectorySymlink", "CacheDirectorySymlink", "LogsDirectorySymlink",
 			"RootDirectory", "RootImage", "BindPaths", "BindReadOnlyPaths", "TemporaryFileSystem", "MountImages", "ExtensionImages", "ExtensionDirectories",
-			"ExecCondition", "ExecStartPre", "ExecStartPost", "ExecStop", "ExecStopPost",
+			"ExecCondition", "ExecStartPre", "ExecStartPost", "ExecReload", "ExecStop", "ExecStopPost",
 		} {
 			properties[key] = ""
 		}
@@ -112,6 +112,24 @@ func setRetireEffect(t *testing.T, f *requestFixture, unit, key, value string) {
 				entries = append(entries, data)
 			}
 			typed = map[string]any{"type": signature, "data": entries}
+		}
+		if key == "EnvironmentFiles" {
+			entries := []any{}
+			for _, line := range strings.Split(value, "\n") {
+				if line == "" {
+					continue
+				}
+				path, optional := strings.CutSuffix(line, " (ignore_errors=yes)")
+				if !optional {
+					var required bool
+					path, required = strings.CutSuffix(line, " (ignore_errors=no)")
+					if !required {
+						t.Fatalf("invalid fixture environment file: %q", line)
+					}
+				}
+				entries = append(entries, []any{path, optional})
+			}
+			typed = map[string]any{"type": "a(sb)", "data": entries}
 		}
 		body, err := json.Marshal(typed)
 		mustOK(t, err)
@@ -637,9 +655,9 @@ func installRetireNodeExecution(t *testing.T, f *requestFixture) {
 	setRetireNodeCommand(t, f, []string{binary, "node", "--config", f.cfg}, "")
 	setRetireEffect(t, f, nodeUnit, "Requires", "sysinit.target")
 	setRetireEffect(t, f, nodeUnit, "After", "sysinit.target")
-	for _, name := range []string{"EnvironmentFiles", "Environment"} {
-		setRetireEffect(t, f, nodeUnit, name, "")
-	}
+	setRetireEffect(t, f, nodeUnit, "Environment", "")
+	// No EnvironmentFile directives: the text printer emits no key at all.
+	writeFile(t, filepath.Join(f.unitsDir, nodeUnit+".EnvironmentFiles.json"), `{"type":"a(sb)","data":[]}`, 0o600)
 }
 
 func setRetireNodeCommand(t *testing.T, f *requestFixture, argv []string, flags string) {

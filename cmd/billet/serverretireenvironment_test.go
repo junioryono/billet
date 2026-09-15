@@ -13,31 +13,6 @@ import (
 	"github.com/junioryono/billet/internal/retirement"
 )
 
-func TestRetirementEnvironmentSpecsPreserveEveryOptionalityFlag(t *testing.T) {
-	for _, test := range []struct {
-		name  string
-		lines []string
-		want  []environmentFileSpec
-	}{
-		{name: "empty", lines: []string{""}},
-		{name: "required", lines: []string{"/etc/billet/node.env (ignore_errors=no)"}, want: []environmentFileSpec{{Path: "/etc/billet/node.env"}}},
-		{name: "optional", lines: []string{"/run/billet/node.env (ignore_errors=yes)"}, want: []environmentFileSpec{{Path: "/run/billet/node.env", IgnoreErrors: true}}},
-		{name: "all entries", lines: []string{"/etc/one (ignore_errors=no)", "/run/two (ignore_errors=yes)", "/etc/three (ignore_errors=no)"}, want: []environmentFileSpec{{Path: "/etc/one"}, {Path: "/run/two", IgnoreErrors: true}, {Path: "/etc/three"}}},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			got, err := environmentFileSpecsOfAll(test.lines)
-			if err != nil || !reflect.DeepEqual(got, test.want) {
-				t.Fatalf("typed environment files = %+v, %v; want %+v", got, err, test.want)
-			}
-		})
-	}
-	for _, lines := range [][]string{nil, {" "}, {"", "/etc/node.env (ignore_errors=no)"}, {"/etc/node.env"}, {"/etc/node.env (ignore_errors=maybe)"}, {"relative (ignore_errors=no)"}, {"/etc/*.env (ignore_errors=no)"}} {
-		if _, err := environmentFileSpecsOfAll(lines); err == nil || !strings.Contains(err.Error(), "retained-input-environment-unknown") {
-			t.Fatalf("unknown environment evidence admitted: %v: %v", lines, err)
-		}
-	}
-}
-
 // The full command supplies the production RequiredInputs/UnitPaths split and
 // the shipped node runtime directories. Dropping environment capture admits the
 // mandatory volatile witness; treating optional files as required kills controls.
@@ -67,13 +42,11 @@ func TestRetirementProtectsMandatoryEnvironmentFilesThroughTheHandoff(t *testing
 			}
 			setRetireEffect(t, f, nodeUnit, "EnvironmentFiles", path+" (ignore_errors="+flag+")")
 			if scenario == "property missing" || scenario == "property unreadable" {
-				effects := filepath.Join(f.unitsDir, nodeUnit+".effects")
-				body := mustRead(t, effects)
-				body = strings.ReplaceAll(body, "EnvironmentFiles="+path+" (ignore_errors=no)\n", "")
+				typed := filepath.Join(f.unitsDir, nodeUnit+".EnvironmentFiles.json")
+				mustOK(t, os.Remove(typed))
 				if scenario == "property unreadable" {
-					body += "EnvironmentFiles=unreadable-property\n"
+					writeFile(t, typed, `{"type":"a(sb)","data":[["/etc/node.env","false"]]}`, 0o600)
 				}
-				writeFile(t, effects, body, 0o644)
 			}
 			queryFailed := false
 			if scenario == "property query failure" {
@@ -81,9 +54,9 @@ func TestRetirementProtectsMandatoryEnvironmentFilesThroughTheHandoff(t *testing
 				retireOperationInspector = func() *lifeops.Inspector {
 					i := saved()
 					lifeops.WithObserver(func(_ context.Context, args []string) {
-						if !queryFailed && slices.Contains(args, "--property=EnvironmentFiles") {
+						if !queryFailed && slices.Contains(args, "EnvironmentFiles") {
 							queryFailed = true
-							mustOK(t, os.Remove(filepath.Join(f.unitsDir, nodeUnit+".effects")))
+							mustOK(t, os.Remove(filepath.Join(f.unitsDir, nodeUnit+".EnvironmentFiles.json")))
 						}
 					})(i)
 					return i
@@ -172,5 +145,28 @@ func TestRetirementRechecksEnvironmentFilesAfterAdmissionAndStopWaits(t *testing
 				t.Fatalf("environment drift crossed the next operation: %+v %s %v", r, next.Phase, f.manager.operations)
 			}
 		})
+	}
+}
+
+// Reverting the command to text EnvironmentFiles refuses this stock control;
+// accepting every read instead is killed by the malformed/query-failure cases.
+func TestRetirementWithoutEnvironmentFilesCompletesThroughProductionReaders(t *testing.T) {
+	f := newRequestFixture(t)
+	retainAndRestartANode(t, f)
+	f.reserve(t)
+	props, err := retireOperationInspector().UnitProperties(t.Context(), nodeUnit, "EnvironmentFiles")
+	mustOK(t, err)
+	if _, exists := props["EnvironmentFiles"]; exists {
+		t.Fatalf("fake invented an empty text property: %v", props)
+	}
+	out, code := f.retainedRequest(t, f.input(t, f.retainedOverrides(t)))
+	retiredAnswer(t, out, code)
+	j := requireRetireJournal(t)
+	if j.Phase != retirement.PhaseDone || !slices.Contains(f.manager.operations, "stop "+nodeUnit) || !slices.Contains(f.manager.operations, "start "+nodeUnit) {
+		t.Fatalf("clean retirement did not complete the node handoff: %s %v", j.Phase, f.manager.operations)
+	}
+	calls := mustRead(t, filepath.Join(f.unitsDir, ".manager-calls"))
+	if !strings.Contains(calls, "org.freedesktop.systemd1.Service EnvironmentFiles\n") {
+		t.Fatal("retirement never used the production typed environment reader")
 	}
 }

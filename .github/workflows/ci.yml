@@ -583,13 +583,9 @@ jobs:
         if: matrix.group == 'policy'
         run: make hybrid-emission-check
 
-      # A retirement admits each service operation from the unit graph systemd
-      # reports, and a fake manager answers whatever the test wrote. This runs
-      # the shipped units, the role's rendered units and the collateral-effect
-      # hazards (OnSuccess=, PropagatesStopTo=, a shared RuntimeDirectory=)
-      # against the guest's own systemd 255, which is disposable. Compiled as
-      # the runner's user so the Go cache stays its own, run as root from the
-      # package directory the test reads its unit files relative to.
+      # Measure unit effects and command readers against disposable systemd 255.
+      # Compile as the runner; run as root from each package's directory.
+      # The command handoff uses a temporary PostgreSQL ledger.
       - name: Measure retirement operation effects on real systemd
         if: matrix.group == 'policy'
         run: |
@@ -600,8 +596,26 @@ jobs:
           fi
           sudo /usr/bin/python3 -c 'import jinja2'
           go test -c -o "$RUNNER_TEMP/lifeops.test" ./internal/lifeops
+          go test -c -o "$RUNNER_TEMP/billet-command.test" ./cmd/billet
+          retirement_postgres=$(docker run -d --rm -p 127.0.0.1::5432 -e POSTGRES_USER=billet -e POSTGRES_PASSWORD=billet -e POSTGRES_DB=billet postgres:18-alpine)
+          trap 'docker stop "$retirement_postgres" >/dev/null' EXIT
+          retirement_postgres_ready=false
+          for attempt in {1..60}; do
+            if docker exec "$retirement_postgres" pg_isready -h 127.0.0.1 -U billet -d billet; then
+              retirement_postgres_ready=true
+              break
+            fi
+            sleep 1
+          done
+          if [ "$retirement_postgres_ready" != true ]; then
+            docker logs "$retirement_postgres"
+            exit 1
+          fi
+          retirement_postgres_address=$(docker port "$retirement_postgres" 5432/tcp)
           cd internal/lifeops
           sudo env "PATH=/usr/bin:/bin:$PATH" BILLET_TEST_SYSTEMD_OPERATION_EFFECTS=1 "$RUNNER_TEMP/lifeops.test" -test.count=1 -test.v -test.run '^TestRealSystemdRetirementOperationEffects$'
+          cd ../../cmd/billet
+          sudo env "PATH=/usr/bin:/bin:$PATH" BILLET_TEST_SYSTEMD_OPERATION_EFFECTS=1 "BILLET_TEST_POSTGRES_DSN=postgres://billet:billet@$retirement_postgres_address/billet?sslmode=disable" "$RUNNER_TEMP/billet-command.test" -test.count=1 -test.v -test.run '^TestRealSystemd'
 
   # Both legs here need the real Debian package, so they share a job: `dist` is
   # phony and runs again for the second target, but the Go build cache is warm

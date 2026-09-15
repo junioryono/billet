@@ -49,6 +49,14 @@ func newOperationFixture(t *testing.T) *operationFixture {
 						values[name] = reply
 						continue
 					}
+					if name == "EnvironmentFiles" {
+						reply, err := fixtureEnvironmentFiles(value)
+						if err != nil {
+							return nil, err
+						}
+						values[name] = reply
+						continue
+					}
 					if signature := fixtureOperationSignature(name); signature != "" {
 						data := []any{}
 						if value != "" {
@@ -78,6 +86,16 @@ func newOperationFixture(t *testing.T) *operationFixture {
 				value, ok := props[args[5]]
 				if !ok {
 					return nil, fmt.Errorf("fixture has no property %s", args[5])
+				}
+				if args[5] == "EnvironmentFiles" {
+					if args[4] != "org.freedesktop.systemd1.Service" {
+						return nil, fmt.Errorf("wrong EnvironmentFiles interface: %v", args)
+					}
+					reply, err := fixtureEnvironmentFiles(value)
+					if err != nil {
+						return nil, err
+					}
+					return json.Marshal(reply)
 				}
 				data := []string{value}
 				switch args[5] {
@@ -136,6 +154,9 @@ func newOperationFixture(t *testing.T) *operationFixture {
 			}
 		}
 		for name, value := range props {
+			if value == "" && fixtureOmitsEmptyArray(name) {
+				continue
+			}
 			if len(requested) == 0 || slices.Contains(requested, name) {
 				fmt.Fprintf(&out, "%s=%s\n", name, value)
 			}
@@ -146,7 +167,7 @@ func newOperationFixture(t *testing.T) *operationFixture {
 	return f
 }
 
-// --all keeps empty values; it does not cancel a literal property filter.
+// --all keeps printable empty values; it does not cancel a literal filter.
 func TestOperationFakeShowFiltersLiteralPropertyNames(t *testing.T) {
 	f := newOperationFixture(t)
 	f.unit(t, "billet-node.service")["Conditions"] = "[unprintable]"
@@ -190,11 +211,39 @@ func fixtureOperationSignature(name string) string {
 		return "a(sba(ss))"
 	case "TemporaryFileSystem":
 		return "a(ss)"
-	case "ExecCondition", "ExecStartPre", "ExecStartPost", "ExecStop", "ExecStopPost":
+	case "EnvironmentFiles":
+		return "a(sb)"
+	case "ExecStartEx":
+		return "a(sasasttttuii)"
+	case "ExecCondition", "ExecStart", "ExecStartPre", "ExecStartPost", "ExecReload", "ExecStop", "ExecStopPost":
 		return "a(sasbttttuii)"
 	default:
 		return ""
 	}
+}
+
+func fixtureEnvironmentFiles(value string) (map[string]any, error) {
+	entries := []any{}
+	for _, line := range strings.Split(value, "\n") {
+		if line == "" {
+			continue
+		}
+		path, optional := strings.CutSuffix(line, " (ignore_errors=yes)")
+		if !optional {
+			var required bool
+			path, required = strings.CutSuffix(line, " (ignore_errors=no)")
+			if !required {
+				return nil, fmt.Errorf("invalid fixture environment file %q", line)
+			}
+		}
+		entries = append(entries, []any{path, optional})
+	}
+	return map[string]any{"type": "a(sb)", "data": entries}, nil
+}
+
+func fixtureOmitsEmptyArray(property string) bool {
+	return property == "EnvironmentFiles" || strings.HasSuffix(property, "DirectorySymlink") || strings.HasPrefix(property, "Exec") && fixtureOperationSignature(property) != "" ||
+		slices.Contains([]string{"Paths", "Listen", "TimersMonotonic", "TimersCalendar", "LogFilterPatterns", "BPFProgram", "SocketBindAllow", "SocketBindDeny", "OpenFile"}, property)
 }
 
 func (f *operationFixture) unit(t *testing.T, name string) map[string]string {
@@ -225,7 +274,7 @@ func (f *operationFixture) unit(t *testing.T, name string) map[string]string {
 			"StopPropagatedFrom JoinsNamespaceOf StateDirectory RuntimeDirectory CacheDirectory LogsDirectory " +
 			"ConfigurationDirectory StateDirectorySymlink RuntimeDirectorySymlink CacheDirectorySymlink LogsDirectorySymlink " +
 			"RootDirectory RootImage BindPaths BindReadOnlyPaths TemporaryFileSystem MountImages ExtensionImages ExtensionDirectories " +
-			"ExecCondition ExecStartPre ExecStartPost ExecStop ExecStopPost") {
+			"ExecCondition ExecStartPre ExecStartPost ExecReload ExecStop ExecStopPost") {
 		p[property] = ""
 	}
 	f.units[name] = p
@@ -1044,4 +1093,37 @@ func operationCallRequests(call, property string) bool {
 		}
 	}
 	return false
+}
+
+func TestOperationFakeOmitsOnlySystemd255EmptyStructuredArrays(t *testing.T) {
+	f := newOperationFixture(t)
+	unit := "billet-node.service"
+	p := f.unit(t, unit)
+	p["EnvironmentFiles"], p["ExecStart"], p["ExecStartEx"] = "", "", ""
+	for _, filtered := range []bool{false, true} {
+		for _, property := range []string{"EnvironmentFiles", "ExecStart", "ExecStartEx", "ExecCondition", "ExecStartPre", "ExecStartPost", "ExecStop", "ExecStopPost", "ExecReload", "StateDirectorySymlink", "RuntimeDirectorySymlink", "CacheDirectorySymlink", "LogsDirectorySymlink", "BindPaths", "BindReadOnlyPaths", "MountImages", "ExtensionImages", "TemporaryFileSystem"} {
+			args := []string{"show", "--all"}
+			if filtered {
+				args = append(args, "--property="+property)
+			}
+			args = append(args, "--", unit)
+			out, err := f.inspector.run(t.Context(), "systemctl", args)
+			if err != nil {
+				t.Fatal(err)
+			}
+			printsEmpty := slices.Contains([]string{"BindPaths", "BindReadOnlyPaths", "MountImages", "ExtensionImages", "TemporaryFileSystem"}, property)
+			if strings.Contains(string(out), property+"=\n") != printsEmpty {
+				t.Fatalf("wrong empty printer for %s filtered=%v: %s", property, filtered, out)
+			}
+		}
+	}
+	files, err := f.inspector.EnvironmentFiles(t.Context(), unit)
+	if err != nil || files == nil || len(files) != 0 {
+		t.Fatalf("empty typed environment: %+v %v", files, err)
+	}
+	p["EnvironmentFiles"] = "/etc/one (ignore_errors=no)\n/run/two (ignore_errors=yes)"
+	files, err = f.inspector.EnvironmentFiles(t.Context(), unit)
+	if err != nil || len(files) != 2 || files[0].IgnoreErrors || !files[1].IgnoreErrors {
+		t.Fatalf("typed environment flags: %+v %v", files, err)
+	}
 }

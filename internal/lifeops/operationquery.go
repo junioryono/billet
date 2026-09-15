@@ -93,6 +93,52 @@ func (i *Inspector) operationExecution(ctx context.Context, unit string, command
 		i.operationPass.execution[unit] = cloneOperationProperties(props)
 		return props, nil
 	}
+	values, err := i.operationArrays(ctx, unit, arrays)
+	if err != nil {
+		return nil, err
+	}
+	for property, value := range values {
+		props[property] = value
+	}
+	if i.operationPass != nil {
+		i.operationPass.execution[unit] = cloneOperationProperties(props)
+	}
+	return props, nil
+}
+
+// ProveServiceArrayEmptiness replaces missing/empty text with typed evidence.
+// Nonempty text remains useful for diagnostics and already prevents permission.
+func (i *Inspector) ProveServiceArrayEmptiness(ctx context.Context, unit string, props map[string][]string, names ...string) error {
+	var arrays []struct{ name, signature string }
+	for _, name := range names {
+		if first(props, name) != "" {
+			continue
+		}
+		if name == "ExecReload" {
+			arrays = append(arrays, struct{ name, signature string }{name, "a(sasbttttuii)"})
+			continue
+		}
+		index := slices.IndexFunc(operationArrayProperties, func(p struct{ name, signature string }) bool { return p.name == name })
+		if index < 0 {
+			return fmt.Errorf("operation-array-unknown: unsupported property %s", name)
+		}
+		arrays = append(arrays, operationArrayProperties[index])
+	}
+	if len(arrays) == 0 {
+		return nil
+	}
+	values, err := i.operationArrays(ctx, unit, arrays)
+	if err != nil {
+		return err
+	}
+	for property, value := range values {
+		props[property] = value
+	}
+	return nil
+}
+
+func (i *Inspector) operationArrays(ctx context.Context, unit string, arrays []struct{ name, signature string }) (map[string][]string, error) {
+	props := make(map[string][]string, len(arrays))
 	args := []string{"get-property", "org.freedesktop.systemd1", operationObjectPath(unit), operationExecutionInterface(unit)}
 	for _, property := range arrays {
 		args = append(args, property.name)
@@ -129,9 +175,6 @@ func (i *Inspector) operationExecution(ctx context.Context, unit string, command
 			continue
 		}
 		props[property.name] = []string{""}
-	}
-	if i.operationPass != nil {
-		i.operationPass.execution[unit] = cloneOperationProperties(props)
 	}
 	return props, nil
 }

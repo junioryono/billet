@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestMain(m *testing.M) {
@@ -160,6 +162,9 @@ func runRetireManagerFake(name string, args []string) error {
 	var out strings.Builder
 	for _, property := range names {
 		for _, value := range props[property] {
+			if value == "" && retireFakeOmitsEmptyArray(property) {
+				continue
+			}
 			fmt.Fprintf(&out, "%s=%s\n", property, value)
 		}
 	}
@@ -215,11 +220,21 @@ func retireFakeArraySignature(property string) string {
 		return "a(sba(ss))"
 	case "TemporaryFileSystem":
 		return "a(ss)"
-	case "ExecCondition", "ExecStartPre", "ExecStartPost", "ExecStop", "ExecStopPost":
+	case "EnvironmentFiles":
+		return "a(sb)"
+	case "ExecStartEx":
+		return "a(sasasttttuii)"
+	case "ExecCondition", "ExecStart", "ExecStartPre", "ExecStartPost", "ExecReload", "ExecStop", "ExecStopPost":
 		return "a(sasbttttuii)"
 	default:
 		return ""
 	}
+}
+
+// v255 systemctl-show.c prints these arrays only from inside the entry loop.
+func retireFakeOmitsEmptyArray(property string) bool {
+	return property == "EnvironmentFiles" || strings.HasSuffix(property, "DirectorySymlink") || strings.HasPrefix(property, "Exec") && retireFakeArraySignature(property) != "" ||
+		slices.Contains([]string{"Paths", "Listen", "TimersMonotonic", "TimersCalendar", "LogFilterPatterns", "BPFProgram", "SocketBindAllow", "SocketBindDeny", "OpenFile"}, property)
 }
 
 func runRetireBusFake(root, name string, args []string) error {
@@ -238,6 +253,21 @@ func runRetireBusFake(root, name string, args []string) error {
 		return err
 	}
 	if jsonMode && args[0] == "get-property" && len(args) == 5 {
+		if realUnit := os.Getenv("BILLET_RETIRE_REAL_ENVIRONMENT_UNIT"); realUnit != "" && unit == nodeUnit && args[4] == "EnvironmentFiles" {
+			forwarded := append([]string{"--json=short"}, args...)
+			forwarded[3] = "/org/freedesktop/systemd1/unit/" + busLabel(realUnit)
+			if err := appendRetireManagerRecord(root, ".real-environment-calls", strings.Join(forwarded, " ")); err != nil {
+				return err
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			out, err := exec.CommandContext(ctx, "/usr/bin/busctl", forwarded...).Output()
+			if err != nil {
+				return err
+			}
+			_, err = os.Stdout.Write(out)
+			return err
+		}
 		file := unit + "." + args[4] + ".json"
 		if name == "busctl-execution" && unit == nodeUnit && args[4] == "ExecStart" {
 			file = "node-exec.json"
@@ -255,6 +285,16 @@ func runRetireBusFake(root, name string, args []string) error {
 	}
 	if jsonMode && args[0] == "call" && len(args) == 7 && args[3] == "org.freedesktop.DBus.Properties" && args[4] == "GetAll" && args[5] == "s" && args[6] == "" {
 		values := make(map[string]any)
+		files, err := filepath.Glob(filepath.Join(root, unit+".*.json"))
+		if err != nil {
+			return err
+		}
+		for _, file := range files {
+			property := strings.TrimSuffix(strings.TrimPrefix(filepath.Base(file), unit+"."), ".json")
+			if _, ok := props[property]; !ok {
+				props[property] = nil
+			}
+		}
 		for property, entries := range props {
 			body, err := os.ReadFile(filepath.Join(root, unit+"."+property+".json"))
 			if err == nil {
@@ -302,4 +342,34 @@ func runRetireBusFake(root, name string, args []string) error {
 		}
 	}
 	return nil
+}
+
+func TestRetireManagerFakeOmitsOnlySystemd255EmptyStructuredArrays(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("BILLET_FAKE_UNITS", root)
+	binary := retireManagerExecutable(t, "systemctl")
+	properties := []string{"EnvironmentFiles", "ExecStart", "ExecStartEx", "ExecCondition", "ExecStartPre", "ExecStartPost", "ExecStop", "ExecStopPost", "ExecReload", "StateDirectorySymlink", "RuntimeDirectorySymlink", "CacheDirectorySymlink", "LogsDirectorySymlink", "BindPaths", "BindReadOnlyPaths", "MountImages", "ExtensionImages", "TemporaryFileSystem"}
+	writeFile(t, filepath.Join(root, nodeUnit), "LoadState=loaded\n", 0o600)
+	writeFile(t, filepath.Join(root, nodeUnit+".effects"), strings.Join(properties, "=\n")+"=\n", 0o600)
+	for _, filtered := range []bool{false, true} {
+		args := []string{"show", "--all"}
+		if filtered {
+			args = append(args, "--property="+strings.Join(properties, ","))
+		}
+		args = append(args, "--", nodeUnit)
+		out, err := exec.CommandContext(t.Context(), binary, args...).Output()
+		mustOK(t, err)
+		for _, property := range properties {
+			printsEmpty := slices.Contains([]string{"BindPaths", "BindReadOnlyPaths", "MountImages", "ExtensionImages", "TemporaryFileSystem"}, property)
+			if strings.Contains(string(out), property+"=\n") != printsEmpty {
+				t.Fatalf("wrong empty printer for %s filtered=%v: %s", property, filtered, out)
+			}
+		}
+	}
+	bus := retireManagerExecutable(t, "busctl")
+	out, err := exec.CommandContext(t.Context(), bus, "get-property", "org.freedesktop.systemd1", "/org/freedesktop/systemd1/unit/billet_2dnode_2eservice", "org.freedesktop.systemd1.Service", "EnvironmentFiles", "ExecStopPost", "StateDirectorySymlink").Output()
+	mustOK(t, err)
+	if string(out) != "a(sb) 0\na(sasbttttuii) 0\na(sst) 0\n" {
+		t.Fatalf("empty typed arrays: %q", out)
+	}
 }

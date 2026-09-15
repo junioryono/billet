@@ -232,29 +232,12 @@ func (i *Inspector) operationPropertyStrings(ctx context.Context, unit, property
 		}
 		return operationValueStrings(value), nil
 	}
-	bin := i.operationBusctl
-	if bin == "" {
-		bin = "busctl"
-	}
-	ctx, cancel := i.bounded(ctx)
-	defer cancel()
 	var readErr error
 	for _, kind := range []string{"Service", "Unit"} {
-		args := []string{"--json=short", "get-property", "org.freedesktop.systemd1", operationObjectPath(unit), "org.freedesktop.systemd1." + kind, property}
-		if i.observe != nil {
-			i.observe(ctx, args)
-		}
-		out, err := i.run(ctx, bin, args)
+		reply, err := i.operationTypedProperty(ctx, unit, "org.freedesktop.systemd1."+kind, property)
 		if err != nil {
 			readErr = err
 			continue
-		}
-		var reply struct {
-			Type string          `json:"type"`
-			Data json.RawMessage `json:"data"`
-		}
-		if err := json.Unmarshal(out, &reply); err != nil || reply.Type == "" || len(reply.Data) == 0 || string(reply.Data) == "null" {
-			return nil, fmt.Errorf("retained-node-path-unknown: %s %s has no typed value", unit, property)
 		}
 		var value any
 		if err := json.Unmarshal(reply.Data, &value); err != nil {
