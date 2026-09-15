@@ -230,7 +230,8 @@ jobs:
       # UNDER -race, because the SQLite job cannot buy it for the tests it
       # skips: these are the only run those tests get, and a data race in one
       # of them would otherwise be detected nowhere. The cost is this package
-      # compiled and run twice, which is what the split buys back.
+      # compiled and run again in each PostgreSQL command job, which is what
+      # the split buys back.
       #
       # EXCEPT THE RETIREMENT ADMISSION TESTS, which test-postgres-retirement
       # runs beside this job with the same pattern as -run, so each test is in
@@ -246,11 +247,24 @@ jobs:
   # command tests drive whole retirements to each boundary against PostgreSQL
   # under -race: on e8af8be (2026-09-15) TestRetirementReprovesEachStoppedBoundary
   # had finished 17 of its 39 cases in 11m58s when test-postgres's 30m command
-  # bound fired. They run here, beside the rest of the command suite, so
-  # neither job's bound has to cover both.
+  # bound fired, about half an hour for that test alone by extrapolation. They
+  # run here, beside the rest of the command suite, in two shards: that test on
+  # its own, and every other TestRetirement test. The shards' patterns
+  # partition the TestRetirement names, and test-postgres skips all of them.
   test-postgres-retirement:
     runs-on: billet-8vcpu-ubuntu-2404
     timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: boundaries
+            run: '^TestRetirementReprovesEachStoppedBoundary$'
+            skip: '^$'
+          - shard: operations
+            run: '^TestRetirement'
+            skip: '^TestRetirementReprovesEachStoppedBoundary$'
+    name: test-postgres-retirement (${{ matrix.shard }})
     services:
       postgres:
         image: postgres:18-alpine
@@ -279,11 +293,11 @@ jobs:
           path: |
             ~/.cache/go-build
             ~/go/pkg/mod
-          key: go-race-cover-${{ hashFiles('go.sum') }}-${{ github.sha }}-${{ github.job }}
+          key: go-race-cover-${{ hashFiles('go.sum') }}-${{ github.sha }}-${{ github.job }}-${{ matrix.shard }}
           restore-keys: |
             go-race-cover-${{ hashFiles('go.sum') }}-
       - name: Test the retirement admission suite against PostgreSQL
-        run: go test -race -count=1 -timeout 60m -vet=off -run '^TestRetirement' ./cmd/billet/
+        run: go test -race -count=1 -timeout 60m -vet=off -run '${{ matrix.run }}' -skip '${{ matrix.skip }}' ./cmd/billet/
 
   lint:
     runs-on: billet-8vcpu-ubuntu-2404
