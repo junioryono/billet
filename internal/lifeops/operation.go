@@ -35,6 +35,7 @@ type OperationProtection struct {
 	UnitPaths          map[string][]string
 	RequiredInputs     map[string][]string
 	ArchivedInputRoots []string
+	RetainedPathUnits  []string
 }
 
 // WithOperationUnitDirectories selects the system manager's installation roots.
@@ -125,11 +126,21 @@ type operationWalk struct {
 // the caller will rename, refusing with retained-input-archived. Only recreatable
 // registration and lock records are disposable;
 // cross-unit runtime, credential and private-tmp cleanup still protects them.
+// RetainedPathUnits also scan every loaded property for absolute paths, excluding
+// only unit-file locations and cgroup identifiers. Archive dependencies refuse
+// with retained-node-path-archived, even in optional or negated forms. Volatile
+// paths refuse except beneath that unit's own resolved RuntimeDirectory entries.
+// Callers bind the CLI and loaded configuration pathname to the journal in both
+// lexical and resolved form, and refuse a leaf symlink before intent; persistent
+// parent-directory symlinks remain supported through rewrite and crash resume.
 // Direct triggers of protected services are checked.
 // Evidence is reread, and admission grants no future authority.
 func (i *Inspector) AdmitOperations(ctx context.Context, sequence []Operation, protection OperationProtection) error {
 	w := operationWalk{inspector: i, protection: protection, units: make(map[string]operationEvidence), targets: make(map[string]bool), paths: make(map[string]operationPathBinding), stopped: make(map[string]bool), standard: make(map[string]bool)}
 	if err := w.admitRetainedInputs(); err != nil {
+		return err
+	}
+	if err := w.admitRetainedUnitPaths(ctx); err != nil {
 		return err
 	}
 	for _, op := range sequence {
@@ -176,6 +187,12 @@ func (i *Inspector) AdmitOperations(ctx context.Context, sequence []Operation, p
 		}
 	}
 	if err := i.AdmitQuietActivation(ctx, protection.QuietUnits, protection.QuietExceptions, protection.WaitingUnits...); err != nil {
+		return err
+	}
+	if err := w.revalidatePaths(); err != nil {
+		return err
+	}
+	if err := w.admitRetainedUnitPaths(ctx); err != nil {
 		return err
 	}
 	if err := w.revalidatePaths(); err != nil {

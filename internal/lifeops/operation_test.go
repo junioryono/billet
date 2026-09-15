@@ -2,6 +2,7 @@ package lifeops
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -18,6 +19,7 @@ type operationFixture struct {
 	calls     []string
 	before    func(string)
 	busReply  func(string, string, string) string
+	pathReply func(string, string) ([]byte, error)
 }
 
 func newOperationFixture(t *testing.T) *operationFixture {
@@ -25,6 +27,27 @@ func newOperationFixture(t *testing.T) *operationFixture {
 	f := &operationFixture{units: make(map[string]map[string]string), root: t.TempDir()}
 	f.inspector = NewInspector(WithOperationUnitDirectories(f.root), withRunner(func(_ context.Context, _ string, args []string) ([]byte, error) {
 		f.calls = append(f.calls, strings.Join(args, " "))
+		if args[0] == "--json=short" && args[1] == "get-property" {
+			if f.pathReply != nil && args[5] == "Conditions" {
+				return f.pathReply(args[3], args[5])
+			}
+			for unit, props := range f.units {
+				if operationObjectPath(unit) != args[3] {
+					continue
+				}
+				value, ok := props[args[5]]
+				if !ok {
+					return nil, fmt.Errorf("fixture has no property %s", args[5])
+				}
+				data := []string{value}
+				switch args[5] {
+				case "ReadWritePaths", "ReadOnlyPaths", "InaccessiblePaths":
+					data = strings.Fields(value)
+				}
+				return json.Marshal(map[string]any{"type": "as", "data": data})
+			}
+			return nil, fmt.Errorf("fixture has no object %s", args[3])
+		}
 		if args[0] == "get-property" {
 			for unit, props := range f.units {
 				if operationObjectPath(unit) != args[2] {
@@ -66,6 +89,12 @@ func newOperationFixture(t *testing.T) *operationFixture {
 			return nil, fmt.Errorf("fixture has no evidence for %s", unit)
 		}
 		var out strings.Builder
+		if slices.Contains(args, "--all") {
+			for name, value := range props {
+				fmt.Fprintf(&out, "%s=%s\n", name, value)
+			}
+			return []byte(out.String()), nil
+		}
 		for _, arg := range args {
 			if name, ok := strings.CutPrefix(arg, "--property="); ok {
 				if value, present := props[name]; present {

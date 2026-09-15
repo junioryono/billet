@@ -187,7 +187,7 @@ func (h *realOperationHost) property(unit, property string) string {
 func (h *realOperationHost) admit(sequence []Operation, protection OperationProtection) error {
 	h.t.Helper()
 	i := NewInspector(WithObserver(func(_ context.Context, args []string) {
-		if args[0] != "show" && args[0] != "get-property" {
+		if args[0] != "show" && args[0] != "get-property" && !(args[0] == "--json=short" && args[1] == "get-property") {
 			h.t.Errorf("admission submitted a job: %v", args)
 		}
 	}))
@@ -316,6 +316,10 @@ print(template.render(
 		},
 	}
 	var networkInvocations []string
+	if retained {
+		protection.RetainedPathUnits = []string{node}
+		protection.ArchivedInputRoots = []string{"/var/lib/" + h.prefix + "/server"}
+	}
 	if role && retained {
 		protection.Units = append(protection.Units, network, dns)
 		protection.RequiredActive = []string{network, dns}

@@ -138,6 +138,9 @@ func (i *Inspector) bounded(ctx context.Context) (context.Context, context.Cance
 func (i *Inspector) properties(ctx context.Context, unit string, names ...string) (map[string][]string, error) {
 	args := make([]string, 0, len(names)+3)
 	args = append(args, "show")
+	if len(names) == 0 {
+		args = append(args, "--all")
+	}
 	for _, n := range names {
 		args = append(args, "--property="+n)
 	}
@@ -162,6 +165,9 @@ func (i *Inspector) properties(ctx context.Context, unit string, names ...string
 	for _, line := range strings.Split(string(out), "\n") {
 		key, value, ok := strings.Cut(line, "=")
 		if !ok {
+			if len(names) == 0 && line != "" {
+				return nil, fmt.Errorf("operation-property-unknown: malformed complete property set for %s", unit)
+			}
 			continue
 		}
 		props[key] = append(props[key], value)
@@ -363,7 +369,7 @@ func execStartFlags(rendered string) (string, bool) {
 // UnitProperties asks systemd about one unit, for a caller outside this
 // package that must read a unit under the same runner, bound and parse every
 // other read goes through: the values of the named properties, absence a
-// value and never an error (see properties).
+// value and never an error (see properties). With no names it requests --all.
 func (i *Inspector) UnitProperties(ctx context.Context, unit string, names ...string) (map[string][]string, error) {
 	return i.properties(ctx, unit, names...)
 }

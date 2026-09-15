@@ -41,6 +41,10 @@ func admitRetirePreparation(ctx context.Context, cfg *config.Config, configPath,
 	p.RequiredActive = append(p.RequiredActive, services...)
 	p.RequiredInputs[""] = append(p.RequiredInputs[""], paths...)
 	if cfg.Node != nil {
+		if r := proveRetireConfigLeaf(configPath); r != nil {
+			return r
+		}
+		p.RetainedPathUnits = []string{nodeUnit}
 		environment, err := requiredRetireEnvironmentFiles(ctx)
 		if err != nil {
 			return retireUnknown(retireReasonEffects, err.Error(), "")
@@ -84,6 +88,9 @@ func admitRetireRequestPreparation(ctx context.Context, m retireMode) *retireRef
 		return r
 	}
 	if fact != retirement.JournalFactAbsent {
+		if r := proveRetireConfigPath(ctx, m.configPath, j); r != nil {
+			return r
+		}
 		if j.Phase == retirement.PhaseDone {
 			if _, r := observeRetirePostconditions(ctx, m, j); r != nil {
 				return r
@@ -142,6 +149,7 @@ func retireOperationProtection(j retirement.Journal) lifeops.OperationProtection
 		p.WaitingUnits = []string{backupServiceUnit}
 	}
 	if j.RetainedInvocation != nil {
+		p.RetainedPathUnits = []string{nodeUnit}
 		for _, service := range j.RetainedInvocation.Services {
 			p.Units = append(p.Units, service.Unit)
 			p.RequiredActive = append(p.RequiredActive, service.Unit)
@@ -178,6 +186,9 @@ func admitRetireOperations(ctx context.Context, j retirement.Journal, operations
 		return retireUnknown(retireReasonStopped, "the journal has no original retained-node configuration path, provider and invocation evidence", "")
 	}
 	if j.RetainedInvocation != nil {
+		if r := proveRetireConfigPath(ctx, j.RetainedInvocation.ConfigPath, j); r != nil {
+			return r
+		}
 		if r := proveRetireRequiredResources(ctx, j); r != nil {
 			return retireUnknown(retireReasonEffects, r.Why, "")
 		}
@@ -220,6 +231,9 @@ func admitRetireOperation(ctx context.Context, j retirement.Journal, verb, unit 
 }
 
 func admitRetireRemaining(ctx context.Context, m retireMode, j retirement.Journal) *retireRefusal {
+	if r := proveRetireConfigPath(ctx, m.configPath, j); r != nil {
+		return r
+	}
 	facts, r := observeRetireFacts(ctx, m, j)
 	if r != nil {
 		return r
@@ -254,6 +268,9 @@ func admitRetireRemaining(ctx context.Context, m retireMode, j retirement.Journa
 func captureRetireInvocation(ctx context.Context, cfg *config.Config, configPath string) (*retirement.RetainedInvocation, *retireRefusal) {
 	if cfg.Node == nil {
 		return nil, nil
+	}
+	if r := proveRetireConfigLeaf(configPath); r != nil {
+		return nil, r
 	}
 	props, err := retireOperationInspector().UnitProperties(ctx, nodeUnit, retireNodeProperties...)
 	if err != nil {

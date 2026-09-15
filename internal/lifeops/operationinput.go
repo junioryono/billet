@@ -54,7 +54,7 @@ func (w *operationWalk) admitRetainedInputs() error {
 	}
 	for _, paths := range w.protection.RequiredInputs {
 		for _, path := range paths {
-			if err := w.admitRetainedInput(path, roots); err != nil {
+			if err := w.admitRetainedInput(path, roots, "retained-input-archived"); err != nil {
 				return err
 			}
 		}
@@ -62,7 +62,7 @@ func (w *operationWalk) admitRetainedInputs() error {
 	return nil
 }
 
-func (w *operationWalk) admitRetainedInput(path string, volatileRoots []string) error {
+func (w *operationWalk) admitRetainedInput(path string, volatileRoots []string, archiveReason string) error {
 	type boundary struct {
 		root   string
 		reason string
@@ -72,7 +72,7 @@ func (w *operationWalk) admitRetainedInput(path string, volatileRoots []string) 
 		boundaries = append(boundaries, boundary{root, "retained-input-volatile"})
 	}
 	for _, root := range w.protection.ArchivedInputRoots {
-		boundaries = append(boundaries, boundary{root, "retained-input-archived"})
+		boundaries = append(boundaries, boundary{root, archiveReason})
 	}
 	// A known lexical violation needs no successful traversal of the input.
 	for _, bound := range boundaries {

@@ -823,6 +823,9 @@ func retireRewrite(ctx context.Context, m retireMode, obs *installedConfigObserv
 	}
 	var boundaryRefusal *retireRefusal
 	if err := installRetireConfig(m.configPath, body, func(staged string) error {
+		if boundaryRefusal = proveRetireConfigPath(ctx, m.configPath, j); boundaryRefusal != nil {
+			return errors.New(boundaryRefusal.Why)
+		}
 		if staged != "" {
 			replacement, err := observeRetireResource(staged)
 			if err != nil {

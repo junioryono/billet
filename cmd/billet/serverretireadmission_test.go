@@ -79,6 +79,11 @@ func installRetireOperationEvidence(t *testing.T, f *requestFixture) {
 	busctl := filepath.Join(root, "busctl")
 	writeFile(t, busctl, `#!/bin/sh
 set -eu
+if [ "$1" = --json=short ]; then
+  [ "$2" = get-property ] || exit 2
+  [ "$4" = /org/freedesktop/systemd1/unit/billet_2dnode_2eservice ] || exit 2
+  exec cat "$BILLET_FAKE_UNITS/billet-node.service.$6.json"
+fi
 [ "$1" = get-property ] || exit 2
 [ "$2" = org.freedesktop.systemd1 ] || exit 2
 [ "$4" = org.freedesktop.systemd1.Service ] || exit 2
@@ -135,6 +140,16 @@ func setRetireEffect(t *testing.T, f *requestFixture, unit, key, value string) {
 	lines = slices.DeleteFunc(lines, func(line string) bool { return strings.HasPrefix(line, key+"=") })
 	lines = append(lines, key+"="+value)
 	writeFile(t, path, strings.Join(lines, "\n")+"\n", 0o644)
+	if value != "[unprintable]" {
+		data := []string{value}
+		switch key {
+		case "ReadWritePaths", "ReadOnlyPaths", "InaccessiblePaths":
+			data = strings.Fields(value)
+		}
+		body, err := json.Marshal(map[string]any{"type": "as", "data": data})
+		mustOK(t, err)
+		writeFile(t, filepath.Join(f.unitsDir, unit+"."+key+".json"), string(body), 0o600)
+	}
 }
 
 func TestRetirementAdmitsTheWholeSequenceBeforeIntent(t *testing.T) {
@@ -279,7 +294,7 @@ func TestRetirementReprovesEachStoppedBoundary(t *testing.T) {
 					return nil
 				}
 				retireBeforeRename = func() {
-					if boundary == "archive" && drift != "controller job" {
+					if boundary == "archive" && drift != "controller job" && drift != "network resource" {
 						move()
 					}
 				}
@@ -287,7 +302,7 @@ func TestRetirementReprovesEachStoppedBoundary(t *testing.T) {
 					if boundary == "status" && drift == "backup process" {
 						move()
 					}
-					if boundary == "archive" && drift == "controller job" && requireRetireJournal(t).Phase == retirement.PhaseStopped {
+					if boundary == "archive" && (drift == "controller job" || drift == "network resource") && requireRetireJournal(t).Phase == retirement.PhaseStopped {
 						move()
 					}
 				}
@@ -835,6 +850,9 @@ func TestRetirementRechecksNodeExecutionOnArchivedResume(t *testing.T) {
 			owner := requireRetireJournal(t).Ownership.Owner
 			out, code := retiredRequest(t, f, "ci-2")
 			want := retireReasonUnit
+			if drift == "command" || drift == "arguments" {
+				want = "retained-config-path-changed"
+			}
 			if drift == "KillMode" {
 				want = retireReasonEffects
 			}
@@ -860,7 +878,7 @@ func TestRetirementRechecksNodeExecutionImmediatelyBeforeStart(t *testing.T) {
 		}
 	}
 	next, r := retireRestartNode(t.Context(), f.cfg, j)
-	if r == nil || r.Reason != retireReasonUnit || next.Phase != j.Phase ||
+	if r == nil || r.Reason != "retained-config-path-changed" || next.Phase != j.Phase ||
 		!slices.Contains(f.manager.operations, "stop "+nodeUnit) || slices.Contains(f.manager.operations, "start "+nodeUnit) {
 		t.Fatalf("start used pre-drain execution shape: next=%s refusal=%+v operations=%v", next.Phase, r, f.manager.operations)
 	}

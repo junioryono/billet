@@ -43,7 +43,13 @@ func proveRetireRequiredResources(ctx context.Context, j retirement.Journal) *re
 	}
 	refuse := func(why string) *retireRefusal { return retireUnknown(retireReasonStopped, why, "") }
 	insp := retireOperationInspector()
+	if r := proveRetireConfigLeaf(want.ConfigPath); r != nil {
+		return refuse(r.Reason + ": " + r.Why)
+	}
 	if err := insp.AdmitRetainedInputs(retainedRequiredInputs(want), j.IdentityDir); err != nil {
+		return refuse(err.Error())
+	}
+	if err := insp.AdmitRetainedUnitPaths(ctx, nodeUnit, j.IdentityDir); err != nil {
 		return refuse(err.Error())
 	}
 	if j.InstalledSHA256 != "" {
@@ -96,6 +102,9 @@ func proveRetireRequiredResources(ctx context.Context, j retirement.Journal) *re
 		return refuse("retained-input-environment-unknown: EnvironmentFiles changed during observation")
 	}
 	if err := insp.AdmitRetainedInputs(retainedRequiredInputs(want), j.IdentityDir); err != nil {
+		return refuse(err.Error())
+	}
+	if err := insp.AdmitRetainedUnitPaths(ctx, nodeUnit, j.IdentityDir); err != nil {
 		return refuse(err.Error())
 	}
 	return proveRetireRequiredIdentities(want)

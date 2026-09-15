@@ -42,18 +42,22 @@ func TestRetirementEnvironmentSpecsPreserveEveryOptionalityFlag(t *testing.T) {
 // the shipped node runtime directories. Dropping environment capture admits the
 // mandatory volatile witness; treating optional files as required kills controls.
 func TestRetirementProtectsMandatoryEnvironmentFilesThroughTheHandoff(t *testing.T) {
-	for _, scenario := range []string{"mandatory runtime", "mandatory persistent", "optional present", "optional absent", "mandatory absent", "property missing", "property unreadable", "property query failure"} {
+	for _, scenario := range []string{"mandatory runtime", "mandatory persistent", "optional present", "optional absent", "optional own runtime", "mandatory absent", "property missing", "property unreadable", "property query failure"} {
 		t.Run(scenario, func(t *testing.T) {
 			f := newRequestFixture(t)
 			retainAndRestartANode(t, f)
 			f.reserve(t)
 			setRetireEffect(t, f, nodeUnit, "RuntimeDirectory", "billet/locks billet/registration")
 			path := filepath.Join(f.unitsDir, "volatile", "run", "billet", "locks", "node.env")
-			if scenario == "mandatory persistent" || scenario == "mandatory absent" {
+			if scenario == "mandatory persistent" || scenario == "mandatory absent" || strings.HasPrefix(scenario, "optional") {
 				path = filepath.Join(t.TempDir(), "etc", "billet", "node.env")
 			}
-			mustOK(t, os.MkdirAll(filepath.Dir(path), 0o700))
-			if scenario != "optional absent" && scenario != "mandatory absent" {
+			if scenario == "optional own runtime" {
+				path = "/run/billet/locks/node.env"
+			} else {
+				mustOK(t, os.MkdirAll(filepath.Dir(path), 0o700))
+			}
+			if scenario != "optional absent" && scenario != "mandatory absent" && scenario != "optional own runtime" {
 				writeFile(t, path, "", 0o600)
 			}
 			optional := strings.HasPrefix(scenario, "optional")
