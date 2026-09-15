@@ -23,6 +23,7 @@ import (
 // not installed, a mountinfo the rename's proof reads, and the addresses the
 // address rule compares against.
 type requestFixture struct {
+	originalNode *retirement.RetainedInvocation
 	*retireFixture
 	unitsDir string
 	caPEM    string
@@ -99,16 +100,25 @@ func newRequestFixture(t *testing.T) *requestFixture {
 	// from one revision and record another.
 	writeFile(t, bin, "#!/bin/sh\nunit=\"\"\nnames=\"\"\nfor a in \"$@\"; do case \"$a\" in --property=*) "+
 		"names=\"$names ${a#--property=}\";; --|show) ;; *) unit=$a;; esac; done\n"+
-		"out=$(for n in $names; do grep \"^$n=\" \"$BILLET_FAKE_UNITS/$unit\" || true; done)\n"+
+		"body=$(cat \"$BILLET_FAKE_UNITS/$unit\") || exit $?\n"+
+		"effects=$(cat \"$BILLET_FAKE_UNITS/$unit.effects\") || exit $?\n"+
+		"absent=$(printf '%s\\n' \"$body\" | grep '^LoadState=not-found$' || true)\n"+
+		"out=$(for n in $names; do if [ -n \"$absent\" ]; then case \"$n\" in FragmentPath|SourcePath|DropInPaths|UnitFileState) "+
+		"printf '%s=\\n' \"$n\"; continue;; esac; fi; "+
+		"printf '%s\\n%s\\n' \"$body\" \"$effects\" | grep \"^$n=\"; rc=$?; "+
+		"if [ \"$rc\" -gt 1 ]; then exit \"$rc\"; fi; done; exit 0) || exit $?\n"+
 		"printf '%s\\n' \"$out\"\n"+
 		"state=$(printf '%s\\n' \"$out\" | grep '^ActiveState=' || true)\n"+
-		"echo \"$unit $state\" >> \"$BILLET_FAKE_UNITS/.asked\"\nexit 0\n", 0o755)
+		"echo \"$unit $state\" >> \"$BILLET_FAKE_UNITS/.asked\"\n"+
+		"case \" $names \" in *' ExecMainStatus '*) echo \"$unit\" >> \"$BILLET_FAKE_UNITS/.backup-observed\";; esac\nexit 0\n", 0o755)
 	t.Setenv("BILLET_FAKE_UNITS", f.unitsDir)
 
 	savedSystemctl := systemctlBinary
 	systemctlBinary = bin
 
 	t.Cleanup(func() { systemctlBinary = savedSystemctl })
+
+	installRetireOperationEvidence(t, f)
 
 	// A FAKE SERVICE MANAGER and a lock this test may take: the transition
 	// after intent stops units and holds the lifecycle lock, and neither
@@ -892,6 +902,16 @@ func (f *requestFixture) retainANode(t *testing.T) {
 	started, err := time.Parse(time.RFC3339, "2026-09-11T09:00:00Z")
 	mustOK(t, err)
 	mustOK(t, os.Chtimes(f.cfg, started.Add(-time.Hour), started.Add(-time.Hour)))
+
+	writeRegistrationRecord(t, useRegistrationRecord(t), f.identity, retainedEndpoint, retainedInvocation)
+	installed, refusal := observeRetireConfig(f.cfg)
+	if refusal != nil {
+		t.Fatalf("fixture installed configuration: %+v", refusal)
+	}
+	f.originalNode, refusal = captureRetireInvocation(t.Context(), installed.cfg)
+	if refusal != nil {
+		t.Fatalf("fixture original node: %+v", refusal)
+	}
 
 	f.pgLedger(t, func(db *state.DB) {
 		registerStatusNode(t, db, "node-a", "v0.10.0", strings.Repeat("a", 64), retainedIncarnation)

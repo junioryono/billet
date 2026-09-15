@@ -20,6 +20,7 @@ type retireServiceManager struct {
 	t          *testing.T
 	unitsDir   string
 	operations []string
+	onEnable   func(string)
 }
 
 func (s *retireServiceManager) Enable(ctx context.Context, unit string) error {
@@ -30,6 +31,9 @@ func (s *retireServiceManager) Enable(ctx context.Context, unit string) error {
 		if also := s.alsoEnables[unit]; also != "" {
 			s.set(also, "UnitFileState", s.enabled[also])
 		}
+	}
+	if s.onEnable != nil {
+		s.onEnable(unit)
 	}
 
 	return err
@@ -61,6 +65,7 @@ func (s *retireServiceManager) StartAndProve(ctx context.Context, unit string) (
 }
 
 func (s *retireServiceManager) Disable(ctx context.Context, unit string) error {
+	s.operations = append(s.operations, "disable "+unit)
 	err := s.fakeConverger.Disable(ctx, unit)
 	if err == nil {
 		s.set(unit, "UnitFileState", "disabled")

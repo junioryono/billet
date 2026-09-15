@@ -343,6 +343,10 @@ func resumeRetirement(ctx context.Context, m retireMode, shape claimShape, db *s
 		return nil, r
 	}
 
+	if r := admitRetireRemaining(ctx, m, j); r != nil {
+		return nil, r
+	}
+
 	if j.Ownership.Owner != m.run {
 		j.Rebind(m.run)
 
@@ -1710,6 +1714,31 @@ func applyRetireIntent(ctx context.Context, m retireMode, root *txLock, dir *os.
 ) (any, *retireRefusal) {
 	now := retireNow()
 
+	j := retirement.Journal{
+		Schema: retirement.JournalSchema, Phase: retirement.PhaseIntent, Variant: plan.variant,
+		Deployment: plan.identity, Retiring: m.retiringHost, Survivor: plan.survivor,
+		Backend: string(config.StatePostgres), Controllers: string(config.ControllersActivePassive),
+		IdentityDir: plan.cfg.Server.IdentityDir, Archive: plan.archive,
+		InstalledSHA256: plan.installed, Config: "absent",
+		Nodes: plan.nodes, EndpointFailoverVerified: plan.failover,
+		Locator: retirement.JournalLocator{Backend: string(config.StatePostgres), DSNEnv: plan.cfg.Server.LedgerDSNEnv(),
+			EnvironmentFile: m.environmentFile, IdentityDir: plan.cfg.Server.IdentityDir, Archive: plan.archive},
+		Provenance: retirement.Provenance{ReservingHolder: plan.row.Run, TransitionID: plan.row.TransitionID,
+			Reservation: plan.row.ReservedAt, Deployment: plan.identity, Retiring: m.retiringHost, Survivor: plan.survivor.Host},
+		Ownership: retirement.Ownership{Owner: m.run},
+	}
+
+	if plan.variant == retirement.VariantRetainedNode {
+		original, r := captureRetireInvocation(ctx, plan.cfg)
+		if r != nil {
+			return nil, r
+		}
+		j.RetainedInvocation = original
+	}
+	if r := admitRetireOperations(ctx, j, retireServiceSequence(j, retirement.Decision{Action: retirement.ActionStop})); r != nil {
+		return nil, r
+	}
+
 	if shape.Guard.Transition == nil {
 		record := shape.Guard
 		record.Transition = &guardTransition{Kind: transitionRetirement, ID: plan.row.TransitionID}
@@ -1731,26 +1760,18 @@ func applyRetireIntent(ctx context.Context, m retireMode, root *txLock, dir *os.
 		}
 	}
 
-	j := retirement.Journal{
-		Schema: retirement.JournalSchema, Phase: retirement.PhaseIntent, Variant: plan.variant,
-		Deployment: plan.identity, Retiring: m.retiringHost, Survivor: plan.survivor,
-		Backend: string(config.StatePostgres), Controllers: string(config.ControllersActivePassive),
-		IdentityDir: plan.cfg.Server.IdentityDir, Archive: plan.archive,
-		InstalledSHA256: plan.installed, Config: "absent",
-		Nodes: plan.nodes, EndpointFailoverVerified: plan.failover,
-		Locator: retirement.JournalLocator{Backend: string(config.StatePostgres), DSNEnv: plan.cfg.Server.LedgerDSNEnv(),
-			EnvironmentFile: m.environmentFile, IdentityDir: plan.cfg.Server.IdentityDir, Archive: plan.archive},
-		Provenance: retirement.Provenance{ReservingHolder: plan.row.Run, TransitionID: plan.row.TransitionID,
-			Reservation: plan.row.ReservedAt, Deployment: plan.identity, Retiring: m.retiringHost, Survivor: plan.survivor.Host},
-		Ownership: retirement.Ownership{Owner: m.run},
-	}
-
 	if plan.variant == retirement.VariantRetainedNode {
 		if err := retirement.WriteStage(plan.rendering); err != nil {
 			return nil, retireUnknown(retireReasonStage, err.Error(), "")
 		}
 
 		j.StagedSHA256, j.Config = retirement.Digest(plan.rendering), "present"
+	}
+
+	// Marker and stage persistence can block after the planned admission. The
+	// staged host now supplies the phase table's actual pre-intent decision.
+	if r := admitRetireRemaining(ctx, m, j); r != nil {
+		return nil, r
 	}
 
 	if err := j.Write(now); err != nil {

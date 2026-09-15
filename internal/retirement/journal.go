@@ -77,7 +77,8 @@ type Journal struct {
 	// TimerStoppedAt is written while the journal is still at intent,
 	// immediately after the timers are stopped and before the status closes,
 	// so a resume recognises a backup that refused in that window.
-	TimerStoppedAt string `json:"timer_stopped_at"`
+	TimerStoppedAt     string              `json:"timer_stopped_at"`
+	RetainedInvocation *RetainedInvocation `json:"retained_invocation,omitempty"`
 
 	// RowDone acknowledges the ledger row's `done`, after which no phase check
 	// opens a ledger; CompletedBy names who wrote it. Settled is the tail's
@@ -253,6 +254,10 @@ func (j *Journal) wellFormed() error {
 
 	if _, err := time.Parse(time.RFC3339, j.WrittenAt); err != nil {
 		return fmt.Errorf("journal carries an unparseable written_at: %w", err)
+	}
+
+	if err := j.retainedInvocationWellFormed(); err != nil {
+		return err
 	}
 
 	return j.tailWellFormed()

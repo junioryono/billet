@@ -51,6 +51,10 @@ func retireResumeArchived(ctx context.Context, m retireMode, root *txLock, dir *
 			"the runbook in docs/operating/upgrades.md"))
 	}
 
+	if r := admitRetireRemaining(ctx, m, j); r != nil {
+		return nil, atRetirePhase(j, r)
+	}
+
 	if j.Ownership.Owner != m.run {
 		j.Rebind(m.run)
 

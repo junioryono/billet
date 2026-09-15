@@ -1893,6 +1893,8 @@ func (s ServiceFacts) PulledUnits() []string {
 	return units
 }
 
+// Retirement uses Inspector.AdmitOperations for a bounded, preventive closure;
+// this ordinary-up diagnostic retains its separate before/after contract.
 // pulledRefusals asks each unit this one would pull in what IT would do to
 // billet's other service.
 //

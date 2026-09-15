@@ -69,6 +69,7 @@ func (f *requestFixture) plantJournal(t *testing.T, phase retirement.Phase, vari
 		mustOK(t, retirement.WriteStage(body))
 
 		j.StagedSHA256, j.Config = retirement.Digest(body), "present"
+		j.RetainedInvocation = f.originalNode
 	}
 
 	// THE TIMERS' STOP IS RECORDED FROM INTENT ON, which is where the window a
@@ -479,7 +480,7 @@ func TestABackupIsAwaitedAndOnlyItsOwnRefusalIsReconciled(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			f := newRequestFixture(t)
 			unit := filepath.Join(f.unitsDir, backupServiceUnit)
-			writeFile(t, unit, c.unit, 0o644)
+			writeFile(t, unit, c.unit+"UnitFileState=static\n", 0o644)
 
 			// The wait is a test's: a poll and a bound this case can reach.
 			savedWait, savedPoll := retireBackupWait, retireBackupPoll
@@ -500,15 +501,10 @@ func TestABackupIsAwaitedAndOnlyItsOwnRefusalIsReconciled(t *testing.T) {
 
 			t.Cleanup(func() { retireResetFailedFn = savedReset })
 
-			// A BACKUP THAT FINISHES ON ITS OWN does so WHILE THE WAIT RUNS.
-			// The fake records each question AFTER it has answered it, so a
-			// recorded question is an observation the transition COMPLETED,
-			// and the resolution is written behind the SECOND of them: the
-			// first is the table's own observation, the second can only be one
-			// the wait itself made. The case then requires exactly ONE await
-			// in the steps, so an await that returned without waiting — which
-			// would meet a backup still running at the next decision — shows
-			// up as a second await and fails.
+			// Admission reads dependency evidence separately. Count only completed
+			// backup-state observations: initial remaining-work observation, table
+			// observation, then the wait's first poll. An early-returning wait
+			// still produces a second await step and fails the action assertion.
 			waited := make(chan struct{})
 			stop := make(chan struct{})
 
@@ -519,7 +515,7 @@ func TestABackupIsAwaitedAndOnlyItsOwnRefusalIsReconciled(t *testing.T) {
 					deadline := time.After(30 * time.Second)
 
 					for {
-						if strings.Count(readIfAny(filepath.Join(f.unitsDir, ".asked")), backupServiceUnit) >= 2 {
+						if strings.Count(readIfAny(filepath.Join(f.unitsDir, ".backup-observed")), backupServiceUnit) >= 3 {
 							publishUnit(t, unit, c.resolve)
 
 							return
@@ -675,19 +671,25 @@ func TestAResumeIsHeldToItsJournalAndMarker(t *testing.T) {
 	}
 }
 
+var retireRegistrationFixturePath string
+
 // useRegistrationRecord points the node's runtime record at a path this test
 // owns, and admits the file it writes: the reader requires a root-owned 0600
 // record, which no test process can create.
 func useRegistrationRecord(t *testing.T) string {
 	t.Helper()
 
+	if retireRegistrationFixturePath != "" && registrationRecordPath == retireRegistrationFixturePath {
+		return registrationRecordPath
+	}
+
 	dir := filepath.Join(t.TempDir(), "registration")
 	mustOK(t, os.MkdirAll(dir, 0o700))
 
 	path := filepath.Join(dir, "current")
-
 	savedPath, savedOpen := registrationRecordPath, registrationOpen
-	registrationRecordPath = path
+	savedFixture := retireRegistrationFixturePath
+	registrationRecordPath, retireRegistrationFixturePath = path, path
 	registrationOpen = func(name string) (*os.File, os.FileInfo, error) {
 		f, err := os.Open(name)
 		if err != nil {
@@ -702,7 +704,10 @@ func useRegistrationRecord(t *testing.T) string {
 		return f, rootOwned{info}, nil
 	}
 
-	t.Cleanup(func() { registrationRecordPath, registrationOpen = savedPath, savedOpen })
+	t.Cleanup(func() {
+		registrationRecordPath, registrationOpen = savedPath, savedOpen
+		retireRegistrationFixturePath = savedFixture
+	})
 
 	return path
 }

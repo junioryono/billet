@@ -583,6 +583,20 @@ jobs:
         if: matrix.group == 'policy'
         run: make hybrid-emission-check
 
+      # A retirement admits each service operation from the unit graph systemd
+      # reports, and a fake manager answers whatever the test wrote. This runs
+      # the shipped units, the role's rendered units and the collateral-effect
+      # hazards (OnSuccess=, PropagatesStopTo=, a shared RuntimeDirectory=)
+      # against the guest's own systemd 255, which is disposable. Compiled as
+      # the runner's user so the Go cache stays its own, run as root from the
+      # package directory the test reads its unit files relative to.
+      - name: Measure retirement operation effects on real systemd
+        if: matrix.group == 'policy'
+        run: |
+          go test -c -o "$RUNNER_TEMP/lifeops.test" ./internal/lifeops
+          cd internal/lifeops
+          sudo env "PATH=$PATH" BILLET_TEST_SYSTEMD_OPERATION_EFFECTS=1 "$RUNNER_TEMP/lifeops.test" -test.count=1 -test.v -test.run '^TestRealSystemdRetirementOperationEffects$'
+
   # Both legs here need the real Debian package, so they share a job: `dist` is
   # phony and runs again for the second target, but the Go build cache is warm
   # by then and it costs about a minute.

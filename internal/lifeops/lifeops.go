@@ -285,7 +285,9 @@ type Report struct {
 // thing is testable without root, without systemd and without a real account
 // database — none of which a unit test can supply.
 type Inspector struct {
-	run runner
+	run               runner
+	operationUnitDirs []string
+	operationBusctl   string
 	// waitDelay is the grace execRunner gives a cancelled run; see
 	// WithWaitDelay.
 	waitDelay time.Duration
