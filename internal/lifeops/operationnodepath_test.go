@@ -26,6 +26,14 @@ func TestRetainedNodePathsCoverEveryPropertyAtEveryAdmission(t *testing.T) {
 				}
 				for _, prefix := range []string{"", "-", "!", "|!"} {
 					node[property] = prefix + "/var/lib/billet/server"
+					if property == "EnvironmentFiles" {
+						// systemd reports an EnvironmentFile= entry with its optionality, not a prefix.
+						ignore := "no"
+						if prefix == "-" {
+							ignore = "yes"
+						}
+						node[property] = "/var/lib/billet/server (ignore_errors=" + ignore + ")"
+					}
 					if err := f.inspector.AdmitOperations(t.Context(), sequence, p); err == nil || !strings.Contains(err.Error(), "retained-node-path-archived") {
 						t.Fatalf("property omitted or optional semantics exempted archive dependence: %v", err)
 					}
