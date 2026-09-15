@@ -109,7 +109,9 @@ func retireTransition(ctx context.Context, m retireMode, obs *installedConfigObs
 		}
 
 		if d.Action == retirement.ActionPostconditions {
-			return j, steps, nil
+			_, r := observeRetirePostconditions(ctx, m, j)
+
+			return j, steps, r
 		}
 
 		if r := retireHoldLifecycle(&host, d.Action); r != nil {
@@ -182,7 +184,7 @@ func performRetireAction(ctx context.Context, m retireMode, obs *installedConfig
 	case retirement.ActionRestart:
 		return retireRestartNode(ctx, j)
 	case retirement.ActionDone:
-		return retireMarkDone(j)
+		return retireMarkDone(ctx, m, j)
 	default:
 		return j, retireUnknown(retireReasonPhase, fmt.Sprintf("the phase table answered %q, which this does not "+
 			"perform", action), "")
@@ -825,10 +827,37 @@ func retireRestartNode(ctx context.Context, j retirement.Journal) (retirement.Jo
 			"persistently enabled", nodeUnit, state.How), "")
 	}
 
+	// Enabling the node can also enable the controller through [Install] Also=.
+	// Read that back before disturbing the node or certifying its restart.
+	controller, err := c.EnabledNow(ctx, serverUnit)
+	if err != nil {
+		return j, retireUnknown(retireReasonRestart, "read back the controller's enablement after enabling "+
+			nodeUnit+": "+err.Error(), "")
+	}
+
+	if controller.How != "disabled" && controller.How != "masked" {
+		return j, retireUnknown(retireReasonRestart, fmt.Sprintf("after enabling %s, %s is %q; the controller must remain "+
+			"persistently disabled or masked before the node is stopped or started", nodeUnit, serverUnit, controller.How), "")
+	}
+
 	// THE NODE'S OWN STOP, which waits for the work it is running for as long
 	// as that takes; nothing here bounds it.
 	if _, err := c.StopAndProve(ctx, nodeUnit); err != nil {
 		return j, retireUnknown(retireReasonRestart, "stop "+nodeUnit+": "+err.Error(), "")
+	}
+
+	// Disappearance alone permits a failed drain. Only the complete successful
+	// stop observation permits starting another invocation and advancing the phase.
+	post, problem := observeUnit(ctx, endpointInspector(), nodeUnit)
+	if problem != "" {
+		return j, retireUnknown(retireReasonRestart, "after the node stop: "+problem+"; the node was not restarted", "")
+	}
+
+	if _, present := post.raw["Result"]; !present || post.ActiveState != "inactive" || post.SubState != "dead" ||
+		post.Result != "success" {
+		return j, retireUnknown(retireReasonRestart, fmt.Sprintf("the successful stop of %s is not proved: "+
+			"ActiveState=%s SubState=%s Result=%s; only inactive/dead/success permits restart; the node was not restarted",
+			nodeUnit, orUnknownWord(post.ActiveState), orUnknownWord(post.SubState), orUnknownWord(post.Result)), "")
 	}
 
 	if _, err := c.StartAndProve(ctx, nodeUnit); err != nil {
@@ -840,7 +869,11 @@ func retireRestartNode(ctx context.Context, j retirement.Journal) (retirement.Jo
 
 // retireMarkDone publishes the last phase and the status that goes with it.
 // The tail after it (the receipt, the row and the marker) is the next change.
-func retireMarkDone(j retirement.Journal) (retirement.Journal, *retireRefusal) {
+func retireMarkDone(ctx context.Context, m retireMode, j retirement.Journal) (retirement.Journal, *retireRefusal) {
+	if _, r := observeRetirePostconditions(ctx, m, j); r != nil {
+		return j, r
+	}
+
 	now := retireNow()
 	j.DoneAt = now.UTC().Format(time.RFC3339Nano)
 
@@ -849,8 +882,8 @@ func retireMarkDone(j retirement.Journal) (retirement.Journal, *retireRefusal) {
 		return next, r
 	}
 
-	if err := retirement.WriteStatus(retirement.PhaseDone, j.Variant, now); err != nil {
-		return next, retireUnknown(retireReasonStatus, "publish the status: "+err.Error(), "")
+	if _, r := retireStatusPostcondition(ctx, m, next); r != nil {
+		return next, r
 	}
 
 	return next, nil

@@ -450,12 +450,12 @@ func TestABackupIsAwaitedAndOnlyItsOwnRefusalIsReconciled(t *testing.T) {
 		"a backup that finishes is waited for": {
 			unit: "LoadState=loaded\nActiveState=active\nSubState=running\nResult=success\nMainPID=99\n",
 			resolve: "LoadState=loaded\nActiveState=inactive\nSubState=dead\nResult=success\nMainPID=0\n" +
-				"ExecMainCode=1\nExecMainStatus=0\n",
+				"UnitFileState=static\nExecMainCode=1\nExecMainStatus=0\n",
 		},
 		"the refusal this retirement caused is cleared": {
 			unit: "LoadState=loaded\nActiveState=failed\nSubState=failed\nResult=exit-code\nMainPID=0\n" +
 				"ExecMainCode=1\nExecMainStatus=6\nExecMainStartTimestamp=Fri 2026-09-11 10:00:30 UTC\n",
-			resolve:   "LoadState=loaded\nActiveState=inactive\nSubState=dead\nResult=success\nMainPID=0\n",
+			resolve:   "LoadState=loaded\nActiveState=inactive\nSubState=dead\nResult=success\nMainPID=0\nUnitFileState=static\n",
 			reconcile: true,
 		},
 		"a backup that failed with another status is not this retirement's": {
