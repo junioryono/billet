@@ -81,6 +81,7 @@ type operationWalk struct {
 	targets    map[string]bool
 	paths      map[string]operationPathBinding
 	stopped    map[string]bool
+	setups     map[string]map[string]operationSetupValue
 }
 
 // AdmitOperations is read-only and valid only at this boundary. It checks the
@@ -92,9 +93,13 @@ type operationWalk struct {
 // unit programs: a root-authored command can do anything, which no static check
 // proves otherwise. Helpers remain permitted where their manager-effect graph
 // cannot reach protected resources. Callers must repeat the existing node
-// execution-shape inspection wherever they authorize a node start.
+// execution-shape inspection wherever they authorize a node start. Newly started
+// helpers require every property of their complete execution/type interface to
+// match the closed setup allowlist; unknown properties or values refuse. Quiet
+// services require a bounded reverse activation closure free of armed sources
+// and active completion handlers, including through aliases and instances.
 func (i *Inspector) AdmitOperations(ctx context.Context, sequence []Operation, protection OperationProtection) error {
-	w := operationWalk{inspector: i, protection: protection, units: make(map[string]operationEvidence), targets: make(map[string]bool), paths: make(map[string]operationPathBinding), stopped: make(map[string]bool)}
+	w := operationWalk{inspector: i, protection: protection, units: make(map[string]operationEvidence), targets: make(map[string]bool), paths: make(map[string]operationPathBinding), stopped: make(map[string]bool), setups: make(map[string]map[string]operationSetupValue)}
 	for _, op := range sequence {
 		w.targets[op.Unit] = true
 	}
@@ -126,6 +131,12 @@ func (i *Inspector) AdmitOperations(ctx context.Context, sequence []Operation, p
 		}
 		if !reflect.DeepEqual(before, after) {
 			return fmt.Errorf("operation-evidence-changed: %s changed during admission", unit)
+		}
+	}
+	for unit, before := range w.setups {
+		after, err := i.operationSetup(ctx, unit)
+		if err != nil || !reflect.DeepEqual(before, after) {
+			return fmt.Errorf("operation-setup-changed: %s changed or could not be read", unit)
 		}
 	}
 	for _, op := range sequence {
@@ -331,6 +342,14 @@ func (w *operationWalk) admit(ctx context.Context, op Operation) error {
 			// are still traversed. This is different from an unreadable unit.
 			continue
 		}
+		if effect.Verb == "stop" && !w.stopped[effect.Unit] {
+			w.stopped[effect.Unit] = true
+			start := Operation{Verb: "start", Unit: effect.Unit}
+			if seen[start] {
+				delete(seen, start)
+				queue = append(queue, start)
+			}
+		}
 		// An active start is idempotent, but its dependencies still join the
 		// transaction. Earlier stops in this sequence invalidate that premise.
 		activeNoop := effect.Verb == "start" && first(ev.props, "ActiveState") == "active" && !w.stopped[effect.Unit]
@@ -349,6 +368,11 @@ func (w *operationWalk) admit(ctx context.Context, op Operation) error {
 		}
 		if effect == op && effect.Verb == "start" {
 			if err := w.admitMountRequirements(effect, ev); err != nil {
+				return err
+			}
+		}
+		if !activeNoop && effect.Verb == "start" {
+			if err := w.admitSetup(ctx, effect, ev); err != nil {
 				return err
 			}
 		}

@@ -1,6 +1,7 @@
 package lifeops
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -73,5 +74,73 @@ func TestQuietActivationExceptionsExpireAtStoppedProof(t *testing.T) {
 	}
 	if err := f.inspector.AdmitQuietActivation(t.Context(), units, nil); err == nil || !strings.Contains(err.Error(), "operation-activation-changed") {
 		t.Fatalf("source changed across the proof: %v", err)
+	}
+}
+
+func TestQuietActivationClosesEveryReverseRelationship(t *testing.T) {
+	for _, relation := range []string{"TriggeredBy", "UpheldBy", "OnSuccessOf", "OnFailureOf", "WantedBy", "RequiredBy", "BoundBy", "RequisiteOf", "ConsistsOf"} {
+		for _, source := range []string{"watcher.path", "watcher.socket", "watcher.timer", "watcher.automount", "upholder.service", "completing.service"} {
+			t.Run(relation+"/"+source, func(t *testing.T) {
+				f := newOperationFixture(t)
+				backup := f.unit(t, "billet-backup.service")
+				helper := f.unit(t, "helper@instance.service")
+				middle := f.unit(t, "middle.service")
+				trigger := f.unit(t, source)
+				backup[relation] = "helper@instance.service"
+				helper["RequiredBy"] = "middle.service"
+				last := "TriggeredBy"
+				if source == "upholder.service" {
+					last = "UpheldBy"
+				} else if source == "completing.service" {
+					last = "OnSuccessOf"
+				}
+				middle[last] = source
+				units := []string{"billet-backup.service"}
+				if err := f.inspector.AdmitQuietActivation(t.Context(), units, nil); err != nil {
+					t.Fatalf("inactive closure control: %v", err)
+				}
+				trigger["ActiveState"] = "active"
+				if err := f.inspector.AdmitQuietActivation(t.Context(), units, nil); err == nil || !strings.Contains(err.Error(), "operation-reactivation: "+source) {
+					t.Fatalf("transitive source admitted: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestQuietActivationRevisitsAliasesAndRefusesIncompleteClosure(t *testing.T) {
+	for _, defect := range []string{"alias completion", "revisited completion", "unreadable", "bound"} {
+		t.Run(defect, func(t *testing.T) {
+			f := newOperationFixture(t)
+			backup := f.unit(t, "billet-backup.service")
+			helper := f.unit(t, "helper.service")
+			backup["WantedBy"] = "helper.service"
+			helper["ActiveState"] = "active"
+			if err := f.inspector.AdmitQuietActivation(t.Context(), []string{"billet-backup.service"}, nil); err != nil {
+				t.Fatalf("active dependency is not an armed source: %v", err)
+			}
+			switch defect {
+			case "alias completion":
+				backup["OnFailureOf"] = "alias.service"
+				alias := f.unit(t, "alias.service")
+				alias["Id"], alias["Names"], alias["ActiveState"] = "helper.service", "helper.service alias.service", "active"
+				helper["Names"] = alias["Names"]
+			case "revisited completion":
+				backup["RequiredBy"] = "middle.service"
+				middle := f.unit(t, "middle.service")
+				middle["OnSuccessOf"] = "helper.service"
+			case "unreadable":
+				delete(helper, "OnSuccessOf")
+			case "bound":
+				for n := range operationUnitLimit {
+					name := fmt.Sprintf("source-%d.service", n)
+					helper["WantedBy"] = name
+					helper = f.unit(t, name)
+				}
+			}
+			if err := f.inspector.AdmitQuietActivation(t.Context(), []string{"billet-backup.service"}, nil); err == nil {
+				t.Fatalf("%s escaped the reverse closure", defect)
+			}
+		})
 	}
 }

@@ -18,13 +18,18 @@ type operationFixture struct {
 	calls     []string
 	before    func(string)
 	busReply  func(string, string, string) string
+	setups    map[string]map[string]operationSetupValue
+	setupRead func(string)
 }
 
 func newOperationFixture(t *testing.T) *operationFixture {
 	t.Helper()
-	f := &operationFixture{units: make(map[string]map[string]string), root: t.TempDir()}
+	f := &operationFixture{units: make(map[string]map[string]string), root: t.TempDir(), setups: make(map[string]map[string]operationSetupValue)}
 	f.inspector = NewInspector(WithOperationUnitDirectories(f.root), withRunner(func(_ context.Context, _ string, args []string) ([]byte, error) {
 		f.calls = append(f.calls, strings.Join(args, " "))
+		if args[0] == "--xml-interface" || args[0] == "--json=short" {
+			return f.setupReply(args)
+		}
 		if args[0] == "get-property" {
 			for unit, props := range f.units {
 				if operationObjectPath(unit) != args[2] {
@@ -110,7 +115,7 @@ func (f *operationFixture) unit(t *testing.T, name string) map[string]string {
 		"FragmentPath": path, "SourcePath": "", "DropInPaths": "", "NeedDaemonReload": "no",
 		"OnSuccessJobMode": "fail", "OnFailureJobMode": "replace", "FailureAction": "none", "SuccessAction": "none",
 		"StartLimitAction": "none", "JobTimeoutAction": "none", "RequiresMountsFor": "", "Where": "/ledger",
-		"Job": "", "KillMode": "control-group", "DynamicUser": "no", "RuntimeDirectoryPreserve": "no", "StopWhenUnneeded": "no",
+		"Transient": "no", "Job": "", "KillMode": "control-group", "DynamicUser": "no", "RuntimeDirectoryPreserve": "no", "StopWhenUnneeded": "no",
 	}
 	// Independent of the production query lists, so deleting a queried property
 	// cannot delete that evidence from the fixture at the same time.
@@ -124,6 +129,7 @@ func (f *operationFixture) unit(t *testing.T, name string) map[string]string {
 		p[property] = ""
 	}
 	f.units[name] = p
+	f.setups[name] = fixtureOperationSetup()
 	return p
 }
 

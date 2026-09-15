@@ -84,7 +84,20 @@ func admitRetireOperations(ctx context.Context, j retirement.Journal, operations
 			}
 		}
 	}
-	if err := retireOperationInspector().AdmitOperations(ctx, operations, retireOperationProtection(j)); err != nil {
+	protection := retireOperationProtection(j)
+	// Individual operations use the same fixed shutdown order as the driver.
+	// A timer's exception expires before its disable, even while phase=intent.
+	first := operations[0]
+	if first.Unit == backupTimerUnit {
+		protection.QuietExceptions = slices.DeleteFunc(protection.QuietExceptions, func(unit string) bool {
+			return unit == upgradeTimerUnit || first.Verb != "stop"
+		})
+	} else if first.Unit == upgradeTimerUnit && first.Verb != "stop" {
+		protection.QuietExceptions = slices.DeleteFunc(protection.QuietExceptions, func(unit string) bool { return unit == upgradeTimerUnit })
+	} else if first.Unit != upgradeTimerUnit {
+		protection.QuietExceptions = nil
+	}
+	if err := retireOperationInspector().AdmitOperations(ctx, operations, protection); err != nil {
 		return retireUnknown(retireReasonEffects, err.Error(), "inspect the named unit and its effective sources; retry with current evidence")
 	}
 	return nil
