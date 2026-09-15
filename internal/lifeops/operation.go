@@ -18,12 +18,15 @@ type Operation struct {
 // OperationProtection describes resources which must survive the operation.
 // Paths owned by the target remain protected; only UnitPaths of the target
 // may be managed by its own directory directives. RequiredActive permits an
-// idempotent dependency start while active, never a stop.
+// idempotent dependency start while active, never a stop. QuietUnits require
+// inactive activation sources; QuietExceptions are sources this sequence stops.
 type OperationProtection struct {
-	Units          []string
-	RequiredActive []string
-	Paths          []string
-	UnitPaths      map[string][]string
+	Units           []string
+	QuietUnits      []string
+	QuietExceptions []string
+	RequiredActive  []string
+	Paths           []string
+	UnitPaths       map[string][]string
 }
 
 // WithOperationUnitDirectories selects the system manager's installation roots.
@@ -77,12 +80,21 @@ type operationWalk struct {
 	units      map[string]operationEvidence
 	targets    map[string]bool
 	paths      map[string]operationPathBinding
+	stopped    map[string]bool
 }
 
 // AdmitOperations is read-only and valid only at this boundary. It checks the
 // whole sequence, then rereads the evidence so a changed definition refuses.
+// Admission judges service-manager effects: relationships in both directions,
+// completion handlers and job modes, manager actions, installation links,
+// directory directives, termination policy and every systemd 255 activation
+// source (including timers, paths, sockets and Upholds). It does not interpret
+// unit programs: a root-authored command can do anything, which no static check
+// proves otherwise. Helpers remain permitted where their manager-effect graph
+// cannot reach protected resources. Callers must repeat the existing node
+// execution-shape inspection wherever they authorize a node start.
 func (i *Inspector) AdmitOperations(ctx context.Context, sequence []Operation, protection OperationProtection) error {
-	w := operationWalk{inspector: i, protection: protection, units: make(map[string]operationEvidence), targets: make(map[string]bool), paths: make(map[string]operationPathBinding)}
+	w := operationWalk{inspector: i, protection: protection, units: make(map[string]operationEvidence), targets: make(map[string]bool), paths: make(map[string]operationPathBinding), stopped: make(map[string]bool)}
 	for _, op := range sequence {
 		w.targets[op.Unit] = true
 	}
@@ -102,6 +114,9 @@ func (i *Inspector) AdmitOperations(ctx context.Context, sequence []Operation, p
 		if err := w.admit(ctx, op); err != nil {
 			return fmt.Errorf("operation-effects: %s %s: %w", op.Verb, op.Unit, err)
 		}
+		if op.Verb == "stop" || op.Verb == "start" {
+			w.stopped[op.Unit] = op.Verb == "stop"
+		}
 	}
 	for _, unit := range sortedOperationUnits(w.units) {
 		before := w.units[unit]
@@ -119,6 +134,9 @@ func (i *Inspector) AdmitOperations(ctx context.Context, sequence []Operation, p
 				return err
 			}
 		}
+	}
+	if err := i.AdmitQuietActivation(ctx, protection.QuietUnits, protection.QuietExceptions); err != nil {
+		return err
 	}
 	if err := w.revalidatePaths(); err != nil {
 		return err
@@ -313,11 +331,13 @@ func (w *operationWalk) admit(ctx context.Context, op Operation) error {
 			// are still traversed. This is different from an unreadable unit.
 			continue
 		}
-		// Manager actions bypass the dependency graph and affect the whole host.
-		// Helpers may carry commands only when their graph and directories cannot
-		// reach protected resources.
-		if err := admitOperationManagerEffects(effect.Unit, ev); err != nil {
-			return err
+		// An active start is idempotent, but its dependencies still join the
+		// transaction. Earlier stops in this sequence invalidate that premise.
+		activeNoop := effect.Verb == "start" && first(ev.props, "ActiveState") == "active" && !w.stopped[effect.Unit]
+		if !activeNoop {
+			if err := admitOperationManagerEffects(effect.Unit, ev); err != nil {
+				return err
+			}
 		}
 		if effect == op {
 			if err := admitOperationCommands(effect.Unit, ev); err != nil {
@@ -332,7 +352,7 @@ func (w *operationWalk) admit(ctx context.Context, op Operation) error {
 				return err
 			}
 		}
-		if effect == op || effect.Verb != "start" || first(ev.props, "ActiveState") != "active" {
+		if !activeNoop {
 			if err := w.admitDirectories(effect, ev); err != nil {
 				return err
 			}
@@ -342,7 +362,7 @@ func (w *operationWalk) admit(ctx context.Context, op Operation) error {
 				queue = append(queue, Operation{Verb: verb, Unit: target})
 			}
 		}
-		if effect == op || effect.Verb == "stop" || first(ev.props, "ActiveState") != "active" {
+		if !activeNoop {
 			add("start", "OnSuccess")
 			add("start", "OnFailure")
 		}
@@ -393,7 +413,7 @@ func (w *operationWalk) admit(ctx context.Context, op Operation) error {
 		// evidence supplied both halves consistently.
 		for unit, other := range w.units {
 			for _, prop := range []string{"OnSuccessOf", "OnFailureOf"} {
-				if slices.Contains(strings.Fields(first(other.props, prop)), effect.Unit) {
+				if !activeNoop && slices.Contains(strings.Fields(first(other.props, prop)), effect.Unit) {
 					queue = append(queue, Operation{Verb: "start", Unit: unit})
 				}
 			}

@@ -37,6 +37,11 @@ func TestRealSystemdRetirementOperationEffects(t *testing.T) {
 			})
 		}
 	}
+	for _, bypass := range []bool{false, true} {
+		t.Run(fmt.Sprintf("archive path/counterfactual=%v", bypass), func(t *testing.T) {
+			realRetirementArchivePath(t, bypass)
+		})
+	}
 	for _, hazard := range []string{"success timer", "stop propagation", "shared runtime", "dns stop", "socket runtime"} {
 		for _, bypass := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/counterfactual=%v", hazard, bypass), func(t *testing.T) {
@@ -59,10 +64,10 @@ func newRealOperationHost(t *testing.T) *realOperationHost {
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 45*time.Second)
 		defer cancel()
-		// Stop timers first, then all services together: an OnSuccess job cannot
-		// escape cleanup by starting a timer we already stopped.
+		// Stop activation sources first, then all services together: an
+		// OnSuccess job cannot escape cleanup by rearming a stopped timer.
 		for _, name := range h.installed {
-			if strings.HasSuffix(name, ".timer") {
+			if strings.HasSuffix(name, ".timer") || strings.HasSuffix(name, ".path") || strings.HasSuffix(name, ".socket") {
 				if err := h.ctl(ctx, "stop", "--", name); err != nil {
 					t.Error(err)
 				}
@@ -289,6 +294,26 @@ print(template.render(
 	if retained {
 		original = h.property(node, "InvocationID")
 	}
+	if retained {
+		// Keep the real implicit chain: neither rendered nor packaged controls
+		// disable DefaultDependencies to evade the distribution's handlers.
+		if !slices.Contains(strings.Fields(h.property(node, "Requires")), "sysinit.target") ||
+			!slices.Contains(strings.Fields(h.property(node, "After")), "sysinit.target") ||
+			!slices.Contains(strings.Fields(h.property("sysinit.target", "Wants")), "local-fs.target") ||
+			h.property("local-fs.target", "ActiveState") != "active" ||
+			h.property("local-fs.target", "OnFailure") != "emergency.target" ||
+			h.property("local-fs.target", "OnFailureJobMode") != "replace-irreversibly" {
+			t.Fatal("retained control lacks the standard active dependency chain")
+		}
+	}
+	protection.QuietUnits = []string{server, h.prefix + "-backup.service", h.prefix + "-upgrade.service"}
+	protection.QuietExceptions = []string{backupTimer, upgradeTimer}
+	var submitted []string
+	c := NewConverger(NewInspector(WithObserver(func(_ context.Context, args []string) {
+		if args[0] != "show" {
+			submitted = append(submitted, strings.Join(args, " "))
+		}
+	})))
 	var performed []Operation
 	for n, op := range sequence {
 		if err := h.admit(sequence[n:], protection); err != nil {
@@ -297,10 +322,32 @@ print(template.render(
 		if err := h.admit([]Operation{op}, protection); err != nil {
 			t.Fatalf("immediate admission %v: %v", op, err)
 		}
-		// A not-found stop has no target job; systemctl reports that absence.
-		if err := h.ctl(t.Context(), op.Verb, "--", op.Unit); err != nil &&
-			!(host == "server-only absent" && strings.HasSuffix(op.Unit, ".timer") && h.property(op.Unit, "LoadState") == "not-found") {
+		// Drive the same helpers retirement calls. Positive timer absence is
+		// a successful no-op; no failed command is ever counted as performed.
+		before := len(submitted)
+		var err error
+		switch op.Verb {
+		case "stop":
+			var result StopResult
+			result, err = c.StopAndProve(t.Context(), op.Unit)
+			if err == nil && result.Gone != Yes {
+				t.Fatalf("stop did not prove disappearance: %+v", result)
+			}
+			if host == "server-only absent" && strings.HasSuffix(op.Unit, ".timer") && result.How != "not-found" {
+				t.Fatalf("absent timer did not return positive absence: %+v", result)
+			}
+		case "disable":
+			err = c.Disable(t.Context(), op.Unit)
+		case "enable":
+			err = c.Enable(t.Context(), op.Unit)
+		case "start":
+			_, err = c.StartAndProve(t.Context(), op.Unit)
+		}
+		if err != nil {
 			t.Fatal(err)
+		}
+		if host == "server-only absent" && strings.HasSuffix(op.Unit, ".timer") && len(submitted) != before {
+			t.Fatalf("positive absence submitted a command: %v", submitted[before:])
 		}
 		performed = append(performed, op)
 		if op.Verb == "stop" && op.Unit == server {
@@ -308,6 +355,9 @@ print(template.render(
 				t.Fatal(err)
 			}
 		}
+	}
+	if err := NewInspector().AdmitQuietActivation(t.Context(), protection.QuietUnits, nil); err != nil {
+		t.Fatalf("completed sequence left activation sources armed: %v", err)
 	}
 	if !slices.Equal(performed, sequence) || (retained && len(performed) != 9) {
 		t.Fatalf("incomplete operation sequence: %v", performed)
@@ -421,6 +471,68 @@ func realRetirementHazard(t *testing.T, hazard string, bypass bool) {
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("counterfactual %s did not produce its claimed collateral effect", hazard)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// PathChanged watches IN_MOVE_SELF in v255 src/core/path.c. The fixture maps
+// /var/lib/billet/server and billet-backup.service into its disposable namespace.
+func realRetirementArchivePath(t *testing.T, bypass bool) {
+	t.Helper()
+	h := newRealOperationHost(t)
+	identity := filepath.Join("/var/lib", h.prefix, "server")
+	archive := filepath.Join("/var/lib", h.prefix, "archived-server")
+	mustCreate := func(path string) {
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustCreate(identity)
+	before, err := os.Stat(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backup, watcher := h.prefix+"-backup.service", h.prefix+"-backup.path"
+	marker := filepath.Join("/var/lib", h.prefix, "backup-started")
+	h.write(backup, "[Service]\nType=oneshot\nExecStart=/usr/bin/touch "+marker+"\nRemainAfterExit=yes\n")
+	h.write(watcher, "[Path]\nPathChanged="+identity+"\nUnit="+backup+"\n")
+	h.run("daemon-reload")
+	h.run("start", "--", watcher)
+	if h.property(watcher, "ActiveState") != "active" || h.property(backup, "ActiveState") != "inactive" ||
+		!slices.Contains(strings.Fields(h.property(backup, "TriggeredBy")), watcher) {
+		t.Fatal("path watcher is not armed against the quiet backup")
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("backup ran before the rename: %v", err)
+	}
+	if !bypass {
+		err := NewInspector().AdmitQuietActivation(t.Context(), []string{backup}, nil)
+		if err == nil || !strings.Contains(err.Error(), "operation-reactivation") {
+			t.Fatalf("active path source admitted: %v", err)
+		}
+		after, err := os.Stat(identity)
+		if err != nil || !os.SameFile(before, after) {
+			t.Fatalf("preventive refusal touched identity: %v", err)
+		}
+		if _, err := os.Stat(archive); !os.IsNotExist(err) {
+			t.Fatalf("preventive refusal archived identity: %v", err)
+		}
+		return
+	}
+	if err := os.Rename(identity, archive); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(marker); err == nil {
+			t.Log("counterfactual identity rename activated backup through PathChanged")
+			return
+		} else if !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("identity rename did not activate backup through the armed path")
 		}
 		time.Sleep(20 * time.Millisecond)
 	}

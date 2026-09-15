@@ -21,6 +21,7 @@ type retireServiceManager struct {
 	unitsDir   string
 	operations []string
 	onEnable   func(string)
+	onDisable  func(string)
 }
 
 func (s *retireServiceManager) Enable(ctx context.Context, unit string) error {
@@ -69,6 +70,9 @@ func (s *retireServiceManager) Disable(ctx context.Context, unit string) error {
 	err := s.fakeConverger.Disable(ctx, unit)
 	if err == nil {
 		s.set(unit, "UnitFileState", "disabled")
+	}
+	if s.onDisable != nil {
+		s.onDisable(unit)
 	}
 
 	return err

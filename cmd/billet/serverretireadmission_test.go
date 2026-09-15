@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"slices"
@@ -19,7 +20,10 @@ func installRetireOperationEvidence(t *testing.T, f *requestFixture) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(f.unitsDir, "billet-upgrade.service"),
 		"LoadState=loaded\nActiveState=inactive\nUnitFileState=static\n", 0o644)
-	for _, unit := range []string{serverUnit, nodeUnit, backupServiceUnit, "billet-upgrade.service", upgradeTimerUnit, backupTimerUnit, "billet-network.service", "billet-dnsmasq@br0.service", "billet-dnsmasq@br1.service"} {
+	for _, unit := range []string{serverUnit, nodeUnit, backupServiceUnit, "billet-upgrade.service", upgradeTimerUnit, backupTimerUnit, "billet-network.service", "billet-dnsmasq@br0.service", "billet-dnsmasq@br1.service", "sysinit.target", "local-fs.target"} {
+		if strings.HasSuffix(unit, ".target") {
+			writeFile(t, filepath.Join(f.unitsDir, unit), "LoadState=loaded\nActiveState=active\nUnitFileState=static\n", 0o644)
+		}
 		if strings.HasPrefix(unit, "billet-dnsmasq@") || unit == "billet-network.service" {
 			pid := "4250"
 			if unit == "billet-network.service" {
@@ -58,6 +62,9 @@ func installRetireOperationEvidence(t *testing.T, f *requestFixture) {
 		slices.Sort(lines)
 		writeFile(t, filepath.Join(f.unitsDir, unit+".effects"), strings.Join(lines, "\n")+"\n", 0o644)
 	}
+	setRetireEffect(t, f, "sysinit.target", "Wants", "local-fs.target")
+	setRetireEffect(t, f, "local-fs.target", "OnFailure", "emergency.target")
+	setRetireEffect(t, f, "local-fs.target", "OnFailureJobMode", "replace-irreversibly")
 	busctl := filepath.Join(root, "busctl")
 	writeFile(t, busctl, `#!/bin/sh
 set -eu
@@ -370,7 +377,7 @@ func TestRetirementRefusesEachOperationAtItsOwnBoundary(t *testing.T) {
 				var r *retireRefusal
 				next := j
 				if op.Unit == nodeUnit {
-					next, r = retireRestartNode(t.Context(), j)
+					next, r = retireRestartNode(t.Context(), f.cfg, j)
 				} else {
 					r = stopAndDisableForRetirement(t.Context(), f.manager, j, op.Unit)
 				}
@@ -498,7 +505,7 @@ func TestRetirementRechecksTerminationAtControllerAndNodeStops(t *testing.T) {
 				next := j
 				if unit == nodeUnit {
 					f.manager.onEnable = func(_ string) { poison() }
-					next, r = retireRestartNode(t.Context(), j)
+					next, r = retireRestartNode(t.Context(), f.cfg, j)
 				} else {
 					poison()
 					r = stopAndDisableForRetirement(t.Context(), f.manager, j, unit)
@@ -587,5 +594,254 @@ func TestRetirementBindsNodeStateAliasBeforeEachOperation(t *testing.T) {
 	}
 	if slices.Contains(f.manager.operations, "stop "+serverUnit) {
 		t.Fatalf("path refusal submitted controller stop: %v", f.manager.operations)
+	}
+}
+
+// Both execution readers receive independently encoded loaded command evidence.
+func installRetireNodeExecution(t *testing.T, f *requestFixture) {
+	t.Helper()
+	binary, err := os.Executable()
+	mustOK(t, err)
+	savedBinary, savedBus := installedBinary, busctlBinary
+	installedBinary = binary
+	busctlBinary = filepath.Join(t.TempDir(), "busctl")
+	writeFile(t, busctlBinary, `#!/bin/sh
+set -eu
+[ "$1" = --json=short ] || exit 2
+[ "$2" = get-property ] || exit 2
+[ "$3" = org.freedesktop.systemd1 ] || exit 2
+[ "$4" = /org/freedesktop/systemd1/unit/billet_2dnode_2eservice ] || exit 2
+[ "$5" = org.freedesktop.systemd1.Service ] || exit 2
+[ "$6" = ExecStart ] || exit 2
+cat "$BILLET_FAKE_UNITS/node-exec.json"
+`, 0o755)
+	t.Cleanup(func() { installedBinary, busctlBinary = savedBinary, savedBus })
+	setRetireNodeCommand(t, f, []string{binary, "node", "--config", f.cfg}, "")
+	setRetireEffect(t, f, nodeUnit, "Requires", "sysinit.target")
+	setRetireEffect(t, f, nodeUnit, "After", "sysinit.target")
+	for _, name := range []string{"EnvironmentFiles", "Environment"} {
+		setRetireEffect(t, f, nodeUnit, name, "")
+	}
+}
+
+func setRetireNodeCommand(t *testing.T, f *requestFixture, argv []string, flags string) {
+	t.Helper()
+	body, err := json.Marshal(map[string]any{"type": "a(sasbttttuii)", "data": []any{
+		[]any{argv[0], argv, false, 0, 0, 0, 0, 0, 0, 0},
+	}})
+	mustOK(t, err)
+	writeFile(t, filepath.Join(f.unitsDir, "node-exec.json"), string(body), 0o644)
+	command := "{ path=" + argv[0] + " ; argv[]=" + strings.Join(argv, " ")
+	setRetireEffect(t, f, nodeUnit, "ExecStart", command+" ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }")
+	setRetireEffect(t, f, nodeUnit, "ExecStartEx", command+" ; flags="+flags+" ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }")
+}
+
+func installRetirePathWatcher(t *testing.T, f *requestFixture, unit string) {
+	t.Helper()
+	watcher := "billet-backup.path"
+	writeFile(t, filepath.Join(f.unitsDir, watcher), "LoadState=loaded\nActiveState=inactive\nJob=\n", 0o644)
+	writeFile(t, filepath.Join(f.unitsDir, watcher+".effects"), "", 0o644)
+	// Same PathChanged/Unit relationship as /var/lib/billet/server in the
+	// real-systemd counterfactual, with this host's identity path substituted.
+	writeFile(t, filepath.Join(f.unitsDir, "watcher-source"),
+		"[Path]\nPathChanged="+f.stateDir+"\nUnit="+unit+"\n", 0o644)
+	setRetireEffect(t, f, unit, "TriggeredBy", watcher)
+}
+
+func TestRetirementRefusesPathActivationBeforeArchiveRename(t *testing.T) {
+	for _, variant := range []retirement.Variant{retirement.VariantServerOnly, retirement.VariantRetainedNode} {
+		t.Run(string(variant), func(t *testing.T) {
+			f := newRequestFixture(t)
+			if variant == retirement.VariantRetainedNode {
+				f.retainANode(t)
+			}
+			f.reserve(t)
+			j := f.plantJournal(t, retirement.PhaseIntent, variant)
+			installRetirePathWatcher(t, f, backupServiceUnit)
+			j, r := retireStop(t.Context(), j)
+			if r != nil {
+				t.Fatalf("inactive path control: %+v", r)
+			}
+			before, err := os.Stat(j.IdentityDir)
+			mustOK(t, err)
+			beforeJournal := mustRead(t, retirement.JournalPath())
+			saved := retireBeforeRename
+			retireBeforeRename = func() { f.manager.set("billet-backup.path", "ActiveState", "active") }
+			t.Cleanup(func() { retireBeforeRename = saved })
+			next, r := retireArchive(t.Context(), j)
+			if r == nil || !strings.Contains(r.Why, "operation-reactivation") || next.Phase != retirement.PhaseStopped {
+				t.Fatalf("archive admitted an active path watcher: phase=%s refusal=%+v", next.Phase, r)
+			}
+			after, err := os.Stat(j.IdentityDir)
+			mustOK(t, err)
+			if !os.SameFile(before, after) || mustRead(t, retirement.JournalPath()) != beforeJournal {
+				t.Fatal("watcher refusal changed identity or phase")
+			}
+			if _, err := os.Lstat(j.Archive); !os.IsNotExist(err) {
+				t.Fatalf("watcher refusal came after rename: %v", err)
+			}
+		})
+	}
+}
+
+func TestRetirementReprovesActivationAtStoppedPublications(t *testing.T) {
+	for _, boundary := range []string{"status", "journal"} {
+		t.Run(boundary, func(t *testing.T) {
+			f := newRequestFixture(t)
+			f.reserve(t)
+			j := f.plantJournal(t, retirement.PhaseIntent, retirement.VariantServerOnly)
+			mustOK(t, retirement.WriteStatus(j.Phase, j.Variant, retireNow()))
+			installRetirePathWatcher(t, f, backupServiceUnit)
+			if r := admitRetireRemaining(t.Context(), retireProofMode(f), j); r != nil {
+				t.Fatalf("healthy earlier admission: %+v", r)
+			}
+			if boundary == "status" {
+				f.manager.onDisable = func(unit string) {
+					if unit == serverUnit {
+						f.manager.set("billet-backup.path", "ActiveState", "active")
+					}
+				}
+			} else {
+				saved := retirement.SyncingDir
+				retirement.SyncingDir = func(dir string) error {
+					if dir == retirement.Root {
+						status, _, err := retirement.ReadStatus()
+						mustOK(t, err)
+						if status.Phase == retirement.PhaseStopped {
+							f.manager.set("billet-backup.path", "ActiveState", "active")
+						}
+					}
+					return nil
+				}
+				t.Cleanup(func() { retirement.SyncingDir = saved })
+			}
+			next, r := retireStop(t.Context(), j)
+			if r == nil || !strings.Contains(r.Why, "operation-reactivation") || next.Phase != j.Phase || requireRetireJournal(t).Phase != j.Phase {
+				t.Fatalf("publication crossed active source: next=%s refusal=%+v", next.Phase, r)
+			}
+			status, _, err := retirement.ReadStatus()
+			mustOK(t, err)
+			want := retirement.PhaseIntent
+			if boundary == "journal" {
+				want = retirement.PhaseStopped
+			}
+			if status.Phase != want {
+				t.Fatalf("status=%s want=%s", status.Phase, want)
+			}
+		})
+	}
+}
+
+func TestRetirementRechecksActivationBeforeConfigMutation(t *testing.T) {
+	for _, variant := range []retirement.Variant{retirement.VariantServerOnly, retirement.VariantRetainedNode} {
+		t.Run(string(variant), func(t *testing.T) {
+			f := newRequestFixture(t)
+			if variant == retirement.VariantRetainedNode {
+				f.retainANode(t)
+			}
+			f.reserve(t)
+			j := f.plantJournal(t, retirement.PhaseArchived, variant)
+			mustOK(t, os.Rename(j.IdentityDir, j.Archive))
+			installRetirePathWatcher(t, f, "billet-upgrade.service")
+			before := mustRead(t, f.cfg)
+			if variant == retirement.VariantRetainedNode {
+				saved := retireBeforeConfigRename
+				retireBeforeConfigRename = func() { f.manager.set("billet-backup.path", "ActiveState", "active") }
+				t.Cleanup(func() { retireBeforeConfigRename = saved })
+			} else {
+				f.manager.set("billet-backup.path", "ActiveState", "active")
+			}
+			next, r := retireRewrite(t.Context(), retireProofMode(f), nil, j)
+			if r == nil || !strings.Contains(r.Why, "operation-reactivation") || next.Phase != j.Phase || mustRead(t, f.cfg) != before {
+				t.Fatalf("config mutation crossed active source: next=%s refusal=%+v", next.Phase, r)
+			}
+			if requireRetireJournal(t).Phase != j.Phase || len(f.manager.operations) != 0 {
+				t.Fatalf("config refusal advanced transition: %v", f.manager.operations)
+			}
+		})
+	}
+}
+
+func TestRetirementRechecksNodeExecutionOnArchivedResume(t *testing.T) {
+	for _, drift := range []string{"command", "arguments", "flags", "missing extended command", "KillMode"} {
+		t.Run(drift, func(t *testing.T) {
+			f := newRequestFixture(t)
+			f.retainANode(t)
+			f.reserve(t)
+			j := plantResumedRetirement(t, f, retirement.PhaseConfigRewritten, retirement.VariantRetainedNode)
+			mustOK(t, os.Rename(j.IdentityDir, j.Archive))
+			writeFile(t, f.cfg, f.rendering(t), 0o600)
+			if r := admitRetireRemaining(t.Context(), retireProofMode(f), j); r != nil {
+				t.Fatalf("healthy archived resume: %+v", r)
+			}
+			switch drift {
+			case "command":
+				setRetireNodeCommand(t, f, []string{"/bin/sh", "-c", "systemctl --no-block start billet-backup.service; exec " + installedBinary + " node --config " + f.cfg}, "")
+			case "arguments":
+				setRetireNodeCommand(t, f, []string{installedBinary, "node", "--config", f.cfg + ".other"}, "")
+			case "flags":
+				setRetireNodeCommand(t, f, []string{installedBinary, "node", "--config", f.cfg}, "privileged")
+			case "missing extended command":
+				setRetireEffect(t, f, nodeUnit, "ExecStartEx", "")
+			case "KillMode":
+				f.manager.set(nodeUnit, "KillMode", "process")
+			}
+			before := mustRead(t, retirement.JournalPath())
+			out, code := retiredRequest(t, f, requestRun)
+			want := retireReasonUnit
+			if drift == "KillMode" {
+				want = retireReasonEffects
+			}
+			if code != exitUnknown || retireAnswer(t, out)["reason"] != want {
+				t.Fatalf("changed execution admitted on archived resume: %s", out)
+			}
+			if len(f.manager.operations) != 0 || mustRead(t, retirement.JournalPath()) != before {
+				t.Fatalf("resume enabled/stopped/started or advanced: %v", f.manager.operations)
+			}
+		})
+	}
+}
+
+func TestRetirementRechecksNodeExecutionImmediatelyBeforeStart(t *testing.T) {
+	f := newRequestFixture(t)
+	f.retainANode(t)
+	f.reserve(t)
+	j := f.plantJournal(t, retirement.PhaseConfigRewritten, retirement.VariantRetainedNode)
+	f.svc.onStop = func(unit string) {
+		if unit == nodeUnit {
+			setRetireNodeCommand(t, f, []string{"/bin/sh", "-c", "exit 0"}, "")
+		}
+	}
+	next, r := retireRestartNode(t.Context(), f.cfg, j)
+	if r == nil || r.Reason != retireReasonUnit || next.Phase != j.Phase ||
+		!slices.Contains(f.manager.operations, "stop "+nodeUnit) || slices.Contains(f.manager.operations, "start "+nodeUnit) {
+		t.Fatalf("start used pre-drain execution shape: next=%s refusal=%+v operations=%v", next.Phase, r, f.manager.operations)
+	}
+}
+
+func TestRetirementChecksActivationBeforePreparingManagedDirectory(t *testing.T) {
+	f := newRequestFixture(t)
+	installed, r := observeRetireConfig(f.cfg)
+	if r != nil {
+		t.Fatal(r)
+	}
+	if err := os.Remove(retirement.RetiredDir()); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	installRetirePathWatcher(t, f, backupServiceUnit)
+	f.manager.set("billet-backup.path", "ActiveState", "active")
+	before, err := os.Stat(f.stateDir)
+	mustOK(t, err)
+	r = judgeHostPreconditions(t.Context(), retireProofMode(f), installed.cfg, &retirePlan{}, retireNow())
+	if r == nil || !strings.Contains(r.Why, "operation-reactivation") {
+		t.Fatalf("managed directory preparation admitted active source: %+v", r)
+	}
+	if _, err := os.Lstat(retirement.RetiredDir()); !os.IsNotExist(err) {
+		t.Fatalf("retirement directory was created before refusal: %v", err)
+	}
+	after, err := os.Stat(f.stateDir)
+	mustOK(t, err)
+	if !os.SameFile(before, after) || len(f.manager.operations) != 0 {
+		t.Fatalf("preparation refusal changed identity or services: %v", f.manager.operations)
 	}
 }

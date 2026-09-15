@@ -110,7 +110,7 @@ func (f *operationFixture) unit(t *testing.T, name string) map[string]string {
 		"FragmentPath": path, "SourcePath": "", "DropInPaths": "", "NeedDaemonReload": "no",
 		"OnSuccessJobMode": "fail", "OnFailureJobMode": "replace", "FailureAction": "none", "SuccessAction": "none",
 		"StartLimitAction": "none", "JobTimeoutAction": "none", "RequiresMountsFor": "", "Where": "/ledger",
-		"KillMode": "control-group", "DynamicUser": "no", "RuntimeDirectoryPreserve": "no", "StopWhenUnneeded": "no",
+		"Job": "", "KillMode": "control-group", "DynamicUser": "no", "RuntimeDirectoryPreserve": "no", "StopWhenUnneeded": "no",
 	}
 	// Independent of the production query lists, so deleting a queried property
 	// cannot delete that evidence from the fixture at the same time.
@@ -338,6 +338,19 @@ func TestOperationAdmissionKeepsSupportedInfrastructureAndDirectoryLists(t *test
 	absent["LoadState"], absent["FragmentPath"] = "not-found", ""
 	masked["LoadState"], masked["UnitFileState"], masked["FragmentPath"] = "masked", "masked", "/dev/null"
 	node["Requires"], node["Wants"], node["Conflicts"] = "-.mount", "network-online.target optional.service container-only.service", "shutdown.target"
+	// The distribution chain is present with DefaultDependencies enabled:
+	// v255 units/sysinit.target and units/local-fs.target (source, 2026-09-15).
+	sysinit := f.unit(t, "sysinit.target")
+	localFS := f.unit(t, "local-fs.target")
+	f.unit(t, "emergency.target")
+	f.unit(t, "emergency.service")
+	swap := f.unit(t, "swap.target")
+	node["Requires"] += " sysinit.target"
+	node["After"] = "sysinit.target"
+	sysinit["Wants"], sysinit["Conflicts"] = "local-fs.target swap.target", "emergency.service emergency.target"
+	sysinit["ActiveState"], localFS["ActiveState"], swap["ActiveState"] = "active", "active", "active"
+	localFS["OnFailure"], localFS["OnFailureJobMode"] = "emergency.target", "replace-irreversibly"
+	localFS["Conflicts"] = "shutdown.target"
 	node["RuntimeDirectory"] = "billet/locks billet/registration"
 	network["ActiveState"], root["ActiveState"], shutdown["ActiveState"] = "active", "active", "inactive"
 	root["FragmentPath"], root["Where"] = "", "/"
@@ -720,6 +733,43 @@ func TestOperationAdmissionKeepsRequiredNetworkActive(t *testing.T) {
 		server["PropagatesStopTo"] = unit
 		if err := f.inspector.AdmitOperations(t.Context(), []Operation{{Verb: "stop", Unit: "billet-server.service"}}, protection); err == nil || !strings.Contains(err.Error(), "operation-protected-effect") {
 			t.Fatalf("guest network stop admitted: %s %v", unit, err)
+		}
+	}
+}
+
+func TestOperationAdmissionActiveStartsSkipOnlyCompletionEffects(t *testing.T) {
+	for _, target := range []bool{false, true} {
+		for _, handler := range []string{"OnSuccessOf", "OnFailureOf"} {
+			t.Run(fmt.Sprintf("target=%v/%s", target, handler), func(t *testing.T) {
+				f := newOperationFixture(t)
+				node := f.unit(t, "billet-node.service")
+				server := f.unit(t, "billet-server.service")
+				helper := f.unit(t, "helper.target")
+				name := "helper.target"
+				node["Requires"] = name
+				if target {
+					helper, name = node, "billet-node.service"
+				}
+				helper["ActiveState"], helper["FailureAction"] = "active", "reboot"
+				server[handler] = name
+				protection := OperationProtection{Units: []string{"billet-node.service", "billet-server.service"}}
+				sequence := []Operation{{Verb: "start", Unit: "billet-node.service"}}
+				if err := f.inspector.AdmitOperations(t.Context(), sequence, protection); err != nil {
+					t.Fatalf("idempotent start followed completion effects: %v", err)
+				}
+				helper["Wants"] = "billet-server.service"
+				if err := f.inspector.AdmitOperations(t.Context(), sequence, protection); err == nil || !strings.Contains(err.Error(), "operation-protected-effect") {
+					t.Fatalf("active start hid a dependency: %v", err)
+				}
+				helper["Wants"], helper["ActiveState"] = "", "inactive"
+				if err := f.inspector.AdmitOperations(t.Context(), sequence, protection); err == nil || !strings.Contains(err.Error(), "operation-manager-action") {
+					t.Fatalf("inactive start skipped manager action: %v", err)
+				}
+				helper["FailureAction"] = "none"
+				if err := f.inspector.AdmitOperations(t.Context(), sequence, protection); err == nil || !strings.Contains(err.Error(), "operation-protected-effect") {
+					t.Fatalf("inactive start skipped inverse handler: %v", err)
+				}
+			})
 		}
 	}
 }

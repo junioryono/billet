@@ -896,6 +896,8 @@ func (f *requestFixture) retainANode(t *testing.T) {
 			"UnitFileState=enabled\nInvocationID="+retainedInvocation+"\nStateChangeTimestamp=\n"+
 			"ExecMainStartTimestamp="+retainedNodeStarted+"\n", 0o644)
 
+	installRetireNodeExecution(t, f)
+
 	// THE INSTALLED CONFIGURATION IS OLDER THAN THE RUNNING NODE, which is what
 	// an ordinary converge leaves behind and what the phases before the rewrite
 	// require; the rewrite is what makes it newer.

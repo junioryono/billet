@@ -216,7 +216,7 @@ func performRetireAction(ctx context.Context, m retireMode, obs *installedConfig
 	case retirement.ActionAdvanceRewritten:
 		return retireAdvance(j, retirement.PhaseConfigRewritten, filepath.Dir(m.configPath))
 	case retirement.ActionRestart:
-		return retireRestartNode(ctx, j)
+		return retireRestartNode(ctx, m.configPath, j)
 	case retirement.ActionDone:
 		return retireMarkDone(ctx, m, j)
 	default:
@@ -777,6 +777,9 @@ func archiveUnderExclusion(ctx context.Context, j retirement.Journal) (retiremen
 func retireRewrite(ctx context.Context, m retireMode, obs *installedConfigObservation, j retirement.Journal,
 ) (retirement.Journal, *retireRefusal) {
 	if j.Variant == retirement.VariantServerOnly {
+		if r := proveRetireActivation(ctx, false); r != nil {
+			return j, r
+		}
 		if err := os.Remove(m.configPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return j, retireUnknown(retireReasonRewrite, "remove "+m.configPath+": "+err.Error(), "")
 		}
@@ -800,9 +803,15 @@ func retireRewrite(ctx context.Context, m retireMode, obs *installedConfigObserv
 		return j, retireUnknown(retireReasonStage, "the staged configuration is not the one recorded at intent", "")
 	}
 
+	if r := proveRetireActivation(ctx, false); r != nil {
+		return j, r
+	}
 	var boundaryRefusal *retireRefusal
 	if err := installRetireConfig(m.configPath, body, func() error {
 		boundaryRefusal = admitRetireRemaining(ctx, m, j)
+		if boundaryRefusal == nil {
+			boundaryRefusal = proveRetireActivation(ctx, false)
+		}
 		if boundaryRefusal != nil {
 			return errors.New(boundaryRefusal.Why)
 		}
@@ -825,12 +834,16 @@ func retireRewrite(ctx context.Context, m retireMode, obs *installedConfigObserv
 // owner and mode: a temporary file beside it, its bytes flushed, renamed over
 // the name, and the directory flushed, so a power loss leaves either
 // configuration whole and never half of one.
-func installRetireConfig(path string, body []byte, beforeRename func() error) error {
+func installRetireConfig(path string, body []byte, beforeMutation func() error) error {
 	dir := filepath.Dir(path)
 
 	info, err := os.Stat(path)
 	if err != nil {
 		return fmt.Errorf("examine the installed configuration %s: %w", path, err)
+	}
+
+	if err := beforeMutation(); err != nil {
+		return err
 	}
 
 	tmp, err := os.CreateTemp(dir, ".billet-serverless-*")
@@ -876,7 +889,7 @@ func installRetireConfig(path string, body []byte, beforeRename func() error) er
 		retireBeforeConfigRename()
 	}
 	// The temporary-file flush may block beyond the caller's admission.
-	if err := beforeRename(); err != nil {
+	if err := beforeMutation(); err != nil {
 		return err
 	}
 	if err := os.Rename(tmp.Name(), path); err != nil {
@@ -894,9 +907,12 @@ func installRetireConfig(path string, body []byte, beforeRename func() error) er
 // THE ENABLEMENT COMES FIRST and is read back, because a node that was active
 // under `enabled-runtime` satisfies every running predicate and would leave a
 // retirement whose completion requires a fact nothing made true.
-func retireRestartNode(ctx context.Context, j retirement.Journal) (retirement.Journal, *retireRefusal) {
+func retireRestartNode(ctx context.Context, configPath string, j retirement.Journal) (retirement.Journal, *retireRefusal) {
 	c := converge()
 
+	if r := proveRetireNodeExecution(ctx, configPath); r != nil {
+		return j, r
+	}
 	if r := admitRetireOperation(ctx, j, "enable", nodeUnit); r != nil {
 		return j, r
 	}
@@ -955,6 +971,14 @@ func retireRestartNode(ctx context.Context, j retirement.Journal) (retirement.Jo
 	}
 
 	if r := admitRetireOperation(ctx, j, "start", nodeUnit); r != nil {
+		return j, r
+	}
+
+	if r := proveRetireNodeExecution(ctx, configPath); r != nil {
+		return j, r
+	}
+
+	if r := proveRetireActivation(ctx, false); r != nil {
 		return j, r
 	}
 

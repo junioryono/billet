@@ -44,10 +44,14 @@ func retireServiceSequence(j retirement.Journal, d retirement.Decision) []lifeop
 
 func retireOperationProtection(j retirement.Journal) lifeops.OperationProtection {
 	p := lifeops.OperationProtection{
-		Units: []string{serverUnit, nodeUnit, backupServiceUnit, "billet-upgrade.service", upgradeTimerUnit, backupTimerUnit},
+		Units:      []string{serverUnit, nodeUnit, backupServiceUnit, "billet-upgrade.service", upgradeTimerUnit, backupTimerUnit},
+		QuietUnits: retireQuietServices,
 		Paths: []string{j.Archive, retirement.RetiredDir(), retirement.GlobalLockPath(), retirement.StatusPath(),
 			retirement.ServiceAccountPath(), retirement.InitLockPath(j.IdentityDir), filepath.Join(hostLockDir, "billet-lifecycle.lock"), upgradeRoot},
 		UnitPaths: map[string][]string{serverUnit: {j.IdentityDir}},
+	}
+	if j.Phase == retirement.PhaseIntent {
+		p.QuietExceptions = []string{upgradeTimerUnit, backupTimerUnit}
 	}
 	if j.RetainedInvocation != nil {
 		for _, service := range j.RetainedInvocation.Services {
@@ -67,7 +71,7 @@ func retireOperationProtection(j retirement.Journal) lifeops.OperationProtection
 
 func admitRetireOperations(ctx context.Context, j retirement.Journal, operations []lifeops.Operation) *retireRefusal {
 	if len(operations) == 0 {
-		return nil
+		return proveRetireActivation(ctx, false)
 	}
 	if j.Variant == retirement.VariantRetainedNode && (j.RetainedInvocation == nil || j.RetainedInvocation.Provider == "") {
 		return retireUnknown(retireReasonStopped, "the journal has no original retained-node provider and invocation evidence", "")
@@ -104,9 +108,16 @@ func admitRetireRemaining(ctx context.Context, m retireMode, j retirement.Journa
 	}
 	if j.Variant == retirement.VariantRetainedNode &&
 		(j.Phase == retirement.PhaseIntent || j.Phase == retirement.PhaseStopped || j.Phase == retirement.PhaseArchived) {
-		return proveRetireInvocation(ctx, j.RetainedInvocation)
+		if r := proveRetireInvocation(ctx, j.RetainedInvocation); r != nil {
+			return r
+		}
 	}
-	return nil
+	if j.Variant == retirement.VariantRetainedNode {
+		if r := proveRetireNodeExecution(ctx, m.configPath); r != nil {
+			return r
+		}
+	}
+	return proveRetireActivation(ctx, j.Phase == retirement.PhaseIntent)
 }
 
 // captureRetireInvocation runs before intent. A resumed journal never invents
@@ -265,6 +276,39 @@ func proveRetireStopped(ctx context.Context, j retirement.Journal) *retireRefusa
 	}
 	if err := insp.ProveUnitProcessesGone(ctx, serverUnit); err != nil {
 		return retireUnknown(retireReasonStopped, err.Error(), "")
+	}
+	return proveRetireActivation(ctx, false)
+}
+
+var retireQuietServices = []string{serverUnit, backupServiceUnit, "billet-upgrade.service"}
+
+func proveRetireActivation(ctx context.Context, stoppingTimers bool) *retireRefusal {
+	var exceptions []string
+	if stoppingTimers {
+		exceptions = []string{upgradeTimerUnit, backupTimerUnit}
+	}
+	if err := retireOperationInspector().AdmitQuietActivation(ctx, retireQuietServices, exceptions); err != nil {
+		return retireUnknown(retireReasonStopped, err.Error(), "")
+	}
+	return nil
+}
+
+// The release inspector owns the loaded shape; lifeops owns command flags and
+// executable identity. Reuse both judgments without interpreting program text.
+func proveRetireNodeExecution(ctx context.Context, configPath string) *retireRefusal {
+	svc, _ := inspectServiceSection(ctx, "node", nodeUnit, &config.Config{}, configPath, nil, "", "", nil)
+	if !svc.Shape.known || svc.Shape.value != "supported" {
+		why := svc.ShapeReason
+		if !svc.Shape.known {
+			why = svc.Shape.why
+		}
+		return retireUnknown(retireReasonUnit, "the current node execution shape is not supported: "+why, "")
+	}
+	if err := retireOperationInspector().AdmitExecution(ctx, nodeUnit, "node", installedBinary, configPath); err != nil {
+		return retireUnknown(retireReasonUnit, err.Error(), "")
+	}
+	if err := retireOperationInspector().AdmitUnitTermination(ctx, nodeUnit); err != nil {
+		return retireUnknown(retireReasonUnit, err.Error(), "")
 	}
 	return nil
 }

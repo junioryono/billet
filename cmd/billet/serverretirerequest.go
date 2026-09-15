@@ -769,7 +769,7 @@ func judgeRetireRequest(ctx context.Context, m retireMode, in *retireInput, obs 
 		return nil, r
 	}
 
-	if r := judgeEntryPredicates(ctx, in, cfg); r != nil {
+	if r := judgeEntryPredicates(ctx, in, cfg, m.configPath); r != nil {
 		return nil, r
 	}
 
@@ -1511,7 +1511,7 @@ func judgeNodeEndpoint(ep endpoint.Endpoint, nodeHost, survivorHost string, surv
 // judgeEntryPredicates holds this host's own node, when it has one, to what
 // the later phases will need: its file unchanged since its start, and a
 // KillMode under which a stop proves something.
-func judgeEntryPredicates(ctx context.Context, in *retireInput, cfg *config.Config) *retireRefusal {
+func judgeEntryPredicates(ctx context.Context, in *retireInput, cfg *config.Config, configPath string) *retireRefusal {
 	if cfg.Node == nil {
 		return nil
 	}
@@ -1533,7 +1533,7 @@ func judgeEntryPredicates(ctx context.Context, in *retireInput, cfg *config.Conf
 		return retireUnknown(retireReasonUnit, "systemd answered no KillMode for "+nodeUnit+", so the later stop's premise "+
 			"cannot be judged", "")
 	case "mixed", "control-group":
-		return nil
+		return proveRetireNodeExecution(ctx, configPath)
 	default:
 		return retireRefuse(retireReasonPolicy, fmt.Sprintf("%s has KillMode=%s, under which a stop proves nothing about the "+
 			"processes that remain; only mixed or control-group is retired", nodeUnit, obs.KillMode), "")
@@ -1556,6 +1556,9 @@ func judgeHostPreconditions(ctx context.Context, m retireMode, cfg *config.Confi
 	destination := retirement.RetiredDir()
 
 	if !m.dryRun {
+		if r := proveRetireActivation(ctx, true); r != nil {
+			return r
+		}
 		if err := retirement.EnsureRetiredDir(); err != nil {
 			return retireUnknown(retireReasonStage, err.Error(), "")
 		}
@@ -1761,6 +1764,9 @@ func applyRetireIntent(ctx context.Context, m retireMode, root *txLock, dir *os.
 	}
 
 	if plan.variant == retirement.VariantRetainedNode {
+		if r := proveRetireActivation(ctx, true); r != nil {
+			return nil, r
+		}
 		if err := retirement.WriteStage(plan.rendering); err != nil {
 			return nil, retireUnknown(retireReasonStage, err.Error(), "")
 		}
