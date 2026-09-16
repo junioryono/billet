@@ -145,6 +145,12 @@ func retireCheckNodeConfig(ctx context.Context, m retireMode) (any, *retireRefus
 	if r != nil {
 		return nil, r
 	}
+	return withRetireInspection(ctx, func(root *txLock) (any, *retireRefusal) {
+		return observeRetireNodeConfig(ctx, m, root, in, operations)
+	})
+}
+
+func withRetireInspection(ctx context.Context, observe func(*txLock) (any, *retireRefusal)) (any, *retireRefusal) {
 	root, err := takeRetireInspectionLock()
 	if err != nil {
 		return nil, retireUnknown(retireReasonLock, err.Error(), "")
@@ -155,7 +161,7 @@ func retireCheckNodeConfig(ctx context.Context, m retireMode) (any, *retireRefus
 	if err != nil {
 		return nil, retireUnknown(retireReasonLock, err.Error(), "")
 	}
-	answer, r := observeRetireNodeConfig(ctx, m, root, in, operations)
+	answer, r := observe(root)
 	if err := hold.Release(); err != nil {
 		why := "release retirement inspection lock: " + err.Error()
 		if r != nil {
@@ -203,9 +209,6 @@ func observeRetireNodeConfig(ctx context.Context, m retireMode, root *txLock, in
 		return nil, retireRefuse(retireReasonConfig, "future rendering changes the retained node state directory", "")
 	}
 	identity := expectedRegistrationIdentity(installed.cfg)
-	if identity.why != "" || identity.contradiction != "" || identity.absent || identity.deployment != j.Deployment {
-		return nil, retireUnknown(retireReasonIdentity, "installed retained node identity is not proved against the archived deployment", "")
-	}
 	if future.Node.Name == "" || future.Node.Name != identity.node {
 		return nil, retireRefuse(retireReasonIdentity, "future rendering changes the retained node identity", "")
 	}
@@ -250,7 +253,7 @@ func observeRetireNodeConfig(ctx context.Context, m retireMode, root *txLock, in
 }
 
 // observeRetireOrdinaryEntry has no publication path and grants no drain proof.
-// A separate command may reuse this observation without changing strict done.
+// Node-config and settled entry share it; closing adds the strict done proof.
 func observeRetireOrdinaryEntry(ctx context.Context, m retireMode, root *txLock) (retirement.Journal, string, *retireRefusal) {
 	var j retirement.Journal
 	dir, shape, err := openGuardForMutation(root)
@@ -300,6 +303,14 @@ func observeRetireOrdinaryEntry(ctx context.Context, m retireMode, root *txLock)
 	if _, r := observeRetireControllerPostconditions(ctx, m, j); r != nil {
 		return j, "", r
 	}
+	installed, er := observeInstalledConfig(m.configPath, true)
+	if er != nil || !installed.present || installed.cfg.Node == nil {
+		return j, "", retireUnknown(retireReasonConfig, "installed retained configuration could not be observed", "")
+	}
+	nodeIdentity := expectedRegistrationIdentity(installed.cfg)
+	if nodeIdentity.why != "" || nodeIdentity.contradiction != "" || nodeIdentity.absent || nodeIdentity.deployment != j.Deployment {
+		return j, "", retireUnknown(retireReasonIdentity, "installed retained node identity is not proved against the archived deployment", "")
+	}
 	if r := proveRetireMaskedAccount(ctx); r != nil {
 		return j, "", r
 	}
@@ -315,51 +326,69 @@ func observeRetireOrdinaryEntry(ctx context.Context, m retireMode, root *txLock)
 
 func observeRetireEntryNode(ctx context.Context, m retireMode, j retirement.Journal) (string, *retireRefusal) {
 	insp := retireOperationInspector()
-	props, err := insp.UnitProperties(ctx, nodeUnit, "LoadState", "ActiveState", "MainPID", "UnitFileState", "NeedDaemonReload", "User", "Group")
+	names := []string{"LoadState", "ActiveState", "MainPID", "UnitFileState", "NeedDaemonReload", "User", "Group", "Id", "FragmentPath", "SourcePath", "DropInPaths", "ControlGroup", "Slice"}
+	props, err := insp.UnitProperties(ctx, nodeUnit, names...)
 	if err != nil {
 		return "", retireUnknown("settled-entry-node-observation-unreadable", err.Error(), "")
 	}
-	for _, name := range []string{"LoadState", "ActiveState", "MainPID", "UnitFileState", "NeedDaemonReload", "User", "Group"} {
+	for _, name := range names {
 		if len(props[name]) != 1 {
 			return "", retireUnknown("settled-entry-node-observation-unreadable", "missing or repeated "+name, "")
 		}
+		if props[name][0] != strings.TrimSpace(props[name][0]) {
+			return "", retireUnknown("settled-entry-node-observation-unreadable", "malformed "+name, "")
+		}
 	}
-	if !slices.Contains([]string{"loaded", "not-found", "masked", "error", "bad-setting"}, firstProp(props, "LoadState")) ||
-		!knownUnitFileState(firstProp(props, "UnitFileState")) || !slices.Contains([]string{"yes", "no"}, firstProp(props, "NeedDaemonReload")) {
+	if props["Id"][0] == "" || strings.ContainsAny(props["Id"][0], " \t\r\n") ||
+		!filepath.IsAbs(props["FragmentPath"][0]) || filepath.Clean(props["FragmentPath"][0]) != props["FragmentPath"][0] {
+		return "", retireUnknown("settled-entry-node-observation-unreadable", "malformed unit identity or fragment path", "")
+	}
+	pid, err := strconv.ParseUint(props["MainPID"][0], 10, 32)
+	if err != nil || strconv.FormatUint(pid, 10) != props["MainPID"][0] {
+		return "", retireUnknown("settled-entry-node-observation-unreadable", "malformed MainPID", "")
+	}
+	if !slices.Contains([]string{"loaded", "not-found", "masked", "error", "bad-setting"}, props["LoadState"][0]) ||
+		!knownUnitFileState(props["UnitFileState"][0]) || !slices.Contains([]string{"yes", "no"}, props["NeedDaemonReload"][0]) {
 		return "", retireUnknown("settled-entry-node-observation-unreadable", "unfamiliar load, enablement or reload property", "")
 	}
-	if firstProp(props, "LoadState") != "loaded" || firstProp(props, "NeedDaemonReload") != "no" {
+	if props["LoadState"][0] != "loaded" || props["NeedDaemonReload"][0] != "no" {
 		return "", retireRefuse("settled-entry-node-unit-mismatch", "node must be loaded with no pending definition reload", "")
 	}
-	if firstProp(props, "UnitFileState") != "enabled" {
-		return "", retireRefuse("settled-entry-node-enablement", "node must be persistently enabled", "")
+	if r := retireRetainedEnablement(nodeUnit, props["UnitFileState"][0]); r != nil {
+		r.Reason = "settled-entry-node-enablement"
+		return "", r
 	}
-	if !slices.Contains([]string{"", "root", "0"}, firstProp(props, "User")) || !slices.Contains([]string{"", "root", "0"}, firstProp(props, "Group")) {
+	if !slices.Contains([]string{"", "root", "0"}, props["User"][0]) || !slices.Contains([]string{"", "root", "0"}, props["Group"][0]) {
 		return "", retireRefuse("settled-entry-node-account", "node must retain root user and group", "")
 	}
-	if r := retireQuietJob(ctx, insp, nodeUnit, true); r != nil {
-		return "", retireUnknown("settled-entry-node-job-observation", r.Why, "")
+	active := props["ActiveState"][0]
+	if !knownActiveState(active) {
+		return "", retireUnknown("settled-entry-node-observation-unreadable", "unfamiliar node activity", "")
+	}
+	if active != "active" && active != "inactive" && active != "failed" {
+		return "", retireRefuse("settled-entry-node-"+active, "node is not quiet or active", "")
+	}
+	if r := observeRetireEntryJob(ctx, insp); r != nil {
+		return "", r
 	}
 	if r := proveRetireNodeExecution(ctx, m.configPath); r != nil {
 		return "", r
 	}
-	active := firstProp(props, "ActiveState")
 	switch active {
 	case "active":
-		if r := proveRetireDoneRegistration(ctx, insp, m.configPath, j); r != nil {
+		if pid == 0 {
+			return "", retireUnknown("settled-entry-node-observation-unreadable", "active node has zero MainPID", "")
+		}
+		if _, r := observeRetirePostconditions(ctx, m, j); r != nil {
 			return "", r
 		}
 		return "active", nil
 	case "inactive", "failed":
-		pid, err := strconv.ParseUint(firstProp(props, "MainPID"), 10, 32)
-		if err != nil {
-			return "", retireUnknown("settled-entry-node-observation-unreadable", "malformed MainPID", "")
-		}
 		if pid != 0 {
 			return "", retireRefuse("settled-entry-node-process-present", "quiet node still has a main process", "")
 		}
 		if err := insp.ProveUnitProcessesGone(ctx, nodeUnit); err != nil {
-			return "", retireUnknown("settled-entry-node-process-present", err.Error(), "")
+			return "", retireUnknown("settled-entry-node-observation-unreadable", err.Error(), "")
 		}
 		return "quiet-" + active, nil
 	default:
@@ -500,7 +529,11 @@ func admitRetireNodeOperations(ctx context.Context, m retireMode, j retirement.J
 	protection.Units = append(protection.Units, services...)
 	protection.RequiredActive = append(protection.RequiredActive, services...)
 	protection.RequiredInputs[""] = paths
-	var sequence []lifeops.Operation
+	// Persistent enablement also needs installation-source evidence: a new
+	// higher-priority fragment need not set NeedDaemonReload. AdmitOperations
+	// only observes; this shares enable's source/link proof without enabling
+	// anything, even when the caller proposes no service operations.
+	sequence := []lifeops.Operation{{Verb: "enable", Unit: nodeUnit}}
 	for _, op := range operations.Services {
 		if op.Unit != nodeUnit && !slices.Contains(services, op.Unit) || !slices.Contains([]string{"start", "stop", "enable"}, op.Verb) {
 			return retireRefuse(retireReasonEffects, "ordinary preflight grants only retained node and required provider service operations", "")
@@ -508,6 +541,9 @@ func admitRetireNodeOperations(ctx context.Context, m retireMode, j retirement.J
 		sequence = append(sequence, lifeops.Operation{Verb: op.Verb, Unit: op.Unit})
 	}
 	if err := retireOperationInspector().AdmitOperations(ctx, sequence, protection); err != nil {
+		if strings.Contains(err.Error(), "operation-install-source-inconsistent") {
+			return retireUnknown("settled-entry-node-unit-mismatch", err.Error(), "")
+		}
 		return retireUnknown(retireReasonEffects, err.Error(), "")
 	}
 	after, err := retireOperationInspector().EnvironmentFiles(ctx, nodeUnit)

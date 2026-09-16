@@ -1,0 +1,8 @@
+{
+  "outcome": "refused",
+  "purpose": "settled-closing",
+  "reason": "postcondition",
+  "schema": 1,
+  "state": "nothing",
+  "why": "billet-node.service is inactive on a host that kept its node"
+}

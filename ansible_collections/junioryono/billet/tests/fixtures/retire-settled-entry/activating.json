@@ -1,0 +1,8 @@
+{
+  "outcome": "refused",
+  "purpose": "settled-entry",
+  "reason": "settled-entry-node-activating",
+  "schema": 1,
+  "state": "nothing",
+  "why": "node is not quiet or active"
+}

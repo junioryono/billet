@@ -1,0 +1,8 @@
+{
+  "outcome": "refused",
+  "purpose": "settled-entry",
+  "reason": "settled-entry-node-unit-mismatch",
+  "schema": 1,
+  "state": "nothing",
+  "why": "node must be loaded with no pending definition reload"
+}
