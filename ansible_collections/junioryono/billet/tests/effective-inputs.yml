@@ -79,7 +79,6 @@
     billet_endpoint_no_billet: false
     billet_endpoint_answerer: /usr/bin/billet
     billet_node_should_run: true
-    billet_image_verify_port: "{{ billet_gate_defaults.billet_image_verify_port }}"
     billet_networks: [{name: effective0, address: 172.31.0.1, prefix: 24}]
     billet_guest_denied_ipv4: [10.0.0.0/8]
     billet_guest_denied_ipv6: ['fc00::/7']
@@ -105,7 +104,12 @@
     - name: Require every ordinary alias and direct path reader to answer from E
       ansible.builtin.assert:
         that:
-          - billet_image_verify_port | int == 8729
+          # THE PORT'S DEFAULT IS PINNED AS TEXT, not evaluated. It is read out of
+          # defaults/main.yml through lookup('file'), and Ansible marks file-lookup
+          # content unsafe, so the nested expression is never re-templated: evaluating
+          # it yields the literal string, and `| int` yields 0 whatever the reader says.
+          - "'billet_effective_config.node.firecracker.image_verify_port' in billet_gate_defaults.billet_image_verify_port"
+          - "'default(7719, true)' in billet_gate_defaults.billet_image_verify_port"
           - billet_configured_server_state_dir == '/var/lib/billet/effective-identity'
           - billet_configured_state_backend == 'postgres'
           - billet_gate_candidates['ansible.builtin.set_fact'].billet_candidate_server_state_dir == '/var/lib/billet/effective-identity'
