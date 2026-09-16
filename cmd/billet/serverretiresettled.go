@@ -95,20 +95,23 @@ func observeRetireEntryJob(ctx context.Context, insp *lifeops.Inspector) *retire
 	if err != nil || len(props["Job"]) != 1 {
 		return retireUnknown("settled-entry-node-job-observation", "queued job absence could not be observed", "")
 	}
-	if job := firstProp(props, "Job"); job != "" {
+	if job := props["Job"][0]; job != "" {
 		fields := strings.Fields(job)
-		if len(fields) == 0 {
+		if len(fields) == 0 || strings.Join(fields, " ") != job {
 			return retireUnknown("settled-entry-node-job-observation", "malformed queued job observation", "")
 		}
 		id, err := strconv.ParseUint(fields[0], 10, 32)
-		if err != nil || id == 0 || len(fields) > 2 ||
+		if err != nil || id == 0 || strconv.FormatUint(id, 10) != fields[0] || len(fields) > 2 ||
 			len(fields) == 2 && fields[1] != "/org/freedesktop/systemd1/job/"+fields[0] {
 			return retireUnknown("settled-entry-node-job-observation", "malformed queued job observation", "")
 		}
 		return retireRefuse("settled-entry-node-queued-job", "node has a queued lifecycle job", "")
 	}
-	pid, err := strconv.ParseUint(firstProp(props, "ControlPID"), 10, 32)
-	if len(props["ControlPID"]) != 1 || err != nil {
+	if len(props["ControlPID"]) != 1 {
+		return retireUnknown("settled-entry-node-observation-unreadable", "control process absence could not be observed", "")
+	}
+	pid, err := strconv.ParseUint(props["ControlPID"][0], 10, 32)
+	if err != nil || strconv.FormatUint(pid, 10) != props["ControlPID"][0] {
 		return retireUnknown("settled-entry-node-observation-unreadable", "control process absence could not be observed", "")
 	}
 	if pid != 0 {
