@@ -2,9 +2,49 @@ package retirement
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 )
+
+func TestNodeConfigVerdictNamesTheFirstDisagreementAndBothValues(t *testing.T) {
+	want := NodeConfigVerdict{Schema: 1, Purpose: "node-config", Outcome: "admitted", Run: "ci-1", Guard: strings.Repeat("a", 32),
+		Retiring: "control-a", Deployment: strings.Repeat("d", 32), TransitionID: strings.Repeat("b", 32), Variant: VariantRetainedNode,
+		RenderingSHA256: strings.Repeat("c", 64), OperationsSHA256: strings.Repeat("e", 64), NodeActivity: "active", State: "nothing"}
+	body, err := json.Marshal(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindings := []string{"run", "guard", "retiring", "deployment", "transition_id", "rendering_sha256", "operations_sha256"}
+	for i, member := range bindings {
+		t.Run(member, func(t *testing.T) {
+			for _, multiple := range []bool{false, true} {
+				var changed map[string]any
+				if err := json.Unmarshal(body, &changed); err != nil {
+					t.Fatal(err)
+				}
+				expected := changed[member]
+				// Quoting keeps even malformed values on one diagnostic line.
+				const replacement = "different\nvalue"
+				changed[member] = replacement
+				if multiple {
+					for _, later := range bindings[i+1:] {
+						changed[later] = replacement
+					}
+				}
+				raw, err := json.Marshal(changed)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, err = DecodeNodeConfigVerdict(raw, 0, want)
+				diagnostic := fmt.Sprintf("node-config verdict binds %s=%q, expected %q", member, replacement, expected)
+				if err == nil || err.Error() != diagnostic {
+					t.Fatalf("wrong binding diagnostic (multiple=%t): got %v, want %s", multiple, err, diagnostic)
+				}
+			}
+		})
+	}
+}
 
 func TestNodeConfigVerdictBindsEveryOperandAndItsExitStatus(t *testing.T) {
 	want := NodeConfigVerdict{Schema: 1, Purpose: "node-config", Outcome: "admitted", Run: "ci-1", Guard: strings.Repeat("a", 32),

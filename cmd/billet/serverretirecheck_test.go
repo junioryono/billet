@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -59,7 +60,7 @@ func runNodeConfigCheck(t *testing.T, f *requestFixture, j retirement.Journal, d
 	t.Helper()
 	args := []string{"--check-node-config", "--input", "-", "--run", requestRun, "--retiring-host", requestRetiring,
 		"--transition", j.Provenance.TransitionID, "--expected-holder", requestRun, "--expected-guard", f.guard.record(t).ID}
-	return f.run(t, document, append(args, extra...)...)
+	return f.runRaw(t, document, append(args, extra...)...)
 }
 
 func forbidNodeConfigWrites(t *testing.T, f *requestFixture) {
@@ -108,6 +109,53 @@ func forbidNodeConfigWrites(t *testing.T, f *requestFixture) {
 			}
 		}
 	})
+}
+
+func TestRetirementNodeConfigVerdictBindsExactOperationBytes(t *testing.T) {
+	f, j := settledNodeConfigFixture(t)
+	forbidNodeConfigWrites(t, f)
+	document := nodeConfigDocument(t, j, mustRead(t, f.cfg), emptyNodeOperations())
+	const compact = `{"filesystem":[],"services":[],"units":[]}`
+	spellings := []struct{ name, operations string }{
+		{"compact", compact},
+		{"whitespace", "{\n  \"filesystem\": [], \"services\": [], \"units\": []\n}"},
+		{"member order", `{"units":[],"services":[],"filesystem":[]}`},
+	}
+	if strings.Count(document, compact) != 1 {
+		t.Fatal("operation-byte witness does not identify exactly one document")
+	}
+	for _, spelling := range spellings {
+		t.Run(spelling.name, func(t *testing.T) {
+			input := strings.Replace(document, compact, spelling.operations, 1)
+			var in retireNodeConfigInput
+			mustOK(t, json.Unmarshal([]byte(input), &in))
+			if string(in.Operations) != spelling.operations {
+				t.Fatalf("input lost the exact operation bytes: %q", in.Operations)
+			}
+			out, code := runNodeConfigCheck(t, f, j, input)
+			want := retirement.NodeConfigVerdict{Run: requestRun, Guard: f.guard.record(t).ID, Retiring: requestRetiring,
+				Deployment: j.Deployment, TransitionID: j.Provenance.TransitionID, RenderingSHA256: in.RenderingSHA256,
+				OperationsSHA256: retirement.Digest(in.Operations)}
+			if _, err := retirement.DecodeNodeConfigVerdict([]byte(out), code, want); err != nil {
+				t.Fatalf("exact operation document refused: %v\n%s", err, out)
+			}
+			for _, other := range spellings {
+				if other.name == spelling.name {
+					continue
+				}
+				changed := want
+				changed.OperationsSHA256 = retirement.Digest([]byte(other.operations))
+				if changed.OperationsSHA256 == want.OperationsSHA256 {
+					t.Fatal("different operation bytes did not change the digest")
+				}
+				_, err := retirement.DecodeNodeConfigVerdict([]byte(out), code, changed)
+				diagnostic := fmt.Sprintf("node-config verdict binds operations_sha256=%q, expected %q", want.OperationsSHA256, changed.OperationsSHA256)
+				if err == nil || err.Error() != diagnostic {
+					t.Fatalf("verdict reused for %s operation bytes: got %v, want %s", other.name, err, diagnostic)
+				}
+			}
+		})
+	}
 }
 
 func TestRetirementNodeConfigAdmitsQuietEntryWithoutDrainOrRegistration(t *testing.T) {

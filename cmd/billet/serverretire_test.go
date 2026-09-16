@@ -68,6 +68,20 @@ func (f *retireFixture) ledger(t *testing.T, fn func(db *state.DB)) {
 func (f *retireFixture) run(t *testing.T, stdin string, args ...string) (string, int) {
 	t.Helper()
 
+	out, code := f.runRaw(t, stdin, args...)
+	out = strings.ReplaceAll(out, f.identity, retireTestIdentity)
+	out = strings.ReplaceAll(out, f.cfg, "/etc/billet/billet.yaml")
+	out = strings.ReplaceAll(out, retirement.Root, "/var/lib/billet")
+	out = strings.ReplaceAll(out, f.guard.root, "/var/lib/billet/upgrades")
+	out = strings.ReplaceAll(out, f.stateDir, "/var/lib/billet/server")
+
+	return out, code
+}
+
+// runRaw preserves the command's bindings for comparison with trusted records.
+func (f *retireFixture) runRaw(t *testing.T, stdin string, args ...string) (string, int) {
+	t.Helper()
+
 	retireStdin = strings.NewReader(stdin)
 
 	var runErr error
@@ -86,12 +100,6 @@ func (f *retireFixture) run(t *testing.T, stdin string, args ...string) (string,
 
 		code = exit.code
 	}
-
-	out = strings.ReplaceAll(out, f.identity, retireTestIdentity)
-	out = strings.ReplaceAll(out, f.cfg, "/etc/billet/billet.yaml")
-	out = strings.ReplaceAll(out, retirement.Root, "/var/lib/billet")
-	out = strings.ReplaceAll(out, f.guard.root, "/var/lib/billet/upgrades")
-	out = strings.ReplaceAll(out, f.stateDir, "/var/lib/billet/server")
 
 	return out, code
 }

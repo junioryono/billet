@@ -37,9 +37,20 @@ func DecodeNodeConfigVerdict(raw []byte, exitCode int, expected NodeConfigVerdic
 		(verdict.NodeActivity != "active" && verdict.NodeActivity != "quiet-inactive" && verdict.NodeActivity != "quiet-failed") {
 		return verdict, fmt.Errorf("not an admitted node-config observation")
 	}
-	expected.Schema, expected.Purpose, expected.Outcome = 1, "node-config", "admitted"
-	expected.Variant, expected.State, expected.NodeActivity = VariantRetainedNode, "nothing", verdict.NodeActivity
-	if verdict != expected || verdict.Run == "" || verdict.Retiring == "" || !transitionIDPattern.MatchString(verdict.Guard) ||
+	for _, binding := range []struct{ member, have, want string }{
+		{"run", verdict.Run, expected.Run},
+		{"guard", verdict.Guard, expected.Guard},
+		{"retiring", verdict.Retiring, expected.Retiring},
+		{"deployment", verdict.Deployment, expected.Deployment},
+		{"transition_id", verdict.TransitionID, expected.TransitionID},
+		{"rendering_sha256", verdict.RenderingSHA256, expected.RenderingSHA256},
+		{"operations_sha256", verdict.OperationsSHA256, expected.OperationsSHA256},
+	} {
+		if binding.have != binding.want {
+			return verdict, fmt.Errorf("node-config verdict binds %s=%q, expected %q", binding.member, binding.have, binding.want)
+		}
+	}
+	if verdict.Run == "" || verdict.Retiring == "" || !transitionIDPattern.MatchString(verdict.Guard) ||
 		!transitionIDPattern.MatchString(verdict.TransitionID) || verdict.Deployment == "" || !nodeConfigDigest(verdict.RenderingSHA256) || !nodeConfigDigest(verdict.OperationsSHA256) {
 		return verdict, fmt.Errorf("node-config verdict does not bind this invocation and exact operands")
 	}
