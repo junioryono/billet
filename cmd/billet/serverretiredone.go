@@ -423,14 +423,8 @@ func retireUnitPostcondition(ctx context.Context, insp *lifeops.Inspector, unit 
 				unit, active), "")
 		}
 
-		if !knownUnitFileState(enablement) {
-			return "", retireUnknown(retireReasonPostcondition, fmt.Sprintf("systemd answered %s's enablement as %s, "+
-				"which this billet does not know", unit, activeWord(enablement)), "")
-		}
-
-		if enablement != "enabled" {
-			return "", retireRefuse(retireReasonPostcondition, fmt.Sprintf("%s is %s, not persistently enabled, on a "+
-				"host that kept its node", unit, enablement), "")
+		if r := retireRetainedEnablement(unit, enablement); r != nil {
+			return "", r
 		}
 
 		// AND IT HAS A PROCESS. systemd reports a service whose process has
@@ -505,6 +499,19 @@ func retireUnitPostcondition(ctx context.Context, insp *lifeops.Inspector, unit 
 		return "", retireRefuse(retireReasonPostcondition, fmt.Sprintf("%s is %s, and a completed retirement leaves it "+
 			"disabled or masked", unit, enablement), "")
 	}
+}
+
+// Retained enablement is identical at quiet entry and strict publication.
+func retireRetainedEnablement(unit, enablement string) *retireRefusal {
+	if !knownUnitFileState(enablement) {
+		return retireUnknown(retireReasonPostcondition, fmt.Sprintf("systemd answered %s's enablement as %s, "+
+			"which this billet does not know", unit, activeWord(enablement)), "")
+	}
+	if enablement != "enabled" {
+		return retireRefuse(retireReasonPostcondition, fmt.Sprintf("%s is %s, not persistently enabled, on a "+
+			"host that kept its node", unit, enablement), "")
+	}
+	return nil
 }
 
 // knownActiveState and knownUnitFileState are systemd's own vocabularies. A

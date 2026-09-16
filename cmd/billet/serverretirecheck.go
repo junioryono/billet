@@ -145,6 +145,12 @@ func retireCheckNodeConfig(ctx context.Context, m retireMode) (any, *retireRefus
 	if r != nil {
 		return nil, r
 	}
+	return withRetireInspection(ctx, func(root *txLock) (any, *retireRefusal) {
+		return observeRetireNodeConfig(ctx, m, root, in, operations)
+	})
+}
+
+func withRetireInspection(ctx context.Context, observe func(*txLock) (any, *retireRefusal)) (any, *retireRefusal) {
 	root, err := takeRetireInspectionLock()
 	if err != nil {
 		return nil, retireUnknown(retireReasonLock, err.Error(), "")
@@ -155,7 +161,7 @@ func retireCheckNodeConfig(ctx context.Context, m retireMode) (any, *retireRefus
 	if err != nil {
 		return nil, retireUnknown(retireReasonLock, err.Error(), "")
 	}
-	answer, r := observeRetireNodeConfig(ctx, m, root, in, operations)
+	answer, r := observe(root)
 	if err := hold.Release(); err != nil {
 		why := "release retirement inspection lock: " + err.Error()
 		if r != nil {
@@ -203,9 +209,6 @@ func observeRetireNodeConfig(ctx context.Context, m retireMode, root *txLock, in
 		return nil, retireRefuse(retireReasonConfig, "future rendering changes the retained node state directory", "")
 	}
 	identity := expectedRegistrationIdentity(installed.cfg)
-	if identity.why != "" || identity.contradiction != "" || identity.absent || identity.deployment != j.Deployment {
-		return nil, retireUnknown(retireReasonIdentity, "installed retained node identity is not proved against the archived deployment", "")
-	}
 	if future.Node.Name == "" || future.Node.Name != identity.node {
 		return nil, retireRefuse(retireReasonIdentity, "future rendering changes the retained node identity", "")
 	}
@@ -250,7 +253,7 @@ func observeRetireNodeConfig(ctx context.Context, m retireMode, root *txLock, in
 }
 
 // observeRetireOrdinaryEntry has no publication path and grants no drain proof.
-// A separate command may reuse this observation without changing strict done.
+// Node-config and settled entry share it; closing adds the strict done proof.
 func observeRetireOrdinaryEntry(ctx context.Context, m retireMode, root *txLock) (retirement.Journal, string, *retireRefusal) {
 	var j retirement.Journal
 	dir, shape, err := openGuardForMutation(root)
@@ -300,6 +303,14 @@ func observeRetireOrdinaryEntry(ctx context.Context, m retireMode, root *txLock)
 	if _, r := observeRetireControllerPostconditions(ctx, m, j); r != nil {
 		return j, "", r
 	}
+	installed, er := observeInstalledConfig(m.configPath, true)
+	if er != nil || !installed.present || installed.cfg.Node == nil {
+		return j, "", retireUnknown(retireReasonConfig, "installed retained configuration could not be observed", "")
+	}
+	nodeIdentity := expectedRegistrationIdentity(installed.cfg)
+	if nodeIdentity.why != "" || nodeIdentity.contradiction != "" || nodeIdentity.absent || nodeIdentity.deployment != j.Deployment {
+		return j, "", retireUnknown(retireReasonIdentity, "installed retained node identity is not proved against the archived deployment", "")
+	}
 	if r := proveRetireMaskedAccount(ctx); r != nil {
 		return j, "", r
 	}
@@ -331,22 +342,29 @@ func observeRetireEntryNode(ctx context.Context, m retireMode, j retirement.Jour
 	if firstProp(props, "LoadState") != "loaded" || firstProp(props, "NeedDaemonReload") != "no" {
 		return "", retireRefuse("settled-entry-node-unit-mismatch", "node must be loaded with no pending definition reload", "")
 	}
-	if firstProp(props, "UnitFileState") != "enabled" {
-		return "", retireRefuse("settled-entry-node-enablement", "node must be persistently enabled", "")
+	if r := retireRetainedEnablement(nodeUnit, firstProp(props, "UnitFileState")); r != nil {
+		r.Reason = "settled-entry-node-enablement"
+		return "", r
 	}
 	if !slices.Contains([]string{"", "root", "0"}, firstProp(props, "User")) || !slices.Contains([]string{"", "root", "0"}, firstProp(props, "Group")) {
 		return "", retireRefuse("settled-entry-node-account", "node must retain root user and group", "")
 	}
-	if r := retireQuietJob(ctx, insp, nodeUnit, true); r != nil {
-		return "", retireUnknown("settled-entry-node-job-observation", r.Why, "")
+	active := firstProp(props, "ActiveState")
+	if !knownActiveState(active) {
+		return "", retireUnknown("settled-entry-node-observation-unreadable", "unfamiliar node activity", "")
+	}
+	if active != "active" && active != "inactive" && active != "failed" {
+		return "", retireRefuse("settled-entry-node-"+active, "node is not quiet or active", "")
+	}
+	if r := observeRetireEntryJob(ctx, insp); r != nil {
+		return "", r
 	}
 	if r := proveRetireNodeExecution(ctx, m.configPath); r != nil {
 		return "", r
 	}
-	active := firstProp(props, "ActiveState")
 	switch active {
 	case "active":
-		if r := proveRetireDoneRegistration(ctx, insp, m.configPath, j); r != nil {
+		if _, r := observeRetirePostconditions(ctx, m, j); r != nil {
 			return "", r
 		}
 		return "active", nil
@@ -359,7 +377,7 @@ func observeRetireEntryNode(ctx context.Context, m retireMode, j retirement.Jour
 			return "", retireRefuse("settled-entry-node-process-present", "quiet node still has a main process", "")
 		}
 		if err := insp.ProveUnitProcessesGone(ctx, nodeUnit); err != nil {
-			return "", retireUnknown("settled-entry-node-process-present", err.Error(), "")
+			return "", retireUnknown("settled-entry-node-observation-unreadable", err.Error(), "")
 		}
 		return "quiet-" + active, nil
 	default:
