@@ -555,7 +555,13 @@ jobs:
           # the fresh-check parses the WHOLE role (static imports resolve
           # modules even for tasks a controller-only run skips), so bare
           # ansible-core is not enough.
-          ansible-galaxy collection install "ansible.posix:$(cat ansible_collections/junioryono/billet/tests/ansible-posix-version)"
+          # --no-cache because the version is pinned exactly and the runner is
+          # fresh, so the galaxy response cache answers nothing this install
+          # needs and can only fail it: a partial entry ("Missing expected
+          # 'results' in ansible-galaxy cache") took out host-lifecycle (guard)
+          # before it ran a single gate, and galaxy's own diagnostic names this
+          # flag as the way out.
+          ansible-galaxy collection install --no-cache "ansible.posix:$(cat ansible_collections/junioryono/billet/tests/ansible-posix-version)"
 
       # The check-mode scenario pins /usr/bin/python3, and the apt module in
       # check mode needs python3-apt there (a real run installs it itself).
