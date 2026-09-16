@@ -1,12 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -35,6 +35,13 @@ var (
 	// retireBeforeRename runs immediately before the archive's rename, under
 	// every lock it holds; a test observes the host there. Nil in production.
 	retireBeforeRename func()
+	// retireBeforeStoppedProof observes status after backup waiting, or archive after admission.
+	retireBeforeStoppedProof func()
+	// retireBeforeConfigRename observes the boundary after the staged file flush.
+	retireBeforeConfigRename func()
+	// retireAfterRegistrationRead runs after the record is closed and before
+	// the closing unit sample. Nil in production.
+	retireAfterRegistrationRead func()
 	// retireResetFailedFn clears the one failure this transition reconciles.
 	retireResetFailedFn = retireResetFailed
 	// retireSyncDir flushes a directory entry; a test fails it between a
@@ -94,6 +101,14 @@ func retireTransition(ctx context.Context, m retireMode, obs *installedConfigObs
 		}
 	}()
 
+	if j.Phase == retirement.PhaseDone {
+		_, r := observeRetirePostconditions(ctx, m, j)
+		return j, steps, r
+	}
+	if r := admitRetireRemaining(ctx, m, j); r != nil {
+		return j, steps, r
+	}
+
 	for range retireStepLimit {
 		facts, r := observeRetireFacts(ctx, m, j)
 		if r != nil {
@@ -114,7 +129,16 @@ func retireTransition(ctx context.Context, m retireMode, obs *installedConfigObs
 			return j, steps, r
 		}
 
+		if r := admitRetireOperations(ctx, j, retireServiceSequence(j, d)); r != nil {
+			return j, steps, r
+		}
+
 		if r := retireHoldLifecycle(&host, d.Action); r != nil {
+			return j, steps, r
+		}
+
+		// Taking or releasing the lifecycle lock may wait past the admission.
+		if r := admitRetireOperations(ctx, j, retireServiceSequence(j, d)); r != nil {
 			return j, steps, r
 		}
 
@@ -139,7 +163,9 @@ func retireHoldLifecycle(host **hostLock, action retirement.Action) *retireRefus
 			return nil
 		}
 
+		noteRetireMutation("lifecycle-lock", "")
 		l, err := lifecycleLock()
+		noteRetireMutation("wait", "lifecycle lock")
 		if err != nil {
 			return retireUnknown(retireReasonLifecycle, err.Error(), "")
 		}
@@ -176,13 +202,46 @@ func performRetireAction(ctx context.Context, m retireMode, obs *installedConfig
 	case retirement.ActionArchive:
 		return retireArchive(ctx, j)
 	case retirement.ActionAdvanceArchived:
-		return retireAdvance(j, retirement.PhaseArchived, filepath.Dir(j.IdentityDir), filepath.Dir(j.Archive))
+		if r := proveRetireStopped(ctx, j); r != nil {
+			return j, r
+		}
+		for _, dir := range []string{filepath.Dir(j.IdentityDir), filepath.Dir(j.Archive)} {
+			if r := admitRetireOperations(ctx, j, nil); r != nil {
+				return j, r
+			}
+			noteRetireMutation("directory-flush", "")
+			if err := retireSyncDir(dir); err != nil {
+				return j, retireUnknown(retireReasonJournal, "flush "+dir+" before recording archived: "+err.Error(), "")
+			}
+		}
+		if r := proveRetireStopped(ctx, j); r != nil {
+			return j, r
+		}
+		return retireAdvancePhase(ctx, j, retirement.PhaseArchived)
 	case retirement.ActionRewrite:
-		return retireRewrite(m, obs, j)
+		if r := admitRetireRemaining(ctx, m, j); r != nil {
+			return j, r
+		}
+		if j.Variant == retirement.VariantRetainedNode {
+			if r := proveRetireInvocation(ctx, j.RetainedInvocation); r != nil {
+				return j, r
+			}
+		}
+		return retireRewrite(ctx, m, obs, j)
 	case retirement.ActionAdvanceRewritten:
-		return retireAdvance(j, retirement.PhaseConfigRewritten, filepath.Dir(m.configPath))
+		if r := admitRetireOperations(ctx, j, nil); r != nil {
+			return j, r
+		}
+		noteRetireMutation("directory-flush", "")
+		if err := retireSyncDir(filepath.Dir(m.configPath)); err != nil {
+			return j, retireUnknown(retireReasonJournal, "flush configuration before recording config-rewritten: "+err.Error(), "")
+		}
+		if r := proveRetireRequiredResources(ctx, j); r != nil {
+			return j, r
+		}
+		return retireAdvancePhase(ctx, j, retirement.PhaseConfigRewritten)
 	case retirement.ActionRestart:
-		return retireRestartNode(ctx, j)
+		return retireRestartNode(ctx, m.configPath, j)
 	case retirement.ActionDone:
 		return retireMarkDone(ctx, m, j)
 	default:
@@ -223,7 +282,16 @@ func observeRetireFacts(ctx context.Context, m retireMode, j retirement.Journal)
 
 	switch j.Phase {
 	case retirement.PhaseIntent, retirement.PhaseStopped:
-		f.Backup = retireBackupFact(ctx, insp, j)
+		props, err := insp.UnitProperties(ctx, backupServiceUnit, retireBackupProperties...)
+		f.Backup = retirement.BackupUnknown
+		if err == nil {
+			f.Backup = retireBackupState(props)
+			if retireBackupRefusedHere(props, j) {
+				// Classify completion without resetting the manager during the
+				// read-only decision. The admitted action reconciles it later.
+				f.Backup = retirement.BackupInactive
+			}
+		}
 	case retirement.PhaseArchived, retirement.PhaseConfigRewritten:
 		if j.Variant == retirement.VariantRetainedNode {
 			f.NodeChanged = retireNodeChangedFact(ctx, insp, m.configPath)
@@ -357,6 +425,10 @@ func retireBackupFact(ctx context.Context, insp *lifeops.Inspector, j retirement
 		return retirement.BackupUnknown
 	}
 
+	if r := admitRetireOperations(ctx, j, nil); r != nil {
+		return retirement.BackupUnknown
+	}
+	noteRetireMutation("service-operation", backupServiceUnit)
 	if err := retireResetFailedFn(ctx, backupServiceUnit); err != nil {
 		return retirement.BackupUnknown
 	}
@@ -543,6 +615,24 @@ func retireNodeUnitFact(ctx context.Context, insp *lifeops.Inspector, configPath
 	}
 
 	ev := readRegistrationRecord(registrationRecordPath)
+	if retireAfterRegistrationRead != nil {
+		retireAfterRegistrationRead()
+	}
+	// The reader closes its descriptor before this sample. Bytes from an
+	// unlinked record cannot prove the invocation that replaced its writer.
+	after, err := insp.UnitProperties(ctx, nodeUnit, retireNodeProperties...)
+	if err != nil {
+		return retirement.NodeUnknown
+	}
+	for _, name := range []string{"InvocationID", "ActiveState", "MainPID", "UnitFileState"} {
+		if len(props[name]) != 1 || len(after[name]) != 1 || firstProp(props, name) != firstProp(after, name) {
+			return retirement.NodeUnknown
+		}
+	}
+	pid, err := strconv.ParseUint(firstProp(after, "MainPID"), 10, 32)
+	if err != nil || pid == 0 {
+		return retirement.NodeUnknown
+	}
 	if ev.record == nil {
 		return retirement.NodeUnknown
 	}
@@ -568,6 +658,7 @@ func retireNodeUnitFact(ctx context.Context, insp *lifeops.Inspector, configPath
 // authority lock: the backup is taking one, and waiting under it would be a
 // deadlock this transition made itself.
 func awaitRetireBackup(ctx context.Context, j retirement.Journal) *retireRefusal {
+	noteRetireMutation("wait", "backup")
 	insp := endpointInspector()
 
 	// THE BOUND IS A TIMER AND NOT THE RECORD'S CLOCK: every time this command
@@ -610,7 +701,7 @@ func retireStop(ctx context.Context, j retirement.Journal) (retirement.Journal, 
 	c := converge()
 
 	for _, unit := range []string{upgradeTimerUnit, backupTimerUnit} {
-		if r := stopAndDisableForRetirement(ctx, c, unit); r != nil {
+		if r := stopAndDisableForRetirement(ctx, c, j, unit); r != nil {
 			return j, r
 		}
 	}
@@ -618,12 +709,16 @@ func retireStop(ctx context.Context, j retirement.Journal) (retirement.Journal, 
 	if j.TimerStoppedAt == "" {
 		j.TimerStoppedAt = retireNow().UTC().Format(time.RFC3339Nano)
 
+		if r := admitRetireOperations(ctx, j, nil); r != nil {
+			return j, r
+		}
+		noteRetireMutation("journal", retirement.JournalPath())
 		if err := j.Write(retireNow()); err != nil {
-			return j, retireUnknown(retireReasonJournal, "record the timers' stop: "+err.Error(), "")
+			return j, retirePersistenceError(retireReasonJournal, "record the timers' stop: ", err)
 		}
 	}
 
-	if r := stopAndDisableForRetirement(ctx, c, serverUnit); r != nil {
+	if r := stopAndDisableForRetirement(ctx, c, j, serverUnit); r != nil {
 		return j, r
 	}
 
@@ -631,21 +726,57 @@ func retireStop(ctx context.Context, j retirement.Journal) (retirement.Journal, 
 		return j, r
 	}
 
-	if err := retirement.WriteStatus(retirement.PhaseStopped, j.Variant, retireNow()); err != nil {
-		return j, retireUnknown(retireReasonStatus, "publish the status: "+err.Error(), "")
+	if retireBeforeStoppedProof != nil {
+		retireBeforeStoppedProof()
 	}
 
-	return retireAdvancePhase(j, retirement.PhaseStopped)
+	if r := proveRetireStopped(ctx, j); r != nil {
+		return j, r
+	}
+
+	noteRetireMutation("status", retirement.StatusPath())
+	if err := retirement.WriteStatus(retirement.PhaseStopped, j.Variant, retireNow()); err != nil {
+		return j, retirePersistenceError(retireReasonStatus, "publish the status: ", err)
+	}
+
+	if r := proveRetireStopped(ctx, j); r != nil {
+		return j, r
+	}
+
+	return retireAdvancePhase(ctx, j, retirement.PhaseStopped)
 }
 
 // stopAndDisableForRetirement stops a unit and disables it, so nothing systemd
 // knows about starts it again on this host or at the next boot.
-func stopAndDisableForRetirement(ctx context.Context, c converger, unit string) *retireRefusal {
-	if _, err := c.StopAndProve(ctx, unit); err != nil {
+func stopAndDisableForRetirement(ctx context.Context, c converger, j retirement.Journal, unit string) *retireRefusal {
+	manager, ok := c.(interface {
+		StopAndProveAdmitted(ctx context.Context, unit string, admit func() error) (lifeops.StopResult, error)
+		DisableAdmitted(ctx context.Context, unit string, admit func() error) error
+	})
+	if !ok {
+		return retireUnknown(retireReasonStop, "service manager has no operation submission admission", "")
+	}
+	var refusal *retireRefusal
+	admit := func(verb string) func() error {
+		return func() error {
+			refusal = admitRetireOperation(ctx, j, verb, unit)
+			if refusal != nil {
+				return errors.New(refusal.Why)
+			}
+			noteRetireMutation("service-operation", verb+" "+unit)
+			return nil
+		}
+	}
+	if _, err := manager.StopAndProveAdmitted(ctx, unit, admit("stop")); err != nil {
+		if refusal != nil {
+			return refusal
+		}
 		return retireUnknown(retireReasonStop, fmt.Sprintf("stop %s: %v", unit, err), "")
 	}
-
-	if err := c.Disable(ctx, unit); err != nil {
+	if err := manager.DisableAdmitted(ctx, unit, admit("disable")); err != nil {
+		if refusal != nil {
+			return refusal
+		}
 		return retireUnknown(retireReasonStop, fmt.Sprintf("disable %s: %v", unit, err), "")
 	}
 
@@ -660,19 +791,24 @@ func retireArchive(ctx context.Context, j retirement.Journal) (retirement.Journa
 	// THE TRANSITION'S OWN EXCLUSION: it acquires the global lock and does not
 	// admit itself through the status it published, because that status is what
 	// it is publishing and it is the one writer the status allows.
-	acc, err := openRetiringIdentityAccess(ctx, j.IdentityDir, identityAccessWait)
-	if err != nil {
-		return j, retireUnknown(retireReasonIdentity, "take the identity exclusion for the archive: "+err.Error(), "")
+	admit := func() *retireRefusal { return admitRetireOperations(ctx, j, nil) }
+	acc, r := openRetireIdentity(ctx, j.IdentityDir, true, admit)
+	if r != nil {
+		return j, r
 	}
 
-	j, moved, r := archiveUnderExclusion(j)
+	j, moved, r := archiveUnderExclusion(ctx, j)
 
 	if moved {
 		acc.moved()
 	}
 
-	if err := acc.Release(); err != nil && r == nil {
-		r = retireUnknown(retireReasonIdentity, "release the identity exclusion after the archive: "+err.Error(), "")
+	if released := releaseRetireIdentity(acc, admit); released != nil {
+		if r == nil {
+			r = released
+		} else {
+			r.Why += "; " + released.Why
+		}
 	}
 
 	return j, r
@@ -681,23 +817,41 @@ func retireArchive(ctx context.Context, j retirement.Journal) (retirement.Journa
 // archiveUnderExclusion is the rename and its flushes, with the exclusion held
 // by the caller; it answers whether the directory moved, so the release knows
 // there is nothing left at its name to hand back.
-func archiveUnderExclusion(j retirement.Journal) (retirement.Journal, bool, *retireRefusal) {
+func archiveUnderExclusion(ctx context.Context, j retirement.Journal) (retirement.Journal, bool, *retireRefusal) {
 	if retireBeforeRename != nil {
 		retireBeforeRename()
 	}
 
+	if r := admitRetireOperations(ctx, j, retireServiceSequence(j, retirement.Decision{Action: retirement.ActionArchive})); r != nil {
+		return j, false, r
+	}
+	if retireBeforeStoppedProof != nil {
+		retireBeforeStoppedProof()
+	}
+	if r := proveRetireStopped(ctx, j); r != nil {
+		return j, false, r
+	}
+
+	noteRetireMutation("archive", j.Archive)
 	if err := os.Rename(j.IdentityDir, j.Archive); err != nil {
 		return j, false, retireUnknown(retireReasonArchive, fmt.Sprintf("move %s to %s: %v", j.IdentityDir, j.Archive,
 			err), "")
 	}
 
 	for _, dir := range []string{filepath.Dir(j.IdentityDir), filepath.Dir(j.Archive)} {
+		if r := admitRetireOperations(ctx, j, nil); r != nil {
+			return j, true, r
+		}
+		noteRetireMutation("directory-flush", "")
 		if err := retireSyncDir(dir); err != nil {
 			return j, true, retireUnknown(retireReasonArchive, "flush "+dir+": "+err.Error(), "")
 		}
 	}
 
-	j, r := retireAdvancePhase(j, retirement.PhaseArchived)
+	if r := proveRetireStopped(ctx, j); r != nil {
+		return j, true, r
+	}
+	j, r := retireAdvancePhase(ctx, j, retirement.PhaseArchived)
 
 	return j, true, r
 }
@@ -705,18 +859,26 @@ func archiveUnderExclusion(j retirement.Journal) (retirement.Journal, bool, *ret
 // retireRewrite installs the staged serverless configuration over the
 // installed one, or removes the installed one on a server-only host, durably
 // in both cases, and only then publishes the phase that certifies it.
-func retireRewrite(m retireMode, obs *installedConfigObservation, j retirement.Journal,
+func retireRewrite(ctx context.Context, m retireMode, obs *installedConfigObservation, j retirement.Journal,
 ) (retirement.Journal, *retireRefusal) {
 	if j.Variant == retirement.VariantServerOnly {
+		if r := admitRetireOperations(ctx, j, nil); r != nil {
+			return j, r
+		}
+		noteRetireMutation("rewrite", m.configPath)
 		if err := os.Remove(m.configPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return j, retireUnknown(retireReasonRewrite, "remove "+m.configPath+": "+err.Error(), "")
 		}
 
+		if r := admitRetireOperations(ctx, j, nil); r != nil {
+			return j, r
+		}
+		noteRetireMutation("directory-flush", "")
 		if err := retireSyncDir(filepath.Dir(m.configPath)); err != nil {
-			return j, retireUnknown(retireReasonRewrite, err.Error(), "")
+			return j, retirePersistenceError(retireReasonRewrite, "", err)
 		}
 
-		return retireAdvancePhase(j, retirement.PhaseConfigRewritten)
+		return retireAdvancePhase(ctx, j, retirement.PhaseConfigRewritten)
 	}
 
 	body, presence, err := retirement.ReadStage()
@@ -731,22 +893,67 @@ func retireRewrite(m retireMode, obs *installedConfigObservation, j retirement.J
 		return j, retireUnknown(retireReasonStage, "the staged configuration is not the one recorded at intent", "")
 	}
 
-	if err := installRetireConfig(m.configPath, body); err != nil {
-		return j, retireUnknown(retireReasonRewrite, err.Error(), "")
+	if r := proveRetireActivation(ctx, false); r != nil {
+		return j, r
+	}
+	var boundaryRefusal *retireRefusal
+	if err := installRetireConfig(m.configPath, body, func(staged string) error {
+		if boundaryRefusal = proveRetireConfigPath(ctx, m.configPath, j); boundaryRefusal != nil {
+			return errors.New(boundaryRefusal.Why)
+		}
+		if staged != "" {
+			replacement, err := observeRetireResource(staged)
+			if err != nil {
+				return err
+			}
+			replacement.Path = m.configPath
+			replacement.ResolvedPath, err = lifeops.ResolveOperationPath(m.configPath)
+			if err != nil {
+				return err
+			}
+			// Persist the staged inode before renaming it, so a crash can prove
+			// that this retirement installed the replacement it is resuming.
+			original := *j.RetainedInvocation
+			original.ConfigReplacement = &replacement
+			j.RetainedInvocation = &original
+			// Observing the staged inode can block. Admit before publishing it,
+			// then admit again after persistence before the configuration rename.
+			boundaryRefusal = admitRetireRemaining(ctx, m, j)
+			if boundaryRefusal != nil {
+				return errors.New(boundaryRefusal.Why)
+			}
+			noteRetireMutation("journal", retirement.JournalPath())
+			if err := j.Write(retireNow()); err != nil {
+				return err
+			}
+		}
+		boundaryRefusal = admitRetireRemaining(ctx, m, j)
+		if boundaryRefusal != nil {
+			return errors.New(boundaryRefusal.Why)
+		}
+		return nil
+	}); err != nil {
+		if boundaryRefusal != nil {
+			return j, boundaryRefusal
+		}
+		return j, retirePersistenceError(retireReasonRewrite, "", err)
 	}
 
+	if r := proveRetireRequiredResources(ctx, j); r != nil {
+		return j, r
+	}
 	if obs != nil {
 		obs.sha256 = retirement.Digest(body)
 	}
 
-	return retireAdvancePhase(j, retirement.PhaseConfigRewritten)
+	return retireAdvancePhase(ctx, j, retirement.PhaseConfigRewritten)
 }
 
 // installRetireConfig writes body over path with the installed file's own
 // owner and mode: a temporary file beside it, its bytes flushed, renamed over
 // the name, and the directory flushed, so a power loss leaves either
 // configuration whole and never half of one.
-func installRetireConfig(path string, body []byte) error {
+func installRetireConfig(path string, body []byte, beforeStep func(string) error) error {
 	dir := filepath.Dir(path)
 
 	info, err := os.Stat(path)
@@ -754,17 +961,23 @@ func installRetireConfig(path string, body []byte) error {
 		return fmt.Errorf("examine the installed configuration %s: %w", path, err)
 	}
 
+	if err := beforeStep(""); err != nil {
+		return err
+	}
+
+	noteRetireMutation("rewrite", path)
 	tmp, err := os.CreateTemp(dir, ".billet-serverless-*")
 	if err != nil {
 		return fmt.Errorf("stage the serverless configuration beside %s: %w", path, err)
 	}
 
 	installed := false
+	cleanupAllowed := true
 
 	defer func() {
 		_ = tmp.Close()
 
-		if !installed {
+		if !installed && cleanupAllowed {
 			_ = os.Remove(tmp.Name())
 		}
 	}()
@@ -785,6 +998,7 @@ func installRetireConfig(path string, body []byte) error {
 		}
 	}
 
+	noteRetireMutation("wait", "configuration flush")
 	if err := tmp.Sync(); err != nil {
 		return fmt.Errorf("flush the serverless configuration: %w", err)
 	}
@@ -793,6 +1007,17 @@ func installRetireConfig(path string, body []byte) error {
 		return fmt.Errorf("close the serverless configuration: %w", err)
 	}
 
+	if retireBeforeConfigRename != nil {
+		retireBeforeConfigRename()
+	}
+	// A refused next step leaves its temporary for inspection.
+	cleanupAllowed = false
+	// The temporary-file flush may block beyond the caller's admission.
+	if err := beforeStep(tmp.Name()); err != nil {
+		return err
+	}
+	cleanupAllowed = true
+	noteRetireMutation("rewrite-rename", path)
 	if err := os.Rename(tmp.Name(), path); err != nil {
 		return fmt.Errorf("install the serverless configuration at %s: %w", path, err)
 	}
@@ -808,9 +1033,17 @@ func installRetireConfig(path string, body []byte) error {
 // THE ENABLEMENT COMES FIRST and is read back, because a node that was active
 // under `enabled-runtime` satisfies every running predicate and would leave a
 // retirement whose completion requires a fact nothing made true.
-func retireRestartNode(ctx context.Context, j retirement.Journal) (retirement.Journal, *retireRefusal) {
+func retireRestartNode(ctx context.Context, configPath string, j retirement.Journal) (retirement.Journal, *retireRefusal) {
 	c := converge()
 
+	if r := proveRetireNodeExecution(ctx, configPath); r != nil {
+		return j, r
+	}
+	if r := admitRetireOperation(ctx, j, "enable", nodeUnit); r != nil {
+		return j, r
+	}
+
+	noteRetireMutation("service-operation", "enable "+nodeUnit)
 	if err := c.Enable(ctx, nodeUnit); err != nil {
 		return j, retireUnknown(retireReasonRestart, "enable "+nodeUnit+": "+err.Error(), "")
 	}
@@ -842,6 +1075,11 @@ func retireRestartNode(ctx context.Context, j retirement.Journal) (retirement.Jo
 
 	// THE NODE'S OWN STOP, which waits for the work it is running for as long
 	// as that takes; nothing here bounds it.
+	if r := admitRetireOperation(ctx, j, "stop", nodeUnit); r != nil {
+		return j, r
+	}
+
+	noteRetireMutation("service-operation", "stop "+nodeUnit)
 	if _, err := c.StopAndProve(ctx, nodeUnit); err != nil {
 		return j, retireUnknown(retireReasonRestart, "stop "+nodeUnit+": "+err.Error(), "")
 	}
@@ -860,11 +1098,20 @@ func retireRestartNode(ctx context.Context, j retirement.Journal) (retirement.Jo
 			nodeUnit, orUnknownWord(post.ActiveState), orUnknownWord(post.SubState), orUnknownWord(post.Result)), "")
 	}
 
+	if r := proveRetireNodeExecution(ctx, configPath); r != nil {
+		return j, r
+	}
+
+	if r := admitRetireOperation(ctx, j, "start", nodeUnit); r != nil {
+		return j, r
+	}
+
+	noteRetireMutation("service-operation", "start "+nodeUnit)
 	if _, err := c.StartAndProve(ctx, nodeUnit); err != nil {
 		return j, retireUnknown(retireReasonRestart, "start "+nodeUnit+": "+err.Error(), "")
 	}
 
-	return retireAdvancePhase(j, retirement.PhaseNodeRestarted)
+	return retireAdvancePhase(ctx, j, retirement.PhaseNodeRestarted)
 }
 
 // retireMarkDone publishes the last phase and the status that goes with it.
@@ -874,10 +1121,7 @@ func retireMarkDone(ctx context.Context, m retireMode, j retirement.Journal) (re
 		return j, r
 	}
 
-	now := retireNow()
-	j.DoneAt = now.UTC().Format(time.RFC3339Nano)
-
-	next, r := retireAdvancePhase(j, retirement.PhaseDone)
+	next, r := retireAdvancePhase(ctx, j, retirement.PhaseDone)
 	if r != nil {
 		return next, r
 	}
@@ -889,32 +1133,29 @@ func retireMarkDone(ctx context.Context, m retireMode, j retirement.Journal) (re
 	return next, nil
 }
 
-// retireAdvance publishes a phase whose act ANOTHER RUN performed and was
-// interrupted before it could flush: the directories that run owed are flushed
-// here, before the phase that certifies them is written. A rename or an unlink
-// is visible to the next observation long before its parent's entry is
-// durable, so a phase published over an unflushed change could survive a power
-// loss the change itself did not.
-func retireAdvance(j retirement.Journal, phase retirement.Phase, dirs ...string) (retirement.Journal, *retireRefusal) {
-	for _, dir := range dirs {
-		if err := retireSyncDir(dir); err != nil {
-			return j, retireUnknown(retireReasonJournal, fmt.Sprintf("flush %s before recording %s: %v", dir, phase,
-				err), "")
-		}
-	}
-
-	return retireAdvancePhase(j, phase)
-}
-
 // retireAdvancePhase writes the journal at its next phase and nothing else.
 //
 // A FAILED WRITE LEAVES THE PHASE WHERE IT WAS, and answers the journal the
 // host still holds: the refusal's `state` is then what the next converge will
 // find, never the phase this run was reaching for.
-func retireAdvancePhase(j retirement.Journal, phase retirement.Phase) (retirement.Journal, *retireRefusal) {
+func retireAdvancePhase(ctx context.Context, j retirement.Journal, phase retirement.Phase) (retirement.Journal, *retireRefusal) {
 	next := j
 	next.Phase = phase
 
+	if r := admitRetireOperations(ctx, j, nil); r != nil {
+		return j, r
+	}
+	if phase == retirement.PhaseDone {
+		configPath := ""
+		if j.RetainedInvocation != nil {
+			configPath = j.RetainedInvocation.ConfigPath
+		}
+		if r := proveRetireDoneRegistration(ctx, endpointInspector(), configPath, j); r != nil {
+			return j, r
+		}
+		next.DoneAt = retireNow().UTC().Format(time.RFC3339Nano)
+	}
+	noteRetireMutation("journal", retirement.JournalPath())
 	err := next.Write(retireNow())
 	if err == nil {
 		return next, nil
@@ -951,9 +1192,9 @@ func retireResetFailed(ctx context.Context, unit string) error {
 	ctx, cancel := context.WithTimeout(ctx, systemctlTimeout)
 	defer cancel()
 
-	out, err := exec.CommandContext(ctx, systemctlBinary, "reset-failed", "--", unit).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("systemctl reset-failed %s: %w: %s", unit, err, strings.TrimSpace(string(out)))
+	var output bytes.Buffer
+	if err := runManagerOutput(ctx, systemctlBinary, []string{"reset-failed", "--", unit}, &output, &output); err != nil {
+		return fmt.Errorf("systemctl reset-failed %s: %w: %s", unit, err, strings.TrimSpace(output.String()))
 	}
 
 	return nil

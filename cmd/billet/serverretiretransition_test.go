@@ -69,6 +69,7 @@ func (f *requestFixture) plantJournal(t *testing.T, phase retirement.Phase, vari
 		mustOK(t, retirement.WriteStage(body))
 
 		j.StagedSHA256, j.Config = retirement.Digest(body), "present"
+		j.RetainedInvocation = f.originalNode
 	}
 
 	// THE TIMERS' STOP IS RECORDED FROM INTENT ON, which is where the window a
@@ -279,6 +280,7 @@ func TestARetainedNodesTransitionInstallsTheStageAndRestartsTheNode(t *testing.T
 func TestARetainedNodeThatPublishesNoRecordIsNotDone(t *testing.T) {
 	for name, endpoint := range map[string]string{
 		"no record at all":                 "",
+		"only the pre-restart record":      "",
 		"a record naming another endpoint": "https://10.0.0.9:7717",
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -288,11 +290,14 @@ func TestARetainedNodeThatPublishesNoRecordIsNotDone(t *testing.T) {
 
 			record := useRegistrationRecord(t)
 
-			if endpoint != "" {
-				f.svc.onStart = func(unit string) {
-					if unit == nodeUnit {
-						restartedNode(t, f, record, endpoint)
-					}
+			f.svc.onStart = func(unit string) {
+				if unit != nodeUnit {
+					return
+				}
+				if name == "no record at all" {
+					mustOK(t, os.Remove(record))
+				} else if endpoint != "" {
+					restartedNode(t, f, record, endpoint)
 				}
 			}
 
@@ -306,6 +311,30 @@ func TestARetainedNodeThatPublishesNoRecordIsNotDone(t *testing.T) {
 
 			if !strings.Contains(whyOf(m), "node_unit") {
 				t.Fatalf("the refusal does not name the fact that refused: %s", out)
+			}
+
+			props, err := endpointInspector().UnitProperties(t.Context(), nodeUnit, "InvocationID")
+			mustOK(t, err)
+			if firstProp(props, "InvocationID") == "" || firstProp(props, "InvocationID") == retainedInvocation {
+				t.Fatal("the fake restart did not change the manager's invocation")
+			}
+			if name == "no record at all" {
+				if _, err := os.Lstat(record); !os.IsNotExist(err) {
+					t.Fatalf("the absent-record case kept a record: %v", err)
+				}
+			} else {
+				ev := readRegistrationRecord(record)
+				invocation := retainedInvocation
+				if endpoint != "" {
+					invocation = firstProp(props, "InvocationID")
+				}
+				if ev.record == nil || ev.record.InvocationID != invocation {
+					t.Fatalf("the record case did not establish invocation %s: %+v", invocation, ev)
+				}
+			}
+			j := requireRetireJournal(t)
+			if j.Phase != retirement.PhaseNodeRestarted || j.DoneAt != "" || j.RowDone || j.Settled {
+				t.Fatalf("an unproved registration completed retirement: %+v", j)
 			}
 		})
 	}
@@ -448,7 +477,7 @@ func TestABackupIsAwaitedAndOnlyItsOwnRefusalIsReconciled(t *testing.T) {
 		reconcile bool
 	}{
 		"a backup that finishes is waited for": {
-			unit: "LoadState=loaded\nActiveState=active\nSubState=running\nResult=success\nMainPID=99\n",
+			unit: "LoadState=loaded\nActiveState=activating\nSubState=start\nJob=42\nResult=success\nMainPID=99\n",
 			resolve: "LoadState=loaded\nActiveState=inactive\nSubState=dead\nResult=success\nMainPID=0\n" +
 				"UnitFileState=static\nExecMainCode=1\nExecMainStatus=0\n",
 		},
@@ -479,7 +508,15 @@ func TestABackupIsAwaitedAndOnlyItsOwnRefusalIsReconciled(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			f := newRequestFixture(t)
 			unit := filepath.Join(f.unitsDir, backupServiceUnit)
-			writeFile(t, unit, c.unit, 0o644)
+			effects := filepath.Join(f.unitsDir, backupServiceUnit+".effects")
+			writeFile(t, effects, strings.ReplaceAll(mustRead(t, effects), "Job=\n", ""), 0o644)
+			if !strings.Contains(c.unit, "Job=") {
+				c.unit += "Job=\n"
+			}
+			if c.resolve != "" {
+				c.resolve += "Job=\n"
+			}
+			writeFile(t, unit, c.unit+"UnitFileState=static\n", 0o644)
 
 			// The wait is a test's: a poll and a bound this case can reach.
 			savedWait, savedPoll := retireBackupWait, retireBackupPoll
@@ -500,15 +537,10 @@ func TestABackupIsAwaitedAndOnlyItsOwnRefusalIsReconciled(t *testing.T) {
 
 			t.Cleanup(func() { retireResetFailedFn = savedReset })
 
-			// A BACKUP THAT FINISHES ON ITS OWN does so WHILE THE WAIT RUNS.
-			// The fake records each question AFTER it has answered it, so a
-			// recorded question is an observation the transition COMPLETED,
-			// and the resolution is written behind the SECOND of them: the
-			// first is the table's own observation, the second can only be one
-			// the wait itself made. The case then requires exactly ONE await
-			// in the steps, so an await that returned without waiting — which
-			// would meet a backup still running at the next decision — shows
-			// up as a second await and fails.
+			// Admission reads dependency evidence separately. Count only completed
+			// backup-state observations: initial remaining-work observation, table
+			// observation, then the wait's first poll. An early-returning wait
+			// still produces a second await step and fails the action assertion.
 			waited := make(chan struct{})
 			stop := make(chan struct{})
 
@@ -519,7 +551,7 @@ func TestABackupIsAwaitedAndOnlyItsOwnRefusalIsReconciled(t *testing.T) {
 					deadline := time.After(30 * time.Second)
 
 					for {
-						if strings.Count(readIfAny(filepath.Join(f.unitsDir, ".asked")), backupServiceUnit) >= 2 {
+						if strings.Count(readIfAny(filepath.Join(f.unitsDir, ".backup-observed")), backupServiceUnit) >= 3 {
 							publishUnit(t, unit, c.resolve)
 
 							return
@@ -675,19 +707,25 @@ func TestAResumeIsHeldToItsJournalAndMarker(t *testing.T) {
 	}
 }
 
+var retireRegistrationFixturePath string
+
 // useRegistrationRecord points the node's runtime record at a path this test
 // owns, and admits the file it writes: the reader requires a root-owned 0600
 // record, which no test process can create.
 func useRegistrationRecord(t *testing.T) string {
 	t.Helper()
 
+	if retireRegistrationFixturePath != "" && registrationRecordPath == retireRegistrationFixturePath {
+		return registrationRecordPath
+	}
+
 	dir := filepath.Join(t.TempDir(), "registration")
 	mustOK(t, os.MkdirAll(dir, 0o700))
 
 	path := filepath.Join(dir, "current")
-
 	savedPath, savedOpen := registrationRecordPath, registrationOpen
-	registrationRecordPath = path
+	savedFixture := retireRegistrationFixturePath
+	registrationRecordPath, retireRegistrationFixturePath = path, path
 	registrationOpen = func(name string) (*os.File, os.FileInfo, error) {
 		f, err := os.Open(name)
 		if err != nil {
@@ -702,7 +740,10 @@ func useRegistrationRecord(t *testing.T) string {
 		return f, rootOwned{info}, nil
 	}
 
-	t.Cleanup(func() { registrationRecordPath, registrationOpen = savedPath, savedOpen })
+	t.Cleanup(func() {
+		registrationRecordPath, registrationOpen = savedPath, savedOpen
+		retireRegistrationFixturePath = savedFixture
+	})
 
 	return path
 }
@@ -741,20 +782,18 @@ func writeRegistrationRecord(t *testing.T, path, deployment, endpoint, invocatio
 	writeFile(t, path, string(body), 0o600)
 }
 
-// restartedNode is what the fake converger's start of the node unit leaves
-// behind: SYSTEMD MINTS A NEW INVOCATION for every start, so the unit's
-// property moves with it, and the node publishes its record under that new
-// invocation when it registers. A fixture whose restart kept the invocation
-// could not tell a receipt written for the restart from the one that was
-// already there.
+// restartedNode publishes registration for the manager's current invocation.
+// Starting the unit and publishing its registration are separate events.
 func restartedNode(t *testing.T, f *requestFixture, record, endpoint string) {
 	t.Helper()
 
-	unit := filepath.Join(f.unitsDir, nodeUnit)
-	writeFile(t, unit, strings.Replace(mustRead(t, unit), "InvocationID="+retainedInvocation,
-		"InvocationID="+retainedRestartInvocation, 1), 0o644)
-
-	writeRegistrationRecord(t, record, f.identity, endpoint, retainedRestartInvocation)
+	props, err := endpointInspector().UnitProperties(t.Context(), nodeUnit, "InvocationID")
+	mustOK(t, err)
+	invocation := firstProp(props, "InvocationID")
+	if invocation == "" {
+		t.Fatal("the manager has no current node invocation to register")
+	}
+	writeRegistrationRecord(t, record, f.identity, endpoint, invocation)
 }
 
 // advanceRowToIntent moves the reserved row to intent, as the intent does.

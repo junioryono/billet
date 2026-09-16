@@ -241,6 +241,9 @@ type openMode struct {
 	// raised. See OpenPostgresCompletion.
 	completion bool
 
+	// existingLocal refuses local preparation and opens only an existing lock.
+	existingLocal bool
+
 	// release is the billet opening the ledger, for the release watermark, or
 	// empty for a caller that named none and gets neither the check nor the
 	// record. See WithRunningRelease.
@@ -298,7 +301,11 @@ func openDir(
 	// the directory and the ledger exist (requireLedgerFile), and a report that
 	// repaired the directory's mode on its way past would be a report with a
 	// side effect on the host it describes.
-	if !mode.inspect {
+	if mode.existingLocal {
+		if err := validateCompletionDirectory(stateDir); err != nil {
+			return nil, err
+		}
+	} else if !mode.inspect {
 		noteOpenSideEffect("mkdir")
 
 		if err := os.MkdirAll(stateDir, 0o700); err != nil {
@@ -338,7 +345,11 @@ func openDir(
 	if !mode.inspect {
 		noteOpenSideEffect("lock")
 
-		held, err := lockDir(stateDir)
+		openLock := lockDir
+		if mode.existingLocal {
+			openLock = lockExistingCompletionDir
+		}
+		held, err := openLock(stateDir)
 
 		switch {
 		case err == nil:

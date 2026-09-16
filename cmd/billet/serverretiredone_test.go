@@ -866,3 +866,48 @@ func TestAnUnparseableConfigurationIsJudgedByWhatItsVariantAsks(t *testing.T) {
 		}
 	})
 }
+
+// Historical identities must not govern a command which enters at done.
+func TestDoneRetirementUsesCurrentServerlessInputs(t *testing.T) {
+	for _, change := range []string{"older journal", "configuration comment", "atomic certificate replacement"} {
+		t.Run(change, func(t *testing.T) {
+			f, j := retireProofHost(t, retirement.VariantRetainedNode, retirement.PhaseDone)
+			j.RowDone, j.CompletedBy, j.Settled = true, requestRetiring, true
+			if change == "older journal" {
+				j.RetainedInvocation = nil
+			}
+			mustOK(t, j.Write(retireNow()))
+			markGuard(t, f.guard, nil, nil)
+			switch change {
+			case "configuration comment":
+				writeFile(t, f.cfg, mustRead(t, f.cfg)+"# ordinary serverless edit\n", 0o600)
+			case "atomic certificate replacement":
+				obs, r := observeInstalledConfig(f.cfg, true)
+				if r != nil {
+					t.Fatal(r)
+				}
+				path := obs.cfg.Node.TLS.CertPath
+				before, err := os.Stat(path)
+				mustOK(t, err)
+				writeFile(t, path+".renewed", mustRead(t, path), before.Mode().Perm())
+				mustOK(t, os.Rename(path+".renewed", path))
+				after, err := os.Stat(path)
+				mustOK(t, err)
+				if os.SameFile(before, after) {
+					t.Fatal("certificate replacement kept its historical inode")
+				}
+			}
+			journalBefore := mustRead(t, retirement.JournalPath())
+			operationsBefore := len(f.manager.operations)
+			out, code := retiredRequest(t, f, requestRun)
+			answer := retireAnswer(t, out)
+			if code != 0 || answer["outcome"] != retireOutcomeUnchanged || answer["phase"] != string(retirement.PhaseDone) ||
+				asMap(answer["postconditions"])["config"] != retireConfigPresent {
+				t.Fatalf("completed retirement refused current inputs (%s): %s", change, out)
+			}
+			if mustRead(t, retirement.JournalPath()) != journalBefore || len(f.manager.operations) != operationsBefore {
+				t.Fatalf("done path performed transition work: %v", f.manager.operations)
+			}
+		})
+	}
+}

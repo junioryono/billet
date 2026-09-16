@@ -111,7 +111,9 @@ func publish(path string, body []byte, mode os.FileMode) error {
 	}
 
 	tmpName := tmp.Name()
-	cleanup := func() { _ = os.Remove(tmpName) }
+	cleanup := func() {
+		_ = os.Remove(tmpName)
+	}
 
 	if _, err := tmp.Write(body); err != nil {
 		_ = tmp.Close()

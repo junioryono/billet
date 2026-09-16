@@ -27,6 +27,7 @@ import (
 	"github.com/junioryono/billet/deploy"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/hostupgrade"
+	"github.com/junioryono/billet/internal/lifeops"
 	"github.com/junioryono/billet/internal/provenance"
 	"github.com/junioryono/billet/internal/regularfile"
 	"github.com/junioryono/billet/internal/state"
@@ -793,13 +794,43 @@ func inspectProvenanceSection(report *inspectReport, exeSHA string) {
 	}
 }
 
+// managerCommandRunner is nil outside fixtures; inspectors and direct manager
+// reads share it so a fixture never needs to launch a manager process.
+var managerCommandRunner func(context.Context, string, []string, io.Writer, io.Writer) error
+
+// managerRunnerOption leaves the production inspector's bounds and cancellation intact.
+func managerRunnerOption() lifeops.Option {
+	if managerCommandRunner == nil {
+		return lifeops.WithCommandRunner(nil)
+	}
+	return lifeops.WithCommandRunner(runManagerCommand)
+}
+
+// runManagerOutput leaves diagnostic formatting and stream separation to the caller.
+func runManagerOutput(ctx context.Context, bin string, args []string, stdout, stderr io.Writer) error {
+	if managerCommandRunner != nil {
+		return managerCommandRunner(ctx, bin, args, stdout, stderr)
+	}
+	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd.Stdout, cmd.Stderr = stdout, stderr
+	return cmd.Run()
+}
+
+func runManagerCommand(ctx context.Context, bin string, args []string) ([]byte, error) {
+	var stdout, stderr bytes.Buffer
+	if err := runManagerOutput(ctx, bin, args, &stdout, &stderr); err != nil {
+		return nil, fmt.Errorf("%s %s: %w: %s", bin, strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+	}
+	return stdout.Bytes(), nil
+}
+
 // unitProperties is one `systemctl show` for the properties the report needs,
 // parsed into key -> values (a key can repeat, ExecStart among them).
 func unitProperties(ctx context.Context, unit string) (map[string][]string, error) {
 	ctx, cancel := context.WithTimeout(ctx, systemctlTimeout)
 	defer cancel()
 	names := []string{"LoadState", "UnitFileState", "ActiveState", "SubState", "MainPID",
-		"InvocationID", "NeedDaemonReload", "ExecMainStartTimestamp", "ExecStart", "EnvironmentFiles",
+		"InvocationID", "NeedDaemonReload", "ExecMainStartTimestamp", "ExecStart",
 		"Environment", "RootDirectory", "RootImage", "BindPaths", "BindReadOnlyPaths", "MountImages",
 		"ExtensionImages", "ExtensionDirectories", "TemporaryFileSystem"}
 	args := make([]string, 0, len(names)+3)
@@ -809,9 +840,7 @@ func unitProperties(ctx context.Context, unit string) (map[string][]string, erro
 	}
 	args = append(args, "--", unit)
 	var stdout, stderr bytes.Buffer
-	cmd := exec.CommandContext(ctx, systemctlBinary, args...)
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	if err := cmd.Run(); err != nil {
+	if err := runManagerOutput(ctx, systemctlBinary, args, &stdout, &stderr); err != nil {
 		return nil, fmt.Errorf("systemctl show %s: %w: %s", unit, err, strings.TrimSpace(stderr.String()))
 	}
 	props := map[string][]string{}
@@ -909,10 +938,8 @@ func unitExecStart(ctx context.Context, unit string) ([]execRecord, error) {
 	defer cancel()
 	object := "/org/freedesktop/systemd1/unit/" + busLabel(unit)
 	var stdout, stderr bytes.Buffer
-	cmd := exec.CommandContext(ctx, busctlBinary, "--json=short", "get-property",
-		"org.freedesktop.systemd1", object, "org.freedesktop.systemd1.Service", "ExecStart")
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	if err := cmd.Run(); err != nil {
+	if err := runManagerOutput(ctx, busctlBinary, []string{"--json=short", "get-property",
+		"org.freedesktop.systemd1", object, "org.freedesktop.systemd1.Service", "ExecStart"}, &stdout, &stderr); err != nil {
 		return nil, fmt.Errorf("busctl get-property ExecStart of %s: %w: %s", unit, err, strings.TrimSpace(stderr.String()))
 	}
 	var reply struct {
@@ -983,33 +1010,9 @@ func busLabel(name string) string {
 	return b.String()
 }
 
-// environmentFilesOfAll reads every EnvironmentFiles property line systemd
-// printed (one per file on systemd 255, `<path> (ignore_errors=yes|no)`). The
-// suffix is stripped exactly and the WHOLE path is kept, because a path can
-// itself contain " (" and a parser that cut at the first one would name a
-// sibling file; a line in any other form is refused rather than guessed at.
-func environmentFilesOfAll(lines []string) ([]string, error) {
-	out := make([]string, 0, len(lines))
-	for _, line := range lines {
-		line = strings.TrimRight(line, "\r")
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-		var path string
-		switch {
-		case strings.HasSuffix(line, " (ignore_errors=yes)"):
-			path = strings.TrimSuffix(line, " (ignore_errors=yes)")
-		case strings.HasSuffix(line, " (ignore_errors=no)"):
-			path = strings.TrimSuffix(line, " (ignore_errors=no)")
-		default:
-			return nil, fmt.Errorf("an EnvironmentFiles entry in a form the inspector does not read")
-		}
-		if !filepath.IsAbs(path) {
-			return nil, fmt.Errorf("an EnvironmentFiles entry that is not an absolute path")
-		}
-		out = append(out, path)
-	}
-	return out, nil
+// Keep optionality in the sample identity although the report exposes only paths.
+func unitEnvironmentFiles(ctx context.Context, unit string) ([]lifeops.EnvironmentFile, error) {
+	return lifeops.NewInspector(lifeops.WithOperationBusctl(busctlBinary), lifeops.WithTimeout(systemctlTimeout), managerRunnerOption()).EnvironmentFiles(ctx, unit)
 }
 
 // inspectServiceSection reports one unit and says whether it is bound to the
@@ -1072,7 +1075,11 @@ func inspectServiceSection(ctx context.Context, role, unit string, cfg *config.C
 		rendered = execStartArgvOf(props["ExecStart"][0])
 	}
 	svc.ExecStart = known(rendered)
-	envFiles, envErr := environmentFilesOfAll(props["EnvironmentFiles"])
+	envSpecs, envErr := unitEnvironmentFiles(ctx, unit)
+	envFiles := make([]string, 0, len(envSpecs))
+	for _, spec := range envSpecs {
+		envFiles = append(envFiles, spec.Path)
+	}
 	if envErr != nil {
 		svc.EnvironmentFiles = unknown(envErr.Error())
 	} else {
@@ -1146,7 +1153,7 @@ func inspectServiceSection(ctx context.Context, role, unit string, cfg *config.C
 		return svc, binding
 	}
 	svc.MainPID = known(pid)
-	processBinding := inspectRunningProcess(ctx, &svc, role, unit, pid, props, records, cfg, inspectorConfig, inspectorInfo, inspectorSHA, exeSHA, exeInfo, unitConfigPath, envFiles)
+	processBinding := inspectRunningProcess(ctx, &svc, role, unit, pid, props, records, envSpecs, cfg, inspectorConfig, inspectorInfo, inspectorSHA, exeSHA, exeInfo, unitConfigPath, envFiles)
 	return svc, weaker(binding, processBinding)
 }
 
@@ -1211,13 +1218,16 @@ type processSample struct {
 // unitIdentity is what must not move across a sample: which process systemd
 // calls the unit's main one, which invocation it is, and the exec-shaping
 // properties whose change would make the unit another unit.
-func unitIdentity(props map[string][]string, records []execRecord) string {
-	parts := make([]string, 0, 6+len(remappingDirectives))
+func unitIdentity(props map[string][]string, records []execRecord, envSpecs []lifeops.EnvironmentFile) string {
+	parts := make([]string, 0, 5+len(envSpecs)+len(remappingDirectives))
 	parts = append(parts,
 		firstProp(props, "MainPID"), firstProp(props, "InvocationID"),
-		strings.Join(props["ExecStart"], "\x00"), strings.Join(props["EnvironmentFiles"], "\x00"),
+		strings.Join(props["ExecStart"], "\x00"),
 		strings.Join(props["Environment"], "\x00"), recordsKey(records),
 	)
+	for _, spec := range envSpecs {
+		parts = append(parts, strconv.Quote(spec.Path)+"="+strconv.FormatBool(spec.IgnoreErrors))
+	}
 	// The remapping directives and the structured records are part of the
 	// shape, so a reload that adds a bind mount or moves an argument boundary
 	// under the sample, leaving the rendered strings alone, must discard it.
@@ -1246,9 +1256,9 @@ func recordsKey(records []execRecord) string {
 // time at the end, and a unit that changed under the sample has a different
 // identity, so evidence about the image is never attributed to a process the
 // other reads saw. Three samples at most, then could-not-tell.
-func sampleProcess(ctx context.Context, unit, role string, pid int, first map[string][]string, records []execRecord, inspectorConfig string) (processSample, error) {
+func sampleProcess(ctx context.Context, unit, role string, pid int, first map[string][]string, records []execRecord, envSpecs []lifeops.EnvironmentFile, inspectorConfig string) (processSample, error) {
 	dir := filepath.Join(procRoot, strconv.Itoa(pid))
-	identity := unitIdentity(first, records)
+	identity := unitIdentity(first, records, envSpecs)
 	for range inspectSamples {
 		before, err := processStartTicks(dir)
 		if err != nil {
@@ -1318,6 +1328,10 @@ func sampleProcess(ctx context.Context, unit, role string, pid int, first map[st
 		if err != nil {
 			return processSample{}, err
 		}
+		againEnv, err := unitEnvironmentFiles(ctx, unit)
+		if err != nil {
+			return processSample{}, err
+		}
 		// A failed re-read of the records is a nil key; equal to the first
 		// read only when that failed too, so a shape that appeared or vanished
 		// under the sample discards it.
@@ -1325,7 +1339,7 @@ func sampleProcess(ctx context.Context, unit, role string, pid int, first map[st
 		if againErr != nil {
 			againRecords = nil
 		}
-		if unitIdentity(again, againRecords) != identity {
+		if unitIdentity(again, againRecords, againEnv) != identity {
 			continue
 		}
 		after, err := processStartTicks(dir)
@@ -1426,10 +1440,10 @@ func viewEvidence(sample processSample, startedAt time.Time, startKnown bool) (m
 // configuration through its own command line and reports its image against
 // the executable's; the second answer is that binding.
 func inspectRunningProcess(ctx context.Context, svc *inspectService, role, unit string, pid int,
-	props map[string][]string, records []execRecord, cfg *config.Config, inspectorConfig string,
+	props map[string][]string, records []execRecord, envSpecs []lifeops.EnvironmentFile, cfg *config.Config, inspectorConfig string,
 	inspectorInfo os.FileInfo, inspectorSHA string, exeSHA string, exeInfo os.FileInfo, unitConfigPath string, envFiles []string,
 ) maybe {
-	sample, err := sampleProcess(ctx, unit, role, pid, props, records, inspectorConfig)
+	sample, err := sampleProcess(ctx, unit, role, pid, props, records, envSpecs, inspectorConfig)
 	if err != nil {
 		fillRunningUnknown(svc, err.Error())
 		svc.DSNEnv = unknown(err.Error())

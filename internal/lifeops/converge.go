@@ -39,6 +39,8 @@ const DefaultStabilityWait = 6 * time.Second
 const (
 	stateRoot   = "/var/lib"
 	runtimeRoot = "/run"
+	configRoot  = "/etc"
+	varTmpRoot  = "/var/tmp"
 )
 
 // Refusal is a reason `up` will not proceed, and what to do about it. Both
@@ -1639,6 +1641,22 @@ type StopResult struct {
 // none at all for the host transaction). The observation that follows is a
 // property read, bounded as every property read is.
 func (c *Converger) StopAndProve(ctx context.Context, unit string) (StopResult, error) {
+	return c.StopAndProveAdmitted(ctx, unit, nil)
+}
+
+// StopAndProveAdmitted observes timer absence/masking before final admission.
+// No manager query separates successful admission from command submission.
+func (c *Converger) StopAndProveAdmitted(ctx context.Context, unit string, admit func() error) (StopResult, error) {
+	if quiet, err := c.quietTimer(ctx, unit); err != nil {
+		return StopResult{}, err
+	} else if quiet != "" {
+		return StopResult{Gone: Yes, How: quiet}, nil
+	}
+	if admit != nil {
+		if err := admit(); err != nil {
+			return StopResult{}, err
+		}
+	}
 	if _, err := c.inspector.exec(ctx, []string{"stop", "--", unit}); err != nil {
 		return StopResult{}, fmt.Errorf("stop %s: %w", unit, err)
 	}
@@ -1779,6 +1797,22 @@ func (c *Converger) CollateralNote() string {
 // boot that nothing established can run — and must equally not disable one an
 // operator had enabled before it arrived.
 func (c *Converger) Disable(ctx context.Context, unit string) error {
+	return c.DisableAdmitted(ctx, unit, nil)
+}
+
+// DisableAdmitted runs final admission after the timer observation, immediately
+// before submitting disable. Other callers retain Disable's existing behavior.
+func (c *Converger) DisableAdmitted(ctx context.Context, unit string, admit func() error) error {
+	if quiet, err := c.quietTimer(ctx, unit); err != nil {
+		return err
+	} else if quiet != "" {
+		return nil
+	}
+	if admit != nil {
+		if err := admit(); err != nil {
+			return err
+		}
+	}
 	ctx, cancel := c.inspector.bounded(ctx)
 	defer cancel()
 
@@ -1893,6 +1927,8 @@ func (s ServiceFacts) PulledUnits() []string {
 	return units
 }
 
+// Retirement uses Inspector.AdmitOperations for a bounded, preventive closure;
+// this ordinary-up diagnostic retains its separate before/after contract.
 // pulledRefusals asks each unit this one would pull in what IT would do to
 // billet's other service.
 //

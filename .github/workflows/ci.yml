@@ -186,7 +186,8 @@ jobs:
     # 50 because this job now compiles and runs cmd/billet under -race as well
     # as internal/state and the capacity suite; the sibling job's note applies
     # here too -- raise it when the suite grows, do not trim tests to fit it.
-    timeout-minutes: 50
+    # 70 since the command step's own bound became 45 (below).
+    timeout-minutes: 70
     services:
       postgres:
         image: postgres:18-alpine
@@ -230,13 +231,78 @@ jobs:
       # UNDER -race, because the SQLite job cannot buy it for the tests it
       # skips: these are the only run those tests get, and a data race in one
       # of them would otherwise be detected nowhere. The cost is this package
-      # compiled and run twice, which is what the split buys back.
+      # compiled and run again in each PostgreSQL command job, which is what
+      # the split buys back.
+      #
+      # EXCEPT THE RETIREMENT ADMISSION TESTS, which test-postgres-retirement
+      # runs beside this job with the same pattern as -run, so each test is in
+      # exactly one of the two.
+      #
+      # 45m: main took 1683.9s of the old 30m bound on d4d4e2e (2026-09-15), and
+      # with the retirement admission run before every step the rest of the
+      # suite timed out at 30m on 4ba24f7 the same day even without those tests.
       - name: Test the command suite against PostgreSQL
-        run: go test -race -count=1 -timeout 30m -vet=off ./cmd/billet/
+        run: go test -race -count=1 -timeout 45m -vet=off -skip '^TestRetirement' ./cmd/billet/
       - name: Test the capacity suite against PostgreSQL
         run: go test -count=1 -timeout 20m ./internal/alloc/
         env:
           BILLET_TEST_LEDGER: postgres
+
+  # A retirement admits its service operations before every step, so its
+  # command tests drive whole retirements to each boundary against PostgreSQL
+  # under -race: on e8af8be (2026-09-15) TestRetirementReprovesEachStoppedBoundary
+  # had finished 17 of its 39 cases in 11m58s when test-postgres's 30m command
+  # bound fired, about half an hour for that test alone by extrapolation. They
+  # run here, beside the rest of the command suite, in two shards: that test on
+  # its own, and every other TestRetirement test. The shards' patterns
+  # partition the TestRetirement names, and test-postgres skips all of them.
+  test-postgres-retirement:
+    runs-on: billet-8vcpu-ubuntu-2404
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: boundaries
+            run: '^TestRetirementReprovesEachStoppedBoundary$'
+            skip: '^$'
+          - shard: operations
+            run: '^TestRetirement'
+            skip: '^TestRetirementReprovesEachStoppedBoundary$'
+    name: test-postgres-retirement (${{ matrix.shard }})
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: billet
+          POSTGRES_PASSWORD: billet
+          POSTGRES_DB: billet
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U billet"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      BILLET_TEST_POSTGRES_DSN: postgres://billet:billet@127.0.0.1:5432/billet?sslmode=disable
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Cache the race+cover Go build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-race-cover-${{ hashFiles('go.sum') }}-${{ github.sha }}-${{ github.job }}-${{ matrix.shard }}
+          restore-keys: |
+            go-race-cover-${{ hashFiles('go.sum') }}-
+      - name: Test the retirement admission suite against PostgreSQL
+        run: go test -race -count=1 -timeout 60m -vet=off -run '${{ matrix.run }}' -skip '${{ matrix.skip }}' ./cmd/billet/
 
   lint:
     runs-on: billet-8vcpu-ubuntu-2404
@@ -583,6 +649,40 @@ jobs:
         if: matrix.group == 'policy'
         run: make hybrid-emission-check
 
+      # Measure unit effects and command readers against disposable systemd 255.
+      # Compile as the runner; run as root from each package's directory.
+      # The command handoff uses a temporary PostgreSQL ledger.
+      - name: Measure retirement operation effects on real systemd
+        if: matrix.group == 'policy'
+        run: |
+          if [ "$(dpkg-query -W -f '${db:Status-Status}' python3-jinja2 2>/dev/null)" != installed ]; then
+            sudo sed -i -e 's,^URIs: http://archive[.]ubuntu[.]com/ubuntu/$,URIs: https://archive.ubuntu.com/ubuntu/ https://mirrors.edge.kernel.org/ubuntu/,' -e 's,^URIs: http://ports[.]ubuntu[.]com/ubuntu-ports/$,URIs: https://ports.ubuntu.com/ubuntu-ports/,' /etc/apt/sources.list.d/ubuntu.sources
+            sudo timeout -v -k 10 300 apt-get -o APT::Update::Error-Mode=any -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
+            sudo timeout -v -k 10 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y --no-install-recommends python3-jinja2
+          fi
+          sudo /usr/bin/python3 -c 'import jinja2'
+          go test -c -o "$RUNNER_TEMP/lifeops.test" ./internal/lifeops
+          go test -c -o "$RUNNER_TEMP/billet-command.test" ./cmd/billet
+          retirement_postgres=$(docker run -d --rm -p 127.0.0.1::5432 -e POSTGRES_USER=billet -e POSTGRES_PASSWORD=billet -e POSTGRES_DB=billet postgres:18-alpine)
+          trap 'docker stop "$retirement_postgres" >/dev/null' EXIT
+          retirement_postgres_ready=false
+          for attempt in {1..60}; do
+            if docker exec "$retirement_postgres" pg_isready -h 127.0.0.1 -U billet -d billet; then
+              retirement_postgres_ready=true
+              break
+            fi
+            sleep 1
+          done
+          if [ "$retirement_postgres_ready" != true ]; then
+            docker logs "$retirement_postgres"
+            exit 1
+          fi
+          retirement_postgres_address=$(docker port "$retirement_postgres" 5432/tcp)
+          cd internal/lifeops
+          sudo env "PATH=/usr/bin:/bin:$PATH" BILLET_TEST_SYSTEMD_OPERATION_EFFECTS=1 "$RUNNER_TEMP/lifeops.test" -test.count=1 -test.v -test.run '^TestRealSystemdRetirementOperationEffects$'
+          cd ../../cmd/billet
+          sudo env "PATH=/usr/bin:/bin:$PATH" BILLET_TEST_SYSTEMD_OPERATION_EFFECTS=1 "BILLET_TEST_POSTGRES_DSN=postgres://billet:billet@$retirement_postgres_address/billet?sslmode=disable" "$RUNNER_TEMP/billet-command.test" -test.count=1 -test.v -test.run '^TestRealSystemd'
+
   # Both legs here need the real Debian package, so they share a job: `dist` is
   # phony and runs again for the second target, but the Go build cache is warm
   # by then and it costs about a minute.
@@ -830,6 +930,7 @@ jobs:
       [
         test,
         test-postgres,
+        test-postgres-retirement,
         lint,
         release-config,
         host-lifecycle,

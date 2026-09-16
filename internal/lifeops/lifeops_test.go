@@ -2,6 +2,7 @@ package lifeops
 
 import (
 	"context"
+	"fmt"
 	"io/fs"
 	"maps"
 	"os"
@@ -46,6 +47,38 @@ func (a *answers) run(ctx context.Context, _ string, args []string) ([]byte, err
 	}
 	if a.fail != nil {
 		return nil, a.fail
+	}
+
+	if args[0] == "get-property" {
+		if len(args) < 5 || args[1] != "org.freedesktop.systemd1" || args[3] != "org.freedesktop.systemd1.Service" {
+			return nil, fmt.Errorf("unsupported typed request: %v", args)
+		}
+		for unit, reply := range a.reply {
+			if operationObjectPath(unit) != args[2] {
+				continue
+			}
+			props := make(map[string]string)
+			for _, line := range strings.Split(reply, "\n") {
+				if key, value, ok := strings.Cut(line, "="); ok {
+					props[key] = value
+				}
+			}
+			var out strings.Builder
+			for _, property := range args[4:] {
+				value, ok := props[property]
+				signature := fixtureOperationSignature(property)
+				if !ok || signature == "" {
+					return nil, fmt.Errorf("missing typed fixture %s %s", unit, property)
+				}
+				if value == "" {
+					fmt.Fprintf(&out, "%s 0\n", signature)
+				} else {
+					fmt.Fprintf(&out, "%s 1 %s\n", signature, value)
+				}
+			}
+			return []byte(out.String()), nil
+		}
+		return nil, fmt.Errorf("missing typed object %s", args[2])
 	}
 
 	// A UNIT THE FIXTURE NEVER STAGED STILL GETS AN ANSWER, because systemd
@@ -93,14 +126,13 @@ func filterProperties(reply string, args []string) string {
 		}
 	}
 
-	if len(asked) == 0 {
-		return reply
-	}
-
 	var kept []string
 	for _, line := range strings.Split(reply, "\n") {
-		key, _, ok := strings.Cut(line, "=")
-		if ok && asked[key] {
+		key, value, ok := strings.Cut(line, "=")
+		if value == "" && fixtureOmitsEmptyArray(key) {
+			continue
+		}
+		if ok && (len(asked) == 0 || asked[key]) {
 			kept = append(kept, line)
 		}
 	}
@@ -138,6 +170,9 @@ func measured(over map[string]string) string {
 		"ExecStart": "{ path=/usr/bin/billet ; argv[]=/usr/bin/billet server --config " +
 			"/etc/billet/billet.yaml ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; " +
 			"pid=0 ; code=(null) ; status=0/0 }",
+	}
+	for _, name := range []string{"ExecStartPre", "ExecStartPost", "ExecCondition", "ExecStopPost", "ExecReload", "BindPaths", "BindReadOnlyPaths", "MountImages"} {
+		fields[name] = ""
 	}
 	maps.Copy(fields, over)
 
@@ -394,8 +429,8 @@ func TestInspectAsksSystemdForTheFactsItReports(t *testing.T) {
 	if _, err := h.inspector(a).Inspect(t.Context(), "/etc/billet/billet.yaml", nil); err != nil {
 		t.Fatalf("Inspect: %v", err)
 	}
-	if len(a.calls) != 2 {
-		t.Fatalf("asked systemd %d times, want one query per unit", len(a.calls))
+	if len(a.calls) != 3 || a.calls[1][0] != "get-property" {
+		t.Fatalf("asked systemd %d times, want two text queries and one typed array query: %v", len(a.calls), a.calls)
 	}
 
 	got := strings.Join(a.calls[0], " ")

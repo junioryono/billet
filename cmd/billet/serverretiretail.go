@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"time"
@@ -133,7 +134,7 @@ func retireTail(ctx context.Context, m retireMode, root *txLock, dir *os.File, j
 	completion := retirement.CompletionOf(j)
 	answer.Completion = &completion
 
-	j, r = retireTailRow(ctx, j, answer)
+	j, r = retireTailRow(ctx, m, j, answer)
 	if r != nil {
 		return nil, r
 	}
@@ -151,7 +152,7 @@ func retireTail(ctx context.Context, m retireMode, root *txLock, dir *os.File, j
 		return nil, r
 	}
 
-	cleared, r := retireClearMarker(root, dir, m.run, j)
+	cleared, r := retireClearMarker(ctx, m, root, dir, j)
 	if r != nil {
 		return nil, r
 	}
@@ -164,7 +165,7 @@ func retireTail(ctx context.Context, m retireMode, root *txLock, dir *os.File, j
 		return nil, r
 	}
 
-	if r := retireMarkSettled(&j); r != nil {
+	if r := retireMarkSettled(ctx, m, &j); r != nil {
 		return nil, r
 	}
 
@@ -196,8 +197,15 @@ func retireTailReceipt(ctx context.Context, m retireMode, j retirement.Journal) 
 		return retireReceiptNone, nil
 	}
 
+	noteRetireMutation("wait", "receipt registration")
 	answer, r := refreshReceipt(ctx, receiptMode{configPath: m.configPath, run: m.run, refresh: true,
-		wait: retireReceiptWait})
+		wait: retireReceiptWait, beforeMutation: func() *endpointRefusal {
+			if r := admitRetireDoneProtection(ctx, m, j); r != nil {
+				return endpointUnknown(retireReasonEffects, r.Why, r.Next, "")
+			}
+			noteRetireMutation("receipt", receiptPath)
+			return nil
+		}})
 	if r != nil {
 		return "", retireFromEndpointFor(retireReasonReceipt, r)
 	}
@@ -227,7 +235,7 @@ func retireTailReceipt(ctx context.Context, m retireMode, j retirement.Journal) 
 // this host and the ledger has not heard yet — and everything else is a
 // refusal, because a ledger that disagrees with this journal is not a thing to
 // wait out.
-func retireTailRow(ctx context.Context, j retirement.Journal, answer *retireTailAnswer,
+func retireTailRow(ctx context.Context, m retireMode, j retirement.Journal, answer *retireTailAnswer,
 ) (retirement.Journal, *retireRefusal) {
 	if j.RowDone {
 		answer.Row = retireRowAlready
@@ -239,7 +247,18 @@ func retireTailRow(ctx context.Context, j retirement.Journal, answer *retireTail
 	bounded, cancel := context.WithTimeout(ctx, retireLedgerBound)
 	defer cancel()
 
-	db, problem := retireOpenLedgerByLocator(bounded, j)
+	db, problem := retireOpenByLocator(bounded, j, func(openCtx context.Context, dir, dsn string) (*state.DB, error) {
+		if err := openCtx.Err(); err != nil {
+			return nil, err
+		}
+		if r := admitRetireHistoricalProtection(ctx, m, j); r != nil {
+			return nil, &retireStepError{refusal: r}
+		}
+		noteRetireMutation("completion-preparation", dir)
+		db, err := state.OpenPostgresCompletion(openCtx, dir, dsn, state.WithRunningRelease(version.Version()), state.WithExistingLocalState())
+		noteRetireMutation("wait", "completion ledger open")
+		return db, err
+	})
 
 	switch {
 	case problem.refusal != nil:
@@ -255,6 +274,10 @@ func retireTailRow(ctx context.Context, j retirement.Journal, answer *retireTail
 
 	defer func() { _ = db.Close() }()
 
+	if r := admitRetireHistoricalProtection(ctx, m, j); r != nil {
+		return j, r
+	}
+	noteRetireMutation("row-completion", "")
 	row, outcome, err := db.CompleteRetirement(bounded, state.RetirementCompletion{
 		Deployment: j.Deployment, Retiring: j.Retiring, Survivor: j.Survivor.Host,
 		TransitionID: j.Provenance.TransitionID, ReservedAt: j.Provenance.Reservation,
@@ -282,12 +305,16 @@ func retireTailRow(ctx context.Context, j retirement.Journal, answer *retireTail
 	j.RowDone = true
 	j.CompletedBy = row.CompletedBy
 
+	if r := admitRetireHistoricalProtection(ctx, m, j); r != nil {
+		return j, r
+	}
+	noteRetireMutation("acknowledgement", retirement.JournalPath())
 	if err := j.Write(retireNow()); err != nil {
 		// THE ROW IS WRITTEN AND THE JOURNAL DOES NOT SAY SO. The next
 		// converge's tail reaches the same call, which answers `already` from
 		// the row itself, so nothing is lost; what must not happen is the
 		// marker being cleared over a journal that has not recorded it.
-		return j, retireUnknown(retireReasonJournal, "record the completed row in the journal: "+err.Error(), "")
+		return j, retirePersistenceError(retireReasonJournal, "record the completed row in the journal: ", err)
 	}
 
 	// THE LEDGER'S WORD IS TRANSLATED, not passed through: this answer's
@@ -308,19 +335,13 @@ func retireTailRow(ctx context.Context, j retirement.Journal, answer *retireTail
 	return j, nil
 }
 
-// retireOpenLedgerByLocator opens the ledger the way a host past the archive
+// retireOpenByLocator opens the ledger the way a host past the archive
 // must: from the journal's locator, because the installed configuration has no
 // `server:` any more and the identity is at the archive.
 //
 // IT ANSWERS THREE WAYS. A handle; nil with a reason, which is a PENDING row
 // and not a failure of this converge; or a refusal, which is everything this
 // command cannot classify.
-func retireOpenLedgerByLocator(ctx context.Context, j retirement.Journal) (*state.DB, ledgerProblem) {
-	return retireOpenByLocator(ctx, j, func(ctx context.Context, dir, dsn string) (*state.DB, error) {
-		return state.OpenPostgresCompletion(ctx, dir, dsn, state.WithRunningRelease(version.Version()))
-	})
-}
-
 func retireOpenByLocator(ctx context.Context, j retirement.Journal,
 	open func(ctx context.Context, dir, dsn string) (*state.DB, error),
 ) (*state.DB, ledgerProblem) {
@@ -347,6 +368,10 @@ func retireOpenByLocator(ctx context.Context, j retirement.Journal,
 	// directory lock, the classifier takes nothing at all.
 	db, err := open(ctx, j.Locator.Archive, dsn)
 	if err != nil {
+		var step *retireStepError
+		if errors.As(err, &step) {
+			return nil, ledgerProblem{refusal: step.refusal}
+		}
 		return nil, ledgerProblem{cause: err}
 	}
 
@@ -524,13 +549,13 @@ func retireDeadlinePending(outer, bounded context.Context, err error) string {
 // rewrites the whole record, so the copy taken at the start is behind by at
 // least one of this run's own writes. Reading it again is also what re-checks
 // that the guard is still this converge's before anything is written to it.
-func retireClearMarker(root *txLock, dir *os.File, run string, j retirement.Journal) (string, *retireRefusal) {
+func retireClearMarker(ctx context.Context, m retireMode, root *txLock, dir *os.File, j retirement.Journal) (string, *retireRefusal) {
 	shape, err := classifyGuardDirFrom(dir)
 	if err != nil {
 		return "", retireUnknown(retireReasonGuard, "read the guard's record before clearing the marker: "+err.Error(), "")
 	}
 
-	if r := judgeGuardShape(shape, run); r != nil {
+	if r := judgeGuardShape(shape, m.run); r != nil {
 		return "", r
 	}
 
@@ -547,14 +572,29 @@ func retireClearMarker(root *txLock, dir *os.File, run string, j retirement.Jour
 	record := shape.Guard
 	record.Transition = nil
 
+	if r := admitRetireDoneProtection(ctx, m, j); r != nil {
+		return "", r
+	}
+	if r := proveRetireDoneRegistration(ctx, endpointInspector(), m.configPath, j); r != nil {
+		return "", r
+	}
+	noteRetireMutation("marker", "")
 	if err := writeGuardRecordAt(dir, record, true); err != nil {
 		return "", retireUnknown(retireReasonMarker, "clear the retirement's marker from the guard: "+err.Error(), "")
 	}
 
+	if r := admitRetireDoneProtection(ctx, m, j); r != nil {
+		return "", r
+	}
+	noteRetireMutation("directory-flush", "")
 	if err := syncDirFD(dir); err != nil {
 		return "", retireUnknown(retireReasonMarker, "flush the guard directory: "+err.Error(), "")
 	}
 
+	if r := admitRetireDoneProtection(ctx, m, j); r != nil {
+		return "", r
+	}
+	noteRetireMutation("directory-flush", "")
 	if err := syncDirFD(root.dir); err != nil {
 		return "", retireUnknown(retireReasonMarker, "flush the upgrade root: "+err.Error(), "")
 	}
@@ -567,11 +607,18 @@ func retireClearMarker(root *txLock, dir *os.File, run string, j retirement.Jour
 // marker, which is the state the takeover rule reads as an unfinished tail.
 // The reverse order would leave a settled journal beside a marker nothing
 // clears.
-func retireMarkSettled(j *retirement.Journal) *retireRefusal {
+func retireMarkSettled(ctx context.Context, m retireMode, j *retirement.Journal) *retireRefusal {
+	if r := admitRetireDoneProtection(ctx, m, *j); r != nil {
+		return r
+	}
+	if r := proveRetireDoneRegistration(ctx, endpointInspector(), m.configPath, *j); r != nil {
+		return r
+	}
 	j.Settled = true
 
+	noteRetireMutation("settlement", retirement.JournalPath())
 	if err := j.Write(retireNow()); err != nil {
-		return retireUnknown(retireReasonJournal, "record the retirement as settled: "+err.Error(), "")
+		return retirePersistenceError(retireReasonJournal, "record the retirement as settled: ", err)
 	}
 
 	return nil

@@ -42,6 +42,9 @@ type receiptMode struct {
 	evidence, confirmation, configPath, desired, run string
 	refresh, dryRun                                  bool
 	wait                                             time.Duration
+	// beforeMutation is the enclosing command's current effects admission.
+	// Ordinary receipt callers leave it nil.
+	beforeMutation func() *endpointRefusal
 }
 
 // receiptAnswer is the successful answer of both modes.
@@ -409,7 +412,7 @@ func refreshReceipt(ctx context.Context, m receiptMode) (any, *endpointRefusal) 
 			Why: "a dry run writes no receipt; this is what a converge would write"}, nil
 	}
 
-	return publishReceipt(ctx, insp, installed, br, rec, true)
+	return publishReceipt(ctx, insp, installed, br, rec, true, m.beforeMutation)
 }
 
 // closeProcess re-observes the node immediately before a receipt is written
@@ -440,8 +443,18 @@ func closeProcess(ctx context.Context, insp *lifeops.Inspector, read unitObserva
 // the write or the shortcut, then the durable write and the two closing
 // flushes.
 func publishReceipt(ctx context.Context, insp *lifeops.Inspector, installed *installedConfigObservation,
-	br bracketedRecord, rec endpointReceipt, allowCurrent bool,
+	br bracketedRecord, rec endpointReceipt, allowCurrent bool, admissions ...func() *endpointRefusal,
 ) (any, *endpointRefusal) {
+	admit := func() *endpointRefusal {
+		for _, admission := range admissions {
+			if admission != nil {
+				if r := admission(); r != nil {
+					return r
+				}
+			}
+		}
+		return nil
+	}
 	dir := filepath.Dir(receiptPath)
 	parent := filepath.Dir(dir)
 
@@ -460,10 +473,16 @@ func publishReceipt(ctx context.Context, insp *lifeops.Inspector, installed *ins
 	dirInfo, err := receiptLstat(dir)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
+		if r := admit(); r != nil {
+			return nil, r
+		}
 		if err := receiptMkdir(dir, 0o700); err != nil {
 			return nil, endpointUnknown(endpointReasonTrust, fmt.Sprintf("create the receipt directory %s: %v", dir, err), "", "")
 		}
 
+		if r := admit(); r != nil {
+			return nil, r
+		}
 		if err := receiptSyncDir(parent); err != nil {
 			return nil, endpointUnknown(endpointReasonTrust, fmt.Sprintf("flush %s after creating the receipt directory: %v",
 				parent, err), "converge again; the flush is retried", "")
@@ -592,6 +611,9 @@ func publishReceipt(ctx context.Context, insp *lifeops.Inspector, installed *ins
 		}
 
 		for _, d := range []string{dir, parent} {
+			if r := admit(); r != nil {
+				return nil, r
+			}
 			if err := receiptSyncDir(d); err != nil {
 				return nil, endpointUnknown(endpointReasonTrust, fmt.Sprintf("flush %s: %v", d, err), "converge again; the flush is retried", "")
 			}
@@ -646,6 +668,9 @@ func publishReceipt(ctx context.Context, insp *lifeops.Inspector, installed *ins
 
 	body = append(body, '\n')
 
+	if r := admit(); r != nil {
+		return nil, r
+	}
 	if _, err := receiptInstaller().Install(dir, filepath.Base(receiptPath), 0o600, func(w io.Writer) error {
 		_, err := w.Write(body)
 
@@ -654,6 +679,9 @@ func publishReceipt(ctx context.Context, insp *lifeops.Inspector, installed *ins
 		return nil, endpointUnknown(endpointReasonTrust, "write the receipt: "+err.Error(), "converge again", "")
 	}
 
+	if r := admit(); r != nil {
+		return nil, r
+	}
 	if err := receiptSyncDir(parent); err != nil {
 		return nil, endpointUnknown(endpointReasonTrust, fmt.Sprintf("flush %s after writing the receipt: %v", parent, err),
 			"converge again; the flush is retried", "")

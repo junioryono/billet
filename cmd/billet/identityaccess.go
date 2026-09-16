@@ -349,30 +349,6 @@ func (a *identityAccess) handBack() error {
 	return errors.Join(handBackIdentity(a.dir, acct, identityArtefacts), handBackIdentity(a.dir, acct, ledgerArtefacts))
 }
 
-// openRetiringIdentityAccess is the transition's take on the exclusion: the
-// global lock acquired without admission (the closed status is its own), then
-// the inner lock inside the directory, so a legacy writer that took only the
-// inner lock is excluded too. Everything else is the ordinary access's,
-// release and hand-back included.
-func openRetiringIdentityAccess(ctx context.Context, dir string, wait time.Duration) (*identityAccess, error) {
-	if dir == "" {
-		return nil, errors.New("billet: an identity directory is needed and the configuration names none")
-	}
-
-	ex, err := wirecert.ResolveRetiringExclusion(ctx, dir, wait)
-	if err != nil {
-		return nil, err
-	}
-
-	acc := &identityAccess{dir: dir, exclusion: ex, account: ex.Account}
-
-	if err := acc.lockInner(ctx, ex); err != nil {
-		return nil, errors.Join(err, acc.exclusion.Release())
-	}
-
-	return acc.registered(), nil
-}
-
 // serverIdentityAccess is the control plane's own take on the exclusion, with
 // the one exemption the protocol keeps: an UNPRIVILEGED server on a host no
 // installer has prepared (no record, positively no global lock) starts as it

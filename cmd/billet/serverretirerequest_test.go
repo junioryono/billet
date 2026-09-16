@@ -23,6 +23,7 @@ import (
 // not installed, a mountinfo the rename's proof reads, and the addresses the
 // address rule compares against.
 type requestFixture struct {
+	originalNode *retirement.RetainedInvocation
 	*retireFixture
 	unitsDir string
 	caPEM    string
@@ -83,49 +84,7 @@ func newRequestFixture(t *testing.T) *requestFixture {
 	mustOK(t, err)
 	mustOK(t, db.Close())
 
-	// A fake systemd: the backup service is not installed, which is a
-	// positive answer and not an unread one.
-	f.unitsDir = filepath.Join(t.TempDir(), "units")
-	mustOK(t, os.MkdirAll(f.unitsDir, 0o755))
-	retiredUnits(t, f)
-	writeFile(t, filepath.Join(f.unitsDir, backupServiceUnit),
-		"LoadState=not-found\nActiveState=inactive\nSubState=dead\nResult=success\nKillMode=control-group\nMainPID=0\n"+
-			"InvocationID=\nStateChangeTimestamp=\n", 0o644)
-
-	bin := filepath.Join(t.TempDir(), "systemctl")
-	// THE ANSWER IS READ ONCE AND RECORDED WITH WHAT IT SAID: a test that must
-	// know the transition saw a particular state needs the fake's own account
-	// of what it answered, and one that reads the unit file twice could answer
-	// from one revision and record another.
-	writeFile(t, bin, "#!/bin/sh\nunit=\"\"\nnames=\"\"\nfor a in \"$@\"; do case \"$a\" in --property=*) "+
-		"names=\"$names ${a#--property=}\";; --|show) ;; *) unit=$a;; esac; done\n"+
-		"out=$(for n in $names; do grep \"^$n=\" \"$BILLET_FAKE_UNITS/$unit\" || true; done)\n"+
-		"printf '%s\\n' \"$out\"\n"+
-		"state=$(printf '%s\\n' \"$out\" | grep '^ActiveState=' || true)\n"+
-		"echo \"$unit $state\" >> \"$BILLET_FAKE_UNITS/.asked\"\nexit 0\n", 0o755)
-	t.Setenv("BILLET_FAKE_UNITS", f.unitsDir)
-
-	savedSystemctl := systemctlBinary
-	systemctlBinary = bin
-
-	t.Cleanup(func() { systemctlBinary = savedSystemctl })
-
-	// A FAKE SERVICE MANAGER and a lock this test may take: the transition
-	// after intent stops units and holds the lifecycle lock, and neither
-	// belongs to the machine running the suite.
-	f.svc = &fakeConverger{}
-	f.manager = &retireServiceManager{fakeConverger: f.svc, t: t, unitsDir: f.unitsDir}
-
-	savedConverge := converge
-	converge = func(...lifeops.ConvergeOption) converger { return f.manager }
-
-	savedLockDir := hostLockDir
-	hostLockDir = t.TempDir()
-
-	t.Cleanup(func() {
-		converge = savedConverge
-		hostLockDir = savedLockDir
-	})
+	installRetireHostManager(t, f)
 
 	// ONE MOUNT holds everything, so the rename is one rename on one mount.
 	mountinfo := filepath.Join(t.TempDir(), "mountinfo")
@@ -698,7 +657,7 @@ func TestServerRetireRequestProvesTheRenameAndTheBackup(t *testing.T) {
 	// A backup that is still running.
 	writeFile(t, filepath.Join(f.unitsDir, backupServiceUnit),
 		"LoadState=loaded\nActiveState=active\nSubState=running\nResult=success\nKillMode=control-group\nMainPID=4242\n"+
-			"InvocationID=\nStateChangeTimestamp=\n", 0o644)
+			"UnitFileState=static\nInvocationID=\nStateChangeTimestamp=\n", 0o644)
 
 	out, code = f.request(t, f.input(t, nil))
 	if m := retireAnswer(t, out); m["reason"] != retireReasonBackup || code != exitRefused {
@@ -834,9 +793,9 @@ const (
 	retainedIncarnation = "00112233445566778899aabbccddeeff"
 	survivorAddress     = "10.0.0.2"
 
-	// The invocation the node runs under BEFORE the retirement, which every
-	// report and the receipt of the time name, and the one systemd mints for
-	// the restart the transition performs.
+	// The original invocation shared by reports and the pre-retirement receipt,
+	// and another invocation used by explicit unit/record fixtures. The fake
+	// manager generates its own fresh invocation on each start.
 	retainedInvocation        = "0123456789abcdef0123456789abcdef"
 	retainedRestartInvocation = "fedcba9876543210fedcba9876543210"
 )
@@ -886,12 +845,24 @@ func (f *requestFixture) retainANode(t *testing.T) {
 			"UnitFileState=enabled\nInvocationID="+retainedInvocation+"\nStateChangeTimestamp=\n"+
 			"ExecMainStartTimestamp="+retainedNodeStarted+"\n", 0o644)
 
+	installRetireNodeExecution(t, f)
+
 	// THE INSTALLED CONFIGURATION IS OLDER THAN THE RUNNING NODE, which is what
 	// an ordinary converge leaves behind and what the phases before the rewrite
 	// require; the rewrite is what makes it newer.
 	started, err := time.Parse(time.RFC3339, "2026-09-11T09:00:00Z")
 	mustOK(t, err)
 	mustOK(t, os.Chtimes(f.cfg, started.Add(-time.Hour), started.Add(-time.Hour)))
+
+	writeRegistrationRecord(t, useRegistrationRecord(t), f.identity, retainedEndpoint, retainedInvocation)
+	installed, refusal := observeRetireConfig(f.cfg)
+	if refusal != nil {
+		t.Fatalf("fixture installed configuration: %+v", refusal)
+	}
+	f.originalNode, refusal = captureRetireInvocation(t.Context(), installed.cfg, f.cfg)
+	if refusal != nil {
+		t.Fatalf("fixture original node: %+v", refusal)
+	}
 
 	f.pgLedger(t, func(db *state.DB) {
 		registerStatusNode(t, db, "node-a", "v0.10.0", strings.Repeat("a", 64), retainedIncarnation)
@@ -1001,4 +972,43 @@ func mustRead(t *testing.T, path string) string {
 	mustOK(t, err)
 
 	return string(body)
+}
+
+// Row-only commands judge host effects too, using the same observational fake.
+func installRetireHostManager(t *testing.T, f *requestFixture) {
+	t.Helper()
+	// A fake systemd: the backup service is not installed, which is a
+	// positive answer and not an unread one.
+	f.unitsDir = filepath.Join(t.TempDir(), "units")
+	mustOK(t, os.MkdirAll(f.unitsDir, 0o755))
+	retiredUnits(t, f)
+	writeFile(t, filepath.Join(f.unitsDir, backupServiceUnit),
+		"LoadState=not-found\nActiveState=inactive\nSubState=dead\nResult=success\nKillMode=control-group\nMainPID=0\n"+
+			"InvocationID=\nStateChangeTimestamp=\n", 0o644)
+
+	t.Setenv("BILLET_FAKE_UNITS", f.unitsDir)
+
+	savedSystemctl, savedRunner := systemctlBinary, managerCommandRunner
+	systemctlBinary, managerCommandRunner = filepath.Join(f.unitsDir, "systemctl"), retireManagerProcess
+
+	t.Cleanup(func() { systemctlBinary, managerCommandRunner = savedSystemctl, savedRunner })
+
+	installRetireOperationEvidence(t, f)
+
+	// A FAKE SERVICE MANAGER and a lock this test may take: the transition
+	// after intent stops units and holds the lifecycle lock, and neither
+	// belongs to the machine running the suite.
+	f.svc = &fakeConverger{}
+	f.manager = &retireServiceManager{fakeConverger: f.svc, t: t, unitsDir: f.unitsDir}
+
+	savedConverge := converge
+	converge = func(...lifeops.ConvergeOption) converger { return f.manager }
+
+	savedLockDir := hostLockDir
+	hostLockDir = t.TempDir()
+
+	t.Cleanup(func() {
+		converge = savedConverge
+		hostLockDir = savedLockDir
+	})
 }

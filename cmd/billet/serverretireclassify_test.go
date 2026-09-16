@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -1194,6 +1195,18 @@ func TestTheDryRunRoutesTheWholeRowAndJournalPartition(t *testing.T) {
 // with it. Installed node custody selects the unsupported request variant.
 func TestTheDryRunQualifiesRequestsFromTheInstalledPair(t *testing.T) {
 	f := newRequestFixture(t)
+	run := func(args ...string) (string, int) {
+		t.Helper()
+		// Reservation and retained-node setup observe systemd; classification cannot.
+		saved := managerCommandRunner
+		managerCommandRunner = func(_ context.Context, bin string, args []string, _, _ io.Writer) error {
+			t.Fatalf("the classifier asked the service manager: %s %v", bin, args)
+			return nil
+		}
+		defer func() { managerCommandRunner = saved }()
+
+		return f.run(t, "", args...)
+	}
 
 	for _, reserved := range []bool{false, true} {
 		if reserved {
@@ -1209,7 +1222,7 @@ func TestTheDryRunQualifiesRequestsFromTheInstalledPair(t *testing.T) {
 				args = append(args, "--requested")
 				want, why = "new-request", "eligible"
 			}
-			out, code := f.run(t, "", args...)
+			out, code := run(args...)
 			m := assertRetireRoute(t, out, code, want, why)
 			if m["identity"] != "minted" || m["authority"] != "present" || m["installed_roles"] != "server" {
 				t.Fatalf("the installed pair was not observed: %s", out)
@@ -1220,9 +1233,6 @@ func TestTheDryRunQualifiesRequestsFromTheInstalledPair(t *testing.T) {
 	if len(f.svc.trace) != 0 {
 		t.Fatalf("the classifier changed a service: %v", f.svc.trace)
 	}
-	if _, err := os.Lstat(filepath.Join(f.unitsDir, ".asked")); !os.IsNotExist(err) {
-		t.Fatalf("the classifier asked systemd for a service observation: %v", err)
-	}
 
 	f.retainANode(t)
 	for _, requested := range []bool{false, true} {
@@ -1232,7 +1242,7 @@ func TestTheDryRunQualifiesRequestsFromTheInstalledPair(t *testing.T) {
 			args = append(args, "--requested")
 			want, why = "unsupported-variant", "keeps a node"
 		}
-		out, code := f.run(t, "", args...)
+		out, code := run(args...)
 		m := assertRetireRoute(t, out, code, want, why)
 		if m["installed_roles"] != "both" {
 			t.Fatalf("the installed node was hidden: %s", out)
@@ -1242,7 +1252,7 @@ func TestTheDryRunQualifiesRequestsFromTheInstalledPair(t *testing.T) {
 	f.plantJournal(t, retirement.PhaseIntent, retirement.VariantRetainedNode)
 	for _, extra := range [][]string{nil, {"--requested"}} {
 		args := append([]string{"--dry-run", "--retiring-host", requestRetiring}, extra...)
-		out, code := f.run(t, "", args...)
+		out, code := run(args...)
 		assertRetireRoute(t, out, code, "unsupported-variant", "retained-node")
 	}
 }

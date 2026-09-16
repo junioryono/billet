@@ -365,7 +365,9 @@ func TestTheTailRewritesTheRetainedNodesReceipt(t *testing.T) {
 
 	// THE INVOCATION THE RESTART PRODUCED, which is not the one the receipt
 	// carried and not the one every report names.
-	if receipt.InvocationID != retainedRestartInvocation {
+	props, err := endpointInspector().UnitProperties(t.Context(), nodeUnit, "InvocationID")
+	mustOK(t, err)
+	if receipt.InvocationID != firstProp(props, "InvocationID") || receipt.InvocationID == before.InvocationID {
 		t.Fatalf("the receipt names another invocation: %+v", receipt)
 	}
 

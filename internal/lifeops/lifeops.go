@@ -285,7 +285,14 @@ type Report struct {
 // thing is testable without root, without systemd and without a real account
 // database — none of which a unit test can supply.
 type Inspector struct {
-	run runner
+	operationPass       *operationPass
+	run                 runner
+	operationUnitDirs   []string
+	operationBusctl     string
+	operationCgroupRoot string
+	operationBootIDPath string
+	operationTempRoots  []string
+	retainedInputRoots  []string
 	// waitDelay is the grace execRunner gives a cancelled run; see
 	// WithWaitDelay.
 	waitDelay time.Duration
@@ -353,15 +360,19 @@ func WithObserver(fn func(ctx context.Context, args []string)) Option {
 	}
 }
 
-// withRunner replaces process execution. Unexported because its parameter is:
-// an exported option nothing outside this package can construct is a worse API
-// than one that is honestly package-private.
-func withRunner(r runner) Option {
+// WithCommandRunner replaces systemctl and busctl execution. The runner must
+// honor ctx, return stdout separately, and include stderr in any failure. Nil
+// keeps the production runner and its cancellation and output bounds.
+func WithCommandRunner(r func(context.Context, string, []string) ([]byte, error)) Option {
 	return func(i *Inspector) {
 		if r != nil {
 			i.run = r
 		}
 	}
+}
+
+func withRunner(r runner) Option {
+	return WithCommandRunner(r)
 }
 
 // withExecutables replaces the identity seams.
@@ -498,6 +509,14 @@ func (i *Inspector) service(ctx context.Context, unit, packaged string,
 		"MainPID", "NRestarts", "NeedDaemonReload", "ExecStart")
 	if err != nil {
 		return ServiceFacts{Name: unit}, fmt.Errorf("ask systemd about %s: %w", unit, err)
+	}
+
+	if first(props, "LoadState") == "loaded" {
+		if err := i.ProveServiceArrayEmptiness(ctx, unit, props,
+			"ExecStartPre", "ExecStartPost", "ExecCondition", "ExecStopPost", "ExecReload",
+			"BindPaths", "BindReadOnlyPaths", "MountImages"); err != nil {
+			return ServiceFacts{Name: unit}, err
+		}
 	}
 
 	facts := ServiceFacts{

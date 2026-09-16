@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -109,8 +110,17 @@ func newInspectFixture(t *testing.T) *inspectFixture {
 	// asking for stops arriving, so a refusal that depends on it fails its test.
 	writeFile(t, systemctlBinary, "#!/bin/sh\nunit=\"\"\nnames=\"\"\nfor a in \"$@\"; do case \"$a\" in --property=*) names=\"$names ${a#--property=}\";; --|show) ;; *) unit=$a;; esac; done\n"+
 		"for n in $names; do grep \"^$n=\" \"$BILLET_FAKE_UNITS/$unit\"; done\nexit 0\n", 0o755)
-	// busctl --json=short get-property org.freedesktop.systemd1 <object> <iface> ExecStart
-	writeFile(t, busctlBinary, "#!/bin/sh\ncat \"$BILLET_FAKE_UNITS/$(basename \"$4\").exec\"\n", 0o755)
+	writeFile(t, busctlBinary, `#!/bin/sh
+if [ "$#" -ne 6 ] || [ "$1" != --json=short ] || [ "$2" != get-property ] || [ "$3" != org.freedesktop.systemd1 ] || [ "$5" != org.freedesktop.systemd1.Service ]; then
+  exit 2
+fi
+case "$6" in
+  ExecStart) suffix=exec ;;
+  EnvironmentFiles) suffix=environment ;;
+  *) exit 2 ;;
+esac
+cat "$BILLET_FAKE_UNITS/$(basename "$4").$suffix"
+`, 0o755)
 	t.Setenv("BILLET_FAKE_UNITS", f.unitsDir)
 
 	f.writeConfig(t, f.serverConfig())
@@ -244,14 +254,14 @@ func (f *inspectFixture) scheduledUnit(t *testing.T, unit, load, fileState, acti
 	t.Helper()
 	writeFile(t, filepath.Join(f.unitsDir, unit), "LoadState="+load+"\nUnitFileState="+fileState+"\nActiveState="+active+
 		"\nSubState="+sub+"\nMainPID="+strconv.Itoa(pid)+"\nInvocationID=\nNeedDaemonReload=no\nExecMainStartTimestamp=\n"+
-		"EnvironmentFiles=\nEnvironment=\n", 0o644)
+		"Environment=\n", 0o644)
 }
 
 // unitAbsentWith is a unit whose fragment systemd no longer finds, with the
 // runtime facts it still reports.
 func (f *inspectFixture) unitAbsentWith(t *testing.T, unit, active, sub string, pid int) {
 	t.Helper()
-	writeFile(t, filepath.Join(f.unitsDir, unit), "LoadState=not-found\nUnitFileState=\nActiveState="+active+"\nSubState="+sub+"\nMainPID="+strconv.Itoa(pid)+"\nInvocationID=\nNeedDaemonReload=no\nExecMainStartTimestamp=\nEnvironmentFiles=\nEnvironment=\n", 0o644)
+	writeFile(t, filepath.Join(f.unitsDir, unit), "LoadState=not-found\nUnitFileState=\nActiveState="+active+"\nSubState="+sub+"\nMainPID="+strconv.Itoa(pid)+"\nInvocationID=\nNeedDaemonReload=no\nExecMainStartTimestamp=\nEnvironment=\n", 0o644)
 }
 
 // unitRunning renders the properties systemd reports for a unit with the
@@ -273,15 +283,22 @@ func (f *inspectFixture) unitWith(t *testing.T, unit, argv string, envFiles []st
 		"InvocationID=0123456789abcdef0123456789abcdef\nNeedDaemonReload=no\nExecMainStartTimestamp=Tue 2023-11-14 22:14:00 UTC\n" +
 		"RootDirectory=\nRootImage=\nBindPaths=\nBindReadOnlyPaths=\nMountImages=\nExtensionImages=\nExtensionDirectories=\nTemporaryFileSystem=\n" +
 		"ExecStart={ path=" + words[0] + " ; argv[]=" + argv + " ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }\n"
-	if len(envFiles) == 0 {
-		body += "EnvironmentFiles=\n"
-	}
+	envRows := make([]any, 0, len(envFiles))
 	for _, e := range envFiles {
 		body += "EnvironmentFiles=" + e + " (ignore_errors=yes)\n"
+		envRows = append(envRows, []any{e, true})
 	}
 	body += "Environment=" + environment + "\n"
 	writeFile(t, filepath.Join(f.unitsDir, unit), body, 0o644)
 	f.unitExec(t, unit, [][]string{words})
+	f.unitEnvironment(t, unit, envRows)
+}
+
+func (f *inspectFixture) unitEnvironment(t *testing.T, unit string, rows []any) {
+	t.Helper()
+	body, err := json.Marshal(map[string]any{"type": "a(sb)", "data": rows})
+	mustOK(t, err)
+	writeFile(t, filepath.Join(f.unitsDir, busLabel(unit)+".environment"), string(body), 0o644)
 }
 
 // unitExec sets the loaded ExecStart records busctl answers for a unit: each
@@ -839,9 +856,8 @@ func TestReleaseInspectRefusesUnsupportedEnvironmentFileSyntax(t *testing.T) {
 	mustUnknown(t, "matches_file", d.MatchesFile, "unsupported environment file syntax")
 }
 
-// EVERY EnvironmentFiles PROPERTY LINE IS READ: systemd prints one per file,
-// so a reader of the first line alone would compare the DSN against a file
-// another file overrides.
+// Reading only the first loaded environment file could compare the DSN
+// against a file another entry overrides.
 func TestReleaseInspectReadsEveryEnvironmentFileLine(t *testing.T) {
 	f := newInspectFixture(t)
 	f.unitRunning(t, "billet-server.service", "server", f.configPath, []string{"/etc/billet/a.env", "/etc/billet/b.env"})
@@ -851,6 +867,129 @@ func TestReleaseInspectReadsEveryEnvironmentFileLine(t *testing.T) {
 	}
 	if files, ok := mustKnown(t, "environment_files", svc.EnvironmentFiles).([]string); !ok || len(files) != 2 {
 		t.Errorf("environment_files = %v, want both", svc.EnvironmentFiles.value)
+	}
+}
+
+// Missing text is a stock shape; missing typed evidence cannot authorize it.
+func TestReleaseInspectRequiresTypedEnvironmentFiles(t *testing.T) {
+	for _, role := range []string{"server", "node"} {
+		for _, c := range []struct {
+			name, reply, reason string
+		}{
+			{"empty", `{"type":"a(sb)","data":[]}`, ""},
+			{"missing reply", "", "operation-array-unknown"},
+			{"missing data", `{"type":"a(sb)"}`, "operation-array-unknown"},
+			{"null", `{"type":"a(sb)","data":null}`, "operation-array-unknown"},
+			{"wrong signature", `{"type":"as","data":[]}`, "operation-array-unknown"},
+			{"invalid flag", `{"type":"a(sb)","data":[["/etc/billet/server.env",null]]}`, "operation-array-unknown"},
+			{"unreadable", "", "operation-array-unreadable"},
+		} {
+			t.Run(role+"/"+c.name, func(t *testing.T) {
+				f := newInspectFixture(t)
+				unit := "billet-" + role + ".service"
+				f.unitRunning(t, unit, role, f.configPath, nil)
+				if role == "node" {
+					f.unitAbsent(t, "billet-server.service")
+					f.writeConfig(t, f.nodeOnlyConfig())
+					f.process(t, []string{f.binPath, role, "--config", f.configPath}, nil)
+				}
+				out, err := exec.CommandContext(t.Context(), systemctlBinary, "show", "--property=EnvironmentFiles", "--", unit).Output()
+				mustOK(t, err)
+				if len(out) != 0 {
+					t.Fatalf("fake invented empty EnvironmentFiles text: %q", out)
+				}
+				path := filepath.Join(f.unitsDir, busLabel(unit)+".environment")
+				if c.name == "unreadable" {
+					mustOK(t, os.Remove(path))
+				} else {
+					writeFile(t, path, c.reply, 0o644)
+				}
+				r := f.report(t)
+				svc := r.Services[role]
+				if c.reason == "" {
+					files, ok := mustKnown(t, "environment_files", svc.EnvironmentFiles).([]string)
+					if !ok || len(files) != 0 || mustKnown(t, "shape", svc.Shape) != "supported" || mustKnown(t, "config_binding", r.ConfigBinding) != true {
+						t.Fatalf("stock %s was refused: %+v", role, svc)
+					}
+					return
+				}
+				mustUnknown(t, "environment_files", svc.EnvironmentFiles, c.reason)
+				mustUnknown(t, "config_binding", r.ConfigBinding, "")
+				if mustKnown(t, "shape", svc.Shape) != "unsupported" || !strings.Contains(svc.ShapeReason, c.reason) {
+					t.Fatalf("unknown EnvironmentFiles authorized the unit: %+v", svc)
+				}
+			})
+		}
+	}
+}
+
+// These decisions reject configured remapping; they do not require an empty
+// array inventory. Omitted and printed-empty keys have the same decision.
+func TestReleaseInspectRemappingOmissionMatchesEmpty(t *testing.T) {
+	for _, property := range []string{"BindPaths", "BindReadOnlyPaths", "MountImages", "ExtensionImages", "TemporaryFileSystem"} {
+		for _, mode := range []string{"empty", "omitted", "configured"} {
+			t.Run(property+"/"+mode, func(t *testing.T) {
+				f := newInspectFixture(t)
+				switch mode {
+				case "omitted":
+					path := filepath.Join(f.unitsDir, "billet-server.service")
+					body := mustRead(t, path)
+					if !strings.Contains(body, property+"=\n") {
+						t.Fatal("fixture lacks the property to omit")
+					}
+					writeFile(t, path, strings.Replace(body, property+"=\n", "", 1), 0o644)
+				case "configured":
+					f.unitProperty(t, property, "/srv/other:/etc/billet")
+				}
+				r := f.report(t)
+				svc := r.Services["server"]
+				if mode == "configured" {
+					if mustKnown(t, "shape", svc.Shape) != "unsupported" || svc.ShapeReason != "a filesystem remapping directive ("+property+")" {
+						t.Fatalf("configured remapping was not refused: %+v", svc)
+					}
+					mustUnknown(t, "config_binding", r.ConfigBinding, "")
+				} else if mustKnown(t, "shape", svc.Shape) != "supported" || mustKnown(t, "config_binding", r.ConfigBinding) != true {
+					t.Fatalf("stock remapping shape was refused: %+v", svc)
+				}
+			})
+		}
+	}
+}
+
+// The closing read must compare typed paths and flags even when text stays
+// unchanged, and must discard process evidence if the bus stops answering.
+func TestReleaseInspectRechecksTypedEnvironmentFilesAcrossSample(t *testing.T) {
+	for _, mode := range []string{"path", "optionality", "unreadable"} {
+		t.Run(mode, func(t *testing.T) {
+			f := newInspectFixture(t)
+			envFile := filepath.Join(f.dir, "server.env")
+			writeFile(t, envFile, "", 0o640)
+			f.unitRunning(t, "billet-server.service", "server", f.configPath, []string{envFile})
+			changed := false
+			inspectAfterOpen = func(path string) {
+				if changed || path != filepath.Join(f.procDir, strconv.Itoa(inspectPID), "exe") {
+					return
+				}
+				changed = true
+				switch mode {
+				case "path":
+					f.unitEnvironment(t, "billet-server.service", []any{[]any{envFile + ".other", true}})
+				case "optionality":
+					f.unitEnvironment(t, "billet-server.service", []any{[]any{envFile, false}})
+				case "unreadable":
+					mustOK(t, os.Remove(filepath.Join(f.unitsDir, busLabel("billet-server.service")+".environment")))
+				}
+			}
+			svc := f.report(t).Services["server"]
+			if !changed {
+				t.Fatal("drift was not injected during the process sample")
+			}
+			reason := "unit changed under it"
+			if mode == "unreadable" {
+				reason = "operation-array-unreadable"
+			}
+			mustUnknown(t, "running_sha256", svc.RunningSHA256, reason)
+		})
 	}
 }
 
@@ -1962,10 +2101,10 @@ func TestReleaseInspectKeepsTheWholeEnvironmentFileName(t *testing.T) {
 	if !ok || mustKnown(t, "matches_file", d.MatchesFile) != "equal" {
 		t.Errorf("dsn_env = %+v, want equal against the file whose name holds \" (\"", svc.DSNEnv.value)
 	}
-	f.unitProperty(t, "EnvironmentFiles", envFile+" (something else)")
+	f.unitEnvironment(t, "billet-server.service", []any{[]any{envFile, "something else"}})
 	svc = f.report(t).Services["server"]
 	if mustKnown(t, "shape", svc.Shape) != "unsupported" {
-		t.Error("an EnvironmentFiles line in another form was read")
+		t.Error("an EnvironmentFiles record with an invalid optionality flag was read")
 	}
 }
 
