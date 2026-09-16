@@ -40,7 +40,7 @@ func settledNodeConfigFixture(t *testing.T) (*requestFixture, retirement.Journal
 	return f, j
 }
 
-func nodeConfigDocument(t *testing.T, f *requestFixture, j retirement.Journal, rendering string, operations retireNodeOperations) string {
+func nodeConfigDocument(t *testing.T, j retirement.Journal, rendering string, operations retireNodeOperations) string {
 	t.Helper()
 	body, err := json.Marshal(operations)
 	mustOK(t, err)
@@ -126,7 +126,7 @@ func TestRetirementNodeConfigAdmitsQuietEntryWithoutDrainOrRegistration(t *testi
 			forbidNodeConfigWrites(t, f)
 			operations := emptyNodeOperations()
 			operations.Services = []retireServiceOperation{{Verb: "start", Unit: nodeUnit}}
-			document := nodeConfigDocument(t, f, j, mustRead(t, f.cfg), operations)
+			document := nodeConfigDocument(t, j, mustRead(t, f.cfg), operations)
 			out, code := runNodeConfigCheck(t, f, j, document)
 			var in retireNodeConfigInput
 			mustOK(t, json.Unmarshal([]byte(document), &in))
@@ -202,7 +202,7 @@ func TestRetirementNodeConfigAdmitsPackagedServiceDirectories(t *testing.T) {
 		if verb != "" {
 			operations.Services = []retireServiceOperation{{Verb: verb, Unit: nodeUnit}}
 		}
-		out, code := runNodeConfigCheck(t, f, j, nodeConfigDocument(t, f, j, mustRead(t, f.cfg), operations))
+		out, code := runNodeConfigCheck(t, f, j, nodeConfigDocument(t, j, mustRead(t, f.cfg), operations))
 		if code != 0 || retireAnswer(t, out)["outcome"] != "admitted" {
 			t.Fatalf("packaged service directories refused %q: %s", verb, out)
 		}
@@ -243,12 +243,12 @@ func TestRetirementNodeConfigProtectsEnvironmentPathnameAndTraversal(t *testing.
 			forbidNodeConfigWrites(t, f)
 			operations := emptyNodeOperations()
 			operations.Filesystem = []retireFilesystemOperation{{Kind: "recursive-delete", Path: filepath.Join(root, "unrelated")}}
-			out, code := runNodeConfigCheck(t, f, j, nodeConfigDocument(t, f, j, mustRead(t, f.cfg), operations))
+			out, code := runNodeConfigCheck(t, f, j, nodeConfigDocument(t, j, mustRead(t, f.cfg), operations))
 			if code != 0 {
 				t.Fatalf("retained environment control refused: %s", out)
 			}
 			operations.Filesystem[0].Path = c.destination
-			out, code = runNodeConfigCheck(t, f, j, nodeConfigDocument(t, f, j, mustRead(t, f.cfg), operations))
+			out, code = runNodeConfigCheck(t, f, j, nodeConfigDocument(t, j, mustRead(t, f.cfg), operations))
 			if code != exitRefused || retireAnswer(t, out)["reason"] != retireReasonNodePath || !strings.Contains(out, "retaining an environment file grants no mutation") {
 				t.Fatalf("environment pathname destruction admitted or hit another refusal: %s", out)
 			}
@@ -324,7 +324,7 @@ func TestRetirementNodeConfigPlantedReadersRefuseBeforeMutation(t *testing.T) {
 				setRetireEffect(t, f, nodeUnit, "User", "billet")
 				want = "settled-entry-node-account"
 			}
-			document := nodeConfigDocument(t, f, j, rendering, operations)
+			document := nodeConfigDocument(t, j, rendering, operations)
 			if scenario == "changed rendering digest" {
 				document = strings.Replace(document, retirement.Digest([]byte(rendering)), strings.Repeat("0", 64), 1)
 			}
@@ -350,7 +350,7 @@ func TestTheRetireNodeConfigFixturesAreTheCommandsOwn(t *testing.T) {
 				f.manager.set(nodeUnit, "ActiveState", activity)
 				f.manager.set(nodeUnit, "MainPID", "0")
 			}
-			document := nodeConfigDocument(t, f, j, mustRead(t, f.cfg), emptyNodeOperations())
+			document := nodeConfigDocument(t, j, mustRead(t, f.cfg), emptyNodeOperations())
 			out, code := runNodeConfigCheck(t, f, j, document)
 			if code != 0 {
 				t.Fatalf("producer refused: %s", out)
@@ -428,7 +428,7 @@ func TestRetirementNodeConfigRequiresSettledBoundRecordsWithoutRepair(t *testing
 				want = retireReasonIdentity
 			}
 			forbidNodeConfigWrites(t, f)
-			document := nodeConfigDocument(t, f, j, mustRead(t, f.cfg), emptyNodeOperations())
+			document := nodeConfigDocument(t, j, mustRead(t, f.cfg), emptyNodeOperations())
 			out, code := runNodeConfigCheck(t, f, j, document, extra...)
 			if code == 0 || retireAnswer(t, out)["reason"] != want {
 				t.Fatalf("%s admitted or refused for the wrong record: %s", scenario, out)
@@ -456,7 +456,7 @@ func TestRetirementNodeConfigAdmitsFutureCredentialsAndProtectsEachReader(t *tes
 			rendering, err := yaml.Marshal(doc)
 			mustOK(t, err)
 			forbidNodeConfigWrites(t, f)
-			out, code := runNodeConfigCheck(t, f, j, nodeConfigDocument(t, f, j, string(rendering), emptyNodeOperations()))
+			out, code := runNodeConfigCheck(t, f, j, nodeConfigDocument(t, j, string(rendering), emptyNodeOperations()))
 			if code != 0 {
 				t.Fatalf("future %s had to exist before admission: %s", field, out)
 			}
@@ -466,7 +466,7 @@ func TestRetirementNodeConfigAdmitsFutureCredentialsAndProtectsEachReader(t *tes
 			tls[field] = j.IdentityDir + "/" + field
 			rendering, err = yaml.Marshal(doc)
 			mustOK(t, err)
-			out, code = runNodeConfigCheck(t, f, j, nodeConfigDocument(t, f, j, string(rendering), emptyNodeOperations()))
+			out, code = runNodeConfigCheck(t, f, j, nodeConfigDocument(t, j, string(rendering), emptyNodeOperations()))
 			if code != exitRefused || retireAnswer(t, out)["reason"] != retireReasonNodePath {
 				t.Fatalf("future %s reader could recreate the controller: %s", field, out)
 			}
@@ -542,7 +542,7 @@ func TestRetirementNodeConfigPreservesEnvironmentBeforeUnitReplacement(t *testin
 			operations.Units = []retireProposedUnit{{Unit: nodeUnit, Path: source, Contents: body, SHA256: retirement.Digest([]byte(body))}}
 			operations.Filesystem = []retireFilesystemOperation{{Kind: "write", Path: source}}
 			forbidNodeConfigWrites(t, f)
-			out, code := runNodeConfigCheck(t, f, j, nodeConfigDocument(t, f, j, mustRead(t, f.cfg), operations))
+			out, code := runNodeConfigCheck(t, f, j, nodeConfigDocument(t, j, mustRead(t, f.cfg), operations))
 			if scenario == "required present" || scenario == "optional present" || scenario == "optional absent" {
 				if code != 0 {
 					t.Fatalf("supported environment refused: %s", out)
@@ -596,7 +596,7 @@ func TestRetirementNodeConfigRejectsCombinedCacheTLSParentTraversal(t *testing.T
 			rendering, err := yaml.Marshal(doc)
 			mustOK(t, err)
 			forbidNodeConfigWrites(t, f)
-			out, code := runNodeConfigCheck(t, f, j, nodeConfigDocument(t, f, j, string(rendering), operations))
+			out, code := runNodeConfigCheck(t, f, j, nodeConfigDocument(t, j, string(rendering), operations))
 			if field == "safe" {
 				if code != 0 {
 					t.Fatalf("safe future cache configuration refused: %s", out)

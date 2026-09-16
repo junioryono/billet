@@ -229,6 +229,27 @@ func underOrEqual(dir, path string) bool {
 // maxWalkLinks is the kernel's symlink budget for one resolution.
 const maxWalkLinks = 40
 
+type retireWalkReadState uint8
+
+const (
+	retireWalkReadUnknown retireWalkReadState = iota
+	retireWalkReadPresent
+	retireWalkReadAbsent
+)
+
+// classifyRetireWalkRead keeps positive absence separate from failed observations.
+// The walker reports uncertainty as an answer; only unsupported paths are errors.
+func classifyRetireWalkRead(err error) retireWalkReadState {
+	switch {
+	case err == nil:
+		return retireWalkReadPresent
+	case errors.Is(err, fs.ErrNotExist):
+		return retireWalkReadAbsent
+	default:
+		return retireWalkReadUnknown
+	}
+}
+
 // walkTraverses models a consumer which can create missing parents. It judges
 // each intermediate component, including after '..' returns to an existing
 // ancestor. It never creates the hypothetical directories itself.
@@ -240,7 +261,7 @@ func walkTraverses(path, identityDir string) (bool, string, error) {
 	remaining := strings.Split(path, "/")
 	cur, missing := "/", ""
 	rootInfo, err := retireWalkLstat(cur)
-	if err != nil || !rootInfo.IsDir() {
+	if classifyRetireWalkRead(err) != retireWalkReadPresent || !rootInfo.IsDir() {
 		return false, "filesystem root could not be observed", nil
 	}
 	observed := map[string]os.FileInfo{cur: rootInfo}
@@ -273,7 +294,7 @@ func walkTraverses(path, identityDir string) (bool, string, error) {
 			}
 			if missing == "" {
 				info, err := retireWalkLstat(cur)
-				if err != nil || !info.IsDir() || !consistent(cur, info) {
+				if classifyRetireWalkRead(err) != retireWalkReadPresent || !info.IsDir() || !consistent(cur, info) {
 					return false, "inconsistent revisited component: " + cur, nil
 				}
 			}
@@ -289,19 +310,19 @@ func walkTraverses(path, identityDir string) (bool, string, error) {
 			continue
 		}
 		info, lerr := retireWalkLstat(next)
-		switch {
-		case errors.Is(lerr, fs.ErrNotExist):
+		switch classifyRetireWalkRead(lerr) {
+		case retireWalkReadAbsent:
 			if !consistent(next, nil) {
 				return false, "inconsistent revisited component: " + next, nil
 			}
 			// ENOENT is absence only while the observed parent still exists.
 			parent, err := retireWalkLstat(cur)
-			if err != nil || !parent.IsDir() || !consistent(cur, parent) {
+			if classifyRetireWalkRead(err) != retireWalkReadPresent || !parent.IsDir() || !consistent(cur, parent) {
 				return false, "inconsistent missing-path parent: " + cur, nil
 			}
 			cur, missing = next, next
 			continue
-		case lerr != nil:
+		case retireWalkReadUnknown:
 			return false, fmt.Sprintf("examine %s: %v", next, lerr), nil
 		}
 		if !consistent(next, info) {
@@ -313,14 +334,14 @@ func walkTraverses(path, identityDir string) (bool, string, error) {
 				return false, fmt.Sprintf("%s: more than %d symlinks on the way", path, maxWalkLinks), nil
 			}
 			target, err := retireWalkReadlink(next)
-			if err != nil {
+			if classifyRetireWalkRead(err) != retireWalkReadPresent {
 				return false, fmt.Sprintf("read the link %s: %v", next, err), nil
 			}
 			if target == "" || strings.IndexFunc(target, unsafeRetirePathRune) >= 0 {
 				return false, "", fmt.Errorf("unsupported symlink spelling at %s", next)
 			}
 			again, err := retireWalkLstat(next)
-			if err != nil || !os.SameFile(info, again) || info.Mode() != again.Mode() || !info.ModTime().Equal(again.ModTime()) {
+			if classifyRetireWalkRead(err) != retireWalkReadPresent || !os.SameFile(info, again) || info.Mode() != again.Mode() || !info.ModTime().Equal(again.ModTime()) {
 				return false, "link changed during observation: " + next, nil
 			}
 			if filepath.IsAbs(target) {

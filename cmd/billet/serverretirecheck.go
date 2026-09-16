@@ -88,7 +88,7 @@ func decodeRetireNodeConfig(raw []byte, m retireMode) (retireNodeConfigInput, re
 		return refuse("node-config document: " + err.Error())
 	}
 	if in.Schema != 1 || in.Run != m.run || in.Retiring != m.retiringHost || in.TransitionID != m.transition ||
-		len(in.Rendering) == 0 || len(in.Rendering) > retirement.MaxStageBytes || retirement.Digest([]byte(in.Rendering)) != in.RenderingSHA256 {
+		in.Rendering == "" || len(in.Rendering) > retirement.MaxStageBytes || retirement.Digest([]byte(in.Rendering)) != in.RenderingSHA256 {
 		return refuse("node-config document schema, run, host, transition or exact rendering digest does not match")
 	}
 	if err := retirement.DecodeDocument(in.Operations, &operations); err != nil {
@@ -155,7 +155,20 @@ func retireCheckNodeConfig(ctx context.Context, m retireMode) (any, *retireRefus
 	if err != nil {
 		return nil, retireUnknown(retireReasonLock, err.Error(), "")
 	}
-	defer func() { _ = hold.Release() }()
+	answer, r := observeRetireNodeConfig(ctx, m, root, in, operations)
+	if err := hold.Release(); err != nil {
+		why := "release retirement inspection lock: " + err.Error()
+		if r != nil {
+			r.Why += "; " + why
+			return nil, r
+		}
+		return nil, retireUnknown(retireReasonLock, why, "")
+	}
+	return answer, r
+}
+
+// observeRetireNodeConfig runs while both existing inspection locks are held.
+func observeRetireNodeConfig(ctx context.Context, m retireMode, root *txLock, in retireNodeConfigInput, operations retireNodeOperations) (any, *retireRefusal) {
 	j, activity, r := observeRetireOrdinaryEntry(ctx, m, root)
 	if r != nil {
 		return nil, r

@@ -1027,8 +1027,8 @@ func unitEnvironmentFiles(ctx context.Context, unit string) ([]lifeops.Environme
 // be read.
 func inspectServiceSection(ctx context.Context, role, unit string, cfg *config.Config,
 	inspectorConfig string, inspectorInfo os.FileInfo, inspectorSHA string, exeSHA string, exeInfo os.FileInfo,
-) (svc inspectService, binding maybe) {
-	svc = inspectService{LoadedConfig: unknown("nothing on the disk proves what a process read at start")}
+) (inspectService, maybe) {
+	svc := inspectService{LoadedConfig: unknown("nothing on the disk proves what a process read at start")}
 	if hostOS == "darwin" {
 		return serviceAllUnknown(svc, "launchd has no unit shape this inspector reads"), unknown("launchd has no unit shape this inspector reads")
 	}
@@ -1079,18 +1079,18 @@ func inspectServiceSection(ctx context.Context, role, unit string, cfg *config.C
 	}
 	svc.ExecStart = known(rendered)
 	envSpecs, envErr := unitEnvironmentFiles(ctx, unit)
-	defer func() {
+	finish := func(svc inspectService, binding maybe) (inspectService, maybe) {
 		if envErr != nil {
-			return
+			return svc, binding
 		}
 		after, err := unitEnvironmentFiles(ctx, unit)
 		if err == nil && reflect.DeepEqual(envSpecs, after) {
-			return
+			return svc, binding
 		}
 		why := "EnvironmentFiles changed or could not be read at the closing observation"
 		svc.EnvironmentFiles, svc.EnvironmentFileSpecs = unknown(why), unknown(why)
-		binding = weaker(binding, unknown(why))
-	}()
+		return svc, weaker(binding, unknown(why))
+	}
 	envFiles := make([]string, 0, len(envSpecs))
 	for _, spec := range envSpecs {
 		envFiles = append(envFiles, spec.Path)
@@ -1147,7 +1147,7 @@ func inspectServiceSection(ctx context.Context, role, unit string, cfg *config.C
 	default:
 		unitConfigPath = records[0].Argv[3]
 	}
-	binding = unknown("the unit's shape is unsupported, so it names no single config path")
+	binding := unknown("the unit's shape is unsupported, so it names no single config path")
 	if shapeWhy != "" {
 		svc.Shape = known("unsupported")
 		svc.ShapeReason = shapeWhy
@@ -1161,17 +1161,17 @@ func inspectServiceSection(ctx context.Context, role, unit string, cfg *config.C
 		svc.MainPID = unknown(why)
 		fillRunningUnknown(&svc, why)
 		svc.DSNEnv = unknown(why)
-		return svc, weaker(binding, unknown(why))
+		return finish(svc, weaker(binding, unknown(why)))
 	}
 	if pid <= 0 {
 		svc.MainPID = known(nil)
 		fillRunningNull(&svc)
 		svc.DSNEnv = known(nil)
-		return svc, binding
+		return finish(svc, binding)
 	}
 	svc.MainPID = known(pid)
 	processBinding := inspectRunningProcess(ctx, &svc, role, unit, pid, props, records, envSpecs, cfg, inspectorConfig, inspectorInfo, inspectorSHA, exeSHA, exeInfo, unitConfigPath, envFiles)
-	return svc, weaker(binding, processBinding)
+	return finish(svc, weaker(binding, processBinding))
 }
 
 // invocationOf is systemd's InvocationID for a unit: null when systemd

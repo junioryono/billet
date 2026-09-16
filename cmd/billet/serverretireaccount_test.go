@@ -120,7 +120,7 @@ func TestRetirementNodeConfigChecksMaskedAccountAtOrdinaryEntry(t *testing.T) {
 				return &user.Group{Name: name, Gid: "456"}, nil
 			}
 			forbidNodeConfigWrites(t, f)
-			out, code := runNodeConfigCheck(t, f, j, nodeConfigDocument(t, f, j, mustRead(t, f.cfg), emptyNodeOperations()))
+			out, code := runNodeConfigCheck(t, f, j, nodeConfigDocument(t, j, mustRead(t, f.cfg), emptyNodeOperations()))
 			if scenario == "matching" {
 				if code != 0 || retireAnswer(t, out)["outcome"] != "admitted" {
 					t.Fatalf("persistent-mask control refused: %s", out)
