@@ -1,0 +1,8 @@
+{
+  "outcome": "unknown",
+  "purpose": "settled-closing",
+  "reason": "settled-entry-node-job-observation",
+  "schema": 1,
+  "state": "nothing",
+  "why": "malformed queued job observation"
+}
