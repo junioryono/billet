@@ -321,7 +321,13 @@
           - billet_top_level_names.index('Enable and start the billet node') < billet_top_level_names.index('Refresh the node\'s endpoint receipt after the start')
           - billet_top_level_names.index('Refresh the node\'s endpoint receipt after the start') < billet_top_level_names.index('Stop and disable the billet node unless it may run here')
           - "'not billet_endpoint_migrated | default(false) | bool' in (billet_host_service_tasks | selectattr('name', 'equalto', 'Restart the billet node after non-binary inputs change') | first).when"
-          - billet_account_names.index('Refuse to move installed billet state implicitly') < billet_account_names.index('Render billet configuration')
+          # BOTH HALVES OF THE MOVE REFUSAL, since the server's and the node's are
+          # separate tasks: each must precede the render, or a converge writes a
+          # configuration naming a directory the installed deployment does not use.
+          - billet_account_names.index('Refuse to move installed server state implicitly') < billet_account_names.index('Render billet configuration')
+          - billet_account_names.index('Refuse to move installed node state implicitly') < billet_account_names.index('Render billet configuration')
+          - billet_account_names.index('Refuse to move installed server state implicitly') < billet_account_names.index('Stage candidate configuration for the upgrade transaction')
+          - billet_account_names.index('Refuse to move installed node state implicitly') < billet_account_names.index('Stage candidate configuration for the upgrade transaction')
           - billet_stage_inner_names.index("Allocate the transaction's recovery directory") < billet_stage_inner_names.index('Stage the immutable candidate binary inside its recovery journal')
           - billet_stage_inner_names.index('Stage the immutable candidate binary inside its recovery journal') < billet_stage_inner_names.index('Bind the host transaction to the inspected candidate digest')
           - billet_account_names.index('Refuse redirected or non-file upgrade inputs') < billet_account_names.index('Preserve configuration and units before replacing them')

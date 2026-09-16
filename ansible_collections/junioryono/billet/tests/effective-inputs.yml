@@ -278,8 +278,11 @@
     billet_config: {server: {identity_dir: /var/lib/billet/inventory-identity}, node: {state_dir: /var/lib/billet/inventory-node}}
     billet_candidate_server_state_dir: "{{ billet_configured_server_state_dir }}"
     billet_candidate_node_state_dir: /var/lib/billet/effective-node
+    # THREE DISTINCT PATHS — installed, inventory and effective — or an installed
+    # reader that had been rewritten to read E would answer the same value and
+    # nothing here could tell.
     billet_previous_config_file:
-      content: "{{ {'node': {'state_dir': '/var/lib/billet/effective-node'}} | to_yaml | b64encode }}"
+      content: "{{ {'server': {'identity_dir': '/var/lib/billet/installed-identity'}, 'node': {'state_dir': '/var/lib/billet/installed-node'}} | to_yaml | b64encode }}"
     billet_service_user: billet
     billet_service_group: billet
     billet_firecracker_stage: /var/cache/billet-provision
@@ -312,39 +315,54 @@
         billet_node_directories: "{{ billet_gate_dirs.vars.billet_node_directories }}"
 
     # The two installed observations are separate facts, so a refusal names the one
-    # directory that moved. An installed configuration naming no server still
-    # answers the candidate's default, or this comparison refuses every node-only
-    # converge.
-    - name: Require the installed observations to be split
+    # directory that moved.
+    - name: Derive both installed observations through the production expressions
+      ansible.builtin.set_fact:
+        billet_previous_server_state_dir: "{{ billet_gate_previous_server['ansible.builtin.set_fact'].billet_previous_server_state_dir }}"
+        billet_previous_node_state_dir: "{{ billet_gate_previous_node['ansible.builtin.set_fact'].billet_previous_node_state_dir }}"
+
+    # EACH READS THE INSTALLED FILE, not E and not inventory. All three name a
+    # different directory, so answering from the wrong one fails here.
+    - name: Require the installed observations to be split and to read installed evidence
       ansible.builtin.assert:
         that:
           - "'billet_previous_node_state_dir' not in billet_gate_previous_server['ansible.builtin.set_fact']"
           - "'billet_previous_server_state_dir' not in billet_gate_previous_node['ansible.builtin.set_fact']"
-          - billet_gate_previous_node['ansible.builtin.set_fact'].billet_previous_node_state_dir == '/var/lib/billet/effective-node'
+          - billet_previous_server_state_dir == '/var/lib/billet/installed-identity'
+          - billet_previous_node_state_dir == '/var/lib/billet/installed-node'
+        fail_msg: >-
+          An installed observation answered {{ billet_previous_server_state_dir }} and
+          {{ billet_previous_node_state_dir }}; the installed file names
+          /var/lib/billet/installed-identity and /var/lib/billet/installed-node, E names
+          /var/lib/billet/effective-node and inventory names /var/lib/billet/inventory-node.
 
-    - name: Exercise the production node path invariant with the installed path
+    # THE DERIVED OBSERVATION IS WHAT THE REFUSAL JUDGES, never a value this gate
+    # hands it: a test that supplies both sides proves the comparison and nothing
+    # about the reader underneath it. A candidate equal to the installed path is
+    # admitted.
+    - name: Exercise the production node path invariant against the derived observation
       ansible.builtin.assert:
         that: "{{ billet_gate_node_invariant['ansible.builtin.assert'].that }}"
       vars:
-        billet_previous_node_state_dir: /var/lib/billet/effective-node
+        billet_candidate_node_state_dir: /var/lib/billet/installed-node
 
     - name: Initialize the changed-node refusal witness
       ansible.builtin.set_fact:
         billet_gate_node_move_refused: false
 
-    - name: Exercise the production node path invariant with a different installed path
+    # The play's candidate is E's node path, which the installed file does not
+    # name, so the production refusal must fire on the derived observation alone.
+    - name: Exercise the production node path invariant against a moved candidate
       block:
         - name: Apply the production node path assertion
           ansible.builtin.assert:
             that: "{{ billet_gate_node_invariant['ansible.builtin.assert'].that }}"
-          vars:
-            billet_previous_node_state_dir: /var/lib/billet/installed-node
       rescue:
         - name: Record the changed-node refusal
           ansible.builtin.set_fact:
             billet_gate_node_move_refused: true
 
-    - name: Require the node invariant to refuse a move without a server
+    - name: Require the node invariant to refuse a move it derived itself
       ansible.builtin.assert:
         that:
           - billet_gate_node_move_refused
@@ -377,3 +395,24 @@
         - {route: recovery, enabled: true, prepare: false, verified: false, bypass: true, effective: true, run: true}
       loop_control:
         loop_var: billet_gate_policy
+
+- name: No inadmissible route reaches the effective configuration
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    billet_config: {node: {provider: docker}}
+    billet_enable_server: true
+    billet_server_prepare_only: false
+  tasks:
+    - name: Exercise each route the ordinary entry must refuse
+      ansible.builtin.include_tasks: effective-admission-case.yml
+      loop:
+        - {name: bypassed, route: hold, bypass: true, verified: false, ordinary: false, interrupted: false}
+        - {name: recovery, route: ordinary, bypass: false, verified: false, ordinary: false, interrupted: true}
+        - {name: unverified-retained, route: continue, bypass: false, verified: false, ordinary: true, interrupted: false}
+        - {name: held, route: hold, bypass: false, verified: false, ordinary: false, interrupted: false}
+        - {name: new-request, route: new-request, bypass: false, verified: false, ordinary: false, interrupted: false}
+      loop_control:
+        loop_var: billet_gate_refusal
+        label: "{{ billet_gate_refusal.name }}"

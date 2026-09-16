@@ -120,9 +120,6 @@ cat >"$work/retirement-entry-tasks.yml" <<'PLAY'
         argv: ["{{ ansible_playbook_python }}", "{{ billet_gate_own_guard_script }}", "{{ billet_gate_own_guard }}"]
       changed_when: true
       when: billet_gate_own_guard is defined
-    - name: Derive the original request policy for this isolated entry
-      ansible.builtin.set_fact:
-        billet_requested_server_should_run: "{{ billet_enable_server | bool and not billet_server_prepare_only | bool }}"
     - name: Route this host before ordinary work
       ansible.builtin.include_role:
         name: junioryono.billet.host
