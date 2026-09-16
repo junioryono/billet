@@ -235,6 +235,25 @@ func retireArchivedIdentity(j retirement.Journal) (string, *retireRefusal) {
 // persistent enablement and is gone at the next boot.
 func observeRetirePostconditions(ctx context.Context, m retireMode, j retirement.Journal,
 ) (retirePostconditions, *retireRefusal) {
+	held, r := observeRetireControllerPostconditions(ctx, m, j)
+	if r != nil {
+		return held, r
+	}
+	word, r := retireUnitPostcondition(ctx, retirePostconditionInspector(), nodeUnit, true,
+		j.Variant == retirement.VariantRetainedNode, true)
+	if r != nil {
+		return held, atRetirePhase(j, r)
+	}
+	if r := proveRetireDoneRegistration(ctx, retirePostconditionInspector(), m.configPath, j); r != nil {
+		return held, r
+	}
+	held.Node = word
+	return held, nil
+}
+
+// Controller-side obligations are identical at ordinary entry and strict done.
+func observeRetireControllerPostconditions(ctx context.Context, m retireMode, j retirement.Journal,
+) (retirePostconditions, *retireRefusal) {
 	var held retirePostconditions
 
 	present, err := retireDirPresent(j.Archive)
@@ -259,29 +278,19 @@ func observeRetirePostconditions(ctx context.Context, m retireMode, j retirement
 	insp := retirePostconditionInspector()
 
 	for _, unit := range []struct {
-		name  string
-		into  *string
-		pid   bool
-		alive bool
+		name string
+		into *string
+		pid  bool
 	}{
 		{name: serverUnit, into: &held.Server, pid: true},
-		{name: nodeUnit, into: &held.Node, pid: true, alive: j.Variant == retirement.VariantRetainedNode},
 		{name: upgradeTimerUnit, into: &held.UpgradeTimer},
 		{name: backupTimerUnit, into: &held.BackupTimer},
 		{name: backupServiceUnit, into: &held.BackupService, pid: true},
 	} {
 		backupTimerQuiet := held.BackupTimer == retireUnitQuiet || held.BackupTimer == retireUnitNotFound
-		word, r := retireUnitPostcondition(ctx, insp, unit.name, unit.pid, unit.alive, backupTimerQuiet)
+		word, r := retireUnitPostcondition(ctx, insp, unit.name, unit.pid, false, backupTimerQuiet)
 		if r != nil {
 			return held, atRetirePhase(j, r)
-		}
-
-		// A restart can invalidate registration after the phase table's proof.
-		// Every done boundary uses the restart gate's current-invocation rule.
-		if unit.alive {
-			if r := proveRetireDoneRegistration(ctx, insp, m.configPath, j); r != nil {
-				return held, r
-			}
 		}
 
 		*unit.into = word

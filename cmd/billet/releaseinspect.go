@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -171,19 +172,20 @@ type inspectProvenance struct {
 }
 
 type inspectService struct {
-	UnitPresent      maybe  `json:"unit_present"`
-	UnitFileState    maybe  `json:"unit_file_state"`
-	Enabled          maybe  `json:"enabled"`
-	ActiveState      maybe  `json:"active_state"`
-	SubState         maybe  `json:"sub_state"`
-	MainPID          maybe  `json:"main_pid"`
-	InvocationID     maybe  `json:"invocation_id"`
-	ExecMainStart    maybe  `json:"exec_main_start"`
-	ExecStart        maybe  `json:"exec_start"`
-	EnvironmentFiles maybe  `json:"environment_files"`
-	Shape            maybe  `json:"shape"`
-	ShapeReason      string `json:"shape_reason,omitempty"`
-	NeedDaemonReload maybe  `json:"need_daemon_reload"`
+	UnitPresent          maybe  `json:"unit_present"`
+	UnitFileState        maybe  `json:"unit_file_state"`
+	Enabled              maybe  `json:"enabled"`
+	ActiveState          maybe  `json:"active_state"`
+	SubState             maybe  `json:"sub_state"`
+	MainPID              maybe  `json:"main_pid"`
+	InvocationID         maybe  `json:"invocation_id"`
+	ExecMainStart        maybe  `json:"exec_main_start"`
+	ExecStart            maybe  `json:"exec_start"`
+	EnvironmentFiles     maybe  `json:"environment_files"`
+	EnvironmentFileSpecs maybe  `json:"environment_file_specs"`
+	Shape                maybe  `json:"shape"`
+	ShapeReason          string `json:"shape_reason,omitempty"`
+	NeedDaemonReload     maybe  `json:"need_daemon_reload"`
 
 	// fromObservation marks a service whose config digest and mtime were taken
 	// from the configuration observation, so the closing check can withdraw
@@ -1010,7 +1012,7 @@ func busLabel(name string) string {
 	return b.String()
 }
 
-// Keep optionality in the sample identity although the report exposes only paths.
+// Both inspection fields and the process identity share the typed reader.
 func unitEnvironmentFiles(ctx context.Context, unit string) ([]lifeops.EnvironmentFile, error) {
 	return lifeops.NewInspector(lifeops.WithOperationBusctl(busctlBinary), lifeops.WithTimeout(systemctlTimeout), managerRunnerOption()).EnvironmentFiles(ctx, unit)
 }
@@ -1043,6 +1045,7 @@ func inspectServiceSection(ctx context.Context, role, unit string, cfg *config.C
 		svc.UnitPresent = known(false)
 		svc.UnitFileState, svc.Enabled = known(nil), known(nil)
 		svc.ExecStart, svc.Shape, svc.EnvironmentFiles = known(nil), known(nil), known(nil)
+		svc.EnvironmentFileSpecs = known(nil)
 		svc.NeedDaemonReload = needDaemonReload(props)
 		svc.ActiveState, svc.SubState = known(active), known(firstProp(props, "SubState"))
 		svc.ExecMainStart = known(firstProp(props, "ExecMainStartTimestamp"))
@@ -1076,14 +1079,28 @@ func inspectServiceSection(ctx context.Context, role, unit string, cfg *config.C
 	}
 	svc.ExecStart = known(rendered)
 	envSpecs, envErr := unitEnvironmentFiles(ctx, unit)
+	finish := func(svc inspectService, binding maybe) (inspectService, maybe) {
+		if envErr != nil {
+			return svc, binding
+		}
+		after, err := unitEnvironmentFiles(ctx, unit)
+		if err == nil && reflect.DeepEqual(envSpecs, after) {
+			return svc, binding
+		}
+		why := "EnvironmentFiles changed or could not be read at the closing observation"
+		svc.EnvironmentFiles, svc.EnvironmentFileSpecs = unknown(why), unknown(why)
+		return svc, weaker(binding, unknown(why))
+	}
 	envFiles := make([]string, 0, len(envSpecs))
 	for _, spec := range envSpecs {
 		envFiles = append(envFiles, spec.Path)
 	}
 	if envErr != nil {
 		svc.EnvironmentFiles = unknown(envErr.Error())
+		svc.EnvironmentFileSpecs = unknown(envErr.Error())
 	} else {
 		svc.EnvironmentFiles = known(envFiles)
+		svc.EnvironmentFileSpecs = known(envSpecs)
 	}
 	svc.NeedDaemonReload = needDaemonReload(props)
 
@@ -1144,17 +1161,17 @@ func inspectServiceSection(ctx context.Context, role, unit string, cfg *config.C
 		svc.MainPID = unknown(why)
 		fillRunningUnknown(&svc, why)
 		svc.DSNEnv = unknown(why)
-		return svc, weaker(binding, unknown(why))
+		return finish(svc, weaker(binding, unknown(why)))
 	}
 	if pid <= 0 {
 		svc.MainPID = known(nil)
 		fillRunningNull(&svc)
 		svc.DSNEnv = known(nil)
-		return svc, binding
+		return finish(svc, binding)
 	}
 	svc.MainPID = known(pid)
 	processBinding := inspectRunningProcess(ctx, &svc, role, unit, pid, props, records, envSpecs, cfg, inspectorConfig, inspectorInfo, inspectorSHA, exeSHA, exeInfo, unitConfigPath, envFiles)
-	return svc, weaker(binding, processBinding)
+	return finish(svc, weaker(binding, processBinding))
 }
 
 // invocationOf is systemd's InvocationID for a unit: null when systemd
@@ -1174,6 +1191,7 @@ func serviceAllUnknown(svc inspectService, why string) inspectService {
 	svc.UnitFileState, svc.Enabled = unknown(why), unknown(why)
 	svc.ActiveState, svc.SubState, svc.MainPID = unknown(why), unknown(why), unknown(why)
 	svc.ExecMainStart, svc.ExecStart, svc.Shape, svc.EnvironmentFiles = unknown(why), unknown(why), unknown(why), unknown(why)
+	svc.EnvironmentFileSpecs = unknown(why)
 	svc.NeedDaemonReload = unknown(why)
 	fillRunningUnknown(&svc, why)
 	svc.DSNEnv = unknown(why)

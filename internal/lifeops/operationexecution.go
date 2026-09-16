@@ -48,3 +48,36 @@ func admitOperationSetupValues(unit string, ev operationEvidence) error {
 	}
 	return nil
 }
+
+// AdmitUnitReplacement admits an exact re-render of the loaded definition.
+// Changed definitions are outside the currently loaded operation-effects graph.
+func (i *Inspector) AdmitUnitReplacement(ctx context.Context, unit, path, body, environmentLine string) error {
+	props, err := i.properties(ctx, unit, "LoadState", "FragmentPath", "DropInPaths", "NeedDaemonReload")
+	if err != nil {
+		return err
+	}
+	if err := requireOperationProperties(unit, props, []string{"LoadState", "FragmentPath", "DropInPaths", "NeedDaemonReload"}); err != nil {
+		return err
+	}
+	if first(props, "LoadState") != "loaded" || first(props, "FragmentPath") != path || first(props, "DropInPaths") != "" || first(props, "NeedDaemonReload") != "no" {
+		return fmt.Errorf("operation-proposed-unit-unsupported: installed and loaded unit sources differ")
+	}
+	sources, err := readOperationSources(props)
+	if err != nil {
+		return err
+	}
+	if len(sources) != 1 || sources[0].Body != body {
+		return fmt.Errorf("operation-proposed-unit-changed: only the installed definition can be re-rendered")
+	}
+	var environment strings.Builder
+	for _, line := range strings.Split(body, "\n") {
+		key, _, ok := strings.Cut(line, "=")
+		if ok && strings.TrimSpace(key) == "EnvironmentFile" {
+			environment.WriteString(line + "\n")
+		}
+	}
+	if environment.String() != environmentLine {
+		return fmt.Errorf("operation-proposed-environment-mismatch: preserve the loaded filename and optionality")
+	}
+	return nil
+}

@@ -116,6 +116,9 @@
       "environment_file_changed_since_start": {
         "unknown": "launchd has no unit shape this inspector reads"
       },
+      "environment_file_specs": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
       "environment_files": {
         "unknown": "launchd has no unit shape this inspector reads"
       },
@@ -182,6 +185,9 @@
         "unknown": "launchd has no unit shape this inspector reads"
       },
       "environment_file_changed_since_start": {
+        "unknown": "launchd has no unit shape this inspector reads"
+      },
+      "environment_file_specs": {
         "unknown": "launchd has no unit shape this inspector reads"
       },
       "environment_files": {
