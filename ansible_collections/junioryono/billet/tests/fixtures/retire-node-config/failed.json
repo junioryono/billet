@@ -1,0 +1,15 @@
+{
+  "deployment": "dddddddddddddddddddddddddddddddd",
+  "guard": "11111111111111111111111111111111",
+  "node_activity": "quiet-failed",
+  "operations_sha256": "abababababababababababababababababababababababababababababababab",
+  "outcome": "admitted",
+  "purpose": "node-config",
+  "rendering_sha256": "abababababababababababababababababababababababababababababababab",
+  "retiring": "control-a",
+  "run": "ci-1",
+  "schema": 1,
+  "state": "nothing",
+  "transition_id": "22222222222222222222222222222222",
+  "variant": "retained-node"
+}
