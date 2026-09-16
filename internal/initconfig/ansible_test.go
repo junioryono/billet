@@ -138,18 +138,24 @@ func TestAnsibleVarsRefusesWhatIsNotAMapping(t *testing.T) {
 	}
 }
 
-// THE VARIABLE NAME IS PINNED TO THE ROLE'S TEMPLATE.
+// THE EMITTED VARIABLE MUST REACH THE ROLE'S TEMPLATE.
 //
-// If the role renamed its variable, an emission under the old name would be
+// If the role renamed what it reads, an emission under the old name would be
 // valid YAML, set a variable nothing reads, and converge the host with no
 // config change and no error — the failure that looks exactly like success.
-// Nothing else in the toolchain compares these two strings.
-func TestAnsibleVarMatchesTheRoleTemplate(t *testing.T) {
-	path := filepath.Join("..", "..",
-		"ansible_collections", "junioryono", "billet",
-		"roles", "host", "templates", "billet.yaml.j2")
+// Nothing else in the toolchain compares these strings.
+//
+// The template no longer reads the emitted variable directly. It renders an
+// OPERAND its caller binds, so that an ordinary render, a collected rendering
+// and a retirement's own bytes cannot be confused for one another, and an
+// unbound render fails instead of quietly falling back to inventory. That makes
+// the chain two links, and this test pins both: the emission is what the role
+// derives its effective configuration from, and every caller binds the operand.
+func TestAnsibleVarReachesTheRoleTemplateThroughItsOperand(t *testing.T) {
+	role := filepath.Join("..", "..",
+		"ansible_collections", "junioryono", "billet", "roles", "host")
 
-	raw, err := os.ReadFile(path)
+	raw, err := os.ReadFile(filepath.Join(role, "templates", "billet.yaml.j2"))
 	if err != nil {
 		t.Fatalf("read the role template: %v", err)
 	}
@@ -165,9 +171,46 @@ func TestAnsibleVarMatchesTheRoleTemplate(t *testing.T) {
 
 	expr := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(body, "{{"), "}}"))
 	rendered, _, _ := strings.Cut(expr, "|")
+	operand := strings.TrimSpace(rendered)
 
-	if got := strings.TrimSpace(rendered); got != AnsibleVar {
-		t.Errorf("the role template renders %q, but emissions are written under %q — "+
-			"an emission would set a variable nothing reads", got, AnsibleVar)
+	if operand == "" {
+		t.Fatalf("the role template renders no variable:\n%s", body)
+	}
+
+	// LINK ONE: the emission is what the ordinary pass derives its configuration
+	// from. Without this, the role could read some other inventory variable and an
+	// emission would again set something nothing reads.
+	effective, err := os.ReadFile(filepath.Join(role, "tasks", "effective-config.yml"))
+	if err != nil {
+		t.Fatalf("read the role's effective configuration entry: %v", err)
+	}
+	if !strings.Contains(string(effective), AnsibleVar) {
+		t.Errorf("the role derives its effective configuration without reading %q — "+
+			"an emission would set a variable nothing reads", AnsibleVar)
+	}
+
+	// LINK TWO: every caller binds the operand. A caller that renders the template
+	// without binding it is the fallback this operand exists to remove.
+	tasks, err := filepath.Glob(filepath.Join(role, "tasks", "*.yml"))
+	if err != nil {
+		t.Fatalf("list the role's tasks: %v", err)
+	}
+	callers := 0
+	for _, task := range tasks {
+		source, err := os.ReadFile(task)
+		if err != nil {
+			t.Fatalf("read %s: %v", task, err)
+		}
+		if !strings.Contains(string(source), "billet.yaml.j2") {
+			continue
+		}
+		callers++
+		if !strings.Contains(string(source), operand) {
+			t.Errorf("%s renders billet.yaml.j2 without binding %q",
+				filepath.Base(task), operand)
+		}
+	}
+	if callers == 0 {
+		t.Errorf("no task renders billet.yaml.j2, so nothing pins the operand %q", operand)
 	}
 }
