@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
+	"slices"
 	"strings"
 	"testing"
 
@@ -177,6 +179,21 @@ func TestAnsibleVarReachesTheRoleTemplateThroughItsOperand(t *testing.T) {
 		t.Fatalf("the role template renders no variable:\n%s", body)
 	}
 
+	// A SUBSTRING IS NOT A READ. `billet_config` occurs inside
+	// `billet_config_document` and inside `billet_effective_config`, so a rename to
+	// any longer name satisfies a Contains check while reading nothing. Both links
+	// below match the emitted name only where it is a whole word.
+	readsEmission := func(source string) bool {
+		return slices.Contains(strings.FieldsFunc(source, func(r rune) bool {
+			return !(r == '_' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9')
+		}), AnsibleVar)
+	}
+
+	// A BINDING IS THE OPERAND FOLLOWED BY A COLON, in either spelling the role
+	// uses: a task's `vars:` entry writes `operand: value`, and a template lookup
+	// writes `template_vars={'operand': value}` with a quote in between.
+	bound := regexp.MustCompile(regexp.QuoteMeta(operand) + `['"]?\s*:`)
+
 	// LINK ONE: the emission is what the ordinary pass derives its configuration
 	// from. Without this, the role could read some other inventory variable and an
 	// emission would again set something nothing reads.
@@ -184,33 +201,35 @@ func TestAnsibleVarReachesTheRoleTemplateThroughItsOperand(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read the role's effective configuration entry: %v", err)
 	}
-	if !strings.Contains(string(effective), AnsibleVar) {
+	if !readsEmission(string(effective)) {
 		t.Errorf("the role derives its effective configuration without reading %q — "+
 			"an emission would set a variable nothing reads", AnsibleVar)
 	}
 
-	// LINK TWO: every caller binds the operand. A caller that renders the template
-	// without binding it is the fallback this operand exists to remove.
+	// LINK TWO: every INVOCATION binds the operand, counted per invocation rather
+	// than per file: two renders in one file and one binding between them would
+	// satisfy a whole-file check while the unbound one falls back to inventory.
 	tasks, err := filepath.Glob(filepath.Join(role, "tasks", "*.yml"))
 	if err != nil {
 		t.Fatalf("list the role's tasks: %v", err)
 	}
-	callers := 0
+	invocations := 0
 	for _, task := range tasks {
 		source, err := os.ReadFile(task)
 		if err != nil {
 			t.Fatalf("read %s: %v", task, err)
 		}
-		if !strings.Contains(string(source), "billet.yaml.j2") {
+		uses := strings.Count(string(source), "billet.yaml.j2")
+		if uses == 0 {
 			continue
 		}
-		callers++
-		if !strings.Contains(string(source), operand) {
-			t.Errorf("%s renders billet.yaml.j2 without binding %q",
-				filepath.Base(task), operand)
+		invocations += uses
+		if bindings := len(bound.FindAllString(string(source), -1)); bindings < uses {
+			t.Errorf("%s renders billet.yaml.j2 %d times but binds %q %d times",
+				filepath.Base(task), uses, operand, bindings)
 		}
 	}
-	if callers == 0 {
+	if invocations == 0 {
 		t.Errorf("no task renders billet.yaml.j2, so nothing pins the operand %q", operand)
 	}
 }

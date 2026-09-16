@@ -22,10 +22,6 @@
     billet_retirement_local_environment_file: /etc/billet/old-local.env
     billet_node_environment_files: [{path: /etc/billet/old-node.env, ignore_errors: false}]
     billet_endpoint_confirmation_controller: {host: old-controller}
-    billet_confirmation_revalidate: {host: old-controller}
-    billet_confirmation_failures: [old-controller]
-    billet_confirmation_candidates: [old-controller]
-    billet_confirmation_deployment: old-deployment
     billet_node_environment_opening: [old]
     billet_previous_config: {server: {}}
     billet_unit_operands: {old: {}}
@@ -93,10 +89,6 @@
       - billet_retirement_local_environment_file == ''
       - billet_node_environment_files == []
       - billet_endpoint_confirmation_controller == {}
-      - billet_confirmation_revalidate == {}
-      - billet_confirmation_failures == []
-      - billet_confirmation_candidates == []
-      - billet_confirmation_deployment == ''
       - billet_node_environment_opening is none
       - billet_previous_config == {}
       - billet_unit_operands == {}

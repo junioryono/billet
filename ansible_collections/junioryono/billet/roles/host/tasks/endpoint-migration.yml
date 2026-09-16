@@ -61,13 +61,6 @@
     billet_endpoint_receipt_bound: >-
       {{ (2 * (billet_migration_bracket_attempts | int) + 2) * (billet_migration_observation_bound | int) + (billet_guard_timeout | int) }}
   block:
-    - name: Keep the planned controller for immediate revalidation
-      ansible.builtin.set_fact:
-        billet_confirmation_revalidate: "{{ billet_endpoint_confirmation_controller }}"
-
-    - name: Revalidate confirmation before migration acts
-      ansible.builtin.include_tasks: confirmation-controller.yml
-
     - name: Run the endpoint migration
       ansible.builtin.command:
         argv: >-
@@ -121,8 +114,12 @@
     - name: Confirm and receipt the migration
       when: billet_endpoint_answer.outcome == 'migrated'
       vars:
-        billet_registration_executable: "{{ billet_endpoint_confirmation_controller.executable }}"
-        billet_registration_environment: "{{ billet_endpoint_confirmation_controller.environment_present == ['present'] }}"
+        billet_registration_executable: >-
+          {{ hostvars[billet_migration_controller].billet_managed_binary | default('', true)
+             if hostvars[billet_migration_controller].billet_managed_binary | default('', true) | length > 0
+             else '/usr/bin/billet' }}
+        billet_registration_environment: >-
+          {{ (hostvars[billet_migration_controller].billet_server_environment | default({})) | length > 0 }}
       block:
         - name: Keep the migration's evidence for the receipt
           ansible.builtin.tempfile:
@@ -147,7 +144,7 @@
         - name: Refuse a migration with no controller to confirm it
           ansible.builtin.assert:
             that:
-              - billet_endpoint_confirmation_controller | length > 0
+              - billet_migration_controller | default('') | length > 0
             fail_msg: >-
               The node was migrated to {{ billet_endpoint_answer.to }} and no controller is named to confirm its
               registration (billet_migration_controller); declare the control_plane group or set it, then converge
@@ -164,12 +161,12 @@
           ansible.builtin.command:
             argv: >-
               {{ ['timeout', '-k', '10', ((billet_registration_wait | int) + (billet_guard_timeout | int)) | string,
-                  billet_registration_executable, 'rollout', 'registration', '--config', billet_endpoint_confirmation_controller.config,
+                  billet_registration_executable, 'rollout', 'registration', '--config', '/etc/billet/billet.yaml',
                   '--node', billet_endpoint_answer.node, '--incarnation', billet_endpoint_answer.incarnation,
                   '--wait', (billet_registration_wait | string) ~ 's', '--json']
-                 + (['--environment-file', billet_endpoint_confirmation_controller.environment_files[0].path] if billet_registration_environment | bool else []) }}
+                 + (['--environment-file', billet_server_environment_path] if billet_registration_environment | bool else []) }}
             expand_argument_vars: false
-          delegate_to: "{{ billet_endpoint_confirmation_controller.host | default(inventory_hostname, true) }}"
+          delegate_to: "{{ billet_migration_controller | default(inventory_hostname, true) }}"
           register: billet_registration_raw
           changed_when: false
           failed_when: false
@@ -187,9 +184,8 @@
           ansible.builtin.assert:
             that:
               - billet_registration_answer.outcome == 'confirmed'
-              - billet_registration_answer.deployment.id == billet_endpoint_confirmation_controller.deployment
             fail_msg: >-
-              The controller {{ billet_endpoint_confirmation_controller.host }} did not confirm the migrated node's
+              The controller {{ billet_migration_controller }} did not confirm the migrated node's
               registration under incarnation {{ billet_endpoint_answer.incarnation }}:
               {{ 'the wait of ' ~ billet_registration_wait ~ 's ended with the node\'s current registration '
                  ~ (('under incarnation ' ~ billet_registration_answer.last.incarnation ~ ' (epoch ' ~ billet_registration_answer.last.epoch ~ ', ' ~ ('live' if billet_registration_answer.last.live else 'not live') ~ ')')
@@ -263,7 +259,7 @@
               The node {{ billet_endpoint_answer.node }} was migrated from {{ billet_endpoint_answer.from }}
               to {{ billet_endpoint_answer.to }} (invocation {{ billet_endpoint_answer.invocation_id }},
               incarnation {{ billet_endpoint_answer.incarnation }}), its registration confirmed by
-              {{ billet_endpoint_confirmation_controller.host }} at epoch {{ billet_registration_answer.epoch }}, and its receipt
+              {{ billet_migration_controller }} at epoch {{ billet_registration_answer.epoch }}, and its receipt
               {{ billet_receipt_answer.outcome }}.
       always:
         - name: Remove the migration's temporary files

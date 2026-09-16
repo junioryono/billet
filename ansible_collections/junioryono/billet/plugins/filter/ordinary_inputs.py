@@ -19,4 +19,4 @@ def checked(function):
 class FilterModule(object):
     def filters(self):
         return {name: checked(getattr(ordinary_inputs, name)) for name in
-                ['environment_specs', 'unit_results', 'operation_document', 'controller_candidate']}
+                ['environment_specs', 'unit_results', 'operation_document']}

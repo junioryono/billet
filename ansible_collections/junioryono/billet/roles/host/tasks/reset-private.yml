@@ -33,10 +33,6 @@
     billet_retirement_local_environment_file: ""
     billet_node_environment_files: []
     billet_endpoint_confirmation_controller: {}
-    billet_confirmation_revalidate: {}
-    billet_confirmation_failures: []
-    billet_confirmation_candidates: []
-    billet_confirmation_deployment: ""
     billet_node_environment_opening: null
     billet_previous_config: {}
     billet_endpoint_rendering: ""

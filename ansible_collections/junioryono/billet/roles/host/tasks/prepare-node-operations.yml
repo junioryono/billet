@@ -14,6 +14,21 @@
       - not billet_binary_upgrade | default(false) | bool
     fail_msg: Retained operation preparation requires explicit provider effects and a predicted node restart decision.
 
+# A PROVIDER PLAN MAY NOT RESTATE A UNIT THE ROLE ALREADY OWNS. The document is
+# rendered from the merged inventory while account.yml installs from
+# billet_unit_operands alone, so an overriding key would make the binding
+# describe bytes or a destination that nothing installs — admission for one unit
+# and the writing of another.
+- name: Refuse a provider plan that restates an admitted unit
+  ansible.builtin.assert:
+    that:
+      - billet_unit_operands.keys() | list | intersect(billet_retirement_provider_plan.units.keys() | list) == []
+    fail_msg: >-
+      The provider plan restates
+      {{ billet_unit_operands.keys() | list | intersect(billet_retirement_provider_plan.units.keys() | list) | join(', ') }},
+      which the role already renders. One inventory must describe each unit, or the
+      admitted document and the installed file are two different things.
+
 - name: Begin the ordinary filesystem and service operation inventory
   ansible.builtin.set_fact:
     billet_retirement_planned_filesystem: "{{ billet_retirement_provider_plan.filesystem }}"

@@ -83,35 +83,6 @@ def main():
     changed['units'][0]['contents'] = 'unbound'
     refuses(lambda: inputs.operation_document('node: {}\n', changed, 'ci-1', 'control-a', '2' * 32), 'digest')
 
-    inspect = json.loads((HERE / 'fixtures/release-inspect/postgres-controller-guarded.json').read_text())
-    status = json.loads((HERE / 'fixtures/rollout-status/no-rollout.json').read_text())
-    def select(i=inspect, s=status):
-        return inputs.controller_candidate(i, s, 'survivor', '/usr/bin/billet', '/etc/billet/billet.yaml', 'd' * 32, 'ci-1')
-    selected = select()
-    assert selected['host'] == 'survivor'
-    assert selected['environment_files'][0]['path'] == '/var/lib/billet-fixture/server.env'
-    for path, value in [
-        (['config', 'readable'], False), (['services', 'server', 'main_pid'], 0),
-        (['services', 'server', 'invocation_id'], None), (['services', 'server', 'running_sha256'], 'c' * 64),
-        (['config_binding'], False), (['installed_config', 'has_server'], False),
-        (['host', 'retirement'], {'phase': 'done'}), (['host', 'deployment_id'], 'e' * 32),
-        (['services', 'server', 'active_state'], 'inactive'), (['services', 'server', 'need_daemon_reload'], True),
-        (['services', 'server', 'environment_file_changed_since_start'], {'unknown': 'unreadable'}),
-        (['services', 'server', 'config_changed_since_start'], True), (['executable', 'process_bound'], False),
-        (['executable', 'installed_path'], '/different/billet'),
-        (['transaction', 'converge_guard', 'holder'], 'another-holder'),
-        (['transaction', 'converge_guard', 'recovery_pointer'], True),
-    ]:
-        altered = copy.deepcopy(inspect)
-        leaf = altered
-        for key in path[:-1]:
-            leaf = leaf[key]
-        leaf[path[-1]] = value
-        refuses(lambda: select(altered), '')
-    wrong = copy.deepcopy(status)
-    wrong['deployment']['bound'] = False
-    refuses(lambda: select(inspect, wrong), 'unbound')
-
     # The environment module owns credentials only while reading or executing;
     # the test writes empty files, so no fixture contains credential contents.
     package = 'ansible_collections.junioryono.billet.plugins.module_utils'
