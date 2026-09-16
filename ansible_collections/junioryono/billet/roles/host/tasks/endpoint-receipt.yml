@@ -20,9 +20,9 @@
     - not billet_endpoint_compat | default(false) | bool
     - not billet_endpoint_no_billet | default(false) | bool
     - billet_endpoint_answerer | default('') | length > 0
-    - billet_config is mapping
-    - billet_config.node is defined
-    - billet_config.node is not none
+    - billet_effective_config is mapping
+    - billet_effective_config.node is defined
+    - billet_effective_config.node is not none
     - billet_node_should_run | default(false) | bool
   vars:
     # THE MANAGED BINARY ONLY ONCE THIS CONVERGE'S TRANSACTION COMMITTED the

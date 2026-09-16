@@ -39,7 +39,7 @@
         resolved_postgres: >-
           {{ billet_configured_server_state_dir }}
       vars:
-        billet_config:
+        billet_effective_config:
           server:
             identity_dir: /var/lib/billet/identity
             state:
@@ -52,7 +52,7 @@
         resolved_sqlite: >-
           {{ billet_configured_server_state_dir }}
       vars:
-        billet_config:
+        billet_effective_config:
           server:
             state_dir: /srv/billet/server
 
@@ -61,7 +61,7 @@
         resolved_default: >-
           {{ billet_configured_server_state_dir }}
       vars:
-        billet_config:
+        billet_effective_config:
           server:
             listen: 127.0.0.1:7717
 
@@ -70,7 +70,7 @@
         resolved_nodeonly: >-
           {{ billet_configured_server_state_dir }}
       vars:
-        billet_config:
+        billet_effective_config:
           node:
             state_dir: /var/lib/billet/node
 
@@ -105,7 +105,7 @@
       ansible.builtin.set_fact:
         backend_postgres: "{{ billet_configured_state_backend }}"
       vars:
-        billet_config:
+        billet_effective_config:
           server:
             identity_dir: /var/lib/billet/identity
             state:
@@ -117,7 +117,7 @@
       ansible.builtin.set_fact:
         backend_shorthand: "{{ billet_configured_state_backend }}"
       vars:
-        billet_config:
+        billet_effective_config:
           server:
             state_dir: /var/lib/billet/server
 
@@ -125,7 +125,7 @@
       ansible.builtin.set_fact:
         backend_nodeonly: "{{ billet_configured_state_backend }}"
       vars:
-        billet_config:
+        billet_effective_config:
           node:
             state_dir: /var/lib/billet/node
 
@@ -159,7 +159,7 @@
         # gets the assertion wrong — rather than failing to render, which would
         # be a mutation nobody could tell from a typo. In the role this variable
         # is always defined.
-        billet_config:
+        billet_effective_config:
           server:
             identity_dir: /var/lib/billet/identity
             state:
@@ -179,7 +179,7 @@
         # gets the assertion wrong — rather than failing to render, which would
         # be a mutation nobody could tell from a typo. In the role this variable
         # is always defined.
-        billet_config:
+        billet_effective_config:
           server:
             identity_dir: /var/lib/billet/identity
             state:

@@ -1,0 +1,22 @@
+---
+- name: Supply the route and the production original-policy calculation
+  ansible.builtin.set_fact:
+    billet_requested_server_should_run: "{{ billet_gate_requested['ansible.builtin.set_fact'].billet_requested_server_should_run }}"
+    billet_retirement_route: "{{ billet_gate_policy.route }}"
+    billet_retirement_bypass: "{{ billet_gate_policy.bypass }}"
+    billet_retirement_node_verified: "{{ billet_gate_policy.verified }}"
+    billet_authority_closed: false
+
+- name: Apply the production effective server policy
+  ansible.builtin.include_role:
+    name: junioryono.billet.host
+    tasks_from: effective-server-policy
+
+- name: Require effective start policy without overwriting the original request
+  ansible.builtin.assert:
+    that:
+      - billet_server_effective == billet_gate_policy.effective
+      - billet_server_should_run == billet_gate_policy.run
+      - billet_requested_server_should_run == (billet_gate_policy.enabled and not billet_gate_policy.prepare)
+      - billet_enable_server == billet_gate_policy.enabled
+      - billet_server_prepare_only == billet_gate_policy.prepare

@@ -133,7 +133,7 @@
       {{
         billet_upgrade_manifest.node_state_dir
         if billet_interrupted_upgrade | bool
-        else billet_config.get('node', {}).get('state_dir', '/var/lib/billet/node')
+        else billet_effective_config.get('node', {}).get('state_dir', '/var/lib/billet/node')
       }}
 
 # REFUSED HERE RATHER THAN AT `billet check`, because by then the role has
@@ -143,8 +143,8 @@
 - name: Refuse a config naming both server.state_dir and server.identity_dir
   ansible.builtin.assert:
     that:
-      - not (billet_config.get('server', {}).get('identity_dir') and
-             billet_config.get('server', {}).get('state_dir'))
+      - not (billet_effective_config.get('server', {}).get('identity_dir') and
+             billet_effective_config.get('server', {}).get('state_dir'))
     fail_msg: >-
       billet_config.server names both state_dir and identity_dir. They are two
       spellings of the same directory and only one may be written: state_dir

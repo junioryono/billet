@@ -264,7 +264,7 @@ billet_guest_host_tcp_ports:
 billet_guest_host_udp_ports:
   - 53
   - 67
-billet_image_verify_port: "{{ billet_config.node.firecracker.image_verify_port | default(7719, true) }}"
+billet_image_verify_port: "{{ billet_effective_config.node.firecracker.image_verify_port | default(7719, true) }}"
 
 billet_ceph_enabled: true
 billet_ceph_bootstrap: false

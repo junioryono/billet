@@ -23,7 +23,7 @@ table inet billet_guard {
     type filter hook input priority filter; policy accept;
     iifname @guest_ifaces tcp dport { {{ billet_guest_host_tcp_ports | join(', ') }} } accept
     iifname @guest_ifaces udp dport { {{ billet_guest_host_udp_ports | join(', ') }} } accept
-    iifname {{ billet_config.node.firecracker.bridge | to_json }} tcp dport {{ billet_image_verify_port }} accept comment "billet image verification"
+    iifname {{ billet_effective_config.node.firecracker.bridge | to_json }} tcp dport {{ billet_image_verify_port }} accept comment "billet image verification"
     iifname @guest_ifaces counter drop comment "billet guest -> host"
   }
 

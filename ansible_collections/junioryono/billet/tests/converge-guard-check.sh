@@ -857,6 +857,11 @@ cat >"$work/play-endpoint.yml" <<'PLAY'
           become: true
           when: billet_installed_config.stat.exists
 
+        - name: Supply the ordinary effective input to the isolated endpoint entry
+          ansible.builtin.set_fact:
+            billet_effective_config: "{{ billet_config }}"
+            billet_effective_ready: true
+
         - name: Decide the endpoint migration
           ansible.builtin.include_role:
             name: junioryono.billet.host

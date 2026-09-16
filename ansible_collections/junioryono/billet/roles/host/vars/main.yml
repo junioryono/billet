@@ -41,8 +41,8 @@ billet_migration_observation_bound: 30
 billet_migration_probe_bound: 60
 billet_migration_start_bound: 150
 
-# billet_configured_server_state_dir is the directory THIS RUN'S billet_config
-# points the control plane's identity at.
+# billet_configured_server_state_dir is the directory THIS RUN'S EFFECTIVE
+# configuration points the control plane's identity at.
 #
 # TWO SPELLINGS OF ONE DIRECTORY, AND A POSTGRESQL DEPLOYMENT HAS ONLY THE
 # SECOND. `state_dir` is the shorthand — the ledger and the identity in one place
@@ -58,29 +58,41 @@ billet_migration_start_bound: 150
 # finds its own identity directory outside ReadWritePaths under
 # ProtectSystem=strict.
 #
+# THE ABSENT-SERVER DEFAULT STAYS UNTIL THE RETAINED ROUTE REFUSES THE
+# TRANSACTION. §3.2 of the 5d design wants a serverless effective configuration
+# to have no operative server path, and that is safe only once a retained host
+# refuses the role's binary transaction (§2.2). It does not yet: the transaction
+# block in services.yml is gated on billet_binary_upgrade alone, NOT on server
+# enablement, so a node-only host upgrading its binary runs it — and an empty
+# answer here fences `/billet.maintenance` at the filesystem root and `cp -a ""`.
+# Commit 3 introduces the refusal and the emptiness together.
+#
 # HERE RATHER THAN INLINE so there is ONE definition: upgrade-inspect.yml sets
 # the candidate fact from it and the server unit template reads that fact, and a
-# test can exercise this expression against a config directly. account.yml has a
-# near-twin that reads the INSTALLED file rather than this run's request; the two
-# cannot share, and both must read both spellings.
+# test can exercise this expression against a configuration directly. account.yml
+# has a near-twin that reads the INSTALLED file rather than this run's request;
+# the two cannot share, and both must read both spellings.
 billet_configured_server_state_dir: >-
   {{
-    billet_config.get('server', {}).get('identity_dir')
-    or billet_config.get('server', {}).get('state_dir')
+    billet_effective_config.get('server', {}).get('identity_dir')
+    or billet_effective_config.get('server', {}).get('state_dir')
     or '/var/lib/billet/server'
   }}
 
-# billet_configured_state_backend is where THIS RUN'S config keeps the ledger.
+# billet_configured_state_backend is where THIS RUN'S EFFECTIVE configuration
+# keeps the ledger.
 #
 # `sqlite` FOR EVERY CONFIG THAT SAYS NOTHING, which is the same answer the
 # config layer fills in — a `state_dir` shorthand IS `backend: sqlite`, and a
 # node-only host has no server section and no ledger to have an opinion about.
 # Naming the default rather than leaving it empty matters because the refusals
 # that read this are written as "not sqlite": an empty answer would refuse every
-# ordinary host.
+# ordinary host. The preparation decision has its own operand
+# (billet_preparation_state_backend), which IS empty for an absent server and
+# whose refusals are written to admit that.
 billet_configured_state_backend: >-
   {{
-    billet_config.get('server', {}).get('state', {}).get('backend')
+    billet_effective_config.get('server', {}).get('state', {}).get('backend')
     or 'sqlite'
   }}
 

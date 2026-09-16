@@ -1,0 +1,94 @@
+---
+# Source operands and task conditions are read from the production tasks, as in
+# host-upgrade-order.yml. No host operation is replaced by a success fixture.
+- name: Require original public policy before retirement masking
+  ansible.builtin.assert:
+    that:
+      - >-
+        (billet_gate_main_source | selectattr('name', 'equalto', 'Derive whether the billet server may run on this host') | first)
+        ['ansible.builtin.set_fact'].billet_requested_server_should_run is sameas true
+      - >-
+        (billet_gate_request_source | selectattr('name', 'equalto', 'Require a policy that leaves the retiring server stopped') | first)
+        ['ansible.builtin.assert'].that == 'billet_requested_server_should_run | default(none) is sameas false'
+  vars:
+    billet_enable_server: true
+    billet_server_prepare_only: false
+    billet_server_effective: false
+    billet_server_should_run: false
+
+- name: Require full desired collection in each host's own context
+  ansible.builtin.assert:
+    that:
+      - "'hostvars[item].billet_config' in billet_gate_collect_source"
+      - "'billet_retirement_collect_vars.billet_config.node' in billet_gate_collect_host_source"
+      - >-
+        "template_vars={'billet_config_document': billet_retirement_collect_vars.billet_config}"
+        in billet_gate_collect_host_source
+      - "'billet_effective_config' not in billet_gate_collect_source"
+      - "'billet_effective_config' not in billet_gate_collect_host_source"
+      - >-
+        "template_vars={'billet_config_document': billet_effective_config}"
+        in billet_gate_endpoint_source
+      - >-
+        (billet_gate_account_source | selectattr('name', 'equalto', 'Stage candidate configuration for the upgrade transaction') | first)
+        .vars.billet_config_document == billet_effective_config
+      - >-
+        (billet_gate_account_source | selectattr('name', 'equalto', 'Render billet configuration') | first)
+        .vars.billet_config_document == billet_effective_config
+  vars:
+    billet_config: {server: {state_dir: /var/lib/billet/inventory}}
+
+- name: Require retirement to remain closed to retained ordinary convergence
+  ansible.builtin.assert:
+    that:
+      - billet_gate_main_source[-1].when == 'not billet_retirement_bypass | bool'
+      - billet_gate_main_source[-1].block[0]['ansible.builtin.import_tasks'] == 'effective-config.yml'
+      - billet_gate_main_source[-1].block[0].when == 'not billet_interrupted_upgrade | bool'
+      - >-
+        (billet_gate_retirement_source | selectattr('name', 'equalto', 'Admit the ordinary route or its unverified check-mode preview') | first)
+        .when == "billet_retirement_route == 'ordinary' or billet_retirement_check_preview | bool"
+      - >-
+        (billet_gate_retirement_source | selectattr('name', 'equalto', 'Close the ordinary boundary on every other route') | first)
+        .when == "billet_retirement_route != 'ordinary' and not billet_retirement_check_preview | bool"
+      - "'billet_retirement_node_ordinary: true' not in lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/retirement.yml')"
+
+# The ordinary tail stays shared: node-only and controller-plus-node inputs
+# select the same imports in the same order under their existing conditions.
+- name: Require the ordinary imports to retain their order
+  ansible.builtin.assert:
+    that:
+      - >-
+        billet_gate_main_source[-1].block | selectattr('ansible.builtin.import_tasks', 'defined') |
+        map(attribute='ansible.builtin.import_tasks') | list ==
+        ['effective-config.yml', 'service-account.yml', 'upgrade-inspect.yml', 'ledger-mount-name.yml',
+         'upgrade-recover.yml', 'upgrade-fresh-converge.yml', 'network-disable.yml', 'account.yml',
+         'service-account.yml', 'ledger-mount.yml', 'cache-tls.yml', 'firecracker.yml', 'network.yml',
+         'ceph.yml', 'alerts.yml', 'images-refresh.yml', 'backup.yml', 'services.yml']
+      - billet_gate_main_source[-1].block[-1]['ansible.builtin.meta'] == 'flush_handlers'
+
+- name: Require ordinary work to retain each existing condition
+  ansible.builtin.assert:
+    that:
+      - billet_gate_task.when | default([]) == item.condition
+  vars:
+    billet_gate_task: "{{ billet_gate_main_source[-1].block | selectattr('name', 'equalto', item.name) | first }}"
+  loop:
+    - {name: Record the service account and provision the authority locks on an existing installation, condition: []}
+    - {name: Refuse a guest network on a provider that has none, condition: 'not billet_firecracker_enabled'}
+    - {name: Configure billet account and files, condition: []}
+    - {name: Record the service account and provision the authority locks on a fresh host, condition: []}
+    - {name: Mount the control-plane ledger volume fail closed, condition: 'billet_ledger_volume_id | length > 0'}
+    - name: Install the EC2 cache TLS material
+      condition:
+        - billet_effective_config.node is defined
+        - (billet_effective_config.node.cache | default({})).tls_cert is defined
+    - {name: Configure Firecracker, condition: billet_firecracker_enabled}
+    - {name: Configure guest networking, condition: billet_firecracker_enabled}
+    - {name: Configure Ceph, condition: billet_ceph_enabled}
+    - {name: Remove disabled Ceph kernel module policy, condition: 'not billet_ceph_enabled'}
+    - {name: Configure or remove Ceph health alerts, condition: []}
+    - {name: Configure or remove the guest image refresh timer, condition: []}
+    - {name: Configure or remove the deployment backup timer, condition: []}
+    - {name: Configure billet services, condition: []}
+  loop_control:
+    label: "{{ item.name }}"

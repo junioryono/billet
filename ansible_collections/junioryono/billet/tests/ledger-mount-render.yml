@@ -12,7 +12,7 @@
     template_dir: "{{ playbook_dir }}/../roles/host/templates"
     billet_service_user: billet
     billet_service_group: billet
-    billet_config:
+    billet_effective_config:
       server:
         state_dir: /var/lib/billet/server
     # The role resolves this once, in upgrade-inspect.yml, from `identity_dir`

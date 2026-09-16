@@ -1,0 +1,379 @@
+---
+- name: Effective configuration preserves ordinary input and projects only admitted retained input
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    billet_gate_node:
+      name: reference-node
+      provider: docker
+      state_dir: /var/lib/billet/reference-node
+      server: {github: nested-value, targets: [one, two], backup: null}
+    billet_gate_survivors:
+      node: "{{ billet_gate_node }}"
+      sites: [{name: reference-site, backup: {server: unchanged}}]
+      release: {automatic: false}
+      extension: {number: 7, empty: '', text: "first\nsecond\n", unicode: 'café', list: [false, null, 0]}
+    billet_gate_controller:
+      server: {identity_dir: /var/lib/billet/reference-identity, state: {backend: postgres}}
+      github: {private_key_path: /etc/billet/reference-key.pem}
+      targets: [{name: reference-target, private_key_path: /etc/billet/reference-target.pem}]
+      backup: {s3: {bucket: reference-backup}}
+  tasks:
+    - name: Exercise ordinary and retained configuration routes
+      ansible.builtin.include_tasks: effective-inputs-case.yml
+      vars:
+        billet_config: "{{ billet_gate_survivors | combine(billet_gate_controller if billet_gate_case.controller else {}) }}"
+      loop:
+        - {name: node-only, retained: false, controller: false, route: ordinary}
+        - {name: controller-and-node, retained: false, controller: true, route: ordinary}
+        - {name: confirmed-cancellation, retained: false, controller: true, route: cancel}
+        - {name: retained-projection, retained: true, controller: true, route: continue}
+      loop_control:
+        loop_var: billet_gate_case
+        label: "{{ billet_gate_case.name }}"
+
+- name: Operative readers use effective input when inventory disagrees
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    billet_gate_role: "{{ playbook_dir }}/../roles/host"
+    billet_gate_main: "{{ lookup('ansible.builtin.file', billet_gate_role + '/tasks/main.yml') | from_yaml }}"
+    billet_gate_ordinary: "{{ billet_gate_main[-1].block }}"
+    billet_gate_account: "{{ lookup('ansible.builtin.file', billet_gate_role + '/tasks/account.yml') | from_yaml }}"
+    billet_gate_inspect: "{{ lookup('ansible.builtin.file', billet_gate_role + '/tasks/upgrade-inspect.yml') | from_yaml }}"
+    billet_gate_cache: "{{ lookup('ansible.builtin.file', billet_gate_role + '/tasks/cache-tls.yml') | from_yaml }}"
+    billet_gate_network: "{{ lookup('ansible.builtin.file', billet_gate_role + '/tasks/network-disable.yml') | from_yaml }}"
+    billet_gate_receipt: "{{ lookup('ansible.builtin.file', billet_gate_role + '/tasks/endpoint-receipt.yml') | from_yaml }}"
+    billet_gate_defaults: "{{ lookup('ansible.builtin.file', billet_gate_role + '/defaults/main.yml') | from_yaml }}"
+    billet_gate_keys: "{{ billet_gate_ordinary | selectattr('name', 'equalto', \"Decide what this host's config asks of the GitHub App key\") | first }}"
+    billet_gate_targets: "{{ billet_gate_ordinary | selectattr('name', 'equalto', \"Decide what this host's config asks of each further target's App key\") | first }}"
+    billet_gate_provider: "{{ billet_gate_ordinary | selectattr('name', 'equalto', 'Assert the provisioning flags match the configured provider') | first }}"
+    billet_gate_candidates: "{{ billet_gate_inspect | selectattr('name', 'equalto', 'Resolve recovery identity and candidate state directories') | first }}"
+    billet_gate_effective_config:
+      server: {identity_dir: /var/lib/billet/effective-identity, state: {backend: postgres}}
+      github: {private_key_path: /etc/billet/effective-key.pem}
+      targets: [{name: effective-target, private_key_path: /etc/billet/effective-target.pem}]
+      node:
+        provider: firecracker
+        state_dir: /var/lib/billet/effective-node
+        firecracker: {bridge: effective0, image_verify_port: 8729}
+        cache: {tls_cert: /etc/billet/effective-cache/cert.pem, tls_key: /etc/billet/effective-cache/key.pem}
+    billet_config:
+      server: {state_dir: /var/lib/billet/desired-server, state: {backend: sqlite}}
+      github: {private_key_path: /etc/billet/desired-key.pem}
+      targets: [{name: desired-target, private_key_path: /etc/billet/desired-target.pem}]
+      node:
+        provider: docker
+        state_dir: /var/lib/billet/desired-node
+        firecracker: {bridge: desired0, image_verify_port: 9739}
+        cache: {tls_cert: /etc/billet/desired-cache/cert.pem, tls_key: /etc/billet/desired-cache/key.pem}
+    billet_interrupted_upgrade: false
+    billet_service_user: billet
+    billet_service_group: billet
+    billet_firecracker_enabled: true
+    billet_ceph_enabled: false
+    billet_exclusion_darwin: false
+    billet_endpoint_compat: false
+    billet_endpoint_no_billet: false
+    billet_endpoint_answerer: /usr/bin/billet
+    billet_node_should_run: true
+    billet_image_verify_port: "{{ billet_gate_defaults.billet_image_verify_port }}"
+    billet_networks: [{name: effective0, address: 172.31.0.1, prefix: 24}]
+    billet_guest_denied_ipv4: [10.0.0.0/8]
+    billet_guest_denied_ipv6: ['fc00::/7']
+    billet_guest_host_tcp_ports: [53, 7718]
+    billet_guest_host_udp_ports: [53, 67]
+    billet_disable_network_names: [old0]
+    billet_github_target_keys: []
+    billet_github_target_key_srcs: {}
+  tasks:
+    - name: Supply this reader case's effective document
+      ansible.builtin.set_fact:
+        billet_effective_config: "{{ billet_gate_effective_config }}"
+
+    - name: Load the production ordinary aliases
+      ansible.builtin.include_vars:
+        file: "{{ billet_gate_role }}/vars/main.yml"
+
+    - name: Resolve the production key facts for validation
+      ansible.builtin.set_fact:
+        billet_github_key_path: "{{ billet_gate_keys['ansible.builtin.set_fact'].billet_github_key_path }}"
+        billet_github_key_path_is_string: "{{ billet_gate_keys['ansible.builtin.set_fact'].billet_github_key_path_is_string }}"
+
+    - name: Require every ordinary alias and direct path reader to answer from E
+      ansible.builtin.assert:
+        that:
+          - billet_image_verify_port | int == 8729
+          - billet_configured_server_state_dir == '/var/lib/billet/effective-identity'
+          - billet_configured_state_backend == 'postgres'
+          - billet_gate_candidates['ansible.builtin.set_fact'].billet_candidate_server_state_dir == '/var/lib/billet/effective-identity'
+          - billet_gate_candidates['ansible.builtin.set_fact'].billet_candidate_node_state_dir == '/var/lib/billet/effective-node'
+          - billet_gate_keys['ansible.builtin.set_fact'].billet_github_key_required | bool
+          - billet_gate_keys['ansible.builtin.set_fact'].billet_github_key_path == '/etc/billet/effective-key.pem'
+          - billet_gate_keys['ansible.builtin.set_fact'].billet_github_key_path_is_string | bool
+          - billet_gate_targets.loop == billet_effective_config.targets
+          - billet_gate_cache[1].loop == ['/etc/billet/effective-cache', '/etc/billet/effective-cache']
+          - billet_gate_cache[3]['ansible.builtin.copy'].dest == '/etc/billet/effective-cache/cert.pem'
+          - billet_gate_cache[4]['ansible.builtin.copy'].dest == '/etc/billet/effective-cache/key.pem'
+          - "'a firecracker node' in billet_gate_network[2]['ansible.builtin.fail'].msg"
+          - "'as a firecracker node' in billet_gate_network[2]['ansible.builtin.fail'].msg"
+
+    - name: Require effective key presence even when desired input has none
+      ansible.builtin.assert:
+        that:
+          - billet_gate_keys['ansible.builtin.set_fact'].billet_github_key_required | bool
+      vars:
+        billet_config: {}
+
+    - name: Require effective key typing even when desired input is malformed
+      ansible.builtin.assert:
+        that:
+          - billet_gate_keys['ansible.builtin.set_fact'].billet_github_key_path_is_string | bool
+      vars:
+        billet_config: {github: {private_key_path: 17}}
+
+    - name: Exercise the effective host validation beside empty desired input
+      ansible.builtin.assert:
+        that: "{{ (billet_gate_ordinary | selectattr('name', 'equalto', 'Validate billet host inputs') | first)['ansible.builtin.assert'].that }}"
+      vars:
+        billet_config: {}
+        billet_ceph_bootstrap: false
+
+    - name: Exercise the effective target validation beside malformed desired targets
+      ansible.builtin.assert:
+        that: "{{ (billet_gate_ordinary | selectattr('name', 'equalto', 'Refuse a targets list billet will not load') | first)['ansible.builtin.assert'].that }}"
+      vars:
+        billet_config: {targets: malformed}
+
+    - name: Exercise the effective GitHub validation beside malformed desired GitHub input
+      ansible.builtin.assert:
+        that: "{{ (billet_gate_ordinary | selectattr('name', 'equalto', 'Refuse a github block billet will not load') | first)['ansible.builtin.assert'].that }}"
+      vars:
+        billet_config: {github: malformed}
+        billet_github_key_path_is_string: "{{ billet_gate_keys['ansible.builtin.set_fact'].billet_github_key_path_is_string }}"
+        billet_github_key_path: "{{ billet_gate_keys['ansible.builtin.set_fact'].billet_github_key_path }}"
+
+    - name: Exercise the effective server spelling validation beside contradictory desired spellings
+      ansible.builtin.assert:
+        that: "{{ (billet_gate_inspect | selectattr('name', 'equalto', 'Refuse a config naming both server.state_dir and server.identity_dir') | first)['ansible.builtin.assert'].that }}"
+      vars:
+        billet_config: {server: {state_dir: /var/lib/billet/desired-state, identity_dir: /var/lib/billet/desired-identity}}
+
+    - name: Exercise the cache import conditions beside desired input with no cache
+      ansible.builtin.assert:
+        that: "{{ (billet_gate_ordinary | selectattr('name', 'equalto', 'Install the EC2 cache TLS material') | first).when }}"
+      vars:
+        billet_config: {}
+
+    - name: Exercise the production provider validation against contradictory inventory
+      ansible.builtin.assert:
+        that: "{{ billet_gate_provider['ansible.builtin.assert'].that }}"
+
+    - name: Exercise the production receipt presence conditions against server-only inventory
+      ansible.builtin.assert:
+        that: "{{ billet_gate_receipt[0].when }}"
+      vars:
+        billet_config: {server: {state_dir: /var/lib/billet/desired-server}}
+
+    - name: Render the operative node and firewall templates
+      ansible.builtin.set_fact:
+        billet_gate_node_unit: "{{ lookup('ansible.builtin.template', billet_gate_role + '/templates/billet-node.service.j2') }}"
+        billet_gate_firewall: "{{ lookup('ansible.builtin.template', billet_gate_role + '/templates/network.nft.j2') }}"
+
+    - name: Require the exact effective sandbox and firewall operands
+      ansible.builtin.assert:
+        that:
+          - "'ReadWritePaths=-/etc/billet/tls -/srv/jailer \"/var/lib/billet/effective-node\"' in billet_gate_node_unit"
+          - "'desired-node' not in billet_gate_node_unit"
+          - "'iifname \"effective0\" tcp dport 8729 accept' in billet_gate_firewall"
+          - "'desired0' not in billet_gate_firewall"
+          - "'9739' not in billet_gate_firewall"
+
+    - name: Exercise the selected preparation reader with different desired and effective ledgers
+      ansible.builtin.include_role:
+        name: junioryono.billet.host
+        tasks_from: prepare-desired-ledger
+      vars:
+        billet_binary_upgrade: true
+        billet_exclusion_managed_pre_r: false
+
+    - name: Require preparation to retain its desired operand
+      ansible.builtin.assert:
+        that:
+          - billet_preparation_state_backend == 'sqlite'
+          - billet_configured_state_backend == 'postgres'
+
+    - name: Exercise the explicit serializer independently of both global configurations
+      ansible.builtin.set_fact:
+        billet_gate_serialized: "{{ lookup('ansible.builtin.template', billet_gate_role + '/templates/billet.yaml.j2', template_vars={'billet_config_document': billet_gate_document}) }}"
+      vars:
+        billet_gate_document: {node: {name: command-owned, state_dir: /var/lib/billet/recorded-node}, opaque: "one\ntwo\n"}
+
+    - name: Render the same operand beside different global configurations
+      ansible.builtin.set_fact:
+        billet_gate_serialized_again: "{{ lookup('ansible.builtin.template', billet_gate_role + '/templates/billet.yaml.j2', template_vars={'billet_config_document': billet_gate_document, 'billet_config': {'wrong': 'inventory'}, 'billet_effective_config': {'wrong': 'effective'}}) }}"
+      vars:
+        billet_gate_document: {node: {name: command-owned, state_dir: /var/lib/billet/recorded-node}, opaque: "one\ntwo\n"}
+
+    - name: Require the serializer operand to decide every rendered byte
+      ansible.builtin.assert:
+        that:
+          - billet_gate_serialized == billet_gate_serialized_again
+          - (billet_gate_serialized | from_yaml) == billet_gate_document
+          - "'effective' not in billet_gate_serialized"
+          - "'desired' not in billet_gate_serialized"
+      vars:
+        billet_gate_document: {node: {name: command-owned, state_dir: /var/lib/billet/recorded-node}, opaque: "one\ntwo\n"}
+
+    - name: Initialize the missing-operand refusal witness
+      ansible.builtin.set_fact:
+        billet_gate_missing_operand_refused: false
+
+    - name: Exercise the serializer without its explicit operand
+      block:
+        - name: Render with only the global configurations in scope
+          ansible.builtin.set_fact:
+            billet_gate_unbound_rendering: "{{ lookup('ansible.builtin.template', billet_gate_role + '/templates/billet.yaml.j2') }}"
+      rescue:
+        - name: Require the refusal to name the missing serializer operand
+          ansible.builtin.assert:
+            that: "'billet_config_document' in ansible_failed_result.msg"
+        - name: Record the missing-operand refusal
+          ansible.builtin.set_fact:
+            billet_gate_missing_operand_refused: true
+
+    - name: Require the serializer to refuse an implicit global operand
+      ansible.builtin.assert:
+        that: billet_gate_missing_operand_refused
+
+- name: Configuration readers retain their route and operand contracts
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    billet_gate_main_source: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/main.yml') | from_yaml }}"
+    billet_gate_account_source: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/account.yml') | from_yaml }}"
+    billet_gate_retirement_source: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/retirement.yml') | from_yaml }}"
+    billet_gate_request_source: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/retirement-request.yml') | from_yaml }}"
+    billet_gate_collect_source: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/retirement-collect.yml') }}"
+    billet_gate_collect_host_source: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/retirement-collect-host.yml') }}"
+    billet_gate_endpoint_source: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/endpoint-decision.yml') }}"
+  tasks:
+    - name: Exercise the reader call sites and ordinary task ordering
+      ansible.builtin.include_tasks: effective-inputs-order.yml
+
+- name: Server and node destinations are split, and the node invariant refuses on its own
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    billet_gate_role: "{{ playbook_dir }}/../roles/host"
+    billet_gate_account: "{{ lookup('ansible.builtin.file', billet_gate_role + '/tasks/account.yml') | from_yaml }}"
+    billet_gate_dirs: "{{ billet_gate_account | selectattr('name', 'equalto', 'Create billet directories') | first }}"
+    billet_gate_previous_server: "{{ billet_gate_account | selectattr('name', 'equalto', 'Resolve the installed server state directory') | first }}"
+    billet_gate_previous_node: "{{ billet_gate_account | selectattr('name', 'equalto', 'Resolve the installed node state directory') | first }}"
+    billet_gate_node_invariant: "{{ billet_gate_account | selectattr('name', 'equalto', 'Refuse to move installed node state implicitly') | first }}"
+    billet_config: {server: {identity_dir: /var/lib/billet/inventory-identity}, node: {state_dir: /var/lib/billet/inventory-node}}
+    billet_candidate_server_state_dir: "{{ billet_configured_server_state_dir }}"
+    billet_candidate_node_state_dir: /var/lib/billet/effective-node
+    billet_previous_config_file:
+      content: "{{ {'node': {'state_dir': '/var/lib/billet/effective-node'}} | to_yaml | b64encode }}"
+    billet_service_user: billet
+    billet_service_group: billet
+    billet_firecracker_stage: /var/cache/billet-provision
+    billet_interrupted_upgrade: false
+  tasks:
+    - name: Supply the serverless effective document
+      ansible.builtin.set_fact:
+        billet_effective_config: {node: {state_dir: /var/lib/billet/effective-node}}
+
+    - name: Load the production path aliases
+      ansible.builtin.include_vars:
+        file: "{{ billet_gate_role }}/vars/main.yml"
+
+    # THE SERVER'S DESTINATIONS ARE THEIR OWN LIST, which is what lets commit 3
+    # drop them for a retained host without touching the node's. The absent-server
+    # EMPTINESS of that list is deferred with the alias it reads: see
+    # vars/main.yml, and the role's binary transaction that would otherwise fence
+    # the filesystem root.
+    - name: Require the server's destinations to be a separate, admitted list
+      ansible.builtin.assert:
+        that:
+          - billet_gate_dirs.vars.billet_server_directories is defined
+          - billet_gate_dirs.vars.billet_node_directories is defined
+          - billet_server_directories | map(attribute='path') | list == ['/var/lib/billet/server']
+          - billet_node_directories | map(attribute='path') | list == ['/var/lib/billet/effective-node', '/var/lib/billet/health', '/var/lib/billet/upgrades', '/var/cache/billet-provision', '/srv/jailer', '/usr/local/libexec']
+          - billet_common_directories | map(attribute='path') | list == ['/etc/billet', '/etc/billet/network', '/var/lib/billet']
+      vars:
+        billet_common_directories: "{{ billet_gate_dirs.vars.billet_common_directories }}"
+        billet_server_directories: "{{ billet_gate_dirs.vars.billet_server_directories }}"
+        billet_node_directories: "{{ billet_gate_dirs.vars.billet_node_directories }}"
+
+    # The two installed observations are separate facts, so a refusal names the one
+    # directory that moved. An installed configuration naming no server still
+    # answers the candidate's default, or this comparison refuses every node-only
+    # converge.
+    - name: Require the installed observations to be split
+      ansible.builtin.assert:
+        that:
+          - "'billet_previous_node_state_dir' not in billet_gate_previous_server['ansible.builtin.set_fact']"
+          - "'billet_previous_server_state_dir' not in billet_gate_previous_node['ansible.builtin.set_fact']"
+          - billet_gate_previous_node['ansible.builtin.set_fact'].billet_previous_node_state_dir == '/var/lib/billet/effective-node'
+
+    - name: Exercise the production node path invariant with the installed path
+      ansible.builtin.assert:
+        that: "{{ billet_gate_node_invariant['ansible.builtin.assert'].that }}"
+      vars:
+        billet_previous_node_state_dir: /var/lib/billet/effective-node
+
+    - name: Initialize the changed-node refusal witness
+      ansible.builtin.set_fact:
+        billet_gate_node_move_refused: false
+
+    - name: Exercise the production node path invariant with a different installed path
+      block:
+        - name: Apply the production node path assertion
+          ansible.builtin.assert:
+            that: "{{ billet_gate_node_invariant['ansible.builtin.assert'].that }}"
+          vars:
+            billet_previous_node_state_dir: /var/lib/billet/installed-node
+      rescue:
+        - name: Record the changed-node refusal
+          ansible.builtin.set_fact:
+            billet_gate_node_move_refused: true
+
+    - name: Require the node invariant to refuse a move without a server
+      ansible.builtin.assert:
+        that:
+          - billet_gate_node_move_refused
+          - billet_gate_node_invariant.when == ['billet_installed_config.stat.exists', 'not billet_interrupted_upgrade | bool']
+
+- name: Effective server masking preserves the original request policy without reading desired configuration
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    billet_config: "{{ billet_gate_undefined_desired }}"
+    billet_gate_policy_main: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/main.yml') | from_yaml }}"
+    billet_gate_requested: "{{ billet_gate_policy_main | selectattr('name', 'equalto', 'Derive whether the billet server may run on this host') | first }}"
+  tasks:
+    - name: Exercise each policy boundary independently
+      ansible.builtin.include_tasks: effective-server-policy-case.yml
+      vars:
+        billet_enable_server: "{{ billet_gate_policy.enabled }}"
+        billet_server_prepare_only: "{{ billet_gate_policy.prepare }}"
+      loop:
+        - {route: ordinary, enabled: true, prepare: false, verified: false, bypass: false, effective: true, run: true}
+        - {route: ordinary, enabled: false, prepare: false, verified: false, bypass: false, effective: false, run: false}
+        - {route: ordinary, enabled: true, prepare: true, verified: false, bypass: false, effective: true, run: false}
+        - {route: new-request, enabled: true, prepare: false, verified: false, bypass: true, effective: false, run: false}
+        - {route: continue, enabled: true, prepare: false, verified: false, bypass: true, effective: false, run: false}
+        - {route: ordinary, enabled: true, prepare: false, verified: true, bypass: false, effective: false, run: false}
+        - {route: cancel, enabled: true, prepare: false, verified: false, bypass: true, effective: false, run: false}
+        - {route: cancel, enabled: true, prepare: false, verified: false, bypass: false, effective: true, run: true}
+        - {route: hold, enabled: true, prepare: false, verified: false, bypass: true, effective: false, run: false}
+        - {route: recovery, enabled: true, prepare: false, verified: false, bypass: true, effective: true, run: true}
+      loop_control:
+        loop_var: billet_gate_policy

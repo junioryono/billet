@@ -9,6 +9,8 @@ cat >"$work/play-retirement.yml" <<'PLAY'
   gather_facts: false
   tasks:
     - name: Capture the complete ordinary role rendering
+      vars:
+        billet_config_document: "{{ billet_config }}"
       ansible.builtin.template:
         src: "{{ billet_gate_ordinary_template }}"
         dest: "{{ billet_gate_render_dir }}/{{ inventory_hostname }}.yaml"
@@ -21,7 +23,7 @@ cat >"$work/play-retirement.yml" <<'PLAY'
   vars:
     billet_exclusion_platform: Linux
     billet_binary_src: ''
-    billet_server_should_run: false
+    billet_requested_server_should_run: false
   tasks:
     - name: Exercise only the selected retiring host
       ansible.builtin.include_tasks: retirement-entry-tasks.yml
@@ -118,6 +120,9 @@ cat >"$work/retirement-entry-tasks.yml" <<'PLAY'
         argv: ["{{ ansible_playbook_python }}", "{{ billet_gate_own_guard_script }}", "{{ billet_gate_own_guard }}"]
       changed_when: true
       when: billet_gate_own_guard is defined
+    - name: Derive the original request policy for this isolated entry
+      ansible.builtin.set_fact:
+        billet_requested_server_should_run: "{{ billet_enable_server | bool and not billet_server_prepare_only | bool }}"
     - name: Route this host before ordinary work
       ansible.builtin.include_role:
         name: junioryono.billet.host
@@ -1001,6 +1006,7 @@ all:
     control-b:
       billet_server_retire: false
       node_wire_address: 127.0.0.1:7717
+      billet_effective_config: {node: {name: wrong-effective-survivor, server_addr: wrong-effective:7717, provider: docker}}
       billet_config:
         server: {listen: '127.0.0.1:7717', state_dir: /var/lib/billet/server, max_vcpu: 8, max_memory: 32GiB}
         node: {name: '{{ inventory_hostname }}', server_addr: '{{ node_wire_address }}', provider: docker}
@@ -1008,6 +1014,7 @@ all:
       billet_server_retire: false
       billet_config_path: /etc/billet/node-a.yaml
       node_wire_address: 127.0.0.1:7719
+      billet_effective_config: {node: {name: wrong-effective-node, server_addr: wrong-effective:7719, provider: docker}}
       billet_config:
         node: {name: '{{ inventory_hostname }}', server_addr: '{{ node_wire_address }}', provider: docker}
 INV
@@ -1140,7 +1147,7 @@ for clause in upgrade policy survivor; do
     r_new "$name"
     case "$clause" in
       upgrade) a "$name" -e billet_gate_binary_upgrade=true; task='Require retirement outside a binary upgrade'; why='inside a binary upgrade' ;;
-      policy) a "$name" -e '{"billet_server_should_run":true}'; task='Require a policy that leaves the retiring server stopped'; why='the policy will start the server' ;;
+      policy) a "$name" -e '{"billet_requested_server_should_run":true}'; task='Require a policy that leaves the retiring server stopped'; why='the policy will start the server' ;;
       survivor) a "$name" -e billet_retirement_survivor_host=; task='Require a named survivor in this inventory'; why='no distinct inventory survivor' ;;
     esac
     if [ "$mode" = check ]; then a "$name" --check; fi
@@ -1163,7 +1170,7 @@ cat >"$work/play-retirement-survivor.yml" <<'PLAY'
   vars:
     billet_exclusion_platform: Linux
     billet_binary_src: ''
-    billet_server_should_run: false
+    billet_requested_server_should_run: false
   tasks:
     - name: Prepare the retiring transport first
       ansible.builtin.include_role:
@@ -1289,7 +1296,7 @@ cat >"$work/play-retirement-earlier-survivor.yml" <<'PLAY'
   vars:
     billet_exclusion_platform: Linux
     billet_binary_src: ''
-    billet_server_should_run: false
+    billet_requested_server_should_run: false
   tasks:
     - name: Prepare the retiring transport
       ansible.builtin.include_role:
@@ -1377,7 +1384,7 @@ billet_retirement_shared_addresses: [192.0.2.10, 192.0.2.11]
 billet_retirement_endpoint_failover_verified: true
 billet_retirement_collect_rendering: >-
   {{ lookup('ansible.builtin.template', 'billet.yaml.j2',
-            template_vars={'billet_config':
+            template_vars={'billet_config_document':
               (billet_retirement_collect_vars.billet_config | combine({'server':
                 billet_retirement_collect_vars.billet_config.server | dict2items |
                 rejectattr('key', 'equalto', 'max_vcpu') | items2dict}))

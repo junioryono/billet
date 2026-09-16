@@ -59,7 +59,9 @@
           - billet_host_main_tasks_raw[-1].name == 'Converge the ordinary host only after retirement admits it'
           - billet_host_ordinary_boundary.when == 'not billet_retirement_bypass | bool'
           - billet_host_main_tasks_raw[-2]['ansible.builtin.import_tasks'] == 'retirement.yml'
-          - billet_host_ordinary_boundary.block[0]['ansible.builtin.import_tasks'] == 'service-account.yml'
+          - billet_host_ordinary_boundary.block[0]['ansible.builtin.import_tasks'] == 'effective-config.yml'
+          - billet_host_ordinary_boundary.block[0].when == 'not billet_interrupted_upgrade | bool'
+          - billet_host_ordinary_boundary.block[1]['ansible.builtin.import_tasks'] == 'service-account.yml'
           - >-
             (billet_host_ordinary_boundary.block | selectattr('name', 'equalto',
              'Record the service account and provision the authority locks on a fresh host') | first)
@@ -156,7 +158,7 @@
       vars:
         billet_service_user: billet
         billet_service_group: billet
-        billet_config: {}
+        billet_effective_config: {}
         # The role default (defaults/main.yml) does not apply to a bare template
         # lookup, and the template deliberately has no fallback: a provider-aware
         # unit rendered without knowing the provider would be a guess.
@@ -1369,3 +1371,6 @@
 
 - name: Exercise private preparation inputs without a target connection
   ansible.builtin.import_playbook: private-inputs.yml
+
+- name: Guard effective inputs and ordinary reader parity
+  ansible.builtin.import_playbook: effective-inputs.yml

@@ -306,7 +306,7 @@ cat >"$work/renderednode/render.yml" <<PLAY
         billet_service_group: root
         billet_systemd_notify_ready: true
         billet_firecracker_enabled: true
-        billet_config:
+        billet_effective_config:
           node:
             state_dir: /var/lib/billet/node
         billet_server_prepare_only: true
@@ -323,7 +323,7 @@ cat >"$work/renderednode/render.yml" <<PLAY
         billet_service_group: root
         billet_systemd_notify_ready: false
         billet_firecracker_enabled: false
-        billet_config: {}
+        billet_effective_config: {}
         billet_server_prepare_only: false
         billet_server_environment: {}
         billet_server_environment_path: /etc/billet/node.env
@@ -418,7 +418,7 @@ for variant in probe probehold; do
         billet_server_prepare_only: false
         billet_server_environment: {}
         billet_server_environment_path: /etc/billet/node.env
-        billet_config: {}
+        billet_effective_config: {}
 PLAY
     ansible-playbook -i localhost, "$work/rendered$variant/render.yml" >"$work/rendered$variant/render.txt" 2>&1 || { sed -n '1,40p' "$work/rendered$variant/render.txt" >&2; exit 1; }
     for role in server node; do
