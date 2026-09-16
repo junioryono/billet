@@ -19,7 +19,7 @@
       - billet_registration_raw.stdout | default('') | trim | length > 0
       - (billet_registration_raw.stdout | default('') | trim) is match('^\{')
     fail_msg: >-
-      {{ billet_registration_answered_by }} on {{ billet_migration_controller }}
+      {{ billet_registration_answered_by }} on {{ billet_endpoint_confirmation_controller.host | default('unselected') }}
       did not answer the registration's confirmation (exit {{ billet_registration_raw.rc | default('none') }},
       {{ 'ended by the bound' if (billet_registration_raw.rc is not defined or billet_registration_raw.rc < 0 or billet_registration_raw.rc in [124, 137]) else 'no JSON answer' }}).
       The node was migrated and is running on its new endpoint; whether the
@@ -84,7 +84,7 @@
       - item.ok | bool
     fail_msg: >-
       The registration's confirmation through {{ billet_registration_answered_by }}
-      on {{ billet_migration_controller }} answered with a member this role
+      on {{ billet_endpoint_confirmation_controller.host | default('unselected') }} answered with a member this role
       cannot read: {{ item.name }}. The node was migrated; whether the
       controller saw it register is not known. Converge again once the
       controller answers.

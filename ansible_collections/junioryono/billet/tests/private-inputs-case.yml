@@ -22,6 +22,21 @@
     billet_retirement_local_environment_file: /etc/billet/old-local.env
     billet_node_environment_files: [{path: /etc/billet/old-node.env, ignore_errors: false}]
     billet_endpoint_confirmation_controller: {host: old-controller}
+    billet_confirmation_revalidate: {host: old-controller}
+    billet_confirmation_failures: [old-controller]
+    billet_confirmation_candidates: [old-controller]
+    billet_confirmation_deployment: old-deployment
+    billet_node_environment_opening: [old]
+    billet_previous_config: {server: {}}
+    billet_unit_operands: {old: {}}
+    billet_retirement_node_config_argv: [old]
+    billet_retirement_planned_rendering: old
+    billet_retirement_rendered_units: [old]
+    billet_retirement_planned_filesystem: [old]
+    billet_retirement_planned_services: [old]
+    billet_retirement_planned_units: {old: {}}
+    billet_retirement_provider_plan: {filesystem: [old]}
+    billet_retirement_node_restart: true
     billet_endpoint_rendering: old-rendering
     billet_endpoint_planned: true
     billet_endpoint_migrated: true
@@ -78,6 +93,21 @@
       - billet_retirement_local_environment_file == ''
       - billet_node_environment_files == []
       - billet_endpoint_confirmation_controller == {}
+      - billet_confirmation_revalidate == {}
+      - billet_confirmation_failures == []
+      - billet_confirmation_candidates == []
+      - billet_confirmation_deployment == ''
+      - billet_node_environment_opening is none
+      - billet_previous_config == {}
+      - billet_unit_operands == {}
+      - billet_retirement_node_config_argv == []
+      - billet_retirement_planned_rendering == ''
+      - billet_retirement_rendered_units == []
+      - billet_retirement_planned_filesystem == []
+      - billet_retirement_planned_services == []
+      - billet_retirement_planned_units == {}
+      - billet_retirement_provider_plan is none
+      - billet_retirement_node_restart is none
       - billet_endpoint_rendering == ''
       - billet_endpoint_planned is sameas false
       - billet_endpoint_migrated is sameas false

@@ -1,0 +1,457 @@
+---
+- name: Typed environment observations refuse before unit replacement
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ansible_become: false
+    billet_retirement_node_ordinary: true
+    billet_firecracker_enabled: false
+    billet_systemd_notify_ready: true
+    billet_server_prepare_only: false
+    billet_effective_config: {node: {state_dir: /var/lib/billet/node}}
+    billet_server_environment: {}
+    billet_gate_role: "{{ playbook_dir }}/../roles/host"
+  tasks:
+    - name: Initialize this detached retained reader case
+      ansible.builtin.set_fact:
+        billet_retirement_node_ordinary: true
+        billet_effective_config: {node: {state_dir: /var/lib/billet/node}}
+
+    - name: Allocate the environment gate's private files
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: billet-reader-environment-
+      register: billet_gate_environment_root
+
+    - name: Exercise every supported and refused environment shape
+      block:
+        - name: Write the observation-only release inspector
+          ansible.builtin.copy:
+            dest: "{{ billet_gate_environment_root.path }}/inspect"
+            mode: "0700"
+            content: |
+              #!/usr/bin/python3
+              import pathlib
+              root = pathlib.Path(__file__).parent
+              count = root / 'called'
+              source = 'closing.json' if count.exists() else 'opening.json'
+              count.touch()
+              print((root / source).read_text(), end='')
+
+        - name: Exercise the production environment reader before replacement
+          ansible.builtin.include_tasks: reader-environment-case.yml
+          loop:
+            - {name: empty, shape: empty, exists: false, optional: false, refuses: false}
+            - {name: required-existing, shape: single, exists: true, optional: false, refuses: false}
+            - {name: optional-existing, shape: single, exists: true, optional: true, refuses: false}
+            - {name: optional-absent, shape: single, exists: false, optional: true, refuses: false}
+            - {name: required-absent, shape: single, exists: false, optional: false, refuses: true}
+            - {name: malformed, shape: malformed, exists: true, optional: false, refuses: true}
+            - {name: multiple, shape: multiple, exists: true, optional: false, refuses: true}
+            - {name: unsupported, shape: unsupported, exists: true, optional: false, refuses: true}
+            - {name: unknown, shape: unknown, exists: true, optional: false, refuses: true}
+            - {name: absent-unit, shape: absent, exists: false, optional: false, refuses: true}
+            - {name: changing, shape: changing, exists: true, optional: false, refuses: true}
+          loop_control:
+            loop_var: billet_gate_environment_case
+            label: "{{ billet_gate_environment_case.name }}"
+      always:
+        - name: Remove the environment gate's private files
+          ansible.builtin.file:
+            path: "{{ billet_gate_environment_root.path }}"
+            state: absent
+
+- name: Keyed observations cannot inherit another unit's result
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    billet_gate_role: "{{ playbook_dir }}/../roles/host"
+    billet_gate_account: "{{ lookup('ansible.builtin.file', billet_gate_role + '/tasks/account.yml') | from_yaml }}"
+    billet_gate_install: "{{ billet_gate_account | selectattr('name', 'equalto', 'Install the billet systemd units') | first }}"
+    billet_retirement_node_ordinary: true
+  tasks:
+    - name: Initialize the keyed retained reader
+      ansible.builtin.set_fact:
+        billet_retirement_node_ordinary: true
+
+    - name: Derive the production retained unit inventory
+      ansible.builtin.include_role:
+        name: junioryono.billet.host
+        tasks_from: unit-operands
+
+    - name: Plant reversed observations with different results
+      ansible.builtin.set_fact:
+        billet_service_types_by_unit: "{{ [{'item': 'billet-node.service', 'rc': 0, 'stdout': 'notify'}, {'item': 'billet-server.service', 'rc': 0, 'stdout': 'exec'}] | junioryono.billet.unit_results }}"
+        billet_unit_templates_by_unit: "{{ [{'item': {'key': 'billet-node.service'}, 'changed': false}, {'item': {'key': 'billet-server.service'}, 'changed': true}] | junioryono.billet.unit_results }}"
+
+    - name: Require the rendered unit to consume its own observations
+      ansible.builtin.assert:
+        that:
+          - billet_unit_operands.keys() | list == ['billet-node.service']
+          - billet_gate_install.loop | map(attribute='key') | list == ['billet-node.service']
+          - billet_gate_install.vars.billet_systemd_notify_ready is sameas true
+          - billet_unit_templates_by_unit['billet-node.service'].changed is sameas false
+          - billet_unit_templates_by_unit['billet-server.service'].changed is sameas true
+      vars:
+        item: {key: billet-node.service}
+
+    - name: Require the server observation to remain independent
+      ansible.builtin.assert:
+        that: billet_gate_install.vars.billet_systemd_notify_ready is sameas false
+      vars:
+        item: {key: billet-server.service}
+
+- name: Confirmation is unnecessary when no migration is planned
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    billet_endpoint_planned: false
+    billet_migration_controller: unverified-public-default
+  tasks:
+    - name: Plant a preceding confirmation selection
+      ansible.builtin.set_fact:
+        billet_endpoint_confirmation_controller: {host: previous-controller}
+        billet_endpoint_planned: false
+    - name: Exercise the production no-confirmation branch
+      ansible.builtin.include_role:
+        name: junioryono.billet.host
+        tasks_from: confirmation-controller
+    - name: Require no selection and an unchanged public override
+      ansible.builtin.assert:
+        that:
+          - billet_endpoint_confirmation_controller == {}
+          - billet_migration_controller == 'unverified-public-default'
+
+- name: Exact operation documents and separate settled bindings are prepared without commands
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    billet_effective_ready: true
+    billet_effective_config: {node: {name: reference-node, state_dir: /var/lib/billet/node, lock_dir: /run/billet/locks}}
+    billet_config: {server: {identity_dir: /var/lib/billet/wrong}, node: {name: wrong}}
+    billet_retirement_environment_ready: true
+    billet_node_environment_files: [{path: /etc/billet/installed.env, ignore_errors: false}]
+    billet_server_environment: {}
+    billet_firecracker_enabled: false
+    billet_service_types_by_unit: {billet-node.service: {rc: 0, stdout: notify}}
+    billet_exclusion_holder: ci-1
+    billet_exclusion_id: '11111111111111111111111111111111'
+    billet_retirement_transition_id: '22222222222222222222222222222222'
+    billet_exclusion_answerer: /usr/bin/billet
+    billet_retirement_planned_filesystem: [{kind: write, path: /etc/billet/billet.yaml}]
+    billet_retirement_planned_services: [{verb: start, unit: billet-node.service}]
+    billet_retirement_planned_units:
+      billet-node.service: {src: billet-node.service.j2, dest: /etc/systemd/system/billet-node.service}
+  tasks:
+    - name: Initialize the detached binding operands
+      ansible.builtin.set_fact:
+        billet_effective_ready: true
+        billet_effective_config: {node: {name: reference-node, state_dir: /var/lib/billet/node, lock_dir: /run/billet/locks}}
+        billet_retirement_environment_ready: true
+        billet_node_environment_files: [{path: /etc/billet/installed.env, ignore_errors: false}]
+        billet_service_types_by_unit: {billet-node.service: {rc: 0, stdout: notify}}
+        billet_exclusion_holder: ci-1
+        billet_exclusion_id: '11111111111111111111111111111111'
+        billet_retirement_transition_id: '22222222222222222222222222222222'
+        billet_exclusion_answerer: /usr/bin/billet
+        billet_retirement_planned_filesystem: [{kind: write, path: /etc/billet/billet.yaml}]
+        billet_retirement_planned_services: [{verb: start, unit: billet-node.service}]
+        billet_retirement_planned_units:
+          billet-node.service: {src: billet-node.service.j2, dest: /etc/systemd/system/billet-node.service}
+
+    - name: Prepare the production documents without a host connection
+      ansible.builtin.include_role:
+        name: junioryono.billet.host
+        tasks_from: prepare-operation-document
+
+    - name: Require explicit bytes, operands and distinct entry and closing modes
+      ansible.builtin.assert:
+        that:
+          - (billet_retirement_operation_document.document.rendering | from_yaml) == billet_effective_config
+          - billet_retirement_operation_document.document.operations.filesystem == billet_retirement_planned_filesystem
+          - billet_retirement_operation_document.document.operations.services == billet_retirement_planned_services
+          - billet_retirement_operation_document.document.operations.units[0].path == '/etc/systemd/system/billet-node.service'
+          - "'EnvironmentFile=/etc/billet/installed.env' in billet_retirement_operation_document.document.operations.units[0].contents"
+          - billet_retirement_entry_binding.purpose == 'settled-entry'
+          - billet_retirement_closing_binding.purpose == 'settled-closing'
+          - billet_retirement_entry_binding.argv[-1] == '--check-settled-entry'
+          - billet_retirement_closing_binding.argv[-1] == '--check-settled-closing'
+          - "'--input' not in billet_retirement_entry_binding.argv"
+          - "'--input' not in billet_retirement_closing_binding.argv"
+          - billet_retirement_node_config_argv[-3:] == ['--check-node-config', '--input', '-']
+          - (billet_retirement_operation_document.stdin | from_json) == billet_retirement_operation_document.document
+
+    - name: Require the prepared destinations and units to equal the downstream task operands
+      vars:
+        billet_gate_account: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/account.yml') | from_yaml }}"
+        billet_gate_services: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/services.yml') | from_yaml }}"
+        billet_ordinary_config_path: /etc/billet/billet.yaml
+        item: {key: billet-node.service, value: {src: billet-node.service.j2, dest: /etc/systemd/system/billet-node.service}}
+      ansible.builtin.assert:
+        that:
+          - >-
+            (billet_gate_account | selectattr('name', 'equalto', 'Render billet configuration') | first)['ansible.builtin.template'].dest ==
+            billet_retirement_operation_document.document.operations.filesystem[0].path
+          - >-
+            (billet_gate_account | selectattr('name', 'equalto', 'Install the billet systemd units') | first)['ansible.builtin.template'].dest ==
+            billet_retirement_operation_document.document.operations.units[0].path
+          - >-
+            (billet_gate_services | selectattr('name', 'equalto', 'Enable and start the billet node') | first)['ansible.builtin.systemd_service'].name ==
+            billet_retirement_operation_document.document.operations.services[0].unit
+          - >-
+            (billet_gate_services | selectattr('name', 'equalto', 'Enable and start the billet node') | first)['ansible.builtin.systemd_service'].state == 'started'
+
+- name: Operation inventory follows shared effective destinations
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    billet_config:
+      server: {identity_dir: /var/lib/billet/inventory-identity}
+      node: {cache: {tls_cert: /etc/inventory/cert.pem, tls_key: /etc/inventory/key.pem}}
+    billet_cache_tls_cert_src: supplied-certificate
+    billet_cache_tls_key_src: supplied-key
+    billet_firecracker_stage: /var/cache/billet-provision
+    billet_firecracker_enabled: false
+    billet_service_user: billet
+    billet_service_group: billet
+  tasks:
+    - name: Supply finalized observations for the detached operation inventory
+      ansible.builtin.set_fact:
+        billet_effective_ready: true
+        billet_effective_config:
+          node:
+            name: reference-node
+            state_dir: /var/lib/billet/effective-node
+            cache: {tls_cert: /etc/effective/cert.pem, tls_key: /etc/effective/key.pem}
+        billet_candidate_node_state_dir: /var/lib/billet/effective-node
+        billet_retirement_environment_ready: true
+        billet_node_environment_files: [{path: /etc/billet/installed.env, ignore_errors: true}]
+        billet_retirement_provider_plan: {filesystem: [], services: [], units: {}}
+        billet_retirement_node_restart: false
+        billet_node_should_run: true
+        billet_binary_upgrade: false
+        billet_retirement_node_ordinary: true
+        billet_service_types_by_unit: {billet-node.service: {rc: 0, stdout: notify}}
+        billet_exclusion_holder: ci-1
+        billet_exclusion_id: '11111111111111111111111111111111'
+        billet_retirement_transition_id: '22222222222222222222222222222222'
+        billet_exclusion_answerer: /usr/bin/billet
+
+    - name: Derive the retained unit operands
+      ansible.builtin.include_role:
+        name: junioryono.billet.host
+        tasks_from: unit-operands
+
+    - name: Prepare the production node operation inventory
+      ansible.builtin.include_role:
+        name: junioryono.billet.host
+        tasks_from: prepare-node-operations
+
+    - name: Require effective paths and exact intended operations in the prepared document
+      ansible.builtin.assert:
+        that:
+          - "{'kind': 'write', 'path': '/etc/effective/cert.pem'} in billet_retirement_planned_filesystem"
+          - "{'kind': 'write', 'path': '/etc/effective/key.pem'} in billet_retirement_planned_filesystem"
+          - "{'kind': 'mkdir', 'path': '/var/lib/billet/effective-node'} in billet_retirement_planned_filesystem"
+          - "{'kind': 'read', 'path': '/etc/billet/installed.env'} in billet_retirement_planned_filesystem"
+          - "{'kind': 'write', 'path': '/etc/billet/installed.env'} not in billet_retirement_planned_filesystem"
+          - "'/var/lib/billet/inventory-identity' not in (billet_retirement_planned_filesystem | map(attribute='path') | list)"
+          - "'/var/lib/billet/server' not in (billet_retirement_planned_filesystem | map(attribute='path') | list)"
+          - "'/etc/inventory/cert.pem' not in (billet_retirement_planned_filesystem | map(attribute='path') | list)"
+          - billet_retirement_planned_services == [{'verb':'enable', 'unit':'billet-node.service'}, {'verb':'start', 'unit':'billet-node.service'}]
+          - billet_retirement_operation_document.document.operations.filesystem == billet_retirement_planned_filesystem
+          - billet_retirement_operation_document.document.operations.services == billet_retirement_planned_services
+
+- name: Confirmation selects observed controllers rather than the public default
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ansible_become: false
+    billet_exclusion_holder: ci-1
+    billet_gate_controller_inspect: "{{ lookup('ansible.builtin.file', playbook_dir + '/fixtures/release-inspect/postgres-controller-guarded.json') | from_json }}"
+    billet_gate_node_inspect: "{{ lookup('ansible.builtin.file', playbook_dir + '/fixtures/release-inspect/node-with-bundle.json') | from_json }}"
+  tasks:
+    - name: Allocate the controller gate's command fixtures
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: billet-confirmation-
+      register: billet_gate_confirmation_root
+
+    - name: Exercise selection through the production delegated tasks
+      block:
+        - name: Create the candidate fixture directories
+          ansible.builtin.file:
+            path: "{{ billet_gate_confirmation_root.path }}/{{ item }}"
+            state: directory
+            mode: "0700"
+          loop: [local, retired, survivor]
+
+        - name: Install observation-only command fixtures
+          ansible.builtin.copy:
+            dest: "{{ billet_gate_confirmation_root.path }}/{{ item }}/billet"
+            mode: "0700"
+            content: |
+              #!/usr/bin/python3
+              import pathlib, sys
+              root = pathlib.Path(__file__).parent
+              with (root / 'calls').open('a') as stream:
+                  stream.write(' '.join(sys.argv[1:]) + '\n')
+              if sys.argv[1:] == ['version']:
+                  print('billet (devel)')
+              else:
+                  name = {'release': 'inspect.json', 'rollout': 'status.json', 'converge-guard': 'guard.json'}[sys.argv[1]]
+                  print((root / name).read_text(), end='')
+          loop: [local, retired, survivor]
+
+        - name: Plant this node's observed deployment
+          ansible.builtin.copy:
+            content: "{{ billet_gate_node_inspect | combine({'host': {'registration': {'deployment': 'dddddddddddddddddddddddddddddddd'}}}, recursive=true) | to_json }}"
+            dest: "{{ billet_gate_confirmation_root.path }}/local/inspect.json"
+            mode: "0600"
+
+        - name: Plant installed controller observations with their own executable paths
+          ansible.builtin.copy:
+            content: >-
+              {{ billet_gate_controller_inspect | combine(
+                {'executable': {'image': billet_gate_confirmation_root.path ~ '/' ~ item ~ '/billet', 'installed_path': billet_gate_confirmation_root.path ~ '/' ~ item ~ '/billet'},
+                 'transaction': {'converge_guard': {'release_executable': billet_gate_confirmation_root.path ~ '/' ~ item ~ '/billet'}},
+                 'host': {'retirement': ({'phase': 'done'} if item == 'retired' else none)},
+                 'services': {'server': {'environment_file_specs': [], 'environment_files': []}}}, recursive=true) | to_json }}
+            dest: "{{ billet_gate_confirmation_root.path }}/{{ item }}/inspect.json"
+            mode: "0600"
+          loop: [retired, survivor]
+
+        - name: Plant the survivor's bound ledger and settled guard observations
+          ansible.builtin.copy:
+            src: "{{ playbook_dir }}/fixtures/{{ item.src }}"
+            dest: "{{ billet_gate_confirmation_root.path }}/survivor/{{ item.dest }}"
+            mode: "0600"
+          loop:
+            - {src: rollout-status/no-rollout.json, dest: status.json}
+            - {src: guard-status/healthy.json, dest: guard.json}
+
+        - name: Register frozen controller order with prepared host operands
+          ansible.builtin.add_host:
+            name: "{{ item }}"
+            groups: control_plane
+            ansible_connection: local
+            ansible_become: false
+            billet_exclusion_answerer: "{{ billet_gate_confirmation_root.path }}/{{ item }}/billet"
+            billet_exclusion_holder: ci-1
+            billet_exclusion_id: '101112131415161718191a1b1c1d1e1f'
+            billet_exclusion_held: true
+            billet_config_path: /etc/billet/billet.yaml
+            billet_config: {server: {identity_dir: /unverified/inventory}}
+            billet_server_environment: {UNVERIFIED_INVENTORY: unused}
+          loop: [retired, survivor]
+
+        - name: Select automatic confirmation for a planned migration
+          ansible.builtin.set_fact:
+            billet_endpoint_planned: true
+            billet_confirmation_revalidate: {}
+            billet_retirement_survivor: ''
+            billet_endpoint_answerer: "{{ billet_gate_confirmation_root.path }}/local/billet"
+
+        - name: Exercise automatic selection with retired inventory first
+          ansible.builtin.include_role:
+            name: junioryono.billet.host
+            tasks_from: confirmation-controller
+          vars:
+            billet_migration_controller: ''
+
+        - name: Require the survivor's verified operands
+          ansible.builtin.assert:
+            that:
+              - billet_endpoint_confirmation_controller.host == 'survivor'
+              - billet_endpoint_confirmation_controller.environment_files == []
+              - billet_endpoint_confirmation_controller.config == '/etc/billet/billet.yaml'
+              - billet_confirmation_failures | length == 1
+
+        - name: Initialize the explicit unverified-controller witness
+          ansible.builtin.set_fact:
+            billet_gate_controller_refused: false
+
+        - name: Exercise an explicit retired public default
+          block:
+            - name: Verify the explicit controller without automatic fallback
+              ansible.builtin.include_role:
+                name: junioryono.billet.host
+                tasks_from: confirmation-controller
+              vars:
+                billet_migration_controller: retired
+          rescue:
+            - name: Require the refusal at the selection boundary
+              ansible.builtin.assert:
+                that: ansible_failed_task.name == 'Require a positively verified confirmation controller'
+            - name: Record the unverified-controller refusal
+              ansible.builtin.set_fact:
+                billet_gate_controller_refused: true
+
+        - name: Require no unverified public default or fallback selection
+          ansible.builtin.assert:
+            that:
+              - billet_gate_controller_refused
+              - billet_endpoint_confirmation_controller == {}
+              - billet_confirmation_candidates == ['retired']
+      always:
+        - name: Remove the controller gate's private files
+          ansible.builtin.file:
+            path: "{{ billet_gate_confirmation_root.path }}"
+            state: absent
+
+- name: Fresh request and collection retain complete desired eligibility bytes
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    billet_gate_collect_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/retirement-collect-host.yml') | from_yaml }}"
+    billet_gate_render_task: "{{ (billet_gate_collect_tasks | selectattr('name', 'equalto', \"Collect the node's desired configuration and endpoint\") | first).block | selectattr('name', 'equalto', 'Render this node in its own inventory context') | first }}"
+    billet_retirement_collect_vars:
+      billet_config:
+        server: {identity_dir: /var/lib/billet/desired-identity}
+        github: {private_key_path: /etc/billet/desired-key.pem}
+        targets: [{name: desired-target}]
+        backup: {s3: {bucket: desired}}
+        node: {name: desired-node}
+  tasks:
+    - name: Plant opposing ordinary effective eligibility input
+      ansible.builtin.set_fact:
+        billet_effective_config: {node: {name: effective-node}}
+
+    - name: Render the production full desired eligibility expression
+      ansible.builtin.set_fact:
+        billet_gate_full_desired: "{{ billet_gate_render_task['ansible.builtin.set_fact'].billet_retirement_collect_rendering }}"
+      vars:
+        ansible_search_path: ["{{ playbook_dir }}/../roles/host"]
+
+    - name: Require full desired bytes on both fresh and collected evidence
+      ansible.builtin.assert:
+        that:
+          - (billet_gate_full_desired | from_yaml) == billet_retirement_collect_vars.billet_config
+          - (billet_gate_full_desired | from_yaml).node.name == 'desired-node'
+          - "'server' in (billet_gate_full_desired | from_yaml)"
+          - "'github' in (billet_gate_full_desired | from_yaml)"
+          - "'targets' in (billet_gate_full_desired | from_yaml)"
+          - "'backup' in (billet_gate_full_desired | from_yaml)"
+          - "'retirement-collect.yml' in lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/retirement-request.yml')"
+
+- name: Ordinary node-only and combined convergence keep the shared task order and conditions
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    billet_gate_main: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/main.yml') | from_yaml }}"
+    billet_gate_services: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/services.yml') | from_yaml }}"
+    billet_gate_tail: "{{ billet_gate_services | selectattr('name', 'defined') | map(attribute='name') | list }}"
+  tasks:
+    - name: Exercise both ordinary shapes through their shared operand derivation
+      ansible.builtin.include_tasks: reader-ordinary-case.yml
+      loop: [node-only, controller-and-node]
+      loop_control:
+        loop_var: billet_gate_ordinary_shape

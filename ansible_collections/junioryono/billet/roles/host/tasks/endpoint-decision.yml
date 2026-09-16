@@ -189,7 +189,6 @@
           - not billet_endpoint_planned_now or not (billet_binary_upgrade | default(false) | bool)
           - not billet_endpoint_planned_now or (billet_upgrade_claim_shape | default('') not in ['legacy', 'legacy-file'])
           - not billet_endpoint_planned_now or (billet_node_should_run | default(false) | bool)
-          - not billet_endpoint_planned_now or (billet_migration_controller | default('') | length > 0)
         fail_msg: >-
           This converge would move the node's endpoint from
           {{ billet_endpoint_answer.from | default('none', true) }} to
@@ -200,8 +199,6 @@
              if billet_upgrade_claim_shape | default('') in ['legacy', 'legacy-file'] else '' }}
           {{ 'the policy will not start the node in this converge (billet_enable_node or billet_server_prepare_only), so the migrated node could not register;'
              if not (billet_node_should_run | default(false) | bool) else '' }}
-          {{ 'no controller is named to confirm the registration with (billet_migration_controller); declare the control_plane group or set it;'
-             if billet_migration_controller | default('') | length == 0 else '' }}
           nothing was stopped or installed.
       when: billet_endpoint_answerer | length > 0
 
@@ -212,6 +209,9 @@
         billet_endpoint_to: "{{ billet_endpoint_answer.to | default('', true) }}"
         billet_endpoint_record: "{{ billet_endpoint_answer.record }}"
       when: billet_endpoint_answerer | length > 0
+
+    - name: Verify the controller before installing migration inputs
+      ansible.builtin.import_tasks: confirmation-controller.yml
 
     - name: Report the endpoint decision
       ansible.builtin.debug:

@@ -1,0 +1,61 @@
+---
+# Ordinary installations retain their inventory policy. Only the verified
+# retained route preserves installed operands independently of that policy.
+- name: Resolve the ordinary node environment
+  ansible.builtin.set_fact:
+    billet_node_environment_files: >-
+      {{ [{'path': billet_server_environment_path, 'ignore_errors': true}]
+         if billet_server_environment | default({}) | length > 0 else [] }}
+  when: not billet_retirement_node_ordinary | default(false) | bool
+
+- name: Observe the retained node environment before replacement
+  when: billet_retirement_node_ordinary | default(false) | bool
+  block:
+    - name: Inspect the installed node environment
+      ansible.builtin.command:
+        argv: [timeout, -k, '10', '180', "{{ billet_exclusion_answerer }}", release, inspect, --json, --config, /etc/billet/billet.yaml]
+        expand_argument_vars: false
+      register: billet_node_environment_opening_raw
+      changed_when: false
+      check_mode: false
+      become: true
+      no_log: true
+
+    - name: Decode the installed node environment
+      ansible.builtin.set_fact:
+        billet_node_environment_opening: "{{ (billet_node_environment_opening_raw.stdout | junioryono.billet.from_json_strict).services.node | junioryono.billet.environment_specs }}"
+      no_log: true
+
+    - name: Require the retained node unit to exist
+      ansible.builtin.assert:
+        that: billet_node_environment_opening is not none
+        fail_msg: The retained node unit is absent; no replacement is authorized.
+
+    - name: Prove the retained environment files are readable or optionally absent
+      junioryono.billet.environment_files:
+        specs: "{{ billet_node_environment_opening }}"
+      check_mode: false
+      become: true
+      no_log: true
+
+    - name: Inspect the node environment again before replacement
+      ansible.builtin.command:
+        argv: [timeout, -k, '10', '180', "{{ billet_exclusion_answerer }}", release, inspect, --json, --config, /etc/billet/billet.yaml]
+        expand_argument_vars: false
+      register: billet_node_environment_closing_raw
+      changed_when: false
+      check_mode: false
+      become: true
+      no_log: true
+
+    - name: Require unchanged typed node environment observations
+      ansible.builtin.assert:
+        that: >-
+          billet_node_environment_opening ==
+          ((billet_node_environment_closing_raw.stdout | junioryono.billet.from_json_strict).services.node | junioryono.billet.environment_specs)
+        fail_msg: The node EnvironmentFile observation changed; no replacement is authorized.
+
+    - name: Keep the installed node environment independently of controller inventory
+      ansible.builtin.set_fact:
+        billet_node_environment_files: "{{ billet_node_environment_opening }}"
+        billet_retirement_environment_ready: true

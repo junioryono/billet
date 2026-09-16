@@ -1,0 +1,57 @@
+---
+- name: Clear the previous confirmation selection
+  ansible.builtin.set_fact:
+    billet_endpoint_confirmation_controller: {}
+    billet_confirmation_failures: []
+
+# No migration means no controller dependency, including a quiet node's start.
+- name: Verify a controller only when migration needs confirmation
+  when: billet_endpoint_planned | bool
+  block:
+    - name: Inspect the migrating node's deployment
+      ansible.builtin.command:
+        argv: [timeout, -k, '10', '180', "{{ billet_endpoint_answerer }}", release, inspect, --json, --config, /etc/billet/billet.yaml]
+        expand_argument_vars: false
+      register: billet_confirmation_local_raw
+      changed_when: false
+      check_mode: false
+      become: true
+      no_log: true
+
+    - name: Bind confirmation to the observed node deployment
+      ansible.builtin.set_fact:
+        billet_confirmation_deployment: "{{ (billet_confirmation_local_raw.stdout | junioryono.billet.from_json_strict).host.registration.deployment }}"
+        billet_confirmation_candidates: >-
+          {{ ([billet_confirmation_revalidate.host] if billet_confirmation_revalidate | default({}) | length > 0 else
+              ([billet_migration_controller] if billet_migration_controller | length > 0 else
+               ([billet_retirement_survivor] if billet_retirement_survivor | default('') | length > 0 else [])
+               + (groups['control_plane'] | default([])))) | unique(case_sensitive=true) | reject('equalto', inventory_hostname) | list }}
+
+    - name: Require a bound deployment before controller selection
+      ansible.builtin.assert:
+        that:
+          - billet_confirmation_deployment is string
+          - billet_confirmation_deployment is match('^[0-9a-f]{32}\Z')
+        fail_msg: The migrating node's deployment could not be proved; no controller is selected.
+
+    - name: Verify candidate controllers in preference order
+      ansible.builtin.include_tasks: confirmation-candidate.yml
+      loop: "{{ billet_confirmation_candidates }}"
+      loop_control:
+        loop_var: billet_confirmation_host
+      when: billet_endpoint_confirmation_controller | length == 0
+
+    - name: Require a positively verified confirmation controller
+      ansible.builtin.assert:
+        that: billet_endpoint_confirmation_controller | length > 0
+        fail_msg: "No confirmation controller was verified. Unusable candidates: {{ billet_confirmation_failures | join(', ') }}."
+
+    - name: Require unchanged controller operands immediately before migration
+      ansible.builtin.assert:
+        that: billet_endpoint_confirmation_controller == billet_confirmation_revalidate
+        fail_msg: The confirmation controller changed after planning; migration was not started.
+      when: billet_confirmation_revalidate | default({}) | length > 0
+
+    - name: Report the verified private confirmation selection
+      ansible.builtin.debug:
+        msg: "The verified confirmation controller is {{ billet_endpoint_confirmation_controller.host }}, using {{ billet_endpoint_confirmation_controller.executable }} and {{ billet_endpoint_confirmation_controller.config }}."

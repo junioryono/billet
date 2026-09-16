@@ -131,6 +131,7 @@ sections_ran="shared checks"
 "$python" "$here/guard_fallback_check.py"
 "$python" "$here/strict_json_check.py"
 "$python" "$here/holder_check.py"
+"$python" "$here/ordinary_inputs_check.py"
 
 # --- connection-free resets, then the guard before host operations -----------
 "$python" - "$role_tasks" <<'PYPREPORDER'

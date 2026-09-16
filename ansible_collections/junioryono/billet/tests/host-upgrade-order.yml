@@ -398,7 +398,7 @@
           - "'failed_when' not in billet_candidate_probe_ask"
           - billet_candidate_unit_stage.vars.billet_systemd_notify_ready | bool
           - billet_steady_unit_install.vars.billet_systemd_notify_ready | bool
-          - "'billet_installed_service_types' in (billet_ordinary_unit_install.vars.billet_systemd_notify_ready | string)"
+          - "'billet_service_types_by_unit' in (billet_ordinary_unit_install.vars.billet_systemd_notify_ready | string)"
           - billet_main_names.index('Recover an interrupted billet upgrade before converging anything else') < billet_main_names.index('Configure Firecracker')
           - billet_main_names.index('Configure billet account and files') < billet_main_names.index('Configure Firecracker')
           - billet_main_names.index('Recover an interrupted billet upgrade before converging anything else') < billet_main_names.index('Configure guest networking')
@@ -1380,3 +1380,6 @@
 
 - name: Guard effective inputs and ordinary reader parity
   ansible.builtin.import_playbook: effective-inputs.yml
+
+- name: Exercise the final ordinary reader slice
+  ansible.builtin.import_playbook: reader-inputs.yml

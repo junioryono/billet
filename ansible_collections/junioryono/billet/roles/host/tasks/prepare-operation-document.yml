@@ -1,0 +1,77 @@
+---
+# This prepares operands only. main.yml has no caller until commit 3 supplies
+# command-owned entry permission and binds every dependent mutation boundary.
+- name: Require complete operation operands before preparing admission
+  ansible.builtin.assert:
+    that:
+      - billet_effective_ready | bool
+      - billet_effective_config.get('node') is mapping
+      - billet_effective_config.get('server') is not mapping
+      - billet_retirement_environment_ready | bool
+      - billet_retirement_planned_filesystem is sequence
+      - billet_retirement_planned_filesystem is not string
+      - billet_retirement_planned_services is sequence
+      - billet_retirement_planned_services is not string
+      - billet_retirement_planned_units is mapping
+      - "'billet-node.service' in billet_retirement_planned_units"
+      - billet_exclusion_holder | length > 0
+      - billet_exclusion_id is match('^[0-9a-f]{32}\Z')
+      - billet_retirement_transition_id is match('^[0-9a-f]{32}\Z')
+    fail_msg: Admission preparation needs effective rendering, typed environment and complete explicit operation operands.
+
+- name: Render exact effective bytes for operation admission
+  ansible.builtin.set_fact:
+    billet_retirement_planned_rendering: "{{ lookup('ansible.builtin.template', 'billet.yaml.j2', template_vars={'billet_config_document': billet_effective_config}) }}"
+    billet_retirement_rendered_units: []
+  no_log: true
+
+- name: Bind each proposed unit to its exact rendering and destination
+  ansible.builtin.set_fact:
+    billet_retirement_rendered_units: >-
+      {{ billet_retirement_rendered_units + [{'unit': item.key, 'path': item.value.dest,
+           'contents': billet_retirement_unit_contents, 'sha256': billet_retirement_unit_contents | hash('sha256')}] }}
+  vars:
+    billet_retirement_unit_contents: >-
+      {{ lookup('ansible.builtin.template', item.value.src,
+                template_vars={'billet_systemd_notify_ready':
+                  item.key in billet_service_types_by_unit and
+                  billet_service_types_by_unit[item.key].rc == 0 and
+                  billet_service_types_by_unit[item.key].stdout | trim == 'notify'}) }}
+  loop: "{{ billet_retirement_planned_units | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+- name: Prepare the exact node configuration operation document
+  ansible.builtin.set_fact:
+    billet_retirement_operation_document: >-
+      {{ billet_retirement_planned_rendering | junioryono.billet.operation_document(
+           {'filesystem': billet_retirement_planned_filesystem,
+            'services': billet_retirement_planned_services, 'units': billet_retirement_rendered_units},
+           billet_exclusion_holder, inventory_hostname, billet_retirement_transition_id) }}
+  no_log: true
+
+# Settled modes accept flags only, never the node-config stdin document. Their
+# bindings carry the expected purpose so entry cannot stand in for closing.
+- name: Prepare separate settled entry and closing bindings
+  ansible.builtin.set_fact:
+    billet_retirement_entry_binding:
+      purpose: settled-entry
+      run: "{{ billet_exclusion_holder }}"
+      guard: "{{ billet_exclusion_id }}"
+      retiring: "{{ inventory_hostname }}"
+      transition_id: "{{ billet_retirement_transition_id }}"
+      argv: "{{ billet_retirement_binding_argv + ['--check-settled-entry'] }}"
+    billet_retirement_closing_binding:
+      purpose: settled-closing
+      run: "{{ billet_exclusion_holder }}"
+      guard: "{{ billet_exclusion_id }}"
+      retiring: "{{ inventory_hostname }}"
+      transition_id: "{{ billet_retirement_transition_id }}"
+      argv: "{{ billet_retirement_binding_argv + ['--check-settled-closing'] }}"
+    billet_retirement_node_config_argv: "{{ billet_retirement_binding_argv + ['--check-node-config', '--input', '-'] }}"
+  vars:
+    billet_retirement_binding_argv: >-
+      {{ [billet_exclusion_answerer, 'server', 'retire', '--json', '--config', billet_ordinary_config_path,
+          '--run', billet_exclusion_holder, '--expected-holder', billet_exclusion_holder,
+          '--expected-guard', billet_exclusion_id, '--retiring-host', inventory_hostname,
+          '--transition', billet_retirement_transition_id] }}

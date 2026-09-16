@@ -34,6 +34,7 @@
     system: true
     state: present
   become: true
+  when: not billet_retirement_node_verified | default(false) | bool
 
 - name: Create or adopt the billet service account
   ansible.builtin.user:
@@ -45,6 +46,7 @@
     system: true
     state: present
   become: true
+  when: not billet_retirement_node_verified | default(false) | bool
 
 - name: Install billet host dependencies
   ansible.builtin.apt:
@@ -75,49 +77,37 @@
   become: true
   when: billet_installed_config.stat.exists
 
-# Installed observations stay separate from E, and the two comparisons are split
-# so a refusal names the one directory that actually moved.
-#
-# BOTH SPELLINGS, for the reason upgrade-inspect.yml reads both: a deployment
-# whose ledger is in PostgreSQL has ONLY identity_dir, so reading state_dir alone
-# answers the DEFAULT directory for every one of them — and this comparison would
-# then refuse an ordinary converge, telling the operator their installed
-# state_dir is /var/lib/billet/server when their config never said so.
-#
-# AN INSTALLED CONFIG WITH NO SERVER STILL ANSWERS THE DEFAULT, because the
-# candidate does too until the retained route refuses the transaction (see
-# vars/main.yml). Answering '' on one side of a comparison whose other side
-# defaults refuses every node-only converge.
+# Installed paths describe I, never E. An absent server has no identity path;
+# the transaction's historical placeholder is not an ordinary destination.
+- name: Keep installed configuration separate from effective input
+  ansible.builtin.set_fact:
+    billet_previous_config: "{{ (billet_previous_config_file.content | b64decode | from_yaml) if billet_previous_config_file.content is defined else {} }}"
+  no_log: true
+
 - name: Resolve the installed server state directory
   ansible.builtin.set_fact:
     billet_previous_server_state_dir: >-
-      {{
-        (
-          (billet_previous_config_file.content | b64decode | from_yaml).get('server', {}).get('identity_dir')
-          or (billet_previous_config_file.content | b64decode | from_yaml).get('server', {}).get('state_dir')
-          or '/var/lib/billet/server'
-        )
-        if billet_previous_config_file.content is defined
-        else billet_candidate_server_state_dir
-      }}
+      {{ (billet_previous_config.server.get('identity_dir') or billet_previous_config.server.get('state_dir') or '/var/lib/billet/server')
+         if billet_previous_config.get('server') is mapping else '' }}
 
 - name: Resolve the installed node state directory
   ansible.builtin.set_fact:
     billet_previous_node_state_dir: >-
-      {{ (billet_previous_config_file.content | b64decode | from_yaml).get('node', {}).get('state_dir', '/var/lib/billet/node')
-         if billet_previous_config_file.content is defined else billet_candidate_node_state_dir }}
+      {{ billet_previous_config.node.get('state_dir', '/var/lib/billet/node')
+         if billet_previous_config.get('node') is mapping else '' }}
 
 - name: Refuse to move installed server state implicitly
   ansible.builtin.assert:
     that:
-      - billet_previous_server_state_dir == billet_candidate_server_state_dir
+      - billet_previous_server_state_dir == billet_configured_server_state_dir
     fail_msg: >-
       This host already uses server state {{ billet_previous_server_state_dir }}.
       Refusing desired path {{ billet_candidate_server_state_dir }} because it
       would abandon the authoritative ledger or CA. Move state during explicit
       offline maintenance, then converge with the installed path.
   when:
-    - billet_installed_config.stat.exists
+    - billet_previous_config.get('server') is mapping
+    - billet_effective_config.get('server') is mapping
     - not billet_interrupted_upgrade | bool
 
 - name: Refuse to move installed node state implicitly
@@ -130,7 +120,8 @@
       would abandon the node identity. Move state during explicit offline
       maintenance, then converge with the installed path.
   when:
-    - billet_installed_config.stat.exists
+    - billet_previous_config.get('node') is mapping
+    - billet_effective_config.get('node') is mapping
     - not billet_interrupted_upgrade | bool
 
 - name: Create billet directories
@@ -141,22 +132,6 @@
     group: "{{ item.group }}"
     mode: "{{ item.mode }}"
   loop: "{{ billet_common_directories + billet_server_directories + billet_node_directories }}"
-  vars:
-    billet_common_directories:
-      - { path: /etc/billet, owner: root, group: "{{ billet_service_group }}", mode: "0750" }
-      - { path: /etc/billet/network, owner: root, group: root, mode: "0755" }
-      - { path: /var/lib/billet, owner: root, group: root, mode: "0755" }
-    billet_server_directories: >-
-      {{ [{'path': billet_candidate_server_state_dir, 'owner': billet_service_user,
-           'group': billet_service_group, 'mode': '0700'}]
-         if billet_candidate_server_state_dir | length > 0 else [] }}
-    billet_node_directories:
-      - { path: "{{ billet_candidate_node_state_dir }}", owner: root, group: root, mode: "0700" }
-      - { path: /var/lib/billet/health, owner: root, group: root, mode: "0750" }
-      - { path: /var/lib/billet/upgrades, owner: root, group: root, mode: "0700" }
-      - { path: "{{ billet_firecracker_stage }}", owner: root, group: root, mode: "0700" }
-      - { path: /srv/jailer, owner: root, group: root, mode: "0755" }
-      - { path: /usr/local/libexec, owner: root, group: root, mode: "0755" }
   become: true
 
 # THE BINARY CHANGE WAS DECIDED, AND ITS CANDIDATE STAGED, BEFORE THE HOLD, in
@@ -310,6 +285,18 @@
     - not billet_interrupted_upgrade | bool
     - not ansible_check_mode
 
+# THE ENDPOINT DECISION, before the configuration is staged or rendered and
+# before the transaction's first stop: what the running node dials against what
+# the render would install, judged by the command over the rendering on stdin.
+- name: Decide the node's endpoint migration before the render
+  ansible.builtin.import_tasks: endpoint-decision.yml
+
+- name: Resolve node environment operands before unit replacement
+  ansible.builtin.import_tasks: node-environment.yml
+
+- name: Select ordinary unit templates by unit name
+  ansible.builtin.import_tasks: unit-operands.yml
+
 - name: Stage candidate systemd units for the upgrade transaction
   ansible.builtin.template:
     src: "{{ item.src }}"
@@ -338,9 +325,7 @@
       - --property=Type
       - --value
       - "{{ item }}"
-  loop:
-    - billet-server.service
-    - billet-node.service
+  loop: "{{ billet_unit_operands.keys() | list }}"
   register: billet_installed_service_types
   changed_when: false
   failed_when: false
@@ -348,16 +333,21 @@
   become: true
   when: not billet_binary_upgrade | default(false)
 
+- name: Key installed readiness observations by unit name
+  ansible.builtin.set_fact:
+    billet_service_types_by_unit: "{{ billet_installed_service_types.results | junioryono.billet.unit_results }}"
+  when: not billet_binary_upgrade | default(false)
+
 - name: Install the billet systemd units
   ansible.builtin.template:
-    src: "{{ item.src }}"
-    dest: "{{ item.dest }}"
+    src: "{{ item.value.src }}"
+    dest: "{{ item.value.dest }}"
     owner: root
     group: root
     mode: "0644"
-  loop:
-    - { src: billet-server.service.j2, dest: /etc/systemd/system/billet-server.service, installed_index: 0 }
-    - { src: billet-node.service.j2, dest: /etc/systemd/system/billet-node.service, installed_index: 1 }
+  loop: "{{ billet_unit_operands | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
   register: billet_systemd_units
   become: true
   notify: Reload systemd
@@ -383,9 +373,14 @@
     # one upgrade to reach notify; optimistic costs a host that will not start.
     billet_systemd_notify_ready: >-
       {{
-        billet_installed_service_types.results[item.installed_index].rc == 0 and
-        (billet_installed_service_types.results[item.installed_index].stdout | trim) == 'notify'
+        billet_service_types_by_unit[item.key].rc == 0 and
+        (billet_service_types_by_unit[item.key].stdout | trim) == 'notify'
       }}
+
+- name: Key unit replacement observations by unit name
+  ansible.builtin.set_fact:
+    billet_unit_templates_by_unit: "{{ billet_systemd_units.results | junioryono.billet.unit_results }}"
+  when: not billet_binary_upgrade | default(false)
 
 - name: Inspect the installed GitHub App private key
   ansible.builtin.stat:
@@ -467,12 +462,6 @@
   loop_control:
     label: "{{ item.name }}"
 
-# THE ENDPOINT DECISION, before the configuration is staged or rendered and
-# before the transaction's first stop: what the running node dials against what
-# the render would install, judged by the command over the rendering on stdin.
-- name: Decide the node's endpoint migration before the render
-  ansible.builtin.import_tasks: endpoint-decision.yml
-
 - name: Stage candidate configuration for the upgrade transaction
   vars:
     billet_config_document: "{{ billet_effective_config }}"
@@ -493,7 +482,7 @@
     billet_config_document: "{{ billet_effective_config }}"
   ansible.builtin.template:
     src: billet.yaml.j2
-    dest: /etc/billet/billet.yaml
+    dest: "{{ billet_ordinary_config_path }}"
     owner: root
     group: "{{ billet_service_group }}"
     mode: "0640"

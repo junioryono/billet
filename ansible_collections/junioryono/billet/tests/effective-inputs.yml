@@ -299,20 +299,19 @@
     # THE SERVER'S DESTINATIONS ARE THEIR OWN LIST, which is what lets commit 3
     # drop them for a retained host without touching the node's. The absent-server
     # EMPTINESS of that list is deferred with the alias it reads: see
-    # vars/main.yml, and the role's binary transaction that would otherwise fence
-    # the filesystem root.
+    # vars/main.yml. The transaction's fence writes INSIDE this directory and is
+    # gated on the binary change alone, so a node-only host still needs it made.
     - name: Require the server's destinations to be a separate, admitted list
       ansible.builtin.assert:
         that:
-          - billet_gate_dirs.vars.billet_server_directories is defined
-          - billet_gate_dirs.vars.billet_node_directories is defined
+          - billet_configured_server_state_dir == '/var/lib/billet/server'
           - billet_server_directories | map(attribute='path') | list == ['/var/lib/billet/server']
           - billet_node_directories | map(attribute='path') | list == ['/var/lib/billet/effective-node', '/var/lib/billet/health', '/var/lib/billet/upgrades', '/var/cache/billet-provision', '/srv/jailer', '/usr/local/libexec']
           - billet_common_directories | map(attribute='path') | list == ['/etc/billet', '/etc/billet/network', '/var/lib/billet']
-      vars:
-        billet_common_directories: "{{ billet_gate_dirs.vars.billet_common_directories }}"
-        billet_server_directories: "{{ billet_gate_dirs.vars.billet_server_directories }}"
-        billet_node_directories: "{{ billet_gate_dirs.vars.billet_node_directories }}"
+
+    - name: Read I through the production installed configuration expression
+      ansible.builtin.set_fact:
+        billet_previous_config: "{{ (billet_gate_account | selectattr('name', 'equalto', 'Keep installed configuration separate from effective input') | first)['ansible.builtin.set_fact'].billet_previous_config }}"
 
     # The two installed observations are separate facts, so a refusal names the one
     # directory that moved.
@@ -366,7 +365,7 @@
       ansible.builtin.assert:
         that:
           - billet_gate_node_move_refused
-          - billet_gate_node_invariant.when == ['billet_installed_config.stat.exists', 'not billet_interrupted_upgrade | bool']
+          - billet_gate_node_invariant.when == ["billet_previous_config.get('node') is mapping", "billet_effective_config.get('node') is mapping", 'not billet_interrupted_upgrade | bool']
 
 - name: Effective server masking preserves the original request policy without reading desired configuration
   hosts: localhost

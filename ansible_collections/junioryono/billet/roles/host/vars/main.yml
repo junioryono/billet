@@ -63,9 +63,13 @@ billet_migration_start_bound: 150
 # to have no operative server path, and that is safe only once a retained host
 # refuses the role's binary transaction (§2.2). It does not yet: the transaction
 # block in services.yml is gated on billet_binary_upgrade alone, NOT on server
-# enablement, so a node-only host upgrading its binary runs it — and an empty
-# answer here fences `/billet.maintenance` at the filesystem root and `cp -a ""`.
-# Commit 3 introduces the refusal and the emptiness together.
+# enablement, so a node-only host upgrading its binary runs it. Answering ''
+# here empties billet_server_directories, /var/lib/billet/server is never
+# created, and the transaction's fence — an ansible.builtin.copy, which does not
+# create parent directories — fails on a host that has done nothing wrong.
+# Giving the candidate a placeholder in upgrade-inspect.yml does not save it:
+# the fence needs the DIRECTORY, not the path. Commit 3 introduces the refusal
+# and the emptiness together.
 #
 # HERE RATHER THAN INLINE so there is ONE definition: upgrade-inspect.yml sets
 # the candidate fact from it and the server unit template reads that fact, and a
@@ -101,3 +105,21 @@ billet_configured_state_backend: >-
 billet_retire_capability_floor: v0.11.0
 # retireReportLedgerBound (two minutes), plus observation/cleanup margin.
 billet_retire_classify_bound: 180
+
+# Ordinary destinations are explicit operands; recovery keeps its manifest.
+billet_ordinary_config_path: /etc/billet/billet.yaml
+billet_common_directories:
+  - { path: /etc/billet, owner: root, group: "{{ billet_service_group }}", mode: "0750" }
+  - { path: /etc/billet/network, owner: root, group: root, mode: "0755" }
+  - { path: /var/lib/billet, owner: root, group: root, mode: "0755" }
+billet_server_directories: >-
+  {{ [{'path': billet_configured_server_state_dir, 'owner': billet_service_user,
+       'group': billet_service_group, 'mode': '0700'}]
+     if billet_configured_server_state_dir | length > 0 else [] }}
+billet_node_directories:
+  - { path: "{{ billet_candidate_node_state_dir }}", owner: root, group: root, mode: "0700" }
+  - { path: /var/lib/billet/health, owner: root, group: root, mode: "0750" }
+  - { path: /var/lib/billet/upgrades, owner: root, group: root, mode: "0700" }
+  - { path: "{{ billet_firecracker_stage }}", owner: root, group: root, mode: "0700" }
+  - { path: /srv/jailer, owner: root, group: root, mode: "0755" }
+  - { path: /usr/local/libexec, owner: root, group: root, mode: "0755" }

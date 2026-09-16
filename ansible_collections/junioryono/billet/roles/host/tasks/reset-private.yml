@@ -20,11 +20,25 @@
     billet_retirement_closing_binding: {}
     billet_retirement_operation_admission: {}
     billet_retirement_operation_document: {}
+    billet_retirement_node_config_argv: []
+    billet_retirement_planned_rendering: ""
+    billet_retirement_rendered_units: []
+    billet_retirement_planned_filesystem: []
+    billet_retirement_planned_services: []
+    billet_retirement_planned_units: {}
+    billet_retirement_provider_plan: null
+    billet_retirement_node_restart: null
     billet_retirement_environment_ready: false
     billet_retirement_environment_file: ""
     billet_retirement_local_environment_file: ""
     billet_node_environment_files: []
     billet_endpoint_confirmation_controller: {}
+    billet_confirmation_revalidate: {}
+    billet_confirmation_failures: []
+    billet_confirmation_candidates: []
+    billet_confirmation_deployment: ""
+    billet_node_environment_opening: null
+    billet_previous_config: {}
     billet_endpoint_rendering: ""
     billet_endpoint_planned: false
     billet_endpoint_migrated: false
@@ -37,6 +51,7 @@
     billet_effective_paths: []
     billet_service_types_by_unit: {}
     billet_unit_templates_by_unit: {}
+    billet_unit_operands: {}
     billet_service_policy_pending_units: []
     billet_service_policy_manager_unit_paths: []
     billet_service_policy_dropin_locations: {}

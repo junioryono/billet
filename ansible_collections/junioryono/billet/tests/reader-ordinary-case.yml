@@ -1,0 +1,37 @@
+---
+- name: Initialize this ordinary shape independently of preceding retained cases
+  ansible.builtin.set_fact:
+    billet_retirement_node_ordinary: false
+    billet_effective_config: "{{ {'node': {'provider': 'docker'}} | combine({'server': {'state_dir': '/var/lib/billet/server'}} if billet_gate_ordinary_shape == 'controller-and-node' else {}) }}"
+    billet_server_environment: {}
+    billet_node_should_run: true
+    billet_binary_upgrade: false
+    billet_endpoint_migrated: false
+    billet_config_install: {changed: false}
+    billet_firecracker_install: {changed: false}
+    billet_firecracker_links: {changed: false}
+    billet_unit_templates_by_unit: {billet-server.service: {changed: false}, billet-node.service: {changed: true}}
+
+- name: Derive the ordinary unit operands through the production task
+  ansible.builtin.include_role:
+    name: junioryono.billet.host
+    tasks_from: unit-operands
+
+- name: Require the ordinary unit order and lifecycle conditions
+  ansible.builtin.assert:
+    that:
+      - billet_unit_operands.keys() | list == ['billet-server.service', 'billet-node.service']
+      - billet_gate_main[-1].block[-1]['ansible.builtin.meta'] == 'flush_handlers'
+      - billet_gate_tail.index("Migrate the node's endpoint before the ordinary restart") < billet_gate_tail.index('Restart the billet node after non-binary inputs change')
+      - billet_gate_tail.index('Restart the billet node after non-binary inputs change') < billet_gate_tail.index('Enable and start the billet node')
+      - billet_gate_tail.index('Enable and start the billet node') < billet_gate_tail.index("Refresh the node's endpoint receipt after the start")
+      - >-
+        (billet_gate_services | selectattr('name', 'equalto', 'Enable and start the billet node') | first).when ==
+        ['billet_node_should_run', 'not ansible_check_mode']
+      - >-
+        (billet_gate_services | selectattr('name', 'equalto', 'Stop and disable the billet node unless it may run here') | first).when ==
+        ['not billet_node_should_run', 'not ansible_check_mode']
+
+- name: Exercise the unchanged production restart predicate on each ordinary shape
+  ansible.builtin.assert:
+    that: "{{ (billet_gate_services | selectattr('name', 'equalto', 'Restart the billet node after non-binary inputs change') | first).when }}"
