@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 // The units a retirement stops, awaits or leaves installed, beside the two
@@ -228,87 +229,98 @@ func underOrEqual(dir, path string) bool {
 // maxWalkLinks is the kernel's symlink budget for one resolution.
 const maxWalkLinks = 40
 
-// walkTraverses answers whether resolving path from the root reaches the
-// identity directory (resolved) or anything under it at ANY component,
-// symlink targets included, and where it could not look. A component that is
-// missing ends the walk with the remainder appended lexically; a component
-// that cannot be examined for any other reason is could-not-tell. The
-// identity directory is compared resolved, so a path spelled through a link
-// to it is caught as well as one spelled through it.
+// walkTraverses models a consumer which can create missing parents. It judges
+// each intermediate component, including after '..' returns to an existing
+// ancestor. It never creates the hypothetical directories itself.
 func walkTraverses(path, identityDir string) (bool, string, error) {
-	if !filepath.IsAbs(path) {
-		return false, "", fmt.Errorf("%s is not absolute", path)
+	if !supportedRetirePath(path) {
+		return false, "", fmt.Errorf("unsupported absolute path spelling %q", path)
 	}
-
 	inside := func(p string) bool { return underOrEqual(identityDir, p) }
-
-	remaining := splitComponents(path)
-	cur := "/"
+	remaining := strings.Split(path, "/")
+	cur, missing := "/", ""
+	rootInfo, err := retireWalkLstat(cur)
+	if err != nil || !rootInfo.IsDir() {
+		return false, "filesystem root could not be observed", nil
+	}
+	observed := map[string]os.FileInfo{cur: rootInfo}
 	links := 0
-
 	for len(remaining) > 0 {
 		comp := remaining[0]
 		remaining = remaining[1:]
-
 		switch comp {
 		case "", ".":
 			continue
 		case "..":
 			cur = filepath.Dir(cur)
-
+			if missing != "" && !underOrEqual(missing, cur) {
+				missing = ""
+			}
 			if inside(cur) {
 				return true, "", nil
 			}
-
 			continue
 		}
-
 		next := filepath.Join(cur, comp)
-
-		info, lerr := os.Lstat(next)
-
-		switch {
-		case errors.Is(lerr, fs.ErrNotExist):
-			// The rest does not exist yet: its lexical shape is all there is,
-			// and a missing component still under the identity directory would
-			// be created there.
-			rest := filepath.Join(append([]string{next}, remaining...)...)
-
-			return inside(next) || inside(rest), "", nil
-		case lerr != nil:
-			return false, fmt.Sprintf("examine %s: %v", next, lerr), nil
-		}
-
-		if info.Mode()&os.ModeSymlink != 0 {
-			links++
-			if links > maxWalkLinks {
-				return false, "", fmt.Errorf("%s: more than %d symlinks on the way", path, maxWalkLinks)
-			}
-
-			target, rerr := os.Readlink(next)
-			if rerr != nil {
-				return false, fmt.Sprintf("read the link %s: %v", next, rerr), nil
-			}
-
-			if filepath.IsAbs(target) {
-				cur = "/"
-			}
-
-			remaining = append(splitComponents(target), remaining...)
-
-			continue
-		}
-
+		// The traversed name matters even when it is a link leading outside.
 		if inside(next) {
 			return true, "", nil
 		}
-
+		if missing != "" {
+			cur = next
+			continue
+		}
+		info, lerr := retireWalkLstat(next)
+		switch {
+		case errors.Is(lerr, fs.ErrNotExist):
+			// ENOENT is absence only while the observed parent still exists.
+			parent, err := retireWalkLstat(cur)
+			if err != nil || !parent.IsDir() || observed[cur] != nil && !os.SameFile(observed[cur], parent) {
+				return false, "inconsistent missing-path parent: " + cur, nil
+			}
+			cur, missing = next, next
+			continue
+		case lerr != nil:
+			return false, fmt.Sprintf("examine %s: %v", next, lerr), nil
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			links++
+			if links > maxWalkLinks {
+				return false, fmt.Sprintf("%s: more than %d symlinks on the way", path, maxWalkLinks), nil
+			}
+			target, err := retireWalkReadlink(next)
+			if err != nil {
+				return false, fmt.Sprintf("read the link %s: %v", next, err), nil
+			}
+			if target == "" || strings.IndexFunc(target, unsafeRetirePathRune) >= 0 {
+				return false, "", fmt.Errorf("unsupported symlink spelling at %s", next)
+			}
+			again, err := retireWalkLstat(next)
+			if err != nil || !os.SameFile(info, again) || info.Mode() != again.Mode() || !info.ModTime().Equal(again.ModTime()) {
+				return false, "link changed during observation: " + next, nil
+			}
+			if filepath.IsAbs(target) {
+				cur = "/"
+			}
+			remaining = append(strings.Split(target, "/"), remaining...)
+			continue
+		}
 		if len(remaining) > 0 && !info.IsDir() {
 			return false, "", fmt.Errorf("%s: %s is not a directory", path, next)
 		}
-
+		observed[next] = info
 		cur = next
 	}
-
 	return inside(cur), "", nil
+}
+
+var retireWalkLstat = os.Lstat
+var retireWalkReadlink = os.Readlink
+
+func unsafeRetirePathRune(r rune) bool {
+	return unicode.IsControl(r) || unicode.IsSpace(r) || strings.ContainsRune(`%\"'`, r)
+}
+
+func supportedRetirePath(path string) bool {
+	return filepath.IsAbs(path) && strings.IndexFunc(path, unsafeRetirePathRune) < 0
 }

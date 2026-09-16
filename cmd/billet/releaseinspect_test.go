@@ -989,6 +989,8 @@ func TestReleaseInspectRechecksTypedEnvironmentFilesAcrossSample(t *testing.T) {
 				reason = "operation-array-unreadable"
 			}
 			mustUnknown(t, "running_sha256", svc.RunningSHA256, reason)
+			mustUnknown(t, "environment_file_specs", svc.EnvironmentFileSpecs, "closing observation")
+			mustUnknown(t, "environment_files", svc.EnvironmentFiles, "closing observation")
 		})
 	}
 }
@@ -2592,6 +2594,7 @@ services.node.config_sha256
 services.node.dsn_env
 services.node.enabled
 services.node.environment_file_changed_since_start
+services.node.environment_file_specs
 services.node.environment_files
 services.node.exec_main_start
 services.node.exec_start
@@ -2614,6 +2617,7 @@ services.server.config_sha256
 services.server.dsn_env
 services.server.enabled
 services.server.environment_file_changed_since_start
+services.server.environment_file_specs
 services.server.environment_files
 services.server.exec_main_start
 services.server.exec_start
@@ -2862,6 +2866,7 @@ services.node.config_sha256
 services.node.dsn_env
 services.node.enabled
 services.node.environment_file_changed_since_start
+services.node.environment_file_specs
 services.node.environment_files
 services.node.exec_main_start
 services.node.exec_start
@@ -2886,6 +2891,7 @@ services.server.dsn_env.name
 services.server.dsn_env.present
 services.server.enabled
 services.server.environment_file_changed_since_start
+services.server.environment_file_specs
 services.server.environment_files
 services.server.exec_main_start
 services.server.exec_start
@@ -2982,6 +2988,7 @@ services.node.config_sha256
 services.node.dsn_env
 services.node.enabled
 services.node.environment_file_changed_since_start
+services.node.environment_file_specs
 services.node.environment_files
 services.node.exec_main_start
 services.node.exec_start
@@ -3004,6 +3011,7 @@ services.server.config_sha256
 services.server.dsn_env
 services.server.enabled
 services.server.environment_file_changed_since_start
+services.server.environment_file_specs
 services.server.environment_files
 services.server.exec_main_start
 services.server.exec_start
