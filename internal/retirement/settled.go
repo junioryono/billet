@@ -93,7 +93,7 @@ func DecodeSettledRefusal(raw []byte, exitCode int, purpose string) (SettledRefu
 	if refusal.Schema != 1 || refusal.Purpose != purpose ||
 		(purpose != PurposeSettledEntry && purpose != PurposeSettledClosing) || refusal.State != "nothing" ||
 		refusal.Reason == "" || refusal.Why == "" ||
-		!(exitCode == 2 && refusal.Outcome == "refused" || exitCode == 3 && refusal.Outcome == "unknown") {
+		(exitCode != 2 || refusal.Outcome != "refused") && (exitCode != 3 || refusal.Outcome != "unknown") {
 		return refusal, fmt.Errorf("not a settled refusal with matching exit semantics")
 	}
 	return refusal, nil
