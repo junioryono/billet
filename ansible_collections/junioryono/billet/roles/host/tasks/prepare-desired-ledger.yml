@@ -1,0 +1,57 @@
+---
+# Selected only after the binary decision: an unchanged capable installation
+# must reach journal classification without evaluating desired configuration.
+# This is a preparation operand, never ordinary E or historical recovery data.
+- name: Require a mapping for a preparation decision that needs desired configuration
+  ansible.builtin.assert:
+    that:
+      - billet_config is mapping
+    fail_msg: A binary installation/change or pre-guard executable requires a desired configuration mapping.
+
+- name: Validate the desired controller subtree needed by preparation
+  ansible.builtin.assert:
+    that:
+      - billet_config.server is mapping
+      - billet_config.server.state is not defined or billet_config.server.state is mapping
+    fail_msg: The desired server and its state, when present, must be mappings for the preparation ledger decision.
+  when: "'server' in billet_config"
+
+- name: Resolve only the desired ledger operand for preparation
+  ansible.builtin.set_fact:
+    billet_preparation_state_backend: >-
+      {{ (billet_config.server.get('state', {}).get('backend') or 'sqlite')
+         if 'server' in billet_config else '' }}
+
+- name: Refuse a transactional binary change against an external ledger
+  ansible.builtin.assert:
+    that:
+      - not (billet_binary_upgrade | default(false))
+    fail_msg: >-
+      This host's ledger is {{ billet_preparation_state_backend }} and this
+      role's transaction snapshots a state directory an external ledger does
+      not have. billet upgrades such a host itself: billet-upgrade.timer runs
+      `billet host-upgrade --from-rollout` against the rollout the ledger
+      records, fencing, snapshotting and migrating nothing and letting the
+      candidate migrate when it claims. For a first install, put
+      {{ billet_exclusion_binary }} in place yourself, at or after the release
+      that carries the converge guard, with billet-server and billet-node
+      STOPPED, then converge this role again; with the binary already in place
+      the role does everything else, including the config, the units, the
+      timers and {{ billet_server_environment_path }}. See
+      docs/deploying/postgres-and-active-passive.md.
+  when: billet_preparation_state_backend not in ['', 'sqlite']
+
+# A PRE-R MANAGED BINARY ON A POSTGRESQL CONTROLLER is a controller the role
+# cannot move and cannot hold: refused, naming the same route.
+- name: Refuse a PostgreSQL controller whose binary predates the guard
+  ansible.builtin.assert:
+    that:
+      - not (billet_exclusion_managed_pre_r | default(false) | bool)
+    fail_msg: >-
+      {{ billet_exclusion_binary }} predates the converge guard, and this host's
+      ledger is {{ billet_preparation_state_backend }}, which this role's
+      transaction cannot move. Put a billet at or after the release that carries
+      the converge guard in place by the package or by `billet host-upgrade`,
+      with billet-server and billet-node STOPPED, then converge again.
+  when: billet_preparation_state_backend not in ['', 'sqlite']
+

@@ -132,33 +132,34 @@ sections_ran="shared checks"
 "$python" "$here/strict_json_check.py"
 "$python" "$here/holder_check.py"
 
-# --- the guard runs first, the preparation second ---------------------------
-first_task=$(grep -n '^- name:' "$role_tasks/main.yml" | head -1 | cut -d: -f1)
-guard_task=$(grep -n '^- name: Refuse a converge that would destroy the job running it' "$role_tasks/main.yml" | head -1 | cut -d: -f1)
-if [ -z "$guard_task" ] || [ "$first_task" != "$guard_task" ]; then
-  fail "the converge guard is not the first task in main.yml (first task at line ${first_task:-none}, guard at line ${guard_task:-none})"
-fi
-second_task=$(grep -n '^- name:' "$role_tasks/main.yml" | sed -n 2p | cut -d: -f1)
-prepare_task=$(grep -n '^- name: Prepare the exclusion before anything changes this host' "$role_tasks/main.yml" | head -1 | cut -d: -f1)
-if [ -z "$prepare_task" ] || [ "$second_task" != "$prepare_task" ]; then
-  fail "the exclusion's preparation is not the second task in main.yml (second at line ${second_task:-none}, preparation at line ${prepare_task:-none})"
-fi
-"$python" - "$role_tasks/prepare-exclusion.yml" <<'PYPREPORDER'
+# --- connection-free resets, then the guard before host operations -----------
+"$python" - "$role_tasks" <<'PYPREPORDER'
 import pathlib, sys, yaml
-tasks = yaml.safe_load(pathlib.Path(sys.argv[1]).read_text())
-reset, guard = tasks[:2]
+root = pathlib.Path(sys.argv[1])
+main = yaml.safe_load((root / 'main.yml').read_text())
+if [task.get('ansible.builtin.import_tasks') for task in main[:3]] != [
+        'reset-private.yml', 'converge-guard.yml', 'prepare-exclusion.yml']:
+    sys.exit('main.yml must reset private permission, refuse the driving runner, then prepare before host operations')
+tasks = yaml.safe_load((root / 'prepare-exclusion.yml').read_text())
+reset, private, guard = tasks[:3]
 if (reset.get('name') != "Reset this inclusion's exclusion permission"
         or 'ansible.builtin.set_fact' not in reset
         or any(key in reset for key in ['when', 'delegate_to', 'delegate_facts'])):
     sys.exit('prepare-exclusion.yml must reset permission without a connection before every fallible preparation task')
+if private.get('ansible.builtin.import_tasks') != 'reset-private.yml':
+    sys.exit('prepare-exclusion.yml must clear private inputs on every inclusion')
 if (guard.get('name') != 'Refuse a converge that would destroy the job running it'
         or guard.get('ansible.builtin.import_tasks') != 'converge-guard.yml'):
-    sys.exit('prepare-exclusion.yml must import the runner refusal immediately after the permission reset')
+    sys.exit('prepare-exclusion.yml must import the runner refusal immediately after the permission resets')
+private_tasks = yaml.safe_load((root / 'reset-private.yml').read_text())
+if (len(private_tasks) != 1 or 'ansible.builtin.set_fact' not in private_tasks[0]
+        or any(key in private_tasks[0] for key in ['when', 'delegate_to', 'delegate_facts'])):
+    sys.exit('the private reset must be one unconditional connection-free fact assignment')
 PYPREPORDER
 if [ -e "$here/../plugins/modules/guard_status.py" ] || [ -e "$here/guard_status_check.py" ]; then
   fail "the status module is gone from the role; its files must be gone from the collection"
 fi
-echo "ok   the guard is first in the role, preparation second; preparation resets permission first and imports the runner refusal second"
+echo "ok   private resets precede the runner refusal; preparation holds before host operations"
 
 # --- the fakes ---------------------------------------------------------------
 fakes="$work/fakes"

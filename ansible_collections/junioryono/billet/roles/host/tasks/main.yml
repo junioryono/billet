@@ -1,5 +1,8 @@
 ---
-# FIRST, BEFORE EVERY OTHER TASK, and in its own file so the gate can exercise it
+- name: Clear private permission before the host entry can refuse
+  ansible.builtin.import_tasks: reset-private.yml
+
+# BEFORE EVERY HOST OPERATION, and in its own file so the gate can exercise it
 # with tasks_from -- without that, a fixture has to satisfy the whole role's
 # validation before it reaches the guard, and every "this case is allowed" check
 # ends up failing for an unrelated reason instead of passing.

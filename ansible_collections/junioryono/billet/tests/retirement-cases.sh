@@ -321,6 +321,36 @@ for fixture in dry-run-continue dry-run-unknown-ledger dry-run-unknown-journal d
   expect_no_task "$name" 'Inspect the transaction claim before recovery'
 done
 
+# R3/R5 lazy preparation: real main must reach the journal-only command with
+# unusable D. The unsettled case reports its pending row and ends as before.
+# No retained journal is admitted here; R10 remains the retained-route refusal.
+for kind in null-server malformed undefined-config; do
+  name=r3-lazy-$kind
+  r_plant "$name"
+  case "$kind" in
+    null-server) desired='{"billet_config":{"server":null}}' ;;
+    malformed) desired='{"billet_config":["not-a-config-mapping"]}' ;;
+    undefined-config) desired='{"billet_config":"{{ billet_gate_undefined_desired }}"}' ;;
+  esac
+  a "$name" -e "$desired" -e billet_retirement_survivor_host=unreachable
+  if [ "$kind" = undefined-config ]; then
+    r_answers "$name" 'control-a:classify:1:dry-run-continue-done-unsettled.json:0;control-a:request:1:retired-pending.json:0'
+  else
+    r_answers "$name" 'control-a:classify:1:dry-run-continue.json:0;control-a:request:1:retired-settled.json:0'
+  fi
+  r_run "$name" play-retirement-main
+  expect_allowed "$name"
+  expect_no_ordinary "$name"
+  expect_host_commands "$name" 'control-a retire-classify 1;control-a retire-request 1;'
+  r_continuation "$name" 1
+  r_reported "$name" continue
+  expect_no_task "$name" 'Resolve only the desired ledger operand for preparation'
+  expect_no_task "$name" 'Stage the immutable candidate binary inside its recovery journal'
+  if [ "$kind" = undefined-config ]; then
+    expect_ran "$name" "Report a row obligation whose survivor this converge did not prepare"
+  fi
+done
+
 # Judge the task's own changed result, not preparation's recap. The settled
 # controls must report ok; a republished status must report changed even when
 # the outcome word is unchanged. Also require the final settlement message.

@@ -1,0 +1,47 @@
+---
+# No desired input, connection, or previous permission may enter this reset.
+# Guard ownership and historical recovery operands have their own lifetime in
+# prepare-exclusion.yml; these facts authorize only work in this inclusion.
+- name: Reset this inclusion's private host inputs and permissions
+  ansible.builtin.set_fact:
+    billet_effective_config: {}
+    billet_effective_ready: false
+    billet_server_effective: false
+    billet_server_should_run: false
+    billet_requested_server_should_run: false
+    billet_retirement_node_verified: false
+    billet_retirement_node_ordinary: false
+    billet_retirement_bypass: true
+    billet_retirement_route: hold
+    billet_retirement_classification: {}
+    billet_retirement_entry_result: {}
+    billet_retirement_entry_binding: {}
+    billet_retirement_closing_result: {}
+    billet_retirement_closing_binding: {}
+    billet_retirement_operation_admission: {}
+    billet_retirement_operation_document: {}
+    billet_retirement_environment_ready: false
+    billet_retirement_environment_file: ""
+    billet_retirement_local_environment_file: ""
+    billet_node_environment_files: []
+    billet_endpoint_confirmation_controller: {}
+    billet_endpoint_rendering: ""
+    billet_endpoint_planned: false
+    billet_endpoint_migrated: false
+    billet_preparation_state_backend: ""
+    billet_github_key_required: false
+    billet_github_key_managed: false
+    billet_github_key_path: ""
+    billet_github_key_path_is_string: false
+    billet_github_target_keys: []
+    billet_effective_paths: []
+    billet_service_types_by_unit: {}
+    billet_unit_templates_by_unit: {}
+    billet_service_policy_pending_units: []
+    billet_service_policy_manager_unit_paths: []
+    billet_service_policy_dropin_locations: {}
+    billet_retire_answer: {}
+    billet_retire_route: ""
+    billet_retire_state_known: false
+    billet_retire_valid: false
+    billet_retire_reservation: ""

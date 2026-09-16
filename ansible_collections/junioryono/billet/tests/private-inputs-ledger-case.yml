@@ -1,0 +1,15 @@
+---
+- name: Read desired configuration only within the selected preparation include
+  ansible.builtin.include_role:
+    name: junioryono.billet.host
+    tasks_from: prepare-desired-ledger
+  vars:
+    billet_config: "{{ billet_gate_ledger_case.config }}"
+    billet_binary_upgrade: true
+    billet_exclusion_managed_pre_r: false
+
+- name: Require the desired ledger decision without inventing a node-only ledger
+  ansible.builtin.assert:
+    that:
+      - billet_preparation_state_backend == billet_gate_ledger_case.backend
+    fail_msg: Preparation changed the ordinary ledger decision or invented a ledger on a node-only host.

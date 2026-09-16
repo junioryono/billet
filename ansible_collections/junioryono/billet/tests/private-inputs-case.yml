@@ -1,0 +1,109 @@
+---
+- name: Plant the preceding inclusion's inputs and permissions
+  ansible.builtin.set_fact:
+    billet_effective_config: {node: {name: stale-node}}
+    billet_effective_ready: true
+    billet_server_effective: true
+    billet_server_should_run: true
+    billet_requested_server_should_run: true
+    billet_retirement_node_verified: true
+    billet_retirement_node_ordinary: true
+    billet_retirement_bypass: false
+    billet_retirement_route: ordinary
+    billet_retirement_classification: {route: ordinary}
+    billet_retirement_entry_result: {outcome: admitted}
+    billet_retirement_entry_binding: {run: previous}
+    billet_retirement_closing_result: {outcome: verified}
+    billet_retirement_closing_binding: {run: previous}
+    billet_retirement_operation_admission: {outcome: admitted}
+    billet_retirement_operation_document: {run: previous}
+    billet_retirement_environment_ready: true
+    billet_retirement_environment_file: /etc/billet/old-server.env
+    billet_retirement_local_environment_file: /etc/billet/old-local.env
+    billet_node_environment_files: [{path: /etc/billet/old-node.env, ignore_errors: false}]
+    billet_endpoint_confirmation_controller: {host: old-controller}
+    billet_endpoint_rendering: old-rendering
+    billet_endpoint_planned: true
+    billet_endpoint_migrated: true
+    billet_preparation_state_backend: postgres
+    billet_github_key_required: true
+    billet_github_key_managed: true
+    billet_github_key_path: /etc/billet/old-key.pem
+    billet_github_key_path_is_string: true
+    billet_github_target_keys: [{name: removed-target, path: /etc/billet/old-key.pem}]
+    billet_effective_paths: [/var/lib/billet/old-controller]
+    billet_service_types_by_unit: {billet-node.service: simple}
+    billet_unit_templates_by_unit: {billet-server.service: old-rendering}
+    billet_service_policy_pending_units: [billet-server.service]
+    billet_service_policy_manager_unit_paths: [/old-unit-path]
+    billet_service_policy_dropin_locations: {billet-server.service: [/old-dropin]}
+    billet_retire_answer: {outcome: retired}
+    billet_retire_route: ordinary
+    billet_retire_state_known: true
+    billet_retire_valid: true
+    billet_retire_reservation: released
+    billet_exclusion_held: true
+    billet_exclusion_holder: current-holder
+    billet_exclusion_id: current-guard
+    billet_upgrade_claim_shape: guard-pointer
+    billet_interrupted_upgrade: true
+    billet_upgrade_recovery_dir: /recorded/recovery
+
+- name: Run the production connection-free private reset
+  ansible.builtin.include_role:
+    name: junioryono.billet.host
+    tasks_from: reset-private
+
+- name: Refuse any permission or operative input left by the preceding inclusion
+  ansible.builtin.assert:
+    that:
+      - billet_effective_config == {}
+      - billet_effective_ready is sameas false
+      - billet_server_effective is sameas false
+      - billet_server_should_run is sameas false
+      - billet_requested_server_should_run is sameas false
+      - billet_retirement_node_verified is sameas false
+      - billet_retirement_node_ordinary is sameas false
+      - billet_retirement_bypass is sameas true
+      - billet_retirement_route == 'hold'
+      - billet_retirement_classification == {}
+      - billet_retirement_entry_result == {}
+      - billet_retirement_entry_binding == {}
+      - billet_retirement_closing_result == {}
+      - billet_retirement_closing_binding == {}
+      - billet_retirement_operation_admission == {}
+      - billet_retirement_operation_document == {}
+      - billet_retirement_environment_ready is sameas false
+      - billet_retirement_environment_file == ''
+      - billet_retirement_local_environment_file == ''
+      - billet_node_environment_files == []
+      - billet_endpoint_confirmation_controller == {}
+      - billet_endpoint_rendering == ''
+      - billet_endpoint_planned is sameas false
+      - billet_endpoint_migrated is sameas false
+      - billet_preparation_state_backend == ''
+      - billet_github_key_required is sameas false
+      - billet_github_key_managed is sameas false
+      - billet_github_key_path == ''
+      - billet_github_key_path_is_string is sameas false
+      - billet_github_target_keys == []
+      - billet_effective_paths == []
+      - billet_service_types_by_unit == {}
+      - billet_unit_templates_by_unit == {}
+      - billet_service_policy_pending_units == []
+      - billet_service_policy_manager_unit_paths == []
+      - billet_service_policy_dropin_locations == {}
+      - billet_retire_answer == {}
+      - billet_retire_route == ''
+      - billet_retire_state_known is sameas false
+      - billet_retire_valid is sameas false
+      - billet_retire_reservation == ''
+      - billet_enable_server is sameas true
+      - billet_migration_controller == 'controller-chosen-by-inventory'
+      - billet_exclusion_held is sameas true
+      - billet_exclusion_holder == 'current-holder'
+      - billet_exclusion_id == 'current-guard'
+      - billet_upgrade_claim_shape == 'guard-pointer'
+      - billet_interrupted_upgrade is sameas true
+      - billet_upgrade_recovery_dir == '/recorded/recovery'
+    fail_msg: Private admission or inputs survived a reset, or the reset changed public policy or historical guard ownership.
