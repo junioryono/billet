@@ -363,7 +363,7 @@ func admitRetireNodeOperations(ctx context.Context, m retireMode, j retirement.J
 	}
 	j.RetainedInvocation = nil
 	protection := retireOperationProtection(j)
-	protected := append(slices.Clone(protection.Paths), j.IdentityDir)
+	protected := slices.Clone(protection.Paths)
 	for _, unit := range []string{serverUnit, backupServiceUnit, backupTimerUnit, upgradeTimerUnit, "billet-upgrade.service"} {
 		for _, dir := range []string{"/etc/systemd/system", "/run/systemd/system", "/usr/lib/systemd/system", "/lib/systemd/system"} {
 			protected = append(protected, filepath.Join(dir, unit), filepath.Join(dir, unit+".d"))
@@ -377,7 +377,11 @@ func admitRetireNodeOperations(ctx context.Context, m retireMode, j retirement.J
 		}
 		protected = append(protected, strings.Fields(firstProp(props, "DropInPaths"))...)
 	}
+	// Filesystem destinations may never recreate the identity directory.
+	// Service effects keep its ownership in UnitPaths: the server's own
+	// StateDirectory must not overlap an unconditional copy of itself.
 	protection.Paths = protected
+	protected = append(slices.Clone(protected), j.IdentityDir)
 	protection.ArchivedInputRoots = []string{j.IdentityDir}
 	protection.RetainedPathUnits = []string{nodeUnit}
 	protection.RequiredInputs[nodeUnit] = []string{m.configPath}
@@ -443,16 +447,24 @@ func admitRetireNodeOperations(ctx context.Context, m retireMode, j retirement.J
 				return retireRefuse(retireReasonEffects, "a unit destination requires its exact proposed unit document", "")
 			}
 		}
-		// Environment retention never grants a credential write or removal.
+		// Removing a traversed name breaks the unit's input even when its
+		// symlink target lives outside the operation's destination.
 		for _, spec := range environment {
 			if op.Kind != "read" && op.Kind != "mkdir" {
 				resolved, err := lifeops.ResolveOperationPath(op.Path)
-				env, envErr := lifeops.ResolveOperationPath(spec.Path)
-				if err != nil || envErr != nil {
+				if err != nil {
 					return retireUnknown(retireReasonNodePath, "environment operation path could not be resolved", "")
 				}
-				if resolved == env || recursive && underOrEqual(resolved, env) {
-					return retireRefuse(retireReasonNodePath, "retaining an environment file grants no mutation of it", "")
+				for _, destination := range []string{op.Path, resolved} {
+					traverses, unknown, err := walkTraverses(spec.Path, destination)
+					switch {
+					case err != nil:
+						return retireRefuse(retireReasonNodePath, err.Error(), "")
+					case unknown != "":
+						return retireUnknown(retireReasonNodePath, unknown, "")
+					case traverses:
+						return retireRefuse(retireReasonNodePath, "retaining an environment file grants no mutation of its pathname, traversal or target", "")
+					}
 				}
 			}
 		}

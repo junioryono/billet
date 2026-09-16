@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"errors"
+	"os"
 	"os/user"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -71,6 +73,66 @@ func TestRetiredMaskedAccountUsesRecordedLocalIdentity(t *testing.T) {
 				}
 			} else if r == nil || !strings.HasPrefix(r.Reason, "retired-account-") {
 				t.Fatalf("%s was not refused by account observation: %+v", scenario, r)
+			}
+		})
+	}
+}
+
+// Removing proveRetireMaskedAccount from observeRetireOrdinaryEntry must turn
+// each account refusal into the same admission as the matching-mask control.
+func TestRetirementNodeConfigChecksMaskedAccountAtOrdinaryEntry(t *testing.T) {
+	f, j := settledNodeConfigFixture(t)
+	mask := filepath.Join(t.TempDir(), serverUnit)
+	mustOK(t, os.Symlink("/dev/null", mask))
+	f.manager.set(serverUnit, "LoadState", "masked")
+	f.manager.set(serverUnit, "UnitFileState", "masked")
+	setRetireEffect(t, f, serverUnit, "FragmentPath", mask)
+	setRetireEffect(t, f, serverUnit, "User", "")
+	setRetireEffect(t, f, serverUnit, "Group", "")
+	account := retirement.ServiceAccount{User: "billet", UID: 123, Group: "billet", GID: 456}
+	savedUser, savedGroup := retireLookupUser, retireLookupGroup
+	t.Cleanup(func() { retireLookupUser, retireLookupGroup = savedUser, savedGroup })
+	for _, scenario := range []string{"matching", "uid", "gid", "home", "missing record"} {
+		t.Run(scenario, func(t *testing.T) {
+			mustOK(t, retirement.WriteServiceAccount(account))
+			if scenario == "missing record" {
+				mustOK(t, os.Remove(retirement.ServiceAccountPath()))
+			}
+			retireLookupUser = func(name string) (*user.User, error) {
+				if name != account.User {
+					t.Fatalf("looked up an unrecorded user: %q", name)
+				}
+				u := &user.User{Username: name, Uid: "123", Gid: "456", HomeDir: retirement.Root}
+				switch scenario {
+				case "uid":
+					u.Uid = "789"
+				case "gid":
+					u.Gid = "789"
+				case "home":
+					u.HomeDir = "/unrelated"
+				}
+				return u, nil
+			}
+			retireLookupGroup = func(name string) (*user.Group, error) {
+				if name != account.Group {
+					t.Fatalf("looked up an unrecorded group: %q", name)
+				}
+				return &user.Group{Name: name, Gid: "456"}, nil
+			}
+			forbidNodeConfigWrites(t, f)
+			out, code := runNodeConfigCheck(t, f, j, nodeConfigDocument(t, f, j, mustRead(t, f.cfg), emptyNodeOperations()))
+			if scenario == "matching" {
+				if code != 0 || retireAnswer(t, out)["outcome"] != "admitted" {
+					t.Fatalf("persistent-mask control refused: %s", out)
+				}
+				return
+			}
+			wantCode, wantReason := exitRefused, "retired-account-mismatch"
+			if scenario == "missing record" {
+				wantCode, wantReason = exitUnknown, "retired-account-observation"
+			}
+			if code != wantCode || retireAnswer(t, out)["reason"] != wantReason {
+				t.Fatalf("%s reached ordinary admission or another refusal: %s", scenario, out)
 			}
 		})
 	}

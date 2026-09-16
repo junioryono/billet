@@ -66,7 +66,7 @@ func forbidNodeConfigWrites(t *testing.T, f *requestFixture) {
 	t.Helper()
 	before := map[string]string{}
 	absent := []string{}
-	for _, path := range []string{f.cfg, retirement.JournalPath(), retirement.StatusPath(), filepath.Join(f.guard.active(), guardRecordName)} {
+	for _, path := range []string{f.cfg, retirement.JournalPath(), retirement.StatusPath(), retirement.ServiceAccountPath(), filepath.Join(f.guard.active(), guardRecordName)} {
 		body, err := os.ReadFile(path)
 		if errors.Is(err, fs.ErrNotExist) {
 			absent = append(absent, path)
@@ -143,6 +143,119 @@ func TestRetirementNodeConfigAdmitsQuietEntryWithoutDrainOrRegistration(t *testi
 			}
 			if verdict.NodeActivity != wantActivity || strings.Contains(out, "postconditions") {
 				t.Fatalf("entry claimed a completed running-node proof: %s", out)
+			}
+		})
+	}
+}
+
+// Reintroducing identity-directory protection in unconditional service Paths
+// refuses the server's own shipped StateDirectory even with no planned work.
+func TestRetirementNodeConfigAdmitsPackagedServiceDirectories(t *testing.T) {
+	f, j := settledNodeConfigFixture(t)
+	for _, unit := range []string{serverUnit, nodeUnit} {
+		body := mustRead(t, filepath.Join("..", "..", "deploy", unit))
+		props, err := retireOperationInspector().UnitProperties(t.Context(), unit, "FragmentPath")
+		mustOK(t, err)
+		source := firstProp(props, "FragmentPath")
+		body = strings.ReplaceAll(body, "/usr/bin/billet", installedBinary)
+		body = strings.ReplaceAll(body, "/etc/billet/billet.yaml", f.cfg)
+		writeFile(t, source, body, 0o644)
+		for _, line := range strings.Split(body, "\n") {
+			key, value, ok := strings.Cut(line, "=")
+			if !ok {
+				continue
+			}
+			switch key {
+			case "StateDirectory", "RuntimeDirectory", "ReadOnlyPaths", "ReadWritePaths", "User", "Group":
+				setRetireEffect(t, f, unit, key, value)
+			case "KillMode":
+				f.manager.set(unit, key, value)
+			case "PrivateTmp":
+				if value != "true" {
+					t.Fatalf("shipped PrivateTmp changed: %s", value)
+				}
+				setRetireEffect(t, f, unit, key, "yes")
+				setRetireEffect(t, f, unit, "RequiresMountsFor", "/var/tmp")
+			}
+		}
+	}
+	server, err := retireOperationInspector().UnitProperties(t.Context(), serverUnit, "StateDirectory", "RuntimeDirectory")
+	mustOK(t, err)
+	node, err := retireOperationInspector().UnitProperties(t.Context(), nodeUnit, "StateDirectory", "RuntimeDirectory")
+	mustOK(t, err)
+	if firstProp(server, "StateDirectory") != "billet/server" || firstProp(server, "RuntimeDirectory") != "" ||
+		firstProp(node, "StateDirectory") != "billet/node" || firstProp(node, "RuntimeDirectory") != "billet/locks billet/registration" {
+		t.Fatal("control lost the shipped directory declarations")
+	}
+	// The archive stays in the fixture; its old location models the packaged
+	// host. The command only observes this pathname and must never create it.
+	j.IdentityDir = "/var/lib/billet/server"
+	j.Locator.IdentityDir = j.IdentityDir
+	j.RetainedInvocation.IdentityDir = j.IdentityDir
+	if _, err := os.Lstat(j.IdentityDir); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("packaged retired identity must be absent for this control: %v", err)
+	}
+	mustOK(t, j.Write(retireNow()))
+	forbidNodeConfigWrites(t, f)
+	for _, verb := range []string{"", "start"} {
+		operations := emptyNodeOperations()
+		if verb != "" {
+			operations.Services = []retireServiceOperation{{Verb: verb, Unit: nodeUnit}}
+		}
+		out, code := runNodeConfigCheck(t, f, j, nodeConfigDocument(t, f, j, mustRead(t, f.cfg), operations))
+		if code != 0 || retireAnswer(t, out)["outcome"] != "admitted" {
+			t.Fatalf("packaged service directories refused %q: %s", verb, out)
+		}
+	}
+	if _, err := os.Lstat(j.IdentityDir); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("preflight created the retired identity: %v", err)
+	}
+}
+
+// Comparing only resolved environment targets admits the pathname and
+// intermediate-link deletions. Each case first admits the unchanged host.
+func TestRetirementNodeConfigProtectsEnvironmentPathnameAndTraversal(t *testing.T) {
+	f, j := settledNodeConfigFixture(t)
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	mustOK(t, err)
+	target := filepath.Join(root, "etc", "billet", "server.env")
+	tree := filepath.Join(root, "opt", "env-tree")
+	mustOK(t, os.MkdirAll(filepath.Dir(target), 0o700))
+	mustOK(t, os.MkdirAll(tree, 0o700))
+	writeFile(t, target, "", 0o600)
+	path := filepath.Join(tree, "node.env")
+	mustOK(t, os.Symlink(target, path))
+	alias := filepath.Join(root, "env-alias")
+	mustOK(t, os.Symlink(tree, alias))
+	props, err := retireOperationInspector().UnitProperties(t.Context(), nodeUnit, "FragmentPath")
+	mustOK(t, err)
+	source := firstProp(props, "FragmentPath")
+	before := mustRead(t, source)
+	for _, c := range []struct{ name, input, destination string }{
+		{"lexical parent", path, tree},
+		{"lexical leaf", path, path},
+		{"intermediate target", filepath.Join(alias, "node.env"), tree},
+		{"resolved target", path, target},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			setRetireEffect(t, f, nodeUnit, "EnvironmentFiles", c.input+" (ignore_errors=no)")
+			writeFile(t, source, before+"[Service]\nEnvironmentFile="+c.input+"\n", 0o644)
+			forbidNodeConfigWrites(t, f)
+			operations := emptyNodeOperations()
+			operations.Filesystem = []retireFilesystemOperation{{Kind: "recursive-delete", Path: filepath.Join(root, "unrelated")}}
+			out, code := runNodeConfigCheck(t, f, j, nodeConfigDocument(t, f, j, mustRead(t, f.cfg), operations))
+			if code != 0 {
+				t.Fatalf("retained environment control refused: %s", out)
+			}
+			operations.Filesystem[0].Path = c.destination
+			out, code = runNodeConfigCheck(t, f, j, nodeConfigDocument(t, f, j, mustRead(t, f.cfg), operations))
+			if code != exitRefused || retireAnswer(t, out)["reason"] != retireReasonNodePath || !strings.Contains(out, "retaining an environment file grants no mutation") {
+				t.Fatalf("environment pathname destruction admitted or hit another refusal: %s", out)
+			}
+			link, err := os.Readlink(path)
+			mustOK(t, err)
+			if link != target || mustRead(t, target) != "" {
+				t.Fatal("read-only admission changed the environment input")
 			}
 		})
 	}
@@ -248,6 +361,7 @@ func TestTheRetireNodeConfigFixturesAreTheCommandsOwn(t *testing.T) {
 			}))
 		})
 	}
+	fixtureSetIs(t, "retire-node-config", []string{"active", "inactive", "failed"})
 }
 
 func TestRetirementNodeConfigRequiresSettledBoundRecordsWithoutRepair(t *testing.T) {

@@ -244,6 +244,18 @@ func walkTraverses(path, identityDir string) (bool, string, error) {
 		return false, "filesystem root could not be observed", nil
 	}
 	observed := map[string]os.FileInfo{cur: rootInfo}
+	consistent := func(name string, info os.FileInfo) bool {
+		before, seen := observed[name]
+		if !seen {
+			observed[name] = info
+			return true
+		}
+		if before == nil || info == nil {
+			return before == nil && info == nil
+		}
+		return os.SameFile(before, info) && before.Mode() == info.Mode() &&
+			(before.Mode()&os.ModeSymlink == 0 || before.ModTime().Equal(info.ModTime()))
+	}
 	links := 0
 	for len(remaining) > 0 {
 		comp := remaining[0]
@@ -259,6 +271,12 @@ func walkTraverses(path, identityDir string) (bool, string, error) {
 			if inside(cur) {
 				return true, "", nil
 			}
+			if missing == "" {
+				info, err := retireWalkLstat(cur)
+				if err != nil || !info.IsDir() || !consistent(cur, info) {
+					return false, "inconsistent revisited component: " + cur, nil
+				}
+			}
 			continue
 		}
 		next := filepath.Join(cur, comp)
@@ -273,15 +291,21 @@ func walkTraverses(path, identityDir string) (bool, string, error) {
 		info, lerr := retireWalkLstat(next)
 		switch {
 		case errors.Is(lerr, fs.ErrNotExist):
+			if !consistent(next, nil) {
+				return false, "inconsistent revisited component: " + next, nil
+			}
 			// ENOENT is absence only while the observed parent still exists.
 			parent, err := retireWalkLstat(cur)
-			if err != nil || !parent.IsDir() || observed[cur] != nil && !os.SameFile(observed[cur], parent) {
+			if err != nil || !parent.IsDir() || !consistent(cur, parent) {
 				return false, "inconsistent missing-path parent: " + cur, nil
 			}
 			cur, missing = next, next
 			continue
 		case lerr != nil:
 			return false, fmt.Sprintf("examine %s: %v", next, lerr), nil
+		}
+		if !consistent(next, info) {
+			return false, "inconsistent revisited component: " + next, nil
 		}
 		if info.Mode()&os.ModeSymlink != 0 {
 			links++
@@ -308,7 +332,6 @@ func walkTraverses(path, identityDir string) (bool, string, error) {
 		if len(remaining) > 0 && !info.IsDir() {
 			return false, "", fmt.Errorf("%s: %s is not a directory", path, next)
 		}
-		observed[next] = info
 		cur = next
 	}
 	return inside(cur), "", nil
