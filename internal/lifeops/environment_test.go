@@ -101,3 +101,30 @@ func TestServiceInspectionProvesEmptyStructuredArrays(t *testing.T) {
 		})
 	}
 }
+
+func TestEnvironmentFileRenderingPreservesTheLiteralGrammar(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		files  []EnvironmentFile
+		want   string
+		refuse bool
+	}{
+		{"empty", []EnvironmentFile{}, "", false},
+		{"required", []EnvironmentFile{{Path: "/etc/node.env"}}, "EnvironmentFile=/etc/node.env\n", false},
+		{"optional", []EnvironmentFile{{Path: "/etc/node.env", IgnoreErrors: true}}, "EnvironmentFile=-/etc/node.env\n", false},
+		{"unknown", nil, "", true},
+		{"multiple", []EnvironmentFile{{Path: "/etc/a"}, {Path: "/etc/b"}}, "", true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := RenderEnvironmentFiles(c.files)
+			if (err != nil) != c.refuse || got != c.want {
+				t.Fatalf("rendered %q, %v; want %q refusal=%v", got, err, c.want, c.refuse)
+			}
+		})
+	}
+	for _, path := range []string{"relative", "/etc/a b", "/etc/a\t", "/etc/a\x7f", "/etc/%S", `/etc/a\x20b`, `/etc/"a"`, "/etc/a*", "/etc/a\u00a0b"} {
+		if _, err := RenderEnvironmentFiles([]EnvironmentFile{{Path: path}}); err == nil || !strings.Contains(err.Error(), "literal unit grammar") {
+			t.Fatalf("unsupported path was rendered: %q %v", path, err)
+		}
+	}
+}

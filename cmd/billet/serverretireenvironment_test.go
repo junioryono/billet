@@ -170,3 +170,57 @@ func TestRetirementWithoutEnvironmentFilesCompletesThroughProductionReaders(t *t
 		t.Fatal("retirement never used the production typed environment reader")
 	}
 }
+
+func TestRetainedEnvironmentReaderPreservesAbsenceAndReadFailures(t *testing.T) {
+	for _, c := range []struct {
+		name      string
+		optional  bool
+		present   bool
+		link      bool
+		wantError bool
+	}{
+		{"required present", false, true, false, false},
+		{"optional present", true, true, false, false},
+		{"optional absent", true, false, false, false},
+		{"required absent", false, false, false, true},
+		{"optional dangling link", true, false, true, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "node.env")
+			if c.present {
+				writeFile(t, path, "NODE_MODE=worker\n", 0o600)
+			}
+			if c.link {
+				mustOK(t, os.Symlink("missing-target", path))
+			}
+			body, err := readRetireEnvironment(lifeops.EnvironmentFile{Path: path, IgnoreErrors: c.optional})
+			if (err != nil) != c.wantError {
+				t.Fatalf("read error=%v, want error=%v", err, c.wantError)
+			}
+			if c.present && string(body) != "NODE_MODE=worker\n" {
+				t.Fatal("reader did not read the existing file")
+			}
+			if !c.present && !c.link {
+				if _, err := os.Lstat(path); !os.IsNotExist(err) {
+					t.Fatalf("reader created an absent environment file: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestRetainedEnvironmentReaderBoundsExistingOptionalFiles(t *testing.T) {
+	for _, shape := range []string{"directory", "oversized"} {
+		t.Run(shape, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "node.env")
+			if shape == "directory" {
+				mustOK(t, os.Mkdir(path, 0o700))
+			} else {
+				writeFile(t, path, strings.Repeat("x", maxEnvironmentBytes+1), 0o600)
+			}
+			if _, err := readRetireEnvironment(lifeops.EnvironmentFile{Path: path, IgnoreErrors: true}); err == nil {
+				t.Fatal("optional file hid a failed or over-bound read")
+			}
+		})
+	}
+}

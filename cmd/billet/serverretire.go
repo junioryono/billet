@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"io/fs"
@@ -235,12 +236,14 @@ type retireMode struct {
 	answer          string
 	environmentFile string
 
-	reserve     bool
-	abandon     bool
-	completeRow bool
-	acknowledge bool
-	dryRun      bool
-	requested   bool
+	checkNodeConfig bool
+	transition      string
+	reserve         bool
+	abandon         bool
+	completeRow     bool
+	acknowledge     bool
+	dryRun          bool
+	requested       bool
 
 	expectedHolder string
 	expectedGuard  string
@@ -253,6 +256,7 @@ type retireMode struct {
 	failoverVerified bool
 	reservationFresh bool
 	reportMaxAge     time.Duration
+	reportAgeFlagged bool
 }
 
 // The seams: the clock, stdin, the transition id's minting, and the re-exec
@@ -303,6 +307,8 @@ func cmdServerRetire(ctx context.Context, args []string) error {
 	flags.StringVar(&m.answer, "answer", "", "the survivor's answer: - for stdin (with --acknowledge-row)")
 	flags.StringVar(&m.environmentFile, "environment-file", "", "read the PostgreSQL connection string from this "+
 		"systemd environment file instead of the process environment")
+	flags.BoolVar(&m.checkNodeConfig, "check-node-config", false, "read-only retained node rendering and operation admission")
+	flags.StringVar(&m.transition, "transition", "", "with --check-node-config: the settled retirement transition")
 	flags.BoolVar(&m.reserve, "reserve", false, "reserve this deployment's retirement for this host, before any report is collected")
 	flags.BoolVar(&m.abandon, "abandon-reservation", false, "release a reservation nothing has started")
 	flags.BoolVar(&m.completeRow, "complete-row", false, "on the survivor: complete the retiring host's ledger row from its completion document")
@@ -310,8 +316,8 @@ func cmdServerRetire(ctx context.Context, args []string) error {
 	flags.BoolVar(&m.dryRun, "dry-run", false, "classify the host and report; take no billet lock, claim or migrate nothing; "+
 		"create no directory, identity, authority or guard; a SQLite read may leave driver sidecars")
 	flags.BoolVar(&m.requested, "requested", false, "with --dry-run: the inventory asks for a retirement")
-	flags.StringVar(&m.expectedHolder, "expected-holder", "", "with --dry-run: the converge holder whose guard must remain")
-	flags.StringVar(&m.expectedGuard, "expected-guard", "", "with --dry-run: the guard id established by preparation")
+	flags.StringVar(&m.expectedHolder, "expected-holder", "", "with --dry-run or --check-node-config: the converge holder whose guard must remain")
+	flags.StringVar(&m.expectedGuard, "expected-guard", "", "with --dry-run or --check-node-config: the guard id established by preparation")
 	flags.StringVar(&m.input, "input", "", "the request: - for the input document on stdin")
 	flags.BoolVar(&m.serverOnly, "server-only", false, "with --input: this host keeps no node, and the request carries no rendering")
 	flags.BoolVar(&m.survivorFlagged, "survivor-flagged", false, "with --input: the inventory flags the survivor for retirement too")
@@ -335,6 +341,11 @@ func cmdServerRetire(ctx context.Context, args []string) error {
 	if !*asJSON {
 		return errors.New("server retire answers as JSON; pass --json")
 	}
+	flags.Visit(func(f *flag.Flag) {
+		if f.Name == "report-max-age" {
+			m.reportAgeFlagged = true
+		}
+	})
 
 	if r := checkRetireCombination(m); r != nil {
 		return answerRetireRefusal(retireUnexaminedFor(m, drainedBefore(m, r)))
@@ -351,6 +362,8 @@ func cmdServerRetire(ctx context.Context, args []string) error {
 	)
 
 	switch {
+	case m.checkNodeConfig:
+		answer, r = retireCheckNodeConfig(ctx, m)
 	case m.input != "":
 		answer, r = retireRequest(ctx, m)
 	case m.dryRun:
@@ -378,7 +391,7 @@ func cmdServerRetire(ctx context.Context, args []string) error {
 // of, if any, is not something it can say. The record-only modes keep the
 // `state` their own change settled.
 func retireUnexaminedFor(m retireMode, r *retireRefusal) *retireRefusal {
-	if m.input == "" {
+	if m.input == "" || m.checkNodeConfig {
 		return r
 	}
 
@@ -389,6 +402,12 @@ func retireUnexaminedFor(m retireMode, r *retireRefusal) *retireRefusal {
 // exactly one mode, the operands the mode takes and no others, every host name
 // a holder by the guard's grammar.
 func checkRetireCombination(m retireMode) *retireRefusal {
+	if m.checkNodeConfig {
+		return checkRetireNodeConfigCombination(m)
+	}
+	if m.transition != "" {
+		return retireRefuse(retireReasonCombination, "--transition belongs to --check-node-config", "")
+	}
 	modes := 0
 
 	// A dry run over an input judges the request without writing, so the two

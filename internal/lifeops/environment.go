@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"strings"
+	"unicode"
 )
 
 // EnvironmentFile preserves the manager's optionality for each loaded input.
 type EnvironmentFile struct {
-	Path         string
-	IgnoreErrors bool
+	Path         string `json:"path"`
+	IgnoreErrors bool   `json:"ignore_errors"`
 }
 
 // EnvironmentFiles requires a typed Service.EnvironmentFiles a(sb) reply.
@@ -60,4 +62,27 @@ func (i *Inspector) operationTypedProperty(ctx context.Context, unit, iface, pro
 		return operationTypedValue{}, fmt.Errorf("operation-array-unknown: %s %s has no typed value", unit, property)
 	}
 	return reply, nil
+}
+
+// RenderEnvironmentFiles accepts the literal grammar shared by the node unit
+// template and invocation-side loading. The typed reader remains lossless even
+// when the manager reports an entry this template cannot represent.
+func RenderEnvironmentFiles(files []EnvironmentFile) (string, error) {
+	if files == nil || len(files) > 1 {
+		return "", fmt.Errorf("environment-files-unsupported: require a known array of zero or one entry")
+	}
+	if len(files) == 0 {
+		return "", nil
+	}
+	file := files[0]
+	if !filepath.IsAbs(file.Path) || strings.IndexFunc(file.Path, func(r rune) bool {
+		return unicode.IsControl(r) || unicode.IsSpace(r) || strings.ContainsRune(`%\"'*?[]`, r)
+	}) >= 0 {
+		return "", fmt.Errorf("environment-files-unsupported: path is outside the literal unit grammar")
+	}
+	prefix := ""
+	if file.IgnoreErrors {
+		prefix = "-"
+	}
+	return "EnvironmentFile=" + prefix + file.Path + "\n", nil
 }

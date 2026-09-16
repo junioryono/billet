@@ -3,7 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
-	"strings"
+
+	"github.com/junioryono/billet/internal/lifeops"
 )
 
 func requiredRetireEnvironmentFiles(ctx context.Context) ([]string, error) {
@@ -11,11 +12,11 @@ func requiredRetireEnvironmentFiles(ctx context.Context) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("retained-input-environment-unknown: read EnvironmentFiles: %w", err)
 	}
+	if _, err := lifeops.RenderEnvironmentFiles(specs); err != nil {
+		return nil, fmt.Errorf("retained-input-environment-unknown: %w", err)
+	}
 	paths := make([]string, 0, len(specs))
 	for _, spec := range specs {
-		if strings.ContainsAny(spec.Path, " \t\n\r\x00%*?[]\\") {
-			return nil, fmt.Errorf("retained-input-environment-unknown: unsupported EnvironmentFiles path")
-		}
 		if !spec.IgnoreErrors {
 			paths = append(paths, spec.Path)
 		}
