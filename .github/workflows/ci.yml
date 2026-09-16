@@ -183,11 +183,11 @@ jobs:
   # made. internal/state's SQLite suite is NOT re-run here.
   test-postgres:
     runs-on: billet-8vcpu-ubuntu-2404
-    # 50 because this job now compiles and runs cmd/billet under -race as well
-    # as internal/state and the capacity suite; the sibling job's note applies
-    # here too -- raise it when the suite grows, do not trim tests to fit it.
-    # 70 since the command step's own bound became 45 (below).
-    timeout-minutes: 70
+    # 30: the command suite moved to test-postgres-command, so this job is the
+    # ledger backend (283.4s on main at d4d4e2e) and the capacity suite (204.2s)
+    # with their own 20m bounds; the sibling job's note applies here too -- raise
+    # it when the suite grows, do not trim tests to fit it.
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:18-alpine
@@ -221,32 +221,97 @@ jobs:
             go-race-cover-${{ hashFiles('go.sum') }}-
       - name: Test the ledger backend against PostgreSQL
         run: go test -race -count=1 -timeout 20m -vet=off ./internal/state/
-      # THE WHOLE COMMAND SUITE, NOT A LIST OF NAMES. Everything in cmd/billet
-      # that needs a real PostgreSQL — the backup's end-to-end gate, and every
-      # test of a controller's retirement, which is defined for a PostgreSQL
-      # pair and has no SQLite form — SKIPS in the SQLite job. A named list
-      # runs whatever somebody remembered to add to it, and leaves everything
-      # else unrun in both jobs while the run reports success.
-      #
-      # UNDER -race, because the SQLite job cannot buy it for the tests it
-      # skips: these are the only run those tests get, and a data race in one
-      # of them would otherwise be detected nowhere. The cost is this package
-      # compiled and run again in each PostgreSQL command job, which is what
-      # the split buys back.
-      #
-      # EXCEPT THE RETIREMENT ADMISSION TESTS, which test-postgres-retirement
-      # runs beside this job with the same pattern as -run, so each test is in
-      # exactly one of the two.
-      #
-      # 45m: main took 1683.9s of the old 30m bound on d4d4e2e (2026-09-15), and
-      # with the retirement admission run before every step the rest of the
-      # suite timed out at 30m on 4ba24f7 the same day even without those tests.
-      - name: Test the command suite against PostgreSQL
-        run: go test -race -count=1 -timeout 45m -vet=off -skip '^TestRetirement' ./cmd/billet/
       - name: Test the capacity suite against PostgreSQL
         run: go test -count=1 -timeout 20m ./internal/alloc/
         env:
           BILLET_TEST_LEDGER: postgres
+
+  # THE WHOLE COMMAND SUITE, NOT A LIST OF NAMES. Everything in cmd/billet that
+  # needs a real PostgreSQL -- the backup's end-to-end gate, and every test of a
+  # controller's retirement, which is defined for a PostgreSQL pair and has no
+  # SQLite form -- SKIPS in the SQLite job. A named list runs whatever somebody
+  # remembered to add to it, and leaves everything else unrun in both jobs while
+  # the run reports success.
+  #
+  # UNDER -race, because the SQLite job cannot buy it for the tests it skips:
+  # these are the only run those tests get, and a data race in one of them would
+  # otherwise be detected nowhere.
+  #
+  # IN THREE SHARDS, FROM MEASURED COST rather than a guess: on 35044219801
+  # (2026-09-16) the suite took 1817s over 1208 tests, of which TestT* was 587s,
+  # TestA* 546s and the rest 684s. The patterns partition the top-level names;
+  # ^TestRetirement belongs to test-postgres-retirement and is skipped here.
+  test-postgres-command:
+    runs-on: billet-8vcpu-ubuntu-2404
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: a
+            run: '^TestA'
+          - shard: t
+            run: '^TestT'
+          - shard: rest
+            run: '^Test[^AT]'
+    name: test-postgres-command (${{ matrix.shard }})
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: billet
+          POSTGRES_PASSWORD: billet
+          POSTGRES_DB: billet
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U billet"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      BILLET_TEST_POSTGRES_DSN: postgres://billet:billet@127.0.0.1:5432/billet?sslmode=disable
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Cache the race+cover Go build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-race-cover-${{ hashFiles('go.sum') }}-${{ github.sha }}-${{ github.job }}-${{ matrix.shard }}
+          restore-keys: |
+            go-race-cover-${{ hashFiles('go.sum') }}-
+      - name: Test the command suite against PostgreSQL
+        run: |
+          set -o pipefail
+          go test -race -count=1 -timeout 40m -vet=off -run '${{ matrix.run }}' -skip '^TestRetirement' -json ./cmd/billet/ \
+            | tee command-output.json \
+            | jq -R -j 'fromjson? | select(.Output != null) | .Output'
+
+      - name: Report the slowest command tests
+        if: always()
+        run: |
+          if [ ! -s command-output.json ]; then
+            echo "no command-output.json: the command step did not get far enough to produce one"
+            exit 0
+          fi
+          {
+            echo "### 25 slowest ${{ matrix.shard }} command tests"
+            echo
+            echo '```'
+            jq -r 'select(.Action == "pass" or .Action == "fail")
+                   | select(.Test != null and .Elapsed != null)
+                   | [.Elapsed, .Test] | @tsv' command-output.json \
+              | sort -rn \
+              | head -25 \
+              | awk -F'\t' '{ printf "%8.2fs  %s\n", $1, $2 }'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # A retirement admits its service operations before every step, so its
   # command tests drive whole retirements to each boundary against PostgreSQL
@@ -302,7 +367,31 @@ jobs:
           restore-keys: |
             go-race-cover-${{ hashFiles('go.sum') }}-
       - name: Test the retirement admission suite against PostgreSQL
-        run: go test -race -count=1 -timeout 60m -vet=off -run '${{ matrix.run }}' -skip '${{ matrix.skip }}' ./cmd/billet/
+        run: |
+          set -o pipefail
+          go test -race -count=1 -timeout 60m -vet=off -run '${{ matrix.run }}' -skip '${{ matrix.skip }}' -json ./cmd/billet/ \
+            | tee retirement-output.json \
+            | jq -R -j 'fromjson? | select(.Output != null) | .Output'
+
+      - name: Report the slowest retirement tests
+        if: always()
+        run: |
+          if [ ! -s retirement-output.json ]; then
+            echo "no retirement-output.json: the step did not get far enough to produce one"
+            exit 0
+          fi
+          {
+            echo "### 25 slowest ${{ matrix.shard }} tests"
+            echo
+            echo '```'
+            jq -r 'select(.Action == "pass" or .Action == "fail")
+                   | select(.Test != null and .Elapsed != null)
+                   | [.Elapsed, .Test] | @tsv' retirement-output.json \
+              | sort -rn \
+              | head -25 \
+              | awk -F'\t' '{ printf "%8.2fs  %s\n", $1, $2 }'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   lint:
     runs-on: billet-8vcpu-ubuntu-2404
@@ -930,6 +1019,7 @@ jobs:
       [
         test,
         test-postgres,
+        test-postgres-command,
         test-postgres-retirement,
         lint,
         release-config,
