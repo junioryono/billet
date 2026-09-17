@@ -192,12 +192,19 @@
         item: {key: billet-node.service, value: {src: billet-node.service.j2, dest: /etc/systemd/system/billet-node.service}}
       ansible.builtin.assert:
         that:
+          # The two destinations are expressions in account.yml, and read through
+          # lookup they are never re-templated: each would compare its literal
+          # `{{ ... }}` to a path. Each is pinned as exact text and the variable it
+          # names, bound in this task's vars exactly as the role binds it, is what
+          # the document is compared against.
           - >-
-            (billet_gate_account | selectattr('name', 'equalto', 'Render billet configuration') | first)['ansible.builtin.template'].dest ==
-            billet_retirement_operation_document.document.operations.filesystem[0].path
+            (billet_gate_account | selectattr('name', 'equalto', 'Render billet configuration') | first)['ansible.builtin.template'].dest[2:-2]
+            | trim == 'billet_ordinary_config_path'
+          - billet_ordinary_config_path == billet_retirement_operation_document.document.operations.filesystem[0].path
           - >-
-            (billet_gate_account | selectattr('name', 'equalto', 'Install the billet systemd units') | first)['ansible.builtin.template'].dest ==
-            billet_retirement_operation_document.document.operations.units[0].path
+            (billet_gate_account | selectattr('name', 'equalto', 'Install the billet systemd units') | first)['ansible.builtin.template'].dest[2:-2]
+            | trim == 'item.value.dest'
+          - item.value.dest == billet_retirement_operation_document.document.operations.units[0].path
           - >-
             (billet_gate_services | selectattr('name', 'equalto', 'Enable and start the billet node') | first)['ansible.builtin.systemd_service'].name ==
             billet_retirement_operation_document.document.operations.services[0].unit
