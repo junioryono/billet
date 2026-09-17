@@ -751,6 +751,38 @@ for phase in intent archived; do
   expect_no_task "$name" 'Complete the row on the recorded survivor'
 done
 
+# DONE BUT UNSETTLED IS NOT SETTLED ENTRY. Deleting the settled clause from the
+# refusal would strand exactly this host, so it must still reach its continuation.
+# A repeated pending tail reports its receipt current, the other accepted pairing.
+r_plant r10-journal-done-unsettled
+"$python" - "$work/retire-fixtures" "$work/cases/r10-journal-done-unsettled" <<'PYUNSETTLED'
+import json, pathlib, shutil, sys
+fixtures, case = map(pathlib.Path, sys.argv[1:3])
+classifier = json.loads((fixtures / 'dry-run-continue-retained-done-unsettled.json').read_text())
+if classifier['journal']['phase'] != 'done' or classifier['journal']['settled'] is not False:
+    sys.exit('the unsettled retained classification is not done and unsettled')
+shutil.copyfile(fixtures / 'dry-run-continue-retained-done-unsettled.json', case / 'classifier.json')
+answer = json.loads((fixtures / 'retired-retained-pending.json').read_text())
+answer['receipt'] = 'current'
+(case / 'answer.json').write_text(json.dumps(answer))
+PYUNSETTLED
+a r10-journal-done-unsettled -e billet_gate_retained_continuation=true -e billet_retirement_survivor_host=unreachable
+e r10-journal-done-unsettled 'BILLET_GATE_RETIRE_ENV=/etc/billet/node.env (ignore_errors=yes)'
+e r10-journal-done-unsettled "BILLET_GATE_RETIRE_FIXTURES=$work/cases/r10-journal-done-unsettled"
+r_answers r10-journal-done-unsettled 'control-a:classify:1:classifier.json:0;control-a:request:1:answer.json:0'
+r_run r10-journal-done-unsettled
+expect_allowed r10-journal-done-unsettled
+expect_no_ordinary r10-journal-done-unsettled
+expect_no_play_task r10-journal-done-unsettled 'Ordinary convergence sentinel'
+expect_play_task_ran r10-journal-done-unsettled "Observe the retained continuation's terminal boundary"
+expect_no_task r10-journal-done-unsettled 'Refuse settled retained entry before strict continuation'
+expect_ran r10-journal-done-unsettled "Continue through the journal's recorded survivor"
+expect_host_commands r10-journal-done-unsettled 'control-a retire-classify 1;control-a retire-request 1;'
+r_continuation r10-journal-done-unsettled 1 /etc/billet/node.env
+r_reported r10-journal-done-unsettled continue 'continues the retained-node retirement it records'
+r_done_report r10-journal-done-unsettled False changed
+expect_ran r10-journal-done-unsettled "Report a row obligation whose survivor this converge did not prepare"
+
 # A settled retained entry must never attempt strict done proof before the
 # separate ordinary admission exists, including its clock and inspection.
 r_plant r10-journal-done
@@ -1455,6 +1487,28 @@ for outcome in reserved adopted; do
   r_no_ordinary_after_request "$name"
   r_new_document "$name" "$outcome"
 done
+
+# §4.4 on the fresh request: its first answer can already be settled, so it
+# never reaches the continuation's pairing. A server-only answer claiming a
+# receipt passes the strict parser; only the request's own pairing refuses it.
+r_new r19-server-with-receipt
+"$python" - "$work/retire-fixtures" "$work/cases/r19-server-with-receipt" <<'PYRECEIPT'
+import json, pathlib, shutil, sys
+fixtures, case = map(pathlib.Path, sys.argv[1:3])
+for name in ['dry-run-new-request', 'reserved', 'abandoned']:
+    shutil.copyfile(fixtures / (name + '.json'), case / (name + '.json'))
+answer = json.loads((fixtures / 'retired-settled.json').read_text())
+if answer.get('variant') != 'server-only' or answer.get('receipt') != 'none':
+    sys.exit('retired-settled.json is no longer a server-only answer with no receipt')
+answer['receipt'] = 'written'
+(case / 'retired-settled.json').write_text(json.dumps(answer))
+PYRECEIPT
+e r19-server-with-receipt "BILLET_GATE_RETIRE_FIXTURES=$work/cases/r19-server-with-receipt"
+r_run r19-server-with-receipt
+expect_refused r19-server-with-receipt 'Fail with the original request and its cleanup result' \
+  'Require the request to confirm this server-only retirement' 'with no receipt'
+expect_no_task r19-server-with-receipt "Keep the new retirement's result"
+r_no_ordinary_after_request r19-server-with-receipt
 
 # R19 mutation: override only collection's rendering, retaining a server map
 # but dropping one member. The ordinary Ansible render remains independent.

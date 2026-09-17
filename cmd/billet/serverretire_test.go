@@ -222,6 +222,7 @@ func TestTheServerRetireFixturesAreTheCommandsOwn(t *testing.T) {
 		"dry-run-continue-stopped", "dry-run-continue-archived", "dry-run-continue-done-settled",
 		"dry-run-continue-done-unsettled", "dry-run-continue-retained-intent",
 		"dry-run-continue-retained-archived", "dry-run-continue-retained-done",
+		"dry-run-continue-retained-done-unsettled",
 		"dry-run-hold-status-only", "dry-run-hold-stage-only", "dry-run-other-host-row",
 		"dry-run-other-host-row-requested", "dry-run-ordinary-node-only-unreadable-row",
 		"dry-run-ordinary-never-commissioned", "dry-run-hold-abnormal-claim",

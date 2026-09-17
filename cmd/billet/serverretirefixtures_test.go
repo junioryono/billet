@@ -297,6 +297,34 @@ func TestTheRetireCallerFixturesClassifyRetainedNodeJournals(t *testing.T) {
 	}
 }
 
+// A RETAINED-NODE JOURNAL THAT IS DONE BUT UNSETTLED STILL CONTINUES. It is the
+// state the role's settled-entry refusal must not catch: done with its row still
+// owed, reached by the real request with the ledger lost after the archive.
+func TestTheRetireCallerFixturesClassifyAnUnsettledRetainedDoneJournal(t *testing.T) {
+	f := newRequestFixture(t)
+	retainAndRestartANode(t, f)
+	f.reserve(t)
+	plantResumedRetirement(t, f, retirement.PhaseIntent, retirement.VariantRetainedNode)
+	saved := retireBeforeRename
+	retireBeforeRename = func() { t.Setenv("BILLET_STATE_DSN", "") }
+	t.Cleanup(func() { retireBeforeRename = saved })
+
+	out, code := f.retainedRequest(t, f.input(t, f.retainedOverrides(t)))
+	if m := retireAnswer(t, out); code != 0 || m["row"] != retireRowPending || m["settled"] != false {
+		t.Fatalf("the retained request did not leave an unfinished tail: %s", out)
+	}
+
+	out, code = f.run(t, "", "--dry-run", "--retiring-host", requestRetiring)
+	m := assertRetireRoute(t, out, code, "continue", "continues the retained-node retirement it records")
+	journal := asMap(m["journal"])
+	if m["state"] != string(retirement.PhaseDone) || journal["phase"] != string(retirement.PhaseDone) ||
+		journal["variant"] != string(retirement.VariantRetainedNode) || journal["settled"] != false ||
+		journal["row_done"] != false {
+		t.Fatalf("the unsettled retained done journal did not establish its phase and tail: %s", out)
+	}
+	expectRetire(t, out, code, "dry-run-continue-retained-done-unsettled", retireOutcomeReported, "")
+}
+
 // The answers come from resuming a retained intent through the real transition
 // and tail, including a ledger that becomes unreachable after the archive.
 func TestTheRetireCallerFixturesContinueRetainedNodeJournals(t *testing.T) {

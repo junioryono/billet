@@ -1,0 +1,37 @@
+{
+  "authority": "unreadable",
+  "config": "present",
+  "dispatch": "unknown-ledger",
+  "guard": "converge-guard",
+  "identity": "unreadable",
+  "installed_roles": "node",
+  "journal": {
+    "owner": "ci-1",
+    "phase": "done",
+    "retiring": "control-a",
+    "row_done": false,
+    "settled": false,
+    "survivor": "control-b",
+    "transition_id": "0123456789abcdef0123456789abcdef",
+    "variant": "retained-node"
+  },
+  "marker": {
+    "id": "0123456789abcdef0123456789abcdef",
+    "kind": "retirement"
+  },
+  "outcome": "reported",
+  "route": "continue",
+  "route_why": "this host has a readable journal, so this converge continues the retained-node retirement it records",
+  "row": null,
+  "row_fact": "unreadable",
+  "schema": 1,
+  "stage": "present",
+  "state": "done",
+  "status": {
+    "phase": "done",
+    "updated_at": "2026-09-11T10:00:30Z",
+    "variant": "retained-node"
+  },
+  "status_presence": "present",
+  "why": "BILLET_STATE_DSN is not set in this process's environment"
+}
