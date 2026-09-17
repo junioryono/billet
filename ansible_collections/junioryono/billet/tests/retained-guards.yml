@@ -149,3 +149,56 @@
         - {retained: false, upgrade: false, server: false}
       loop_control:
         loop_var: billet_gate_case
+
+# THE CLOSING RELOAD PROBE (§3.3), pinned as text and exercised as a copy: its
+# argv and failed_when come from handlers/main.yml through lookup, so they are
+# never templated here, and the copy below is the same logic written where it is
+# trusted. A retained pass must ask the node and refuse anything but yes or no;
+# every other host keeps the server probe and its exit-status check alone.
+- name: The closing reload probe asks the retained node and accepts only yes or no
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    billet_gate_handlers: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/handlers/main.yml') | from_yaml }}"
+    billet_gate_probe: "{{ billet_gate_handlers | selectattr('name', 'equalto', 'Inspect whether the manager reports a pending reload after unit-file changes') | first }}"
+  tasks:
+    - name: Pin the probe's unit and its failure condition
+      ansible.builtin.assert:
+        that:
+          - >-
+            billet_gate_probe['ansible.builtin.command'].argv[-1][2:-2].split() | join(' ') ==
+            "'billet-node.service' if billet_retirement_node_ordinary | default(false) | bool else 'billet-server.service'"
+          - >-
+            billet_gate_probe.failed_when.split() | join(' ') ==
+            "billet_service_policy_reload_after.rc != 0 or (billet_retirement_node_ordinary | default(false) | bool and billet_service_policy_reload_after.stdout | trim not in ['yes', 'no'])"
+        fail_msg: The closing reload probe changed; update the copy below with it.
+
+    - name: Exercise a copy of the probe's unit selection and failure condition
+      ansible.builtin.assert:
+        that:
+          - >-
+            ('billet-node.service' if billet_retirement_node_ordinary | default(false) | bool else 'billet-server.service')
+            == item.unit
+          - >-
+            (billet_service_policy_reload_after.rc != 0 or
+             (billet_retirement_node_ordinary | default(false) | bool and
+              billet_service_policy_reload_after.stdout | trim not in ['yes', 'no']))
+            == item.fails
+        fail_msg: "{{ item.name }}: the probe selected or judged its answer wrongly."
+      # Whole values through one expression each, so rc stays an integer and the
+      # retained fact a Boolean; a template nested inside a mapping would render
+      # rc as the string "0", which is never equal to 0.
+      vars:
+        billet_retirement_node_ordinary: "{{ item.retained }}"
+        billet_service_policy_reload_after: "{{ item.result }}"
+      loop:
+        - {name: retained yes, retained: true, result: {rc: 0, stdout: 'yes'}, unit: billet-node.service, fails: false}
+        - {name: retained no, retained: true, result: {rc: 0, stdout: "no\n"}, unit: billet-node.service, fails: false}
+        - {name: retained empty, retained: true, result: {rc: 0, stdout: ''}, unit: billet-node.service, fails: true}
+        - {name: retained unfamiliar, retained: true, result: {rc: 0, stdout: 'maybe'}, unit: billet-node.service, fails: true}
+        - {name: retained failed call, retained: true, result: {rc: 1, stdout: 'no'}, unit: billet-node.service, fails: true}
+        - {name: ordinary empty stays accepted, retained: false, result: {rc: 0, stdout: ''}, unit: billet-server.service, fails: false}
+        - {name: ordinary failed call, retained: false, result: {rc: 1, stdout: ''}, unit: billet-server.service, fails: true}
+      loop_control:
+        label: "{{ item.name }}"

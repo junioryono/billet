@@ -13,6 +13,13 @@
 # (a concurrent snap or package operation is not excluded), and says so rather
 # than claiming the flag was its own. Two handlers on one listen name, because a
 # handler cannot hold a block: the probe, then the reload it justifies.
+#
+# ON THE RETAINED ROUTE THE PROBE ASKS THE NODE AND ACCEPTS ONLY yes OR no (§3.3).
+# The retained host's server unit is retired, absent or masked, so it is not the
+# unit whose answer the closing proof relies on; and there an empty or unfamiliar
+# answer would otherwise read as "nothing pending" and skip the reload, leaving
+# strict closing to judge a manager that still owes one. Every other host keeps
+# its existing probe and its existing exit-status check, unchanged.
 - name: Inspect whether the manager reports a pending reload after unit-file changes
   ansible.builtin.command:
     argv:
@@ -20,10 +27,13 @@
       - show
       - --property=NeedDaemonReload
       - --value
-      - billet-server.service
+      - "{{ 'billet-node.service' if billet_retirement_node_ordinary | default(false) | bool else 'billet-server.service' }}"
   register: billet_service_policy_reload_after
   changed_when: false
-  failed_when: billet_service_policy_reload_after.rc != 0
+  failed_when: >-
+    billet_service_policy_reload_after.rc != 0 or
+    (billet_retirement_node_ordinary | default(false) | bool and
+     billet_service_policy_reload_after.stdout | trim not in ['yes', 'no'])
   when:
     - not ansible_check_mode
     - not (_billet_alert_skip_service_control | default(false))

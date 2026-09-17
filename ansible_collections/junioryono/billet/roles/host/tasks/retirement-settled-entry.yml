@@ -21,6 +21,10 @@
               '--transition', billet_retirement_classification.journal.transition_id,
               '--config', billet_ordinary_config_path] }}
         expand_argument_vars: false
+        # UNSTRIPPED, so the parser's byte bound measures what the command wrote.
+        # Ansible otherwise trims trailing newlines first, and a valid answer
+        # padded with thousands of them would pass a bound its own bytes exceed.
+        strip_empty_ends: false
       register: billet_retirement_entry_raw
       ignore_unreachable: true
       changed_when: false

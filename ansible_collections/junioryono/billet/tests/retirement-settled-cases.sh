@@ -41,6 +41,13 @@ for label, member, value, reason in [
     ('boolean-schema', 'schema', True, 'schema'),
     ('string-row', 'row_done', 'true', 'settled retained contract'),
     ('unknown-member', 'extra', True, 'unknown members'),
+    # Each success invariant gets its own corruption, or removing its check
+    # would leave every case's verdict unchanged. The other purpose's success
+    # outcome is the one that matters: entry must never read as verified.
+    ('wrong-outcome', 'outcome', 'verified' if mode == 'entry' else 'admitted', 'outcome or exit'),
+    ('unsettled', 'settled', False, 'settled retained contract'),
+    ('not-done', 'phase', 'node-restarted', 'settled retained contract'),
+    ('wrong-state', 'state', 'done', 'outcome or exit'),
 ]:
     answer = dict(active)
     answer[member] = value
@@ -52,6 +59,9 @@ raw = json.dumps(active)
 add('duplicate-member', raw[:-1] + ', "schema": 1}', 0, True, 'malformed or repeated JSON')
 add('truncated', raw[:-1], 0, True, 'malformed or repeated JSON')
 add('oversized', raw + ' ' * 16384, 0, True, 'bounded complete answer')
+# Newlines, not spaces: an output-stripping command would trim these before
+# the bound measures them, which is the defect this case exists to catch.
+add('oversized-newlines', raw + '\n' * 16384, 0, True, 'bounded complete answer')
 add('exit-mismatch', raw, 2, True, 'exit')
 add('unanswered', '', 0, True, 'bounded complete answer')
 if mode == 'closing':
