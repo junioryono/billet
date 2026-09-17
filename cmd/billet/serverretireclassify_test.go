@@ -2084,8 +2084,7 @@ func TestTheDryRunKeepsBinaryRecoveryOnTheOrdinaryRoute(t *testing.T) {
 				f = newRetireFixture(t)
 				mustHold(t, "ci-1")
 			}
-			switch route {
-			case "continue":
+			if route == "continue" {
 				f.journalAt(t, retirement.PhaseIntent, "ci-1")
 				if entry == "retained-continuation" {
 					j, presence, err := retirement.ReadJournal()
