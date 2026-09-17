@@ -298,7 +298,10 @@
           - "'other names' in (billet_service_policy_compare['ansible.builtin.set_fact'].billet_service_policy_comparison | string)"
           - "\"split(' ')\" in (billet_service_policy_compare['ansible.builtin.set_fact'].billet_service_policy_comparison | string)"
           - "'loaded_path' in (billet_service_policy_compare['ansible.builtin.set_fact'].billet_service_policy_comparison | string)"
-          - billet_main_names[-1] == "Apply the reload the role's own unit-file changes left pending"
+          # Settled closing follows the final reload on the retained route only;
+          # retained-drift.json pins that task's whole mapping, its condition included.
+          - billet_main_names[-2] == "Apply the reload the role's own unit-file changes left pending"
+          - billet_main_names[-1] == "Prove settled closing after all ordinary work and handlers"
           - billet_service_policy_final_flush['ansible.builtin.meta'] == 'flush_handlers'
           - "'--property=NeedDaemonReload' in billet_service_policy_reload_after_probe['ansible.builtin.command'].argv"
           - billet_service_policy_reload_after_probe.changed_when == false
