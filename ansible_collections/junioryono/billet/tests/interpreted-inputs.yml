@@ -69,6 +69,8 @@
             # whole script onto one line and makes /bin/sh refuse its first
             # function name instead of running the witness.
             content: "{{ billet_gate_health_stubs ~ billet_gate_health_body }}"
+            dest: "{{ billet_gate_health_root.path }}/health.sh"
+            mode: '0700'
           vars:
             billet_gate_health_stubs: |
               ceph() { printf 'HEALTH_OK cluster is healthy\n'; }
@@ -76,8 +78,6 @@
             billet_gate_health_body: >-
               {{ lookup('ansible.builtin.template', playbook_dir + '/../roles/host/templates/ceph-health.sh.j2')
                  | replace('state_dir=/var/lib/billet/health', 'state_dir=' ~ (billet_gate_health_root.path | quote)) }}
-            dest: "{{ billet_gate_health_root.path }}/health.sh"
-            mode: '0700'
 
         - name: Execute the non-following publication witness
           ansible.builtin.command:
@@ -150,6 +150,8 @@
             # whole script onto one line and makes /bin/sh refuse its first
             # function name instead of running the witness.
             content: "{{ billet_gate_health_stubs ~ billet_gate_health_body }}"
+            dest: "{{ billet_gate_health_root.path }}/health.sh"
+            mode: '0700'
           vars:
             billet_gate_health_stubs: |
               ceph() { printf 'HEALTH_OK cluster is healthy\n'; }
@@ -157,8 +159,6 @@
             billet_gate_health_body: >-
               {{ lookup('ansible.builtin.template', playbook_dir + '/../roles/host/templates/ceph-health.sh.j2')
                  | replace('state_dir=/var/lib/billet/health', 'state_dir=' ~ (billet_gate_health_root.path | quote)) }}
-            dest: "{{ billet_gate_health_root.path }}/health.sh"
-            mode: '0700'
 
         - name: Execute the non-following publication witness
           ansible.builtin.command:
