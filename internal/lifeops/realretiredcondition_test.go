@@ -87,6 +87,7 @@ func realRetiredConditionMechanism(t *testing.T, mechanism string) {
 	}
 	h.run("daemon-reload")
 	insp := NewInspector()
+	before := make(map[string]uint64)
 	stamp := func(unit string) uint64 {
 		t.Helper()
 		value, err := strconv.ParseUint(h.property(unit, "ConditionTimestampMonotonic"), 10, 64)
@@ -143,24 +144,29 @@ func realRetiredConditionMechanism(t *testing.T, mechanism string) {
 			t.Fatal("dependent did not start")
 		}
 	}
-	wait := func(ready func() bool) {
+	// The diagnostic carries what was measured: a timeout here is a statement
+	// about systemd's behaviour, and the next run must not have to guess which.
+	wait := func(unit string, ready func() bool) {
 		t.Helper()
 		deadline := time.Now().Add(5 * time.Second)
 		for !ready() {
 			if time.Now().After(deadline) {
-				t.Fatal("activation mechanism did not reach its protected service/timer")
+				t.Fatalf("%s never re-evaluated its condition after %s: ActiveState=%s ConditionResult=%s "+
+					"ConditionTimestampMonotonic=%s (was %d) SubState=%s Result=%s NRestarts=%s",
+					unit, mechanism, h.property(unit, "ActiveState"), h.property(unit, "ConditionResult"),
+					h.property(unit, "ConditionTimestampMonotonic"), before[unit],
+					h.property(unit, "SubState"), h.property(unit, "Result"), h.property(unit, "NRestarts"))
 			}
 			time.Sleep(10 * time.Millisecond)
 		}
 	}
-	before := make(map[string]uint64)
 	for _, unit := range protected {
 		measure(unit, 0)
 		before[unit] = stamp(unit)
 	}
 	activate()
 	for _, unit := range protected {
-		wait(func() bool { return stamp(unit) > before[unit] })
+		wait(unit, func() bool { return stamp(unit) > before[unit] })
 		if h.property(unit, "ActiveState") != "inactive" || h.property(unit, "ConditionResult") != "no" {
 			t.Fatalf("protected unit did not skip fresh activation: %s", unit)
 		}
