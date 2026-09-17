@@ -255,14 +255,20 @@ def prepare(scenario, retained):
     if retained:
         # Fixture-owned retirement evidence is deliberately outside the real
         # retirement root. Guard recovery remains real and sees no forged journal.
-        # A serverless seed has no identity directory to retire or remove.
-        # Do not hide a seed that unexpectedly bootstrapped a controller.
+        #
+        # THE NODE-ONLY SEED KEEPS /var/lib/billet/server, and so does every host
+        # that never ran a controller: its binary transaction's fence writes
+        # inside that directory, which is why only the retained route empties the
+        # alias. The retained leg must leave whatever the seed left there exactly
+        # as it found it, so its state before the pass is recorded for the
+        # comparison rather than asserted away.
+        server_dir = pathlib.Path('/var/lib/billet/server')
         try:
-            pathlib.Path('/var/lib/billet/server').lstat()
+            before = server_dir.lstat()
+            write(root() / 'server-dir-before.json',
+                  dict(present=True, mode=before.st_mode, uid=before.st_uid, gid=before.st_gid))
         except FileNotFoundError:
-            pass
-        else:
-            raise ValueError('node-only seed unexpectedly created /var/lib/billet/server')
+            write(root() / 'server-dir-before.json', dict(present=False))
         pathlib.Path('/etc/systemd/system/billet-server.service').unlink()
         MODEL.mkdir()
         (MODEL / 'archive').mkdir()
