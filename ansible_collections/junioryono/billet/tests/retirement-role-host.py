@@ -150,15 +150,28 @@ def answer(command, source, argv):
     print(json.dumps(result))
 
 
-def action(handler, original, tmp, task_vars):
-    task = handler._task
+def task_row(task):
     module = observer.builtin_module(task.action)
     args = dict(task.args)
     name = task.get_name().split(' : ', 1)[-1]
     cfg = settings()
     source = task.get_path()
     phase = observer.guard_phase(module, args, source) if cfg['pass'] != 'seed' else None
-    row = dict(pass_name=cfg['pass'], task=name, module=module, args=args, source=source, guard_phase=phase)
+    return dict(pass_name=cfg['pass'], task=name, module=module, args=args, source=source, guard_phase=phase)
+
+
+def completed(task, result):
+    # ansible-core 2.21.2 returns UnifiedTaskResult after changed_when and
+    # failed_when. A command action's raw changed=True is not that verdict.
+    if not result.skipped:
+        log('tasks.jsonl', dict(task_row(task), event='after', failed=result.failed, changed=result.changed))
+
+
+def action(handler, original, tmp, task_vars):
+    task = handler._task
+    row = task_row(task)
+    module, args, name, phase = (row[key] for key in ['module', 'args', 'task', 'guard_phase'])
+    cfg = settings()
     log('tasks.jsonl', dict(row, event='before'))
     if cfg['retained'] and cfg['pass'] != 'seed':
         observer.require_observable_command(module, args, phase)
@@ -184,7 +197,6 @@ def action(handler, original, tmp, task_vars):
         finally:
             if phase:
                 observer.boundary(root(), 'ordinary')
-    log('tasks.jsonl', dict(row, event='after', failed=bool(result.get('failed')), changed=bool(result.get('changed'))))
     if module == 'ansible.builtin.set_fact' and 'billet_node_should_run' in args:
         log('node-policy.jsonl', dict(
             pass_name=cfg['pass'], task=name,

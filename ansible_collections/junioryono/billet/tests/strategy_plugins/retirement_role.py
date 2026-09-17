@@ -17,6 +17,12 @@ class StrategyModule(Linear):
         spec.loader.exec_module(host)
         self._role_host = host
         original = TaskExecutor._get_action_handler_with_module_context
+        original_execute = TaskExecutor._execute
+
+        def execute(executor):
+            result = original_execute(executor)
+            host.completed(executor._task, result)
+            return result
 
         def resolve(executor, templar):
             handler, context = original(executor, templar)
@@ -29,16 +35,20 @@ class StrategyModule(Linear):
             return handler, context
 
         TaskExecutor._get_action_handler_with_module_context = resolve
+        TaskExecutor._execute = execute
         try:
             return super().run(iterator, play_context)
         finally:
             TaskExecutor._get_action_handler_with_module_context = original
+            TaskExecutor._execute = original_execute
 
     def _execute_meta(self, task, play_context, iterator, target_host):
         result = super()._execute_meta(task, play_context, iterator, target_host)
         state = iterator.get_state_for_host(target_host.name)
-        self._role_host.log('meta.jsonl', dict(
+        row = dict(
             pass_name=self._role_host.settings()['pass'], task=task.get_name().split(' : ', 1)[-1],
             action=task._get_meta(), run_state=state.run_state.name,
-            pending=list(state.handler_notifications)))
+            pending=list(state.handler_notifications))
+        self._role_host.log('meta.jsonl', row)
+        self._role_host.log('tasks.jsonl', dict(row, event='meta'))
         return result

@@ -368,6 +368,47 @@ def interrupted(root):
     require('gate interruption after completed shared network stop' in output, 'interrupted for an unrelated reason')
 
 
+def require_retained_order(all_tasks, pass_name, interrupted_pass):
+    # Meta and completed tasks share this journal, so the final flush can be
+    # ordered against the actual command, including on the later resume pass.
+    tasks = [row for row in all_tasks if row['pass_name'] == pass_name and row['event'] in ['after', 'meta']]
+
+    def position(name):
+        matches = [index for index, row in enumerate(tasks) if row['task'] == name]
+        require(len(matches) == 1, 'missing or repeated phase task: ' + name)
+        return matches[0]
+
+    def command_positions(flag):
+        return [index for index, row in enumerate(tasks)
+                if row['event'] == 'after' and row['module'] == 'ansible.builtin.command'
+                and command_argv(row['args'])[:3] == ['/usr/bin/billet', 'server', 'retire']
+                and flag in command_argv(row['args'])]
+
+    entry = command_positions('--check-settled-entry')
+    admission = command_positions('--check-node-config')
+    closing = command_positions('--check-settled-closing')
+    require(len(entry) == len(admission) == 1, 'entry or node-config command missing or repeated')
+    entry_bound = position('Record the bound settled entry observation')
+    admission_bound = position('Record current node configuration admission')
+    require(entry[0] < entry_bound < admission[0] < admission_bound, 'entry/node-config binding order differs')
+    require(not any(row.get('changed') for row in tasks[entry[0]:admission_bound + 1]),
+            'ordinary mutation preceded bound node-config admission')
+    if interrupted_pass:
+        require(not closing, 'interrupted pass reached closing')
+        require(admission_bound < position('Drain billet compute before changing guest networking'),
+                'interrupted stop preceded node-config admission')
+        return
+    require(len(closing) == 1, 'closing command missing or repeated')
+    start = position('Enable and start the billet node')
+    flush = position("Apply the reload the role's own unit-file changes left pending")
+    reset = position('Forget the preceding settled closing result')
+    bound = position('Record the bound settled closing observation')
+    require(admission_bound < start < flush < reset < closing[0] < bound,
+            'ordinary work/final handler flush/closing order differs')
+    mutations = [row['task'] for row in tasks[closing[0]:] if row.get('changed')]
+    require(not mutations, 'a mutation followed closing: ' + repr(mutations))
+
+
 def finish(root, scenario, variant):
     retained = variant == 'retained'
     passes = ['first', 'second'] if scenario in ['resume', 'stable'] else ['first']
@@ -406,6 +447,7 @@ def finish(root, scenario, variant):
         if retained:
             executed = [row['task'] for row in all_tasks if row['pass_name'] == pass_name and row['event'] == 'after' and not row['failed']]
             require('Record the bound settled entry observation' in executed and 'Record current node configuration admission' in executed, 'entry or node-config answer was not bound by the real caller')
+            require_retained_order(all_tasks, pass_name, scenario == 'resume' and pass_name == 'first')
         if retained and scenario == 'resume' and pass_name == 'first':
             continue
         tasks = [row for row in all_tasks if row['pass_name'] == pass_name and row['event'] == 'after']
@@ -426,10 +468,11 @@ def finish(root, scenario, variant):
         if retained:
             require(commands[-1] == 'retire-settled-closing', 'a command followed closing')
             require(answers[-1]['answer']['outcome'] == 'verified' and 'Record the bound settled closing observation' in names, 'closing was not verified by the real caller')
-            require('Forget the preceding settled closing result' in names, 'closing reset missing')
-            closing_pos = names.index('Forget the preceding settled closing result')
             require('Prove settled closing after all ordinary work and handlers' in output, 'closing include missing')
-            require(not any(row['changed'] for row in tasks[closing_pos:]), 'a mutation followed closing')
+            if scenario.startswith('extra-'):
+                plant = 'Planted retained-only extra ' + scenario.removeprefix('extra-')
+                require(names.count(plant) == 1 and names.index(plant) + 1 == names.index('Enable and start the billet node'),
+                        'lifecycle plant did not execute immediately before the shared start')
         if not retained and not scenario.startswith('extra-'):
             require_control(requests(root, pass_name), scenario, pass_name)
     units = read(root / 'services/control-a.json')
@@ -504,7 +547,11 @@ def compare(control_path, retained_path, negative=None):
     require(control['initial_files'] == retained['initial_files'], 'paired initial installed node inputs differ')
     if negative:
         got, expected = retained['traces']['first'], control['traces']['first']
-        require([negative, NODE] in got, 'planted extra request was not executed')
+        require(control['scenario'] == 'active' and retained['scenario'] == 'extra-' + negative,
+                'planted negative was not paired with its independent active control')
+        require_control(expected, 'active', 'first')
+        planted = [[negative, NODE]] + ([['start', NODE]] if negative == 'stop' else [])
+        require(got == planted, 'planted request/shared-start trace differs: ' + repr(got))
         try:
             compare_traces({'first': expected}, {'first': got})
         except ParityMismatch:
