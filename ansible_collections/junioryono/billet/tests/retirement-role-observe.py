@@ -18,6 +18,8 @@ import yaml
 
 NODE = 'billet-node.service'
 MUTATIONS = {'enable', 'disable', 'start', 'stop', 'restart', 'reload', 'mask', 'unmask', 'try-restart', 'reload-or-restart'}
+MANAGER_READS = {'show', 'is-active', 'is-enabled'}
+FILESYSTEM_MUTATIONS = 0x2 | 0x4 | 0x8 | 0x40 | 0x80 | 0x100 | 0x200 | 0x400 | 0x800
 CONTROLLERS = ('billet-server.', 'billet-backup.', 'billet-upgrade.', 'var-lib-billet-server.mount', 'var-lib-billet-original\\x2dcontroller.mount')
 # internal/lifeops/retiredcondition.go: Inspector.OperationUnitDirectories.
 UNIT_DIRS = tuple(pathlib.Path(path) for path in (
@@ -25,6 +27,12 @@ UNIT_DIRS = tuple(pathlib.Path(path) for path in (
     '/run/systemd/system.control', '/run/systemd/transient', '/run/systemd/generator.early',
     '/run/systemd/generator', '/run/systemd/generator.late', '/usr/local/lib/systemd/system',
     '/usr/lib/systemd/system', '/lib/systemd/system'))
+# Fixed destinations of this witness's retained Firecracker configuration.
+# /tmp migration evidence and arbitrary inventory destinations are not covered.
+ORDINARY_DIRS = tuple(pathlib.Path(path) for path in (
+    '/etc/systemd/network', '/etc/sysctl.d', '/etc/modules-load.d',
+    '/usr/local/bin', '/usr/local/libexec', '/srv/jailer',
+    '/var/lib/billet/node', '/var/lib/billet/health', '/var/lib/billet/firecracker-stage'))
 UPGRADES = pathlib.Path('/var/lib/billet/upgrades')
 PROTECTED = [pathlib.Path(path) for path in [
     '/var/lib/billet/server', '/var/lib/billet/original-controller', '/var/lib/billet/gate-retirement',
@@ -60,7 +68,7 @@ def protected(path):
 def relevant_directory(path):
     # Every unit subdirectory can contain a controller link, including a new
     # target.wants/target.requires tree. Ancestors cover currently absent roots.
-    bases = (*UNIT_DIRS, *PROTECTED, pathlib.Path('/etc/billet'))
+    bases = (*UNIT_DIRS, *PROTECTED, *ORDINARY_DIRS, pathlib.Path('/etc/billet'))
     return any(beneath(base, path) or beneath(path, base) for base in bases)
 
 
@@ -106,7 +114,7 @@ def outside_upgrades(state):
 
 def boundary(root, phase):
     # The single-host linear strategy and driver wait for the drain ACK before
-    # starting a guard command or returning to ordinary tasks. No time guesses.
+    # starting a guard command, returning to ordinary tasks, or sealing closing.
     request = dict(id=uuid.uuid4().hex, phase=phase)
     temporary = root / ('watch-request-' + request['id'])
     temporary.write_text(json.dumps(request))
@@ -180,7 +188,7 @@ def watch(root):
     fd = libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
     if fd < 0:
         raise OSError(ctypes.get_errno(), 'inotify_init1')
-    masks = 0x2 | 0x4 | 0x8 | 0x40 | 0x80 | 0x100 | 0x200 | 0x400 | 0x800
+    masks = FILESYSTEM_MUTATIONS
     watches = {}
     identities = {}
     phase = 'ordinary'
@@ -188,13 +196,13 @@ def watch(root):
     guard_gaps = []
     retained = read(root / 'role-settings.json')['retained']
     # Resolve the standard merged-/usr aliases once; watch their parents too.
-    aliases = {path: path.resolve() for path in (*UNIT_DIRS, pathlib.Path('/etc/billet'), pathlib.Path('/var/lib/billet'))}
+    aliases = {path: path.resolve() for path in (*UNIT_DIRS, *ORDINARY_DIRS, pathlib.Path('/etc/billet'), pathlib.Path('/var/lib/billet'))}
     require(all(path == target or (path in UNIT_DIRS and target in UNIT_DIRS)
                 for path, target in aliases.items()), 'observer root redirects outside the protected namespace')
     bases = set(aliases.values())
 
     def authorized(path):
-        return phase != 'ordinary' and beneath(path, UPGRADES)
+        return phase.startswith('guard-') and beneath(path, UPGRADES)
 
     def inventory():
         wanted = set()
@@ -237,6 +245,8 @@ def watch(root):
                     event = dict(path=str(path), mask=mask, cookie=cookie, phase=phase)
                     output.write(json.dumps(event) + '\n')
                     output.flush()
+                    require(phase != 'closed' or not mask & FILESYSTEM_MUTATIONS,
+                            'filesystem mutation followed closing: ' + str(path))
                     if name and mask & (0x40 | 0x80 | 0x100 | 0x200):
                         require(not any(beneath(base, path) for base in (*aliases, *bases)),
                                 'observer root or ancestor changed: ' + str(path))
@@ -274,12 +284,15 @@ def watch(root):
                 request = None
             if request and request['id'] != handled:
                 target = request['phase']
-                require(target in ['ordinary', 'guard-prepare', 'guard-settle', 'guard-release', 'guard-recover'], 'unknown observation phase')
-                require((phase == 'ordinary') != (target == 'ordinary'), 'overlapping guard observation windows')
+                require(target in ['ordinary', 'closed', 'guard-prepare', 'guard-settle', 'guard-release', 'guard-recover'], 'unknown observation phase')
+                require((phase == 'ordinary' and target != 'ordinary')
+                        or (phase.startswith('guard-') and target == 'ordinary')
+                        or (phase == 'closed' and target == 'guard-recover'),
+                        'overlapping or out-of-order observation windows')
                 audit()
                 current = snapshot()
                 drain()
-                if retained and phase == 'ordinary':
+                if retained and phase in ['ordinary', 'closed']:
                     require(current == baseline, 'protected state changed during ordinary work')
                 elif retained:
                     require(outside_upgrades(current) == outside_upgrades(baseline), 'guard command changed non-guard protected state')
@@ -291,7 +304,7 @@ def watch(root):
                 ack.write_text(json.dumps(request))
                 ack.replace(root / 'watch-ack.json')
             if (root / 'watch-stop').exists():
-                require(phase == 'ordinary', 'observer stopped during an authorized guard operation')
+                require(phase in ['ordinary', 'closed'], 'observer stopped during an authorized guard operation')
                 audit()
                 current = snapshot()
                 drain()
@@ -368,7 +381,7 @@ def interrupted(root):
     require('gate interruption after completed shared network stop' in output, 'interrupted for an unrelated reason')
 
 
-def require_retained_order(all_tasks, pass_name, interrupted_pass):
+def require_retained_order(all_tasks, manager, pass_name, interrupted_pass):
     # Meta and completed tasks share this journal, so the final flush can be
     # ordered against the actual command, including on the later resume pass.
     tasks = [row for row in all_tasks if row['pass_name'] == pass_name and row['event'] in ['after', 'meta']]
@@ -405,8 +418,14 @@ def require_retained_order(all_tasks, pass_name, interrupted_pass):
     bound = position('Record the bound settled closing observation')
     require(admission_bound < start < flush < reset < closing[0] < bound,
             'ordinary work/final handler flush/closing order differs')
-    mutations = [row['task'] for row in tasks[closing[0]:] if row.get('changed')]
-    require(not mutations, 'a mutation followed closing: ' + repr(mutations))
+    # The closing adapter drains and seals inotify before another task runs.
+    # Raw manager requests remain evidence even under changed_when: false.
+    closing_task = tasks[closing[0]]
+    require(closing_task.get('watch_closed') is True, 'closing did not seal filesystem observation')
+    mutations = [row['argv'] for row in manager[closing_task['manager_count']:]
+                 if row['pass_name'] == pass_name
+                 and next((arg for arg in row['argv'] if not arg.startswith('-')), '') not in MANAGER_READS]
+    require(not mutations, 'service-manager mutation followed closing: ' + repr(mutations))
 
 
 def finish(root, scenario, variant):
@@ -447,7 +466,7 @@ def finish(root, scenario, variant):
         if retained:
             executed = [row['task'] for row in all_tasks if row['pass_name'] == pass_name and row['event'] == 'after' and not row['failed']]
             require('Record the bound settled entry observation' in executed and 'Record current node configuration admission' in executed, 'entry or node-config answer was not bound by the real caller')
-            require_retained_order(all_tasks, pass_name, scenario == 'resume' and pass_name == 'first')
+            require_retained_order(all_tasks, rows(root / 'manager.jsonl'), pass_name, scenario == 'resume' and pass_name == 'first')
         if retained and scenario == 'resume' and pass_name == 'first':
             continue
         tasks = [row for row in all_tasks if row['pass_name'] == pass_name and row['event'] == 'after']

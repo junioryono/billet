@@ -164,7 +164,14 @@ def completed(task, result):
     # ansible-core 2.21.2 returns UnifiedTaskResult after changed_when and
     # failed_when. A command action's raw changed=True is not that verdict.
     if not result.skipped:
-        log('tasks.jsonl', dict(task_row(task), event='after', failed=result.failed, changed=result.changed))
+        row = task_row(task)
+        if (settings()['retained'] and row['pass_name'] != 'seed'
+                and row['module'] == 'ansible.builtin.command'
+                and observer.command_argv(row['args'])[:3] == ['/usr/bin/billet', 'server', 'retire']
+                and '--check-settled-closing' in observer.command_argv(row['args'])):
+            observer.boundary(root(), 'closed')
+            row.update(watch_closed=True, manager_count=len(observer.rows(root() / 'manager.jsonl')))
+        log('tasks.jsonl', dict(row, event='after', failed=result.failed, changed=result.changed))
 
 
 def action(handler, original, tmp, task_vars):
