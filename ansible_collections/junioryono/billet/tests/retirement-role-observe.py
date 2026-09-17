@@ -426,6 +426,12 @@ def require_retained_order(all_tasks, manager, pass_name, interrupted_pass):
                  if row['pass_name'] == pass_name
                  and next((arg for arg in row['argv'] if not arg.startswith('-')), '') not in MANAGER_READS]
     require(not mutations, 'service-manager mutation followed closing: ' + repr(mutations))
+    # AND the reported verdict, because the watched roots are not everything the
+    # route writes: the endpoint evidence and confirmation files live in the
+    # system temporary directory, which is deliberately excluded, so a task that
+    # touches them after closing leaves no observed event and no request.
+    reported = [task['name'] for task in tasks[closing[0] + 1:] if task.get('changed')]
+    require(not reported, 'a task reported a change after closing: ' + repr(reported))
 
 
 def finish(root, scenario, variant):
