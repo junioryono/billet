@@ -20,12 +20,35 @@ func retireNodeServiceSuperset() []retireServiceOperation {
 	return []retireServiceOperation{{Verb: "enable", Unit: nodeUnit}, {Verb: "stop", Unit: nodeUnit}, {Verb: "start", Unit: nodeUnit}}
 }
 
+// The generic request fixture has no loaded backup service. These witnesses
+// require all five units loaded before capturing sources or installing drop-ins;
+// positive absence otherwise legitimately skips that unit's inertness proof.
+func newRetireInertFixture(t *testing.T) *requestFixture {
+	t.Helper()
+	f := newRequestFixture(t)
+	f.manager.set(backupServiceUnit, "LoadState", "loaded")
+	f.manager.set(backupServiceUnit, "UnitFileState", "static")
+	for _, unit := range retireInertUnits {
+		props, err := retireOperationInspector().UnitProperties(t.Context(), unit, "LoadState")
+		mustOK(t, err)
+		if firstProp(props, "LoadState") != "loaded" {
+			t.Fatalf("inertness witness requires %s loaded: %v", unit, props)
+		}
+	}
+	return f
+}
+
+func settledRetireInertFixture(t *testing.T) (*requestFixture, retirement.Journal) {
+	t.Helper()
+	return settleNodeConfigFixture(t, newRetireInertFixture(t))
+}
+
 // Plant each durable crash window, then resume through the command's guard,
 // preparation and remaining-operation admission, not just the install helper.
 func TestRetirementInertInstallResumesEveryCrashWindow(t *testing.T) {
 	for count := 0; count <= len(retireInertUnits)+2; count++ {
 		t.Run(string(rune('0'+count)), func(t *testing.T) {
-			f := newRequestFixture(t)
+			f := newRetireInertFixture(t)
 			retainAndRestartANode(t, f)
 			f.reserve(t)
 			j := plantResumedRetirement(t, f, retirement.PhaseIntent, retirement.VariantRetainedNode)
@@ -297,9 +320,11 @@ func TestRetirementAbsentUnitStillReceivesItsDropIn(t *testing.T) {
 }
 
 func TestRetirementSettledEnablementIsVisibleAndPublicationRemainsStrict(t *testing.T) {
-	f, j := settledNodeConfigFixture(t)
+	f, j := settledRetireInertFixture(t)
+	want := make(map[string]string)
 	for _, unit := range retireInertUnits {
 		f.manager.set(unit, "UnitFileState", "enabled")
+		want[unit] = "enabled"
 	}
 	// The installed Also relation is allowed only on the ordinary route.
 	props, err := retireOperationInspector().UnitProperties(t.Context(), nodeUnit, "FragmentPath")
@@ -309,7 +334,7 @@ func TestRetirementSettledEnablementIsVisibleAndPublicationRemainsStrict(t *test
 	for _, purpose := range []string{retirement.PurposeSettledEntry, retirement.PurposeSettledClosing} {
 		out, code := f.runRaw(t, "", settledCheckArgs(t, f, j, purpose)...)
 		verdict, err := retirement.DecodeSettledVerdict([]byte(out), code, settledExpectation(t, f, j, purpose))
-		if err != nil || len(verdict.EnablementChanges) != len(retireInertUnits) {
+		if err != nil || !reflect.DeepEqual(verdict.EnablementChanges, want) {
 			t.Fatalf("enabled inert units were not admitted and reported: %s (%v)", out, err)
 		}
 	}
@@ -372,7 +397,33 @@ func TestRetirementConcretePathsRefuseArchivedKeyringsAndSymlinkedAncestors(t *t
 }
 
 func TestRetirementEveryProtectedUnitNeedsItsDropInAtEveryProof(t *testing.T) {
-	f, j := settledNodeConfigFixture(t)
+	t.Run("stopped/archive", func(t *testing.T) {
+		f := newRetireInertFixture(t)
+		retainAndRestartANode(t, f)
+		f.reserve(t)
+		j := plantResumedRetirement(t, f, retirement.PhaseStopped, retirement.VariantRetainedNode)
+		// Stopped/archive still binds the original invocation and config inode.
+		// A settled host has already replaced both during its handoff.
+		if r := proveRetireStopped(t.Context(), j); r != nil {
+			t.Fatalf("healthy stopped/archive baseline: %+v", r)
+		}
+		for _, unit := range retireInertUnits {
+			t.Run(unit, func(t *testing.T) {
+				path, err := retireInertDropIn(retireOperationInspector(), unit)
+				mustOK(t, err)
+				body := mustRead(t, path)
+				mustOK(t, os.Remove(path))
+				t.Cleanup(func() { writeFile(t, path, body, 0o644) })
+				if r := proveRetireStopped(t.Context(), j); r == nil || r.Reason != retireReasonInertDropIn {
+					t.Fatalf("stopped/archive omitted %s: %+v", unit, r)
+				}
+			})
+		}
+	})
+	f, j := settledRetireInertFixture(t)
+	if _, r := observeRetirePostconditions(t.Context(), retireMode{configPath: f.cfg}, j); r != nil {
+		t.Fatalf("healthy done baseline: %+v", r)
+	}
 	for _, unit := range retireInertUnits {
 		t.Run(unit, func(t *testing.T) {
 			path, err := retireInertDropIn(retireOperationInspector(), unit)
@@ -380,9 +431,6 @@ func TestRetirementEveryProtectedUnitNeedsItsDropInAtEveryProof(t *testing.T) {
 			body := mustRead(t, path)
 			mustOK(t, os.Remove(path))
 			t.Cleanup(func() { writeFile(t, path, body, 0o644) })
-			if r := proveRetireStopped(t.Context(), j); r == nil || r.Reason != retireReasonInertDropIn {
-				t.Fatalf("stopped/archive omitted %s: %+v", unit, r)
-			}
 			if _, r := observeRetirePostconditions(t.Context(), retireMode{configPath: f.cfg}, j); r == nil || r.Reason != retireReasonInertDropIn {
 				t.Fatalf("done omitted %s: %+v", unit, r)
 			}
@@ -398,7 +446,10 @@ func TestRetirementEveryProtectedUnitNeedsItsDropInAtEveryProof(t *testing.T) {
 }
 
 func TestRetirementInertServicesCannotHideDescendantProcesses(t *testing.T) {
-	f, j := settledNodeConfigFixture(t)
+	f, j := settledRetireInertFixture(t)
+	if _, r := observeRetirePostconditions(t.Context(), retireMode{configPath: f.cfg}, j); r != nil {
+		t.Fatalf("healthy process-free baseline: %+v", r)
+	}
 	for _, unit := range []string{serverUnit, backupServiceUnit, upgradeServiceUnit} {
 		t.Run(unit, func(t *testing.T) {
 			root := retireOperationInspector().OperationUnitDirectories()[0]

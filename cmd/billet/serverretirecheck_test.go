@@ -17,7 +17,11 @@ import (
 
 func settledNodeConfigFixture(t *testing.T) (*requestFixture, retirement.Journal) {
 	t.Helper()
-	f := newRequestFixture(t) // Uses the same PostgreSQL gate as sibling command tests.
+	return settleNodeConfigFixture(t, newRequestFixture(t))
+}
+
+func settleNodeConfigFixture(t *testing.T, f *requestFixture) (*requestFixture, retirement.Journal) {
+	t.Helper()
 	retainAndRestartANode(t, f)
 	f.reserve(t)
 	out, code := f.retainedRequest(t, f.input(t, f.retainedOverrides(t)))
@@ -337,7 +341,11 @@ func TestRetirementNodeConfigPlantedReadersRefuseBeforeMutation(t *testing.T) {
 			case "transaction root":
 				operations.Filesystem = append(operations.Filesystem, retireFilesystemOperation{Kind: "delete", Path: upgradeRoot})
 			case "controller unit":
-				operations.Filesystem = append(operations.Filesystem, retireFilesystemOperation{Kind: "write", Path: "/etc/systemd/system/" + serverUnit})
+				// THE FIXTURE'S UNIT DIRECTORY, not the literal system one: the
+				// inspector's directories are redirected here, and protection is
+				// built from them, so a hardcoded /etc/systemd/system path would
+				// be admitted for being outside this host's units entirely.
+				operations.Filesystem = append(operations.Filesystem, retireFilesystemOperation{Kind: "write", Path: filepath.Join(f.unitsDir, serverUnit)})
 			case "changed node name":
 				rendering = strings.Replace(rendering, "node-a", "node-b", 1)
 				want = retireReasonIdentity
