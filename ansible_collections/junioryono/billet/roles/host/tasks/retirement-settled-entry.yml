@@ -1,5 +1,4 @@
 ---
-# This read-only boundary has no main.yml caller until retained activation.
 # The current command answer supplies permission; a preceding answer cannot.
 - name: Forget the preceding settled entry result
   ansible.builtin.set_fact:

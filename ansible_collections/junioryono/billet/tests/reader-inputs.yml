@@ -175,12 +175,12 @@
           - billet_retirement_operation_document.document.operations.services == billet_retirement_planned_services
           - billet_retirement_operation_document.document.operations.units[0].path == '/etc/systemd/system/billet-node.service'
           - "'EnvironmentFile=/etc/billet/installed.env' in billet_retirement_operation_document.document.operations.units[0].contents"
-          - billet_retirement_entry_binding.purpose == 'settled-entry'
-          - billet_retirement_closing_binding.purpose == 'settled-closing'
-          - billet_retirement_entry_binding.argv[-1] == '--check-settled-entry'
-          - billet_retirement_closing_binding.argv[-1] == '--check-settled-closing'
-          - "'--input' not in billet_retirement_entry_binding.argv"
-          - "'--input' not in billet_retirement_closing_binding.argv"
+          - billet_retirement_prepared_entry_binding.purpose == 'settled-entry'
+          - billet_retirement_prepared_closing_binding.purpose == 'settled-closing'
+          - billet_retirement_prepared_entry_binding.argv[-1] == '--check-settled-entry'
+          - billet_retirement_prepared_closing_binding.argv[-1] == '--check-settled-closing'
+          - "'--input' not in billet_retirement_prepared_entry_binding.argv"
+          - "'--input' not in billet_retirement_prepared_closing_binding.argv"
           - billet_retirement_node_config_argv[-3:] == ['--check-node-config', '--input', '-']
           - (billet_retirement_operation_document.stdin | from_json) == billet_retirement_operation_document.document
 
@@ -223,6 +223,7 @@
     billet_cache_tls_key_src: supplied-key
     billet_firecracker_stage: /var/cache/billet-provision
     billet_firecracker_enabled: false
+    billet_ceph_enabled: false
     billet_service_user: billet
     billet_service_group: billet
   tasks:
@@ -237,8 +238,6 @@
         billet_candidate_node_state_dir: /var/lib/billet/effective-node
         billet_retirement_environment_ready: true
         billet_node_environment_files: [{path: /etc/billet/installed.env, ignore_errors: true}]
-        billet_retirement_provider_plan: {filesystem: [], services: [], units: {}}
-        billet_retirement_node_restart: false
         billet_node_should_run: true
         billet_binary_upgrade: false
         billet_retirement_node_ordinary: true
@@ -253,6 +252,11 @@
         name: junioryono.billet.host
         tasks_from: unit-operands
 
+    - name: Derive alert operands for the detached producer
+      ansible.builtin.include_role:
+        name: junioryono.billet.host
+        tasks_from: alert-operands
+
     - name: Prepare the production node operation inventory
       ansible.builtin.include_role:
         name: junioryono.billet.host
@@ -264,12 +268,12 @@
           - "{'kind': 'write', 'path': '/etc/effective/cert.pem'} in billet_retirement_planned_filesystem"
           - "{'kind': 'write', 'path': '/etc/effective/key.pem'} in billet_retirement_planned_filesystem"
           - "{'kind': 'mkdir', 'path': '/var/lib/billet/effective-node'} in billet_retirement_planned_filesystem"
-          - "{'kind': 'read', 'path': '/etc/billet/installed.env'} in billet_retirement_planned_filesystem"
+          - "'/var/lib/billet/upgrades' not in (billet_retirement_planned_filesystem | map(attribute='path') | list)"
           - "{'kind': 'write', 'path': '/etc/billet/installed.env'} not in billet_retirement_planned_filesystem"
           - "'/var/lib/billet/inventory-identity' not in (billet_retirement_planned_filesystem | map(attribute='path') | list)"
           - "'/var/lib/billet/server' not in (billet_retirement_planned_filesystem | map(attribute='path') | list)"
           - "'/etc/inventory/cert.pem' not in (billet_retirement_planned_filesystem | map(attribute='path') | list)"
-          - billet_retirement_planned_services == [{'verb':'enable', 'unit':'billet-node.service'}, {'verb':'start', 'unit':'billet-node.service'}]
+          - billet_retirement_planned_services == [{'verb':'enable', 'unit':'billet-node.service'}, {'verb':'stop', 'unit':'billet-node.service'}, {'verb':'start', 'unit':'billet-node.service'}]
           - billet_retirement_operation_document.document.operations.filesystem == billet_retirement_planned_filesystem
           - billet_retirement_operation_document.document.operations.services == billet_retirement_planned_services
 

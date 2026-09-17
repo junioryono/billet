@@ -96,3 +96,7 @@ for call in calls:
         sys.exit('settled call used unexpected operands or stdin: ' + repr(call))
 PYCALLS
 done
+
+# Connected caller cases share this shard and the same stdin-recording fake.
+# shellcheck source=retirement-activation-cases.sh
+source "$here/retirement-activation-cases.sh"

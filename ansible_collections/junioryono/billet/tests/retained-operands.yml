@@ -1,0 +1,30 @@
+---
+- name: Retained state path validation preserves every node check
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ansible_become: false
+  tasks:
+    - name: Exercise the real upgrade inspector's path checks
+      ansible.builtin.include_tasks: retained-path-case.yml
+      loop:
+        - {retained: true, node: /var/lib/billet/node, refuses: false}
+        - {retained: false, node: /var/lib/billet/node, refuses: true}
+        - {retained: true, node: /var/lib/billet/upgrades/node, refuses: true}
+        - {retained: true, node: /var/lib/billet/node/../escape, refuses: true}
+      loop_control:
+        loop_var: billet_gate_path_case
+
+- name: Retained producer binds the same operands the ordinary tasks consume
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    billet_gate_role: "{{ playbook_dir }}/../roles/host"
+  tasks:
+    - name: Exercise Firecracker with Ceph and alerts and Docker without them
+      ansible.builtin.include_tasks: retained-producer-case.yml
+      loop: [firecracker, docker]
+      loop_control:
+        loop_var: billet_gate_provider

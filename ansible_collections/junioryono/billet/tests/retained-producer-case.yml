@@ -1,0 +1,119 @@
+---
+- name: Initialize the representative producer inventory
+  ansible.builtin.set_fact:
+    billet_effective_ready: true
+    billet_effective_config: "{{ {'node': {'name': 'reference-node', 'provider': billet_gate_provider, 'state_dir': '/var/lib/billet/retained-node', 'lock_dir': '/run/billet/locks'}} }}"
+    billet_candidate_node_state_dir: /var/lib/billet/retained-node
+    billet_retirement_node_ordinary: true
+    billet_node_should_run: true
+    billet_binary_upgrade: false
+    billet_retirement_environment_ready: true
+    billet_node_environment_files: [{path: /etc/billet/installed.env, ignore_errors: true}]
+    billet_service_types_by_unit: {billet-node.service: {rc: 0, stdout: notify}}
+    billet_exclusion_holder: ci-1
+    billet_exclusion_id: '11111111111111111111111111111111'
+    billet_retirement_transition_id: '22222222222222222222222222222222'
+    billet_exclusion_answerer: /usr/bin/billet
+    billet_retirement_entry_binding: {verified: entry}
+    billet_retirement_closing_binding: {verified: closing}
+    billet_service_user: billet
+    billet_service_group: billet
+    billet_server_prepare_only: false
+    billet_cache_tls_cert_src: ''
+    billet_firecracker_enabled: "{{ billet_gate_provider == 'firecracker' }}"
+    billet_ceph_enabled: "{{ billet_gate_provider == 'firecracker' }}"
+    billet_firecracker_version: v1.16.1
+    billet_firecracker_arch: x86_64
+    billet_firecracker_stage: /var/cache/reference-firecracker
+    billet_ceph_keyring_path: /etc/ceph/reference.keyring
+    billet_alert_email: to@example.com
+    billet_smtp_username: user
+    billet_smtp_password: password
+    billet_networks: [{name: reference0}]
+    billet_stale_network_names: [removed0]
+
+- name: Load the production directory operands as trusted expressions
+  ansible.builtin.include_vars:
+    file: "{{ billet_gate_role }}/vars/main.yml"
+
+- name: Derive the node's unit operands through the role
+  ansible.builtin.include_role:
+    name: junioryono.billet.host
+    tasks_from: unit-operands
+
+- name: Derive alert operands through the role
+  ansible.builtin.include_role:
+    name: junioryono.billet.host
+    tasks_from: alert-operands
+
+- name: Exercise the real operation producer
+  ansible.builtin.include_role:
+    name: junioryono.billet.host
+    tasks_from: prepare-node-operations
+
+# These are values passed to the task modules. The drift catalog separately
+# binds the full production mappings that consume them, including every loop.
+- name: Derive expected common task operands
+  ansible.builtin.set_fact:
+    billet_gate_expected_paths:
+      - {kind: write, path: /etc/billet/billet.yaml}
+      - {kind: delete, path: /etc/modules-load.d/billet-rbd.conf}
+      - {kind: write, path: /etc/systemd/system/billet-node.service}
+      - {kind: mkdir, path: /tmp}
+
+- name: Bind directory task values to the expected document
+  ansible.builtin.set_fact:
+    billet_gate_expected_paths: "{{ billet_gate_expected_paths + [{'kind': 'mkdir', 'path': item.path}, {'kind': 'metadata', 'path': item.path}] }}"
+  loop: "{{ billet_common_directories + billet_node_directories }}"
+
+- name: Bind alert task values to the expected document
+  ansible.builtin.set_fact:
+    billet_gate_expected_paths: "{{ billet_gate_expected_paths + [{'kind': 'write' if billet_ceph_enabled else 'delete', 'path': item}] }}"
+  loop: "{{ [billet_smtp_config_path, billet_smtp_marker_path, billet_ceph_health_script_path, billet_ceph_health_service_path, billet_ceph_health_timer_path] }}"
+
+- name: Bind image maintenance task values to the expected document
+  ansible.builtin.set_fact:
+    billet_gate_expected_paths: "{{ billet_gate_expected_paths + [{'kind': 'write' if billet_ceph_enabled else 'delete', 'path': '/etc/systemd/system/' ~ item}] }}"
+  loop: [billet-images-refresh.service, billet-images-refresh.timer]
+
+- name: Bind provider task values to the expected document
+  when: billet_firecracker_enabled
+  ansible.builtin.set_fact:
+    billet_gate_expected_paths: >-
+      {{ billet_gate_expected_paths + [
+         {'kind': 'mkdir', 'path': billet_firecracker_stage},
+         {'kind': 'recursive-write', 'path': billet_firecracker_stage},
+         {'kind': 'write', 'path': billet_firecracker_stage ~ '/firecracker-' ~ billet_firecracker_version ~ '-' ~ billet_firecracker_arch ~ '.tgz'},
+         {'kind': 'write', 'path': '/usr/local/bin/firecracker-' ~ billet_firecracker_version},
+         {'kind': 'write', 'path': '/usr/local/bin/jailer-' ~ billet_firecracker_version},
+         {'kind': 'write', 'path': '/usr/local/bin/firecracker'},
+         {'kind': 'write', 'path': '/usr/local/bin/jailer'},
+         {'kind': 'write', 'path': '/etc/sysctl.d/99-billet-node.conf'},
+         {'kind': 'write', 'path': '/etc/systemd/system/billet-dnsmasq@.service'},
+         {'kind': 'write', 'path': '/etc/billet/network.nft'},
+         {'kind': 'write', 'path': '/etc/systemd/system/billet-network.service'},
+         {'kind': 'write', 'path': '/etc/systemd/network/80-reference0.netdev'},
+         {'kind': 'write', 'path': '/etc/systemd/network/81-reference0.network'},
+         {'kind': 'write', 'path': '/etc/billet/network/reference0.conf'},
+         {'kind': 'write', 'path': '/etc/systemd/system/billet-dnsmasq@reference0.service'},
+         {'kind': 'delete', 'path': '/etc/billet/network/removed0.conf'},
+         {'kind': 'delete', 'path': '/etc/systemd/network/80-removed0.netdev'},
+         {'kind': 'delete', 'path': '/etc/systemd/network/81-removed0.network'},
+         {'kind': 'write', 'path': billet_ceph_keyring_path},
+         {'kind': 'metadata', 'path': billet_ceph_keyring_path},
+         {'kind': 'write', 'path': '/etc/modules-load.d/billet-rbd.conf'}] }}
+
+- name: Require the whole operation inventory and preserve verified bindings
+  ansible.builtin.assert:
+    that:
+      - billet_retirement_planned_filesystem | sort(attribute='kind') | sort(attribute='path') == billet_gate_expected_paths | sort(attribute='kind') | sort(attribute='path')
+      - billet_retirement_operation_document.document.operations.filesystem == billet_retirement_planned_filesystem
+      - billet_retirement_operation_document.document.operations.services == [{'verb':'enable', 'unit':'billet-node.service'}, {'verb':'stop', 'unit':'billet-node.service'}, {'verb':'start', 'unit':'billet-node.service'}]
+      - billet_retirement_operation_document.document.operations.units | map(attribute='unit') | list == ['billet-node.service']
+      - billet_retirement_operation_document.document.operations.units[0].path == billet_unit_operands['billet-node.service'].dest
+      - billet_retirement_operation_document.document.operations.units[0].contents == lookup('ansible.builtin.template', billet_gate_role + '/templates/billet-node.service.j2', template_vars={'billet_systemd_notify_ready': true})
+      - (billet_retirement_operation_document.document.rendering | from_yaml) == billet_effective_config
+      - "billet_retirement_entry_binding == {'verified': 'entry'}"
+      - "billet_retirement_closing_binding == {'verified': 'closing'}"
+      - "'/var/lib/billet/upgrades' not in (billet_retirement_planned_filesystem | map(attribute='path') | list)"
+      - "'/etc/billet/installed.env' not in (billet_retirement_planned_filesystem | map(attribute='path') | list)"

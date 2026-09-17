@@ -7,64 +7,81 @@
       - billet_retirement_classification.journal.variant in ['server-only', 'retained-node']
     fail_msg: The continuation requires this host's server-only or retained-node journal; ordinary convergence remains bypassed.
 
-- name: Refuse settled retained entry before strict continuation
-  ansible.builtin.fail:
-    msg: Ordinary convergence of a settled retained-node host arrives with its settled-entry admission; ordinary convergence remains bypassed.
+- name: Admit the already settled retained journal
   when:
+    - not ansible_check_mode
     - billet_retirement_classification.journal.variant == 'retained-node'
     - billet_retirement_classification.journal.phase == 'done'
     - billet_retirement_classification.journal.settled is sameas true
+  block:
+    - name: Obtain current settled entry permission
+      ansible.builtin.include_tasks: retirement-settled-entry.yml
 
-- name: Keep this host's environment operand across the survivor handoff
-  ansible.builtin.set_fact:
-    billet_retirement_variant: "{{ billet_retirement_classification.journal.variant }}"
-    billet_retirement_survivor: "{{ billet_retirement_classification.journal.survivor }}"
-    billet_retirement_transition_id: "{{ billet_retirement_classification.journal.transition_id }}"
-    billet_retirement_local_environment_file: "{{ billet_retirement_environment_file }}"
+    - name: Open ordinary work only on the admitted entry answer
+      ansible.builtin.set_fact:
+        billet_retirement_node_ordinary: true
+        billet_retirement_bypass: false
+        billet_retirement_transition_id: "{{ billet_retirement_entry_result.transition_id }}"
 
-- name: Read this host's clock for the continuation envelope
-  ansible.builtin.command:
-    argv: [date, -u, '+%Y-%m-%dT%H:%M:%SZ']
-    expand_argument_vars: false
-  register: billet_retirement_clock
-  changed_when: false
-  become: true
+# Entry state, never the continuation's result, decides this boundary. A pass
+# that finishes retirement must end even if its last command settles the journal.
+- name: Continue only an incomplete or unsettled retirement
+  when:
+    - not ansible_check_mode
+    - not (billet_retirement_classification.journal.variant == 'retained-node' and
+           billet_retirement_classification.journal.phase == 'done' and
+           billet_retirement_classification.journal.settled is sameas true)
+  block:
+    - name: Keep this host's environment operand across the survivor handoff
+      ansible.builtin.set_fact:
+        billet_retirement_variant: "{{ billet_retirement_classification.journal.variant }}"
+        billet_retirement_survivor: "{{ billet_retirement_classification.journal.survivor }}"
+        billet_retirement_transition_id: "{{ billet_retirement_classification.journal.transition_id }}"
+        billet_retirement_local_environment_file: "{{ billet_retirement_environment_file }}"
 
-- name: Inspect only this host for its continuation envelope
-  ansible.builtin.command:
-    argv: ["{{ billet_retirement_answerer }}", release, inspect, --json, --config, /etc/billet/billet.yaml]
-    expand_argument_vars: false
-  register: billet_retirement_inspect_raw
-  changed_when: false
-  become: true
+    - name: Read this host's clock for the continuation envelope
+      ansible.builtin.command:
+        argv: [date, -u, '+%Y-%m-%dT%H:%M:%SZ']
+        expand_argument_vars: false
+      register: billet_retirement_clock
+      changed_when: false
+      become: true
 
-- name: Carry this host's continuation document
-  ansible.builtin.set_fact:
-    billet_retirement_document:
-      schema: 1
-      round:
-        id: "{{ billet_exclusion_holder }}-{{ billet_retirement_clock.stdout | trim }}"
-        started_at: "{{ billet_retirement_clock.stdout | trim }}"
-      self:
-        host: "{{ inventory_hostname }}"
-        collected_at: "{{ billet_retirement_clock.stdout | trim }}"
-        inspect: "{{ billet_retirement_inspect_raw.stdout | junioryono.billet.from_json_strict }}"
-        status: null
-      survivor: null
-      nodes: {}
-      desired: null
-  no_log: true
+    - name: Inspect only this host for its continuation envelope
+      ansible.builtin.command:
+        argv: ["{{ billet_retirement_answerer }}", release, inspect, --json, --config, /etc/billet/billet.yaml]
+        expand_argument_vars: false
+      register: billet_retirement_inspect_raw
+      changed_when: false
+      become: true
 
-- name: Run the local continuation
-  ansible.builtin.include_tasks: retirement-continue-call.yml
+    - name: Carry this host's continuation document
+      ansible.builtin.set_fact:
+        billet_retirement_document:
+          schema: 1
+          round:
+            id: "{{ billet_exclusion_holder }}-{{ billet_retirement_clock.stdout | trim }}"
+            started_at: "{{ billet_retirement_clock.stdout | trim }}"
+          self:
+            host: "{{ inventory_hostname }}"
+            collected_at: "{{ billet_retirement_clock.stdout | trim }}"
+            inspect: "{{ billet_retirement_inspect_raw.stdout | junioryono.billet.from_json_strict }}"
+            status: null
+          survivor: null
+          nodes: {}
+          desired: null
+      no_log: true
 
-- name: Carry a pending row to this converge's survivor when prepared
-  ansible.builtin.include_tasks: retirement-tail.yml
-  when: billet_retirement_result.row | default('') == 'pending'
+    - name: Run the local continuation
+      ansible.builtin.include_tasks: retirement-continue-call.yml
 
-- name: Report the retirement's settlement or remaining obligation
-  ansible.builtin.debug:
-    msg: >-
-      Retirement is locally done; settled={{ billet_retirement_result.settled }}.
-      {{ billet_retirement_result.row_why | default('') }}
-      Ordinary host tasks remain bypassed.
+    - name: Carry a pending row to this converge's survivor when prepared
+      ansible.builtin.include_tasks: retirement-tail.yml
+      when: billet_retirement_result.row | default('') == 'pending'
+
+    - name: Report the retirement's settlement or remaining obligation
+      ansible.builtin.debug:
+        msg: >-
+          Retirement is locally done; settled={{ billet_retirement_result.settled }}.
+          {{ billet_retirement_result.row_why | default('') }}
+          Ordinary host tasks remain bypassed.

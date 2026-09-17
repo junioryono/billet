@@ -271,6 +271,9 @@
           inferred. Guest bridge names must be unique Linux interface names of at
           most 15 characters and cannot contain path or control characters.
 
+    - name: Validate interpreted inventory before any ordinary template
+      ansible.builtin.import_tasks: validate-interpreted-inputs.yml
+
     - name: Refuse a managed GitHub App key with nothing to install and none installed
       ansible.builtin.assert:
         that:
@@ -481,6 +484,10 @@
       ansible.builtin.import_tasks: network-disable.yml
       when: not billet_firecracker_enabled
 
+    - name: Admit concrete retained node operations before ordinary mutation
+      ansible.builtin.import_tasks: retirement-node-preflight.yml
+      when: billet_retirement_node_ordinary | bool
+
     # THE CANDIDATE WAS RESOLVED, FETCHED AND STAGED BY THE PREPARATION
     # (stage-candidate.yml, before the hold), so by here billet_binary_upgrade and
     # the transaction's recovery directory are settled and nothing below reaches
@@ -549,3 +556,9 @@
     # role and not of whatever follows it in a play.
     - name: Apply the reload the role's own unit-file changes left pending
       ansible.builtin.meta: flush_handlers
+
+    # services.yml has already completed confirmation, receipts and their cleanup.
+    # No notification or ordinary mutation may follow this read-only boundary.
+    - name: Prove settled closing after all ordinary work and handlers
+      ansible.builtin.include_tasks: retirement-settled-closing.yml
+      when: billet_retirement_node_ordinary | bool

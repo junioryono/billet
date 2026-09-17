@@ -1,5 +1,4 @@
 ---
-# This read-only boundary has no main.yml caller until retained activation.
 # The current command answer supplies permission; a preceding answer cannot.
 - name: Forget the preceding settled closing result
   ansible.builtin.set_fact:
@@ -59,14 +58,18 @@
           variant: "{{ billet_retire_settled_answer.variant }}"
 
   rescue:
+    # Keep the outer ordinary block selected until its failure is raised.
+    # Changing bypass here could skip the failure through an inherited when.
     - name: Keep ordinary work closed after a settled closing refusal
       ansible.builtin.set_fact:
         billet_retirement_closing_result: {}
         billet_retirement_closing_binding: {}
         billet_retirement_node_verified: false
-        billet_retirement_node_ordinary: false
-        billet_retirement_bypass: true
 
     - name: Report the settled closing refusal
       ansible.builtin.fail:
         msg: "{{ ansible_failed_result.msg | default('The settled-closing command did not answer; ordinary convergence remains closed.') }}"
+
+- name: Report controller enablement changes without repairing retired units
+  ansible.builtin.debug:
+    msg: "Retired controller enablement changes: {{ billet_retirement_closing_result.enablement_changes }}"

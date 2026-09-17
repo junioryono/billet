@@ -117,15 +117,42 @@
       vars:
         billet_gate_refusal: "{{ lookup('ansible.builtin.file', billet_gate_role + '/tasks/retirement-binary-refusal.yml') | from_yaml }}"
 
-    - name: Require settled callers to remain disconnected from routing
+    - name: Require settled admission and final closing to be connected
       ansible.builtin.assert:
         that:
-          - "'retirement-settled-entry.yml' not in billet_gate_source"
-          - "'retirement-settled-closing.yml' not in billet_gate_source"
-          - "'billet_retirement_node_ordinary: true' not in billet_gate_source"
+          - billet_gate_continue[1].block[0]['ansible.builtin.include_tasks'] == 'retirement-settled-entry.yml'
+          - billet_gate_continue[1].block[1]['ansible.builtin.set_fact'].billet_retirement_node_ordinary is sameas true
+          - billet_gate_continue[1].block[1]['ansible.builtin.set_fact'].billet_retirement_bypass is sameas false
+          - "'not ansible_check_mode' in billet_gate_continue[1].when"
+          - billet_gate_main[-1].block[-2]['ansible.builtin.meta'] == 'flush_handlers'
+          - billet_gate_main[-1].block[-1]['ansible.builtin.include_tasks'] == 'retirement-settled-closing.yml'
+          - billet_gate_main[-1].block[-1].when == 'billet_retirement_node_ordinary | bool'
       vars:
-        billet_gate_source: "{{ lookup('ansible.builtin.file', billet_gate_role + '/tasks/' + item) }}"
-      loop: [main.yml, retirement.yml, retirement-continue.yml, retirement-continue-call.yml]
+        billet_gate_continue: "{{ lookup('ansible.builtin.file', billet_gate_role + '/tasks/retirement-continue.yml') | from_yaml }}"
+
+    - name: Pin the retained migration selection refusals before delegation
+      ansible.builtin.assert:
+        that:
+          - billet_gate_selection['ansible.builtin.assert'].that == 'billet_migration_controller != inventory_hostname'
+          - billet_gate_selection.when == ['billet_retirement_node_ordinary | default(false) | bool', 'billet_endpoint_answer.planned | default(false) | bool']
+          - billet_gate_confirmation.when == "billet_endpoint_answer.outcome == 'migrated'"
+          - billet_gate_confirmation.block[0]['ansible.builtin.assert'].that == 'not billet_retirement_node_ordinary | default(false) | bool or billet_migration_controller != inventory_hostname'
+      vars:
+        billet_gate_decision: "{{ lookup('ansible.builtin.file', billet_gate_role + '/tasks/endpoint-decision.yml') | from_yaml }}"
+        billet_gate_migration: "{{ lookup('ansible.builtin.file', billet_gate_role + '/tasks/endpoint-migration.yml') | from_yaml }}"
+        billet_gate_selection: "{{ billet_gate_decision[1].block | selectattr('name', 'equalto', 'Refuse retained endpoint migration confirmed by the retired host') | first }}"
+        billet_gate_confirmation: "{{ billet_gate_migration[0].block | selectattr('name', 'equalto', 'Confirm and receipt the migration') | first }}"
+
+    - name: Exercise the pinned selection rule without inherited production facts
+      ansible.builtin.assert:
+        that:
+          - (not item.retained or not item.planned or item.controller != 'retiring') is sameas item.admitted
+          - (not item.retained or item.controller != 'retiring') is sameas item.confirmable
+      loop:
+        - {retained: true, planned: false, controller: retiring, admitted: true, confirmable: false}
+        - {retained: true, planned: true, controller: retiring, admitted: false, confirmable: false}
+        - {retained: true, planned: true, controller: survivor, admitted: true, confirmable: true}
+        - {retained: false, planned: true, controller: retiring, admitted: true, confirmable: true}
 
 - name: Retained binary refusal and server directory emptiness use real production tasks
   hosts: localhost

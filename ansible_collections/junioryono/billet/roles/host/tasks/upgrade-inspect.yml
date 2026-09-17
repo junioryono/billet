@@ -151,28 +151,28 @@
       means `identity_dir: <dir>` plus `state: {backend: sqlite}`. billet
       refuses this config at load, and the role will not guess which one you
       meant before it fences, chowns and sandboxes a directory.
-  when: not billet_interrupted_upgrade | bool
+  when: not billet_interrupted_upgrade | bool and not billet_retirement_node_ordinary | bool
 
 - name: Refuse unsafe billet state directories
   ansible.builtin.assert:
     that:
-      - billet_candidate_server_state_dir.startswith('/var/lib/billet/')
+      - billet_retirement_node_ordinary | bool or (billet_candidate_server_state_dir.startswith('/var/lib/billet/'))
       - billet_candidate_node_state_dir.startswith('/var/lib/billet/')
-      - "'/./' not in billet_candidate_server_state_dir"
-      - "'/../' not in billet_candidate_server_state_dir"
+      - billet_retirement_node_ordinary | bool or ('/./' not in billet_candidate_server_state_dir)
+      - billet_retirement_node_ordinary | bool or ('/../' not in billet_candidate_server_state_dir)
       - "'/./' not in billet_candidate_node_state_dir"
       - "'/../' not in billet_candidate_node_state_dir"
-      - not billet_candidate_server_state_dir.endswith('/.')
-      - not billet_candidate_server_state_dir.endswith('/..')
+      - billet_retirement_node_ordinary | bool or (not billet_candidate_server_state_dir.endswith('/.'))
+      - billet_retirement_node_ordinary | bool or (not billet_candidate_server_state_dir.endswith('/..'))
       - not billet_candidate_node_state_dir.endswith('/.')
       - not billet_candidate_node_state_dir.endswith('/..')
-      - not billet_candidate_server_state_dir.startswith('/var/lib/billet/upgrades/')
-      - billet_candidate_server_state_dir != '/var/lib/billet/upgrades'
+      - billet_retirement_node_ordinary | bool or (not billet_candidate_server_state_dir.startswith('/var/lib/billet/upgrades/'))
+      - billet_retirement_node_ordinary | bool or (billet_candidate_server_state_dir != '/var/lib/billet/upgrades')
       - not billet_candidate_node_state_dir.startswith('/var/lib/billet/upgrades/')
       - billet_candidate_node_state_dir != '/var/lib/billet/upgrades'
-      - billet_candidate_server_state_dir != billet_candidate_node_state_dir
-      - not billet_candidate_server_state_dir.startswith(billet_candidate_node_state_dir + '/')
-      - not billet_candidate_node_state_dir.startswith(billet_candidate_server_state_dir + '/')
+      - billet_retirement_node_ordinary | bool or (billet_candidate_server_state_dir != billet_candidate_node_state_dir)
+      - billet_retirement_node_ordinary | bool or (not billet_candidate_server_state_dir.startswith(billet_candidate_node_state_dir + '/'))
+      - billet_retirement_node_ordinary | bool or (not billet_candidate_node_state_dir.startswith(billet_candidate_server_state_dir + '/'))
     fail_msg: >-
       The host role accepts distinct, dedicated server.state_dir and
       node.state_dir paths only below /var/lib/billet. The paths cannot contain
@@ -186,10 +186,10 @@
       - realpath
       - --canonicalize-missing
       - "{{ item }}"
-  loop:
-    - /var/lib/billet
-    - "{{ billet_candidate_server_state_dir }}"
-    - "{{ billet_candidate_node_state_dir }}"
+  loop: >-
+    {{ ['/var/lib/billet']
+       + ([] if billet_retirement_node_ordinary | bool else [billet_candidate_server_state_dir])
+       + [billet_candidate_node_state_dir] }}
   register: billet_resolved_state_paths
   changed_when: false
   check_mode: false
@@ -212,10 +212,10 @@
   ansible.builtin.stat:
     path: "{{ item }}"
     follow: false
-  loop:
-    - /var/lib/billet
-    - "{{ billet_candidate_server_state_dir }}"
-    - "{{ billet_candidate_node_state_dir }}"
+  loop: >-
+    {{ ['/var/lib/billet']
+       + ([] if billet_retirement_node_ordinary | bool else [billet_candidate_server_state_dir])
+       + [billet_candidate_node_state_dir] }}
   register: billet_state_paths
   check_mode: false
   become: true

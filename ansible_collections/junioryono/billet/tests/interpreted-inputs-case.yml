@@ -1,0 +1,45 @@
+---
+- name: Reset interpreter inputs between cases
+  ansible.builtin.set_fact:
+    billet_guest_dns_servers: ['1.1.1.1', '2001:4860:4860::8888']
+    billet_smtp_host: smtp.example.com
+    billet_smtp_port: 587
+    billet_smtp_username: example-user
+    billet_smtp_password: example-password
+    billet_alert_from: from@example.com
+    billet_alert_email: to@example.com
+    billet_networks: [{name: guest0, address: 192.0.2.1, prefix: 24, dhcp_start: 192.0.2.2, dhcp_end: 192.0.2.254, netmask: 255.255.255.0}]
+    billet_guest_denied_ipv4: [10.0.0.0/8]
+    billet_guest_denied_ipv6: ['fc00::/7']
+    billet_guest_host_tcp_ports: [22]
+    billet_guest_host_udp_ports: [53]
+    billet_image_verify_port: 7719
+    billet_firecracker_version: v1.16.1
+    billet_gate_input_refused: false
+
+- name: Apply this case's inventory values without stale fact precedence
+  ansible.builtin.set_fact:
+    "{{ item.key }}": "{{ item.value }}"
+  loop: "{{ billet_gate_input_case['values'] | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+- name: Exercise the production interpreter validation
+  block:
+    - name: Include the real host input validation
+      ansible.builtin.include_role:
+        name: junioryono.billet.host
+        tasks_from: validate-interpreted-inputs
+  rescue:
+    - name: Require refusal by the inventory member's name
+      ansible.builtin.assert:
+        that:
+          - billet_gate_input_case.refuses | length > 0
+          - billet_gate_input_case.refuses in ansible_failed_result.msg
+    - name: Record the expected input refusal
+      ansible.builtin.set_fact:
+        billet_gate_input_refused: true
+
+- name: Require exactly the expected interpreter outcome
+  ansible.builtin.assert:
+    that: billet_gate_input_refused == (billet_gate_input_case.refuses | length > 0)

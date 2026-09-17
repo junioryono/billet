@@ -291,12 +291,15 @@
 # the render would install, judged by the command over the rendering on stdin.
 - name: Decide the node's endpoint migration before the render
   ansible.builtin.import_tasks: endpoint-decision.yml
+  when: not billet_retirement_node_ordinary | bool
 
 - name: Resolve node environment operands before unit replacement
   ansible.builtin.import_tasks: node-environment.yml
+  when: not billet_retirement_node_ordinary | bool
 
 - name: Select ordinary unit templates by unit name
   ansible.builtin.import_tasks: unit-operands.yml
+  when: not billet_retirement_node_ordinary | bool
 
 - name: Stage candidate systemd units for the upgrade transaction
   ansible.builtin.template:
@@ -318,26 +321,9 @@
     billet_systemd_upgrade_probe_hold: "{{ billet_candidate_probe_holds_on_flag | default(false) | bool }}"
     billet_systemd_notify_ready: true
 
-- name: Inspect installed service readiness types before ordinary convergence
-  ansible.builtin.command:
-    argv:
-      - systemctl
-      - show
-      - --property=Type
-      - --value
-      - "{{ item }}"
-  loop: "{{ billet_unit_operands.keys() | list }}"
-  register: billet_installed_service_types
-  changed_when: false
-  failed_when: false
-  check_mode: false
-  become: true
-  when: not billet_binary_upgrade | default(false)
-
-- name: Key installed readiness observations by unit name
-  ansible.builtin.set_fact:
-    billet_service_types_by_unit: "{{ billet_installed_service_types.results | junioryono.billet.unit_results }}"
-  when: not billet_binary_upgrade | default(false)
+- name: Observe readiness before ordinary unit replacement
+  ansible.builtin.import_tasks: unit-readiness.yml
+  when: not billet_retirement_node_ordinary | bool
 
 - name: Install the billet systemd units
   ansible.builtin.template:

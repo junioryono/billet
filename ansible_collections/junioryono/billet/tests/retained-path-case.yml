@@ -1,0 +1,37 @@
+---
+- name: Initialize independent state path operands
+  ansible.builtin.set_fact:
+    billet_retirement_node_ordinary: "{{ billet_gate_path_case.retained }}"
+    billet_interrupted_upgrade: false
+    billet_upgrade_claim_shape: guard
+    billet_upgrade_manifest: {inputs: []}
+    billet_service_user: billet
+    billet_service_group: billet
+    billet_configured_server_state_dir: ''
+    billet_effective_config: "{{ {'node': {'state_dir': billet_gate_path_case.node}} }}"
+    billet_gate_path_refused: false
+
+- name: Exercise state paths through the production inspector
+  block:
+    - name: Include the real state path validation
+      ansible.builtin.include_role:
+        name: junioryono.billet.host
+        tasks_from: upgrade-inspect
+  rescue:
+    - name: Require the intended state path refusal
+      ansible.builtin.assert:
+        that:
+          - ansible_failed_task.name == 'Refuse unsafe billet state directories'
+          - "'dedicated server.state_dir' in ansible_failed_result.msg"
+    - name: Record this path refusal
+      ansible.builtin.set_fact:
+        billet_gate_path_refused: true
+
+- name: Require the precise retained path outcome
+  ansible.builtin.assert:
+    that:
+      - billet_gate_path_refused is sameas billet_gate_path_case.refuses
+      - >-
+        billet_gate_path_case.refuses or
+        (billet_resolved_state_paths.results | map(attribute='item') | list == ['/var/lib/billet', billet_gate_path_case.node]
+         and billet_state_paths.results | map(attribute='item') | list == ['/var/lib/billet', billet_gate_path_case.node])

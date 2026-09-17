@@ -727,14 +727,29 @@ r_held r10-installed-both unsupported-variant
 
 # R10: retained journals continue with their recorded operands and paired
 # receipts, then end even when settled. Desired inventory supplies no operands.
-for phase in intent archived; do
+for phase in intent stopped archived config-rewritten node-restarted; do
   name=r10-journal-$phase
   r_plant "$name"
   a "$name" -e billet_gate_retained_continuation=true -e billet_retirement_survivor_host=unreachable
   e "$name" 'BILLET_GATE_RETIRE_ENV=/etc/billet/node.env (ignore_errors=yes)'
   answer=retired-retained-settled
   if [ "$phase" = archived ]; then answer=retired-retained-pending; fi
-  r_answers "$name" "control-a:classify:1:dry-run-continue-retained-$phase.json:0;control-a:request:1:$answer.json:0"
+  case "$phase" in
+    stopped|config-rewritten|node-restarted)
+      # Caller-only phase variants of a producer classification. Real phase
+      # transitions and physical state witnesses remain 3d's responsibility.
+      "$python" - "$work/retire-fixtures" "$work/cases/$name" "$phase" "$answer" <<'PYPHASE'
+import json, pathlib, shutil, sys
+fixtures, case, phase, answer = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3], sys.argv[4]
+value = json.loads((fixtures / 'dry-run-continue-retained-intent.json').read_text())
+value['journal']['phase'] = value['status']['phase'] = value['state'] = phase
+(case / 'classifier.json').write_text(json.dumps(value))
+shutil.copyfile(fixtures / (answer + '.json'), case / 'answer.json')
+PYPHASE
+      e "$name" "BILLET_GATE_RETIRE_FIXTURES=$work/cases/$name"
+      r_answers "$name" "control-a:classify:1:classifier.json:0;control-a:request:1:answer.json:0" ;;
+    *) r_answers "$name" "control-a:classify:1:dry-run-continue-retained-$phase.json:0;control-a:request:1:$answer.json:0" ;;
+  esac
   r_run "$name"
   expect_allowed "$name"
   expect_no_ordinary "$name"
@@ -755,7 +770,7 @@ for phase in intent archived; do
 done
 
 # DONE BUT UNSETTLED IS NOT SETTLED ENTRY. Deleting the settled clause from the
-# refusal would strand exactly this host, so it must still reach its continuation.
+# entry predicate would strand this host, so it must still reach its continuation.
 # A repeated pending tail reports its receipt current, the other accepted pairing.
 r_plant r10-journal-done-unsettled
 "$python" - "$work/retire-fixtures" "$work/cases/r10-journal-done-unsettled" <<'PYUNSETTLED'
@@ -778,7 +793,7 @@ expect_allowed r10-journal-done-unsettled
 expect_no_ordinary r10-journal-done-unsettled
 expect_no_play_task r10-journal-done-unsettled 'Ordinary convergence sentinel'
 expect_play_task_ran r10-journal-done-unsettled "Observe the retained continuation's terminal boundary"
-expect_no_task r10-journal-done-unsettled 'Refuse settled retained entry before strict continuation'
+expect_no_task r10-journal-done-unsettled 'Check settled entry through the retirement command'
 expect_ran r10-journal-done-unsettled "Continue through the journal's recorded survivor"
 expect_host_commands r10-journal-done-unsettled 'control-a retire-classify 1;control-a retire-request 1;'
 r_continuation r10-journal-done-unsettled 1 /etc/billet/node.env
@@ -786,23 +801,8 @@ r_reported r10-journal-done-unsettled continue 'continues the retained-node reti
 r_done_report r10-journal-done-unsettled False changed
 expect_ran r10-journal-done-unsettled "Report a row obligation whose survivor this converge did not prepare"
 
-# A settled retained entry must never attempt strict done proof before the
-# separate ordinary admission exists, including its clock and inspection.
-r_plant r10-journal-done
-a r10-journal-done -e billet_gate_retained_continuation=true
-r_answers r10-journal-done 'control-a:classify:1:dry-run-continue-retained-done.json:0'
-r_run r10-journal-done
-expect_refused r10-journal-done 'Refuse settled retained entry before strict continuation' \
-  'Ordinary convergence of a settled retained-node host arrives with its settled-entry admission'
-expect_no_ordinary r10-journal-done
-expect_no_play_task r10-journal-done 'Ordinary convergence sentinel'
-expect_play_task_ran r10-journal-done "Observe the retained continuation's terminal boundary"
-expect_host_commands r10-journal-done 'control-a retire-classify 1;'
-expect_no_task r10-journal-done "Read this host's clock for the continuation envelope"
-expect_no_task r10-journal-done 'Inspect only this host for its continuation envelope'
-expect_no_task r10-journal-done "Continue through the journal's recorded survivor"
-expect_no_task r10-journal-done 'Inspect the transaction claim before recovery'
-r_reported r10-journal-done continue 'continues the retained-node retirement it records'
+# r10-journal-done now runs the connected entry, node-config and closing callers
+# in retirement-activation-cases.sh; the normal continuation must stay unused.
 
 # Each bad answer still passes the strict parser. Only binding the variant
 # and pairing its receipt can refuse these case-local corruptions.

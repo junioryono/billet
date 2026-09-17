@@ -1,6 +1,5 @@
 ---
-# Only an admitted ordinary route consumes desired configuration. The retained
-# branch has no main.yml admission until its command-owned preflights exist.
+# Only an admitted ordinary route consumes desired configuration.
 - name: Refuse retained binary transactions before ordinary input or host mutation
   ansible.builtin.import_tasks: retirement-binary-refusal.yml
 
@@ -14,6 +13,17 @@
         or (not billet_retirement_node_ordinary | bool
             and billet_retirement_route in ['ordinary', 'cancel', 'unverified-check-mode'])
     fail_msg: Effective configuration requires an admitted ordinary route outside recovery.
+
+- name: Refuse possible recommissioning from frozen controller configuration
+  ansible.builtin.assert:
+    that:
+      - billet_config is mapping
+      - "'server' not in billet_config or billet_server_retire | bool"
+    fail_msg: >-
+      billet_config still contains server on a retired host. Set billet_server_retire
+      to retain retirement intent, or supply explicitly serverless configuration;
+      ordinary convergence cannot authorize possible recommissioning.
+  when: billet_retirement_node_ordinary | bool
 
 - name: Derive the configuration for this ordinary pass
   ansible.builtin.set_fact:

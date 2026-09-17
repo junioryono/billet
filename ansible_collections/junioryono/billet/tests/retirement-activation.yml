@@ -1,0 +1,102 @@
+---
+# Caller coverage only. Whole-role effects and lifecycle parity belong to 3d.
+- name: Exercise the connected retained caller with fixture-owned observations
+  hosts: control-a
+  gather_facts: false
+  tasks:
+    - name: Prepare the caller under the real converge guard
+      ansible.builtin.include_role:
+        name: junioryono.billet.host
+        tasks_from: prepare-exclusion
+
+    - name: Bind the recording caller to its fixture operands
+      ansible.builtin.set_fact:
+        billet_exclusion_holder: ci-1
+        billet_exclusion_id: '11111111111111111111111111111111'
+        billet_node_should_run: true
+        billet_config: "{{ {'node': {'name': 'reference-node', 'provider': 'docker', 'server_addr': 'https://control-b:9443', 'state_dir': '/var/lib/billet/node', 'lock_dir': '/run/billet/locks'}} | combine({'server': {'identity_dir': '/var/lib/billet/retired'}} if billet_gate_frozen else {}) }}"
+        billet_firecracker_enabled: false
+        billet_ceph_enabled: false
+        billet_server_prepare_only: false
+        billet_service_user: billet
+        billet_service_group: billet
+        billet_cache_tls_cert_src: ''
+        billet_smtp_username: ''
+        billet_smtp_password: ''
+
+    - name: Enter through the production retirement route
+      ansible.builtin.include_role:
+        name: junioryono.billet.host
+        tasks_from: retirement
+
+    - name: Observe the check-mode retained hold
+      ansible.builtin.assert:
+        that:
+          - billet_retirement_bypass is sameas true
+          - billet_retirement_node_ordinary is sameas false
+      when: ansible_check_mode
+
+    - name: Exercise the admitted ordinary caller boundaries
+      when: not billet_retirement_bypass | bool
+      block:
+        - name: Derive E through the admitted production entry
+          ansible.builtin.include_role:
+            name: junioryono.billet.host
+            tasks_from: effective-config
+
+        - name: Supply read-only downstream observations for the caller fixture
+          ansible.builtin.set_fact:
+            billet_candidate_node_state_dir: "{{ billet_effective_config.node.state_dir }}"
+            billet_retirement_environment_ready: true
+            billet_node_environment_files: []
+            billet_service_types_by_unit: {billet-node.service: {rc: 0, stdout: notify}}
+
+        - name: Select the real node unit operands
+          ansible.builtin.include_role:
+            name: junioryono.billet.host
+            tasks_from: unit-operands
+
+        - name: Select the real alert operands
+          ansible.builtin.include_role:
+            name: junioryono.billet.host
+            tasks_from: alert-operands
+
+        - name: Produce the real concrete operation document
+          ansible.builtin.include_role:
+            name: junioryono.billet.host
+            tasks_from: prepare-node-operations
+
+        # The fake only prints a file. This harness binds the fixture's two
+        # placeholder digests to this independently captured producer document.
+        - name: Bind the node-config fixture to the produced bytes
+          ansible.builtin.copy:
+            content: "{{ billet_gate_node_answer | combine({'rendering_sha256': billet_retirement_operation_document.rendering_sha256, 'operations_sha256': billet_retirement_operation_document.operations_sha256} if billet_gate_node_answer.outcome == 'admitted' else {}) | to_json }}"
+            dest: "{{ billet_gate_answer_root }}/node-config.json"
+            mode: '0600'
+
+        - name: Save the exact expected stdin for the outside observer
+          ansible.builtin.copy:
+            content: "{{ billet_retirement_operation_document.stdin }}"
+            dest: "{{ billet_gate_answer_root }}/expected.stdin"
+            mode: '0600'
+
+        - name: Call the production node configuration admission
+          ansible.builtin.include_role:
+            name: junioryono.billet.host
+            tasks_from: retirement-node-config
+
+        - name: Ordinary retained work sentinel
+          ansible.builtin.debug:
+            msg: The entry and exact node operation document were admitted.
+
+        - name: Finish pending handlers before the closing caller
+          ansible.builtin.meta: flush_handlers
+
+        - name: Call the production final closing boundary
+          ansible.builtin.include_role:
+            name: junioryono.billet.host
+            tasks_from: retirement-settled-closing
+
+        - name: Observe the successful caller result
+          ansible.builtin.debug:
+            msg: The retained caller finished with verified closing.

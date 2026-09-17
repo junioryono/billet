@@ -1,75 +1,118 @@
 ---
-# Operands are prepared after read-only predictions, before any ordinary write.
-# No retained route calls this file in commit 2. Provider planners must supply
-# their complete effects; an omitted plan is not an empty plan.
-- name: Require complete downstream plans for retained operation preparation
+# A superset of concrete destinations avoids predicting changed results. The
+# shared tasks consume these same facts; the drift gate binds their definitions.
+- name: Require runnable retained node operands
   ansible.builtin.assert:
     that:
-      - billet_retirement_provider_plan is mapping
-      - billet_retirement_provider_plan.filesystem is sequence
-      - billet_retirement_provider_plan.services is sequence
-      - billet_retirement_provider_plan.units is mapping
-      - billet_retirement_node_restart is boolean
       - billet_node_should_run | bool
       - not billet_binary_upgrade | default(false) | bool
-    fail_msg: Retained operation preparation requires explicit provider effects and a predicted node restart decision.
+      - billet_unit_operands.keys() | list == ['billet-node.service']
+    fail_msg: Retained operation preparation requires a runnable node and no binary transaction.
 
-# A PROVIDER PLAN MAY NOT RESTATE A UNIT THE ROLE ALREADY OWNS. The document is
-# rendered from the merged inventory while account.yml installs from
-# billet_unit_operands alone, so an overriding key would make the binding
-# describe bytes or a destination that nothing installs — admission for one unit
-# and the writing of another.
-- name: Refuse a provider plan that restates an admitted unit
-  ansible.builtin.assert:
-    that:
-      - billet_unit_operands.keys() | list | intersect(billet_retirement_provider_plan.units.keys() | list) == []
-    fail_msg: >-
-      The provider plan restates
-      {{ billet_unit_operands.keys() | list | intersect(billet_retirement_provider_plan.units.keys() | list) | join(', ') }},
-      which the role already renders. One inventory must describe each unit, or the
-      admitted document and the installed file are two different things.
-
-- name: Begin the ordinary filesystem and service operation inventory
+- name: Begin the concrete ordinary operation inventory
   ansible.builtin.set_fact:
-    billet_retirement_planned_filesystem: "{{ billet_retirement_provider_plan.filesystem }}"
-    billet_retirement_planned_services: >-
-      {{ billet_retirement_provider_plan.services
-         + ([{'verb': 'stop', 'unit': 'billet-node.service'}, {'verb': 'start', 'unit': 'billet-node.service'}]
-            if billet_retirement_node_restart else [])
-         + [{'verb': 'enable', 'unit': 'billet-node.service'}, {'verb': 'start', 'unit': 'billet-node.service'}] }}
-    billet_retirement_planned_units: "{{ billet_unit_operands | combine(billet_retirement_provider_plan.units) }}"
+    billet_retirement_planned_filesystem:
+      - {kind: write, path: "{{ billet_ordinary_config_path }}"}
+      - {kind: delete, path: /etc/modules-load.d/billet-rbd.conf}
+    billet_retirement_planned_services:
+      - {verb: enable, unit: billet-node.service}
+      - {verb: stop, unit: billet-node.service}
+      - {verb: start, unit: billet-node.service}
+    billet_retirement_planned_units: "{{ billet_unit_operands }}"
 
-- name: Bind ordinary directory destinations and ownership operations
+- name: Bind ordinary directory creation and nonrecursive metadata
   ansible.builtin.set_fact:
     billet_retirement_planned_filesystem: >-
-      {{ billet_retirement_planned_filesystem + [{'kind': 'mkdir', 'path': item.path}, {'kind': 'chown', 'path': item.path}] }}
+      {{ billet_retirement_planned_filesystem + [{'kind': 'mkdir', 'path': item.path}, {'kind': 'metadata', 'path': item.path}] }}
   loop: "{{ billet_common_directories + billet_node_directories }}"
   loop_control:
     label: "{{ item.path }}"
 
-- name: Bind the configuration destination
-  ansible.builtin.set_fact:
-    billet_retirement_planned_filesystem: "{{ billet_retirement_planned_filesystem + [{'kind': 'write', 'path': billet_ordinary_config_path}] }}"
-
-- name: Bind unit replacement destinations
+- name: Bind node unit replacement destinations
   ansible.builtin.set_fact:
     billet_retirement_planned_filesystem: "{{ billet_retirement_planned_filesystem + [{'kind': 'write', 'path': item.value.dest}] }}"
-  loop: "{{ billet_retirement_planned_units | dict2items }}"
+  loop: "{{ billet_unit_operands | dict2items }}"
   loop_control:
     label: "{{ item.key }}"
-
-- name: Bind installed environment reads without granting credential mutation
-  ansible.builtin.set_fact:
-    billet_retirement_planned_filesystem: "{{ billet_retirement_planned_filesystem + [{'kind': 'read', 'path': item.path}] }}"
-  loop: "{{ billet_node_environment_files }}"
-  loop_control:
-    label: "{{ item.path }}"
 
 - name: Bind supplied cache TLS destinations and parent creation
   ansible.builtin.set_fact:
     billet_retirement_planned_filesystem: >-
       {{ billet_retirement_planned_filesystem + [{'kind': 'mkdir', 'path': item | dirname}, {'kind': 'write', 'path': item}] }}
   loop: "{{ [billet_effective_config.node.cache.tls_cert, billet_effective_config.node.cache.tls_key] if billet_cache_tls_cert_src | length > 0 else [] }}"
+
+- name: Bind Firecracker staging extraction and installed binaries
+  when: billet_firecracker_enabled
+  ansible.builtin.set_fact:
+    billet_retirement_planned_filesystem: >-
+      {{ billet_retirement_planned_filesystem
+         + [{'kind': 'mkdir', 'path': billet_firecracker_stage},
+            {'kind': 'recursive-write', 'path': billet_firecracker_stage},
+            {'kind': 'write', 'path': billet_firecracker_stage ~ '/firecracker-' ~ billet_firecracker_version ~ '-' ~ billet_firecracker_arch ~ '.tgz'},
+            {'kind': 'write', 'path': '/usr/local/bin/firecracker-' ~ billet_firecracker_version},
+            {'kind': 'write', 'path': '/usr/local/bin/jailer-' ~ billet_firecracker_version},
+            {'kind': 'write', 'path': '/usr/local/bin/firecracker'},
+            {'kind': 'write', 'path': '/usr/local/bin/jailer'}] }}
+
+- name: Bind guest network constants
+  when: billet_firecracker_enabled
+  ansible.builtin.set_fact:
+    billet_retirement_planned_filesystem: >-
+      {{ billet_retirement_planned_filesystem + [
+         {'kind': 'write', 'path': '/etc/sysctl.d/99-billet-node.conf'},
+         {'kind': 'write', 'path': '/etc/systemd/system/billet-dnsmasq@.service'},
+         {'kind': 'write', 'path': '/etc/billet/network.nft'},
+         {'kind': 'write', 'path': '/etc/systemd/system/billet-network.service'}] }}
+
+- name: Bind configured guest network destinations
+  when: billet_firecracker_enabled
+  ansible.builtin.set_fact:
+    billet_retirement_planned_filesystem: >-
+      {{ billet_retirement_planned_filesystem + [
+         {'kind': 'write', 'path': '/etc/systemd/network/80-' ~ item.name ~ '.netdev'},
+         {'kind': 'write', 'path': '/etc/systemd/network/81-' ~ item.name ~ '.network'},
+         {'kind': 'write', 'path': '/etc/billet/network/' ~ item.name ~ '.conf'},
+         {'kind': 'write', 'path': '/etc/systemd/system/billet-dnsmasq@' ~ item.name ~ '.service'}] }}
+  loop: "{{ billet_networks }}"
+
+- name: Bind removed guest network destinations
+  when: billet_firecracker_enabled
+  ansible.builtin.set_fact:
+    billet_retirement_planned_filesystem: >-
+      {{ billet_retirement_planned_filesystem + [
+         {'kind': 'delete', 'path': '/etc/billet/network/' ~ item ~ '.conf'},
+         {'kind': 'delete', 'path': '/etc/systemd/network/80-' ~ item ~ '.netdev'},
+         {'kind': 'delete', 'path': '/etc/systemd/network/81-' ~ item ~ '.network'}] }}
+  loop: "{{ billet_stale_network_names | default([]) }}"
+
+- name: Bind Ceph keyring and kernel module policy
+  when: billet_ceph_enabled
+  ansible.builtin.set_fact:
+    billet_retirement_planned_filesystem: >-
+      {{ billet_retirement_planned_filesystem + [
+         {'kind': 'write', 'path': billet_ceph_keyring_path},
+         {'kind': 'metadata', 'path': billet_ceph_keyring_path},
+         {'kind': 'write', 'path': '/etc/modules-load.d/billet-rbd.conf'}] }}
+
+- name: Bind alert installation or cleanup destinations
+  ansible.builtin.set_fact:
+    billet_retirement_planned_filesystem: >-
+      {{ billet_retirement_planned_filesystem + [{'kind': 'write' if billet_ceph_enabled and billet_alert_email | length > 0 else 'delete', 'path': item}] }}
+  loop: >-
+    {{ [billet_smtp_config_path, billet_smtp_marker_path, billet_ceph_health_script_path,
+        billet_ceph_health_service_path, billet_ceph_health_timer_path] }}
+
+- name: Bind image refresh installation or cleanup destinations
+  ansible.builtin.set_fact:
+    billet_retirement_planned_filesystem: >-
+      {{ billet_retirement_planned_filesystem + [{'kind': 'write' if billet_firecracker_enabled and billet_ceph_enabled else 'delete', 'path': '/etc/systemd/system/' ~ item}] }}
+  loop: [billet-images-refresh.service, billet-images-refresh.timer]
+
+# tempfile uses the system temporary directory. Its unpredictable child names
+# are private files; no recursive operation on the shared parent is granted.
+- name: Bind the system temporary directory class root
+  ansible.builtin.set_fact:
+    billet_retirement_planned_filesystem: "{{ billet_retirement_planned_filesystem + [{'kind': 'mkdir', 'path': billet_endpoint_temp_dir}] }}"
 
 - name: Prepare the command documents without calling admission
   ansible.builtin.import_tasks: prepare-operation-document.yml

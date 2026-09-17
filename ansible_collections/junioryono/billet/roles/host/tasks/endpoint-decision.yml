@@ -205,6 +205,18 @@
           nothing was stopped or installed.
       when: billet_endpoint_answerer | length > 0
 
+    # #14 owns controller selection. Until it verifies an independent controller,
+    # a retired host cannot confirm its own migration; quiet starts need none.
+    - name: Refuse retained endpoint migration confirmed by the retired host
+      ansible.builtin.assert:
+        that: billet_migration_controller != inventory_hostname
+        fail_msg: >-
+          Retained endpoint migration cannot use inventory_hostname as billet_migration_controller;
+          the retired controller cannot confirm registration (#14).
+      when:
+        - billet_retirement_node_ordinary | default(false) | bool
+        - billet_endpoint_answer.planned | default(false) | bool
+
     - name: Take the endpoint decision as this run's facts
       ansible.builtin.set_fact:
         billet_endpoint_planned: "{{ billet_endpoint_answer.planned | bool }}"

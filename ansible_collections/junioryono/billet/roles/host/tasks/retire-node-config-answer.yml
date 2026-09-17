@@ -1,0 +1,106 @@
+---
+# Node-config success has a purpose; the command's generic refusal does not.
+# The operations digest binds the exact operations JSON within stdin, not a
+# second serialization and not the hash of the complete envelope.
+- name: Require one bounded node configuration answer
+  ansible.builtin.assert:
+    that:
+      - billet_retirement_node_config_raw.rc | default(none) is integer
+      - billet_retirement_node_config_raw.rc in [0, 2, 3]
+      - not billet_retirement_node_config_raw.unreachable | default(false) | bool
+      - not billet_retirement_node_config_raw.skipped | default(false) | bool
+      - billet_retirement_node_config_raw.rc != 0 or not billet_retirement_node_config_raw.failed | default(false) | bool
+      - billet_retirement_node_config_raw.stdout | default(none) is string
+      - billet_retirement_node_config_raw.stdout | trim | length > 0
+      - billet_retirement_node_config_raw.stdout.encode('utf-8') | length <= 16384
+    fail_msg: The node-config command did not return one bounded complete answer; ordinary mutation remains closed.
+
+- name: Decode the node configuration answer strictly
+  block:
+    - name: Read node configuration JSON without duplicate members
+      ansible.builtin.set_fact:
+        billet_retirement_node_config_answer: "{{ billet_retirement_node_config_raw.stdout | junioryono.billet.from_json_strict }}"
+  rescue:
+    - name: Refuse unreadable node configuration JSON
+      ansible.builtin.fail:
+        msg: The node-config command returned malformed or repeated JSON; ordinary mutation remains closed.
+
+- name: Require a node configuration answer object
+  ansible.builtin.assert:
+    that: billet_retirement_node_config_answer is mapping
+    fail_msg: The node-config answer is not an object.
+
+- name: Require exact node configuration answer members
+  ansible.builtin.assert:
+    that: billet_retirement_node_config_answer.keys() | list | sort == billet_node_config_members | sort
+    fail_msg: The node-config answer has missing or unknown members.
+  vars:
+    billet_node_config_members: >-
+      {{ (['schema', 'outcome', 'reason', 'why', 'state']
+          + (['next'] if 'next' in billet_retirement_node_config_answer else []))
+         if billet_retirement_node_config_answer.outcome | default('') in ['refused', 'unknown']
+         else ['schema', 'purpose', 'outcome', 'run', 'guard', 'retiring', 'deployment',
+               'transition_id', 'variant', 'rendering_sha256', 'operations_sha256', 'node_activity', 'state'] }}
+
+- name: Require node configuration schema and exit semantics
+  ansible.builtin.assert:
+    that:
+      - billet_retirement_node_config_answer.schema is integer
+      - billet_retirement_node_config_answer.schema == 1
+      - billet_retirement_node_config_answer.state == 'nothing'
+      - billet_retirement_node_config_answer.outcome in ['admitted', 'refused', 'unknown']
+      - >-
+        billet_retirement_node_config_raw.rc ==
+        (2 if billet_retirement_node_config_answer.outcome == 'refused' else
+         3 if billet_retirement_node_config_answer.outcome == 'unknown' else 0)
+    fail_msg: The node-config answer disagrees with its schema, outcome or exit.
+
+- name: Require typed node configuration refusal diagnostics
+  ansible.builtin.assert:
+    that:
+      - billet_retirement_node_config_answer.reason is string
+      - billet_retirement_node_config_answer.reason | length > 0
+      - billet_retirement_node_config_answer.why is string
+      - billet_retirement_node_config_answer.why | length > 0
+      - billet_retirement_node_config_answer.next | default('') is string
+    fail_msg: The node-config refusal has no typed reason and diagnostic.
+  when: billet_retirement_node_config_answer.outcome in ['refused', 'unknown']
+
+- name: Refuse the node configuration command's negative answer
+  ansible.builtin.fail:
+    msg: >-
+      Retirement's node-config was {{ billet_retirement_node_config_answer.outcome }}
+      ({{ billet_retirement_node_config_answer.reason }}): {{ billet_retirement_node_config_answer.why }}
+      Ordinary mutation remains closed.
+  when: billet_retirement_node_config_answer.outcome in ['refused', 'unknown']
+
+- name: Require typed node configuration success bindings
+  ansible.builtin.assert:
+    that:
+      - billet_retirement_node_config_answer[item] is string
+      - billet_retirement_node_config_answer[item] | length > 0
+    fail_msg: "The node-config answer has an invalid {{ item }} binding."
+  loop: [run, guard, retiring, deployment, transition_id, rendering_sha256, operations_sha256]
+
+- name: Bind node configuration admission to this entry and exact document
+  ansible.builtin.assert:
+    that:
+      - billet_retirement_node_config_answer.purpose == 'node-config'
+      - billet_retirement_node_config_answer.variant == 'retained-node'
+      - billet_retirement_node_config_answer.node_activity in ['active', 'quiet-inactive', 'quiet-failed']
+      - billet_retirement_node_config_answer.guard is match('^[0-9a-f]{32}\Z')
+      - billet_retirement_node_config_answer.transition_id is match('^[0-9a-f]{32}\Z')
+      - billet_retirement_node_config_answer.rendering_sha256 is match('^[0-9a-f]{64}\Z')
+      - billet_retirement_node_config_answer.operations_sha256 is match('^[0-9a-f]{64}\Z')
+      - billet_retirement_node_config_answer.run == billet_exclusion_holder
+      - billet_retirement_node_config_answer.guard == billet_exclusion_id
+      - billet_retirement_node_config_answer.retiring == inventory_hostname
+      - billet_retirement_node_config_answer.deployment == billet_retirement_entry_result.deployment
+      - billet_retirement_node_config_answer.transition_id == billet_retirement_entry_result.transition_id
+      - billet_retirement_node_config_answer.rendering_sha256 == billet_retirement_operation_document.rendering_sha256
+      - billet_retirement_node_config_answer.operations_sha256 == billet_retirement_operation_document.operations_sha256
+    fail_msg: The node-config answer does not bind this entry, run, transition, rendering and operation document.
+
+- name: Record current node configuration admission
+  ansible.builtin.set_fact:
+    billet_retirement_operation_admission: "{{ billet_retirement_node_config_answer }}"

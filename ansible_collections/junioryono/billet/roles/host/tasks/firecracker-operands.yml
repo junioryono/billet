@@ -1,0 +1,5 @@
+---
+- name: Select the Firecracker release architecture
+  ansible.builtin.set_fact:
+    billet_firecracker_arch: "{{ {'x86_64': 'x86_64', 'aarch64': 'aarch64'}.get(ansible_facts['architecture'], '') }}"
+

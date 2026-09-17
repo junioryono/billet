@@ -1,14 +1,7 @@
 ---
-- name: Inspect previously managed billet guest networks
-  ansible.builtin.find:
-    paths: /etc/billet/network
-    patterns: "*.conf"
-    file_type: file
-  register: billet_managed_network_files
-  become: true
-
-- name: Identify guest networks removed from configuration
-  ansible.builtin.include_tasks: network-stale.yml
+- name: Resolve guest network destinations
+  ansible.builtin.import_tasks: network-operands.yml
+  when: not billet_retirement_node_ordinary | bool
 
 - name: Predict the IP forwarding change
   ansible.posix.sysctl:

@@ -423,10 +423,11 @@ if [ "${1:-} ${2:-}" = 'server retire' ]; then
     case "$arg" in
       --dry-run) [ -n "$retire_mode" ] || retire_mode=classify ;;
       --reserve) retire_mode=reserve ;;
-      --input) retire_mode=request ;;
+      --input) [ "$retire_mode" = node-config ] || retire_mode=request ;;
       --abandon-reservation) retire_mode=abandon ;;
       --complete-row) retire_mode=complete ;;
       --acknowledge-row) retire_mode=acknowledge ;;
+      --check-node-config) retire_mode=node-config ;;
       --check-settled-entry) retire_mode=settled-entry ;;
       --check-settled-closing) retire_mode=settled-closing ;;
     esac

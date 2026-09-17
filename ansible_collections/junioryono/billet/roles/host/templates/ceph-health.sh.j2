@@ -7,7 +7,8 @@ mkdir -p "${state_dir}"
 
 detail=$(ceph health detail 2>&1) || status=ERROR
 status=${status:-$(printf '%s\n' "${detail}" | sed -n '1s/ .*//p')}
-previous=$(test -f "${state_file}" && cat "${state_file}" || true)
+# A symlink is never read: its target may be an archived secret.
+previous=$(test -f "${state_file}" && ! test -L "${state_file}" && cat "${state_file}" || true)
 
 if [ "${status}" != "HEALTH_OK" ] && [ "${detail}" != "${previous}" ]; then
     printf '%s\n' "${detail}" | mail -r {{ billet_alert_from | quote }} -s "billet Ceph health on $(hostname): ${status}" {{ billet_alert_email | quote }}
@@ -15,4 +16,10 @@ elif [ "${status}" = "HEALTH_OK" ] && [ -n "${previous}" ] && ! printf '%s' "${p
     printf '%s\n' "Ceph recovered on $(hostname): ${detail}" | mail -r {{ billet_alert_from | quote }} -s "billet Ceph recovered on $(hostname)" {{ billet_alert_email | quote }}
 fi
 
-printf '%s\n' "${detail}" >"${state_file}"
+# Rename replaces a planted ceph.last symlink instead of opening its target;
+# -T keeps a symlink to a directory from receiving the file inside it.
+state_tmp=$(mktemp "${state_dir}/.ceph.last.XXXXXXXX")
+trap 'rm -f "${state_tmp}"' EXIT HUP INT TERM
+printf '%s\n' "${detail}" >"${state_tmp}"
+mv -fT -- "${state_tmp}" "${state_file}"
+trap - EXIT HUP INT TERM

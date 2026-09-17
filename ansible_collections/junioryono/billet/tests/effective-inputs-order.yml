@@ -46,7 +46,7 @@
   vars:
     billet_config: {server: {state_dir: /var/lib/billet/inventory}}
 
-- name: Require retirement to remain closed to retained ordinary convergence
+- name: Require retained ordinary work to enter through the settled continuation
   ansible.builtin.assert:
     that:
       - billet_gate_main_source[-1].when == 'not billet_retirement_bypass | bool'
@@ -58,7 +58,8 @@
       - >-
         (billet_gate_retirement_source | selectattr('name', 'equalto', 'Close the ordinary boundary on every other route') | first)
         .when == "billet_retirement_route != 'ordinary' and not billet_retirement_check_preview | bool"
-      - "'billet_retirement_node_ordinary: true' not in lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/retirement.yml')"
+      - "'retirement-continue.yml' in lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/retirement.yml')"
+      - "'billet_retirement_node_ordinary: true' in lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/retirement-continue.yml')"
 
 # THE IMPORTS ARE COLLECTED BY THEIR LITERAL KEY. `selectattr` and
 # `map(attribute=...)` read dots in an attribute name as a path, so
@@ -82,10 +83,11 @@
       - >-
         billet_gate_ordinary_imports ==
         ['effective-config.yml', 'service-account.yml', 'upgrade-inspect.yml', 'ledger-mount-name.yml',
-         'upgrade-recover.yml', 'upgrade-fresh-converge.yml', 'network-disable.yml', 'account.yml',
+         'upgrade-recover.yml', 'upgrade-fresh-converge.yml', 'validate-interpreted-inputs.yml', 'network-disable.yml',
+         'retirement-node-preflight.yml', 'account.yml',
          'service-account.yml', 'ledger-mount.yml', 'cache-tls.yml', 'firecracker.yml', 'network.yml',
          'ceph.yml', 'alerts.yml', 'images-refresh.yml', 'backup.yml', 'services.yml']
-      - billet_gate_main_source[-1].block[-1]['ansible.builtin.meta'] == 'flush_handlers'
+      - billet_gate_main_source[-1].block[-2]['ansible.builtin.meta'] == 'flush_handlers'
     fail_msg: >-
       The ordinary imports are now {{ billet_gate_ordinary_imports }}.
 
