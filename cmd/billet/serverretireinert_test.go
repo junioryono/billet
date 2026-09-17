@@ -326,9 +326,10 @@ func TestRetirementUpgradeStaticRequiresItsQuietTimerAndNoProcess(t *testing.T) 
 	for _, hazard := range []string{"timer", "process", "active"} {
 		t.Run(hazard, func(t *testing.T) {
 			unit, property, value := upgradeServiceUnit, "MainPID", "99"
-			if hazard == "timer" {
+			switch hazard {
+			case "timer":
 				unit, property, value = upgradeTimerUnit, "ActiveState", "active"
-			} else if hazard == "active" {
+			case "active":
 				property, value = "ActiveState", "active"
 			}
 			file := filepath.Join(f.unitsDir, unit)

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -103,7 +104,7 @@ func installRetireInertFile(path string, body []byte, mode fs.FileMode) error {
 		if err != nil {
 			return err
 		}
-		if string(have) != string(body) {
+		if !bytes.Equal(have, body) {
 			return fmt.Errorf("existing retirement file differs: %s", path)
 		}
 	}
@@ -354,7 +355,7 @@ func reconcileRetireInert(ctx context.Context, m retireMode, j retirement.Journa
 		if err != nil {
 			return retireUnknown(retireReasonInertInstall, err.Error(), "")
 		}
-		protected := append(retireOperationProtection(j).Paths, j.IdentityDir)
+		protected := slices.Concat(retireOperationProtection(j).Paths, []string{j.IdentityDir})
 		if r := admitRetireFuturePath(path, true, protected); r != nil {
 			return r
 		}
@@ -463,7 +464,7 @@ func retireInertEvidence(ctx context.Context, j retirement.Journal) ([]lifeops.R
 }
 
 func proveRetireNoConditionOverride(insp *lifeops.Inspector, unit, own string, paths []string) *retireRefusal {
-	var directories []string
+	directories := make([]string, 0, len(insp.OperationUnitDirectories())+len(paths))
 	for _, root := range insp.OperationUnitDirectories() {
 		directories = append(directories, filepath.Join(root, unit+".d"))
 	}

@@ -138,7 +138,7 @@ func retireSettledEnablement(ctx context.Context, j retirement.Journal) (map[str
 		if !knownUnitFileState(state) {
 			return nil, retireUnknown(retireReasonPostcondition, "controller enablement is unknown", "")
 		}
-		if state != "disabled" && state != "masked" && !((unit == backupServiceUnit || unit == upgradeServiceUnit) && state == "static") {
+		if state != "disabled" && state != "masked" && (unit != backupServiceUnit && unit != upgradeServiceUnit || state != "static") {
 			changes[unit] = state
 		}
 	}

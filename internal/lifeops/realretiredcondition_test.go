@@ -38,6 +38,7 @@ func TestRealSystemdRetiredConditions(t *testing.T) {
 }
 
 func realRetiredConditionMechanism(t *testing.T, mechanism string) {
+	t.Helper()
 	h := newRealOperationHost(t)
 	marker := filepath.Join(t.TempDir(), "retired")
 	witness := filepath.Join(filepath.Dir(marker), "executed")
