@@ -303,11 +303,12 @@
             billet_gate_render_task['ansible.builtin.set_fact'].billet_retirement_collect_rendering[2:-2].split() | join(' ')
             == "lookup('ansible.builtin.template', 'billet.yaml.j2', template_vars={'billet_config_document': billet_retirement_collect_vars.billet_config})"
 
+    # The copy names the template by path: production finds `billet.yaml.j2`
+    # through the role's own search path, which a playbook does not have, and the
+    # pin above is what holds production to the bare name and this operand.
     - name: Render the full desired eligibility document through a copy of the production expression
       ansible.builtin.set_fact:
-        billet_gate_full_desired: "{{ lookup('ansible.builtin.template', 'billet.yaml.j2', template_vars={'billet_config_document': billet_retirement_collect_vars.billet_config}) }}"
-      vars:
-        ansible_search_path: ["{{ playbook_dir }}/../roles/host"]
+        billet_gate_full_desired: "{{ lookup('ansible.builtin.template', playbook_dir + '/../roles/host/templates/billet.yaml.j2', template_vars={'billet_config_document': billet_retirement_collect_vars.billet_config}) }}"
 
     - name: Require full desired bytes on both fresh and collected evidence
       ansible.builtin.assert:
