@@ -101,26 +101,91 @@
         billet_github_key_path: "{{ billet_gate_keys['ansible.builtin.set_fact'].billet_github_key_path }}"
         billet_github_key_path_is_string: "{{ billet_gate_keys['ansible.builtin.set_fact'].billet_github_key_path_is_string }}"
 
-    - name: Require every ordinary alias and direct path reader to answer from E
+    # THE TWO ALIASES ARE EVALUATED, and they are the only readers here that can
+    # be: `include_vars` PARSES vars/main.yml, so its values template normally.
+    # Giving E an identity directory and a backend that inventory disagrees with
+    # is therefore a real measurement of which document the aliases read.
+    - name: Require the ordinary aliases to answer from E
       ansible.builtin.assert:
         that:
-          # THE PORT'S DEFAULT IS PINNED AS TEXT, not evaluated. It is read out of
-          # defaults/main.yml through lookup('file'), and Ansible marks file-lookup
-          # content unsafe, so the nested expression is never re-templated: evaluating
-          # it yields the literal string, and `| int` yields 0 whatever the reader says.
-          - "'billet_effective_config.node.firecracker.image_verify_port' in billet_gate_defaults.billet_image_verify_port"
-          - "'default(7719, true)' in billet_gate_defaults.billet_image_verify_port"
           - billet_configured_server_state_dir == '/var/lib/billet/effective-identity'
           - billet_configured_state_backend == 'postgres'
-          - billet_gate_candidates['ansible.builtin.set_fact'].billet_candidate_server_state_dir == '/var/lib/billet/effective-identity'
-          - billet_gate_candidates['ansible.builtin.set_fact'].billet_candidate_node_state_dir == '/var/lib/billet/effective-node'
-          - billet_gate_keys['ansible.builtin.set_fact'].billet_github_key_required | bool
-          - billet_gate_keys['ansible.builtin.set_fact'].billet_github_key_path == '/etc/billet/effective-key.pem'
-          - billet_gate_keys['ansible.builtin.set_fact'].billet_github_key_path_is_string | bool
-          - billet_gate_targets.loop == billet_effective_config.targets
-          - billet_gate_cache[1].loop == ['/etc/billet/effective-cache', '/etc/billet/effective-cache']
-          - billet_gate_cache[3]['ansible.builtin.copy'].dest == '/etc/billet/effective-cache/cert.pem'
-          - billet_gate_cache[4]['ansible.builtin.copy'].dest == '/etc/billet/effective-cache/key.pem'
+        fail_msg: >-
+          The ordinary aliases resolved {{ billet_configured_server_state_dir }} and
+          {{ billet_configured_state_backend }}; E names /var/lib/billet/effective-identity
+          and postgres, and inventory disagrees on both.
+
+    # EVERY OTHER READER IS PINNED AS TEXT, not evaluated, and this is a real
+    # limit rather than a preference. Each is read out of a task file through
+    # lookup('file'), and Ansible marks file-lookup content unsafe so that a file
+    # cannot inject a template — which means the nested expression is never
+    # re-templated. Evaluating one yields the literal `{{ ... }}`: it equals no
+    # path, satisfies no `| bool`, and equals no list, so an assertion written
+    # that way can only ever fail, whichever document the reader names. Asking
+    # instead which document the expression NAMES is the question the design
+    # actually poses (§3.5: an ordinary operative read from raw inventory is a
+    # defect), and it is answerable from the text.
+    #
+    # THE SECOND CLAUSE IS THE DISCRIMINATING ONE. Naming the effective document
+    # is satisfied by an expression that reads both; what must be absent is a raw
+    # `billet_config`, so the two names that legitimately contain it as a prefix
+    # are removed before looking.
+    - name: Require every operative reader to name the effective document
+      ansible.builtin.assert:
+        that:
+          - item.expression is search(item.names)
+          - >-
+            (item.expression | replace('billet_effective_config', '') | replace('billet_configured', ''))
+            is not search('billet_config')
+        fail_msg: >-
+          {{ item.reader }} reads `{{ item.expression }}`, which does not answer from
+          the effective document.
+      loop:
+        - reader: the transaction's candidate server directory
+          names: billet_configured_server_state_dir
+          expression: "{{ billet_gate_candidates['ansible.builtin.set_fact'].billet_candidate_server_state_dir }}"
+        - reader: the transaction's candidate node directory
+          names: billet_effective_config
+          expression: "{{ billet_gate_candidates['ansible.builtin.set_fact'].billet_candidate_node_state_dir }}"
+        - reader: the GitHub App key requirement
+          names: billet_effective_config
+          expression: "{{ billet_gate_keys['ansible.builtin.set_fact'].billet_github_key_required }}"
+        - reader: the GitHub App key path
+          names: billet_effective_config
+          expression: "{{ billet_gate_keys['ansible.builtin.set_fact'].billet_github_key_path }}"
+        - reader: the GitHub App key's type test
+          names: billet_effective_config
+          expression: "{{ billet_gate_keys['ansible.builtin.set_fact'].billet_github_key_path_is_string }}"
+        - reader: the further targets' key policy
+          names: billet_effective_config
+          expression: "{{ billet_gate_targets.loop }}"
+        - reader: the cache TLS parent directories
+          names: billet_effective_config
+          expression: "{{ billet_gate_cache[1].loop | join(' ') }}"
+        - reader: the cache TLS certificate destination
+          names: billet_effective_config
+          expression: "{{ billet_gate_cache[3]['ansible.builtin.copy'].dest }}"
+        - reader: the cache TLS key destination
+          names: billet_effective_config
+          expression: "{{ billet_gate_cache[4]['ansible.builtin.copy'].dest }}"
+        - reader: the image-verification port's default
+          names: billet_effective_config.node.firecracker.image_verify_port
+          expression: "{{ billet_gate_defaults.billet_image_verify_port }}"
+      loop_control:
+        label: "{{ item.reader }}"
+
+    # The port keeps its default beside naming E: an absent one makes every host
+    # that says nothing render a portless rule.
+    - name: Require the image-verification port to keep its default
+      ansible.builtin.assert:
+        that:
+          - "'default(7719, true)' in billet_gate_defaults.billet_image_verify_port"
+
+    # The provider refusal names the node's provider from E, and its message is
+    # plain text rather than an expression, so this one reads as written.
+    - name: Require the provider refusal to describe the effective node
+      ansible.builtin.assert:
+        that:
           - "'a firecracker node' in billet_gate_network[2]['ansible.builtin.fail'].msg"
           - "'as a firecracker node' in billet_gate_network[2]['ansible.builtin.fail'].msg"
 
