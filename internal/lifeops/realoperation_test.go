@@ -316,6 +316,11 @@ with open(sys.argv[1], encoding="utf-8") as source:
     template = Environment(undefined=StrictUndefined).from_string(source.read())
 print(template.render(
     billet_firecracker_enabled=sys.argv[4] == "true",
+    # THE EFFECTIVE DOCUMENT, because that is what the ordinary templates read now
+    # (5d's reader conversion). StrictUndefined is what makes this a real coupling
+    # rather than a silently empty render: a template that goes back to
+    # billet_config, or forward to a name this does not supply, fails here.
+    billet_effective_config={},
     billet_config={},
     billet_ledger_volume_id="fixture-volume",
     billet_ledger_mount_unit_name=sys.argv[2],
