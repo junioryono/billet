@@ -208,7 +208,10 @@ def base_variables():
 def seed():
     # The namespace overlays /etc; these accounts never reach the host database.
     subprocess.run(['groupadd', '--system', 'billetgate'], check=True)
-    subprocess.run(['useradd', '--system', '--no-log-init', '--key', 'CREATE_MAIL_SPOOL=no', '--gid', 'billetgate', '--home-dir', '/var/lib/billet', '--no-create-home', 'billetgate'], check=True)
+    # No --key CREATE_MAIL_SPOOL=no: the runner image's shadow build answers
+    # "unknown item" and exits 3, which fails the seed before any case runs.
+    subprocess.run(['useradd', '--system', '--no-log-init', '--gid', 'billetgate',
+                    '--home-dir', '/var/lib/billet', '--no-create-home', 'billetgate'], check=True)
     import grp
     import pwd
     write('/var/lib/billet/service-account', dict(user='billetgate', group='billetgate', uid=pwd.getpwnam('billetgate').pw_uid, gid=grp.getgrnam('billetgate').gr_gid))
