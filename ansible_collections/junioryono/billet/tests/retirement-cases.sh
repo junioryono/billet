@@ -1508,8 +1508,10 @@ answer['receipt'] = 'written'
 PYRECEIPT
 e r19-server-with-receipt "BILLET_GATE_RETIRE_FIXTURES=$work/cases/r19-server-with-receipt"
 r_run r19-server-with-receipt
-expect_refused r19-server-with-receipt 'Fail with the original request and its cleanup result' \
-  'Require the request to confirm this server-only retirement' 'with no receipt'
+# failed_at names the first failure; the rescue's final fail carries the
+# original task name and the cleanup result after it.
+expect_refused r19-server-with-receipt 'Require the request to confirm this server-only retirement' \
+  'with no receipt' 'Afterwards: ' 'Ordinary host tasks remain bypassed.'
 expect_no_task r19-server-with-receipt "Keep the new retirement's result"
 r_no_ordinary_after_request r19-server-with-receipt
 

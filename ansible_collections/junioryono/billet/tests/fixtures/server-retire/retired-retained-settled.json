@@ -18,8 +18,12 @@
       "phase": "archived"
     },
     {
-      "action": "done",
+      "action": "restart",
       "phase": "config-rewritten"
+    },
+    {
+      "action": "done",
+      "phase": "node-restarted"
     }
   ],
   "status": "done",

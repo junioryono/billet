@@ -178,20 +178,22 @@
       ansible.builtin.assert:
         that:
           - >-
-            ('billet-node.service' if billet_retirement_node_ordinary | default(false) | bool else 'billet-server.service')
+            ('billet-node.service' if billet_gate_retained | default(false) | bool else 'billet-server.service')
             == item.unit
           - >-
-            (billet_service_policy_reload_after.rc != 0 or
-             (billet_retirement_node_ordinary | default(false) | bool and
-              billet_service_policy_reload_after.stdout | trim not in ['yes', 'no']))
+            (billet_gate_reload.rc != 0 or
+             (billet_gate_retained | default(false) | bool and
+              billet_gate_reload.stdout | trim not in ['yes', 'no']))
             == item.fails
         fail_msg: "{{ item.name }}: the probe selected or judged its answer wrongly."
       # Whole values through one expression each, so rc stays an integer and the
       # retained fact a Boolean; a template nested inside a mapping would render
-      # rc as the string "0", which is never equal to 0.
+      # rc as the string "0", which is never equal to 0. The copy's names are its
+      # own: earlier plays leave the production names set as facts, which outrank
+      # task vars and would answer every case as an ordinary host.
       vars:
-        billet_retirement_node_ordinary: "{{ item.retained }}"
-        billet_service_policy_reload_after: "{{ item.result }}"
+        billet_gate_retained: "{{ item.retained }}"
+        billet_gate_reload: "{{ item.result }}"
       loop:
         - {name: retained yes, retained: true, result: {rc: 0, stdout: 'yes'}, unit: billet-node.service, fails: false}
         - {name: retained no, retained: true, result: {rc: 0, stdout: "no\n"}, unit: billet-node.service, fails: false}
