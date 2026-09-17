@@ -99,6 +99,7 @@
 
     - name: Reset the new request's reservation and collection
       ansible.builtin.set_fact:
+        billet_retirement_variant: server-only
         billet_retirement_survivor: "{{ billet_retirement_survivor_host }}"
         billet_retirement_local_environment_file: "{{ billet_retirement_environment_file }}"
         billet_retirement_reservation: {}

@@ -1253,7 +1253,7 @@ func TestTheDryRunQualifiesRequestsFromTheInstalledPair(t *testing.T) {
 	for _, extra := range [][]string{nil, {"--requested"}} {
 		args := append([]string{"--dry-run", "--retiring-host", requestRetiring}, extra...)
 		out, code := run(args...)
-		assertRetireRoute(t, out, code, "unsupported-variant", "retained-node")
+		assertRetireRoute(t, out, code, "continue", "retained-node")
 	}
 }
 
@@ -1482,9 +1482,13 @@ func TestTheDryRunHoldsOnlyTheGuardContinuityItWasGiven(t *testing.T) {
 // while ordinary tasks remain reachable. The observation must neither settle
 // nor repair the record, with or without continuity flags.
 func TestTheDryRunRequiresAMutationReadyGuardOnlyForRetirement(t *testing.T) {
-	for _, route := range []string{"ordinary", "new-request", "continue", "cancel", "unsupported-variant"} {
+	for _, entry := range []string{"ordinary", "new-request", "continue", "retained-continuation", "cancel", "unsupported-variant"} {
 		for _, damage := range []string{"preparing", "interrupted rewrite"} {
-			t.Run(route+"/"+damage, func(t *testing.T) {
+			t.Run(entry+"/"+damage, func(t *testing.T) {
+				route := entry
+				if entry == "retained-continuation" {
+					route = "continue"
+				}
 				var f *retireFixture
 				rowFact, why := retirement.RowAbsent, ""
 				args := []string{"--dry-run", "--retiring-host", "control-a"}
@@ -1503,6 +1507,16 @@ func TestTheDryRunRequiresAMutationReadyGuardOnlyForRetirement(t *testing.T) {
 					mustHold(t, "ci-1")
 					if route == "continue" {
 						f.journalAt(t, retirement.PhaseIntent, "ci-1")
+						if entry == "retained-continuation" {
+							j, presence, err := retirement.ReadJournal()
+							mustOK(t, err)
+							if presence != retirement.JournalPresent {
+								t.Fatal("the fixture's journal is absent")
+							}
+							j.Variant, j.Config = retirement.VariantRetainedNode, "present"
+							j.StagedSHA256 = strings.Repeat("a", 64)
+							mustOK(t, j.Write(retireNow()))
+						}
 						why = "readable journal"
 					}
 					if route == "unsupported-variant" {
@@ -2055,8 +2069,12 @@ func retireBinaryRecoveryFixture(t *testing.T, legacy bool) (*retireFixture, str
 // still reaches the tasks that own that pointer, with or without continuity
 // flags; omitting an expectation cannot hide the pointer in front of us.
 func TestTheDryRunKeepsBinaryRecoveryOnTheOrdinaryRoute(t *testing.T) {
-	for _, route := range []string{"ordinary", "cancel", "continue", "unsupported-variant"} {
-		t.Run(route, func(t *testing.T) {
+	for _, entry := range []string{"ordinary", "cancel", "continue", "retained-continuation"} {
+		t.Run(entry, func(t *testing.T) {
+			route := entry
+			if entry == "retained-continuation" {
+				route = "continue"
+			}
 			var f *retireFixture
 			if route == "cancel" {
 				request := newRequestFixture(t)
@@ -2067,9 +2085,9 @@ func TestTheDryRunKeepsBinaryRecoveryOnTheOrdinaryRoute(t *testing.T) {
 				mustHold(t, "ci-1")
 			}
 			switch route {
-			case "continue", "unsupported-variant":
+			case "continue":
 				f.journalAt(t, retirement.PhaseIntent, "ci-1")
-				if route == "unsupported-variant" {
+				if entry == "retained-continuation" {
 					j, presence, err := retirement.ReadJournal()
 					mustOK(t, err)
 					if presence != retirement.JournalPresent {

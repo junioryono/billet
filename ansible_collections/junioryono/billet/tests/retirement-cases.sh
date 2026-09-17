@@ -145,6 +145,12 @@ cat >"$work/retirement-entry-tasks.yml" <<'PLAY'
              and not (ansible_check_mode and billet_retirement_route == 'unverified-check-mode'))
         fail_msg: The route left the ordinary boundary open.
   always:
+    - name: Observe the retained continuation's terminal boundary
+      ansible.builtin.assert:
+        that:
+          - billet_retirement_bypass is sameas true
+          - billet_retirement_node_ordinary is sameas false
+      when: billet_gate_retained_continuation | default(false) | bool
     - name: Observe cancellation's terminal boundary
       ansible.builtin.debug:
         msg: "Cancellation bypass={{ billet_retirement_bypass | default(true) }}."
@@ -325,7 +331,7 @@ done
 
 # R3/R5 lazy preparation: real main must reach the journal-only command with
 # unusable D. The unsettled case reports its pending row and ends as before.
-# No retained journal is admitted here; R10 remains the retained-route refusal.
+# R10 separately exercises retained continuation and its settled-entry boundary.
 for kind in null-server malformed undefined-config; do
   name=r3-lazy-$kind
   r_plant "$name"
@@ -429,7 +435,7 @@ expect_allowed r5-handoff
 expect_host_commands r5-handoff 'control-a retire-classify 1;control-a retire-request 1;control-b retire-complete 1;control-a retire-acknowledge 1;control-a retire-request 2;'
 expect_no_ordinary r5-handoff
 expect_no_play_task r5-handoff 'Ordinary convergence sentinel'
-expect_ran r5-handoff 'Require a known completed server-only retirement'
+expect_ran r5-handoff 'Require a known completed retirement matching its variant and receipt'
 r_continuation r5-handoff 2 /etc/billet/server.env handoff
 r_reported r5-handoff continue
 
@@ -716,14 +722,93 @@ r_answers r10-installed-both 'control-a:classify:1:dry-run-unsupported-variant.j
 r_run r10-installed-both
 r_held r10-installed-both unsupported-variant
 
-# R10: a retained node in the journal refuses at every supported phase.
-for phase in intent archived done; do
+# R10: retained journals continue with their recorded operands and paired
+# receipts, then end even when settled. Desired inventory supplies no operands.
+for phase in intent archived; do
   name=r10-journal-$phase
   r_plant "$name"
-  r_answers "$name" "control-a:classify:1:dry-run-unsupported-variant-$phase.json:0"
+  a "$name" -e billet_gate_retained_continuation=true -e billet_retirement_survivor_host=unreachable
+  e "$name" 'BILLET_GATE_RETIRE_ENV=/etc/billet/node.env (ignore_errors=yes)'
+  answer=retired-retained-settled
+  if [ "$phase" = archived ]; then answer=retired-retained-pending; fi
+  r_answers "$name" "control-a:classify:1:dry-run-continue-retained-$phase.json:0;control-a:request:1:$answer.json:0"
   r_run "$name"
-  r_held "$name" unsupported-variant
-  r_reported "$name" unsupported-variant 'the journal records a retained-node retirement'
+  expect_allowed "$name"
+  expect_no_ordinary "$name"
+  expect_no_play_task "$name" 'Ordinary convergence sentinel'
+  expect_play_task_ran "$name" "Observe the retained continuation's terminal boundary"
+  expect_no_task "$name" 'Inspect the transaction claim before recovery'
+  expect_host_commands "$name" 'control-a retire-classify 1;control-a retire-request 1;'
+  r_continuation "$name" 1 /etc/billet/node.env
+  r_reported "$name" continue 'continues the retained-node retirement it records'
+  if [ "$phase" = archived ]; then
+    r_done_report "$name" False changed
+    expect_ran "$name" "Report a row obligation whose survivor this converge did not prepare"
+  else
+    r_done_report "$name" True changed
+    expect_no_task "$name" "Report a row obligation whose survivor this converge did not prepare"
+  fi
+  expect_no_task "$name" 'Complete the row on the recorded survivor'
+done
+
+# A settled retained entry must never attempt strict done proof before the
+# separate ordinary admission exists, including its clock and inspection.
+r_plant r10-journal-done
+a r10-journal-done -e billet_gate_retained_continuation=true
+r_answers r10-journal-done 'control-a:classify:1:dry-run-continue-retained-done.json:0'
+r_run r10-journal-done
+expect_refused r10-journal-done 'Refuse settled retained entry before strict continuation' \
+  'Ordinary convergence of a settled retained-node host arrives with its settled-entry admission'
+expect_no_ordinary r10-journal-done
+expect_no_play_task r10-journal-done 'Ordinary convergence sentinel'
+expect_play_task_ran r10-journal-done "Observe the retained continuation's terminal boundary"
+expect_host_commands r10-journal-done 'control-a retire-classify 1;'
+expect_no_task r10-journal-done "Read this host's clock for the continuation envelope"
+expect_no_task r10-journal-done 'Inspect only this host for its continuation envelope'
+expect_no_task r10-journal-done "Continue through the journal's recorded survivor"
+expect_no_task r10-journal-done 'Inspect the transaction claim before recovery'
+r_reported r10-journal-done continue 'continues the retained-node retirement it records'
+
+# Each bad answer still passes the strict parser. Only binding the variant
+# and pairing its receipt can refuse these case-local corruptions.
+for kind in retained-no-receipt server-with-receipt wrong-variant; do
+  name=r10-$kind
+  r_plant "$name"
+  a "$name" -e billet_gate_retained_continuation=true
+  classifier=dry-run-continue-retained-intent
+  answer=retired-retained-settled
+  if [ "$kind" = server-with-receipt ]; then
+    classifier=dry-run-continue
+    answer=retired-settled
+  fi
+  "$python" - "$work/retire-fixtures" "$work/cases/$name" "$classifier" "$answer" "$kind" <<'PYPAIR'
+import json, pathlib, shutil, sys
+fixtures, case = map(pathlib.Path, sys.argv[1:3])
+classifier, source, kind = sys.argv[3:]
+shutil.copyfile(fixtures / (classifier + '.json'), case / 'classifier.json')
+answer = json.loads((fixtures / (source + '.json')).read_text())
+if kind == 'retained-no-receipt':
+    answer['receipt'] = 'none'
+elif kind == 'server-with-receipt':
+    answer['receipt'] = 'written'
+else:
+    answer['variant'], answer['receipt'] = 'server-only', 'none'
+(case / 'answer.json').write_text(json.dumps(answer))
+PYPAIR
+  e "$name" "BILLET_GATE_RETIRE_FIXTURES=$work/cases/$name"
+  r_answers "$name" 'control-a:classify:1:classifier.json:0;control-a:request:1:answer.json:0'
+  r_run "$name"
+  expect_refused "$name" 'Require a known completed retirement matching its variant and receipt' \
+    'The continuation did not confirm a known done state with the recorded variant and its paired receipt'
+  expect_no_ordinary "$name"
+  expect_no_play_task "$name" 'Ordinary convergence sentinel'
+  expect_play_task_ran "$name" "Observe the retained continuation's terminal boundary"
+  expect_host_commands "$name" 'control-a retire-classify 1;control-a retire-request 1;'
+  r_continuation "$name" 1
+  r_reported "$name" continue
+  expect_no_task "$name" "Record the continuation's result and changes"
+  expect_no_task "$name" 'Complete the row on the recorded survivor'
+  expect_no_task "$name" 'Inspect the transaction claim before recovery'
 done
 
 # R11: each unexplained artefact keeps ordinary work and mutations closed.

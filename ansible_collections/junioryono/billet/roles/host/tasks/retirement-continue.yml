@@ -4,11 +4,20 @@
     that:
       - billet_retirement_classification.journal is mapping
       - billet_retirement_classification.journal.retiring == inventory_hostname
-      - billet_retirement_classification.journal.variant == 'server-only'
-    fail_msg: The continuation requires this host's server-only journal; ordinary convergence remains bypassed.
+      - billet_retirement_classification.journal.variant in ['server-only', 'retained-node']
+    fail_msg: The continuation requires this host's server-only or retained-node journal; ordinary convergence remains bypassed.
+
+- name: Refuse settled retained entry before strict continuation
+  ansible.builtin.fail:
+    msg: Ordinary convergence of a settled retained-node host arrives with its settled-entry admission; ordinary convergence remains bypassed.
+  when:
+    - billet_retirement_classification.journal.variant == 'retained-node'
+    - billet_retirement_classification.journal.phase == 'done'
+    - billet_retirement_classification.journal.settled is sameas true
 
 - name: Keep this host's environment operand across the survivor handoff
   ansible.builtin.set_fact:
+    billet_retirement_variant: "{{ billet_retirement_classification.journal.variant }}"
     billet_retirement_survivor: "{{ billet_retirement_classification.journal.survivor }}"
     billet_retirement_transition_id: "{{ billet_retirement_classification.journal.transition_id }}"
     billet_retirement_local_environment_file: "{{ billet_retirement_environment_file }}"

@@ -11,6 +11,7 @@
     billet_retirement_bypass: false
     billet_retirement_route: ordinary
     billet_retirement_classification: {route: ordinary}
+    billet_retirement_variant: retained-node
     billet_retirement_entry_result: {outcome: admitted}
     billet_retirement_entry_binding: {run: previous}
     billet_retirement_closing_result: {outcome: verified}
@@ -78,6 +79,7 @@
       - billet_retirement_bypass is sameas true
       - billet_retirement_route == 'hold'
       - billet_retirement_classification == {}
+      - billet_retirement_variant == ''
       - billet_retirement_entry_result == {}
       - billet_retirement_entry_binding == {}
       - billet_retirement_closing_result == {}
