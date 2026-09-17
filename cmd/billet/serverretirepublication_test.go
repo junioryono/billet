@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/junioryono/billet/internal/lifeops"
 	"github.com/junioryono/billet/internal/retirement"
 	"github.com/junioryono/billet/internal/state"
 )
@@ -147,6 +149,21 @@ func TestRetirementCommandRecordsAdmissionForEveryStep(t *testing.T) {
 				// Consume the boundary: a second command needs its own admission.
 				last, lastPath = "submitted", command
 			}
+			// Inertness reloads through the inspector, outside the converger.
+			// Observe that actual submission through the same boundary assertion.
+			savedInspector := retireOperationInspector
+			reloads := 0
+			retireOperationInspector = func() *lifeops.Inspector {
+				insp := savedInspector()
+				lifeops.WithObserver(func(_ context.Context, args []string) {
+					if len(args) == 1 && args[0] == "daemon-reload" {
+						reloads++
+						f.manager.onSubmit("daemon-reload")
+					}
+				})(insp)
+				return insp
+			}
+			t.Cleanup(func() { retireOperationInspector = savedInspector })
 			retireMutationEvent = func(event, path string) {
 				switch event {
 				case "admission":
@@ -183,8 +200,13 @@ func TestRetirementCommandRecordsAdmissionForEveryStep(t *testing.T) {
 			}
 			retiredAnswer(t, out, code)
 			wantSubmitted := 6
+			wantReloads := 0
 			if retained {
-				wantSubmitted = 9
+				// Six controller stop/disable calls, three node calls, one reload.
+				wantSubmitted, wantReloads = 10, 1
+			}
+			if reloads != wantReloads {
+				t.Fatalf("inertness reload submissions=%d want=%d", reloads, wantReloads)
 			}
 			if submitted != wantSubmitted || steps["service-operation"] != submitted {
 				t.Fatalf("service boundaries=%d submissions=%d want=%d", steps["service-operation"], submitted, wantSubmitted)

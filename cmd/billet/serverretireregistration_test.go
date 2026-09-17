@@ -1,14 +1,12 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/junioryono/billet/internal/lifeops"
 	"github.com/junioryono/billet/internal/retirement"
 )
 
@@ -249,7 +247,7 @@ func TestRetirementBracketsRegistrationAtEveryDoneWrite(t *testing.T) {
 }
 
 // Moving a boundary's registration proof ahead of admission (or deleting it)
-// permits that write after the admission observer restarts the node.
+// permits that write after completed admission restarts the node.
 func TestRetirementReprovesRegistrationAfterAdmissionAtEveryDoneWrite(t *testing.T) {
 	retireRegistrationWriteBoundaries(t, "admission")
 }
@@ -300,10 +298,16 @@ func retireRegistrationWriteBoundaries(t *testing.T, injection string) {
 			beforeGuard := mustRead(t, guardPath)
 			beforeDoneAt := j.DoneAt
 			admitted, injected, attemptedWrite := false, false, false
-			savedEvent, savedRead, savedInspector := retireMutationEvent, retireAfterRegistrationRead, retireOperationInspector
+			savedEvent, savedRead := retireMutationEvent, retireAfterRegistrationRead
 			retireMutationEvent = func(event, _ string) {
 				if event == "admission" {
 					admitted = true
+					// Inertness also reads through the operation inspector before
+					// admission; inject only after admission actually completes.
+					if injection == "admission" && !injected {
+						injected = true
+						restartRetireProofNode(t, f, "missing")
+					}
 				}
 				if event == "journal" || event == "status" || event == "marker" || event == "settlement" {
 					attemptedWrite = true
@@ -315,18 +319,8 @@ func retireRegistrationWriteBoundaries(t *testing.T, injection string) {
 					restartRetireProofNode(t, f, "missing")
 				}
 			}
-			retireOperationInspector = func() *lifeops.Inspector {
-				insp := savedInspector()
-				lifeops.WithObserver(func(_ context.Context, _ []string) {
-					if injection == "admission" && !injected {
-						injected = true
-						restartRetireProofNode(t, f, "missing")
-					}
-				})(insp)
-				return insp
-			}
 			t.Cleanup(func() {
-				retireMutationEvent, retireAfterRegistrationRead, retireOperationInspector = savedEvent, savedRead, savedInspector
+				retireMutationEvent, retireAfterRegistrationRead = savedEvent, savedRead
 			})
 
 			next := j
