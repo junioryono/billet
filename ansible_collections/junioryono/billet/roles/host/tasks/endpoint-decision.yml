@@ -47,7 +47,7 @@
     # decision judges is what the render will write.
     - name: Render the desired configuration for the endpoint decision
       ansible.builtin.set_fact:
-        billet_endpoint_rendering: "{{ lookup('ansible.builtin.template', 'billet.yaml.j2') }}"
+        billet_endpoint_rendering: "{{ lookup('ansible.builtin.template', 'billet.yaml.j2', template_vars={'billet_config_document': billet_effective_config}) }}"
       no_log: true
 
     # NO BILLET TO ASK: a node running on a host with no billet cannot be

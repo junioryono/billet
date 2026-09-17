@@ -1,0 +1,9 @@
+---
+# The same keyed inventory drives observation and replacement; removing one unit
+# cannot shift another unit onto its readiness result.
+- name: Select the units this ordinary pass renders
+  ansible.builtin.set_fact:
+    billet_unit_operands: >-
+      {{ ({} if billet_retirement_node_ordinary | default(false) | bool else
+           {'billet-server.service': {'src': 'billet-server.service.j2', 'dest': '/etc/systemd/system/billet-server.service'}})
+         | combine({'billet-node.service': {'src': 'billet-node.service.j2', 'dest': '/etc/systemd/system/billet-node.service'}}) }}

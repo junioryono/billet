@@ -6,9 +6,19 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
+
+// nodeStateDirExpression matches the role template's expression for the node's
+// state directory whatever variable it reads, so a rename cannot quietly stop
+// this control from projecting it.
+//
+// NOT A [^{}] CHARACTER CLASS: the expression contains `{}` of its own, in
+// `.get('node', {})`, so a class excluding braces matches nothing at all. The
+// lazy quantifiers stop at the first `}}`, which is the expression's own close.
+var nodeStateDirExpression = regexp.MustCompile(`\{\{.*?state_dir.*?\}\}`)
 
 func TestRetainedNodePathsCoverEveryPropertyAtEveryAdmission(t *testing.T) {
 	for _, verb := range []string{"", "enable", "disable", "stop", "start"} {
@@ -65,7 +75,16 @@ func TestRetainedNodePathsAdmitPackagedAndRoleDirectoryValues(t *testing.T) {
 				}
 				switch key {
 				case "ReadOnlyPaths", "ReadWritePaths", "RuntimeDirectory", "StateDirectory", "LogsDirectory":
-					value = strings.ReplaceAll(value, "{{ billet_config.get('node', {}).get('state_dir', '/var/lib/billet/node') }}", "/var/lib/billet/node")
+					// PROJECT WHATEVER EXPRESSION NAMES THE STATE DIRECTORY, by shape
+					// rather than by the variable's name, and refuse a leftover. Matched
+					// on the exact old text this silently stopped replacing when 5d
+					// renamed the variable, after which ReadWritePaths held the literal
+					// `{{ ... }}` — non-empty, so the guard below still passed, and every
+					// path comparison ran against a string that is not a path.
+					value = nodeStateDirExpression.ReplaceAllString(value, "/var/lib/billet/node")
+					if strings.Contains(value, "{{") {
+						t.Fatalf("%s carries an expression this control cannot project: %s", key, value)
+					}
 					node[key] = strings.ReplaceAll(value, "\"", "")
 				}
 			}

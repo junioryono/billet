@@ -1,0 +1,30 @@
+---
+- name: Private facts cannot carry permission into another inclusion
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    billet_config: "{{ billet_gate_desired_expression_that_is_not_defined }}"
+    billet_enable_server: true
+    billet_migration_controller: controller-chosen-by-inventory
+  tasks:
+    - name: Exercise repeated resets beside unusable desired input
+      ansible.builtin.include_tasks: private-inputs-case.yml
+      loop: [first-inclusion, second-inclusion]
+      loop_control:
+        loop_var: billet_gate_inclusion
+
+- name: Desired ledger preparation preserves ordinary controller and node decisions
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Exercise the selected desired preparation subtree
+      ansible.builtin.include_tasks: private-inputs-ledger-case.yml
+      loop:
+        - {name: node-only, config: {node: {provider: docker}}, backend: ""}
+        - {name: controller-and-node, config: {server: {state_dir: /var/lib/billet/server}, node: {provider: docker}}, backend: sqlite}
+        - {name: explicit-sqlite, config: {server: {state: {backend: sqlite}}}, backend: sqlite}
+      loop_control:
+        loop_var: billet_gate_ledger_case
+        label: "{{ billet_gate_ledger_case.name }}"

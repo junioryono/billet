@@ -1,5 +1,8 @@
 ---
-# FIRST, BEFORE EVERY OTHER TASK, and in its own file so the gate can exercise it
+- name: Clear private permission before the host entry can refuse
+  ansible.builtin.import_tasks: reset-private.yml
+
+# BEFORE EVERY HOST OPERATION, and in its own file so the gate can exercise it
 # with tasks_from -- without that, a fixture has to satisfy the whole role's
 # validation before it reaches the guard, and every "this case is allowed" check
 # ends up failing for an unrelated reason instead of passing.
@@ -14,17 +17,12 @@
 - name: Prepare the exclusion before anything changes this host
   ansible.builtin.import_tasks: prepare-exclusion.yml
 
-# ONE PREDICATE FOR EVERY START, derived once. billet_enable_server answers "is
-# this host the control plane" and is what ledger-mount's assert tests;
-# billet_server_should_run answers "may it run right now", which is what every
-# start-capable task is really asking. Written as one fact because the role
-# starts the server from SIX places — the readiness probe, the ordinary restart,
-# the steady-state start, the upgrade finalizer, the recovery finalizer, and
-# durable enablement that starts it at the next boot — and a hold applied to some
-# of them is not a hold.
+# Fresh retirement reads the original public policy before routing masks it.
+# Start-capable tasks consume billet_server_should_run after the classifier
+# derives effective enablement; masking cannot authorize a fresh request.
 - name: Derive whether the billet server may run on this host
   ansible.builtin.set_fact:
-    billet_server_should_run: >-
+    billet_requested_server_should_run: >-
       {{ billet_enable_server and not (billet_server_prepare_only | default(false)) }}
     # THE NODE IS HELD TOO, AND THAT IS NOT SYMMETRY FOR ITS OWN SAKE. A CERTLESS
     # node co-resident with a server mints the deployment identity when the server
@@ -72,6 +70,10 @@
 - name: Converge the ordinary host only after retirement admits it
   when: not billet_retirement_bypass | bool
   block:
+    - name: Derive the configuration admitted for ordinary work
+      ansible.builtin.import_tasks: effective-config.yml
+      when: not billet_interrupted_upgrade | bool
+
     # THE SERVICE-ACCOUNT RECORD, EARLY, on an existing installation: before any
     # ordinary convergence, after retirement has admitted this host.
     - name: Record the service account and provision the authority locks on an existing installation
@@ -179,11 +181,11 @@
     - name: Decide what this host's config asks of the GitHub App key
       ansible.builtin.set_fact:
         billet_github_key_required: >-
-          {{ billet_config is mapping and 'github' in billet_config }}
+          {{ billet_effective_config is mapping and 'github' in billet_effective_config }}
         billet_github_key_path: >-
-          {{ ((billet_config | default({})).github | default({})).private_key_path | default('', true) }}
+          {{ ((billet_effective_config | default({})).github | default({})).private_key_path | default('', true) }}
         billet_github_key_path_is_string: >-
-          {{ (((billet_config | default({})).github | default({})).private_key_path | default('', true)) is string }}
+          {{ (((billet_effective_config | default({})).github | default({})).private_key_path | default('', true)) is string }}
 
     # The role manages the key at ONE path. It does not refuse the others: a
     # config may name a key some other mechanism provisions, and billet only ever
@@ -211,15 +213,15 @@
       ansible.builtin.assert:
         that:
           - >-
-            billet_config.targets is none
-            or (billet_config.targets | type_debug) == 'list'
+            billet_effective_config.targets is none
+            or (billet_effective_config.targets | type_debug) == 'list'
         fail_msg: >-
           billet_config.targets is present but is not a list of targets. billet
           refuses the config when it LOADS — which, left to billet, happens inside
           this role's upgrade transaction, after the host has already been changed.
       when:
-        - billet_config is mapping
-        - billet_config.targets is defined
+        - billet_effective_config is mapping
+        - billet_effective_config.targets is defined
 
     # The policy item carries whether a source was SUPPLIED and never the source
     # itself, so the assertions and stat results below, which have no no_log, can
@@ -238,8 +240,8 @@
                            | length > 0
              }] }}
       loop: >-
-        {{ (billet_config.targets | default([]))
-           if (billet_config is mapping and (billet_config.targets | default([])) is not none)
+        {{ (billet_effective_config.targets | default([]))
+           if (billet_effective_config is mapping and (billet_effective_config.targets | default([])) is not none)
            else [] }}
       loop_control:
         label: "{{ item.name | default('?') }}"
@@ -251,8 +253,8 @@
     - name: Validate billet host inputs
       ansible.builtin.assert:
         that:
-          - billet_config is mapping
-          - billet_config | length > 0
+          - billet_effective_config is mapping
+          - billet_effective_config | length > 0
           - not billet_ceph_bootstrap or billet_ceph_mon_ip | length > 0
           - not billet_ceph_bootstrap or billet_ceph_devices | length > 0
           - billet_networks | map(attribute='name') | unique | list | length == billet_networks | length
@@ -280,7 +282,7 @@
     - name: Refuse a github block billet will not load
       ansible.builtin.assert:
         that:
-          - billet_config.github is mapping
+          - billet_effective_config.github is mapping
           - billet_github_key_path_is_string | bool
           - billet_github_key_path | length > 0
         fail_msg: >-
@@ -433,14 +435,14 @@
           # A host with NO node runs no compute backend, so it must provision none —
           # otherwise a control-plane-only config with the default flags would install
           # firecracker, the guest network and Ceph on a machine that runs no jobs.
-          - billet_config.node is defined or not billet_firecracker_enabled
-          - billet_config.node is defined or not billet_ceph_enabled
+          - billet_effective_config.node is defined or not billet_firecracker_enabled
+          - billet_effective_config.node is defined or not billet_ceph_enabled
           # With a node, its provider must be KNOWN and match the flags. A missing,
           # empty or misspelled provider is refused HERE, before any task mutates the
           # host, rather than left to `billet check` after the fact.
-          - billet_config.node is not defined or (billet_config.node.provider | default('')) in ['firecracker', 'ec2', 'docker', 'tart']
-          - billet_config.node is not defined or (billet_config.node.provider | default('')) != 'firecracker' or billet_firecracker_enabled
-          - billet_config.node is not defined or (billet_config.node.provider | default('')) == 'firecracker' or not billet_firecracker_enabled
+          - billet_effective_config.node is not defined or (billet_effective_config.node.provider | default('')) in ['firecracker', 'ec2', 'docker', 'tart']
+          - billet_effective_config.node is not defined or (billet_effective_config.node.provider | default('')) != 'firecracker' or billet_firecracker_enabled
+          - billet_effective_config.node is not defined or (billet_effective_config.node.provider | default('')) == 'firecracker' or not billet_firecracker_enabled
           - not billet_ceph_enabled or billet_firecracker_enabled
         fail_msg: >-
           node.provider must be one of firecracker, ec2, docker or tart, and
@@ -498,8 +500,8 @@
     - name: Install the EC2 cache TLS material
       ansible.builtin.import_tasks: cache-tls.yml
       when:
-        - billet_config.node is defined
-        - (billet_config.node.cache | default({})).tls_cert is defined
+        - billet_effective_config.node is defined
+        - (billet_effective_config.node.cache | default({})).tls_cert is defined
 
     - name: Configure Firecracker
       ansible.builtin.import_tasks: firecracker.yml

@@ -1,0 +1,75 @@
+---
+# Operands are prepared after read-only predictions, before any ordinary write.
+# No retained route calls this file in commit 2. Provider planners must supply
+# their complete effects; an omitted plan is not an empty plan.
+- name: Require complete downstream plans for retained operation preparation
+  ansible.builtin.assert:
+    that:
+      - billet_retirement_provider_plan is mapping
+      - billet_retirement_provider_plan.filesystem is sequence
+      - billet_retirement_provider_plan.services is sequence
+      - billet_retirement_provider_plan.units is mapping
+      - billet_retirement_node_restart is boolean
+      - billet_node_should_run | bool
+      - not billet_binary_upgrade | default(false) | bool
+    fail_msg: Retained operation preparation requires explicit provider effects and a predicted node restart decision.
+
+# A PROVIDER PLAN MAY NOT RESTATE A UNIT THE ROLE ALREADY OWNS. The document is
+# rendered from the merged inventory while account.yml installs from
+# billet_unit_operands alone, so an overriding key would make the binding
+# describe bytes or a destination that nothing installs — admission for one unit
+# and the writing of another.
+- name: Refuse a provider plan that restates an admitted unit
+  ansible.builtin.assert:
+    that:
+      - billet_unit_operands.keys() | list | intersect(billet_retirement_provider_plan.units.keys() | list) == []
+    fail_msg: >-
+      The provider plan restates
+      {{ billet_unit_operands.keys() | list | intersect(billet_retirement_provider_plan.units.keys() | list) | join(', ') }},
+      which the role already renders. One inventory must describe each unit, or the
+      admitted document and the installed file are two different things.
+
+- name: Begin the ordinary filesystem and service operation inventory
+  ansible.builtin.set_fact:
+    billet_retirement_planned_filesystem: "{{ billet_retirement_provider_plan.filesystem }}"
+    billet_retirement_planned_services: >-
+      {{ billet_retirement_provider_plan.services
+         + ([{'verb': 'stop', 'unit': 'billet-node.service'}, {'verb': 'start', 'unit': 'billet-node.service'}]
+            if billet_retirement_node_restart else [])
+         + [{'verb': 'enable', 'unit': 'billet-node.service'}, {'verb': 'start', 'unit': 'billet-node.service'}] }}
+    billet_retirement_planned_units: "{{ billet_unit_operands | combine(billet_retirement_provider_plan.units) }}"
+
+- name: Bind ordinary directory destinations and ownership operations
+  ansible.builtin.set_fact:
+    billet_retirement_planned_filesystem: >-
+      {{ billet_retirement_planned_filesystem + [{'kind': 'mkdir', 'path': item.path}, {'kind': 'chown', 'path': item.path}] }}
+  loop: "{{ billet_common_directories + billet_node_directories }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Bind the configuration destination
+  ansible.builtin.set_fact:
+    billet_retirement_planned_filesystem: "{{ billet_retirement_planned_filesystem + [{'kind': 'write', 'path': billet_ordinary_config_path}] }}"
+
+- name: Bind unit replacement destinations
+  ansible.builtin.set_fact:
+    billet_retirement_planned_filesystem: "{{ billet_retirement_planned_filesystem + [{'kind': 'write', 'path': item.value.dest}] }}"
+  loop: "{{ billet_retirement_planned_units | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+- name: Bind installed environment reads without granting credential mutation
+  ansible.builtin.set_fact:
+    billet_retirement_planned_filesystem: "{{ billet_retirement_planned_filesystem + [{'kind': 'read', 'path': item.path}] }}"
+  loop: "{{ billet_node_environment_files }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Bind supplied cache TLS destinations and parent creation
+  ansible.builtin.set_fact:
+    billet_retirement_planned_filesystem: >-
+      {{ billet_retirement_planned_filesystem + [{'kind': 'mkdir', 'path': item | dirname}, {'kind': 'write', 'path': item}] }}
+  loop: "{{ [billet_effective_config.node.cache.tls_cert, billet_effective_config.node.cache.tls_key] if billet_cache_tls_cert_src | length > 0 else [] }}"
+
+- name: Prepare the command documents without calling admission
+  ansible.builtin.import_tasks: prepare-operation-document.yml

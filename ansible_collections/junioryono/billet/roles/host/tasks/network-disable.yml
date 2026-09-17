@@ -37,8 +37,8 @@
   ansible.builtin.fail:
     msg: >-
       This host still carries a billet guest network ({{ billet_disable_network_names | join(', ') }})
-      but is now configured as {{ ('a ' + billet_config.node.provider + ' node')
-      if billet_config.node is defined else 'a control plane with no node' }}, which
+      but is now configured as {{ ('a ' + billet_effective_config.node.provider + ' node')
+      if billet_effective_config.node is defined else 'a control plane with no node' }}, which
       has no guest network. Billet will not tear that down implicitly: it is a
       destructive change that must not race the transactional upgrade. Convert
       deliberately instead — drain and decommission the firecracker compute on this
@@ -47,6 +47,6 @@
       /etc/systemd/network/80-NAME.netdev and 81-NAME.network; stop and disable
       billet-network.service and delete the billet_guard and billet_nat nftables
       tables; then remove /etc/billet/network and /etc/sysctl.d/99-billet-node.conf,
-      and converge this role as a {{ billet_config.node.provider }} node on the
+      and converge this role as a {{ billet_effective_config.node.provider }} node on the
       clean host.
   when: billet_disable_conf_files.files | length > 0

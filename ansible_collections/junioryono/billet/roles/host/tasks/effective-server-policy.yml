@@ -1,0 +1,20 @@
+---
+# Retirement cannot turn frozen inventory into permission to start a controller.
+# Recovery keeps its historical route and the original public start policy.
+#
+# A CLOSED AUTHORITY IS NOT A TERM HERE. service-account.yml publishes
+# billet_authority_closed and refuses a closed controller outright, and it runs
+# after this file, so reading the fact here answers its default and protects
+# nothing; the refusal one task later is what stops such a host.
+- name: Derive the effective server enablement policy
+  ansible.builtin.set_fact:
+    billet_server_effective: >-
+      {{ false if billet_retirement_node_verified | bool
+         or billet_retirement_route in ['new-request', 'continue', 'hold', 'unsupported-variant']
+         or (billet_retirement_route == 'cancel' and billet_retirement_bypass | bool)
+         else billet_enable_server | bool }}
+
+- name: Derive whether the effective billet server may run
+  ansible.builtin.set_fact:
+    billet_server_should_run: >-
+      {{ billet_server_effective | bool and not (billet_server_prepare_only | bool) }}

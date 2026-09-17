@@ -1,0 +1,27 @@
+---
+# Only an admitted ordinary route consumes desired configuration. The retained
+# branch has no main.yml admission until its command-owned preflights exist.
+- name: Require ordinary admission before reading effective configuration
+  ansible.builtin.assert:
+    that:
+      - not billet_retirement_bypass | bool
+      - not billet_interrupted_upgrade | bool
+      - >-
+        (billet_retirement_node_ordinary | bool and billet_retirement_node_verified | bool)
+        or (not billet_retirement_node_ordinary | bool
+            and billet_retirement_route in ['ordinary', 'cancel', 'unverified-check-mode'])
+    fail_msg: Effective configuration requires an admitted ordinary route outside recovery.
+
+- name: Derive the configuration for this ordinary pass
+  ansible.builtin.set_fact:
+    billet_effective_config: >-
+      {{ (billet_config | dict2items | rejectattr('key', 'in', ['server', 'github', 'targets', 'backup']) | items2dict)
+         if billet_retirement_node_ordinary | bool else billet_config }}
+  no_log: true
+
+- name: Mark this ordinary configuration ready
+  ansible.builtin.set_fact:
+    billet_effective_ready: true
+
+- name: Apply the admitted ordinary server policy
+  ansible.builtin.import_tasks: effective-server-policy.yml

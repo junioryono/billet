@@ -555,7 +555,30 @@ jobs:
           # the fresh-check parses the WHOLE role (static imports resolve
           # modules even for tasks a controller-only run skips), so bare
           # ansible-core is not enough.
-          ansible-galaxy collection install "ansible.posix:$(cat ansible_collections/junioryono/billet/tests/ansible-posix-version)"
+          # --no-cache because the version is pinned exactly and the runner is
+          # fresh, so the galaxy response cache answers nothing this install
+          # needs and can only fail it: a partial entry ("Missing expected
+          # 'results' in ansible-galaxy cache") took out host-lifecycle (guard)
+          # before it ran a single gate, and galaxy's own diagnostic names this
+          # flag as the way out.
+          #
+          # BOUNDED RETRIES because galaxy.ansible.com is a third party this gate
+          # cannot do without and does not control: it answered 502 Bad Gateway on
+          # the very next run and took out host-lifecycle (policy) the same way,
+          # before any gate ran. Same treatment every apt call in these gates
+          # already gets. `until` consumes the status, so a failed attempt is a
+          # loop condition rather than something `set -e` ends the step on, and
+          # `timeout` bounds an attempt that hangs instead of answering.
+          posix="$(cat ansible_collections/junioryono/billet/tests/ansible-posix-version)"
+          attempt=1
+          until timeout -k 10 120 ansible-galaxy collection install --no-cache "ansible.posix:$posix"; do
+            if [ "$attempt" -ge 5 ]; then
+              echo "galaxy did not serve ansible.posix:$posix after $attempt attempts" >&2
+              exit 1
+            fi
+            sleep $((attempt * 10))
+            attempt=$((attempt + 1))
+          done
 
       # The check-mode scenario pins /usr/bin/python3, and the apt module in
       # check mode needs python3-apt there (a real run installs it itself).

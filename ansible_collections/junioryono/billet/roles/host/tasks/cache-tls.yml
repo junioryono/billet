@@ -17,8 +17,8 @@
   ansible.builtin.stat:
     path: "{{ item }}"
   loop:
-    - "{{ billet_config.node.cache.tls_cert | dirname }}"
-    - "{{ billet_config.node.cache.tls_key | dirname }}"
+    - "{{ billet_effective_config.node.cache.tls_cert | dirname }}"
+    - "{{ billet_effective_config.node.cache.tls_key | dirname }}"
   register: billet_cache_tls_dirs
   become: true
   when: billet_cache_tls_cert_src | length > 0
@@ -44,7 +44,7 @@
 - name: Install the EC2 cache TLS certificate
   ansible.builtin.copy:
     src: "{{ billet_cache_tls_cert_src }}"
-    dest: "{{ billet_config.node.cache.tls_cert }}"
+    dest: "{{ billet_effective_config.node.cache.tls_cert }}"
     owner: root
     group: root
     mode: "0644"
@@ -57,7 +57,7 @@
 - name: Install the EC2 cache TLS private key
   ansible.builtin.copy:
     src: "{{ billet_cache_tls_key_src }}"
-    dest: "{{ billet_config.node.cache.tls_key }}"
+    dest: "{{ billet_effective_config.node.cache.tls_key }}"
     owner: root
     group: root
     mode: "0600"

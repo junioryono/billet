@@ -65,6 +65,9 @@
     billet_interrupted_upgrade: "{{ billet_interrupted_upgrade | default(false) if billet_exclusion_held | default(false) else false }}"
     billet_upgrade_recovery_dir: "{{ billet_upgrade_recovery_dir | default('') if billet_exclusion_held | default(false) else '' }}"
 
+- name: Clear private permission before preparation can refuse
+  ansible.builtin.import_tasks: reset-private.yml
+
 - name: Refuse a converge that would destroy the job running it
   ansible.builtin.import_tasks: converge-guard.yml
 

@@ -146,6 +146,9 @@
     billet_retirement_bypass: true
   when: billet_retirement_route != 'ordinary' and not billet_retirement_check_preview | bool
 
+- name: Apply the classified route to the server policy
+  ansible.builtin.import_tasks: effective-server-policy.yml
+
 - name: Report the retirement route
   ansible.builtin.debug:
     msg: >-

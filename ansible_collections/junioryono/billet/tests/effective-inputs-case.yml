@@ -1,0 +1,41 @@
+---
+- name: Reset the production private inputs before each route
+  ansible.builtin.include_role:
+    name: junioryono.billet.host
+    tasks_from: reset-private
+
+# These permissions are fixtures for the isolated derivation, never a route
+# through main.yml. The call-site gate keeps retained admission closed.
+- name: Supply the isolated route's admission and desired input
+  ansible.builtin.set_fact:
+    billet_retirement_route: "{{ billet_gate_case.route }}"
+    billet_retirement_bypass: false
+    billet_retirement_node_verified: "{{ billet_gate_case.retained }}"
+    billet_retirement_node_ordinary: "{{ billet_gate_case.retained }}"
+    billet_interrupted_upgrade: false
+
+- name: Derive E through the production ordinary entry
+  ansible.builtin.include_role:
+    name: junioryono.billet.host
+    tasks_from: effective-config
+  vars:
+    billet_enable_server: "{{ billet_gate_case.controller }}"
+
+- name: Require the complete projection or unchanged desired document
+  ansible.builtin.assert:
+    that:
+      - billet_effective_ready is sameas true
+      - billet_effective_config == (billet_gate_survivors if billet_gate_case.retained else billet_config)
+      - billet_effective_config.node == billet_gate_node
+      - billet_config == (billet_gate_survivors | combine(billet_gate_controller if billet_gate_case.controller else {}))
+      - billet_server_effective == (billet_gate_case.controller and not billet_gate_case.retained)
+      - billet_server_should_run == (billet_gate_case.controller and not billet_gate_case.retained)
+    fail_msg: The effective route changed desired input, lost a retained value, or granted retired server policy.
+
+- name: Require every removed member absent only on the retained route
+  ansible.builtin.assert:
+    that:
+      - item not in billet_effective_config
+      - item in billet_config
+  loop: [server, github, targets, backup]
+  when: billet_gate_case.retained

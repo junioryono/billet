@@ -1,0 +1,46 @@
+---
+- name: Reset the production private inputs before each refusal case
+  ansible.builtin.include_role:
+    name: junioryono.billet.host
+    tasks_from: reset-private
+
+# A RECOGNISABLE PRIOR DOCUMENT, so the refusal is proved to happen BEFORE E is
+# assigned rather than after: an entry that derived E and then refused would
+# leave this sentinel replaced.
+- name: Plant a recognisable prior effective document
+  ansible.builtin.set_fact:
+    billet_effective_config: {sentinel: untouched}
+    billet_gate_admitted: false
+
+- name: Supply the inadmissible route
+  ansible.builtin.set_fact:
+    billet_retirement_route: "{{ billet_gate_refusal.route }}"
+    billet_retirement_bypass: "{{ billet_gate_refusal.bypass }}"
+    billet_retirement_node_verified: "{{ billet_gate_refusal.verified }}"
+    billet_retirement_node_ordinary: "{{ billet_gate_refusal.ordinary }}"
+    billet_interrupted_upgrade: "{{ billet_gate_refusal.interrupted }}"
+
+- name: Attempt the production ordinary entry
+  block:
+    - name: Derive E through the production ordinary entry
+      ansible.builtin.include_role:
+        name: junioryono.billet.host
+        tasks_from: effective-config
+    - name: Record that admission was granted
+      ansible.builtin.set_fact:
+        billet_gate_admitted: true
+  rescue:
+    - name: Record the admission refusal
+      ansible.builtin.set_fact:
+        billet_gate_admitted: false
+
+- name: Require refusal before E or readiness
+  ansible.builtin.assert:
+    that:
+      - billet_gate_admitted is sameas false
+      - "billet_effective_config == {'sentinel': 'untouched'}"
+      - billet_effective_ready is sameas false
+    fail_msg: >-
+      The {{ billet_gate_refusal.name }} route reached the effective
+      configuration: admitted={{ billet_gate_admitted }},
+      E={{ billet_effective_config }}, ready={{ billet_effective_ready }}.

@@ -264,7 +264,7 @@ billet_guest_host_tcp_ports:
 billet_guest_host_udp_ports:
   - 53
   - 67
-billet_image_verify_port: "{{ billet_config.node.firecracker.image_verify_port | default(7719, true) }}"
+billet_image_verify_port: "{{ billet_effective_config.node.firecracker.image_verify_port | default(7719, true) }}"
 
 billet_ceph_enabled: true
 billet_ceph_bootstrap: false
@@ -342,10 +342,9 @@ billet_receipt_wait: 60
 # How long the controller polls its ledger for the node's registration under
 # the new incarnation.
 billet_registration_wait: 300
-# THE CONTROLLER THAT CONFIRMS: the inventory host the registration is asked
-# on, by default the first host of the fleet playbook's control_plane group.
-# A planned migration without one is refused before anything is stopped.
-billet_migration_controller: "{{ (groups['control_plane'] | default([]) | first) | default('') }}"
+# An explicit confirmation controller is verified or refused. Empty requests
+# automatic selection from observed controllers when migration needs one.
+billet_migration_controller: ""
 # The platform the exclusion is prepared for: Linux, or Darwin for the fleet
 # playbook's macOS play. From the gathered facts, because the preparation runs
 # before the role's own platform assertion and on a Mac holds without

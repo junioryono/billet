@@ -724,9 +724,21 @@
   register: billet_check
   changed_when: false
   when:
+    - not billet_retirement_node_ordinary | default(false) | bool
     - not billet_binary_upgrade | default(false)
     - not ansible_check_mode
   become: true
+
+- name: Validate a retained node with its installed environment
+  junioryono.billet.environment_files:
+    specs: "{{ billet_node_environment_files }}"
+    check: true
+  when:
+    - billet_retirement_node_ordinary | default(false) | bool
+    - not billet_binary_upgrade | default(false)
+    - not ansible_check_mode
+  become: true
+  no_log: true
 
 - name: Return server state created by validation to the control-plane account
   ansible.builtin.file:
@@ -780,7 +792,7 @@
       billet_private_key_install.changed | default(false) or
       billet_server_environment_install.changed | default(false) or
       billet_state_ca_bundle_install.changed | default(false) or
-      billet_systemd_units.changed | default(false)
+      (billet_unit_templates_by_unit.values() | selectattr('changed', 'equalto', true) | list | length > 0)
   become: true
 
 # THE ENDPOINT MIGRATION, in place of the ordinary restart: the command judges
@@ -805,7 +817,7 @@
       billet_firecracker_links.changed | default(false) or
       (billet_server_environment | default({}) | length > 0 and
        billet_server_environment_install.changed | default(false)) or
-      billet_systemd_units.changed | default(false)
+      (billet_unit_templates_by_unit.values() | selectattr('changed', 'equalto', true) | list | length > 0)
   become: true
 
 - name: Enable and start the billet server

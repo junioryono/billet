@@ -10,7 +10,7 @@
 
 - name: Require a policy that leaves the retiring server stopped
   ansible.builtin.assert:
-    that: billet_server_should_run | default(none) is sameas false
+    that: billet_requested_server_should_run | default(none) is sameas false
     fail_msg: 'Retirement precondition: the policy will start the server in this converge; disable its start policy first.'
 
 - name: Require a named survivor in this inventory

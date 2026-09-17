@@ -33,6 +33,8 @@
     billet_host_backup_text: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/backup.yml') }}"
     billet_host_prepare_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/prepare-exclusion.yml') | from_yaml }}"
     billet_host_prepare_text: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/prepare-exclusion.yml') }}"
+    billet_host_private_reset_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/reset-private.yml') | from_yaml }}"
+    billet_host_preparation_ledger_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/prepare-desired-ledger.yml') | from_yaml }}"
     billet_host_stage_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/stage-candidate.yml') | from_yaml }}"
     billet_host_binary_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/binary.yml') | from_yaml }}"
     billet_host_allocate_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/allocate-recovery.yml') | from_yaml }}"
@@ -57,7 +59,9 @@
           - billet_host_main_tasks_raw[-1].name == 'Converge the ordinary host only after retirement admits it'
           - billet_host_ordinary_boundary.when == 'not billet_retirement_bypass | bool'
           - billet_host_main_tasks_raw[-2]['ansible.builtin.import_tasks'] == 'retirement.yml'
-          - billet_host_ordinary_boundary.block[0]['ansible.builtin.import_tasks'] == 'service-account.yml'
+          - billet_host_ordinary_boundary.block[0]['ansible.builtin.import_tasks'] == 'effective-config.yml'
+          - billet_host_ordinary_boundary.block[0].when == 'not billet_interrupted_upgrade | bool'
+          - billet_host_ordinary_boundary.block[1]['ansible.builtin.import_tasks'] == 'service-account.yml'
           - >-
             (billet_host_ordinary_boundary.block | selectattr('name', 'equalto',
              'Record the service account and provision the authority locks on a fresh host') | first)
@@ -154,7 +158,7 @@
       vars:
         billet_service_user: billet
         billet_service_group: billet
-        billet_config: {}
+        billet_effective_config: {}
         # The role default (defaults/main.yml) does not apply to a bare template
         # lookup, and the template deliberately has no fallback: a provider-aware
         # unit rendered without knowing the provider would be a guess.
@@ -317,7 +321,13 @@
           - billet_top_level_names.index('Enable and start the billet node') < billet_top_level_names.index('Refresh the node\'s endpoint receipt after the start')
           - billet_top_level_names.index('Refresh the node\'s endpoint receipt after the start') < billet_top_level_names.index('Stop and disable the billet node unless it may run here')
           - "'not billet_endpoint_migrated | default(false) | bool' in (billet_host_service_tasks | selectattr('name', 'equalto', 'Restart the billet node after non-binary inputs change') | first).when"
-          - billet_account_names.index('Refuse to move installed billet state implicitly') < billet_account_names.index('Render billet configuration')
+          # BOTH HALVES OF THE MOVE REFUSAL, since the server's and the node's are
+          # separate tasks: each must precede the render, or a converge writes a
+          # configuration naming a directory the installed deployment does not use.
+          - billet_account_names.index('Refuse to move installed server state implicitly') < billet_account_names.index('Render billet configuration')
+          - billet_account_names.index('Refuse to move installed node state implicitly') < billet_account_names.index('Render billet configuration')
+          - billet_account_names.index('Refuse to move installed server state implicitly') < billet_account_names.index('Stage candidate configuration for the upgrade transaction')
+          - billet_account_names.index('Refuse to move installed node state implicitly') < billet_account_names.index('Stage candidate configuration for the upgrade transaction')
           - billet_stage_inner_names.index("Allocate the transaction's recovery directory") < billet_stage_inner_names.index('Stage the immutable candidate binary inside its recovery journal')
           - billet_stage_inner_names.index('Stage the immutable candidate binary inside its recovery journal') < billet_stage_inner_names.index('Bind the host transaction to the inspected candidate digest')
           - billet_account_names.index('Refuse redirected or non-file upgrade inputs') < billet_account_names.index('Preserve configuration and units before replacing them')
@@ -388,7 +398,7 @@
           - "'failed_when' not in billet_candidate_probe_ask"
           - billet_candidate_unit_stage.vars.billet_systemd_notify_ready | bool
           - billet_steady_unit_install.vars.billet_systemd_notify_ready | bool
-          - "'billet_installed_service_types' in (billet_ordinary_unit_install.vars.billet_systemd_notify_ready | string)"
+          - "'billet_service_types_by_unit' in (billet_ordinary_unit_install.vars.billet_systemd_notify_ready | string)"
           - billet_main_names.index('Recover an interrupted billet upgrade before converging anything else') < billet_main_names.index('Configure Firecracker')
           - billet_main_names.index('Configure billet account and files') < billet_main_names.index('Configure Firecracker')
           - billet_main_names.index('Recover an interrupted billet upgrade before converging anything else') < billet_main_names.index('Configure guest networking')
@@ -787,9 +797,10 @@
     - name: The preparation runs first, calls twice through one parser, settles last and cleans up in its rescue
       ansible.builtin.assert:
         that:
-          - billet_main_names[0] == 'Refuse a converge that would destroy the job running it'
-          - billet_main_names[1] == 'Prepare the exclusion before anything changes this host'
-          - billet_host_main_tasks[1]['ansible.builtin.import_tasks'] == 'prepare-exclusion.yml'
+          - billet_host_main_tasks[0]['ansible.builtin.import_tasks'] == 'reset-private.yml'
+          - billet_main_names[1] == 'Refuse a converge that would destroy the job running it'
+          - billet_main_names[2] == 'Prepare the exclusion before anything changes this host'
+          - billet_host_main_tasks[2]['ansible.builtin.import_tasks'] == 'prepare-exclusion.yml'
           # THE CONNECTION-FREE RESET precedes every fallible task, including the runner refusal.
           - billet_prepare_names[0] == "Reset this inclusion's exclusion permission"
           - "'ansible.builtin.set_fact' in billet_host_prepare_tasks[0]"
@@ -797,8 +808,17 @@
           - billet_host_prepare_tasks[0].delegate_to is not defined
           - billet_host_prepare_tasks[0].delegate_facts is not defined
           - billet_host_prepare_tasks[0]['ansible.builtin.set_fact'].billet_exclusion_settled is sameas false
-          - billet_prepare_names[1] == 'Refuse a converge that would destroy the job running it'
-          - billet_host_prepare_tasks[1]['ansible.builtin.import_tasks'] == 'converge-guard.yml'
+          - billet_host_prepare_tasks[1]['ansible.builtin.import_tasks'] == 'reset-private.yml'
+          - billet_prepare_names[2] == 'Refuse a converge that would destroy the job running it'
+          - billet_host_prepare_tasks[2]['ansible.builtin.import_tasks'] == 'converge-guard.yml'
+          - billet_host_private_reset_tasks | length == 1
+          - billet_host_private_reset_tasks[0].when is not defined
+          - billet_host_private_reset_tasks[0].delegate_to is not defined
+          - billet_host_private_reset_tasks[0].delegate_facts is not defined
+          - "'ansible.builtin.set_fact' in billet_host_private_reset_tasks[0]"
+          - "'billet_config' not in (billet_host_private_reset_tasks[0] | to_json)"
+          - "'billet_enable_server' not in (billet_host_private_reset_tasks[0] | to_json)"
+          - "'billet_migration_controller' not in (billet_host_private_reset_tasks[0] | to_json)"
           - billet_prepare_names.index('Refuse a converge without a holder') < billet_prepare_names.index('Inspect the managed binary and the upgrade root')
           # THE CLAIM'S FACTS are defined on every path before the block, and a dry run takes its shape from the report.
           - billet_prepare_names.index("Reset this inclusion's exclusion permission") < billet_prepare_names.index('Note what the managed binary and the root are')
@@ -1216,6 +1236,9 @@
           executable for the calls, and execute nothing itself.
 
     - name: The staging resets only the transaction facts and judges nothing about the guard
+      vars:
+        billet_stage_ledger_include: "{{ billet_stage_block | selectattr('name', 'equalto', 'Select desired ledger validation only when preparation needs it') | first }}"
+        billet_preparation_ledger_names: "{{ billet_host_preparation_ledger_tasks | map(attribute='name') | list }}"
       ansible.builtin.assert:
         that:
           - "'billet_binary_upgrade' in billet_stage_reset['ansible.builtin.set_fact']"
@@ -1232,9 +1255,15 @@
           - "'billet_exclusion_darwin' in ((billet_host_stage_tasks | selectattr('name', 'equalto', 'Inspect the installed billet binary') | first).when | string)"
           - billet_stage_names.index('Inspect the installed billet binary') < billet_stage_names.index("Resolve and stage this invocation's candidate")
           # THE REFUSALS OF AN EXTERNAL LEDGER before any allocation; the guard's judgements are the command's.
-          - billet_stage_block_names.index('Decide whether the billet binary needs a transactional upgrade') < billet_stage_block_names.index('Refuse a transactional binary change against an external ledger')
-          - billet_stage_block_names.index('Refuse a transactional binary change against an external ledger') < billet_stage_block_names.index('Refuse a PostgreSQL controller whose binary predates the guard')
-          - billet_stage_block_names.index('Refuse a PostgreSQL controller whose binary predates the guard') < billet_stage_block_names.index('Stage the candidate for the transaction')
+          - billet_stage_block_names.index('Decide whether the billet binary needs a transactional upgrade') < billet_stage_block_names.index('Select desired ledger validation only when preparation needs it')
+          - billet_stage_block_names.index('Select desired ledger validation only when preparation needs it') < billet_stage_block_names.index('Stage the candidate for the transaction')
+          - billet_stage_ledger_include['ansible.builtin.include_tasks'] == 'prepare-desired-ledger.yml'
+          - billet_stage_ledger_include.vars is not defined
+          - billet_stage_ledger_include.when == '(billet_binary_upgrade | default(false) | bool) or (billet_exclusion_managed_pre_r | default(false) | bool)'
+          - "'billet_config' not in (billet_host_stage_tasks | to_json)"
+          - billet_preparation_ledger_names.index('Validate the desired controller subtree needed by preparation') < billet_preparation_ledger_names.index('Resolve only the desired ledger operand for preparation')
+          - billet_preparation_ledger_names.index('Resolve only the desired ledger operand for preparation') < billet_preparation_ledger_names.index('Refuse a transactional binary change against an external ledger')
+          - billet_preparation_ledger_names.index('Refuse a transactional binary change against an external ledger') < billet_preparation_ledger_names.index('Refuse a PostgreSQL controller whose binary predates the guard')
           - billet_stage_block_names | last == 'Stage the candidate for the transaction'
           - billet_stage_inner_names == ["Allocate the transaction's recovery directory", 'Stage the immutable candidate binary inside its recovery journal', 'Inspect the journaled candidate billet binary', 'Bind the host transaction to the inspected candidate digest']
           - "'guard_status' not in (billet_host_stage_tasks | to_json)"
@@ -1346,3 +1375,11 @@
           proving ownership by shape, removing the pointer alone and setting the
           shape back to guard.
 
+- name: Exercise private preparation inputs without a target connection
+  ansible.builtin.import_playbook: private-inputs.yml
+
+- name: Guard effective inputs and ordinary reader parity
+  ansible.builtin.import_playbook: effective-inputs.yml
+
+- name: Exercise the final ordinary reader slice
+  ansible.builtin.import_playbook: reader-inputs.yml

@@ -115,7 +115,7 @@
       ansible.builtin.set_fact:
         billet_retirement_collect_rendering: >-
           {{ lookup('ansible.builtin.template', 'billet.yaml.j2',
-                    template_vars={'billet_config': billet_retirement_collect_vars.billet_config}) }}
+                    template_vars={'billet_config_document': billet_retirement_collect_vars.billet_config}) }}
       no_log: true
 
     - name: Ask this node for its desired endpoint

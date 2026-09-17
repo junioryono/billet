@@ -33,6 +33,25 @@
   check_mode: false
   become: true
 
+- name: Inspect persistent server enablement before account comparison
+  ansible.builtin.command:
+    argv: [systemctl, show, --property=UnitFileState, --value, billet-server.service]
+  register: billet_installed_server_unit_file_state
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  become: true
+  when: billet_retirement_node_verified | default(false) | bool
+
+- name: Prove the retained account without replacing its identity
+  junioryono.billet.retired_account:
+    user: "{{ billet_service_user }}"
+    group: "{{ billet_service_group }}"
+    home: "{{ billet_service_home }}"
+  check_mode: false
+  become: true
+  when: billet_retirement_node_verified | default(false) | bool
+
 - name: Inspect the installed billet server identity before account mutation
   ansible.builtin.command:
     argv:
@@ -49,6 +68,7 @@
   failed_when: false
   check_mode: false
   become: true
+  when: billet_installed_server_unit_load_state.stdout | trim == 'loaded'
 
 - name: Refuse an implicit installed service identity migration
   ansible.builtin.assert:
@@ -56,7 +76,12 @@
       - billet_installed_server_unit_load_state.rc == 0
       - >-
         billet_installed_server_unit_load_state.stdout | trim == 'not-found' or
+        (billet_retirement_node_verified | default(false) | bool and
+         billet_installed_server_unit_load_state.stdout | trim == 'masked' and
+         billet_installed_server_unit_file_state.rc | default(-1) == 0 and
+         billet_installed_server_unit_file_state.stdout | default('') | trim == 'masked') or
         (
+          billet_installed_server_unit_load_state.stdout | trim == 'loaded' and
           billet_installed_server_identity.results[0].rc == 0 and
           billet_installed_server_identity.results[1].rc == 0 and
           billet_installed_server_identity.results[0].stdout | trim == billet_service_user and
@@ -64,11 +89,31 @@
         )
     fail_msg: >-
       The installed billet server runs as
-      {{ billet_installed_server_identity.results[0].stdout | trim }}:{{
-      billet_installed_server_identity.results[1].stdout | trim }}, not the
+      {{ billet_installed_server_identity.results[0].stdout | default('unobserved') | trim }}:{{
+      billet_installed_server_identity.results[1].stdout | default('unobserved') | trim }}, not the
       requested {{ billet_service_user }}:{{ billet_service_group }}. Move the
       ledger and credentials during an explicit offline identity migration;
       the host role will not change ownership before a recoverable transaction.
+
+# Root custody belongs to the node even when the server is absent or masked.
+- name: Inspect the retained node account
+  ansible.builtin.command:
+    argv: [systemctl, show, "--property={{ item }}", --value, billet-node.service]
+  loop: [User, Group]
+  register: billet_installed_node_identity
+  changed_when: false
+  check_mode: false
+  become: true
+  when: billet_retirement_node_verified | default(false) | bool
+
+- name: Require root custody of the retained node
+  ansible.builtin.assert:
+    that:
+      - item.rc == 0
+      - item.stdout | trim in ['', 'root', '0']
+    fail_msg: The retained node must keep root user and group.
+  loop: "{{ billet_installed_node_identity.results | default([]) }}"
+  when: billet_retirement_node_verified | default(false) | bool
 
 # AN EXISTING ACCOUNT IS NOT AUTOMATICALLY OURS. What follows in account.yml
 # hands this identity the deployment's private CA key, and what follows in
