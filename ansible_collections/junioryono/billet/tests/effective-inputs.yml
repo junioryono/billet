@@ -171,6 +171,9 @@
         - reader: the image-verification port's default
           names: billet_effective_config.node.firecracker.image_verify_port
           expression: "{{ billet_gate_defaults.billet_image_verify_port }}"
+        - reader: the implicit-provider-conversion refusal
+          names: billet_effective_config.node.provider
+          expression: "{{ billet_gate_network[2]['ansible.builtin.fail'].msg }}"
       loop_control:
         label: "{{ item.reader }}"
 
@@ -181,13 +184,18 @@
         that:
           - "'default(7719, true)' in billet_gate_defaults.billet_image_verify_port"
 
-    # The provider refusal names the node's provider from E, and its message is
-    # plain text rather than an expression, so this one reads as written.
-    - name: Require the provider refusal to describe the effective node
+    # THE REFUSAL NAMES THE PROVIDER IT IS REFUSING, and it builds that phrase at
+    # render time from `'a ' + <provider> + ' node'`, so no provider's name is in
+    # the source to match: it is pinned above, with the readers, by the document
+    # its expression names. What IS in the source is the sentence around it, and
+    # a refusal that stopped naming the network it will not tear down implicitly
+    # would be a worse diagnostic even while reading the right document.
+    - name: Require the provider refusal to keep its diagnostic
       ansible.builtin.assert:
         that:
-          - "'a firecracker node' in billet_gate_network[2]['ansible.builtin.fail'].msg"
-          - "'as a firecracker node' in billet_gate_network[2]['ansible.builtin.fail'].msg"
+          - "'still carries a billet guest network' in billet_gate_network[2]['ansible.builtin.fail'].msg"
+          - "'has no guest network' in billet_gate_network[2]['ansible.builtin.fail'].msg"
+          - "'must not race the transactional upgrade' in billet_gate_network[2]['ansible.builtin.fail'].msg"
 
     - name: Require effective key presence even when desired input has none
       ansible.builtin.assert:
