@@ -532,11 +532,11 @@ func proveRetireStopped(ctx context.Context, j retirement.Journal) *retireRefusa
 			return r
 		}
 	}
-	if r := proveRetireInertProcesses(ctx, j); r != nil {
-		return r
-	}
 	if err := insp.ProveUnitProcessesGone(ctx, serverUnit); err != nil {
 		return retireUnknown(retireReasonStopped, err.Error(), "")
+	}
+	if r := proveRetireInertProcesses(ctx, j); r != nil {
+		return r
 	}
 	if r := proveRetireActivation(ctx, false); r != nil {
 		return r

@@ -231,6 +231,10 @@ func TestRetirementReprovesEachStoppedBoundary(t *testing.T) {
 					f.originalNode.Resources = append(f.originalNode.Resources, resource)
 				}
 				f.reserve(t)
+				if drift == "backup process" {
+					f.manager.set(backupServiceUnit, "LoadState", "loaded")
+					f.manager.set(backupServiceUnit, "UnitFileState", "static")
+				}
 				j := f.plantJournal(t, retirement.PhaseIntent, retirement.VariantRetainedNode)
 				mustOK(t, retirement.WriteStatus(retirement.PhaseIntent, j.Variant, retireNow()))
 				if r := admitRetireRemaining(t.Context(), retireProofMode(f), j); r != nil {
@@ -250,8 +254,6 @@ func TestRetirementReprovesEachStoppedBoundary(t *testing.T) {
 					case "controller job":
 						setRetireEffect(t, f, serverUnit, "Job", "42")
 					case "backup process":
-						f.manager.set(backupServiceUnit, "LoadState", "loaded")
-						f.manager.set(backupServiceUnit, "UnitFileState", "static")
 						f.manager.set(backupServiceUnit, "MainPID", "42")
 					case "network activity":
 						f.manager.set("billet-dnsmasq@br0.service", "ActiveState", "inactive")
