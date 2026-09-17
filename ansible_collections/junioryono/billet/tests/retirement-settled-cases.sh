@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Sourced only by the retirement routes shard, after r_plant and the wrapper.
+# Sourced only by the settled shard, after r_plant and the wrapper.
 # Two plays amortize namespace setup; every answer still runs the real caller.
 cp "$here/retirement-settled.yml" "$work/play-retirement-settled.yml"
 cp "$here/retirement-settled-case.yml" "$work/retirement-settled-case.yml"

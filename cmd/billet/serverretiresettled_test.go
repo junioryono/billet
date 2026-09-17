@@ -307,7 +307,7 @@ func TestRetirementSettledEntryRequiresEveryProtectedBinding(t *testing.T) {
 	args := settledCheckArgs(t, f, j, retirement.PurposeSettledEntry)
 	quietSettledNode(t, f, "inactive")
 	for _, scenario := range []string{"status absent", "status malformed", "status stale", "unsettled", "row incomplete", "completion absent",
-		"done time malformed", "marker", "holder", "guard id", "preparing", "transaction", "transition", "survivor", "provenance", "archive identity", "identity recreated", "controller enabled"} {
+		"done time malformed", "marker", "holder", "guard id", "preparing", "transaction", "transition", "survivor", "provenance", "archive identity", "identity recreated", "controller active"} {
 		t.Run(scenario, func(t *testing.T) {
 			paths := []string{retirement.StatusPath(), retirement.JournalPath(), filepath.Join(f.guard.active(), guardRecordName),
 				filepath.Join(f.unitsDir, serverUnit)}
@@ -381,8 +381,8 @@ func TestRetirementSettledEntryRequiresEveryProtectedBinding(t *testing.T) {
 				mustOK(t, os.Mkdir(j.IdentityDir, 0o700))
 				t.Cleanup(func() { mustOK(t, os.Remove(j.IdentityDir)) })
 				want = retireReasonIdentity
-			case "controller enabled":
-				f.manager.set(serverUnit, "UnitFileState", "enabled")
+			case "controller active":
+				f.manager.set(serverUnit, "ActiveState", "active")
 				want = retireReasonPostcondition
 			}
 			forbidSettledWrites(t, f)
@@ -428,7 +428,7 @@ func TestRetirementSettledClosingRequiresStrictProofAfterEntry(t *testing.T) {
 			case "inactive", "failed":
 				quietSettledNode(t, f, drift)
 			case "controller":
-				f.manager.set(serverUnit, "UnitFileState", "enabled")
+				f.manager.set(serverUnit, "ActiveState", "active")
 			case "unit":
 				setRetireEffect(t, f, nodeUnit, "NeedDaemonReload", "yes")
 				wantReason = "settled-entry-node-unit-mismatch"

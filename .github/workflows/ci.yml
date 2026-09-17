@@ -318,9 +318,8 @@ jobs:
   # under -race: on e8af8be (2026-09-15) TestRetirementReprovesEachStoppedBoundary
   # had finished 17 of its 39 cases in 11m58s when test-postgres's 30m command
   # bound fired, about half an hour for that test alone by extrapolation. They
-  # run here, beside the rest of the command suite, in two shards: that test on
-  # its own, and every other TestRetirement test. The shards' patterns
-  # partition the TestRetirement names, and test-postgres skips all of them.
+  # run here in seven disjoint source-owned shards. The partition check refuses
+  # missing or duplicate selection; test-postgres skips all TestRetirement names.
   test-postgres-retirement:
     runs-on: billet-8vcpu-ubuntu-2404
     timeout-minutes: 75
@@ -329,11 +328,12 @@ jobs:
       matrix:
         include:
           - shard: boundaries
-            run: '^TestRetirementReprovesEachStoppedBoundary$'
-            skip: '^$'
+          - shard: settled
+          - shard: node-config
+          - shard: registration
+          - shard: inert
+          - shard: effects
           - shard: operations
-            run: '^TestRetirement'
-            skip: '^TestRetirementReprovesEachStoppedBoundary$'
     name: test-postgres-retirement (${{ matrix.shard }})
     services:
       postgres:
@@ -369,7 +369,7 @@ jobs:
       - name: Test the retirement admission suite against PostgreSQL
         run: |
           set -o pipefail
-          go test -race -count=1 -timeout 60m -vet=off -run '${{ matrix.run }}' -skip '${{ matrix.skip }}' -json ./cmd/billet/ \
+          python3 scripts/check-retirement-shards.py --run '${{ matrix.shard }}' \
             | tee retirement-output.json \
             | jq -R -j 'fromjson? | select(.Output != null) | .Output'
 
@@ -490,32 +490,31 @@ jobs:
       - name: Prove every documented Terraform module source is pinnable
         run: make module-sources
 
+  retirement-selection:
+    needs: host-lifecycle
+    runs-on: billet-8vcpu-ubuntu-2404
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: retirement-selection-*
+          path: retirement-selection
+      - name: Prove all retirement role cases ran exactly once
+        run: python3 scripts/check-retirement-shards.py --completed-roles retirement-selection
+
   host-lifecycle:
     runs-on: billet-8vcpu-ubuntu-2404
-    # SEVEN GROUPS. The twenty gates ran serially in one job at 18
-    # minutes on the last green main run (measured 2026-09-11: the dry-run
-    # policy gate 255 s, the pinned-release fetch 166 s, the key-policy gate
-    # 164 s, the emitted-block converge 107 s, the cloudflared gate 97 s, and
-    # 77 s installing Ansible), and the converge-guard gate on this branch runs
-    # two hundred cases. Retirement now adds a few hundred playbook launches:
-    # run 34819012996 on 6e7869b (2026-09-14) started guard at 08:16:14Z,
-    # reached endpoint at 08:48:41Z and retirement at 09:01:13Z, then was
-    # cancelled at 09:01:31Z by the 45-minute cap after four R7 cases. Every
-    # guard and endpoint case passed, but removing retirement alone leaves
-    # guard within seconds of the cap. Endpoint took 12m32s, so endpoint and
-    # retirement each have their own group; guard skips both. Run 34848474843
-    # on 46fcafa (2026-09-14) started retirement at 13:56:15Z and failed at
-    # 14:32:15Z on r2-policy-normal's diagnostic expectation. Every route case
-    # passed through r-boundary, R15, R18 and R21, but routes had consumed about
-    # 36 of the 45 minutes before the 5c.d1 request cases could run. Requests
-    # now have their own retirement-request group; retirement skips requests.
-    # Setup runs in all seven groups because each is a fresh guest.
-    # Batching compatible cases into one playbook launch inside the gates is
-    # the deeper follow-up, as the timeout's comment already says.
+    # The former retirement group reached 36 minutes before request coverage
+    # on 46fcafa (2026-09-14). Partition its parser, routes, compatibility,
+    # retained continuation, recovery and 3c settled callers. Requests retain
+    # their existing group (planning input: 28/45 minutes). The 3c operand and
+    # drift plays also leave shape. These are structural budget estimates;
+    # complete CI timings must establish the required <=35 minute margin.
     strategy:
       fail-fast: false
       matrix:
-        group: [policy, roles, guard, shape, retirement, retirement-request, endpoint]
+        group: [policy, roles, guard, shape, retirement-node-shape, retirement, retirement-routes, retirement-compatibility, retirement-node, retirement-recovery, retirement-node-settled, retirement-request, endpoint]
     name: host-lifecycle (${{ matrix.group }})
     # Sized from what the gates measurably take: the run was cancelled at 15
     # minutes after the two connector gates and the fleet gate joined it
@@ -693,12 +692,30 @@ jobs:
         run: make converge-guard-check
 
       - name: Prove the retirement parser and caller routes
-        if: matrix.group == 'retirement'
+        if: contains(fromJSON('["retirement", "retirement-routes", "retirement-compatibility", "retirement-node", "retirement-recovery", "retirement-node-settled"]'), matrix.group)
         env:
           BILLET_GATE_REQUIRE_ROOT: "1"
           BILLET_GATE_ONLY: retirement
           BILLET_GATE_SKIP: retirement-request
+          BILLET_RETIREMENT_SHARD: ${{ fromJSON('{"retirement":"parser","retirement-routes":"routes","retirement-compatibility":"compatibility","retirement-node":"retained","retirement-recovery":"recovery","retirement-node-settled":"settled"}')[matrix.group] }}
+          BILLET_RETIREMENT_REPORT: ${{ runner.temp }}/retirement-selection.json
         run: make converge-guard-check
+
+      - name: Record the completed retirement case inventory
+        if: contains(fromJSON('["retirement", "retirement-routes", "retirement-compatibility", "retirement-node", "retirement-recovery", "retirement-node-settled"]'), matrix.group)
+        uses: actions/upload-artifact@v7
+        with:
+          name: retirement-selection-${{ matrix.group }}
+          path: ${{ runner.temp }}/retirement-selection.json
+          if-no-files-found: error
+
+      - name: Prove retirement shard coverage
+        if: matrix.group == 'retirement-node-shape'
+        run: make retirement-shard-check
+
+      - name: Prove retained ordinary operands and drift
+        if: matrix.group == 'retirement-node-shape'
+        run: make retirement-node-shape
 
       - name: Prove retirement requests, collection and cleanup
         if: matrix.group == 'retirement-request'
@@ -1047,6 +1064,7 @@ jobs:
         lint,
         release-config,
         host-lifecycle,
+        retirement-selection,
         package-lifecycle,
         terraform,
         terraform-consumer-floor,

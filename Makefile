@@ -343,6 +343,14 @@ example-check: ## Converge examples/single-host-docker with a generated block
 key-policy-check: ## Prove the role's GitHub App key policy, owned path and foreign
 	ansible_collections/junioryono/billet/tests/key-policy-check.sh
 
+.PHONY: retirement-node-shape
+retirement-node-shape: ## Exercise retained input, operand and drift witnesses
+	ANSIBLE_COLLECTIONS_PATH=$(CURDIR)/ansible_collections ansible-playbook ansible_collections/junioryono/billet/tests/retirement-node-shape.yml
+
+.PHONY: retirement-shard-check
+retirement-shard-check: ## Prove retirement CI selectors form a complete disjoint partition
+	python3 scripts/check-retirement-shards.py
+
 .PHONY: converge-guard-check
 converge-guard-check: ## Prove a converge driven from a billet-managed runner is refused
 	ansible_collections/junioryono/billet/tests/converge-guard-check.sh
