@@ -367,7 +367,8 @@
         that:
           - billet_configured_server_state_dir == '/var/lib/billet/server'
           - billet_server_directories | map(attribute='path') | list == ['/var/lib/billet/server']
-          - billet_node_directories | map(attribute='path') | list == ['/var/lib/billet/effective-node', '/var/lib/billet/health', '/var/lib/billet/upgrades', '/var/cache/billet-provision', '/srv/jailer', '/usr/local/libexec']
+          # The transaction root is appended, because the retained route drops it.
+          - billet_node_directories | map(attribute='path') | list == ['/var/lib/billet/effective-node', '/var/lib/billet/health', '/var/cache/billet-provision', '/srv/jailer', '/usr/local/libexec', '/var/lib/billet/upgrades']
           - billet_common_directories | map(attribute='path') | list == ['/etc/billet', '/etc/billet/network', '/var/lib/billet']
 
     # THE THREE INSTALLED-OBSERVATION EXPRESSIONS ARE PINNED AS EXACT TEXT, then
