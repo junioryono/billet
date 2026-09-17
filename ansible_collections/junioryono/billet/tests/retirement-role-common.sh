@@ -38,6 +38,12 @@ chmod 0755 /usr/sbin/nft'
       e "$name" "ANSIBLE_COLLECTIONS_PATH=$work/cases/$name/collection:$collections_path" ;;
   esac
   ns_case "$name" escalated play-retirement-role
+  # The shared failure printer tails only 60 lines. Preserve the complete
+  # observer diagnostic, including the seed and measured request traces.
+  if [ "$status" -ne 0 ] && [ -f "$work/cases/$name/role-failure.txt" ]; then
+    cat "$work/cases/$name/role-failure.txt" >&2
+    fail "$name: whole-role observer failed; see unit expectations and request trace above"
+  fi
   expect_allowed "$name"
 }
 r_role_pair() {

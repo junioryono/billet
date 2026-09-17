@@ -22,6 +22,7 @@ else
   cat "$case_dir/out-seed"
   exit "$seed_rc"
 fi
+"$PYTHON" "$observer" seed
 "$PYTHON" "$helper" prepare "$scenario" "$variant"
 "$PYTHON" "$observer" snapshot >"$case_dir/protected-before.json"
 "$PYTHON" "$observer" initial >"$case_dir/initial-files.json"
@@ -46,12 +47,13 @@ first_rc=$?
 set -e
 printf '%s\n' "$first_rc" >"$case_dir/role-status-first"
 cat "$case_dir/out-first"
-if [ "$scenario" = resume ]; then
+if [ "$scenario" = resume ] && [ "$variant" = retained ]; then
   [ "$first_rc" -ne 0 ]
   [ -f "$case_dir/interrupted.json" ]
   "$PYTHON" "$observer" interrupted
 else
   [ "$first_rc" -eq 0 ]
+  [ ! -e "$case_dir/interrupted.json" ]
 fi
 if [ "$scenario" = resume ] || [ "$scenario" = stable ]; then
   cp /var/lib/billet/upgrades/active/guard.json "$case_dir/guard-before.json"

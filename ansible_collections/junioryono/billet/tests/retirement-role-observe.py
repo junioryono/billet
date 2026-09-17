@@ -321,8 +321,41 @@ def require_control(trace, scenario, pass_name):
     network = [['stop', NODE], ['restart', 'billet-dnsmasq@billet0.service'],
                ['restart', 'billet-dnsmasq@billet1.service'], ['start', NODE]]
     expected.update(network=network, combined=network,
-                    resume=[['stop', NODE]] if pass_name == 'first' else network[1:])
+                    resume=network if pass_name == 'first' else [])
     require(trace == expected[scenario], f'independent node-only {scenario}/{pass_name}: {trace!r} != {expected[scenario]!r}')
+
+
+def require_node_ready(root, pass_name):
+    unit = read(root / 'services/control-a.json')[NODE]
+    failures = []
+    for field, expected in [('ActiveState', 'active'), ('UnitFileState', 'enabled'), ('NeedDaemonReload', 'no')]:
+        if unit.get(field) != expected:
+            failures.append(f'{field}={unit.get(field)!r}, expected {expected!r}')
+    if 'MainPID' not in unit or unit['MainPID'] == '0':
+        failures.append(f'MainPID={unit.get("MainPID")!r}, expected a recorded nonzero PID')
+    require(not failures, f'{root.name}/{pass_name}: {NODE}: ' + '; '.join(failures))
+
+
+def failure_diagnostic(root, mode, error):
+    # Report only the manager's public argv and the activation-policy scalars;
+    # the command capture and task arguments can contain guard tokens.
+    lines = [f'whole-role observer failure: case={root.name} phase={mode}']
+    for filename, label in [('node-policy.jsonl', 'recorded node policy'),
+                            ('manager.jsonl', 'recorded systemctl request trace')]:
+        lines.append(label + ':')
+        try:
+            lines.append((root / filename).read_text().rstrip())
+        except OSError as diagnostic_error:
+            lines.append(f'unavailable: {diagnostic_error}')
+    try:
+        unit = read(root / 'services/control-a.json')[NODE]
+        lines.append(f'{NODE} recorded state: {json.dumps(unit, sort_keys=True)}')
+    except (ValueError, KeyError, OSError) as diagnostic_error:
+        lines.append(f'{NODE} state unavailable: {diagnostic_error}')
+    lines.append(f'whole-role observer failure: case={root.name} phase={mode}: {error}')
+    diagnostic = '\n'.join(lines) + '\n'
+    print(diagnostic, file=sys.stderr, end='')
+    (root / 'role-failure.txt').write_text(diagnostic)
 
 
 def interrupted(root):
@@ -373,7 +406,7 @@ def finish(root, scenario, variant):
         if retained:
             executed = [row['task'] for row in all_tasks if row['pass_name'] == pass_name and row['event'] == 'after' and not row['failed']]
             require('Record the bound settled entry observation' in executed and 'Record current node configuration admission' in executed, 'entry or node-config answer was not bound by the real caller')
-        if scenario == 'resume' and pass_name == 'first':
+        if retained and scenario == 'resume' and pass_name == 'first':
             continue
         tasks = [row for row in all_tasks if row['pass_name'] == pass_name and row['event'] == 'after']
         names = [row['task'] for row in tasks]
@@ -381,7 +414,7 @@ def finish(root, scenario, variant):
         require('Refuse the receipt\'s refresh' in names, 'ordinary receipt parser was never reached')
         receipt = [row for row in answers if row['command'] == 'receipt' and '--refresh' in row['argv']]
         require(len(receipt) == 1 and receipt[0]['answer']['outcome'] in ['written', 'current'], 'ordinary refresh missing')
-        if scenario == 'resume':
+        if scenario == 'resume' and (retained or pass_name == 'first'):
             require(receipt[0]['answer']['outcome'] == 'written', 'resume did not refresh its modeled receipt')
         # Meta is executed by the strategy itself, outside action adapters.
         # Observe its scheduling directly as well as the handler actions.
@@ -400,8 +433,7 @@ def finish(root, scenario, variant):
         if not retained and not scenario.startswith('extra-'):
             require_control(requests(root, pass_name), scenario, pass_name)
     units = read(root / 'services/control-a.json')
-    require(units[NODE]['ActiveState'] == 'active' and units[NODE]['MainPID'] != '0'
-            and units[NODE]['UnitFileState'] == 'enabled' and units[NODE]['NeedDaemonReload'] == 'no', 'modeled node did not finish active, enabled and reloaded')
+    require_node_ready(root, passes[-1])
     events = rows(root / 'filesystem.jsonl')
     coverage = read(root / 'watch-complete.json')
     require(coverage['ordinary_coverage'] == 'continuous', 'absence of events has no continuous observation proof')
@@ -481,7 +513,13 @@ def compare(control_path, retained_path, negative=None):
             raise ValueError('parity comparison accepted extra ' + negative)
         print('ok: parity rejects retained-only extra ' + negative + ' despite active final state and closing')
     else:
-        compare_traces(control['traces'], retained['traces'])
+        if control['scenario'] == 'resume':
+            # The control completes uninterrupted. Only the retained leg splits
+            # this same ordered request sequence across the stop boundary.
+            compare_traces(control['traces']['first'] + control['traces']['second'],
+                           retained['traces']['first'] + retained['traces']['second'])
+        else:
+            compare_traces(control['traces'], retained['traces'])
         require(control['final']['InvocationID'] == retained['final']['InvocationID'], 'modeled invocation histories differ')
         print('ok: exact lifecycle request parity ' + control['scenario'])
 
@@ -500,6 +538,8 @@ if __name__ == '__main__':
                          pathlib.Path('/etc/billet/network.nft')]
                 paths += sorted(pathlib.Path('/etc/billet/network').glob('*.conf'))
                 print(json.dumps({str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}))
+            elif mode == 'seed':
+                require_node_ready(root, 'seed')
             elif mode == 'watch':
                 try:
                     watch(root)
@@ -519,4 +559,7 @@ if __name__ == '__main__':
             else:
                 raise ValueError('unknown observer mode: ' + mode)
     except (ValueError, KeyError, OSError) as error:
+        if mode in ['seed', 'interrupted', 'finish']:
+            failure_diagnostic(root, mode, error)
+            sys.exit(1)
         sys.exit(str(error))

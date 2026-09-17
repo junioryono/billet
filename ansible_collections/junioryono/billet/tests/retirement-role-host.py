@@ -184,6 +184,13 @@ def action(handler, original, tmp, task_vars):
             if phase:
                 observer.boundary(root(), 'ordinary')
     log('tasks.jsonl', dict(row, event='after', failed=bool(result.get('failed')), changed=bool(result.get('changed'))))
+    if module == 'ansible.builtin.set_fact' and 'billet_node_should_run' in args:
+        log('node-policy.jsonl', dict(
+            pass_name=cfg['pass'], task=name,
+            billet_enable_node=task_vars.get('billet_enable_node'),
+            billet_server_prepare_only=task_vars.get('billet_server_prepare_only'),
+            ansible_check_mode=task_vars.get('ansible_check_mode'),
+            billet_node_should_run=result.get('ansible_facts', {}).get('billet_node_should_run')))
     # The stop has returned and its state file has been written. Failing this
     # task stops Ansible before the next task without inventing quiet state.
     if cfg['interrupt'] and name == 'Drain billet compute before changing guest networking' and not result.get('failed'):
@@ -194,6 +201,7 @@ def action(handler, original, tmp, task_vars):
 
 def base_variables():
     return dict(billet_binary_src='', billet_enable_server=False, billet_enable_node=True,
+                billet_server_prepare_only=False,
                 billet_firecracker_enabled=True, billet_ceph_enabled=False, billet_automatic_updates=False,
                 billet_service_user='billetgate', billet_service_group='billetgate',
                 billet_firecracker_version='v1.16.1', billet_firecracker_stage='/var/lib/billet/firecracker-stage',
@@ -223,6 +231,14 @@ def seed():
                            NeedDaemonReload='no', Type='notify', User='root' if name == NODE else 'billetgate',
                            Group='root' if name == NODE else 'billetgate', Job='', InvocationID='1' * 32,
                            Endpoint='http://127.0.0.1:7717')
+        # The first role reload must see the files behind these loaded units.
+        # Otherwise the manager marks enablement not-found and keeps it even
+        # after the role installs the unit, falsely answering is-enabled with 0.
+        # The seed role replaces these fragments before either measured leg.
+        fragment = name.split('@', 1)[0] + '@.service' if '@' in name else name
+        pathlib.Path('/etc/systemd/system', fragment).write_text(
+            '[Service]\nType=notify\nUser=' + units[name]['User'] + '\nGroup=' + units[name]['Group']
+            + '\nExecStart=/bin/true\n[Install]\nWantedBy=multi-user.target\n')
     write(root() / 'services/control-a.json', units)
     write(root() / 'role-vars.json', base_variables())
     write(root() / 'role-settings.json', dict(**{'pass': 'seed'}, retained=False, interrupt=False, negative=''))
@@ -239,8 +255,14 @@ def prepare(scenario, retained):
     if retained:
         # Fixture-owned retirement evidence is deliberately outside the real
         # retirement root. Guard recovery remains real and sees no forged journal.
-        import shutil
-        shutil.rmtree('/var/lib/billet/server')
+        # A serverless seed has no identity directory to retire or remove.
+        # Do not hide a seed that unexpectedly bootstrapped a controller.
+        try:
+            pathlib.Path('/var/lib/billet/server').lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            raise ValueError('node-only seed unexpectedly created /var/lib/billet/server')
         pathlib.Path('/etc/systemd/system/billet-server.service').unlink()
         MODEL.mkdir()
         (MODEL / 'archive').mkdir()
@@ -259,7 +281,7 @@ def prepare(scenario, retained):
         state[NODE].update(ActiveState=scenario, SubState='dead' if scenario == 'inactive' else 'failed', MainPID='0')
         write(root() / 'services/control-a.json', state)
     write(root() / 'role-vars.json', cfg)
-    write(root() / 'role-settings.json', dict(**{'pass': 'first'}, retained=retained, interrupt=scenario == 'resume',
+    write(root() / 'role-settings.json', dict(**{'pass': 'first'}, retained=retained, interrupt=retained and scenario == 'resume',
                                             negative=scenario.removeprefix('extra-') if scenario.startswith('extra-') else ''))
     write(root() / 'initial-node.json', node())
 
