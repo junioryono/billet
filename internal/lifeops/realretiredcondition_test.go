@@ -192,7 +192,7 @@ func realRetiredConditionMechanism(t *testing.T, mechanism string) {
 		t.Fatal(err)
 	}
 	activate()
-	wait(func() bool {
+	wait(service, func() bool {
 		_, err := os.Stat(witness)
 		if err != nil && !os.IsNotExist(err) {
 			t.Fatal(err)
