@@ -5,7 +5,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
-	"slices"
 	"strings"
 	"testing"
 
@@ -180,14 +179,11 @@ func TestAnsibleVarReachesTheRoleTemplateThroughItsOperand(t *testing.T) {
 	}
 
 	// A SUBSTRING IS NOT A READ. `billet_config` occurs inside
-	// `billet_config_document` and inside `billet_effective_config`, so a rename to
-	// any longer name satisfies a Contains check while reading nothing. Both links
-	// below match the emitted name only where it is a whole word.
-	readsEmission := func(source string) bool {
-		return slices.Contains(strings.FieldsFunc(source, func(r rune) bool {
-			return !(r == '_' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9')
-		}), AnsibleVar)
-	}
+	// `billet_config_document`, so a rename to any longer name satisfies a Contains
+	// check while reading nothing. `\b` is what makes this a read rather than an
+	// occurrence: Go counts `_` as a word character, so the boundary does not fall
+	// between `billet_config` and `_document` and the longer name cannot satisfy it.
+	reads := regexp.MustCompile(`\b` + regexp.QuoteMeta(AnsibleVar) + `\b`)
 
 	// A BINDING IS THE OPERAND FOLLOWED BY A COLON, in either spelling the role
 	// uses: a task's `vars:` entry writes `operand: value`, and a template lookup
@@ -201,7 +197,7 @@ func TestAnsibleVarReachesTheRoleTemplateThroughItsOperand(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read the role's effective configuration entry: %v", err)
 	}
-	if !readsEmission(string(effective)) {
+	if !reads.Match(effective) {
 		t.Errorf("the role derives its effective configuration without reading %q — "+
 			"an emission would set a variable nothing reads", AnsibleVar)
 	}
