@@ -111,7 +111,9 @@
       - billet_retirement_operation_document.document.operations.services == [{'verb':'enable', 'unit':'billet-node.service'}, {'verb':'stop', 'unit':'billet-node.service'}, {'verb':'start', 'unit':'billet-node.service'}]
       - billet_retirement_operation_document.document.operations.units | map(attribute='unit') | list == ['billet-node.service']
       - billet_retirement_operation_document.document.operations.units[0].path == billet_unit_operands['billet-node.service'].dest
-      - billet_retirement_operation_document.document.operations.units[0].contents == lookup('ansible.builtin.template', billet_gate_role + '/templates/billet-node.service.j2', template_vars={'billet_systemd_notify_ready': true})
+      # Quoted: the colon and space inside template_vars would otherwise make
+      # YAML read this item as a mapping, which Ansible refuses as a condition.
+      - "billet_retirement_operation_document.document.operations.units[0].contents == lookup('ansible.builtin.template', billet_gate_role + '/templates/billet-node.service.j2', template_vars={'billet_systemd_notify_ready': true})"
       - (billet_retirement_operation_document.document.rendering | from_yaml) == billet_effective_config
       - "billet_retirement_entry_binding == {'verified': 'entry'}"
       - "billet_retirement_closing_binding == {'verified': 'closing'}"
