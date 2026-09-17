@@ -2,7 +2,7 @@
   "outcome": "refused",
   "purpose": "settled-entry",
   "reason": "settled-entry-node-reloading",
-  "schema": 1,
+  "schema": 2,
   "state": "nothing",
   "why": "node is not quiet or active"
 }

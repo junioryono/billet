@@ -117,6 +117,24 @@ func (i Installer) Install(
 	return final, nil
 }
 
+const stagingPrefix = ".durable-"
+
+// IsStagingName identifies the non-effective temporary basename used by Install.
+// It grants no ownership or deletion permission; callers may ignore these names
+// only where dot files have no effect (for example systemd drop-in directories).
+func IsStagingName(name string) bool {
+	suffix, ok := strings.CutPrefix(name, stagingPrefix)
+	if !ok || suffix == "" {
+		return false
+	}
+	for _, digit := range suffix {
+		if digit < '0' || digit > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // createStaged and closeStaged are the two steps of an install that no exported
 // seam reaches: the staged file's creation and its close before the rename.
 // They are variables so this package's own tests can fail them (a close that
@@ -125,7 +143,7 @@ func (i Installer) Install(
 // them, and the record writer that installs through the zero-value Installer is
 // held to that by its own structural test.
 var (
-	createStaged = func(dir string) (*os.File, error) { return os.CreateTemp(dir, ".durable-*") }
+	createStaged = func(dir string) (*os.File, error) { return os.CreateTemp(dir, stagingPrefix+"*") }
 	closeStaged  = func(f *os.File) error { return f.Close() }
 )
 

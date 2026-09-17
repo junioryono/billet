@@ -7,9 +7,9 @@ import (
 )
 
 func settledVerdictFixture(purpose string) SettledVerdict {
-	verdict := SettledVerdict{Schema: 1, Purpose: purpose, Outcome: "admitted", Run: "ci-1", Guard: strings.Repeat("a", 32),
+	verdict := SettledVerdict{Schema: SettledSchema, Purpose: purpose, Outcome: "admitted", Run: "ci-1", Guard: strings.Repeat("a", 32),
 		Retiring: "control-a", Deployment: strings.Repeat("d", 32), TransitionID: strings.Repeat("b", 32), Variant: VariantRetainedNode,
-		Phase: PhaseDone, RowDone: true, Settled: true, CompletedBy: "control-b", NodeActivity: "quiet-inactive", State: "nothing"}
+		Phase: PhaseDone, RowDone: true, Settled: true, CompletedBy: "control-b", NodeActivity: "quiet-inactive", State: "nothing", EnablementChanges: map[string]string{}}
 	if purpose == PurposeSettledClosing {
 		verdict.Outcome, verdict.NodeActivity = "verified", "active"
 	}
@@ -59,9 +59,9 @@ func TestSettledVerdictRequiresCompleteStrictBoundDocuments(t *testing.T) {
 				})
 			}
 			for _, raw := range []string{string(body) + "}", string(body) + string(body), string(body[:len(body)-1]),
-				strings.Replace(string(body), `"schema":1`, `"schema":1,"schema":1`, 1),
-				strings.Replace(string(body), `"schema":1`, `"Schema":1`, 1),
-				strings.Replace(string(body), `"schema":1`, `"postconditions":{"node":"running"},"schema":1`, 1),
+				strings.Replace(string(body), `"schema":2`, `"schema":2,"schema":2`, 1),
+				strings.Replace(string(body), `"schema":2`, `"Schema":2`, 1),
+				strings.Replace(string(body), `"schema":2`, `"postconditions":{"node":"running"},"schema":2`, 1),
 				string(body) + strings.Repeat(" ", 16<<10)} {
 				if _, err := DecodeSettledVerdict([]byte(raw), 0, want); err == nil {
 					t.Fatal("accepted malformed, duplicate, oversized, tail-shaped or incomplete verdict")
@@ -132,7 +132,7 @@ func TestSettledRefusalRequiresItsOwnBranchAndExit(t *testing.T) {
 			if code == 3 {
 				outcome = "unknown"
 			}
-			want := SettledRefusal{Schema: 1, Purpose: purpose, Outcome: outcome, Reason: "guard", Why: "not this holder", State: "nothing"}
+			want := SettledRefusal{Schema: SettledSchema, Purpose: purpose, Outcome: outcome, Reason: "guard", Why: "not this holder", State: "nothing"}
 			body, err := json.Marshal(want)
 			if err != nil {
 				t.Fatal(err)
@@ -146,9 +146,9 @@ func TestSettledRefusalRequiresItsOwnBranchAndExit(t *testing.T) {
 				}
 			}
 			for _, raw := range []string{string(body) + "{}", string(body[:len(body)-1]), string(body) + strings.Repeat(" ", 16<<10),
-				strings.Replace(string(body), `"schema":1`, `"schema":1,"row_done":true`, 1),
-				strings.Replace(string(body), `"schema":1`, `"Schema":1`, 1),
-				strings.Replace(string(body), `"schema":1`, `"schema":1,"schema":1`, 1),
+				strings.Replace(string(body), `"schema":2`, `"schema":2,"row_done":true`, 1),
+				strings.Replace(string(body), `"schema":2`, `"Schema":2`, 1),
+				strings.Replace(string(body), `"schema":2`, `"schema":2,"schema":2`, 1),
 				strings.Replace(string(body), `"reason":"guard"`, `"reason":null`, 1)} {
 				if _, err := DecodeSettledRefusal([]byte(raw), code, purpose); err == nil {
 					t.Fatal("refusal accepted incomplete, malformed or success-branch members")
@@ -157,6 +157,27 @@ func TestSettledRefusalRequiresItsOwnBranchAndExit(t *testing.T) {
 			if _, err := DecodeSettledVerdict(body, code, settledVerdictFixture(purpose)); err == nil {
 				t.Fatal("refusal admitted as success")
 			}
+		}
+	}
+}
+
+func TestSettledEnablementChangesAreTypedReports(t *testing.T) {
+	want := settledVerdictFixture(PurposeSettledClosing)
+	want.EnablementChanges = map[string]string{"billet-server.service": "enabled"}
+	body, err := json.Marshal(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DecodeSettledVerdict(body, 0, want); err != nil {
+		t.Fatal(err)
+	}
+	for _, replacement := range []string{`null`, `[]`, `{"other.service":"enabled"}`, `{"billet-server.service":true}`, `{"billet-server.service":""}`} {
+		changed := strings.Replace(string(body), `{"billet-server.service":"enabled"}`, replacement, 1)
+		if changed == string(body) {
+			t.Fatal("corruption did not change the report")
+		}
+		if _, err := DecodeSettledVerdict([]byte(changed), 0, want); err == nil {
+			t.Fatalf("accepted malformed enablement report: %s", changed)
 		}
 	}
 }

@@ -2,7 +2,7 @@
   "outcome": "unknown",
   "purpose": "settled-entry",
   "reason": "settled-entry-node-job-observation",
-  "schema": 1,
+  "schema": 2,
   "state": "nothing",
   "why": "queued job absence could not be observed"
 }

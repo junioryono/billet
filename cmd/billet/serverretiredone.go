@@ -255,6 +255,9 @@ func observeRetirePostconditions(ctx context.Context, m retireMode, j retirement
 func observeRetireControllerPostconditions(ctx context.Context, m retireMode, j retirement.Journal,
 ) (retirePostconditions, *retireRefusal) {
 	var held retirePostconditions
+	if r := proveRetireInert(ctx, j); r != nil {
+		return held, r
+	}
 
 	present, err := retireDirPresent(j.Archive)
 
@@ -288,7 +291,7 @@ func observeRetireControllerPostconditions(ctx context.Context, m retireMode, j 
 		{name: backupServiceUnit, into: &held.BackupService, pid: true},
 	} {
 		backupTimerQuiet := held.BackupTimer == retireUnitQuiet || held.BackupTimer == retireUnitNotFound
-		word, r := retireUnitPostcondition(ctx, insp, unit.name, unit.pid, false, backupTimerQuiet)
+		word, r := retireControllerUnitPostcondition(ctx, insp, unit.name, unit.pid, backupTimerQuiet, m)
 		if r != nil {
 			return held, atRetirePhase(j, r)
 		}
@@ -296,6 +299,15 @@ func observeRetireControllerPostconditions(ctx context.Context, m retireMode, j 
 		*unit.into = word
 	}
 
+	if j.Variant == retirement.VariantRetainedNode {
+		if r := proveRetireInertProcesses(ctx, j); r != nil {
+			return held, r
+		}
+		if _, r := retireControllerUnitPostcondition(ctx, insp, upgradeServiceUnit, true,
+			held.UpgradeTimer == retireUnitQuiet || held.UpgradeTimer == retireUnitNotFound, m); r != nil {
+			return held, r
+		}
+	}
 	return held, nil
 }
 
@@ -305,6 +317,9 @@ func observeRetireControllerPostconditions(ctx context.Context, m retireMode, j 
 func proveRetireDoneRegistration(ctx context.Context, insp *lifeops.Inspector, configPath string,
 	j retirement.Journal,
 ) *retireRefusal {
+	if r := proveRetireInert(ctx, j); r != nil {
+		return r
+	}
 	if j.Variant == retirement.VariantRetainedNode && retireNodeUnitFact(ctx, insp, configPath) != retirement.NodeReady {
 		return atRetirePhase(j, retireUnknown(retireReasonPostcondition,
 			"retained-node-registration-unproved: "+nodeUnit+" has not proved registration under its current "+
@@ -398,7 +413,7 @@ func retireConfigPostcondition(configPath string, j retirement.Journal) (string,
 // retireUnitPostcondition judges one unit. `alive` names the one unit a
 // retained-node host must still be running. `backupTimerQuiet` is proof from
 // the backup timer's successful postcondition in this same observation pass.
-func retireUnitPostcondition(ctx context.Context, insp *lifeops.Inspector, unit string, pid, alive, backupTimerQuiet bool,
+func retireUnitPostcondition(ctx context.Context, insp *lifeops.Inspector, unit string, pid, alive, backupTimerQuiet bool, inertEnablement ...bool,
 ) (string, *retireRefusal) {
 	props, err := insp.UnitProperties(ctx, unit, retireDoneProperties...)
 	if err != nil {
@@ -475,6 +490,13 @@ func retireUnitPostcondition(ctx context.Context, insp *lifeops.Inspector, unit 
 		return retireUnitNotFound, nil
 	}
 
+	if len(inertEnablement) == 1 && inertEnablement[0] {
+		if !knownUnitFileState(enablement) {
+			return "", retireUnknown(retireReasonPostcondition, "unknown inert unit enablement: "+unit, "")
+		}
+		return retireUnitQuiet, nil
+	}
+
 	if !knownUnitFileState(enablement) {
 		return "", retireUnknown(retireReasonPostcondition, fmt.Sprintf("systemd answered %s's enablement as %s, which "+
 			"this billet does not know", unit, activeWord(enablement)), "")
@@ -483,10 +505,10 @@ func retireUnitPostcondition(ctx context.Context, insp *lifeops.Inspector, unit 
 	// Measured on the reference controller, 2026-09-15, systemd 255
 	// (255.4-1ubuntu8.17): the backup service was loaded/inactive/static,
 	// while its timer was loaded/active/enabled. The service has no [Install]
-	// section and is started by that timer, so static is quiet ONLY for this
-	// service, after proving inactivity and no process above AND judging its
+	// section, as does the upgrade service. Static is quiet only for these
+	// services, after proving inactivity and no process above AND judging its
 	// timer quiet in this pass. A missing or later timer check grants nothing.
-	if unit == backupServiceUnit && enablement == "static" && pid && backupTimerQuiet {
+	if (unit == backupServiceUnit || unit == upgradeServiceUnit) && enablement == "static" && pid && backupTimerQuiet {
 		return retireUnitQuiet, nil
 	}
 
@@ -544,4 +566,9 @@ func activeWord(value string) string {
 	}
 
 	return value
+}
+
+func retireControllerUnitPostcondition(ctx context.Context, insp *lifeops.Inspector, unit string, pid, timerQuiet bool, m retireMode) (string, *retireRefusal) {
+	return retireUnitPostcondition(ctx, insp, unit, pid, false, timerQuiet,
+		m.checkSettledEntry || m.checkSettledClosing || m.checkNodeConfig)
 }

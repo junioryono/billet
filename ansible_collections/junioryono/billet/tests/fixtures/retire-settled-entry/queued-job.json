@@ -2,7 +2,7 @@
   "outcome": "refused",
   "purpose": "settled-entry",
   "reason": "settled-entry-node-queued-job",
-  "schema": 1,
+  "schema": 2,
   "state": "nothing",
   "why": "node has a queued lifecycle job"
 }

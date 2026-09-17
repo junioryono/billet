@@ -48,13 +48,13 @@
          if billet_retire_settled_answer.outcome | default('') in ['refused', 'unknown']
          else ['schema', 'purpose', 'outcome', 'run', 'guard', 'retiring', 'deployment',
                'transition_id', 'variant', 'phase', 'row_done', 'settled', 'completed_by',
-               'node_activity', 'state'] }}
+               'node_activity', 'state', 'enablement_changes'] }}
 
 - name: Require the settled schema purpose and exit semantics
   ansible.builtin.assert:
     that:
       - billet_retire_settled_answer.schema is integer
-      - billet_retire_settled_answer.schema == 1
+      - billet_retire_settled_answer.schema == 2
       - billet_retire_settled_answer.purpose == billet_retire_settled_purpose
       - billet_retire_settled_answer.state == 'nothing'
       - >-
@@ -98,6 +98,7 @@
     that:
       - billet_retire_settled_answer.guard is match('^[0-9a-f]{32}\Z')
       - billet_retire_settled_answer.transition_id is match('^[0-9a-f]{32}\Z')
+      - billet_retire_settled_answer.enablement_changes is mapping
       - billet_retire_settled_answer.variant == 'retained-node'
       - billet_retire_settled_answer.phase == 'done'
       - billet_retire_settled_answer.row_done is sameas true
@@ -107,3 +108,12 @@
         (['active', 'quiet-inactive', 'quiet-failed'] if billet_retire_settled_purpose == 'settled-entry'
          else ['active'])
     fail_msg: "The {{ billet_retire_settled_purpose }} answer does not prove the settled retained contract and required node activity."
+
+- name: Require typed controller enablement observations
+  ansible.builtin.assert:
+    that:
+      - item.key in ['billet-server.service', 'billet-backup.service', 'billet-backup.timer', 'billet-upgrade.service', 'billet-upgrade.timer']
+      - item.value is string
+      - item.value | length > 0
+    fail_msg: "The {{ billet_retire_settled_purpose }} answer has an invalid controller enablement observation."
+  loop: "{{ billet_retire_settled_answer.enablement_changes | dict2items }}"

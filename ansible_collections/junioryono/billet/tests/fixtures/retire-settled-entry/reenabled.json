@@ -1,9 +1,11 @@
 {
   "completed_by": "control-a",
   "deployment": "dddddddddddddddddddddddddddddddd",
-  "enablement_changes": {},
+  "enablement_changes": {
+    "billet-server.service": "enabled"
+  },
   "guard": "11111111111111111111111111111111",
-  "node_activity": "quiet-inactive",
+  "node_activity": "active",
   "outcome": "admitted",
   "phase": "done",
   "purpose": "settled-entry",

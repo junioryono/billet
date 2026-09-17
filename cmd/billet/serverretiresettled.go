@@ -25,7 +25,7 @@ func answerRetireModeRefusal(m retireMode, r *retireRefusal) error {
 	if r.Outcome == retireOutcomeUnknown {
 		code = exitUnknown
 	}
-	return answerJSON(retirement.SettledRefusal{Schema: 1, Purpose: retireSettledPurpose(m), Outcome: r.Outcome,
+	return answerJSON(retirement.SettledRefusal{Schema: retirement.SettledSchema, Purpose: retireSettledPurpose(m), Outcome: r.Outcome,
 		Reason: r.Reason, Why: r.Why, State: stateNothingRetire}, code, r.Why)
 }
 
@@ -83,7 +83,11 @@ func retireCheckSettled(ctx context.Context, m retireMode) (any, *retireRefusal)
 		if m.checkSettledClosing {
 			outcome = "verified"
 		}
-		return &retirement.SettledVerdict{Schema: 1, Purpose: retireSettledPurpose(m), Outcome: outcome,
+		changes, r := retireSettledEnablement(ctx, j)
+		if r != nil {
+			return nil, r
+		}
+		return &retirement.SettledVerdict{Schema: retirement.SettledSchema, Purpose: retireSettledPurpose(m), Outcome: outcome, EnablementChanges: changes,
 			Run: m.run, Guard: m.expectedGuard, Retiring: m.retiringHost, Deployment: j.Deployment,
 			TransitionID: j.Provenance.TransitionID, Variant: j.Variant, Phase: j.Phase, RowDone: j.RowDone,
 			Settled: j.Settled, CompletedBy: j.CompletedBy, NodeActivity: activity, State: stateNothingRetire}, nil
@@ -118,4 +122,28 @@ func observeRetireEntryJob(ctx context.Context, insp *lifeops.Inspector) *retire
 		return retireRefuse("settled-entry-node-process-present", "node still has a control process", "")
 	}
 	return nil
+}
+
+func retireSettledEnablement(ctx context.Context, j retirement.Journal) (map[string]string, *retireRefusal) {
+	changes := make(map[string]string)
+	for _, unit := range retireInertUnits {
+		props, err := retireOperationInspector().UnitProperties(ctx, unit, "LoadState", "UnitFileState")
+		if err != nil || len(props["LoadState"]) != 1 || len(props["UnitFileState"]) != 1 {
+			return nil, retireUnknown(retireReasonPostcondition, "controller enablement could not be observed", "")
+		}
+		state := firstProp(props, "UnitFileState")
+		if firstProp(props, "LoadState") == "not-found" {
+			continue
+		}
+		if !knownUnitFileState(state) {
+			return nil, retireUnknown(retireReasonPostcondition, "controller enablement is unknown", "")
+		}
+		if state != "disabled" && state != "masked" && !((unit == backupServiceUnit || unit == upgradeServiceUnit) && state == "static") {
+			changes[unit] = state
+		}
+	}
+	if r := proveRetireInert(ctx, j); r != nil {
+		return nil, r
+	}
+	return changes, nil
 }

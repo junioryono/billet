@@ -173,7 +173,7 @@ func TestRetirementNodeConfigAdmitsQuietEntryWithoutDrainOrRegistration(t *testi
 			t.Setenv("BILLET_STATE_DSN", "postgres://billet@127.0.0.1:1/unreachable?sslmode=disable")
 			forbidNodeConfigWrites(t, f)
 			operations := emptyNodeOperations()
-			operations.Services = []retireServiceOperation{{Verb: "start", Unit: nodeUnit}}
+			operations.Services = retireNodeServiceSuperset()
 			document := nodeConfigDocument(t, j, mustRead(t, f.cfg), operations)
 			out, code := runNodeConfigCheck(t, f, j, document)
 			var in retireNodeConfigInput
@@ -248,7 +248,7 @@ func TestRetirementNodeConfigAdmitsPackagedServiceDirectories(t *testing.T) {
 	for _, verb := range []string{"", "start"} {
 		operations := emptyNodeOperations()
 		if verb != "" {
-			operations.Services = []retireServiceOperation{{Verb: verb, Unit: nodeUnit}}
+			operations.Services = retireNodeServiceSuperset()
 		}
 		out, code := runNodeConfigCheck(t, f, j, nodeConfigDocument(t, j, mustRead(t, f.cfg), operations))
 		if code != 0 || retireAnswer(t, out)["outcome"] != "admitted" {

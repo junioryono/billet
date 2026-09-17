@@ -1,6 +1,7 @@
 {
   "completed_by": "control-a",
   "deployment": "dddddddddddddddddddddddddddddddd",
+  "enablement_changes": {},
   "guard": "11111111111111111111111111111111",
   "node_activity": "active",
   "outcome": "admitted",
@@ -9,7 +10,7 @@
   "retiring": "control-a",
   "row_done": true,
   "run": "ci-1",
-  "schema": 1,
+  "schema": 2,
   "settled": true,
   "state": "nothing",
   "transition_id": "22222222222222222222222222222222",

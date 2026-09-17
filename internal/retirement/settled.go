@@ -4,6 +4,7 @@ import "fmt"
 
 // PurposeSettledEntry and PurposeSettledClosing identify distinct contracts.
 const (
+	SettledSchema         = 2
 	PurposeSettledEntry   = "settled-entry"
 	PurposeSettledClosing = "settled-closing"
 )
@@ -11,6 +12,10 @@ const (
 // SettledVerdict is a current observation, never a publication or drain token.
 // Neither purpose shares the tail's answer or its running postcondition member.
 type SettledVerdict struct {
+	// EnablementChanges reports departures from the retirement quiet states.
+	// Inertness admits them; neither entry nor closing repairs enablement.
+	EnablementChanges map[string]string `json:"enablement_changes"`
+
 	Schema       int     `json:"schema"`
 	Purpose      string  `json:"purpose"`
 	Outcome      string  `json:"outcome"`
@@ -47,10 +52,23 @@ func DecodeSettledVerdict(raw []byte, exitCode int, expected SettledVerdict) (Se
 	if err := DecodeDocument(raw, &verdict); err != nil {
 		return verdict, err
 	}
-	if exitCode != 0 || verdict.Schema != 1 || verdict.Purpose != expected.Purpose ||
+	if exitCode != 0 || verdict.Schema != SettledSchema || verdict.Purpose != expected.Purpose ||
 		verdict.Variant != VariantRetainedNode || verdict.Variant != expected.Variant || verdict.Phase != PhaseDone || !verdict.RowDone || !verdict.Settled ||
 		verdict.CompletedBy == "" || verdict.State != "nothing" {
 		return verdict, fmt.Errorf("not a successful settled observation")
+	}
+	if verdict.EnablementChanges == nil {
+		return verdict, fmt.Errorf("settled verdict has no enablement observation")
+	}
+	for unit, state := range verdict.EnablementChanges {
+		switch unit {
+		case "billet-server.service", "billet-backup.service", "billet-backup.timer", "billet-upgrade.service", "billet-upgrade.timer":
+		default:
+			return verdict, fmt.Errorf("settled verdict reports an unrelated unit")
+		}
+		if state == "" {
+			return verdict, fmt.Errorf("settled verdict has an empty enablement observation")
+		}
 	}
 	switch verdict.Purpose {
 	case PurposeSettledEntry:
@@ -90,7 +108,7 @@ func DecodeSettledRefusal(raw []byte, exitCode int, purpose string) (SettledRefu
 	if err := DecodeDocument(raw, &refusal); err != nil {
 		return refusal, err
 	}
-	if refusal.Schema != 1 || refusal.Purpose != purpose ||
+	if refusal.Schema != SettledSchema || refusal.Purpose != purpose ||
 		(purpose != PurposeSettledEntry && purpose != PurposeSettledClosing) || refusal.State != "nothing" ||
 		refusal.Reason == "" || refusal.Why == "" ||
 		(exitCode != 2 || refusal.Outcome != "refused") && (exitCode != 3 || refusal.Outcome != "unknown") {

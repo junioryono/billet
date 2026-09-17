@@ -70,6 +70,9 @@ func (f *requestFixture) plantJournal(t *testing.T, phase retirement.Phase, vari
 
 		j.StagedSHA256, j.Config = retirement.Digest(body), "present"
 		j.RetainedInvocation = f.originalNode
+		var err error
+		j.InertSources, err = retireInertSources(t.Context(), retireOperationInspector())
+		mustOK(t, err)
 	}
 
 	// THE TIMERS' STOP IS RECORDED FROM INTENT ON, which is where the window a
@@ -90,6 +93,20 @@ func (f *requestFixture) plantJournal(t *testing.T, phase retirement.Phase, vari
 	}
 
 	mustOK(t, j.Write(retireNow()))
+	if variant == retirement.VariantRetainedNode && phase != retirement.PhaseIntent {
+		// Later-phase fixtures may already have rewritten configuration or
+		// archived identity. Plant their completed install, not a fictitious
+		// intent resume which must now pass the original pre-mutation proof.
+		body, err := json.Marshal(retireInertRecord{Schema: 1, Transition: j.Provenance.TransitionID, Deployment: j.Deployment, Sources: j.InertSources})
+		mustOK(t, err)
+		writeFile(t, retireInertMarker(j), string(body), 0o600)
+		for _, unit := range retireInertUnits {
+			path, err := retireInertDropIn(retireOperationInspector(), unit)
+			mustOK(t, err)
+			writeFile(t, path, retireInertBytes(j), 0o644)
+		}
+		mustOK(t, reloadRetireManagerFake(f.unitsDir))
+	}
 
 	return j
 }

@@ -19,7 +19,7 @@ func installRetireOperationEvidence(t *testing.T, f *requestFixture) {
 	t.Helper()
 	root := t.TempDir()
 	writeFile(t, filepath.Join(f.unitsDir, "billet-upgrade.service"),
-		"LoadState=loaded\nActiveState=inactive\nUnitFileState=static\n", 0o644)
+		"LoadState=loaded\nActiveState=inactive\nUnitFileState=static\nMainPID=0\n", 0o644)
 	for _, unit := range []string{serverUnit, nodeUnit, backupServiceUnit, "billet-upgrade.service", upgradeTimerUnit, backupTimerUnit, "billet-network.service", "billet-dnsmasq@br0.service", "billet-dnsmasq@br1.service", "sysinit.target", "local-fs.target", "multi-user.target", "systemd-firstboot.service", "helper.service"} {
 		if unit == "helper.service" || unit == "systemd-firstboot.service" {
 			writeFile(t, filepath.Join(f.unitsDir, unit), "LoadState=loaded\nActiveState=inactive\nUnitFileState=static\n", 0o644)
