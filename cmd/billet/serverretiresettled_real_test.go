@@ -57,13 +57,14 @@ func TestRealSystemdRetirementSettledEntryObservations(t *testing.T) {
 			case "active", "failed", "deactivating", "reloading":
 				settledObservationCtl(t, "start", "--", unit)
 				awaitSettledObservation(t, unit, "ActiveState", "active")
-				if scenario == "failed" {
+				switch scenario {
+				case "failed":
 					settledObservationCtl(t, "kill", "--kill-whom=main", "--signal=KILL", "--", unit)
 					awaitSettledObservation(t, unit, "ActiveState", "failed")
-				} else if scenario == "deactivating" {
+				case "deactivating":
 					settledObservationCtl(t, "stop", "--no-block", "--", unit)
 					awaitSettledObservation(t, unit, "ActiveState", "deactivating")
-				} else if scenario == "reloading" {
+				case "reloading":
 					settledObservationCtl(t, "reload", "--no-block", "--", unit)
 					awaitSettledObservation(t, unit, "ActiveState", "reloading")
 				}
@@ -127,9 +128,10 @@ func TestRealSystemdRetirementSettledEntryObservations(t *testing.T) {
 				}
 			default:
 				want := "settled-entry-node-" + scenario
-				if scenario == "queued job" {
+				switch scenario {
+				case "queued job":
 					want = "settled-entry-node-queued-job"
-				} else if scenario == "unit mismatch" {
+				case "unit mismatch":
 					want = "settled-entry-node-unit-mismatch"
 				}
 				refusal, err := retirement.DecodeSettledRefusal([]byte(out), code, retirement.PurposeSettledEntry)
@@ -272,7 +274,7 @@ func forwardSettledManagerObservations(t *testing.T, unit string) *int {
 		realArgs = append(realArgs, "--", unit)
 		cmd := exec.CommandContext(ctx, "/usr/bin/systemctl", realArgs...)
 		cmd.Stderr = stderr
-		real, err := cmd.Output()
+		answer, err := cmd.Output()
 		if err != nil {
 			return err
 		}
@@ -285,7 +287,7 @@ func forwardSettledManagerObservations(t *testing.T, unit string) *int {
 				}
 			}
 		}
-		_, err = stdout.Write(real)
+		_, err = stdout.Write(answer)
 		return err
 	}
 	return &observations
