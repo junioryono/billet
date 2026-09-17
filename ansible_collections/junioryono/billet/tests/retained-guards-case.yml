@@ -1,0 +1,42 @@
+---
+- name: Plant this retained binary decision and serverless effective input
+  ansible.builtin.set_fact:
+    billet_retirement_node_ordinary: "{{ billet_gate_case.retained }}"
+    billet_binary_upgrade: "{{ billet_gate_case.upgrade }}"
+    billet_effective_config: {node: {provider: docker}}
+    billet_config: "{{ {'node': {'provider': 'docker'}} | combine({'server': {'identity_dir': '/var/lib/billet/identity'}} if billet_gate_case.server else {}) }}"
+    billet_gate_binary_refused: false
+
+- name: Exercise the production binary transaction refusal
+  block:
+    - name: Include the ordinary entry's binary refusal
+      ansible.builtin.include_role:
+        name: junioryono.billet.host
+        tasks_from: retirement-binary-refusal
+  rescue:
+    - name: Require the intended refusal and operator path
+      ansible.builtin.assert:
+        that:
+          - ansible_failed_task.name == "Refuse the role's binary transaction on a retained node"
+          - "'billet host-upgrade' in ansible_failed_result.msg"
+    - name: Record this case's refusal
+      ansible.builtin.set_fact:
+        billet_gate_binary_refused: true
+
+- name: Require refusal exactly for the retained binary transaction
+  ansible.builtin.assert:
+    that: billet_gate_binary_refused is sameas (billet_gate_case.retained and billet_gate_case.upgrade)
+
+# include_vars supplies trusted expressions, unlike lookup(file) | from_yaml.
+- name: Load the production state directory aliases
+  ansible.builtin.include_vars:
+    file: "{{ billet_gate_role }}/vars/main.yml"
+
+- name: Require emptiness only for retained ordinary work
+  ansible.builtin.assert:
+    that:
+      - billet_configured_server_state_dir == ('' if billet_gate_case.retained else '/var/lib/billet/server')
+      - >-
+        billet_server_directories ==
+        ([] if billet_gate_case.retained else
+         [{'path': '/var/lib/billet/server', 'owner': 'billet', 'group': 'billet', 'mode': '0700'}])

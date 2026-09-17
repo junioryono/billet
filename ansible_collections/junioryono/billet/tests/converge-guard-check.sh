@@ -427,6 +427,8 @@ if [ "${1:-} ${2:-}" = 'server retire' ]; then
       --abandon-reservation) retire_mode=abandon ;;
       --complete-row) retire_mode=complete ;;
       --acknowledge-row) retire_mode=acknowledge ;;
+      --check-settled-entry) retire_mode=settled-entry ;;
+      --check-settled-closing) retire_mode=settled-closing ;;
     esac
   done
   cmd="retire-${retire_mode:-invalid}"

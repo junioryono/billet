@@ -303,6 +303,9 @@ PY
 # R1: one classifier, ordinary admitted, no retirement mutation or recovery.
 if [ "${BILLET_GATE_ONLY:-}" != retirement-request ]; then
 "$python" "$here/executable_version_check.py"
+
+# Detached settled callers use the same recording fixture answerer as routing.
+. "$here/retirement-settled-cases.sh"
 r_plant r1-ordinary
 r_answers r1-ordinary 'control-a:classify:1:dry-run-ordinary.json:0'
 r_run r1-ordinary

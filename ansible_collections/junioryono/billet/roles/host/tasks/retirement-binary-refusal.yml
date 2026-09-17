@@ -1,0 +1,10 @@
+---
+# Preparation decides the binary change before routing. Refuse at ordinary
+# entry, before inspection can act or any controller resource can be touched.
+- name: Refuse the role's binary transaction on a retained node
+  ansible.builtin.fail:
+    msg: >-
+      A retained-node host cannot run this role's binary transaction. Use the Go
+      billet host-upgrade path instead, then converge the unchanged binary.
+      No ordinary service or configuration mutation has been admitted.
+  when: billet_retirement_node_ordinary | bool and billet_binary_upgrade | default(false) | bool

@@ -96,11 +96,11 @@
   vars:
     billet_gate_task: "{{ billet_gate_main_source[-1].block | selectattr('name', 'equalto', item.name) | first }}"
   loop:
-    - {name: Record the service account and provision the authority locks on an existing installation, condition: []}
+    - {name: Record the service account and provision the authority locks on an existing installation, condition: 'not billet_retirement_node_ordinary | bool'}
     - {name: Refuse a guest network on a provider that has none, condition: 'not billet_firecracker_enabled'}
     - {name: Configure billet account and files, condition: []}
-    - {name: Record the service account and provision the authority locks on a fresh host, condition: []}
-    - {name: Mount the control-plane ledger volume fail closed, condition: 'billet_ledger_volume_id | length > 0'}
+    - {name: Record the service account and provision the authority locks on a fresh host, condition: 'not billet_retirement_node_ordinary | bool'}
+    - {name: Mount the control-plane ledger volume fail closed, condition: ['billet_ledger_volume_id | length > 0', 'not billet_retirement_node_ordinary | bool']}
     - name: Install the EC2 cache TLS material
       condition:
         - billet_effective_config.node is defined
@@ -111,7 +111,7 @@
     - {name: Remove disabled Ceph kernel module policy, condition: 'not billet_ceph_enabled'}
     - {name: Configure or remove Ceph health alerts, condition: []}
     - {name: Configure or remove the guest image refresh timer, condition: []}
-    - {name: Configure or remove the deployment backup timer, condition: []}
+    - {name: Configure or remove the deployment backup timer, condition: 'not billet_retirement_node_ordinary | bool'}
     - {name: Configure billet services, condition: []}
   loop_control:
     label: "{{ item.name }}"

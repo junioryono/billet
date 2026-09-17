@@ -109,6 +109,7 @@
     - billet_previous_config.get('server') is mapping
     - billet_effective_config.get('server') is mapping
     - not billet_interrupted_upgrade | bool
+    - not billet_retirement_node_ordinary | bool
 
 - name: Refuse to move installed node state implicitly
   ansible.builtin.assert:
@@ -522,7 +523,9 @@
   # reaches the log — the same rule the App private key's install follows.
   no_log: true
   become: true
-  when: billet_server_environment | length > 0
+  when:
+    - billet_server_environment | length > 0
+    - not billet_retirement_node_ordinary | bool
 
 # THE LEDGER'S TRUST ANCHOR, when the ledger is somewhere that needs one.
 #
@@ -540,7 +543,9 @@
     mode: "0644"
   register: billet_state_ca_bundle_install
   become: true
-  when: billet_state_ca_bundle_src | length > 0
+  when:
+    - billet_state_ca_bundle_src | length > 0
+    - not billet_retirement_node_ordinary | bool
 
 # WHOSE FILE IT IS, recorded beside it — the msmtprc sidecar's shape, for the
 # same reason: the removal below must never take a file an operator wrote
@@ -553,7 +558,9 @@
     group: root
     mode: "0600"
   become: true
-  when: billet_server_environment | length > 0
+  when:
+    - billet_server_environment | length > 0
+    - not billet_retirement_node_ordinary | bool
 
 - name: Inspect ownership of the billet server environment
   ansible.builtin.stat:
@@ -561,7 +568,9 @@
   register: billet_server_environment_marker
   check_mode: false
   become: true
-  when: billet_server_environment | length == 0
+  when:
+    - billet_server_environment | length == 0
+    - not billet_retirement_node_ordinary | bool
 
 # AND REMOVED WHEN IT IS NO LONGER CONFIGURED, which is not tidiness.
 #
@@ -587,3 +596,4 @@
   when:
     - billet_server_environment | length == 0
     - billet_server_environment_marker.stat.exists | default(false)
+    - not billet_retirement_node_ordinary | bool

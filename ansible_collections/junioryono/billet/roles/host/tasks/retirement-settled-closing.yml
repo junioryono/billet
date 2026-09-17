@@ -1,0 +1,70 @@
+---
+# This read-only boundary has no main.yml caller until retained activation.
+# The current command answer supplies permission; a preceding answer cannot.
+- name: Forget the preceding settled closing result
+  ansible.builtin.set_fact:
+    billet_retirement_closing_result: {}
+    billet_retirement_closing_binding: {}
+
+- name: Obtain a bound settled closing observation
+  block:
+    - name: Check settled closing through the retirement command
+      ansible.builtin.command:
+        argv: >-
+          {{ ['timeout', '-k', '10', billet_retire_classify_bound | string,
+              billet_retirement_answerer, 'server', 'retire', '--check-settled-closing', '--json',
+              '--run', billet_exclusion_holder, '--expected-holder', billet_exclusion_holder,
+              '--expected-guard', billet_exclusion_id, '--retiring-host', inventory_hostname,
+              '--transition', billet_retirement_classification.journal.transition_id,
+              '--config', billet_ordinary_config_path] }}
+        expand_argument_vars: false
+      register: billet_retirement_closing_raw
+      ignore_unreachable: true
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      become: true
+
+    - name: Parse the settled closing answer
+      ansible.builtin.include_tasks: retire-settled-answer.yml
+      vars:
+        billet_retire_settled_raw: "{{ billet_retirement_closing_raw }}"
+        billet_retire_settled_purpose: settled-closing
+
+    - name: Bind settled closing to this holder and classification
+      ansible.builtin.assert:
+        that:
+          - billet_retire_settled_answer.run == billet_exclusion_holder
+          - billet_retire_settled_answer.guard == billet_exclusion_id
+          - billet_retire_settled_answer.retiring == inventory_hostname
+          - billet_retire_settled_answer.transition_id == billet_retirement_classification.journal.transition_id
+          - billet_retire_settled_answer.variant == billet_retirement_classification.journal.variant
+          - billet_retire_settled_answer.deployment == billet_retirement_entry_result.deployment
+        fail_msg: >-
+          Retirement's settled-closing answer does not bind this holder, guard, host,
+          transition and variant to the classifier; ordinary convergence remains closed.
+
+    - name: Record the bound settled closing observation
+      ansible.builtin.set_fact:
+        billet_retirement_closing_result: "{{ billet_retire_settled_answer }}"
+        billet_retirement_closing_binding:
+          purpose: settled-closing
+          run: "{{ billet_retire_settled_answer.run }}"
+          guard: "{{ billet_retire_settled_answer.guard }}"
+          retiring: "{{ billet_retire_settled_answer.retiring }}"
+          deployment: "{{ billet_retire_settled_answer.deployment }}"
+          transition_id: "{{ billet_retire_settled_answer.transition_id }}"
+          variant: "{{ billet_retire_settled_answer.variant }}"
+
+  rescue:
+    - name: Keep ordinary work closed after a settled closing refusal
+      ansible.builtin.set_fact:
+        billet_retirement_closing_result: {}
+        billet_retirement_closing_binding: {}
+        billet_retirement_node_verified: false
+        billet_retirement_node_ordinary: false
+        billet_retirement_bypass: true
+
+    - name: Report the settled closing refusal
+      ansible.builtin.fail:
+        msg: "{{ ansible_failed_result.msg | default('The settled-closing command did not answer; ordinary convergence remains closed.') }}"

@@ -1,0 +1,57 @@
+---
+- name: Plant classification and stale observations without routing ordinary work
+  ansible.builtin.set_fact:
+    billet_retirement_answerer: /usr/bin/billet
+    billet_exclusion_holder: ci-1
+    billet_exclusion_id: '11111111111111111111111111111111'
+    billet_retirement_classification:
+      journal:
+        transition_id: '22222222222222222222222222222222'
+        variant: "{{ billet_gate_settled_case.classified_variant | default('retained-node') }}"
+    billet_retirement_entry_result: {stale: true, deployment: dddddddddddddddddddddddddddddddd}
+    billet_retirement_entry_binding: {stale: true}
+    billet_retirement_closing_result: {stale: true}
+    billet_retirement_closing_binding: {stale: true}
+    billet_retirement_node_verified: true
+    billet_retirement_node_ordinary: false
+    billet_retirement_bypass: true
+    billet_gate_settled_refused: false
+
+- name: Call the production settled boundary
+  block:
+    - name: Include the real settled command and parser
+      ansible.builtin.include_role:
+        name: junioryono.billet.host
+        tasks_from: "retirement-settled-{{ billet_gate_settled_mode }}"
+  rescue:
+    - name: Require the caller to preserve the intended refusal
+      ansible.builtin.assert:
+        that:
+          - ansible_failed_task.name == ('Report the settled ' ~ billet_gate_settled_mode ~ ' refusal')
+          - billet_gate_settled_case.refuses
+          - billet_gate_settled_case.reason in ansible_failed_result.msg
+          - billet_gate_settled_case.why in ansible_failed_result.msg
+    - name: Record the refused settled observation
+      ansible.builtin.set_fact:
+        billet_gate_settled_refused: true
+
+- name: Require the exact verdict and no ordinary activation
+  ansible.builtin.assert:
+    that:
+      - billet_gate_settled_refused is sameas billet_gate_settled_case.refuses
+      - billet_retirement_node_ordinary is sameas false
+      - billet_retirement_bypass is sameas true
+      - billet_retirement_node_verified is sameas (not billet_gate_settled_case.refuses)
+      - billet_gate_result == ({} if billet_gate_settled_case.refuses else billet_gate_settled_case.answer)
+      - billet_gate_binding == ({} if billet_gate_settled_case.refuses else billet_gate_expected_binding)
+  vars:
+    billet_gate_result: "{{ billet_retirement_entry_result if billet_gate_settled_mode == 'entry' else billet_retirement_closing_result }}"
+    billet_gate_binding: "{{ billet_retirement_entry_binding if billet_gate_settled_mode == 'entry' else billet_retirement_closing_binding }}"
+    billet_gate_expected_binding:
+      purpose: "settled-{{ billet_gate_settled_mode }}"
+      run: ci-1
+      guard: '11111111111111111111111111111111'
+      retiring: control-a
+      deployment: dddddddddddddddddddddddddddddddd
+      transition_id: '22222222222222222222222222222222'
+      variant: retained-node

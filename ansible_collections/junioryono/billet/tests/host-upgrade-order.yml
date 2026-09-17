@@ -1383,3 +1383,6 @@
 
 - name: Exercise the final ordinary reader slice
   ansible.builtin.import_playbook: reader-inputs.yml
+
+- name: Retained ordinary exclusions and binary refusal
+  ansible.builtin.import_playbook: retained-guards.yml

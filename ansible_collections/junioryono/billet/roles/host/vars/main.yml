@@ -58,18 +58,13 @@ billet_migration_start_bound: 150
 # finds its own identity directory outside ReadWritePaths under
 # ProtectSystem=strict.
 #
-# THE ABSENT-SERVER DEFAULT STAYS UNTIL THE RETAINED ROUTE REFUSES THE
-# TRANSACTION. §3.2 of the 5d design wants a serverless effective configuration
-# to have no operative server path, and that is safe only once a retained host
-# refuses the role's binary transaction (§2.2). It does not yet: the transaction
-# block in services.yml is gated on billet_binary_upgrade alone, NOT on server
-# enablement, so a node-only host upgrading its binary runs it. Answering ''
-# here empties billet_server_directories, /var/lib/billet/server is never
-# created, and the transaction's fence — an ansible.builtin.copy, which does not
-# create parent directories — fails on a host that has done nothing wrong.
-# Giving the candidate a placeholder in upgrade-inspect.yml does not save it:
-# the fence needs the DIRECTORY, not the path. Commit 3 introduces the refusal
-# and the emptiness together.
+# EMPTINESS BELONGS ONLY TO THE RETAINED ORDINARY ROUTE, where
+# retirement-binary-refusal.yml refuses the role's binary transaction before
+# ordinary work. A never-controller node-only host still runs that transaction:
+# its fence writes <server state dir>/billet.maintenance with copy, which cannot
+# create parent directories. Keep the default directory for that host, including
+# serverless E; a candidate placeholder alone cannot supply the directory.
+# Retained hosts have no operative server directory and must not recreate one.
 #
 # HERE RATHER THAN INLINE so there is ONE definition: upgrade-inspect.yml sets
 # the candidate fact from it and the server unit template reads that fact, and a
@@ -78,9 +73,10 @@ billet_migration_start_bound: 150
 # the two cannot share, and both must read both spellings.
 billet_configured_server_state_dir: >-
   {{
-    billet_effective_config.get('server', {}).get('identity_dir')
-    or billet_effective_config.get('server', {}).get('state_dir')
-    or '/var/lib/billet/server'
+    '' if billet_retirement_node_ordinary | default(false) | bool else
+    (billet_effective_config.get('server', {}).get('identity_dir')
+     or billet_effective_config.get('server', {}).get('state_dir')
+     or '/var/lib/billet/server')
   }}
 
 # billet_configured_state_backend is where THIS RUN'S EFFECTIVE configuration

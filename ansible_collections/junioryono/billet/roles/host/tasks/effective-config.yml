@@ -1,6 +1,9 @@
 ---
 # Only an admitted ordinary route consumes desired configuration. The retained
 # branch has no main.yml admission until its command-owned preflights exist.
+- name: Refuse retained binary transactions before ordinary input or host mutation
+  ansible.builtin.import_tasks: retirement-binary-refusal.yml
+
 - name: Require ordinary admission before reading effective configuration
   ansible.builtin.assert:
     that:
