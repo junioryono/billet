@@ -32,6 +32,16 @@
         (billet_gate_services | selectattr('name', 'equalto', 'Stop and disable the billet node unless it may run here') | first).when ==
         ['not billet_node_should_run', 'not ansible_check_mode']
 
-- name: Exercise the unchanged production restart predicate on each ordinary shape
+# The restart predicate cannot be applied here: it is read out of a task file and
+# Ansible refuses a template from an untrusted source. Its shape is pinned
+# instead — the shared conditions this case is about, and one disjunction over
+# the install results, which reader-environment-case.yml exercises as a copy.
+- name: Require the restart predicate to keep its shared ordinary conditions
   ansible.builtin.assert:
-    that: "{{ (billet_gate_services | selectattr('name', 'equalto', 'Restart the billet node after non-binary inputs change') | first).when }}"
+    that:
+      - >-
+        (billet_gate_services | selectattr('name', 'equalto', 'Restart the billet node after non-binary inputs change') | first).when[:4] ==
+        ['billet_node_should_run', 'not ansible_check_mode', 'not billet_binary_upgrade | default(false)',
+         'not billet_endpoint_migrated | default(false) | bool']
+      - >-
+        (billet_gate_services | selectattr('name', 'equalto', 'Restart the billet node after non-binary inputs change') | first).when | length == 5

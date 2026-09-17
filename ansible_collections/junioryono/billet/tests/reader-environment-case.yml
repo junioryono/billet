@@ -85,12 +85,37 @@
         billet_server_environment_install: {changed: false}
         billet_unit_templates_by_unit: "{{ {'billet-node.service': billet_gate_projected_unit} }}"
 
-    - name: Require projection alone to leave the production restart predicate false
+    # THE PREDICATE IS PINNED AS TEXT AND EXERCISED AS A COPY. It was read out of
+    # a task file, and Ansible refuses to evaluate a template from an untrusted
+    # source, so the production clause cannot be applied here; the copy below is
+    # the same disjunction written in this playbook, where it is trusted. A change
+    # to the production predicate fails the pin rather than passing silently.
+    - name: Pin the production restart predicate
       vars:
         billet_gate_service_tasks: "{{ lookup('ansible.builtin.file', billet_gate_role + '/tasks/services.yml') | from_yaml }}"
         billet_gate_restart_task: "{{ billet_gate_service_tasks | selectattr('name', 'equalto', 'Restart the billet node after non-binary inputs change') | first }}"
       ansible.builtin.assert:
-        that: "{{ ['not (' ~ billet_gate_restart_task.when[-1] ~ ')'] }}"
+        that:
+          - >-
+            billet_gate_restart_task.when[-1] | regex_replace('\\s+', ' ') | trim ==
+            "billet_config_install.changed | default(false) or billet_firecracker_install.changed | default(false) or
+            billet_firecracker_links.changed | default(false) or (billet_server_environment | default({}) | length > 0 and
+            billet_server_environment_install.changed | default(false)) or
+            (billet_unit_templates_by_unit.values() | selectattr('changed', 'equalto', true) | list | length > 0)"
+            | regex_replace('\\s+', ' ') | trim
+        fail_msg: >-
+          The production restart predicate changed; this gate exercises a copy of it
+          and the copy must be updated with it. Production now reads
+          {{ billet_gate_restart_task.when[-1] }}.
+
+    - name: Require projection alone to leave the restart predicate false
+      ansible.builtin.assert:
+        that:
+          - >-
+            not (billet_config_install.changed | default(false) or billet_firecracker_install.changed | default(false) or
+            billet_firecracker_links.changed | default(false) or (billet_server_environment | default({}) | length > 0 and
+            billet_server_environment_install.changed | default(false)) or
+            (billet_unit_templates_by_unit.values() | selectattr('changed', 'equalto', true) | list | length > 0))
 
     - name: Require typed optionality and filename preservation in the rendered bytes
       ansible.builtin.assert:
