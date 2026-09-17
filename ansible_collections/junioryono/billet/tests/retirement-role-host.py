@@ -14,6 +14,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import stat
 import subprocess
 import sys
 
@@ -262,13 +263,23 @@ def prepare(scenario, retained):
         # alias. The retained leg must leave whatever the seed left there exactly
         # as it found it, so its state before the pass is recorded for the
         # comparison rather than asserted away.
+        # What may be inside it is the binary transaction's fence and nothing
+        # else: identity, state or a ledger there would mean the seed bootstrapped
+        # a controller, and the retained leg would then be measuring a host that
+        # never was node-only.
         server_dir = pathlib.Path('/var/lib/billet/server')
         try:
             before = server_dir.lstat()
-            write(root() / 'server-dir-before.json',
-                  dict(present=True, mode=before.st_mode, uid=before.st_uid, gid=before.st_gid))
         except FileNotFoundError:
-            write(root() / 'server-dir-before.json', dict(present=False))
+            write(root() / 'server-dir-before.json', dict(present=False, entries=[]))
+        else:
+            entries = sorted(entry.name for entry in server_dir.iterdir())
+            if not stat.S_ISDIR(before.st_mode) or set(entries) - {'billet.maintenance'}:
+                raise ValueError('node-only seed left more than a fence in /var/lib/billet/server: '
+                                 + repr(entries))
+            write(root() / 'server-dir-before.json',
+                  dict(present=True, mode=before.st_mode, uid=before.st_uid, gid=before.st_gid,
+                       entries=entries))
         pathlib.Path('/etc/systemd/system/billet-server.service').unlink()
         MODEL.mkdir()
         (MODEL / 'archive').mkdir()
