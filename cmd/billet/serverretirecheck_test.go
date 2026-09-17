@@ -341,11 +341,13 @@ func TestRetirementNodeConfigPlantedReadersRefuseBeforeMutation(t *testing.T) {
 			case "transaction root":
 				operations.Filesystem = append(operations.Filesystem, retireFilesystemOperation{Kind: "delete", Path: upgradeRoot})
 			case "controller unit":
-				// THE FIXTURE'S UNIT DIRECTORY, not the literal system one: the
-				// inspector's directories are redirected here, and protection is
-				// built from them, so a hardcoded /etc/systemd/system path would
-				// be admitted for being outside this host's units entirely.
-				operations.Filesystem = append(operations.Filesystem, retireFilesystemOperation{Kind: "write", Path: filepath.Join(f.unitsDir, serverUnit)})
+				// THE INSPECTOR'S OWN UNIT DIRECTORY, not the literal system one
+				// and not the fake manager's property directory: protection is
+				// built from the directories the inspector reports, which the
+				// fixture redirects, so any other path would be admitted for
+				// being outside this host's units entirely.
+				operations.Filesystem = append(operations.Filesystem, retireFilesystemOperation{
+					Kind: "write", Path: filepath.Join(retireOperationInspector().OperationUnitDirectories()[0], serverUnit)})
 			case "changed node name":
 				rendering = strings.Replace(rendering, "node-a", "node-b", 1)
 				want = retireReasonIdentity

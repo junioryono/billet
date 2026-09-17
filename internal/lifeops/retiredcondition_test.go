@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -114,5 +115,24 @@ func TestRetiredConditionEvidenceExemptsOnlyIncomingRuntimeEdges(t *testing.T) {
 				t.Fatalf("%s did not refuse at %s: %v", hazard, want, err)
 			}
 		})
+	}
+}
+
+// Every retirement fixture redirects these directories, so nothing else would
+// notice one disappearing from the default: unit protection is built from this
+// list, and a directory missing here is a directory nothing protects.
+func TestTheDefaultUnitDirectoriesAreEverySystemdSearchPath(t *testing.T) {
+	have := (&Inspector{}).OperationUnitDirectories()
+	for _, dir := range []string{"/etc/systemd/system", "/run/systemd/system", "/etc/systemd/system.control",
+		"/run/systemd/system.control", "/run/systemd/transient", "/run/systemd/generator.early",
+		"/run/systemd/generator", "/run/systemd/generator.late", "/usr/local/lib/systemd/system",
+		"/usr/lib/systemd/system", "/lib/systemd/system"} {
+		if !slices.Contains(have, dir) {
+			t.Fatalf("%s is not protected as a unit directory: %v", dir, have)
+		}
+	}
+	redirected := (&Inspector{operationUnitDirs: []string{"/tmp/units"}}).OperationUnitDirectories()
+	if len(redirected) != 1 || redirected[0] != "/tmp/units" {
+		t.Fatalf("a redirect must replace the defaults exactly: %v", redirected)
 	}
 }
