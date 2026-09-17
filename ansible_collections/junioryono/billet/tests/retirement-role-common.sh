@@ -20,10 +20,12 @@ r_role_case() { # scenario retained|control [case-name]
 done
 rm -rf /etc/systemd/system/billet-* /etc/systemd/system/var-lib-billet-server.mount
 mkdir -p /usr/local/bin /etc/systemd/network /etc/sysctl.d /etc/modules-load.d
+# The version is part of the planted names: all-host validation requires a
+# vMAJOR.MINOR.PATCH release, so a made-up word here fails before any task runs.
 for binary in firecracker jailer; do
-  printf "#!/bin/sh\nexit 0\n" >"/usr/local/bin/$binary-gate"
-  chmod 0755 "/usr/local/bin/$binary-gate"
-  ln -sf "$binary-gate" "/usr/local/bin/$binary"
+  printf "#!/bin/sh\nexit 0\n" >"/usr/local/bin/$binary-v1.16.1"
+  chmod 0755 "/usr/local/bin/$binary-v1.16.1"
+  ln -sf "$binary-v1.16.1" "/usr/local/bin/$binary"
 done
 printf "#!/bin/sh\nexit 0\n" >/usr/sbin/nft
 chmod 0755 /usr/sbin/nft'

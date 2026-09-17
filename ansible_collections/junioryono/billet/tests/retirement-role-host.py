@@ -196,7 +196,7 @@ def base_variables():
     return dict(billet_binary_src='', billet_enable_server=False, billet_enable_node=True,
                 billet_firecracker_enabled=True, billet_ceph_enabled=False, billet_automatic_updates=False,
                 billet_service_user='billetgate', billet_service_group='billetgate',
-                billet_firecracker_version='gate', billet_firecracker_stage='/var/lib/billet/firecracker-stage',
+                billet_firecracker_version='v1.16.1', billet_firecracker_stage='/var/lib/billet/firecracker-stage',
                 billet_migration_controller='control-b', billet_github_private_key_src='',
                 billet_cache_tls_cert_src='', billet_cache_tls_key_src='',
                 billet_guest_dns_servers=['1.1.1.1'],
