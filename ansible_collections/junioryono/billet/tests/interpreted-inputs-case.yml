@@ -31,11 +31,18 @@
         name: junioryono.billet.host
         tasks_from: validate-interpreted-inputs
   rescue:
+    # A LOOPED ASSERT REPORTS ITS OWN AGGREGATE MESSAGE, not the fail_msg of the
+    # item that refused, so the member's name is looked for in both.
     - name: Require refusal by the inventory member's name
       ansible.builtin.assert:
         that:
           - billet_gate_input_case.refuses | length > 0
-          - billet_gate_input_case.refuses in ansible_failed_result.msg
+          - billet_gate_input_case.refuses in billet_gate_input_diagnostic
+        fail_msg: "{{ billet_gate_input_case.refuses }} is not named by: {{ billet_gate_input_diagnostic }}"
+      vars:
+        billet_gate_input_diagnostic: >-
+          {{ ansible_failed_result.msg | default('') ~ ' '
+             ~ (ansible_failed_result.results | default([]) | map(attribute='msg') | select('string') | join(' ')) }}
     - name: Record the expected input refusal
       ansible.builtin.set_fact:
         billet_gate_input_refused: true
