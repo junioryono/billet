@@ -1,7 +1,19 @@
 ---
-- name: Supply the route and the production original-policy calculation
+# The original-policy calculation is pinned as exact text and evaluated as a copy:
+# read out of main.yml through lookup, it is never re-templated, so a fact set
+# from it would hold the literal `{{ ... }}` and compare equal to no Boolean.
+- name: Pin the production original-policy calculation
+  ansible.builtin.assert:
+    that:
+      - >-
+        billet_gate_requested['ansible.builtin.set_fact'].billet_requested_server_should_run[2:-2].split() | join(' ')
+        == 'billet_enable_server and not (billet_server_prepare_only | default(false))'
+    fail_msg: >-
+      The original-policy calculation changed; update the copy below with it.
+
+- name: Supply the route and a copy of the production original-policy calculation
   ansible.builtin.set_fact:
-    billet_requested_server_should_run: "{{ billet_gate_requested['ansible.builtin.set_fact'].billet_requested_server_should_run }}"
+    billet_requested_server_should_run: "{{ billet_enable_server and not (billet_server_prepare_only | default(false)) }}"
     billet_retirement_route: "{{ billet_gate_policy.route }}"
     billet_retirement_bypass: "{{ billet_gate_policy.bypass }}"
     billet_retirement_node_verified: "{{ billet_gate_policy.verified }}"

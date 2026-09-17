@@ -86,20 +86,41 @@
         billet_service_types_by_unit: "{{ [{'item': 'billet-node.service', 'rc': 0, 'stdout': 'notify'}, {'item': 'billet-server.service', 'rc': 0, 'stdout': 'exec'}] | junioryono.billet.unit_results }}"
         billet_unit_templates_by_unit: "{{ [{'item': {'key': 'billet-node.service'}, 'changed': false}, {'item': {'key': 'billet-server.service'}, 'changed': true}] | junioryono.billet.unit_results }}"
 
+    # THE INSTALL TASK'S LOOP AND READINESS OPERAND ARE PINNED AS EXACT TEXT and
+    # exercised as copies. Read out of account.yml through lookup, neither is ever
+    # re-templated: the loop is the literal `{{ ... }}` string, so mapping `key`
+    # over it walks characters, and the readiness operand is a string that is
+    # `sameas` no Boolean. The copies below are what the keyed lookup actually
+    # computes for each unit.
+    - name: Pin the install task's unit loop and readiness operand
+      ansible.builtin.assert:
+        that:
+          - billet_gate_install.loop[2:-2].split() | join(' ') == 'billet_unit_operands | dict2items'
+          - >-
+            billet_gate_install.vars.billet_systemd_notify_ready[2:-2].split() | join(' ')
+            == "billet_service_types_by_unit[item.key].rc == 0 and (billet_service_types_by_unit[item.key].stdout | trim) == 'notify'"
+
     - name: Require the rendered unit to consume its own observations
       ansible.builtin.assert:
         that:
           - billet_unit_operands.keys() | list == ['billet-node.service']
-          - billet_gate_install.loop | map(attribute='key') | list == ['billet-node.service']
-          - billet_gate_install.vars.billet_systemd_notify_ready is sameas true
+          - billet_unit_operands | dict2items | map(attribute='key') | list == ['billet-node.service']
+          - >-
+            (billet_service_types_by_unit[item.key].rc == 0 and
+             (billet_service_types_by_unit[item.key].stdout | trim) == 'notify') is sameas true
           - billet_unit_templates_by_unit['billet-node.service'].changed is sameas false
           - billet_unit_templates_by_unit['billet-server.service'].changed is sameas true
       vars:
         item: {key: billet-node.service}
 
+    # Keyed by unit, so the server's `exec` cannot leak into the node's readiness
+    # and the node's `notify` cannot leak into the server's.
     - name: Require the server observation to remain independent
       ansible.builtin.assert:
-        that: billet_gate_install.vars.billet_systemd_notify_ready is sameas false
+        that:
+          - >-
+            (billet_service_types_by_unit[item.key].rc == 0 and
+             (billet_service_types_by_unit[item.key].stdout | trim) == 'notify') is sameas false
       vars:
         item: {key: billet-server.service}
 
@@ -264,9 +285,20 @@
       ansible.builtin.set_fact:
         billet_effective_config: {node: {name: effective-node}}
 
-    - name: Render the production full desired eligibility expression
+    # The collection's rendering expression is pinned as exact text and rendered as
+    # a copy: read through lookup it is never re-templated, so a fact set from it
+    # would hold the expression rather than the bytes it renders, and every
+    # comparison below would run against the wrong thing.
+    - name: Pin the production collection rendering expression
+      ansible.builtin.assert:
+        that:
+          - >-
+            billet_gate_render_task['ansible.builtin.set_fact'].billet_retirement_collect_rendering[2:-2].split() | join(' ')
+            == "lookup('ansible.builtin.template', 'billet.yaml.j2', template_vars={'billet_config_document': billet_retirement_collect_vars.billet_config})"
+
+    - name: Render the full desired eligibility document through a copy of the production expression
       ansible.builtin.set_fact:
-        billet_gate_full_desired: "{{ billet_gate_render_task['ansible.builtin.set_fact'].billet_retirement_collect_rendering }}"
+        billet_gate_full_desired: "{{ lookup('ansible.builtin.template', 'billet.yaml.j2', template_vars={'billet_config_document': billet_retirement_collect_vars.billet_config}) }}"
       vars:
         ansible_search_path: ["{{ playbook_dir }}/../roles/host"]
 

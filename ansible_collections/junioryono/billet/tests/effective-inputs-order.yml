@@ -4,9 +4,14 @@
 - name: Require original public policy before retirement masking
   ansible.builtin.assert:
     that:
+      # Pinned as exact text: read through lookup, the calculation is never
+      # re-templated, so `is sameas true` on it could only ever be false. The
+      # copy below proves the calculation answers true for an enabled server.
       - >-
         (billet_gate_main_source | selectattr('name', 'equalto', 'Derive whether the billet server may run on this host') | first)
-        ['ansible.builtin.set_fact'].billet_requested_server_should_run is sameas true
+        ['ansible.builtin.set_fact'].billet_requested_server_should_run[2:-2].split() | join(' ')
+        == 'billet_enable_server and not (billet_server_prepare_only | default(false))'
+      - (billet_enable_server and not (billet_server_prepare_only | default(false))) is sameas true
       - >-
         (billet_gate_request_source | selectattr('name', 'equalto', 'Require a policy that leaves the retiring server stopped') | first)
         ['ansible.builtin.assert'].that == 'billet_requested_server_should_run | default(none) is sameas false'
@@ -29,12 +34,15 @@
       - >-
         "template_vars={'billet_config_document': billet_effective_config}"
         in billet_gate_endpoint_source
+      # The two bindings are text: a `vars:` value read through lookup is never
+      # re-templated, so comparing it to the effective document's VALUE compares a
+      # literal `{{ ... }}` to a mapping and can only fail.
       - >-
         (billet_gate_account_source | selectattr('name', 'equalto', 'Stage candidate configuration for the upgrade transaction') | first)
-        .vars.billet_config_document == billet_effective_config
+        .vars.billet_config_document[2:-2].split() | join(' ') == 'billet_effective_config'
       - >-
         (billet_gate_account_source | selectattr('name', 'equalto', 'Render billet configuration') | first)
-        .vars.billet_config_document == billet_effective_config
+        .vars.billet_config_document[2:-2].split() | join(' ') == 'billet_effective_config'
   vars:
     billet_config: {server: {state_dir: /var/lib/billet/inventory}}
 

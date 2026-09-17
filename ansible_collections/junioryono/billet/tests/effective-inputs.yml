@@ -79,6 +79,14 @@
     billet_endpoint_no_billet: false
     billet_endpoint_answerer: /usr/bin/billet
     billet_node_should_run: true
+    # THE PORT IS A COPY OF THE ROLE DEFAULT'S EXPRESSION, written here where it is
+    # trusted. The firewall template reads billet_image_verify_port, a role default
+    # this play does not load, and the default itself cannot be evaluated from the
+    # file (it arrives through lookup, which Ansible will not re-template). A
+    # literal 8729 would make the port half of the firewall assertion true however
+    # the reader was written; this copy resolves from E, and the loop below pins
+    # the production default to naming exactly this path with this fallback.
+    billet_image_verify_port: "{{ billet_effective_config.node.firecracker.image_verify_port | default(7719, true) }}"
     billet_networks: [{name: effective0, address: 172.31.0.1, prefix: 24}]
     billet_guest_denied_ipv4: [10.0.0.0/8]
     billet_guest_denied_ipv6: ['fc00::/7']
@@ -95,11 +103,6 @@
     - name: Load the production ordinary aliases
       ansible.builtin.include_vars:
         file: "{{ billet_gate_role }}/vars/main.yml"
-
-    - name: Resolve the production key facts for validation
-      ansible.builtin.set_fact:
-        billet_github_key_path: "{{ billet_gate_keys['ansible.builtin.set_fact'].billet_github_key_path }}"
-        billet_github_key_path_is_string: "{{ billet_gate_keys['ansible.builtin.set_fact'].billet_github_key_path_is_string }}"
 
     # THE TWO ALIASES ARE EVALUATED, and they are the only readers here that can
     # be: `include_vars` PARSES vars/main.yml, so its values template normally.
@@ -367,16 +370,43 @@
           - billet_node_directories | map(attribute='path') | list == ['/var/lib/billet/effective-node', '/var/lib/billet/health', '/var/lib/billet/upgrades', '/var/cache/billet-provision', '/srv/jailer', '/usr/local/libexec']
           - billet_common_directories | map(attribute='path') | list == ['/etc/billet', '/etc/billet/network', '/var/lib/billet']
 
-    - name: Read I through the production installed configuration expression
+    # THE THREE INSTALLED-OBSERVATION EXPRESSIONS ARE PINNED AS EXACT TEXT, then
+    # evaluated as copies written here. They cannot be evaluated from the task
+    # file: a template read through lookup is never re-templated, so a fact set
+    # from one holds the literal `{{ ... }}` and every comparison against a path
+    # fails whatever the expression reads. Pinning the text (braces stripped,
+    # whitespace collapsed) means a production change fails here rather than
+    # leaving the copy below to prove something production no longer does.
+    - name: Pin the production installed-observation expressions
+      ansible.builtin.assert:
+        that:
+          - item.source[2:-2].split() | join(' ') == item.expected
+        fail_msg: >-
+          {{ item.fact }} is now `{{ item.source }}`, which this gate no longer
+          exercises; update the copy below with it.
+      loop:
+        - fact: billet_previous_config
+          source: "{{ (billet_gate_account | selectattr('name', 'equalto', 'Keep installed configuration separate from effective input') | first)['ansible.builtin.set_fact'].billet_previous_config }}"
+          expected: "(billet_previous_config_file.content | b64decode | from_yaml) if billet_previous_config_file.content is defined else {}"
+        - fact: billet_previous_server_state_dir
+          source: "{{ billet_gate_previous_server['ansible.builtin.set_fact'].billet_previous_server_state_dir }}"
+          expected: "(billet_previous_config.server.get('identity_dir') or billet_previous_config.server.get('state_dir') or '/var/lib/billet/server') if billet_previous_config.get('server') is mapping else ''"
+        - fact: billet_previous_node_state_dir
+          source: "{{ billet_gate_previous_node['ansible.builtin.set_fact'].billet_previous_node_state_dir }}"
+          expected: "billet_previous_config.node.get('state_dir', '/var/lib/billet/node') if billet_previous_config.get('node') is mapping else ''"
+      loop_control:
+        label: "{{ item.fact }}"
+
+    - name: Read the installed file through a copy of the production expression
       ansible.builtin.set_fact:
-        billet_previous_config: "{{ (billet_gate_account | selectattr('name', 'equalto', 'Keep installed configuration separate from effective input') | first)['ansible.builtin.set_fact'].billet_previous_config }}"
+        billet_previous_config: "{{ (billet_previous_config_file.content | b64decode | from_yaml) if billet_previous_config_file.content is defined else {} }}"
 
     # The two installed observations are separate facts, so a refusal names the one
     # directory that moved.
-    - name: Derive both installed observations through the production expressions
+    - name: Derive both installed observations through copies of the production expressions
       ansible.builtin.set_fact:
-        billet_previous_server_state_dir: "{{ billet_gate_previous_server['ansible.builtin.set_fact'].billet_previous_server_state_dir }}"
-        billet_previous_node_state_dir: "{{ billet_gate_previous_node['ansible.builtin.set_fact'].billet_previous_node_state_dir }}"
+        billet_previous_server_state_dir: "{{ (billet_previous_config.server.get('identity_dir') or billet_previous_config.server.get('state_dir') or '/var/lib/billet/server') if billet_previous_config.get('server') is mapping else '' }}"
+        billet_previous_node_state_dir: "{{ billet_previous_config.node.get('state_dir', '/var/lib/billet/node') if billet_previous_config.get('node') is mapping else '' }}"
 
     # EACH READS THE INSTALLED FILE, not E and not inventory. All three name a
     # different directory, so answering from the wrong one fails here.
