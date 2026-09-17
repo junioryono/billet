@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -57,6 +58,16 @@ func (i *Inspector) ProveRetiredConditionEvidence(ctx context.Context, unit, mar
 	return RetiredConditionEvidence{unit: unit, marker: marker}, nil
 }
 
+// A masked fragment is the null device itself or a name that resolves to it; a
+// symlink to anything else, or one that cannot be resolved, is not a mask.
+func nullFragment(path string) bool {
+	if path == os.DevNull {
+		return true
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	return err == nil && resolved == os.DevNull
+}
+
 func (proof RetiredConditionEvidence) proveProperties(props map[string][]string) error {
 	if err := requireOperationProperties(proof.unit, props, []string{"LoadState", "UnitFileState", "FragmentPath", "NeedDaemonReload"}); err != nil {
 		return err
@@ -65,7 +76,7 @@ func (proof RetiredConditionEvidence) proveProperties(props map[string][]string)
 		return fmt.Errorf("retired-inert-reload: %s has a pending or unknown reload", proof.unit)
 	}
 	if proof.persistentMask {
-		if first(props, "LoadState") != "masked" || first(props, "UnitFileState") != "masked" || first(props, "FragmentPath") != "/dev/null" {
+		if first(props, "LoadState") != "masked" || first(props, "UnitFileState") != "masked" || !nullFragment(first(props, "FragmentPath")) {
 			return fmt.Errorf("retired-inert-mask: %s is not persistently masked at /dev/null", proof.unit)
 		}
 	} else if first(props, "LoadState") != "loaded" {

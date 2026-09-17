@@ -386,6 +386,16 @@ func reconcileRetireInert(ctx context.Context, m retireMode, j retirement.Journa
 // All five proof boundaries share this effective-condition proof. Activity and
 // enablement are separate: installation precedes stop, and settled ordinary
 // work may enable a unit whose condition still prevents every start.
+// The masked fragment is the null device itself or a name for it; a symlink to
+// anything else, or one that cannot be resolved, is not a mask.
+func retireNullFragment(path string) bool {
+	if path == os.DevNull {
+		return true
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	return err == nil && resolved == os.DevNull
+}
+
 func proveRetireInert(ctx context.Context, j retirement.Journal) *retireRefusal {
 	if j.Variant != retirement.VariantRetainedNode {
 		return nil
@@ -399,7 +409,10 @@ func proveRetireInert(ctx context.Context, j retirement.Journal) *retireRefusal 
 		if err != nil {
 			return retireUnknown(retireReasonInertCondition, err.Error(), "")
 		}
-		for _, key := range []string{"LoadState", "NeedDaemonReload", "DropInPaths", "UnitFileState", "FragmentPath"} {
+		// The mask's own two answers are required only where a mask is claimed,
+		// so a unit that answers nothing for them keeps the refusal its own
+		// missing evidence produces rather than a mask diagnostic.
+		for _, key := range []string{"LoadState", "NeedDaemonReload", "DropInPaths"} {
 			if len(props[key]) != 1 {
 				return retireUnknown(retireReasonInertCondition, "missing or repeated "+key+": "+unit, "")
 			}
@@ -416,7 +429,10 @@ func proveRetireInert(ctx context.Context, j retirement.Journal) *retireRefusal 
 		// together, because `masked-runtime` is gone at the next boot and a
 		// mask whose fragment is a real file is not a mask at all.
 		if firstProp(props, "LoadState") == "masked" {
-			if firstProp(props, "UnitFileState") != "masked" || firstProp(props, "FragmentPath") != "/dev/null" {
+			if len(props["UnitFileState"]) != 1 || len(props["FragmentPath"]) != 1 {
+				return retireUnknown(retireReasonInertCondition, "mask evidence could not be observed: "+unit, "")
+			}
+			if firstProp(props, "UnitFileState") != "masked" || !retireNullFragment(firstProp(props, "FragmentPath")) {
 				return retireUnknown(retireReasonInertCondition, "mask is not persistent or does not resolve to /dev/null: "+unit, "")
 			}
 			continue
