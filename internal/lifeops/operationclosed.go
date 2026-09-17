@@ -181,11 +181,15 @@ func (w *operationWalk) admitClosedSet(ctx context.Context) error {
 			return fmt.Errorf("operation-inert-evidence: no protected unit binding")
 		}
 		ev := w.units[proof.unit]
-		if first(ev.props, "LoadState") != "loaded" || first(ev.props, "NeedDaemonReload") != "no" {
-			return fmt.Errorf("operation-inert-evidence: %s is not loaded without a pending reload", proof.unit)
-		}
-		if _, err := w.inspector.ProveRetiredConditionEvidence(ctx, proof.unit, proof.marker); err != nil {
+		if err := proof.proveProperties(ev.props); err != nil {
 			return fmt.Errorf("operation-inert-evidence: %s: %w", proof.unit, err)
+		}
+		fresh, err := w.inspector.ProveRetiredConditionEvidence(ctx, proof.unit, proof.marker)
+		if err != nil {
+			return fmt.Errorf("operation-inert-evidence: %s: %w", proof.unit, err)
+		}
+		if fresh != proof {
+			return fmt.Errorf("operation-inert-evidence: %s changed its inertness proof", proof.unit)
 		}
 	}
 	for _, unit := range own {

@@ -97,35 +97,89 @@ func TestRetirementInertInstallResumesEveryCrashWindow(t *testing.T) {
 // it without a drop-in; a runtime mask and a mask whose fragment is a real file
 // are not that, and must not pass for looking like it.
 func TestRetirementInertProofAcceptsOnlyAPersistentMaskWithoutADropIn(t *testing.T) {
-	for _, shape := range []string{"persistent", "runtime", "real fragment"} {
-		t.Run(shape, func(t *testing.T) {
-			f, j := settledNodeConfigFixture(t)
-			path, err := retireInertDropIn(retireOperationInspector(), serverUnit)
-			mustOK(t, err)
-			mustOK(t, os.Remove(path))
-			setRetireEffect(t, f, serverUnit, "DropInPaths", "")
-			f.manager.set(serverUnit, "LoadState", "masked")
-			f.manager.set(serverUnit, "UnitFileState", "masked")
-			setRetireEffect(t, f, serverUnit, "FragmentPath", "/dev/null")
-			switch shape {
-			case "runtime":
-				f.manager.set(serverUnit, "UnitFileState", "masked-runtime")
-			case "real fragment":
-				fragment := filepath.Join(f.unitsDir, serverUnit)
-				writeFile(t, fragment, "[Unit]\n", 0o644)
-				setRetireEffect(t, f, serverUnit, "FragmentPath", fragment)
-			}
-			out, code := f.runRaw(t, "", settledCheckArgs(t, f, j, retirement.PurposeSettledEntry)...)
-			if shape == "persistent" {
-				if code != 0 {
-					t.Fatalf("a persistent mask was refused: %s", out)
+	mask := func(t *testing.T, f *requestFixture, shape string) {
+		t.Helper()
+		path, err := retireInertDropIn(retireOperationInspector(), serverUnit)
+		mustOK(t, err)
+		mustOK(t, os.Remove(path))
+		setRetireEffect(t, f, serverUnit, "DropInPaths", "")
+		writeFile(t, filepath.Join(f.unitsDir, serverUnit+".Conditions.json"), `{"type":"a(sbbsi)","data":[]}`, 0o600)
+		f.manager.set(serverUnit, "LoadState", "masked")
+		f.manager.set(serverUnit, "UnitFileState", "masked")
+		setRetireEffect(t, f, serverUnit, "FragmentPath", "/dev/null")
+		switch shape {
+		case "runtime":
+			f.manager.set(serverUnit, "UnitFileState", "masked-runtime")
+		case "real fragment":
+			fragment := filepath.Join(f.unitsDir, serverUnit)
+			setRetireEffect(t, f, serverUnit, "FragmentPath", fragment)
+		case "reload":
+			setRetireEffect(t, f, serverUnit, "NeedDaemonReload", "yes")
+		default:
+			if property, missing := strings.CutPrefix(shape, "missing "); missing {
+				file := filepath.Join(f.unitsDir, serverUnit)
+				if property == "FragmentPath" || property == "NeedDaemonReload" {
+					file += ".effects"
 				}
-				return
+				setRetireUnitProperty(t, file, property, "")
 			}
-			refusal, err := retirement.DecodeSettledRefusal([]byte(out), code, retirement.PurposeSettledEntry)
-			if err != nil || refusal.Reason != retireReasonInertCondition {
-				t.Fatalf("%s passed as a mask: %s (%v)", shape, out, err)
+		}
+	}
+	for _, shape := range []string{"persistent", "runtime", "real fragment", "reload", "missing LoadState", "missing UnitFileState", "missing FragmentPath", "missing NeedDaemonReload"} {
+		t.Run(shape, func(t *testing.T) {
+			want := retireReasonInertCondition
+			if shape == "reload" {
+				want = retireReasonInertReload
 			}
+			t.Run("settled", func(t *testing.T) {
+				f, j := settledRetireInertFixture(t)
+				mask(t, f, shape)
+				setRetireEffect(t, f, nodeUnit, "Wants", serverUnit)
+				setRetireEffect(t, f, serverUnit, "WantedBy", nodeUnit)
+				for _, purpose := range []string{retirement.PurposeSettledEntry, retirement.PurposeSettledClosing} {
+					out, code := f.runRaw(t, "", settledCheckArgs(t, f, j, purpose)...)
+					if shape == "persistent" {
+						if _, err := retirement.DecodeSettledVerdict([]byte(out), code, settledExpectation(t, f, j, purpose)); err != nil {
+							t.Fatalf("%s refused a persistent mask: %s (%v)", purpose, out, err)
+						}
+					} else if refusal, err := retirement.DecodeSettledRefusal([]byte(out), code, purpose); err != nil || refusal.Reason != want {
+						t.Fatalf("%s missed %s: %s (%v)", purpose, shape, out, err)
+					}
+				}
+				operations := emptyNodeOperations()
+				operations.Services = retireNodeServiceSuperset()
+				out, code := runNodeConfigCheck(t, f, j, nodeConfigDocument(t, j, mustRead(t, f.cfg), operations))
+				if shape == "persistent" {
+					if code != 0 {
+						t.Fatalf("node-config refused a persistent mask: %s", out)
+					}
+				} else if code == 0 || !strings.Contains(out, want) {
+					t.Fatalf("node-config missed %s: %s", shape, out)
+				}
+				_, r := observeRetirePostconditions(t.Context(), retireMode{configPath: f.cfg}, j)
+				if shape == "persistent" {
+					if r != nil {
+						t.Fatalf("done refused a persistent mask: %+v", r)
+					}
+				} else if r == nil || r.Reason != want {
+					t.Fatalf("done missed %s: %+v", shape, r)
+				}
+			})
+			t.Run("stopped", func(t *testing.T) {
+				f := newRetireInertFixture(t)
+				retainAndRestartANode(t, f)
+				f.reserve(t)
+				j := plantResumedRetirement(t, f, retirement.PhaseStopped, retirement.VariantRetainedNode)
+				mask(t, f, shape)
+				r := proveRetireStopped(t.Context(), j)
+				if shape == "persistent" {
+					if r != nil {
+						t.Fatalf("stopped/archive refused a persistent mask: %+v", r)
+					}
+				} else if r == nil || r.Reason != want {
+					t.Fatalf("stopped/archive missed %s: %+v", shape, r)
+				}
+			})
 		})
 	}
 }

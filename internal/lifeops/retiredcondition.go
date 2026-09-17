@@ -23,15 +23,27 @@ func (i *Inspector) OperationUnitDirectories() []string {
 }
 
 // RetiredConditionEvidence cannot be constructed with authority outside lifeops.
-// A walk rechecks the condition and marker rather than treating it as a permit.
+// A walk rechecks the condition and marker or persistent mask, not a permit.
 type RetiredConditionEvidence struct {
-	unit   string
-	marker string
+	unit           string
+	marker         string
+	persistentMask bool
 }
 
-// ProveRetiredConditionEvidence binds effective condition evidence to its unit
-// and an existing regular marker. The caller separately binds marker contents.
+// ProveRetiredConditionEvidence observes a persistent mask or binds an effective
+// condition to an existing regular marker. The caller binds marker contents.
 func (i *Inspector) ProveRetiredConditionEvidence(ctx context.Context, unit, marker string) (RetiredConditionEvidence, error) {
+	props, err := i.properties(ctx, unit, "LoadState", "UnitFileState", "FragmentPath", "NeedDaemonReload")
+	if err != nil {
+		return RetiredConditionEvidence{}, err
+	}
+	proof := RetiredConditionEvidence{unit: unit, persistentMask: first(props, "LoadState") == "masked"}
+	if err := proof.proveProperties(props); err != nil {
+		return RetiredConditionEvidence{}, err
+	}
+	if proof.persistentMask {
+		return proof, nil
+	}
 	if err := i.ProveRetiredCondition(ctx, unit, marker); err != nil {
 		return RetiredConditionEvidence{}, err
 	}
@@ -43,6 +55,23 @@ func (i *Inspector) ProveRetiredConditionEvidence(ctx context.Context, unit, mar
 		return RetiredConditionEvidence{}, err
 	}
 	return RetiredConditionEvidence{unit: unit, marker: marker}, nil
+}
+
+func (proof RetiredConditionEvidence) proveProperties(props map[string][]string) error {
+	if err := requireOperationProperties(proof.unit, props, []string{"LoadState", "UnitFileState", "FragmentPath", "NeedDaemonReload"}); err != nil {
+		return err
+	}
+	if first(props, "NeedDaemonReload") != "no" {
+		return fmt.Errorf("retired-inert-reload: %s has a pending or unknown reload", proof.unit)
+	}
+	if proof.persistentMask {
+		if first(props, "LoadState") != "masked" || first(props, "UnitFileState") != "masked" || first(props, "FragmentPath") != "/dev/null" {
+			return fmt.Errorf("retired-inert-mask: %s is not persistently masked at /dev/null", proof.unit)
+		}
+	} else if first(props, "LoadState") != "loaded" {
+		return fmt.Errorf("retired-inert-condition: %s is not loaded", proof.unit)
+	}
+	return nil
 }
 
 // ProveRetiredCondition reads Unit.Conditions, not the historical ConditionResult.

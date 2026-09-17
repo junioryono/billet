@@ -118,6 +118,76 @@ func TestRetiredConditionEvidenceExemptsOnlyIncomingRuntimeEdges(t *testing.T) {
 	}
 }
 
+func TestPersistentMaskEvidenceRequiresEveryObservedProperty(t *testing.T) {
+	for _, c := range []struct{ property, value, diagnostic string }{
+		{"LoadState", "not-found", "retired-inert-condition"},
+		{"LoadState", "", "operation-property-unknown"},
+		{"UnitFileState", "masked-runtime", "retired-inert-mask"},
+		{"UnitFileState", "", "operation-property-unknown"},
+		{"FragmentPath", "/etc/systemd/system/billet-server.service", "retired-inert-mask"},
+		{"FragmentPath", "", "operation-property-unknown"},
+		{"NeedDaemonReload", "yes", "retired-inert-reload"},
+		{"NeedDaemonReload", "", "operation-property-unknown"},
+	} {
+		t.Run(c.property+"="+c.value, func(t *testing.T) {
+			f := newOperationFixture(t)
+			server := f.unit(t, "billet-server.service")
+			server["LoadState"], server["UnitFileState"], server["FragmentPath"] = "masked", "masked", "/dev/null"
+			server[c.property] = c.value
+			if c.value == "" {
+				delete(server, c.property)
+			}
+			proof, err := f.inspector.ProveRetiredConditionEvidence(t.Context(), "billet-server.service", "")
+			if err == nil || !strings.Contains(err.Error(), c.diagnostic) || proof != (RetiredConditionEvidence{}) {
+				t.Fatalf("invalid mask produced evidence: %+v (%v)", proof, err)
+			}
+		})
+	}
+}
+
+func TestPersistentMaskEvidenceIsRevalidatedByEveryWalk(t *testing.T) {
+	for _, hazard := range []string{"clean", "zero evidence", "runtime before walk", "runtime on reread"} {
+		t.Run(hazard, func(t *testing.T) {
+			f := newOperationFixture(t)
+			const unit = "billet-backup.timer"
+			timer := f.unit(t, unit)
+			timer["LoadState"], timer["UnitFileState"], timer["FragmentPath"] = "masked", "masked", "/dev/null"
+			timer["OnSuccessOf"] = "helper.service"
+			proof, err := f.inspector.ProveRetiredConditionEvidence(t.Context(), unit, filepath.Join(f.root, "absent-marker"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			p := OperationProtection{Units: []string{unit}, RetiredConditions: []RetiredConditionEvidence{proof}}
+			reads := 0
+			f.before = func(name string) {
+				if name == unit {
+					reads++
+					if hazard == "runtime on reread" && reads == 2 {
+						timer["UnitFileState"] = "masked-runtime"
+					}
+				}
+			}
+			switch hazard {
+			case "zero evidence":
+				p.RetiredConditions = []RetiredConditionEvidence{{}}
+			case "runtime before walk":
+				timer["UnitFileState"] = "masked-runtime"
+			}
+			err = f.inspector.AdmitOperations(t.Context(), nil, p)
+			if hazard == "clean" {
+				if err != nil || reads != 2 {
+					t.Fatalf("persistent mask was not proved on both passes: reads=%d error=%v", reads, err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), "operation-inert-evidence") {
+				t.Fatalf("%s reused unproved mask evidence: %v", hazard, err)
+			}
+			if hazard == "runtime on reread" && (reads != 2 || !strings.Contains(err.Error(), "operation-evidence-reread")) {
+				t.Fatalf("runtime mask did not reach the second pass: reads=%d error=%v", reads, err)
+			}
+		})
+	}
+}
+
 // Every retirement fixture redirects these directories, so nothing else would
 // notice one disappearing from the default: unit protection is built from this
 // list, and a directory missing here is a directory nothing protects.
