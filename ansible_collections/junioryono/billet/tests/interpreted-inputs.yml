@@ -64,10 +64,18 @@
         # state directory differs from the actual rendered production script.
         - name: Render the actual health script with a private state directory
           ansible.builtin.copy:
-            content: >-
-              {{ "ceph() { printf 'HEALTH_OK\\n'; }\nmail() { return 99; }\n"
-                 ~ (lookup('ansible.builtin.template', playbook_dir + '/../roles/host/templates/ceph-health.sh.j2')
-                    | replace('state_dir=/var/lib/billet/health', 'state_dir=' ~ (billet_gate_health_root.path | quote))) }}
+            # THE STUBS COME FROM A BLOCK SCALAR, not an escaped Jinja string: a
+            # folded expression keeps "\n" as two characters, which collapses the
+            # whole script onto one line and makes /bin/sh refuse its first
+            # function name instead of running the witness.
+            content: "{{ billet_gate_health_stubs ~ billet_gate_health_body }}"
+          vars:
+            billet_gate_health_stubs: |
+              ceph() { printf 'HEALTH_OK cluster is healthy\n'; }
+              mail() { return 99; }
+            billet_gate_health_body: >-
+              {{ lookup('ansible.builtin.template', playbook_dir + '/../roles/host/templates/ceph-health.sh.j2')
+                 | replace('state_dir=/var/lib/billet/health', 'state_dir=' ~ (billet_gate_health_root.path | quote)) }}
             dest: "{{ billet_gate_health_root.path }}/health.sh"
             mode: '0700'
 
@@ -98,7 +106,7 @@
               - billet_gate_health_canary.content | b64decode == "HEALTH_OK protected canary\n"
               - billet_gate_health_last.stat.isreg
               - not billet_gate_health_last.stat.islnk
-              - billet_gate_health_value.content | b64decode == "HEALTH_OK\n"
+              - billet_gate_health_value.content | b64decode == "HEALTH_OK cluster is healthy\n"
       always:
         - name: Remove the health script witness directory
           ansible.builtin.file:
@@ -137,10 +145,18 @@
         # state directory differs from the actual rendered production script.
         - name: Render the actual health script with a private state directory
           ansible.builtin.copy:
-            content: >-
-              {{ "ceph() { printf 'HEALTH_OK\\n'; }\nmail() { return 99; }\n"
-                 ~ (lookup('ansible.builtin.template', playbook_dir + '/../roles/host/templates/ceph-health.sh.j2')
-                    | replace('state_dir=/var/lib/billet/health', 'state_dir=' ~ (billet_gate_health_root.path | quote))) }}
+            # THE STUBS COME FROM A BLOCK SCALAR, not an escaped Jinja string: a
+            # folded expression keeps "\n" as two characters, which collapses the
+            # whole script onto one line and makes /bin/sh refuse its first
+            # function name instead of running the witness.
+            content: "{{ billet_gate_health_stubs ~ billet_gate_health_body }}"
+          vars:
+            billet_gate_health_stubs: |
+              ceph() { printf 'HEALTH_OK cluster is healthy\n'; }
+              mail() { return 99; }
+            billet_gate_health_body: >-
+              {{ lookup('ansible.builtin.template', playbook_dir + '/../roles/host/templates/ceph-health.sh.j2')
+                 | replace('state_dir=/var/lib/billet/health', 'state_dir=' ~ (billet_gate_health_root.path | quote)) }}
             dest: "{{ billet_gate_health_root.path }}/health.sh"
             mode: '0700'
 
@@ -173,7 +189,7 @@
               - billet_gate_health_canary.matched == 0
               - billet_gate_health_last.stat.isreg
               - not billet_gate_health_last.stat.islnk
-              - billet_gate_health_value.content | b64decode == "HEALTH_OK\n"
+              - billet_gate_health_value.content | b64decode == "HEALTH_OK cluster is healthy\n"
       always:
         - name: Remove the health script witness directory
           ansible.builtin.file:
