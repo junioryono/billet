@@ -343,6 +343,22 @@ if retirement_section retained; then
   . "$here/retirement-retained-cases.sh"
   retirement_section_finished
 fi
+if retirement_section parity-basic; then
+  . "$here/retirement-parity-basic-cases.sh"
+  retirement_section_finished
+fi
+if retirement_section parity-network; then
+  . "$here/retirement-parity-network-cases.sh"
+  retirement_section_finished
+fi
+if retirement_section parity-negative; then
+  . "$here/retirement-parity-negative-cases.sh"
+  retirement_section_finished
+fi
+if retirement_section resume; then
+  . "$here/retirement-resume-cases.sh"
+  retirement_section_finished
+fi
 if retirement_section recovery; then
   . "$here/retirement-recovery-cases.sh"
   retirement_section_finished

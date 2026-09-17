@@ -128,7 +128,7 @@ esac
 # A subshard narrows retirement only; it cannot silently select requests too.
 case "${BILLET_RETIREMENT_SHARD:-}" in
   "") ;;
-  parser|routes|compatibility|retained|recovery|settled)
+  parser|routes|compatibility|retained|recovery|settled|parity-basic|parity-network|parity-negative|resume)
     [ "${BILLET_GATE_ONLY:-}" = retirement ] || fail "BILLET_RETIREMENT_SHARD requires BILLET_GATE_ONLY=retirement"
     [ "$skip_retirement_request" = 1 ] || fail "a retirement subshard requires BILLET_GATE_SKIP=retirement-request" ;;
   *) fail "unknown BILLET_RETIREMENT_SHARD=${BILLET_RETIREMENT_SHARD}" ;;
@@ -360,6 +360,14 @@ root = pathlib.Path(os.environ["BILLET_GATE_SERVICES"])
 path = root / (os.environ.get("BILLET_GATE_HOST", "localhost") + ".json")
 units = json.loads(path.read_text())
 tool, *args = sys.argv[1:]
+role_root = os.environ.get("BILLET_GATE_ROLE")
+if role_root and tool == "systemctl":
+    import subprocess
+    subprocess.run([sys.executable, os.environ["BILLET_GATE_RECORDER"], os.environ["BILLET_GATE_CALLS"],
+                    os.environ.get("BILLET_GATE_HOST", "localhost"), "systemctl", "", *args], check=True, stdout=subprocess.DEVNULL)
+    with (pathlib.Path(role_root) / "manager.jsonl").open("a") as stream:
+        setting = json.loads((pathlib.Path(role_root) / "role-settings.json").read_text())
+        stream.write(json.dumps(dict(pass_name=setting["pass"], argv=args)) + "\n")
 if tool == "pgrep":
     if args != ["-x", "billet"]:
         sys.exit("the recovery pgrep fake does not answer " + repr(args))
@@ -377,8 +385,11 @@ if tool == "systemd-cgls":
 operation = next((a for a in args if not a.startswith("-")), "")
 if operation == "daemon-reload":
     for name, unit in units.items():
-        present = any((pathlib.Path(root) / name).exists() for root in
-                      ["/etc/systemd/system", "/run/systemd/system", "/usr/lib/systemd/system"])
+        candidates = [name]
+        if role_root and "@" in name:
+            candidates.append(name.split("@", 1)[0] + "@.service")
+        present = any((pathlib.Path(directory) / candidate).exists() for directory in
+                      ["/etc/systemd/system", "/run/systemd/system", "/usr/lib/systemd/system"] for candidate in candidates)
         unit["LoadState"] = "loaded" if present else "not-found"
         if not present:
             unit["UnitFileState"] = "not-found"
@@ -410,6 +421,14 @@ if operation in ["start", "restart", "stop"]:
     if unit["LoadState"] != "loaded":
         sys.exit("the recovery systemctl fake cannot start or stop an absent unit")
     active = operation != "stop"
+    if role_root and active and (operation == "restart" or unit["ActiveState"] != "active"):
+        unit["InvocationID"] = format(int(unit["InvocationID"], 16) + 1, "032x")
+        if names[0] == "billet-node.service":
+            import yaml
+            unit["Endpoint"] = yaml.safe_load(pathlib.Path("/etc/billet/billet.yaml").read_text())["node"]["server_addr"]
+            registration = pathlib.Path("/var/lib/billet/node/gate-registration.json")
+            registration.parent.mkdir(parents=True, exist_ok=True)
+            registration.write_text(json.dumps(dict(invocation=unit["InvocationID"], endpoint=unit["Endpoint"])))
     unit.update(ActiveState="active" if active else "inactive", SubState="running" if active else "dead",
                 MainPID=os.environ["BILLET_GATE_SERVICE_PID"] if active else "0", ControlPID="0", Result="success")
 elif operation in ["enable", "disable"]:
@@ -418,6 +437,9 @@ elif operation in ["enable", "disable"]:
     unit["UnitFileState"] = ("enabled-runtime" if "--runtime" in args else "enabled") if operation == "enable" else "disabled"
 else:
     sys.exit("the recovery systemctl fake does not answer " + repr(args))
+if role_root and operation in ["enable", "disable"]:
+    for observed in units.values():
+        observed["NeedDaemonReload"] = "yes"
 path.write_text(json.dumps(units))
 PYSERVICE
 
@@ -489,6 +511,17 @@ printf 'role=%s\ninvocation=%s\ncmd=%s\nhost=%s\nhost_invocation=%s\nsequence=%s
 WRAP
     printf '%s' "$hook_lines"
     cat <<'WRAP'
+# Whole-role adapters still record exact argv/stdin above. Guard operations
+# always continue to the real backing binary.
+if [ -n "${BILLET_GATE_ROLE:-}" ] && [ "${1:-}" != converge-guard ]; then
+  case "$cmd" in
+    retire-*|migrate-endpoint|receipt|registration|release|check|local)
+      printf 'backing=0 cmd=%s whole-role-adapter\n' "$cmd" >>"$priv"
+      "${PYTHON:-python3}" "$BILLET_GATE_ROLE_HELPER" answer "$cmd" "$input" "$@"
+      exit "$?" ;;
+  esac
+fi
+
 # A RETIREMENT SUBSTITUTION IS THE WHOLE CALL, BEFORE ANY BACKING RUN.
 # BILLET_GATE_RETIRE_ANSWERS=host:mode:host-invocation:fixture.json:exit,
 # several separated by semicolons. Fixtures are snapshots of HEAD, never
@@ -1531,7 +1564,9 @@ mkdir -p "$case_dir/tmp"
 # work directory may live under it, so it cannot be overlaid), and what the
 # case is answerable for is what appeared during its play.
 ls /tmp 2>/dev/null | grep '^billet-endpoint-' | sort >"$case_dir/tmp-before" || true
-if [ "$mode" = escalated ]; then
+if [ -s "$case_dir/role-driver" ]; then
+  env "${envs[@]}" HOME="$HOME_DIR" /bin/bash "$(cat "$case_dir/role-driver")" "$case_dir" "$play" >"$case_dir/out" 2>&1
+elif [ "$mode" = escalated ]; then
   env "${envs[@]}" HOME="$HOME_DIR" "$ANSIBLE_PLAYBOOK" -i "$INVENTORY" "$play" -e ansible_become=false -e billet_gate_expect_uid=0 "${args[@]+"${args[@]}"}" >"$case_dir/out" 2>&1
 elif [ "$mode" = become ]; then
   # THE INVOKER, WITH THE ROLE'S OWN ESCALATION: no ansible_become is forced,

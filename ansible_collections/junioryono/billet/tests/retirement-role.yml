@@ -1,0 +1,17 @@
+---
+# main.yml and its handlers run unchanged; only the explicit external adapters
+# in the test strategy and recording executable are substituted.
+- name: Converge the complete host role against the namespace adapters
+  hosts: control-a
+  gather_facts: false
+  strategy: retirement_role
+  pre_tasks:
+    - name: Supply the namespace platform through the fact cache
+      ansible.builtin.set_fact:
+        cacheable: true
+        ansible_system: Linux
+        ansible_os_family: Debian
+        ansible_architecture: x86_64
+        ansible_service_mgr: systemd
+  roles:
+    - junioryono.billet.host

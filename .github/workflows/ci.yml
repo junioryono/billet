@@ -514,7 +514,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        group: [policy, roles, guard, shape, retirement-node-shape, retirement, retirement-routes, retirement-compatibility, retirement-node, retirement-recovery, retirement-node-settled, retirement-request, endpoint]
+        group: [policy, roles, guard, shape, retirement-node-shape, retirement, retirement-routes, retirement-compatibility, retirement-node, retirement-recovery, retirement-node-settled, retirement-parity-basic, retirement-parity-network, retirement-parity-negative, retirement-resume, retirement-request, endpoint]
     name: host-lifecycle (${{ matrix.group }})
     # Sized from what the gates measurably take: the run was cancelled at 15
     # minutes after the two connector gates and the fleet gate joined it
@@ -692,17 +692,17 @@ jobs:
         run: make converge-guard-check
 
       - name: Prove the retirement parser and caller routes
-        if: contains(fromJSON('["retirement", "retirement-routes", "retirement-compatibility", "retirement-node", "retirement-recovery", "retirement-node-settled"]'), matrix.group)
+        if: contains(fromJSON('["retirement", "retirement-routes", "retirement-compatibility", "retirement-node", "retirement-recovery", "retirement-node-settled", "retirement-parity-basic", "retirement-parity-network", "retirement-parity-negative", "retirement-resume"]'), matrix.group)
         env:
           BILLET_GATE_REQUIRE_ROOT: "1"
           BILLET_GATE_ONLY: retirement
           BILLET_GATE_SKIP: retirement-request
-          BILLET_RETIREMENT_SHARD: ${{ fromJSON('{"retirement":"parser","retirement-routes":"routes","retirement-compatibility":"compatibility","retirement-node":"retained","retirement-recovery":"recovery","retirement-node-settled":"settled"}')[matrix.group] }}
+          BILLET_RETIREMENT_SHARD: ${{ fromJSON('{"retirement":"parser","retirement-routes":"routes","retirement-compatibility":"compatibility","retirement-node":"retained","retirement-recovery":"recovery","retirement-node-settled":"settled","retirement-parity-basic":"parity-basic","retirement-parity-network":"parity-network","retirement-parity-negative":"parity-negative","retirement-resume":"resume"}')[matrix.group] }}
           BILLET_RETIREMENT_REPORT: ${{ runner.temp }}/retirement-selection.json
         run: make converge-guard-check
 
       - name: Record the completed retirement case inventory
-        if: contains(fromJSON('["retirement", "retirement-routes", "retirement-compatibility", "retirement-node", "retirement-recovery", "retirement-node-settled"]'), matrix.group)
+        if: contains(fromJSON('["retirement", "retirement-routes", "retirement-compatibility", "retirement-node", "retirement-recovery", "retirement-node-settled", "retirement-parity-basic", "retirement-parity-network", "retirement-parity-negative", "retirement-resume"]'), matrix.group)
         uses: actions/upload-artifact@v7
         with:
           name: retirement-selection-${{ matrix.group }}
