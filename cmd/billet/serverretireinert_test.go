@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -99,6 +100,19 @@ func TestRetirementInertInstallResumesEveryCrashWindow(t *testing.T) {
 func TestRetirementInertProofAcceptsOnlyAPersistentMaskWithoutADropIn(t *testing.T) {
 	mask := func(t *testing.T, f *requestFixture, shape string) {
 		t.Helper()
+		// A MASKED SERVER ALSO HAS TO ACCOUNT FOR ITSELF: the retired account
+		// observation reads the recorded service account and looks it up, so
+		// without this the case would refuse for that instead of the mask.
+		account := retirement.ServiceAccount{User: "billet", UID: 123, Group: "billet", GID: 456}
+		mustOK(t, retirement.WriteServiceAccount(account))
+		savedUser, savedGroup := retireLookupUser, retireLookupGroup
+		t.Cleanup(func() { retireLookupUser, retireLookupGroup = savedUser, savedGroup })
+		retireLookupUser = func(name string) (*user.User, error) {
+			return &user.User{Username: name, Uid: "123", Gid: "456", HomeDir: retirement.Root}, nil
+		}
+		retireLookupGroup = func(name string) (*user.Group, error) {
+			return &user.Group{Name: name, Gid: "456"}, nil
+		}
 		path, err := retireInertDropIn(retireOperationInspector(), serverUnit)
 		mustOK(t, err)
 		mustOK(t, os.Remove(path))
