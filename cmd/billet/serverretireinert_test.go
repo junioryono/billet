@@ -93,6 +93,43 @@ func TestRetirementInertInstallResumesEveryCrashWindow(t *testing.T) {
 	}
 }
 
+// A persistent mask is inertness systemd enforces itself, so the proof accepts
+// it without a drop-in; a runtime mask and a mask whose fragment is a real file
+// are not that, and must not pass for looking like it.
+func TestRetirementInertProofAcceptsOnlyAPersistentMaskWithoutADropIn(t *testing.T) {
+	for _, shape := range []string{"persistent", "runtime", "real fragment"} {
+		t.Run(shape, func(t *testing.T) {
+			f, j := settledNodeConfigFixture(t)
+			path, err := retireInertDropIn(retireOperationInspector(), serverUnit)
+			mustOK(t, err)
+			mustOK(t, os.Remove(path))
+			setRetireEffect(t, f, serverUnit, "DropInPaths", "")
+			f.manager.set(serverUnit, "LoadState", "masked")
+			f.manager.set(serverUnit, "UnitFileState", "masked")
+			setRetireEffect(t, f, serverUnit, "FragmentPath", "/dev/null")
+			switch shape {
+			case "runtime":
+				f.manager.set(serverUnit, "UnitFileState", "masked-runtime")
+			case "real fragment":
+				fragment := filepath.Join(f.unitsDir, serverUnit)
+				writeFile(t, fragment, "[Unit]\n", 0o644)
+				setRetireEffect(t, f, serverUnit, "FragmentPath", fragment)
+			}
+			out, code := f.runRaw(t, "", settledCheckArgs(t, f, j, retirement.PurposeSettledEntry)...)
+			if shape == "persistent" {
+				if code != 0 {
+					t.Fatalf("a persistent mask was refused: %s", out)
+				}
+				return
+			}
+			refusal, err := retirement.DecodeSettledRefusal([]byte(out), code, retirement.PurposeSettledEntry)
+			if err != nil || refusal.Reason != retireReasonInertCondition {
+				t.Fatalf("%s passed as a mask: %s (%v)", shape, out, err)
+			}
+		})
+	}
+}
+
 func TestRetirementInertProofRefusesEachBrokenConjunct(t *testing.T) {
 	for _, hazard := range []string{"marker", "altered marker", "drop-in", "altered drop-in", "unloaded", "reload", "reset", "condition", "duplicate", "unknown load", "missing property"} {
 		t.Run(hazard, func(t *testing.T) {

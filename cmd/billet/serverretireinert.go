@@ -395,11 +395,11 @@ func proveRetireInert(ctx context.Context, j retirement.Journal) *retireRefusal 
 	}
 	insp := retireOperationInspector()
 	for _, unit := range retireInertUnits {
-		props, err := insp.UnitProperties(ctx, unit, "LoadState", "NeedDaemonReload", "DropInPaths")
+		props, err := insp.UnitProperties(ctx, unit, "LoadState", "NeedDaemonReload", "DropInPaths", "UnitFileState", "FragmentPath")
 		if err != nil {
 			return retireUnknown(retireReasonInertCondition, err.Error(), "")
 		}
-		for _, key := range []string{"LoadState", "NeedDaemonReload", "DropInPaths"} {
+		for _, key := range []string{"LoadState", "NeedDaemonReload", "DropInPaths", "UnitFileState", "FragmentPath"} {
 			if len(props[key]) != 1 {
 				return retireUnknown(retireReasonInertCondition, "missing or repeated "+key+": "+unit, "")
 			}
@@ -410,8 +410,19 @@ func proveRetireInert(ctx context.Context, j retirement.Journal) *retireRefusal 
 		if firstProp(props, "LoadState") == "not-found" {
 			continue
 		}
+		// A PERSISTENTLY MASKED UNIT IS INERT WITHOUT THE DROP-IN, and more
+		// strongly: systemd refuses to start a unit whose fragment is
+		// /dev/null, by dependency or by hand. All three answers are required
+		// together, because `masked-runtime` is gone at the next boot and a
+		// mask whose fragment is a real file is not a mask at all.
+		if firstProp(props, "LoadState") == "masked" {
+			if firstProp(props, "UnitFileState") != "masked" || firstProp(props, "FragmentPath") != "/dev/null" {
+				return retireUnknown(retireReasonInertCondition, "mask is not persistent or does not resolve to /dev/null: "+unit, "")
+			}
+			continue
+		}
 		if firstProp(props, "LoadState") != "loaded" {
-			return retireUnknown(retireReasonInertCondition, "unit is neither loaded nor positively absent: "+unit, "")
+			return retireUnknown(retireReasonInertCondition, "unit is neither loaded, persistently masked nor positively absent: "+unit, "")
 		}
 		path, err := retireInertDropIn(insp, unit)
 		if err != nil {
