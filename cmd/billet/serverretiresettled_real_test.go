@@ -79,10 +79,15 @@ func TestRealSystemdRetirementSettledEntryObservations(t *testing.T) {
 					}
 				}
 			case "unit mismatch":
-				// THE ORIGINAL DEFINITION MUST BE LOADED FIRST. A unit systemd has
-				// never resolved is loaded from disk at its first property query,
-				// so changing the fragment before that query would be read as the
-				// unit's own definition and leave NeedDaemonReload=no forever.
+				// MEASURED ON SYSTEMD 255, 2026-09-18: a property query does not
+				// hold the unit loaded, so changing the fragment after one still
+				// answers NeedDaemonReload=no forever, and cleanup reports the
+				// unit was never loaded. Starting it loads the original
+				// definition and keeps it loaded, and systemd then notices the
+				// fragment change. The unit stays running for this case; the
+				// entry command's node activity is fixture-owned.
+				settledObservationCtl(t, "start", "--", unit)
+				awaitSettledObservation(t, unit, "ActiveState", "active")
 				awaitSettledObservation(t, unit, "NeedDaemonReload", "no")
 				writeFile(t, path, body+"Environment=BILLET_ENTRY_WITNESS=changed\n", 0o644)
 				awaitSettledObservation(t, unit, "NeedDaemonReload", "yes")
