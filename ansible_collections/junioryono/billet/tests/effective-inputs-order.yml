@@ -24,7 +24,11 @@
 - name: Require full desired collection in each host's own context
   ansible.builtin.assert:
     that:
-      - "'hostvars[item].billet_config' in billet_gate_collect_source"
+      # The node-bearing predicate is established before the reservation now, so it is
+      # read where it lives; what this gate pins is that it reads each host's OWN raw
+      # desired configuration out of hostvars, never the retained effective one.
+      - "'hostvars[item].billet_config' in billet_gate_node_hosts_source"
+      - "'billet_effective_config' not in billet_gate_node_hosts_source"
       - "'billet_retirement_collect_vars.billet_config.node' in billet_gate_collect_host_source"
       - >-
         "template_vars={'billet_config_document': billet_retirement_collect_vars.billet_config}"
