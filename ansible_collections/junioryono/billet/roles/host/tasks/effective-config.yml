@@ -19,16 +19,13 @@
     that:
       - billet_config is mapping
       - "'server' not in billet_config or billet_server_retire | bool"
-    fail_msg: >-
-      billet_config still contains server on a retired host. Set billet_server_retire
-      to retain retirement intent, or supply explicitly serverless configuration;
-      ordinary convergence cannot authorize possible recommissioning.
+    fail_msg: billet_config still contains server on a retired host. Set billet_server_retire to retain retirement intent, or supply explicitly serverless configuration; ordinary convergence cannot authorize possible recommissioning.
   when: billet_retirement_node_ordinary | bool
 
 - name: Derive the configuration for this ordinary pass
   ansible.builtin.set_fact:
     billet_effective_config: >-
-      {{ (billet_config | dict2items | rejectattr('key', 'in', ['server', 'github', 'targets', 'backup']) | items2dict)
+      {{ (billet_config | junioryono.billet.serverless_config)
          if billet_retirement_node_ordinary | bool else billet_config }}
   no_log: true
 
