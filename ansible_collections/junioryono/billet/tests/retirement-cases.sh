@@ -5,7 +5,7 @@
 cat >"$work/play-retirement.yml" <<'PLAY'
 ---
 - name: Capture the ordinary template in each node's context
-  hosts: control-b:node-a
+  hosts: "{{ 'control-a:control-b:node-a' if billet_gate_retained_request | default(false) | bool else 'control-b:node-a' }}"
   gather_facts: false
   tasks:
     - name: Capture the complete ordinary role rendering
@@ -16,6 +16,18 @@ cat >"$work/play-retirement.yml" <<'PLAY'
         dest: "{{ billet_gate_render_dir }}/{{ inventory_hostname }}.yaml"
         mode: "0600"
       when: billet_gate_capture_rendering | default(false) | bool
+      no_log: true
+    - name: Capture the independently projected retained rendering
+      vars:
+        billet_config_document: "{{ billet_config | dict2items | rejectattr('key', 'in', ['server', 'github', 'targets', 'backup']) | items2dict }}"
+      ansible.builtin.template:
+        src: "{{ billet_gate_ordinary_template }}"
+        dest: "{{ billet_gate_render_dir }}/control-a-serverless.yaml"
+        mode: "0600"
+      when:
+        - billet_gate_capture_rendering | default(false) | bool
+        - billet_gate_retained_request | default(false) | bool
+        - inventory_hostname == 'control-a'
       no_log: true
 - name: Exercise the retirement entry after real preparation
   hosts: "{{ [billet_gate_retirement_host | default('control-a'), 'control-b'] if billet_gate_new | default(false) | bool else billet_gate_retirement_host | default('control-a') }}"
@@ -124,6 +136,15 @@ cat >"$work/retirement-entry-tasks.yml" <<'PLAY'
       ansible.builtin.include_role:
         name: junioryono.billet.host
         tasks_from: retirement
+    - name: Prove the fresh retained answer was accepted
+      ansible.builtin.assert:
+        that:
+          - billet_retirement_requested_variant == 'retained-node'
+          - billet_retirement_result.variant == 'retained-node'
+          - billet_retirement_result.receipt == 'written'
+          - billet_retirement_result.settled is sameas true
+          - billet_retirement_bypass is sameas true
+      when: billet_gate_expect_retained_result | default(false) | bool
     - name: Ordinary convergence sentinel
       ansible.builtin.debug:
         msg: The ordinary boundary was reached.
@@ -444,11 +465,12 @@ INV
 # Assert the entire reservation/request argv, all delegated argv, the exact
 # document member sets, raw rendering hashes (including the final newline),
 # host-specific variable expansion and both positive and forbidden effects.
-r_new_document() { # case reserved|adopted
-  "$python" - "$work/cases/$1" "$here/fixtures" "$2" <<'PY'
+r_new_document() { # case reserved|adopted [server-only|retained-node]
+  "$python" - "$work/cases/$1" "$here/fixtures" "$2" "${3:-server-only}" <<'PY'
 import datetime, hashlib, json, pathlib, re, sys, yaml
 case, fixtures = map(pathlib.Path, sys.argv[1:3])
 outcome = sys.argv[3]
+retained = sys.argv[4] == 'retained-node'
 root = case / 'calls'
 calls = [json.loads(line) for line in (root / 'index.jsonl').read_text().splitlines()]
 def one(host, command):
@@ -463,7 +485,10 @@ digest = hashlib.sha256((case / 'installed.yaml.plant').read_bytes()).hexdigest(
 common = ['--json', '--run', 'ci-1', '--retiring-host', 'control-a', '--survivor-host', 'control-b', '--installed-sha256', digest]
 if reserve['argv'] != ['server', 'retire', '--reserve'] + common + ['--config', '/etc/billet/billet.yaml', '--environment-file', '/etc/billet/server.env']:
     sys.exit('reserve argv differs: ' + repr(reserve['argv']))
-expected = ['server', 'retire', '--input', '-'] + common + ['--server-only', '--config', '/etc/billet/billet.yaml']
+expected = ['server', 'retire', '--input', '-'] + common
+if not retained:
+    expected += ['--server-only']
+expected += ['--config', '/etc/billet/billet.yaml']
 if outcome == 'reserved':
     expected += ['--reservation-fresh']
 expected += ['--shared-address', '192.0.2.10', '--shared-address', '192.0.2.11', '--endpoint-failover-verified', '--report-max-age', '10m', '--environment-file', '/etc/billet/server.env']
@@ -473,8 +498,30 @@ if request['argv'] != expected:
 if not request['has_stdin']:
     sys.exit('request has no stdin')
 doc = json.loads((root / request['stdin']).read_text())
-if set(doc) != {'schema', 'round', 'self', 'survivor', 'nodes', 'desired', 'desired_nodes'} or type(doc['schema']) is not int or doc['schema'] != 1 or doc['desired'] is not None:
+if set(doc) != {'schema', 'round', 'self', 'survivor', 'nodes', 'desired', 'desired_nodes'} or type(doc['schema']) is not int or doc['schema'] != 1:
     sys.exit('new-request document shape differs')
+if retained:
+    if not isinstance(doc['desired'], str):
+        sys.exit('retained desired is not a rendering')
+    serverless = doc['desired'].encode('utf-8')
+    ordinary = (case / 'ordinary-render/control-a.yaml').read_bytes()
+    projected = (case / 'ordinary-render/control-a-serverless.yaml').read_bytes()
+    if serverless != projected:
+        sys.exit('retained B differs from independently projected ordinary template bytes')
+    if serverless == ordinary or not serverless.endswith(b'\n') or not ordinary.endswith(b'\n'):
+        sys.exit('retained B and full self rendering must be distinct bytes with final newlines')
+    full, reduced = yaml.safe_load(ordinary), yaml.safe_load(serverless)
+    removed = {'server', 'github', 'targets', 'backup'}
+    if not isinstance(full, dict) or not removed <= set(full) or 'node' not in full:
+        sys.exit('full self rendering lost a server member or its node')
+    if not isinstance(reduced, dict) or 'node' not in reduced or removed & set(reduced):
+        sys.exit('retained B has the wrong member set')
+    if reduced != {key: value for key, value in full.items() if key not in removed}:
+        sys.exit('retained B changed a member outside the four removed keys')
+    if yaml.safe_load((case / 'installed.yaml.plant').read_bytes()) != full:
+        sys.exit('retained installed and full desired configurations differ')
+elif doc['desired'] is not None:
+    sys.exit('server-only request carried a desired rendering')
 if set(doc['round']) != {'id', 'started_at'} or doc['round']['id'] != 'ci-1-' + doc['round']['started_at']:
     sys.exit('round binding differs')
 def timestamp(s):
@@ -485,10 +532,13 @@ started = timestamp(doc['round']['started_at'])
 reserved_at = datetime.datetime.fromisoformat(fixture('server-retire', outcome)['reserved_at'].replace('Z', '+00:00'))
 if started < reserved_at:
     sys.exit('round precedes reservation')
-if set(doc['nodes']) != {'control-b', 'node-a'} or set(doc['desired_nodes']) != set(doc['nodes']):
+node_hosts = {'control-a', 'control-b', 'node-a'} if retained else {'control-b', 'node-a'}
+if set(doc['nodes']) != node_hosts or set(doc['desired_nodes']) != node_hosts:
     sys.exit('collection omitted a deployment node or collected another host')
 if doc['nodes']['control-b'] != doc['survivor']:
     sys.exit('the node-bearing survivor needs its own nodes entry')
+if retained and doc['nodes']['control-a'] != doc['self']:
+    sys.exit('the retained host needs its full self envelope in nodes')
 for host, envelope, inspect_name, status_name in [
     ('control-a', doc['self'], 'postgres-controller-guarded', 'retirement-reserved'),
     ('control-b', doc['survivor'], 'postgres-controller-guarded', 'no-rollout'),
@@ -504,6 +554,8 @@ for host, envelope, inspect_name, status_name in [
     if envelope['status'] != expected_status:
         sys.exit('ledger document differs for ' + host)
     path = '/etc/billet/node-a.yaml' if host == 'node-a' else '/etc/billet/billet.yaml'
+    if retained and host == 'control-a':
+        path = '/etc/billet/control-a.yaml'
     inspection = one(host, 'release')
     if inspection['argv'] != ['release', 'inspect', '--json', '--config', path]:
         sys.exit('inspect argv differs for ' + host)
@@ -515,7 +567,7 @@ for host, envelope, inspect_name, status_name in [
             sys.exit('status did not use its executing host\'s observed environment')
         if not inspection['sequence'] < status['sequence'] < request['sequence']:
             sys.exit('status collected out of order')
-    if host != 'control-a':
+    if host in node_hosts:
         migration = one(host, 'migrate-endpoint')
         if migration['argv'] != ['node', 'migrate-endpoint', '--config', path, '--desired', '-', '--wait', '120s', '--dry-run', '--json']:
             sys.exit('endpoint dry-run argv differs for ' + host)
@@ -523,18 +575,20 @@ for host, envelope, inspect_name, status_name in [
         if not migration['has_stdin'] or not rendering.endswith(b'\n'):
             sys.exit('node did not receive exact configuration bytes')
         parsed = yaml.safe_load(rendering)
-        address = '127.0.0.1:7717' if host == 'control-b' else '127.0.0.1:7719'
+        address = '127.0.0.1:7719' if host == 'node-a' else '127.0.0.1:7717'
         if parsed['node'] != dict(name=host, server_addr=address, provider='docker'):
             sys.exit('configuration was not rendered in its own host context')
         ordinary = (case / 'ordinary-render' / (host + '.yaml')).read_bytes()
         if rendering != ordinary:
             sys.exit('collected rendering differs from ordinary role template bytes for ' + host)
-        endpoint_name = 'reported-unplanned' if host == 'control-b' else 'reported-planned'
+        endpoint_name = 'reported-planned' if host == 'node-a' else 'reported-unplanned'
         desired = doc['desired_nodes'][host]
         if desired != {'sha256': hashlib.sha256(ordinary).hexdigest(), 'endpoint': fixture('node-migrate-endpoint', endpoint_name)['to']}:
             sys.exit('desired node evidence was not computed from exact stdin and its own answer')
         if not inspection['sequence'] < migration['sequence'] < request['sequence']:
             sys.exit('endpoint collected out of order')
+        if status_name and not status['sequence'] < migration['sequence']:
+            sys.exit('endpoint preceded ledger status for ' + host)
 if any(c['host'] == 'node-a' and c['command'] == 'status' for c in calls):
     sys.exit('node with no ledger was asked for status')
 if any(c['command'] in ['retire-abandon', 'retire-complete', 'retire-acknowledge'] for c in calls):
@@ -545,7 +599,7 @@ if len(clocks) != 4 or any(c['host'] != 'control-a' or c['argv'] != ['-u', '+%Y-
 if not reserve['sequence'] < clocks[0]['sequence'] < one('control-a', 'release')['sequence']:
     sys.exit('round clock was not read freshly after reserve and before delegation')
 for clock, host in zip(clocks[1:], ['control-a', 'control-b', 'node-a']):
-    last_report = one(host, 'status' if host == 'control-a' else 'migrate-endpoint')
+    last_report = one(host, 'migrate-endpoint' if host in node_hosts else 'status')
     if not last_report['sequence'] < clock['sequence'] < request['sequence']:
         sys.exit('envelope clock was not read after its reports')
 # local prepare is a real early import effect, before the reservation.
@@ -591,6 +645,10 @@ if retirement_section request-windows; then
 fi
 if retirement_section request-cancellation; then
   . "$here/retirement-request-cancellation-cases.sh"
+  retirement_section_finished
+fi
+if retirement_section request-retained; then
+  . "$here/retirement-request-retained-cases.sh"
   retirement_section_finished
 fi
 

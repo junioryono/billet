@@ -132,7 +132,7 @@ case "${BILLET_RETIREMENT_SHARD:-}" in
   parser|routes|compatibility|retained|recovery|settled|parity-basic|parity-network|parity-negative|resume)
     [ "${BILLET_GATE_ONLY:-}" = retirement ] || fail "BILLET_RETIREMENT_SHARD requires BILLET_GATE_ONLY=retirement"
     [ "$skip_retirement_request" = 1 ] || fail "a retirement subshard requires BILLET_GATE_SKIP=retirement-request" ;;
-  request-evidence|request-collection|request-windows|request-cancellation)
+  request-evidence|request-collection|request-windows|request-cancellation|request-retained)
     [ "${BILLET_GATE_ONLY:-}" = retirement-request ] || fail "a request subshard requires BILLET_GATE_ONLY=retirement-request" ;;
   *) fail "unknown BILLET_RETIREMENT_SHARD=${BILLET_RETIREMENT_SHARD}" ;;
 esac

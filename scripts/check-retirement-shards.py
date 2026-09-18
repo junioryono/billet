@@ -30,6 +30,7 @@ ROLE_SHARDS = {
     'retirement-request-collection': 'request-collection',
     'retirement-request-windows': 'request-windows',
     'retirement-request-cancellation': 'request-cancellation',
+    'retirement-request-retained': 'request-retained',
 }
 # Count invocations of the case runner, not protocol calls inside a case. The
 # settled parser has two batched cases; recovery keeps both passes in one case.
@@ -37,7 +38,7 @@ ROLE_CASES = {'parser': 60, 'routes': 15, 'compatibility': 74,
               'retained': 10, 'recovery': 21, 'settled': 14,
               'parity-basic': 8, 'parity-network': 8, 'parity-negative': 4, 'resume': 2,
               'request-evidence': 12, 'request-collection': 12,
-              'request-windows': 13, 'request-cancellation': 17}
+              'request-windows': 13, 'request-cancellation': 17, 'request-retained': 10}
 
 
 def require_partition(expected, groups):

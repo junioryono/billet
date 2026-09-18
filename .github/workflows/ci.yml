@@ -507,14 +507,16 @@ jobs:
     runs-on: billet-8vcpu-ubuntu-2404
     # The former retirement group reached 36 minutes before request coverage
     # on 46fcafa (2026-09-14). Partition its parser, routes, compatibility,
-    # retained continuation, recovery and 3c settled callers. The 54 request
-    # cases now have four sections (planning input: 28/45 minutes unsharded).
-    # The 3c operand and drift plays also leave shape. These are structural budgets;
-    # complete CI timings must establish the required <=35 minute margin.
+    # retained continuation, recovery and 3c settled callers. The 64 request
+    # cases now have five sections (planning input: 28/45 minutes unsharded,
+    # before the retained ones). The 3c operand and drift plays also leave
+    # shape. These are structural budgets; complete CI timings must establish
+    # the required <=35 minute margin, and which request section is slowest is
+    # not something the case counts decide.
     strategy:
       fail-fast: false
       matrix:
-        group: [policy, roles, guard, shape, retirement-node-shape, retirement, retirement-routes, retirement-compatibility, retirement-node, retirement-recovery, retirement-node-settled, retirement-parity-basic, retirement-parity-network, retirement-parity-negative, retirement-resume, retirement-request-evidence, retirement-request-collection, retirement-request-windows, retirement-request-cancellation, endpoint]
+        group: [policy, roles, guard, shape, retirement-node-shape, retirement, retirement-routes, retirement-compatibility, retirement-node, retirement-recovery, retirement-node-settled, retirement-parity-basic, retirement-parity-network, retirement-parity-negative, retirement-resume, retirement-request-evidence, retirement-request-collection, retirement-request-windows, retirement-request-cancellation, retirement-request-retained, endpoint]
     name: host-lifecycle (${{ matrix.group }})
     # Sized from what the gates measurably take: the run was cancelled at 15
     # minutes after the two connector gates and the fleet gate joined it
@@ -692,17 +694,17 @@ jobs:
         run: make converge-guard-check
 
       - name: Prove the selected retirement route or request section
-        if: contains(fromJSON('["retirement", "retirement-routes", "retirement-compatibility", "retirement-node", "retirement-recovery", "retirement-node-settled", "retirement-parity-basic", "retirement-parity-network", "retirement-parity-negative", "retirement-resume", "retirement-request-evidence", "retirement-request-collection", "retirement-request-windows", "retirement-request-cancellation"]'), matrix.group)
+        if: contains(fromJSON('["retirement", "retirement-routes", "retirement-compatibility", "retirement-node", "retirement-recovery", "retirement-node-settled", "retirement-parity-basic", "retirement-parity-network", "retirement-parity-negative", "retirement-resume", "retirement-request-evidence", "retirement-request-collection", "retirement-request-windows", "retirement-request-cancellation", "retirement-request-retained"]'), matrix.group)
         env:
           BILLET_GATE_REQUIRE_ROOT: "1"
           BILLET_GATE_ONLY: ${{ startsWith(matrix.group, 'retirement-request-') && 'retirement-request' || 'retirement' }}
           BILLET_GATE_SKIP: ${{ !startsWith(matrix.group, 'retirement-request-') && 'retirement-request' || '' }}
-          BILLET_RETIREMENT_SHARD: ${{ fromJSON('{"retirement":"parser","retirement-routes":"routes","retirement-compatibility":"compatibility","retirement-node":"retained","retirement-recovery":"recovery","retirement-node-settled":"settled","retirement-parity-basic":"parity-basic","retirement-parity-network":"parity-network","retirement-parity-negative":"parity-negative","retirement-resume":"resume","retirement-request-evidence":"request-evidence","retirement-request-collection":"request-collection","retirement-request-windows":"request-windows","retirement-request-cancellation":"request-cancellation"}')[matrix.group] }}
+          BILLET_RETIREMENT_SHARD: ${{ fromJSON('{"retirement":"parser","retirement-routes":"routes","retirement-compatibility":"compatibility","retirement-node":"retained","retirement-recovery":"recovery","retirement-node-settled":"settled","retirement-parity-basic":"parity-basic","retirement-parity-network":"parity-network","retirement-parity-negative":"parity-negative","retirement-resume":"resume","retirement-request-evidence":"request-evidence","retirement-request-collection":"request-collection","retirement-request-windows":"request-windows","retirement-request-cancellation":"request-cancellation","retirement-request-retained":"request-retained"}')[matrix.group] }}
           BILLET_RETIREMENT_REPORT: ${{ runner.temp }}/retirement-selection.json
         run: make converge-guard-check
 
       - name: Record the completed retirement case inventory
-        if: contains(fromJSON('["retirement", "retirement-routes", "retirement-compatibility", "retirement-node", "retirement-recovery", "retirement-node-settled", "retirement-parity-basic", "retirement-parity-network", "retirement-parity-negative", "retirement-resume", "retirement-request-evidence", "retirement-request-collection", "retirement-request-windows", "retirement-request-cancellation"]'), matrix.group)
+        if: contains(fromJSON('["retirement", "retirement-routes", "retirement-compatibility", "retirement-node", "retirement-recovery", "retirement-node-settled", "retirement-parity-basic", "retirement-parity-network", "retirement-parity-negative", "retirement-resume", "retirement-request-evidence", "retirement-request-collection", "retirement-request-windows", "retirement-request-cancellation", "retirement-request-retained"]'), matrix.group)
         uses: actions/upload-artifact@v7
         with:
           name: retirement-selection-${{ matrix.group }}
