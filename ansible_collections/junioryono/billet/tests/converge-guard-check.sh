@@ -125,12 +125,15 @@ retirement_only=0
 case "${BILLET_GATE_ONLY:-}" in
   retirement|retirement-request) retirement_only=1 ;;
 esac
-# A subshard narrows retirement only; it cannot silently select requests too.
+# One variable carries both families: a shard names one section; the gate checks
+# which half owns it, rather than leaving that distinction to the operator.
 case "${BILLET_RETIREMENT_SHARD:-}" in
   "") ;;
   parser|routes|compatibility|retained|recovery|settled|parity-basic|parity-network|parity-negative|resume)
     [ "${BILLET_GATE_ONLY:-}" = retirement ] || fail "BILLET_RETIREMENT_SHARD requires BILLET_GATE_ONLY=retirement"
     [ "$skip_retirement_request" = 1 ] || fail "a retirement subshard requires BILLET_GATE_SKIP=retirement-request" ;;
+  request-evidence|request-collection|request-windows|request-cancellation|request-retained)
+    [ "${BILLET_GATE_ONLY:-}" = retirement-request ] || fail "a request subshard requires BILLET_GATE_ONLY=retirement-request" ;;
   *) fail "unknown BILLET_RETIREMENT_SHARD=${BILLET_RETIREMENT_SHARD}" ;;
 esac
 retirement_sections=0

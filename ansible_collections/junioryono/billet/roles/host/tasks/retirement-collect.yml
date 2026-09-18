@@ -1,15 +1,19 @@
 ---
-# Inventory is the deployment, not the current control-plane play's host set.
-# hostvars resolves billet_config in its own host's context; the ordinary
-# template has exactly that one input, including its final newline.
-- name: Find every deployment host whose desired configuration bears a node
-  ansible.builtin.set_fact:
-    billet_retirement_node_hosts: "{{ billet_retirement_node_hosts + [item] }}"
-  loop: "{{ groups['all'] }}"
-  when: >-
-    (hostvars[item].billet_config | default({}) is mapping
-     and 'node' in hostvars[item].billet_config | default({}))
-    or hostvars[item].billet_enable_node | default(false) | bool
+# The node-bearing host set was established before the reservation, from the
+# same inventory predicate the variant's refusals read; it is re-read here at
+# the point of use, because this is where the document is assembled. The
+# ordinary template has exactly one input, including its final newline.
+- name: Require the retiring node in the retained request's collection
+  ansible.builtin.assert:
+    that: inventory_hostname in billet_retirement_node_hosts
+    fail_msg: "Retirement collection: retained-node host {{ inventory_hostname }} is missing from billet_retirement_node_hosts; its full pre-transition node evidence must be collected."
+  when: billet_retirement_variant == 'retained-node'
+
+- name: Refuse the retiring host in a server-only node collection
+  ansible.builtin.assert:
+    that: inventory_hostname not in billet_retirement_node_hosts
+    fail_msg: "Retirement collection: server-only host {{ inventory_hostname }} appears in billet_retirement_node_hosts; remove its desired node or node enablement from inventory, or converge node installation before requesting retained-node retirement."
+  when: billet_retirement_variant == 'server-only'
 
 - name: Read the retiring host's clock before the first collection delegation
   ansible.builtin.command:
@@ -53,6 +57,6 @@
       self: "{{ billet_retirement_reports[inventory_hostname] }}"
       survivor: "{{ billet_retirement_reports[billet_retirement_survivor] }}"
       nodes: "{{ dict(billet_retirement_node_hosts | zip(billet_retirement_node_hosts | map('extract', billet_retirement_reports))) }}"
-      desired: null
+      desired: "{{ billet_retirement_serverless_rendering if billet_retirement_variant == 'retained-node' else none }}"
       desired_nodes: "{{ billet_retirement_desired_nodes }}"
   no_log: true

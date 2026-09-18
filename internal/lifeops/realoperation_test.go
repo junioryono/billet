@@ -631,7 +631,12 @@ func realRetirementHazard(t *testing.T, hazard string, bypass bool) {
 	}
 	h.write(server, "[Unit]\nDefaultDependencies=no\n"+unitExtra+"[Service]\nType=exec\nExecStart=/bin/sleep infinity\n"+serviceExtra+install)
 	h.write(node, "[Unit]\nDefaultDependencies=no\n[Service]\nType=exec\nExecStart=/bin/sleep infinity\nRuntimeDirectory="+runtimeName+"\n")
-	h.write(timer, "[Unit]\nDefaultDependencies=no\n[Timer]\nOnActiveSec=1ms\nUnit="+backup+"\n")
+	// ACCURACY IS PINNED BECAUSE THE COUNTERFACTUAL WAITS ON THIS ELAPSE. A timer
+	// that does not set AccuracySec leaves systemd free to coalesce the wakeup
+	// within its default window, and on 2026-09-18 this case failed alone, with
+	// the backup effect still absent after five seconds while every sibling
+	// hazard measured its collateral in under two.
+	h.write(timer, "[Unit]\nDefaultDependencies=no\n[Timer]\nOnActiveSec=1ms\nAccuracySec=1us\nUnit="+backup+"\n")
 	h.write(backup, "[Unit]\nDefaultDependencies=no\n[Service]\nType=oneshot\nExecStart=/usr/bin/touch "+backupEffect+"\n")
 	h.write(dns, "[Unit]\nDefaultDependencies=no\n[Service]\nType=exec\nExecStart=/bin/sleep infinity\n")
 	if hazard == "socket runtime" {

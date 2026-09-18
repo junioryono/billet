@@ -183,7 +183,7 @@
     - billet_retirement_route == 'continue'
     - not ansible_check_mode
 
-- name: Request a new server-only retirement
+- name: Request a new retirement of the installed variant
   ansible.builtin.include_tasks: retirement-request.yml
   when: billet_retirement_route == 'new-request'
 

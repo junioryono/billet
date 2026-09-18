@@ -175,8 +175,10 @@ func TestTheDryRunsStateIsTheHostsAndNotAConstant(t *testing.T) {
 // A LATER FAILED READ OVERRULES AN EARLIER ADMISSION. The row's close is
 // after the first local observations and before the final state observation,
 // so replacing a record there exercises the second read, not the first.
+// The retained-node request opens a ledger; a node-only unsupported variant
+// never does, so its final observation cannot be interrupted by this hook.
 func TestTheDryRunCarriesAFailedFinalStateObservationIntoTheRoute(t *testing.T) {
-	for _, earlier := range []string{"ordinary", "continue", "new-request", "cancel", "unsupported-variant", "hold"} {
+	for _, earlier := range []string{"ordinary", "continue", "new-request", "cancel", "new-request-retained", "hold"} {
 		for _, failed := range []string{"journal", "status"} {
 			if earlier == "continue" && failed == "status" {
 				// A READABLE JOURNAL SUPPLIES THE STATE without a status read.
@@ -184,12 +186,17 @@ func TestTheDryRunCarriesAFailedFinalStateObservationIntoTheRoute(t *testing.T) 
 			}
 			t.Run(earlier+"/"+failed, func(t *testing.T) {
 				var f *retireFixture
+				route := earlier
 				rowFact := retirement.RowAbsent
 				args := []string{"--dry-run", "--retiring-host", "control-a"}
 				why := ""
-				if earlier == "new-request" || earlier == "cancel" {
+				if earlier == "new-request" || earlier == "new-request-retained" || earlier == "cancel" {
 					request := newRequestFixture(t)
 					f = request.retireFixture
+					if earlier == "new-request-retained" {
+						request.retainANode(t)
+						route = "new-request"
+					}
 					if earlier == "cancel" {
 						request.reserve(t)
 						rowFact, why = retirement.RowReservedMine, "inventory no longer requests"
@@ -204,20 +211,17 @@ func TestTheDryRunCarriesAFailedFinalStateObservationIntoTheRoute(t *testing.T) 
 				case "continue":
 					f.journalAt(t, retirement.PhaseIntent, "ci-1")
 					why = "readable journal"
-				case "unsupported-variant":
-					// INSTALLED NODE CUSTODY SELECTS WITHOUT A JOURNAL, so the
-					// final observation must judge the status as well as the journal.
-					body := mustRead(t, f.cfg) + "\nnode:\n  name: node-a\n  server_addr: 127.0.0.1:7717\n" +
-						"  provider: docker\n  state_dir: " + filepath.Join(t.TempDir(), "node") + "\n"
-					writeFile(t, f.cfg, body, 0o600)
-					args = append(args, "--requested")
-					why = "keeps a node"
+				case "new-request-retained":
+					why = "keeps this host's node"
 				case "hold":
 					args = append(args, "--requested")
 					why = "PostgreSQL active-passive"
 				}
 				out, code := f.run(t, "", args...)
-				before := assertRetireRoute(t, out, code, earlier, why)
+				before := assertRetireRoute(t, out, code, route, why)
+				if earlier == "new-request-retained" && before["installed_roles"] != "both" {
+					t.Fatalf("the installed node was hidden: %s", out)
+				}
 				wantState := stateNothingRetire
 				if earlier == "continue" {
 					wantState = string(retirement.PhaseIntent)
@@ -1192,7 +1196,7 @@ func TestTheDryRunRoutesTheWholeRowAndJournalPartition(t *testing.T) {
 
 // REQUESTED QUALIFIES A NEW REQUEST; it never chooses a journal's route.
 // The same eligible host is ordinary without it and adopts its reservation
-// with it. Installed node custody selects the unsupported request variant.
+// with it. Installed node custody selects a request that keeps this host's node.
 func TestTheDryRunQualifiesRequestsFromTheInstalledPair(t *testing.T) {
 	f := newRequestFixture(t)
 	run := func(args ...string) (string, int) {
@@ -1240,7 +1244,7 @@ func TestTheDryRunQualifiesRequestsFromTheInstalledPair(t *testing.T) {
 		want, why := "cancel", "inventory no longer requests"
 		if requested {
 			args = append(args, "--requested")
-			want, why = "unsupported-variant", "keeps a node"
+			want, why = "new-request", "keeps this host's node"
 		}
 		out, code := run(args...)
 		m := assertRetireRoute(t, out, code, want, why)
@@ -1257,18 +1261,25 @@ func TestTheDryRunQualifiesRequestsFromTheInstalledPair(t *testing.T) {
 	}
 }
 
-// NODE CUSTODY NAMES THE UNSUPPORTED VARIANT BEFORE PAIR ELIGIBILITY. A
-// fresh request on either backend must not disguise a retained node as a
-// backend or controller-mode refusal.
-func TestTheDryRunNamesAFreshRetainedNodeRequestBeforePairEligibility(t *testing.T) {
-	for _, pair := range []string{"sqlite", "postgres single", "postgres active-passive"} {
-		t.Run(pair, func(t *testing.T) {
+// A FRESH RETAINED-NODE REQUEST MUST MEET PAIR ELIGIBILITY after its installed
+// roles are established, naming the backend or controller-mode refusal.
+func TestTheDryRunRequiresPairEligibilityForAFreshRetainedNodeRequest(t *testing.T) {
+	for _, pair := range []struct {
+		name  string
+		route string
+		why   string
+	}{
+		{"sqlite", "hold", "a retirement is defined for a PostgreSQL active-passive pair, and this deployment's ledger is sqlite"},
+		{"postgres single", "hold", "a retirement is defined for an active-passive pair, and this deployment's controllers are single"},
+		{"postgres active-passive", "new-request", "keeps this host's node"},
+	} {
+		t.Run(pair.name, func(t *testing.T) {
 			var f *retireFixture
-			if pair == "sqlite" {
+			if pair.name == "sqlite" {
 				f = newRetireFixture(t)
 			} else {
 				f = newRequestFixture(t).retireFixture
-				if pair == "postgres single" {
+				if pair.name == "postgres single" {
 					f.cfg = writePostgresConfig(t, f.stateDir)
 				}
 			}
@@ -1277,7 +1288,7 @@ func TestTheDryRunNamesAFreshRetainedNodeRequestBeforePairEligibility(t *testing
 			writeFile(t, f.cfg, body, 0o600)
 
 			out, code := f.run(t, "", "--dry-run", "--retiring-host", "control-a", "--requested")
-			m := assertRetireRoute(t, out, code, "unsupported-variant", "does not support retiring a host that keeps a node")
+			m := assertRetireRoute(t, out, code, pair.route, pair.why)
 			if m["config"] != "present" || m["installed_roles"] != "both" || m["row_fact"] != string(retirement.RowAbsent) {
 				t.Fatalf("the installed host did not establish a fresh retained-node request: %s", out)
 			}
@@ -1303,6 +1314,7 @@ func TestTheDryRunHoldsCancellationUnderASingleControllerConfiguration(t *testin
 // A NODE-ONLY CONFIGURATION SKIPS THE LEDGER; that is no failed observation
 // of a controller. Neither the default identity path nor an old ledger may
 // supply evidence for a server section the installed configuration lacks.
+// The same host is ordinary without a request and unsupported with one.
 func TestTheDryRunRecognisesANodeWithoutAttemptingALedgerRead(t *testing.T) {
 	f := newRetireFixture(t)
 	writeFile(t, f.cfg, "node:\n  name: node-a\n  server_addr: 127.0.0.1:7717\n  provider: docker\n"+
@@ -1320,7 +1332,7 @@ func TestTheDryRunRecognisesANodeWithoutAttemptingALedgerRead(t *testing.T) {
 		want, why := "ordinary", ""
 		if requested {
 			args = append(args, "--requested")
-			want, why = "hold", "has a node and no server"
+			want, why = "unsupported-variant", "has a node and no server"
 		}
 		out, code := f.run(t, "", args...)
 		m := assertRetireRoute(t, out, code, want, why)
@@ -1520,11 +1532,11 @@ func TestTheDryRunRequiresAMutationReadyGuardOnlyForRetirement(t *testing.T) {
 						why = "readable journal"
 					}
 					if route == "unsupported-variant" {
-						body := mustRead(t, f.cfg) + "\nnode:\n  name: node-a\n  server_addr: 127.0.0.1:7717\n" +
+						body := "node:\n  name: node-a\n  server_addr: 127.0.0.1:7717\n" +
 							"  provider: docker\n  state_dir: " + filepath.Join(t.TempDir(), "node") + "\n"
 						writeFile(t, f.cfg, body, 0o600)
 						args = append(args, "--requested")
-						why = "keeps a node"
+						rowFact, why = retirement.RowUnreadable, "has a node and no server"
 					}
 				}
 				rec := f.guard.record(t)
@@ -1535,6 +1547,9 @@ func TestTheDryRunRequiresAMutationReadyGuardOnlyForRetirement(t *testing.T) {
 				m := assertRetireRoute(t, out, code, route, why)
 				if m["row_fact"] != string(rowFact) || rec.Preparing {
 					t.Fatalf("the undamaged guard's host did not establish the route: %s", out)
+				}
+				if route == "unsupported-variant" && (m["config"] != "present" || m["installed_roles"] != "node") {
+					t.Fatalf("the unsupported variant did not come from an installed node-only host: %s", out)
 				}
 
 				temporary := filepath.Join(f.guard.active(), guardTmpName)

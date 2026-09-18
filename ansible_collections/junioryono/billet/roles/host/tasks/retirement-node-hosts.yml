@@ -1,0 +1,18 @@
+---
+# THE ONE ANSWER TO WHICH HOSTS BEAR A NODE, computed from inventory alone and
+# before anything is reserved, so the variant's node-presence refusals and the
+# collection that must carry every node read the same set. Inventory is the
+# deployment, not the current control-plane play's host set; hostvars resolves
+# billet_config in its own host's context.
+- name: Reset the deployment's node-bearing host set
+  ansible.builtin.set_fact:
+    billet_retirement_node_hosts: []
+
+- name: Find every deployment host whose desired configuration bears a node
+  ansible.builtin.set_fact:
+    billet_retirement_node_hosts: "{{ billet_retirement_node_hosts + [item] }}"
+  loop: "{{ groups['all'] }}"
+  when: >-
+    (hostvars[item].billet_config | default({}) is mapping
+     and 'node' in hostvars[item].billet_config | default({}))
+    or hostvars[item].billet_enable_node | default(false) | bool

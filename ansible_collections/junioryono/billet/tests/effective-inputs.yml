@@ -320,6 +320,7 @@
     billet_gate_retirement_source: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/retirement.yml') | from_yaml }}"
     billet_gate_request_source: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/retirement-request.yml') | from_yaml }}"
     billet_gate_collect_source: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/retirement-collect.yml') }}"
+    billet_gate_node_hosts_source: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/retirement-node-hosts.yml') }}"
     billet_gate_collect_host_source: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/retirement-collect-host.yml') }}"
     billet_gate_endpoint_source: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/endpoint-decision.yml') }}"
   tasks:

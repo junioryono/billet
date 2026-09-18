@@ -26,19 +26,13 @@
 - name: Require the survivor in the retiring host's play
   ansible.builtin.assert:
     that: billet_retirement_survivor_host in ansible_play_hosts_all
-    fail_msg: >-
-      Retirement precondition: survivor {{ billet_retirement_survivor_host }} is outside
-      this play. Preparation in an earlier play cannot prove the survivor stayed healthy;
-      converge the survivor in the same play as the retiring host.
+    fail_msg: "Retirement precondition: survivor {{ billet_retirement_survivor_host }} is outside this play. Preparation in an earlier play cannot prove the survivor stayed healthy; converge the survivor in the same play as the retiring host."
   when: not ansible_check_mode
 
 - name: Require the survivor still active in this play
   ansible.builtin.assert:
     that: billet_retirement_survivor_host in ansible_play_hosts
-    fail_msg: >-
-      Retirement precondition: survivor {{ billet_retirement_survivor_host }} is no longer active
-      in this play (failure, unreachability, or an intentional end of that host).
-      Resolve the cause, then converge the survivor in the same play as the retiring host.
+    fail_msg: "Retirement precondition: survivor {{ billet_retirement_survivor_host }} is no longer active in this play (failure, unreachability, or an intentional end of that host). Resolve the cause, then converge the survivor in the same play as the retiring host."
   when: not ansible_check_mode
 
 - name: Require this converge's settled survivor guard
@@ -50,10 +44,7 @@
       - billet_retirement_peer.billet_exclusion_held | default(none) is sameas true
       - billet_retirement_peer.billet_exclusion_holder | default('') == billet_exclusion_holder
       - billet_retirement_peer.billet_upgrade_claim_shape | default('') == 'guard'
-    fail_msg: >-
-      Retirement precondition: survivor {{ billet_retirement_survivor_host }} needs a
-      settled, held, pointer-free guard published by its own preparation under
-      holder {{ billet_exclusion_holder }}. A skipped settlement is not success.
+    fail_msg: "Retirement precondition: survivor {{ billet_retirement_survivor_host }} needs a settled, held, pointer-free guard published by its own preparation under holder {{ billet_exclusion_holder }}. A skipped settlement is not success."
   when: not ansible_check_mode
 
 - name: Require the retiring host's preparation window closed
@@ -65,12 +56,45 @@
     fail_msg: 'Retirement precondition: this host is still preparing or has no settled pointer-free guard.'
   when: not ansible_check_mode
 
+- name: Require an observed installed controller role for the new request
+  ansible.builtin.assert:
+    that:
+      - billet_retirement_classification.config | default('unreadable') == 'present'
+      - billet_retirement_classification.installed_roles | default(none) in ['server', 'both']
+    fail_msg: "Retirement precondition: cannot select a fresh request variant from config={{ billet_retirement_classification.config | default('unreadable') }} and installed_roles={{ billet_retirement_classification.installed_roles | default(none) }}. A missing installed configuration observation is could-not-tell; establish a readable installed controller configuration before requesting retirement."
+
+- name: Select the new request's variant from the installed roles
+  ansible.builtin.set_fact:
+    billet_retirement_requested_variant: "{{ 'retained-node' if billet_retirement_classification.installed_roles == 'both' else 'server-only' }}"
+
+# ONE PREDICATE DECIDES WHETHER A HOST BEARS A NODE, and it is the collection's.
+# Deciding it twice once refused nothing here and then failed inside the reserved
+# window, which is a reservation to abandon rather than a converge that never
+# started; check mode reported that same host as ready.
+- name: Establish the deployment's node-bearing hosts before reserving anything
+  ansible.builtin.include_tasks: retirement-node-hosts.yml
+
+- name: Require inventory to retain the installed node
+  ansible.builtin.assert:
+    that: inventory_hostname in billet_retirement_node_hosts
+    fail_msg: 'Retirement precondition: the installed configuration has both server and node, and inventory bears no node for this host. Restore the installed node in billet_config to retain it; to remove it, first converge that removal as an ordinary change with billet_server_retire false, then request retirement.'
+  when: billet_retirement_requested_variant == 'retained-node'
+
+- name: Refuse an inventory node that is not installed
+  ansible.builtin.assert:
+    that: inventory_hostname not in billet_retirement_node_hosts
+    fail_msg: 'Retirement precondition: the installed configuration is server-only, and inventory bears a node for this host through billet_config or billet_enable_node. Remove the uninstalled node from inventory for server-only retirement; to retain it, first converge its installation as an ordinary change with billet_server_retire false, then request retirement.'
+  when: billet_retirement_requested_variant == 'server-only'
+
+- name: Require a policy that keeps the retained node running
+  ansible.builtin.assert:
+    that: billet_node_should_run | default(none) is sameas true
+    fail_msg: "Retirement precondition: retained-node retirement requires billet_node_should_run true, but billet_enable_node={{ billet_enable_node | default(none) }} and billet_server_prepare_only={{ billet_server_prepare_only | default(false) }}. Set billet_enable_node true and billet_server_prepare_only false before requesting retirement; a stopped or prepare-only node contradicts retention."
+  when: billet_retirement_requested_variant == 'retained-node'
+
 - name: Report the prospective new retirement
   ansible.builtin.debug:
-    msg: >-
-      Would request a server-only retirement through survivor {{ billet_retirement_survivor_host }}.
-      A real run needs that survivor prepared with a settled, held, pointer-free guard
-      under this converge's holder; check mode reserves and collects nothing.
+    msg: "Would request a {{ billet_retirement_requested_variant }} retirement through survivor {{ billet_retirement_survivor_host }}. {{ 'This host keeps its node.' if billet_retirement_requested_variant == 'retained-node' else '' }} A real run needs that survivor prepared with a settled, held, pointer-free guard under this converge's holder; check mode reserves and collects nothing."
   when: ansible_check_mode
 
 - name: Reserve and request the new retirement in a real converge
@@ -99,13 +123,13 @@
 
     - name: Reset the new request's reservation and collection
       ansible.builtin.set_fact:
-        billet_retirement_variant: server-only
+        billet_retirement_variant: "{{ billet_retirement_requested_variant }}"
+        billet_retirement_serverless_rendering: ""
         billet_retirement_survivor: "{{ billet_retirement_survivor_host }}"
         billet_retirement_local_environment_file: "{{ billet_retirement_environment_file }}"
         billet_retirement_reservation: {}
         billet_retirement_transition_id: ""
         billet_retirement_reports: {}
-        billet_retirement_node_hosts: []
         billet_retirement_desired_nodes: {}
         billet_retire_valid: false
         billet_retire_reservation: ""
@@ -158,6 +182,14 @@
             billet_retirement_transition_id: "{{ billet_retire_answer.transition_id }}"
           changed_when: true
 
+        - name: Render the retained configuration after binding the reservation
+          ansible.builtin.set_fact:
+            billet_retirement_serverless_rendering: >-
+              {{ lookup('ansible.builtin.template', 'billet.yaml.j2',
+                        template_vars={'billet_config_document': billet_config | junioryono.billet.serverless_config}) }}
+          no_log: true
+          when: billet_retirement_variant == 'retained-node'
+
         - name: Collect the deployment after reserving it
           ansible.builtin.include_tasks: retirement-collect.yml
 
@@ -166,14 +198,15 @@
             billet_retirement_shared_argv: "{{ billet_retirement_shared_argv + ['--shared-address', item] }}"
           loop: "{{ billet_retirement_shared_addresses }}"
 
-        - name: Request the server-only retirement with this collection
+        - name: Request the selected retirement variant with this collection
           ansible.builtin.command:
             argv: >-
               {{ [billet_retirement_answerer, 'server', 'retire', '--input', '-', '--json',
                   '--run', billet_exclusion_holder, '--retiring-host', inventory_hostname,
                   '--survivor-host', billet_retirement_survivor,
-                  '--installed-sha256', billet_retirement_installed.stat.checksum,
-                  '--server-only', '--config', '/etc/billet/billet.yaml']
+                  '--installed-sha256', billet_retirement_installed.stat.checksum]
+                 + (['--server-only'] if billet_retirement_variant == 'server-only' else [])
+                 + ['--config', '/etc/billet/billet.yaml']
                  + (['--reservation-fresh'] if billet_retirement_reservation.outcome == 'reserved' else [])
                  + (['--survivor-flagged'] if hostvars[billet_retirement_survivor].billet_server_retire | default(false) | bool else [])
                  + billet_retirement_shared_argv
@@ -198,20 +231,22 @@
             billet_retire_call: request
             billet_retire_answered_by: "{{ billet_retirement_answerer }}"
 
-        - name: Require the request to confirm this server-only retirement
+        - name: Require the request to confirm the selected retirement variant
           ansible.builtin.assert:
             that:
               - billet_retire_state_known | bool
               - billet_retire_answer.outcome in ['retired', 'unchanged']
-              - billet_retire_answer.variant | default('') == 'server-only'
+              - billet_retire_answer.variant | default('') == billet_retirement_variant
               - billet_retire_answer.state == 'done'
               - billet_retire_answer.transition_id == billet_retirement_transition_id
               # The receipt is paired with the variant here too: a request's first
               # tail-shaped answer that already settled never reaches the
-              # continuation's pairing, so a server-only answer claiming a receipt
-              # would otherwise be accepted.
-              - billet_retire_answer.outcome != 'retired' or billet_retire_answer.receipt | default('') == 'none'
-            fail_msg: The new request did not confirm this server-only retirement at a known done state with no receipt.
+              # continuation's pairing.
+              - >-
+                billet_retire_answer.outcome != 'retired'
+                or (billet_retirement_variant == 'server-only' and billet_retire_answer.receipt | default('') == 'none')
+                or (billet_retirement_variant == 'retained-node' and billet_retire_answer.receipt | default('') in ['written', 'current'])
+            fail_msg: "The new request did not confirm this {{ billet_retirement_variant }} retirement at a known done state with its matching receipt (none for server-only; written or current for retained-node)."
 
         - name: Bind the returned completion to the reservation
           ansible.builtin.assert:

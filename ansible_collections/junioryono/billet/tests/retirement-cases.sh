@@ -5,7 +5,7 @@
 cat >"$work/play-retirement.yml" <<'PLAY'
 ---
 - name: Capture the ordinary template in each node's context
-  hosts: control-b:node-a
+  hosts: "{{ 'control-a:control-b:node-a' if billet_gate_retained_request | default(false) | bool else 'control-b:node-a' }}"
   gather_facts: false
   tasks:
     - name: Capture the complete ordinary role rendering
@@ -16,6 +16,18 @@ cat >"$work/play-retirement.yml" <<'PLAY'
         dest: "{{ billet_gate_render_dir }}/{{ inventory_hostname }}.yaml"
         mode: "0600"
       when: billet_gate_capture_rendering | default(false) | bool
+      no_log: true
+    - name: Capture the independently projected retained rendering
+      vars:
+        billet_config_document: "{{ billet_config | dict2items | rejectattr('key', 'in', ['server', 'github', 'targets', 'backup']) | items2dict }}"
+      ansible.builtin.template:
+        src: "{{ billet_gate_ordinary_template }}"
+        dest: "{{ billet_gate_render_dir }}/control-a-serverless.yaml"
+        mode: "0600"
+      when:
+        - billet_gate_capture_rendering | default(false) | bool
+        - billet_gate_retained_request | default(false) | bool
+        - inventory_hostname == 'control-a'
       no_log: true
 - name: Exercise the retirement entry after real preparation
   hosts: "{{ [billet_gate_retirement_host | default('control-a'), 'control-b'] if billet_gate_new | default(false) | bool else billet_gate_retirement_host | default('control-a') }}"
@@ -124,6 +136,15 @@ cat >"$work/retirement-entry-tasks.yml" <<'PLAY'
       ansible.builtin.include_role:
         name: junioryono.billet.host
         tasks_from: retirement
+    - name: Prove the fresh retained answer was accepted
+      ansible.builtin.assert:
+        that:
+          - billet_retirement_requested_variant == 'retained-node'
+          - billet_retirement_result.variant == 'retained-node'
+          - billet_retirement_result.receipt == 'written'
+          - billet_retirement_result.settled is sameas true
+          - billet_retirement_bypass is sameas true
+      when: billet_gate_expect_retained_result | default(false) | bool
     - name: Ordinary convergence sentinel
       ansible.builtin.debug:
         msg: The ordinary boundary was reached.
@@ -444,11 +465,12 @@ INV
 # Assert the entire reservation/request argv, all delegated argv, the exact
 # document member sets, raw rendering hashes (including the final newline),
 # host-specific variable expansion and both positive and forbidden effects.
-r_new_document() { # case reserved|adopted
-  "$python" - "$work/cases/$1" "$here/fixtures" "$2" <<'PY'
+r_new_document() { # case reserved|adopted [server-only|retained-node]
+  "$python" - "$work/cases/$1" "$here/fixtures" "$2" "${3:-server-only}" <<'PY'
 import datetime, hashlib, json, pathlib, re, sys, yaml
 case, fixtures = map(pathlib.Path, sys.argv[1:3])
 outcome = sys.argv[3]
+retained = sys.argv[4] == 'retained-node'
 root = case / 'calls'
 calls = [json.loads(line) for line in (root / 'index.jsonl').read_text().splitlines()]
 def one(host, command):
@@ -463,7 +485,10 @@ digest = hashlib.sha256((case / 'installed.yaml.plant').read_bytes()).hexdigest(
 common = ['--json', '--run', 'ci-1', '--retiring-host', 'control-a', '--survivor-host', 'control-b', '--installed-sha256', digest]
 if reserve['argv'] != ['server', 'retire', '--reserve'] + common + ['--config', '/etc/billet/billet.yaml', '--environment-file', '/etc/billet/server.env']:
     sys.exit('reserve argv differs: ' + repr(reserve['argv']))
-expected = ['server', 'retire', '--input', '-'] + common + ['--server-only', '--config', '/etc/billet/billet.yaml']
+expected = ['server', 'retire', '--input', '-'] + common
+if not retained:
+    expected += ['--server-only']
+expected += ['--config', '/etc/billet/billet.yaml']
 if outcome == 'reserved':
     expected += ['--reservation-fresh']
 expected += ['--shared-address', '192.0.2.10', '--shared-address', '192.0.2.11', '--endpoint-failover-verified', '--report-max-age', '10m', '--environment-file', '/etc/billet/server.env']
@@ -473,8 +498,30 @@ if request['argv'] != expected:
 if not request['has_stdin']:
     sys.exit('request has no stdin')
 doc = json.loads((root / request['stdin']).read_text())
-if set(doc) != {'schema', 'round', 'self', 'survivor', 'nodes', 'desired', 'desired_nodes'} or type(doc['schema']) is not int or doc['schema'] != 1 or doc['desired'] is not None:
+if set(doc) != {'schema', 'round', 'self', 'survivor', 'nodes', 'desired', 'desired_nodes'} or type(doc['schema']) is not int or doc['schema'] != 1:
     sys.exit('new-request document shape differs')
+if retained:
+    if not isinstance(doc['desired'], str):
+        sys.exit('retained desired is not a rendering')
+    serverless = doc['desired'].encode('utf-8')
+    ordinary = (case / 'ordinary-render/control-a.yaml').read_bytes()
+    projected = (case / 'ordinary-render/control-a-serverless.yaml').read_bytes()
+    if serverless != projected:
+        sys.exit('retained B differs from independently projected ordinary template bytes')
+    if serverless == ordinary or not serverless.endswith(b'\n') or not ordinary.endswith(b'\n'):
+        sys.exit('retained B and full self rendering must be distinct bytes with final newlines')
+    full, reduced = yaml.safe_load(ordinary), yaml.safe_load(serverless)
+    removed = {'server', 'github', 'targets', 'backup'}
+    if not isinstance(full, dict) or not removed <= set(full) or 'node' not in full:
+        sys.exit('full self rendering lost a server member or its node')
+    if not isinstance(reduced, dict) or 'node' not in reduced or removed & set(reduced):
+        sys.exit('retained B has the wrong member set')
+    if reduced != {key: value for key, value in full.items() if key not in removed}:
+        sys.exit('retained B changed a member outside the four removed keys')
+    if yaml.safe_load((case / 'installed.yaml.plant').read_bytes()) != full:
+        sys.exit('retained installed and full desired configurations differ')
+elif doc['desired'] is not None:
+    sys.exit('server-only request carried a desired rendering')
 if set(doc['round']) != {'id', 'started_at'} or doc['round']['id'] != 'ci-1-' + doc['round']['started_at']:
     sys.exit('round binding differs')
 def timestamp(s):
@@ -485,10 +532,13 @@ started = timestamp(doc['round']['started_at'])
 reserved_at = datetime.datetime.fromisoformat(fixture('server-retire', outcome)['reserved_at'].replace('Z', '+00:00'))
 if started < reserved_at:
     sys.exit('round precedes reservation')
-if set(doc['nodes']) != {'control-b', 'node-a'} or set(doc['desired_nodes']) != set(doc['nodes']):
+node_hosts = {'control-a', 'control-b', 'node-a'} if retained else {'control-b', 'node-a'}
+if set(doc['nodes']) != node_hosts or set(doc['desired_nodes']) != node_hosts:
     sys.exit('collection omitted a deployment node or collected another host')
 if doc['nodes']['control-b'] != doc['survivor']:
     sys.exit('the node-bearing survivor needs its own nodes entry')
+if retained and doc['nodes']['control-a'] != doc['self']:
+    sys.exit('the retained host needs its full self envelope in nodes')
 for host, envelope, inspect_name, status_name in [
     ('control-a', doc['self'], 'postgres-controller-guarded', 'retirement-reserved'),
     ('control-b', doc['survivor'], 'postgres-controller-guarded', 'no-rollout'),
@@ -504,6 +554,8 @@ for host, envelope, inspect_name, status_name in [
     if envelope['status'] != expected_status:
         sys.exit('ledger document differs for ' + host)
     path = '/etc/billet/node-a.yaml' if host == 'node-a' else '/etc/billet/billet.yaml'
+    if retained and host == 'control-a':
+        path = '/etc/billet/control-a.yaml'
     inspection = one(host, 'release')
     if inspection['argv'] != ['release', 'inspect', '--json', '--config', path]:
         sys.exit('inspect argv differs for ' + host)
@@ -515,7 +567,7 @@ for host, envelope, inspect_name, status_name in [
             sys.exit('status did not use its executing host\'s observed environment')
         if not inspection['sequence'] < status['sequence'] < request['sequence']:
             sys.exit('status collected out of order')
-    if host != 'control-a':
+    if host in node_hosts:
         migration = one(host, 'migrate-endpoint')
         if migration['argv'] != ['node', 'migrate-endpoint', '--config', path, '--desired', '-', '--wait', '120s', '--dry-run', '--json']:
             sys.exit('endpoint dry-run argv differs for ' + host)
@@ -523,18 +575,20 @@ for host, envelope, inspect_name, status_name in [
         if not migration['has_stdin'] or not rendering.endswith(b'\n'):
             sys.exit('node did not receive exact configuration bytes')
         parsed = yaml.safe_load(rendering)
-        address = '127.0.0.1:7717' if host == 'control-b' else '127.0.0.1:7719'
+        address = '127.0.0.1:7719' if host == 'node-a' else '127.0.0.1:7717'
         if parsed['node'] != dict(name=host, server_addr=address, provider='docker'):
             sys.exit('configuration was not rendered in its own host context')
         ordinary = (case / 'ordinary-render' / (host + '.yaml')).read_bytes()
         if rendering != ordinary:
             sys.exit('collected rendering differs from ordinary role template bytes for ' + host)
-        endpoint_name = 'reported-unplanned' if host == 'control-b' else 'reported-planned'
+        endpoint_name = 'reported-planned' if host == 'node-a' else 'reported-unplanned'
         desired = doc['desired_nodes'][host]
         if desired != {'sha256': hashlib.sha256(ordinary).hexdigest(), 'endpoint': fixture('node-migrate-endpoint', endpoint_name)['to']}:
             sys.exit('desired node evidence was not computed from exact stdin and its own answer')
         if not inspection['sequence'] < migration['sequence'] < request['sequence']:
             sys.exit('endpoint collected out of order')
+        if status_name and not status['sequence'] < migration['sequence']:
+            sys.exit('endpoint preceded ledger status for ' + host)
 if any(c['host'] == 'node-a' and c['command'] == 'status' for c in calls):
     sys.exit('node with no ledger was asked for status')
 if any(c['command'] in ['retire-abandon', 'retire-complete', 'retire-acknowledge'] for c in calls):
@@ -545,7 +599,7 @@ if len(clocks) != 4 or any(c['host'] != 'control-a' or c['argv'] != ['-u', '+%Y-
 if not reserve['sequence'] < clocks[0]['sequence'] < one('control-a', 'release')['sequence']:
     sys.exit('round clock was not read freshly after reserve and before delegation')
 for clock, host in zip(clocks[1:], ['control-a', 'control-b', 'node-a']):
-    last_report = one(host, 'status' if host == 'control-a' else 'migrate-endpoint')
+    last_report = one(host, 'migrate-endpoint' if host in node_hosts else 'status')
     if not last_report['sequence'] < clock['sequence'] < request['sequence']:
         sys.exit('envelope clock was not read after its reports')
 # local prepare is a real early import effect, before the reservation.
@@ -555,424 +609,7 @@ if len(prepared) != 1 or prepared[0]['host'] != 'control-a' or prepared[0]['sequ
 PY
 }
 
-# R2: each static clause fails alone, in both modes. Missing preparation is
-# a real-run precondition, separately exercised by R16 below.
-for clause in upgrade policy survivor; do
-  for mode in normal check; do
-    name=r2-$clause-$mode
-    r_new "$name"
-    case "$clause" in
-      upgrade) a "$name" -e billet_gate_binary_upgrade=true; task='Require retirement outside a binary upgrade'; why='inside a binary upgrade' ;;
-      policy) a "$name" -e '{"billet_requested_server_should_run":true}'; task='Require a policy that leaves the retiring server stopped'; why='the policy will start the server' ;;
-      survivor) a "$name" -e billet_retirement_survivor_host=; task='Require a named survivor in this inventory'; why='no distinct inventory survivor' ;;
-    esac
-    if [ "$mode" = check ]; then a "$name" --check; fi
-    r_run "$name"
-    expect_refused "$name" "$task" "Retirement precondition: $why"
-    r_no_collection "$name"
-    expect_host_commands "$name" 'control-a retire-classify 1;'
-  done
-done
-
-# R16: both hosts prepare successfully in this play, then the survivor fails
-# before the old reset position or loses its real SSH connection there. A third
-# case removes it before reinclusion, leaving settled facts to test active-host
-# membership independently of the reset. Shared namespace preparation is serial.
-cat >"$work/play-retirement-survivor.yml" <<'PLAY'
----
-- name: Refuse a survivor removed after its first successful preparation
-  hosts: control-a:control-b
-  gather_facts: false
-  vars:
-    billet_exclusion_platform: Linux
-    billet_binary_src: ''
-    billet_requested_server_should_run: false
-  tasks:
-    - name: Prepare the retiring transport first
-      ansible.builtin.include_role:
-        name: junioryono.billet.host
-        tasks_from: prepare-exclusion
-      vars:
-        billet_allow_converge_from_billet_runner: true
-      when: inventory_hostname == 'control-a'
-    - name: Prepare the survivor transport first
-      ansible.builtin.include_role:
-        name: junioryono.billet.host
-        tasks_from: prepare-exclusion
-      vars:
-        billet_allow_converge_from_billet_runner: true
-      when: inventory_hostname == 'control-b'
-    - name: Prove the survivor completed its first preparation
-      ansible.builtin.assert:
-        that:
-          - billet_exclusion_settled is sameas true
-          - billet_exclusion_held is sameas true
-          - billet_exclusion_holder == 'ci-1'
-          - billet_upgrade_claim_shape == 'guard'
-          - billet_exclusion_answerer == '/usr/bin/billet'
-          - billet_exclusion_id | length > 0
-      when: inventory_hostname == 'control-b'
-    - name: Save the held survivor's run facts
-      ansible.builtin.set_fact:
-        billet_gate_first_guard:
-          held: "{{ billet_exclusion_held }}"
-          holder: "{{ billet_exclusion_holder }}"
-          id: "{{ billet_exclusion_id }}"
-          shape: "{{ billet_upgrade_claim_shape }}"
-          interrupted: "{{ billet_interrupted_upgrade }}"
-          recovery: "{{ billet_upgrade_recovery_dir }}"
-      when: inventory_hostname == 'control-b'
-    - name: Remove the survivor before a second inclusion
-      ansible.builtin.fail:
-        msg: The survivor failed after preparation and before reinclusion.
-      when: inventory_hostname == 'control-b' and billet_gate_survivor_failure == 'inactive'
-    - name: Lose the survivor's connection before its second preparation
-      ansible.builtin.set_fact:
-        ansible_connection: ssh
-        ansible_host: 127.0.0.1
-        ansible_port: 0
-        ansible_connect_timeout: 1
-        ansible_ssh_common_args: '-o BatchMode=yes -o ConnectionAttempts=1'
-      when: inventory_hostname == 'control-b' and billet_gate_survivor_failure == 'unreachable'
-    - name: Prepare the survivor a second time
-      ansible.builtin.include_role:
-        name: junioryono.billet.host
-        tasks_from: prepare-exclusion
-      vars:
-        billet_allow_converge_from_billet_runner: "{{ billet_gate_survivor_failure != 'failed' }}"
-      when: inventory_hostname == 'control-b'
-    - name: Prove the removed survivor's publication and held identity
-      vars:
-        peer: "{{ hostvars['control-b'] }}"
-      ansible.builtin.assert:
-        that:
-          - "'control-b' not in ansible_play_hosts"
-          - "'control-b' in ansible_play_hosts_all"
-          - peer.billet_exclusion_settled is sameas (billet_gate_survivor_failure == 'inactive')
-          - billet_gate_survivor_failure == 'inactive' or peer.billet_exclusion_answerer == ''
-          - billet_gate_survivor_failure == 'inactive' or peer.billet_exclusion_answered_now is sameas false
-          - billet_gate_survivor_failure == 'inactive' or peer.billet_exclusion_answerer_version == {'type':'unreadable'}
-          - peer.billet_exclusion_held == peer.billet_gate_first_guard.held
-          - peer.billet_exclusion_holder == peer.billet_gate_first_guard.holder
-          - peer.billet_exclusion_id == peer.billet_gate_first_guard.id
-          - peer.billet_upgrade_claim_shape == peer.billet_gate_first_guard.shape
-          - peer.billet_interrupted_upgrade == peer.billet_gate_first_guard.interrupted
-          - peer.billet_upgrade_recovery_dir == peer.billet_gate_first_guard.recovery
-      when: inventory_hostname == 'control-a'
-    - name: Route the retiring host with the failed survivor still in hostvars
-      ansible.builtin.include_role:
-        name: junioryono.billet.host
-        tasks_from: retirement
-      when: inventory_hostname == 'control-a'
-PLAY
-for failure in failed unreachable inactive; do
-  name=r16-second-$failure
-  r_new "$name"
-  e "$name" RUNNER_NAME=billet-survivor-failure
-  a "$name" -e "billet_gate_survivor_failure=$failure"
-  r_run "$name" play-retirement-survivor
-  case "$failure" in
-    failed) task='Refuse a converge driven from a billet-managed runner'; why='runner billet itself manages' ;;
-    unreachable) task='Inspect the managed binary and the upgrade root'; why='UNREACHABLE!' ;;
-    inactive) task='Remove the survivor before a second inclusion'; why='before reinclusion' ;;
-  esac
-  expect_refused "$name" "$task" "$why"
-  "$python" - "$work/cases/$name/out" <<'PYPREPARED'
-import pathlib, sys
-text = pathlib.Path(sys.argv[1]).read_text()
-for task, host in [("Prove the survivor completed its first preparation", 'control-b'),
-                   ("Prove the removed survivor's publication and held identity", 'control-a')]:
-    parts = text.split('TASK [' + task + ']')
-    if len(parts) != 2 or ('ok: [' + host + ']') not in parts[1].split('TASK [', 1)[0]:
-        sys.exit('R16 did not prove preparation/publication on ' + host + ': ' + task)
-PYPREPARED
-  expect_final "$name" 'Retirement precondition: survivor control-b is no longer active in this play (failure, unreachability, or an intentional end of that host).' 'Resolve the cause, then converge the survivor in the same play as the retiring host.'
-  r_no_collection "$name"
-  expect_host_commands "$name" 'control-a retire-classify 1;'
-done
-
-# R16: successful preparation in an earlier play leaves settled hostvars but
-# supplies no evidence that the survivor stayed healthy outside this play.
-cat >"$work/play-retirement-earlier-survivor.yml" <<'PLAY'
----
-- name: Prepare the survivor in an earlier play
-  hosts: control-b
-  gather_facts: false
-  vars:
-    billet_exclusion_platform: Linux
-    billet_binary_src: ''
-  tasks:
-    - name: Prepare the survivor transport
-      ansible.builtin.include_role:
-        name: junioryono.billet.host
-        tasks_from: prepare-exclusion
-- name: Attempt retirement in a separate play
-  hosts: control-a
-  gather_facts: false
-  vars:
-    billet_exclusion_platform: Linux
-    billet_binary_src: ''
-    billet_requested_server_should_run: false
-  tasks:
-    - name: Prepare the retiring transport
-      ansible.builtin.include_role:
-        name: junioryono.billet.host
-        tasks_from: prepare-exclusion
-    - name: Prove the earlier survivor's settled facts remain outside this play
-      vars:
-        peer: "{{ hostvars['control-b'] }}"
-      ansible.builtin.assert:
-        that:
-          - "'control-b' not in ansible_play_hosts_all"
-          - "'control-b' not in ansible_play_hosts"
-          - peer.billet_exclusion_settled is sameas true
-          - peer.billet_exclusion_held is sameas true
-          - peer.billet_exclusion_holder == billet_exclusion_holder
-          - peer.billet_upgrade_claim_shape == 'guard'
-          - peer.billet_exclusion_answerer == '/usr/bin/billet'
-          - peer.billet_exclusion_id | length > 0
-    - name: Route retirement with only earlier-play survivor evidence
-      ansible.builtin.include_role:
-        name: junioryono.billet.host
-        tasks_from: retirement
-PLAY
-r_new r16-earlier-play
-r_run r16-earlier-play play-retirement-earlier-survivor
-expect_refused r16-earlier-play "Require the survivor in the retiring host's play" \
-  'Retirement precondition: survivor control-b is outside this play.' \
-  'Preparation in an earlier play cannot prove the survivor stayed healthy; converge the survivor in the same play as the retiring host.'
-expect_play_task_ran r16-earlier-play "Prove the earlier survivor's settled facts remain outside this play"
-r_no_collection r16-earlier-play
-expect_host_commands r16-earlier-play 'control-a retire-classify 1;'
-
-# R16: the other clauses remain true, so settled alone, a skipped settlement,
-# another holder and a binary pointer each have an independent witness.
-for clause in unsettled holder pointer unheld; do
-  name=r16-$clause
-  r_new "$name"
-  a "$name" -e "billet_gate_peer_clause=$clause"
-  r_run "$name"
-  expect_refused "$name" "Require this converge's settled survivor guard" 'needs a settled, held, pointer-free guard'
-  r_no_collection "$name"
-  expect_host_commands "$name" 'control-a retire-classify 1;'
-done
-r_new r2-unprepared
-# A real run has no published survivor guard at all; setting an answerer is
-# insufficient. The check-mode partner reports the prerequisite and succeeds.
-a r2-unprepared -e billet_gate_peer=false
-r_run r2-unprepared
-expect_refused r2-unprepared "Require this converge's settled survivor guard" 'needs a settled, held, pointer-free guard'
-r_no_collection r2-unprepared
-r_new r2-preview
-a r2-preview --check -e billet_gate_peer=false
-r_run r2-preview
-expect_allowed r2-preview
-expect_ran r2-preview 'Report the prospective new retirement'
-expect_host_commands r2-preview 'control-a retire-classify 1;'
-r_no_collection r2-preview
-grep -qF 'A real run needs that survivor prepared' "$work/cases/r2-preview/out" || fail 'r2-preview: missing survivor preparation report'
-
-# R19 and the end-to-end success: the fake answers without judging the flag,
-# and exact argv assertions kill passing it after adoption or omitting it fresh.
-for outcome in reserved adopted; do
-  name=r19-$outcome
-  r_new "$name" "$outcome"
-  mkdir -p "$work/cases/$name/ordinary-render"
-  a "$name" -e billet_gate_capture_rendering=true -e "billet_gate_ordinary_template=$role_tasks/../templates/billet.yaml.j2" -e "billet_gate_render_dir=$work/cases/$name/ordinary-render"
-  # Per-host retirement policy must remain distinct in hostvars.
-  a "$name" -e '{"billet_retirement_shared_addresses":["192.0.2.10","192.0.2.11"],"billet_retirement_endpoint_failover_verified":true}'
-  r_run "$name"
-  expect_allowed "$name"
-  expect_host_commands "$name" 'control-a retire-classify 1;control-a retire-reserve 1;control-a retire-request 1;'
-  expect_ran "$name" "Prepare this host's authority exclusion"
-  expect_ran "$name" "Keep the new retirement's result"
-  r_no_ordinary_after_request "$name"
-  r_new_document "$name" "$outcome"
-done
-
-# §4.4 on the fresh request: its first answer can already be settled, so it
-# never reaches the continuation's pairing. A server-only answer claiming a
-# receipt passes the strict parser; only the request's own pairing refuses it.
-r_new r19-server-with-receipt
-"$python" - "$work/retire-fixtures" "$work/cases/r19-server-with-receipt" <<'PYRECEIPT'
-import json, pathlib, shutil, sys
-fixtures, case = map(pathlib.Path, sys.argv[1:3])
-for name in ['dry-run-new-request', 'reserved', 'abandoned']:
-    shutil.copyfile(fixtures / (name + '.json'), case / (name + '.json'))
-answer = json.loads((fixtures / 'retired-settled.json').read_text())
-if answer.get('variant') != 'server-only' or answer.get('receipt') != 'none':
-    sys.exit('retired-settled.json is no longer a server-only answer with no receipt')
-answer['receipt'] = 'written'
-(case / 'retired-settled.json').write_text(json.dumps(answer))
-PYRECEIPT
-e r19-server-with-receipt "BILLET_GATE_RETIRE_FIXTURES=$work/cases/r19-server-with-receipt"
-r_run r19-server-with-receipt
-# failed_at names the first failure; the rescue's final fail carries the
-# original task name and the cleanup result after it.
-expect_refused r19-server-with-receipt 'Require the request to confirm this server-only retirement' \
-  'with no receipt' 'Afterwards: ' 'Ordinary host tasks remain bypassed.'
-expect_no_task r19-server-with-receipt "Keep the new retirement's result"
-r_no_ordinary_after_request r19-server-with-receipt
-
-# R19 mutation: override only collection's rendering, retaining a server map
-# but dropping one member. The ordinary Ansible render remains independent.
-r_new r19-dropped-server-member
-mkdir -p "$work/cases/r19-dropped-server-member/ordinary-render"
-a r19-dropped-server-member -e billet_gate_capture_rendering=true -e "billet_gate_ordinary_template=$role_tasks/../templates/billet.yaml.j2" -e "billet_gate_render_dir=$work/cases/r19-dropped-server-member/ordinary-render"
-cat >"$work/cases/r19-dropped-server-member/mutation.yml" <<'VARS'
-billet_retirement_shared_addresses: [192.0.2.10, 192.0.2.11]
-billet_retirement_endpoint_failover_verified: true
-billet_retirement_collect_rendering: >-
-  {{ lookup('ansible.builtin.template', 'billet.yaml.j2',
-            template_vars={'billet_config_document':
-              (billet_retirement_collect_vars.billet_config | combine({'server':
-                billet_retirement_collect_vars.billet_config.server | dict2items |
-                rejectattr('key', 'equalto', 'max_vcpu') | items2dict}))
-              if billet_retirement_collect_host == 'control-b'
-              else billet_retirement_collect_vars.billet_config}) }}
-VARS
-a r19-dropped-server-member -e "@$work/cases/r19-dropped-server-member/mutation.yml"
-r_run r19-dropped-server-member
-expect_allowed r19-dropped-server-member
-if r_new_document r19-dropped-server-member reserved >"$work/cases/r19-dropped-server-member/mutation-out" 2>&1; then
-  fail 'R19 accepted a collected rendering missing a server member'
-fi
-grep -qFx 'collected rendering differs from ordinary role template bytes for control-b' "$work/cases/r19-dropped-server-member/mutation-out" || fail 'R19 mutation failed for a reason other than ordinary-render byte equality' "$work/cases/r19-dropped-server-member/mutation-out"
-
-# R13: node-a's connection plugin really cannot connect, after the row was
-# reserved and the survivor was collected. No module exit stands for this.
-r_new r13-unreachable
-e r13-unreachable BILLET_GATE_RETIRE_OBLIGATION=/var/lib/billet/gate-reservation
-cat >>"$work/cases/r13-unreachable/inventory.yml" <<'INV'
-      ansible_connection: ssh
-      ansible_host: 127.0.0.1
-      ansible_port: 0
-      ansible_connect_timeout: 1
-      ansible_ssh_common_args: '-o BatchMode=yes -o ConnectionAttempts=1'
-INV
-r_run r13-unreachable
-expect_refused r13-unreachable "Collect the host's release inspection" 'node-a release inspection was unsuccessful or unreachable'
-expect_final r13-unreachable 'The reservation was abandoned.'
-expect_host_commands r13-unreachable 'control-a retire-classify 1;control-a retire-reserve 1;control-a retire-abandon 1;'
-r_no_ordinary_after_request r13-unreachable
-expect_path_absent r13-unreachable /var/lib/billet/gate-reservation
-"$python" - "$work/cases/r13-unreachable" <<'PY'
-import json, pathlib, sys
-case = pathlib.Path(sys.argv[1])
-text = (case / 'out').read_text()
-if 'UNREACHABLE!' not in text or 'node-a' not in text:
-    sys.exit('R13 did not establish connection-layer UNREACHABLE')
-header = 'TASK [junioryono.billet.host : Require a successful delegated release inspection]'
-blocks = text.split(header)[1:]
-failures = [b.split('TASK [', 1)[0] for b in blocks if 'fatal: [control-a]:' in b.split('TASK [', 1)[0]]
-if len(failures) != 1 or 'node-a release inspection was unsuccessful or unreachable' not in failures[0] or 'UNREACHABLE!' in failures[0]:
-    sys.exit('R13 did not convert unreachable into an ordinary retiring-host assertion failure')
-calls = [json.loads(line) for line in (case / 'calls/index.jsonl').read_text().splitlines()]
-if any(c['host'] == 'node-a' for c in calls):
-    sys.exit('an unreachable transport ran a module')
-if sum(c['host'] == 'control-b' and c['command'] == 'release' for c in calls) != 1:
-    sys.exit('R13 failed before reaching delegated collection')
-abandon = [c for c in calls if c['command'] == 'retire-abandon']
-if len(abandon) != 1 or abandon[0]['argv'] != ['server', 'retire', '--abandon-reservation', '--json', '--run', 'ci-1', '--retiring-host', 'control-a', '--config', '/etc/billet/billet.yaml', '--environment-file', '/etc/billet/server.env']:
-    sys.exit('R13 cleanup did not carry exact local abandonment argv')
-PY
-
-# Missing desired rendering, missing prepared answerer and failed status may
-# not silently remove a node or survivor from the collected document.
-for clause in rendering answerer status; do
-  name=r-collection-$clause
-  r_new "$name"
-  case "$clause" in
-    rendering)
-      "$python" - "$work/cases/$name/inventory.yml" <<'PYRENDER'
-import pathlib, sys, yaml
-p = pathlib.Path(sys.argv[1])
-d = yaml.safe_load(p.read_text())
-d['all']['hosts']['node-a'].update(billet_config={}, billet_enable_node=True)
-p.write_text(yaml.safe_dump(d))
-PYRENDER
-      task="Require this node's complete desired configuration"; why='node node-a has no complete desired rendering' ;;
-    answerer)
-      a "$name" -e billet_gate_no_answerer=true
-      task='Require a prepared answerer for every collected host'; why='node-a has no prepared answerer' ;;
-    status)
-      e "$name" "BILLET_GATE_REPORT_ANSWERS=control-a:release:1:$here/fixtures/release-inspect/postgres-controller-guarded.json:0;control-a:status:1:$here/fixtures/rollout-status/retirement-reserved.json:0;control-b:release:1:$here/fixtures/release-inspect/postgres-controller-guarded.json:0;control-b:status:1:$here/fixtures/rollout-status/no-rollout.json:3"
-      task='Require a successful delegated ledger status'; why='control-b ledger status was unsuccessful or unreachable' ;;
-  esac
-  r_run "$name"
-  expect_refused "$name" "$task" "$why"
-  expect_final "$name" 'The reservation was abandoned.'
-  expect_host_commands "$name" 'control-a retire-classify 1;control-a retire-reserve 1;control-a retire-abandon 1;'
-  r_no_ordinary_after_request "$name"
-done
-
-# Binding corruption stays case-local; the corpus always comes from Go.
-for member in run retiring survivor transition_id; do
-  name=r-reservation-binding-$member
-  r_new "$name" adopted
-  mkdir -p "$work/cases/$name/answers"
-  cp "$work/retire-fixtures/"*.json "$work/cases/$name/answers/"
-  "$python" - "$work/cases/$name/answers" "$member" <<'PY'
-import json, pathlib, sys
-root, member = pathlib.Path(sys.argv[1]), sys.argv[2]
-p = root / 'adopted.json'
-d = json.loads(p.read_text())
-d[member] = 'fedcba9876543210fedcba9876543210' if member == 'transition_id' else 'another'
-p.write_text(json.dumps(d))
-# The classifier's reservation observation supplies the old transition id.
-p = root / 'dry-run-new-request.json'
-d = json.loads(p.read_text())
-a = json.loads((root / 'reserved.json').read_text())
-d.update(row={k: a[k] for k in ['retiring', 'survivor', 'run', 'transition_id', 'reserved_at']}, row_fact='reserved-mine', dispatch='adopt')
-d['row']['state'] = 'reserved'
-p.write_text(json.dumps(d))
-PY
-  e "$name" "BILLET_GATE_RETIRE_FIXTURES=$work/cases/$name/answers"
-  r_run "$name"
-  expect_refused "$name" 'Bind the reservation before collecting anything' 'reservation binding disagrees'
-  expect_host_commands "$name" 'control-a retire-classify 1;control-a retire-reserve 1;control-a retire-abandon 1;'
-  expect_no_task "$name" "Read the retiring host's clock before the first collection delegation"
-  r_no_ordinary_after_request "$name"
-done
-
-# R20: the classifier sees the actual damage AFTER preparation; it may not
-# enter the early account import, settle it, or remove the interrupted rewrite.
-cat >"$work/retirement-own-guard.py" <<'PY'
-import json, pathlib, sys
-p = pathlib.Path('/var/lib/billet/upgrades/active/guard.json')
-d = json.loads(p.read_text())
-if d.get('preparing', False) or d['holder'] != 'ci-1':
-    sys.exit('R20 must start with this converge\'s settled guard')
-if sys.argv[1] == 'preparing':
-    d['preparing'] = True
-    d['token'] = 'a' * 32
-    p.write_text(json.dumps(d))
-elif sys.argv[1] == 'interrupted-rewrite':
-    p.with_name('guard.json.tmp').write_text('interrupted guard record')
-else:
-    sys.exit('unknown own guard damage')
-PY
-for damage in preparing interrupted-rewrite; do
-  name=r20-$damage
-  r_new "$name"
-  a "$name" -e "billet_gate_own_guard=$damage" -e "billet_gate_own_guard_script=$work/retirement-own-guard.py"
-  r_answers "$name" "control-a:classify:1:dry-run-hold-$damage.json:0"
-  r_run "$name"
-  r_held "$name" hold
-  r_reported "$name" hold "${damage//-/ }"
-  r_no_collection "$name"
-  expect_play_task_ran "$name" 'Inject an unfinished own guard after preparation'
-  if [ "$damage" = preparing ]; then
-    expect_state "$name" record_preparing True
-  else
-    expect_state "$name" record_preparing False
-    expect_state "$name" record_tmp file
-  fi
-done
-
-# R17: the fake establishes the marker-before-journal window at the request;
-# its cleanup effect is gated on an actual abandon invocation, never on failure
-# alone. The unknown-intent-journal answer must be produced/harvested by Go.
+# Shared marker setup for the request failure and earlier-guard witnesses.
 cat >"$work/retirement-window.py" <<'PY'
 import json, pathlib, sys
 root = pathlib.Path('/var/lib/billet')
@@ -993,447 +630,27 @@ else:
     sys.exit('unknown retirement window action')
 record.write_text(json.dumps(d))
 PY
-# A per-case executable wrapper around the already-recording managed wrapper
-# plants the marker and observes cleanup; preparation still runs the real Go
-# guard. It has no retirement answer of its own.
-cat >"$work/retirement-window-wrapper" <<WRAP
-#!/bin/bash
-set -eu
-case "\$*" in
-  'server retire --input '*)
-    '$python' '$work/retirement-window.py' mark
-    if [ "\${BILLET_GATE_WINDOW_CLEANUP:-}" = unreachable ]; then touch /var/lib/billet/gate-disconnect; fi ;;
-  'server retire --abandon-reservation '*)
-    if [ "\${BILLET_GATE_WINDOW_CLEANUP:-}" = success ]; then '$python' '$work/retirement-window.py' abandon; fi ;;
-esac
-exec /usr/bin/billet.window-backing "\$@"
-WRAP
-chmod 0755 "$work/retirement-window-wrapper"
-for cleanup in success refused unanswered unreachable released; do
-  name=r17-$cleanup
-  r_new "$name"
-  request_fixture=unknown-intent-journal
-  request_exit=3
-  abandon_fixture=abandoned-marker-cleared
-  abandon_exit=0
-  if [ "$cleanup" = released ]; then
-    request_fixture=refused-request-released
-    request_exit=2
-  else
-    p "$name" "mv /usr/bin/billet /usr/bin/billet.window-backing; cp '$work/retirement-window-wrapper' /usr/bin/billet"
-  fi
-  if [ "$cleanup" = refused ]; then abandon_fixture=refused-abandon-journal; abandon_exit=2; fi
-  r_answers "$name" "control-a:classify:1:dry-run-new-request.json:0;control-a:reserve:1:reserved.json:0;control-a:request:1:$request_fixture.json:$request_exit;control-a:abandon:1:$abandon_fixture.json:$abandon_exit"
-  e "$name" "BILLET_GATE_WINDOW_CLEANUP=$cleanup"
-  if [ "$cleanup" = unreachable ]; then
-    "$python" - "$work/cases/$name/inventory.yml" <<'PYCONNECTION'
-import pathlib, sys, yaml
-p = pathlib.Path(sys.argv[1])
-d = yaml.safe_load(p.read_text())
-d['all']['hosts']['control-a'].update(
-    ansible_connection="{{ 'ssh' if lookup('ansible.builtin.fileglob', '/var/lib/billet/gate-disconnect') | length > 0 else 'local' }}",
-    ansible_host='127.0.0.1', ansible_port=0, ansible_connect_timeout=1,
-    ansible_ssh_common_args='-o BatchMode=yes -o ConnectionAttempts=1')
-p.write_text(yaml.safe_dump(d))
-PYCONNECTION
-  fi
-  if [ "$cleanup" = unanswered ]; then e "$name" 'BILLET_GATE_DROP_ANSWER=retire-abandon:1'; fi
-  post "$name" "cp /var/lib/billet/upgrades/active/guard.json '$work/cases/$name/guard-after.json'"
-  r_run "$name"
-  "$python" - "$work/cases/$name/guard-after.json" "$cleanup" <<'PYMARKER'
-import json, sys
-d = json.load(open(sys.argv[1]))
-kept = sys.argv[2] in ['refused', 'unanswered', 'unreachable']
-if ('transition' in d) != kept:
-    sys.exit('R17 left the wrong marker state after cleanup')
-if kept and d['transition'] != {'kind': 'retirement', 'id': '0123456789abcdef0123456789abcdef'}:
-    sys.exit('R17 changed an unproved marker')
-PYMARKER
-  expect_refused "$name" "Refuse the retirement's answer" "was $([ "$request_exit" = 3 ] && echo unknown || echo refused)"
-  # Compare the decoded final diagnostic with the producer's whole reason;
-  # a common word such as journal could come from cleanup alone.
-  final_fatal "$name" >"$work/cases/$name/final-failure"
-  PYTHONPATH="$here" "$python" -B - "$work/cases/$name/final-failure" "$work/retire-fixtures/$request_fixture.json" "$cleanup" "$work/retire-fixtures/$abandon_fixture.json" "$work/cases/$name/out" <<'PYWHY'
-import json, pathlib, sys
-from callback_result import callback_message
-text = pathlib.Path(sys.argv[1]).read_text()
-message = callback_message(text, pathlib.Path(sys.argv[1]).parent.name + ': final fatal task', failed=True)
-original = json.loads(pathlib.Path(sys.argv[2]).read_text())['why']
-if original not in message:
-    sys.exit('R17 lost the original request reason during cleanup')
-if sys.argv[3] == 'refused':
-    cleanup = json.loads(pathlib.Path(sys.argv[4]).read_text())['why']
-    if cleanup not in message or message.index(original) >= message.index(cleanup):
-        sys.exit('R17 did not report cleanup refusal after the original reason')
-if sys.argv[3] in ['unanswered', 'unreachable'] and "did not answer retirement's abandon call" not in message:
-    sys.exit('R17 did not report unanswered cleanup beside the original reason')
-if sys.argv[3] == 'unreachable':
-    output = pathlib.Path(sys.argv[5]).read_text()
-    parts = output.split('TASK [junioryono.billet.host : Ask abandonment to discharge the reservation]')
-    if len(parts) != 2 or 'fatal: [control-a]: UNREACHABLE!' not in parts[1].split('TASK [', 1)[0]:
-        sys.exit('R17 did not lose the connection specifically at abandonment')
-    for clause in ['reservation for retiring host control-a', 'survivor control-b', 'run ci-1',
-                   'transition 0123456789abcdef0123456789abcdef', 'is not proved released']:
-        if clause not in message:
-            sys.exit('R17 did not name its outstanding reservation: ' + clause)
-PYWHY
-  r_no_ordinary_after_request "$name"
-  expect_path_absent "$name" /var/lib/billet/retired/journal.json
-  if [ "$cleanup" = released ]; then
-    expect_host_commands "$name" 'control-a retire-classify 1;control-a retire-reserve 1;control-a retire-request 1;'
-    expect_final "$name" 'reservation released; abandonment was skipped'
-  else
-    if [ "$cleanup" = unreachable ]; then
-      expect_host_commands "$name" 'control-a retire-classify 1;control-a retire-reserve 1;control-a retire-request 1;'
-      grep -qF 'UNREACHABLE!' "$work/cases/$name/out" || fail "$name: abandonment did not lose its connection"
-      expect_ran "$name" 'Keep the cleanup refusal beside the original failure'
-    else
-      expect_host_commands "$name" 'control-a retire-classify 1;control-a retire-reserve 1;control-a retire-request 1;control-a retire-abandon 1;'
-    fi
-    if [ "$cleanup" = success ]; then
-      expect_final "$name" 'The reservation was abandoned.'
-    else
-      expect_final "$name" 'Cleanup remains outstanding:'
-    fi
-    expect_final "$name" 'journal'
-  fi
-done
-# R6: R5 already proves the continuation entry and unprepared-survivor report.
-# This adds the new-request entry, including the local-only post-ack document
-# and observable marker/settlement effects at each of the three tail calls.
-cat >"$work/retirement-tail-effects.py" <<'PYTAILSTATE'
-import json, pathlib, sys
-root = pathlib.Path('/var/lib/billet')
-record = root / 'upgrades/active/guard.json'
-guard = json.loads(record.read_text())
-path = root / 'gate-tail-state.json'
-state = json.loads(path.read_text()) if path.exists() else dict(row='reserved', acknowledged=False, settled=False, events=[])
-action = sys.argv[1]
-if action == 'request':
-    if any(e['action'] == 'request' for e in state['events']):
-        guard.pop('transition', None)
-        state['settled'] = True
-    else:
-        guard['transition'] = {'kind': 'retirement', 'id': '0123456789abcdef0123456789abcdef'}
-        state['row'] = 'pending'
-elif action == 'complete':
-    state['row'] = 'done'
-elif action == 'acknowledge':
-    state['acknowledged'] = True
-else:
-    sys.exit('unknown tail effect')
-state['events'].append(dict(action=action, row=state['row'], acknowledged=state['acknowledged'], settled=state['settled'], marker=guard.get('transition')))
-record.write_text(json.dumps(guard))
-path.write_text(json.dumps(state))
-PYTAILSTATE
-cat >"$work/retirement-tail-wrapper" <<WRAP
-#!/bin/bash
-set -eu
-status=0
-/usr/bin/billet.tail-backing "\$@" || status=\$?
-if [ "\$status" = 0 ]; then
-  case "\$*" in
-    'server retire --input '*) '$python' '$work/retirement-tail-effects.py' request ;;
-    'server retire --complete-row '*) '$python' '$work/retirement-tail-effects.py' complete ;;
-    'server retire --acknowledge-row '*) '$python' '$work/retirement-tail-effects.py' acknowledge ;;
-  esac
+
+if retirement_section request-evidence; then
+  . "$here/retirement-request-evidence-cases.sh"
+  retirement_section_finished
 fi
-exit "\$status"
-WRAP
-chmod 0755 "$work/retirement-tail-wrapper"
-r_new r6-request-handoff
-p r6-request-handoff "mv /usr/bin/billet /usr/bin/billet.tail-backing; cp '$work/retirement-tail-wrapper' /usr/bin/billet"
-r_answers r6-request-handoff 'control-a:classify:1:dry-run-new-request.json:0;control-a:reserve:1:reserved.json:0;control-a:request:1:retired-pending.json:0;control-b:complete:1:completed.json:0;control-a:acknowledge:1:acknowledged.json:0;control-a:request:2:retired-after-survivor-ack.json:0'
-post r6-request-handoff "cp /var/lib/billet/gate-tail-state.json '$work/cases/r6-request-handoff/tail-after.json'; cp /var/lib/billet/upgrades/active/guard.json '$work/cases/r6-request-handoff/guard-after.json'"
-r_run r6-request-handoff
-expect_allowed r6-request-handoff
-r_no_ordinary_after_request r6-request-handoff
-expect_host_commands r6-request-handoff 'control-a retire-classify 1;control-a retire-reserve 1;control-a retire-request 1;control-b retire-complete 1;control-a retire-acknowledge 1;control-a retire-request 2;'
-expect_no_task r6-request-handoff 'Report a row obligation whose survivor this converge did not prepare'
-# expect_ran reads ok/changed results; include_tasks reports included instead.
-# Assert the settlement command inside the include, after the exact call order.
-expect_ran r6-request-handoff "Continue through the journal's recorded survivor"
-PYTHONPATH="$here" "$python" -B - "$work/cases/r6-request-handoff" "$work/retire-fixtures" <<'PYTAIL'
-import json, pathlib, sys
-from callback_result import callback_message
-case, fixtures = map(pathlib.Path, sys.argv[1:])
-root = case / 'calls'
-calls = [json.loads(line) for line in (root / 'index.jsonl').read_text().splitlines()]
-retire = [c for c in calls if c['command'].startswith('retire-')]
-request, complete, ack, continuation = retire[2:]
-def document(call):
-    if not call['has_stdin']:
-        sys.exit('a pending-row call omitted its document')
-    return json.loads((root / call['stdin']).read_text())
-if complete['argv'] != ['server', 'retire', '--complete-row', '--json', '--run', 'ci-1', '--as-host', 'control-b', '--completion', '-', '--config', '/etc/billet/billet.yaml', '--environment-file', '/etc/billet/server.env']:
-    sys.exit('pending completion argv differs')
-if ack['argv'] != ['server', 'retire', '--acknowledge-row', '--json', '--run', 'ci-1', '--retiring-host', 'control-a', '--answer', '-', '--config', '/etc/billet/billet.yaml']:
-    sys.exit('pending acknowledgement argv differs')
-if continuation['argv'] != ['server', 'retire', '--input', '-', '--json', '--run', 'ci-1', '--retiring-host', 'control-a', '--survivor-host', 'control-b', '--config', '/etc/billet/billet.yaml', '--environment-file', '/etc/billet/server.env']:
-    sys.exit('post-acknowledgement continuation argv differs')
-if document(complete) != json.loads((fixtures / 'retired-pending.json').read_text())['completion']:
-    sys.exit('the survivor did not receive the pending completion')
-if document(ack) != json.loads((fixtures / 'completed.json').read_text()):
-    sys.exit('acknowledgement did not carry the survivor answer')
-original = document(request)
-expected = dict(schema=1, round=original['round'], self=dict(original['self'], status=None), survivor=None, nodes={}, desired=None)
-if document(continuation) != expected:
-    sys.exit('the final continuation did not keep exactly the collected local envelope')
-if any(c['sequence'] > request['sequence'] and c['command'] in ['release', 'status', 'migrate-endpoint', 'collection-clock', 'retire-reserve', 'retire-abandon'] for c in calls):
-    sys.exit('the pending tail recollected, reserved or abandoned')
-marker = dict(kind='retirement', id='0123456789abcdef0123456789abcdef')
-expected_events = [dict(action=a, row=r, acknowledged=k, settled=s, marker=m) for a, r, k, s, m in [
-    ('request', 'pending', False, False, marker),
-    ('complete', 'done', False, False, marker),
-    ('acknowledge', 'done', True, False, marker),
-    ('request', 'done', True, True, None),
-]]
-state = json.loads((case / 'tail-after.json').read_text())
-if state != dict(row='done', acknowledged=True, settled=True, events=expected_events):
-    sys.exit('the three tail calls did not preserve the marker until final settlement: ' + repr(state))
-if 'transition' in json.loads((case / 'guard-after.json').read_text()):
-    sys.exit('the final continuation left the marker')
-text = (case / 'out').read_text()
-parts = text.split("TASK [junioryono.billet.host : Report the new retirement's settlement or obligation]")
-if len(parts) != 2:
-    sys.exit('the request did not report its final settlement')
-message = callback_message(parts[1].split('TASK [', 1)[0], case.name + ': settlement')
-if not message.startswith('Retirement is locally done; settled=True.') or 'Ordinary host tasks remain bypassed.' not in message:
-    sys.exit('the request reported its pre-acknowledgement state: ' + message)
-PYTAIL
-
-# R12: cancellation uses the observed survivor even when inventory names an
-# unreachable alternative. The row starts under ci-0; this converge is ci-1.
-for scenario in success check adopt-refused adopt-unanswered adopt-unreachable adopt-fresh adopt-fresh-refused adopt-fresh-unanswered adopt-fresh-transition adopt-run adopt-retiring adopt-survivor adopt-transition abandon-refused abandon-unanswered abandon-transition abandon-unreachable; do
-  name=r12-$scenario
-  r_plant "$name"
-  ep_plant_config "$name" 127.0.0.1:7717 server-only
-  a "$name" -e billet_converge_guard_holder=ci-1 -e billet_gate_cancel=true -e billet_server_retire=false -e billet_retirement_survivor_host=unreachable
-  e "$name" 'BILLET_GATE_RETIRE_ENV=/etc/billet/server.env (ignore_errors=yes)'
-  e "$name" BILLET_GATE_RETIRE_OBLIGATION=/var/lib/billet/gate-cancel-reservation
-  p "$name" 'printf "ci-0\n" >/var/lib/billet/gate-cancel-reservation'
-  mkdir -p "$work/cases/$name/answers"
-  cp "$work/retire-fixtures/"*.json "$work/cases/$name/answers/"
-  e "$name" "BILLET_GATE_RETIRE_FIXTURES=$work/cases/$name/answers"
-  adopted=adopted; adopt_exit=0; abandoned=abandoned; abandon_exit=0
-  step=adoption; task='Bind cancellation adoption to the classified reservation'; why='did not confirm the observed binding'
-  case "$scenario" in
-    check) a "$name" --check ;;
-    adopt-refused) adopted=refused-guard-holder; adopt_exit=2; task="Refuse the retirement's answer"; why="was refused" ;;
-    adopt-unanswered) e "$name" BILLET_GATE_DROP_ANSWER=retire-reserve:1; task='Refuse a retirement call that did not answer'; why="did not answer retirement's reserve call" ;;
-    adopt-unreachable)
-      # A registered step fact changes only the connection of the first
-      # mutation; classification and the digest observation used local transport.
-      cat >"$work/cases/$name/inventory.yml" <<'INV'
-all:
-  hosts:
-    control-a:
-      ansible_connection: "{{ 'ssh' if billet_retirement_cancel_step | default('') == 'adoption' else 'local' }}"
-      ansible_host: 127.0.0.1
-      ansible_port: 0
-      ansible_connect_timeout: 1
-      ansible_ssh_common_args: '-o BatchMode=yes -o ConnectionAttempts=1'
-INV
-      a "$name" -i "$work/cases/$name/inventory.yml"
-      task='Adopt the cancellation reservation under this holder'; why='UNREACHABLE!'
-      ;;
-    adopt-fresh*)
-      adopted=reserved
-      task='Require cancellation to adopt an existing reservation'; why='unexpectedly answered reserved instead of adopted'
-      # A fresh row has its own transition, not the classifier's old one.
-      "$python" - "$work/cases/$name/answers" "$scenario" <<'PYFRESH'
-import json, pathlib, sys
-root, scenario = pathlib.Path(sys.argv[1]), sys.argv[2]
-for name in ['reserved', 'abandoned']:
-    if name == 'abandoned' and scenario == 'adopt-fresh-transition':
-        continue
-    path = root / (name + '.json')
-    answer = json.loads(path.read_text())
-    answer['transition_id'] = 'fedcba9876543210fedcba9876543210'
-    path.write_text(json.dumps(answer))
-PYFRESH
-      if [ "$scenario" = adopt-fresh-refused ]; then abandoned=refused-abandon-journal; abandon_exit=2; fi
-      if [ "$scenario" = adopt-fresh-unanswered ]; then e "$name" BILLET_GATE_DROP_ANSWER=retire-abandon:1; fi
-      ;;
-    adopt-run|adopt-retiring|adopt-survivor|adopt-transition|abandon-transition)
-      "$python" - "$work/cases/$name/answers" "$scenario" <<'PYBIND'
-import json, pathlib, sys
-root, scenario = pathlib.Path(sys.argv[1]), sys.argv[2]
-path = root / ('abandoned.json' if scenario.startswith('abandon-') else 'adopted.json')
-answer = json.loads(path.read_text())
-member = scenario.split('-', 1)[1]
-member = 'transition_id' if member == 'transition' else member
-answer[member] = 'fedcba9876543210fedcba9876543210' if member == 'transition_id' else 'another'
-path.write_text(json.dumps(answer))
-PYBIND
-      ;;
-    abandon-refused) abandoned=refused-abandon-journal; abandon_exit=2; task="Refuse the retirement's answer"; why='was refused' ;;
-    abandon-unanswered) e "$name" BILLET_GATE_DROP_ANSWER=retire-abandon:1; task='Refuse a retirement call that did not answer'; why="did not answer retirement's abandon call" ;;
-    abandon-unreachable)
-      # The reserve wrapper runs this hook after its transport is established;
-      # later tasks resolve the real SSH connection to the closed port.
-      cat >"$work/cases/$name/disconnect" <<'HOOK'
-#!/bin/sh
-set -eu
-touch /var/lib/billet/gate-cancel-disconnect
-HOOK
-      chmod 0755 "$work/cases/$name/disconnect"
-      e "$name" "BILLET_GATE_HOOK=retire-reserve:1:$work/cases/$name/disconnect"
-      cat >"$work/cases/$name/inventory.yml" <<'INV'
-all:
-  hosts:
-    control-a:
-      ansible_connection: "{{ 'ssh' if lookup('ansible.builtin.fileglob', '/var/lib/billet/gate-cancel-disconnect') | length > 0 else 'local' }}"
-      ansible_host: 127.0.0.1
-      ansible_port: 0
-      ansible_connect_timeout: 1
-      ansible_ssh_common_args: '-o BatchMode=yes -o ConnectionAttempts=1'
-INV
-      a "$name" -i "$work/cases/$name/inventory.yml"
-      task='Abandon the adopted cancellation reservation'; why='UNREACHABLE!'
-      ;;
-  esac
-  case "$scenario" in
-    abandon-*) step=abandonment ;;
-  esac
-  if [ "$scenario" = abandon-transition ]; then
-    task='Bind cancellation abandonment to the classified reservation'; why='answered for another transition'
-  fi
-  r_answers "$name" "control-a:classify:1:dry-run-cancel-previous-run.json:0;control-a:reserve:1:$adopted.json:$adopt_exit;control-a:abandon:1:$abandoned.json:$abandon_exit"
-  post "$name" "if [ -f /var/lib/billet/gate-cancel-reservation ]; then cp /var/lib/billet/gate-cancel-reservation '$work/cases/$name/reservation-after'; fi"
-  post "$name" "if [ -f /var/lib/billet/gate-cancel-ordinary ]; then cp /var/lib/billet/gate-cancel-ordinary '$work/cases/$name/ordinary-after'; fi"
-  r_run "$name"
-  r_reported "$name" cancel
-  expect_no_ordinary "$name"
-  expect_no_task "$name" 'Inspect the transaction claim before recovery'
-  if [ "$scenario" = success ]; then
-    expect_allowed "$name"
-    expect_play_task_ran "$name" 'Ordinary convergence sentinel'
-    expect_play_task_ran "$name" 'Record the ordinary cancellation effect'
-    expect_ran "$name" 'Admit ordinary work after confirmed cancellation'
-    expect_path_absent "$name" /var/lib/billet/gate-cancel-reservation
-  else
-    expect_path_absent "$name" /var/lib/billet/gate-cancel-ordinary
-    expect_no_play_task "$name" 'Ordinary convergence sentinel'
-    expect_no_task "$name" 'Admit ordinary work after confirmed cancellation'
-    if [ "$scenario" = check ]; then
-      expect_allowed "$name"
-      expect_ran "$name" 'Report the prospective reservation cancellation'
-      expect_no_task "$name" "Read the installed configuration's cancellation digest"
-    else
-      expect_refused "$name" "$task" "$why"
-      expect_final "$name" "Reservation cancellation failed at $step" 'Ordinary host tasks remain bypassed.'
-    fi
-  fi
-  case "$scenario" in
-    adopt-fresh*)
-      expect_final "$name" 'unexpectedly answered reserved instead of adopted'
-      expect_ran "$name" 'Ask abandonment to discharge the fresh cancellation reservation'
-      expect_no_task "$name" 'Abandon the adopted cancellation reservation'
-      if [ "$scenario" = adopt-fresh ]; then
-        expect_ran "$name" 'Bind cancellation cleanup to the fresh transition'
-        expect_final "$name" 'Afterwards: The fresh reservation was abandoned.'
-        expect_path_absent "$name" /var/lib/billet/gate-cancel-reservation
-      else
-        expect_ran "$name" 'Keep the fresh cancellation cleanup refusal'
-        expect_final "$name" 'Cleanup remains outstanding: reservation for retiring host control-a,' 'survivor control-b, run ci-1,' 'transition fedcba9876543210fedcba9876543210 is not proved released.'
-        case "$scenario" in
-          adopt-fresh-refused) expect_final "$name" "Retirement's abandon" 'was refused' ;;
-          adopt-fresh-unanswered) expect_final "$name" "did not answer retirement's abandon call" ;;
-          adopt-fresh-transition) expect_final "$name" 'The abandonment answered for another transition; cleanup is unproved.' ;;
-        esac
-      fi
-      ;;
-  esac
-  case "$scenario" in
-    check|adopt-unreachable) calls='control-a retire-classify 1;' ;;
-    adopt-fresh*) calls='control-a retire-classify 1;control-a retire-reserve 1;control-a retire-abandon 1;' ;;
-    adopt-*|abandon-unreachable) calls='control-a retire-classify 1;control-a retire-reserve 1;' ;;
-    *) calls='control-a retire-classify 1;control-a retire-reserve 1;control-a retire-abandon 1;' ;;
-  esac
-  expect_host_commands "$name" "$calls"
-  PYTHONPATH="$here" "$python" -B - "$work/cases/$name" "$scenario" <<'PYCANCEL'
-import hashlib, json, pathlib, sys
-from callback_result import callback_message
-case, scenario = pathlib.Path(sys.argv[1]), sys.argv[2]
-records = [json.loads(line) for line in (case / 'calls/index.jsonl').read_text().splitlines()]
-for call in records:
-    if call['host'] != 'control-a' or call['command'] in ['release', 'status', 'migrate-endpoint'] or call['argv'][:2] == ['local', 'prepare']:
-        sys.exit('cancellation collected evidence, contacted inventory survivor or imported the service account')
-    if call['command'] not in ['retire-reserve', 'retire-abandon']:
-        continue
-    common = ['--json', '--run', 'ci-1', '--retiring-host', 'control-a']
-    if call['command'] == 'retire-reserve':
-        expected = ['server', 'retire', '--reserve'] + common + ['--survivor-host', 'control-b', '--installed-sha256', hashlib.sha256((case / 'installed.yaml.plant').read_bytes()).hexdigest()]
-    else:
-        expected = ['server', 'retire', '--abandon-reservation'] + common
-    expected += ['--config', '/etc/billet/billet.yaml', '--environment-file', '/etc/billet/server.env']
-    if call['argv'] != expected or call['has_stdin']:
-        sys.exit('cancellation argv/stdin differs: ' + repr(call))
-text = (case / 'out').read_text()
-parts = text.split("TASK [Observe cancellation's terminal boundary]")
-if len(parts) != 2:
-    sys.exit('cancellation did not report its actual bypass after the result')
-message = callback_message(parts[1].split('TASK [', 1)[0], case.name + ': bypass')
-if message != 'Cancellation bypass=' + ('False' if scenario == 'success' else 'True') + '.':
-    sys.exit('cancellation left the wrong actual bypass: ' + message)
-if scenario == 'success':
-    if (case / 'ordinary-after').read_text() != 'reached':
-        sys.exit('confirmed cancellation did not produce its ordinary effect')
-    binding = text.index('TASK [junioryono.billet.host : Bind cancellation abandonment to the classified reservation]')
-    admission = text.index('TASK [junioryono.billet.host : Admit ordinary work after confirmed cancellation]')
-    ordinary = text.index('TASK [Ordinary convergence sentinel]')
-    if not binding < admission < ordinary:
-        sys.exit('ordinary work ran before confirmed and bound abandonment')
-if scenario == 'check':
-    parts = text.split('TASK [junioryono.billet.host : Report the prospective reservation cancellation]')
-    if len(parts) != 2:
-        sys.exit('check mode did not report prospective cancellation exactly once')
-    preview = callback_message(parts[1].split('TASK [', 1)[0], case.name + ': preview')
-    for clause in ['recorded survivor control-b under holder ci-1', 'validate its binding, then abandon it.', 'Check mode cancels nothing; ordinary host tasks remain bypassed.']:
-        if clause not in preview:
-            sys.exit('cancellation preview omitted ' + clause)
-if scenario in ['check', 'adopt-refused', 'adopt-unreachable']:
-    if (case / 'reservation-after').read_text() != 'ci-0\n':
-        sys.exit('cancellation changed an unadopted reservation')
-elif (scenario.startswith('adopt-') and scenario not in ['adopt-fresh', 'adopt-fresh-unanswered', 'adopt-fresh-transition']) or scenario in ['abandon-refused', 'abandon-unreachable']:
-    if (case / 'reservation-after').read_text() != 'reserved\n':
-        sys.exit('unconfirmed cancellation lost the reserved obligation')
-else:
-    if (case / 'reservation-after').exists():
-        sys.exit('the successful fake abandonment did not remove its row')
-if scenario in ['adopt-unreachable', 'abandon-unreachable']:
-    task, call = ('Adopt the cancellation reservation under this holder', 'reserve') if scenario == 'adopt-unreachable' else ('Abandon the adopted cancellation reservation', 'abandon')
-    parts = text.split('TASK [junioryono.billet.host : ' + task + ']')
-    if len(parts) != 2 or 'fatal: [control-a]: UNREACHABLE!' not in parts[1].split('TASK [', 1)[0]:
-        sys.exit('the cancellation did not lose its connection at ' + task)
-    if "did not answer retirement's " + call + " call" not in text:
-        sys.exit('unreachable cancellation did not reach the ordinary parser failure')
-PYCANCEL
-done
-
-# An older marked guard can stop preparation before retirement is dispatched.
-# Keep that earlier obligation and do not claim the cancel route was reached.
-r_plant r12-earlier-guard
-p r12-earlier-guard "plant_guard ci-0 /usr/bin/billet; '$python' '$work/retirement-window.py' mark"
-a r12-earlier-guard -e billet_converge_guard_holder=ci-1 -e billet_gate_cancel=true
-post r12-earlier-guard "cp /var/lib/billet/upgrades/active/guard.json '$work/cases/r12-earlier-guard/guard-after.json'"
-r_run r12-earlier-guard
-expect_refused r12-earlier-guard "Refuse the preparation's answer" 'held by ci-0'
-expect_final r12-earlier-guard 'old-driver-stopped'
-expect_host_commands r12-earlier-guard ''
-expect_no_task r12-earlier-guard 'Ask the retirement classifier'
-expect_no_task r12-earlier-guard 'Report the retirement route'
-expect_no_task r12-earlier-guard 'Report the prospective reservation cancellation'
-expect_no_play_task r12-earlier-guard 'Ordinary convergence sentinel'
-expect_no_ordinary r12-earlier-guard
-expect_path_absent r12-earlier-guard /var/lib/billet/retired/journal.json
-"$python" - "$work/cases/r12-earlier-guard/guard-after.json" <<'PYGUARD'
-import json, sys
-record = json.load(open(sys.argv[1]))
-if record['holder'] != 'ci-0' or record.get('transition') != dict(kind='retirement', id='0123456789abcdef0123456789abcdef'):
-    sys.exit('preparation changed the older guard or abandoned its marker')
-PYGUARD
+if retirement_section request-collection; then
+  . "$here/retirement-request-collection-cases.sh"
+  retirement_section_finished
+fi
+if retirement_section request-windows; then
+  . "$here/retirement-request-windows-cases.sh"
+  retirement_section_finished
+fi
+if retirement_section request-cancellation; then
+  . "$here/retirement-request-cancellation-cases.sh"
+  retirement_section_finished
+fi
+if retirement_section request-retained; then
+  . "$here/retirement-request-retained-cases.sh"
+  retirement_section_finished
+fi
 
 sections_ran="$sections_ran, retirement requests (R)"
 else
