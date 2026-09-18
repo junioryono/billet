@@ -507,14 +507,14 @@ jobs:
     runs-on: billet-8vcpu-ubuntu-2404
     # The former retirement group reached 36 minutes before request coverage
     # on 46fcafa (2026-09-14). Partition its parser, routes, compatibility,
-    # retained continuation, recovery and 3c settled callers. Requests retain
-    # their existing group (planning input: 28/45 minutes). The 3c operand and
-    # drift plays also leave shape. These are structural budget estimates;
+    # retained continuation, recovery and 3c settled callers. The 54 request
+    # cases now have four sections (planning input: 28/45 minutes unsharded).
+    # The 3c operand and drift plays also leave shape. These are structural budgets;
     # complete CI timings must establish the required <=35 minute margin.
     strategy:
       fail-fast: false
       matrix:
-        group: [policy, roles, guard, shape, retirement-node-shape, retirement, retirement-routes, retirement-compatibility, retirement-node, retirement-recovery, retirement-node-settled, retirement-parity-basic, retirement-parity-network, retirement-parity-negative, retirement-resume, retirement-request, endpoint]
+        group: [policy, roles, guard, shape, retirement-node-shape, retirement, retirement-routes, retirement-compatibility, retirement-node, retirement-recovery, retirement-node-settled, retirement-parity-basic, retirement-parity-network, retirement-parity-negative, retirement-resume, retirement-request-evidence, retirement-request-collection, retirement-request-windows, retirement-request-cancellation, endpoint]
     name: host-lifecycle (${{ matrix.group }})
     # Sized from what the gates measurably take: the run was cancelled at 15
     # minutes after the two connector gates and the fleet gate joined it
@@ -691,18 +691,18 @@ jobs:
           BILLET_GATE_ONLY: endpoint
         run: make converge-guard-check
 
-      - name: Prove the retirement parser and caller routes
-        if: contains(fromJSON('["retirement", "retirement-routes", "retirement-compatibility", "retirement-node", "retirement-recovery", "retirement-node-settled", "retirement-parity-basic", "retirement-parity-network", "retirement-parity-negative", "retirement-resume"]'), matrix.group)
+      - name: Prove the selected retirement route or request section
+        if: contains(fromJSON('["retirement", "retirement-routes", "retirement-compatibility", "retirement-node", "retirement-recovery", "retirement-node-settled", "retirement-parity-basic", "retirement-parity-network", "retirement-parity-negative", "retirement-resume", "retirement-request-evidence", "retirement-request-collection", "retirement-request-windows", "retirement-request-cancellation"]'), matrix.group)
         env:
           BILLET_GATE_REQUIRE_ROOT: "1"
-          BILLET_GATE_ONLY: retirement
-          BILLET_GATE_SKIP: retirement-request
-          BILLET_RETIREMENT_SHARD: ${{ fromJSON('{"retirement":"parser","retirement-routes":"routes","retirement-compatibility":"compatibility","retirement-node":"retained","retirement-recovery":"recovery","retirement-node-settled":"settled","retirement-parity-basic":"parity-basic","retirement-parity-network":"parity-network","retirement-parity-negative":"parity-negative","retirement-resume":"resume"}')[matrix.group] }}
+          BILLET_GATE_ONLY: ${{ startsWith(matrix.group, 'retirement-request-') && 'retirement-request' || 'retirement' }}
+          BILLET_GATE_SKIP: ${{ !startsWith(matrix.group, 'retirement-request-') && 'retirement-request' || '' }}
+          BILLET_RETIREMENT_SHARD: ${{ fromJSON('{"retirement":"parser","retirement-routes":"routes","retirement-compatibility":"compatibility","retirement-node":"retained","retirement-recovery":"recovery","retirement-node-settled":"settled","retirement-parity-basic":"parity-basic","retirement-parity-network":"parity-network","retirement-parity-negative":"parity-negative","retirement-resume":"resume","retirement-request-evidence":"request-evidence","retirement-request-collection":"request-collection","retirement-request-windows":"request-windows","retirement-request-cancellation":"request-cancellation"}')[matrix.group] }}
           BILLET_RETIREMENT_REPORT: ${{ runner.temp }}/retirement-selection.json
         run: make converge-guard-check
 
       - name: Record the completed retirement case inventory
-        if: contains(fromJSON('["retirement", "retirement-routes", "retirement-compatibility", "retirement-node", "retirement-recovery", "retirement-node-settled", "retirement-parity-basic", "retirement-parity-network", "retirement-parity-negative", "retirement-resume"]'), matrix.group)
+        if: contains(fromJSON('["retirement", "retirement-routes", "retirement-compatibility", "retirement-node", "retirement-recovery", "retirement-node-settled", "retirement-parity-basic", "retirement-parity-network", "retirement-parity-negative", "retirement-resume", "retirement-request-evidence", "retirement-request-collection", "retirement-request-windows", "retirement-request-cancellation"]'), matrix.group)
         uses: actions/upload-artifact@v7
         with:
           name: retirement-selection-${{ matrix.group }}
@@ -716,13 +716,6 @@ jobs:
       - name: Prove retained ordinary operands and drift
         if: matrix.group == 'retirement-node-shape'
         run: make retirement-node-shape
-
-      - name: Prove retirement requests, collection and cleanup
-        if: matrix.group == 'retirement-request'
-        env:
-          BILLET_GATE_REQUIRE_ROOT: "1"
-          BILLET_GATE_ONLY: retirement-request
-        run: make converge-guard-check
 
       # The ssh_access role's whole value is one refusal, and no other suite
       # configures a key, so every other gate takes its "nothing configured"
@@ -1063,7 +1056,7 @@ jobs:
         test-postgres-retirement,
         lint,
         release-config,
-        host-lifecycle,
+        host-lifecycle, # Includes every route and request matrix group.
         retirement-selection,
         package-lifecycle,
         terraform,

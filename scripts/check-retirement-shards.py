@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Require complete, disjoint retirement CI selection and nonempty execution."""
+"""Require complete, disjoint retirement CI selection and nonempty execution.
+
+The cross-shard execution inventory covers both route and fresh-request sections; requests were previously outside that union.
+"""
 import argparse
 import collections
 import json
@@ -23,12 +26,18 @@ ROLE_SHARDS = {
     'retirement-parity-network': 'parity-network',
     'retirement-parity-negative': 'parity-negative',
     'retirement-resume': 'resume',
+    'retirement-request-evidence': 'request-evidence',
+    'retirement-request-collection': 'request-collection',
+    'retirement-request-windows': 'request-windows',
+    'retirement-request-cancellation': 'request-cancellation',
 }
 # Count invocations of the case runner, not protocol calls inside a case. The
 # settled parser has two batched cases; recovery keeps both passes in one case.
 ROLE_CASES = {'parser': 60, 'routes': 15, 'compatibility': 74,
               'retained': 10, 'recovery': 21, 'settled': 14,
-              'parity-basic': 8, 'parity-network': 8, 'parity-negative': 4, 'resume': 2}
+              'parity-basic': 8, 'parity-network': 8, 'parity-negative': 4, 'resume': 2,
+              'request-evidence': 12, 'request-collection': 12,
+              'request-windows': 13, 'request-cancellation': 17}
 
 
 def require_partition(expected, groups):
@@ -72,9 +81,11 @@ def check_role_partition(workflow):
     if matrix is None:
         raise ValueError('host-lifecycle matrix missing')
     names = [name.strip() for name in matrix[1].split(',')]
-    for name in [*ROLE_SHARDS, 'retirement-request', 'retirement-node-shape']:
+    for name in [*ROLE_SHARDS, 'retirement-node-shape']:
         if names.count(name) != 1:
             raise ValueError('missing or duplicate host group: ' + name)
+    if 'retirement-request' in names:
+        raise ValueError('unsharded request group remains in the workflow')
     assignment = re.search(r"BILLET_RETIREMENT_SHARD: \$\{\{ fromJSON\('(.*?)'\)\[matrix.group\] \}\}", workflow)
     if assignment is None or json.loads(assignment[1]) != ROLE_SHARDS:
         raise ValueError('workflow does not pass the complete role shard map')
