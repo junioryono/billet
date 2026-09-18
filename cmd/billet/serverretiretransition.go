@@ -105,6 +105,9 @@ func retireTransition(ctx context.Context, m retireMode, obs *installedConfigObs
 		_, r := observeRetirePostconditions(ctx, m, j)
 		return j, steps, r
 	}
+	if r := reconcileRetireInert(ctx, m, j); r != nil {
+		return j, steps, r
+	}
 	if r := admitRetireRemaining(ctx, m, j); r != nil {
 		return j, steps, r
 	}
@@ -698,6 +701,13 @@ func awaitRetireBackup(ctx context.Context, j retirement.Journal) *retireRefusal
 // only recognise that refusal as this retirement's by the time the timers
 // stopped.
 func retireStop(ctx context.Context, j retirement.Journal) (retirement.Journal, *retireRefusal) {
+	m := retireMode{}
+	if j.RetainedInvocation != nil {
+		m.configPath = j.RetainedInvocation.ConfigPath
+	}
+	if r := reconcileRetireInert(ctx, m, j); r != nil {
+		return j, r
+	}
 	c := converge()
 
 	for _, unit := range []string{upgradeTimerUnit, backupTimerUnit} {
@@ -1146,6 +1156,9 @@ func retireAdvancePhase(ctx context.Context, j retirement.Journal, phase retirem
 		return j, r
 	}
 	if phase == retirement.PhaseDone {
+		if r := proveRetireInert(ctx, j); r != nil {
+			return j, r
+		}
 		configPath := ""
 		if j.RetainedInvocation != nil {
 			configPath = j.RetainedInvocation.ConfigPath

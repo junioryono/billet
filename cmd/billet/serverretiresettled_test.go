@@ -200,6 +200,12 @@ func TestRetirementSettledModesRequireTheEffectiveInstalledSource(t *testing.T) 
 				return i
 			}
 			t.Cleanup(func() { retireOperationInspector = saved })
+			for _, unit := range retireInertUnits {
+				path, err := retireInertDropIn(retireOperationInspector(), unit)
+				mustOK(t, err)
+				writeFile(t, path, retireInertBytes(j), 0o644)
+				setRetireEffect(t, f, unit, "DropInPaths", path)
+			}
 			forbidSettledWrites(t, f)
 			args := settledCheckArgs(t, f, j, c.purpose)
 			out, code := f.runRaw(t, "", args...)
@@ -301,7 +307,7 @@ func TestRetirementSettledEntryRequiresEveryProtectedBinding(t *testing.T) {
 	args := settledCheckArgs(t, f, j, retirement.PurposeSettledEntry)
 	quietSettledNode(t, f, "inactive")
 	for _, scenario := range []string{"status absent", "status malformed", "status stale", "unsettled", "row incomplete", "completion absent",
-		"done time malformed", "marker", "holder", "guard id", "preparing", "transaction", "transition", "survivor", "provenance", "archive identity", "identity recreated", "controller enabled"} {
+		"done time malformed", "marker", "holder", "guard id", "preparing", "transaction", "transition", "survivor", "provenance", "archive identity", "identity recreated", "controller active"} {
 		t.Run(scenario, func(t *testing.T) {
 			paths := []string{retirement.StatusPath(), retirement.JournalPath(), filepath.Join(f.guard.active(), guardRecordName),
 				filepath.Join(f.unitsDir, serverUnit)}
@@ -375,8 +381,8 @@ func TestRetirementSettledEntryRequiresEveryProtectedBinding(t *testing.T) {
 				mustOK(t, os.Mkdir(j.IdentityDir, 0o700))
 				t.Cleanup(func() { mustOK(t, os.Remove(j.IdentityDir)) })
 				want = retireReasonIdentity
-			case "controller enabled":
-				f.manager.set(serverUnit, "UnitFileState", "enabled")
+			case "controller active":
+				f.manager.set(serverUnit, "ActiveState", "active")
 				want = retireReasonPostcondition
 			}
 			forbidSettledWrites(t, f)
@@ -422,7 +428,7 @@ func TestRetirementSettledClosingRequiresStrictProofAfterEntry(t *testing.T) {
 			case "inactive", "failed":
 				quietSettledNode(t, f, drift)
 			case "controller":
-				f.manager.set(serverUnit, "UnitFileState", "enabled")
+				f.manager.set(serverUnit, "ActiveState", "active")
 			case "unit":
 				setRetireEffect(t, f, nodeUnit, "NeedDaemonReload", "yes")
 				wantReason = "settled-entry-node-unit-mismatch"
@@ -545,11 +551,11 @@ func TestRetirementSettledModesExcludeAllOtherOperations(t *testing.T) {
 // The TestThe prefix intentionally places producers in the t command shard.
 func TestTheRetireSettledEntryFixturesAreTheCommandsOwn(t *testing.T) {
 	retireSettledFixtures(t, retirement.PurposeSettledEntry,
-		[]string{"active", "inactive", "failed", "activating", "deactivating", "reloading", "queued-job", "unknown-job", "blank-job", "unit-mismatch"})
+		[]string{"active", "reenabled", "inactive", "failed", "activating", "deactivating", "reloading", "queued-job", "unknown-job", "blank-job", "unit-mismatch"})
 }
 
 func TestTheRetireSettledClosingFixturesAreTheCommandsOwn(t *testing.T) {
-	retireSettledFixtures(t, retirement.PurposeSettledClosing, []string{"active", "inactive", "failed", "blank-job", "unit-mismatch"})
+	retireSettledFixtures(t, retirement.PurposeSettledClosing, []string{"active", "reenabled", "inactive", "failed", "blank-job", "unit-mismatch"})
 }
 
 func retireSettledFixtures(t *testing.T, purpose string, names []string) {
@@ -559,13 +565,15 @@ func retireSettledFixtures(t *testing.T, purpose string, names []string) {
 	family := "retire-" + purpose
 	for _, name := range names {
 		t.Run(name, func(t *testing.T) {
-			for _, path := range []string{filepath.Join(f.unitsDir, nodeUnit), filepath.Join(f.unitsDir, nodeUnit+".effects"), registrationRecordPath} {
+			for _, path := range []string{filepath.Join(f.unitsDir, serverUnit), filepath.Join(f.unitsDir, nodeUnit), filepath.Join(f.unitsDir, nodeUnit+".effects"), registrationRecordPath} {
 				before := mustRead(t, path)
 				info, err := os.Stat(path)
 				mustOK(t, err)
 				t.Cleanup(func() { writeFile(t, path, before, info.Mode().Perm()) })
 			}
 			switch name {
+			case "reenabled":
+				f.manager.set(serverUnit, "UnitFileState", "enabled")
 			case "active":
 			case "inactive", "failed":
 				quietSettledNode(t, f, name)
@@ -582,7 +590,7 @@ func retireSettledFixtures(t *testing.T, purpose string, names []string) {
 			}
 			forbidSettledWrites(t, f)
 			out, code := f.runRaw(t, "", args...)
-			if name == "active" || purpose == retirement.PurposeSettledEntry && (name == "inactive" || name == "failed") {
+			if name == "active" || name == "reenabled" || purpose == retirement.PurposeSettledEntry && (name == "inactive" || name == "failed") {
 				_, err := retirement.DecodeSettledVerdict([]byte(out), code, settledExpectation(t, f, j, purpose))
 				mustOK(t, err)
 			} else {

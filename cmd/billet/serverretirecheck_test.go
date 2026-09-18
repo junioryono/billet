@@ -17,7 +17,11 @@ import (
 
 func settledNodeConfigFixture(t *testing.T) (*requestFixture, retirement.Journal) {
 	t.Helper()
-	f := newRequestFixture(t) // Uses the same PostgreSQL gate as sibling command tests.
+	return settleNodeConfigFixture(t, newRequestFixture(t))
+}
+
+func settleNodeConfigFixture(t *testing.T, f *requestFixture) (*requestFixture, retirement.Journal) {
+	t.Helper()
 	retainAndRestartANode(t, f)
 	f.reserve(t)
 	out, code := f.retainedRequest(t, f.input(t, f.retainedOverrides(t)))
@@ -173,7 +177,7 @@ func TestRetirementNodeConfigAdmitsQuietEntryWithoutDrainOrRegistration(t *testi
 			t.Setenv("BILLET_STATE_DSN", "postgres://billet@127.0.0.1:1/unreachable?sslmode=disable")
 			forbidNodeConfigWrites(t, f)
 			operations := emptyNodeOperations()
-			operations.Services = []retireServiceOperation{{Verb: "start", Unit: nodeUnit}}
+			operations.Services = retireNodeServiceSuperset()
 			document := nodeConfigDocument(t, j, mustRead(t, f.cfg), operations)
 			out, code := runNodeConfigCheck(t, f, j, document)
 			var in retireNodeConfigInput
@@ -248,7 +252,7 @@ func TestRetirementNodeConfigAdmitsPackagedServiceDirectories(t *testing.T) {
 	for _, verb := range []string{"", "start"} {
 		operations := emptyNodeOperations()
 		if verb != "" {
-			operations.Services = []retireServiceOperation{{Verb: verb, Unit: nodeUnit}}
+			operations.Services = retireNodeServiceSuperset()
 		}
 		out, code := runNodeConfigCheck(t, f, j, nodeConfigDocument(t, j, mustRead(t, f.cfg), operations))
 		if code != 0 || retireAnswer(t, out)["outcome"] != "admitted" {
@@ -337,7 +341,13 @@ func TestRetirementNodeConfigPlantedReadersRefuseBeforeMutation(t *testing.T) {
 			case "transaction root":
 				operations.Filesystem = append(operations.Filesystem, retireFilesystemOperation{Kind: "delete", Path: upgradeRoot})
 			case "controller unit":
-				operations.Filesystem = append(operations.Filesystem, retireFilesystemOperation{Kind: "write", Path: "/etc/systemd/system/" + serverUnit})
+				// THE INSPECTOR'S OWN UNIT DIRECTORY, not the literal system one
+				// and not the fake manager's property directory: protection is
+				// built from the directories the inspector reports, which the
+				// fixture redirects, so any other path would be admitted for
+				// being outside this host's units entirely.
+				operations.Filesystem = append(operations.Filesystem, retireFilesystemOperation{
+					Kind: "write", Path: filepath.Join(retireOperationInspector().OperationUnitDirectories()[0], serverUnit)})
 			case "changed node name":
 				rendering = strings.Replace(rendering, "node-a", "node-b", 1)
 				want = retireReasonIdentity

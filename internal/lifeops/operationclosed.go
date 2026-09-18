@@ -176,6 +176,22 @@ func (w *operationWalk) admitClosedSet(ctx context.Context) error {
 			w.protection.Units = append(w.protection.Units, alias)
 		}
 	}
+	for _, proof := range w.protection.RetiredConditions {
+		if proof.unit == "" || !slices.Contains(w.declared.Units, proof.unit) {
+			return fmt.Errorf("operation-inert-evidence: no protected unit binding")
+		}
+		ev := w.units[proof.unit]
+		if err := proof.proveProperties(ev.props); err != nil {
+			return fmt.Errorf("operation-inert-evidence: %s: %w", proof.unit, err)
+		}
+		fresh, err := w.inspector.ProveRetiredConditionEvidence(ctx, proof.unit, proof.marker)
+		if err != nil {
+			return fmt.Errorf("operation-inert-evidence: %s: %w", proof.unit, err)
+		}
+		if fresh != proof {
+			return fmt.Errorf("operation-inert-evidence: %s changed its inertness proof", proof.unit)
+		}
+	}
 	for _, unit := range own {
 		ev := w.units[unit]
 		entries, err := operationInstallEntries(ev.sources)
@@ -248,6 +264,9 @@ func (w *operationWalk) admitRoleIdentities(roles []string) error {
 }
 
 func (w *operationWalk) closedRelation(ctx context.Context, unit, relation, target string) error {
+	if w.inertIncomingEdge(unit, relation, target) {
+		return nil
+	}
 	if !w.edgeAllowed(unit, relation, target) {
 		return fmt.Errorf("operation-edge-outside-set: %s %s=%s", unit, strings.TrimPrefix(relation, "Install."), target)
 	}
@@ -275,8 +294,33 @@ func (w *operationWalk) closedRelation(ctx context.Context, unit, relation, targ
 	return nil
 }
 
+func (w *operationWalk) inertUnit(unit string) bool {
+	unit = w.canonicalUnit(unit)
+	for _, proof := range w.protection.RetiredConditions {
+		if proof.unit != "" && w.canonicalUnit(proof.unit) == unit {
+			return true
+		}
+	}
+	return false
+}
+
+// Installation, ordering and outgoing effects retain their normal checks.
+func (w *operationWalk) inertIncomingEdge(unit, relation, target string) bool {
+	switch relation {
+	case "Wants", "Requires", "Requisite", "BindsTo", "Upholds", "Triggers", "OnSuccess", "OnFailure", "PropagatesStopTo", "PropagatesReloadTo":
+		return w.inertUnit(target)
+	case "WantedBy", "RequiredBy", "RequisiteOf", "BoundBy", "UpheldBy", "TriggeredBy", "OnSuccessOf", "OnFailureOf", "StopPropagatedFrom", "ReloadPropagatedFrom":
+		return w.inertUnit(unit)
+	default:
+		return false
+	}
+}
+
 func (w *operationWalk) edgeAllowed(unit, relation, target string) bool {
 	unit, target = w.canonicalUnit(unit), w.canonicalUnit(target)
+	if relation == "Install.Also" && w.inertUnit(target) {
+		return true
+	}
 	if key, install := strings.CutPrefix(relation, "Install."); install {
 		if key == "Alias" {
 			return unit == target

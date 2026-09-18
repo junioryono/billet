@@ -1,0 +1,119 @@
+---
+# internal/retirement/settled.go owns these two shapes and their 16 KiB bound.
+# Entry's quiet activity never supplies closing's active-node proof.
+- name: Forget the preceding settled answer
+  ansible.builtin.set_fact:
+    billet_retire_settled_answer: {}
+
+- name: Require one bounded settled command answer
+  ansible.builtin.assert:
+    that:
+      - billet_retire_settled_purpose in ['settled-entry', 'settled-closing']
+      - billet_retire_settled_raw.rc | default(none) is integer
+      - billet_retire_settled_raw.rc in [0, 2, 3]
+      - not billet_retire_settled_raw.unreachable | default(false) | bool
+      - not billet_retire_settled_raw.skipped | default(false) | bool
+      - billet_retire_settled_raw.rc != 0 or not billet_retire_settled_raw.failed | default(false) | bool
+      - billet_retire_settled_raw.stdout | default(none) is string
+      - billet_retire_settled_raw.stdout | trim | length > 0
+      - billet_retire_settled_raw.stdout.encode('utf-8') | length <= 16384
+    fail_msg: >-
+      The {{ billet_retire_settled_purpose }} command did not return one bounded
+      complete answer (exit {{ billet_retire_settled_raw.rc | default('none') }});
+      ordinary convergence remains closed.
+
+- name: Read the settled answer strictly
+  block:
+    - name: Decode the settled answer without duplicate members
+      ansible.builtin.set_fact:
+        billet_retire_settled_answer: "{{ billet_retire_settled_raw.stdout | junioryono.billet.from_json_strict }}"
+  rescue:
+    - name: Refuse unreadable settled JSON
+      ansible.builtin.fail:
+        msg: "The {{ billet_retire_settled_purpose }} command returned malformed or repeated JSON; ordinary convergence remains closed."
+
+- name: Require a settled answer object
+  ansible.builtin.assert:
+    that: billet_retire_settled_answer is mapping
+    fail_msg: "The {{ billet_retire_settled_purpose }} answer is not an object."
+
+- name: Require the settled answer's exact branch members
+  ansible.builtin.assert:
+    that:
+      - billet_retire_settled_answer.keys() | list | sort == billet_retire_settled_members | sort
+    fail_msg: "The {{ billet_retire_settled_purpose }} answer has missing or unknown members."
+  vars:
+    billet_retire_settled_members: >-
+      {{ ['schema', 'purpose', 'outcome', 'reason', 'why', 'state']
+         if billet_retire_settled_answer.outcome | default('') in ['refused', 'unknown']
+         else ['schema', 'purpose', 'outcome', 'run', 'guard', 'retiring', 'deployment',
+               'transition_id', 'variant', 'phase', 'row_done', 'settled', 'completed_by',
+               'node_activity', 'state', 'enablement_changes'] }}
+
+- name: Require the settled schema purpose and exit semantics
+  ansible.builtin.assert:
+    that:
+      - billet_retire_settled_answer.schema is integer
+      - billet_retire_settled_answer.schema == 2
+      - billet_retire_settled_answer.purpose == billet_retire_settled_purpose
+      - billet_retire_settled_answer.state == 'nothing'
+      - >-
+        billet_retire_settled_answer.outcome in
+        (['admitted', 'refused', 'unknown'] if billet_retire_settled_purpose == 'settled-entry'
+         else ['verified', 'refused', 'unknown'])
+      - >-
+        billet_retire_settled_raw.rc ==
+        (2 if billet_retire_settled_answer.outcome == 'refused' else
+         3 if billet_retire_settled_answer.outcome == 'unknown' else 0)
+    fail_msg: "The {{ billet_retire_settled_purpose }} answer disagrees with its schema, purpose, outcome or exit."
+
+- name: Require typed settled refusal diagnostics
+  ansible.builtin.assert:
+    that:
+      - billet_retire_settled_answer.reason is string
+      - billet_retire_settled_answer.reason | length > 0
+      - billet_retire_settled_answer.why is string
+      - billet_retire_settled_answer.why | length > 0
+    fail_msg: "The {{ billet_retire_settled_purpose }} refusal has no typed reason and diagnostic."
+  when: billet_retire_settled_answer.outcome in ['refused', 'unknown']
+
+- name: Refuse the settled command's negative answer
+  ansible.builtin.fail:
+    msg: >-
+      Retirement's {{ billet_retire_settled_purpose }} was {{ billet_retire_settled_answer.outcome }}
+      ({{ billet_retire_settled_answer.reason | default('') }}): {{ billet_retire_settled_answer.why | default('') }}
+      Ordinary convergence remains closed.
+  when: billet_retire_settled_answer.outcome in ['refused', 'unknown']
+
+- name: Require typed settled success bindings
+  ansible.builtin.assert:
+    that:
+      - billet_retire_settled_answer[item] is string
+      - billet_retire_settled_answer[item] | length > 0
+    fail_msg: "The {{ billet_retire_settled_purpose }} answer has an invalid {{ item }} binding."
+  loop: [run, guard, retiring, deployment, transition_id, completed_by]
+
+- name: Require the settled retained contract and its activity proof
+  ansible.builtin.assert:
+    that:
+      - billet_retire_settled_answer.guard is match('^[0-9a-f]{32}\Z')
+      - billet_retire_settled_answer.transition_id is match('^[0-9a-f]{32}\Z')
+      - billet_retire_settled_answer.enablement_changes is mapping
+      - billet_retire_settled_answer.variant == 'retained-node'
+      - billet_retire_settled_answer.phase == 'done'
+      - billet_retire_settled_answer.row_done is sameas true
+      - billet_retire_settled_answer.settled is sameas true
+      - >-
+        billet_retire_settled_answer.node_activity in
+        (['active', 'quiet-inactive', 'quiet-failed'] if billet_retire_settled_purpose == 'settled-entry'
+         else ['active'])
+    fail_msg: "The {{ billet_retire_settled_purpose }} answer does not prove the settled retained contract and required node activity."
+
+- name: Require typed controller enablement observations
+  ansible.builtin.assert:
+    that:
+      - item.key in ['billet-server.service', 'billet-backup.service', 'billet-backup.timer', 'billet-upgrade.service', 'billet-upgrade.timer']
+      - item.value is string
+      - item.value | length > 0
+    fail_msg: "The {{ billet_retire_settled_purpose }} answer has an invalid controller enablement observation."
+  loop: "{{ billet_retire_settled_answer.enablement_changes | dict2items }}"

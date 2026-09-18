@@ -2,7 +2,7 @@
   "outcome": "refused",
   "purpose": "settled-closing",
   "reason": "settled-entry-node-unit-mismatch",
-  "schema": 1,
+  "schema": 2,
   "state": "nothing",
   "why": "node must be loaded with no pending definition reload"
 }

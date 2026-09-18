@@ -168,6 +168,23 @@ func retireRequestUnder(ctx context.Context, m retireMode) (any, *retireRefusal)
 		return nil, r
 	}
 
+	if j.Phase == retirement.PhaseIntent && j.Variant == retirement.VariantRetainedNode {
+		if r := requireRetireMarker(shape, j); r != nil {
+			return nil, r
+		}
+		identity, r := retireIdentity(j.IdentityDir)
+		if r != nil {
+			return nil, r
+		}
+		if err := j.Validate(retirement.JournalExpectation{Retiring: m.retiringHost, Identity: identity,
+			Holder: m.run, TakenOverFrom: shape.Guard.TakenOverFrom}); err != nil {
+			return nil, retireUnknown(retireReasonJournal, err.Error(), "")
+		}
+		if r := reconcileRetireInert(ctx, m, j); r != nil {
+			return nil, r
+		}
+	}
+
 	// A `done` JOURNAL IS ANSWERED FROM THE JOURNAL ITSELF, before any
 	// configuration is read and before any ledger is opened: the host it
 	// describes has no identity at its configured path and, when it kept no
@@ -355,6 +372,10 @@ func resumeRetirement(ctx context.Context, m retireMode, shape claimShape, db *s
 	j retirement.Journal, identity string, row state.Retirement,
 ) (any, *retireRefusal) {
 	if r := validateRetireJournal(&j, m, shape, identity, row); r != nil {
+		return nil, r
+	}
+
+	if r := reconcileRetireInert(ctx, m, j); r != nil {
 		return nil, r
 	}
 
@@ -1757,6 +1778,14 @@ func applyRetireIntent(ctx context.Context, m retireMode, root *txLock, dir *os.
 			return nil, r
 		}
 		j.RetainedInvocation = original
+		pending, err := retireOperationInspector().PendingReloadUnits(ctx)
+		if err != nil || len(pending) != 0 {
+			return nil, retireUnknown(retireReasonInertReload, "cannot record intent with a pending or unreadable reload", "")
+		}
+		j.InertSources, err = retireInertSources(ctx, retireOperationInspector())
+		if err != nil {
+			return nil, retireUnknown(retireReasonInertSource, err.Error(), "")
+		}
 	}
 	if r := admitRetireOperations(ctx, j, retireServiceSequence(j, retirement.Decision{Action: retirement.ActionStop})); r != nil {
 		return nil, r

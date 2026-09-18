@@ -121,9 +121,17 @@
         billet_registration_environment: >-
           {{ (hostvars[billet_migration_controller].billet_server_environment | default({})) | length > 0 }}
       block:
+        # #14 still owns selection. Recheck the actual migration branch too:
+        # an unchanged dry run cannot authorize self-confirmation after drift.
+        - name: Refuse confirmation on the retired controller
+          ansible.builtin.assert:
+            that: not billet_retirement_node_ordinary | default(false) | bool or billet_migration_controller != inventory_hostname
+            fail_msg: Retained endpoint migration cannot confirm on the retired inventory_hostname (#14).
+
         - name: Keep the migration's evidence for the receipt
           ansible.builtin.tempfile:
             state: file
+            path: "{{ billet_endpoint_temp_dir }}"
             prefix: billet-endpoint-evidence-
           register: billet_endpoint_evidence_file
           become: true
@@ -197,6 +205,7 @@
         - name: Keep the registration's confirmation for the receipt
           ansible.builtin.tempfile:
             state: file
+            path: "{{ billet_endpoint_temp_dir }}"
             prefix: billet-endpoint-confirmation-
           register: billet_endpoint_confirmation_file
           become: true

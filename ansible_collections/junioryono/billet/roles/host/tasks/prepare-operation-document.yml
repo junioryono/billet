@@ -1,6 +1,5 @@
 ---
-# This prepares operands only. main.yml has no caller until commit 3 supplies
-# command-owned entry permission and binds every dependent mutation boundary.
+# Preparation never overwrites command-verified entry or closing bindings.
 - name: Require complete operation operands before preparing admission
   ansible.builtin.assert:
     that:
@@ -54,14 +53,14 @@
 # bindings carry the expected purpose so entry cannot stand in for closing.
 - name: Prepare separate settled entry and closing bindings
   ansible.builtin.set_fact:
-    billet_retirement_entry_binding:
+    billet_retirement_prepared_entry_binding:
       purpose: settled-entry
       run: "{{ billet_exclusion_holder }}"
       guard: "{{ billet_exclusion_id }}"
       retiring: "{{ inventory_hostname }}"
       transition_id: "{{ billet_retirement_transition_id }}"
       argv: "{{ billet_retirement_binding_argv + ['--check-settled-entry'] }}"
-    billet_retirement_closing_binding:
+    billet_retirement_prepared_closing_binding:
       purpose: settled-closing
       run: "{{ billet_exclusion_holder }}"
       guard: "{{ billet_exclusion_id }}"

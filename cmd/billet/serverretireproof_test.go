@@ -292,6 +292,10 @@ func retireProofHost(t *testing.T, variant retirement.Variant, phase retirement.
 		f.retainANode(t)
 	}
 	f.reserve(t)
+	// The backup must be loaded before the late-phase fixture reloads its
+	// retirement drop-in into the manager's property store.
+	f.manager.set(backupServiceUnit, "LoadState", "loaded")
+	f.manager.set(backupServiceUnit, "UnitFileState", "static")
 	j := plantResumedRetirement(t, f, phase, variant)
 	mustOK(t, os.Rename(f.stateDir, j.Archive))
 	if variant == retirement.VariantRetainedNode {
@@ -302,8 +306,6 @@ func retireProofHost(t *testing.T, variant retirement.Variant, phase retirement.
 	} else {
 		mustOK(t, os.Remove(f.cfg))
 	}
-	f.manager.set(backupServiceUnit, "LoadState", "loaded")
-	f.manager.set(backupServiceUnit, "UnitFileState", "static")
 
 	return f, j
 }

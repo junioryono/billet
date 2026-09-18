@@ -405,9 +405,15 @@ func admitRetireNodeOperations(ctx context.Context, m retireMode, j retirement.J
 	}
 	j.RetainedInvocation = nil
 	protection := retireOperationProtection(j)
+	evidence, r := retireInertEvidence(ctx, j)
+	if r != nil {
+		return r
+	}
+	protection.RetiredConditions = evidence
+	protection.QuietUnits = nil
 	protected := slices.Clone(protection.Paths)
-	for _, unit := range []string{serverUnit, backupServiceUnit, backupTimerUnit, upgradeTimerUnit, "billet-upgrade.service"} {
-		for _, dir := range []string{"/etc/systemd/system", "/run/systemd/system", "/usr/lib/systemd/system", "/lib/systemd/system"} {
+	for _, unit := range retireInertUnits {
+		for _, dir := range retireOperationInspector().OperationUnitDirectories() {
 			protected = append(protected, filepath.Join(dir, unit), filepath.Join(dir, unit+".d"))
 		}
 		props, err := retireOperationInspector().UnitProperties(ctx, unit, "LoadState", "FragmentPath", "DropInPaths")
@@ -465,10 +471,10 @@ func admitRetireNodeOperations(ctx context.Context, m retireMode, j retirement.J
 		return retireUnknown(retireReasonEffects, "node unit source could not be observed", "")
 	}
 	for _, op := range operations.Filesystem {
-		if !slices.Contains([]string{"read", "write", "mkdir", "chown", "delete", "recursive-chown", "recursive-delete", "recursive-walk"}, op.Kind) {
+		if !slices.Contains([]string{"read", "write", "mkdir", "metadata", "delete", "recursive-chown", "recursive-write", "recursive-delete", "recursive-walk"}, op.Kind) {
 			return retireRefuse(retireReasonInput, "unsupported filesystem operation kind", "")
 		}
-		recursive := strings.HasPrefix(op.Kind, "recursive-") || op.Kind == "delete" || op.Kind == "write" || op.Kind == "chown"
+		recursive := strings.HasPrefix(op.Kind, "recursive-") || op.Kind == "delete" || op.Kind == "write"
 		if r := admitRetireFuturePath(op.Path, recursive, protected); r != nil {
 			return r
 		}
@@ -482,10 +488,10 @@ func admitRetireNodeOperations(ctx context.Context, m retireMode, j retirement.J
 				return retireUnknown(retireReasonNodePath, err.Error(), "")
 			}
 			unitPath := target == source || recursive && underOrEqual(target, source)
-			for _, dir := range []string{"/etc/systemd/system", "/run/systemd/system", "/usr/lib/systemd/system", "/lib/systemd/system"} {
+			for _, dir := range retireOperationInspector().OperationUnitDirectories() {
 				unitPath = unitPath || underOrEqual(dir, target) || recursive && underOrEqual(target, dir)
 			}
-			if unitPath && (op.Kind != "write" || !slices.ContainsFunc(operations.Units, func(unit retireProposedUnit) bool { return unit.Path == op.Path })) {
+			if unitPath && !retireOrdinaryUnitDestination(op.Path) && (op.Kind != "write" || !slices.ContainsFunc(operations.Units, func(unit retireProposedUnit) bool { return unit.Path == op.Path })) {
 				return retireRefuse(retireReasonEffects, "a unit destination requires its exact proposed unit document", "")
 			}
 		}
@@ -498,6 +504,15 @@ func admitRetireNodeOperations(ctx context.Context, m retireMode, j retirement.J
 					return retireUnknown(retireReasonNodePath, "environment operation path could not be resolved", "")
 				}
 				for _, destination := range []string{op.Path, resolved} {
+					if op.Kind == "metadata" {
+						environmentPath, err := lifeops.ResolveOperationPath(spec.Path)
+						if err != nil {
+							return retireUnknown(retireReasonNodePath, err.Error(), "")
+						}
+						if destination != spec.Path && destination != environmentPath {
+							continue
+						}
+					}
 					traverses, unknown, err := walkTraverses(spec.Path, destination)
 					switch {
 					case err != nil:
@@ -533,12 +548,16 @@ func admitRetireNodeOperations(ctx context.Context, m retireMode, j retirement.J
 	// higher-priority fragment need not set NeedDaemonReload. AdmitOperations
 	// only observes; this shares enable's source/link proof without enabling
 	// anything, even when the caller proposes no service operations.
-	sequence := []lifeops.Operation{{Verb: "enable", Unit: nodeUnit}}
-	for _, op := range operations.Services {
-		if op.Unit != nodeUnit && !slices.Contains(services, op.Unit) || !slices.Contains([]string{"start", "stop", "enable"}, op.Verb) {
-			return retireRefuse(retireReasonEffects, "ordinary preflight grants only retained node and required provider service operations", "")
+	sequence := []lifeops.Operation{{Verb: "enable", Unit: nodeUnit}, {Verb: "stop", Unit: nodeUnit}, {Verb: "start", Unit: nodeUnit}}
+	if len(operations.Services) != 0 {
+		if len(operations.Services) != len(sequence) {
+			return retireRefuse(retireReasonEffects, "ordinary preflight requires the node enable, stop, start superset", "")
 		}
-		sequence = append(sequence, lifeops.Operation{Verb: op.Verb, Unit: op.Unit})
+		for n, op := range operations.Services {
+			if op.Unit != nodeUnit || op.Verb != sequence[n].Verb {
+				return retireRefuse(retireReasonEffects, "ordinary preflight requires only the node enable, stop, start superset", "")
+			}
+		}
 	}
 	if err := retireOperationInspector().AdmitOperations(ctx, sequence, protection); err != nil {
 		if strings.Contains(err.Error(), "operation-install-source-inconsistent") {
@@ -595,4 +614,16 @@ func readRetireEnvironment(spec lifeops.EnvironmentFile) ([]byte, error) {
 		}
 	}
 	return body, err
+}
+
+// The role owns these auxiliary units by parity. Their concrete destinations
+// still pass protected-path admission; only the node carries a proposed unit.
+func retireOrdinaryUnitDestination(path string) bool {
+	name := filepath.Base(path)
+	if !slices.Contains(retireOperationInspector().OperationUnitDirectories(), filepath.Dir(path)) {
+		return false
+	}
+	return slices.Contains([]string{"billet-network.service", "billet-images-refresh.service", "billet-images-refresh.timer",
+		"billet-ceph-health.service", "billet-ceph-health.timer"}, name) ||
+		strings.HasPrefix(name, "billet-dnsmasq@") && strings.HasSuffix(name, ".service")
 }

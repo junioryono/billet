@@ -24,16 +24,21 @@
     billet_retire_call: request
     billet_retire_answered_by: "{{ billet_retirement_answerer }}"
 
-- name: Require a known completed server-only retirement
+- name: Require a known completed retirement matching its variant and receipt
   ansible.builtin.assert:
     that:
       - billet_retire_state_known | bool
       - billet_retire_answer.outcome in ['retired', 'unchanged']
-      - billet_retire_answer.variant | default('') == 'server-only'
+      - billet_retire_answer.variant | default('') == billet_retirement_variant
       - billet_retire_answer.state == 'done'
       - billet_retire_answer.transition_id == billet_retirement_transition_id
+      # Settled unchanged answers carry postconditions, not a tail receipt.
+      - >-
+        billet_retire_answer.outcome != 'retired' or
+        (billet_retire_answer.variant == 'retained-node' and billet_retire_answer.receipt | default('') in ['written', 'current']) or
+        (billet_retire_answer.variant == 'server-only' and billet_retire_answer.receipt | default('') == 'none')
     fail_msg: >-
-      The continuation did not confirm a known server-only done state;
+      The continuation did not confirm a known done state with the recorded variant and its paired receipt;
       ordinary convergence remains bypassed.
 
 - name: Record the continuation's result and changes

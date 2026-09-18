@@ -155,6 +155,20 @@ func runRetireManagerFake(ctx context.Context, name string, args []string, stdou
 	if name != "systemctl" {
 		return runRetireBusFake(ctx, root, name, args, stdout)
 	}
+	if len(args) == 1 && args[0] == "daemon-reload" {
+		return reloadRetireManagerFake(root)
+	}
+	if len(args) == 3 && args[0] == "list-units" {
+		files, err := filepath.Glob(filepath.Join(root, "*.effects"))
+		if err != nil {
+			return err
+		}
+		rows := []map[string]string{}
+		for _, file := range files {
+			rows = append(rows, map[string]string{"unit": strings.TrimSuffix(filepath.Base(file), ".effects")})
+		}
+		return json.NewEncoder(stdout).Encode(rows)
+	}
 	if len(args) < 3 {
 		return fmt.Errorf("incomplete systemctl request: %v", args)
 	}
@@ -522,4 +536,53 @@ func TestRetireManagerPreservesCallerDiagnostics(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Loading copies observed source bytes into the manager's separate property
+// store. It supplies no admission decision and never changes unit activity.
+func reloadRetireManagerFake(root string) error {
+	if err := appendRetireManagerRecord(root, ".submitted", "daemon-reload"); err != nil {
+		return err
+	}
+	for _, unit := range retireInertUnits {
+		props, err := readRetireManagerProperties(root, unit)
+		if err != nil {
+			return err
+		}
+		fragment := firstProp(props, "FragmentPath")
+		if fragment == "" {
+			continue
+		}
+		path := filepath.Join(filepath.Dir(fragment), unit+".d", retireDropInName)
+		body, err := os.ReadFile(path)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		marker := strings.TrimSuffix(strings.TrimPrefix(string(body), "[Unit]\nConditionPathExists=!"), "\n")
+		reply := map[string]any{"type": "a(sbbsi)", "data": []any{[]any{"ConditionPathExists", false, true, marker, 0}}}
+		encoded, err := json.Marshal(reply)
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(root, unit+".Conditions.json"), encoded, 0o600); err != nil {
+			return err
+		}
+		file := filepath.Join(root, unit+".effects")
+		data, err := os.ReadFile(file)
+		if err != nil {
+			return err
+		}
+		lines := strings.Split(strings.TrimSuffix(string(data), "\n"), "\n")
+		for key, value := range map[string]string{"DropInPaths": path, "NeedDaemonReload": "no", "Conditions": "[unprintable]"} {
+			lines = slices.DeleteFunc(lines, func(line string) bool { return strings.HasPrefix(line, key+"=") })
+			lines = append(lines, key+"="+value)
+		}
+		if err := os.WriteFile(file, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
 }

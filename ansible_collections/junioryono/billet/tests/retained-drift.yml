@@ -1,0 +1,11 @@
+---
+- name: Bind retained operations to the reviewed task graph and template sweep
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Check the ordinary graph and each independent planted counterexample
+      ansible.builtin.command:
+        argv: ["{{ ansible_playbook_python }}", "{{ playbook_dir }}/retained_drift.py", --case, "{{ item }}"]
+      loop: [positive, unlisted-task, changed-argument, changed-read-argv, unlisted-template-variable]
+      changed_when: false

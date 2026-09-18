@@ -1,13 +1,6 @@
 ---
-- name: Classify optional SMTP alert credentials
-  ansible.builtin.set_fact:
-    billet_smtp_user_set: "{{ billet_smtp_username | length > 0 }}"
-    billet_smtp_password_set: "{{ billet_smtp_password | length > 0 }}"
-    billet_smtp_config_path: "{{ (_billet_alert_root | default('')) ~ '/etc/msmtprc' }}"
-    billet_smtp_marker_path: "{{ (_billet_alert_root | default('')) ~ '/etc/billet/msmtprc-managed' }}"
-    billet_ceph_health_script_path: "{{ (_billet_alert_root | default('')) ~ '/usr/local/libexec/billet-ceph-health' }}"
-    billet_ceph_health_service_path: "{{ (_billet_alert_root | default('')) ~ '/etc/systemd/system/billet-ceph-health.service' }}"
-    billet_ceph_health_timer_path: "{{ (_billet_alert_root | default('')) ~ '/etc/systemd/system/billet-ceph-health.timer' }}"
+- name: Resolve alert destinations
+  ansible.builtin.import_tasks: alert-operands.yml
 
 - name: Inspect an existing SMTP configuration
   ansible.builtin.stat:
@@ -138,11 +131,12 @@
           - python3
           - -c
           - >-
-            import re,smtplib,ssl; c=open('{{ billet_smtp_config_path }}').read();
+            import re,smtplib,ssl,sys; c=open(sys.argv[1]).read();
             v=lambda k: re.search(rf'^{k}\s+(\S+)',c,re.M).group(1);
             s=smtplib.SMTP(v('host'),int(v('port')),timeout=25); s.ehlo();
             s.starttls(context=ssl.create_default_context()); s.ehlo();
             s.login(v('user'),v('password')); s.quit()
+          - "{{ billet_smtp_config_path }}"
       changed_when: false
       become: "{{ _billet_alert_become | default(true) }}"
       no_log: true

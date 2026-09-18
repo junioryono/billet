@@ -2,7 +2,10 @@ package lifeops
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -25,6 +28,14 @@ type Operation struct {
 // inactive activation sources; QuietExceptions are sources this sequence stops.
 // WaitingUnits defer backup activity to the caller's wait/reconciliation proof.
 type OperationProtection struct {
+	// RetiredConditions are produced by ProveRetiredConditionEvidence and revalidated
+	// by each walk; they exempt only incoming runtime activation edges.
+	RetiredConditions []RetiredConditionEvidence
+
+	// PendingRetirementReload verifies the journal-bound owned drop-in change
+	// and returns its path. It is consulted only for NeedDaemonReload=yes.
+	PendingRetirementReload func(context.Context, string) (string, error)
+
 	Units              []string
 	QuietUnits         []string
 	WaitingUnits       []string
@@ -299,7 +310,14 @@ func (w *operationWalk) read(ctx context.Context, unit string) (operationEvidenc
 	if masked && (strings.HasSuffix(unit, ".timer") || first(props, "UnitFileState") == "masked") {
 		return operationEvidence{props: props}, nil
 	}
-	if first(props, "LoadState") != "loaded" || first(props, "NeedDaemonReload") != "no" {
+	ownedDropIn := ""
+	if first(props, "NeedDaemonReload") == "yes" && w.protection.PendingRetirementReload != nil {
+		ownedDropIn, err = w.protection.PendingRetirementReload(ctx, unit)
+		if err != nil {
+			return operationEvidence{}, err
+		}
+	}
+	if first(props, "LoadState") != "loaded" || (first(props, "NeedDaemonReload") != "no" && ownedDropIn == "") {
 		return operationEvidence{}, fmt.Errorf("operation-source-unsupported: %s LoadState=%q FragmentPath=%q UnitFileState=%q ActiveState=%q Job=%q NeedDaemonReload=%q", unit,
 			first(props, "LoadState"), first(props, "FragmentPath"), first(props, "UnitFileState"), first(props, "ActiveState"), first(props, "Job"), first(props, "NeedDaemonReload"))
 	}
@@ -351,7 +369,21 @@ func (w *operationWalk) read(ctx context.Context, unit string) (operationEvidenc
 	if !scoped || first(props, "FragmentPath") == "" {
 		return operationEvidence{props: props, privateTrees: privateTrees}, nil
 	}
-	sources, err := readOperationSources(props)
+	sourceProps := props
+	if ownedDropIn != "" {
+		if _, err := os.Lstat(ownedDropIn); errors.Is(err, fs.ErrNotExist) {
+			sourceProps = make(map[string][]string, len(props))
+			for key, value := range props {
+				sourceProps[key] = value
+			}
+			dropins := strings.Fields(first(props, "DropInPaths"))
+			dropins = slices.DeleteFunc(dropins, func(path string) bool { return path == ownedDropIn })
+			sourceProps["DropInPaths"] = []string{strings.Join(dropins, " ")}
+		} else if err != nil {
+			return operationEvidence{}, err
+		}
+	}
+	sources, err := readOperationSources(sourceProps)
 	if err != nil {
 		return operationEvidence{}, fmt.Errorf("operation-source-unreadable: %s: %w", unit, err)
 	}
@@ -453,7 +485,7 @@ func (w *operationWalk) admit(ctx context.Context, op Operation) error {
 			op.Unit = canonical
 		}
 		if effect != op && protectedOperationUnit(effect.Unit, w.protection.Units) &&
-			(effect.Verb != "start" || !slices.Contains(w.protection.RequiredActive, effect.Unit) || first(ev.props, "ActiveState") != "active") {
+			(effect.Verb != "start" || (!w.inertUnit(effect.Unit) && (!slices.Contains(w.protection.RequiredActive, effect.Unit) || first(ev.props, "ActiveState") != "active"))) {
 			return fmt.Errorf("operation-protected-effect: %s %s reaches %s %s", op.Verb, op.Unit, effect.Verb, effect.Unit)
 		}
 		if first(ev.props, "LoadState") == "not-found" || first(ev.props, "LoadState") == "masked" {
@@ -532,7 +564,7 @@ func (w *operationWalk) admit(ctx context.Context, op Operation) error {
 					if err != nil {
 						return err
 					}
-					if first(from.props, "ActiveState") != "inactive" && !w.stopped[source] && !slices.Contains(w.protection.QuietExceptions, source) {
+					if !w.inertUnit(effect.Unit) && first(from.props, "ActiveState") != "inactive" && !w.stopped[source] && !slices.Contains(w.protection.QuietExceptions, source) {
 						return fmt.Errorf("operation-reactivation: %s %s=%s is not quiet", effect.Unit, prop, source)
 					}
 				}

@@ -59,7 +59,7 @@ def operation_document(rendering, operations, run, retiring, transition):
     if set(operations) != {'filesystem', 'services', 'units'} or any(not isinstance(v, list) for v in operations.values()):
         raise Refusal('operation document requires three explicit arrays')
     for op in operations['filesystem']:
-        if set(op) != {'kind', 'path'} or op['kind'] not in ['read', 'write', 'mkdir', 'chown', 'delete', 'recursive-chown', 'recursive-delete', 'recursive-walk']:
+        if set(op) != {'kind', 'path'} or op['kind'] not in ['read', 'write', 'mkdir', 'metadata', 'delete', 'recursive-chown', 'recursive-write', 'recursive-delete', 'recursive-walk']:
             raise Refusal('unsupported filesystem operand')
     for op in operations['services']:
         if set(op) != {'verb', 'unit'}:

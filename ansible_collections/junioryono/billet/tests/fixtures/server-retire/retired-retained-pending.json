@@ -1,0 +1,46 @@
+{
+  "schema": 1,
+  "outcome": "retired",
+  "phase": "done",
+  "variant": "retained-node",
+  "transition_id": "0123456789abcdef0123456789abcdef",
+  "steps": [
+    {
+      "action": "stop",
+      "phase": "intent"
+    },
+    {
+      "action": "archive",
+      "phase": "stopped"
+    },
+    {
+      "action": "rewrite",
+      "phase": "archived"
+    },
+    {
+      "action": "restart",
+      "phase": "config-rewritten"
+    },
+    {
+      "action": "done",
+      "phase": "node-restarted"
+    }
+  ],
+  "status": "done",
+  "receipt": "written",
+  "row": "pending",
+  "row_why": "BILLET_STATE_DSN is not set in this process's environment",
+  "completed_by": "",
+  "completion": {
+    "schema": 1,
+    "deployment": "dddddddddddddddddddddddddddddddd",
+    "retiring": "control-a",
+    "survivor": "control-b",
+    "transition_id": "0123456789abcdef0123456789abcdef",
+    "reservation": "2026-09-11T10:00:00Z",
+    "done_at": "2026-09-11T10:00:30Z"
+  },
+  "marker": "kept",
+  "settled": false,
+  "state": "done"
+}

@@ -724,7 +724,7 @@
   register: billet_check
   changed_when: false
   when:
-    - not billet_retirement_node_ordinary | default(false) | bool
+    - not billet_retirement_node_ordinary | bool
     - not billet_binary_upgrade | default(false)
     - not ansible_check_mode
   become: true
@@ -750,6 +750,7 @@
   when:
     - billet_enable_server
     - not ansible_check_mode
+    - not billet_retirement_node_ordinary | bool
   become: true
 
 - name: Inspect control-plane state files
@@ -761,6 +762,7 @@
   when:
     - billet_enable_server
     - not ansible_check_mode
+    - not billet_retirement_node_ordinary | bool
   become: true
 
 - name: Protect control-plane state files
@@ -775,6 +777,7 @@
   when:
     - billet_enable_server
     - not ansible_check_mode
+    - not billet_retirement_node_ordinary | bool
   become: true
 
 - name: Restart the billet server after non-binary inputs change
@@ -793,6 +796,7 @@
       billet_server_environment_install.changed | default(false) or
       billet_state_ca_bundle_install.changed | default(false) or
       (billet_unit_templates_by_unit.values() | selectattr('changed', 'equalto', true) | list | length > 0)
+    - not billet_retirement_node_ordinary | bool
   become: true
 
 # THE ENDPOINT MIGRATION, in place of the ordinary restart: the command judges
@@ -828,6 +832,7 @@
   when:
     - billet_server_should_run
     - not ansible_check_mode
+    - not billet_retirement_node_ordinary | bool
   become: true
   notify: billet unit files changed
 
@@ -859,6 +864,7 @@
   when:
     - not billet_server_should_run
     - not ansible_check_mode
+    - not billet_retirement_node_ordinary | bool
   become: true
   notify: billet unit files changed
 
@@ -896,7 +902,9 @@
     - { src: billet-upgrade.timer.j2, dest: billet-upgrade.timer, wanted: "{{ billet_server_should_run }}" }
   loop_control:
     label: "{{ item.dest }}"
-  when: item.wanted | bool
+  when:
+    - item.wanted | bool
+    - not billet_retirement_node_ordinary | bool
   register: billet_scheduled_units
   become: true
 
@@ -906,6 +914,7 @@
   when:
     - billet_scheduled_units is changed
     - not ansible_check_mode
+    - not billet_retirement_node_ordinary | bool
   become: true
 
 # THE TIMER, NOT THE SERVICE: the service is a oneshot the timer triggers, and
@@ -922,5 +931,6 @@
   when:
     - item.wanted | bool
     - not ansible_check_mode
+    - not billet_retirement_node_ordinary | bool
   become: true
   notify: billet unit files changed

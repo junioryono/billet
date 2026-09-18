@@ -2,7 +2,7 @@
   "schema": 1,
   "outcome": "reported",
   "journal": {
-    "phase": "archived",
+    "phase": "intent",
     "variant": "retained-node",
     "row_done": false,
     "settled": false,
@@ -12,7 +12,7 @@
     "survivor": "control-b"
   },
   "status": {
-    "phase": "archived",
+    "phase": "intent",
     "variant": "retained-node",
     "updated_at": "2026-09-11T10:00:30Z"
   },
@@ -22,16 +22,22 @@
     "kind": "retirement",
     "id": "0123456789abcdef0123456789abcdef"
   },
-  "row": null,
-  "row_fact": "unreadable",
-  "dispatch": "unknown-ledger",
+  "row": {
+    "retiring": "control-a",
+    "survivor": "control-b",
+    "run": "ci-1",
+    "state": "intent",
+    "transition_id": "0123456789abcdef0123456789abcdef",
+    "reserved_at": "2026-09-11T10:00:00Z"
+  },
+  "row_fact": "intent-mine",
+  "dispatch": "resume",
   "status_presence": "present",
   "config": "present",
   "installed_roles": "both",
-  "identity": "absent",
-  "authority": "absent",
-  "route": "unsupported-variant",
-  "route_why": "the journal records a retained-node retirement, which this converge does not support",
-  "why": "no deployment identity is minted in /var/lib/billet/server, so no row can be associated with this host",
-  "state": "archived"
+  "identity": "minted",
+  "authority": "present",
+  "route": "continue",
+  "route_why": "this host has a readable journal, so this converge continues the retained-node retirement it records",
+  "state": "intent"
 }

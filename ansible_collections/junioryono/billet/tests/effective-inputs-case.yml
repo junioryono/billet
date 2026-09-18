@@ -5,7 +5,7 @@
     tasks_from: reset-private
 
 # These permissions are fixtures for the isolated derivation, never a route
-# through main.yml. The call-site gate keeps retained admission closed.
+# through main.yml. The call-site gate pins command-owned entry admission.
 - name: Supply the isolated route's admission and desired input
   ansible.builtin.set_fact:
     billet_retirement_route: "{{ billet_gate_case.route }}"
@@ -20,6 +20,7 @@
     tasks_from: effective-config
   vars:
     billet_enable_server: "{{ billet_gate_case.controller }}"
+    billet_server_retire: true
 
 - name: Require the complete projection or unchanged desired document
   ansible.builtin.assert:

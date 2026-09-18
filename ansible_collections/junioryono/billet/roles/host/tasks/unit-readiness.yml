@@ -1,0 +1,22 @@
+---
+- name: Inspect installed service readiness types before ordinary convergence
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - show
+      - --property=Type
+      - --value
+      - "{{ item }}"
+  loop: "{{ billet_unit_operands.keys() | list }}"
+  register: billet_installed_service_types
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  become: true
+  when: not billet_binary_upgrade | default(false)
+
+- name: Key installed readiness observations by unit name
+  ansible.builtin.set_fact:
+    billet_service_types_by_unit: "{{ billet_installed_service_types.results | junioryono.billet.unit_results }}"
+  when: not billet_binary_upgrade | default(false)
+

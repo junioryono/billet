@@ -1,0 +1,233 @@
+---
+- name: Retained ordinary work excludes controller resources and preserves node lifecycle
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    billet_gate_role: "{{ playbook_dir }}/../roles/host"
+    billet_gate_main: "{{ lookup('ansible.builtin.file', billet_gate_role + '/tasks/main.yml') | from_yaml }}"
+    billet_gate_effective: "{{ lookup('ansible.builtin.file', billet_gate_role + '/tasks/effective-config.yml') | from_yaml }}"
+  tasks:
+    # File lookup content is text, never a trusted when expression.
+    - name: Pin each controller exclusion by task name
+      ansible.builtin.assert:
+        that:
+          - billet_gate_matches | length == 1
+          - "'not billet_retirement_node_ordinary | bool' in billet_gate_conditions"
+        fail_msg: "{{ item.file }} / {{ item.name }} must exclude retained ordinary work."
+      vars:
+        billet_gate_source: "{{ lookup('ansible.builtin.file', billet_gate_role + '/tasks/' + item.file) | from_yaml }}"
+        billet_gate_tasks: "{{ billet_gate_source[-1].block if item.file == 'main.yml' else billet_gate_source }}"
+        billet_gate_matches: "{{ billet_gate_tasks | selectattr('name', 'equalto', item.name) | list }}"
+        billet_gate_conditions: "{{ [billet_gate_matches[0].when] if billet_gate_matches[0].when is string else billet_gate_matches[0].when }}"
+      loop:
+        - file: main.yml
+          name: Record the service account and provision the authority locks on an existing installation
+        - file: main.yml
+          name: Compute the ledger mount name for ordinary convergence
+        - file: main.yml
+          name: Inspect the installed ledger mount unit
+        - file: main.yml
+          name: Refuse to drop a previously configured ledger volume
+        - file: main.yml
+          name: Record the service account and provision the authority locks on a fresh host
+        - file: main.yml
+          name: Mount the control-plane ledger volume fail closed
+        - file: main.yml
+          name: Configure or remove the deployment backup timer
+        - file: account.yml
+          name: Refuse to move installed server state implicitly
+        - file: account.yml
+          name: Render the billet server environment
+        - file: account.yml
+          name: Install the ledger's certificate bundle
+        - file: account.yml
+          name: Record ownership of the billet server environment
+        - file: account.yml
+          name: Inspect ownership of the billet server environment
+        - file: account.yml
+          name: Remove the billet server environment when nothing configures it
+        - file: services.yml
+          name: Validate a billet host whose binary did not change
+        - file: services.yml
+          name: Return server state created by validation to the control-plane account
+        - file: services.yml
+          name: Inspect control-plane state files
+        - file: services.yml
+          name: Protect control-plane state files
+        - file: services.yml
+          name: Restart the billet server after non-binary inputs change
+        - file: services.yml
+          name: Enable and start the billet server
+        - file: services.yml
+          name: Stop and disable the billet server unless it may run here
+        - file: services.yml
+          name: Install the scheduled updater units
+        - file: services.yml
+          name: Load the scheduled updater units
+        - file: services.yml
+          name: Enable the scheduled updaters
+      loop_control:
+        label: "{{ item.file }} / {{ item.name }}"
+
+    - name: Pin the complete shared node lifecycle conditions as text
+      ansible.builtin.assert:
+        that: billet_gate_task.when == item.conditions
+        fail_msg: "{{ item.name }} changed the shared node lifecycle condition."
+      vars:
+        billet_gate_source: "{{ lookup('ansible.builtin.file', billet_gate_role + '/tasks/' + item.file) | from_yaml }}"
+        billet_gate_task: "{{ billet_gate_source | selectattr('name', 'equalto', item.name) | first }}"
+      loop:
+        - file: services.yml
+          name: Restart the billet node after non-binary inputs change
+          conditions:
+            - billet_node_should_run
+            - not ansible_check_mode
+            - not billet_binary_upgrade | default(false)
+            - not billet_endpoint_migrated | default(false) | bool
+            - >-
+              billet_config_install.changed | default(false) or
+              billet_firecracker_install.changed | default(false) or
+              billet_firecracker_links.changed | default(false) or
+              (billet_server_environment | default({}) | length > 0 and
+               billet_server_environment_install.changed | default(false)) or
+              (billet_unit_templates_by_unit.values() | selectattr('changed', 'equalto', true) | list | length > 0)
+        - file: services.yml
+          name: Enable and start the billet node
+          conditions: [billet_node_should_run, not ansible_check_mode]
+        - file: services.yml
+          name: Stop and disable the billet node unless it may run here
+          conditions: [not billet_node_should_run, not ansible_check_mode]
+        - file: network.yml
+          name: Drain billet compute before changing guest networking
+          conditions:
+            - billet_network_requires_drain
+            - billet_node_unit_load_state.stdout | trim != 'not-found'
+            - not ansible_check_mode
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Require binary refusal at ordinary entry before inspection or mutation
+      ansible.builtin.assert:
+        that:
+          - billet_gate_main[-1].block[0]['ansible.builtin.import_tasks'] == 'effective-config.yml'
+          - billet_gate_effective[0]['ansible.builtin.import_tasks'] == 'retirement-binary-refusal.yml'
+          - billet_gate_refusal | length == 1
+          - billet_gate_refusal[0].when == 'billet_retirement_node_ordinary | bool and billet_binary_upgrade | default(false) | bool'
+      vars:
+        billet_gate_refusal: "{{ lookup('ansible.builtin.file', billet_gate_role + '/tasks/retirement-binary-refusal.yml') | from_yaml }}"
+
+    - name: Require settled admission and final closing to be connected
+      ansible.builtin.assert:
+        that:
+          - billet_gate_continue[1].block[0]['ansible.builtin.include_tasks'] == 'retirement-settled-entry.yml'
+          - billet_gate_continue[1].block[1]['ansible.builtin.set_fact'].billet_retirement_node_ordinary is sameas true
+          - billet_gate_continue[1].block[1]['ansible.builtin.set_fact'].billet_retirement_bypass is sameas false
+          - "'not ansible_check_mode' in billet_gate_continue[1].when"
+          - billet_gate_main[-1].block[-2]['ansible.builtin.meta'] == 'flush_handlers'
+          - billet_gate_main[-1].block[-1]['ansible.builtin.include_tasks'] == 'retirement-settled-closing.yml'
+          - billet_gate_main[-1].block[-1].when == 'billet_retirement_node_ordinary | bool'
+      vars:
+        billet_gate_continue: "{{ lookup('ansible.builtin.file', billet_gate_role + '/tasks/retirement-continue.yml') | from_yaml }}"
+
+    - name: Pin the retained migration selection refusals before delegation
+      ansible.builtin.assert:
+        that:
+          - billet_gate_selection['ansible.builtin.assert'].that == 'billet_migration_controller != inventory_hostname'
+          - billet_gate_selection.when == ['billet_retirement_node_ordinary | default(false) | bool', 'billet_endpoint_answer.planned | default(false) | bool']
+          - billet_gate_confirmation.when == "billet_endpoint_answer.outcome == 'migrated'"
+          - billet_gate_confirmation.block[0]['ansible.builtin.assert'].that == 'not billet_retirement_node_ordinary | default(false) | bool or billet_migration_controller != inventory_hostname'
+      vars:
+        billet_gate_decision: "{{ lookup('ansible.builtin.file', billet_gate_role + '/tasks/endpoint-decision.yml') | from_yaml }}"
+        billet_gate_migration: "{{ lookup('ansible.builtin.file', billet_gate_role + '/tasks/endpoint-migration.yml') | from_yaml }}"
+        billet_gate_selection: "{{ billet_gate_decision[1].block | selectattr('name', 'equalto', 'Refuse retained endpoint migration confirmed by the retired host') | first }}"
+        billet_gate_confirmation: "{{ billet_gate_migration[0].block | selectattr('name', 'equalto', 'Confirm and receipt the migration') | first }}"
+
+    - name: Exercise the pinned selection rule without inherited production facts
+      ansible.builtin.assert:
+        that:
+          - (not item.retained or not item.planned or item.controller != 'retiring') is sameas item.admitted
+          - (not item.retained or item.controller != 'retiring') is sameas item.confirmable
+      loop:
+        - {retained: true, planned: false, controller: retiring, admitted: true, confirmable: false}
+        - {retained: true, planned: true, controller: retiring, admitted: false, confirmable: false}
+        - {retained: true, planned: true, controller: survivor, admitted: true, confirmable: true}
+        - {retained: false, planned: true, controller: retiring, admitted: true, confirmable: true}
+
+- name: Retained binary refusal and server directory emptiness use real production tasks
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    billet_gate_role: "{{ playbook_dir }}/../roles/host"
+    billet_service_user: billet
+    billet_service_group: billet
+  tasks:
+    - name: Exercise every binary decision beside both desired server shapes
+      ansible.builtin.include_tasks: retained-guards-case.yml
+      loop:
+        - {retained: true, upgrade: true, server: true}
+        - {retained: true, upgrade: true, server: false}
+        - {retained: false, upgrade: true, server: true}
+        - {retained: false, upgrade: true, server: false}
+        - {retained: true, upgrade: false, server: true}
+        - {retained: true, upgrade: false, server: false}
+        - {retained: false, upgrade: false, server: true}
+        - {retained: false, upgrade: false, server: false}
+      loop_control:
+        loop_var: billet_gate_case
+
+# THE CLOSING RELOAD PROBE (§3.3), pinned as text and exercised as a copy: its
+# argv and failed_when come from handlers/main.yml through lookup, so they are
+# never templated here, and the copy below is the same logic written where it is
+# trusted. A retained pass must ask the node and refuse anything but yes or no;
+# every other host keeps the server probe and its exit-status check alone.
+- name: The closing reload probe asks the retained node and accepts only yes or no
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    billet_gate_handlers: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/handlers/main.yml') | from_yaml }}"
+    billet_gate_probe: "{{ billet_gate_handlers | selectattr('name', 'equalto', 'Inspect whether the manager reports a pending reload after unit-file changes') | first }}"
+  tasks:
+    - name: Pin the probe's unit and its failure condition
+      ansible.builtin.assert:
+        that:
+          - >-
+            billet_gate_probe['ansible.builtin.command'].argv[-1][2:-2].split() | join(' ') ==
+            "'billet-node.service' if billet_retirement_node_ordinary | default(false) | bool else 'billet-server.service'"
+          - >-
+            billet_gate_probe.failed_when.split() | join(' ') ==
+            "billet_service_policy_reload_after.rc != 0 or (billet_retirement_node_ordinary | default(false) | bool and billet_service_policy_reload_after.stdout | trim not in ['yes', 'no'])"
+        fail_msg: The closing reload probe changed; update the copy below with it.
+
+    - name: Exercise a copy of the probe's unit selection and failure condition
+      ansible.builtin.assert:
+        that:
+          - >-
+            ('billet-node.service' if billet_gate_retained | default(false) | bool else 'billet-server.service')
+            == item.unit
+          - >-
+            (billet_gate_reload.rc != 0 or
+             (billet_gate_retained | default(false) | bool and
+              billet_gate_reload.stdout | trim not in ['yes', 'no']))
+            == item.fails
+        fail_msg: "{{ item.name }}: the probe selected or judged its answer wrongly."
+      # Whole values through one expression each, so rc stays an integer and the
+      # retained fact a Boolean; a template nested inside a mapping would render
+      # rc as the string "0", which is never equal to 0. The copy's names are its
+      # own: earlier plays leave the production names set as facts, which outrank
+      # task vars and would answer every case as an ordinary host.
+      vars:
+        billet_gate_retained: "{{ item.retained }}"
+        billet_gate_reload: "{{ item.result }}"
+      loop:
+        - {name: retained yes, retained: true, result: {rc: 0, stdout: 'yes'}, unit: billet-node.service, fails: false}
+        - {name: retained no, retained: true, result: {rc: 0, stdout: "no\n"}, unit: billet-node.service, fails: false}
+        - {name: retained empty, retained: true, result: {rc: 0, stdout: ''}, unit: billet-node.service, fails: true}
+        - {name: retained unfamiliar, retained: true, result: {rc: 0, stdout: 'maybe'}, unit: billet-node.service, fails: true}
+        - {name: retained failed call, retained: true, result: {rc: 1, stdout: 'no'}, unit: billet-node.service, fails: true}
+        - {name: ordinary empty stays accepted, retained: false, result: {rc: 0, stdout: ''}, unit: billet-server.service, fails: false}
+        - {name: ordinary failed call, retained: false, result: {rc: 1, stdout: ''}, unit: billet-server.service, fails: true}
+      loop_control:
+        label: "{{ item.name }}"

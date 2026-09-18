@@ -1,0 +1,79 @@
+---
+# These values become directives, not argv. Quote-free multiline input would
+# let an inventory value add an unrelated root write to the consumer's config.
+- name: Validate billet_guest_dns_servers as a list
+  ansible.builtin.assert:
+    that: billet_guest_dns_servers is sequence and billet_guest_dns_servers is not string and billet_guest_dns_servers is not mapping
+    fail_msg: billet_guest_dns_servers must be a list of IPv4 or IPv6 literals.
+
+- name: Validate each billet_guest_dns_servers literal
+  ansible.builtin.assert:
+    that: item | junioryono.billet.ip_literal
+    fail_msg: billet_guest_dns_servers must contain only IPv4 or IPv6 literals.
+  loop: "{{ billet_guest_dns_servers }}"
+
+- name: Validate each SMTP member as a single line without controls
+  ansible.builtin.assert:
+    that: lookup('ansible.builtin.vars', item) | string | junioryono.billet.single_line
+    fail_msg: "{{ item }} must be a single line without control characters."
+  loop: [billet_smtp_host, billet_smtp_port, billet_smtp_username, billet_smtp_password, billet_alert_from, billet_alert_email]
+  # Never print a credential, even when its grammar is refused. The loop label
+  # and diagnostic carry only its inventory name.
+  loop_control:
+    label: "{{ item }}"
+
+- name: Validate billet_smtp_host
+  ansible.builtin.assert:
+    that: billet_smtp_host | junioryono.billet.smtp_host
+    fail_msg: billet_smtp_host must be a DNS hostname or IP literal.
+
+- name: Validate billet_smtp_port
+  ansible.builtin.assert:
+    that: billet_smtp_port | junioryono.billet.port
+    fail_msg: billet_smtp_port must be a decimal port from 1 to 65535.
+
+- name: Validate billet_alert_from
+  ansible.builtin.assert:
+    that: billet_alert_from == '' or billet_alert_from | junioryono.billet.mailbox
+    fail_msg: billet_alert_from must be empty or one unquoted mailbox address.
+
+- name: Validate billet_alert_email
+  ansible.builtin.assert:
+    that: billet_alert_email == '' or billet_alert_email | junioryono.billet.mailbox
+    fail_msg: billet_alert_email must be empty or one unquoted mailbox address.
+
+- name: Validate guest network configuration literals
+  ansible.builtin.assert:
+    that:
+      - item.name is match('^[A-Za-z0-9][A-Za-z0-9_.-]{0,14}\Z')
+      - item.name not in ['.', '..']
+      - item.address | junioryono.billet.ip_literal(4)
+      - item.dhcp_start | junioryono.billet.ip_literal(4)
+      - item.dhcp_end | junioryono.billet.ip_literal(4)
+      - item.netmask | junioryono.billet.ip_literal(4)
+      - item.prefix | string is match('^([0-9]|[12][0-9]|3[0-2])\Z')
+    fail_msg: billet_networks must contain literal interface names, IPv4 addresses and decimal prefixes.
+  loop: "{{ billet_networks }}"
+
+- name: Validate billet_guest_denied_ipv4
+  ansible.builtin.assert:
+    that: item | junioryono.billet.ip_network_literal(4)
+    fail_msg: billet_guest_denied_ipv4 must contain IPv4 network literals.
+  loop: "{{ billet_guest_denied_ipv4 }}"
+
+- name: Validate billet_guest_denied_ipv6
+  ansible.builtin.assert:
+    that: item | junioryono.billet.ip_network_literal(6)
+    fail_msg: billet_guest_denied_ipv6 must contain IPv6 network literals.
+  loop: "{{ billet_guest_denied_ipv6 }}"
+
+- name: Validate guest firewall port literals
+  ansible.builtin.assert:
+    that: item | junioryono.billet.firewall_port
+    fail_msg: billet_guest_host_tcp_ports, billet_guest_host_udp_ports and billet_image_verify_port must contain ports from 1 to 65535, port ranges or service names.
+  loop: "{{ billet_guest_host_tcp_ports + billet_guest_host_udp_ports + [billet_image_verify_port] }}"
+
+- name: Validate billet_firecracker_version for versioned destinations
+  ansible.builtin.assert:
+    that: billet_firecracker_version is match('^v[0-9]+\.[0-9]+\.[0-9]+\Z')
+    fail_msg: billet_firecracker_version must be a vMAJOR.MINOR.PATCH release.

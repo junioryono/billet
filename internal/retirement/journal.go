@@ -80,6 +80,10 @@ type Journal struct {
 	TimerStoppedAt     string              `json:"timer_stopped_at"`
 	RetainedInvocation *RetainedInvocation `json:"retained_invocation,omitempty"`
 
+	// InertSources binds reload recovery to the sources admitted before intent.
+	// It is absent on server-only and older journals; absence grants no reload.
+	InertSources map[string]string `json:"inert_sources,omitempty"`
+
 	// RowDone acknowledges the ledger row's `done`, after which no phase check
 	// opens a ledger; CompletedBy names who wrote it. Settled is the tail's
 	// end, written after the guard's marker is cleared.

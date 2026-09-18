@@ -14,11 +14,13 @@
     billet_retirement_bypass: true
     billet_retirement_route: hold
     billet_retirement_classification: {}
+    billet_retirement_variant: ""
     billet_retirement_entry_result: {}
     billet_retirement_entry_binding: {}
     billet_retirement_closing_result: {}
     billet_retirement_closing_binding: {}
     billet_retirement_operation_admission: {}
+    billet_retirement_node_config_answer: {}
     billet_retirement_operation_document: {}
     billet_retirement_node_config_argv: []
     billet_retirement_planned_rendering: ""
@@ -26,8 +28,8 @@
     billet_retirement_planned_filesystem: []
     billet_retirement_planned_services: []
     billet_retirement_planned_units: {}
-    billet_retirement_provider_plan: null
-    billet_retirement_node_restart: null
+    billet_retirement_prepared_entry_binding: {}
+    billet_retirement_prepared_closing_binding: {}
     billet_retirement_environment_ready: false
     billet_retirement_environment_file: ""
     billet_retirement_local_environment_file: ""

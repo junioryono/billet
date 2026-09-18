@@ -1,0 +1,11 @@
+---
+- name: Classify optional SMTP alert credentials
+  ansible.builtin.set_fact:
+    billet_smtp_user_set: "{{ billet_smtp_username | length > 0 }}"
+    billet_smtp_password_set: "{{ billet_smtp_password | length > 0 }}"
+    billet_smtp_config_path: "{{ (_billet_alert_root | default('')) ~ '/etc/msmtprc' }}"
+    billet_smtp_marker_path: "{{ (_billet_alert_root | default('')) ~ '/etc/billet/msmtprc-managed' }}"
+    billet_ceph_health_script_path: "{{ (_billet_alert_root | default('')) ~ '/usr/local/libexec/billet-ceph-health' }}"
+    billet_ceph_health_service_path: "{{ (_billet_alert_root | default('')) ~ '/etc/systemd/system/billet-ceph-health.service' }}"
+    billet_ceph_health_timer_path: "{{ (_billet_alert_root | default('')) ~ '/etc/systemd/system/billet-ceph-health.timer' }}"
+

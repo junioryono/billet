@@ -1,0 +1,23 @@
+---
+- name: Forget the preceding node configuration admission
+  ansible.builtin.set_fact:
+    billet_retirement_operation_admission: {}
+    billet_retirement_node_config_answer: {}
+
+- name: Check the exact node configuration and operation document
+  ansible.builtin.command:
+    argv: "{{ ['timeout', '-k', '10', billet_retire_classify_bound | string] + billet_retirement_node_config_argv }}"
+    stdin: "{{ billet_retirement_operation_document.stdin }}"
+    stdin_add_newline: false
+    expand_argument_vars: false
+    strip_empty_ends: false
+  register: billet_retirement_node_config_raw
+  changed_when: false
+  failed_when: false
+  ignore_unreachable: true
+  check_mode: false
+  become: true
+  no_log: true
+
+- name: Parse the bound node configuration answer
+  ansible.builtin.import_tasks: retire-node-config-answer.yml

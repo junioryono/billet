@@ -35,8 +35,16 @@ func admitRetirePreparation(ctx context.Context, cfg *config.Config, configPath,
 	return admitRetireConfiguredProtection(ctx, cfg, configPath, j)
 }
 
-func admitRetireConfiguredProtection(ctx context.Context, cfg *config.Config, configPath string, j retirement.Journal) *retireRefusal {
+func admitRetireConfiguredProtection(ctx context.Context, cfg *config.Config, configPath string, j retirement.Journal, ordinary ...bool) *retireRefusal {
 	p := retireOperationProtection(j)
+	if len(ordinary) == 1 && ordinary[0] {
+		evidence, r := retireInertEvidence(ctx, j)
+		if r != nil {
+			return r
+		}
+		p.RetiredConditions = evidence
+		p.QuietUnits = nil
+	}
 	if j.Phase == retirement.PhaseDone {
 		p.ArchivedInputRoots = nil
 	}
@@ -106,6 +114,9 @@ func admitRetireRequestPreparation(ctx context.Context, m retireMode) *retireRef
 		return admitRetireDoneProtection(ctx, m, j)
 	}
 	if fact != retirement.JournalFactAbsent {
+		if j.Phase == retirement.PhaseIntent && j.Variant == retirement.VariantRetainedNode && len(j.InertSources) != 0 {
+			return admitRetireInertPreparation(ctx, m, j)
+		}
 		if r := proveRetireConfigPath(ctx, m.configPath, j); r != nil {
 			return r
 		}
@@ -173,7 +184,7 @@ func admitRetireDoneProtection(ctx context.Context, m retireMode, j retirement.J
 		cfg = obs.cfg
 	}
 	j.RetainedInvocation = nil
-	return admitRetireConfiguredProtection(ctx, cfg, m.configPath, j)
+	return admitRetireConfiguredProtection(ctx, cfg, m.configPath, j, m.checkSettledEntry || m.checkSettledClosing || m.checkNodeConfig)
 }
 
 func retireServiceSequence(j retirement.Journal, d retirement.Decision) []lifeops.Operation {
@@ -243,7 +254,7 @@ func retainedRequiredInputs(want *retirement.RetainedInvocation) []string {
 	return paths
 }
 
-func admitRetireOperations(ctx context.Context, j retirement.Journal, operations []lifeops.Operation) *retireRefusal {
+func admitRetireOperations(ctx context.Context, j retirement.Journal, operations []lifeops.Operation, reload ...func(context.Context, string) (string, error)) *retireRefusal {
 	if j.Variant == retirement.VariantRetainedNode && (j.RetainedInvocation == nil || j.RetainedInvocation.Provider == "" || j.RetainedInvocation.ConfigPath == "") {
 		return retireUnknown(retireReasonStopped, "the journal has no original retained-node configuration path, provider and invocation evidence", "")
 	}
@@ -264,6 +275,9 @@ func admitRetireOperations(ctx context.Context, j retirement.Journal, operations
 		}
 	}
 	protection := retireOperationProtection(j)
+	if len(reload) == 1 {
+		protection.PendingRetirementReload = reload[0]
+	}
 	// Individual operations use the same fixed shutdown order as the driver.
 	// A timer's exception expires before its disable, even while phase=intent.
 	first := lifeops.Operation{}
@@ -294,7 +308,7 @@ func admitRetireOperation(ctx context.Context, j retirement.Journal, verb, unit 
 	return admitRetireOperations(ctx, j, []lifeops.Operation{{Verb: verb, Unit: unit}})
 }
 
-func admitRetireRemaining(ctx context.Context, m retireMode, j retirement.Journal) *retireRefusal {
+func admitRetireRemaining(ctx context.Context, m retireMode, j retirement.Journal, reload ...func(context.Context, string) (string, error)) *retireRefusal {
 	if r := proveRetireConfigPath(ctx, m.configPath, j); r != nil {
 		return r
 	}
@@ -306,7 +320,7 @@ func admitRetireRemaining(ctx context.Context, m retireMode, j retirement.Journa
 	if d.Action == retirement.ActionRefuse {
 		return retireUnknown(retireReasonPhase, "remaining service operations could not be determined: "+d.Reason, "")
 	}
-	if r := admitRetireOperations(ctx, j, retireServiceSequence(j, d)); r != nil {
+	if r := admitRetireOperations(ctx, j, retireServiceSequence(j, d), reload...); r != nil {
 		return r
 	}
 	if j.Variant == retirement.VariantRetainedNode &&
@@ -328,7 +342,7 @@ func admitRetireRemaining(ctx context.Context, m retireMode, j retirement.Journa
 		return r
 	}
 	// Invocation and execution reads may block after the first admission.
-	return admitRetireOperations(ctx, j, retireServiceSequence(j, d))
+	return admitRetireOperations(ctx, j, retireServiceSequence(j, d), reload...)
 }
 
 // captureRetireInvocation runs before intent. A resumed journal never invents
@@ -486,6 +500,9 @@ func proveRetireInvocation(ctx context.Context, want *retirement.RetainedInvocat
 // Backup reconciliation precedes fresh timer/controller/node observations. This
 // proof never awaits a backup under the archive's authority exclusion.
 func proveRetireStopped(ctx context.Context, j retirement.Journal) *retireRefusal {
+	if r := proveRetireInert(ctx, j); r != nil {
+		return r
+	}
 	insp := retireOperationInspector()
 	if retireBackupFact(ctx, insp, j) != retirement.BackupInactive {
 		return retireUnknown(retireReasonStopped, "backup completion is not currently proved", "")
@@ -505,12 +522,21 @@ func proveRetireStopped(ctx context.Context, j retirement.Journal) *retireRefusa
 		return retireUnknown(retireReasonStopped, backupServiceUnit+": "+r.Why, "")
 	}
 	if j.Variant == retirement.VariantRetainedNode {
+		if r := retireQuietJob(ctx, insp, upgradeServiceUnit, true); r != nil {
+			return r
+		}
+		if _, r := retireUnitPostcondition(ctx, insp, upgradeServiceUnit, true, false, true); r != nil {
+			return r
+		}
 		if r := proveRetireInvocation(ctx, j.RetainedInvocation); r != nil {
 			return r
 		}
 	}
 	if err := insp.ProveUnitProcessesGone(ctx, serverUnit); err != nil {
 		return retireUnknown(retireReasonStopped, err.Error(), "")
+	}
+	if r := proveRetireInertProcesses(ctx, j); r != nil {
+		return r
 	}
 	if r := proveRetireActivation(ctx, false); r != nil {
 		return r

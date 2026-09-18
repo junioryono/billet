@@ -1,0 +1,16 @@
+---
+# The namespace runner supplies the recording fixture answerer and case list.
+- name: Exercise settled callers without ordinary activation
+  hosts: control-a
+  gather_facts: false
+  tasks:
+    - name: Drive every producer fixture and binding refusal through the real caller
+      ansible.builtin.include_tasks: retirement-settled-case.yml
+      loop: "{{ billet_gate_settled_cases }}"
+      loop_control:
+        loop_var: billet_gate_settled_case
+        label: "{{ billet_gate_settled_case.name }}"
+
+    - name: Record completion of every settled case
+      ansible.builtin.debug:
+        msg: "Settled {{ billet_gate_settled_mode }} exercised {{ billet_gate_settled_cases | length }} cases."

@@ -2,7 +2,7 @@
   "outcome": "refused",
   "purpose": "settled-closing",
   "reason": "postcondition",
-  "schema": 1,
+  "schema": 2,
   "state": "nothing",
   "why": "billet-node.service is failed on a host that kept its node"
 }

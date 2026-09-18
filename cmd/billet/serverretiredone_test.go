@@ -71,6 +71,11 @@ func retiredUnits(t *testing.T, f *requestFixture) {
 	writeFile(t, filepath.Join(f.unitsDir, backupServiceUnit), "LoadState=loaded\nActiveState=inactive\n"+
 		"SubState=dead\nResult=success\nKillMode=control-group\nMainPID=0\nUnitFileState=static\nInvocationID=\n"+
 		"StateChangeTimestamp=\n", 0o644)
+	if f.originalNode != nil {
+		// Loading the formerly absent backup also loads its installed retirement
+		// drop-in and typed condition; the completed transition left both on disk.
+		mustOK(t, reloadRetireManagerFake(f.unitsDir))
+	}
 }
 
 // EVERY LATER CONVERGE OF A RETIRED HOST MEETS A SETTLED `done` JOURNAL, and

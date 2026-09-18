@@ -98,6 +98,7 @@
   tasks:
     - name: Supply this reader case's effective document
       ansible.builtin.set_fact:
+        billet_retirement_node_ordinary: false
         billet_effective_config: "{{ billet_gate_effective_config }}"
 
     - name: Load the production ordinary aliases
@@ -351,23 +352,23 @@
   tasks:
     - name: Supply the serverless effective document
       ansible.builtin.set_fact:
+        billet_retirement_node_ordinary: false
         billet_effective_config: {node: {state_dir: /var/lib/billet/effective-node}}
 
     - name: Load the production path aliases
       ansible.builtin.include_vars:
         file: "{{ billet_gate_role }}/vars/main.yml"
 
-    # THE SERVER'S DESTINATIONS ARE THEIR OWN LIST, which is what lets commit 3
-    # drop them for a retained host without touching the node's. The absent-server
-    # EMPTINESS of that list is deferred with the alias it reads: see
-    # vars/main.yml. The transaction's fence writes INSIDE this directory and is
-    # gated on the binary change alone, so a node-only host still needs it made.
+    # A NEVER-CONTROLLER NODE KEEPS THE DEFAULT DIRECTORY. Its transaction's
+    # fence writes inside it, even with serverless E. Retained-only emptiness is
+    # exercised separately by retained-guards.yml through the same aliases.
     - name: Require the server's destinations to be a separate, admitted list
       ansible.builtin.assert:
         that:
           - billet_configured_server_state_dir == '/var/lib/billet/server'
           - billet_server_directories | map(attribute='path') | list == ['/var/lib/billet/server']
-          - billet_node_directories | map(attribute='path') | list == ['/var/lib/billet/effective-node', '/var/lib/billet/health', '/var/lib/billet/upgrades', '/var/cache/billet-provision', '/srv/jailer', '/usr/local/libexec']
+          # The transaction root is appended, because the retained route drops it.
+          - billet_node_directories | map(attribute='path') | list == ['/var/lib/billet/effective-node', '/var/lib/billet/health', '/var/cache/billet-provision', '/srv/jailer', '/usr/local/libexec', '/var/lib/billet/upgrades']
           - billet_common_directories | map(attribute='path') | list == ['/etc/billet', '/etc/billet/network', '/var/lib/billet']
 
     # THE THREE INSTALLED-OBSERVATION EXPRESSIONS ARE PINNED AS EXACT TEXT, then

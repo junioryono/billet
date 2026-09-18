@@ -1686,7 +1686,7 @@ func retireBinaryRecoveryTarget(root *os.File, shape claimShape) (string, error)
 func retireRoute(report *retireReport, cfg *config.Config, requested bool) (string, string) {
 	if report.Journal != nil {
 		if report.Journal.Variant == retirement.VariantRetainedNode {
-			return "unsupported-variant", "the journal records a retained-node retirement, which this converge does not support"
+			return "continue", "this host has a readable journal, so this converge continues the retained-node retirement it records"
 		}
 
 		return "continue", "this host has a readable journal, so the retirement it records is what this converge continues"

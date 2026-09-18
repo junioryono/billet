@@ -18,10 +18,12 @@ func TestRetirementRefusesControllerAliasOfNodeOnIntentResume(t *testing.T) {
 	if r := admitRetireRemaining(t.Context(), retireProofMode(f), j); r != nil {
 		t.Fatalf("healthy intent control: %+v", r)
 	}
-	f.manager.set("billet-upgrade.service", "LoadState", "not-found")
+	// A loaded alias must refuse even when the recorded installation sources
+	// still match; replacing FragmentPath would test source drift first.
 	setRetireEffect(t, f, nodeUnit, "Names", nodeUnit+" "+serverUnit)
-	writeFile(t, filepath.Join(f.unitsDir, serverUnit+".effects"), mustRead(t, filepath.Join(f.unitsDir, nodeUnit+".effects")), 0o644)
-	writeFile(t, filepath.Join(f.unitsDir, serverUnit), mustRead(t, filepath.Join(f.unitsDir, nodeUnit)), 0o644)
+	if r := admitRetireInertReload(t.Context(), retireOperationInspector(), j, retireInertRecord{Sources: j.InertSources}); r != nil {
+		t.Fatalf("alias fixture changed reload evidence: %+v", r)
+	}
 	before := mustRead(t, retirement.JournalPath())
 	out, code := retiredRequest(t, f, requestRun)
 	if code != exitUnknown || retireAnswer(t, out)["reason"] != retireReasonEffects || !strings.Contains(out, "operation-role-collision") {
@@ -75,6 +77,10 @@ func TestRetirementRefusesReloadPreservedPrivateTmpBeforeControllerStop(t *testi
 				j.RetainedInvocation.Resources = append(j.RetainedInvocation.Resources, resource)
 			}
 			writeFile(t, f.cfg, configBody, 0o600)
+			// The volatile inputs belong to this intent's installed configuration;
+			// an unrelated digest mismatch must not mask their teardown refusal.
+			j.InstalledSHA256 = f.installedSHA(t)
+			mustOK(t, j.Write(retireNow()))
 			// Loaded settings after yes -> daemon-reload -> no retain the old tree.
 			setRetireEffect(t, f, owner, "PrivateTmp", "no")
 			if owner == backupServiceUnit {

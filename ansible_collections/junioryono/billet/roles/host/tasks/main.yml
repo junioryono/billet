@@ -78,6 +78,7 @@
     # ordinary convergence, after retirement has admitted this host.
     - name: Record the service account and provision the authority locks on an existing installation
       ansible.builtin.import_tasks: service-account.yml
+      when: not billet_retirement_node_ordinary | bool
       vars:
         billet_service_account_site: early
 
@@ -113,6 +114,7 @@
 
     - name: Compute the ledger mount name for ordinary convergence
       ansible.builtin.import_tasks: ledger-mount-name.yml
+      when: not billet_retirement_node_ordinary | bool
 
     # A HOST CONVERGED WITH A LEDGER VOLUME MUST NOT SILENTLY DROP IT. The mount
     # unit on disk is durable evidence of the earlier choice; an inventory that
@@ -120,6 +122,7 @@
     # unit WITHOUT the mount dependency, and the next failed mount would fork the
     # ledger onto the root disk — the exact failure the volume exists to prevent.
     - name: Inspect the installed ledger mount unit
+      when: not billet_retirement_node_ordinary | bool
       ansible.builtin.stat:
         path: "/etc/systemd/system/{{ billet_ledger_mount_unit_name }}"
       register: billet_ledger_mount_unit_installed_stat
@@ -127,6 +130,7 @@
       become: true
 
     - name: Refuse to drop a previously configured ledger volume
+      when: not billet_retirement_node_ordinary | bool
       ansible.builtin.assert:
         that:
           - billet_ledger_volume_id | length > 0 or not billet_ledger_mount_unit_installed_stat.stat.exists
@@ -266,6 +270,9 @@
           requires an explicit monitor address and device list; disks are never
           inferred. Guest bridge names must be unique Linux interface names of at
           most 15 characters and cannot contain path or control characters.
+
+    - name: Validate interpreted inventory before any ordinary template
+      ansible.builtin.import_tasks: validate-interpreted-inputs.yml
 
     - name: Refuse a managed GitHub App key with nothing to install and none installed
       ansible.builtin.assert:
@@ -477,6 +484,10 @@
       ansible.builtin.import_tasks: network-disable.yml
       when: not billet_firecracker_enabled
 
+    - name: Admit concrete retained node operations before ordinary mutation
+      ansible.builtin.import_tasks: retirement-node-preflight.yml
+      when: billet_retirement_node_ordinary | bool
+
     # THE CANDIDATE WAS RESOLVED, FETCHED AND STAGED BY THE PREPARATION
     # (stage-candidate.yml, before the hold), so by here billet_binary_upgrade and
     # the transaction's recovery directory are settled and nothing below reaches
@@ -487,6 +498,7 @@
     # THE SAME RECORD, LATE, on a fresh host: the account it records now exists.
     - name: Record the service account and provision the authority locks on a fresh host
       ansible.builtin.import_tasks: service-account.yml
+      when: not billet_retirement_node_ordinary | bool
       vars:
         billet_service_account_site: late
 
@@ -495,7 +507,9 @@
     # expected). Gated on the volume id: without one, mounting stays the operator's.
     - name: Mount the control-plane ledger volume fail closed
       ansible.builtin.import_tasks: ledger-mount.yml
-      when: billet_ledger_volume_id | length > 0
+      when:
+        - billet_ledger_volume_id | length > 0
+        - not billet_retirement_node_ordinary | bool
 
     - name: Install the EC2 cache TLS material
       ansible.builtin.import_tasks: cache-tls.yml
@@ -530,6 +544,7 @@
 
     - name: Configure or remove the deployment backup timer
       ansible.builtin.import_tasks: backup.yml
+      when: not billet_retirement_node_ordinary | bool
 
     - name: Configure billet services
       ansible.builtin.import_tasks: services.yml
@@ -541,3 +556,9 @@
     # role and not of whatever follows it in a play.
     - name: Apply the reload the role's own unit-file changes left pending
       ansible.builtin.meta: flush_handlers
+
+    # services.yml has already completed confirmation, receipts and their cleanup.
+    # No notification or ordinary mutation may follow this read-only boundary.
+    - name: Prove settled closing after all ordinary work and handlers
+      ansible.builtin.include_tasks: retirement-settled-closing.yml
+      when: billet_retirement_node_ordinary | bool

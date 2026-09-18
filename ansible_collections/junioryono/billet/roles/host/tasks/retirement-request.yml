@@ -99,6 +99,7 @@
 
     - name: Reset the new request's reservation and collection
       ansible.builtin.set_fact:
+        billet_retirement_variant: server-only
         billet_retirement_survivor: "{{ billet_retirement_survivor_host }}"
         billet_retirement_local_environment_file: "{{ billet_retirement_environment_file }}"
         billet_retirement_reservation: {}
@@ -205,7 +206,12 @@
               - billet_retire_answer.variant | default('') == 'server-only'
               - billet_retire_answer.state == 'done'
               - billet_retire_answer.transition_id == billet_retirement_transition_id
-            fail_msg: The new request did not confirm this server-only retirement at a known done state.
+              # The receipt is paired with the variant here too: a request's first
+              # tail-shaped answer that already settled never reaches the
+              # continuation's pairing, so a server-only answer claiming a receipt
+              # would otherwise be accepted.
+              - billet_retire_answer.outcome != 'retired' or billet_retire_answer.receipt | default('') == 'none'
+            fail_msg: The new request did not confirm this server-only retirement at a known done state with no receipt.
 
         - name: Bind the returned completion to the reservation
           ansible.builtin.assert:

@@ -1,0 +1,31 @@
+---
+# Nothing here may reload the manager, create a directory or render onto the
+# host. account.yml's opening reload is already an ordinary mutation.
+- name: Decide retained endpoint operands before ordinary mutation
+  ansible.builtin.import_tasks: endpoint-decision.yml
+
+- name: Observe retained environment operands before ordinary mutation
+  ansible.builtin.import_tasks: node-environment.yml
+
+- name: Select retained unit operands before ordinary mutation
+  ansible.builtin.import_tasks: unit-operands.yml
+
+- name: Observe retained readiness before ordinary mutation
+  ansible.builtin.import_tasks: unit-readiness.yml
+
+- name: Resolve retained alert destinations before admission
+  ansible.builtin.import_tasks: alert-operands.yml
+
+- name: Resolve retained Firecracker destinations before admission
+  ansible.builtin.import_tasks: firecracker-operands.yml
+  when: billet_firecracker_enabled
+
+- name: Resolve retained guest network destinations before admission
+  ansible.builtin.import_tasks: network-operands.yml
+  when: billet_firecracker_enabled
+
+- name: Prepare all concrete retained filesystem operations
+  ansible.builtin.import_tasks: prepare-node-operations.yml
+
+- name: Admit the exact retained node configuration document
+  ansible.builtin.import_tasks: retirement-node-config.yml

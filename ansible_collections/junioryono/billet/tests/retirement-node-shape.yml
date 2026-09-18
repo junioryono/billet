@@ -1,0 +1,12 @@
+---
+- name: Retained ordinary exclusions and binary refusal
+  ansible.builtin.import_playbook: retained-guards.yml
+
+- name: Guard retained operation and template drift
+  ansible.builtin.import_playbook: retained-drift.yml
+
+- name: Exercise interpreted inventory validation
+  ansible.builtin.import_playbook: interpreted-inputs.yml
+
+- name: Exercise retained path validation and producer operands
+  ansible.builtin.import_playbook: retained-operands.yml

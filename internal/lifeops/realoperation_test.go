@@ -30,6 +30,7 @@ func TestRealSystemdRetirementOperationEffects(t *testing.T) {
 		t.Fatalf("this measurement is pinned to systemd 255: %s", version)
 	}
 	t.Logf("systemd measurement %s: %s", time.Now().UTC().Format(time.RFC3339), strings.TrimSpace(string(version)))
+	t.Run("retired conditions", TestRealSystemdRetiredConditions)
 	for _, role := range []bool{false, true} {
 		for _, host := range []string{"retained", "retained condition", "server-only masked", "server-only absent"} {
 			t.Run(fmt.Sprintf("sequence/role=%v/%s", role, host), func(t *testing.T) {

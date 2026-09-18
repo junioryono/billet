@@ -4,8 +4,8 @@
   "journal": {
     "phase": "done",
     "variant": "retained-node",
-    "row_done": true,
-    "settled": true,
+    "row_done": false,
+    "settled": false,
     "owner": "ci-1",
     "transition_id": "0123456789abcdef0123456789abcdef",
     "retiring": "control-a",
@@ -18,23 +18,20 @@
   },
   "stage": "present",
   "guard": "converge-guard",
-  "marker": null,
-  "row": {
-    "retiring": "control-a",
-    "survivor": "control-b",
-    "run": "ci-1",
-    "state": "done",
-    "transition_id": "0123456789abcdef0123456789abcdef",
-    "reserved_at": "2026-09-11T10:00:00Z"
+  "marker": {
+    "kind": "retirement",
+    "id": "0123456789abcdef0123456789abcdef"
   },
-  "row_fact": "done-mine",
-  "dispatch": "done",
+  "row": null,
+  "row_fact": "unreadable",
+  "dispatch": "unknown-ledger",
   "status_presence": "present",
   "config": "present",
   "installed_roles": "node",
   "identity": "unreadable",
   "authority": "unreadable",
-  "route": "unsupported-variant",
-  "route_why": "the journal records a retained-node retirement, which this converge does not support",
+  "route": "continue",
+  "route_why": "this host has a readable journal, so this converge continues the retained-node retirement it records",
+  "why": "BILLET_STATE_DSN is not set in this process's environment",
   "state": "done"
 }

@@ -1,0 +1,197 @@
+---
+- name: Validate configuration interpreters through the real role entry
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Exercise named literal and control-character cases
+      ansible.builtin.include_tasks: interpreted-inputs-case.yml
+      loop:
+        - {name: literals, values: {}, refuses: ''}
+        - {name: IPv6 SMTP host, values: {billet_smtp_host: '2001:db8::25'}, refuses: ''}
+        - {name: DNS name refused, values: {billet_guest_dns_servers: [resolver.example]}, refuses: billet_guest_dns_servers}
+        - {name: DNS directive refused, values: {billet_guest_dns_servers: ["1.1.1.1\nlog-facility=/protected"]}, refuses: billet_guest_dns_servers}
+        - {name: DNS scoped IPv6 refused, values: {billet_guest_dns_servers: ['fe80::1%eth0']}, refuses: billet_guest_dns_servers}
+        - {name: host newline, values: {billet_smtp_host: "smtp.example\nlogfile /protected"}, refuses: billet_smtp_host}
+        - {name: host grammar, values: {billet_smtp_host: 'smtp.example /protected'}, refuses: billet_smtp_host}
+        - {name: port newline, values: {billet_smtp_port: "587\nlogfile /protected"}, refuses: billet_smtp_port}
+        - {name: port grammar, values: {billet_smtp_port: '587extra'}, refuses: billet_smtp_port}
+        - {name: port range, values: {billet_smtp_port: 65536}, refuses: billet_smtp_port}
+        - {name: username newline, values: {billet_smtp_username: "user\rlogfile /protected"}, refuses: billet_smtp_username}
+        - {name: password control, values: {billet_smtp_password: "secret\u007f"}, refuses: billet_smtp_password}
+        - {name: password tab, values: {billet_smtp_password: "secret\tvalue"}, refuses: billet_smtp_password}
+        - {name: password unicode control, values: {billet_smtp_password: "secret\u0085value"}, refuses: billet_smtp_password}
+        - {name: sender newline, values: {billet_alert_from: "from@example.com\nlogfile /protected"}, refuses: billet_alert_from}
+        - {name: sender grammar, values: {billet_alert_from: 'Name <from@example.com>'}, refuses: billet_alert_from}
+        - {name: recipient control, values: {billet_alert_email: "to@example.com\u0001"}, refuses: billet_alert_email}
+        - {name: firewall CIDR injection, values: {billet_guest_denied_ipv4: ['10.0.0.0/8; include /protected']}, refuses: billet_guest_denied_ipv4}
+        - {name: firewall port injection, values: {billet_guest_host_tcp_ports: ['22; include /protected']}, refuses: billet_guest_host_tcp_ports}
+        - {name: firewall service name and range accepted, values: {billet_guest_host_tcp_ports: [ssh, '8000-8080', 443], billet_guest_host_udp_ports: [domain]}, refuses: ''}
+        - {name: firewall reversed range, values: {billet_guest_host_tcp_ports: ['8080-8000']}, refuses: billet_guest_host_tcp_ports}
+      loop_control:
+        loop_var: billet_gate_input_case
+        label: "{{ billet_gate_input_case.name }}"
+
+- name: Ceph health publication replaces a symlink without touching its target
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    billet_alert_from: from@example.com
+    billet_alert_email: to@example.com
+  tasks:
+    - name: Allocate the health script witness directory
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: billet-health-write-
+      register: billet_gate_health_root
+
+    - name: Run the rendered script against an independent protected canary
+      block:
+        - name: Write the protected health canary
+          ansible.builtin.copy:
+            content: "HEALTH_OK protected canary\n"
+            dest: "{{ billet_gate_health_root.path }}/protected"
+            mode: '0600'
+
+        - name: Plant the redirected last-health pathname
+          ansible.builtin.file:
+            src: "{{ billet_gate_health_root.path }}/protected"
+            dest: "{{ billet_gate_health_root.path }}/ceph.last"
+            state: link
+
+        # Functions replace external commands without PATH fallback. Only the
+        # state directory differs from the actual rendered production script.
+        - name: Render the actual health script with a private state directory
+          ansible.builtin.copy:
+            # THE STUBS COME FROM A BLOCK SCALAR, not an escaped Jinja string: a
+            # folded expression keeps "\n" as two characters, which collapses the
+            # whole script onto one line and makes /bin/sh refuse its first
+            # function name instead of running the witness.
+            content: "{{ billet_gate_health_stubs ~ billet_gate_health_body }}"
+            dest: "{{ billet_gate_health_root.path }}/health.sh"
+            mode: '0700'
+          vars:
+            billet_gate_health_stubs: |
+              ceph() { printf 'HEALTH_OK cluster is healthy\n'; }
+              mail() { return 99; }
+            billet_gate_health_body: >-
+              {{ lookup('ansible.builtin.template', playbook_dir + '/../roles/host/templates/ceph-health.sh.j2')
+                 | replace('state_dir=/var/lib/billet/health', 'state_dir=' ~ (billet_gate_health_root.path | quote)) }}
+
+        - name: Execute the non-following publication witness
+          ansible.builtin.command:
+            argv: [/bin/sh, "{{ billet_gate_health_root.path }}/health.sh"]
+          changed_when: false
+
+        - name: Read the canary after publication
+          ansible.builtin.slurp:
+            src: "{{ billet_gate_health_root.path }}/protected"
+          register: billet_gate_health_canary
+
+        - name: Inspect the published health pathname without following it
+          ansible.builtin.stat:
+            path: "{{ billet_gate_health_root.path }}/ceph.last"
+            follow: false
+          register: billet_gate_health_last
+
+        - name: Read the published health value
+          ansible.builtin.slurp:
+            src: "{{ billet_gate_health_root.path }}/ceph.last"
+          register: billet_gate_health_value
+
+        - name: Require replacement of the name and preservation of its old target
+          ansible.builtin.assert:
+            that:
+              - billet_gate_health_canary.content | b64decode == "HEALTH_OK protected canary\n"
+              - billet_gate_health_last.stat.isreg
+              - not billet_gate_health_last.stat.islnk
+              - billet_gate_health_value.content | b64decode == "HEALTH_OK cluster is healthy\n"
+      always:
+        - name: Remove the health script witness directory
+          ansible.builtin.file:
+            path: "{{ billet_gate_health_root.path }}"
+            state: absent
+
+- name: Ceph health publication replaces a symlink to a directory without writing inside it
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    billet_alert_from: from@example.com
+    billet_alert_email: to@example.com
+  tasks:
+    - name: Allocate the health script witness directory
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: billet-health-dir-
+      register: billet_gate_health_root
+
+    - name: Run the rendered script against an independent protected canary
+      block:
+        - name: Create the protected health directory
+          ansible.builtin.file:
+            path: "{{ billet_gate_health_root.path }}/protected"
+            state: directory
+            mode: '0700'
+
+        - name: Plant the redirected last-health pathname
+          ansible.builtin.file:
+            src: "{{ billet_gate_health_root.path }}/protected"
+            dest: "{{ billet_gate_health_root.path }}/ceph.last"
+            state: link
+
+        # Functions replace external commands without PATH fallback. Only the
+        # state directory differs from the actual rendered production script.
+        - name: Render the actual health script with a private state directory
+          ansible.builtin.copy:
+            # THE STUBS COME FROM A BLOCK SCALAR, not an escaped Jinja string: a
+            # folded expression keeps "\n" as two characters, which collapses the
+            # whole script onto one line and makes /bin/sh refuse its first
+            # function name instead of running the witness.
+            content: "{{ billet_gate_health_stubs ~ billet_gate_health_body }}"
+            dest: "{{ billet_gate_health_root.path }}/health.sh"
+            mode: '0700'
+          vars:
+            billet_gate_health_stubs: |
+              ceph() { printf 'HEALTH_OK cluster is healthy\n'; }
+              mail() { return 99; }
+            billet_gate_health_body: >-
+              {{ lookup('ansible.builtin.template', playbook_dir + '/../roles/host/templates/ceph-health.sh.j2')
+                 | replace('state_dir=/var/lib/billet/health', 'state_dir=' ~ (billet_gate_health_root.path | quote)) }}
+
+        - name: Execute the non-following publication witness
+          ansible.builtin.command:
+            argv: [/bin/sh, "{{ billet_gate_health_root.path }}/health.sh"]
+          changed_when: false
+
+        - name: List the protected directory after publication
+          ansible.builtin.find:
+            paths: "{{ billet_gate_health_root.path }}/protected"
+            hidden: true
+            file_type: any
+          register: billet_gate_health_canary
+
+        - name: Inspect the published health pathname without following it
+          ansible.builtin.stat:
+            path: "{{ billet_gate_health_root.path }}/ceph.last"
+            follow: false
+          register: billet_gate_health_last
+
+        - name: Read the published health value
+          ansible.builtin.slurp:
+            src: "{{ billet_gate_health_root.path }}/ceph.last"
+          register: billet_gate_health_value
+
+        - name: Require replacement of the name and preservation of its old target
+          ansible.builtin.assert:
+            that:
+              - billet_gate_health_canary.matched == 0
+              - billet_gate_health_last.stat.isreg
+              - not billet_gate_health_last.stat.islnk
+              - billet_gate_health_value.content | b64decode == "HEALTH_OK cluster is healthy\n"
+      always:
+        - name: Remove the health script witness directory
+          ansible.builtin.file:
+            path: "{{ billet_gate_health_root.path }}"
+            state: absent

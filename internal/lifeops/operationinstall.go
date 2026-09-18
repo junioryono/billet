@@ -108,6 +108,33 @@ func operationInstallEntries(sources []operationSource) (map[string][]string, er
 }
 
 func (w *operationWalk) admitInstallation(ctx context.Context, op Operation) error {
+	queue := []string{op.Unit}
+	seen := make(map[string]bool)
+	for len(queue) != 0 {
+		unit := queue[0]
+		queue = queue[1:]
+		if seen[unit] {
+			continue
+		}
+		seen[unit] = true
+		if err := w.admitInstallationUnit(ctx, Operation{Verb: op.Verb, Unit: unit}); err != nil {
+			return err
+		}
+		entries, err := operationInstallEntries(w.units[unit].sources)
+		if err != nil {
+			return err
+		}
+		for _, target := range entries["Also"] {
+			if err := w.closedRelation(ctx, unit, "Install.Also", target); err != nil {
+				return err
+			}
+			queue = append(queue, target)
+		}
+	}
+	return nil
+}
+
+func (w *operationWalk) admitInstallationUnit(ctx context.Context, op Operation) error {
 	ev, err := w.get(ctx, op.Unit)
 	if err != nil {
 		return err
