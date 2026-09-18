@@ -510,9 +510,11 @@ jobs:
     # retained continuation, recovery and 3c settled callers. The 64 request
     # cases now have five sections (planning input: 28/45 minutes unsharded,
     # before the retained ones). The 3c operand and drift plays also leave
-    # shape. These are structural budgets; complete CI timings must establish
-    # the required <=35 minute margin, and which request section is slowest is
-    # not something the case counts decide.
+    # shape. MEASURED ON 86a018e (2026-09-18), the run that first executed the
+    # five request sections: evidence 7, collection 8, cancellation 8, windows 9
+    # and retained 9 minutes, against 28 for the one group they replaced. The
+    # margin is set elsewhere — guard at 32 and parity-network at 31 are this
+    # job's long poles, and no request section is near them.
     strategy:
       fail-fast: false
       matrix:
