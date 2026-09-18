@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 # Sourced by retirement-cases.sh inside its selected CI section.
-# R10's installed-both request fixture; the desired configuration has no node.
-r_plant r10-installed-both
-a r10-installed-both -e billet_server_retire=true -e '{"billet_config":{"server":{"state_dir":"/var/lib/billet/server"}}}'
-r_answers r10-installed-both 'control-a:classify:1:dry-run-unsupported-variant.json:0'
-r_run r10-installed-both
-r_held r10-installed-both unsupported-variant
+# R10: the word holds the host, whatever observation produced it. The corpus
+# fixture is a requested node-only host, the one observation that reaches
+# unsupported-variant now that an installed pair keeping a node is requestable;
+# the role branches on the route word alone, so this case asserts that alone.
+# R10's fresh installed-both request is the request section's.
+r_plant r10-unsupported-variant
+a r10-unsupported-variant -e billet_server_retire=true -e '{"billet_config":{"server":{"state_dir":"/var/lib/billet/server"}}}'
+r_answers r10-unsupported-variant 'control-a:classify:1:dry-run-unsupported-variant.json:0'
+r_run r10-unsupported-variant
+r_held r10-unsupported-variant unsupported-variant
 
 # R10: retained journals continue with their recorded operands and paired
 # receipts, then end even when settled. Desired inventory supplies no operands.

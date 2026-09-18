@@ -1742,7 +1742,10 @@ func retireRoute(report *retireReport, cfg *config.Config, requested bool) (stri
 		case nodeOnly && !requested:
 			return "ordinary", ""
 		case nodeOnly:
-			return "hold", "this host's installed configuration has a node and no server, and a controller's " +
+			// NO SERVER MEANS NO LEDGER, so only this observation reaches
+			// unsupported-variant. The roles check in retireNewRequestRoute
+			// is the total partition's fallback, not a reachable answer.
+			return "unsupported-variant", "this host's installed configuration has a node and no server, and a controller's " +
 				"retirement is not defined for it"
 		case report.Identity == "absent" && report.Authority == "absent" &&
 			(report.Config == "absent" || report.Config == "malformed" ||
@@ -1793,17 +1796,19 @@ func retireNewRequestRoute(report *retireReport, cfg *config.Config) (string, st
 		return "hold", "a new retirement needs an installed configuration and this host has none to read"
 	}
 
-	if retireRolesWord(report.InstalledRoles) == "both" {
-		return "unsupported-variant", "this converge does not support retiring a host that keeps a node"
-	}
-
-	if retireRolesWord(report.InstalledRoles) != "server" || cfg.Server == nil {
-		return "hold", fmt.Sprintf("a new retirement needs an installed configuration with a server and no node, and "+
-			"this host's installed roles are %s", retireRolesWord(report.InstalledRoles))
+	roles := retireRolesWord(report.InstalledRoles)
+	if (roles != "server" && roles != "both") || cfg.Server == nil {
+		return "hold", fmt.Sprintf("a new retirement needs an installed configuration with a server, and "+
+			"this host's installed roles are %s", roles)
 	}
 
 	if r := retirePairEligibility(cfg); r != nil {
 		return "hold", r.Why
+	}
+
+	if roles == "both" {
+		return "new-request", "the inventory requests a retirement that keeps this host's node and this installed active-passive " +
+			"PostgreSQL host is eligible"
 	}
 
 	return "new-request", "the inventory requests a retirement and this installed server-only active-passive PostgreSQL host is eligible"

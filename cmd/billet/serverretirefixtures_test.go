@@ -427,7 +427,7 @@ func TestTheRetireCallerFixturesClassifyPostgresPairs(t *testing.T) {
 		f := newRequestFixture(t)
 
 		out, code := f.run(t, "", "--dry-run", "--retiring-host", requestRetiring, "--requested")
-		m := assertRetireRoute(t, out, code, "new-request", "eligible")
+		m := assertRetireRoute(t, out, code, "new-request", "server-only")
 		if m["row_fact"] != string(retirement.RowAbsent) || m["installed_roles"] != "server" {
 			t.Fatalf("the fixture did not establish a fresh server-only request: %s", out)
 		}
@@ -446,14 +446,27 @@ func TestTheRetireCallerFixturesClassifyPostgresPairs(t *testing.T) {
 		expectRetire(t, out, code, "dry-run-cancel", retireOutcomeReported, "")
 	})
 
-	t.Run("unsupported-variant", func(t *testing.T) {
+	t.Run("new-request-retained", func(t *testing.T) {
 		f := newRequestFixture(t)
 		f.retainANode(t)
 
 		out, code := f.run(t, "", "--dry-run", "--retiring-host", requestRetiring, "--requested")
-		m := assertRetireRoute(t, out, code, "unsupported-variant", "keeps a node")
+		m := assertRetireRoute(t, out, code, "new-request", "keeps this host's node")
 		if m["installed_roles"] != "both" || m["journal"] != nil || m["row_fact"] != string(retirement.RowAbsent) {
 			t.Fatalf("the installed configuration did not establish a fresh retained-node request: %s", out)
+		}
+		expectRetire(t, out, code, "dry-run-new-request-retained", retireOutcomeReported, "")
+	})
+
+	t.Run("unsupported-variant", func(t *testing.T) {
+		f := newRetireFixture(t)
+		writeFile(t, f.cfg, "node:\n  name: node-a\n  server_addr: 127.0.0.1:7717\n  provider: docker\n"+
+			"  state_dir: "+filepath.Join(t.TempDir(), "node")+"\n", 0o600)
+
+		out, code := f.run(t, "", "--dry-run", "--retiring-host", requestRetiring, "--requested")
+		m := assertRetireRoute(t, out, code, "unsupported-variant", "has a node and no server")
+		if m["installed_roles"] != "node" || m["config"] != "present" || m["row_fact"] != string(retirement.RowUnreadable) {
+			t.Fatalf("the installed configuration did not establish a node-only request: %s", out)
 		}
 		expectRetire(t, out, code, "dry-run-unsupported-variant", retireOutcomeReported, "")
 	})
