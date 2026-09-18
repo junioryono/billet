@@ -166,14 +166,27 @@ func realRetiredConditionMechanism(t *testing.T, mechanism string) {
 	}
 	activate()
 	for _, unit := range protected {
-		wait(unit, func() bool { return stamp(unit) > before[unit] })
+		// MEASURED ON SYSTEMD 255 (255.4-1ubuntu8.17), 2026-09-17: a direct
+		// `systemctl start` of a unit whose condition fails leaves
+		// ConditionTimestampMonotonic at 0 and answers ConditionResult=no,
+		// ActiveState=inactive, SubState=dead. Every other mechanism here
+		// advances that timestamp, so only this one waits on the answer itself.
+		if mechanism == "direct" {
+			wait(unit, func() bool {
+				return h.property(unit, "ConditionResult") == "no" && h.property(unit, "ActiveState") == "inactive"
+			})
+		} else {
+			wait(unit, func() bool { return stamp(unit) > before[unit] })
+		}
 		if h.property(unit, "ActiveState") != "inactive" || h.property(unit, "ConditionResult") != "no" {
 			t.Fatalf("protected unit did not skip fresh activation: %s", unit)
 		}
 		if err := insp.ProveRetiredCondition(t.Context(), unit, marker); err != nil {
 			t.Fatal(err)
 		}
-		measure(unit, -1)
+		if mechanism != "direct" {
+			measure(unit, -1)
+		}
 	}
 	if h.property(service, "MainPID") != "0" {
 		t.Fatal("protected service acquired a main process")
