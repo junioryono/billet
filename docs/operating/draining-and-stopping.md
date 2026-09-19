@@ -37,6 +37,14 @@ sudo systemctl kill --kill-whom=main --signal=SIGTERM billet-server
 
 On a Mac the same commands drive the launch agents, with one difference: launchd cannot start a disabled service, so `up` enables before it proves, and what protects the host is the unwinding ([Run jobs on a Mac](../deploying/mac-tart.md)).
 
+## Retiring a controller and keeping its node
+
+Use the [controller-retirement procedure](upgrades.md#when-a-controller-retires) to remove one controller of a PostgreSQL active-passive pair while retaining its node. Plan the endpoint move first: a node still dialling the retiring controller cannot be requested, so an ordinary converge must move it to the survivor and establish matching receipt, registration and installed configuration before retirement. The node runs through controller shutdown, archival and configuration replacement; retirement's own restart phase then stops and starts it before completion. Retention is not uninterrupted node uptime.
+
+A later converge may admit a settled retained host whose node is quiet `inactive` or `failed`, provided the entry proof finds no main or control process, no cgroup processes or queued job, persistent enablement and an agreeing supported loaded and installed unit. This permits the shared ordinary node lifecycle to bring it back. It requires no runtime registration record at entry and proves neither successful drain nor compute absence; strict publication, settlement and the ordinary pass's closing proof still require an active node with its current registration.
+
+The retained ordinary pass records the same node lifecycle operations as a node-only pass over the same effective configuration, including network changes, endpoint migration and restart after interruption. The recorded-operation parity witnesses do not establish successful drains on real hosts. The all-host successful-drain guarantee belongs to issue #127 and is not established by this retirement work; use the [deployment drain](#drain) when a compute-clearance proof is needed.
+
 ## Force
 
 ```bash

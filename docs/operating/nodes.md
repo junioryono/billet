@@ -74,6 +74,10 @@ A node replaces its certificate over the wire when less than a third of its life
 
 A node that stops cleanly (`systemctl stop billet-node`, `billet local down`, SIGTERM) drains: it stops taking work, waits for the jobs already running for as long as they run, and then tells the control plane it is leaving, so placement moves to other hosts at once. A node that dies is forgotten only by silence, about four and a half minutes, because from the control plane a crash and a partition look the same and the drain's compute barrier depends on that caution. Its compute keeps running and is re-adopted when the node comes back.
 
+## Keeping a node when its controller retires
+
+A host in a PostgreSQL active-passive pair can retire its controller and keep its installed node, and the rules that decide whether it may are the retirement's, not this page's. What a node operator has to know before planning one: a node still dialling the controller being removed cannot be retained until its endpoint moves to the survivor in an ordinary converge, and retention is not a promise of uninterrupted node uptime, because the transition stops and starts the node on the serverless configuration before it completes. [Retiring a controller that keeps its node](upgrades.md) states both rules and the refusals that enforce them; do not restate them here.
+
 ## Decommissioning
 
 A node row is durable, so a retired machine would block every future drain from proving the fleet clear. `billet nodes decommission <node>` stops expecting the host to answer for its compute. It requires a current proof that the host holds nothing (the drain's compute barrier), refuses a host the deployment is still talking to, and refuses a host still holding a lease. `--force` overrides only the reachability refusal and records the exclusion as durably **unproven**, which `billet status` and every later drain name rather than reporting the fleet clear. The ordinary replacement of a machine needs none of this: reuse the node name.

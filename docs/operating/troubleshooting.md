@@ -79,6 +79,24 @@ The failure mode of this system is a job that queues rather than an error. Start
 | BuildKit `type=gha` fails with `x509: certificate signed by unknown authority` | a `docker-container` builder carries its own trust store the interception CA cannot reach | opt in with `url_v2=${{ env.BILLET_ACTIONS_CACHE_URL }}` and `network=host` |
 | cache steps fall back to GitHub | the kill switch blocks the scope, the node listener is down, or the request shape is one billet does not serve | `billet cache enable`; a fallback never fails the job |
 
+## A retirement or retained-node converge refuses
+
+The refusal names the boundary it could not prove and the input or operation to fix. Follow that diagnosis before retrying the [retirement procedure](upgrades.md#when-a-controller-retires); removing the journal, closure status or guard marker discards recovery evidence and does not authorize ordinary work.
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| the node endpoint names the retiring controller | retirement cannot preserve a node that still dials the controller being removed | converge the endpoint move to the survivor first with retirement disabled, then establish matching receipt, registration and installed configuration; the failover assertion covers a DNS name, a shared address and an address held by neither controller, and records only that you assert it survives this controller's removal |
+| survivor outside this play, no longer active, or missing a settled guard | earlier-play facts, a failed/unreachable host or an unsettled preparation cannot authorize the request | include both controllers in the same play and host limit, resolve the survivor's failure, and prepare both under the same holder with settled pointer-free guards |
+| `billet_config still contains server on a retired host` | removing the flag beside frozen controller inventory could request recommissioning | keep `billet_server_retire: true` while that inventory contains `server`, or supply explicitly serverless configuration before removing the flag |
+| `planned path traverses protected resource` or `recursive operation contains a protected resource` | a proposed path crosses controller state, archive, retirement/upgrade metadata or controller unit sources, or a recursive operation includes them | move the node destination outside the named protected path or narrow the operation; a symlink or a later `..` does not erase traversal, even through missing parents |
+| an effect or unit-replacement refusal names a relationship, property or source | a node operation could affect protected controller resources, or the proposed node unit changes execution semantics the current manager graph cannot prove | remove the named unsupported relationship or redirection, or restore the supported installed definition; a stopped unit or familiar target name alone grants no permission |
+| `EnvironmentFile observation or validation refused` | the installed node environment is unreadable, changed, or outside the supported path/content grammar | check the [retained environment grammar](upgrades.md#retained-node-environment-files), file readability and optionality; the role preserves the installed operand and does not repair its contents |
+| `settled-entry-node-*` | activity is transitional, a process or job remains, observations are unknown, or loaded and installed unit definitions disagree | resolve the named process, job or unit condition and retry; quiet inactive/failed entry is allowed only with its complete proof and is not a drain certificate |
+| settled closing refuses after node work | the current active-node, registration, path or controller-inertness proof failed | fix the reported condition and converge again; historical done/settled records and an earlier receipt do not certify this pass succeeded |
+| `A retained-node host cannot run this role's binary transaction` | the converge selected a binary change on a retained host | use the [supported retained-host upgrade paths](upgrades.md#upgrading-a-retained-node), then converge with an unchanged binary |
+
+The operation walker judges every path component, including symlink targets and hypothetical missing parents, before dependent mutation. An unreadable component, changed observation or exhausted symlink bound is could-not-tell, never an absent resource. Retained work cannot recreate the original controller identity, rewrite its units or timers, repair its metadata or recursively change their ancestors. A refusal preserves that boundary and names what the next converge needs corrected.
+
 ## Where to look
 
 - `billet check --config <path>`: every precondition billet can test, including the GitHub credential.
