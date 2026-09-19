@@ -809,14 +809,14 @@ func (p *plane) reofferLocked(s *scaleSet, capacity int) {
 	p.pushLocked(s, nil, ids, jobs...)
 }
 
-// nudge makes a parked listener run one iteration of its loop: it re-escrows
-// against whatever room the fleet now has and re-advertises, and the poll that
-// follows offers it whatever is waiting.
+// nudge makes a parked listener run one iteration of its loop: it reconciles its
+// pool against whatever room the fleet now has and re-advertises, and the poll
+// that follows offers it whatever is waiting.
 //
 // HOW FREED ROOM IS CONTESTED. When a job finishes, every tier with jobs waiting
 // would in production notice the room on its next poll, in an order the clocks
-// decide. The harness nudges contenders and donors in the fleet's order after
-// every event, so the contest has one outcome per trace.
+// decide. The harness nudges every tier in the fleet's order after every event,
+// so the contest has one outcome per trace.
 func (p *plane) nudge(label string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

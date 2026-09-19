@@ -68,6 +68,46 @@ func TestAnOpenChargeAtTheLastInstantIsStillCounted(t *testing.T) {
 	}
 }
 
+// A LEASE THAT NEVER CARRIED A JOB IS STILL IN THE SWEEP. Escrow bought for an
+// offer that was then lost is charged to its host from purchase to release, and
+// a proof that left it out would miss an overcommit only it causes.
+func TestAnUnusedLeaseIsInTheSweep(t *testing.T) {
+	t.Parallel()
+
+	start := DefaultStart
+
+	r := &Report{Fleet: oneHost(), Records: []Record{
+		chargeAt(start, start.Add(10*time.Minute)),
+		chargeAt(start, start.Add(10*time.Minute)),
+	}}
+
+	for i := range r.Records {
+		r.Records[i].Seq = int64(i + 1)
+	}
+
+	if violations := r.checkCapacity(); len(violations) != 0 {
+		t.Fatalf("two 4 vCPU jobs on an 8 vCPU host were reported as an overcommit: %v", violations)
+	}
+
+	r.escrows = []charge{{
+		from: start.Add(2 * time.Minute), to: start.Add(4 * time.Minute),
+		vcpu: 4, memory: 8 * config.GiB, node: "only",
+	}}
+
+	if peak := r.PeakDeploymentVCPU(); peak != 12 {
+		t.Errorf("the deployment peaked at %d vCPU, want 12 with the unused lease counted", peak)
+	}
+
+	violations := r.checkCapacity()
+	if len(violations) == 0 {
+		t.Fatal("an unused lease on a full host was not reported as an overcommit")
+	}
+
+	if !strings.Contains(violations[0], "host only carried 12 vCPU") {
+		t.Errorf("the violation does not name the host and the load: %v", violations)
+	}
+}
+
 // A RECORD WHOSE TIMESTAMPS CONTRADICT THE LIFECYCLE IS REFUSED.
 func TestARecordOutOfOrderIsRefused(t *testing.T) {
 	t.Parallel()
