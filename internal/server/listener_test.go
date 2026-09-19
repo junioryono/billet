@@ -188,10 +188,9 @@ func stopsWithoutWaiting() Option {
 // arithmetic in the assertions can be read without cross-referencing.
 const tierVCPU = 4
 
-// An idle scale set needs one backed slot so GitHub will send it the first
-// statistics message, but it must not escrow the entire deployment while it has
-// no assigned work. Otherwise the first listener to poll can renew every lease
-// forever and a second tier with a real backlog advertises zero indefinitely.
+// An idle scale set advertises its ceiling so GitHub will assign it work, and
+// holds nothing while it has none. Otherwise the first listener to poll can
+// renew every lease forever and a second tier with a real backlog runs nothing.
 func TestIdleTierLeavesCapacityForASecondTierBacklog(t *testing.T) {
 	tiers := []config.Tier{tier("billet-4vcpu-idle"), tier("billet-4vcpu-busy")}
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 12, MaxMemory: 64 * config.GiB}, tiers)
@@ -256,11 +255,11 @@ func TestIdleTierLeavesCapacityForASecondTierBacklog(t *testing.T) {
 	}
 
 	firstBusyCapacity := <-busyPoll
-	if firstIdleCapacity != 1 {
-		t.Errorf("idle tier advertised %d runners, want one discovery slot", firstIdleCapacity)
+	if firstIdleCapacity != 3 {
+		t.Errorf("idle tier advertised %d runners, want its ceiling of 3", firstIdleCapacity)
 	}
-	if firstBusyCapacity != 2 {
-		t.Errorf("busy tier advertised %d runners, want its two assigned jobs", firstBusyCapacity)
+	if firstBusyCapacity != 3 {
+		t.Errorf("busy tier advertised %d runners, want its ceiling of 3", firstBusyCapacity)
 	}
 	close(launched)
 	var launchedIDs []int64
@@ -272,6 +271,14 @@ func TestIdleTierLeavesCapacityForASecondTierBacklog(t *testing.T) {
 	}
 }
 
+// SURPLUS ESCROW GOES BACK TO WHAT IS COMMITTED, AND NO FURTHER DOWN THAN THAT.
+//
+// There is no idle escrow to keep any more: assigned work is backed when its
+// runner launches (backPoolSlot), and the advertisement is a steady ceiling
+// nothing backs (#140). So whatever a tier holds beyond its committed work —
+// leases bought for offers it did not acquire, a race the pool lost — goes back
+// in full, whatever GitHub's assigned count says, because that count is served
+// by launching, not by holding.
 func TestAssignedDemandFallingReturnsSurplusEscrow(t *testing.T) {
 	tiers := []config.Tier{tier("billet-4vcpu-demand")}
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB}, tiers)
@@ -285,36 +292,26 @@ func TestAssignedDemandFallingReturnsSurplusEscrow(t *testing.T) {
 	}
 
 	l.observed = &Statistics{TotalAssignedJobs: 2}
-	if err := l.prepareEscrow(t.Context()); err != nil {
-		t.Fatalf("prepare for assigned work: %v", err)
-	}
-	l.releaseIdleEscrowAbove(t.Context(), l.advertisedCapacity())
-	if got := l.capacity(); got != 3 {
-		t.Errorf("capacity with two assigned jobs = %d, want two jobs plus discovery", got)
-	}
-
-	l.observed = &Statistics{}
-	if err := l.prepareEscrow(t.Context()); err != nil {
-		t.Fatalf("prepare after demand drained: %v", err)
-	}
-	l.releaseIdleEscrowAbove(t.Context(), l.advertisedCapacity())
-	if got := l.capacity(); got != 1 {
-		t.Errorf("idle capacity = %d, want one discovery slot", got)
+	l.releaseIdleEscrowAbove(t.Context(), l.targetCapacity())
+	if got := l.capacity(); got != 0 {
+		t.Errorf("capacity with two assigned jobs and none launched = %d, want 0: "+
+			"assigned work is backed when its runner launches, not in advance", got)
 	}
 
 	usage, err := a.Usage(t.Context())
 	if err != nil {
 		t.Fatalf("Usage: %v", err)
 	}
-	if usage.VCPU != tierVCPU {
-		t.Errorf("ledger holds %d vCPU, want one %d-vCPU discovery slot", usage.VCPU, tierVCPU)
+	if usage.VCPU != 0 {
+		t.Errorf("ledger holds %d vCPU for a tier running nothing, want 0 (#116)", usage.VCPU)
 	}
 }
 
-// A lower maxCapacity is a remote promise before it is a local number. Releasing
-// first lets a peer escrow the same machine while GitHub may still assign against
-// the previous advertisement.
-func TestLowerAdvertisementPrecedesSurplusRelease(t *testing.T) {
+// SURPLUS ESCROW GOES BACK AND THE ADVERTISEMENT DOES NOT MOVE. The advertisement
+// is a steady ceiling that nothing backs (#140), so a listener holding escrow
+// beyond its committed work hands all of it back to its peers, and what GitHub is
+// told stays the ceiling throughout: lowering it would make the tier unassignable.
+func TestSurplusEscrowReturnsWithoutLoweringTheAdvertisement(t *testing.T) {
 	tiers := []config.Tier{tier("billet-4vcpu-old"), tier("billet-4vcpu-peer")}
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 12, MaxMemory: 64 * config.GiB}, tiers)
 
@@ -339,7 +336,7 @@ func TestLowerAdvertisementPrecedesSurplusRelease(t *testing.T) {
 	}
 	l := NewListener(a, tiers[0].Label, session, stopsWithoutWaiting())
 	if err := l.refillEscrow(t.Context()); err != nil {
-		t.Fatalf("seed old full-deployment advertisement: %v", err)
+		t.Fatalf("hold the whole deployment in escrow: %v", err)
 	}
 
 	ctx, cancel := context.WithCancel(t.Context())
@@ -348,17 +345,11 @@ func TestLowerAdvertisementPrecedesSurplusRelease(t *testing.T) {
 
 	select {
 	case got := <-firstPoll:
-		if got != 1 {
-			t.Fatalf("lower advertisement = %d, want one discovery slot", got)
+		if got != 3 {
+			t.Fatalf("advertised %d, want the tier's ceiling of 3 whatever it holds", got)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("listener never began the lower-capacity poll")
-	}
-
-	if got, err := a.Headroom(t.Context(), tiers[1].Label); err != nil {
-		t.Fatalf("peer headroom while the lower poll is blocked: %v", err)
-	} else if got != 0 {
-		t.Errorf("peer headroom while GitHub has not observed the lower capacity = %d, want 0", got)
+		t.Fatal("listener never polled")
 	}
 
 	close(returnFirstPoll)
@@ -366,13 +357,13 @@ func TestLowerAdvertisementPrecedesSurplusRelease(t *testing.T) {
 	for {
 		got, err := a.Headroom(t.Context(), tiers[1].Label)
 		if err != nil {
-			t.Fatalf("peer headroom after the lower poll: %v", err)
+			t.Fatalf("peer headroom: %v", err)
 		}
-		if got == 2 {
+		if got == 3 {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("peer headroom stayed %d after GitHub observed the lower capacity, want 2", got)
+			t.Fatalf("peer headroom stayed %d, want all 3 slots back from a tier running nothing", got)
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -434,12 +425,6 @@ func TestOfferRefillLeavesHeadroomForAConcurrentTier(t *testing.T) {
 	first := NewListener(a, tiers[0].Label, firstSession)
 	secondSession := &fakeSession{}
 	second := NewListener(a, tiers[1].Label, secondSession)
-	if err := first.prepareEscrow(t.Context()); err != nil {
-		t.Fatalf("first discovery slot: %v", err)
-	}
-	if err := second.prepareEscrow(t.Context()); err != nil {
-		t.Fatalf("second discovery slot: %v", err)
-	}
 
 	firstDone := make(chan error, 1)
 	go func() {
@@ -860,15 +845,14 @@ func TestRetryableSurplusReleaseFailureRestoresOwnedLease(t *testing.T) {
 	}
 }
 
-// THE invariant of the listener plane, and the reason the allocator exists: the sum
-// of what every listener has advertised to GitHub at any instant never exceeds the
-// global budget.
+// THE invariant of the listener plane moved from the advertisement to the ledger.
 //
-// Each tier is its own scale set with its own `maxCapacity`, so listeners computing
-// their own maximum would let GitHub fill all of them at once. Reserving on
-// ASSIGNMENT is too late. Capacity is escrowed BEFORE it is advertised, and this
-// drives several listeners against one allocator to watch what they advertise.
-func TestAdvertisedCapacityNeverExceedsTheBudget(t *testing.T) {
+// Every tier advertises its own ceiling at once (#140), so what GitHub is told
+// across tiers exceeds the budget by design: that is what lets every tier be
+// assigned work. What must never exceed the budget is what the ledger holds,
+// because a lease is what a runner starts on. This drives several listeners
+// against one allocator and watches both.
+func TestEveryTierAdvertisesItsCeilingWhileTheLedgerStaysWithinTheBudget(t *testing.T) {
 	const (
 		budget  = 12       // vCPU
 		perTier = tierVCPU // so at most 3 runners exist across all tiers at once
@@ -882,30 +866,12 @@ func TestAdvertisedCapacityNeverExceedsTheBudget(t *testing.T) {
 
 	a := newAllocator(t, alloc.Limits{MaxVCPU: budget, MaxMemory: 64 * config.GiB}, tiers)
 
-	// advertised tracks what each listener currently has outstanding, and the
-	// peak of their sum. A listener holds its advertisement for the duration of
-	// a poll, which is exactly the window in which GitHub may act on it.
 	var (
 		mu          sync.Mutex
-		outstanding = map[string]int{}
-		peak        int
+		advertised  = map[string]int{}
+		peakUsage   int
+		usageErrors []error
 	)
-
-	observe := func(tierLabel string, capacity int) {
-		mu.Lock()
-		defer mu.Unlock()
-
-		outstanding[tierLabel] = capacity
-
-		sum := 0
-		for _, c := range outstanding {
-			sum += c
-		}
-
-		if sum > peak {
-			peak = sum
-		}
-	}
 
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer cancel()
@@ -921,12 +887,18 @@ func TestAdvertisedCapacityNeverExceedsTheBudget(t *testing.T) {
 			defer wg.Done()
 
 			session := &fakeSession{
+				stats: &Statistics{TotalAssignedJobs: 2},
 				onPoll: func(maxCapacity int) {
-					// Recorded and NOT cleared afterwards. An advertisement is live
-					// from the moment it is sent until it is replaced — GitHub may
-					// act on the last maxCapacity it saw at any point — so the
-					// honest measure is the sum of each listener's most recent one.
-					observe(tr.Label, maxCapacity)
+					usage, err := a.Usage(context.WithoutCancel(ctx))
+
+					mu.Lock()
+					advertised[tr.Label] = maxCapacity
+					if err != nil {
+						usageErrors = append(usageErrors, err)
+					} else {
+						peakUsage = max(peakUsage, usage.VCPU)
+					}
+					mu.Unlock()
 
 					if polls.Add(1) >= 60 {
 						cancel()
@@ -934,7 +906,8 @@ func TestAdvertisedCapacityNeverExceedsTheBudget(t *testing.T) {
 				},
 			}
 
-			l := NewListener(a, tr.Label, session)
+			l := NewListener(a, tr.Label, session, WithRunner(&fakeRunner{}),
+				WithRunnerRegistry(&fakeRunnerRegistry{}), stopsWithoutWaiting())
 			if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) &&
 				!errors.Is(err, context.DeadlineExceeded) {
 				t.Errorf("listener %s: %v", tr.Label, err)
@@ -948,23 +921,25 @@ func TestAdvertisedCapacityNeverExceedsTheBudget(t *testing.T) {
 		t.Fatal("no listener ever polled; this test proves nothing")
 	}
 
-	// ZERO SATISFIES "NEVER EXCEEDS", WHICH IS WHY THIS IS HERE.
-	//
-	// The assertion below is one-sided: a billet that advertised nothing at all
-	// would pass it perfectly. That was harmless while capacity came from a config
-	// number, because there was no way to reach zero by accident. It stopped being
-	// harmless the moment capacity came from a FLEET — a deployment with no
-	// registered host now correctly advertises zero, so this test would have gone
-	// on passing while proving nothing about the invariant it is named for.
-	if peak == 0 {
-		t.Fatal("no listener ever advertised anything, so the ceiling below was never " +
-			"exercised; the fleet these listeners run on can hold nothing")
+	for _, err := range usageErrors {
+		t.Errorf("read the ledger's usage: %v", err)
 	}
 
-	// vCPU, not runner count: the budget is a vector and this is the axis the
-	// tiers here contend on.
-	if got := peak * perTier; got > budget {
-		t.Errorf("listeners advertised %d vCPU at once against a %d vCPU budget", got, budget)
+	for _, tr := range tiers {
+		if got := advertised[tr.Label]; got != budget/perTier {
+			t.Errorf("%s advertised %d, want its ceiling %d", tr.Label, got, budget/perTier)
+		}
+	}
+
+	// ZERO SATISFIES "NEVER EXCEEDS". Each tier is assigned two jobs, six across
+	// room for three, so the ledger has to have been filled for the ceiling below
+	// to have been exercised.
+	if peakUsage == 0 {
+		t.Fatal("the ledger never held anything, so the budget below was never exercised")
+	}
+
+	if peakUsage > budget {
+		t.Errorf("the ledger held %d vCPU at once against a %d vCPU budget", peakUsage, budget)
 	}
 }
 
@@ -1809,7 +1784,7 @@ func TestRecoveryRetirementFenceSurvivesNodeCustodyAndRefusesLateStart(t *testin
 	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(&fakeRunner{
 		onDestroy: func(int64) error { return ErrCustody },
 	}), WithRunnerRegistry(&fakeRunnerRegistry{}))
-	if _, err := l.reconcilePool(t.Context(), 0); err != nil {
+	if err := l.reconcilePool(t.Context(), 0); err != nil {
 		t.Fatalf("reconcile pool: %v", err)
 	}
 	member, err := a.PoolRunnerByLease(t.Context(), lease.ID)
@@ -1905,7 +1880,7 @@ func TestContradictoryStartedIdentityRetiresOnlyThatPoolMember(t *testing.T) {
 	if err != nil || len(members) != 2 {
 		t.Fatalf("pool members = %+v, err %v", members, err)
 	}
-	bad := members[0]
+	bad, good := members[0], members[1]
 	if err := l.handle(t.Context(), &Message{MessageID: 2,
 		Started: []Job{{RequestID: bad.LaunchRequestID, RunID: 101, RunnerID: 77,
 			RunnerName: bad.RunnerName}},
@@ -1916,9 +1891,21 @@ func TestContradictoryStartedIdentityRetiresOnlyThatPoolMember(t *testing.T) {
 		t.Fatalf("destroyed requests = %v, want only contradictory member %d",
 			destroyed, bad.LaunchRequestID)
 	}
+	// GitHub still counts two assigned jobs and there is room, so the retired
+	// member may be replaced; what must hold is that only it was retired.
 	members, err = a.PoolRunners(t.Context(), tiers[0].Label)
-	if err != nil || len(members) != 1 || members[0].LaunchRequestID == bad.LaunchRequestID {
-		t.Fatalf("remaining pool = %+v, err %v", members, err)
+	if err != nil {
+		t.Fatalf("read the pool: %v", err)
+	}
+	kept := false
+	for _, m := range members {
+		if m.LeaseID == bad.LeaseID {
+			t.Errorf("the contradictory member %s is still in the pool", bad.RunnerName)
+		}
+		kept = kept || m.LeaseID == good.LeaseID
+	}
+	if !kept {
+		t.Errorf("remaining pool = %+v, want it to keep the consistent member %s", members, good.RunnerName)
 	}
 }
 
@@ -2101,6 +2088,9 @@ func TestRestartAdvertisesAdoptedRunnerInTotalCapacity(t *testing.T) {
 	}
 }
 
+// A runner becoming serviceable between polls is adopted into committed capacity
+// on the next poll. The steady ceiling hides that in the advertisement (#140), so
+// the committed count is read beside it: it is what a drain advertises.
 func TestRunnerBecomingServiceableBetweenPollsEntersAdvertisedCapacity(t *testing.T) {
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 4, MaxMemory: 64 * config.GiB}, tiers)
@@ -2112,10 +2102,13 @@ func TestRunnerBecomingServiceableBetweenPollsEntersAdvertisedCapacity(t *testin
 	ctx, cancel := context.WithCancel(t.Context())
 	polls := 0
 	advertised := []int{}
+	committed := []int{}
+	var l *Listener
 	session := &fakeSession{stats: &Statistics{TotalAssignedJobs: 1}}
 	session.onPoll = func(capacity int) {
 		polls++
 		advertised = append(advertised, capacity)
+		committed = append(committed, l.committedCapacity())
 		if polls == 1 {
 			if err := a.Bind(t.Context(), lease.ID, lease.Epoch, "test-host-firecracker"); err != nil {
 				t.Fatalf("Bind: %v", err)
@@ -2127,13 +2120,18 @@ func TestRunnerBecomingServiceableBetweenPollsEntersAdvertisedCapacity(t *testin
 			cancel()
 		}
 	}
-	l := NewListener(a, tiers[0].Label, session, WithRunner(&fakeRunner{}),
+	l = NewListener(a, tiers[0].Label, session, WithRunner(&fakeRunner{}),
 		stopsWithoutWaiting())
 	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run: %v", err)
 	}
-	if !slices.Equal(advertised, []int{0, 1}) {
-		t.Fatalf("advertised capacity = %v, want [0 1] across the recovery transition", advertised)
+	if !slices.Equal(advertised, []int{1, 1}) {
+		t.Fatalf("advertised capacity = %v, want the ceiling [1 1] across the recovery transition",
+			advertised)
+	}
+	if !slices.Equal(committed, []int{0, 1}) {
+		t.Fatalf("committed capacity = %v, want [0 1]: the runner that became serviceable "+
+			"between polls was not adopted", committed)
 	}
 }
 
@@ -2355,7 +2353,7 @@ func TestEscrowSurvivesAPollLongerThanTheLeaseTTL(t *testing.T) {
 	l.session = &fakeSession{onPoll: func(int) {
 		switch polls.Add(1) {
 		case 1:
-			// The escrow happens before the poll, so what is held now is what has
+			// The test staged escrow before Run, so what is held now is what has
 			// to survive the stall — FIVE TIMES the TTL inside a single
 			// GetMessage. Every one of these leases expires during this call
 			// unless something renews them on a clock of its own.
@@ -2394,9 +2392,9 @@ func TestEscrowSurvivesAPollLongerThanTheLeaseTTL(t *testing.T) {
 				}
 			}
 
-			// Checked HERE, not after Run returns: shutdown releases the escrow, so by then
-			// every lease is legitimately terminal and the assertion would fire against correct
-			// behaviour. One poll later, refillEscrow has already replaced them.
+			// Checked HERE, not after Run returns: the listener releases escrow it
+			// holds beyond its committed work once the poll returns, and shutdown
+			// releases the rest, so by then every lease is legitimately terminal.
 			//
 			// Identity, not count: a listener that loses its escrow re-escrows and holds the
 			// same NUMBER of leases. Renewability of these specific leases is the property.
@@ -2415,6 +2413,13 @@ func TestEscrowSurvivesAPollLongerThanTheLeaseTTL(t *testing.T) {
 			cancel()
 		}
 	}}
+
+	// ESCROW HELD ACROSS A POLL, as an offer's purchase is while its assignment
+	// is outstanding. Nothing is held in advance any more (#140), so the test
+	// stages it; the listener releases it only after the poll returns.
+	if err := l.refillEscrow(t.Context()); err != nil {
+		t.Fatalf("stage escrow across the poll: %v", err)
+	}
 
 	// Cancellation is how this listener is stopped, and Run reports the context
 	// error rather than nil — Server.Run is what turns that into a clean exit.

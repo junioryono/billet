@@ -228,14 +228,14 @@ func awaitRun(ctx context.Context, t *testing.T, run *runResult) {
 // to GitHub about the capacity somebody IS using.
 //
 // Advertising a constant zero is untrue while a job runs, and the number billet
-// sends is the scale set's TOTAL capacity rather than its spare. Releasing the idle
-// escrow makes the advertisement fall to the work still in flight and reach zero by
-// itself — the drain's completion condition, without a second source of truth.
-func TestADrainReleasesIdleEscrowAndAdvertisesOnlyWhatIsRunning(t *testing.T) {
+// sends is the scale set's TOTAL capacity rather than its spare. A drain lowers
+// the advertisement from the tier's ceiling to the work still in flight, and it
+// reaches zero by itself: the drain's completion condition, without a second
+// source of truth.
+func TestADrainAdvertisesOnlyWhatIsRunning(t *testing.T) {
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
-	// Room for two runners at four vCPU each, so there is genuinely idle escrow
-	// to release while one job runs. With room for exactly one, `held` would be
-	// empty anyway and the test would pass against a drain that releases nothing.
+	// Room for two runners at four vCPU each, so the ceiling (2) is above the one
+	// running job and the drain's lower number is distinguishable from it.
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
 		alloc.WithLeaseTTL(300*time.Millisecond))
 
@@ -274,19 +274,9 @@ func TestADrainReleasesIdleEscrowAndAdvertisesOnlyWhatIsRunning(t *testing.T) {
 	// advertised records what each poll told GitHub, so the assertion is about
 	// the number that actually went out rather than about internal state that
 	// might never be sent.
-	// DECLARED BEFORE onPoll IS INSTALLED so the hook can read what the listener
-	// is holding. It is assigned before Run starts, which happens-before the
-	// goroutine that calls the hook.
-	var l *Listener
-
 	var (
 		mu         sync.Mutex
 		advertised []int
-		// heldWhenSent pairs each advertisement with the escrow still held when it
-		// went out. The pairing is the assertion: either number alone cannot show
-		// which happened first, and the order is the whole invariant — GitHub's
-		// live number must never exceed what this listener can back.
-		heldWhenSent []int
 	)
 
 	session.onPoll = func(capacity int) {
@@ -294,7 +284,6 @@ func TestADrainReleasesIdleEscrowAndAdvertisesOnlyWhatIsRunning(t *testing.T) {
 		defer mu.Unlock()
 
 		advertised = append(advertised, capacity)
-		heldWhenSent = append(heldWhenSent, len(l.Held()))
 	}
 
 	lastAdvertised := func() (int, bool) {
@@ -310,7 +299,7 @@ func TestADrainReleasesIdleEscrowAndAdvertisesOnlyWhatIsRunning(t *testing.T) {
 
 	var dl drainLog
 
-	l = NewListener(a, "billet-4vcpu-a", session,
+	l := NewListener(a, "billet-4vcpu-a", session,
 		WithRunner(&fakeRunner{}),
 		WithDrainGrace(20*time.Second),
 		dl.option())
@@ -318,7 +307,11 @@ func TestADrainReleasesIdleEscrowAndAdvertisesOnlyWhatIsRunning(t *testing.T) {
 	run := startRun(ctx, l)
 
 	waitUntil(deadline, t, "the job to be running", func() bool { return l.Running() == 1 })
-	waitUntil(deadline, t, "the spare capacity to be escrowed", func() bool { return len(l.Held()) > 0 })
+	waitUntil(deadline, t, "a poll advertising the ceiling while the job runs", func() bool {
+		n, ok := lastAdvertised()
+
+		return ok && n == 2
+	})
 
 	// The drain begins here.
 	cancel()
@@ -337,56 +330,9 @@ func TestADrainReleasesIdleEscrowAndAdvertisesOnlyWhatIsRunning(t *testing.T) {
 		return ok && n == 1
 	})
 
-	// WAITED FOR, NOT ASSUMED, and the reason is the ordering this test now also
-	// asserts below. The escrow goes back AFTER the poll that carried the smaller
-	// number, so between that advertisement going out and the poll returning
-	// there is a window where the number is already low and the escrow is still
-	// held. That window is the point — checking immediately here asserted the old
-	// order, where the release came first.
-	waitUntil(deadline, t, "the idle escrow to go back", func() bool { return len(l.Held()) == 0 })
-
-	// AND IT WENT BACK IN THE RIGHT ORDER. The teardown's own rule is that the
-	// last maxCapacity GitHub saw stays live until the session ends, so releasing
-	// the escrow FIRST leaves a positive advertisement standing with nothing
-	// behind it — GitHub assigns against it, and the assignment arrives to find
-	// `held` empty and is declined. The poll that first lowers the number must
-	// still be holding.
-	mu.Lock()
-	sent := append([]int(nil), advertised...)
-	holding := append([]int(nil), heldWhenSent...)
-	mu.Unlock()
-
-	// AGAINST THE PEAK, not against the first poll: the advertisement climbs as
-	// the job is taken (a discovery slot, then the assigned job), so the
-	// withdrawal is the first drop below the highest number GitHub was ever told.
-	var (
-		peak    int
-		lowered bool
-	)
-
-	for i, n := range sent {
-		if n > peak {
-			peak = n
-
-			continue
-		}
-
-		if i > 0 && n < peak {
-			lowered = true
-
-			if holding[i] == 0 {
-				t.Errorf("the escrow went back before, or with, the poll that lowered the "+
-					"advertisement from %d to %d: advertised=%v held=%v",
-					peak, n, sent, holding)
-			}
-
-			break
-		}
-	}
-
-	if !lowered {
-		t.Errorf("no poll advertised less than the peak of %d, so nothing was withdrawn: %v",
-			peak, sent)
+	if held := len(l.Held()); held != 0 {
+		t.Errorf("a draining listener holds %d idle leases; it buys nothing and holds nothing spare",
+			held)
 	}
 
 	if got := l.Running(); got != 1 {
@@ -1064,9 +1010,17 @@ func TestAnIdleLeaseTheDrainCouldNotReleaseIsReleasedAtShutdown(t *testing.T) {
 	l := NewListener(a, "billet-4vcpu-a", &fakeSession{},
 		WithRunner(&fakeRunner{}), stopsWithoutWaiting(), dl.option())
 
-	run := startRun(ctx, l)
+	// Staged: nothing is escrowed in advance of work any more (#140), and escrow
+	// bought for an offer is what a drain can find itself holding.
+	if err := l.refillEscrow(t.Context()); err != nil {
+		t.Fatalf("stage idle escrow: %v", err)
+	}
 
-	waitUntil(deadline, t, "the escrow to be taken", func() bool { return len(l.Held()) > 0 })
+	if len(l.Held()) == 0 {
+		t.Fatal("staged no escrow; this test proves nothing")
+	}
+
+	run := startRun(ctx, l)
 
 	cancel()
 

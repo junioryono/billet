@@ -228,10 +228,10 @@ func buildStack(t *testing.T, log *slog.Logger, fleet Fleet, tiers []config.Tier
 // listener parked.
 //
 // THE SECOND THING THE HARNESS STEERS, BESIDE THE CLOCK, and it steers an order
-// GitHub itself leaves to chance. Listeners start together and each escrows its
-// discovery slot as soon as its session opens; escrow is placement, so with two
-// tiers of different sizes the host each slot lands on depends on which
-// goroutine ran first, and every later job on that tier inherits it. Waiting
+// GitHub itself leaves to chance. Listeners start together and each buys a lease
+// as soon as its first job is assigned; escrow is placement, so with two tiers
+// of different sizes the host each lease lands on depends on which goroutine ran
+// first, and every later job on that tier inherits it. Waiting
 // HERE rather than in the scripted service's handler, because the scale-set
 // client serialises its calls under one mutex and a request held open in the
 // handler would hold every other tier's request behind it.
