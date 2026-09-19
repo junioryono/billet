@@ -310,11 +310,9 @@ type Listener struct {
 	// uses the allocator directly; no production option can replace it.
 	releaseCapacity func(context.Context, string, int64, alloc.Phase) error
 	// Escrowed capacity that HAS been given to a job, keyed by request id so a
-	// redelivered message is recognised rather than assigned twice.
-	//
-	// Both halves are advertised — see capacity(). The safety property is that the
-	// number sent to GitHub is only ever capacity this listener took from the
-	// allocator, never one computed from headroom.
+	// redelivered message is recognised rather than assigned twice. Every entry
+	// was bought from the allocator before its runner launched; that purchase,
+	// not the advertisement, is what keeps the fleet within its budget.
 	running map[int64]*alloc.Lease
 	// Resolved aliases retain consumed offer facts while the lease is running.
 	// A durable busy pool binding supersedes these intended-job facts.
@@ -849,13 +847,11 @@ func WithMaxCapacity(ceiling int) Option {
 
 // Run polls until the context is done.
 //
-// The order of operations is the design: capacity is escrowed BEFORE it is
-// advertised, and only what the escrow actually returned is advertised.
-//
-// The other way round — advertise what this tier could theoretically take,
-// reserve when GitHub assigns — over-admits by construction on any host with
-// more than one tier: each listener computes a maximum from the same free pool,
-// GitHub fills all of them at once, and reserving on assignment is too late.
+// The order of operations is the design: a lease is bought atomically from the
+// allocator BEFORE each runner launches, and nothing launches without one. The
+// advertisement is a steady ceiling (steadyAdvertisement) that nothing backs, so
+// GitHub may assign more across tiers than the fleet can run at once; the
+// surplus waits, assigned, until a purchase succeeds (#140).
 //
 // The vendor's own listener package computes a desired runner count itself,
 // which is why billet does not use it.
@@ -1273,15 +1269,10 @@ func (l *Listener) Run(ctx context.Context) error {
 			}
 		}
 
-		// WHAT IS STILL HERE, not what billet would like. capacity() falls to the
-		// work in flight as the idle escrow goes back, and reaches zero by itself
-		// — which is the same shape a drain uses, and for the same reason: a
-		// constant zero while a job runs is untrue, since what billet sends is the
-		// scale set's total capacity.
-		// WITHDRAWING ADVERTISES WHAT IS COMMITTED, not what is held. The escrow
-		// stays until a poll has carried the smaller number, because until then
-		// GitHub's live advertisement is still the old one and an assignment
-		// against it has to find backing.
+		// A DRAINING OR SEALED LISTENER ADVERTISES WHAT IS COMMITTED, which falls to
+		// the work in flight and reaches zero by itself; a constant zero while a job
+		// runs is untrue, since what billet sends is the scale set's total capacity.
+		// Otherwise every tier advertises its steady ceiling.
 		advertised := l.committedCapacity()
 		withdrawnWhenSent := true
 
@@ -1598,9 +1589,9 @@ func (l *Listener) beginDrain(ctx context.Context) (context.Context, context.Can
 
 // releaseStrandedEscrow hands back capacity whose machine has gone away.
 //
-// refillEscrow only ever ADDS, so when the host a reservation names disappears the
-// promise does not move: GitHub goes on assigning against it and every job is
-// acquired and then fails to launch.
+// A held lease names its machine, and one whose machine has gone would be
+// assigned a job that then fails to launch; releasing it lets the next purchase
+// place on a host that is there.
 //
 // ONLY `held` LEASES: one has never been assigned, so giving it back costs a
 // re-escrow at worst. Anything acquiring or running is somebody's job.
@@ -1859,11 +1850,8 @@ func (l *Listener) warnDrainOverrun() {
 		"drain_timeout", grace)
 }
 
-// capacity is what this listener advertises: TOTAL escrowed, not free.
-//
-// All three collections count, and each lease came from the allocator, so the sum
-// across listeners is still bounded by the budget. Sending only the free half would
-// shrink the advertisement every time a job started.
+// capacity is every lease this listener owns or has adopted, idle or not. Each
+// came from the allocator, so the sum across listeners is bounded by the budget.
 func (l *Listener) capacity() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -1881,14 +1869,8 @@ func (l *Listener) idleEscrow() int {
 }
 
 // committedCapacity is what this listener owes GitHub: work it has promised or
-// is running, with idle escrow excluded.
-//
-// IT IS WHAT A WITHDRAWAL ADVERTISES. Handing the escrow back first and then
-// advertising the smaller number gets the order backwards — see the teardown's
-// own rule, that the last maxCapacity GitHub saw stays live until the session
-// ends, so releasing escrow first leaves a positive advertisement standing with
-// nothing behind it. Lowering the number first and releasing after the poll that
-// carried it keeps the advertisement backed at every instant.
+// is running, with idle escrow excluded. It is what a draining or sealed
+// listener advertises, and the floor under steadyAdvertisement.
 func (l *Listener) committedCapacity() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()

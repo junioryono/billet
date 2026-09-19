@@ -86,12 +86,13 @@ func TestEveryTraceJobHasALedgerRow(t *testing.T) {
 	}
 
 	// NO LEASE WITHOUT A JOB (#140). Capacity is bought when a runner starts, so
-	// a trace whose every job ran leaves no row for a lease that never carried
-	// one; an idle reservation per tier is what v0.10.0 wasted (#116). Any such
-	// row would still be in the overcommit sweep, which is the second half.
-	if report.EscrowRows != 0 || len(report.escrows) != report.EscrowRows {
-		t.Errorf("counted %d escrow rows and swept %d; want none: a lease was held that "+
-			"never carried a job", report.EscrowRows, len(report.escrows))
+	// this trace, which is only assigned work, leaves no row for a lease that
+	// never carried one; an idle reservation per tier is what v0.10.0 wasted
+	// (#116). Such rows are legitimate elsewhere (an offer bought and then lost),
+	// and TestAnUnusedLeaseIsInTheSweep proves the sweep charges them.
+	if report.EscrowRows != 0 {
+		t.Errorf("counted %d rows for leases that never carried a job; want none",
+			report.EscrowRows)
 	}
 
 	for _, rec := range report.Records {

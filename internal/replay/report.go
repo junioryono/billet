@@ -155,7 +155,7 @@ func readReport(ctx context.Context, db *state.DB, fleet Fleet, trace Trace) (*R
 
 		// THE CHARGE STARTS AT ESCROW, from the lease row, which outlives the
 		// lease: job_history opens at assignment, and a capacity audit that began
-		// there would miss the slot every tier holds before any job is given it.
+		// there would miss the time between a lease's purchase and its job.
 		lease, err := reads.ReadLeaseCharge(ctx, row.LeaseID)
 		if err != nil {
 			return nil, fmt.Errorf("read what lease %s charged: %w", row.LeaseID, err)
@@ -397,7 +397,8 @@ func parseStamp(s string) (time.Time, error) {
 }
 
 // charges is every claim the ledger recorded on the fleet: each job's lease
-// from its escrow to its archive, and every discovery slot the same way.
+// from its escrow to its archive, and every lease that never carried a job the
+// same way.
 //
 // A CHARGE WITH NO END IS NOT DROPPED, AND NOT CLOSED EITHER. A lease the
 // ledger never archived is still charged, and leaving it out would let the one

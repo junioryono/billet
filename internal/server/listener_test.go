@@ -2088,8 +2088,9 @@ func TestRestartAdvertisesAdoptedRunnerInTotalCapacity(t *testing.T) {
 	}
 }
 
-// A runner becoming serviceable between polls stays inside the advertisement. The
-// steady ceiling already covers it (#140), so the advertisement does not move.
+// A runner becoming serviceable between polls is adopted into committed capacity
+// on the next poll. The steady ceiling hides that in the advertisement (#140), so
+// the committed count is read beside it: it is what a drain advertises.
 func TestRunnerBecomingServiceableBetweenPollsEntersAdvertisedCapacity(t *testing.T) {
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 4, MaxMemory: 64 * config.GiB}, tiers)
@@ -2101,10 +2102,13 @@ func TestRunnerBecomingServiceableBetweenPollsEntersAdvertisedCapacity(t *testin
 	ctx, cancel := context.WithCancel(t.Context())
 	polls := 0
 	advertised := []int{}
+	committed := []int{}
+	var l *Listener
 	session := &fakeSession{stats: &Statistics{TotalAssignedJobs: 1}}
 	session.onPoll = func(capacity int) {
 		polls++
 		advertised = append(advertised, capacity)
+		committed = append(committed, l.committedCapacity())
 		if polls == 1 {
 			if err := a.Bind(t.Context(), lease.ID, lease.Epoch, "test-host-firecracker"); err != nil {
 				t.Fatalf("Bind: %v", err)
@@ -2116,7 +2120,7 @@ func TestRunnerBecomingServiceableBetweenPollsEntersAdvertisedCapacity(t *testin
 			cancel()
 		}
 	}
-	l := NewListener(a, tiers[0].Label, session, WithRunner(&fakeRunner{}),
+	l = NewListener(a, tiers[0].Label, session, WithRunner(&fakeRunner{}),
 		stopsWithoutWaiting())
 	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run: %v", err)
@@ -2124,6 +2128,10 @@ func TestRunnerBecomingServiceableBetweenPollsEntersAdvertisedCapacity(t *testin
 	if !slices.Equal(advertised, []int{1, 1}) {
 		t.Fatalf("advertised capacity = %v, want the ceiling [1 1] across the recovery transition",
 			advertised)
+	}
+	if !slices.Equal(committed, []int{0, 1}) {
+		t.Fatalf("committed capacity = %v, want [0 1]: the runner that became serviceable "+
+			"between polls was not adopted", committed)
 	}
 }
 
