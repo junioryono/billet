@@ -82,8 +82,10 @@ func TestRunServerReturnsNothingWhenTheClaimWasStopped(t *testing.T) {
 	var branch *ast.IfStmt
 
 	ast.Inspect(fn, func(n ast.Node) bool {
+		// AN `if` WITHOUT AN Init IS THE COMMON CASE, and ast.Inspect panics on a
+		// nil node rather than ignoring it.
 		stmt, ok := n.(*ast.IfStmt)
-		if !ok || branch != nil {
+		if !ok || branch != nil || stmt.Init == nil {
 			return true
 		}
 
@@ -103,35 +105,29 @@ func TestRunServerReturnsNothingWhenTheClaimWasStopped(t *testing.T) {
 			"`if err := becomeController(...); err != nil` of its own")
 	}
 
-	var classified, cleanReturn bool
+	// THE BRANCH RETURNS WHAT THE CLASSIFIER ANSWERS, AND NOTHING ELSE. A body
+	// that calls stoppedBeforeTheClaim and returns the error anyway is the bug
+	// again, and a body that returns before consulting it never reaches the
+	// question; requiring the branch's one return to BE the call rules out both.
+	var returns []*ast.ReturnStmt
 
 	ast.Inspect(branch.Body, func(n ast.Node) bool {
-		switch node := n.(type) {
-		case *ast.CallExpr:
-			if calleeName(node) == "stoppedBeforeTheClaim" {
-				classified = true
-			}
-		case *ast.ReturnStmt:
-			// EXACTLY `return nil`, which is the whole behaviour: a branch that
-			// classifies and then returns the error anyway is the bug again.
-			if len(node.Results) == 1 {
-				if id, ok := node.Results[0].(*ast.Ident); ok && id.Name == "nil" {
-					cleanReturn = true
-				}
-			}
+		if stmt, ok := n.(*ast.ReturnStmt); ok {
+			returns = append(returns, stmt)
 		}
 
 		return true
 	})
 
-	if !classified {
-		t.Error("runServer no longer asks stoppedBeforeTheClaim about a failed claim, so " +
-			"a control plane asked to stop exits 1 again and every retirement of one " +
-			"refuses at intent")
+	if len(returns) != 1 || len(returns[0].Results) != 1 {
+		t.Fatalf("the failed-claim branch has %d returns, want exactly one returning one "+
+			"value: whatever it answers is how a stopped control plane exits", len(returns))
 	}
 
-	if !cleanReturn {
-		t.Error("runServer never returns nil from the failed-claim branch, so " +
-			"classifying the stop changes nothing about how the process exits")
+	call, ok := returns[0].Results[0].(*ast.CallExpr)
+	if !ok || calleeName(call) != "stoppedBeforeTheClaim" {
+		t.Error("the failed-claim branch does not return stoppedBeforeTheClaim's answer, " +
+			"so a control plane asked to stop exits 1 again and every retirement of one " +
+			"refuses at intent")
 	}
 }

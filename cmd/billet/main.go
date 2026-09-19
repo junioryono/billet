@@ -631,11 +631,7 @@ func runServer(
 	if err := becomeController(ctx, cfg, db, deployment, standby); err != nil {
 		// THE FENCE IS READ AFTER THE ATTEMPT, not beside it: the claim's own
 		// write is one a successor can refuse.
-		if err := stoppedBeforeTheClaim(ctx, db.LeadershipLost(), err); err != nil {
-			return err
-		}
-
-		return nil
+		return stoppedBeforeTheClaim(ctx, db.LeadershipLost(), err)
 	}
 
 	// AND A LOST CLAIM STOPS THEM THE SAME WAY, WHICH IS THE HALF THAT REFUSING A
