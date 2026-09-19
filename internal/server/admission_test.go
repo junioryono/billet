@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -91,13 +90,14 @@ func TestASealedDeploymentDoesNotStopTheListener(t *testing.T) {
 		t.Errorf("a sealed deployment escrowed %d capacity", got)
 	}
 
-	// The same through the other entry point the poll loop uses.
+	// The same through the one place the poll loop buys capacity: the pool's
+	// purchase at launch, with GitHub reporting work assigned.
 	sealed.observed = &Statistics{TotalAssignedJobs: 4}
-	if err := sealed.prepareEscrow(t.Context()); err != nil {
-		t.Fatalf("prepareEscrow stopped the listener on a sealed deployment: %v", err)
+	if err := sealed.backPoolSlot(t.Context()); err != nil {
+		t.Fatalf("the pool's purchase stopped the listener on a sealed deployment: %v", err)
 	}
 	if got := sealed.capacity(); got != 0 {
-		t.Errorf("a sealed deployment escrowed %d capacity through prepareEscrow", got)
+		t.Errorf("a sealed deployment escrowed %d capacity through the pool's purchase", got)
 	}
 }
 
@@ -146,7 +146,7 @@ func TestAGenuineLedgerFailureStillStopsTheListener(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 
-	err = l.prepareEscrow(t.Context())
+	err = l.backPoolSlot(t.Context())
 	if err == nil {
 		t.Fatal("a listener carried on against a ledger it could not use")
 	}
@@ -720,18 +720,22 @@ func TestTheLoopReObservesTheSealBeforeHandlingAMessage(t *testing.T) {
 	}
 }
 
-// A SEAL LANDING DURING THE POLL MUST NOT STRIP THE BACKING FROM AN ASSIGNMENT
-// IN THE MESSAGE THAT POLL RETURNED.
+// A SEAL IS ABSOLUTE FOR NEW LEASES, SO AN ASSIGNMENT THAT ARRIVES WITH ONE WAITS
+// FOR IT TO LIFT — AND THEN RUNS.
 //
-// GitHub can assign work this listener holds no in-memory promise for — after a
-// restart, or on the direct-assignment path — and `assign` backs such a job from
-// `held`. So the order in the loop is load-bearing: mark, handle, THEN hand the
-// idle escrow back. Handing it back first empties `held`, and the assignment is
-// declined for want of escrow that existed when GitHub made it.
+// This used to assert the opposite: that a job GitHub assigned against the
+// pre-seal advertisement was backed from an idle escrow the listener was already
+// holding, because "a job already assigned is not new work". With no idle
+// escrow any more (#140) backing it would mean buying a lease UNDER the seal,
+// and the host-upgrade transaction's safety rests on the seal refusing every new
+// lease so the ledger can quiesce. That fence outranks one poll of latency.
 //
-// That is revoking a commitment already made, which is the one thing a seal must
-// not do. It refuses NEW work; a job already assigned is not new work.
-func TestASealDuringThePollKeepsBackingAnAssignmentAlreadyMade(t *testing.T) {
+// So the trade is deliberate and bounded: the only assignments caught are the
+// ones in the poll that was in flight when the seal landed, since every poll
+// after it advertises committed work only. They are not lost — GitHub keeps them
+// assigned to this scale set — and the first reconciliation after the seal
+// lifts buys their leases and launches them.
+func TestASealedDeploymentHoldsAnAssignmentUntilAdmissionReopens(t *testing.T) {
 	tiers := []config.Tier{tier("billet-4vcpu-midpollassign")}
 	db := openState(t)
 
@@ -745,26 +749,29 @@ func TestASealDuringThePollKeepsBackingAnAssignmentAlreadyMade(t *testing.T) {
 	defer cancel()
 
 	var (
-		mu       sync.Mutex
-		polls    int
-		sealedAt int
-		assigned bool
-		launched []int64
+		mu            sync.Mutex
+		polls         int
+		sealedAt      int
+		resumedAt     int
+		assigned      bool
+		launched      []int64
+		whileSealed   int
+		pollsAtLaunch int
 	)
 
 	session := &fakeSession{}
 
-	// THE SEAL LANDS WHILE THE POLL IS BLOCKED — after the escrow was taken and
-	// advertised, before the message comes back. That is the window the fix is
-	// about, and onPoll is exactly it.
+	// THE SEAL LANDS WHILE THE FIRST POLL IS BLOCKED, so the assignment that poll
+	// returns was made against the pre-seal advertisement. Admission reopens two
+	// polls later.
 	session.onPoll = func(int) {
 		mu.Lock()
 		polls++
-		first := polls == 1
 		count := polls
 		mu.Unlock()
 
-		if first {
+		switch count {
+		case 1:
 			if _, err := db.Seal(t.Context(), state.SealRequest{
 				Provenance: state.ProvenanceOperator, Actor: "ops",
 			}); err != nil {
@@ -774,15 +781,36 @@ func TestASealDuringThePollKeepsBackingAnAssignmentAlreadyMade(t *testing.T) {
 			mu.Lock()
 			sealedAt = count
 			mu.Unlock()
+		case 3:
+			mu.Lock()
+			whileSealed = len(launched)
+			mu.Unlock()
+
+			current, err := db.Admission(t.Context())
+			if err != nil {
+				t.Errorf("Admission: %v", err)
+
+				return
+			}
+
+			if _, err := db.Resume(t.Context(), state.ResumeRequest{
+				Expect: current.Generation, Actor: "ops",
+			}); err != nil {
+				t.Errorf("Resume: %v", err)
+			}
+
+			mu.Lock()
+			resumedAt = count
+			mu.Unlock()
 		}
 
-		if count >= 4 {
+		if count >= 8 {
 			cancel()
 		}
 	}
 
-	// NO PROMISE ON FILE for this request, which is the case `assign` backs from
-	// `held` — the restart and direct-assignment path.
+	// THE MESSAGE GITHUB.COM SENDS: the job assigned outright, and statistics
+	// counting it. There is no promise on file and no escrow held for it.
 	session.onGet = func() (*Message, error) {
 		mu.Lock()
 		defer mu.Unlock()
@@ -790,7 +818,11 @@ func TestASealDuringThePollKeepsBackingAnAssignmentAlreadyMade(t *testing.T) {
 		if !assigned {
 			assigned = true
 
-			return &Message{MessageID: 1, Assigned: []Job{{RequestID: 11, RunID: 101}}}, nil
+			return &Message{
+				MessageID:  1,
+				Statistics: &Statistics{TotalAssignedJobs: 1},
+				Assigned:   []Job{{RequestID: 11, RunID: 101}},
+			}, nil
 		}
 
 		return nil, ErrNoMessage
@@ -803,6 +835,7 @@ func TestASealDuringThePollKeepsBackingAnAssignmentAlreadyMade(t *testing.T) {
 	runner := &fakeRunner{onLaunch: func(requestID int64) error {
 		mu.Lock()
 		launched = append(launched, requestID)
+		pollsAtLaunch = polls
 		mu.Unlock()
 
 		return nil
@@ -817,23 +850,31 @@ func TestASealDuringThePollKeepsBackingAnAssignmentAlreadyMade(t *testing.T) {
 	}
 
 	mu.Lock()
-	when, delivered := sealedAt, assigned
+	sealed, resumed, delivered := sealedAt, resumedAt, assigned
+	sealedCount, got, at := whileSealed, append([]int64(nil), launched...), pollsAtLaunch
 	mu.Unlock()
 
-	if when != 1 || !delivered {
-		t.Fatalf("the fixture did not stage the window: sealed at poll %d, assignment "+
-			"delivered %v", when, delivered)
+	if sealed != 1 || resumed != 3 || !delivered {
+		t.Fatalf("the fixture did not stage the window: sealed at poll %d, resumed at "+
+			"poll %d, assignment delivered %v", sealed, resumed, delivered)
 	}
 
-	// THE JOB IS BACKED — the runner was asked to launch it. Declined, `assign`
-	// returns before anything reaches the runner.
-	mu.Lock()
-	got := append([]int64(nil), launched...)
-	mu.Unlock()
+	// NOTHING WHILE SEALED: buying a lease under the seal is exactly what the
+	// upgrade fence relies on never happening.
+	if sealedCount != 0 {
+		t.Errorf("launched %d runners while admission was sealed; a seal must refuse "+
+			"every new lease", sealedCount)
+	}
 
-	if !slices.Contains(got, 11) {
-		t.Errorf("a seal landing mid-poll declined an assignment GitHub had already made "+
-			"against capacity advertised before the seal; launched: %v", got)
+	// AND THE JOB RUNS once it reopens, rather than being dropped.
+	if len(got) == 0 {
+		t.Fatalf("the assignment never ran after admission reopened; a job GitHub " +
+			"assigned before the seal is delayed by it, never lost")
+	}
+
+	if at < resumed {
+		t.Errorf("the first launch happened during poll %d, before admission reopened "+
+			"at poll %d", at, resumed)
 	}
 }
 
@@ -961,24 +1002,17 @@ func TestTheSamePoolMemberIsRetiredWhenGitHubStopsCountingIt(t *testing.T) {
 //
 // This is the end-to-end property `billet drain --wait` rests on: nothing is
 // running, so nothing will ever finish, and reaching quiet has to come from the
-// listener handing back what it holds rather than from work completing.
+// listener holding nothing rather than from work completing.
 //
-// WHAT ACTUALLY MAKES IT TRUE, established by mutation rather than by reading:
-//
-//   - Handing back EVERY held lease. Trimming to targetCapacity instead — which
-//     keeps one discovery slot — leaves a capacity-phase lease the barrier
-//     counts, and Quiet() never becomes true. Killed this test.
-//   - Handing back at all. Killed this test.
-//
-// And what does NOT make it true, said out loud because both mutations SURVIVED
-// and it would be easy to claim otherwise: skipping prepareEscrow while
-// quiesced, and dropping the discovery slot from the advertisement. Neither is
-// load-bearing HERE, because alloc.Escrow refuses at the ledger while sealed, so
-// a refill cannot recreate escrow whether or not the loop attempts one, and an
-// advertisement is a number sent to GitHub rather than a lease. Both are still
-// right to keep — one stops billet asking for what it will be refused, the other
-// stops GitHub being told about capacity that is not there — but the guarantee
-// rests on the allocator, not on the loop remembering.
+// WHAT MAKES IT TRUE NOW is that an idle tier reserves nothing in the first
+// place (#140): there is no discovery escrow for the seal to have to take back,
+// and any escrow bought for an offer is handed back once no acquisition needs
+// it. The seal itself is enforced by the allocator, which refuses every new
+// lease while sealed, so a purchase cannot recreate escrow whether or not the
+// loop attempts one — the guarantee rests on the ledger, not on the loop
+// remembering. (An earlier version of this comment recorded mutation results
+// against the rotation-era loop, which kept one discovery slot; those results
+// no longer describe this code and have not been re-run against it.)
 //
 // OBSERVED WHILE THE LISTENER RUNS, not after. The shutdown drain releases
 // escrow too, so a sample taken after Run returns would report quiet whether or
@@ -1076,24 +1110,21 @@ func TestAnIdleSealedDeploymentReachesQuietWithoutAnotherJob(t *testing.T) {
 	}
 }
 
-// AN UNREADABLE ADMISSION STATE DECLINES OFFERS AND KEEPS WHAT IT HOLDS.
+// AN UNREADABLE ADMISSION STATE BUYS NOTHING.
 //
-// The two are different kinds of act and only one is fail-closed. REFUSING costs
-// a poll and cannot admit work billet is unable to back, so doing it on a failed
-// read is the safe direction. HANDING THE ESCROW BACK is premised on knowing the
-// deployment is sealed — which is exactly what just failed to be established —
-// and a listener that returns its escrow on a transient database blip hands the
-// gap to another tier and retakes it next poll, which is the flapping the escrow
-// exists to prevent.
+// Could-not-tell refuses new work: billet cannot establish that the deployment
+// is admitting, so it takes no lease for work it cannot prove it may start. This
+// used to be one half of a pair. The other half kept an idle escrow rather than
+// hand it back on a read that failed, and it went with idle escrow itself
+// (#140). What remains is the fail-closed half, and it now guards the one place
+// capacity is bought: the pool's purchase at launch.
 //
-// DRIVEN THROUGH Run, and that is the whole point of this version. The earlier
-// one called a helper that composed mark-and-release, with a comment claiming it
-// was "the composition the pre-poll site uses". A later change made the loop
-// mark and release in two steps and dropped the `known` bit between them — so
-// production released escrow on an unreadable read while this test stayed green,
-// because the helper it called was by then reachable from nothing but itself.
-// A test that names an invariant has to exercise the code that holds it.
-func TestAnUnreadableAdmissionStateKeepsTheEscrowItCannotJustify(t *testing.T) {
+// DRIVEN THROUGH Run, because a test that names an invariant has to exercise
+// the code that holds it; an earlier version of this test called a helper that
+// production had stopped reaching, and stayed green while the loop changed.
+// That the loop survives the failed read is
+// TestAnUnreadableAdmissionStateDoesNotStopTheLoop's.
+func TestAnUnreadableAdmissionStateBuysNothing(t *testing.T) {
 	tiers := []config.Tier{tier("billet-4vcpu-keephold")}
 	db := openState(t)
 
@@ -1107,14 +1138,14 @@ func TestAnUnreadableAdmissionStateKeepsTheEscrowItCannotJustify(t *testing.T) {
 	defer cancel()
 
 	var (
-		mu     sync.Mutex
-		polls  int
-		broke  bool
-		afterB []int
+		mu       sync.Mutex
+		polls    int
+		broke    bool
+		assigned bool
+		launched int
 	)
 
 	session := &fakeSession{}
-	l := NewListener(a, tiers[0].Label, session)
 
 	session.onPoll = func(int) {
 		mu.Lock()
@@ -1122,9 +1153,10 @@ func TestAnUnreadableAdmissionStateKeepsTheEscrowItCannotJustify(t *testing.T) {
 		count := polls
 		mu.Unlock()
 
-		// Escrow first, then break ONLY the admission read — the rest of the
+		// BROKEN BEFORE THE WORK ARRIVES, so every purchase that work asks for
+		// meets the failed read. Only the admission table goes; the rest of the
 		// ledger still answers, the way a timed-out read on a busy database does.
-		if count == 2 {
+		if count == 1 {
 			if err := db.Tx(context.WithoutCancel(ctx), func(tx *sql.Tx) error {
 				_, err := tx.ExecContext(context.WithoutCancel(ctx), `DROP TABLE admission`)
 
@@ -1136,23 +1168,39 @@ func TestAnUnreadableAdmissionStateKeepsTheEscrowItCannotJustify(t *testing.T) {
 			mu.Lock()
 			broke = true
 			mu.Unlock()
-
-			return
 		}
-
-		// Every poll after the break, record what is still held. These are full
-		// iterations: each one marked, polled, and reached the release decision.
-		mu.Lock()
-		if broke {
-			afterB = append(afterB, l.idleEscrow())
-		}
-		mu.Unlock()
 
 		if count >= 6 {
 			cancel()
 		}
 	}
-	session.onGet = func() (*Message, error) { return nil, ErrNoMessage }
+
+	session.onGet = func() (*Message, error) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		if !assigned {
+			assigned = true
+
+			return &Message{
+				MessageID:  1,
+				Statistics: &Statistics{TotalAssignedJobs: 1},
+				Assigned:   []Job{{RequestID: 11, RunID: 101}},
+			}, nil
+		}
+
+		return nil, ErrNoMessage
+	}
+
+	runner := &fakeRunner{onLaunch: func(int64) error {
+		mu.Lock()
+		launched++
+		mu.Unlock()
+
+		return nil
+	}}
+
+	l := NewListener(a, tiers[0].Label, session, WithRunner(runner), stopsWithoutWaiting())
 
 	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) &&
 		!errors.Is(err, context.DeadlineExceeded) {
@@ -1160,31 +1208,36 @@ func TestAnUnreadableAdmissionStateKeepsTheEscrowItCannotJustify(t *testing.T) {
 	}
 
 	mu.Lock()
-	held, brokeIt := append([]int(nil), afterB...), broke
+	brokeIt, delivered, n := broke, assigned, launched
 	mu.Unlock()
 
-	if !brokeIt || len(held) < 2 {
-		t.Fatalf("the fixture never completed a poll with an unreadable admission state "+
-			"(broke=%v, samples=%d)", brokeIt, len(held))
+	if !brokeIt || !delivered {
+		t.Fatalf("the fixture did not stage the window: broke=%v, assignment delivered=%v",
+			brokeIt, delivered)
 	}
 
-	// STILL HOLDING, on every poll after the read began failing. Handing it back
-	// is an action taken on a fact that was never established.
-	for i, n := range held {
-		if n == 0 {
-			t.Fatalf("the listener handed its escrow back on poll %d after a read that "+
-				"FAILED; that gap goes to another tier and is retaken next poll: %v",
-				i+1, held)
-		}
+	if n != 0 {
+		t.Errorf("launched %d runners while billet could not read whether the deployment "+
+			"admits work; could-not-tell must refuse, not buy", n)
 	}
 
-	// AND IT DECLINED, which is the fail-closed half and must still happen.
 	if !l.isQuiesced() {
 		t.Error("an unreadable admission state left the listener taking work")
 	}
 }
 
-func TestWithdrawingLowersTheNumberBeforeHandingTheEscrowBack(t *testing.T) {
+// AN IDLE TIER HOLDS NOTHING, EITHER SIDE OF A SEAL, AND THE SEAL WITHDRAWS ITS
+// ADVERTISEMENT.
+//
+// This replaces a test of the opposite rule: that a listener lowered its
+// advertisement BEFORE handing back the escrow behind it, so that GitHub's live
+// number never exceeded what billet could back. #140 retires that rule on
+// purpose — the advertisement is a steady ceiling nothing backs, and a job
+// assigned beyond what can run waits — so there is no escrow to order against.
+// What must still hold is that nothing is reserved for an idle tier at any
+// point, and that a seal withdraws the advertisement to committed work, so
+// GitHub assigns nothing new into a deployment that is not admitting.
+func TestAnIdleTierHoldsNothingAndASealWithdrawsItsAdvertisement(t *testing.T) {
 	tiers := []config.Tier{tier("billet-4vcpu-withdraw")}
 	db := openState(t)
 
@@ -1200,9 +1253,8 @@ func TestWithdrawingLowersTheNumberBeforeHandingTheEscrowBack(t *testing.T) {
 	var (
 		mu    sync.Mutex
 		polls int
-		// Each poll's advertised number paired with what was still held when it
-		// went out. The pairing is the point: a snapshot of either alone cannot
-		// show which came first.
+		// Each poll's advertised number paired with what was held when it went
+		// out, because "nothing is held" has to be true at every instant.
 		sent []struct{ advertised, held int }
 	)
 
@@ -1216,8 +1268,6 @@ func TestWithdrawingLowersTheNumberBeforeHandingTheEscrowBack(t *testing.T) {
 		sent = append(sent, struct{ advertised, held int }{capacity, l.idleEscrow()})
 		mu.Unlock()
 
-		// Sealed after the first poll has advertised the escrow, so there IS a
-		// live advertisement to withdraw.
 		if count == 1 {
 			if _, err := db.Seal(t.Context(), state.SealRequest{
 				Provenance: state.ProvenanceOperator, Actor: "ops",
@@ -1244,37 +1294,25 @@ func TestWithdrawingLowersTheNumberBeforeHandingTheEscrowBack(t *testing.T) {
 	if len(got) < 3 {
 		t.Fatalf("only %d polls; the fixture never reached a withdrawal", len(got))
 	}
-	if got[0].advertised == 0 {
-		t.Fatalf("the first poll advertised nothing, so there was no advertisement to "+
-			"withdraw: %+v", got)
+
+	// THE CEILING, before the seal: 16 vCPU of 4-vCPU shapes.
+	if got[0].advertised != 4 {
+		t.Errorf("the first poll advertised %d, want the tier's ceiling of 4: %+v",
+			got[0].advertised, got)
 	}
 
-	// THE POLL THAT FIRST CARRIES THE LOWER NUMBER STILL HOLDS THE ESCROW. That
-	// is the whole invariant: at no instant is GitHub's live number larger than
-	// what this listener can back.
-	var withdrew bool
-
-	for _, p := range got[1:] {
-		if p.advertised < got[0].advertised {
-			withdrew = true
-
-			if p.held == 0 {
-				t.Errorf("the escrow was handed back before, or in the same breath as, the "+
-					"poll that lowered the advertisement: %+v", got)
-			}
-
-			break
+	for i, p := range got {
+		if p.held != 0 {
+			t.Errorf("poll %d went out holding %d idle leases for a tier running nothing "+
+				"(#116): %+v", i+1, p.held, got)
 		}
 	}
 
-	if !withdrew {
-		t.Errorf("no poll ever advertised less than the first, so the seal never withdrew "+
-			"anything: %+v", got)
-	}
-
-	// AND IT DOES GO BACK, so this is a deferral rather than a leak.
-	if l.idleEscrow() != 0 {
-		t.Errorf("the listener still holds %d idle leases after several sealed polls",
-			l.idleEscrow())
+	// WITHDRAWN on the first poll after the seal is seen, and kept withdrawn.
+	for i, p := range got[1:] {
+		if p.advertised != 0 {
+			t.Errorf("poll %d advertised %d after the seal; a sealed deployment "+
+				"advertises committed work only: %+v", i+2, p.advertised, got)
+		}
 	}
 }

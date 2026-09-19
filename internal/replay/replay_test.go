@@ -85,12 +85,13 @@ func TestEveryTraceJobHasALedgerRow(t *testing.T) {
 		t.Fatalf("recorded %d jobs for a trace of %d", len(report.Records), len(trace.Arrivals))
 	}
 
-	// EVERY DISCOVERY CHARGE IS IN THE PROOF, including turns withdrawn without
-	// a job. Rotation can create many such rows per tier; counting only permanent
-	// slots would omit real charges from the overcommit sweep.
-	if report.EscrowRows < len(twoHosts(config.PlacementPack).Tiers) || len(report.escrows) != report.EscrowRows {
-		t.Errorf("counted %d escrow rows and swept %d; want at least one discovery turn per tier (%d)",
-			report.EscrowRows, len(report.escrows), len(twoHosts(config.PlacementPack).Tiers))
+	// NO LEASE WITHOUT A JOB (#140). Capacity is bought when a runner starts, so
+	// a trace whose every job ran leaves no row for a lease that never carried
+	// one; an idle reservation per tier is what v0.10.0 wasted (#116). Any such
+	// row would still be in the overcommit sweep, which is the second half.
+	if report.EscrowRows != 0 || len(report.escrows) != report.EscrowRows {
+		t.Errorf("counted %d escrow rows and swept %d; want none: a lease was held that "+
+			"never carried a job", report.EscrowRows, len(report.escrows))
 	}
 
 	for _, rec := range report.Records {

@@ -258,7 +258,6 @@ type Statistics struct {
 // Listener runs one tier's scale set.
 type Listener struct {
 	alloc   *alloc.Allocator
-	arbiter *discoveryArbiter
 	tier    string
 	session Session
 	log     *slog.Logger
@@ -402,11 +401,6 @@ type Listener struct {
 	// TotalAssignedJobs is the documented scaling signal; counting messages is
 	// not, because a response carries at most 50 and a large backlog is truncated.
 	observed *Statistics
-	// Poll-loop-owned demand hints. A source snapshot replaces the aggregate;
-	// accepted offers spend it so stale available statistics cannot pin a turn.
-	demandObservation *Statistics
-	claimedSinceStats int
-	waitingOffers     []actualJobIdentity
 
 	// Bounds somebody else's JOB rather than billet's own teardown, so it has its
 	// own ceiling. See maxDrainGrace.
@@ -1122,7 +1116,7 @@ func (l *Listener) Run(ctx context.Context) error {
 	l.observed = l.session.Statistics()
 	l.reportOrphanedBacklog()
 	if l.observed != nil {
-		if _, err := l.reconcilePool(ctx, l.observed.TotalAssignedJobs); err != nil {
+		if err := l.reconcilePool(ctx, l.observed.TotalAssignedJobs); err != nil {
 			return err
 		}
 	}
@@ -1221,24 +1215,14 @@ func (l *Listener) Run(ctx context.Context) error {
 		// same reason: the request arrives from another process, and a poll is how
 		// often this listener reconsiders everything else.
 		//
-		// BEFORE THE ESCROW IS TOPPED UP, so capacity the force returns is available
-		// to this poll rather than the next one.
+		// BEFORE THE POOL RECONCILES, so capacity the force returns is available to
+		// this poll's launches rather than the next one's.
 		//
 		// NOT GUARDED BY !draining. An operator who drained, waited, and gave up
 		// waiting is precisely who runs this, and refusing to act during a drain
 		// would leave them with no orderly way out of the state the drain put them
 		// in.
 		l.forceDestroy(pollCtx)
-
-		if !draining && !quiesced {
-			if err := l.prepareEscrow(pollCtx); err != nil {
-				if cancelledWhileServing(ctx, draining, err) {
-					continue
-				}
-
-				return stopping(ctx, err)
-			}
-		}
 
 		if !draining {
 			// RECONCILED EVEN WHILE QUIESCED, but to GITHUB'S OWN ASSIGNED COUNT
@@ -1275,7 +1259,7 @@ func (l *Listener) Run(ctx context.Context) error {
 			// waiting for. The seal under-delivers visibly rather than reporting a
 			// deployment quiesced that is not.
 			if l.observed != nil && !l.messageHeld() {
-				if err := l.reconcileAdmissionPool(pollCtx, l.observed.TotalAssignedJobs); err != nil {
+				if err := l.reconcilePool(pollCtx, l.observed.TotalAssignedJobs); err != nil {
 					// reconcilePool launches runners, which can take minutes; a
 					// cancellation landing mid-launch must enter the drain so the
 					// jobs already running finish, not stop the listener and have
@@ -1301,9 +1285,8 @@ func (l *Listener) Run(ctx context.Context) error {
 		advertised := l.committedCapacity()
 		withdrawnWhenSent := true
 
-		var admissionTurn uint64
 		if !draining && !quiesced {
-			advertised, admissionTurn = l.admissionPoll()
+			advertised = l.steadyAdvertisement()
 			withdrawnWhenSent = false
 		}
 		l.reportCapacity(pollCtx, &advertised, "in flight")
@@ -1314,11 +1297,7 @@ func (l *Listener) Run(ctx context.Context) error {
 			l.reportCapacity(context.WithoutCancel(pollCtx), nil, "ambiguous")
 		}
 
-		// AN EMPTY EXCHANGE CAN COMPLETE A DISCOVERY TURN. Its old backing stays
-		// until a subsequent exchange has carried the smaller advertisement;
-		// finishing the turn itself releases nothing.
 		if errors.Is(err, ErrNoMessage) {
-			l.finishAdmissionTurn(admissionTurn)
 			// BEFORE reconcilePool, and that ordering is load-bearing rather than
 			// tidy. This branch's reconcile is NOT guarded by `!draining` — unlike
 			// the pre-poll one — and it launches out of `held`: `assignPoolSlot`
@@ -1345,7 +1324,7 @@ func (l *Listener) Run(ctx context.Context) error {
 			l.handBackIdleEscrow(pollCtx, draining || (quiesced && admissionKnown))
 
 			if l.observed != nil && !l.messageHeld() {
-				if _, err := l.reconcilePool(pollCtx, l.observed.TotalAssignedJobs); err != nil {
+				if err := l.reconcilePool(pollCtx, l.observed.TotalAssignedJobs); err != nil {
 					// reconcilePool launches runners, which can take minutes; a
 					// cancellation landing mid-launch must enter the drain so the
 					// jobs already running finish, not stop the listener and have
@@ -1361,8 +1340,12 @@ func (l *Listener) Run(ctx context.Context) error {
 					return stopping(ctx, err)
 				}
 			}
+			// THE ADVERTISEMENT IS NOT A FLOOR UNDER THE ESCROW ANY MORE. It is a
+			// steady ceiling that nothing backs (steadyAdvertisement), so keeping
+			// escrow up to it would hold idle capacity forever — #116 again. What
+			// is kept is what is committed; a runner buys its own lease at launch.
 			if !draining && !quiesced {
-				l.releaseIdleEscrowAbove(pollCtx, max(advertised, l.targetCapacity()))
+				l.releaseIdleEscrowAbove(pollCtx, l.targetCapacity())
 			}
 			l.reportCapacity(pollCtx, nil, "")
 
@@ -1392,9 +1375,10 @@ func (l *Listener) Run(ctx context.Context) error {
 		// message.
 		quiesced, admissionKnown = l.markAdmission(pollCtx)
 
-		if !draining && !quiesced && l.arbiter == nil {
-			l.releaseIdleEscrowAbove(pollCtx,
-				max(advertised, l.messageCapacityTarget(msg)))
+		// Kept: what this message's offers and assignments can consume, and no
+		// more — the advertisement backs nothing (see the empty-exchange branch).
+		if !draining && !quiesced {
+			l.releaseIdleEscrowAbove(pollCtx, l.messageCapacityTarget(msg))
 		}
 
 		handled := l.handle(pollCtx, msg)
@@ -1454,11 +1438,6 @@ func (l *Listener) Run(ctx context.Context) error {
 					"error", poison)
 				poisonMessageID = 0
 				poisonRefusals = 0
-				// A QUARANTINED MESSAGE IS A HANDLED EXCHANGE, and ends its turn as
-				// every other handled exchange does. Skipping this let a stream of
-				// poisoned messages hold the shared admission turn indefinitely,
-				// refusing every waiting tier's purchase.
-				l.finishAdmissionTurn(admissionTurn)
 
 				continue
 			}
@@ -1476,9 +1455,8 @@ func (l *Listener) Run(ctx context.Context) error {
 
 		poisonMessageID = 0
 		poisonRefusals = 0
-		l.finishAdmissionTurn(admissionTurn)
 		if !draining {
-			l.releaseIdleEscrowAbove(pollCtx, max(advertised, l.targetCapacity()))
+			l.releaseIdleEscrowAbove(pollCtx, l.targetCapacity())
 		}
 		l.reportCapacity(pollCtx, nil, "")
 	}
@@ -1798,10 +1776,9 @@ func (l *Listener) releaseIdleEscrowAbove(ctx context.Context, target int) {
 	}
 
 	if released > 0 {
-		l.log.Info("released idle escrow above this tier's assigned demand",
+		l.log.Info("released escrow this tier held beyond its committed work",
 			"tier", l.tier, "released", released, "target_capacity", target)
 	}
-	l.observeDemand(l.observed)
 }
 
 // isDraining reports whether this listener has been asked to stop and is
@@ -1919,58 +1896,71 @@ func (l *Listener) committedCapacity() int {
 	return len(l.releasing) + len(l.acquiring) + len(l.running) + len(l.adopted)
 }
 
-// advertisedCapacity may be lower than capacity while a shrink is pending. The
-// surplus remains escrowed until GetMessage returns after sending this lower
-// value, so GitHub and the allocator never disagree about who may use it.
-func (l *Listener) advertisedCapacity() int {
-	return min(l.capacity(), l.targetCapacity())
-}
-
-// targetCapacity includes a backed discovery turn when arbitration permits it.
+// steadyAdvertisement is what this tier tells GitHub it can run at once: its
+// configured ceiling, never less than the work it already has, and never more
+// than a configured maxCapacity (AdvertiseNothing sets that to zero).
 //
-// ZERO-CAPACITY DISCOVERY IS UNMEASURED. Keep the slot, but share its turn rather
-// than granting every catalogue entry a permanent claim on execution capacity.
-func (l *Listener) targetCapacity() int {
-	return l.targetCapacityFor(l.observed, 0)
+// UNBACKED, DELIBERATELY, and this reverses the rule this listener was built on.
+// Billet used to advertise only what it had already escrowed, so a tier that
+// held nothing advertised zero — and GitHub.com assigns work only to a scale set
+// that is advertising, and tells one advertising zero nothing at all. Holding
+// one escrow per tier forever wasted most of a fleet (#116); passing one escrow
+// between tiers left each advertising for one poll in eighteen minutes, and a
+// job queued against an idle tier went unassigned for over four hours (#140).
+//
+// So every tier advertises what it could run, all the time, and the escrow is
+// bought when a runner is launched instead (reconcilePool). A job GitHub assigns
+// beyond what can run now waits, assigned, until a lease can be bought for it;
+// the allocator's atomic purchase is what stops an overcommit, exactly as it
+// always was.
+//
+// COULD-NOT-TELL ADVERTISES ONLY WHAT IS COMMITTED: a ceiling that cannot be
+// read is not a licence to claim capacity.
+func (l *Listener) steadyAdvertisement() int {
+	advertised := l.committedCapacity()
+
+	if l.alloc != nil {
+		ceiling, err := l.alloc.AdvertisedCeiling(l.tier)
+		if err != nil {
+			l.log.Error("could not read this tier's advertised ceiling; advertising only the "+
+				"work it already has", "tier", l.tier, "error", err)
+		} else {
+			advertised = max(advertised, ceiling)
+		}
+	}
+
+	if l.maxCapacity != nil {
+		advertised = min(advertised, *l.maxCapacity)
+	}
+
+	return max(advertised, 0)
 }
 
-func (l *Listener) targetCapacityFor(observed *Statistics, offered int) int {
-	if l.arbiter != nil {
-		target := l.committedCapacity()
-		if l.arbiter.permits(l.tier) && target < math.MaxInt {
-			target++
-		}
-		if l.maxCapacity != nil {
-			target = min(target, *l.maxCapacity)
-		}
+// targetCapacity is the escrow this listener should hold with nothing in hand:
+// exactly what is committed. There is no idle escrow to keep; see
+// steadyAdvertisement.
+func (l *Listener) targetCapacity() int {
+	return l.targetCapacityFor(0)
+}
 
-		return max(target, 0)
-	}
-	desired := 0
-	if observed != nil && observed.TotalAssignedJobs > 0 {
-		desired = observed.TotalAssignedJobs
-	}
+// targetCapacityFor is the escrow needed to back what is committed plus
+// `offered` more acquisitions, which is only ever the offer path's own need.
+// Work GitHub has already assigned is backed when its runner is launched, not
+// in advance.
+func (l *Listener) targetCapacityFor(offered int) int {
 	l.mu.Lock()
 	active := len(l.acquiring) + len(l.running) + len(l.adopted)
 	l.mu.Unlock()
-	if offered > math.MaxInt-active {
-		desired = math.MaxInt
-	} else {
-		desired = max(desired, active+offered)
-	}
 
-	target := desired
-	if target < math.MaxInt {
-		target++
+	target := math.MaxInt
+	if offered <= math.MaxInt-active {
+		target = active + offered
 	}
 	if l.maxCapacity != nil && target > *l.maxCapacity {
 		target = *l.maxCapacity
 	}
-	if target < 0 {
-		return 0
-	}
 
-	return target
+	return max(target, 0)
 }
 
 // messageCapacityTarget is what the returned response can consume before any
@@ -1985,12 +1975,8 @@ func (l *Listener) messageCapacityTarget(msg *Message) int {
 	} else {
 		work += len(msg.Assigned)
 	}
-	observed := l.observed
-	if msg.Statistics != nil {
-		observed = msg.Statistics
-	}
 
-	return l.targetCapacityFor(observed, work)
+	return l.targetCapacityFor(work)
 }
 
 func (l *Listener) refreshAdoptedCapacity(ctx context.Context) error {
@@ -2938,29 +2924,16 @@ func (l *Listener) renew(ctx context.Context, lease *alloc.Lease) renewal {
 	return renewalUnknown
 }
 
-// refillEscrow tops the escrow up to what this tier could use.
-//
-// Escrow returns what it could actually give, which may be nothing when another
-// tier holds the capacity. Advertising zero is a correct answer: it tells GitHub
-// to assign this tier no work, which is exactly true.
+// refillEscrow buys as much escrow as the fleet has room for, up to a configured
+// maxCapacity. Nothing in production calls it: capacity is bought per offer in
+// handle and per launch in backPoolSlot (#140). It stages a listener holding
+// escrow for a test.
 func (l *Listener) refillEscrow(ctx context.Context) error {
 	return l.refillEscrowTo(ctx, math.MaxInt)
 }
 
-// prepareEscrow fills ordinary polling only as far as its admission turn allows.
-// A standalone listener retains the single-tier demand-plus-discovery policy.
-// SURPLUS STAYS BACKED UNTIL THE LOWER EXCHANGE IS HANDLED. Releasing first would
-// let another tier claim capacity GitHub could still assign against here.
-func (l *Listener) prepareEscrow(ctx context.Context) error {
-	l.observeDemand(l.observed)
-	return l.refillEscrowTo(ctx, l.targetCapacity())
-}
-
+// refillEscrowTo tops escrow up to target, as far as the allocator has room.
 func (l *Listener) refillEscrowTo(ctx context.Context, target int) error {
-	if l.arbiter != nil {
-		return l.arbitrateEscrow(ctx, target)
-	}
-
 	return l.refillEscrowUngated(ctx, target, math.MaxInt)
 }
 
@@ -3166,8 +3139,6 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 		l.complete(ctx, job)
 	}
 
-	l.rememberAvailable(msg, resolved)
-
 	// A zero advertisement is not the same as refusing work, and this is where
 	// the difference is enforced.
 	//
@@ -3218,11 +3189,6 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 	// stop a queued message arriving or an unacknowledged one being redelivered,
 	// and either would otherwise be acquired against escrow the refill takes
 	// straight back.
-	observedDemand := l.observed
-	if msg.Statistics != nil {
-		observedDemand = msg.Statistics
-	}
-	l.observeDemand(observedDemand)
 	switch {
 	case l.isDraining() || l.isQuiesced():
 		if len(msg.Available) > 0 {
@@ -3230,22 +3196,12 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 				"tier", l.tier, "available", len(msg.Available),
 				"reason", refusalReason(l.isDraining()))
 		}
-	case l.arbiter != nil && !l.arbiter.permits(l.tier):
-		if len(msg.Available) > 0 {
-			l.log.Info("deferring an offer to another tier's admission turn",
-				"tier", l.tier, "available", len(msg.Available))
-		}
 	default:
-		// THE SAME ARBITRATION GATES OFFERS AND POLLS. A refill here cannot
-		// bypass the tier waiting for returning headroom, and only real escrow
-		// can back an acquisition.
+		// ONLY REAL ESCROW CAN BACK AN ACQUISITION, and it is bought here, for
+		// exactly the offers in hand: the allocator's atomic purchase decides
+		// whether there is room, and what it refuses is not acquired.
 		if len(msg.Available) > 0 {
-			observed := l.observed
-			if msg.Statistics != nil {
-				observed = msg.Statistics
-			}
-			if err := l.refillEscrowTo(ctx,
-				l.targetCapacityFor(observed, len(msg.Available))); err != nil {
+			if err := l.refillEscrowTo(ctx, l.targetCapacityFor(len(msg.Available))); err != nil {
 				return err
 			}
 		}
@@ -3285,6 +3241,10 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 			continue
 		}
 
+		if err := l.backAssignment(ctx, job.RequestID); err != nil {
+			return err
+		}
+
 		lease, needsCompute, err := l.assignResolved(ctx, *entry)
 		if err != nil {
 			return err
@@ -3308,7 +3268,7 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 	// earlier hold blocks reconciliation until this message is acknowledged.
 	if msg.Statistics != nil && len(resolved.held) == 0 {
 		l.observed = msg.Statistics
-		if _, err := l.reconcilePool(ctx, msg.Statistics.TotalAssignedJobs); err != nil {
+		if err := l.reconcilePool(ctx, msg.Statistics.TotalAssignedJobs); err != nil {
 			return err
 		}
 	}
@@ -3400,20 +3360,20 @@ func (l *Listener) quarantineStarted(ctx context.Context, job Job, cause error) 
 // Growth creates anonymous physical members because individual job entries are
 // lifecycle data and may be truncated. Only idle members are selected for
 // shrinkage; a busy member belongs to a job regardless of what any aggregate
-// says while messages are in flight. Reports whether growth took held backing.
-func (l *Listener) reconcilePool(ctx context.Context, desired int) (bool, error) {
+// says while messages are in flight.
+func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 	if l.messageHeld() {
-		return false, nil
+		return nil
 	}
 	if l.beforePoolReconcile != nil {
 		l.beforePoolReconcile()
 	}
 	if l.alloc == nil || desired < 0 {
-		return false, nil
+		return nil
 	}
 	runners, err := l.alloc.PoolRunners(ctx, l.tier)
 	if err != nil {
-		return false, fmt.Errorf("server: read runner pool for %s reconciliation: %w", l.tier, err)
+		return fmt.Errorf("server: read runner pool for %s reconciliation: %w", l.tier, err)
 	}
 
 	for i := range runners {
@@ -3424,30 +3384,31 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) (bool, error)
 
 	runners, err = l.alloc.PoolRunners(ctx, l.tier)
 	if err != nil {
-		return false, fmt.Errorf("server: refresh runner pool for %s reconciliation: %w", l.tier, err)
+		return fmt.Errorf("server: refresh runner pool for %s reconciliation: %w", l.tier, err)
 	}
 	active, err := l.alloc.ActiveRunnerLeases(ctx, l.tier)
 	if err != nil {
-		return false, fmt.Errorf("server: count active runner leases for %s reconciliation: %w", l.tier, err)
+		return fmt.Errorf("server: count active runner leases for %s reconciliation: %w", l.tier, err)
 	}
-	consumed := false
 	for active < desired {
-		lease, job, held, err := l.assignPoolSlot(ctx)
+		if err := l.backPoolSlot(ctx); err != nil {
+			return err
+		}
+		lease, job, err := l.assignPoolSlot(ctx)
 		if err != nil {
-			return consumed, err
+			return err
 		}
 		if lease == nil {
 			break
 		}
-		consumed = consumed || held
 		if err := l.launch(ctx, lease, job); err != nil {
-			return consumed, err
+			return err
 		}
 		active++
 	}
 	surplus := active - desired
 	if surplus <= 0 {
-		return consumed, nil
+		return nil
 	}
 	for i := range runners {
 		if surplus == 0 {
@@ -3466,7 +3427,61 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) (bool, error)
 		surplus--
 	}
 
-	return consumed, nil
+	return nil
+}
+
+// backPoolSlot buys the one lease the next pool member needs, at the moment it
+// is needed, when nothing is already set aside for it.
+//
+// THIS IS WHERE CAPACITY IS RESERVED NOW, instead of in advance of an
+// advertisement (steadyAdvertisement). The purchase is the allocator's ordinary
+// atomic Escrow, so the ceiling, per-node fit, floors, max_concurrent, macOS
+// slots and the admission seal all still decide it; a full or sealed fleet buys
+// nothing, and the assigned job waits at GitHub until a later reconciliation
+// can. ONE AT A TIME, because the loop that calls this launches what it buys
+// before asking for another, so a burst of assignments never holds more than
+// one lease it has not yet started.
+//
+// NOT WHILE DRAINING. A drain waits for the work it has and takes no more, and
+// the drain-time reconciliation still runs; buying here would start a runner
+// after the drain began, which it could only then destroy.
+func (l *Listener) backPoolSlot(ctx context.Context) error {
+	if l.isDraining() {
+		return nil
+	}
+
+	l.mu.Lock()
+	ready := len(l.acquiring) > 0 || len(l.held) > 0
+	l.mu.Unlock()
+
+	if ready {
+		return nil
+	}
+
+	return l.refillEscrowUngated(ctx, l.capacity()+1, 1)
+}
+
+// backAssignment buys one lease for an assignment this listener holds no promise
+// for, when no idle lease is held to take it: GitHub can assign a request after a
+// restart, or one a control plane that is gone acquired. A lease bought for a job
+// whose promise sits under another alias is idle afterwards, and the release after
+// the message hands it back. Not while draining, for backPoolSlot's reason.
+func (l *Listener) backAssignment(ctx context.Context, requestID int64) error {
+	if l.isDraining() {
+		return nil
+	}
+
+	l.mu.Lock()
+	_, promised := l.acquiring[requestID]
+	_, running := l.running[requestID]
+	ready := promised || running || len(l.held) > 0
+	l.mu.Unlock()
+
+	if ready {
+		return nil
+	}
+
+	return l.refillEscrowUngated(ctx, l.capacity()+1, 1)
 }
 
 func (l *Listener) activePoolMembers(ctx context.Context) (int, error) {
@@ -3480,8 +3495,7 @@ func (l *Listener) activePoolMembers(ctx context.Context) (int, error) {
 
 // assignPoolSlot turns one escrowed lease into a physical runner whose durable
 // identity is the lease rather than one entry from GitHub's truncated message.
-// Reports whether it took held backing rather than an existing promise.
-func (l *Listener) assignPoolSlot(ctx context.Context) (*alloc.Lease, Job, bool, error) {
+func (l *Listener) assignPoolSlot(ctx context.Context) (*alloc.Lease, Job, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -3499,17 +3513,17 @@ func (l *Listener) assignPoolSlot(ctx context.Context) (*alloc.Lease, Job, bool,
 	fromPromise := lease != nil
 	if !fromPromise {
 		if len(l.held) == 0 {
-			return nil, Job{}, false, nil
+			return nil, Job{}, nil
 		}
 		lease = l.held[0]
 	}
 
 	requestID, err := l.alloc.IdentifyPoolSlot(ctx, lease.ID)
 	if err != nil {
-		return nil, Job{}, false, fmt.Errorf("server: identify pool slot for lease %s: %w", lease.ID, err)
+		return nil, Job{}, fmt.Errorf("server: identify pool slot for lease %s: %w", lease.ID, err)
 	}
 	if err := l.alloc.Assign(ctx, lease.ID, lease.Epoch, 0, requestID); err != nil {
-		return nil, Job{}, false, fmt.Errorf("server: assign pool slot lease %s: %w", lease.ID, err)
+		return nil, Job{}, fmt.Errorf("server: assign pool slot lease %s: %w", lease.ID, err)
 	}
 
 	if fromPromise {
@@ -3520,7 +3534,7 @@ func (l *Listener) assignPoolSlot(ctx context.Context) (*alloc.Lease, Job, bool,
 	delete(l.heldOrder, lease.ID)
 	l.running[requestID] = lease
 
-	return lease, Job{RequestID: requestID}, !fromPromise, nil
+	return lease, Job{RequestID: requestID}, nil
 }
 
 // retirePoolMember removes routing before compute, then returns its capacity.
@@ -3758,14 +3772,12 @@ func (l *Listener) acquireUnfinished(ctx context.Context, available []resolvedJo
 			continue
 		}
 		if containsActual(finished, entry.actual) || containsActual(committed, entry.actual) {
-			l.forgetAvailable(entry.actual)
 			continue
 		}
 		eligible = append(eligible, *entry)
 	}
 	protocolFor := make(map[int64]int64, len(available))
 	internalFor := make(map[int64]int64, len(available))
-	offerFor := make(map[int64]actualJobIdentity, len(available))
 	for i := range eligible {
 		entry := &eligible[i]
 		protocolID := entry.protocolID
@@ -3776,7 +3788,6 @@ func (l *Listener) acquireUnfinished(ctx context.Context, available []resolvedJo
 				ErrUntrustworthySession, l.tier, prior, job.RequestID, protocolID)
 		}
 		internalFor[protocolID] = job.RequestID
-		offerFor[protocolID] = entry.actual
 	}
 	// Validate every wire offer before coalescing acquisition representatives.
 	identified := make([]resolvedJob, 0, len(eligible))
@@ -3792,22 +3803,9 @@ func (l *Listener) acquireUnfinished(ctx context.Context, available []resolvedJo
 	}
 	for i := range identified {
 		protocolFor[identified[i].job.RequestID] = identified[i].protocolID
-		offerFor[identified[i].protocolID] = identified[i].actual
 	}
 
-	// THE TURN MUST STILL BELONG TO THIS TIER WHEN ESCROW BECOMES A PROMISE.
-	// Another listener can establish demand after the handler's offer guard;
-	// a stale permission must not spend the backing it is waiting to receive.
-	var reservedInternal []int64
-	if l.arbiter == nil {
-		reservedInternal = l.reserve(identified)
-	} else {
-		l.arbiter.mu.Lock()
-		if l.arbiter.owner == l.tier {
-			reservedInternal = l.reserve(identified)
-		}
-		l.arbiter.mu.Unlock()
-	}
+	reservedInternal := l.reserve(identified)
 	l.reportCapacity(ctx, nil, "")
 	if len(reservedInternal) == 0 {
 		return nil
@@ -3859,10 +3857,6 @@ func (l *Listener) acquireUnfinished(ctx context.Context, available []resolvedJo
 		acquiredInternal = append(acquiredInternal, internalFor[protocolID])
 	}
 	l.unreserve(missing(reservedInternal, acquiredInternal))
-	for _, id := range acquiredProtocol {
-		l.forgetAvailable(offerFor[id])
-	}
-	l.claimedSinceStats += len(acquiredProtocol)
 
 	return nil
 }

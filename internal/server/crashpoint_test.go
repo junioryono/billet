@@ -224,8 +224,8 @@ func TestARestartAtEveryBoundaryLeavesOneObligationOrNone(t *testing.T) {
 			l := NewListener(f.alloc, f.tiers[0].Label, session, WithRunner(f.runner()),
 				WithDrainGrace(notDrainingHere), stopsWithoutWaiting())
 
-			if err := l.prepareEscrow(t.Context()); err != nil {
-				t.Fatalf("prepare escrow: %v", err)
+			if err := l.refillEscrowTo(t.Context(), l.targetCapacityFor(1)); err != nil {
+				t.Fatalf("buy the escrow one offer needs: %v", err)
 			}
 
 			tc.drive(t, f, l, session)
@@ -262,8 +262,8 @@ func TestASuccessorDoesNotRelaunchAJobAlreadyRunning(t *testing.T) {
 	first := NewListener(f.alloc, f.tiers[0].Label, &fakeSession{}, WithRunner(f.runner()),
 		WithDrainGrace(notDrainingHere), stopsWithoutWaiting())
 
-	if err := first.prepareEscrow(t.Context()); err != nil {
-		t.Fatalf("prepare escrow: %v", err)
+	if err := first.refillEscrowTo(t.Context(), first.targetCapacityFor(1)); err != nil {
+		t.Fatalf("buy the escrow one offer needs: %v", err)
 	}
 
 	if err := first.acquire(t.Context(), []Job{{RequestID: requestID}}); err != nil {
@@ -323,8 +323,8 @@ func TestACrashLeavesRunningCapacityCharged(t *testing.T) {
 	l := NewListener(f.alloc, f.tiers[0].Label, &fakeSession{}, WithRunner(f.runner()),
 		WithDrainGrace(notDrainingHere), stopsWithoutWaiting())
 
-	if err := l.prepareEscrow(t.Context()); err != nil {
-		t.Fatalf("prepare escrow: %v", err)
+	if err := l.refillEscrowTo(t.Context(), l.targetCapacityFor(1)); err != nil {
+		t.Fatalf("buy the escrow one offer needs: %v", err)
 	}
 
 	if err := l.acquire(t.Context(), []Job{{RequestID: requestID}}); err != nil {
@@ -372,8 +372,8 @@ func TestACrashDuringAnAmbiguousLaunchKeepsTheObligation(t *testing.T) {
 	l := NewListener(f.alloc, f.tiers[0].Label, &fakeSession{}, WithRunner(f.runner()),
 		WithDrainGrace(notDrainingHere), stopsWithoutWaiting())
 
-	if err := l.prepareEscrow(t.Context()); err != nil {
-		t.Fatalf("prepare escrow: %v", err)
+	if err := l.refillEscrowTo(t.Context(), l.targetCapacityFor(1)); err != nil {
+		t.Fatalf("buy the escrow one offer needs: %v", err)
 	}
 
 	if err := l.acquire(t.Context(), []Job{{RequestID: requestID}}); err != nil {
@@ -425,8 +425,8 @@ func TestACrashLeavesEscrowForTheReaperRatherThanReleasingIt(t *testing.T) {
 	l := NewListener(f.alloc, f.tiers[0].Label, &fakeSession{}, WithRunner(f.runner()),
 		WithDrainGrace(notDrainingHere), stopsWithoutWaiting())
 
-	if err := l.prepareEscrow(t.Context()); err != nil {
-		t.Fatalf("prepare escrow: %v", err)
+	if err := l.refillEscrowTo(t.Context(), l.targetCapacityFor(1)); err != nil {
+		t.Fatalf("buy the escrow one offer needs: %v", err)
 	}
 
 	before := f.escrowed(t)

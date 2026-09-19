@@ -99,11 +99,11 @@ type Report struct {
 	// verdict over such a ledger is provisional rather than final.
 	Unfinished []int64
 	// EscrowRows counts history rows for leases that were never assigned a job:
-	// the discovery slots released at shutdown. Reported so a reader can tell
-	// them from a missing job.
+	// capacity bought for an offer or a launch that did not use it. Reported so a
+	// reader can tell them from a missing job.
 	EscrowRows int
 	// escrows are those rows' charges, kept out of the job records and in the
-	// capacity proof: a discovery slot is charged to its host like any lease.
+	// capacity proof: an unused lease is charged to its host like any other.
 	escrows []charge
 	// Violations are the overcommits the ledger's charges prove: a host or the
 	// deployment charged more than it has, at some instant.
@@ -123,7 +123,7 @@ type charge struct {
 func (c charge) open() bool { return c.to.IsZero() }
 
 // historyBound is how many extra rows beyond the trace the read allows for:
-// the discovery escrows every tier holds and releases over a replay. The query
+// leases bought over a replay that never carried a job. The query
 // is bounded, so a read that fills the bound is refused rather than trusted, a
 // truncated history being a smaller ledger that proves less than it seems to.
 const historyBound = 4096

@@ -125,20 +125,15 @@ func Run(t *testing.T, fleet Fleet, trace Trace, opts Options) *Report {
 		actions.deliver(ev)
 		settle(describe(ev))
 
-		// DONORS MUST POLL TOO WHEN ANY WORK WAITS. A positive advertisement may
-		// back idle discovery that arbitration has asked to withdraw. Waking only
-		// starved tiers would park the donor forever while its peer waits for the
-		// lower exchange to release that backing. Poll order stays deterministic;
-		// the real arbiter decides who may buy the returning capacity.
+		// EVERY TIER POLLS WHEN ANY WORK WAITS, in the fleet's order, so which
+		// waiting tier buys returning capacity is deterministic per trace.
 		//
-		// UNTIL A PASS CHANGES NOTHING. A tier nudged while it advertised nothing
-		// uses that poll to escrow the room it can now see and advertise it; the
-		// offer it could take comes on a poll after that, which is the next pass.
-		// One pass would leave such a tier holding escrow and never offered its
-		// backlog, and if this was the trace's last event, those jobs would never
-		// run. A pass that acquires nothing and changes no advertisement is the
-		// end, so a tier that declines its offer every time is not offered it
-		// forever.
+		// UNTIL A PASS CHANGES NOTHING. A tier whose purchase was refused on one
+		// pass buys the room freed by another tier's release on a later one. One
+		// pass would leave such a tier's backlog waiting, and if this was the
+		// trace's last event, those jobs would never run. A pass that acquires
+		// nothing and changes no advertisement is the end, so a tier that
+		// declines its offer every time is not offered it forever.
 		for changed := true; changed; {
 			changed = false
 
