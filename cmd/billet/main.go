@@ -624,8 +624,14 @@ func runServer(
 	// EVERYTHING AUTHORITATIVE IS BELOW THIS LINE, and that is the whole of the
 	// standby design. There is no second implementation of a control plane: a
 	// standby is this same function, stopped here until it can go on.
+	// A STOP WHILE THIS HOST IS STILL TRYING IS A STOP, NOT A FAILURE. See
+	// stoppedBeforeTheClaim: exiting non-zero here left systemd holding a failed
+	// unit for a standby that was asked to stop, and `billet server retire`
+	// refuses to act against one.
 	if err := becomeController(ctx, cfg, db, deployment, standby); err != nil {
-		return err
+		// THE FENCE IS READ AFTER THE ATTEMPT, not beside it: the claim's own
+		// write is one a successor can refuse.
+		return stoppedBeforeTheClaim(ctx, db.LeadershipLost(), err)
 	}
 
 	// AND A LOST CLAIM STOPS THEM THE SAME WAY, WHICH IS THE HALF THAT REFUSING A

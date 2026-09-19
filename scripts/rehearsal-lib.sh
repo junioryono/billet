@@ -462,16 +462,60 @@ rehearsal_journal_step() {
 
 # rehearsal_teardown_hosts removes the containers, the network and the storage
 # a rehearsal created. Registered on EXIT by every driver, so a failed
-# assertion still leaves nothing running.
+# assertion still leaves nothing running. Returns non-zero, having named each
+# one on stderr, when something it was asked to remove is still there: a
+# removal that failed is not a removal that was not needed, and a driver that
+# reads the status can refuse to call such a run green.
 rehearsal_teardown_hosts() {
     local network=$1 storage=$2
     shift 2
-    local name
+    local name left=0
 
     for name in "$@"; do
-        docker rm -f "${name}" >/dev/null 2>&1 || true
+        # -v REMOVES THE ANONYMOUS VOLUMES the image declared, which `docker rm
+        # -f` alone leaves behind: the PostgreSQL image declares
+        # /var/lib/postgresql, so every promotion and retirement run leaked a
+        # database's storage. Bind mounts are not volumes and it does not touch
+        # them.
+        if ! docker rm -f -v "${name}" >/dev/null 2>&1; then
+            # A removal of a container that was never created fails too, so the
+            # survivor is what decides, never the removal's own status.
+            if docker container inspect "${name}" >/dev/null 2>&1; then
+                echo "TEARDOWN: container ${name} survived removal" >&2
+                left=1
+            fi
+        fi
     done
 
-    docker network rm "${network}" >/dev/null 2>&1 || true
-    rm -rf "${storage}" || true
+    if ! docker network rm "${network}" >/dev/null 2>&1; then
+        if docker network inspect "${network}" >/dev/null 2>&1; then
+            echo "TEARDOWN: network ${network} survived removal" >&2
+            left=1
+        fi
+    fi
+
+    # THE SNAPSHOT STORAGE IS ROOT'S, WRITTEN FROM INSIDE A PRIVILEGED
+    # CONTAINER, so the account that ran the rehearsal cannot remove it and
+    # `rm -rf` fails with permission denied on every run that started a node
+    # (measured on a GitHub runner, 2026-09-19). Emptying it as root in a
+    # throwaway container of the image the hosts already pulled costs no further
+    # download; the directory itself is this account's, from mktemp, so the
+    # second removal is an ordinary one. Only a directory that survives BOTH is
+    # a leak worth a verdict.
+    if [ -n "${storage}" ] && [ -e "${storage}" ]; then
+        rm -rf "${storage}" >/dev/null 2>&1
+    fi
+
+    if [ -n "${storage}" ] && [ -e "${storage}" ]; then
+        docker run --rm -v "${storage}:/storage" ubuntu:24.04 \
+            find /storage -mindepth 1 -delete >/dev/null 2>&1
+        rm -rf "${storage}" >/dev/null 2>&1
+    fi
+
+    if [ -n "${storage}" ] && [ -e "${storage}" ]; then
+        echo "TEARDOWN: storage ${storage} survived removal" >&2
+        left=1
+    fi
+
+    return "${left}"
 }
