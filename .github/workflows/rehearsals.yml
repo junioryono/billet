@@ -1,9 +1,10 @@
 name: Host rehearsals
 
-# THE FOUR PATHS THAT WERE PROVED ONLY AGAINST FAKES, run on packaged hosts under
+# THE FIVE PATHS THAT WERE PROVED ONLY AGAINST FAKES, run on packaged hosts under
 # real systemd: a rollout from one published release to the next with a rollback,
 # `billet local recover` over a deployment a real control plane served, a CA
-# rotation across nodes that renew, and a PostgreSQL promotion under a partition.
+# rotation across nodes that renew, a PostgreSQL promotion under a partition,
+# and a controller retirement retaining its node.
 # scripts/*-rehearsal.sh hold the scenarios; docs/reference/records/host-rehearsals.md
 # holds what they measured.
 #
@@ -27,7 +28,7 @@ on:
         required: false
         default: all
         type: choice
-        options: [all, rollout, recover, ca-rotation, promotion]
+        options: [all, rollout, recover, ca-rotation, promotion, retirement]
   schedule:
     - cron: "0 5 * * 2"
 
@@ -149,3 +150,7 @@ jobs:
       - name: Promotion rehearsal
         if: always() && (inputs.only == 'all' || inputs.only == 'promotion' || inputs.only == '')
         run: make promotion-rehearsal
+
+      - name: Retirement rehearsal
+        if: always() && (inputs.only == 'all' || inputs.only == 'retirement' || inputs.only == '')
+        run: make retirement-rehearsal

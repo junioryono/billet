@@ -446,7 +446,7 @@ postgres-restore-rehearsal: dist ## Rehearse a restore of a deployment whose led
 
 # THE REAL-HOST REHEARSALS. Each drives a path that was proved only against a
 # fake onto packaged hosts under real systemd in throwaway containers, and
-# asserts on what the hosts hold afterwards (scripts/rehearsal-lib.sh). All four
+# asserts on what the hosts hold afterwards (scripts/rehearsal-lib.sh). All five
 # need a config with a working GitHub App (BILLET_REHEARSAL_APP_CONFIG) and the
 # key it names (BILLET_REHEARSAL_APP_KEY), because a control plane will not start
 # without one; they SKIP rather than fail without it. Outside `check` for that
@@ -471,6 +471,10 @@ ca-rotation-rehearsal: dist ## Rotate and retire the node-wire authority across 
 .PHONY: promotion-rehearsal
 promotion-rehearsal: dist ## Partition the active PostgreSQL controller and measure the standby's promotion
 	scripts/promotion-rehearsal.sh
+
+.PHONY: retirement-rehearsal
+retirement-rehearsal: dist ## Retire a packaged PostgreSQL controller while retaining its node on the survivor
+	scripts/retirement-rehearsal.sh
 
 .PHONY: systemd-lifecycle
 systemd-lifecycle: dist ## Drive `billet local up`/`down` against real systemd and the real package
