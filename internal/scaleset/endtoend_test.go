@@ -199,11 +199,13 @@ func TestAnAvailableJobIsAcquiredByItsOwnRequestID(t *testing.T) {
 	}
 }
 
-// The capacity billet escrowed is the number it puts on the wire.
+// The tier's ceiling is the number billet puts on the wire, and it holds nothing
+// to send it.
 //
 // maxCapacity travels as a header rather than in the body, so it is invisible to
 // any test that only inspects billet's types — and it is the single value GitHub
-// uses to decide how much work to send.
+// uses to decide how much work to send. An idle tier that sent less than it could
+// run is one GitHub gives no work to, which is what #140 fixed.
 func TestAdvertisedCapacityReachesTheWireAsAHeader(t *testing.T) {
 	var (
 		advertised atomic.Int64
@@ -316,9 +318,22 @@ func TestAdvertisedCapacityReachesTheWireAsAHeader(t *testing.T) {
 			"repeatedly", polls.Load())
 	}
 
-	if got := advertised.Load(); got != 1 {
-		t.Errorf("advertised %d runners; an idle tier must send its one escrow-backed "+
-			"discovery slot rather than holding the whole deployment", got)
+	// TWO: 8 vCPU of budget over a 4 vCPU shape. The host is far larger, so the
+	// deployment ceiling is what binds.
+	if got := advertised.Load(); got != 2 {
+		t.Errorf("advertised %d runners on the wire, want this tier's ceiling of 2: a tier "+
+			"advertising less than it could run is one GitHub assigns no work to (#140)", got)
+	}
+
+	// AND IT PAID NOTHING TO SAY SO. The advertisement is not backed; a lease is
+	// bought when a runner launches, and this tier launched none.
+	usage, err := a.Usage(t.Context())
+	if err != nil {
+		t.Fatalf("Usage: %v", err)
+	}
+
+	if usage.VCPU != 0 {
+		t.Errorf("the ledger holds %d vCPU for a tier that ran nothing, want 0 (#116)", usage.VCPU)
 	}
 }
 
