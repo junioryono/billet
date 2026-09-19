@@ -11,8 +11,9 @@ import (
 //
 // THIS IS ELIGIBILITY FOR WAITING, NEVER AN ADVERTISEMENT. It ignores execution
 // leases but keeps host policy, remote shape charges, deployment ceilings and
-// explicit floors. A tier with no eligible host must not freeze arbitration;
-// a large tier whose host is merely busy must keep its turn while room returns.
+// explicit floors. A tier with no eligible host must not hold up the waiting
+// order; a large tier whose host is merely busy must keep its place while room
+// returns. Nothing calls it until that ordering lands (#140's second stage).
 func (a *Allocator) PotentialCapacity(ctx context.Context) (map[string]int, error) {
 	out := make(map[string]int, len(a.tiers))
 	err := a.db.View(ctx, func(tx querier) error {

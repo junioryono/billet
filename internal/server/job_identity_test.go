@@ -204,13 +204,10 @@ func TestKnownIncarnationContradictsAnOfferAlias(t *testing.T) {
 		{name: "different job sharing request", offer: Job{RequestID: 11, RunID: 101, JobID: "K"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, listeners := arbitrationListeners(t, []config.Tier{tier("work")}, tierVCPU)
+			_, listeners := wiredListeners(t, []config.Tier{tier("work")}, tierVCPU)
 			l := listeners[0]
 			session := &fakeSession{}
 			l.session = session
-			if err := l.prepareEscrow(t.Context()); err != nil {
-				t.Fatal(err)
-			}
 			if err := l.handle(t.Context(), &Message{MessageID: 1, Available: []Job{tc.offer},
 				Completed: []Job{{RequestID: 11, RunID: 101, JobID: "J", Result: "Cancelled"}},
 			}); err != nil {
@@ -224,37 +221,10 @@ func TestKnownIncarnationContradictsAnOfferAlias(t *testing.T) {
 	}
 }
 
-func TestCompletionPreservesDemandForAnotherKnownRun(t *testing.T) {
-	_, listeners := arbitrationListeners(t, []config.Tier{tier("a-work"), tier("b-work")}, tierVCPU)
-	first, second := listeners[0], listeners[1]
-	first.observed = &Statistics{TotalAssignedJobs: 1}
-	if err := first.prepareEscrow(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-	if err := second.handle(t.Context(), &Message{MessageID: 1,
-		Available: []Job{{RequestID: 12, RunID: 102, JobID: "J"}},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if len(second.waitingOffers) != 1 {
-		t.Fatal("fixture did not retain the refused offer")
-	}
-	if err := second.handle(t.Context(), &Message{MessageID: 2,
-		Completed: []Job{{RequestID: 11, RunID: 101, JobID: "J", Result: "Cancelled"}},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	_, turn := first.admissionPoll()
-	first.finishAdmissionTurn(turn)
-	if len(second.waitingOffers) != 1 || second.waitingOffers[0].run != 102 || !second.arbiter.permits(second.tier) {
-		t.Fatalf("other run lost its demand or priority: %+v", second.waitingOffers)
-	}
-}
-
 func TestCompletedRunnerDropsOnlyItsDischargedCommitment(t *testing.T) {
 	for _, outcome := range []string{"acquired", "offer refused", "destroy failed"} {
 		t.Run(outcome, func(t *testing.T) {
-			a, listeners := arbitrationListeners(t, []config.Tier{tier("work")}, 2*tierVCPU)
+			a, listeners := wiredListeners(t, []config.Tier{tier("work")}, 2*tierVCPU)
 			l := listeners[0]
 			session := &fakeSession{}
 			if outcome == "offer refused" {
@@ -269,9 +239,6 @@ func TestCompletedRunnerDropsOnlyItsDischargedCommitment(t *testing.T) {
 				}
 				return nil
 			}}
-			if err := l.prepareEscrow(t.Context()); err != nil {
-				t.Fatal(err)
-			}
 			if err := l.refillEscrowUngated(t.Context(), 2, 2); err != nil {
 				t.Fatal(err)
 			}
@@ -310,11 +277,11 @@ func TestCompletedRunnerDropsOnlyItsDischargedCommitment(t *testing.T) {
 				t.Fatalf("completed lease still open: %v", err)
 			}
 			if outcome == "offer refused" {
-				if l.Acquiring() != 0 || len(l.waitingOffers) != 1 || l.waitingOffers[0].job != "J" || l.waitingOffers[0].run != 101 {
-					t.Fatalf("refused J lost demand: promises %d, waiting %+v", l.Acquiring(), l.waitingOffers)
+				if l.Acquiring() != 0 {
+					t.Fatalf("a refused offer left %d promises; GitHub gave nothing to back", l.Acquiring())
 				}
-			} else if p := l.acquiring[13]; p == nil || p.lease.ID == lease.ID || len(l.waitingOffers) != 0 {
-				t.Fatalf("J was not backed by fresh escrow: promise %+v, waiting %+v", p, l.waitingOffers)
+			} else if p := l.acquiring[13]; p == nil || p.lease.ID == lease.ID {
+				t.Fatalf("J was not backed by fresh escrow: promise %+v", p)
 			}
 		})
 	}
@@ -522,13 +489,10 @@ func TestConsumedPromiseRetainsItsRunAndRequestAliases(t *testing.T) {
 func TestAmbiguousCompletionNeverAcknowledgesHeldAssignmentsAfterRetries(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
-		shared      bool
 		nextMessage bool
 	}{
-		{name: "standalone retries"},
-		{name: "shared admission retries", shared: true},
-		{name: "standalone different message", nextMessage: true},
-		{name: "shared admission different message", shared: true, nextMessage: true},
+		{name: "retries"},
+		{name: "different message", nextMessage: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			tiers := []config.Tier{tier("work")}
@@ -552,10 +516,8 @@ func TestAmbiguousCompletionNeverAcknowledgesHeldAssignmentsAfterRetries(t *test
 			if first == nil || second == nil || l.idleEscrow() != 1 {
 				t.Fatal("fixture needs two candidate promises and spare escrow")
 			}
-			spare := l.Held()[0]
-			if tc.shared {
-				l.arbiter = newDiscoveryArbiter(tiers)
-			}
+			// The spare lease is idle escrow beyond committed work, which the
+			// listener hands back after a poll (#140); the promises are what must hold.
 			checkHeld := func() {
 				t.Helper()
 				l.mu.Lock()
@@ -565,7 +527,7 @@ func TestAmbiguousCompletionNeverAcknowledgesHeldAssignmentsAfterRetries(t *test
 					t.Errorf("retry changed held ownership or statistics: intact %v, observed %+v, launches %d",
 						intact, l.observed, launches.Load())
 				}
-				for _, lease := range []*alloc.Lease{first.lease, second.lease, spare} {
+				for _, lease := range []*alloc.Lease{first.lease, second.lease} {
 					current, err := a.Lease(t.Context(), lease.ID)
 					if err != nil || current.Phase != alloc.PhaseCapacity || current.RequestID != 0 {
 						t.Errorf("held lease changed before session close: %+v, %v", current, err)

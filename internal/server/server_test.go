@@ -265,7 +265,10 @@ func TestReconciliationFailureStopsStartup(t *testing.T) {
 // a double-admission, which is worse.
 //
 // Driven with a TTL far shorter than the poll cadence so the race is certain
-// rather than occasional.
+// rather than occasional. The leases are running work's, because nothing is
+// escrowed ahead of an advertisement any more (#140): GitHub reports two assigned
+// jobs, the pool launches two runners, and the ledger has to go on holding both
+// for as long as the listener renews them.
 func TestReaperDoesNotReclaimCapacityStillAdvertised(t *testing.T) {
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
 
@@ -310,7 +313,7 @@ func TestReaperDoesNotReclaimCapacityStillAdvertised(t *testing.T) {
 
 	prov := &fakeProvisioner{
 		newSession: func(string) Session {
-			return &fakeSession{onPoll: func(capacity int) {
+			return &fakeSession{stats: &Statistics{TotalAssignedJobs: 2}, onPoll: func(capacity int) {
 				// READ AT THE INSTANT OF THE ADVERTISEMENT, inside the poll, so the
 				// two describe one moment. Read afterwards it would describe a
 				// listener that has already released everything on the way out.
@@ -352,8 +355,14 @@ func TestReaperDoesNotReclaimCapacityStillAdvertised(t *testing.T) {
 		s.onReap = func(int) { reaps.Add(1) }
 	})
 
+	// A SECOND SIGNAL ALREADY GIVEN, so the shutdown does not wait on the two
+	// runners, which these fakes never finish.
+	hurry := make(chan struct{})
+	close(hurry)
+
 	srv := New(a, prov, tiers, "test-owner", nil,
-		WithReapInterval(leaseTTL/5), observeReaps)
+		WithReapInterval(leaseTTL/5), observeReaps, WithNodeRunner(&fakeRunner{}),
+		WithHurry(hurry))
 	if err := srv.Run(ctx); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -382,10 +391,10 @@ func TestReaperDoesNotReclaimCapacityStillAdvertised(t *testing.T) {
 		}
 	}
 
-	// And the steady state is nonzero: escrow that is being renewed stays held,
-	// so this listener keeps advertising rather than flapping to nothing.
+	// And the steady state is nonzero: a tier advertises its ceiling whatever it
+	// holds, so this listener keeps advertising rather than flapping to nothing.
 	if advertised[len(advertised)-1] == 0 {
-		t.Errorf("the listener ended up advertising nothing; escrow was not renewed: %v", advertised)
+		t.Errorf("the listener ended up advertising nothing: %v", advertised)
 	}
 
 	if usageErr != nil {

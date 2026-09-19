@@ -87,7 +87,7 @@ Load the skill before starting, not after being stuck. Each holds rules that cos
 - **Permission comes from what is proved, never from what is present or broken.** Capacity is released on proof the compute is gone; a retire, a decommission, an abandon and a fleet handover each derive their permission from a positive proof, and every narrower rule ("is something missing", "is it live") shipped first and was wrong.
 - **A rule about an API billet does not own is pinned to measured behaviour, with the date**, never to a reading of the documentation. When in doubt, write a probe and run it where the code runs.
 - **Zero values are the safe ones.** `TeardownRequested`, `TrustUnknown`, `AdmissionUnknown`, an unrecorded epoch: each refuses or holds rather than proceeding.
-- **Escrow before advertise; exactly one party renews a lease; a timer never authorises a teardown.**
+- **A lease before every runner, never one reserved for an idle tier; exactly one party renews a lease; a timer never authorises a teardown.**
 - **One of each**: one signer, one SQLite driver import site, one scale-set client, one query directory, one toolset file, one durable-install ordering, one answer to where kernels live. A second copy is one that is wrong.
 - **Assemble in tests the way the CLI does** (`internal/wiring`), and prove a mechanism is used, not only that it works.
 
