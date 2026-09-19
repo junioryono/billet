@@ -250,6 +250,84 @@ func TestAWaitingStandbyReportsTheHolder(t *testing.T) {
 	}
 }
 
+// AND A CANCELLED WAIT SAYS SO, which is what the command above it acts on.
+//
+// `cmd/billet`'s stoppedBeforeTheClaim exits 0 on exactly this error, because a
+// host stopped while it takes the claim leaves the deployment as it found it.
+// Until 2026-09-19 it exited 1 instead: systemd held `ActiveState=failed` for a
+// unit that did what it was asked, and `billet server retire` refuses to act
+// against a failed unit, so a retained-node retirement of a standby stopped at
+// intent (measured by scripts/retirement-rehearsal.sh, run 35411568410). The
+// classification is the command's; that there is a cancellation to classify is
+// this.
+//
+// WHAT IT PINS IS THE IDENTITY, NOT THE BRANCH. A cancellation delivered while a
+// standby waits is observed either by the select below the poll or by the next
+// ClaimController, which asCancellation re-identifies; both carry
+// context.Canceled and the command's predicate needs only that. Pinning which
+// one answered would pin a race.
+func TestACancelledStandbyWaitReportsTheCancellation(t *testing.T) {
+	dsn := requirePostgres(t)
+
+	leader, err := OpenPostgres(t.Context(), t.TempDir(), dsn)
+	if err != nil {
+		t.Fatalf("OpenPostgres: %v", err)
+	}
+
+	// THROUGH Cleanup RATHER THAN A CLOSE AT THE END: every assertion below can
+	// end the test, and a leader left open holds the advisory lock for the rest
+	// of the package's run.
+	t.Cleanup(func() {
+		if err := leader.Close(); err != nil {
+			t.Errorf("closing the leader: %v", err)
+		}
+	})
+
+	if _, err := leader.ClaimController(t.Context(), "the-incumbent", testDeployment); err != nil {
+		t.Fatalf("the leader could not claim: %v", err)
+	}
+
+	standby := openStandby(t, dsn)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	waiting := make(chan struct{}, 1)
+	returned := make(chan error, 1)
+
+	go func() {
+		_, err := standby.AwaitController(ctx, "standby", testDeployment,
+			func(ControllerClaim) {
+				select {
+				case waiting <- struct{}{}:
+				default:
+				}
+			})
+		returned <- err
+	}()
+
+	// CANCELLED ONLY ONCE IT IS ACTUALLY WAITING, or the cancellation could be
+	// read by the first claim attempt instead of by the wait this is about.
+	select {
+	case <-waiting:
+	case <-time.After(20 * time.Second):
+		t.Fatal("a standby beside a held claim never began waiting")
+	}
+
+	cancel()
+
+	select {
+	case err := <-returned:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("the cancelled wait returned %v, want an error carrying "+
+				"context.Canceled; without it the command cannot tell a stop from a fault "+
+				"and exits non-zero on both", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("the cancelled wait never returned")
+	}
+}
+
 // A STANDBY MIGRATES AT PROMOTION AND NOT BEFORE.
 //
 // It opened without the controller exclusion and therefore without the right to

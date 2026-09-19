@@ -494,7 +494,25 @@ rehearsal_teardown_hosts() {
         fi
     fi
 
-    if [ -n "${storage}" ] && ! rm -rf "${storage}"; then
+    # THE SNAPSHOT STORAGE IS ROOT'S, WRITTEN FROM INSIDE A PRIVILEGED
+    # CONTAINER, so the account that ran the rehearsal cannot remove it and
+    # `rm -rf` fails with permission denied on every run that started a node
+    # (measured on a GitHub runner, 2026-09-19). Emptying it as root in a
+    # throwaway container of the image the hosts already pulled costs no further
+    # download; the directory itself is this account's, from mktemp, so the
+    # second removal is an ordinary one. Only a directory that survives BOTH is
+    # a leak worth a verdict.
+    if [ -n "${storage}" ] && [ -e "${storage}" ]; then
+        rm -rf "${storage}" >/dev/null 2>&1
+    fi
+
+    if [ -n "${storage}" ] && [ -e "${storage}" ]; then
+        docker run --rm -v "${storage}:/storage" ubuntu:24.04 \
+            find /storage -mindepth 1 -delete >/dev/null 2>&1
+        rm -rf "${storage}" >/dev/null 2>&1
+    fi
+
+    if [ -n "${storage}" ] && [ -e "${storage}" ]; then
         echo "TEARDOWN: storage ${storage} survived removal" >&2
         left=1
     fi
