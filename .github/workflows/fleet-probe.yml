@@ -1,0 +1,18 @@
+name: Fleet probe
+
+# SCRATCH BRANCH ONLY, never merged. One job on the label whose queue is stuck,
+# to tell a wedged job apart from a fleet that is not serving. `on: push` to
+# this branch rather than workflow_dispatch, because a dispatch cannot be
+# targeted at a ref until the workflow is on the default branch.
+on:
+  push:
+    branches: [junior-sep19-fleet-probe]
+
+permissions: {}
+
+jobs:
+  probe:
+    runs-on: billet-2vcpu-ubuntu-2404
+    timeout-minutes: 10
+    steps:
+      - run: echo "served at $(date -u +%H:%M:%SZ) on ${RUNNER_NAME:-unknown}"
