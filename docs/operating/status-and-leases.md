@@ -24,6 +24,14 @@ The advertisement is the listener's **last confirmed** completed exchange and it
 
 Every tier advertises at once and holds nothing while idle. A lease is bought when a runner is about to start, so the discovery count is normally zero; escrow bought for an offer or an assignment that did not use it is released after that message is handled. Explicit `reserved` floors still protect their configured room. When the fleet is full, an assigned job waits at GitHub and starts on a later poll once running work has finished and released its capacity.
 
+A tier with work it could not buy room for says so, on a line of its own:
+
+```text
+          waiting 3 job(s) for room, oldest since 2026-09-20T11:40:00Z
+```
+
+**That line is the only place a queue is visible.** Nothing is reserved for an idle tier, so in the ledger a tier with three queued jobs and a tier nobody has asked for are the same shape: both hold nothing and both advertise their ceiling. The count is what GitHub has assigned beyond what this tier could start, and the timestamp is when it first could not start it — not when the observation was written, so it reads as the age of the oldest wait. It is absent when nothing is waiting, and a control plane older than this field reports nothing rather than a queue of zero.
+
 Which waiting tier takes that room is `server.admission_order`. Under `fair`, the default, it goes to the tier that has waited longest, and no other tier buys until that tier's shape fits: a large shape only ever fits when several small jobs end together, so first-come starves it on a fleet that is never idle. The freed room therefore sits idle while it accumulates, for at most as long as the longest job already running. Under `fill` anything that fits starts instead, and the largest shape may wait indefinitely. A tier stops holding the line as soon as its demand is served or GitHub's count says the work was cancelled.
 
 ## `billet leases`

@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"slices"
+	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
 )
@@ -32,6 +33,23 @@ func (l *Listener) reportCapacity(ctx context.Context, sent *int, exchange strin
 	}
 	report := alloc.ListenerCapacity{
 		Sent: l.capacitySent, Confirmed: l.capacityConfirmed, Exchange: l.capacityExchange,
+		Waiting: l.waitingFor,
+	}
+
+	// THE QUEUE'S OWN RECORD OF WHEN THIS TIER BEGAN WAITING, not a fresh
+	// timestamp: the point of the field is how long the oldest work has been
+	// waiting, and a value stamped at each observation would always read as
+	// "just now".
+	if since, ok := l.order.waitingSince(l.tier); ok {
+		report.WaitingSince = since.UTC().Format(time.RFC3339Nano)
+	}
+
+	// A COUNT WITHOUT A DATE IS NOT A WAIT. The two are written by different
+	// parties — the count by this tier's own reconciliation, the date by the
+	// queue every listener shares — so a tier the queue has already released
+	// reports neither rather than a queue that no longer exists.
+	if report.WaitingSince == "" {
+		report.Waiting = 0
 	}
 	for _, lease := range l.held {
 		report.Discovery = append(report.Discovery, lease.ID)

@@ -33,4 +33,13 @@ func printTierCapacity(w io.Writer, label string, r alloc.TierCapacity) {
 	}
 	fmt.Fprintf(w, "          advertisement last confirmed %s, sent %s, exchange %s (observed %s)\n",
 		count(r.Listener.Confirmed), count(r.Listener.Sent), r.Listener.Exchange, r.ObservedAt)
+
+	// PRINTED ONLY WHEN THERE IS A QUEUE. Nothing is reserved for an idle tier,
+	// so a tier with queued work and a tier nobody wants are the same shape in
+	// every count above; this line is the difference, and a zero printed beside
+	// every healthy tier is a line nobody reads.
+	if r.Listener.Waiting > 0 && r.Listener.WaitingSince != "" {
+		fmt.Fprintf(w, "          waiting %d job(s) for room, oldest since %s\n",
+			r.Listener.Waiting, r.Listener.WaitingSince)
+	}
 }

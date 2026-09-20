@@ -110,7 +110,7 @@ func TestFairHoldsTheLineForALargeShape(t *testing.T) {
 
 	// One small job finishes. Four vCPU are free: enough for another small job,
 	// not enough for the large one.
-	freeOneLease(t, a, "a-small")
+	freeOneLease(t, a)
 
 	if err := small.reconcilePool(t.Context(), 2); err != nil {
 		t.Fatalf("small tier reconcile after a slot freed: %v", err)
@@ -122,7 +122,7 @@ func TestFairHoldsTheLineForALargeShape(t *testing.T) {
 	}
 
 	// The second small job finishes. Now the large shape fits and must take it.
-	freeOneLease(t, a, "a-small")
+	freeOneLease(t, a)
 
 	if err := large.reconcilePool(t.Context(), 1); err != nil {
 		t.Fatalf("large tier reconcile once its shape fits: %v", err)
@@ -150,7 +150,7 @@ func TestFillGivesFreedRoomToWhateverFits(t *testing.T) {
 		t.Fatalf("large tier reconcile: %v", err)
 	}
 
-	freeOneLease(t, a, "a-small")
+	freeOneLease(t, a)
 
 	if err := small.reconcilePool(t.Context(), 2); err != nil {
 		t.Fatalf("small tier reconcile after a slot freed: %v", err)
@@ -218,7 +218,7 @@ func TestATierWhoseDemandDisappearsStopsHoldingTheLine(t *testing.T) {
 		t.Fatalf("large tier reconcile with no demand: %v", err)
 	}
 
-	freeOneLease(t, a, "a-small")
+	freeOneLease(t, a)
 
 	if err := small.reconcilePool(t.Context(), 2); err != nil {
 		t.Fatalf("small tier reconcile after the wait cleared: %v", err)
@@ -231,9 +231,13 @@ func TestATierWhoseDemandDisappearsStopsHoldingTheLine(t *testing.T) {
 	}
 }
 
-// freeOneLease ends one of a tier's open leases, as a finished job does.
-func freeOneLease(t *testing.T, a *alloc.Allocator, tierLabel string) {
+// freeOneLease ends one of the small tier's open leases, as a finished job does.
+// The small tier is the one that fills the fleet in every case here, so it is
+// also the only one holding a lease to give back.
+func freeOneLease(t *testing.T, a *alloc.Allocator) {
 	t.Helper()
+
+	tierLabel := contenders()[0].Label
 
 	runners, err := a.PoolRunners(t.Context(), tierLabel)
 	if err != nil {
