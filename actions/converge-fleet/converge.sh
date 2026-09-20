@@ -281,6 +281,17 @@ done <"$reach_targets"
 # failed; the pass's own status is what this script exits with.
 log="$billet_action_runner_temp/billet-converge-1.log"
 status=0
+
+# THE MARKER IS WRITTEN BEFORE THE PLAYBOOK, NOT AFTER IT. The role's first task
+# on every host is the hold, so a run that is killed, cancelled or fails part-way
+# is exactly the run whose guards need releasing; a marker written afterwards
+# would be missing in precisely that case. Written in check mode too, because a
+# check holds the host as a converge does.
+#
+# It carries the holder so the release step releases what this run held, even if
+# something later in the job changed the environment.
+printf '%s\n' "${BILLET_CONVERGE_GUARD_HOLDER:-}" >"$billet_action_runner_temp/billet-guard-held"
+
 if [[ $billet_action_mode == check ]]; then
   run_ansible ansible-playbook "${args[@]}" --check --diff "$billet_action_playbook" 2>&1 | tee "$log" || status=$?
 else

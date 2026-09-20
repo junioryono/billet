@@ -96,6 +96,11 @@ outputs:
   billet-ref:
     description: The billet ref this action, and therefore the collection, ran from
     value: ${{ steps.prepare.outputs.billet_ref }}
+  converge-guard-holder:
+    description: >-
+      The name every host was held under for this run, released by the action
+      itself. Reported so a guard found standing afterwards can be addressed.
+    value: ${{ steps.prepare.outputs.converge_guard_holder }}
 
 runs:
   using: composite
@@ -138,6 +143,19 @@ runs:
         BILLET_LIMIT: ${{ inputs.limit }}
         BILLET_PROVE_IDEMPOTENT: ${{ inputs.prove-idempotent }}
       run: "${{ github.action_path }}/converge.sh"
+
+    # BEFORE THE CREDENTIALS ARE SHREDDED, and on every path. The role holds
+    # every host and never releases; a guard nobody releases stands until a
+    # person removes it, and every later converge and every rollout dispatch on
+    # that host refuses while it does. A converge that died half way is exactly
+    # the run that is holding one.
+    - name: Release the converge guard this run holds
+      if: ${{ always() }}
+      shell: bash
+      env:
+        BILLET_INVENTORY: ${{ inputs.inventory }}
+        BILLET_LIMIT: ${{ inputs.limit }}
+      run: "${{ github.action_path }}/release-guard.sh"
 
     - name: Leave nothing behind
       if: ${{ always() }}

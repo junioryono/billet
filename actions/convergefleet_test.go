@@ -193,6 +193,9 @@ type convergeRun struct {
 	listHosts, debug, recap1, recap2                                                                   string
 	ncFail, runnerName                                                                                 string
 	pbExit                                                                                             string
+	// holder is what the role reads as the converge guard's holder: the run's
+	// own name, exported by prepare.sh and inherited from the environment.
+	holder string
 }
 
 // run executes converge.sh with the fixture's fakes and returns combined
@@ -262,6 +265,7 @@ func (f *convergeFixture) run(t *testing.T, r convergeRun) (string, error) {
 		"BILLET_EXTRA_VARS=" + r.extraVars,
 		"BILLET_LIMIT=" + r.limit,
 		"BILLET_PROVE_IDEMPOTENT=" + r.prove,
+		"BILLET_CONVERGE_GUARD_HOLDER=" + r.holder,
 	}
 	if r.runnerName != "" {
 		cmd.Env = append(cmd.Env, "RUNNER_NAME="+r.runnerName)
