@@ -473,6 +473,10 @@ type ServerConfig struct {
 	// Placement decides which of several suitable machines a job is sent to.
 	// Empty means pack. Only meaningful once a deployment has more than one.
 	Placement PlacementPolicy `yaml:"placement,omitempty"`
+	// AdmissionOrder decides which waiting tier takes the room a finished job
+	// leaves, when the fleet cannot hold every tier that wants work. Empty means
+	// fair. Only meaningful once a deployment has tiers of different sizes.
+	AdmissionOrder AdmissionOrder `yaml:"admission_order,omitempty"`
 	// NodeTLSHosts are the names and addresses nodes will dial this control plane by.
 	// They become the subject names of the certificate it serves.
 	//
@@ -3755,6 +3759,10 @@ func (c *Config) validateServer() []error {
 	errs = append(errs, c.validateBootstrapListen()...)
 
 	if err := c.Server.Placement.Validate(); err != nil {
+		errs = append(errs, err)
+	}
+
+	if err := c.Server.AdmissionOrder.Validate(); err != nil {
 		errs = append(errs, err)
 	}
 	// Required, not optional. Without a ceiling the allocator has nothing to
