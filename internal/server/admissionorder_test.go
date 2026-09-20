@@ -310,3 +310,51 @@ func TestTheConfiguredAdmissionOrderReachesTheListeners(t *testing.T) {
 		})
 	}
 }
+
+// EVERY TIER'S LISTENER GETS THE SAME QUEUE, AND BUILDING IT RACES NOBODY.
+//
+// listenerOpts runs on each tier's own goroutine (runTier), so a queue built
+// lazily there is two listeners racing to create it — and whichever won, the
+// fleet would be split between two queues each being fair about half of it.
+// Caught by -race on the e2e suite; this is the same thing at its own level,
+// and it fails without the detector too, because the pointers differ.
+func TestEveryListenerSharesOneQueueBuiltBeforeTheyStart(t *testing.T) {
+	t.Parallel()
+
+	tiers := contenders()
+
+	a, err := alloc.New(openState(t), alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s := New(a, nil, tiers, "shared-queue-test", nil)
+
+	queues := make([]*admissionQueue, len(tiers))
+
+	var wg sync.WaitGroup
+
+	for i := range tiers {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			l := NewListener(a, tiers[i].Label, &fakeSession{}, s.listenerOpts(nil)...)
+			queues[i] = l.order
+		}()
+	}
+
+	wg.Wait()
+
+	for i, q := range queues {
+		if q == nil {
+			t.Fatalf("%s got no admission queue", tiers[i].Label)
+		}
+
+		if q != queues[0] {
+			t.Errorf("%s got a different admission queue from %s, so each is fair about part "+
+				"of the fleet", tiers[i].Label, tiers[0].Label)
+		}
+	}
+}

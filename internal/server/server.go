@@ -321,6 +321,14 @@ func New(
 		opt(s)
 	}
 
+	// AFTER THE OPTIONS AND ONCE, because listenerOpts runs on every tier's own
+	// goroutine (runTier) and a queue built lazily there is two listeners racing
+	// to create it — and, whoever won, two halves of one fleet being fair about
+	// different things. Measured by -race on this package's own e2e suite.
+	if s.order == nil {
+		s.order = newAdmissionQueue(config.AdmissionFair)
+	}
+
 	return s
 }
 
@@ -644,10 +652,6 @@ func (s *Server) listenerOpts(prov Provisioner) []Option {
 	// ALWAYS, and shared: fairness between tiers is a property of the set of
 	// listeners, so a control plane that handed some of them a queue and not
 	// others would be fair about part of its fleet.
-	if s.order == nil {
-		s.order = newAdmissionQueue(config.AdmissionFair)
-	}
-
 	opts = append(opts, WithAdmissionQueue(s.order))
 
 	if s.runner != nil {
