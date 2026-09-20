@@ -192,6 +192,24 @@ server:
   #
   # placement: pack
 
+  # WHICH WAITING TIER TAKES THE ROOM A FINISHED JOB LEAVES.
+  #
+  # Every tier tells GitHub what it could run at all times, so GitHub can assign
+  # more work across tiers than the fleet holds at once; the jobs that do not fit
+  # wait, and this decides who goes first when room appears.
+  #
+  # `fair` (the default) gives it to the tier that has waited longest, and holds
+  # the room until that tier's shape fits. A 64-vCPU job only ever fits when
+  # several small jobs end together, so without this it waits behind a stream of
+  # 2-vCPU jobs for as long as they keep arriving. The cost is that the freed
+  # room sits idle while it accumulates, bounded by the longest job running.
+  #
+  # `fill` starts anything that fits instead: more work runs, and your largest
+  # shape may wait indefinitely on a fleet that is never idle. Reach for it when
+  # your tiers are close enough in size that the wait costs more than it buys.
+  #
+  # admission_order: fair
+
 # The GitHub target this deployment serves, and the App that manages its runners.
 #
 # A TARGET IS AN ORGANIZATION OR A REPOSITORY. Write `org:` for an organization,

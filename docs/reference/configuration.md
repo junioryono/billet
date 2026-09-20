@@ -20,6 +20,7 @@ Byte sizes are written as `32GiB`, `512MiB` and parsed exactly; durations as Go 
 | `identity.aws_ssm` | for `aws-ssm` | `region`, `prefix` (isolates one deployment in an account), `kms_key_id` |
 | `max_vcpu`, `max_memory` | yes, positive | the deployment ceiling across every tier |
 | `placement` | no | `pack` (default) or `spread` |
+| `admission_order` | no | `fair` (default) or `fill`; which waiting tier takes the room a finished job leaves |
 | `drain_timeout` | no | when billet starts reporting a drain as long; never a deadline |
 
 ## `github`

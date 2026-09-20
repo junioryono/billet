@@ -62,6 +62,8 @@ type Server struct {
 	targets []Target
 	// maxCapacity, when set, caps every listener. See WithMaxCapacity.
 	maxCapacity *int
+	// order is the admission order every listener of this control plane shares.
+	order *admissionQueue
 	// reapEvery is how often abandoned capacity is reclaimed.
 	reapEvery time.Duration
 	// hurry, when closed, ends every listener's drain wait early.
@@ -153,6 +155,12 @@ type StagedCredentialSweeper interface {
 // which is right for a deployment with no backend that stages a credential.
 func WithStagedCredentialSweeper(s StagedCredentialSweeper) ControlPlaneOption {
 	return func(srv *Server) { srv.credentialSweeper = s }
+}
+
+// WithAdmissionOrder sets which waiting tier takes the room a finished job
+// leaves. See config.AdmissionOrder; empty is fair.
+func WithAdmissionOrder(order config.AdmissionOrder) ControlPlaneOption {
+	return func(s *Server) { s.order = newAdmissionQueue(order) }
 }
 
 // WithNodeRunner attaches the compute every listener launches onto.
@@ -276,7 +284,10 @@ func OptionsFromConfig(cfg *config.Config) ([]ControlPlaneOption, error) {
 		return nil, err
 	}
 
-	return []ControlPlaneOption{WithDrainTimeout(drain)}, nil
+	return []ControlPlaneOption{
+		WithDrainTimeout(drain),
+		WithAdmissionOrder(cfg.Server.Order()),
+	}, nil
 }
 
 // AdvertiseNothing makes every listener advertise zero capacity.
@@ -629,6 +640,15 @@ func (s *Server) listenerOpts(prov Provisioner) []Option {
 	if s.maxCapacity != nil {
 		opts = append(opts, WithMaxCapacity(*s.maxCapacity))
 	}
+
+	// ALWAYS, and shared: fairness between tiers is a property of the set of
+	// listeners, so a control plane that handed some of them a queue and not
+	// others would be fair about part of its fleet.
+	if s.order == nil {
+		s.order = newAdmissionQueue(config.AdmissionFair)
+	}
+
+	opts = append(opts, WithAdmissionQueue(s.order))
 
 	if s.runner != nil {
 		opts = append(opts, WithRunner(s.runner))
