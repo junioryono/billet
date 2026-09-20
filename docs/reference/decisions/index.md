@@ -16,6 +16,7 @@ adr-008-state-backends
 adr-009-controller-election
 adr-010-automatic-updates
 adr-011-targets-and-repository-scope
+adr-012-steady-advertisement
 ```
 
 | Record | Decides |
@@ -31,3 +32,4 @@ adr-011-targets-and-repository-scope
 | [ADR-009](adr-009-controller-election.md) | the controller election: a session advisory lock plus an epoch fence, and no failure detector |
 | [ADR-010](adr-010-automatic-updates.md) | why a deployment updates itself by default, how the controller's own upgrade is carried out by a root timer on Linux and a launch agent on a Mac, what the transaction skips on a PostgreSQL ledger, and the release watermark that stops an unattended update going backwards |
 | [ADR-011](adr-011-targets-and-repository-scope.md) | one control plane serving several GitHub targets, organizations and repositories, each with its own App; why a repository target is untrusted-only and holds the wider `administration: write` grant; what the Actions service answered at repository scope |
+| [ADR-012](adr-012-steady-advertisement.md) | why every tier advertises what it could run rather than what it holds, why capacity is bought when a runner starts, and what the two shipped designs that reserved before advertising cost |

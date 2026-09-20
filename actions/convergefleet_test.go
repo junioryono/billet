@@ -125,7 +125,12 @@ case " $* " in
       error) echo "Error communicating with daemon" >&2; exit 3 ;;
       *) echo "Registration Missing"; exit 1 ;;
     esac ;;
-  *" registration delete "*) if [ "${BILLET_FAKE_WARP_DELETE_SAYS:-}" = missing ]; then echo "Registration Missing"; exit 1; fi ;;
+  *" registration delete "*)
+    case "${BILLET_FAKE_WARP_DELETE_SAYS:-}" in
+      missing) echo "Registration Missing"; exit 1 ;;
+      # The text a managed deployment answers, measured 2026-09-19.
+      managed) echo "Error: Operation not authorized in this context." >&2; exit 1 ;;
+    esac ;;
 esac
 exit "${BILLET_FAKE_WARP_EXIT:-0}"
 `,
@@ -889,6 +894,78 @@ func TestCleanupRemovesOnlyWhatThisRunCreated(t *testing.T) {
 			if _, err := os.Stat(filepath.Join(f.runnerTm, name)); !os.IsNotExist(err) {
 				t.Errorf("%s survived cleanup", name)
 			}
+		}
+	})
+
+	// A MANAGED CLIENT MAY NOT DELETE ITS OWN REGISTRATION, and the first fleet
+	// to run this action met it on its first converge: enrolled by service token
+	// through mdm.xml, `registration delete` answers "Operation not authorized in
+	// this context" (measured 2026-09-19, ubuntu-24.04). Removing mdm.xml and
+	// restarting warp-svc does not lift it — it discards the local registration,
+	// so the delete has nothing to ask about and the device entry survives
+	// unreachable. There is no ordering that makes this succeed.
+	//
+	// So it must not fail: every converge of a managed fleet would be a failed
+	// job whatever the converge did. It must still be loud, and it must name the
+	// device, because the entry outlives the runner and only a person or the API
+	// can remove it.
+	t.Run("a managed deployment's refusal is reported with the device and is not a failure", func(t *testing.T) {
+		t.Parallel()
+		f := newConvergeFixture(t)
+		for _, name := range []string{"billet-ssh-key", "billet-app-key.pem", "billet-warp-registered"} {
+			if err := os.WriteFile(filepath.Join(f.runnerTm, name), []byte("x"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		out, err := runCleanup(t, f, "0", "BILLET_FAKE_WARP_DELETE_SAYS=managed", "BILLET_FAKE_WARP_REGISTERED=yes")
+		if err != nil {
+			t.Fatalf("a refusal the client cannot act on failed the cleanup:\n%s", out)
+		}
+		if !strings.Contains(out, "::warning::") || !strings.Contains(out, "managed deployment") {
+			t.Errorf("the refusal is not reported as a managed deployment:\n%s", out)
+		}
+		if !strings.Contains(out, "device abc") {
+			t.Errorf("the device the operator has to remove is not named:\n%s", out)
+		}
+		if strings.Contains(out, "::error::") {
+			t.Errorf("a refusal no ordering can fix is reported as an error:\n%s", out)
+		}
+		// THE DEVICE IS READ BEFORE THE DISCONNECT. `registration show` after a
+		// disconnect is a different question, and the id is the whole point of
+		// the message.
+		joined := strings.Join(f.callsOf(t, "warp-cli"), "\n")
+		show := strings.Index(joined, "registration show")
+		disconnect := strings.Index(joined, "disconnect")
+		if show < 0 || disconnect < 0 || show > disconnect {
+			t.Errorf("the device id is not read before the disconnect:\n%s", joined)
+		}
+		// Nothing is kept for a later cleanup: there is nothing a later cleanup
+		// could do about a registration this client may not delete.
+		for _, name := range []string{"billet-ssh-key", "billet-app-key.pem", "billet-warp-registered"} {
+			if _, err := os.Stat(filepath.Join(f.runnerTm, name)); !os.IsNotExist(err) {
+				t.Errorf("%s survived cleanup", name)
+			}
+		}
+	})
+
+	// AND AN UNREADABLE DEVICE IS NOT A DEVICE WITHOUT AN ID. The message still
+	// goes out, saying it could not read one, rather than naming an empty string.
+	t.Run("a managed refusal whose device could not be read still reports", func(t *testing.T) {
+		t.Parallel()
+		f := newConvergeFixture(t)
+		for _, name := range []string{"billet-ssh-key", "billet-warp-registered"} {
+			if err := os.WriteFile(filepath.Join(f.runnerTm, name), []byte("x"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		out, err := runCleanup(t, f, "0", "BILLET_FAKE_WARP_DELETE_SAYS=managed", "BILLET_FAKE_WARP_REGISTERED=error")
+		if err != nil {
+			t.Fatalf("cleanup failed on an unreadable device:\n%s", out)
+		}
+		if !strings.Contains(out, "device unread") {
+			t.Errorf("an unreadable device id is not said to be unread:\n%s", out)
 		}
 	})
 }

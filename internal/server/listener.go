@@ -352,6 +352,15 @@ type Listener struct {
 	// maxCapacity caps what this listener advertises. nil lets the escrow decide.
 	maxCapacity *int
 
+	// order decides whether this tier may buy capacity while another waits. Nil
+	// for a standalone listener, which has no peers to be fair between.
+	order *admissionQueue
+
+	// waitingFor is how much of GitHub's assigned work this tier could not buy
+	// capacity for at its last reconciliation. Guarded by mu; reported, never
+	// scheduled on.
+	waitingFor int
+
 	stalePromise time.Duration
 
 	// Bounds the remote half of the teardown, so an unbounded Destroy cannot keep
@@ -843,6 +852,12 @@ func WithLogger(log *slog.Logger) Option {
 // caller computed something wrong, and turning it into 0 hides that.
 func WithMaxCapacity(ceiling int) Option {
 	return func(l *Listener) { l.maxCapacity = &ceiling }
+}
+
+// WithAdmissionQueue shares one control plane's admission order between its
+// listeners. See admissionQueue: it decides who buys, never who advertises.
+func WithAdmissionQueue(q *admissionQueue) Option {
+	return func(l *Listener) { l.order = q }
 }
 
 // Run polls until the context is done.
@@ -3373,6 +3388,14 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 		return fmt.Errorf("server: count active runner leases for %s reconciliation: %w", l.tier, err)
 	}
 	for active < desired {
+		// WHOSE TURN IT IS, asked before the purchase and not after: under fair
+		// the room a finished job leaves belongs to the longest-waiting tier
+		// until its shape fits, and a tier that bought first would have taken it
+		// (admissionQueue).
+		if !l.order.mayBuy(l.tier) {
+			break
+		}
+
 		if err := l.backPoolSlot(ctx); err != nil {
 			return err
 		}
@@ -3388,6 +3411,19 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 		}
 		active++
 	}
+	// WHAT THIS TIER STILL WANTS, recorded for the order. Demand that is met, or
+	// that GitHub's count says has gone away, releases this tier's place rather
+	// than holding the fleet behind work nobody is waiting for any more.
+	l.mu.Lock()
+	l.waitingFor = max(desired-active, 0)
+	l.mu.Unlock()
+
+	if active < desired {
+		l.order.waits(l.tier)
+	} else {
+		l.order.served(l.tier)
+	}
+
 	surplus := active - desired
 	if surplus <= 0 {
 		return nil
