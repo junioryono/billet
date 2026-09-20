@@ -31,7 +31,11 @@ for f in "$RUNNER_TEMP/billet-ssh-key" "$RUNNER_TEMP/billet-app-key.pem" "$RUNNE
 done
 
 if [[ -f "$RUNNER_TEMP/billet-warp-registered" ]]; then
-  registration_gone=0
+  # SETTLED, NOT GONE: this run has nothing further to do about the registration.
+  # In the managed case below the device entry provably survives, and a flag that
+  # claimed otherwise would be the script telling the operator the opposite of
+  # what the warning beside it says.
+  registration_settled=0
   token_gone=0
   # THE DEVICE ID BEFORE ANYTHING ELSE, because it is what an operator acts on
   # and every path below can take it away. A read that fails is not a device
@@ -41,10 +45,10 @@ if [[ -f "$RUNNER_TEMP/billet-warp-registered" ]]; then
   device=${device:-unread}
   timeout -k 5 60 warp-cli --accept-tos disconnect || echo "::warning::warp-cli disconnect failed; continuing with the registration"
   if output=$(timeout -k 5 60 warp-cli --accept-tos registration delete 2>&1); then
-    registration_gone=1
+    registration_settled=1
   elif grep -qiE 'registration missing|missing registration|not registered|no registration' <<<"$output"; then
     echo "the registration is already gone"
-    registration_gone=1
+    registration_settled=1
   elif grep -qiE 'not authorized in this context' <<<"$output"; then
     # A MANAGED CLIENT MAY NOT DELETE ITS OWN REGISTRATION, and no ordering in
     # this script changes that. Measured 2026-09-19 on ubuntu-24.04 enrolled by
@@ -64,7 +68,7 @@ if [[ -f "$RUNNER_TEMP/billet-warp-registered" ]]; then
     # nobody. It is said at warning level, with the id, every time.
     echo "::warning::this WARP client is a managed deployment, so it may not delete its own registration: $output"
     echo "::warning::device $device stays in Team & Resources -> Devices until the device inactivity policy expires it. Remove it from the dashboard or the API if that is too long; a client cannot."
-    registration_gone=1
+    registration_settled=1
   else
     echo "::error::warp-cli registration delete failed; device $device may still be registered with this Zero Trust organization: $output"
     failed=1
@@ -75,7 +79,7 @@ if [[ -f "$RUNNER_TEMP/billet-warp-registered" ]]; then
     echo "::error::/var/lib/cloudflare-warp/mdm.xml could not be removed; the service token stays on this runner"
     failed=1
   fi
-  if [[ $registration_gone == 1 && $token_gone == 1 ]]; then
+  if [[ $registration_settled == 1 && $token_gone == 1 ]]; then
     if ! rm -f "$RUNNER_TEMP/billet-warp-registered" || [[ -e "$RUNNER_TEMP/billet-warp-registered" ]]; then
       echo "::error::the ownership marker $RUNNER_TEMP/billet-warp-registered could not be removed"
       failed=1
