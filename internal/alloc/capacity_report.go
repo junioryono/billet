@@ -24,6 +24,17 @@ type ListenerCapacity struct {
 	Sent      *int     `json:"sent"`
 	Confirmed *int     `json:"confirmed"`
 	Exchange  string   `json:"exchange"`
+	// Waiting is how much of GitHub's assigned work this tier could not buy
+	// capacity for, and WaitingSince when it first could not. Zero and empty
+	// mean nothing is waiting.
+	//
+	// THE ONLY RECORD OF A QUEUE THAT IS NOT BILLET'S. Nothing is reserved for
+	// an idle tier any more, so a tier waiting for room is indistinguishable in
+	// the ledger from a tier nobody wants: both hold nothing (#140). An
+	// observation written by a control plane that predates these carries
+	// neither, which reads as not waiting, so this needs no migration.
+	Waiting      int    `json:"waiting,omitempty"`
+	WaitingSince string `json:"waiting_since,omitempty"`
 }
 
 // RecordListenerCapacity publishes the listener's ownership for another process.

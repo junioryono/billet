@@ -356,6 +356,11 @@ type Listener struct {
 	// for a standalone listener, which has no peers to be fair between.
 	order *admissionQueue
 
+	// waitingFor is how much of GitHub's assigned work this tier could not buy
+	// capacity for at its last reconciliation. Guarded by mu; reported, never
+	// scheduled on.
+	waitingFor int
+
 	stalePromise time.Duration
 
 	// Bounds the remote half of the teardown, so an unbounded Destroy cannot keep
@@ -3409,6 +3414,10 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 	// WHAT THIS TIER STILL WANTS, recorded for the order. Demand that is met, or
 	// that GitHub's count says has gone away, releases this tier's place rather
 	// than holding the fleet behind work nobody is waiting for any more.
+	l.mu.Lock()
+	l.waitingFor = max(desired-active, 0)
+	l.mu.Unlock()
+
 	if active < desired {
 		l.order.waits(l.tier)
 	} else {

@@ -62,3 +62,42 @@ func TestStatusShowsDiscoverySeparatelyFromHeadroom(t *testing.T) {
 		}
 	}
 }
+
+// STATUS SAYS WHAT A TIER IS WAITING FOR, and how long the oldest has waited.
+//
+// Nothing is reserved for an idle tier (#140), so in the ledger a tier with
+// five queued jobs and a tier nobody wants look identical: both hold nothing
+// and both advertise their ceiling. The listener's observation is the only
+// place that difference exists, and an operator asking "why is nothing
+// running" needs it printed rather than inferred.
+func TestStatusSaysWhatATierIsWaitingFor(t *testing.T) {
+	var waiting strings.Builder
+
+	printTierCapacity(&waiting, "billet-64vcpu", alloc.TierCapacity{
+		ObservedAt: "2026-09-20T12:00:00Z",
+		Listener: alloc.ListenerCapacity{
+			Exchange:     "confirmed",
+			Waiting:      3,
+			WaitingSince: "2026-09-20T11:40:00Z",
+		},
+	})
+
+	for _, want := range []string{"waiting 3", "2026-09-20T11:40:00Z"} {
+		if !strings.Contains(waiting.String(), want) {
+			t.Errorf("the tier report does not say %q:\n%s", want, waiting.String())
+		}
+	}
+
+	// AND SAYS NOTHING WHEN NOTHING IS WAITING, rather than printing a zero
+	// beside every healthy tier: the line exists to be noticed.
+	var quiet strings.Builder
+
+	printTierCapacity(&quiet, "billet-2vcpu", alloc.TierCapacity{
+		ObservedAt: "2026-09-20T12:00:00Z",
+		Listener:   alloc.ListenerCapacity{Exchange: "confirmed"},
+	})
+
+	if strings.Contains(quiet.String(), "waiting") {
+		t.Errorf("a tier with nothing waiting reported a queue:\n%s", quiet.String())
+	}
+}
